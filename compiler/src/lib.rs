@@ -11,6 +11,7 @@ pub mod front;
 pub mod lexer;
 pub mod lir;
 pub mod lower;
+pub mod mapgen;
 pub mod parser;
 pub mod prove;
 pub mod rgen;

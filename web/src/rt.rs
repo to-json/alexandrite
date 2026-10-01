@@ -741,6 +741,12 @@ pub extern "C" fn alxr_f_to_u64(x: f64, lp: i64, ln: i64) -> i64 {
 }
 
 #[unsafe(no_mangle)]
+pub extern "C" fn alxr_str_from_bytes(p: i64, n: i64) {
+    let b = bytes(p, n).to_vec();
+    ret_str(&b);
+}
+
+#[unsafe(no_mangle)]
 pub extern "C" fn alxr_rune_to_s(r: i64) {
     let c = u32::try_from(r).ok().and_then(char::from_u32).unwrap_or('\u{FFFD}');
     ret_str(c.to_string().as_bytes());

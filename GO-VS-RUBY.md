@@ -104,3 +104,8 @@ The logic: **fallibility is a prefix** ("approximately do this", "you'll probabl
 | D2 | Shifts | Go: no overflow panic, count >= width gives 0 (or -1), negative count panics | M1 |
 | D3 | Conversions | `to_X` checked (panics), `as_X` truncates like Go's `X(v)` | M1 |
 | D4 | Constants | Ruby spelling (`NAME = expr` at the top level, capitalized), Go's exact semantics | M1 |
+| D5 | Empty collections | `max`/`min`/`first`/`reduce` panic on empty (Go's `slices.Max`); lookups that commonly miss return `T?`: `find`, `m[k]`, `m.delete(k)` | M3 |
+| D6 | Subslice capacity | `a[lo..hi]` shares storage but has no spare capacity, so `<<` onto a subslice copies instead of overwriting the parent's next element (Go's `append` aliasing footgun); `a[lo..hi]` is inclusive, `a[lo...hi]` exclusive (Ruby ranges), either end may be left out | M3 |
+| D7 | `[v; n]` fill | a fill holding storage (a slice, a fixed array, a struct with one) is evaluated once per element, so `[[0; 3]; 3]` is three independent rows (Rust's `vec![v; n]` clones; Go's `make` gives nil rows) | M3 |
+| D8 | Map printing and keys | `puts m` prints Go's `map[k:v ...]` in insertion order (Go sorts); keys are integer types, Str or Bool for now; `m[k] op= v` reads a missing key as V's zero (Go) | M3 |
+| D9 | `copy(dst, src)` | Go's: copies `min(len)` elements, returns the count, overlapping slices behave like memmove | M3 |

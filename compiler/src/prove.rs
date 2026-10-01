@@ -65,7 +65,7 @@ fn scan_assigns(e: &TExpr, c: &mut HashSet<LocalId>) {
 
 fn each_child(e: &TExpr, f: &mut dyn FnMut(&TExpr)) {
     match &e.kind {
-        TK::Assign(_, v) | TK::Neg(v) | TK::Not(v) | TK::Try(v) | TK::Puts(v) => f(v),
+        TK::Assign(_, v) | TK::Neg(v) | TK::Not(v) | TK::Try(v) | TK::Puts(v) | TK::Some(v) => f(v),
         TK::IndexAssign(_, i, v) => {
             f(i);
             f(v);
@@ -73,6 +73,10 @@ fn each_child(e: &TExpr, f: &mut dyn FnMut(&TExpr)) {
         TK::Bin(_, a, b) | TK::Range(a, b, _) | TK::Index(a, b) => {
             f(a);
             f(b);
+        }
+        TK::Slice(a, lo, hi, _) => {
+            f(a);
+            lo.iter().chain(hi.iter()).for_each(|x| f(x));
         }
         TK::Ternary(c, a, b) => {
             f(c);

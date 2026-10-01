@@ -359,6 +359,8 @@ AlxStr alx_rune_to_s(int64_t r) {
     return str_of(b, (size_t)n);
 }
 
+AlxStr alx_str_from_bytes(const uint8_t *p, int64_t n) { return str_of((const char *)p, (size_t)n); }
+
 void alx_puts_u64(int64_t bits) { printf("%llu\n", (unsigned long long)(uint64_t)bits); }
 
 /* ---------- output ---------- */

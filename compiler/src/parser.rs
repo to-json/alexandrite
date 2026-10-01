@@ -222,15 +222,36 @@ impl<'a> Parser<'a> {
 
     fn type_expr(&mut self) -> PResult<TypeExpr> {
         let sp = self.span();
-        if self.eat_op("[") {
+        let base = if self.eat_op("[") {
             let inner = self.type_expr()?;
-            self.expect_op("]")?;
-            return Ok(TypeExpr::Array(Box::new(inner), sp.to(self.prev_span())));
+            if self.eat_op(";") {
+                let n = self.or()?;
+                self.expect_op("]")?;
+                TypeExpr::Fixed(Box::new(inner), Box::new(n), sp.to(self.prev_span()))
+            } else {
+                self.expect_op("]")?;
+                TypeExpr::Array(Box::new(inner), sp.to(self.prev_span()))
+            }
+        } else {
+            match self.bump().tok {
+                Tok::Const(n) if self.is_op("[") && !self.space_before() => {
+                    self.bump();
+                    let mut args = vec![self.type_expr()?];
+                    while self.eat_op(",") {
+                        args.push(self.type_expr()?);
+                    }
+                    self.expect_op("]")?;
+                    TypeExpr::App(n, args, sp.to(self.prev_span()))
+                }
+                Tok::Const(n) => TypeExpr::Named(n, sp),
+                t => return Err(Diag::new(sp, format!("expected a type, found {}", describe(&t)))),
+            }
+        };
+        if self.is_op("?") && !self.space_before() {
+            self.bump();
+            return Ok(TypeExpr::Opt(Box::new(base), sp.to(self.prev_span())));
         }
-        match self.bump().tok {
-            Tok::Const(n) => Ok(TypeExpr::Named(n, sp)),
-            t => Err(Diag::new(sp, format!("expected a type, found {}", describe(&t)))),
-        }
+        Ok(base)
     }
 
     fn braced_stmts(&mut self) -> PResult<Vec<Stmt>> {
@@ -680,6 +701,22 @@ impl<'a> Parser<'a> {
     fn postfix(&mut self) -> PResult<Expr> {
         let mut e = self.primary()?;
         loop {
+            if self.is_op("?.") {
+                // Optional chaining: the call happens only if the receiver is present.
+                self.bump();
+                self.skip_line_continuation();
+                let name_span = self.span();
+                let name = match self.bump().tok {
+                    Tok::Ident(n) => n,
+                    t => return Err(Diag::new(name_span, format!("expected a method name after `?.`, found {}", describe(&t)))),
+                };
+                let (args, block_sym) = if self.is_op("(") && !self.space_before() { self.call_args()? } else { (vec![], None) };
+                let block = self.maybe_block()?;
+                let sp = e.span.to(self.prev_span());
+                let call = self.mk(ExprKind::Call { recv: Some(Box::new(e)), name, name_span, args, block, block_sym }, sp);
+                e = self.mk(ExprKind::OptCall(Box::new(call)), sp);
+                continue;
+            }
             if self.is_op(".") {
                 self.bump();
                 self.skip_line_continuation();
@@ -697,7 +734,22 @@ impl<'a> Parser<'a> {
             }
             if self.is_op("[") && !self.space_before() {
                 self.bump();
-                let idx = self.expr()?;
+                // A reslice may leave out either end: `a[2..]`, `a[...n]`.
+                let isp = self.span();
+                let idx = if self.is_op("..") || self.is_op("...") {
+                    let excl = self.bump().tok == Tok::Op("...");
+                    let hi = if self.is_op("]") { None } else { Some(Box::new(self.or()?)) };
+                    self.mk(ExprKind::SliceRange(None, hi, excl), isp.to(self.prev_span()))
+                } else {
+                    let lo = self.or()?;
+                    if self.is_op("..") || self.is_op("...") {
+                        let excl = self.bump().tok == Tok::Op("...");
+                        let hi = if self.is_op("]") { None } else { Some(Box::new(self.or()?)) };
+                        self.mk(ExprKind::SliceRange(Some(Box::new(lo)), hi, excl), isp.to(self.prev_span()))
+                    } else {
+                        lo
+                    }
+                };
                 self.expect_op("]")?;
                 let sp = e.span.to(self.prev_span());
                 e = self.mk(ExprKind::Index(Box::new(e), Box::new(idx)), sp);
@@ -796,7 +848,7 @@ impl<'a> Parser<'a> {
         match self.peek() {
             Tok::Int(_) | Tok::BigInt(_) | Tok::Float(..) | Tok::Str(_) | Tok::Interp(_) | Tok::Ident(_) | Tok::Const(_) | Tok::Sym(_) => true,
             Tok::Kw(Kw::Case) => true,
-            Tok::Kw(Kw::True | Kw::False | Kw::Nil | Kw::Try) => true,
+            Tok::Kw(Kw::True | Kw::False | Kw::Nil | Kw::None | Kw::Try) => true,
             Tok::Op("(") | Tok::Op("[") => true,
             // `puts -x` (Ruby): a minus right before its operand starts an argument.
             Tok::Op("-") | Tok::Op("^") => !self.toks[(self.pos + 1).min(self.toks.len() - 1)].space_before,
@@ -843,6 +895,7 @@ impl<'a> Parser<'a> {
             Tok::Kw(Kw::True) => self.mk(ExprKind::Bool(true), sp),
             Tok::Kw(Kw::False) => self.mk(ExprKind::Bool(false), sp),
             Tok::Kw(Kw::Nil) => self.mk(ExprKind::Nil, sp),
+            Tok::Kw(Kw::None) => self.mk(ExprKind::None, sp),
             Tok::Const(c) => self.mk(ExprKind::Const(c), sp),
             Tok::Op("(") => {
                 let saved = std::mem::replace(&mut self.in_cond, false);
@@ -856,9 +909,55 @@ impl<'a> Parser<'a> {
                 e.span = sp.to(self.prev_span());
                 e
             }
+            Tok::Op("{") => {
+                let mut pairs = vec![];
+                let saved = std::mem::replace(&mut self.in_cond, false);
+                self.skip_newlines();
+                while !self.is_op("}") {
+                    let k = if let (Tok::Ident(name), Tok::Op(":")) = (self.peek().clone(), self.peek_at(1).clone()) {
+                        let nsp = self.bump().span;
+                        self.bump();
+                        self.mk(ExprKind::Str(name), nsp)
+                    } else {
+                        let k = self.expr()?;
+                        self.skip_newlines();
+                        self.expect_op("=>")?;
+                        k
+                    };
+                    self.skip_newlines();
+                    let v = self.expr()?;
+                    pairs.push((k, v));
+                    self.skip_newlines();
+                    if !self.eat_op(",") {
+                        break;
+                    }
+                    self.skip_newlines();
+                }
+                self.skip_newlines();
+                self.expect_op("}")?;
+                self.in_cond = saved;
+                self.mk(ExprKind::MapLit(pairs), sp.to(self.prev_span()))
+            }
             Tok::Op("[") => {
                 let mut items = vec![];
                 self.skip_newlines();
+                if !self.is_op("]") {
+                    let first = self.expr()?;
+                    if self.eat_op(";") {
+                        // `[v; n]`
+                        let n = self.or()?;
+                        self.expect_op("]")?;
+                        return Ok(self.mk(ExprKind::ArrayRepeat(Box::new(first), Box::new(n)), sp.to(self.prev_span())));
+                    }
+                    items.push(first);
+                    self.skip_newlines();
+                    if self.eat_op(",") {
+                        self.skip_newlines();
+                    } else {
+                        self.expect_op("]")?;
+                        return Ok(self.mk(ExprKind::Array(items), sp.to(self.prev_span())));
+                    }
+                }
                 while !self.is_op("]") {
                     items.push(self.expr()?);
                     self.skip_newlines();

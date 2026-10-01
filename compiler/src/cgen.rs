@@ -688,6 +688,7 @@ impl FnEmit<'_> {
                     Rt::IntFmt => s("alx_int_fmt"),
                     Rt::FToU64 => s("alx_f_to_u64"),
                     Rt::RuneToS => s("alx_rune_to_s"),
+                    Rt::StrFromBytes => format!("alx_str_from_bytes((const uint8_t *)({0}).ptr, ({0}).len)", a[0]),
                 }
             }
             LE::Index { arr, idx, check } => {

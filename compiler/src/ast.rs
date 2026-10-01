@@ -134,6 +134,12 @@ pub struct Param {
 pub enum TypeExpr {
     Named(String, Span),
     Array(Box<TypeExpr>, Span),
+    /// `T?`
+    Opt(Box<TypeExpr>, Span),
+    /// `[T; N]`: a fixed-size array (a value). N is a literal or a constant.
+    Fixed(Box<TypeExpr>, Box<Expr>, Span),
+    /// `Name[T, ...]`: a generic type applied (`Map[Str, Int]`).
+    App(String, Vec<TypeExpr>, Span),
 }
 
 #[derive(Debug, Clone)]
@@ -287,6 +293,16 @@ pub enum ExprKind {
     Case(Option<Box<Expr>>, Vec<CaseArm>),
     /// `if` used as a value: `x = if c { a } else { b }`
     If(Box<Expr>, Vec<Stmt>, Vec<Stmt>),
+    /// `none`
+    None,
+    /// `[v; n]`: n copies of v (a fixed-size array)
+    ArrayRepeat(Box<Expr>, Box<Expr>),
+    /// `{k => v, ...}` / `{name: v}` (a Str key) / `{}`
+    MapLit(Vec<(Expr, Expr)>),
+    /// The index of a reslice: `a[lo...hi]`, `a[lo..]`, `a[...hi]`
+    SliceRange(Option<Box<Expr>>, Option<Box<Expr>>, bool),
+    /// `x?.m(...)`: the inner Call's receiver is the optional value.
+    OptCall(Box<Expr>),
 }
 
 #[derive(Debug, Clone)]

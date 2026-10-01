@@ -83,6 +83,77 @@ mod rt {
         AlxErr::Overflow(loc)
     }
 
+    /// A Go slice: a window (off, len, cap) onto shared storage. Clones share
+    /// the storage; `push` writes in place while there's capacity, else copies.
+    #[derive(Debug)]
+    pub struct Sl<T> {
+        buf: Arc<std::sync::Mutex<Vec<T>>>,
+        off: usize,
+        len: usize,
+        cap: usize,
+    }
+    impl<T> Clone for Sl<T> {
+        fn clone(&self) -> Self {
+            Sl { buf: self.buf.clone(), off: self.off, len: self.len, cap: self.cap }
+        }
+    }
+    impl<T> Default for Sl<T> {
+        fn default() -> Self {
+            Sl::from(vec![])
+        }
+    }
+    impl<T> From<Vec<T>> for Sl<T> {
+        fn from(v: Vec<T>) -> Self {
+            let n = v.len();
+            Sl { buf: Arc::new(std::sync::Mutex::new(v)), off: 0, len: n, cap: n }
+        }
+    }
+    impl<T: Clone> Sl<T> {
+        pub fn with_cap(c: usize) -> Self {
+            Sl { buf: Arc::new(std::sync::Mutex::new(Vec::with_capacity(c))), off: 0, len: 0, cap: c }
+        }
+        pub fn len(&self) -> usize {
+            self.len
+        }
+        pub fn get(&self, i: usize) -> T {
+            self.buf.lock().unwrap()[self.off + i].clone()
+        }
+        pub fn with<R>(&self, i: usize, f: impl FnOnce(&mut T) -> R) -> R {
+            f(&mut self.buf.lock().unwrap()[self.off + i])
+        }
+        pub fn to_vec(&self) -> Vec<T> {
+            self.buf.lock().unwrap()[self.off..self.off + self.len].to_vec()
+        }
+        /// `a[s, n]`: shares storage, capacity 0 (appending copies).
+        pub fn slice(&self, s: usize, n: usize) -> Self {
+            Sl { buf: self.buf.clone(), off: self.off + s, len: n, cap: 0 }
+        }
+        pub fn push(&mut self, x: T) {
+            if self.len < self.cap {
+                let mut b = self.buf.lock().unwrap();
+                let at = self.off + self.len;
+                if at < b.len() {
+                    b[at] = x;
+                } else {
+                    b.push(x);
+                }
+            } else {
+                let mut v = self.to_vec();
+                let c = (self.cap * 2).max(4);
+                v.reserve(c - v.len());
+                v.push(x);
+                *self = Sl { buf: Arc::new(std::sync::Mutex::new(v)), off: 0, len: self.len, cap: c };
+            }
+            self.len += 1;
+        }
+    }
+
+    impl<T: Ord> Sl<T> {
+        pub fn sort(&mut self) {
+            self.buf.lock().unwrap()[self.off..self.off + self.len].sort();
+        }
+    }
+
     pub fn idx(i: i64, n: usize, loc: &str) -> usize {
         if i < 0 || i as u64 >= n as u64 {
             panic("index out of bounds", loc)
@@ -162,7 +233,10 @@ mod rt {
         }
         n.isqrt()
     }
-    pub fn digits(mut v: i64, loc: &str) -> Vec<i64> {
+    pub fn digits(v: i64, loc: &str) -> Sl<i64> {
+        Sl::from(digits_v(v, loc))
+    }
+    fn digits_v(mut v: i64, loc: &str) -> Vec<i64> {
         if v < 0 {
             panic("`digits` of a negative number", loc)
         }
@@ -186,7 +260,10 @@ mod rt {
     pub fn str_delete(s: Str, chars: Str) -> Str {
         Str(s.0.iter().copied().filter(|b| !chars.0.contains(b)).collect::<Vec<u8>>().into())
     }
-    pub fn str_split(s: Str, sep: Str) -> Vec<Str> {
+    pub fn str_split(s: Str, sep: Str) -> Sl<Str> {
+        Sl::from(str_split_v(s, sep))
+    }
+    fn str_split_v(s: Str, sep: Str) -> Vec<Str> {
         let mut out = vec![];
         let (b, p) = (&s.0[..], &sep.0[..]);
         let mut start = 0;
@@ -240,11 +317,11 @@ mod rt {
         }
     }
 
-    pub fn arr_new<T: Clone>(n: i64, fill: T, loc: &str) -> Vec<T> {
+    pub fn arr_new<T: Clone>(n: i64, fill: T, loc: &str) -> Sl<T> {
         if n < 0 {
             panic("negative array size", loc)
         }
-        vec![fill; n as usize]
+        Sl::from(vec![fill; n as usize])
     }
     pub fn cap(n: i64) -> usize {
         n.max(0) as usize
@@ -375,7 +452,10 @@ mod rt {
         println!("{}", v.to_string());
     }
 
-    pub fn pmap<T: Clone + Sync, R: Clone + Send + Default>(xs: &[T], f: fn(T) -> Result<R, AlxErr>) -> Result<Vec<R>, AlxErr> {
+    pub fn pmap<T: Clone + Sync, R: Clone + Send + Default>(xs: &Sl<T>, f: fn(T) -> Result<R, AlxErr>) -> Result<Sl<R>, AlxErr> {
+        pmap_v(&xs.to_vec(), f).map(Sl::from)
+    }
+    fn pmap_v<T: Clone + Sync, R: Clone + Send + Default>(xs: &[T], f: fn(T) -> Result<R, AlxErr>) -> Result<Vec<R>, AlxErr> {
         let mut out = vec![R::default(); xs.len()];
         let workers = std::thread::available_parallelism().map_or(4, |n| n.get());
         let chunk = xs.len().div_ceil(workers).max(1);

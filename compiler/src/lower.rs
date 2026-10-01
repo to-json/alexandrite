@@ -49,12 +49,15 @@ pub fn lty(t: &Ty, mode: Overflow) -> LTy {
             }
         }
         Ty::IntK(k) => LTy::IntK(*k),
+        // (present, value)
+        Ty::Opt(t) => LTy::Tup(vec![LTy::Bool, lty(t, mode)]),
         Ty::Float => LTy::F64,
         Ty::Struct(_, fs) => LTy::Tup(fs.iter().map(|(_, t)| lty(t, mode)).collect()),
         Ty::Bool => LTy::Bool,
         Ty::Str => LTy::Str,
         Ty::Unit | Ty::Never | Ty::Yielder(_) | Ty::Var(_) => LTy::Unit,
-        Ty::Array(t) | Ty::Seq(t, _) => LTy::Arr(Box::new(lty(t, mode))),
+        Ty::Array(t) | Ty::Fixed(t, _) | Ty::Seq(t, _) => LTy::Arr(Box::new(lty(t, mode))),
+        Ty::Map(k, v) => crate::mapgen::map_ty(&lty(k, mode), &lty(v, mode)),
         Ty::Tuple(ts) => LTy::Tup(ts.iter().map(|t| lty(t, mode)).collect()),
         Ty::Range => LTy::Range,
         Ty::Gen(t) => LTy::Gen(Box::new(lty(t, mode))),
@@ -262,6 +265,10 @@ impl<'a> Lw<'a> {
             }
             TK::M(M::IntSqrt, None, args, _) => self.interval(&args[0]).filter(|(lo, _)| *lo >= 0).map(|(lo, hi)| (isqrt(lo), isqrt(hi))),
             TK::M(M::Size, Some(r), _, _) => match r.kind {
+                _ if matches!(r.ty, Ty::Fixed(..)) => {
+                    let Ty::Fixed(_, n) = r.ty else { unreachable!() };
+                    Some((n as i64, n as i64))
+                }
                 TK::Local(l) if matches!(r.ty, Ty::Array(_)) && self.f.locals[l].reassigned == 0 => self.fixed_len.get(&l).map(|n| (*n, *n)),
                 _ => None,
             },
@@ -461,15 +468,23 @@ impl<'a> Lw<'a> {
             TK::PlaceAssign(l, steps, op, v) => self.place_assign(*l, steps, *op, v, e),
             TK::Format(pieces, args) => self.format(pieces, args),
             TK::Seq(ss) => self.scoped_value(ss, &e.ty),
+            TK::None => {
+                let t = self.lty(&e.ty);
+                let LTy::Tup(ts) = &t else { unreachable!() };
+                let z = zero_le(&ts[1]);
+                LE::Tup(t, vec![LE::B(false), z])
+            }
+            TK::Some(x) => {
+                let t = self.lty(&e.ty);
+                let v = self.arg(x);
+                LE::Tup(t, vec![LE::B(true), v])
+            }
             TK::Str(s) => LE::S(s.clone()),
             TK::Bool(b) => LE::B(*b),
             TK::Unit => LE::Unit,
             TK::Local(l) => LE::Var(self.var_of(*l)),
             TK::Assign(l, v) => {
-                let mut x = self.expr(v);
-                if matches!(v.kind, TK::Local(_)) && matches!(v.ty, Ty::Array(_)) {
-                    x = LE::Rt(Rt::ArrCopy, vec![x]);
-                }
+                let x = self.arg(v);
                 let var = self.var_of(*l);
                 self.emit(LS::Set(var, x));
                 LE::Var(var)
@@ -485,6 +500,10 @@ impl<'a> Lw<'a> {
                 let var = self.var_of(*l);
                 self.emit(LS::SetIndex { arr: var, idx: iv, val: vv.clone(), check });
                 vv
+            }
+            TK::Bin(BinOp::Add, a, b) if e.ty == Ty::Str => {
+                let (x, y) = (self.expr(a), self.expr(b));
+                LE::Rt(Rt::StrCat, vec![x, y])
             }
             TK::Bin(op, a, b) => self.binary(*op, a, b, e),
             TK::Neg(x) => {
@@ -530,6 +549,54 @@ impl<'a> Lw<'a> {
                 let b = self.int_in(b, hi.span);
                 LE::Range(Box::new(a), Box::new(b), *excl)
             }
+            TK::Index(a, i) if a.ty == Ty::Str => {
+                let sv = self.expr(a);
+                let sv = self.bind(sv, LTy::Str);
+                let iv = self.expr(i);
+                let iv = self.int_in_t(iv, &i.ty, i.span);
+                let iv = self.bind(iv, LTy::I64);
+                let n = LE::Rt(Rt::StrLen, vec![sv.clone()]);
+                let bad = LE::Cond(Box::new(LE::Cmp(Op::Lt, Box::new(iv.clone()), Box::new(LE::I(0)), LTy::I64)), Box::new(LE::B(true)), Box::new(LE::Cmp(Op::Ge, Box::new(iv.clone()), Box::new(n), LTy::I64)));
+                self.emit(LS::If(bad, vec![LS::Panic("index out of bounds".into(), self.loc(i.span))], vec![]));
+                LE::Rt(Rt::StrByte, vec![sv, iv, LE::I(0)])
+            }
+            TK::Slice(a, lo, hi, excl) => {
+                let is_str = a.ty == Ty::Str;
+                let at = self.lty(&a.ty);
+                let av = self.expr(a);
+                let av = self.bind(av, at.clone());
+                let n = self.tmp(LTy::I64);
+                self.emit(LS::Set(n, if is_str { LE::Rt(Rt::StrLen, vec![av.clone()]) } else { LE::Len(Box::new(av.clone())) }));
+                let lo_v = match lo {
+                    Some(x) => {
+                        let v = self.expr(x);
+                        let v = self.int_in_t(v, &x.ty, x.span);
+                        self.bind(v, LTy::I64)
+                    }
+                    None => LE::I(0),
+                };
+                let end = match hi {
+                    Some(x) => {
+                        let v = self.expr(x);
+                        let v = self.int_in_t(v, &x.ty, x.span);
+                        let v = if *excl { v } else { LE::Arith(Op::Add, Box::new(v), Box::new(LE::I(1)), Ovf::Unchecked) };
+                        self.bind(v, LTy::I64)
+                    }
+                    None => LE::Var(n),
+                };
+                let cmp = |op, x: &LE, y: &LE| LE::Cmp(op, Box::new(x.clone()), Box::new(y.clone()), LTy::I64);
+                let or = |x: LE, y: LE| LE::Cond(Box::new(x), Box::new(LE::B(true)), Box::new(y));
+                let bad = or(cmp(Op::Lt, &lo_v, &LE::I(0)), or(cmp(Op::Lt, &end, &lo_v), cmp(Op::Gt, &end, &LE::Var(n))));
+                self.emit(LS::If(bad, vec![LS::Panic("slice bounds out of range".into(), self.loc(e.span))], vec![]));
+                let len = self.tmp(LTy::I64);
+                self.emit(LS::Set(len, LE::Arith(Op::Sub, Box::new(end), Box::new(lo_v.clone()), Ovf::Unchecked)));
+                if is_str {
+                    // A non-literal length: always a substring, even when empty.
+                    LE::Rt(Rt::StrByte, vec![av, lo_v, LE::Var(len)])
+                } else {
+                    LE::Slice(at, Box::new(av), Box::new(lo_v), Box::new(LE::Var(len)))
+                }
+            }
             TK::Index(a, i) => {
                 let check = self.index_check(a, i);
                 let av = self.expr(a);
@@ -545,6 +612,11 @@ impl<'a> Lw<'a> {
             TK::Try(inner) => self.try_expr(inner),
             TK::Puts(x) => {
                 let v = self.expr(x);
+                if matches!(x.ty, Ty::Opt(_) | Ty::Map(..)) {
+                    let s = self.to_s(v, &x.ty);
+                    self.emit(LS::Puts(s, LTy::Str));
+                    return LE::Unit;
+                }
                 let t = self.lty(&x.ty);
                 self.emit(LS::Puts(v, t));
                 LE::Unit
@@ -561,10 +633,249 @@ impl<'a> Lw<'a> {
         }
     }
 
-    /// Arguments are copied if they are array locals (value semantics).
+    /// A value being stored or passed: fixed arrays (and values holding
+    /// them) are copied unless the expression already made a fresh one.
+    /// Slices share their storage.
     fn arg(&mut self, a: &TExpr) -> LE {
         let v = self.expr(a);
-        if matches!(a.kind, TK::Local(_)) && matches!(a.ty, Ty::Array(_)) { LE::Rt(Rt::ArrCopy, vec![v]) } else { v }
+        let fresh = matches!(a.kind, TK::Array(_) | TK::Call(..) | TK::M(M::ArrayNew | M::StructNew, ..) | TK::Some(_) | TK::None);
+        if fresh || !a.ty.is_value_array() {
+            return v;
+        }
+        self.copy_value(v, &a.ty)
+    }
+
+    /// A var holding `e` (a new one unless `e` already is a var).
+    fn tmp_of(&mut self, e: LE, ty: LTy) -> V {
+        match e {
+            LE::Var(v) => v,
+            e => {
+                let t = self.tmp(ty);
+                self.emit(LS::Set(t, e));
+                t
+            }
+        }
+    }
+
+    /// A copy of an array with its own storage (elements copied as values).
+    fn copy_arr(&mut self, v: LE, el: &Ty) -> LE {
+        let lt = LTy::Arr(Box::new(self.lty(el)));
+        let c = self.tmp(lt);
+        self.emit(LS::Set(c, LE::Rt(Rt::ArrCopy, vec![v])));
+        if el.is_value_array() {
+            let i = self.tmp(LTy::I64);
+            let n = self.tmp(LTy::I64);
+            self.emit(LS::Set(i, LE::I(0)));
+            self.emit(LS::Set(n, LE::Len(Box::new(LE::Var(c)))));
+            let l = self.label();
+            let body = self.sub(|lw| {
+                lw.emit(LS::If(LE::Cmp(Op::Ge, Box::new(LE::Var(i)), Box::new(LE::Var(n)), LTy::I64), vec![LS::Break(l)], vec![]));
+                let x = LE::Index { arr: Box::new(LE::Var(c)), idx: Box::new(LE::Var(i)), check: None };
+                let x = lw.copy_value(x, el);
+                lw.emit(LS::SetIndex { arr: c, idx: LE::Var(i), val: x, check: None });
+                lw.emit(LS::Set(i, LE::Arith(Op::Add, Box::new(LE::Var(i)), Box::new(LE::I(1)), Ovf::Unchecked)));
+            });
+            self.emit(LS::Loop(l, body));
+        }
+        LE::Var(c)
+    }
+
+    fn map_fns(&mut self, t: &Ty) -> (crate::mapgen::MapFns, LTy, LTy) {
+        let Ty::Map(k, v) = t else { unreachable!("not a map: {t:?}") };
+        let (k, v) = (self.lty(k), self.lty(v));
+        let fns = crate::mapgen::instantiate(&mut self.prog.borrow_mut(), &k, &v);
+        (fns, k, v)
+    }
+
+    /// Field `f` of map `m`'s header.
+    fn map_hdr(m: &LE, f: usize) -> LE {
+        LE::Field(Box::new(LE::Index { arr: Box::new(m.clone()), idx: Box::new(LE::I(0)), check: None }), f)
+    }
+
+    /// Run `k` on each live entry (key, value) in order. Entries added while
+    /// iterating are visited too; deleted ones are skipped.
+    fn map_each(&mut self, m: &LE, kt: &Ty, vt: &Ty, mut k: impl FnMut(&mut Self, LE, LE)) {
+        use crate::mapgen::{KEYS, LIVE, VALS};
+        let (klt, vlt) = (self.lty(kt), self.lty(vt));
+        let i = self.tmp(LTy::I64);
+        self.emit(LS::Set(i, LE::I(0)));
+        let l = self.label();
+        let m = m.clone();
+        let body = self.sub(|lw| {
+            let n = LE::Len(Box::new(Self::map_hdr(&m, KEYS)));
+            lw.emit(LS::If(LE::Cmp(Op::Ge, Box::new(LE::Var(i)), Box::new(n), LTy::I64), vec![LS::Break(l)], vec![]));
+            let at = |f| LE::Index { arr: Box::new(Self::map_hdr(&m, f)), idx: Box::new(LE::Var(i)), check: None };
+            let (kv, vv) = (lw.tmp(klt.clone()), lw.tmp(vlt.clone()));
+            let live = at(LIVE);
+            let inner = lw.sub(|lw| {
+                lw.emit(LS::Set(kv, at(KEYS)));
+                lw.emit(LS::Set(vv, at(VALS)));
+                k(lw, LE::Var(kv), LE::Var(vv));
+            });
+            lw.emit(LS::If(live, inner, vec![]));
+            lw.emit(LS::Set(i, LE::Arith(Op::Add, Box::new(LE::Var(i)), Box::new(LE::I(1)), Ovf::Unchecked)));
+        });
+        self.emit(LS::Loop(l, body));
+    }
+
+    fn map_op(&mut self, m: M, e: &TExpr, recv: Option<&TExpr>, args: &[TExpr]) -> LE {
+        use crate::mapgen::{COUNT, VALS};
+        let mty = match m {
+            M::MapNew => &e.ty,
+            _ => &recv.unwrap().ty,
+        };
+        let (fns, klt, vlt) = self.map_fns(mty);
+        let Ty::Map(kt, vt) = mty else { unreachable!() };
+        let mlt = self.lty(mty);
+        let val_at = |m: &LE, ix: &LE| LE::Index { arr: Box::new(Self::map_hdr(m, VALS)), idx: Box::new(ix.clone()), check: None };
+        match m {
+            M::MapNew => {
+                let mv = self.tmp(mlt);
+                let cap = match recv {
+                    Some(_) => LE::I(0),
+                    None => LE::I(args.len() as i64 / 2),
+                };
+                self.emit(LS::Set(mv, LE::Call(fns.new.clone(), vec![cap])));
+                if let Some(src) = recv {
+                    let sv = self.expr(src);
+                    let sv = self.bind(sv, self.lty(&src.ty));
+                    let set = fns.set.clone();
+                    self.map_each(&sv, kt, vt, |lw, k, v| {
+                        let v = lw.copy_value(v, vt);
+                        lw.emit(LS::Eval(LE::Call(set.clone(), vec![LE::Var(mv), k, v])));
+                    });
+                }
+                for pair in args.chunks(2) {
+                    let k = self.expr(&pair[0]);
+                    let v = self.arg(&pair[1]);
+                    self.emit(LS::Eval(LE::Call(fns.set.clone(), vec![LE::Var(mv), k, v])));
+                }
+                LE::Var(mv)
+            }
+            M::MapSet => {
+                let mv = self.expr(recv.unwrap());
+                let k = self.expr(&args[0]);
+                let v = self.arg(&args[1]);
+                self.emit(LS::Eval(LE::Call(fns.set.clone(), vec![mv, k, v])));
+                LE::Unit
+            }
+            M::MapGet | M::MapDel | M::MapGetOr => {
+                let mv = self.expr(recv.unwrap());
+                let mv = self.bind(mv, mlt);
+                let k = self.expr(&args[0]);
+                let f = if m == M::MapDel { fns.del.clone() } else { fns.find.clone() };
+                let ix = self.tmp(LTy::I64);
+                self.emit(LS::Set(ix, LE::Call(f, vec![mv.clone(), k])));
+                let found = LE::Cmp(Op::Ge, Box::new(LE::Var(ix)), Box::new(LE::I(0)), LTy::I64);
+                let r = self.tmp(vlt.clone());
+                let dflt = if m == M::MapGetOr { self.expr(&args[1]) } else { zero_le(&vlt) };
+                let got = val_at(&mv, &LE::Var(ix));
+                let got = if m == M::MapDel { got } else { self.copy_value(got, vt) };
+                let _ = klt;
+                self.emit(LS::Set(r, LE::Cond(Box::new(found.clone()), Box::new(got), Box::new(dflt))));
+                if m == M::MapGetOr {
+                    LE::Var(r)
+                } else {
+                    LE::Tup(self.lty(&e.ty), vec![found, LE::Var(r)])
+                }
+            }
+            M::MapHas => {
+                let mv = self.expr(recv.unwrap());
+                let k = self.expr(&args[0]);
+                LE::Cmp(Op::Ge, Box::new(LE::Call(fns.find.clone(), vec![mv, k])), Box::new(LE::I(0)), LTy::I64)
+            }
+            M::MapSize => {
+                let mv = self.expr(recv.unwrap());
+                self.int_out(Self::map_hdr(&mv, COUNT))
+            }
+            M::MapKeys | M::MapValues => {
+                let mv = self.expr(recv.unwrap());
+                let mv = self.bind(mv, mlt);
+                let keys = m == M::MapKeys;
+                let el = if keys { klt } else { vlt };
+                let out = self.tmp(LTy::Arr(Box::new(el.clone())));
+                self.emit(LS::Set(out, LE::ArrWithCap(el, Box::new(Self::map_hdr(&mv, COUNT)))));
+                self.map_each(&mv, kt, vt, |lw, k, v| {
+                    let x = if keys { k } else { lw.copy_value(v, vt) };
+                    lw.emit(LS::Push(out, x));
+                });
+                LE::Var(out)
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    /// The code point of the `cl`-byte UTF-8 sequence at `s[i]`.
+    fn decode_rune(&mut self, s: &LE, i: V, cl: V) -> LE {
+        let byte = |k: i64| {
+            let at = if k == 0 { LE::Var(i) } else { LE::Arith(Op::Add, Box::new(LE::Var(i)), Box::new(LE::I(k)), Ovf::Unchecked) };
+            LE::Rt(Rt::StrByte, vec![s.clone(), at, LE::I(0)])
+        };
+        let prim = |p: Prim, a: LE, b: LE| LE::Prim(p, vec![a, b]);
+        let low6 = |k: i64, sh: i64| prim(Prim::Shl, prim(Prim::And, byte(k), LE::I(0x3f)), LE::I(sh));
+        let r = self.tmp(LTy::I64);
+        let b0 = self.tmp(LTy::I64);
+        self.emit(LS::Set(b0, byte(0)));
+        let is = |n: i64| LE::Cmp(Op::Eq, Box::new(LE::Var(cl)), Box::new(LE::I(n)), LTy::I64);
+        let one = LE::Cond(Box::new(LE::Cmp(Op::Lt, Box::new(LE::Var(b0)), Box::new(LE::I(0x80)), LTy::I64)), Box::new(LE::Var(b0)), Box::new(LE::I(0xfffd)));
+        let two = prim(Prim::Or, prim(Prim::Shl, prim(Prim::And, LE::Var(b0), LE::I(0x1f)), LE::I(6)), low6(1, 0));
+        let three = prim(Prim::Or, prim(Prim::Or, prim(Prim::Shl, prim(Prim::And, LE::Var(b0), LE::I(0x0f)), LE::I(12)), low6(1, 6)), low6(2, 0));
+        let four = prim(Prim::Or, prim(Prim::Or, prim(Prim::Or, prim(Prim::Shl, prim(Prim::And, LE::Var(b0), LE::I(0x07)), LE::I(18)), low6(1, 12)), low6(2, 6)), low6(3, 0));
+        self.emit(LS::Set(r, LE::Cond(Box::new(is(1)), Box::new(one), Box::new(LE::Cond(Box::new(is(2)), Box::new(two), Box::new(LE::Cond(Box::new(is(3)), Box::new(three), Box::new(four))))))));
+        LE::Var(r)
+    }
+
+    fn copy_value(&mut self, v: LE, ty: &Ty) -> LE {
+        if !ty.is_value_array() {
+            return v;
+        }
+        match ty {
+            Ty::Fixed(el, n) => {
+                let lt = self.lty(ty);
+                let c = self.tmp(lt);
+                self.emit(LS::Set(c, LE::Rt(Rt::ArrCopy, vec![v])));
+                if el.is_value_array() {
+                    let i = self.tmp(LTy::I64);
+                    self.emit(LS::Set(i, LE::I(0)));
+                    let l = self.label();
+                    let n = *n as i64;
+                    let body = self.sub(|lw| {
+                        lw.emit(LS::If(LE::Cmp(Op::Ge, Box::new(LE::Var(i)), Box::new(LE::I(n)), LTy::I64), vec![LS::Break(l)], vec![]));
+                        let x = LE::Index { arr: Box::new(LE::Var(c)), idx: Box::new(LE::Var(i)), check: None };
+                        let x = lw.copy_value(x, el);
+                        lw.emit(LS::SetIndex { arr: c, idx: LE::Var(i), val: x, check: None });
+                        lw.emit(LS::Set(i, LE::Arith(Op::Add, Box::new(LE::Var(i)), Box::new(LE::I(1)), Ovf::Unchecked)));
+                    });
+                    self.emit(LS::Loop(l, body));
+                }
+                LE::Var(c)
+            }
+            Ty::Struct(_, fs) => {
+                let lt = self.lty(ty);
+                let t = self.bind(v, lt.clone());
+                let vals = fs.iter().enumerate().map(|(k, (_, ft))| self.copy_value(LE::Field(Box::new(t.clone()), k), ft)).collect();
+                LE::Tup(lt, vals)
+            }
+            Ty::Tuple(ts) => {
+                let lt = self.lty(ty);
+                let t = self.bind(v, lt.clone());
+                let vals = ts.iter().enumerate().map(|(k, ft)| self.copy_value(LE::Field(Box::new(t.clone()), k), ft)).collect();
+                LE::Tup(lt, vals)
+            }
+            Ty::Opt(x) => {
+                let lt = self.lty(ty);
+                let c = self.tmp(lt.clone());
+                self.emit(LS::Set(c, v));
+                let present = LE::Field(Box::new(LE::Var(c)), 0);
+                let body = self.sub(|lw| {
+                    let p = lw.copy_value(LE::Field(Box::new(LE::Var(c)), 1), x);
+                    lw.emit(LS::Set(c, LE::Tup(lt.clone(), vec![LE::B(true), p])));
+                });
+                self.emit(LS::If(present, body, vec![]));
+                LE::Var(c)
+            }
+            _ => v,
+        }
     }
 
     fn try_expr(&mut self, inner: &TExpr) -> LE {
@@ -921,7 +1232,30 @@ impl<'a> Lw<'a> {
 
     fn to_s(&mut self, v: LE, t: &Ty) -> LE {
         match t {
+            Ty::Opt(inner) => {
+                let lt = self.lty(t);
+                let v = self.bind(v, lt);
+                let s = self.to_s(LE::Field(Box::new(v.clone()), 1), inner);
+                LE::Cond(Box::new(LE::Field(Box::new(v), 0)), Box::new(s), Box::new(LE::S("none".into())))
+            }
             Ty::Str => v,
+            Ty::Map(kt, vt) => {
+                // Go's `map[k:v k:v]`, in insertion order.
+                let lt = self.lty(t);
+                let m = self.bind(v, lt);
+                let s = self.tmp(LTy::Str);
+                let first = self.tmp(LTy::Bool);
+                self.emit(LS::Set(s, LE::S("map[".into())));
+                self.emit(LS::Set(first, LE::B(true)));
+                self.map_each(&m, kt, vt, |lw, k, v| {
+                    let sep = LE::Cond(Box::new(LE::Var(first)), Box::new(LE::S(String::new())), Box::new(LE::S(" ".into())));
+                    let ks = lw.to_s(k, kt);
+                    let vs = lw.to_s(v, vt);
+                    lw.emit(LS::Set(s, LE::Rt(Rt::StrCat, vec![LE::Var(s), sep, ks, LE::S(":".into()), vs])));
+                    lw.emit(LS::Set(first, LE::B(false)));
+                });
+                LE::Rt(Rt::StrCat, vec![LE::Var(s), LE::S("]".into())])
+            }
             Ty::IntK(IntKind::U64) => LE::Rt(Rt::U64ToS, vec![v]),
             Ty::IntK(_) => LE::Rt(Rt::IntToS, vec![v]),
             Ty::Float => LE::Rt(Rt::FToS, vec![v]),
@@ -1001,7 +1335,7 @@ impl<'a> Lw<'a> {
         use M::*;
         let sp = e.span;
         match m {
-            Sum | Max | Min | MaxBy | MinBy | First | ToA | Each | Reduce | All | Any | Count | Include | Sort => {
+            Sum | Max | Min | MaxBy | MinBy | First | Find | ToA | Each | Reduce | All | Any | Count | Include | Sort => {
                 self.pipeline(m, e, recv.unwrap(), args, blk)
             }
             Pmap => self.pmap(e, recv.unwrap(), blk.unwrap()),
@@ -1058,6 +1392,65 @@ impl<'a> Lw<'a> {
                 let v = self.int_in(v, sp);
                 self.int_out(LE::Rt(Rt::Isqrt, vec![v, LE::Loc(self.loc(sp))]))
             }
+            MapNew | MapGet | MapGetOr | MapSet | MapDel | MapHas | MapSize | MapKeys | MapValues => self.map_op(m, e, recv, args),
+            FromBytes => {
+                let v = self.expr(&args[0]);
+                LE::Rt(Rt::StrFromBytes, vec![v])
+            }
+            Dup => {
+                let r = recv.unwrap();
+                let v = self.expr(r);
+                let el = r.ty.arr_elem().unwrap();
+                self.copy_arr(v, &el)
+            }
+            CopyInto => {
+                let lt = self.lty(&args[0].ty);
+                let d = self.expr(&args[0]);
+                let d = self.tmp_of(d, lt.clone());
+                let s = self.expr(&args[1]);
+                let s = self.bind(s, lt.clone());
+                let n = self.tmp(LTy::I64);
+                let (dl, sl) = (LE::Len(Box::new(LE::Var(d))), LE::Len(Box::new(s.clone())));
+                self.emit(LS::Set(n, LE::Cond(Box::new(LE::Cmp(Op::Lt, Box::new(dl.clone()), Box::new(sl.clone()), LTy::I64)), Box::new(dl), Box::new(sl))));
+                // Through a copy of the source, so overlapping slices work (memmove).
+                let t = self.tmp(lt.clone());
+                self.emit(LS::Set(t, LE::Rt(Rt::ArrCopy, vec![LE::Slice(lt, Box::new(s), Box::new(LE::I(0)), Box::new(LE::Var(n)))])));
+                let el = args[0].ty.arr_elem().unwrap();
+                let i = self.tmp(LTy::I64);
+                self.emit(LS::Set(i, LE::I(0)));
+                let l = self.label();
+                let body = self.sub(|lw| {
+                    lw.emit(LS::If(LE::Cmp(Op::Ge, Box::new(LE::Var(i)), Box::new(LE::Var(n)), LTy::I64), vec![LS::Break(l)], vec![]));
+                    let x = LE::Index { arr: Box::new(LE::Var(t)), idx: Box::new(LE::Var(i)), check: None };
+                    let x = lw.copy_value(x, &el);
+                    lw.emit(LS::SetIndex { arr: d, idx: LE::Var(i), val: x, check: None });
+                    lw.emit(LS::Set(i, LE::Arith(Op::Add, Box::new(LE::Var(i)), Box::new(LE::I(1)), Ovf::Unchecked)));
+                });
+                self.emit(LS::Loop(l, body));
+                self.int_out(LE::Var(n))
+            }
+            ArrayNew if args[1].ty.is_value_array() || matches!(args[1].ty, Ty::Array(_)) => {
+                // A fill holding storage is evaluated once per element, so
+                // the elements don't share it (`[[0; 3]; 3]` is 3 rows).
+                let n = self.expr(&args[0]);
+                let n = self.int_in(n, args[0].span);
+                let n = self.bind(n, LTy::I64);
+                self.emit(LS::If(LE::Cmp(Op::Lt, Box::new(n.clone()), Box::new(LE::I(0)), LTy::I64), vec![LS::Panic("negative array size".into(), self.loc(sp))], vec![]));
+                let lt = self.lty(&e.ty);
+                let a = self.tmp(lt);
+                self.emit(LS::Set(a, LE::ArrWithCap(self.lty(&args[1].ty), Box::new(n.clone()))));
+                let i = self.tmp(LTy::I64);
+                self.emit(LS::Set(i, LE::I(0)));
+                let l = self.label();
+                let body = self.sub(|lw| {
+                    lw.emit(LS::If(LE::Cmp(Op::Ge, Box::new(LE::Var(i)), Box::new(n.clone()), LTy::I64), vec![LS::Break(l)], vec![]));
+                    let x = lw.arg(&args[1]);
+                    lw.emit(LS::Push(a, x));
+                    lw.emit(LS::Set(i, LE::Arith(Op::Add, Box::new(LE::Var(i)), Box::new(LE::I(1)), Ovf::Unchecked)));
+                });
+                self.emit(LS::Loop(l, body));
+                LE::Var(a)
+            }
             ArrayNew => {
                 let n = self.expr(&args[0]);
                 let n = self.int_in(n, args[0].span);
@@ -1083,6 +1476,17 @@ impl<'a> Lw<'a> {
                 let t = self.lty(&e.ty);
                 let vs = args.iter().map(|a| self.arg(a)).collect();
                 LE::Tup(t, vs)
+            }
+            OptPresent => LE::Field(Box::new(self.expr(recv.unwrap())), 0),
+            OptGet => LE::Field(Box::new(self.expr(recv.unwrap())), 1),
+            Unwrap => {
+                let r = recv.unwrap();
+                let v = self.expr(r);
+                let t = self.lty(&r.ty);
+                let v = self.bind(v, t);
+                let absent = LE::Not(Box::new(LE::Field(Box::new(v.clone()), 0)));
+                self.emit(LS::If(absent, vec![LS::Panic("unwrap of none".into(), self.loc(sp))], vec![]));
+                LE::Field(Box::new(v), 1)
             }
             TupleGet(k) => {
                 let v = self.expr(recv.unwrap());
@@ -1163,7 +1567,7 @@ impl<'a> Lw<'a> {
         let mut stages: Vec<&TExpr> = vec![];
         let mut base = recv;
         while let TK::M(m, Some(r), _, _) = &base.kind {
-            if !m.is_stage() || matches!(m, M::Chars | M::Bytes | M::EachIndex | M::EachCons) {
+            if !m.is_stage() || matches!(m, M::Chars | M::Bytes | M::Runes | M::EachIndex | M::EachCons) {
                 break;
             }
             stages.push(base);
@@ -1199,7 +1603,7 @@ impl<'a> Lw<'a> {
     /// Lower `e` (a Seq) to a fresh array local and return a TExpr naming it.
     fn materialize(&mut self, e: &TExpr) -> TExpr {
         let el = match &e.ty {
-            Ty::Seq(t, _) | Ty::Array(t) => (**t).clone(),
+            Ty::Seq(t, _) | Ty::Array(t) | Ty::Fixed(t, _) => (**t).clone(),
             _ => Ty::Int,
         };
         let arr_ty = Ty::arr(el);
@@ -1226,7 +1630,8 @@ impl<'a> Lw<'a> {
         let outer = self.label();
         let out_ty = self.lty(&e.ty);
         let elem_ty = match &e.ty {
-            Ty::Array(t) => self.lty(t),
+            Ty::Array(t) | Ty::Fixed(t, _) => self.lty(t),
+            Ty::Opt(t) if term == Find => self.lty(t),
             _ => out_ty.clone(),
         };
         // Terminal state.
@@ -1254,10 +1659,15 @@ impl<'a> Lw<'a> {
                 Some(v)
             }
             Max | Min | MaxBy | MinBy | First | Reduce => Some(self.tmp(out_ty.clone())),
+            Find => {
+                let v = self.tmp(elem_ty.clone());
+                self.emit(LS::Set(v, zero_le(&elem_ty)));
+                Some(v)
+            }
             Each => None,
             _ => unreachable!(),
         };
-        let have = if matches!(term, Max | Min | MaxBy | MinBy | First | Reduce) {
+        let have = if matches!(term, Max | Min | MaxBy | MinBy | First | Find | Reduce) {
             let h = self.tmp(LTy::Bool);
             self.emit(LS::Set(h, LE::B(false)));
             Some(h)
@@ -1331,7 +1741,7 @@ impl<'a> Lw<'a> {
                     let c = if et == LTy::PInt { LE::PArith(Op::Eq, Box::new(x), Box::new(include_x.clone().unwrap())) } else { LE::Cmp(Op::Eq, Box::new(x), Box::new(include_x.clone().unwrap()), et) };
                     lw.emit(LS::If(c, vec![LS::Set(acc.unwrap(), LE::B(true)), LS::Break(outer)], vec![]));
                 }
-                First => {
+                First | Find => {
                     lw.emit(LS::Set(acc.unwrap(), x));
                     lw.emit(LS::Set(have.unwrap(), LE::B(true)));
                     lw.emit(LS::Break(outer));
@@ -1373,6 +1783,7 @@ impl<'a> Lw<'a> {
                 LE::Var(a)
             }
             Each => LE::Unit,
+            Find => LE::Tup(out_ty.clone(), vec![LE::Var(have.unwrap()), LE::Var(acc.unwrap())]),
             Max | Min | MaxBy | MinBy | First | Reduce => {
                 let what = match term {
                     Max => "max",
@@ -1418,7 +1829,7 @@ impl<'a> Lw<'a> {
     fn seq_elem_lty(&self, base: &TExpr, stages: &[&TExpr]) -> LTy {
         let t = stages.last().map_or(&base.ty, |s| &s.ty);
         match t {
-            Ty::Seq(t, _) | Ty::Array(t) | Ty::Gen(t) => self.lty(t),
+            Ty::Seq(t, _) | Ty::Array(t) | Ty::Fixed(t, _) | Ty::Gen(t) => self.lty(t),
             Ty::Range => self.lty(&Ty::Int),
             _ => LTy::Unit,
         }
@@ -1437,11 +1848,11 @@ impl<'a> Lw<'a> {
                 }
                 LE::I(0)
             }
-            TK::Local(_) if matches!(base.ty, Ty::Array(_)) => {
+            TK::Local(_) if matches!(base.ty, Ty::Array(_) | Ty::Fixed(..)) => {
                 let v = self.expr(base);
                 LE::Len(Box::new(v))
             }
-            TK::M(M::Chars | M::Bytes, Some(s), _, _) => {
+            TK::M(M::Chars | M::Bytes | M::Runes, Some(s), _, _) => {
                 let v = self.expr(s);
                 LE::Rt(Rt::StrLen, vec![v])
             }
@@ -1477,8 +1888,9 @@ impl<'a> Lw<'a> {
         let base_lty = self.lty(&base.ty);
         let promote = self.promote();
         match (&base.kind, &base.ty) {
-            (TK::M(M::Chars | M::Bytes, Some(s), _, _), _) => {
+            (TK::M(M::Chars | M::Bytes | M::Runes, Some(s), _, _), _) => {
                 let chars = matches!(base.kind, TK::M(M::Chars, ..));
+                let runes = matches!(base.kind, TK::M(M::Runes, ..));
                 let sv = self.expr(s);
                 let sv = self.bind(sv, LTy::Str);
                 let i = self.tmp(LTy::I64);
@@ -1495,11 +1907,17 @@ impl<'a> Lw<'a> {
                         lw.emit(LS::Set(x, LE::Rt(Rt::StrByte, vec![sv.clone(), LE::Var(i), LE::Var(cl)])));
                         lw.emit(LS::Set(i, LE::Arith(Op::Add, Box::new(LE::Var(i)), Box::new(LE::Var(cl)), Ovf::Unchecked)));
                         LE::Var(x)
+                    } else if runes {
+                        let cl = lw.tmp(LTy::I64);
+                        lw.emit(LS::Set(cl, LE::Rt(Rt::StrChar, vec![sv.clone(), LE::Var(i)])));
+                        let x = lw.decode_rune(&sv, i, cl);
+                        lw.emit(LS::Set(i, LE::Arith(Op::Add, Box::new(LE::Var(i)), Box::new(LE::Var(cl)), Ovf::Unchecked)));
+                        x
                     } else {
                         let x = lw.tmp(LTy::I64);
                         lw.emit(LS::Set(x, LE::Rt(Rt::StrByte, vec![sv.clone(), LE::Var(i), LE::I(0)])));
                         lw.emit(LS::Set(i, LE::Arith(Op::Add, Box::new(LE::Var(i)), Box::new(LE::I(1)), Ovf::Unchecked)));
-                        lw.int_out(LE::Var(x))
+                        LE::Var(x)
                     };
                     lw.apply(&st, 0, x, None, l, outer, k);
                 });
@@ -1598,7 +2016,29 @@ impl<'a> Lw<'a> {
                 });
                 self.emit(LS::Loop(l, body));
             }
-            (_, Ty::Array(_)) => {
+            (_, Ty::Map(kt, vt)) => {
+                let mv = self.expr(base);
+                let mv = self.bind(mv, base_lty.clone());
+                let tl = LTy::Tup(vec![self.lty(kt), self.lty(vt)]);
+                let l = own_label.unwrap_or_else(|| self.label());
+                // The pipeline loop is the map walk; `break` leaves it.
+                let i = self.tmp(LTy::I64);
+                self.emit(LS::Set(i, LE::I(0)));
+                let body = self.sub(|lw| {
+                    use crate::mapgen::{KEYS, LIVE, VALS};
+                    let n = LE::Len(Box::new(Self::map_hdr(&mv, KEYS)));
+                    lw.emit(LS::If(LE::Cmp(Op::Ge, Box::new(LE::Var(i)), Box::new(n), LTy::I64), vec![LS::Break(l)], vec![]));
+                    let x = lw.tmp(tl.clone());
+                    lw.emit(LS::Set(i, LE::Arith(Op::Add, Box::new(LE::Var(i)), Box::new(LE::I(1)), Ovf::Unchecked)));
+                    let back = LE::Arith(Op::Add, Box::new(LE::Var(i)), Box::new(LE::I(-1)), Ovf::Unchecked);
+                    let at_back = |f| LE::Index { arr: Box::new(Self::map_hdr(&mv, f)), idx: Box::new(back.clone()), check: None };
+                    lw.emit(LS::If(LE::Not(Box::new(at_back(LIVE))), vec![LS::Continue(l)], vec![]));
+                    lw.emit(LS::Set(x, LE::Tup(tl.clone(), vec![at_back(KEYS), at_back(VALS)])));
+                    lw.apply(&st, 0, LE::Var(x), None, l, outer, k);
+                });
+                self.emit(LS::Loop(l, body));
+            }
+            (_, Ty::Array(_) | Ty::Fixed(..)) => {
                 let av = self.expr(base);
                 let av = self.bind(av, base_lty.clone());
                 let el = match &base_lty {
@@ -1673,7 +2113,7 @@ impl<'a> Lw<'a> {
                 let mut inner_stages: Vec<&TExpr> = vec![];
                 let mut src = tail;
                 while let TK::M(mm, Some(r), _, _) = &src.kind {
-                    if !mm.is_stage() || matches!(mm, M::Chars | M::Bytes | M::EachIndex | M::EachCons) {
+                    if !mm.is_stage() || matches!(mm, M::Chars | M::Bytes | M::Runes | M::EachIndex | M::EachCons) {
                         break;
                     }
                     inner_stages.push(src);
@@ -1848,7 +2288,11 @@ fn collect_locals(e: &TExpr, out: &mut Vec<LocalId>) {
             collect_locals(a, out);
             collect_locals(b, out);
         }
-        TK::Neg(x) | TK::Not(x) | TK::Try(x) | TK::Puts(x) => collect_locals(x, out),
+        TK::Neg(x) | TK::Not(x) | TK::Try(x) | TK::Puts(x) | TK::Some(x) => collect_locals(x, out),
+        TK::Slice(a, lo, hi, _) => {
+            collect_locals(a, out);
+            lo.iter().chain(hi.iter()).for_each(|x| collect_locals(x, out));
+        }
         TK::Ternary(a, b, c) => {
             collect_locals(a, out);
             collect_locals(b, out);
@@ -1921,5 +2365,21 @@ fn out_of_range(k: IntKind, r: LE) -> LE {
     } else {
         // Unsigned: anything above max, including "negative" results.
         LE::Prim(Prim::ULt, vec![LE::I(k.max() as i64), r])
+    }
+}
+
+/// The zero value of a LIR type, as an expression.
+fn zero_le(t: &LTy) -> LE {
+    match t {
+        LTy::I64 | LTy::IntK(_) => LE::I(0),
+        LTy::F64 => LE::F(0.0),
+        LTy::Bool => LE::B(false),
+        LTy::Unit => LE::Unit,
+        LTy::Str => LE::S(String::new()),
+        LTy::PInt => LE::ToP(Box::new(LE::I(0))),
+        LTy::Arr(e) => LE::ArrWithCap((**e).clone(), Box::new(LE::I(0))),
+        LTy::Tup(ts) => LE::Tup(t.clone(), ts.iter().map(zero_le).collect()),
+        LTy::Range => LE::Range(Box::new(LE::I(0)), Box::new(LE::I(0)), false),
+        LTy::Gen(_) => panic!("an optional generator has no zero value yet"),
     }
 }

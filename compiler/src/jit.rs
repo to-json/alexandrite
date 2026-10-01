@@ -36,7 +36,7 @@ mod rt {
         alxj_p_add, alxj_p_sub, alxj_p_mul, alxj_p_div, alxj_p_rem, alxj_p_pow, alxj_p_cmp, alxj_p_even, alxj_p_to_i64,
         alxj_p_to_s, alxj_p_ndigits, alxj_p_digits, alxj_puts_pint,
         alxj_puts_f64, alxj_f_to_s, alxj_f_fmt, alxj_f_to_i, alxj_str_cat,
-        alxj_puts_u64, alxj_u64_to_s, alxj_int_fmt, alxj_f_to_u64, alxj_rune_to_s,
+        alxj_puts_u64, alxj_u64_to_s, alxj_int_fmt, alxj_f_to_u64, alxj_rune_to_s, alxj_str_from_bytes,
     );
 }
 type RtFn = unsafe extern "C" fn();
@@ -360,7 +360,7 @@ impl Fx<'_, '_, '_> {
 
     fn rt_bool(&mut self, f: RtFn, args: &[Value]) -> Value {
         let r = self.call_rt(f, args, true).unwrap();
-        self.b.ins().icmp_imm(IntCC::NotEqual, r, 0)
+        self.b.ins().icmp_imm_s(IntCC::NotEqual, r, 0)
     }
 
     fn fref(&mut self, id: FuncId) -> FuncRef {
@@ -675,7 +675,7 @@ impl Fx<'_, '_, '_> {
                 let (grow, cont) = (self.b.create_block(), self.b.create_block());
                 self.b.ins().brif(full, grow, &[], cont, &[]);
                 self.b.switch_to_block(grow);
-                let dbl = self.b.ins().ishl_imm(a[2], 1);
+                let dbl = self.b.ins().ishl_imm_s(a[2], 1);
                 let four = self.ic(4);
                 let nc = self.b.ins().select(a[2], dbl, four);
                 let ez = self.ic(esz);
@@ -683,10 +683,10 @@ impl Fx<'_, '_, '_> {
                 self.set(*v, &[np, a[1], nc]);
                 self.enter(cont);
                 let a = self.get(*v);
-                let off = self.b.ins().imul_imm(a[1], esz);
+                let off = self.b.ins().imul_imm_s(a[1], esz);
                 let addr = self.b.ins().iadd(a[0], off);
                 self.store(&et, &x, addr, 0);
-                let n1 = self.b.ins().iadd_imm(a[1], 1);
+                let n1 = self.b.ins().iadd_imm_s(a[1], 1);
                 self.set(*v, &[a[0], n1, a[2]]);
             }
             LS::Eval(e) => {
@@ -767,7 +767,7 @@ impl Fx<'_, '_, '_> {
                     _ => {
                         let out = self.slot(8);
                         let ok = self.rt_bool(rt::alxj_try_pow, &[a, b, out]);
-                        let bad = self.b.ins().icmp_imm(IntCC::Equal, ok, 0);
+                        let bad = self.b.ins().icmp_imm_s(IntCC::Equal, ok, 0);
                         self.fail_if(bad, path, |s| ErrSrc::Overflow(s.cstr(loc)));
                         self.b.ins().load(I64, MemFlagsData::trusted(), out, 0)
                     }
@@ -787,7 +787,7 @@ impl Fx<'_, '_, '_> {
                 let fr = self.fref(id);
                 let call = self.b.ins().call(fr, &av);
                 let ok = self.b.inst_results(call)[0];
-                let bad = self.b.ins().icmp_imm(IntCC::Equal, ok, 0);
+                let bad = self.b.ins().icmp_imm_s(IntCC::Equal, ok, 0);
                 self.fail_if(bad, path, |_| ErrSrc::At(errp));
                 if let (Some(d), Some(out)) = (dst, out) {
                     let vals = self.load(&callee.ret.clone(), out, 0);
@@ -801,7 +801,7 @@ impl Fx<'_, '_, '_> {
                 let out = self.slot(16);
                 let errp = self.slot(ERR_SIZE);
                 let ok = self.rt_bool(rt::alxj_file_read, &[ps, l, out, errp]);
-                let bad = self.b.ins().icmp_imm(IntCC::Equal, ok, 0);
+                let bad = self.b.ins().icmp_imm_s(IntCC::Equal, ok, 0);
                 self.fail_if(bad, path, |_| ErrSrc::At(errp));
                 let vals = self.load(&LTy::Str, out, 0);
                 self.set(*dst, &vals);
@@ -853,7 +853,7 @@ impl Fx<'_, '_, '_> {
                 let fr = self.fref(wid);
                 let wf = self.b.ins().func_addr(I64, fr);
                 let ok = self.rt_bool(rt::alxj_pmap, &[a[0], a[1], ie, outp, oe, wf, errp]);
-                let bad = self.b.ins().icmp_imm(IntCC::Equal, ok, 0);
+                let bad = self.b.ins().icmp_imm_s(IntCC::Equal, ok, 0);
                 self.fail_if(bad, path, |_| ErrSrc::At(errp));
                 self.set(*dst, &[outp, a[1], a[1]]);
             }
@@ -930,7 +930,7 @@ impl Fx<'_, '_, '_> {
             LE::Cond(_, a, _) => self.ty(a),
             LE::Call(f, _) => self.d.funcs[f.as_str()].1.ret.clone(),
             LE::Rt(rt, args) => match rt {
-                Rt::IntToS | Rt::PIntToS | Rt::StrRev | Rt::StrDelete | Rt::FToS | Rt::FFmt | Rt::StrCat | Rt::U64ToS | Rt::IntFmt | Rt::RuneToS => LTy::Str,
+                Rt::IntToS | Rt::PIntToS | Rt::StrRev | Rt::StrDelete | Rt::FToS | Rt::FFmt | Rt::StrCat | Rt::U64ToS | Rt::IntFmt | Rt::RuneToS | Rt::StrFromBytes => LTy::Str,
                 Rt::IntToF | Rt::FSqrt | Rt::FAbs => LTy::F64,
                 Rt::StrByte => {
                     if matches!(args[2], LE::I(0)) {
@@ -974,18 +974,18 @@ impl Fx<'_, '_, '_> {
             let loc = loc.to_string();
             self.cold_if(oob, |s| s.panic("index out of bounds", &loc));
         }
-        let off = self.b.ins().imul_imm(i, lay(et).size as i64);
+        let off = self.b.ins().imul_imm_s(i, lay(et).size as i64);
         self.b.ins().iadd(a[0], off)
     }
 
     /// Division by zero, or MIN / -1 (Div only): the cases that fail.
     fn div_bad(&mut self, op: Op, a: Value, b: Value) -> Value {
-        let z = self.b.ins().icmp_imm(IntCC::Equal, b, 0);
+        let z = self.b.ins().icmp_imm_s(IntCC::Equal, b, 0);
         if op == Op::Rem {
             return z;
         }
-        let m1 = self.b.ins().icmp_imm(IntCC::Equal, b, -1);
-        let mn = self.b.ins().icmp_imm(IntCC::Equal, a, i64::MIN);
+        let m1 = self.b.ins().icmp_imm_s(IntCC::Equal, b, -1);
+        let mn = self.b.ins().icmp_imm_s(IntCC::Equal, a, i64::MIN);
         let both = self.b.ins().band(m1, mn);
         self.b.ins().bor(z, both)
     }
@@ -994,7 +994,7 @@ impl Fx<'_, '_, '_> {
     /// not -1 with a == MIN for Div.
     fn floor_divrem(&mut self, op: Op, a: Value, b: Value) -> Value {
         // Divide by 1 instead of -1: avoids the machine trap on MIN % -1.
-        let m1 = self.b.ins().icmp_imm(IntCC::Equal, b, -1);
+        let m1 = self.b.ins().icmp_imm_s(IntCC::Equal, b, -1);
         let one = self.ic(1);
         let bs = self.b.ins().select(m1, one, b);
         if op == Op::Div {
@@ -1037,24 +1037,24 @@ impl Fx<'_, '_, '_> {
                 if let Some(k) = konst.filter(|k| *k > 1 && (*k as u64).is_power_of_two()) {
                     // Truncating division by 2^s: bias negatives by 2^s - 1, then shift.
                     let sh = k.trailing_zeros() as i64;
-                    let sign = self.b.ins().sshr_imm(av, 63);
-                    let bias = self.b.ins().ushr_imm(sign, 64 - sh);
+                    let sign = self.b.ins().sshr_imm_s(av, 63);
+                    let bias = self.b.ins().ushr_imm_s(sign, 64 - sh);
                     let biased = self.b.ins().iadd(av, bias);
-                    let q = self.b.ins().sshr_imm(biased, sh);
+                    let q = self.b.ins().sshr_imm_s(biased, sh);
                     return if op == Op::Div {
                         q
                     } else {
-                        let qk = self.b.ins().ishl_imm(q, sh);
+                        let qk = self.b.ins().ishl_imm_s(q, sh);
                         self.b.ins().isub(av, qk)
                     };
                 }
                 if konst.is_none_or(|k| k == 0 || k == -1) {
-                    let z = self.b.ins().icmp_imm(IntCC::Equal, bv, 0);
+                    let z = self.b.ins().icmp_imm_s(IntCC::Equal, bv, 0);
                     let loc = loc.to_string();
                     self.cold_if(z, |s| s.panic("division by zero", &loc));
                     if op == Op::Div {
-                        let m1 = self.b.ins().icmp_imm(IntCC::Equal, bv, -1);
-                        let mn = self.b.ins().icmp_imm(IntCC::Equal, av, i64::MIN);
+                        let m1 = self.b.ins().icmp_imm_s(IntCC::Equal, bv, -1);
+                        let mn = self.b.ins().icmp_imm_s(IntCC::Equal, av, i64::MIN);
                         let both = self.b.ins().band(m1, mn);
                         self.overflow_if(both, &loc);
                     }
@@ -1209,7 +1209,7 @@ impl Fx<'_, '_, '_> {
                     Op::Pow => self.pint_call(rt::alxj_p_pow, Some(&p), &[a, b], Some("pow")),
                     _ => {
                         let c = self.pint_call(rt::alxj_p_cmp, None, &[a, b], None)[0];
-                        vec![self.b.ins().icmp_imm(Self::icmp_of(*op), c, 0)]
+                        vec![self.b.ins().icmp_imm_s(Self::icmp_of(*op), c, 0)]
                     }
                 }
             }
@@ -1224,22 +1224,22 @@ impl Fx<'_, '_, '_> {
                             let p = self.spill(&LTy::Str, &v);
                             let r = self.call_rt(rt::alxj_str_is_pal, &[p], true).unwrap();
                             let cc = if *op == Op::Eq { IntCC::NotEqual } else { IntCC::Equal };
-                            return vec![self.b.ins().icmp_imm(cc, r, 0)];
+                            return vec![self.b.ins().icmp_imm_s(cc, r, 0)];
                         }
                         let (av, bv) = (self.e(a), self.e(b));
                         let (pa, pb) = (self.spill(&LTy::Str, &av), self.spill(&LTy::Str, &bv));
                         if matches!(op, Op::Eq | Op::Ne) {
                             let r = self.call_rt(rt::alxj_str_eq, &[pa, pb], true).unwrap();
                             let cc = if *op == Op::Eq { IntCC::NotEqual } else { IntCC::Equal };
-                            vec![self.b.ins().icmp_imm(cc, r, 0)]
+                            vec![self.b.ins().icmp_imm_s(cc, r, 0)]
                         } else {
                             let r = self.call_rt(rt::alxj_str_cmp, &[pa, pb], true).unwrap();
-                            vec![self.b.ins().icmp_imm(Self::icmp_of(*op), r, 0)]
+                            vec![self.b.ins().icmp_imm_s(Self::icmp_of(*op), r, 0)]
                         }
                     }
                     LTy::PInt => {
                         let c = self.pint_call(rt::alxj_p_cmp, None, &[a, b], None)[0];
-                        vec![self.b.ins().icmp_imm(Self::icmp_of(*op), c, 0)]
+                        vec![self.b.ins().icmp_imm_s(Self::icmp_of(*op), c, 0)]
                     }
                     LTy::F64 => {
                         let (av, bv) = (self.e1(a), self.e1(b));
@@ -1262,14 +1262,14 @@ impl Fx<'_, '_, '_> {
             LE::Neg(x, ovf) => {
                 let v = self.e1(x);
                 if let Ovf::Panic(loc) = ovf {
-                    let mn = self.b.ins().icmp_imm(IntCC::Equal, v, i64::MIN);
+                    let mn = self.b.ins().icmp_imm_s(IntCC::Equal, v, i64::MIN);
                     self.overflow_if(mn, &loc.clone());
                 }
                 vec![self.b.ins().ineg(v)]
             }
             LE::Not(x) => {
                 let v = self.e1(x);
-                vec![self.b.ins().icmp_imm(IntCC::Equal, v, 0)]
+                vec![self.b.ins().icmp_imm_s(IntCC::Equal, v, 0)]
             }
             LE::Cond(c, a, b) => {
                 let t = self.ty(a);
@@ -1329,7 +1329,7 @@ impl Fx<'_, '_, '_> {
                 let ez = self.ic(lay(t).size as i64);
                 let p = self.call_rt(rt::alxj_arr_alloc, &[nv, ez], true).unwrap();
                 let z = self.ic(0);
-                let neg = self.b.ins().icmp_imm(IntCC::SignedLessThan, nv, 0);
+                let neg = self.b.ins().icmp_imm_s(IntCC::SignedLessThan, nv, 0);
                 let cap = self.b.ins().select(neg, z, nv);
                 vec![p, z, cap]
             }
@@ -1338,7 +1338,7 @@ impl Fx<'_, '_, '_> {
                 let av = self.e(a);
                 let s = self.e1(start);
                 let l = self.e1(len);
-                let off = self.b.ins().imul_imm(s, esz);
+                let off = self.b.ins().imul_imm_s(s, esz);
                 let p = self.b.ins().iadd(av[0], off);
                 let z = self.ic(0);
                 vec![p, l, z]
@@ -1448,12 +1448,12 @@ impl Fx<'_, '_, '_> {
             }
             Rt::Even => {
                 let v = self.e1(&args[0]);
-                let low = self.b.ins().band_imm(v, 1);
-                vec![self.b.ins().icmp_imm(IntCC::Equal, low, 0)]
+                let low = self.b.ins().band_imm_s(v, 1);
+                vec![self.b.ins().icmp_imm_s(IntCC::Equal, low, 0)]
             }
             Rt::PEven => {
                 let r = self.pint_call(rt::alxj_p_even, None, &[&args[0]], None)[0];
-                vec![self.b.ins().icmp_imm(IntCC::NotEqual, r, 0)]
+                vec![self.b.ins().icmp_imm_s(IntCC::NotEqual, r, 0)]
             }
             Rt::IntToF => {
                 let v = self.e1(&args[0]);
@@ -1471,6 +1471,12 @@ impl Fx<'_, '_, '_> {
             Rt::FAbs => {
                 let v = self.e1(&args[0]);
                 vec![self.b.ins().fabs(v)]
+            }
+            Rt::StrFromBytes => {
+                let a = self.e(&args[0]);
+                let out = self.slot(16);
+                self.call_rt(rt::alxj_str_from_bytes, &[out, a[0], a[1]], false);
+                self.load(&s, out, 0)
             }
             Rt::U64ToS | Rt::RuneToS => {
                 let v = self.e1(&args[0]);

@@ -57,6 +57,8 @@ pub enum Kw {
     In,
     Case,
     Defer,
+    /// `none`: the absent value of a `T?`
+    None,
 }
 
 #[derive(Debug, Clone)]
@@ -68,8 +70,8 @@ pub struct Token {
 }
 
 /// Longest first: the lexer takes the first match.
-const OPS: [&str; 51] = [
-    "&^=", "+%=", "-%=", "*%=", "<<=", ">>=", "**=", "...", "<=>", "**", "==", "=>", "!=", "<=", ">=", "&&", "||", "&^", "<<", ">>", "..",
+const OPS: [&str; 52] = [
+    "&^=", "+%=", "-%=", "*%=", "<<=", ">>=", "**=", "...", "<=>", "**", "==", "=>", "!=", "<=", ">=", "&&", "||", "&^", "<<", ">>", "..", "?.",
     "+=", "-=", "*=", "/=", "%=", "&=", "|=", "^=", "+%", "-%", "*%", "->", "&:", "+", "-", "*", "/", "%", "<", ">", "=", "!", "?",
     ":", ".", ",", ";", "|", "&", "^",
 ];
@@ -238,9 +240,10 @@ pub fn lex_at(file: u32, src: &str, base: u32) -> Result<Vec<Token>, Diag> {
             }
             // `even?`, `strip!`: a trailing ? or ! belongs to the name unless it
             // starts `!=` / `?:`-style punctuation.
+            // `x?.f` is optional chaining, so `?.` is never part of a name.
             if i < b.len() && !b[start].is_ascii_uppercase() && (b[i] == b'?' || b[i] == b'!') && b.get(i + 1) != Some(&b'=') {
                 let next = b.get(i + 1).copied().unwrap_or(b' ');
-                if b[i] == b'!' || next != b':' {
+                if b[i] == b'!' || (next != b':' && next != b'.') {
                     i += 1;
                 }
             }
@@ -266,6 +269,7 @@ pub fn lex_at(file: u32, src: &str, base: u32) -> Result<Vec<Token>, Diag> {
                 "in" => Tok::Kw(Kw::In),
                 "case" => Tok::Kw(Kw::Case),
                 "defer" => Tok::Kw(Kw::Defer),
+                "none" => Tok::Kw(Kw::None),
                 w if w.as_bytes()[0].is_ascii_uppercase() => Tok::Const(w.to_string()),
                 w => Tok::Ident(w.to_string()),
             };

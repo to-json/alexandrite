@@ -101,3 +101,4 @@ void alxj_u64_to_s(AlxStr *out, int64_t v) { *out = alx_u64_to_s(v); }
 void alxj_int_fmt(AlxStr *out, int64_t v, int64_t base, int64_t upper, int64_t uns) { *out = alx_int_fmt(v, base, upper != 0, uns != 0); }
 int64_t alxj_f_to_u64(double x, const char *loc) { return alx_f_to_u64(x, loc); }
 void alxj_rune_to_s(AlxStr *out, int64_t r) { *out = alx_rune_to_s(r); }
+void alxj_str_from_bytes(AlxStr *out, const uint8_t *p, int64_t n) { *out = alx_str_from_bytes(p, n); }

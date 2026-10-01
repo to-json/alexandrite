@@ -6,7 +6,7 @@ use crate::ast::{BinOp, IntKind};
 use crate::tast::ConstVal;
 use num_bigint::BigInt;
 use num_rational::BigRational;
-use num_traits::{One, Signed, ToPrimitive, Zero};
+use num_traits::{Signed, ToPrimitive, Zero};
 
 /// The exact value of a decimal float literal (`4.84143e+00`, `0.1`).
 pub fn parse_float(text: &str) -> Option<BigRational> {

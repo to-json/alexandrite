@@ -82,6 +82,7 @@ const RT: &[(&str, &str)] = &[
     ("alxr_int_fmt", "jjii>"),
     ("alxr_f_to_u64", "fjj>j"),
     ("alxr_rune_to_s", "j>"),
+    ("alxr_str_from_bytes", "jj>"),
 ];
 
 fn sig_of(s: &str) -> (Vec<ValType>, Vec<ValType>) {
@@ -1210,7 +1211,7 @@ impl<'c, 'p> Fx<'c, 'p> {
             LE::Cond(_, a, _) => self.ty(a),
             LE::Call(f, _) => self.cx.funcs[f.as_str()].1.ret.clone(),
             LE::Rt(r, args) => match r {
-                Rt::IntToS | Rt::PIntToS | Rt::StrRev | Rt::StrDelete | Rt::FToS | Rt::FFmt | Rt::StrCat | Rt::U64ToS | Rt::IntFmt | Rt::RuneToS => LTy::Str,
+                Rt::IntToS | Rt::PIntToS | Rt::StrRev | Rt::StrDelete | Rt::FToS | Rt::FFmt | Rt::StrCat | Rt::U64ToS | Rt::IntFmt | Rt::RuneToS | Rt::StrFromBytes => LTy::Str,
                 Rt::IntToF | Rt::FSqrt | Rt::FAbs => LTy::F64,
                 Rt::StrByte => {
                     if matches!(args[2], LE::I(0)) {
@@ -1697,6 +1698,12 @@ impl<'c, 'p> Fx<'c, 'p> {
             Rt::RuneToS => call_ret(self, "alxr_rune_to_s", 2),
             Rt::FToU64 => call(self, "alxr_f_to_u64"),
             Rt::FFmt => call_ret(self, "alxr_f_fmt", 2),
+            Rt::StrFromBytes => {
+                let v = self.eval_locals(&args[0]);
+                self.ins().local_get(v[0]).local_get(v[1]);
+                self.rt("alxr_str_from_bytes");
+                self.ret_words(2);
+            }
             Rt::StrCat => {
                 let p = self.local(W);
                 self.ins().i64_const(16 * args.len() as i64);

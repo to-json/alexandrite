@@ -229,6 +229,7 @@ AlxStr alx_u64_to_s(int64_t bits);
 AlxStr alx_int_fmt(int64_t v, int64_t base, bool upper, bool is_u64);
 int64_t alx_f_to_u64(double x, const char *loc);
 AlxStr alx_rune_to_s(int64_t r);
+AlxStr alx_str_from_bytes(const uint8_t *p, int64_t n);
 void alx_puts_u64(int64_t bits);
 Arr_PInt alx_p_digits(AlxPInt a, const char *loc);
 

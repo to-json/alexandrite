@@ -149,6 +149,8 @@ pub enum Rt {
     FToU64,
     /// A Rune as a one-character Str (`%c`).
     RuneToS,
+    /// A Str holding a copy of a [U8]'s bytes.
+    StrFromBytes,
 }
 
 /// Primitive integer operations on i64 registers. The lowering builds Go's
@@ -274,4 +276,6 @@ pub struct LProgram {
     pub workers: Vec<LWorker>,
     /// Uses bignums: link the bignum runtime.
     pub uses_pint: bool,
+    /// Map instantiations generated so far (see mapgen), by K/V.
+    pub maps: Vec<String>,
 }

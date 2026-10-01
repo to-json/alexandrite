@@ -17,7 +17,7 @@ fn rty(t: &LTy) -> String {
         LTy::Bool => "bool".into(),
         LTy::Str => "Str".into(),
         LTy::Unit => "()".into(),
-        LTy::Arr(t) => format!("Vec<{}>", rty(t)),
+        LTy::Arr(t) => format!("Sl<{}>", rty(t)),
         LTy::Tup(ts) => format!("({},)", ts.iter().map(rty).collect::<Vec<_>>().join(", ")),
         LTy::Range => "AlxRange".into(),
         LTy::Gen(t) => format!("Gen<{}>", rty(t)),
@@ -170,27 +170,37 @@ impl FnEmit<'_> {
                     Some(l) => format!("idx({i}, v{arr}.len(), {})", loc(l)),
                     None => format!("({i}) as usize"),
                 };
-                self.line(&format!("{{ let i_ = {at}; v{arr}[i_] = {x}; }}"));
+                self.line(&format!("{{ let x_ = {x}; let i_ = {at}; v{arr}.with(i_, |e_| *e_ = x_); }}"));
             }
             LS::SetPlace { var, steps, val } => {
                 // Indices first (each bounds-checked against the array it
                 // indexes), then one write: keeps the borrow checker happy.
+                // Slices write through `with` (shared storage), nesting one
+                // closure per index step.
+                // Index values are computed before any lock is taken.
                 let mut code = format!("{{ let x_ = {};", self.e(val));
+                for (k, st) in steps.iter().enumerate() {
+                    if let Step::Index(i, _) = st {
+                        code.push_str(&format!(" let j{k}_ = {};", self.e(i)));
+                    }
+                }
                 let mut lv = format!("v{var}");
+                let mut opens = 0;
                 for (k, st) in steps.iter().enumerate() {
                     lv = match st {
-                        Step::Index(i, check) => {
+                        Step::Index(_, check) => {
                             let at = match check {
-                                Some(l) => format!("idx({}, {lv}.len(), {})", self.e(i), loc(l)),
-                                None => format!("({}) as usize", self.e(i)),
+                                Some(l) => format!("idx(j{k}_, {lv}.len(), {})", loc(l)),
+                                None => format!("j{k}_ as usize"),
                             };
-                            code.push_str(&format!(" let i{k}_ = {at};"));
-                            format!("{lv}[i{k}_]")
+                            code.push_str(&format!(" let i{k}_ = {at}; {lv}.with(i{k}_, |e{k}_| {{"));
+                            opens += 1;
+                            format!("(*e{k}_)")
                         }
                         Step::Field(f) => format!("{lv}.{f}"),
                     };
                 }
-                self.line(&format!("{code} {lv} = x_; }}"));
+                self.line(&format!("{code} {lv} = x_; {} }}", "});".repeat(opens)));
             }
             LS::FailIf { cond, loc: l, path } => {
                 let c = self.e(cond);
@@ -478,9 +488,9 @@ impl FnEmit<'_> {
                     Rt::PNDigits => format!("({}).to_s().len()", a[0]),
                     Rt::Isqrt => call("isqrt"),
                     Rt::Digits => call("digits"),
-                    Rt::PDigits => format!("({}).digits({})", a[0], a[1]),
+                    Rt::PDigits => format!("Sl::from(({}).digits({}))", a[0], a[1]),
                     Rt::SatAdd => call("sat_add"),
-                    Rt::ArrCopy => a[0].clone(),
+                    Rt::ArrCopy => format!("Sl::from(({}).to_vec())", a[0]),
                     Rt::Even => call("even"),
                     Rt::PEven => format!("({}).even()", a[0]),
                     Rt::PToI64 => format!("({}).to_i64({})", a[0], a[1]),
@@ -495,24 +505,25 @@ impl FnEmit<'_> {
                     Rt::IntFmt => call("int_fmt"),
                     Rt::FToU64 => call("f_to_u64"),
                     Rt::RuneToS => call("rune_to_s"),
+                    Rt::StrFromBytes => format!("Str(({}).to_vec().into_iter().map(|b| b as u8).collect::<Vec<u8>>().into())", a[0]),
                 }
             }
             LE::Index { arr, idx, check } => {
                 let p = self.place(arr);
                 let i = self.e(idx);
                 match check {
-                    Some(l) => format!("{p}[idx({i}, {p}.len(), {})].clone()", loc(l)),
-                    None => format!("{p}[({i}) as usize].clone()"),
+                    Some(l) => format!("{p}.get(idx({i}, {p}.len(), {}))", loc(l)),
+                    None => format!("{p}.get(({i}) as usize)"),
                 }
             }
             LE::Len(x) => format!("({}.len() as i64)", self.place(x)),
-            LE::ArrLit(_, vs) => format!("vec![{}]", vs.iter().map(|x| self.e(x)).collect::<Vec<_>>().join(", ")),
+            LE::ArrLit(_, vs) => format!("Sl::from(vec![{}])", vs.iter().map(|x| self.e(x)).collect::<Vec<_>>().join(", ")),
             LE::ArrNew(_, n, fill, l) => format!("arr_new({}, {}, {})", self.e(n), self.e(fill), loc(l)),
-            LE::ArrWithCap(_, n) => format!("Vec::with_capacity(cap({}))", self.e(n)),
+            LE::ArrWithCap(_, n) => format!("Sl::with_cap(cap({}))", self.e(n)),
             LE::Slice(_, a, start, len) => {
                 let p = self.place(a);
                 let (s, n) = (self.e(start), self.e(len));
-                format!("{p}[({s}) as usize..(({s}) + ({n})) as usize].to_vec()")
+                format!("{p}.slice(({s}) as usize, ({n}) as usize)")
             }
             LE::Range(lo, hi, ex) => format!("AlxRange {{ lo: {}, hi: {}, excl: {ex} }}", self.e(lo), self.e(hi)),
             LE::RangeField(r, k) => format!("{}.{}", self.place(r), ["lo", "hi", "excl"][*k as usize]),

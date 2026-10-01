@@ -17,8 +17,15 @@ pub enum Ty {
     Bool,
     Str,
     Unit,
+    /// `[T]`: a slice (a window onto shared storage).
     Array(Box<Ty>),
+    /// `[T; N]`: a fixed-length array, a value (copied on assignment).
+    Fixed(Box<Ty>, u64),
+    /// `Map[K, V]`: ordered (insertion order), shared like a Go map.
+    Map(Box<Ty>, Box<Ty>),
     Tuple(Vec<Ty>),
+    /// `T?`: a T or nothing (no nil anywhere else).
+    Opt(Box<Ty>),
     /// A user struct (a value): its name and fields, in order.
     Struct(String, Vec<(String, Ty)>),
     /// Range[Int]
@@ -46,10 +53,13 @@ impl Ty {
             Ty::IntK(k) => k.name().into(),
             Ty::Float => "Float".into(),
             Ty::Struct(n, _) => n.clone(),
+            Ty::Opt(t) => format!("{}?", t.show()),
             Ty::Bool => "Bool".into(),
             Ty::Str => "Str".into(),
             Ty::Unit => "nil".into(),
-            Ty::Array(t) => format!("Array[{}]", t.show()),
+            Ty::Array(t) => format!("[{}]", t.show()),
+            Ty::Fixed(t, n) => format!("[{}; {n}]", t.show()),
+            Ty::Map(k, v) => format!("Map[{}, {}]", k.show(), v.show()),
             Ty::Tuple(ts) => format!("({})", ts.iter().map(Ty::show).collect::<Vec<_>>().join(", ")),
             Ty::Range => "Range[Int]".into(),
             Ty::Seq(t, true) => format!("Lazy[{}]", t.show()),
@@ -63,8 +73,9 @@ impl Ty {
     pub fn has_var(&self) -> bool {
         match self {
             Ty::Var(_) => true,
-            Ty::Array(t) | Ty::Seq(t, _) | Ty::Gen(t) | Ty::Yielder(t) => t.has_var(),
+            Ty::Array(t) | Ty::Fixed(t, _) | Ty::Seq(t, _) | Ty::Gen(t) | Ty::Yielder(t) | Ty::Opt(t) => t.has_var(),
             Ty::Tuple(ts) => ts.iter().any(Ty::has_var),
+            Ty::Map(k, v) => k.has_var() || v.has_var(),
             _ => false,
         }
     }
@@ -78,6 +89,23 @@ impl Ty {
     }
     pub fn of_kind(k: IntKind) -> Ty {
         if k == IntKind::I64 { Ty::Int } else { Ty::IntK(k) }
+    }
+    /// The element type of a slice or fixed array.
+    pub fn arr_elem(&self) -> Option<Ty> {
+        match self {
+            Ty::Array(t) | Ty::Fixed(t, _) => Some((**t).clone()),
+            _ => None,
+        }
+    }
+    /// Copied on assignment: fixed arrays, and structs/tuples holding one.
+    pub fn is_value_array(&self) -> bool {
+        match self {
+            Ty::Fixed(..) => true,
+            Ty::Struct(_, fs) => fs.iter().any(|(_, t)| t.is_value_array()),
+            Ty::Tuple(ts) => ts.iter().any(Ty::is_value_array),
+            Ty::Opt(t) => t.is_value_array(),
+            _ => false,
+        }
     }
     pub fn field(&self, name: &str) -> Option<(usize, Ty)> {
         match self {
@@ -162,7 +190,34 @@ pub enum M {
     Sqrt,
     /// `Name.new(fields...)`
     StructNew,
+    /// T? → Bool
+    OptPresent,
+    /// T? → T, unchecked (only after a presence test)
+    OptGet,
+    /// T? → T, panics on none
+    Unwrap,
     ArrayNew,
+    /// `xs.dup`: a copy with its own storage.
+    Dup,
+    /// `Str.from_bytes(xs)`.
+    FromBytes,
+    /// `copy(dst, src)`: Go's copy, returns the count.
+    CopyInto,
+    /// `s.runes`: the code points of a Str (U+FFFD for invalid bytes).
+    Runes,
+    /// Maps: `{k => v, ...}` (args: k1, v1, k2, v2, ...), `m[k]` (V?),
+    /// `m.fetch(k, d)`, `m[k] = v`, `delete` (V?), `key?`, `size`, `keys`, `values`.
+    /// `find { pred }` → T? (a select stage, then this terminal).
+    Find,
+    MapNew,
+    MapGet,
+    MapGetOr,
+    MapSet,
+    MapDel,
+    MapHas,
+    MapSize,
+    MapKeys,
+    MapValues,
     FileRead,
     EnumNew,
     Loop,
@@ -171,7 +226,7 @@ pub enum M {
 impl M {
     pub fn is_stage(self) -> bool {
         use M::*;
-        matches!(self, Select | Reject | Map | FlatMap | TakeWhile | Drop | Take | EachWithIndex | Lazy | EachIndex | EachCons | Chars | Bytes)
+        matches!(self, Select | Reject | Map | FlatMap | TakeWhile | Drop | Take | EachWithIndex | Lazy | EachIndex | EachCons | Chars | Bytes | Runes)
     }
 }
 
@@ -201,6 +256,8 @@ pub enum TK {
     Ternary(Box<TExpr>, Box<TExpr>, Box<TExpr>),
     Range(Box<TExpr>, Box<TExpr>, bool),
     Index(Box<TExpr>, Box<TExpr>),
+    /// `a[lo..hi]` / `a[lo...hi]` on a slice, fixed array or Str (ends optional).
+    Slice(Box<TExpr>, Option<Box<TExpr>>, Option<Box<TExpr>>, bool),
     Call(FuncId, Vec<TExpr>),
     /// Builtin method: receiver, args, block.
     M(M, Option<Box<TExpr>>, Vec<TExpr>, Option<Box<TBlock>>),
@@ -213,6 +270,10 @@ pub enum TK {
     Format(Vec<FmtPiece>, Vec<TExpr>),
     /// Statements whose value is the last one's (a `case` arm, a desugaring).
     Seq(Vec<TStmt>),
+    /// The absent value of a T?.
+    None,
+    /// A present T?.
+    Some(Box<TExpr>),
 }
 
 #[derive(Clone, Debug, PartialEq)]

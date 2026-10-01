@@ -4,10 +4,32 @@ The Ruby of Rust: Ruby-feel syntax, Rust's type construction, and no tracing GC.
 
 ## Settled
 
-- **Backend:** emit Rust source and compile it in one rustc build. Keep the IR separate from the backend so it can be swapped. Move to MIR only when the expressiveness gap hurts (probe 04: custom MIR works one function at a time, and the `built` dialect still borrow-checks).
+- **Architecture** (revised 2026-10-01, replacing "emit Rust source"):
+  ```
+  .alx → front end (parsing, types, purity, regions, moves: OUR checker)
+       → Alexandrite IR  (language-specific optimizations live here)
+       → C backend: the main one. Fast compiler for debug builds; clang/gcc for release.
+       → Rust backend: a test oracle in CI, plus the bootstrap path.
+       → later: Cranelift or QBE.
+  ```
+  - **Why:** we don't pay for rustc on every build, and we control the whole stack. Optimizations that depend on knowing the language (purity, pool lifetimes, size rules, fusion, destination-passing) run on our IR before any backend sees the code. LLVM and GCC still handle register allocation, instruction selection and vectorization.
+  - **Safety:** our checker is the authority. It's simpler than Rust's because values don't escape as references: move checking is flow analysis, and pools and handles are already the front end's job (probe 07). In CI, the Rust backend's output is checked by rustc. **If rustc rejects code our checker accepted, that's a bug in our checker.**
+  - **Rules for faithful C** (probe 10): emit every runtime check (bounds, overflow); arithmetic is defined (`-fwrapv` or checked builtins); drops happen at the IR's explicit points; no type punning except through `memcpy`; panic means abort. **Stack frames are capped by the IR**, with large values in pools and our own probes for large frames, because `-fstack-clash-protection` is ignored on Apple arm64. Checks the IR has proved unnecessary are left out of the emitted C. CI runs the oracle and ASan/UBSan to catch a wrong proof.
+  - **Measured** (probe 10, about 15k lines): C builds are 2.2x (debug) and 2.8x (release) faster than Rust. `rustc check` alone takes longer than a complete C debug build. Optimized run time is at parity (0.96–1.23x). C debug builds run 2–6x faster than Rust debug builds.
+  - **Cost:** the runtime (pools, channels, scheduler) is written in C, without rustc checking it. Tokio doesn't come along. CSP semantics stay as they are (probe 08).
+  - The earlier probes emitted Rust, and their findings about semantics still hold. Probe 04 (custom MIR) is now only relevant to the Rust oracle.
+  - **Consequences of the move to C:**
+    - generics and traits keep Rust's *design*, but monomorphization and trait resolution are implemented in our IR
+    - the standard runtime (pools, Vec, String, ordered Hash, Set, channels, scheduler) is ours, written in C
+    - source maps are `#line N "file.alx"` directives, so debuggers and sanitizer reports point at `.alx` lines
+    - splitting a 2x pool in place (probe 01's gap) is plain C; the checker owns proving it safe
+  - **Compiler implementation language:** Rust for now. Self-hosted eventually.
+  - **Interop:** using Rust crates goes through `extern "C"` shims around those crates. Using C libraries follows C conventions directly (headers, C ABI). Calls into either from pure code need `trust_pure`.
+- **Concurrency runtime:** our own, in C, taking Tokio's scheduler design. Async functions (inferred, probe 08) are lowered by our compiler into stackless state machines, the way rustc lowers `async`. The scheduler uses work stealing with per-worker run queues, a global queue for tasks submitted from outside, a LIFO slot for message-passing locality, and cooperative budgeting in place of preemption. CSP semantics are as in probe 08.
 - **No tracing GC.** The objections are pauses, runtime weight and hidden costs.
 - **Memory model: pools.** A pool is allocated at a declaration with 2x headroom. The spare half is for copy-and-hand-off.
 - **Escaping values:** pool parameters are inferred inside a module. At public boundaries and block exits, values are copied out or the whole pool moves (probes 01 and 02).
+- **Syntax: braces everywhere, and `end` doesn't exist.** Methods, blocks, `struct`, `enum`, `error`, `case`, `if`: everything is `{ … }`. Escaping blocks are lambdas, `->(x) { … }`. (The sketches in probes 01–10 predate this and still use `end`.)
 - **Blocks:** braces, `{ |x| … }`. They don't escape by default, so they get inlined, and `return`, `?`, `break` and `next` mean what they mean in the enclosing method. A block the callee stores must be an explicit lambda. `yield` in an inlinable method is splicing (probe 05).
 - **`#[pure]`** (Rust-style attribute; the exact characters can change later):
   - **Model: destination-passing.** A pure function takes its arguments plus a pre-existing zero value of its return type (Go-style zero values) and fills it in. Scratch memory it uses internally dies at return. The caller never observes anything new coming into existence.
@@ -55,9 +77,69 @@ The Ruby of Rust: Ruby-feel syntax, Rust's type construction, and no tracing GC.
   - `try` inside a block stops at the first error and propagates it.
   - Block shorthand: `it`, `&:name`, `{ |(k, v)| … }`.
   - `pmap` and the other parallel methods accept pure blocks only.
-- **Headers:** a ceremony for declaring signatures, purity and size contracts, optionally in a separate file (prior art: OCaml `.mli`, SPARK specs). Whether they also define boundaries for separate compilation is **undecided**. Start with contracts only.
+- **Headers:** a ceremony for declaring signatures, purity and size contracts, optionally in a separate file (prior art: OCaml `.mli`, SPARK specs). **They are also separate-compilation boundaries:** one `.o` per module, with the C ABI at the boundaries.
+- **Type inference:** as far-reaching as possible (aiming at Crystal-style whole-program inference), limited by one constraint: builds must stay faster than rustc's.
+- **Integer overflow in impure code:** chosen per file with a flag. The settings are **abort** (the default), **wrap** and **promote** (to bignum, Ruby-style). The spelling doesn't matter; the working spelling is `#![overflow(abort | wrap | promote)]`. Pure code stays proven or fallible.
+- **Pool sizing when the size is only known at runtime:** grow like a Vec (doubling), and the compiler warns that the pool's size isn't known statically.
+- **Error sets** (probe 11):
+  - Declared with `error ParseError { BadDigit(U8), Empty }`.
+  - `T!` is inferred: the union of `fail` sites and `try`'d callees' sets. Recursion is solved as a fixed point.
+  - `T!E` is declared, and callers see the declared set, so it acts as a boundary. Declared sets can be unions, `T!(ParseError | Overflow)`, because builtin tags like `Overflow` come from unproven arithmetic.
+  - **Exported functions must declare their set**, so headers stay stable.
+  - Handling: `try e` propagates; `e rescue { |err| … }` handles; `case` matches on tags. Our checker owns exhaustiveness.
+  - **In C:** every tag has a unique global number, and all sets share one `Err { tag; payload }` type, so converting to a larger set is a copy. Payloads over 16 bytes go in a pool. `default:` aborts as a backstop.
+- **Strings:** UTF-8.
+- **Generics and traits** (probe 13):
+  - **Hybrid duck typing.** A parameter without a type is generic, and its bound is inferred: each method used resolves to the one trait that provides it. **Exported functions carry the inferred bound in the header** (`pub def total[T: Sum](xs: T)`). Requirements that are inherent or ambiguous are fine inside a module and an error on export. Errors at a call site name the inferred bound and the line it came from.
+  - **Nominal conformance:** `impl Shape for Circle { … }`. Derives generate impls. Traits with default methods are the mixins (Enumerable, Comparable).
+  - **Inferred `dyn`:** in a mixed collection, the common trait is inferred from how the elements are used. If every concrete type is visible, the compiler emits a **closed tagged union with `switch` dispatch** (1.34x faster than method tables in probe 13). Otherwise it emits `{table, pointer}` with objects in pools. Explicit `dyn` is available.
+  - **Code generation:** debug builds pass method tables (4.1x faster compile, 9.6x smaller binary at 200×20; +8% run time), and release builds monomorphize. Same meaning either way. The method table format is shared with `dyn`.
+  - **Bound inference beyond direct calls:**
+    - Chained use constrains associated types: `x.sum.to_s` infers `T: Sum, T.Output: Show`.
+    - Passing `x` on to another generic function adds that function's bounds. Bounds propagate across the call graph as a fixed point, using the same machinery as error sets.
+    - If a method takes generic arguments and inference can't decide the bound, it's a compile error asking for an annotation, never a guess.
+  - **Syntax:**
+    - generic parameters in brackets: `struct Pair[A, B] { a: A, b: B }`, `def first[T](xs: [T]) -> T?`
+    - bounds inline (`[T: Sum + Show]`) or in a `where` clause: `def f[T](x: T) where T: Sum, T.Output: Show { … }`
+    - associated types declared as `trait Sum { type Output; def sum -> Output }` and referred to as `T.Output`
+  - **Release builds:** monomorphize, with three things to limit code size and build time:
+    - instantiations shared across modules (deduplicated by type arguments)
+    - one copy shared by layout-identical instantiations
+    - method tables for functions known to be cold (profile-guided, later)
+  - **Macros may declare the signatures they generate:** `macro def derive_json(T: Type) -> Code declares { to_json -> Str; from_json(s: Str) -> T! }`.
+    - With a declaration, expansion is lazy per member, and headers list the generated signatures without running the macro.
+    - Without one, the whole type expands, as in probe 12.
+- **Metaprogramming** (probe 12). It covers boilerplate and derives, DSLs, generated APIs and reflection.
+  - **Macros are pure functions that return code**, run by an IR interpreter inside the compiler. They build code with `quote { … }` and splice values in with `#{…}`. They're deterministic, sandboxed and cacheable, and have an evaluation step budget.
+  - **Interleaved with type checking, and lazy.** A type's member table is completed the first time something looks up one of its members: its derives run and its refinements attach. Macros may look up other types (nested expansion). Dependency loops are compile errors that name the full chain. Macros nobody uses never run.
+  - **Reflection at compile time:** `T.fields` (with attributes such as `#[json(rename: …)]`), `T.methods`, `T.responds?`, `T.name`.
+  - **`method_missing` at compile time:** called when a lookup fails; returning nil means the method doesn't exist. Results are cached by (type, name, argument types).
+  - **DSLs:** blocks with a receiver (`&block: Spec` sets the block's `self`). Free at run time, because blocks are inlined.
+  - **Refinements:** `refine` / `using`, lexically scoped, emitted as functions with mangled names.
+  - **Declared inputs only:** `comptime read(path)` works only on files listed in the build manifest, and their contents are hashed.
+  - **Incremental cache:** keyed on *direct* dependencies, with member-table fingerprints for early cutoff. Never record dependencies transitively, which made 10 000 types take 66 s in probe 12. Use a global revision counter so a build where nothing changed skips checking entirely.
+  - Exported macros are shipped in headers as IR. Macro-generated code is hygienic, except for names spliced in through `#{…}`. Errors inside generated code are reported with the chain of expansions.
+  - The scheduler must use an explicit work stack, not recursion, because chains of types run deep.
 
-## Open
+## Build plan
 
-- Column-precise source maps: per-expression markers, or a side table mapping rustc's column ranges.
-- Headers as boundaries for separate compilation (still deferred).
+Each phase ends with something runnable. The probes' `out.rs` / `.c` files are the expected output for the matching phases.
+
+1. **Parser:** braces-only syntax, `.alx` and header files, with spans kept for `#line` source maps.
+2. **Front end:** type inference with inferred bounds; error sets; purity and the proven-or-fallible prover (intervals, Enumerable size rules, types that carry facts); handles and branding; **our move/region checker**. Every Alexandrite-level error is reported here (probe 07).
+3. **IR:** explicit drops, pools, destinations and checks. Optimizations that depend on knowing the language run here: inlining blocks, fusing pure chains and `.lazy`, pre-sizing destinations, removing checks the prover made unnecessary.
+4. **C backend and runtime:** pools, Vec, String (UTF-8), an insertion-ordered Hash and Set, the `Err` representation, overflow modes, stack-frame caps. Debug builds use method tables and clang -O0 (tcc where it's available). Release builds monomorphize and use -O2.
+5. **CI safety net:** the Rust backend's output checked by rustc (the oracle), plus C built with ASan/UBSan, over every test program.
+6. **Standard library:** Enumerable and Comparable as traits with default methods, and the size rules.
+7. **Macros:** the IR interpreter, the lazy scheduler (explicit work stack, direct dependencies, early cutoff, a revision counter), and declared inputs.
+8. **Concurrency:** inferred async lowered to state machines; a work-stealing scheduler in C copied from Tokio's design; channels, `spawn`, `concurrently`, `pmap`.
+9. **Self-hosting.**
+
+## Deferred measurements
+
+Not open design questions: checks to run once the compiler exists.
+
+- Release-build cost of monomorphization with calls spread across files (probe 13's -O2 run was flawed).
+- How much monomorphization gains over method tables on code that vectorizes.
+- tcc as the debug backend, measured on Linux.
+- `-fstack-clash-protection` on Linux gcc and clang, versus our own stack probes.

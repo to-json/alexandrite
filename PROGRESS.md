@@ -8,6 +8,7 @@ Read this first after a context compaction.
 - `acceptance/run.py`: the harness.
 - `acceptance/ruby/{idiomatic,fast}/`: Ruby ports of the positive cases; `acceptance/bench.py` times them against `alx run` and the release binaries.
 - `compiler/`: the `alx` crate (Rust). The root `Cargo.toml` workspace excludes `probes/`.
+- `web/`: the in-browser compiler (`alx-web`, wasm32): `alx` lib front end + `wasmgen.rs` (LIR → WebAssembly; generators via resume guards) + `rt.rs` (the runtime in Rust). `build.sh`, `test.mjs` (all cases through the browser pipeline in Node), `publish.sh DEST` (the site: `../loot/webb/warez/11-alexandrite`). `pmap` is sequential there.
 - `compiler/runtime/`: the C runtime (`alx.h`, `alx.c`) plus vendored libtommath (Unlicense).
 
 ## Compiler architecture (v0)

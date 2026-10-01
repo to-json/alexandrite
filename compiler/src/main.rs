@@ -1,17 +1,7 @@
-mod ast;
-mod cgen;
-mod check;
-mod diag;
 mod driver;
-mod front;
 mod jit;
-mod lexer;
-mod lir;
-mod lower;
-mod parser;
-mod prove;
-mod rgen;
-mod tast;
+
+pub use alx::{cgen, check, front, lir, lower, rgen, tast};
 
 use std::process::ExitCode;
 

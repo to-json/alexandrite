@@ -1,5 +1,8 @@
 //! Links the C runtime into `alx` itself, for the JIT behind `alx run`.
 fn main() {
+    if std::env::var("CARGO_CFG_TARGET_ARCH").as_deref() == Ok("wasm32") {
+        return;
+    }
     let rt = "runtime";
     for f in ["alx.h", "alx.c", "alx_big.c", "jit_shims.c", "libtommath/tommath_amalgam.c"] {
         println!("cargo:rerun-if-changed={rt}/{f}");

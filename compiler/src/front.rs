@@ -21,9 +21,14 @@ pub fn parse_file(sm: &mut SourceMap, display: String, text: String, next_id: &m
 }
 
 pub fn load(path: &Path, display: &str) -> Result<Loaded, (SourceMap, Diag)> {
+    load_with(path, display, &|p| std::fs::read_to_string(p))
+}
+
+/// `load`, reading files through `read` (the browser has no file system).
+pub fn load_with(path: &Path, display: &str, read: &dyn Fn(&Path) -> std::io::Result<String>) -> Result<Loaded, (SourceMap, Diag)> {
     let mut sm = SourceMap::default();
     let mut next_id = 0;
-    let text = match std::fs::read_to_string(path) {
+    let text = match read(path) {
         Ok(t) => t,
         Err(e) => {
             let d = Diag::new(Span::default(), format!("cannot read `{display}`: {e}"));
@@ -39,7 +44,7 @@ pub fn load(path: &Path, display: &str) -> Result<Loaded, (SourceMap, Diag)> {
     let mut libs = vec![];
     for (req, sp) in &main.requires {
         let file = dir.join(format!("{req}.alx"));
-        let text = match std::fs::read_to_string(&file) {
+        let text = match read(&file) {
             Ok(t) => t,
             Err(_) => return Err((sm, Diag::new(*sp, format!("cannot find `{req}` (looked for `{}`)", file.display())))),
         };

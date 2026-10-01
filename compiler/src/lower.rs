@@ -58,6 +58,7 @@ pub fn lty(t: &Ty, mode: Overflow) -> LTy {
         Ty::Unit | Ty::Never | Ty::Yielder(_) | Ty::Var(_) => LTy::Unit,
         Ty::Array(t) | Ty::Fixed(t, _) | Ty::Seq(t, _) => LTy::Arr(Box::new(lty(t, mode))),
         Ty::Map(k, v) => crate::mapgen::map_ty(&lty(k, mode), &lty(v, mode)),
+        Ty::Enum(_, vs) => LTy::Tup(std::iter::once(LTy::I64).chain(vs.iter().flat_map(|(_, fs)| fs.iter().map(|(_, t)| lty(t, mode)))).collect()),
         Ty::Tuple(ts) => LTy::Tup(ts.iter().map(|t| lty(t, mode)).collect()),
         Ty::Range => LTy::Range,
         Ty::Gen(t) => LTy::Gen(Box::new(lty(t, mode))),
@@ -612,7 +613,7 @@ impl<'a> Lw<'a> {
             TK::Try(inner) => self.try_expr(inner),
             TK::Puts(x) => {
                 let v = self.expr(x);
-                if matches!(x.ty, Ty::Opt(_) | Ty::Map(..)) {
+                if matches!(x.ty, Ty::Opt(_) | Ty::Map(..) | Ty::Array(_) | Ty::Fixed(..) | Ty::Struct(..) | Ty::Tuple(_) | Ty::Enum(..)) {
                     let s = self.to_s(v, &x.ty);
                     self.emit(LS::Puts(s, LTy::Str));
                     return LE::Unit;
@@ -1239,6 +1240,81 @@ impl<'a> Lw<'a> {
                 LE::Cond(Box::new(LE::Field(Box::new(v), 0)), Box::new(s), Box::new(LE::S("none".into())))
             }
             Ty::Str => v,
+            Ty::Array(el) | Ty::Fixed(el, _) => {
+                // Go: `[1 2 3]`.
+                let lt = self.lty(t);
+                let a = self.bind(v, lt);
+                let s = self.tmp(LTy::Str);
+                let i = self.tmp(LTy::I64);
+                self.emit(LS::Set(s, LE::S("[".into())));
+                self.emit(LS::Set(i, LE::I(0)));
+                let l = self.label();
+                let body = self.sub(|lw| {
+                    lw.emit(LS::If(LE::Cmp(Op::Ge, Box::new(LE::Var(i)), Box::new(LE::Len(Box::new(a.clone()))), LTy::I64), vec![LS::Break(l)], vec![]));
+                    let x = LE::Index { arr: Box::new(a.clone()), idx: Box::new(LE::Var(i)), check: None };
+                    let xs = lw.to_s(x, el);
+                    let sep = LE::Cond(Box::new(LE::Cmp(Op::Eq, Box::new(LE::Var(i)), Box::new(LE::I(0)), LTy::I64)), Box::new(LE::S(String::new())), Box::new(LE::S(" ".into())));
+                    lw.emit(LS::Set(s, LE::Rt(Rt::StrCat, vec![LE::Var(s), sep, xs])));
+                    lw.emit(LS::Set(i, LE::Arith(Op::Add, Box::new(LE::Var(i)), Box::new(LE::I(1)), Ovf::Unchecked)));
+                });
+                self.emit(LS::Loop(l, body));
+                LE::Rt(Rt::StrCat, vec![LE::Var(s), LE::S("]".into())])
+            }
+            Ty::Enum(_, vs) => {
+                // `Red`, `Circle(2)`.
+                let lt = self.lty(t);
+                let x = self.bind(v, lt);
+                let tag = LE::Field(Box::new(x.clone()), 0);
+                let mut slot = 1;
+                let mut shown = vec![];
+                for (name, fs) in vs {
+                    let s = if fs.is_empty() {
+                        LE::S(name.clone())
+                    } else {
+                        let mut parts = vec![LE::S(format!("{name}("))];
+                        for (j, (_, ft)) in fs.iter().enumerate() {
+                            if j > 0 {
+                                parts.push(LE::S(", ".into()));
+                            }
+                            let f = self.to_s(LE::Field(Box::new(x.clone()), slot + j), ft);
+                            let fv = self.tmp(LTy::Str);
+                            self.emit(LS::Set(fv, f));
+                            parts.push(LE::Var(fv));
+                        }
+                        parts.push(LE::S(")".into()));
+                        LE::Rt(Rt::StrCat, parts)
+                    };
+                    slot += fs.len();
+                    shown.push(s);
+                }
+                let mut acc = shown.pop().unwrap_or(LE::S(String::new()));
+                for (k, s) in shown.into_iter().enumerate().rev() {
+                    acc = LE::Cond(Box::new(LE::Cmp(Op::Eq, Box::new(tag.clone()), Box::new(LE::I(k as i64)), LTy::I64)), Box::new(s), Box::new(acc));
+                }
+                acc
+            }
+            Ty::Struct(_, _) | Ty::Tuple(_) => {
+                // Go: `{1 2}`.
+                let fts: Vec<Ty> = match t {
+                    Ty::Struct(_, fs) => fs.iter().map(|(_, t)| t.clone()).collect(),
+                    Ty::Tuple(ts) => ts.clone(),
+                    _ => unreachable!(),
+                };
+                let lt = self.lty(t);
+                let x = self.bind(v, lt);
+                let mut parts = vec![LE::S("{".into())];
+                for (k, ft) in fts.iter().enumerate() {
+                    if k > 0 {
+                        parts.push(LE::S(" ".into()));
+                    }
+                    let fs = self.to_s(LE::Field(Box::new(x.clone()), k), ft);
+                    let fv = self.tmp(LTy::Str);
+                    self.emit(LS::Set(fv, fs));
+                    parts.push(LE::Var(fv));
+                }
+                parts.push(LE::S("}".into()));
+                LE::Rt(Rt::StrCat, parts)
+            }
             Ty::Map(kt, vt) => {
                 // Go's `map[k:v k:v]`, in insertion order.
                 let lt = self.lty(t);
@@ -1487,6 +1563,18 @@ impl<'a> Lw<'a> {
                 let absent = LE::Not(Box::new(LE::Field(Box::new(v.clone()), 0)));
                 self.emit(LS::If(absent, vec![LS::Panic("unwrap of none".into(), self.loc(sp))], vec![]));
                 LE::Field(Box::new(v), 1)
+            }
+            VariantNew(k) => {
+                let lt = self.lty(&e.ty);
+                let mut vals = vec![LE::I(k as i64)];
+                for a in args {
+                    vals.push(self.arg(a));
+                }
+                LE::Tup(lt, vals)
+            }
+            EnumTag => {
+                let v = self.expr(recv.unwrap());
+                self.int_out(LE::Field(Box::new(v), 0))
             }
             TupleGet(k) => {
                 let v = self.expr(recv.unwrap());

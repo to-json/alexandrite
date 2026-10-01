@@ -21,6 +21,9 @@ pub enum Ty {
     Array(Box<Ty>),
     /// `[T; N]`: a fixed-length array, a value (copied on assignment).
     Fixed(Box<Ty>, u64),
+    /// `enum`: its name and variants (each with its fields). A value: the
+    /// tag, then every variant's fields side by side.
+    Enum(String, Vec<(String, Vec<(String, Ty)>)>),
     /// `Map[K, V]`: ordered (insertion order), shared like a Go map.
     Map(Box<Ty>, Box<Ty>),
     Tuple(Vec<Ty>),
@@ -52,7 +55,7 @@ impl Ty {
             Ty::Int => "Int".into(),
             Ty::IntK(k) => k.name().into(),
             Ty::Float => "Float".into(),
-            Ty::Struct(n, _) => n.clone(),
+            Ty::Struct(n, _) | Ty::Enum(n, _) => n.clone(),
             Ty::Opt(t) => format!("{}?", t.show()),
             Ty::Bool => "Bool".into(),
             Ty::Str => "Str".into(),
@@ -90,6 +93,19 @@ impl Ty {
     pub fn of_kind(k: IntKind) -> Ty {
         if k == IntKind::I64 { Ty::Int } else { Ty::IntK(k) }
     }
+    /// The name of a struct or enum (methods live under it).
+    pub fn type_name(&self) -> Option<&str> {
+        match self {
+            Ty::Struct(n, _) | Ty::Enum(n, _) => Some(n),
+            _ => None,
+        }
+    }
+    /// An enum's flattened slots: variant `k`'s first field is at slot
+    /// `enum_slot(k)` of the value (slot 0 is the tag).
+    pub fn enum_slot(&self, k: usize) -> usize {
+        let Ty::Enum(_, vs) = self else { panic!("not an enum") };
+        1 + vs[..k].iter().map(|(_, fs)| fs.len()).sum::<usize>()
+    }
     /// The element type of a slice or fixed array.
     pub fn arr_elem(&self) -> Option<Ty> {
         match self {
@@ -103,6 +119,7 @@ impl Ty {
             Ty::Fixed(..) => true,
             Ty::Struct(_, fs) => fs.iter().any(|(_, t)| t.is_value_array()),
             Ty::Tuple(ts) => ts.iter().any(Ty::is_value_array),
+            Ty::Enum(_, vs) => vs.iter().any(|(_, fs)| fs.iter().any(|(_, t)| t.is_value_array())),
             Ty::Opt(t) => t.is_value_array(),
             _ => false,
         }
@@ -207,6 +224,10 @@ pub enum M {
     Runes,
     /// Maps: `{k => v, ...}` (args: k1, v1, k2, v2, ...), `m[k]` (V?),
     /// `m.fetch(k, d)`, `m[k] = v`, `delete` (V?), `key?`, `size`, `keys`, `values`.
+    /// An enum value's variant index.
+    EnumTag,
+    /// Build variant `k` of an enum: args are every slot after the tag.
+    VariantNew(usize),
     /// `find { pred }` → T? (a select stage, then this terminal).
     Find,
     MapNew,

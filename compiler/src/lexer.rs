@@ -51,6 +51,7 @@ pub enum Kw {
     Try,
     Require,
     Struct,
+    Enum,
     /// `fn` and `ƒ`: a pure `def`
     Fn,
     For,
@@ -264,6 +265,7 @@ pub fn lex_at(file: u32, src: &str, base: u32) -> Result<Vec<Token>, Diag> {
                 "try" => Tok::Kw(Kw::Try),
                 "require" => Tok::Kw(Kw::Require),
                 "struct" => Tok::Kw(Kw::Struct),
+                "enum" => Tok::Kw(Kw::Enum),
                 "fn" => Tok::Kw(Kw::Fn),
                 "for" => Tok::Kw(Kw::For),
                 "in" => Tok::Kw(Kw::In),

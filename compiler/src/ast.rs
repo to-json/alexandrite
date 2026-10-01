@@ -89,6 +89,7 @@ pub struct Module {
     pub requires: Vec<(String, Span)>,
     pub defs: Vec<Def>,
     pub structs: Vec<StructDef>,
+    pub enums: Vec<EnumDef>,
     /// `NAME = expr` at the top level: compile-time constants (Go's exact rules).
     pub consts: Vec<ConstDef>,
     /// Top-level statements, run in order (the implicit `main`).
@@ -121,6 +122,21 @@ pub struct StructDef {
     pub name: String,
     pub span: Span,
     pub fields: Vec<(String, TypeExpr, Span)>,
+}
+
+/// `enum Name { Variant(field: T, ...), Bare, ... }`: a sum type (a value).
+#[derive(Debug, Clone)]
+pub struct EnumDef {
+    pub name: String,
+    pub span: Span,
+    pub variants: Vec<(String, Vec<(String, TypeExpr, Span)>, Span)>,
+}
+
+/// Methods are defs named `Type.name` whose first parameter is `self`.
+/// In a `!` method `self` is a one-element slice holding the receiver, so
+/// writes reach the caller (Go's pointer receiver).
+pub fn method_name(owner: &str, m: &str) -> String {
+    format!("{owner}.{m}")
 }
 
 #[derive(Debug, Clone)]
@@ -326,4 +342,7 @@ pub enum Pat {
     Value(Expr),
     /// `lo..hi` / `lo...hi`
     Range(Expr, Expr, bool),
+    /// `Circle(r, _)` / `Empty`: an enum variant, binding its fields. Without
+    /// parens it may also be a constant (the checker decides).
+    Variant(String, Option<Vec<(String, Span)>>, Span),
 }

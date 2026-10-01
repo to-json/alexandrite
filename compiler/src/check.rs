@@ -108,25 +108,24 @@ impl<'a> World<'a> {
         eval_const(&self.consts, e)
     }
 
-    /// Declare structs (in any order; a struct can't contain itself).
-    pub fn add_structs(&mut self, defs: &[StructDef]) -> R<()> {
-        let by_name: HashMap<&str, &StructDef> = defs.iter().map(|d| (d.name.as_str(), d)).collect();
-        for d in defs {
-            if self.structs.contains_key(&d.name) || self.consts.contains_key(&d.name) || ["Int", "Float", "Bool", "Str", "Array", "Math", "File", "Enumerator"].contains(&d.name.as_str()) {
-                return Err(Diag::new(d.span, format!("`{}` is already defined", d.name)));
-            }
+    /// Declare structs and enums (in any order; a value type can't contain itself).
+    pub fn add_structs(&mut self, defs: &[StructDef], enums: &[EnumDef]) -> R<()> {
+        #[derive(Clone, Copy)]
+        enum Def<'d> {
+            S(&'d StructDef),
+            E(&'d EnumDef),
         }
-        fn resolve(name: &str, by_name: &HashMap<&str, &StructDef>, done: &mut Structs, visiting: &mut Vec<String>, consts: &Consts) -> R<Ty> {
-            if let Some(t) = done.get(name) {
-                return Ok(t.clone());
+        let mut by_name: HashMap<&str, Def> = HashMap::new();
+        let all = defs.iter().map(|d| (d.name.as_str(), d.span, Def::S(d))).chain(enums.iter().map(|d| (d.name.as_str(), d.span, Def::E(d))));
+        for (name, span, d) in all {
+            if by_name.contains_key(name) || self.structs.contains_key(name) || self.consts.contains_key(name) || ["Int", "Float", "Bool", "Str", "Array", "Map", "Math", "File", "Enumerator"].contains(&name) {
+                return Err(Diag::new(span, format!("`{name}` is already defined")));
             }
-            let d = by_name[name];
-            if visiting.iter().any(|v| v == name) {
-                return Err(Diag::new(d.span, format!("struct `{name}` contains itself; a struct is a value, so it can't")));
-            }
-            visiting.push(name.to_string());
-            let mut fields = vec![];
-            for (f, te, _) in &d.fields {
+            by_name.insert(name, d);
+        }
+        fn fields_of(fs: &[(String, TypeExpr, Span)], by_name: &HashMap<&str, Def>, done: &mut Structs, visiting: &mut Vec<String>, consts: &Consts) -> R<Vec<(String, Ty)>> {
+            let mut out = vec![];
+            for (f, te, _) in fs {
                 let mut names = vec![];
                 type_names(te, &mut names);
                 for n in names {
@@ -134,16 +133,40 @@ impl<'a> World<'a> {
                         resolve(&n, by_name, done, visiting, consts)?;
                     }
                 }
-                let t = type_from(te, done, consts)?;
-                fields.push((f.clone(), t));
+                out.push((f.clone(), type_from(te, done, consts)?));
             }
+            Ok(out)
+        }
+        fn resolve(name: &str, by_name: &HashMap<&str, Def>, done: &mut Structs, visiting: &mut Vec<String>, consts: &Consts) -> R<Ty> {
+            if let Some(t) = done.get(name) {
+                return Ok(t.clone());
+            }
+            let d = by_name[name];
+            let span = match d {
+                Def::S(s) => s.span,
+                Def::E(e) => e.span,
+            };
+            if visiting.iter().any(|v| v == name) {
+                return Err(Diag::new(span, format!("`{name}` contains itself; it is a value, so it can't (recursive types come with the memory model)")));
+            }
+            visiting.push(name.to_string());
+            let t = match d {
+                Def::S(s) => Ty::Struct(name.to_string(), fields_of(&s.fields, by_name, done, visiting, consts)?),
+                Def::E(e) => {
+                    let mut vs = vec![];
+                    for (v, fs, _) in &e.variants {
+                        vs.push((v.clone(), fields_of(fs, by_name, done, visiting, consts)?));
+                    }
+                    Ty::Enum(name.to_string(), vs)
+                }
+            };
             visiting.pop();
-            let t = Ty::Struct(name.to_string(), fields);
             done.insert(name.to_string(), t.clone());
             Ok(t)
         }
-        for d in defs {
-            resolve(&d.name, &by_name, &mut self.structs, &mut vec![], &self.consts)?;
+        let names: Vec<&str> = by_name.keys().copied().collect();
+        for n in names {
+            resolve(n, &by_name, &mut self.structs, &mut vec![], &self.consts)?;
         }
         Ok(())
     }
@@ -304,7 +327,38 @@ pub fn eval_const(consts: &Consts, e: &Expr) -> R<CVal> {
 }
 
 pub fn cname(s: &str) -> String {
-    s.replace('?', "_q").replace('!', "_b")
+    let mut o = String::new();
+    for c in s.chars() {
+        match c {
+            '?' => o.push_str("_q"),
+            '!' => o.push_str("_b"),
+            '.' => o.push_str("__"),
+            '+' => o.push_str("_add"),
+            '-' => o.push_str("_sub"),
+            '*' => o.push_str("_mul"),
+            '/' => o.push_str("_div"),
+            '%' => o.push_str("_rem"),
+            '=' => o.push_str("_eq"),
+            '<' => o.push_str("_lt"),
+            '>' => o.push_str("_gt"),
+            '[' => o.push_str("_idx"),
+            ']' => {}
+            c => o.push(c),
+        }
+    }
+    o
+}
+
+/// Values `puts` and interpolation can show.
+pub fn printable(t: &Ty) -> bool {
+    match t {
+        Ty::Int | Ty::IntK(_) | Ty::Float | Ty::Str | Ty::Bool | Ty::Var(_) => true,
+        Ty::Opt(t) | Ty::Array(t) | Ty::Fixed(t, _) => printable(t),
+        Ty::Map(k, v) => printable(k) && printable(v),
+        Ty::Struct(_, fs) => fs.iter().all(|(_, t)| printable(t)),
+        Ty::Tuple(ts) => ts.iter().all(printable),
+        _ => false,
+    }
 }
 
 pub fn map_key_ok(t: &Ty) -> bool {
@@ -380,6 +434,9 @@ struct FnCx<'w, 'a> {
     /// Kind of each enclosing loop-ish construct, innermost last.
     loops: Vec<LoopKind>,
     n_params: usize,
+    /// In a method: `Some(true)` for a `!` method (`self` is a one-element
+    /// slice holding the receiver), `Some(false)` for one taking a copy.
+    method: Option<bool>,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -396,7 +453,7 @@ const SEQ_METHODS: &[&str] = &[
 ];
 const ARRAY_EXTRA: &[&str] = &["each_index", "each_cons", "pmap", "last", "reverse", "<<", "dup"];
 const INT_METHODS: &[&str] = &["to_s", "to_f", "to_i", "to_u8", "to_i32", "to_u32", "to_u64", "as_u8", "as_i32", "as_u32", "as_u64", "even?", "odd?", "digits", "step"];
-const FLOAT_METHODS: &[&str] = &["to_s", "to_f", "to_i", "abs"];
+const FLOAT_METHODS: &[&str] = &["to_s", "to_f", "to_i", "abs", "sqrt"];
 const STR_METHODS: &[&str] = &["chars", "bytes", "runes", "size", "length", "reverse", "delete", "split", "to_i", "to_s"];
 
 fn lev(a: &str, b: &str) -> usize {
@@ -426,6 +483,7 @@ impl<'w, 'a> FnCx<'w, 'a> {
             const_err: std::cell::RefCell::new(None),
             pure_decl: def.is_some_and(|d| d.pure),
             fn_name: def.map_or("main".into(), |d| d.name.clone()),
+            method: def.filter(|d| d.params.first().is_some_and(|p| p.name == "self")).map(|d| d.name.ends_with('!')),
             is_main: def.is_none(),
             ret: Ty::Unit,
             impure: false,
@@ -828,6 +886,11 @@ impl<'w, 'a> FnCx<'w, 'a> {
             self.locals[id].reassigned += 1;
             return Ok(id);
         }
+        if let Some(Ty::Struct(_, fs)) = self.self_struct() {
+            if self.lookup("self").is_some() && fs.iter().any(|(f, _)| f == name) {
+                return Err(Diag::new(sp, format!("`{name}` is a field: write `self.{name} = ...` to set it (in a `!` method), or pick another name for a local")));
+            }
+        }
         Ok(self.declare(name, ty.clone()))
     }
 
@@ -863,6 +926,14 @@ impl<'w, 'a> FnCx<'w, 'a> {
             ExprKind::Bool(b) => self.mk(TK::Bool(*b), Ty::Bool, sp),
             ExprKind::Nil => self.mk(TK::Unit, Ty::Unit, sp),
             ExprKind::Sym(s) => return Err(Diag::new(sp, format!("symbol `:{s}` can only be used as a block (`&:{s}`) or with `reduce`"))),
+            ExprKind::Name(n) if n == "self" && self.method == Some(true) => {
+                let id = self.lookup(n).expect("self is declared");
+                let t = self.locals[id].ty.clone();
+                let el = self.resolve(&t).arr_elem().expect("self is a [T]");
+                let a = self.mk(TK::Local(id), t, sp);
+                let z = self.mk(TK::Int(0), Ty::Int, sp);
+                self.mk(TK::Index(Box::new(a), Box::new(z)), el, sp)
+            }
             ExprKind::Name(n) => match self.lookup(n) {
                 Some(id) => self.mk(TK::Local(id), self.locals[id].ty.clone(), sp),
                 None => return self.call(None, n, sp, &[], None, None, sp),
@@ -877,6 +948,12 @@ impl<'w, 'a> FnCx<'w, 'a> {
             ExprKind::Index(a, i) => {
                 let a = self.value(a)?;
                 let at = self.resolve(&a.ty);
+                if let Some(sn) = at.type_name() {
+                    if let Some(&def) = self.w.by_name.get(&method_name(sn, "[]")) {
+                        let k = self.value(i)?;
+                        return self.call_def(def, "[]", sp, vec![a, k], sp);
+                    }
+                }
                 if let Ty::Map(kt, vt) = &at {
                     let k = self.value(i)?;
                     let k = self.coerce(k, kt)?;
@@ -932,6 +1009,13 @@ impl<'w, 'a> FnCx<'w, 'a> {
                 self.mk(TK::M(M::MapNew, None, args, None), Ty::Map(Box::new(kt), Box::new(vt)), sp)
             }
             ExprKind::Assign(target, v) => match &target.kind {
+                ExprKind::Name(n) if n == "self" && self.method.is_some() => {
+                    let (id, steps, pty) = self.place(target)?;
+                    let v = self.value(v)?;
+                    let v = self.coerce(v, &pty)?;
+                    self.expect(&v.ty, &pty, v.span, "assignment")?;
+                    self.mk(TK::PlaceAssign(id, steps, None, Box::new(v)), pty, sp)
+                }
                 ExprKind::Name(n) => {
                     let v = self.value(v)?;
                     let v = match self.lookup(n) {
@@ -989,6 +1073,9 @@ impl<'w, 'a> FnCx<'w, 'a> {
             ExprKind::OpAssign(op, target, v) => {
                 let ExprKind::Name(n) = &target.kind else { unreachable!() };
                 let Some(id) = self.lookup(n) else {
+                    if self.self_field(target).is_some() {
+                        return Err(Diag::new(target.span, format!("`{n}` is a field: write `self.{n} {}= ...` (in a `!` method)", op.text())));
+                    }
                     return Err(Diag::new(target.span, format!("`{n}` is not defined yet")));
                 };
                 let cur = self.mk(TK::Local(id), self.locals[id].ty.clone(), target.span);
@@ -1078,9 +1165,10 @@ impl<'w, 'a> FnCx<'w, 'a> {
                         InterpPart::Lit(s) => pieces.push(FmtPiece::Lit(s.clone())),
                         InterpPart::Expr(x) => {
                             let v = self.value(x)?;
+                            let v = self.show_value(v)?;
                             let t = self.resolve(&v.ty);
-                            if !matches!(t, Ty::Int | Ty::IntK(_) | Ty::Float | Ty::Str | Ty::Bool | Ty::Opt(_) | Ty::Var(_)) {
-                                return Err(Diag::new(x.span, format!("can't interpolate a {} yet", t.show())).note("interpolation shows Int, Float, Str and Bool values"));
+                            if !printable(&t) {
+                                return Err(Diag::new(x.span, format!("can't interpolate a {} yet", t.show())));
                             }
                             pieces.push(FmtPiece::Str(vals.len()));
                             vals.push(v);
@@ -1134,7 +1222,22 @@ impl<'w, 'a> FnCx<'w, 'a> {
 
     /// An assignable place: a local, then `[i]` and `.field` steps.
     fn place(&mut self, e: &Expr) -> R<(LocalId, Vec<TStep>, Ty)> {
+        if let Some(f) = self.self_field(e) {
+            return self.place(&f);
+        }
         match &e.kind {
+            ExprKind::Name(n) if n == "self" && self.method.is_some() => {
+                let id = self.lookup(n).expect("self is declared");
+                if self.method == Some(false) {
+                    let m = self.fn_name.rsplit('.').next().unwrap_or_default().to_string();
+                    return Err(Diag::new(e.span, format!("`{m}` gets a copy of `self`; a method that changes it is named with `!` (`def {m}!`)")));
+                }
+                self.locals[id].mutated = true;
+                let t = self.resolve(&self.locals[id].ty.clone());
+                let el = t.arr_elem().expect("self is a [T]");
+                let z = self.mk(TK::Int(0), Ty::Int, e.span);
+                Ok((id, vec![TStep::Index(z)], el))
+            }
             ExprKind::Name(n) => {
                 let Some(id) = self.lookup(n) else {
                     return Err(Diag::new(e.span, format!("`{n}` is not defined yet")));
@@ -1316,6 +1419,16 @@ impl<'w, 'a> FnCx<'w, 'a> {
             Ty::Str => TK::Str(String::new()),
             Ty::Array(_) => TK::Array(vec![]),
             Ty::Map(..) => TK::M(M::MapNew, None, vec![], None),
+            Ty::Enum(_, vs) => {
+                // The first variant, with zero fields.
+                let mut slots = vec![];
+                for (_, fs) in vs.clone() {
+                    for (_, ft) in fs {
+                        slots.push(self.zero_of(&ft, sp)?);
+                    }
+                }
+                TK::M(M::VariantNew(0), None, slots, None)
+            }
             Ty::Fixed(el, n) => {
                 let z = self.zero_of(el, sp)?;
                 TK::M(M::ArrayNew, None, vec![self.mk(TK::Int(*n as i64), Ty::Int, sp), z], None)
@@ -1344,6 +1457,11 @@ impl<'w, 'a> FnCx<'w, 'a> {
         };
         let mut conds: Vec<(TExpr, TExpr)> = vec![];
         let mut default: Option<TExpr> = None;
+        let enum_ty = subj.as_ref().map(|(_, t)| self.resolve(t)).filter(|t| matches!(t, Ty::Enum(..)));
+        let mut covered: Vec<bool> = match &enum_ty {
+            Some(Ty::Enum(_, vs)) => vec![false; vs.len()],
+            _ => vec![],
+        };
         for arm in arms {
             if arm.pats.is_empty() {
                 if default.is_some() {
@@ -1356,9 +1474,56 @@ impl<'w, 'a> FnCx<'w, 'a> {
                 return Err(Diag::new(arm.span, "this arm comes after `_`, so it can never match"));
             }
             let mut cond: Option<TExpr> = None;
+            let mut binds: Vec<(String, Ty, TExpr)> = vec![];
             for pat in &arm.pats {
                 let local = |cx: &mut Self| subj.as_ref().map(|(id, ty)| cx.mk(TK::Local(*id), ty.clone(), arm.span));
                 let c = match pat {
+                    Pat::Variant(vn, bs, vsp) => {
+                        let variant = match &enum_ty {
+                            Some(Ty::Enum(en, vs)) => match vs.iter().position(|(v, _)| v == vn) {
+                                Some(k) => Some((k, vs[k].1.clone())),
+                                None => return Err(Diag::new(*vsp, format!("`{vn}` is not a variant of {en}; its variants are {}", vs.iter().map(|(v, _)| v.as_str()).collect::<Vec<_>>().join(", ")))),
+                            },
+                            _ => None,
+                        };
+                        match variant {
+                            Some((k, fields)) => {
+                                let et = enum_ty.clone().unwrap();
+                                covered[k] = true;
+                                let l = local(self).unwrap();
+                                let tag = self.mk(TK::M(M::EnumTag, Some(Box::new(l)), vec![], None), Ty::Int, *vsp);
+                                let kv = self.mk(TK::Int(k as i64), Ty::Int, *vsp);
+                                if let Some(bs) = bs {
+                                    if bs.len() != fields.len() {
+                                        return Err(Diag::new(*vsp, format!("`{vn}` has {} field(s) ({}), the pattern binds {}", fields.len(), fields.iter().map(|(f, _)| f.as_str()).collect::<Vec<_>>().join(", "), bs.len())));
+                                    }
+                                    if arm.pats.len() > 1 {
+                                        return Err(Diag::new(*vsp, "an arm with alternatives (`|`) can't bind fields"));
+                                    }
+                                    let base = et.enum_slot(k);
+                                    for (j, ((b, _), (_, ft))) in bs.iter().zip(&fields).enumerate() {
+                                        if b != "_" {
+                                            let l = local(self).unwrap();
+                                            let get = self.mk(TK::M(M::TupleGet(base + j), Some(Box::new(l)), vec![], None), ft.clone(), *vsp);
+                                            binds.push((b.clone(), ft.clone(), get));
+                                        }
+                                    }
+                                }
+                                self.mk(TK::Bin(BinOp::Eq, Box::new(tag), Box::new(kv)), Ty::Bool, *vsp)
+                            }
+                            None if bs.is_none() => {
+                                let e = Expr { kind: ExprKind::Const(vn.clone()), span: *vsp, id: NodeId::MAX };
+                                match local(self) {
+                                    Some(l) => {
+                                        let r = self.value(&e)?;
+                                        self.binary(BinOp::Eq, l, r, *vsp)?
+                                    }
+                                    None => self.cond(&e)?,
+                                }
+                            }
+                            None => return Err(Diag::new(*vsp, format!("`{vn}(...)` is a variant pattern, but the subject isn't an enum"))),
+                        }
+                    }
                     Pat::Value(e) => match local(self) {
                         Some(l) => {
                             let r = self.value(e)?;
@@ -1383,8 +1548,19 @@ impl<'w, 'a> FnCx<'w, 'a> {
                     }
                 });
             }
-            let body = self.arm_body(&arm.body, arm.span)?;
+            let body = self.arm_body_with(binds, &arm.body, arm.span)?;
             conds.push((cond.unwrap(), body));
+        }
+        // Over an enum: every variant must be covered (or `_` given); the
+        // last arm then needs no test.
+        if let (Some(Ty::Enum(en, vs)), None) = (&enum_ty, &default) {
+            let missing: Vec<&str> = vs.iter().zip(&covered).filter(|(_, c)| !**c).map(|((v, _), _)| v.as_str()).collect();
+            if !missing.is_empty() {
+                return Err(Diag::new(sp, format!("this `case` on {en} doesn't cover {}; add {} or `_`", missing.join(", "), if missing.len() == 1 { "an arm for it" } else { "arms for them" })));
+            }
+            if let Some((_, last)) = conds.pop() {
+                default = Some(last);
+            }
         }
         // Without `_` nothing may match: the arms are statements and the case has no value.
         let has_default = default.is_some();
@@ -1464,11 +1640,125 @@ impl<'w, 'a> FnCx<'w, 'a> {
     }
 
     /// Evaluate an optional into a fresh local: (local, its assignment).
+    /// Inside a method, a bare field name `f` means `self.f`.
+    fn self_field(&self, e: &Expr) -> Option<Expr> {
+        let (name, name_span) = match &e.kind {
+            ExprKind::Call { recv: None, name, args, block: None, name_span, .. } if args.is_empty() => (name, name_span),
+            ExprKind::Name(n) if n != "self" => (n, &e.span),
+            _ => return None,
+        };
+        if self.method.is_none() || self.lookup(name).is_some() {
+            return None;
+        }
+        let Some(Ty::Struct(_, fs)) = self.self_struct() else { return None };
+        if !fs.iter().any(|(f, _)| f == name) {
+            return None;
+        }
+        let me = Expr { kind: ExprKind::Name("self".into()), span: *name_span, id: NodeId::MAX };
+        Some(Expr { kind: ExprKind::Call { recv: Some(Box::new(me)), name: name.clone(), name_span: *name_span, args: vec![], block: None, block_sym: None }, span: e.span, id: e.id })
+    }
+
+    /// A struct with a `to_s` method prints through it (Go's Stringer).
+    fn show_value(&mut self, v: TExpr) -> R<TExpr> {
+        if let Some(sn) = self.resolve(&v.ty).type_name().map(str::to_string) {
+            if let Some(&def) = self.w.by_name.get(&method_name(&sn, "to_s")) {
+                let sp = v.span;
+                return self.call_def(def, "to_s", sp, vec![v], sp);
+            }
+        }
+        Ok(v)
+    }
+
+    /// `a == b` field by field (Go's comparable structs).
+    fn struct_eq(&mut self, l: TExpr, r: TExpr, sp: Span) -> R<TExpr> {
+        let t = self.resolve(&l.ty);
+        let fts: Vec<Ty> = match &t {
+            Ty::Struct(_, fs) => fs.iter().map(|(_, t)| t.clone()).collect(),
+            Ty::Tuple(ts) => ts.clone(),
+            // Unused slots hold zero values, so comparing them all works.
+            Ty::Enum(_, vs) => std::iter::once(Ty::Int).chain(vs.iter().flat_map(|(_, fs)| fs.iter().map(|(_, t)| t.clone()))).collect(),
+            _ => unreachable!(),
+        };
+        let (lid, s1) = self.opt_tmp(l, sp);
+        let (rid, s2) = self.opt_tmp(r, sp);
+        let mut acc: Option<TExpr> = None;
+        for (k, ft) in fts.iter().enumerate() {
+            if matches!(self.resolve(ft), Ty::Array(_) | Ty::Map(..) | Ty::Fixed(..)) {
+                return Err(Diag::new(sp, format!("`==` on {}: its field of type {} can't be compared; define `def ==(other)`", t.show(), ft.show())));
+            }
+            let a = self.mk(TK::Local(lid), t.clone(), sp);
+            let b = self.mk(TK::Local(rid), t.clone(), sp);
+            let fa = self.mk(TK::M(M::TupleGet(k), Some(Box::new(a)), vec![], None), ft.clone(), sp);
+            let fb = self.mk(TK::M(M::TupleGet(k), Some(Box::new(b)), vec![], None), ft.clone(), sp);
+            let eq = if matches!(self.resolve(ft), Ty::Opt(_)) { self.opt_eq(fa, fb, sp)? } else { self.binary(BinOp::Eq, fa, fb, sp)? };
+            acc = Some(match acc {
+                None => eq,
+                Some(p) => self.mk(TK::Bin(BinOp::And, Box::new(p), Box::new(eq)), Ty::Bool, sp),
+            });
+        }
+        let e = acc.unwrap_or_else(|| self.mk(TK::Bool(true), Ty::Bool, sp));
+        Ok(self.mk(TK::Seq(vec![s1, s2, TStmt::Expr(e)]), Ty::Bool, sp))
+    }
+
+    /// Two T? are equal if both are absent or both hold equal values.
+    fn opt_eq(&mut self, a: TExpr, b: TExpr, sp: Span) -> R<TExpr> {
+        let ot = a.ty.clone();
+        let (aid, s1) = self.opt_tmp(a, sp);
+        let (bid, s2) = self.opt_tmp(b, sp);
+        let (pa, pb) = (self.opt_present(aid, &ot, sp), self.opt_present(bid, &ot, sp));
+        let both = self.mk(TK::Bin(BinOp::Eq, Box::new(pa.clone()), Box::new(pb)), Ty::Bool, sp);
+        let (ga, gb) = (self.opt_get(aid, &ot, sp), self.opt_get(bid, &ot, sp));
+        let inner = self.binary(BinOp::Eq, ga, gb, sp)?;
+        let t = self.mk(TK::Bool(true), Ty::Bool, sp);
+        let vals = self.mk(TK::Ternary(Box::new(pa), Box::new(inner), Box::new(t)), Ty::Bool, sp);
+        let e = self.mk(TK::Bin(BinOp::And, Box::new(both), Box::new(vals)), Ty::Bool, sp);
+        Ok(self.mk(TK::Seq(vec![s1, s2, TStmt::Expr(e)]), Ty::Bool, sp))
+    }
+
+    /// The struct type of `self` in a method.
+    fn self_struct(&self) -> Option<Ty> {
+        let id = self.lookup("self")?;
+        let t = self.resolve(&self.locals[id].ty);
+        match self.method {
+            Some(true) => t.arr_elem(),
+            _ => Some(t),
+        }
+    }
+
+    /// `recv.m!(args)`: call a mutating method on a place, through a
+    /// one-element slice, and write the receiver back.
+    fn mutating_call(&mut self, recv: &Expr, def: usize, name: &str, name_span: Span, args: &[Expr], sp: Span) -> R<TExpr> {
+        let (id, steps, pty) = self.place(recv).map_err(|d| {
+            if matches!(recv.kind, ExprKind::Name(_) | ExprKind::Index(..) | ExprKind::Call { .. }) { d } else { Diag::new(recv.span, format!("`{name}` changes its receiver; call it on a variable")) }
+        })?;
+        let cur = self.place_read(id, &steps, &pty, recv.span);
+        let arr = self.mk(TK::Array(vec![cur]), Ty::arr(pty.clone()), recv.span);
+        let (tid, s1) = self.opt_tmp(arr, recv.span);
+        let mut targs = vec![self.mk(TK::Local(tid), Ty::arr(pty.clone()), recv.span)];
+        for a in args {
+            targs.push(self.value(a)?);
+        }
+        let call = self.call_def(def, name, name_span, targs, sp)?;
+        let rty = call.ty.clone();
+        let (rid, s2) = self.opt_tmp(call, sp);
+        let tl = self.mk(TK::Local(tid), Ty::arr(pty.clone()), sp);
+        let z = self.mk(TK::Int(0), Ty::Int, sp);
+        let back = self.mk(TK::Index(Box::new(tl), Box::new(z)), pty.clone(), sp);
+        let wb = if steps.is_empty() { self.mk(TK::Assign(id, Box::new(back)), pty, sp) } else { self.mk(TK::PlaceAssign(id, steps, None, Box::new(back)), pty, sp) };
+        let r = self.mk(TK::Local(rid), rty.clone(), sp);
+        Ok(self.mk(TK::Seq(vec![s1, s2, TStmt::Expr(wb), TStmt::Expr(r)]), rty, sp))
+    }
+
     /// The type of a local or a field path, without checking anything.
     fn peek_ty(&self, e: &Expr) -> Option<Ty> {
+        if let Some(f) = self.self_field(e) {
+            return self.peek_ty(&f);
+        }
         match &e.kind {
+            ExprKind::Name(n) if n == "self" && self.method.is_some() => self.self_struct(),
             ExprKind::Name(n) => self.lookup(n).map(|id| self.resolve(&self.locals[id].ty)),
             ExprKind::Call { recv: Some(r), name, args, block: None, .. } if args.is_empty() => self.peek_ty(r)?.field(name).map(|(_, t)| self.resolve(&t)),
+            ExprKind::Index(a, i) if !matches!(i.kind, ExprKind::SliceRange(..)) => self.peek_ty(a)?.arr_elem().map(|t| self.resolve(&t)),
             _ => None,
         }
     }
@@ -1619,10 +1909,21 @@ impl<'w, 'a> FnCx<'w, 'a> {
     }
 
     fn arm_body(&mut self, body: &[Stmt], sp: Span) -> R<TExpr> {
+        self.arm_body_with(vec![], body, sp)
+    }
+
+    /// An arm's body, with pattern bindings declared first.
+    fn arm_body_with(&mut self, binds: Vec<(String, Ty, TExpr)>, body: &[Stmt], sp: Span) -> R<TExpr> {
         self.scopes.push(HashMap::new());
+        let mut pre = vec![];
+        for (n, t, v) in binds {
+            let id = self.declare(&n, t.clone());
+            pre.push(TStmt::Expr(self.mk(TK::Assign(id, Box::new(v)), t, sp)));
+        }
         let r = self.body(body);
         self.scopes.pop();
-        let (mut ss, ty) = r?;
+        let (ss, ty) = r?;
+        let mut ss: Vec<TStmt> = pre.into_iter().chain(ss).collect();
         if let Some(TStmt::Expr(e)) = ss.last_mut() {
             let m = self.materialize(e.clone());
             *e = m;
@@ -1701,6 +2002,51 @@ impl<'w, 'a> FnCx<'w, 'a> {
             self.expect(&l.ty, &Ty::Bool, l.span, &format!("`{}`", op.text()))?;
             self.expect(&r.ty, &Ty::Bool, r.span, &format!("`{}`", op.text()))?;
             return Ok(self.mk(TK::Bin(op, Box::new(l), Box::new(r)), Ty::Bool, sp));
+        }
+        // Operators on structs: their methods (`def +(o)`, `def ==(o)`, `def <=>(o)`).
+        let lres = self.resolve(&l.ty);
+        if let Some(sn) = lres.type_name() {
+            let sn = sn.to_string();
+            let sn = &sn;
+            let m = match op {
+                BinOp::Add => "+",
+                BinOp::Sub => "-",
+                BinOp::Mul => "*",
+                BinOp::Div => "/",
+                BinOp::Rem => "%",
+                BinOp::Eq | BinOp::Ne => "==",
+                BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => "<=>",
+                _ => "",
+            };
+            if let Some(&def) = self.w.by_name.get(&method_name(sn, m)) {
+                let call = self.call_def(def, m, sp, vec![l, r], sp)?;
+                return Ok(match op {
+                    BinOp::Ne => {
+                        self.expect(&call.ty, &Ty::Bool, sp, "`==`")?;
+                        self.mk(TK::Not(Box::new(call)), Ty::Bool, sp)
+                    }
+                    BinOp::Eq => {
+                        self.expect(&call.ty, &Ty::Bool, sp, "`==`")?;
+                        call
+                    }
+                    BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
+                        self.expect(&call.ty, &Ty::Int, sp, "`<=>`")?;
+                        let z = self.mk(TK::Int(0), Ty::Int, sp);
+                        self.mk(TK::Bin(op, Box::new(call), Box::new(z)), Ty::Bool, sp)
+                    }
+                    _ => call,
+                });
+            }
+            if !m.is_empty() && !matches!(op, BinOp::Eq | BinOp::Ne) {
+                return Err(Diag::new(sp, format!("`{}` on {sn}: define `def {m}(other)` inside `struct {sn}`", op.text())));
+            }
+        }
+        if matches!(op, BinOp::Eq | BinOp::Ne) && matches!(lres, Ty::Struct(..) | Ty::Tuple(_) | Ty::Enum(..)) {
+            if !self.unify(&l.ty, &r.ty) {
+                return Err(Diag::new(sp, format!("`{}` between {} and {}", op.text(), lres.show(), self.resolve(&r.ty).show())));
+            }
+            let eq = self.struct_eq(l, r, sp)?;
+            return Ok(if op == BinOp::Ne { self.mk(TK::Not(Box::new(eq)), Ty::Bool, sp) } else { eq });
         }
         // Constants fold exactly (Go).
         if let (TK::Const(a), TK::Const(b)) = (&l.kind, &r.kind) {
@@ -1830,6 +2176,20 @@ impl<'w, 'a> FnCx<'w, 'a> {
         let Some(recv) = recv else {
             return self.global_call(name, name_span, args, block, bsym, sp);
         };
+        if name.ends_with('!') {
+            let st = match &recv.kind {
+                ExprKind::Name(n) if n == "self" && self.method.is_some() => self.self_struct(),
+                _ => self.peek_ty(recv),
+            };
+            if let Some(sn) = st.as_ref().and_then(|t| t.type_name()) {
+                if let Some(&def) = self.w.by_name.get(&method_name(sn, name)) {
+                    if block.is_some() {
+                        return Err(Diag::new(sp, format!("`{name}` doesn't take a block")));
+                    }
+                    return self.mutating_call(recv, def, name, name_span, args, sp);
+                }
+            }
+        }
         let r = self.expr(recv)?;
         self.method(r, name, name_span, args, block, bsym, sp)
     }
@@ -1845,6 +2205,7 @@ impl<'w, 'a> FnCx<'w, 'a> {
                     return Err(Diag::new(sp, format!("`{name}` takes one argument")));
                 }
                 let v = self.value(&args[0])?;
+                let v = self.show_value(v)?;
                 return Ok(self.mk(TK::Puts(Box::new(v)), Ty::Unit, sp));
             }
             "loop" => {
@@ -1877,6 +2238,17 @@ impl<'w, 'a> FnCx<'w, 'a> {
             _ => {}
         }
         let _ = bsym;
+        // Inside a method, a bare name is a field or method of `self`.
+        if self.method.is_some() && self.lookup("self").is_some() {
+            let st = self.self_struct();
+            if let Some(Ty::Struct(sn, fs)) = &st {
+                let is_field = args.is_empty() && block.is_none() && fs.iter().any(|(f, _)| f == name);
+                if is_field || self.w.by_name.contains_key(&method_name(sn, name)) {
+                    let me = Expr { kind: ExprKind::Name("self".into()), span: name_span, id: NodeId::MAX };
+                    return self.call(Some(&me), name, name_span, args, block, bsym, sp);
+                }
+            }
+        }
         let Some(&def) = self.w.by_name.get(name) else {
             let mut msg = format!("undefined local variable or method `{name}`");
             let cands: Vec<String> = self.scopes.iter().flat_map(|s| s.keys().cloned()).chain(self.w.by_name.keys().cloned()).collect();
@@ -1889,13 +2261,23 @@ impl<'w, 'a> FnCx<'w, 'a> {
             return Err(Diag::new(sp, format!("`{name}` doesn't take a block")));
         }
         let d = self.w.defs[def].def.clone();
-        let ext = self.w.defs[def].external.as_ref().map(|e| e.params.clone());
         if args.len() != d.params.len() {
             return Err(Diag::new(name_span, format!("`{name}` takes {} argument(s), got {}", d.params.len(), args.len())));
         }
+        let targs = args.iter().map(|a| self.value(a)).collect::<R<Vec<_>>>()?;
+        self.call_def(def, name, name_span, targs, sp)
+    }
+
+    /// Call def `def` with checked arguments (a method's include `self`).
+    fn call_def(&mut self, def: usize, name: &str, name_span: Span, args: Vec<TExpr>, sp: Span) -> R<TExpr> {
+        let d = self.w.defs[def].def.clone();
+        let ext = self.w.defs[def].external.as_ref().map(|e| e.params.clone());
+        if args.len() != d.params.len() {
+            let own = usize::from(d.params.first().is_some_and(|p| p.name == "self"));
+            return Err(Diag::new(name_span, format!("`{name}` takes {} argument(s), got {}", d.params.len() - own, args.len() - own)));
+        }
         let mut targs = vec![];
-        for (i, (a, p)) in args.iter().zip(&d.params).enumerate() {
-            let v = self.value(a)?;
+        for (i, (v, p)) in args.into_iter().zip(&d.params).enumerate() {
             let want = match (&ext, &p.ty) {
                 (Some(ts), _) => Some(ts[i].clone()),
                 (None, Some(t)) => Some(type_from(t, &self.w.structs, &self.w.consts)?),
@@ -1955,6 +2337,47 @@ impl<'w, 'a> FnCx<'w, 'a> {
 
     fn const_call(&mut self, c: &str, csp: Span, name: &str, name_span: Span, args: &[Expr], block: Option<&Block>, sp: Span) -> R<TExpr> {
         let argv = |cx: &mut Self| args.iter().map(|a| cx.value(a)).collect::<R<Vec<_>>>();
+        if let Some(et @ Ty::Enum(..)) = self.w.structs.get(c).cloned() {
+            let Ty::Enum(_, vs) = &et else { unreachable!() };
+            let Some(k) = vs.iter().position(|(v, _)| v == name) else {
+                return Err(Diag::new(name_span, format!("{c} has no variant `{name}`; its variants are {}", vs.iter().map(|(v, _)| v.as_str()).collect::<Vec<_>>().join(", "))));
+            };
+            if block.is_some() {
+                return Err(Diag::new(sp, "a variant doesn't take a block"));
+            }
+            let fields = &vs[k].1;
+            let mut given: Vec<Option<TExpr>> = vec![None; fields.len()];
+            let kw = args.iter().any(|a| matches!(a.kind, ExprKind::KwArg(..)));
+            if !kw && args.len() != fields.len() {
+                return Err(Diag::new(sp, format!("`{c}.{name}` takes {} value(s) ({}), got {}", fields.len(), fields.iter().map(|(f, _)| f.as_str()).collect::<Vec<_>>().join(", "), args.len())));
+            }
+            for (i, a) in args.iter().enumerate() {
+                let (j, v) = match &a.kind {
+                    ExprKind::KwArg(n, nsp, v) => match fields.iter().position(|(f, _)| f == n) {
+                        Some(j) => (j, v.as_ref()),
+                        None => return Err(Diag::new(*nsp, format!("`{c}.{name}` has no field `{n}`"))),
+                    },
+                    _ if kw => return Err(Diag::new(a.span, format!("`{c}.{name}`: mix of positional and keyword arguments; use one or the other"))),
+                    _ => (i, a),
+                };
+                let ft = fields[j].1.clone();
+                let v = self.value(v)?;
+                let v = self.coerce(v, &ft)?;
+                self.expect(&v.ty, &ft, v.span, &format!("`{c}.{name}` field `{}`", fields[j].0))?;
+                given[j] = Some(v);
+            }
+            let mut slots = vec![];
+            for (vk, (_, fs)) in vs.iter().enumerate() {
+                for (j, (f, ft)) in fs.iter().enumerate() {
+                    let v = if vk == k { given[j].take() } else { None };
+                    slots.push(match v {
+                        Some(v) => v,
+                        None => self.zero_of(ft, sp).ok_or_else(|| Diag::new(sp, format!("`{c}.{name}` needs `{f}`: {} has no zero value", ft.show())))?,
+                    });
+                }
+            }
+            return Ok(self.mk(TK::M(M::VariantNew(k), None, slots, None), et.clone(), sp));
+        }
         if let (Some(st), "new") = (self.w.structs.get(c).cloned(), name) {
             let Ty::Struct(_, fields) = &st else { unreachable!() };
             if args.is_empty() || args.iter().any(|a| matches!(a.kind, ExprKind::KwArg(..))) {
@@ -2296,7 +2719,37 @@ impl<'w, 'a> FnCx<'w, 'a> {
                 }
                 return Ok(mk_m(self, M::TupleGet(k), recv, vec![], None, ft));
             }
+            if let Some(&def) = self.w.by_name.get(&method_name(sn, name)) {
+                if name.ends_with('!') {
+                    return Err(Diag::new(recv.span, format!("`{name}` changes its receiver; call it on a variable")));
+                }
+                if block.is_some() {
+                    return Err(Diag::new(sp, format!("`{name}` doesn't take a block")));
+                }
+                let mut targs = vec![recv];
+                for a in args {
+                    targs.push(self.value(a)?);
+                }
+                return self.call_def(def, name, name_span, targs, sp);
+            }
             return Err(self.no_field(sn, fs, name, name_span));
+        }
+        if let Ty::Enum(en, vs) = &rt {
+            if let Some(&def) = self.w.by_name.get(&method_name(en, name)) {
+                if name.ends_with('!') {
+                    return Err(Diag::new(recv.span, format!("`{name}` changes its receiver; call it on a variable")));
+                }
+                let mut targs = vec![recv];
+                for a in args {
+                    targs.push(self.value(a)?);
+                }
+                return self.call_def(def, name, name_span, targs, sp);
+            }
+            if name == "to_i" && vs.iter().all(|(_, fs)| fs.is_empty()) {
+                // Payload-free enums are Go's iota constants.
+                return Ok(mk_m(self, M::EnumTag, recv, vec![], None, Ty::Int));
+            }
+            return Err(Diag::new(name_span, format!("no method `{name}` on {en}")));
         }
         // Float methods
         if rt == Ty::Float {
@@ -2304,6 +2757,7 @@ impl<'w, 'a> FnCx<'w, 'a> {
                 "to_f" => return Ok(recv),
                 "to_i" | "to_int" | "truncate" => return Ok(mk_m(self, M::FloatToI, recv, vec![], None, Ty::Int)),
                 "abs" => return Ok(mk_m(self, M::FloatAbs, recv, vec![], None, Ty::Float)),
+                "sqrt" => return Ok(self.mk(TK::M(M::Sqrt, None, vec![recv], None), Ty::Float, sp)),
                 "to_s" => return Ok(mk_m(self, M::FloatToS, recv, vec![], None, Ty::Str)),
                 _ => {}
             }

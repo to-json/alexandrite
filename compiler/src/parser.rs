@@ -39,6 +39,9 @@ impl<'a> Parser<'a> {
     fn space_before(&self) -> bool {
         self.toks[self.pos].space_before
     }
+    fn space_before_at(&self, k: usize) -> bool {
+        self.toks[(self.pos + k).min(self.toks.len() - 1)].space_before
+    }
     fn bump(&mut self) -> Token {
         let t = self.toks[self.pos].clone();
         if self.pos < self.toks.len() - 1 {
@@ -89,7 +92,7 @@ impl<'a> Parser<'a> {
     // ---------- module ----------
 
     fn module(&mut self, file: u32) -> PResult<Module> {
-        let mut m = Module { file, overflow: Overflow::Abort, requires: vec![], defs: vec![], structs: vec![], consts: vec![], main: vec![] };
+        let mut m = Module { file, overflow: Overflow::Abort, requires: vec![], defs: vec![], structs: vec![], enums: vec![], consts: vec![], main: vec![] };
         self.skip_newlines();
         while let Tok::Directive(name, arg) = self.peek().clone() {
             let sp = self.bump().span;
@@ -114,7 +117,14 @@ impl<'a> Parser<'a> {
                     }
                 }
                 Tok::Attr(_) | Tok::Kw(Kw::Def) | Tok::Kw(Kw::Fn) => m.defs.push(self.def()?),
-                Tok::Kw(Kw::Struct) => m.structs.push(self.struct_def()?),
+                Tok::Kw(Kw::Struct) => {
+                    let s = self.struct_def(&mut m.defs)?;
+                    m.structs.push(s);
+                }
+                Tok::Kw(Kw::Enum) => {
+                    let e = self.enum_def(&mut m.defs)?;
+                    m.enums.push(e);
+                }
                 Tok::Const(name) if matches!(self.peek_at(1), Tok::Op("=") | Tok::Op(":")) => {
                     // `NAME = expr` / `NAME: Type = expr`: a constant.
                     let sp = self.bump().span;
@@ -135,6 +145,11 @@ impl<'a> Parser<'a> {
     }
 
     fn def(&mut self) -> PResult<Def> {
+        self.def_in(None)
+    }
+
+    /// A def; inside `struct Owner { }` it is a method taking `self`.
+    fn def_in(&mut self, owner: Option<&str>) -> PResult<Def> {
         let start = self.span();
         let mut pure = false;
         while let Tok::Attr(a) = self.peek().clone() {
@@ -155,10 +170,23 @@ impl<'a> Parser<'a> {
         let name_span = self.span();
         let name = match self.bump().tok {
             Tok::Ident(n) => n,
+            // Operators, inside a struct: `def +(o)`, `def ==(o)`, `def <=>(o)`, `def [](i)`.
+            Tok::Op(op @ ("+" | "-" | "*" | "/" | "%" | "==" | "<=>")) if owner.is_some() => op.to_string(),
+            Tok::Op("[") if owner.is_some() && self.eat_op("]") => "[]".to_string(),
             t => return Err(Diag::new(name_span, format!("expected a method name, found {}", describe(&t)))),
         };
         self.scopes.push(HashSet::new());
         let mut params = vec![];
+        if let Some(o) = owner {
+            let t = TypeExpr::Named(o.to_string(), name_span);
+            let ty = if name.ends_with('!') { TypeExpr::Array(Box::new(t), name_span) } else { t };
+            self.declare("self");
+            params.push(Param { name: "self".into(), ty: Some(ty), span: name_span });
+        }
+        let name = match owner {
+            Some(o) => method_name(o, &name),
+            None => name,
+        };
         if self.is_op("(") && !self.space_before() {
             self.bump();
             while !self.is_op(")") {
@@ -188,7 +216,62 @@ impl<'a> Parser<'a> {
         Ok(Def { name, span: start.to(self.prev_span()), name_span, params, ret, fallible, pure, body })
     }
 
-    fn struct_def(&mut self) -> PResult<StructDef> {
+    fn enum_def(&mut self, methods: &mut Vec<Def>) -> PResult<EnumDef> {
+        let start = self.bump().span;
+        let sp = self.span();
+        let name = match self.bump().tok {
+            Tok::Const(n) => n,
+            t => return Err(Diag::new(sp, format!("expected an enum name (capitalized), found {}", describe(&t)))),
+        };
+        self.expect_op("{")?;
+        let mut variants: Vec<(String, Vec<(String, TypeExpr, Span)>, Span)> = vec![];
+        loop {
+            self.skip_newlines();
+            while self.eat_op(",") {
+                self.skip_newlines();
+            }
+            if self.eat_op("}") {
+                break;
+            }
+            if matches!(self.peek(), Tok::Attr(_) | Tok::Kw(Kw::Def) | Tok::Kw(Kw::Fn)) {
+                methods.push(self.def_in(Some(&name))?);
+                continue;
+            }
+            let vsp = self.span();
+            let vname = match self.bump().tok {
+                Tok::Const(n) => n,
+                t => return Err(Diag::new(vsp, format!("expected a variant name (capitalized), found {}", describe(&t)))),
+            };
+            if variants.iter().any(|(v, _, _)| *v == vname) {
+                return Err(Diag::new(vsp, format!("variant `{vname}` is declared twice")));
+            }
+            let mut fields = vec![];
+            if self.is_op("(") && !self.space_before() {
+                self.bump();
+                while !self.is_op(")") {
+                    let fsp = self.span();
+                    // `name: Type`, or just `Type` (fields named 0, 1, ...).
+                    let fname = if let (Tok::Ident(n), Tok::Op(":")) = (self.peek().clone(), self.peek_at(1).clone()) {
+                        self.bump();
+                        self.bump();
+                        n
+                    } else {
+                        fields.len().to_string()
+                    };
+                    let ty = self.type_expr()?;
+                    fields.push((fname, ty, fsp));
+                    if !self.eat_op(",") {
+                        break;
+                    }
+                }
+                self.expect_op(")")?;
+            }
+            variants.push((vname, fields, vsp));
+        }
+        Ok(EnumDef { name, span: start.to(self.prev_span()), variants })
+    }
+
+    fn struct_def(&mut self, methods: &mut Vec<Def>) -> PResult<StructDef> {
         let start = self.bump().span;
         let sp = self.span();
         let name = match self.bump().tok {
@@ -204,6 +287,10 @@ impl<'a> Parser<'a> {
             }
             if self.eat_op("}") {
                 break;
+            }
+            if matches!(self.peek(), Tok::Attr(_) | Tok::Kw(Kw::Def) | Tok::Kw(Kw::Fn)) {
+                methods.push(self.def_in(Some(&name))?);
+                continue;
             }
             let fsp = self.span();
             let fname = match self.bump().tok {
@@ -309,7 +396,7 @@ impl<'a> Parser<'a> {
                 self.bump();
                 return self.for_rest(start);
             }
-            Tok::Kw(Kw::Struct) => return Err(Diag::new(start, "structs can only be defined at the top level")),
+            Tok::Kw(Kw::Struct) | Tok::Kw(Kw::Enum) => return Err(Diag::new(start, "types can only be defined at the top level")),
             Tok::Ident(name) if matches!(self.peek_at(1), Tok::Op(":")) && matches!(self.peek_at(2), Tok::Const(_) | Tok::Op("[")) => {
                 // `x: T = e`
                 let sp = self.bump().span;
@@ -441,12 +528,45 @@ impl<'a> Parser<'a> {
             }
             let asp = self.span();
             let mut pats = vec![];
+            self.scopes.push(HashSet::new());
             if matches!(self.peek(), Tok::Ident(n) if n == "_") && matches!(self.peek_at(1), Tok::Op("=>")) {
                 self.bump();
             } else if subject.is_none() {
                 pats.push(Pat::Value(self.expr()?));
             } else {
                 loop {
+                    if let Tok::Const(vname) = self.peek().clone() {
+                        let paren = matches!(self.peek_at(1), Tok::Op("(")) && !self.space_before_at(1);
+                        if paren || matches!(self.peek_at(1), Tok::Op("=>") | Tok::Op("|")) {
+                            let vsp = self.bump().span;
+                            let binds = if paren {
+                                self.bump();
+                                let mut bs = vec![];
+                                while !self.is_op(")") {
+                                    let bsp = self.span();
+                                    match self.bump().tok {
+                                        Tok::Ident(n) => {
+                                            self.declare(&n);
+                                            bs.push((n, bsp));
+                                        }
+                                        t => return Err(Diag::new(bsp, format!("expected a name to bind (or `_`), found {}", describe(&t)))),
+                                    }
+                                    if !self.eat_op(",") {
+                                        break;
+                                    }
+                                }
+                                self.expect_op(")")?;
+                                Some(bs)
+                            } else {
+                                None
+                            };
+                            pats.push(Pat::Variant(vname, binds, vsp.to(self.prev_span())));
+                            if !self.eat_op("|") {
+                                break;
+                            }
+                            continue;
+                        }
+                    }
                     let lo = self.shift()?;
                     let pat = if self.is_op("..") || self.is_op("...") {
                         let excl = self.bump().tok == Tok::Op("...");
@@ -467,6 +587,7 @@ impl<'a> Parser<'a> {
                 let e = self.expr()?;
                 vec![Stmt { span: e.span, kind: StmtKind::Expr(e) }]
             };
+            self.scopes.pop();
             arms.push(CaseArm { pats, body, span: asp.to(self.prev_span()) });
         }
         self.in_cond = saved;
@@ -723,7 +844,7 @@ impl<'a> Parser<'a> {
                 let name_span = self.span();
                 let name = match self.bump().tok {
                     Tok::Ident(n) => n,
-                    Tok::Const(n) if n == "new" => n,
+                    Tok::Const(n) => n,
                     t => return Err(Diag::new(name_span, format!("expected a method name after `.`, found {}", describe(&t)))),
                 };
                 let (args, block_sym) = if self.is_op("(") && !self.space_before() { self.call_args()? } else { (vec![], None) };

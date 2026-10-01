@@ -70,6 +70,7 @@ GROUPS = {
     "pe008": "A5", "pe022": "A5",
     "nbody": "A7",
     "ints": "M1",
+    "syntax": "M2",
 }
 
 

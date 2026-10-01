@@ -9,6 +9,8 @@ pub enum Tok {
     BigInt(String),
     /// Value and source text.
     Float(f64, String),
+    /// A double-quoted string with `#{...}` parts.
+    Interp(Vec<IPiece>),
     Str(String),
     Ident(String),
     Const(String),
@@ -22,6 +24,14 @@ pub enum Tok {
     Op(&'static str),
     Newline,
     Eof,
+}
+
+/// A piece of an interpolated string: literal text, or the source of an
+/// embedded expression and its byte offset in the file.
+#[derive(Debug, Clone, PartialEq)]
+pub enum IPiece {
+    Lit(String),
+    Code(String, u32),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -41,6 +51,12 @@ pub enum Kw {
     Try,
     Require,
     Struct,
+    /// `fn` and `ƒ`: a pure `def`
+    Fn,
+    For,
+    In,
+    Case,
+    Defer,
 }
 
 #[derive(Debug, Clone)]
@@ -52,21 +68,26 @@ pub struct Token {
 }
 
 /// Longest first: the lexer takes the first match.
-const OPS: [&str; 50] = [
-    "&^=", "+%=", "-%=", "*%=", "<<=", ">>=", "**=", "...", "<=>", "**", "==", "!=", "<=", ">=", "&&", "||", "&^", "<<", ">>", "..",
+const OPS: [&str; 51] = [
+    "&^=", "+%=", "-%=", "*%=", "<<=", ">>=", "**=", "...", "<=>", "**", "==", "=>", "!=", "<=", ">=", "&&", "||", "&^", "<<", ">>", "..",
     "+=", "-=", "*=", "/=", "%=", "&=", "|=", "^=", "+%", "-%", "*%", "->", "&:", "+", "-", "*", "/", "%", "<", ">", "=", "!", "?",
     ":", ".", ",", ";", "|", "&", "^",
 ];
 const BRACKETS: [&str; 6] = ["(", ")", "[", "]", "{", "}"];
 
 pub fn lex(file: u32, src: &str) -> Result<Vec<Token>, Diag> {
+    lex_at(file, src, 0)
+}
+
+/// Lex `src`, which starts at byte `base` of the file (interpolated code).
+pub fn lex_at(file: u32, src: &str, base: u32) -> Result<Vec<Token>, Diag> {
     let b = src.as_bytes();
     let mut i = 0usize;
     let mut out: Vec<Token> = Vec::new();
     // Heredocs whose bodies start on the next line: (index in `out`, terminator, squiggly).
     let mut pending: Vec<(usize, String, bool)> = Vec::new();
     let mut space = false;
-    let sp = |lo: usize, hi: usize| Span { file, lo: lo as u32, hi: hi as u32 };
+    let sp = |lo: usize, hi: usize| Span { file, lo: base + lo as u32, hi: base + hi as u32 };
     while i < b.len() {
         let c = b[i];
         if c == b' ' || c == b'\t' || c == b'\r' {
@@ -205,6 +226,12 @@ pub fn lex(file: u32, src: &str) -> Result<Vec<Token>, Diag> {
             space = false;
             continue;
         }
+        if src[i..].starts_with('ƒ') {
+            out.push(Token { tok: Tok::Kw(Kw::Fn), span: sp(i, i + 'ƒ'.len_utf8()), space_before: space });
+            i += 'ƒ'.len_utf8();
+            space = false;
+            continue;
+        }
         if c.is_ascii_alphabetic() || c == b'_' {
             while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_') {
                 i += 1;
@@ -234,6 +261,11 @@ pub fn lex(file: u32, src: &str) -> Result<Vec<Token>, Diag> {
                 "try" => Tok::Kw(Kw::Try),
                 "require" => Tok::Kw(Kw::Require),
                 "struct" => Tok::Kw(Kw::Struct),
+                "fn" => Tok::Kw(Kw::Fn),
+                "for" => Tok::Kw(Kw::For),
+                "in" => Tok::Kw(Kw::In),
+                "case" => Tok::Kw(Kw::Case),
+                "defer" => Tok::Kw(Kw::Defer),
                 w if w.as_bytes()[0].is_ascii_uppercase() => Tok::Const(w.to_string()),
                 w => Tok::Ident(w.to_string()),
             };
@@ -245,6 +277,7 @@ pub fn lex(file: u32, src: &str) -> Result<Vec<Token>, Diag> {
             let q = c;
             i += 1;
             let mut s = String::new();
+            let mut pieces: Vec<IPiece> = Vec::new();
             loop {
                 if i >= b.len() || b[i] == b'\n' {
                     return Err(Diag::new(sp(start, i), "unterminated string"));
@@ -263,11 +296,52 @@ pub fn lex(file: u32, src: &str) -> Result<Vec<Token>, Diag> {
                     i += 2;
                     continue;
                 }
+                if q == b'"' && b[i] == b'#' && b.get(i + 1) == Some(&b'{') {
+                    // `#{ expr }`: find the matching brace (strings inside count).
+                    let open = i + 2;
+                    let mut j = open;
+                    let mut depth = 1;
+                    let mut in_str: Option<u8> = None;
+                    while j < b.len() && b[j] != b'\n' {
+                        match (in_str, b[j]) {
+                            (Some(qq), x) if x == qq => in_str = None,
+                            (Some(_), b'\\') => j += 1,
+                            (Some(_), _) => {}
+                            (None, b'"' | b'\'') => in_str = Some(b[j]),
+                            (None, b'{') => depth += 1,
+                            (None, b'}') => {
+                                depth -= 1;
+                                if depth == 0 {
+                                    break;
+                                }
+                            }
+                            _ => {}
+                        }
+                        j += 1;
+                    }
+                    if j >= b.len() || b[j] != b'}' {
+                        return Err(Diag::new(sp(i, i + 2), "unterminated `#{` in string"));
+                    }
+                    if !s.is_empty() {
+                        pieces.push(IPiece::Lit(std::mem::take(&mut s)));
+                    }
+                    pieces.push(IPiece::Code(src[open..j].to_string(), base + open as u32));
+                    i = j + 1;
+                    continue;
+                }
                 let ch = src[i..].chars().next().unwrap();
                 s.push(ch);
                 i += ch.len_utf8();
             }
-            out.push(Token { tok: Tok::Str(s), span: sp(start, i), space_before: space });
+            let tok = if pieces.is_empty() {
+                Tok::Str(s)
+            } else {
+                if !s.is_empty() {
+                    pieces.push(IPiece::Lit(s));
+                }
+                Tok::Interp(pieces)
+            };
+            out.push(Token { tok, span: sp(start, i), space_before: space });
             space = false;
             continue;
         }

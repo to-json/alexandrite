@@ -211,6 +211,8 @@ pub enum TK {
     PlaceAssign(LocalId, Vec<TStep>, Option<BinOp>, Box<TExpr>),
     /// `format("...", args)`: pieces checked against the arguments.
     Format(Vec<FmtPiece>, Vec<TExpr>),
+    /// Statements whose value is the last one's (a `case` arm, a desugaring).
+    Seq(Vec<TStmt>),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -262,6 +264,8 @@ pub enum TStmt {
     Next(Span),
     Break(Option<TExpr>, Span),
     Return(Option<TExpr>, Span),
+    /// Run when the enclosing block exits.
+    Defer(TExpr),
 }
 
 #[derive(Clone, Debug)]

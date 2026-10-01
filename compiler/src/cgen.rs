@@ -302,9 +302,10 @@ impl FnEmit<'_> {
     }
 
     fn err_path(&mut self, path: &ErrPath, e: &str) {
-        match (path, self.ctx) {
-            (ErrPath::Die, _) | (_, Ctx::Main) | (_, Ctx::Gen) | (_, Ctx::Plain) => self.line(&format!("alx_die({e});")),
-            (ErrPath::Return, Ctx::Fallible) | (ErrPath::Return, Ctx::Worker) => self.line(&format!("{{ *err_ = {e}; return false; }}")),
+        self.block(path.cleanup());
+        match (path.is_return(), self.ctx) {
+            (true, Ctx::Fallible | Ctx::Worker) => self.line(&format!("{{ *err_ = {e}; return false; }}")),
+            _ => self.line(&format!("alx_die({e});")),
         }
     }
 

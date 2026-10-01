@@ -45,7 +45,7 @@ fn scan_assigns_stmt(s: &TStmt, c: &mut HashSet<LocalId>) {
             scan_assigns(e, c);
             a.iter().chain(b).for_each(|s| scan_assigns_stmt(s, c));
         }
-        TStmt::Break(Some(e), _) | TStmt::Return(Some(e), _) => scan_assigns(e, c),
+        TStmt::Break(Some(e), _) | TStmt::Return(Some(e), _) | TStmt::Defer(e) => scan_assigns(e, c),
         _ => {}
     }
 }
@@ -80,6 +80,11 @@ fn each_child(e: &TExpr, f: &mut dyn FnMut(&TExpr)) {
             f(b);
         }
         TK::Call(_, args) | TK::Array(args) | TK::Format(_, args) => args.iter().for_each(f),
+        TK::Seq(ss) => {
+            for s in ss {
+                stmt_exprs(s, f);
+            }
+        }
         TK::PlaceAssign(_, steps, _, v) => {
             for st in steps {
                 if let TStep::Index(i) = st {
@@ -115,7 +120,7 @@ fn stmt_exprs(s: &TStmt, f: &mut dyn FnMut(&TExpr)) {
             f(e);
             a.iter().chain(b).for_each(|s| stmt_exprs(s, f));
         }
-        TStmt::Break(Some(e), _) | TStmt::Return(Some(e), _) => f(e),
+        TStmt::Break(Some(e), _) | TStmt::Return(Some(e), _) | TStmt::Defer(e) => f(e),
         _ => {}
     }
 }

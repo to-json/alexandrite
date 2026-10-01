@@ -21,11 +21,11 @@ pub fn lower(p: &TProgram, sm: &SourceMap, opts: &Opts) -> LProgram {
     let prog = RefCell::new(LProgram::default());
     for f in &p.funcs {
         let lf = if f.external {
-            let mut lw = Lw::new(p, sm, opts, f, f.overflow, ErrPath::Return, &prog);
+            let mut lw = Lw::new(p, sm, opts, f, f.overflow, ErrPath::Return(vec![]), &prog);
             let params = f.params.iter().map(|l| lw.var_of(*l)).collect();
             LFunc { name: f.cname.clone(), params, vars: lw.vars, ret: lty(&f.ret, f.overflow), fallible: f.fallible, body: vec![], external: true, is_main: false, labels: 0 }
         } else {
-            let path = if f.is_main { ErrPath::Die } else { ErrPath::Return };
+            let path = if f.is_main { ErrPath::Die(vec![]) } else { ErrPath::Return(vec![]) };
             let mut lw = Lw::new(p, sm, opts, f, f.overflow, path, &prog);
             let params: Vec<V> = f.params.iter().map(|l| lw.var_of(*l)).collect();
             lw.analyze_facts(&f.body);
@@ -79,8 +79,11 @@ struct Lw<'a> {
     local_var: HashMap<LocalId, V>,
     out: Vec<Vec<LS>>,
     labels: usize,
-    next_target: Vec<Option<Label>>,
-    break_target: Vec<Label>,
+    /// Loop targets, each with the defer depth where its body starts.
+    next_target: Vec<(Option<Label>, usize)>,
+    break_target: Vec<(Label, usize)>,
+    /// `defer`red expressions per open block, innermost last.
+    defers: Vec<Vec<TExpr>>,
     path: ErrPath,
     /// Inside `try (arith)`: arithmetic fails to the error path.
     try_arith: bool,
@@ -112,6 +115,7 @@ impl<'a> Lw<'a> {
             labels: 0,
             next_target: vec![],
             break_target: vec![],
+            defers: vec![],
             path,
             try_arith: false,
             consts: HashMap::new(),
@@ -287,23 +291,88 @@ impl<'a> Lw<'a> {
 
     fn body_with_return(&mut self, body: &[TStmt], returns_value: bool) -> Vec<LS> {
         self.sub(|lw| {
+            lw.defers.push(vec![]);
             for (i, s) in body.iter().enumerate() {
                 if returns_value && i == body.len() - 1 {
                     if let TStmt::Expr(e) = s {
-                        let v = lw.expr(e);
+                        let mut v = lw.expr(e);
+                        if lw.has_defers(0) {
+                            let t = lw.lty(&e.ty);
+                            v = lw.bind(v, t);
+                            lw.emit_defers(0);
+                        }
                         lw.emit(LS::Return(Some(v)));
                         continue;
                     }
                 }
                 lw.stmt(s);
             }
+            lw.emit_defers(0);
+            lw.defers.pop();
         })
     }
 
     fn stmts(&mut self, ss: &[TStmt]) {
+        self.defers.push(vec![]);
         for s in ss {
             self.stmt(s);
         }
+        let depth = self.defers.len() - 1;
+        self.emit_defers(depth);
+        self.defers.pop();
+    }
+
+    fn has_defers(&self, from: usize) -> bool {
+        self.defers[from.min(self.defers.len())..].iter().any(|d| !d.is_empty())
+    }
+
+    /// Run the deferred code of blocks `from..` (innermost first), as when
+    /// leaving them. Errors inside deferred code clean up only outer blocks.
+    fn emit_defers(&mut self, from: usize) {
+        if !self.has_defers(from) {
+            return;
+        }
+        let saved = self.defers.clone();
+        for depth in (from..saved.len()).rev() {
+            self.defers.truncate(depth);
+            for e in saved[depth].iter().rev() {
+                self.stmt(&TStmt::Expr(e.clone()));
+            }
+        }
+        self.defers = saved;
+    }
+
+    /// The error path here: the function's, plus the deferred code of every open block.
+    fn err_path(&mut self) -> ErrPath {
+        let cleanup = if self.has_defers(0) { self.sub(|lw| lw.emit_defers(0)) } else { vec![] };
+        match self.path {
+            ErrPath::Return(_) => ErrPath::Return(cleanup),
+            ErrPath::Die(_) => ErrPath::Die(cleanup),
+        }
+    }
+
+    /// Lower statements whose last expression is the value, in their own
+    /// defer scope (the value is computed before the deferred code runs).
+    fn scoped_value(&mut self, ss: &[TStmt], ty: &Ty) -> LE {
+        self.defers.push(vec![]);
+        let mut val = LE::Unit;
+        for (i, s) in ss.iter().enumerate() {
+            if i + 1 == ss.len() {
+                if let TStmt::Expr(e) = s {
+                    val = self.expr(e);
+                    continue;
+                }
+            }
+            self.stmt(s);
+        }
+        let depth = self.defers.len() - 1;
+        if self.has_defers(depth) {
+            let t = self.lty(ty);
+            val = self.bind(val, t);
+            self.emit_defers(depth);
+        }
+        self.defers.pop();
+        val
     }
 
     fn stmt(&mut self, s: &TStmt) {
@@ -332,8 +401,8 @@ impl<'a> Lw<'a> {
                 let inner = self.sub(|lw| {
                     let cv = lw.expr(c);
                     lw.emit(LS::If(LE::Not(Box::new(cv)), vec![LS::Break(l)], vec![]));
-                    lw.next_target.push(Some(l));
-                    lw.break_target.push(l);
+                    lw.next_target.push((Some(l), lw.defers.len()));
+                    lw.break_target.push((l, lw.defers.len()));
                     lw.stmts(body);
                     lw.break_target.pop();
                     lw.next_target.pop();
@@ -347,19 +416,31 @@ impl<'a> Lw<'a> {
                 self.emit(LS::If(cv, a, b));
             }
             TStmt::Next(_) => match self.next_target.last() {
-                Some(Some(l)) => {
-                    let l = *l;
+                Some((Some(l), depth)) => {
+                    let (l, depth) = (*l, *depth);
+                    self.emit_defers(depth);
                     self.emit(LS::Continue(l));
                 }
                 _ => unreachable!("`next` outside a loop survived checking"),
             },
             TStmt::Break(_, _) => {
-                let l = *self.break_target.last().expect("break target");
+                let (l, depth) = *self.break_target.last().expect("break target");
+                self.emit_defers(depth);
                 self.emit(LS::Break(l));
             }
             TStmt::Return(v, _) => {
-                let v = v.as_ref().map(|v| self.expr(v));
-                self.emit(LS::Return(v));
+                let mut v = v.as_ref().map(|v| (self.expr(v), self.lty(&v.ty)));
+                if self.has_defers(0) {
+                    v = v.map(|(x, t)| (self.bind(x, t.clone()), t));
+                    self.emit_defers(0);
+                }
+                self.emit(LS::Return(v.map(|(x, _)| x)));
+            }
+            TStmt::Defer(e) => {
+                if self.defers.is_empty() {
+                    self.defers.push(vec![]);
+                }
+                self.defers.last_mut().unwrap().push(e.clone());
             }
         }
     }
@@ -379,6 +460,7 @@ impl<'a> Lw<'a> {
             TK::Float(v) => LE::F(*v),
             TK::PlaceAssign(l, steps, op, v) => self.place_assign(*l, steps, *op, v, e),
             TK::Format(pieces, args) => self.format(pieces, args),
+            TK::Seq(ss) => self.scoped_value(ss, &e.ty),
             TK::Str(s) => LE::S(s.clone()),
             TK::Bool(b) => LE::B(*b),
             TK::Unit => LE::Unit,
@@ -414,7 +496,7 @@ impl<'a> Lw<'a> {
                     LE::PArith(Op::Sub, Box::new(LE::ToP(Box::new(LE::I(0)))), Box::new(v))
                 } else if self.try_arith {
                     let dst = self.tmp(LTy::I64);
-                    let path = self.path.clone();
+                    let path = self.err_path();
                     self.emit(LS::TryArith { dst, op: Op::Sub, a: LE::I(0), b: v, loc: self.loc(e.span), path });
                     LE::Var(dst)
                 } else {
@@ -486,7 +568,7 @@ impl<'a> Lw<'a> {
     }
 
     fn try_expr(&mut self, inner: &TExpr) -> LE {
-        let path = self.path.clone();
+        let path = self.err_path();
         match &inner.kind {
             TK::Call(fid, args) => {
                 let f = &self.p.funcs[*fid];
@@ -599,7 +681,7 @@ impl<'a> Lw<'a> {
             _ if k == IntKind::I64 => {
                 if self.try_arith {
                     let dst = self.tmp(LTy::I64);
-                    let path = self.path.clone();
+                    let path = self.err_path();
                     self.emit(LS::TryArith { dst, op: lop, a, b, loc: self.loc(sp), path });
                     return LE::Var(dst);
                 }
@@ -634,7 +716,7 @@ impl<'a> Lw<'a> {
                 let b = self.bind(b, LTy::I64);
                 let zero = LE::Cmp(Op::Eq, Box::new(b.clone()), Box::new(LE::I(0)), LTy::I64);
                 if self.try_arith {
-                    let path = self.path.clone();
+                    let path = self.err_path();
                     self.emit(LS::FailIf { cond: zero, loc: self.loc(sp), path });
                 } else {
                     self.emit(LS::If(zero, vec![LS::Panic("division by zero".into(), self.loc(sp))], vec![]));
@@ -685,7 +767,7 @@ impl<'a> Lw<'a> {
     fn overflow_if(&mut self, cond: LE, k: IntKind, sp: Span) {
         let loc = self.loc(sp);
         if self.try_arith {
-            let path = self.path.clone();
+            let path = self.err_path();
             self.emit(LS::FailIf { cond, loc, path });
         } else {
             self.emit(LS::If(cond, vec![LS::Panic(format!("overflow ({})", k.name()), loc)], vec![]));
@@ -874,17 +956,12 @@ impl<'a> Lw<'a> {
                 }
             }
         }
-        self.next_target.push(next_label);
-        let mut val = LE::Unit;
-        for (i, s) in b.body.iter().enumerate() {
-            if i == b.body.len() - 1 {
-                if let TStmt::Expr(e) = s {
-                    val = self.expr(e);
-                    continue;
-                }
-            }
-            self.stmt(s);
-        }
+        self.next_target.push((next_label, self.defers.len()));
+        let ty = match b.body.last() {
+            Some(TStmt::Expr(e)) => e.ty.clone(),
+            _ => Ty::Unit,
+        };
+        let val = self.scoped_value(&b.body, &ty);
         self.next_target.pop();
         for p in &b.params {
             self.facts.remove(p);
@@ -1028,8 +1105,8 @@ impl<'a> Lw<'a> {
                 let l = self.label();
                 let b = blk.unwrap();
                 let inner = self.sub(|lw| {
-                    lw.next_target.push(Some(l));
-                    lw.break_target.push(l);
+                    lw.next_target.push((Some(l), lw.defers.len()));
+                    lw.break_target.push((l, lw.defers.len()));
                     lw.stmts(&b.body);
                     lw.break_target.pop();
                     lw.next_target.pop();
@@ -1071,7 +1148,7 @@ impl<'a> Lw<'a> {
             let next = if bounded { LE::Arith(Op::Add, Box::new(LE::Var(i)), Box::new(LE::Var(byv)), Ovf::Unchecked) } else { LE::Rt(Rt::SatAdd, vec![LE::Var(i), LE::Var(byv)]) };
             lw.emit(LS::Set(i, next));
             let xv = lw.int_out(LE::Var(x));
-            lw.break_target.push(l);
+            lw.break_target.push((l, lw.defers.len()));
             lw.inline_block(b, &[xv], &[fact], Some(l));
             lw.break_target.pop();
         });
@@ -1235,7 +1312,7 @@ impl<'a> Lw<'a> {
                 ToA | Sort => lw.emit(LS::Push(acc.unwrap(), x)),
                 Count => lw.emit(LS::Set(acc.unwrap(), LE::Arith(Op::Add, Box::new(LE::Var(acc.unwrap())), Box::new(LE::I(1)), Ovf::Unchecked))),
                 Each => {
-                    lw.break_target.push(outer);
+                    lw.break_target.push((outer, lw.defers.len()));
                     let v = lw.inline_block(blk.unwrap(), &[x], &[fact], Some(inner));
                     if !matches!(v, LE::Unit | LE::Var(_) | LE::I(_) | LE::B(_)) {
                         lw.emit(LS::Eval(v));
@@ -1659,7 +1736,7 @@ impl<'a> Lw<'a> {
             LTy::Gen(t) => *t,
             _ => unreachable!(),
         };
-        let mut g = Lw::new(self.p, self.sm, self.opts, self.f, self.mode, ErrPath::Die, self.prog);
+        let mut g = Lw::new(self.p, self.sm, self.opts, self.f, self.mode, ErrPath::Die(vec![]), self.prog);
         g.consts = self.consts.clone();
         g.fixed_len = self.fixed_len.clone();
         let cap_vars: Vec<V> = caps.iter().map(|l| g.var_of(*l)).collect();
@@ -1693,7 +1770,7 @@ impl<'a> Lw<'a> {
             LTy::Arr(t) => *t,
             _ => unreachable!(),
         };
-        let mut w = Lw::new(self.p, self.sm, self.opts, self.f, self.mode, ErrPath::Return, self.prog);
+        let mut w = Lw::new(self.p, self.sm, self.opts, self.f, self.mode, ErrPath::Return(vec![]), self.prog);
         let param = w.new_var("x", in_ty.clone());
         let (body_stmts, v) = w.sub_val(|w| w.inline_block(b, &[LE::Var(param)], &[], None));
         let mut body = body_stmts;
@@ -1705,7 +1782,7 @@ impl<'a> Lw<'a> {
         prog.workers.push(LWorker { id, input: in_ty, func });
         drop(prog);
         let dst = self.tmp(LTy::Arr(Box::new(out_ty)));
-        let path = self.path.clone();
+        let path = self.err_path();
         self.emit(LS::Pmap { dst, arr, worker: id, path });
         LE::Var(dst)
     }
@@ -1750,7 +1827,7 @@ fn collect_locals_stmt(s: &TStmt, out: &mut Vec<LocalId>) {
             collect_locals(c, out);
             a.iter().chain(b).for_each(|s| collect_locals_stmt(s, out));
         }
-        TStmt::Break(Some(e), _) | TStmt::Return(Some(e), _) => collect_locals(e, out),
+        TStmt::Break(Some(e), _) | TStmt::Return(Some(e), _) | TStmt::Defer(e) => collect_locals(e, out),
         _ => {}
     }
 }
@@ -1778,6 +1855,7 @@ fn collect_locals(e: &TExpr, out: &mut Vec<LocalId>) {
             collect_locals(c, out);
         }
         TK::Call(_, xs) | TK::Array(xs) | TK::Format(_, xs) => xs.iter().for_each(|x| collect_locals(x, out)),
+        TK::Seq(ss) => ss.iter().for_each(|s| collect_locals_stmt(s, out)),
         TK::PlaceAssign(l, steps, _, v) => {
             out.push(*l);
             for st in steps {

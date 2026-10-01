@@ -561,6 +561,7 @@ impl<'w, 'a> FnCx<'w, 'a> {
             TStmt::If(c, a, b) => TStmt::If(self.zonk(c), self.zonk_stmts(a), self.zonk_stmts(b)),
             TStmt::Break(e, sp) => TStmt::Break(e.map(|e| self.zonk(e)), sp),
             TStmt::Return(e, sp) => TStmt::Return(e.map(|e| self.zonk(e)), sp),
+            TStmt::Defer(e) => TStmt::Defer(self.zonk(e)),
             s => s,
         }
     }
@@ -613,6 +614,7 @@ impl<'w, 'a> FnCx<'w, 'a> {
             TK::Puts(x) => TK::Puts(b(x)),
             TK::Array(xs) => TK::Array(xs.into_iter().map(|a| self.zonk(a)).collect()),
             TK::Format(ps, xs) => TK::Format(ps, xs.into_iter().map(|a| self.zonk(a)).collect()),
+            TK::Seq(ss) => TK::Seq(self.zonk_stmts(ss)),
             TK::PlaceAssign(l, steps, op, v) => TK::PlaceAssign(
                 l,
                 steps
@@ -636,8 +638,12 @@ impl<'w, 'a> FnCx<'w, 'a> {
     fn body(&mut self, stmts: &[Stmt]) -> R<(Vec<TStmt>, Ty)> {
         let mut out = vec![];
         let mut last = Ty::Unit;
-        for s in stmts {
-            let t = self.stmt(s)?;
+        for (i, s) in stmts.iter().enumerate() {
+            // A trailing `if ... else ...` is the block's value (Ruby).
+            let t = match &s.kind {
+                StmtKind::If(c, a, b) if i + 1 == stmts.len() && !b.is_empty() => TStmt::Expr(self.if_value(c, a, b, s.span)?),
+                _ => self.stmt(s)?,
+            };
             last = match &t {
                 TStmt::Expr(e) => e.ty.clone(),
                 TStmt::Next(_) | TStmt::Break(..) | TStmt::Return(..) => Ty::Never,
@@ -696,6 +702,10 @@ impl<'w, 'a> FnCx<'w, 'a> {
                 let (a, _) = self.body(a)?;
                 let (b, _) = self.body(b)?;
                 TStmt::If(c, a, b)
+            }
+            StmtKind::Defer(e) => {
+                let v = self.expr(e)?;
+                TStmt::Defer(v)
             }
             StmtKind::Next => {
                 if self.loops.is_empty() {
@@ -926,6 +936,27 @@ impl<'w, 'a> FnCx<'w, 'a> {
                 let ty = inner.ty.clone();
                 self.mk(TK::Try(Box::new(inner)), ty, sp)
             }
+            ExprKind::Interp(parts) => {
+                let mut pieces = vec![];
+                let mut vals = vec![];
+                for p in parts {
+                    match p {
+                        InterpPart::Lit(s) => pieces.push(FmtPiece::Lit(s.clone())),
+                        InterpPart::Expr(x) => {
+                            let v = self.value(x)?;
+                            let t = self.resolve(&v.ty);
+                            if !matches!(t, Ty::Int | Ty::IntK(_) | Ty::Float | Ty::Str | Ty::Bool | Ty::Var(_)) {
+                                return Err(Diag::new(x.span, format!("can't interpolate a {} yet", t.show())).note("interpolation shows Int, Float, Str and Bool values"));
+                            }
+                            pieces.push(FmtPiece::Str(vals.len()));
+                            vals.push(v);
+                        }
+                    }
+                }
+                self.mk(TK::Format(pieces, vals), Ty::Str, sp)
+            }
+            ExprKind::Case(subject, arms) => return self.case(subject.as_deref(), arms, sp),
+            ExprKind::If(c, a, b) => return self.if_value(c, a, b, sp),
             ExprKind::KwArg(n, nsp, _) => return Err(Diag::new(*nsp, format!("keyword argument `{n}:` outside `Struct.new`")).note("keyword arguments name struct fields: `Body.new(x: 1.0, mass: m)`")),
             ExprKind::Array(items) => {
                 let el = self.site(e.id, 0);
@@ -1068,6 +1099,145 @@ impl<'w, 'a> FnCx<'w, 'a> {
             _ => return None,
         };
         Some(self.mk(kind, t.clone(), sp))
+    }
+
+    /// `case`: lowered to a chain of conditionals over a temporary.
+    fn case(&mut self, subject: Option<&Expr>, arms: &[CaseArm], sp: Span) -> R<TExpr> {
+        let mut pre = vec![];
+        let subj = match subject {
+            Some(s) => {
+                let v = self.value(s)?;
+                let ty = v.ty.clone();
+                let id = self.declare(&format!("_case{}", sp.lo), ty.clone());
+                pre.push(TStmt::Expr(self.mk(TK::Assign(id, Box::new(v)), ty.clone(), sp)));
+                Some((id, ty))
+            }
+            None => None,
+        };
+        let mut conds: Vec<(TExpr, TExpr)> = vec![];
+        let mut default: Option<TExpr> = None;
+        for arm in arms {
+            if arm.pats.is_empty() {
+                if default.is_some() {
+                    return Err(Diag::new(arm.span, "a second `_` arm can never match"));
+                }
+                default = Some(self.arm_body(&arm.body, arm.span)?);
+                continue;
+            }
+            if default.is_some() {
+                return Err(Diag::new(arm.span, "this arm comes after `_`, so it can never match"));
+            }
+            let mut cond: Option<TExpr> = None;
+            for pat in &arm.pats {
+                let local = |cx: &mut Self| subj.as_ref().map(|(id, ty)| cx.mk(TK::Local(*id), ty.clone(), arm.span));
+                let c = match pat {
+                    Pat::Value(e) => match local(self) {
+                        Some(l) => {
+                            let r = self.value(e)?;
+                            self.binary(BinOp::Eq, l, r, e.span)?
+                        }
+                        None => self.cond(e)?,
+                    },
+                    Pat::Range(lo, hi, excl) => {
+                        let l = local(self).ok_or_else(|| Diag::new(lo.span, "a range pattern needs a `case` subject"))?;
+                        let lov = self.value(lo)?;
+                        let ge = self.binary(BinOp::Ge, l.clone(), lov, lo.span)?;
+                        let hiv = self.value(hi)?;
+                        let lt = self.binary(if *excl { BinOp::Lt } else { BinOp::Le }, l, hiv, hi.span)?;
+                        self.binary(BinOp::And, ge, lt, lo.span.to(hi.span))?
+                    }
+                };
+                cond = Some(match cond {
+                    None => c,
+                    Some(prev) => {
+                        let s = prev.span.to(c.span);
+                        self.binary(BinOp::Or, prev, c, s)?
+                    }
+                });
+            }
+            let body = self.arm_body(&arm.body, arm.span)?;
+            conds.push((cond.unwrap(), body));
+        }
+        // Without `_` nothing may match: the arms are statements and the case has no value.
+        let has_default = default.is_some();
+        let unitize = |cx: &mut Self, b: TExpr| -> TExpr {
+            let span = b.span;
+            let TK::Seq(mut ss) = b.kind else { unreachable!() };
+            ss.push(TStmt::Expr(cx.mk(TK::Unit, Ty::Unit, span)));
+            cx.mk(TK::Seq(ss), Ty::Unit, span)
+        };
+        let mut acc = match default {
+            Some(d) => d,
+            None => self.mk(TK::Unit, Ty::Unit, sp),
+        };
+        let ty = acc.ty.clone();
+        for (_, b) in &conds {
+            if has_default && !self.unify(&b.ty, &ty) {
+                return Err(Diag::new(b.span, format!("this arm is {}, but the others are {}", self.resolve(&b.ty).show(), self.resolve(&ty).show())));
+            }
+        }
+        for (c, b) in conds.into_iter().rev() {
+            let b = if has_default { b } else { unitize(self, b) };
+            let s = c.span.to(b.span);
+            acc = self.mk(TK::Ternary(Box::new(c), Box::new(b), Box::new(acc)), ty.clone(), s);
+        }
+        if pre.is_empty() {
+            return Ok(acc);
+        }
+        pre.push(TStmt::Expr(acc));
+        Ok(self.mk(TK::Seq(pre), ty, sp))
+    }
+
+    /// `if` as a value: the branches' values if they agree, else nil.
+    fn if_value(&mut self, c: &Expr, a: &[Stmt], b: &[Stmt], sp: Span) -> R<TExpr> {
+        let c = self.cond(c)?;
+        // Branches share the enclosing scope, as statement `if`s do (Ruby).
+        let (ta, tb) = (self.seq_body(a, sp)?, self.seq_body(b, sp)?);
+        let (ra, rb) = (self.resolve(&ta.ty), self.resolve(&tb.ty));
+        let (ta, tb, ty) = if !b.is_empty() && self.unify(&ra, &rb) {
+            let ty = if matches!(ra, Ty::Never) { rb } else { ra };
+            (ta, tb, ty)
+        } else {
+            let unit = |cx: &mut Self, x: TExpr| {
+                let span = x.span;
+                let TK::Seq(mut ss) = x.kind else { unreachable!() };
+                ss.push(TStmt::Expr(cx.mk(TK::Unit, Ty::Unit, span)));
+                cx.mk(TK::Seq(ss), Ty::Unit, span)
+            };
+            (unit(self, ta), unit(self, tb), Ty::Unit)
+        };
+        Ok(self.mk(TK::Ternary(Box::new(c), Box::new(ta), Box::new(tb)), ty, sp))
+    }
+
+    fn seq_body(&mut self, body: &[Stmt], sp: Span) -> R<TExpr> {
+        let (mut ss, ty) = self.body(body)?;
+        if let Some(TStmt::Expr(e)) = ss.last_mut() {
+            let m = self.materialize(e.clone());
+            *e = m;
+        }
+        let ty = match ss.last() {
+            Some(TStmt::Expr(e)) => e.ty.clone(),
+            _ if matches!(ty, Ty::Never) => Ty::Never,
+            _ => Ty::Unit,
+        };
+        Ok(self.mk(TK::Seq(ss), ty, sp))
+    }
+
+    fn arm_body(&mut self, body: &[Stmt], sp: Span) -> R<TExpr> {
+        self.scopes.push(HashMap::new());
+        let r = self.body(body);
+        self.scopes.pop();
+        let (mut ss, ty) = r?;
+        if let Some(TStmt::Expr(e)) = ss.last_mut() {
+            let m = self.materialize(e.clone());
+            *e = m;
+        }
+        let ty = match ss.last() {
+            Some(TStmt::Expr(e)) => e.ty.clone(),
+            _ if matches!(ty, Ty::Never) => Ty::Never,
+            _ => Ty::Unit,
+        };
+        Ok(self.mk(TK::Seq(ss), ty, sp))
     }
 
     /// An index: any integer type (a constant defaults to Int).

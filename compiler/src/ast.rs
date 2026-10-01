@@ -154,6 +154,8 @@ pub enum StmtKind {
     Next,
     Break(Option<Expr>),
     Return(Option<Expr>),
+    /// `defer e`: run when the enclosing block exits.
+    Defer(Expr),
 }
 
 #[derive(Debug, Clone)]
@@ -279,4 +281,33 @@ pub enum ExprKind {
     Array(Vec<Expr>),
     /// `name: value` in an argument list (`Body.new(x: 1.0)`).
     KwArg(String, Span, Box<Expr>),
+    /// `"a #{x} b"`
+    Interp(Vec<InterpPart>),
+    /// `case subject { pat => body ... }`, or `case { cond => body ... }`
+    Case(Option<Box<Expr>>, Vec<CaseArm>),
+    /// `if` used as a value: `x = if c { a } else { b }`
+    If(Box<Expr>, Vec<Stmt>, Vec<Stmt>),
+}
+
+#[derive(Debug, Clone)]
+pub enum InterpPart {
+    Lit(String),
+    Expr(Expr),
+}
+
+#[derive(Debug, Clone)]
+pub struct CaseArm {
+    /// Alternatives (`1 | 2`); empty means `_`.
+    pub pats: Vec<Pat>,
+    pub body: Vec<Stmt>,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone)]
+pub enum Pat {
+    /// A value compared with `==` (literal, constant), or with a guard-less
+    /// `case { cond => }` the condition itself.
+    Value(Expr),
+    /// `lo..hi` / `lo...hi`
+    Range(Expr, Expr, bool),
 }

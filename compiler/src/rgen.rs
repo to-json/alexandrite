@@ -151,8 +151,9 @@ impl FnEmit<'_> {
     }
 
     fn err_path(&mut self, path: &ErrPath, e: &str) {
+        self.block(path.cleanup());
         match (path, self.ctx) {
-            (ErrPath::Return, Ctx::Fallible | Ctx::Worker) => self.line(&format!("return Err({e});")),
+            (ErrPath::Return(_), Ctx::Fallible | Ctx::Worker) => self.line(&format!("return Err({e});")),
             _ => self.line(&format!("die({e});")),
         }
     }

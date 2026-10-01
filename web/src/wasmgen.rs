@@ -560,7 +560,8 @@ impl<'c, 'p> Fx<'c, 'p> {
 
     /// Inside a block that must not fall through: report the error.
     fn err_path(&mut self, path: &ErrPath, src: ErrSrc) {
-        let ret = matches!(path, ErrPath::Return) && matches!(self.kind, Kind::Fallible | Kind::Worker);
+        self.block(path.cleanup());
+        let ret = path.is_return() && matches!(self.kind, Kind::Fallible | Kind::Worker);
         if let ErrSrc::Overflow(loc) = src {
             self.str_const(loc);
             self.rt("alxr_err_overflow");

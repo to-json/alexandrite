@@ -187,10 +187,22 @@ pub enum Step {
 
 #[derive(Clone, Debug)]
 pub enum ErrPath {
-    /// In a fallible function: return the error.
-    Return,
-    /// At the top level: print the error and exit 1.
-    Die,
+    /// In a fallible function: return the error. The statements are the
+    /// deferred code of every enclosing block, run first.
+    Return(Vec<LS>),
+    /// At the top level: print the error and exit 1 (after the deferred code).
+    Die(Vec<LS>),
+}
+
+impl ErrPath {
+    pub fn cleanup(&self) -> &[LS] {
+        match self {
+            ErrPath::Return(c) | ErrPath::Die(c) => c,
+        }
+    }
+    pub fn is_return(&self) -> bool {
+        matches!(self, ErrPath::Return(_))
+    }
 }
 
 #[derive(Clone, Debug)]

@@ -568,7 +568,8 @@ impl Fx<'_, '_, '_> {
 
     /// The error path: return the error to the caller, or print it and exit.
     fn err_path(&mut self, path: &ErrPath, src: ErrSrc) {
-        let ret = matches!(path, ErrPath::Return) && matches!(self.kind, Kind::Fallible | Kind::Worker);
+        self.block(path.cleanup());
+        let ret = path.is_return() && matches!(self.kind, Kind::Fallible | Kind::Worker);
         if ret {
             let errp = *self.params.last().unwrap();
             match src {

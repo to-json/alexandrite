@@ -4,7 +4,7 @@
 
 use crate::ast::*;
 use crate::diag::{Diag, Span};
-use crate::lexer::{Kw, Tok, Token};
+use crate::lexer::{IPiece, Kw, Tok, Token};
 use std::collections::HashSet;
 
 pub struct Parser<'a> {
@@ -113,7 +113,7 @@ impl<'a> Parser<'a> {
                         _ => return Err(Diag::new(sp, "`require` takes a string path")),
                     }
                 }
-                Tok::Attr(_) | Tok::Kw(Kw::Def) => m.defs.push(self.def()?),
+                Tok::Attr(_) | Tok::Kw(Kw::Def) | Tok::Kw(Kw::Fn) => m.defs.push(self.def()?),
                 Tok::Kw(Kw::Struct) => m.structs.push(self.struct_def()?),
                 Tok::Const(name) if matches!(self.peek_at(1), Tok::Op("=") | Tok::Op(":")) => {
                     // `NAME = expr` / `NAME: Type = expr`: a constant.
@@ -145,7 +145,10 @@ impl<'a> Parser<'a> {
             }
             self.skip_newlines();
         }
-        if !self.is_kw(Kw::Def) {
+        if self.is_kw(Kw::Fn) {
+            // `fn` / `ƒ`: a pure def
+            pure = true;
+        } else if !self.is_kw(Kw::Def) {
             return Err(Diag::new(self.span(), "expected `def` after attribute"));
         }
         self.bump();
@@ -276,7 +279,15 @@ impl<'a> Parser<'a> {
                 self.bump();
                 StmtKind::Return(if self.at_stmt_end() { None } else { Some(self.expr()?) })
             }
-            Tok::Kw(Kw::Def) | Tok::Attr(_) => return Err(Diag::new(start, "methods can only be defined at the top level")),
+            Tok::Kw(Kw::Def) | Tok::Kw(Kw::Fn) | Tok::Attr(_) => return Err(Diag::new(start, "methods can only be defined at the top level")),
+            Tok::Kw(Kw::Defer) => {
+                self.bump();
+                StmtKind::Defer(self.expr()?)
+            }
+            Tok::Kw(Kw::For) => {
+                self.bump();
+                return self.for_rest(start);
+            }
             Tok::Kw(Kw::Struct) => return Err(Diag::new(start, "structs can only be defined at the top level")),
             Tok::Ident(name) if matches!(self.peek_at(1), Tok::Op(":")) && matches!(self.peek_at(2), Tok::Const(_) | Tok::Op("[")) => {
                 // `x: T = e`
@@ -343,7 +354,14 @@ impl<'a> Parser<'a> {
         self.skip_newlines();
         if self.is_kw(Kw::Else) {
             self.bump();
-            els = self.braced_stmts()?;
+            if self.is_kw(Kw::If) || self.is_kw(Kw::Unless) {
+                // `else if`
+                let unless = self.is_kw(Kw::Unless);
+                let sp = self.bump().span;
+                els = vec![self.if_rest(sp, unless)?];
+            } else {
+                els = self.braced_stmts()?;
+            }
         } else if self.is_kw(Kw::Elsif) {
             let sp = self.bump().span;
             els = vec![self.if_rest(sp, false)?];
@@ -351,6 +369,87 @@ impl<'a> Parser<'a> {
             self.pos = save;
         }
         Ok(Stmt { kind: StmtKind::If(cond, then, els), span: start.to(self.prev_span()) })
+    }
+
+    /// `for x in xs { ... }` / `for a, b in pairs { ... }`: sugar for
+    /// `xs.each { |x| ... }` (break / next / return behave as in a loop).
+    fn for_rest(&mut self, start: Span) -> PResult<Stmt> {
+        let mut params = vec![];
+        loop {
+            let sp = self.span();
+            match self.bump().tok {
+                Tok::Ident(n) => params.push((n, sp)),
+                t => return Err(Diag::new(sp, format!("expected a loop variable, found {}", describe(&t)))),
+            }
+            if !self.eat_op(",") {
+                break;
+            }
+        }
+        if !self.is_kw(Kw::In) {
+            return Err(Diag::new(self.span(), format!("expected `in`, found {}", describe(self.peek()))));
+        }
+        self.bump();
+        let coll = self.cond()?;
+        self.scopes.push(HashSet::new());
+        for (n, _) in &params {
+            self.declare(n);
+        }
+        let bstart = self.span();
+        let body = self.braced_stmts()?;
+        self.scopes.pop();
+        let id = self.id();
+        let block = Block { id, params, body, span: bstart.to(self.prev_span()) };
+        let sp = start.to(self.prev_span());
+        let call = self.mk(ExprKind::Call { recv: Some(Box::new(coll)), name: "each".into(), name_span: start, args: vec![], block: Some(Box::new(block)), block_sym: None }, sp);
+        Ok(Stmt { kind: StmtKind::Expr(call), span: sp })
+    }
+
+    /// `case [subject] { pat | pat => body ... }`
+    fn case_rest(&mut self, start: Span) -> PResult<Expr> {
+        let subject = if self.is_op("{") { None } else { Some(Box::new(self.cond()?)) };
+        self.expect_op("{")?;
+        let saved = std::mem::replace(&mut self.in_cond, false);
+        let mut arms = vec![];
+        loop {
+            self.skip_newlines();
+            while self.eat_op(",") {
+                self.skip_newlines();
+            }
+            if self.eat_op("}") {
+                break;
+            }
+            let asp = self.span();
+            let mut pats = vec![];
+            if matches!(self.peek(), Tok::Ident(n) if n == "_") && matches!(self.peek_at(1), Tok::Op("=>")) {
+                self.bump();
+            } else if subject.is_none() {
+                pats.push(Pat::Value(self.expr()?));
+            } else {
+                loop {
+                    let lo = self.shift()?;
+                    let pat = if self.is_op("..") || self.is_op("...") {
+                        let excl = self.bump().tok == Tok::Op("...");
+                        Pat::Range(lo, self.shift()?, excl)
+                    } else {
+                        Pat::Value(lo)
+                    };
+                    pats.push(pat);
+                    if !self.eat_op("|") {
+                        break;
+                    }
+                }
+            }
+            self.expect_op("=>")?;
+            let body = if self.is_op("{") {
+                self.braced_stmts()?
+            } else {
+                let e = self.expr()?;
+                vec![Stmt { span: e.span, kind: StmtKind::Expr(e) }]
+            };
+            arms.push(CaseArm { pats, body, span: asp.to(self.prev_span()) });
+        }
+        self.in_cond = saved;
+        Ok(self.mk(ExprKind::Case(subject, arms), start.to(self.prev_span())))
     }
 
     fn cond(&mut self) -> PResult<Expr> {
@@ -695,7 +794,8 @@ impl<'a> Parser<'a> {
             return false;
         }
         match self.peek() {
-            Tok::Int(_) | Tok::BigInt(_) | Tok::Float(..) | Tok::Str(_) | Tok::Ident(_) | Tok::Const(_) | Tok::Sym(_) => true,
+            Tok::Int(_) | Tok::BigInt(_) | Tok::Float(..) | Tok::Str(_) | Tok::Interp(_) | Tok::Ident(_) | Tok::Const(_) | Tok::Sym(_) => true,
+            Tok::Kw(Kw::Case) => true,
             Tok::Kw(Kw::True | Kw::False | Kw::Nil | Kw::Try) => true,
             Tok::Op("(") | Tok::Op("[") => true,
             // `puts -x` (Ruby): a minus right before its operand starts an argument.
@@ -712,6 +812,33 @@ impl<'a> Parser<'a> {
             Tok::BigInt(t) => self.mk(ExprKind::BigInt(t), sp),
             Tok::Float(v, t) => self.mk(ExprKind::Float(v, t), sp),
             Tok::Str(s) => self.mk(ExprKind::Str(s), sp),
+            Tok::Interp(pieces) => {
+                let mut parts = vec![];
+                for p in pieces {
+                    match p {
+                        IPiece::Lit(s) => parts.push(InterpPart::Lit(s)),
+                        IPiece::Code(src, base) => {
+                            let toks = crate::lexer::lex_at(sp.file, &src, base)?;
+                            let mut sub = Parser { toks: &toks, pos: 0, next_id: self.next_id, scopes: self.scopes.clone(), in_cond: false };
+                            sub.skip_newlines();
+                            let e = sub.expr()?;
+                            sub.skip_newlines();
+                            if !matches!(sub.peek(), Tok::Eof) {
+                                return Err(Diag::new(sub.span(), format!("unexpected {} in `#{{...}}`", describe(sub.peek()))));
+                            }
+                            parts.push(InterpPart::Expr(e));
+                        }
+                    }
+                }
+                self.mk(ExprKind::Interp(parts), sp)
+            }
+            Tok::Kw(Kw::Case) => return self.case_rest(sp),
+            Tok::Kw(Kw::If) | Tok::Kw(Kw::Unless) => {
+                let unless = t.tok == Tok::Kw(Kw::Unless);
+                let st = self.if_rest(sp, unless)?;
+                let StmtKind::If(c, a, b) = st.kind else { unreachable!() };
+                self.mk(ExprKind::If(Box::new(c), a, b), st.span)
+            }
             Tok::Sym(s) => self.mk(ExprKind::Sym(s), sp),
             Tok::Kw(Kw::True) => self.mk(ExprKind::Bool(true), sp),
             Tok::Kw(Kw::False) => self.mk(ExprKind::Bool(false), sp),
@@ -791,7 +918,7 @@ pub fn describe(t: &Tok) -> String {
         Tok::Int(v) => format!("`{v}`"),
         Tok::BigInt(t) => format!("`{t}`"),
         Tok::Float(_, t) => format!("`{t}`"),
-        Tok::Str(_) => "a string".into(),
+        Tok::Str(_) | Tok::Interp(_) => "a string".into(),
         Tok::Ident(n) | Tok::Const(n) => format!("`{n}`"),
         Tok::Sym(s) => format!("`:{s}`"),
         Tok::Attr(a) => format!("`#[{a}]`"),

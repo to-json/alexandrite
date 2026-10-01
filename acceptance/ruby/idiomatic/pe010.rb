@@ -1,0 +1,8 @@
+limit = 2_000_000
+sieve = Array.new(limit, true)
+sieve[0] = sieve[1] = false
+(2..Integer.sqrt(limit)).each { |i|
+  next unless sieve[i]
+  (i * i).step(limit - 1, i) { sieve[it] = false }
+}
+puts sieve.each_index.select { sieve[it] }.sum

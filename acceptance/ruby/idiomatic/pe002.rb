@@ -1,0 +1,2 @@
+fibs = Enumerator.new { |y| a, b = 1, 2; loop { y << a; a, b = b, a + b } }
+puts fibs.lazy.take_while { it <= 4_000_000 }.select(&:even?).sum

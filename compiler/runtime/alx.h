@@ -25,8 +25,23 @@ typedef struct { int tag; AlxStr detail; const char *loc; } AlxErr;
 /* Generators: every generator state begins with this. */
 typedef struct AlxGen { bool (*next)(struct AlxGen *self, void *out); } AlxGen;
 
-/* ---------- memory: one program-lifetime region (v0) ---------- */
-void *alx_alloc(size_t bytes);
+/* ---------- memory: one program-lifetime region (v0) ----------
+ * Nothing is freed, so allocation is a per-thread bump pointer into
+ * malloc'd chunks; large requests go straight to malloc. */
+extern _Thread_local char *alx_bump_cur, *alx_bump_end;
+extern bool alx_counting;
+extern size_t alx_allocs;
+void *alx_alloc_slow(size_t bytes);
+static inline void *alx_alloc(size_t bytes) {
+    if (__builtin_expect(alx_counting, 0)) __atomic_fetch_add(&alx_allocs, 1, __ATOMIC_RELAXED);
+    size_t n = ((bytes ? bytes : 1) + 15) & ~(size_t)15;
+    char *p = alx_bump_cur;
+    if (__builtin_expect((size_t)(alx_bump_end - p) >= n, 1)) {
+        alx_bump_cur = p + n;
+        return p;
+    }
+    return alx_alloc_slow(n);
+}
 void alx_init(void);
 
 /* ---------- panics ---------- */
@@ -142,9 +157,36 @@ ALX_ARR(bool, Arr_Bool)
 
 /* ---------- strings ---------- */
 static inline AlxStr alx_str_lit(const char *p, int64_t n) { AlxStr s = { p, n }; return s; }
-AlxStr alx_int_to_s(int64_t v);
 AlxStr alx_str_rev(AlxStr s);
 bool alx_str_eq(AlxStr a, AlxStr b);
+static inline AlxStr alx_int_to_s(int64_t v) {
+    char buf[24], *e = buf + sizeof buf, *q = e;
+    uint64_t u = v < 0 ? -(uint64_t)v : (uint64_t)v;
+    do { *--q = (char)('0' + u % 10); u /= 10; } while (u);
+    if (v < 0) *--q = '-';
+    int64_t n = e - q;
+    char *p = (char *)alx_alloc((size_t)n);
+    memcpy(p, q, (size_t)n);
+    AlxStr s = { p, n };
+    return s;
+}
+/* `v.to_s.size` */
+static inline int64_t alx_int_ndigits(int64_t v) {
+    uint64_t u = v < 0 ? -(uint64_t)v : (uint64_t)v;
+    int64_t n = v < 0 ? 2 : 1;
+    while (u >= 10) { u /= 10; n++; }
+    return n;
+}
+/* `s == s.reverse` without building the reverse (reverse is by character). */
+static inline bool alx_str_is_pal(AlxStr s) {
+    for (int64_t i = 0, j = s.len - 1; i < j; i++, j--) {
+        unsigned char a = (unsigned char)s.ptr[i], b = (unsigned char)s.ptr[j];
+        if ((a | b) & 0x80) return alx_str_eq(s, alx_str_rev(s));
+        if (a != b) return false;
+    }
+    if ((s.len & 1) && ((unsigned char)s.ptr[s.len / 2] & 0x80)) return alx_str_eq(s, alx_str_rev(s));
+    return true;
+}
 int alx_str_cmp(AlxStr a, AlxStr b);
 AlxStr alx_str_delete(AlxStr s, AlxStr chars);
 Arr_Str alx_str_split(AlxStr s, AlxStr sep);
@@ -181,6 +223,7 @@ AlxPInt alx_p_pow(AlxPInt a, AlxPInt b, const char *loc);
 int alx_p_cmp(AlxPInt a, AlxPInt b);
 bool alx_p_even(AlxPInt a);
 AlxStr alx_p_to_s(AlxPInt a);
+int64_t alx_p_ndigits(AlxPInt a);
 Arr_PInt alx_p_digits(AlxPInt a, const char *loc);
 
 #endif

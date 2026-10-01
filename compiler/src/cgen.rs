@@ -531,6 +531,11 @@ impl FnEmit<'_> {
                     _ => unreachable!(),
                 }
             }
+            LE::Cmp(op @ (Op::Eq | Op::Ne), a, b, LTy::Str) if palindrome_test(a, b).is_some() => {
+                let x = self.e(palindrome_test(a, b).unwrap());
+                let neg = if *op == Op::Ne { "!" } else { "" };
+                format!("({neg}alx_str_is_pal({x}))")
+            }
             LE::Cmp(op, a, b, t) => {
                 let (a, b) = (self.e(a), self.e(b));
                 let sym = match op {
@@ -580,6 +585,8 @@ impl FnEmit<'_> {
                         }
                     }
                     Rt::StrLen => format!("({}).len", a[0]),
+                    Rt::NDigits => s("alx_int_ndigits"),
+                    Rt::PNDigits => s("alx_p_ndigits"),
                     Rt::Isqrt => s("alx_isqrt"),
                     Rt::Digits => s("alx_digits"),
                     Rt::PDigits => s("alx_p_digits"),
@@ -617,5 +624,17 @@ impl FnEmit<'_> {
             LE::GenNew(id, vals) => format!("gen{id}_new({})", vals.iter().map(|x| self.e(x)).collect::<Vec<_>>().join(", ")),
             LE::ToP(x) => format!("alx_p_from({})", self.e(x)),
         }
+    }
+}
+
+/// `s == s.reverse` (either side) on a variable: the variable.
+fn palindrome_test<'a>(a: &'a LE, b: &'a LE) -> Option<&'a LE> {
+    let rev_of = |x: &LE, r: &LE| matches!((x, r), (LE::Var(v), LE::Rt(Rt::StrRev, args)) if matches!(args.as_slice(), [LE::Var(w)] if w == v));
+    if rev_of(a, b) {
+        Some(a)
+    } else if rev_of(b, a) {
+        Some(b)
+    } else {
+        None
     }
 }

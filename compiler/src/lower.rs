@@ -626,6 +626,12 @@ impl<'a> Lw<'a> {
             Size => {
                 let r = recv.unwrap();
                 let v = self.expr(r);
+                // `n.to_s.size`: count digits; the string is never observed.
+                let v = match v {
+                    LE::Rt(Rt::IntToS, a) => return self.int_out(LE::Rt(Rt::NDigits, a)),
+                    LE::Rt(Rt::PIntToS, a) => return self.int_out(LE::Rt(Rt::PNDigits, a)),
+                    v => v,
+                };
                 let n = if r.ty == Ty::Str { LE::Rt(Rt::StrLen, vec![v]) } else { LE::Len(Box::new(v)) };
                 self.int_out(n)
             }

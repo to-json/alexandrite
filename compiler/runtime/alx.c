@@ -7,19 +7,33 @@
 
 /* ---------- memory ---------- */
 
-static size_t alx_allocs;
+size_t alx_allocs;
+bool alx_counting;
+_Thread_local char *alx_bump_cur, *alx_bump_end;
 
 static void alx_report(void) {
-    if (getenv("ALX_COUNT_ALLOCS")) fprintf(stderr, "alx-allocs: %zu\n", alx_allocs);
+    if (alx_counting) fprintf(stderr, "alx-allocs: %zu\n", alx_allocs);
 }
 
-void alx_init(void) { atexit(alx_report); }
+void alx_init(void) {
+    alx_counting = getenv("ALX_COUNT_ALLOCS") != NULL;
+    atexit(alx_report);
+}
 
-void *alx_alloc(size_t bytes) {
-    void *p = malloc(bytes ? bytes : 1);
-    if (!p) alx_panic("out of memory", "runtime");
-    __atomic_fetch_add(&alx_allocs, 1, __ATOMIC_RELAXED);
-    return p;
+enum { ALX_CHUNK = 1 << 20 };
+
+/* `n` is rounded to 16 already. */
+void *alx_alloc_slow(size_t n) {
+    if (n > ALX_CHUNK / 16) {
+        void *p = malloc(n);
+        if (!p) alx_panic("out of memory", "runtime");
+        return p;
+    }
+    char *c = malloc(ALX_CHUNK);
+    if (!c) alx_panic("out of memory", "runtime");
+    alx_bump_cur = c + n;
+    alx_bump_end = c + ALX_CHUNK;
+    return c;
 }
 
 /* ---------- panics and errors ---------- */
@@ -101,15 +115,6 @@ Arr_I64 alx_digits(int64_t v, const char *loc) {
 }
 
 /* ---------- strings ---------- */
-
-AlxStr alx_int_to_s(int64_t v) {
-    char buf[24];
-    int n = snprintf(buf, sizeof buf, "%lld", (long long)v);
-    char *p = alx_alloc((size_t)n);
-    memcpy(p, buf, (size_t)n);
-    AlxStr s = { p, n };
-    return s;
-}
 
 AlxStr alx_str_rev(AlxStr s) {
     char *p = alx_alloc((size_t)s.len);

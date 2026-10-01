@@ -14,7 +14,7 @@ Read this first after a context compaction.
 lexer → parser (AST with spans) → check (type inference per function instance, monomorphized; purity; diagnostics) → lower (typed AST → LIR: loops, temps, labeled breaks; Enumerable chains fused) → cgen (C) / rgen (Rust oracle) → driver (clang, cache in `.alx-cache/` next to the source).
 
 v0 decisions, made deliberately (record them in DESIGN.md at the end):
-- **Memory:** one program-lifetime region (malloc, never freed). Memory-safe because nothing is freed; per-scope pools come later.
+- **Memory:** one program-lifetime region (per-thread bump allocator, never freed). Memory-safe because nothing is freed; per-scope pools come later.
 - **Errors:** one global `Err` type; per-function error-set inference is simplified to "fallible or not".
 - **Top level:** acts as `main -> ()!`. Fallible calls there have an implicit `try`; an uncaught error prints a message and exits 1.
 - **Prover:** constant intervals, loop-variable intervals (range, step, each_index), fixed-length arrays, division/modulo by a nonzero constant other than -1, and the counter axiom (`v += 1` from a constant start can't overflow 64 bits in any feasible run).

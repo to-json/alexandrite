@@ -104,6 +104,9 @@ pub enum Rt {
     StrChar,
     StrByte,
     StrLen,
+    /// `x.to_s.size` without building the string.
+    NDigits,
+    PNDigits,
     Isqrt,
     Digits,
     PDigits,

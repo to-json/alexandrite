@@ -155,6 +155,42 @@ AlxStr alx_p_to_s(AlxPInt a) {
     return s;
 }
 
+/* 10**k, cached per thread. */
+static _Thread_local mp_int **p10;
+static _Thread_local int64_t p10_cap;
+
+static const mp_int *pow10(int64_t k) {
+    if (k >= p10_cap) {
+        int64_t nc = p10_cap ? p10_cap : 64;
+        while (nc <= k) nc *= 2;
+        mp_int **t = calloc((size_t)nc, sizeof *t);
+        if (!t) alx_panic("out of memory", "runtime");
+        if (p10_cap) memcpy(t, p10, (size_t)p10_cap * sizeof *t);
+        free(p10);
+        p10 = t;
+        p10_cap = nc;
+    }
+    if (!p10[k]) {
+        mp_int *m = malloc(sizeof *m);
+        if (!m) alx_panic("out of memory", "runtime");
+        check(mp_init(m));
+        if (k > 0 && p10[k - 1]) check(mp_mul_d(p10[k - 1], 10, m));
+        else { mp_set_i64(m, 10); check(mp_expt_n(m, (int)k, m)); }
+        p10[k] = m;
+    }
+    return p10[k];
+}
+
+/* `a.to_s.size` without converting: 10**(d-1) <= |a| < 10**d. */
+int64_t alx_p_ndigits(AlxPInt a) {
+    if (!a.big) return alx_int_ndigits(a.v);
+    const mp_int *m = &a.big->m;
+    int64_t d = (int64_t)((double)(mp_count_bits(m) - 1) * 0.30102999566398119521) + 1;
+    while (d > 1 && mp_cmp_mag(m, pow10(d - 1)) == MP_LT) d--;
+    while (mp_cmp_mag(m, pow10(d)) != MP_LT) d++;
+    return d + (mp_isneg(m) ? 1 : 0);
+}
+
 Arr_PInt alx_p_digits(AlxPInt a, const char *loc) {
     if ((!a.big && a.v < 0) || (a.big && mp_isneg(&a.big->m))) alx_panic("`digits` of a negative number", loc);
     AlxStr s = alx_p_to_s(a);

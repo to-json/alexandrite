@@ -129,6 +129,7 @@ The Ruby of Rust: Ruby-feel syntax, Rust's type construction, and no tracing GC.
 Deliberate simplifications in the first compiler, each a known gap against the design above:
 
 - **Memory:** one program-lifetime region. The runtime allocates and never frees, so it is memory-safe by construction. Per-scope pools (probes 01 and 02) aren't implemented yet.
+- **Allocation:** since nothing is freed, `alx_alloc` is a per-thread bump pointer into 1 MiB malloc chunks (larger requests go to malloc). Peepholes that avoid building strings no one observes: `n.to_s.size` counts digits (bignums: compare against cached powers of ten), and `s == s.reverse` on a variable is an in-place palindrome test.
 - **Error sets:** one global `Err` type. A function is either fallible or not; per-set inference (probe 11) isn't implemented yet.
 - **Top level** behaves like `main -> ()!`. Fallible calls there get an implicit `try`, and an unhandled error prints a message and exits 1.
 - **Prover:** constant and loop-variable intervals (ranges, `step`, `each_index`), arrays of fixed length, division or modulo by a constant other than 0 and -1, sum bounds (element interval × element count), and **the counter axiom**: `v += 1` from a constant start can't overflow 64 bits in any feasible run. Release builds drop every check that this proves unnecessary.

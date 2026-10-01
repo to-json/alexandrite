@@ -388,6 +388,8 @@ impl FnEmit<'_> {
                         }
                     }
                     Rt::StrLen => format!("{p0}.len()"),
+                    Rt::NDigits => format!("{}.len()", call("int_to_s")),
+                    Rt::PNDigits => format!("({}).to_s().len()", a[0]),
                     Rt::Isqrt => call("isqrt"),
                     Rt::Digits => call("digits"),
                     Rt::PDigits => format!("({}).digits({})", a[0], a[1]),

@@ -124,6 +124,22 @@ The Ruby of Rust: Ruby-feel syntax, Rust's type construction, and no tracing GC.
   - Exported macros are shipped in headers as IR. Macro-generated code is hygienic, except for names spliced in through `#{…}`. Errors inside generated code are reported with the chain of expansions.
   - The scheduler must use an explicit work stack, not recursion, because chains of types run deep.
 
+## v0 implementation (compiler/, passing ACCEPTANCE.md)
+
+Deliberate simplifications in the first compiler, each a known gap against the design above:
+
+- **Memory:** one program-lifetime region. The runtime allocates and never frees, so it is memory-safe by construction. Per-scope pools (probes 01 and 02) aren't implemented yet.
+- **Error sets:** one global `Err` type. A function is either fallible or not; per-set inference (probe 11) isn't implemented yet.
+- **Top level** behaves like `main -> ()!`. Fallible calls there get an implicit `try`, and an unhandled error prints a message and exits 1.
+- **Prover:** constant and loop-variable intervals (ranges, `step`, `each_index`), arrays of fixed length, division or modulo by a constant other than 0 and -1, sum bounds (element interval × element count), and **the counter axiom**: `v += 1` from a constant start can't overflow 64 bits in any feasible run. Release builds drop every check that this proves unnecessary.
+- **Generics:** monomorphization only. There are no method tables in debug builds yet, and no traits.
+- `first`, `max`, `max_by` and `reduce` on an empty collection panic. `T?` comes later.
+- **Conditions of `if` and `while`:** a `{` after a method call counts as a block only if `|` follows it.
+- **Generators:** a state machine in C (labels and gotos, every variable hoisted into the state), a nightly `gen` block in the Rust oracle.
+- **`pmap` blocks** can't capture locals yet.
+- **Libraries** (`require`) are compiled separately and cached by a hash of their source. The generated `.alxh` header is the boundary. Exported functions must have typed parameters.
+- **Bignums** (`promote`): libtommath, vendored as an amalgamation and always compiled optimized. The Rust oracle has its own small bignum, and its division only handles values that fit in 64 bits.
+
 ## Build plan
 
 Each phase ends with something runnable. The probes' `out.rs` / `.c` files are the expected output for the matching phases.

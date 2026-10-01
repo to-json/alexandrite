@@ -6,6 +6,9 @@ Problems are taken from the first few dozen, whose answers are widely published.
 
 ## The harness
 
+Run it with `python3 acceptance/run.py` (`-k pe010` filters cases). It builds `alx` in release mode, runs every check below, and exits 0 only if all of them pass.
+
+
 ```
 acceptance/
   run.py                 # runs every case in both modes, checks output and budgets
@@ -20,7 +23,7 @@ For each case, `run.py`:
 1. **`alx run case.alx`**: a debug build (method tables, clang -O0), then runs it. Checks stdout, and checks the **edit-to-answer** time (build plus run) against the budget.
 2. **`alx run --release case.alx`**: release build, then runs it. Checks stdout, and checks the **run time** against a hand-written Rust reference (`refs/peNNN.rs`, `rustc -O`).
 3. **Safety net:** builds the case with ASan/UBSan, and checks the Rust backend's output with rustc (the oracle). Both must be clean. A rustc rejection is a bug in our checker (DESIGN.md, Architecture).
-4. **Negative cases** (`*.bad.alx` + `*.expected_error`): compilation must fail, and the first error must match the expected text, **file:line:column** included.
+4. **Negative cases** (`*.bad.alx` + `*.expected_error`): compilation must fail, and the first error must match the expected text, **file:line:column** included. Runtime failures (`*.expected_runtime`) give the exit status on the first line (`abort` or a number), then lines that must appear in stderr.
 
 Global requirements that every case checks:
 - **One file is a program.** `alx run file.alx` needs no manifest, no `main`, no project setup. Top-level statements run in order, as in a Ruby script.

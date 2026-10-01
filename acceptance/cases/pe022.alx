@@ -1,0 +1,2 @@
+names = File.read("fixtures/names.txt").delete('"').split(",").sort
+puts names.each_with_index.sum { |name, i| (i + 1) * name.bytes.sum { it - 64 } }

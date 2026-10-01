@@ -80,6 +80,7 @@ The Ruby of Rust: Ruby-feel syntax, Rust's type construction, and no tracing GC.
 - **Headers:** a ceremony for declaring signatures, purity and size contracts, optionally in a separate file (prior art: OCaml `.mli`, SPARK specs). **They are also separate-compilation boundaries:** one `.o` per module, with the C ABI at the boundaries.
 - **Type inference:** as far-reaching as possible (aiming at Crystal-style whole-program inference), limited by one constraint: builds must stay faster than rustc's.
 - **Integer overflow in impure code:** chosen per file with a flag. The settings are **abort** (the default), **wrap** and **promote** (to bignum, Ruby-style). The spelling doesn't matter; the working spelling is `#![overflow(abort | wrap | promote)]`. Pure code stays proven or fallible.
+  - **Bignum for `promote`:** libtommath (public domain / Unlicense), vendored into the runtime and linked only into programs that use `promote`. GMP was rejected because of its license (see "Runtime licensing").
 - **Pool sizing when the size is only known at runtime:** grow like a Vec (doubling), and the compiler warns that the pool's size isn't known statically.
 - **Error sets** (probe 11):
   - Declared with `error ParseError { BadDigit(U8), Empty }`.
@@ -89,6 +90,8 @@ The Ruby of Rust: Ruby-feel syntax, Rust's type construction, and no tracing GC.
   - Handling: `try e` propagates; `e rescue { |err| … }` handles; `case` matches on tags. Our checker owns exhaustiveness.
   - **In C:** every tag has a unique global number, and all sets share one `Err { tag; payload }` type, so converting to a larger set is a copy. Payloads over 16 bytes go in a pool. `default:` aborts as a backstop.
 - **Strings:** UTF-8.
+- **Project license: Apache-2.0 WITH LLVM-exception**, for the whole project: compiler, runtime and standard library (`LICENSE`). The exception means that runtime code compiled into a user's binary carries no notice requirement (it waives sections 4(a), 4(b) and 4(d) for embedded portions), and Apache-2.0 provides a patent grant.
+- **Runtime licensing: writing a program in Alexandrite must never put an obligation on its author.** Everything linked into a user's binary (our runtime, the scheduler, vendored libraries) must be under a license that requires nothing of people who distribute binaries: no copyleft and no attribution. Allowed: public domain / Unlicense, 0BSD, MIT-0, Apache-2.0 WITH LLVM-exception. Not allowed in the runtime: (L)GPL, MPL, plain MIT/BSD/Apache-2.0 (they require a notice to travel with binaries). The compiler itself isn't linked into user programs, so this rule doesn't apply to it. Rust crates reached through `extern "C"` shims are the user's own choice and their own licenses.
 - **Generics and traits** (probe 13):
   - **Hybrid duck typing.** A parameter without a type is generic, and its bound is inferred: each method used resolves to the one trait that provides it. **Exported functions carry the inferred bound in the header** (`pub def total[T: Sum](xs: T)`). Requirements that are inherent or ambiguous are fine inside a module and an error on export. Errors at a call site name the inferred bound and the line it came from.
   - **Nominal conformance:** `impl Shape for Circle { … }`. Derives generate impls. Traits with default methods are the mixins (Enumerable, Comparable).

@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception */
 /* Alexandrite C runtime, probe 10. Everything the C backend's output may
  * rely on. Rules (DESIGN.md, "Rules for faithful C"):
  *   - every runtime check is explicit (ALX_IDX, ALX_ADD, ...)

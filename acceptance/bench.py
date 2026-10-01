@@ -6,7 +6,8 @@ usage: acceptance/bench.py [CASE ...] [-r RUNNERS] [--vs RUNNER] [-n N] [--once]
   CASE      case names or substrings (pe010, 01, ...); default: all
   -r        comma-separated runners or groups; default: all
   --vs      add a column per runner: its time / this runner's time
-  --speedup add a column: fastest Ruby runner / RUNNER (default alx-rel)
+  --speedup add a column: fastest selected non-alx, non-rust runner / RUNNER
+            (default alx-rel), e.g. -r ruby --speedup or -r golang --speedup
   -n        max runs per cell (best-of; default 50, capped at ~3 s per cell)
   --once    run each cell once and print its output instead of timing it
   --list    list cases and runners
@@ -20,11 +21,17 @@ Runners (wall ms from process start to exit; output checked each run):
   fast        ruby/fast, `ruby --disable-gems` (no JIT)
   fast-yjit   ruby/fast, --disable-gems --yjit --yjit-call-threshold=1
   fast-zjit   ruby/fast, --disable-gems --zjit --zjit-call-threshold=1
-Groups: alx, ruby, idiomatic, fastrb, all.
+  go-run      go/idiomatic, `go run` of a freshly edited copy each time
+              (edit-to-answer: the program recompiles, the std cache is warm)
+  go          go/idiomatic, prebuilt with `go build`
+  go-fast     go/fast, prebuilt with `go build`
+Groups: alx, ruby, idiomatic, fastrb, golang, all.
 
-ruby/idiomatic is a direct port. ruby/fast does the same work with the
-same algorithm, hand-optimized (while loops, no intermediate arrays,
-Ractors where the source uses pmap).
+ruby/idiomatic is a direct port. go/idiomatic is what a Go programmer
+would write (loops, iter.Seq generators, strconv, math/big, goroutines
+for pmap). */fast do the same work with the same algorithm as the .alx
+source, hand-optimized (no intermediate arrays or strings; Ractors /
+goroutines where the source uses pmap).
 
 examples:
   acceptance/bench.py                          everything
@@ -32,6 +39,7 @@ examples:
   acceptance/bench.py -r alx,ruby --vs alx-rel
   acceptance/bench.py -r alx-rel,ruby --speedup
   acceptance/bench.py -r fastrb --speedup alx-run
+  acceptance/bench.py -r alx-rel,golang --speedup
   acceptance/bench.py pe025 -r alx-rel,rb --once
 """
 
@@ -47,14 +55,17 @@ ROOT = Path(__file__).resolve().parent.parent
 CASES = ROOT / "acceptance" / "cases"
 REFS = ROOT / "acceptance" / "refs"
 RB = ROOT / "acceptance" / "ruby"
+GO_SRC = ROOT / "acceptance" / "go"
 ALX = ROOT / "target" / "release" / "alx"
 WORK = Path(tempfile.mkdtemp(prefix="alx-bench-"))
 CASE_NAMES = sorted(p.stem for p in CASES.glob("pe*.alx") if p.stem.count(".") == 0)
 
 RUBY = shutil.which("ruby", path="/opt/homebrew/opt/ruby/bin") or "ruby"
 FAST = [RUBY, "--disable-gems"]
+GO = shutil.which("go") or "/opt/homebrew/bin/go"
 
-# runner -> function(case) -> argv, or None if the runner has nothing for this case
+# runner -> function(case) -> argv, or a function returning a fresh argv per
+# run, or None if the runner has nothing for this case
 RUNNERS = {
     "alx-run": lambda c: [ALX, "run", f"{c}.alx"],
     "alx-rel": lambda c: alx_release(c),
@@ -64,12 +75,16 @@ RUNNERS = {
     "fast": lambda c: FAST + [RB / "fast" / f"{c}.rb"],
     "fast-yjit": lambda c: FAST + ["--yjit", "--yjit-call-threshold=1", RB / "fast" / f"{c}.rb"],
     "fast-zjit": lambda c: FAST + ["--zjit", "--zjit-call-threshold=1", RB / "fast" / f"{c}.rb"],
+    "go-run": lambda c: lambda: go_edited(c),
+    "go": lambda c: go_build(c, "idiomatic"),
+    "go-fast": lambda c: go_build(c, "fast"),
 }
 GROUPS = {
     "alx": ["alx-run", "alx-rel"],
     "ruby": ["rb", "rb-yjit", "fast", "fast-yjit", "fast-zjit"],
     "idiomatic": ["rb", "rb-yjit"],
     "fastrb": ["fast", "fast-yjit", "fast-zjit"],
+    "golang": ["go-run", "go", "go-fast"],
     "all": list(RUNNERS),
 }
 
@@ -91,7 +106,30 @@ def rust_ref(case):
     return [out]
 
 
+def go_build(case, flavor):
+    out = WORK / f"go_{flavor}_{case}"
+    if not out.exists():
+        subprocess.run([GO, "build", "-o", out, GO_SRC / flavor / f"{case}.go"], check=True, capture_output=True)
+    return [out]
+
+
+_edits = 0
+
+
+def go_edited(case):
+    """A new copy of the source with a unique comment: `go run` must recompile it."""
+    global _edits
+    _edits += 1
+    d = WORK / f"gorun_{case}_{_edits}"
+    d.mkdir()
+    src = (GO_SRC / "idiomatic" / f"{case}.go").read_text() + f"\n// edit {_edits}\n"
+    (d / "main.go").write_text(src)
+    return [GO, "run", d / "main.go"]
+
+
 def timed(cmd, want):
+    if callable(cmd):
+        cmd = cmd()
     t0 = time.perf_counter()
     r = subprocess.run(cmd, cwd=CASES, capture_output=True, text=True)
     ms = (time.perf_counter() - t0) * 1e3
@@ -155,6 +193,8 @@ def main():
         subprocess.run(["cargo", "build", "--release", "-q"], cwd=ROOT, check=True, stderr=subprocess.DEVNULL)
     if any(r in GROUPS["ruby"] for r in runners):
         print(subprocess.run([RUBY, "-v"], capture_output=True, text=True).stdout.strip())
+    if any(r in GROUPS["golang"] for r in runners):
+        print(subprocess.run([GO, "version"], capture_output=True, text=True).stdout.strip())
 
     if a.once:
         for c in cases:
@@ -173,7 +213,7 @@ def main():
     w = 11
     head = f"{'case':<7}" + "".join(f"{r:>{w}}" for r in runners) + "".join(f"{r + '/' + a.vs:>{max(w, len(r) + len(a.vs) + 3)}}" for r in vs_cols)
     if a.speedup:
-        head += f"{'rb/' + a.speedup:>{w + 1}}"
+        head += f"{'best/' + a.speedup:>{w + 3}}"
     print(head)
     failed = False
     for c in cases:
@@ -195,8 +235,8 @@ def main():
             ok = row[r] is not None and row[a.vs]
             cells.append(f"{row[r] / row[a.vs]:{cw - 1}.2f}x" if ok else f"{'-':>{cw}}")
         if a.speedup:
-            rb = [row[r] for r in runners if r in GROUPS["ruby"] and row[r] is not None]
-            cells.append(f"{min(rb) / row[a.speedup]:{w}.2f}x" if rb and row[a.speedup] else f"{'-':>{w + 1}}")
+            others = [row[r] for r in runners if not r.startswith("alx") and r != "rust" and row[r] is not None]
+            cells.append(f"{min(others) / row[a.speedup]:{w + 2}.2f}x" if others and row[a.speedup] else f"{'-':>{w + 3}}")
         print(f"{c:<7}" + "".join(cells), flush=True)
     sys.exit(1 if failed else 0)
 

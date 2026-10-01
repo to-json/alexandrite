@@ -11,7 +11,7 @@ Read this first after a context compaction.
 - `compiler/runtime/`: the C runtime (`alx.h`, `alx.c`) plus vendored libtommath (Unlicense).
 
 ## Compiler architecture (v0)
-lexer → parser (AST with spans) → check (type inference per function instance, monomorphized; purity; diagnostics) → lower (typed AST → LIR: loops, temps, labeled breaks; Enumerable chains fused) → cgen (C) / rgen (Rust oracle) → driver (clang, cache in `.alx-cache/` next to the source).
+lexer → parser (AST with spans) → check (type inference per function instance, monomorphized; purity; diagnostics) → lower (typed AST → LIR: loops, temps, labeled breaks; Enumerable chains fused) → jit (Cranelift, in-process: `alx run`) / cgen (C) / rgen (Rust oracle) → driver (clang for native builds, cache in `.alx-cache/` next to the source).
 
 v0 decisions, made deliberately (record them in DESIGN.md at the end):
 - **Memory:** one program-lifetime region (per-thread bump allocator, never freed). Memory-safe because nothing is freed; per-scope pools come later.

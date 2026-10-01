@@ -133,6 +133,7 @@ Deliberate simplifications in the first compiler, each a known gap against the d
 - **Error sets:** one global `Err` type. A function is either fallible or not; per-set inference (probe 11) isn't implemented yet.
 - **Top level** behaves like `main -> ()!`. Fallible calls there get an implicit `try`, and an unhandled error prints a message and exits 1.
 - **Prover:** constant and loop-variable intervals (ranges, `step`, `each_index`), arrays of fixed length, division or modulo by a constant other than 0 and -1, sum bounds (element interval × element count), and **the counter axiom**: `v += 1` from a constant start can't overflow 64 bits in any feasible run. Release builds drop every check that this proves unnecessary.
+- **`alx run` is a JIT.** Debug runs lower the whole program (libraries included, from source) to Cranelift IR, compile it in memory, and run it in the `alx` process, with the C runtime linked into `alx` (build.rs; entry points in `runtime/jit_shims.c` take only int64 and pointer arguments). Same LIR, same runtime, same checks and messages as the C backend; edit-to-answer drops from ~140 ms (clang + link) to ~2 ms. `--release`, `--sanitize`, `--emit-*`, `alx build` and `ALX_NO_JIT=1` use clang.
 - **Generics:** monomorphization only. There are no method tables in debug builds yet, and no traits.
 - `first`, `max`, `max_by` and `reduce` on an empty collection panic. `T?` comes later.
 - **Conditions of `if` and `while`:** a `{` after a method call counts as a block only if `|` follows it.

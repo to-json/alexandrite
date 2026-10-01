@@ -20,7 +20,7 @@ acceptance/
 ```
 
 For each case, `run.py`:
-1. **`alx run case.alx`**: a debug build (method tables, clang -O0), then runs it. Checks stdout, and checks the **edit-to-answer** time (build plus run) against the budget.
+1. **`alx run case.alx`**: a debug build, then runs it. (v0: the whole program is JIT-compiled in memory with Cranelift and run in-process; `alx build` without `--release` still produces a clang -O0 binary.) Checks stdout, and checks the **edit-to-answer** time (build plus run) against the budget.
 2. **`alx run --release case.alx`**: release build, then runs it. Checks stdout, and checks the **run time** against a hand-written Rust reference (`refs/peNNN.rs`, `rustc -O`).
 3. **Safety net:** builds the case with ASan/UBSan, and checks the Rust backend's output with rustc (the oracle). Both must be clean. A rustc rejection is a bug in our checker (DESIGN.md, Architecture).
 4. **Negative cases** (`*.bad.alx` + `*.expected_error`): compilation must fail, and the first error must match the expected text, **file:line:column** included. Runtime failures (`*.expected_runtime`) give the exit status on the first line (`abort` or a number), then lines that must appear in stderr.
@@ -210,8 +210,8 @@ Not one problem. These are what working on twenty problems in an evening feels l
 |---|---|---|
 | **Edit-to-answer** | edit pe001 (change `1000` to `999`), rerun, 10 times | median < 300 ms (debug), on the machine from probe 10 |
 | **Error round-trip** | introduce a typo (`selct`), rerun | the error names `selct`, suggests `select`, gives file:line:col, and arrives in < 200 ms |
-| **Library reuse** | `pe003.alx` uses `lib/primes.alx` from A2 | a second run doesn't rebuild the library (its header's hash is unchanged) |
-| **No setup** | a fresh directory containing only `pe001.alx` | `alx run pe001.alx` works, and creates nothing except a cache directory |
+| **Library reuse** | `pe003.alx` uses `lib/primes.alx` from A2 | a second native build doesn't rebuild the library (its header's hash is unchanged); `alx run` JITs the whole program in memory |
+| **No setup** | a fresh directory containing only `pe001.alx` | `alx run pe001.alx` works, and creates nothing except, at most, a cache directory |
 | **Answer check** | `alx run pe010.alx --expect 142913828922` | exit code 0 if the output matches and 1 otherwise, so solutions can be checked in a loop |
 | **Oracle clean** | the CI job over all cases | rustc accepts every emitted `.rs`, and ASan/UBSan are clean |
 

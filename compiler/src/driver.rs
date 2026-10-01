@@ -1,4 +1,5 @@
-//! `alx run`: front end → C → clang → run. Everything built lands in
+//! `alx run`: front end → Cranelift JIT, in process (debug), or front end →
+//! C → clang → run (`--release`, `--sanitize`, `alx build`). Everything built lands in
 //! `.alx-cache/` next to the source file; nothing else is created.
 
 use crate::{cgen, front, lower};
@@ -236,7 +237,77 @@ pub fn build_only(file: &str, o: &Options) -> ExitCode {
     }
 }
 
+/// `alx run` without --release/--sanitize: whole program from source,
+/// compiled in memory by the Cranelift JIT, run in this process.
+fn run_jit(file: &str, o: &Options) -> ExitCode {
+    let l = match front::load(Path::new(file), file) {
+        Ok(l) => l,
+        Err((sm, d)) => {
+            eprint!("{}", sm.render(&d));
+            return ExitCode::from(1);
+        }
+    };
+    let p = match front::check_program(&l, front::lib_defs(&l)) {
+        Ok(p) => p,
+        Err(d) => {
+            eprint!("{}", l.sm.render(&d));
+            return ExitCode::from(1);
+        }
+    };
+    let lp = lower::lower(&p, &l.sm, &lower::Opts { release: false });
+    log(o, "jit");
+    let Some(want) = &o.expect else {
+        return match crate::jit::run(&lp) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("alx: {e}");
+                ExitCode::from(3)
+            }
+        };
+    };
+    // --expect: run in a child whose stdout we capture.
+    let mut fds = [0; 2];
+    unsafe {
+        if libc::pipe(fds.as_mut_ptr()) != 0 {
+            eprintln!("alx: pipe failed");
+            return ExitCode::from(3);
+        }
+        let pid = libc::fork();
+        if pid == 0 {
+            libc::close(fds[0]);
+            libc::dup2(fds[1], 1);
+            libc::close(fds[1]);
+            let code = match crate::jit::run(&lp) {
+                Ok(()) => 0,
+                Err(e) => {
+                    eprintln!("alx: {e}");
+                    3
+                }
+            };
+            libc::_exit(code);
+        }
+        libc::close(fds[1]);
+        use std::io::Read;
+        use std::os::fd::FromRawFd;
+        let mut got = String::new();
+        let _ = std::fs::File::from_raw_fd(fds[0]).read_to_string(&mut got);
+        let mut status = 0;
+        libc::waitpid(pid, &mut status, 0);
+        print!("{got}");
+        let ok = libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0;
+        if got.trim() == want.trim() && ok {
+            ExitCode::SUCCESS
+        } else {
+            eprintln!("alx: expected `{}`, got `{}`", want.trim(), got.trim());
+            ExitCode::from(1)
+        }
+    }
+}
+
 pub fn run(file: &str, o: &Options) -> ExitCode {
+    if !o.release && !o.sanitize && o.emit_c.is_none() && o.emit_rust.is_none() && std::env::var_os("ALX_NO_JIT").is_none() {
+        return run_jit(file, o);
+    }
     let bin = match build(file, o) {
         Ok(b) => b,
         Err(c) => return c,

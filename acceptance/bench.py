@@ -6,7 +6,7 @@ usage: acceptance/bench.py [CASE ...] [-r RUNNERS] [--vs RUNNER] [-n N] [--once]
   CASE      case names or substrings (pe010, 01, ...); default: all
   -r        comma-separated runners or groups; default: all
   --vs      add a column per runner: its time / this runner's time
-  --speedup add a column: fastest Ruby runner / alx-rel (implies alx-rel)
+  --speedup add a column: fastest Ruby runner / RUNNER (default alx-rel)
   -n        max runs per cell (best-of; default 50, capped at ~3 s per cell)
   --once    run each cell once and print its output instead of timing it
   --list    list cases and runners
@@ -31,6 +31,7 @@ examples:
   acceptance/bench.py pe010 pe014 -r alx-rel,fast-yjit,rust
   acceptance/bench.py -r alx,ruby --vs alx-rel
   acceptance/bench.py -r alx-rel,ruby --speedup
+  acceptance/bench.py -r fastrb --speedup alx-run
   acceptance/bench.py pe025 -r alx-rel,rb --once
 """
 
@@ -125,7 +126,7 @@ def main():
     ap.add_argument("cases", nargs="*")
     ap.add_argument("-r", default="all")
     ap.add_argument("--vs")
-    ap.add_argument("--speedup", action="store_true")
+    ap.add_argument("--speedup", nargs="?", const="alx-rel", metavar="RUNNER")
     ap.add_argument("-n", type=int, default=50)
     ap.add_argument("--once", action="store_true")
     ap.add_argument("--list", action="store_true")
@@ -147,8 +148,8 @@ def main():
         if a.vs not in runners:
             runners.append(a.vs)
 
-    if a.speedup and "alx-rel" not in runners:
-        runners.insert(0, "alx-rel")
+    if a.speedup and a.speedup not in runners:
+        runners.insert(0, a.speedup)
 
     if any(r.startswith("alx") for r in runners):
         subprocess.run(["cargo", "build", "--release", "-q"], cwd=ROOT, check=True, stderr=subprocess.DEVNULL)
@@ -172,7 +173,7 @@ def main():
     w = 11
     head = f"{'case':<7}" + "".join(f"{r:>{w}}" for r in runners) + "".join(f"{r + '/' + a.vs:>{max(w, len(r) + len(a.vs) + 3)}}" for r in vs_cols)
     if a.speedup:
-        head += f"{'rb/alx-rel':>{w + 1}}"
+        head += f"{'rb/' + a.speedup:>{w + 1}}"
     print(head)
     failed = False
     for c in cases:
@@ -195,7 +196,7 @@ def main():
             cells.append(f"{row[r] / row[a.vs]:{cw - 1}.2f}x" if ok else f"{'-':>{cw}}")
         if a.speedup:
             rb = [row[r] for r in runners if r in GROUPS["ruby"] and row[r] is not None]
-            cells.append(f"{min(rb) / row['alx-rel']:{w}.2f}x" if rb and row["alx-rel"] else f"{'-':>{w + 1}}")
+            cells.append(f"{min(rb) / row[a.speedup]:{w}.2f}x" if rb and row[a.speedup] else f"{'-':>{w + 1}}")
         print(f"{c:<7}" + "".join(cells), flush=True)
     sys.exit(1 if failed else 0)
 

@@ -4,6 +4,7 @@ mod check;
 mod diag;
 mod driver;
 mod front;
+mod jit;
 mod lexer;
 mod lir;
 mod lower;

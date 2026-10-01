@@ -189,9 +189,12 @@ def a6():
     if lib.exists():
         shutil.rmtree(lib)
     shutil.copytree(CASES, lib, ignore=shutil.ignore_patterns(".alx-cache"))
-    r1, _ = run([ALX, "run", "-v", "pe007.alx"], cwd=lib)
-    r2, _ = run([ALX, "run", "-v", "pe007.alx"], cwd=lib)
-    ok = "lib/primes: compiling" in r1.stderr and "lib/primes: cached" in r2.stderr and r2.stdout.strip() == "104743"
+    # (`alx run` JITs the whole program in memory; native builds compile
+    # libraries separately and cache them.)
+    r1, _ = run([ALX, "build", "-v", "pe007.alx"], cwd=lib)
+    r2, _ = run([ALX, "build", "-v", "pe007.alx"], cwd=lib)
+    out = run([r2.stdout.strip()], cwd=lib)[0].stdout.strip() if r2.returncode == 0 else ""
+    ok = "lib/primes: compiling" in r1.stderr and "lib/primes: cached" in r2.stderr and out == "104743"
     check("A6", "library reuse", ok, " / ".join(l for l in r2.stderr.splitlines() if "lib/" in l))
 
     # No setup: a fresh directory containing only pe001.alx.
@@ -202,7 +205,7 @@ def a6():
     shutil.copy(CASES / "pe001.alx", fresh / "pe001.alx")
     r, _ = run([ALX, "run", "pe001.alx"], cwd=fresh)
     entries = sorted(p.name for p in fresh.iterdir())
-    check("A6", "no setup", r.stdout.strip() == "233168" and entries == [".alx-cache", "pe001.alx"], f"directory now holds {entries}")
+    check("A6", "no setup", r.stdout.strip() == "233168" and entries in ([".alx-cache", "pe001.alx"], ["pe001.alx"]), f"directory now holds {entries}")
 
     # Answer check.
     good = run([ALX, "run", "pe010.alx", "--expect", "142913828922"])[0].returncode

@@ -628,7 +628,7 @@ impl FnEmit<'_> {
 }
 
 /// `s == s.reverse` (either side) on a variable: the variable.
-fn palindrome_test<'a>(a: &'a LE, b: &'a LE) -> Option<&'a LE> {
+pub fn palindrome_test<'a>(a: &'a LE, b: &'a LE) -> Option<&'a LE> {
     let rev_of = |x: &LE, r: &LE| matches!((x, r), (LE::Var(v), LE::Rt(Rt::StrRev, args)) if matches!(args.as_slice(), [LE::Var(w)] if w == v));
     if rev_of(a, b) {
         Some(a)

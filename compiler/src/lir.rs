@@ -1,9 +1,15 @@
 //! Low-level IR shared by the C backend and the Rust oracle: structured
 //! statements, explicit loops with labels, explicit checks.
 
+pub use crate::ast::IntKind;
+
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub enum LTy {
     I64,
+    /// A Go integer type other than I64. In registers it is an i64 holding
+    /// the value (sign- or zero-extended; U64 as its bit pattern); in arrays
+    /// and structs it takes its own width.
+    IntK(IntKind),
     /// Float: an IEEE double.
     F64,
     /// Int in a `#![overflow(promote)]` file: small or bignum.
@@ -76,6 +82,8 @@ pub enum LE {
     Neg(Box<LE>, Ovf),
     /// Float arithmetic (IEEE: never fails).
     FArith(Op, Box<LE>, Box<LE>),
+    /// A primitive operation on i64 registers (see `Prim`).
+    Prim(Prim, Vec<LE>),
     FNeg(Box<LE>),
     Not(Box<LE>),
     Cond(Box<LE>, Box<LE>, Box<LE>),
@@ -133,6 +141,41 @@ pub enum Rt {
     FFmt,
     /// Concatenate all argument strings.
     StrCat,
+    /// A U64 (bit pattern in an i64) in decimal.
+    U64ToS,
+    /// (v, base, upper, unsigned): `%x` `%X` `%o` `%b`.
+    IntFmt,
+    /// Float → U64: (x, loc); fails on NaN, negatives and out of range.
+    FToU64,
+    /// A Rune as a one-character Str (`%c`).
+    RuneToS,
+}
+
+/// Primitive integer operations on i64 registers. The lowering builds Go's
+/// integer semantics (widths, overflow checks, shifts) out of these.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Prim {
+    And,
+    Or,
+    Xor,
+    /// a & !b
+    AndNot,
+    Not,
+    /// Shift counts are always in 0..64 here.
+    Shl,
+    ShrS,
+    ShrU,
+    /// Unsigned comparisons (as u64).
+    ULt,
+    ULe,
+    UDiv,
+    URem,
+    /// High 64 bits of the unsigned 128-bit product.
+    UMulHi,
+    /// Truncate to a narrow kind's width, then sign- or zero-extend back.
+    Wrap(IntKind),
+    /// u64 → f64
+    UToF,
 }
 
 /// A step of an assignable place.
@@ -156,6 +199,8 @@ pub enum LS {
     SetIndex { arr: V, idx: LE, val: LE, check: Option<String> },
     /// `var[i].f... = val`: a write through index and field steps.
     SetPlace { var: V, steps: Vec<Step>, val: LE },
+    /// If `cond`, fail with an overflow error at `loc` (sized arithmetic under `~`).
+    FailIf { cond: LE, loc: String, path: ErrPath },
     Push(V, LE),
     Eval(LE),
     If(LE, Vec<LS>, Vec<LS>),

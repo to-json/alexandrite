@@ -6,7 +6,7 @@
 //! each_cons) and emits one loop. Without `.lazy`, a chain whose blocks do
 //! I/O is materialized stage by stage instead (Ruby's eager semantics).
 
-use crate::ast::{BinOp, Overflow};
+use crate::ast::{BinOp, IntKind, Overflow};
 use crate::diag::{SourceMap, Span};
 use crate::lir::*;
 use crate::tast::*;
@@ -48,6 +48,7 @@ pub fn lty(t: &Ty, mode: Overflow) -> LTy {
                 LTy::I64
             }
         }
+        Ty::IntK(k) => LTy::IntK(*k),
         Ty::Float => LTy::F64,
         Ty::Struct(_, fs) => LTy::Tup(fs.iter().map(|(_, t)| lty(t, mode)).collect()),
         Ty::Bool => LTy::Bool,
@@ -367,7 +368,14 @@ impl<'a> Lw<'a> {
 
     fn expr(&mut self, e: &TExpr) -> LE {
         match &e.kind {
-            TK::Int(v) => self.int_out(LE::I(*v)),
+            TK::Int(v) => {
+                if e.ty == Ty::Int {
+                    self.int_out(LE::I(*v))
+                } else {
+                    LE::I(*v)
+                }
+            }
+            TK::Const(_) => unreachable!("constants are typed by the checker"),
             TK::Float(v) => LE::F(*v),
             TK::PlaceAssign(l, steps, op, v) => self.place_assign(*l, steps, *op, v, e),
             TK::Format(pieces, args) => self.format(pieces, args),
@@ -388,7 +396,7 @@ impl<'a> Lw<'a> {
                 let arr_t = TExpr { kind: TK::Local(*l), ty: self.f.locals[*l].ty.clone(), span: e.span };
                 let check = self.index_check(&arr_t, i);
                 let iv = self.expr(i);
-                let iv = self.int_in(iv, i.span);
+                let iv = self.int_in_t(iv, &i.ty, i.span);
                 let vv = self.expr(v);
                 let vt = self.lty(&v.ty);
                 let vv = self.bind(vv, vt);
@@ -444,7 +452,7 @@ impl<'a> Lw<'a> {
                 let check = self.index_check(a, i);
                 let av = self.expr(a);
                 let iv = self.expr(i);
-                let iv = self.int_in(iv, i.span);
+                let iv = self.int_in_t(iv, &i.ty, i.span);
                 LE::Index { arr: Box::new(av), idx: Box::new(iv), check }
             }
             TK::Call(fid, args) => {
@@ -505,23 +513,8 @@ impl<'a> Lw<'a> {
     }
 
     fn binary(&mut self, op: BinOp, a: &TExpr, b: &TExpr, e: &TExpr) -> LE {
-        let lop = match op {
-            BinOp::Add => Op::Add,
-            BinOp::Sub => Op::Sub,
-            BinOp::Mul => Op::Mul,
-            BinOp::Div => Op::Div,
-            BinOp::Rem => Op::Rem,
-            BinOp::Pow => Op::Pow,
-            BinOp::Eq => Op::Eq,
-            BinOp::Ne => Op::Ne,
-            BinOp::Lt => Op::Lt,
-            BinOp::Le => Op::Le,
-            BinOp::Gt => Op::Gt,
-            BinOp::Ge => Op::Ge,
-            BinOp::And => Op::And,
-            BinOp::Or => Op::Or,
-        };
         if matches!(op, BinOp::And | BinOp::Or) {
+            let lop = if op == BinOp::And { Op::And } else { Op::Or };
             let av = self.expr(a);
             let (sb, bv) = self.sub_val(|lw| lw.expr(b));
             if sb.is_empty() {
@@ -538,29 +531,212 @@ impl<'a> Lw<'a> {
         let av = self.expr(a);
         let bv = self.expr(b);
         let at = self.lty(&a.ty);
+        let lop = op_of(op);
         if at == LTy::F64 {
             return if op.is_arith() { LE::FArith(lop, Box::new(av), Box::new(bv)) } else { LE::Cmp(lop, Box::new(av), Box::new(bv), at) };
         }
-        if !op.is_arith() {
-            if at == LTy::PInt {
-                return LE::PArith(lop, Box::new(av), Box::new(bv));
-            }
+        if !matches!(at, LTy::I64 | LTy::IntK(_) | LTy::PInt) {
+            // Str and Bool comparisons.
             return LE::Cmp(lop, Box::new(av), Box::new(bv), at);
         }
+        let k = a.ty.int_kind().unwrap_or(IntKind::I64);
         if at == LTy::PInt {
-            return LE::PArith(lop, Box::new(av), Box::new(bv));
+            if op.is_arith() || is_cmp(op) {
+                return LE::PArith(lop, Box::new(av), Box::new(bv));
+            }
+            // Bit operations on a promoted Int work on its 64-bit value.
+            let (x, y) = (self.int_in(av, a.span), self.int_in_t(bv, &b.ty, b.span));
+            let bk = b.ty.int_kind().unwrap_or(IntKind::I64);
+            let r = self.int_op(op, IntKind::I64, bk, x, y, e.span, false);
+            return self.int_out(r);
         }
+        if is_cmp(op) {
+            return self.cmp(lop, av, bv, &at);
+        }
+        let bk = b.ty.int_kind().unwrap_or(IntKind::I64);
+        let bv = if b.ty == Ty::Int { self.int_in(bv, b.span) } else { bv };
+        // Release: an I64 operation whose result interval is known can't overflow.
+        let proven = k == IntKind::I64 && self.opts.release && matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul) && self.interval(e).is_some();
+        self.int_op(op, k, bk, av, bv, e.span, proven)
+    }
+
+    /// A comparison of two values of type `t` (unsigned for U64).
+    fn cmp(&mut self, op: Op, a: LE, b: LE, t: &LTy) -> LE {
+        match t {
+            LTy::IntK(IntKind::U64) if matches!(op, Op::Lt | Op::Le | Op::Gt | Op::Ge) => match op {
+                Op::Lt => LE::Prim(Prim::ULt, vec![a, b]),
+                Op::Le => LE::Prim(Prim::ULe, vec![a, b]),
+                Op::Gt => LE::Prim(Prim::ULt, vec![b, a]),
+                _ => LE::Prim(Prim::ULe, vec![b, a]),
+            },
+            LTy::IntK(_) => LE::Cmp(op, Box::new(a), Box::new(b), LTy::I64),
+            LTy::PInt => LE::PArith(op, Box::new(a), Box::new(b)),
+            _ => LE::Cmp(op, Box::new(a), Box::new(b), t.clone()),
+        }
+    }
+
+    /// Go's integer operations on kind `k` (registers hold i64s). `bk` is
+    /// the right operand's kind (it differs only for shift counts).
+    #[allow(clippy::too_many_arguments)]
+    fn int_op(&mut self, op: BinOp, k: IntKind, bk: IntKind, a: LE, b: LE, sp: Span, proven: bool) -> LE {
+        let lop = op_of(op);
+        let wrap_mode = self.mode == Overflow::Wrap;
+        match op {
+            BinOp::BitAnd => LE::Prim(Prim::And, vec![a, b]),
+            BinOp::BitOr => LE::Prim(Prim::Or, vec![a, b]),
+            BinOp::BitXor => LE::Prim(Prim::Xor, vec![a, b]),
+            BinOp::AndNot => LE::Prim(Prim::AndNot, vec![a, b]),
+            BinOp::Shl | BinOp::Shr => self.shift(op, k, bk, a, b, sp),
+            BinOp::AddW | BinOp::SubW | BinOp::MulW => {
+                let lop = match op {
+                    BinOp::AddW => Op::Add,
+                    BinOp::SubW => Op::Sub,
+                    _ => Op::Mul,
+                };
+                wrap_to(k, LE::Arith(lop, Box::new(a), Box::new(b), Ovf::Wrap))
+            }
+            BinOp::Add | BinOp::Sub | BinOp::Mul if wrap_mode => wrap_to(k, LE::Arith(lop, Box::new(a), Box::new(b), Ovf::Wrap)),
+            _ if k == IntKind::I64 => {
+                if self.try_arith {
+                    let dst = self.tmp(LTy::I64);
+                    let path = self.path.clone();
+                    self.emit(LS::TryArith { dst, op: lop, a, b, loc: self.loc(sp), path });
+                    return LE::Var(dst);
+                }
+                if proven {
+                    return LE::Arith(lop, Box::new(a), Box::new(b), Ovf::Unchecked);
+                }
+                LE::Arith(lop, Box::new(a), Box::new(b), self.ovf(sp))
+            }
+            BinOp::Add | BinOp::Sub | BinOp::Mul => {
+                let a = self.bind(a, LTy::I64);
+                let b = self.bind(b, LTy::I64);
+                if k == IntKind::U64 {
+                    let r = self.tmp(LTy::I64);
+                    self.emit(LS::Set(r, LE::Arith(lop, Box::new(a.clone()), Box::new(b.clone()), Ovf::Wrap)));
+                    let ovf = match op {
+                        BinOp::Add => LE::Prim(Prim::ULt, vec![LE::Var(r), a]),
+                        BinOp::Sub => LE::Prim(Prim::ULt, vec![a, b]),
+                        _ => LE::Cmp(Op::Ne, Box::new(LE::Prim(Prim::UMulHi, vec![a, b])), Box::new(LE::I(0)), LTy::I64),
+                    };
+                    self.overflow_if(ovf, k, sp);
+                    return LE::Var(r);
+                }
+                // Narrow: the 64-bit result is exact; check it fits.
+                let r = self.tmp(LTy::I64);
+                self.emit(LS::Set(r, LE::Arith(lop, Box::new(a), Box::new(b), Ovf::Wrap)));
+                let out = out_of_range(k, LE::Var(r));
+                self.overflow_if(out, k, sp);
+                LE::Var(r)
+            }
+            BinOp::Div | BinOp::Rem => {
+                let a = self.bind(a, LTy::I64);
+                let b = self.bind(b, LTy::I64);
+                let zero = LE::Cmp(Op::Eq, Box::new(b.clone()), Box::new(LE::I(0)), LTy::I64);
+                if self.try_arith {
+                    let path = self.path.clone();
+                    self.emit(LS::FailIf { cond: zero, loc: self.loc(sp), path });
+                } else {
+                    self.emit(LS::If(zero, vec![LS::Panic("division by zero".into(), self.loc(sp))], vec![]));
+                }
+                if k == IntKind::U64 {
+                    return LE::Prim(if op == BinOp::Div { Prim::UDiv } else { Prim::URem }, vec![a, b]);
+                }
+                let r = self.tmp(LTy::I64);
+                self.emit(LS::Set(r, LE::Arith(lop, Box::new(a), Box::new(b), Ovf::Unchecked)));
+                if op == BinOp::Div && k.signed() {
+                    // MIN / -1 is the one quotient that doesn't fit.
+                    if wrap_mode {
+                        return wrap_to(k, LE::Var(r));
+                    }
+                    let out = out_of_range(k, LE::Var(r));
+                    self.overflow_if(out, k, sp);
+                }
+                LE::Var(r)
+            }
+            _ => unreachable!("`{}` on {}", op.text(), k.name()),
+        }
+    }
+
+    /// Go's shifts: no overflow; a count of the width or more shifts
+    /// everything out; a negative count panics.
+    #[allow(clippy::too_many_arguments)]
+    fn shift(&mut self, op: BinOp, k: IntKind, ck: IntKind, a: LE, c: LE, sp: Span) -> LE {
+        let a = self.bind(a, LTy::I64);
+        let c = self.bind(c, LTy::I64);
+        if ck.signed() {
+            let neg = LE::Cmp(Op::Lt, Box::new(c.clone()), Box::new(LE::I(0)), LTy::I64);
+            self.emit(LS::If(neg, vec![LS::Panic("negative shift amount".into(), self.loc(sp))], vec![]));
+        }
+        let w = k.bits() as i64;
+        let big = LE::Prim(Prim::ULe, vec![LE::I(w), c.clone()]);
+        if op == BinOp::Shl {
+            return LE::Cond(Box::new(big), Box::new(LE::I(0)), Box::new(wrap_to(k, LE::Prim(Prim::Shl, vec![a, c]))));
+        }
+        if k == IntKind::U64 {
+            return LE::Cond(Box::new(big), Box::new(LE::I(0)), Box::new(LE::Prim(Prim::ShrU, vec![a, c])));
+        }
+        // Registers hold sign- or zero-extended values: an arithmetic shift
+        // clamped to 63 is right for every other kind.
+        let clamped = LE::Cond(Box::new(LE::Prim(Prim::ULe, vec![LE::I(63), c.clone()])), Box::new(LE::I(63)), Box::new(c));
+        LE::Prim(Prim::ShrS, vec![a, clamped])
+    }
+
+    fn overflow_if(&mut self, cond: LE, k: IntKind, sp: Span) {
+        let loc = self.loc(sp);
         if self.try_arith {
-            let dst = self.tmp(LTy::I64);
             let path = self.path.clone();
-            self.emit(LS::TryArith { dst, op: lop, a: av, b: bv, loc: self.loc(e.span), path });
-            return LE::Var(dst);
+            self.emit(LS::FailIf { cond, loc, path });
+        } else {
+            self.emit(LS::If(cond, vec![LS::Panic(format!("overflow ({})", k.name()), loc)], vec![]));
         }
-        // Release: an operation whose result interval is known can't overflow.
-        if self.opts.release && matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul) && self.interval(e).is_some() {
-            return LE::Arith(lop, Box::new(av), Box::new(bv), Ovf::Unchecked);
+    }
+
+    /// An Int of this function's mode, needed as a machine i64 (other
+    /// integer kinds are already machine values).
+    fn int_in_t(&self, e: LE, t: &Ty, sp: Span) -> LE {
+        if *t == Ty::Int { self.int_in(e, sp) } else { e }
+    }
+
+    /// `x.to_u8` (checked) / `x.as_u8` (wrapping) from an integer or a Float.
+    fn convert(&mut self, k: IntKind, wrap: bool, x: &TExpr, sp: Span) -> LE {
+        let v = self.expr(x);
+        let loc = self.loc(sp);
+        let fail = |k: IntKind| LS::Panic(format!("conversion overflow: the value doesn't fit {}", k.name()), loc.clone());
+        if x.ty == Ty::Float {
+            if k == IntKind::U64 {
+                return LE::Rt(Rt::FToU64, vec![v, LE::Loc(loc.clone())]);
+            }
+            let i = self.tmp(LTy::I64);
+            self.emit(LS::Set(i, LE::Rt(Rt::FToI, vec![v, LE::Loc(loc.clone())])));
+            if k != IntKind::I64 {
+                let out = out_of_range(k, LE::Var(i));
+                self.emit(LS::If(out, vec![fail(k)], vec![]));
+            }
+            let r = LE::Var(i);
+            return if k == IntKind::I64 { self.int_out(r) } else { r };
         }
-        LE::Arith(lop, Box::new(av), Box::new(bv), self.ovf(e.span))
+        let sk = x.ty.int_kind().unwrap_or(IntKind::I64);
+        let v = self.int_in_t(v, &x.ty, x.span);
+        let v = self.bind(v, LTy::I64);
+        let r = if wrap {
+            wrap_to(k, v)
+        } else {
+            let out = if sk == IntKind::U64 {
+                (k != IntKind::U64).then(|| LE::Prim(Prim::ULt, vec![LE::I(k.max() as i64), v.clone()]))
+            } else if k == IntKind::U64 {
+                Some(LE::Cmp(Op::Lt, Box::new(v.clone()), Box::new(LE::I(0)), LTy::I64))
+            } else if k == IntKind::I64 || (k.min() <= sk.min() && k.max() >= sk.max()) {
+                None
+            } else {
+                Some(out_of_range(k, v.clone()))
+            };
+            if let Some(out) = out {
+                self.emit(LS::If(out, vec![fail(k)], vec![]));
+            }
+            v
+        };
+        if k == IntKind::I64 { self.int_out(r) } else { r }
     }
 
     /// `place = v` / `place op= v`: index expressions are evaluated once.
@@ -577,7 +753,7 @@ impl<'a> Lw<'a> {
                         Some(self.loc(i.span))
                     };
                     let iv = self.expr(i);
-                    let iv = self.int_in(iv, i.span);
+                    let iv = self.int_in_t(iv, &i.ty, i.span);
                     let iv = self.bind(iv, LTy::I64);
                     lsteps.push(Step::Index(iv, check));
                 }
@@ -611,24 +787,18 @@ impl<'a> Lw<'a> {
     /// `a op b` on already-lowered operands of type `t`.
     fn arith_le(&mut self, op: crate::ast::BinOp, a: LE, b: LE, t: &LTy, sp: Span) -> LE {
         use crate::ast::BinOp as B;
-        let lop = match op {
-            B::Add => Op::Add,
-            B::Sub => Op::Sub,
-            B::Mul => Op::Mul,
-            B::Div => Op::Div,
-            B::Rem => Op::Rem,
-            _ => Op::Pow,
-        };
+        let lop = op_of(op);
+        let _ = B::Add;
         match t {
             LTy::F64 => LE::FArith(lop, Box::new(a), Box::new(b)),
-            LTy::PInt => LE::PArith(lop, Box::new(a), Box::new(b)),
-            _ if self.try_arith => {
-                let dst = self.tmp(LTy::I64);
-                let path = self.path.clone();
-                self.emit(LS::TryArith { dst, op: lop, a, b, loc: self.loc(sp), path });
-                LE::Var(dst)
+            LTy::PInt if op.is_arith() => LE::PArith(lop, Box::new(a), Box::new(b)),
+            LTy::PInt => {
+                let (x, y) = (self.int_in(a, sp), self.int_in(b, sp));
+                let r = self.int_op(op, IntKind::I64, IntKind::I64, x, y, sp, false);
+                self.int_out(r)
             }
-            _ => LE::Arith(lop, Box::new(a), Box::new(b), self.ovf(sp)),
+            LTy::IntK(k) => self.int_op(op, *k, *k, a, b, sp, false),
+            _ => self.int_op(op, IntKind::I64, IntKind::I64, a, b, sp, false),
         }
     }
 
@@ -649,6 +819,15 @@ impl<'a> Lw<'a> {
                 FmtPiece::Int(k) => self.to_s(vals[*k].clone(), &args[*k].ty),
                 FmtPiece::Str(k) => self.to_s(vals[*k].clone(), &args[*k].ty),
                 FmtPiece::Fixed(k, d) => LE::Rt(Rt::FFmt, vec![vals[*k].clone(), LE::I(*d as i64)]),
+                FmtPiece::Base(k, base, upper) => {
+                    let t = &args[*k].ty;
+                    let v = self.int_in_t(vals[*k].clone(), t, args[*k].span);
+                    LE::Rt(Rt::IntFmt, vec![v, LE::I(*base as i64), LE::B(*upper), LE::B(*t == Ty::IntK(IntKind::U64))])
+                }
+                FmtPiece::Char(k) => {
+                    let v = self.int_in_t(vals[*k].clone(), &args[*k].ty, args[*k].span);
+                    LE::Rt(Rt::RuneToS, vec![v])
+                }
             });
         }
         match parts.len() {
@@ -661,6 +840,8 @@ impl<'a> Lw<'a> {
     fn to_s(&mut self, v: LE, t: &Ty) -> LE {
         match t {
             Ty::Str => v,
+            Ty::IntK(IntKind::U64) => LE::Rt(Rt::U64ToS, vec![v]),
+            Ty::IntK(_) => LE::Rt(Rt::IntToS, vec![v]),
             Ty::Float => LE::Rt(Rt::FToS, vec![v]),
             Ty::Bool => LE::Cond(Box::new(v), Box::new(LE::S("true".into())), Box::new(LE::S("false".into()))),
             _ => LE::Rt(if self.promote() { Rt::PIntToS } else { Rt::IntToS }, vec![v]),
@@ -772,8 +953,9 @@ impl<'a> Lw<'a> {
                 LE::Rt(Rt::StrRev, vec![v])
             }
             ToS => {
-                let v = self.expr(recv.unwrap());
-                LE::Rt(if self.promote() { Rt::PIntToS } else { Rt::IntToS }, vec![v])
+                let r = recv.unwrap();
+                let v = self.expr(r);
+                self.to_s(v, &r.ty)
             }
             ToI => {
                 let v = self.expr(recv.unwrap());
@@ -785,8 +967,9 @@ impl<'a> Lw<'a> {
                 LE::Rt(if m == Delete { Rt::StrDelete } else { Rt::StrSplit }, vec![v, a])
             }
             Even | Odd => {
-                let v = self.expr(recv.unwrap());
-                let ev = LE::Rt(if self.promote() { Rt::PEven } else { Rt::Even }, vec![v]);
+                let r = recv.unwrap();
+                let v = self.expr(r);
+                let ev = LE::Rt(if self.promote() && r.ty == Ty::Int { Rt::PEven } else { Rt::Even }, vec![v]);
                 if m == Odd { LE::Not(Box::new(ev)) } else { ev }
             }
             Digits => {
@@ -808,9 +991,10 @@ impl<'a> Lw<'a> {
             ToF => {
                 let r = recv.unwrap();
                 let v = self.expr(r);
-                let v = self.int_in(v, r.span);
-                LE::Rt(Rt::IntToF, vec![v])
+                let v = self.int_in_t(v, &r.ty, r.span);
+                if r.ty == Ty::IntK(IntKind::U64) { LE::Prim(Prim::UToF, vec![v]) } else { LE::Rt(Rt::IntToF, vec![v]) }
             }
+            Conv(k, wrap) => self.convert(k, wrap, recv.unwrap(), sp),
             FloatToI => {
                 let v = self.expr(recv.unwrap());
                 self.int_out(LE::Rt(Rt::FToI, vec![v, LE::Loc(self.loc(sp))]))
@@ -1614,5 +1798,50 @@ fn collect_locals(e: &TExpr, out: &mut Vec<LocalId>) {
             }
         }
         _ => {}
+    }
+}
+
+fn op_of(op: BinOp) -> Op {
+    match op {
+        BinOp::Add | BinOp::AddW => Op::Add,
+        BinOp::Sub | BinOp::SubW => Op::Sub,
+        BinOp::Mul | BinOp::MulW => Op::Mul,
+        BinOp::Div => Op::Div,
+        BinOp::Rem => Op::Rem,
+        BinOp::Pow => Op::Pow,
+        BinOp::Eq => Op::Eq,
+        BinOp::Ne => Op::Ne,
+        BinOp::Lt => Op::Lt,
+        BinOp::Le => Op::Le,
+        BinOp::Gt => Op::Gt,
+        BinOp::Ge => Op::Ge,
+        BinOp::And => Op::And,
+        BinOp::Or => Op::Or,
+        // Bit operations never reach `Op` (they lower to `Prim`).
+        _ => Op::Add,
+    }
+}
+
+fn is_cmp(op: BinOp) -> bool {
+    matches!(op, BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge)
+}
+
+/// Truncate to a narrow kind's width (identity for 64-bit kinds).
+fn wrap_to(k: IntKind, e: LE) -> LE {
+    if k.bits() == 64 { e } else { LE::Prim(Prim::Wrap(k), vec![e]) }
+}
+
+/// `r` (an exact 64-bit result) is outside narrow kind `k`'s range.
+fn out_of_range(k: IntKind, r: LE) -> LE {
+    if k.signed() {
+        LE::Cmp(
+            Op::Or,
+            Box::new(LE::Cmp(Op::Lt, Box::new(r.clone()), Box::new(LE::I(k.min() as i64)), LTy::I64)),
+            Box::new(LE::Cmp(Op::Gt, Box::new(r), Box::new(LE::I(k.max() as i64)), LTy::I64)),
+            LTy::Bool,
+        )
+    } else {
+        // Unsigned: anything above max, including "negative" results.
+        LE::Prim(Prim::ULt, vec![LE::I(k.max() as i64), r])
     }
 }

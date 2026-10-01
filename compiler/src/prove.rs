@@ -198,6 +198,9 @@ impl Prover<'_> {
                 let what = if steps.iter().any(|s| matches!(s, TStep::Index(_))) { "index" } else { "arithmetic" };
                 return Err(Diag::new(e.span, format!("unproven {what} in `#[pure] def {}`: `{}`; use `try`", self.f.src_name, self.sm.snippet(e.span))));
             }
+            TK::Bin(crate::ast::BinOp::Shl | crate::ast::BinOp::Shr, _, c) if !under_try && !matches!(c.kind, TK::Int(n) if n >= 0) && c.ty.int_kind().is_some_and(|k| k.signed()) => {
+                return Err(Diag::new(c.span, format!("unproven shift in `#[pure] def {}`: a negative count panics; use a constant or an unsigned count", self.f.src_name)));
+            }
             TK::Index(..) if !under_try => {
                 return Err(Diag::new(e.span, format!("unproven index in `#[pure] def {}`: `{}` may be out of bounds; use `try`", self.f.src_name, self.sm.snippet(e.span))));
             }
@@ -226,5 +229,5 @@ impl Prover<'_> {
 
 /// Int arithmetic, which can overflow. (Float arithmetic can't fail.)
 fn is_arith(e: &TExpr) -> bool {
-    e.ty == Ty::Int && (matches!(&e.kind, TK::Bin(op, ..) if op.is_arith()) || matches!(e.kind, TK::Neg(_)))
+    e.ty.int_kind().is_some() && (matches!(&e.kind, TK::Bin(op, ..) if op.is_arith()) || matches!(e.kind, TK::Neg(_)))
 }

@@ -326,6 +326,37 @@ mod rt {
         Str::lit(&v)
     }
 
+    /// Go's %x %X %o %b.
+    pub fn int_fmt(v: i64, base: i64, upper: bool, is_u64: bool) -> Str {
+        let neg = !is_u64 && v < 0;
+        let m: u64 = if neg { (v as u64).wrapping_neg() } else { v as u64 };
+        let mut s = match base {
+            16 => format!("{m:x}"),
+            8 => format!("{m:o}"),
+            _ => format!("{m:b}"),
+        };
+        if upper {
+            s = s.to_uppercase();
+        }
+        if neg {
+            s.insert(0, '-');
+        }
+        Str::lit(s.as_bytes())
+    }
+    pub fn f_to_u64(x: f64, loc: &str) -> i64 {
+        if x.is_nan() || x.is_infinite() {
+            panic("Float#to_u64 of NaN or Infinity", loc)
+        }
+        if x < 0.0 || x >= 18446744073709551616.0 {
+            panic("conversion overflow: the value doesn't fit U64", loc)
+        }
+        (x as u64) as i64
+    }
+    pub fn rune_to_s(r: i64) -> Str {
+        let c = u32::try_from(r).ok().and_then(char::from_u32).unwrap_or('\u{FFFD}');
+        Str::lit(c.to_string().as_bytes())
+    }
+
     pub fn puts_i64(v: i64) {
         println!("{v}");
     }

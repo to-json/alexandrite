@@ -89,7 +89,7 @@ impl<'a> Parser<'a> {
     // ---------- module ----------
 
     fn module(&mut self, file: u32) -> PResult<Module> {
-        let mut m = Module { file, overflow: Overflow::Abort, requires: vec![], defs: vec![], structs: vec![], main: vec![] };
+        let mut m = Module { file, overflow: Overflow::Abort, requires: vec![], defs: vec![], structs: vec![], consts: vec![], main: vec![] };
         self.skip_newlines();
         while let Tok::Directive(name, arg) = self.peek().clone() {
             let sp = self.bump().span;
@@ -115,6 +115,15 @@ impl<'a> Parser<'a> {
                 }
                 Tok::Attr(_) | Tok::Kw(Kw::Def) => m.defs.push(self.def()?),
                 Tok::Kw(Kw::Struct) => m.structs.push(self.struct_def()?),
+                Tok::Const(name) if matches!(self.peek_at(1), Tok::Op("=") | Tok::Op(":")) => {
+                    // `NAME = expr` / `NAME: Type = expr`: a constant.
+                    let sp = self.bump().span;
+                    let ty = if self.eat_op(":") { Some(self.type_expr()?) } else { None };
+                    self.expect_op("=")?;
+                    self.skip_line_continuation();
+                    let value = self.expr()?;
+                    m.consts.push(ConstDef { name, span: sp, ty, value });
+                }
                 Tok::Directive(..) => return Err(Diag::new(self.span(), "directives must come first in the file")),
                 _ => {
                     let s = self.stmt()?;
@@ -269,6 +278,17 @@ impl<'a> Parser<'a> {
             }
             Tok::Kw(Kw::Def) | Tok::Attr(_) => return Err(Diag::new(start, "methods can only be defined at the top level")),
             Tok::Kw(Kw::Struct) => return Err(Diag::new(start, "structs can only be defined at the top level")),
+            Tok::Ident(name) if matches!(self.peek_at(1), Tok::Op(":")) && matches!(self.peek_at(2), Tok::Const(_) | Tok::Op("[")) => {
+                // `x: T = e`
+                let sp = self.bump().span;
+                self.bump();
+                let ty = self.type_expr()?;
+                self.expect_op("=")?;
+                self.skip_line_continuation();
+                let e = self.expr()?;
+                self.declare(&name);
+                StmtKind::Decl(name, sp, ty, e)
+            }
             Tok::Ident(_) if self.is_multi_assign() => {
                 let mut targets = vec![];
                 loop {
@@ -375,7 +395,23 @@ impl<'a> Parser<'a> {
             let sp = lhs.span.to(rhs.span);
             return Ok(self.mk(ExprKind::Assign(Box::new(lhs), Box::new(rhs)), sp));
         }
-        for (tok, op) in [("+=", BinOp::Add), ("-=", BinOp::Sub), ("*=", BinOp::Mul), ("/=", BinOp::Div)] {
+        for (tok, op) in [
+            ("+=", BinOp::Add),
+            ("-=", BinOp::Sub),
+            ("*=", BinOp::Mul),
+            ("/=", BinOp::Div),
+            ("%=", BinOp::Rem),
+            ("**=", BinOp::Pow),
+            ("&=", BinOp::BitAnd),
+            ("|=", BinOp::BitOr),
+            ("^=", BinOp::BitXor),
+            ("&^=", BinOp::AndNot),
+            ("<<=", BinOp::Shl),
+            (">>=", BinOp::Shr),
+            ("+%=", BinOp::AddW),
+            ("-%=", BinOp::SubW),
+            ("*%=", BinOp::MulW),
+        ] {
             if self.is_op(tok) {
                 self.bump();
                 let rhs = self.expr()?;
@@ -454,39 +490,71 @@ impl<'a> Parser<'a> {
         self.binary_level(&[("==", BinOp::Eq), ("!=", BinOp::Ne)], Self::comparison)
     }
     fn comparison(&mut self) -> PResult<Expr> {
-        self.binary_level(&[("<=", BinOp::Le), (">=", BinOp::Ge), ("<", BinOp::Lt), (">", BinOp::Gt)], Self::shift)
+        self.binary_level(&[("<=", BinOp::Le), (">=", BinOp::Ge), ("<", BinOp::Lt), (">", BinOp::Gt)], Self::bitor)
+    }
+    // Precedence follows Ruby (so `arr << x + 1` pushes `x + 1`), with Go's
+    // extra operators slotted in: `| ^` < `& &^` < `<< >>` < `+ -` < `* / %`.
+    fn bitor(&mut self) -> PResult<Expr> {
+        self.binary_level(&[("|", BinOp::BitOr), ("^", BinOp::BitXor)], Self::bitand)
+    }
+    fn bitand(&mut self) -> PResult<Expr> {
+        self.binary_level(&[("&^", BinOp::AndNot), ("&", BinOp::BitAnd)], Self::shift)
     }
     fn shift(&mut self) -> PResult<Expr> {
         let mut l = self.additive()?;
-        while self.is_op("<<") {
-            let op_span = self.bump().span;
-            let r = self.additive()?;
-            let sp = l.span.to(r.span);
-            l = self.mk(
-                ExprKind::Call { recv: Some(Box::new(l)), name: "<<".into(), name_span: op_span, args: vec![r], block: None, block_sym: None },
-                sp,
-            );
+        loop {
+            if self.is_op("<<") {
+                // A method call: push for arrays, send for channels, shift for integers.
+                let op_span = self.bump().span;
+                let r = self.additive()?;
+                let sp = l.span.to(r.span);
+                l = self.mk(
+                    ExprKind::Call { recv: Some(Box::new(l)), name: "<<".into(), name_span: op_span, args: vec![r], block: None, block_sym: None },
+                    sp,
+                );
+            } else if self.is_op(">>") {
+                self.bump();
+                let r = self.additive()?;
+                let sp = l.span.to(r.span);
+                l = self.mk(ExprKind::Binary(BinOp::Shr, Box::new(l), Box::new(r)), sp);
+            } else {
+                return Ok(l);
+            }
         }
-        Ok(l)
     }
     fn additive(&mut self) -> PResult<Expr> {
-        self.binary_level(&[("+", BinOp::Add), ("-", BinOp::Sub)], Self::multiplicative)
+        self.binary_level(&[("+%", BinOp::AddW), ("-%", BinOp::SubW), ("+", BinOp::Add), ("-", BinOp::Sub)], Self::multiplicative)
     }
     fn multiplicative(&mut self) -> PResult<Expr> {
-        self.binary_level(&[("*", BinOp::Mul), ("/", BinOp::Div), ("%", BinOp::Rem)], Self::unary)
+        self.binary_level(&[("*%", BinOp::MulW), ("*", BinOp::Mul), ("/", BinOp::Div), ("%", BinOp::Rem)], Self::unary)
     }
     fn unary(&mut self) -> PResult<Expr> {
         if self.is_op("-") {
             let sp = self.bump().span;
             let e = self.unary()?;
             let full = sp.to(e.span);
-            if let ExprKind::Int(v) = e.kind {
-                return Ok(self.mk(ExprKind::Int(-v), full));
-            }
-            if let ExprKind::Float(v) = e.kind {
-                return Ok(self.mk(ExprKind::Float(-v), full));
+            match &e.kind {
+                ExprKind::Int(v) if *v != i64::MIN => return Ok(self.mk(ExprKind::Int(-v), full)),
+                ExprKind::BigInt(t) => {
+                    let n = format!("-{t}");
+                    return Ok(match n.parse::<i64>() {
+                        Ok(v) => self.mk(ExprKind::Int(v), full),
+                        Err(_) => self.mk(ExprKind::BigInt(n), full),
+                    });
+                }
+                ExprKind::Float(v, t) => {
+                    let (v, t) = (-v, format!("-{t}"));
+                    return Ok(self.mk(ExprKind::Float(v, t), full));
+                }
+                _ => {}
             }
             return Ok(self.mk(ExprKind::Neg(Box::new(e)), full));
+        }
+        if self.is_op("^") {
+            let sp = self.bump().span;
+            let e = self.unary()?;
+            let full = sp.to(e.span);
+            return Ok(self.mk(ExprKind::BitNot(Box::new(e)), full));
         }
         if self.is_kw(Kw::Try) {
             let sp = self.bump().span;
@@ -627,11 +695,11 @@ impl<'a> Parser<'a> {
             return false;
         }
         match self.peek() {
-            Tok::Int(_) | Tok::Float(_) | Tok::Str(_) | Tok::Ident(_) | Tok::Const(_) | Tok::Sym(_) => true,
+            Tok::Int(_) | Tok::BigInt(_) | Tok::Float(..) | Tok::Str(_) | Tok::Ident(_) | Tok::Const(_) | Tok::Sym(_) => true,
             Tok::Kw(Kw::True | Kw::False | Kw::Nil | Kw::Try) => true,
             Tok::Op("(") | Tok::Op("[") => true,
             // `puts -x` (Ruby): a minus right before its operand starts an argument.
-            Tok::Op("-") => !self.toks[(self.pos + 1).min(self.toks.len() - 1)].space_before,
+            Tok::Op("-") | Tok::Op("^") => !self.toks[(self.pos + 1).min(self.toks.len() - 1)].space_before,
             _ => false,
         }
     }
@@ -641,7 +709,8 @@ impl<'a> Parser<'a> {
         let sp = t.span;
         Ok(match t.tok {
             Tok::Int(v) => self.mk(ExprKind::Int(v), sp),
-            Tok::Float(v) => self.mk(ExprKind::Float(v), sp),
+            Tok::BigInt(t) => self.mk(ExprKind::BigInt(t), sp),
+            Tok::Float(v, t) => self.mk(ExprKind::Float(v, t), sp),
             Tok::Str(s) => self.mk(ExprKind::Str(s), sp),
             Tok::Sym(s) => self.mk(ExprKind::Sym(s), sp),
             Tok::Kw(Kw::True) => self.mk(ExprKind::Bool(true), sp),
@@ -720,7 +789,8 @@ pub fn is_place(e: &Expr) -> bool {
 pub fn describe(t: &Tok) -> String {
     match t {
         Tok::Int(v) => format!("`{v}`"),
-        Tok::Float(v) => format!("`{v}`"),
+        Tok::BigInt(t) => format!("`{t}`"),
+        Tok::Float(_, t) => format!("`{t}`"),
         Tok::Str(_) => "a string".into(),
         Tok::Ident(n) | Tok::Const(n) => format!("`{n}`"),
         Tok::Sym(s) => format!("`:{s}`"),

@@ -5,7 +5,10 @@ use crate::diag::{Diag, Span};
 #[derive(Debug, Clone, PartialEq)]
 pub enum Tok {
     Int(i64),
-    Float(f64),
+    /// An integer literal too large for i64, in decimal.
+    BigInt(String),
+    /// Value and source text.
+    Float(f64, String),
     Str(String),
     Ident(String),
     Const(String),
@@ -48,9 +51,11 @@ pub struct Token {
     pub space_before: bool,
 }
 
-const OPS: [&str; 34] = [
-    "**=", "...", "<=>", "**", "==", "!=", "<=", ">=", "&&", "||", "<<", "..", "+=", "-=", "*=", "/=", "->", "&:", "+", "-",
-    "*", "/", "%", "<", ">", "=", "!", "?", ":", ".", ",", ";", "|", "&",
+/// Longest first: the lexer takes the first match.
+const OPS: [&str; 50] = [
+    "&^=", "+%=", "-%=", "*%=", "<<=", ">>=", "**=", "...", "<=>", "**", "==", "!=", "<=", ">=", "&&", "||", "&^", "<<", ">>", "..",
+    "+=", "-=", "*=", "/=", "%=", "&=", "|=", "^=", "+%", "-%", "*%", "->", "&:", "+", "-", "*", "/", "%", "<", ">", "=", "!", "?",
+    ":", ".", ",", ";", "|", "&", "^",
 ];
 const BRACKETS: [&str; 6] = ["(", ")", "[", "]", "{", "}"];
 
@@ -126,6 +131,31 @@ pub fn lex(file: u32, src: &str) -> Result<Vec<Token>, Diag> {
             continue;
         }
         if c.is_ascii_digit() {
+            // 0x / 0o / 0b integers.
+            if c == b'0' && i + 2 < b.len() && matches!(b[i + 1], b'x' | b'X' | b'o' | b'O' | b'b' | b'B') {
+                let radix = match b[i + 1] {
+                    b'x' | b'X' => 16,
+                    b'o' | b'O' => 8,
+                    _ => 2,
+                };
+                let mut j = i + 2;
+                let mut digits = String::new();
+                while j < b.len() && (b[j].is_ascii_alphanumeric() || b[j] == b'_') {
+                    if b[j] != b'_' {
+                        digits.push(b[j] as char);
+                    }
+                    j += 1;
+                }
+                let v = num_bigint::BigInt::parse_bytes(digits.as_bytes(), radix).ok_or_else(|| Diag::new(sp(start, j), format!("malformed base-{radix} literal")))?;
+                i = j;
+                let tok = match i64::try_from(&v) {
+                    Ok(x) => Tok::Int(x),
+                    Err(_) => Tok::BigInt(v.to_string()),
+                };
+                out.push(Token { tok, span: sp(start, i), space_before: space });
+                space = false;
+                continue;
+            }
             let mut s = String::new();
             while i < b.len() && (b[i].is_ascii_digit() || b[i] == b'_') {
                 if b[i] != b'_' {
@@ -163,12 +193,15 @@ pub fn lex(file: u32, src: &str) -> Result<Vec<Token>, Diag> {
             }
             if float {
                 let v: f64 = s.parse().map_err(|_| Diag::new(sp(start, i), "malformed Float literal"))?;
-                out.push(Token { tok: Tok::Float(v), span: sp(start, i), space_before: space });
+                out.push(Token { tok: Tok::Float(v, s), span: sp(start, i), space_before: space });
                 space = false;
                 continue;
             }
-            let v: i64 = s.parse().map_err(|_| Diag::new(sp(start, i), "integer literal too large for Int"))?;
-            out.push(Token { tok: Tok::Int(v), span: sp(start, i), space_before: space });
+            let tok = match s.parse::<i64>() {
+                Ok(v) => Tok::Int(v),
+                Err(_) => Tok::BigInt(s),
+            };
+            out.push(Token { tok, span: sp(start, i), space_before: space });
             space = false;
             continue;
         }
@@ -255,7 +288,7 @@ pub fn lex(file: u32, src: &str) -> Result<Vec<Token>, Diag> {
         }
         // Symbols: `:name`, `:*`; but not `a ? b : c` (space after colon).
         if c == b':' && i + 1 < b.len() && !b[i + 1].is_ascii_whitespace() {
-            let prev_is_value = matches!(out.last().map(|t| &t.tok), Some(Tok::Ident(_) | Tok::Int(_) | Tok::Float(_) | Tok::Op(")") | Tok::Op("]")));
+            let prev_is_value = matches!(out.last().map(|t| &t.tok), Some(Tok::Ident(_) | Tok::Int(_) | Tok::BigInt(_) | Tok::Float(..) | Tok::Op(")") | Tok::Op("]")));
             if !prev_is_value || space {
                 let mut j = i + 1;
                 if b[j].is_ascii_alphabetic() || b[j] == b'_' {

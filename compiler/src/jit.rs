@@ -36,39 +36,56 @@ mod rt {
         alxj_p_add, alxj_p_sub, alxj_p_mul, alxj_p_div, alxj_p_rem, alxj_p_pow, alxj_p_cmp, alxj_p_even, alxj_p_to_i64,
         alxj_p_to_s, alxj_p_ndigits, alxj_p_digits, alxj_puts_pint,
         alxj_puts_f64, alxj_f_to_s, alxj_f_fmt, alxj_f_to_i, alxj_str_cat,
+        alxj_puts_u64, alxj_u64_to_s, alxj_int_fmt, alxj_f_to_u64, alxj_rune_to_s,
     );
 }
 type RtFn = unsafe extern "C" fn();
 
 const ERR_SIZE: u32 = 32; // sizeof(AlxErr)
 
-/// C layout of a type: size, alignment, and its scalars (offset, type).
+/// C layout of a type: size, alignment, its scalars (offset, SSA type) and
+/// how each sits in memory (narrow integers are stored at their own width
+/// but held as I64 in registers).
 struct Lay {
     size: u32,
     align: u32,
     fields: Vec<(u32, Type)>,
+    mem: Vec<Mem>,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Mem {
+    Full,
+    /// (bytes, signed)
+    Narrow(u8, bool),
 }
 
 fn lay(t: &LTy) -> Lay {
-    let words = |n: u32| Lay { size: 8 * n, align: 8, fields: (0..n).map(|i| (8 * i, I64)).collect() };
+    let words = |n: u32| Lay { size: 8 * n, align: 8, fields: (0..n).map(|i| (8 * i, I64)).collect(), mem: vec![Mem::Full; n as usize] };
     match t {
         LTy::I64 | LTy::Gen(_) => words(1),
-        LTy::F64 => Lay { size: 8, align: 8, fields: vec![(0, F64)] },
+        LTy::F64 => Lay { size: 8, align: 8, fields: vec![(0, F64)], mem: vec![Mem::Full] },
+        LTy::IntK(k) if k.bits() == 64 => words(1),
+        LTy::IntK(k) => {
+            let n = (k.bits() / 8) as u8;
+            Lay { size: n as u32, align: n as u32, fields: vec![(0, I64)], mem: vec![Mem::Narrow(n, k.signed())] }
+        }
         LTy::PInt | LTy::Str => words(2),
         LTy::Arr(_) => words(3),
-        LTy::Bool => Lay { size: 1, align: 1, fields: vec![(0, I8)] },
-        LTy::Unit => Lay { size: 1, align: 1, fields: vec![] },
-        LTy::Range => Lay { size: 24, align: 8, fields: vec![(0, I64), (8, I64), (16, I8)] },
+        LTy::Bool => Lay { size: 1, align: 1, fields: vec![(0, I8)], mem: vec![Mem::Full] },
+        LTy::Unit => Lay { size: 1, align: 1, fields: vec![], mem: vec![] },
+        LTy::Range => Lay { size: 24, align: 8, fields: vec![(0, I64), (8, I64), (16, I8)], mem: vec![Mem::Full; 3] },
         LTy::Tup(ts) => {
-            let (mut off, mut align, mut fields) = (0u32, 1u32, vec![]);
+            let (mut off, mut align, mut fields, mut mem) = (0u32, 1u32, vec![], vec![]);
             for t in ts {
                 let l = lay(t);
                 off = off.next_multiple_of(l.align);
                 fields.extend(l.fields.iter().map(|(o, ty)| (off + o, *ty)));
+                mem.extend(l.mem);
                 off += l.size;
                 align = align.max(l.align);
             }
-            Lay { size: off.next_multiple_of(align).max(1), align, fields }
+            Lay { size: off.next_multiple_of(align).max(1), align, fields, mem }
         }
     }
 }
@@ -361,13 +378,37 @@ impl Fx<'_, '_, '_> {
     }
 
     fn store(&mut self, t: &LTy, vals: &[Value], addr: Value, off: i32) {
-        for ((o, _), v) in lay(t).fields.iter().zip(vals) {
-            self.b.ins().store(MemFlagsData::trusted(), *v, addr, off + *o as i32);
+        let l = lay(t);
+        for (((o, _), m), v) in l.fields.iter().zip(&l.mem).zip(vals) {
+            let at = off + *o as i32;
+            let f = MemFlagsData::trusted();
+            match m {
+                Mem::Full => self.b.ins().store(f, *v, addr, at),
+                Mem::Narrow(1, _) => self.b.ins().istore8(f, *v, addr, at),
+                Mem::Narrow(2, _) => self.b.ins().istore16(f, *v, addr, at),
+                Mem::Narrow(_, _) => self.b.ins().istore32(f, *v, addr, at),
+            };
         }
     }
 
     fn load(&mut self, t: &LTy, addr: Value, off: i32) -> Vec<Value> {
-        lay(t).fields.iter().map(|(o, ty)| self.b.ins().load(*ty, MemFlagsData::trusted(), addr, off + *o as i32)).collect()
+        let l = lay(t);
+        l.fields
+            .iter()
+            .zip(&l.mem)
+            .map(|((o, ty), m)| {
+                let (at, f) = (off + *o as i32, MemFlagsData::trusted());
+                match m {
+                    Mem::Full => self.b.ins().load(*ty, f, addr, at),
+                    Mem::Narrow(1, true) => self.b.ins().sload8(I64, f, addr, at),
+                    Mem::Narrow(1, false) => self.b.ins().uload8(I64, f, addr, at),
+                    Mem::Narrow(2, true) => self.b.ins().sload16(I64, f, addr, at),
+                    Mem::Narrow(2, false) => self.b.ins().uload16(I64, f, addr, at),
+                    Mem::Narrow(_, true) => self.b.ins().sload32(f, addr, at),
+                    Mem::Narrow(_, false) => self.b.ins().uload32(f, addr, at),
+                }
+            })
+            .collect()
     }
 
     fn spill(&mut self, t: &LTy, vals: &[Value]) -> Value {
@@ -580,6 +621,10 @@ impl Fx<'_, '_, '_> {
                 let et = elem(&self.f.vars[*arr].ty).clone();
                 let addr = self.elem_addr(&a, i, &et, check.as_deref());
                 self.store(&et, &x, addr, 0);
+            }
+            LS::FailIf { cond, loc, path } => {
+                let c = self.e1(cond);
+                self.fail_if(c, path, |s| ErrSrc::Overflow(s.cstr(loc)));
             }
             LS::SetPlace { var, steps, val } => {
                 let x = self.e(val);
@@ -820,6 +865,12 @@ impl Fx<'_, '_, '_> {
                     LTy::F64 => {
                         self.call_rt(rt::alxj_puts_f64, &x, false);
                     }
+                    LTy::IntK(IntKind::U64) => {
+                        self.call_rt(rt::alxj_puts_u64, &x, false);
+                    }
+                    LTy::IntK(_) => {
+                        self.call_rt(rt::alx_puts_i64, &x, false);
+                    }
                     LTy::Bool => {
                         self.call_rt(rt::alxj_puts_bool, &x, false);
                     }
@@ -860,7 +911,9 @@ impl Fx<'_, '_, '_> {
         match e {
             LE::Var(v) => self.f.vars[*v].ty.clone(),
             LE::I(_) | LE::Loc(_) | LE::Arith(..) | LE::Neg(..) | LE::Len(_) => LTy::I64,
-            LE::F(_) | LE::FArith(..) | LE::FNeg(_) => LTy::F64,
+            LE::F(_) | LE::FArith(..) | LE::FNeg(_) | LE::Prim(Prim::UToF, _) => LTy::F64,
+            LE::Prim(Prim::ULt | Prim::ULe, _) => LTy::Bool,
+            LE::Prim(..) => LTy::I64,
             LE::B(_) | LE::Cmp(..) | LE::Not(_) => LTy::Bool,
             LE::S(_) => LTy::Str,
             LE::Unit => LTy::Unit,
@@ -876,7 +929,7 @@ impl Fx<'_, '_, '_> {
             LE::Cond(_, a, _) => self.ty(a),
             LE::Call(f, _) => self.d.funcs[f.as_str()].1.ret.clone(),
             LE::Rt(rt, args) => match rt {
-                Rt::IntToS | Rt::PIntToS | Rt::StrRev | Rt::StrDelete | Rt::FToS | Rt::FFmt | Rt::StrCat => LTy::Str,
+                Rt::IntToS | Rt::PIntToS | Rt::StrRev | Rt::StrDelete | Rt::FToS | Rt::FFmt | Rt::StrCat | Rt::U64ToS | Rt::IntFmt | Rt::RuneToS => LTy::Str,
                 Rt::IntToF | Rt::FSqrt | Rt::FAbs => LTy::F64,
                 Rt::StrByte => {
                     if matches!(args[2], LE::I(0)) {
@@ -1081,6 +1134,35 @@ impl Fx<'_, '_, '_> {
             LE::FNeg(x) => {
                 let v = self.e1(x);
                 vec![self.b.ins().fneg(v)]
+            }
+            LE::Prim(p, args) => {
+                let a: Vec<Value> = args.iter().map(|x| self.e1(x)).collect();
+                let ins = self.b.ins();
+                vec![match p {
+                    Prim::And => ins.band(a[0], a[1]),
+                    Prim::Or => ins.bor(a[0], a[1]),
+                    Prim::Xor => ins.bxor(a[0], a[1]),
+                    Prim::AndNot => ins.band_not(a[0], a[1]),
+                    Prim::Not => ins.bnot(a[0]),
+                    Prim::Shl => ins.ishl(a[0], a[1]),
+                    Prim::ShrS => ins.sshr(a[0], a[1]),
+                    Prim::ShrU => ins.ushr(a[0], a[1]),
+                    Prim::ULt => ins.icmp(IntCC::UnsignedLessThan, a[0], a[1]),
+                    Prim::ULe => ins.icmp(IntCC::UnsignedLessThanOrEqual, a[0], a[1]),
+                    Prim::UDiv => ins.udiv(a[0], a[1]),
+                    Prim::URem => ins.urem(a[0], a[1]),
+                    Prim::UMulHi => ins.umulhi(a[0], a[1]),
+                    Prim::UToF => ins.fcvt_from_uint(F64, a[0]),
+                    Prim::Wrap(k) => {
+                        let nt = match k.bits() {
+                            8 => I8,
+                            16 => cranelift_codegen::ir::types::I16,
+                            _ => cranelift_codegen::ir::types::I32,
+                        };
+                        let r = ins.ireduce(nt, a[0]);
+                        if k.signed() { self.b.ins().sextend(I64, r) } else { self.b.ins().uextend(I64, r) }
+                    }
+                }]
             }
             LE::B(b) => vec![self.b.ins().iconst(I8, *b as i64)],
             LE::S(s) => {
@@ -1388,6 +1470,23 @@ impl Fx<'_, '_, '_> {
             Rt::FAbs => {
                 let v = self.e1(&args[0]);
                 vec![self.b.ins().fabs(v)]
+            }
+            Rt::U64ToS | Rt::RuneToS => {
+                let v = self.e1(&args[0]);
+                let out = self.slot(16);
+                self.call_rt(if r == Rt::U64ToS { rt::alxj_u64_to_s } else { rt::alxj_rune_to_s }, &[out, v], false);
+                self.load(&s, out, 0)
+            }
+            Rt::IntFmt => {
+                let vs: Vec<Value> = args.iter().map(|a| self.e1(a)).collect();
+                let out = self.slot(16);
+                self.call_rt(rt::alxj_int_fmt, &[out, vs[0], vs[1], vs[2], vs[3]], false);
+                self.load(&s, out, 0)
+            }
+            Rt::FToU64 => {
+                let v = self.e1(&args[0]);
+                let l = self.e1(&args[1]);
+                vec![self.call_rt(rt::alxj_f_to_u64, &[v, l], true).unwrap()]
             }
             Rt::FToS => {
                 let v = self.e1(&args[0]);

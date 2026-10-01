@@ -223,6 +223,13 @@ AlxStr alx_f_fmt(double x, int64_t digits);
 int64_t alx_f_to_i(double x, const char *loc);
 void alx_puts_f64(double x);
 AlxStr alx_str_cat(int64_t n, const AlxStr *parts);
+
+/* ---------- sized integers ---------- */
+AlxStr alx_u64_to_s(int64_t bits);
+AlxStr alx_int_fmt(int64_t v, int64_t base, bool upper, bool is_u64);
+int64_t alx_f_to_u64(double x, const char *loc);
+AlxStr alx_rune_to_s(int64_t r);
+void alx_puts_u64(int64_t bits);
 Arr_PInt alx_p_digits(AlxPInt a, const char *loc);
 
 #endif

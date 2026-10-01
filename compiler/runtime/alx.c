@@ -318,6 +318,49 @@ AlxStr alx_str_cat(int64_t n, const AlxStr *parts) {
     return s;
 }
 
+/* ---------- sized integers ---------- */
+
+AlxStr alx_u64_to_s(int64_t bits) {
+    char buf[24];
+    int n = snprintf(buf, sizeof buf, "%llu", (unsigned long long)(uint64_t)bits);
+    return str_of(buf, (size_t)n);
+}
+
+/* Go's %x %X %o %b: sign, then the magnitude in the base (U64: unsigned). */
+AlxStr alx_int_fmt(int64_t v, int64_t base, bool upper, bool is_u64) {
+    const char *digits = upper ? "0123456789ABCDEF" : "0123456789abcdef";
+    bool neg = !is_u64 && v < 0;
+    uint64_t m = neg ? -(uint64_t)v : (uint64_t)v;
+    char buf[72];
+    int o = sizeof buf;
+    do {
+        buf[--o] = digits[m % (uint64_t)base];
+        m /= (uint64_t)base;
+    } while (m);
+    if (neg) buf[--o] = '-';
+    return str_of(buf + o, sizeof buf - (size_t)o);
+}
+
+int64_t alx_f_to_u64(double x, const char *loc) {
+    if (isnan(x) || isinf(x)) alx_panic("Float#to_u64 of NaN or Infinity", loc);
+    if (x < 0 || x >= 18446744073709551616.0) alx_panic("conversion overflow: the value doesn't fit U64", loc);
+    return (int64_t)(uint64_t)x;
+}
+
+/* A Rune as UTF-8; invalid code points become U+FFFD, as in Go. */
+AlxStr alx_rune_to_s(int64_t r) {
+    if (r < 0 || r > 0x10FFFF || (r >= 0xD800 && r <= 0xDFFF)) r = 0xFFFD;
+    char b[4];
+    int n;
+    if (r < 0x80) { b[0] = (char)r; n = 1; }
+    else if (r < 0x800) { b[0] = (char)(0xC0 | (r >> 6)); b[1] = (char)(0x80 | (r & 0x3F)); n = 2; }
+    else if (r < 0x10000) { b[0] = (char)(0xE0 | (r >> 12)); b[1] = (char)(0x80 | ((r >> 6) & 0x3F)); b[2] = (char)(0x80 | (r & 0x3F)); n = 3; }
+    else { b[0] = (char)(0xF0 | (r >> 18)); b[1] = (char)(0x80 | ((r >> 12) & 0x3F)); b[2] = (char)(0x80 | ((r >> 6) & 0x3F)); b[3] = (char)(0x80 | (r & 0x3F)); n = 4; }
+    return str_of(b, (size_t)n);
+}
+
+void alx_puts_u64(int64_t bits) { printf("%llu\n", (unsigned long long)(uint64_t)bits); }
+
 /* ---------- output ---------- */
 
 void alx_puts_i64(int64_t v) { printf("%lld\n", (long long)v); }

@@ -691,6 +691,61 @@ fn go_float(x: f64) -> String {
     out
 }
 
+// ---------- sized integers ----------
+
+#[unsafe(no_mangle)]
+pub extern "C" fn alxr_umulhi(a: i64, b: i64) -> i64 {
+    ((a as u64 as u128 * b as u64 as u128) >> 64) as i64
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn alxr_puts_u64(v: i64) {
+    let s = st();
+    s.out.push_str(&(v as u64).to_string());
+    s.out.push('\n');
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn alxr_u64_to_s(v: i64) {
+    ret_str((v as u64).to_string().as_bytes());
+}
+
+/// Go's %x %X %o %b.
+#[unsafe(no_mangle)]
+pub extern "C" fn alxr_int_fmt(v: i64, base: i64, upper: i32, is_u64: i32) {
+    let neg = is_u64 == 0 && v < 0;
+    let m: u64 = if neg { (v as u64).wrapping_neg() } else { v as u64 };
+    let mut s = match base {
+        16 => format!("{m:x}"),
+        8 => format!("{m:o}"),
+        _ => format!("{m:b}"),
+    };
+    if upper != 0 {
+        s = s.to_uppercase();
+    }
+    if neg {
+        s.insert(0, '-');
+    }
+    ret_str(s.as_bytes());
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn alxr_f_to_u64(x: f64, lp: i64, ln: i64) -> i64 {
+    if x.is_nan() || x.is_infinite() {
+        panic_msg("Float#to_u64 of NaN or Infinity", &loc(lp, ln));
+    }
+    if x < 0.0 || x >= 18446744073709551616.0 {
+        panic_msg("conversion overflow: the value doesn't fit U64", &loc(lp, ln));
+    }
+    (x as u64) as i64
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn alxr_rune_to_s(r: i64) {
+    let c = u32::try_from(r).ok().and_then(char::from_u32).unwrap_or('\u{FFFD}');
+    ret_str(c.to_string().as_bytes());
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn alxr_puts_f64(x: f64) {
     let s = st();

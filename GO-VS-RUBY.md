@@ -95,3 +95,12 @@ The logic: **fallibility is a prefix** ("approximately do this", "you'll probabl
 | E4 | no `~` | you hold the Result value (`~T`); unused Results warn |
 | E5 | Go's `~int` approximation constraint | spelled `like Int` in generic bounds, so `~` keeps one meaning |
 | E6 | `rescue { \|e\| ... }`, `case e { Variant(x) => ... }`, `fail E`, `e.wrap("ctx")` | handling, exhaustive over closed sets, `_` required on open ones |
+
+## Derived decisions (made while building; flagged for review)
+
+| # | Question | Decision | Milestone |
+|---|---|---|---|
+| D1 | Operator precedence | Ruby's order with Go's operators slotted in (`\| ^` < `& &^` < `<< >>` < `+ -` < `* / %`); the Go port parenthesizes where Go's order differs | M1 |
+| D2 | Shifts | Go: no overflow panic, count >= width gives 0 (or -1), negative count panics | M1 |
+| D3 | Conversions | `to_X` checked (panics), `as_X` truncates like Go's `X(v)` | M1 |
+| D4 | Constants | Ruby spelling (`NAME = expr` at the top level, capitalized), Go's exact semantics | M1 |

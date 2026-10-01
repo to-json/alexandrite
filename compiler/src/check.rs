@@ -8,6 +8,7 @@
 //! starts from them. Only the final pass reports errors.
 
 use crate::ast::*;
+use crate::consts;
 use crate::diag::{Diag, SourceMap, Span};
 use crate::tast::*;
 use std::collections::HashMap;
@@ -41,6 +42,15 @@ pub struct World<'a> {
     fatal: Option<Diag>,
     /// User structs by name, fields resolved.
     pub structs: Structs,
+    /// Top-level constants: value and declared type (None = untyped, Go).
+    pub consts: HashMap<String, (CVal, Option<Ty>)>,
+}
+
+#[derive(Clone, Debug)]
+pub enum CVal {
+    Num(ConstVal),
+    Str(String),
+    Bool(bool),
 }
 
 pub type Structs = HashMap<String, Ty>;
@@ -55,7 +65,78 @@ impl<'a> World<'a> {
                 return Err(Diag::new(d.def.name_span, format!("`{}` is defined twice", d.def.name)));
             }
         }
-        Ok(World { sm, defs, by_name, instances: HashMap::new(), funcs: vec![], sigs: HashMap::new(), fatal: None, structs: HashMap::new() })
+        Ok(World { sm, defs, by_name, instances: HashMap::new(), funcs: vec![], sigs: HashMap::new(), fatal: None, structs: HashMap::new(), consts: HashMap::new() })
+    }
+
+    /// Evaluate top-level constants, in order (each may use earlier ones).
+    pub fn add_consts(&mut self, defs: &[ConstDef]) -> R<()> {
+        for d in defs {
+            if self.consts.contains_key(&d.name) || self.structs.contains_key(&d.name) {
+                return Err(Diag::new(d.span, format!("`{}` is already defined", d.name)));
+            }
+            let v = self.eval_const(&d.value)?;
+            let ty = match &d.ty {
+                Some(te) => {
+                    let t = type_from(te, &self.structs)?;
+                    let ok = match (&v, &t) {
+                        (CVal::Num(_), Ty::Float) => true,
+                        (CVal::Num(n), t) if t.int_kind().is_some() => {
+                            let k = t.int_kind().unwrap();
+                            match consts::as_int(n) {
+                                Some(i) if consts::fit(&i, k).is_some() => true,
+                                Some(i) => return Err(Diag::new(d.value.span, format!("constant {i} overflows {}", k.name()))),
+                                None => false,
+                            }
+                        }
+                        (CVal::Str(_), Ty::Str) | (CVal::Bool(_), Ty::Bool) => true,
+                        _ => false,
+                    };
+                    if !ok {
+                        return Err(Diag::new(d.value.span, format!("`{}` is declared {} but its value isn't", d.name, t.show())));
+                    }
+                    Some(t)
+                }
+                None => None,
+            };
+            self.consts.insert(d.name.clone(), (v, ty));
+        }
+        Ok(())
+    }
+
+    fn eval_const(&self, e: &Expr) -> R<CVal> {
+        let num = |e: &Expr, v: CVal| match v {
+            CVal::Num(n) => Ok(n),
+            _ => Err(Diag::new(e.span, "expected a numeric constant")),
+        };
+        Ok(match &e.kind {
+            ExprKind::Int(v) => CVal::Num(ConstVal::Int((*v).into())),
+            ExprKind::BigInt(t) => CVal::Num(ConstVal::Int(t.parse().map_err(|_| Diag::new(e.span, "malformed integer"))?)),
+            ExprKind::Float(v, t) => CVal::Num(consts::parse_float(t).map_or(ConstVal::Float(num_rational::BigRational::from_float(*v).unwrap_or_default()), ConstVal::Float)),
+            ExprKind::Str(s) => CVal::Str(s.clone()),
+            ExprKind::Bool(b) => CVal::Bool(*b),
+            ExprKind::Const(c) => match self.consts.get(c) {
+                Some((v, _)) => v.clone(),
+                None => return Err(Diag::new(e.span, format!("`{c}` isn't a constant defined above"))),
+            },
+            ExprKind::Neg(x) => CVal::Num(consts::neg(&num(x, self.eval_const(x)?)?)),
+            ExprKind::BitNot(x) => match num(x, self.eval_const(x)?)? {
+                ConstVal::Int(i) => CVal::Num(ConstVal::Int(-i - 1)),
+                _ => return Err(Diag::new(e.span, "`^` needs an integer constant")),
+            },
+            ExprKind::Binary(op, a, b) => {
+                let (x, y) = (num(a, self.eval_const(a)?)?, num(b, self.eval_const(b)?)?);
+                match consts::fold(*op, &x, &y) {
+                    Ok(Some(v)) => CVal::Num(v),
+                    Ok(None) => return Err(Diag::new(e.span, format!("`{}` isn't a constant operation", op.text()))),
+                    Err(m) => return Err(Diag::new(e.span, m)),
+                }
+            }
+            ExprKind::Call { recv: Some(r), name, args, block: None, .. } if name == "<<" && args.len() == 1 => {
+                let (x, y) = (num(r, self.eval_const(r)?)?, num(&args[0], self.eval_const(&args[0])?)?);
+                CVal::Num(consts::fold(BinOp::Shl, &x, &y).map_err(|m| Diag::new(e.span, m))?.unwrap())
+            }
+            _ => return Err(Diag::new(e.span, "a constant must be computable at compile time: literals, other constants and operators")),
+        })
     }
 
     /// Declare structs (in any order; a struct can't contain itself).
@@ -220,11 +301,13 @@ pub fn cname(s: &str) -> String {
 pub fn type_from(t: &TypeExpr, structs: &Structs) -> R<Ty> {
     match t {
         TypeExpr::Named(n, sp) => match n.as_str() {
-            "Int" => Ok(Ty::Int),
             "Float" => Ok(Ty::Float),
             "Bool" => Ok(Ty::Bool),
             "Str" => Ok(Ty::Str),
-            _ => structs.get(n).cloned().ok_or_else(|| Diag::new(*sp, format!("unknown type `{n}`"))),
+            _ => match IntKind::from_name(n) {
+                Some(k) => Ok(Ty::of_kind(k)),
+                None => structs.get(n).cloned().ok_or_else(|| Diag::new(*sp, format!("unknown type `{n}`"))),
+            },
         },
         TypeExpr::Array(t, _) => Ok(Ty::arr(type_from(t, structs)?)),
     }
@@ -239,6 +322,8 @@ struct FnCx<'w, 'a> {
     sites: Vec<((NodeId, u32), Ty)>,
     strict: bool,
     unresolved: bool,
+    /// The first constant that doesn't fit its final type (found while zonking).
+    const_err: std::cell::RefCell<Option<Diag>>,
     pure_decl: bool,
     fn_name: String,
     is_main: bool,
@@ -266,7 +351,7 @@ const SEQ_METHODS: &[&str] = &[
     "first", "to_a", "each", "reduce", "inject", "all?", "any?", "count", "include?", "sort", "size", "length",
 ];
 const ARRAY_EXTRA: &[&str] = &["each_index", "each_cons", "pmap", "last", "reverse", "<<"];
-const INT_METHODS: &[&str] = &["to_s", "to_f", "even?", "odd?", "digits", "step"];
+const INT_METHODS: &[&str] = &["to_s", "to_f", "to_i", "to_u8", "to_i32", "to_u32", "to_u64", "as_u8", "as_i32", "as_u32", "as_u64", "even?", "odd?", "digits", "step"];
 const FLOAT_METHODS: &[&str] = &["to_s", "to_f", "to_i", "abs"];
 const STR_METHODS: &[&str] = &["chars", "bytes", "size", "length", "reverse", "delete", "split", "to_i", "to_s"];
 
@@ -294,6 +379,7 @@ impl<'w, 'a> FnCx<'w, 'a> {
             sites: vec![],
             strict,
             unresolved: false,
+            const_err: std::cell::RefCell::new(None),
             pure_decl: def.is_some_and(|d| d.pure),
             fn_name: def.map_or("main".into(), |d| d.name.clone()),
             is_main: def.is_none(),
@@ -415,7 +501,7 @@ impl<'w, 'a> FnCx<'w, 'a> {
             if let Some(TStmt::Expr(e)) = stmts.last_mut() {
                 let e2 = self.materialize(e.clone());
                 let rt = self.ret.clone();
-                let e2 = self.coerce(e2, &rt);
+                let e2 = self.coerce(e2, &rt)?;
                 *e = e2;
                 let t = e.ty.clone();
                 let rt = self.ret.clone();
@@ -443,6 +529,9 @@ impl<'w, 'a> FnCx<'w, 'a> {
             }
         }
         let body = self.zonk_stmts(stmts);
+        if let Some(e) = self.const_err.borrow_mut().take() {
+            return Err(e);
+        }
         Ok(TFunc {
             cname: String::new(),
             src_name: self.fn_name.clone(),
@@ -476,7 +565,33 @@ impl<'w, 'a> FnCx<'w, 'a> {
         }
     }
     fn zonk(&self, e: TExpr) -> TExpr {
-        let ty = self.resolve(&e.ty);
+        let mut ty = self.resolve(&e.ty);
+        if let TK::Const(v) = &e.kind {
+            // An untyped constant takes its final type here, and must fit it.
+            if matches!(ty, Ty::Var(_)) {
+                ty = if matches!(v, ConstVal::Float(_)) { Ty::Float } else { Ty::Int };
+            }
+            let kind = match ty.int_kind() {
+                Some(k) => match consts::as_int(v).and_then(|i| consts::fit(&i, k).map(|b| (i, b))) {
+                    Some((_, bits)) => TK::Int(bits),
+                    None => {
+                        let mut err = self.const_err.borrow_mut();
+                        if err.is_none() {
+                            *err = Some(match consts::as_int(v) {
+                                Some(i) => Diag::new(e.span, format!("constant {i} overflows {}", k.name())).note(if k == IntKind::I64 { "it can still take part in constant arithmetic; only its final value must fit".to_string() } else { format!("{} holds {}..{}", k.name(), k.min(), k.max()) }),
+                                None => Diag::new(e.span, format!("constant {} isn't an integer", consts::show(v))),
+                            });
+                        }
+                        TK::Int(0)
+                    }
+                },
+                None => TK::Float(consts::to_f64(&match v {
+                    ConstVal::Int(i) => num_rational::BigRational::from_integer(i.clone()),
+                    ConstVal::Float(q) => q.clone(),
+                })),
+            };
+            return TExpr { kind, ty, span: e.span };
+        }
         let b = |x: Box<TExpr>| Box::new(self.zonk(*x));
         let kind = match e.kind {
             TK::Assign(l, v) => TK::Assign(l, b(v)),
@@ -547,6 +662,26 @@ impl<'w, 'a> FnCx<'w, 'a> {
                 }
                 TStmt::MultiAssign(ids, vals)
             }
+            StmtKind::Decl(name, nsp, te, e) => {
+                let ty = type_from(te, &self.w.structs)?;
+                let v = self.value(e)?;
+                let v = self.coerce(v, &ty)?;
+                if !self.unify(&v.ty, &ty) {
+                    return Err(Diag::new(e.span, format!("`{name}` is declared {}, but this is {}", ty.show(), self.resolve(&v.ty).show())));
+                }
+                let id = match self.lookup(name) {
+                    Some(id) => {
+                        let lt = self.locals[id].ty.clone();
+                        if !self.unify(&lt, &ty) {
+                            return Err(Diag::new(*nsp, format!("`{name}` is already {}", self.resolve(&lt).show())));
+                        }
+                        self.locals[id].reassigned += 1;
+                        id
+                    }
+                    None => self.declare(name, ty.clone()),
+                };
+                TStmt::Expr(self.mk(TK::Assign(id, Box::new(v)), ty, s.span))
+            }
             StmtKind::While(c, body) => {
                 let c = self.cond(c)?;
                 self.loops.push(LoopKind::While);
@@ -580,7 +715,7 @@ impl<'w, 'a> FnCx<'w, 'a> {
                 }
                 let v = v.as_ref().map(|v| self.value(v)).transpose()?;
                 let rt = self.ret.clone();
-                let v = v.map(|v| self.coerce(v, &rt));
+                let v = v.map(|v| self.coerce(v, &rt)).transpose()?;
                 let t = v.as_ref().map_or(Ty::Unit, |v| v.ty.clone());
                 self.expect(&t, &rt, s.span, "return value")?;
                 TStmt::Return(v, s.span)
@@ -630,8 +765,12 @@ impl<'w, 'a> FnCx<'w, 'a> {
     fn expr(&mut self, e: &Expr) -> R<TExpr> {
         let sp = e.span;
         Ok(match &e.kind {
-            ExprKind::Int(v) => self.mk(TK::Int(*v), Ty::Int, sp),
-            ExprKind::Float(v) => self.mk(TK::Float(*v), Ty::Float, sp),
+            ExprKind::Int(v) => self.mk(TK::Const(ConstVal::Int((*v).into())), Ty::Int, sp),
+            ExprKind::BigInt(t) => self.mk(TK::Const(ConstVal::Int(t.parse().map_err(|_| Diag::new(sp, "malformed integer"))?)), Ty::Int, sp),
+            ExprKind::Float(v, t) => match consts::parse_float(t) {
+                Some(q) => self.mk(TK::Const(ConstVal::Float(q)), Ty::Float, sp),
+                None => self.mk(TK::Float(*v), Ty::Float, sp),
+            },
             ExprKind::Str(s) => self.mk(TK::Str(s.clone()), Ty::Str, sp),
             ExprKind::Bool(b) => self.mk(TK::Bool(*b), Ty::Bool, sp),
             ExprKind::Nil => self.mk(TK::Unit, Ty::Unit, sp),
@@ -640,14 +779,16 @@ impl<'w, 'a> FnCx<'w, 'a> {
                 Some(id) => self.mk(TK::Local(id), self.locals[id].ty.clone(), sp),
                 None => return self.call(None, n, sp, &[], None, None, sp),
             },
-            ExprKind::Const(c) => return Err(Diag::new(sp, format!("`{c}` is not a value; call a method on it (`{c}.new`, ...)"))),
+            ExprKind::Const(c) => match self.w.consts.get(c).cloned() {
+                Some((v, ty)) => return self.const_value(v, ty, sp),
+                None => return Err(Diag::new(sp, format!("`{c}` is not a value; call a method on it (`{c}.new`, ...)"))),
+            },
             ExprKind::Call { recv, name, name_span, args, block, block_sym } => {
                 return self.call(recv.as_deref(), name, *name_span, args, block.as_deref(), block_sym.as_ref(), sp);
             }
             ExprKind::Index(a, i) => {
                 let a = self.value(a)?;
-                let i = self.value(i)?;
-                self.expect(&i.ty, &Ty::Int, i.span, "index")?;
+                let i = self.index_value(i)?;
                 let el = match self.resolve(&a.ty) {
                     Ty::Array(t) => *t,
                     Ty::Var(_) => self.unknown(a.span, "the indexed value")?,
@@ -671,15 +812,14 @@ impl<'w, 'a> FnCx<'w, 'a> {
                         return Err(Diag::new(sp, format!("`#[pure] def {}` can't mutate its argument `{an}`", self.fn_name)));
                     }
                     self.locals[id].mutated = true;
-                    let idx = self.value(idx)?;
-                    self.expect(&idx.ty, &Ty::Int, idx.span, "index")?;
+                    let idx = self.index_value(idx)?;
                     let v = self.value(v)?;
                     let el = match self.resolve(&self.locals[id].ty.clone()) {
                         Ty::Array(t) => *t,
                         Ty::Var(_) => self.unknown(arr.span, "the array")?,
                         t => return Err(Diag::new(arr.span, format!("cannot assign into {}", t.show()))),
                     };
-                    let v = self.coerce(v, &el);
+                    let v = self.coerce(v, &el)?;
                     self.expect(&v.ty, &el, v.span, "element assignment")?;
                     let ty = v.ty.clone();
                     self.mk(TK::IndexAssign(id, Box::new(idx), Box::new(v)), ty, sp)
@@ -687,7 +827,7 @@ impl<'w, 'a> FnCx<'w, 'a> {
                 _ => {
                     let (id, steps, pty) = self.place(target)?;
                     let v = self.value(v)?;
-                    let v = self.coerce(v, &pty);
+                    let v = self.coerce(v, &pty)?;
                     self.expect(&v.ty, &pty, v.span, "assignment")?;
                     self.mk(TK::PlaceAssign(id, steps, None, Box::new(v)), pty, sp)
                 }
@@ -722,11 +862,33 @@ impl<'w, 'a> FnCx<'w, 'a> {
             }
             ExprKind::Neg(x) => {
                 let x = self.value(x)?;
-                if matches!(self.resolve(&x.ty), Ty::Float) {
-                    return Ok(self.mk(TK::Neg(Box::new(x)), Ty::Float, sp));
+                if let TK::Const(v) = &x.kind {
+                    let ty = x.ty.clone();
+                    let e = self.mk(TK::Const(consts::neg(v)), ty.clone(), sp);
+                    return self.coerce(e, &ty);
+                }
+                let t = self.resolve(&x.ty);
+                if t == Ty::Float || t.int_kind().is_some() {
+                    return Ok(self.mk(TK::Neg(Box::new(x)), t, sp));
                 }
                 self.expect(&x.ty, &Ty::Int, x.span, "negation")?;
                 self.mk(TK::Neg(Box::new(x)), Ty::Int, sp)
+            }
+            ExprKind::BitNot(x) => {
+                let x = self.value(x)?;
+                if let TK::Const(ConstVal::Int(i)) = &x.kind {
+                    let ty = x.ty.clone();
+                    let e = self.mk(TK::Const(ConstVal::Int(-i - 1)), ty.clone(), sp);
+                    return self.coerce(e, &ty);
+                }
+                let t = self.resolve(&x.ty);
+                let Some(k) = t.int_kind() else {
+                    return Err(Diag::new(x.span, format!("`^` needs an integer, got {}", t.show())));
+                };
+                // ^x = x XOR all-ones (of the type's width).
+                let mask = if k.signed() || k == IntKind::U64 { -1 } else { k.max() as i64 };
+                let m = self.mk(TK::Int(mask), t.clone(), sp);
+                self.mk(TK::Bin(BinOp::BitXor, Box::new(x), Box::new(m)), t, sp)
             }
             ExprKind::Not(x) => {
                 let x = self.value(x)?;
@@ -798,8 +960,7 @@ impl<'w, 'a> FnCx<'w, 'a> {
                     Ty::Var(_) => self.unknown(a.span, "the array")?,
                     t => return Err(Diag::new(a.span, format!("cannot index into {}", t.show()))),
                 };
-                let i = self.value(i)?;
-                self.expect(&i.ty, &Ty::Int, i.span, "index")?;
+                let i = self.index_value(i)?;
                 steps.push(TStep::Index(i));
                 Ok((id, steps, el))
             }
@@ -855,21 +1016,47 @@ impl<'w, 'a> FnCx<'w, 'a> {
         Diag::new(sp, msg)
     }
 
-    /// An Int *literal* where a Float is wanted is a Float (Go's untyped
-    /// constants). An Int variable is not converted: that takes `.to_f`.
-    fn coerce(&mut self, e: TExpr, want: &Ty) -> TExpr {
-        if matches!(self.resolve(want), Ty::Float) {
-            if let TK::Int(v) = e.kind {
-                return self.mk(TK::Float(v as f64), Ty::Float, e.span);
+    /// A constant where a type is wanted takes that type (Go's untyped
+    /// constants), and must fit it. Non-constants are never converted:
+    /// an Int variable needs `.to_f` or `.to_u8`.
+    fn coerce(&mut self, e: TExpr, want: &Ty) -> R<TExpr> {
+        let want = self.resolve(want);
+        if let (TK::Array(_), Ty::Array(el)) = (&e.kind, &want) {
+            let TK::Array(items) = e.kind else { unreachable!() };
+            let el = (**el).clone();
+            let items = items.into_iter().map(|x| self.coerce(x, &el)).collect::<R<Vec<_>>>()?;
+            for x in &items {
+                self.expect(&x.ty, &el, x.span, "array element")?;
             }
+            return Ok(self.mk(TK::Array(items), want, e.span));
         }
-        e
+        let TK::Const(v) = &e.kind else { return Ok(e) };
+        match &want {
+            Ty::Float => {
+                let q = match v {
+                    ConstVal::Int(i) => num_rational::BigRational::from_integer(i.clone()),
+                    ConstVal::Float(q) => q.clone(),
+                };
+                Ok(self.mk(TK::Const(ConstVal::Float(q)), Ty::Float, e.span))
+            }
+            t if t.int_kind().is_some() => {
+                let k = t.int_kind().unwrap();
+                let Some(i) = consts::as_int(v) else {
+                    return Err(Diag::new(e.span, format!("constant {} isn't an integer, so it can't be {}", consts::show(v), k.name())));
+                };
+                if consts::fit(&i, k).is_none() {
+                    return Err(Diag::new(e.span, format!("constant {i} overflows {}", k.name())).note(format!("{} holds {}..{}", k.name(), k.min(), k.max())));
+                }
+                Ok(self.mk(TK::Const(ConstVal::Int(i)), want.clone(), e.span))
+            }
+            _ => Ok(e),
+        }
     }
 
     /// Go's zero value of a type, as an expression.
     fn zero_of(&mut self, t: &Ty, sp: Span) -> Option<TExpr> {
         let kind = match t {
-            Ty::Int => TK::Int(0),
+            Ty::Int | Ty::IntK(_) => TK::Int(0),
             Ty::Float => TK::Float(0.0),
             Ty::Bool => TK::Bool(false),
             Ty::Str => TK::Str(String::new()),
@@ -883,49 +1070,134 @@ impl<'w, 'a> FnCx<'w, 'a> {
         Some(self.mk(kind, t.clone(), sp))
     }
 
+    /// An index: any integer type (a constant defaults to Int).
+    fn index_value(&mut self, e: &Expr) -> R<TExpr> {
+        let i = self.value(e)?;
+        let i = self.coerce(i, &Ty::Int)?;
+        let t = self.resolve(&i.ty);
+        if t.int_kind().is_none() {
+            self.expect(&i.ty, &Ty::Int, i.span, "index")?;
+        }
+        Ok(i)
+    }
+
+    /// A top-level constant used as a value.
+    fn const_value(&mut self, v: CVal, ty: Option<Ty>, sp: Span) -> R<TExpr> {
+        Ok(match (v, ty) {
+            (CVal::Str(s), _) => self.mk(TK::Str(s), Ty::Str, sp),
+            (CVal::Bool(b), _) => self.mk(TK::Bool(b), Ty::Bool, sp),
+            (CVal::Num(n), None) => {
+                let ty = if matches!(n, ConstVal::Float(_)) { Ty::Float } else { Ty::Int };
+                self.mk(TK::Const(n), ty, sp)
+            }
+            (CVal::Num(n), Some(t)) => {
+                // A typed constant is a plain value of its type.
+                let e = self.mk(TK::Const(n), t.clone(), sp);
+                let e = self.coerce(e, &t)?;
+                let TK::Const(n) = &e.kind else { unreachable!() };
+                let kind = match t.int_kind() {
+                    Some(k) => TK::Int(consts::fit(&consts::as_int(n).unwrap(), k).unwrap()),
+                    None => TK::Float(consts::to_f64(&match n {
+                        ConstVal::Int(i) => num_rational::BigRational::from_integer(i.clone()),
+                        ConstVal::Float(q) => q.clone(),
+                    })),
+                };
+                self.mk(kind, t, sp)
+            }
+        })
+    }
+
     fn param_count(&self) -> usize {
         self.n_params
     }
 
     fn binary(&mut self, op: BinOp, l: TExpr, r: TExpr, sp: Span) -> R<TExpr> {
+        if matches!(op, BinOp::And | BinOp::Or) {
+            self.expect(&l.ty, &Ty::Bool, l.span, &format!("`{}`", op.text()))?;
+            self.expect(&r.ty, &Ty::Bool, r.span, &format!("`{}`", op.text()))?;
+            return Ok(self.mk(TK::Bin(op, Box::new(l), Box::new(r)), Ty::Bool, sp));
+        }
+        // Constants fold exactly (Go).
+        if let (TK::Const(a), TK::Const(b)) = (&l.kind, &r.kind) {
+            match consts::fold(op, a, b) {
+                Err(m) => return Err(Diag::new(sp, m)),
+                Ok(Some(v)) => {
+                    let (lt, rt) = (self.resolve(&l.ty), self.resolve(&r.ty));
+                    let ty = if lt == rt && lt.int_kind().is_some() && lt != Ty::Int {
+                        lt
+                    } else if matches!(v, ConstVal::Float(_)) {
+                        Ty::Float
+                    } else {
+                        Ty::Int
+                    };
+                    let e = self.mk(TK::Const(v), ty.clone(), sp);
+                    return self.coerce(e, &ty);
+                }
+                Ok(None) => {}
+            }
+        }
+        let is_const = |e: &TExpr| matches!(e.kind, TK::Const(_));
+        let shift = matches!(op, BinOp::Shl | BinOp::Shr);
+        // A constant operand takes the other operand's type.
+        let (l, r) = if shift {
+            let r = if is_const(&r) { self.coerce(r, &Ty::Int)? } else { r };
+            let l = if is_const(&l) { self.coerce(l, &Ty::Int)? } else { l };
+            (l, r)
+        } else if is_const(&l) && !is_const(&r) {
+            let rt = self.resolve(&r.ty);
+            (if matches!(rt, Ty::Var(_)) { l } else { self.coerce(l, &rt)? }, r)
+        } else if is_const(&r) && !is_const(&l) {
+            let lt = self.resolve(&l.ty);
+            let r = if matches!(lt, Ty::Var(_)) { r } else { self.coerce(r, &lt)? };
+            (l, r)
+        } else {
+            (l, r)
+        };
         let (lt, rt) = (self.resolve(&l.ty), self.resolve(&r.ty));
-        // Float arithmetic and comparison: an Int operand is converted.
-        if !matches!(op, BinOp::And | BinOp::Or) && (lt == Ty::Float || rt == Ty::Float) {
+        if shift {
+            let k = match &lt {
+                Ty::Var(_) => {
+                    let t = self.unknown(l.span, "the shifted value")?;
+                    return Ok(self.mk(TK::Bin(op, Box::new(l), Box::new(r)), t, sp));
+                }
+                t => t.int_kind().ok_or_else(|| Diag::new(l.span, format!("`{}` needs an integer, got {}", op.text(), t.show())))?,
+            };
+            if rt.int_kind().is_none() && !matches!(rt, Ty::Var(_)) {
+                return Err(Diag::new(r.span, format!("a shift count must be an integer, got {}", rt.show())));
+            }
+            return Ok(self.mk(TK::Bin(op, Box::new(l), Box::new(r)), Ty::of_kind(k), sp));
+        }
+        // Float arithmetic and comparison: an Int operand must be a literal.
+        if lt == Ty::Float || rt == Ty::Float {
             for (e, t) in [(&l, &lt), (&r, &rt)] {
-                if !matches!(t, Ty::Int | Ty::Float | Ty::Var(_)) {
+                if t.int_kind().is_some() {
+                    return Err(Diag::new(e.span, format!("`{}` mixes Float and {}: convert with `.to_f`", op.text(), t.show())).note("only numeric constants convert implicitly (as in Go)"));
+                }
+                if !matches!(t, Ty::Float | Ty::Var(_)) {
                     return Err(Diag::new(e.span, format!("`{}` needs numbers, got {}", op.text(), t.show())));
                 }
-                if *t == Ty::Int && !matches!(e.kind, TK::Int(_)) {
-                    return Err(Diag::new(e.span, format!("`{}` mixes Float and Int: convert the Int with `.to_f`", op.text())).note("only numeric literals convert implicitly (as in Go)"));
-                }
             }
-            if matches!(op, BinOp::Rem | BinOp::Pow) {
-                return Err(Diag::new(sp, format!("`{}` on Float isn't supported yet", op.text())));
+            if !(op.is_arith() || matches!(op, BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge)) || matches!(op, BinOp::Rem | BinOp::Pow) {
+                return Err(Diag::new(sp, format!("`{}` isn't defined on Float", op.text())));
             }
-            let l = if matches!(lt, Ty::Var(_)) {
-                self.unify(&l.ty, &Ty::Float);
-                l
-            } else {
-                self.coerce(l, &Ty::Float)
-            };
-            let r = if matches!(rt, Ty::Var(_)) {
-                self.unify(&r.ty, &Ty::Float);
-                r
-            } else {
-                self.coerce(r, &Ty::Float)
-            };
+            self.unify(&l.ty, &Ty::Float);
+            self.unify(&r.ty, &Ty::Float);
             let ty = if op.is_arith() { Ty::Float } else { Ty::Bool };
             return Ok(self.mk(TK::Bin(op, Box::new(l), Box::new(r)), ty, sp));
         }
+        let mismatch = |cx: &Self| {
+            let (a, b) = (cx.resolve(&l.ty), cx.resolve(&r.ty));
+            let hint = match (a.int_kind(), b.int_kind()) {
+                (Some(_), Some(k)) => format!("convert one side, e.g. `.to_{}`", k.method()),
+                _ => String::new(),
+            };
+            let d = Diag::new(sp, format!("mismatched types {} and {} for `{}`", a.show(), b.show(), op.text()));
+            if hint.is_empty() { d } else { d.note(hint) }
+        };
         let ty = match op {
-            BinOp::And | BinOp::Or => {
-                self.expect(&lt, &Ty::Bool, l.span, &format!("`{}`", op.text()))?;
-                self.expect(&rt, &Ty::Bool, r.span, &format!("`{}`", op.text()))?;
-                Ty::Bool
-            }
             BinOp::Eq | BinOp::Ne => {
                 if !self.unify(&lt, &rt) {
-                    return Err(Diag::new(sp, format!("cannot compare {} with {}", lt.show(), rt.show())));
+                    return Err(mismatch(self));
                 }
                 if matches!(self.resolve(&lt), Ty::Struct(..) | Ty::Tuple(_) | Ty::Array(_)) {
                     return Err(Diag::new(sp, format!("`{}` on {} values isn't supported yet; compare their fields", op.text(), self.resolve(&lt).show())));
@@ -933,7 +1205,6 @@ impl<'w, 'a> FnCx<'w, 'a> {
                 Ty::Bool
             }
             _ => {
-                // Arithmetic and ordering: Int (Str supports ordering).
                 let known = if !matches!(lt, Ty::Var(_)) { lt.clone() } else { rt.clone() };
                 let operand = match known {
                     Ty::Var(_) => self.unknown(sp, "this operand")?,
@@ -941,18 +1212,18 @@ impl<'w, 'a> FnCx<'w, 'a> {
                     t => t,
                 };
                 if !matches!(operand, Ty::Var(_)) {
-                    for (t, s) in [(&l.ty, l.span), (&r.ty, r.span)] {
-                        let t = t.clone();
-                        if !self.unify(&t, &operand) || !matches!(self.resolve(&t), Ty::Int | Ty::Str | Ty::Var(_)) {
-                            return Err(Diag::new(s, format!("`{}` needs Int operands, got {}", op.text(), self.resolve(&t).show())));
-                        }
+                    if !self.unify(&l.ty, &operand) || !self.unify(&r.ty, &operand) {
+                        return Err(mismatch(self));
+                    }
+                    let k = operand.int_kind();
+                    if k.is_none() && operand != Ty::Str {
+                        return Err(Diag::new(sp, format!("`{}` needs numbers, got {}", op.text(), operand.show())));
+                    }
+                    if op == BinOp::Pow && operand != Ty::Int {
+                        return Err(Diag::new(sp, format!("`**` is only defined on Int, got {}", operand.show())));
                     }
                 }
-                if matches!(op, BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge) {
-                    Ty::Bool
-                } else {
-                    operand
-                }
+                if matches!(op, BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge) { Ty::Bool } else { operand }
             }
         };
         Ok(self.mk(TK::Bin(op, Box::new(l), Box::new(r)), ty, sp))
@@ -964,7 +1235,9 @@ impl<'w, 'a> FnCx<'w, 'a> {
     fn call(&mut self, recv: Option<&Expr>, name: &str, name_span: Span, args: &[Expr], block: Option<&Block>, bsym: Option<&(String, Span)>, sp: Span) -> R<TExpr> {
         // Constant receivers: Int.sqrt, Array.new, File.read, Enumerator.new.
         if let Some(Expr { kind: ExprKind::Const(c), span: csp, .. }) = recv {
-            return self.const_call(c, *csp, name, name_span, args, block, sp);
+            if !self.w.consts.contains_key(c) {
+                return self.const_call(c, *csp, name, name_span, args, block, sp);
+            }
         }
         let Some(recv) = recv else {
             return self.global_call(name, name_span, args, block, bsym, sp);
@@ -1026,7 +1299,7 @@ impl<'w, 'a> FnCx<'w, 'a> {
                 (None, None) => None,
             };
             let v = match &want {
-                Some(w) => self.coerce(v, w),
+                Some(w) => self.coerce(v, w)?,
                 None => v,
             };
             if let Some(want) = want {
@@ -1096,7 +1369,7 @@ impl<'w, 'a> FnCx<'w, 'a> {
                     }
                     let ft = &fields[k].1;
                     let v = self.value(v)?;
-                    let v = self.coerce(v, ft);
+                    let v = self.coerce(v, ft)?;
                     if !self.unify(&v.ty, ft) {
                         return Err(Diag::new(v.span, format!("`{c}.{n}` is {}, got {}", ft.show(), self.resolve(&v.ty).show())));
                     }
@@ -1117,7 +1390,7 @@ impl<'w, 'a> FnCx<'w, 'a> {
             let mut vals = vec![];
             for (a, (f, ft)) in args.iter().zip(fields) {
                 let v = self.value(a)?;
-                let v = self.coerce(v, ft);
+                let v = self.coerce(v, ft)?;
                 if !self.unify(&v.ty, ft) {
                     return Err(Diag::new(a.span, format!("`{c}.{f}` is {}, got {}", ft.show(), self.resolve(&v.ty).show())));
                 }
@@ -1131,7 +1404,7 @@ impl<'w, 'a> FnCx<'w, 'a> {
                 if a.len() != 1 {
                     return Err(Diag::new(sp, "`Math.sqrt` takes one argument"));
                 }
-                let x = self.coerce(a[0].clone(), &Ty::Float);
+                let x = self.coerce(a[0].clone(), &Ty::Float)?;
                 self.expect(&x.ty, &Ty::Float, x.span, "Math.sqrt")?;
                 Ok(self.mk(TK::M(M::Sqrt, None, vec![x], None), Ty::Float, sp))
             }
@@ -1344,11 +1617,54 @@ impl<'w, 'a> FnCx<'w, 'a> {
                 _ => {}
             }
         }
+        // Conversions between numeric types: `to_u8` checks, `as_u8` wraps (Go's `uint8(x)`).
+        if rt.int_kind().is_some() || rt == Ty::Float {
+            let conv = name.strip_prefix("to_").map(|n| (n, false)).or_else(|| name.strip_prefix("as_").map(|n| (n, true)));
+            if let Some((n, wrap)) = conv {
+                let k = match n {
+                    "i" => Some(IntKind::I64),
+                    "byte" => Some(IntKind::U8),
+                    "rune" => Some(IntKind::I32),
+                    n => [IntKind::I8, IntKind::I16, IntKind::I32, IntKind::I64, IntKind::U8, IntKind::U16, IntKind::U32, IntKind::U64].into_iter().find(|k| k.method() == n),
+                };
+                if let Some(k) = k {
+                    if wrap && rt == Ty::Float {
+                        return Err(Diag::new(name_span, format!("`as_{n}` wraps integers; for a Float use `to_{n}`")));
+                    }
+                    let recv = self.coerce(recv, &if rt == Ty::Float { Ty::Float } else { Ty::Int })?;
+                    if n == "i" && rt == Ty::Float {
+                        return Ok(mk_m(self, M::FloatToI, recv, vec![], None, Ty::Int));
+                    }
+                    return Ok(mk_m(self, M::Conv(k, wrap), recv, vec![], None, Ty::of_kind(k)));
+                }
+            }
+        }
+        // Methods on every integer type.
+        if let Some(k) = rt.int_kind() {
+            match name {
+                "to_f" => {
+                    let recv = self.coerce(recv, &Ty::Int)?;
+                    return Ok(mk_m(self, M::ToF, recv, vec![], None, Ty::Float));
+                }
+                "to_s" => {
+                    let recv = self.coerce(recv, &Ty::Int)?;
+                    return Ok(mk_m(self, M::ToS, recv, vec![], None, Ty::Str));
+                }
+                "even?" if k != IntKind::I64 => return Ok(mk_m(self, M::Even, recv, vec![], None, Ty::Bool)),
+                "odd?" if k != IntKind::I64 => return Ok(mk_m(self, M::Odd, recv, vec![], None, Ty::Bool)),
+                "<<" => {
+                    let a = argv(self)?;
+                    if a.len() != 1 {
+                        return Err(Diag::new(sp, "`<<` takes one operand"));
+                    }
+                    return self.binary(BinOp::Shl, recv, a.into_iter().next().unwrap(), sp);
+                }
+                _ => {}
+            }
+        }
         // Int methods
         if rt == Ty::Int {
             match name {
-                "to_f" => return Ok(mk_m(self, M::ToF, recv, vec![], None, Ty::Float)),
-                "to_s" => return Ok(mk_m(self, M::ToS, recv, vec![], None, Ty::Str)),
                 "even?" => return Ok(mk_m(self, M::Even, recv, vec![], None, Ty::Bool)),
                 "odd?" => return Ok(mk_m(self, M::Odd, recv, vec![], None, Ty::Bool)),
                 "digits" => return Ok(mk_m(self, M::Digits, recv, vec![], None, Ty::arr(Ty::Int))),
@@ -1487,7 +1803,7 @@ impl<'w, 'a> FnCx<'w, 'a> {
                     return Ok(mk_m(self, M::Sum, recv, vec![], blk, st));
                 }
                 "max" | "min" => {
-                    if !matches!(self.resolve(&el), Ty::Int | Ty::Float | Ty::Str) {
+                    if !matches!(self.resolve(&el), Ty::Int | Ty::IntK(_) | Ty::Float | Ty::Str) {
                         return Err(Diag::new(sp, format!("`{name}` needs Int, Float or Str elements, got {}", self.resolve(&el).show())));
                     }
                     return Ok(mk_m(self, if name == "max" { M::Max } else { M::Min }, recv, vec![], None, el));
@@ -1616,10 +1932,27 @@ impl<'w, 'a> FnCx<'w, 'a> {
             let bad = |what: &str| Diag::new(v.span, format!("`%{spec}` needs {what}, got {}", t.show()));
             let piece = match spec.as_str() {
                 "d" | "i" => {
-                    if t != Ty::Int {
-                        return Err(bad("an Int"));
+                    if t.int_kind().is_none() {
+                        return Err(bad("an integer"));
                     }
                     FmtPiece::Int(k)
+                }
+                "x" | "X" | "o" | "b" => {
+                    if t.int_kind().is_none() {
+                        return Err(bad("an integer"));
+                    }
+                    let base = match spec.as_str() {
+                        "o" => 8,
+                        "b" => 2,
+                        _ => 16,
+                    };
+                    FmtPiece::Base(k, base, spec == "X")
+                }
+                "c" => {
+                    if t.int_kind().is_none() {
+                        return Err(bad("a Rune"));
+                    }
+                    FmtPiece::Char(k)
                 }
                 "s" => {
                     if t != Ty::Str {
@@ -1628,7 +1961,7 @@ impl<'w, 'a> FnCx<'w, 'a> {
                     FmtPiece::Str(k)
                 }
                 "v" => {
-                    if !matches!(t, Ty::Int | Ty::Float | Ty::Str | Ty::Bool) {
+                    if !matches!(t, Ty::Int | Ty::IntK(_) | Ty::Float | Ty::Str | Ty::Bool) {
                         return Err(bad("an Int, Float, Str or Bool"));
                     }
                     FmtPiece::Str(k)
@@ -1646,7 +1979,7 @@ impl<'w, 'a> FnCx<'w, 'a> {
                     let prec = if spec == "f" { 6 } else { spec[1..spec.len() - 1].parse::<u32>().unwrap().min(40) };
                     FmtPiece::Fixed(k, prec)
                 }
-                _ => return Err(Diag::new(*fsp, format!("unsupported directive `%{spec}`")).note("supported so far (Go's fmt verbs): %v, %d, %s, %t, %f, %.Nf, %%")),
+                _ => return Err(Diag::new(*fsp, format!("unsupported directive `%{spec}`")).note("supported so far (Go's fmt verbs): %v, %d, %s, %t, %f, %.Nf, %x, %X, %o, %b, %c, %%")),
             };
             pieces.push(piece);
             k += 1;
@@ -1660,8 +1993,8 @@ impl<'w, 'a> FnCx<'w, 'a> {
         let vals = vals
             .into_iter()
             .enumerate()
-            .map(|(i, v)| if pieces.contains(&FmtPiece::Fixed(i, 0)) || pieces.iter().any(|p| matches!(p, FmtPiece::Fixed(j, _) if *j == i)) { self.coerce(v, &Ty::Float) } else { v })
-            .collect();
+            .map(|(i, v)| if pieces.iter().any(|p| matches!(p, FmtPiece::Fixed(j, _) if *j == i)) { self.coerce(v, &Ty::Float) } else { Ok(v) })
+            .collect::<R<Vec<_>>>()?;
         Ok(self.mk(TK::Format(pieces, vals), Ty::Str, sp))
     }
 
@@ -1678,7 +2011,7 @@ impl<'w, 'a> FnCx<'w, 'a> {
     fn no_method(&self, rt: &Ty, name: &str, sp: Span) -> Diag {
         let mut cands: Vec<&str> = vec![];
         match rt {
-            Ty::Int => cands.extend(INT_METHODS),
+            Ty::Int | Ty::IntK(_) => cands.extend(INT_METHODS),
             Ty::Float => cands.extend(FLOAT_METHODS),
             Ty::Str => cands.extend(STR_METHODS),
             Ty::Array(_) => {

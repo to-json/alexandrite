@@ -7,6 +7,7 @@ use std::fmt::Write;
 pub fn ty_name(t: &LTy) -> String {
     match t {
         LTy::I64 => "I64".into(),
+        LTy::IntK(k) => k.name().into(),
         LTy::F64 => "F64".into(),
         LTy::PInt => "PInt".into(),
         LTy::Bool => "Bool".into(),
@@ -21,7 +22,7 @@ pub fn ty_name(t: &LTy) -> String {
 
 pub fn cty(t: &LTy) -> String {
     match t {
-        LTy::I64 => "int64_t".into(),
+        LTy::I64 | LTy::IntK(_) => "int64_t".into(),
         LTy::F64 => "double".into(),
         LTy::PInt => "AlxPInt".into(),
         LTy::Bool => "bool".into(),
@@ -33,9 +34,27 @@ pub fn cty(t: &LTy) -> String {
     }
 }
 
+/// The C type in memory (array elements, struct fields): integers take
+/// their own width there; in registers they are all int64_t.
+pub fn cty_mem(t: &LTy) -> String {
+    match t {
+        LTy::IntK(k) => match k {
+            IntKind::I8 => "int8_t",
+            IntKind::I16 => "int16_t",
+            IntKind::I32 => "int32_t",
+            IntKind::U8 => "uint8_t",
+            IntKind::U16 => "uint16_t",
+            IntKind::U32 => "uint32_t",
+            IntKind::I64 | IntKind::U64 => "int64_t",
+        }
+        .into(),
+        t => cty(t),
+    }
+}
+
 fn zero(t: &LTy) -> String {
     match t {
-        LTy::I64 | LTy::Unit => "0".into(),
+        LTy::I64 | LTy::IntK(_) | LTy::Unit => "0".into(),
         LTy::F64 => "0.0".into(),
         LTy::Bool => "false".into(),
         LTy::Gen(_) => "NULL".into(),
@@ -169,7 +188,7 @@ impl Gen<'_> {
                 self.need_type(inner);
                 let n = ty_name(t);
                 if !BUILTIN_ARRS.contains(&n.as_str()) && self.types_done.insert(n.clone()) {
-                    let _ = writeln!(self.typedefs, "ALX_ARR({}, {n})", cty(inner));
+                    let _ = writeln!(self.typedefs, "ALX_ARR({}, {n})", cty_mem(inner));
                 }
             }
             LTy::Tup(ts) => {
@@ -178,7 +197,7 @@ impl Gen<'_> {
                 }
                 let n = ty_name(t);
                 if self.types_done.insert(n.clone()) {
-                    let fields: Vec<String> = ts.iter().enumerate().map(|(i, x)| format!("{} f{i};", cty(x))).collect();
+                    let fields: Vec<String> = ts.iter().enumerate().map(|(i, x)| format!("{} f{i};", cty_mem(x))).collect();
                     let _ = writeln!(self.typedefs, "typedef struct {{ {} }} {n};", fields.join(" "));
                 }
             }
@@ -220,7 +239,7 @@ impl Gen<'_> {
         let _ = err_unused();
         for (i, v) in f.vars.iter().enumerate() {
             if f.params.contains(&i) {
-                let _ = writeln!(e.out, "    {} {} = *(const {} *)in_;", cty(&v.ty), vname(f, i), cty(&v.ty));
+                let _ = writeln!(e.out, "    {} {} = *(const {} *)in_;", cty(&v.ty), vname(f, i), cty_mem(&v.ty));
             } else {
                 let _ = writeln!(e.out, "    {} {} = {};", cty(&v.ty), vname(f, i), zero(&v.ty));
             }
@@ -315,6 +334,14 @@ impl FnEmit<'_> {
                 let x = self.e(val);
                 self.line(&format!("{lv} = {x};"));
             }
+            LS::FailIf { cond, loc, path } => {
+                let c = self.e(cond);
+                self.line(&format!("if ({c}) {{"));
+                self.ind += 1;
+                self.err_path(path, &format!("alx_err_overflow({})", c_str(loc)));
+                self.ind -= 1;
+                self.line("}");
+            }
             LS::Push(v, e) => {
                 let ty = ty_name(&self.f.vars[*v].ty);
                 let x = self.e(e);
@@ -355,7 +382,8 @@ impl FnEmit<'_> {
             LS::Return(v) => match (self.ctx, v) {
                 (Ctx::Fallible | Ctx::Worker, Some(v)) => {
                     let x = self.e(v);
-                    self.line(&format!("{{ *({} *)out_ = {x}; return true; }}", cty(&self.f.ret)));
+                    let t = if self.ctx == Ctx::Worker { cty_mem(&self.f.ret) } else { cty(&self.f.ret) };
+                    self.line(&format!("{{ *({t} *)out_ = {x}; return true; }}"));
                 }
                 (Ctx::Fallible | Ctx::Worker, None) => self.line("return true;"),
                 (Ctx::Plain, Some(v)) => {
@@ -436,7 +464,7 @@ impl FnEmit<'_> {
                 self.line(&format!("{d} = {}_cap(in_.len);", ty_name(&dt)));
                 self.line(&format!("{d}.len = in_.len;"));
                 self.line("AlxErr e_;");
-                self.line(&format!("if (!alx_pmap(in_.ptr, in_.len, sizeof *in_.ptr, {d}.ptr, sizeof({}), worker{worker}, &e_)) {{", cty(out_t)));
+                self.line(&format!("if (!alx_pmap(in_.ptr, in_.len, sizeof *in_.ptr, {d}.ptr, sizeof({}), worker{worker}, &e_)) {{", cty_mem(out_t)));
                 self.ind += 1;
                 self.err_path(path, "e_");
                 self.ind -= 1;
@@ -448,6 +476,8 @@ impl FnEmit<'_> {
                 let x = self.e(e);
                 let f = match t {
                     LTy::I64 => "alx_puts_i64",
+                    LTy::IntK(IntKind::U64) => "alx_puts_u64",
+                    LTy::IntK(_) => "alx_puts_i64",
                     LTy::F64 => "alx_puts_f64",
                     LTy::Str => "alx_puts_str",
                     LTy::Bool => "alx_puts_bool",
@@ -500,6 +530,27 @@ impl FnEmit<'_> {
                 format!("({} {sym} {})", self.e(a), self.e(b))
             }
             LE::FNeg(x) => format!("(-{})", self.e(x)),
+            LE::Prim(p, args) => {
+                let a: Vec<String> = args.iter().map(|x| self.e(x)).collect();
+                let u = |x: &str| format!("((uint64_t)({x}))");
+                match p {
+                    Prim::And => format!("({} & {})", a[0], a[1]),
+                    Prim::Or => format!("({} | {})", a[0], a[1]),
+                    Prim::Xor => format!("({} ^ {})", a[0], a[1]),
+                    Prim::AndNot => format!("({} & ~{})", a[0], a[1]),
+                    Prim::Not => format!("(~{})", a[0]),
+                    Prim::Shl => format!("((int64_t)({} << ({})))", u(&a[0]), a[1]),
+                    Prim::ShrS => format!("({} >> ({}))", a[0], a[1]),
+                    Prim::ShrU => format!("((int64_t)({} >> ({})))", u(&a[0]), a[1]),
+                    Prim::ULt => format!("({} < {})", u(&a[0]), u(&a[1])),
+                    Prim::ULe => format!("({} <= {})", u(&a[0]), u(&a[1])),
+                    Prim::UDiv => format!("((int64_t)({} / {}))", u(&a[0]), u(&a[1])),
+                    Prim::URem => format!("((int64_t)({} % {}))", u(&a[0]), u(&a[1])),
+                    Prim::UMulHi => format!("((int64_t)(((unsigned __int128){} * {}) >> 64))", u(&a[0]), u(&a[1])),
+                    Prim::Wrap(k) => format!("((int64_t)({})({}))", cty_mem(&LTy::IntK(*k)), a[0]),
+                    Prim::UToF => format!("((double){})", u(&a[0])),
+                }
+            }
             LE::B(b) => if *b { "true" } else { "false" }.into(),
             LE::S(s) => format!("alx_str_lit({}, {})", c_str(s), s.len()),
             LE::Loc(s) => c_str(s),
@@ -632,6 +683,10 @@ impl FnEmit<'_> {
                     Rt::FToS => s("alx_f_to_s"),
                     Rt::FFmt => s("alx_f_fmt"),
                     Rt::StrCat => format!("alx_str_cat({}, (AlxStr[]){{{}}})", a.len(), a.join(", ")),
+                    Rt::U64ToS => s("alx_u64_to_s"),
+                    Rt::IntFmt => s("alx_int_fmt"),
+                    Rt::FToU64 => s("alx_f_to_u64"),
+                    Rt::RuneToS => s("alx_rune_to_s"),
                 }
             }
             LE::Index { arr, idx, check } => {
@@ -647,7 +702,7 @@ impl FnEmit<'_> {
                 if vs.is_empty() {
                     format!("{n}_cap(0)")
                 } else {
-                    format!("{n}_lit({}, ({}[]){{{}}})", vs.len(), cty(t), vs.iter().map(|x| self.e(x)).collect::<Vec<_>>().join(", "))
+                    format!("{n}_lit({}, ({}[]){{{}}})", vs.len(), cty_mem(t), vs.iter().map(|x| self.e(x)).collect::<Vec<_>>().join(", "))
                 }
             }
             LE::ArrNew(t, n, fill, loc) => format!("{}_new({}, {}, {})", ty_name(&LTy::Arr(Box::new(t.clone()))), self.e(n), self.e(fill), c_str(loc)),

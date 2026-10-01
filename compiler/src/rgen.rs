@@ -9,7 +9,9 @@ const PRELUDE: &str = include_str!("../runtime/prelude.rs");
 
 fn rty(t: &LTy) -> String {
     match t {
-        LTy::I64 => "i64".into(),
+        // Every integer kind is an i64 here (bit pattern for U64): the
+        // oracle checks meaning, not memory layout.
+        LTy::I64 | LTy::IntK(_) => "i64".into(),
         LTy::F64 => "f64".into(),
         LTy::PInt => "PInt".into(),
         LTy::Bool => "bool".into(),
@@ -23,7 +25,7 @@ fn rty(t: &LTy) -> String {
 }
 
 fn is_copy(t: &LTy) -> bool {
-    matches!(t, LTy::I64 | LTy::F64 | LTy::Bool | LTy::Unit | LTy::Range)
+    matches!(t, LTy::I64 | LTy::IntK(_) | LTy::F64 | LTy::Bool | LTy::Unit | LTy::Range)
 }
 
 fn lit(s: &str) -> String {
@@ -189,6 +191,14 @@ impl FnEmit<'_> {
                 }
                 self.line(&format!("{code} {lv} = x_; }}"));
             }
+            LS::FailIf { cond, loc: l, path } => {
+                let c = self.e(cond);
+                self.line(&format!("if {c} {{"));
+                self.ind += 1;
+                self.err_path(path, &format!("err_overflow({})", loc(l)));
+                self.ind -= 1;
+                self.line("}");
+            }
             LS::Push(v, e) => {
                 let x = self.e(e);
                 self.line(&format!("{{ let x_ = {x}; v{v}.push(x_); }}"));
@@ -287,6 +297,8 @@ impl FnEmit<'_> {
                 let x = self.e(e);
                 match t {
                     LTy::I64 => self.line(&format!("puts_i64({x});")),
+                    LTy::IntK(IntKind::U64) => self.line(&format!("println!(\"{{}}\", ({x}) as u64);")),
+                    LTy::IntK(_) => self.line(&format!("puts_i64({x});")),
                     LTy::F64 => self.line(&format!("puts_str(f_to_s({x}));")),
                     LTy::Str => self.line(&format!("puts_str({x});")),
                     LTy::Bool => self.line(&format!("puts_bool({x});")),
@@ -340,6 +352,38 @@ impl FnEmit<'_> {
                 format!("(({}) {sym} ({}))", self.e(a), self.e(b))
             }
             LE::FNeg(x) => format!("(-({}))", self.e(x)),
+            LE::Prim(p, args) => {
+                let a: Vec<String> = args.iter().map(|x| self.e(x)).collect();
+                let u = |x: &str| format!("(({x}) as u64)");
+                match p {
+                    Prim::And => format!("(({}) & ({}))", a[0], a[1]),
+                    Prim::Or => format!("(({}) | ({}))", a[0], a[1]),
+                    Prim::Xor => format!("(({}) ^ ({}))", a[0], a[1]),
+                    Prim::AndNot => format!("(({}) & !({}))", a[0], a[1]),
+                    Prim::Not => format!("(!({}))", a[0]),
+                    Prim::Shl => format!("(({}).wrapping_shl(({}) as u32))", a[0], a[1]),
+                    Prim::ShrS => format!("(({}) >> ({}))", a[0], a[1]),
+                    Prim::ShrU => format!("(({} >> ({})) as i64)", u(&a[0]), a[1]),
+                    Prim::ULt => format!("({} < {})", u(&a[0]), u(&a[1])),
+                    Prim::ULe => format!("({} <= {})", u(&a[0]), u(&a[1])),
+                    Prim::UDiv => format!("(({} / {}) as i64)", u(&a[0]), u(&a[1])),
+                    Prim::URem => format!("(({} % {}) as i64)", u(&a[0]), u(&a[1])),
+                    Prim::UMulHi => format!("((({} as u128 * {} as u128) >> 64) as i64)", u(&a[0]), u(&a[1])),
+                    Prim::Wrap(k) => {
+                        let t = match k {
+                            IntKind::I8 => "i8",
+                            IntKind::I16 => "i16",
+                            IntKind::I32 => "i32",
+                            IntKind::U8 => "u8",
+                            IntKind::U16 => "u16",
+                            IntKind::U32 => "u32",
+                            _ => "i64",
+                        };
+                        format!("((({}) as {t}) as i64)", a[0])
+                    }
+                    Prim::UToF => format!("({} as f64)", u(&a[0])),
+                }
+            }
             LE::B(b) => b.to_string(),
             LE::S(s) => format!("Str::lit({})", lit(s)),
             LE::Loc(s) => loc(s),
@@ -446,6 +490,10 @@ impl FnEmit<'_> {
                     Rt::FToS => call("f_to_s"),
                     Rt::FFmt => call("f_fmt"),
                     Rt::StrCat => format!("str_cat(vec![{}])", a.join(", ")),
+                    Rt::U64ToS => format!("Str::lit((({}) as u64).to_string().as_bytes())", a[0]),
+                    Rt::IntFmt => call("int_fmt"),
+                    Rt::FToU64 => call("f_to_u64"),
+                    Rt::RuneToS => call("rune_to_s"),
                 }
             }
             LE::Index { arr, idx, check } => {

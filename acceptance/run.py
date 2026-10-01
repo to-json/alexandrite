@@ -69,6 +69,7 @@ GROUPS = {
     "pe004": "A4", "pe014": "A4",
     "pe008": "A5", "pe022": "A5",
     "nbody": "A7",
+    "ints": "M1",
 }
 
 
@@ -244,6 +245,9 @@ def main():
         negative_compile("pe004.bad", "A4")
         negative_runtime("pe020.bad", "A3")
         negative_runtime("pe022.missing", "A5")
+        negative_compile("ints.bad1", "M1")
+        negative_compile("ints.bad2", "M1")
+        negative_runtime("ints.overflow", "M1")
     if not filt or "A3" in filt:
         print("== A3 promote overhead", flush=True)
         promote_overhead()

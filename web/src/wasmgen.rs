@@ -76,6 +76,12 @@ const RT: &[(&str, &str)] = &[
     ("alxr_f_fmt", "fj>"),
     ("alxr_f_to_i", "fjj>j"),
     ("alxr_str_cat", "jj>"),
+    ("alxr_umulhi", "jj>j"),
+    ("alxr_puts_u64", "j>"),
+    ("alxr_u64_to_s", "j>"),
+    ("alxr_int_fmt", "jjii>"),
+    ("alxr_f_to_u64", "fjj>j"),
+    ("alxr_rune_to_s", "j>"),
 ];
 
 fn sig_of(s: &str) -> (Vec<ValType>, Vec<ValType>) {
@@ -96,6 +102,8 @@ enum F {
     By,
     /// 8-byte IEEE double.
     Fl,
+    /// A narrow integer: (bytes, signed) in memory, i64 in locals.
+    N(u8, bool),
 }
 
 impl F {
@@ -104,6 +112,7 @@ impl F {
             F::Wd => W,
             F::By => I,
             F::Fl => D,
+            F::N(..) => W,
         }
     }
 }
@@ -119,6 +128,11 @@ fn lay(t: &LTy) -> Lay {
     match t {
         LTy::I64 | LTy::Gen(_) => words(1),
         LTy::F64 => Lay { size: 8, align: 8, fields: vec![(0, F::Fl)] },
+        LTy::IntK(k) if k.bits() == 64 => words(1),
+        LTy::IntK(k) => {
+            let n = (k.bits() / 8) as u8;
+            Lay { size: n as u32, align: n as u32, fields: vec![(0, F::N(n, k.signed()))] }
+        }
         LTy::PInt | LTy::Str => words(2),
         LTy::Arr(_) => words(3),
         LTy::Bool => Lay { size: 1, align: 1, fields: vec![(0, F::By)] },
@@ -358,7 +372,12 @@ struct Fx<'c, 'p> {
 }
 
 fn mem(off: u32, f: F) -> MemArg {
-    MemArg { offset: off as u64, align: if f == F::By { 0 } else { 3 }, memory_index: 0 }
+    let align = match f {
+        F::By => 0,
+        F::N(n, _) => n.trailing_zeros(),
+        _ => 3,
+    };
+    MemArg { offset: off as u64, align, memory_index: 0 }
 }
 
 impl<'c, 'p> Fx<'c, 'p> {
@@ -474,6 +493,12 @@ impl<'c, 'p> Fx<'c, 'p> {
                 F::Wd => self.ins().i64_load(mem(off + o, f)),
                 F::By => self.ins().i32_load8_u(mem(off + o, f)),
                 F::Fl => self.ins().f64_load(mem(off + o, f)),
+                F::N(1, true) => self.ins().i64_load8_s(mem(off + o, f)),
+                F::N(1, false) => self.ins().i64_load8_u(mem(off + o, f)),
+                F::N(2, true) => self.ins().i64_load16_s(mem(off + o, f)),
+                F::N(2, false) => self.ins().i64_load16_u(mem(off + o, f)),
+                F::N(_, true) => self.ins().i64_load32_s(mem(off + o, f)),
+                F::N(_, false) => self.ins().i64_load32_u(mem(off + o, f)),
             };
         }
     }
@@ -486,6 +511,9 @@ impl<'c, 'p> Fx<'c, 'p> {
                 F::Wd => self.ins().i64_store(mem(off + o, f)),
                 F::By => self.ins().i32_store8(mem(off + o, f)),
                 F::Fl => self.ins().f64_store(mem(off + o, f)),
+                F::N(1, _) => self.ins().i64_store8(mem(off + o, f)),
+                F::N(2, _) => self.ins().i64_store16(mem(off + o, f)),
+                F::N(..) => self.ins().i64_store32(mem(off + o, f)),
             };
         }
     }
@@ -710,6 +738,12 @@ impl<'c, 'p> Fx<'c, 'p> {
                 let a = self.vars[*arr].clone();
                 let addr = self.elem_addr(a[0], a[1], i, &et, check.as_deref());
                 self.store(&et, addr, 0, &x);
+            }
+            LS::FailIf { cond, loc, path } => {
+                self.e(cond);
+                self.if_(vec![]);
+                self.err_path(path, ErrSrc::Overflow(loc));
+                self.end();
             }
             LS::SetPlace { var, steps, val } => {
                 let x = self.eval_locals(val);
@@ -962,6 +996,8 @@ impl<'c, 'p> Fx<'c, 'p> {
                 match t {
                     LTy::I64 => self.rt("alxr_puts_i64"),
                     LTy::F64 => self.rt("alxr_puts_f64"),
+                    LTy::IntK(IntKind::U64) => self.rt("alxr_puts_u64"),
+                    LTy::IntK(_) => self.rt("alxr_puts_i64"),
                     LTy::Str => self.rt("alxr_puts_str"),
                     LTy::Bool => self.rt("alxr_puts_bool"),
                     LTy::PInt => self.rt("alxr_puts_pint"),
@@ -1155,7 +1191,9 @@ impl<'c, 'p> Fx<'c, 'p> {
         match e {
             LE::Var(v) => self.f.vars[*v].ty.clone(),
             LE::I(_) | LE::Arith(..) | LE::Neg(..) | LE::Len(_) => LTy::I64,
-            LE::F(_) | LE::FArith(..) | LE::FNeg(_) => LTy::F64,
+            LE::F(_) | LE::FArith(..) | LE::FNeg(_) | LE::Prim(Prim::UToF, _) => LTy::F64,
+            LE::Prim(Prim::ULt | Prim::ULe, _) => LTy::Bool,
+            LE::Prim(..) => LTy::I64,
             LE::Loc(_) | LE::S(_) => LTy::Str,
             LE::B(_) | LE::Cmp(..) | LE::Not(_) => LTy::Bool,
             LE::Unit => LTy::Unit,
@@ -1171,7 +1209,7 @@ impl<'c, 'p> Fx<'c, 'p> {
             LE::Cond(_, a, _) => self.ty(a),
             LE::Call(f, _) => self.cx.funcs[f.as_str()].1.ret.clone(),
             LE::Rt(r, args) => match r {
-                Rt::IntToS | Rt::PIntToS | Rt::StrRev | Rt::StrDelete | Rt::FToS | Rt::FFmt | Rt::StrCat => LTy::Str,
+                Rt::IntToS | Rt::PIntToS | Rt::StrRev | Rt::StrDelete | Rt::FToS | Rt::FFmt | Rt::StrCat | Rt::U64ToS | Rt::IntFmt | Rt::RuneToS => LTy::Str,
                 Rt::IntToF | Rt::FSqrt | Rt::FAbs => LTy::F64,
                 Rt::StrByte => {
                     if matches!(args[2], LE::I(0)) {
@@ -1229,6 +1267,61 @@ impl<'c, 'p> Fx<'c, 'p> {
             LE::FNeg(x) => {
                 self.e(x);
                 self.ins().f64_neg();
+            }
+            LE::Prim(p, args) => {
+                for a in args {
+                    self.e(a);
+                }
+                match p {
+                    Prim::And => {
+                        self.ins().i64_and();
+                    }
+                    Prim::Or => {
+                        self.ins().i64_or();
+                    }
+                    Prim::Xor => {
+                        self.ins().i64_xor();
+                    }
+                    Prim::AndNot => {
+                        self.ins().i64_const(-1).i64_xor().i64_and();
+                    }
+                    Prim::Not => {
+                        self.ins().i64_const(-1).i64_xor();
+                    }
+                    Prim::Shl => {
+                        self.ins().i64_shl();
+                    }
+                    Prim::ShrS => {
+                        self.ins().i64_shr_s();
+                    }
+                    Prim::ShrU => {
+                        self.ins().i64_shr_u();
+                    }
+                    Prim::ULt => {
+                        self.ins().i64_lt_u();
+                    }
+                    Prim::ULe => {
+                        self.ins().i64_le_u();
+                    }
+                    Prim::UDiv => {
+                        self.ins().i64_div_u();
+                    }
+                    Prim::URem => {
+                        self.ins().i64_rem_u();
+                    }
+                    Prim::UMulHi => self.rt("alxr_umulhi"),
+                    Prim::UToF => {
+                        self.ins().f64_convert_i64_u();
+                    }
+                    Prim::Wrap(k) => {
+                        match (k.signed(), k.bits()) {
+                            (true, 8) => self.ins().i64_extend8_s(),
+                            (true, 16) => self.ins().i64_extend16_s(),
+                            (true, _) => self.ins().i64_extend32_s(),
+                            (false, b) => self.ins().i64_const(((1u64 << b) - 1) as i64).i64_and(),
+                        };
+                    }
+                }
             }
             LE::B(b) => {
                 self.ins().i32_const(*b as i32);
@@ -1436,7 +1529,11 @@ impl<'c, 'p> Fx<'c, 'p> {
                 self.ins().local_set(p);
                 if esz == 1 && l.fields.len() == 1 {
                     self.addr(p);
-                    self.ins().local_get(x[0]).local_get(nv).i32_wrap_i64().memory_fill(0);
+                    self.ins().local_get(x[0]);
+                    if matches!(l.fields[0].1, F::N(..)) {
+                        self.ins().i32_wrap_i64();
+                    }
+                    self.ins().local_get(nv).i32_wrap_i64().memory_fill(0);
                 } else {
                     let (i, addr) = (self.local(W), self.local(W));
                     self.ins().i64_const(0).local_set(i).block(BlockType::Empty).loop_(BlockType::Empty);
@@ -1594,6 +1691,10 @@ impl<'c, 'p> Fx<'c, 'p> {
                 self.ins().f64_abs();
             }
             Rt::FToS => call_ret(self, "alxr_f_to_s", 2),
+            Rt::U64ToS => call_ret(self, "alxr_u64_to_s", 2),
+            Rt::IntFmt => call_ret(self, "alxr_int_fmt", 2),
+            Rt::RuneToS => call_ret(self, "alxr_rune_to_s", 2),
+            Rt::FToU64 => call(self, "alxr_f_to_u64"),
             Rt::FFmt => call_ret(self, "alxr_f_fmt", 2),
             Rt::StrCat => {
                 let p = self.local(W);

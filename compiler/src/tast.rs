@@ -1,12 +1,18 @@
 //! Typed tree produced by the checker: one `TFunc` per function instance
 //! (monomorphized), every expression typed, every call resolved.
 
+pub use crate::ast::IntKind;
 use crate::ast::{BinOp, Overflow};
+use num_bigint::BigInt;
+use num_rational::BigRational;
 use crate::diag::Span;
 
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub enum Ty {
+    /// I64, the default integer.
     Int,
+    /// Every other integer type (never I64).
+    IntK(IntKind),
     Float,
     Bool,
     Str,
@@ -37,6 +43,7 @@ impl Ty {
     pub fn show(&self) -> String {
         match self {
             Ty::Int => "Int".into(),
+            Ty::IntK(k) => k.name().into(),
             Ty::Float => "Float".into(),
             Ty::Struct(n, _) => n.clone(),
             Ty::Bool => "Bool".into(),
@@ -60,6 +67,17 @@ impl Ty {
             Ty::Tuple(ts) => ts.iter().any(Ty::has_var),
             _ => false,
         }
+    }
+    /// The integer kind of an integer type.
+    pub fn int_kind(&self) -> Option<IntKind> {
+        match self {
+            Ty::Int => Some(IntKind::I64),
+            Ty::IntK(k) => Some(*k),
+            _ => None,
+        }
+    }
+    pub fn of_kind(k: IntKind) -> Ty {
+        if k == IntKind::I64 { Ty::Int } else { Ty::IntK(k) }
     }
     pub fn field(&self, name: &str) -> Option<(usize, Ty)> {
         match self {
@@ -136,6 +154,8 @@ pub enum M {
     ToF,
     /// Float → Int (truncates; fails on NaN, infinities and out-of-range values)
     FloatToI,
+    /// Integer or Float → integer kind: `to_u8` (checked) or `as_u8` (wraps, as Go's `uint8(x)`)
+    Conv(IntKind, bool),
     FloatAbs,
     FloatToS,
     /// Math.sqrt
@@ -164,8 +184,11 @@ pub struct TExpr {
 
 #[derive(Clone, Debug)]
 pub enum TK {
+    /// A typed integer literal (bit pattern for U64).
     Int(i64),
     Float(f64),
+    /// An untyped constant (Go): exact until its use gives it a type.
+    Const(ConstVal),
     Str(String),
     Bool(bool),
     Unit,
@@ -190,6 +213,12 @@ pub enum TK {
     Format(Vec<FmtPiece>, Vec<TExpr>),
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub enum ConstVal {
+    Int(BigInt),
+    Float(BigRational),
+}
+
 #[derive(Clone, Debug)]
 pub enum TStep {
     Index(TExpr),
@@ -205,6 +234,10 @@ pub enum FmtPiece {
     Str(usize),
     /// `%f`, `%.Nf`: argument k (Float or Int), N decimals
     Fixed(usize, u32),
+    /// `%x` `%X` `%o` `%b`: argument k in a base
+    Base(usize, u32, bool),
+    /// `%c`: argument k as a character (a Rune)
+    Char(usize),
 }
 
 #[derive(Clone, Debug)]

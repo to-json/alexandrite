@@ -39,7 +39,11 @@ pub struct World<'a> {
     /// An error inside a callee is final: retry passes of the caller must
     /// not swallow it.
     fatal: Option<Diag>,
+    /// User structs by name, fields resolved.
+    pub structs: Structs,
 }
+
+pub type Structs = HashMap<String, Ty>;
 
 const PASSES: usize = 4;
 
@@ -51,7 +55,43 @@ impl<'a> World<'a> {
                 return Err(Diag::new(d.def.name_span, format!("`{}` is defined twice", d.def.name)));
             }
         }
-        Ok(World { sm, defs, by_name, instances: HashMap::new(), funcs: vec![], sigs: HashMap::new(), fatal: None })
+        Ok(World { sm, defs, by_name, instances: HashMap::new(), funcs: vec![], sigs: HashMap::new(), fatal: None, structs: HashMap::new() })
+    }
+
+    /// Declare structs (in any order; a struct can't contain itself).
+    pub fn add_structs(&mut self, defs: &[StructDef]) -> R<()> {
+        let by_name: HashMap<&str, &StructDef> = defs.iter().map(|d| (d.name.as_str(), d)).collect();
+        for d in defs {
+            if self.structs.contains_key(&d.name) || ["Int", "Float", "Bool", "Str", "Array", "Math", "File", "Enumerator"].contains(&d.name.as_str()) {
+                return Err(Diag::new(d.span, format!("`{}` is already defined", d.name)));
+            }
+        }
+        fn resolve(name: &str, by_name: &HashMap<&str, &StructDef>, done: &mut Structs, visiting: &mut Vec<String>) -> R<Ty> {
+            if let Some(t) = done.get(name) {
+                return Ok(t.clone());
+            }
+            let d = by_name[name];
+            if visiting.iter().any(|v| v == name) {
+                return Err(Diag::new(d.span, format!("struct `{name}` contains itself; a struct is a value, so it can't")));
+            }
+            visiting.push(name.to_string());
+            let mut fields = vec![];
+            for (f, te, _) in &d.fields {
+                let t = match te {
+                    TypeExpr::Named(n, _) if by_name.contains_key(n.as_str()) => resolve(n, by_name, done, visiting)?,
+                    _ => type_from(te, done)?,
+                };
+                fields.push((f.clone(), t));
+            }
+            visiting.pop();
+            let t = Ty::Struct(name.to_string(), fields);
+            done.insert(name.to_string(), t.clone());
+            Ok(t)
+        }
+        for d in defs {
+            resolve(&d.name, &by_name, &mut self.structs, &mut vec![])?;
+        }
+        Ok(())
     }
 
     pub fn check_main(&mut self, main: &[Stmt], overflow: Overflow, span: Span) -> R<FuncId> {
@@ -71,7 +111,7 @@ impl<'a> World<'a> {
             let mut tys = vec![];
             for p in &d.params {
                 match &p.ty {
-                    Some(t) => tys.push(type_from(t)?),
+                    Some(t) => tys.push(type_from(t, &self.structs)?),
                     None => {
                         return Err(Diag::new(p.span, format!("cannot export `{}`: parameter `{}` needs a type (headers need explicit types)", d.name, p.name)));
                     }
@@ -114,7 +154,7 @@ impl<'a> World<'a> {
         let def_ast = info.def.clone();
         let overflow = info.overflow;
         if let Some(ret) = &def_ast.ret {
-            self.sigs.insert(id, (type_from(ret)?, def_ast.fallible, def_ast.pure));
+            self.sigs.insert(id, (type_from(ret, &self.structs)?, def_ast.fallible, def_ast.pure));
         }
         let _ = call_span;
         let f = match self.check_fn(id, Some(&def_ast), &args, &def_ast.body, overflow, def_ast.span) {
@@ -177,15 +217,16 @@ pub fn cname(s: &str) -> String {
     s.replace('?', "_q").replace('!', "_b")
 }
 
-pub fn type_from(t: &TypeExpr) -> R<Ty> {
+pub fn type_from(t: &TypeExpr, structs: &Structs) -> R<Ty> {
     match t {
         TypeExpr::Named(n, sp) => match n.as_str() {
             "Int" => Ok(Ty::Int),
+            "Float" => Ok(Ty::Float),
             "Bool" => Ok(Ty::Bool),
             "Str" => Ok(Ty::Str),
-            _ => Err(Diag::new(*sp, format!("unknown type `{n}`"))),
+            _ => structs.get(n).cloned().ok_or_else(|| Diag::new(*sp, format!("unknown type `{n}`"))),
         },
-        TypeExpr::Array(t, _) => Ok(Ty::arr(type_from(t)?)),
+        TypeExpr::Array(t, _) => Ok(Ty::arr(type_from(t, structs)?)),
     }
 }
 
@@ -225,7 +266,8 @@ const SEQ_METHODS: &[&str] = &[
     "first", "to_a", "each", "reduce", "inject", "all?", "any?", "count", "include?", "sort", "size", "length",
 ];
 const ARRAY_EXTRA: &[&str] = &["each_index", "each_cons", "pmap", "last", "reverse", "<<"];
-const INT_METHODS: &[&str] = &["to_s", "even?", "odd?", "digits", "step", "abs"];
+const INT_METHODS: &[&str] = &["to_s", "to_f", "even?", "odd?", "digits", "step"];
+const FLOAT_METHODS: &[&str] = &["to_s", "to_f", "to_i", "abs"];
 const STR_METHODS: &[&str] = &["chars", "bytes", "size", "length", "reverse", "delete", "split", "to_i", "to_s"];
 
 fn lev(a: &str, b: &str) -> usize {
@@ -362,7 +404,7 @@ impl<'w, 'a> FnCx<'w, 'a> {
             }
             self.n_params = params.len();
             self.ret = match &d.ret {
-                Some(t) => type_from(t)?,
+                Some(t) => type_from(t, &self.w.structs)?,
                 None => self.fresh(),
             };
         }
@@ -372,6 +414,8 @@ impl<'w, 'a> FnCx<'w, 'a> {
             // The value of the last statement is the return value.
             if let Some(TStmt::Expr(e)) = stmts.last_mut() {
                 let e2 = self.materialize(e.clone());
+                let rt = self.ret.clone();
+                let e2 = self.coerce(e2, &rt);
                 *e = e2;
                 let t = e.ty.clone();
                 let rt = self.ret.clone();
@@ -453,6 +497,19 @@ impl<'w, 'a> FnCx<'w, 'a> {
             TK::Try(x) => TK::Try(b(x)),
             TK::Puts(x) => TK::Puts(b(x)),
             TK::Array(xs) => TK::Array(xs.into_iter().map(|a| self.zonk(a)).collect()),
+            TK::Format(ps, xs) => TK::Format(ps, xs.into_iter().map(|a| self.zonk(a)).collect()),
+            TK::PlaceAssign(l, steps, op, v) => TK::PlaceAssign(
+                l,
+                steps
+                    .into_iter()
+                    .map(|st| match st {
+                        TStep::Index(i) => TStep::Index(self.zonk(i)),
+                        f => f,
+                    })
+                    .collect(),
+                op,
+                b(v),
+            ),
             k => k,
         };
         TExpr { kind, ty, span: e.span }
@@ -522,8 +579,9 @@ impl<'w, 'a> FnCx<'w, 'a> {
                     return Err(Diag::new(s.span, "`return` at the top level"));
                 }
                 let v = v.as_ref().map(|v| self.value(v)).transpose()?;
-                let t = v.as_ref().map_or(Ty::Unit, |v| v.ty.clone());
                 let rt = self.ret.clone();
+                let v = v.map(|v| self.coerce(v, &rt));
+                let t = v.as_ref().map_or(Ty::Unit, |v| v.ty.clone());
                 self.expect(&t, &rt, s.span, "return value")?;
                 TStmt::Return(v, s.span)
             }
@@ -573,6 +631,7 @@ impl<'w, 'a> FnCx<'w, 'a> {
         let sp = e.span;
         Ok(match &e.kind {
             ExprKind::Int(v) => self.mk(TK::Int(*v), Ty::Int, sp),
+            ExprKind::Float(v) => self.mk(TK::Float(*v), Ty::Float, sp),
             ExprKind::Str(s) => self.mk(TK::Str(s.clone()), Ty::Str, sp),
             ExprKind::Bool(b) => self.mk(TK::Bool(*b), Ty::Bool, sp),
             ExprKind::Nil => self.mk(TK::Unit, Ty::Unit, sp),
@@ -603,10 +662,8 @@ impl<'w, 'a> FnCx<'w, 'a> {
                     let ty = v.ty.clone();
                     self.mk(TK::Assign(id, Box::new(v)), ty, sp)
                 }
-                ExprKind::Index(arr, idx) => {
-                    let ExprKind::Name(an) = &arr.kind else {
-                        return Err(Diag::new(arr.span, "can only assign into an element of a local array"));
-                    };
+                ExprKind::Index(arr, idx) if matches!(arr.kind, ExprKind::Name(_)) => {
+                    let ExprKind::Name(an) = &arr.kind else { unreachable!() };
                     let Some(id) = self.lookup(an) else {
                         return Err(Diag::new(arr.span, format!("unknown local `{an}`")));
                     };
@@ -622,16 +679,32 @@ impl<'w, 'a> FnCx<'w, 'a> {
                         Ty::Var(_) => self.unknown(arr.span, "the array")?,
                         t => return Err(Diag::new(arr.span, format!("cannot assign into {}", t.show()))),
                     };
+                    let v = self.coerce(v, &el);
                     self.expect(&v.ty, &el, v.span, "element assignment")?;
                     let ty = v.ty.clone();
                     self.mk(TK::IndexAssign(id, Box::new(idx), Box::new(v)), ty, sp)
                 }
-                _ => return Err(Diag::new(target.span, "cannot assign to this")),
+                _ => {
+                    let (id, steps, pty) = self.place(target)?;
+                    let v = self.value(v)?;
+                    let v = self.coerce(v, &pty);
+                    self.expect(&v.ty, &pty, v.span, "assignment")?;
+                    self.mk(TK::PlaceAssign(id, steps, None, Box::new(v)), pty, sp)
+                }
             },
+            ExprKind::OpAssign(op, target, v) if !matches!(target.kind, ExprKind::Name(_)) => {
+                let (id, steps, pty) = self.place(target)?;
+                let cur = self.place_read(id, &steps, &pty, target.span);
+                let rhs = self.value(v)?;
+                let bin = self.binary(*op, cur, rhs, sp)?;
+                if !self.unify(&bin.ty, &pty) {
+                    return Err(Diag::new(sp, format!("`{}=` on a {} place gives {}", op.text(), self.resolve(&pty).show(), self.resolve(&bin.ty).show())));
+                }
+                let TK::Bin(_, _, rhs) = bin.kind else { unreachable!() };
+                self.mk(TK::PlaceAssign(id, steps, Some(*op), rhs), pty, sp)
+            }
             ExprKind::OpAssign(op, target, v) => {
-                let ExprKind::Name(n) = &target.kind else {
-                    return Err(Diag::new(target.span, "compound assignment needs a local variable"));
-                };
+                let ExprKind::Name(n) = &target.kind else { unreachable!() };
                 let Some(id) = self.lookup(n) else {
                     return Err(Diag::new(target.span, format!("`{n}` is not defined yet")));
                 };
@@ -649,6 +722,9 @@ impl<'w, 'a> FnCx<'w, 'a> {
             }
             ExprKind::Neg(x) => {
                 let x = self.value(x)?;
+                if matches!(self.resolve(&x.ty), Ty::Float) {
+                    return Ok(self.mk(TK::Neg(Box::new(x)), Ty::Float, sp));
+                }
                 self.expect(&x.ty, &Ty::Int, x.span, "negation")?;
                 self.mk(TK::Neg(Box::new(x)), Ty::Int, sp)
             }
@@ -688,6 +764,7 @@ impl<'w, 'a> FnCx<'w, 'a> {
                 let ty = inner.ty.clone();
                 self.mk(TK::Try(Box::new(inner)), ty, sp)
             }
+            ExprKind::KwArg(n, nsp, _) => return Err(Diag::new(*nsp, format!("keyword argument `{n}:` outside `Struct.new`")).note("keyword arguments name struct fields: `Body.new(x: 1.0, mass: m)`")),
             ExprKind::Array(items) => {
                 let el = self.site(e.id, 0);
                 let mut out = vec![];
@@ -701,12 +778,145 @@ impl<'w, 'a> FnCx<'w, 'a> {
         })
     }
 
+    /// An assignable place: a local, then `[i]` and `.field` steps.
+    fn place(&mut self, e: &Expr) -> R<(LocalId, Vec<TStep>, Ty)> {
+        match &e.kind {
+            ExprKind::Name(n) => {
+                let Some(id) = self.lookup(n) else {
+                    return Err(Diag::new(e.span, format!("`{n}` is not defined yet")));
+                };
+                if self.pure_decl && id < self.param_count() {
+                    return Err(Diag::new(e.span, format!("`#[pure] def {}` can't mutate its argument `{n}`", self.fn_name)));
+                }
+                self.locals[id].mutated = true;
+                Ok((id, vec![], self.locals[id].ty.clone()))
+            }
+            ExprKind::Index(a, i) => {
+                let (id, mut steps, t) = self.place(a)?;
+                let el = match self.resolve(&t) {
+                    Ty::Array(t) => *t,
+                    Ty::Var(_) => self.unknown(a.span, "the array")?,
+                    t => return Err(Diag::new(a.span, format!("cannot index into {}", t.show()))),
+                };
+                let i = self.value(i)?;
+                self.expect(&i.ty, &Ty::Int, i.span, "index")?;
+                steps.push(TStep::Index(i));
+                Ok((id, steps, el))
+            }
+            ExprKind::Call { recv: Some(r), name, name_span, .. } => {
+                let (id, mut steps, t) = self.place(r)?;
+                let t = self.resolve(&t);
+                let Some((k, ft)) = t.field(name) else {
+                    return Err(match &t {
+                        Ty::Var(_) => Diag::new(r.span, "cannot infer the type of this value; add a type annotation"),
+                        Ty::Struct(sn, fs) => self.no_field(sn, fs, name, *name_span),
+                        t => Diag::new(*name_span, format!("cannot assign to `.{name}` of {}", t.show())),
+                    });
+                };
+                steps.push(TStep::Field(k));
+                Ok((id, steps, ft))
+            }
+            _ => Err(Diag::new(e.span, "cannot assign to this")),
+        }
+    }
+
+    /// Reading a place, as an expression (for `place op= v`).
+    fn place_read(&mut self, id: LocalId, steps: &[TStep], pty: &Ty, sp: Span) -> TExpr {
+        let mut cur = self.mk(TK::Local(id), self.locals[id].ty.clone(), sp);
+        for st in steps {
+            let t = self.resolve(&cur.ty);
+            cur = match st {
+                TStep::Index(i) => {
+                    let el = match t {
+                        Ty::Array(e) => *e,
+                        _ => pty.clone(),
+                    };
+                    self.mk(TK::Index(Box::new(cur), Box::new(i.clone())), el, sp)
+                }
+                TStep::Field(k) => {
+                    let ft = match &t {
+                        Ty::Struct(_, fs) => fs[*k].1.clone(),
+                        _ => pty.clone(),
+                    };
+                    self.mk(TK::M(M::TupleGet(*k), Some(Box::new(cur)), vec![], None), ft, sp)
+                }
+            };
+        }
+        cur
+    }
+
+    fn no_field(&self, sn: &str, fs: &[(String, Ty)], name: &str, sp: Span) -> Diag {
+        let mut msg = format!("`{sn}` has no field `{name}`");
+        if let Some((best, _)) = fs.iter().filter(|(f, _)| lev(f, name) <= 2).min_by_key(|(f, _)| lev(f, name)) {
+            msg.push_str(&format!("; did you mean `{best}`?"));
+        } else {
+            msg.push_str(&format!("; its fields are {}", fs.iter().map(|(f, _)| format!("`{f}`")).collect::<Vec<_>>().join(", ")));
+        }
+        Diag::new(sp, msg)
+    }
+
+    /// An Int *literal* where a Float is wanted is a Float (Go's untyped
+    /// constants). An Int variable is not converted: that takes `.to_f`.
+    fn coerce(&mut self, e: TExpr, want: &Ty) -> TExpr {
+        if matches!(self.resolve(want), Ty::Float) {
+            if let TK::Int(v) = e.kind {
+                return self.mk(TK::Float(v as f64), Ty::Float, e.span);
+            }
+        }
+        e
+    }
+
+    /// Go's zero value of a type, as an expression.
+    fn zero_of(&mut self, t: &Ty, sp: Span) -> Option<TExpr> {
+        let kind = match t {
+            Ty::Int => TK::Int(0),
+            Ty::Float => TK::Float(0.0),
+            Ty::Bool => TK::Bool(false),
+            Ty::Str => TK::Str(String::new()),
+            Ty::Array(_) => TK::Array(vec![]),
+            Ty::Struct(_, fs) => {
+                let vals = fs.clone().iter().map(|(_, ft)| self.zero_of(ft, sp)).collect::<Option<Vec<_>>>()?;
+                TK::M(M::StructNew, None, vals, None)
+            }
+            _ => return None,
+        };
+        Some(self.mk(kind, t.clone(), sp))
+    }
+
     fn param_count(&self) -> usize {
         self.n_params
     }
 
     fn binary(&mut self, op: BinOp, l: TExpr, r: TExpr, sp: Span) -> R<TExpr> {
         let (lt, rt) = (self.resolve(&l.ty), self.resolve(&r.ty));
+        // Float arithmetic and comparison: an Int operand is converted.
+        if !matches!(op, BinOp::And | BinOp::Or) && (lt == Ty::Float || rt == Ty::Float) {
+            for (e, t) in [(&l, &lt), (&r, &rt)] {
+                if !matches!(t, Ty::Int | Ty::Float | Ty::Var(_)) {
+                    return Err(Diag::new(e.span, format!("`{}` needs numbers, got {}", op.text(), t.show())));
+                }
+                if *t == Ty::Int && !matches!(e.kind, TK::Int(_)) {
+                    return Err(Diag::new(e.span, format!("`{}` mixes Float and Int: convert the Int with `.to_f`", op.text())).note("only numeric literals convert implicitly (as in Go)"));
+                }
+            }
+            if matches!(op, BinOp::Rem | BinOp::Pow) {
+                return Err(Diag::new(sp, format!("`{}` on Float isn't supported yet", op.text())));
+            }
+            let l = if matches!(lt, Ty::Var(_)) {
+                self.unify(&l.ty, &Ty::Float);
+                l
+            } else {
+                self.coerce(l, &Ty::Float)
+            };
+            let r = if matches!(rt, Ty::Var(_)) {
+                self.unify(&r.ty, &Ty::Float);
+                r
+            } else {
+                self.coerce(r, &Ty::Float)
+            };
+            let ty = if op.is_arith() { Ty::Float } else { Ty::Bool };
+            return Ok(self.mk(TK::Bin(op, Box::new(l), Box::new(r)), ty, sp));
+        }
         let ty = match op {
             BinOp::And | BinOp::Or => {
                 self.expect(&lt, &Ty::Bool, l.span, &format!("`{}`", op.text()))?;
@@ -716,6 +926,9 @@ impl<'w, 'a> FnCx<'w, 'a> {
             BinOp::Eq | BinOp::Ne => {
                 if !self.unify(&lt, &rt) {
                     return Err(Diag::new(sp, format!("cannot compare {} with {}", lt.show(), rt.show())));
+                }
+                if matches!(self.resolve(&lt), Ty::Struct(..) | Ty::Tuple(_) | Ty::Array(_)) {
+                    return Err(Diag::new(sp, format!("`{}` on {} values isn't supported yet; compare their fields", op.text(), self.resolve(&lt).show())));
                 }
                 Ty::Bool
             }
@@ -784,6 +997,7 @@ impl<'w, 'a> FnCx<'w, 'a> {
                 return Ok(self.mk(TK::M(M::Loop, None, vec![], Some(Box::new(blk))), Ty::Unit, sp));
             }
             "it" => return Err(Diag::new(sp, "`it` can only be used inside a block")),
+            "format" | "sprintf" => return self.format(name, args, sp),
             _ => {}
         }
         let _ = bsym;
@@ -808,8 +1022,12 @@ impl<'w, 'a> FnCx<'w, 'a> {
             let v = self.value(a)?;
             let want = match (&ext, &p.ty) {
                 (Some(ts), _) => Some(ts[i].clone()),
-                (None, Some(t)) => Some(type_from(t)?),
+                (None, Some(t)) => Some(type_from(t, &self.w.structs)?),
                 (None, None) => None,
+            };
+            let v = match &want {
+                Some(w) => self.coerce(v, w),
+                None => v,
             };
             if let Some(want) = want {
                 if !self.unify(&v.ty, &want) {
@@ -861,7 +1079,62 @@ impl<'w, 'a> FnCx<'w, 'a> {
 
     fn const_call(&mut self, c: &str, csp: Span, name: &str, name_span: Span, args: &[Expr], block: Option<&Block>, sp: Span) -> R<TExpr> {
         let argv = |cx: &mut Self| args.iter().map(|a| cx.value(a)).collect::<R<Vec<_>>>();
+        if let (Some(st), "new") = (self.w.structs.get(c).cloned(), name) {
+            let Ty::Struct(_, fields) = &st else { unreachable!() };
+            if args.iter().any(|a| matches!(a.kind, ExprKind::KwArg(..))) {
+                // Keywords: any subset of fields, in any order; the rest are zero (Go).
+                let mut given: Vec<Option<TExpr>> = vec![None; fields.len()];
+                for a in args {
+                    let ExprKind::KwArg(n, nsp, v) = &a.kind else {
+                        return Err(Diag::new(a.span, format!("`{c}.new`: mix of positional and keyword arguments; use one or the other")));
+                    };
+                    let Some(k) = fields.iter().position(|(f, _)| f == n) else {
+                        return Err(self.no_field(c, fields, n, *nsp));
+                    };
+                    if given[k].is_some() {
+                        return Err(Diag::new(*nsp, format!("field `{n}` given twice")));
+                    }
+                    let ft = &fields[k].1;
+                    let v = self.value(v)?;
+                    let v = self.coerce(v, ft);
+                    if !self.unify(&v.ty, ft) {
+                        return Err(Diag::new(v.span, format!("`{c}.{n}` is {}, got {}", ft.show(), self.resolve(&v.ty).show())));
+                    }
+                    given[k] = Some(v);
+                }
+                let mut vals = vec![];
+                for (k, g) in given.into_iter().enumerate() {
+                    vals.push(match g {
+                        Some(v) => v,
+                        None => self.zero_of(&fields[k].1, sp).ok_or_else(|| Diag::new(sp, format!("`{c}.{}` has no zero value ({}); give it", fields[k].0, fields[k].1.show())))?,
+                    });
+                }
+                return Ok(self.mk(TK::M(M::StructNew, None, vals, None), st, sp));
+            }
+            if args.len() != fields.len() {
+                return Err(Diag::new(sp, format!("`{c}.new` takes {} arguments ({}), got {}", fields.len(), fields.iter().map(|(f, _)| f.as_str()).collect::<Vec<_>>().join(", "), args.len())));
+            }
+            let mut vals = vec![];
+            for (a, (f, ft)) in args.iter().zip(fields) {
+                let v = self.value(a)?;
+                let v = self.coerce(v, ft);
+                if !self.unify(&v.ty, ft) {
+                    return Err(Diag::new(a.span, format!("`{c}.{f}` is {}, got {}", ft.show(), self.resolve(&v.ty).show())));
+                }
+                vals.push(v);
+            }
+            return Ok(self.mk(TK::M(M::StructNew, None, vals, None), st, sp));
+        }
         match (c, name) {
+            ("Math", "sqrt") => {
+                let a = argv(self)?;
+                if a.len() != 1 {
+                    return Err(Diag::new(sp, "`Math.sqrt` takes one argument"));
+                }
+                let x = self.coerce(a[0].clone(), &Ty::Float);
+                self.expect(&x.ty, &Ty::Float, x.span, "Math.sqrt")?;
+                Ok(self.mk(TK::M(M::Sqrt, None, vec![x], None), Ty::Float, sp))
+            }
             ("Int", "sqrt") => {
                 let a = argv(self)?;
                 if a.len() != 1 {
@@ -1051,9 +1324,30 @@ impl<'w, 'a> FnCx<'w, 'a> {
                 return Ok(mk_m(self, M::Yield, recv, a, None, Ty::Unit));
             }
         }
+        // Struct fields
+        if let Ty::Struct(sn, fs) = &rt {
+            if let Some((k, ft)) = rt.field(name) {
+                if !args.is_empty() || block.is_some() {
+                    return Err(Diag::new(sp, format!("`{sn}.{name}` is a field, not a method")));
+                }
+                return Ok(mk_m(self, M::TupleGet(k), recv, vec![], None, ft));
+            }
+            return Err(self.no_field(sn, fs, name, name_span));
+        }
+        // Float methods
+        if rt == Ty::Float {
+            match name {
+                "to_f" => return Ok(recv),
+                "to_i" | "to_int" | "truncate" => return Ok(mk_m(self, M::FloatToI, recv, vec![], None, Ty::Int)),
+                "abs" => return Ok(mk_m(self, M::FloatAbs, recv, vec![], None, Ty::Float)),
+                "to_s" => return Ok(mk_m(self, M::FloatToS, recv, vec![], None, Ty::Str)),
+                _ => {}
+            }
+        }
         // Int methods
         if rt == Ty::Int {
             match name {
+                "to_f" => return Ok(mk_m(self, M::ToF, recv, vec![], None, Ty::Float)),
                 "to_s" => return Ok(mk_m(self, M::ToS, recv, vec![], None, Ty::Str)),
                 "even?" => return Ok(mk_m(self, M::Even, recv, vec![], None, Ty::Bool)),
                 "odd?" => return Ok(mk_m(self, M::Odd, recv, vec![], None, Ty::Bool)),
@@ -1187,12 +1481,14 @@ impl<'w, 'a> FnCx<'w, 'a> {
                             (Some(b), t)
                         }
                     };
-                    self.expect(&t, &Ty::Int, sp, "`sum` elements")?;
-                    return Ok(mk_m(self, M::Sum, recv, vec![], blk, Ty::Int));
+                    let t = self.resolve(&t);
+                    let st = if t == Ty::Float { Ty::Float } else { Ty::Int };
+                    self.expect(&t, &st, sp, "`sum` elements")?;
+                    return Ok(mk_m(self, M::Sum, recv, vec![], blk, st));
                 }
                 "max" | "min" => {
-                    if !matches!(self.resolve(&el), Ty::Int | Ty::Str) {
-                        return Err(Diag::new(sp, format!("`{name}` needs Int or Str elements, got {}", self.resolve(&el).show())));
+                    if !matches!(self.resolve(&el), Ty::Int | Ty::Float | Ty::Str) {
+                        return Err(Diag::new(sp, format!("`{name}` needs Int, Float or Str elements, got {}", self.resolve(&el).show())));
                     }
                     return Ok(mk_m(self, if name == "max" { M::Max } else { M::Min }, recv, vec![], None, el));
                 }
@@ -1282,6 +1578,93 @@ impl<'w, 'a> FnCx<'w, 'a> {
         Err(self.no_method(&rt, name, name_span))
     }
 
+    /// `format("...", args)`: Go's fmt verbs. The format string must be a
+    /// literal, so every directive is checked against its argument here.
+    fn format(&mut self, name: &str, args: &[Expr], sp: Span) -> R<TExpr> {
+        let Some(Expr { kind: ExprKind::Str(fmt), span: fsp, .. }) = args.first() else {
+            return Err(Diag::new(sp, format!("`{name}` takes a format string literal first")));
+        };
+        let vals = args[1..].iter().map(|a| self.value(a)).collect::<R<Vec<_>>>()?;
+        let mut pieces = vec![];
+        let mut lit = String::new();
+        let mut k = 0;
+        let mut it = fmt.chars().peekable();
+        while let Some(c) = it.next() {
+            if c != '%' {
+                lit.push(c);
+                continue;
+            }
+            let mut spec = String::new();
+            while let Some(&d) = it.peek() {
+                spec.push(d);
+                it.next();
+                if d.is_ascii_alphabetic() || d == '%' {
+                    break;
+                }
+            }
+            if spec == "%" {
+                lit.push('%');
+                continue;
+            }
+            if !lit.is_empty() {
+                pieces.push(FmtPiece::Lit(std::mem::take(&mut lit)));
+            }
+            let Some(v) = vals.get(k) else {
+                return Err(Diag::new(*fsp, format!("`%{spec}` has no argument: {} given", vals.len())));
+            };
+            let t = self.resolve(&v.ty);
+            let bad = |what: &str| Diag::new(v.span, format!("`%{spec}` needs {what}, got {}", t.show()));
+            let piece = match spec.as_str() {
+                "d" | "i" => {
+                    if t != Ty::Int {
+                        return Err(bad("an Int"));
+                    }
+                    FmtPiece::Int(k)
+                }
+                "s" => {
+                    if t != Ty::Str {
+                        return Err(bad("a Str (use `%v` for any value)"));
+                    }
+                    FmtPiece::Str(k)
+                }
+                "v" => {
+                    if !matches!(t, Ty::Int | Ty::Float | Ty::Str | Ty::Bool) {
+                        return Err(bad("an Int, Float, Str or Bool"));
+                    }
+                    FmtPiece::Str(k)
+                }
+                "t" => {
+                    if t != Ty::Bool {
+                        return Err(bad("a Bool"));
+                    }
+                    FmtPiece::Str(k)
+                }
+                _ if spec.ends_with('f') && (spec == "f" || (spec.starts_with('.') && spec[1..spec.len() - 1].parse::<u32>().is_ok())) => {
+                    if !matches!(t, Ty::Int | Ty::Float) {
+                        return Err(bad("a number"));
+                    }
+                    let prec = if spec == "f" { 6 } else { spec[1..spec.len() - 1].parse::<u32>().unwrap().min(40) };
+                    FmtPiece::Fixed(k, prec)
+                }
+                _ => return Err(Diag::new(*fsp, format!("unsupported directive `%{spec}`")).note("supported so far (Go's fmt verbs): %v, %d, %s, %t, %f, %.Nf, %%")),
+            };
+            pieces.push(piece);
+            k += 1;
+        }
+        if !lit.is_empty() {
+            pieces.push(FmtPiece::Lit(lit));
+        }
+        if k != vals.len() {
+            return Err(Diag::new(sp, format!("`{name}`: {} directive(s) but {} argument(s)", k, vals.len())));
+        }
+        let vals = vals
+            .into_iter()
+            .enumerate()
+            .map(|(i, v)| if pieces.contains(&FmtPiece::Fixed(i, 0)) || pieces.iter().any(|p| matches!(p, FmtPiece::Fixed(j, _) if *j == i)) { self.coerce(v, &Ty::Float) } else { v })
+            .collect();
+        Ok(self.mk(TK::Format(pieces, vals), Ty::Str, sp))
+    }
+
     fn materialize_block_tail(&mut self, blk: &mut TBlock, t: Ty) -> Ty {
         if let Some(TStmt::Expr(e)) = blk.body.last_mut() {
             let m = self.materialize(e.clone());
@@ -1296,6 +1679,7 @@ impl<'w, 'a> FnCx<'w, 'a> {
         let mut cands: Vec<&str> = vec![];
         match rt {
             Ty::Int => cands.extend(INT_METHODS),
+            Ty::Float => cands.extend(FLOAT_METHODS),
             Ty::Str => cands.extend(STR_METHODS),
             Ty::Array(_) => {
                 cands.extend(SEQ_METHODS);

@@ -89,7 +89,7 @@ impl<'a> Parser<'a> {
     // ---------- module ----------
 
     fn module(&mut self, file: u32) -> PResult<Module> {
-        let mut m = Module { file, overflow: Overflow::Abort, requires: vec![], defs: vec![], main: vec![] };
+        let mut m = Module { file, overflow: Overflow::Abort, requires: vec![], defs: vec![], structs: vec![], main: vec![] };
         self.skip_newlines();
         while let Tok::Directive(name, arg) = self.peek().clone() {
             let sp = self.bump().span;
@@ -114,6 +114,7 @@ impl<'a> Parser<'a> {
                     }
                 }
                 Tok::Attr(_) | Tok::Kw(Kw::Def) => m.defs.push(self.def()?),
+                Tok::Kw(Kw::Struct) => m.structs.push(self.struct_def()?),
                 Tok::Directive(..) => return Err(Diag::new(self.span(), "directives must come first in the file")),
                 _ => {
                     let s = self.stmt()?;
@@ -173,6 +174,38 @@ impl<'a> Parser<'a> {
         let body = self.braced_stmts()?;
         self.scopes.pop();
         Ok(Def { name, span: start.to(self.prev_span()), name_span, params, ret, fallible, pure, body })
+    }
+
+    fn struct_def(&mut self) -> PResult<StructDef> {
+        let start = self.bump().span;
+        let sp = self.span();
+        let name = match self.bump().tok {
+            Tok::Const(n) => n,
+            t => return Err(Diag::new(sp, format!("expected a struct name (capitalized), found {}", describe(&t)))),
+        };
+        self.expect_op("{")?;
+        let mut fields: Vec<(String, TypeExpr, Span)> = vec![];
+        loop {
+            self.skip_newlines();
+            while self.eat_op(",") {
+                self.skip_newlines();
+            }
+            if self.eat_op("}") {
+                break;
+            }
+            let fsp = self.span();
+            let fname = match self.bump().tok {
+                Tok::Ident(n) => n,
+                t => return Err(Diag::new(fsp, format!("expected a field name, found {}", describe(&t)))),
+            };
+            self.expect_op(":")?;
+            let ty = self.type_expr()?;
+            if fields.iter().any(|(f, _, _)| *f == fname) {
+                return Err(Diag::new(fsp, format!("field `{fname}` is declared twice")));
+            }
+            fields.push((fname, ty, fsp));
+        }
+        Ok(StructDef { name, span: start.to(self.prev_span()), fields })
     }
 
     fn type_expr(&mut self) -> PResult<TypeExpr> {
@@ -235,6 +268,7 @@ impl<'a> Parser<'a> {
                 StmtKind::Return(if self.at_stmt_end() { None } else { Some(self.expr()?) })
             }
             Tok::Kw(Kw::Def) | Tok::Attr(_) => return Err(Diag::new(start, "methods can only be defined at the top level")),
+            Tok::Kw(Kw::Struct) => return Err(Diag::new(start, "structs can only be defined at the top level")),
             Tok::Ident(_) if self.is_multi_assign() => {
                 let mut targets = vec![];
                 loop {
@@ -329,7 +363,7 @@ impl<'a> Parser<'a> {
     pub fn expr(&mut self) -> PResult<Expr> {
         let lhs = self.ternary()?;
         if self.is_op("=") {
-            if !matches!(lhs.kind, ExprKind::Name(_) | ExprKind::Index(..)) {
+            if !is_place(&lhs) {
                 return Err(Diag::new(lhs.span, "cannot assign to this expression"));
             }
             self.bump();
@@ -341,7 +375,7 @@ impl<'a> Parser<'a> {
             let sp = lhs.span.to(rhs.span);
             return Ok(self.mk(ExprKind::Assign(Box::new(lhs), Box::new(rhs)), sp));
         }
-        for (tok, op) in [("+=", BinOp::Add), ("-=", BinOp::Sub), ("*=", BinOp::Mul)] {
+        for (tok, op) in [("+=", BinOp::Add), ("-=", BinOp::Sub), ("*=", BinOp::Mul), ("/=", BinOp::Div)] {
             if self.is_op(tok) {
                 self.bump();
                 let rhs = self.expr()?;
@@ -449,6 +483,9 @@ impl<'a> Parser<'a> {
             if let ExprKind::Int(v) = e.kind {
                 return Ok(self.mk(ExprKind::Int(-v), full));
             }
+            if let ExprKind::Float(v) = e.kind {
+                return Ok(self.mk(ExprKind::Float(-v), full));
+            }
             return Ok(self.mk(ExprKind::Neg(Box::new(e)), full));
         }
         if self.is_kw(Kw::Try) {
@@ -519,6 +556,14 @@ impl<'a> Parser<'a> {
                     other => return Err(Diag::new(t.span, format!("expected a method name after `&:`, found {}", describe(&other)))),
                 };
                 sym = Some((name, sp.to(t.span)));
+            } else if let (Tok::Ident(name), Tok::Op(":")) = (self.peek().clone(), self.peek_at(1).clone()) {
+                // `name: value`
+                let nsp = self.bump().span;
+                self.bump();
+                self.skip_newlines();
+                let v = self.expr()?;
+                let full = nsp.to(v.span);
+                args.push(self.mk(ExprKind::KwArg(name, nsp, Box::new(v)), full));
             } else {
                 args.push(self.expr()?);
             }
@@ -582,9 +627,11 @@ impl<'a> Parser<'a> {
             return false;
         }
         match self.peek() {
-            Tok::Int(_) | Tok::Str(_) | Tok::Ident(_) | Tok::Const(_) | Tok::Sym(_) => true,
+            Tok::Int(_) | Tok::Float(_) | Tok::Str(_) | Tok::Ident(_) | Tok::Const(_) | Tok::Sym(_) => true,
             Tok::Kw(Kw::True | Kw::False | Kw::Nil | Kw::Try) => true,
             Tok::Op("(") | Tok::Op("[") => true,
+            // `puts -x` (Ruby): a minus right before its operand starts an argument.
+            Tok::Op("-") => !self.toks[(self.pos + 1).min(self.toks.len() - 1)].space_before,
             _ => false,
         }
     }
@@ -594,6 +641,7 @@ impl<'a> Parser<'a> {
         let sp = t.span;
         Ok(match t.tok {
             Tok::Int(v) => self.mk(ExprKind::Int(v), sp),
+            Tok::Float(v) => self.mk(ExprKind::Float(v), sp),
             Tok::Str(s) => self.mk(ExprKind::Str(s), sp),
             Tok::Sym(s) => self.mk(ExprKind::Sym(s), sp),
             Tok::Kw(Kw::True) => self.mk(ExprKind::Bool(true), sp),
@@ -659,9 +707,20 @@ impl<'a> Parser<'a> {
     }
 }
 
+/// An assignable place: a name, `place[i]`, or `place.field`.
+pub fn is_place(e: &Expr) -> bool {
+    match &e.kind {
+        ExprKind::Name(_) => true,
+        ExprKind::Index(a, _) => is_place(a),
+        ExprKind::Call { recv: Some(r), args, block: None, block_sym: None, .. } if args.is_empty() => is_place(r),
+        _ => false,
+    }
+}
+
 pub fn describe(t: &Tok) -> String {
     match t {
         Tok::Int(v) => format!("`{v}`"),
+        Tok::Float(v) => format!("`{v}`"),
         Tok::Str(_) => "a string".into(),
         Tok::Ident(n) | Tok::Const(n) => format!("`{n}`"),
         Tok::Sym(s) => format!("`:{s}`"),

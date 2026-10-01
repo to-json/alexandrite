@@ -215,6 +215,26 @@ Not one problem. These are what working on twenty problems in an evening feels l
 | **Answer check** | `alx run pe010.alx --expect 142913828922` | exit code 0 if the output matches and 1 otherwise, so solutions can be checked in a loop |
 | **Oracle clean** | the CI job over all cases | rustc accepts every emitted `.rs`, and ASan/UBSan are clean |
 
+## A7: Go-class workloads (the Benchmarks Game)
+
+Alexandrite's capabilities follow Go's (GO-VS-RUBY.md). These cases are Benchmarks Game programs, single-threaded and at reduced size, written the way a Go programmer would write them, with Go, Rust and Ruby ports in `acceptance/{go,refs,ruby}/`.
+
+```
+# nbody.alx (excerpt): value structs, keyword construction, place updates
+struct Body { x: Float, y: Float, z: Float, vx: Float, vy: Float, vz: Float, mass: Float }
+bodies = [Body.new(mass: solar_mass), Body.new(x: 4.84143144246472090e+00, ...), ...]
+bodies[i].vx -= dx * bodies[j].mass * mag
+puts format("%.9f", energy(bodies))
+```
+
+| case | expected | budget |
+|---|---|---|
+| nbody (1,000,000 steps) | `-0.169075164` / `-0.169086185` (Go's output; at 1,000 steps it gives the published `-0.169087605`) | edit-to-answer < 300 ms; release ≤ 1.5x the Rust reference |
+
+**Pass if:** output matches Go's exactly (same arithmetic, same order, Go's `%.9f`), on every backend: JIT, clang debug and release, the Rust oracle, and the browser.
+
+**Exercises:** `Float` (IEEE, Go's printing and `fmt` verbs), `Math.sqrt`, value `struct`s with keyword construction and zero values, writes through places (`a[i].f op= v`), Go's literal-only Int→Float conversion.
+
 ## How far the build plan has to go
 
 | tests | earliest the build plan delivers it |
@@ -227,4 +247,4 @@ Not one problem. These are what working on twenty problems in an evening feels l
 
 **License check (all cases):** every object linked into a case's binary comes from the runtime or from vendored code on DESIGN.md's runtime license allowlist. The CI job reads a license manifest for `rt/` and fails on anything else.
 
-**The project counts as usable for day-to-day Project Euler when A1–A6 all pass on the reference machine.**
+**The project counts as usable for day-to-day Project Euler when A1–A6 all pass on the reference machine.** A7 grows as Go-class features land.

@@ -540,7 +540,7 @@ fn divmod(av: i64, ab: i64, bv: i64, bb: i64, lp: i64, ln: i64) -> (BigInt, BigI
     if b.is_zero() {
         panic_msg("division by zero", &loc(lp, ln));
     }
-    big_of(av, ab).div_mod_floor(&b)
+    big_of(av, ab).div_rem(&b) // truncating, as in Go
 }
 
 #[unsafe(no_mangle)]
@@ -641,6 +641,99 @@ pub extern "C" fn alxr_p_digits(v: i64, b: i64, lp: i64, ln: i64) {
         *word(a, 2 * k + 1) = 0;
     }
     ret(&[a as i64, n as i64, n as i64]);
+}
+
+// ---------- floats ----------
+
+/// A Float as Go's fmt prints it (see alx_f_to_s in alx.c).
+fn go_float(x: f64) -> String {
+    if x.is_nan() {
+        return "NaN".into();
+    }
+    if x.is_infinite() {
+        return if x < 0.0 { "-Inf".into() } else { "+Inf".into() };
+    }
+    if x == 0.0 {
+        return if x.is_sign_negative() { "-0".into() } else { "0".into() };
+    }
+    let e = format!("{:e}", x.abs());
+    let (mant, exp) = e.split_once('e').unwrap();
+    let exp10: i32 = exp.parse().unwrap();
+    let digits: Vec<char> = mant.chars().filter(|c| *c != '.').collect();
+    let n = digits.len() as i32;
+    let decpt = exp10 + 1;
+    let mut out = String::new();
+    if x < 0.0 {
+        out.push('-');
+    }
+    if exp10 < -4 || exp10 >= 6 {
+        out.push(digits[0]);
+        if n > 1 {
+            out.push('.');
+            out.extend(&digits[1..]);
+        }
+        out.push_str(&format!("e{}{:02}", if exp10 < 0 { '-' } else { '+' }, exp10.abs()));
+    } else if decpt <= 0 {
+        out.push_str("0.");
+        for _ in 0..-decpt {
+            out.push('0');
+        }
+        out.extend(&digits);
+    } else {
+        for i in 0..decpt {
+            out.push(if i < n { digits[i as usize] } else { '0' });
+        }
+        if n > decpt {
+            out.push('.');
+            out.extend(&digits[decpt as usize..]);
+        }
+    }
+    out
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn alxr_puts_f64(x: f64) {
+    let s = st();
+    s.out.push_str(&go_float(x));
+    s.out.push('\n');
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn alxr_f_to_s(x: f64) {
+    ret_str(go_float(x).as_bytes());
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn alxr_f_fmt(x: f64, digits: i64) {
+    let s = if x.is_nan() {
+        "NaN".to_string()
+    } else if x.is_infinite() {
+        (if x < 0.0 { "-Inf" } else { "+Inf" }).to_string()
+    } else {
+        format!("{:.*}", digits.clamp(0, 40) as usize, x)
+    };
+    ret_str(s.as_bytes());
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn alxr_f_to_i(x: f64, lp: i64, ln: i64) -> i64 {
+    if x.is_nan() || x.is_infinite() {
+        panic_msg("Float#to_i of NaN or Infinity", &loc(lp, ln));
+    }
+    if x >= 9223372036854775808.0 || x < -9223372036854775808.0 {
+        panic_msg("Float#to_i: out of Int range", &loc(lp, ln));
+    }
+    x as i64
+}
+
+/// Concatenate `n` strings stored as (ptr, len) pairs at `p`.
+#[unsafe(no_mangle)]
+pub extern "C" fn alxr_str_cat(p: i64, n: i64) {
+    let mut out = vec![];
+    for k in 0..n as usize {
+        out.extend_from_slice(bytes(*word(p as usize, 2 * k), *word(p as usize, 2 * k + 1)));
+    }
+    ret_str(&out);
 }
 
 #[unsafe(no_mangle)]

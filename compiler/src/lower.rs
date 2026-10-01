@@ -48,6 +48,8 @@ pub fn lty(t: &Ty, mode: Overflow) -> LTy {
                 LTy::I64
             }
         }
+        Ty::Float => LTy::F64,
+        Ty::Struct(_, fs) => LTy::Tup(fs.iter().map(|(_, t)| lty(t, mode)).collect()),
         Ty::Bool => LTy::Bool,
         Ty::Str => LTy::Str,
         Ty::Unit | Ty::Never | Ty::Yielder(_) | Ty::Var(_) => LTy::Unit,
@@ -217,6 +219,11 @@ impl<'a> Lw<'a> {
                             }
                         }
                     }
+                    if let TK::Array(items) = &v.kind {
+                        if !loc.pushed {
+                            self.fixed_len.insert(*l, items.len() as i64);
+                        }
+                    }
                 }
             }
         }
@@ -249,6 +256,10 @@ impl<'a> Lw<'a> {
                 }
             }
             TK::M(M::IntSqrt, None, args, _) => self.interval(&args[0]).filter(|(lo, _)| *lo >= 0).map(|(lo, hi)| (isqrt(lo), isqrt(hi))),
+            TK::M(M::Size, Some(r), _, _) => match r.kind {
+                TK::Local(l) if matches!(r.ty, Ty::Array(_)) && self.f.locals[l].reassigned == 0 => self.fixed_len.get(&l).map(|n| (*n, *n)),
+                _ => None,
+            },
             _ => None,
         }
     }
@@ -357,6 +368,9 @@ impl<'a> Lw<'a> {
     fn expr(&mut self, e: &TExpr) -> LE {
         match &e.kind {
             TK::Int(v) => self.int_out(LE::I(*v)),
+            TK::Float(v) => LE::F(*v),
+            TK::PlaceAssign(l, steps, op, v) => self.place_assign(*l, steps, *op, v, e),
+            TK::Format(pieces, args) => self.format(pieces, args),
             TK::Str(s) => LE::S(s.clone()),
             TK::Bool(b) => LE::B(*b),
             TK::Unit => LE::Unit,
@@ -385,6 +399,9 @@ impl<'a> Lw<'a> {
             TK::Bin(op, a, b) => self.binary(*op, a, b, e),
             TK::Neg(x) => {
                 let v = self.expr(x);
+                if e.ty == Ty::Float {
+                    return LE::FNeg(Box::new(v));
+                }
                 if self.promote() {
                     LE::PArith(Op::Sub, Box::new(LE::ToP(Box::new(LE::I(0)))), Box::new(v))
                 } else if self.try_arith {
@@ -521,6 +538,9 @@ impl<'a> Lw<'a> {
         let av = self.expr(a);
         let bv = self.expr(b);
         let at = self.lty(&a.ty);
+        if at == LTy::F64 {
+            return if op.is_arith() { LE::FArith(lop, Box::new(av), Box::new(bv)) } else { LE::Cmp(lop, Box::new(av), Box::new(bv), at) };
+        }
         if !op.is_arith() {
             if at == LTy::PInt {
                 return LE::PArith(lop, Box::new(av), Box::new(bv));
@@ -541,6 +561,110 @@ impl<'a> Lw<'a> {
             return LE::Arith(lop, Box::new(av), Box::new(bv), Ovf::Unchecked);
         }
         LE::Arith(lop, Box::new(av), Box::new(bv), self.ovf(e.span))
+    }
+
+    /// `place = v` / `place op= v`: index expressions are evaluated once.
+    fn place_assign(&mut self, l: LocalId, steps: &[TStep], op: Option<crate::ast::BinOp>, v: &TExpr, e: &TExpr) -> LE {
+        let var = self.var_of(l);
+        let mut lsteps = vec![];
+        for (k, st) in steps.iter().enumerate() {
+            match st {
+                TStep::Index(i) => {
+                    let check = if k == 0 {
+                        let arr_t = TExpr { kind: TK::Local(l), ty: self.f.locals[l].ty.clone(), span: e.span };
+                        self.index_check(&arr_t, i)
+                    } else {
+                        Some(self.loc(i.span))
+                    };
+                    let iv = self.expr(i);
+                    let iv = self.int_in(iv, i.span);
+                    let iv = self.bind(iv, LTy::I64);
+                    lsteps.push(Step::Index(iv, check));
+                }
+                TStep::Field(f) => lsteps.push(Step::Field(*f)),
+            }
+        }
+        let pty = self.lty(&e.ty);
+        let rhs = self.expr(v);
+        let val = match op {
+            None => rhs,
+            Some(op) => {
+                let mut cur = LE::Var(var);
+                for st in &lsteps {
+                    cur = match st {
+                        Step::Index(i, check) => LE::Index { arr: Box::new(cur), idx: Box::new(i.clone()), check: check.clone() },
+                        Step::Field(f) => LE::Field(Box::new(cur), *f),
+                    };
+                }
+                self.arith_le(op, cur, rhs, &pty, e.span)
+            }
+        };
+        let val = self.bind(val, pty);
+        if lsteps.is_empty() {
+            self.emit(LS::Set(var, val.clone()));
+        } else {
+            self.emit(LS::SetPlace { var, steps: lsteps, val: val.clone() });
+        }
+        val
+    }
+
+    /// `a op b` on already-lowered operands of type `t`.
+    fn arith_le(&mut self, op: crate::ast::BinOp, a: LE, b: LE, t: &LTy, sp: Span) -> LE {
+        use crate::ast::BinOp as B;
+        let lop = match op {
+            B::Add => Op::Add,
+            B::Sub => Op::Sub,
+            B::Mul => Op::Mul,
+            B::Div => Op::Div,
+            B::Rem => Op::Rem,
+            _ => Op::Pow,
+        };
+        match t {
+            LTy::F64 => LE::FArith(lop, Box::new(a), Box::new(b)),
+            LTy::PInt => LE::PArith(lop, Box::new(a), Box::new(b)),
+            _ if self.try_arith => {
+                let dst = self.tmp(LTy::I64);
+                let path = self.path.clone();
+                self.emit(LS::TryArith { dst, op: lop, a, b, loc: self.loc(sp), path });
+                LE::Var(dst)
+            }
+            _ => LE::Arith(lop, Box::new(a), Box::new(b), self.ovf(sp)),
+        }
+    }
+
+    /// `format(...)`: a concatenation of literal pieces and formatted arguments.
+    fn format(&mut self, pieces: &[FmtPiece], args: &[TExpr]) -> LE {
+        let vals: Vec<LE> = args
+            .iter()
+            .map(|a| {
+                let v = self.expr(a);
+                let t = self.lty(&a.ty);
+                self.bind(v, t)
+            })
+            .collect();
+        let mut parts = vec![];
+        for p in pieces {
+            parts.push(match p {
+                FmtPiece::Lit(s) => LE::S(s.clone()),
+                FmtPiece::Int(k) => self.to_s(vals[*k].clone(), &args[*k].ty),
+                FmtPiece::Str(k) => self.to_s(vals[*k].clone(), &args[*k].ty),
+                FmtPiece::Fixed(k, d) => LE::Rt(Rt::FFmt, vec![vals[*k].clone(), LE::I(*d as i64)]),
+            });
+        }
+        match parts.len() {
+            0 => LE::S(String::new()),
+            1 if matches!(parts[0], LE::S(_)) => parts.pop().unwrap(),
+            _ => LE::Rt(Rt::StrCat, parts),
+        }
+    }
+
+    fn to_s(&mut self, v: LE, t: &Ty) -> LE {
+        match t {
+            Ty::Str => v,
+            Ty::Float => LE::Rt(Rt::FToS, vec![v]),
+            Ty::Bool => LE::Cond(Box::new(v), Box::new(LE::S("true".into())), Box::new(LE::S("false".into()))),
+            _ => LE::Rt(if self.promote() { Rt::PIntToS } else { Rt::IntToS }, vec![v]),
+        }
     }
 
     // ---------- blocks ----------
@@ -680,6 +804,24 @@ impl<'a> Lw<'a> {
                 let fill = self.expr(&args[1]);
                 let el = self.lty(&args[1].ty);
                 LE::ArrNew(el, Box::new(n), Box::new(fill), self.loc(sp))
+            }
+            ToF => {
+                let r = recv.unwrap();
+                let v = self.expr(r);
+                let v = self.int_in(v, r.span);
+                LE::Rt(Rt::IntToF, vec![v])
+            }
+            FloatToI => {
+                let v = self.expr(recv.unwrap());
+                self.int_out(LE::Rt(Rt::FToI, vec![v, LE::Loc(self.loc(sp))]))
+            }
+            FloatAbs => LE::Rt(Rt::FAbs, vec![self.expr(recv.unwrap())]),
+            FloatToS => LE::Rt(Rt::FToS, vec![self.expr(recv.unwrap())]),
+            Sqrt => LE::Rt(Rt::FSqrt, vec![self.expr(&args[0])]),
+            StructNew => {
+                let t = self.lty(&e.ty);
+                let vs = args.iter().map(|a| self.arg(a)).collect();
+                LE::Tup(t, vs)
             }
             TupleGet(k) => {
                 let v = self.expr(recv.unwrap());
@@ -830,7 +972,7 @@ impl<'a> Lw<'a> {
         let acc = match term {
             Sum => {
                 let v = self.tmp(out_ty.clone());
-                let z = self.int_out(LE::I(0));
+                let z = if out_ty == LTy::F64 { LE::F(0.0) } else { self.int_out(LE::I(0)) };
                 self.emit(LS::Set(v, z));
                 Some(v)
             }
@@ -895,7 +1037,9 @@ impl<'a> Lw<'a> {
                         (Some(n), Some((lo, hi))) => lo.unsigned_abs().max(hi.unsigned_abs()).checked_mul(n as u64).is_some_and(|m| m < i64::MAX as u64),
                         _ => false,
                     };
-                    let sum = if lw.promote() {
+                    let sum = if out_ty == LTy::F64 {
+                        LE::FArith(Op::Add, Box::new(LE::Var(a)), Box::new(v))
+                    } else if lw.promote() {
                         LE::PArith(Op::Add, Box::new(LE::Var(a)), Box::new(v))
                     } else if proven {
                         LE::Arith(Op::Add, Box::new(LE::Var(a)), Box::new(v), Ovf::Unchecked)
@@ -1449,7 +1593,16 @@ fn collect_locals(e: &TExpr, out: &mut Vec<LocalId>) {
             collect_locals(b, out);
             collect_locals(c, out);
         }
-        TK::Call(_, xs) | TK::Array(xs) => xs.iter().for_each(|x| collect_locals(x, out)),
+        TK::Call(_, xs) | TK::Array(xs) | TK::Format(_, xs) => xs.iter().for_each(|x| collect_locals(x, out)),
+        TK::PlaceAssign(l, steps, _, v) => {
+            out.push(*l);
+            for st in steps {
+                if let TStep::Index(i) = st {
+                    collect_locals(i, out);
+                }
+            }
+            collect_locals(v, out);
+        }
         TK::M(_, r, xs, b) => {
             if let Some(r) = r {
                 collect_locals(r, out);

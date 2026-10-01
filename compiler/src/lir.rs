@@ -4,6 +4,8 @@
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub enum LTy {
     I64,
+    /// Float: an IEEE double.
+    F64,
     /// Int in a `#![overflow(promote)]` file: small or bignum.
     PInt,
     Bool,
@@ -57,6 +59,7 @@ pub enum Ovf {
 pub enum LE {
     Var(V),
     I(i64),
+    F(f64),
     B(bool),
     S(String),
     /// A source location string (C: `const char *`).
@@ -71,6 +74,9 @@ pub enum LE {
     /// Comparisons and boolean ops (no overflow possible), any scalar type.
     Cmp(Op, Box<LE>, Box<LE>, LTy),
     Neg(Box<LE>, Ovf),
+    /// Float arithmetic (IEEE: never fails).
+    FArith(Op, Box<LE>, Box<LE>),
+    FNeg(Box<LE>),
     Not(Box<LE>),
     Cond(Box<LE>, Box<LE>, Box<LE>),
     /// Call a non-fallible user function.
@@ -115,6 +121,25 @@ pub enum Rt {
     Even,
     PEven,
     PToI64,
+    /// Int → Float
+    IntToF,
+    /// Float → Int: (x, loc); truncates, fails on NaN/inf/out of range.
+    FToI,
+    FSqrt,
+    FAbs,
+    /// Float#to_s, as Ruby prints it.
+    FToS,
+    /// (x, digits): fixed notation, `%.Nf`.
+    FFmt,
+    /// Concatenate all argument strings.
+    StrCat,
+}
+
+/// A step of an assignable place.
+#[derive(Clone, Debug)]
+pub enum Step {
+    Index(LE, Option<String>),
+    Field(usize),
 }
 
 #[derive(Clone, Debug)]
@@ -129,6 +154,8 @@ pub enum ErrPath {
 pub enum LS {
     Set(V, LE),
     SetIndex { arr: V, idx: LE, val: LE, check: Option<String> },
+    /// `var[i].f... = val`: a write through index and field steps.
+    SetPlace { var: V, steps: Vec<Step>, val: LE },
     Push(V, LE),
     Eval(LE),
     If(LE, Vec<LS>, Vec<LS>),

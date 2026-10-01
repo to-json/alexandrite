@@ -11,6 +11,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <math.h>
 
 typedef struct { const char *ptr; int64_t len; } AlxStr;
 typedef struct { int64_t lo, hi; bool excl; } AlxRange;
@@ -65,17 +66,12 @@ static inline int64_t alx_mul(int64_t a, int64_t b, const char *loc) { int64_t r
 static inline int64_t alx_div(int64_t a, int64_t b, const char *loc) {
     if (b == 0) alx_panic("division by zero", loc);
     if (a == INT64_MIN && b == -1) alx_overflow(loc);
-    /* Ruby semantics: floor division. */
-    int64_t q = a / b;
-    if ((a % b != 0) && ((a < 0) != (b < 0))) q -= 1;
-    return q;
+    return a / b; /* truncates, as in Go */
 }
 static inline int64_t alx_rem(int64_t a, int64_t b, const char *loc) {
     if (b == 0) alx_panic("division by zero", loc);
     if (b == -1) return 0;
-    int64_t r = a % b;
-    if (r != 0 && ((r < 0) != (b < 0))) r += b;
-    return r;
+    return a % b; /* sign of the dividend, as in Go */
 }
 static inline int64_t alx_neg(int64_t a, const char *loc) { if (a == INT64_MIN) alx_overflow(loc); return -a; }
 int64_t alx_pow(int64_t a, int64_t b, const char *loc);
@@ -84,17 +80,13 @@ static inline bool alx_try_sub(int64_t a, int64_t b, int64_t *r) { return !__bui
 static inline bool alx_try_mul(int64_t a, int64_t b, int64_t *r) { return !__builtin_mul_overflow(a, b, r); }
 static inline bool alx_try_div(int64_t a, int64_t b, int64_t *r) {
     if (b == 0 || (a == INT64_MIN && b == -1)) return false;
-    int64_t q = a / b;
-    if ((a % b != 0) && ((a < 0) != (b < 0))) q -= 1;
-    *r = q;
+    *r = a / b;
     return true;
 }
 static inline bool alx_try_rem(int64_t a, int64_t b, int64_t *r) {
     if (b == 0) return false;
     if (b == -1) { *r = 0; return true; }
-    int64_t m = a % b;
-    if (m != 0 && ((m < 0) != (b < 0))) m += b;
-    *r = m;
+    *r = a % b;
     return true;
 }
 bool alx_try_pow(int64_t a, int64_t b, int64_t *r);
@@ -224,6 +216,13 @@ int alx_p_cmp(AlxPInt a, AlxPInt b);
 bool alx_p_even(AlxPInt a);
 AlxStr alx_p_to_s(AlxPInt a);
 int64_t alx_p_ndigits(AlxPInt a);
+
+/* ---------- floats ---------- */
+AlxStr alx_f_to_s(double x);
+AlxStr alx_f_fmt(double x, int64_t digits);
+int64_t alx_f_to_i(double x, const char *loc);
+void alx_puts_f64(double x);
+AlxStr alx_str_cat(int64_t n, const AlxStr *parts);
 Arr_PInt alx_p_digits(AlxPInt a, const char *loc);
 
 #endif

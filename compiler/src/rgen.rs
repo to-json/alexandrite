@@ -10,6 +10,7 @@ const PRELUDE: &str = include_str!("../runtime/prelude.rs");
 fn rty(t: &LTy) -> String {
     match t {
         LTy::I64 => "i64".into(),
+        LTy::F64 => "f64".into(),
         LTy::PInt => "PInt".into(),
         LTy::Bool => "bool".into(),
         LTy::Str => "Str".into(),
@@ -22,7 +23,7 @@ fn rty(t: &LTy) -> String {
 }
 
 fn is_copy(t: &LTy) -> bool {
-    matches!(t, LTy::I64 | LTy::Bool | LTy::Unit | LTy::Range)
+    matches!(t, LTy::I64 | LTy::F64 | LTy::Bool | LTy::Unit | LTy::Range)
 }
 
 fn lit(s: &str) -> String {
@@ -168,6 +169,26 @@ impl FnEmit<'_> {
                 };
                 self.line(&format!("{{ let i_ = {at}; v{arr}[i_] = {x}; }}"));
             }
+            LS::SetPlace { var, steps, val } => {
+                // Indices first (each bounds-checked against the array it
+                // indexes), then one write: keeps the borrow checker happy.
+                let mut code = format!("{{ let x_ = {};", self.e(val));
+                let mut lv = format!("v{var}");
+                for (k, st) in steps.iter().enumerate() {
+                    lv = match st {
+                        Step::Index(i, check) => {
+                            let at = match check {
+                                Some(l) => format!("idx({}, {lv}.len(), {})", self.e(i), loc(l)),
+                                None => format!("({}) as usize", self.e(i)),
+                            };
+                            code.push_str(&format!(" let i{k}_ = {at};"));
+                            format!("{lv}[i{k}_]")
+                        }
+                        Step::Field(f) => format!("{lv}.{f}"),
+                    };
+                }
+                self.line(&format!("{code} {lv} = x_; }}"));
+            }
             LS::Push(v, e) => {
                 let x = self.e(e);
                 self.line(&format!("{{ let x_ = {x}; v{v}.push(x_); }}"));
@@ -266,6 +287,7 @@ impl FnEmit<'_> {
                 let x = self.e(e);
                 match t {
                     LTy::I64 => self.line(&format!("puts_i64({x});")),
+                    LTy::F64 => self.line(&format!("puts_str(f_to_s({x}));")),
                     LTy::Str => self.line(&format!("puts_str({x});")),
                     LTy::Bool => self.line(&format!("puts_bool({x});")),
                     LTy::PInt => self.line(&format!("puts_pint({x});")),
@@ -299,6 +321,25 @@ impl FnEmit<'_> {
                     format!("({i}i64)")
                 }
             }
+            LE::F(v) => {
+                if v.is_nan() {
+                    "f64::NAN".into()
+                } else if v.is_infinite() {
+                    if *v > 0.0 { "f64::INFINITY".into() } else { "f64::NEG_INFINITY".into() }
+                } else {
+                    format!("({v:?}f64)")
+                }
+            }
+            LE::FArith(op, a, b) => {
+                let sym = match op {
+                    Op::Add => "+",
+                    Op::Sub => "-",
+                    Op::Mul => "*",
+                    _ => "/",
+                };
+                format!("(({}) {sym} ({}))", self.e(a), self.e(b))
+            }
+            LE::FNeg(x) => format!("(-({}))", self.e(x)),
             LE::B(b) => b.to_string(),
             LE::S(s) => format!("Str::lit({})", lit(s)),
             LE::Loc(s) => loc(s),
@@ -398,6 +439,13 @@ impl FnEmit<'_> {
                     Rt::Even => call("even"),
                     Rt::PEven => format!("({}).even()", a[0]),
                     Rt::PToI64 => format!("({}).to_i64({})", a[0], a[1]),
+                    Rt::IntToF => format!("(({}) as f64)", a[0]),
+                    Rt::FToI => call("f_to_i"),
+                    Rt::FSqrt => format!("({}).sqrt()", a[0]),
+                    Rt::FAbs => format!("({}).abs()", a[0]),
+                    Rt::FToS => call("f_to_s"),
+                    Rt::FFmt => call("f_fmt"),
+                    Rt::StrCat => format!("str_cat(vec![{}])", a.join(", ")),
                 }
             }
             LE::Index { arr, idx, check } => {

@@ -23,6 +23,7 @@ use wasm_encoder::{
 
 const W: ValType = ValType::I64;
 const I: ValType = ValType::I32;
+const D: ValType = ValType::F64;
 
 /// Runtime entry points: name and signature ("args>results", j = i64, i = i32).
 const RT: &[(&str, &str)] = &[
@@ -70,11 +71,20 @@ const RT: &[(&str, &str)] = &[
     ("alxr_p_ndigits", "jj>j"),
     ("alxr_p_digits", "jjjj>"),
     ("alxr_puts_pint", "jj>"),
+    ("alxr_puts_f64", "f>"),
+    ("alxr_f_to_s", "f>"),
+    ("alxr_f_fmt", "fj>"),
+    ("alxr_f_to_i", "fjj>j"),
+    ("alxr_str_cat", "jj>"),
 ];
 
 fn sig_of(s: &str) -> (Vec<ValType>, Vec<ValType>) {
     let (a, r) = s.split_once('>').unwrap();
-    let t = |c: char| if c == 'j' { W } else { I };
+    let t = |c: char| match c {
+        'j' => W,
+        'f' => D,
+        _ => I,
+    };
     (a.chars().map(t).collect(), r.chars().map(t).collect())
 }
 
@@ -84,6 +94,8 @@ enum F {
     Wd,
     /// 1 byte in memory, i32 in locals (bool).
     By,
+    /// 8-byte IEEE double.
+    Fl,
 }
 
 impl F {
@@ -91,6 +103,7 @@ impl F {
         match self {
             F::Wd => W,
             F::By => I,
+            F::Fl => D,
         }
     }
 }
@@ -105,6 +118,7 @@ fn lay(t: &LTy) -> Lay {
     let words = |n: u32| Lay { size: 8 * n, align: 8, fields: (0..n).map(|i| (8 * i, F::Wd)).collect() };
     match t {
         LTy::I64 | LTy::Gen(_) => words(1),
+        LTy::F64 => Lay { size: 8, align: 8, fields: vec![(0, F::Fl)] },
         LTy::PInt | LTy::Str => words(2),
         LTy::Arr(_) => words(3),
         LTy::Bool => Lay { size: 1, align: 1, fields: vec![(0, F::By)] },
@@ -344,7 +358,7 @@ struct Fx<'c, 'p> {
 }
 
 fn mem(off: u32, f: F) -> MemArg {
-    MemArg { offset: off as u64, align: if f == F::Wd { 3 } else { 0 }, memory_index: 0 }
+    MemArg { offset: off as u64, align: if f == F::By { 0 } else { 3 }, memory_index: 0 }
 }
 
 impl<'c, 'p> Fx<'c, 'p> {
@@ -441,11 +455,11 @@ impl<'c, 'p> Fx<'c, 'p> {
 
     fn zeros(&mut self, ts: &[ValType]) {
         for t in ts {
-            if *t == W {
-                self.ins().i64_const(0);
-            } else {
-                self.ins().i32_const(0);
-            }
+            match *t {
+                W => self.ins().i64_const(0),
+                D => self.ins().f64_const(0.0.into()),
+                _ => self.ins().i32_const(0),
+            };
         }
     }
 
@@ -459,6 +473,7 @@ impl<'c, 'p> Fx<'c, 'p> {
             match f {
                 F::Wd => self.ins().i64_load(mem(off + o, f)),
                 F::By => self.ins().i32_load8_u(mem(off + o, f)),
+                F::Fl => self.ins().f64_load(mem(off + o, f)),
             };
         }
     }
@@ -470,6 +485,7 @@ impl<'c, 'p> Fx<'c, 'p> {
             match f {
                 F::Wd => self.ins().i64_store(mem(off + o, f)),
                 F::By => self.ins().i32_store8(mem(off + o, f)),
+                F::Fl => self.ins().f64_store(mem(off + o, f)),
             };
         }
     }
@@ -695,6 +711,49 @@ impl<'c, 'p> Fx<'c, 'p> {
                 let addr = self.elem_addr(a[0], a[1], i, &et, check.as_deref());
                 self.store(&et, addr, 0, &x);
             }
+            LS::SetPlace { var, steps, val } => {
+                let x = self.eval_locals(val);
+                // Through the variable's own locals until the first index,
+                // then through memory.
+                let mut ty = self.f.vars[*var].ty.clone();
+                let mut start = 0usize;
+                let mut mem: Option<(u32, u32)> = None;
+                for st in steps {
+                    match st {
+                        Step::Field(k) => {
+                            let LTy::Tup(ts) = ty.clone() else { panic!("wasmgen: field of {ty:?}") };
+                            match &mut mem {
+                                None => start += ts[..*k].iter().map(|t| vts(t).len()).sum::<usize>(),
+                                Some((_, off)) => *off += field_offset(&ty, *k),
+                            }
+                            ty = ts[*k].clone();
+                        }
+                        Step::Index(i, check) => {
+                            let a = match mem {
+                                None => self.vars[*var][start..start + 3].to_vec(),
+                                Some((addr, off)) => {
+                                    self.load(&ty, addr, off);
+                                    self.pop(&[W, W, W])
+                                }
+                            };
+                            let iv = self.eval_locals(i)[0];
+                            let et = elem(&ty).clone();
+                            let addr = self.elem_addr(a[0], a[1], iv, &et, check.as_deref());
+                            mem = Some((addr, 0));
+                            ty = et;
+                        }
+                    }
+                }
+                match mem {
+                    None => {
+                        let dst = self.vars[*var][start..start + x.len()].to_vec();
+                        for (d, s) in dst.iter().zip(&x) {
+                            self.ins().local_get(*s).local_set(*d);
+                        }
+                    }
+                    Some((addr, off)) => self.store(&ty, addr, off, &x),
+                }
+            }
             LS::Push(v, e) => {
                 let et = elem(&self.f.vars[*v].ty).clone();
                 let esz = lay(&et).size as i64;
@@ -902,6 +961,7 @@ impl<'c, 'p> Fx<'c, 'p> {
                 self.e(e);
                 match t {
                     LTy::I64 => self.rt("alxr_puts_i64"),
+                    LTy::F64 => self.rt("alxr_puts_f64"),
                     LTy::Str => self.rt("alxr_puts_str"),
                     LTy::Bool => self.rt("alxr_puts_bool"),
                     LTy::PInt => self.rt("alxr_puts_pint"),
@@ -981,21 +1041,18 @@ impl<'c, 'p> Fx<'c, 'p> {
         }
     }
 
-    /// Push floor a / b or floor a % b; b != 0, and not (Div) MIN / -1.
+    /// Push truncating a / b or a % b (Go); b != 0, and not (Div) MIN / -1.
     fn floor_divrem(&mut self, op: Op, a: u32, b: u32) {
-        let (bs, q, r, adj) = (self.local(W), self.local(W), self.local(W), self.local(I));
+        let bs = self.local(W);
         // b == -1 → divide by 1 (avoids the MIN % -1 trap), then fix up.
         self.ins().i64_const(1).local_get(b).local_get(b).i64_const(-1).i64_eq().select().local_set(bs);
-        self.ins().local_get(a).local_get(bs).i64_div_s().local_set(q);
-        self.ins().local_get(a).local_get(q).local_get(bs).i64_mul().i64_sub().local_set(r);
-        self.ins().local_get(r).i64_const(0).i64_ne().local_get(r).local_get(b).i64_xor().i64_const(0).i64_lt_s().i32_and().local_set(adj);
         if op == Op::Div {
             self.ins().i64_const(0).local_get(a).i64_sub();
-            self.ins().local_get(q).local_get(adj).i64_extend_i32_u().i64_sub();
+            self.ins().local_get(a).local_get(bs).i64_div_s();
             self.ins().local_get(b).i64_const(-1).i64_eq().select();
         } else {
             self.ins().i64_const(0);
-            self.ins().local_get(r).local_get(b).i64_add().local_get(r).local_get(adj).select();
+            self.ins().local_get(a).local_get(bs).i64_rem_s();
             self.ins().local_get(b).i64_const(-1).i64_eq().select();
         }
     }
@@ -1008,12 +1065,17 @@ impl<'c, 'p> Fx<'c, 'p> {
             Ovf::Unchecked => "proven".into(),
         };
         if matches!(op, Op::Div | Op::Rem) {
-            if let Some(k) = konst.filter(|k| *k > 0 && (*k as u64).is_power_of_two()) {
+            if let Some(k) = konst.filter(|k| *k > 1 && (*k as u64).is_power_of_two()) {
+                // Truncating division by 2^s: bias negatives by 2^s - 1, then shift.
+                let sh = k.trailing_zeros() as i64;
                 self.e(a);
+                let x = self.pop(&[W])[0];
+                let q = self.local(W);
+                self.ins().local_get(x).local_get(x).i64_const(63).i64_shr_s().i64_const(64 - sh).i64_shr_u().i64_add().i64_const(sh).i64_shr_s().local_set(q);
                 if op == Op::Div {
-                    self.ins().i64_const(k.trailing_zeros() as i64).i64_shr_s();
+                    self.ins().local_get(q);
                 } else {
-                    self.ins().i64_const(k - 1).i64_and();
+                    self.ins().local_get(x).local_get(q).i64_const(sh).i64_shl().i64_sub();
                 }
                 return;
             }
@@ -1093,6 +1155,7 @@ impl<'c, 'p> Fx<'c, 'p> {
         match e {
             LE::Var(v) => self.f.vars[*v].ty.clone(),
             LE::I(_) | LE::Arith(..) | LE::Neg(..) | LE::Len(_) => LTy::I64,
+            LE::F(_) | LE::FArith(..) | LE::FNeg(_) => LTy::F64,
             LE::Loc(_) | LE::S(_) => LTy::Str,
             LE::B(_) | LE::Cmp(..) | LE::Not(_) => LTy::Bool,
             LE::Unit => LTy::Unit,
@@ -1108,7 +1171,8 @@ impl<'c, 'p> Fx<'c, 'p> {
             LE::Cond(_, a, _) => self.ty(a),
             LE::Call(f, _) => self.cx.funcs[f.as_str()].1.ret.clone(),
             LE::Rt(r, args) => match r {
-                Rt::IntToS | Rt::PIntToS | Rt::StrRev | Rt::StrDelete => LTy::Str,
+                Rt::IntToS | Rt::PIntToS | Rt::StrRev | Rt::StrDelete | Rt::FToS | Rt::FFmt | Rt::StrCat => LTy::Str,
+                Rt::IntToF | Rt::FSqrt | Rt::FAbs => LTy::F64,
                 Rt::StrByte => {
                     if matches!(args[2], LE::I(0)) {
                         LTy::I64
@@ -1149,6 +1213,23 @@ impl<'c, 'p> Fx<'c, 'p> {
                 self.get(&ls);
             }
             LE::I(i) => self.i64c(*i),
+            LE::F(v) => {
+                self.ins().f64_const((*v).into());
+            }
+            LE::FArith(op, a, b) => {
+                self.e(a);
+                self.e(b);
+                match op {
+                    Op::Add => self.ins().f64_add(),
+                    Op::Sub => self.ins().f64_sub(),
+                    Op::Mul => self.ins().f64_mul(),
+                    _ => self.ins().f64_div(),
+                };
+            }
+            LE::FNeg(x) => {
+                self.e(x);
+                self.ins().f64_neg();
+            }
             LE::B(b) => {
                 self.ins().i32_const(*b as i32);
             }
@@ -1158,6 +1239,17 @@ impl<'c, 'p> Fx<'c, 'p> {
                 for v in vs {
                     self.e(v);
                 }
+            }
+            LE::Field(x, i) if matches!(**x, LE::Index { .. }) => {
+                // An element's field: load just that field.
+                let LE::Index { arr, idx, check } = &**x else { unreachable!() };
+                let et = elem(&self.ty(arr)).clone();
+                let a = self.eval_locals(arr);
+                let iv = self.eval_locals(idx)[0];
+                let addr = self.elem_addr(a[0], a[1], iv, &et, check.as_deref());
+                let LTy::Tup(ts) = &et else { unreachable!() };
+                let off = field_offset(&et, *i);
+                self.load(&ts[*i].clone(), addr, off);
             }
             LE::Field(x, i) => {
                 let LTy::Tup(ts) = self.ty(x) else { unreachable!() };
@@ -1237,6 +1329,18 @@ impl<'c, 'p> Fx<'c, 'p> {
                     self.e(b);
                     self.rt("alxr_p_cmp");
                     self.cmp0(*op);
+                }
+                (_, LTy::F64) => {
+                    self.e(a);
+                    self.e(b);
+                    match op {
+                        Op::Eq => self.ins().f64_eq(),
+                        Op::Ne => self.ins().f64_ne(),
+                        Op::Lt => self.ins().f64_lt(),
+                        Op::Le => self.ins().f64_le(),
+                        Op::Gt => self.ins().f64_gt(),
+                        _ => self.ins().f64_ge(),
+                    };
                 }
                 (_, LTy::Bool) => {
                     self.e(a);
@@ -1476,6 +1580,49 @@ impl<'c, 'p> Fx<'c, 'p> {
             }
             Rt::PEven => call(self, "alxr_p_even"),
             Rt::PToI64 => call(self, "alxr_p_to_i64"),
+            Rt::IntToF => {
+                self.e(&args[0]);
+                self.ins().f64_convert_i64_s();
+            }
+            Rt::FToI => call(self, "alxr_f_to_i"),
+            Rt::FSqrt => {
+                self.e(&args[0]);
+                self.ins().f64_sqrt();
+            }
+            Rt::FAbs => {
+                self.e(&args[0]);
+                self.ins().f64_abs();
+            }
+            Rt::FToS => call_ret(self, "alxr_f_to_s", 2),
+            Rt::FFmt => call_ret(self, "alxr_f_fmt", 2),
+            Rt::StrCat => {
+                let p = self.local(W);
+                self.ins().i64_const(16 * args.len() as i64);
+                self.rt("alxr_alloc");
+                self.ins().local_set(p);
+                for (k, a) in args.iter().enumerate() {
+                    let v = self.eval_locals(a);
+                    self.store(&LTy::Str, p, 16 * k as u32, &v);
+                }
+                self.ins().local_get(p).i64_const(args.len() as i64);
+                self.rt("alxr_str_cat");
+                self.ret_words(2);
+            }
         }
     }
+}
+
+/// Byte offset of field `k` of a tuple type (C layout).
+fn field_offset(t: &LTy, k: usize) -> u32 {
+    let LTy::Tup(ts) = t else { panic!("wasmgen: field of {t:?}") };
+    let mut off = 0u32;
+    for (i, ft) in ts.iter().enumerate() {
+        let l = lay(ft);
+        off = off.next_multiple_of(l.align);
+        if i == k {
+            return off;
+        }
+        off += l.size;
+    }
+    unreachable!()
 }

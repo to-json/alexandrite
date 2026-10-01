@@ -87,3 +87,10 @@ void alxj_p_to_s(AlxStr *out, const AlxPInt *a) { *out = alx_p_to_s(*a); }
 int64_t alxj_p_ndigits(const AlxPInt *a) { return alx_p_ndigits(*a); }
 void alxj_p_digits(Arr_PInt *out, const AlxPInt *a, const char *loc) { *out = alx_p_digits(*a, loc); }
 void alxj_puts_pint(const AlxPInt *a) { alx_puts_pint(*a); }
+
+/* ---------- floats ---------- */
+void alxj_puts_f64(double x) { alx_puts_f64(x); }
+void alxj_f_to_s(AlxStr *out, double x) { *out = alx_f_to_s(x); }
+void alxj_f_fmt(AlxStr *out, double x, int64_t digits) { *out = alx_f_fmt(x, digits); }
+int64_t alxj_f_to_i(double x, const char *loc) { return alx_f_to_i(x, loc); }
+void alxj_str_cat(AlxStr *out, const AlxStr *parts, int64_t n) { *out = alx_str_cat(n, parts); }

@@ -88,27 +88,18 @@ int alx_p_cmp(AlxPInt a, AlxPInt b) {
     return o == MP_LT ? -1 : o == MP_GT ? 1 : 0;
 }
 
-/* Floor division and modulo (Ruby semantics). */
+/* Truncating division and remainder (Go semantics). */
 static void divmod(AlxPInt a, AlxPInt b, const char *loc, AlxPInt *q, AlxPInt *m) {
     if (!b.big && b.v == 0) alx_panic("division by zero", loc);
     if (!a.big && !b.big && !(a.v == INT64_MIN && b.v == -1)) {
-        int64_t qq = a.v / b.v, mm = a.v % b.v;
-        if (mm != 0 && ((mm < 0) != (b.v < 0))) {
-            qq -= 1;
-            mm += b.v;
-        }
-        *q = alx_p_from(qq);
-        *m = alx_p_from(mm);
+        *q = alx_p_from(a.v / b.v);
+        *m = alx_p_from(a.v % b.v);
         return;
     }
     mp_int ta, tb;
     const mp_int *x = as_mp(a, &ta), *y = as_mp(b, &tb);
     AlxBig *bq = new_big(), *br = new_big();
-    check(mp_div(x, y, &bq->m, &br->m));
-    if (!mp_iszero(&br->m) && (mp_isneg(&br->m) != mp_isneg(y))) {
-        check(mp_sub_d(&bq->m, 1, &bq->m));
-        check(mp_add(&br->m, y, &br->m));
-    }
+    check(mp_div(x, y, &bq->m, &br->m)); /* truncating */
     release(a, &ta);
     release(b, &tb);
     *q = normalize(bq);

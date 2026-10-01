@@ -7,6 +7,7 @@ use std::fmt::Write;
 pub fn ty_name(t: &LTy) -> String {
     match t {
         LTy::I64 => "I64".into(),
+        LTy::F64 => "F64".into(),
         LTy::PInt => "PInt".into(),
         LTy::Bool => "Bool".into(),
         LTy::Str => "Str".into(),
@@ -21,6 +22,7 @@ pub fn ty_name(t: &LTy) -> String {
 pub fn cty(t: &LTy) -> String {
     match t {
         LTy::I64 => "int64_t".into(),
+        LTy::F64 => "double".into(),
         LTy::PInt => "AlxPInt".into(),
         LTy::Bool => "bool".into(),
         LTy::Str => "AlxStr".into(),
@@ -34,6 +36,7 @@ pub fn cty(t: &LTy) -> String {
 fn zero(t: &LTy) -> String {
     match t {
         LTy::I64 | LTy::Unit => "0".into(),
+        LTy::F64 => "0.0".into(),
         LTy::Bool => "false".into(),
         LTy::Gen(_) => "NULL".into(),
         t => format!("({}){{0}}", cty(t)),
@@ -300,6 +303,18 @@ impl FnEmit<'_> {
                     None => self.line(&format!("{a}.ptr[{i}] = {x};")),
                 }
             }
+            LS::SetPlace { var, steps, val } => {
+                let mut lv = self.v(*var);
+                for st in steps {
+                    lv = match st {
+                        Step::Index(i, Some(loc)) => format!("ALX_IDX_SET({lv}, {}, {})", self.e(i), c_str(loc)),
+                        Step::Index(i, None) => format!("({lv}).ptr[{}]", self.e(i)),
+                        Step::Field(k) => format!("({lv}).f{k}"),
+                    };
+                }
+                let x = self.e(val);
+                self.line(&format!("{lv} = {x};"));
+            }
             LS::Push(v, e) => {
                 let ty = ty_name(&self.f.vars[*v].ty);
                 let x = self.e(e);
@@ -433,6 +448,7 @@ impl FnEmit<'_> {
                 let x = self.e(e);
                 let f = match t {
                     LTy::I64 => "alx_puts_i64",
+                    LTy::F64 => "alx_puts_f64",
                     LTy::Str => "alx_puts_str",
                     LTy::Bool => "alx_puts_bool",
                     LTy::PInt => "alx_puts_pint",
@@ -473,6 +489,17 @@ impl FnEmit<'_> {
                     format!("INT64_C({i})")
                 }
             }
+            LE::F(v) => c_double(*v),
+            LE::FArith(op, a, b) => {
+                let sym = match op {
+                    Op::Add => "+",
+                    Op::Sub => "-",
+                    Op::Mul => "*",
+                    _ => "/",
+                };
+                format!("({} {sym} {})", self.e(a), self.e(b))
+            }
+            LE::FNeg(x) => format!("(-{})", self.e(x)),
             LE::B(b) => if *b { "true" } else { "false" }.into(),
             LE::S(s) => format!("alx_str_lit({}, {})", c_str(s), s.len()),
             LE::Loc(s) => c_str(s),
@@ -598,6 +625,13 @@ impl FnEmit<'_> {
                     Rt::Even => s("alx_even"),
                     Rt::PEven => s("alx_p_even"),
                     Rt::PToI64 => s("alx_p_to_i64"),
+                    Rt::IntToF => format!("((double)({}))", a[0]),
+                    Rt::FToI => s("alx_f_to_i"),
+                    Rt::FSqrt => s("sqrt"),
+                    Rt::FAbs => s("fabs"),
+                    Rt::FToS => s("alx_f_to_s"),
+                    Rt::FFmt => s("alx_f_fmt"),
+                    Rt::StrCat => format!("alx_str_cat({}, (AlxStr[]){{{}}})", a.len(), a.join(", ")),
                 }
             }
             LE::Index { arr, idx, check } => {
@@ -636,5 +670,17 @@ pub fn palindrome_test<'a>(a: &'a LE, b: &'a LE) -> Option<&'a LE> {
         Some(b)
     } else {
         None
+    }
+}
+
+/// A C double literal (the lexer can produce infinities from huge literals).
+fn c_double(v: f64) -> String {
+    if v.is_nan() {
+        "NAN".into()
+    } else if v.is_infinite() {
+        if v > 0.0 { "INFINITY".into() } else { "(-INFINITY)".into() }
+    } else {
+        // Debug is the shortest round-trip form, always with `.` or `e`.
+        format!("({v:?})")
     }
 }

@@ -79,7 +79,15 @@ fn each_child(e: &TExpr, f: &mut dyn FnMut(&TExpr)) {
             f(a);
             f(b);
         }
-        TK::Call(_, args) | TK::Array(args) => args.iter().for_each(f),
+        TK::Call(_, args) | TK::Array(args) | TK::Format(_, args) => args.iter().for_each(f),
+        TK::PlaceAssign(_, steps, _, v) => {
+            for st in steps {
+                if let TStep::Index(i) = st {
+                    f(i);
+                }
+            }
+            f(v);
+        }
         TK::M(_, r, args, blk) => {
             if let Some(r) = r {
                 f(r);
@@ -186,6 +194,10 @@ impl Prover<'_> {
                 }
                 return self.children_of_arith(e, under_try);
             }
+            TK::PlaceAssign(_, steps, op, _) if !under_try && (steps.iter().any(|s| matches!(s, TStep::Index(_))) || matches!(op, Some(o) if o.is_arith() && e.ty == Ty::Int)) => {
+                let what = if steps.iter().any(|s| matches!(s, TStep::Index(_))) { "index" } else { "arithmetic" };
+                return Err(Diag::new(e.span, format!("unproven {what} in `#[pure] def {}`: `{}`; use `try`", self.f.src_name, self.sm.snippet(e.span))));
+            }
             TK::Index(..) if !under_try => {
                 return Err(Diag::new(e.span, format!("unproven index in `#[pure] def {}`: `{}` may be out of bounds; use `try`", self.f.src_name, self.sm.snippet(e.span))));
             }
@@ -212,6 +224,7 @@ impl Prover<'_> {
     }
 }
 
+/// Int arithmetic, which can overflow. (Float arithmetic can't fail.)
 fn is_arith(e: &TExpr) -> bool {
-    matches!(&e.kind, TK::Bin(op, ..) if op.is_arith()) || matches!(e.kind, TK::Neg(_))
+    e.ty == Ty::Int && (matches!(&e.kind, TK::Bin(op, ..) if op.is_arith()) || matches!(e.kind, TK::Neg(_)))
 }

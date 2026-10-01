@@ -10,7 +10,8 @@
 
 use crate::lir::*;
 use cranelift_codegen::ir::condcodes::IntCC;
-use cranelift_codegen::ir::types::{I8, I64};
+use cranelift_codegen::ir::condcodes::FloatCC;
+use cranelift_codegen::ir::types::{F64, I8, I64};
 use cranelift_codegen::ir::{AbiParam, Block, BlockArg, FuncRef, InstBuilder, MemFlagsData, SigRef, Signature, StackSlotData, StackSlotKind, TrapCode, Type, Value};
 use cranelift_codegen::settings::{self, Configurable};
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
@@ -34,6 +35,7 @@ mod rt {
         alxj_err_overflow, alxj_die, alxj_file_read, alxj_puts_str, alxj_puts_bool, alxj_puts_unit, alxj_pmap, alxj_finish,
         alxj_p_add, alxj_p_sub, alxj_p_mul, alxj_p_div, alxj_p_rem, alxj_p_pow, alxj_p_cmp, alxj_p_even, alxj_p_to_i64,
         alxj_p_to_s, alxj_p_ndigits, alxj_p_digits, alxj_puts_pint,
+        alxj_puts_f64, alxj_f_to_s, alxj_f_fmt, alxj_f_to_i, alxj_str_cat,
     );
 }
 type RtFn = unsafe extern "C" fn();
@@ -51,6 +53,7 @@ fn lay(t: &LTy) -> Lay {
     let words = |n: u32| Lay { size: 8 * n, align: 8, fields: (0..n).map(|i| (8 * i, I64)).collect() };
     match t {
         LTy::I64 | LTy::Gen(_) => words(1),
+        LTy::F64 => Lay { size: 8, align: 8, fields: vec![(0, F64)] },
         LTy::PInt | LTy::Str => words(2),
         LTy::Arr(_) => words(3),
         LTy::Bool => Lay { size: 1, align: 1, fields: vec![(0, I8)] },
@@ -253,7 +256,7 @@ struct Fx<'m, 'b, 'p> {
     gstate: Option<(Value, Vec<u32>)>,
     resume: Vec<Block>,
     yields: usize,
-    sigs: HashMap<(usize, bool), SigRef>,
+    sigs: HashMap<(Vec<Type>, Option<Type>), SigRef>,
     frefs: HashMap<FuncId, FuncRef>,
 }
 
@@ -305,24 +308,37 @@ impl Fx<'_, '_, '_> {
     }
 
     fn call_rt(&mut self, f: RtFn, args: &[Value], ret: bool) -> Option<Value> {
-        let key = (args.len(), ret);
+        self.call_rt_t(f, args, ret.then_some(I64))
+    }
+
+    /// Call a runtime function: i64/pointer and f64 arguments (bools are
+    /// widened), an optional i64 or f64 result.
+    fn call_rt_t(&mut self, f: RtFn, args: &[Value], ret: Option<Type>) -> Option<Value> {
+        let args: Vec<Value> = args
+            .iter()
+            .map(|&a| match self.b.func.dfg.value_type(a) {
+                I64 | F64 => a,
+                _ => self.b.ins().uextend(I64, a),
+            })
+            .collect();
+        let tys: Vec<Type> = args.iter().map(|a| self.b.func.dfg.value_type(*a)).collect();
+        let key = (tys.clone(), ret);
         let sig = match self.sigs.get(&key) {
             Some(s) => *s,
             None => {
                 let mut s = self.m.make_signature();
-                s.params.extend((0..args.len()).map(|_| AbiParam::new(I64)));
-                if ret {
-                    s.returns.push(AbiParam::new(I64));
+                s.params.extend(tys.iter().map(|t| AbiParam::new(*t)));
+                if let Some(r) = ret {
+                    s.returns.push(AbiParam::new(r));
                 }
                 let r = self.b.import_signature(s);
                 self.sigs.insert(key, r);
                 r
             }
         };
-        let args: Vec<Value> = args.iter().map(|&a| if self.b.func.dfg.value_type(a) == I64 { a } else { self.b.ins().uextend(I64, a) }).collect();
         let fp = self.ic(f as usize as i64);
         let call = self.b.ins().call_indirect(sig, fp, &args);
-        if ret { Some(self.b.inst_results(call)[0]) } else { None }
+        if ret.is_some() { Some(self.b.inst_results(call)[0]) } else { None }
     }
 
     fn rt_bool(&mut self, f: RtFn, args: &[Value]) -> Value {
@@ -485,9 +501,13 @@ impl Fx<'_, '_, '_> {
             if skip.contains(&i) {
                 continue;
             }
-            let zs: Vec<Value> = lay(&self.f.vars[i].ty).fields.iter().map(|(_, t)| self.b.ins().iconst(*t, 0)).collect();
+            let zs: Vec<Value> = lay(&self.f.vars[i].ty).fields.iter().map(|(_, t)| self.zero(*t)).collect();
             self.set(i, &zs);
         }
+    }
+
+    fn zero(&mut self, t: Type) -> Value {
+        if t == F64 { self.b.ins().f64const(0.0) } else { self.b.ins().iconst(t, 0) }
     }
 
     fn gen_finish(&mut self) {
@@ -560,6 +580,45 @@ impl Fx<'_, '_, '_> {
                 let et = elem(&self.f.vars[*arr].ty).clone();
                 let addr = self.elem_addr(&a, i, &et, check.as_deref());
                 self.store(&et, &x, addr, 0);
+            }
+            LS::SetPlace { var, steps, val } => {
+                let x = self.e(val);
+                // Walk the steps: through the variable's own scalars until the
+                // first index, then through memory.
+                let mut ty = self.f.vars[*var].ty.clone();
+                let mut start = 0usize;
+                let mut mem: Option<(Value, i32)> = None;
+                for st in steps {
+                    match st {
+                        Step::Field(k) => {
+                            let LTy::Tup(ts) = ty.clone() else { panic!("jit: field of {ty:?}") };
+                            match &mut mem {
+                                None => start += ts[..*k].iter().map(nflat).sum::<usize>(),
+                                Some((_, off)) => *off += field_offset(&ty, *k) as i32,
+                            }
+                            ty = ts[*k].clone();
+                        }
+                        Step::Index(i, check) => {
+                            let a = match mem {
+                                None => self.get(*var)[start..start + 3].to_vec(),
+                                Some((addr, off)) => self.load(&ty, addr, off),
+                            };
+                            let iv = self.e1(i);
+                            let et = elem(&ty).clone();
+                            let addr = self.elem_addr(&a, iv, &et, check.as_deref());
+                            mem = Some((addr, 0));
+                            ty = et;
+                        }
+                    }
+                }
+                match mem {
+                    None => {
+                        let mut all = self.get(*var);
+                        all.splice(start..start + x.len(), x);
+                        self.set(*var, &all);
+                    }
+                    Some((addr, off)) => self.store(&ty, &x, addr, off),
+                }
             }
             LS::Push(v, e) => {
                 let x = self.e(e);
@@ -758,6 +817,9 @@ impl Fx<'_, '_, '_> {
                     LTy::I64 => {
                         self.call_rt(rt::alx_puts_i64, &x, false);
                     }
+                    LTy::F64 => {
+                        self.call_rt(rt::alxj_puts_f64, &x, false);
+                    }
                     LTy::Bool => {
                         self.call_rt(rt::alxj_puts_bool, &x, false);
                     }
@@ -798,6 +860,7 @@ impl Fx<'_, '_, '_> {
         match e {
             LE::Var(v) => self.f.vars[*v].ty.clone(),
             LE::I(_) | LE::Loc(_) | LE::Arith(..) | LE::Neg(..) | LE::Len(_) => LTy::I64,
+            LE::F(_) | LE::FArith(..) | LE::FNeg(_) => LTy::F64,
             LE::B(_) | LE::Cmp(..) | LE::Not(_) => LTy::Bool,
             LE::S(_) => LTy::Str,
             LE::Unit => LTy::Unit,
@@ -813,7 +876,8 @@ impl Fx<'_, '_, '_> {
             LE::Cond(_, a, _) => self.ty(a),
             LE::Call(f, _) => self.d.funcs[f.as_str()].1.ret.clone(),
             LE::Rt(rt, args) => match rt {
-                Rt::IntToS | Rt::PIntToS | Rt::StrRev | Rt::StrDelete => LTy::Str,
+                Rt::IntToS | Rt::PIntToS | Rt::StrRev | Rt::StrDelete | Rt::FToS | Rt::FFmt | Rt::StrCat => LTy::Str,
+                Rt::IntToF | Rt::FSqrt | Rt::FAbs => LTy::F64,
                 Rt::StrByte => {
                     if matches!(args[2], LE::I(0)) {
                         LTy::I64
@@ -872,29 +936,19 @@ impl Fx<'_, '_, '_> {
         self.b.ins().bor(z, both)
     }
 
-    /// Floor division / modulo (Ruby semantics); `b` is nonzero, and not
-    /// -1 with a == MIN for Div.
+    /// Truncating division / remainder (Go semantics); `b` is nonzero, and
+    /// not -1 with a == MIN for Div.
     fn floor_divrem(&mut self, op: Op, a: Value, b: Value) -> Value {
-        // Rem by -1 is 0; avoid the machine trap on MIN % -1.
+        // Divide by 1 instead of -1: avoids the machine trap on MIN % -1.
         let m1 = self.b.ins().icmp_imm(IntCC::Equal, b, -1);
         let one = self.ic(1);
         let bs = self.b.ins().select(m1, one, b);
-        let q = self.b.ins().sdiv(a, bs);
-        let qb = self.b.ins().imul(q, bs);
-        let r = self.b.ins().isub(a, qb);
-        let nz = self.b.ins().icmp_imm(IntCC::NotEqual, r, 0);
-        let x = self.b.ins().bxor(r, b);
-        let neg = self.b.ins().icmp_imm(IntCC::SignedLessThan, x, 0);
-        let adj = self.b.ins().band(nz, neg);
         if op == Op::Div {
-            let adj = self.b.ins().uextend(I64, adj);
-            // b == -1 (a != MIN): a / -1 = -a exactly.
-            let q = self.b.ins().isub(q, adj);
+            let q = self.b.ins().sdiv(a, bs);
             let na = self.b.ins().ineg(a);
             self.b.ins().select(m1, na, q)
         } else {
-            let rb = self.b.ins().iadd(r, b);
-            let r = self.b.ins().select(adj, rb, r);
+            let r = self.b.ins().srem(a, bs);
             let z = self.ic(0);
             self.b.ins().select(m1, z, r)
         }
@@ -926,9 +980,19 @@ impl Fx<'_, '_, '_> {
                 },
             },
             Op::Div | Op::Rem => {
-                if let Some(k) = konst.filter(|k| *k > 0 && (*k as u64).is_power_of_two()) {
-                    // Floor semantics make powers of two exact shifts and masks.
-                    return if op == Op::Div { self.b.ins().sshr_imm(av, k.trailing_zeros() as i64) } else { self.b.ins().band_imm(av, k - 1) };
+                if let Some(k) = konst.filter(|k| *k > 1 && (*k as u64).is_power_of_two()) {
+                    // Truncating division by 2^s: bias negatives by 2^s - 1, then shift.
+                    let sh = k.trailing_zeros() as i64;
+                    let sign = self.b.ins().sshr_imm(av, 63);
+                    let bias = self.b.ins().ushr_imm(sign, 64 - sh);
+                    let biased = self.b.ins().iadd(av, bias);
+                    let q = self.b.ins().sshr_imm(biased, sh);
+                    return if op == Op::Div {
+                        q
+                    } else {
+                        let qk = self.b.ins().ishl_imm(q, sh);
+                        self.b.ins().isub(av, qk)
+                    };
                 }
                 if konst.is_none_or(|k| k == 0 || k == -1) {
                     let z = self.b.ins().icmp_imm(IntCC::Equal, bv, 0);
@@ -1004,6 +1068,20 @@ impl Fx<'_, '_, '_> {
         match e {
             LE::Var(v) => self.get(*v),
             LE::I(i) => vec![self.ic(*i)],
+            LE::F(v) => vec![self.b.ins().f64const(*v)],
+            LE::FArith(op, a, b) => {
+                let (a, b) = (self.e1(a), self.e1(b));
+                vec![match op {
+                    Op::Add => self.b.ins().fadd(a, b),
+                    Op::Sub => self.b.ins().fsub(a, b),
+                    Op::Mul => self.b.ins().fmul(a, b),
+                    _ => self.b.ins().fdiv(a, b),
+                }]
+            }
+            LE::FNeg(x) => {
+                let v = self.e1(x);
+                vec![self.b.ins().fneg(v)]
+            }
             LE::B(b) => vec![self.b.ins().iconst(I8, *b as i64)],
             LE::S(s) => {
                 let p = self.strs.bytes(s);
@@ -1017,6 +1095,18 @@ impl Fx<'_, '_, '_> {
                     out.extend(self.e(v));
                 }
                 out
+            }
+            LE::Field(x, i) if matches!(**x, LE::Index { .. }) => {
+                // An element's field: load just that field.
+                let LE::Index { arr, idx, check } = &**x else { unreachable!() };
+                let at = self.ty(arr);
+                let et = elem(&at).clone();
+                let a = self.e(arr);
+                let iv = self.e1(idx);
+                let addr = self.elem_addr(&a, iv, &et, check.as_deref());
+                let LTy::Tup(ts) = &et else { unreachable!() };
+                let off = field_offset(&et, *i) as i32;
+                self.load(&ts[*i].clone(), addr, off)
             }
             LE::Field(x, i) => {
                 let LTy::Tup(ts) = self.ty(x) else { unreachable!() };
@@ -1067,6 +1157,18 @@ impl Fx<'_, '_, '_> {
                     LTy::PInt => {
                         let c = self.pint_call(rt::alxj_p_cmp, None, &[a, b], None)[0];
                         vec![self.b.ins().icmp_imm(Self::icmp_of(*op), c, 0)]
+                    }
+                    LTy::F64 => {
+                        let (av, bv) = (self.e1(a), self.e1(b));
+                        let cc = match op {
+                            Op::Eq => FloatCC::Equal,
+                            Op::Ne => FloatCC::NotEqual,
+                            Op::Lt => FloatCC::LessThan,
+                            Op::Le => FloatCC::LessThanOrEqual,
+                            Op::Gt => FloatCC::GreaterThan,
+                            _ => FloatCC::GreaterThanOrEqual,
+                        };
+                        vec![self.b.ins().fcmp(cc, av, bv)]
                     }
                     _ => {
                         let (av, bv) = (self.e1(a), self.e1(b));
@@ -1270,6 +1372,47 @@ impl Fx<'_, '_, '_> {
                 let r = self.pint_call(rt::alxj_p_even, None, &[&args[0]], None)[0];
                 vec![self.b.ins().icmp_imm(IntCC::NotEqual, r, 0)]
             }
+            Rt::IntToF => {
+                let v = self.e1(&args[0]);
+                vec![self.b.ins().fcvt_from_sint(F64, v)]
+            }
+            Rt::FToI => {
+                let v = self.e1(&args[0]);
+                let l = self.e1(&args[1]);
+                vec![self.call_rt(rt::alxj_f_to_i, &[v, l], true).unwrap()]
+            }
+            Rt::FSqrt => {
+                let v = self.e1(&args[0]);
+                vec![self.b.ins().sqrt(v)]
+            }
+            Rt::FAbs => {
+                let v = self.e1(&args[0]);
+                vec![self.b.ins().fabs(v)]
+            }
+            Rt::FToS => {
+                let v = self.e1(&args[0]);
+                let out = self.slot(16);
+                self.call_rt(rt::alxj_f_to_s, &[out, v], false);
+                self.load(&s, out, 0)
+            }
+            Rt::FFmt => {
+                let v = self.e1(&args[0]);
+                let d = self.e1(&args[1]);
+                let out = self.slot(16);
+                self.call_rt(rt::alxj_f_fmt, &[out, v, d], false);
+                self.load(&s, out, 0)
+            }
+            Rt::StrCat => {
+                let parts = self.slot(16 * args.len() as u32);
+                for (k, a) in args.iter().enumerate() {
+                    let v = self.e(a);
+                    self.store(&s, &v, parts, 16 * k as i32);
+                }
+                let n = self.ic(args.len() as i64);
+                let out = self.slot(16);
+                self.call_rt(rt::alxj_str_cat, &[out, parts, n], false);
+                self.load(&s, out, 0)
+            }
             Rt::PToI64 => {
                 let v = self.e(&args[0]);
                 let p = self.spill(&LTy::PInt, &v);
@@ -1278,4 +1421,19 @@ impl Fx<'_, '_, '_> {
             }
         }
     }
+}
+
+/// Byte offset of field `k` of a tuple type (C layout).
+fn field_offset(t: &LTy, k: usize) -> u32 {
+    let LTy::Tup(ts) = t else { panic!("jit: field of {t:?}") };
+    let mut off = 0u32;
+    for (i, ft) in ts.iter().enumerate() {
+        let l = lay(ft);
+        off = off.next_multiple_of(l.align);
+        if i == k {
+            return off;
+        }
+        off += l.size;
+    }
+    unreachable!()
 }

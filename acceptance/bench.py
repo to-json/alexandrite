@@ -58,7 +58,7 @@ RB = ROOT / "acceptance" / "ruby"
 GO_SRC = ROOT / "acceptance" / "go"
 ALX = ROOT / "target" / "release" / "alx"
 WORK = Path(tempfile.mkdtemp(prefix="alx-bench-"))
-CASE_NAMES = sorted(p.stem for p in CASES.glob("pe*.alx") if p.stem.count(".") == 0)
+CASE_NAMES = sorted(p.stem for p in CASES.glob("*.alx") if "." not in p.stem and (CASES / f"{p.stem}.expected").exists())
 
 RUBY = shutil.which("ruby", path="/opt/homebrew/opt/ruby/bin") or "ruby"
 FAST = [RUBY, "--disable-gems"]

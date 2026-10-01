@@ -133,8 +133,7 @@ mod rt {
         if b == 0 {
             return None;
         }
-        let q = a.checked_div(b)?;
-        Some(if a % b != 0 && ((a < 0) != (b < 0)) { q - 1 } else { q })
+        a.checked_div(b) // truncates, as in Go
     }
     pub fn try_rem(a: i64, b: i64) -> Option<i64> {
         if b == 0 {
@@ -143,8 +142,7 @@ mod rt {
         if b == -1 {
             return Some(0);
         }
-        let r = a % b;
-        Some(if r != 0 && ((r < 0) != (b < 0)) { r + b } else { r })
+        Some(a % b) // sign of the dividend, as in Go
     }
     pub fn try_pow(a: i64, b: i64) -> Option<i64> {
         if b < 0 || b > u32::MAX as i64 {
@@ -250,6 +248,82 @@ mod rt {
     }
     pub fn cap(n: i64) -> usize {
         n.max(0) as usize
+    }
+
+    /// A Float as Go's fmt prints it (see alx_f_to_s in alx.c).
+    pub fn f_to_s(x: f64) -> Str {
+        Str::lit(go_float(x).as_bytes())
+    }
+    pub fn go_float(x: f64) -> String {
+        if x.is_nan() {
+            return "NaN".into();
+        }
+        if x.is_infinite() {
+            return if x < 0.0 { "-Inf".into() } else { "+Inf".into() };
+        }
+        if x == 0.0 {
+            return if x.is_sign_negative() { "-0".into() } else { "0".into() };
+        }
+        // `{:e}` is the shortest round-trip form: d[.ddd]e[-]X
+        let e = format!("{:e}", x.abs());
+        let (mant, exp) = e.split_once('e').unwrap();
+        let exp10: i32 = exp.parse().unwrap();
+        let digits: Vec<char> = mant.chars().filter(|c| *c != '.').collect();
+        let n = digits.len() as i32;
+        let decpt = exp10 + 1;
+        let mut out = String::new();
+        if x < 0.0 {
+            out.push('-');
+        }
+        if exp10 < -4 || exp10 >= 6 {
+            out.push(digits[0]);
+            if n > 1 {
+                out.push('.');
+                out.extend(&digits[1..]);
+            }
+            out.push_str(&format!("e{}{:02}", if exp10 < 0 { '-' } else { '+' }, exp10.abs()));
+        } else if decpt <= 0 {
+            out.push_str("0.");
+            for _ in 0..-decpt {
+                out.push('0');
+            }
+            out.extend(&digits);
+        } else {
+            for i in 0..decpt {
+                out.push(if i < n { digits[i as usize] } else { '0' });
+            }
+            if n > decpt {
+                out.push('.');
+                out.extend(&digits[decpt as usize..]);
+            }
+        }
+        out
+    }
+    pub fn f_fmt(x: f64, digits: i64) -> Str {
+        let s = if x.is_nan() {
+            "NaN".to_string()
+        } else if x.is_infinite() {
+            (if x < 0.0 { "-Inf" } else { "+Inf" }).to_string()
+        } else {
+            format!("{:.*}", digits as usize, x)
+        };
+        Str::lit(s.as_bytes())
+    }
+    pub fn f_to_i(x: f64, loc: &str) -> i64 {
+        if x.is_nan() || x.is_infinite() {
+            panic("Float#to_i of NaN or Infinity", loc)
+        }
+        if x >= 9223372036854775808.0 || x < -9223372036854775808.0 {
+            panic("Float#to_i: out of Int range", loc)
+        }
+        x as i64
+    }
+    pub fn str_cat(parts: Vec<Str>) -> Str {
+        let mut v = Vec::new();
+        for p in &parts {
+            v.extend_from_slice(&p.0);
+        }
+        Str::lit(&v)
     }
 
     pub fn puts_i64(v: i64) {

@@ -68,6 +68,8 @@ pub fn check_program(l: &Loaded, externs: Vec<DefInfo>) -> Result<TProgram, Diag
     let mut defs: Vec<DefInfo> = l.main.defs.iter().map(|d| DefInfo { def: d.clone(), overflow: l.main.overflow, external: None }).collect();
     defs.extend(externs);
     let mut w = World::new(&l.sm, defs)?;
+    let structs: Vec<_> = l.main.structs.iter().chain(l.libs.iter().flat_map(|(_, _, m)| m.structs.iter())).cloned().collect();
+    w.add_structs(&structs)?;
     let main = w.check_main(&l.main.main, l.main.overflow, Span { file: l.main.file, lo: 0, hi: 0 })?;
     let mut funcs: Vec<_> = w.funcs.into_iter().map(|f| f.expect("every instance checked")).collect();
     for f in funcs.iter_mut() {
@@ -111,6 +113,7 @@ pub fn check_library(l: &Loaded, idx: usize, prefix: &str) -> Result<(TProgram, 
     let (_, _, m) = &l.libs[idx];
     let defs = m.defs.iter().map(|d| DefInfo { def: d.clone(), overflow: m.overflow, external: None }).collect();
     let mut w = World::new(&l.sm, defs)?;
+    w.add_structs(&m.structs)?;
     let exports = w.check_exports()?;
     let mut funcs: Vec<_> = w.funcs.into_iter().map(|f| f.expect("every instance checked")).collect();
     for f in funcs.iter_mut() {
@@ -210,6 +213,7 @@ fn parse_ty(s: &str) -> Result<Ty, String> {
     let inner = |pre: &str| s.strip_prefix(pre).and_then(|r| r.strip_suffix(']'));
     Ok(match s {
         "Int" => Ty::Int,
+        "Float" => Ty::Float,
         "Bool" => Ty::Bool,
         "Str" => Ty::Str,
         "nil" => Ty::Unit,

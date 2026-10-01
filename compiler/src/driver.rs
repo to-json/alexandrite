@@ -218,7 +218,7 @@ fn build(file: &str, o: &Options) -> Result<PathBuf, ExitCode> {
         None => cache.join(format!("{stem}-{}", o.mode())),
     };
     let mut cmd = Command::new("clang");
-    cmd.args(o.cflags()).arg("-I").arg(&inc).arg(&prog_c).args(&objs).arg("-o").arg(&bin).arg("-lpthread");
+    cmd.args(o.cflags()).arg("-I").arg(&inc).arg(&prog_c).args(&objs).arg("-o").arg(&bin).arg("-lpthread").arg("-lm");
     log(o, &format!("{stem}: compiling"));
     let st = cmd.status().map_err(|e| fail(format!("cannot run clang: {e}")))?;
     if !st.success() {

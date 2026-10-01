@@ -5,6 +5,7 @@ use crate::diag::{Diag, Span};
 #[derive(Debug, Clone, PartialEq)]
 pub enum Tok {
     Int(i64),
+    Float(f64),
     Str(String),
     Ident(String),
     Const(String),
@@ -36,6 +37,7 @@ pub enum Kw {
     Nil,
     Try,
     Require,
+    Struct,
 }
 
 #[derive(Debug, Clone)]
@@ -46,8 +48,8 @@ pub struct Token {
     pub space_before: bool,
 }
 
-const OPS: [&str; 33] = [
-    "**=", "...", "<=>", "**", "==", "!=", "<=", ">=", "&&", "||", "<<", "..", "+=", "-=", "*=", "->", "&:", "+", "-",
+const OPS: [&str; 34] = [
+    "**=", "...", "<=>", "**", "==", "!=", "<=", ">=", "&&", "||", "<<", "..", "+=", "-=", "*=", "/=", "->", "&:", "+", "-",
     "*", "/", "%", "<", ">", "=", "!", "?", ":", ".", ",", ";", "|", "&",
 ];
 const BRACKETS: [&str; 6] = ["(", ")", "[", "]", "{", "}"];
@@ -131,6 +133,40 @@ pub fn lex(file: u32, src: &str) -> Result<Vec<Token>, Diag> {
                 }
                 i += 1;
             }
+            // A Float: digits `.` digits (so `1..10` and `1.to_s` stay Int), and/or an exponent.
+            let mut float = false;
+            if i + 1 < b.len() && b[i] == b'.' && b[i + 1].is_ascii_digit() {
+                float = true;
+                s.push('.');
+                i += 1;
+                while i < b.len() && (b[i].is_ascii_digit() || b[i] == b'_') {
+                    if b[i] != b'_' {
+                        s.push(b[i] as char);
+                    }
+                    i += 1;
+                }
+            }
+            if i < b.len() && (b[i] == b'e' || b[i] == b'E') {
+                let mut j = i + 1;
+                if j < b.len() && (b[j] == b'+' || b[j] == b'-') {
+                    j += 1;
+                }
+                if j < b.len() && b[j].is_ascii_digit() {
+                    float = true;
+                    s.push_str(&src[i..j]);
+                    i = j;
+                    while i < b.len() && b[i].is_ascii_digit() {
+                        s.push(b[i] as char);
+                        i += 1;
+                    }
+                }
+            }
+            if float {
+                let v: f64 = s.parse().map_err(|_| Diag::new(sp(start, i), "malformed Float literal"))?;
+                out.push(Token { tok: Tok::Float(v), span: sp(start, i), space_before: space });
+                space = false;
+                continue;
+            }
             let v: i64 = s.parse().map_err(|_| Diag::new(sp(start, i), "integer literal too large for Int"))?;
             out.push(Token { tok: Tok::Int(v), span: sp(start, i), space_before: space });
             space = false;
@@ -164,6 +200,7 @@ pub fn lex(file: u32, src: &str) -> Result<Vec<Token>, Diag> {
                 "nil" => Tok::Kw(Kw::Nil),
                 "try" => Tok::Kw(Kw::Try),
                 "require" => Tok::Kw(Kw::Require),
+                "struct" => Tok::Kw(Kw::Struct),
                 w if w.as_bytes()[0].is_ascii_uppercase() => Tok::Const(w.to_string()),
                 w => Tok::Ident(w.to_string()),
             };
@@ -218,7 +255,7 @@ pub fn lex(file: u32, src: &str) -> Result<Vec<Token>, Diag> {
         }
         // Symbols: `:name`, `:*`; but not `a ? b : c` (space after colon).
         if c == b':' && i + 1 < b.len() && !b[i + 1].is_ascii_whitespace() {
-            let prev_is_value = matches!(out.last().map(|t| &t.tok), Some(Tok::Ident(_) | Tok::Int(_) | Tok::Op(")") | Tok::Op("]")));
+            let prev_is_value = matches!(out.last().map(|t| &t.tok), Some(Tok::Ident(_) | Tok::Int(_) | Tok::Float(_) | Tok::Op(")") | Tok::Op("]")));
             if !prev_is_value || space {
                 let mut j = i + 1;
                 if b[j].is_ascii_alphabetic() || b[j] == b'_' {

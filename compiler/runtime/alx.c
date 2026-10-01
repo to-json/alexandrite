@@ -230,6 +230,94 @@ bool alx_file_read(AlxStr path, const char *loc, AlxStr *out, AlxErr *err) {
     return true;
 }
 
+/* ---------- floats ---------- */
+
+static AlxStr str_of(const char *p, size_t n) {
+    char *q = alx_alloc(n);
+    memcpy(q, p, n);
+    AlxStr s = { q, (int64_t)n };
+    return s;
+}
+
+/* A Float as Go's fmt prints it (%v): the shortest digits that read back
+ * as x; exponent form when the exponent is < -4 or >= 6, e.g. 100, 0.5,
+ * 1e+06, 1.5e-07, +Inf, NaN. */
+AlxStr alx_f_to_s(double x) {
+    if (isnan(x)) return str_of("NaN", 3);
+    if (isinf(x)) return x < 0 ? str_of("-Inf", 4) : str_of("+Inf", 4);
+    if (x == 0) return signbit(x) ? str_of("-0", 2) : str_of("0", 1);
+    char e[40];
+    for (int p = 1; p <= 17; p++) {
+        snprintf(e, sizeof e, "%.*e", p - 1, x);
+        if (strtod(e, NULL) == x) break;
+    }
+    /* e = [-]d[.ddd]e[+-]XX */
+    const char *q = e;
+    bool neg = *q == '-';
+    if (neg) q++;
+    char digits[24];
+    int n = 0;
+    for (; *q && *q != 'e'; q++)
+        if (*q != '.') digits[n++] = *q;
+    int exp10 = atoi(q + 1);
+    int decpt = exp10 + 1;
+    char out[64];
+    int o = 0;
+    if (neg) out[o++] = '-';
+    if (exp10 < -4 || exp10 >= 6) {
+        out[o++] = digits[0];
+        if (n > 1) {
+            out[o++] = '.';
+            for (int i = 1; i < n; i++) out[o++] = digits[i];
+        }
+        o += snprintf(out + o, sizeof out - (size_t)o, "e%+03d", exp10);
+    } else if (decpt <= 0) {
+        out[o++] = '0';
+        out[o++] = '.';
+        for (int i = 0; i < -decpt; i++) out[o++] = '0';
+        for (int i = 0; i < n; i++) out[o++] = digits[i];
+    } else {
+        for (int i = 0; i < decpt; i++) out[o++] = i < n ? digits[i] : '0';
+        if (n > decpt) {
+            out[o++] = '.';
+            for (int i = decpt; i < n; i++) out[o++] = digits[i];
+        }
+    }
+    return str_of(out, (size_t)o);
+}
+
+/* format("%.Nf", x) */
+AlxStr alx_f_fmt(double x, int64_t digits) {
+    if (isnan(x)) return str_of("NaN", 3);
+    if (isinf(x)) return x < 0 ? str_of("-Inf", 4) : str_of("+Inf", 4);
+    int n = snprintf(NULL, 0, "%.*f", (int)digits, x);
+    char *p = alx_alloc((size_t)n + 1);
+    snprintf(p, (size_t)n + 1, "%.*f", (int)digits, x);
+    AlxStr s = { p, n };
+    return s;
+}
+
+int64_t alx_f_to_i(double x, const char *loc) {
+    if (isnan(x) || isinf(x)) alx_panic("Float#to_i of NaN or Infinity", loc);
+    if (x >= 9223372036854775808.0 || x < -9223372036854775808.0) alx_panic("Float#to_i: out of Int range", loc);
+    return (int64_t)x;
+}
+
+void alx_puts_f64(double x) { alx_puts_str(alx_f_to_s(x)); }
+
+AlxStr alx_str_cat(int64_t n, const AlxStr *parts) {
+    int64_t len = 0;
+    for (int64_t i = 0; i < n; i++) len += parts[i].len;
+    char *p = alx_alloc((size_t)len);
+    int64_t o = 0;
+    for (int64_t i = 0; i < n; i++) {
+        if (parts[i].len) memcpy(p + o, parts[i].ptr, (size_t)parts[i].len);
+        o += parts[i].len;
+    }
+    AlxStr s = { p, len };
+    return s;
+}
+
 /* ---------- output ---------- */
 
 void alx_puts_i64(int64_t v) { printf("%lld\n", (long long)v); }

@@ -20,6 +20,9 @@ const PE = [
   ['pe022', 'names scores', 'File.read of a bundled 46 KB fixture; `sort`, `each_with_index`, `bytes`.'],
   ['pe025', '1000-digit Fibonacci number', 'Bignums in a loop; `to_s.size` is a digit count, no string built.'],
 ];
+const BENCHMARKS = [
+  ['nbody', 'n-body', 'The Benchmarks Game classic: structs, Floats, 1,000,000 steps of a 5-body orbit.'],
+];
 const MISTAKES = [
   ['pe001.typo', 'a typo', 'Did-you-mean suggestions name the line and column.'],
   ['pe004.bad', 'a type error', '`palindrome?` takes an Int, not a Str.'],
@@ -33,6 +36,9 @@ for (const [id, title, note] of PE) {
   const n = Number(id.slice(2));
   const head = `# Project Euler ${n}: ${title}` + (note ? `\n# ${note}` : '');
   ex.push({ id, group: 'project euler', title: `${n}. ${title}`, source: `${head}\n${read(id + '.alx')}` });
+}
+for (const [id, title, note] of BENCHMARKS) {
+  ex.push({ id, group: 'benchmarks game', title, source: `# ${note}\n${read(id + '.alx')}` });
 }
 for (const [id, title, note] of MISTAKES) {
   ex.push({ id, group: 'mistakes', title, source: `# Mistake: ${title}. ${note}\n${read(id + '.alx')}` });

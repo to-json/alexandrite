@@ -7,11 +7,14 @@ use crate::diag::Span;
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub enum Ty {
     Int,
+    Float,
     Bool,
     Str,
     Unit,
     Array(Box<Ty>),
     Tuple(Vec<Ty>),
+    /// A user struct (a value): its name and fields, in order.
+    Struct(String, Vec<(String, Ty)>),
     /// Range[Int]
     Range,
     /// An unmaterialized pipeline: elements of type T. `true` = lazy.
@@ -34,6 +37,8 @@ impl Ty {
     pub fn show(&self) -> String {
         match self {
             Ty::Int => "Int".into(),
+            Ty::Float => "Float".into(),
+            Ty::Struct(n, _) => n.clone(),
             Ty::Bool => "Bool".into(),
             Ty::Str => "Str".into(),
             Ty::Unit => "nil".into(),
@@ -54,6 +59,12 @@ impl Ty {
             Ty::Array(t) | Ty::Seq(t, _) | Ty::Gen(t) | Ty::Yielder(t) => t.has_var(),
             Ty::Tuple(ts) => ts.iter().any(Ty::has_var),
             _ => false,
+        }
+    }
+    pub fn field(&self, name: &str) -> Option<(usize, Ty)> {
+        match self {
+            Ty::Struct(_, fs) => fs.iter().position(|(f, _)| f == name).map(|k| (k, fs[k].1.clone())),
+            _ => None,
         }
     }
 }
@@ -121,6 +132,16 @@ pub enum M {
     Yield,
     TupleGet(usize),
     IntSqrt,
+    /// Int → Float
+    ToF,
+    /// Float → Int (truncates; fails on NaN, infinities and out-of-range values)
+    FloatToI,
+    FloatAbs,
+    FloatToS,
+    /// Math.sqrt
+    Sqrt,
+    /// `Name.new(fields...)`
+    StructNew,
     ArrayNew,
     FileRead,
     EnumNew,
@@ -144,6 +165,7 @@ pub struct TExpr {
 #[derive(Clone, Debug)]
 pub enum TK {
     Int(i64),
+    Float(f64),
     Str(String),
     Bool(bool),
     Unit,
@@ -162,6 +184,27 @@ pub enum TK {
     Try(Box<TExpr>),
     Puts(Box<TExpr>),
     Array(Vec<TExpr>),
+    /// `place = v`, or `place op= v`: a local, then index and field steps.
+    PlaceAssign(LocalId, Vec<TStep>, Option<BinOp>, Box<TExpr>),
+    /// `format("...", args)`: pieces checked against the arguments.
+    Format(Vec<FmtPiece>, Vec<TExpr>),
+}
+
+#[derive(Clone, Debug)]
+pub enum TStep {
+    Index(TExpr),
+    Field(usize),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum FmtPiece {
+    Lit(String),
+    /// `%d`: argument k (Int)
+    Int(usize),
+    /// `%v`, `%s`, `%t`: argument k as Go's fmt shows it
+    Str(usize),
+    /// `%f`, `%.Nf`: argument k (Float or Int), N decimals
+    Fixed(usize, u32),
 }
 
 #[derive(Clone, Debug)]

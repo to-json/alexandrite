@@ -6,6 +6,7 @@ Read this first after a context compaction.
 - `acceptance/cases/`: case files, `.expected`, `.expected_error`, `.expected_runtime`, `.budget`, `fixtures/`, `lib/primes.alx`. Written and checked against Python.
 - `acceptance/refs/`: Rust references for the timing budgets (pe007, pe010, pe014). Verified.
 - `acceptance/run.py`: the harness.
+- `GO-VS-RUBY.md`: the decision log (Go = capabilities/semantics, Ruby = syntax tips). Check it before any semantic choice.
 - `acceptance/go/{idiomatic,fast}/`: Go ports (Go 1.27). Runners `go-run` (edit-to-answer), `go`, `go-fast` in bench.py.
 - `acceptance/ruby/{idiomatic,fast}/`: Ruby ports of the positive cases; `acceptance/bench.py` times them against `alx run` and the release binaries.
 - `compiler/`: the `alx` crate (Rust). The root `Cargo.toml` workspace excludes `probes/`.
@@ -37,3 +38,4 @@ v0 decisions, made deliberately (record them in DESIGN.md at the end):
 - [x] Rust oracle backend (all 12 programs: rustc accepts, output agrees)
 - [x] harness `run.py`: budgets, sanitizers, oracle, license manifest. **76/76 checks pass.**
 - [x] v0 decisions recorded in DESIGN.md ("v0 implementation")
+- [x] A7 nbody: Float, struct (keyword init, zero values), places, `format` (Go verbs), Math.sqrt; all five backends agree with Go byte-for-byte. Release ≈ Rust, ~1.15x faster than Go. **82/82 checks pass.**

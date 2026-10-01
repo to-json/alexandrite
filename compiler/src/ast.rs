@@ -17,6 +17,7 @@ pub struct Module {
     pub overflow: Overflow,
     pub requires: Vec<(String, Span)>,
     pub defs: Vec<Def>,
+    pub structs: Vec<StructDef>,
     /// Top-level statements, run in order (the implicit `main`).
     pub main: Vec<Stmt>,
 }
@@ -31,6 +32,14 @@ pub struct Def {
     pub fallible: bool,
     pub pure: bool,
     pub body: Vec<Stmt>,
+}
+
+/// `struct Name { field: Type, ... }`: a value type.
+#[derive(Debug, Clone)]
+pub struct StructDef {
+    pub name: String,
+    pub span: Span,
+    pub fields: Vec<(String, TypeExpr, Span)>,
 }
 
 #[derive(Debug, Clone)]
@@ -125,6 +134,7 @@ impl BinOp {
 #[derive(Debug, Clone)]
 pub enum ExprKind {
     Int(i64),
+    Float(f64),
     Str(String),
     Bool(bool),
     Nil,
@@ -147,11 +157,14 @@ pub enum ExprKind {
     Not(Box<Expr>),
     Range(Box<Expr>, Box<Expr>, bool),
     Ternary(Box<Expr>, Box<Expr>, Box<Expr>),
-    /// `x = e`, `a[i] = e`. The target is a Name or an Index expression.
+    /// `x = e`, `a[i] = e`, `p.f = e`, `a[i].f = e`: the target is a Name, an
+    /// Index, or a field (a Call with no arguments) over a place.
     Assign(Box<Expr>, Box<Expr>),
     /// `x += e` etc.: desugared by the parser to Assign(x, Binary(op, x, e)),
     /// but remembered for the counter rule.
     OpAssign(BinOp, Box<Expr>, Box<Expr>),
     Try(Box<Expr>),
     Array(Vec<Expr>),
+    /// `name: value` in an argument list (`Body.new(x: 1.0)`).
+    KwArg(String, Span, Box<Expr>),
 }

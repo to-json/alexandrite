@@ -31,7 +31,7 @@ export function run(name, src) {
 
 const filter = process.argv[2] || '';
 let fail = 0;
-for (const f of readdirSync(cases).filter(f => /^pe\d+\.alx$/.test(f) && f.includes(filter)).sort()) {
+for (const f of readdirSync(cases).filter(f => /^[a-z]+\d*\.alx$/.test(f) && readdirSync(cases).includes(f.replace('.alx', '.expected')) && f.includes(filter)).sort()) {
   const want = readFileSync(cases + f.replace('.alx', '.expected'), 'utf8').trim();
   const r = run(f, readFileSync(cases + f, 'utf8'));
   const got = (r.stdout ?? '').trim();

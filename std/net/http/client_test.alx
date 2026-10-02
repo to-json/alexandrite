@@ -1,0 +1,228 @@
+import "bytes"
+import "net"
+import "strings"
+import "sync"
+
+def parse_resp(raw: Str, head: Bool) -> Response {
+  br = bufio.new_reader(bytes.new_buffer_string(raw))
+  read_response(br, head).unwrap
+}
+
+test "client decodes chunked bodies" {
+  r = parse_resp("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Type: text/plain\r\n\r\n5\r\nhello\r\n7;x=y\r\n, world\r\n0\r\nTrailer: ignored\r\n\r\n", false)
+  assert_eq r.status, 200
+  assert_eq r.status_text, "OK"
+  assert_eq r.body_string, "hello, world"
+  assert_eq r.header.get("content-type"), "text/plain"
+}
+
+test "client decodes length, close-delimited and bodiless responses" {
+  r = parse_resp("HTTP/1.1 201 Created\r\nContent-Length: 4\r\n\r\nabcdEXTRA", false)
+  assert_eq r.status, 201
+  assert_eq r.body_string, "abcd"
+  r = parse_resp("HTTP/1.0 200 OK\r\n\r\nuntil the end", false)
+  assert_eq r.body_string, "until the end"
+  r = parse_resp("HTTP/1.1 204 No Content\r\n\r\n", false)
+  assert_eq r.body.size, 0
+  r = parse_resp("HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\n", true)
+  assert_eq r.body.size, 0
+  assert_eq r.header.get("Content-Length"), "10"
+}
+
+test "client rejects malformed responses" {
+  br = bufio.new_reader(bytes.new_buffer_string("NOT HTTP\r\n\r\n"))
+  assert read_response(br, false).err?
+  br = bufio.new_reader(bytes.new_buffer_string("HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\nshort"))
+  assert read_response(br, false).err?
+  br = bufio.new_reader(bytes.new_buffer_string("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nzz\r\n"))
+  assert read_response(br, false).err?
+  br = bufio.new_reader(bytes.new_buffer_string(""))
+  assert read_response(br, false).err?
+}
+
+test "client against a canned chunked server" {
+  ln = net.listen("tcp", "127.0.0.1:0").unwrap
+  port = ln.port
+  srv = spawn {
+    c = ln.~accept
+    buf: [Byte] = [0; 1024]
+    c.read!(buf).unwrap
+    c.write_string!("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n").unwrap
+    c.write_string!("3\r\nabc\r\n").unwrap
+    c.write_string!("3\r\ndef\r\n0\r\n\r\n").unwrap
+    c.close!.unwrap
+    1
+  }
+  r = get("http://127.0.0.1:#{port}/").unwrap
+  assert_eq r.body_string, "abcdef"
+  assert_eq srv.wait.unwrap, 1
+}
+
+test "client errors: refused connection, bad url" {
+  ln = net.listen("tcp", "127.0.0.1:0").unwrap
+  port = ln.port
+  ln.close!.unwrap
+  assert get("http://127.0.0.1:#{port}/").err?
+  assert get("ftp://example.com/").err?
+  assert get("http://").err?
+}
+
+def echo_headers(w: ResponseWriter, r: Request) -> Unit {
+  w.write_string!("#{r.method} #{r.path} ua=#{r.header.get("user-agent")} x=#{r.header.get("X-Custom")} q=#{r.raw_query}").unwrap
+}
+
+def redir(w: ResponseWriter, r: Request) -> Unit {
+  redirect(w, r, "/final?from=redir", 302)
+}
+
+def see_other(w: ResponseWriter, r: Request) -> Unit {
+  redirect(w, r, "/final", 303)
+}
+
+def final(w: ResponseWriter, r: Request) -> Unit {
+  w.write_string!("final #{r.method} #{r.raw_query} body=#{r.body.size}").unwrap
+}
+
+def loop_redirect(w: ResponseWriter, r: Request) -> Unit {
+  redirect(w, r, "/loop", 302)
+}
+
+def start2(mux: ServeMux) -> (Server, Int) {
+  srv = new_server(mux)
+  ln = net.listen("tcp", "127.0.0.1:0").unwrap
+  port = ln.port
+  spawn { srv.serve(ln) }
+  (srv, port)
+}
+
+test "client request headers and redirects" {
+  mux = new_serve_mux
+  mux.handle_func("/echo", echo_headers)
+  mux.handle_func("/redir", redir)
+  mux.handle_func("/seeother", see_other)
+  mux.handle_func("/final", final)
+  mux.handle_func("/loop", loop_redirect)
+  srv, port = start2(mux)
+  base = "http://127.0.0.1:#{port}"
+  req = new_request("GET", base + "/echo?a=1", []).unwrap
+  req.header.set!("x-custom", "yes")
+  c = new_client
+  r = c.do(req).unwrap
+  assert_eq r.body_string, "GET /echo ua=alx-http/1 x=yes q=a=1"
+  r = get(base + "/redir").unwrap
+  assert_eq r.status, 200
+  assert_eq r.body_string, "final GET from=redir body=0"
+  r = post(base + "/seeother", "text/plain", "data").unwrap
+  assert_eq r.body_string, "final GET  body=0"
+  c.max_redirects = 0
+  r = c.get(base + "/redir").unwrap
+  assert_eq r.status, 302
+  assert_eq r.header.get("Location"), "/final?from=redir"
+  c.max_redirects = 3
+  r = c.get(base + "/loop").unwrap
+  assert_eq r.status, 302
+  srv.shutdown
+}
+
+test "error, not_found, redirect helpers and form values" {
+  mux = new_serve_mux
+  mux.handle_func("/err") { |w, r| error(w, "kaput", 500) }
+  mux.handle_func("/nf") { |w, r| not_found(w, r) }
+  mux.handle_func("/form") { |w, r|
+    w.write_string!("#{r.form_value("a") || "?"}|#{r.form_value("b") || "?"}")
+  }
+  mux.handle_func("/status") { |w, r|
+    w.write_header!(418)
+    w.write_header!(200)
+    w.write_string!("tea")
+  }
+  mux.handle_func("/empty") { |w, r| w.write_header!(204) }
+  mux.handle_func("/hdr") { |w, r|
+    w.header.add!("X-Multi", "1")
+    w.header.add!("x-multi", "2")
+    w.header.set!("X-Inject", "a\r\nInjected: yes")
+  }
+  srv, port = start2(mux)
+  base = "http://127.0.0.1:#{port}"
+  r = get(base + "/err").unwrap
+  assert_eq r.status, 500
+  assert_eq r.body_string, "kaput\n"
+  assert_eq get(base + "/nf").unwrap.status, 404
+  r = post(base + "/form?a=1", "application/x-www-form-urlencoded", "b=x+y%21").unwrap
+  assert_eq r.body_string, "1|x y!"
+  r = get(base + "/status").unwrap
+  assert_eq r.status, 418
+  assert_eq r.body_string, "tea"
+  r = get(base + "/empty").unwrap
+  assert_eq r.status, 204
+  assert_eq r.header.get("Content-Length"), ""
+  r = get(base + "/hdr").unwrap
+  assert_eq r.header.values("X-Multi").join(","), "1,2"
+  assert_eq r.header.get("Injected"), ""
+  srv.shutdown
+}
+
+test "path cleaning and subtree redirects over the wire" {
+  mux = new_serve_mux
+  mux.handle_func("/a/b") { |w, r| w.write_string!("ab") }
+  mux.handle_func("/dir/") { |w, r| w.write_string!("dir:#{r.path}") }
+  srv, port = start2(mux)
+  base = "http://127.0.0.1:#{port}"
+  c = new_client
+  c.max_redirects = 0
+  r = c.get(base + "/a//b").unwrap
+  assert_eq r.status, 301
+  assert_eq r.header.get("Location"), "/a/b"
+  r = c.get(base + "/dir").unwrap
+  assert_eq r.status, 301
+  assert_eq r.header.get("Location"), "/dir/"
+  assert_eq get(base + "/a//b").unwrap.body_string, "ab"
+  assert_eq get(base + "/dir/x%20y").unwrap.body_string, "dir:/dir/x y"
+  srv.shutdown
+}
+
+test "limits: huge headers and bodies are refused" {
+  mux = new_serve_mux
+  mux.handle_func("/") { |w, r| w.write_string!("ok") }
+  srv, port = start2(mux)
+  c = net.dial("tcp", "127.0.0.1:#{port}").unwrap
+  br = bufio.new_reader(c)
+  c.write_string!("POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 999999999999\r\n\r\n").unwrap
+  assert_eq read_response(br, false).unwrap.status, 413
+  c.close!.unwrap
+  c = net.dial("tcp", "127.0.0.1:#{port}").unwrap
+  br = bufio.new_reader(c)
+  hdrs = ""
+  i = 0
+  while i < 250 {
+    hdrs += "X-H#{i}: v\r\n"
+    i += 1
+  }
+  c.write_string!("GET / HTTP/1.1\r\nHost: x\r\n#{hdrs}\r\n").unwrap
+  assert_eq read_response(br, false).unwrap.status, 431
+  c.close!.unwrap
+  assert_eq get("http://127.0.0.1:#{port}/").unwrap.body_string, "ok"
+  srv.shutdown
+}
+
+test "shutdown waits for requests in flight" {
+  mux = new_serve_mux
+  gate = Chan[Bool].new
+  started = Chan[Bool].new
+  mux.handle_func("/slow") { |w, r|
+    started << true
+    gate.recv
+    w.write_string!("done")
+  }
+  srv, port = start2(mux)
+  req = spawn { get("http://127.0.0.1:#{port}/slow").unwrap.body_string }
+  started.recv
+  stopper = spawn {
+    srv.shutdown
+    1
+  }
+  # The in-flight request is still unfinished, so shutdown has not returned.
+  gate << true
+  assert_eq req.wait.unwrap, "done"
+  assert_eq stopper.wait.unwrap, 1
+}

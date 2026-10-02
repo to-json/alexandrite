@@ -1080,6 +1080,7 @@ impl<'c, 'p> Fx<'c, 'p> {
 
     fn ty(&self, e: &LE) -> LTy {
         match e {
+            LE::RegionOf(_) => LTy::Region,
             LE::RegionProgram => LTy::Region,
             LE::ChanNew(t, _) => LTy::Chan(Box::new(t.clone())),
             LE::ChanLen(_) => LTy::I64,
@@ -1141,6 +1142,7 @@ impl<'c, 'p> Fx<'c, 'p> {
         let t = self.ty(e);
         let out = vts(&t);
         match e {
+            LE::RegionOf(_) => self.i64c(0),
             // The browser never frees: regions are no-ops (handle 0).
             LE::RegionProgram => self.i64c(0),
             LE::ChanNew(..) | LE::ChanLen(_) => unreachable!("rejected by uses_concurrency"),

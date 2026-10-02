@@ -918,6 +918,7 @@ impl Fx<'_, '_, '_> {
 
     fn ty(&self, e: &LE) -> LTy {
         match e {
+            LE::RegionOf(_) => LTy::Region,
             LE::RegionProgram => LTy::Region,
             LE::ChanNew(t, _) => LTy::Chan(Box::new(t.clone())),
             LE::ChanLen(_) => LTy::I64,
@@ -1120,6 +1121,7 @@ impl Fx<'_, '_, '_> {
 
     fn e(&mut self, e: &LE) -> Vec<Value> {
         match e {
+            LE::RegionOf(_) => unimplemented!("R2: region_of in the JIT"),
             LE::RegionProgram => vec![self.call_rt(rt::alxj_region_program, &[], true).unwrap()],
             LE::ChanNew(t, cap) => {
                 let c = self.e1(cap);

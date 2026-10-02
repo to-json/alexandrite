@@ -133,6 +133,13 @@ pub enum LE {
     ChanLen(Box<LE>),
     /// This thread's program region (never freed; what everything used before regions).
     RegionProgram,
+    /// The region holding the storage of this value (an `Arr` or a `Str`:
+    /// the region whose chunk or large block contains its data pointer,
+    /// interior pointers included). For anything else (an empty array, a
+    /// string literal, memory from another thread) this thread's program
+    /// region. Used to store values into a caller's container: they go
+    /// where the container's storage lives.
+    RegionOf(Box<LE>),
 }
 
 /// A case of `LS::Select`.

@@ -329,6 +329,7 @@ impl FnEmit<'_> {
 
     fn e(&self, e: &LE) -> String {
         match e {
+            LE::RegionOf(_) => "()".into(),
             LE::RegionProgram => "()".into(),
             LE::ChanNew(t, cap) => format!("Chan::<{}>::new({})", rty(t), self.e(cap)),
             LE::ChanLen(c) => format!("({}).len()", self.e(c)),

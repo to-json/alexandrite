@@ -550,6 +550,7 @@ impl FnEmit<'_> {
 
     fn e(&self, e: &LE) -> String {
         match e {
+            LE::RegionOf(_) => unimplemented!("R2: region_of in C"),
             LE::RegionProgram => "alx_region_program()".into(),
             LE::ChanNew(t, cap) => format!("alx_chan_new({}, sizeof({}))", self.e(cap), cty_mem(t)),
             LE::ChanLen(c) => format!("alx_chan_len({})", self.e(c)),

@@ -584,7 +584,11 @@ impl<'a> Lw<'a> {
         }
         let saved = self.defers.clone();
         for depth in (from..saved.len()).rev() {
+            // Errors in deferred code clean up only the outer blocks; a scope
+            // inside it sits below an empty level (so its own cleanup never
+            // looks like leaving the function, which frees the frame).
             self.defers.truncate(depth);
+            self.defers.push(vec![]);
             for e in saved[depth].iter().rev() {
                 self.stmt(&TStmt::Expr(e.clone()));
             }

@@ -1,0 +1,209 @@
+import "net"
+import "strings"
+import "strconv"
+
+# A body that outgrows this many buffered bytes switches the response to
+# chunked transfer coding (headers go out, then each write is a chunk).
+pub FLUSH_THRESHOLD = 32768
+
+struct RWState {
+  # 0 until write_header! (or the first write).
+  status: Int
+  # Body bytes held back so Content-Length can be sent.
+  body: [Byte]
+  head_sent: Bool
+  chunked: Bool
+  # Whether the connection must close after this response.
+  close_after: Bool
+  # The request used HTTP/1.1, so chunked coding is available.
+  can_chunk: Bool
+  head_request: Bool
+  # Bytes not yet written to the connection.
+  out: [Byte]
+}
+
+# What a handler writes its response to. Copies share state (D36), so it can
+# be passed around freely.
+#
+# Framing: the response is held in memory while the handler writes. If it
+# finishes with less than FLUSH_THRESHOLD bytes (and never called `flush!`),
+# it goes out with a `Content-Length`; otherwise the headers go out first with
+# `Transfer-Encoding: chunked` and each write is a chunk. HTTP/1.0 clients
+# always get a buffered, length-framed response. `Date` and `Server` headers
+# are not sent.
+pub struct ResponseWriter {
+  st: [RWState]
+  conn: net.Conn
+  # The response headers: set them before the first write.
+  header: Header
+
+  # Sets the status line. Only the first call counts; headers set after it
+  # (and a write) are not sent unless the response is still being buffered.
+  pub def write_header!(code: Int) {
+    return if st[0].status != 0
+    c = code
+    c = 500 if c < 100 || c > 999
+    self.st[0].status = c
+    return
+  }
+
+  pub def status -> Int { st[0].status }
+
+  # Appends p to the body (status 200 if none was set); p.size.
+  pub def write!(p: [Byte]) -> ~Int {
+    self.write_header!(200)
+    return p.size if st[0].head_request && st[0].head_sent
+    if st[0].head_sent {
+      self.~send_chunk!(p)
+      return p.size
+    }
+    for c in p { self.st[0].body << c }
+    if st[0].body.size >= FLUSH_THRESHOLD && st[0].can_chunk {
+      self.~start_stream!
+    }
+    p.size
+  }
+
+  pub def write_string!(s: Str) -> ~Int {
+    self.~write!(s.bytes.to_a)
+  }
+
+  # Sends what's buffered now (switching to chunked coding), so the client
+  # sees it before the handler is done. On HTTP/1.0 it does nothing.
+  pub def flush! -> ~Unit {
+    return if !st[0].can_chunk
+    self.write_header!(200)
+    self.~start_stream! unless st[0].head_sent
+    self.~flush_out!
+  }
+
+  def put_string!(s: Str) -> ~Unit {
+    for c in s.bytes { self.st[0].out << c }
+    return
+  }
+
+  def put!(p: [Byte]) -> ~Unit {
+    for c in p { self.st[0].out << c }
+    return
+  }
+
+  def flush_out! -> ~Unit {
+    return if st[0].out.size == 0
+    o = st[0].out
+    self.st[0].out = []
+    conn.~write!(o)
+    return
+  }
+
+  def bodyless? -> Bool {
+    s = st[0].status
+    s < 200 || s == 204 || s == 304
+  }
+
+  def send_head!(content_length: Int) -> ~Unit {
+    s = st[0].status
+    if content_length >= 0 {
+      header.set!("Content-Length", strconv.itoa(content_length)) unless bodyless?
+    } else {
+      header.set!("Transfer-Encoding", "chunked")
+      header.del!("Content-Length")
+    }
+    if !header.has?("Content-Type") && st[0].body.size > 0 && !bodyless? {
+      b = st[0].body
+      ctype = b[0] == 60 ? "text/html; charset=utf-8" : "text/plain; charset=utf-8"
+      header.set!("Content-Type", ctype)
+    }
+    if lower(header.get("Connection")) == "close" {
+      self.st[0].close_after = true
+    }
+    header.set!("Connection", "close") if st[0].close_after
+    self.~put_string!("HTTP/1.1 #{s} #{status_text(s)}\r\n")
+    for k in header.keys {
+      for v in header.values(k) {
+        self.~put_string!("#{k}: #{clean(v)}\r\n")
+      }
+    }
+    self.~put_string!("\r\n")
+    self.st[0].head_sent = true
+  }
+
+  def start_stream! -> ~Unit {
+    self.~send_head!(-1)
+    self.st[0].chunked = true
+    b = st[0].body
+    self.st[0].body = []
+    self.~send_chunk!(b)
+  }
+
+  def send_chunk!(p: [Byte]) -> ~Unit {
+    return if p.size == 0 || st[0].head_request
+    self.~put_string!(strconv.format_int(p.size, 16) + "\r\n")
+    self.~put!(p)
+    self.~put_string!("\r\n")
+    self.~flush_out! if st[0].out.size > 65536
+  }
+
+  # Called by the server when the handler returns: completes the response and
+  # flushes it. true if the connection stays usable.
+  def finish! -> ~Bool {
+    self.write_header!(200)
+    if !st[0].head_sent {
+      n = st[0].body.size
+      self.~send_head!(n)
+      if n > 0 && !st[0].head_request && !bodyless? {
+        self.~put!(st[0].body)
+      }
+    } else if st[0].chunked && !st[0].head_request {
+      self.~put_string!("0\r\n\r\n")
+    }
+    self.~flush_out!
+    !st[0].close_after
+  }
+}
+
+# A header value with CR and LF replaced by spaces (no response splitting).
+def clean(v: Str) -> Str {
+  return v unless strings.contains(v, "\n") || strings.contains(v, "\r")
+  strings.replace_all(strings.replace_all(v, "\r", " "), "\n", " ")
+}
+
+def new_response_writer(conn: net.Conn, head_request: Bool, can_chunk: Bool, close_after: Bool) -> ResponseWriter {
+  b: [Byte] = []
+  ob: [Byte] = []
+  s: [RWState] = [RWState.new(status: 0, body: b, head_sent: false, chunked: false, close_after: close_after, can_chunk: can_chunk, head_request: head_request, out: ob)]
+  ResponseWriter.new(st: s, conn: conn, header: new_header)
+}
+
+# Replies with the status `code` and `msg` as a text/plain body.
+pub def error(w: ResponseWriter, msg: Str, code: Int) {
+  w.header.del!("Content-Length")
+  w.header.set!("Content-Type", "text/plain; charset=utf-8")
+  w.header.set!("X-Content-Type-Options", "nosniff")
+  w.write_header!(code)
+  w.write_string!(msg + "\n")
+}
+
+# Replies "404 page not found".
+pub def not_found(w: ResponseWriter, r: Request) {
+  error(w, "404 page not found", 404)
+}
+
+def html_escape(s: Str) -> Str {
+  x = strings.replace_all(s, "&", "&amp;")
+  x = strings.replace_all(x, "<", "&lt;")
+  x = strings.replace_all(x, ">", "&gt;")
+  strings.replace_all(x, "\"", "&#34;")
+}
+
+# Replies with a redirect to `url` (a path or a full URL) and status `code`
+# (301, 302, 303, 307 or 308).
+pub def redirect(w: ResponseWriter, r: Request, url: Str, code: Int) {
+  w.header.set!("Location", url)
+  if r.method == "GET" || r.method == "HEAD" {
+    w.header.set!("Content-Type", "text/html; charset=utf-8")
+  }
+  w.write_header!(code)
+  if r.method == "GET" {
+    w.write_string!("<a href=\"" + html_escape(url) + "\">" + status_text(code) + "</a>.\n\n")
+  }
+}

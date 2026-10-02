@@ -34,4 +34,4 @@ Decisions R1–R10 and S1–S4 in `GO-VS-RUBY.md`.
 | R7 | **Explain** | `alx explain mem`: each allocation's region and why (what sends it to the program region); sites inside loops that pile up are marked |
 | L1 | **Text & data core** | strings, strconv, unicode, unicode/utf8, bytes, slices, maps, sort, math, fmt, errors — Go's APIs, alx idioms (S2); tuples, functions as values, blocks for function parameters. Done: 11 packages, 172 test blocks |
 | L2 | **Systems core** | os, io, bufio, time, flag, path, path/filepath over a C FFI (`extern def`); tasks sleep without blocking their worker. Done: 7 packages, 115 test blocks plus ~1,700 Go-generated assertions |
-| L3 | **Server core** | I/O event loop (netpoll) under R5's scheduler, net, net/http, context, sync, encoding/json via derives (S3) |
+| L3 | **Server core** | I/O event loop (kqueue/epoll) under R5's scheduler; net, net/http (Go 1.22 routing, keep-alive, client), encoding/json via `#[derive(Json)]` (S3), context, sync. Done: ~46k req/s in-process hello-world; 10k idle connections in 454 MB |

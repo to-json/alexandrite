@@ -1,0 +1,47 @@
+# Hello-world HTTP server under load, all in one process (client tasks share the
+# scheduler with the server's connection tasks):
+#   alx run --release acceptance/httpbench.alx
+#   ALX_MEMSTATS=1 /usr/bin/time -l alx run --release acceptance/httpbench.alx
+# CLIENTS keep-alive connections, each sending REQS requests one after another.
+import "bufio"
+import "net"
+import "net/http"
+import "time"
+
+CLIENTS = 50
+REQS = 200
+
+def hello(w: http.ResponseWriter, r: http.Request) -> Unit {
+  w.write_string!("hello, world\n")
+}
+
+mux = http.new_serve_mux
+mux.handle_func("GET /hello", hello)
+srv = http.new_server(mux)
+ln = net.listen("tcp", "127.0.0.1:0").unwrap
+port = ln.port
+spawn { srv.serve(ln) }
+
+start = time.now
+clients = (1..CLIENTS).map { |_|
+  spawn {
+    c = net.dial("tcp", "127.0.0.1:#{port}").unwrap
+    c.set_nodelay(true)
+    br = bufio.new_reader(c)
+    ok = 0
+    i = 0
+    while i < REQS {
+      c.write_string!("GET /hello HTTP/1.1\r\nHost: bench\r\n\r\n").unwrap
+      resp = http.read_response(br, false).unwrap
+      ok += 1 if resp.status == 200 && resp.body.size == 13
+      i += 1
+    }
+    c.close!.unwrap
+    ok
+  }
+}.to_a
+total = clients.sum { it.wait.unwrap }
+elapsed = time.now.unix_nano - start.unix_nano
+secs = elapsed.to_f / 1e9
+puts "#{total} requests ok in #{secs}s = #{total.to_f / secs} req/s"
+srv.shutdown

@@ -550,14 +550,25 @@ mod rt {
         fn poll(fds: *mut PollFd, n: std::ffi::c_ulong, ms: i32) -> i32;
     }
     pub unsafe fn shim_alx_fd_wait(fd: i64, mode: i64) -> i64 {
-        let mut p = PollFd { fd: fd as i32, events: if mode == 1 { 1 } else { 4 }, revents: 0 };
-        while unsafe { poll(&mut p, 1, -1) } < 0 {
-            let e = std::io::Error::last_os_error();
-            if e.raw_os_error() != Some(4) {
-                return neg_errno(&e);
+        // In slices: closing a descriptor in another thread doesn't wake a
+        // poll on it (macOS), so check now and then that it's still open.
+        loop {
+            let mut p = PollFd { fd: fd as i32, events: if mode == 1 { 1 } else { 4 }, revents: 0 };
+            let r = unsafe { poll(&mut p, 1, 50) };
+            if r > 0 {
+                return 0;
+            }
+            if r < 0 {
+                let e = std::io::Error::last_os_error();
+                if e.raw_os_error() != Some(4) {
+                    return neg_errno(&e);
+                }
+            }
+            // F_GETFD (1) fails with EBADF once the descriptor is closed.
+            if unsafe { libc_fcntl(fd as i32, 1) } < 0 {
+                return 0;
             }
         }
-        0
     }
     pub unsafe fn shim_alx_fd_close(fd: i64) -> i64 {
         if unsafe { close(fd as i32) } == 0 { 0 } else { neg_errno(&std::io::Error::last_os_error()) }

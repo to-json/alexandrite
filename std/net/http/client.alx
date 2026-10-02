@@ -1,0 +1,114 @@
+import "bufio"
+import "net"
+import "strings"
+import "strconv"
+
+# An HTTP/1.1 client. Each request opens its own connection and sends
+# `Connection: close` (no connection pool, no keep-alive on the client side).
+# Responses may be length-framed, chunked or read to end of stream. Redirects
+# (301, 302, 303, 307, 308) are followed up to `max_redirects` times, to http://
+# locations or paths on the same host. No timeouts (net has no deadlines), no
+# TLS (an https:// URL is an error), no proxies, no cookies.
+pub struct Client {
+  # 0 turns redirect following off.
+  max_redirects: Int
+
+  # Sends `req` and reads the whole response.
+  pub def do(req: Request) -> ~Response {
+    cur = req
+    n = 0
+    loop {
+      resp = ~send_once(cur)
+      redirect = resp.status == 301 || resp.status == 302 || resp.status == 303 || resp.status == 307 || resp.status == 308
+      loc = resp.header.get("Location")
+      return resp if !redirect || loc.size == 0 || n >= max_redirects
+      n += 1
+      u = ~parse_url(cur.url)
+      target = loc
+      if strings.has_prefix(loc, "/") {
+        target = "http://#{u.host_header}#{loc}"
+      }
+      nxt = ~new_request(cur.method, target, cur.body)
+      for k in cur.header.keys {
+        for v in cur.header.values(k) { nxt.header.add!(k, v) }
+      }
+      if resp.status == 303 || ((resp.status == 301 || resp.status == 302) && cur.method != "GET" && cur.method != "HEAD") {
+        nxt.method = "GET"
+        nxt.body = []
+        nxt.header.del!("Content-Type")
+        nxt.header.del!("Content-Length")
+      }
+      cur = nxt
+    }
+  }
+
+  pub def get(url: Str) -> ~Response {
+    req = ~new_request("GET", url, [])
+    self.~do(req)
+  }
+
+  pub def head(url: Str) -> ~Response {
+    req = ~new_request("HEAD", url, [])
+    self.~do(req)
+  }
+
+  pub def post(url: Str, content_type: Str, body: Str) -> ~Response {
+    self.~post_bytes(url, content_type, body.bytes.to_a)
+  }
+
+  pub def post_bytes(url: Str, content_type: Str, body: [Byte]) -> ~Response {
+    req = ~new_request("POST", url, body)
+    req.header.set!("Content-Type", content_type)
+    self.~do(req)
+  }
+}
+
+pub def new_client -> Client {
+  Client.new(max_redirects: 10)
+}
+
+def send_once(req: Request) -> ~Response {
+  u = ~parse_url(req.url)
+  conn = ~net.dial("tcp", u.host_port)
+  bw = bufio.new_writer(conn)
+  br = bufio.new_reader(conn)
+  h = req.header.clone
+  h.set!("Host", req.host) unless h.has?("Host")
+  h.set!("Connection", "close")
+  h.set!("User-Agent", "alx-http/1") unless h.has?("User-Agent")
+  has_body = req.body.size > 0 || req.method == "POST" || req.method == "PUT" || req.method == "PATCH"
+  h.set!("Content-Length", strconv.itoa(req.body.size)) if has_body
+  bw.~write_string!("#{req.method} #{u.request_uri} HTTP/1.1\r\n")
+  for k in h.keys {
+    for v in h.values(k) {
+      bw.~write_string!("#{k}: #{clean(v)}\r\n")
+    }
+  }
+  bw.~write_string!("\r\n")
+  bw.~write!(req.body) if req.body.size > 0
+  bw.~flush!
+  resp = read_response(br, req.method == "HEAD")
+  conn.close!
+  ~resp
+}
+
+# One-off helpers using a default client.
+pub def get(url: Str) -> ~Response {
+  c = new_client
+  c.~get(url)
+}
+
+pub def head(url: Str) -> ~Response {
+  c = new_client
+  c.~head(url)
+}
+
+pub def post(url: Str, content_type: Str, body: Str) -> ~Response {
+  c = new_client
+  c.~post(url, content_type, body)
+}
+
+pub def post_bytes(url: Str, content_type: Str, body: [Byte]) -> ~Response {
+  c = new_client
+  c.~post_bytes(url, content_type, body)
+}

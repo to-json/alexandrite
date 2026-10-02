@@ -1,0 +1,188 @@
+import "strings"
+import "strconv"
+
+pub error HttpError {
+  # A malformed request (the server answers 400).
+  BadRequest(why: Str)
+  # A malformed response from the server.
+  BadResponse(why: Str)
+  # A URL the client can't use.
+  BadUrl(why: Str)
+  # A message over the size limits.
+  TooLarge(why: Str)
+  # The connection ended in the middle of a message.
+  Eof(what: Str)
+  # `serve` returns this once `shutdown` has been called.
+  ServerClosed
+
+  def message -> Str {
+    case self {
+      BadRequest(w) => "http: bad request: #{w}"
+      BadResponse(w) => "http: bad response: #{w}"
+      BadUrl(w) => "http: bad url: #{w}"
+      TooLarge(w) => "http: too large: #{w}"
+      Eof(w) => "http: unexpected EOF in #{w}"
+      ServerClosed => "http: Server closed"
+    }
+  }
+}
+
+def hex_val(c: Byte) -> Int {
+  return c.to_i - 48 if c >= 48 && c <= 57
+  return c.to_i - 87 if c >= 97 && c <= 102
+  return c.to_i - 55 if c >= 65 && c <= 70
+  -1
+}
+
+HEX = "0123456789ABCDEF"
+
+# Percent-decodes s. With `plus`, "+" is a space (query strings); paths keep it.
+pub def unescape(s: Str, plus: Bool) -> ~Str {
+  return s if !strings.contains(s, "%") && !(plus && strings.contains(s, "+"))
+  out: [Byte] = []
+  i = 0
+  n = s.size
+  while i < n {
+    c = s[i]
+    if c == 37 {
+      fail HttpError.BadRequest("invalid URL escape in #{s}") if i + 2 >= n
+      h = hex_val(s[i + 1])
+      l = hex_val(s[i + 2])
+      fail HttpError.BadRequest("invalid URL escape in #{s}") if h < 0 || l < 0
+      out << (h * 16 + l).as_u8
+      i += 3
+    } else if c == 43 && plus {
+      out << 32
+      i += 1
+    } else {
+      out << c
+      i += 1
+    }
+  }
+  Str.from_bytes(out)
+}
+
+def unreserved(c: Byte) -> Bool {
+  (c >= 97 && c <= 122) || (c >= 65 && c <= 90) || (c >= 48 && c <= 57) || c == 45 || c == 95 || c == 46 || c == 126
+}
+
+# Escapes s for a query component: unreserved bytes stay, space is "+",
+# everything else is %XX.
+pub def query_escape(s: Str) -> Str {
+  escape(s, true)
+}
+
+# Escapes s for a path segment (space is %20).
+pub def path_escape(s: Str) -> Str {
+  escape(s, false)
+}
+
+def escape(s: Str, plus: Bool) -> Str {
+  out: [Byte] = []
+  for c in s.bytes {
+    if unreserved(c) {
+      out << c
+    } else if c == 32 && plus {
+      out << 43
+    } else {
+      out << 37
+      out << HEX[c.to_i >> 4]
+      out << HEX[c.to_i & 15]
+    }
+  }
+  Str.from_bytes(out)
+}
+
+# The value of `key` in a raw query string ("a=1&b=2"), decoded; the first
+# one wins. none if absent or undecodable.
+pub def query_value(raw: Str, key: Str) -> Str? {
+  for part in strings.split(raw, "&") {
+    next if part.size == 0
+    k = part
+    v = ""
+    if kv = strings.cut(part, "=") {
+      k, v = kv
+    }
+    dk = unescape(k, true).unwrap_or(k)
+    if dk == key {
+      d = unescape(v, true)
+      return d.unwrap_or(v)
+    }
+  }
+  none
+}
+
+# Every (key, value) pair of a raw query string, decoded, in order.
+pub def query_pairs(raw: Str) -> [(Str, Str)] {
+  out: [(Str, Str)] = []
+  for part in strings.split(raw, "&") {
+    next if part.size == 0
+    k = part
+    v = ""
+    if kv = strings.cut(part, "=") {
+      k, v = kv
+    }
+    out << (unescape(k, true).unwrap_or(k), unescape(v, true).unwrap_or(v))
+  }
+  out
+}
+
+# A parsed "http://host:port/path?query" (the only scheme the client speaks).
+pub struct Url {
+  scheme: Str
+  host: Str
+  port: Int
+  path: Str
+  raw_query: Str
+
+  # "host:port" for dialing.
+  pub def host_port -> Str {
+    "#{host}:#{port}"
+  }
+
+  # The Host header value (the port is left out when it's the default).
+  pub def host_header -> Str {
+    return host if port == 80 && scheme == "http"
+    return host if port == 443 && scheme == "https"
+    "#{host}:#{port}"
+  }
+
+  # The request target: path plus "?query".
+  pub def request_uri -> Str {
+    p = path.size == 0 ? "/" : path
+    raw_query.size == 0 ? p : "#{p}?#{raw_query}"
+  }
+}
+
+pub def parse_url(u: Str) -> ~Url {
+  rest = u
+  scheme = "http"
+  if i = strings.cut(u, "://") {
+    scheme, rest = i
+  }
+  fail HttpError.BadUrl("unsupported scheme #{scheme}") if scheme != "http"
+  fail HttpError.BadUrl("missing host in #{u}") if rest.size == 0
+  j = strings.index_any(rest, "/?")
+  hostport = rest
+  tail = ""
+  if j >= 0 {
+    hostport = rest[0...j]
+    tail = rest[j...rest.size]
+  }
+  path = tail
+  query = ""
+  if pq = strings.cut(tail, "?") {
+    path, query = pq
+  }
+  fail HttpError.BadUrl("missing host in #{u}") if hostport.size == 0
+  host = hostport
+  port = 80
+  c = strings.last_index(hostport, ":")
+  if c >= 0 && !strings.has_suffix(hostport, "]") {
+    host = hostport[0...c]
+    port = strconv.atoi(hostport[c + 1...hostport.size]).unwrap_or(-1)
+    fail HttpError.BadUrl("invalid port in #{u}") if port < 0 || port > 65535
+  }
+  host = host[1...host.size - 1] if host.size > 1 && host[0] == 91
+  Url.new(scheme: scheme, host: host, port: port, path: path, raw_query: query)
+}

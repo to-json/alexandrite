@@ -101,6 +101,7 @@ GROUPS = {
     "l2fixes": "L2",
     "echo": "L3",
     "jsondemo": "L3",
+    "httpdemo": "L3",
 }
 
 

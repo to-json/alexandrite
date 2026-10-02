@@ -30,6 +30,10 @@ pub enum Ty {
     Error,
     /// `~T` held as a value: a T or an Error.
     Result(Box<Ty>),
+    /// A spawned task whose body produces this (a `~T` if it uses `~`).
+    Task(Box<Ty>),
+    /// A channel of T.
+    Chan(Box<Ty>),
     /// A function value (`(A, B) -> R`): one of the program's lambda
     /// literals of this type, with its captured values.
     Fn(Vec<Ty>, Box<Ty>),
@@ -77,6 +81,8 @@ impl Ty {
             Ty::Map(k, v) => format!("Map[{}, {}]", k.show(), v.show()),
             Ty::Error => "Error".into(),
             Ty::Result(t) => format!("~{}", t.show()),
+            Ty::Task(t) => format!("Task[{}]", t.show()),
+            Ty::Chan(t) => format!("Chan[{}]", t.show()),
             Ty::Fn(ps, r) => format!("({}) -> {}", ps.iter().map(Ty::show).collect::<Vec<_>>().join(", "), r.show()),
             Ty::Tuple(ts) => format!("({})", ts.iter().map(Ty::show).collect::<Vec<_>>().join(", ")),
             Ty::Range => "Range[Int]".into(),
@@ -95,7 +101,7 @@ impl Ty {
             Ty::Tuple(ts) => ts.iter().any(Ty::has_var),
             Ty::Map(k, v) => k.has_var() || v.has_var(),
             Ty::Fn(ps, r) => ps.iter().any(Ty::has_var) || r.has_var(),
-            Ty::Result(t) => t.has_var(),
+            Ty::Result(t) | Ty::Task(t) | Ty::Chan(t) => t.has_var(),
             _ => false,
         }
     }
@@ -261,6 +267,16 @@ pub enum M {
     ResUnwrap,
     ResUnwrapOr,
     ResRescue,
+    /// `spawn { }` (the block); args are its captured locals.
+    Spawn,
+    /// `t.wait` → ~T.
+    TaskWait,
+    /// `Chan[T].new(cap)`; `send`/`<<`, `recv` (T?), `close`, `size`.
+    ChanNew,
+    ChanSend,
+    ChanRecv,
+    ChanClose,
+    ChanLen,
     /// A lambda literal (the block); args are its captured locals.
     Lambda,
     /// Call a function value: recv is the function, args its arguments.
@@ -338,6 +354,15 @@ pub enum TK {
     None,
     /// A present T?.
     Some(Box<TExpr>),
+    /// `select { when ... }`: the arms, then the `else` body if any.
+    Select(Vec<TSelArm>, Option<Vec<TStmt>>),
+}
+
+#[derive(Clone, Debug)]
+pub enum TSelArm {
+    /// `when v = ch.recv`: binds the local (a T?) for the body.
+    Recv { ch: TExpr, bind: Option<LocalId>, body: Vec<TStmt> },
+    Send { ch: TExpr, val: TExpr, body: Vec<TStmt> },
 }
 
 #[derive(Clone, Debug, PartialEq)]

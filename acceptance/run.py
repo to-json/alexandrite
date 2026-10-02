@@ -160,6 +160,20 @@ def negative_runtime(case, group):
     check(group, f"{case} runtime failure", status_ok and not missing, f"exit {r.returncode}" + (f", missing {missing}" if missing else ""))
 
 
+def modules():
+    d = CASES / "modtest"
+    env = {"ALX_MODCACHE": str(d / "cache")}
+    want = (d / "main.expected").read_text().strip()
+    r, _ = run([ALX, "run", "main.alx"], cwd=d, env=env)
+    check("M6", "modtest require+replace+MVS output", r.stdout.strip() == want and r.returncode == 0, f"got {r.stdout.strip()!r} {r.stderr.strip()[:200]}")
+    r, _ = run([ALX, "run", "bad.alx"], cwd=d, env=env)
+    want = (d / "bad.expected_error").read_text().strip().splitlines()
+    got = [l.rstrip() for l in r.stderr.splitlines()[:2]]
+    check("M6", "modtest unrequired import error", got == want and r.returncode == 1, f"got {got}")
+    r, _ = run([ALX, "run", "main.alx"], cwd=d, env={"ALX_MODCACHE": str(WORK / "empty-cache")})
+    check("M6", "modtest missing cache dir error", "isn't in the module cache" in r.stderr and r.returncode == 1, r.stderr.strip()[:200])
+
+
 def promote_overhead():
     tmp = WORK / "promote"
     tmp.mkdir(exist_ok=True)
@@ -268,6 +282,9 @@ def main():
         negative_compile("packages.bad2", "M6")
         negative_compile("packages.bad3", "M6")
         negative_compile("refinements.bad1", "M6")
+    if not filt or "mod" in filt:
+        print("== modules", flush=True)
+        modules()
     if not filt or "A3" in filt:
         print("== A3 promote overhead", flush=True)
         promote_overhead()

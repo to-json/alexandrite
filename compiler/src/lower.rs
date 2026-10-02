@@ -102,6 +102,8 @@ pub fn lty(t: &Ty, mode: Overflow) -> LTy {
         // Error: (type tag, location, wrap context, then each error type's value).
         Ty::Error => LTy::Tup([LTy::I64, LTy::Str, LTy::Str].into_iter().chain(ERRORS.with(|e| e.borrow().clone()).iter().map(|t| lty(t, mode))).collect()),
         Ty::Result(t) => result_lty(lty(t, mode), mode),
+        Ty::Task(t) => LTy::Task(Box::new(lty(t, mode))),
+        Ty::Chan(t) => LTy::Chan(Box::new(lty(t, mode))),
         Ty::Fn(..) => LTy::Tup(std::iter::once(LTy::I64).chain(lambda_sites(t).iter().map(|(_, caps)| LTy::Tup(caps.iter().map(|c| lty(c, mode)).collect()))).collect()),
         Ty::Iface(n) => {
             let impls = IFACES.with(|m| m.borrow().get(n).cloned().unwrap_or_default());
@@ -542,6 +544,55 @@ impl<'a> Lw<'a> {
                 let t = self.lty(&e.ty);
                 let v = self.arg(x);
                 LE::Tup(t, vec![LE::B(true), v])
+            }
+            TK::Select(arms, default) => {
+                let mut cases = vec![];
+                let mut recv_vars = vec![];
+                for a in arms {
+                    match a {
+                        TSelArm::Recv { ch, .. } => {
+                            let c = self.expr(ch);
+                            let lt = self.lty(&ch.ty);
+                            let c = self.bind(c, lt.clone());
+                            let LTy::Chan(el) = lt else { unreachable!() };
+                            let (ok, val) = (self.tmp(LTy::Bool), self.tmp((*el).clone()));
+                            self.emit(LS::Set(val, zero_le(&el)));
+                            cases.push(SelCase::Recv { ch: c, ok, val });
+                            recv_vars.push(Some((ok, val)));
+                        }
+                        TSelArm::Send { ch, val, .. } => {
+                            let c = self.expr(ch);
+                            let c = self.bind(c, self.lty(&ch.ty));
+                            let v = self.arg(val);
+                            let v = self.bind(v, self.lty(&val.ty));
+                            cases.push(SelCase::Send { ch: c, val: v });
+                            recv_vars.push(None);
+                        }
+                    }
+                }
+                let dst = self.tmp(LTy::I64);
+                let n = cases.len();
+                self.emit(LS::Select { cases, default: default.is_some(), dst });
+                for (i, a) in arms.iter().enumerate() {
+                    let body = self.sub(|lw| {
+                        if let (TSelArm::Recv { bind: Some(l), ch, .. }, Some((ok, val))) = (a, recv_vars[i]) {
+                            let Ty::Chan(t) = &ch.ty else { unreachable!() };
+                            let ot = lw.lty(&Ty::Opt(t.clone()));
+                            let v = lw.var_of(*l);
+                            lw.emit(LS::Set(v, LE::Tup(ot, vec![LE::Var(ok), LE::Var(val)])));
+                        }
+                        let b = match a {
+                            TSelArm::Recv { body, .. } | TSelArm::Send { body, .. } => body,
+                        };
+                        lw.stmts(b);
+                    });
+                    self.emit(LS::If(LE::Cmp(Op::Eq, Box::new(LE::Var(dst)), Box::new(LE::I(i as i64)), LTy::I64), body, vec![]));
+                }
+                if let Some(d) = default {
+                    let body = self.sub(|lw| lw.stmts(d));
+                    self.emit(LS::If(LE::Cmp(Op::Eq, Box::new(LE::Var(dst)), Box::new(LE::I(n as i64)), LTy::I64), body, vec![]));
+                }
+                LE::Unit
             }
             TK::Str(s) => LE::S(s.clone()),
             TK::Bool(b) => LE::B(*b),
@@ -1880,6 +1931,98 @@ impl<'a> Lw<'a> {
                     None => LE::Unit,
                 }
             }
+            Spawn => {
+                let b = blk.unwrap();
+                let Ty::Task(produced) = &e.ty else { unreachable!() };
+                let fallible = matches!(**produced, Ty::Result(_));
+                let ok_ty = match &**produced {
+                    Ty::Result(t) => (**t).clone(),
+                    t => t.clone(),
+                };
+                let cap_tys: Vec<LTy> = args.iter().map(|a| self.lty(&a.ty)).collect();
+                let env_t = LTy::Tup(cap_tys.clone());
+                // The body becomes a worker: unpack the captured copies, run, return.
+                let mut w = Lw::new(self.p, self.sm, self.opts, self.f, self.mode, ErrPath::Return(vec![]), self.prog);
+                if fallible {
+                    w.res = Some(ok_lty(w.lty(&ok_ty)));
+                }
+                let env = w.new_var("env", env_t.clone());
+                let mut body = vec![];
+                for (j, a) in args.iter().enumerate() {
+                    let TK::Local(l) = a.kind else { unreachable!() };
+                    let v = w.var_of(l);
+                    body.push(LS::Set(v, LE::Field(Box::new(LE::Var(env)), j)));
+                }
+                let (stmts, v) = w.sub_val(|w| w.scoped_value(&b.body, &ok_ty));
+                body.extend(stmts);
+                let out_t = if fallible { result_lty(w.lty(&ok_ty), self.mode) } else { ok_lty(w.lty(&ok_ty)) };
+                let v = if fallible { w.ok_result(if ok_ty == Ty::Unit { LE::B(false) } else { v }) } else if ok_ty == Ty::Unit { LE::B(false) } else { v };
+                body.push(LS::Return(Some(v)));
+                let mut prog = self.prog.borrow_mut();
+                let id = prog.workers.len();
+                let func = LFunc { name: format!("worker{id}"), params: vec![env], vars: std::mem::take(&mut w.vars), ret: out_t, body, external: false, is_main: false, labels: w.labels };
+                prog.workers.push(LWorker { id, input: env_t.clone(), func });
+                drop(prog);
+                let caps: Vec<LE> = args.iter().map(|a| self.arg(a)).collect();
+                let lt = self.lty(&e.ty);
+                let dst = self.tmp(lt);
+                self.emit(LS::Spawn { dst, worker: id, env: LE::Tup(env_t, caps) });
+                LE::Var(dst)
+            }
+            TaskWait => {
+                let r = recv.unwrap();
+                let Ty::Task(produced) = &r.ty else { unreachable!() };
+                let tv = self.expr(r);
+                let tv = self.bind(tv, self.lty(&r.ty));
+                let LTy::Task(inner) = self.lty(&r.ty) else { unreachable!() };
+                let (ok, val, msg) = (self.tmp(LTy::Bool), self.tmp((*inner).clone()), self.tmp(LTy::Str));
+                self.emit(LS::Set(val, zero_le(&inner)));
+                self.emit(LS::Wait { task: tv, ok, val, msg });
+                let rt = self.lty(&e.ty);
+                let out = self.tmp(rt.clone());
+                let good = if matches!(**produced, Ty::Result(_)) {
+                    LE::Var(val)
+                } else {
+                    let et = self.lty(&Ty::Error);
+                    LE::Tup(rt.clone(), vec![LE::B(true), LE::Var(val), zero_le(&et)])
+                };
+                let panicked = self.make_error("TaskError", 0, vec![LE::Var(msg)], sp);
+                let LTy::Tup(ts) = &rt else { unreachable!() };
+                let bad = LE::Tup(rt.clone(), vec![LE::B(false), zero_le(&ts[1]), panicked]);
+                self.emit(LS::Set(out, LE::Cond(Box::new(LE::Var(ok)), Box::new(good), Box::new(bad))));
+                LE::Var(out)
+            }
+            ChanNew => {
+                let Ty::Chan(t) = &e.ty else { unreachable!() };
+                let el = self.lty(t);
+                let cap = self.expr(&args[0]);
+                let cap = self.int_in(cap, args[0].span);
+                LE::ChanNew(el, Box::new(cap))
+            }
+            ChanSend => {
+                let c = self.expr(recv.unwrap());
+                let v = self.arg(&args[0]);
+                self.emit(LS::ChanSend { ch: c, val: v, loc: self.loc(sp) });
+                LE::Unit
+            }
+            ChanRecv => {
+                let r = recv.unwrap();
+                let c = self.expr(r);
+                let LTy::Chan(el) = self.lty(&r.ty) else { unreachable!() };
+                let (ok, val) = (self.tmp(LTy::Bool), self.tmp((*el).clone()));
+                self.emit(LS::Set(val, zero_le(&el)));
+                self.emit(LS::ChanRecv { ch: c, ok, val });
+                LE::Tup(self.lty(&e.ty), vec![LE::Var(ok), LE::Var(val)])
+            }
+            ChanClose => {
+                let c = self.expr(recv.unwrap());
+                self.emit(LS::ChanClose { ch: c, loc: self.loc(sp) });
+                LE::Unit
+            }
+            ChanLen => {
+                let c = self.expr(recv.unwrap());
+                self.int_out(LE::ChanLen(Box::new(c)))
+            }
             ToIface(k) => {
                 let lt = self.lty(&e.ty);
                 let LTy::Tup(ts) = &lt else { unreachable!() };
@@ -2574,6 +2717,22 @@ impl<'a> Lw<'a> {
                 });
                 self.emit(LS::Loop(l, body));
             }
+            (_, Ty::Chan(t)) => {
+                // Receive until the channel is closed and drained.
+                let cv = self.expr(base);
+                let cv = self.bind(cv, base_lty.clone());
+                let el = self.lty(t);
+                let l = own_label.unwrap_or_else(|| self.label());
+                let body = self.sub(|lw| {
+                    let ok = lw.tmp(LTy::Bool);
+                    let x = lw.tmp(el.clone());
+                    lw.emit(LS::Set(x, zero_le(&el)));
+                    lw.emit(LS::ChanRecv { ch: cv.clone(), ok, val: x });
+                    lw.emit(LS::If(LE::Not(Box::new(LE::Var(ok))), vec![LS::Break(l)], vec![]));
+                    lw.apply(&st, 0, LE::Var(x), None, l, outer, k);
+                });
+                self.emit(LS::Loop(l, body));
+            }
             (_, Ty::Gen(t)) => {
                 let gv = self.expr(base);
                 let gv = self.bind(gv, base_lty.clone());
@@ -2834,6 +2993,23 @@ fn collect_locals(e: &TExpr, out: &mut Vec<LocalId>) {
             collect_locals(b, out);
         }
         TK::Neg(x) | TK::Not(x) | TK::Try(x) | TK::Puts(x) | TK::Some(x) => collect_locals(x, out),
+        TK::Select(arms, d) => {
+            for a in arms {
+                match a {
+                    TSelArm::Recv { ch, bind, body } => {
+                        collect_locals(ch, out);
+                        out.extend(bind.iter().copied());
+                        body.iter().for_each(|s| collect_locals_stmt(s, out));
+                    }
+                    TSelArm::Send { ch, val, body } => {
+                        collect_locals(ch, out);
+                        collect_locals(val, out);
+                        body.iter().for_each(|s| collect_locals_stmt(s, out));
+                    }
+                }
+            }
+            d.iter().flatten().for_each(|s| collect_locals_stmt(s, out));
+        }
         TK::Slice(a, lo, hi, _) => {
             collect_locals(a, out);
             lo.iter().chain(hi.iter()).for_each(|x| collect_locals(x, out));
@@ -2916,7 +3092,9 @@ fn out_of_range(k: IntKind, r: LE) -> LE {
 /// The zero value of a LIR type, as an expression.
 fn zero_le(t: &LTy) -> LE {
     match t {
-        LTy::Task(_) | LTy::Chan(_) => unimplemented!("M7: zero value of a task/channel handle"),
+        // A fresh closed-over channel stands in for "no channel" (never observed).
+        LTy::Chan(e) => LE::ChanNew((**e).clone(), Box::new(LE::I(0))),
+        LTy::Task(_) => panic!("a task handle has no zero value"),
         LTy::I64 | LTy::IntK(_) => LE::I(0),
         LTy::F64 => LE::F(0.0),
         LTy::Bool => LE::B(false),

@@ -340,4 +340,22 @@ void alx_sys_dir_close(int64_t h);
 /* The i-th "NAME=value" of the environment, NULL past the end. */
 const char *alx_environ(int64_t i);
 
+/* ---------- the I/O event loop and sockets (std net, L3) ---------- */
+/* Wait until fd is readable (mode 1) or writable (mode 2) or in error: parks a
+ * task (poller thread), poll(2)s otherwise. 0, or -errno if fd can't be polled. */
+int64_t alx_fd_wait(int64_t fd, int64_t mode);
+/* close(2) that wakes tasks waiting on fd first. 0 or -errno. */
+int64_t alx_fd_close(int64_t fd);
+/* Sockets: non-blocking, close-on-exec fds; negative results are -errno
+ * (-100000: name not found). Address buffers must hold 64 bytes. */
+int64_t alx_sock_listen(const char *host, int64_t port, int64_t backlog);
+int64_t alx_sock_accept(int64_t fd, uint8_t *out_addr);
+int64_t alx_sock_connect(const char *host, int64_t port);
+int64_t alx_sock_error(int64_t fd);
+int64_t alx_sock_local_addr(int64_t fd, uint8_t *out);
+int64_t alx_sock_peer_addr(int64_t fd, uint8_t *out);
+int64_t alx_sock_set_nodelay(int64_t fd, int64_t on);
+int64_t alx_sock_shutdown(int64_t fd, int64_t how);
+int64_t alx_sock_lookup(const char *host, uint8_t *out, int64_t n);
+
 #endif

@@ -1,0 +1,171 @@
+import "io"
+
+def b(s: Str) -> [Byte] { s.bytes.to_a }
+
+# Echoes everything it reads back until end of stream.
+def echo(c: Conn) -> Int {
+  buf: [Byte] = [0; 256]
+  total = 0
+  loop {
+    n = c.read!(buf).unwrap
+    break if n == 0
+    c.write!(buf[0...n]).unwrap
+    total += n
+  }
+  c.close!.unwrap
+  total
+}
+
+test "split and join host port" {
+  h, p = split_host_port("example.com:80").unwrap
+  assert_eq h, "example.com"
+  assert_eq p, "80"
+  h, p = split_host_port(":8080").unwrap
+  assert_eq h, ""
+  assert_eq p, "8080"
+  h, p = split_host_port("[::1]:443").unwrap
+  assert_eq h, "::1"
+  assert_eq p, "443"
+  assert_eq split_host_port("nohost").err.unwrap.message, "address nohost: missing port in address"
+  assert_eq split_host_port("a:b:c").err.unwrap.message, "address a:b:c: too many colons in address"
+  assert_eq join_host_port("::1", "80"), "[::1]:80"
+  assert_eq join_host_port("h", "80"), "h:80"
+  assert_eq join_host_port("", "80"), ":80"
+}
+
+test "listen picks a port" {
+  l = listen("tcp", "127.0.0.1:0").unwrap
+  h, p = split_host_port(l.addr).unwrap
+  assert_eq h, "127.0.0.1"
+  assert p != "0"
+  l.close!.unwrap
+  assert l.close!.err?, "second close fails"
+}
+
+test "echo server and client in one process" {
+  l = listen("tcp", "127.0.0.1:0").unwrap
+  addr = "127.0.0.1:#{l.port}"
+  srv = spawn {
+    sc = l.~accept
+    echo(sc)
+  }
+  c = dial("tcp", addr).unwrap
+  assert_eq c.remote_addr, addr
+  assert c.local_addr.size > 0
+  assert_eq c.write_string!("hello, net").unwrap, 10
+  buf: [Byte] = [0; 64]
+  got = 0
+  while got < 10 {
+    got += c.read!(buf[got...64]).unwrap
+  }
+  assert_eq Str.from_bytes(buf[0...10]), "hello, net"
+  c.close_write!.unwrap
+  assert_eq c.read!(buf).unwrap, 0
+  assert_eq srv.wait.unwrap, 10
+  c.close!.unwrap
+}
+
+test "many concurrent clients" {
+  l = listen("tcp", "127.0.0.1:0").unwrap
+  addr = "127.0.0.1:#{l.port}"
+  n = 200
+  spawn {
+    handlers = (1..n).map { |_|
+      c = l.~accept
+      spawn { echo(c) }
+    }.to_a
+    handlers.sum { it.wait.unwrap }
+  }
+  clients = (1..n).map { |i|
+    spawn {
+      c = ~dial("tcp", addr)
+      msg = "client #{i}"
+      c.~write!(b(msg))
+      c.~close_write!
+      got = ~io.read_all(c)
+      c.~close!
+      Str.from_bytes(got) == msg ? i : 0
+    }
+  }.to_a
+  total = clients.sum { it.wait.unwrap }
+  assert_eq total, n * (n + 1) / 2
+}
+
+test "connection refused" {
+  # Port 1 on loopback: nothing listens there.
+  e = dial("tcp", "127.0.0.1:1").err.unwrap
+  assert_eq e.message, "dial tcp 127.0.0.1:1: connect: connection refused"
+  assert is_conn_refused(e)
+  case e {
+    ConnRefused => assert true
+    _ => assert false, "expected ConnRefused"
+  }
+}
+
+test "address in use" {
+  l = listen("tcp", "127.0.0.1:0").unwrap
+  e = listen("tcp", l.addr).err.unwrap
+  case e {
+    AddrInUse => assert true
+    _ => assert false, "expected AddrInUse: #{e.message}"
+  }
+  l.close!.unwrap
+}
+
+test "read EOF after the peer closes" {
+  l = listen("tcp", "127.0.0.1:0").unwrap
+  addr = "127.0.0.1:#{l.port}"
+  spawn {
+    c = l.~accept
+    c.~write_string!("bye")
+    c.~close!
+  }
+  c = dial("tcp", addr).unwrap
+  all = io.read_all(c).unwrap
+  assert_eq Str.from_bytes(all), "bye"
+  buf: [Byte] = [0; 8]
+  assert_eq c.read!(buf).unwrap, 0
+  c.close!.unwrap
+}
+
+test "closing a listener wakes accept" {
+  l = listen("tcp", "127.0.0.1:0").unwrap
+  t = spawn {
+    r = l.accept
+    r.err?
+  }
+  alx_sleep_ns(30_000_000)
+  l.close!.unwrap
+  assert t.wait.unwrap
+}
+
+test "use after close" {
+  l = listen("tcp", "127.0.0.1:0").unwrap
+  addr = "127.0.0.1:#{l.port}"
+  spawn {
+    sc = l.~accept
+    echo(sc)
+  }
+  c = dial("tcp", addr).unwrap
+  c.close!.unwrap
+  e = c.write_string!("x").err.unwrap
+  assert is_closed(e)
+  assert_eq e.message, "write #{addr}: use of closed network connection"
+}
+
+test "dial timeout succeeds when the peer answers" {
+  l = listen("tcp", "127.0.0.1:0").unwrap
+  c = dial_timeout("tcp", l.addr, 2_000_000_000).unwrap
+  c.close!.unwrap
+  l.close!.unwrap
+}
+
+test "bad network and bad address" {
+  assert_eq dial("udp", "127.0.0.1:1").err.unwrap.message, "dial tcp 127.0.0.1:1: unknown network udp"
+  assert dial("tcp", "nope").err?
+}
+
+test "lookup_host" {
+  addrs = lookup_host("127.0.0.1").unwrap
+  assert_eq addrs[0], "127.0.0.1"
+}

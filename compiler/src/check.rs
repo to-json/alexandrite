@@ -2118,6 +2118,18 @@ impl<'w, 'a> FnCx<'w, 'a> {
     /// an Int variable needs `.to_f` or `.to_u8`.
     fn coerce(&mut self, e: TExpr, want: &Ty) -> R<TExpr> {
         let want = self.resolve(want);
+        // A tuple literal coerces element by element (`(1, "a")` as `(U8, Str)`).
+        if let (TK::M(M::TupleNew, None, items, None), Ty::Tuple(ts)) = (&e.kind, &want) {
+            if items.len() == ts.len() && self.resolve(&e.ty) != want {
+                let sp = e.span;
+                let mut vs = vec![];
+                for (x, t) in items.clone().into_iter().zip(ts.clone()) {
+                    vs.push(self.coerce(x, &t)?);
+                }
+                let ty = Ty::Tuple(vs.iter().map(|v| v.ty.clone()).collect());
+                return Ok(self.mk(TK::M(M::TupleNew, None, vs, None), ty, sp));
+            }
+        }
         if want == Ty::Error {
             let et = self.resolve(&e.ty);
             if let Some(k) = self.w.error_index(&et) {
@@ -3362,7 +3374,9 @@ impl<'w, 'a> FnCx<'w, 'a> {
                         Ty::Int
                     };
                     let e = self.mk(TK::Const(v), ty.clone(), sp);
-                    return self.coerce(e, &ty);
+                    // An Int result stays exact until it gets its final type
+                    // (`v: U64 = 1 << 63`); zonk checks that it fits.
+                    return if ty == Ty::Int { Ok(e) } else { self.coerce(e, &ty) };
                 }
                 Ok(None) => {}
             }

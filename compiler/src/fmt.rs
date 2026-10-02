@@ -109,8 +109,8 @@ fn step(toks: &[Token], i: usize, pi: usize, pk: Kind, pv: bool, st: &mut State)
         let (_, k, v) = classify(c, cop, pv, false, cs, next_adjacent, st);
         return (false, k, v);
     }
-    // `Const<` with no spaces opens a generic argument list.
-    if cop == Some("<") && matches!(p, Tok::Const(_)) && !cs && next_adjacent {
+    // `Const<` (or `~(A, B)<`) with no spaces opens a type argument list.
+    if cop == Some("<") && (matches!(p, Tok::Const(_)) || pop == Some(")")) && !cs && next_adjacent {
         st.angle += 1;
         return (false, Kind::Prefix, false);
     }

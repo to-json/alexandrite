@@ -15,4 +15,6 @@ Every decision these milestones implement is in `GO-VS-RUBY.md`. Each milestone 
 | M7 | **Concurrency** | `spawn`, `Chan[T]`, `select`, waiting, `Context`; a panic kills its task, not the process |
 | M8 | **Tooling** | `alx fmt`; `alx test` (`*_test.alx`, `test`, `bench`, output-checked examples); unused warnings and `--strict` |
 
+**Status (2026-10-01): all eight milestones are done** — see `docs/milestones/` and the notebook. Next: the memory model (pools, the move/region checker), then porting Go's standard library.
+
 Order is by dependency: numbers and syntax first (small, everything uses them), then collections (C1 changes array semantics under everything), then types, errors (which use enums and interfaces), packages, concurrency (which uses all of it) and tooling.

@@ -445,7 +445,8 @@ impl<'a> World<'a> {
         let s = |v: &str| (v.to_string(), vec![("path".to_string(), Ty::Str)]);
         let builtins = [
             ("IoError", vec![s("NotFound"), s("Failed")]),
-            ("ArithError", vec![("Overflow".to_string(), vec![]), ("DivZero".to_string(), vec![])]),
+            ("ArithError", vec![("Overflow".to_string(), vec![]), ("DivZero".to_string(), vec![]), ("Domain".to_string(), vec![("message".to_string(), Ty::Str)])]),
+            ("IndexError", vec![("OutOfBounds".to_string(), vec![]), ("SliceBounds".to_string(), vec![]), ("NoElement".to_string(), vec![("message".to_string(), Ty::Str)])]),
             ("Failure", vec![("Msg".to_string(), vec![("message".to_string(), Ty::Str)])]),
             ("TaskError", vec![("Panicked".to_string(), vec![("message".to_string(), Ty::Str)])]),
         ];
@@ -2095,25 +2096,33 @@ impl<'w, 'a> FnCx<'w, 'a> {
                 if self.in_lambda {
                     return Err(Diag::new(sp, "`~` inside a lambda isn't supported yet; handle the result (`unwrap_or`, `rescue`)"));
                 }
-                // A held Result propagates too.
-                if let Ty::Result(t) = self.resolve(&inner.ty) {
-                    self.errs.insert("Error".into());
-                    return Ok(self.mk(TK::Try(Box::new(inner)), *t, sp));
+                // What can fail under the `~`: the operation itself (a held
+                // Result, a fallible call, File.read), and every builtin
+                // under it that would otherwise panic (call arguments too).
+                let mut errs = std::collections::BTreeSet::new();
+                let held = if let Ty::Result(t) = self.resolve(&inner.ty) {
+                    errs.insert("Error".to_string());
+                    Some(*t)
+                } else {
+                    match &inner.kind {
+                        TK::Call(f, _) if is_fallible_expr(&inner, self) => {
+                            errs.extend(self.w.funcs[*f].as_ref().map_or_else(|| vec!["Error".to_string()], |f| f.errs.clone()));
+                        }
+                        TK::M(M::FileRead, ..) => {
+                            errs.insert("IoError".into());
+                        }
+                        _ => {}
+                    }
+                    None
+                };
+                let fallible_op = held.is_some() || is_fallible_expr(&inner, self);
+                try_faults(&inner, &mut errs);
+                if errs.is_empty() && !fallible_op {
+                    return Err(Diag::new(sp, "`~` needs something that can fail: a fallible call, a `~T` value, arithmetic, indexing or slicing, or another builtin that can panic (`first`, `unwrap`, `to_u8`, ...)"));
                 }
-                match &inner.kind {
-                    TK::Call(f, _) => {
-                        let errs = self.w.funcs[*f].as_ref().map_or_else(|| vec!["Error".to_string()], |f| f.errs.clone());
-                        self.errs.extend(errs);
-                    }
-                    TK::M(M::FileRead, ..) => {
-                        self.errs.insert("IoError".into());
-                    }
-                    _ => {
-                        self.errs.insert("ArithError".into());
-                    }
-                }
-                if !is_fallible_expr(&inner, self) {
-                    return Err(Diag::new(sp, "`~` needs a fallible call, a `~T` value, or arithmetic"));
+                self.errs.extend(errs);
+                if let Some(t) = held {
+                    return Ok(self.mk(TK::Try(Box::new(inner)), t, sp));
                 }
                 let ty = inner.ty.clone();
                 self.mk(TK::Try(Box::new(inner)), ty, sp)
@@ -5428,10 +5437,44 @@ fn is_fallible_expr(e: &TExpr, cx: &FnCx) -> bool {
     match &e.kind {
         TK::Call(f, _) => cx.w.funcs[*f].as_ref().map_or_else(|| cx.w.sigs.get(f).is_some_and(|s| s.1), |f| f.fallible),
         TK::M(M::FileRead, ..) => true,
-        TK::Bin(op, ..) => op.is_arith(),
-        TK::Neg(_) => true,
         _ => false,
     }
+}
+
+/// An integer type, or one not known yet.
+fn int_like(t: &Ty) -> bool {
+    t.int_kind().is_some() || matches!(t, Ty::Var(_))
+}
+
+/// The builtin errors that operations under a `~` can fail with instead of
+/// panicking: arithmetic (ArithError) and the panicking builtins of
+/// `prove::fault`. A nested `~` and blocks that become functions of
+/// their own aren't covered by this one.
+fn try_faults(e: &TExpr, out: &mut std::collections::BTreeSet<String>) {
+    match &e.kind {
+        TK::Try(_) => return,
+        _ if crate::prove::own_function_block(e) => {
+            if let TK::M(_, r, args, _) = &e.kind {
+                r.iter().map(|r| &**r).chain(args).for_each(|x| try_faults(x, out));
+            }
+            return;
+        }
+        TK::Bin(op, ..) | TK::PlaceAssign(_, _, Some(op), _) if op.is_arith() && int_like(&e.ty) => {
+            out.insert("ArithError".into());
+        }
+        TK::Neg(_) if int_like(&e.ty) => {
+            out.insert("ArithError".into());
+        }
+        // A negative count panics.
+        TK::Bin(BinOp::Shl | BinOp::Shr, _, c) if c.ty.int_kind().is_none_or(|k| k.signed()) && !matches!(c.kind, TK::Int(n) if n >= 0) => {
+            out.insert("ArithError".into());
+        }
+        _ => {}
+    }
+    if let Some(f) = crate::prove::fault(e) {
+        out.insert(f.err.to_string());
+    }
+    crate::prove::each_child(e, &mut |x| try_faults(x, out));
 }
 
 // ---- math block: intrinsics behind std/math ----

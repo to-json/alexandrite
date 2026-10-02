@@ -269,7 +269,7 @@ struct Lw<'a> {
     defers: Vec<Vec<TExpr>>,
     path: ErrPath,
     /// Inside `try (arith)`: arithmetic fails to the error path.
-    try_arith: bool,
+    try_mode: bool,
     consts: HashMap<LocalId, i64>,
     fixed_len: HashMap<LocalId, i64>,
     facts: HashMap<LocalId, Fact>,
@@ -314,7 +314,7 @@ impl<'a> Lw<'a> {
             break_target: vec![],
             defers: vec![],
             path,
-            try_arith: false,
+            try_mode: false,
             consts: HashMap::new(),
             fixed_len: HashMap::new(),
             facts: HashMap::new(),
@@ -407,7 +407,7 @@ impl<'a> Lw<'a> {
     fn ovf(&self, sp: Span) -> Ovf {
         match self.mode {
             Overflow::Wrap => Ovf::Wrap,
-            _ if self.f.pure && self.opts.release && !self.try_arith => Ovf::Unchecked,
+            _ if self.f.pure && self.opts.release && !self.try_mode => Ovf::Unchecked,
             _ => Ovf::Panic(self.loc(sp)),
         }
     }
@@ -928,13 +928,20 @@ impl<'a> Lw<'a> {
             }
             TK::IndexAssign(l, i, v) => {
                 let arr_t = TExpr { kind: TK::Local(*l), ty: self.f.locals[*l].ty.clone(), span: e.span };
-                let check = self.index_check(&arr_t, i);
+                let mut check = self.index_check(&arr_t, i);
                 let iv = self.expr(i);
-                let iv = self.int_in_t(iv, &i.ty, i.span);
+                let mut iv = self.int_in_t(iv, &i.ty, i.span);
+                if self.try_mode {
+                    iv = self.bind(iv, LTy::I64);
+                }
                 let vv = self.expr(v);
                 let vt = self.lty(&v.ty);
                 let vv = self.bind(vv, vt);
                 let var = self.var_of(*l);
+                if self.try_mode {
+                    self.guard(Self::out_of_bounds(&LE::Var(var), &iv), "index out of bounds", i.span, "IndexError", 0);
+                    check = None;
+                }
                 self.emit(LS::SetIndex { arr: var, idx: iv, val: vv.clone(), check });
                 vv
             }
@@ -954,7 +961,7 @@ impl<'a> Lw<'a> {
                 }
                 if self.promote() {
                     LE::PArith(Op::Sub, Box::new(LE::ToP(Box::new(LE::I(0)))), Box::new(v))
-                } else if self.try_arith {
+                } else if self.try_mode {
                     self.checked_arith(Op::Sub, LE::I(0), v, e.span)
                 } else {
                     LE::Neg(Box::new(v), self.ovf(e.span))
@@ -1008,7 +1015,7 @@ impl<'a> Lw<'a> {
                 let iv = self.bind(iv, LTy::I64);
                 let n = LE::Rt(Rt::StrLen, vec![sv.clone()]);
                 let bad = LE::Cond(Box::new(LE::Cmp(Op::Lt, Box::new(iv.clone()), Box::new(LE::I(0)), LTy::I64)), Box::new(LE::B(true)), Box::new(LE::Cmp(Op::Ge, Box::new(iv.clone()), Box::new(n), LTy::I64)));
-                self.emit(LS::If(bad, vec![LS::Panic("index out of bounds".into(), self.loc(i.span))], vec![]));
+                self.guard(bad, "index out of bounds", i.span, "IndexError", 0);
                 LE::Rt(Rt::StrByte, vec![sv, iv, LE::I(0)])
             }
             TK::Slice(a, lo, hi, excl) => {
@@ -1038,7 +1045,7 @@ impl<'a> Lw<'a> {
                 let cmp = |op, x: &LE, y: &LE| LE::Cmp(op, Box::new(x.clone()), Box::new(y.clone()), LTy::I64);
                 let or = |x: LE, y: LE| LE::Cond(Box::new(x), Box::new(LE::B(true)), Box::new(y));
                 let bad = or(cmp(Op::Lt, &lo_v, &LE::I(0)), or(cmp(Op::Lt, &end, &lo_v), cmp(Op::Gt, &end, &LE::Var(n))));
-                self.emit(LS::If(bad, vec![LS::Panic("slice bounds out of range".into(), self.loc(e.span))], vec![]));
+                self.guard(bad, "slice bounds out of range", e.span, "IndexError", 1);
                 let len = self.tmp(LTy::I64);
                 self.emit(LS::Set(len, LE::Arith(Op::Sub, Box::new(end), Box::new(lo_v.clone()), Ovf::Unchecked)));
                 if is_str {
@@ -1047,6 +1054,15 @@ impl<'a> Lw<'a> {
                 } else {
                     LE::Slice(at, Box::new(av), Box::new(lo_v), Box::new(LE::Var(len)))
                 }
+            }
+            TK::Index(a, i) if self.try_mode => {
+                let av = self.expr(a);
+                let av = self.bind_arr(av, self.lty(&a.ty));
+                let iv = self.expr(i);
+                let iv = self.int_in_t(iv, &i.ty, i.span);
+                let iv = self.bind(iv, LTy::I64);
+                self.guard(Self::out_of_bounds(&av, &iv), "index out of bounds", i.span, "IndexError", 0);
+                LE::Index { arr: Box::new(av), idx: Box::new(iv), check: None }
             }
             TK::Index(a, i) => {
                 let check = self.index_check(a, i);
@@ -1369,6 +1385,76 @@ impl<'a> Lw<'a> {
         self.emit(LS::If(cond, body, vec![]));
     }
 
+    /// A runtime check: when `bad` holds, panic with `msg`, or under `~`
+    /// fail with builtin error `ty`'s variant `j` (variant 2 of ArithError
+    /// and IndexError carries `msg` as its message).
+    fn guard(&mut self, bad: LE, msg: &str, sp: Span, ty: &str, j: usize) {
+        if self.try_mode {
+            let vals = if j == 2 { vec![LE::S(msg.into())] } else { vec![] };
+            let err = self.make_error(ty, j, vals, sp);
+            self.fail_if(bad, err);
+        } else {
+            self.emit(LS::If(bad, vec![LS::Panic(msg.into(), self.loc(sp))], vec![]));
+        }
+    }
+
+    /// `idx` outside `0...len(arr)`, as one unsigned comparison.
+    fn out_of_bounds(arr: &LE, idx: &LE) -> LE {
+        LE::Prim(Prim::ULe, vec![LE::Len(Box::new(arr.clone())), idx.clone()])
+    }
+
+    /// An array value usable more than once (array constants are read in place).
+    fn bind_arr(&mut self, a: LE, t: LTy) -> LE {
+        if matches!(a, LE::Global(_)) { a } else { self.bind(a, t) }
+    }
+
+    /// `a ** b` under `~`: a negative exponent or overflow fails (squaring
+    /// with checked multiplications).
+    fn checked_pow(&mut self, a: LE, b: LE, sp: Span) -> LE {
+        let a = self.bind(a, LTy::I64);
+        let b = self.bind(b, LTy::I64);
+        self.guard(LE::Cmp(Op::Lt, Box::new(b.clone()), Box::new(LE::I(0)), LTy::I64), "negative exponent", sp, "ArithError", 2);
+        let (r, base, n) = (self.tmp(LTy::I64), self.tmp(LTy::I64), self.tmp(LTy::I64));
+        self.emit(LS::Set(r, LE::I(1)));
+        self.emit(LS::Set(base, a));
+        self.emit(LS::Set(n, b));
+        let l = self.label();
+        let body = self.sub(|lw| {
+            lw.emit(LS::If(LE::Cmp(Op::Eq, Box::new(LE::Var(n)), Box::new(LE::I(0)), LTy::I64), vec![LS::Break(l)], vec![]));
+            let odd = LE::Cmp(Op::Ne, Box::new(LE::Prim(Prim::And, vec![LE::Var(n), LE::I(1)])), Box::new(LE::I(0)), LTy::I64);
+            let mul = lw.sub(|lw| {
+                let v = lw.checked_arith(Op::Mul, LE::Var(r), LE::Var(base), sp);
+                lw.emit(LS::Set(r, v));
+            });
+            lw.emit(LS::If(odd, mul, vec![]));
+            lw.emit(LS::Set(n, LE::Prim(Prim::ShrS, vec![LE::Var(n), LE::I(1)])));
+            let sq = lw.sub(|lw| {
+                let v = lw.checked_arith(Op::Mul, LE::Var(base), LE::Var(base), sp);
+                lw.emit(LS::Set(base, v));
+            });
+            lw.emit(LS::If(LE::Cmp(Op::Ne, Box::new(LE::Var(n)), Box::new(LE::I(0)), LTy::I64), sq, vec![]));
+        });
+        self.emit(LS::Loop(l, body));
+        LE::Var(r)
+    }
+
+    /// Under `~`: a Float that `to_i` (or `to_u64` when `u64`) can't
+    /// convert fails instead of reaching the runtime's panic.
+    fn float_to_int_guard(&mut self, v: LE, u64: bool, sp: Span) -> LE {
+        if !self.try_mode {
+            return v;
+        }
+        let v = self.bind(v, LTy::F64);
+        let nan = LE::Cmp(Op::Ne, Box::new(v.clone()), Box::new(v.clone()), LTy::F64);
+        self.guard(nan, "Float#to_i of NaN", sp, "ArithError", 2);
+        let (lo, hi) = if u64 { (0.0, 18446744073709551616.0) } else { (-9223372036854775808.0, 9223372036854775808.0) };
+        let ge = LE::Cmp(Op::Ge, Box::new(v.clone()), Box::new(LE::F(lo)), LTy::F64);
+        let lt = LE::Cmp(Op::Lt, Box::new(v.clone()), Box::new(LE::F(hi)), LTy::F64);
+        let inside = LE::Cond(Box::new(ge), Box::new(lt), Box::new(LE::B(false)));
+        self.guard(LE::Not(Box::new(inside)), "conversion overflow", sp, "ArithError", 0);
+        v
+    }
+
     /// If Result `r` failed, propagate its error.
     fn unwrap_result(&mut self, r: LE) {
         let err = LE::Field(Box::new(r.clone()), 2);
@@ -1465,7 +1551,13 @@ impl<'a> Lw<'a> {
                                 Box::new(LE::Rt(Rt::StrCat, vec![LE::S("File.read: cannot read `".into()), p2, LE::S("`".into())])),
                             )
                         }
-                        (None, "ArithError") => LE::Cond(Box::new(LE::Cmp(Op::Eq, Box::new(LE::Field(Box::new(v.clone()), 0)), Box::new(LE::I(0)), LTy::I64)), Box::new(LE::S("overflow".into())), Box::new(LE::S("division by zero".into()))),
+                        (None, t @ ("ArithError" | "IndexError")) => {
+                            // Two payload-free variants, then one carrying its message.
+                            let (m0, m1) = if t == "ArithError" { ("overflow", "division by zero") } else { ("index out of bounds", "slice bounds out of range") };
+                            let tag = |j: i64| LE::Cmp(Op::Eq, Box::new(LE::Field(Box::new(v.clone()), 0)), Box::new(LE::I(j)), LTy::I64);
+                            let rest = LE::Cond(Box::new(tag(1)), Box::new(LE::S(m1.into())), Box::new(LE::Field(Box::new(v.clone()), 1)));
+                            LE::Cond(Box::new(tag(0)), Box::new(LE::S(m0.into())), Box::new(rest))
+                        }
                         (None, "Failure" | "TaskError") => LE::Field(Box::new(v.clone()), 1),
                         (None, _) => w.to_s(v.clone(), t),
                     };
@@ -1639,6 +1731,14 @@ impl<'a> Lw<'a> {
     }
 
     fn try_expr(&mut self, inner: &TExpr) -> LE {
+        // Everything under `~` fails instead of panicking (call arguments too).
+        let saved = std::mem::replace(&mut self.try_mode, true);
+        let v = self.try_expr_in(inner);
+        self.try_mode = saved;
+        v
+    }
+
+    fn try_expr_in(&mut self, inner: &TExpr) -> LE {
         let path = self.err_path();
         match &inner.kind {
             TK::Call(fid, args) => {
@@ -1676,12 +1776,7 @@ impl<'a> Lw<'a> {
                 self.unwrap_result(v.clone());
                 if unit { LE::Unit } else { LE::Field(Box::new(v), 1) }
             }
-            _ => {
-                let saved = std::mem::replace(&mut self.try_arith, true);
-                let v = self.expr(inner);
-                self.try_arith = saved;
-                v
-            }
+            _ => self.expr(inner),
         }
     }
 
@@ -1769,10 +1864,11 @@ impl<'a> Lw<'a> {
                 wrap_to(k, LE::Arith(lop, Box::new(a), Box::new(b), Ovf::Wrap))
             }
             BinOp::Add | BinOp::Sub | BinOp::Mul if wrap_mode => wrap_to(k, LE::Arith(lop, Box::new(a), Box::new(b), Ovf::Wrap)),
+            BinOp::Pow if self.try_mode => self.checked_pow(a, b, sp),
             // Under `~`, Div and Rem take the checked path below (zero
             // divisor, MIN / -1); checked_arith only knows Add/Sub/Mul.
-            _ if k == IntKind::I64 && !(self.try_arith && matches!(op, BinOp::Div | BinOp::Rem)) => {
-                if self.try_arith {
+            _ if k == IntKind::I64 && !(self.try_mode && matches!(op, BinOp::Div | BinOp::Rem)) => {
+                if self.try_mode {
                     return self.checked_arith(lop, a, b, sp);
                 }
                 if proven {
@@ -1805,7 +1901,7 @@ impl<'a> Lw<'a> {
                 let a = self.bind(a, LTy::I64);
                 let b = self.bind(b, LTy::I64);
                 let zero = LE::Cmp(Op::Eq, Box::new(b.clone()), Box::new(LE::I(0)), LTy::I64);
-                if self.try_arith {
+                if self.try_mode {
                     let err = self.make_error("ArithError", 1, vec![], sp);
                     self.fail_if(zero, err);
                 } else {
@@ -1849,7 +1945,7 @@ impl<'a> Lw<'a> {
         let c = self.bind(c, LTy::I64);
         if ck.signed() {
             let neg = LE::Cmp(Op::Lt, Box::new(c.clone()), Box::new(LE::I(0)), LTy::I64);
-            self.emit(LS::If(neg, vec![LS::Panic("negative shift amount".into(), self.loc(sp))], vec![]));
+            self.guard(neg, "negative shift amount", sp, "ArithError", 2);
         }
         let w = k.bits() as i64;
         let big = LE::Prim(Prim::ULe, vec![LE::I(w), c.clone()]);
@@ -1867,7 +1963,7 @@ impl<'a> Lw<'a> {
 
     fn overflow_if(&mut self, cond: LE, k: IntKind, sp: Span) {
         let loc = self.loc(sp);
-        if self.try_arith {
+        if self.try_mode {
             let _ = loc;
             let err = self.make_error("ArithError", 0, vec![], sp);
             self.fail_if(cond, err);
@@ -1886,8 +1982,9 @@ impl<'a> Lw<'a> {
     fn convert(&mut self, k: IntKind, wrap: bool, x: &TExpr, sp: Span) -> LE {
         let v = self.expr(x);
         let loc = self.loc(sp);
-        let fail = |k: IntKind| LS::Panic(format!("conversion overflow: the value doesn't fit {}", k.name()), loc.clone());
+        let msg = format!("conversion overflow: the value doesn't fit {}", k.name());
         if x.ty == Ty::Float {
+            let v = self.float_to_int_guard(v, k == IntKind::U64, sp);
             if k == IntKind::U64 {
                 return LE::Rt(Rt::FToU64, vec![v, LE::Loc(loc.clone())]);
             }
@@ -1895,7 +1992,7 @@ impl<'a> Lw<'a> {
             self.emit(LS::Set(i, LE::Rt(Rt::FToI, vec![v, LE::Loc(loc.clone())])));
             if k != IntKind::I64 {
                 let out = out_of_range(k, LE::Var(i));
-                self.emit(LS::If(out, vec![fail(k)], vec![]));
+                self.guard(out, &msg, sp, "ArithError", 0);
             }
             let r = LE::Var(i);
             return if k == IntKind::I64 { self.int_out(r) } else { r };
@@ -1916,7 +2013,7 @@ impl<'a> Lw<'a> {
                 Some(out_of_range(k, v.clone()))
             };
             if let Some(out) = out {
-                self.emit(LS::If(out, vec![fail(k)], vec![]));
+                self.guard(out, &msg, sp, "ArithError", 0);
             }
             v
         };
@@ -1944,6 +2041,21 @@ impl<'a> Lw<'a> {
                 TStep::Field(f) => lsteps.push(Step::Field(*f)),
             }
         }
+        if self.try_mode {
+            // Each index checked against the place it indexes, in order.
+            let mut cur = LE::Var(var);
+            for (st, ts) in lsteps.iter_mut().zip(steps) {
+                cur = match st {
+                    Step::Index(i, check) => {
+                        let TStep::Index(ie) = ts else { unreachable!() };
+                        self.guard(Self::out_of_bounds(&cur, i), "index out of bounds", ie.span, "IndexError", 0);
+                        *check = None;
+                        LE::Index { arr: Box::new(cur), idx: Box::new(i.clone()), check: None }
+                    }
+                    Step::Field(f) => LE::Field(Box::new(cur), *f),
+                };
+            }
+        }
         let pty = self.lty(&e.ty);
         let rhs = self.expr(v);
         let val = match op {
@@ -1968,16 +2080,20 @@ impl<'a> Lw<'a> {
         val
     }
 
-    /// `a op b` on promoted Ints. Under `~`, a zero divisor is an
-    /// ArithError (nothing else can fail: there is no overflow).
+    /// `a op b` on promoted Ints. Under `~`, a zero divisor and a negative
+    /// or oversized exponent are ArithErrors (there is no overflow).
     fn parith(&mut self, op: BinOp, a: LE, b: LE, sp: Span) -> LE {
         let lop = op_of(op);
-        if self.try_arith && matches!(op, BinOp::Div | BinOp::Rem) {
+        if self.try_mode && matches!(op, BinOp::Div | BinOp::Rem | BinOp::Pow) {
             let a = self.bind(a, LTy::PInt);
             let b = self.bind(b, LTy::PInt);
-            let zero = LE::PArith(Op::Eq, Box::new(b.clone()), Box::new(LE::ToP(Box::new(LE::I(0)))));
-            let err = self.make_error("ArithError", 1, vec![], sp);
-            self.fail_if(zero, err);
+            let p = |x: i64| Box::new(LE::ToP(Box::new(LE::I(x))));
+            if op == BinOp::Pow {
+                self.guard(LE::PArith(Op::Lt, Box::new(b.clone()), p(0)), "negative exponent", sp, "ArithError", 2);
+                self.guard(LE::PArith(Op::Gt, Box::new(b.clone()), p(i32::MAX as i64)), "exponent out of range", sp, "ArithError", 0);
+            } else {
+                self.guard(LE::PArith(Op::Eq, Box::new(b.clone()), p(0)), "division by zero", sp, "ArithError", 1);
+            }
             return LE::PArith(lop, Box::new(a), Box::new(b));
         }
         LE::PArith(lop, Box::new(a), Box::new(b))
@@ -2285,7 +2401,14 @@ impl<'a> Lw<'a> {
                 let el = self.lty(&e.ty);
                 let av = self.bind(v, LTy::Arr(Box::new(el)));
                 let idx = LE::Arith(Op::Sub, Box::new(LE::Len(Box::new(av.clone()))), Box::new(LE::I(1)), Ovf::Unchecked);
-                LE::Index { arr: Box::new(av), idx: Box::new(idx), check: Some(self.loc(sp)) }
+                let check = if self.try_mode {
+                    let empty = LE::Cmp(Op::Eq, Box::new(LE::Len(Box::new(av.clone()))), Box::new(LE::I(0)), LTy::I64);
+                    self.guard(empty, "`last` of an empty collection", sp, "IndexError", 2);
+                    None
+                } else {
+                    Some(self.loc(sp))
+                };
+                LE::Index { arr: Box::new(av), idx: Box::new(idx), check }
             }
             Reverse => {
                 let v = self.expr(recv.unwrap());
@@ -2313,11 +2436,27 @@ impl<'a> Lw<'a> {
             }
             Digits => {
                 let v = self.expr(recv.unwrap());
+                let v = if self.try_mode {
+                    let p = self.promote();
+                    let v = self.bind(v, if p { LTy::PInt } else { LTy::I64 });
+                    let neg = if p { LE::PArith(Op::Lt, Box::new(v.clone()), Box::new(LE::ToP(Box::new(LE::I(0))))) } else { LE::Cmp(Op::Lt, Box::new(v.clone()), Box::new(LE::I(0)), LTy::I64) };
+                    self.guard(neg, "`digits` of a negative number", sp, "ArithError", 2);
+                    v
+                } else {
+                    v
+                };
                 if self.promote() { LE::Rt(Rt::PDigits, vec![v, LE::Loc(self.loc(sp))]) } else { LE::Rt(Rt::Digits, vec![v, LE::Loc(self.loc(sp))]) }
             }
             IntSqrt => {
                 let v = self.expr(&args[0]);
                 let v = self.int_in(v, sp);
+                let v = if self.try_mode {
+                    let v = self.bind(v, LTy::I64);
+                    self.guard(LE::Cmp(Op::Lt, Box::new(v.clone()), Box::new(LE::I(0)), LTy::I64), "Int.sqrt of a negative number", sp, "ArithError", 2);
+                    v
+                } else {
+                    v
+                };
                 self.int_out(LE::Rt(Rt::Isqrt, vec![v, LE::Loc(self.loc(sp))]))
             }
             MapNew | MapGet | MapGetOr | MapSet | MapDel | MapHas | MapSize | MapKeys | MapValues => self.map_op(m, e, recv, args),
@@ -2363,7 +2502,7 @@ impl<'a> Lw<'a> {
                 let n = self.expr(&args[0]);
                 let n = self.int_in(n, args[0].span);
                 let n = self.bind(n, LTy::I64);
-                self.emit(LS::If(LE::Cmp(Op::Lt, Box::new(n.clone()), Box::new(LE::I(0)), LTy::I64), vec![LS::Panic("negative array size".into(), self.loc(sp))], vec![]));
+                self.guard(LE::Cmp(Op::Lt, Box::new(n.clone()), Box::new(LE::I(0)), LTy::I64), "negative array size", sp, "ArithError", 2);
                 let lt = self.lty(&e.ty);
                 let a = self.tmp(lt);
                 self.emit(LS::Set(a, LE::ArrWithCap(self.lty(&args[1].ty), Box::new(n.clone()))));
@@ -2382,6 +2521,13 @@ impl<'a> Lw<'a> {
             ArrayNew => {
                 let n = self.expr(&args[0]);
                 let n = self.int_in(n, args[0].span);
+                let n = if self.try_mode {
+                    let n = self.bind(n, LTy::I64);
+                    self.guard(LE::Cmp(Op::Lt, Box::new(n.clone()), Box::new(LE::I(0)), LTy::I64), "negative array size", sp, "ArithError", 2);
+                    n
+                } else {
+                    n
+                };
                 let fill = self.expr(&args[1]);
                 let el = self.lty(&args[1].ty);
                 LE::ArrNew(el, Box::new(n), Box::new(fill), self.loc(sp))
@@ -2395,6 +2541,7 @@ impl<'a> Lw<'a> {
             Conv(k, wrap) => self.convert(k, wrap, recv.unwrap(), sp),
             FloatToI => {
                 let v = self.expr(recv.unwrap());
+                let v = self.float_to_int_guard(v, false, sp);
                 self.int_out(LE::Rt(Rt::FToI, vec![v, LE::Loc(self.loc(sp))]))
             }
             FloatAbs => LE::Rt(Rt::FAbs, vec![self.expr(recv.unwrap())]),
@@ -2421,7 +2568,7 @@ impl<'a> Lw<'a> {
                 let t = self.lty(&r.ty);
                 let v = self.bind(v, t);
                 let absent = LE::Not(Box::new(LE::Field(Box::new(v.clone()), 0)));
-                self.emit(LS::If(absent, vec![LS::Panic("unwrap of none".into(), self.loc(sp))], vec![]));
+                self.guard(absent, "unwrap of none", sp, "IndexError", 2);
                 LE::Field(Box::new(v), 1)
             }
             Lambda => {
@@ -2619,10 +2766,16 @@ impl<'a> Lw<'a> {
                             None
                         };
                         let slot = self.tmp((**slot_t).clone());
-                        self.emit(LS::Set(slot, LE::Index { arr: Box::new(hdr(0)), idx: Box::new(h.clone()), check: Some(loc.clone()) }));
+                        let check = if self.try_mode {
+                            self.guard(Self::out_of_bounds(&hdr(0), &h), "index out of bounds", sp, "IndexError", 0);
+                            None
+                        } else {
+                            Some(loc.clone())
+                        };
+                        self.emit(LS::Set(slot, LE::Index { arr: Box::new(hdr(0)), idx: Box::new(h.clone()), check }));
                         let live = LE::Cmp(Op::Eq, Box::new(LE::Field(Box::new(LE::Var(slot)), 0)), Box::new(handle_gen(hv.clone())), LTy::I64);
                         if m != PoolRemove {
-                            self.emit(LS::If(LE::Not(Box::new(live.clone())), vec![LS::Panic("use of a removed pool handle".into(), loc.clone())], vec![]));
+                            self.guard(LE::Not(Box::new(live.clone())), "use of a removed pool handle", sp, "IndexError", 2);
                         }
                         let slot_step = vec![crate::lir::Step::Index(LE::I(0), None), crate::lir::Step::Field(0), crate::lir::Step::Index(h.clone(), None)];
                         match m {
@@ -2994,6 +3147,11 @@ impl<'a> Lw<'a> {
                         let d = self.expr(&args[0]);
                         LE::Cond(Box::new(ok), Box::new(val), Box::new(d))
                     }
+                    ResUnwrap if self.try_mode => {
+                        // Under `~`: the error propagates as it is.
+                        self.unwrap_result(rv.clone());
+                        val
+                    }
                     ResUnwrap => {
                         let msg = self.error_message(err);
                         let die = LS::Die(LE::Rt(Rt::StrCat, vec![LE::S("unwrap of an error: ".into()), msg, LE::S(format!(" ({})", self.loc(sp)))]));
@@ -3030,7 +3188,7 @@ impl<'a> Lw<'a> {
         self.emit(LS::Set(i, start));
         self.emit(LS::Set(lim, limit));
         self.emit(LS::Set(byv, by));
-        self.emit(LS::If(LE::Cmp(Op::Le, Box::new(LE::Var(byv)), Box::new(LE::I(0)), LTy::I64), vec![LS::Panic("`step` needs a positive step".into(), self.loc(args[1].span))], vec![]));
+        self.guard(LE::Cmp(Op::Le, Box::new(LE::Var(byv)), Box::new(LE::I(0)), LTy::I64), "`step` needs a positive step", args[1].span, "ArithError", 2);
         let fact = match (self.interval(recv), self.interval(&args[0])) {
             (Some((lo, _)), Some((_, hi))) => Some(Fact::Interval(lo, hi)),
             _ => None,
@@ -3205,6 +3363,8 @@ impl<'a> Lw<'a> {
                         LE::FArith(Op::Add, Box::new(LE::Var(a)), Box::new(v))
                     } else if lw.promote() {
                         LE::PArith(Op::Add, Box::new(LE::Var(a)), Box::new(v))
+                    } else if lw.try_mode {
+                        lw.checked_arith(Op::Add, LE::Var(a), v, sp)
                     } else if proven {
                         LE::Arith(Op::Add, Box::new(LE::Var(a)), Box::new(v), Ovf::Unchecked)
                     } else {
@@ -3293,7 +3453,8 @@ impl<'a> Lw<'a> {
                     First => "first",
                     _ => "reduce",
                 };
-                self.emit(LS::If(LE::Not(Box::new(LE::Var(have.unwrap()))), vec![LS::Panic(format!("`{what}` of an empty collection"), loc)], vec![]));
+                let _ = loc;
+                self.guard(LE::Not(Box::new(LE::Var(have.unwrap()))), &format!("`{what}` of an empty collection"), sp, "IndexError", 2);
                 LE::Var(acc.unwrap())
             }
             _ => unreachable!(),

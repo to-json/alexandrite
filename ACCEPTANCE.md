@@ -160,6 +160,10 @@ Negative cases:
 | `pe014.bad1.alx` | `puts n` inside `collatz_len` | `` `#[pure] def collatz_len` can't do I/O: `puts` `` at the right line and column |
 | `pe014.bad2.alx` | `try` removed from `3 * n + 1` | `` unproven arithmetic in `#[pure] def collatz_len`: `3 * n + 1` may overflow; use `try` or prove a bound `` |
 | `pe004.bad.alx` | `palindrome?(it)` called with a `Str` | `` `palindrome?` expects Int, got Str `` at the call site, with no generated or C names in the message |
+| `pure.bad1`–`pure.bad4` | `xs[5..]`, `s[5..]`, `xs.first`, `xs.sum` in a `fn` | `` unproven slice/`first`/`sum` in `#[pure] def …` …; use `~(...)` `` |
+| `pure.bad5`–`pure.bad8` | `~` in a non-fallible `fn`; `~` over nothing that can fail; an index under a `~T<ArithError>`; `panic` in a `fn` | the matching error |
+
+`pure.alx` covers the positive side: every builtin that can panic (indexing, slicing, `first`/`last`/`max`/`min`/`max_by`/`min_by`/`reduce`, `sum`, `unwrap`, checked conversions, `digits`, `Int.sqrt`, `Array.new`, `**`, shifts, `step`, pool slots) is proven from constants or written under `~(...)`, where it fails with an IndexError or ArithError instead of panicking, on every backend.
 
 **Pass if:**
 - Output matches.

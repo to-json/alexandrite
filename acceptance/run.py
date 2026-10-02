@@ -95,6 +95,7 @@ GROUPS = {
     "arms": "M2",
     "smallfixes": "L1",
     "trymethod": "M5",
+    "pure": "A4",
 }
 
 
@@ -408,6 +409,8 @@ def main():
         negative_compile("sharing.bad4", "R6")
         negative_compile("pe014.bad2", "A4")
         negative_compile("pe004.bad", "A4")
+        for i in range(1, 9):
+            negative_compile(f"pure.bad{i}", "A4")
         negative_runtime("pe020.bad", "A3")
         negative_runtime("pe022.missing", "A5")
         negative_compile("ffi.bad1", "L2")

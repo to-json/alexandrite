@@ -1281,10 +1281,18 @@ impl<'a> Parser<'a> {
             // next call (not the whole chain); the chain continues after it.
             let sp = self.bump().span;
             let mut e = self.primary()?;
-            // A bare name or constant takes its whole dotted chain up to the
-            // first call with arguments: `~p.twice`, `~self.plus(1)`, `~File.read(p)`.
+            // A bare name or constant takes its whole dotted chain (indexing
+            // included) up to the first call with arguments: `~p.twice`,
+            // `~self.plus(1)`, `~File.read(p)`, `~xs[i]`, `~ps[i].plus(1)`.
             if matches!(e.kind, ExprKind::Name(_) | ExprKind::Const(_) | ExprKind::TypeApp(..)) {
-                while self.is_op(".") && !matches!(self.peek_at(1), Tok::Op("~")) {
+                loop {
+                    if self.is_op("[") && !self.space_before() {
+                        e = self.index_step(e)?;
+                        continue;
+                    }
+                    if !(self.is_op(".") && !matches!(self.peek_at(1), Tok::Op("~"))) {
+                        break;
+                    }
                     e = self.postfix_step(e)?.expect("a `.` step");
                     let had_args = matches!(&e.kind, ExprKind::Call { args, block, block_sym, .. } if !args.is_empty() || block.is_some() || block_sym.is_some())
                         || matches!(self.toks[self.pos - 1].tok, Tok::Op(")"));
@@ -1418,30 +1426,35 @@ impl<'a> Parser<'a> {
                 continue;
             }
             if self.is_op("[") && !self.space_before() {
-                self.bump();
-                // A reslice may leave out either end: `a[2..]`, `a[...n]`.
-                let isp = self.span();
-                let idx = if self.is_op("..") || self.is_op("...") {
-                    let excl = self.bump().tok == Tok::Op("...");
-                    let hi = if self.is_op("]") { None } else { Some(Box::new(self.or()?)) };
-                    self.mk(ExprKind::SliceRange(None, hi, excl), isp.to(self.prev_span()))
-                } else {
-                    let lo = self.or()?;
-                    if self.is_op("..") || self.is_op("...") {
-                        let excl = self.bump().tok == Tok::Op("...");
-                        let hi = if self.is_op("]") { None } else { Some(Box::new(self.or()?)) };
-                        self.mk(ExprKind::SliceRange(Some(Box::new(lo)), hi, excl), isp.to(self.prev_span()))
-                    } else {
-                        lo
-                    }
-                };
-                self.expect_op("]")?;
-                let sp = e.span.to(self.prev_span());
-                e = self.mk(ExprKind::Index(Box::new(e), Box::new(idx)), sp);
+                e = self.index_step(e)?;
                 continue;
             }
             return Ok(e);
         }
+    }
+
+    /// `e[i]` / `e[lo..hi]`, at the `[`.
+    fn index_step(&mut self, e: Expr) -> PResult<Expr> {
+        self.bump();
+        // A reslice may leave out either end: `a[2..]`, `a[...n]`.
+        let isp = self.span();
+        let idx = if self.is_op("..") || self.is_op("...") {
+            let excl = self.bump().tok == Tok::Op("...");
+            let hi = if self.is_op("]") { None } else { Some(Box::new(self.or()?)) };
+            self.mk(ExprKind::SliceRange(None, hi, excl), isp.to(self.prev_span()))
+        } else {
+            let lo = self.or()?;
+            if self.is_op("..") || self.is_op("...") {
+                let excl = self.bump().tok == Tok::Op("...");
+                let hi = if self.is_op("]") { None } else { Some(Box::new(self.or()?)) };
+                self.mk(ExprKind::SliceRange(Some(Box::new(lo)), hi, excl), isp.to(self.prev_span()))
+            } else {
+                lo
+            }
+        };
+        self.expect_op("]")?;
+        let sp = e.span.to(self.prev_span());
+        Ok(self.mk(ExprKind::Index(Box::new(e), Box::new(idx)), sp))
     }
 
     fn call_args(&mut self) -> PResult<(Vec<Expr>, Option<(String, Span)>)> {

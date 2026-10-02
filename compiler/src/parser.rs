@@ -1433,8 +1433,8 @@ impl<'a> Parser<'a> {
             Tok::Kw(Kw::Case) => true,
             Tok::Kw(Kw::True | Kw::False | Kw::Nil | Kw::None | Kw::Try) => true,
             Tok::Op("(") | Tok::Op("[") | Tok::Op("~") | Tok::Op("->") => true,
-            // `puts -x` (Ruby): a minus right before its operand starts an argument.
-            Tok::Op("-") | Tok::Op("^") => !self.toks[(self.pos + 1).min(self.toks.len() - 1)].space_before,
+            // `puts -x` (Ruby): a minus (or `!`) right before its operand starts an argument.
+            Tok::Op("-") | Tok::Op("^") | Tok::Op("!") => !self.toks[(self.pos + 1).min(self.toks.len() - 1)].space_before,
             _ => false,
         }
     }

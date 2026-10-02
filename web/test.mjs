@@ -32,7 +32,15 @@ export function run(name, src) {
 
 const filter = process.argv[2] || '';
 let fail = 0;
-for (const f of readdirSync(cases).filter(f => /^[a-z]+\d*\.alx$/.test(f) && readdirSync(cases).includes(f.replace('.alx', '.expected')) && f.includes(filter)).sort()) {
+// The browser has no threads: concurrency must be refused at compile time.
+const browserless = ['concurrency.alx'];
+for (const f of browserless.filter(f => f.includes(filter))) {
+  const r = run(f, readFileSync(cases + f, 'utf8'));
+  const ok = (r.compileError ?? '').includes("aren't available in the browser") && !(r.compileError ?? '').includes('internal');
+  if (!ok) fail++;
+  console.log(`${ok ? 'ok  ' : 'FAIL'} ${f} refused in the browser ${ok ? '' : JSON.stringify(r)}`);
+}
+for (const f of readdirSync(cases).filter(f => /^[a-z]+\d*\.alx$/.test(f) && !browserless.includes(f) && readdirSync(cases).includes(f.replace('.alx', '.expected')) && f.includes(filter)).sort()) {
   const want = readFileSync(cases + f.replace('.alx', '.expected'), 'utf8').trim();
   const r = run(f, readFileSync(cases + f, 'utf8'));
   const got = (r.stdout ?? '').trim();

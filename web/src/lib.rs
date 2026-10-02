@@ -42,7 +42,7 @@ pub fn compile(name: &str, source: &str) -> Result<Vec<u8>, String> {
     let l = alx::front::load_with(Path::new(name), name, &read, &list).map_err(|(sm, d)| sm.render(&d))?;
     let p = alx::front::check_program(&l, alx::front::lib_defs(&l)).map_err(|d| l.sm.render(&d))?;
     let lp = alx::lower::lower(&p, &l.sm, &alx::lower::Opts { release: false });
-    wasmgen::emit(&lp).map_err(|e| format!("internal compiler error: {e}"))
+    wasmgen::emit(&lp).map_err(|e| if e.contains("aren't available in the browser") { format!("error: {e}") } else { format!("internal compiler error: {e}") })
 }
 
 /// Start a run: fresh memory region and output buffers.

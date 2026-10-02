@@ -102,7 +102,7 @@ pub fn lty(t: &Ty, mode: Overflow) -> LTy {
         // Error: (type tag, location, wrap context, then each error type's value).
         Ty::Error => LTy::Tup([LTy::I64, LTy::Str, LTy::Str].into_iter().chain(ERRORS.with(|e| e.borrow().clone()).iter().map(|t| lty(t, mode))).collect()),
         Ty::Result(t) => result_lty(lty(t, mode), mode),
-        Ty::Task(t) => LTy::Task(Box::new(lty(t, mode))),
+        Ty::Task(t) => LTy::Task(Box::new(ok_lty(lty(t, mode)))),
         Ty::Chan(t) => LTy::Chan(Box::new(lty(t, mode))),
         Ty::Fn(..) => LTy::Tup(std::iter::once(LTy::I64).chain(lambda_sites(t).iter().map(|(_, caps)| LTy::Tup(caps.iter().map(|c| lty(c, mode)).collect()))).collect()),
         Ty::Iface(n) => {
@@ -1054,7 +1054,7 @@ impl<'a> Lw<'a> {
                             )
                         }
                         (None, "ArithError") => LE::Cond(Box::new(LE::Cmp(Op::Eq, Box::new(LE::Field(Box::new(v.clone()), 0)), Box::new(LE::I(0)), LTy::I64)), Box::new(LE::S("overflow".into())), Box::new(LE::S("division by zero".into()))),
-                        (None, "Failure") => LE::Field(Box::new(v.clone()), 1),
+                        (None, "Failure" | "TaskError") => LE::Field(Box::new(v.clone()), 1),
                         (None, _) => w.to_s(v.clone(), t),
                     };
                     w.emit(LS::Set(s, m));
@@ -1955,6 +1955,15 @@ impl<'a> Lw<'a> {
                 }
                 let (stmts, v) = w.sub_val(|w| w.scoped_value(&b.body, &ok_ty));
                 body.extend(stmts);
+                // Nothing to return: the last expression still runs.
+                let v = if ok_ty == Ty::Unit {
+                    if !matches!(v, LE::Unit | LE::Var(_) | LE::I(_) | LE::B(_)) {
+                        body.push(LS::Eval(v));
+                    }
+                    LE::B(false)
+                } else {
+                    v
+                };
                 let out_t = if fallible { result_lty(w.lty(&ok_ty), self.mode) } else { ok_lty(w.lty(&ok_ty)) };
                 let v = if fallible { w.ok_result(if ok_ty == Ty::Unit { LE::B(false) } else { v }) } else if ok_ty == Ty::Unit { LE::B(false) } else { v };
                 body.push(LS::Return(Some(v)));

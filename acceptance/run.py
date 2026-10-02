@@ -76,6 +76,7 @@ GROUPS = {
     "errors": "M5",
     "packages": "M6",
     "refinements": "M6",
+    "concurrency": "M7",
 }
 
 
@@ -292,6 +293,7 @@ def main():
         negative_compile("packages.bad2", "M6")
         negative_compile("packages.bad3", "M6")
         negative_compile("refinements.bad1", "M6")
+        negative_runtime("concurrency.deadlock", "M7")
     if not filt or "mod" in filt:
         print("== modules", flush=True)
         modules()

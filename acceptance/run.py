@@ -97,6 +97,7 @@ GROUPS = {
     "trymethod": "M5",
     "pure": "A4",
     "flags": "L2",
+    "wc": "L2",
 }
 
 

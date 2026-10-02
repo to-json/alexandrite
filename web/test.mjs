@@ -33,7 +33,7 @@ export function run(name, src) {
 const filter = process.argv[2] || '';
 let fail = 0;
 // The browser has no threads: concurrency must be refused at compile time.
-const browserless = ['concurrency.alx', 'regions.alx', 'asserts.alx', 'sharing.alx', 'sync.alx', 'ffi.alx', 'flags.alx'];
+const browserless = ['concurrency.alx', 'regions.alx', 'asserts.alx', 'sharing.alx', 'sync.alx', 'ffi.alx', 'flags.alx', 'wc.alx'];
 for (const f of browserless.filter(f => f.includes(filter))) {
   const r = run(f, readFileSync(cases + f, 'utf8'));
   const ok = (r.compileError ?? '').includes("aren't available in the browser") && !(r.compileError ?? '').includes('internal');

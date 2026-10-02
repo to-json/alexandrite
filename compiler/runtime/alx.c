@@ -8,6 +8,7 @@
 #include <setjmp.h>
 #include <signal.h>
 #include <sys/stat.h>
+#include <dirent.h>
 #include <time.h>
 #include <sys/mman.h>
 #include <unistd.h>
@@ -1741,6 +1742,8 @@ static const SysConst sys_consts[] = {
     SC(S_IFMT) SC(S_IFREG) SC(S_IFDIR) SC(S_IFLNK) SC(S_IFIFO) SC(S_IFCHR) SC(S_IFBLK) SC(S_IFSOCK)
     SC(S_IRWXU) SC(S_IRUSR) SC(S_IWUSR) SC(S_IXUSR) SC(S_IRWXG) SC(S_IRWXO)
     SC(CLOCK_REALTIME) SC(CLOCK_MONOTONIC)
+    SC(O_NOFOLLOW) SC(EINPROGRESS) SC(ENOTSUP) SC(EOVERFLOW) SC(ETXTBSY) SC(EDQUOT) SC(ESTALE) SC(ENOBUFS)
+    SC(S_ISUID) SC(S_ISGID) SC(S_ISVTX) SC(S_IRGRP) SC(S_IWGRP) SC(S_IXGRP) SC(S_IROTH) SC(S_IWOTH) SC(S_IXOTH)
 };
 #undef SC
 
@@ -1750,4 +1753,72 @@ int64_t alx_sys_const(const char *name) {
     for (size_t i = 0; i < sizeof sys_consts / sizeof sys_consts[0]; i++)
         if (strcmp(sys_consts[i].name, name) == 0) return sys_consts[i].val;
     return -1;
+}
+
+/* ---------- files and directories (std os) ----------
+ * Non-variadic, layout-free views of stat(2) and readdir(3). They return 0 or
+ * -errno rather than leaving the answer in errno, so every backend (the Rust
+ * oracle included) agrees. */
+
+#ifdef __APPLE__
+#define ALX_MTIME_NS(st) ((int64_t)(st).st_mtimespec.tv_sec * 1000000000 + (st).st_mtimespec.tv_nsec)
+#define ALX_ATIME_NS(st) ((int64_t)(st).st_atimespec.tv_sec * 1000000000 + (st).st_atimespec.tv_nsec)
+#else
+#define ALX_MTIME_NS(st) ((int64_t)(st).st_mtim.tv_sec * 1000000000 + (st).st_mtim.tv_nsec)
+#define ALX_ATIME_NS(st) ((int64_t)(st).st_atim.tv_sec * 1000000000 + (st).st_atim.tv_nsec)
+#endif
+
+static void stat_out(const struct stat *st, uint8_t *out) {
+    int64_t v[ALX_STAT_FIELDS] = { (int64_t)st->st_mode, (int64_t)st->st_size, ALX_MTIME_NS(*st), ALX_ATIME_NS(*st), (int64_t)st->st_ino, (int64_t)st->st_nlink };
+    memcpy(out, v, sizeof v);
+}
+
+int32_t alx_sys_stat(const char *path, uint8_t *out, int32_t follow) {
+    struct stat st;
+    if ((follow ? stat(path, &st) : lstat(path, &st)) != 0) return -errno;
+    stat_out(&st, out);
+    return 0;
+}
+
+int32_t alx_sys_fstat(int32_t fd, uint8_t *out) {
+    struct stat st;
+    if (fstat(fd, &st) != 0) return -errno;
+    stat_out(&st, out);
+    return 0;
+}
+
+/* A directory handle (a DIR*) or -errno. */
+int64_t alx_sys_dir_open(const char *path) {
+    DIR *d = opendir(path);
+    return d ? (int64_t)(intptr_t)d : -(int64_t)errno;
+}
+
+/* The next entry's name (valid until the next call; "." and ".." are skipped),
+ * or NULL at the end. kind[0] = 1 file, 2 directory, 3 symlink, 4 other, 0 unknown. */
+const char *alx_sys_dir_next(int64_t h, uint8_t *kind) {
+    DIR *d = (DIR *)(intptr_t)h;
+    struct dirent *e;
+    while ((e = readdir(d)) != NULL) {
+        if (strcmp(e->d_name, ".") == 0 || strcmp(e->d_name, "..") == 0) continue;
+        switch (e->d_type) {
+        case DT_REG: kind[0] = 1; break;
+        case DT_DIR: kind[0] = 2; break;
+        case DT_LNK: kind[0] = 3; break;
+        case DT_UNKNOWN: kind[0] = 0; break;
+        default: kind[0] = 4;
+        }
+        return e->d_name;
+    }
+    return NULL;
+}
+
+void alx_sys_dir_close(int64_t h) { closedir((DIR *)(intptr_t)h); }
+
+/* environ[i], NULL past the end. */
+extern char **environ;
+const char *alx_environ(int64_t i) {
+    if (!environ) return NULL;
+    for (int64_t k = 0; k <= i; k++)
+        if (!environ[k]) return NULL;
+    return environ[i];
 }

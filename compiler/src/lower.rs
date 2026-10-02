@@ -1281,6 +1281,23 @@ impl<'a> Lw<'a> {
         }
     }
 
+    /// `call` (an implementor's method) as the interface method's result: an
+    /// infallible method satisfying a fallible interface method always succeeds.
+    fn iface_result(&mut self, e: &TExpr, fid: FuncId, call: LE) -> (Vec<LS>, LE) {
+        let f = &self.p.funcs[fid];
+        let Ty::Result(t) = &e.ty else { return (vec![], call) };
+        if f.fallible {
+            return (vec![], call);
+        }
+        let rt = result_lty(ok_lty(self.lty(t)), self.mode);
+        let et = self.lty(&Ty::Error);
+        if **t == Ty::Unit {
+            (vec![LS::Eval(call)], LE::Tup(rt, vec![LE::B(true), LE::B(false), zero_le(&et)]))
+        } else {
+            (vec![], LE::Tup(rt, vec![LE::B(true), call, zero_le(&et)]))
+        }
+    }
+
     /// A successful Result of this function's type.
     fn ok_result(&mut self, v: LE) -> LE {
         let ok = self.res.clone().expect("in a fallible function");
@@ -2970,6 +2987,10 @@ impl<'a> Lw<'a> {
                         lw.emit(LS::Set(cell, LE::ArrLit(ct.clone(), vec![LE::Field(Box::new(held.clone()), k + 1)])));
                         lw.emit(LS::RegionRestore(saved));
                         let call = LE::Call(f.clone(), std::iter::once(LE::Var(cell)).chain(avs.iter().cloned()).collect());
+                        let (pre, call) = lw.iface_result(e, fids[mi], call);
+                        for st in pre {
+                            lw.emit(st);
+                        }
                         match out {
                             Some(o) => lw.emit(LS::Set(o, call)),
                             None => lw.emit(LS::Eval(call)),
@@ -3004,11 +3025,12 @@ impl<'a> Lw<'a> {
                 for (k, (_, fids)) in impls.iter().enumerate() {
                     let f = &self.p.funcs[fids[mi]];
                     let call = LE::Call(f.cname.clone(), std::iter::once(LE::Field(Box::new(rv.clone()), k + 1)).chain(avs.iter().cloned()).collect());
-                    let st = match out {
+                    let (mut sts, call) = self.iface_result(e, fids[mi], call);
+                    sts.push(match out {
                         Some(o) => LS::Set(o, call),
                         None => LS::Eval(call),
-                    };
-                    self.emit(LS::If(LE::Cmp(Op::Eq, Box::new(tag.clone()), Box::new(LE::I(k as i64)), LTy::I64), vec![st], vec![]));
+                    });
+                    self.emit(LS::If(LE::Cmp(Op::Eq, Box::new(tag.clone()), Box::new(LE::I(k as i64)), LTy::I64), sts, vec![]));
                 }
                 match out {
                     Some(o) => LE::Var(o),

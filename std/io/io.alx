@@ -1,0 +1,226 @@
+# Package io: Go's io, with the Rust-shaped errors of GO-VS-RUBY F3.
+#
+# Shape (differences from Go):
+#  - End of input is not an error. `read!` returns 0 at EOF (and for an empty
+#    p); the optional readers elsewhere return none. Go's `io.EOF` therefore
+#    doesn't exist; `StreamError.UnexpectedEof` is Go's `ErrUnexpectedEOF`, raised by
+#    `read_exact` / `copy_n` when the input ends too early.
+#  - `Reader` / `Writer` are structural interfaces (F2): any struct with
+#    `def read!(p: [Byte]) -> ~Int` / `def write!(p: [Byte]) -> ~Int` is one,
+#    and so is one whose method can't fail (`bytes.Buffer`): an infallible
+#    method satisfies a fallible interface method.
+#  - Structs are values, so the free functions below (`copy`, `read_all`,
+#    `write_all`, ...) receive a COPY of the reader / writer they are given.
+#    That is exactly right for handles whose state lives outside the value
+#    (`os.File`, `os.stdout`), and for readers and writers that are fully
+#    consumed or filled by the call. A reader or writer that is used again
+#    afterwards (a half-read `bytes.Buffer`, a `bufio.Reader`) is driven through
+#    its own methods: `buf.read!(p)`, `buf.write_string!(s)`. An interface
+#    value held in a variable is a place: `w.write!(p)` mutates it in place
+#    (R7), and so does `w.write_string!(s)` for the interfaces here.
+#  - The sizes of an I/O call are bytes; offsets are Ints.
+#  - Blocking: a read on a pipe or terminal blocks its worker thread (the
+#    event loop arrives with L3).
+
+# Errors raised by this package (a user's reader may raise its own).
+pub error StreamError {
+  # The input ended before the requested bytes were read.
+  UnexpectedEof
+  # A write accepted fewer bytes than offered, without an error.
+  ShortWrite
+  # A buffer was too small for the data.
+  ShortBuffer
+  # Reads kept returning nothing without reaching the end.
+  NoProgress
+  # A negative or otherwise impossible count or offset.
+  InvalidArgument(what: Str)
+
+  def message -> Str {
+    case self {
+      UnexpectedEof => "unexpected EOF"
+      ShortWrite => "short write"
+      ShortBuffer => "short buffer"
+      NoProgress => "multiple Read calls return no data or error"
+      InvalidArgument(what) => "invalid argument: #{what}"
+    }
+  }
+}
+
+# `whence` for `Seeker.seek!`.
+pub SEEK_START = 0
+pub SEEK_CURRENT = 1
+pub SEEK_END = 2
+
+# Reads up to p.size bytes into p; returns the count. 0 means end of input
+# (or an empty p).
+pub interface Reader {
+  def read!(p: [Byte]) -> ~Int
+}
+
+# Writes all of p, or fails; returns p.size.
+pub interface Writer {
+  def write!(p: [Byte]) -> ~Int
+}
+
+pub interface Closer {
+  def close! -> ~Unit
+}
+
+# Moves the read/write offset (whence: SEEK_START, SEEK_CURRENT, SEEK_END);
+# returns the new offset from the start.
+pub interface Seeker {
+  def seek!(offset: Int, whence: Int) -> ~Int
+}
+
+pub interface StringWriter {
+  def write_string!(s: Str) -> ~Int
+}
+
+pub interface ReadWriter {
+  def read!(p: [Byte]) -> ~Int
+  def write!(p: [Byte]) -> ~Int
+}
+
+pub interface ReadCloser {
+  def read!(p: [Byte]) -> ~Int
+  def close! -> ~Unit
+}
+
+pub interface WriteCloser {
+  def write!(p: [Byte]) -> ~Int
+  def close! -> ~Unit
+}
+
+pub interface ReadWriteCloser {
+  def read!(p: [Byte]) -> ~Int
+  def write!(p: [Byte]) -> ~Int
+  def close! -> ~Unit
+}
+
+pub interface ReadSeeker {
+  def read!(p: [Byte]) -> ~Int
+  def seek!(offset: Int, whence: Int) -> ~Int
+}
+
+pub interface WriteSeeker {
+  def write!(p: [Byte]) -> ~Int
+  def seek!(offset: Int, whence: Int) -> ~Int
+}
+
+pub interface ReadWriteSeeker {
+  def read!(p: [Byte]) -> ~Int
+  def write!(p: [Byte]) -> ~Int
+  def seek!(offset: Int, whence: Int) -> ~Int
+}
+
+CHUNK = 32768
+
+# Writes all of p; fails with ShortWrite if the writer stops accepting bytes.
+pub def write_all(w: Writer, p: [Byte]) -> ~Unit {
+  out = w
+  off = 0
+  while off < p.size {
+    n = out.~write!(p[off...p.size])
+    fail StreamError.ShortWrite if n <= 0
+    off += n
+  }
+}
+
+# Writes s; returns s.size.
+pub def write_string(w: Writer, s: Str) -> ~Int {
+  out = w
+  b = s.bytes.to_a
+  off = 0
+  while off < b.size {
+    n = out.~write!(b[off...b.size])
+    fail StreamError.ShortWrite if n <= 0
+    off += n
+  }
+  b.size
+}
+
+# Reads until p is full or the input ends; returns the count (less than
+# p.size only at the end of input). Never fails at EOF.
+pub def read_full(r: Reader, p: [Byte]) -> ~Int {
+  src = r
+  got = 0
+  while got < p.size {
+    n = src.~read!(p[got...p.size])
+    break if n == 0
+    got += n
+  }
+  got
+}
+
+# Reads exactly p.size bytes; fails with UnexpectedEof if the input ends first
+# (Go's ReadFull). Nothing is read for an empty p.
+pub def read_exact(r: Reader, p: [Byte]) -> ~Unit {
+  n = ~read_full(r, p)
+  fail StreamError.UnexpectedEof if n < p.size
+}
+
+# Everything up to the end of input.
+pub def read_all(r: Reader) -> ~[Byte] {
+  src = r
+  out: [Byte] = []
+  chunk: [Byte] = [0; 8192]
+  loop {
+    n = src.~read!(chunk)
+    break if n == 0
+    i = 0
+    while i < n {
+      out << chunk[i]
+      i += 1
+    }
+  }
+  out
+}
+
+# Copies src to dst until the end of src; returns the byte count.
+pub def copy(dst: Writer, src: Reader) -> ~Int {
+  from = src
+  to = dst
+  buf: [Byte] = [0; 32768]
+  total = 0
+  loop {
+    n = from.~read!(buf)
+    break if n == 0
+    off = 0
+    while off < n {
+      m = to.~write!(buf[off...n])
+      fail StreamError.ShortWrite if m <= 0
+      off += m
+    }
+    total += n
+  }
+  total
+}
+
+# Copies exactly n bytes; fails with UnexpectedEof if src ends first.
+pub def copy_n(dst: Writer, src: Reader, n: Int) -> ~Int {
+  fail StreamError.InvalidArgument("negative count") if n < 0
+  from = src
+  to = dst
+  buf: [Byte] = [0; 32768]
+  total = 0
+  while total < n {
+    want = n - total
+    want = buf.size if want > buf.size
+    got = from.~read!(buf[0...want])
+    fail StreamError.UnexpectedEof if got == 0
+    off = 0
+    while off < got {
+      m = to.~write!(buf[off...got])
+      fail StreamError.ShortWrite if m <= 0
+      off += m
+    }
+    total += got
+  }
+  total
+}
+
+# A Writer that accepts and drops everything (Go's io.Discard).
+pub struct Discard {
+  pub def write!(p: [Byte]) -> Int { p.size }
+  pub def write_string!(s: Str) -> Int { s.size }
+}

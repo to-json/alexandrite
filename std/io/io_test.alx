@@ -1,0 +1,182 @@
+# A reader producing n bytes: 'a', 'b', ... repeating, in chunks of at most 7.
+struct Alphabet {
+  left: Int
+  pos: Int
+
+  def read!(p: [Byte]) -> ~Int {
+    n = left < p.size ? left : p.size
+    n = 7 if n > 7
+    i = 0
+    while i < n {
+      p[i] = (97 + (pos + i) % 26).as_u8
+      i += 1
+    }
+    self.pos = pos + n
+    self.left = left - n
+    n
+  }
+}
+
+# A reader that fails once `ok` bytes have been delivered.
+struct Flaky {
+  ok: Int
+
+  def read!(p: [Byte]) -> ~Int {
+    fail "disk on fire" if ok <= 0
+    n = ok < p.size ? ok : p.size
+    i = 0
+    while i < n {
+      p[i] = 120
+      i += 1
+    }
+    self.ok = ok - n
+    n
+  }
+}
+
+# A writer counting bytes and the number of write calls.
+struct Counter {
+  bytes: Int
+  calls: Int
+
+  def write!(p: [Byte]) -> ~Int {
+    self.bytes = bytes + p.size
+    self.calls = calls + 1
+    p.size
+  }
+}
+
+# A writer that takes at most 3 bytes per call.
+struct Trickle {
+  total: Int
+
+  def write!(p: [Byte]) -> ~Int {
+    n = p.size < 3 ? p.size : 3
+    self.total = total + n
+    n
+  }
+}
+
+# An in-memory buffer: writes append, reads consume from the front.
+struct Mem {
+  data: [Byte]
+  off: Int
+
+  def write!(p: [Byte]) -> Int {
+    for c in p {
+      self.data << c
+    }
+    p.size
+  }
+
+  def read!(p: [Byte]) -> Int {
+    n = data.size - off
+    n = p.size if n > p.size
+    i = 0
+    while i < n {
+      p[i] = data[off + i]
+      i += 1
+    }
+    self.off = off + n
+    n
+  }
+}
+
+# A writer that accepts nothing.
+struct Stuck {
+  x: Int
+
+  def write!(p: [Byte]) -> ~Int {
+    0
+  }
+}
+
+def b(s: Str) -> [Byte] { s.bytes.to_a }
+def s(x: [Byte]) -> Str { Str.from_bytes(x) }
+
+test "a user struct is a Reader" {
+  got = read_all(Alphabet.new(left: 30, pos: 0)).unwrap
+  assert_eq s(got), "abcdefghijklmnopqrstuvwxyzabcd"
+  assert_eq read_all(Alphabet.new(left: 0, pos: 0)).unwrap.size, 0
+}
+
+test "copy into an in-memory writer through an interface in a place" {
+  w: Writer = Mem.new(data: [], off: 0)
+  src: Reader = Alphabet.new(left: 100000, pos: 0)
+  buf: [Byte] = [0; 64]
+  total = 0
+  loop {
+    n = src.read!(buf).unwrap
+    break if n == 0
+    assert_eq w.write!(buf[0...n]).unwrap, n
+    total += n
+  }
+  assert_eq total, 100000
+}
+
+test "copy counts and calls" {
+  c = Counter.new
+  assert_eq copy(c, Alphabet.new(left: 1000, pos: 0)).unwrap, 1000
+  assert_eq copy(Discard.new, Alphabet.new(left: 50, pos: 0)).unwrap, 50
+  assert_eq copy(Discard.new, Alphabet.new(left: 0, pos: 0)).unwrap, 0
+}
+
+test "copy propagates errors from either side" {
+  e = copy(Discard.new, Flaky.new(ok: 10)).err
+  assert_eq e.unwrap.message, "disk on fire"
+  e2 = copy(Stuck.new, Alphabet.new(left: 10, pos: 0)).err
+  assert_eq e2.unwrap.message, "short write"
+  case e2.unwrap {
+    ShortWrite => assert true
+    _ => assert false, "expected ShortWrite"
+  }
+}
+
+test "write_all and write_string" {
+  assert write_all(Trickle.new, b("0123456789")).ok?
+  assert_eq write_string(Trickle.new, "héllo").unwrap, 6
+  assert write_all(Stuck.new, b("x")).err?
+  assert write_all(Stuck.new, b("")).ok?
+  assert_eq write_string(Discard.new, "abc").unwrap, 3
+}
+
+test "read_full and read_exact" {
+  buf: [Byte] = [0; 10]
+  assert_eq read_full(Alphabet.new(left: 25, pos: 0), buf).unwrap, 10
+  assert_eq s(buf), "abcdefghij"
+  assert_eq read_full(Alphabet.new(left: 4, pos: 0), buf).unwrap, 4
+  assert read_exact(Alphabet.new(left: 25, pos: 0), buf).ok?
+  e = read_exact(Alphabet.new(left: 4, pos: 0), buf).err.unwrap
+  assert_eq e.message, "unexpected EOF"
+  assert read_exact(Alphabet.new(left: 0, pos: 0), b("")).ok?
+  assert read_exact(Flaky.new(ok: 3), buf).err?
+}
+
+test "copy_n" {
+  c = Counter.new
+  assert_eq copy_n(c, Alphabet.new(left: 100, pos: 0), 40).unwrap, 40
+  e = copy_n(c, Alphabet.new(left: 10, pos: 0), 40).err.unwrap
+  assert_eq e.message, "unexpected EOF"
+  assert_eq copy_n(c, Alphabet.new(left: 10, pos: 0), 0).unwrap, 0
+  assert copy_n(c, Alphabet.new(left: 10, pos: 0), -1).err?
+}
+
+test "infallible methods satisfy the interfaces" {
+  m = Mem.new(data: b("12345"), off: 0)
+  r: Reader = m
+  buf: [Byte] = [0; 3]
+  assert_eq r.read!(buf).unwrap, 3
+  assert_eq s(buf), "123"
+  assert_eq r.read!(buf).unwrap, 2
+  assert_eq r.read!(buf).unwrap, 0
+  assert_eq s(read_all(Mem.new(data: b("xyz"), off: 1)).unwrap), "yz"
+  w: Writer = Mem.new(data: [], off: 0)
+  assert_eq w.write!(b("abc")).unwrap, 3
+  assert_eq write_string(Mem.new(data: [], off: 0), "q").unwrap, 1
+}
+
+test "Discard" {
+  d = Discard.new
+  assert_eq d.write!(b("abc")), 3
+  assert_eq d.write_string!("hello"), 5
+}

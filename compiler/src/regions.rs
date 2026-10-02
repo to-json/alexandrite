@@ -109,9 +109,13 @@ pub fn allocates(e: &TExpr, promote: bool) -> bool {
     }
 }
 
+type Ifaces = HashMap<String, Vec<(Ty, Vec<usize>)>>;
+
 struct Graph<'a> {
     f: &'a TFunc,
     sums: &'a [Summary],
+    /// Each interface's implementors, with their method instances.
+    ifaces: &'a Ifaces,
     edges: HashMap<Node, Vec<Node>>,
     sites: Vec<usize>,
     /// The loops (innermost last) around the walk's current point, and
@@ -220,9 +224,38 @@ impl<'a> Graph<'a> {
                 let avs: Vec<Node> = per_arg.iter().flatten().copied().collect();
                 match m {
                     // Stored where it outlives the call.
-                    M::ChanSend | M::Yield | M::Spawn | M::EnumNew | M::FnCall | M::IfaceCall(_) | M::Pmap => {
+                    M::ChanSend | M::Yield | M::Spawn | M::EnumNew | M::FnCall | M::Pmap => {
                         self.flow(&rv, &[Node::Global]);
                         self.flow(&avs, &[Node::Global]);
+                    }
+                    // An interface call runs one of the implementors' methods:
+                    // what escapes is what any of their summaries says escapes
+                    // (parameter 0 is the receiver).
+                    M::IfaceCall(mi) => {
+                        let iname = match recv.as_ref().map(|r| &r.ty) {
+                            Some(Ty::Iface(n)) => Some(n.clone()),
+                            Some(Ty::Array(t)) => match &**t {
+                                Ty::Iface(n) => Some(n.clone()),
+                                _ => None,
+                            },
+                            _ => None,
+                        };
+                        let impls: Vec<usize> = iname.and_then(|n| self.ifaces.get(&n)).map(|v| v.iter().filter_map(|(_, fids)| fids.get(*mi).copied()).collect()).unwrap_or_default();
+                        if impls.is_empty() {
+                            self.flow(&rv, &[Node::Global]);
+                            self.flow(&avs, &[Node::Global]);
+                        }
+                        for fid in impls {
+                            let sum = self.sums.get(fid).cloned().unwrap_or_default();
+                            if sum.to_global.first().copied().unwrap_or(true) {
+                                self.flow(&rv, &[Node::Global]);
+                            }
+                            for (i, av) in per_arg.iter().enumerate() {
+                                if sum.to_global.get(i + 1).copied().unwrap_or(true) {
+                                    self.flow(av, &[Node::Global]);
+                                }
+                            }
+                        }
                     }
                     // Mutations of the receiver: what's stored (and any growth)
                     // lives as long as the receiver.
@@ -421,8 +454,8 @@ fn unsafe_ref<'b>(p: *const TExpr) -> &'b TExpr {
     unsafe { &*p }
 }
 
-fn graph<'a>(f: &'a TFunc, sums: &'a [Summary]) -> Graph<'a> {
-    let mut g = Graph { f, sums, edges: HashMap::new(), sites: vec![], loops: vec![], site_loops: HashMap::new(), loop_bodies: HashMap::new(), mutations: vec![], defs: vec![], at: f.span, why_global: HashMap::new(), loop_at: HashMap::new() };
+fn graph<'a>(f: &'a TFunc, sums: &'a [Summary], ifaces: &'a Ifaces) -> Graph<'a> {
+    let mut g = Graph { f, sums, ifaces, edges: HashMap::new(), sites: vec![], loops: vec![], site_loops: HashMap::new(), loop_bodies: HashMap::new(), mutations: vec![], defs: vec![], at: f.span, why_global: HashMap::new(), loop_at: HashMap::new() };
     // Writing into a parameter's storage writes into the caller's objects.
     for p in &f.params {
         g.edge(Node::Local(*p), Node::Caller(*p));
@@ -458,7 +491,7 @@ pub fn aliases(p: &TProgram) -> Vec<HashMap<LocalId, (Vec<LocalId>, Vec<LocalId>
             if f.external {
                 return out;
             }
-            let g = graph(f, &sums);
+            let g = graph(f, &sums, &p.ifaces);
             let mut adj: HashMap<Node, Vec<Node>> = HashMap::new();
             for (a, bs) in &g.edges {
                 for b in bs {
@@ -517,7 +550,7 @@ fn summaries(p: &TProgram) -> Vec<Summary> {
             if f.external {
                 continue;
             }
-            let g = graph(f, &sums);
+            let g = graph(f, &sums, &p.ifaces);
             // What does each parameter's (caller-owned) storage reach,
             // other than its own caller?
             let mut s = Summary::default();
@@ -545,7 +578,7 @@ fn analyze_with(p: &TProgram, sums: &[Summary]) -> Vec<FnPlacement> {
             if f.external {
                 return FnPlacement::default();
             }
-            let g = graph(f, sums);
+            let g = graph(f, sums, &p.ifaces);
             let fresh = fresh_locals(f, &g);
             let mut out = FnPlacement::default();
             for s in &g.sites {
@@ -806,7 +839,7 @@ pub fn explain(p: &TProgram, sm: &crate::diag::SourceMap, files: &[u32]) -> Stri
         if f.external || !files.contains(&f.span.file) {
             continue;
         }
-        let g = graph(f, &sums);
+        let g = graph(f, &sums, &p.ifaces);
         if g.sites.is_empty() {
             continue;
         }

@@ -41,7 +41,7 @@ mod rt {
         alxj_puts_u64, alxj_u64_to_s, alxj_int_fmt, alxj_f_to_u64, alxj_rune_to_s, alxj_str_from_bytes,
         alxj_die_str, alxj_panic_str, alxj_exit, alxj_now_ns, alxj_cap_begin, alxj_cap_end, alxj_file_status, alxj_file_read_or_empty,
         alxj_ffi_enter, alxj_ffi_save_errno, alxj_cstr_new, alxj_cstr_free, alxj_errno, alxj_strerror, alxj_str_from_cstr, alxj_str_from_ptr,
-        alx_sys_open, alx_sys_fcntl, alx_sys_const, alx_argc, alx_argv, alx_sleep_ns, alx_wall_ns, alx_mono_ns, alx_local_offset, alx_local_zone,
+        alx_sys_open, alx_sys_fcntl, alx_sys_const, alx_sys_stat, alx_sys_fstat, alx_sys_dir_open, alx_sys_dir_next, alx_sys_dir_close, alx_environ, alx_argc, alx_argv, alx_sleep_ns, alx_wall_ns, alx_mono_ns, alx_local_offset, alx_local_zone,
         alxj_spawn, alxj_task_wait, alxj_lock_new, alxj_lock, alxj_unlock, alxj_atomic_new, alxj_chan_new, alxj_chan_len, alxj_chan_send, alxj_chan_recv, alxj_chan_close, alxj_select,
     );
 }
@@ -214,6 +214,12 @@ fn resolve_c_symbol(name: &str) -> Option<usize> {
         "alx_sys_open" => Some(rt::alx_sys_open as usize),
         "alx_sys_fcntl" => Some(rt::alx_sys_fcntl as usize),
         "alx_sys_const" => Some(rt::alx_sys_const as usize),
+        "alx_sys_stat" => Some(rt::alx_sys_stat as usize),
+        "alx_sys_fstat" => Some(rt::alx_sys_fstat as usize),
+        "alx_sys_dir_open" => Some(rt::alx_sys_dir_open as usize),
+        "alx_sys_dir_next" => Some(rt::alx_sys_dir_next as usize),
+        "alx_sys_dir_close" => Some(rt::alx_sys_dir_close as usize),
+        "alx_environ" => Some(rt::alx_environ as usize),
         "alx_argc" => Some(rt::alx_argc as usize),
         "alx_argv" => Some(rt::alx_argv as usize),
         "alx_sleep_ns" => Some(rt::alx_sleep_ns as usize),

@@ -1,0 +1,237 @@
+import "io"
+import "bytes"
+
+def tmp -> Str {
+  mkdir_temp("", "alx-os-test-*").unwrap
+}
+
+def b(s: Str) -> [Byte] { s.bytes.to_a }
+
+test "file round trip" {
+  d = tmp
+  name = d + "/a.txt"
+  f = create(name).unwrap
+  assert_eq f.write_string!("hello, ").unwrap, 7
+  assert_eq f.write!(b("world\n")).unwrap, 6
+  f.close!.unwrap
+  assert f.close!.err?, "second close fails"
+  assert_eq read_file_string(name).unwrap, "hello, world\n"
+  info = stat(name).unwrap
+  assert_eq info.size, 13
+  assert_eq info.name, "a.txt"
+  assert info.is_regular
+  assert !info.is_dir
+  assert info.mod_time > 1_000_000_000_000_000_000
+  remove_all(d).unwrap
+}
+
+test "read, seek, read_at, append, truncate" {
+  d = tmp
+  name = d + "/b.bin"
+  write_file(name, b("0123456789"), 0o600).unwrap
+  assert_eq stat(name).unwrap.perm, 0o600
+  f = open_file(name, O_RDWR, 0).unwrap
+  buf: [Byte] = [0; 4]
+  assert_eq f.read!(buf).unwrap, 4
+  assert_eq Str.from_bytes(buf), "0123"
+  assert_eq f.seek!(2, io.SEEK_CURRENT).unwrap, 6
+  assert_eq f.read!(buf).unwrap, 4
+  assert_eq Str.from_bytes(buf), "6789"
+  assert_eq f.read!(buf).unwrap, 0
+  assert_eq f.seek!(0, io.SEEK_START).unwrap, 0
+  assert_eq f.read_at(buf, 3).unwrap, 4
+  assert_eq Str.from_bytes(buf), "3456"
+  assert_eq f.seek!(-2, io.SEEK_END).unwrap, 8
+  assert_eq f.write_at(b("XY"), 0).unwrap, 2
+  f.truncate!(6).unwrap
+  assert_eq f.stat.unwrap.size, 6
+  f.sync!.unwrap
+  f.close!.unwrap
+  assert_eq read_file_string(name).unwrap, "XY2345"
+  g = open_file(name, O_WRONLY | O_APPEND, 0).unwrap
+  g.write_string!("++").unwrap
+  g.close!.unwrap
+  assert_eq read_file_string(name).unwrap, "XY2345++"
+  remove_all(d).unwrap
+}
+
+test "O_EXCL and O_CREATE" {
+  d = tmp
+  name = d + "/x"
+  f = open_file(name, O_WRONLY | O_CREATE | O_EXCL, 0o644).unwrap
+  f.close!.unwrap
+  e = open_file(name, O_WRONLY | O_CREATE | O_EXCL, 0o644).err
+  assert is_exist(e.unwrap)
+  assert_eq e.unwrap.message, "open #{name}: file exists"
+  remove_all(d).unwrap
+}
+
+test "errors read like Go's" {
+  r = open("/no/such/file")
+  assert r.err?
+  e = r.err.unwrap
+  assert is_not_exist(e)
+  assert !is_exist(e)
+  assert !is_permission(e)
+  assert_eq e.message, "open /no/such/file: no such file or directory"
+  case e {
+    NotExist => assert true
+    _ => assert false, "expected NotExist"
+  }
+  case e {
+    FsError => assert true
+    _ => assert false, "expected FsError"
+  }
+  assert is_not_exist(stat("/no/such").err.unwrap)
+  assert_eq stat("/no/such").err.unwrap.message, "stat /no/such: no such file or directory"
+  assert is_not_exist(read_dir("/no/such").err.unwrap)
+  assert is_not_exist(remove("/no/such").err.unwrap)
+  assert remove_all("/no/such").ok?, "remove_all of nothing is fine"
+  d = tmp
+  write_file(d + "/f", b("x"), 0o644).unwrap
+  ne = mkdir(d + "/f", 0o755).err.unwrap
+  assert is_exist(ne)
+  nd = read_dir(d + "/f").err.unwrap
+  assert_eq nd.message, "open #{d}/f: not a directory"
+  mkdir(d + "/sub", 0o755).unwrap
+  write_file(d + "/sub/g", b("x"), 0o644).unwrap
+  assert is_exist(remove(d + "/sub").err.unwrap), "directory not empty"
+  remove_all(d).unwrap
+}
+
+test "directories" {
+  d = tmp
+  mkdir_all(d + "/p/q/r", 0o755).unwrap
+  mkdir_all(d + "/p/q/r", 0o755).unwrap
+  assert stat(d + "/p/q/r").unwrap.is_dir
+  write_file(d + "/p/b.txt", b("b"), 0o644).unwrap
+  write_file(d + "/p/a.txt", b("a"), 0o644).unwrap
+  write_file(d + "/p/c.txt", b("c"), 0o644).unwrap
+  es = read_dir(d + "/p").unwrap
+  names = es.map { it.name }.to_a
+  assert_eq names[0] + names[1] + names[2] + names[3], "a.txtb.txtc.txtq"
+  assert es[3].is_dir
+  assert es[0].is_regular
+  assert_eq es[0].path, d + "/p/a.txt"
+  assert_eq es[0].info.unwrap.size, 1
+  assert mkdir_all(d + "/p/a.txt/z", 0o755).err?
+  rename(d + "/p/a.txt", d + "/p/z.txt").unwrap
+  assert stat(d + "/p/a.txt").err?
+  assert_eq read_file_string(d + "/p/z.txt").unwrap, "a"
+  assert_eq read_dir(d + "/p/q/r").unwrap.size, 0
+  remove(d + "/p/q/r").unwrap
+  remove(d + "/p/z.txt").unwrap
+  assert remove_all(d + "/p").ok?
+  assert stat(d + "/p").err?
+  remove_all(d).unwrap
+  assert stat(d).err?
+}
+
+test "links" {
+  d = tmp
+  write_file(d + "/t", b("target"), 0o644).unwrap
+  symlink("t", d + "/s").unwrap
+  assert_eq readlink(d + "/s").unwrap, "t"
+  assert lstat(d + "/s").unwrap.is_symlink
+  assert stat(d + "/s").unwrap.is_regular
+  assert_eq read_file_string(d + "/s").unwrap, "target"
+  link(d + "/t", d + "/h").unwrap
+  assert_eq stat(d + "/t").unwrap.nlink, 2
+  chmod(d + "/t", 0o600).unwrap
+  assert_eq stat(d + "/h").unwrap.perm, 0o600
+  remove_all(d).unwrap
+}
+
+test "temp files" {
+  d = tmp
+  f = create_temp(d, "pre-*.dat").unwrap
+  assert has_prefix(f.name, d + "/pre-")
+  assert has_suffix(f.name, ".dat")
+  f.write_string!("tmp").unwrap
+  f.close!.unwrap
+  assert_eq read_file_string(f.name).unwrap, "tmp"
+  t2 = mkdir_temp(d, "dir").unwrap
+  assert stat(t2).unwrap.is_dir
+  assert has_prefix(t2, d + "/dir")
+  assert mkdir_temp("/no/such", "x").err?
+  remove_all(d).unwrap
+}
+
+def has_prefix(s: Str, p: Str) -> Bool {
+  s.size >= p.size && s[0...p.size] == p
+}
+
+def has_suffix(s: Str, p: Str) -> Bool {
+  s.size >= p.size && s[s.size - p.size...s.size] == p
+}
+
+test "environment" {
+  assert getenv("ALX_OS_TEST_UNSET").none?
+  setenv("ALX_OS_TEST_VAR", "héllo=1").unwrap
+  assert_eq getenv("ALX_OS_TEST_VAR") || "", "héllo=1"
+  found = false
+  for kv in environ {
+    found = true if kv == "ALX_OS_TEST_VAR=héllo=1"
+  }
+  assert found, "environ lists it"
+  unsetenv("ALX_OS_TEST_VAR").unwrap
+  assert getenv("ALX_OS_TEST_VAR").none?
+  assert temp_dir.size > 0
+}
+
+test "process" {
+  assert args.size >= 1
+  assert getpid > 0
+  assert getppid > 0
+  assert getuid >= 0
+  assert hostname.unwrap.size > 0
+  wd = getwd.unwrap
+  assert wd.size > 0 && wd[0] == 47
+  d = tmp
+  chdir(d).unwrap
+  assert_eq stat(".").unwrap.ino, stat(d).unwrap.ino
+  chdir(wd).unwrap
+  assert_eq getwd.unwrap, wd
+  assert chdir("/no/such/dir").err?
+  remove_all(d).unwrap
+  assert user_home_dir.ok? || getenv("HOME").none?
+}
+
+test "io.copy between File and bytes.Buffer" {
+  d = tmp
+  name = d + "/c.txt"
+  src = bytes.new_buffer_string("copy me, please")
+  f = create(name).unwrap
+  assert_eq io.copy(f, src).unwrap, 15
+  f.close!.unwrap
+  g = open(name).unwrap
+  dst = bytes.Buffer.new
+  assert_eq io.copy(dst, g).unwrap, 15
+  # Buffer is a value: copying into it from a function doesn't change ours.
+  assert_eq dst.size, 0
+  g.close!.unwrap
+  h = open(name).unwrap
+  assert_eq Str.from_bytes(io.read_all(h).unwrap), "copy me, please"
+  h.close!.unwrap
+  # Through the interface in a place, the Buffer does change.
+  w: io.Writer = bytes.Buffer.new
+  assert_eq w.write!(b("abc")).unwrap, 3
+  remove_all(d).unwrap
+}
+
+test "stdout is a Writer" {
+  out = stdout
+  assert out.is_terminal || !out.is_terminal
+  assert_eq io.write_string(out, "").unwrap, 0
+  assert_eq stdin.fd, 0
+  assert_eq stderr.name, "/dev/stderr"
+}
+
+test "bad descriptors" {
+  f = File.new(fd: -1, name: "nofile")
+  buf: [Byte] = [0; 4]
+  e = f.read!(buf).err.unwrap
+  assert_eq e.message, "read nofile: bad file descriptor"
+  assert f.write!(b("x")).err?
+  assert f.sync!.err?
+}

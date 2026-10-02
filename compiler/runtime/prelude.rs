@@ -445,6 +445,89 @@ mod rt {
         }
     }
 
+    // The C runtime's file and directory shims (alx.h), over std.
+    fn cpath(p: *const std::ffi::c_char) -> std::path::PathBuf {
+        use std::os::unix::ffi::OsStrExt;
+        std::path::PathBuf::from(std::ffi::OsStr::from_bytes(unsafe { std::ffi::CStr::from_ptr(p) }.to_bytes()))
+    }
+    fn stat_fill(m: &std::fs::Metadata, out: *mut u8) {
+        use std::os::unix::fs::MetadataExt;
+        let v: [i64; 6] = [m.mode() as i64, m.size() as i64, m.mtime() * 1_000_000_000 + m.mtime_nsec(), m.atime() * 1_000_000_000 + m.atime_nsec(), m.ino() as i64, m.nlink() as i64];
+        unsafe { std::ptr::copy_nonoverlapping(v.as_ptr() as *const u8, out, 48) };
+    }
+    fn neg_errno(e: &std::io::Error) -> i64 {
+        -(e.raw_os_error().unwrap_or(5) as i64)
+    }
+    pub unsafe fn shim_alx_sys_stat(path: *const std::ffi::c_char, out: *mut u8, follow: i32) -> i32 {
+        let p = cpath(path);
+        match if follow != 0 { std::fs::metadata(p) } else { std::fs::symlink_metadata(p) } {
+            Ok(m) => {
+                stat_fill(&m, out);
+                0
+            }
+            Err(e) => neg_errno(&e) as i32,
+        }
+    }
+    pub unsafe fn shim_alx_sys_fstat(fd: i32, out: *mut u8) -> i32 {
+        use std::os::fd::FromRawFd;
+        let f = std::mem::ManuallyDrop::new(unsafe { std::fs::File::from_raw_fd(fd) });
+        match f.metadata() {
+            Ok(m) => {
+                stat_fill(&m, out);
+                0
+            }
+            Err(e) => neg_errno(&e) as i32,
+        }
+    }
+    struct DirH {
+        it: std::fs::ReadDir,
+        cur: std::ffi::CString,
+    }
+    pub unsafe fn shim_alx_sys_dir_open(path: *const std::ffi::c_char) -> i64 {
+        match std::fs::read_dir(cpath(path)) {
+            Ok(it) => Box::into_raw(Box::new(DirH { it, cur: std::ffi::CString::default() })) as usize as i64,
+            Err(e) => neg_errno(&e),
+        }
+    }
+    pub unsafe fn shim_alx_sys_dir_next(h: i64, kind: *mut u8) -> *mut std::ffi::c_void {
+        use std::os::unix::ffi::OsStrExt;
+        let d = unsafe { &mut *(h as usize as *mut DirH) };
+        for e in d.it.by_ref() {
+            let Ok(e) = e else { continue };
+            let name = e.file_name();
+            let k = match e.file_type() {
+                Ok(t) if t.is_file() => 1,
+                Ok(t) if t.is_dir() => 2,
+                Ok(t) if t.is_symlink() => 3,
+                Ok(_) => 4,
+                Err(_) => 0,
+            };
+            unsafe { *kind = k };
+            d.cur = std::ffi::CString::new(name.as_bytes()).unwrap_or_default();
+            return d.cur.as_ptr() as *mut std::ffi::c_void;
+        }
+        std::ptr::null_mut()
+    }
+    pub unsafe fn shim_alx_sys_dir_close(h: i64) {
+        drop(unsafe { Box::from_raw(h as usize as *mut DirH) });
+    }
+    unsafe extern "C" {
+        static environ: *const *const std::ffi::c_char;
+    }
+    pub unsafe fn shim_alx_environ(i: i64) -> *mut std::ffi::c_void {
+        unsafe {
+            if environ.is_null() {
+                return std::ptr::null_mut();
+            }
+            for k in 0..=i {
+                if (*environ.offset(k as isize)).is_null() {
+                    return std::ptr::null_mut();
+                }
+            }
+            *environ.offset(i as isize) as *mut std::ffi::c_void
+        }
+    }
+
     pub fn now_ns() -> i64 {
         static T0: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
         T0.get_or_init(std::time::Instant::now).elapsed().as_nanos() as i64

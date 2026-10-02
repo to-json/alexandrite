@@ -1,0 +1,87 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-24.04,     target: x86_64-unknown-linux-gnu }
+          - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu }
+          - { os: macos-15,         target: aarch64-apple-darwin }
+          - { os: macos-15-intel,   target: x86_64-apple-darwin }
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - name: Install clang
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y clang
+      - name: Build
+        run: cargo build --release --locked -p alx
+      - name: Test
+        run: cargo test --release --locked -p alx
+      - name: Smoke (JIT run, AOT build)
+        run: |
+          alx=target/release/alx
+          $alx run acceptance/cases/closures.alx | diff - acceptance/cases/closures.expected
+          $alx build --release acceptance/cases/collections.alx -o "$RUNNER_TEMP/collections"
+          "$RUNNER_TEMP/collections" | diff - acceptance/cases/collections.expected
+      - name: std tests
+        run: |
+          for d in $(find std -name '*_test.alx' -exec dirname {} \; | sort -u); do
+            target/release/alx test "$d"
+          done
+      - name: Package
+        run: |
+          name=alx-${{ matrix.target }}
+          mkdir -p "dist/$name"
+          cp target/release/alx LICENSE "dist/$name/"
+          cp compiler/runtime/LICENSES "dist/$name/LICENSES-runtime"
+          tar -C dist -czf "dist/$name.tar.gz" "$name"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: alx-${{ matrix.target }}
+          path: dist/alx-${{ matrix.target }}.tar.gz
+
+  wasm:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - name: Build alx-web
+        run: cargo build --release --locked --target wasm32-unknown-unknown -p alx-web
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [build, wasm]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v5
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" dist/*.tar.gz --repo "$GITHUB_REPOSITORY" --generate-notes

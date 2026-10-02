@@ -258,6 +258,15 @@ mod rt {
     fn str_split_v(s: Str, sep: Str) -> Vec<Str> {
         let mut out = vec![];
         let (b, p) = (&s.0[..], &sep.0[..]);
+        if p.is_empty() {
+            let mut i = 0;
+            while i < b.len() {
+                let n = utf8_seq_len(&b[i..]);
+                out.push(Str::lit(&b[i..i + n]));
+                i += n;
+            }
+            return out;
+        }
         let mut start = 0;
         let mut i = 0;
         while i + p.len() <= b.len() {
@@ -270,10 +279,13 @@ mod rt {
             }
         }
         out.push(Str::lit(&b[start..]));
-        while out.last().is_some_and(|x| x.0.is_empty()) {
-            out.pop();
-        }
         out
+    }
+    /// The length of the UTF-8 sequence at the start of `b` (1 for an invalid byte).
+    fn utf8_seq_len(b: &[u8]) -> usize {
+        let c = b[0];
+        let n = if c < 0x80 { 1 } else if c >= 0xF0 { 4 } else if c >= 0xE0 { 3 } else if c >= 0xC0 { 2 } else { 1 };
+        if n > b.len() || b[1..n].iter().any(|x| x & 0xC0 != 0x80) { 1 } else { n }
     }
     pub fn str_to_i(s: Str) -> i64 {
         let t = String::from_utf8_lossy(&s.0);

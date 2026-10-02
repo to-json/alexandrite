@@ -352,23 +352,31 @@ pub extern "C" fn alxr_str_delete(p: i64, n: i64, cp: i64, cn: i64) {
 #[unsafe(no_mangle)]
 pub extern "C" fn alxr_str_split(p: i64, n: i64, sp: i64, sn: i64) {
     let (s, sep) = (bytes(p, n), bytes(sp, sn));
-    if sep.is_empty() {
-        panic_msg("`split` with an empty separator", "runtime");
-    }
     let mut parts: Vec<(i64, i64)> = vec![];
-    let (mut start, mut i) = (0usize, 0usize);
-    while i + sep.len() <= s.len() {
-        if &s[i..i + sep.len()] == sep {
-            parts.push((p + start as i64, (i - start) as i64));
-            i += sep.len();
-            start = i;
-        } else {
-            i += 1;
+    if sep.is_empty() {
+        // Go: after each UTF-8 sequence (an invalid byte on its own).
+        let mut i = 0usize;
+        while i < s.len() {
+            let c = s[i];
+            let mut k = if c < 0x80 { 1 } else if c >= 0xF0 { 4 } else if c >= 0xE0 { 3 } else if c >= 0xC0 { 2 } else { 1 };
+            if i + k > s.len() || s[i + 1..i + k].iter().any(|x| x & 0xC0 != 0x80) {
+                k = 1;
+            }
+            parts.push((p + i as i64, k as i64));
+            i += k;
         }
-    }
-    parts.push((p + start as i64, (s.len() - start) as i64));
-    while parts.last().is_some_and(|x| x.1 == 0) {
-        parts.pop();
+    } else {
+        let (mut start, mut i) = (0usize, 0usize);
+        while i + sep.len() <= s.len() {
+            if &s[i..i + sep.len()] == sep {
+                parts.push((p + start as i64, (i - start) as i64));
+                i += sep.len();
+                start = i;
+            } else {
+                i += 1;
+            }
+        }
+        parts.push((p + start as i64, (s.len() - start) as i64));
     }
     let a = alloc(16 * parts.len().max(1));
     for (k, (pp, ln)) in parts.iter().enumerate() {

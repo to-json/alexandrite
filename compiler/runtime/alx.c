@@ -406,9 +406,23 @@ AlxStr alx_str_delete(AlxStr s, AlxStr chars) {
     return r;
 }
 
+/* Go's strings.Split: every field, empty ones included; an empty separator
+ * splits after each UTF-8 sequence (an invalid byte on its own). */
 Arr_Str alx_str_split(AlxStr s, AlxStr sep) {
     Arr_Str a = Arr_Str_cap(16);
-    if (sep.len == 0) alx_panic("`split` with an empty separator", "runtime");
+    if (sep.len == 0) {
+        for (int64_t i = 0; i < s.len;) {
+            uint8_t c = (uint8_t)s.ptr[i];
+            int64_t n = c < 0x80 ? 1 : c >= 0xF0 ? 4 : c >= 0xE0 ? 3 : c >= 0xC0 ? 2 : 1;
+            if (i + n > s.len) n = 1;
+            for (int64_t k = 1; k < n; k++)
+                if (((uint8_t)s.ptr[i + k] & 0xC0) != 0x80) { n = 1; break; }
+            AlxStr part = { s.ptr + i, n };
+            Arr_Str_push(&a, part);
+            i += n;
+        }
+        return a;
+    }
     int64_t start = 0;
     for (int64_t i = 0; i + sep.len <= s.len;) {
         if (memcmp(s.ptr + i, sep.ptr, (size_t)sep.len) == 0) {
@@ -422,8 +436,6 @@ Arr_Str alx_str_split(AlxStr s, AlxStr sep) {
     }
     AlxStr last = { s.ptr + start, s.len - start };
     Arr_Str_push(&a, last);
-    /* Ruby drops trailing empty fields. */
-    while (a.len > 0 && a.ptr[a.len - 1].len == 0) a.len--;
     return a;
 }
 

@@ -99,6 +99,7 @@ GROUPS = {
     "flags": "L2",
     "wc": "L2",
     "l2fixes": "L2",
+    "echo": "L3",
 }
 
 

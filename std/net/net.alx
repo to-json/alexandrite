@@ -10,11 +10,10 @@
 #    `dial tcp 127.0.0.1:1: connect: connection refused`. Match with `case`:
 #        case e { ConnRefused => ...; Timeout => ...; Closed => ...; _ => ... }
 #  - End of stream is not an error: `Conn.read!` returns 0 (GO-VS-RUBY F3).
-#  - `Conn` and `Listener` hold their descriptor in shared state (GO-VS-RUBY
-#    D36), so copies are the same connection: pass one to a function, or
-#    move it into `spawn` (R6: the spawner can't use it afterwards, which is
-#    Go's hand-off). `close!` on any copy closes them all; a task parked on
-#    the descriptor is woken and fails with `Closed`.
+#  - `Conn` and `Listener` hold their descriptor in an Atomic, so copies are
+#    the same connection and tasks may share one (one accepts or reads
+#    while another closes, as in Go). `close!` on any copy closes them all;
+#    a task parked on the descriptor is woken and fails with `Closed`.
 #  - `Conn` is an io.Reader, io.Writer and io.Closer. `write!` writes all of
 #    its argument, retrying on partial writes.
 #  - Addresses are "host:port" strings; ":0" lets the system pick a port
@@ -128,6 +127,8 @@ def describe(f: NetFailure, kind: Int) -> Str {
   return "#{head}: use of closed network connection" if kind == 2
   return "address #{f.addr}: #{f.syscall}" if kind == 3
   return "#{f.op}: #{f.syscall}: no such host" if f.code == NO_HOST
+  # No errno: the call's own reason is the whole message.
+  return "#{head}: #{f.syscall}" if f.code == 0
   "#{head}: #{f.syscall}: #{errno_message(f.code)}"
 }
 
@@ -249,12 +250,14 @@ pub def lookup_host(host: Str) -> ~[Str] {
 
 # A TCP connection. The descriptor lives in shared state (D36).
 pub struct Conn {
-  cell: [Int]
+  # The descriptor, -1 once closed. Atomic: copies share it, and tasks may
+  # share a connection (one reads while another closes).
+  fdv: Atomic[Int]
   local: Str
   remote: Str
 
   # The descriptor; -1 once closed.
-  pub def fd -> Int { cell.size == 0 ? -1 : cell[0] }
+  pub def fd -> Int { fdv.load }
 
   pub def local_addr -> Str { local }
   pub def remote_addr -> Str { remote }
@@ -307,9 +310,8 @@ pub struct Conn {
   # Closes the connection (every copy of it) and wakes tasks waiting on it.
   # A second close fails with Closed.
   pub def close! -> ~Unit {
-    f = fd
+    f = fdv.swap(-1)
     fail closed_error("close", remote) if f < 0
-    self.cell[0] = -1
     r = alx_fd_close(f)
     fail net_error("close", remote, "close", -r) if r < 0
   }
@@ -332,8 +334,7 @@ pub struct Conn {
 }
 
 def new_conn(fd: Int, local: Str, remote: Str) -> Conn {
-  cell: [Int] = [fd]
-  Conn.new(cell: cell, local: local, remote: remote)
+  Conn.new(fdv: Atomic.new(fd), local: local, remote: remote)
 }
 
 # Waits for a non-blocking connect on fd to finish: 0 or the errno.
@@ -398,11 +399,13 @@ pub def dial_timeout(network: Str, addr: Str, d_ns: Int) -> ~Conn {
 
 # A TCP listening socket. The descriptor lives in shared state (D36).
 pub struct Listener {
-  cell: [Int]
+  # The descriptor, -1 once closed. Atomic: copies share it, and tasks may
+  # share a connection (one reads while another closes).
+  fdv: Atomic[Int]
   # The bound address, "ip:port" (the real port after ":0").
   addr: Str
 
-  pub def fd -> Int { cell.size == 0 ? -1 : cell[0] }
+  pub def fd -> Int { fdv.load }
 
   # The bound port, an Int: unlike `addr` (a Str, which the sharing check
   # treats as part of the listener), it can be used after the listener has been
@@ -437,9 +440,8 @@ pub struct Listener {
   # Stops listening and wakes tasks blocked in accept! (they fail with
   # Closed). A second close fails.
   pub def close! -> ~Unit {
-    f = fd
+    f = fdv.swap(-1)
     fail closed_error("close", addr) if f < 0
-    self.cell[0] = -1
     r = alx_fd_close(f)
     fail net_error("close", addr, "close", -r) if r < 0
   }
@@ -454,6 +456,5 @@ pub def listen(network: Str, addr: Str) -> ~Listener {
   fail net_error("listen", addr, "bind", -fd) if fd < 0
   buf = zeros(64)
   bound = addr_of(buf, alx_sock_local_addr(fd, buf))
-  cell: [Int] = [fd]
-  Listener.new(cell: cell, addr: bound)
+  Listener.new(fdv: Atomic.new(fd), addr: bound)
 }

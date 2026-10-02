@@ -1466,6 +1466,79 @@ impl<'a> Parser<'a> {
                 e.span = sp.to(self.prev_span());
                 e
             }
+            Tok::Ident(kw) if kw == "spawn" && !self.is_local("spawn") && !matches!(self.peek(), Tok::Op("(")) => {
+                // `spawn { ... }`, or `spawn f(x)` = `spawn { f(x) }`
+                if self.is_op("{") {
+                    let bsp = self.span();
+                    self.bump();
+                    self.pos -= 1;
+                    let body = self.braced_stmts()?;
+                    let id = self.id();
+                    let block = Block { id, params: vec![], body, span: bsp.to(self.prev_span()) };
+                    self.mk(ExprKind::Spawn(Box::new(block)), sp.to(self.prev_span()))
+                } else {
+                    let e = self.expr()?;
+                    let id = self.id();
+                    let esp = e.span;
+                    let block = Block { id, params: vec![], body: vec![Stmt { span: esp, kind: StmtKind::Expr(e) }], span: esp };
+                    self.mk(ExprKind::Spawn(Box::new(block)), sp.to(esp))
+                }
+            }
+            Tok::Ident(kw) if kw == "select" && !self.is_local("select") && self.is_op("{") => {
+                self.bump();
+                let mut arms = vec![];
+                let mut default = None;
+                loop {
+                    self.skip_newlines();
+                    if self.eat_op("}") {
+                        break;
+                    }
+                    let asp = self.span();
+                    self.scopes.push(HashSet::new());
+                    let op = if self.is_kw(Kw::Else) {
+                        self.bump();
+                        None
+                    } else {
+                        match self.bump().tok {
+                            Tok::Ident(w) if w == "when" => {}
+                            t => return Err(Diag::new(asp, format!("expected `when` or `else` in `select`, found {}", describe(&t)))),
+                        }
+                        // `when v = ch.recv` / `when ch.recv` / `when ch.send(x)` / `when ch << x`
+                        let bind = if matches!(self.peek(), Tok::Ident(_)) && matches!(self.peek_at(1), Tok::Op("=")) {
+                            let bsp = self.span();
+                            let Tok::Ident(n) = self.bump().tok else { unreachable!() };
+                            self.bump();
+                            Some((n, bsp))
+                        } else {
+                            None
+                        };
+                        let e = self.expr()?;
+                        let op = match e.kind {
+                            ExprKind::Call { recv: Some(ch), name, args, .. } if name == "recv" && args.is_empty() => SelOp::Recv(bind.clone(), *ch),
+                            ExprKind::Call { recv: Some(ch), name, mut args, .. } if (name == "send" || name == "<<") && args.len() == 1 && bind.is_none() => SelOp::Send(*ch, args.pop().unwrap()),
+                            _ => return Err(Diag::new(e.span, "a `select` case is `when v = ch.recv`, `when ch.recv` or `when ch.send(x)`")),
+                        };
+                        if let Some((n, _)) = &bind {
+                            self.declare(n);
+                        }
+                        Some(op)
+                    };
+                    self.expect_op("=>")?;
+                    let body = if self.is_op("{") {
+                        self.braced_stmts()?
+                    } else {
+                        let e = self.expr()?;
+                        vec![Stmt { span: e.span, kind: StmtKind::Expr(e) }]
+                    };
+                    self.scopes.pop();
+                    match op {
+                        Some(op) => arms.push(SelArm { op, body, span: asp.to(self.prev_span()) }),
+                        None if default.is_none() => default = Some(body),
+                        None => return Err(Diag::new(asp, "a `select` has one `else`")),
+                    }
+                }
+                self.mk(ExprKind::Select(arms, default), sp.to(self.prev_span()))
+            }
             Tok::Op("->") => {
                 // `->(x: Int, y) -> Int { ... }` / `-> { ... }`
                 self.scopes.push(HashSet::new());

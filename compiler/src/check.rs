@@ -987,6 +987,8 @@ const SEQ_METHODS: &[&str] = &[
 const ARRAY_EXTRA: &[&str] = &["each_index", "each_cons", "pmap", "last", "reverse", "<<", "dup"];
 const INT_METHODS: &[&str] = &["to_s", "to_f", "to_i", "to_u8", "to_i32", "to_u32", "to_u64", "as_u8", "as_i32", "as_u32", "as_u64", "even?", "odd?", "digits", "step"];
 const FLOAT_METHODS: &[&str] = &["to_s", "to_f", "to_i", "abs", "sqrt"];
+/// `fmt` functions the compiler provides (std/fmt/fmt.alx documents them).
+const FMT_BUILTINS: &[&str] = &["sprintf", "printf", "sprint", "sprintln", "print", "println", "errorf"];
 const STR_METHODS: &[&str] = &["chars", "bytes", "runes", "size", "length", "reverse", "delete", "split", "to_i", "to_s"];
 
 fn lev(a: &str, b: &str) -> usize {
@@ -3300,6 +3302,9 @@ impl<'w, 'a> FnCx<'w, 'a> {
                     }
                     return Err(Diag::new(name_span, format!("`{name}` is a type (or isn't in that package); call a method on it")));
                 }
+                if path == "fmt" && crate::front::is_std("fmt") && FMT_BUILTINS.contains(&name) {
+                    return self.fmt_call(name, args, sp);
+                }
                 if !self.w.by_name.contains_key(&q) {
                     return Err(Diag::new(name_span, format!("package `{}` has no `{name}`", path)));
                 }
@@ -4685,8 +4690,32 @@ impl<'w, 'a> FnCx<'w, 'a> {
                 return Err(Diag::new(*fsp, format!("`%{spec}` has no argument: {} given", vals.len())));
             };
             let t = self.resolve(&v.ty);
+            // Flags, width, precision, verb: `%-+ 08.3f`.
+            let (mut left, mut zero, mut plus, mut space) = (false, false, false, false);
+            let mut rest = spec.as_str();
+            while let Some(c) = rest.chars().next().filter(|c| "-+0 #".contains(*c)) {
+                match c {
+                    '-' => left = true,
+                    '+' => plus = true,
+                    '0' => zero = true,
+                    ' ' => space = true,
+                    _ => {}
+                }
+                rest = &rest[1..];
+            }
+            let wlen = rest.chars().take_while(char::is_ascii_digit).count();
+            let width: u32 = rest[..wlen].parse().unwrap_or(0).min(1000);
+            rest = &rest[wlen..];
+            let mut prec: Option<u32> = None;
+            if let Some(r) = rest.strip_prefix('.') {
+                let n = r.chars().take_while(char::is_ascii_digit).count();
+                prec = Some(r[..n].parse().unwrap_or(0).min(40));
+                rest = &r[n..];
+            }
+            let verb = rest;
             let bad = |what: &str| Diag::new(v.span, format!("`%{spec}` needs {what}, got {}", t.show()));
-            let piece = match spec.as_str() {
+            let numeric = t.int_kind().is_some() || t == Ty::Float;
+            let piece = match verb {
                 "d" | "i" => {
                     if t.int_kind().is_none() {
                         return Err(bad("an integer"));
@@ -4697,12 +4726,12 @@ impl<'w, 'a> FnCx<'w, 'a> {
                     if t.int_kind().is_none() {
                         return Err(bad("an integer"));
                     }
-                    let base = match spec.as_str() {
+                    let base = match verb {
                         "o" => 8,
                         "b" => 2,
                         _ => 16,
                     };
-                    FmtPiece::Base(k, base, spec == "X")
+                    FmtPiece::Base(k, base, verb == "X")
                 }
                 "c" => {
                     if t.int_kind().is_none() {
@@ -4716,27 +4745,50 @@ impl<'w, 'a> FnCx<'w, 'a> {
                     }
                     FmtPiece::Str(k)
                 }
+                "q" => {
+                    if t != Ty::Str {
+                        return Err(bad("a Str"));
+                    }
+                    FmtPiece::Quote(k)
+                }
                 "v" => {
-                    if !matches!(t, Ty::Int | Ty::IntK(_) | Ty::Float | Ty::Str | Ty::Bool) {
-                        return Err(bad("an Int, Float, Str or Bool"));
+                    if !printable(&t) {
+                        return Err(bad("a value that can be shown"));
                     }
                     FmtPiece::Str(k)
                 }
+                "T" => FmtPiece::Lit(t.show()),
                 "t" => {
                     if t != Ty::Bool {
                         return Err(bad("a Bool"));
                     }
                     FmtPiece::Str(k)
                 }
-                _ if spec.ends_with('f') && (spec == "f" || (spec.starts_with('.') && spec[1..spec.len() - 1].parse::<u32>().is_ok())) => {
+                "f" | "F" => {
                     if !matches!(t, Ty::Int | Ty::Float) {
                         return Err(bad("a number"));
                     }
-                    let prec = if spec == "f" { 6 } else { spec[1..spec.len() - 1].parse::<u32>().unwrap().min(40) };
-                    FmtPiece::Fixed(k, prec)
+                    FmtPiece::Fixed(k, prec.unwrap_or(6))
                 }
-                _ => return Err(Diag::new(*fsp, format!("unsupported directive `%{spec}`")).note("supported so far (Go's fmt verbs): %v, %d, %s, %t, %f, %.Nf, %x, %X, %o, %b, %c, %%")),
+                "e" | "E" => {
+                    if !matches!(t, Ty::Int | Ty::Float) {
+                        return Err(bad("a number"));
+                    }
+                    FmtPiece::Exp(k, prec.unwrap_or(6), verb == "E")
+                }
+                _ => return Err(Diag::new(*fsp, format!("unsupported directive `%{spec}`")).note("supported so far (Go's fmt verbs): %v, %d, %s, %q, %t, %f, %e, %E, %x, %X, %o, %b, %c, %T, %%, with flags `-+0 `, a width and a precision")),
             };
+            let piece = if width > 0 || plus || space {
+                FmtPiece::Padded { inner: Box::new(piece), width, left, zero: zero && !left && numeric, plus: plus && numeric, space: space && numeric && !plus }
+            } else {
+                piece
+            };
+            // `%T` shows no argument.
+            if verb == "T" {
+                pieces.push(piece);
+                k += 1;
+                continue;
+            }
             pieces.push(piece);
             k += 1;
         }
@@ -4749,9 +4801,50 @@ impl<'w, 'a> FnCx<'w, 'a> {
         let vals = vals
             .into_iter()
             .enumerate()
-            .map(|(i, v)| if pieces.iter().any(|p| matches!(p, FmtPiece::Fixed(j, _) if *j == i)) { self.coerce(v, &Ty::Float) } else { Ok(v) })
+            .map(|(i, v)| if pieces.iter().any(|p| p.wants_float() && p.arg() == Some(i)) { self.coerce(v, &Ty::Float) } else { Ok(v) })
             .collect::<R<Vec<_>>>()?;
         Ok(self.mk(TK::Format(pieces, vals), Ty::Str, sp))
+    }
+
+    /// `fmt.sprintf` and friends (std/fmt): builtins over `format`.
+    fn fmt_call(&mut self, name: &str, args: &[Expr], sp: Span) -> R<TExpr> {
+        let text = match name {
+            "sprintf" | "printf" | "errorf" => self.format(name, args, sp)?,
+            _ => {
+                // sprint / sprintln / print / println: every operand as `%v`.
+                let line = name.ends_with("ln");
+                let vals = args.iter().map(|a| self.value(a)).collect::<R<Vec<_>>>()?;
+                let mut pieces = vec![];
+                for (i, v) in vals.iter().enumerate() {
+                    let t = self.resolve(&v.ty);
+                    if !printable(&t) {
+                        return Err(Diag::new(v.span, format!("`fmt.{name}` can't show a {}", t.show())));
+                    }
+                    if i > 0 {
+                        let prev = self.resolve(&vals[i - 1].ty);
+                        if line || (prev != Ty::Str && t != Ty::Str) {
+                            pieces.push(FmtPiece::Lit(" ".into()));
+                        }
+                    }
+                    pieces.push(FmtPiece::Str(i));
+                }
+                if line {
+                    pieces.push(FmtPiece::Lit("\n".into()));
+                }
+                self.mk(TK::Format(pieces, vals), Ty::Str, sp)
+            }
+        };
+        match name {
+            "printf" | "print" | "println" => {
+                if self.pure_decl {
+                    return Err(Diag::new(sp, format!("`#[pure] def {}` can't do I/O: `fmt.{name}`", self.fn_name)));
+                }
+                self.impure = true;
+                Ok(self.mk(TK::M(M::PrintStr, None, vec![text], None), Ty::Unit, sp))
+            }
+            "errorf" => self.to_error(text),
+            _ => Ok(text),
+        }
     }
 
     fn materialize_block_tail(&mut self, blk: &mut TBlock, t: Ty) -> Ty {

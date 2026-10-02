@@ -34,10 +34,10 @@ mod rt {
         alxj_alloc, alxj_zalloc, alxj_arr_alloc, alxj_arr_grow, alxj_arr_new, alxj_arr_copy,
         alxj_int_to_s, alxj_str_rev, alxj_str_delete, alxj_str_split, alxj_str_to_i, alxj_str_charlen, alxj_str_sub,
         alxj_str_eq, alxj_str_cmp, alxj_str_is_pal, alxj_int_ndigits, alxj_digits,
-        alxj_puts_str, alxj_puts_bool, alxj_puts_unit, alxj_pmap, alxj_finish,
+        alxj_puts_str, alxj_print_str, alxj_puts_bool, alxj_puts_unit, alxj_pmap, alxj_finish,
         alxj_p_add, alxj_p_sub, alxj_p_mul, alxj_p_div, alxj_p_rem, alxj_p_pow, alxj_p_cmp, alxj_p_even, alxj_p_to_i64,
         alxj_p_to_s, alxj_p_ndigits, alxj_p_digits, alxj_puts_pint,
-        alxj_puts_f64, alxj_f_to_s, alxj_f_fmt, alxj_f_to_i, alxj_str_cat,
+        alxj_puts_f64, alxj_f_to_s, alxj_f_fmt, alxj_f_fmt_e, alxj_str_pad, alxj_str_quote, alxj_f_to_i, alxj_str_cat,
         alxj_puts_u64, alxj_u64_to_s, alxj_int_fmt, alxj_f_to_u64, alxj_rune_to_s, alxj_str_from_bytes,
         alxj_die_str, alxj_panic_str, alxj_exit, alxj_now_ns, alxj_cap_begin, alxj_cap_end, alxj_file_status, alxj_file_read_or_empty,
         alxj_spawn, alxj_task_wait, alxj_lock_new, alxj_lock, alxj_unlock, alxj_atomic_new, alxj_chan_new, alxj_chan_len, alxj_chan_send, alxj_chan_recv, alxj_chan_close, alxj_select,
@@ -865,6 +865,11 @@ impl Fx<'_, '_, '_> {
                 self.call_rt(rt::alxj_pmap, &[a[0], a[1], ie, outp, oe, wf], false);
                 self.set(*dst, &[outp, a[1], a[1]]);
             }
+            LS::Print(e) => {
+                let x = self.e(e);
+                let p = self.spill(&LTy::Str, &x);
+                self.call_rt(rt::alxj_print_str, &[p], false);
+            }
             LS::Puts(e, t) => {
                 let x = self.e(e);
                 match t {
@@ -966,7 +971,7 @@ impl Fx<'_, '_, '_> {
             LE::Cond(_, a, _) => self.ty(a),
             LE::Call(f, _) => self.d.funcs[f.as_str()].1.ret.clone(),
             LE::Rt(rt, args) => match rt {
-                Rt::IntToS | Rt::PIntToS | Rt::StrRev | Rt::StrDelete | Rt::FToS | Rt::FFmt | Rt::StrCat | Rt::U64ToS | Rt::IntFmt | Rt::RuneToS | Rt::StrFromBytes | Rt::FileRead | Rt::CapEnd => LTy::Str,
+                Rt::IntToS | Rt::PIntToS | Rt::StrRev | Rt::StrDelete | Rt::FToS | Rt::FFmt | Rt::FFmtE | Rt::StrPad | Rt::StrQuote | Rt::StrCat | Rt::U64ToS | Rt::IntFmt | Rt::RuneToS | Rt::StrFromBytes | Rt::FileRead | Rt::CapEnd => LTy::Str,
                 Rt::FileStatus | Rt::NowNs | Rt::CapBegin => LTy::I64,
                 Rt::IntToF | Rt::FSqrt | Rt::FAbs => LTy::F64,
                 Rt::StrByte => {
@@ -1599,6 +1604,24 @@ impl Fx<'_, '_, '_> {
                 self.call_rt(rt::alxj_f_fmt, &[out, v, d], false);
                 self.load(&s, out, 0)
             }
+            Rt::FFmtE => {
+                let v = self.e1(&args[0]);
+                let d = self.e1(&args[1]);
+                let u = self.e1(&args[2]);
+                let out = self.slot(16);
+                self.call_rt(rt::alxj_f_fmt_e, &[out, v, d, u], false);
+                self.load(&s, out, 0)
+            }
+            Rt::StrPad => {
+                let sv = self.e(&args[0]);
+                let sp = self.spill(&s, &sv);
+                let w = self.e1(&args[1]);
+                let fl = self.e1(&args[2]);
+                let out = self.slot(16);
+                self.call_rt(rt::alxj_str_pad, &[out, sp, w, fl], false);
+                self.load(&s, out, 0)
+            }
+            Rt::StrQuote => self.pint_call(rt::alxj_str_quote, Some(&s), &[&args[0]], None),
             Rt::StrCat => {
                 let parts = self.slot(16 * args.len() as u32);
                 for (k, a) in args.iter().enumerate() {

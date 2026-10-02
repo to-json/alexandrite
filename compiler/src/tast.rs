@@ -302,6 +302,8 @@ pub enum M {
     /// lock; `v` is the value, changed in place; the result is copied out).
     MutexNew,
     Lock,
+    /// `fmt.print*`: write a Str (args[0]) to stdout, no newline added.
+    PrintStr,
     /// `Atomic.new(v)`; `load`, `store(v)`, `add(n)` (the new value),
     /// `swap(v)` (the old one), `compare_and_swap(old, new)` (Bool).
     AtomicNew,
@@ -432,6 +434,30 @@ pub enum FmtPiece {
     Base(usize, u32, bool),
     /// `%c`: argument k as a character (a Rune)
     Char(usize),
+    /// `%q`: argument k (a Str) double-quoted, Go-escaped
+    Quote(usize),
+    /// `%e` `%E`: argument k (a number) in exponent form, N decimals
+    Exp(usize, u32, bool),
+    /// A piece with flags and a width: `%-8s`, `%05d`, `%+d`, `% d`.
+    Padded { inner: Box<FmtPiece>, width: u32, left: bool, zero: bool, plus: bool, space: bool },
+}
+impl FmtPiece {
+    /// The argument this piece shows.
+    pub fn arg(&self) -> Option<usize> {
+        match self {
+            FmtPiece::Lit(_) => None,
+            FmtPiece::Int(k) | FmtPiece::Str(k) | FmtPiece::Fixed(k, _) | FmtPiece::Base(k, ..) | FmtPiece::Char(k) | FmtPiece::Quote(k) | FmtPiece::Exp(k, ..) => Some(*k),
+            FmtPiece::Padded { inner, .. } => inner.arg(),
+        }
+    }
+    /// Whether it shows its argument as a Float.
+    pub fn wants_float(&self) -> bool {
+        match self {
+            FmtPiece::Fixed(..) | FmtPiece::Exp(..) => true,
+            FmtPiece::Padded { inner, .. } => inner.wants_float(),
+            _ => false,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]

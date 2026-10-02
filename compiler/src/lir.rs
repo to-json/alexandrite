@@ -211,6 +211,13 @@ pub enum Rt {
     FFmt,
     /// Concatenate all argument strings.
     StrCat,
+    /// (s, width, flags): pad to `width` runes; flags 1 = on the right
+    /// (`%-5s`), 2 = with zeros after any sign (`%05d`).
+    StrPad,
+    /// (s): Go's `%q` / strconv.Quote: double-quoted, escaped.
+    StrQuote,
+    /// (x, digits, upper): `%e` / `%E`, as Go prints it (`1.234560e+03`, `+Inf`).
+    FFmtE,
     /// A U64 (bit pattern in an i64) in decimal.
     U64ToS,
     /// (v, base, upper, unsigned): `%x` `%X` `%o` `%b`.
@@ -286,6 +293,8 @@ pub enum LS {
     /// `dst = arr.pmap { worker }`.
     Pmap { dst: V, arr: LE, worker: usize },
     Puts(LE, LTy),
+    /// Write a Str to stdout as it is (no newline added).
+    Print(LE),
     Panic(String, String),
     /// Panic with a computed message (a Str, without the `alexandrite: `
     /// prefix, which the runtime adds). Task-aware like `Panic`.

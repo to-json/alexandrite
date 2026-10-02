@@ -1897,26 +1897,49 @@ impl<'a> Lw<'a> {
             .collect();
         let mut parts = vec![];
         for p in pieces {
-            parts.push(match p {
-                FmtPiece::Lit(s) => LE::S(s.clone()),
-                FmtPiece::Int(k) => self.to_s(vals[*k].clone(), &args[*k].ty),
-                FmtPiece::Str(k) => self.to_s(vals[*k].clone(), &args[*k].ty),
-                FmtPiece::Fixed(k, d) => LE::Rt(Rt::FFmt, vec![vals[*k].clone(), LE::I(*d as i64)]),
-                FmtPiece::Base(k, base, upper) => {
-                    let t = &args[*k].ty;
-                    let v = self.int_in_t(vals[*k].clone(), t, args[*k].span);
-                    LE::Rt(Rt::IntFmt, vec![v, LE::I(*base as i64), LE::B(*upper), LE::B(*t == Ty::IntK(IntKind::U64))])
-                }
-                FmtPiece::Char(k) => {
-                    let v = self.int_in_t(vals[*k].clone(), &args[*k].ty, args[*k].span);
-                    LE::Rt(Rt::RuneToS, vec![v])
-                }
-            });
+            let part = self.fmt_piece(p, &vals, args);
+            parts.push(part);
         }
         match parts.len() {
             0 => LE::S(String::new()),
             1 if matches!(parts[0], LE::S(_)) => parts.pop().unwrap(),
             _ => LE::Rt(Rt::StrCat, parts),
+        }
+    }
+
+    fn fmt_piece(&mut self, p: &FmtPiece, vals: &[LE], args: &[TExpr]) -> LE {
+        match p {
+            FmtPiece::Lit(s) => LE::S(s.clone()),
+            FmtPiece::Int(k) => self.to_s(vals[*k].clone(), &args[*k].ty),
+            FmtPiece::Str(k) => self.to_s(vals[*k].clone(), &args[*k].ty),
+            FmtPiece::Fixed(k, d) => LE::Rt(Rt::FFmt, vec![vals[*k].clone(), LE::I(*d as i64)]),
+            FmtPiece::Exp(k, d, upper) => LE::Rt(Rt::FFmtE, vec![vals[*k].clone(), LE::I(*d as i64), LE::B(*upper)]),
+            FmtPiece::Quote(k) => LE::Rt(Rt::StrQuote, vec![vals[*k].clone()]),
+            FmtPiece::Base(k, base, upper) => {
+                let t = &args[*k].ty;
+                let v = self.int_in_t(vals[*k].clone(), t, args[*k].span);
+                LE::Rt(Rt::IntFmt, vec![v, LE::I(*base as i64), LE::B(*upper), LE::B(*t == Ty::IntK(IntKind::U64))])
+            }
+            FmtPiece::Char(k) => {
+                let v = self.int_in_t(vals[*k].clone(), &args[*k].ty, args[*k].span);
+                LE::Rt(Rt::RuneToS, vec![v])
+            }
+            FmtPiece::Padded { inner, width, left, zero, plus, space } => {
+                let s = self.fmt_piece(inner, vals, args);
+                let mut s = self.bind(s, LTy::Str);
+                // `+` / ` `: a sign on non-negative numbers.
+                if *plus || *space {
+                    let first = LE::Rt(Rt::StrByte, vec![s.clone(), LE::I(0), LE::I(0)]);
+                    let neg = LE::Cmp(Op::Eq, Box::new(first), Box::new(LE::I(b'-' as i64)), LTy::I64);
+                    let signed = LE::Rt(Rt::StrCat, vec![LE::S(if *plus { "+" } else { " " }.into()), s.clone()]);
+                    s = self.bind(LE::Cond(Box::new(neg), Box::new(s.clone()), Box::new(signed)), LTy::Str);
+                }
+                if *width == 0 {
+                    return s;
+                }
+                let flags = (*left as i64) | ((*zero as i64) << 1);
+                LE::Rt(Rt::StrPad, vec![s, LE::I(*width as i64), LE::I(flags)])
+            }
         }
     }
 
@@ -2512,6 +2535,11 @@ impl<'a> Lw<'a> {
                         }
                     }
                 }
+            }
+            PrintStr => {
+                let s = self.expr(&args[0]);
+                self.emit(LS::Print(s));
+                LE::Unit
             }
             MutexNew => {
                 let lt = self.lty(&e.ty);

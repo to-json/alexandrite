@@ -519,6 +519,10 @@ impl FnEmit<'_> {
                 self.ind -= 1;
                 self.line("}");
             }
+            LS::Print(e) => {
+                let x = self.e(e);
+                self.line(&format!("alx_print_str({x});"));
+            }
             LS::Puts(e, t) => {
                 let x = self.e(e);
                 let f = match t {
@@ -753,6 +757,9 @@ impl FnEmit<'_> {
                     Rt::FAbs => s("fabs"),
                     Rt::FToS => s("alx_f_to_s"),
                     Rt::FFmt => s("alx_f_fmt"),
+                    Rt::FFmtE => s("alx_f_fmt_e"),
+                    Rt::StrPad => s("alx_str_pad"),
+                    Rt::StrQuote => s("alx_str_quote"),
                     Rt::StrCat => format!("alx_str_cat({}, (AlxStr[]){{{}}})", a.len(), a.join(", ")),
                     Rt::U64ToS => s("alx_u64_to_s"),
                     Rt::IntFmt => s("alx_int_fmt"),

@@ -300,6 +300,10 @@ impl FnEmit<'_> {
                 let a = self.e(arr);
                 self.line(&format!("v{dst} = pmap(&{a}, worker{worker});"));
             }
+            LS::Print(e) => {
+                let x = self.e(e);
+                self.line(&format!("print_str({x});"));
+            }
             LS::Puts(e, t) => {
                 let x = self.e(e);
                 match t {
@@ -521,6 +525,9 @@ impl FnEmit<'_> {
                     Rt::FAbs => format!("({}).abs()", a[0]),
                     Rt::FToS => call("f_to_s"),
                     Rt::FFmt => call("f_fmt"),
+                    Rt::FFmtE => call("f_fmt_e"),
+                    Rt::StrPad => call("str_pad"),
+                    Rt::StrQuote => call("str_quote"),
                     Rt::StrCat => format!("str_cat(vec![{}])", a.join(", ")),
                     Rt::U64ToS => format!("Str::lit((({}) as u64).to_string().as_bytes())", a[0]),
                     Rt::IntFmt => call("int_fmt"),

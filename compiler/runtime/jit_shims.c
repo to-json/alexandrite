@@ -82,6 +82,7 @@ void alxj_file_read_or_empty(AlxStr *out, const AlxStr *path) { *out = alx_file_
 
 /* ---------- output, sorting, pmap ---------- */
 void alxj_puts_str(const AlxStr *s) { alx_puts_str(*s); }
+void alxj_print_str(const AlxStr *s) { alx_print_str(*s); }
 void alxj_puts_bool(int64_t b) { alx_puts_bool(b != 0); }
 void alxj_puts_unit(void) { puts(""); }
 void alxj_pmap(const void *in, int64_t n, int64_t in_size, void *out, int64_t out_size, AlxWorker fn) {
@@ -108,6 +109,9 @@ void alxj_puts_pint(const AlxPInt *a) { alx_puts_pint(*a); }
 void alxj_puts_f64(double x) { alx_puts_f64(x); }
 void alxj_f_to_s(AlxStr *out, double x) { *out = alx_f_to_s(x); }
 void alxj_f_fmt(AlxStr *out, double x, int64_t digits) { *out = alx_f_fmt(x, digits); }
+void alxj_f_fmt_e(AlxStr *out, double x, int64_t digits, bool upper) { *out = alx_f_fmt_e(x, digits, upper); }
+void alxj_str_pad(AlxStr *out, const AlxStr *s, int64_t width, int64_t flags) { *out = alx_str_pad(*s, width, flags); }
+void alxj_str_quote(AlxStr *out, const AlxStr *s) { *out = alx_str_quote(*s); }
 int64_t alxj_f_to_i(double x, const char *loc) { return alx_f_to_i(x, loc); }
 void alxj_str_cat(AlxStr *out, const AlxStr *parts, int64_t n) { *out = alx_str_cat(n, parts); }
 

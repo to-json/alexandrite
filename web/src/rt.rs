@@ -433,6 +433,12 @@ pub extern "C" fn alxr_puts_i64(v: i64) {
 }
 
 #[unsafe(no_mangle)]
+pub extern "C" fn alxr_print_str(p: i64, n: i64) {
+    let b = bytes(p, n);
+    st().out.push_str(&String::from_utf8_lossy(b));
+}
+
+#[unsafe(no_mangle)]
 pub extern "C" fn alxr_puts_str(p: i64, n: i64) {
     let b = bytes(p, n);
     let s = st();
@@ -775,3 +781,106 @@ pub extern "C" fn alxr_puts_pint(v: i64, b: i64) {
     s.out.push('\n');
 }
 
+/// `%.Ne` as Go (and C) print it: at least two exponent digits.
+fn fmt_e_string(x: f64, digits: i64, upper: bool) -> String {
+    if x.is_nan() {
+        return "NaN".into();
+    }
+    if x.is_infinite() {
+        return (if x < 0.0 { "-Inf" } else { "+Inf" }).into();
+    }
+    let r = format!("{:.*e}", digits.max(0) as usize, x);
+    let (m, e) = r.split_once('e').unwrap();
+    let (sign, digs) = match e.strip_prefix('-') {
+        Some(d) => ('-', d),
+        None => ('+', e),
+    };
+    let out = format!("{m}e{sign}{digs:0>2}");
+    if upper { out.to_uppercase() } else { out }
+}
+/// Pad to `width` runes: flags 1 = on the right, 2 = zeros after a sign.
+fn pad_bytes(s: &[u8], width: i64, flags: i64) -> Vec<u8> {
+    let runes = s.iter().filter(|b| (**b & 0xC0) != 0x80).count() as i64;
+    if runes >= width {
+        return s.to_vec();
+    }
+    let pad = (width - runes) as usize;
+    let mut out = Vec::with_capacity(s.len() + pad);
+    if flags & 1 != 0 {
+        out.extend_from_slice(s);
+        out.extend(std::iter::repeat_n(b' ', pad));
+    } else if flags & 2 != 0 {
+        let sign = usize::from(matches!(s.first(), Some(b'-' | b'+' | b' ')));
+        out.extend_from_slice(&s[..sign]);
+        out.extend(std::iter::repeat_n(b'0', pad));
+        out.extend_from_slice(&s[sign..]);
+    } else {
+        out.extend(std::iter::repeat_n(b' ', pad));
+        out.extend_from_slice(s);
+    }
+    out
+}
+/// Go's strconv.Quote (see alx_str_quote in the C runtime).
+fn quote_bytes(s: &[u8]) -> Vec<u8> {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut o = vec![b'"'];
+    let mut i = 0;
+    while i < s.len() {
+        let c = s[i];
+        if c < 0x80 {
+            let e: Option<&[u8]> = match c {
+                7 => Some(b"\\a"),
+                8 => Some(b"\\b"),
+                12 => Some(b"\\f"),
+                b'\n' => Some(b"\\n"),
+                b'\r' => Some(b"\\r"),
+                b'\t' => Some(b"\\t"),
+                11 => Some(b"\\v"),
+                b'\\' => Some(b"\\\\"),
+                b'"' => Some(b"\\\""),
+                _ => None,
+            };
+            match e {
+                Some(e) => o.extend_from_slice(e),
+                None if c < 0x20 || c == 0x7f => o.extend_from_slice(&[b'\\', b'x', HEX[(c >> 4) as usize], HEX[(c & 15) as usize]]),
+                None => o.push(c),
+            }
+            i += 1;
+            continue;
+        }
+        let n = match std::str::from_utf8(&s[i..(i + 4).min(s.len())]) {
+            Ok(t) => t.chars().next().map_or(0, char::len_utf8),
+            Err(e) if e.valid_up_to() > 0 => std::str::from_utf8(&s[i..i + e.valid_up_to()]).unwrap().chars().next().map_or(0, char::len_utf8),
+            Err(_) => 0,
+        };
+        if n == 0 {
+            o.extend_from_slice(&[b'\\', b'x', HEX[(c >> 4) as usize], HEX[(c & 15) as usize]]);
+            i += 1;
+            continue;
+        }
+        if n == 2 && c == 0xC2 && s[i + 1] < 0xA0 {
+            let r = s[i + 1];
+            o.extend_from_slice(&[b'\\', b'u', b'0', b'0', HEX[(r >> 4) as usize], HEX[(r & 15) as usize]]);
+        } else {
+            o.extend_from_slice(&s[i..i + n]);
+        }
+        i += n;
+    }
+    o.push(b'"');
+    o
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn alxr_f_fmt_e(x: f64, digits: i64, upper: i32) {
+    ret_str(fmt_e_string(x, digits.clamp(0, 40), upper != 0).as_bytes());
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn alxr_str_pad(p: i64, n: i64, width: i64, flags: i64) {
+    ret_str(&pad_bytes(bytes(p, n), width, flags));
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn alxr_str_quote(p: i64, n: i64) {
+    ret_str(&quote_bytes(bytes(p, n)));
+}

@@ -427,6 +427,103 @@ mod rt {
         };
         Str::lit(s.as_bytes())
     }
+    /// `%.Ne` as Go (and C) print it: at least two exponent digits.
+    pub fn fmt_e_string(x: f64, digits: i64, upper: bool) -> String {
+        if x.is_nan() {
+            return "NaN".into();
+        }
+        if x.is_infinite() {
+            return (if x < 0.0 { "-Inf" } else { "+Inf" }).into();
+        }
+        let r = format!("{:.*e}", digits.max(0) as usize, x);
+        let (m, e) = r.split_once('e').unwrap();
+        let (sign, digs) = match e.strip_prefix('-') {
+            Some(d) => ('-', d),
+            None => ('+', e),
+        };
+        let out = format!("{m}e{sign}{digs:0>2}");
+        if upper { out.to_uppercase() } else { out }
+    }
+    /// Pad to `width` runes: flags 1 = on the right, 2 = zeros after a sign.
+    pub fn pad_bytes(s: &[u8], width: i64, flags: i64) -> Vec<u8> {
+        let runes = s.iter().filter(|b| (**b & 0xC0) != 0x80).count() as i64;
+        if runes >= width {
+            return s.to_vec();
+        }
+        let pad = (width - runes) as usize;
+        let mut out = Vec::with_capacity(s.len() + pad);
+        if flags & 1 != 0 {
+            out.extend_from_slice(s);
+            out.extend(std::iter::repeat_n(b' ', pad));
+        } else if flags & 2 != 0 {
+            let sign = usize::from(matches!(s.first(), Some(b'-' | b'+' | b' ')));
+            out.extend_from_slice(&s[..sign]);
+            out.extend(std::iter::repeat_n(b'0', pad));
+            out.extend_from_slice(&s[sign..]);
+        } else {
+            out.extend(std::iter::repeat_n(b' ', pad));
+            out.extend_from_slice(s);
+        }
+        out
+    }
+    /// Go's strconv.Quote (see alx_str_quote in the C runtime).
+    pub fn quote_bytes(s: &[u8]) -> Vec<u8> {
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        let mut o = vec![b'"'];
+        let mut i = 0;
+        while i < s.len() {
+            let c = s[i];
+            if c < 0x80 {
+                let e: Option<&[u8]> = match c {
+                    7 => Some(b"\\a"),
+                    8 => Some(b"\\b"),
+                    12 => Some(b"\\f"),
+                    b'\n' => Some(b"\\n"),
+                    b'\r' => Some(b"\\r"),
+                    b'\t' => Some(b"\\t"),
+                    11 => Some(b"\\v"),
+                    b'\\' => Some(b"\\\\"),
+                    b'"' => Some(b"\\\""),
+                    _ => None,
+                };
+                match e {
+                    Some(e) => o.extend_from_slice(e),
+                    None if c < 0x20 || c == 0x7f => o.extend_from_slice(&[b'\\', b'x', HEX[(c >> 4) as usize], HEX[(c & 15) as usize]]),
+                    None => o.push(c),
+                }
+                i += 1;
+                continue;
+            }
+            let n = match std::str::from_utf8(&s[i..(i + 4).min(s.len())]) {
+                Ok(t) => t.chars().next().map_or(0, char::len_utf8),
+                Err(e) if e.valid_up_to() > 0 => std::str::from_utf8(&s[i..i + e.valid_up_to()]).unwrap().chars().next().map_or(0, char::len_utf8),
+                Err(_) => 0,
+            };
+            if n == 0 {
+                o.extend_from_slice(&[b'\\', b'x', HEX[(c >> 4) as usize], HEX[(c & 15) as usize]]);
+                i += 1;
+                continue;
+            }
+            if n == 2 && c == 0xC2 && s[i + 1] < 0xA0 {
+                let r = s[i + 1];
+                o.extend_from_slice(&[b'\\', b'u', b'0', b'0', HEX[(r >> 4) as usize], HEX[(r & 15) as usize]]);
+            } else {
+                o.extend_from_slice(&s[i..i + n]);
+            }
+            i += n;
+        }
+        o.push(b'"');
+        o
+    }
+    pub fn f_fmt_e(x: f64, digits: i64, upper: bool) -> Str {
+        Str::lit(fmt_e_string(x, digits, upper).as_bytes())
+    }
+    pub fn str_pad(s: Str, width: i64, flags: i64) -> Str {
+        Str(pad_bytes(&s.0, width, flags).into())
+    }
+    pub fn str_quote(s: Str) -> Str {
+        Str(quote_bytes(&s.0).into())
+    }
     pub fn f_to_i(x: f64, loc: &str) -> i64 {
         if x.is_nan() || x.is_infinite() {
             panic("Float#to_i of NaN or Infinity", loc)
@@ -485,6 +582,10 @@ mod rt {
         if s.0.last() != Some(&b'\n') {
             let _ = o.write_all(b"\n");
         }
+    }
+    pub fn print_str(s: Str) {
+        use std::io::Write;
+        let _ = std::io::stdout().write_all(&s.0);
     }
     pub fn puts_bool(b: bool) {
         println!("{b}");

@@ -602,6 +602,94 @@ AlxStr alx_f_fmt(double x, int64_t digits) {
     return s;
 }
 
+/* format("%.Ne", x), as Go prints it. */
+AlxStr alx_f_fmt_e(double x, int64_t digits, bool upper) {
+    if (isnan(x)) return str_of("NaN", 3);
+    if (isinf(x)) return x < 0 ? str_of("-Inf", 4) : str_of("+Inf", 4);
+    const char *f = upper ? "%.*E" : "%.*e";
+    int n = snprintf(NULL, 0, f, (int)digits, x);
+    char *p = alx_alloc((size_t)n + 1);
+    snprintf(p, (size_t)n + 1, f, (int)digits, x);
+    AlxStr s = { p, n };
+    return s;
+}
+
+/* Pad to `width` runes: flags 1 = on the right, 2 = zeros after a sign. */
+AlxStr alx_str_pad(AlxStr s, int64_t width, int64_t flags) {
+    int64_t runes = 0;
+    for (int64_t i = 0; i < s.len; i++) runes += ((uint8_t)s.ptr[i] & 0xC0) != 0x80;
+    if (runes >= width) return s;
+    int64_t pad = width - runes;
+    char *p = alx_alloc((size_t)(s.len + pad));
+    if (flags & 1) {
+        memcpy(p, s.ptr, (size_t)s.len);
+        memset(p + s.len, ' ', (size_t)pad);
+    } else if (flags & 2) {
+        int64_t sign = s.len > 0 && (s.ptr[0] == '-' || s.ptr[0] == '+' || s.ptr[0] == ' ');
+        memcpy(p, s.ptr, (size_t)sign);
+        memset(p + sign, '0', (size_t)pad);
+        memcpy(p + sign + pad, s.ptr + sign, (size_t)(s.len - sign));
+    } else {
+        memset(p, ' ', (size_t)pad);
+        memcpy(p + pad, s.ptr, (size_t)s.len);
+    }
+    AlxStr r = { p, s.len + pad };
+    return r;
+}
+
+/* Go's strconv.Quote: printable runes as they are, the usual backslash
+ * escapes, \xHH for other bytes below 0x80 and for invalid UTF-8, \uHHHH
+ * for C1 controls. */
+AlxStr alx_str_quote(AlxStr s) {
+    char *p = alx_alloc((size_t)s.len * 4 + 2);
+    int64_t o = 0;
+    p[o++] = '"';
+    static const char hex[] = "0123456789abcdef";
+    for (int64_t i = 0; i < s.len;) {
+        uint8_t c = (uint8_t)s.ptr[i];
+        if (c < 0x80) {
+            const char *e = NULL;
+            switch (c) {
+            case '\a': e = "\\a"; break;
+            case '\b': e = "\\b"; break;
+            case '\f': e = "\\f"; break;
+            case '\n': e = "\\n"; break;
+            case '\r': e = "\\r"; break;
+            case '\t': e = "\\t"; break;
+            case '\v': e = "\\v"; break;
+            case '\\': e = "\\\\"; break;
+            case '"': e = "\\\""; break;
+            }
+            if (e) { p[o++] = e[0]; p[o++] = e[1]; }
+            else if (c < 0x20 || c == 0x7f) { p[o++] = '\\'; p[o++] = 'x'; p[o++] = hex[c >> 4]; p[o++] = hex[c & 15]; }
+            else p[o++] = (char)c;
+            i++;
+            continue;
+        }
+        /* A multi-byte rune: copied if well-formed, else \xHH per byte. */
+        int n = c >= 0xF0 ? 4 : c >= 0xE0 ? 3 : c >= 0xC2 ? 2 : 0;
+        bool ok = n > 0 && i + n <= s.len && c <= 0xF4;
+        for (int k = 1; ok && k < n; k++) ok = ((uint8_t)s.ptr[i + k] & 0xC0) == 0x80;
+        if (ok && n == 3 && c == 0xE0) ok = (uint8_t)s.ptr[i + 1] >= 0xA0;
+        if (ok && n == 3 && c == 0xED) ok = (uint8_t)s.ptr[i + 1] < 0xA0;
+        if (ok && n == 4 && c == 0xF0) ok = (uint8_t)s.ptr[i + 1] >= 0x90;
+        if (ok && n == 4 && c == 0xF4) ok = (uint8_t)s.ptr[i + 1] < 0x90;
+        if (!ok) { p[o++] = '\\'; p[o++] = 'x'; p[o++] = hex[c >> 4]; p[o++] = hex[c & 15]; i++; continue; }
+        if (n == 2 && c == 0xC2 && (uint8_t)s.ptr[i + 1] < 0xA0) {
+            uint8_t r = (uint8_t)s.ptr[i + 1];
+            memcpy(p + o, "\\u00", 4); o += 4; p[o++] = hex[r >> 4]; p[o++] = hex[r & 15];
+            i += 2;
+            continue;
+        }
+        memcpy(p + o, s.ptr + i, (size_t)n);
+        o += n;
+        i += n;
+    }
+    p[o++] = '"';
+    AlxStr r = { p, o };
+    return r;
+}
+
 int64_t alx_f_to_i(double x, const char *loc) {
     if (isnan(x) || isinf(x)) alx_panic("Float#to_i of NaN or Infinity", loc);
     if (x >= 9223372036854775808.0 || x < -9223372036854775808.0) alx_panic("Float#to_i: out of Int range", loc);
@@ -676,6 +764,7 @@ void alx_puts_str(AlxStr s) {
     if (s.len == 0 || s.ptr[s.len - 1] != '\n') fputc('\n', stdout);
 }
 void alx_puts_bool(bool b) { puts(b ? "true" : "false"); }
+void alx_print_str(AlxStr s) { fwrite(s.ptr, 1, (size_t)s.len, stdout); }
 
 /* ---------- parallel map ---------- */
 

@@ -55,6 +55,7 @@ const RT: &[(&str, &str)] = &[
     ("alxr_sort_str", "jj>"),
     ("alxr_puts_i64", "j>"),
     ("alxr_puts_str", "jj>"),
+    ("alxr_print_str", "jj>"),
     ("alxr_puts_bool", "i>"),
     ("alxr_puts_unit", ">"),
     ("alxr_p_add", "jjjj>"),
@@ -73,6 +74,9 @@ const RT: &[(&str, &str)] = &[
     ("alxr_puts_f64", "f>"),
     ("alxr_f_to_s", "f>"),
     ("alxr_f_fmt", "fj>"),
+    ("alxr_f_fmt_e", "fji>"),
+    ("alxr_str_pad", "jjjj>"),
+    ("alxr_str_quote", "jj>"),
     ("alxr_f_to_i", "fjj>j"),
     ("alxr_str_cat", "jj>"),
     ("alxr_umulhi", "jj>j"),
@@ -874,6 +878,10 @@ impl<'c, 'p> Fx<'c, 'p> {
                 self.ins().local_get(out).local_get(a[1]).local_get(a[1]);
                 self.set_var(*dst);
             }
+            LS::Print(e) => {
+                self.e(e);
+                self.rt("alxr_print_str");
+            }
             LS::Puts(e, t) => {
                 self.e(e);
                 match t {
@@ -1111,7 +1119,7 @@ impl<'c, 'p> Fx<'c, 'p> {
             LE::Cond(_, a, _) => self.ty(a),
             LE::Call(f, _) => self.cx.funcs[f.as_str()].1.ret.clone(),
             LE::Rt(r, args) => match r {
-                Rt::IntToS | Rt::PIntToS | Rt::StrRev | Rt::StrDelete | Rt::FToS | Rt::FFmt | Rt::StrCat | Rt::U64ToS | Rt::IntFmt | Rt::RuneToS | Rt::StrFromBytes | Rt::FileRead | Rt::CapEnd => LTy::Str,
+                Rt::IntToS | Rt::PIntToS | Rt::StrRev | Rt::StrDelete | Rt::FToS | Rt::FFmt | Rt::FFmtE | Rt::StrPad | Rt::StrQuote | Rt::StrCat | Rt::U64ToS | Rt::IntFmt | Rt::RuneToS | Rt::StrFromBytes | Rt::FileRead | Rt::CapEnd => LTy::Str,
                 Rt::FileStatus | Rt::NowNs | Rt::CapBegin => LTy::I64,
                 Rt::IntToF | Rt::FSqrt | Rt::FAbs => LTy::F64,
                 Rt::StrByte => {
@@ -1611,6 +1619,9 @@ impl<'c, 'p> Fx<'c, 'p> {
             Rt::RuneToS => call_ret(self, "alxr_rune_to_s", 2),
             Rt::FToU64 => call(self, "alxr_f_to_u64"),
             Rt::FFmt => call_ret(self, "alxr_f_fmt", 2),
+            Rt::FFmtE => call_ret(self, "alxr_f_fmt_e", 2),
+            Rt::StrPad => call_ret(self, "alxr_str_pad", 2),
+            Rt::StrQuote => call_ret(self, "alxr_str_quote", 2),
             Rt::StrFromBytes => {
                 let v = self.eval_locals(&args[0]);
                 self.ins().local_get(v[0]).local_get(v[1]);

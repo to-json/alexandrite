@@ -264,6 +264,10 @@ int64_t alx_p_ndigits(AlxPInt a);
 /* ---------- floats ---------- */
 AlxStr alx_f_to_s(double x);
 AlxStr alx_f_fmt(double x, int64_t digits);
+AlxStr alx_f_fmt_e(double x, int64_t digits, bool upper);
+AlxStr alx_str_pad(AlxStr s, int64_t width, int64_t flags);
+AlxStr alx_str_quote(AlxStr s);
+void alx_print_str(AlxStr s);
 int64_t alx_f_to_i(double x, const char *loc);
 void alx_puts_f64(double x);
 AlxStr alx_str_cat(int64_t n, const AlxStr *parts);

@@ -84,6 +84,7 @@ GROUPS = {
     "asserts": "M8",
     "sharing": "R6",
     "sync": "R6",
+    "fmt": "L1",
 }
 
 

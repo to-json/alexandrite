@@ -200,6 +200,9 @@ struct Decls<'p> {
     /// A worker's input and result types (for `spawn`).
     worker_in: HashMap<usize, LTy>,
     worker_out: HashMap<usize, LTy>,
+    /// Each global's type and address: memory of this process, never freed
+    /// (the program runs here, once).
+    globals: Vec<(LTy, i64)>,
     /// The program's C functions (address, signature), by `LE::Ffi` index.
     externs: Vec<(usize, FfiSig)>,
 }
@@ -270,7 +273,8 @@ pub fn run(p: &LProgram) -> Result<(), String> {
         let addr = resolve_c_symbol(&x.sym).ok_or_else(|| format!("undefined extern symbol `{}` (no such C function in this process)", x.sym))?;
         externs.push((addr, x.clone()));
     }
-    let mut d = Decls { funcs: HashMap::new(), gens: HashMap::new(), workers: HashMap::new(), worker_in: HashMap::new(), worker_out: HashMap::new(), externs };
+    let globals = p.globals.iter().map(|t| (t.clone(), Box::leak(vec![0u64; lay(t).size.div_ceil(8) as usize].into_boxed_slice()).as_mut_ptr() as i64)).collect();
+    let mut d = Decls { funcs: HashMap::new(), gens: HashMap::new(), workers: HashMap::new(), worker_in: HashMap::new(), worker_out: HashMap::new(), externs, globals };
     for f in &p.funcs {
         if f.external {
             return Err(format!("jit: external function `{}`", f.name));
@@ -757,6 +761,12 @@ impl Fx<'_, '_, '_> {
 
     fn stmt(&mut self, s: &LS) {
         match s {
+            LS::SetGlobal(k, v) => {
+                let vals = self.e(v);
+                let (t, at) = self.d.globals[*k].clone();
+                let addr = self.ic(at);
+                self.store(&t, &vals, addr, 0);
+            }
             LS::RegionFree(r) => {
                 let r = self.e1(r);
                 self.call_rt(rt::alxj_region_free, &[r], false);
@@ -1146,6 +1156,7 @@ impl Fx<'_, '_, '_> {
 
     fn ty(&self, e: &LE) -> LTy {
         match e {
+            LE::Global(k) => self.d.globals[*k].0.clone(),
             LE::RegionNew(_) => LTy::Region,
             LE::RegionBytes(_) => LTy::I64,
             LE::RegionOf(_) => LTy::Region,
@@ -1357,6 +1368,11 @@ impl Fx<'_, '_, '_> {
 
     fn e(&mut self, e: &LE) -> Vec<Value> {
         match e {
+            LE::Global(k) => {
+                let (t, at) = self.d.globals[*k].clone();
+                let addr = self.ic(at);
+                self.load(&t, addr, 0)
+            }
             LE::RegionNew(p) => {
                 let p = self.e1(p);
                 vec![self.call_rt(rt::alxj_region_new_child, &[p], true).unwrap()]

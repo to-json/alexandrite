@@ -1098,6 +1098,9 @@ impl<'a> Parser<'a> {
     pub fn expr(&mut self) -> PResult<Expr> {
         let lhs = self.ternary()?;
         if self.is_op("=") {
+            if let Some(c) = const_root(&lhs) {
+                return Err(Diag::new(lhs.span, format!("`{c}` is a constant and can't be changed")).note(format!("copy it into a variable to get an array of your own: `xs = {c}`")));
+            }
             if !is_place(&lhs) {
                 return Err(Diag::new(lhs.span, "cannot assign to this expression"));
             }
@@ -1821,6 +1824,17 @@ impl<'a> Parser<'a> {
 }
 
 /// An assignable place: a name, `place[i]`, or `place.field`.
+/// `C[i]...`: an element of constant `C`.
+fn const_root(e: &Expr) -> Option<&str> {
+    match &e.kind {
+        ExprKind::Index(a, _) => match &a.kind {
+            ExprKind::Const(c) => Some(c),
+            _ => const_root(a),
+        },
+        _ => None,
+    }
+}
+
 pub fn is_place(e: &Expr) -> bool {
     match &e.kind {
         ExprKind::Name(_) => true,

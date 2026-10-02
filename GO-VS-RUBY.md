@@ -131,6 +131,8 @@ The logic: **fallibility is a prefix** ("approximately do this", "you'll probabl
 | D29 | Warnings | unused locals (assigned, never read) and unused imports; `_` / `_name` silences; `--strict` and `alx test` make them errors (Go's compile errors, softened per P3) | M8 |
 | D30 | `alx fmt` | token-based and meaning-preserving (re-lexed and compared on every run): 2-space indent by bracket nesting, Go-ish operator spacing, at most one blank line, line breaks never added or removed, trailing comments aligned in runs (gofmt). No options | M8 |
 | D31 | `alx test` | `*_test.alx` in a package's directory, compiled with the package (tests see private names); `test "name" { }`, `bench "name" { }` (with `-bench`), `example "name" { } outputs "text"`; `assert cond`, `assert_eq got, want`; each test runs as its own task, so one failure or panic doesn't stop the run; Go-style output and exit status | M8 |
+| D32 | Array constants | `MONTHS = ["Jan", "Feb"]`, `SQ: [U8; 3] = [1, 4, 9]`, `[0; 4]`, nested, `pub`: literals of constants. Each use as a value is a fresh array (as if the literal were written there), so `xs = MONTHS; xs[0] = "x"` never changes the constant and `MONTHS[0] = "x"` is an error. Reading an element without storage (`MONTHS[i]`, `GRID[i][j]`) reads a global built once before the first statement, so lookups don't allocate; `.size` is folded. A package with one isn't compiled separately (D23). Map constants: not yet | L1 |
+| D33 | Statement `case` / `if` | a `case` or `if ... else` whose value isn't used (a statement, the body of a loop or `each`) may have arms of different types; used as a value (assigned, passed, returned, a function's last expression), its arms must agree | L1 |
 
 ## Memory model and the next push (user, 2026-10-01)
 

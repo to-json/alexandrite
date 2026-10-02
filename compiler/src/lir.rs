@@ -169,6 +169,8 @@ pub enum LE {
     /// Bytes allocated in a region so far (chunks in use + large blocks),
     /// I64. Used to decide when a container's region is worth compacting.
     RegionBytes(Box<LE>),
+    /// Global `k`'s value (`LProgram::globals`), shared by every task.
+    Global(usize),
 }
 
 /// The C-side type of an `extern def` parameter or result.
@@ -406,6 +408,9 @@ pub enum LS {
     /// Flush stdout, print the Str and a newline to stderr, exit 1.
     Die(LE),
     SortInPlace(V, LTy),
+    /// Set global `k`. Only at the start of main, before any other code
+    /// (or task) runs: globals are read-only after that.
+    SetGlobal(usize, LE),
 }
 
 #[derive(Clone, Debug)]
@@ -449,6 +454,8 @@ pub struct LProgram {
     pub maps: Vec<String>,
     /// The C functions of `extern def`s (what `LE::Ffi` indexes).
     pub externs: Vec<FfiSig>,
+    /// Program-wide variables (array constants), by `LE::Global` index.
+    pub globals: Vec<LTy>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

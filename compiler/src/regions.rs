@@ -103,7 +103,7 @@ pub fn allocates(e: &TExpr, promote: bool) -> bool {
             M::TupleGet(_) | M::OptPresent | M::OptGet | M::Unwrap | M::EnumTag | M::Size | M::MapSize | M::MapHas | M::ChanLen | M::ResIsOk | M::ErrIs(_) | M::ErrAs(_)
                 | M::Even | M::Odd | M::IntSqrt | M::ToF | M::FloatToI | M::Conv(..) | M::FloatAbs | M::Sqrt | M::Math(_) | M::FloatBits | M::FloatFromBits | M::NowNs | M::PtrNull | M::CErrno
                 | M::Sum | M::Max | M::Min | M::MaxBy | M::MinBy | M::Count | M::All | M::Any | M::Include | M::First | M::Last | M::Find | M::Each | M::Loop | M::Step
-                | M::ChanClose | M::CapBegin | M::Exit
+                | M::ChanClose | M::CapBegin | M::Exit | M::Global(_)
         ) || (promote && e.ty == Ty::Int),
         _ => false,
     }

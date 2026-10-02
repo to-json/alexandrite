@@ -94,11 +94,17 @@ pub fn emit(p: &LProgram) -> String {
     for gn in &p.gens {
         g.need_type(&gn.elem);
     }
+    for t in &p.globals {
+        g.need_type(t);
+    }
     // Prototypes.
     let mut protos = String::new();
     for (i, x) in p.externs.iter().enumerate() {
         let params: Vec<&str> = x.params.iter().map(|t| ffi_cty(*t)).collect();
         let _ = writeln!(protos, "extern {} alx_ffi_{i}({}) __asm__(ALX_SYM({:?}));", ffi_cty(x.ret), if params.is_empty() { "void".into() } else { params.join(", ") }, x.sym);
+    }
+    for (k, t) in p.globals.iter().enumerate() {
+        let _ = writeln!(protos, "static {} alx_global{k};", cty(t));
     }
     for f in &p.funcs {
         let _ = writeln!(protos, "{};", proto(f));
@@ -349,6 +355,10 @@ impl FnEmit<'_> {
 
     fn stmt(&mut self, s: &LS) {
         match s {
+            LS::SetGlobal(k, v) => {
+                let v = self.e(v);
+                self.line(&format!("alx_global{k} = {v};"));
+            }
             LS::RegionFree(r) => {
                 let r = self.e(r);
                 self.line(&format!("alx_region_free({r});"));
@@ -600,6 +610,7 @@ impl FnEmit<'_> {
 
     fn e(&self, e: &LE) -> String {
         match e {
+            LE::Global(k) => format!("alx_global{k}"),
             LE::RegionNew(p) => format!("alx_region_new_child({})", self.e(p)),
             LE::RegionBytes(r) => format!("alx_region_bytes({})", self.e(r)),
             LE::RegionOf(x) => format!("alx_region_of(({}).ptr)", self.e(x)),

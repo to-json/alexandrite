@@ -88,6 +88,8 @@ GROUPS = {
     "tuples": "L1",
     "funcvalues": "L1",
     "ffi": "L2",
+    "consts": "M2",
+    "arms": "M2",
 }
 
 
@@ -424,6 +426,10 @@ def main():
         negative_compile("packages.bad3", "M6")
         negative_compile("refinements.bad1", "M6")
         negative_runtime("concurrency.deadlock", "M7")
+        negative_compile("consts.bad1", "M2")
+        negative_compile("consts.bad2", "M2")
+        negative_compile("arms.bad1", "M2")
+        negative_compile("arms.bad2", "M2")
     if not filt or "mod" in filt:
         print("== modules", flush=True)
         modules()

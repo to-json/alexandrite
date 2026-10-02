@@ -24,6 +24,34 @@ thread_local! {
     static ERRORS: RefCell<Vec<Ty>> = const { RefCell::new(Vec::new()) };
     /// Every lambda literal: (enclosing function, block start, fn type, capture types).
     static LAMBDAS: RefCell<Vec<(String, u32, Ty, Vec<Ty>)>> = const { RefCell::new(Vec::new()) };
+    /// The LIR global of each array constant read in place, by (`M::Global`
+    /// index, type): an Int is a bignum in promote mode, so one constant
+    /// can need two.
+    static GLOBALS: RefCell<Vec<(usize, LTy)>> = const { RefCell::new(Vec::new()) };
+}
+
+/// The LIR global for array constant `k` as an `t`.
+fn global_of(k: usize, t: LTy) -> usize {
+    GLOBALS.with(|g| {
+        let mut g = g.borrow_mut();
+        g.iter().position(|(j, u)| *j == k && *u == t).unwrap_or_else(|| {
+            g.push((k, t));
+            g.len() - 1
+        })
+    })
+}
+
+/// A constant's literal value (`const_lit`) as an `t`; nothing to evaluate.
+fn lit_le(e: &TExpr, t: &LTy) -> LE {
+    match (&e.kind, t) {
+        (TK::Int(v), LTy::PInt) => LE::ToP(Box::new(LE::I(*v))),
+        (TK::Int(v), _) => LE::I(*v),
+        (TK::Float(v), _) => LE::F(*v),
+        (TK::Str(s), _) => LE::S(s.clone()),
+        (TK::Bool(b), _) => LE::B(*b),
+        (TK::Array(items), LTy::Arr(el)) => LE::ArrLit((**el).clone(), items.iter().map(|x| lit_le(x, el)).collect()),
+        _ => unreachable!("not a constant literal: {e:?}"),
+    }
 }
 
 /// The sites (global index) of lambdas of function type `t`, in tag order.
@@ -37,6 +65,7 @@ pub fn lower(p: &TProgram, sm: &SourceMap, opts: &Opts) -> LProgram {
     LAMBDAS.with(|l| {
         *l.borrow_mut() = p.funcs.iter().flat_map(|f| f.lambdas.iter().map(move |(lo, t, caps)| (f.cname.clone(), *lo, t.clone(), caps.iter().map(|c| f.locals[*c].ty.clone()).collect()))).collect();
     });
+    GLOBALS.with(|g| g.borrow_mut().clear());
     let prog = RefCell::new(LProgram::default());
     // R1: where each allocation lives (unless turned off, for comparison).
     let placement = if std::env::var_os("ALX_NO_REGIONS").is_some() { vec![] } else { crate::regions::analyze(p) };
@@ -76,6 +105,14 @@ pub fn lower(p: &TProgram, sm: &SourceMap, opts: &Opts) -> LProgram {
     }
     let mut prog = prog.into_inner();
     prog.uses_pint = p.funcs.iter().any(|f| f.overflow == Overflow::Promote);
+    // Array constants' globals are set before anything else runs, in the
+    // program region (current at that point), and only read afterwards.
+    let globals = GLOBALS.with(|g| g.take());
+    if let Some(main) = prog.funcs.iter_mut().find(|f| f.is_main) {
+        let init = globals.iter().enumerate().map(|(id, (k, t))| LS::SetGlobal(id, lit_le(&p.globals[*k], t)));
+        main.body.splice(0..0, init);
+    }
+    prog.globals = globals.into_iter().map(|(_, t)| t).collect();
     prog
 }
 
@@ -2200,6 +2237,7 @@ impl<'a> Lw<'a> {
             Sum | Max | Min | MaxBy | MinBy | First | Find | ToA | Each | Reduce | All | Any | Count | Include | Sort => {
                 self.pipeline(m, e, recv.unwrap(), args, blk)
             }
+            Global(k) => LE::Global(global_of(k, self.lty(&e.ty))),
             Pmap => self.pmap(e, recv.unwrap(), blk.unwrap()),
             Size => {
                 let r = recv.unwrap();

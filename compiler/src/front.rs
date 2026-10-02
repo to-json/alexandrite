@@ -483,6 +483,7 @@ pub fn check_program(l: &Loaded, externs: Vec<DefInfo>) -> Result<TProgram, Diag
         }
     }
     warnings.sort_by_key(|d| (d.span.file, d.span.lo));
+    let globals = w.globals.into_iter().map(|(_, v)| v).collect();
     let mut funcs: Vec<_> = w.funcs.into_iter().map(|f| f.expect("every instance checked")).collect();
     for f in funcs.iter_mut() {
         if !f.external {
@@ -492,7 +493,7 @@ pub fn check_program(l: &Loaded, externs: Vec<DefInfo>) -> Result<TProgram, Diag
     for f in &funcs {
         prove::prove(f, &l.sm)?;
     }
-    let mut p = TProgram { funcs, main, ifaces, stringers, errors, messages, warnings };
+    let mut p = TProgram { funcs, main, ifaces, stringers, errors, messages, warnings, globals };
     // R5: lambdas see the variables they capture, not copies.
     crate::capture::convert(&mut p);
     // R6: what goes to another task isn't used here afterwards.
@@ -526,6 +527,8 @@ pub fn separable(p: &Package) -> bool {
         // The header spells types with `parse_ty`: sized ints and structs can't cross it.
         && m.defs.iter().filter(|d| d.public).all(|d| d.params.iter().all(|p| p.ty.as_ref().is_some_and(header_type)) && d.ret.as_ref().is_none_or(header_type))
         && m.defs.iter().any(|d| d.public)
+        // Array constants live in globals the program's main sets up.
+        && !m.consts.iter().any(|c| matches!(c.value.kind, crate::ast::ExprKind::Array(_) | crate::ast::ExprKind::ArrayRepeat(..)))
 }
 
 fn header_type(t: &crate::ast::TypeExpr) -> bool {
@@ -566,7 +569,7 @@ pub fn check_library(l: &Loaded, idx: usize, prefix: &str) -> Result<(TProgram, 
     for f in &funcs {
         prove::prove(f, &l.sm)?;
     }
-    Ok((TProgram { funcs, main: usize::MAX, ifaces, stringers, errors, messages, warnings: vec![] }, exports))
+    Ok((TProgram { funcs, main: usize::MAX, ifaces, stringers, errors, messages, warnings: vec![], globals: vec![] }, exports))
 }
 
 /// The generated header: one line per export.

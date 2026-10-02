@@ -171,6 +171,9 @@ pub struct World<'a> {
     pub warnings: Vec<Diag>,
     /// Refinements by (qualified) name: each target type with its methods.
     pub refines: HashMap<String, Vec<(Ty, HashMap<String, usize>)>>,
+    /// Array constants read in place (`MONTHS[i]`): name and value, by
+    /// `M::Global` index. Set once, before the program runs; never written.
+    pub globals: Vec<(String, TExpr)>,
 }
 
 #[derive(Clone, Debug)]
@@ -187,6 +190,75 @@ pub enum CVal {
     Num(ConstVal),
     Str(String),
     Bool(bool),
+    /// An array literal of constants (a slice or a fixed array: the
+    /// constant's type says which, and is always known for these).
+    Arr(Vec<CVal>),
+}
+
+/// The type of a constant's value: `want` if given (checking that the value
+/// fits it), else the default (Int, Float, Str, Bool, and slices of those).
+fn const_type(v: &CVal, want: Option<&Ty>, sp: Span) -> R<Ty> {
+    match (v, want) {
+        (CVal::Num(n), None) => Ok(if matches!(n, ConstVal::Float(_)) { Ty::Float } else { Ty::Int }),
+        (CVal::Num(_), Some(Ty::Float)) => Ok(Ty::Float),
+        (CVal::Num(n), Some(t)) if t.int_kind().is_some() => {
+            let k = t.int_kind().unwrap();
+            match consts::as_int(n) {
+                Some(i) if consts::fit(&i, k).is_some() => Ok(t.clone()),
+                Some(i) => Err(Diag::new(sp, format!("constant {i} overflows {}", k.name()))),
+                None => Err(Diag::new(sp, format!("constant {} isn't an integer, so it can't be {}", consts::show(n), k.name()))),
+            }
+        }
+        (CVal::Str(_), None | Some(Ty::Str)) => Ok(Ty::Str),
+        (CVal::Bool(_), None | Some(Ty::Bool)) => Ok(Ty::Bool),
+        (CVal::Arr(vs), Some(t @ Ty::Fixed(_, n))) if vs.len() as u64 != *n => Err(Diag::new(sp, format!("{} elements where {} needs {n}", vs.len(), t.show()))),
+        (CVal::Arr(vs), Some(t @ (Ty::Array(el) | Ty::Fixed(el, _)))) => {
+            for v in vs {
+                const_type(v, Some(el), sp)?;
+            }
+            Ok(t.clone())
+        }
+        (CVal::Arr(vs), None) => {
+            let Some(first) = vs.first() else {
+                return Err(Diag::new(sp, "an empty array constant needs a type: `NAME: [T] = []`"));
+            };
+            // Untyped numbers join: an Int among Floats is a Float.
+            let floats = vs.iter().all(|v| matches!(v, CVal::Num(_))) && vs.iter().any(|v| matches!(v, CVal::Num(ConstVal::Float(_))));
+            let el = if floats { Ty::Float } else { const_type(first, None, sp)? };
+            for v in vs {
+                if const_type(v, Some(&el), sp).ok().as_ref() != Some(&el) {
+                    return Err(Diag::new(sp, format!("an array constant's elements must have one type; this one has {} and {}", el.show(), const_type(v, None, sp)?.show())));
+                }
+            }
+            Ok(Ty::arr(el))
+        }
+        (_, Some(t)) => Err(Diag::new(sp, format!("this constant isn't {}", t.show()))),
+    }
+}
+
+/// A constant's value as a typed literal (`ty` from `const_type`). Each use
+/// of an array constant as a value is a fresh array built from this.
+pub fn const_lit(v: &CVal, ty: &Ty, sp: Span) -> TExpr {
+    let kind = match (v, ty) {
+        (CVal::Num(n), Ty::Float) => TK::Float(consts::to_f64(&match n {
+            ConstVal::Int(i) => num_rational::BigRational::from_integer(i.clone()),
+            ConstVal::Float(q) => q.clone(),
+        })),
+        (CVal::Num(n), t) => TK::Int(consts::fit(&consts::as_int(n).unwrap(), t.int_kind().unwrap()).unwrap()),
+        (CVal::Str(s), _) => TK::Str(s.clone()),
+        (CVal::Bool(b), _) => TK::Bool(*b),
+        (CVal::Arr(vs), t) => {
+            let el = t.arr_elem().unwrap();
+            TK::Array(vs.iter().map(|v| const_lit(v, &el, sp)).collect())
+        }
+    };
+    TExpr { kind, ty: ty.clone(), span: sp }
+}
+
+/// Values of this type share no mutable storage: an element read from a
+/// constant array can be handed out as it is.
+fn storage_free(t: &Ty) -> bool {
+    matches!(t, Ty::Int | Ty::IntK(_) | Ty::Float | Ty::Bool | Ty::Str)
 }
 
 pub type Structs = HashMap<String, Ty>;
@@ -204,7 +276,7 @@ impl<'a> World<'a> {
         }
         GENERICS.with(|g| g.borrow_mut().clear());
         INSTS.with(|g| g.borrow_mut().clear());
-        Ok(World { sm, defs, by_name, instances: HashMap::new(), funcs: vec![], sigs: HashMap::new(), fatal: None, structs: HashMap::new(), consts: HashMap::new(), ifaces: HashMap::new(), impls: HashMap::new(), stringers: HashMap::new(), errors: vec![], refines: HashMap::new(), warnings: vec![] })
+        Ok(World { sm, defs, by_name, instances: HashMap::new(), funcs: vec![], sigs: HashMap::new(), fatal: None, structs: HashMap::new(), consts: HashMap::new(), ifaces: HashMap::new(), impls: HashMap::new(), stringers: HashMap::new(), errors: vec![], refines: HashMap::new(), warnings: vec![], globals: vec![] })
     }
 
     /// Evaluate top-level constants, in order (each may use earlier ones).
@@ -219,6 +291,11 @@ impl<'a> World<'a> {
             let v = v?;
             let prev = enter_pkg(&pkg_of(&d.name));
             let ty = match &d.ty {
+                Some(te) if matches!(v, CVal::Arr(_)) => {
+                    let t = type_from(te, &self.structs, &self.consts)?;
+                    Some(const_type(&v, Some(&t), d.value.span)?)
+                }
+                None if matches!(v, CVal::Arr(_)) => Some(const_type(&v, None, d.value.span)?),
                 Some(te) => {
                     let t = type_from(te, &self.structs, &self.consts)?;
                     let ok = match (&v, &t) {
@@ -249,6 +326,15 @@ impl<'a> World<'a> {
 
     fn eval_const(&self, e: &Expr) -> R<CVal> {
         eval_const(&self.consts, e)
+    }
+
+    /// The global holding array constant `name` (made on first use).
+    fn const_global(&mut self, name: &str, v: &CVal, ty: &Ty) -> usize {
+        if let Some(k) = self.globals.iter().position(|(n, _)| n == name) {
+            return k;
+        }
+        self.globals.push((name.to_string(), const_lit(v, ty, Span::default())));
+        self.globals.len() - 1
     }
 
     /// Declare structs and enums (in any order; a value type can't contain itself).
@@ -726,7 +812,17 @@ pub fn eval_const(consts: &Consts, e: &Expr) -> R<CVal> {
             let (x, y) = (num(r, eval_const(consts, r)?)?, num(&args[0], eval_const(consts, &args[0])?)?);
             CVal::Num(consts::fold(BinOp::Shl, &x, &y).map_err(|m| Diag::new(e.span, m))?.unwrap())
         }
-        _ => return Err(Diag::new(e.span, "a constant must be computable at compile time: literals, other constants and operators")),
+        ExprKind::Array(items) => CVal::Arr(items.iter().map(|x| eval_const(consts, x)).collect::<R<_>>()?),
+        ExprKind::ArrayRepeat(v, n) => {
+            let v = eval_const(consts, v)?;
+            let n = match eval_const(consts, n)? {
+                CVal::Num(n) => consts::as_int(&n).and_then(|i| usize::try_from(i).ok()).filter(|n| *n <= 1 << 20),
+                _ => None,
+            };
+            let n = n.ok_or_else(|| Diag::new(e.span, "an array constant's length must be an integer constant from 0 to 1048576"))?;
+            CVal::Arr(vec![v; n])
+        }
+        _ => return Err(Diag::new(e.span, "a constant must be computable at compile time: literals, arrays of them, other constants and operators")),
     })
 }
 
@@ -1028,6 +1124,8 @@ struct FnCx<'w, 'a> {
     /// In a method: `Some(true)` for a `!` method (`self` is a one-element
     /// slice holding the receiver), `Some(false)` for one taking a copy.
     method: Option<bool>,
+    /// The next block checked has its value discarded (`each`, `step`).
+    block_unused: bool,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -1084,6 +1182,7 @@ impl<'w, 'a> FnCx<'w, 'a> {
             lock_floor: None,
             lambdas: vec![],
             method: def.filter(|d| d.params.first().is_some_and(|p| p.name == "self")).map(|d| d.name.ends_with('!')),
+            block_unused: false,
             is_main: def.is_none(),
             ret: Ty::Unit,
             impure: false,
@@ -1213,7 +1312,7 @@ impl<'w, 'a> FnCx<'w, 'a> {
                 None => self.fresh(),
             };
         }
-        let (mut stmts, tail_ty) = self.body(body)?;
+        let (mut stmts, tail_ty) = self.body_as(body, !self.is_main)?;
         if !self.is_main {
             let sp = def.map_or(Span::default(), |d| d.span);
             // The value of the last statement is the return value.
@@ -1431,12 +1530,22 @@ impl<'w, 'a> FnCx<'w, 'a> {
 
     /// Returns the statements and the type of the last one's value.
     fn body(&mut self, stmts: &[Stmt]) -> R<(Vec<TStmt>, Ty)> {
+        self.body_as(stmts, true)
+    }
+
+    /// `used`: whether the last statement's value is the block's value
+    /// (otherwise it is discarded, like every earlier statement's). A `case`
+    /// or `if` whose value is discarded may have arms of different types.
+    fn body_as(&mut self, stmts: &[Stmt], used: bool) -> R<(Vec<TStmt>, Ty)> {
         let mut out = vec![];
         let mut last = Ty::Unit;
         for (i, s) in stmts.iter().enumerate() {
-            // A trailing `if ... else ...` is the block's value (Ruby).
+            let used = used && i + 1 == stmts.len();
             let t = match &s.kind {
-                StmtKind::If(c, a, b) if i + 1 == stmts.len() && !b.is_empty() => TStmt::Expr(self.if_value(c, a, b, s.span)?),
+                // A trailing `if ... else ...` is the block's value (Ruby).
+                StmtKind::If(c, a, b) if i + 1 == stmts.len() && !b.is_empty() => TStmt::Expr(self.if_value(c, a, b, s.span, used)?),
+                StmtKind::Expr(Expr { kind: ExprKind::Case(subject, arms), span, .. }) => TStmt::Expr(self.case(subject.as_deref(), arms, *span, used)?),
+                StmtKind::Expr(Expr { kind: ExprKind::If(c, a, b), span, .. }) => TStmt::Expr(self.if_value(c, a, b, *span, used)?),
                 _ => self.stmt(s)?,
             };
             last = match &t {
@@ -1541,7 +1650,7 @@ impl<'w, 'a> FnCx<'w, 'a> {
                 self.loops.push(LoopKind::While);
                 self.scopes.push(HashMap::new());
                 let bind = opt.map(|(_, name, tmp, ty)| self.opt_bind(&name, tmp, &ty, s.span));
-                let r = self.body(body);
+                let r = self.body_as(body, false);
                 self.pop_scope();
                 self.loops.pop();
                 let (mut b, _) = r?;
@@ -1554,16 +1663,16 @@ impl<'w, 'a> FnCx<'w, 'a> {
                 if let Some((cond, name, tmp, ty)) = self.opt_let(c)? {
                     self.scopes.push(HashMap::new());
                     let bind = self.opt_bind(&name, tmp, &ty, s.span);
-                    let r = self.body(a);
+                    let r = self.body_as(a, false);
                     self.pop_scope();
                     let (mut ta, _) = r?;
                     ta.insert(0, bind);
-                    let (tb, _) = self.body(b)?;
+                    let (tb, _) = self.body_as(b, false)?;
                     return Ok(TStmt::If(cond, ta, tb));
                 }
                 let c = self.cond(c)?;
-                let (a, _) = self.body(a)?;
-                let (b, _) = self.body(b)?;
+                let (a, _) = self.body_as(a, false)?;
+                let (b, _) = self.body_as(b, false)?;
                 TStmt::If(c, a, b)
             }
             StmtKind::Defer(e) => {
@@ -1726,10 +1835,17 @@ impl<'w, 'a> FnCx<'w, 'a> {
                 Some((v, ty)) => return self.const_value(v, ty, sp),
                 None => return Err(Diag::new(sp, format!("`{c}` is not a value; call a method on it (`{c}.new`, ...)"))),
             },
+            ExprKind::Call { recv: Some(r), name, args, block: None, block_sym: None, .. } if matches!(name.as_str(), "size" | "length") && args.is_empty() && self.const_array(r).is_some() => {
+                let Some((_, CVal::Arr(vs), _)) = self.const_array(r) else { unreachable!() };
+                self.mk(TK::Int(vs.len() as i64), Ty::Int, sp)
+            }
             ExprKind::Call { recv, name, name_span, args, block, block_sym } => {
                 return self.call(recv.as_deref(), name, *name_span, args, block.as_deref(), block_sym.as_ref(), sp);
             }
             ExprKind::Index(a, i) => {
+                if let Some(r) = self.const_read(e)? {
+                    return Ok(r);
+                }
                 let a = self.value(a)?;
                 let at = self.resolve(&a.ty);
                 if let Some(sn) = at.type_name() {
@@ -2018,7 +2134,7 @@ impl<'w, 'a> FnCx<'w, 'a> {
                 }
                 self.mk(TK::Format(pieces, vals), Ty::Str, sp)
             }
-            ExprKind::Case(subject, arms) => return self.case(subject.as_deref(), arms, sp),
+            ExprKind::Case(subject, arms) => return self.case(subject.as_deref(), arms, sp, true),
             ExprKind::None => {
                 let t = self.fresh();
                 self.mk(TK::None, Ty::Opt(Box::new(t)), sp)
@@ -2046,7 +2162,7 @@ impl<'w, 'a> FnCx<'w, 'a> {
                 let t = self.mk(TK::Ternary(Box::new(present), Box::new(some), Box::new(none)), ty.clone(), sp);
                 self.mk(TK::Seq(vec![pre, TStmt::Expr(t)]), ty, sp)
             }
-            ExprKind::If(c, a, b) => return self.if_value(c, a, b, sp),
+            ExprKind::If(c, a, b) => return self.if_value(c, a, b, sp, true),
             ExprKind::KwArg(n, nsp, _) => return Err(Diag::new(*nsp, format!("keyword argument `{n}:` outside `Struct.new`")).note("keyword arguments name struct fields: `Body.new(x: 1.0, mass: m)`")),
             ExprKind::Array(items) => {
                 let el = self.site(e.id, 0);
@@ -2114,6 +2230,7 @@ impl<'w, 'a> FnCx<'w, 'a> {
                 steps.push(TStep::Field(k));
                 Ok((id, steps, ft))
             }
+            ExprKind::Const(c) if self.const_array(e).is_some() => Err(Diag::new(e.span, format!("`{c}` is a constant and can't be changed")).note(format!("copy it into a variable to get an array of your own: `xs = {c}`"))),
             _ => Err(Diag::new(e.span, "cannot assign to this")),
         }
     }
@@ -2313,7 +2430,9 @@ impl<'w, 'a> FnCx<'w, 'a> {
     }
 
     /// `case`: lowered to a chain of conditionals over a temporary.
-    fn case(&mut self, subject: Option<&Expr>, arms: &[CaseArm], sp: Span) -> R<TExpr> {
+    /// `used`: the case's value is wanted. If not (a statement), its arms
+    /// may be of different types, as an `if` statement's branches may.
+    fn case(&mut self, subject: Option<&Expr>, arms: &[CaseArm], sp: Span, used: bool) -> R<TExpr> {
         let mut pre = vec![];
         let subj = match subject {
             Some(s) => {
@@ -2337,7 +2456,7 @@ impl<'w, 'a> FnCx<'w, 'a> {
                 if default.is_some() {
                     return Err(Diag::new(arm.span, "a second `_` arm can never match"));
                 }
-                default = Some(self.arm_body(&arm.body, arm.span)?);
+                default = Some(self.arm_body_with(vec![], &arm.body, arm.span, used)?);
                 continue;
             }
             if default.is_some() {
@@ -2463,7 +2582,7 @@ impl<'w, 'a> FnCx<'w, 'a> {
                     }
                 });
             }
-            let body = self.arm_body_with(binds, &arm.body, arm.span)?;
+            let body = self.arm_body_with(binds, &arm.body, arm.span, used)?;
             conds.push((cond.unwrap(), body));
         }
         // Over an enum: every variant must be covered (or `_` given); the
@@ -2478,7 +2597,8 @@ impl<'w, 'a> FnCx<'w, 'a> {
             }
         }
         // Without `_` nothing may match: the arms are statements and the case has no value.
-        let has_default = default.is_some();
+        // Unused, it has none either.
+        let has_default = default.is_some() && used;
         let unitize = |cx: &mut Self, b: TExpr| -> TExpr {
             let span = b.span;
             let TK::Seq(mut ss) = b.kind else { unreachable!() };
@@ -2502,7 +2622,8 @@ impl<'w, 'a> FnCx<'w, 'a> {
             }
         }
         let mut acc = match default {
-            Some(d) => d,
+            Some(d) if has_default => d,
+            Some(d) => unitize(self, d),
             None => self.mk(TK::Unit, Ty::Unit, sp),
         };
         let ty = acc.ty.clone();
@@ -2879,7 +3000,7 @@ impl<'w, 'a> FnCx<'w, 'a> {
                     };
                     self.scopes.push(HashMap::new());
                     let id = bind.as_ref().map(|(n, _)| self.declare(n, Ty::Opt(t.clone())));
-                    let r = self.body(&a.body);
+                    let r = self.body_as(&a.body, false);
                     self.pop_scope();
                     TSelArm::Recv { ch: c, bind: id, body: r?.0 }
                 }
@@ -2892,7 +3013,7 @@ impl<'w, 'a> FnCx<'w, 'a> {
                     let v = self.coerce(v, &t)?;
                     self.expect(&v.ty, &t, v.span, "sent value")?;
                     self.scopes.push(HashMap::new());
-                    let r = self.body(&a.body);
+                    let r = self.body_as(&a.body, false);
                     self.pop_scope();
                     TSelArm::Send { ch: c, val: v, body: r?.0 }
                 }
@@ -2902,7 +3023,7 @@ impl<'w, 'a> FnCx<'w, 'a> {
         let d = match default {
             Some(b) => {
                 self.scopes.push(HashMap::new());
-                let r = self.body(b);
+                let r = self.body_as(b, false);
                 self.pop_scope();
                 Some(r?.0)
             }
@@ -3203,12 +3324,14 @@ impl<'w, 'a> FnCx<'w, 'a> {
     }
 
     /// `if` as a value: the branches' values if they agree, else nil.
-    fn if_value(&mut self, c: &Expr, a: &[Stmt], b: &[Stmt], sp: Span) -> R<TExpr> {
+    /// `used`: the value is wanted, so the branches must agree; otherwise
+    /// (a statement) they may differ and the `if` has no value.
+    fn if_value(&mut self, c: &Expr, a: &[Stmt], b: &[Stmt], sp: Span, used: bool) -> R<TExpr> {
         let (c, ta) = match self.opt_let(c)? {
             Some((cond, name, tmp, ty)) => {
                 self.scopes.push(HashMap::new());
                 let bind = self.opt_bind(&name, tmp, &ty, sp);
-                let ta = self.seq_body(a, sp);
+                let ta = self.seq_body(a, sp, used);
                 self.pop_scope();
                 let mut ta = ta?;
                 if let TK::Seq(ss) = &mut ta.kind {
@@ -3219,15 +3342,24 @@ impl<'w, 'a> FnCx<'w, 'a> {
             None => {
                 let c = self.cond(c)?;
                 // Branches share the enclosing scope, as statement `if`s do (Ruby).
-                (c, self.seq_body(a, sp)?)
+                (c, self.seq_body(a, sp, used)?)
             }
         };
-        let tb = self.seq_body(b, sp)?;
+        let tb = self.seq_body(b, sp, used)?;
         let (ta, tb) = self.join(ta, tb)?;
         let (ra, rb) = (self.resolve(&ta.ty), self.resolve(&tb.ty));
-        let (ta, tb, ty) = if !b.is_empty() && self.unify(&ra, &rb) {
+        let (ta, tb, ty) = if used && !b.is_empty() && self.unify(&ra, &rb) {
             let ty = if matches!(ra, Ty::Never) { rb } else { ra };
             (ta, tb, ty)
+        } else if used && !b.is_empty() {
+            let at = match &tb.kind {
+                TK::Seq(ss) => match ss.last() {
+                    Some(TStmt::Expr(e)) => e.span,
+                    _ => tb.span,
+                },
+                _ => tb.span,
+            };
+            return Err(Diag::new(at, format!("this branch is {}, but the other is {}", rb.show(), ra.show())).note("an `if` used as a value needs branches of one type; as a statement, they may differ"));
         } else {
             let unit = |cx: &mut Self, x: TExpr| {
                 let span = x.span;
@@ -3240,8 +3372,8 @@ impl<'w, 'a> FnCx<'w, 'a> {
         Ok(self.mk(TK::Ternary(Box::new(c), Box::new(ta), Box::new(tb)), ty, sp))
     }
 
-    fn seq_body(&mut self, body: &[Stmt], sp: Span) -> R<TExpr> {
-        let (mut ss, ty) = self.body(body)?;
+    fn seq_body(&mut self, body: &[Stmt], sp: Span, used: bool) -> R<TExpr> {
+        let (mut ss, ty) = self.body_as(body, used)?;
         if let Some(TStmt::Expr(e)) = ss.last_mut() {
             let m = self.materialize(e.clone());
             *e = m;
@@ -3254,19 +3386,15 @@ impl<'w, 'a> FnCx<'w, 'a> {
         Ok(self.mk(TK::Seq(ss), ty, sp))
     }
 
-    fn arm_body(&mut self, body: &[Stmt], sp: Span) -> R<TExpr> {
-        self.arm_body_with(vec![], body, sp)
-    }
-
     /// An arm's body, with pattern bindings declared first.
-    fn arm_body_with(&mut self, binds: Vec<(String, Ty, TExpr)>, body: &[Stmt], sp: Span) -> R<TExpr> {
+    fn arm_body_with(&mut self, binds: Vec<(String, Ty, TExpr)>, body: &[Stmt], sp: Span, used: bool) -> R<TExpr> {
         self.scopes.push(HashMap::new());
         let mut pre = vec![];
         for (n, t, v) in binds {
             let id = self.declare(&n, t.clone());
             pre.push(TStmt::Expr(self.mk(TK::Assign(id, Box::new(v)), t, sp)));
         }
-        let r = self.body(body);
+        let r = self.body_as(body, used);
         self.pop_scope();
         let (ss, ty) = r?;
         let mut ss: Vec<TStmt> = pre.into_iter().chain(ss).collect();
@@ -3293,9 +3421,61 @@ impl<'w, 'a> FnCx<'w, 'a> {
         Ok(i)
     }
 
+    /// The array constant `e` names (`C`, `pkg.C`), if it does: its
+    /// qualified name, value and type.
+    fn const_array(&self, e: &Expr) -> Option<(String, CVal, Ty)> {
+        let q = match &e.kind {
+            ExprKind::Const(c) => resolve_name(c, e.span, &|q| self.w.consts.contains_key(q)).ok()?,
+            ExprKind::Call { recv: Some(r), name, args, block: None, .. } if args.is_empty() => Some(format!("{}.{name}", self.pkg_alias(r)?)).filter(|q| is_public(q))?,
+            _ => return None,
+        };
+        match self.w.consts.get(&q) {
+            Some((v @ CVal::Arr(_), Some(t))) => Some((q, v.clone(), t.clone())),
+            _ => None,
+        }
+    }
+
+    /// `C[i]`, `C[i][j]`, ... of an array constant `C`, when the element read
+    /// shares no storage: read in place from the constant's global, so a
+    /// lookup in a loop allocates nothing. (Anything else gets a fresh copy.)
+    fn const_read(&mut self, e: &Expr) -> R<Option<TExpr>> {
+        let mut idxs = vec![];
+        let mut base = e;
+        while let ExprKind::Index(a, i) = &base.kind {
+            if matches!(i.kind, ExprKind::SliceRange(..)) {
+                return Ok(None);
+            }
+            idxs.push(&**i);
+            base = a;
+        }
+        let Some((name, v, ty)) = self.const_array(base) else { return Ok(None) };
+        let mut el = ty.clone();
+        for _ in &idxs {
+            match el.arr_elem() {
+                Some(t) => el = t,
+                None => return Ok(None),
+            }
+        }
+        if !storage_free(&el) {
+            return Ok(None);
+        }
+        let k = self.w.const_global(&name, &v, &ty);
+        let mut cur = self.mk(TK::M(M::Global(k), None, vec![], None), ty, base.span);
+        for i in idxs.into_iter().rev() {
+            let el = cur.ty.arr_elem().unwrap();
+            let i = self.index_value(i)?;
+            let sp = cur.span.to(i.span);
+            cur = self.mk(TK::Index(Box::new(cur), Box::new(i)), el, sp);
+        }
+        Ok(Some(cur))
+    }
+
     /// A top-level constant used as a value.
     fn const_value(&mut self, v: CVal, ty: Option<Ty>, sp: Span) -> R<TExpr> {
         Ok(match (v, ty) {
+            // A fresh array per use: changing it never changes the constant.
+            (v @ CVal::Arr(_), Some(t)) => const_lit(&v, &t, sp),
+            (CVal::Arr(_), None) => unreachable!("array constants are typed"),
             (CVal::Str(s), _) => self.mk(TK::Str(s), Ty::Str, sp),
             (CVal::Bool(b), _) => self.mk(TK::Bool(b), Ty::Bool, sp),
             (CVal::Num(n), None) => {
@@ -3545,7 +3725,8 @@ impl<'w, 'a> FnCx<'w, 'a> {
             }
             if let ExprKind::Call { recv: Some(r2), name: tn, args: a2, block: None, name_span: tsp, .. } = &r.kind {
                 if a2.is_empty() && tn.chars().next().is_some_and(|c| c.is_uppercase()) {
-                    if let Some(path) = self.pkg_alias(r2) {
+                    // (`geom.ORIGIN.size` is a method of the constant's value.)
+                    if let Some(path) = self.pkg_alias(r2).filter(|p| !self.w.consts.contains_key(&format!("{p}.{tn}"))) {
                         let alias_q = format!("{}.{tn}", match &r2.kind { ExprKind::Name(a) => a.clone(), ExprKind::Call { name, .. } => name.clone(), _ => unreachable!() });
                         let _ = path;
                         return self.const_call(&alias_q, *tsp, name, name_span, args, block, sp);
@@ -3731,7 +3912,7 @@ impl<'w, 'a> FnCx<'w, 'a> {
                 let Some(b) = block else { return Err(Diag::new(sp, "`loop` needs a block")) };
                 self.loops.push(LoopKind::While);
                 self.scopes.push(HashMap::new());
-                let (body, _) = self.body(&b.body)?;
+                let (body, _) = self.body_as(&b.body, false)?;
                 self.pop_scope();
                 self.loops.pop();
                 let blk = TBlock { params: vec![], destructure: false, body, pure: true, span: b.span , own: (0, 0) };
@@ -4173,7 +4354,7 @@ impl<'w, 'a> FnCx<'w, 'a> {
                 };
                 self.loops.push(LoopKind::Gen);
                 let saved = std::mem::replace(&mut self.impure, false);
-                let (body, _) = self.body(&b.body)?;
+                let (body, _) = self.body_as(&b.body, false)?;
                 let pure = !self.impure;
                 self.impure = saved || self.impure;
                 self.loops.pop();
@@ -4196,6 +4377,7 @@ impl<'w, 'a> FnCx<'w, 'a> {
     }
 
     fn block_n(&mut self, b: &Block, params: &[Ty], allow_destructure: bool) -> R<(TBlock, Ty)> {
+        let used = !std::mem::take(&mut self.block_unused);
         let own_start = self.locals.len();
         self.scopes.push(HashMap::new());
         let mut ids = vec![];
@@ -4239,7 +4421,7 @@ impl<'w, 'a> FnCx<'w, 'a> {
         }
         self.loops.push(LoopKind::Block);
         let saved = std::mem::replace(&mut self.impure, false);
-        let r = self.body(&b.body);
+        let r = self.body_as(&b.body, used);
         let pure = !self.impure;
         self.impure = saved || self.impure;
         self.loops.pop();
@@ -4743,6 +4925,7 @@ impl<'w, 'a> FnCx<'w, 'a> {
                         self.expect(&x.ty, &Ty::Int, x.span, "step")?;
                     }
                     let Some(b) = block else { return Err(Diag::new(sp, "`step` needs a block")) };
+                    self.block_unused = true;
                     let (blk, _) = self.block(b, &Ty::Int)?;
                     return Ok(mk_m(self, M::Step, recv, a, Some(blk), Ty::Unit));
                 }
@@ -4902,6 +5085,7 @@ impl<'w, 'a> FnCx<'w, 'a> {
                 }
                 "to_a" => return Ok(mk_m(self, M::ToA, recv, vec![], None, Ty::arr(el))),
                 "each" => {
+                    self.block_unused = block.is_some();
                     let (blk, _) = self.any_block(block, bsym, &el, sp, name)?;
                     return Ok(mk_m(self, M::Each, recv, vec![], Some(blk), Ty::Unit));
                 }

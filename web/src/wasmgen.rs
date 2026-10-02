@@ -217,6 +217,8 @@ struct Ctx<'p> {
     workers: HashMap<usize, (u32, &'p LWorker)>,
     consts: HashMap<String, (i64, i64)>,
     ret: i64,
+    /// Each global's type and address in the runtime's memory.
+    globals: Vec<(LTy, i64)>,
 }
 
 impl Ctx<'_> {
@@ -294,7 +296,12 @@ pub fn emit(p: &LProgram) -> Result<Vec<u8>, String> {
         return Err("spawn, channels, Mutex and Atomic aren't available in the browser yet".into());
     }
     rt::st().consts.clear();
-    let mut cx = Ctx { types: vec![], type_idx: HashMap::new(), rt_idx: HashMap::new(), funcs: HashMap::new(), gens: HashMap::new(), workers: HashMap::new(), consts: HashMap::new(), ret: rt::ret_addr() };
+    let mut cx = Ctx { types: vec![], type_idx: HashMap::new(), rt_idx: HashMap::new(), funcs: HashMap::new(), gens: HashMap::new(), workers: HashMap::new(), consts: HashMap::new(), ret: rt::ret_addr(), globals: vec![] };
+    for t in &p.globals {
+        let b: Box<[u8]> = vec![0u8; lay(t).size.next_multiple_of(8) as usize].into_boxed_slice();
+        cx.globals.push((t.clone(), b.as_ptr() as usize as i64));
+        rt::st().consts.push(b);
+    }
     let mut imports = ImportSection::new();
     imports.import("env", "memory", EntityType::Memory(MemoryType { minimum: 1, maximum: None, memory64: false, shared: false, page_size_log2: None }));
     for (k, (name, sig)) in RT.iter().enumerate() {
@@ -720,6 +727,15 @@ impl<'c, 'p> Fx<'c, 'p> {
 
     fn stmt(&mut self, s: &LS) {
         match s {
+            LS::SetGlobal(k, v) => {
+                let (t, at) = self.cx.globals[*k].clone();
+                let ts = self.e(v);
+                let vals = self.pop(&ts);
+                let base = self.local(W);
+                self.i64c(at);
+                self.ins().local_set(base);
+                self.store(&t, base, 0, &vals);
+            }
             LS::RegionFree(_) => {}
             LS::RegionEnter { .. } | LS::RegionExit { .. } | LS::RegionUse { .. } | LS::RegionRestore(_) => {}
             LS::Spawn { .. } | LS::Wait { .. } | LS::ChanSend { .. } | LS::ChanRecv { .. } | LS::ChanClose { .. } | LS::Select { .. } | LS::Lock(_) | LS::Unlock(_) | LS::AtomicStore(..) => unreachable!("rejected by uses_concurrency"),
@@ -1107,6 +1123,7 @@ impl<'c, 'p> Fx<'c, 'p> {
     fn ty(&self, e: &LE) -> LTy {
         match e {
             LE::Ffi(..) => unreachable!("rejected by uses_ffi"),
+            LE::Global(k) => self.cx.globals[*k].0.clone(),
             LE::LockNew => LTy::Lock,
             LE::AtomicNew(_) => LTy::Atomic,
             LE::AtomicLoad(_) | LE::AtomicRmw(..) => LTy::I64,
@@ -1182,6 +1199,13 @@ impl<'c, 'p> Fx<'c, 'p> {
             // The browser never frees: regions are no-ops (handle 0).
             LE::RegionProgram => self.i64c(0),
             LE::Ffi(..) => unreachable!("rejected by uses_ffi"),
+            LE::Global(k) => {
+                let (t, at) = self.cx.globals[*k].clone();
+                let base = self.local(W);
+                self.i64c(at);
+                self.ins().local_set(base);
+                self.load(&t, base, 0);
+            }
             LE::ChanNew(..) | LE::ChanLen(_) | LE::LockNew | LE::AtomicNew(_) | LE::AtomicLoad(_) | LE::AtomicRmw(..) | LE::AtomicCas(..) => unreachable!("rejected by uses_concurrency"),
             LE::Var(v) => {
                 let ls = self.vars[*v].clone();

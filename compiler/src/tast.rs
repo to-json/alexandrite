@@ -269,6 +269,9 @@ pub enum M {
     CopyInto,
     /// `s.runes`: the code points of a Str (U+FFFD for invalid bytes).
     Runes,
+    /// Array constant k, read in place (`TProgram::globals`). Only ever
+    /// indexed down to elements without storage, so it is never changed.
+    Global(usize),
     /// Maps: `{k => v, ...}` (args: k1, v1, k2, v2, ...), `m[k]` (V?),
     /// `m.fetch(k, d)`, `m[k] = v`, `delete` (V?), `key?`, `size`, `keys`, `values`.
     /// An enum value's variant index.
@@ -550,4 +553,7 @@ pub struct TProgram {
     pub messages: HashMap<usize, FuncId>,
     /// Unused locals and imports (errors under `--strict`).
     pub warnings: Vec<crate::diag::Diag>,
+    /// Array constants read in place, by `M::Global` index: each one's
+    /// value, a literal. Built before the program's first statement.
+    pub globals: Vec<TExpr>,
 }

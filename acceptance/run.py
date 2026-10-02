@@ -77,6 +77,7 @@ GROUPS = {
     "packages": "M6",
     "refinements": "M6",
     "concurrency": "M7",
+    "asserts": "M8",
 }
 
 
@@ -183,6 +184,49 @@ def modules():
     check("M6", "modtest unrequired import error", got == want and r.returncode == 1, f"got {got}")
     r, _ = run([ALX, "run", "main.alx"], cwd=d, env={"ALX_MODCACHE": str(WORK / "empty-cache")})
     check("M6", "modtest missing cache dir error", "isn't in the module cache" in r.stderr and r.returncode == 1, r.stderr.strip()[:200])
+
+
+def norm_test_output(text):
+    """Timings vary: (0.12s) and the final `ok  dir 0.123s` become constants."""
+    text = re.sub(r"\(\d+\.\d\ds\)", "(0.00s)", text)
+    return re.sub(r" \d+\.\d{3}s$", " 0.000s", text, flags=re.M)
+
+
+def testing():
+    """`alx test`: discovery, assertions, examples, benchmarks, exit codes."""
+    d = CASES / "testing"
+    r, _ = run([ALX, "test"], cwd=d)
+    want = (d / "test.expected").read_text()
+    check("M8", "alx test passes (package + tests, imports, examples)", r.returncode == 0 and norm_test_output(r.stdout) == want, f"exit {r.returncode}: {norm_test_output(r.stdout)[-300:]!r} {r.stderr.strip()[:200]}")
+    r, _ = run([ALX, "test", "calc_test.alx"], cwd=d)
+    check("M8", "alx test FILE", r.returncode == 0 and norm_test_output(r.stdout) == want, f"exit {r.returncode}")
+    r, _ = run([ALX, "test", "testing"])
+    check("M8", "alx test DIR from elsewhere", r.returncode == 0 and "ok     testing " in r.stdout, f"exit {r.returncode}")
+    r, _ = run([ALX, "test", "-run", "clamp"], cwd=d)
+    out = norm_test_output(r.stdout)
+    check("M8", "alx test -run filters by substring", r.returncode == 0 and "=== RUN   clamp" in out and "RUN   add" not in out and "RUN   printing" not in out, out[:200])
+    r, _ = run([ALX, "test", "-bench", "."], cwd=d, env={"ALX_BENCHTIME": "20ms"})
+    check("M8", "alx test -bench runs benchmarks", r.returncode == 0 and re.search(r"^Benchmarkadd +\d+ +[\d.]+ ns/op$", r.stdout, re.M) is not None, r.stdout[-200:])
+    r, _ = run([ALX, "test", "-benchtime", "10ms", "-bench", "add", "-run", "none"], cwd=d)
+    check("M8", "alx test -benchtime, benchmarks only", r.returncode == 0 and re.search(r"^Benchmarkadd +\d+ +[\d.]+ ns/op$", r.stdout, re.M) is not None and "=== RUN" not in r.stdout, r.stdout[-200:])
+    r, _ = run([ALX, "test"], cwd=d)
+    check("M8", "benchmarks don't run without -bench", "Benchmark" not in r.stdout, "")
+    r, _ = run([ALX, "test", "--release"], cwd=d)
+    check("M8", "alx test --release (C backend)", r.returncode == 0 and norm_test_output(r.stdout) == want, f"exit {r.returncode}: {r.stderr.strip()[:200]}")
+
+    d = CASES / "testing_fail"
+    r, _ = run([ALX, "test"], cwd=d)
+    want = (d / "test.expected").read_text()
+    check("M8", "alx test failures: output and exit code 1", r.returncode == 1 and norm_test_output(r.stdout) == want, f"exit {r.returncode}: {norm_test_output(r.stdout)[-300:]!r}")
+    r, _ = run([ALX, "test", "--release"], cwd=d)
+    check("M8", "alx test --release failures: exit code 1", r.returncode == 1 and norm_test_output(r.stdout) == want, f"exit {r.returncode}")
+
+    # `test` blocks belong in test files.
+    tmp = WORK / "misplaced"
+    tmp.mkdir(exist_ok=True)
+    (tmp / "a.alx").write_text('test "x" {\n  assert true\n}\n')
+    r, _ = run([ALX, "run", "a.alx"], cwd=tmp)
+    check("M8", "test block outside a _test.alx file is an error", r.returncode == 1 and "`test` blocks belong in a `*_test.alx` file" in r.stderr, r.stderr.strip()[:200])
 
 
 def promote_overhead():
@@ -298,6 +342,8 @@ def main():
         print("== modules", flush=True)
         modules()
         warnings()
+        print("== alx test", flush=True)
+        testing()
     if not filt or "A3" in filt:
         print("== A3 promote overhead", flush=True)
         promote_overhead()

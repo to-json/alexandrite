@@ -300,6 +300,14 @@ impl FnEmit<'_> {
                 self.line(&format!("die_str({x});"));
             }
             LS::Panic(m, l) => self.line(&format!("panic({:?}, {});", m, loc(l))),
+            LS::Exit(e) => {
+                let x = self.e(e);
+                self.line(&format!("{{ use std::io::Write; let _ = std::io::stdout().flush(); std::process::exit(({x}) as i32); }}"));
+            }
+            LS::PanicStr(e) => {
+                let x = self.e(e);
+                self.line(&format!("panic_str({x});"));
+            }
             LS::SortInPlace(v, _) => self.line(&format!("v{v}.sort();")),
         }
     }
@@ -492,6 +500,9 @@ impl FnEmit<'_> {
                     Rt::RuneToS => call("rune_to_s"),
                     Rt::FileStatus => call("file_status"),
                     Rt::FileRead => call("file_read_or_empty"),
+                    Rt::NowNs => call("now_ns"),
+                    Rt::CapBegin => call("cap_begin"),
+                    Rt::CapEnd => call("cap_end"),
                     Rt::StrFromBytes => format!("Str(({}).to_vec().into_iter().map(|b| b as u8).collect::<Vec<u8>>().into())", a[0]),
                 }
             }

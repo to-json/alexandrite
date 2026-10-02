@@ -722,6 +722,11 @@ impl<'a> Lw<'a> {
                 LE::Call(f.cname.clone(), args)
             }
             TK::Try(inner) => self.try_expr(inner),
+            TK::Panic(x) => {
+                let m = self.expr(x);
+                self.emit(LS::PanicStr(m));
+                LE::Unit
+            }
             TK::Puts(x) => {
                 let v = self.expr(x);
                 if matches!(x.ty, Ty::Opt(_) | Ty::Map(..) | Ty::Array(_) | Ty::Fixed(..) | Ty::Struct(..) | Ty::Tuple(_) | Ty::Enum(..) | Ty::Iface(_) | Ty::Error) {
@@ -2116,6 +2121,21 @@ impl<'a> Lw<'a> {
                 LE::Unit
             }
             EnumNew => self.generator(e, blk.unwrap()),
+            Exit => {
+                let c = self.expr(&args[0]);
+                self.emit(LS::Exit(c));
+                LE::Unit
+            }
+            NowNs | CapBegin | CapEnd => {
+                let (rt, ty) = match m {
+                    NowNs => (Rt::NowNs, LTy::I64),
+                    CapBegin => (Rt::CapBegin, LTy::I64),
+                    _ => (Rt::CapEnd, LTy::Str),
+                };
+                let t = self.tmp(ty);
+                self.emit(LS::Set(t, LE::Rt(rt, vec![])));
+                if m == CapBegin { LE::Unit } else { LE::Var(t) }
+            }
             FileRead => {
                 // Without `~`: a `~Str` value.
                 let p = self.expr(&args[0]);
@@ -3001,7 +3021,7 @@ fn collect_locals(e: &TExpr, out: &mut Vec<LocalId>) {
             collect_locals(a, out);
             collect_locals(b, out);
         }
-        TK::Neg(x) | TK::Not(x) | TK::Try(x) | TK::Puts(x) | TK::Some(x) => collect_locals(x, out),
+        TK::Neg(x) | TK::Not(x) | TK::Try(x) | TK::Puts(x) | TK::Panic(x) | TK::Some(x) => collect_locals(x, out),
         TK::Select(arms, d) => {
             for a in arms {
                 match a {

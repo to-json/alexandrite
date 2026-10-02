@@ -70,6 +70,9 @@ mod rt {
     pub fn panic(what: &str, loc: &str) -> ! {
         fail(format!("alexandrite: {what} at {loc}"))
     }
+    pub fn panic_str(s: Str) -> ! {
+        fail(format!("alexandrite: {}", String::from_utf8_lossy(&s.0)))
+    }
     pub fn overflow(loc: &str) -> ! {
         fail(format!("alexandrite: overflow at {loc}\nhint: add `#![overflow(promote)]` to this file to promote to bignums"))
     }
@@ -309,6 +312,50 @@ mod rt {
             Ok(b) => Str(b.into()),
             Err(_) => Str::lit(b""),
         }
+    }
+
+    pub fn now_ns() -> i64 {
+        static T0: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+        T0.get_or_init(std::time::Instant::now).elapsed().as_nanos() as i64
+    }
+    unsafe extern "C" {
+        fn dup(fd: i32) -> i32;
+        fn dup2(a: i32, b: i32) -> i32;
+        fn close(fd: i32) -> i32;
+    }
+    /// (saved stdout fd, capture file path) while a capture is active.
+    static CAP: std::sync::Mutex<Option<(i32, std::path::PathBuf)>> = std::sync::Mutex::new(None);
+    /// Redirect file descriptor 1 into a temporary file (process-wide).
+    pub fn cap_begin() -> i64 {
+        use std::io::Write;
+        use std::os::fd::AsRawFd;
+        let _ = std::io::stdout().flush();
+        let mut g = CAP.lock().unwrap_or_else(|e| e.into_inner());
+        if g.is_some() {
+            return 0;
+        }
+        let path = std::env::temp_dir().join(format!("alx-cap-{}", std::process::id()));
+        if let Ok(f) = std::fs::File::create(&path) {
+            unsafe {
+                let saved = dup(1);
+                dup2(f.as_raw_fd(), 1);
+                *g = Some((saved, path));
+            }
+        }
+        0
+    }
+    pub fn cap_end() -> Str {
+        use std::io::Write;
+        let _ = std::io::stdout().flush();
+        let mut g = CAP.lock().unwrap_or_else(|e| e.into_inner());
+        let Some((saved, path)) = g.take() else { return Str::lit(b"") };
+        unsafe {
+            dup2(saved, 1);
+            close(saved);
+        }
+        let b = std::fs::read(&path).unwrap_or_default();
+        let _ = std::fs::remove_file(&path);
+        Str(b.into())
     }
 
     pub fn arr_new<T: Clone>(n: i64, fill: T, loc: &str) -> Sl<T> {

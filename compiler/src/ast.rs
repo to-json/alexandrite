@@ -100,6 +100,26 @@ pub struct Module {
     pub consts: Vec<ConstDef>,
     /// Top-level statements, run in order (the implicit `main`).
     pub main: Vec<Stmt>,
+    /// `test`/`bench`/`example` blocks (only legal in `*_test.alx` files).
+    pub tests: Vec<TestDecl>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TestKind {
+    Test,
+    Bench,
+    Example,
+}
+
+/// `test "name" { body }`, `bench "name" { body }`,
+/// `example "name" { body } outputs "text"`. The body is a fallible def.
+#[derive(Debug, Clone)]
+pub struct TestDecl {
+    pub kind: TestKind,
+    pub name: String,
+    pub span: Span,
+    pub outputs: Option<String>,
+    pub def: Def,
 }
 
 #[derive(Debug, Clone)]

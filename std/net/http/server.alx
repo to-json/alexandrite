@@ -146,7 +146,29 @@ def serve_conn(conn: net.Conn, srv: Server) {
     srv.ctl.lock { |c| c.idle.delete(fd) }
     http10 = req.proto == "HTTP/1.0"
     w = new_response_writer(conn, req.method == "HEAD", !http10, req.wants_close || srv.shutting?)
-    srv.mux.serve_http(w, req)
+    clean = clean_path(req.path)
+    if req.path != "*" && clean != req.path {
+      loc = req.raw_query.size > 0 ? clean + "?" + req.raw_query : clean
+      redirect(w, req, loc, 301)
+    } else {
+      m = srv.mux.find(req.method, req.path)
+      # (Inline, not `dispatch(m, w, req)`: see the compiler caveat on
+      # `dispatch` in mux.alx.)
+      if m.code == 0 {
+        rq = req
+        rq.pathvals = m.pvals
+        h = m.handler
+        h(w, rq)
+      } else if m.code == 301 {
+        loc = req.raw_query.size > 0 ? m.location + "?" + req.raw_query : m.location
+        redirect(w, req, loc, 301)
+      } else if m.code == 405 {
+        w.header.set!("Allow", m.allow)
+        error(w, "Method Not Allowed", 405)
+      } else {
+        not_found(w, req)
+      }
+    }
     done = w.finish!
     break if done.err?
     break unless done.unwrap

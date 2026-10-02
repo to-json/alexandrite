@@ -34,7 +34,7 @@ struct MuxState {
 
 # What a lookup found. code: 0 matched, 404, 405 (`allow` lists the methods),
 # 301 (`location` is the cleaned or slash-added path).
-struct Match {
+pub struct Match {
   code: Int
   handler: (ResponseWriter, Request) -> Unit
   pvals: Map[Str, Str]
@@ -85,10 +85,14 @@ pub struct ServeMux {
     (pat, m.code)
   }
 
-  def find(method: Str, path: Str) -> Match {
+  # Looks the request up: the match carries the handler (copied out of the
+  # mux), the path values, and the status (404, 405, 301) when none ran.
+  pub def find(method: Str, path: Str) -> Match {
     st.lock { |s| route_lookup(s.routes, method, path) }
   }
 
+  # Answers a request: finds its route and runs it (see `dispatch` for a
+  # caveat about where to call it from).
   pub def serve_http(w: ResponseWriter, r: Request) {
     clean = clean_path(r.path)
     if r.path != "*" && clean != r.path {
@@ -97,20 +101,32 @@ pub struct ServeMux {
       return
     }
     m = find(r.method, r.path)
-    if m.code == 0 {
-      rq = r
-      rq.pathvals = m.pvals
-      h = m.handler
-      h(w, rq)
-    } else if m.code == 301 {
-      loc = r.raw_query.size > 0 ? m.location + "?" + r.raw_query : m.location
-      redirect(w, r, loc, 301)
-    } else if m.code == 405 {
-      w.header.set!("Allow", m.allow)
-      error(w, "Method Not Allowed", 405)
-    } else {
-      not_found(w, r)
-    }
+    dispatch(m, w, r)
+  }
+}
+
+# Runs the outcome of `mux.find`: the matched handler (with the pattern's path
+# values set on the request), or the 404, 405 or redirect reply.
+#
+# Compiler caveat: a handler closure copied out of a Mutex shares memory with
+# the writer it is called with, so `find` and `dispatch` must run in the scope
+# that created `w` (the server does). `serve_http` called with a writer made
+# by an outer scope can free what the handler stored in `w.header` when it
+# returns.
+pub def dispatch(m: Match, w: ResponseWriter, r: Request) {
+  if m.code == 0 {
+    rq = r
+    rq.pathvals = m.pvals
+    h = m.handler
+    h(w, rq)
+  } else if m.code == 301 {
+    loc = r.raw_query.size > 0 ? m.location + "?" + r.raw_query : m.location
+    redirect(w, r, loc, 301)
+  } else if m.code == 405 {
+    w.header.set!("Allow", m.allow)
+    error(w, "Method Not Allowed", 405)
+  } else {
+    not_found(w, r)
   }
 }
 

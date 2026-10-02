@@ -1,0 +1,272 @@
+# Package path: Go's path — slash-separated paths (URLs, archive entries).
+# Use path/filepath for the operating system's paths.
+#
+# Differences from Go: `join` takes a [Str] (no variadics); `split`
+# returns a (dir, file) tuple; `match` fails with ErrBadPattern.
+
+pub error PathError {
+  # A malformed `match` pattern.
+  ErrBadPattern
+}
+
+# The shortest path equivalent to `p`: one slash between elements, no `.`,
+# `..` resolved against what precedes it, no trailing slash (except "/").
+pub def clean(p: Str) -> Str {
+  return "." if p.size == 0
+  rooted = p[0] == 47
+  n = p.size
+  out: [Byte] = []
+  r = 0
+  dotdot = 0
+  if rooted {
+    out << 47
+    r = 1
+    dotdot = 1
+  }
+  while r < n {
+    if p[r] == 47 {
+      r += 1
+    } else if p[r] == 46 && (r + 1 == n || p[r + 1] == 47) {
+      r += 1
+    } else if p[r] == 46 && p[r + 1] == 46 && (r + 2 == n || p[r + 2] == 47) {
+      r += 2
+      if out.size > dotdot {
+        # Back up to the previous slash.
+        w = out.size - 1
+        while w > dotdot && out[w] != 47 {
+          w -= 1
+        }
+        out = out[0...w]
+      } else if !rooted {
+        if out.size > 0 {
+          out << 47
+        }
+        out << 46
+        out << 46
+        dotdot = out.size
+      }
+    } else {
+      if (rooted && out.size != 1) || (!rooted && out.size != 0) {
+        out << 47
+      }
+      while r < n && p[r] != 47 {
+        out << p[r]
+        r += 1
+      }
+    }
+  }
+  return "." if out.size == 0
+  Str.from_bytes(out)
+}
+
+# The non-empty elements joined with slashes, cleaned; "" if all are empty.
+pub def join(elems: [Str]) -> Str {
+  parts: [Str] = []
+  for e in elems {
+    parts << e if e.size > 0
+  }
+  return "" if parts.size == 0
+  s = parts[0]
+  i = 1
+  while i < parts.size {
+    s = s + "/" + parts[i]
+    i += 1
+  }
+  clean(s)
+}
+
+# `p` split after its last slash: (dir, file); dir keeps the slash.
+pub def split(p: Str) -> (Str, Str) {
+  i = p.size - 1
+  while i >= 0 && p[i] != 47 {
+    i -= 1
+  }
+  (p[0...i + 1], p[i + 1...p.size])
+}
+
+# The last element; "." for "", "/" for only slashes.
+pub def base(p: Str) -> Str {
+  return "." if p.size == 0
+  e = p.size
+  while e > 0 && p[e - 1] == 47 {
+    e -= 1
+  }
+  return "/" if e == 0
+  s = p[0...e]
+  i = s.size - 1
+  while i >= 0 && s[i] != 47 {
+    i -= 1
+  }
+  s[i + 1...s.size]
+}
+
+# All but the last element, cleaned.
+pub def dir(p: Str) -> Str {
+  d, _ = split(p)
+  clean(d)
+}
+
+# The extension of the last element, dot included; "" if none.
+pub def ext(p: Str) -> Str {
+  i = p.size - 1
+  while i >= 0 && p[i] != 47 {
+    return p[i...p.size] if p[i] == 46
+    i -= 1
+  }
+  ""
+}
+
+# Whether `p` starts with a slash.
+pub def is_abs(p: Str) -> Bool {
+  p.size > 0 && p[0] == 47
+}
+
+# Whether `name` matches the shell pattern: `*` (any run of non-slash
+# bytes), `?` (one non-slash character), `[a-z]` / `[^...]` classes, `\c`.
+pub def match(pattern: Str, name: Str) -> ~Bool<PathError> {
+  m = glob(pattern, 0, name, 0)
+  fail PathError.ErrBadPattern if m < 0
+  m == 1
+}
+
+# 1 if pattern[pi...] matches name[ni...], 0 if not, -1 for a bad pattern.
+def glob(pat: Str, pi: Int, name: Str, ni: Int) -> Int {
+  p = pi
+  n = ni
+  while p < pat.size {
+    c = pat[p]
+    if c == 42 {
+      # `*`: try every split of the non-slash run.
+      while p < pat.size && pat[p] == 42 {
+        p += 1
+      }
+      k = n
+      while true {
+        r = glob(pat, p, name, k)
+        return r if r != 0
+        return 0 if k >= name.size || name[k] == 47
+        k += 1
+      }
+    }
+    return valid_rest(pat, p) if n >= name.size
+    if c == 63 {
+      return 0 if name[n] == 47
+      n += rune_size(name, n)
+      p += 1
+    } else if c == 91 {
+      r = class_match(pat, p, name, n)
+      return -1 if r < 0
+      return valid_rest(pat, p) if r == 0
+      p = r
+      n += rune_size(name, n)
+    } else {
+      if c == 92 {
+        p += 1
+        return -1 if p >= pat.size
+      }
+      return valid_rest(pat, p) if pat[p] != name[n]
+      p += 1
+      n += 1
+    }
+  }
+  n == name.size ? 1 : 0
+}
+
+# 0, or -1 if the rest of the pattern is malformed (Go reports bad
+# patterns even on a mismatch).
+def valid_rest(pat: Str, from: Int) -> Int {
+  p = from
+  while p < pat.size {
+    if pat[p] == 92 {
+      return -1 if p + 1 >= pat.size
+      p += 2
+    } else if pat[p] == 91 {
+      r = class_match(pat, p, "a", 0)
+      return -1 if r < 0
+      e = class_end(pat, p)
+      return -1 if e < 0
+      p = e
+    } else {
+      p += 1
+    }
+  }
+  0
+}
+
+# Where the class starting at pat[p] (`[`) ends (after `]`), or -1.
+def class_end(pat: Str, p: Int) -> Int {
+  i = p + 1
+  i += 1 if i < pat.size && pat[i] == 94
+  first = true
+  while i < pat.size {
+    return i + 1 if pat[i] == 93 && !first
+    i += 1 if pat[i] == 92
+    i += 1
+    first = false
+  }
+  -1
+}
+
+# The position after the class at pat[p] if name[n]'s rune is in it, 0 if
+# not, -1 if the class is malformed.
+def class_match(pat: Str, p: Int, name: Str, n: Int) -> Int {
+  e = class_end(pat, p)
+  return -1 if e < 0
+  r = rune_at(name, n)
+  i = p + 1
+  negate = false
+  if pat[i] == 94 {
+    negate = true
+    i += 1
+  }
+  hit = false
+  while i < e - 1 {
+    # An unescaped `-` can't start a range (Go).
+    return -1 if pat[i] == 45
+    if pat[i] == 92 {
+      i += 1
+    }
+    lo = rune_at(pat, i)
+    i += rune_size(pat, i)
+    hi = lo
+    if i < e - 1 && pat[i] == 45 {
+      i += 1
+      return -1 if i >= e - 1 || pat[i] == 45
+      if pat[i] == 92 {
+        i += 1
+      }
+      hi = rune_at(pat, i)
+      i += rune_size(pat, i)
+    }
+    hit = true if lo <= r && r <= hi
+  }
+  return 0 if hit == negate
+  e
+}
+
+def rune_size(s: Str, i: Int) -> Int {
+  c = s[i].to_i
+  n = 1
+  if c >= 0xF0 {
+    n = 4
+  } else if c >= 0xE0 {
+    n = 3
+  } else if c >= 0xC0 {
+    n = 2
+  }
+  n = 1 if i + n > s.size
+  n
+}
+
+def rune_at(s: Str, i: Int) -> Int {
+  n = rune_size(s, i)
+  c = s[i].to_i
+  return c if n == 1
+  r = c & (0x7F >> n)
+  k = 1
+  while k < n {
+    r = (r << 6) | (s[i + k].to_i & 0x3F)
+    k += 1
+  }
+  r
+}

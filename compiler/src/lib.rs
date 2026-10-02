@@ -7,6 +7,7 @@ pub mod cgen;
 pub mod check;
 pub mod consts;
 pub mod diag;
+pub mod fmt;
 pub mod front;
 pub mod lexer;
 pub mod lir;

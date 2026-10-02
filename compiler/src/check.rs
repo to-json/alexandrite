@@ -1154,6 +1154,10 @@ struct FnCx<'w, 'a> {
     /// Inside a `lock` block: `self.loops`' length outside it (leaving the
     /// block early would keep the lock held).
     lock_floor: Option<usize>,
+    /// The `!`-call cells of the function being checked, made empty on
+    /// entry (None inside lambdas, task and generator bodies, which become
+    /// functions of their own).
+    cells: Option<Vec<(LocalId, Ty)>>,
     /// Lambda literals checked so far: (block span start, fn type, captures).
     lambdas: Vec<(u32, Ty, Vec<LocalId>)>,
     /// The type the expression being checked is wanted as (for inferring
@@ -1218,6 +1222,7 @@ impl<'w, 'a> FnCx<'w, 'a> {
             usings: def.map_or_else(Vec::new, |d| d.using.iter().map(|u| (0, resolve_name(u, Span::default(), &|_| true).unwrap_or_else(|_| u.clone()))).collect()),
             in_lambda: false,
             lock_floor: None,
+            cells: None,
             lambdas: vec![],
             method: def.filter(|d| d.params.first().is_some_and(|p| p.name == "self")).map(|d| d.name.ends_with('!')),
             block_unused: false,
@@ -1353,7 +1358,24 @@ impl<'w, 'a> FnCx<'w, 'a> {
         // Only a declared return type makes the last expression a value
         // that must exist; otherwise a trailing `case`/`if` whose arms
         // disagree is a statement, and the function returns nothing.
-        let (mut stmts, tail_ty) = self.body_as(body, def.is_some_and(|d| d.ret.is_some()))?;
+        self.cells = Some(vec![]);
+        let r = self.body_as(body, def.is_some_and(|d| d.ret.is_some()));
+        let cells = self.cells.take().unwrap_or_default();
+        let (mut stmts, tail_ty) = r?;
+        // The cells exist from the start, in the frame (a cell made inside a
+        // loop would die with the iteration it was made in).
+        if !cells.is_empty() {
+            let mut init: Vec<TStmt> = cells
+                .into_iter()
+                .map(|(c, t)| {
+                    let sp = def.map_or(Span::default(), |d| d.span);
+                    let empty = self.mk(TK::Array(vec![]), t.clone(), sp);
+                    TStmt::Expr(self.mk(TK::Assign(c, Box::new(empty)), t, sp))
+                })
+                .collect();
+            init.append(&mut stmts);
+            stmts = init;
+        }
         if !self.is_main {
             let sp = def.map_or(Span::default(), |d| d.span);
             // The value of the last statement is the return value.
@@ -2869,6 +2891,7 @@ impl<'w, 'a> FnCx<'w, 'a> {
         };
         let saved_lambda = std::mem::replace(&mut self.in_lambda, true);
         let saved_lock = self.lock_floor.take();
+        let saved_cells = self.cells.take();
         let saved_ret = std::mem::replace(&mut self.ret, rvar.clone());
         let saved_main = std::mem::replace(&mut self.is_main, false);
         let saved = self.want_hint.take();
@@ -2894,6 +2917,7 @@ impl<'w, 'a> FnCx<'w, 'a> {
         self.is_main = saved_main;
         self.in_lambda = saved_lambda;
         self.lock_floor = saved_lock;
+        self.cells = saved_cells;
         let (mut tb, bt) = r?;
         if ret.is_none() && hint.is_none() && !matches!(self.resolve(&bt), Ty::Never) && !self.unify(&rvar, &bt) {
             return Err(Diag::new(sp, format!("this lambda returns {} and {}", self.resolve(&rvar).show(), self.resolve(&bt).show())));
@@ -3013,6 +3037,7 @@ impl<'w, 'a> FnCx<'w, 'a> {
         let saved_main = std::mem::replace(&mut self.is_main, false);
         let saved_lambda = std::mem::replace(&mut self.in_lambda, false);
         let saved_lock = self.lock_floor.take();
+        let saved_cells = self.cells.take();
         let saved_loops = std::mem::take(&mut self.loops);
         let rvar = self.fresh();
         let saved_ret = std::mem::replace(&mut self.ret, rvar.clone());
@@ -3024,6 +3049,7 @@ impl<'w, 'a> FnCx<'w, 'a> {
         self.loops = saved_loops;
         self.in_lambda = saved_lambda;
         self.lock_floor = saved_lock;
+        self.cells = saved_cells;
         self.is_main = saved_main;
         self.fallible_decl = saved_fallible;
         let body_errs = std::mem::replace(&mut self.errs, saved_errs);
@@ -3220,8 +3246,7 @@ impl<'w, 'a> FnCx<'w, 'a> {
             if matches!(recv.kind, ExprKind::Name(_) | ExprKind::Index(..) | ExprKind::Call { .. }) { d } else { Diag::new(recv.span, format!("`{name}` changes its receiver; call it on a variable")) }
         })?;
         let cur = self.place_read(id, &steps, &pty, recv.span);
-        let arr = self.mk(TK::Array(vec![cur]), Ty::arr(pty.clone()), recv.span);
-        let (tid, s1) = self.opt_tmp(arr, recv.span);
+        let (tid, s1) = self.call_cell(cur, &pty, recv.span);
         let mut targs = vec![self.mk(TK::Local(tid), Ty::arr(pty.clone()), recv.span)];
         for a in args {
             targs.push(self.value(a)?);
@@ -3250,13 +3275,37 @@ impl<'w, 'a> FnCx<'w, 'a> {
         Ok(self.mk(TK::Seq(vec![s1, s2, TStmt::Expr(wb), TStmt::Expr(r)]), rty, sp))
     }
 
+    /// The one-element slice a `!` call gets its receiver in: one per call
+    /// site, made on first use and reused after (a loop allocates it once).
+    fn call_cell(&mut self, cur: TExpr, pty: &Ty, sp: Span) -> (LocalId, TStmt) {
+        let n = self.locals.len();
+        let at = Ty::arr(pty.clone());
+        if self.cells.is_none() {
+            // A lambda or task body: a fresh cell per call.
+            let arr = self.mk(TK::Array(vec![cur]), at, sp);
+            return self.opt_tmp(arr, sp);
+        }
+        let cell = self.declare(&format!("__cell{n}"), at.clone());
+        let l = |ck: &mut Self| ck.mk(TK::Local(cell), at.clone(), sp);
+        let size = { let c = l(self); self.mk(TK::M(M::Size, Some(Box::new(c)), vec![], None), Ty::Int, sp) };
+        let zero = self.mk(TK::Int(0), Ty::Int, sp);
+        let fresh = self.mk(TK::Bin(BinOp::Eq, Box::new(size), Box::new(zero)), Ty::Bool, sp);
+        self.cells.as_mut().unwrap().push((cell, at.clone()));
+        self.locals[cell].mutated = true;
+        self.locals[cell].pushed = true;
+        let c = l(self);
+        let make = self.mk(TK::M(M::Push, Some(Box::new(c)), vec![cur.clone()], None), Ty::Unit, sp);
+        let z = self.mk(TK::Int(0), Ty::Int, sp);
+        let reuse = self.mk(TK::IndexAssign(cell, Box::new(z), Box::new(cur)), pty.clone(), sp);
+        (cell, TStmt::If(fresh, vec![TStmt::Expr(make)], vec![TStmt::Expr(reuse)]))
+    }
+
     /// `w.m!(args)` where `w` is an interface value in a place: dispatch on
     /// a one-element slice holding the value, then write it back.
     fn mutating_iface_call(&mut self, recv: &Expr, iname: &str, k: usize, m: &IfaceMethod, args: &[Expr], sp: Span) -> R<TExpr> {
         let (id, steps, pty) = self.place(recv)?;
         let cur = self.place_read(id, &steps, &pty, recv.span);
-        let arr = self.mk(TK::Array(vec![cur]), Ty::arr(pty.clone()), recv.span);
-        let (tid, s1) = self.opt_tmp(arr, recv.span);
+        let (tid, s1) = self.call_cell(cur, &pty, recv.span);
         if args.len() != m.params.len() {
             return Err(Diag::new(sp, format!("`{iname}.{}` takes {} argument(s), got {}", m.name, m.params.len(), args.len())));
         }
@@ -4425,7 +4474,10 @@ impl<'w, 'a> FnCx<'w, 'a> {
                 };
                 self.loops.push(LoopKind::Gen);
                 let saved = std::mem::replace(&mut self.impure, false);
-                let (body, _) = self.body_as(&b.body, false)?;
+                let saved_cells = self.cells.take();
+                let r = self.body_as(&b.body, false);
+                self.cells = saved_cells;
+                let (body, _) = r?;
                 let pure = !self.impure;
                 self.impure = saved || self.impure;
                 self.loops.pop();

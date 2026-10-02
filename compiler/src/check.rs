@@ -1412,6 +1412,30 @@ impl<'w, 'a> FnCx<'w, 'a> {
     fn stmt(&mut self, s: &Stmt) -> R<TStmt> {
         Ok(match &s.kind {
             StmtKind::Expr(e) => TStmt::Expr(self.expr(e)?),
+            StmtKind::PlaceMultiAssign(targets, values) => {
+                if targets.len() != values.len() {
+                    return Err(Diag::new(s.span, format!("{} places but {} values", targets.len(), values.len())));
+                }
+                // Every value first (into hidden locals), then the stores.
+                let mut out = vec![];
+                let mut tmps = vec![];
+                for v in values {
+                    let tv = self.value(v)?;
+                    let n = self.locals.len();
+                    let name = format!("__multi{n}");
+                    let id = self.declare(&name, tv.ty.clone());
+                    out.push(TStmt::Expr(self.mk(TK::Assign(id, Box::new(tv.clone())), tv.ty.clone(), v.span)));
+                    tmps.push(name);
+                }
+                for (t, name) in targets.iter().zip(&tmps) {
+                    let rhs = Expr { id: NodeId::MAX, kind: ExprKind::Name(name.clone()), span: t.span };
+                    let asg = Expr { id: NodeId::MAX, kind: ExprKind::Assign(Box::new(t.clone()), Box::new(rhs)), span: t.span };
+                    let e = self.expr(&asg)?;
+                    out.push(TStmt::Expr(e));
+                }
+                out.push(TStmt::Expr(self.mk(TK::Unit, Ty::Unit, s.span)));
+                TStmt::Expr(self.mk(TK::Seq(out), Ty::Unit, s.span))
+            }
             StmtKind::MultiAssign(targets, values) => {
                 // `a, b = pair`: take a tuple apart.
                 if values.len() == 1 && targets.len() > 1 {

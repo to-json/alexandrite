@@ -835,7 +835,30 @@ impl<'a> Parser<'a> {
                 }
                 StmtKind::MultiAssign(targets, values)
             }
-            _ => StmtKind::Expr(self.expr()?),
+            _ => {
+                // `a[i], a[j] = a[j], a[i]`: places on the left.
+                let at = self.pos;
+                let first = self.ternary()?;
+                if self.is_op(",") && is_place(&first) {
+                    let mut targets = vec![first];
+                    while self.eat_op(",") {
+                        let t = self.ternary()?;
+                        if !is_place(&t) {
+                            return Err(Diag::new(t.span, "cannot assign to this expression"));
+                        }
+                        targets.push(t);
+                    }
+                    self.expect_op("=")?;
+                    let mut values = vec![self.expr()?];
+                    while self.eat_op(",") {
+                        values.push(self.expr()?);
+                    }
+                    StmtKind::PlaceMultiAssign(targets, values)
+                } else {
+                    self.pos = at;
+                    StmtKind::Expr(self.expr()?)
+                }
+            }
         };
         let mut s = Stmt { kind, span: start.to(self.prev_span()) };
         // Modifiers: `stmt if cond`, `stmt unless cond`.

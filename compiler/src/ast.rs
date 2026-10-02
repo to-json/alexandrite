@@ -301,6 +301,8 @@ pub enum StmtKind {
     Expr(Expr),
     /// `a, b = x, y` (also the single-target case when written with commas).
     MultiAssign(Vec<(String, Span)>, Vec<Expr>),
+    /// `a[i], a[j] = a[j], a[i]`: several places, every value read first.
+    PlaceMultiAssign(Vec<Expr>, Vec<Expr>),
     /// `x: T = e`
     Decl(String, Span, TypeExpr, Expr),
     While(Expr, Vec<Stmt>),

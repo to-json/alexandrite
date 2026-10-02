@@ -1312,7 +1312,10 @@ impl<'w, 'a> FnCx<'w, 'a> {
                 None => self.fresh(),
             };
         }
-        let (mut stmts, tail_ty) = self.body_as(body, !self.is_main)?;
+        // Only a declared return type makes the last expression a value
+        // that must exist; otherwise a trailing `case`/`if` whose arms
+        // disagree is a statement, and the function returns nothing.
+        let (mut stmts, tail_ty) = self.body_as(body, def.is_some_and(|d| d.ret.is_some()))?;
         if !self.is_main {
             let sp = def.map_or(Span::default(), |d| d.span);
             // The value of the last statement is the return value.
@@ -1533,9 +1536,10 @@ impl<'w, 'a> FnCx<'w, 'a> {
         self.body_as(stmts, true)
     }
 
-    /// `used`: whether the last statement's value is the block's value
-    /// (otherwise it is discarded, like every earlier statement's). A `case`
-    /// or `if` whose value is discarded may have arms of different types.
+    /// `used`: whether the last statement's value is required (otherwise it
+    /// may be discarded, like every earlier statement's). A `case` or `if`
+    /// whose value may be discarded can have arms of different types; it
+    /// then has no value.
     fn body_as(&mut self, stmts: &[Stmt], used: bool) -> R<(Vec<TStmt>, Ty)> {
         let mut out = vec![];
         let mut last = Ty::Unit;
@@ -2430,8 +2434,8 @@ impl<'w, 'a> FnCx<'w, 'a> {
     }
 
     /// `case`: lowered to a chain of conditionals over a temporary.
-    /// `used`: the case's value is wanted. If not (a statement), its arms
-    /// may be of different types, as an `if` statement's branches may.
+    /// `used`: the case's value is required. If not (a statement), its arms
+    /// may be of different types (it then has no value), as an `if`'s may.
     fn case(&mut self, subject: Option<&Expr>, arms: &[CaseArm], sp: Span, used: bool) -> R<TExpr> {
         let mut pre = vec![];
         let subj = match subject {
@@ -2597,8 +2601,7 @@ impl<'w, 'a> FnCx<'w, 'a> {
             }
         }
         // Without `_` nothing may match: the arms are statements and the case has no value.
-        // Unused, it has none either.
-        let has_default = default.is_some() && used;
+        let mut has_default = default.is_some();
         let unitize = |cx: &mut Self, b: TExpr| -> TExpr {
             let span = b.span;
             let TK::Seq(mut ss) = b.kind else { unreachable!() };
@@ -2621,17 +2624,25 @@ impl<'w, 'a> FnCx<'w, 'a> {
                 default = Some(lift(self, default.unwrap())?);
             }
         }
+        // Arms that disagree: an error if the value is wanted, else a statement (no value).
+        if let Some(d) = default.as_ref().filter(|_| has_default) {
+            let ty = d.ty.clone();
+            for (_, b) in &conds {
+                if !self.unify(&b.ty, &ty) {
+                    if used {
+                        return Err(Diag::new(b.span, format!("this arm is {}, but the others are {}", self.resolve(&b.ty).show(), self.resolve(&ty).show())));
+                    }
+                    has_default = false;
+                    break;
+                }
+            }
+        }
         let mut acc = match default {
             Some(d) if has_default => d,
             Some(d) => unitize(self, d),
             None => self.mk(TK::Unit, Ty::Unit, sp),
         };
         let ty = acc.ty.clone();
-        for (_, b) in &conds {
-            if has_default && !self.unify(&b.ty, &ty) {
-                return Err(Diag::new(b.span, format!("this arm is {}, but the others are {}", self.resolve(&b.ty).show(), self.resolve(&ty).show())));
-            }
-        }
         for (c, b) in conds.into_iter().rev() {
             let b = if has_default { b } else { unitize(self, b) };
             let s = c.span.to(b.span);
@@ -3324,8 +3335,8 @@ impl<'w, 'a> FnCx<'w, 'a> {
     }
 
     /// `if` as a value: the branches' values if they agree, else nil.
-    /// `used`: the value is wanted, so the branches must agree; otherwise
-    /// (a statement) they may differ and the `if` has no value.
+    /// `used`: the value is required, so the branches must agree; otherwise
+    /// (a statement) they may differ and the `if` then has no value.
     fn if_value(&mut self, c: &Expr, a: &[Stmt], b: &[Stmt], sp: Span, used: bool) -> R<TExpr> {
         let (c, ta) = match self.opt_let(c)? {
             Some((cond, name, tmp, ty)) => {
@@ -3348,7 +3359,7 @@ impl<'w, 'a> FnCx<'w, 'a> {
         let tb = self.seq_body(b, sp, used)?;
         let (ta, tb) = self.join(ta, tb)?;
         let (ra, rb) = (self.resolve(&ta.ty), self.resolve(&tb.ty));
-        let (ta, tb, ty) = if used && !b.is_empty() && self.unify(&ra, &rb) {
+        let (ta, tb, ty) = if !b.is_empty() && self.unify(&ra, &rb) {
             let ty = if matches!(ra, Ty::Never) { rb } else { ra };
             (ta, tb, ty)
         } else if used && !b.is_empty() {

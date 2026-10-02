@@ -3975,7 +3975,12 @@ impl<'w, 'a> FnCx<'w, 'a> {
                     _ => vec![],
                 };
                 let is_field = args.is_empty() && block.is_none() && fs.iter().any(|(f, _)| f == name);
-                if is_field || self.w.by_name.contains_key(&method_name(sn, name)) || self.w.default_for(sn, name).is_some() {
+                // A method of `self` wins, unless only a function of that
+                // name outside the struct takes these arguments.
+                let own_fits = self.w.by_name.get(&method_name(sn, name)).is_some_and(|&d| self.w.defs[d].def.params.len() == args.len() + 1 || block.is_some());
+                let outer_fits = resolve_name(name, name_span, &|q| self.w.by_name.contains_key(q)).ok().and_then(|q| self.w.by_name.get(&q).copied()).is_some_and(|d| self.w.defs[d].def.params.len() == args.len());
+                let own = self.w.by_name.contains_key(&method_name(sn, name)) && (own_fits || !outer_fits);
+                if is_field || own || self.w.default_for(sn, name).is_some() {
                     let me = Expr { kind: ExprKind::Name("self".into()), span: name_span, id: NodeId::MAX };
                     return self.call(Some(&me), name, name_span, args, block, bsym, sp);
                 }

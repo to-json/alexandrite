@@ -225,8 +225,10 @@ typedef struct AlxChan AlxChan;
 /* A case of alx_select. `buf` holds the value to send / receives the value.
  * `ok` is written only on the chosen recv case (the caller presets it). */
 typedef struct { AlxChan *ch; void *buf; int64_t is_send; int64_t ok; } AlxSelCase;
-/* Run `fn(copy of env, result)` on a new thread. A panic in the task is
- * caught: see alx_task_wait. */
+/* Run `fn(copy of env, result)` as a task: a coroutine on one of N worker
+ * threads (ALX_PROCS, default the CPU count), 256 KiB of stack (ALX_TASK_STACK).
+ * Blocking channel/wait calls park it. A panic in the task is caught: see
+ * alx_task_wait. */
 AlxTask *alx_spawn(AlxWorker fn, const void *env, size_t in_size, size_t out_size);
 /* Block until the task is done. True: result copied to `out`. False: the task
  * panicked; `*msg` is its message (`out` untouched). Repeatable. */

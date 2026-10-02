@@ -1,12 +1,15 @@
 /* SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception */
-/* Runtime test for tasks and channels.
+/* Runtime test for tasks (coroutines on worker threads) and channels.
  * Run (from compiler/runtime):
  *   clang -O1 -g -pthread -I. -Ilibtommath -o /tmp/tasks_test tests/tasks_test.c alx.c alx_big.c -lm && /tmp/tasks_test
  * (add -fsanitize=address or -fsanitize=thread to taste). Exits 0 on success.
- * The deadlock case aborts the process by design, so it only runs with
- * `tasks_test deadlock` (expect "all tasks are asleep: deadlock"). */
+ * Also run it with ALX_PROCS=1 (every task on one worker).
+ * The deadlock and overflow cases abort the process by design, so they only run
+ * with `tasks_test deadlock` (expect "all tasks are asleep: deadlock") and
+ * `tasks_test overflow` (expect "stack overflow in a task"). */
 #include "../alx.h"
 
+#include <time.h>
 #include <unistd.h>
 
 #include <assert.h>
@@ -64,6 +67,55 @@ static void sel_sender(const void *in, void *out) {
     (void)out;
     CHECK(alx_select(cs, 1, false, "select") == 0);
 }
+
+/* Daisy chain: task i receives from ch[i], adds 1, sends to ch[i+1]. */
+typedef struct { AlxChan *in, *out; } Link;
+static void link_task(const void *in, void *out) {
+    Link l = *(const Link *)in;
+    int64_t v;
+    (void)out;
+    CHECK(alx_chan_recv(l.in, &v));
+    v++;
+    alx_chan_send(l.out, &v, "chain");
+}
+
+/* Tasks that enter a region, allocate, park, and check everything on resume. */
+typedef struct { AlxChan *go, *done; int64_t id; } Rg;
+static void region_task(const void *in, void *out) {
+    Rg g = *(const Rg *)in;
+    AlxRegion *prog = alx_region_cur();   /* the worker's program region */
+    char *pa = alx_alloc(100); memset(pa, (int)g.id, 100);
+    AlxRegion *saved = alx_region_cur(), *r = alx_region_enter();
+    char *a = alx_alloc(5000); memset(a, (int)g.id + 1, 5000);
+    char *big = alx_alloc(3u << 20); memset(big, (int)g.id + 2, 3u << 20);   /* large block */
+    AlxRegion *child = alx_region_new_child(r);
+    int64_t v;
+    (void)out;
+    CHECK(alx_chan_recv(g.go, &v));                       /* parks; other tasks run here */
+    CHECK(alx_region_cur() == r && alx_region_of(a) == r && alx_region_of(big) == r);
+    for (int i = 0; i < 5000; i++) CHECK(a[i] == (char)(g.id + 1));
+    CHECK(big[0] == (char)(g.id + 2) && big[(3u << 20) - 1] == (char)(g.id + 2));
+    char *b = alx_alloc(70000); memset(b, (int)g.id + 3, 70000);  /* new chunk in r */
+    AlxRegion *sv = alx_region_use(child);
+    char *c = alx_alloc(64); memset(c, 9, 64);
+    alx_chan_send(g.done, &v, "x");                       /* park again, child current */
+    CHECK(alx_region_cur() == child && c[63] == 9);
+    alx_region_set(sv);
+    for (int i = 0; i < 5000; i++) CHECK(a[i] == (char)(g.id + 1));
+    for (int i = 0; i < 70000; i++) CHECK(b[i] == (char)(g.id + 3));
+    alx_region_exit(r, saved);
+    CHECK(alx_region_cur() == prog);
+    for (int i = 0; i < 100; i++) CHECK(pa[i] == (char)g.id);
+}
+
+static int64_t g_depth;
+static int64_t recurse(int64_t n) {
+    volatile char pad[512];
+    pad[0] = (char)n;
+    g_depth = n;
+    return n < 0 ? 0 : recurse(n + 1) + pad[0];
+}
+static void overflower_stack(const void *in, void *out) { (void)in; (void)out; recurse(0); }
 
 int main(int argc, char **argv) {
     alx_init();
@@ -187,6 +239,43 @@ int main(int argc, char **argv) {
         int64_t r;
         CHECK(!alx_task_wait(t, &r, &msg));
         CHECK(strstr(msg.ptr, "send on a closed channel") != NULL);
+    }
+    /* region state follows each task across parks (tasks interleave on workers) */
+    {
+        enum { N = 24 };
+        AlxChan *go = alx_chan_new(0, sizeof(int64_t)), *done = alx_chan_new(0, sizeof(int64_t));
+        AlxTask *ts[N];
+        for (int i = 0; i < N; i++) { Rg g = { go, done, i + 1 }; ts[i] = alx_spawn(region_task, &g, sizeof g, 1); }
+        for (int i = 0; i < N; i++) { v = i; alx_chan_send(go, &v, "x"); }
+        for (int i = 0; i < N; i++) CHECK(alx_chan_recv(done, &v));
+        for (int i = 0; i < N; i++) { AlxStr msg; char o; CHECK(alx_task_wait(ts[i], &o, &msg)); }
+    }
+    /* daisy chain of 100000 tasks */
+    {
+#if defined(__SANITIZE_THREAD__) || (defined(__has_feature) && __has_feature(thread_sanitizer))
+        enum { N = 5000 };   /* TSan fibers are slow to create */
+#else
+        enum { N = 100000 };
+#endif
+        struct timespec t0, t1;
+        clock_gettime(CLOCK_MONOTONIC, &t0);
+        AlxChan **chs = malloc((N + 1) * sizeof *chs);
+        AlxTask **ts = malloc(N * sizeof *ts);
+        for (int i = 0; i <= N; i++) chs[i] = alx_chan_new(0, sizeof(int64_t));
+        for (int i = 0; i < N; i++) { Link l = { chs[i], chs[i + 1] }; ts[i] = alx_spawn(link_task, &l, sizeof l, 1); }
+        v = 0;
+        alx_chan_send(chs[0], &v, "chain");
+        int64_t r = -1;
+        CHECK(alx_chan_recv(chs[N], &r) && r == N);
+        for (int i = 0; i < N; i++) { AlxStr msg; char o; CHECK(alx_task_wait(ts[i], &o, &msg)); }
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        fprintf(stderr, "chain of %d: %.0f ms\n", N, (double)(t1.tv_sec - t0.tv_sec) * 1e3 + (double)(t1.tv_nsec - t0.tv_nsec) / 1e6);
+    }
+    if (argc > 1 && !strcmp(argv[1], "overflow")) {
+        AlxTask *t = alx_spawn(overflower_stack, NULL, 0, 1);
+        AlxStr msg;
+        char o;
+        alx_task_wait(t, &o, &msg);
     }
     if (argc > 1 && !strcmp(argv[1], "deadlock")) {
         AlxChan *c = alx_chan_new(0, sizeof(int64_t));

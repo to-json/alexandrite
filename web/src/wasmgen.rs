@@ -126,6 +126,7 @@ struct Lay {
 fn lay(t: &LTy) -> Lay {
     let words = |n: u32| Lay { size: 8 * n, align: 8, fields: (0..n).map(|i| (8 * i, F::Wd)).collect() };
     match t {
+        LTy::Region => words(1),
         LTy::Task(_) | LTy::Chan(_) => words(1),
         LTy::I64 | LTy::Gen(_) => words(1),
         LTy::F64 => Lay { size: 8, align: 8, fields: vec![(0, F::Fl)] },
@@ -698,6 +699,7 @@ impl<'c, 'p> Fx<'c, 'p> {
 
     fn stmt(&mut self, s: &LS) {
         match s {
+            LS::RegionEnter { .. } | LS::RegionExit { .. } | LS::RegionUse { .. } | LS::RegionRestore(_) => {}
             LS::Spawn { .. } | LS::Wait { .. } | LS::ChanSend { .. } | LS::ChanRecv { .. } | LS::ChanClose { .. } | LS::Select { .. } => unreachable!("rejected by uses_concurrency"),
             LS::Set(v, e) => {
                 self.e(e);
@@ -1078,6 +1080,7 @@ impl<'c, 'p> Fx<'c, 'p> {
 
     fn ty(&self, e: &LE) -> LTy {
         match e {
+            LE::RegionProgram => LTy::Region,
             LE::ChanNew(t, _) => LTy::Chan(Box::new(t.clone())),
             LE::ChanLen(_) => LTy::I64,
             LE::Var(v) => self.f.vars[*v].ty.clone(),
@@ -1138,6 +1141,8 @@ impl<'c, 'p> Fx<'c, 'p> {
         let t = self.ty(e);
         let out = vts(&t);
         match e {
+            // The browser never frees: regions are no-ops (handle 0).
+            LE::RegionProgram => self.i64c(0),
             LE::ChanNew(..) | LE::ChanLen(_) => unreachable!("rejected by uses_concurrency"),
             LE::Var(v) => {
                 let ls = self.vars[*v].clone();

@@ -27,6 +27,10 @@ pub enum LTy {
     /// A handle to a channel carrying values of this type (pointer-sized;
     /// copies refer to the same channel; safe to use from any task).
     Chan(Box<LTy>),
+    /// A memory region (pointer-sized handle). Every allocation the runtime
+    /// makes (arrays, strings, map storage, growth) goes into the thread's
+    /// *current* region. See `LS::RegionEnter` and friends.
+    Region,
 }
 
 impl LTy {
@@ -127,6 +131,8 @@ pub enum LE {
     ChanNew(LTy, Box<LE>),
     /// The number of values buffered in a channel right now (I64).
     ChanLen(Box<LE>),
+    /// This thread's program region (never freed; what everything used before regions).
+    RegionProgram,
 }
 
 /// A case of `LS::Select`.
@@ -254,6 +260,17 @@ pub enum LS {
     PanicStr(LE),
     /// Flush stdout and exit the process with this status (an I64).
     Exit(LE),
+    /// `saved` := the current region; `region` := a fresh empty region,
+    /// which becomes current. Should be cheap (reuse freed chunks).
+    RegionEnter { region: V, saved: V },
+    /// Free everything allocated in `region` (all of it at once), then make
+    /// `saved` current again. Nothing allocated in `region` is used after.
+    RegionExit { region: V, saved: V },
+    /// `saved` := the current region; `region` (any live region handle)
+    /// becomes current: allocations go there until `RegionRestore`.
+    RegionUse { region: LE, saved: V },
+    /// Make `saved` (from a `RegionUse`) current again.
+    RegionRestore(V),
     /// Start a task running `workers[worker]` on `env` (a value of the
     /// worker's `input` type, copied); `dst` (an `LTy::Task`) gets its handle.
     /// A panic inside the task ends only that task (see `Wait`); a panic on

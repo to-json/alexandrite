@@ -63,6 +63,7 @@ enum Mem {
 fn lay(t: &LTy) -> Lay {
     let words = |n: u32| Lay { size: 8 * n, align: 8, fields: (0..n).map(|i| (8 * i, I64)).collect(), mem: vec![Mem::Full; n as usize] };
     match t {
+        LTy::Region => words(1),
         LTy::Task(_) | LTy::Chan(_) => words(1),
         LTy::I64 | LTy::Gen(_) => words(1),
         LTy::F64 => Lay { size: 8, align: 8, fields: vec![(0, F64)], mem: vec![Mem::Full] },
@@ -549,6 +550,7 @@ impl Fx<'_, '_, '_> {
 
     fn stmt(&mut self, s: &LS) {
         match s {
+            LS::RegionEnter { .. } | LS::RegionExit { .. } | LS::RegionUse { .. } | LS::RegionRestore(_) => unimplemented!("R1: regions in the JIT"),
             LS::Spawn { dst, worker, env } => {
                 let (it, ot) = (self.d.worker_in[worker].clone(), self.d.worker_out[worker].clone());
                 let x = self.e(env);
@@ -897,6 +899,7 @@ impl Fx<'_, '_, '_> {
 
     fn ty(&self, e: &LE) -> LTy {
         match e {
+            LE::RegionProgram => LTy::Region,
             LE::ChanNew(t, _) => LTy::Chan(Box::new(t.clone())),
             LE::ChanLen(_) => LTy::I64,
             LE::Var(v) => self.f.vars[*v].ty.clone(),
@@ -1098,6 +1101,7 @@ impl Fx<'_, '_, '_> {
 
     fn e(&mut self, e: &LE) -> Vec<Value> {
         match e {
+            LE::RegionProgram => unimplemented!("R1: regions in the JIT"),
             LE::ChanNew(t, cap) => {
                 let c = self.e1(cap);
                 let esz = self.ic(lay(t).size as i64);

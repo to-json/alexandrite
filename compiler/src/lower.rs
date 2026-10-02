@@ -3134,6 +3134,7 @@ fn out_of_range(k: IntKind, r: LE) -> LE {
 /// The zero value of a LIR type, as an expression.
 fn zero_le(t: &LTy) -> LE {
     match t {
+        LTy::Region => LE::RegionProgram,
         // A fresh closed-over channel stands in for "no channel" (never observed).
         LTy::Chan(e) => LE::ChanNew((**e).clone(), Box::new(LE::I(0))),
         LTy::Task(_) => panic!("a task handle has no zero value"),

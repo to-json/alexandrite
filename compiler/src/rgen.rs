@@ -9,6 +9,7 @@ const PRELUDE: &str = include_str!("../runtime/prelude.rs");
 
 fn rty(t: &LTy) -> String {
     match t {
+        LTy::Region => "()".into(),
         LTy::Task(t) => format!("Task<{}>", rty(t)),
         LTy::Chan(t) => format!("Chan<{}>", rty(t)),
         // Every integer kind is an i64 here (bit pattern for U64): the
@@ -143,6 +144,8 @@ impl FnEmit<'_> {
 
     fn stmt(&mut self, s: &LS) {
         match s {
+            // Rust owns its memory: regions are meaningless here.
+            LS::RegionEnter { .. } | LS::RegionExit { .. } | LS::RegionUse { .. } | LS::RegionRestore(_) => {}
             LS::Spawn { dst, worker, env } => {
                 let x = self.e(env);
                 self.line(&format!("v{dst} = task_spawn(worker{worker}, {x});"));
@@ -326,6 +329,7 @@ impl FnEmit<'_> {
 
     fn e(&self, e: &LE) -> String {
         match e {
+            LE::RegionProgram => "()".into(),
             LE::ChanNew(t, cap) => format!("Chan::<{}>::new({})", rty(t), self.e(cap)),
             LE::ChanLen(c) => format!("({}).len()", self.e(c)),
             LE::Var(v) => self.var(*v),

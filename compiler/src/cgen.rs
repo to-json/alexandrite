@@ -6,6 +6,7 @@ use std::fmt::Write;
 
 pub fn ty_name(t: &LTy) -> String {
     match t {
+        LTy::Region => unimplemented!("R1: regions in C"),
         LTy::Task(t) => format!("Task_{}", ty_name(t)),
         LTy::Chan(t) => format!("Chan_{}", ty_name(t)),
         LTy::I64 => "I64".into(),
@@ -24,6 +25,7 @@ pub fn ty_name(t: &LTy) -> String {
 
 pub fn cty(t: &LTy) -> String {
     match t {
+        LTy::Region => unimplemented!("R1: regions in C"),
         LTy::Task(_) => "AlxTask *".into(),
         LTy::Chan(_) => "AlxChan *".into(),
         LTy::I64 | LTy::IntK(_) => "int64_t".into(),
@@ -317,6 +319,7 @@ impl FnEmit<'_> {
 
     fn stmt(&mut self, s: &LS) {
         match s {
+            LS::RegionEnter { .. } | LS::RegionExit { .. } | LS::RegionUse { .. } | LS::RegionRestore(_) => unimplemented!("R1: regions in C"),
             LS::Spawn { dst, worker, env } => {
                 let w = &self.p.workers[*worker];
                 let (it, ot) = (cty_mem(&w.input), cty_mem(&w.func.ret));
@@ -532,6 +535,7 @@ impl FnEmit<'_> {
 
     fn e(&self, e: &LE) -> String {
         match e {
+            LE::RegionProgram => unimplemented!("R1: regions in C"),
             LE::ChanNew(t, cap) => format!("alx_chan_new({}, sizeof({}))", self.e(cap), cty_mem(t)),
             LE::ChanLen(c) => format!("alx_chan_len({})", self.e(c)),
             LE::Var(v) => self.v(*v),

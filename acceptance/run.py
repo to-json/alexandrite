@@ -80,6 +80,7 @@ GROUPS = {
     "regions": "R1",
     "closures": "R4",
     "writers": "R4",
+    "pools": "R4",
     "asserts": "M8",
 }
 

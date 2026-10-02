@@ -194,7 +194,7 @@ impl<'a> Graph<'a> {
                     }
                     // Mutations of the receiver: what's stored (and any growth)
                     // lives as long as the receiver.
-                    M::Push | M::MapSet | M::MapDel | M::CopyInto => {
+                    M::Push | M::MapSet | M::MapDel | M::CopyInto | M::PoolAdd | M::PoolSet => {
                         let mut stored = avs.clone();
                         stored.push(site(e));
                         self.flow(&stored, &rv);

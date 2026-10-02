@@ -228,6 +228,7 @@ impl<'a> World<'a> {
         for d in enums.iter().filter(|d| !d.tparams.is_empty()) {
             GENERICS.with(|g| g.borrow_mut().insert(d.name.clone(), GenDef::E(d.clone())));
         }
+        DECLARED.with(|d| d.borrow_mut().extend(defs.iter().map(|x| x.name.clone()).chain(enums.iter().map(|x| x.name.clone()))));
         let defs: Vec<&StructDef> = defs.iter().filter(|d| d.tparams.is_empty()).collect();
         let enums: Vec<&EnumDef> = enums.iter().filter(|d| d.tparams.is_empty()).collect();
         let all = defs.iter().copied().map(|d| (d.name.as_str(), d.span, Def::S(d))).chain(enums.iter().copied().map(|d| (d.name.as_str(), d.span, Def::E(d))));
@@ -720,7 +721,7 @@ pub fn cname(s: &str) -> String {
 /// Values `puts` and interpolation can show.
 pub fn printable(t: &Ty) -> bool {
     match t {
-        Ty::Int | Ty::IntK(_) | Ty::Float | Ty::Str | Ty::Bool | Ty::Var(_) | Ty::Iface(_) | Ty::Error => true,
+        Ty::Int | Ty::IntK(_) | Ty::Float | Ty::Str | Ty::Bool | Ty::Var(_) | Ty::Iface(_) | Ty::Error | Ty::Handle(_) => true,
         Ty::Opt(t) | Ty::Array(t) | Ty::Fixed(t, _) => printable(t),
         Ty::Map(k, v) => printable(k) && printable(v),
         Ty::Struct(_, fs) => fs.iter().all(|(_, t)| printable(t)),
@@ -738,6 +739,8 @@ fn type_names(t: &TypeExpr, out: &mut Vec<String>) {
         TypeExpr::Named(n, _) => out.push(n.clone()),
         TypeExpr::Array(t, _) | TypeExpr::Opt(t, _) | TypeExpr::Fixed(t, _, _) => type_names(t, out),
         TypeExpr::App(_, ts, _) => ts.iter().for_each(|t| type_names(t, out)),
+        // A handle names its type without containing it.
+        TypeExpr::Handle(..) => {}
         TypeExpr::Fn(ps, r, _) => {
             ps.iter().for_each(|t| type_names(t, out));
             type_names(r, out);
@@ -768,6 +771,8 @@ thread_local! {
     /// Generic instances: `Stack[Int]` → (`Stack`, [Int]).
     pub static INSTS: std::cell::RefCell<HashMap<String, (String, Vec<Ty>)>> = std::cell::RefCell::new(HashMap::new());
     static DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Every struct and enum name (for `@T` handles to types not resolved yet).
+    pub static DECLARED: std::cell::RefCell<std::collections::HashSet<String>> = std::cell::RefCell::new(Default::default());
 }
 
 pub fn generic(n: &str) -> Option<GenDef> {
@@ -877,6 +882,13 @@ pub fn type_from(t: &TypeExpr, structs: &Structs, consts: &Consts) -> R<Ty> {
         },
         TypeExpr::Array(t, _) => Ok(Ty::arr(type_from(t)?)),
         TypeExpr::Result(t, _, _) => Ok(Ty::Result(Box::new(type_from(t)?))),
+        TypeExpr::Handle(n, sp) => {
+            let q = resolve_name(n, *sp, &|q| structs.contains_key(q) || generic(q).is_some() || DECLARED.with(|d| d.borrow().contains(q)))?;
+            if !(structs.contains_key(&q) || DECLARED.with(|d| d.borrow().contains(&q))) {
+                return Err(Diag::new(*sp, format!("unknown type `{n}`")));
+            }
+            Ok(Ty::Handle(q))
+        }
         TypeExpr::Fn(ps, r, _) => Ok(Ty::Fn(ps.iter().map(type_from).collect::<R<Vec<_>>>()?, Box::new(type_from(r)?))),
         TypeExpr::Opt(t, _) => Ok(Ty::Opt(Box::new(type_from(t)?))),
         TypeExpr::App(n, args, sp) => match (n.as_str(), args.as_slice()) {
@@ -889,6 +901,7 @@ pub fn type_from(t: &TypeExpr, structs: &Structs, consts: &Consts) -> R<Ty> {
             }
             ("Map", _) => Err(Diag::new(*sp, "`Map` takes two types: `Map[K, V]`")),
             ("Chan", [t]) => Ok(Ty::Chan(Box::new(type_from(t)?))),
+            ("Pool", [t]) => Ok(Ty::Pool(Box::new(type_from(t)?))),
             ("Task", [t]) => Ok(Ty::Task(Box::new(type_from(t)?))),
             (g, _) if generic(&resolve_name(g, *sp, &|q| generic(q).is_some())?).is_some() => {
                 let g = resolve_name(g, *sp, &|q| generic(q).is_some())?;
@@ -1046,6 +1059,7 @@ impl<'w, 'a> FnCx<'w, 'a> {
             Ty::Fn(ps, r) => Ty::Fn(ps.iter().map(|t| self.resolve(t)).collect(), Box::new(self.resolve(r))),
             Ty::Result(t) => Ty::Result(Box::new(self.resolve(t))),
             Ty::Task(t) => Ty::Task(Box::new(self.resolve(t))),
+            Ty::Pool(t) => Ty::Pool(Box::new(self.resolve(t))),
             Ty::Chan(t) => Ty::Chan(Box::new(self.resolve(t))),
             Ty::Seq(t, l) => Ty::seq(self.resolve(t), *l),
             Ty::Gen(t) => Ty::Gen(Box::new(self.resolve(t))),
@@ -1072,7 +1086,7 @@ impl<'w, 'a> FnCx<'w, 'a> {
             (Ty::Seq(x, _), Ty::Seq(y, _)) => self.unify(x, y),
             (Ty::Fixed(x, n), Ty::Fixed(y, m)) if n == m => self.unify(x, y),
             (Ty::Map(k1, v1), Ty::Map(k2, v2)) => self.unify(k1, k2) && self.unify(v1, v2),
-            (Ty::Result(x), Ty::Result(y)) | (Ty::Task(x), Ty::Task(y)) | (Ty::Chan(x), Ty::Chan(y)) => self.unify(x, y),
+            (Ty::Result(x), Ty::Result(y)) | (Ty::Task(x), Ty::Task(y)) | (Ty::Chan(x), Ty::Chan(y)) | (Ty::Pool(x), Ty::Pool(y)) => self.unify(x, y),
             (Ty::Fn(p1, r1), Ty::Fn(p2, r2)) if p1.len() == p2.len() => {
                 let pairs: Vec<_> = p1.iter().cloned().zip(p2.iter().cloned()).collect();
                 pairs.iter().all(|(x, y)| self.unify(x, y)) && self.unify(r1, r2)
@@ -1567,6 +1581,12 @@ impl<'w, 'a> FnCx<'w, 'a> {
                         return self.call_def(def, "[]", sp, vec![a, k], sp);
                     }
                 }
+                if let Ty::Pool(t) = &at {
+                    let h = self.value(i)?;
+                    let want = Ty::Handle(t.show());
+                    self.expect(&h.ty, &want, h.span, "pool handle")?;
+                    return Ok(self.mk(TK::M(M::PoolGet, Some(Box::new(a)), vec![h], None), (**t).clone(), sp));
+                }
                 if let Ty::Map(kt, vt) = &at {
                     let k = self.value(i)?;
                     let k = self.coerce(k, kt)?;
@@ -1606,6 +1626,17 @@ impl<'w, 'a> FnCx<'w, 'a> {
                 self.mk(TK::M(M::ArrayNew, None, vec![n, v], None), Ty::arr(el), sp)
             }
             ExprKind::Assign(target, _) | ExprKind::OpAssign(_, target, _) if self.is_map_index(target) => return self.map_assign(e),
+            ExprKind::Assign(target, v) if matches!(&target.kind, ExprKind::Index(a, _) if matches!(self.peek_ty(a), Some(Ty::Pool(_)))) => {
+                let ExprKind::Index(a, i) = &target.kind else { unreachable!() };
+                let p = self.value(a)?;
+                let Ty::Pool(t) = self.resolve(&p.ty) else { unreachable!() };
+                let h = self.value(i)?;
+                self.expect(&h.ty, &Ty::Handle(t.show()), h.span, "pool handle")?;
+                let v = self.value_as(v, &t)?;
+                self.expect(&v.ty, &t, v.span, "pool value")?;
+                self.impure = true;
+                return Ok(self.mk(TK::M(M::PoolSet, Some(Box::new(p)), vec![h, v], None), Ty::Unit, sp));
+            }
             ExprKind::MapLit(pairs) => {
                 let (kt, vt) = (self.fresh(), self.fresh());
                 let mut args = vec![];
@@ -2072,6 +2103,7 @@ impl<'w, 'a> FnCx<'w, 'a> {
             Ty::Str => TK::Str(String::new()),
             Ty::Array(_) => TK::Array(vec![]),
             Ty::Map(..) => TK::M(M::MapNew, None, vec![], None),
+            Ty::Pool(_) => TK::M(M::PoolNew, None, vec![], None),
             Ty::Enum(_, vs) => {
                 // The first variant, with zero fields.
                 let mut slots = vec![];
@@ -3064,6 +3096,12 @@ impl<'w, 'a> FnCx<'w, 'a> {
                 return Err(Diag::new(sp, format!("`{}` on {sn}: define `def {m}(other)` inside `struct {sn}`", op.text())));
             }
         }
+        if let (BinOp::Eq | BinOp::Ne, Ty::Handle(_)) = (op, &lres) {
+            if !self.unify(&l.ty, &r.ty) {
+                return Err(Diag::new(sp, format!("`{}` between {} and {}", op.text(), lres.show(), self.resolve(&r.ty).show())));
+            }
+            return Ok(self.mk(TK::Bin(op, Box::new(l), Box::new(r)), Ty::Bool, sp));
+        }
         if matches!(op, BinOp::Eq | BinOp::Ne) && matches!(lres, Ty::Struct(..) | Ty::Tuple(_) | Ty::Enum(..)) {
             if !self.unify(&l.ty, &r.ty) {
                 return Err(Diag::new(sp, format!("`{}` between {} and {}", op.text(), lres.show(), self.resolve(&r.ty).show())));
@@ -3221,6 +3259,13 @@ impl<'w, 'a> FnCx<'w, 'a> {
         }
         // `Stack[Int].new`: a generic type with explicit arguments.
         if let Some(Expr { kind: ExprKind::TypeApp(c, tes), span: csp, .. }) = recv {
+            if c == "Pool" && tes.len() == 1 && name == "new" && args.is_empty() {
+                let t = type_from(&tes[0], &self.w.structs, &self.w.consts)?;
+                if t.type_name().is_none() {
+                    return Err(Diag::new(*csp, format!("a pool holds a struct or enum (its handles are `@Name`), not {}", t.show())));
+                }
+                return Ok(self.mk(TK::M(M::PoolNew, None, vec![], None), Ty::Pool(Box::new(t)), sp));
+            }
             if c == "Chan" && tes.len() == 1 && name == "new" {
                 let t = type_from(&tes[0], &self.w.structs, &self.w.consts)?;
                 let cap = match args {
@@ -3866,6 +3911,7 @@ impl<'w, 'a> FnCx<'w, 'a> {
             Ty::Array(t) | Ty::Fixed(t, _) => Some((*t, false)),
             Ty::Map(k, v) => Some((Ty::Tuple(vec![*k, *v]), false)),
             Ty::Chan(t) => Some((*t, false)),
+            Ty::Pool(t) => Some((Ty::Tuple(vec![Ty::Handle(t.show()), *t]), false)),
             Ty::Seq(t, l) => Some((*t, l)),
             Ty::Gen(t) => Some((*t, false)),
             Ty::Var(_) => {
@@ -4069,6 +4115,27 @@ impl<'w, 'a> FnCx<'w, 'a> {
                 ("size" | "length", 0) => return Ok(mk_m(self, M::ChanLen, recv, vec![], None, Ty::Int)),
                 _ if self.elem_of(&rt, sp)?.is_some() && SEQ_METHODS.contains(&name) => {}
                 _ => return Err(Diag::new(name_span, format!("no method `{name}` on {}; it has send (<<), recv, close, size, and the Enumerable methods", rt.show()))),
+            }
+        }
+        if let Ty::Pool(t) = &rt {
+            let t = (**t).clone();
+            let ht = Ty::Handle(t.show());
+            match (name, args.len()) {
+                ("add" | "<<", 1) => {
+                    let v = self.value_as(&args[0], &t)?;
+                    self.expect(&v.ty, &t, v.span, "pool value")?;
+                    self.impure = true;
+                    return Ok(mk_m(self, M::PoolAdd, recv, vec![v], None, ht));
+                }
+                ("remove", 1) => {
+                    let h = self.value(&args[0])?;
+                    self.expect(&h.ty, &ht, h.span, "pool handle")?;
+                    self.impure = true;
+                    return Ok(mk_m(self, M::PoolRemove, recv, vec![h], None, Ty::Opt(Box::new(t))));
+                }
+                ("size" | "length", 0) => return Ok(mk_m(self, M::PoolSize, recv, vec![], None, Ty::Int)),
+                _ if SEQ_METHODS.contains(&name) => {}
+                _ => return Err(Diag::new(name_span, format!("no method `{name}` on {}; it has add, remove, size, [h], and the Enumerable methods over (handle, value)", rt.show()))),
             }
         }
         if let (Ty::Task(t), "wait", 0) = (&rt, name, args.len()) {
@@ -4567,7 +4634,7 @@ fn occurs(v: u32, t: &Ty) -> bool {
         Ty::Tuple(ts) => ts.iter().any(|t| occurs(v, t)),
         Ty::Map(k, x) => occurs(v, k) || occurs(v, x),
         Ty::Fn(ps, r) => ps.iter().any(|t| occurs(v, t)) || occurs(v, r),
-        Ty::Result(t) | Ty::Task(t) | Ty::Chan(t) => occurs(v, t),
+        Ty::Result(t) | Ty::Task(t) | Ty::Chan(t) | Ty::Pool(t) => occurs(v, t),
         _ => false,
     }
 }

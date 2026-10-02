@@ -34,6 +34,10 @@ pub enum Ty {
     Task(Box<Ty>),
     /// A channel of T.
     Chan(Box<Ty>),
+    /// `Pool[T]`: values addressed by handles (shared, like a map).
+    Pool(Box<Ty>),
+    /// `@T`: a handle into a pool of T (named by T's type name).
+    Handle(String),
     /// A function value (`(A, B) -> R`): one of the program's lambda
     /// literals of this type, with its captured values.
     Fn(Vec<Ty>, Box<Ty>),
@@ -83,6 +87,8 @@ impl Ty {
             Ty::Result(t) => format!("~{}", t.show()),
             Ty::Task(t) => format!("Task[{}]", t.show()),
             Ty::Chan(t) => format!("Chan[{}]", t.show()),
+            Ty::Pool(t) => format!("Pool[{}]", t.show()),
+            Ty::Handle(n) => format!("@{n}"),
             Ty::Fn(ps, r) => format!("({}) -> {}", ps.iter().map(Ty::show).collect::<Vec<_>>().join(", "), r.show()),
             Ty::Tuple(ts) => format!("({})", ts.iter().map(Ty::show).collect::<Vec<_>>().join(", ")),
             Ty::Range => "Range[Int]".into(),
@@ -101,7 +107,7 @@ impl Ty {
             Ty::Tuple(ts) => ts.iter().any(Ty::has_var),
             Ty::Map(k, v) => k.has_var() || v.has_var(),
             Ty::Fn(ps, r) => ps.iter().any(Ty::has_var) || r.has_var(),
-            Ty::Result(t) | Ty::Task(t) | Ty::Chan(t) => t.has_var(),
+            Ty::Result(t) | Ty::Task(t) | Ty::Chan(t) | Ty::Pool(t) => t.has_var(),
             _ => false,
         }
     }
@@ -269,6 +275,13 @@ pub enum M {
     ResUnwrap,
     ResUnwrapOr,
     ResRescue,
+    /// Pools: `Pool[T].new`, `add(v)` → @T, `p[h]`, `p[h] = v`, `remove(h)` → T?, `size`.
+    PoolNew,
+    PoolAdd,
+    PoolGet,
+    PoolSet,
+    PoolRemove,
+    PoolSize,
     /// `spawn { }` (the block); args are its captured locals.
     Spawn,
     /// `t.wait` → ~T.

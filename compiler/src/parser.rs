@@ -598,6 +598,25 @@ impl<'a> Parser<'a> {
 
     fn type_expr(&mut self) -> PResult<TypeExpr> {
         let sp = self.span();
+        if self.eat_op("@") {
+            let mut name = match self.bump().tok {
+                Tok::Const(n) => n,
+                Tok::Ident(pkg) if self.is_op(".") => {
+                    self.bump();
+                    match self.bump().tok {
+                        Tok::Const(n) => format!("{pkg}.{n}"),
+                        t => return Err(Diag::new(sp, format!("expected a type after `@`, found {}", describe(&t)))),
+                    }
+                }
+                t => return Err(Diag::new(sp, format!("expected a type after `@`, found {}", describe(&t)))),
+            };
+            let base = TypeExpr::Handle(std::mem::take(&mut name), sp.to(self.prev_span()));
+            if self.is_op("?") && !self.space_before() {
+                self.bump();
+                return Ok(TypeExpr::Opt(Box::new(base), sp.to(self.prev_span())));
+            }
+            return Ok(base);
+        }
         if self.eat_op("~") {
             let t = self.type_expr()?;
             let errs = if self.is_op("<") && !self.space_before() {
@@ -758,7 +777,7 @@ impl<'a> Parser<'a> {
             Tok::Kw(Kw::Struct) | Tok::Kw(Kw::Enum) => return Err(Diag::new(start, "types can only be defined at the top level")),
             Tok::Ident(name)
                 if matches!(self.peek_at(1), Tok::Op(":"))
-                    && (matches!(self.peek_at(2), Tok::Const(_) | Tok::Op("[") | Tok::Op("(") | Tok::Op("~"))
+                    && (matches!(self.peek_at(2), Tok::Const(_) | Tok::Op("[") | Tok::Op("(") | Tok::Op("~") | Tok::Op("@"))
                         || (matches!(self.peek_at(2), Tok::Ident(_)) && matches!(self.peek_at(3), Tok::Op(".")) && matches!(self.peek_at(4), Tok::Const(_)))) =>
             {
                 // `x: T = e`

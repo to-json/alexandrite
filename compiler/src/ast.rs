@@ -230,6 +230,7 @@ pub fn texpr_word(t: &TypeExpr) -> String {
         TypeExpr::Fixed(e, _, _) => format!("Fixed{}", texpr_word(e)),
         TypeExpr::App(n, args, _) => format!("{n}{}", args.iter().map(texpr_word).collect::<String>()),
         TypeExpr::Result(e, _, _) => format!("Res{}", texpr_word(e)),
+        TypeExpr::Handle(n, _) => format!("H{}", n.replace(['.', '/'], "_")),
         TypeExpr::Fn(ps, r, _) => format!("Fn{}To{}", ps.iter().map(texpr_word).collect::<String>(), texpr_word(r)),
     }
 }
@@ -279,6 +280,9 @@ pub enum TypeExpr {
     App(String, Vec<TypeExpr>, Span),
     /// `~T`, `~T<E | F>`: a fallible T (a Result value when held).
     Result(Box<TypeExpr>, Option<Vec<String>>, Span),
+    /// `@Node`: a handle into a `Pool[Node]` (refers to the type by name, so
+    /// `struct Node { kids: [@Node] }` is fine).
+    Handle(String, Span),
     /// `(A, B) -> R`: a function value (a lambda).
     Fn(Vec<TypeExpr>, Box<TypeExpr>, Span),
 }

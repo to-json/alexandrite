@@ -29,7 +29,7 @@ macro_rules! runtime {
 mod rt {
     runtime!(
         alx_init, alx_panic, alx_overflow, alx_pow, alx_isqrt, alx_sort_i64, alx_sort_str, alx_puts_i64,
-        alxj_region_cur, alxj_region_enter, alxj_region_exit, alxj_region_use, alxj_region_set, alxj_region_program, alxj_region_of,
+        alxj_region_cur, alxj_region_enter, alxj_region_exit, alxj_region_use, alxj_region_set, alxj_region_program, alxj_region_of, alxj_region_new_child, alxj_region_free, alxj_region_bytes,
         alxj_alloc, alxj_zalloc, alxj_arr_alloc, alxj_arr_grow, alxj_arr_new, alxj_arr_copy,
         alxj_int_to_s, alxj_str_rev, alxj_str_delete, alxj_str_split, alxj_str_to_i, alxj_str_charlen, alxj_str_sub,
         alxj_str_eq, alxj_str_cmp, alxj_str_is_pal, alxj_int_ndigits, alxj_digits,
@@ -551,7 +551,10 @@ impl Fx<'_, '_, '_> {
 
     fn stmt(&mut self, s: &LS) {
         match s {
-            LS::RegionFree(_) => unimplemented!("R3: child regions in the JIT"),
+            LS::RegionFree(r) => {
+                let r = self.e1(r);
+                self.call_rt(rt::alxj_region_free, &[r], false);
+            }
             LS::RegionEnter { region, saved } => {
                 let sv = self.call_rt(rt::alxj_region_cur, &[], true).unwrap();
                 self.set(*saved, &[sv]);
@@ -1124,7 +1127,14 @@ impl Fx<'_, '_, '_> {
 
     fn e(&mut self, e: &LE) -> Vec<Value> {
         match e {
-            LE::RegionNew(_) | LE::RegionBytes(_) => unimplemented!("R3: child regions in the JIT"),
+            LE::RegionNew(p) => {
+                let p = self.e1(p);
+                vec![self.call_rt(rt::alxj_region_new_child, &[p], true).unwrap()]
+            }
+            LE::RegionBytes(r) => {
+                let r = self.e1(r);
+                vec![self.call_rt(rt::alxj_region_bytes, &[r], true).unwrap()]
+            }
             LE::RegionOf(x) => {
                 // Arr and Str both keep their data pointer in word 0.
                 let v = self.e(x);

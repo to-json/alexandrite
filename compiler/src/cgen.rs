@@ -319,7 +319,10 @@ impl FnEmit<'_> {
 
     fn stmt(&mut self, s: &LS) {
         match s {
-            LS::RegionFree(_) => unimplemented!("R3: child regions in C"),
+            LS::RegionFree(r) => {
+                let r = self.e(r);
+                self.line(&format!("alx_region_free({r});"));
+            }
             LS::RegionEnter { region, saved } => {
                 let (r, sv) = (self.v(*region), self.v(*saved));
                 self.line(&format!("{sv} = alx_region_cur(); {r} = alx_region_enter();"));
@@ -551,7 +554,8 @@ impl FnEmit<'_> {
 
     fn e(&self, e: &LE) -> String {
         match e {
-            LE::RegionNew(_) | LE::RegionBytes(_) => unimplemented!("R3: child regions in C"),
+            LE::RegionNew(p) => format!("alx_region_new_child({})", self.e(p)),
+            LE::RegionBytes(r) => format!("alx_region_bytes({})", self.e(r)),
             LE::RegionOf(x) => format!("alx_region_of(({}).ptr)", self.e(x)),
             LE::RegionProgram => "alx_region_program()".into(),
             LE::ChanNew(t, cap) => format!("alx_chan_new({}, sizeof({}))", self.e(cap), cty_mem(t)),

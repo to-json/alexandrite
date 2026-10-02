@@ -13,6 +13,9 @@ void *alxj_region_use(void *r) { return alx_region_use(r); }
 void alxj_region_set(void *r) { alx_region_set(r); }
 void *alxj_region_of(const void *p) { return alx_region_of(p); }
 void *alxj_region_program(void) { return alx_region_program(); }
+void *alxj_region_new_child(void *p) { return alx_region_new_child(p); }
+void alxj_region_free(void *r) { alx_region_free(r); }
+int64_t alxj_region_bytes(void *r) { return alx_region_bytes(r); }
 
 void *alxj_alloc(int64_t n) { return alx_alloc((size_t)n); }
 

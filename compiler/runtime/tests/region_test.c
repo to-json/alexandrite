@@ -191,11 +191,119 @@ static void of_threads(void) {
     alx_region_exit(r, s);
 }
 
+static void children(void) {
+    AlxRegion *prog = alx_region_program();
+    size_t h0 = alx_mem_held();
+    /* freed with the parent */
+    AlxRegion *s = alx_region_cur(), *p = alx_region_enter();
+    AlxRegion *c1 = alx_region_new_child(p), *c2 = alx_region_new_child(p);
+    AlxRegion *g = alx_region_new_child(c1);
+    CHECK(alx_region_cur() == p && c1 != c2 && g != c1);
+    char *pm = alx_alloc(100), *m1, *m2, *mg;
+    AlxRegion *sv = alx_region_use(c1);
+    CHECK(sv == p && alx_region_cur() == c1);
+    m1 = alx_alloc(5000); fill(m1, 5000, 1);
+    for (int i = 0; i < 10; i++) fill(alx_alloc(500000), 500000, 1);   /* many chunks */
+    CHECK(alx_region_of(m1) == c1);
+    alx_region_set(c2);
+    m2 = alx_alloc(3u << 20); fill(m2, 3u << 20, 2);                  /* large */
+    CHECK(alx_region_of(m2 + 1000) == c2 && alx_region_of(m1) == c1);
+    alx_region_set(g);
+    mg = alx_alloc(64);
+    CHECK(alx_region_of(mg) == g);
+    alx_region_set(p);
+    CHECK(alx_region_of(pm) == p && all(m1, 5000, 1));
+    CHECK(alx_mem_held() >= h0 + (4u << 20));
+    alx_region_exit(p, s);
+    CHECK(alx_region_cur() == prog);
+    CHECK(alx_region_of(m1) == prog && alx_region_of(m2) == prog && alx_region_of(mg) == prog);
+    CHECK(alx_mem_held() <= h0 + (4u << 20));       /* at most the free list */
+
+    /* explicit free + unlink; the parent's exit later must not double free */
+    s = alx_region_cur(); p = alx_region_enter();
+    c1 = alx_region_new_child(p); c2 = alx_region_new_child(p);
+    AlxRegion *c3 = alx_region_new_child(p);
+    alx_region_use(c2); char *x = alx_alloc(10); alx_region_set(p);
+    alx_region_use(c1); alx_alloc(10); alx_region_set(p);
+    alx_region_use(c3); alx_alloc(3u << 20); alx_region_set(p);
+    CHECK(alx_region_of(x) == c2);
+    alx_region_free(c2);
+    CHECK(alx_region_of(x) == prog);
+    alx_region_free(c3);
+    alx_region_free(c1);
+    c1 = alx_region_new_child(p);           /* struct reuse after free */
+    alx_region_free(c1);
+    alx_region_exit(p, s);
+    CHECK(alx_mem_held() <= h0 + (4u << 20));
+
+    /* children of the program region live until freed */
+    AlxRegion *pc = alx_region_new_child(prog);
+    sv = alx_region_use(pc);
+    char *y = alx_alloc(2u << 20); fill(y, 2u << 20, 9);
+    alx_region_set(sv);
+    s = alx_region_cur(); p = alx_region_enter(); alx_region_exit(p, s);
+    CHECK(all(y, 2u << 20, 9) && alx_region_of(y) == pc);
+    alx_region_free(pc);
+    CHECK(alx_region_of(y) == prog);
+
+    /* bytes: current and not current */
+    s = alx_region_cur(); p = alx_region_enter();
+    CHECK(alx_region_bytes(p) == 0);
+    c1 = alx_region_new_child(p);
+    CHECK(alx_region_bytes(c1) == 0);
+    alx_alloc(100);
+    CHECK(alx_region_bytes(p) == 112);
+    alx_region_use(c1);
+    CHECK(alx_region_bytes(p) == 112 && alx_region_bytes(c1) == 0);
+    alx_alloc(16); alx_alloc(1);
+    CHECK(alx_region_bytes(c1) == 32);
+    int64_t tot = 32;
+    for (int i = 0; i < 100; i++) { alx_alloc(40000); tot += 40000; }   /* 40000 is a multiple of 16 */
+    int64_t b = alx_region_bytes(c1);
+    CHECK(b == tot);
+    alx_alloc(2u << 20);
+    int64_t b2 = alx_region_bytes(c1);
+    CHECK(b2 == b + (2 << 20));
+    alx_region_set(p);
+    CHECK(alx_region_bytes(c1) == b2 && alx_region_bytes(p) == 112);
+    alx_alloc(16);
+    CHECK(alx_region_bytes(p) == 128 && alx_region_bytes(c1) == b2);
+    alx_region_exit(p, s);
+
+    /* compaction: a child replaced by a fresh one after copying a small live set */
+    s = alx_region_cur(); p = alx_region_enter();
+    AlxRegion *box = alx_region_new_child(p);
+    size_t hb = alx_mem_held();
+    int64_t *live = NULL; int n = 0;
+    for (int round = 0; round < 10000; round++) {
+        sv = alx_region_use(box);
+        for (int i = 0; i < 50; i++) fill(alx_alloc(2000), 2000, i);   /* garbage */
+        alx_region_set(sv);
+        if (alx_region_bytes(box) > (64 << 10)) {
+            AlxRegion *nb = alx_region_new_child(p);
+            sv = alx_region_use(nb);
+            int64_t *nl = alx_alloc(8 * 9);
+            for (int i = 0; i < n; i++) nl[i] = live[i];
+            nl[n++] = round;
+            if (n > 8) { memmove(nl, nl + 1, 8 * 8); n = 8; }
+            alx_region_set(sv);
+            alx_region_free(box);
+            box = nb; live = nl;
+            CHECK(alx_region_of(live) == box);
+        }
+        CHECK(alx_mem_held() <= hb + (8u << 20));
+    }
+    CHECK(n == 8 && live[7] > 9000);
+    alx_region_exit(p, s);
+    CHECK(alx_mem_held() <= h0 + (4u << 20));
+}
+
 int main(void) {
     alx_init();
     nested();
     bounded();
     large();
+    children();
     of_basic(); of_large(); of_reuse(); of_threads();
     pthread_t t[16];
     for (int i = 0; i < 16; i++) pthread_create(&t[i], NULL, thr, NULL);

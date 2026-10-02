@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception */
 #include "alx.h"
 
+#include <assert.h>
 #include <errno.h>
 #include <pthread.h>
 #include <setjmp.h>
@@ -59,6 +60,9 @@ struct AlxRegion {
     char *cur, *end;       /* bump position; valid only while not current */
     Blk *chunks, *larges;
     AlxRegion *pool_next;
+    char *cbase;           /* payload start of the newest chunk (NULL: none) */
+    size_t counted;        /* bytes used in older chunks + large blocks */
+    AlxRegion *parent, *child, *sib, *sib_prev;   /* child regions (R3) */
 };
 
 static _Thread_local AlxRegion tl_prog;
@@ -165,7 +169,7 @@ AlxRegion *alx_region_use(AlxRegion *r) {
     return p;
 }
 
-AlxRegion *alx_region_enter(void) {
+static AlxRegion *region_alloc(void) {
     AlxRegion *r = tl_pool;
     if (r) tl_pool = r->pool_next;
     else {
@@ -173,15 +177,35 @@ AlxRegion *alx_region_enter(void) {
         if (!r) alx_panic("out of memory", "runtime");
     }
     r->cur = r->end = NULL; r->chunks = r->larges = NULL; r->pool_next = NULL;
+    r->cbase = NULL; r->counted = 0;
+    r->parent = r->child = r->sib = r->sib_prev = NULL;
+    return r;
+}
+
+AlxRegion *alx_region_enter(void) {
+    AlxRegion *r = region_alloc();
     alx_region_set(r);
     return r;
 }
 
-void alx_region_exit(AlxRegion *r, AlxRegion *saved) {
-    AlxRegion *c = cur_region();
-    if (c != r && c != saved) { c->cur = alx_bump_cur; c->end = alx_bump_end; }
-    if (c != saved) { alx_bump_cur = saved->cur; alx_bump_end = saved->end; }
-    tl_cur = saved;
+AlxRegion *alx_region_new_child(AlxRegion *parent) {
+    AlxRegion *r = region_alloc();
+    r->parent = parent;
+    r->sib = parent->child;
+    if (r->sib) r->sib->sib_prev = r;
+    parent->child = r;
+    return r;
+}
+
+/* Free r's children (recursively), then its chunks and large blocks, unlink
+ * it, and recycle the struct. Does not touch the current region. */
+static void region_release(AlxRegion *r) {
+    while (r->child) region_release(r->child);
+    if (r->parent) {
+        if (r->sib_prev) r->sib_prev->sib = r->sib; else r->parent->child = r->sib;
+        if (r->sib) r->sib->sib_prev = r->sib_prev;
+        r->parent = NULL;
+    }
     for (Blk *b = r->chunks, *n; b; b = n) {
         n = b->next;
         reg_blk(b, ALX_CHUNK, NULL);
@@ -193,6 +217,27 @@ void alx_region_exit(AlxRegion *r, AlxRegion *saved) {
     r->pool_next = tl_pool; tl_pool = r;
 }
 
+void alx_region_exit(AlxRegion *r, AlxRegion *saved) {
+    AlxRegion *c = cur_region();
+    if (c != r && c != saved) { c->cur = alx_bump_cur; c->end = alx_bump_end; }
+    if (c != saved) { alx_bump_cur = saved->cur; alx_bump_end = saved->end; }
+    tl_cur = saved;
+    region_release(r);
+}
+
+void alx_region_free(AlxRegion *r) {
+    assert(r != &tl_prog && "alx_region_free of the program region");
+    for (AlxRegion *c = cur_region(); c; c = c->parent)
+        assert(c != r && "alx_region_free of a region that is (inside) the current one");
+    region_release(r);
+}
+
+int64_t alx_region_bytes(AlxRegion *r) {
+    if (!r->cbase) return (int64_t)r->counted;
+    char *cur = r == cur_region() ? alx_bump_cur : r->cur;
+    return (int64_t)(r->counted + (size_t)(cur - r->cbase));
+}
+
 /* `n` is rounded to 16 already. */
 void *alx_alloc_slow(size_t n) {
     AlxRegion *r = cur_region();
@@ -202,6 +247,7 @@ void *alx_alloc_slow(size_t n) {
         if (!b) alx_panic("out of memory", "runtime");
         mem_add(sz);
         b->size = sz; b->next = r->larges; r->larges = b;
+        r->counted += n;
         reg_blk(b, sz, r);
         return (char *)b + ALX_HDR;
     }
@@ -216,6 +262,8 @@ void *alx_alloc_slow(size_t n) {
     c->next = r->chunks; r->chunks = c;
     reg_blk(c, ALX_CHUNK, r);
     char *base = (char *)c + ALX_HDR;
+    if (r->cbase) r->counted += (size_t)(alx_bump_cur - r->cbase);
+    r->cbase = base;
     alx_bump_cur = base + n;
     alx_bump_end = (char *)c + ALX_CHUNK;
     return base;

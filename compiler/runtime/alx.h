@@ -50,6 +50,15 @@ AlxRegion *alx_region_program(void);         /* this thread's program region */
 AlxRegion *alx_region_cur(void);             /* the current region */
 AlxRegion *alx_region_enter(void);           /* fresh empty region, made current */
 void alx_region_exit(AlxRegion *r, AlxRegion *saved); /* free r; make saved current */
+/* A fresh empty child region of parent (not made current). Freed with its
+ * parent (alx_region_exit / alx_region_free of it, recursively), or earlier by
+ * alx_region_free. The program region may be a parent. */
+AlxRegion *alx_region_new_child(AlxRegion *parent);
+/* Free r now: its children, chunks and large blocks; unlink it from its
+ * parent. r must not be current (nor the program region). */
+void alx_region_free(AlxRegion *r);
+/* Bytes allocated in r so far (chunk bytes in use + large blocks); O(1). */
+int64_t alx_region_bytes(AlxRegion *r);
 AlxRegion *alx_region_use(AlxRegion *r);     /* make r current; returns previous */
 void alx_region_set(AlxRegion *r);           /* make r current */
 /* The region of this thread whose chunk or large block contains p (interior

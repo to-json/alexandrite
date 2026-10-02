@@ -205,17 +205,37 @@ test "io.copy between File and bytes.Buffer" {
   assert_eq io.copy(f, src).unwrap, 15
   f.close!.unwrap
   g = open(name).unwrap
-  dst = bytes.Buffer.new
+  dst = bytes.new_buffer([])
   assert_eq io.copy(dst, g).unwrap, 15
-  # Buffer is a value: copying into it from a function doesn't change ours.
-  assert_eq dst.size, 0
+  # Buffers share state across copies: io.copy filled ours.
+  assert_eq dst.size, 15
+  assert_eq dst.string, "copy me, please"
   g.close!.unwrap
+  assert g.close!.err?
+  # The zero value works in place, once it has been written to.
+  z = bytes.Buffer.new
+  assert_eq z.size, 0
+  z.write_string!("x")
+  assert_eq io.copy(z, open(name).unwrap).unwrap, 15
+  assert_eq z.size, 16
   h = open(name).unwrap
   assert_eq Str.from_bytes(io.read_all(h).unwrap), "copy me, please"
   h.close!.unwrap
   # Through the interface in a place, the Buffer does change.
   w: io.Writer = bytes.Buffer.new
   assert_eq w.write!(b("abc")).unwrap, 3
+  remove_all(d).unwrap
+}
+
+test "File copies share the descriptor state" {
+  d = tmp
+  f = create(d + "/s.txt").unwrap
+  g = f
+  assert_eq f.fd, g.fd
+  f.close!.unwrap
+  assert_eq g.fd, -1
+  assert g.close!.err?, "closing the other copy fails: already closed"
+  assert g.write!(b("x")).err?
   remove_all(d).unwrap
 }
 
@@ -228,10 +248,26 @@ test "stdout is a Writer" {
 }
 
 test "bad descriptors" {
-  f = File.new(fd: -1, name: "nofile")
+  f = new_file(-1, "nofile")
   buf: [Byte] = [0; 4]
   e = f.read!(buf).err.unwrap
   assert_eq e.message, "read nofile: bad file descriptor"
   assert f.write!(b("x")).err?
   assert f.sync!.err?
+}
+
+test "io functions drive shared Buffers" {
+  src = bytes.new_buffer_string("0123456789")
+  dst = bytes.new_buffer([])
+  buf: [Byte] = [0; 3]
+  assert_eq src.read!(buf), 3
+  # copy consumes the rest of src and fills dst, both ours.
+  assert_eq io.copy(dst, src).unwrap, 7
+  assert_eq src.size, 0
+  assert_eq dst.string, "3456789"
+  assert_eq io.write_string(dst, "!").unwrap, 1
+  assert_eq io.copy_n(dst, bytes.new_buffer_string("abc"), 2).unwrap, 2
+  assert_eq dst.string, "3456789!ab"
+  assert_eq Str.from_bytes(io.read_all(dst).unwrap), "3456789!ab"
+  assert_eq dst.size, 0
 }

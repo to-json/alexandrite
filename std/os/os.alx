@@ -16,10 +16,10 @@
 #    the platform's own values, fixed at compile time; the runtime's constant
 #    table, `alx_sys_const`, is a runtime lookup here, so these are stable
 #    stand-ins.) Permissions are plain Ints: `0o644`.
-#  - `File` is a value holding a file descriptor and a name. Its `!` methods
-#    need a variable as receiver (`f = ~os.open(p); f.read!(buf)`), and a copy
-#    of a File shares the descriptor: `close!` on one copy does not mark the
-#    others closed.
+#  - `File` holds a file descriptor (in shared state, GO-VS-RUBY D36) and a
+#    name. Its `!` methods need a variable as receiver (`f = ~os.open(p);
+#    f.read!(buf)`). Copies of a File are the same file: `close!` on one copy
+#    closes them all, so a second close on any copy fails, as in Go.
 #  - `stdin` / `stdout` / `stderr` are functions returning those Files. Output
 #    through them is unbuffered; use bufio.Writer.
 #  - Times are Ints: nanoseconds since the Unix epoch.
@@ -282,10 +282,15 @@ pub def lstat(name: Str) -> ~FileInfo {
 
 # ----------------------------------------------------------------------- File
 
-# An open file: its descriptor and the name it was opened with.
+# An open file: its descriptor and the name it was opened with. The descriptor
+# lives in a one-element slice (GO-VS-RUBY D36), so copies of a File share it:
+# `close!` on one copy closes them all (a second close, on any copy, fails).
 pub struct File {
-  fd: Int
+  cell: [Int]
   name: Str
+
+  # The descriptor; -1 once closed (or for a File made without one).
+  pub def fd -> Int { cell.size == 0 ? -1 : cell[0] }
 
   # Reads up to p.size bytes; returns the count, 0 at the end of the file.
   pub def read!(p: [Byte]) -> ~Int {
@@ -358,7 +363,7 @@ pub struct File {
     fail ferr("close" + " " + name, c("EBADF")) if fd < 0
     r = c_close(fd.to_i32)
     code = C.errno
-    self.fd = -1
+    self.cell[0] = -1
     fail ferr("close" + " " + name, code) if r != 0
   }
 
@@ -389,9 +394,15 @@ pub struct File {
   pub def is_terminal -> Bool { c_isatty(fd.to_i32) }
 }
 
-pub def stdin -> File { File.new(fd: 0, name: "/dev/stdin") }
-pub def stdout -> File { File.new(fd: 1, name: "/dev/stdout") }
-pub def stderr -> File { File.new(fd: 2, name: "/dev/stderr") }
+# A File over an existing descriptor.
+pub def new_file(fd: Int, name: Str) -> File {
+  cell: [Int] = [fd]
+  File.new(cell: cell, name: name)
+}
+
+pub def stdin -> File { new_file(0, "/dev/stdin") }
+pub def stdout -> File { new_file(1, "/dev/stdout") }
+pub def stderr -> File { new_file(2, "/dev/stderr") }
 
 # The platform's O_* value for the portable flags.
 def native_flags(flags: Int) -> Int {
@@ -407,6 +418,11 @@ def native_flags(flags: Int) -> Int {
 # Opens the named file with the given O_* flags; a new file gets permissions
 # `perm` (before the umask).
 pub def open_file(name: Str, flags: Int, perm: Int) -> ~File {
+  fd = ~open_fd(name, flags, perm)
+  new_file(fd, Str.from_bytes(name.bytes.to_a))
+}
+
+def open_fd(name: Str, flags: Int, perm: Int) -> ~Int {
   nf = native_flags(flags).to_i32
   fd = alx_sys_open(name, nf, perm.to_i32)
   while fd < 0 {
@@ -414,17 +430,21 @@ pub def open_file(name: Str, flags: Int, perm: Int) -> ~File {
     fail ferr("open" + " " + name, code) if code != c("EINTR")
     fd = alx_sys_open(name, nf, perm.to_i32)
   }
-  File.new(fd: fd.to_i, name: Str.from_bytes(name.bytes.to_a))
+  fd.to_i
 }
 
-# Opens for reading.
+# Opens for reading. (open and create call open_fd, not open_file: a File,
+# whose descriptor is in a slice, returned through two fallible calls in a row
+# is corrupted by a compiler bug.)
 pub def open(name: Str) -> ~File {
-  ~open_file(name, O_RDONLY, 0)
+  fd = ~open_fd(name, O_RDONLY, 0)
+  new_file(fd, Str.from_bytes(name.bytes.to_a))
 }
 
 # Creates or truncates for reading and writing (permissions 0o666).
 pub def create(name: Str) -> ~File {
-  ~open_file(name, O_RDWR | O_CREATE | O_TRUNC, 0o666)
+  fd = ~open_fd(name, O_RDWR | O_CREATE | O_TRUNC, 0o666)
+  new_file(fd, Str.from_bytes(name.bytes.to_a))
 }
 
 # The whole content of a file.
@@ -661,7 +681,7 @@ pub def create_temp(dir: Str, pattern: Str) -> ~File {
   while i < 10000 {
     name = temp_name(base, pattern, i)
     fd = alx_sys_open(name, native_flags(O_RDWR | O_CREATE | O_EXCL).to_i32, 0o600)
-    return File.new(fd: fd.to_i, name: name) if fd >= 0
+    return new_file(fd.to_i, name) if fd >= 0
     code = C.errno
     fail ferr("open" + " " + name, code) if code != c("EEXIST")
     i += 1

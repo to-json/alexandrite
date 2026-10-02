@@ -58,6 +58,7 @@ void alxj_int_to_s(AlxStr *out, int64_t v) { *out = alx_int_to_s(v); }
 void alxj_str_rev(AlxStr *out, const AlxStr *s) { *out = alx_str_rev(*s); }
 void alxj_str_delete(AlxStr *out, const AlxStr *s, const AlxStr *chars) { *out = alx_str_delete(*s, *chars); }
 void alxj_str_split(Arr_Str *out, const AlxStr *s, const AlxStr *sep) { *out = alx_str_split(*s, *sep); }
+void alxj_str_join(AlxStr *out, const Arr_Str *a, const AlxStr *sep) { *out = alx_str_join(*a, *sep); }
 int64_t alxj_str_to_i(const AlxStr *s) { return alx_str_to_i(*s); }
 int64_t alxj_str_charlen(const AlxStr *s, int64_t i) { return alx_str_charlen(*s, i); }
 void alxj_str_sub(AlxStr *out, const AlxStr *s, int64_t i, int64_t n) { *out = alx_str_sub(*s, i, n); }

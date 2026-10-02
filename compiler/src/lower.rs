@@ -2835,6 +2835,33 @@ impl<'a> Lw<'a> {
                     }
                 }
             }
+            Join => {
+                let r = recv.unwrap();
+                let Ty::Array(el) = &r.ty else { unreachable!() };
+                let av = self.expr(r);
+                let sep = self.expr(&args[0]);
+                if **el == Ty::Str {
+                    return LE::Rt(Rt::StrJoin, vec![av, sep]);
+                }
+                // Other elements: shown one by one into a [Str] first.
+                let at = self.lty(&r.ty);
+                let a = self.tmp_of(av, at);
+                let strs = self.tmp(LTy::Arr(Box::new(LTy::Str)));
+                self.emit(LS::Set(strs, LE::ArrWithCap(LTy::Str, Box::new(LE::Len(Box::new(LE::Var(a)))))));
+                let i = self.tmp(LTy::I64);
+                self.emit(LS::Set(i, LE::I(0)));
+                let l = self.label();
+                let el_t = (**el).clone();
+                let body = self.sub(|lw| {
+                    lw.emit(LS::If(LE::Cmp(Op::Ge, Box::new(LE::Var(i)), Box::new(LE::Len(Box::new(LE::Var(a)))), LTy::I64), vec![LS::Break(l)], vec![]));
+                    let x = LE::Index { arr: Box::new(LE::Var(a)), idx: Box::new(LE::Var(i)), check: None };
+                    let s = lw.to_s(x, &el_t);
+                    lw.emit(LS::Push(strs, s));
+                    lw.emit(LS::Set(i, LE::Arith(Op::Add, Box::new(LE::Var(i)), Box::new(LE::I(1)), Ovf::Unchecked)));
+                });
+                self.emit(LS::Loop(l, body));
+                LE::Rt(Rt::StrJoin, vec![LE::Var(strs), sep])
+            }
             TupleNew => {
                 let lt = self.lty(&e.ty);
                 let vs = args.iter().map(|a| self.arg(a)).collect();

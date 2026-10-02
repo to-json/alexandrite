@@ -350,6 +350,20 @@ pub extern "C" fn alxr_str_delete(p: i64, n: i64, cp: i64, cn: i64) {
 
 /// Arr_Str: elements are (ptr, len) pairs pointing into `s`.
 #[unsafe(no_mangle)]
+pub extern "C" fn alxr_str_join(ap: i64, an: i64, _cap: i64, sp: i64, sn: i64) {
+    let sep = bytes(sp, sn);
+    let mut out: Vec<u8> = vec![];
+    for k in 0..an as usize {
+        if k > 0 {
+            out.extend_from_slice(sep);
+        }
+        let (p, n) = (*word(ap as usize, 2 * k), *word(ap as usize, 2 * k + 1));
+        out.extend_from_slice(bytes(p, n));
+    }
+    ret_str(&out);
+}
+
+#[unsafe(no_mangle)]
 pub extern "C" fn alxr_str_split(p: i64, n: i64, sp: i64, sn: i64) {
     let (s, sep) = (bytes(p, n), bytes(sp, sn));
     let mut parts: Vec<(i64, i64)> = vec![];

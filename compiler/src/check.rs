@@ -519,6 +519,28 @@ impl<'a> World<'a> {
         Ok(())
     }
 
+    /// Whether a value of type `t` contains (not behind a handle) a value
+    /// of interface `iface`.
+    fn contains_iface(&self, t: &Ty, iface: &str, seen: &mut Vec<String>) -> bool {
+        match t {
+            Ty::Iface(j) if j == iface => true,
+            Ty::Iface(j) => {
+                if seen.contains(j) {
+                    return false;
+                }
+                seen.push(j.clone());
+                let impls: Vec<Ty> = self.impls.get(j).map(|v| v.iter().map(|(t, _)| t.clone()).collect()).unwrap_or_default();
+                impls.iter().any(|x| self.contains_iface(x, iface, seen))
+            }
+            Ty::Struct(_, fs) => fs.iter().any(|(_, f)| self.contains_iface(f, iface, seen)),
+            Ty::Enum(_, vs) => vs.iter().any(|(_, fs)| fs.iter().any(|(_, f)| self.contains_iface(f, iface, seen))),
+            Ty::Tuple(ts) => ts.iter().any(|x| self.contains_iface(x, iface, seen)),
+            Ty::Opt(x) | Ty::Array(x) | Ty::Fixed(x, _) | Ty::Result(x) | Ty::Mutex(x) | Ty::Chan(x) => self.contains_iface(x, iface, seen),
+            Ty::Map(k, v) => self.contains_iface(k, iface, seen) || self.contains_iface(v, iface, seen),
+            _ => false,
+        }
+    }
+
     /// Make `t` an implementor of interface `iface` (checking it has every
     /// method), returning its tag.
     fn implement(&mut self, iface: &str, t: &Ty, sp: Span) -> R<usize> {
@@ -529,6 +551,11 @@ impl<'a> World<'a> {
             return Err(Diag::new(sp, format!("{} can't satisfy {iface}: only structs and enums have methods", t.show())));
         };
         let tn = tn.to_string();
+        // An interface value holds its implementors by value: one that holds
+        // the interface itself would be infinitely large.
+        if self.contains_iface(t, iface, &mut vec![]) {
+            return Err(Diag::new(sp, format!("{tn} can't be a {iface}: it holds a {iface} value itself, and an interface value contains its implementors")).note(format!("make {tn} generic over what it holds (`struct {tn}[T] {{ inner: T }}`, like Rust's BufReader<R>), or keep the inner value in a Pool and hold an @handle")));
+        }
         let methods = self.ifaces[iface].clone();
         let impls = self.impls.entry(iface.to_string()).or_default();
         impls.push((t.clone(), vec![]));
@@ -602,10 +629,17 @@ impl<'a> World<'a> {
             for tp in &tps {
                 if let Some(Bound::Iface(i)) = &tp.bound {
                     let t = out[&tp.name].clone();
-                    if !self.ifaces.contains_key(i) {
+                    // `io.Reader` through an import alias; `Reader` in its own package.
+                    let prev = enter_pkg(&self.defs[def].pkg);
+                    let key = match i.split_once('.') {
+                        Some((alias, n)) => import_path(alias).map_or_else(|| i.clone(), |p| format!("{p}.{n}")),
+                        None => resolve_name(i, tp.span, &|q| self.ifaces.contains_key(q)).unwrap_or_else(|_| i.clone()),
+                    };
+                    leave_pkg(prev);
+                    if !self.ifaces.contains_key(&key) {
                         return Err(Diag::new(tp.span, format!("`{i}` isn't an interface")));
                     }
-                    self.implement(i, &t, sp)?;
+                    self.implement(&key, &t, sp)?;
                 }
             }
         }
@@ -3945,8 +3979,10 @@ impl<'w, 'a> FnCx<'w, 'a> {
                 let (body, _) = self.body_as(&b.body, false)?;
                 self.pop_scope();
                 self.loops.pop();
+                // A loop nothing breaks out of never finishes (it returns, fails or panics).
+                let ty = if breaks_out(&body) { Ty::Unit } else { Ty::Never };
                 let blk = TBlock { params: vec![], destructure: false, body, pure: true, span: b.span , own: (0, 0) };
-                return Ok(self.mk(TK::M(M::Loop, None, vec![], Some(Box::new(blk))), Ty::Unit, sp));
+                return Ok(self.mk(TK::M(M::Loop, None, vec![], Some(Box::new(blk))), ty, sp));
             }
             "it" => return Err(Diag::new(sp, "`it` can only be used inside a block")),
             "format" | "sprintf" => return self.format(name, args, sp),
@@ -5086,6 +5122,21 @@ impl<'w, 'a> FnCx<'w, 'a> {
                     return Ok(mk_m(self, M::EachWithIndex, recv, vec![], None, seq(Ty::Tuple(vec![el, Ty::Int]))));
                 }
                 "lazy" => return Ok(mk_m(self, M::Lazy, recv, vec![], None, Ty::seq(el, true))),
+                // `xs.join(sep)`: the elements as `%v` with `sep` between (Go's strings.Join).
+                "join" if matches!(rt, Ty::Array(_)) && args.len() <= 1 && block.is_none() => {
+                    if !printable(&el) {
+                        return Err(Diag::new(sp, format!("`join` shows each element, and {} can't be shown", el.show())));
+                    }
+                    let sep = match args.first() {
+                        Some(a) => {
+                            let v = self.value(a)?;
+                            self.expect(&v.ty, &Ty::Str, v.span, "`join` separator")?;
+                            v
+                        }
+                        None => self.mk(TK::Str(String::new()), Ty::Str, sp),
+                    };
+                    return Ok(mk_m(self, M::Join, recv, vec![sep], None, Ty::Str));
+                }
                 "sum" => {
                     let (blk, t) = match (block, bsym) {
                         (None, None) => (None, el.clone()),
@@ -5535,4 +5586,38 @@ fn subst_type(te: &TypeExpr, env: &HashMap<String, Ty>, structs: &Structs, const
         TypeExpr::App(n, args, _) if n == "Map" && args.len() == 2 => Ty::Map(Box::new(go(&args[0])?), Box::new(go(&args[1])?)),
         _ => type_from(te, structs, consts).ok()?,
     })
+}
+
+/// Whether a `break` in these statements leaves the loop they're the body
+/// of (not counting breaks of loops and blocks nested inside).
+fn breaks_out(ss: &[TStmt]) -> bool {
+    ss.iter().any(|s| match s {
+        TStmt::Break(..) => true,
+        // A nested loop's breaks are its own (its condition can't break).
+        TStmt::While(..) => false,
+        TStmt::If(c, a, b) => expr_breaks_out(c) || breaks_out(a) || breaks_out(b),
+        _ => {
+            let mut hit = false;
+            crate::prove::stmt_exprs(s, &mut |e| hit |= expr_breaks_out(e));
+            hit
+        }
+    })
+}
+
+fn expr_breaks_out(e: &TExpr) -> bool {
+    match &e.kind {
+        TK::Seq(ss) => breaks_out(ss),
+        TK::Select(arms, d) => {
+            arms.iter().any(|a| match a {
+                TSelArm::Recv { body, .. } | TSelArm::Send { body, .. } => breaks_out(body),
+            }) || d.as_ref().is_some_and(|d| breaks_out(d))
+        }
+        // A block's `break` leaves the block's own call.
+        TK::M(_, recv, args, Some(_)) => recv.as_ref().is_some_and(|r| expr_breaks_out(r)) || args.iter().any(expr_breaks_out),
+        _ => {
+            let mut hit = false;
+            crate::prove::each_child(e, &mut |c| hit |= expr_breaks_out(c));
+            hit
+        }
+    }
 }

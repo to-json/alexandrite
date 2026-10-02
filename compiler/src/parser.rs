@@ -426,6 +426,14 @@ impl<'a> Parser<'a> {
                         t => return Err(Diag::new(bsp, format!("expected a type after `like`, found {}", describe(&t)))),
                     },
                     Tok::Const(i) => Some(Bound::Iface(i)),
+                    // `io.Reader`: an interface from an imported package.
+                    Tok::Ident(pkg) if self.is_op(".") && matches!(self.peek_at(1), Tok::Const(_)) => {
+                        self.bump();
+                        match self.bump().tok {
+                            Tok::Const(i) => Some(Bound::Iface(format!("{pkg}.{i}"))),
+                            _ => unreachable!(),
+                        }
+                    }
                     t => return Err(Diag::new(bsp, format!("expected a bound (an interface, or `like Int`), found {}", describe(&t)))),
                 }
             } else {

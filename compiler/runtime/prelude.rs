@@ -260,6 +260,16 @@ mod rt {
     pub fn str_delete(s: Str, chars: Str) -> Str {
         Str(s.0.iter().copied().filter(|b| !chars.0.contains(b)).collect::<Vec<u8>>().into())
     }
+    pub fn str_join(a: Sl<Str>, sep: Str) -> Str {
+        let mut out: Vec<u8> = vec![];
+        for (i, x) in a.to_vec().iter().enumerate() {
+            if i > 0 {
+                out.extend_from_slice(&sep.0);
+            }
+            out.extend_from_slice(&x.0);
+        }
+        Str(out.into())
+    }
     pub fn str_split(s: Str, sep: Str) -> Sl<Str> {
         Sl::from(str_split_v(s, sep))
     }

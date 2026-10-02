@@ -98,6 +98,7 @@ GROUPS = {
     "pure": "A4",
     "flags": "L2",
     "wc": "L2",
+    "l2fixes": "L2",
 }
 
 
@@ -401,6 +402,7 @@ def main():
     if not filt or "neg" in filt:
         print("== negative cases", flush=True)
         negative_compile("pe014.bad1", "A4")
+        negative_compile("l2fixes.bad1", "L2")
         negative_compile("sharing.bad1", "R6")
         negative_compile("sync.bad1", "R6")
         negative_compile("sync.bad2", "R6")

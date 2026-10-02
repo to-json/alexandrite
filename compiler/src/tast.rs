@@ -316,6 +316,8 @@ pub enum M {
     Lock,
     /// `(a, b)`: a tuple of the args.
     TupleNew,
+    /// `xs.join(sep)` (args[0] is sep).
+    Join,
     /// `fmt.print*`: write a Str (args[0]) to stdout, no newline added.
     PrintStr,
     /// `Atomic.new(v)`; `load`, `store(v)`, `add(n)` (the new value),

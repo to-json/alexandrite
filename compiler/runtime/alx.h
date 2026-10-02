@@ -193,6 +193,7 @@ static inline bool alx_str_is_pal(AlxStr s) {
 int alx_str_cmp(AlxStr a, AlxStr b);
 AlxStr alx_str_delete(AlxStr s, AlxStr chars);
 Arr_Str alx_str_split(AlxStr s, AlxStr sep);
+AlxStr alx_str_join(Arr_Str a, AlxStr sep);
 int64_t alx_str_to_i(AlxStr s);
 /* Byte length of the UTF-8 character starting at byte i. */
 int64_t alx_str_charlen(AlxStr s, int64_t i);

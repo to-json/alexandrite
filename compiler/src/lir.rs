@@ -263,6 +263,8 @@ pub enum Rt {
     FFmt,
     /// Concatenate all argument strings.
     StrCat,
+    /// (arr: [Str], sep): the elements with `sep` between them.
+    StrJoin,
     /// (s, width, flags): pad to `width` runes; flags 1 = on the right
     /// (`%-5s`), 2 = with zeros after any sign (`%05d`).
     StrPad,

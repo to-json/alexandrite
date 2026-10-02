@@ -794,6 +794,7 @@ impl FnEmit<'_> {
                     Rt::StrRev => s("alx_str_rev"),
                     Rt::StrDelete => s("alx_str_delete"),
                     Rt::StrSplit => s("alx_str_split"),
+                    Rt::StrJoin => s("alx_str_join"),
                     Rt::StrToI => s("alx_str_to_i"),
                     Rt::StrChar => s("alx_str_charlen"),
                     Rt::StrByte => {

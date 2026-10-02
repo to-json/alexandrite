@@ -48,6 +48,7 @@ const RT: &[(&str, &str)] = &[
     ("alxr_str_cmp", "jjjj>i"),
     ("alxr_str_delete", "jjjj>"),
     ("alxr_str_split", "jjjj>"),
+    ("alxr_str_join", "jjjjj>"),
     ("alxr_str_to_i", "jj>j"),
     ("alxr_str_charlen", "jjj>j"),
     ("alxr_str_sub", "jjjj>"),
@@ -1154,7 +1155,7 @@ impl<'c, 'p> Fx<'c, 'p> {
             LE::Cond(_, a, _) => self.ty(a),
             LE::Call(f, _) => self.cx.funcs[f.as_str()].1.ret.clone(),
             LE::Rt(r, args) => match r {
-                Rt::IntToS | Rt::PIntToS | Rt::StrRev | Rt::StrDelete | Rt::FToS | Rt::FFmt | Rt::FFmtE | Rt::StrPad | Rt::StrQuote | Rt::StrCat | Rt::U64ToS | Rt::IntFmt | Rt::RuneToS | Rt::StrFromBytes | Rt::FileRead | Rt::CapEnd => LTy::Str,
+                Rt::IntToS | Rt::PIntToS | Rt::StrRev | Rt::StrDelete | Rt::StrJoin | Rt::FToS | Rt::FFmt | Rt::FFmtE | Rt::StrPad | Rt::StrQuote | Rt::StrCat | Rt::U64ToS | Rt::IntFmt | Rt::RuneToS | Rt::StrFromBytes | Rt::FileRead | Rt::CapEnd => LTy::Str,
                 Rt::FileStatus | Rt::NowNs | Rt::CapBegin => LTy::I64,
                 Rt::IntToF | Rt::FSqrt | Rt::FAbs | Rt::Math(_) | Rt::FFromBits => LTy::F64,
                 Rt::FBits => LTy::IntK(IntKind::U64),
@@ -1596,6 +1597,7 @@ impl<'c, 'p> Fx<'c, 'p> {
             Rt::StrRev => call_ret(self, "alxr_str_rev", 2),
             Rt::StrDelete => call_ret(self, "alxr_str_delete", 2),
             Rt::StrSplit => call_ret(self, "alxr_str_split", 3),
+            Rt::StrJoin => call_ret(self, "alxr_str_join", 2),
             Rt::StrToI => call(self, "alxr_str_to_i"),
             Rt::StrChar => call(self, "alxr_str_charlen"),
             Rt::StrByte => {

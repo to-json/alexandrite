@@ -443,6 +443,19 @@ Arr_Str alx_str_split(AlxStr s, AlxStr sep) {
     return a;
 }
 
+AlxStr alx_str_join(Arr_Str a, AlxStr sep) {
+    int64_t len = 0;
+    for (int64_t i = 0; i < a.len; i++) len += a.ptr[i].len + (i > 0 ? sep.len : 0);
+    char *p = alx_alloc((size_t)(len ? len : 1));
+    int64_t o = 0;
+    for (int64_t i = 0; i < a.len; i++) {
+        if (i > 0 && sep.len) { memcpy(p + o, sep.ptr, (size_t)sep.len); o += sep.len; }
+        if (a.ptr[i].len) { memcpy(p + o, a.ptr[i].ptr, (size_t)a.ptr[i].len); o += a.ptr[i].len; }
+    }
+    AlxStr r = { p, len };
+    return r;
+}
+
 int64_t alx_str_to_i(AlxStr s) {
     /* Ruby: leading whitespace, optional sign, digits; garbage stops it. */
     int64_t i = 0, v = 0;

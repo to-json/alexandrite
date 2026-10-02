@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception */
 /* Runtime test for tasks and channels.
  * Run (from compiler/runtime):
  *   clang -O1 -g -pthread -I. -Ilibtommath -o /tmp/tasks_test tests/tasks_test.c alx.c alx_big.c -lm && /tmp/tasks_test

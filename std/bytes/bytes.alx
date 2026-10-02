@@ -1,0 +1,747 @@
+# Package bytes: Go's bytes, for `[Byte]` (S2). The twin of `strings`.
+#
+# Conventions (as in strings, see GO-VS-RUBY.md S2):
+#  - Names are Go's, in snake_case; indexes and sizes are in bytes; "not found"
+#    for the index family is -1. (T, bool) pairs are options: `cut` returns
+#    `([Byte], [Byte])?`, `cut_prefix` / `cut_suffix` return `[Byte]?`.
+#  - Aliasing follows Go. Results Go documents as subslices of the input
+#    (split*, fields*, trim*, cut*) share its storage; they have no spare
+#    capacity (D6), so appending to one copies. Results Go documents as copies
+#    (clone, join, repeat, replace*, map, to_lower, to_upper, to_valid_utf8,
+#    runes) never alias their input.
+#  - Invalid UTF-8 decodes as U+FFFD with width 1, as in Go.
+#  - Case mapping and equal_fold go through strings' tables (ASCII, Latin-1,
+#    Latin Extended-A, Greek, Cyrillic) at the cost of one Str round trip.
+#  - Builtin methods win over method sugar, so a name that is also a builtin
+#    array method (`map`, `repeat`...) is called qualified: `bytes.map(f, b)`.
+#  - Buffer (Go's bytes.Buffer) follows the io shape of GO-VS-RUBY F3: end of
+#    data is not an error. `read!` returns 0 at EOF (and for an empty p);
+#    `read_byte!`, `read_rune!`, `read_string!`, `read_bytes!` return none at
+#    EOF. `read_string!(delim)` returns the text through the delimiter, or the
+#    remainder if there is none (Go returns it with io.EOF); none only when
+#    nothing was left. `cap` is the length (no capacity primitive yet) and
+#    `grow!` only validates n.
+
+import "strings"
+
+BAD = 0xFFFD * 8 + 1
+
+def is_cont(b: Int) -> Bool { b >= 0x80 && b <= 0xBF }
+
+# Decode the rune starting at byte i (i < s.size).
+def dec(s: [Byte], i: Int) -> Int {
+  n = s.size
+  b0 = s[i].to_i
+  return b0 * 8 + 1 if b0 < 0x80
+  return BAD if b0 < 0xC2 || b0 > 0xF4
+  return BAD if i + 1 >= n
+  b1 = s[i + 1].to_i
+  if b0 < 0xE0 {
+    return BAD if !is_cont(b1)
+    return (((b0 & 0x1F) << 6) | (b1 & 0x3F)) * 8 + 2
+  }
+  lo = 0x80
+  hi = 0xBF
+  if b0 == 0xE0 { lo = 0xA0 }
+  if b0 == 0xED { hi = 0x9F }
+  if b0 == 0xF0 { lo = 0x90 }
+  if b0 == 0xF4 { hi = 0x8F }
+  return BAD if b1 < lo || b1 > hi
+  return BAD if i + 2 >= n
+  b2 = s[i + 2].to_i
+  return BAD if !is_cont(b2)
+  if b0 < 0xF0 {
+    return (((b0 & 0x0F) << 12) | ((b1 & 0x3F) << 6) | (b2 & 0x3F)) * 8 + 3
+  }
+  return BAD if i + 3 >= n
+  b3 = s[i + 3].to_i
+  return BAD if !is_cont(b3)
+  (((b0 & 0x07) << 18) | ((b1 & 0x3F) << 12) | ((b2 & 0x3F) << 6) | (b3 & 0x3F)) * 8 + 4
+}
+
+# Decode the rune ending just before byte e (e > 0).
+def dec_last(s: [Byte], e: Int) -> Int {
+  start = e - 1
+  b = s[start].to_i
+  return b * 8 + 1 if b < 0x80
+  lim = e - 4
+  lim = 0 if lim < 0
+  start -= 1
+  while start >= lim {
+    break if !is_cont(s[start].to_i)
+    start -= 1
+  }
+  start = lim if start < lim
+  v = dec(s, start)
+  return BAD if start + (v & 7) != e
+  v
+}
+
+def valid_rune(c: Int) -> Bool { c >= 0 && c <= 0x10FFFF && !(c >= 0xD800 && c <= 0xDFFF) }
+
+def rune_count(s: [Byte]) -> Int {
+  n = s.size
+  i = 0
+  c = 0
+  while i < n {
+    i += dec(s, i) & 7
+    c += 1
+  }
+  c
+}
+
+def is_space_rune(r: Int) -> Bool {
+  if r < 0x100 { return r == 32 || (r >= 9 && r <= 13) || r == 0x85 || r == 0xA0 }
+  r == 0x1680 || (r >= 0x2000 && r <= 0x200A) || r == 0x2028 || r == 0x2029 || r == 0x202F || r == 0x205F || r == 0x3000
+}
+
+# ------------------------------------------------------------------ building
+
+# out with src[a...b] appended (always use the result).
+def app(out: [Byte], src: [Byte], a: Int, b: Int) -> [Byte] {
+  res = out
+  i = a
+  while i < b {
+    res << src[i]
+    i += 1
+  }
+  res
+}
+
+# out with the UTF-8 encoding of rune value c appended (invalid: U+FFFD).
+def put_rune(out: [Byte], c: Int) -> [Byte] {
+  res = out
+  r = c
+  r = 0xFFFD if !valid_rune(r)
+  if r < 0x80 {
+    res << r.as_u8
+  } else if r < 0x800 {
+    res << (0xC0 | (r >> 6)).as_u8
+    res << (0x80 | (r & 0x3F)).as_u8
+  } else if r < 0x10000 {
+    res << (0xE0 | (r >> 12)).as_u8
+    res << (0x80 | ((r >> 6) & 0x3F)).as_u8
+    res << (0x80 | (r & 0x3F)).as_u8
+  } else {
+    res << (0xF0 | (r >> 18)).as_u8
+    res << (0x80 | ((r >> 12) & 0x3F)).as_u8
+    res << (0x80 | ((r >> 6) & 0x3F)).as_u8
+    res << (0x80 | (r & 0x3F)).as_u8
+  }
+  res
+}
+
+def empty_bytes -> [Byte] {
+  out: [Byte] = []
+  out
+}
+
+# A copy of b with its own storage.
+pub def clone(b: [Byte]) -> [Byte] {
+  app(empty_bytes, b, 0, b.size)
+}
+
+# ------------------------------------------------------------------- search
+
+def match_at(s: [Byte], i: Int, sub: [Byte]) -> Bool {
+  m = sub.size
+  j = 0
+  while j < m {
+    return false if s[i + j] != sub[j]
+    j += 1
+  }
+  true
+}
+
+def index_from(s: [Byte], sub: [Byte], start: Int) -> Int {
+  m = sub.size
+  return start if m == 0
+  first = sub[0]
+  last = s.size - m
+  i = start
+  while i <= last {
+    return i if s[i] == first && match_at(s, i, sub)
+    i += 1
+  }
+  -1
+}
+
+# Whether a and b hold the same bytes.
+pub def equal(a: [Byte], b: [Byte]) -> Bool {
+  return false if a.size != b.size
+  match_at(a, 0, b)
+}
+
+# Three-way comparison: -1, 0 or +1 (bytewise, shorter first on a common
+# prefix).
+pub def compare(a: [Byte], b: [Byte]) -> Int {
+  n = a.size < b.size ? a.size : b.size
+  i = 0
+  while i < n {
+    return -1 if a[i] < b[i]
+    return 1 if a[i] > b[i]
+    i += 1
+  }
+  return -1 if a.size < b.size
+  return 1 if a.size > b.size
+  0
+}
+
+pub def has_prefix(b: [Byte], prefix: [Byte]) -> Bool {
+  b.size >= prefix.size && match_at(b, 0, prefix)
+}
+
+pub def has_suffix(b: [Byte], suffix: [Byte]) -> Bool {
+  b.size >= suffix.size && match_at(b, b.size - suffix.size, suffix)
+}
+
+# Index of the first instance of sep in b, or -1.
+pub def index(b: [Byte], sep: [Byte]) -> Int { index_from(b, sep, 0) }
+
+# Index of the last instance of sep in b, or -1.
+pub def last_index(b: [Byte], sep: [Byte]) -> Int {
+  m = sep.size
+  return b.size if m == 0
+  i = b.size - m
+  while i >= 0 {
+    return i if b[i] == sep[0] && match_at(b, i, sep)
+    i -= 1
+  }
+  -1
+}
+
+pub def index_byte(b: [Byte], c: Byte) -> Int {
+  i = 0
+  n = b.size
+  while i < n {
+    return i if b[i] == c
+    i += 1
+  }
+  -1
+}
+
+pub def last_index_byte(b: [Byte], c: Byte) -> Int {
+  i = b.size - 1
+  while i >= 0 {
+    return i if b[i] == c
+    i -= 1
+  }
+  -1
+}
+
+# Index of the first instance of the rune r, or -1. U+FFFD also matches
+# invalid UTF-8 bytes (Go).
+pub def index_rune(b: [Byte], r: Rune) -> Int {
+  c = r.to_i
+  return index_byte(b, c.as_u8) if c >= 0 && c < 0x80
+  n = b.size
+  if c == 0xFFFD {
+    i = 0
+    while i < n {
+      v = dec(b, i)
+      return i if (v >> 3) == 0xFFFD
+      i += v & 7
+    }
+    return -1
+  }
+  return -1 if !valid_rune(c)
+  index(b, put_rune(empty_bytes, c))
+}
+
+# Index of the first rune of b for which f is true, or -1.
+pub def index_func(b: [Byte], f: (Rune) -> Bool) -> Int {
+  n = b.size
+  i = 0
+  while i < n {
+    v = dec(b, i)
+    return i if f((v >> 3).as_i32)
+    i += v & 7
+  }
+  -1
+}
+
+# Index of the last rune of b for which f is true, or -1.
+pub def last_index_func(b: [Byte], f: (Rune) -> Bool) -> Int {
+  e = b.size
+  while e > 0 {
+    v = dec_last(b, e)
+    e -= v & 7
+    return e if f((v >> 3).as_i32)
+  }
+  -1
+}
+
+# Index of the first rune of b that is in chars, or -1.
+pub def index_any(b: [Byte], chars: Str) -> Int {
+  return -1 if chars.size == 0
+  n = b.size
+  i = 0
+  while i < n {
+    v = dec(b, i)
+    return i if strings.index_rune(chars, (v >> 3).as_i32) >= 0
+    i += v & 7
+  }
+  -1
+}
+
+# Index of the last rune of b that is in chars, or -1.
+pub def last_index_any(b: [Byte], chars: Str) -> Int {
+  return -1 if chars.size == 0
+  e = b.size
+  while e > 0 {
+    v = dec_last(b, e)
+    e -= v & 7
+    return e if strings.index_rune(chars, (v >> 3).as_i32) >= 0
+  }
+  -1
+}
+
+pub def contains(b: [Byte], sub: [Byte]) -> Bool { index(b, sub) >= 0 }
+pub def contains_any(b: [Byte], chars: Str) -> Bool { index_any(b, chars) >= 0 }
+pub def contains_rune(b: [Byte], r: Rune) -> Bool { index_rune(b, r) >= 0 }
+pub def contains_func(b: [Byte], f: (Rune) -> Bool) -> Bool { index_func(b, f) >= 0 }
+
+# Number of non-overlapping instances of sep in b; with an empty sep, the
+# number of runes plus one.
+pub def count(b: [Byte], sep: [Byte]) -> Int {
+  return rune_count(b) + 1 if sep.size == 0
+  c = 0
+  i = 0
+  loop {
+    j = index_from(b, sep, i)
+    break if j < 0
+    c += 1
+    i = j + sep.size
+  }
+  c
+}
+
+# Slices b around the first instance of sep (subslices of b); none if absent.
+pub def cut(b: [Byte], sep: [Byte]) -> ([Byte], [Byte])? {
+  i = index(b, sep)
+  return none if i < 0
+  (b[0...i], b[i + sep.size...b.size])
+}
+
+pub def cut_prefix(b: [Byte], prefix: [Byte]) -> [Byte]? {
+  return none if !has_prefix(b, prefix)
+  b[prefix.size...b.size]
+}
+
+pub def cut_suffix(b: [Byte], suffix: [Byte]) -> [Byte]? {
+  return none if !has_suffix(b, suffix)
+  b[0...b.size - suffix.size]
+}
+
+# Whether a and b are equal under simple Unicode case folding (strings' table
+# coverage).
+pub def equal_fold(a: [Byte], b: [Byte]) -> Bool {
+  strings.equal_fold(Str.from_bytes(a), Str.from_bytes(b))
+}
+
+# ---------------------------------------------------------------- splitting
+
+def explode(s: [Byte], n: Int) -> [[Byte]] {
+  out: [[Byte]] = []
+  size = s.size
+  i = 0
+  while i < size {
+    if n > 0 && out.size == n - 1 {
+      out << s[i...size]
+      return out
+    }
+    w = dec(s, i) & 7
+    out << s[i...i + w]
+    i += w
+  }
+  out
+}
+
+def gen_split(s: [Byte], sep: [Byte], save: Int, n: Int) -> [[Byte]] {
+  out: [[Byte]] = []
+  return out if n == 0
+  return explode(s, n) if sep.size == 0
+  start = 0
+  loop {
+    break if n > 0 && out.size >= n - 1
+    j = index_from(s, sep, start)
+    break if j < 0
+    out << s[start...j + save]
+    start = j + sep.size
+  }
+  out << s[start...s.size]
+  out
+}
+
+# Splits s around every instance of sep (subslices of s). An empty sep splits
+# into UTF-8 sequences.
+pub def split(s: [Byte], sep: [Byte]) -> [[Byte]] { gen_split(s, sep, 0, -1) }
+pub def split_after(s: [Byte], sep: [Byte]) -> [[Byte]] { gen_split(s, sep, sep.size, -1) }
+# At most n pieces (n < 0: all; n == 0: none); the last holds the remainder.
+pub def split_n(s: [Byte], sep: [Byte], n: Int) -> [[Byte]] { gen_split(s, sep, 0, n) }
+pub def split_after_n(s: [Byte], sep: [Byte], n: Int) -> [[Byte]] { gen_split(s, sep, sep.size, n) }
+
+# Splits s around runs of runes for which f is true; no empty pieces.
+pub def fields_func(s: [Byte], f: (Rune) -> Bool) -> [[Byte]] {
+  out: [[Byte]] = []
+  n = s.size
+  start = -1
+  i = 0
+  while i < n {
+    v = dec(s, i)
+    if f((v >> 3).as_i32) {
+      if start >= 0 {
+        out << s[start...i]
+        start = -1
+      }
+    } else if start < 0 {
+      start = i
+    }
+    i += v & 7
+  }
+  out << s[start...n] if start >= 0
+  out
+}
+
+# Splits s around runs of Unicode white space; no empty pieces.
+pub def fields(s: [Byte]) -> [[Byte]] {
+  out: [[Byte]] = []
+  n = s.size
+  start = -1
+  i = 0
+  while i < n {
+    v = dec(s, i)
+    if is_space_rune(v >> 3) {
+      if start >= 0 {
+        out << s[start...i]
+        start = -1
+      }
+    } else if start < 0 {
+      start = i
+    }
+    i += v & 7
+  }
+  out << s[start...n] if start >= 0
+  out
+}
+
+# A new slice: the elements of s with sep between them.
+pub def join(s: [[Byte]], sep: [Byte]) -> [Byte] {
+  out = empty_bytes
+  i = 0
+  while i < s.size {
+    out = app(out, sep, 0, sep.size) if i > 0
+    out = app(out, s[i], 0, s[i].size)
+    i += 1
+  }
+  out
+}
+
+# b repeated count times (a new slice). Panics if count is negative.
+pub def repeat(b: [Byte], count: Int) -> [Byte] {
+  assert count >= 0 # negative count panics (Go)
+  out = empty_bytes
+  i = 0
+  while i < count {
+    out = app(out, b, 0, b.size)
+    i += 1
+  }
+  out
+}
+
+# The runes of s as a slice (invalid bytes become U+FFFD).
+pub def runes(s: [Byte]) -> [Rune] {
+  out: [Rune] = []
+  n = s.size
+  i = 0
+  while i < n {
+    v = dec(s, i)
+    out << (v >> 3).as_i32
+    i += v & 7
+  }
+  out
+}
+
+# ---------------------------------------------------------------- replacing
+
+# A copy of s with the first n non-overlapping instances of old replaced by
+# new (n < 0: all). An empty old matches before every rune and at the end.
+pub def replace(s: [Byte], old: [Byte], new: [Byte], n: Int) -> [Byte] {
+  m = count(s, old)
+  return clone(s) if m == 0 || n == 0
+  limit = n
+  limit = m if n < 0 || m < n
+  out = empty_bytes
+  start = 0
+  k = 0
+  while k < limit {
+    j = start
+    if old.size == 0 {
+      j += dec(s, start) & 7 if k > 0
+    } else {
+      j = index_from(s, old, start)
+    }
+    out = app(out, s, start, j)
+    out = app(out, new, 0, new.size)
+    start = j + old.size
+    k += 1
+  }
+  app(out, s, start, s.size)
+}
+
+pub def replace_all(s: [Byte], old: [Byte], new: [Byte]) -> [Byte] { replace(s, old, new, -1) }
+
+# A copy of s with every rune mapped through mapping; runes mapped to a
+# negative value are dropped.
+pub def map(mapping: (Rune) -> Rune, s: [Byte]) -> [Byte] {
+  out = empty_bytes
+  n = s.size
+  i = 0
+  while i < n {
+    v = dec(s, i)
+    m = mapping((v >> 3).as_i32).to_i
+    out = put_rune(out, m) if m >= 0
+    i += v & 7
+  }
+  out
+}
+
+# A copy of s with each run of invalid UTF-8 bytes replaced by replacement.
+pub def to_valid_utf8(s: [Byte], replacement: [Byte]) -> [Byte] {
+  out = empty_bytes
+  n = s.size
+  i = 0
+  bad = false
+  while i < n {
+    v = dec(s, i)
+    w = v & 7
+    if v == BAD {
+      out = app(out, replacement, 0, replacement.size) if !bad
+      bad = true
+    } else {
+      out = app(out, s, i, i + w)
+      bad = false
+    }
+    i += w
+  }
+  out
+}
+
+# ------------------------------------------------------------------- case
+
+# Upper-case copy of s (strings' coverage note applies).
+pub def to_upper(s: [Byte]) -> [Byte] {
+  clone(strings.to_upper(Str.from_bytes(s)).bytes.to_a)
+}
+
+# Lower-case copy of s.
+pub def to_lower(s: [Byte]) -> [Byte] {
+  clone(strings.to_lower(Str.from_bytes(s)).bytes.to_a)
+}
+
+# ------------------------------------------------------------------ trimming
+# All trims return subslices of the input.
+
+pub def trim_left_func(s: [Byte], f: (Rune) -> Bool) -> [Byte] {
+  n = s.size
+  i = 0
+  while i < n {
+    v = dec(s, i)
+    break if !f((v >> 3).as_i32)
+    i += v & 7
+  }
+  s[i...n]
+}
+
+pub def trim_right_func(s: [Byte], f: (Rune) -> Bool) -> [Byte] {
+  e = s.size
+  while e > 0 {
+    v = dec_last(s, e)
+    break if !f((v >> 3).as_i32)
+    e -= v & 7
+  }
+  s[0...e]
+}
+
+pub def trim_func(s: [Byte], f: (Rune) -> Bool) -> [Byte] { trim_right_func(trim_left_func(s, f), f) }
+
+pub def trim_left(s: [Byte], cutset: Str) -> [Byte] {
+  return s if s.size == 0 || cutset.size == 0
+  trim_left_func(s, ->(r: Rune) -> Bool { strings.index_rune(cutset, r) >= 0 })
+}
+
+pub def trim_right(s: [Byte], cutset: Str) -> [Byte] {
+  return s if s.size == 0 || cutset.size == 0
+  trim_right_func(s, ->(r: Rune) -> Bool { strings.index_rune(cutset, r) >= 0 })
+}
+
+pub def trim(s: [Byte], cutset: Str) -> [Byte] {
+  return s if s.size == 0 || cutset.size == 0
+  trim_right(trim_left(s, cutset), cutset)
+}
+
+pub def trim_prefix(s: [Byte], prefix: [Byte]) -> [Byte] {
+  return s if !has_prefix(s, prefix)
+  s[prefix.size...s.size]
+}
+
+pub def trim_suffix(s: [Byte], suffix: [Byte]) -> [Byte] {
+  return s if !has_suffix(s, suffix)
+  s[0...s.size - suffix.size]
+}
+
+# s without leading and trailing Unicode white space.
+pub def trim_space(s: [Byte]) -> [Byte] {
+  n = s.size
+  i = 0
+  while i < n {
+    v = dec(s, i)
+    break if !is_space_rune(v >> 3)
+    i += v & 7
+  }
+  e = n
+  while e > i {
+    v = dec_last(s, e)
+    break if !is_space_rune(v >> 3)
+    e -= v & 7
+  }
+  s[i...e]
+}
+
+# -------------------------------------------------------------------- Buffer
+# A growable byte buffer with a read offset (Go's bytes.Buffer). Writes append;
+# reads consume from the front. The zero value is an empty buffer.
+pub struct Buffer {
+  buf: [Byte]
+  off: Int
+
+  # Appends p; returns len(p).
+  pub def write!(p: [Byte]) -> Int {
+    n = p.size
+    i = 0
+    while i < n {
+      self.buf << p[i]
+      i += 1
+    }
+    n
+  }
+  # Appends s; returns the number of bytes written.
+  pub def write_string!(s: Str) -> Int {
+    n = s.size
+    i = 0
+    while i < n {
+      self.buf << s[i]
+      i += 1
+    }
+    n
+  }
+  pub def write_byte!(c: Byte) {
+    self.buf << c
+  }
+  # Appends r as UTF-8 (invalid values become U+FFFD); returns bytes written.
+  pub def write_rune!(r: Rune) -> Int {
+    before = buf.size
+    self.buf = put_rune(buf, r.to_i)
+    buf.size - before
+  }
+
+  # Unread bytes.
+  pub def size -> Int { buf.size - off }
+  pub def len -> Int { buf.size - off }
+  # Capacity: the length (no capacity primitive yet).
+  pub def cap -> Int { buf.size }
+  # The unread portion, aliasing the buffer; valid until the next write.
+  pub def bytes -> [Byte] { buf[off...buf.size] }
+  pub def to_s -> Str { Str.from_bytes(buf[off...buf.size]) }
+  pub def string -> Str { Str.from_bytes(buf[off...buf.size]) }
+
+  pub def reset! {
+    self.buf = []
+    self.off = 0
+  }
+  # Keeps only the first n unread bytes. Panics unless 0 <= n <= size.
+  pub def truncate!(n: Int) {
+    assert n >= 0 && n <= buf.size - off, "truncate out of range"
+    if n == 0 {
+      self.buf = []
+      self.off = 0
+    } else {
+      self.buf = buf[0...off + n]
+    }
+  }
+  pub def grow!(n: Int) {
+    assert n >= 0, "negative count"
+  }
+
+  # Reads up to p.size bytes into p; returns the count, 0 at EOF (or if p is
+  # empty).
+  pub def read!(p: [Byte]) -> Int {
+    avail = buf.size - off
+    n = p.size < avail ? p.size : avail
+    return 0 if n == 0
+    copy(p[0...n], buf[off...off + n])
+    self.off = off + n
+    if off == buf.size {
+      self.buf = []
+      self.off = 0
+    }
+    n
+  }
+  # The next n unread bytes (fewer at the end), aliasing the buffer, and
+  # consumes them.
+  pub def next!(n: Int) -> [Byte] {
+    assert n >= 0, "negative count"
+    avail = buf.size - off
+    m = n < avail ? n : avail
+    out = buf[off...off + m]
+    self.off = off + m
+    out
+  }
+  pub def read_byte! -> Byte? {
+    return none if off >= buf.size
+    c = buf[off]
+    self.off = off + 1
+    c
+  }
+  # The next rune and its width in bytes; none at EOF. Invalid UTF-8 reads as
+  # (U+FFFD, 1).
+  pub def read_rune! -> (Rune, Int)? {
+    return none if off >= buf.size
+    v = dec(buf, off)
+    self.off = off + (v & 7)
+    ((v >> 3).as_i32, v & 7)
+  }
+  # Reads through the first delim (included), or to the end if there is none;
+  # none if nothing was left.
+  pub def read_bytes!(delim: Byte) -> [Byte]? {
+    return none if off >= buf.size
+    i = off
+    while i < buf.size && buf[i] != delim {
+      i += 1
+    }
+    e = i < buf.size ? i + 1 : i
+    out = clone(buf[off...e])
+    self.off = e
+    out
+  }
+  pub def read_string!(delim: Byte) -> Str? {
+    return none if off >= buf.size
+    i = off
+    while i < buf.size && buf[i] != delim {
+      i += 1
+    }
+    e = i < buf.size ? i + 1 : i
+    out = Str.from_bytes(buf[off...e])
+    self.off = e
+    out
+  }
+}
+
+# A Buffer holding a copy of b, ready to read.
+pub def new_buffer(b: [Byte]) -> Buffer {
+  Buffer.new(buf: clone(b), off: 0)
+}
+
+pub def new_buffer_string(s: Str) -> Buffer {
+  Buffer.new(buf: s.bytes.to_a, off: 0)
+}

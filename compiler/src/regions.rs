@@ -40,6 +40,9 @@ pub enum Place {
     Iter(usize),
     Frame,
     Ret,
+    /// Stored into the storage behind parameter p (and nothing longer-lived):
+    /// allocated in the region of the container it's stored into (R2).
+    Into(LocalId),
     Global,
 }
 
@@ -49,6 +52,8 @@ pub enum Place {
 pub struct FnPlacement {
     pub sites: HashMap<usize, Place>,
     pub loops: std::collections::HashSet<usize>,
+    /// Some site is stored into a parameter's storage.
+    pub into: bool,
 }
 
 /// Per function: does parameter i flow to the result, or escape?
@@ -459,21 +464,24 @@ pub fn analyze(p: &TProgram) -> Vec<FnPlacement> {
                 return FnPlacement::default();
             }
             let g = graph(f, &sums);
-            let cls = g.classes();
             let fresh = fresh_locals(f, &g);
             let mut out = FnPlacement::default();
             for s in &g.sites {
-                let place = match cls.get(&Node::Site(*s)).copied().unwrap_or(Class::Local) {
-                    Class::Global => Place::Global,
-                    Class::Ret => Place::Ret,
-                    Class::Local => {
-                        // The innermost loop whose iteration nothing it
-                        // reaches outlives.
-                        let reach = reaches_from(&g, Node::Site(*s));
-                        let locals: Vec<LocalId> = reach.iter().filter_map(|n| if let Node::Local(l) = n { Some(*l) } else { None }).collect();
-                        let loops = g.site_loops.get(s).cloned().unwrap_or_default();
-                        loops.iter().rev().find(|l| fresh.get(l).is_some_and(|ok| locals.iter().all(|x| ok.contains(x)))).map_or(Place::Frame, |l| Place::Iter(*l))
-                    }
+                let reach = reaches_from(&g, Node::Site(*s));
+                let callers: Vec<LocalId> = reach.iter().filter_map(|n| if let Node::Caller(l) = n { Some(*l) } else { None }).collect();
+                let ret = reach.contains(&Node::Ret);
+                let place = if reach.contains(&Node::Global) || callers.len() > 1 || (ret && !callers.is_empty()) {
+                    Place::Global
+                } else if let [p] = callers.as_slice() {
+                    out.into = true;
+                    Place::Into(*p)
+                } else if ret {
+                    Place::Ret
+                } else {
+                    // The innermost loop whose iteration nothing it reaches outlives.
+                    let locals: Vec<LocalId> = reach.iter().filter_map(|n| if let Node::Local(l) = n { Some(*l) } else { None }).collect();
+                    let loops = g.site_loops.get(s).cloned().unwrap_or_default();
+                    loops.iter().rev().find(|l| fresh.get(l).is_some_and(|ok| locals.iter().all(|x| ok.contains(x)))).map_or(Place::Frame, |l| Place::Iter(*l))
                 };
                 if let Place::Iter(l) = place {
                     out.loops.insert(l);

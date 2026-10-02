@@ -1,0 +1,401 @@
+# Package flag: Go's flag — command-line flag parsing.
+#
+# Go's flag.Int returns a *int that Parse fills in. Alexandrite has no
+# pointers, so a FlagSet owns the values and you read them back by name:
+#
+#   fs = flag.new_set("prog")
+#   fs.int!("n", 5, "how many")          # Go: n := fs.Int("n", 5, "how many")
+#   fs.bool!("v", false, "verbose")
+#   fs.str!("name", "x", "who")
+#   fs.strs!("I", "include dir")         # repeated: -I a -I b collects both
+#   fs.var!("level", my_value, "level")  # custom flag.Value (set! returns the rejection reason or none)
+#   r = fs.parse!(args)                  # a ~Unit<FlagError>; `~r` propagates it
+#   n = fs.get_int("n")                  # *n
+#   rest = fs.args                       # fs.Args(): the non-flag arguments
+#
+# Getters (get_bool, get_int, get_float, get_str, get_strs, get_value) panic
+# on an unknown name or the wrong kind. `set?(name)` is Go's Visit (was the
+# flag given on the command line); `names` lists the flags sorted.
+#
+# Parsing follows Go: `-f`, `--f`, `-f=x`, `-f x` (not for bools: a bool
+# takes only `-f` or `-f=false`), `--` ends the flags and is consumed,
+# parsing stops at the first non-flag argument (or a lone `-`), integers
+# take Go's syntax (0x, 0o, 0b, underscores: strconv.parse_int base 0).
+# `-h` / `-help` (when not defined) fail with FlagError.Help carrying the
+# usage text. Unlike Go, parse! never prints: `fs.usage` returns the text.
+#
+# The program's own arguments: `flag.args_of_program` (argv without argv[0]),
+# `fs.parse_program!` = `fs.parse!(args_of_program)`.
+#
+# Differences from Go: no Duration/Uint/Int64 flags (no time package yet; use
+# `var!` with your own Value), no global CommandLine set, no ContinueOnError
+# policy (parse! always returns the error and never exits or prints), no
+# per-flag Lookup struct. A custom Value is copied into the set (interface
+# values are sums), so read it back with `get_value(name)`.
+
+import "strconv"
+import "strings"
+
+# The ways parsing fails (Go reports these as plain errors; ErrHelp is Help).
+pub error FlagError {
+  Unknown(name: Str)                        # flag provided but not defined
+  Missing(name: Str)                        # flag needs an argument
+  BadValue(name: Str, value: Str, why: Str) # the value didn't parse / set failed
+  BadSyntax(arg: Str)                       # ---x, -=x
+  Help(usage: Str)                          # -h / -help: the usage text
+
+  def message -> Str {
+    case self {
+      Unknown(n) => "flag provided but not defined: -#{n}"
+      Missing(n) => "flag needs an argument: -#{n}"
+      BadValue(n, v, why) => "invalid value #{strconv.quote(v)} for flag -#{n}: #{why}"
+      BadSyntax(a) => "bad flag syntax: #{a}"
+      Help(u) => u
+    }
+  }
+}
+
+# A custom flag value (Go's flag.Value). `set!` receives the text after the
+# flag and returns none, or the reason it was rejected (shown as
+# "invalid value ...: reason"). (Not `~Unit`: a fallible result doesn't
+# survive an interface call yet.)
+pub interface Value {
+  def set!(s: Str) -> Str?
+  def to_s -> Str
+}
+
+K_BOOL = 0
+K_INT = 1
+K_FLOAT = 2
+K_STR = 3
+K_LIST = 4
+K_VAR = 5
+
+struct Flag {
+  name: Str
+  usage: Str
+  kind: Int
+  defv: Str # the default, as text (for usage)
+  b: Bool
+  i: Int
+  f: Float
+  s: Str
+  list: [Str]
+  vidx: Int # index into the set's custom values
+  given: Bool
+}
+
+pub struct FlagSet {
+  name: Str
+  flags: [Flag]
+  vals: [Value]
+  rest: [Str]
+  parsed: Bool
+
+  def add!(name: Str, usage: Str, kind: Int, defv: Str) -> Int {
+    if name.size == 0 || name[0] == 45 || name.contains("=") {
+      panic "flag: bad flag name #{strconv.quote(name)}"
+    }
+    for fl in flags {
+      panic "flag redefined: #{name}" if fl.name == name
+    }
+    self.flags << Flag.new(name: name, usage: usage, kind: kind, defv: defv, b: false, i: 0, f: 0.0, s: "", list: [], vidx: -1, given: false)
+    flags.size - 1
+  }
+
+  def find(name: Str) -> Int {
+    i = 0
+    while i < flags.size {
+      return i if flags[i].name == name
+      i += 1
+    }
+    -1
+  }
+
+  def must(name: Str, kind: Int) -> Int {
+    i = find(name)
+    panic "flag: no flag named #{name}" if i < 0
+    panic "flag: -#{name} has a different type" if flags[i].kind != kind
+    i
+  }
+
+  # Defines a bool flag with a default.
+  pub def bool!(name: Str, value: Bool, usage: Str) {
+    i = add!(name, usage, K_BOOL, "#{value}")
+    self.flags[i].b = value
+  }
+
+  pub def int!(name: Str, value: Int, usage: Str) {
+    i = add!(name, usage, K_INT, "#{value}")
+    self.flags[i].i = value
+  }
+
+  pub def float!(name: Str, value: Float, usage: Str) {
+    i = add!(name, usage, K_FLOAT, "#{value}")
+    self.flags[i].f = value
+  }
+
+  pub def str!(name: Str, value: Str, usage: Str) {
+    i = add!(name, usage, K_STR, value)
+    self.flags[i].s = value
+  }
+
+  # A flag that may repeat; every occurrence is collected, in order.
+  pub def strs!(name: Str, usage: Str) {
+    add!(name, usage, K_LIST, "")
+  }
+
+  # A flag with a user-defined Value; its current to_s is the default.
+  pub def var!(name: Str, v: Value, usage: Str) {
+    i = add!(name, usage, K_VAR, v.to_s)
+    self.vals << v
+    self.flags[i].vidx = vals.size - 1
+  }
+
+  pub def get_bool(name: Str) -> Bool { flags[must(name, K_BOOL)].b }
+  pub def get_int(name: Str) -> Int { flags[must(name, K_INT)].i }
+  pub def get_float(name: Str) -> Float { flags[must(name, K_FLOAT)].f }
+  pub def get_str(name: Str) -> Str { flags[must(name, K_STR)].s }
+  pub def get_strs(name: Str) -> [Str] { flags[must(name, K_LIST)].list }
+  pub def get_value(name: Str) -> Value { vals[flags[must(name, K_VAR)].vidx] }
+
+  # Was the flag given on the command line (Go's Visit)?
+  pub def set?(name: Str) -> Bool {
+    i = find(name)
+    panic "flag: no flag named #{name}" if i < 0
+    flags[i].given
+  }
+
+  # The flag names, sorted.
+  pub def names -> [Str] {
+    out: [Str] = []
+    for fl in flags { out << fl.name }
+    sort_strs(out)
+  }
+
+  # The arguments left after the flags (Go's Args).
+  pub def args -> [Str] { rest }
+  pub def arg(i: Int) -> Str? {
+    return none if i < 0 || i >= rest.size
+    rest[i]
+  }
+  pub def nargs -> Int { rest.size }
+  pub def parsed? -> Bool { parsed }
+
+  # "Usage of prog:" and the defaults.
+  pub def usage -> Str {
+    head = name.size == 0 ? "Usage:\n" : "Usage of #{name}:\n"
+    head + defaults
+  }
+
+  # The flag descriptions in Go's PrintDefaults format, sorted by name:
+  #   "  -n int\n    \thow many (default 5)\n"
+  pub def defaults -> Str {
+    out = ""
+    for n in names {
+      fl = flags[find(n)]
+      line = "  -" + fl.name
+      ty, usage = unquote_usage(fl)
+      line += " " + ty if ty.size > 0
+      if line.size <= 4 {
+        line += "\t"
+      } else {
+        line += "\n    \t"
+      }
+      line += usage.replace_all("\n", "\n    \t")
+      if !zero_default?(fl) {
+        if fl.kind == K_STR {
+          line += " (default #{strconv.quote(fl.defv)})"
+        } else {
+          line += " (default #{fl.defv})"
+        }
+      }
+      out += line + "\n"
+    }
+    out
+  }
+
+  def set_flag!(i: Int, value: Str, has_value: Bool) -> FlagError? {
+    fl = flags[i]
+    nm = fl.name
+    k = fl.kind
+    if k == K_BOOL {
+      v = true
+      if has_value {
+        r = strconv.parse_bool(value)
+        if e = r.err {
+          return FlagError.BadValue(nm, value, num_why(e))
+        }
+        v = r.unwrap
+      }
+      self.flags[i].b = v
+    } else if k == K_INT {
+      ri = strconv.parse_int(value, 0, 64)
+      if e2 = ri.err {
+        return FlagError.BadValue(nm, value, num_why(e2))
+      }
+      self.flags[i].i = ri.unwrap
+    } else if k == K_FLOAT {
+      rf = strconv.parse_float(value)
+      if e3 = rf.err {
+        return FlagError.BadValue(nm, value, num_why(e3))
+      }
+      self.flags[i].f = rf.unwrap
+    } else if k == K_STR {
+      self.flags[i].s = value
+    } else if k == K_LIST {
+      self.flags[i].list << value
+    } else {
+      if why = self.vals[fl.vidx].set!(value) {
+        return FlagError.BadValue(nm, value, why)
+      }
+    }
+    self.flags[i].given = true
+    none
+  }
+
+  # Parses args (without the program name). Stops at the first non-flag
+  # argument; the rest is available as `args`.
+  def run!(args: [Str]) -> FlagError? {
+    self.parsed = true
+    p = 0
+    while p < args.size {
+      s = args[p]
+      break if s.size < 2 || s[0] != 45
+      minuses = 1
+      if s[1] == 45 {
+        minuses = 2
+        if s.size == 2 {
+          p += 1
+          break
+        }
+      }
+      fname = s[minuses...s.size]
+      if fname.size == 0 || fname[0] == 45 || fname[0] == 61 {
+        return FlagError.BadSyntax(s)
+      }
+      p += 1
+      value = ""
+      has_value = false
+      eq = fname.index("=")
+      if eq >= 0 {
+        value = fname[(eq + 1)...fname.size]
+        has_value = true
+        fname = fname[0...eq]
+      }
+      i = find(fname)
+      if i < 0 {
+        return FlagError.Help(usage) if fname == "help" || fname == "h"
+        return FlagError.Unknown(fname)
+      }
+      if flags[i].kind == K_BOOL {
+        e = set_flag!(i, value, has_value)
+        return e if e.present?
+      } else {
+        if !has_value && p < args.size {
+          value = args[p]
+          has_value = true
+          p += 1
+        }
+        return FlagError.Missing(fname) if !has_value
+        e = set_flag!(i, value, true)
+        return e if e.present?
+      }
+    }
+    self.rest = args[p...args.size]
+    none
+  }
+
+  # Parses args (without the program name). Stops at the first non-flag
+  # argument; the rest is available as `args`. Fails with a FlagError.
+  # (Propagate with a held value: `r = fs.parse!(a)` then `~r`; `fs.~parse!(a)`
+  # isn't accepted for `!` methods yet.)
+  pub def parse!(args: [Str]) -> ~Unit<FlagError> {
+    if e = run!(args) {
+      fail e
+    }
+  }
+
+  # Parses the program's own arguments.
+  pub def parse_program! -> ~Unit<FlagError> {
+    if e = run!(args_of_program) {
+      fail e
+    }
+  }
+}
+
+# A new, empty set. `name` is shown in the usage header.
+pub def new_set(name: Str) -> FlagSet {
+  FlagSet.new(name: name, flags: [], vals: [], rest: [], parsed: false)
+}
+
+extern def alx_argc -> Int
+extern def alx_argv(i: Int) -> Ptr
+
+# The program's arguments, without argv[0].
+pub def args_of_program -> [Str] {
+  out: [Str] = []
+  i = 1
+  n = alx_argc
+  while i < n {
+    out << Str.from_cstr(alx_argv(i))
+    i += 1
+  }
+  out
+}
+
+# Go's errParse / errRange text for a failed number.
+def num_why(e: Error) -> Str {
+  case e {
+    ErrRange(_, _) => "value out of range"
+    _ => "parse error"
+  }
+}
+
+# Go's UnquoteUsage: a `back-quoted` word in the usage is the value's name
+# (and is shown without quotes); otherwise a name by kind.
+def unquote_usage(fl: Flag) -> (Str, Str) {
+  u = fl.usage
+  a = u.index("`")
+  if a >= 0 {
+    rest = u[(a + 1)...u.size]
+    b = rest.index("`")
+    if b >= 0 {
+      return rest[0...b], u[0...a] + rest[0...b] + rest[(b + 1)...rest.size]
+    }
+  }
+  ty = case fl.kind {
+    K_BOOL => ""
+    K_INT => "int"
+    K_FLOAT => "float"
+    K_STR => "string"
+    K_LIST => "string"
+    _ => "value"
+  }
+  return ty, u
+}
+
+def zero_default?(fl: Flag) -> Bool {
+  case fl.kind {
+    K_BOOL => fl.defv == "false"
+    K_INT => fl.defv == "0"
+    K_FLOAT => fl.defv == "0"
+    _ => fl.defv == ""
+  }
+}
+
+def sort_strs(xs: [Str]) -> [Str] {
+  out = xs
+  i = 1
+  while i < out.size {
+    j = i
+    while j > 0 && out[j - 1] > out[j] {
+      t = out[j]
+      out[j] = out[j - 1]
+      out[j - 1] = t
+      j -= 1
+    }
+    i += 1
+  }
+  out
+}

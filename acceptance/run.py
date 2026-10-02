@@ -88,6 +88,7 @@ GROUPS = {
     "tuples": "L1",
     "funcvalues": "L1",
     "ffi": "L2",
+    "flags": "L2",
 }
 
 

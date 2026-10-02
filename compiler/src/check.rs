@@ -2208,7 +2208,7 @@ impl<'w, 'a> FnCx<'w, 'a> {
                     let selfl = if self.method == Some(true) { self.lookup("self") } else { None };
                     try_faults(&inner, &mut errs, selfl);
                 }
-                if self.wrap {
+                if self.wrap && fallible_op {
                     errs.remove("ArithError");
                 }
                 if errs.is_empty() && !fallible_op {

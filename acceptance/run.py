@@ -407,6 +407,8 @@ def main():
         negative_compile("sharing.bad1", "R6")
         negative_compile("sync.bad1", "R6")
         negative_compile("sync.bad2", "R6")
+        for n in (1, 2, 3):
+            negative_compile(f"jsondemo.bad{n}", "L3")
         negative_compile("sync.bad3", "R6")
         negative_compile("sync.bad4", "R6")
         negative_compile("sharing.bad2", "R6")

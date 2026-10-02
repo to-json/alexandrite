@@ -90,6 +90,8 @@ GROUPS = {
     "ffi": "L2",
     "consts": "M2",
     "arms": "M2",
+    "smallfixes": "L1",
+    "trymethod": "M5",
 }
 
 
@@ -430,6 +432,7 @@ def main():
         negative_compile("consts.bad2", "M2")
         negative_compile("arms.bad1", "M2")
         negative_compile("arms.bad2", "M2")
+        negative_compile("smallfixes.bad1", "L1")
     if not filt or "mod" in filt:
         print("== modules", flush=True)
         modules()

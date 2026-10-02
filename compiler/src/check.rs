@@ -3970,7 +3970,7 @@ impl<'w, 'a> FnCx<'w, 'a> {
         let Some(&def) = self.w.by_name.get(name) else {
             let mut msg = format!("undefined local variable or method `{name}`");
             let cands: Vec<String> = self.scopes.iter().flat_map(|s| s.keys().cloned()).chain(self.w.by_name.keys().cloned()).collect();
-            if let Some(best) = cands.iter().filter(|c| lev(c, name) <= 2).min_by_key(|c| lev(c, name)) {
+            if let Some(best) = cands.iter().filter(|c| c.as_str() != name && lev(c, name) <= 2).min_by_key(|c| lev(c, name)) {
                 msg.push_str(&format!("; did you mean `{best}`?"));
             }
             return Err(Diag::new(name_span, msg));
@@ -4650,6 +4650,7 @@ impl<'w, 'a> FnCx<'w, 'a> {
             let inner = (**inner).clone();
             return match name {
                 "present?" => Ok(mk_m(self, M::OptPresent, recv, vec![], None, Ty::Bool)),
+                "some?" => Ok(mk_m(self, M::OptPresent, recv, vec![], None, Ty::Bool)),
                 "none?" => {
                     let p = mk_m(self, M::OptPresent, recv, vec![], None, Ty::Bool);
                     Ok(self.mk(TK::Not(Box::new(p)), Ty::Bool, sp))
@@ -5142,11 +5143,21 @@ impl<'w, 'a> FnCx<'w, 'a> {
                     self.expect(&bt, &Ty::Bool, blk.span, &format!("`{name}` block"))?;
                     return Ok(mk_m(self, if name == "all?" { M::All } else { M::Any }, recv, vec![], Some(blk), Ty::Bool));
                 }
-                "count" | "size" | "length" if block.is_none() => {
+                "count" | "size" | "length" if block.is_none() && bsym.is_none() && args.is_empty() => {
                     return Ok(mk_m(self, M::Count, recv, vec![], None, Ty::Int));
                 }
+                "count" if args.is_empty() => {
+                    let (blk, bt) = self.any_block(block, bsym, &el, sp, name)?;
+                    self.expect(&bt, &Ty::Bool, blk.span, "`count` block")?;
+                    let sel = mk_m(self, M::Select, recv, vec![], Some(blk), seq(el.clone()));
+                    return Ok(mk_m(self, M::Count, sel, vec![], None, Ty::Int));
+                }
                 "include?" => {
-                    let a = argv(self)?;
+                    let mut a = argv(self)?;
+                    if a.len() == 1 {
+                        let x = a.remove(0);
+                        a.push(self.coerce(x, &el)?);
+                    }
                     self.expect(&a[0].ty, &el, a[0].span, "include?")?;
                     return Ok(mk_m(self, M::Include, recv, a, None, Ty::Bool));
                 }
@@ -5387,7 +5398,9 @@ impl<'w, 'a> FnCx<'w, 'a> {
             _ => {}
         }
         let mut msg = format!("no method `{name}` on {}", rt.show());
-        if let Some(best) = cands.iter().filter(|c| lev(c, name) <= 2).min_by_key(|c| lev(c, name)) {
+        if cands.contains(&name) {
+            msg = format!("`{name}` exists on {}, but not with these arguments or this block", rt.show());
+        } else if let Some(best) = cands.iter().filter(|c| **c != name && lev(c, name) <= 2).min_by_key(|c| lev(c, name)) {
             msg.push_str(&format!("; did you mean `{best}`?"));
         }
         Diag::new(sp, msg)

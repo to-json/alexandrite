@@ -238,7 +238,6 @@ impl<'a> Parser<'a> {
                         }
                         t => return Err(Diag::new(self.span(), format!("`pub` goes before a declaration, found {}", describe(&t)))),
                     }
-                    let _ = before;
                 }
                 Tok::Attr(_) | Tok::Kw(Kw::Def) | Tok::Kw(Kw::Fn) => m.defs.push(self.def()?),
                 Tok::Ident(kw) if kw == "extern" && matches!(self.peek_at(1), Tok::Kw(Kw::Def)) => m.defs.push(self.extern_def()?),
@@ -1282,9 +1281,17 @@ impl<'a> Parser<'a> {
             // next call (not the whole chain); the chain continues after it.
             let sp = self.bump().span;
             let mut e = self.primary()?;
-            let pkg = matches!(&e.kind, ExprKind::Name(n) if !self.is_local(n));
-            if (pkg || matches!(e.kind, ExprKind::Const(_) | ExprKind::TypeApp(..))) && self.is_op(".") {
-                e = self.postfix_step(e)?.expect("a `.` step");
+            // A bare name or constant takes its whole dotted chain up to the
+            // first call with arguments: `~p.twice`, `~self.plus(1)`, `~File.read(p)`.
+            if matches!(e.kind, ExprKind::Name(_) | ExprKind::Const(_) | ExprKind::TypeApp(..)) {
+                while self.is_op(".") && !matches!(self.peek_at(1), Tok::Op("~")) {
+                    e = self.postfix_step(e)?.expect("a `.` step");
+                    let had_args = matches!(&e.kind, ExprKind::Call { args, block, block_sym, .. } if !args.is_empty() || block.is_some() || block_sym.is_some())
+                        || matches!(self.toks[self.pos - 1].tok, Tok::Op(")"));
+                    if had_args {
+                        break;
+                    }
+                }
             }
             let full = sp.to(e.span);
             let t = self.mk(ExprKind::Try(Box::new(e)), full);

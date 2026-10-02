@@ -194,6 +194,26 @@ def explain():
     check("R7", "explain mem: regions and reasons", r.returncode == 0 and not missing, f"missing {missing}")
 
 
+def tasks_memory():
+    """R5: 100000 tasks (coroutines) in a daisy chain run in bounded memory (release build)."""
+    d = CASES / "mem"
+    r, _ = run([ALX, "build", "--release", "tasks.alx"], cwd=d)
+    binary = r.stdout.strip()
+    with open(WORK / "tasks.out", "w+") as fo, open(WORK / "tasks.err", "w+") as fe:
+        t0 = time.perf_counter()
+        pr = subprocess.Popen([binary], cwd=d, env={**os.environ, "ALX_MEMSTATS": "1"}, stdout=fo, stderr=fe)
+        _, status, ru = os.wait4(pr.pid, 0)  # this child's own rusage
+        ms = (time.perf_counter() - t0) * 1e3
+        fo.seek(0); fe.seek(0)
+        out, err = fo.read(), fe.read()
+    rss = ru.ru_maxrss if sys.platform == "darwin" else ru.ru_maxrss * 1024  # bytes
+    peak = next((int(w.split("=")[1]) for w in err.split() if w.startswith("peak=")), None)
+    ok = status == 0 and out.strip() == "100000" and peak is not None and peak <= 64 << 20 and rss < 512 << 20
+    check("R5", "100000-task daisy chain", ok, f"peak {peak} bytes, rss {rss >> 20} MiB, {ms:.0f} ms, stdout {out.strip()[:40]!r}")
+    r3, _ = run([ALX, "run", "tasks.alx"], cwd=d)
+    check("R5", "100000-task daisy chain (JIT)", r3.returncode == 0 and r3.stdout.strip() == "100000", f"exit {r3.returncode}")
+
+
 def warnings():
     """Unused locals and imports warn; --strict makes them errors."""
     d = CASES / "warn"
@@ -391,6 +411,7 @@ def main():
         warnings()
         memory()
         explain()
+        tasks_memory()
         fmt_check()
         print("== alx test", flush=True)
         testing()

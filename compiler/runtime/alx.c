@@ -5,6 +5,8 @@
 #include <errno.h>
 #include <pthread.h>
 #include <setjmp.h>
+#include <signal.h>
+#include <sys/mman.h>
 #include <unistd.h>
 
 /* ---------- memory ---------- */
@@ -718,40 +720,114 @@ void alx_pmap(const void *in, int64_t n, size_t in_size, void *out, size_t out_s
 }
 
 /* ---------- tasks and channels ----------
- * One global mutex guards every channel and task; one global condition
- * variable is broadcast on every state change (simple, and it lets `select`
- * wait on several channels at once). `g_gen` counts broadcasts: a waiter that
- * wakes with an unchanged `g_gen` was woken spuriously. Deadlock detection:
- * `g_live` counts main plus unfinished tasks; `g_blocked` counts those
- * waiting since the last broadcast. When equal, nothing can ever wake. */
+ * Tasks are stackful coroutines (hand-written context switch) multiplexed
+ * over N persistent worker threads. Blocking operations park the task; the
+ * worker goes on to run another one.
+ *
+ * Stacks: every worker owns one mmap'd run stack (guard page below, size
+ * ALX_TASK_STACK, default 256 KiB) that all its tasks run on. When a task
+ * parks, its live part [sp, top) is copied to the heap; it is copied back to
+ * the same addresses on resume. A parked task costs its used bytes (about a
+ * kilobyte) instead of a page-rounded private stack, so 100000 tasks fit.
+ * That relies on nothing outside the task pointing into its stack while it
+ * is parked (wait-list nodes live in the task, not on the stack). Under
+ * ASan/TSan (shadow state is per address) and with -DALX_PRIVATE_STACKS each
+ * task gets a private pooled stack instead.
+ *
+ * A task is PINNED to the worker that first runs it. Compiled C caches the
+ * address of a thread-local (alx_bump_cur / alx_bump_end) in a callee-saved
+ * register across calls such as alx_chan_recv, so a task resumed on another
+ * thread would keep writing the old thread's bump cache. Pinning makes that
+ * impossible; the cost is that a woken task waits for its own worker. New
+ * tasks sit in a global queue and are taken by whichever worker is free.
+ *
+ * One global mutex g_mu guards every channel, task and run queue. Each
+ * channel (and each task, for `wait`) has a wait list; a state change wakes
+ * only that list's waiters (a woken waiter re-checks its condition, so
+ * spurious wakeups are harmless). Deadlock detection: g_runnable counts the
+ * threads/tasks that are running, queued or not yet started (main included);
+ * when it would drop to zero, main (always parked then) reports it. */
+
+#ifdef __SANITIZE_THREAD__
+#  define ALX_TSAN 1
+#elif defined(__has_feature)
+#  if __has_feature(thread_sanitizer)
+#    define ALX_TSAN 1
+#  endif
+#endif
+#if defined(ALX_ASAN) || defined(ALX_TSAN) || defined(ALX_PRIVATE_STACKS)
+#  define ALX_PRIV 1
+#endif
+#ifdef ALX_ASAN
+void __sanitizer_start_switch_fiber(void **fake_save, const void *bottom, size_t size);
+void __sanitizer_finish_switch_fiber(void *fake_save, const void **bottom_old, size_t *size_old);
+void __asan_unpoison_memory_region(const volatile void *p, size_t n);
+#endif
+#ifdef ALX_TSAN
+void *__tsan_get_current_fiber(void);
+void *__tsan_create_fiber(unsigned flags);
+void __tsan_destroy_fiber(void *fiber);
+void __tsan_switch_to_fiber(void *fiber, unsigned flags);
+#endif
+
+/* Context switch: push the callee-saved registers, store sp in *from, load
+ * `to`, pop, return into it. */
+void alx_ctx_switch(void **from, void *to);
+#ifdef __APPLE__
+#  define CTX_SYM "_alx_ctx_switch"
+#  define CTX_TYPE ""
+#elif defined(__aarch64__)
+#  define CTX_SYM "alx_ctx_switch"
+#  define CTX_TYPE ".type alx_ctx_switch,%function\n"
+#else
+#  define CTX_SYM "alx_ctx_switch"
+#  define CTX_TYPE ".type alx_ctx_switch,@function\n"
+#endif
+#if defined(__aarch64__)
+enum { CTX_FRAME = 160 };
+__asm__(".text\n.p2align 2\n.globl " CTX_SYM "\n" CTX_TYPE CTX_SYM ":\n"
+    "sub sp, sp, #160\n"
+    "stp x19, x20, [sp, #0]\n stp x21, x22, [sp, #16]\n stp x23, x24, [sp, #32]\n"
+    "stp x25, x26, [sp, #48]\n stp x27, x28, [sp, #64]\n stp x29, x30, [sp, #80]\n"
+    "stp d8, d9, [sp, #96]\n stp d10, d11, [sp, #112]\n stp d12, d13, [sp, #128]\n stp d14, d15, [sp, #144]\n"
+    "mov x9, sp\n str x9, [x0]\n mov sp, x1\n"
+    "ldp x19, x20, [sp, #0]\n ldp x21, x22, [sp, #16]\n ldp x23, x24, [sp, #32]\n"
+    "ldp x25, x26, [sp, #48]\n ldp x27, x28, [sp, #64]\n ldp x29, x30, [sp, #80]\n"
+    "ldp d8, d9, [sp, #96]\n ldp d10, d11, [sp, #112]\n ldp d12, d13, [sp, #128]\n ldp d14, d15, [sp, #144]\n"
+    "add sp, sp, #160\n ret\n");
+#elif defined(__x86_64__)
+enum { CTX_FRAME = 64 };
+__asm__(".text\n.p2align 4\n.globl " CTX_SYM "\n" CTX_TYPE CTX_SYM ":\n"
+    "pushq %rbp\n pushq %rbx\n pushq %r12\n pushq %r13\n pushq %r14\n pushq %r15\n"
+    "movq %rsp, (%rdi)\n movq %rsi, %rsp\n"
+    "popq %r15\n popq %r14\n popq %r13\n popq %r12\n popq %rbx\n popq %rbp\n ret\n");
+#else
+#  error "alx.c: no context switch for this architecture"
+#endif
+
+/* The initial frame of a new task: switching to it "returns" into `entry`. */
+static void *ctx_init(char *top, void (*entry)(void)) {
+    void **sp = (void **)(top - CTX_FRAME);
+    memset(sp, 0, CTX_FRAME);
+#if defined(__aarch64__)
+    sp[11] = (void *)entry;      /* x30 */
+#else
+    sp[6] = (void *)entry;       /* return address; sp[7] = 0 pads the alignment */
+#endif
+    return sp;
+}
 
 static pthread_mutex_t g_mu = PTHREAD_MUTEX_INITIALIZER;
-static pthread_cond_t g_cv = PTHREAD_COND_INITIALIZER;
-static uint64_t g_gen;
-static int64_t g_live = 1, g_blocked;
+static int64_t g_runnable = 1;   /* main */
 
-static void wake_all(void) {
-    g_gen++;
-    g_blocked = 0;
-    pthread_cond_broadcast(&g_cv);
-}
-
-/* With g_mu held and the awaited condition false: sleep until the next
- * broadcast. False (still holding g_mu) if that can never come. */
-static bool block_wait(void) {
-    if (!tl_uncounted && ++g_blocked >= g_live) {
-        g_blocked--;
-        return false;
-    }
-    uint64_t g = g_gen;
-    do pthread_cond_wait(&g_cv, &g_mu); while (g == g_gen);
-    return true;
-}
-
-static _Noreturn void deadlock(void) {
-    pthread_mutex_unlock(&g_mu);
-    alx_panic("all tasks are asleep: deadlock", "runtime");
-}
+typedef struct WNode { struct WNode *next, **pprev; struct Parker *p; } WNode;
+typedef struct Parker {
+    AlxTask *task;               /* NULL: a plain thread (parks on cv) */
+    pthread_cond_t cv;
+    bool parked, dead, counted, cv_init;
+} Parker;
+typedef struct Worker Worker;
+typedef struct { AlxTask *head, *tail; } TQ;
 
 struct AlxTask {
     AlxWorker fn;
@@ -760,7 +836,147 @@ struct AlxTask {
     bool finished, panicked;
     char *msg;
     jmp_buf jb;
+    WNode *w;                    /* waiters for `finished` */
+    Parker pk;
+    AlxTask *qnext;
+    Worker *home;                /* the worker it runs on (set at first run) */
+    void *sp, *fake, *fiber;     /* saved sp; sanitizer fiber state */
+    char *guard, *lo;            /* its stack: guard page, usable low end */
+    AlxRegion *cur;              /* saved tl_cur */
+    bool dead;                   /* done for good: the stack can be recycled */
+    bool started;
+    char *save;                  /* copy of the live stack while parked */
+    size_t nsave, csave;
+    WNode wn[4], *wnp;           /* wait-list nodes while parked (not on the stack) */
 };
+
+struct Worker {
+    pthread_cond_t cv;
+    TQ q;
+    bool idle;
+    Worker *idle_next;
+    void *sp, *fake, *fiber;     /* the scheduler's context */
+    const void *sbot;
+    size_t ssz;
+    char *guard, *lo;            /* the run stack (copy mode) */
+};
+
+static TQ g_newq;
+static Worker *g_workers, *g_idle;
+static int g_nworkers;
+static size_t g_stk_size, g_page;
+
+static void tq_push(TQ *q, AlxTask *t) { t->qnext = NULL; if (q->tail) q->tail->qnext = t; else q->head = t; q->tail = t; }
+static AlxTask *tq_pop(TQ *q) {
+    AlxTask *t = q->head;
+    if (t && !(q->head = t->qnext)) q->tail = NULL;
+    return t;
+}
+
+static void wl_add(WNode **head, WNode *n, Parker *p) {
+    n->p = p; n->next = *head;
+    if (*head) (*head)->pprev = &n->next;
+    n->pprev = head; *head = n;
+}
+static void wl_del(WNode *n) {
+    *n->pprev = n->next;
+    if (n->next) n->next->pprev = n->pprev;
+}
+
+static void idle_wake(Worker *w) {
+    for (Worker **pp = &g_idle; *pp; pp = &(*pp)->idle_next)
+        if (*pp == w) { *pp = w->idle_next; break; }
+    w->idle = false;
+    pthread_cond_signal(&w->cv);
+}
+
+/* Make a parked task runnable again on its worker (g_mu held). */
+static void enqueue(AlxTask *t) {
+    Worker *w = t->home;
+    tq_push(&w->q, t);
+    if (w->idle) idle_wake(w);
+}
+
+static Parker *g_main_p;
+
+static void unpark(Parker *p) {
+    if (!p->parked) return;
+    p->parked = false;
+    if (p->counted) g_runnable++;
+    if (p->task) enqueue(p->task); else pthread_cond_signal(&p->cv);
+}
+
+static void wake(WNode **head) { for (WNode *n = *head; n; n = n->next) unpark(n->p); }
+
+/* Nothing runnable but main is parked: nothing can ever wake it. */
+static void check_dead(void) {
+    if (g_runnable == 0 && g_main_p && g_main_p->parked) { g_main_p->dead = true; unpark(g_main_p); }
+}
+
+static _Thread_local Parker tl_pk;
+static Parker *cur_pk(void) {
+    if (tl_task) return &tl_task->pk;
+    Parker *p = &tl_pk;
+    if (!p->cv_init) { pthread_cond_init(&p->cv, NULL); p->cv_init = true; p->counted = !tl_uncounted; }
+    return p;
+}
+
+/* Task side: flush the region state and switch to the scheduler. */
+static void sw_out(AlxTask *t, bool dying) {
+    AlxRegion *c = cur_region();
+    c->cur = alx_bump_cur; c->end = alx_bump_end;
+    t->cur = tl_cur;
+    Worker *w = t->home;
+#ifdef ALX_ASAN
+    __sanitizer_start_switch_fiber(dying ? NULL : &t->fake, w->sbot, w->ssz);
+#endif
+#ifdef ALX_TSAN
+    __tsan_switch_to_fiber(w->fiber, 0);
+#endif
+    alx_ctx_switch(&t->sp, w->sp);
+#ifdef ALX_ASAN
+    __sanitizer_finish_switch_fiber(t->fake, NULL, NULL);
+#endif
+    (void)dying;
+}
+
+/* With g_mu held, the awaited condition false: register on `heads` and sleep
+ * until one of those lists is woken. False (still holding g_mu) if that can
+ * never happen. Only main is ever told so: a task that finds everything
+ * asleep parks, and main is woken to report it. */
+static bool block_wait(WNode ***heads, int n) {
+    Parker *p = cur_pk();
+    if (p->counted && !p->task && g_runnable == 1) return false;
+    WNode ndv[p->task ? 1 : (n ? n : 1)], *nd = ndv;
+    if (p->task) {
+        AlxTask *t = p->task;
+        if (n <= 4) nd = t->wn;
+        else if (!(nd = t->wnp = realloc(t->wnp, (size_t)n * sizeof *nd))) alx_panic("out of memory", "runtime");
+    }
+    for (int i = 0; i < n; i++) wl_add(heads[i], &nd[i], p);
+    p->parked = true; p->dead = false;
+    if (p->counted) {
+        g_runnable--;
+        if (!p->task) g_main_p = p;
+        else check_dead();
+    }
+    if (p->task) {
+        pthread_mutex_unlock(&g_mu);
+        sw_out(p->task, false);
+        pthread_mutex_lock(&g_mu);
+    } else {
+        while (p->parked) pthread_cond_wait(&p->cv, &g_mu);
+    }
+    for (int i = 0; i < n; i++) wl_del(&nd[i]);
+    if (p->dead) { p->dead = false; return false; }
+    return true;
+}
+static bool block_wait1(WNode **head) { WNode **hs[1] = { head }; return block_wait(hs, 1); }
+
+static _Noreturn void deadlock(void) {
+    pthread_mutex_unlock(&g_mu);
+    alx_panic("all tasks are asleep: deadlock", "runtime");
+}
 
 static _Noreturn void task_panic(char *msg) {
     AlxTask *t = tl_task;
@@ -768,18 +984,228 @@ static _Noreturn void task_panic(char *msg) {
     _longjmp(t->jb, 1);
 }
 
-static void *task_main(void *arg) {
-    AlxTask *t = arg;
-    tl_task = t;
-    if (_setjmp(t->jb) == 0) t->fn(t->env, t->res);
-    else t->panicked = true;
-    tl_task = NULL;
+/* ---- stacks ---- */
+
+static size_t parse_size(const char *s, size_t dflt) {
+    char *e;
+    double v = strtod(s, &e);
+    if (e == s || v <= 0) return dflt;
+    if (*e == 'k' || *e == 'K') v *= 1024;
+    else if (*e == 'm' || *e == 'M') v *= 1024 * 1024;
+    return (size_t)v;
+}
+
+static char *stack_map(void) {
+    void *m = mmap(NULL, g_page + g_stk_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+    if (m == MAP_FAILED) return NULL;
+    if (mprotect(m, g_page, PROT_NONE)) { munmap(m, g_page + g_stk_size); return NULL; }
+    return m;
+}
+
+#ifdef ALX_PRIV
+static pthread_mutex_t g_stk_mu = PTHREAD_MUTEX_INITIALIZER;
+static char *g_stk_pool;         /* free stacks (guard base), linked through their top word */
+static int g_stk_n;
+enum { STK_POOL_CAP = 256 };
+
+static char *stack_link(char *base) { return base + g_page + g_stk_size - sizeof(void *); }
+
+static bool stack_get(AlxTask *t) {
+    pthread_mutex_lock(&g_stk_mu);
+    char *base = g_stk_pool;
+    if (base) { g_stk_pool = *(char **)stack_link(base); g_stk_n--; }
+    pthread_mutex_unlock(&g_stk_mu);
+    if (!base && !(base = stack_map())) return false;
+    t->guard = base; t->lo = base + g_page;
+#ifdef ALX_ASAN
+    __asan_unpoison_memory_region(t->lo, g_stk_size);
+#endif
+    return true;
+}
+
+static void stack_put(AlxTask *t) {
+    char *base = t->guard;
+    pthread_mutex_lock(&g_stk_mu);
+    if (g_stk_n < STK_POOL_CAP) {
+        *(char **)stack_link(base) = g_stk_pool; g_stk_pool = base; g_stk_n++;
+        base = NULL;
+    }
+    pthread_mutex_unlock(&g_stk_mu);
+    if (base) munmap(base, g_page + g_stk_size);
+    t->guard = t->lo = NULL;
+}
+#endif
+
+/* A fault in a task's guard page is a stack overflow. */
+static struct sigaction old_segv, old_bus;
+static void fault_handler(int sig, siginfo_t *si, void *uc) {
+    AlxTask *t = tl_task;
+    char *a = si->si_addr;
+    if (t && t->guard && a >= t->guard && a < t->guard + g_page) {
+        static const char m[] = "alexandrite: stack overflow in a task\n";
+        fflush(stdout);
+        ssize_t r = write(2, m, sizeof m - 1);
+        (void)r;
+        abort();
+    }
+    struct sigaction *o = sig == SIGSEGV ? &old_segv : &old_bus;
+    if (o->sa_flags & SA_SIGINFO) o->sa_sigaction(sig, si, uc);
+    else if (o->sa_handler != SIG_DFL && o->sa_handler != SIG_IGN) o->sa_handler(sig);
+    else signal(sig, SIG_DFL);   /* returning re-faults into the default action */
+}
+
+/* ---- scheduler ---- */
+
+static void task_finish(AlxTask *t) {
     pthread_mutex_lock(&g_mu);
     t->finished = true;
-    g_live--;
-    wake_all();
+    wake(&t->w);
+    g_runnable--;
+    check_dead();
     pthread_mutex_unlock(&g_mu);
+}
+
+static void task_entry(void) {
+    AlxTask *t = tl_task;
+#ifdef ALX_ASAN
+    __sanitizer_finish_switch_fiber(NULL, &t->home->sbot, &t->home->ssz);
+#endif
+    if (_setjmp(t->jb) == 0) t->fn(t->env, t->res);
+    else t->panicked = true;
+    task_finish(t);
+    t->dead = true;
+    sw_out(t, true);
+    abort();
+}
+
+static void run_task(Worker *w, AlxTask *t) {
+    if (!t->started) {
+        t->started = true;
+#ifdef ALX_PRIV
+        if (!stack_get(t)) {
+            t->msg = (char *)"alexandrite: cannot allocate a task stack";
+            t->panicked = true;
+            task_finish(t);
+            return;
+        }
+#else
+        t->guard = w->guard; t->lo = w->lo;
+#endif
+        t->sp = ctx_init(t->lo + g_stk_size, task_entry);
+#ifdef ALX_TSAN
+        t->fiber = __tsan_create_fiber(0);
+#endif
+    }
+#ifndef ALX_PRIV
+    else memcpy(t->sp, t->save, t->nsave);
+#endif
+    AlxRegion *r = t->cur ? t->cur : &tl_prog;
+    alx_bump_cur = r->cur; alx_bump_end = r->end;
+    tl_cur = t->cur;
+    tl_task = t;
+#ifdef ALX_ASAN
+    __sanitizer_start_switch_fiber(&w->fake, t->lo, g_stk_size);
+#endif
+#ifdef ALX_TSAN
+    __tsan_switch_to_fiber(t->fiber, 0);
+#endif
+    alx_ctx_switch(&w->sp, t->sp);
+#ifdef ALX_ASAN
+    __sanitizer_finish_switch_fiber(w->fake, NULL, NULL);
+#endif
+    tl_task = NULL;
+#ifdef ALX_PRIV
+    if (t->dead) {
+#ifdef ALX_TSAN
+        __tsan_destroy_fiber(t->fiber);
+#endif
+        stack_put(t);
+    }
+#else
+    if (!t->dead) {
+        size_t n = (size_t)(w->lo + g_stk_size - (char *)t->sp);
+        if (n > t->csave) {
+            free(t->save);
+            if (!(t->save = malloc(t->csave = n))) alx_panic("out of memory", "runtime");
+        }
+        memcpy(t->save, t->sp, n);
+        t->nsave = n;
+    } else {
+        free(t->save); t->save = NULL; t->csave = t->nsave = 0;
+    }
+#endif
+    if (t->dead) { free(t->wnp); t->wnp = NULL; }
+}
+
+static void *worker_main(void *arg) {
+    Worker *w = arg;
+#ifndef ALX_PRIV
+    w->guard = stack_map();
+    if (!w->guard) alx_panic("cannot start a task", "runtime");
+    w->lo = w->guard + g_page;
+#endif
+    size_t ss = 64 << 10;
+    stack_t st = { .ss_sp = malloc(ss), .ss_size = ss };
+    if (st.ss_sp) sigaltstack(&st, NULL);
+#ifdef ALX_TSAN
+    w->fiber = __tsan_get_current_fiber();
+#endif
+    pthread_mutex_lock(&g_mu);
+    for (;;) {
+        AlxTask *t = tq_pop(&w->q);
+        if (!t && (t = tq_pop(&g_newq))) t->home = w;
+        if (!t) {
+            w->idle = true; w->idle_next = g_idle; g_idle = w;
+            do pthread_cond_wait(&w->cv, &g_mu); while (w->idle);
+            continue;
+        }
+        pthread_mutex_unlock(&g_mu);
+        run_task(w, t);
+        pthread_mutex_lock(&g_mu);
+    }
     return NULL;
+}
+
+/* With g_mu held, at the first spawn. False if no worker could start. */
+static bool workers_start(void) {
+    if (g_nworkers) return true;
+    g_page = (size_t)sysconf(_SC_PAGESIZE);
+#if defined(ALX_ASAN) || defined(ALX_TSAN)
+    size_t dflt = 1 << 20;       /* instrumented frames are big */
+#else
+    size_t dflt = 256 << 10;
+#endif
+    const char *e = getenv("ALX_TASK_STACK");
+    g_stk_size = e ? parse_size(e, dflt) : dflt;
+    if (g_stk_size < 4 * g_page) g_stk_size = 4 * g_page;
+    g_stk_size = (g_stk_size + g_page - 1) & ~(g_page - 1);
+    struct sigaction sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_sigaction = fault_handler;
+    sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGSEGV, &sa, &old_segv);
+    sigaction(SIGBUS, &sa, &old_bus);
+    long n = sysconf(_SC_NPROCESSORS_ONLN);
+    e = getenv("ALX_PROCS");
+    if (e && atol(e) > 0) n = atol(e);
+    if (n < 1) n = 1;
+    if (n > 256) n = 256;
+    g_workers = calloc((size_t)n, sizeof(Worker));
+    if (!g_workers) return false;
+    pthread_attr_t at;
+    pthread_attr_init(&at);
+    pthread_attr_setdetachstate(&at, PTHREAD_CREATE_DETACHED);
+    int started = 0;
+    for (long i = 0; i < n; i++) {
+        pthread_cond_init(&g_workers[i].cv, NULL);
+        pthread_t th;
+        if (pthread_create(&th, &at, worker_main, &g_workers[i])) break;
+        started++;
+    }
+    pthread_attr_destroy(&at);
+    g_nworkers = started;
+    return started > 0;
 }
 
 AlxTask *alx_spawn(AlxWorker fn, const void *env, size_t in_size, size_t out_size) {
@@ -791,29 +1217,23 @@ AlxTask *alx_spawn(AlxWorker fn, const void *env, size_t in_size, size_t out_siz
     t->res = calloc(1, out_size ? out_size : 1);
     if (!t->env || !t->res) alx_panic("out of memory", "runtime");
     if (in_size) memcpy(t->env, env, in_size);
+    t->pk.task = t; t->pk.counted = true;
     pthread_mutex_lock(&g_mu);
-    g_live++;
-    pthread_mutex_unlock(&g_mu);
-    pthread_attr_t at;
-    pthread_attr_init(&at);
-    pthread_attr_setdetachstate(&at, PTHREAD_CREATE_DETACHED);
-    pthread_attr_setstacksize(&at, (size_t)8 << 20);
-    pthread_t th;
-    int rc = pthread_create(&th, &at, task_main, t);
-    pthread_attr_destroy(&at);
-    if (rc) {
-        pthread_mutex_lock(&g_mu);
-        g_live--;
+    if (!workers_start()) {
         pthread_mutex_unlock(&g_mu);
         alx_panic("cannot start a task", "runtime");
     }
+    g_runnable++;
+    tq_push(&g_newq, t);
+    if (g_idle) idle_wake(g_idle);
+    pthread_mutex_unlock(&g_mu);
     return t;
 }
 
 bool alx_task_wait(AlxTask *t, void *out, AlxStr *msg) {
     pthread_mutex_lock(&g_mu);
     while (!t->finished)
-        if (!block_wait()) deadlock();
+        if (!block_wait1(&t->w)) deadlock();
     pthread_mutex_unlock(&g_mu);
     if (t->panicked) {
         msg->ptr = t->msg;
@@ -832,6 +1252,7 @@ struct AlxChan {
     bool slot_full, closed;
     uint64_t send_seq, taken_seq;  /* ticket of the slot's sender / last taken */
     int64_t recv_waiting, send_waiting;
+    WNode *w;                      /* parked senders / receivers / selects */
 };
 
 AlxChan *alx_chan_new(int64_t cap, size_t esz) {
@@ -890,7 +1311,7 @@ void alx_chan_send(AlxChan *c, const void *val, const char *loc) {
     pthread_mutex_lock(&g_mu);
     while (!c->closed) {
         if (try_put(c, val, false)) {
-            wake_all();
+            wake(&c->w);
             if (c->cap > 0) {
                 pthread_mutex_unlock(&g_mu);
                 return;
@@ -898,14 +1319,14 @@ void alx_chan_send(AlxChan *c, const void *val, const char *loc) {
             /* Rendezvous: wait until a receiver took it. */
             uint64_t ticket = c->send_seq;
             while (c->taken_seq < ticket && !c->closed)
-                if (!block_wait()) deadlock();
+                if (!block_wait1(&c->w)) deadlock();
             if (c->taken_seq >= ticket) {
                 pthread_mutex_unlock(&g_mu);
                 return;
             }
             break; /* closed while waiting: close dropped the value */
         }
-        if (!block_wait()) deadlock();
+        if (!block_wait1(&c->w)) deadlock();
     }
     pthread_mutex_unlock(&g_mu);
     alx_panic("send on a closed channel", loc);
@@ -915,7 +1336,7 @@ bool alx_chan_recv(AlxChan *c, void *out) {
     pthread_mutex_lock(&g_mu);
     for (;;) {
         if (try_take(c, out)) {
-            wake_all();
+            wake(&c->w);
             pthread_mutex_unlock(&g_mu);
             return true;
         }
@@ -924,8 +1345,8 @@ bool alx_chan_recv(AlxChan *c, void *out) {
             return false;
         }
         c->recv_waiting++;
-        if (c->send_waiting) wake_all(); /* a blocked select-sender may now proceed */
-        bool ok = block_wait();
+        if (c->send_waiting) wake(&c->w); /* a blocked select-sender may now proceed */
+        bool ok = block_wait1(&c->w);
         c->recv_waiting--;
         if (!ok) deadlock();
     }
@@ -939,7 +1360,7 @@ void alx_chan_close(AlxChan *c, const char *loc) {
     }
     c->closed = true;
     c->slot_full = false; /* a blocked sender's value is dropped; it panics */
-    wake_all();
+    wake(&c->w);
     pthread_mutex_unlock(&g_mu);
 }
 
@@ -972,13 +1393,13 @@ int64_t alx_select(AlxSelCase *cs, int64_t n, bool has_default, const char *loc)
                     alx_panic("send on a closed channel", loc);
                 }
                 if (try_put(s->ch, s->buf, true)) {
-                    wake_all();
+                    wake(&s->ch->w);
                     pthread_mutex_unlock(&g_mu);
                     return i;
                 }
             } else if (try_take(s->ch, s->buf)) {
                 s->ok = 1;
-                wake_all();
+                wake(&s->ch->w);
                 pthread_mutex_unlock(&g_mu);
                 return i;
             } else if (s->ch->closed) {
@@ -991,17 +1412,17 @@ int64_t alx_select(AlxSelCase *cs, int64_t n, bool has_default, const char *loc)
             pthread_mutex_unlock(&g_mu);
             return n;
         }
-        bool wake = false;
+        WNode **hs[n ? n : 1];
         for (int64_t i = 0; i < n; i++) {
+            hs[i] = &cs[i].ch->w;
             if (cs[i].is_send) {
                 cs[i].ch->send_waiting++;
             } else {
                 cs[i].ch->recv_waiting++;
-                wake |= cs[i].ch->send_waiting > 0;
+                if (cs[i].ch->send_waiting > 0) wake(&cs[i].ch->w);
             }
         }
-        if (wake) wake_all();
-        bool ok = block_wait();
+        bool ok = block_wait(hs, (int)n);
         for (int64_t i = 0; i < n; i++) {
             if (cs[i].is_send) cs[i].ch->send_waiting--;
             else cs[i].ch->recv_waiting--;
@@ -1012,9 +1433,10 @@ int64_t alx_select(AlxSelCase *cs, int64_t n, bool has_default, const char *loc)
 
 /* ---------- locks and atomics (R6) ---------- */
 
-/* A lock is a flag under the scheduler's lock: a holder blocks waiters the
- * way a full channel blocks senders, so deadlock detection covers it. */
-struct AlxLock { bool held; };
+/* A lock is a flag under the scheduler's lock with its own wait list: a
+ * holder parks takers the way a full channel parks senders, so deadlock
+ * detection covers it. */
+struct AlxLock { bool held; WNode *w; /* parked takers */ };
 
 AlxLock *alx_lock_new(void) {
     AlxLock *l = calloc(1, sizeof *l);
@@ -1025,7 +1447,7 @@ AlxLock *alx_lock_new(void) {
 void alx_lock(AlxLock *l) {
     pthread_mutex_lock(&g_mu);
     while (l->held)
-        if (!block_wait()) deadlock();
+        if (!block_wait1(&l->w)) deadlock();
     l->held = true;
     pthread_mutex_unlock(&g_mu);
 }
@@ -1033,7 +1455,7 @@ void alx_lock(AlxLock *l) {
 void alx_unlock(AlxLock *l) {
     pthread_mutex_lock(&g_mu);
     l->held = false;
-    wake_all();
+    wake(&l->w);
     pthread_mutex_unlock(&g_mu);
 }
 

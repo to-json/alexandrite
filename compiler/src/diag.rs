@@ -81,6 +81,11 @@ impl SourceMap {
         &self.files[sp.file as usize].text[sp.lo as usize..sp.hi as usize]
     }
 
+    pub fn render_warning(&self, d: &Diag) -> String {
+        let s = self.render(d);
+        format!("warning{}", s.strip_prefix("error").unwrap_or(&s))
+    }
+
     pub fn render(&self, d: &Diag) -> String {
         let f = &self.files[d.span.file as usize];
         let (l, c) = f.line_col(d.span.lo);

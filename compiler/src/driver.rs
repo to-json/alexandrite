@@ -22,6 +22,20 @@ pub struct Options {
     pub emit_c: Option<String>,
     pub emit_rust: Option<String>,
     pub out: Option<String>,
+    /// Warnings are errors.
+    pub strict: bool,
+}
+
+/// Print a program's warnings; under `--strict` they fail the build.
+fn report(sm: &alx::diag::SourceMap, p: &crate::tast::TProgram, o: &Options) -> bool {
+    for w in &p.warnings {
+        if o.strict {
+            eprint!("{}", sm.render(w));
+        } else {
+            eprint!("{}", sm.render_warning(w));
+        }
+    }
+    !(o.strict && !p.warnings.is_empty())
 }
 
 impl Options {
@@ -186,6 +200,9 @@ fn build(file: &str, o: &Options) -> Result<PathBuf, ExitCode> {
             return Err(ExitCode::from(1));
         }
     };
+    if !report(&l.sm, &p, o) {
+        return Err(ExitCode::from(1));
+    }
     let lp = lower::lower(&p, &l.sm, &lower::Opts { release: o.release });
     let c = cgen::emit(&lp);
     if let Some(path) = &o.emit_c {
@@ -257,6 +274,9 @@ fn run_jit(file: &str, o: &Options) -> ExitCode {
             return ExitCode::from(1);
         }
     };
+    if !report(&l.sm, &p, o) {
+        return ExitCode::from(1);
+    }
     let lp = lower::lower(&p, &l.sm, &lower::Opts { release: false });
     log(o, "jit");
     let Some(want) = &o.expect else {

@@ -169,6 +169,8 @@ pub struct Local {
     pub mutated: bool,
     /// Ever grown with `<<` (its length isn't fixed).
     pub pushed: bool,
+    /// Introduced by an assignment in the source (unused ones warn).
+    pub user: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -457,4 +459,6 @@ pub struct TProgram {
     pub errors: Vec<Ty>,
     /// Error types with a `message` method: index → its instance.
     pub messages: HashMap<usize, FuncId>,
+    /// Unused locals and imports (errors under `--strict`).
+    pub warnings: Vec<crate::diag::Diag>,
 }

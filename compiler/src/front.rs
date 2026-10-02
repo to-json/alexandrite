@@ -385,6 +385,18 @@ pub fn check_program(l: &Loaded, externs: Vec<DefInfo>) -> Result<TProgram, Diag
     let ifaces = std::mem::take(&mut w.impls);
     let stringers = std::mem::take(&mut w.stringers);
     let errors = std::mem::take(&mut w.errors);
+    let mut warnings = std::mem::take(&mut w.warnings);
+    // Imports nothing refers to (packages compiled separately count as used).
+    let mods = std::iter::once((String::new(), &l.main)).chain(l.pkgs.iter().filter(|p| !ext.contains(&p.path)).map(|p| (p.path.clone(), &p.module)));
+    for (pkg, m) in mods {
+        for i in &m.imports {
+            let alias = import_name(i);
+            if !crate::check::import_used(&pkg, &alias) && !ext.contains(i.path.trim_end_matches('/')) {
+                warnings.push(Diag::new(i.span, format!("`{}` is imported but not used", i.path)));
+            }
+        }
+    }
+    warnings.sort_by_key(|d| (d.span.file, d.span.lo));
     let mut funcs: Vec<_> = w.funcs.into_iter().map(|f| f.expect("every instance checked")).collect();
     for f in funcs.iter_mut() {
         if !f.external {
@@ -394,7 +406,7 @@ pub fn check_program(l: &Loaded, externs: Vec<DefInfo>) -> Result<TProgram, Diag
     for f in &funcs {
         prove::prove(f, &l.sm)?;
     }
-    Ok(TProgram { funcs, main, ifaces, stringers, errors, messages })
+    Ok(TProgram { funcs, main, ifaces, stringers, errors, messages, warnings })
 }
 
 /// Kept for callers of the old library interface: packages are now
@@ -452,7 +464,7 @@ pub fn check_library(l: &Loaded, idx: usize, prefix: &str) -> Result<(TProgram, 
     for f in &funcs {
         prove::prove(f, &l.sm)?;
     }
-    Ok((TProgram { funcs, main: usize::MAX, ifaces, stringers, errors, messages }, exports))
+    Ok((TProgram { funcs, main: usize::MAX, ifaces, stringers, errors, messages, warnings: vec![] }, exports))
 }
 
 /// The generated header: one line per export.

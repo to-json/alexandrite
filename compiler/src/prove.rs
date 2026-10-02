@@ -63,7 +63,7 @@ fn scan_assigns(e: &TExpr, c: &mut HashSet<LocalId>) {
     each_child(e, &mut |x| scan_assigns(x, c));
 }
 
-fn each_child(e: &TExpr, f: &mut dyn FnMut(&TExpr)) {
+pub(crate) fn each_child(e: &TExpr, f: &mut dyn FnMut(&TExpr)) {
     match &e.kind {
         TK::Assign(_, v) | TK::Neg(v) | TK::Not(v) | TK::Try(v) | TK::Puts(v) | TK::Some(v) => f(v),
         TK::IndexAssign(_, i, v) => {
@@ -128,7 +128,7 @@ fn each_child(e: &TExpr, f: &mut dyn FnMut(&TExpr)) {
     }
 }
 
-fn stmt_exprs(s: &TStmt, f: &mut dyn FnMut(&TExpr)) {
+pub(crate) fn stmt_exprs(s: &TStmt, f: &mut dyn FnMut(&TExpr)) {
     match s {
         TStmt::Expr(e) => f(e),
         TStmt::MultiAssign(_, es) => es.iter().for_each(f),
@@ -140,7 +140,7 @@ fn stmt_exprs(s: &TStmt, f: &mut dyn FnMut(&TExpr)) {
             f(e);
             a.iter().chain(b).for_each(|s| stmt_exprs(s, f));
         }
-        TStmt::Break(Some(e), _) | TStmt::Return(Some(e), _) | TStmt::Defer(e) => f(e),
+        TStmt::Break(Some(e), _) | TStmt::Return(Some(e), _) | TStmt::Defer(e) | TStmt::Fail(e, _) => f(e),
         _ => {}
     }
 }

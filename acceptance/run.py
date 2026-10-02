@@ -160,6 +160,16 @@ def negative_runtime(case, group):
     check(group, f"{case} runtime failure", status_ok and not missing, f"exit {r.returncode}" + (f", missing {missing}" if missing else ""))
 
 
+def warnings():
+    """Unused locals and imports warn; --strict makes them errors."""
+    d = CASES / "warn"
+    r, _ = run([ALX, "run", "warn.alx"], cwd=d)
+    ok = r.returncode == 0 and r.stdout.strip() == "5" and "warning: `pk` is imported but not used" in r.stderr and "warning: `unused` is assigned but never used" in r.stderr and "_quiet" not in r.stderr
+    check("M8", "unused warnings", ok, f"exit {r.returncode}, stderr {r.stderr.strip()[:200]!r}")
+    r, _ = run([ALX, "run", "--strict", "warn.alx"], cwd=d)
+    check("M8", "--strict makes warnings errors", r.returncode == 1 and r.stdout == "" and "error: `pk` is imported but not used" in r.stderr, f"exit {r.returncode}")
+
+
 def modules():
     d = CASES / "modtest"
     env = {"ALX_MODCACHE": str(d / "cache")}
@@ -285,6 +295,7 @@ def main():
     if not filt or "mod" in filt:
         print("== modules", flush=True)
         modules()
+        warnings()
     if not filt or "A3" in filt:
         print("== A3 promote overhead", flush=True)
         promote_overhead()

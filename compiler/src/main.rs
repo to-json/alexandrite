@@ -28,6 +28,7 @@ fn main() -> ExitCode {
             "--release" => o.release = true,
             "--sanitize" => o.sanitize = true,
             "-v" | "--verbose" => o.verbose = true,
+            "--strict" => o.strict = true,
             "--expect" => o.expect = val(),
             "--emit-c" => o.emit_c = val(),
             "--emit-rust" => o.emit_rust = val(),

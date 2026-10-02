@@ -35,10 +35,12 @@ thread_local! {
     /// The package whose code is being checked (names resolve there first).
     static PKG: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
     /// Every package's imports (alias → path), and the public names.
+    static USED: std::cell::RefCell<std::collections::HashSet<(String, String)>> = std::cell::RefCell::new(Default::default());
     static PKGS: std::cell::RefCell<(HashMap<String, HashMap<String, String>>, std::collections::HashSet<String>)> = std::cell::RefCell::new(Default::default());
 }
 
 pub fn set_packages(public: std::collections::HashSet<String>, imports: HashMap<String, HashMap<String, String>>) {
+    USED.with(|u| u.borrow_mut().clear());
     PKGS.with(|p| *p.borrow_mut() = (imports, public));
 }
 
@@ -64,7 +66,16 @@ pub fn pkg_of(name: &str) -> String {
 /// The import path an alias names in the current package.
 pub fn import_path(alias: &str) -> Option<String> {
     let pkg = current_pkg();
-    PKGS.with(|p| p.borrow().0.get(&pkg).and_then(|m| m.get(alias).cloned()))
+    let r = PKGS.with(|p| p.borrow().0.get(&pkg).and_then(|m| m.get(alias).cloned()));
+    if r.is_some() {
+        USED.with(|u| u.borrow_mut().insert((pkg, alias.to_string())));
+    }
+    r
+}
+
+/// Was import `alias` of package `pkg` used?
+pub fn import_used(pkg: &str, alias: &str) -> bool {
+    USED.with(|u| u.borrow().contains(&(pkg.to_string(), alias.to_string())))
 }
 
 pub fn is_public(q: &str) -> bool {
@@ -119,6 +130,8 @@ pub struct World<'a> {
     pub stringers: HashMap<String, FuncId>,
     /// Error types (enums), in tag order: builtins first, then `error` decls.
     pub errors: Vec<Ty>,
+    /// Warnings found so far (deduplicated by location).
+    pub warnings: Vec<Diag>,
     /// Refinements by (qualified) name: each target type with its methods.
     pub refines: HashMap<String, Vec<(Ty, HashMap<String, usize>)>>,
 }
@@ -154,7 +167,7 @@ impl<'a> World<'a> {
         }
         GENERICS.with(|g| g.borrow_mut().clear());
         INSTS.with(|g| g.borrow_mut().clear());
-        Ok(World { sm, defs, by_name, instances: HashMap::new(), funcs: vec![], sigs: HashMap::new(), fatal: None, structs: HashMap::new(), consts: HashMap::new(), ifaces: HashMap::new(), impls: HashMap::new(), stringers: HashMap::new(), errors: vec![], refines: HashMap::new() })
+        Ok(World { sm, defs, by_name, instances: HashMap::new(), funcs: vec![], sigs: HashMap::new(), fatal: None, structs: HashMap::new(), consts: HashMap::new(), ifaces: HashMap::new(), impls: HashMap::new(), stringers: HashMap::new(), errors: vec![], refines: HashMap::new(), warnings: vec![] })
     }
 
     /// Evaluate top-level constants, in order (each may use earlier ones).
@@ -542,7 +555,7 @@ impl<'a> World<'a> {
                 cname: ext.symbol.clone(),
                 src_name: info.def.name.clone(),
                 params: (0..ext.params.len()).collect(),
-                locals: ext.params.iter().enumerate().map(|(i, t)| Local { name: format!("p{i}"), ty: t.clone(), reassigned: 0, mutated: false, pushed: false }).collect(),
+                locals: ext.params.iter().enumerate().map(|(i, t)| Local { name: format!("p{i}"), ty: t.clone(), reassigned: 0, mutated: false, pushed: false, user: false }).collect(),
                 ret: ext.ret.clone(),
                 fallible: ext.fallible,
                 pure: ext.pure,
@@ -921,6 +934,8 @@ struct FnCx<'w, 'a> {
     /// Kind of each enclosing loop-ish construct, innermost last.
     loops: Vec<LoopKind>,
     n_params: usize,
+    /// Where each source-declared local was first assigned.
+    decl_spans: Vec<(LocalId, Span)>,
     /// Active refinements: (scope depth where `using` appeared, name).
     usings: Vec<(usize, String)>,
     /// Error types this function can fail with ("Error" = any).
@@ -983,6 +998,7 @@ impl<'w, 'a> FnCx<'w, 'a> {
             fn_name: def.map_or("main".into(), |d| d.name.clone()),
             want_hint: None,
             errs: Default::default(),
+            decl_spans: vec![],
             usings: def.map_or_else(Vec::new, |d| d.using.iter().map(|u| (0, resolve_name(u, Span::default(), &|_| true).unwrap_or_else(|_| u.clone()))).collect()),
             in_lambda: false,
             lambdas: vec![],
@@ -1093,7 +1109,7 @@ impl<'w, 'a> FnCx<'w, 'a> {
     }
 
     fn declare(&mut self, name: &str, ty: Ty) -> LocalId {
-        self.locals.push(Local { name: name.to_string(), ty, reassigned: 0, mutated: false, pushed: false });
+        self.locals.push(Local { name: name.to_string(), ty, reassigned: 0, mutated: false, pushed: false, user: false });
         let id = self.locals.len() - 1;
         self.scopes.last_mut().unwrap().insert(name.to_string(), id);
         id
@@ -1165,6 +1181,44 @@ impl<'w, 'a> FnCx<'w, 'a> {
             }
         }
         let errs = self.errs.iter().cloned().collect();
+        // Locals assigned but never read (Go's "declared and not used").
+        let mut read = std::collections::HashSet::new();
+        fn reads(e: &TExpr, out: &mut std::collections::HashSet<LocalId>) {
+            match &e.kind {
+                TK::Local(l) | TK::IndexAssign(l, ..) | TK::PlaceAssign(l, ..) => {
+                    out.insert(*l);
+                }
+                _ => {}
+            }
+            if let TK::Select(arms, _) = &e.kind {
+                for a in arms {
+                    if let TSelArm::Recv { bind: Some(l), .. } = a {
+                        out.insert(*l);
+                    }
+                }
+            }
+            if let TK::M(_, _, _, Some(b)) = &e.kind {
+                for s in &b.body {
+                    crate::prove::stmt_exprs(s, &mut |x| reads(x, out));
+                }
+            }
+            crate::prove::each_child(e, &mut |x| reads(x, out));
+        }
+        for s in &body {
+            crate::prove::stmt_exprs(s, &mut |x| reads(x, &mut read));
+            if let TStmt::MultiAssign(ls, _) = s {
+                let _ = ls;
+            }
+        }
+        for (id, sp) in &self.decl_spans {
+            let l = &self.locals[*id];
+            if l.user && !read.contains(id) && !l.name.starts_with('_') && l.name != "self" {
+                let d = Diag::new(*sp, format!("`{}` is assigned but never used", l.name)).note("use it, or name it `_` or `_name`");
+                if !self.w.warnings.iter().any(|w| w.span == d.span) {
+                    self.w.warnings.push(d);
+                }
+            }
+        }
         Ok(TFunc {
             lambdas,
             errs,
@@ -1447,7 +1501,10 @@ impl<'w, 'a> FnCx<'w, 'a> {
                 return Err(Diag::new(sp, format!("`{name}` is a field: write `self.{name} = ...` to set it (in a `!` method), or pick another name for a local")));
             }
         }
-        Ok(self.declare(name, ty.clone()))
+        let id = self.declare(name, ty.clone());
+        self.locals[id].user = true;
+        self.decl_spans.push((id, sp));
+        Ok(id)
     }
 
     // ---------- expressions ----------

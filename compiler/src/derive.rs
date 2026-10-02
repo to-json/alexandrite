@@ -485,12 +485,6 @@ impl<'a> Gen<'a> {
         Ok(())
     }
 
-    /// Does a missing key leave this type without a zero value we can spell
-    /// in a temporary? (A named type inside a variant's named fields.)
-    fn needs_stage(&self, t: &TypeExpr) -> bool {
-        let _ = t;
-        false
-    }
 }
 
 fn check_keys<'a>(fields: impl Iterator<Item = &'a DField>, what: &str) -> Result<(), String> {
@@ -659,26 +653,20 @@ pub fn json_source(job: &DeriveJob, alias: &str, types: &ModuleTypes) -> Result<
                 let named = v.fields.iter().any(|f| f.name.parse::<usize>().is_err());
                 let mut args: Vec<String> = vec![];
                 if named {
-                    // Named fields: an object. Each field gets a temporary; a named
-                    // (non-primitive) type is staged as `T?` and required.
-                    let mut stages: Vec<(String, bool)> = vec![];
+                    // Named fields: an object. Each field gets a temporary holding its zero.
+                    let mut temps: Vec<String> = vec![];
                     for f in v.fields.iter() {
                         let t = g.fresh("p");
-                        let staged = g.needs_stage(&f.ty);
-                        if staged {
-                            g.w(2, format!("{t}: {}? = none", type_src(&f.ty)));
-                        } else {
-                            match g.zero(&f.ty) {
-                                Some(z) => g.w(2, format!("{t}: {} = {z}", type_src(&f.ty))),
-                                None => return Err(fail(format!("field `{}` of variant `{}` has no zero value", f.name, v.name))),
-                            }
+                        match g.zero(&f.ty) {
+                            Some(z) => g.w(2, format!("{t}: {} = {z}", type_src(&f.ty))),
+                            None => return Err(fail(format!("field `{}` of variant `{}` has no zero value", f.name, v.name))),
                         }
-                        stages.push((t, staged));
+                        temps.push(t);
                     }
                     g.w(2, "if _d.open_obj! {");
                     g.w(3, "while _d.next_key! {");
                     g.w(4, "case _d.key {");
-                    for (f, (t, _)) in v.fields.iter().zip(&stages) {
+                    for (f, t) in v.fields.iter().zip(&temps) {
                         if f.opts.skip {
                             continue;
                         }
@@ -694,9 +682,91 @@ pub fn json_source(job: &DeriveJob, alias: &str, types: &ModuleTypes) -> Result<
                     g.w(4, "}");
                     g.w(3, "}");
                     g.w(2, "}");
-                    for (t, staged) in &stages {
-                        args.push(if *staged { format!("{t}!") } else { t.clone() });
+                    args = temps;
+                } else if v.fields.len() == 1 {
+                    let x = g.fresh("v");
+                    g.dec(&v.fields[0].ty, &x, 2).map_err(&fail)?;
+                    args.push(x);
+                } else {
+                    g.w(2, "_d.open_tuple!");
+                    for (k, f) in v.fields.iter().enumerate() {
+                        g.w(2, format!("_d.tuple_next!({k}, {})", v.fields.len()));
+                        let x = g.fresh("v");
+                        g.dec(&f.ty, &x, 2).map_err(&fail)?;
+                        args.push(x);
                     }
+                    g.w(2, format!("_d.tuple_end!({})", v.fields.len()));
+                }
+                g.w(2, format!("{name}.{}({})", v.name, args.join(", ")));
+                g.w(1, "}");
+                helpers.push_str(&std::mem::replace(&mut g.out, saved));
+            }
+            g.w(5, "_ => _d.skip!");
+            g.w(4, "}");
+            g.w(3, "}");
+            g.w(2, "}");
+            g.w(2, "_r");
+        }
+        DShape::Enum(vs) => {
+            if vs.is_empty() {
+                return Err(fail("an enum without variants has no JSON form".to_string()));
+            }
+            g.w(2, "_vn = _d.variant!");
+            g.w(2, "_wr = _d.wrapped");
+            g.w(2, format!("_r = {name}.json_zero"));
+            g.w(2, "case _vn {");
+            for v in vs {
+                let vname = v.opts.rename.clone().unwrap_or_else(|| v.name.clone());
+                g.w(3, format!("{} => {{", lit(&vname)));
+                let ctx = format!("{name}.{}", v.name);
+                if v.fields.is_empty() {
+                    g.w(4, "_d.unit_variant!(_wr)");
+                    g.w(4, format!("_r = {name}.{}", v.name));
+                    g.w(4, "nil");
+                    g.w(3, "}");
+                    continue;
+                }
+                let hn = format!("json_v_{}", v.name);
+                g.w(4, format!("_r = {name}.{hn}(_d, _wr)"));
+                g.w(4, "nil");
+                g.w(3, "}");
+                let saved = std::mem::take(&mut g.out);
+                g.w(1, format!("def self.{hn}(_d: {a}.Decoder, _wr: Bool) -> {name} {{"));
+                g.w(2, format!("_d.at!({})", lit(&ctx)));
+                g.w(2, "_d.need_payload!(_wr)");
+                let named = v.fields.iter().any(|f| f.name.parse::<usize>().is_err());
+                let mut args: Vec<String> = vec![];
+                if named {
+                    // Named fields: an object. Each field gets a temporary holding its zero.
+                    let mut temps: Vec<String> = vec![];
+                    for f in v.fields.iter() {
+                        let t = g.fresh("p");
+                        match g.zero(&f.ty) {
+                            Some(z) => g.w(2, format!("{t}: {} = {z}", type_src(&f.ty))),
+                            None => return Err(fail(format!("field `{}` of variant `{}` has no zero value", f.name, v.name))),
+                        }
+                        temps.push(t);
+                    }
+                    g.w(2, "if _d.open_obj! {");
+                    g.w(3, "while _d.next_key! {");
+                    g.w(4, "case _d.key {");
+                    for (f, t) in v.fields.iter().zip(&temps) {
+                        if f.opts.skip {
+                            continue;
+                        }
+                        let key = f.opts.rename.clone().unwrap_or_else(|| f.name.clone());
+                        g.w(5, format!("{} => {{", lit(&key)));
+                        let x = g.fresh("v");
+                        g.dec(&f.ty, &x, 6).map_err(&fail)?;
+                        g.w(6, format!("{t} = {x}"));
+                        g.w(6, "nil");
+                        g.w(5, "}");
+                    }
+                    g.w(5, "_ => _d.skip!");
+                    g.w(4, "}");
+                    g.w(3, "}");
+                    g.w(2, "}");
+                    args = temps;
                 } else if v.fields.len() == 1 {
                     let x = g.fresh("v");
                     g.dec(&v.fields[0].ty, &x, 2).map_err(&fail)?;

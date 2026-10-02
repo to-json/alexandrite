@@ -23,9 +23,12 @@ typedef struct { int64_t v; AlxBig *big; } AlxPInt;
 /* Generators: every generator state begins with this. */
 typedef struct AlxGen { bool (*next)(struct AlxGen *self, void *out); } AlxGen;
 
-/* ---------- memory: one program-lifetime region (v0) ----------
- * Nothing is freed, so allocation is a per-thread bump pointer into
- * malloc'd chunks; large requests go straight to malloc. */
+/* ---------- memory: regions ----------
+ * A region is a list of chunks plus a list of large blocks. Each thread has
+ * a program region (never freed) and a current region; alx_alloc allocates
+ * in the current region. The current region's bump cursor lives in the
+ * thread-locals below (saved into the region struct when it is switched
+ * out), so the fast path is a bump. Handles are thread-local. */
 extern _Thread_local char *alx_bump_cur, *alx_bump_end;
 extern bool alx_counting;
 extern size_t alx_allocs;
@@ -41,6 +44,17 @@ static inline void *alx_alloc(size_t bytes) {
     return alx_alloc_slow(n);
 }
 void alx_init(void);
+
+typedef struct AlxRegion AlxRegion;
+AlxRegion *alx_region_program(void);         /* this thread's program region */
+AlxRegion *alx_region_cur(void);             /* the current region */
+AlxRegion *alx_region_enter(void);           /* fresh empty region, made current */
+void alx_region_exit(AlxRegion *r, AlxRegion *saved); /* free r; make saved current */
+AlxRegion *alx_region_use(AlxRegion *r);     /* make r current; returns previous */
+void alx_region_set(AlxRegion *r);           /* make r current */
+/* Stats (all threads): bytes held in chunks/large blocks, live regions + free lists. */
+size_t alx_mem_held(void);
+size_t alx_mem_peak(void);
 
 /* ---------- panics ---------- */
 _Noreturn void alx_panic(const char *what, const char *loc);

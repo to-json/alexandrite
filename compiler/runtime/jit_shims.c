@@ -6,6 +6,13 @@
 
 typedef struct { void *ptr; int64_t len; int64_t cap; } AnyArr;
 
+void *alxj_region_cur(void) { return alx_region_cur(); }
+void *alxj_region_enter(void) { return alx_region_enter(); }
+void alxj_region_exit(void *r, void *saved) { alx_region_exit(r, saved); }
+void *alxj_region_use(void *r) { return alx_region_use(r); }
+void alxj_region_set(void *r) { alx_region_set(r); }
+void *alxj_region_program(void) { return alx_region_program(); }
+
 void *alxj_alloc(int64_t n) { return alx_alloc((size_t)n); }
 
 void *alxj_zalloc(int64_t n) {

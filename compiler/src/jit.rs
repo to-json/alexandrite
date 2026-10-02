@@ -29,6 +29,7 @@ macro_rules! runtime {
 mod rt {
     runtime!(
         alx_init, alx_panic, alx_overflow, alx_pow, alx_isqrt, alx_sort_i64, alx_sort_str, alx_puts_i64,
+        alxj_region_cur, alxj_region_enter, alxj_region_exit, alxj_region_use, alxj_region_set, alxj_region_program,
         alxj_alloc, alxj_zalloc, alxj_arr_alloc, alxj_arr_grow, alxj_arr_new, alxj_arr_copy,
         alxj_int_to_s, alxj_str_rev, alxj_str_delete, alxj_str_split, alxj_str_to_i, alxj_str_charlen, alxj_str_sub,
         alxj_str_eq, alxj_str_cmp, alxj_str_is_pal, alxj_int_ndigits, alxj_digits,
@@ -550,7 +551,25 @@ impl Fx<'_, '_, '_> {
 
     fn stmt(&mut self, s: &LS) {
         match s {
-            LS::RegionEnter { .. } | LS::RegionExit { .. } | LS::RegionUse { .. } | LS::RegionRestore(_) => unimplemented!("R1: regions in the JIT"),
+            LS::RegionEnter { region, saved } => {
+                let sv = self.call_rt(rt::alxj_region_cur, &[], true).unwrap();
+                self.set(*saved, &[sv]);
+                let r = self.call_rt(rt::alxj_region_enter, &[], true).unwrap();
+                self.set(*region, &[r]);
+            }
+            LS::RegionExit { region, saved } => {
+                let (r, sv) = (self.get(*region), self.get(*saved));
+                self.call_rt(rt::alxj_region_exit, &[r[0], sv[0]], false);
+            }
+            LS::RegionUse { region, saved } => {
+                let r = self.e1(region);
+                let sv = self.call_rt(rt::alxj_region_use, &[r], true).unwrap();
+                self.set(*saved, &[sv]);
+            }
+            LS::RegionRestore(saved) => {
+                let sv = self.get(*saved);
+                self.call_rt(rt::alxj_region_set, &[sv[0]], false);
+            }
             LS::Spawn { dst, worker, env } => {
                 let (it, ot) = (self.d.worker_in[worker].clone(), self.d.worker_out[worker].clone());
                 let x = self.e(env);
@@ -1101,7 +1120,7 @@ impl Fx<'_, '_, '_> {
 
     fn e(&mut self, e: &LE) -> Vec<Value> {
         match e {
-            LE::RegionProgram => unimplemented!("R1: regions in the JIT"),
+            LE::RegionProgram => vec![self.call_rt(rt::alxj_region_program, &[], true).unwrap()],
             LE::ChanNew(t, cap) => {
                 let c = self.e1(cap);
                 let esz = self.ic(lay(t).size as i64);

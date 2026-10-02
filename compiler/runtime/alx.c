@@ -11,30 +11,148 @@
 size_t alx_allocs;
 bool alx_counting;
 _Thread_local char *alx_bump_cur, *alx_bump_end;
+static size_t mem_held, mem_peak;
+static bool alx_memstats;
+
+size_t alx_mem_held(void) { return __atomic_load_n(&mem_held, __ATOMIC_RELAXED); }
+size_t alx_mem_peak(void) { return __atomic_load_n(&mem_peak, __ATOMIC_RELAXED); }
+
+static void mem_add(size_t n) {
+    size_t h = __atomic_add_fetch(&mem_held, n, __ATOMIC_RELAXED);
+    size_t p = __atomic_load_n(&mem_peak, __ATOMIC_RELAXED);
+    while (h > p && !__atomic_compare_exchange_n(&mem_peak, &p, h, true, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {}
+}
+static void mem_sub(size_t n) { __atomic_sub_fetch(&mem_held, n, __ATOMIC_RELAXED); }
 
 static void alx_report(void) {
     if (alx_counting) fprintf(stderr, "alx-allocs: %zu\n", alx_allocs);
+    if (alx_memstats) fprintf(stderr, "alx-mem: peak=%zu final=%zu\n", alx_mem_peak(), alx_mem_held());
 }
 
 void alx_init(void) {
     alx_counting = getenv("ALX_COUNT_ALLOCS") != NULL;
+    alx_memstats = getenv("ALX_MEMSTATS") != NULL;
     atexit(alx_report);
 }
 
-enum { ALX_CHUNK = 1 << 20 };
+enum { ALX_CHUNK = 1 << 20, ALX_HDR = 16 };
+
+#if defined(__has_feature)
+#  if __has_feature(address_sanitizer)
+#    define ALX_ASAN 1
+#  endif
+#endif
+#if defined(__SANITIZE_ADDRESS__)
+#  define ALX_ASAN 1
+#endif
+/* Under ASan freed chunks are free()d (not reused) so use-after-free is caught. */
+#ifdef ALX_ASAN
+enum { ALX_FREE_CAP = 0 };
+#else
+enum { ALX_FREE_CAP = 4 };  /* chunks kept per thread (4 MB) */
+#endif
+
+/* Chunks and large blocks start with a 16-byte header. */
+typedef struct Blk { struct Blk *next; size_t size; } Blk;
+
+struct AlxRegion {
+    char *cur, *end;       /* bump position; valid only while not current */
+    Blk *chunks, *larges;
+    AlxRegion *pool_next;
+};
+
+static _Thread_local AlxRegion tl_prog;
+static _Thread_local AlxRegion *tl_cur;        /* NULL = program region */
+static _Thread_local AlxRegion *tl_pool;       /* spare region structs */
+static _Thread_local Blk *tl_free;             /* free chunks */
+static _Thread_local int tl_nfree;
+
+static pthread_key_t free_key;
+static pthread_once_t free_once = PTHREAD_ONCE_INIT;
+static _Thread_local bool tl_free_armed;
+/* At thread exit, return the thread's free chunks to the OS. */
+static void free_chunks(void *unused) {
+    (void)unused;
+    for (Blk *b = tl_free, *n; b; b = n) { n = b->next; mem_sub(b->size); free(b); }
+    tl_free = NULL; tl_nfree = 0;
+}
+static void free_key_init(void) { pthread_key_create(&free_key, free_chunks); }
+static void arm_free(void) {
+    pthread_once(&free_once, free_key_init);
+    pthread_setspecific(free_key, &tl_free_armed);
+    tl_free_armed = true;
+}
+
+static inline AlxRegion *cur_region(void) { return tl_cur ? tl_cur : &tl_prog; }
+
+AlxRegion *alx_region_program(void) { return &tl_prog; }
+AlxRegion *alx_region_cur(void) { return cur_region(); }
+
+void alx_region_set(AlxRegion *r) {
+    AlxRegion *c = cur_region();
+    if (c == r) return;
+    c->cur = alx_bump_cur; c->end = alx_bump_end;
+    alx_bump_cur = r->cur; alx_bump_end = r->end;
+    tl_cur = r;
+}
+
+AlxRegion *alx_region_use(AlxRegion *r) {
+    AlxRegion *p = cur_region();
+    alx_region_set(r);
+    return p;
+}
+
+AlxRegion *alx_region_enter(void) {
+    AlxRegion *r = tl_pool;
+    if (r) tl_pool = r->pool_next;
+    else {
+        r = malloc(sizeof *r);
+        if (!r) alx_panic("out of memory", "runtime");
+    }
+    r->cur = r->end = NULL; r->chunks = r->larges = NULL; r->pool_next = NULL;
+    alx_region_set(r);
+    return r;
+}
+
+void alx_region_exit(AlxRegion *r, AlxRegion *saved) {
+    AlxRegion *c = cur_region();
+    if (c != r && c != saved) { c->cur = alx_bump_cur; c->end = alx_bump_end; }
+    if (c != saved) { alx_bump_cur = saved->cur; alx_bump_end = saved->end; }
+    tl_cur = saved;
+    for (Blk *b = r->chunks, *n; b; b = n) {
+        n = b->next;
+        if (tl_nfree < ALX_FREE_CAP) { if (!tl_free_armed) arm_free(); b->next = tl_free; tl_free = b; tl_nfree++; }
+        else { mem_sub(b->size); free(b); }
+    }
+    for (Blk *b = r->larges, *n; b; b = n) { n = b->next; mem_sub(b->size); free(b); }
+    r->chunks = r->larges = NULL;
+    r->pool_next = tl_pool; tl_pool = r;
+}
 
 /* `n` is rounded to 16 already. */
 void *alx_alloc_slow(size_t n) {
+    AlxRegion *r = cur_region();
     if (n > ALX_CHUNK / 16) {
-        void *p = malloc(n);
-        if (!p) alx_panic("out of memory", "runtime");
-        return p;
+        size_t sz = n + ALX_HDR;
+        Blk *b = malloc(sz);
+        if (!b) alx_panic("out of memory", "runtime");
+        mem_add(sz);
+        b->size = sz; b->next = r->larges; r->larges = b;
+        return (char *)b + ALX_HDR;
     }
-    char *c = malloc(ALX_CHUNK);
-    if (!c) alx_panic("out of memory", "runtime");
-    alx_bump_cur = c + n;
-    alx_bump_end = c + ALX_CHUNK;
-    return c;
+    Blk *c = tl_free;
+    if (c) { tl_free = c->next; tl_nfree--; }
+    else {
+        c = malloc(ALX_CHUNK);
+        if (!c) alx_panic("out of memory", "runtime");
+        mem_add(ALX_CHUNK);
+        c->size = ALX_CHUNK;
+    }
+    c->next = r->chunks; r->chunks = c;
+    char *base = (char *)c + ALX_HDR;
+    alx_bump_cur = base + n;
+    alx_bump_end = (char *)c + ALX_CHUNK;
+    return base;
 }
 
 /* ---------- panics and errors ---------- */

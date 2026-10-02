@@ -6,7 +6,7 @@ use std::fmt::Write;
 
 pub fn ty_name(t: &LTy) -> String {
     match t {
-        LTy::Region => unimplemented!("R1: regions in C"),
+        LTy::Region => "Region".into(),
         LTy::Task(t) => format!("Task_{}", ty_name(t)),
         LTy::Chan(t) => format!("Chan_{}", ty_name(t)),
         LTy::I64 => "I64".into(),
@@ -25,7 +25,7 @@ pub fn ty_name(t: &LTy) -> String {
 
 pub fn cty(t: &LTy) -> String {
     match t {
-        LTy::Region => unimplemented!("R1: regions in C"),
+        LTy::Region => "AlxRegion *".into(),
         LTy::Task(_) => "AlxTask *".into(),
         LTy::Chan(_) => "AlxChan *".into(),
         LTy::I64 | LTy::IntK(_) => "int64_t".into(),
@@ -319,7 +319,22 @@ impl FnEmit<'_> {
 
     fn stmt(&mut self, s: &LS) {
         match s {
-            LS::RegionEnter { .. } | LS::RegionExit { .. } | LS::RegionUse { .. } | LS::RegionRestore(_) => unimplemented!("R1: regions in C"),
+            LS::RegionEnter { region, saved } => {
+                let (r, sv) = (self.v(*region), self.v(*saved));
+                self.line(&format!("{sv} = alx_region_cur(); {r} = alx_region_enter();"));
+            }
+            LS::RegionExit { region, saved } => {
+                let (r, sv) = (self.v(*region), self.v(*saved));
+                self.line(&format!("alx_region_exit({r}, {sv});"));
+            }
+            LS::RegionUse { region, saved } => {
+                let (r, sv) = (self.e(region), self.v(*saved));
+                self.line(&format!("{sv} = alx_region_use({r});"));
+            }
+            LS::RegionRestore(saved) => {
+                let sv = self.v(*saved);
+                self.line(&format!("alx_region_set({sv});"));
+            }
             LS::Spawn { dst, worker, env } => {
                 let w = &self.p.workers[*worker];
                 let (it, ot) = (cty_mem(&w.input), cty_mem(&w.func.ret));
@@ -535,7 +550,7 @@ impl FnEmit<'_> {
 
     fn e(&self, e: &LE) -> String {
         match e {
-            LE::RegionProgram => unimplemented!("R1: regions in C"),
+            LE::RegionProgram => "alx_region_program()".into(),
             LE::ChanNew(t, cap) => format!("alx_chan_new({}, sizeof({}))", self.e(cap), cty_mem(t)),
             LE::ChanLen(c) => format!("alx_chan_len({})", self.e(c)),
             LE::Var(v) => self.v(*v),

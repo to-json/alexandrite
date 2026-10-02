@@ -191,6 +191,9 @@ static inline int64_t alx_str_byte(AlxStr s, int64_t i) { return (unsigned char)
 Arr_I64 alx_digits(int64_t v, const char *loc);
 void alx_sort_i64(Arr_I64 *a);
 void alx_sort_str(Arr_Str *a);
+_Noreturn void alx_die_str(AlxStr msg);
+int64_t alx_file_status(AlxStr path);
+AlxStr alx_file_read_or_empty(AlxStr path);
 bool alx_file_read(AlxStr path, const char *loc, AlxStr *out, AlxErr *err);
 
 /* ---------- output ---------- */

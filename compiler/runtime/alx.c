@@ -73,6 +73,13 @@ void alx_die(AlxErr e) {
     exit(1);
 }
 
+void alx_die_str(AlxStr msg) {
+    fflush(stdout);
+    fwrite(msg.ptr, 1, (size_t)msg.len, stderr);
+    fputc('\n', stderr);
+    exit(1);
+}
+
 /* ---------- integers ---------- */
 
 bool alx_try_pow(int64_t a, int64_t b, int64_t *r) {
@@ -228,6 +235,21 @@ bool alx_file_read(AlxStr path, const char *loc, AlxStr *out, AlxErr *err) {
     out->ptr = p;
     out->len = (int64_t)got;
     return true;
+}
+
+int64_t alx_file_status(AlxStr path) {
+    AlxStr out;
+    AlxErr err;
+    if (alx_file_read(path, "", &out, &err)) return 0;
+    return err.tag == ALX_ERR_NOT_FOUND ? 1 : 2;
+}
+
+AlxStr alx_file_read_or_empty(AlxStr path) {
+    AlxStr out;
+    AlxErr err;
+    if (alx_file_read(path, "", &out, &err)) return out;
+    AlxStr e = { "", 0 };
+    return e;
 }
 
 /* ---------- floats ---------- */

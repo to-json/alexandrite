@@ -318,6 +318,10 @@ impl FnEmit<'_> {
                     _ => self.line(&format!("let _ = {x}; println!();")),
                 }
             }
+            LS::Die(e) => {
+                let x = self.e(e);
+                self.line(&format!("die_str({x});"));
+            }
             LS::Panic(m, l) => self.line(&format!("panic({:?}, {});", m, loc(l))),
             LS::SortInPlace(v, _) => self.line(&format!("v{v}.sort();")),
         }
@@ -507,6 +511,8 @@ impl FnEmit<'_> {
                     Rt::IntFmt => call("int_fmt"),
                     Rt::FToU64 => call("f_to_u64"),
                     Rt::RuneToS => call("rune_to_s"),
+                    Rt::FileStatus => call("file_status"),
+                    Rt::FileRead => call("file_read_or_empty"),
                     Rt::StrFromBytes => format!("Str(({}).to_vec().into_iter().map(|b| b as u8).collect::<Vec<u8>>().into())", a[0]),
                 }
             }

@@ -217,6 +217,29 @@ pub extern "C" fn alxr_file_read(p: i64, n: i64, lp: i64, ln: i64) -> i32 {
     }
 }
 
+#[unsafe(no_mangle)]
+pub extern "C" fn alxr_die_str(p: i64, n: i64) {
+    let s = st();
+    s.err.push_str(&String::from_utf8_lossy(bytes(p, n)));
+    s.err.push('\n');
+    stop(Stop::Exit1)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn alxr_file_status(p: i64, n: i64) -> i64 {
+    let path = String::from_utf8_lossy(bytes(p, n)).into_owned();
+    let key = path.trim_start_matches("./");
+    if st().files.contains_key(key) { 0 } else { 1 }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn alxr_file_read_or_empty(p: i64, n: i64) {
+    let path = String::from_utf8_lossy(bytes(p, n)).into_owned();
+    let key = path.trim_start_matches("./");
+    let data = st().files.get(key).cloned().unwrap_or_default();
+    ret_str(&data);
+}
+
 // ---------- integers ----------
 
 fn try_pow(mut a: i64, mut b: i64) -> Option<i64> {

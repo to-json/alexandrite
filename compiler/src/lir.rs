@@ -151,6 +151,10 @@ pub enum Rt {
     RuneToS,
     /// A Str holding a copy of a [U8]'s bytes.
     StrFromBytes,
+    /// (path): 0 if the file can be read, 1 if it doesn't exist, 2 for any other error.
+    FileStatus,
+    /// (path): the file's contents; empty on failure (check `FileStatus` first).
+    FileRead,
 }
 
 /// Primitive integer operations on i64 registers. The lowering builds Go's
@@ -235,6 +239,8 @@ pub enum LS {
     Pmap { dst: V, arr: LE, worker: usize, path: ErrPath },
     Puts(LE, LTy),
     Panic(String, String),
+    /// Flush stdout, print the Str and a newline to stderr, exit 1.
+    Die(LE),
     SortInPlace(V, LTy),
 }
 

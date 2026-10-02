@@ -494,6 +494,10 @@ impl FnEmit<'_> {
                 };
                 self.line(&format!("{f}({x});"));
             }
+            LS::Die(e) => {
+                let x = self.e(e);
+                self.line(&format!("alx_die_str({x});"));
+            }
             LS::Panic(msg, loc) => self.line(&format!("alx_panic({}, {});", c_str(msg), c_str(loc))),
             LS::SortInPlace(v, el) => {
                 let f = match el {
@@ -688,6 +692,8 @@ impl FnEmit<'_> {
                     Rt::IntFmt => s("alx_int_fmt"),
                     Rt::FToU64 => s("alx_f_to_u64"),
                     Rt::RuneToS => s("alx_rune_to_s"),
+                    Rt::FileStatus => s("alx_file_status"),
+                    Rt::FileRead => s("alx_file_read_or_empty"),
                     Rt::StrFromBytes => format!("alx_str_from_bytes((const uint8_t *)({0}).ptr, ({0}).len)", a[0]),
                 }
             }

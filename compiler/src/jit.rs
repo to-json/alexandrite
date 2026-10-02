@@ -37,6 +37,7 @@ mod rt {
         alxj_p_to_s, alxj_p_ndigits, alxj_p_digits, alxj_puts_pint,
         alxj_puts_f64, alxj_f_to_s, alxj_f_fmt, alxj_f_to_i, alxj_str_cat,
         alxj_puts_u64, alxj_u64_to_s, alxj_int_fmt, alxj_f_to_u64, alxj_rune_to_s, alxj_str_from_bytes,
+        alxj_die_str, alxj_file_status, alxj_file_read_or_empty,
     );
 }
 type RtFn = unsafe extern "C" fn();
@@ -889,6 +890,13 @@ impl Fx<'_, '_, '_> {
                     _ => self.panic("`puts` of this type isn't supported yet", "puts"),
                 }
             }
+            LS::Die(e) => {
+                let v = self.e(e);
+                let ps = self.spill(&LTy::Str, &v);
+                self.call_rt(rt::alxj_die_str, &[ps], false);
+                self.b.ins().trap(TrapCode::unwrap_user(1));
+                self.fresh();
+            }
             LS::Panic(msg, loc) => self.panic(msg, loc),
             LS::SortInPlace(v, el) => {
                 let f = match el {
@@ -930,7 +938,8 @@ impl Fx<'_, '_, '_> {
             LE::Cond(_, a, _) => self.ty(a),
             LE::Call(f, _) => self.d.funcs[f.as_str()].1.ret.clone(),
             LE::Rt(rt, args) => match rt {
-                Rt::IntToS | Rt::PIntToS | Rt::StrRev | Rt::StrDelete | Rt::FToS | Rt::FFmt | Rt::StrCat | Rt::U64ToS | Rt::IntFmt | Rt::RuneToS | Rt::StrFromBytes => LTy::Str,
+                Rt::IntToS | Rt::PIntToS | Rt::StrRev | Rt::StrDelete | Rt::FToS | Rt::FFmt | Rt::StrCat | Rt::U64ToS | Rt::IntFmt | Rt::RuneToS | Rt::StrFromBytes | Rt::FileRead => LTy::Str,
+                Rt::FileStatus => LTy::I64,
                 Rt::IntToF | Rt::FSqrt | Rt::FAbs => LTy::F64,
                 Rt::StrByte => {
                     if matches!(args[2], LE::I(0)) {
@@ -1471,6 +1480,18 @@ impl Fx<'_, '_, '_> {
             Rt::FAbs => {
                 let v = self.e1(&args[0]);
                 vec![self.b.ins().fabs(v)]
+            }
+            Rt::FileStatus => {
+                let v = self.e(&args[0]);
+                let ps = self.spill(&LTy::Str, &v);
+                vec![self.call_rt(rt::alxj_file_status, &[ps], true).unwrap()]
+            }
+            Rt::FileRead => {
+                let v = self.e(&args[0]);
+                let ps = self.spill(&LTy::Str, &v);
+                let out = self.slot(16);
+                self.call_rt(rt::alxj_file_read_or_empty, &[out, ps], false);
+                self.load(&s, out, 0)
             }
             Rt::StrFromBytes => {
                 let a = self.e(&args[0]);

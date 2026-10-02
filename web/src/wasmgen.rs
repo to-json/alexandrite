@@ -36,6 +36,9 @@ const RT: &[(&str, &str)] = &[
     ("alxr_err_overflow", "jj>"),
     ("alxr_die", ">"),
     ("alxr_file_read", "jjjj>i"),
+    ("alxr_die_str", "jj>"),
+    ("alxr_file_status", "jj>j"),
+    ("alxr_file_read_or_empty", "jj>"),
     ("alxr_pow", "jjjj>j"),
     ("alxr_try_pow", "jj>i"),
     ("alxr_mul_chk", "jj>j"),
@@ -1012,6 +1015,11 @@ impl<'c, 'p> Fx<'c, 'p> {
                     }
                 }
             }
+            LS::Die(e) => {
+                self.e(e);
+                self.rt("alxr_die_str");
+                self.ins().unreachable();
+            }
             LS::Panic(msg, loc) => self.panic(msg, loc),
             LS::SortInPlace(v, el) => {
                 let a = self.vars[*v].clone();
@@ -1211,7 +1219,8 @@ impl<'c, 'p> Fx<'c, 'p> {
             LE::Cond(_, a, _) => self.ty(a),
             LE::Call(f, _) => self.cx.funcs[f.as_str()].1.ret.clone(),
             LE::Rt(r, args) => match r {
-                Rt::IntToS | Rt::PIntToS | Rt::StrRev | Rt::StrDelete | Rt::FToS | Rt::FFmt | Rt::StrCat | Rt::U64ToS | Rt::IntFmt | Rt::RuneToS | Rt::StrFromBytes => LTy::Str,
+                Rt::IntToS | Rt::PIntToS | Rt::StrRev | Rt::StrDelete | Rt::FToS | Rt::FFmt | Rt::StrCat | Rt::U64ToS | Rt::IntFmt | Rt::RuneToS | Rt::StrFromBytes | Rt::FileRead => LTy::Str,
+                Rt::FileStatus => LTy::I64,
                 Rt::IntToF | Rt::FSqrt | Rt::FAbs => LTy::F64,
                 Rt::StrByte => {
                     if matches!(args[2], LE::I(0)) {
@@ -1695,6 +1704,8 @@ impl<'c, 'p> Fx<'c, 'p> {
             Rt::FToS => call_ret(self, "alxr_f_to_s", 2),
             Rt::U64ToS => call_ret(self, "alxr_u64_to_s", 2),
             Rt::IntFmt => call_ret(self, "alxr_int_fmt", 2),
+            Rt::FileStatus => call(self, "alxr_file_status"),
+            Rt::FileRead => call_ret(self, "alxr_file_read_or_empty", 2),
             Rt::RuneToS => call_ret(self, "alxr_rune_to_s", 2),
             Rt::FToU64 => call(self, "alxr_f_to_u64"),
             Rt::FFmt => call_ret(self, "alxr_f_fmt", 2),

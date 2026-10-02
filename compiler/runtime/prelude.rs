@@ -79,6 +79,14 @@ mod rt {
         }
         std::process::exit(1)
     }
+    pub fn die_str(s: Str) -> ! {
+        use std::io::Write;
+        let _ = std::io::stdout().flush();
+        let mut e = std::io::stderr();
+        let _ = e.write_all(&s.0);
+        let _ = e.write_all(b"\n");
+        std::process::exit(1)
+    }
     pub fn err_overflow(loc: &'static str) -> AlxErr {
         AlxErr::Overflow(loc)
     }
@@ -314,6 +322,20 @@ mod rt {
             Ok(b) => Ok(Str(b.into())),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(AlxErr::NotFound(p, loc)),
             Err(_) => Err(AlxErr::Io(p, loc)),
+        }
+    }
+
+    pub fn file_status(p: Str) -> i64 {
+        match std::fs::read(String::from_utf8_lossy(&p.0).to_string()) {
+            Ok(_) => 0,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => 1,
+            Err(_) => 2,
+        }
+    }
+    pub fn file_read_or_empty(p: Str) -> Str {
+        match std::fs::read(String::from_utf8_lossy(&p.0).to_string()) {
+            Ok(b) => Str(b.into()),
+            Err(_) => Str::lit(b""),
         }
     }
 

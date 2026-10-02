@@ -64,6 +64,10 @@ void alxj_err_overflow(AlxErr *out, const char *loc) { *out = alx_err_overflow(l
 void alxj_die(const AlxErr *e) { alx_die(*e); }
 int64_t alxj_file_read(const AlxStr *path, const char *loc, AlxStr *out, AlxErr *err) { return alx_file_read(*path, loc, out, err); }
 
+void alxj_die_str(const AlxStr *s) { alx_die_str(*s); }
+int64_t alxj_file_status(const AlxStr *path) { return alx_file_status(*path); }
+void alxj_file_read_or_empty(AlxStr *out, const AlxStr *path) { *out = alx_file_read_or_empty(*path); }
+
 /* ---------- output, sorting, pmap ---------- */
 void alxj_puts_str(const AlxStr *s) { alx_puts_str(*s); }
 void alxj_puts_bool(int64_t b) { alx_puts_bool(b != 0); }

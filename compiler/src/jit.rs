@@ -38,6 +38,7 @@ mod rt {
         alxj_puts_f64, alxj_f_to_s, alxj_f_fmt, alxj_f_to_i, alxj_str_cat,
         alxj_puts_u64, alxj_u64_to_s, alxj_int_fmt, alxj_f_to_u64, alxj_rune_to_s, alxj_str_from_bytes,
         alxj_die_str, alxj_file_status, alxj_file_read_or_empty,
+        alxj_spawn, alxj_task_wait, alxj_chan_new, alxj_chan_len, alxj_chan_send, alxj_chan_recv, alxj_chan_close, alxj_select,
     );
 }
 type RtFn = unsafe extern "C" fn();
@@ -113,6 +114,9 @@ struct Decls<'p> {
     funcs: HashMap<&'p str, (FuncId, &'p LFunc)>,
     gens: HashMap<usize, (FuncId, &'p LGen)>,
     workers: HashMap<usize, FuncId>,
+    /// A worker's input and result types (for `spawn`).
+    worker_in: HashMap<usize, LTy>,
+    worker_out: HashMap<usize, LTy>,
 }
 
 /// Compile the program and run it in this process. Returns only if the
@@ -127,7 +131,7 @@ pub fn run(p: &LProgram) -> Result<(), String> {
     let isa = cranelift_native::builder().map_err(|e| format!("jit: {e}"))?.finish(settings::Flags::new(fb)).map_err(|e| format!("jit: {e}"))?;
     let mut m = JITModule::new(JITBuilder::with_isa(isa, default_libcall_names()));
 
-    let mut d = Decls { funcs: HashMap::new(), gens: HashMap::new(), workers: HashMap::new() };
+    let mut d = Decls { funcs: HashMap::new(), gens: HashMap::new(), workers: HashMap::new(), worker_in: HashMap::new(), worker_out: HashMap::new() };
     for f in &p.funcs {
         if f.external {
             return Err(format!("jit: external function `{}`", f.name));
@@ -143,6 +147,8 @@ pub fn run(p: &LProgram) -> Result<(), String> {
     for w in &p.workers {
         let id = m.declare_function(&format!("worker{}", w.id), Linkage::Local, &worker_sig(&m)).map_err(|e| e.to_string())?;
         d.workers.insert(w.id, id);
+        d.worker_in.insert(w.id, w.input.clone());
+        d.worker_out.insert(w.id, w.func.ret.clone());
     }
 
     let mut ctx = m.make_context();
@@ -543,7 +549,105 @@ impl Fx<'_, '_, '_> {
 
     fn stmt(&mut self, s: &LS) {
         match s {
-            LS::Spawn { .. } | LS::Wait { .. } | LS::ChanSend { .. } | LS::ChanRecv { .. } | LS::ChanClose { .. } | LS::Select { .. } => unimplemented!("M7: tasks and channels in the JIT"),
+            LS::Spawn { dst, worker, env } => {
+                let (it, ot) = (self.d.worker_in[worker].clone(), self.d.worker_out[worker].clone());
+                let x = self.e(env);
+                let envp = self.spill(&it, &x);
+                let (ie, oe) = (self.ic(lay(&it).size as i64), self.ic(lay(&ot).size as i64));
+                let fr = self.fref(self.d.workers[worker]);
+                let wf = self.b.ins().func_addr(I64, fr);
+                let h = self.call_rt(rt::alxj_spawn, &[wf, envp, ie, oe], true).unwrap();
+                self.set(*dst, &[h]);
+            }
+            LS::Wait { task, ok, val, msg } => {
+                let t = self.e1(task);
+                let vt = self.f.vars[*val].ty.clone();
+                // Preset both buffers with the current values: the runtime
+                // writes only the one that applies.
+                let (vv, mv) = (self.get(*val), self.get(*msg));
+                let vp = self.spill(&vt, &vv);
+                let mp = self.spill(&LTy::Str, &mv);
+                let r = self.call_rt(rt::alxj_task_wait, &[t, vp, mp], true).unwrap();
+                let okv = self.b.ins().ireduce(I8, r);
+                self.set(*ok, &[okv]);
+                let nv = self.load(&vt, vp, 0);
+                self.set(*val, &nv);
+                let nm = self.load(&LTy::Str, mp, 0);
+                self.set(*msg, &nm);
+            }
+            LS::ChanSend { ch, val, loc } => {
+                let LTy::Chan(et) = self.ty(ch) else { panic!("jit: send on a non-channel") };
+                let c = self.e1(ch);
+                let x = self.e(val);
+                let p = self.spill(&et, &x);
+                let l = self.cstr(loc);
+                self.call_rt(rt::alxj_chan_send, &[c, p, l], false);
+            }
+            LS::ChanRecv { ch, ok, val } => {
+                let c = self.e1(ch);
+                let vt = self.f.vars[*val].ty.clone();
+                let vv = self.get(*val);
+                let p = self.spill(&vt, &vv);
+                let r = self.call_rt(rt::alxj_chan_recv, &[c, p], true).unwrap();
+                let okv = self.b.ins().ireduce(I8, r);
+                self.set(*ok, &[okv]);
+                let nv = self.load(&vt, p, 0);
+                self.set(*val, &nv);
+            }
+            LS::ChanClose { ch, loc } => {
+                let c = self.e1(ch);
+                let l = self.cstr(loc);
+                self.call_rt(rt::alxj_chan_close, &[c, l], false);
+            }
+            LS::Select { cases, default, dst } => {
+                // AlxSelCase { ch, buf, is_send, ok }: four words each.
+                let n = cases.len() as i64;
+                let arr = self.slot((32 * cases.len().max(1)) as u32);
+                let mf = MemFlagsData::trusted();
+                let mut recvs = vec![];
+                for (i, c) in cases.iter().enumerate() {
+                    let base = 32 * i as i32;
+                    match c {
+                        SelCase::Send { ch, val } => {
+                            let LTy::Chan(et) = self.ty(ch) else { panic!("jit: select send on a non-channel") };
+                            let cv = self.e1(ch);
+                            let x = self.e(val);
+                            let p = self.spill(&et, &x);
+                            let one = self.ic(1);
+                            let zero = self.ic(0);
+                            self.b.ins().store(mf, cv, arr, base);
+                            self.b.ins().store(mf, p, arr, base + 8);
+                            self.b.ins().store(mf, one, arr, base + 16);
+                            self.b.ins().store(mf, zero, arr, base + 24);
+                        }
+                        SelCase::Recv { ch, ok, val } => {
+                            let cv = self.e1(ch);
+                            let vt = self.f.vars[*val].ty.clone();
+                            let vv = self.get(*val);
+                            let p = self.spill(&vt, &vv);
+                            let okv = self.get(*ok)[0];
+                            let okw = self.b.ins().uextend(I64, okv);
+                            let zero = self.ic(0);
+                            self.b.ins().store(mf, cv, arr, base);
+                            self.b.ins().store(mf, p, arr, base + 8);
+                            self.b.ins().store(mf, zero, arr, base + 16);
+                            self.b.ins().store(mf, okw, arr, base + 24);
+                            recvs.push((base, p, *ok, *val, vt));
+                        }
+                    }
+                }
+                let (nv, dv) = (self.ic(n), self.ic(*default as i64));
+                let l = self.cstr("select");
+                let r = self.call_rt(rt::alxj_select, &[arr, nv, dv, l], true).unwrap();
+                self.set(*dst, &[r]);
+                for (base, p, ok, val, vt) in recvs {
+                    let okw = self.b.ins().load(I64, mf, arr, base + 24);
+                    let okv = self.b.ins().ireduce(I8, okw);
+                    self.set(ok, &[okv]);
+                    let nv = self.load(&vt, p, 0);
+                    self.set(val, &nv);
+                }
+            }
             LS::Set(v, e) => {
                 let x = self.e(e);
                 self.set(*v, &x);
@@ -983,7 +1087,15 @@ impl Fx<'_, '_, '_> {
 
     fn e(&mut self, e: &LE) -> Vec<Value> {
         match e {
-            LE::ChanNew(..) | LE::ChanLen(_) => unimplemented!("M7: channels in the JIT"),
+            LE::ChanNew(t, cap) => {
+                let c = self.e1(cap);
+                let esz = self.ic(lay(t).size as i64);
+                vec![self.call_rt(rt::alxj_chan_new, &[c, esz], true).unwrap()]
+            }
+            LE::ChanLen(c) => {
+                let c = self.e1(c);
+                vec![self.call_rt(rt::alxj_chan_len, &[c], true).unwrap()]
+            }
             LE::Var(v) => self.get(*v),
             LE::I(i) => vec![self.ic(*i)],
             LE::F(v) => vec![self.b.ins().f64const(*v)],

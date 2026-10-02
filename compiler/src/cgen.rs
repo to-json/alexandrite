@@ -6,7 +6,8 @@ use std::fmt::Write;
 
 pub fn ty_name(t: &LTy) -> String {
     match t {
-        LTy::Task(_) | LTy::Chan(_) => unimplemented!("M7: task/channel types in C"),
+        LTy::Task(t) => format!("Task_{}", ty_name(t)),
+        LTy::Chan(t) => format!("Chan_{}", ty_name(t)),
         LTy::I64 => "I64".into(),
         LTy::IntK(k) => k.name().into(),
         LTy::F64 => "F64".into(),
@@ -23,7 +24,8 @@ pub fn ty_name(t: &LTy) -> String {
 
 pub fn cty(t: &LTy) -> String {
     match t {
-        LTy::Task(_) | LTy::Chan(_) => unimplemented!("M7: task/channel types in C"),
+        LTy::Task(_) => "AlxTask *".into(),
+        LTy::Chan(_) => "AlxChan *".into(),
         LTy::I64 | LTy::IntK(_) => "int64_t".into(),
         LTy::F64 => "double".into(),
         LTy::PInt => "AlxPInt".into(),
@@ -59,7 +61,7 @@ fn zero(t: &LTy) -> String {
         LTy::I64 | LTy::IntK(_) | LTy::Unit => "0".into(),
         LTy::F64 => "0.0".into(),
         LTy::Bool => "false".into(),
-        LTy::Gen(_) => "NULL".into(),
+        LTy::Gen(_) | LTy::Task(_) | LTy::Chan(_) => "NULL".into(),
         t => format!("({}){{0}}", cty(t)),
     }
 }
@@ -166,6 +168,7 @@ enum Ctx {
 }
 
 struct FnEmit<'f> {
+    p: &'f LProgram,
     f: &'f LFunc,
     ctx: Ctx,
     /// In a generator: variables are fields of `g`.
@@ -195,7 +198,7 @@ impl Gen<'_> {
                     let _ = writeln!(self.typedefs, "typedef struct {{ {} }} {n};", fields.join(" "));
                 }
             }
-            LTy::Gen(inner) => self.need_type(inner),
+            LTy::Gen(inner) | LTy::Task(inner) | LTy::Chan(inner) => self.need_type(inner),
             _ => {}
         }
     }
@@ -206,7 +209,7 @@ impl Gen<'_> {
         } else {
             Ctx::Plain
         };
-        let mut e = FnEmit { f, ctx, in_gen: false, yields: 0, out: String::new(), ind: 1 };
+        let mut e = FnEmit { p: self.p, f, ctx, in_gen: false, yields: 0, out: String::new(), ind: 1 };
         let _ = writeln!(self.out, "{} {{", proto(f));
         for (i, v) in f.vars.iter().enumerate() {
             if !f.params.contains(&i) {
@@ -223,7 +226,7 @@ impl Gen<'_> {
 
     fn worker(&mut self, w: &LWorker) {
         let f = &w.func;
-        let mut e = FnEmit { f, ctx: Ctx::Worker, in_gen: false, yields: 0, out: String::new(), ind: 1 };
+        let mut e = FnEmit { p: self.p, f, ctx: Ctx::Worker, in_gen: false, yields: 0, out: String::new(), ind: 1 };
         let _ = writeln!(self.out, "static void worker{}(const void *in_, void *out_) {{", w.id);
         for (i, v) in f.vars.iter().enumerate() {
             if f.params.contains(&i) {
@@ -245,7 +248,7 @@ impl Gen<'_> {
             let _ = writeln!(self.out, "    {} {};", cty(&v.ty), vname(f, i));
         }
         let _ = writeln!(self.out, "}} Gen{id};\n");
-        let mut e = FnEmit { f, ctx: Ctx::Gen, in_gen: true, yields: 0, out: String::new(), ind: 1 };
+        let mut e = FnEmit { p: self.p, f, ctx: Ctx::Gen, in_gen: true, yields: 0, out: String::new(), ind: 1 };
         e.block(&f.body);
         let n = e.yields;
         let elem = cty(&gn.elem);
@@ -279,6 +282,33 @@ impl FnEmit<'_> {
         if self.in_gen { format!("g->{}", vname(self.f, v)) } else { vname(self.f, v) }
     }
 
+    /// The static type of a (channel-valued) expression.
+    fn ty_of(&self, e: &LE) -> Option<LTy> {
+        match e {
+            LE::Var(v) => Some(self.f.vars[*v].ty.clone()),
+            LE::ChanNew(t, _) => Some(LTy::Chan(Box::new(t.clone()))),
+            LE::Field(x, i) => match self.ty_of(x)? {
+                LTy::Tup(ts) => ts.get(*i).cloned(),
+                _ => None,
+            },
+            LE::Index { arr, .. } => match self.ty_of(arr)? {
+                LTy::Arr(t) => Some(*t),
+                _ => None,
+            },
+            LE::Cond(_, a, _) => self.ty_of(a),
+            LE::Call(f, _) => self.p.funcs.iter().find(|x| &x.name == f).map(|x| x.ret.clone()),
+            _ => None,
+        }
+    }
+
+    /// The in-memory C element type of a channel expression.
+    fn chan_elem(&self, ch: &LE) -> String {
+        match self.ty_of(ch) {
+            Some(LTy::Chan(t)) => cty_mem(&t),
+            t => panic!("cgen: channel expression of unknown type ({t:?}): {ch:?}"),
+        }
+    }
+
     fn block(&mut self, ss: &[LS]) {
         for s in ss {
             self.stmt(s);
@@ -287,7 +317,69 @@ impl FnEmit<'_> {
 
     fn stmt(&mut self, s: &LS) {
         match s {
-            LS::Spawn { .. } | LS::Wait { .. } | LS::ChanSend { .. } | LS::ChanRecv { .. } | LS::ChanClose { .. } | LS::Select { .. } => unimplemented!("M7: tasks and channels in C"),
+            LS::Spawn { dst, worker, env } => {
+                let w = &self.p.workers[*worker];
+                let (it, ot) = (cty_mem(&w.input), cty_mem(&w.func.ret));
+                let (x, d) = (self.e(env), self.v(*dst));
+                self.line(&format!("{{ {it} env_ = {x}; {d} = alx_spawn(worker{}, &env_, sizeof env_, sizeof({ot})); }}", w.id));
+            }
+            LS::Wait { task, ok, val, msg } => {
+                let vt = cty_mem(&self.f.vars[*val].ty);
+                let (t, o, v, m) = (self.e(task), self.v(*ok), self.v(*val), self.v(*msg));
+                self.line(&format!("{{ {vt} out_ = {v}; {o} = alx_task_wait({t}, &out_, &{m}); {v} = out_; }}"));
+            }
+            LS::ChanSend { ch, val, loc } => {
+                let vt = self.chan_elem(ch);
+                let (c, x) = (self.e(ch), self.e(val));
+                self.line(&format!("{{ AlxChan *ch_ = {c}; {vt} val_ = {x}; alx_chan_send(ch_, &val_, {}); }}", c_str(loc)));
+            }
+            LS::ChanRecv { ch, ok, val } => {
+                let vt = cty_mem(&self.f.vars[*val].ty);
+                let (c, o, v) = (self.e(ch), self.v(*ok), self.v(*val));
+                self.line(&format!("{{ {vt} out_ = {v}; {o} = alx_chan_recv({c}, &out_); {v} = out_; }}"));
+            }
+            LS::ChanClose { ch, loc } => {
+                let c = self.e(ch);
+                self.line(&format!("alx_chan_close({c}, {});", c_str(loc)));
+            }
+            LS::Select { cases, default, dst } => {
+                self.line("{");
+                self.ind += 1;
+                // Evaluate every case expression once, in order.
+                let mut inits = vec![];
+                for (i, c) in cases.iter().enumerate() {
+                    match c {
+                        SelCase::Send { ch, val } => {
+                            let (cx, vx) = (self.e(ch), self.e(val));
+                            let vt = self.chan_elem(ch);
+                            self.line(&format!("AlxChan *c{i}_ = {cx}; {vt} s{i}_ = {vx};"));
+                            inits.push(format!("{{ c{i}_, &s{i}_, 1, 0 }}"));
+                        }
+                        SelCase::Recv { ch, ok, val } => {
+                            let vt = cty_mem(&self.f.vars[*val].ty);
+                            let (cx, o, v) = (self.e(ch), self.v(*ok), self.v(*val));
+                            self.line(&format!("AlxChan *c{i}_ = {cx}; {vt} r{i}_ = {v};"));
+                            inits.push(format!("{{ c{i}_, &r{i}_, 0, {o} }}"));
+                        }
+                    }
+                }
+                let n = cases.len();
+                let d = self.v(*dst);
+                if n == 0 {
+                    self.line(&format!("{d} = alx_select(NULL, 0, {default}, \"select\");"));
+                } else {
+                    self.line(&format!("AlxSelCase sc_[{n}] = {{ {} }};", inits.join(", ")));
+                    self.line(&format!("{d} = alx_select(sc_, {n}, {default}, \"select\");"));
+                }
+                for (i, c) in cases.iter().enumerate() {
+                    if let SelCase::Recv { ok, val, .. } = c {
+                        let (o, v) = (self.v(*ok), self.v(*val));
+                        self.line(&format!("{o} = sc_[{i}].ok != 0; {v} = r{i}_;"));
+                    }
+                }
+                self.ind -= 1;
+                self.line("}");
+            }
             LS::Set(v, e) => {
                 let x = self.e(e);
                 let v = self.v(*v);
@@ -432,7 +524,8 @@ impl FnEmit<'_> {
 
     fn e(&self, e: &LE) -> String {
         match e {
-            LE::ChanNew(..) | LE::ChanLen(_) => unimplemented!("M7: channels in C"),
+            LE::ChanNew(t, cap) => format!("alx_chan_new({}, sizeof({}))", self.e(cap), cty_mem(t)),
+            LE::ChanLen(c) => format!("alx_chan_len({})", self.e(c)),
             LE::Var(v) => self.v(*v),
             LE::I(i) => {
                 if *i == i64::MIN {

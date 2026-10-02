@@ -186,6 +186,27 @@ void alx_puts_pint(AlxPInt v);
 typedef void (*AlxWorker)(const void *in, void *out);
 void alx_pmap(const void *in, int64_t n, size_t in_size, void *out, size_t out_size, AlxWorker fn);
 
+/* ---------- tasks and channels ---------- */
+typedef struct AlxTask AlxTask;
+typedef struct AlxChan AlxChan;
+/* A case of alx_select. `buf` holds the value to send / receives the value.
+ * `ok` is written only on the chosen recv case (the caller presets it). */
+typedef struct { AlxChan *ch; void *buf; int64_t is_send; int64_t ok; } AlxSelCase;
+/* Run `fn(copy of env, result)` on a new thread. A panic in the task is
+ * caught: see alx_task_wait. */
+AlxTask *alx_spawn(AlxWorker fn, const void *env, size_t in_size, size_t out_size);
+/* Block until the task is done. True: result copied to `out`. False: the task
+ * panicked; `*msg` is its message (`out` untouched). Repeatable. */
+bool alx_task_wait(AlxTask *t, void *out, AlxStr *msg);
+AlxChan *alx_chan_new(int64_t cap, size_t esz);
+int64_t alx_chan_len(AlxChan *c);
+void alx_chan_send(AlxChan *c, const void *val, const char *loc);
+/* False if the channel is closed and drained (`out` untouched). */
+bool alx_chan_recv(AlxChan *c, void *out);
+void alx_chan_close(AlxChan *c, const char *loc);
+/* Index of the case run, or n if none was ready and `has_default`. */
+int64_t alx_select(AlxSelCase *cases, int64_t n, bool has_default, const char *loc);
+
 /* ---------- bignums (promote mode) ---------- */
 AlxPInt alx_p_from(int64_t v);
 int64_t alx_p_to_i64(AlxPInt a, const char *loc);

@@ -212,6 +212,39 @@ fn json_quote(s: &str) -> String {
     o
 }
 
+/// A piece of an encoded value: literal JSON text, or a Str expression.
+enum Frag {
+    Lit(String),
+    Ex(String),
+}
+
+/// One interpolated string literal for the pieces.
+fn frags_expr(fr: &[Frag]) -> String {
+    let mut o = String::from("\"");
+    let mut lit_acc = String::new();
+    let flush = |o: &mut String, acc: &mut String| {
+        if !acc.is_empty() {
+            let l = lit(acc);
+            o.push_str(&l[1..l.len() - 1]);
+            acc.clear();
+        }
+    };
+    for f in fr {
+        match f {
+            Frag::Lit(t) => lit_acc.push_str(t),
+            Frag::Ex(e) => {
+                flush(&mut o, &mut lit_acc);
+                o.push_str("#{");
+                o.push_str(e);
+                o.push('}');
+            }
+        }
+    }
+    flush(&mut o, &mut lit_acc);
+    o.push('"');
+    o
+}
+
 #[derive(Clone)]
 enum Ty<'a> {
     Int(IntKind),
@@ -288,64 +321,58 @@ impl<'a> Gen<'a> {
         })
     }
 
-    /// Statements that write `x` (an expression without side effects) to `e`.
-    fn enc(&mut self, t: &'a TypeExpr, x: &str, ind: usize) -> GResult<()> {
-        match self.classify(t)? {
-            Ty::Int(k) => match k {
-                IntKind::I64 => self.w(ind, format!("_e.int!({x})")),
-                IntKind::U64 => self.w(ind, format!("_e.uint!({x})")),
-                _ => self.w(ind, format!("_e.int!({x}.to_i)")),
-            },
-            Ty::Float => self.w(ind, format!("_e.float!({x})")),
-            Ty::Bool => self.w(ind, format!("_e.bool!({x})")),
-            Ty::Str => self.w(ind, format!("_e.str!({x})")),
-            Ty::Named(_) => self.w(ind, format!("{x}.json_enc(_e)")),
+    /// The pieces of the Str that encodes `x` (an expression without side effects),
+    /// after any statements it needs (temporaries) are written at `ind`. A value
+    /// becomes one interpolated string, so a record costs one allocation and one
+    /// push into the encoder, however many fields it has.
+    fn enc(&mut self, t: &'a TypeExpr, x: &str, ind: usize) -> GResult<Vec<Frag>> {
+        Ok(match self.classify(t)? {
+            Ty::Int(_) | Ty::Bool => vec![Frag::Ex(x.to_string())],
+            Ty::Float => vec![Frag::Ex(format!("_e.f!({x})"))],
+            Ty::Str => vec![Frag::Ex(format!("_e.q({x})"))],
+            Ty::Named(_) => vec![Frag::Ex(format!("{x}.json_str(_e)"))],
             Ty::Opt(inner) => {
-                let v = self.fresh("o");
+                let (o, v) = (self.fresh("o"), self.fresh("v"));
+                self.w(ind, format!("{o} = \"null\""));
                 self.w(ind, format!("if {v} = {x} {{"));
-                self.enc(inner, &v, ind + 1)?;
-                self.w(ind, "} else {");
-                self.w(ind + 1, "_e.raw!(\"null\")");
+                let fr = self.enc(inner, &v, ind + 1)?;
+                self.w(ind + 1, format!("{o} = {}", frags_expr(&fr)));
                 self.w(ind, "}");
+                vec![Frag::Ex(o)]
             }
             Ty::Arr(inner) => {
-                let (i, v) = (self.fresh("i"), self.fresh("x"));
-                self.w(ind, "_e.raw!(\"[\")");
-                self.w(ind, format!("{i} = 0"));
+                let (a, v) = (self.fresh("a"), self.fresh("x"));
+                self.w(ind, format!("{a}: [Str] = []"));
                 self.w(ind, format!("for {v} in {x} {{"));
-                self.w(ind + 1, format!("_e.raw!(\",\") if {i} > 0"));
-                self.w(ind + 1, format!("{i} += 1"));
-                self.enc(inner, &v, ind + 1)?;
+                let fr = self.enc(inner, &v, ind + 1)?;
+                self.w(ind + 1, format!("{a} << {}", frags_expr(&fr)));
                 self.w(ind, "}");
-                self.w(ind, "_e.raw!(\"]\")");
+                vec![Frag::Lit("[".into()), Frag::Ex(format!("{a}.join(\",\")")), Frag::Lit("]".into())]
             }
             Ty::Map(inner) => {
-                let (i, k, v) = (self.fresh("i"), self.fresh("k"), self.fresh("v"));
-                self.w(ind, "_e.raw!(\"{\")");
-                self.w(ind, format!("{i} = 0"));
+                let (a, k, v) = (self.fresh("a"), self.fresh("k"), self.fresh("v"));
+                self.w(ind, format!("{a}: [Str] = []"));
                 self.w(ind, format!("for {k}, {v} in {x} {{"));
-                self.w(ind + 1, format!("_e.raw!(\",\") if {i} > 0"));
-                self.w(ind + 1, format!("{i} += 1"));
-                self.w(ind + 1, format!("_e.str!({k})"));
-                self.w(ind + 1, "_e.raw!(\":\")");
-                self.enc(inner, &v, ind + 1)?;
+                let mut fr = vec![Frag::Ex(format!("_e.q({k})")), Frag::Lit(":".into())];
+                fr.extend(self.enc(inner, &v, ind + 1)?);
+                self.w(ind + 1, format!("{a} << {}", frags_expr(&fr)));
                 self.w(ind, "}");
-                self.w(ind, "_e.raw!(\"}\")");
+                vec![Frag::Lit("{".into()), Frag::Ex(format!("{a}.join(\",\")")), Frag::Lit("}".into())]
             }
             Ty::Tuple(ts) => {
                 let names: Vec<String> = ts.iter().map(|_| self.fresh("t")).collect();
                 self.w(ind, format!("{} = {x}", names.join(", ")));
-                self.w(ind, "_e.raw!(\"[\")");
+                let mut fr = vec![Frag::Lit("[".into())];
                 for (k, (t, n)) in ts.iter().zip(&names).enumerate() {
                     if k > 0 {
-                        self.w(ind, "_e.raw!(\",\")");
+                        fr.push(Frag::Lit(",".into()));
                     }
-                    self.enc(t, n, ind)?;
+                    fr.extend(self.enc(t, n, ind)?);
                 }
-                self.w(ind, "_e.raw!(\"]\")");
+                fr.push(Frag::Lit("]".into()));
+                fr
             }
-        }
-        Ok(())
+        })
     }
 
     /// A test for "empty" (Go's omitempty), or None if the type is never empty.
@@ -362,28 +389,26 @@ impl<'a> Gen<'a> {
         }
     }
 
-    /// Statements that write `{"k":v,...}` for named fields held in `vals`
-    /// (expressions) to `e`.
-    fn enc_object(&mut self, fields: &'a [DField], vals: &[String], ind: usize) -> GResult<()> {
+    /// The pieces of `{"k":v,...}` for named fields held in `vals` (expressions).
+    fn enc_object(&mut self, fields: &'a [DField], vals: &[String], ind: usize) -> GResult<Vec<Frag>> {
         let live: Vec<usize> = (0..fields.len()).filter(|&k| !fields[k].opts.skip).collect();
         let dynamic = live.iter().any(|&k| fields[k].opts.omit_empty && self.empty(&fields[k].ty, &vals[k]).is_some());
         if !dynamic {
             if live.is_empty() {
-                self.w(ind, "_e.raw!(\"{}\")");
-                return Ok(());
+                return Ok(vec![Frag::Lit("{}".into())]);
             }
+            let mut fr = vec![];
             for (pos, &k) in live.iter().enumerate() {
                 let key = json_quote(fields[k].opts.rename.as_deref().unwrap_or(&fields[k].name));
                 let open = if pos == 0 { "{" } else { "," };
-                self.w(ind, format!("_e.raw!({})", lit(&format!("{open}{key}:"))));
-                self.enc(&fields[k].ty, &vals[k], ind)?;
+                fr.push(Frag::Lit(format!("{open}{key}:")));
+                fr.extend(self.enc(&fields[k].ty, &vals[k], ind)?);
             }
-            self.w(ind, "_e.raw!(\"}\")");
-            return Ok(());
+            fr.push(Frag::Lit("}".into()));
+            return Ok(fr);
         }
-        let n = self.fresh("n");
-        self.w(ind, "_e.raw!(\"{\")");
-        self.w(ind, format!("{n} = 0"));
+        let ps = self.fresh("ps");
+        self.w(ind, format!("{ps}: [Str] = []"));
         for &k in &live {
             let key = json_quote(fields[k].opts.rename.as_deref().unwrap_or(&fields[k].name));
             let cond = if fields[k].opts.omit_empty { self.empty(&fields[k].ty, &vals[k]) } else { None };
@@ -393,34 +418,33 @@ impl<'a> Gen<'a> {
             } else {
                 ind
             };
-            self.w(ind2, format!("_e.raw!({n} == 0 ? {} : {})", lit(&format!("{key}:")), lit(&format!(",{key}:"))));
-            self.w(ind2, format!("{n} += 1"));
-            self.enc(&fields[k].ty, &vals[k], ind2)?;
+            let mut fr = vec![Frag::Lit(format!("{key}:"))];
+            fr.extend(self.enc(&fields[k].ty, &vals[k], ind2)?);
+            self.w(ind2, format!("{ps} << {}", frags_expr(&fr)));
             if cond.is_some() {
                 self.w(ind, "}");
             }
         }
-        self.w(ind, "_e.raw!(\"}\")");
-        Ok(())
+        Ok(vec![Frag::Lit("{".into()), Frag::Ex(format!("{ps}.join(\",\")")), Frag::Lit("}".into())])
     }
 
     /// Statements that read a value of type `t` from `d` into a new local `dest`.
     fn dec(&mut self, t: &'a TypeExpr, dest: &str, ind: usize) -> GResult<()> {
         match self.classify(t)? {
             Ty::Int(k) => match k {
-                IntKind::I64 => self.w(ind, format!("{dest} = _d.~int!")),
-                IntKind::U64 => self.w(ind, format!("{dest} = _d.~uint!(64)")),
-                k if k.signed() => self.w(ind, format!("{dest} = _d.~sint!({}).as_{}", k.bits(), k.method())),
-                k => self.w(ind, format!("{dest} = _d.~uint!({}).as_{}", k.bits(), k.method())),
+                IntKind::I64 => self.w(ind, format!("{dest} = _d.int!")),
+                IntKind::U64 => self.w(ind, format!("{dest} = _d.uint!(64)")),
+                k if k.signed() => self.w(ind, format!("{dest} = _d.sint!({}).as_{}", k.bits(), k.method())),
+                k => self.w(ind, format!("{dest} = _d.uint!({}).as_{}", k.bits(), k.method())),
             },
-            Ty::Float => self.w(ind, format!("{dest} = _d.~float!")),
-            Ty::Bool => self.w(ind, format!("{dest} = _d.~bool!")),
-            Ty::Str => self.w(ind, format!("{dest} = _d.~str!")),
-            Ty::Named(n) => self.w(ind, format!("{dest} = {n}.~json_dec(_d)")),
+            Ty::Float => self.w(ind, format!("{dest} = _d.float!")),
+            Ty::Bool => self.w(ind, format!("{dest} = _d.bool!")),
+            Ty::Str => self.w(ind, format!("{dest} = _d.str!")),
+            Ty::Named(n) => self.w(ind, format!("{dest} = {n}.json_dec(_d)")),
             Ty::Opt(inner) => {
                 let (isnull, v) = (self.fresh("z"), self.fresh("v"));
                 self.w(ind, format!("{dest}: {} = none", type_src(t)));
-                self.w(ind, format!("{isnull} = _d.~take_null!"));
+                self.w(ind, format!("{isnull} = _d.take_null!"));
                 self.w(ind, format!("if !{isnull} {{"));
                 self.dec(inner, &v, ind + 1)?;
                 self.w(ind + 1, format!("{dest} = {v}"));
@@ -429,8 +453,8 @@ impl<'a> Gen<'a> {
             Ty::Arr(inner) => {
                 let v = self.fresh("v");
                 self.w(ind, format!("{dest}: {} = []", type_src(t)));
-                self.w(ind, "if _d.~open_arr! {");
-                self.w(ind + 1, "while _d.~more! {");
+                self.w(ind, "if _d.open_arr! {");
+                self.w(ind + 1, "while _d.more! {");
                 self.dec(inner, &v, ind + 2)?;
                 self.w(ind + 2, format!("{dest} << {v}"));
                 self.w(ind + 1, "}");
@@ -439,8 +463,8 @@ impl<'a> Gen<'a> {
             Ty::Map(inner) => {
                 let (k, v) = (self.fresh("k"), self.fresh("v"));
                 self.w(ind, format!("{dest}: {} = {{}}", type_src(t)));
-                self.w(ind, "if _d.~open_obj! {");
-                self.w(ind + 1, "while _d.~next_key! {");
+                self.w(ind, "if _d.open_obj! {");
+                self.w(ind + 1, "while _d.next_key! {");
                 self.w(ind + 2, format!("{k} = _d.key"));
                 self.dec(inner, &v, ind + 2)?;
                 self.w(ind + 2, format!("{dest}[{k}] = {v}"));
@@ -449,12 +473,12 @@ impl<'a> Gen<'a> {
             }
             Ty::Tuple(ts) => {
                 let names: Vec<String> = ts.iter().map(|_| self.fresh("t")).collect();
-                self.w(ind, "_d.~open_tuple!");
+                self.w(ind, "_d.open_tuple!");
                 for (k, (t, n)) in ts.iter().zip(&names).enumerate() {
-                    self.w(ind, format!("_d.~tuple_next!({k}, {})", ts.len()));
+                    self.w(ind, format!("_d.tuple_next!({k}, {})", ts.len()));
                     self.dec(t, n, ind)?;
                 }
-                self.w(ind, format!("_d.~tuple_end!({})", ts.len()));
+                self.w(ind, format!("_d.tuple_end!({})", ts.len()));
                 self.w(ind, format!("{dest} = ({})", names.join(", ")));
             }
         }
@@ -464,7 +488,8 @@ impl<'a> Gen<'a> {
     /// Does a missing key leave this type without a zero value we can spell
     /// in a temporary? (A named type inside a variant's named fields.)
     fn needs_stage(&self, t: &TypeExpr) -> bool {
-        matches!(t, TypeExpr::Named(n, _) if IntKind::from_name(n).is_none() && !matches!(n.as_str(), "Float" | "Bool" | "Str"))
+        let _ = t;
+        false
     }
 }
 
@@ -494,52 +519,80 @@ pub fn json_source(job: &DeriveJob, alias: &str, types: &ModuleTypes) -> Result<
     let _ = &tp;
     g.w(0, format!("struct {name} {{"));
     // ---- encoding
-    g.w(1, format!("{pubk}def json_enc(_e: {a}.Encoder) {{"));
+    g.w(1, format!("{pubk}def json_str(_e: {a}.Encoder) -> Str {{"));
     match &job.shape {
         DShape::Struct(fields) => {
             check_keys(fields.iter(), "").map_err(&fail)?;
             let vals: Vec<String> = fields.iter().map(|f| format!("self.{}", f.name)).collect();
-            g.enc_object(fields, &vals, 2).map_err(&fail)?;
+            let fr = g.enc_object(fields, &vals, 2).map_err(&fail)?;
+            g.w(2, frags_expr(&fr));
         }
         DShape::Enum(vs) => {
             check_keys(vs.iter().map(|v| DField { name: v.name.clone(), ty: TypeExpr::Named("Str".into(), job.span), opts: v.opts.clone(), span: job.span }).collect::<Vec<_>>().iter(), "variants").map_err(&fail)?;
             if vs.is_empty() {
-                g.w(2, "_e.raw!(\"null\")");
+                g.w(2, "\"null\"");
             } else {
+                g.w(2, "_r = \"null\"");
                 g.w(2, "case self {");
                 for v in vs {
                     let vname = v.opts.rename.clone().unwrap_or_else(|| v.name.clone());
                     let key = json_quote(&vname);
                     if v.fields.is_empty() {
-                        g.w(3, format!("{} => _e.str!({})", v.name, lit(&vname)));
+                        g.w(3, format!("{} => {{", v.name));
+                        g.w(4, format!("_r = {}", lit(&key)));
+                        g.w(4, "nil");
+                        g.w(3, "}");
                         continue;
                     }
                     let vals: Vec<String> = (0..v.fields.len()).map(|k| format!("_f{k}")).collect();
                     g.w(3, format!("{}({}) => {{", v.name, vals.join(", ")));
-                    g.w(4, format!("_e.raw!({})", lit(&format!("{{{key}:"))));
+                    let mut fr = vec![Frag::Lit(format!("{{{key}:"))];
                     let named = v.fields.iter().any(|f| f.name.parse::<usize>().is_err());
                     if named {
                         if v.fields.iter().any(|f| f.name.parse::<usize>().is_ok()) {
                             return Err(fail(format!("variant `{}` mixes named and unnamed fields", v.name)));
                         }
                         check_keys(v.fields.iter(), &format!("variant {}", v.name)).map_err(&fail)?;
-                        g.enc_object(&v.fields, &vals, 4).map_err(&fail)?;
+                        fr.extend(g.enc_object(&v.fields, &vals, 4).map_err(&fail)?);
                     } else if v.fields.len() == 1 {
-                        g.enc(&v.fields[0].ty, &vals[0], 4).map_err(&fail)?;
+                        fr.extend(g.enc(&v.fields[0].ty, &vals[0], 4).map_err(&fail)?);
                     } else {
-                        g.w(4, "_e.raw!(\"[\")");
+                        fr.push(Frag::Lit("[".into()));
                         for (k, f) in v.fields.iter().enumerate() {
                             if k > 0 {
-                                g.w(4, "_e.raw!(\",\")");
+                                fr.push(Frag::Lit(",".into()));
                             }
-                            g.enc(&f.ty, &vals[k], 4).map_err(&fail)?;
+                            fr.extend(g.enc(&f.ty, &vals[k], 4).map_err(&fail)?);
                         }
-                        g.w(4, "_e.raw!(\"]\")");
+                        fr.push(Frag::Lit("]".into()));
                     }
-                    g.w(4, "_e.raw!(\"}\")");
+                    fr.push(Frag::Lit("}".into()));
+                    g.w(4, format!("_r = {}", frags_expr(&fr)));
+                    g.w(4, "nil");
                     g.w(3, "}");
                 }
                 g.w(2, "}");
+                g.w(2, "_r");
+            }
+        }
+    }
+    g.w(1, "}");
+    g.w(1, format!("{pubk}def json_enc(_e: {a}.Encoder) {{"));
+    g.w(2, "_e.raw!(self.json_str(_e))");
+    g.w(1, "}");
+    // ---- the value json_dec returns after an error
+    g.w(1, format!("{pubk}def self.json_zero -> {name} {{"));
+    match &job.shape {
+        DShape::Struct(_) => g.w(2, format!("{name}.new")),
+        DShape::Enum(vs) => {
+            if let Some(v) = vs.first() {
+                let zs: Option<Vec<String>> = v.fields.iter().map(|f| g.zero(&f.ty)).collect();
+                let Some(zs) = zs else { return Err(fail(format!("variant `{}` has a field without a zero value", v.name))) };
+                if zs.is_empty() {
+                    g.w(2, format!("{name}.{}", v.name));
+                } else {
+                    g.w(2, format!("{name}.{}({})", v.name, zs.join(", ")));
+                }
             }
         }
     }
@@ -548,29 +601,29 @@ pub fn json_source(job: &DeriveJob, alias: &str, types: &ModuleTypes) -> Result<
     // Each field (and each enum variant) reads in a helper def of its own, so the
     // frame of `json_dec` stays small however many fields there are.
     let mut helpers = String::new();
-    g.w(1, format!("{pubk}def self.json_dec(_d: {a}.Decoder) -> ~{name}<{a}.JsonError> {{"));
+    g.w(1, format!("{pubk}def self.json_dec(_d: {a}.Decoder) -> {name} {{"));
     match &job.shape {
         DShape::Struct(fields) => {
             g.w(2, format!("_r = {name}.new"));
-            g.w(2, "if _d.~open_obj! {");
-            g.w(3, "while _d.~next_key! {");
+            g.w(2, "if _d.open_obj! {");
+            g.w(3, "while _d.next_key! {");
             g.w(4, "case _d.key {");
             for f in fields.iter().filter(|f| !f.opts.skip) {
                 let key = f.opts.rename.clone().unwrap_or_else(|| f.name.clone());
                 let hn = format!("json_f_{}", f.name);
                 g.w(5, format!("{} => {{", lit(&key)));
                 g.w(6, format!("_d.at!({})", lit(&format!("{name}.{}", f.name))));
-                g.w(6, format!("_r.{} = {name}.~{hn}(_d)", f.name));
+                g.w(6, format!("_r.{} = {name}.{hn}(_d)", f.name));
                 g.w(6, "nil");
                 g.w(5, "}");
                 let saved = std::mem::take(&mut g.out);
-                g.w(1, format!("def self.{hn}(_d: {a}.Decoder) -> ~{}<{a}.JsonError> {{", type_src(&f.ty)));
+                g.w(1, format!("def self.{hn}(_d: {a}.Decoder) -> {} {{", type_src(&f.ty)));
                 g.dec(&f.ty, "_v", 2).map_err(&fail)?;
                 g.w(2, "_v");
                 g.w(1, "}");
                 helpers.push_str(&std::mem::replace(&mut g.out, saved));
             }
-            g.w(5, "_ => _d.~skip!");
+            g.w(5, "_ => _d.skip!");
             g.w(4, "}");
             g.w(3, "}");
             g.w(2, "}");
@@ -580,29 +633,29 @@ pub fn json_source(job: &DeriveJob, alias: &str, types: &ModuleTypes) -> Result<
             if vs.is_empty() {
                 return Err(fail("an enum without variants has no JSON form".to_string()));
             }
-            g.w(2, "_vn = _d.~variant!");
+            g.w(2, "_vn = _d.variant!");
             g.w(2, "_wr = _d.wrapped");
-            g.w(2, format!("_r: {name}? = none"));
+            g.w(2, format!("_r = {name}.json_zero"));
             g.w(2, "case _vn {");
             for v in vs {
                 let vname = v.opts.rename.clone().unwrap_or_else(|| v.name.clone());
                 g.w(3, format!("{} => {{", lit(&vname)));
                 let ctx = format!("{name}.{}", v.name);
                 if v.fields.is_empty() {
-                    g.w(4, "_d.~unit_variant!(_wr)");
+                    g.w(4, "_d.unit_variant!(_wr)");
                     g.w(4, format!("_r = {name}.{}", v.name));
                     g.w(4, "nil");
                     g.w(3, "}");
                     continue;
                 }
                 let hn = format!("json_v_{}", v.name);
-                g.w(4, format!("_r = {name}.~{hn}(_d, _wr)"));
+                g.w(4, format!("_r = {name}.{hn}(_d, _wr)"));
                 g.w(4, "nil");
                 g.w(3, "}");
                 let saved = std::mem::take(&mut g.out);
-                g.w(1, format!("def self.{hn}(_d: {a}.Decoder, _wr: Bool) -> ~{name}<{a}.JsonError> {{"));
+                g.w(1, format!("def self.{hn}(_d: {a}.Decoder, _wr: Bool) -> {name} {{"));
                 g.w(2, format!("_d.at!({})", lit(&ctx)));
-                g.w(2, "_d.~need_payload!(_wr)");
+                g.w(2, "_d.need_payload!(_wr)");
                 let named = v.fields.iter().any(|f| f.name.parse::<usize>().is_err());
                 let mut args: Vec<String> = vec![];
                 if named {
@@ -622,8 +675,8 @@ pub fn json_source(job: &DeriveJob, alias: &str, types: &ModuleTypes) -> Result<
                         }
                         stages.push((t, staged));
                     }
-                    g.w(2, "if _d.~open_obj! {");
-                    g.w(3, "while _d.~next_key! {");
+                    g.w(2, "if _d.open_obj! {");
+                    g.w(3, "while _d.next_key! {");
                     g.w(4, "case _d.key {");
                     for (f, (t, _)) in v.fields.iter().zip(&stages) {
                         if f.opts.skip {
@@ -637,7 +690,7 @@ pub fn json_source(job: &DeriveJob, alias: &str, types: &ModuleTypes) -> Result<
                         g.w(6, "nil");
                         g.w(5, "}");
                     }
-                    g.w(5, "_ => _d.~skip!");
+                    g.w(5, "_ => _d.skip!");
                     g.w(4, "}");
                     g.w(3, "}");
                     g.w(2, "}");
@@ -649,14 +702,14 @@ pub fn json_source(job: &DeriveJob, alias: &str, types: &ModuleTypes) -> Result<
                     g.dec(&v.fields[0].ty, &x, 2).map_err(&fail)?;
                     args.push(x);
                 } else {
-                    g.w(2, "_d.~open_tuple!");
+                    g.w(2, "_d.open_tuple!");
                     for (k, f) in v.fields.iter().enumerate() {
-                        g.w(2, format!("_d.~tuple_next!({k}, {})", v.fields.len()));
+                        g.w(2, format!("_d.tuple_next!({k}, {})", v.fields.len()));
                         let x = g.fresh("v");
                         g.dec(&f.ty, &x, 2).map_err(&fail)?;
                         args.push(x);
                     }
-                    g.w(2, format!("_d.~tuple_end!({})", v.fields.len()));
+                    g.w(2, format!("_d.tuple_end!({})", v.fields.len()));
                 }
                 // Staged (required) fields: unwrap, or fail when missing.
                 let mut call_args = vec![];
@@ -684,14 +737,11 @@ pub fn json_source(job: &DeriveJob, alias: &str, types: &ModuleTypes) -> Result<
                 helpers.push_str(&std::mem::replace(&mut g.out, saved));
             }
             g.w(3, "_ => {");
-            g.w(4, format!("fail _d.bad_variant({}, _vn)", lit(&name)));
+            g.w(4, format!("_d.bad_variant!({}, _vn)", lit(&name)));
             g.w(3, "}");
             g.w(2, "}");
-            g.w(2, "_d.~end_variant!(_wr)");
-            g.w(2, "if _x = _r {");
-            g.w(3, "return _x");
-            g.w(2, "}");
-            g.w(2, format!("fail _d.bad_variant({}, _vn)", lit(&name)));
+            g.w(2, "_d.end_variant!(_wr)");
+            g.w(2, "_r");
         }
     }
     g.w(1, "}");
@@ -709,7 +759,7 @@ pub fn json_source(job: &DeriveJob, alias: &str, types: &ModuleTypes) -> Result<
     g.w(1, format!("{pubk}def self.from_json(_s: Str) -> ~{name}<{a}.JsonError> {{"));
     g.w(2, format!("{a}.~check(_s)"));
     g.w(2, format!("_d = {a}.new_decoder(_s)"));
-    g.w(2, format!("_v = {name}.~json_dec(_d)"));
+    g.w(2, format!("_v = {name}.json_dec(_d)"));
     g.w(2, "_d.~done!");
     g.w(2, "_v");
     g.w(1, "}");
@@ -726,6 +776,7 @@ impl<'a> Gen<'a> {
             TypeExpr::Named(n, _) if n == "Float" => "0.0".into(),
             TypeExpr::Named(n, _) if n == "Bool" => "false".into(),
             TypeExpr::Named(n, _) if n == "Str" => "\"\"".into(),
+            TypeExpr::Named(n, _) if !self.tparams.contains(n) => format!("{n}.json_zero"),
             TypeExpr::Array(..) => "[]".into(),
             TypeExpr::App(n, ..) if n == "Map" => "{}".into(),
             TypeExpr::Opt(..) => "none".into(),

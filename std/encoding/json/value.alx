@@ -55,41 +55,46 @@ struct DocB {
   }
 }
 
-# A scalar (string, number, true, false, null) at p; returns its node index.
-def build_scalar(d: Decoder, b: DocB, p: Int, key: Str) -> ~Int<JsonError> {
+# A scalar (string, number, true, false, null) at p; returns its node index
+# (-1 after an error, which the decoder holds).
+def build_scalar(d: Decoder, b: DocB, p: Int, key: Str) -> Int {
   s = d.s
   c = s[p]
   if c == 34 {
-    str = d.~read_string!(p)
+    str = d.read_string!(p)
+    return -1 if d.failed
     return b.add!(K_STR, 0.0, str, key, 0, 0)
   }
-  if c == 116 {
-    d.st[0].pos = ~literal_end(s, p, "true")
-    return b.add!(K_BOOL, 1.0, "", key, 0, 0)
-  }
-  if c == 102 {
-    d.st[0].pos = ~literal_end(s, p, "false")
-    return b.add!(K_BOOL, 0.0, "", key, 0, 0)
-  }
-  if c == 110 {
-    d.st[0].pos = ~literal_end(s, p, "null")
-    return b.add!(K_NULL, 0.0, "", key, 0, 0)
+  if c == 116 || c == 102 || c == 110 {
+    w = c == 116 ? "true" : (c == 102 ? "false" : "null")
+    e = lit_end(s, p, w)
+    if e < 0 {
+      d.bad!(e)
+      return -1
+    }
+    d.st[0].pos = e
+    return b.add!(c == 110 ? K_NULL : K_BOOL, c == 116 ? 1.0 : 0.0, "", key, 0, 0)
   }
   if c == 45 || is_digit(c) {
-    e = ~number_end(s, p)
+    e = num_end(s, p)
+    if e < 0 {
+      d.bad!(e)
+      return -1
+    }
     d.st[0].pos = e
     txt = s[p...e]
     f = parse_number(txt)
     # A literal beyond Float's range (1e999): keep the text, value 0.
     return b.add!(K_NUM, f || 0.0, txt, key, 0, 0)
   }
-  fail begin_value_err(s, p)
+  d.bad!(code(p, E_BEGIN))
+  -1
 }
 
-# Parses the value at the decoder's position into b; returns its node index.
-# Iterative (an explicit stack of open containers), so nesting depth is bounded
-# by MAX_DEPTH and not by the call stack.
-def build(d: Decoder, b: DocB) -> ~Int<JsonError> {
+# Parses the value at the decoder's position into b; returns its node index
+# (-1 after an error, which the decoder holds). Iterative (an explicit stack of
+# open containers), so nesting depth is bounded by MAX_DEPTH, not by the call stack.
+def build(d: Decoder, b: DocB) -> Int {
   s = d.s
   fk: [Int] = []
   fkey: [Str] = []
@@ -100,19 +105,26 @@ def build(d: Decoder, b: DocB) -> ~Int<JsonError> {
   pkey = ""
   loop {
     p = skip_ws(s, d.st[0].pos)
-    fail err_eof(p) if p >= s.size
+    if p >= s.size {
+      d.bad!(code(p, E_EOF))
+      return -1
+    }
     c = s[p]
     id = -1
     if c == 123 || c == 91 {
-      fail JsonError.Invalid(msg: "exceeded max depth", offset: p) if fp >= MAX_DEPTH
+      if fp >= MAX_DEPTH {
+        d.bad!(code(p, E_DEPTH))
+        return -1
+      }
       more = false
       if c == 123 {
-        _ = d.~open_obj!
-        more = d.~next_key!
+        _ = d.open_obj!
+        more = d.next_key!
       } else {
-        _ = d.~open_arr!
-        more = d.~more!
+        _ = d.open_arr!
+        more = d.more!
       }
+      return -1 if d.failed
       if more {
         if fp < fk.size {
           fk[fp] = c.to_i
@@ -130,7 +142,8 @@ def build(d: Decoder, b: DocB) -> ~Int<JsonError> {
       start = b.add_edges!([])
       id = b.add!(c == 123 ? K_OBJ : K_ARR, 0.0, "", pkey, start, 0)
     } else {
-      id = ~build_scalar(d, b, p, pkey)
+      id = build_scalar(d, b, p, pkey)
+      return -1 if id < 0
     }
     # A value is finished: attach it to its parent and close the containers it ends.
     loop {
@@ -144,10 +157,11 @@ def build(d: Decoder, b: DocB) -> ~Int<JsonError> {
       top = fk[fp - 1]
       more = false
       if top == 123 {
-        more = d.~next_key!
+        more = d.next_key!
       } else {
-        more = d.~more!
+        more = d.more!
       }
+      return -1 if d.failed
       if more {
         pkey = top == 123 ? d.key : ""
         break
@@ -309,10 +323,26 @@ pub struct Value {
     }
   }
 
-  pub def self.json_dec(d: Decoder) -> ~Value<JsonError> {
+  # The value `json_dec` returns after an error: null.
+  pub def self.json_zero -> Value {
+    Value.new(nodes: [], edges: [], id: 0)
+  }
+
+  # Reads one value; after an error (kept in the decoder) it returns json_zero.
+  pub def self.json_dec(d: Decoder) -> Value {
     b = DocB.new(st: [DocS.new(nodes: [], edges: [])])
-    root = ~build(d, b)
+    root = build(d, b)
+    return Value.new(nodes: [], edges: [], id: 0) if d.failed
     Value.new(nodes: b.st[0].nodes, edges: b.st[0].edges, id: root)
+  }
+
+  # The JSON text of this value (what a derived `json_str` embeds).
+  pub def json_str(_e: Encoder) -> Str {
+    e2 = new_encoder()
+    e2.set_escape_html!(_e.html)
+    json_enc(e2)
+    r = e2.finish!
+    r.unwrap_or("null")
   }
 
   # Compact JSON (an unsupported value, which a parsed tree can't hold, aside).
@@ -339,7 +369,9 @@ pub struct Value {
 pub def parse(s: Str) -> ~Value<JsonError> {
   ~check(s)
   d = new_decoder(s)
-  Value.~json_dec(d)
+  v = Value.json_dec(d)
+  d.~done!
+  v
 }
 
 # ------------------------------------------------------------ Indent, Compact

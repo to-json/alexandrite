@@ -2,7 +2,7 @@
 
 Goal of this push (user, 2026-10-01): **finish the language** to Go parity, plus DESIGN.md's error system and refinements, so the next step can be porting Go's standard library. The memory model (pools, the move/region checker) is a separate conversation *after* this push; until then everything lives in v0's program-lifetime region.
 
-Every decision these milestones implement is in `GO-VS-RUBY.md`. Each milestone ends with: acceptance cases (`acceptance/cases/`), all backends agreeing (JIT, clang debug/release, Rust oracle; the browser where the feature makes sense there), `run.py` green, a milestone doc in `docs/milestones/`, a commit, and an update to the doc site.
+Every decision these milestones implement is in `GO-VS-RUBY.md`. Each milestone ends with: acceptance cases (`acceptance/cases/`), all backends agreeing (JIT, clang debug/release, Rust oracle; the browser where the feature makes sense there), `run.alx` green, a milestone doc in `docs/milestones/`, a commit, and an update to the doc site.
 
 | # | Milestone | Contents |
 |---|---|---|
@@ -35,3 +35,4 @@ Decisions R1–R10 and S1–S4 in `GO-VS-RUBY.md`.
 | L1 | **Text & data core** | strings, strconv, unicode, unicode/utf8, bytes, slices, maps, sort, math, fmt, errors — Go's APIs, alx idioms (S2); tuples, functions as values, blocks for function parameters. Done: 11 packages, 172 test blocks |
 | L2 | **Systems core** | os, io, bufio, time, flag, path, path/filepath over a C FFI (`extern def`); tasks sleep without blocking their worker. Done: 7 packages, 115 test blocks plus ~1,700 Go-generated assertions |
 | L3 | **Server core** | I/O event loop (kqueue/epoll) under R5's scheduler; net, net/http (Go 1.22 routing, keep-alive, client), encoding/json via `#[derive(Json)]` (S3), context, sync. Done: ~46k req/s in-process hello-world; 10k idle connections in 454 MB |
+| T1 | **Scripting** | command literals (`` `cat #{f} \| grep -c x` ``, parsed by alx; each `#{}` one argument), Go's `os/exec` plus pipelines, redirects and `ProcessState` measurements, the `sh` package (files, `**` globs, scoped `in_dir`/`with_env`, `parallel`); fallible lambdas. The repository's Python tooling is now alx |

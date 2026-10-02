@@ -1,0 +1,362 @@
+# Run and time (or measure the memory of) the acceptance cases under any
+# combination of runners.
+#
+# usage: alx run acceptance/bench.alx [CASE ...] [-r RUNNERS] [--vs RUNNER]
+#          [--speedup [RUNNER]] [--mem] [-n N] [--once] [--list]
+#
+#   CASE      case names or substrings (pe010, 01, ...); default: all
+#   -r        comma-separated runners or groups; default: all
+#   --vs      add a column per runner: its number / this runner's
+#   --speedup add a column: fastest selected non-alx, non-rust runner / RUNNER
+#             (default alx-rel), e.g. -r ruby --speedup or -r golang --speedup
+#   --mem     peak resident memory (MiB, the smallest of the runs) instead of
+#             wall time
+#   -n        max runs per cell (best-of; default 50, capped at ~3 s per cell)
+#   --once    run each cell once and print its output instead of timing it
+#   --list    list cases and runners
+#
+# Runners (wall ms from process start to exit; output checked each run):
+#   alx-run     `alx run`: JIT build + run (edit-to-answer)
+#   alx-rel     prebuilt release binary (built before timing)
+#   rust        hand-written Rust reference, rustc -O (pe007, pe010, pe014)
+#   rb          ruby/idiomatic, `ruby`
+#   rb-yjit     ruby/idiomatic, `ruby --yjit`
+#   fast        ruby/fast, `ruby --disable-gems` (no JIT)
+#   fast-yjit   ruby/fast, --disable-gems --yjit --yjit-call-threshold=1
+#   fast-zjit   ruby/fast, --disable-gems --zjit --zjit-call-threshold=1
+#   go-run      go/idiomatic, `go run` of a freshly edited copy each time
+#               (edit-to-answer: the program recompiles, the std cache is warm)
+#   go          go/idiomatic, prebuilt with `go build`
+#   go-fast     go/fast, prebuilt with `go build`
+# Groups: alx, ruby, idiomatic, fastrb, golang, all.
+#
+# ruby/idiomatic is a direct port. go/idiomatic is what a Go programmer would
+# write (loops, iter.Seq generators, strconv, math/big, goroutines for pmap).
+# */fast do the same work with the same algorithm as the .alx source,
+# hand-optimized (no intermediate arrays or strings; Ractors / goroutines
+# where the source uses pmap).
+#
+# examples:
+#   alx run acceptance/bench.alx                          everything
+#   alx run acceptance/bench.alx pe010 pe014 -r alx-rel,fast-yjit,rust
+#   alx run acceptance/bench.alx -r alx,ruby --vs alx-rel
+#   alx run acceptance/bench.alx -r alx-rel,golang --speedup
+#   alx run acceptance/bench.alx -r alx-rel,go,rb --mem
+#   alx run acceptance/bench.alx pe025 -r alx-rel,rb --once
+
+import "fmt"
+import "os"
+import "os/exec"
+import "path"
+import "sh"
+import "slices"
+import "strings"
+
+RUNNERS = ["alx-run", "alx-rel", "rust", "rb", "rb-yjit", "fast", "fast-yjit", "fast-zjit", "go-run", "go", "go-fast"]
+GROUP_NAMES = ["alx", "ruby", "idiomatic", "fastrb", "golang", "all"]
+
+def group(name: Str) -> [Str] {
+  case name {
+    "alx" => ["alx-run", "alx-rel"]
+    "ruby" => ["rb", "rb-yjit", "fast", "fast-yjit", "fast-zjit"]
+    "idiomatic" => ["rb", "rb-yjit"]
+    "fastrb" => ["fast", "fast-yjit", "fast-zjit"]
+    "golang" => ["go-run", "go", "go-fast"]
+    "all" => RUNNERS
+    _ => [name]
+  }
+}
+
+# The repository: the nearest directory up from here with acceptance/cases.
+def find_root -> ~Str {
+  d = ~sh.pwd
+  loop {
+    return d if sh.dir?(path.join([d, "acceptance", "cases"]))
+    sh.abort("run this from inside the alexandrite repository") if d == "/"
+    d = path.dir(d)
+  }
+}
+
+struct Env {
+  root: Str
+  cases: Str
+  work: Str
+  alx: Str
+  ruby: Str
+  go: Str
+}
+
+# What to run for a case under a runner, or none if the runner has nothing
+# for it. `edit` numbers go-run's fresh copies.
+def argv(e: Env, r: Str, c: Str, edit: Int) -> ~[Str]? {
+  rb = path.join([e.root, "acceptance", "ruby"])
+  # Runners without a port of this case have nothing to run.
+  src = case r {
+    "rb" | "rb-yjit" => "#{rb}/idiomatic/#{c}.rb"
+    "fast" | "fast-yjit" | "fast-zjit" => "#{rb}/fast/#{c}.rb"
+    "go-run" | "go" => "#{e.root}/acceptance/go/idiomatic/#{c}.go"
+    "go-fast" => "#{e.root}/acceptance/go/fast/#{c}.go"
+    _ => ""
+  }
+  return none if src != "" && !sh.exists?(src)
+  case r {
+    "alx-run" => [e.alx, "run", "#{c}.alx"]
+    "alx-rel" => [~alx_release(e, c)]
+    "rust" => ~rust_ref(e, c)
+    "rb" => [e.ruby, "#{rb}/idiomatic/#{c}.rb"]
+    "rb-yjit" => [e.ruby, "--yjit", "#{rb}/idiomatic/#{c}.rb"]
+    "fast" => [e.ruby, "--disable-gems", "#{rb}/fast/#{c}.rb"]
+    "fast-yjit" => [e.ruby, "--disable-gems", "--yjit", "--yjit-call-threshold=1", "#{rb}/fast/#{c}.rb"]
+    "fast-zjit" => [e.ruby, "--disable-gems", "--zjit", "--zjit-call-threshold=1", "#{rb}/fast/#{c}.rb"]
+    "go-run" => [e.go, "run", ~go_edited(e, c, edit)]
+    "go" => [~go_build(e, c, "idiomatic")]
+    _ => [~go_build(e, c, "fast")]
+  }
+}
+
+def alx_release(e: Env, c: Str) -> ~Str {
+  b = `#{e.alx} build --release #{c}.alx`
+  b.dir = e.cases
+  strings.trim_space(b.~output)
+}
+
+def rust_ref(e: Env, c: Str) -> ~[Str]? {
+  src = path.join([e.root, "acceptance", "refs", "#{c}.rs"])
+  return none if !sh.exists?(src)
+  out = path.join([e.work, "ref_#{c}"])
+  `rustc --edition 2024 -O #{src} -o #{out}`.~output if !sh.exists?(out)
+  [out]
+}
+
+def go_build(e: Env, c: Str, flavor: Str) -> ~Str {
+  out = path.join([e.work, "go_#{flavor}_#{c}"])
+  `#{e.go} build -o #{out} #{e.root}/acceptance/go/#{flavor}/#{c}.go`.~output if !sh.exists?(out)
+  out
+}
+
+# A new copy of the source with a unique comment: `go run` must recompile it.
+def go_edited(e: Env, c: Str, edit: Int) -> ~Str {
+  d = path.join([e.work, "gorun_#{c}_#{edit}"])
+  sh.~mkdir_p(d)
+  src = ~sh.read("#{e.root}/acceptance/go/idiomatic/#{c}.go")
+  f = path.join([d, "main.go"])
+  sh.~write(f, src + "\n// edit #{edit}\n")
+  f
+}
+
+# One run: (wall ms, peak MiB, ok, what it printed).
+def measure(e: Env, cmd: [Str], want: Str) -> ~(Float, Float, Bool, exec.Captured) {
+  c = exec.command(cmd[0], cmd[1...cmd.size])
+  c.dir = e.cases
+  r = c.~capture
+  ok = r.state.success && strings.trim_space(r.stdout) == want
+  (r.state.wall_ns.to_f / 1e6, r.state.max_rss.to_f / 1048576.0, ok, r)
+}
+
+def main_args -> [Str] { sh.args }
+
+e0 = ~find_root
+ruby = sh.which("ruby") || "ruby"
+ruby = "/opt/homebrew/opt/ruby/bin/ruby" if sh.file?("/opt/homebrew/opt/ruby/bin/ruby")
+work = ~os.mkdir_temp("", "alx-bench-")
+env = Env.new(root: e0, cases: path.join([e0, "acceptance", "cases"]), work: work, alx: path.join([e0, "target", "release", "alx"]), ruby: ruby, go: sh.which("go") || "/opt/homebrew/bin/go")
+defer sh.rm_rf(work)
+
+# Arguments: flags anywhere among the case names.
+case_args: [Str] = []
+runner_spec = "all"
+vs = ""
+speedup = ""
+mem = false
+nmax = 50
+once = false
+list = false
+argv_ = main_args
+i = 0
+while i < argv_.size {
+  a = argv_[i]
+  value = i + 1 < argv_.size ? argv_[i + 1] : ""
+  if a == "-r" {
+    runner_spec = value
+    i += 1
+  } else if a == "--vs" {
+    vs = value
+    i += 1
+  } else if a == "--speedup" {
+    speedup = "alx-rel"
+    if value != "" && !strings.has_prefix(value, "-") && slices.contains(RUNNERS, value) {
+      speedup = value
+      i += 1
+    }
+  } else if a == "-n" {
+    nmax = value.to_i
+    i += 1
+  } else if a == "--mem" {
+    mem = true
+  } else if a == "--once" {
+    once = true
+  } else if a == "--list" {
+    list = true
+  } else if a == "-h" || a == "--help" {
+    puts "usage: alx run acceptance/bench.alx [CASE ...] [-r RUNNERS] [--vs RUNNER] [--speedup [RUNNER]] [--mem] [-n N] [--once] [--list]"
+    sh.exit(0)
+  } else if strings.has_prefix(a, "-") {
+    sh.abort("unknown flag #{a}; try --help")
+  } else {
+    case_args << a
+  }
+  i += 1
+}
+
+all_cases: [Str] = []
+for f in sh.~glob("#{env.cases}/*.alx") {
+  stem = path.base(f)[0...path.base(f).size - 4]
+  all_cases << stem if !strings.contains(stem, ".") && sh.exists?("#{env.cases}/#{stem}.expected")
+}
+
+if list {
+  puts "cases:   " + all_cases.join(" ")
+  puts "runners: " + RUNNERS.join(" ")
+  gs: [Str] = []
+  for g in GROUP_NAMES { gs << "#{g}=#{group(g).join(",")}" }
+  puts "groups:  " + gs.join("  ")
+  sh.exit(0)
+}
+
+cases: [Str] = []
+for c in all_cases {
+  cases << c if case_args.size == 0 || case_args.any? { |k| strings.contains(c, k) }
+}
+sh.abort("no case matches #{case_args.join(" ")}; try --list") if cases.size == 0
+
+runners: [Str] = []
+for name in runner_spec.split(",") {
+  for r in group(name) {
+    sh.abort("unknown runner #{r}; try --list") if !slices.contains(RUNNERS, r)
+    runners << r if !slices.contains(runners, r)
+  }
+}
+if vs != "" {
+  sh.abort("unknown runner #{vs}") if !slices.contains(RUNNERS, vs)
+  runners << vs if !slices.contains(runners, vs)
+}
+runners = [speedup] + runners if speedup != "" && !slices.contains(runners, speedup)
+
+if runners.any? { |r| strings.has_prefix(r, "alx") } {
+  b = `cargo build --release -q`
+  b.dir = env.root
+  b.~output
+}
+if runners.any? { |r| slices.contains(group("ruby"), r) } {
+  puts strings.trim_space(`#{env.ruby} -v`.~output)
+}
+if runners.any? { |r| slices.contains(group("golang"), r) } {
+  puts strings.trim_space(`#{env.go} version`.~output)
+}
+
+edits = 0
+
+if once {
+  for c in cases {
+    want = strings.trim_space(~sh.read("#{env.cases}/#{c}.expected"))
+    for r in runners {
+      edits += 1
+      cmd = ~argv(env, r, c, edits)
+      if a = cmd {
+        m = ~measure(env, a, want)
+        puts fmt.sprintf("%s %-10s %s %9.1f ms %5.1f MiB  %s", c, r, m[2] ? "ok  " : "FAIL", m[0], m[1], strings.trim_space(m[3].stdout))
+        err = strings.trim_space(m[3].stderr)
+        puts "    " + strings.replace_all(err, "\n", "\n    ") if err != ""
+      }
+    }
+  }
+  sh.exit(0)
+}
+
+# A cell: the best of up to nmax runs (at least 3, until ~3 s are spent).
+def best(e: Env, r: Str, c: Str, want: Str, nmax: Int, mem: Bool, edit0: Int) -> ~(Float, Bool, Str)? {
+  first = ~argv(e, r, c, edit0)
+  return none if first.none?
+  b = 1.0e18
+  spent = 0.0
+  n = 0
+  while n < nmax && (n < 3 || spent < 3000.0) {
+    cmd = first.unwrap
+    if n > 0 && r == "go-run" {
+      again = ~argv(e, r, c, edit0 * 1000 + n)
+      cmd = again.unwrap
+    }
+    m = ~measure(e, cmd, want)
+    return (0.0, false, "wrong output #{strings.trim_space(m[3].stdout)} #{strings.trim_space(m[3].stderr)}") if !m[2]
+    v = mem ? m[1] : m[0]
+    b = v if v < b
+    spent += m[0]
+    n += 1
+  }
+  (b, true, "")
+}
+
+cw = 7
+for c in cases { cw = c.size + 1 if c.size + 1 > cw }
+def pad(s: Str, n: Int) -> Str { s.size >= n ? s : s + strings.repeat(" ", n - s.size) }
+vs_cols: [Str] = []
+for r in runners {
+  vs_cols << r if vs != "" && r != vs
+}
+head = pad("case", cw)
+for r in runners { head += fmt.sprintf("%11s", r) }
+for r in vs_cols { head += fmt.sprintf("%14s", r + "/" + vs) }
+head += fmt.sprintf("%14s", "best/" + speedup) if speedup != ""
+puts head + (mem ? "   (peak MiB)" : "   (ms)")
+failed = false
+for c in cases {
+  want = strings.trim_space(~sh.read("#{env.cases}/#{c}.expected"))
+  row: [Float?] = []
+  for r in runners {
+    edits += 1
+    cell = ~best(env, r, c, want, nmax, mem, edits)
+    if b = cell {
+      if !b[1] {
+        failed = true
+        sh.warn("#{c} #{r}: #{b[2]}")
+        row << none
+      } else {
+        row << b[0]
+      }
+    } else {
+      row << none
+    }
+  }
+  line = pad(c, cw)
+  for v in row {
+    if x = v {
+      line += fmt.sprintf("%11.1f", x)
+    } else {
+      line += fmt.sprintf("%11s", "-")
+    }
+  }
+  vi = slices.index(runners, vs)
+  for r in vs_cols {
+    k = slices.index(runners, r)
+    num = row[k] || -1.0
+    den = vi >= 0 ? (row[vi] || -1.0) : -1.0
+    line += num > 0.0 && den > 0.0 ? fmt.sprintf("%13.2fx", num / den) : fmt.sprintf("%14s", "-")
+  }
+  if speedup != "" {
+    others = -1.0
+    j = 0
+    while j < runners.size {
+      r = runners[j]
+      if !strings.has_prefix(r, "alx") && r != "rust" {
+        if x = row[j] {
+          others = x if others < 0.0 || x < others
+        }
+      }
+      j += 1
+    }
+    mine = row[slices.index(runners, speedup)] || -1.0
+    line += others > 0.0 && mine > 0.0 ? fmt.sprintf("%13.2fx", others / mine) : fmt.sprintf("%14s", "-")
+  }
+  puts line
+}
+sh.exit(failed ? 1 : 0)

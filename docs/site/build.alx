@@ -1,0 +1,73 @@
+# Builds the Alexandrite notebook site: docs/site/index.html.
+#
+# Embeds ROADMAP.md, GO-VS-RUBY.md and docs/milestones/*.md into one page
+# (rendered client-side with marked). Run after writing a milestone doc, then
+# republish docs/site/index.html:
+#
+#   alx run docs/site/build.alx
+
+import "encoding/json"
+import "path"
+import "sh"
+import "slices"
+import "strings"
+
+def title_of(md: Str, fallback: Str) -> Str {
+  for line in md.split("\n") {
+    return strings.trim_space(line[2...line.size]) if strings.has_prefix(line, "# ")
+  }
+  fallback
+}
+
+# A roadmap table row `| M1 | **Name** | contents |`: (id, name, contents).
+def milestone_row(line: Str) -> (Str, Str, Str)? {
+  return none if !strings.has_prefix(line, "| ") || !strings.has_suffix(line, " |")
+  cells = line[2...line.size - 2].split(" | ")
+  return none if cells.size != 3
+  id = cells[0]
+  return none if id.size < 2 || !strings.contains("MRLT", id[0...1])
+  for k in 1...id.size {
+    return none if id[k] < 48 || id[k] > 57
+  }
+  name = cells[1]
+  return none if !strings.has_prefix(name, "**") || !strings.has_suffix(name, "**")
+  (id, name[2...name.size - 2], cells[2])
+}
+
+def doc_json(id: Str, title: Str, group: Str, md: Str) -> Str {
+  "{\"id\": #{json.quote(id)}, \"title\": #{json.quote(title)}, \"group\": #{json.quote(group)}, \"md\": #{json.quote(md)}}"
+}
+
+# Milestone files in reading order: M, then R, L and T; by number.
+def order_key(stem: Str) -> Int {
+  letter = strings.index("MRLT", stem[0...1])
+  (letter < 0 ? 9 : letter) * 1000 + stem[1...stem.size].to_i
+}
+
+sh.abort("run from the repository root") if !sh.exists?("ROADMAP.md")
+roadmap = sh.~read("ROADMAP.md")
+mdir = "docs/milestones"
+stems: [Str] = []
+for f in sh.~glob("#{mdir}/*.md") { stems << path.base(f)[0...path.base(f).size - 3] }
+slices.sort_func(stems) { |a, b| order_key(a) - order_key(b) }
+
+milestones: [Str] = []
+done = 0
+for line in roadmap.split("\n") {
+  if row = milestone_row(line) {
+    is_done = slices.contains(stems, row[0])
+    done += 1 if is_done
+    milestones << "{\"id\": #{json.quote(row[0].to_lower)}, \"num\": #{json.quote(row[0])}, \"name\": #{json.quote(row[1])}, \"contents\": #{json.quote(row[2])}, \"done\": #{is_done}}"
+  }
+}
+
+docs = [doc_json("roadmap", "Roadmap", "plan", roadmap), doc_json("decisions", "Go vs Ruby decisions", "plan", sh.~read("GO-VS-RUBY.md"))]
+for stem in stems {
+  md = sh.~read("#{mdir}/#{stem}.md")
+  docs << doc_json(stem.to_lower, title_of(md, stem), "log", md)
+}
+
+payload = "{\"docs\": [#{docs.join(", ")}], \"milestones\": [#{milestones.join(", ")}]}"
+tmpl = sh.~read("docs/site/template.html")
+sh.~write("docs/site/index.html", strings.replace(tmpl, "/*DATA*/null", payload, 1))
+puts "wrote docs/site/index.html (#{docs.size} docs, #{done}/#{milestones.size} milestones done)"

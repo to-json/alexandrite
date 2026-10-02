@@ -1710,7 +1710,12 @@ impl<'w, 'a> FnCx<'w, 'a> {
                         self.locals[id].reassigned += 1;
                         id
                     }
-                    None => self.declare(name, ty.clone()),
+                    None => {
+                        let id = self.declare(name, ty.clone());
+                        self.locals[id].user = true;
+                        self.decl_spans.push((id, *nsp));
+                        id
+                    }
                 };
                 TStmt::Expr(self.mk(TK::Assign(id, Box::new(v)), ty, s.span))
             }
@@ -1778,11 +1783,11 @@ impl<'w, 'a> FnCx<'w, 'a> {
                 if self.lock_floor.is_some() {
                     return Err(Diag::new(s.span, "`fail` inside a `lock` block would leave the lock held; return a value from the block and fail after it"));
                 }
+                if self.in_lambda && !self.fallible_decl {
+                    return Err(Diag::new(s.span, "`fail` inside a lambda that isn't fallible: give it a `~T` result"));
+                }
                 if !self.is_main && !self.fallible_decl {
                     return Err(Diag::new(s.span, format!("`fail` in `{}`, which isn't fallible: declare it `-> ~T`", self.fn_name)));
-                }
-                if self.in_lambda {
-                    return Err(Diag::new(s.span, "`fail` inside a lambda isn't supported yet"));
                 }
                 let e = self.value(v)?;
                 let e = self.to_error(e)?;
@@ -2161,11 +2166,11 @@ impl<'w, 'a> FnCx<'w, 'a> {
                 let inner = self.value(x);
                 self.under_try = saved;
                 let inner = inner?;
+                if self.in_lambda && !self.fallible_decl {
+                    return Err(Diag::new(sp, "`~` inside a lambda that isn't fallible: give it a `~T` result (`->(x: Int) -> ~Int { ... }`), or handle the result (`unwrap_or`, `rescue`)"));
+                }
                 if !self.is_main && !self.fallible_decl {
                     return Err(Diag::new(sp, format!("`~` in `{}`, which isn't fallible: declare it `-> ~T`", self.fn_name)));
-                }
-                if self.in_lambda {
-                    return Err(Diag::new(sp, "`~` inside a lambda isn't supported yet; handle the result (`unwrap_or`, `rescue`)"));
                 }
                 // What can fail under the `~`: the operation itself (a held
                 // Result, a fallible call, File.read), and every builtin
@@ -2926,10 +2931,19 @@ impl<'w, 'a> FnCx<'w, 'a> {
             (None, Some((_, r))) => r.clone(),
             (None, None) => self.fresh(),
         };
+        // A lambda of type `(..) -> ~T` is fallible like a def: `~` and `fail`
+        // inside return the error, and its body produces a T.
+        let fallible = matches!(self.resolve(&rvar), Ty::Result(_));
+        let body_ret = match self.resolve(&rvar) {
+            Ty::Result(t) => *t,
+            _ => rvar.clone(),
+        };
+        let saved_fallible = std::mem::replace(&mut self.fallible_decl, fallible);
+        let saved_declared = std::mem::replace(&mut self.declared_errs, false);
         let saved_lambda = std::mem::replace(&mut self.in_lambda, true);
         let saved_lock = self.lock_floor.take();
         let saved_cells = self.cells.take();
-        let saved_ret = std::mem::replace(&mut self.ret, rvar.clone());
+        let saved_ret = std::mem::replace(&mut self.ret, body_ret.clone());
         let saved_main = std::mem::replace(&mut self.is_main, false);
         let saved = self.want_hint.take();
         let saved_loops = std::mem::take(&mut self.loops);
@@ -2953,6 +2967,8 @@ impl<'w, 'a> FnCx<'w, 'a> {
         self.ret = saved_ret;
         self.is_main = saved_main;
         self.in_lambda = saved_lambda;
+        self.fallible_decl = saved_fallible;
+        self.declared_errs = saved_declared;
         self.lock_floor = saved_lock;
         self.cells = saved_cells;
         let (mut tb, bt) = r?;
@@ -2960,10 +2976,11 @@ impl<'w, 'a> FnCx<'w, 'a> {
             return Err(Diag::new(sp, format!("this lambda returns {} and {}", self.resolve(&rvar).show(), self.resolve(&bt).show())));
         }
         let rt = self.resolve(&rvar);
-        if rt != Ty::Unit {
+        let bt_want = self.resolve(&body_ret);
+        if bt_want != Ty::Unit {
             if let Some(TStmt::Expr(last)) = tb.body.pop() {
-                let last = self.coerce(last, &rt)?;
-                self.expect(&last.ty, &rt, last.span, "lambda result")?;
+                let last = self.coerce(last, &bt_want)?;
+                self.expect(&last.ty, &bt_want, last.span, "lambda result")?;
                 tb.body.push(TStmt::Expr(last));
             } else {
                 return Err(Diag::new(sp, format!("this lambda should return {}", rt.show())));
@@ -3725,6 +3742,15 @@ impl<'w, 'a> FnCx<'w, 'a> {
                 return Err(Diag::new(sp, format!("`{}` between {} and {}", op.text(), lres.show(), self.resolve(&r.ty).show())));
             }
             return Ok(self.mk(TK::Bin(op, Box::new(l), Box::new(r)), Ty::Bool, sp));
+        }
+        // `a + b` on slices: a new slice holding both (Ruby's Array#+, Go's
+        // append(a[:len(a):len(a)], b...)).
+        if op == BinOp::Add && matches!(lres, Ty::Array(_)) {
+            if !self.unify(&l.ty, &r.ty) {
+                return Err(Diag::new(sp, format!("`+` between {} and {}", lres.show(), self.resolve(&r.ty).show())));
+            }
+            let t = l.ty.clone();
+            return Ok(self.mk(TK::Bin(op, Box::new(l), Box::new(r)), t, sp));
         }
         if matches!(op, BinOp::Eq | BinOp::Ne) && matches!(lres, Ty::Struct(..) | Ty::Tuple(_) | Ty::Enum(..)) {
             if !self.unify(&l.ty, &r.ty) {
@@ -5159,6 +5185,10 @@ impl<'w, 'a> FnCx<'w, 'a> {
                 }
                 _ => {}
             }
+        }
+        // A function value's `dup`: its captures copied (so it can go to a task).
+        if matches!(rt, Ty::Fn(..)) && matches!(name, "dup" | "clone") && args.is_empty() {
+            return Ok(mk_m(self, M::Dup, recv, vec![], None, rt.clone()));
         }
         // Arrays: push, size, indexing helpers.
         if let Ty::Array(el) = &rt {

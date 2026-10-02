@@ -1880,7 +1880,7 @@ static const SysConst sys_consts[] = {
     SC(O_SYNC)
 #endif
     SC(SEEK_SET) SC(SEEK_CUR) SC(SEEK_END)
-    SC(F_GETFD) SC(F_SETFD) SC(F_GETFL) SC(F_SETFL) SC(FD_CLOEXEC)
+    SC(F_GETFD) SC(F_SETFD) SC(F_GETFL) SC(F_SETFL) SC(FD_CLOEXEC) SC(F_DUPFD_CLOEXEC) SC(SIGPIPE) SC(SIGBUS)
     SC(EPERM) SC(ENOENT) SC(ESRCH) SC(EINTR) SC(EIO) SC(ENXIO) SC(E2BIG) SC(ENOEXEC) SC(EBADF) SC(ECHILD)
     SC(EAGAIN) SC(ENOMEM) SC(EACCES) SC(EFAULT) SC(EBUSY) SC(EEXIST) SC(EXDEV) SC(ENODEV) SC(ENOTDIR)
     SC(EISDIR) SC(EINVAL) SC(ENFILE) SC(EMFILE) SC(ENOTTY) SC(EFBIG) SC(ENOSPC) SC(ESPIPE) SC(EROFS)
@@ -1971,6 +1971,107 @@ const char *alx_environ(int64_t i) {
     return environ[i];
 }
 
+/* ---------- processes (std os/exec) ---------- */
+
+#include <spawn.h>
+#include <sys/wait.h>
+#include <sys/resource.h>
+#include <poll.h>
+
+static char **nul_list(const uint8_t *p, int64_t n) {
+    char **v = malloc(sizeof(char *) * (size_t)(n + 1));
+    if (!v) return NULL;
+    for (int64_t i = 0; i < n; i++) {
+        v[i] = (char *)p;
+        p += strlen((const char *)p) + 1;
+    }
+    v[n] = NULL;
+    return v;
+}
+
+int64_t alx_sys_spawn(const uint8_t *argv, int64_t argc, const uint8_t *env, int64_t envc, const char *dir,
+                      int64_t fd0, int64_t fd1, int64_t fd2) {
+    char **av = nul_list(argv, argc);
+    char **ev = envc >= 0 ? nul_list(env, envc) : environ;
+    if (!av || !ev) return -ENOMEM;
+    posix_spawn_file_actions_t fa;
+    posix_spawn_file_actions_init(&fa);
+    int64_t fds[3] = { fd0, fd1, fd2 };
+    for (int i = 0; i < 3; i++)
+        if (fds[i] >= 0) posix_spawn_file_actions_adddup2(&fa, (int)fds[i], i);
+    if (dir && dir[0]) posix_spawn_file_actions_addchdir_np(&fa, dir);
+    posix_spawnattr_t at;
+    posix_spawnattr_init(&at);
+    sigset_t none, all;
+    sigemptyset(&none);
+    sigfillset(&all);
+    posix_spawnattr_setsigmask(&at, &none);
+    posix_spawnattr_setsigdefault(&at, &all);
+    posix_spawnattr_setflags(&at, POSIX_SPAWN_SETSIGMASK | POSIX_SPAWN_SETSIGDEF);
+    pid_t pid;
+    int rc = posix_spawnp(&pid, av[0], &fa, &at, av, ev);
+    posix_spawn_file_actions_destroy(&fa);
+    posix_spawnattr_destroy(&at);
+    free(av);
+    if (envc >= 0) free(ev);
+    return rc ? -(int64_t)rc : (int64_t)pid;
+}
+
+int64_t alx_sys_wait(int64_t pid, uint8_t *out) {
+    int st;
+    struct rusage ru;
+    while (wait4((pid_t)pid, &st, 0, &ru) < 0)
+        if (errno != EINTR) return -errno;
+#ifdef __APPLE__
+    int64_t rss = (int64_t)ru.ru_maxrss;  /* bytes */
+#else
+    int64_t rss = (int64_t)ru.ru_maxrss * 1024;  /* KiB */
+#endif
+    int64_t v[5] = {
+        WIFSIGNALED(st) ? 1 : 0,
+        WIFSIGNALED(st) ? WTERMSIG(st) : WEXITSTATUS(st),
+        (int64_t)ru.ru_utime.tv_sec * 1000000000 + (int64_t)ru.ru_utime.tv_usec * 1000,
+        (int64_t)ru.ru_stime.tv_sec * 1000000000 + (int64_t)ru.ru_stime.tv_usec * 1000,
+        rss,
+    };
+    memcpy(out, v, sizeof v);
+    return 0;
+}
+
+int64_t alx_sys_pipe(uint8_t *out, int64_t nonblock) {
+    int p[2];
+    if (pipe(p) != 0) return -errno;
+    fcntl(p[0], F_SETFD, FD_CLOEXEC);
+    fcntl(p[1], F_SETFD, FD_CLOEXEC);
+    if (nonblock) fcntl(p[0], F_SETFL, fcntl(p[0], F_GETFL) | O_NONBLOCK);
+    int64_t v[2] = { p[0], p[1] };
+    memcpy(out, v, sizeof v);
+    return 0;
+}
+
+int64_t alx_sys_exec(const uint8_t *argv, int64_t argc, const uint8_t *env, int64_t envc, const char *dir,
+                     int64_t fd0, int64_t fd1, int64_t fd2) {
+    char **av = nul_list(argv, argc);
+    char **ev = envc >= 0 ? nul_list(env, envc) : environ;
+    if (!av || !ev) return -ENOMEM;
+    if (dir && dir[0] && chdir(dir) != 0) return -errno;
+    int64_t fds[3] = { fd0, fd1, fd2 };
+    for (int i = 0; i < 3; i++)
+        if (fds[i] >= 0 && fds[i] != i && dup2((int)fds[i], i) < 0) return -errno;
+    fflush(stdout);
+    fflush(stderr);
+    if (envc >= 0) environ = ev;
+    execvp(av[0], av);
+    return -errno;
+}
+
+int64_t alx_sys_poll2(int64_t a, int64_t b) {
+    struct pollfd pf[2] = { { (int)a, POLLIN, 0 }, { (int)b, POLLIN, 0 } };
+    while (poll(pf, 2, -1) < 0)
+        if (errno != EINTR) return -errno;
+    return 0;
+}
+
 /* ======================================================================
  * L3: the I/O event loop (netpoll) and sockets
  * ======================================================================
@@ -1988,7 +2089,6 @@ const char *alx_environ(int64_t i) {
  * a woken waiter retries its syscall, so an fd closed and reused in between
  * is not detected (Go uses fd refcounts); the Linux (epoll) path is UNTESTED. */
 #include <poll.h>
-#include <sys/socket.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <arpa/inet.h>

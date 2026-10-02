@@ -5,10 +5,10 @@ Read this first after a context compaction.
 ## Layout
 - `acceptance/cases/`: case files, `.expected`, `.expected_error`, `.expected_runtime`, `.budget`, `fixtures/`, `lib/primes.alx`. Written and checked against Python.
 - `acceptance/refs/`: Rust references for the timing budgets (pe007, pe010, pe014). Verified.
-- `acceptance/run.py`: the harness.
+- `acceptance/run.alx`: the harness (`alx run acceptance/run.alx`).
 - `GO-VS-RUBY.md`: the decision log (Go = capabilities/semantics, Ruby = syntax tips). Check it before any semantic choice.
-- `acceptance/go/{idiomatic,fast}/`: Go ports (Go 1.27). Runners `go-run` (edit-to-answer), `go`, `go-fast` in bench.py.
-- `acceptance/ruby/{idiomatic,fast}/`: Ruby ports of the positive cases; `acceptance/bench.py` times them against `alx run` and the release binaries.
+- `acceptance/go/{idiomatic,fast}/`: Go ports (Go 1.27). Runners `go-run` (edit-to-answer), `go`, `go-fast` in bench.alx.
+- `acceptance/ruby/{idiomatic,fast}/`: Ruby ports of the positive cases; `acceptance/bench.alx` times them (or measures peak memory with `--mem`) against `alx run` and the release binaries.
 - `compiler/`: the `alx` crate (Rust). The root `Cargo.toml` workspace excludes `probes/`.
 - `web/`: the in-browser compiler (`alx-web`, wasm32): `alx` lib front end + `wasmgen.rs` (LIR → WebAssembly; generators via resume guards) + `rt.rs` (the runtime in Rust). `build.sh`, `test.mjs` (all cases through the browser pipeline in Node), `publish.sh DEST` (the site: `../loot/webb/warez/11-alexandrite`). `pmap` is sequential there.
 - `compiler/runtime/`: the C runtime (`alx.h`, `alx.c`) plus vendored libtommath (Unlicense).

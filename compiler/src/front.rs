@@ -477,7 +477,10 @@ pub fn check_program(l: &Loaded, externs: Vec<DefInfo>) -> Result<TProgram, Diag
         }
         for i in &m.imports {
             let alias = import_name(i);
-            if !crate::check::import_used(&pkg, &alias) && !ext.contains(i.path.trim_end_matches('/')) {
+            // Only reached code records uses (generic and untested defs
+            // aren't checked), so a reference in the file's text counts too.
+            let in_text = l.sm.files.get(i.span.file as usize).is_some_and(|f| mentions(&f.text, &alias));
+            if !crate::check::import_used(&pkg, &alias) && !in_text && !ext.contains(i.path.trim_end_matches('/')) {
                 warnings.push(Diag::new(i.span, format!("`{}` is imported but not used", i.path)));
             }
         }
@@ -886,4 +889,20 @@ pub fn load_tests(dir: &Path, dir_shown: &str, only: Option<&Path>, o: &TestOpts
     }
     overflow.insert(runner.file, Overflow::Abort);
     Ok((Loaded { sm, main: runner, pkgs, overflow }, n, total))
+}
+
+/// Does `text` use `alias.` as a qualifier (not as part of a longer name)?
+fn mentions(text: &str, alias: &str) -> bool {
+    let pat = format!("{alias}.");
+    let b = text.as_bytes();
+    let mut from = 0;
+    while let Some(k) = text[from..].find(&pat) {
+        let at = from + k;
+        let before = if at == 0 { b' ' } else { b[at - 1] };
+        if !(before.is_ascii_alphanumeric() || before == b'_' || before == b'.') {
+            return true;
+        }
+        from = at + 1;
+    }
+    false
 }

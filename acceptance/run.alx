@@ -1,0 +1,709 @@
+# Acceptance harness for ACCEPTANCE.md (A1–A6) and every milestone since.
+#
+# usage: alx run acceptance/run.alx [-k FILTER]
+#
+# Builds the compiler (release), then for every case:
+#   1. debug   `alx run`: stdout, edit-to-answer budget
+#   2. release `alx build --release`: stdout, run time vs the Rust reference
+#   3. safety  ASan/UBSan build, and the Rust oracle (rustc must accept it,
+#              and its output must match)
+#   4. negative cases: the first error (message + file:line:col) must match
+# plus the A3 promote-overhead check, the A6 workflow checks, the module,
+# memory, std and `alx test` checks and the runtime license manifest. Exit
+# status 0 iff everything passes.
+
+import "fmt"
+import "os"
+import "os/exec"
+import "path"
+import "sh"
+import "slices"
+import "strings"
+
+struct Check {
+  group: Str
+  name: Str
+  ok: Bool
+  detail: Str
+}
+
+# A finished command: what it printed, how it ended, how long it took.
+struct Ran {
+  stdout: Str
+  stderr: Str
+  code: Int    # exit status; -signal if killed
+  ms: Float
+  rss: Int     # peak resident bytes
+}
+
+# ------------------------------------------------------------------ helpers
+
+# Runs argv in dir with extra "KEY=value" variables.
+def run_in(argv: [Str], dir: Str, extra: [Str]) -> ~Ran {
+  c = exec.command(argv[0], argv[1...argv.size])
+  c.dir = dir
+  c.env = merged_env(extra) if extra.size > 0
+  r = c.~capture
+  st = r.state
+  Ran.new(stdout: r.stdout, stderr: r.stderr, code: st.signal != 0 ? -st.signal : st.exit_code, ms: st.wall_ns.to_f / 1e6, rss: st.max_rss)
+}
+
+# This process's environment with these "KEY=value" entries set.
+def merged_env(extra: [Str]) -> [Str] {
+  keys: [Str] = []
+  for kv in extra { keys << kv[0...strings.index(kv, "=")] }
+  out: [Str] = []
+  for kv in os.environ {
+    i = strings.index(kv, "=")
+    out << kv if i < 0 || !slices.contains(keys, kv[0...i])
+  }
+  out + extra
+}
+
+def median(xs: [Float]) -> Float {
+  ys = xs.dup
+  slices.sort(ys)
+  n = ys.size
+  return ys[n / 2] if n % 2 == 1
+  (ys[n / 2 - 1] + ys[n / 2]) / 2.0
+}
+
+def trim(s: Str) -> Str { strings.trim_space(s) }
+
+def first_n(s: Str, n: Int) -> Str { s.size <= n ? s : s[0...n] }
+
+def last_n(s: Str, n: Int) -> Str { s.size <= n ? s : s[s.size - n...s.size] }
+
+# The Int after `key` in text (`alx-allocs: 12` with key "alx-allocs: ",
+# `peak=4096` with key "peak="), or -1.
+def int_after(text: Str, key: Str) -> Int {
+  i = strings.index(text, key)
+  return -1 if i < 0
+  j = i + key.size
+  k = j
+  while k < text.size && text[k] >= 48 && text[k] <= 57 { k += 1 }
+  return -1 if k == j
+  text[j...k].to_i
+}
+
+def digits_at(s: Str, i: Int) -> Int {
+  k = i
+  while k < s.size && s[k] >= 48 && s[k] <= 57 { k += 1 }
+  k - i
+}
+
+# Timings vary: `(0.12s)` and a line's final ` 0.123s` become constants.
+def norm_test_output(text: Str) -> Str {
+  out: [Str] = []
+  for line in text.split("\n") {
+    b = ""
+    i = 0
+    while i < line.size {
+      # (D+.DDs)
+      if line[i] == 40 {
+        d = digits_at(line, i + 1)
+        j = i + 1 + d
+        if d > 0 && j + 4 < line.size + 1 && j < line.size && line[j] == 46 && digits_at(line, j + 1) == 2 && j + 4 < line.size && line[j + 3] == 115 && line[j + 4] == 41 {
+          b += "(0.00s)"
+          i = j + 5
+          next
+        }
+      }
+      b += line[i...i + 1]
+      i += 1
+    }
+    # trailing " D+.DDDs"
+    sp = strings.last_index(b, " ")
+    if sp >= 0 && strings.has_suffix(b, "s") {
+      tail = b[sp + 1...b.size - 1]
+      dot = strings.index(tail, ".")
+      if dot > 0 && digits_at(tail, 0) == dot && digits_at(tail, dot + 1) == 3 && tail.size == dot + 4 {
+        b = b[0...sp] + " 0.000s"
+      }
+    }
+    out << b
+  }
+  out.join("\n")
+}
+
+# A line `Benchmarkadd <n> <x> ns/op`.
+def has_bench_line(text: Str) -> Bool {
+  for line in text.split("\n") {
+    ws: [Str] = []
+    for w in line.split(" ") { ws << w if w != "" }
+    if ws.size == 4 && ws[0] == "Benchmarkadd" && digits_at(ws[1], 0) == ws[1].size && ws[3] == "ns/op" {
+      return true
+    }
+  }
+  false
+}
+
+# ------------------------------------------------------------------ the harness
+
+struct H {
+  root: Str
+  cases: Str
+  refs: Str
+  alx: Str
+  work: Str
+  results: [Check]
+
+  def check!(group: Str, name: Str, ok: Bool, detail: Str) {
+    results << Check.new(group: group, name: name, ok: ok, detail: detail)
+    mark = ok ? "PASS" : "FAIL"
+    puts "  [#{mark}] #{group} #{name}" + (detail != "" ? ": #{detail}" : "")
+  }
+
+  def run(argv: [Str]) -> ~Ran { ~run_in(argv, cases, []) }
+
+  def best_ms(argv: [Str], n: Int, dir: Str, extra: [Str]) -> ~Float {
+    b = 1.0e18
+    k = 0
+    while k < n {
+      r = ~run_in(argv, dir, extra)
+      b = r.ms if r.ms < b
+      k += 1
+    }
+    b
+  }
+}
+
+def budget(h: H, c: Str) -> ~Map[Str, Float] {
+  b: Map[Str, Float] = {}
+  p = "#{h.cases}/#{c}.budget"
+  return b if !sh.exists?(p)
+  for line in ~sh.read_lines(p) {
+    ws: [Str] = []
+    for w in line.split(" ") { ws << w if w != "" }
+    b[ws[0]] = ~strconv_float(ws[1]) if ws.size == 2
+  }
+  b
+}
+
+def strconv_float(s: Str) -> ~Float {
+  dot = strings.index(s, ".")
+  return s.to_i.to_f if dot < 0
+  whole = s[0...dot].to_i.to_f
+  frac = s[dot + 1...s.size]
+  scale = 1.0
+  for _ in 0...frac.size { scale *= 10.0 }
+  whole + frac.to_i.to_f / scale
+}
+
+def case_groups -> [(Str, Str)] {
+  [
+    ("pe001", "A1"), ("pe002", "A1"), ("pe006", "A1"),
+    ("pe007", "A2"), ("pe010", "A2"),
+    ("pe016", "A3"), ("pe020", "A3"), ("pe025", "A3"),
+    ("pe004", "A4"), ("pe014", "A4"),
+    ("pe008", "A5"), ("pe022", "A5"),
+    ("nbody", "A7"),
+    ("ints", "M1"),
+    ("syntax", "M2"),
+    ("collections", "M3"),
+    ("types", "M4"),
+    ("errors", "M5"),
+    ("checkeddiv", "M5"),
+    ("checkeddivpromote", "M5"),
+    ("checkeddivwrap", "M5"),
+    ("packages", "M6"),
+    ("refinements", "M6"),
+    ("concurrency", "M7"),
+    ("regions", "R1"),
+    ("closures", "R4"),
+    ("writers", "R4"),
+    ("pools", "R4"),
+    ("asserts", "M8"),
+    ("sharing", "R6"),
+    ("sync", "R6"),
+    ("fmt", "L1"),
+    ("tuples", "L1"),
+    ("funcvalues", "L1"),
+    ("ffi", "L2"),
+    ("consts", "M2"),
+    ("arms", "M2"),
+    ("smallfixes", "L1"),
+    ("trymethod", "M5"),
+    ("pure", "A4"),
+    ("flags", "L2"),
+    ("wc", "L2"),
+    ("l2fixes", "L2"),
+    ("echo", "L3"),
+    ("jsondemo", "L3"),
+    ("httpdemo", "L3"),
+    ("scripting", "T1"),
+  ]
+}
+
+def positive(h: H, c: Str, g: Str) -> ~H {
+  h2 = h
+  want = trim(~sh.read("#{h.cases}/#{c}.expected"))
+  b = ~budget(h, c)
+  src = "#{c}.alx"
+
+  # 1. debug + edit-to-answer
+  r = h2.~run([h.alx, "run", src])
+  h2.check!(g, "#{c} debug output", trim(r.stdout) == want && r.code == 0, "got #{fmt.sprintf("%q", trim(r.stdout))} #{first_n(trim(r.stderr), 200)}")
+  if limit = b["edit_to_answer_ms"] {
+    ts: [Float] = []
+    for _ in 0...7 {
+      x = h2.~run([h.alx, "run", src])
+      ts << x.ms
+    }
+    m = median(ts)
+    h2.check!(g, "#{c} edit-to-answer", m < limit, fmt.sprintf("median %.0f ms (budget %.0f)", m, limit))
+  }
+
+  # 2. release
+  rb = h2.~run([h.alx, "build", "--release", src])
+  binary = trim(rb.stdout)
+  r2 = h2.~run([binary])
+  h2.check!(g, "#{c} release output", trim(r2.stdout) == want && r2.code == 0, "got #{fmt.sprintf("%q", trim(r2.stdout))}")
+  if limit = b["release_vs_ref"] {
+    ref_bin = "#{h.work}/ref_#{c}"
+    `rustc --edition 2024 -O #{h.refs}/#{c}.rs -o #{ref_bin}`.~output if !sh.exists?(ref_bin)
+    ours = h2.~best_ms([binary], 15, h.cases, [])
+    theirs = h2.~best_ms([ref_bin], 15, h.cases, [])
+    ratio = ours / theirs
+    h2.check!(g, "#{c} release vs Rust", ratio <= limit, fmt.sprintf("%.2f ms vs %.2f ms = %.2fx (budget %vx)", ours, theirs, ratio, limit))
+  }
+  lim = b["release_allocs"] || b["release_allocs_max"] || -1.0
+  if lim >= 0.0 {
+    r3 = ~run_in([binary], h.cases, ["ALX_COUNT_ALLOCS=1"])
+    n = int_after(r3.stderr, "alx-allocs: ")
+    h2.check!(g, "#{c} release allocations", n >= 0 && n.to_f <= lim, fmt.sprintf("%d (limit %.0f)", n, lim))
+  }
+  if limit = b["release_checked_index"] {
+    rel_c = "#{h.work}/#{c}-rel.c"
+    dbg_c = "#{h.work}/#{c}-dbg.c"
+    h2.~run([h.alx, "build", "--release", "--emit-c", rel_c, src])
+    h2.~run([h.alx, "build", "--emit-c", dbg_c, src])
+    rel = idx_checks(~sh.read(rel_c))
+    dbg = idx_checks(~sh.read(dbg_c))
+    h2.check!(g, "#{c} index checks removed in release", rel.to_f <= limit && dbg > 0, "debug #{dbg}, release #{rel}")
+  }
+  if need = b["pmap_speedup"] {
+    cores = trim(`getconf _NPROCESSORS_ONLN`.~output).to_i
+    one = h2.~best_ms([binary], 5, h.cases, ["ALX_THREADS=1"])
+    many = h2.~best_ms([binary], 5, h.cases, [])
+    sp = one / many
+    ok = cores >= 4 ? sp >= need : true
+    h2.check!(g, "#{c} pmap speedup", ok, fmt.sprintf("%.1f ms on 1 thread, %.1f ms on %d cores = %.1fx (need %vx on >=4 cores)", one, many, cores, sp, need))
+  }
+
+  # 3. safety net
+  rs = h2.~run([h.alx, "run", "--sanitize", src])
+  reports: [Str] = []
+  for l in rs.stderr.split("\n") {
+    reports << l if strings.contains(l, "runtime error") || strings.contains(l, "AddressSanitizer")
+  }
+  detail = reports.size > 0 ? reports[0] : (rs.code != 0 ? first_n(trim(rs.stderr), 200) : "")
+  h2.check!(g, "#{c} ASan/UBSan clean", trim(rs.stdout) == want && rs.code == 0 && reports.size == 0, detail)
+  rsrc = "#{h.work}/#{c}.rs"
+  h2.~run([h.alx, "build", "--emit-rust", rsrc, src])
+  rbin = "#{h.work}/#{c}_oracle"
+  rc = ~run_in(["rustc", "--edition", "2024", "-O", rsrc, "-o", rbin], h.cases, [])
+  if rc.code != 0 {
+    first = first_n(rc.stderr, 200)
+    for l in rc.stderr.split("\n") {
+      if strings.has_prefix(l, "error") {
+        first = l
+        break
+      }
+    }
+    h2.check!(g, "#{c} Rust oracle accepts", false, first)
+  } else {
+    r4 = h2.~run([rbin])
+    h2.check!(g, "#{c} Rust oracle accepts and agrees", trim(r4.stdout) == want, "oracle printed #{fmt.sprintf("%q", trim(r4.stdout))}")
+  }
+  h2
+}
+
+def idx_checks(text: Str) -> Int { strings.count(text, "ALX_IDX(") + strings.count(text, "ALX_IDX_SET(") }
+
+def first_lines(s: Str, n: Int) -> [Str] {
+  out: [Str] = []
+  for l in s.split("\n") {
+    break if out.size == n
+    out << strings.trim_right(l, " \t\r")
+  }
+  out
+}
+
+def negative_compile(h: H, c: Str, g: Str) -> ~(H, Float) {
+  h2 = h
+  want = first_lines(trim(~sh.read("#{h.cases}/#{c}.expected_error")), 99)
+  r = h2.~run([h.alx, "run", "#{c}.alx"])
+  got = first_lines(r.stderr, 2)
+  ok = slices.equal(got, want) && r.code == 1
+  h2.check!(g, "#{c} first error", ok, ok ? "" : "got #{got.join(" / ")}")
+  (h2, r.ms)
+}
+
+def negative_runtime(h: H, c: Str, g: Str) -> ~H {
+  h2 = h
+  lines = trim(~sh.read("#{h.cases}/#{c}.expected_runtime")).split("\n")
+  status = trim(lines[0][strings.index(lines[0], ":") + 1...lines[0].size])
+  r = h2.~run([h.alx, "run", "#{c}.alx"])
+  status_ok = status == "abort" ? r.code == -6 : r.code == status.to_i
+  missing: [Str] = []
+  for l in lines[1...lines.size] {
+    missing << l if !strings.contains(r.stderr, l)
+  }
+  h2.check!(g, "#{c} runtime failure", status_ok && missing.size == 0, "exit #{r.code}" + (missing.size > 0 ? ", missing #{missing.join(" / ")}" : ""))
+  h2
+}
+
+# R1-R3: call-, loop- and churn-heavy programs run in bounded memory.
+def memory(h: H) -> ~H {
+  h2 = h
+  d = "#{h.cases}/mem"
+  progs = [("calls.alx", "12588314", "R1"), ("loops.alx", "1000000", "R1"), ("fill.alx", "140000", "R2"), ("churn.alx", "100", "R3"), ("pchurn.alx", "50", "R3")]
+  for p in progs {
+    rb = ~run_in([h.alx, "build", "--release", p[0]], d, [])
+    r2 = ~run_in([trim(rb.stdout)], d, ["ALX_MEMSTATS=1"])
+    peak = int_after(r2.stderr, "peak=")
+    first = r2.stdout.split("\n")[0]
+    ok = r2.code == 0 && first == p[1] && peak >= 0 && peak <= 8 << 20
+    h2.check!(p[2], "bounded memory: #{p[0]}", ok, "peak #{peak} bytes, stdout #{fmt.sprintf("%q", first_n(trim(r2.stdout), 40))}")
+  }
+  h2
+}
+
+# L1+: every std package's own tests pass, on the JIT and in release builds.
+def std_tests(h: H) -> ~H {
+  h2 = h
+  dirs: [Str] = []
+  for f in sh.~glob("#{h.root}/std/**/*_test.alx") {
+    dd = path.dir(f)
+    dirs << dd if !slices.contains(dirs, dd)
+  }
+  slices.sort(dirs)
+  for dd in dirs {
+    name = dd[h.root.size + 5...dd.size]
+    for mode in [[], ["--release"]] {
+      r = ~run_in([h.alx, "test"] + mode + [dd], h.root, [])
+      label = mode.size > 0 ? "release" : "jit"
+      h2.check!("L1", "std/#{name} tests (#{label})", r.code == 0, last_n(r.stdout, 300) + last_n(r.stderr, 300))
+    }
+  }
+  h2
+}
+
+# R7: `alx explain mem` names each allocation's region and why.
+def explain(h: H) -> ~H {
+  h2 = h
+  r = ~run_in([h.alx, "explain", "mem", "explain.alx"], "#{h.cases}/mem", [])
+  wants = [
+    "`cache`'s own region: compacted at the loop at 5:7",
+    "6:10    \"line #{"#"}{i}\"",
+    "piles up until then",
+    "program region, never freed: it reaches `spawn { \"task #{"#"}{i}\" }` at 11:7",
+    "1 allocation site(s) in the program region; 3 site(s) inside loops that pile up",
+  ]
+  missing: [Str] = []
+  for w in wants { missing << w if !strings.contains(r.stdout, w) }
+  h2.check!("R7", "explain mem: regions and reasons", r.code == 0 && missing.size == 0, "missing #{missing.join(" / ")}")
+  h2
+}
+
+# R5: 100000 tasks (coroutines) in a daisy chain run in bounded memory.
+def tasks_memory(h: H) -> ~H {
+  h2 = h
+  d = "#{h.cases}/mem"
+  rb = ~run_in([h.alx, "build", "--release", "tasks.alx"], d, [])
+  r = ~run_in([trim(rb.stdout)], d, ["ALX_MEMSTATS=1"])
+  peak = int_after(r.stderr, "peak=")
+  ok = r.code == 0 && trim(r.stdout) == "100000" && peak >= 0 && peak <= 64 << 20 && r.rss < 512 << 20
+  h2.check!("R5", "100000-task daisy chain", ok, fmt.sprintf("peak %d bytes, rss %d MiB, %.0f ms, stdout %q", peak, r.rss >> 20, r.ms, first_n(trim(r.stdout), 40)))
+  r3 = ~run_in([h.alx, "run", "tasks.alx"], d, [])
+  h2.check!("R5", "100000-task daisy chain (JIT)", r3.code == 0 && trim(r3.stdout) == "100000", "exit #{r3.code}")
+  h2
+}
+
+# Unused locals and imports warn; --strict makes them errors.
+def warnings(h: H) -> ~H {
+  h2 = h
+  d = "#{h.cases}/warn"
+  r = ~run_in([h.alx, "run", "warn.alx"], d, [])
+  ok = r.code == 0 && trim(r.stdout) == "5" && strings.contains(r.stderr, "warning: `pk` is imported but not used") && strings.contains(r.stderr, "warning: `unused` is assigned but never used") && !strings.contains(r.stderr, "_quiet")
+  h2.check!("M8", "unused warnings", ok, "exit #{r.code}, stderr #{fmt.sprintf("%q", first_n(trim(r.stderr), 200))}")
+  r = ~run_in([h.alx, "run", "--strict", "warn.alx"], d, [])
+  h2.check!("M8", "--strict makes warnings errors", r.code == 1 && r.stdout == "" && strings.contains(r.stderr, "error: `pk` is imported but not used"), "exit #{r.code}")
+  h2
+}
+
+def modules(h: H) -> ~H {
+  h2 = h
+  d = "#{h.cases}/modtest"
+  env = ["ALX_MODCACHE=#{d}/cache"]
+  want = trim(~sh.read("#{d}/main.expected"))
+  r = ~run_in([h.alx, "run", "main.alx"], d, env)
+  h2.check!("M6", "modtest require+replace+MVS output", trim(r.stdout) == want && r.code == 0, "got #{fmt.sprintf("%q", trim(r.stdout))} #{first_n(trim(r.stderr), 200)}")
+  r = ~run_in([h.alx, "run", "bad.alx"], d, env)
+  want2 = first_lines(trim(~sh.read("#{d}/bad.expected_error")), 99)
+  got = first_lines(r.stderr, 2)
+  h2.check!("M6", "modtest unrequired import error", slices.equal(got, want2) && r.code == 1, "got #{got.join(" / ")}")
+  r = ~run_in([h.alx, "run", "main.alx"], d, ["ALX_MODCACHE=#{h.work}/empty-cache"])
+  h2.check!("M6", "modtest missing cache dir error", strings.contains(r.stderr, "isn't in the module cache") && r.code == 1, first_n(trim(r.stderr), 200))
+  h2
+}
+
+def fmt_check(h: H) -> ~H {
+  h2 = h
+  paths = sh.~glob("#{h.cases}/*.alx") + ["#{h.cases}/pkgs", "#{h.cases}/lib"]
+  r = h2.~run([h.alx, "fmt", "--check"] + paths)
+  h2.check!("M8", "alx fmt --check: cases are canonically formatted", r.code == 0 && r.stdout == "", "exit #{r.code}: #{first_n(trim(r.stdout), 200)}")
+  h2
+}
+
+# `alx test`: discovery, assertions, examples, benchmarks, exit codes.
+def testing(h: H) -> ~H {
+  h2 = h
+  d = "#{h.cases}/testing"
+  want = ~sh.read("#{d}/test.expected")
+  r = ~run_in([h.alx, "test"], d, [])
+  h2.check!("M8", "alx test passes (package + tests, imports, examples)", r.code == 0 && norm_test_output(r.stdout) == want, "exit #{r.code}: #{last_n(norm_test_output(r.stdout), 300)} #{first_n(trim(r.stderr), 200)}")
+  r = ~run_in([h.alx, "test", "calc_test.alx"], d, [])
+  h2.check!("M8", "alx test FILE", r.code == 0 && norm_test_output(r.stdout) == want, "exit #{r.code}")
+  r = h2.~run([h.alx, "test", "testing"])
+  h2.check!("M8", "alx test DIR from elsewhere", r.code == 0 && strings.contains(r.stdout, "ok     testing "), "exit #{r.code}")
+  r = ~run_in([h.alx, "test", "-run", "clamp"], d, [])
+  out = norm_test_output(r.stdout)
+  h2.check!("M8", "alx test -run filters by substring", r.code == 0 && strings.contains(out, "=== RUN   clamp") && !strings.contains(out, "RUN   add") && !strings.contains(out, "RUN   printing"), first_n(out, 200))
+  r = ~run_in([h.alx, "test", "-bench", "."], d, ["ALX_BENCHTIME=20ms"])
+  h2.check!("M8", "alx test -bench runs benchmarks", r.code == 0 && has_bench_line(r.stdout), last_n(r.stdout, 200))
+  r = ~run_in([h.alx, "test", "-benchtime", "10ms", "-bench", "add", "-run", "none"], d, [])
+  h2.check!("M8", "alx test -benchtime, benchmarks only", r.code == 0 && has_bench_line(r.stdout) && !strings.contains(r.stdout, "=== RUN"), last_n(r.stdout, 200))
+  r = ~run_in([h.alx, "test"], d, [])
+  h2.check!("M8", "benchmarks don't run without -bench", !strings.contains(r.stdout, "Benchmark"), "")
+  r = ~run_in([h.alx, "test", "--release"], d, [])
+  h2.check!("M8", "alx test --release (C backend)", r.code == 0 && norm_test_output(r.stdout) == want, "exit #{r.code}: #{first_n(trim(r.stderr), 200)}")
+
+  d = "#{h.cases}/testing_fail"
+  want = ~sh.read("#{d}/test.expected")
+  r = ~run_in([h.alx, "test"], d, [])
+  h2.check!("M8", "alx test failures: output and exit code 1", r.code == 1 && norm_test_output(r.stdout) == want, "exit #{r.code}: #{last_n(norm_test_output(r.stdout), 300)}")
+  r = ~run_in([h.alx, "test", "--release"], d, [])
+  h2.check!("M8", "alx test --release failures: exit code 1", r.code == 1 && norm_test_output(r.stdout) == want, "exit #{r.code}")
+
+  # `test` blocks belong in test files.
+  tmp = "#{h.work}/misplaced"
+  sh.~mkdir_p(tmp)
+  sh.~write("#{tmp}/a.alx", "test \"x\" {\n  assert true\n}\n")
+  r = ~run_in([h.alx, "run", "a.alx"], tmp, [])
+  h2.check!("M8", "test block outside a _test.alx file is an error", r.code == 1 && strings.contains(r.stderr, "`test` blocks belong in a `*_test.alx` file"), first_n(trim(r.stderr), 200))
+  h2
+}
+
+def promote_overhead(h: H) -> ~H {
+  h2 = h
+  tmp = "#{h.work}/promote"
+  sh.~mkdir_p(tmp)
+  src = ~sh.read("#{h.cases}/pe001.alx")
+  sh.~write("#{tmp}/plain.alx", src)
+  sh.~write("#{tmp}/prom.alx", "#![overflow(promote)]\n" + src)
+  b1 = trim(~run_in([h.alx, "build", "--release", "plain.alx"], tmp, []).stdout)
+  b2 = trim(~run_in([h.alx, "build", "--release", "prom.alx"], tmp, []).stdout)
+  out = trim(~run_in([b2], tmp, []).stdout)
+  h2.check!("A3", "promote-mode pe001 output", out == "233168", out)
+  t1 = h2.~best_ms([b1], 31, tmp, [])
+  t2 = h2.~best_ms([b2], 31, tmp, [])
+  h2.check!("A3", "promote overhead on word-sized values", t2 <= 1.2 * t1, fmt.sprintf("%.2f ms vs %.2f ms = %.2fx (limit 1.2x)", t2, t1, t2 / t1))
+  h2
+}
+
+def a6(h: H) -> ~H {
+  h2 = h
+  # Edit-to-answer: alternate an edit, rerun.
+  tmp = "#{h.work}/edit"
+  sh.~mkdir_p(tmp)
+  src = ~sh.read("#{h.cases}/pe001.alx")
+  times: [Float] = []
+  outs: [Str] = []
+  for i in 0...10 {
+    sh.~write("#{tmp}/pe001.alx", strings.replace_all(src, "1000", i % 2 == 1 ? "999" : "1000"))
+    r = ~run_in([h.alx, "run", "pe001.alx"], tmp, [])
+    times << r.ms
+    o = trim(r.stdout)
+    outs << o if !slices.contains(outs, o)
+  }
+  slices.sort(outs)
+  m = median(times)
+  h2.check!("A6", "edit-to-answer", m < 300.0 && slices.equal(outs, ["232169", "233168"]), fmt.sprintf("median %.0f ms over 10 edits; outputs %v", m, outs))
+
+  # Error round-trip.
+  ts: [Float] = []
+  for _ in 0...3 {
+    x = ~negative_compile(h2, "pe001.typo", "A6")
+    h2 = x[0]
+    ts << x[1]
+  }
+  em = median(ts)
+  h2.check!("A6", "error round-trip time", em < 200.0, fmt.sprintf("%.0f ms", em))
+
+  # Library reuse: fresh cache, then a second run must not rebuild the library.
+  lib = "#{h.work}/libreuse"
+  sh.~rm_rf(lib)
+  sh.~cp_r(h.cases, lib)
+  sh.~rm_rf("#{lib}/.alx-cache")
+  # (`alx run` JITs the whole program in memory; native builds compile
+  # libraries separately and cache them.)
+  r1 = ~run_in([h.alx, "build", "-v", "pe007.alx"], lib, [])
+  r2 = ~run_in([h.alx, "build", "-v", "pe007.alx"], lib, [])
+  out = r2.code == 0 ? trim(~run_in([trim(r2.stdout)], lib, []).stdout) : ""
+  ok = strings.contains(r1.stderr, "lib/primes: compiling") && strings.contains(r2.stderr, "lib/primes: cached") && out == "104743"
+  libl: [Str] = []
+  for l in r2.stderr.split("\n") { libl << l if strings.contains(l, "lib/") }
+  h2.check!("A6", "library reuse", ok, libl.join(" / "))
+
+  # No setup: a fresh directory containing only pe001.alx.
+  fresh = "#{h.work}/fresh"
+  sh.~rm_rf(fresh)
+  sh.~mkdir_p(fresh)
+  sh.~cp("#{h.cases}/pe001.alx", "#{fresh}/pe001.alx")
+  r = ~run_in([h.alx, "run", "pe001.alx"], fresh, [])
+  entries: [Str] = []
+  for en in ~os.read_dir(fresh) { entries << en.name }
+  okd = slices.equal(entries, [".alx-cache", "pe001.alx"]) || slices.equal(entries, ["pe001.alx"])
+  h2.check!("A6", "no setup", trim(r.stdout) == "233168" && okd, "directory now holds #{entries.join(", ")}")
+
+  # Answer check.
+  good = h2.~run([h.alx, "run", "pe010.alx", "--expect", "142913828922"]).code
+  bad = h2.~run([h.alx, "run", "pe010.alx", "--expect", "1"]).code
+  h2.check!("A6", "--expect", good == 0 && bad == 1, "exit #{good} on match, #{bad} on mismatch")
+  h2
+}
+
+def licenses(h: H) -> ~H {
+  h2 = h
+  rt = "#{h.root}/compiler/runtime"
+  allowed = ["Apache-2.0 WITH LLVM-exception", "Unlicense", "0BSD", "MIT-0", "public domain"]
+  listed: [Str] = []
+  bad: [Str] = []
+  for line in ~sh.read_lines("#{rt}/LICENSES") {
+    next if trim(line) == "" || strings.has_prefix(line, "#")
+    t = trim(line)
+    sp = 0
+    while sp < t.size && t[sp] != 32 && t[sp] != 9 { sp += 1 }
+    p = t[0...sp]
+    lic = trim(t[sp...t.size])
+    listed << p
+    bad << "#{p}: #{lic}" if !slices.contains(allowed, lic)
+  }
+  files: [Str] = []
+  for f in sh.~walk(rt) {
+    if sh.file?(f) && path.base(f) != "LICENSES" {
+      files << f[rt.size + 1...f.size]
+    }
+  }
+  unlisted: [Str] = []
+  for f in files { unlisted << f if !slices.contains(listed, f) }
+  ok = unlisted.size == 0 && bad.size == 0
+  h2.check!("all", "runtime license manifest", ok, ok ? "#{files.size} files, all allowed" : "unlisted #{unlisted.join(", ")}, disallowed #{bad.join(", ")}")
+  h2
+}
+
+# ------------------------------------------------------------------ main
+
+def find_root -> ~Str {
+  d = ~sh.pwd
+  loop {
+    return d if sh.dir?(path.join([d, "acceptance", "cases"]))
+    sh.abort("run this from inside the alexandrite repository") if d == "/"
+    d = path.dir(d)
+  }
+}
+
+filt = ""
+a = sh.args
+k = slices.index(a, "-k")
+filt = a[k + 1] if k >= 0 && k + 1 < a.size
+
+root = ~find_root
+work = ~os.mkdir_temp("", "alx-acceptance-")
+h = H.new(root: root, cases: "#{root}/acceptance/cases", refs: "#{root}/acceptance/refs", alx: "#{root}/target/release/alx", work: work, results: [])
+
+puts "building the compiler (release)..."
+cb = `cargo build --release -q`
+cb.dir = root
+cb.~run
+sh.~rm_rf("#{h.cases}/.alx-cache")
+for gc in case_groups {
+  if strings.contains(gc[0], filt) {
+    puts "== #{gc[0]}"
+    h = ~positive(h, gc[0], gc[1])
+  }
+}
+if filt == "" || strings.contains(filt, "neg") {
+  puts "== negative cases"
+  compile_neg = [
+    ("pe014.bad1", "A4"), ("l2fixes.bad1", "L2"), ("sharing.bad1", "R6"), ("sync.bad1", "R6"), ("sync.bad2", "R6"),
+    ("jsondemo.bad1", "L3"), ("jsondemo.bad2", "L3"), ("jsondemo.bad3", "L3"),
+    ("sync.bad3", "R6"), ("sync.bad4", "R6"), ("sharing.bad2", "R6"), ("sharing.bad3", "R6"), ("sharing.bad4", "R6"),
+    ("pe014.bad2", "A4"), ("pe004.bad", "A4"),
+    ("pure.bad1", "A4"), ("pure.bad2", "A4"), ("pure.bad3", "A4"), ("pure.bad4", "A4"), ("pure.bad5", "A4"), ("pure.bad6", "A4"), ("pure.bad7", "A4"), ("pure.bad8", "A4"),
+    ("ffi.bad1", "L2"), ("ffi.bad2", "L2"), ("ffi.bad3", "L2"),
+    ("ints.bad1", "M1"), ("ints.bad2", "M1"),
+    ("collections.bad1", "M3"), ("collections.bad2", "M3"),
+    ("types.bad1", "M4"), ("types.bad2", "M4"), ("types.bad3", "M4"),
+    ("errors.bad1", "M5"), ("errors.bad2", "M5"), ("errors.bad3", "M5"),
+    ("packages.bad1", "M6"), ("packages.bad2", "M6"), ("packages.bad3", "M6"),
+    ("refinements.bad1", "M6"),
+    ("consts.bad1", "M2"), ("consts.bad2", "M2"), ("arms.bad1", "M2"), ("arms.bad2", "M2"),
+    ("smallfixes.bad1", "L1"),
+    ("scripting.bad1", "T1"), ("scripting.bad2", "T1"),
+  ]
+  for n in compile_neg {
+    x = ~negative_compile(h, n[0], n[1])
+    h = x[0]
+  }
+  for n in [("pe020.bad", "A3"), ("pe022.missing", "A5"), ("ints.overflow", "M1"), ("collections.oob", "M3"), ("errors.die", "M5"), ("concurrency.deadlock", "M7")] {
+    h = ~negative_runtime(h, n[0], n[1])
+  }
+}
+if filt == "" || strings.contains(filt, "mod") {
+  puts "== modules"
+  h = ~modules(h)
+  h = ~warnings(h)
+  h = ~memory(h)
+  h = ~explain(h)
+  h = ~std_tests(h)
+  h = ~tasks_memory(h)
+  h = ~fmt_check(h)
+  puts "== alx test"
+  h = ~testing(h)
+}
+if filt == "" || strings.contains(filt, "A3") {
+  puts "== A3 promote overhead"
+  h = ~promote_overhead(h)
+}
+if filt == "" || strings.contains(filt, "A6") {
+  puts "== A6 day-to-day loop"
+  h = ~a6(h)
+}
+h = ~licenses(h) if filt == ""
+
+puts ""
+groups: [Str] = []
+for r in h.results { groups << r.group if !slices.contains(groups, r.group) }
+slices.sort(groups)
+puts "| group | passed | failed |"
+puts "|---|---|---|"
+for g in groups {
+  p = 0
+  f = 0
+  for r in h.results {
+    if r.group == g {
+      if r.ok { p += 1 } else { f += 1 }
+    }
+  }
+  puts "| #{g} | #{p} | #{f} |"
+}
+failed: [Check] = []
+for r in h.results { failed << r if !r.ok }
+puts ""
+puts "#{h.results.size - failed.size}/#{h.results.size} checks passed"
+for r in failed { puts "  FAIL #{r.group} #{r.name}: #{r.detail}" }
+sh.rm_rf(work)
+sh.exit(failed.size > 0 ? 1 : 0)

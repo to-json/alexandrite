@@ -1037,6 +1037,30 @@ impl<'a> Lw<'a> {
                 let (x, y) = (self.expr(a), self.expr(b));
                 LE::Rt(Rt::StrCat, vec![x, y])
             }
+            TK::Bin(BinOp::Add, a, b) if matches!(e.ty, Ty::Array(_)) => {
+                let at = self.lty(&e.ty);
+                let et = at.clone().arr_elem_lty();
+                let x = self.expr(a);
+                let x = self.bind(x, at.clone());
+                let y = self.expr(b);
+                let y = self.bind(y, at.clone());
+                let len = |v: &LE| LE::Len(Box::new(v.clone()));
+                let n = LE::Arith(Op::Add, Box::new(len(&x)), Box::new(len(&y)), Ovf::Unchecked);
+                let c = self.tmp(at);
+                self.emit(LS::Set(c, LE::ArrWithCap(et, Box::new(n))));
+                for src in [x, y] {
+                    let i = self.tmp(LTy::I64);
+                    self.emit(LS::Set(i, LE::I(0)));
+                    let l = self.label();
+                    let body = self.sub(|lw| {
+                        lw.emit(LS::If(LE::Cmp(Op::Ge, Box::new(LE::Var(i)), Box::new(len(&src)), LTy::I64), vec![LS::Break(l)], vec![]));
+                        lw.emit(LS::Push(c, LE::Index { arr: Box::new(src.clone()), idx: Box::new(LE::Var(i)), check: None }));
+                        lw.emit(LS::Set(i, LE::Arith(Op::Add, Box::new(LE::Var(i)), Box::new(LE::I(1)), Ovf::Unchecked)));
+                    });
+                    self.emit(LS::Loop(l, body));
+                }
+                LE::Var(c)
+            }
             TK::Bin(op, a, b) => self.binary(*op, a, b, e),
             TK::Neg(x) => {
                 let v = self.expr(x);
@@ -2598,6 +2622,12 @@ impl<'a> Lw<'a> {
                 let v = self.expr(&args[0]);
                 LE::Rt(Rt::StrFromBytes, vec![v])
             }
+            Dup if matches!(recv.unwrap().ty, Ty::Fn(..)) => {
+                let r = recv.unwrap();
+                let v = self.expr(r);
+                let t = self.lty(&r.ty);
+                self.deep_copy(v, &t)
+            }
             Dup => {
                 let r = recv.unwrap();
                 let v = self.expr(r);
@@ -2714,6 +2744,14 @@ impl<'a> Lw<'a> {
                 // The body becomes its own function: captures first, then params.
                 let Ty::Fn(pts, rt) = &e.ty else { unreachable!() };
                 let mut w = Lw::new(self.p, self.sm, self.opts, self.f, self.mode, ErrPath::Return(vec![]), self.prog);
+                // `(..) -> ~T`: a fallible body, like a fallible def's.
+                let ok_t = match &**rt {
+                    Ty::Result(t) => Some(w.lty(t)),
+                    _ => None,
+                };
+                if let Some(t) = &ok_t {
+                    w.res = Some(ok_lty(t.clone()));
+                }
                 let mut params = vec![];
                 for a in args {
                     let TK::Local(l) = a.kind else { unreachable!() };
@@ -2727,11 +2765,24 @@ impl<'a> Lw<'a> {
                 }
                 let (mut body, v) = w.sub_val(|w| w.inline_block(b, &pvs, &[], None));
                 let ret = w.lty(rt);
-                // A Unit body's last expression still runs (it's a call, say).
-                if ret == LTy::Unit && !matches!(v, LE::Unit | LE::Var(_) | LE::I(_) | LE::B(_)) {
-                    body.push(LS::Eval(v.clone()));
+                if ok_t.is_some() {
+                    let v = if ok_t == Some(LTy::Unit) {
+                        if !matches!(v, LE::Unit | LE::Var(_) | LE::I(_) | LE::B(_)) {
+                            body.push(LS::Eval(v));
+                        }
+                        LE::B(false) // ok_lty's placeholder for Unit
+                    } else {
+                        v
+                    };
+                    let r = w.ok_result(v);
+                    body.push(LS::Return(Some(r)));
+                } else {
+                    // A Unit body's last expression still runs (it's a call, say).
+                    if ret == LTy::Unit && !matches!(v, LE::Unit | LE::Var(_) | LE::I(_) | LE::B(_)) {
+                        body.push(LS::Eval(v.clone()));
+                    }
+                    body.push(LS::Return(if ret == LTy::Unit { None } else { Some(v) }));
                 }
-                body.push(LS::Return(if ret == LTy::Unit { None } else { Some(v) }));
                 let func = LFunc { name: format!("__lambda_{g}"), params, vars: std::mem::take(&mut w.vars), ret, body, external: false, is_main: false, labels: w.labels };
                 self.prog.borrow_mut().funcs.push(func);
                 let lt = self.lty(&e.ty);

@@ -11,6 +11,8 @@ pub enum Tok {
     Float(f64, String),
     /// A double-quoted string with `#{...}` parts.
     Interp(Vec<IPiece>),
+    /// A command literal: `` `cat #{f} | grep -c x` ``.
+    Cmd(Vec<CmdPart>),
     Str(String),
     Ident(String),
     Const(String),
@@ -32,6 +34,20 @@ pub enum Tok {
 pub enum IPiece {
     Lit(String),
     Code(String, u32),
+}
+
+/// A piece of a command literal: a word (literal text and `#{}` pieces, one
+/// argument), `#{*xs}` (a [Str] spliced as several arguments), or an operator
+/// (the `os/exec` literal kinds: 1 `|`, 2 `<`, 3 `>`, 4 `>>`, 5 `2>`, 6 `2>>`,
+/// 7 `2>&1`, 8 `>&2`, 9 `&>`). Each piece has its span.
+#[derive(Debug, Clone, PartialEq)]
+pub enum CmdPart {
+    Word(Vec<IPiece>, Span),
+    Splice(String, u32, Span),
+    Op(i64, Span),
+    /// Something the literal doesn't support: reported by the parser (so
+    /// `alx fmt` still reads the file). Message, note, span.
+    Bad(String, String, Span),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -301,6 +317,13 @@ pub fn lex_at(file: u32, src: &str, base: u32) -> Result<Vec<Token>, Diag> {
             space = false;
             continue;
         }
+        if c == b'`' {
+            let (tok, end) = lex_cmd(file, src, base, i)?;
+            out.push(Token { tok, span: sp(i, end), space_before: space });
+            i = end;
+            space = false;
+            continue;
+        }
         if c == b'"' || c == b'\'' {
             let q = c;
             i += 1;
@@ -463,4 +486,205 @@ pub fn lex_at(file: u32, src: &str, base: u32) -> Result<Vec<Token>, Diag> {
     out.push(Token { tok: Tok::Newline, span: sp(b.len(), b.len()), space_before: false });
     out.push(Token { tok: Tok::Eof, span: sp(b.len(), b.len()), space_before: false });
     Ok(out)
+}
+
+/// The end of a `#{...}` whose body starts at `open`: the index of its `}`.
+fn interp_end(b: &[u8], open: usize) -> Option<usize> {
+    let (mut j, mut depth, mut in_str) = (open, 1, None::<u8>);
+    while j < b.len() && b[j] != b'\n' {
+        match (in_str, b[j]) {
+            (Some(qq), x) if x == qq => in_str = None,
+            (Some(_), b'\\') => j += 1,
+            (Some(_), _) => {}
+            (None, b'"' | b'\'') => in_str = Some(b[j]),
+            (None, b'{') => depth += 1,
+            (None, b'}') => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(j);
+                }
+            }
+            _ => {}
+        }
+        j += 1;
+    }
+    None
+}
+
+/// A command literal starting at the backtick at `start`: its token and the
+/// index after the closing backtick. Words split on blanks; '...' is literal;
+/// "..." takes \" \\ \` \$ escapes and `#{}`; `\c` outside quotes is c.
+fn lex_cmd(file: u32, src: &str, base: u32, start: usize) -> Result<(Tok, usize), Diag> {
+    let b = src.as_bytes();
+    let sp = |lo: usize, hi: usize| Span { file, lo: base + lo as u32, hi: base + hi as u32 };
+    let mut parts: Vec<CmdPart> = vec![];
+    let mut pieces: Vec<IPiece> = vec![];
+    let mut lit = String::new();
+    let mut in_word = false;
+    let mut word_lo = 0usize;
+    let mut i = start + 1;
+    fn flush(parts: &mut Vec<CmdPart>, pieces: &mut Vec<IPiece>, lit: &mut String, in_word: &mut bool, span: Span) {
+        if !*in_word {
+            return;
+        }
+        if !lit.is_empty() || pieces.is_empty() {
+            pieces.push(IPiece::Lit(std::mem::take(lit)));
+        }
+        parts.push(CmdPart::Word(std::mem::take(pieces), span));
+        *in_word = false;
+    }
+    // Operators, longest first: (text, kind, only at the start of a word).
+    const OPS: &[(&str, i64, bool)] = &[("2>&1", 7, true), ("1>&2", 8, true), ("2>>", 6, true), ("2>", 5, true), (">&2", 8, false), ("&>", 9, false), (">>", 4, false), (">", 3, false), ("<", 2, false), ("|", 1, false)];
+    loop {
+        if i >= b.len() {
+            return Err(Diag::new(sp(start, start + 1), "unterminated command literal: no closing backtick"));
+        }
+        let c = b[i];
+        if c == b'`' {
+            flush(&mut parts, &mut pieces, &mut lit, &mut in_word, sp(word_lo, i));
+            i += 1;
+            break;
+        }
+        if c == b' ' || c == b'\t' || c == b'\n' || c == b'\r' {
+            flush(&mut parts, &mut pieces, &mut lit, &mut in_word, sp(word_lo, i));
+            i += 1;
+            continue;
+        }
+        let rest = &src[i..];
+        if rest.starts_with("||") || rest.starts_with("&&") || c == b';' {
+            let t = if c == b';' { ";" } else { &rest[..2] };
+            flush(&mut parts, &mut pieces, &mut lit, &mut in_word, sp(word_lo, i));
+            parts.push(CmdPart::Bad(format!("`{t}` isn't supported in a command literal: run the commands separately (`a`.~run, `b`.~run) and use the language's control flow"), String::new(), sp(i, i + t.len())));
+            i += t.len();
+            continue;
+        }
+        if let Some(&(text, kind, word_start)) = OPS.iter().find(|(t, _, ws)| rest.starts_with(t) && (!ws || !in_word)) {
+            let _ = word_start;
+            flush(&mut parts, &mut pieces, &mut lit, &mut in_word, sp(word_lo, i));
+            parts.push(CmdPart::Op(kind, sp(i, i + text.len())));
+            i += text.len();
+            continue;
+        }
+        let unsupported = match c {
+            b'&' => Some(("there are no background jobs", "start it in a task: `spawn { `cmd`.~run }`")),
+            b'$' => Some(("there are no shell variables", "interpolate: `echo #{x}`, `#{os.getenv(\"HOME\") || \"\"}`")),
+            b'*' | b'?' | b'[' => Some(("there is no globbing", "quote it ('*.c'), or expand it in the program: `rm #{*sh.~glob(\"*.o\")}`")),
+            b'(' | b')' | b'{' | b'}' | b'~' => Some(("this is shell syntax the literal doesn't have", "quote it if it's part of an argument: '(...)'")),
+            _ => None,
+        };
+        if let Some((what, hint)) = unsupported {
+            parts.push(CmdPart::Bad(format!("unquoted `{}` in a command literal: {what}", c as char), hint.to_string(), sp(i, i + 1)));
+            i += 1;
+            continue;
+        }
+        if !in_word {
+            in_word = true;
+            word_lo = i;
+        }
+        match c {
+            b'\\' => {
+                let Some(ch) = src[i + 1..].chars().next() else {
+                    return Err(Diag::new(sp(i, i + 1), "a command literal can't end with `\\`"));
+                };
+                lit.push(ch);
+                i += 1 + ch.len_utf8();
+            }
+            b'\'' => {
+                let close = src[i + 1..].find('\'').ok_or_else(|| Diag::new(sp(i, i + 1), "unterminated '...' in a command literal"))?;
+                lit.push_str(&src[i + 1..i + 1 + close]);
+                i += close + 2;
+            }
+            b'"' => {
+                i += 1;
+                loop {
+                    if i >= b.len() {
+                        return Err(Diag::new(sp(word_lo, i), "unterminated \"...\" in a command literal"));
+                    }
+                    match b[i] {
+                        b'"' => {
+                            i += 1;
+                            break;
+                        }
+                        b'\\' if matches!(b.get(i + 1), Some(b'"' | b'\\' | b'`' | b'$')) => {
+                            lit.push(b[i + 1] as char);
+                            i += 2;
+                        }
+                        b'#' if b.get(i + 1) == Some(&b'{') => {
+                            let end = interp_end(b, i + 2).ok_or_else(|| Diag::new(sp(i, i + 2), "unterminated `#{` in a command literal"))?;
+                            if !lit.is_empty() {
+                                pieces.push(IPiece::Lit(std::mem::take(&mut lit)));
+                            }
+                            pieces.push(IPiece::Code(src[i + 2..end].to_string(), base + (i + 2) as u32));
+                            i = end + 1;
+                        }
+                        _ => {
+                            let ch = src[i..].chars().next().unwrap();
+                            lit.push(ch);
+                            i += ch.len_utf8();
+                        }
+                    }
+                }
+            }
+            b'#' if b.get(i + 1) == Some(&b'{') => {
+                let end = interp_end(b, i + 2).ok_or_else(|| Diag::new(sp(i, i + 2), "unterminated `#{` in a command literal"))?;
+                let body = &src[i + 2..end];
+                let alone = word_lo == i && lit.is_empty() && pieces.is_empty();
+                let next_ends = matches!(b.get(end + 1), None | Some(b' ' | b'\t' | b'\n' | b'`' | b'|' | b'<' | b'>'));
+                if let Some(code) = body.trim_start().strip_prefix('*') {
+                    if !(alone && next_ends) {
+                        parts.push(CmdPart::Bad("`#{*xs}` splices a list as separate arguments, so it must be a whole word".into(), String::new(), sp(i, end + 1)));
+                        i = end + 1;
+                        continue;
+                    }
+                    let off = body.len() - code.len();
+                    parts.push(CmdPart::Splice(code.to_string(), base + (i + 2 + off) as u32, sp(i, end + 1)));
+                    in_word = false;
+                    i = end + 1;
+                    continue;
+                }
+                if !lit.is_empty() {
+                    pieces.push(IPiece::Lit(std::mem::take(&mut lit)));
+                }
+                pieces.push(IPiece::Code(body.to_string(), base + (i + 2) as u32));
+                i = end + 1;
+            }
+            _ => {
+                let ch = src[i..].chars().next().unwrap();
+                lit.push(ch);
+                i += ch.len_utf8();
+            }
+        }
+    }
+    // Shape: stages of at least one word; a redirect takes a word.
+    let mut k = 0;
+    let mut stage_words = 0;
+    let mut bad: Option<CmdPart> = None;
+    while k < parts.len() && bad.is_none() {
+        match &parts[k] {
+            CmdPart::Word(..) | CmdPart::Splice(..) => stage_words += 1,
+            CmdPart::Bad(..) => {}
+            CmdPart::Op(1, s) => {
+                if stage_words == 0 {
+                    bad = Some(CmdPart::Bad("`|` needs a command on its left".into(), String::new(), *s));
+                }
+                stage_words = 0;
+            }
+            CmdPart::Op(7 | 8, _) => {}
+            CmdPart::Op(_, s) => {
+                if !matches!(parts.get(k + 1), Some(CmdPart::Word(..))) {
+                    bad = Some(CmdPart::Bad("a redirect needs a file name after it".into(), String::new(), *s));
+                }
+                k += 1;
+            }
+        }
+        k += 1;
+    }
+    if bad.is_none() && stage_words == 0 && !parts.iter().any(|p| matches!(p, CmdPart::Bad(..))) {
+        let msg = if parts.is_empty() { "an empty command literal" } else { "a command literal needs a command after its last `|`" };
+        bad = Some(CmdPart::Bad(msg.into(), String::new(), sp(start, i)));
+    }
+    if let Some(b) = bad {
+        parts.push(b);
+    }
+    Ok((Tok::Cmd(parts), i))
 }

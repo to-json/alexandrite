@@ -549,6 +549,122 @@ mod rt {
     unsafe extern "C" {
         fn poll(fds: *mut PollFd, n: std::ffi::c_ulong, ms: i32) -> i32;
     }
+    // Processes (std os/exec): the C runtime's spawn/wait/pipe shims.
+    fn sysc(name: &str) -> i32 {
+        super::sys_consts().iter().find(|(k, _)| *k == name).map_or(-1, |(_, v)| *v as i32)
+    }
+    unsafe fn nul_list(p: *const u8, n: i64) -> Vec<std::ffi::OsString> {
+        use std::os::unix::ffi::OsStrExt;
+        let mut out = vec![];
+        let mut p = p;
+        for _ in 0..n {
+            let c = unsafe { std::ffi::CStr::from_ptr(p as *const std::ffi::c_char) };
+            out.push(std::ffi::OsStr::from_bytes(c.to_bytes()).to_os_string());
+            p = unsafe { p.add(c.to_bytes().len() + 1) };
+        }
+        out
+    }
+    unsafe extern "C" {
+        fn pipe(fds: *mut i32) -> i32;
+        fn wait4(pid: i32, status: *mut i32, options: i32, ru: *mut i64) -> i32;
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn shim_alx_sys_spawn(argv: *mut u8, argc: i64, env: *mut u8, envc: i64, dir: *const std::ffi::c_char, fd0: i64, fd1: i64, fd2: i64) -> i64 {
+        use std::os::fd::FromRawFd;
+        let av = unsafe { nul_list(argv, argc) };
+        let mut cmd = std::process::Command::new(&av[0]);
+        cmd.args(&av[1..]);
+        if envc >= 0 {
+            cmd.env_clear();
+            for kv in unsafe { nul_list(env, envc) } {
+                let kv = kv.to_string_lossy().into_owned();
+                let (k, v) = kv.split_once('=').unwrap_or((&kv, ""));
+                cmd.env(k, v);
+            }
+        }
+        let d = cpath(dir);
+        if !d.as_os_str().is_empty() {
+            cmd.current_dir(d);
+        }
+        let io = |fd: i64| if fd < 0 { std::process::Stdio::inherit() } else { unsafe { std::process::Stdio::from(std::fs::File::from_raw_fd(libc_fcntl(fd as i32, sysc("F_DUPFD_CLOEXEC"), 3))) } };
+        cmd.stdin(io(fd0)).stdout(io(fd1)).stderr(io(fd2));
+        match cmd.spawn() {
+            Ok(c) => c.id() as i64,
+            Err(e) => neg_errno(&e),
+        }
+    }
+    pub unsafe fn shim_alx_sys_wait(pid: i64, out: *mut u8) -> i64 {
+        let mut st = 0i32;
+        let mut ru = [0i64; 18];
+        loop {
+            if unsafe { wait4(pid as i32, &mut st, 0, ru.as_mut_ptr()) } >= 0 {
+                break;
+            }
+            let e = std::io::Error::last_os_error();
+            if e.kind() != std::io::ErrorKind::Interrupted {
+                return neg_errno(&e);
+            }
+        }
+        // struct timeval: tv_sec (8 bytes), tv_usec (an int32 on macOS).
+        let us = |i: usize| (ru[i] & 0xffff_ffff) as i32 as i64;
+        let rss = if cfg!(target_os = "macos") { ru[4] } else { ru[4] * 1024 };
+        let sig = st & 0x7f;
+        let killed = sig != 0 && sig != 0x7f;
+        let v = [killed as i64, if killed { sig as i64 } else { ((st >> 8) & 0xff) as i64 }, ru[0] * 1_000_000_000 + us(1) * 1000, ru[2] * 1_000_000_000 + us(3) * 1000, rss];
+        unsafe { std::ptr::copy_nonoverlapping(v.as_ptr() as *const u8, out, 40) };
+        0
+    }
+    pub unsafe fn shim_alx_sys_exec(argv: *mut u8, argc: i64, env: *mut u8, envc: i64, dir: *const std::ffi::c_char, fd0: i64, fd1: i64, fd2: i64) -> i64 {
+        use std::os::unix::process::CommandExt;
+        use std::os::fd::FromRawFd;
+        let av = unsafe { nul_list(argv, argc) };
+        let mut cmd = std::process::Command::new(&av[0]);
+        cmd.args(&av[1..]);
+        if envc >= 0 {
+            cmd.env_clear();
+            for kv in unsafe { nul_list(env, envc) } {
+                let kv = kv.to_string_lossy().into_owned();
+                let (k, v) = kv.split_once('=').unwrap_or((&kv, ""));
+                cmd.env(k, v);
+            }
+        }
+        let d = cpath(dir);
+        if !d.as_os_str().is_empty() {
+            cmd.current_dir(d);
+        }
+        let io = |fd: i64| if fd < 0 { std::process::Stdio::inherit() } else { unsafe { std::process::Stdio::from(std::fs::File::from_raw_fd(libc_fcntl(fd as i32, sysc("F_DUPFD_CLOEXEC"), 3))) } };
+        cmd.stdin(io(fd0)).stdout(io(fd1)).stderr(io(fd2));
+        use std::io::Write;
+        let _ = std::io::stdout().flush();
+        neg_errno(&cmd.exec())
+    }
+    pub unsafe fn shim_alx_sys_pipe(out: *mut u8, nonblock: i64) -> i64 {
+        let mut p = [0i32; 2];
+        if unsafe { pipe(p.as_mut_ptr()) } != 0 {
+            return neg_errno(&std::io::Error::last_os_error());
+        }
+        unsafe {
+            libc_fcntl(p[0], sysc("F_SETFD"), sysc("FD_CLOEXEC"));
+            libc_fcntl(p[1], sysc("F_SETFD"), sysc("FD_CLOEXEC"));
+            if nonblock != 0 {
+                let fl = libc_fcntl(p[0], sysc("F_GETFL"));
+                libc_fcntl(p[0], sysc("F_SETFL"), fl | sysc("O_NONBLOCK"));
+            }
+        }
+        let v = [p[0] as i64, p[1] as i64];
+        unsafe { std::ptr::copy_nonoverlapping(v.as_ptr() as *const u8, out, 16) };
+        0
+    }
+    pub unsafe fn shim_alx_sys_poll2(a: i64, b: i64) -> i64 {
+        let mut fds = [PollFd { fd: a as i32, events: 1, revents: 0 }, PollFd { fd: b as i32, events: 1, revents: 0 }];
+        while unsafe { poll(fds.as_mut_ptr(), 2, -1) } < 0 {
+            let e = std::io::Error::last_os_error();
+            if e.kind() != std::io::ErrorKind::Interrupted {
+                return neg_errno(&e);
+            }
+        }
+        0
+    }
     pub unsafe fn shim_alx_fd_wait(fd: i64, mode: i64) -> i64 {
         // In slices: closing a descriptor in another thread doesn't wake a
         // poll on it (macOS), so check now and then that it's still open.

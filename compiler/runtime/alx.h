@@ -363,6 +363,26 @@ void alx_sys_dir_close(int64_t h);
 /* The i-th "NAME=value" of the environment, NULL past the end. */
 const char *alx_environ(int64_t i);
 
+/* ---------- processes (std os/exec) ----------
+ * spawn: argv / env are argc / envc NUL-terminated strings back to back
+ * (envc < 0: inherit this process's environment); dir "" = this directory;
+ * fd0..fd2 become the child's stdin/stdout/stderr. PATH is searched for
+ * argv[0]. The pid, or -errno. */
+int64_t alx_sys_spawn(const uint8_t *argv, int64_t argc, const uint8_t *env, int64_t envc, const char *dir,
+                      int64_t fd0, int64_t fd1, int64_t fd2);
+/* Waits for pid. out (5 int64s): 0 exited / 1 killed, its status / signal,
+ * user and system CPU ns, peak resident bytes. 0 or -errno. */
+int64_t alx_sys_wait(int64_t pid, uint8_t *out);
+/* A pipe, both ends close-on-exec (the read end non-blocking if nonblock):
+ * out = 2 int64s (read, write). 0 or -errno. */
+int64_t alx_sys_pipe(uint8_t *out, int64_t nonblock);
+/* Replaces this process (execvp; dir "" = stay): returns only on failure,
+ * with -errno. Arguments as for alx_sys_spawn. */
+int64_t alx_sys_exec(const uint8_t *argv, int64_t argc, const uint8_t *env, int64_t envc, const char *dir,
+                     int64_t fd0, int64_t fd1, int64_t fd2);
+/* Blocks until a or b (either may be -1) is readable or hung up. 0 or -errno. */
+int64_t alx_sys_poll2(int64_t a, int64_t b);
+
 /* ---------- the I/O event loop and sockets (std net, L3) ---------- */
 /* Wait until fd is readable (mode 1) or writable (mode 2) or in error: parks a
  * task (poller thread), poll(2)s otherwise. 0, or -errno if fd can't be polled. */

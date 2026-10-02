@@ -28,7 +28,7 @@ fn convert_fn(f: &mut TFunc) {
     }
     by_lambda.retain(|l| {
         let loc = &f.locals[*l];
-        (loc.reassigned > 0 || loc.mutated) && !by_task.contains(l) && !in_multi.contains(l) && (loc.user || f.params.contains(l)) && zero(&loc.ty).is_some()
+        (loc.reassigned > 0 || loc.mutated || loc.pushed) && !by_task.contains(l) && !in_multi.contains(l) && (loc.user || f.params.contains(l)) && zero(&loc.ty).is_some()
     });
     if by_lambda.is_empty() {
         return;

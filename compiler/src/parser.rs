@@ -4,7 +4,7 @@
 
 use crate::ast::*;
 use crate::diag::{Diag, Span};
-use crate::lexer::{IPiece, Kw, Tok, Token};
+use crate::lexer::{CmdPart, IPiece, Kw, Tok, Token};
 use std::collections::HashSet;
 
 /// Methods of a generic type take `self` untyped: each instance is checked
@@ -51,9 +51,23 @@ pub struct Parser<'a> {
 
 type PResult<T> = Result<T, Diag>;
 
+/// The local name of the `os/exec` import that command literals use.
+const CMD_PKG: &str = "alxexec";
+
 pub fn parse(file: u32, toks: &[Token], next_id: &mut NodeId) -> PResult<Module> {
     let mut p = Parser { toks, pos: 0, next_id, scopes: vec![HashSet::new()], in_cond: false, usings: vec![], extern_mode: false, cur_derives: vec![], jobs: vec![] };
-    p.module(file)
+    let mut m = p.module(file)?;
+    // Command literals call into os/exec (also from inside `#{...}`).
+    let has_cmd = toks.iter().any(|t| match &t.tok {
+        Tok::Cmd(_) => true,
+        Tok::Interp(ps) => ps.iter().any(|x| matches!(x, IPiece::Code(c, _) if c.contains('`'))),
+        _ => false,
+    });
+    if has_cmd {
+        let span = toks.iter().find(|t| matches!(t.tok, Tok::Cmd(_))).map_or(toks[0].span, |t| t.span);
+        m.imports.push(Import { alias: Some(CMD_PKG.into()), path: "os/exec".into(), span });
+    }
+    Ok(m)
 }
 
 impl<'a> Parser<'a> {
@@ -112,6 +126,31 @@ impl<'a> Parser<'a> {
         *self.next_id += 1;
         *self.next_id
     }
+    /// `"a #{x} b"` from its lexed pieces.
+    fn interp(&mut self, pieces: Vec<IPiece>, sp: Span) -> PResult<Expr> {
+        let mut parts = vec![];
+        for p in pieces {
+            match p {
+                IPiece::Lit(s) => parts.push(InterpPart::Lit(s)),
+                IPiece::Code(src, base) => parts.push(InterpPart::Expr(self.code_expr(&src, base, sp, "`#{...}`")?)),
+            }
+        }
+        Ok(self.mk(ExprKind::Interp(parts), sp))
+    }
+
+    /// The expression in an embedded piece of source (`#{...}`).
+    fn code_expr(&mut self, src: &str, base: u32, sp: Span, what: &str) -> PResult<Expr> {
+        let toks = crate::lexer::lex_at(sp.file, src, base)?;
+        let mut sub = Parser { toks: &toks, pos: 0, next_id: self.next_id, scopes: self.scopes.clone(), in_cond: false, usings: vec![], extern_mode: false, cur_derives: vec![], jobs: vec![] };
+        sub.skip_newlines();
+        let e = sub.expr()?;
+        sub.skip_newlines();
+        if !matches!(sub.peek(), Tok::Eof) {
+            return Err(Diag::new(sub.span(), format!("unexpected {} in {what}", describe(sub.peek()))));
+        }
+        Ok(e)
+    }
+
     fn mk(&mut self, kind: ExprKind, span: Span) -> Expr {
         Expr { id: self.id(), kind, span }
     }
@@ -1687,7 +1726,7 @@ impl<'a> Parser<'a> {
             return false;
         }
         match self.peek() {
-            Tok::Int(_) | Tok::BigInt(_) | Tok::Float(..) | Tok::Str(_) | Tok::Interp(_) | Tok::Ident(_) | Tok::Const(_) | Tok::Sym(_) => true,
+            Tok::Int(_) | Tok::BigInt(_) | Tok::Float(..) | Tok::Str(_) | Tok::Interp(_) | Tok::Cmd(_) | Tok::Ident(_) | Tok::Const(_) | Tok::Sym(_) => true,
             Tok::Kw(Kw::Case) => true,
             Tok::Kw(Kw::True | Kw::False | Kw::Nil | Kw::None | Kw::Try) => true,
             Tok::Op("(") | Tok::Op("[") | Tok::Op("~") | Tok::Op("->") => true,
@@ -1705,25 +1744,39 @@ impl<'a> Parser<'a> {
             Tok::BigInt(t) => self.mk(ExprKind::BigInt(t), sp),
             Tok::Float(v, t) => self.mk(ExprKind::Float(v, t), sp),
             Tok::Str(s) => self.mk(ExprKind::Str(s), sp),
-            Tok::Interp(pieces) => {
-                let mut parts = vec![];
-                for p in pieces {
-                    match p {
-                        IPiece::Lit(s) => parts.push(InterpPart::Lit(s)),
-                        IPiece::Code(src, base) => {
-                            let toks = crate::lexer::lex_at(sp.file, &src, base)?;
-                            let mut sub = Parser { toks: &toks, pos: 0, next_id: self.next_id, scopes: self.scopes.clone(), in_cond: false, usings: vec![], extern_mode: false, cur_derives: vec![], jobs: vec![] };
-                            sub.skip_newlines();
-                            let e = sub.expr()?;
-                            sub.skip_newlines();
-                            if !matches!(sub.peek(), Tok::Eof) {
-                                return Err(Diag::new(sub.span(), format!("unexpected {} in `#{{...}}`", describe(sub.peek()))));
-                            }
-                            parts.push(InterpPart::Expr(e));
-                        }
-                    }
+            Tok::Interp(pieces) => self.interp(pieces, sp)?,
+            Tok::Cmd(cparts) => {
+                // `os/exec.from_literal(groups, kinds)`: a group per word ([w]),
+                // per `#{*xs}` (xs) and per operator ([""]).
+                // The first thing the literal doesn't support, in source order.
+                let mut bads: Vec<&CmdPart> = cparts.iter().filter(|p| matches!(p, CmdPart::Bad(..))).collect();
+                bads.sort_by_key(|p| if let CmdPart::Bad(_, _, s) = p { s.lo } else { 0 });
+                if let Some(CmdPart::Bad(msg, note, bsp)) = bads.first() {
+                    let d = Diag::new(*bsp, msg.clone());
+                    return Err(if note.is_empty() { d } else { d.note(note.clone()) });
                 }
-                self.mk(ExprKind::Interp(parts), sp)
+                let mut groups = vec![];
+                let mut kinds = vec![];
+                for p in cparts {
+                    let (g, k) = match p {
+                        CmdPart::Word(pieces, wsp) => {
+                            let w = if let [IPiece::Lit(s)] = pieces.as_slice() { self.mk(ExprKind::Str(s.clone()), wsp) } else { self.interp(pieces, wsp)? };
+                            (self.mk(ExprKind::Array(vec![w]), wsp), 0)
+                        }
+                        CmdPart::Splice(code, base, ssp) => (self.code_expr(&code, base, ssp, "`#{*...}`")?, 10),
+                        CmdPart::Op(k, osp) => {
+                            let e = self.mk(ExprKind::Str(String::new()), osp);
+                            (self.mk(ExprKind::Array(vec![e]), osp), k)
+                        }
+                        CmdPart::Bad(..) => unreachable!(),
+                    };
+                    groups.push(g);
+                    kinds.push(self.mk(ExprKind::Int(k), sp));
+                }
+                let recv = self.mk(ExprKind::Name(CMD_PKG.into()), sp);
+                let ga = self.mk(ExprKind::Array(groups), sp);
+                let ka = self.mk(ExprKind::Array(kinds), sp);
+                self.mk(ExprKind::Call { recv: Some(Box::new(recv)), name: "from_literal".into(), name_span: sp, args: vec![ga, ka], block: None, block_sym: None }, sp)
             }
             Tok::Kw(Kw::Case) => return self.case_rest(sp),
             Tok::Kw(Kw::If) | Tok::Kw(Kw::Unless) => {
@@ -2013,6 +2066,7 @@ pub fn describe(t: &Tok) -> String {
         Tok::BigInt(t) => format!("`{t}`"),
         Tok::Float(_, t) => format!("`{t}`"),
         Tok::Str(_) | Tok::Interp(_) => "a string".into(),
+        Tok::Cmd(_) => "a command literal".into(),
         Tok::Ident(n) | Tok::Const(n) => format!("`{n}`"),
         Tok::Sym(s) => format!("`:{s}`"),
         Tok::Attr(a) => format!("`#[{a}]`"),

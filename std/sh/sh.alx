@@ -1,0 +1,473 @@
+# Package sh: what shell scripts are for, without the shell. Files (Ruby's
+# FileUtils names), globs with `**`, directories and the environment, and the
+# small things scripts need (arguments, stdin, abort, timing, parallelism,
+# colors). Commands themselves are command literals, which need no import:
+#
+#   import "sh"
+#
+#   sh.mkdir_p("build/out")
+#   for f in sh.~glob("src/**/*.c") {
+#     `cc -c #{f} -o build/out/#{path.base(f)}.o`.~run
+#   }
+#   sh.in_dir("build") { `tar czf out.tgz out`.~run }
+#   sh.parallel(sh.~glob("*.png"), 8) { |f| `optipng -quiet #{f}`.~run }
+#   sh.abort("no config") if !sh.exists?("app.toml")
+#
+# Failures are the os package's FsError (and exec's ExecError from commands).
+# Paths are relative to the current directory, which `cd` / `in_dir` change
+# for the whole process (as a shell's `cd` does).
+#
+# Not Go (milestone T1): a shell-scripting kit in the spirit of Ruby's FileUtils and Dir.glob.
+# Where Go has the function (os.ReadFile, filepath.Glob) the name here is the
+# shell's or Ruby's and the behaviour is the shell's (`cp` into a directory,
+# `rm_f` of nothing is fine, `**` in globs, hidden files only by `.`).
+
+import "os"
+import "os/exec"
+import "path"
+import "path/filepath"
+import "slices"
+import "strings"
+import "time"
+
+extern def c_utimes(p: Str, times: [Byte]) -> I32 = "utimes"
+extern def c_isatty(fd: I32) -> Bool = "isatty"
+extern def alx_mono_ns -> Int
+extern def alx_wall_ns -> Int
+extern def alx_sys_const(name: Str) -> Int
+
+# ------------------------------------------------------------------ files
+
+# The whole file as text.
+pub def read(p: Str) -> ~Str {
+  ~os.read_file_string(p)
+}
+
+# The file's lines, without their newlines (and no empty last line for a
+# final newline).
+pub def read_lines(p: Str) -> ~[Str] {
+  lines_of(~os.read_file_string(p))
+}
+
+# Replaces the file's content with s (creating it, mode 0644).
+pub def write(p: Str, s: Str) -> ~Unit {
+  ~os.write_file(p, s.bytes.to_a, 0o644)
+}
+
+# Adds s to the end of the file (creating it).
+pub def append(p: Str, s: Str) -> ~Unit {
+  f = ~os.open_file(p, os.O_WRONLY | os.O_CREATE | os.O_APPEND, 0o644)
+  r = f.write_string!(s)
+  r2 = f.close!
+  ~r
+  ~r2
+}
+
+# Does anything exist at p (a dangling symlink counts)?
+pub def exists?(p: Str) -> Bool { os.lstat(p).ok? }
+
+# Is p a directory (following symlinks)?
+pub def dir?(p: Str) -> Bool {
+  r = os.stat(p)
+  r.ok? && r.unwrap.is_dir
+}
+
+# Is p a regular file (following symlinks)?
+pub def file?(p: Str) -> Bool {
+  r = os.stat(p)
+  r.ok? && r.unwrap.is_regular
+}
+
+# Creates the directory and any missing parents (mode 0755); fine if it exists.
+pub def mkdir_p(p: Str) -> ~Unit {
+  ~os.mkdir_all(p, 0o755)
+}
+
+# Removes a file or an empty directory.
+pub def rm(p: Str) -> ~Unit {
+  ~os.remove(p)
+}
+
+# Removes a file or an empty directory; nothing there is fine.
+pub def rm_f(p: Str) -> ~Unit {
+  r = os.remove(p)
+  if e = r.err {
+    return if os.is_not_exist(e)
+    fail e
+  }
+}
+
+# Removes p and everything under it; nothing there is fine.
+pub def rm_rf(p: Str) -> ~Unit {
+  ~os.remove_all(p)
+}
+
+# Creates an empty file, or sets an existing one's modification time to now.
+pub def touch(p: Str) -> ~Unit {
+  if !exists?(p) {
+    ~write(p, "")
+    return
+  }
+  t: [Byte] = [0; 32]
+  sec = alx_wall_ns / 1000000000
+  i = 0
+  while i < 8 {
+    t[i] = ((sec >> (8 * i)) & 255).as_u8
+    t[16 + i] = ((sec >> (8 * i)) & 255).as_u8
+    i += 1
+  }
+  r = c_utimes(p, t)
+  fail os.fs_error("touch", p, C.errno) if r != 0
+}
+
+# A symbolic link at `link` pointing to `target`.
+pub def ln_s(target: Str, link: Str) -> ~Unit {
+  ~os.symlink(target, link)
+}
+
+pub def chmod(p: Str, mode: Int) -> ~Unit {
+  ~os.chmod(p, mode)
+}
+
+# Copies a file (keeping its permissions). Into a directory if dst is one.
+pub def cp(src: Str, dst: Str) -> ~Unit {
+  to = dir?(dst) ? path.join([dst, path.base(src)]) : dst
+  ~copy_file(src, to)
+}
+
+# Copies a file or a directory tree (`cp -r`): into dst if dst is an existing
+# directory, else as dst. Symlinks are copied as links.
+pub def cp_r(src: Str, dst: Str) -> ~Unit {
+  to = dir?(dst) ? path.join([dst, path.base(src)]) : dst
+  ~copy_tree(src, to)
+}
+
+# Moves (renames) a file or directory; into dst if dst is a directory.
+# Across file systems it copies and then removes.
+pub def mv(src: Str, dst: Str) -> ~Unit {
+  to = dir?(dst) ? path.join([dst, path.base(src)]) : dst
+  r = os.rename(src, to)
+  if e = r.err {
+    case e {
+      Other(at) => {
+        if at.code == exdev {
+          ~copy_tree(src, to)
+          ~os.remove_all(src)
+          return
+        }
+      }
+      _ => {}
+    }
+    fail e
+  }
+}
+
+def exdev -> Int { alx_sys_const("EXDEV") }
+
+def copy_file(src: Str, dst: Str) -> ~Unit {
+  info = ~os.stat(src)
+  data = ~os.read_file(src)
+  ~os.write_file(dst, data, info.perm)
+  ~os.chmod(dst, info.perm)
+}
+
+def copy_tree(src: Str, dst: Str) -> ~Unit {
+  info = ~os.lstat(src)
+  if info.is_symlink {
+    target = ~os.readlink(src)
+    ~os.symlink(target, dst)
+    return
+  }
+  if !info.is_dir {
+    ~copy_file(src, dst)
+    return
+  }
+  ~os.mkdir_all(dst, info.perm | 0o700)
+  for en in ~os.read_dir(src) {
+    ~copy_tree(en.path, path.join([dst, en.name]))
+  }
+  ~os.chmod(dst, info.perm)
+}
+
+# ------------------------------------------------------------------ finding
+
+# The paths matching a pattern, sorted. Like filepath.glob (`*`, `?`, `[a-z]`
+# within one name), plus `**` as a whole element: any number of directories
+# (`src/**/*.c` is every .c file under src, `**` alone is everything below).
+# As in a shell, `*` doesn't match a leading `.` (write `.*` for those), and a
+# pattern with no wildcards matches only what exists.
+pub def glob(pattern: Str) -> ~[Str] {
+  absolute = strings.has_prefix(pattern, "/")
+  segs: [Str] = []
+  for s in pattern.split("/") {
+    segs << s if s != ""
+  }
+  cur: [Str] = [absolute ? "/" : ""]
+  for seg in segs {
+    nxt: [Str] = []
+    if seg == "**" {
+      for b in cur {
+        nxt << b
+        for d in all_below(b, true) { nxt << d }
+      }
+    } else if !has_meta(seg) {
+      for b in cur { nxt << join2(b, seg) }
+    } else {
+      for b in cur {
+        entries = os.read_dir(b == "" ? "." : b)
+        next if !entries.ok?
+        for en in entries.unwrap {
+          next if strings.has_prefix(en.name, ".") && !strings.has_prefix(seg, ".")
+          nxt << join2(b, en.name) if ~filepath.match(seg, en.name)
+        }
+      }
+    }
+    cur = nxt
+  }
+  out: [Str] = []
+  for p in cur {
+    out << p if p != "" && exists?(p)
+  }
+  slices.sort(out)
+  slices.compact(out)
+}
+
+# Every path under root (files and directories, not root itself, symlinks not
+# followed), sorted; hidden ones (`.x`) included. `find root` for scripts:
+#   for f in sh.~walk("src") { ... if strings.has_suffix(f, ".go") }
+pub def walk(root: Str) -> ~[Str] {
+  ~os.lstat(root)
+  out = all_below(root, false)
+  for f in files_below(root) { out << f }
+  slices.sort(out)
+  out
+}
+
+# The directories under b (b "" = "."), recursively; without hidden ones if
+# `skip_hidden`.
+def all_below(b: Str, skip_hidden: Bool) -> [Str] {
+  out: [Str] = []
+  todo = [b]
+  while todo.size > 0 {
+    d = todo[todo.size - 1]
+    todo = todo[0...todo.size - 1]
+    entries = os.read_dir(d == "" ? "." : d)
+    next if !entries.ok?
+    for en in entries.unwrap {
+      next if skip_hidden && strings.has_prefix(en.name, ".")
+      if en.is_dir {
+        p = join2(d, en.name)
+        out << p
+        todo << p
+      }
+    }
+  }
+  out
+}
+
+# Every non-directory under b.
+def files_below(b: Str) -> [Str] {
+  out: [Str] = []
+  todo = [b]
+  while todo.size > 0 {
+    d = todo[todo.size - 1]
+    todo = todo[0...todo.size - 1]
+    entries = os.read_dir(d)
+    next if !entries.ok?
+    for en in entries.unwrap {
+      p = join2(d, en.name)
+      if en.is_dir {
+        todo << p
+      } else {
+        out << p
+      }
+    }
+  }
+  out
+}
+
+def join2(a: Str, b: Str) -> Str {
+  return b if a == ""
+  return "/" + b if a == "/"
+  a + "/" + b
+}
+
+def has_meta(p: Str) -> Bool {
+  i = 0
+  while i < p.size {
+    c = p[i]
+    return true if c == 42 || c == 63 || c == 91 || c == 92
+    i += 1
+  }
+  false
+}
+
+# ------------------------------------------------------ directories and env
+
+# The current directory.
+pub def pwd -> ~Str {
+  ~os.getwd
+}
+
+# Changes the current directory (for the whole process).
+pub def cd(dir: Str) -> ~Unit {
+  ~os.chdir(dir)
+}
+
+# Runs f in dir, then changes back (also when f fails).
+pub def in_dir(dir: Str, f: () -> ~Unit) -> ~Unit {
+  back = ~os.getwd
+  ~os.chdir(dir)
+  r = f()
+  ~os.chdir(back)
+  ~r
+}
+
+# Runs f with the variables set ("KEY=value"; "KEY" alone unsets it), then
+# restores them (also when f fails). Commands started inside inherit them.
+pub def with_env(vars: [Str], f: () -> ~Unit) -> ~Unit {
+  keys: [Str] = []
+  old: [Str?] = []
+  for kv in vars {
+    i = strings.index(kv, "=")
+    k = i < 0 ? kv : kv[0...i]
+    keys << k
+    old << os.getenv(k)
+    if i < 0 {
+      ~os.unsetenv(k)
+    } else {
+      ~os.setenv(k, kv[i + 1...kv.size])
+    }
+  }
+  r = f()
+  j = 0
+  while j < keys.size {
+    if v = old[j] {
+      ~os.setenv(keys[j], v)
+    } else {
+      ~os.unsetenv(keys[j])
+    }
+    j += 1
+  }
+  ~r
+}
+
+# An environment variable, or `default` if it's unset or empty.
+pub def env(k: Str, default: Str) -> Str {
+  v = os.getenv(k) || ""
+  v == "" ? default : v
+}
+
+# The executable `name` would run (searching $PATH), or none.
+pub def which(name: Str) -> Str? {
+  r = exec.look_path(name)
+  return none if !r.ok?
+  r.unwrap
+}
+
+pub def home -> Str { os.getenv("HOME") || "/" }
+
+# ------------------------------------------------------------------ scripts
+
+# The script's arguments (without the program).
+pub def args -> [Str] {
+  a = os.args
+  a.size > 0 ? a[1...a.size] : a
+}
+
+# All of standard input as text.
+pub def stdin_text -> ~Str {
+  ~os.read_file_string("/dev/stdin")
+}
+
+# Standard input's lines.
+pub def stdin_lines -> ~[Str] {
+  lines_of(~stdin_text)
+}
+
+# Text split into lines (without the newlines; a final newline doesn't make
+# an empty last line).
+pub def lines_of(s: Str) -> [Str] {
+  return [] if s.size == 0
+  t = strings.has_suffix(s, "\n") ? s[0...s.size - 1] : s
+  t.split("\n")
+}
+
+# Prints to standard error.
+pub def warn(msg: Str) {
+  e = os.stderr
+  e.write_string!(msg + "\n")
+}
+
+# Prints msg to standard error and exits with status 1 (Ruby's abort).
+pub def abort(msg: Str) {
+  warn(msg)
+  os.exit(1)
+}
+
+# Exits now with this status.
+pub def exit(code: Int) {
+  os.exit(code)
+}
+
+# How long f takes (it still fails if f does).
+pub def timed(f: () -> ~Unit) -> ~time.Duration {
+  t0 = alx_mono_ns
+  ~f()
+  time.duration(alx_mono_ns - t0)
+}
+
+# Runs f on every element, at most `limit` at a time (each in a task). Every
+# element is attempted; if any fail, the first failure in element order is
+# returned after all have finished. As in a `spawn` body, what f captures is
+# copied into the tasks: send results back over a channel, not by pushing to
+# a captured variable.
+pub def parallel[T](xs: [T], limit: Int, f: (T) -> ~Unit) -> ~Unit {
+  return if xs.size == 0
+  jobs = Chan[(Int, T)].new(xs.size)
+  i = 0
+  while i < xs.size {
+    jobs << (i, xs[i])
+    i += 1
+  }
+  jobs.close
+  n = limit < 1 ? 1 : (limit > xs.size ? xs.size : limit)
+  errs = Chan[(Int, Str)].new(xs.size)
+  workers = (1..n).map { |w|
+    g = f.dup
+    spawn {
+      for job in jobs {
+        r = g(job[1])
+        if e = r.err {
+          errs << (job[0], e.message)
+        }
+      }
+      w
+    }
+  }.to_a
+  for t in workers { t.wait }
+  errs.close
+  first = -1
+  msg = ""
+  for e in errs {
+    if first < 0 || e[0] < first {
+      first = e[0]
+      msg = e[1]
+    }
+  }
+  fail msg if first >= 0
+}
+
+# Text in color for a terminal: these return s unchanged when standard
+# output isn't a terminal or NO_COLOR is set.
+pub def red(s: Str) -> Str { ansi("31", s) }
+pub def green(s: Str) -> Str { ansi("32", s) }
+pub def yellow(s: Str) -> Str { ansi("33", s) }
+pub def blue(s: Str) -> Str { ansi("34", s) }
+pub def bold(s: Str) -> Str { ansi("1", s) }
+pub def dim(s: Str) -> Str { ansi("2", s) }
+
+def ansi(code: Str, s: Str) -> Str {
+  return s if !c_isatty(1) || (os.getenv("NO_COLOR") || "") != ""
+  "\e[#{code}m#{s}\e[0m"
+}

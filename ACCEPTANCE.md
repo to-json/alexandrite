@@ -6,12 +6,12 @@ Problems are taken from the first few dozen, whose answers are widely published.
 
 ## The harness
 
-Run it with `python3 acceptance/run.py` (`-k pe010` filters cases). It builds `alx` in release mode, runs every check below, and exits 0 only if all of them pass.
+Run it with `alx run acceptance/run.alx` (`-k pe010` filters cases). It builds `alx` in release mode, runs every check below, and exits 0 only if all of them pass.
 
 
 ```
 acceptance/
-  run.py                 # runs every case in both modes, checks output and budgets
+  run.alx                # runs every case in both modes, checks output and budgets
   cases/
     pe001.alx
     pe001.expected       # exact stdout
@@ -19,7 +19,7 @@ acceptance/
     fixtures/names.txt   # data files some problems need
 ```
 
-For each case, `run.py`:
+For each case, `run.alx`:
 1. **`alx run case.alx`**: a debug build, then runs it. (v0: the whole program is JIT-compiled in memory with Cranelift and run in-process; `alx build` without `--release` still produces a clang -O0 binary.) Checks stdout, and checks the **edit-to-answer** time (build plus run) against the budget.
 2. **`alx run --release case.alx`**: release build, then runs it. Checks stdout, and checks the **run time** against a hand-written Rust reference (`refs/peNNN.rs`, `rustc -O`).
 3. **Safety net:** builds the case with ASan/UBSan, and checks the Rust backend's output with rustc (the oracle). Both must be clean. A rustc rejection is a bug in our checker (DESIGN.md, Architecture).

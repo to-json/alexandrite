@@ -1,0 +1,91 @@
+import "os"
+import "strings"
+
+def t(s: Str) -> Str { strings.trim_space(s) }
+
+test "output, args stay whole" {
+  assert_eq t(command("printf", ["%s|", "a b", "c"]).output.unwrap), "a b|c|"
+}
+
+test "capture: status, both streams, resources" {
+  c = command("sh", ["-c", "echo out; echo err >&2; exit 3"]).capture.unwrap
+  assert_eq t(c.stdout), "out"
+  assert_eq t(c.stderr), "err"
+  assert_eq c.state.exit_code, 3
+  assert !c.state.success
+  assert_eq c.state.to_s, "exit status 3"
+  assert c.state.max_rss > 0
+  assert c.state.wall_ns > 0
+}
+
+test "a nonzero exit fails, with stderr in the message" {
+  r = command("sh", ["-c", "echo bad >&2; exit 4"]).output
+  assert r.err?
+  assert_eq r.err.unwrap.message, "`sh -c 'echo bad >&2; exit 4'`: exit status 4: bad"
+}
+
+test "check = false returns the status" {
+  c = command("sh", ["-c", "exit 5"])
+  c.check = false
+  assert_eq c.run.unwrap.exit_code, 5
+}
+
+test "not found" {
+  r = command("no-such-program-alx", []).run
+  assert_eq r.err.unwrap.message, "exec: \"no-such-program-alx\": executable file not found in $PATH"
+}
+
+test "dir, env, stdin" {
+  c = command("pwd", [])
+  c.dir = "/"
+  assert_eq t(c.output.unwrap), "/"
+  e = command("sh", ["-c", "echo $ALX_T"])
+  e.env = ["ALX_T=yes"]
+  assert_eq t(e.output.unwrap), "yes"
+  w = command("wc", ["-c"])
+  w.stdin = strings.repeat("x", 100000)
+  assert_eq t(w.output.unwrap), "100000"
+}
+
+test "large outputs on both streams don't deadlock" {
+  c = command("sh", ["-c", "head -c 300000 /dev/zero; head -c 200000 /dev/zero >&2"]).capture.unwrap
+  assert_eq c.stdout.size, 300000
+  assert_eq c.stderr.size, 200000
+}
+
+test "signals" {
+  c = command("sh", ["-c", "kill -9 $$"]).capture.unwrap
+  assert_eq c.state.signal, 9
+  assert_eq c.state.exit_code, -1
+  assert_eq c.state.to_s, "signal: killed"
+}
+
+test "pipelines: pipe, pipefail, SIGPIPE" {
+  p = command("printf", ["a\nb\nc\n"]).pipe(command("grep", ["-c", "."]))
+  assert_eq t(p.output.unwrap), "3"
+  assert_eq p.to_s, "printf 'a\nb\nc\n' | grep -c ."
+  f = command("false", []).pipe(command("cat", []))
+  assert !f.capture.unwrap.success
+  y = command("yes", []).pipe(command("head", ["-n", "1"]))
+  assert_eq t(y.output.unwrap), "y"
+}
+
+test "from_literal: stages and redirects in order" {
+  d = os.mkdir_temp("", "alx-exec-test-*").unwrap
+  # `sh -c '...' > both.txt 2>&1`
+  c = from_literal([["sh"], ["-c"], ["echo out; echo err >&2"], [""], ["both.txt"], [""]], [0, 0, 0, 3, 0, 7])
+  c.dir = d
+  assert_eq c.to_s, "sh -c 'echo out; echo err >&2' > both.txt 2>&1"
+  c.run.unwrap
+  assert_eq os.read_file_string(d + "/both.txt").unwrap, "out\nerr\n"
+  # `wc -l < both.txt | tr -d ' '` with #{*xs} splicing ["-l"]
+  r = from_literal([["wc"], ["-l"], [""], ["both.txt"], [""], ["tr"], ["-d", " "]], [0, 10, 2, 0, 1, 0, 10])
+  r.dir = d
+  assert_eq t(r.output.unwrap), "2"
+  os.remove_all(d).unwrap
+}
+
+test "look_path" {
+  assert strings.has_suffix(look_path("sh").unwrap, "/sh")
+  assert look_path("no-such-program-alx").err?
+}

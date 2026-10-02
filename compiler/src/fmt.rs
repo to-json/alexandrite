@@ -6,7 +6,7 @@
 //! lines. The result is re-lexed and compared with the input's tokens, so a
 //! formatter bug can never silently change meaning.
 
-use crate::lexer::{lex, IPiece, Kw, Tok, Token};
+use crate::lexer::{lex, CmdPart, IPiece, Kw, Tok, Token};
 use std::path::{Path, PathBuf};
 
 enum Line {
@@ -46,7 +46,7 @@ fn op(t: &Tok) -> Option<&'static str> {
 
 fn value_end(t: &Tok) -> bool {
     match t {
-        Tok::Ident(_) | Tok::Const(_) | Tok::Int(_) | Tok::BigInt(_) | Tok::Float(..) | Tok::Str(_) | Tok::Interp(_) | Tok::Sym(_) => true,
+        Tok::Ident(_) | Tok::Const(_) | Tok::Int(_) | Tok::BigInt(_) | Tok::Float(..) | Tok::Str(_) | Tok::Interp(_) | Tok::Cmd(_) | Tok::Sym(_) => true,
         Tok::Kw(k) => matches!(k, Kw::True | Kw::False | Kw::Nil | Kw::None),
         Tok::Op(o) => matches!(*o, ")" | "]" | "}"),
         _ => false,
@@ -54,7 +54,7 @@ fn value_end(t: &Tok) -> bool {
 }
 
 fn wordish(t: &Tok) -> bool {
-    matches!(t, Tok::Ident(_) | Tok::Const(_) | Tok::Int(_) | Tok::BigInt(_) | Tok::Float(..) | Tok::Str(_) | Tok::Interp(_) | Tok::Sym(_) | Tok::Kw(_))
+    matches!(t, Tok::Ident(_) | Tok::Const(_) | Tok::Int(_) | Tok::BigInt(_) | Tok::Float(..) | Tok::Str(_) | Tok::Interp(_) | Tok::Cmd(_) | Tok::Sym(_) | Tok::Kw(_))
 }
 
 const ALWAYS_BIN: &[&str] = &[
@@ -407,6 +407,20 @@ pub fn norm_tokens(src: &str) -> Result<Vec<Tok>, String> {
     for t in toks {
         let tok = match t.tok {
             Tok::Interp(ps) => Tok::Interp(ps.into_iter().map(|p| if let IPiece::Code(s, _) = p { IPiece::Code(s, 0) } else { p }).collect()),
+            Tok::Cmd(ps) => {
+                let z = crate::diag::Span { file: 0, lo: 0, hi: 0 };
+                let code = |p: IPiece| if let IPiece::Code(s, _) = p { IPiece::Code(s, 0) } else { p };
+                Tok::Cmd(
+                    ps.into_iter()
+                        .map(|p| match p {
+                            CmdPart::Word(w, _) => CmdPart::Word(w.into_iter().map(code).collect(), z),
+                            CmdPart::Splice(c, _, _) => CmdPart::Splice(c, 0, z),
+                            CmdPart::Op(k, _) => CmdPart::Op(k, z),
+                            CmdPart::Bad(m, n, _) => CmdPart::Bad(m, n, z),
+                        })
+                        .collect(),
+                )
+            }
             o => o,
         };
         if tok == Tok::Newline && (out.is_empty() || out.last() == Some(&Tok::Newline)) {

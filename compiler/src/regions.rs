@@ -95,7 +95,7 @@ pub fn allocates(e: &TExpr, promote: bool) -> bool {
     match &e.kind {
         TK::Array(_) | TK::Format(..) | TK::Call(..) => true,
         // Strings concatenate; Ints are bignums in promote mode.
-        TK::Bin(..) | TK::Neg(_) => e.ty == Ty::Str || (promote && e.ty == Ty::Int),
+        TK::Bin(..) | TK::Neg(_) => matches!(e.ty, Ty::Str | Ty::Array(_)) || (promote && e.ty == Ty::Int),
         TK::M(m, ..) => !matches!(
             m,
             // Scalars, reads, and terminals that produce an element or a number
@@ -319,11 +319,13 @@ impl<'a> Graph<'a> {
                 }
                 // A task handle doesn't share its captures' storage (they
                 // went to the task, through Global).
-                // A copy of a flat slice or map is fresh storage.
+                // A copy of a flat slice or map is fresh storage, and so is a
+                // function value's (its captures are copied deeply).
                 let flat_copy = *m == M::Dup
                     && match &e.ty {
                         Ty::Array(t) => !has_storage(t),
                         Ty::Map(k, t) => !has_storage(k) && !has_storage(t),
+                        Ty::Fn(..) => true,
                         _ => false,
                     };
                 if !matches!(m, M::Spawn | M::Lock) && !flat_copy {

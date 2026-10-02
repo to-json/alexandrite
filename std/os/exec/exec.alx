@@ -1,0 +1,588 @@
+# Package exec: Go's os/exec — run other programs — plus pipelines and
+# redirects, so scripts don't need a shell.
+#
+#   c = exec.command("go", ["build", "-o", "app", "."])
+#   c.dir = "/src/app"                     # Go: cmd.Dir
+#   c.env = os.environ + ["CGO_ENABLED=0"] # Go: cmd.Env (none: inherit ours)
+#   out = c.~output                        # stdout; fails on a nonzero exit
+#
+# The same, as a command literal (backticks; each #{} is one argument, never
+# split or re-parsed, so there is nothing to quote):
+#
+#   out = `go build -o #{name} .`.~output
+#   n = `cat #{f} | grep -c error`.~output
+#   `make 2>&1 > build.log`.~run
+#
+# A literal understands words, '...' and "..." quoting, `|` and the redirects
+# `< f`, `> f`, `>> f`, `2> f`, `2>> f`, `&> f`, `2>&1` and `>&2` (applied left
+# to right, as in sh). There is no globbing, no variables and no `&&` / `;`:
+# that is what the surrounding program is for. Relative redirect paths are
+# relative to `dir`.
+#
+# A Cmd is a plain value describing what to run; running it doesn't change
+# it, so one Cmd can run any number of times.
+#
+#   run              Go's Run. Output goes nowhere (Go) unless `passthrough`
+#                    (a literal sets it: `make`.~run shows make's output).
+#   output           Go's Output: stdout as a Str (Go: []byte)
+#   combined_output  Go's CombinedOutput: stdout and stderr interleaved
+#   capture          (not in Go) stdout, stderr and the ProcessState, without
+#                    failing on a nonzero exit: for harnesses and tools
+#   exec             replaces this process (Go's syscall.Exec); one stage only
+#   pipe(other)      (not in Go) this command's stdout into other's stdin
+#
+# A nonzero exit fails with ExecError.Exit (like `set -e`). With the
+# environment variable ALX_EXEC_NOFAIL=1, run/output/combined_output return
+# normally instead and the status is the caller's to check; `c.check = false`
+# does the same for one command. A pipeline fails if any stage does
+# (`pipefail`), except an earlier stage killed by SIGPIPE (`yes | head`).
+#
+# stdin is the null device, or `c.stdin = "text"` (Go: cmd.Stdin = strings.
+# NewReader("text")). Failures are ExecError: NotFound (no such program),
+# Start (spawn failed: errno), Redirect (a redirect's file can't be opened),
+# Exit (ran and exited nonzero or was killed; Go's ExitError, with the
+# ProcessState and the stderr text).
+#
+# A ProcessState has what Go's has, plus measurements taken by the wait:
+# `exit_code` (-1 if killed), `signal` (0 if not killed), `success`,
+# `user_ns` / `sys_ns` (CPU time), `max_rss` (peak resident set, bytes) and
+# `wall_ns` (spawn to exit).
+#
+# `look_path(name)` is Go's LookPath: the file `name` names in $PATH.
+#
+# Differences from Go: no Start/Wait split, no pipes to a running process,
+# no Context / timeouts, no Process.Kill. Waiting blocks the calling thread.
+
+import "os"
+import "path"
+import "strconv"
+import "strings"
+
+extern def alx_sys_spawn(argv: [Byte], argc: Int, env: [Byte], envc: Int, dir: Str, fd0: Int, fd1: Int, fd2: Int) -> Int
+extern def alx_sys_exec(argv: [Byte], argc: Int, env: [Byte], envc: Int, dir: Str, fd0: Int, fd1: Int, fd2: Int) -> Int
+extern def alx_sys_wait(pid: Int, out: [Byte]) -> Int
+extern def alx_sys_pipe(out: [Byte], nonblock: Int) -> Int
+extern def alx_sys_poll2(a: Int, b: Int) -> Int
+extern def alx_sys_open(p: Str, flags: I32, mode: I32) -> I32
+extern def alx_sys_const(name: Str) -> Int
+extern def alx_mono_ns -> Int
+extern def c_read(fd: I32, buf: [Byte], n: Int) -> Int = "read"
+extern def c_write(fd: I32, buf: [Byte], n: Int) -> Int = "write"
+extern def c_close(fd: I32) -> I32 = "close"
+
+# How a finished process ended, and what it used.
+pub struct ProcessState {
+  pid: Int
+  exit_code: Int # -1 if a signal killed it
+  signal: Int    # the signal that killed it, 0 if it exited
+  user_ns: Int   # CPU time in user mode
+  sys_ns: Int    # CPU time in the kernel
+  max_rss: Int   # peak resident set size, bytes
+  wall_ns: Int   # from spawn to exit
+
+  pub def success -> Bool { exit_code == 0 }
+  pub def exited -> Bool { signal == 0 }
+
+  # Go's ProcessState.String: "exit status 1", "signal: killed".
+  pub def to_s -> Str {
+    return "exit status #{exit_code}" if signal == 0
+    "signal: #{signal_name(signal)}"
+  }
+}
+
+# A run that exited nonzero or was killed (Go's ExitError).
+pub struct ExitInfo {
+  cmd: Str
+  state: ProcessState
+  stderr: Str
+}
+
+pub error ExecError {
+  NotFound(name: Str)
+  Start(name: Str, code: Int)
+  Redirect(file: Str, code: Int)
+  Exit(info: ExitInfo)
+
+  def message -> Str {
+    case self {
+      NotFound(n) => "exec: #{strconv.quote(n)}: executable file not found in $PATH"
+      Start(n, code) => "fork/exec #{n}: #{os.errno_message(code)}"
+      Redirect(f, code) => "open #{f}: #{os.errno_message(code)}"
+      Exit(info) => exit_message(info)
+    }
+  }
+}
+
+def exit_message(info: ExitInfo) -> Str {
+  m = "`#{info.cmd}`: #{info.state.to_s}"
+  err = strings.trim_space(info.stderr)
+  return m if err.size == 0
+  "#{m}: #{err}"
+}
+
+# What `capture` returns: the output and how the process ended (for a
+# pipeline, `state` decides the status and `states` has every stage's).
+pub struct Captured {
+  stdout: Str
+  stderr: Str
+  state: ProcessState
+  states: [ProcessState]
+
+  pub def success -> Bool { state.success }
+}
+
+# A redirect of one stage, applied in order: kind is one of the R_* below.
+pub struct Redir {
+  kind: Int
+  file: Str
+}
+
+pub R_IN = 0         # < file
+pub R_OUT = 1        # > file
+pub R_APPEND = 2     # >> file
+pub R_ERR = 3        # 2> file
+pub R_ERR_APPEND = 4 # 2>> file
+pub R_ERR_TO_OUT = 5 # 2>&1
+pub R_OUT_TO_ERR = 6 # >&2
+pub R_BOTH = 7       # &> file
+
+# One program of a pipeline: its argv and its redirects.
+pub struct Stage {
+  args: [Str]
+  redirs: [Redir]
+}
+
+# What to run: one or more stages (`a | b`). `args` of the first stage are
+# Go's cmd.Args (args[0] is the program, looked up in $PATH).
+pub struct Cmd {
+  stages: [Stage]
+  dir: Str          # "" = this process's directory
+  env: [Str]?       # "KEY=value" entries; none = this process's environment
+  stdin: Str?       # none = the null device
+  passthrough: Bool # run: stdout/stderr to ours instead of the null device
+  check: Bool       # fail on a nonzero exit (default: unless ALX_EXEC_NOFAIL=1)
+
+  # Go's cmd.Path: the first program's name.
+  pub def path -> Str { stages[0].args[0] }
+  # Go's cmd.Args, of the first stage.
+  pub def args -> [Str] { stages[0].args }
+
+  # Runs to completion (Go's Run). Output is discarded unless `passthrough`.
+  pub def run -> ~ProcessState {
+    c = ~go(passthrough ? 2 : 0)
+    ~checked(c, "")
+    c.state
+  }
+
+  # Its standard output (Go's Output). A nonzero exit is ExecError.Exit with
+  # the stderr text.
+  pub def output -> ~Str {
+    c = ~go(1)
+    ~checked(c, c.stderr)
+    c.stdout
+  }
+
+  # Standard output and error, interleaved as written (Go's CombinedOutput).
+  pub def combined_output -> ~Str {
+    c = ~go(3)
+    ~checked(c, c.stdout)
+    c.stdout
+  }
+
+  # Runs it and returns both outputs and the ProcessState; fails only if it
+  # can't be started (a nonzero exit is in `state`).
+  pub def capture -> ~Captured {
+    self.~go(1)
+  }
+
+  # This command's stdout feeding `to`'s stdin (`a | b`). The result keeps
+  # this command's dir, env, stdin and flags.
+  pub def pipe(to: Cmd) -> Cmd {
+    r = self
+    r.stages = stages + to.stages
+    r
+  }
+
+  # Replaces this process with the command (Go's syscall.Exec, applying dir,
+  # env and redirects). Returns only if that fails.
+  pub def exec -> ~Unit {
+    fail ExecError.Start("exec", alx_sys_const("EINVAL")) if stages.size != 1
+    st = stages[0]
+    fd0 = ~stdin_fd
+    fds = ~apply_redirs(st.redirs, [fd0, -1, -1])
+    r = alx_sys_exec(argv_blob(prog_args(st.args)), st.args.size, env_blob, env_count, dir, fds[0], fds[1], fds[2])
+    fail ExecError.NotFound(st.args[0]) if r == -alx_sys_const("ENOENT")
+    fail ExecError.Start(st.args[0], -r)
+  }
+
+  # The command line, for messages: `go build -o app .` (Go's Cmd.String).
+  pub def to_s -> Str {
+    parts: [Str] = []
+    for st in stages {
+      words: [Str] = []
+      for a in st.args { words << show_word(a) }
+      for r in st.redirs { words << show_redir(r) }
+      parts << words.join(" ")
+    }
+    parts.join(" | ")
+  }
+
+  def checked(c: Captured, err: Str) -> ~Unit {
+    fail ExecError.Exit(ExitInfo.new(cmd: to_s, state: c.state, stderr: err)) if check && !c.state.success
+  }
+
+  # Runs every stage. mode: 0 stdout/stderr discarded, 1 both captured,
+  # 2 both ours, 3 captured together.
+  def go(mode: Int) -> ~Captured {
+    n = stages.size
+    # The capture pipes (read ends non-blocking, for the drain loop).
+    cap_out = (-1, -1)
+    cap_err = (-1, -1)
+    if mode == 1 || mode == 3 {
+      cap_out = ~os_pipe(true)
+      cap_err = mode == 1 ? ~os_pipe(true) : cap_out
+    }
+    sink = mode == 0 ? ~open_null(1) : -1
+    out_fd = mode == 0 ? sink : (mode == 2 ? -1 : cap_out[1])
+    err_fd = mode == 0 ? sink : (mode == 2 ? -1 : cap_err[1])
+    pids: [Int] = []
+    t0s: [Int] = []
+    first_in = ~stdin_fd
+    prev_read = first_in
+    to_close: [Int] = [first_in]
+    to_close << sink if sink >= 0
+    failure: Error? = none
+    i = 0
+    while i < n {
+      st = stages[i]
+      link = (-1, -1)
+      if i + 1 < n {
+        r = os_pipe(false)
+        if !r.ok? {
+          failure = r.err
+          break
+        }
+        link = r.unwrap
+        to_close << link[0]
+        to_close << link[1]
+      }
+      stage_out = i + 1 < n ? link[1] : out_fd
+      fds_r = apply_redirs(st.redirs, [prev_read, stage_out, err_fd])
+      if !fds_r.ok? {
+        failure = fds_r.err
+        break
+      }
+      fds = fds_r.unwrap
+      for k in 3...fds.size { to_close << fds[k] }
+      t0 = alx_mono_ns
+      pid = alx_sys_spawn(argv_blob(prog_args(st.args)), st.args.size, env_blob, env_count, dir, fds[0], fds[1], fds[2])
+      if pid < 0 {
+        failure = pid == -alx_sys_const("ENOENT") ? ExecError.NotFound(st.args[0]) : ExecError.Start(st.args[0], -pid)
+        break
+      }
+      pids << pid
+      t0s << t0
+      prev_read = link[0]
+      i += 1
+    }
+    # The parent keeps only the capture read ends.
+    for fd in to_close { close_fd(fd) if fd >= 0 }
+    close_fd(cap_out[1]) if cap_out[1] >= 0
+    close_fd(cap_err[1]) if mode == 1 && cap_err[1] >= 0
+    got = drain(cap_out[0], mode == 1 ? cap_err[0] : -1)
+    states: [ProcessState] = []
+    j = 0
+    while j < pids.size {
+      s = ~wait(pids[j], t0s[j])
+      states << s
+      j += 1
+    }
+    if f = failure {
+      fail f
+    }
+    Captured.new(stdout: Str.from_bytes(got[0]), stderr: Str.from_bytes(got[1]), state: deciding(states), states: states)
+  }
+
+  # The child's stdin: the null device, or a pipe already holding the text
+  # (written by a task while the child reads, so any size works).
+  def stdin_fd -> ~Int {
+    if s = stdin {
+      p = ~os_pipe(false)
+      w = p[1]
+      data = s.bytes.to_a
+      spawn {
+        off = 0
+        while off < data.size {
+          n = c_write(w.to_i32, data[off...data.size], data.size - off)
+          break if n < 0
+          off += n
+        }
+        close_fd(w)
+      }
+      return p[0]
+    }
+    ~open_null(0)
+  }
+
+  # A relative program path with a slash is relative to `dir` (as in Go).
+  def prog_args(a: [Str]) -> [Str] {
+    p = a[0]
+    return a if dir == "" || !strings.contains(p, "/") || strings.has_prefix(p, "/")
+    [path.join([dir, p])] + a[1...a.size]
+  }
+
+  def env_count -> Int {
+    if e = env {
+      return e.size
+    }
+    -1
+  }
+
+  def env_blob -> [Byte] {
+    b: [Byte] = []
+    if e = env {
+      b = argv_blob(e)
+    }
+    b << 0
+    b
+  }
+
+  # fds [stdin, stdout, stderr] after the redirects, in order; files opened
+  # are appended (for the caller to close).
+  def apply_redirs(rs: [Redir], start: [Int]) -> ~[Int] {
+    fds = start
+    opened: [Int] = []
+    for r in rs {
+      k = r.kind
+      if k == R_ERR_TO_OUT {
+        fds[2] = fds[1]
+      } else if k == R_OUT_TO_ERR {
+        fds[1] = fds[2]
+      } else {
+        fd = open_redir(r)
+        if !fd.ok? {
+          for o in opened { close_fd(o) }
+        }
+        f = ~fd
+        opened << f
+        fds[0] = f if k == R_IN
+        fds[1] = f if k == R_OUT || k == R_APPEND || k == R_BOTH
+        fds[2] = f if k == R_ERR || k == R_ERR_APPEND || k == R_BOTH
+      }
+    }
+    fds + opened
+  }
+
+  def open_redir(r: Redir) -> ~Int {
+    p = r.file
+    p = path.join([dir, p]) if dir != "" && !strings.has_prefix(p, "/")
+    k = r.kind
+    flags = alx_sys_const("O_CLOEXEC")
+    if k == R_IN {
+      flags |= alx_sys_const("O_RDONLY")
+    } else {
+      flags |= alx_sys_const("O_WRONLY") | alx_sys_const("O_CREAT")
+      flags |= (k == R_APPEND || k == R_ERR_APPEND) ? alx_sys_const("O_APPEND") : alx_sys_const("O_TRUNC")
+    }
+    fd = alx_sys_open(p, flags.to_i32, 0o644)
+    fail ExecError.Redirect(r.file, C.errno) if fd < 0
+    fd.to_i
+  }
+}
+
+# A Cmd for `name args...` (Go's Command).
+pub def command(name: Str, args: [Str]) -> Cmd {
+  Cmd.new(stages: [Stage.new(args: [name] + args, redirs: [])], dir: "", env: none, stdin: none, passthrough: false, check: default_check)
+}
+
+# The Cmd a command literal builds, from the parser's split: one group per
+# word ([w]), per `#{*xs}` (xs, kind 10) and per operator ([""], kind: 1 `|`,
+# 2.. a redirect R_* + 2, whose file is the next group's word).
+pub def from_literal(groups: [[Str]], kinds: [Int]) -> Cmd {
+  stages: [Stage] = []
+  args: [Str] = []
+  redirs: [Redir] = []
+  i = 0
+  while i < groups.size {
+    k = kinds[i]
+    if k == 0 || k == 10 {
+      for w in groups[i] { args << w }
+    } else if k == 1 {
+      stages << Stage.new(args: args, redirs: redirs)
+      args = []
+      redirs = []
+    } else if k - 2 == R_ERR_TO_OUT || k - 2 == R_OUT_TO_ERR {
+      redirs << Redir.new(kind: k - 2, file: "")
+    } else {
+      redirs << Redir.new(kind: k - 2, file: groups[i + 1][0])
+      i += 1
+    }
+    i += 1
+  }
+  stages << Stage.new(args: args, redirs: redirs)
+  Cmd.new(stages: stages, dir: "", env: none, stdin: none, passthrough: true, check: default_check)
+}
+
+def default_check -> Bool { (os.getenv("ALX_EXEC_NOFAIL") || "") != "1" }
+
+# The path of the executable `name` would run: itself if it has a slash,
+# else the first match in $PATH (Go's LookPath).
+pub def look_path(name: Str) -> ~Str {
+  if strings.contains(name, "/") {
+    return name if executable(name)
+    fail ExecError.NotFound(name)
+  }
+  dirs = (os.getenv("PATH") || "").split(":")
+  for d in dirs {
+    p = path.join([d == "" ? "." : d, name])
+    return p if executable(p)
+  }
+  fail ExecError.NotFound(name)
+}
+
+def executable(p: Str) -> Bool {
+  r = os.stat(p)
+  if !r.ok? {
+    return false
+  }
+  info = r.unwrap
+  info.is_regular && (info.mode & 0o111) != 0
+}
+
+# The state deciding a pipeline's status: the last stage's, unless an earlier
+# one failed (not by SIGPIPE).
+def deciding(states: [ProcessState]) -> ProcessState {
+  i = 0
+  while i + 1 < states.size {
+    s = states[i]
+    return s if !s.success && s.signal != alx_sys_const("SIGPIPE")
+    i += 1
+  }
+  states[states.size - 1]
+}
+
+# Reads a and b (-1: none) to end of file: (a's bytes, b's bytes).
+def drain(a0: Int, b0: Int) -> ([Byte], [Byte]) {
+  out: [Byte] = []
+  err: [Byte] = []
+  a = a0
+  b = b0
+  buf: [Byte] = [0; 65536]
+  eagain = alx_sys_const("EAGAIN")
+  while a >= 0 || b >= 0 {
+    progress = false
+    if a >= 0 {
+      n = c_read(a.to_i32, buf, buf.size)
+      if n > 0 {
+        for x in buf[0...n] { out << x }
+        progress = true
+      } else if n == 0 || C.errno != eagain {
+        close_fd(a)
+        a = -1
+        progress = true
+      }
+    }
+    if b >= 0 {
+      n = c_read(b.to_i32, buf, buf.size)
+      if n > 0 {
+        for x in buf[0...n] { err << x }
+        progress = true
+      } else if n == 0 || C.errno != eagain {
+        close_fd(b)
+        b = -1
+        progress = true
+      }
+    }
+    alx_sys_poll2(a, b) if !progress
+  }
+  (out, err)
+}
+
+def argv_blob(xs: [Str]) -> [Byte] {
+  b: [Byte] = []
+  for a in xs {
+    for x in a.bytes { b << x }
+    b << 0
+  }
+  b
+}
+
+def show_word(w: Str) -> Str {
+  return "''" if w.size == 0
+  i = 0
+  while i < w.size {
+    c = w[i]
+    plain = (c >= 97 && c <= 122) || (c >= 65 && c <= 90) || (c >= 48 && c <= 57) || c == 45 || c == 95 || c == 46 || c == 47 || c == 61 || c == 58 || c == 44 || c == 43 || c == 64
+    return "'" + strings.replace_all(w, "'", "'\\''") + "'" if !plain
+    i += 1
+  }
+  w
+}
+
+def show_redir(r: Redir) -> Str {
+  case r.kind {
+    0 => "< #{show_word(r.file)}"
+    1 => "> #{show_word(r.file)}"
+    2 => ">> #{show_word(r.file)}"
+    3 => "2> #{show_word(r.file)}"
+    4 => "2>> #{show_word(r.file)}"
+    5 => "2>&1"
+    6 => ">&2"
+    _ => "&> #{show_word(r.file)}"
+  }
+}
+
+def signal_name(s: Int) -> Str {
+  return "bus error" if s == alx_sys_const("SIGBUS")
+  return "broken pipe" if s == alx_sys_const("SIGPIPE")
+  case s {
+    1 => "hangup"
+    2 => "interrupt"
+    3 => "quit"
+    4 => "illegal instruction"
+    6 => "abort trap"
+    9 => "killed"
+    11 => "segmentation fault"
+    15 => "terminated"
+    _ => "signal #{s}"
+  }
+}
+
+def close_fd(fd: Int) {
+  c_close(fd.to_i32)
+}
+
+# Two pipe ends: (read, write).
+def os_pipe(nonblock: Bool) -> ~(Int, Int) {
+  b: [Byte] = [0; 16]
+  r = alx_sys_pipe(b, nonblock ? 1 : 0)
+  fail ExecError.Start("pipe", -r) if r < 0
+  (get64(b, 0), get64(b, 1))
+}
+
+def open_null(mode: Int) -> ~Int {
+  fd = alx_sys_open("/dev/null", (mode | alx_sys_const("O_CLOEXEC")).to_i32, 0)
+  fail ExecError.Start("/dev/null", C.errno) if fd < 0
+  fd.to_i
+}
+
+def wait(pid: Int, t0: Int) -> ~ProcessState {
+  b: [Byte] = [0; 40]
+  r = alx_sys_wait(pid, b)
+  fail ExecError.Start("wait", -r) if r < 0
+  wall = alx_mono_ns - t0
+  killed = get64(b, 0) == 1
+  code = get64(b, 1)
+  ProcessState.new(pid: pid, exit_code: killed ? -1 : code, signal: killed ? code : 0, user_ns: get64(b, 2), sys_ns: get64(b, 3), max_rss: get64(b, 4), wall_ns: wall)
+}
+
+# The k-th native-endian (little-endian) Int of b.
+def get64(b: [Byte], k: Int) -> Int {
+  v = 0
+  i = 7
+  while i >= 0 {
+    v = (v << 8) | b[k * 8 + i].to_i
+    i -= 1
+  }
+  v
+}

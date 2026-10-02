@@ -860,10 +860,26 @@ pub fn bind_tparams(te: &TypeExpr, t: &Ty, tps: &[TParam], out: &mut HashMap<Str
     }
 }
 
+/// Whether a generic first parameter written `te` can take a receiver of type
+/// `t` for method sugar: the outer shape (slice, map, optional, function) must
+/// agree, so `xs.equal(ys)` doesn't pick `maps.equal`. A bare type parameter
+/// takes anything.
+fn sugar_shape_fits(te: &TypeExpr, t: &Ty) -> bool {
+    match te {
+        TypeExpr::Array(..) => matches!(t, Ty::Array(_)),
+        TypeExpr::Fixed(..) => matches!(t, Ty::Fixed(..)),
+        TypeExpr::Opt(..) => matches!(t, Ty::Opt(_)),
+        TypeExpr::Fn(..) => matches!(t, Ty::Fn(..)),
+        TypeExpr::App(n, ..) if n == "Map" => matches!(t, Ty::Map(..)),
+        TypeExpr::App(n, ..) if n == "Chan" => matches!(t, Ty::Chan(_)),
+        _ => true,
+    }
+}
+
 pub fn type_from(t: &TypeExpr, structs: &Structs, consts: &Consts) -> R<Ty> {
     let type_from = |t| type_from(t, structs, consts);
     match t {
-        TypeExpr::Named(n, sp) if !matches!(n.as_str(), "Float" | "Bool" | "Str" | "Error") && IntKind::from_name(n).is_none() && !structs.contains_key(n) => {
+        TypeExpr::Named(n, sp) if !matches!(n.as_str(), "Float" | "Bool" | "Str" | "Error" | "Unit") && IntKind::from_name(n).is_none() && !structs.contains_key(n) => {
             let q = resolve_name(n, *sp, &|q| structs.contains_key(q) || generic(q).is_some())?;
             if generic(&q).is_some() && !structs.contains_key(&q) {
                 return Err(Diag::new(*sp, format!("`{n}` is generic: give its type arguments (`{n}[...]`)")));
@@ -875,6 +891,7 @@ pub fn type_from(t: &TypeExpr, structs: &Structs, consts: &Consts) -> R<Ty> {
             "Bool" => Ok(Ty::Bool),
             "Str" => Ok(Ty::Str),
             "Error" => Ok(Ty::Error),
+            "Unit" => Ok(Ty::Unit),
             _ => match IntKind::from_name(n) {
                 Some(k) => Ok(Ty::of_kind(k)),
                 None => structs.get(n).cloned().ok_or_else(|| Diag::new(*sp, format!("unknown type `{n}`"))),
@@ -984,7 +1001,7 @@ const SEQ_METHODS: &[&str] = &[
     "select", "filter", "reject", "find", "map", "flat_map", "take_while", "drop", "take", "each_with_index", "lazy", "sum", "max", "min", "max_by", "min_by",
     "first", "to_a", "each", "reduce", "inject", "all?", "any?", "count", "include?", "sort", "size", "length",
 ];
-const ARRAY_EXTRA: &[&str] = &["each_index", "each_cons", "pmap", "last", "reverse", "<<", "dup"];
+const ARRAY_EXTRA: &[&str] = &["each_index", "each_cons", "pmap", "last", "<<", "dup"];
 const INT_METHODS: &[&str] = &["to_s", "to_f", "to_i", "to_u8", "to_i32", "to_u32", "to_u64", "as_u8", "as_i32", "as_u32", "as_u64", "even?", "odd?", "digits", "step"];
 const FLOAT_METHODS: &[&str] = &["to_s", "to_f", "to_i", "abs", "sqrt"];
 const STR_METHODS: &[&str] = &["chars", "bytes", "runes", "size", "length", "reverse", "delete", "split", "to_i", "to_s"];
@@ -4024,7 +4041,7 @@ impl<'w, 'a> FnCx<'w, 'a> {
             }
             let fits = match d.params.first().and_then(|p| p.ty.as_ref()) {
                 None => false,
-                Some(_) if !d.tparams.is_empty() => true,
+                Some(te) if !d.tparams.is_empty() => sugar_shape_fits(te, t),
                 Some(te) => type_from(te, &self.w.structs, &self.w.consts).is_ok_and(|pt| pt == *t),
             };
             if fits {
@@ -4474,7 +4491,6 @@ impl<'w, 'a> FnCx<'w, 'a> {
                 }
                 "size" | "length" => return Ok(mk_m(self, M::Size, recv, vec![], None, Ty::Int)),
                 "last" => return Ok(mk_m(self, M::Last, recv, vec![], None, el)),
-                "reverse" => return Ok(mk_m(self, M::Reverse, recv, vec![], None, Ty::arr(el))),
                 "each_index" => return Ok(mk_m(self, M::EachIndex, recv, vec![], None, Ty::seq(Ty::Int, false))),
                 "each_cons" => {
                     let a = argv(self)?;
@@ -4636,7 +4652,7 @@ impl<'w, 'a> FnCx<'w, 'a> {
                     }
                     return Ok(mk_m(self, M::Sort, recv, vec![], None, Ty::arr(el)));
                 }
-                "each_index" | "each_cons" | "pmap" | "last" | "reverse" => {
+                "each_index" | "each_cons" | "pmap" | "last" => {
                     // Array-only: materialize, then retry.
                     let arr = self.materialize(recv);
                     if matches!(self.resolve(&arr.ty), Ty::Array(_)) {

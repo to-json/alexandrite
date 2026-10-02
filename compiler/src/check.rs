@@ -4346,6 +4346,12 @@ impl<'w, 'a> FnCx<'w, 'a> {
             }
             return Err(Diag::new(name_span, format!("no method `{name}` on {en}")));
         }
+        // math block: libm calls (`x.__sin`, `x.__pow(y)`) and bit casts, for std/math.
+        if rt == Ty::Float || rt == Ty::IntK(IntKind::U64) {
+            if let Some(r) = self.math_intrinsic(&rt, &recv, name, name_span, args, sp) {
+                return r;
+            }
+        }
         // Float methods
         if rt == Ty::Float {
             match name {
@@ -4810,5 +4816,36 @@ fn is_fallible_expr(e: &TExpr, cx: &FnCx) -> bool {
         TK::Bin(op, ..) => op.is_arith(),
         TK::Neg(_) => true,
         _ => false,
+    }
+}
+
+// ---- math block: intrinsics behind std/math ----
+impl<'w, 'a> FnCx<'w, 'a> {
+    /// `x.__sin`, `x.__pow(y)`, `x.__fma(y, z)` (libm on Floats), `x.__bits`
+    /// (Float -> U64) and `u.__from_bits` (U64 -> Float). None: not one of these.
+    fn math_intrinsic(&mut self, rt: &Ty, recv: &TExpr, name: &str, name_span: Span, args: &[Expr], sp: Span) -> Option<R<TExpr>> {
+        let n = name.strip_prefix("__")?;
+        let (m, ty, arity) = match (rt, n) {
+            (Ty::Float, "bits") => (M::FloatBits, Ty::IntK(IntKind::U64), 1),
+            (Ty::IntK(IntKind::U64), "from_bits") => (M::FloatFromBits, Ty::Float, 1),
+            (Ty::Float, _) => {
+                let f = crate::lir::MathFn::by_name(n)?;
+                (M::Math(f), Ty::Float, f.arity())
+            }
+            _ => return None,
+        };
+        Some((|| {
+            if args.len() + 1 != arity {
+                return Err(Diag::new(name_span, format!("`{name}` takes {} argument(s), got {}", arity - 1, args.len())));
+            }
+            let mut targs = vec![];
+            for a in args {
+                let v = self.value(a)?;
+                let v = self.coerce(v, &Ty::Float)?;
+                self.expect(&v.ty, &Ty::Float, v.span, name)?;
+                targs.push(v);
+            }
+            Ok(self.mk(TK::M(m, Some(Box::new(recv.clone())), targs, None), ty, sp))
+        })())
     }
 }

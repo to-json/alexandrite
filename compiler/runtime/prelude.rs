@@ -427,6 +427,59 @@ mod rt {
         };
         Str::lit(s.as_bytes())
     }
+    // math block: libm for the std/math intrinsics (the same C library the C backend calls).
+    mod cm {
+    unsafe extern "C" {
+        pub fn sin(x: f64) -> f64; pub fn cos(x: f64) -> f64; pub fn tan(x: f64) -> f64;
+        pub fn asin(x: f64) -> f64; pub fn acos(x: f64) -> f64; pub fn atan(x: f64) -> f64; pub fn atan2(y: f64, x: f64) -> f64;
+        pub fn sinh(x: f64) -> f64; pub fn cosh(x: f64) -> f64; pub fn tanh(x: f64) -> f64;
+        pub fn asinh(x: f64) -> f64; pub fn acosh(x: f64) -> f64; pub fn atanh(x: f64) -> f64;
+        pub fn exp(x: f64) -> f64; pub fn exp2(x: f64) -> f64; pub fn expm1(x: f64) -> f64;
+        pub fn log(x: f64) -> f64; pub fn log2(x: f64) -> f64; pub fn log10(x: f64) -> f64; pub fn log1p(x: f64) -> f64;
+        pub fn pow(x: f64, y: f64) -> f64; pub fn cbrt(x: f64) -> f64; pub fn hypot(x: f64, y: f64) -> f64;
+        pub fn floor(x: f64) -> f64; pub fn ceil(x: f64) -> f64; pub fn trunc(x: f64) -> f64; pub fn round(x: f64) -> f64; pub fn rint(x: f64) -> f64;
+        pub fn fmod(x: f64, y: f64) -> f64; pub fn remainder(x: f64, y: f64) -> f64; pub fn fma(x: f64, y: f64, z: f64) -> f64;
+        pub fn nextafter(x: f64, y: f64) -> f64; pub fn copysign(x: f64, y: f64) -> f64;
+        pub fn erf(x: f64) -> f64; pub fn erfc(x: f64) -> f64; pub fn tgamma(x: f64) -> f64; pub fn lgamma(x: f64) -> f64;
+    }
+    }
+    pub fn m_sin(x: f64) -> f64 { unsafe { cm::sin(x) } }
+    pub fn m_cos(x: f64) -> f64 { unsafe { cm::cos(x) } }
+    pub fn m_tan(x: f64) -> f64 { unsafe { cm::tan(x) } }
+    pub fn m_asin(x: f64) -> f64 { unsafe { cm::asin(x) } }
+    pub fn m_acos(x: f64) -> f64 { unsafe { cm::acos(x) } }
+    pub fn m_atan(x: f64) -> f64 { unsafe { cm::atan(x) } }
+    pub fn m_atan2(x: f64, y: f64) -> f64 { unsafe { cm::atan2(x, y) } }
+    pub fn m_sinh(x: f64) -> f64 { unsafe { cm::sinh(x) } }
+    pub fn m_cosh(x: f64) -> f64 { unsafe { cm::cosh(x) } }
+    pub fn m_tanh(x: f64) -> f64 { unsafe { cm::tanh(x) } }
+    pub fn m_asinh(x: f64) -> f64 { unsafe { cm::asinh(x) } }
+    pub fn m_acosh(x: f64) -> f64 { unsafe { cm::acosh(x) } }
+    pub fn m_atanh(x: f64) -> f64 { unsafe { cm::atanh(x) } }
+    pub fn m_exp(x: f64) -> f64 { unsafe { cm::exp(x) } }
+    pub fn m_exp2(x: f64) -> f64 { unsafe { cm::exp2(x) } }
+    pub fn m_expm1(x: f64) -> f64 { unsafe { cm::expm1(x) } }
+    pub fn m_log(x: f64) -> f64 { unsafe { cm::log(x) } }
+    pub fn m_log2(x: f64) -> f64 { unsafe { cm::log2(x) } }
+    pub fn m_log10(x: f64) -> f64 { unsafe { cm::log10(x) } }
+    pub fn m_log1p(x: f64) -> f64 { unsafe { cm::log1p(x) } }
+    pub fn m_pow(x: f64, y: f64) -> f64 { unsafe { cm::pow(x, y) } }
+    pub fn m_cbrt(x: f64) -> f64 { unsafe { cm::cbrt(x) } }
+    pub fn m_hypot(x: f64, y: f64) -> f64 { unsafe { cm::hypot(x, y) } }
+    pub fn m_floor(x: f64) -> f64 { unsafe { cm::floor(x) } }
+    pub fn m_ceil(x: f64) -> f64 { unsafe { cm::ceil(x) } }
+    pub fn m_trunc(x: f64) -> f64 { unsafe { cm::trunc(x) } }
+    pub fn m_round(x: f64) -> f64 { unsafe { cm::round(x) } }
+    pub fn m_rint(x: f64) -> f64 { unsafe { cm::rint(x) } }
+    pub fn m_fmod(x: f64, y: f64) -> f64 { unsafe { cm::fmod(x, y) } }
+    pub fn m_remainder(x: f64, y: f64) -> f64 { unsafe { cm::remainder(x, y) } }
+    pub fn m_fma(x: f64, y: f64, z: f64) -> f64 { unsafe { cm::fma(x, y, z) } }
+    pub fn m_nextafter(x: f64, y: f64) -> f64 { unsafe { cm::nextafter(x, y) } }
+    pub fn m_copysign(x: f64, y: f64) -> f64 { unsafe { cm::copysign(x, y) } }
+    pub fn m_erf(x: f64) -> f64 { unsafe { cm::erf(x) } }
+    pub fn m_erfc(x: f64) -> f64 { unsafe { cm::erfc(x) } }
+    pub fn m_tgamma(x: f64) -> f64 { unsafe { cm::tgamma(x) } }
+    pub fn m_lgamma(x: f64) -> f64 { unsafe { cm::lgamma(x) } }
     pub fn f_to_i(x: f64, loc: &str) -> i64 {
         if x.is_nan() || x.is_infinite() {
             panic("Float#to_i of NaN or Infinity", loc)

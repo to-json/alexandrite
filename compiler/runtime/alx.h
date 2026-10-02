@@ -265,6 +265,8 @@ int64_t alx_p_ndigits(AlxPInt a);
 AlxStr alx_f_to_s(double x);
 AlxStr alx_f_fmt(double x, int64_t digits);
 int64_t alx_f_to_i(double x, const char *loc);
+static inline int64_t alx_f_bits(double x) { int64_t b; memcpy(&b, &x, 8); return b; }
+static inline double alx_f_from_bits(int64_t b) { double x; memcpy(&x, &b, 8); return x; }
 void alx_puts_f64(double x);
 AlxStr alx_str_cat(int64_t n, const AlxStr *parts);
 

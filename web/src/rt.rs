@@ -758,6 +758,52 @@ pub extern "C" fn alxr_f_to_i(x: f64, lp: i64, ln: i64) -> i64 {
     x as i64
 }
 
+/// math block: the libm functions wasm has no instruction for (pure Rust `libm`).
+#[unsafe(no_mangle)]
+pub extern "C" fn alxr_math(x: f64, y: f64, z: f64, id: i64) -> f64 {
+    use alx::lir::MathFn::*;
+    let Some(f) = alx::lir::MathFn::from_id(id as u8) else { return f64::NAN };
+    match f {
+        Sin => libm::sin(x),
+        Cos => libm::cos(x),
+        Tan => libm::tan(x),
+        Asin => libm::asin(x),
+        Acos => libm::acos(x),
+        Atan => libm::atan(x),
+        Atan2 => libm::atan2(x, y),
+        Sinh => libm::sinh(x),
+        Cosh => libm::cosh(x),
+        Tanh => libm::tanh(x),
+        Asinh => libm::asinh(x),
+        Acosh => libm::acosh(x),
+        Atanh => libm::atanh(x),
+        Exp => libm::exp(x),
+        Exp2 => libm::exp2(x),
+        Expm1 => libm::expm1(x),
+        Log => libm::log(x),
+        Log2 => libm::log2(x),
+        Log10 => libm::log10(x),
+        Log1p => libm::log1p(x),
+        Pow => libm::pow(x, y),
+        Cbrt => libm::cbrt(x),
+        Hypot => libm::hypot(x, y),
+        Floor => libm::floor(x),
+        Ceil => libm::ceil(x),
+        Trunc => libm::trunc(x),
+        Round => libm::round(x),
+        RoundEven => libm::rint(x),
+        Fmod => libm::fmod(x, y),
+        Remainder => libm::remainder(x, y),
+        Fma => libm::fma(x, y, z),
+        Nextafter => libm::nextafter(x, y),
+        Copysign => libm::copysign(x, y),
+        Erf => libm::erf(x),
+        Erfc => libm::erfc(x),
+        Gamma => libm::tgamma(x),
+        Lgamma => libm::lgamma(x),
+    }
+}
+
 /// Concatenate `n` strings stored as (ptr, len) pairs at `p`.
 #[unsafe(no_mangle)]
 pub extern "C" fn alxr_str_cat(p: i64, n: i64) {

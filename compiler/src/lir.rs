@@ -205,6 +205,12 @@ pub enum Rt {
     FToI,
     FSqrt,
     FAbs,
+    /// A libm function on Floats (see `MathFn`).
+    Math(MathFn),
+    /// Float -> U64: the IEEE bit pattern.
+    FBits,
+    /// U64 -> Float: reinterpret the bit pattern.
+    FFromBits,
     /// Float#to_s, as Ruby prints it.
     FToS,
     /// (x, digits): fixed notation, `%.Nf`.
@@ -386,4 +392,43 @@ pub struct LProgram {
 pub enum AtomicOp {
     Add,
     Swap,
+}
+
+// ---- math (std/math): C library functions on Floats ----
+
+macro_rules! math_fns {
+    ($($v:ident $name:literal $arity:literal $c:literal;)*) => {
+        /// A libm function on F64 arguments, F64 result. The alexandrite side
+        /// reaches it as a `__name` method on Float (see `check.rs`); the
+        /// `math` package wraps those.
+        #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+        #[repr(u8)]
+        pub enum MathFn { $($v),* }
+        impl MathFn {
+            pub const ALL: &'static [MathFn] = &[$(MathFn::$v),*];
+            /// The method name after the `__` prefix.
+            pub fn name(self) -> &'static str { match self { $(MathFn::$v => $name),* } }
+            /// Number of Float arguments (receiver included).
+            pub fn arity(self) -> usize { match self { $(MathFn::$v => $arity),* } }
+            /// The C library function.
+            pub fn c_name(self) -> &'static str { match self { $(MathFn::$v => $c),* } }
+            pub fn by_name(n: &str) -> Option<MathFn> { match n { $($name => Some(MathFn::$v),)* _ => None } }
+            pub fn from_id(i: u8) -> Option<MathFn> { Self::ALL.get(i as usize).copied() }
+        }
+    };
+}
+
+math_fns! {
+    Sin "sin" 1 "sin"; Cos "cos" 1 "cos"; Tan "tan" 1 "tan";
+    Asin "asin" 1 "asin"; Acos "acos" 1 "acos"; Atan "atan" 1 "atan"; Atan2 "atan2" 2 "atan2";
+    Sinh "sinh" 1 "sinh"; Cosh "cosh" 1 "cosh"; Tanh "tanh" 1 "tanh";
+    Asinh "asinh" 1 "asinh"; Acosh "acosh" 1 "acosh"; Atanh "atanh" 1 "atanh";
+    Exp "exp" 1 "exp"; Exp2 "exp2" 1 "exp2"; Expm1 "expm1" 1 "expm1";
+    Log "log" 1 "log"; Log2 "log2" 1 "log2"; Log10 "log10" 1 "log10"; Log1p "log1p" 1 "log1p";
+    Pow "pow" 2 "pow"; Cbrt "cbrt" 1 "cbrt"; Hypot "hypot" 2 "hypot";
+    Floor "floor" 1 "floor"; Ceil "ceil" 1 "ceil"; Trunc "trunc" 1 "trunc";
+    Round "round" 1 "round"; RoundEven "round_even" 1 "rint";
+    Fmod "fmod" 2 "fmod"; Remainder "remainder" 2 "remainder"; Fma "fma" 3 "fma";
+    Nextafter "nextafter" 2 "nextafter"; Copysign "copysign" 2 "copysign";
+    Erf "erf" 1 "erf"; Erfc "erfc" 1 "erfc"; Gamma "gamma" 1 "tgamma"; Lgamma "lgamma" 1 "lgamma";
 }

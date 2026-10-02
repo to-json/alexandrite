@@ -512,7 +512,18 @@ pub fn separable(p: &Package) -> bool {
         && !m.enums.iter().any(|e| e.error || !e.tparams.is_empty())
         && !m.structs.iter().any(|s| !s.tparams.is_empty())
         && m.defs.iter().filter(|d| d.public).all(|d| d.tparams.is_empty() && !d.fallible && !d.name.contains("].") && d.params.iter().all(|p| p.ty.is_some()))
+        // The header spells types with `parse_ty`: sized ints and structs can't cross it.
+        && m.defs.iter().filter(|d| d.public).all(|d| d.params.iter().all(|p| p.ty.as_ref().is_some_and(header_type)) && d.ret.as_ref().is_none_or(header_type))
         && m.defs.iter().any(|d| d.public)
+}
+
+fn header_type(t: &crate::ast::TypeExpr) -> bool {
+    use crate::ast::TypeExpr;
+    match t {
+        TypeExpr::Named(n, _) => matches!(n.as_str(), "Int" | "Float" | "Bool" | "Str"),
+        TypeExpr::Array(t, _) => header_type(t),
+        _ => false,
+    }
 }
 
 /// Check a separable package on its own: its `pub` defs are the exports.

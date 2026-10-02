@@ -243,6 +243,12 @@ pub enum M {
     FloatToS,
     /// Math.sqrt
     Sqrt,
+    /// A libm function (`x.__sin`; the receiver and args are Floats).
+    Math(crate::lir::MathFn),
+    /// Float -> U64 bit pattern (`x.__bits`).
+    FloatBits,
+    /// U64 -> Float (`u.__from_bits`).
+    FloatFromBits,
     /// `Name.new(fields...)`
     StructNew,
     /// T? → Bool

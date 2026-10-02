@@ -1,6 +1,763 @@
 # Package strings: Go's strings, with alx idioms (S2).
+#
+# Conventions (decided here, see GO-VS-RUBY.md S2):
+#  - Names are Go's, in snake_case. Strings are immutable UTF-8 byte strings;
+#    every index and size is in BYTES, as in Go.
+#  - "Not found" for the index family stays Go's -1 (an Int), not `Int?`: S2
+#    only rewrites (T, bool) and (T, error) pairs, and -1 keeps ported code
+#    one-to-one (`if i >= 0`).
+#  - (T, bool) pairs become options: cut_prefix / cut_suffix return `Str?`.
+#    `cut` would be `(Str, Str)?`, but tuples can't be written in types yet,
+#    so it returns `Cut?`, a struct with `before` and `after`.
+#  - Runes are `Rune` (I32), bytes are `Byte` (U8), as in Go. Invalid UTF-8
+#    decodes as U+FFFD with width 1, as in Go.
+#  - split is Go's: an empty separator splits into UTF-8 sequences, and empty
+#    pieces are kept ("a,," -> ["a", "", ""], "" -> [""]). The builtin
+#    `Str#split` is Ruby's (panics on an empty separator, drops trailing
+#    empty pieces). Builtin methods win over method sugar, so `s.split(x)` is
+#    the builtin; call `strings.split(s, x)` for Go's.
+#  - Case mapping covers ASCII, Latin-1, Latin Extended-A, Greek and Cyrillic
+#    (basic, extended and historic ranges); other scripts pass through
+#    unchanged, and Go's multi-rune or titlecase special cases are not
+#    covered. equal_fold compares upper-then-lower mapped runes, same
+#    coverage.
+#  - Building is linear: everything that assembles a string goes through a
+#    byte buffer (Builder), never repeated concatenation.
 
-# Whether `s` begins with `prefix`.
+# ---------------------------------------------------------------- UTF-8 core
+# Private helpers. A decoded rune is packed into one Int as `rune * 8 + width`
+# (no tuples yet), so decoding allocates nothing.
+
+BAD = 0xFFFD * 8 + 1
+
+def is_cont(b: Int) -> Bool { b >= 0x80 && b <= 0xBF }
+
+# Decode the rune starting at byte i (i < s.size).
+def dec(s: Str, i: Int) -> Int {
+  n = s.size
+  b0 = s[i].to_i
+  return b0 * 8 + 1 if b0 < 0x80
+  return BAD if b0 < 0xC2 || b0 > 0xF4
+  return BAD if i + 1 >= n
+  b1 = s[i + 1].to_i
+  if b0 < 0xE0 {
+    return BAD if !is_cont(b1)
+    return (((b0 & 0x1F) << 6) | (b1 & 0x3F)) * 8 + 2
+  }
+  lo = 0x80
+  hi = 0xBF
+  if b0 == 0xE0 { lo = 0xA0 }
+  if b0 == 0xED { hi = 0x9F }
+  if b0 == 0xF0 { lo = 0x90 }
+  if b0 == 0xF4 { hi = 0x8F }
+  return BAD if b1 < lo || b1 > hi
+  return BAD if i + 2 >= n
+  b2 = s[i + 2].to_i
+  return BAD if !is_cont(b2)
+  if b0 < 0xF0 {
+    return (((b0 & 0x0F) << 12) | ((b1 & 0x3F) << 6) | (b2 & 0x3F)) * 8 + 3
+  }
+  return BAD if i + 3 >= n
+  b3 = s[i + 3].to_i
+  return BAD if !is_cont(b3)
+  (((b0 & 0x07) << 18) | ((b1 & 0x3F) << 12) | ((b2 & 0x3F) << 6) | (b3 & 0x3F)) * 8 + 4
+}
+
+# Decode the rune ending just before byte e (e > 0).
+def dec_last(s: Str, e: Int) -> Int {
+  start = e - 1
+  b = s[start].to_i
+  return b * 8 + 1 if b < 0x80
+  lim = e - 4
+  lim = 0 if lim < 0
+  start -= 1
+  while start >= lim {
+    break if !is_cont(s[start].to_i)
+    start -= 1
+  }
+  start = lim if start < lim
+  v = dec(s, start)
+  return BAD if start + (v & 7) != e
+  v
+}
+
+def valid_rune(c: Int) -> Bool { c >= 0 && c <= 0x10FFFF && !(c >= 0xD800 && c <= 0xDFFF) }
+
+def rune_count(s: Str) -> Int {
+  n = s.size
+  i = 0
+  c = 0
+  while i < n {
+    i += dec(s, i) & 7
+    c += 1
+  }
+  c
+}
+
+def is_space_rune(r: Int) -> Bool {
+  if r < 0x100 { return r == 32 || (r >= 9 && r <= 13) || r == 0x85 || r == 0xA0 }
+  r == 0x1680 || (r >= 0x2000 && r <= 0x200A) || r == 0x2028 || r == 0x2029 || r == 0x202F || r == 0x205F || r == 0x3000
+}
+
+def upper_rune(r: Int) -> Int {
+  if r < 0x80 { return r >= 97 && r <= 122 ? r - 32 : r }
+  if r < 0x100 {
+    return 0x39C if r == 0xB5
+    return r - 32 if r >= 0xE0 && r <= 0xFE && r != 0xF7
+    return 0x178 if r == 0xFF
+    return r
+  }
+  if r < 0x180 {
+    return r - 1 if (r >= 0x100 && r <= 0x137 && r % 2 == 1) && r != 0x131
+    return 0x49 if r == 0x131
+    return r - 1 if r >= 0x139 && r <= 0x148 && r % 2 == 0
+    return r - 1 if r >= 0x14A && r <= 0x177 && r % 2 == 1
+    return r - 1 if r >= 0x179 && r <= 0x17E && r % 2 == 0
+    return 0x53 if r == 0x17F
+    return r
+  }
+  if r >= 0x370 && r < 0x400 {
+    return 0x3A3 if r == 0x3C2
+    return r - 32 if r >= 0x3B1 && r <= 0x3CB
+    return 0x386 if r == 0x3AC
+    return r - 37 if r >= 0x3AD && r <= 0x3AF
+    return 0x38C if r == 0x3CC
+    return r - 63 if r == 0x3CD || r == 0x3CE
+    return r
+  }
+  if r >= 0x400 && r < 0x530 {
+    return r - 32 if r >= 0x430 && r <= 0x44F
+    return r - 80 if r >= 0x450 && r <= 0x45F
+    return r - 1 if r >= 0x460 && r <= 0x481 && r % 2 == 1
+    return r - 1 if r >= 0x48A && r <= 0x4BF && r % 2 == 1
+    return 0x4C0 if r == 0x4CF
+    return r - 1 if r >= 0x4C1 && r <= 0x4CE && r % 2 == 0
+    return r - 1 if r >= 0x4D0 && r <= 0x52F && r % 2 == 1
+    return r
+  }
+  r
+}
+
+def lower_rune(r: Int) -> Int {
+  if r < 0x80 { return r >= 65 && r <= 90 ? r + 32 : r }
+  if r < 0x100 {
+    return r + 32 if r >= 0xC0 && r <= 0xDE && r != 0xD7
+    return r
+  }
+  if r < 0x180 {
+    return 0x69 if r == 0x130
+    return r + 1 if r >= 0x100 && r <= 0x137 && r % 2 == 0 && r != 0x130
+    return r + 1 if r >= 0x139 && r <= 0x148 && r % 2 == 1
+    return r + 1 if r >= 0x14A && r <= 0x177 && r % 2 == 0
+    return 0xFF if r == 0x178
+    return r + 1 if r >= 0x179 && r <= 0x17E && r % 2 == 1
+    return r
+  }
+  if r >= 0x370 && r < 0x400 {
+    return r + 32 if r >= 0x391 && r <= 0x3AB && r != 0x3A2
+    return 0x3AC if r == 0x386
+    return r + 37 if r >= 0x388 && r <= 0x38A
+    return 0x3CC if r == 0x38C
+    return r + 63 if r == 0x38E || r == 0x38F
+    return r
+  }
+  if r >= 0x400 && r < 0x530 {
+    return r + 32 if r >= 0x410 && r <= 0x42F
+    return r + 80 if r >= 0x400 && r <= 0x40F
+    return r + 1 if r >= 0x460 && r <= 0x481 && r % 2 == 0
+    return r + 1 if r >= 0x48A && r <= 0x4BF && r % 2 == 0
+    return 0x4CF if r == 0x4C0
+    return r + 1 if r >= 0x4C1 && r <= 0x4CE && r % 2 == 1
+    return r + 1 if r >= 0x4D0 && r <= 0x52F && r % 2 == 0
+    return r
+  }
+  r
+}
+
+# ------------------------------------------------------------------- Builder
+# A growable byte buffer: appends are amortized O(1), to_s copies once.
+pub struct Builder {
+  buf: [Byte]
+
+  # Appends s[a...b] (bytes).
+  def put_str!(s: Str, a: Int, b: Int) {
+    i = a
+    while i < b {
+      self.buf << s[i]
+      i += 1
+    }
+  }
+
+  # Appends the UTF-8 encoding of rune value c (invalid values become U+FFFD).
+  def put_rune!(c: Int) -> Int {
+    r = c
+    r = 0xFFFD if !valid_rune(r)
+    if r < 0x80 {
+      self.buf << r.as_u8
+      return 1
+    }
+    if r < 0x800 {
+      self.buf << (0xC0 | (r >> 6)).as_u8
+      self.buf << (0x80 | (r & 0x3F)).as_u8
+      return 2
+    }
+    if r < 0x10000 {
+      self.buf << (0xE0 | (r >> 12)).as_u8
+      self.buf << (0x80 | ((r >> 6) & 0x3F)).as_u8
+      self.buf << (0x80 | (r & 0x3F)).as_u8
+      return 3
+    }
+    self.buf << (0xF0 | (r >> 18)).as_u8
+    self.buf << (0x80 | ((r >> 12) & 0x3F)).as_u8
+    self.buf << (0x80 | ((r >> 6) & 0x3F)).as_u8
+    self.buf << (0x80 | (r & 0x3F)).as_u8
+    4
+  }
+
+  # Appends s; returns the number of bytes written.
+  pub def write!(s: Str) -> Int {
+    put_str!(s, 0, s.size)
+    s.size
+  }
+  pub def write_byte!(b: Byte) {
+    self.buf << b
+  }
+  # Appends r as UTF-8; returns the number of bytes written.
+  pub def write_rune!(r: Rune) -> Int { put_rune!(r.to_i) }
+  # The accumulated string (a copy).
+  pub def to_s -> Str { Str.from_bytes(buf) }
+  pub def string -> Str { Str.from_bytes(buf) }
+  # Bytes written so far.
+  pub def size -> Int { buf.size }
+  pub def reset! {
+    self.buf = []
+  }
+  # Go's Grow(n). There is no capacity primitive yet; appends are already
+  # amortized O(1), so this only validates n.
+  pub def grow!(n: Int) {
+    assert n >= 0
+  }
+}
+
+# ------------------------------------------------------------------- search
+
+# Whether s[i...] begins with sub (caller ensures i + sub.size <= s.size).
+def match_at(s: Str, i: Int, sub: Str) -> Bool {
+  m = sub.size
+  j = 0
+  while j < m {
+    return false if s[i + j] != sub[j]
+    j += 1
+  }
+  true
+}
+
+# First index >= start where sub occurs, or -1.
+def index_from(s: Str, sub: Str, start: Int) -> Int {
+  m = sub.size
+  return start if m == 0
+  first = sub[0]
+  last = s.size - m
+  i = start
+  while i <= last {
+    return i if s[i] == first && match_at(s, i, sub)
+    i += 1
+  }
+  -1
+}
+
+# Whether s begins with prefix.
 pub def has_prefix(s: Str, prefix: Str) -> Bool {
-  s.size >= prefix.size && s[0...prefix.size] == prefix
+  s.size >= prefix.size && match_at(s, 0, prefix)
+}
+
+# Whether s ends with suffix.
+pub def has_suffix(s: Str, suffix: Str) -> Bool {
+  s.size >= suffix.size && match_at(s, s.size - suffix.size, suffix)
+}
+
+# Index of the first instance of substr in s, or -1.
+pub def index(s: Str, substr: Str) -> Int { index_from(s, substr, 0) }
+
+# Index of the last instance of substr in s, or -1.
+pub def last_index(s: Str, substr: Str) -> Int {
+  m = substr.size
+  return s.size if m == 0
+  i = s.size - m
+  while i >= 0 {
+    return i if s[i] == substr[0] && match_at(s, i, substr)
+    i -= 1
+  }
+  -1
+}
+
+# Index of the first byte c in s, or -1.
+pub def index_byte(s: Str, c: Byte) -> Int {
+  i = 0
+  n = s.size
+  while i < n {
+    return i if s[i] == c
+    i += 1
+  }
+  -1
+}
+
+# Index of the last byte c in s, or -1.
+pub def last_index_byte(s: Str, c: Byte) -> Int {
+  i = s.size - 1
+  while i >= 0 {
+    return i if s[i] == c
+    i -= 1
+  }
+  -1
+}
+
+# Index of the first instance of the rune r, or -1. U+FFFD also matches
+# invalid UTF-8 bytes (Go).
+pub def index_rune(s: Str, r: Rune) -> Int {
+  c = r.to_i
+  return index_byte(s, c.as_u8) if c >= 0 && c < 0x80
+  n = s.size
+  if c == 0xFFFD {
+    i = 0
+    while i < n {
+      v = dec(s, i)
+      return i if (v >> 3) == 0xFFFD
+      i += v & 7
+    }
+    return -1
+  }
+  return -1 if !valid_rune(c)
+  b = Builder.new
+  b.put_rune!(c)
+  index(s, b.to_s)
+}
+
+# Index of the first rune of s for which f is true, or -1.
+pub def index_func(s: Str, f: (Rune) -> Bool) -> Int {
+  n = s.size
+  i = 0
+  while i < n {
+    v = dec(s, i)
+    return i if f((v >> 3).as_i32)
+    i += v & 7
+  }
+  -1
+}
+
+# Index of the last rune of s for which f is true, or -1.
+pub def last_index_func(s: Str, f: (Rune) -> Bool) -> Int {
+  e = s.size
+  while e > 0 {
+    v = dec_last(s, e)
+    e -= v & 7
+    return e if f((v >> 3).as_i32)
+  }
+  -1
+}
+
+# Index of the first rune of s that is in chars, or -1.
+pub def index_any(s: Str, chars: Str) -> Int {
+  return -1 if chars.size == 0
+  n = s.size
+  i = 0
+  while i < n {
+    v = dec(s, i)
+    return i if index_rune(chars, (v >> 3).as_i32) >= 0
+    i += v & 7
+  }
+  -1
+}
+
+# Index of the last rune of s that is in chars, or -1.
+pub def last_index_any(s: Str, chars: Str) -> Int {
+  return -1 if chars.size == 0
+  e = s.size
+  while e > 0 {
+    v = dec_last(s, e)
+    e -= v & 7
+    return e if index_rune(chars, (v >> 3).as_i32) >= 0
+  }
+  -1
+}
+
+pub def contains(s: Str, substr: Str) -> Bool { index(s, substr) >= 0 }
+pub def contains_any(s: Str, chars: Str) -> Bool { index_any(s, chars) >= 0 }
+pub def contains_rune(s: Str, r: Rune) -> Bool { index_rune(s, r) >= 0 }
+pub def contains_func(s: Str, f: (Rune) -> Bool) -> Bool { index_func(s, f) >= 0 }
+
+# Number of non-overlapping instances of substr in s; with an empty substr,
+# the number of runes plus one.
+pub def count(s: Str, substr: Str) -> Int {
+  return rune_count(s) + 1 if substr.size == 0
+  c = 0
+  i = 0
+  loop {
+    j = index_from(s, substr, i)
+    break if j < 0
+    c += 1
+    i = j + substr.size
+  }
+  c
+}
+
+# Three-way comparison: -1, 0 or +1 (bytewise).
+pub def compare(a: Str, b: Str) -> Int {
+  return 0 if a == b
+  a < b ? -1 : 1
+}
+
+# The result of cut.
+pub struct Cut {
+  before: Str
+  after: Str
+}
+
+# Slices s around the first instance of sep: the text before and after it;
+# none if sep is absent.
+pub def cut(s: Str, sep: Str) -> Cut? {
+  i = index(s, sep)
+  return none if i < 0
+  Cut.new(before: s[0...i], after: s[i + sep.size...s.size])
+}
+
+# s without the leading prefix; none if s doesn't start with it.
+pub def cut_prefix(s: Str, prefix: Str) -> Str? {
+  return none if !has_prefix(s, prefix)
+  s[prefix.size...s.size]
+}
+
+# s without the trailing suffix; none if s doesn't end with it.
+pub def cut_suffix(s: Str, suffix: Str) -> Str? {
+  return none if !has_suffix(s, suffix)
+  s[0...s.size - suffix.size]
+}
+
+# Whether s and t are equal under simple Unicode case folding.
+pub def equal_fold(s: Str, t: Str) -> Bool {
+  i = 0
+  j = 0
+  while i < s.size && j < t.size {
+    a = dec(s, i)
+    b = dec(t, j)
+    ra = a >> 3
+    rb = b >> 3
+    if ra != rb {
+      return false if lower_rune(upper_rune(ra)) != lower_rune(upper_rune(rb))
+    }
+    i += a & 7
+    j += b & 7
+  }
+  i == s.size && j == t.size
+}
+
+# ---------------------------------------------------------------- splitting
+
+# Go's explode: s split into at most n UTF-8 sequences (n < 0: all).
+def explode(s: Str, n: Int) -> [Str] {
+  out: [Str] = []
+  size = s.size
+  i = 0
+  while i < size {
+    if n > 0 && out.size == n - 1 {
+      out << s[i...size]
+      return out
+    }
+    w = dec(s, i) & 7
+    out << s[i...i + w]
+    i += w
+  }
+  out
+}
+
+def gen_split(s: Str, sep: Str, save: Int, n: Int) -> [Str] {
+  out: [Str] = []
+  return out if n == 0
+  return explode(s, n) if sep.size == 0
+  start = 0
+  loop {
+    break if n > 0 && out.size >= n - 1
+    j = index_from(s, sep, start)
+    break if j < 0
+    out << s[start...j + save]
+    start = j + sep.size
+  }
+  out << s[start...s.size]
+  out
+}
+
+# Splits s around every instance of sep. An empty sep splits into UTF-8
+# sequences.
+pub def split(s: Str, sep: Str) -> [Str] { gen_split(s, sep, 0, -1) }
+# Like split, but keeps sep at the end of each piece.
+pub def split_after(s: Str, sep: Str) -> [Str] { gen_split(s, sep, sep.size, -1) }
+# At most n pieces (n < 0: all; n == 0: none); the last holds the remainder.
+pub def split_n(s: Str, sep: Str, n: Int) -> [Str] { gen_split(s, sep, 0, n) }
+pub def split_after_n(s: Str, sep: Str, n: Int) -> [Str] { gen_split(s, sep, sep.size, n) }
+
+# Splits s around runs of runes for which f is true; no empty pieces.
+pub def fields_func(s: Str, f: (Rune) -> Bool) -> [Str] {
+  out: [Str] = []
+  n = s.size
+  start = -1
+  i = 0
+  while i < n {
+    v = dec(s, i)
+    if f((v >> 3).as_i32) {
+      if start >= 0 {
+        out << s[start...i]
+        start = -1
+      }
+    } else if start < 0 {
+      start = i
+    }
+    i += v & 7
+  }
+  out << s[start...n] if start >= 0
+  out
+}
+
+# Splits s around runs of Unicode white space; no empty pieces.
+pub def fields(s: Str) -> [Str] {
+  out: [Str] = []
+  n = s.size
+  start = -1
+  i = 0
+  while i < n {
+    v = dec(s, i)
+    if is_space_rune(v >> 3) {
+      if start >= 0 {
+        out << s[start...i]
+        start = -1
+      }
+    } else if start < 0 {
+      start = i
+    }
+    i += v & 7
+  }
+  out << s[start...n] if start >= 0
+  out
+}
+
+# Concatenates elems with sep between them.
+pub def join(elems: [Str], sep: Str) -> Str {
+  return "" if elems.size == 0
+  return elems[0] if elems.size == 1
+  b = Builder.new
+  i = 0
+  while i < elems.size {
+    b.put_str!(sep, 0, sep.size) if i > 0
+    b.put_str!(elems[i], 0, elems[i].size)
+    i += 1
+  }
+  b.to_s
+}
+
+# s repeated count times. Panics if count is negative.
+pub def repeat(s: Str, count: Int) -> Str {
+  assert count >= 0 # negative count panics (Go)
+  return "" if count == 0 || s.size == 0
+  b = Builder.new
+  i = 0
+  while i < count {
+    b.put_str!(s, 0, s.size)
+    i += 1
+  }
+  b.to_s
+}
+
+# ---------------------------------------------------------------- replacing
+
+# s with the first n non-overlapping instances of old replaced by new
+# (n < 0: all). An empty old matches before every rune and at the end.
+pub def replace(s: Str, old: Str, new: Str, n: Int) -> Str {
+  return s if old == new || n == 0
+  m = count(s, old)
+  return s if m == 0
+  limit = n
+  limit = m if n < 0 || m < n
+  b = Builder.new
+  start = 0
+  k = 0
+  while k < limit {
+    j = start
+    if old.size == 0 {
+      j += dec(s, start) & 7 if k > 0
+    } else {
+      j = index_from(s, old, start)
+    }
+    b.put_str!(s, start, j)
+    b.put_str!(new, 0, new.size)
+    start = j + old.size
+    k += 1
+  }
+  b.put_str!(s, start, s.size)
+  b.to_s
+}
+
+pub def replace_all(s: Str, old: Str, new: Str) -> Str { replace(s, old, new, -1) }
+
+# s with every rune mapped through mapping; runes mapped to a negative value
+# are dropped.
+pub def map(mapping: (Rune) -> Rune, s: Str) -> Str {
+  b = Builder.new
+  n = s.size
+  i = 0
+  while i < n {
+    v = dec(s, i)
+    m = mapping((v >> 3).as_i32).to_i
+    b.put_rune!(m) if m >= 0
+    i += v & 7
+  }
+  b.to_s
+}
+
+# s with each run of invalid UTF-8 bytes replaced by replacement.
+pub def to_valid_utf8(s: Str, replacement: Str) -> Str {
+  b = Builder.new
+  n = s.size
+  i = 0
+  bad = false
+  while i < n {
+    v = dec(s, i)
+    w = v & 7
+    if v == BAD {
+      b.put_str!(replacement, 0, replacement.size) if !bad
+      bad = true
+    } else {
+      b.put_str!(s, i, i + w)
+      bad = false
+    }
+    i += w
+  }
+  b.to_s
+}
+
+# ------------------------------------------------------------------- case
+
+def map_case(s: Str, up: Bool) -> Str {
+  n = s.size
+  # ASCII fast path: nothing to do, or a plain byte loop.
+  i = 0
+  work = false
+  while i < n {
+    c = s[i].to_i
+    if c >= 0x80 {
+      work = true
+      break
+    }
+    work = true if up && c >= 97 && c <= 122
+    work = true if !up && c >= 65 && c <= 90
+    i += 1
+  }
+  return s if !work
+  b = Builder.new
+  i = 0
+  while i < n {
+    c = s[i].to_i
+    if c < 0x80 {
+      if up && c >= 97 && c <= 122 {
+        b.buf << (c - 32).as_u8
+      } else if !up && c >= 65 && c <= 90 {
+        b.buf << (c + 32).as_u8
+      } else {
+        b.buf << s[i]
+      }
+      i += 1
+    } else {
+      v = dec(s, i)
+      w = v & 7
+      if v == BAD {
+        b.put_str!(s, i, i + 1)
+      } else {
+        r = v >> 3
+        b.put_rune!(up ? upper_rune(r) : lower_rune(r))
+      }
+      i += w
+    }
+  }
+  b.to_s
+}
+
+# Upper-case s (see the coverage note at the top).
+pub def to_upper(s: Str) -> Str { map_case(s, true) }
+# Lower-case s.
+pub def to_lower(s: Str) -> Str { map_case(s, false) }
+
+# ------------------------------------------------------------------ trimming
+
+# s without leading runes for which f is true.
+pub def trim_left_func(s: Str, f: (Rune) -> Bool) -> Str {
+  n = s.size
+  i = 0
+  while i < n {
+    v = dec(s, i)
+    break if !f((v >> 3).as_i32)
+    i += v & 7
+  }
+  return s if i == 0
+  s[i...n]
+}
+
+# s without trailing runes for which f is true.
+pub def trim_right_func(s: Str, f: (Rune) -> Bool) -> Str {
+  e = s.size
+  while e > 0 {
+    v = dec_last(s, e)
+    break if !f((v >> 3).as_i32)
+    e -= v & 7
+  }
+  return s if e == s.size
+  s[0...e]
+}
+
+pub def trim_func(s: Str, f: (Rune) -> Bool) -> Str { trim_right_func(trim_left_func(s, f), f) }
+
+# s without any leading runes contained in cutset.
+pub def trim_left(s: Str, cutset: Str) -> Str {
+  return s if s.size == 0 || cutset.size == 0
+  trim_left_func(s, ->(r: Rune) -> Bool { index_rune(cutset, r) >= 0 })
+}
+
+# s without any trailing runes contained in cutset.
+pub def trim_right(s: Str, cutset: Str) -> Str {
+  return s if s.size == 0 || cutset.size == 0
+  trim_right_func(s, ->(r: Rune) -> Bool { index_rune(cutset, r) >= 0 })
+}
+
+# s without any leading or trailing runes contained in cutset.
+pub def trim(s: Str, cutset: Str) -> Str {
+  return s if s.size == 0 || cutset.size == 0
+  trim_right(trim_left(s, cutset), cutset)
+}
+
+# s without the leading prefix, if present.
+pub def trim_prefix(s: Str, prefix: Str) -> Str {
+  return s if !has_prefix(s, prefix)
+  s[prefix.size...s.size]
+}
+
+# s without the trailing suffix, if present.
+pub def trim_suffix(s: Str, suffix: Str) -> Str {
+  return s if !has_suffix(s, suffix)
+  s[0...s.size - suffix.size]
+}
+
+# s without leading and trailing Unicode white space.
+pub def trim_space(s: Str) -> Str {
+  n = s.size
+  i = 0
+  while i < n {
+    v = dec(s, i)
+    break if !is_space_rune(v >> 3)
+    i += v & 7
+  }
+  e = n
+  while e > i {
+    v = dec_last(s, e)
+    break if !is_space_rune(v >> 3)
+    e -= v & 7
+  }
+  return s if i == 0 && e == n
+  s[i...e]
 }

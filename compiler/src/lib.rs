@@ -15,5 +15,6 @@ pub mod lower;
 pub mod mapgen;
 pub mod parser;
 pub mod prove;
+pub mod regions;
 pub mod rgen;
 pub mod tast;

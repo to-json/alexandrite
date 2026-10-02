@@ -38,7 +38,9 @@ pub fn lower(p: &TProgram, sm: &SourceMap, opts: &Opts) -> LProgram {
         *l.borrow_mut() = p.funcs.iter().flat_map(|f| f.lambdas.iter().map(move |(lo, t, caps)| (f.cname.clone(), *lo, t.clone(), caps.iter().map(|c| f.locals[*c].ty.clone()).collect()))).collect();
     });
     let prog = RefCell::new(LProgram::default());
-    for f in &p.funcs {
+    // R1: where each allocation lives (unless turned off, for comparison).
+    let placement = if std::env::var_os("ALX_NO_REGIONS").is_some() { vec![] } else { crate::regions::analyze(p) };
+    for (fi, f) in p.funcs.iter().enumerate() {
         let lf = if f.external {
             let mut lw = Lw::new(p, sm, opts, f, f.overflow, ErrPath::Return(vec![]), &prog);
             let params = f.params.iter().map(|l| lw.var_of(*l)).collect();
@@ -51,7 +53,17 @@ pub fn lower(p: &TProgram, sm: &SourceMap, opts: &Opts) -> LProgram {
             }
             let params: Vec<V> = f.params.iter().map(|l| lw.var_of(*l)).collect();
             lw.analyze_facts(&f.body);
+            // The call's own region: entered here, exited on every way out.
+            let mut prologue = vec![];
+            if let Some(pl) = placement.get(fi).filter(|pl| !pl.sites.is_empty()) {
+                let (frame, dest) = (lw.new_var("frame", LTy::Region), lw.new_var("dest", LTy::Region));
+                prologue.push(LS::RegionEnter { region: frame, saved: dest });
+                lw.place = Some(pl);
+                lw.frame = Some((frame, dest));
+            }
             let mut body = lw.body_with_return(&f.body, !f.is_main && f.ret != Ty::Unit);
+            prologue.append(&mut body);
+            let mut body = prologue;
             if lw.res.is_some() && f.ret == Ty::Unit {
                 // Falling off the end of a fallible def that returns nothing.
                 body.push(LS::Return(Some(lw.ok_result(LE::B(false)))));
@@ -148,6 +160,17 @@ struct Lw<'a> {
     prog: &'a RefCell<LProgram>,
     /// In a fallible function: the ok value's type (returns are wrapped).
     res: Option<LTy>,
+    /// R1 placement for this function's allocation sites, its frame region
+    /// and the caller's (`dest`), and the class whose region is current.
+    place: Option<&'a crate::regions::FnPlacement>,
+    frame: Option<(V, V)>,
+    ambient: crate::regions::Place,
+    /// Each loop's iteration region (and the region saved when entering it).
+    iter_vars: HashMap<usize, (V, V)>,
+    /// Iteration regions open now, with the defer depth they belong to.
+    iter_open: Vec<(usize, V, V)>,
+    /// For the next inlined block: the defer depth its `next` unwinds to.
+    next_depth: Option<usize>,
 }
 
 /// A stage of a pipeline with its pre-loop state.
@@ -180,6 +203,12 @@ impl<'a> Lw<'a> {
             facts: HashMap::new(),
             prog,
             res: None,
+            place: None,
+            frame: None,
+            ambient: crate::regions::Place::Frame,
+            iter_vars: HashMap::new(),
+            iter_open: vec![],
+            next_depth: None,
         }
     }
 
@@ -386,7 +415,41 @@ impl<'a> Lw<'a> {
     }
 
     fn has_defers(&self, from: usize) -> bool {
-        self.defers[from.min(self.defers.len())..].iter().any(|d| !d.is_empty())
+        (from == 0 && self.frame.is_some()) || self.iter_open.iter().any(|(d, _, _)| *d >= from) || self.defers[from.min(self.defers.len())..].iter().any(|d| !d.is_empty())
+    }
+
+    /// The iteration region of loop `key`, if its body allocates per iteration.
+    fn iter_region(&mut self, key: usize) -> Option<(V, V)> {
+        if !self.place.is_some_and(|pl| pl.loops.contains(&key)) || self.frame.is_none() {
+            return None;
+        }
+        if let Some(r) = self.iter_vars.get(&key) {
+            return Some(*r);
+        }
+        let r = (self.new_var("iter", LTy::Region), self.new_var("outer", LTy::Region));
+        self.iter_vars.insert(key, r);
+        Some(r)
+    }
+
+    /// Open loop `key`'s iteration region (as a defer level, so every way
+    /// out of the loop's body frees it). Returns what `close_iter` needs.
+    fn open_iter(&mut self, key: usize) -> Option<(V, V, crate::regions::Place)> {
+        let (r, sv) = self.iter_region(key)?;
+        self.defers.push(vec![]);
+        let depth = self.defers.len() - 1;
+        self.emit(LS::RegionEnter { region: r, saved: sv });
+        self.iter_open.push((depth, r, sv));
+        let prev = std::mem::replace(&mut self.ambient, crate::regions::Place::Iter(key));
+        Some((r, sv, prev))
+    }
+
+    fn close_iter(&mut self, open: Option<(V, V, crate::regions::Place)>) {
+        if let Some((r, sv, prev)) = open {
+            self.ambient = prev;
+            self.emit(LS::RegionExit { region: r, saved: sv });
+            self.iter_open.pop();
+            self.defers.pop();
+        }
     }
 
     /// Run the deferred code of blocks `from..` (innermost first), as when
@@ -403,6 +466,18 @@ impl<'a> Lw<'a> {
             }
         }
         self.defers = saved;
+        // Leaving loops: their iteration regions go (innermost first).
+        for (d, r, sv) in self.iter_open.clone().into_iter().rev() {
+            if d >= from {
+                self.emit(LS::RegionExit { region: r, saved: sv });
+            }
+        }
+        // Leaving the function: its region goes too.
+        if from == 0 {
+            if let Some((frame, dest)) = self.frame {
+                self.emit(LS::RegionExit { region: frame, saved: dest });
+            }
+        }
     }
 
     /// The error path here: the function's, plus the deferred code of every open block.
@@ -461,7 +536,14 @@ impl<'a> Lw<'a> {
             }
             TStmt::While(c, body) => {
                 let l = self.label();
+                // Each iteration gets a fresh region: entered before the loop,
+                // renewed at the top of every iteration, left after it.
+                let open = self.open_iter(s as *const TStmt as usize);
                 let inner = self.sub(|lw| {
+                    if let Some((r, sv, _)) = open {
+                        lw.emit(LS::RegionExit { region: r, saved: sv });
+                        lw.emit(LS::RegionEnter { region: r, saved: sv });
+                    }
                     let cv = lw.expr(c);
                     lw.emit(LS::If(LE::Not(Box::new(cv)), vec![LS::Break(l)], vec![]));
                     lw.next_target.push((Some(l), lw.defers.len()));
@@ -471,6 +553,7 @@ impl<'a> Lw<'a> {
                     lw.next_target.pop();
                 });
                 self.emit(LS::Loop(l, inner));
+                self.close_iter(open);
             }
             TStmt::If(c, a, b) => {
                 let cv = self.expr(c);
@@ -521,6 +604,49 @@ impl<'a> Lw<'a> {
     // ---------- expressions ----------
 
     fn expr(&mut self, e: &TExpr) -> LE {
+        // R1: an allocation that must live elsewhere than the current
+        // region is made with that region current (and forced to a value
+        // before switching back: LIR expressions run where they're used).
+        if let (Some(pl), Some((frame, dest))) = (self.place, self.frame) {
+            if crate::regions::allocates(e, self.promote()) {
+                use crate::regions::Place;
+                let mut class = pl.sites.get(&(e as *const TExpr as usize)).copied().unwrap_or(Place::Global);
+                // A loop not open here (can't happen, but never guess): the frame.
+                if let Place::Iter(k) = class {
+                    if !self.iter_open.iter().any(|(_, r, _)| Some(r) == self.iter_vars.get(&k).map(|x| &x.0)) {
+                        class = Place::Frame;
+                    }
+                }
+                if class != self.ambient {
+                    let region = match class {
+                        Place::Iter(k) => LE::Var(self.iter_vars[&k].0),
+                        Place::Frame => LE::Var(frame),
+                        Place::Ret => LE::Var(dest),
+                        Place::Global => LE::RegionProgram,
+                    };
+                    let saved = self.tmp(LTy::Region);
+                    self.emit(LS::RegionUse { region, saved });
+                    let prev = std::mem::replace(&mut self.ambient, class);
+                    let v = self.expr_in(e);
+                    let lt = self.lty(&e.ty);
+                    let v = if lt == LTy::Unit {
+                        if !matches!(v, LE::Unit | LE::Var(_) | LE::I(_) | LE::B(_)) {
+                            self.emit(LS::Eval(v));
+                        }
+                        LE::Unit
+                    } else {
+                        self.bind(v, lt)
+                    };
+                    self.ambient = prev;
+                    self.emit(LS::RegionRestore(saved));
+                    return v;
+                }
+            }
+        }
+        self.expr_in(e)
+    }
+
+    fn expr_in(&mut self, e: &TExpr) -> LE {
         match &e.kind {
             TK::Int(v) => {
                 if e.ty == Ty::Int {
@@ -946,18 +1072,86 @@ impl<'a> Lw<'a> {
     /// Leave with error `err` (an Error value): return it from a fallible
     /// function, or print it and exit 1 at the top level.
     fn fail(&mut self, err: LE) {
+        // The error outlives this call's region: copy it to the caller's first.
+        let err = match (self.frame, &self.path, &self.res) {
+            (Some((_, dest)), ErrPath::Return(_), Some(_)) => {
+                let et = self.lty(&Ty::Error);
+                let saved = self.tmp(LTy::Region);
+                self.emit(LS::RegionUse { region: LE::Var(dest), saved });
+                let c = self.deep_copy(err, &et);
+                let c = self.bind(c, et);
+                self.emit(LS::RegionRestore(saved));
+                c
+            }
+            _ => err,
+        };
         let path = self.err_path();
-        self.block(path.cleanup());
         match (&path, self.res.clone()) {
             (ErrPath::Return(_), Some(ok)) => {
+                self.block(path.cleanup());
                 let rt = result_lty(ok.clone(), self.mode);
                 self.emit(LS::Return(Some(LE::Tup(rt, vec![LE::B(false), zero_le(&ok), err]))));
             }
             _ => {
+                // The message first: cleanup may free what the error refers to.
                 let msg = self.error_message(err.clone());
                 let loc = LE::Field(Box::new(err), 1);
-                self.emit(LS::Die(LE::Rt(Rt::StrCat, vec![LE::S("error: ".into()), msg, LE::S(" (".into()), loc, LE::S(")".into())])));
+                let text = LE::Rt(Rt::StrCat, vec![LE::S("error: ".into()), msg, LE::S(" (".into()), loc, LE::S(")".into())]);
+                let text = self.bind(text, LTy::Str);
+                // Printed from the program region (the frame is gone by then).
+                let keep = self.tmp(LTy::Str);
+                let saved = self.tmp(LTy::Region);
+                self.emit(LS::RegionUse { region: LE::RegionProgram, saved });
+                self.emit(LS::Set(keep, LE::Rt(Rt::StrCat, vec![text, LE::S(String::new())])));
+                self.emit(LS::RegionRestore(saved));
+                self.block(path.cleanup());
+                self.emit(LS::Die(LE::Var(keep)));
             }
+        }
+    }
+
+    /// A copy of `v` whose storage (strings, arrays) is all fresh, in the
+    /// current region.
+    fn deep_copy(&mut self, v: LE, t: &LTy) -> LE {
+        fn has_storage(t: &LTy) -> bool {
+            match t {
+                LTy::Str | LTy::Arr(_) | LTy::PInt => true,
+                LTy::Tup(ts) => ts.iter().any(has_storage),
+                _ => false,
+            }
+        }
+        if !has_storage(t) {
+            return v;
+        }
+        match t {
+            LTy::Str => LE::Rt(Rt::StrCat, vec![v, LE::S(String::new())]),
+            LTy::PInt => v,
+            LTy::Tup(ts) => {
+                let x = self.bind(v, t.clone());
+                let fields = ts.iter().enumerate().map(|(k, ft)| self.deep_copy(LE::Field(Box::new(x.clone()), k), ft)).collect();
+                LE::Tup(t.clone(), fields)
+            }
+            LTy::Arr(el) => {
+                let c = self.tmp(t.clone());
+                self.emit(LS::Set(c, LE::Rt(Rt::ArrCopy, vec![v])));
+                if has_storage(el) {
+                    let (i, n) = (self.tmp(LTy::I64), self.tmp(LTy::I64));
+                    self.emit(LS::Set(i, LE::I(0)));
+                    self.emit(LS::Set(n, LE::Len(Box::new(LE::Var(c)))));
+                    let l = self.label();
+                    let el = (**el).clone();
+                    let body = self.sub(|lw| {
+                        lw.emit(LS::If(LE::Cmp(Op::Ge, Box::new(LE::Var(i)), Box::new(LE::Var(n)), LTy::I64), vec![LS::Break(l)], vec![]));
+                        let x = LE::Index { arr: Box::new(LE::Var(c)), idx: Box::new(LE::Var(i)), check: None };
+                        let x = lw.deep_copy(x, &el);
+                        lw.emit(LS::SetIndex { arr: c, idx: LE::Var(i), val: x, check: None });
+                        lw.emit(LS::Set(i, LE::Arith(Op::Add, Box::new(LE::Var(i)), Box::new(LE::I(1)), Ovf::Unchecked)));
+                    });
+                    self.emit(LS::Loop(l, body));
+                }
+                LE::Var(c)
+            }
+            _ => v,
         }
     }
 
@@ -1687,7 +1881,8 @@ impl<'a> Lw<'a> {
                 }
             }
         }
-        self.next_target.push((next_label, self.defers.len()));
+        let nd = self.next_depth.take().unwrap_or(self.defers.len());
+        self.next_target.push((next_label, nd));
         let ty = match b.body.last() {
             Some(TStmt::Expr(e)) => e.ty.clone(),
             _ => Ty::Unit,
@@ -2123,7 +2318,12 @@ impl<'a> Lw<'a> {
             Loop => {
                 let l = self.label();
                 let b = blk.unwrap();
+                let open = self.open_iter(e as *const TExpr as usize);
                 let inner = self.sub(|lw| {
+                    if let Some((r, sv, _)) = open {
+                        lw.emit(LS::RegionExit { region: r, saved: sv });
+                        lw.emit(LS::RegionEnter { region: r, saved: sv });
+                    }
                     lw.next_target.push((Some(l), lw.defers.len()));
                     lw.break_target.push((l, lw.defers.len()));
                     lw.stmts(&b.body);
@@ -2131,6 +2331,7 @@ impl<'a> Lw<'a> {
                     lw.next_target.pop();
                 });
                 self.emit(LS::Loop(l, inner));
+                self.close_iter(open);
                 LE::Unit
             }
             EnumNew => self.generator(e, blk.unwrap()),
@@ -2423,10 +2624,16 @@ impl<'a> Lw<'a> {
                 Count => lw.emit(LS::Set(acc.unwrap(), LE::Arith(Op::Add, Box::new(LE::Var(acc.unwrap())), Box::new(LE::I(1)), Ovf::Unchecked))),
                 Each => {
                     lw.break_target.push((outer, lw.defers.len()));
+                    // One region per element (freed on every way out, `next` too).
+                    let open = lw.open_iter(e as *const TExpr as usize);
+                    if open.is_some() {
+                        lw.next_depth = Some(lw.defers.len() - 1);
+                    }
                     let v = lw.inline_block(blk.unwrap(), &[x], &[fact], Some(inner));
                     if !matches!(v, LE::Unit | LE::Var(_) | LE::I(_) | LE::B(_)) {
                         lw.emit(LS::Eval(v));
                     }
+                    lw.close_iter(open);
                     lw.break_target.pop();
                 }
                 All | Any => {
@@ -3018,7 +3225,7 @@ pub(crate) fn collect_locals_stmt(s: &TStmt, out: &mut Vec<LocalId>) {
     }
 }
 
-fn collect_locals(e: &TExpr, out: &mut Vec<LocalId>) {
+pub(crate) fn collect_locals(e: &TExpr, out: &mut Vec<LocalId>) {
     match &e.kind {
         TK::Local(l) => out.push(*l),
         TK::Assign(l, v) => {

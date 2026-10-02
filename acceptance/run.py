@@ -77,6 +77,7 @@ GROUPS = {
     "packages": "M6",
     "refinements": "M6",
     "concurrency": "M7",
+    "regions": "R1",
     "asserts": "M8",
 }
 
@@ -160,6 +161,18 @@ def negative_runtime(case, group):
     status_ok = (r.returncode == -6) if status == "abort" else (r.returncode == int(status))
     missing = [l for l in lines[1:] if l not in r.stderr]
     check(group, f"{case} runtime failure", status_ok and not missing, f"exit {r.returncode}" + (f", missing {missing}" if missing else ""))
+
+
+def memory():
+    """R1: call- and loop-heavy programs run in bounded memory (release builds)."""
+    d = CASES / "mem"
+    for prog, want in [("calls.alx", "12588314"), ("loops.alx", "1000000")]:
+        r, _ = run([ALX, "build", "--release", prog], cwd=d)
+        binary = r.stdout.strip()
+        r2, _ = run([binary], cwd=d, env={"ALX_MEMSTATS": "1"})
+        peak = next((int(w.split("=")[1]) for w in r2.stderr.split() if w.startswith("peak=")), None)
+        ok = r2.returncode == 0 and r2.stdout.splitlines()[:1] == [want] and peak is not None and peak <= 8 << 20
+        check("R1", f"bounded memory: {prog}", ok, f"peak {peak} bytes, stdout {r2.stdout.strip()[:40]!r}")
 
 
 def warnings():
@@ -349,6 +362,7 @@ def main():
         print("== modules", flush=True)
         modules()
         warnings()
+        memory()
         fmt_check()
         print("== alx test", flush=True)
         testing()

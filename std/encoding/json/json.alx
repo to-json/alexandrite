@@ -1,0 +1,281 @@
+# Package json: Go's encoding/json, built on compile-time derives (S3).
+#
+# There is no runtime type information, so a type opts in:
+#
+#   import "encoding/json"
+#
+#   #[derive(Json)]
+#   struct User {
+#     name: Str
+#     #[json("e-mail")] email: Str?
+#     #[json(omit_empty)] tags: [Str]
+#     #[json(skip)] cache: Int
+#   }
+#
+#   s = ~u.to_json                    # {"name":"ann","e-mail":null}
+#   u2 = ~User.from_json(s)           # also: u.to_json_indent("", "  ")
+#
+# What `#[derive(Json)]` writes into the type (the parser expands it to plain
+# defs; see compiler/src/derive.rs):
+#
+#   def json_enc(e: json.Encoder)              write the value to an Encoder
+#   def self.json_dec(d: json.Decoder) -> ~T   read one value from a Decoder
+#   def to_json -> ~Str                        compact JSON (Go's Marshal)
+#   def to_json_indent(prefix, indent) -> ~Str (Go's MarshalIndent)
+#   def self.from_json(s: Str) -> ~T           one whole document (Go's Unmarshal)
+#
+# `json.marshal(v)` takes anything with a `json_enc` (a derived type, a Value).
+#
+# ---- Encoding table (Go's, where Go has the concept)
+#
+#   Int, I8..U64   a number, without a fraction          Bool    true / false
+#   Float          Go's shortest form ('f', or 'e' below 1e-6 / from 1e21);
+#                  NaN and the infinities fail the encoding (json: unsupported value)
+#   Str            a string, escaped as Go does by default: <, >, & as < >
+#                  & (see Encoder.set_escape_html!), U+2028/9 as  /9, invalid
+#                  UTF-8 as �
+#   T?             the value, or null
+#   [T]            an array (an empty slice is [] -- there is no nil slice)
+#   Map[Str, V]    an object, in insertion order (Go sorts the keys)
+#   (A, B)         an array of the elements
+#   struct         an object with the fields in order; options on a field:
+#                    #[json("name")]       the key
+#                    #[json(omit_empty)]   leave out false, 0, "", [], {} and none
+#                    #[json(skip)]         leave out of encoding and decoding
+#   enum           (an extension: Go has no sum types; serde's "externally tagged")
+#                    unit variant         "Red"
+#                    Circle(Float)        {"Circle":1.5}
+#                    Pair(Int, Str)       {"Pair":[1,"a"]}
+#                    Rect(w: Float, h: Float)   {"Rect":{"w":1,"h":2}}
+#                  A variant takes `#[json("name")]` to rename it, its named fields
+#                  take the field options.
+#
+# ---- Decoding (Go's Unmarshal rules)
+#
+#   - The document is checked for syntax first (so a syntax error anywhere beats a
+#     type error earlier in the text, as in Go).
+#   - Unknown object keys are skipped. Keys match exactly (Go also matches case
+#     insensitively). A key given twice: the last wins. Fields absent from the
+#     input keep their zero value.
+#   - null leaves a field at its zero value (Go: unchanged), and is none for a `T?`.
+#   - Numbers into an Int type must be integers in range: 1.5, 1e2 and 300 into a
+#     U8 are type errors. Into a Float: any number that fits.
+#   - Strings are unescaped, \uXXXX with surrogate pairs; a lone surrogate and
+#     invalid UTF-8 become U+FFFD.
+#
+# ---- Errors (JsonError; messages are Go's where Go has the same error)
+#
+#   Syntax      unexpected end of JSON input
+#               invalid character 'x' looking for beginning of value
+#               (also: after object key, after array element, in string escape
+#               code, in literal true (expecting 'r'), in numeric literal, ...)
+#   Type        json: cannot unmarshal string into field User.age of type Int
+#               (`into value of type` when there is no field, `number 1.5`
+#               for a number that is not an integer)
+#   Unsupported json: unsupported value: NaN
+#   Invalid     json: unknown variant "Pentagon" for Shape / missing field ...
+#   `e.offset` is the byte offset where it was found.
+#
+# ---- The dynamic API
+#
+# `parse(s)` gives a Value (an immutable tree stored in flat arrays: an enum
+# can't contain itself, see GO-VS-RUBY D?? / `Value contains itself`).
+# `v.kind`, `v.get("key")`, `v.at(i)`, `v.as_str`, `v.as_float`, `v.as_int`,
+# `v.as_bool`, `v.size`, `v.keys`, `v.to_s`. A Value can be a field of a derived
+# type (like Go's json.RawMessage / interface{}).
+#
+# ---- Also
+#
+#   valid(s) -> Bool          check(s) -> ~Unit   (the error says where)
+#   indent(s, prefix, indent) -> ~Str     compact(s) -> ~Str     quote(s) -> Str
+#   html_escape(s) -> Str     marshal(v) -> ~Str  marshal_indent(v, prefix, indent)
+#   Encoder / Decoder for streaming and for hand-written json_enc / json_dec.
+
+import "strconv"
+import "unicode/utf8"
+
+# What can go wrong. `offset` is a byte offset into the input.
+pub error JsonError {
+  Syntax(msg: Str, offset: Int)
+  Type(value: Str, want: Str, field: Str, offset: Int)
+  Unsupported(msg: Str)
+  Invalid(msg: Str, offset: Int)
+
+  def message -> Str {
+    case self {
+      Syntax(m, _) => m
+      Type(v, w, f, _) => f == "" ? "json: cannot unmarshal " + v + " into value of type " + w : "json: cannot unmarshal " + v + " into field " + f + " of type " + w
+      Unsupported(m) => "json: unsupported value: " + m
+      Invalid(m, _) => "json: " + m
+    }
+  }
+
+  # The byte offset in the input where the problem was found (0 for encoding errors).
+  pub def offset -> Int {
+    case self {
+      Syntax(_, o) => o
+      Type(_, _, _, o) => o
+      Unsupported(_) => 0
+      Invalid(_, o) => o
+    }
+  }
+}
+
+HEX = "0123456789abcdef"
+
+# ------------------------------------------------------------------ helpers
+
+# Go's quoteChar: the byte c as a quoted character for syntax errors.
+def quote_char(c: Int) -> Str {
+  return "'\\''" if c == 39
+  return "'\"'" if c == 34
+  q = strconv.quote_rune(c.to_i32)
+  q
+}
+
+def err_char(c: Byte, ctx: Str, off: Int) -> JsonError {
+  JsonError.Syntax(msg: "invalid character " + quote_char(c.to_i) + " " + ctx, offset: off)
+}
+
+def err_eof(off: Int) -> JsonError {
+  JsonError.Syntax(msg: "unexpected end of JSON input", offset: off)
+}
+
+# Appends the UTF-8 encoding of rune r (r must be valid).
+def push_rune(buf: [Byte], r: Int) -> [Byte] {
+  b = buf
+  if r < 0x80 {
+    b << r.as_u8
+  } else if r < 0x800 {
+    b << (0xC0 | (r >> 6)).as_u8
+    b << (0x80 | (r & 0x3F)).as_u8
+  } else if r < 0x10000 {
+    b << (0xE0 | (r >> 12)).as_u8
+    b << (0x80 | ((r >> 6) & 0x3F)).as_u8
+    b << (0x80 | (r & 0x3F)).as_u8
+  } else {
+    b << (0xF0 | (r >> 18)).as_u8
+    b << (0x80 | ((r >> 12) & 0x3F)).as_u8
+    b << (0x80 | ((r >> 6) & 0x3F)).as_u8
+    b << (0x80 | (r & 0x3F)).as_u8
+  }
+  b
+}
+
+# Appends s as a JSON string literal, with Go's escaping.
+def put_quoted(buf: [Byte], s: Str, html: Bool) -> [Byte] {
+  b = buf
+  b << 34
+  n = s.size
+  i = 0
+  while i < n {
+    c = s[i]
+    if c < 0x80 {
+      if c >= 0x20 && c != 34 && c != 92 && !(html && (c == 60 || c == 62 || c == 38)) {
+        b << c
+      } else if c == 34 {
+        b << 92
+        b << 34
+      } else if c == 92 {
+        b << 92
+        b << 92
+      } else if c == 10 {
+        b << 92
+        b << 110
+      } else if c == 13 {
+        b << 92
+        b << 114
+      } else if c == 9 {
+        b << 92
+        b << 116
+      } else if c == 8 {
+        b << 92
+        b << 98
+      } else if c == 12 {
+        b << 92
+        b << 102
+      } else {
+        # \u00XX
+        b << 92
+        b << 117
+        b << 48
+        b << 48
+        b << HEX[(c >> 4).to_i]
+        b << HEX[(c & 15).to_i]
+      }
+      i += 1
+    } else {
+      r, w = utf8.decode_rune_at(s, i)
+      if r == 0xFFFD && w == 1 {
+        # invalid UTF-8
+        b << 92
+        b << 117
+        b << 102
+        b << 102
+        b << 102
+        b << 100
+      } else if r == 0x2028 || r == 0x2029 {
+        b << 92
+        b << 117
+        b << 50
+        b << 48
+        b << 50
+        b << HEX[r.to_i - 0x2028 + 8]
+      } else {
+        j = 0
+        while j < w {
+          b << s[i + j]
+          j += 1
+        }
+      }
+      i += w
+    }
+  }
+  b << 34
+  b
+}
+
+# s as a JSON string literal, as Go's json.Marshal writes it (<, >, & escaped).
+pub def quote(s: Str) -> Str {
+  b: [Byte] = []
+  b = put_quoted(b, s, true)
+  Str.from_bytes(b)
+}
+
+# The same, without the HTML escapes (Go's SetEscapeHTML(false)).
+pub def quote_raw(s: Str) -> Str {
+  b: [Byte] = []
+  b = put_quoted(b, s, false)
+  Str.from_bytes(b)
+}
+
+# s with <, >, & and U+2028/9 in JSON strings escaped (Go's HTMLEscape).
+pub def html_escape(s: Str) -> Str {
+  b: [Byte] = []
+  i = 0
+  n = s.size
+  while i < n {
+    c = s[i]
+    if c == 60 || c == 62 || c == 38 {
+      b << 92
+      b << 117
+      b << 48
+      b << 48
+      b << HEX[(c >> 4).to_i]
+      b << HEX[(c & 15).to_i]
+      i += 1
+    } else if c == 0xE2 && i + 2 < n && s[i + 1] == 0x80 && (s[i + 2] == 0xA8 || s[i + 2] == 0xA9) {
+      b << 92
+      b << 117
+      b << 50
+      b << 48
+      b << 50
+      b << HEX[s[i + 2].to_i - 0xA8 + 8]
+      i += 3
+    } else {
+      b << c
+      i += 1
+    }
+  }
+  Str.from_bytes(b)
+}

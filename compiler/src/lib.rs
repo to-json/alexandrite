@@ -7,6 +7,7 @@ pub mod capture;
 pub mod cgen;
 pub mod check;
 pub mod consts;
+pub mod derive;
 pub mod diag;
 pub mod fmt;
 pub mod front;

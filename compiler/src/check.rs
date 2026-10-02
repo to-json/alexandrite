@@ -4268,6 +4268,39 @@ impl<'w, 'a> FnCx<'w, 'a> {
     fn const_call_named(&mut self, c: &str, named: Option<Ty>, csp: Span, name: &str, name_span: Span, args: &[Expr], block: Option<&Block>, sp: Span) -> R<TExpr> {
         let argv = |cx: &mut Self| args.iter().map(|a| cx.value(a)).collect::<R<Vec<_>>>();
         let named = named.or_else(|| self.w.structs.get(c).cloned());
+        // `Point.from_json(s)`: a static method (`def self.from_json`), a def of the
+        // type without a receiver.
+        if named.is_some() {
+            let q = method_name(c, name);
+            if let Some(&def) = self.w.by_name.get(&q) {
+                if self.w.defs[def].def.params.first().is_none_or(|p| p.name != "self") {
+                    if block.is_some() {
+                        return Err(Diag::new(sp, format!("`{c}.{name}` doesn't take a block")));
+                    }
+                    let d = self.w.defs[def].def.clone();
+                    if args.len() != d.params.len() {
+                        return Err(Diag::new(name_span, format!("`{c}.{name}` takes {} argument(s), got {}", d.params.len(), args.len())));
+                    }
+                    let mut targs = vec![];
+                    for (a, p) in args.iter().zip(&d.params) {
+                        let v = match &p.ty {
+                            Some(t) => {
+                                let prev = enter_pkg(&self.w.defs[def].pkg);
+                                let r = type_from(t, &self.w.structs, &self.w.consts);
+                                leave_pkg(prev);
+                                match r {
+                                    Ok(t) => self.value_as(a, &t)?,
+                                    Err(_) => self.value(a)?,
+                                }
+                            }
+                            None => self.value(a)?,
+                        };
+                        targs.push(v);
+                    }
+                    return self.call_def(def, &q, name_span, targs, sp);
+                }
+            }
+        }
         if let Some(et @ Ty::Enum(..)) = named.clone() {
             let Ty::Enum(_, vs) = &et else { unreachable!() };
             let Some(k) = vs.iter().position(|(v, _)| v == name) else {

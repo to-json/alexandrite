@@ -1,0 +1,163 @@
+# Encoding: the Encoder that derived `json_enc` methods write to.
+
+import "strconv"
+
+# Appends the decimal digits of u.
+def put_uint(buf: [Byte], u0: U64) -> [Byte] {
+  b = buf
+  u = u0
+  if u < 10 {
+    b << (48 + u.as_u8)
+    return b
+  }
+  start = b.size
+  while u > 0 {
+    b << (48 + (u % 10).as_u8)
+    u = u / 10
+  }
+  i = start
+  j = b.size - 1
+  while i < j {
+    t = b[i]
+    b[i] = b[j]
+    b[j] = t
+    i += 1
+    j -= 1
+  }
+  b
+}
+
+struct EState {
+  buf: [Byte]
+  err: Str
+  html: Bool
+}
+
+# The output side. Copies share the buffer (GO-VS-RUBY D36), so a derived
+# `json_enc(e)` can be handed `e` by value. Make one with `new_encoder`.
+pub struct Encoder {
+  st: [EState]
+
+  # Appends s as it is (punctuation, a number you formatted, a literal).
+  pub def raw!(s: Str) {
+    b = st[0].buf
+    i = 0
+    n = s.size
+    while i < n {
+      b << s[i]
+      i += 1
+    }
+    self.st[0].buf = b
+  }
+
+  pub def byte!(c: Byte) {
+    b = st[0].buf
+    b << c
+    self.st[0].buf = b
+  }
+
+  pub def null! { raw!("null") }
+
+  pub def bool!(v: Bool) { raw!(v ? "true" : "false") }
+
+  pub def int!(v: Int) {
+    b = st[0].buf
+    if v < 0 {
+      b << 45
+      b = put_uint(b, 0 -% v.as_u64)
+    } else {
+      b = put_uint(b, v.as_u64)
+    }
+    self.st[0].buf = b
+  }
+
+  pub def uint!(v: U64) {
+    b = st[0].buf
+    b = put_uint(b, v)
+    self.st[0].buf = b
+  }
+
+  # Go's float rules. NaN and the infinities record an error that `finish!` reports.
+  pub def float!(f: Float) {
+    if f != f || f > 1.7976931348623157e308 || f < -1.7976931348623157e308 {
+      fail_with!(strconv.format_float(f, "g", -1, 64))
+      return
+    }
+    a = f < 0.0 ? -f : f
+    b = st[0].buf
+    if a < 1.0e15 && a == a.to_i.to_f {
+      # integral: no fraction, no exponent
+      if f < 0.0 || (f == 0.0 && 1.0 / f < 0.0) {
+        b << 45
+      }
+      b = put_uint(b, a.to_i.as_u64)
+      self.st[0].buf = b
+      return
+    }
+    fmt = "f"
+    fmt = "e" if a < 1.0e-6 || a >= 1.0e21
+    s = strconv.format_float(f, fmt, -1, 64)
+    n = s.size
+    if fmt == "e" && n >= 4 && s[n - 4] == 101 && s[n - 3] == 45 && s[n - 2] == 48 {
+      # e-09 -> e-9
+      i = 0
+      while i < n - 2 {
+        b << s[i]
+        i += 1
+      }
+      b << s[n - 1]
+    } else {
+      i = 0
+      while i < n {
+        b << s[i]
+        i += 1
+      }
+    }
+    self.st[0].buf = b
+    nil
+  }
+
+  def fail_with!(msg: Str) {
+    if st[0].err == "" {
+      self.st[0].err = msg
+    }
+  }
+
+  # Appends s as a JSON string.
+  pub def str!(s: Str) {
+    b = st[0].buf
+    b = put_quoted(b, s, st[0].html)
+    self.st[0].buf = b
+  }
+
+  # Go's SetEscapeHTML: on by default.
+  pub def set_escape_html!(on: Bool) {
+    self.st[0].html = on
+  }
+
+  # The JSON written so far, or the first error (a NaN or infinity).
+  pub def finish! -> ~Str<JsonError> {
+    fail JsonError.Unsupported(st[0].err) if st[0].err != ""
+    Str.from_bytes(st[0].buf)
+  }
+
+  pub def size -> Int { st[0].buf.size }
+}
+
+pub def new_encoder -> Encoder {
+  Encoder.new(st: [EState.new(buf: [], err: "", html: true)])
+}
+
+# Go's Marshal: v is anything with a `json_enc` (a derived type, a Value).
+pub def marshal[T](v: T) -> ~Str<JsonError> {
+  e = new_encoder()
+  v.json_enc(e)
+  e.~finish!
+}
+
+pub def marshal_indent[T](v: T, prefix: Str, ind: Str) -> ~Str<JsonError> {
+  e = new_encoder()
+  v.json_enc(e)
+  s = e.~finish!
+  ~indent(s, prefix, ind)
+}

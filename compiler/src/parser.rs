@@ -11,7 +11,7 @@ use std::collections::HashSet;
 /// with the concrete type.
 fn generic_self(methods: &mut [Def]) {
     for m in methods {
-        if let Some(p) = m.params.first_mut() {
+        if let Some(p) = m.params.first_mut().filter(|p| p.name == "self") {
             p.ty = None;
         }
     }
@@ -43,12 +43,16 @@ pub struct Parser<'a> {
     usings: Vec<String>,
     /// Parsing an `extern def`: no body, an optional `= "symbol"`.
     extern_mode: bool,
+    /// `#[derive(...)]` names read before the declaration being parsed.
+    cur_derives: Vec<String>,
+    /// Derives to expand once the whole module is read (see derive.rs).
+    jobs: Vec<crate::derive::DeriveJob>,
 }
 
 type PResult<T> = Result<T, Diag>;
 
 pub fn parse(file: u32, toks: &[Token], next_id: &mut NodeId) -> PResult<Module> {
-    let mut p = Parser { toks, pos: 0, next_id, scopes: vec![HashSet::new()], in_cond: false, usings: vec![], extern_mode: false };
+    let mut p = Parser { toks, pos: 0, next_id, scopes: vec![HashSet::new()], in_cond: false, usings: vec![], extern_mode: false, cur_derives: vec![], jobs: vec![] };
     p.module(file)
 }
 
@@ -203,11 +207,13 @@ impl<'a> Parser<'a> {
                         }
                         Tok::Kw(Kw::Struct) => {
                             let s = self.struct_def(&mut m.defs)?;
+                            self.mark_pub(&s.name);
                             m.public.insert(s.name.clone());
                             m.structs.push(s);
                         }
                         Tok::Kw(Kw::Enum) => {
                             let e = self.enum_def(&mut m.defs)?;
+                            self.mark_pub(&e.name);
                             m.public.insert(e.name.clone());
                             m.enums.push(e);
                         }
@@ -239,6 +245,7 @@ impl<'a> Parser<'a> {
                         t => return Err(Diag::new(self.span(), format!("`pub` goes before a declaration, found {}", describe(&t)))),
                     }
                 }
+                Tok::Attr(_) if self.attrs_precede_type() => self.type_attrs()?,
                 Tok::Attr(_) | Tok::Kw(Kw::Def) | Tok::Kw(Kw::Fn) => m.defs.push(self.def()?),
                 Tok::Ident(kw) if kw == "extern" && matches!(self.peek_at(1), Tok::Kw(Kw::Def)) => m.defs.push(self.extern_def()?),
                 Tok::Kw(Kw::Struct) => {
@@ -274,7 +281,79 @@ impl<'a> Parser<'a> {
                 }
             }
         }
+        self.expand_derives(&mut m)?;
         Ok(m)
+    }
+
+    /// Are the `#[...]` attributes at the cursor followed by a struct or enum?
+    fn attrs_precede_type(&self) -> bool {
+        let mut k = 0;
+        while matches!(self.peek_at(k), Tok::Attr(_) | Tok::Newline) {
+            k += 1;
+        }
+        if matches!(self.peek_at(k), Tok::Ident(p) if p == "pub") {
+            k += 1;
+        }
+        matches!(self.peek_at(k), Tok::Kw(Kw::Struct) | Tok::Kw(Kw::Enum))
+    }
+
+    /// `#[derive(Json, Eq)]` before a struct or enum.
+    fn type_attrs(&mut self) -> PResult<()> {
+        while let Tok::Attr(a) = self.peek().clone() {
+            let sp = self.bump().span;
+            match crate::derive::derive_names(&a, sp)? {
+                Some(names) => self.cur_derives.extend(names),
+                None => return Err(Diag::new(sp, format!("unknown attribute `#[{a}]` on a type")).note("known: #[derive(Json)]; #[json(...)] goes on fields and variants")),
+            }
+            self.skip_newlines();
+        }
+        Ok(())
+    }
+
+    fn mark_pub(&mut self, name: &str) {
+        if let Some(j) = self.jobs.iter_mut().rev().find(|j| j.name == name) {
+            j.public = true;
+        }
+    }
+
+    /// Write the code of every recorded derive and parse it in as methods.
+    fn expand_derives(&mut self, m: &mut Module) -> PResult<()> {
+        if self.jobs.is_empty() {
+            return Ok(());
+        }
+        let jobs = std::mem::take(&mut self.jobs);
+        // The local name of the `encoding/json` import (added if the file has none).
+        let alias = match m.imports.iter().find(|i| i.path == "encoding/json") {
+            Some(i) => import_name(i),
+            None => {
+                m.imports.push(Import { alias: Some("alxjson".into()), path: "encoding/json".into(), span: jobs[0].span });
+                "alxjson".to_string()
+            }
+        };
+        let mut types = crate::derive::ModuleTypes { local: Default::default(), enums: Default::default() };
+        for s in &m.structs {
+            types.local.insert(s.name.clone(), jobs.iter().any(|j| j.name == s.name));
+        }
+        for e in &m.enums {
+            types.local.insert(e.name.clone(), jobs.iter().any(|j| j.name == e.name));
+            types.enums.insert(e.name.clone());
+        }
+        for job in &jobs {
+            let text = crate::derive::json_source(job, &alias, &types)?;
+            let mut toks = crate::lexer::lex(job.span.file, &text).map_err(|d| Diag::new(job.span, format!("derive(Json) on `{}` made code that doesn't lex: {}\n{text}", job.name, d.msg)))?;
+            for t in &mut toks {
+                t.span = job.span;
+            }
+            let mut sub = Parser { toks: &toks, pos: 0, next_id: self.next_id, scopes: vec![HashSet::new()], in_cond: false, usings: vec![], extern_mode: false, cur_derives: vec![], jobs: vec![] };
+            sub.skip_newlines();
+            let mut defs = vec![];
+            sub.struct_def(&mut defs).map_err(|d| Diag::new(job.span, format!("derive(Json) on `{}` made code that doesn't parse: {}\n{text}", job.name, d.msg)))?;
+            for d in &mut defs {
+                d.span = job.span;
+            }
+            m.defs.extend(defs);
+        }
+        Ok(())
     }
 
     fn def(&mut self) -> PResult<Def> {
@@ -327,6 +406,12 @@ impl<'a> Parser<'a> {
             return Err(Diag::new(self.span(), "expected `def` after attribute"));
         }
         self.bump();
+        // `def self.name(...)` inside a type: a static method (no receiver), called `Type.name(...)`.
+        let is_static = owner.is_some() && !in_iface && matches!(self.peek(), Tok::Ident(s) if s == "self") && matches!(self.peek_at(1), Tok::Op("."));
+        if is_static {
+            self.bump();
+            self.bump();
+        }
         let name_span = self.span();
         let name = match self.bump().tok {
             Tok::Ident(n) => n,
@@ -338,7 +423,7 @@ impl<'a> Parser<'a> {
         let tparams = self.tparams()?;
         self.scopes.push(HashSet::new());
         let mut params = vec![];
-        if let Some(o) = owner {
+        if let Some(o) = owner.filter(|_| !is_static) {
             let t = TypeExpr::Named(o.to_string(), name_span);
             let ty = if name.ends_with('!') { TypeExpr::Array(Box::new(t), name_span) } else { t };
             self.declare("self");
@@ -542,8 +627,11 @@ impl<'a> Parser<'a> {
         };
         let tparams = self.tparams()?;
         let first_method = methods.len();
+        let derives = std::mem::take(&mut self.cur_derives);
         self.expect_op("{")?;
         let mut variants: Vec<(String, Vec<(String, TypeExpr, Span)>, Span)> = vec![];
+        let mut dvariants: Vec<crate::derive::DVariant> = vec![];
+        let mut vpend = crate::derive::Opts::default();
         loop {
             self.skip_newlines();
             while self.eat_op(",") {
@@ -551,6 +639,14 @@ impl<'a> Parser<'a> {
             }
             if self.eat_op("}") {
                 break;
+            }
+            // `#[json("name")]` before a variant.
+            if let Tok::Attr(a) = self.peek().clone() {
+                if a.trim_start().starts_with("json") {
+                    let asp = self.bump().span;
+                    crate::derive::apply_json_attr(&a, asp, &mut vpend)?;
+                    continue;
+                }
             }
             if matches!(self.peek(), Tok::Ident(p) if p == "pub") && matches!(self.peek_at(1), Tok::Attr(_) | Tok::Kw(Kw::Def) | Tok::Kw(Kw::Fn)) {
                 self.bump();
@@ -572,9 +668,15 @@ impl<'a> Parser<'a> {
                 return Err(Diag::new(vsp, format!("variant `{vname}` is declared twice")));
             }
             let mut fields = vec![];
+            let mut dfields: Vec<crate::derive::DField> = vec![];
             if self.is_op("(") && !self.space_before() {
                 self.bump();
                 while !self.is_op(")") {
+                    let mut fo = crate::derive::Opts::default();
+                    while let Tok::Attr(a) = self.peek().clone() {
+                        let asp = self.bump().span;
+                        crate::derive::apply_json_attr(&a, asp, &mut fo)?;
+                    }
                     let fsp = self.span();
                     // `name: Type`, or just `Type` (fields named 0, 1, ...).
                     let fname = if let (Tok::Ident(n), Tok::Op(":")) = (self.peek().clone(), self.peek_at(1).clone()) {
@@ -585,6 +687,7 @@ impl<'a> Parser<'a> {
                         fields.len().to_string()
                     };
                     let ty = self.type_expr()?;
+                    dfields.push(crate::derive::DField { name: fname.clone(), ty: ty.clone(), opts: fo, span: fsp });
                     fields.push((fname, ty, fsp));
                     if !self.eat_op(",") {
                         break;
@@ -592,12 +695,17 @@ impl<'a> Parser<'a> {
                 }
                 self.expect_op(")")?;
             }
+            dvariants.push(crate::derive::DVariant { name: vname.clone(), fields: dfields, opts: std::mem::take(&mut vpend) });
             variants.push((vname, fields, vsp));
         }
         if !tparams.is_empty() {
             generic_self(&mut methods[first_method..]);
         }
-        Ok(EnumDef { name, span: start.to(self.prev_span()), error: false, tparams, variants })
+        let span = start.to(self.prev_span());
+        if derives.iter().any(|d| d == "Json") {
+            self.jobs.push(crate::derive::DeriveJob { name: name.clone(), tparams: tparams.iter().map(|t| t.name.clone()).collect(), public: false, span, shape: crate::derive::DShape::Enum(dvariants) });
+        }
+        Ok(EnumDef { name, span, error: false, tparams, variants })
     }
 
     fn struct_def(&mut self, methods: &mut Vec<Def>) -> PResult<StructDef> {
@@ -609,8 +717,11 @@ impl<'a> Parser<'a> {
         };
         let tparams = self.tparams()?;
         let first_method = methods.len();
+        let derives = std::mem::take(&mut self.cur_derives);
         self.expect_op("{")?;
         let mut fields: Vec<(String, TypeExpr, Span)> = vec![];
+        let mut fopts: Vec<crate::derive::Opts> = vec![];
+        let mut pend = crate::derive::Opts::default();
         loop {
             self.skip_newlines();
             while self.eat_op(",") {
@@ -618,6 +729,14 @@ impl<'a> Parser<'a> {
             }
             if self.eat_op("}") {
                 break;
+            }
+            // `#[json("name")]`, `#[json(omit_empty)]`, `#[json(skip)]` on the next field.
+            if let Tok::Attr(a) = self.peek().clone() {
+                if a.trim_start().starts_with("json") {
+                    let asp = self.bump().span;
+                    crate::derive::apply_json_attr(&a, asp, &mut pend)?;
+                    continue;
+                }
             }
             if matches!(self.peek(), Tok::Ident(p) if p == "pub") && matches!(self.peek_at(1), Tok::Attr(_) | Tok::Kw(Kw::Def) | Tok::Kw(Kw::Fn)) {
                 self.bump();
@@ -641,11 +760,17 @@ impl<'a> Parser<'a> {
                 return Err(Diag::new(fsp, format!("field `{fname}` is declared twice")));
             }
             fields.push((fname, ty, fsp));
+            fopts.push(std::mem::take(&mut pend));
         }
         if !tparams.is_empty() {
             generic_self(&mut methods[first_method..]);
         }
-        Ok(StructDef { name, span: start.to(self.prev_span()), tparams, fields })
+        let span = start.to(self.prev_span());
+        if derives.iter().any(|d| d == "Json") {
+            let dfields = fields.iter().zip(fopts).map(|((n, t, s), o)| crate::derive::DField { name: n.clone(), ty: t.clone(), opts: o, span: *s }).collect();
+            self.jobs.push(crate::derive::DeriveJob { name: name.clone(), tparams: tparams.iter().map(|t| t.name.clone()).collect(), public: false, span, shape: crate::derive::DShape::Struct(dfields) });
+        }
+        Ok(StructDef { name, span, tparams, fields })
     }
 
     fn type_expr(&mut self) -> PResult<TypeExpr> {
@@ -1584,7 +1709,7 @@ impl<'a> Parser<'a> {
                         IPiece::Lit(s) => parts.push(InterpPart::Lit(s)),
                         IPiece::Code(src, base) => {
                             let toks = crate::lexer::lex_at(sp.file, &src, base)?;
-                            let mut sub = Parser { toks: &toks, pos: 0, next_id: self.next_id, scopes: self.scopes.clone(), in_cond: false, usings: vec![], extern_mode: false };
+                            let mut sub = Parser { toks: &toks, pos: 0, next_id: self.next_id, scopes: self.scopes.clone(), in_cond: false, usings: vec![], extern_mode: false, cur_derives: vec![], jobs: vec![] };
                             sub.skip_newlines();
                             let e = sub.expr()?;
                             sub.skip_newlines();

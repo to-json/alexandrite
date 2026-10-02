@@ -1,0 +1,399 @@
+# The dynamic side: a parsed JSON document as a Value, and Indent / Compact.
+#
+# A recursive enum (`enum Value { Arr([Value]) }`) isn't expressible yet (the
+# compiler says "`Value` contains itself; it is a value, so it can't"), so a
+# document is stored flat: nodes in post-order (children before their parent,
+# the root last) and one array of child indices. A Value is (nodes, edges, id),
+# three words, cheap to copy; copies share the arrays.
+
+import "strconv"
+
+K_NULL = 0
+K_BOOL = 1
+K_NUM = 2
+K_STR = 3
+K_ARR = 4
+K_OBJ = 5
+
+pub enum Kind { Null, Bool, Number, String, Array, Object }
+
+pub struct Node {
+  kind: Int
+  # Bool: 1 for true. Number: the parsed value.
+  num: Float
+  # String: the text. Number: the literal as written.
+  str: Str
+  # The member name when the parent is an object.
+  key: Str
+  # Containers: the first child's place in `edges`, and how many children.
+  start: Int
+  cnt: Int
+}
+
+struct DocS {
+  nodes: [Node]
+  edges: [Int]
+}
+
+struct DocB {
+  st: [DocS]
+
+  def add!(kind: Int, num: Float, str: Str, key: Str, start: Int, cnt: Int) -> Int {
+    ns = st[0].nodes
+    ns << Node.new(kind: kind, num: num, str: str, key: key, start: start, cnt: cnt)
+    self.st[0].nodes = ns
+    ns.size - 1
+  }
+
+  def add_edges!(kids: [Int]) -> Int {
+    es = st[0].edges
+    start = es.size
+    for k in kids { es << k }
+    self.st[0].edges = es
+    start
+  }
+}
+
+# Parses the value at the decoder's position into b; returns its node index.
+def build(d: Decoder, b: DocB, key: Str, depth: Int) -> ~Int<JsonError> {
+  s = d.s
+  p = skip_ws(s, d.st[0].pos)
+  fail err_eof(p) if p >= s.size
+  c = s[p]
+  if c == 34 {
+    str = d.~read_string!(p)
+    return b.add!(K_STR, 0.0, str, key, 0, 0)
+  }
+  if c == 123 {
+    fail JsonError.Invalid(msg: "exceeded max depth", offset: p) if depth >= MAX_DEPTH
+    kids: [Int] = []
+    _ = d.~open_obj!
+    while d.~next_key! {
+      k = d.key
+      kids << ~build(d, b, k, depth + 1)
+    }
+    start = b.add_edges!(kids)
+    return b.add!(K_OBJ, 0.0, "", key, start, kids.size)
+  }
+  if c == 91 {
+    fail JsonError.Invalid(msg: "exceeded max depth", offset: p) if depth >= MAX_DEPTH
+    kids: [Int] = []
+    _ = d.~open_arr!
+    while d.~more! {
+      kids << ~build(d, b, "", depth + 1)
+    }
+    start = b.add_edges!(kids)
+    return b.add!(K_ARR, 0.0, "", key, start, kids.size)
+  }
+  if c == 116 {
+    d.st[0].pos = ~literal_end(s, p, "true")
+    return b.add!(K_BOOL, 1.0, "", key, 0, 0)
+  }
+  if c == 102 {
+    d.st[0].pos = ~literal_end(s, p, "false")
+    return b.add!(K_BOOL, 0.0, "", key, 0, 0)
+  }
+  if c == 110 {
+    d.st[0].pos = ~literal_end(s, p, "null")
+    return b.add!(K_NULL, 0.0, "", key, 0, 0)
+  }
+  if c == 45 || is_digit(c) {
+    e = ~number_end(s, p)
+    d.st[0].pos = e
+    txt = s[p...e]
+    f = parse_number(txt)
+    # A literal beyond Float's range (1e999): keep the text, value 0.
+    return b.add!(K_NUM, f || 0.0, txt, key, 0, 0)
+  }
+  fail begin_value_err(s, p)
+}
+
+# A parsed JSON value (or a part of a parsed document).
+pub struct Value {
+  nodes: [Node]
+  edges: [Int]
+  id: Int
+
+  def node -> Node {
+    return Node.new(kind: K_NULL, num: 0.0, str: "", key: "", start: 0, cnt: 0) if id < 0 || id >= nodes.size
+    nodes[id]
+  }
+
+  def child(k: Int) -> Value {
+    Value.new(nodes: nodes, edges: edges, id: edges[node.start + k])
+  }
+
+  pub def kind -> Kind {
+    case node.kind {
+      K_BOOL => Kind.Bool
+      K_NUM => Kind.Number
+      K_STR => Kind.String
+      K_ARR => Kind.Array
+      K_OBJ => Kind.Object
+      _ => Kind.Null
+    }
+  }
+
+  pub def null? -> Bool { node.kind == K_NULL }
+  pub def bool? -> Bool { node.kind == K_BOOL }
+  pub def number? -> Bool { node.kind == K_NUM }
+  pub def string? -> Bool { node.kind == K_STR }
+  pub def array? -> Bool { node.kind == K_ARR }
+  pub def object? -> Bool { node.kind == K_OBJ }
+
+  pub def as_bool -> Bool? {
+    n = node
+    return none if n.kind != K_BOOL
+    n.num != 0.0
+  }
+
+  pub def as_float -> Float? {
+    n = node
+    return none if n.kind != K_NUM
+    n.num
+  }
+
+  # The number as an Int, if it is an integer that fits.
+  pub def as_int -> Int? {
+    n = node
+    return none if n.kind != K_NUM
+    r = strconv.parse_int(n.str, 10, 64)
+    return none if r.err?
+    r.unwrap
+  }
+
+  pub def as_str -> Str? {
+    n = node
+    return none if n.kind != K_STR
+    n.str
+  }
+
+  # The number of elements of an array, members of an object; 0 otherwise.
+  pub def size -> Int {
+    n = node
+    return 0 if n.kind != K_ARR && n.kind != K_OBJ
+    n.cnt
+  }
+
+  # Element i of an array.
+  pub def at(i: Int) -> Value? {
+    n = node
+    return none if n.kind != K_ARR || i < 0 || i >= n.cnt
+    child(i)
+  }
+
+  # Member `k` of an object (the last one if the key is repeated).
+  pub def get(k: Str) -> Value? {
+    n = node
+    return none if n.kind != K_OBJ
+    i = n.cnt - 1
+    while i >= 0 {
+      c = child(i)
+      return c if c.node.key == k
+      i -= 1
+    }
+    none
+  }
+
+  # The member names of an object, in document order.
+  pub def keys -> [Str] {
+    out: [Str] = []
+    n = node
+    return out if n.kind != K_OBJ
+    i = 0
+    while i < n.cnt {
+      out << child(i).node.key
+      i += 1
+    }
+    out
+  }
+
+  # The elements of an array, or the member values of an object.
+  pub def values -> [Value] {
+    out: [Value] = []
+    n = node
+    return out if n.kind != K_ARR && n.kind != K_OBJ
+    i = 0
+    while i < n.cnt {
+      out << child(i)
+      i += 1
+    }
+    out
+  }
+
+  # Writes the compact JSON of this value.
+  pub def json_enc(e: Encoder) {
+    n = node
+    case n.kind {
+      K_BOOL => e.bool!(n.num != 0.0)
+      K_NUM => e.raw!(n.str)
+      K_STR => e.str!(n.str)
+      K_ARR => {
+        e.raw!("[")
+        i = 0
+        while i < n.cnt {
+          e.raw!(",") if i > 0
+          child(i).json_enc(e)
+          i += 1
+        }
+        e.raw!("]")
+      }
+      K_OBJ => {
+        e.raw!("{")
+        i = 0
+        while i < n.cnt {
+          e.raw!(",") if i > 0
+          c = child(i)
+          e.str!(c.node.key)
+          e.raw!(":")
+          c.json_enc(e)
+          i += 1
+        }
+        e.raw!("}")
+      }
+      _ => e.raw!("null")
+    }
+  }
+
+  pub def self.json_dec(d: Decoder) -> ~Value<JsonError> {
+    b = DocB.new(st: [DocS.new(nodes: [], edges: [])])
+    root = ~build(d, b, "", 0)
+    Value.new(nodes: b.st[0].nodes, edges: b.st[0].edges, id: root)
+  }
+
+  # Compact JSON (an unsupported value, which a parsed tree can't hold, aside).
+  pub def to_s -> Str {
+    e = new_encoder()
+    json_enc(e)
+    r = e.finish!
+    r || ""
+  }
+
+  pub def to_json -> ~Str<JsonError> {
+    e = new_encoder()
+    json_enc(e)
+    e.~finish!
+  }
+
+  pub def to_json_indent(prefix: Str, ind: Str) -> ~Str<JsonError> {
+    s = to_json
+    ~indent(s, prefix, ind)
+  }
+}
+
+# Parses one JSON document (Go: Unmarshal into an interface{}).
+pub def parse(s: Str) -> ~Value<JsonError> {
+  ~check(s)
+  d = new_decoder(s)
+  Value.~json_dec(d)
+}
+
+# ------------------------------------------------------------ Indent, Compact
+
+def put_newline(buf: [Byte], prefix: Str, ind: Str, depth: Int) -> [Byte] {
+  b = buf
+  b << 10
+  i = 0
+  while i < prefix.size {
+    b << prefix[i]
+    i += 1
+  }
+  k = 0
+  while k < depth {
+    i = 0
+    while i < ind.size {
+      b << ind[i]
+      i += 1
+    }
+    k += 1
+  }
+  b
+}
+
+# Go's json.Indent: each element of an object or array on its own line, starting
+# with `prefix`, then `ind` once per level; `{}` and `[]` stay as they are;
+# spaces between tokens are dropped, `: ` gets one space. Fails on invalid JSON.
+pub def indent(s: Str, prefix: Str, ind: Str) -> ~Str<JsonError> {
+  ~check(s)
+  b: [Byte] = []
+  depth = 0
+  need = false
+  in_str = false
+  esc = false
+  n = s.size
+  i = 0
+  while i < n {
+    c = s[i]
+    i += 1
+    if in_str {
+      b << c
+      if esc {
+        esc = false
+      } else if c == 92 {
+        esc = true
+      } else if c == 34 {
+        in_str = false
+      }
+      next
+    }
+    next if c == 32 || c == 10 || c == 13 || c == 9
+    if need && c != 93 && c != 125 {
+      need = false
+      depth += 1
+      b = put_newline(b, prefix, ind, depth)
+    }
+    if c == 34 {
+      in_str = true
+      b << c
+    } else if c == 123 || c == 91 {
+      need = true
+      b << c
+    } else if c == 44 {
+      b << c
+      b = put_newline(b, prefix, ind, depth)
+    } else if c == 58 {
+      b << c
+      b << 32
+    } else if c == 125 || c == 93 {
+      if need {
+        need = false
+      } else {
+        depth -= 1
+        b = put_newline(b, prefix, ind, depth)
+      }
+      b << c
+    } else {
+      b << c
+    }
+  }
+  Str.from_bytes(b)
+}
+
+# Go's json.Compact: s without the spaces between tokens.
+pub def compact(s: Str) -> ~Str<JsonError> {
+  ~check(s)
+  b: [Byte] = []
+  in_str = false
+  esc = false
+  n = s.size
+  i = 0
+  while i < n {
+    c = s[i]
+    i += 1
+    if in_str {
+      b << c
+      if esc {
+        esc = false
+      } else if c == 92 {
+        esc = true
+      } else if c == 34 {
+        in_str = false
+      }
+      next
+    }
+    next if c == 32 || c == 10 || c == 13 || c == 9
+    in_str = true if c == 34
+    b << c
+  }
+  Str.from_bytes(b)
+}

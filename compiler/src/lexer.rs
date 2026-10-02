@@ -144,7 +144,27 @@ pub fn lex_at(file: u32, src: &str, base: u32) -> Result<Vec<Token>, Diag> {
                 continue;
             }
             if src[i..].starts_with("#[") {
-                let end = src[i..].find(']').map(|k| i + k).ok_or_else(|| Diag::new(sp(i, i + 2), "unterminated `#[`"))?;
+                // The closing `]`, skipping nested brackets and "strings" (`#[json("a]b")]`).
+                let end = {
+                    let (mut depth, mut j, mut in_str, mut found) = (0usize, i + 2, false, None);
+                    while j < b.len() && b[j] != b'\n' {
+                        match (in_str, b[j]) {
+                            (true, b'\\') => j += 1,
+                            (true, b'"') => in_str = false,
+                            (true, _) => {}
+                            (false, b'"') => in_str = true,
+                            (false, b'[') => depth += 1,
+                            (false, b']') if depth == 0 => {
+                                found = Some(j);
+                                break;
+                            }
+                            (false, b']') => depth -= 1,
+                            _ => {}
+                        }
+                        j += 1;
+                    }
+                    found.ok_or_else(|| Diag::new(sp(i, i + 2), "unterminated `#[`"))?
+                };
                 out.push(Token { tok: Tok::Attr(src[i + 2..end].trim().to_string()), span: sp(i, end + 1), space_before: space });
                 i = end + 1;
                 space = false;

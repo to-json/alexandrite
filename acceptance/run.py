@@ -100,6 +100,7 @@ GROUPS = {
     "wc": "L2",
     "l2fixes": "L2",
     "echo": "L3",
+    "httpdemo": "L3",
 }
 
 

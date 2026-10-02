@@ -1,0 +1,75 @@
+# L3: an HTTP server and its clients in one process. The server routes with
+# Go 1.22 patterns, keeps connections alive, streams a chunked reply; the
+# clients are plain `http.get` / `http.post` calls and one raw connection that
+# sends three requests down a single socket.
+import "net"
+import "net/http"
+import "bufio"
+import "strings"
+
+def t(s: Str) -> Str { strings.trim_space(s) }
+
+def hello(w: http.ResponseWriter, r: http.Request) -> Unit {
+  name = r.path_value("name")
+  greeting = r.query("greeting") || "hello"
+  w.write_string!("#{greeting}, #{name}!\n")
+}
+
+def create(w: http.ResponseWriter, r: http.Request) -> Unit {
+  w.header.set!("Content-Type", "text/plain")
+  w.write_header!(http.STATUS_CREATED)
+  w.write_string!("stored #{r.body.size} bytes: #{r.body_string}\n")
+}
+
+def numbers(w: http.ResponseWriter, r: http.Request) -> Unit {
+  i = 1
+  while i <= 5 {
+    w.write_string!("#{i}\n")
+    w.flush!
+    i += 1
+  }
+}
+
+mux = http.new_serve_mux
+mux.handle_func("GET /hello/{name}", hello)
+mux.handle_func("POST /items", create)
+mux.handle_func("GET /numbers", numbers)
+mux.handle_func("/{$}") { |w, r| w.write_string!("home\n") }
+
+srv = http.new_server(mux)
+ln = net.listen("tcp", "127.0.0.1:0").unwrap
+port = ln.port
+base = "http://127.0.0.1:#{port}"
+serving = spawn { srv.serve(ln) }
+
+r = http.get(base + "/hello/world").unwrap
+puts "#{r.status} #{t(r.body_string)} (#{r.header.get("content-type")})"
+r = http.get(base + "/hello/alx?greeting=hi%20there").unwrap
+puts "#{r.status} #{t(r.body_string)}"
+r = http.post(base + "/items", "text/plain", "some data").unwrap
+puts "#{r.status} #{t(r.body_string)}"
+r = http.get(base + "/numbers").unwrap
+puts "#{r.status} chunked=#{r.header.get("Transfer-Encoding")} #{t(r.body_string).split("\n").join(",")}"
+r = http.get(base + "/missing").unwrap
+puts "#{r.status} #{t(r.body_string)}"
+r = http.post(base + "/hello/x", "text/plain", "").unwrap
+puts "#{r.status} allow=#{r.header.get("Allow")}"
+
+# Three requests on one connection.
+c = net.dial("tcp", "127.0.0.1:#{port}").unwrap
+br = bufio.new_reader(c)
+["/", "/hello/one", "/hello/two"].each { |path|
+  c.write_string!("GET #{path} HTTP/1.1\r\nHost: demo\r\n\r\n").unwrap
+  resp = http.read_response(br, false).unwrap
+  puts "keep-alive #{path} -> #{resp.status} #{t(resp.body_string)}"
+}
+c.close!.unwrap
+
+# Eight clients at once.
+results = (1..8).map { |i|
+  spawn { t(http.get("http://127.0.0.1:#{port}/hello/c#{i}").unwrap.body_string) }
+}.to_a
+puts results.map { it.wait.unwrap }.to_a.join(" ")
+
+srv.shutdown
+puts serving.wait.ok? ? "server stopped" : "server error"

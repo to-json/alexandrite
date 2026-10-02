@@ -1631,7 +1631,29 @@ impl<'w, 'a> FnCx<'w, 'a> {
             }
             ExprKind::Name(n) => match self.lookup(n) {
                 Some(id) => self.mk(TK::Local(id), self.locals[id].ty.clone(), sp),
-                None => return self.call(None, n, sp, &[], None, None, sp),
+                None => {
+                    // A function passed as a value where one is wanted:
+                    // `sort_func(xs, by_len)` is `sort_func(xs, ->(a, b) { by_len(a, b) })`.
+                    // (A bare name of a function with parameters can't be a call.)
+                    let q = resolve_name(n, sp, &|q| self.w.by_name.contains_key(q)).unwrap_or_else(|_| n.clone());
+                    let def = self.w.by_name.get(&q).map(|&d| self.w.defs[d].def.clone());
+                    if let Some(d) = def.filter(|d| !d.params.is_empty() && d.tparams.is_empty() && d.params.iter().all(|p| p.ty.is_some())) {
+                        {
+                            let id = NodeId::MAX;
+                            let names: Vec<String> = (0..d.params.len()).map(|i| format!("__arg{i}")).collect();
+                            let call = Expr {
+                                id,
+                                kind: ExprKind::Call { recv: None, name: n.clone(), name_span: sp, args: names.iter().map(|a| Expr { id, kind: ExprKind::Name(a.clone()), span: sp }).collect(), block: None, block_sym: None },
+                                span: sp,
+                            };
+                            let body = Block { id, params: names.iter().map(|a| (a.clone(), sp)).collect(), body: vec![Stmt { kind: StmtKind::Expr(call), span: sp }], span: sp };
+                            let params = names.into_iter().zip(&d.params).map(|(name, p)| Param { name, ty: p.ty.clone(), span: sp }).collect();
+                            let lam = Expr { id, kind: ExprKind::Lambda(params, d.ret.clone(), Box::new(body)), span: sp };
+                            return self.expr(&lam);
+                        }
+                    }
+                    return self.call(None, n, sp, &[], None, None, sp);
+                }
             },
             ExprKind::Const(c) => match self.w.consts.get(&resolve_name(c, sp, &|q| self.w.consts.contains_key(q))?).cloned() {
                 Some((v, ty)) => return self.const_value(v, ty, sp),
@@ -2634,6 +2656,39 @@ impl<'w, 'a> FnCx<'w, 'a> {
         Ok(self.mk(TK::M(M::Lambda, None, cap_es, Some(Box::new(tb))), ty, sp))
     }
 
+    /// A block passed where `def`'s last parameter takes a function: a
+    /// lambda whose parameter types come from that parameter's type, with
+    /// the def's type parameters bound by the arguments before it.
+    fn block_as_lambda(&mut self, def: usize, before: &[TExpr], b: &Block) -> R<TExpr> {
+        let d = self.w.defs[def].def.clone();
+        let mut env: HashMap<String, Ty> = HashMap::new();
+        for (p, a) in d.params.iter().zip(before) {
+            if let Some(te) = &p.ty {
+                let at = self.resolve(&a.ty);
+                bind_tparams(te, &at, &d.tparams, &mut env);
+            }
+        }
+        let prev = enter_pkg(&self.w.defs[def].pkg);
+        let want = match d.params.last().and_then(|p| p.ty.as_ref()) {
+            Some(te) => subst_type(te, &env, &self.w.structs, &self.w.consts),
+            None => None,
+        };
+        leave_pkg(prev);
+        let Some(Ty::Fn(ps, _)) = want.clone() else {
+            return Err(Diag::new(b.span, format!("can't tell this block's parameter types from `{}`'s arguments; pass a lambda with typed parameters", d.name)));
+        };
+        let mut blk = b.clone();
+        if blk.params.is_empty() && ps.len() == 1 {
+            blk.params = vec![("it".into(), b.span)];
+        }
+        let params = blk.params.iter().map(|(n, s)| Param { name: n.clone(), ty: None, span: *s }).collect();
+        let lam = Expr { id: NodeId::MAX, kind: ExprKind::Lambda(params, None, Box::new(blk)), span: b.span };
+        let saved = self.want_hint.replace(want.unwrap());
+        let r = self.expr(&lam);
+        self.want_hint = saved;
+        r
+    }
+
     /// `next`/`break` mustn't leave a `lock` block (only loops inside it).
     fn not_leaving_lock(&self, sp: Span, what: &str) -> R<()> {
         match self.lock_floor {
@@ -3631,10 +3686,20 @@ impl<'w, 'a> FnCx<'w, 'a> {
             }
             return Err(Diag::new(name_span, msg));
         };
-        if block.is_some() {
-            return Err(Diag::new(sp, format!("`{name}` doesn't take a block")));
-        }
         let d = self.w.defs[def].def.clone();
+        // A block for a last parameter of function type: `index_func(xs) { |x| ... }`.
+        if let Some(b) = block {
+            if d.params.len() != args.len() + 1 || !matches!(d.params.last().and_then(|p| p.ty.as_ref()), Some(TypeExpr::Fn(..))) {
+                return Err(Diag::new(sp, format!("`{name}` doesn't take a block")));
+            }
+            let mut targs = vec![];
+            for a in args {
+                targs.push(self.value(a)?);
+            }
+            let f = self.block_as_lambda(def, &targs, b)?;
+            targs.push(f);
+            return self.call_def(def, name, name_span, targs, sp);
+        }
         if args.len() != d.params.len() {
             return Err(Diag::new(name_span, format!("`{name}` takes {} argument(s), got {}", d.params.len(), args.len())));
         }
@@ -4101,12 +4166,20 @@ impl<'w, 'a> FnCx<'w, 'a> {
     /// `strings.has_prefix(s, p)`).
     fn method(&mut self, recv: TExpr, name: &str, name_span: Span, args: &[Expr], block: Option<&Block>, bsym: Option<&(String, Span)>, sp: Span) -> R<TExpr> {
         match self.method_builtin(recv.clone(), name, name_span, args, block, bsym, sp) {
-            Err(d) if d.msg.starts_with(&format!("no method `{name}`")) && block.is_none() && bsym.is_none() => {
+            Err(d) if d.msg.starts_with(&format!("no method `{name}`")) && bsym.is_none() => {
                 let rt = self.resolve(&recv.ty);
                 let Some(def) = self.std_sugar(&rt, name)? else { return Err(d) };
                 let mut targs = vec![recv];
                 for a in args {
                     targs.push(self.value(a)?);
+                }
+                // `xs.index_func { |x| ... }`: the block is the last argument.
+                if let Some(b) = block {
+                    if self.w.defs[def].def.params.len() != targs.len() + 1 {
+                        return Err(d);
+                    }
+                    let f = self.block_as_lambda(def, &targs, b)?;
+                    targs.push(f);
                 }
                 self.call_def(def, name, name_span, targs, sp)
             }
@@ -5039,4 +5112,18 @@ impl<'w, 'a> FnCx<'w, 'a> {
             Ok(self.mk(TK::M(m, Some(Box::new(recv.clone())), targs, None), ty, sp))
         })())
     }
+}
+
+/// A declared type with type parameters replaced by their bindings.
+fn subst_type(te: &TypeExpr, env: &HashMap<String, Ty>, structs: &Structs, consts: &Consts) -> Option<Ty> {
+    let go = |t: &TypeExpr| subst_type(t, env, structs, consts);
+    Some(match te {
+        TypeExpr::Named(n, _) if env.contains_key(n) => env[n].clone(),
+        TypeExpr::Array(e, _) => Ty::arr(go(e)?),
+        TypeExpr::Opt(e, _) => Ty::Opt(Box::new(go(e)?)),
+        TypeExpr::Tuple(es, _) => Ty::Tuple(es.iter().map(go).collect::<Option<Vec<_>>>()?),
+        TypeExpr::Fn(ps, r, _) => Ty::Fn(ps.iter().map(go).collect::<Option<Vec<_>>>()?, Box::new(go(r)?)),
+        TypeExpr::App(n, args, _) if n == "Map" && args.len() == 2 => Ty::Map(Box::new(go(&args[0])?), Box::new(go(&args[1])?)),
+        _ => type_from(te, structs, consts).ok()?,
+    })
 }

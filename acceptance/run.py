@@ -86,6 +86,7 @@ GROUPS = {
     "sync": "R6",
     "fmt": "L1",
     "tuples": "L1",
+    "funcvalues": "L1",
 }
 
 

@@ -1140,6 +1140,12 @@ struct FnCx<'w, 'a> {
     fallible_decl: bool,
     /// Depth of `try` directly enclosing the expression being checked.
     under_try: bool,
+    /// The def being checked declares its error set (`~T<A | B>`).
+    declared_errs: bool,
+    /// `#![overflow(wrap)]`: arithmetic under `~` can't fail with ArithError.
+    wrap: bool,
+    /// The error set of the last fallible `!` call (its result is held in a Seq).
+    mut_errs: Option<Vec<String>>,
     /// Kind of each enclosing loop-ish construct, innermost last.
     loops: Vec<LoopKind>,
     n_params: usize,
@@ -1231,6 +1237,9 @@ impl<'w, 'a> FnCx<'w, 'a> {
             impure: false,
             fallible_decl: def.is_some_and(|d| d.fallible),
             under_try: false,
+            declared_errs: def.is_some_and(|d| d.errs.is_some()),
+            wrap: _overflow == Overflow::Wrap,
+            mut_errs: None,
             loops: vec![],
             n_params: 0,
         }
@@ -2148,6 +2157,7 @@ impl<'w, 'a> FnCx<'w, 'a> {
                     return Err(Diag::new(sp, "`~` inside a `lock` block could leave the lock held; handle the error inside (`rescue`, `unwrap_or`) or after the block"));
                 }
                 let saved = std::mem::replace(&mut self.under_try, true);
+                self.mut_errs = None;
                 let inner = self.value(x);
                 self.under_try = saved;
                 let inner = inner?;
@@ -2161,13 +2171,30 @@ impl<'w, 'a> FnCx<'w, 'a> {
                 // Result, a fallible call, File.read), and every builtin
                 // under it that would otherwise panic (call arguments too).
                 let mut errs = std::collections::BTreeSet::new();
+                let mut mut_call = false;
                 let held = if let Ty::Result(t) = self.resolve(&inner.ty) {
-                    errs.insert("Error".to_string());
+                    match (&inner.kind, self.mut_errs.take()) {
+                        (TK::Seq(..), Some(es)) if !es.is_empty() => {
+                            errs.extend(es);
+                            mut_call = true;
+                        }
+                        _ => {
+                            errs.insert("Error".to_string());
+                        }
+                    }
                     Some(*t)
                 } else {
                     match &inner.kind {
                         TK::Call(f, _) if is_fallible_expr(&inner, self) => {
-                            errs.extend(self.w.funcs[*f].as_ref().map_or_else(|| vec!["Error".to_string()], |f| f.errs.clone()));
+                            // (A call to a def still being checked, in a def with a declared set: the
+                            // callee's failures are covered by the declaration, which is the contract.)
+                            match &self.w.funcs[*f] {
+                                Some(f) => errs.extend(f.errs.clone()),
+                                None if self.declared_errs => {}
+                                None => {
+                                    errs.insert("Error".to_string());
+                                }
+                            }
                         }
                         TK::M(M::FileRead, ..) => {
                             errs.insert("IoError".into());
@@ -2177,7 +2204,13 @@ impl<'w, 'a> FnCx<'w, 'a> {
                     None
                 };
                 let fallible_op = held.is_some() || is_fallible_expr(&inner, self);
-                try_faults(&inner, &mut errs);
+                if !mut_call {
+                    let selfl = if self.method == Some(true) { self.lookup("self") } else { None };
+                    try_faults(&inner, &mut errs, selfl);
+                }
+                if self.wrap && fallible_op {
+                    errs.remove("ArithError");
+                }
                 if errs.is_empty() && !fallible_op {
                     return Err(Diag::new(sp, "`~` needs something that can fail: a fallible call, a `~T` value, arithmetic, indexing or slicing, or another builtin that can panic (`first`, `unwrap`, `to_u8`, ...)"));
                 }
@@ -2489,6 +2522,10 @@ impl<'w, 'a> FnCx<'w, 'a> {
                     }
                 }
                 TK::M(M::VariantNew(0), None, slots, None)
+            }
+            Ty::Tuple(ts) => {
+                let vals = ts.clone().iter().map(|t| self.zero_of(t, sp)).collect::<Option<Vec<_>>>()?;
+                TK::M(M::TupleNew, None, vals, None)
             }
             Ty::Fixed(el, n) => {
                 let z = self.zero_of(el, sp)?;
@@ -3257,6 +3294,9 @@ impl<'w, 'a> FnCx<'w, 'a> {
         let call = self.call_def(def, name, name_span, targs, sp);
         self.under_try = saved;
         let call = call?;
+        if let TK::Call(f, _) = &call.kind {
+            self.mut_errs = self.w.funcs[*f].as_ref().map(|f| f.errs.clone());
+        }
         let rty = call.ty.clone();
         if matches!(self.resolve(&rty), Ty::Unit) {
             let tl = self.mk(TK::Local(tid), Ty::arr(pty.clone()), sp);
@@ -4268,6 +4308,39 @@ impl<'w, 'a> FnCx<'w, 'a> {
     fn const_call_named(&mut self, c: &str, named: Option<Ty>, csp: Span, name: &str, name_span: Span, args: &[Expr], block: Option<&Block>, sp: Span) -> R<TExpr> {
         let argv = |cx: &mut Self| args.iter().map(|a| cx.value(a)).collect::<R<Vec<_>>>();
         let named = named.or_else(|| self.w.structs.get(c).cloned());
+        // `Point.from_json(s)`: a static method (`def self.from_json`), a def of the
+        // type without a receiver.
+        if named.is_some() {
+            let q = method_name(c, name);
+            if let Some(&def) = self.w.by_name.get(&q) {
+                if self.w.defs[def].def.params.first().is_none_or(|p| p.name != "self") {
+                    if block.is_some() {
+                        return Err(Diag::new(sp, format!("`{c}.{name}` doesn't take a block")));
+                    }
+                    let d = self.w.defs[def].def.clone();
+                    if args.len() != d.params.len() {
+                        return Err(Diag::new(name_span, format!("`{c}.{name}` takes {} argument(s), got {}", d.params.len(), args.len())));
+                    }
+                    let mut targs = vec![];
+                    for (a, p) in args.iter().zip(&d.params) {
+                        let v = match &p.ty {
+                            Some(t) => {
+                                let prev = enter_pkg(&self.w.defs[def].pkg);
+                                let r = type_from(t, &self.w.structs, &self.w.consts);
+                                leave_pkg(prev);
+                                match r {
+                                    Ok(t) => self.value_as(a, &t)?,
+                                    Err(_) => self.value(a)?,
+                                }
+                            }
+                            None => self.value(a)?,
+                        };
+                        targs.push(v);
+                    }
+                    return self.call_def(def, &q, name_span, targs, sp);
+                }
+            }
+        }
         if let Some(et @ Ty::Enum(..)) = named.clone() {
             let Ty::Enum(_, vs) = &et else { unreachable!() };
             let Some(k) = vs.iter().position(|(v, _)| v == name) else {
@@ -5574,12 +5647,14 @@ fn int_like(t: &Ty) -> bool {
 /// panicking: arithmetic (ArithError) and the panicking builtins of
 /// `prove::fault`. A nested `~` and blocks that become functions of
 /// their own aren't covered by this one.
-fn try_faults(e: &TExpr, out: &mut std::collections::BTreeSet<String>) {
+fn try_faults(e: &TExpr, out: &mut std::collections::BTreeSet<String>, selfl: Option<LocalId>) {
     match &e.kind {
+        // Reading `self` in a `!` method: its one-element slice, always there.
+        TK::Index(a, i) if matches!((&a.kind, &i.kind), (TK::Local(l), TK::Int(0)) if Some(*l) == selfl) => return,
         TK::Try(_) => return,
         _ if crate::prove::own_function_block(e) => {
             if let TK::M(_, r, args, _) = &e.kind {
-                r.iter().map(|r| &**r).chain(args).for_each(|x| try_faults(x, out));
+                r.iter().map(|r| &**r).chain(args).for_each(|x| try_faults(x, out, selfl));
             }
             return;
         }
@@ -5598,7 +5673,7 @@ fn try_faults(e: &TExpr, out: &mut std::collections::BTreeSet<String>) {
     if let Some(f) = crate::prove::fault(e) {
         out.insert(f.err.to_string());
     }
-    crate::prove::each_child(e, &mut |x| try_faults(x, out));
+    crate::prove::each_child(e, &mut |x| try_faults(x, out, selfl));
 }
 
 // ---- math block: intrinsics behind std/math ----

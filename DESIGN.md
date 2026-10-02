@@ -124,6 +124,7 @@ The Ruby of Rust: Ruby-feel syntax, Rust's type construction, and no tracing GC.
   - **Incremental cache:** keyed on *direct* dependencies, with member-table fingerprints for early cutoff. Never record dependencies transitively, which made 10 000 types take 66 s in probe 12. Use a global revision counter so a build where nothing changed skips checking entirely.
   - Exported macros are shipped in headers as IR. Macro-generated code is hygienic, except for names spliced in through `#{…}`. Errors inside generated code are reported with the chain of expansions.
   - The scheduler must use an explicit work stack, not recursion, because chains of types run deep.
+  - **As shipped (L3): the first built-in derive, not general macros.** `#[derive(Json)]` is expanded by the parser as source text (`compiler/src/derive.rs`): the type's fields and `#[json(...)]` options are turned into ordinary `def`s (`json_str`, `json_enc`, `self.json_dec`, `to_json`, `self.from_json`, ...) that are parsed back in as methods, so no later stage knows derives exist. It runs eagerly for every derived type (not lazily per member), per declaration (not per generic instance, so generic types can't derive yet), and with no hygiene concerns beyond `_`-prefixed locals. Static methods (`def self.from_json`) were added for it. Moving to the macro design above means replacing the text generator with the IR interpreter and running it at member lookup; the generated API (D37-D39) stays.
 
 ## v0 implementation (compiler/, passing ACCEPTANCE.md)
 

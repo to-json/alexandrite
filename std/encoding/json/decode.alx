@@ -1,0 +1,998 @@
+#![overflow(wrap)]
+# Decoding: the Decoder that derived `json_dec` methods read from, the syntax
+# checker, and the number/string scanners.
+#
+# Speed shapes this file. A fallible call returns the program's whole Error sum
+# (hundreds of bytes), so nothing on the hot path is fallible: the scanners
+# return an index, or a negative error code (see `code`), and the Decoder's
+# errors are sticky: the first one is kept, every later call returns at once
+# with a zero value, and `done!` (the one fallible method) reports it.
+
+import "strconv"
+import "unicode/utf8"
+
+MAX_DEPTH = 10000
+
+# ---- error codes: -(1 + pos * 64 + kind)
+E_EOF = 0
+E_NUM = 1
+E_DEC = 2
+E_EXP = 3
+E_STRLIT = 4
+E_ESC = 5
+E_HEX = 6
+E_BEGIN = 7
+E_KEY = 8
+E_ELEM = 9
+E_PAIR = 10
+E_KEYSTART = 11
+E_TOP = 12
+E_DEPTH = 13
+# 16 + 5 * word + i: byte i of "true" / "false" / "null" was wrong
+E_LIT = 16
+
+def code(pos: Int, kind: Int) -> Int { -(1 + pos * 64 + kind) }
+
+# The error a code stands for (only built on the cold path).
+def err_from(s: Str, c: Int) -> JsonError {
+  v = -c - 1
+  pos = v / 64
+  kind = v % 64
+  return err_eof(pos) if kind == E_EOF
+  return JsonError.Invalid(msg: "exceeded max depth", offset: pos) if kind == E_DEPTH
+  ch = s[pos]
+  if kind >= E_LIT {
+    w = (kind - E_LIT) / 5
+    i = (kind - E_LIT) % 5
+    word = w == 0 ? "true" : (w == 1 ? "false" : "null")
+    return err_char(ch, "in literal " + word + " (expecting " + quote_char(word[i].to_i) + ")", pos)
+  }
+  ctx = "looking for beginning of value"
+  ctx = "in numeric literal" if kind == E_NUM
+  ctx = "after decimal point in numeric literal" if kind == E_DEC
+  ctx = "in exponent of numeric literal" if kind == E_EXP
+  ctx = "in string literal" if kind == E_STRLIT
+  ctx = "in string escape code" if kind == E_ESC
+  ctx = "in \\u hexadecimal character escape" if kind == E_HEX
+  ctx = "after object key" if kind == E_KEY
+  ctx = "after array element" if kind == E_ELEM
+  ctx = "after object key:value pair" if kind == E_PAIR
+  ctx = "looking for beginning of object key string" if kind == E_KEYSTART
+  ctx = "after top-level value" if kind == E_TOP
+  err_char(ch, ctx, pos)
+}
+
+# Index of the first non-space byte at or after p (JSON's four spaces).
+def skip_ws(s: Str, p0: Int) -> Int {
+  p = p0
+  n = s.size
+  while p < n {
+    c = s[p]
+    break if c != 32 && c != 10 && c != 13 && c != 9
+    p += 1
+  }
+  p
+}
+
+def is_digit(c: Byte) -> Bool { c >= 48 && c <= 57 }
+
+# The end of the number token starting at p (s[p] is '-' or a digit), after
+# checking JSON's number grammar; or an error code.
+def num_end(s: Str, p0: Int) -> Int {
+  n = s.size
+  p = p0
+  if s[p] == 45 {
+    p += 1
+    return code(p, E_EOF) if p >= n
+    return code(p, E_NUM) if !is_digit(s[p])
+  }
+  if s[p] == 48 {
+    p += 1
+  } else {
+    while p < n && is_digit(s[p]) { p += 1 }
+  }
+  if p < n && s[p] == 46 {
+    p += 1
+    return code(p, E_EOF) if p >= n
+    return code(p, E_DEC) if !is_digit(s[p])
+    while p < n && is_digit(s[p]) { p += 1 }
+  }
+  if p < n && (s[p] == 101 || s[p] == 69) {
+    p += 1
+    return code(p, E_EOF) if p >= n
+    if s[p] == 43 || s[p] == 45 {
+      p += 1
+      return code(p, E_EOF) if p >= n
+    }
+    return code(p, E_EXP) if !is_digit(s[p])
+    while p < n && is_digit(s[p]) { p += 1 }
+  }
+  p
+}
+
+# The end of the literal word (true, false, null) at p; or an error code.
+def lit_end(s: Str, p: Int, word: Str) -> Int {
+  n = s.size
+  w = word.size == 5 ? 1 : (word[0] == 110 ? 2 : 0)
+  i = 1
+  while i < word.size {
+    return code(p + i, E_EOF) if p + i >= n
+    return code(p + i, E_LIT + 5 * w + i) if s[p + i] != word[i]
+    i += 1
+  }
+  p + word.size
+}
+
+# The kind of value starting with byte c, as Go names it in type errors.
+def kind_word(c: Byte) -> Str {
+  return "string" if c == 34
+  return "object" if c == 123
+  return "array" if c == 91
+  return "bool" if c == 116 || c == 102
+  return "null" if c == 110
+  "number"
+}
+
+# Parse the 4 hex digits of a \u escape at s[p...p+4] (already checked).
+def hex4(s: Str, p: Int) -> Int {
+  v = 0
+  k = 0
+  while k < 4 {
+    c = s[p + k].to_i
+    d = c - 48
+    d = c - 87 if c >= 97
+    d = c - 55 if c >= 65 && c <= 70
+    v = v * 16 + d
+    k += 1
+  }
+  v
+}
+
+def is_hex(h: Int) -> Bool { (h >= 48 && h <= 57) || (h >= 97 && h <= 102) || (h >= 65 && h <= 70) }
+
+# The index after the string literal starting at p (s[p] is the opening quote),
+# checking escapes and control characters; or an error code.
+def str_end(s: Str, p0: Int) -> Int {
+  n = s.size
+  p = p0 + 1
+  while p < n {
+    c = s[p]
+    return p + 1 if c == 34
+    return code(p, E_STRLIT) if c < 32
+    if c == 92 {
+      p += 1
+      return code(p, E_EOF) if p >= n
+      e = s[p]
+      if e == 117 {
+        k = 1
+        while k <= 4 {
+          return code(p + k, E_EOF) if p + k >= n
+          return code(p + k, E_HEX) if !is_hex(s[p + k].to_i)
+          k += 1
+        }
+        p += 4
+      } else if !(e == 34 || e == 92 || e == 47 || e == 98 || e == 102 || e == 110 || e == 114 || e == 116) {
+        return code(p, E_ESC)
+      }
+    }
+    p += 1
+  }
+  code(n, E_EOF)
+}
+
+# Skips one value starting at p0 (after whitespace) while checking its syntax;
+# returns the index after it, or an error code. Iterative (an explicit stack of
+# open arrays and objects), so nesting depth is bounded by MAX_DEPTH, not by the
+# call stack.
+def skip_value(s: Str, p0: Int, depth: Int) -> Int {
+  cap = 64
+  loop {
+    zero: Byte = 0
+    r = skip_in(s, p0, depth, Array.new(cap, zero))
+    return r if r != E_GROW
+    cap = cap * 16
+  }
+}
+
+# The code skip_in returns when its stack is too small.
+E_GROW = -4611686018427387904
+
+# skip_value with the stack of open containers given (its length is the depth it
+# can hold). Allocating nothing, so its loop needs no per-iteration region.
+def skip_in(s: Str, p0: Int, depth: Int, stack: [Byte]) -> Int {
+  n = s.size
+  cap = stack.size
+  sp = 0
+  p = p0
+  loop {
+    p = skip_ws(s, p)
+    return code(p, E_EOF) if p >= n
+    c = s[p]
+    if c == 123 || c == 91 {
+      return code(p, E_DEPTH) if sp + depth >= MAX_DEPTH
+      close = c == 123 ? 125 : 93
+      p = skip_ws(s, p + 1)
+      return code(p, E_EOF) if p >= n
+      if s[p].to_i != close {
+        return E_GROW if sp >= cap
+        stack[sp] = c
+        sp += 1
+        if c == 123 {
+          return code(p, E_KEYSTART) if s[p] != 34
+          p = str_end(s, p)
+          return p if p < 0
+          p = skip_ws(s, p)
+          return code(p, E_EOF) if p >= n
+          return code(p, E_KEY) if s[p] != 58
+          p += 1
+        }
+        next
+      }
+      p += 1
+    } else if c == 34 {
+      p = str_end(s, p)
+      return p if p < 0
+    } else if c == 116 {
+      p = lit_end(s, p, "true")
+      return p if p < 0
+    } else if c == 102 {
+      p = lit_end(s, p, "false")
+      return p if p < 0
+    } else if c == 110 {
+      p = lit_end(s, p, "null")
+      return p if p < 0
+    } else if c == 45 || is_digit(c) {
+      p = num_end(s, p)
+      return p if p < 0
+    } else {
+      return code(p, E_BEGIN)
+    }
+    # A value ended at p: close containers and find the next value.
+    loop {
+      return p if sp == 0
+      p = skip_ws(s, p)
+      return code(p, E_EOF) if p >= n
+      top = stack[sp - 1]
+      c = s[p]
+      if top == 91 {
+        if c == 93 {
+          sp -= 1
+          p += 1
+          next
+        }
+        return code(p, E_ELEM) if c != 44
+        p += 1
+        break
+      }
+      if c == 125 {
+        sp -= 1
+        p += 1
+        next
+      }
+      return code(p, E_PAIR) if c != 44
+      p = skip_ws(s, p + 1)
+      return code(p, E_EOF) if p >= n
+      return code(p, E_KEYSTART) if s[p] != 34
+      p = str_end(s, p)
+      return p if p < 0
+      p = skip_ws(s, p)
+      return code(p, E_EOF) if p >= n
+      return code(p, E_KEY) if s[p] != 58
+      p += 1
+      break
+    }
+  }
+}
+
+# Is s one valid JSON text? The error says what is wrong and where.
+pub def check(s: Str) -> ~Unit<JsonError> {
+  p = skip_value(s, 0, 0)
+  fail err_from(s, p) if p < 0
+  p = skip_ws(s, p)
+  fail err_char(s[p], "after top-level value", p) if p < s.size
+}
+
+# Go's json.Valid.
+pub def valid(s: Str) -> Bool {
+  p = skip_value(s, 0, 0)
+  return false if p < 0
+  skip_ws(s, p) >= s.size
+}
+
+struct DState {
+  pos: Int
+  key: Str
+  ctx: Str
+  wrapped: Bool
+  fresh: Bool
+  failed: Bool
+  errs: [JsonError]
+}
+
+# The input side. Copies share the position and the error (GO-VS-RUBY D36).
+# Derived `json_dec` methods call these in a fixed pattern; each reads the next
+# value (spaces before it are skipped) and leaves the position after it. They
+# don't fail: the first problem is remembered (`failed`), every call after it
+# returns a zero value at once, and `done!` reports the error. So a hand-written
+# `json_dec` has no error handling to write; call `d.~done!` at the end.
+pub struct Decoder {
+  s: Str
+  st: [DState]
+
+  pub def pos -> Int { st[0].pos }
+
+  # The key found by the last `next_key!`.
+  pub def key -> Str { st[0].key }
+
+  pub def wrapped -> Bool { st[0].wrapped }
+
+  pub def failed -> Bool { st[0].failed }
+
+  # Names the field being read, for type errors ("User.age").
+  pub def at!(ctx: Str) {
+    self.st[0].ctx = ctx
+  }
+
+  # Records the first error.
+  pub def fail!(e: JsonError) {
+    if !st[0].failed {
+      self.st[0].failed = true
+      self.st[0].errs = [e]
+    }
+    nil
+  }
+
+  def bad!(c: Int) {
+    fail!(err_from(s, c))
+  }
+
+  def wrong!(p: Int, got: Str, want: Str) {
+    fail!(JsonError.Type(value: got, want: want, field: st[0].ctx, offset: p))
+  }
+
+  # The index of the next value's first byte; -1 (and an error) at the end or after an error.
+  def start! -> Int {
+    return -1 if st[0].failed
+    p = skip_ws(s, st[0].pos)
+    if p >= s.size {
+      fail!(err_eof(p))
+      return -1
+    }
+    p
+  }
+
+  # Skips the value at p (a mismatch: the error is already recorded).
+  def skip_at!(p: Int) {
+    e = skip_value(s, p, 0)
+    if e < 0 {
+      bad!(e)
+    } else {
+      self.st[0].pos = e
+    }
+  }
+
+  # ---- null
+
+  # If the next value is null, consumes it and returns true.
+  pub def take_null! -> Bool {
+    p = start!
+    return false if p < 0
+    return false if s[p] != 110
+    e = lit_end(s, p, "null")
+    if e < 0 {
+      bad!(e)
+      return false
+    }
+    self.st[0].pos = e
+    true
+  }
+
+  # ---- scalars (null reads as the zero value, as in Go)
+
+  pub def bool! -> Bool {
+    p = start!
+    return false if p < 0
+    c = s[p]
+    if c == 116 || c == 102 || c == 110 {
+      w = c == 116 ? "true" : (c == 102 ? "false" : "null")
+      e = lit_end(s, p, w)
+      if e < 0 {
+        bad!(e)
+        return false
+      }
+      self.st[0].pos = e
+      return c == 116
+    }
+    wrong!(p, kind_word(c), "Bool")
+    false
+  }
+
+  # The number at p as an integer with at most neg_lim / pos_lim magnitude.
+  def int_in!(want: Str, neg_lim: U64, pos_lim: U64) -> Int {
+    p = start!
+    return 0 if p < 0
+    c = s[p]
+    if c == 110 {
+      take_null!
+      return 0
+    }
+    if !(c == 45 || is_digit(c)) {
+      wrong!(p, kind_word(c), want)
+      return 0
+    }
+    e = num_end(s, p)
+    if e < 0 {
+      bad!(e)
+      return 0
+    }
+    i = p
+    neg = false
+    if c == 45 {
+      neg = true
+      i += 1
+    }
+    u: U64 = 0
+    lim = neg ? neg_lim : pos_lim
+    ok = true
+    while i < e {
+      d = s[i]
+      if !is_digit(d) {
+        ok = false
+        break
+      }
+      dv = (d - 48).to_u64
+      if u > (lim - dv) / 10 {
+        ok = false
+        break
+      }
+      u = u * 10 + dv
+      i += 1
+    }
+    if !ok {
+      wrong!(p, "number " + s[p...e], want)
+      return 0
+    }
+    self.st[0].pos = e
+    return 0 -% u.as_i64 if neg
+    u.as_i64
+  }
+
+  pub def int! -> Int {
+    int_in!("Int", 9223372036854775808, 9223372036854775807)
+  }
+
+  # A signed integer of `bits` bits (the caller converts with as_i8 ...).
+  pub def sint!(bits: Int) -> Int {
+    one: U64 = 1
+    half = one << (bits - 1)
+    int_in!("I" + bits.to_s, half, half - 1)
+  }
+
+  # An unsigned integer of `bits` bits.
+  pub def uint!(bits: Int) -> U64 {
+    p = start!
+    return 0 if p < 0
+    c = s[p]
+    if c == 110 {
+      take_null!
+      return 0
+    }
+    want = "U" + bits.to_s
+    if !(c == 45 || is_digit(c)) {
+      wrong!(p, kind_word(c), want)
+      return 0
+    }
+    e = num_end(s, p)
+    if e < 0 {
+      bad!(e)
+      return 0
+    }
+    one: U64 = 1
+    lim: U64 = 18446744073709551615
+    lim = (one << bits) - 1 if bits < 64
+    u: U64 = 0
+    i = p
+    ok = c != 45
+    while ok && i < e {
+      d = s[i]
+      if !is_digit(d) {
+        ok = false
+      } else {
+        dv = (d - 48).to_u64
+        if u > (lim - dv) / 10 {
+          ok = false
+        } else {
+          u = u * 10 + dv
+          i += 1
+        }
+      }
+    }
+    if !ok {
+      wrong!(p, "number " + s[p...e], want)
+      return 0
+    }
+    self.st[0].pos = e
+    u
+  }
+
+  pub def float! -> Float {
+    p = start!
+    return 0.0 if p < 0
+    c = s[p]
+    if c == 110 {
+      take_null!
+      return 0.0
+    }
+    if !(c == 45 || is_digit(c)) {
+      wrong!(p, kind_word(c), "Float")
+      return 0.0
+    }
+    e = num_end(s, p)
+    if e < 0 {
+      bad!(e)
+      return 0.0
+    }
+    f = parse_number(s[p...e])
+    if f.none? {
+      wrong!(p, "number " + s[p...e], "Float")
+      return 0.0
+    }
+    self.st[0].pos = e
+    f || 0.0
+  }
+
+  # ---- strings
+
+  # Reads the string literal at p (s[p] is the opening quote); leaves the
+  # position after it. Escapes are decoded; invalid UTF-8 becomes U+FFFD.
+  def read_string!(p: Int) -> Str {
+    n = s.size
+    i = p + 1
+    start = i
+    # Fast path: plain ASCII with no escapes.
+    while i < n {
+      c = s[i]
+      if c == 34 {
+        self.st[0].pos = i + 1
+        return s[start...i]
+      }
+      break if c == 92 || c >= 128 || c < 32
+      i += 1
+    }
+    e = str_end(s, p)
+    if e < 0 {
+      bad!(e)
+      return ""
+    }
+    # Slow path (the string is well formed up to e).
+    b: [Byte] = []
+    j = start
+    while j < i {
+      b << s[j]
+      j += 1
+    }
+    while i < e - 1 {
+      c = s[i]
+      if c == 92 {
+        i += 1
+        x = s[i]
+        if x == 98 {
+          b << 8
+        } else if x == 102 {
+          b << 12
+        } else if x == 110 {
+          b << 10
+        } else if x == 114 {
+          b << 13
+        } else if x == 116 {
+          b << 9
+        } else if x == 117 {
+          r = hex4(s, i + 1)
+          i += 4
+          if r >= 0xD800 && r < 0xDC00 {
+            # a high surrogate: needs \uDC00..\uDFFF right after
+            if i + 6 < e && s[i + 1] == 92 && s[i + 2] == 117 {
+              lo = hex4(s, i + 3)
+              if lo >= 0xDC00 && lo < 0xE000 {
+                r = 0x10000 + ((r - 0xD800) << 10) + (lo - 0xDC00)
+                i += 6
+              } else {
+                r = 0xFFFD
+              }
+            } else {
+              r = 0xFFFD
+            }
+          } else if r >= 0xDC00 && r < 0xE000 {
+            r = 0xFFFD
+          }
+          b = push_rune(b, r)
+        } else {
+          b << x
+        }
+        i += 1
+      } else if c < 128 {
+        b << c
+        i += 1
+      } else {
+        rr, w = utf8.decode_rune_at(s, i)
+        if rr == 0xFFFD && w == 1 {
+          b << 0xEF
+          b << 0xBF
+          b << 0xBD
+        } else {
+          k = 0
+          while k < w {
+            b << s[i + k]
+            k += 1
+          }
+        }
+        i += w
+      }
+    }
+    self.st[0].pos = e
+    Str.from_bytes(b)
+  }
+
+  pub def str! -> Str {
+    p = start!
+    return "" if p < 0
+    c = s[p]
+    return read_string!(p) if c == 34
+    if c == 110 {
+      take_null!
+      return ""
+    }
+    wrong!(p, kind_word(c), "Str")
+    ""
+  }
+
+  # ---- objects
+
+  # Consumes `{`. False if the value was null (then there is nothing to read).
+  pub def open_obj! -> Bool {
+    p = start!
+    return false if p < 0
+    c = s[p]
+    if c == 123 {
+      self.st[0].pos = p + 1
+      self.st[0].fresh = true
+      return true
+    }
+    if c == 110 {
+      take_null!
+      return false
+    }
+    wrong!(p, kind_word(c), "object")
+    false
+  }
+
+  # The next member: reads its key (see `key`) and the colon, leaving the
+  # position at the value; false at the closing `}` (or after an error).
+  pub def next_key! -> Bool {
+    return false if st[0].failed
+    n = s.size
+    p = skip_ws(s, st[0].pos)
+    if p >= n {
+      bad!(code(p, E_EOF))
+      return false
+    }
+    c = s[p]
+    if c == 125 {
+      self.st[0].pos = p + 1
+      self.st[0].fresh = false
+      return false
+    }
+    if !st[0].fresh {
+      if c != 44 {
+        bad!(code(p, E_PAIR))
+        return false
+      }
+      p = skip_ws(s, p + 1)
+      if p >= n {
+        bad!(code(p, E_EOF))
+        return false
+      }
+    }
+    if s[p] != 34 {
+      bad!(code(p, E_KEYSTART))
+      return false
+    }
+    k = read_string!(p)
+    return false if st[0].failed
+    q = skip_ws(s, st[0].pos)
+    if q >= n {
+      bad!(code(q, E_EOF))
+      return false
+    }
+    if s[q] != 58 {
+      bad!(code(q, E_KEY))
+      return false
+    }
+    self.st[0].pos = q + 1
+    self.st[0].key = k
+    self.st[0].fresh = false
+    true
+  }
+
+  # ---- arrays
+
+  # Consumes `[`. False if the value was null.
+  pub def open_arr! -> Bool {
+    p = start!
+    return false if p < 0
+    c = s[p]
+    if c == 91 {
+      self.st[0].pos = p + 1
+      self.st[0].fresh = true
+      return true
+    }
+    if c == 110 {
+      take_null!
+      return false
+    }
+    wrong!(p, kind_word(c), "array")
+    false
+  }
+
+  # True if another element follows (the position is then at it); false at `]`
+  # (or after an error).
+  pub def more! -> Bool {
+    return false if st[0].failed
+    n = s.size
+    p = skip_ws(s, st[0].pos)
+    if p >= n {
+      bad!(code(p, E_EOF))
+      return false
+    }
+    c = s[p]
+    if c == 93 {
+      self.st[0].pos = p + 1
+      self.st[0].fresh = false
+      return false
+    }
+    if st[0].fresh {
+      self.st[0].fresh = false
+      self.st[0].pos = p
+      return true
+    }
+    if c != 44 {
+      bad!(code(p, E_ELEM))
+      return false
+    }
+    self.st[0].pos = p + 1
+    true
+  }
+
+  # ---- tuples (fixed-length arrays)
+
+  pub def open_tuple! {
+    p = start!
+    return if p < 0
+    c = s[p]
+    if c == 91 {
+      self.st[0].pos = p + 1
+      self.st[0].fresh = true
+      return
+    }
+    wrong!(p, kind_word(c), "tuple")
+    nil
+  }
+
+  # Moves to element k of an n-element tuple.
+  pub def tuple_next!(k: Int, n: Int) {
+    return if st[0].failed
+    p = skip_ws(s, st[0].pos)
+    if p >= s.size {
+      bad!(code(p, E_EOF))
+      return
+    }
+    c = s[p]
+    if c == 93 {
+      wrong!(p, "array of length " + k.to_s, "tuple of length " + n.to_s)
+      return
+    }
+    if k > 0 {
+      if c != 44 {
+        bad!(code(p, E_ELEM))
+        return
+      }
+      self.st[0].pos = p + 1
+    } else {
+      self.st[0].pos = p
+    }
+    nil
+  }
+
+  pub def tuple_end!(n: Int) {
+    return if st[0].failed
+    p = skip_ws(s, st[0].pos)
+    if p >= s.size {
+      bad!(code(p, E_EOF))
+      return
+    }
+    if s[p] != 93 {
+      wrong!(p, "array of length more than " + n.to_s, "tuple of length " + n.to_s)
+      return
+    }
+    self.st[0].pos = p + 1
+    self.st[0].fresh = false
+    nil
+  }
+
+  # ---- enums
+
+  # An enum value: a string (a unit variant) or `{"Variant": payload`. Returns
+  # the variant's name; `wrapped` says whether a payload follows.
+  pub def variant! -> Str {
+    p = start!
+    return "" if p < 0
+    c = s[p]
+    if c == 34 {
+      self.st[0].wrapped = false
+      return read_string!(p)
+    }
+    if c == 123 {
+      q = skip_ws(s, p + 1)
+      if q >= s.size {
+        bad!(code(q, E_EOF))
+        return ""
+      }
+      if s[q] != 34 {
+        bad!(code(q, E_KEYSTART))
+        return ""
+      }
+      k = read_string!(q)
+      return "" if st[0].failed
+      r = skip_ws(s, st[0].pos)
+      if r >= s.size {
+        bad!(code(r, E_EOF))
+        return ""
+      }
+      if s[r] != 58 {
+        bad!(code(r, E_KEY))
+        return ""
+      }
+      self.st[0].pos = r + 1
+      self.st[0].wrapped = true
+      return k
+    }
+    wrong!(p, kind_word(c), "enum")
+    ""
+  }
+
+  # A unit variant may be written `{"V": null}`; anything after the colon is skipped.
+  pub def unit_variant!(wrapped: Bool) {
+    return if st[0].failed
+    if wrapped {
+      p = skip_ws(s, st[0].pos)
+      skip_at!(p)
+    }
+    nil
+  }
+
+  pub def need_payload!(wrapped: Bool) {
+    return if st[0].failed
+    if !wrapped {
+      fail!(JsonError.Invalid(msg: "variant " + st[0].ctx + " needs a payload: {\"Variant\": ...}", offset: st[0].pos))
+    }
+    nil
+  }
+
+  # Closes the `}` of a `{"Variant": payload}`.
+  pub def end_variant!(wrapped: Bool) {
+    return if st[0].failed
+    if wrapped {
+      p = skip_ws(s, st[0].pos)
+      if p >= s.size {
+        bad!(code(p, E_EOF))
+        return
+      }
+      if s[p] != 125 {
+        bad!(code(p, E_PAIR))
+        return
+      }
+      self.st[0].pos = p + 1
+    }
+    nil
+  }
+
+  # Records "unknown variant" for an enum named `owner`.
+  pub def bad_variant!(owner: Str, name: Str) {
+    fail!(JsonError.Invalid(msg: "unknown variant " + quote(name) + " for " + owner, offset: st[0].pos))
+  }
+
+  # ---- skipping and the end
+
+  # Skips the next value (any), checking its syntax.
+  pub def skip! {
+    p = start!
+    return if p < 0
+    skip_at!(p)
+    nil
+  }
+
+  # The end: reports the first error, or any text left after the value.
+  pub def done! -> ~Unit<JsonError> {
+    fail st[0].errs[0] if st[0].failed
+    p = skip_ws(s, st[0].pos)
+    fail err_char(s[p], "after top-level value", p) if p < s.size
+  }
+}
+
+pub def new_decoder(s: Str) -> Decoder {
+  Decoder.new(s: s, st: [DState.new(pos: 0, key: "", ctx: "", wrapped: false, fresh: false, failed: false, errs: [])])
+}
+
+# ---------------------------------------------------------------- numbers
+
+POW10 = [1.0, 10.0, 100.0, 1000.0, 10000.0, 100000.0, 1000000.0, 10000000.0, 100000000.0, 1000000000.0, 10000000000.0, 100000000000.0, 1000000000000.0, 10000000000000.0, 100000000000000.0, 1000000000000000.0, 10000000000000000.0, 100000000000000000.0, 1000000000000000000.0, 10000000000000000000.0, 100000000000000000000.0, 1000000000000000000000.0, 10000000000000000000000.0]
+
+# The Float of a number token (grammar already checked); none if it is out of
+# range. Short decimals take an exact fast path (mantissa below 2^53, power of
+# ten up to 22), the rest goes through strconv.
+def parse_number(t: Str) -> Float? {
+  n = t.size
+  i = 0
+  neg = false
+  if t[0] == 45 {
+    neg = true
+    i = 1
+  }
+  mant: U64 = 0
+  digits = 0
+  frac = 0
+  seen_dot = false
+  while i < n {
+    c = t[i]
+    if is_digit(c) {
+      if digits < 19 {
+        mant = mant * 10 + (c - 48).to_u64
+        digits += 1 if mant > 0
+        frac += 1 if seen_dot
+      } else {
+        return slow_number(t)
+      }
+    } else if c == 46 {
+      seen_dot = true
+    } else {
+      break
+    }
+    i += 1
+  }
+  ex = 0
+  if i < n {
+    # e or E
+    i += 1
+    eneg = false
+    if t[i] == 45 {
+      eneg = true
+      i += 1
+    } else if t[i] == 43 {
+      i += 1
+    }
+    while i < n {
+      ex = ex * 10 + (t[i] - 48).to_i
+      return slow_number(t) if ex > 100000
+      i += 1
+    }
+    ex = -ex if eneg
+  }
+  e10 = ex - frac
+  limit: U64 = 9007199254740992
+  if mant <= limit && e10 >= -22 && e10 <= 22 {
+    f = mant.to_i.to_f
+    if e10 < 0 {
+      f = f / POW10[-e10]
+    } else {
+      f = f * POW10[e10]
+    }
+    return neg ? -f : f
+  }
+  slow_number(t)
+}
+
+def slow_number(t: Str) -> Float? {
+  r = strconv.parse_float(t)
+  return none if r.err?
+  r.unwrap
+}

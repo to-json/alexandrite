@@ -1,0 +1,147 @@
+#![overflow(wrap)]
+# Encoding: the Encoder that derived `json_enc` methods write to.
+#
+# The output is a list of pieces (literals, numbers, strings), joined once at
+# `finish!`: appending a piece costs one push, where appending bytes costs one
+# push each, and a push is the expensive thing in a loop (it switches regions).
+
+import "strconv"
+import "unicode/utf8"
+
+# Can s be written between quotes as it is? (No escapes, valid UTF-8.)
+def plain(s: Str, html: Bool) -> Bool {
+  hi = false
+  i = 0
+  n = s.size
+  while i < n {
+    c = s[i]
+    return false if c < 0x20 || c == 34 || c == 92
+    return false if html && (c == 60 || c == 62 || c == 38)
+    if c >= 0x80 {
+      hi = true
+      return false if c == 0xE2 && i + 2 < n && s[i + 1] == 0x80 && (s[i + 2] == 0xA8 || s[i + 2] == 0xA9)
+    }
+    i += 1
+  }
+  !hi || utf8.valid_string(s)
+}
+
+# Go's float text; "" for NaN and the infinities.
+def fmt_float(f: Float) -> Str {
+  return "" if f != f || f > 1.7976931348623157e308 || f < -1.7976931348623157e308
+  a = f < 0.0 ? -f : f
+  if a < 1.0e15 && a == a.to_i.to_f {
+    # integral: no fraction, no exponent
+    return "-0" if f == 0.0 && 1.0 / f < 0.0
+    return f.to_i.to_s
+  }
+  fmt = "f"
+  fmt = "e" if a < 1.0e-6 || a >= 1.0e21
+  s = strconv.format_float(f, fmt, -1, 64)
+  n = s.size
+  if fmt == "e" && n >= 4 && s[n - 4] == 101 && s[n - 3] == 45 && s[n - 2] == 48 {
+    # e-09 -> e-9
+    return s[0...(n - 2)] + s[(n - 1)...n]
+  }
+  s
+}
+
+struct EState {
+  pieces: [Str]
+  err: Str
+  html: Bool
+}
+
+# The output side. Copies share the buffer (GO-VS-RUBY D36), so a derived
+# `json_enc(e)` can be handed `e` by value. Make one with `new_encoder`.
+pub struct Encoder {
+  st: [EState]
+
+  # Appends s as it is (punctuation, a number you formatted, a literal).
+  pub def raw!(s: Str) {
+    self.st[0].pieces << s
+  }
+
+  pub def null! {
+    self.st[0].pieces << "null"
+  }
+
+  pub def bool!(v: Bool) {
+    self.st[0].pieces << (v ? "true" : "false")
+  }
+
+  pub def int!(v: Int) {
+    self.st[0].pieces << v.to_s
+  }
+
+  pub def uint!(v: U64) {
+    self.st[0].pieces << v.to_s
+  }
+
+  # Go's float rules. NaN and the infinities record an error that `finish!` reports.
+  pub def float!(v: Float) {
+    self.st[0].pieces << f!(v)
+  }
+
+  # The text of f; for NaN and the infinities, "null" and an error `finish!` reports.
+  pub def f!(v: Float) -> Str {
+    s = fmt_float(v)
+    if s == "" {
+      if st[0].err == "" {
+        self.st[0].err = strconv.format_float(v, "g", -1, 64)
+      }
+      return "null"
+    }
+    s
+  }
+
+  # s as a JSON string literal (quoted and escaped).
+  pub def q(s: Str) -> Str {
+    return "\"#{s}\"" if plain(s, st[0].html)
+    b: [Byte] = []
+    b = put_quoted(b, s, st[0].html)
+    Str.from_bytes(b)
+  }
+
+  # Appends s as a JSON string.
+  pub def str!(s: Str) {
+    self.st[0].pieces << q(s)
+  }
+
+  # Go's SetEscapeHTML: on by default.
+  pub def set_escape_html!(on: Bool) {
+    self.st[0].html = on
+  }
+
+  # The JSON written so far, or the first error (a NaN or infinity).
+  pub def finish! -> ~Str<JsonError> {
+    fail JsonError.Unsupported(st[0].err) if st[0].err != ""
+    st[0].pieces.join("")
+  }
+
+  pub def html -> Bool { st[0].html }
+
+  pub def size -> Int {
+    n = 0
+    st[0].pieces.each { |p| n += p.size }
+    n
+  }
+}
+
+pub def new_encoder -> Encoder {
+  Encoder.new(st: [EState.new(pieces: [], err: "", html: true)])
+}
+
+# Go's Marshal: v is anything with a `json_enc` (a derived type, a Value).
+pub def marshal[T](v: T) -> ~Str<JsonError> {
+  e = new_encoder()
+  v.json_enc(e)
+  e.~finish!
+}
+
+pub def marshal_indent[T](v: T, prefix: Str, ind: Str) -> ~Str<JsonError> {
+  e = new_encoder()
+  v.json_enc(e)
+  s = e.~finish!
+  ~indent(s, prefix, ind)
+}

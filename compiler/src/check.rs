@@ -1861,6 +1861,10 @@ impl<'w, 'a> FnCx<'w, 'a> {
                 let c = self.cond(c)?;
                 let a = self.value(a)?;
                 let b = self.value(b)?;
+                // An untyped constant takes the other branch's type (`r == 0 ? -1 : r`).
+                let (ta, tb) = (self.resolve(&a.ty), self.resolve(&b.ty));
+                let a = if matches!(a.kind, TK::Const(_)) && ta != tb { self.coerce(a.clone(), &tb).unwrap_or(a) } else { a };
+                let b = if matches!(b.kind, TK::Const(_)) && ta != tb { self.coerce(b.clone(), &ta).unwrap_or(b) } else { b };
                 let (a, b) = self.join(a, b)?;
                 if !self.unify(&a.ty, &b.ty) {
                     return Err(Diag::new(sp, format!("branches have different types: {} and {}", self.resolve(&a.ty).show(), self.resolve(&b.ty).show())));
@@ -3514,14 +3518,32 @@ impl<'w, 'a> FnCx<'w, 'a> {
                 let v = self.show_value(v)?;
                 return Ok(self.mk(TK::Puts(Box::new(v)), Ty::Unit, sp));
             }
-            "assert" if self.w.by_name.get("assert").is_none() => {
+            "panic" if self.w.by_name.get("panic").is_none() => {
                 if args.len() != 1 {
-                    return Err(Diag::new(sp, "`assert` takes one argument: `assert cond`"));
+                    return Err(Diag::new(sp, "`panic` takes one argument: `panic(message)`"));
+                }
+                let m = self.value(&args[0])?;
+                let m = self.show_value(m)?;
+                return Ok(self.mk(TK::Panic(Box::new(m)), Ty::Never, sp));
+            }
+            "assert" if self.w.by_name.get("assert").is_none() => {
+                if args.is_empty() || args.len() > 2 {
+                    return Err(Diag::new(sp, "`assert` takes a condition and maybe a message: `assert cond, \"why\"`"));
                 }
                 let c = self.value(&args[0])?;
                 self.expect(&c.ty, &Ty::Bool, c.span, "`assert` condition")?;
                 let text = format!("assertion failed: {} at {}", self.w.sm.snippet(args[0].span).trim(), self.w.sm.loc(sp));
                 let msg = self.mk(TK::Str(text), Ty::Str, sp);
+                // `assert cond, why`: the message goes after the source text.
+                let msg = match args.get(1) {
+                    Some(w) => {
+                        let w = self.value(w)?;
+                        let w = self.show_value(w)?;
+                        let sep = self.mk(TK::Str(": ".into()), Ty::Str, sp);
+                        self.mk(TK::Format(vec![FmtPiece::Str(0), FmtPiece::Str(1), FmtPiece::Str(2)], vec![msg, sep, w]), Ty::Str, sp)
+                    }
+                    None => msg,
+                };
                 let fail = self.mk(TK::Panic(Box::new(msg)), Ty::Unit, sp);
                 let neg = self.mk(TK::Not(Box::new(c)), Ty::Bool, sp);
                 return Ok(self.mk(TK::Seq(vec![TStmt::If(neg, vec![TStmt::Expr(fail)], vec![])]), Ty::Unit, sp));

@@ -421,7 +421,13 @@ impl<'a> Lw<'a> {
             lw.defers.push(vec![]);
             for (i, s) in body.iter().enumerate() {
                 if returns_value && i == body.len() - 1 {
+                    // A last expression that never finishes (every branch
+                    // returns) has no value to return.
                     if let TStmt::Expr(e) = s {
+                        if e.ty == Ty::Never {
+                            lw.stmt(s);
+                            continue;
+                        }
                         let mut v = lw.expr(e);
                         if lw.has_defers(0) {
                             let t = lw.lty(&e.ty);

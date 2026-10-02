@@ -102,3 +102,13 @@ void alxj_int_fmt(AlxStr *out, int64_t v, int64_t base, int64_t upper, int64_t u
 int64_t alxj_f_to_u64(double x, const char *loc) { return alx_f_to_u64(x, loc); }
 void alxj_rune_to_s(AlxStr *out, int64_t r) { *out = alx_rune_to_s(r); }
 void alxj_str_from_bytes(AlxStr *out, const uint8_t *p, int64_t n) { *out = alx_str_from_bytes(p, n); }
+
+/* ---------- tasks and channels ---------- */
+void *alxj_spawn(AlxWorker fn, const void *env, int64_t in_size, int64_t out_size) { return alx_spawn(fn, env, (size_t)in_size, (size_t)out_size); }
+int64_t alxj_task_wait(AlxTask *t, void *out, AlxStr *msg) { return alx_task_wait(t, out, msg); }
+void *alxj_chan_new(int64_t cap, int64_t esz) { return alx_chan_new(cap, (size_t)esz); }
+int64_t alxj_chan_len(AlxChan *c) { return alx_chan_len(c); }
+void alxj_chan_send(AlxChan *c, const void *val, const char *loc) { alx_chan_send(c, val, loc); }
+int64_t alxj_chan_recv(AlxChan *c, void *out) { return alx_chan_recv(c, out); }
+void alxj_chan_close(AlxChan *c, const char *loc) { alx_chan_close(c, loc); }
+int64_t alxj_select(AlxSelCase *cases, int64_t n, int64_t has_default, const char *loc) { return alx_select(cases, n, has_default != 0, loc); }

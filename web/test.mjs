@@ -40,7 +40,7 @@ for (const f of readdirSync(cases).filter(f => /^[a-z]+\d*\.alx$/.test(f) && rea
   console.log(`${ok ? 'ok  ' : 'FAIL'} ${f.padEnd(10)} compile ${r.compileMs?.toFixed(1)} ms  inst ${r.instMs?.toFixed(1)} ms  run ${r.runMs?.toFixed(1)} ms` + (ok ? '' : `  got ${JSON.stringify(got)} ${r.compileError ?? ''} ${r.stderr ?? ''} ${r.status}`));
 }
 // Runtime failures.
-for (const [f, status, needle] of [['pe020.bad.alx', 'abort', 'overflow at pe020.bad.alx:1:'], ['pe022.missing.alx', 1, 'File.read: no such file `fixtures/nope.txt` (pe022.missing.alx:1:9)']]) {
+for (const [f, status, needle] of [['pe020.bad.alx', 'abort', 'overflow at pe020.bad.alx:1:'], ['pe022.missing.alx', 1, 'File.read: no such file `fixtures/nope.txt` (pe022.missing.alx:1:10)']]) {
   const r = run(f, readFileSync(cases + f, 'utf8'));
   const ok = r.status === status && r.stderr.includes(needle);
   if (!ok) fail++;

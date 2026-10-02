@@ -9,7 +9,8 @@ const PRELUDE: &str = include_str!("../runtime/prelude.rs");
 
 fn rty(t: &LTy) -> String {
     match t {
-        LTy::Task(_) | LTy::Chan(_) => unimplemented!("M7: task/channel types in the Rust oracle"),
+        LTy::Task(t) => format!("Task<{}>", rty(t)),
+        LTy::Chan(t) => format!("Chan<{}>", rty(t)),
         // Every integer kind is an i64 here (bit pattern for U64): the
         // oracle checks meaning, not memory layout.
         LTy::I64 | LTy::IntK(_) => "i64".into(),
@@ -142,7 +143,50 @@ impl FnEmit<'_> {
 
     fn stmt(&mut self, s: &LS) {
         match s {
-            LS::Spawn { .. } | LS::Wait { .. } | LS::ChanSend { .. } | LS::ChanRecv { .. } | LS::ChanClose { .. } | LS::Select { .. } => unimplemented!("M7: tasks and channels in the Rust oracle"),
+            LS::Spawn { dst, worker, env } => {
+                let x = self.e(env);
+                self.line(&format!("v{dst} = task_spawn(worker{worker}, {x});"));
+            }
+            LS::Wait { task, ok, val, msg } => {
+                let t = self.e(task);
+                self.line(&format!("match ({t}).wait() {{ Ok(x_) => {{ v{ok} = true; v{val} = x_; }} Err(m_) => {{ v{ok} = false; v{msg} = m_; }} }}"));
+            }
+            LS::ChanSend { ch, val, loc: l } => {
+                let (c, x) = (self.e(ch), self.e(val));
+                self.line(&format!("{{ let c_ = {c}; let x_ = {x}; c_.send(x_, {}); }}", loc(l)));
+            }
+            LS::ChanRecv { ch, ok, val } => {
+                let c = self.e(ch);
+                self.line(&format!("match ({c}).recv() {{ Some(x_) => {{ v{ok} = true; v{val} = x_; }} None => {{ v{ok} = false; }} }}"));
+            }
+            LS::ChanClose { ch, loc: l } => {
+                let c = self.e(ch);
+                self.line(&format!("({c}).close({});", loc(l)));
+            }
+            LS::Select { cases, default, dst } => {
+                // Case expressions are evaluated once, in order, into `s{i}_`.
+                let mut code = String::from("{ ");
+                for (i, c) in cases.iter().enumerate() {
+                    match c {
+                        SelCase::Send { ch, val } => {
+                            let (c, x) = (self.e(ch), self.e(val));
+                            code.push_str(&format!("let c{i}_ = {c}; let x{i}_ = {x}; let mut s{i}_ = SelSend::new(c{i}_, x{i}_); "));
+                        }
+                        SelCase::Recv { ch, .. } => {
+                            code.push_str(&format!("let mut s{i}_ = SelRecv::new({}); ", self.e(ch)));
+                        }
+                    }
+                }
+                let refs: Vec<String> = (0..cases.len()).map(|i| format!("&mut s{i}_ as &mut dyn SelCase")).collect();
+                code.push_str(&format!("v{dst} = select(&mut [{}], {default}); ", refs.join(", ")));
+                for (i, c) in cases.iter().enumerate() {
+                    if let SelCase::Recv { ok, val, .. } = c {
+                        code.push_str(&format!("if v{dst} == {i} {{ match s{i}_.result() {{ Some(x_) => {{ v{ok} = true; v{val} = x_; }} None => {{ v{ok} = false; }} }} }} "));
+                    }
+                }
+                code.push('}');
+                self.line(&code);
+            }
             LS::Set(v, e) => {
                 let x = self.e(e);
                 self.line(&format!("v{v} = {x};"));
@@ -274,7 +318,8 @@ impl FnEmit<'_> {
 
     fn e(&self, e: &LE) -> String {
         match e {
-            LE::ChanNew(..) | LE::ChanLen(_) => unimplemented!("M7: channels in the Rust oracle"),
+            LE::ChanNew(t, cap) => format!("Chan::<{}>::new({})", rty(t), self.e(cap)),
+            LE::ChanLen(c) => format!("({}).len()", self.e(c)),
             LE::Var(v) => self.var(*v),
             LE::I(i) => {
                 if *i == i64::MIN {

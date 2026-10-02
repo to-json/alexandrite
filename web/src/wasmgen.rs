@@ -257,7 +257,20 @@ fn worker_sig(w: &LWorker) -> (Vec<ValType>, Vec<ValType>) {
     (vts(&w.func.vars[p].ty), vts(&w.func.ret))
 }
 
+/// Does the program use tasks or channels? (Checked on the Debug form of the
+/// IR: the browser has no threads, so these are rejected up front.)
+fn uses_concurrency(p: &LProgram) -> bool {
+    let funcs = p.funcs.iter().chain(p.gens.iter().map(|g| &g.func)).chain(p.workers.iter().map(|w| &w.func));
+    funcs.into_iter().any(|f| {
+        let d = format!("{:?}", f.body);
+        ["Spawn {", "Wait {", "ChanSend {", "ChanRecv {", "ChanClose {", "Select {", "ChanNew(", "ChanLen("].iter().any(|k| d.contains(k))
+    })
+}
+
 pub fn emit(p: &LProgram) -> Result<Vec<u8>, String> {
+    if uses_concurrency(p) {
+        return Err("spawn and channels aren't available in the browser yet".into());
+    }
     rt::st().consts.clear();
     let mut cx = Ctx { types: vec![], type_idx: HashMap::new(), rt_idx: HashMap::new(), funcs: HashMap::new(), gens: HashMap::new(), workers: HashMap::new(), consts: HashMap::new(), ret: rt::ret_addr() };
     let mut imports = ImportSection::new();
@@ -685,7 +698,7 @@ impl<'c, 'p> Fx<'c, 'p> {
 
     fn stmt(&mut self, s: &LS) {
         match s {
-            LS::Spawn { .. } | LS::Wait { .. } | LS::ChanSend { .. } | LS::ChanRecv { .. } | LS::ChanClose { .. } | LS::Select { .. } => unimplemented!("M7: tasks and channels in the browser"),
+            LS::Spawn { .. } | LS::Wait { .. } | LS::ChanSend { .. } | LS::ChanRecv { .. } | LS::ChanClose { .. } | LS::Select { .. } => unreachable!("rejected by uses_concurrency"),
             LS::Set(v, e) => {
                 self.e(e);
                 self.set_var(*v);
@@ -1113,7 +1126,7 @@ impl<'c, 'p> Fx<'c, 'p> {
         let t = self.ty(e);
         let out = vts(&t);
         match e {
-            LE::ChanNew(..) | LE::ChanLen(_) => unimplemented!("M7: channels in the browser"),
+            LE::ChanNew(..) | LE::ChanLen(_) => unreachable!("rejected by uses_concurrency"),
             LE::Var(v) => {
                 let ls = self.vars[*v].clone();
                 self.get(&ls);

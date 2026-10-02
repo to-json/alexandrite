@@ -1,0 +1,500 @@
+# Tests for package time. The Go-generated vectors are in vec_*_test.alx.
+import "strings"
+
+# Times here use UTC and fixed zones, so the tests don't depend on the machine's zone.
+
+def perr(l: Str, v: Str) -> Str {
+  r = parse(l, v)
+  if e = r.err { return e.message }
+  "ok"
+}
+
+# "unix nsec offset" of a successful parse.
+def pok(l: Str, v: Str) -> Str {
+  r = parse(l, v)
+  if e = r.err { return "error: " + e.message }
+  t = r.unwrap
+  _, off = t.zone_info
+  "#{t.unix} #{t.nanosecond} #{off}"
+}
+
+def pdur(s: Str) -> Int {
+  r = parse_duration(s)
+  if e = r.err { return -1 }
+  r.unwrap.ns
+}
+
+def perr_dur(s: Str) -> Str {
+  r = parse_duration(s)
+  if e = r.err { return e.message }
+  "ok"
+}
+
+# f: year, month, day, hour, minute, second, nsec, weekday, yday, iso year, iso week, offset, (unused)
+def check_fields(t: Time, f: [Int], unix_sec: Int) {
+  assert_eq t.year, f[0]
+  assert_eq t.month, f[1]
+  assert_eq t.day, f[2]
+  assert_eq t.hour, f[3]
+  assert_eq t.minute, f[4]
+  assert_eq t.second, f[5]
+  assert_eq t.nanosecond, f[6]
+  assert_eq t.weekday, f[7]
+  assert_eq t.year_day, f[8]
+  iy, iw = t.iso_week
+  assert_eq iy, f[9]
+  assert_eq iw, f[10]
+  _, off = t.zone_info
+  assert_eq off, f[11]
+  assert_eq t.unix, unix_sec
+  y, m, d = t.date
+  assert_eq y, f[0]
+  assert_eq m, f[1]
+  assert_eq d, f[2]
+  h, mi, s = t.clock
+  assert_eq h, f[3]
+  assert_eq mi, f[4]
+  assert_eq s, f[5]
+}
+
+def check_unix(sec: Int, nsec: Int, want: Str, f: [Int]) {
+  t = unix(sec, nsec).utc
+  assert_eq t.format(RFC3339_NANO), want
+  assert_eq t.year, f[0]
+  assert_eq t.month, f[1]
+  assert_eq t.day, f[2]
+  assert_eq t.hour, f[3]
+  assert_eq t.minute, f[4]
+  assert_eq t.second, f[5]
+  assert_eq t.nanosecond, f[6]
+  assert_eq t.weekday, f[7]
+  assert_eq t.year_day, f[8]
+  # round trip through date()
+  u = date(t.year, t.month, t.day, t.hour, t.minute, t.second, t.nanosecond, utc())
+  assert_eq u.unix, t.unix
+  assert_eq u.unix_nano, t.unix_nano if t.unix > -9000000000 && t.unix < 9000000000
+}
+
+test "duration constants and operators" {
+  assert_eq (second() * 90).to_s, "1m30s"
+  assert_eq (minute() * 2 + second() * 3).ns, 123000000000
+  assert_eq (hour() - minute()).ns, 3540000000000
+  assert_eq (hour() / 4).to_s, "15m0s"
+  assert second() < minute()
+  assert hour() > minute()
+  assert second() <= second()
+  assert second() >= second()
+  assert second() == duration(1000000000)
+  assert second() != millisecond()
+  assert_eq millisecond().ns, 1000000
+  assert_eq microsecond().ns, 1000
+  assert_eq nanosecond().ns, 1
+}
+
+test "duration accessors" {
+  d = duration(90 * 1000000000 + 500000000)
+  assert_eq d.seconds, 90.5
+  assert_eq d.minutes, 1.5083333333333333
+  assert_eq d.milliseconds, 90500
+  assert_eq d.microseconds, 90500000
+  assert_eq d.nanoseconds, 90500000000
+  assert_eq (hour() * 36).hours, 36.0
+  assert_eq duration(-1500000000).seconds, -1.5
+  assert_eq duration(-5).abs.ns, 5
+  assert_eq duration(5).abs.ns, 5
+  assert_eq duration(-9223372036854775808).abs.ns, 9223372036854775807
+  assert_eq duration(1500).string, "1.5µs"
+}
+
+test "duration to_s" {
+  assert_eq duration(0).to_s, "0s"
+  assert_eq "#{second() * 3}", "3s"
+  assert_eq (hour() + minute() * 2 + second() * 3 + millisecond() * 500).to_s, "1h2m3.5s"
+  assert_eq (millisecond() * 1500).to_s, "1.5s"
+  assert_eq (microsecond() * 1500).to_s, "1.5ms"
+  assert_eq (hour() * 100).to_s, "100h0m0s"
+}
+
+test "parse_duration" {
+  assert_eq pdur("1h2m3.5s"), 3723500000000
+  assert_eq pdur("-1.5h"), -5400000000000
+  assert_eq pdur("300ms"), 300000000
+  assert_eq pdur("0"), 0
+  assert_eq pdur("2h45m"), 9900000000000
+  assert_eq perr_dur("5"), "time: missing unit in duration \"5\""
+  assert_eq perr_dur("5 s"), "time: unknown unit \" s\" in duration \"5 s\""
+  assert_eq perr_dur("5x"), "time: unknown unit \"x\" in duration \"5x\""
+  assert_eq perr_dur(""), "time: invalid duration \"\""
+  d = parse_duration("1h30m").unwrap
+  assert_eq d.minutes, 90.0
+}
+
+test "duration truncate and round" {
+  d = duration(1234567890)
+  assert_eq d.truncate(second()).ns, 1000000000
+  assert_eq d.truncate(millisecond()).ns, 1234000000
+  assert_eq d.round(second()).ns, 1000000000
+  assert_eq d.round(millisecond() * 10).ns, 1230000000
+  assert_eq duration(1500000000).round(second()).ns, 2000000000
+  assert_eq duration(-1500000000).round(second()).ns, -2000000000
+  assert_eq d.truncate(duration(0)).ns, d.ns
+  assert_eq d.round(duration(-1)).ns, d.ns
+}
+
+test "zero time" {
+  z = Time.new()
+  assert z.is_zero
+  assert_eq z.to_s, "0001-01-01 00:00:00 +0000 UTC"
+  assert_eq z.year, 1
+  assert_eq z.weekday, MONDAY
+  assert_eq z.unix, -62135596800
+  assert_eq z.format(RFC3339), "0001-01-01T00:00:00Z"
+  assert !unix(0, 0).is_zero
+  assert z.before(unix(0, 0))
+}
+
+test "calendar: days and leap years" {
+  assert_eq date(2024, 2, 29, 0, 0, 0, 0, utc()).year_day, 60
+  assert_eq date(2023, 12, 31, 0, 0, 0, 0, utc()).year_day, 365
+  assert_eq date(2024, 12, 31, 0, 0, 0, 0, utc()).year_day, 366
+  assert_eq date(1900, 12, 31, 0, 0, 0, 0, utc()).year_day, 365
+  assert_eq date(2000, 12, 31, 0, 0, 0, 0, utc()).year_day, 366
+  # 1900 is not a leap year, 2000 is, 0 is, -4 is, -100 is not
+  assert_eq date(1900, 2, 29, 0, 0, 0, 0, utc()).format(DATE_ONLY), "1900-03-01"
+  assert_eq date(2000, 2, 29, 0, 0, 0, 0, utc()).format(DATE_ONLY), "2000-02-29"
+  assert_eq date(0, 2, 29, 0, 0, 0, 0, utc()).format(DATE_ONLY), "0000-02-29"
+  assert_eq date(-4, 2, 29, 0, 0, 0, 0, utc()).format(DATE_ONLY), "-0004-02-29"
+  assert_eq date(-100, 2, 29, 0, 0, 0, 0, utc()).format(DATE_ONLY), "-0100-03-01"
+  # every day of 400 years round-trips
+  days = 0
+  y = 1600
+  while y < 2000 {
+    (1..12).each { |m|
+      n = date(y, m + 1, 0, 0, 0, 0, 0, utc()).day
+      d = 1
+      while d <= n {
+        t = date(y, m, d, 12, 0, 0, 0, utc())
+        assert_eq t.day, d
+        assert_eq t.month, m
+        assert_eq t.year, y
+        days += 1
+        d += 1
+      }
+    }
+    y += 100
+  }
+  assert_eq days, 1461 # 1600 is a leap year; 1700, 1800, 1900 are not
+}
+
+test "weekday, month names and constants" {
+  t = date(2024, 3, 15, 0, 0, 0, 0, utc())
+  assert_eq t.weekday, FRIDAY
+  assert_eq t.weekday_name, "Friday"
+  assert_eq t.month, MARCH
+  assert_eq t.month_name, "March"
+  assert_eq month_name(DECEMBER), "December"
+  assert_eq weekday_name(SUNDAY), "Sunday"
+  assert_eq month_name(13), "%!Month(13)"
+  assert_eq weekday_name(7), "%!Weekday(7)"
+}
+
+test "iso_week" {
+  y, w = date(2021, 1, 3, 0, 0, 0, 0, utc()).iso_week
+  assert_eq y, 2020
+  assert_eq w, 53
+  y, w = date(2021, 1, 4, 0, 0, 0, 0, utc()).iso_week
+  assert_eq y, 2021
+  assert_eq w, 1
+  y, w = date(2018, 12, 31, 0, 0, 0, 0, utc()).iso_week
+  assert_eq y, 2019
+  assert_eq w, 1
+  y, w = date(2016, 1, 1, 0, 0, 0, 0, utc()).iso_week
+  assert_eq y, 2015
+  assert_eq w, 53
+}
+
+test "zones" {
+  t = date(2024, 6, 1, 12, 0, 0, 0, utc())
+  est = fixed_zone("EST", -5 * 3600)
+  e = t.in_zone(est)
+  assert_eq e.hour, 7
+  assert_eq e.format(RFC3339), "2024-06-01T07:00:00-05:00"
+  assert_eq e.format(RFC1123), "Sat, 01 Jun 2024 07:00:00 EST"
+  assert e.equal(t)
+  assert e == t
+  assert_eq e.utc.format(RFC3339), "2024-06-01T12:00:00Z"
+  name, off = e.zone_info
+  assert_eq name, "EST"
+  assert_eq off, -18000
+  assert_eq e.location.to_s, "EST"
+  # date() in a zone takes the wall clock there
+  d = date(2024, 6, 1, 7, 0, 0, 0, est)
+  assert d.equal(t)
+  # an unnamed zone prints its offset for MST
+  n = t.in_zone(fixed_zone("", 3600 + 1800))
+  assert_eq n.format("MST"), "+0130"
+  assert_eq n.format("Z07:00"), "+01:30"
+  assert_eq t.format("MST Z07:00"), "UTC Z"
+  assert_eq load_location("UTC").unwrap.to_s, "UTC"
+  assert_eq load_location("").unwrap.to_s, "UTC"
+  assert_eq load_location("Local").unwrap.to_s, "Local"
+  assert_eq load_location("Mars/Olympus").err.unwrap.message, "unknown time zone Mars/Olympus"
+}
+
+test "local zone is self-consistent" {
+  # whatever the machine's zone is: wall clock and instant agree
+  t = date(2024, 1, 15, 12, 30, 0, 0, local())
+  assert_eq t.hour, 12
+  assert_eq t.minute, 30
+  assert_eq t.day, 15
+  u = date(2024, 7, 15, 12, 30, 0, 0, local())
+  assert_eq u.hour, 12
+  assert_eq u.day, 15
+  n = unix(1700000000, 0)
+  assert_eq n.unix, 1700000000
+  assert_eq n.utc.unix, 1700000000
+  assert n.equal(n.utc)
+  _, off = n.zone_info
+  assert_eq n.utc.add(duration(off * 1000000000)).format(DATE_TIME), n.format(DATE_TIME)
+  assert_eq now().location.to_s, "Local"
+  assert_eq now().utc.location.to_s, "UTC"
+  assert_eq n.local.format(RFC3339), n.format(RFC3339)
+  # arithmetic re-resolves the zone at the new instant (daylight saving)
+  [3600, 86400 * 30, 86400 * 100, 86400 * 200, -86400 * 150].each { |secs|
+    moved = n.add(duration(secs * 1000000000))
+    assert_eq moved.format(RFC3339), unix(1700000000 + secs, 0).format(RFC3339)
+  }
+}
+
+test "add, sub and comparisons" {
+  a = date(2024, 1, 1, 0, 0, 0, 0, utc())
+  b = a.add(hour() * 36 + millisecond() * 5)
+  assert_eq b.format("2006-01-02 15:04:05.000"), "2024-01-02 12:00:00.005"
+  assert_eq b.sub(a).to_s, "36h0m0.005s"
+  assert_eq a.sub(b).to_s, "-36h0m0.005s"
+  assert a.before(b)
+  assert b.after(a)
+  assert !a.after(b)
+  assert a < b
+  assert b > a
+  assert a <= a
+  assert_eq a.compare(b), -1
+  assert_eq b.compare(a), 1
+  assert_eq a.compare(a), 0
+  assert_eq a.add(duration(-1)).format(RFC3339_NANO), "2023-12-31T23:59:59.999999999Z"
+  # saturating Sub
+  far = date(2400, 1, 1, 0, 0, 0, 0, utc())
+  assert_eq far.sub(a).ns, 9223372036854775807
+  assert_eq a.sub(far).ns, -9223372036854775808
+}
+
+test "unix constructors and accessors" {
+  t = unix(1700000000, 123456789).utc
+  assert_eq t.unix, 1700000000
+  assert_eq t.unix_milli, 1700000000123
+  assert_eq t.unix_micro, 1700000000123456
+  assert_eq t.unix_nano, 1700000000123456789
+  assert_eq unix_milli(1700000000123).utc.format(RFC3339_NANO), "2023-11-14T22:13:20.123Z"
+  assert_eq unix_micro(-1).utc.format(RFC3339_NANO), "1969-12-31T23:59:59.999999Z"
+  assert_eq unix_milli(-1).utc.format(RFC3339_NANO), "1969-12-31T23:59:59.999Z"
+  assert_eq unix(0, -1).utc.format(RFC3339_NANO), "1969-12-31T23:59:59.999999999Z"
+  assert_eq unix(5, 2500000000).utc.format(RFC3339_NANO), "1970-01-01T00:00:07.5Z"
+}
+
+test "monotonic clock" {
+  a = now()
+  b = now()
+  assert b.sub(a).ns >= 0
+  assert a.before(b) || a.equal(b)
+  # a monotonic reading survives add and utc/local, and is dropped by round(0)
+  c = a.add(second())
+  assert_eq c.sub(a).ns, 1000000000
+  assert_eq a.utc.add(second()).sub(a).ns, 1000000000
+  assert_eq a.strip_mono.add(second()).sub(a).ns, 1000000000
+  assert strings.contains(a.to_s, "m=+")
+  assert !strings.contains(a.strip_mono.to_s, "m=")
+  assert !strings.contains(a.round(duration(0)).to_s, "m=")
+  s = now()
+  sleep(millisecond() * 20)
+  e = since(s)
+  assert e.ns >= 19000000
+  assert e.ns < 2000000000
+  assert until(s).ns < 0
+  assert until(now().add(hour())).ns > 0
+}
+
+test "sleep" {
+  s = now()
+  sleep(millisecond() * 30)
+  assert since(s).ns >= 29000000
+  s2 = now()
+  sleep(duration(0))
+  sleep(duration(-5))
+  assert since(s2).ns < 20000000
+}
+
+test "after delivers once" {
+  s = now()
+  ch = after(millisecond() * 40)
+  t = ch.recv.unwrap
+  assert since(s).ns >= 39000000
+  assert t.sub(s).ns >= 39000000
+}
+
+test "select with a timeout" {
+  never = Chan[Int].new
+  s = now()
+  got = "none"
+  select {
+    when v = never.recv => got = "value"
+    when t = after(millisecond() * 30).recv => got = "timeout"
+  }
+  assert_eq got, "timeout"
+  assert since(s).ns >= 29000000
+
+  # a value that arrives first wins
+  fast = Chan[Int].new(1)
+  spawn {
+    sleep(millisecond() * 5)
+    fast << 7
+  }
+  out = 0
+  select {
+    when v = fast.recv => out = v.unwrap
+    when t = after(second() * 5).recv => out = -1
+  }
+  assert_eq out, 7
+}
+
+test "timer stop and fire" {
+  tm = new_timer(millisecond() * 20)
+  assert tm.stop
+  assert !tm.stop
+  sleep(millisecond() * 60)
+  fired = false
+  select {
+    when t = tm.c.recv => fired = true
+    else => nil
+  }
+  assert !fired
+
+  t2 = new_timer(millisecond() * 10)
+  t2.c.recv
+  assert !t2.stop
+}
+
+test "ticker ticks and stops" {
+  tk = new_ticker(millisecond() * 15)
+  n = 0
+  s = now()
+  while n < 4 {
+    tk.c.recv
+    n += 1
+  }
+  tk.stop
+  e = since(s)
+  assert e.ns >= 55000000
+  assert e.ns < 2000000000
+  # after stopping, nothing more arrives (a tick may already be buffered)
+  sleep(millisecond() * 60)
+  tk.c.recv if tk.c.size > 0
+  sleep(millisecond() * 40)
+  assert_eq tk.c.size, 0
+}
+
+test "tick" {
+  ch = tick(millisecond() * 10)
+  a = ch.recv.unwrap
+  b = ch.recv.unwrap
+  assert b.sub(a).ns >= 5000000
+}
+
+test "format basics" {
+  t = date(2006, 1, 2, 15, 4, 5, 999999999, fixed_zone("MST", -7 * 3600))
+  assert_eq t.format(ANSIC), "Mon Jan  2 15:04:05 2006"
+  assert_eq t.format(RFC3339_NANO), "2006-01-02T15:04:05.999999999-07:00"
+  assert_eq t.format(KITCHEN), "3:04PM"
+  assert_eq t.format("2006-01-02T15:04:05.000Z07:00"), "2006-01-02T15:04:05.999-07:00"
+  assert_eq t.to_s, "2006-01-02 15:04:05.999999999 -0700 MST"
+  assert_eq "#{t}", "2006-01-02 15:04:05.999999999 -0700 MST"
+  assert_eq t.format(""), ""
+  assert_eq t.format("literal"), "literal"
+}
+
+test "parse returns errors" {
+  r = parse(RFC3339, "garbage")
+  assert r.err?
+  assert_eq perr(RFC3339, "garbage"), "parsing time \"garbage\" as \"2006-01-02T15:04:05Z07:00\": cannot parse \"garbage\" as \"2006\""
+  r2 = parse(DATE_ONLY, "2024-02-30")
+  assert_eq r2.err.unwrap.message, "parsing time \"2024-02-30\": day out of range"
+}
+
+test "parse in location" {
+  est = fixed_zone("EST", -5 * 3600)
+  t = parse_in_location(DATE_TIME, "2024-06-01 12:00:00", est).unwrap
+  assert_eq t.unix, date(2024, 6, 1, 17, 0, 0, 0, utc()).unix
+  _, off = t.zone_info
+  assert_eq off, -18000
+  # an explicit offset wins over the location
+  u = parse_in_location(RFC3339, "2024-06-01T12:00:00Z", est).unwrap
+  assert_eq u.unix, date(2024, 6, 1, 12, 0, 0, 0, utc()).unix
+  # parse of a formatted time round-trips
+  orig = date(2031, 8, 9, 10, 11, 12, 345678901, fixed_zone("", 5 * 3600 + 1800))
+  back = parse(RFC3339_NANO, orig.format(RFC3339_NANO)).unwrap
+  assert back.equal(orig)
+  _, boff = back.zone_info
+  assert_eq boff, 5 * 3600 + 1800
+}
+
+test "parse zone abbreviations" {
+  t = parse(RFC1123, "Mon, 02 Jan 2006 15:04:05 PST").unwrap
+  name, off = t.zone_info
+  assert_eq name, "PST"
+  assert_eq off, 0
+  assert_eq t.format(RFC1123), "Mon, 02 Jan 2006 15:04:05 PST"
+  u = parse(RFC1123, "Mon, 02 Jan 2006 15:04:05 GMT+5").unwrap
+  _, uoff = u.zone_info
+  assert_eq uoff, 18000
+}
+
+test "zone-less parse is UTC" {
+  t = parse(KITCHEN, "3:04PM").unwrap
+  assert_eq t.year, 0
+  assert_eq t.month, 1
+  assert_eq t.day, 1
+  assert_eq t.hour, 15
+  assert_eq t.format(DATE_TIME), "0000-01-01 15:04:00"
+}
+
+test "add_date normalizes" {
+  t = date(2024, 1, 31, 10, 0, 0, 0, utc())
+  assert_eq t.add_date(0, 1, 0).format(DATE_ONLY), "2024-03-02"
+  assert_eq t.add_date(1, 0, 0).format(DATE_ONLY), "2025-01-31"
+  assert_eq t.add_date(0, 0, 30).format(DATE_ONLY), "2024-03-01"
+  assert_eq date(2024, 2, 29, 0, 0, 0, 0, utc()).add_date(1, 0, 0).format(DATE_ONLY), "2025-03-01"
+}
+
+test "truncate and round Time" {
+  t = date(2024, 5, 6, 7, 8, 9, 600000000, utc())
+  assert_eq t.truncate(second()).format(RFC3339_NANO), "2024-05-06T07:08:09Z"
+  assert_eq t.round(second()).format(RFC3339_NANO), "2024-05-06T07:08:10Z"
+  assert_eq t.truncate(hour()).format(RFC3339_NANO), "2024-05-06T07:00:00Z"
+  assert_eq t.round(minute()).format(RFC3339_NANO), "2024-05-06T07:08:00Z"
+  assert_eq t.truncate(hour() * 24).format(RFC3339_NANO), "2024-05-06T00:00:00Z"
+  assert_eq t.truncate(duration(0)).format(RFC3339_NANO), t.format(RFC3339_NANO)
+}
+
+test "fields" {
+  t = date(2024, 2, 29, 13, 14, 15, 16, fixed_zone("X", 3600))
+  assert_eq t.year, 2024
+  assert_eq t.month, 2
+  assert_eq t.day, 29
+  assert_eq t.hour, 13
+  assert_eq t.minute, 14
+  assert_eq t.second, 15
+  assert_eq t.nanosecond, 16
+  assert_eq t.weekday, THURSDAY
+  assert_eq t.year_day, 60
+  assert_eq t.utc.hour, 12
+  assert_eq t.unix, date(2024, 2, 29, 12, 14, 15, 0, utc()).unix
+}

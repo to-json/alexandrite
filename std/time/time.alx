@@ -1,0 +1,815 @@
+# Package time: Go's time, with alx idioms (S2). Milestone L2.
+#
+#   Go                                  alx
+#   time.Duration (int64 ns)            Duration { ns: Int } with operators and methods
+#   time.Second, 5 * time.Second        second(), second() * 5   (see below)
+#   d.Seconds() / d.Milliseconds()      d.seconds -> Float / d.milliseconds -> Int
+#   d.String(), ParseDuration(s)        d.to_s ("1h2m3.5s"), parse_duration(s) -> ~Duration<DurationError>
+#   time.Time                           Time (a value; immutable, every method returns a new one)
+#   time.Now(), time.Unix(s, ns)        now(), unix(sec, nsec), unix_milli(ms), unix_micro(us)
+#   time.Date(y, m, d, h, mi, s, ns, loc)  date(y, m, d, h, mi, s, ns, loc)   (month is an Int 1..12)
+#   t.Add / t.Sub / t.AddDate           t.add(d) / t.sub(u) -> Duration / t.add_date(y, m, d)
+#   t.Format(layout) / time.Parse       t.format(layout) / parse(layout, value) -> ~Time<ParseError>
+#   time.Sleep / After / Tick           sleep(d) / after(d) -> Chan[Time] / tick(d) -> Chan[Time]
+#   time.Timer / time.Ticker            Timer / Ticker (new_timer, new_ticker; stop)
+#
+# Differences from Go, and things worth knowing:
+#   - Duration is a struct (not an integer), so constants cannot be Durations:
+#     the units are zero-argument functions, `time.second * 5`, `time.minute * 2`.
+#     `+ - * /` (the last two take an Int), `< <= > >=` and `==` work on Durations.
+#   - Months are Ints 1..12 (JANUARY..DECEMBER are constants), weekdays are Ints
+#     0..6 with Sunday 0 (SUNDAY..SATURDAY); month_name / weekday_name give the names.
+#   - A Time is the instant (seconds since 0001-01-01 UTC and nanoseconds) plus an
+#     optional monotonic reading plus a zone (offset and abbreviation). `==` on Times
+#     compares the instants (Go's Equal); `<`, `>` order them. Calendar math is exact
+#     proleptic Gregorian, valid over the whole Int range of seconds. The zero Time is
+#     0001-01-01 00:00:00 UTC, as in Go.
+#   - Locations: utc(), local(), fixed_zone(name, offset). `local()` is the C library's
+#     zone for the process (TZ), asked per instant for the offset and abbreviation. There
+#     is no tz database: load_location knows only "", "UTC" and "Local".
+#   - Parsing a zone abbreviation (MST) whose offset isn't in the layout gives a fixed
+#     zone with that name and offset 0 (as Go does for unknown abbreviations), except that
+#     "UTC" and "GMT+n" forms are understood.
+#   - Timers: after/tick run a spawned task that sleeps; Timer and Ticker can be stopped
+#     (the task then ends the next time it wakes). tick never stops; use a Ticker.
+#     A Ticker, like Go's, drops ticks the receiver is too slow to take.
+#   - Time layouts are Go's reference time (Mon Jan 2 15:04:05 MST 2006), unchanged.
+import "strconv"
+
+extern def alx_wall_ns -> Int
+extern def alx_mono_ns -> Int
+extern def alx_sleep_ns(ns: Int)
+extern def alx_local_offset(unix_sec: Int) -> Int
+extern def alx_local_zone(unix_sec: Int) -> Ptr
+
+# ---------------------------------------------------------------- constants
+
+NS_PER_SEC = 1000000000
+SEC_PER_DAY = 86400
+# Seconds from 0001-01-01 to 1970-01-01 (Go's unixToInternal).
+UNIX_TO_YEAR1 = 62135596800
+# Days from 0001-01-01 to 1970-01-01.
+DAYS_UNIX_TO_YEAR1 = 719162
+MAX_INT = 9223372036854775807
+MIN_INT = -9223372036854775808
+
+pub JANUARY = 1
+pub FEBRUARY = 2
+pub MARCH = 3
+pub APRIL = 4
+pub MAY = 5
+pub JUNE = 6
+pub JULY = 7
+pub AUGUST = 8
+pub SEPTEMBER = 9
+pub OCTOBER = 10
+pub NOVEMBER = 11
+pub DECEMBER = 12
+
+pub SUNDAY = 0
+pub MONDAY = 1
+pub TUESDAY = 2
+pub WEDNESDAY = 3
+pub THURSDAY = 4
+pub FRIDAY = 5
+pub SATURDAY = 6
+
+# The layouts of Go's package time.
+pub ANSIC = "Mon Jan _2 15:04:05 2006"
+pub UNIX_DATE = "Mon Jan _2 15:04:05 MST 2006"
+pub RUBY_DATE = "Mon Jan 02 15:04:05 -0700 2006"
+pub RFC822 = "02 Jan 06 15:04 MST"
+pub RFC822Z = "02 Jan 06 15:04 -0700"
+pub RFC850 = "Monday, 02-Jan-06 15:04:05 MST"
+pub RFC1123 = "Mon, 02 Jan 2006 15:04:05 MST"
+pub RFC1123Z = "Mon, 02 Jan 2006 15:04:05 -0700"
+pub RFC3339 = "2006-01-02T15:04:05Z07:00"
+pub RFC3339_NANO = "2006-01-02T15:04:05.999999999Z07:00"
+pub KITCHEN = "3:04PM"
+pub STAMP = "Jan _2 15:04:05"
+pub STAMP_MILLI = "Jan _2 15:04:05.000"
+pub STAMP_MICRO = "Jan _2 15:04:05.000000"
+pub STAMP_NANO = "Jan _2 15:04:05.000000000"
+pub DATE_TIME = "2006-01-02 15:04:05"
+pub DATE_ONLY = "2006-01-02"
+pub TIME_ONLY = "15:04:05"
+
+# ------------------------------------------------------------ small helpers
+
+# Floor division and modulus (the sign of the result follows the divisor).
+def fdiv(a: Int, b: Int) -> Int {
+  q = a / b
+  q -= 1 if (a % b != 0) && ((a < 0) != (b < 0))
+  q
+}
+
+def fmod(a: Int, b: Int) -> Int { a - fdiv(a, b) * b }
+
+def zpad(n: Int, width: Int) -> Str {
+  neg = n < 0
+  s = (if neg { 0 - n } else { n }).to_s
+  while s.size < width { s = "0" + s }
+  neg ? "-" + s : s
+}
+
+# (a + b) mod m for 0 <= a, b < m, without overflow.
+def addmod(a: Int, b: Int, m: Int) -> Int {
+  return a - (m - b) if a >= m - b
+  a + b
+}
+
+# (a * b) mod m for 0 <= a, b < m, without overflow.
+def mulmod(a: Int, b: Int, m: Int) -> Int {
+  r = 0
+  x = a
+  y = b
+  while y > 0 {
+    r = addmod(r, x, m) if (y & 1) == 1
+    x = addmod(x, x, m)
+    y = y >> 1
+  }
+  r
+}
+
+def is_leap(y: Int) -> Bool { (y % 4 == 0) && (y % 100 != 0 || y % 400 == 0) }
+
+def days_in_month(y: Int, m: Int) -> Int {
+  return 29 if m == 2 && is_leap(y)
+  case m {
+    2 => 28
+    4 => 30
+    6 => 30
+    9 => 30
+    11 => 30
+    _ => 31
+  }
+}
+
+# Days since 1970-01-01 of the civil date (y, m, d); m in 1..12, d any Int
+# (it just adds days). Howard Hinnant's days_from_civil.
+def days_from_civil(y0: Int, m: Int, d: Int) -> Int {
+  y = y0
+  y -= 1 if m <= 2
+  era = fdiv(y, 400)
+  yoe = y - era * 400
+  mp = m > 2 ? m - 3 : m + 9
+  doy = (153 * mp + 2) / 5
+  doe = yoe * 365 + yoe / 4 - yoe / 100 + doy
+  era * 146097 + doe - 719468 + (d - 1)
+}
+
+# The civil date (year, month, day) of a day count since 1970-01-01.
+def civil_from_days(z0: Int) -> (Int, Int, Int) {
+  z = z0 + 719468
+  era = fdiv(z, 146097)
+  doe = z - era * 146097
+  yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365
+  y = yoe + era * 400
+  doy = doe - (365 * yoe + yoe / 4 - yoe / 100)
+  mp = (5 * doy + 2) / 153
+  d = doy - (153 * mp + 2) / 5 + 1
+  m = mp < 10 ? mp + 3 : mp - 9
+  y += 1 if m <= 2
+  return y, m, d
+}
+
+pub def month_name(m: Int) -> Str { month_str(m) }
+
+def month_str(m: Int) -> Str {
+  case m {
+    1 => "January"
+    2 => "February"
+    3 => "March"
+    4 => "April"
+    5 => "May"
+    6 => "June"
+    7 => "July"
+    8 => "August"
+    9 => "September"
+    10 => "October"
+    11 => "November"
+    12 => "December"
+    _ => "%!Month(#{m})"
+  }
+}
+
+pub def weekday_name(d: Int) -> Str { weekday_str(d) }
+
+def weekday_str(d: Int) -> Str {
+  case d {
+    0 => "Sunday"
+    1 => "Monday"
+    2 => "Tuesday"
+    3 => "Wednesday"
+    4 => "Thursday"
+    5 => "Friday"
+    6 => "Saturday"
+    _ => "%!Weekday(#{d})"
+  }
+}
+
+# ----------------------------------------------------------------- Duration
+
+# Why a duration string didn't parse (Go's messages).
+pub error DurationError {
+  Invalid(input: Str)
+  MissingUnit(input: Str)
+  UnknownUnit(unit: Str, input: Str)
+
+  def message -> Str {
+    case self {
+      Invalid(s) => "time: invalid duration #{strconv.quote(s)}"
+      MissingUnit(s) => "time: missing unit in duration #{strconv.quote(s)}"
+      UnknownUnit(u, s) => "time: unknown unit #{strconv.quote(u)} in duration #{strconv.quote(s)}"
+    }
+  }
+}
+
+# "1.5" style: ip / 10^prec with the fractional digits, trailing zeros dropped.
+def frac_str(v: Int, prec: Int) -> Str {
+  p = 1
+  (1..prec).each { p *= 10 }
+  ip = v / p
+  fr = v % p
+  return ip.to_s if fr == 0
+  digits = zpad(fr, prec)
+  n = digits.size
+  while n > 0 && digits[n - 1].to_i == 48 { n -= 1 }
+  "#{ip}.#{digits[0...n]}"
+}
+
+# A length of time in nanoseconds (Go's time.Duration). The longest is about
+# 292 years either way. Sums and products panic on overflow.
+pub struct Duration {
+  ns: Int
+
+  pub def +(o: Duration) -> Duration { Duration.new(ns + o.ns) }
+  pub def -(o: Duration) -> Duration { Duration.new(ns - o.ns) }
+  pub def *(k: Int) -> Duration { Duration.new(ns * k) }
+  pub def /(k: Int) -> Duration { Duration.new(ns / k) }
+  pub def <=>(o: Duration) -> Int {
+    return -1 if ns < o.ns
+    return 1 if ns > o.ns
+    0
+  }
+
+  pub def nanoseconds -> Int { ns }
+  pub def microseconds -> Int { ns / 1000 }
+  pub def milliseconds -> Int { ns / 1000000 }
+  # Float seconds, minutes and hours (whole units plus the exact fraction).
+  pub def seconds -> Float { (ns / NS_PER_SEC).to_f + (ns % NS_PER_SEC).to_f / 1e9 }
+  pub def minutes -> Float { (ns / 60000000000).to_f + (ns % 60000000000).to_f / 6e10 }
+  pub def hours -> Float { (ns / 3600000000000).to_f + (ns % 3600000000000).to_f / 3.6e12 }
+
+  pub def abs -> Duration {
+    return Duration.new(MAX_INT) if ns == MIN_INT
+    ns < 0 ? Duration.new(0 - ns) : self
+  }
+
+  # Rounds toward zero to a multiple of m (d unchanged if m <= 0).
+  pub def truncate(m: Duration) -> Duration {
+    return self if m.ns <= 0
+    Duration.new(ns - ns % m.ns)
+  }
+
+  # Rounds to the nearest multiple of m, halves away from zero; on overflow
+  # the result saturates at the largest or smallest Duration (Go's Round).
+  pub def round(m: Duration) -> Duration {
+    return self if m.ns <= 0
+    r = ns % m.ns
+    if ns < 0 {
+      r = 0 - r
+      return Duration.new(ns + r) if r < m.ns - r
+      gap = m.ns - r
+      return Duration.new(MIN_INT) if ns < MIN_INT + gap
+      return Duration.new(ns - gap)
+    }
+    return Duration.new(ns - r) if r < m.ns - r
+    gap = m.ns - r
+    return Duration.new(MAX_INT) if ns > MAX_INT - gap
+    Duration.new(ns + gap)
+  }
+
+  # Go's format: "0s", "1.5ms", "72h3m0.5s", "-2m0s".
+  pub def to_s -> Str {
+    return "0s" if ns == 0
+    return "-2562047h47m16.854775808s" if ns == MIN_INT
+    neg = ns < 0
+    u = neg ? 0 - ns : ns
+    out = ""
+    if u < NS_PER_SEC {
+      if u < 1000 {
+        out = "#{u}ns"
+      } else if u < 1000000 {
+        out = frac_str(u, 3) + "µs"
+      } else {
+        out = frac_str(u, 6) + "ms"
+      }
+    } else {
+      secs = u / NS_PER_SEC
+      sec_part = (secs % 60) * NS_PER_SEC + u % NS_PER_SEC
+      out = frac_str(sec_part, 9) + "s"
+      mins = secs / 60
+      if mins > 0 {
+        out = "#{mins % 60}m" + out
+        hours = mins / 60
+        out = "#{hours}h" + out if hours > 0
+      }
+    }
+    neg ? "-" + out : out
+  }
+  pub def string -> Str { self.to_s }
+}
+
+pub def nanosecond -> Duration { Duration.new(1) }
+pub def microsecond -> Duration { Duration.new(1000) }
+pub def millisecond -> Duration { Duration.new(1000000) }
+pub def second -> Duration { Duration.new(1000000000) }
+pub def minute -> Duration { Duration.new(60000000000) }
+pub def hour -> Duration { Duration.new(3600000000000) }
+
+# A Duration of n nanoseconds.
+pub def duration(ns: Int) -> Duration { Duration.new(ns) }
+
+def digit?(s: Str, i: Int) -> Bool { i < s.size && s[i].to_i >= 48 && s[i].to_i <= 57 }
+
+def unit_ns(u: Str) -> Int {
+  case u {
+    "ns" => 1
+    "us" => 1000
+    "µs" => 1000 # U+00B5
+    "μs" => 1000 # U+03BC
+    "ms" => 1000000
+    "s" => 1000000000
+    "m" => 60000000000
+    "h" => 3600000000000
+    _ => 0
+  }
+}
+
+# Go's ParseDuration: a signed sequence of decimal numbers, each with a unit
+# suffix: "300ms", "-1.5h", "2h45m". Units: ns us (or µs) ms s m h.
+pub def parse_duration(s0: Str) -> ~Duration<DurationError> {
+  s = s0
+  fail DurationError.Invalid(s0) if s == ""
+  neg = false
+  if s[0].to_i == 45 || s[0].to_i == 43 {
+    neg = s[0].to_i == 45
+    s = s[1...s.size]
+  }
+  return Duration.new(0) if s == "0"
+  fail DurationError.Invalid(s0) if s == ""
+  total = 0
+  while s != "" {
+    # the integer part
+    v = 0
+    f = 0
+    scale = 1.0
+    fail DurationError.Invalid(s0) if !(s[0].to_i == 46 || digit?(s, 0))
+    pl = s.size
+    i = 0
+    while digit?(s, i) {
+      d = s[i].to_i - 48
+      fail DurationError.Invalid(s0) if v > (MAX_INT - d) / 10
+      v = v * 10 + d
+      i += 1
+    }
+    s = s[i...s.size]
+    pre = pl != s.size
+    post = false
+    if s != "" && s[0].to_i == 46 {
+      s = s[1...s.size]
+      pl = s.size
+      i = 0
+      overflow = false
+      while digit?(s, i) {
+        d = s[i].to_i - 48
+        if !overflow {
+          if f > (MAX_INT - d) / 10 {
+            overflow = true
+          } else {
+            f = f * 10 + d
+            scale *= 10.0
+          }
+        }
+        i += 1
+      }
+      s = s[i...s.size]
+      post = pl != s.size
+    }
+    fail DurationError.Invalid(s0) if !pre && !post
+    # the unit
+    i = 0
+    while i < s.size && s[i].to_i != 46 && !digit?(s, i) { i += 1 }
+    fail DurationError.MissingUnit(s0) if i == 0
+    u = s[0...i]
+    s = s[i...s.size]
+    unit = unit_ns(u)
+    fail DurationError.UnknownUnit(u, s0) if unit == 0
+    fail DurationError.Invalid(s0) if v > MAX_INT / unit
+    v *= unit
+    if f > 0 {
+      add = (f.to_f * (unit.to_f / scale)).to_i
+      fail DurationError.Invalid(s0) if v > MAX_INT - add
+      v += add
+    }
+    fail DurationError.Invalid(s0) if total > MAX_INT - v
+    total += v
+  }
+  Duration.new(neg ? 0 - total : total)
+}
+
+# -------------------------------------------------------------- Locations
+
+# A zone: UTC, the process's local zone, or a fixed offset.
+pub struct Location {
+  name: Str
+  offset: Int # seconds east of UTC (fixed zones)
+  kind: Int   # 0 UTC, 1 Local, 2 fixed
+
+  pub def to_s -> Str { name }
+  pub def string -> Str { name }
+}
+
+pub def utc -> Location { utc_loc() }
+pub def local -> Location { local_loc() }
+def utc_loc -> Location { Location.new(name: "UTC", offset: 0, kind: 0) }
+def local_loc -> Location { Location.new(name: "Local", offset: 0, kind: 1) }
+
+# A zone with a fixed offset (seconds east of UTC). An empty name prints the
+# offset ("-0700") where Go would print the abbreviation.
+pub def fixed_zone(name: Str, offset: Int) -> Location {
+  Location.new(name: name, offset: offset, kind: 2)
+}
+
+# Only "", "UTC" and "Local" (there is no tz database).
+pub def load_location(name: Str) -> ~Location<LocationError> {
+  return utc() if name == "" || name == "UTC"
+  return local() if name == "Local"
+  fail LocationError.Unknown(name)
+}
+
+pub error LocationError {
+  Unknown(name: Str)
+  def message -> Str {
+    case self {
+      Unknown(n) => "unknown time zone #{n}"
+    }
+  }
+}
+
+# ---------------------------------------------------------------------- Time
+
+# An instant with a zone. `sec` counts seconds since 0001-01-01 00:00:00 UTC,
+# `nsec` is 0..999999999; `mono` (when `has_mono`) is a monotonic clock reading
+# in nanoseconds, kept so that differences of two now() values ignore wall clock
+# jumps; `off` and `zone` are the offset and abbreviation in effect;
+# `kind` is 0 UTC, 1 Local, 2 fixed.
+pub struct Time {
+  sec: Int
+  nsec: Int
+  mono: Int
+  has_mono: Bool
+  off: Int
+  zone: Str
+  kind: Int
+
+  # seconds since the epoch in the zone's wall clock
+  def wall_sec -> Int { sec + off }
+
+  # (year, month, day) of the wall clock
+  def civil -> (Int, Int, Int) {
+    civil_from_days(fdiv(sec + off, SEC_PER_DAY) - DAYS_UNIX_TO_YEAR1)
+  }
+
+  pub def unix -> Int { sec - UNIX_TO_YEAR1 }
+  pub def unix_milli -> Int { (sec - UNIX_TO_YEAR1) * 1000 + nsec / 1000000 }
+  pub def unix_micro -> Int { (sec - UNIX_TO_YEAR1) * 1000000 + nsec / 1000 }
+  pub def unix_nano -> Int { (sec - UNIX_TO_YEAR1) * NS_PER_SEC + nsec }
+
+  pub def year -> Int {
+    y, _, _ = self.civil
+    y
+  }
+  # 1..12
+  pub def month -> Int {
+    _, m, _ = self.civil
+    m
+  }
+  pub def day -> Int {
+    _, _, d = self.civil
+    d
+  }
+  pub def date -> (Int, Int, Int) { self.civil }
+  pub def hour -> Int { fmod(sec + off, SEC_PER_DAY) / 3600 }
+  pub def minute -> Int { fmod(sec + off, 3600) / 60 }
+  pub def second -> Int { fmod(sec + off, 60) }
+  pub def clock -> (Int, Int, Int) { return self.hour, self.minute, self.second }
+  pub def nanosecond -> Int { nsec }
+  pub def month_name -> Str { month_str(self.month) }
+  pub def weekday_name -> Str { weekday_str(self.weekday) }
+
+  # 0 = Sunday .. 6 = Saturday.
+  pub def weekday -> Int { fmod(fdiv(sec + off, SEC_PER_DAY) + 1, 7) }
+
+  # 1..366
+  pub def year_day -> Int {
+    y, _, _ = self.civil
+    fdiv(sec + off, SEC_PER_DAY) - DAYS_UNIX_TO_YEAR1 - days_from_civil(y, 1, 1) + 1
+  }
+
+  # ISO 8601 (year, week): the week containing the year's first Thursday is week 1.
+  pub def iso_week -> (Int, Int) {
+    days = fdiv(sec + off, SEC_PER_DAY) - DAYS_UNIX_TO_YEAR1
+    wd = fmod(days + 3, 7) # Monday = 0
+    thu = days - wd + 3
+    y, _, _ = civil_from_days(thu)
+    week = (thu - days_from_civil(y, 1, 1)) / 7 + 1
+    return y, week
+  }
+
+  # Lays the time out as the Go reference-time `layout` ("2006-01-02 15:04", RFC3339...).
+  pub def format(layout: Str) -> Str { format_time(self, layout) }
+
+  pub def is_zero -> Bool { sec == 0 && nsec == 0 }
+
+  # The same instant; the monotonic reading is kept.
+  pub def utc -> Time {
+    Time.new(sec: sec, nsec: nsec, mono: mono, has_mono: has_mono, off: 0, zone: "UTC", kind: 0)
+  }
+  pub def local -> Time { self.in_zone(local_loc()) }
+  pub def in_zone(loc: Location) -> Time {
+    case loc.kind {
+      0 => self.utc
+      1 => in_local(sec, nsec, mono, has_mono)
+      _ => Time.new(sec: sec, nsec: nsec, mono: mono, has_mono: has_mono, off: loc.offset, zone: loc.name, kind: 2)
+    }
+  }
+  pub def location -> Location {
+    case kind {
+      0 => utc_loc()
+      1 => local_loc()
+      _ => fixed_zone(zone, off)
+    }
+  }
+  # The zone's abbreviation and offset in seconds east of UTC.
+  pub def zone_info -> (Str, Int) {
+    return self.zone_name, off
+  }
+  def zone_name -> Str { kind == 0 ? "UTC" : zone }
+
+  # Strips the monotonic reading (Go's t.Round(0)).
+  pub def strip_mono -> Time {
+    Time.new(sec: sec, nsec: nsec, mono: 0, has_mono: false, off: off, zone: zone, kind: kind)
+  }
+
+  pub def add(d: Duration) -> Time {
+    ds = d.ns / NS_PER_SEC
+    dn = nsec + d.ns % NS_PER_SEC
+    s = sec + ds
+    if dn >= NS_PER_SEC {
+      s += 1
+      dn -= NS_PER_SEC
+    } else if dn < 0 {
+      s -= 1
+      dn += NS_PER_SEC
+    }
+    m = mono
+    hm = has_mono
+    if hm {
+      if (d.ns > 0 && mono > MAX_INT - d.ns) || (d.ns < 0 && mono < MIN_INT - d.ns) {
+        hm = false
+        m = 0
+      } else {
+        m = mono + d.ns
+      }
+    }
+    # the local zone's offset depends on the instant
+    return in_local(s, dn, m, hm) if kind == 1
+    Time.new(sec: s, nsec: dn, mono: m, has_mono: hm, off: off, zone: zone, kind: kind)
+  }
+
+  # self - u, saturating at the longest Durations. With a monotonic reading on
+  # both sides it is the monotonic difference.
+  pub def sub(u: Time) -> Duration {
+    if has_mono && u.has_mono {
+      return Duration.new(mono - u.mono)
+    }
+    ds = sec - u.sec
+    dn = nsec - u.nsec
+    lim = 9223372036
+    return Duration.new(MAX_INT) if ds > lim || (ds == lim && dn > 854775807)
+    return Duration.new(MIN_INT) if ds < 0 - lim || (ds == 0 - lim && dn < -854775808)
+    Duration.new(ds * NS_PER_SEC + dn)
+  }
+
+  pub def since -> Duration { now().sub(self) }
+  pub def until -> Duration { self.sub(now()) }
+
+  pub def before(u: Time) -> Bool { sec < u.sec || (sec == u.sec && nsec < u.nsec) }
+  pub def after(u: Time) -> Bool { sec > u.sec || (sec == u.sec && nsec > u.nsec) }
+  pub def equal(u: Time) -> Bool { sec == u.sec && nsec == u.nsec }
+  # -1, 0 or 1 comparing the instants.
+  pub def compare(u: Time) -> Int {
+    return -1 if self.before(u)
+    return 1 if self.after(u)
+    0
+  }
+  pub def ==(u: Time) -> Bool { sec == u.sec && nsec == u.nsec }
+  pub def <=>(u: Time) -> Int { self.compare(u) }
+
+  # Adds years, months and days to the wall-clock date, normalizing the result
+  # (Jan 31 + 1 month is Mar 3 or 2) as Go does.
+  pub def add_date(years: Int, months: Int, days: Int) -> Time {
+    y, mo, d = self.civil
+    h, mi, s = self.clock
+    make_date(y + years, mo + months, d + days, h, mi, s, nsec, self.location)
+  }
+
+  # The part of t since the zero Time that doesn't divide evenly by d (d > 0).
+  def rem(d: Duration) -> Int {
+    dn = d.ns
+    if dn % NS_PER_SEC == 0 {
+      return fmod(sec, dn / NS_PER_SEC) * NS_PER_SEC + nsec
+    }
+    if NS_PER_SEC % dn == 0 {
+      return nsec % dn
+    }
+    addmod(mulmod(fmod(sec, dn), NS_PER_SEC % dn, dn), nsec % dn, dn)
+  }
+
+  # Rounds down to a multiple of d since the zero Time. The monotonic reading
+  # is stripped. d <= 0 only strips it.
+  pub def truncate(d: Duration) -> Time {
+    return self.strip_mono if d.ns <= 0
+    self.strip_mono.add(Duration.new(0 - self.rem(d)))
+  }
+
+  # Rounds to the nearest multiple of d since the zero Time, halves up.
+  pub def round(d: Duration) -> Time {
+    return self.strip_mono if d.ns <= 0
+    r = self.rem(d)
+    if r < d.ns - r {
+      return self.strip_mono.add(Duration.new(0 - r))
+    }
+    self.strip_mono.add(Duration.new(d.ns - r))
+  }
+
+  # Go's String(): "2006-01-02 15:04:05.999999999 -0700 MST", plus the
+  # monotonic reading " m=+0.000123456" when there is one.
+  pub def to_s -> Str {
+    s = self.format("2006-01-02 15:04:05.999999999 -0700 MST")
+    if has_mono {
+      m = mono
+      sign = "+"
+      if m < 0 {
+        sign = "-"
+        m = 0 - m
+      }
+      s += " m=#{sign}#{m / NS_PER_SEC}.#{zpad(m % NS_PER_SEC, 9)}"
+    }
+    s
+  }
+  pub def string -> Str { self.to_s }
+}
+
+# This instant in the process's local zone.
+def in_local(sec: Int, nsec: Int, mono: Int, has_mono: Bool) -> Time {
+  u = sec - UNIX_TO_YEAR1
+  off = alx_local_offset(u)
+  name = Str.from_cstr(alx_local_zone(u))
+  Time.new(sec: sec, nsec: nsec, mono: mono, has_mono: has_mono, off: off, zone: name, kind: 1)
+}
+
+# The Time `sec` seconds and `nsec` nanoseconds after the Unix epoch (nsec
+# outside 0..999999999 carries into sec), in the local zone.
+pub def unix(sec: Int, nsec: Int) -> Time {
+  s = sec + fdiv(nsec, NS_PER_SEC)
+  n = fmod(nsec, NS_PER_SEC)
+  in_local(s + UNIX_TO_YEAR1, n, 0, false)
+}
+
+pub def unix_milli(ms: Int) -> Time { unix(fdiv(ms, 1000), fmod(ms, 1000) * 1000000) }
+pub def unix_micro(us: Int) -> Time { unix(fdiv(us, 1000000), fmod(us, 1000000) * 1000) }
+
+# The current time, local zone, with a monotonic reading.
+pub def now -> Time {
+  w = alx_wall_ns()
+  m = alx_mono_ns()
+  s = fdiv(w, NS_PER_SEC)
+  t = in_local(s + UNIX_TO_YEAR1, w - s * NS_PER_SEC, m, true)
+  t
+}
+
+# Go's time.Since / time.Until.
+pub def since(t: Time) -> Duration { now().sub(t) }
+pub def until(t: Time) -> Duration { t.sub(now()) }
+
+# The Time for a calendar date and wall clock in loc. Out-of-range fields
+# normalize (month 13 is January of the next year, day 0 the last day of the
+# previous month, ...) as in Go. In the local zone, a time skipped by a
+# daylight saving jump resolves to one side of it.
+pub def date(year: Int, month: Int, day: Int, hour: Int, min: Int, sec: Int, nsec: Int, loc: Location) -> Time {
+  make_date(year, month, day, hour, min, sec, nsec, loc)
+}
+
+def make_date(year: Int, month: Int, day: Int, hour: Int, min: Int, sec: Int, nsec: Int, loc: Location) -> Time {
+  m0 = month - 1
+  y = year + fdiv(m0, 12)
+  m = fmod(m0, 12) + 1
+  # carry nanoseconds into seconds
+  s = sec + fdiv(nsec, NS_PER_SEC)
+  n = fmod(nsec, NS_PER_SEC)
+  days = days_from_civil(y, m, day)
+  wall = days * SEC_PER_DAY + hour * 3600 + min * 60 + s # as if UTC
+  if loc.kind == 0 {
+    return Time.new(sec: wall + UNIX_TO_YEAR1, nsec: n, mono: 0, has_mono: false, off: 0, zone: "UTC", kind: 0)
+  }
+  if loc.kind == 1 {
+    off = alx_local_offset(wall)
+    u = wall - off
+    off2 = alx_local_offset(u)
+    u = wall - off2 if off2 != off
+    return in_local(u + UNIX_TO_YEAR1, n, 0, false)
+  }
+  Time.new(sec: wall - loc.offset + UNIX_TO_YEAR1, nsec: n, mono: 0, has_mono: false, off: loc.offset, zone: loc.name, kind: 2)
+}
+
+# ------------------------------------------------------- sleeping and timers
+
+# Pauses the calling task for at least d (a sleeping task does not hold up
+# the others). A d <= 0 returns at once.
+pub def sleep(d: Duration) {
+  alx_sleep_ns(d.ns) if d.ns > 0
+}
+
+# A channel that receives the current time once, after d.
+pub def after(d: Duration) -> Chan[Time] {
+  ch = Chan[Time].new(1)
+  spawn {
+    sleep(d)
+    ch << now()
+  }
+  ch
+}
+
+# A channel that receives the time every d, forever. The ticking task is never
+# reclaimed: use a Ticker (new_ticker) when you need to stop it. d must be > 0.
+pub def tick(d: Duration) -> Chan[Time] {
+  new_ticker(d).c
+}
+
+# A one-shot timer: `c` receives the time once d has elapsed, unless stopped.
+# state: 0 pending, 1 fired, 2 stopped.
+pub struct Timer {
+  c: Chan[Time]
+  state: Atomic[Int]
+
+  # Prevents the timer from firing. True if this stopped it, false if it had
+  # already fired or been stopped.
+  pub def stop -> Bool { state.compare_and_swap(0, 2) }
+}
+
+pub def new_timer(d: Duration) -> Timer {
+  ch = Chan[Time].new(1)
+  st = Atomic.new(0)
+  spawn {
+    sleep(d)
+    if st.compare_and_swap(0, 1) { ch << now() }
+  }
+  Timer.new(c: ch, state: st)
+}
+
+# A repeating timer: `c` receives the time every d until stopped. Ticks are
+# dropped when the receiver falls behind.
+pub struct Ticker {
+  c: Chan[Time]
+  state: Atomic[Int]
+
+  pub def stop {
+    state.store(2)
+  }
+}
+
+pub def new_ticker(d: Duration) -> Ticker {
+  assert d.ns > 0, "time: non-positive interval for new_ticker"
+  ch = Chan[Time].new(1)
+  st = Atomic.new(0)
+  spawn {
+    next_at = alx_mono_ns() + d.ns
+    while st.load() == 0 {
+      wait = next_at - alx_mono_ns()
+      alx_sleep_ns(wait) if wait > 0
+      break if st.load() != 0
+      select {
+        when ch.send(now()) => nil
+        else => nil
+      }
+      next_at += d.ns
+      # fell far behind (a long pause): resynchronize rather than burst
+      now_m = alx_mono_ns()
+      next_at = now_m + d.ns if next_at < now_m - d.ns
+    }
+  }
+  Ticker.new(c: ch, state: st)
+}

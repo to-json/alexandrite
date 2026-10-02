@@ -1,0 +1,725 @@
+# Time layouts: format and parse, a port of Go's time/format.go.
+import "strings"
+import "strconv"
+
+# Element codes (low byte); the fractional-second elements also carry their digit
+# count in bits 8..15 and a "comma separator" flag in bit 16.
+C_LONG_MONTH = 1
+C_MONTH = 2
+C_NUM_MONTH = 3
+C_ZERO_MONTH = 4
+C_LONG_WEEKDAY = 5
+C_WEEKDAY = 6
+C_DAY = 7
+C_UNDER_DAY = 8
+C_ZERO_DAY = 9
+C_UNDER_YEARDAY = 10
+C_ZERO_YEARDAY = 11
+C_HOUR = 12
+C_HOUR12 = 13
+C_ZERO_HOUR12 = 14
+C_MINUTE = 15
+C_ZERO_MINUTE = 16
+C_SECOND = 17
+C_ZERO_SECOND = 18
+C_LONG_YEAR = 19
+C_YEAR = 20
+C_PM = 21
+C_LOWER_PM = 22
+C_TZ = 23
+C_ISO_TZ = 24             # Z0700
+C_ISO_SECONDS_TZ = 25     # Z070000
+C_ISO_SHORT_TZ = 26       # Z07
+C_ISO_COLON_TZ = 27       # Z07:00
+C_ISO_COLON_SECONDS_TZ = 28 # Z07:00:00
+C_NUM_TZ = 29             # -0700
+C_NUM_SECONDS_TZ = 30     # -070000
+C_NUM_SHORT_TZ = 31       # -07
+C_NUM_COLON_TZ = 32       # -07:00
+C_NUM_COLON_SECONDS_TZ = 33 # -07:00:00
+C_FRAC0 = 34              # .000
+C_FRAC9 = 35              # .999
+
+# Why a time string didn't parse (Go's *ParseError).
+pub error ParseError {
+  Cannot(layout: Str, value: Str, layout_elem: Str, value_elem: Str)
+  Failed(value: Str, why: Str)
+
+  def message -> Str {
+    case self {
+      Cannot(l, v, le, ve) => "parsing time #{strconv.quote(v)} as #{strconv.quote(l)}: cannot parse #{strconv.quote(ve)} as #{strconv.quote(le)}"
+      Failed(v, why) => "parsing time #{strconv.quote(v)}: #{why}"
+    }
+  }
+}
+
+# --------------------------------------------------------------- scanning
+
+# The byte at s[i], or -1 past the end.
+def at(s: Str, i: Int) -> Int { i < s.size ? s[i].to_i : -1 }
+
+# Whether s[i...] starts with sub.
+def has_at(s: Str, i: Int, sub: Str) -> Bool {
+  return false if i + sub.size > s.size
+  j = 0
+  while j < sub.size {
+    return false if s[i + j] != sub[j]
+    j += 1
+  }
+  true
+}
+
+def lower?(c: Int) -> Bool { c >= 97 && c <= 122 }
+
+# Finds the next element of a layout at or after `start`. Returns (pos, std, end):
+# the literal text is layout[start...pos], the element layout[pos...end), and std is
+# its code (0 when there are no more elements, pos == end == layout.size).
+def next_chunk(layout: Str, start: Int) -> (Int, Int, Int) {
+  n = layout.size
+  i = start
+  while i < n {
+    c = layout[i].to_i
+    if c == 74 { # J
+      if has_at(layout, i, "Jan") {
+        return i, C_LONG_MONTH, i + 7 if has_at(layout, i, "January")
+        return i, C_MONTH, i + 3 if !lower?(at(layout, i + 3))
+      }
+    } else if c == 77 { # M
+      if has_at(layout, i, "Mon") {
+        return i, C_LONG_WEEKDAY, i + 6 if has_at(layout, i, "Monday")
+        return i, C_WEEKDAY, i + 3 if !lower?(at(layout, i + 3))
+      }
+      return i, C_TZ, i + 3 if has_at(layout, i, "MST")
+    } else if c == 48 { # 0
+      c1 = at(layout, i + 1)
+      if c1 >= 49 && c1 <= 54 {
+        code = case c1 {
+          49 => C_ZERO_MONTH
+          50 => C_ZERO_DAY
+          51 => C_ZERO_HOUR12
+          52 => C_ZERO_MINUTE
+          53 => C_ZERO_SECOND
+          _ => C_YEAR
+        }
+        return i, code, i + 2
+      }
+      return i, C_ZERO_YEARDAY, i + 3 if has_at(layout, i, "002")
+    } else if c == 49 { # 1
+      return i, C_HOUR, i + 2 if at(layout, i + 1) == 53
+      return i, C_NUM_MONTH, i + 1
+    } else if c == 50 { # 2
+      return i, C_LONG_YEAR, i + 4 if has_at(layout, i, "2006")
+      return i, C_DAY, i + 1
+    } else if c == 95 { # _
+      if at(layout, i + 1) == 50 {
+        # _2006 is really a literal _ followed by the year
+        return i + 1, C_LONG_YEAR, i + 5 if has_at(layout, i + 1, "2006")
+        return i, C_UNDER_DAY, i + 2
+      }
+      return i, C_UNDER_YEARDAY, i + 3 if has_at(layout, i, "__2")
+    } else if c == 51 { # 3
+      return i, C_HOUR12, i + 1
+    } else if c == 52 { # 4
+      return i, C_MINUTE, i + 1
+    } else if c == 53 { # 5
+      return i, C_SECOND, i + 1
+    } else if c == 80 { # P
+      return i, C_PM, i + 2 if at(layout, i + 1) == 77
+    } else if c == 112 { # p
+      return i, C_LOWER_PM, i + 2 if at(layout, i + 1) == 109
+    } else if c == 45 { # -
+      return i, C_NUM_COLON_SECONDS_TZ, i + 9 if has_at(layout, i, "-07:00:00")
+      return i, C_NUM_SECONDS_TZ, i + 7 if has_at(layout, i, "-070000")
+      return i, C_NUM_COLON_TZ, i + 6 if has_at(layout, i, "-07:00")
+      return i, C_NUM_TZ, i + 5 if has_at(layout, i, "-0700")
+      return i, C_NUM_SHORT_TZ, i + 3 if has_at(layout, i, "-07")
+    } else if c == 90 { # Z
+      return i, C_ISO_COLON_SECONDS_TZ, i + 9 if has_at(layout, i, "Z07:00:00")
+      return i, C_ISO_SECONDS_TZ, i + 7 if has_at(layout, i, "Z070000")
+      return i, C_ISO_COLON_TZ, i + 6 if has_at(layout, i, "Z07:00")
+      return i, C_ISO_TZ, i + 5 if has_at(layout, i, "Z0700")
+      return i, C_ISO_SHORT_TZ, i + 3 if has_at(layout, i, "Z07")
+    } else if c == 46 || c == 44 { # . ,
+      c1 = at(layout, i + 1)
+      if c1 == 48 || c1 == 57 {
+        j = i + 1
+        while at(layout, j) == c1 { j += 1 }
+        if !digit?(layout, j) {
+          code = c1 == 48 ? C_FRAC0 : C_FRAC9
+          comma = c == 44 ? 1 : 0
+          return i, code + ((j - (i + 1)) << 8) + (comma << 16), j
+        }
+      }
+    }
+    i += 1
+  }
+  return n, 0, n
+}
+
+# ------------------------------------------------------------- formatting
+
+# Time t laid out as `layout` (Go's Format).
+def format_time(t: Time, layout: Str) -> Str {
+  y, mo, d = t.date
+  h = t.hour
+  mi = t.minute
+  s = t.second
+  out = ""
+  pos = 0
+  while true {
+    p, std, e = next_chunk(layout, pos)
+    out += layout[pos...p]
+    break if std == 0
+    pos = e
+    code = std & 255
+    if code == C_YEAR {
+      yy = y < 0 ? 0 - y : y
+      out += zpad(yy % 100, 2)
+    } else if code == C_LONG_YEAR {
+      out += zpad(y, 4)
+    } else if code == C_MONTH {
+      out += month_str(mo)[0...3]
+    } else if code == C_LONG_MONTH {
+      out += month_str(mo)
+    } else if code == C_NUM_MONTH {
+      out += mo.to_s
+    } else if code == C_ZERO_MONTH {
+      out += zpad(mo, 2)
+    } else if code == C_WEEKDAY {
+      out += weekday_str(t.weekday)[0...3]
+    } else if code == C_LONG_WEEKDAY {
+      out += weekday_str(t.weekday)
+    } else if code == C_DAY {
+      out += d.to_s
+    } else if code == C_UNDER_DAY {
+      out += " " if d < 10
+      out += d.to_s
+    } else if code == C_ZERO_DAY {
+      out += zpad(d, 2)
+    } else if code == C_UNDER_YEARDAY {
+      yd = t.year_day
+      out += " " if yd < 100
+      out += " " if yd < 10
+      out += yd.to_s
+    } else if code == C_ZERO_YEARDAY {
+      out += zpad(t.year_day, 3)
+    } else if code == C_HOUR {
+      out += zpad(h, 2)
+    } else if code == C_HOUR12 || code == C_ZERO_HOUR12 {
+      hr = h % 12
+      hr = 12 if hr == 0
+      out += code == C_HOUR12 ? hr.to_s : zpad(hr, 2)
+    } else if code == C_MINUTE {
+      out += mi.to_s
+    } else if code == C_ZERO_MINUTE {
+      out += zpad(mi, 2)
+    } else if code == C_SECOND {
+      out += s.to_s
+    } else if code == C_ZERO_SECOND {
+      out += zpad(s, 2)
+    } else if code == C_PM {
+      out += h >= 12 ? "PM" : "AM"
+    } else if code == C_LOWER_PM {
+      out += h >= 12 ? "pm" : "am"
+    } else if code == C_TZ {
+      name = t.zone_name
+      if name != "" {
+        out += name
+      } else {
+        out += format_offset(t.off, false, false, true, false)
+      }
+    } else if code >= C_ISO_TZ && code <= C_NUM_COLON_SECONDS_TZ {
+      iso = code <= C_ISO_COLON_SECONDS_TZ
+      colon = code == C_ISO_COLON_TZ || code == C_ISO_COLON_SECONDS_TZ || code == C_NUM_COLON_TZ || code == C_NUM_COLON_SECONDS_TZ
+      short = code == C_ISO_SHORT_TZ || code == C_NUM_SHORT_TZ
+      secs = code == C_ISO_SECONDS_TZ || code == C_ISO_COLON_SECONDS_TZ || code == C_NUM_SECONDS_TZ || code == C_NUM_COLON_SECONDS_TZ
+      if iso && t.off == 0 {
+        out += "Z"
+      } else {
+        out += format_offset(t.off, colon, short, false, secs)
+      }
+    } else if code == C_FRAC0 || code == C_FRAC9 {
+      out += format_nano(t.nanosecond, (std >> 8) & 255, code == C_FRAC9, (std >> 16) == 1)
+    }
+  }
+  out
+}
+
+# "+hh:mm" and friends. `plain` is the "MST with no name" form: always "+hhmm".
+def format_offset(off: Int, colon: Bool, short: Bool, plain: Bool, secs: Bool) -> Str {
+  zone = off / 60 # minutes, toward zero
+  absoff = off
+  sign = "+"
+  if zone < 0 {
+    sign = "-"
+    zone = 0 - zone
+    absoff = 0 - absoff
+  }
+  out = sign + zpad(zone / 60, 2)
+  return out if short
+  out += ":" if colon
+  out += zpad(zone % 60, 2)
+  if secs {
+    out += ":" if colon
+    out += zpad(absoff % 60, 2)
+  }
+  out
+}
+
+# The fraction ".123": n digits of the 9, trailing zeros dropped when `trim`.
+def format_nano(nanosec: Int, n0: Int, trim: Bool, comma: Bool) -> Str {
+  n = n0
+  return "" if trim && (n == 0 || nanosec == 0)
+  digits = zpad(nanosec, 9)
+  n = 9 if n > 9
+  if trim {
+    while n > 0 && digits[n - 1].to_i == 48 { n -= 1 }
+    return "" if n == 0
+  }
+  (comma ? "," : ".") + digits[0...n]
+}
+
+# ---------------------------------------------------------------- parsing
+
+# One of the names at the start of v (case-insensitively): its index, or -1.
+def lookup(v: Str, long_names: Bool, months: Bool) -> Int {
+  count = months ? 12 : 7
+  i = 0
+  while i < count {
+    name = months ? month_str(i + 1) : weekday_str(i)
+    name = name[0...3] if !long_names
+    if v.size >= name.size && strings.equal_fold(v[0...name.size], name) {
+      return i
+    }
+    i += 1
+  }
+  -1
+}
+
+# A one- or two-digit number at the start of v (two exactly when `fixed`), or -1.
+def get_num(v: Str, fixed: Bool) -> Int {
+  return -1 if !digit?(v, 0)
+  if !digit?(v, 1) {
+    return -1 if fixed
+    return v[0].to_i - 48
+  }
+  (v[0].to_i - 48) * 10 + v[1].to_i - 48
+}
+
+# Length of get_num's match.
+def num_len(v: Str) -> Int { digit?(v, 1) ? 2 : 1 }
+
+# Up to three digits (exactly three when fixed): the value, or -1; digits in `len`.
+def get_num3(v: Str, fixed: Bool) -> Int {
+  n = 0
+  i = 0
+  while i < 3 && digit?(v, i) {
+    n = n * 10 + v[i].to_i - 48
+    i += 1
+  }
+  return -1 if i == 0 || (fixed && i != 3)
+  n
+}
+
+# The decimal number in s[from...to], or -1 if it isn't all digits.
+def atoi_range(s: Str, from: Int, to: Int) -> Int {
+  return -1 if to <= from
+  n = 0
+  i = from
+  while i < to {
+    return -1 if !digit?(s, i)
+    n = n * 10 + s[i].to_i - 48
+    i += 1
+  }
+  n
+}
+
+def comma_or_period?(c: Int) -> Bool { c == 46 || c == 44 }
+
+# Nanoseconds from the fraction at the start of v spanning nbytes (with the
+# separator), or -1 if malformed.
+def parse_nanos(v: Str, nbytes0: Int) -> Int {
+  return -1 if !comma_or_period?(at(v, 0))
+  nbytes = nbytes0
+  nbytes = 10 if nbytes > 10
+  ns = atoi_range(v, 1, nbytes)
+  return -1 if ns < 0
+  scale = 10 - nbytes
+  while scale > 0 {
+    ns *= 10
+    scale -= 1
+  }
+  ns
+}
+
+# Skips the literal `prefix` of a layout at the start of v (runs of spaces match
+# runs of spaces): the new index into v, or -1.
+def skip(v: Str, prefix: Str) -> (Int, Bool) {
+  i = 0
+  j = 0
+  while j < prefix.size {
+    if prefix[j].to_i == 32 {
+      return i, false if i < v.size && v[i].to_i != 32
+      while j < prefix.size && prefix[j].to_i == 32 { j += 1 }
+      while i < v.size && v[i].to_i == 32 { i += 1 }
+    } else {
+      return i, false if i >= v.size || v[i] != prefix[j]
+      i += 1
+      j += 1
+    }
+  }
+  return i, true
+}
+
+# Length of a leading "+h"/"-hh" offset (hours <= 23) for GMT+n / +hh zone names, else 0.
+def parse_signed_offset(v: Str) -> Int {
+  c = at(v, 0)
+  return 0 if c != 45 && c != 43
+  i = 1
+  x = 0
+  while digit?(v, i) {
+    x = x * 10 + v[i].to_i - 48
+    i += 1
+  }
+  return 0 if i == 1 || x > 23
+  i
+}
+
+# The length of a time zone abbreviation at the start of v, or 0.
+def parse_zone_name(v: Str) -> Int {
+  return 0 if v.size < 3
+  return 4 if has_at(v, 0, "ChST") || has_at(v, 0, "MeST")
+  return 3 + (v.size == 3 ? 0 : parse_signed_offset(v[3...v.size])) if has_at(v, 0, "GMT")
+  c0 = v[0].to_i
+  return parse_signed_offset(v) if c0 == 43 || c0 == 45
+  n_upper = 0
+  while n_upper < 6 && n_upper < v.size && v[n_upper].to_i >= 65 && v[n_upper].to_i <= 90 {
+    n_upper += 1
+  }
+  return 3 if n_upper == 3
+  return 4 if n_upper == 4 && (v[3].to_i == 84 || has_at(v, 0, "WITA"))
+  return 5 if n_upper == 5 && v[4].to_i == 84
+  0
+}
+
+# Parses `value` as `layout` (Go's reference time layouts), zone-less results in UTC.
+pub def parse(layout: Str, value: Str) -> ~Time<ParseError> {
+  ~parse_in_location(layout, value, utc())
+}
+
+# Like parse, but a time with no zone information is taken to be in `loc`.
+pub def parse_in_location(layout: Str, value: Str, loc: Location) -> ~Time<ParseError> {
+  v = value
+  year = 0
+  month = -1
+  day = -1
+  yday = -1
+  hour = 0
+  minute = 0
+  sec = 0
+  nsec = 0
+  pm_set = false
+  am_set = false
+  have_zone = false # an offset or Z was parsed
+  zone_offset = -1
+  zone_name = ""
+  utc_z = false
+  pos = 0
+  while true {
+    p, std, e = next_chunk(layout, pos)
+    lit = layout[pos...p]
+    skipped, skip_ok = skip(v, lit)
+    v = v[skipped...v.size]
+    fail ParseError.Cannot(layout, value, lit, v) if !skip_ok
+    if std == 0 {
+      fail ParseError.Failed(value, "extra text: #{strconv.quote(v)}") if v.size != 0
+      break
+    }
+    pos = e
+    code = std & 255
+    stdstr = layout[p...e]
+    range_what = ""
+    bad = false
+    consumed = 0
+    if code == C_YEAR {
+      if v.size < 2 || !digit?(v, 0) || !digit?(v, 1) {
+        bad = true
+      } else {
+        year = atoi_range(v, 0, 2)
+        year = year >= 69 ? year + 1900 : year + 2000
+        consumed = 2
+      }
+    } else if code == C_LONG_YEAR {
+      if v.size < 4 || !digit?(v, 0) {
+        bad = true
+      } else {
+        year = atoi_range(v, 0, 4)
+        bad = year < 0
+        consumed = 4
+      }
+    } else if code == C_MONTH || code == C_LONG_MONTH {
+      m = lookup(v, code == C_LONG_MONTH, true)
+      if m < 0 {
+        bad = true
+      } else {
+        month = m + 1
+        consumed = (code == C_LONG_MONTH ? month_str(month) : month_str(month)[0...3]).size
+      }
+    } else if code == C_NUM_MONTH || code == C_ZERO_MONTH {
+      month = get_num(v, code == C_ZERO_MONTH)
+      if month < 0 {
+        bad = true
+      } else {
+        consumed = num_len(v)
+        range_what = "month" if month <= 0 || month > 12
+      }
+    } else if code == C_WEEKDAY || code == C_LONG_WEEKDAY {
+      w = lookup(v, code == C_LONG_WEEKDAY, false)
+      if w < 0 {
+        bad = true
+      } else {
+        consumed = (code == C_LONG_WEEKDAY ? weekday_str(w) : weekday_str(w)[0...3]).size
+      }
+    } else if code == C_DAY || code == C_UNDER_DAY || code == C_ZERO_DAY {
+      vv = v
+      lead = 0
+      if code == C_UNDER_DAY && at(v, 0) == 32 {
+        vv = v[1...v.size]
+        lead = 1
+      }
+      day = get_num(vv, code == C_ZERO_DAY)
+      if day < 0 {
+        bad = true
+      } else {
+        consumed = lead + num_len(vv)
+      }
+    } else if code == C_UNDER_YEARDAY || code == C_ZERO_YEARDAY {
+      lead = 0
+      if code == C_UNDER_YEARDAY {
+        while lead < 2 && at(v, lead) == 32 { lead += 1 }
+      }
+      vv = v[lead...v.size]
+      yday = get_num3(vv, code == C_ZERO_YEARDAY || lead == 2)
+      if yday < 0 {
+        bad = true
+      } else {
+        k = 0
+        while k < 3 && digit?(vv, k) { k += 1 }
+        consumed = lead + k
+      }
+    } else if code == C_HOUR {
+      hour = get_num(v, false)
+      if hour < 0 {
+        bad = true
+      } else {
+        consumed = num_len(v)
+        range_what = "hour" if hour >= 24
+      }
+    } else if code == C_HOUR12 || code == C_ZERO_HOUR12 {
+      hour = get_num(v, code == C_ZERO_HOUR12)
+      if hour < 0 {
+        bad = true
+      } else {
+        consumed = num_len(v)
+        range_what = "hour" if hour > 12
+      }
+    } else if code == C_MINUTE || code == C_ZERO_MINUTE {
+      minute = get_num(v, code == C_ZERO_MINUTE)
+      if minute < 0 {
+        bad = true
+      } else {
+        consumed = num_len(v)
+        range_what = "minute" if minute >= 60
+      }
+    } else if code == C_SECOND || code == C_ZERO_SECOND {
+      sec = get_num(v, code == C_ZERO_SECOND)
+      if sec < 0 {
+        bad = true
+      } else {
+        consumed = num_len(v)
+        range_what = "second" if sec >= 60
+        # a fraction in the value but none in the layout: take it anyway
+        if range_what == "" && v.size >= consumed + 2 && comma_or_period?(at(v, consumed)) && digit?(v, consumed + 1) {
+          _, nstd, _ = next_chunk(layout, pos)
+          ncode = nstd & 255
+          if ncode != C_FRAC0 && ncode != C_FRAC9 {
+            k = consumed + 2
+            while digit?(v, k) { k += 1 }
+            ns = parse_nanos(v[consumed...v.size], k - consumed)
+            if ns < 0 {
+              range_what = "fractional second"
+            } else {
+              nsec = ns
+              consumed = k
+            }
+          }
+        }
+      }
+    } else if code == C_PM || code == C_LOWER_PM {
+      ap = v.size >= 2 ? v[0...2] : ""
+      if code == C_PM && ap == "PM" {
+        pm_set = true
+        consumed = 2
+      } else if code == C_PM && ap == "AM" {
+        am_set = true
+        consumed = 2
+      } else if code == C_LOWER_PM && ap == "pm" {
+        pm_set = true
+        consumed = 2
+      } else if code == C_LOWER_PM && ap == "am" {
+        am_set = true
+        consumed = 2
+      } else {
+        bad = true
+      }
+    } else if code >= C_ISO_TZ && code <= C_NUM_COLON_SECONDS_TZ {
+      iso = code <= C_ISO_COLON_SECONDS_TZ
+      if iso && at(v, 0) == 90 {
+        utc_z = true
+        have_zone = true
+        zone_offset = 0
+        consumed = 1
+      } else {
+        colon = code == C_ISO_COLON_TZ || code == C_NUM_COLON_TZ
+        short = code == C_ISO_SHORT_TZ || code == C_NUM_SHORT_TZ
+        colon_secs = code == C_ISO_COLON_SECONDS_TZ || code == C_NUM_COLON_SECONDS_TZ
+        secs_nocolon = code == C_ISO_SECONDS_TZ || code == C_NUM_SECONDS_TZ
+        need = 5
+        need = 6 if colon
+        need = 3 if short
+        need = 9 if colon_secs
+        need = 7 if secs_nocolon
+        hr = -1
+        mm = 0
+        ss = 0
+        if v.size < need {
+          bad = true
+        } else if (colon || colon_secs) && at(v, 3) != 58 {
+          bad = true
+        } else if colon_secs && at(v, 6) != 58 {
+          bad = true
+        } else {
+          hr = atoi_range(v, 1, 3)
+          if colon || colon_secs {
+            mm = atoi_range(v, 4, 6)
+          } else if !short {
+            mm = atoi_range(v, 3, 5)
+          }
+          if colon_secs {
+            ss = atoi_range(v, 7, 9)
+          } else if secs_nocolon {
+            ss = atoi_range(v, 5, 7)
+          }
+          if hr < 0 || mm < 0 || ss < 0 {
+            bad = true
+          } else {
+            sign = at(v, 0)
+            if sign != 43 && sign != 45 {
+              bad = true
+            } else if hr > 24 {
+              range_what = "time zone offset hour"
+            } else if mm > 60 {
+              range_what = "time zone offset minute"
+            } else if ss > 60 {
+              range_what = "time zone offset second"
+            } else {
+              off = (hr * 60 + mm) * 60 + ss
+              zone_offset = sign == 45 ? 0 - off : off
+              have_zone = true
+              consumed = need
+            }
+          }
+        }
+      }
+    } else if code == C_TZ {
+      if has_at(v, 0, "UTC") {
+        utc_z = true
+        have_zone = true
+        zone_offset = 0
+        consumed = 3
+      } else {
+        n = parse_zone_name(v)
+        if n == 0 {
+          bad = true
+        } else {
+          zone_name = v[0...n]
+          consumed = n
+        }
+      }
+    } else if code == C_FRAC0 {
+      ndigit = 1 + ((std >> 8) & 255)
+      if v.size < ndigit {
+        bad = true
+      } else {
+        ns = parse_nanos(v, ndigit)
+        if ns < 0 {
+          # a malformed fraction: bad separator or digits
+          if !comma_or_period?(at(v, 0)) || !digit?(v, 1) {
+            bad = true
+          } else {
+            range_what = "fractional second"
+          }
+        } else {
+          nsec = ns
+          consumed = ndigit
+        }
+      }
+    } else if code == C_FRAC9 {
+      if v.size >= 2 && comma_or_period?(at(v, 0)) && digit?(v, 1) {
+        k = 1
+        while digit?(v, k) { k += 1 }
+        ns = parse_nanos(v, k)
+        if ns < 0 {
+          range_what = "fractional second"
+        } else {
+          nsec = ns
+          consumed = k
+        }
+      }
+    }
+    fail ParseError.Failed(value, "#{range_what} out of range") if range_what != ""
+    fail ParseError.Cannot(layout, value, stdstr, v) if bad
+    v = v[consumed...v.size]
+  }
+  # 12-hour clocks
+  if pm_set && hour < 12 {
+    hour += 12
+  } else if am_set && hour == 12 {
+    hour = 0
+  }
+  if yday >= 0 {
+    ylen = is_leap(year) ? 366 : 365
+    fail ParseError.Failed(value, "day-of-year out of range") if yday < 1 || yday > ylen
+    _, m, d = civil_from_days(days_from_civil(year, 1, 1) + yday - 1)
+    fail ParseError.Failed(value, "day-of-year does not match month") if month >= 0 && month != m
+    fail ParseError.Failed(value, "day-of-year does not match day") if day >= 0 && day != d
+    month = m
+    day = d
+  } else {
+    month = 1 if month < 0
+    day = 1 if day < 0
+  }
+  fail ParseError.Failed(value, "day out of range") if day < 1 || day > days_in_month(year, month)
+
+  if utc_z {
+    return date(year, month, day, hour, minute, sec, nsec, utc())
+  }
+  if have_zone {
+    t = date(year, month, day, hour, minute, sec, nsec, utc())
+    t = t.add(Duration.new(0 - zone_offset * NS_PER_SEC))
+    # an offset matching the local zone at that instant keeps the local zone
+    lt = t.local
+    return lt if lt.off == zone_offset && (zone_name == "" || lt.zone == zone_name)
+    return t.in_zone(fixed_zone(zone_name, zone_offset))
+  }
+  if zone_name != "" {
+    off = 0
+    if zone_name.size > 3 && has_at(zone_name, 0, "GMT") {
+      sgn = zone_name[3].to_i == 45 ? -1 : 1
+      off = sgn * atoi_range(zone_name, 4, zone_name.size) * 3600
+    }
+    t = date(year, month, day, hour, minute, sec, nsec, utc())
+    return t.in_zone(fixed_zone(zone_name, off))
+  }
+  date(year, month, day, hour, minute, sec, nsec, loc)
+}

@@ -9,6 +9,8 @@ pub fn ty_name(t: &LTy) -> String {
         LTy::Region => "Region".into(),
         LTy::Task(t) => format!("Task_{}", ty_name(t)),
         LTy::Chan(t) => format!("Chan_{}", ty_name(t)),
+        LTy::Lock => "Lock".into(),
+        LTy::Atomic => "Atomic".into(),
         LTy::I64 => "I64".into(),
         LTy::IntK(k) => k.name().into(),
         LTy::F64 => "F64".into(),
@@ -28,6 +30,8 @@ pub fn cty(t: &LTy) -> String {
         LTy::Region => "AlxRegion *".into(),
         LTy::Task(_) => "AlxTask *".into(),
         LTy::Chan(_) => "AlxChan *".into(),
+        LTy::Lock => "AlxLock *".into(),
+        LTy::Atomic => "int64_t *".into(),
         LTy::I64 | LTy::IntK(_) => "int64_t".into(),
         LTy::F64 => "double".into(),
         LTy::PInt => "AlxPInt".into(),
@@ -364,6 +368,18 @@ impl FnEmit<'_> {
                 let c = self.e(ch);
                 self.line(&format!("alx_chan_close({c}, {});", c_str(loc)));
             }
+            LS::Lock(l) => {
+                let l = self.e(l);
+                self.line(&format!("alx_lock({l});"));
+            }
+            LS::Unlock(l) => {
+                let l = self.e(l);
+                self.line(&format!("alx_unlock({l});"));
+            }
+            LS::AtomicStore(a, v) => {
+                let (a, v) = (self.e(a), self.e(v));
+                self.line(&format!("__atomic_store_n({a}, {v}, __ATOMIC_SEQ_CST);"));
+            }
             LS::Select { cases, default, dst } => {
                 self.line("{");
                 self.ind += 1;
@@ -560,6 +576,12 @@ impl FnEmit<'_> {
             LE::RegionProgram => "alx_region_program()".into(),
             LE::ChanNew(t, cap) => format!("alx_chan_new({}, sizeof({}))", self.e(cap), cty_mem(t)),
             LE::ChanLen(c) => format!("alx_chan_len({})", self.e(c)),
+            LE::LockNew => "alx_lock_new()".into(),
+            LE::AtomicNew(v) => format!("alx_atomic_new({})", self.e(v)),
+            LE::AtomicLoad(a) => format!("__atomic_load_n({}, __ATOMIC_SEQ_CST)", self.e(a)),
+            LE::AtomicRmw(AtomicOp::Add, a, v) => format!("(__atomic_add_fetch({}, {}, __ATOMIC_SEQ_CST))", self.e(a), self.e(v)),
+            LE::AtomicRmw(AtomicOp::Swap, a, v) => format!("(__atomic_exchange_n({}, {}, __ATOMIC_SEQ_CST))", self.e(a), self.e(v)),
+            LE::AtomicCas(a, o, n) => format!("({{ int64_t exp_ = {}; __atomic_compare_exchange_n({}, &exp_, {}, false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST); }})", self.e(o), self.e(a), self.e(n)),
             LE::Var(v) => self.v(*v),
             LE::I(i) => {
                 if *i == i64::MIN {

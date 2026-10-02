@@ -83,6 +83,7 @@ GROUPS = {
     "pools": "R4",
     "asserts": "M8",
     "sharing": "R6",
+    "sync": "R6",
 }
 
 
@@ -341,6 +342,10 @@ def main():
         print("== negative cases", flush=True)
         negative_compile("pe014.bad1", "A4")
         negative_compile("sharing.bad1", "R6")
+        negative_compile("sync.bad1", "R6")
+        negative_compile("sync.bad2", "R6")
+        negative_compile("sync.bad3", "R6")
+        negative_compile("sync.bad4", "R6")
         negative_compile("sharing.bad2", "R6")
         negative_compile("sharing.bad3", "R6")
         negative_compile("sharing.bad4", "R6")

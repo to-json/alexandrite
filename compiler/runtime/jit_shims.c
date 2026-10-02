@@ -127,4 +127,8 @@ int64_t alxj_chan_len(AlxChan *c) { return alx_chan_len(c); }
 void alxj_chan_send(AlxChan *c, const void *val, const char *loc) { alx_chan_send(c, val, loc); }
 int64_t alxj_chan_recv(AlxChan *c, void *out) { return alx_chan_recv(c, out); }
 void alxj_chan_close(AlxChan *c, const char *loc) { alx_chan_close(c, loc); }
+AlxLock *alxj_lock_new(void) { return alx_lock_new(); }
+void alxj_lock(AlxLock *l) { alx_lock(l); }
+void alxj_unlock(AlxLock *l) { alx_unlock(l); }
+int64_t *alxj_atomic_new(int64_t v) { return alx_atomic_new(v); }
 int64_t alxj_select(AlxSelCase *cases, int64_t n, int64_t has_default, const char *loc) { return alx_select(cases, n, has_default != 0, loc); }

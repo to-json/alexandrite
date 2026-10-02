@@ -27,6 +27,12 @@ pub enum LTy {
     /// A handle to a channel carrying values of this type (pointer-sized;
     /// copies refer to the same channel; safe to use from any task).
     Chan(Box<LTy>),
+    /// A lock (pointer-sized; copies refer to the same lock; safe to use
+    /// from any task). Taking a held lock blocks the task, not the thread.
+    Lock,
+    /// A shared I64 cell read and written atomically (pointer-sized; copies
+    /// refer to the same cell; sequentially consistent).
+    Atomic,
     /// A memory region (pointer-sized handle). Every allocation the runtime
     /// makes (arrays, strings, map storage, growth) goes into the thread's
     /// *current* region. See `LS::RegionEnter` and friends.
@@ -131,6 +137,18 @@ pub enum LE {
     ChanNew(LTy, Box<LE>),
     /// The number of values buffered in a channel right now (I64).
     ChanLen(Box<LE>),
+    /// A new, unheld lock.
+    LockNew,
+    /// A new atomic cell holding this I64.
+    AtomicNew(Box<LE>),
+    /// The cell's value (I64). Lowering binds it right away: reads and
+    /// writes of atomics keep their order.
+    AtomicLoad(Box<LE>),
+    /// Atomically: `Add` adds and gives the new value; `Swap` stores and
+    /// gives the old one (I64). Bound right away, as `AtomicLoad` is.
+    AtomicRmw(AtomicOp, Box<LE>, Box<LE>),
+    /// If the cell holds `old`, store `new`; whether it did (Bool).
+    AtomicCas(Box<LE>, Box<LE>, Box<LE>),
     /// This thread's program region (never freed; what everything used before regions).
     RegionProgram,
     /// The region holding the storage of this value (an `Arr` or a `Str`:
@@ -307,6 +325,12 @@ pub enum LS {
     /// Close `ch`; receivers drain what's buffered, then see `ok` = false.
     /// Closing twice panics at `loc`.
     ChanClose { ch: LE, loc: String },
+    /// Take the lock, blocking (the task) while another holder has it.
+    Lock(LE),
+    /// Release the lock (held by this task) and wake a waiter.
+    Unlock(LE),
+    /// Store into an atomic cell.
+    AtomicStore(LE, LE),
     /// Run one ready case, chosen fairly (random among the ready ones);
     /// `dst` = its index. If none is ready: with `default`, run none and set
     /// `dst` = `cases.len()`; otherwise block until one is. The case
@@ -356,4 +380,10 @@ pub struct LProgram {
     pub uses_pint: bool,
     /// Map instantiations generated so far (see mapgen), by K/V.
     pub maps: Vec<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AtomicOp {
+    Add,
+    Swap,
 }

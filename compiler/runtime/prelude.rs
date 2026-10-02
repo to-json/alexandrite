@@ -521,6 +521,51 @@ mod rt {
         m.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    /// A lock handle (alexandrite's `Mutex[T]` keeps its value beside it).
+    #[derive(Clone)]
+    pub struct AlxLock(Arc<(Mutex<bool>, Condvar)>);
+    impl Default for AlxLock {
+        fn default() -> Self {
+            AlxLock(Arc::new((Mutex::new(false), Condvar::new())))
+        }
+    }
+    impl AlxLock {
+        pub fn lock(&self) {
+            let mut held = lk(&self.0.0);
+            while *held {
+                held = self.0.1.wait(held).unwrap_or_else(|e| e.into_inner());
+            }
+            *held = true;
+        }
+        pub fn unlock(&self) {
+            *lk(&self.0.0) = false;
+            self.0.1.notify_one();
+        }
+    }
+    /// An atomic cell handle.
+    #[derive(Clone, Default)]
+    pub struct AlxAtomic(Arc<std::sync::atomic::AtomicI64>);
+    impl AlxAtomic {
+        pub fn new(v: i64) -> Self {
+            AlxAtomic(Arc::new(std::sync::atomic::AtomicI64::new(v)))
+        }
+        pub fn load(&self) -> i64 {
+            self.0.load(std::sync::atomic::Ordering::SeqCst)
+        }
+        pub fn store(&self, v: i64) {
+            self.0.store(v, std::sync::atomic::Ordering::SeqCst)
+        }
+        pub fn add(&self, v: i64) -> i64 {
+            self.0.fetch_add(v, std::sync::atomic::Ordering::SeqCst).wrapping_add(v)
+        }
+        pub fn swap(&self, v: i64) -> i64 {
+            self.0.swap(v, std::sync::atomic::Ordering::SeqCst)
+        }
+        pub fn cas(&self, old: i64, new: i64) -> bool {
+            self.0.compare_exchange(old, new, std::sync::atomic::Ordering::SeqCst, std::sync::atomic::Ordering::SeqCst).is_ok()
+        }
+    }
+
     struct TaskInner<T> {
         res: Mutex<Option<Result<T, Str>>>,
         cv: Condvar,

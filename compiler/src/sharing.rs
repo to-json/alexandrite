@@ -44,7 +44,7 @@ pub fn check(p: &TProgram, sm: &SourceMap) -> Result<(), Diag> {
 #[derive(Clone, Copy, PartialEq)]
 struct Move {
     at: Span,
-    task: bool,
+    what: &'static str,
     /// The variable named at the move (for messages about its aliases).
     via: LocalId,
 }
@@ -80,11 +80,15 @@ impl Ck<'_> {
 
     fn use_of(&mut self, l: LocalId, sp: Span) {
         if let Some(m) = self.moved.get(&l).copied() {
-            let what = if m.task { "moved into a task" } else { "sent on a channel" };
+            let what = m.what;
             let msg = if m.at == sp {
                 format!("`{}` goes into a task on every iteration of this loop, so each task would share it with the one before", self.name(l))
             } else if m.via == l {
+                if what == "moved into a mutex" {
+                format!("`{}` was {what} at {}, so it's reached only through the mutex's `lock` now", self.name(l), self.sm.loc(m.at))
+            } else {
                 format!("`{}` was {what} at {}, so the other task owns it now; using it here would share it without synchronization", self.name(l), self.sm.loc(m.at))
+            }
             } else {
                 format!("`{}` shares storage with `{}`, which was {what} at {}; using it here would share it without synchronization", self.name(l), self.name(m.via), self.sm.loc(m.at))
             };
@@ -95,7 +99,7 @@ impl Ck<'_> {
     }
 
     /// `vals` go to another task at `at`.
-    fn hand_over(&mut self, vals: &[&TExpr], at: Span, task: bool) {
+    fn hand_over(&mut self, vals: &[&TExpr], at: Span, what: &'static str) {
         for v in vals {
             if !shares(&v.ty) {
                 continue;
@@ -116,7 +120,7 @@ impl Ck<'_> {
                 }
                 for x in comp {
                     if shares(&self.f.locals[x].ty) {
-                        self.moved.insert(x, Move { at, task, via: l });
+                        self.moved.insert(x, Move { at, what, via: l });
                     }
                 }
             }
@@ -235,7 +239,7 @@ impl Ck<'_> {
                     self.expr(c);
                 }
                 let cs: Vec<&TExpr> = caps.iter().collect();
-                self.hand_over(&cs, e.span, true);
+                self.hand_over(&cs, e.span, "moved into a task");
                 // The body is the task's own code.
                 if let Some(b) = blk {
                     let saved = std::mem::take(&mut self.moved);
@@ -253,7 +257,35 @@ impl Ck<'_> {
                     self.expr(a);
                 }
                 let vs: Vec<&TExpr> = args.iter().collect();
-                self.hand_over(&vs, e.span, false);
+                self.hand_over(&vs, e.span, "sent on a channel");
+            }
+            TK::M(M::MutexNew, _, args, _) => {
+                for a in args {
+                    self.expr(a);
+                }
+                let vs: Vec<&TExpr> = args.iter().collect();
+                self.hand_over(&vs, e.span, "moved into a mutex");
+            }
+            TK::M(M::Lock, recv, _, Some(b)) => {
+                if let Some(r) = recv {
+                    self.expr(r);
+                }
+                // Nothing outside the block may keep hold of the guarded value.
+                if let Some(v) = b.params.first() {
+                    let (comp, _) = self.al.get(v).cloned().unwrap_or_default();
+                    for x in comp {
+                        let inside = (b.own.0..b.own.1).contains(&x) || x == *v;
+                        if !inside && shares(&self.f.locals[x].ty) {
+                            let mut d = Diag::new(b.span, format!("`{}` would keep a reference into the value `lock` guards, past the end of the block", self.name(x)));
+                            d.notes.push(format!("store a copy (`{}.dup`), or return what you need from the block (its value is copied out)", self.name(*v)));
+                            self.fail(d);
+                        }
+                    }
+                }
+                self.looped(|ck| {
+                    ck.stmts(&b.body);
+                    None
+                });
             }
             TK::M(M::Lambda, _, caps, _) => {
                 // Captures are uses; the body runs later, on its own.
@@ -296,7 +328,7 @@ impl Ck<'_> {
                         TSelArm::Send { ch, val, body } => {
                             self.expr(ch);
                             self.expr(val);
-                            self.hand_over(&[val], val.span, false);
+                            self.hand_over(&[val], val.span, "sent on a channel");
                             self.stmts(body);
                         }
                     }

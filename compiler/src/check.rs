@@ -902,6 +902,11 @@ pub fn type_from(t: &TypeExpr, structs: &Structs, consts: &Consts) -> R<Ty> {
             ("Map", _) => Err(Diag::new(*sp, "`Map` takes two types: `Map[K, V]`")),
             ("Chan", [t]) => Ok(Ty::Chan(Box::new(type_from(t)?))),
             ("Pool", [t]) => Ok(Ty::Pool(Box::new(type_from(t)?))),
+            ("Mutex", [t]) => Ok(Ty::Mutex(Box::new(type_from(t)?))),
+            ("Atomic", [t]) => match type_from(t)? {
+                t @ (Ty::Int | Ty::Bool) => Ok(Ty::Atomic(Box::new(t))),
+                t => Err(Diag::new(*sp, format!("`Atomic` holds an Int or a Bool, not {}; guard other values with a `Mutex`", t.show()))),
+            },
             ("Task", [t]) => Ok(Ty::Task(Box::new(type_from(t)?))),
             (g, _) if generic(&resolve_name(g, *sp, &|q| generic(q).is_some())?).is_some() => {
                 let g = resolve_name(g, *sp, &|q| generic(q).is_some())?;
@@ -954,6 +959,9 @@ struct FnCx<'w, 'a> {
     errs: std::collections::BTreeSet<String>,
     /// Inside a lambda's body (no `~` there yet).
     in_lambda: bool,
+    /// Inside a `lock` block: `self.loops`' length outside it (leaving the
+    /// block early would keep the lock held).
+    lock_floor: Option<usize>,
     /// Lambda literals checked so far: (block span start, fn type, captures).
     lambdas: Vec<(u32, Ty, Vec<LocalId>)>,
     /// The type the expression being checked is wanted as (for inferring
@@ -1013,6 +1021,7 @@ impl<'w, 'a> FnCx<'w, 'a> {
             decl_spans: vec![],
             usings: def.map_or_else(Vec::new, |d| d.using.iter().map(|u| (0, resolve_name(u, Span::default(), &|_| true).unwrap_or_else(|_| u.clone()))).collect()),
             in_lambda: false,
+            lock_floor: None,
             lambdas: vec![],
             method: def.filter(|d| d.params.first().is_some_and(|p| p.name == "self")).map(|d| d.name.ends_with('!')),
             is_main: def.is_none(),
@@ -1060,6 +1069,8 @@ impl<'w, 'a> FnCx<'w, 'a> {
             Ty::Result(t) => Ty::Result(Box::new(self.resolve(t))),
             Ty::Task(t) => Ty::Task(Box::new(self.resolve(t))),
             Ty::Pool(t) => Ty::Pool(Box::new(self.resolve(t))),
+            Ty::Mutex(t) => Ty::Mutex(Box::new(self.resolve(t))),
+            Ty::Atomic(t) => Ty::Atomic(Box::new(self.resolve(t))),
             Ty::Chan(t) => Ty::Chan(Box::new(self.resolve(t))),
             Ty::Seq(t, l) => Ty::seq(self.resolve(t), *l),
             Ty::Gen(t) => Ty::Gen(Box::new(self.resolve(t))),
@@ -1086,7 +1097,7 @@ impl<'w, 'a> FnCx<'w, 'a> {
             (Ty::Seq(x, _), Ty::Seq(y, _)) => self.unify(x, y),
             (Ty::Fixed(x, n), Ty::Fixed(y, m)) if n == m => self.unify(x, y),
             (Ty::Map(k1, v1), Ty::Map(k2, v2)) => self.unify(k1, k2) && self.unify(v1, v2),
-            (Ty::Result(x), Ty::Result(y)) | (Ty::Task(x), Ty::Task(y)) | (Ty::Chan(x), Ty::Chan(y)) | (Ty::Pool(x), Ty::Pool(y)) => self.unify(x, y),
+            (Ty::Result(x), Ty::Result(y)) | (Ty::Task(x), Ty::Task(y)) | (Ty::Chan(x), Ty::Chan(y)) | (Ty::Pool(x), Ty::Pool(y)) | (Ty::Mutex(x), Ty::Mutex(y)) | (Ty::Atomic(x), Ty::Atomic(y)) => self.unify(x, y),
             (Ty::Fn(p1, r1), Ty::Fn(p2, r2)) if p1.len() == p2.len() => {
                 let pairs: Vec<_> = p1.iter().cloned().zip(p2.iter().cloned()).collect();
                 pairs.iter().all(|(x, y)| self.unify(x, y)) && self.unify(r1, r2)
@@ -1449,12 +1460,14 @@ impl<'w, 'a> FnCx<'w, 'a> {
                 TStmt::Defer(v)
             }
             StmtKind::Next => {
+                self.not_leaving_lock(s.span, "next")?;
                 if self.loops.is_empty() {
                     return Err(Diag::new(s.span, "`next` outside a loop or block"));
                 }
                 TStmt::Next(s.span)
             }
             StmtKind::Break(v) => {
+                self.not_leaving_lock(s.span, "break")?;
                 if self.loops.is_empty() {
                     return Err(Diag::new(s.span, "`break` outside a loop or block"));
                 }
@@ -1469,6 +1482,9 @@ impl<'w, 'a> FnCx<'w, 'a> {
                 TStmt::Expr(self.mk(TK::Unit, Ty::Unit, s.span))
             }
             StmtKind::Fail(v) => {
+                if self.lock_floor.is_some() {
+                    return Err(Diag::new(s.span, "`fail` inside a `lock` block would leave the lock held; return a value from the block and fail after it"));
+                }
                 if !self.is_main && !self.fallible_decl {
                     return Err(Diag::new(s.span, format!("`fail` in `{}`, which isn't fallible: declare it `-> ~T`", self.fn_name)));
                 }
@@ -1480,6 +1496,9 @@ impl<'w, 'a> FnCx<'w, 'a> {
                 TStmt::Fail(e, s.span)
             }
             StmtKind::Return(v) => {
+                if self.lock_floor.is_some() {
+                    return Err(Diag::new(s.span, "`return` inside a `lock` block would leave the lock held; return after it"));
+                }
                 if self.is_main {
                     return Err(Diag::new(s.span, "`return` at the top level"));
                 }
@@ -1792,6 +1811,9 @@ impl<'w, 'a> FnCx<'w, 'a> {
                 self.mk(TK::Ternary(Box::new(c), Box::new(a), Box::new(b)), ty, sp)
             }
             ExprKind::Try(x) => {
+                if self.lock_floor.is_some() {
+                    return Err(Diag::new(sp, "`~` inside a `lock` block could leave the lock held; handle the error inside (`rescue`, `unwrap_or`) or after the block"));
+                }
                 let saved = std::mem::replace(&mut self.under_try, true);
                 let inner = self.value(x);
                 self.under_try = saved;
@@ -2494,6 +2516,7 @@ impl<'w, 'a> FnCx<'w, 'a> {
             (None, None) => self.fresh(),
         };
         let saved_lambda = std::mem::replace(&mut self.in_lambda, true);
+        let saved_lock = self.lock_floor.take();
         let saved_ret = std::mem::replace(&mut self.ret, rvar.clone());
         let saved_main = std::mem::replace(&mut self.is_main, false);
         let saved = self.want_hint.take();
@@ -2518,6 +2541,7 @@ impl<'w, 'a> FnCx<'w, 'a> {
         self.ret = saved_ret;
         self.is_main = saved_main;
         self.in_lambda = saved_lambda;
+        self.lock_floor = saved_lock;
         let (mut tb, bt) = r?;
         if ret.is_none() && hint.is_none() && !matches!(self.resolve(&bt), Ty::Never) && !self.unify(&rvar, &bt) {
             return Err(Diag::new(sp, format!("this lambda returns {} and {}", self.resolve(&rvar).show(), self.resolve(&bt).show())));
@@ -2548,6 +2572,38 @@ impl<'w, 'a> FnCx<'w, 'a> {
         Ok(self.mk(TK::M(M::Lambda, None, cap_es, Some(Box::new(tb))), ty, sp))
     }
 
+    /// `next`/`break` mustn't leave a `lock` block (only loops inside it).
+    fn not_leaving_lock(&self, sp: Span, what: &str) -> R<()> {
+        match self.lock_floor {
+            Some(f) if self.loops.len() <= f + 1 => Err(Diag::new(sp, format!("`{what}` would leave the `lock` block with the lock held; let the block finish"))),
+            _ => Ok(()),
+        }
+    }
+
+    /// `Mutex.new(v)` / `Atomic.new(v)`, with the value type given or not.
+    fn sync_new(&mut self, c: &str, t: Option<Ty>, csp: Span, args: &[Expr], sp: Span) -> R<TExpr> {
+        let [a] = args else {
+            return Err(Diag::new(sp, format!("`{c}.new` takes the initial value")));
+        };
+        let v = match &t {
+            Some(t) => {
+                let v = self.value_as(a, t)?;
+                self.expect(&v.ty, t, v.span, "initial value")?;
+                v
+            }
+            None => self.value(a)?,
+        };
+        let vt = self.resolve(&v.ty);
+        self.impure = true;
+        if c == "Mutex" {
+            return Ok(self.mk(TK::M(M::MutexNew, None, vec![v], None), Ty::Mutex(Box::new(vt)), sp));
+        }
+        if !matches!(vt, Ty::Int | Ty::Bool) {
+            return Err(Diag::new(csp, format!("`Atomic` holds an Int or a Bool, not {}; guard other values with a `Mutex`", vt.show())));
+        }
+        Ok(self.mk(TK::M(M::AtomicNew, None, vec![v], None), Ty::Atomic(Box::new(vt)), sp))
+    }
+
     fn fn_call(&mut self, f: TExpr, args: &[Expr], sp: Span) -> R<TExpr> {
         let Ty::Fn(ps, r) = self.resolve(&f.ty) else { unreachable!() };
         if args.len() != ps.len() {
@@ -2563,14 +2619,15 @@ impl<'w, 'a> FnCx<'w, 'a> {
         Ok(self.mk(TK::M(M::FnCall, Some(Box::new(f)), targs, None), *r, sp))
     }
 
-    /// `spawn { body }`: the body runs on its own task, with copies of the
-    /// locals it uses (slices and maps still share storage). It may use `~`:
-    /// its errors become the task's result.
+    /// `spawn { body }`: the body runs on its own task, with the locals it
+    /// uses moved in (sharing.rs rejects using shared storage afterwards).
+    /// It may use `~`: its errors become the task's result.
     fn spawn(&mut self, blk: &Block, sp: Span) -> R<TExpr> {
         let saved_errs = std::mem::take(&mut self.errs);
         let saved_fallible = std::mem::replace(&mut self.fallible_decl, true);
         let saved_main = std::mem::replace(&mut self.is_main, false);
         let saved_lambda = std::mem::replace(&mut self.in_lambda, false);
+        let saved_lock = self.lock_floor.take();
         let saved_loops = std::mem::take(&mut self.loops);
         let rvar = self.fresh();
         let saved_ret = std::mem::replace(&mut self.ret, rvar.clone());
@@ -2581,6 +2638,7 @@ impl<'w, 'a> FnCx<'w, 'a> {
         self.ret = saved_ret;
         self.loops = saved_loops;
         self.in_lambda = saved_lambda;
+        self.lock_floor = saved_lock;
         self.is_main = saved_main;
         self.fallible_decl = saved_fallible;
         let body_errs = std::mem::replace(&mut self.errs, saved_errs);
@@ -3266,6 +3324,10 @@ impl<'w, 'a> FnCx<'w, 'a> {
                 }
                 return Ok(self.mk(TK::M(M::PoolNew, None, vec![], None), Ty::Pool(Box::new(t)), sp));
             }
+            if (c == "Mutex" || c == "Atomic") && tes.len() == 1 && name == "new" {
+                let t = type_from(&tes[0], &self.w.structs, &self.w.consts)?;
+                return self.sync_new(c, Some(t), *csp, args, sp);
+            }
             if c == "Chan" && tes.len() == 1 && name == "new" {
                 let t = type_from(&tes[0], &self.w.structs, &self.w.consts)?;
                 let cap = match args {
@@ -3288,6 +3350,12 @@ impl<'w, 'a> FnCx<'w, 'a> {
             let targs = tes.iter().map(|t| type_from(t, &self.w.structs, &self.w.consts)).collect::<R<Vec<_>>>()?;
             let t = instantiate(c, &g, targs, *csp, &self.w.structs, &self.w.consts)?;
             return self.const_call_named(c, Some(t), *csp, name, name_span, args, block, sp);
+        }
+        // `Mutex.new(v)`, `Atomic.new(v)` (and `Mutex[T].new(v)` above).
+        if let Some(Expr { kind: ExprKind::Const(c), span: csp, .. }) = recv {
+            if (c == "Mutex" || c == "Atomic") && name == "new" && !self.w.consts.contains_key(c) {
+                return self.sync_new(c, None, *csp, args, sp);
+            }
         }
         // Constant receivers: Int.sqrt, Array.new, File.read, Enumerator.new.
         if let Some(Expr { kind: ExprKind::Const(c), span: csp, .. }) = recv {
@@ -4117,6 +4185,53 @@ impl<'w, 'a> FnCx<'w, 'a> {
                 _ => return Err(Diag::new(name_span, format!("no method `{name}` on {}; it has send (<<), recv, close, size, and the Enumerable methods", rt.show()))),
             }
         }
+        if let Ty::Mutex(t) = &rt {
+            let t = (**t).clone();
+            self.impure = true;
+            return match (name, args.len()) {
+                ("lock", 0) => {
+                    let Some(b) = block else {
+                        return Err(Diag::new(sp, "`lock` needs a block: `m.lock { |v| ... }`"));
+                    };
+                    let saved = self.lock_floor.replace(self.loops.len());
+                    let r = self.block(b, &t);
+                    self.lock_floor = saved;
+                    let (blk, bt) = r?;
+                    Ok(mk_m(self, M::Lock, recv, vec![], Some(blk), bt))
+                }
+                _ => Err(Diag::new(name_span, format!("no method `{name}` on {}; reach the value with `lock {{ |v| ... }}`", rt.show()))),
+            };
+        }
+        if let Ty::Atomic(t) = &rt {
+            let t = (**t).clone();
+            self.impure = true;
+            let mut val = |ck: &mut Self, a: &Expr| -> R<TExpr> {
+                let v = ck.value_as(a, &t)?;
+                ck.expect(&v.ty, &t, v.span, "atomic value")?;
+                Ok(v)
+            };
+            return match (name, args.len()) {
+                ("load", 0) => Ok(mk_m(self, M::AtomicLoad, recv, vec![], None, t)),
+                ("store", 1) => {
+                    let v = val(self, &args[0])?;
+                    Ok(mk_m(self, M::AtomicStore, recv, vec![v], None, Ty::Unit))
+                }
+                ("add", 1) if t == Ty::Int => {
+                    let v = val(self, &args[0])?;
+                    Ok(mk_m(self, M::AtomicAdd, recv, vec![v], None, Ty::Int))
+                }
+                ("swap", 1) => {
+                    let v = val(self, &args[0])?;
+                    Ok(mk_m(self, M::AtomicSwap, recv, vec![v], None, t))
+                }
+                ("compare_and_swap", 2) => {
+                    let o = val(self, &args[0])?;
+                    let n = val(self, &args[1])?;
+                    Ok(mk_m(self, M::AtomicCas, recv, vec![o, n], None, Ty::Bool))
+                }
+                _ => Err(Diag::new(name_span, format!("no method `{name}` on {}; it has load, store, {}swap and compare_and_swap", rt.show(), if t == Ty::Int { "add, " } else { "" }))),
+            };
+        }
         if let Ty::Pool(t) = &rt {
             let t = (**t).clone();
             let ht = Ty::Handle(t.show());
@@ -4634,7 +4749,7 @@ fn occurs(v: u32, t: &Ty) -> bool {
         Ty::Tuple(ts) => ts.iter().any(|t| occurs(v, t)),
         Ty::Map(k, x) => occurs(v, k) || occurs(v, x),
         Ty::Fn(ps, r) => ps.iter().any(|t| occurs(v, t)) || occurs(v, r),
-        Ty::Result(t) | Ty::Task(t) | Ty::Chan(t) | Ty::Pool(t) => occurs(v, t),
+        Ty::Result(t) | Ty::Task(t) | Ty::Chan(t) | Ty::Pool(t) | Ty::Mutex(t) | Ty::Atomic(t) => occurs(v, t),
         _ => false,
     }
 }

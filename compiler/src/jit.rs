@@ -11,6 +11,7 @@
 use crate::lir::*;
 use cranelift_codegen::ir::condcodes::IntCC;
 use cranelift_codegen::ir::condcodes::FloatCC;
+use cranelift_codegen::ir::AtomicRmwOp;
 use cranelift_codegen::ir::types::{F64, I8, I64};
 use cranelift_codegen::ir::{AbiParam, Block, BlockArg, FuncRef, InstBuilder, MemFlagsData, SigRef, Signature, StackSlotData, StackSlotKind, TrapCode, Type, Value};
 use cranelift_codegen::settings::{self, Configurable};
@@ -39,7 +40,7 @@ mod rt {
         alxj_puts_f64, alxj_f_to_s, alxj_f_fmt, alxj_f_to_i, alxj_str_cat,
         alxj_puts_u64, alxj_u64_to_s, alxj_int_fmt, alxj_f_to_u64, alxj_rune_to_s, alxj_str_from_bytes,
         alxj_die_str, alxj_panic_str, alxj_exit, alxj_now_ns, alxj_cap_begin, alxj_cap_end, alxj_file_status, alxj_file_read_or_empty,
-        alxj_spawn, alxj_task_wait, alxj_chan_new, alxj_chan_len, alxj_chan_send, alxj_chan_recv, alxj_chan_close, alxj_select,
+        alxj_spawn, alxj_task_wait, alxj_lock_new, alxj_lock, alxj_unlock, alxj_atomic_new, alxj_chan_new, alxj_chan_len, alxj_chan_send, alxj_chan_recv, alxj_chan_close, alxj_select,
     );
 }
 type RtFn = unsafe extern "C" fn();
@@ -65,7 +66,7 @@ fn lay(t: &LTy) -> Lay {
     let words = |n: u32| Lay { size: 8 * n, align: 8, fields: (0..n).map(|i| (8 * i, I64)).collect(), mem: vec![Mem::Full; n as usize] };
     match t {
         LTy::Region => words(1),
-        LTy::Task(_) | LTy::Chan(_) => words(1),
+        LTy::Task(_) | LTy::Chan(_) | LTy::Lock | LTy::Atomic => words(1),
         LTy::I64 | LTy::Gen(_) => words(1),
         LTy::F64 => Lay { size: 8, align: 8, fields: vec![(0, F64)], mem: vec![Mem::Full] },
         LTy::IntK(k) if k.bits() == 64 => words(1),
@@ -624,6 +625,18 @@ impl Fx<'_, '_, '_> {
                 let l = self.cstr(loc);
                 self.call_rt(rt::alxj_chan_close, &[c, l], false);
             }
+            LS::Lock(l) => {
+                let l = self.e1(l);
+                self.call_rt(rt::alxj_lock, &[l], false);
+            }
+            LS::Unlock(l) => {
+                let l = self.e1(l);
+                self.call_rt(rt::alxj_unlock, &[l], false);
+            }
+            LS::AtomicStore(a, v) => {
+                let (a, v) = (self.e1(a), self.e1(v));
+                self.b.ins().atomic_store(MemFlagsData::trusted(), v, a);
+            }
             LS::Select { cases, default, dst } => {
                 // AlxSelCase { ch, buf, is_send, ok }: four words each.
                 let n = cases.len() as i64;
@@ -929,6 +942,10 @@ impl Fx<'_, '_, '_> {
             LE::RegionProgram => LTy::Region,
             LE::ChanNew(t, _) => LTy::Chan(Box::new(t.clone())),
             LE::ChanLen(_) => LTy::I64,
+            LE::LockNew => LTy::Lock,
+            LE::AtomicNew(_) => LTy::Atomic,
+            LE::AtomicLoad(_) | LE::AtomicRmw(..) => LTy::I64,
+            LE::AtomicCas(..) => LTy::Bool,
             LE::Var(v) => self.f.vars[*v].ty.clone(),
             LE::I(_) | LE::Loc(_) | LE::Arith(..) | LE::Neg(..) | LE::Len(_) => LTy::I64,
             LE::F(_) | LE::FArith(..) | LE::FNeg(_) | LE::Prim(Prim::UToF, _) => LTy::F64,
@@ -1150,6 +1167,30 @@ impl Fx<'_, '_, '_> {
             LE::ChanLen(c) => {
                 let c = self.e1(c);
                 vec![self.call_rt(rt::alxj_chan_len, &[c], true).unwrap()]
+            }
+            LE::LockNew => vec![self.call_rt(rt::alxj_lock_new, &[], true).unwrap()],
+            LE::AtomicNew(v) => {
+                let v = self.e1(v);
+                vec![self.call_rt(rt::alxj_atomic_new, &[v], true).unwrap()]
+            }
+            LE::AtomicLoad(a) => {
+                let a = self.e1(a);
+                vec![self.b.ins().atomic_load(I64, MemFlagsData::trusted(), a)]
+            }
+            LE::AtomicRmw(op, a, v) => {
+                let (a, v) = (self.e1(a), self.e1(v));
+                match op {
+                    AtomicOp::Add => {
+                        let old = self.b.ins().atomic_rmw(I64, MemFlagsData::trusted(), AtomicRmwOp::Add, a, v);
+                        vec![self.b.ins().iadd(old, v)]
+                    }
+                    AtomicOp::Swap => vec![self.b.ins().atomic_rmw(I64, MemFlagsData::trusted(), AtomicRmwOp::Xchg, a, v)],
+                }
+            }
+            LE::AtomicCas(a, o, n) => {
+                let (a, o, n) = (self.e1(a), self.e1(o), self.e1(n));
+                let old = self.b.ins().atomic_cas(MemFlagsData::trusted(), a, o, n);
+                vec![self.b.ins().icmp(IntCC::Equal, old, o)]
             }
             LE::Var(v) => self.get(*v),
             LE::I(i) => vec![self.ic(*i)],

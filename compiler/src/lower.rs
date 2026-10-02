@@ -145,6 +145,9 @@ pub fn lty(t: &Ty, mode: Overflow) -> LTy {
         // A pool: a one-element array (shared, like a map) holding the slots
         // (present?, value) and the live count. A handle is a slot index.
         Ty::Pool(t) => LTy::Arr(Box::new(pool_header(lty(t, mode)))),
+        // A one-element array (shared, like a map) of (lock, value).
+        Ty::Mutex(t) => LTy::Arr(Box::new(LTy::Tup(vec![LTy::Lock, lty(t, mode)]))),
+        Ty::Atomic(_) => LTy::Atomic,
         Ty::Handle(_) => LTy::I64,
         Ty::Chan(t) => LTy::Chan(Box::new(lty(t, mode))),
         Ty::Fn(..) => LTy::Tup(std::iter::once(LTy::I64).chain(lambda_sites(t).iter().map(|(_, caps)| LTy::Tup(caps.iter().map(|c| lty(c, mode)).collect()))).collect()),
@@ -2510,6 +2513,75 @@ impl<'a> Lw<'a> {
                     }
                 }
             }
+            MutexNew => {
+                let lt = self.lty(&e.ty);
+                let LTy::Arr(h) = &lt else { unreachable!() };
+                let v = self.arg(&args[0]);
+                LE::ArrLit((**h).clone(), vec![LE::Tup((**h).clone(), vec![LE::LockNew, v])])
+            }
+            Lock => {
+                // Holding the lock: the block gets the value, changes to it
+                // are written back, and the result is copied out (it mustn't
+                // point into what the lock guards).
+                let r = recv.unwrap();
+                let lt = self.lty(&r.ty);
+                let pv = self.expr(r);
+                let p = self.tmp_of(pv, lt);
+                let cell = || LE::Index { arr: Box::new(LE::Var(p)), idx: Box::new(LE::I(0)), check: None };
+                self.emit(LS::Lock(LE::Field(Box::new(cell()), 0)));
+                let b = blk.unwrap();
+                let res = self.inline_block(b, &[LE::Field(Box::new(cell()), 1)], &[], None);
+                let rt = self.lty(&e.ty);
+                let res = self.bind(res, rt.clone());
+                let res = self.deep_copy(res, &rt);
+                let res = self.bind(res, rt);
+                let pvar = self.var_of(b.params[0]);
+                self.emit(LS::SetPlace { var: p, steps: vec![crate::lir::Step::Index(LE::I(0), None), crate::lir::Step::Field(1)], val: LE::Var(pvar) });
+                self.emit(LS::Unlock(LE::Field(Box::new(cell()), 0)));
+                res
+            }
+            AtomicNew | AtomicLoad | AtomicStore | AtomicAdd | AtomicSwap | AtomicCas => {
+                // Bools are 0/1 in the cell.
+                let Ty::Atomic(vt) = (if m == AtomicNew { e.ty.clone() } else { recv.unwrap().ty.clone() }) else { unreachable!() };
+                let is_bool = *vt == Ty::Bool;
+                let mut val_in = |lw: &mut Self, a: &TExpr| {
+                    let v = lw.expr(a);
+                    if is_bool { LE::Cond(Box::new(v), Box::new(LE::I(1)), Box::new(LE::I(0))) } else { lw.int_in(v, a.span) }
+                };
+                let val_out = |lw: &mut Self, x: LE| {
+                    let x = lw.bind(x, LTy::I64);
+                    if is_bool { LE::Cmp(Op::Ne, Box::new(x), Box::new(LE::I(0)), LTy::I64) } else { lw.int_out(x) }
+                };
+                if m == AtomicNew {
+                    let v = val_in(self, &args[0]);
+                    return LE::AtomicNew(Box::new(v));
+                }
+                let av = self.expr(recv.unwrap());
+                let a = self.tmp_of(av, LTy::Atomic);
+                let a = || Box::new(LE::Var(a));
+                match m {
+                    AtomicLoad => val_out(self, LE::AtomicLoad(a())),
+                    AtomicStore => {
+                        let v = val_in(self, &args[0]);
+                        self.emit(LS::AtomicStore(*a(), v));
+                        LE::Unit
+                    }
+                    AtomicAdd => {
+                        let v = val_in(self, &args[0]);
+                        val_out(self, LE::AtomicRmw(crate::lir::AtomicOp::Add, a(), Box::new(v)))
+                    }
+                    AtomicSwap => {
+                        let v = val_in(self, &args[0]);
+                        val_out(self, LE::AtomicRmw(crate::lir::AtomicOp::Swap, a(), Box::new(v)))
+                    }
+                    _ => {
+                        let o = val_in(self, &args[0]);
+                        let o = self.bind(o, LTy::I64);
+                        let n = val_in(self, &args[1]);
+                        self.bind(LE::AtomicCas(a(), Box::new(o), Box::new(n)), LTy::Bool)
+                    }
+                }
+            }
             ChanNew => {
                 let Ty::Chan(t) = &e.ty else { unreachable!() };
                 let el = self.lty(t);
@@ -3723,6 +3795,8 @@ fn zero_le(t: &LTy) -> LE {
         // A fresh closed-over channel stands in for "no channel" (never observed).
         LTy::Chan(e) => LE::ChanNew((**e).clone(), Box::new(LE::I(0))),
         LTy::Task(_) => panic!("a task handle has no zero value"),
+        LTy::Lock => LE::LockNew,
+        LTy::Atomic => LE::AtomicNew(Box::new(LE::I(0))),
         LTy::I64 | LTy::IntK(_) => LE::I(0),
         LTy::F64 => LE::F(0.0),
         LTy::Bool => LE::B(false),

@@ -254,7 +254,10 @@ impl<'a> Graph<'a> {
                         }
                         for s in &b.body {
                             let sv = self.stmt(s);
-                            v.extend(sv);
+                            // A `lock` block's value is copied out.
+                            if *m != M::Lock {
+                                v.extend(sv);
+                            }
                         }
                         if is_loop {
                             self.loops.pop();
@@ -270,7 +273,7 @@ impl<'a> Graph<'a> {
                         Ty::Map(k, t) => !has_storage(k) && !has_storage(t),
                         _ => false,
                     };
-                if *m != M::Spawn && !flat_copy {
+                if !matches!(m, M::Spawn | M::Lock) && !flat_copy {
                     v.extend(rv);
                     v.extend(avs);
                 }
@@ -459,6 +462,9 @@ pub fn aliases(p: &TProgram) -> Vec<HashMap<LocalId, (Vec<LocalId>, Vec<LocalId>
                         match m {
                             Node::Caller(q) => callers.push(*q),
                             Node::Ret | Node::Global => {}
+                            // A mutex is a wall: what it guards is reached
+                            // only under its lock.
+                            Node::Local(x) if matches!(f.locals[*x].ty, Ty::Mutex(_)) => {}
                             Node::Local(x) => {
                                 locals.push(*x);
                                 stack.push(*m);

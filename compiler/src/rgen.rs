@@ -12,6 +12,8 @@ fn rty(t: &LTy) -> String {
         LTy::Region => "()".into(),
         LTy::Task(t) => format!("Task<{}>", rty(t)),
         LTy::Chan(t) => format!("Chan<{}>", rty(t)),
+        LTy::Lock => "AlxLock".into(),
+        LTy::Atomic => "AlxAtomic".into(),
         // Every integer kind is an i64 here (bit pattern for U64): the
         // oracle checks meaning, not memory layout.
         LTy::I64 | LTy::IntK(_) => "i64".into(),
@@ -166,6 +168,18 @@ impl FnEmit<'_> {
             LS::ChanClose { ch, loc: l } => {
                 let c = self.e(ch);
                 self.line(&format!("({c}).close({});", loc(l)));
+            }
+            LS::Lock(l) => {
+                let l = self.e(l);
+                self.line(&format!("({l}).lock();"));
+            }
+            LS::Unlock(l) => {
+                let l = self.e(l);
+                self.line(&format!("({l}).unlock();"));
+            }
+            LS::AtomicStore(a, v) => {
+                let (a, v) = (self.e(a), self.e(v));
+                self.line(&format!("({a}).store({v});"));
             }
             LS::Select { cases, default, dst } => {
                 // Case expressions are evaluated once, in order, into `s{i}_`.
@@ -336,6 +350,12 @@ impl FnEmit<'_> {
             LE::RegionProgram => "()".into(),
             LE::ChanNew(t, cap) => format!("Chan::<{}>::new({})", rty(t), self.e(cap)),
             LE::ChanLen(c) => format!("({}).len()", self.e(c)),
+            LE::LockNew => "AlxLock::default()".into(),
+            LE::AtomicNew(v) => format!("AlxAtomic::new({})", self.e(v)),
+            LE::AtomicLoad(a) => format!("({}).load()", self.e(a)),
+            LE::AtomicRmw(AtomicOp::Add, a, v) => format!("({}).add({})", self.e(a), self.e(v)),
+            LE::AtomicRmw(AtomicOp::Swap, a, v) => format!("({}).swap({})", self.e(a), self.e(v)),
+            LE::AtomicCas(a, o, n) => format!("({}).cas({}, {})", self.e(a), self.e(o), self.e(n)),
             LE::Var(v) => self.var(*v),
             LE::I(i) => {
                 if *i == i64::MIN {

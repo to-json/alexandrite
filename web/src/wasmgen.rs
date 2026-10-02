@@ -127,7 +127,7 @@ fn lay(t: &LTy) -> Lay {
     let words = |n: u32| Lay { size: 8 * n, align: 8, fields: (0..n).map(|i| (8 * i, F::Wd)).collect() };
     match t {
         LTy::Region => words(1),
-        LTy::Task(_) | LTy::Chan(_) => words(1),
+        LTy::Task(_) | LTy::Chan(_) | LTy::Lock | LTy::Atomic => words(1),
         LTy::I64 | LTy::Gen(_) => words(1),
         LTy::F64 => Lay { size: 8, align: 8, fields: vec![(0, F::Fl)] },
         LTy::IntK(k) if k.bits() == 64 => words(1),
@@ -264,13 +264,13 @@ fn uses_concurrency(p: &LProgram) -> bool {
     let funcs = p.funcs.iter().chain(p.gens.iter().map(|g| &g.func)).chain(p.workers.iter().map(|w| &w.func));
     funcs.into_iter().any(|f| {
         let d = format!("{:?}", f.body);
-        ["Spawn {", "Wait {", "ChanSend {", "ChanRecv {", "ChanClose {", "Select {", "ChanNew(", "ChanLen("].iter().any(|k| d.contains(k))
+        ["Spawn {", "Wait {", "ChanSend {", "ChanRecv {", "ChanClose {", "Select {", "ChanNew(", "ChanLen(", "LockNew", "AtomicNew("].iter().any(|k| d.contains(k))
     })
 }
 
 pub fn emit(p: &LProgram) -> Result<Vec<u8>, String> {
     if uses_concurrency(p) {
-        return Err("spawn and channels aren't available in the browser yet".into());
+        return Err("spawn, channels, Mutex and Atomic aren't available in the browser yet".into());
     }
     rt::st().consts.clear();
     let mut cx = Ctx { types: vec![], type_idx: HashMap::new(), rt_idx: HashMap::new(), funcs: HashMap::new(), gens: HashMap::new(), workers: HashMap::new(), consts: HashMap::new(), ret: rt::ret_addr() };
@@ -701,7 +701,7 @@ impl<'c, 'p> Fx<'c, 'p> {
         match s {
             LS::RegionFree(_) => {}
             LS::RegionEnter { .. } | LS::RegionExit { .. } | LS::RegionUse { .. } | LS::RegionRestore(_) => {}
-            LS::Spawn { .. } | LS::Wait { .. } | LS::ChanSend { .. } | LS::ChanRecv { .. } | LS::ChanClose { .. } | LS::Select { .. } => unreachable!("rejected by uses_concurrency"),
+            LS::Spawn { .. } | LS::Wait { .. } | LS::ChanSend { .. } | LS::ChanRecv { .. } | LS::ChanClose { .. } | LS::Select { .. } | LS::Lock(_) | LS::Unlock(_) | LS::AtomicStore(..) => unreachable!("rejected by uses_concurrency"),
             LS::Set(v, e) => {
                 self.e(e);
                 self.set_var(*v);
@@ -1081,6 +1081,10 @@ impl<'c, 'p> Fx<'c, 'p> {
 
     fn ty(&self, e: &LE) -> LTy {
         match e {
+            LE::LockNew => LTy::Lock,
+            LE::AtomicNew(_) => LTy::Atomic,
+            LE::AtomicLoad(_) | LE::AtomicRmw(..) => LTy::I64,
+            LE::AtomicCas(..) => LTy::Bool,
             LE::RegionNew(_) => LTy::Region,
             LE::RegionBytes(_) => LTy::I64,
             LE::RegionOf(_) => LTy::Region,
@@ -1150,7 +1154,7 @@ impl<'c, 'p> Fx<'c, 'p> {
             LE::RegionOf(_) => self.i64c(0),
             // The browser never frees: regions are no-ops (handle 0).
             LE::RegionProgram => self.i64c(0),
-            LE::ChanNew(..) | LE::ChanLen(_) => unreachable!("rejected by uses_concurrency"),
+            LE::ChanNew(..) | LE::ChanLen(_) | LE::LockNew | LE::AtomicNew(_) | LE::AtomicLoad(_) | LE::AtomicRmw(..) | LE::AtomicCas(..) => unreachable!("rejected by uses_concurrency"),
             LE::Var(v) => {
                 let ls = self.vars[*v].clone();
                 self.get(&ls);

@@ -222,6 +222,11 @@ void alx_pmap(const void *in, int64_t n, size_t in_size, void *out, size_t out_s
 /* ---------- tasks and channels ---------- */
 typedef struct AlxTask AlxTask;
 typedef struct AlxChan AlxChan;
+typedef struct AlxLock AlxLock;
+AlxLock *alx_lock_new(void);
+void alx_lock(AlxLock *l);
+void alx_unlock(AlxLock *l);
+int64_t *alx_atomic_new(int64_t v);
 /* A case of alx_select. `buf` holds the value to send / receives the value.
  * `ok` is written only on the chosen recv case (the caller presets it). */
 typedef struct { AlxChan *ch; void *buf; int64_t is_send; int64_t ok; } AlxSelCase;

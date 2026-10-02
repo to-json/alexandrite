@@ -38,6 +38,10 @@ pub enum Ty {
     Pool(Box<Ty>),
     /// `@T`: a handle into a pool of T (named by T's type name).
     Handle(String),
+    /// `Mutex[T]`: a T only reached under its lock (shared between tasks).
+    Mutex(Box<Ty>),
+    /// `Atomic[T]` (Int or Bool): shared between tasks.
+    Atomic(Box<Ty>),
     /// A function value (`(A, B) -> R`): one of the program's lambda
     /// literals of this type, with its captured values.
     Fn(Vec<Ty>, Box<Ty>),
@@ -89,6 +93,8 @@ impl Ty {
             Ty::Chan(t) => format!("Chan[{}]", t.show()),
             Ty::Pool(t) => format!("Pool[{}]", t.show()),
             Ty::Handle(n) => format!("@{n}"),
+            Ty::Mutex(t) => format!("Mutex[{}]", t.show()),
+            Ty::Atomic(t) => format!("Atomic[{}]", t.show()),
             Ty::Fn(ps, r) => format!("({}) -> {}", ps.iter().map(Ty::show).collect::<Vec<_>>().join(", "), r.show()),
             Ty::Tuple(ts) => format!("({})", ts.iter().map(Ty::show).collect::<Vec<_>>().join(", ")),
             Ty::Range => "Range[Int]".into(),
@@ -107,7 +113,7 @@ impl Ty {
             Ty::Tuple(ts) => ts.iter().any(Ty::has_var),
             Ty::Map(k, v) => k.has_var() || v.has_var(),
             Ty::Fn(ps, r) => ps.iter().any(Ty::has_var) || r.has_var(),
-            Ty::Result(t) | Ty::Task(t) | Ty::Chan(t) | Ty::Pool(t) => t.has_var(),
+            Ty::Result(t) | Ty::Task(t) | Ty::Chan(t) | Ty::Pool(t) | Ty::Mutex(t) | Ty::Atomic(t) => t.has_var(),
             _ => false,
         }
     }
@@ -292,6 +298,18 @@ pub enum M {
     ChanRecv,
     ChanClose,
     ChanLen,
+    /// `Mutex.new(v)`; `m.lock { |v| ... }` (the block runs holding the
+    /// lock; `v` is the value, changed in place; the result is copied out).
+    MutexNew,
+    Lock,
+    /// `Atomic.new(v)`; `load`, `store(v)`, `add(n)` (the new value),
+    /// `swap(v)` (the old one), `compare_and_swap(old, new)` (Bool).
+    AtomicNew,
+    AtomicLoad,
+    AtomicStore,
+    AtomicAdd,
+    AtomicSwap,
+    AtomicCas,
     /// A lambda literal (the block); args are its captured locals.
     Lambda,
     /// Call a function value: recv is the function, args its arguments.

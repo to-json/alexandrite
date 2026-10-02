@@ -1009,3 +1009,37 @@ int64_t alx_select(AlxSelCase *cs, int64_t n, bool has_default, const char *loc)
         if (!ok) deadlock();
     }
 }
+
+/* ---------- locks and atomics (R6) ---------- */
+
+/* A lock is a flag under the scheduler's lock: a holder blocks waiters the
+ * way a full channel blocks senders, so deadlock detection covers it. */
+struct AlxLock { bool held; };
+
+AlxLock *alx_lock_new(void) {
+    AlxLock *l = calloc(1, sizeof *l);
+    if (!l) alx_panic("out of memory", "runtime");
+    return l;
+}
+
+void alx_lock(AlxLock *l) {
+    pthread_mutex_lock(&g_mu);
+    while (l->held)
+        if (!block_wait()) deadlock();
+    l->held = true;
+    pthread_mutex_unlock(&g_mu);
+}
+
+void alx_unlock(AlxLock *l) {
+    pthread_mutex_lock(&g_mu);
+    l->held = false;
+    wake_all();
+    pthread_mutex_unlock(&g_mu);
+}
+
+int64_t *alx_atomic_new(int64_t v) {
+    int64_t *a = malloc(sizeof *a);
+    if (!a) alx_panic("out of memory", "runtime");
+    __atomic_store_n(a, v, __ATOMIC_SEQ_CST);
+    return a;
+}

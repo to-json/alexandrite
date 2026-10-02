@@ -177,7 +177,6 @@ struct Lw<'a> {
 
 /// A stage of a pipeline with its pre-loop state.
 struct Stage<'t> {
-    m: M,
     node: &'t TExpr,
     counter: Option<V>,
     limit: Option<V>,
@@ -2826,7 +2825,7 @@ impl<'a> Lw<'a> {
             } else {
                 None
             };
-            st.push(Stage { m: *m, node: s, counter, limit });
+            st.push(Stage { node: s, counter, limit });
         }
         let base_lty = self.lty(&base.ty);
         let promote = self.promote();

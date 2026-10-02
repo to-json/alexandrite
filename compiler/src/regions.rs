@@ -335,35 +335,6 @@ impl<'a> Graph<'a> {
             _ => vec![],
         }
     }
-
-    /// The strongest sink each node reaches.
-    fn classes(&self) -> HashMap<Node, Class> {
-        // Reverse reachability from the sinks.
-        let mut rev: HashMap<Node, Vec<Node>> = HashMap::new();
-        for (a, bs) in &self.edges {
-            for b in bs {
-                rev.entry(*b).or_default().push(*a);
-            }
-        }
-        let mut out: HashMap<Node, Class> = HashMap::new();
-        let mut sinks = vec![(Node::Global, Class::Global), (Node::Ret, Class::Ret)];
-        sinks.extend(self.f.params.iter().map(|p| (Node::Caller(*p), Class::Global)));
-        sinks.sort_by_key(|(_, c)| std::cmp::Reverse(*c));
-        for (sink, class) in sinks {
-            let mut stack = vec![sink];
-            while let Some(n) = stack.pop() {
-                let cur = out.get(&n).copied().unwrap_or(Class::Local);
-                if cur >= class && n != sink {
-                    continue;
-                }
-                out.insert(n, cur.max(class));
-                if let Some(ps) = rev.get(&n) {
-                    stack.extend(ps.iter().copied());
-                }
-            }
-        }
-        out
-    }
 }
 
 /// Does the type contain an Int (a bignum, in promote mode)?

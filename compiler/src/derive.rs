@@ -561,6 +561,7 @@ pub fn json_source(job: &DeriveJob, alias: &str, types: &ModuleTypes) -> Result<
                 g.w(5, format!("{} => {{", lit(&key)));
                 g.w(6, format!("_d.at!({})", lit(&format!("{name}.{}", f.name))));
                 g.w(6, format!("_r.{} = {name}.~{hn}(_d)", f.name));
+                g.w(6, "nil");
                 g.w(5, "}");
                 let saved = std::mem::take(&mut g.out);
                 g.w(1, format!("def self.{hn}(_d: {a}.Decoder) -> ~{}<{a}.JsonError> {{", type_src(&f.ty)));
@@ -590,11 +591,13 @@ pub fn json_source(job: &DeriveJob, alias: &str, types: &ModuleTypes) -> Result<
                 if v.fields.is_empty() {
                     g.w(4, "_d.~unit_variant!(_wr)");
                     g.w(4, format!("_r = {name}.{}", v.name));
+                    g.w(4, "nil");
                     g.w(3, "}");
                     continue;
                 }
                 let hn = format!("json_v_{}", v.name);
                 g.w(4, format!("_r = {name}.~{hn}(_d, _wr)"));
+                g.w(4, "nil");
                 g.w(3, "}");
                 let saved = std::mem::take(&mut g.out);
                 g.w(1, format!("def self.{hn}(_d: {a}.Decoder, _wr: Bool) -> ~{name}<{a}.JsonError> {{"));
@@ -631,6 +634,7 @@ pub fn json_source(job: &DeriveJob, alias: &str, types: &ModuleTypes) -> Result<
                         let x = g.fresh("v");
                         g.dec(&f.ty, &x, 6).map_err(&fail)?;
                         g.w(6, format!("{t} = {x}"));
+                        g.w(6, "nil");
                         g.w(5, "}");
                     }
                     g.w(5, "_ => _d.~skip!");

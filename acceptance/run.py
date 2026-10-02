@@ -96,6 +96,7 @@ GROUPS = {
     "smallfixes": "L1",
     "trymethod": "M5",
     "pure": "A4",
+    "flags": "L2",
 }
 
 

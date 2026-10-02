@@ -994,9 +994,13 @@ impl<'a> Lw<'a> {
                 let t = self.lty(&e.ty);
                 let t = self.tmp(t);
                 let mut sa = sa;
-                sa.push(LS::Set(t, va));
+                if a.ty != Ty::Never {
+                    sa.push(LS::Set(t, va));
+                }
                 let mut sb = sb;
-                sb.push(LS::Set(t, vb));
+                if b.ty != Ty::Never {
+                    sb.push(LS::Set(t, vb));
+                }
                 self.emit(LS::If(cv, sa, sb));
                 LE::Var(t)
             }

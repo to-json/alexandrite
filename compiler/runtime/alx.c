@@ -67,12 +67,22 @@ static _Thread_local AlxRegion *tl_pool;       /* spare region structs */
 static _Thread_local Blk *tl_free;             /* free chunks */
 static _Thread_local int tl_nfree;
 
+/* Granule registry: this thread's map from 1 MB granule number to the region
+ * owning the chunk / large block that covers it (open addressing, linear
+ * probing, backward-shift deletion; granule 0 is never mapped so g == 0 marks
+ * an empty slot). Chunks and large blocks are 1 MB-aligned and large blocks
+ * are padded to whole granules, so a granule belongs to at most one block. */
+typedef struct { uintptr_t g; AlxRegion *r; } RegEnt;
+static _Thread_local RegEnt *tl_reg;
+static _Thread_local size_t tl_reg_cap, tl_reg_n;   /* cap is a power of two */
+
 static pthread_key_t free_key;
 static pthread_once_t free_once = PTHREAD_ONCE_INIT;
 static _Thread_local bool tl_free_armed;
 /* At thread exit, return the thread's free chunks to the OS. */
 static void free_chunks(void *unused) {
     (void)unused;
+    free(tl_reg); tl_reg = NULL; tl_reg_cap = tl_reg_n = 0;
     for (Blk *b = tl_free, *n; b; b = n) { n = b->next; mem_sub(b->size); free(b); }
     tl_free = NULL; tl_nfree = 0;
 }
@@ -81,6 +91,59 @@ static void arm_free(void) {
     pthread_once(&free_once, free_key_init);
     pthread_setspecific(free_key, &tl_free_armed);
     tl_free_armed = true;
+}
+
+static inline size_t reg_hash(uintptr_t g, size_t mask) {
+    return (size_t)((g * 0x9E3779B97F4A7C15ull) >> 32) & mask;
+}
+static void reg_put(uintptr_t g, AlxRegion *r) {
+    if (!tl_reg_cap || (tl_reg_n + 1) * 2 > tl_reg_cap) {
+        size_t nc = tl_reg_cap ? tl_reg_cap * 2 : 64;
+        RegEnt *t = calloc(nc, sizeof *t);
+        if (!t) alx_panic("out of memory", "runtime");
+        for (size_t i = 0; i < tl_reg_cap; i++)
+            if (tl_reg[i].g) {
+                size_t j = reg_hash(tl_reg[i].g, nc - 1);
+                while (t[j].g) j = (j + 1) & (nc - 1);
+                t[j] = tl_reg[i];
+            }
+        free(tl_reg); tl_reg = t; tl_reg_cap = nc;
+        if (!tl_free_armed) arm_free();
+    }
+    size_t m = tl_reg_cap - 1, i = reg_hash(g, m);
+    while (tl_reg[i].g && tl_reg[i].g != g) i = (i + 1) & m;
+    if (!tl_reg[i].g) tl_reg_n++;
+    tl_reg[i].g = g; tl_reg[i].r = r;
+}
+static void reg_del(uintptr_t g) {
+    if (!tl_reg_cap) return;
+    size_t m = tl_reg_cap - 1, i = reg_hash(g, m);
+    while (tl_reg[i].g && tl_reg[i].g != g) i = (i + 1) & m;
+    if (!tl_reg[i].g) return;
+    tl_reg_n--;
+    for (size_t j = i;;) {
+        j = (j + 1) & m;
+        if (!tl_reg[j].g) break;
+        size_t h = reg_hash(tl_reg[j].g, m);
+        /* entry j stays put if its home h lies cyclically in (i, j] */
+        if (i <= j ? (i < h && h <= j) : (i < h || h <= j)) continue;
+        tl_reg[i] = tl_reg[j]; i = j;
+    }
+    tl_reg[i].g = 0;
+}
+static void reg_blk(const void *b, size_t size, AlxRegion *r) {
+    uintptr_t g0 = (uintptr_t)b >> 20, g1 = ((uintptr_t)b + size - 1) >> 20;
+    for (uintptr_t g = g0; g <= g1; g++) { if (r) reg_put(g, r); else reg_del(g); }
+}
+
+AlxRegion *alx_region_of(const void *p) {
+    if (p && tl_reg_n) {
+        uintptr_t g = (uintptr_t)p >> 20;
+        size_t m = tl_reg_cap - 1, i = reg_hash(g, m);
+        for (RegEnt *e; (e = &tl_reg[i])->g; i = (i + 1) & m)
+            if (e->g == g) return e->r;
+    }
+    return &tl_prog;
 }
 
 static inline AlxRegion *cur_region(void) { return tl_cur ? tl_cur : &tl_prog; }
@@ -121,10 +184,11 @@ void alx_region_exit(AlxRegion *r, AlxRegion *saved) {
     tl_cur = saved;
     for (Blk *b = r->chunks, *n; b; b = n) {
         n = b->next;
+        reg_blk(b, ALX_CHUNK, NULL);
         if (tl_nfree < ALX_FREE_CAP) { if (!tl_free_armed) arm_free(); b->next = tl_free; tl_free = b; tl_nfree++; }
         else { mem_sub(b->size); free(b); }
     }
-    for (Blk *b = r->larges, *n; b; b = n) { n = b->next; mem_sub(b->size); free(b); }
+    for (Blk *b = r->larges, *n; b; b = n) { n = b->next; reg_blk(b, b->size, NULL); mem_sub(b->size); free(b); }
     r->chunks = r->larges = NULL;
     r->pool_next = tl_pool; tl_pool = r;
 }
@@ -134,21 +198,23 @@ void *alx_alloc_slow(size_t n) {
     AlxRegion *r = cur_region();
     if (n > ALX_CHUNK / 16) {
         size_t sz = n + ALX_HDR;
-        Blk *b = malloc(sz);
+        Blk *b = aligned_alloc(ALX_CHUNK, (sz + ALX_CHUNK - 1) & ~(size_t)(ALX_CHUNK - 1));
         if (!b) alx_panic("out of memory", "runtime");
         mem_add(sz);
         b->size = sz; b->next = r->larges; r->larges = b;
+        reg_blk(b, sz, r);
         return (char *)b + ALX_HDR;
     }
     Blk *c = tl_free;
     if (c) { tl_free = c->next; tl_nfree--; }
     else {
-        c = malloc(ALX_CHUNK);
+        c = aligned_alloc(ALX_CHUNK, ALX_CHUNK);
         if (!c) alx_panic("out of memory", "runtime");
         mem_add(ALX_CHUNK);
         c->size = ALX_CHUNK;
     }
     c->next = r->chunks; r->chunks = c;
+    reg_blk(c, ALX_CHUNK, r);
     char *base = (char *)c + ALX_HDR;
     alx_bump_cur = base + n;
     alx_bump_end = (char *)c + ALX_CHUNK;

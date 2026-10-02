@@ -52,6 +52,10 @@ AlxRegion *alx_region_enter(void);           /* fresh empty region, made current
 void alx_region_exit(AlxRegion *r, AlxRegion *saved); /* free r; make saved current */
 AlxRegion *alx_region_use(AlxRegion *r);     /* make r current; returns previous */
 void alx_region_set(AlxRegion *r);           /* make r current */
+/* The region of this thread whose chunk or large block contains p (interior
+ * pointers included); else (NULL, literals, stack, malloc, other threads) the
+ * program region. O(1) expected. */
+AlxRegion *alx_region_of(const void *p);
 /* Stats (all threads): bytes held in chunks/large blocks, live regions + free lists. */
 size_t alx_mem_held(void);
 size_t alx_mem_peak(void);

@@ -29,7 +29,7 @@ macro_rules! runtime {
 mod rt {
     runtime!(
         alx_init, alx_panic, alx_overflow, alx_pow, alx_isqrt, alx_sort_i64, alx_sort_str, alx_puts_i64,
-        alxj_region_cur, alxj_region_enter, alxj_region_exit, alxj_region_use, alxj_region_set, alxj_region_program,
+        alxj_region_cur, alxj_region_enter, alxj_region_exit, alxj_region_use, alxj_region_set, alxj_region_program, alxj_region_of,
         alxj_alloc, alxj_zalloc, alxj_arr_alloc, alxj_arr_grow, alxj_arr_new, alxj_arr_copy,
         alxj_int_to_s, alxj_str_rev, alxj_str_delete, alxj_str_split, alxj_str_to_i, alxj_str_charlen, alxj_str_sub,
         alxj_str_eq, alxj_str_cmp, alxj_str_is_pal, alxj_int_ndigits, alxj_digits,
@@ -1121,7 +1121,11 @@ impl Fx<'_, '_, '_> {
 
     fn e(&mut self, e: &LE) -> Vec<Value> {
         match e {
-            LE::RegionOf(_) => unimplemented!("R2: region_of in the JIT"),
+            LE::RegionOf(x) => {
+                // Arr and Str both keep their data pointer in word 0.
+                let v = self.e(x);
+                vec![self.call_rt(rt::alxj_region_of, &[v[0]], true).unwrap()]
+            }
             LE::RegionProgram => vec![self.call_rt(rt::alxj_region_program, &[], true).unwrap()],
             LE::ChanNew(t, cap) => {
                 let c = self.e1(cap);

@@ -85,11 +85,118 @@ static void *thr(void *arg) {
     return NULL;
 }
 
+/* ---- alx_region_of ---- */
+static char g_buf[64];
+static const char *g_lit = "a string literal";
+
+static void of_basic(void) {
+    AlxRegion *prog = alx_region_program();
+    char stack[64]; void *m = malloc(100);
+    CHECK(alx_region_of(NULL) == prog && alx_region_of(g_lit) == prog);
+    CHECK(alx_region_of(stack) == prog && alx_region_of(m) == prog && alx_region_of(g_buf) == prog);
+    char *pa = alx_alloc(100);
+    CHECK(alx_region_of(pa) == prog);
+    AlxRegion *s = alx_region_cur(), *r = alx_region_enter();
+    char *a = alx_alloc(100), *b = alx_alloc(1000);
+    CHECK(alx_region_of(a) == r && alx_region_of(a + 99) == r && alx_region_of(b + 500) == r);
+    /* run through several chunks, checking first and last byte of each allocation */
+    for (int i = 0; i < 40000; i++) {
+        char *last = alx_alloc(64);
+        CHECK(alx_region_of(last) == r && alx_region_of(last + 63) == r);
+    }
+    /* allocate in the program region while r is current */
+    AlxRegion *sv = alx_region_use(prog);
+    char *q = alx_alloc(100);
+    alx_region_set(sv);
+    CHECK(alx_region_of(q) == prog && alx_region_of(a) == r);
+    /* nested */
+    AlxRegion *s2 = alx_region_cur(), *r2 = alx_region_enter();
+    char *c = alx_alloc(100);
+    CHECK(alx_region_of(c) == r2 && alx_region_of(a) == r && r2 != r);
+    alx_region_exit(r2, s2);
+    CHECK(alx_region_of(c) == prog);          /* freed: unregistered */
+    CHECK(alx_region_of(a) == r);
+    alx_region_exit(r, s);
+    CHECK(alx_region_of(a) == prog && alx_region_of(pa) == prog && alx_region_of(q) == prog);
+    free(m);
+}
+
+static void of_large(void) {
+    AlxRegion *prog = alx_region_program();
+    AlxRegion *s = alx_region_cur(), *r = alx_region_enter();
+    size_t n = 10u << 20;
+    char *p = alx_alloc(n); fill(p, n, 1);
+    char *small = alx_alloc(80);
+    CHECK(alx_region_of(p) == r && alx_region_of(p + n - 1) == r && alx_region_of(small) == r);
+    for (size_t o = 0; o < n; o += 4099) CHECK(alx_region_of(p + o) == r);
+    char *p2 = alx_alloc(100000);     /* sub-granule large block */
+    CHECK(alx_region_of(p2) == r && alx_region_of(p2 + 99999) == r);
+    alx_region_exit(r, s);
+    for (size_t o = 0; o < n; o += 4099) CHECK(alx_region_of(p + o) == prog);
+    CHECK(alx_region_of(p2 + 5) == prog);
+}
+
+static void of_reuse(void) {
+    AlxRegion *prog = alx_region_program();
+    for (int round = 0; round < 6; round++) {
+        AlxRegion *s = alx_region_cur(), *r1 = alx_region_enter();
+        char *a[8];
+        for (int i = 0; i < 8; i++) { a[i] = alx_alloc(300000); CHECK(alx_region_of(a[i]) == r1); }
+        alx_region_exit(r1, s);
+        for (int i = 0; i < 8; i++) CHECK(alx_region_of(a[i]) == prog);
+        /* a new region reuses the freed chunks (non-ASan): must report the new one */
+        AlxRegion *s2 = alx_region_cur(), *r2 = alx_region_enter();
+        for (int i = 0; i < 8; i++) {
+            char *b = alx_alloc(300000);
+            CHECK(alx_region_of(b) == r2);
+            for (int j = 0; j < 8; j++) if (a[j] == b) CHECK(alx_region_of(a[j]) == r2);
+        }
+        alx_region_exit(r2, s2);
+    }
+    /* many live regions at once: forces registry growth and deletion shifts */
+    enum { N = 300 };
+    static AlxRegion *rs[N], *ss[N]; static char *ps[N];
+    for (int i = 0; i < N; i++) { ss[i] = alx_region_cur(); rs[i] = alx_region_enter(); ps[i] = alx_alloc(2000); }
+    for (int i = 0; i < N; i++) CHECK(alx_region_of(ps[i]) == rs[i]);
+    for (int i = N - 1; i >= 0; i--) {
+        CHECK(alx_region_of(ps[i]) == rs[i]);
+        alx_region_exit(rs[i], ss[i]);
+        CHECK(alx_region_of(ps[i]) == prog);
+        for (int j = 0; j < i; j += 7) CHECK(alx_region_of(ps[j]) == rs[j]);
+    }
+}
+
+static void *of_thr(void *arg) {
+    AlxRegion *prog = alx_region_program();
+    char *foreign = arg;
+    CHECK(alx_region_of(foreign) == prog);    /* another thread's memory */
+    for (int i = 0; i < 200; i++) {
+        AlxRegion *s = alx_region_cur(), *r = alx_region_enter();
+        char *p = alx_alloc(5000), *big = alx_alloc(3u << 20);
+        CHECK(alx_region_of(p + 4000) == r && alx_region_of(big + (2u << 20)) == r);
+        CHECK(alx_region_of(foreign) == prog);
+        alx_region_exit(r, s);
+        CHECK(alx_region_of(p) == prog && alx_region_of(big) == prog);
+    }
+    return NULL;
+}
+
+static void of_threads(void) {
+    AlxRegion *s = alx_region_cur(), *r = alx_region_enter();
+    char *mine = alx_alloc(1000);
+    pthread_t t[8];
+    for (int i = 0; i < 8; i++) pthread_create(&t[i], NULL, of_thr, mine);
+    for (int i = 0; i < 8; i++) pthread_join(t[i], NULL);
+    CHECK(alx_region_of(mine) == r);
+    alx_region_exit(r, s);
+}
+
 int main(void) {
     alx_init();
     nested();
     bounded();
     large();
+    of_basic(); of_large(); of_reuse(); of_threads();
     pthread_t t[16];
     for (int i = 0; i < 16; i++) pthread_create(&t[i], NULL, thr, NULL);
     for (int i = 0; i < 16; i++) pthread_join(t[i], NULL);

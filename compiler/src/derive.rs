@@ -489,7 +489,7 @@ pub fn json_source(job: &DeriveJob, alias: &str, types: &ModuleTypes) -> Result<
     if !job.tparams.is_empty() {
         return Err(fail("generic types can't derive Json yet; derive it on a concrete wrapper, or write json_enc / json_dec by hand".to_string()));
     }
-    let (pubk, name, a) = (if job.public { "pub " } else { "" }, job.name.clone(), alias.to_string());
+    let (pubk, name, a) = ("pub ", job.name.clone(), alias.to_string());
     let tp = String::new();
     let _ = &tp;
     g.w(0, format!("struct {name} {{"));
@@ -545,6 +545,9 @@ pub fn json_source(job: &DeriveJob, alias: &str, types: &ModuleTypes) -> Result<
     }
     g.w(1, "}");
     // ---- decoding
+    // Each field (and each enum variant) reads in a helper def of its own, so the
+    // frame of `json_dec` stays small however many fields there are.
+    let mut helpers = String::new();
     g.w(1, format!("{pubk}def self.json_dec(_d: {a}.Decoder) -> ~{name}<{a}.JsonError> {{"));
     match &job.shape {
         DShape::Struct(fields) => {
@@ -554,12 +557,17 @@ pub fn json_source(job: &DeriveJob, alias: &str, types: &ModuleTypes) -> Result<
             g.w(4, "case _d.key {");
             for f in fields.iter().filter(|f| !f.opts.skip) {
                 let key = f.opts.rename.clone().unwrap_or_else(|| f.name.clone());
+                let hn = format!("json_f_{}", f.name);
                 g.w(5, format!("{} => {{", lit(&key)));
                 g.w(6, format!("_d.at!({})", lit(&format!("{name}.{}", f.name))));
-                let v = g.fresh("v");
-                g.dec(&f.ty, &v, 6).map_err(&fail)?;
-                g.w(6, format!("_r.{} = {v}", f.name));
+                g.w(6, format!("_r.{} = {name}.~{hn}(_d)", f.name));
                 g.w(5, "}");
+                let saved = std::mem::take(&mut g.out);
+                g.w(1, format!("def self.{hn}(_d: {a}.Decoder) -> ~{}<{a}.JsonError> {{", type_src(&f.ty)));
+                g.dec(&f.ty, "_v", 2).map_err(&fail)?;
+                g.w(2, "_v");
+                g.w(1, "}");
+                helpers.push_str(&std::mem::replace(&mut g.out, saved));
             }
             g.w(5, "_ => _d.~skip!");
             g.w(4, "}");
@@ -582,90 +590,94 @@ pub fn json_source(job: &DeriveJob, alias: &str, types: &ModuleTypes) -> Result<
                 if v.fields.is_empty() {
                     g.w(4, "_d.~unit_variant!(_wr)");
                     g.w(4, format!("_r = {name}.{}", v.name));
-                } else {
-                    g.w(4, format!("_d.at!({})", lit(&ctx)));
-                    g.w(4, "_d.~need_payload!(_wr)");
-                    let named = v.fields.iter().any(|f| f.name.parse::<usize>().is_err());
-                    let mut args: Vec<String> = vec![];
-                    if named {
-                        // Named fields: an object. Each field gets a temporary;
-                        // a named (non-primitive) type is staged as `T?` and required.
-                        let mut stages: Vec<(String, bool)> = vec![];
-                        let mut tmp: Vec<String> = vec![];
-                        for f in v.fields.iter() {
-                            let t = g.fresh("p");
-                            let staged = g.needs_stage(&f.ty);
-                            if staged {
-                                g.w(5, format!("{t}: {}? = none", type_src(&f.ty)));
-                            } else {
-                                match g.zero(&f.ty) {
-                                    Some(z) => g.w(5, format!("{t}: {} = {z}", type_src(&f.ty))),
-                                    None => return Err(fail(format!("field `{}` of variant `{}` has no zero value", f.name, v.name))),
-                                }
-                            }
-                            stages.push((t.clone(), staged));
-                            tmp.push(t);
-                        }
-                        g.w(4, "if _d.~open_obj! {");
-                        g.w(5, "while _d.~next_key! {");
-                        g.w(6, "case _d.key {");
-                        for (f, (t, staged)) in v.fields.iter().zip(&stages) {
-                            if f.opts.skip {
-                                continue;
-                            }
-                            let key = f.opts.rename.clone().unwrap_or_else(|| f.name.clone());
-                            g.w(7, format!("{} => {{", lit(&key)));
-                            let x = g.fresh("v");
-                            g.dec(&f.ty, &x, 8).map_err(&fail)?;
-                            let _ = staged;
-                            g.w(8, format!("{t} = {x}"));
-                            g.w(7, "}");
-                        }
-                        g.w(7, "_ => _d.~skip!");
-                        g.w(6, "}");
-                        g.w(5, "}");
-                        g.w(4, "}");
-                        for (t, staged) in &stages {
-                            if *staged {
-                                args.push(format!("{t}!"));
-                            } else {
-                                args.push(t.clone());
-                            }
-                        }
-                    } else if v.fields.len() == 1 {
-                        let x = g.fresh("v");
-                        g.dec(&v.fields[0].ty, &x, 4).map_err(&fail)?;
-                        args.push(x);
-                    } else {
-                        g.w(4, "_d.~open_tuple!");
-                        for (k, f) in v.fields.iter().enumerate() {
-                            g.w(4, format!("_d.~tuple_next!({k}, {})", v.fields.len()));
-                            let x = g.fresh("v");
-                            g.dec(&f.ty, &x, 4).map_err(&fail)?;
-                            args.push(x);
-                        }
-                        g.w(4, format!("_d.~tuple_end!({})", v.fields.len()));
-                    }
-                    // Staged (required) fields: unwrap with an error when missing.
-                    let mut call_args = vec![];
-                    let mut open = 0;
-                    for (k, a) in args.iter().enumerate() {
-                        if let Some(t) = a.strip_suffix('!') {
-                            let u = g.fresh("u");
-                            g.w(4 + open, format!("if {u} = {t} {{"));
-                            open += 1;
-                            call_args.push(u);
-                            let _ = k;
+                    g.w(3, "}");
+                    continue;
+                }
+                let hn = format!("json_v_{}", v.name);
+                g.w(4, format!("_r = {name}.~{hn}(_d, _wr)"));
+                g.w(3, "}");
+                let saved = std::mem::take(&mut g.out);
+                g.w(1, format!("def self.{hn}(_d: {a}.Decoder, _wr: Bool) -> ~{name}<{a}.JsonError> {{"));
+                g.w(2, format!("_d.at!({})", lit(&ctx)));
+                g.w(2, "_d.~need_payload!(_wr)");
+                let named = v.fields.iter().any(|f| f.name.parse::<usize>().is_err());
+                let mut args: Vec<String> = vec![];
+                if named {
+                    // Named fields: an object. Each field gets a temporary; a named
+                    // (non-primitive) type is staged as `T?` and required.
+                    let mut stages: Vec<(String, bool)> = vec![];
+                    for f in v.fields.iter() {
+                        let t = g.fresh("p");
+                        let staged = g.needs_stage(&f.ty);
+                        if staged {
+                            g.w(2, format!("{t}: {}? = none", type_src(&f.ty)));
                         } else {
-                            call_args.push(a.clone());
+                            match g.zero(&f.ty) {
+                                Some(z) => g.w(2, format!("{t}: {} = {z}", type_src(&f.ty))),
+                                None => return Err(fail(format!("field `{}` of variant `{}` has no zero value", f.name, v.name))),
+                            }
                         }
+                        stages.push((t, staged));
                     }
-                    g.w(4 + open, format!("_r = {name}.{}({})", v.name, call_args.join(", ")));
-                    for k in (0..open).rev() {
-                        g.w(4 + k, format!("}} else {{ fail _d.missing_field({}) }}", lit(&ctx)));
+                    g.w(2, "if _d.~open_obj! {");
+                    g.w(3, "while _d.~next_key! {");
+                    g.w(4, "case _d.key {");
+                    for (f, (t, _)) in v.fields.iter().zip(&stages) {
+                        if f.opts.skip {
+                            continue;
+                        }
+                        let key = f.opts.rename.clone().unwrap_or_else(|| f.name.clone());
+                        g.w(5, format!("{} => {{", lit(&key)));
+                        let x = g.fresh("v");
+                        g.dec(&f.ty, &x, 6).map_err(&fail)?;
+                        g.w(6, format!("{t} = {x}"));
+                        g.w(5, "}");
+                    }
+                    g.w(5, "_ => _d.~skip!");
+                    g.w(4, "}");
+                    g.w(3, "}");
+                    g.w(2, "}");
+                    for (t, staged) in &stages {
+                        args.push(if *staged { format!("{t}!") } else { t.clone() });
+                    }
+                } else if v.fields.len() == 1 {
+                    let x = g.fresh("v");
+                    g.dec(&v.fields[0].ty, &x, 2).map_err(&fail)?;
+                    args.push(x);
+                } else {
+                    g.w(2, "_d.~open_tuple!");
+                    for (k, f) in v.fields.iter().enumerate() {
+                        g.w(2, format!("_d.~tuple_next!({k}, {})", v.fields.len()));
+                        let x = g.fresh("v");
+                        g.dec(&f.ty, &x, 2).map_err(&fail)?;
+                        args.push(x);
+                    }
+                    g.w(2, format!("_d.~tuple_end!({})", v.fields.len()));
+                }
+                // Staged (required) fields: unwrap, or fail when missing.
+                let mut call_args = vec![];
+                let mut open = 0;
+                for a in &args {
+                    if let Some(t) = a.strip_suffix('!') {
+                        let u = g.fresh("u");
+                        g.w(2 + open, format!("if {u} = {t} {{"));
+                        open += 1;
+                        call_args.push(u);
+                    } else {
+                        call_args.push(a.clone());
                     }
                 }
-                g.w(3, "}");
+                if open == 0 {
+                    g.w(2, format!("{name}.{}({})", v.name, call_args.join(", ")));
+                } else {
+                    g.w(2 + open, format!("return {name}.{}({})", v.name, call_args.join(", ")));
+                    for k in (0..open).rev() {
+                        g.w(2 + k, "}");
+                    }
+                    g.w(2, format!("fail _d.missing_field({})", lit(&ctx)));
+                }
+                g.w(1, "}");
+                helpers.push_str(&std::mem::replace(&mut g.out, saved));
             }
             g.w(3, "_ => {");
             g.w(4, format!("fail _d.bad_variant({}, _vn)", lit(&name)));
@@ -679,6 +691,7 @@ pub fn json_source(job: &DeriveJob, alias: &str, types: &ModuleTypes) -> Result<
         }
     }
     g.w(1, "}");
+    g.out.push_str(&helpers);
     // ---- the conveniences
     g.w(1, format!("{pubk}def to_json -> ~Str<{a}.JsonError> {{"));
     g.w(2, format!("_e = {a}.new_encoder()"));
@@ -690,6 +703,7 @@ pub fn json_source(job: &DeriveJob, alias: &str, types: &ModuleTypes) -> Result<
     g.w(2, format!("{a}.~indent(_s, _prefix, _indent)"));
     g.w(1, "}");
     g.w(1, format!("{pubk}def self.from_json(_s: Str) -> ~{name}<{a}.JsonError> {{"));
+    g.w(2, format!("{a}.~check(_s)"));
     g.w(2, format!("_d = {a}.new_decoder(_s)"));
     g.w(2, format!("_v = {name}.~json_dec(_d)"));
     g.w(2, "_d.~done!");

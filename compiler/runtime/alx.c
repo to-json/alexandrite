@@ -999,6 +999,8 @@ static void enqueue(AlxTask *t) {
 }
 
 static Parker *g_main_p;
+/* Tasks asleep on a timer: they'll wake on their own, so not a deadlock. */
+static int64_t g_sleepers;
 
 static void unpark(Parker *p) {
     if (!p->parked) return;
@@ -1011,7 +1013,7 @@ static void wake(WNode **head) { for (WNode *n = *head; n; n = n->next) unpark(n
 
 /* Nothing runnable but main is parked: nothing can ever wake it. */
 static void check_dead(void) {
-    if (g_runnable == 0 && g_main_p && g_main_p->parked) { g_main_p->dead = true; unpark(g_main_p); }
+    if (g_runnable == 0 && g_sleepers == 0 && g_main_p && g_main_p->parked) { g_main_p->dead = true; unpark(g_main_p); }
 }
 
 static _Thread_local Parker tl_pk;
@@ -1047,7 +1049,7 @@ static void sw_out(AlxTask *t, bool dying) {
  * asleep parks, and main is woken to report it. */
 static bool block_wait(WNode ***heads, int n) {
     Parker *p = cur_pk();
-    if (p->counted && !p->task && g_runnable == 1) return false;
+    if (p->counted && !p->task && g_runnable == 1 && g_sleepers == 0) return false;
     WNode ndv[p->task ? 1 : (n ? n : 1)], *nd = ndv;
     if (p->task) {
         AlxTask *t = p->task;
@@ -1565,4 +1567,78 @@ int64_t *alx_atomic_new(int64_t v) {
     if (!a) alx_panic("out of memory", "runtime");
     __atomic_store_n(a, v, __ATOMIC_SEQ_CST);
     return a;
+}
+
+/* ---------- sleeping (time.sleep) ---------- */
+
+/* A task asleep parks on a deadline-ordered list; one timer thread wakes
+ * each at its deadline. A plain thread (main) just sleeps. */
+typedef struct Timer { int64_t at; Parker *p; struct Timer *next; } Timer;
+static Timer *g_timers;
+static pthread_cond_t g_tcv = PTHREAD_COND_INITIALIZER;
+static bool g_timer_thread;
+
+static int64_t mono_ns(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec * 1000000000 + ts.tv_nsec;
+}
+
+static void *timer_main(void *arg) {
+    (void)arg;
+    tl_uncounted = true;
+    pthread_mutex_lock(&g_mu);
+    for (;;) {
+        while (!g_timers) pthread_cond_wait(&g_tcv, &g_mu);
+        int64_t now = mono_ns();
+        if (g_timers->at > now) {
+            /* Wait until the earliest deadline (or an earlier one arrives). */
+            struct timespec rt;
+            clock_gettime(CLOCK_REALTIME, &rt);
+            int64_t until = (int64_t)rt.tv_sec * 1000000000 + rt.tv_nsec + (g_timers->at - now);
+            struct timespec dl = { (time_t)(until / 1000000000), (long)(until % 1000000000) };
+            pthread_cond_timedwait(&g_tcv, &g_mu, &dl);
+            continue;
+        }
+        Timer *t = g_timers;
+        g_timers = t->next;
+        g_sleepers--;
+        unpark(t->p);
+        free(t);
+    }
+    return NULL;
+}
+
+void alx_sleep_ns(int64_t ns) {
+    if (ns <= 0) return;
+    if (!tl_task) {
+        struct timespec ts = { (time_t)(ns / 1000000000), (long)(ns % 1000000000) };
+        while (nanosleep(&ts, &ts) != 0 && errno == EINTR) {}
+        return;
+    }
+    Parker *p = cur_pk();
+    Timer *t = malloc(sizeof *t);
+    if (!t) alx_panic("out of memory", "runtime");
+    t->at = mono_ns() + ns;
+    t->p = p;
+    pthread_mutex_lock(&g_mu);
+    if (!g_timer_thread) {
+        pthread_t th;
+        pthread_attr_t at;
+        pthread_attr_init(&at);
+        pthread_attr_setdetachstate(&at, PTHREAD_CREATE_DETACHED);
+        if (pthread_create(&th, &at, timer_main, NULL) != 0) alx_panic("cannot start the timer thread", "runtime");
+        pthread_attr_destroy(&at);
+        g_timer_thread = true;
+    }
+    Timer **pp = &g_timers;
+    while (*pp && (*pp)->at <= t->at) pp = &(*pp)->next;
+    t->next = *pp;
+    *pp = t;
+    if (g_timers == t) pthread_cond_signal(&g_tcv);
+    g_sleepers++;
+    p->parked = true; p->dead = false;
+    if (p->counted) g_runnable--;
+    pthread_mutex_unlock(&g_mu);
+    sw_out(p->task, false);
 }

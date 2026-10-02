@@ -25,6 +25,11 @@ pub enum Ty {
     /// `enum`: its name and variants (each with its fields). A value: the
     /// tag, then every variant's fields side by side.
     Enum(String, Vec<(String, Vec<(String, Ty)>)>),
+    /// Any error value: one of the program's `error` types (and the
+    /// builtin ones), with where it happened and any `wrap` context.
+    Error,
+    /// `~T` held as a value: a T or an Error.
+    Result(Box<Ty>),
     /// A function value (`(A, B) -> R`): one of the program's lambda
     /// literals of this type, with its captured values.
     Fn(Vec<Ty>, Box<Ty>),
@@ -70,6 +75,8 @@ impl Ty {
             Ty::Array(t) => format!("[{}]", t.show()),
             Ty::Fixed(t, n) => format!("[{}; {n}]", t.show()),
             Ty::Map(k, v) => format!("Map[{}, {}]", k.show(), v.show()),
+            Ty::Error => "Error".into(),
+            Ty::Result(t) => format!("~{}", t.show()),
             Ty::Fn(ps, r) => format!("({}) -> {}", ps.iter().map(Ty::show).collect::<Vec<_>>().join(", "), r.show()),
             Ty::Tuple(ts) => format!("({})", ts.iter().map(Ty::show).collect::<Vec<_>>().join(", ")),
             Ty::Range => "Range[Int]".into(),
@@ -88,6 +95,7 @@ impl Ty {
             Ty::Tuple(ts) => ts.iter().any(Ty::has_var),
             Ty::Map(k, v) => k.has_var() || v.has_var(),
             Ty::Fn(ps, r) => ps.iter().any(Ty::has_var) || r.has_var(),
+            Ty::Result(t) => t.has_var(),
             _ => false,
         }
     }
@@ -236,6 +244,23 @@ pub enum M {
     /// `m.fetch(k, d)`, `m[k] = v`, `delete` (V?), `key?`, `size`, `keys`, `values`.
     /// An enum value's variant index.
     EnumTag,
+    /// An error enum value as an `Error` (k = its index in `TProgram::errors`).
+    ToError(usize),
+    /// `e.message` (with any wrap context).
+    ErrMessage,
+    /// `e.wrap(ctx)`.
+    ErrWrap,
+    /// Is `Error` value of error type `k`? / its value as that type.
+    ErrIs(usize),
+    ErrAs(usize),
+    /// Results: `ok` (T?), `err` (Error?), `ok?`, `unwrap`, `unwrap_or(d)`,
+    /// `rescue { |e| v }`.
+    ResOk,
+    ResErr,
+    ResIsOk,
+    ResUnwrap,
+    ResUnwrapOr,
+    ResRescue,
     /// A lambda literal (the block); args are its captured locals.
     Lambda,
     /// Call a function value: recv is the function, args its arguments.
@@ -364,6 +389,8 @@ pub enum TStmt {
     Next(Span),
     Break(Option<TExpr>, Span),
     Return(Option<TExpr>, Span),
+    /// `fail e` (an `Error` value).
+    Fail(TExpr, Span),
     /// Run when the enclosing block exits.
     Defer(TExpr),
 }
@@ -388,6 +415,8 @@ pub struct TFunc {
     pub is_main: bool,
     /// Lambda literals in this function: (block span start, fn type, captured locals).
     pub lambdas: Vec<(u32, Ty, Vec<LocalId>)>,
+    /// The error types it can fail with ("Error" = any).
+    pub errs: Vec<String>,
 }
 
 pub struct TProgram {
@@ -399,4 +428,8 @@ pub struct TProgram {
     /// `to_s` instances of types that are printed (by `Ty::show`), so
     /// printing a slice of them uses each element's `to_s` (Go's Stringer).
     pub stringers: HashMap<String, FuncId>,
+    /// Every error type (enums), in tag order; builtins first.
+    pub errors: Vec<Ty>,
+    /// Error types with a `message` method: index → its instance.
+    pub messages: HashMap<usize, FuncId>,
 }

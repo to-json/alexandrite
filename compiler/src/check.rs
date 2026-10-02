@@ -49,6 +49,8 @@ pub struct World<'a> {
     /// Each interface's implementors so far, with their method instances.
     pub impls: HashMap<String, Vec<(Ty, Vec<FuncId>)>>,
     pub stringers: HashMap<String, FuncId>,
+    /// Error types (enums), in tag order: builtins first, then `error` decls.
+    pub errors: Vec<Ty>,
 }
 
 #[derive(Clone, Debug)]
@@ -82,7 +84,7 @@ impl<'a> World<'a> {
         }
         GENERICS.with(|g| g.borrow_mut().clear());
         INSTS.with(|g| g.borrow_mut().clear());
-        Ok(World { sm, defs, by_name, instances: HashMap::new(), funcs: vec![], sigs: HashMap::new(), fatal: None, structs: HashMap::new(), consts: HashMap::new(), ifaces: HashMap::new(), impls: HashMap::new(), stringers: HashMap::new() })
+        Ok(World { sm, defs, by_name, instances: HashMap::new(), funcs: vec![], sigs: HashMap::new(), fatal: None, structs: HashMap::new(), consts: HashMap::new(), ifaces: HashMap::new(), impls: HashMap::new(), stringers: HashMap::new(), errors: vec![] })
     }
 
     /// Evaluate top-level constants, in order (each may use earlier ones).
@@ -142,7 +144,7 @@ impl<'a> World<'a> {
         let enums: Vec<&EnumDef> = enums.iter().filter(|d| d.tparams.is_empty()).collect();
         let all = defs.iter().copied().map(|d| (d.name.as_str(), d.span, Def::S(d))).chain(enums.iter().copied().map(|d| (d.name.as_str(), d.span, Def::E(d))));
         for (name, span, d) in all {
-            if by_name.contains_key(name) || self.structs.contains_key(name) || self.consts.contains_key(name) || ["Int", "Float", "Bool", "Str", "Array", "Map", "Math", "File", "Enumerator"].contains(&name) {
+            if by_name.contains_key(name) || self.structs.contains_key(name) || self.consts.contains_key(name) || ["Int", "Float", "Bool", "Str", "Array", "Map", "Math", "File", "Enumerator", "Error"].contains(&name) {
                 return Err(Diag::new(span, format!("`{name}` is already defined")));
             }
             by_name.insert(name, d);
@@ -192,7 +194,44 @@ impl<'a> World<'a> {
         for n in names {
             resolve(n, &by_name, &mut self.structs, &mut vec![], &self.consts)?;
         }
+        for e in enums.iter().filter(|e| e.error) {
+            let t = self.structs[&e.name].clone();
+            self.errors.push(t);
+        }
         Ok(())
+    }
+
+    /// The builtin error types.
+    pub fn add_builtin_errors(&mut self) {
+        let s = |v: &str| (v.to_string(), vec![("path".to_string(), Ty::Str)]);
+        let builtins = [
+            ("IoError", vec![s("NotFound"), s("Failed")]),
+            ("ArithError", vec![("Overflow".to_string(), vec![]), ("DivZero".to_string(), vec![])]),
+            ("Failure", vec![("Msg".to_string(), vec![("message".to_string(), Ty::Str)])]),
+        ];
+        for (n, vs) in builtins {
+            let t = Ty::Enum(n.into(), vs);
+            self.structs.insert(n.into(), t.clone());
+            self.errors.push(t);
+        }
+    }
+
+    /// The index of error type `t`, if it is one.
+    pub fn error_index(&self, t: &Ty) -> Option<usize> {
+        self.errors.iter().position(|e| e == t)
+    }
+
+    /// Instances of each error type's `message` method.
+    pub fn message_instances(&mut self) -> R<HashMap<usize, FuncId>> {
+        let mut out = HashMap::new();
+        for (k, t) in self.errors.clone().iter().enumerate() {
+            let Some(tn) = t.type_name() else { continue };
+            if let Some(&def) = self.by_name.get(&method_name(tn, "message")) {
+                let fid = self.instance(def, vec![t.clone()], Span::default())?;
+                out.insert(k, fid);
+            }
+        }
+        Ok(out)
     }
 
     /// Declare interface names (before structs, whose fields may use them).
@@ -396,6 +435,7 @@ impl<'a> World<'a> {
                 external: true,
                 is_main: false,
                 lambdas: vec![],
+                errs: if ext.fallible { vec!["Error".into()] } else { vec![] },
             };
             self.funcs[id] = Some(f);
             return Ok(id);
@@ -540,7 +580,7 @@ pub fn cname(s: &str) -> String {
 /// Values `puts` and interpolation can show.
 pub fn printable(t: &Ty) -> bool {
     match t {
-        Ty::Int | Ty::IntK(_) | Ty::Float | Ty::Str | Ty::Bool | Ty::Var(_) | Ty::Iface(_) => true,
+        Ty::Int | Ty::IntK(_) | Ty::Float | Ty::Str | Ty::Bool | Ty::Var(_) | Ty::Iface(_) | Ty::Error => true,
         Ty::Opt(t) | Ty::Array(t) | Ty::Fixed(t, _) => printable(t),
         Ty::Map(k, v) => printable(k) && printable(v),
         Ty::Struct(_, fs) => fs.iter().all(|(_, t)| printable(t)),
@@ -562,6 +602,7 @@ fn type_names(t: &TypeExpr, out: &mut Vec<String>) {
             ps.iter().for_each(|t| type_names(t, out));
             type_names(r, out);
         }
+        TypeExpr::Result(t, _, _) => type_names(t, out),
     }
 }
 
@@ -682,12 +723,14 @@ pub fn type_from(t: &TypeExpr, structs: &Structs, consts: &Consts) -> R<Ty> {
             "Float" => Ok(Ty::Float),
             "Bool" => Ok(Ty::Bool),
             "Str" => Ok(Ty::Str),
+            "Error" => Ok(Ty::Error),
             _ => match IntKind::from_name(n) {
                 Some(k) => Ok(Ty::of_kind(k)),
                 None => structs.get(n).cloned().ok_or_else(|| Diag::new(*sp, format!("unknown type `{n}`"))),
             },
         },
         TypeExpr::Array(t, _) => Ok(Ty::arr(type_from(t)?)),
+        TypeExpr::Result(t, _, _) => Ok(Ty::Result(Box::new(type_from(t)?))),
         TypeExpr::Fn(ps, r, _) => Ok(Ty::Fn(ps.iter().map(type_from).collect::<R<Vec<_>>>()?, Box::new(type_from(r)?))),
         TypeExpr::Opt(t, _) => Ok(Ty::Opt(Box::new(type_from(t)?))),
         TypeExpr::App(n, args, sp) => match (n.as_str(), args.as_slice()) {
@@ -741,6 +784,10 @@ struct FnCx<'w, 'a> {
     /// Kind of each enclosing loop-ish construct, innermost last.
     loops: Vec<LoopKind>,
     n_params: usize,
+    /// Error types this function can fail with ("Error" = any).
+    errs: std::collections::BTreeSet<String>,
+    /// Inside a lambda's body (no `~` there yet).
+    in_lambda: bool,
     /// Lambda literals checked so far: (block span start, fn type, captures).
     lambdas: Vec<(u32, Ty, Vec<LocalId>)>,
     /// The type the expression being checked is wanted as (for inferring
@@ -796,6 +843,8 @@ impl<'w, 'a> FnCx<'w, 'a> {
             pure_decl: def.is_some_and(|d| d.pure),
             fn_name: def.map_or("main".into(), |d| d.name.clone()),
             want_hint: None,
+            errs: Default::default(),
+            in_lambda: false,
             lambdas: vec![],
             method: def.filter(|d| d.params.first().is_some_and(|p| p.name == "self")).map(|d| d.name.ends_with('!')),
             is_main: def.is_none(),
@@ -840,6 +889,7 @@ impl<'w, 'a> FnCx<'w, 'a> {
             Ty::Fixed(t, n) => Ty::Fixed(Box::new(self.resolve(t)), *n),
             Ty::Map(k, v) => Ty::Map(Box::new(self.resolve(k)), Box::new(self.resolve(v))),
             Ty::Fn(ps, r) => Ty::Fn(ps.iter().map(|t| self.resolve(t)).collect(), Box::new(self.resolve(r))),
+            Ty::Result(t) => Ty::Result(Box::new(self.resolve(t))),
             Ty::Seq(t, l) => Ty::seq(self.resolve(t), *l),
             Ty::Gen(t) => Ty::Gen(Box::new(self.resolve(t))),
             Ty::Opt(t) => Ty::Opt(Box::new(self.resolve(t))),
@@ -865,6 +915,7 @@ impl<'w, 'a> FnCx<'w, 'a> {
             (Ty::Seq(x, _), Ty::Seq(y, _)) => self.unify(x, y),
             (Ty::Fixed(x, n), Ty::Fixed(y, m)) if n == m => self.unify(x, y),
             (Ty::Map(k1, v1), Ty::Map(k2, v2)) => self.unify(k1, k2) && self.unify(v1, v2),
+            (Ty::Result(x), Ty::Result(y)) => self.unify(x, y),
             (Ty::Fn(p1, r1), Ty::Fn(p2, r2)) if p1.len() == p2.len() => {
                 let pairs: Vec<_> = p1.iter().cloned().zip(p2.iter().cloned()).collect();
                 pairs.iter().all(|(x, y)| self.unify(x, y)) && self.unify(r1, r2)
@@ -959,8 +1010,21 @@ impl<'w, 'a> FnCx<'w, 'a> {
             return Err(e);
         }
         let lambdas = self.lambdas.iter().map(|(lo, t, c)| (*lo, self.resolve(t), c.clone())).collect();
+        // A declared error set must cover what the body can fail with.
+        if let Some(Some(declared)) = def.map(|d| d.errs.clone()) {
+            if !declared.iter().any(|e| e == "Error") {
+                for e in &self.errs {
+                    if !declared.contains(e) {
+                        let d = def.unwrap();
+                        return Err(Diag::new(d.name_span, format!("`{}` can fail with {e}, which its `~T<{}>` doesn't list", d.name, declared.join(" | "))).note("add it, or declare `~T<Error>` (any error)"));
+                    }
+                }
+            }
+        }
+        let errs = self.errs.iter().cloned().collect();
         Ok(TFunc {
             lambdas,
+            errs,
             cname: String::new(),
             src_name: self.fn_name.clone(),
             params,
@@ -989,6 +1053,7 @@ impl<'w, 'a> FnCx<'w, 'a> {
             TStmt::If(c, a, b) => TStmt::If(self.zonk(c), self.zonk_stmts(a), self.zonk_stmts(b)),
             TStmt::Break(e, sp) => TStmt::Break(e.map(|e| self.zonk(e)), sp),
             TStmt::Return(e, sp) => TStmt::Return(e.map(|e| self.zonk(e)), sp),
+            TStmt::Fail(e, sp) => TStmt::Fail(self.zonk(e), sp),
             TStmt::Defer(e) => TStmt::Defer(self.zonk(e)),
             s => s,
         }
@@ -1174,6 +1239,17 @@ impl<'w, 'a> FnCx<'w, 'a> {
                     return Err(Diag::new(s.span, "`break` outside a loop or block"));
                 }
                 TStmt::Break(v.as_ref().map(|v| self.value(v)).transpose()?, s.span)
+            }
+            StmtKind::Fail(v) => {
+                if !self.is_main && !self.fallible_decl {
+                    return Err(Diag::new(s.span, format!("`fail` in `{}`, which isn't fallible: declare it `-> ~T`", self.fn_name)));
+                }
+                if self.in_lambda {
+                    return Err(Diag::new(s.span, "`fail` inside a lambda isn't supported yet"));
+                }
+                let e = self.value(v)?;
+                let e = self.to_error(e)?;
+                TStmt::Fail(e, s.span)
             }
             StmtKind::Return(v) => {
                 if self.is_main {
@@ -1471,10 +1547,30 @@ impl<'w, 'a> FnCx<'w, 'a> {
                 self.under_try = saved;
                 let inner = inner?;
                 if !self.is_main && !self.fallible_decl {
-                    return Err(Diag::new(sp, format!("`try` in `{}`, which isn't fallible: declare it `-> T!`", self.fn_name)));
+                    return Err(Diag::new(sp, format!("`~` in `{}`, which isn't fallible: declare it `-> ~T`", self.fn_name)));
+                }
+                if self.in_lambda {
+                    return Err(Diag::new(sp, "`~` inside a lambda isn't supported yet; handle the result (`unwrap_or`, `rescue`)"));
+                }
+                // A held Result propagates too.
+                if let Ty::Result(t) = self.resolve(&inner.ty) {
+                    self.errs.insert("Error".into());
+                    return Ok(self.mk(TK::Try(Box::new(inner)), *t, sp));
+                }
+                match &inner.kind {
+                    TK::Call(f, _) => {
+                        let errs = self.w.funcs[*f].as_ref().map_or_else(|| vec!["Error".to_string()], |f| f.errs.clone());
+                        self.errs.extend(errs);
+                    }
+                    TK::M(M::FileRead, ..) => {
+                        self.errs.insert("IoError".into());
+                    }
+                    _ => {
+                        self.errs.insert("ArithError".into());
+                    }
                 }
                 if !is_fallible_expr(&inner, self) {
-                    return Err(Diag::new(sp, "`try` needs a fallible call or arithmetic"));
+                    return Err(Diag::new(sp, "`~` needs a fallible call, a `~T` value, or arithmetic"));
                 }
                 let ty = inner.ty.clone();
                 self.mk(TK::Try(Box::new(inner)), ty, sp)
@@ -1639,6 +1735,13 @@ impl<'w, 'a> FnCx<'w, 'a> {
     /// an Int variable needs `.to_f` or `.to_u8`.
     fn coerce(&mut self, e: TExpr, want: &Ty) -> R<TExpr> {
         let want = self.resolve(want);
+        if want == Ty::Error {
+            let et = self.resolve(&e.ty);
+            if let Some(k) = self.w.error_index(&et) {
+                let sp = e.span;
+                return Ok(self.mk(TK::M(M::ToError(k), Some(Box::new(e)), vec![], None), Ty::Error, sp));
+            }
+        }
         // A struct or enum where an interface is wanted is wrapped (Go's implicit conversion).
         if let Ty::Iface(iname) = &want {
             let et = self.resolve(&e.ty);
@@ -1841,6 +1944,51 @@ impl<'w, 'a> FnCx<'w, 'a> {
                                     }
                                 }
                                 self.mk(TK::Bin(BinOp::Eq, Box::new(tag), Box::new(kv)), Ty::Bool, *vsp)
+                            }
+                            None if subj.as_ref().is_some_and(|(_, t)| self.resolve(t) == Ty::Error) => {
+                                // Over an Error: a variant of any error type, or an error type itself.
+                                let l = local(self).unwrap();
+                                let errors = self.w.errors.clone();
+                                if let Some(k) = errors.iter().position(|t| t.type_name() == Some(vn.as_str())) {
+                                    if bs.is_some() {
+                                        return Err(Diag::new(*vsp, format!("`{vn}` is an error type; match its variants to bind fields")));
+                                    }
+                                    self.mk(TK::M(M::ErrIs(k), Some(Box::new(l)), vec![], None), Ty::Bool, *vsp)
+                                } else {
+                                    let hits: Vec<(usize, usize)> = errors.iter().enumerate().filter_map(|(k, t)| match t {
+                                        Ty::Enum(_, vs) => vs.iter().position(|(v, _)| v == vn).map(|j| (k, j)),
+                                        _ => None,
+                                    }).collect();
+                                    let (k, j) = match hits.as_slice() {
+                                        [one] => *one,
+                                        [] => return Err(Diag::new(*vsp, format!("no error type has a variant `{vn}`"))),
+                                        _ => return Err(Diag::new(*vsp, format!("several error types have a variant `{vn}`; match the type first"))),
+                                    };
+                                    let et = errors[k].clone();
+                                    let Ty::Enum(_, vs) = &et else { unreachable!() };
+                                    let fields = vs[j].1.clone();
+                                    let is = self.mk(TK::M(M::ErrIs(k), Some(Box::new(l.clone())), vec![], None), Ty::Bool, *vsp);
+                                    let as_t = self.mk(TK::M(M::ErrAs(k), Some(Box::new(l)), vec![], None), et.clone(), *vsp);
+                                    if let Some(bs) = bs {
+                                        if bs.len() != fields.len() {
+                                            return Err(Diag::new(*vsp, format!("`{vn}` has {} field(s), the pattern binds {}", fields.len(), bs.len())));
+                                        }
+                                        if arm.pats.len() > 1 {
+                                            return Err(Diag::new(*vsp, "an arm with alternatives (`|`) can't bind fields"));
+                                        }
+                                        let base = et.enum_slot(j);
+                                        for (m, ((b, _), (_, ft))) in bs.iter().zip(&fields).enumerate() {
+                                            if b != "_" {
+                                                let get = self.mk(TK::M(M::TupleGet(base + m), Some(Box::new(as_t.clone())), vec![], None), ft.clone(), *vsp);
+                                                binds.push((b.clone(), ft.clone(), get));
+                                            }
+                                        }
+                                    }
+                                    let tag = self.mk(TK::M(M::EnumTag, Some(Box::new(as_t)), vec![], None), Ty::Int, *vsp);
+                                    let jv = self.mk(TK::Int(j as i64), Ty::Int, *vsp);
+                                    let eq = self.mk(TK::Bin(BinOp::Eq, Box::new(tag), Box::new(jv)), Ty::Bool, *vsp);
+                                    self.mk(TK::Bin(BinOp::And, Box::new(is), Box::new(eq)), Ty::Bool, *vsp)
+                                }
                             }
                             None if bs.is_none() => {
                                 let e = Expr { kind: ExprKind::Const(vn.clone()), span: *vsp, id: NodeId::MAX };
@@ -2094,6 +2242,7 @@ impl<'w, 'a> FnCx<'w, 'a> {
             (None, Some((_, r))) => r.clone(),
             (None, None) => self.fresh(),
         };
+        let saved_lambda = std::mem::replace(&mut self.in_lambda, true);
         let saved_ret = std::mem::replace(&mut self.ret, rvar.clone());
         let saved_main = std::mem::replace(&mut self.is_main, false);
         let saved = self.want_hint.take();
@@ -2117,6 +2266,7 @@ impl<'w, 'a> FnCx<'w, 'a> {
         self.want_hint = saved;
         self.ret = saved_ret;
         self.is_main = saved_main;
+        self.in_lambda = saved_lambda;
         let (mut tb, bt) = r?;
         if ret.is_none() && hint.is_none() && !matches!(self.resolve(&bt), Ty::Never) && !self.unify(&rvar, &bt) {
             return Err(Diag::new(sp, format!("this lambda returns {} and {}", self.resolve(&rvar).show(), self.resolve(&bt).show())));
@@ -2185,6 +2335,33 @@ impl<'w, 'a> FnCx<'w, 'a> {
         self.want_hint = saved;
         let v = v?;
         self.coerce(v, &w)
+    }
+
+    /// `fail x`: a Str becomes `Failure.Msg(x)`; an error type's value is wrapped.
+    fn to_error(&mut self, e: TExpr) -> R<TExpr> {
+        let sp = e.span;
+        let t = self.resolve(&e.ty);
+        match &t {
+            Ty::Error => Ok(e),
+            Ty::Str => {
+                let ft = self.w.structs["Failure"].clone();
+                let v = self.mk(TK::M(M::VariantNew(0), None, vec![e], None), ft.clone(), sp);
+                let k = self.w.error_index(&ft).unwrap();
+                Ok(self.mk(TK::M(M::ToError(k), Some(Box::new(v)), vec![], None), Ty::Error, sp))
+            }
+            _ => match self.w.error_index(&t) {
+                Some(k) => Ok(self.mk(TK::M(M::ToError(k), Some(Box::new(e)), vec![], None), Ty::Error, sp)),
+                None => Err(Diag::new(sp, format!("`fail` takes an error (a value of an `error` type) or a message Str, not {}", t.show()))),
+            },
+        }
+        .inspect(|_| {
+            let name = match &t {
+                Ty::Str => "Failure".to_string(),
+                Ty::Error => "Error".to_string(),
+                t => t.type_name().unwrap_or("Error").to_string(),
+            };
+            self.errs.insert(name);
+        })
     }
 
     /// The struct type of `self` in a method.
@@ -2874,11 +3051,10 @@ impl<'w, 'a> FnCx<'w, 'a> {
         if !fallible || self.under_try {
             return Ok(e);
         }
-        if self.is_main {
-            let (ty, sp) = (e.ty.clone(), e.span);
-            return Ok(self.mk(TK::Try(Box::new(e)), ty, sp));
-        }
-        Err(Diag::new(e.span, format!("`{name}` can fail: handle it with `try`")))
+        // Without `~`, a fallible call is a `~T` value.
+        let _ = name;
+        let t = Ty::Result(Box::new(e.ty.clone()));
+        Ok(TExpr { ty: t, ..e })
     }
 
     fn const_call(&mut self, c: &str, csp: Span, name: &str, name_span: Span, args: &[Expr], block: Option<&Block>, sp: Span) -> R<TExpr> {
@@ -3330,6 +3506,42 @@ impl<'w, 'a> FnCx<'w, 'a> {
                 return self.call_def(def, name, name_span, targs, sp);
             }
             return Err(self.no_field(sn, fs, name, name_span));
+        }
+        if rt == Ty::Error {
+            return match (name, args.len()) {
+                ("message" | "to_s", 0) => Ok(mk_m(self, M::ErrMessage, recv, vec![], None, Ty::Str)),
+                ("wrap", 1) => {
+                    let c = self.value(&args[0])?;
+                    self.expect(&c.ty, &Ty::Str, c.span, "`wrap` context")?;
+                    Ok(mk_m(self, M::ErrWrap, recv, vec![c], None, Ty::Error))
+                }
+                _ => Err(Diag::new(name_span, format!("no method `{name}` on Error; it has message, wrap"))),
+            };
+        }
+        if let Ty::Result(t) = &rt {
+            let t = (**t).clone();
+            return match (name, args.len()) {
+                ("ok", 0) => Ok(mk_m(self, M::ResOk, recv, vec![], None, Ty::Opt(Box::new(t)))),
+                ("err", 0) => Ok(mk_m(self, M::ResErr, recv, vec![], None, Ty::Opt(Box::new(Ty::Error)))),
+                ("ok?", 0) => Ok(mk_m(self, M::ResIsOk, recv, vec![], None, Ty::Bool)),
+                ("err?", 0) => {
+                    let ok = mk_m(self, M::ResIsOk, recv, vec![], None, Ty::Bool);
+                    Ok(self.mk(TK::Not(Box::new(ok)), Ty::Bool, sp))
+                }
+                ("unwrap", 0) => Ok(mk_m(self, M::ResUnwrap, recv, vec![], None, t)),
+                ("unwrap_or", 1) => {
+                    let d = self.value(&args[0])?;
+                    let d = self.coerce(d, &t)?;
+                    self.expect(&d.ty, &t, d.span, "`unwrap_or` default")?;
+                    Ok(mk_m(self, M::ResUnwrapOr, recv, vec![d], None, t))
+                }
+                ("rescue", 0) => {
+                    let (blk, bt) = self.any_block(block, bsym, &Ty::Error, sp, name)?;
+                    self.expect(&bt, &t, blk.span, "`rescue` value")?;
+                    Ok(mk_m(self, M::ResRescue, recv, vec![], Some(blk), t))
+                }
+                _ => Err(Diag::new(name_span, format!("no method `{name}` on {}; handle it with `~`, ok, err, unwrap, unwrap_or, rescue", rt.show()))),
+            };
         }
         if let (Ty::Fn(..), "call") = (&rt, name) {
             return self.fn_call(recv, args, sp);
@@ -3818,6 +4030,7 @@ fn occurs(v: u32, t: &Ty) -> bool {
         Ty::Tuple(ts) => ts.iter().any(|t| occurs(v, t)),
         Ty::Map(k, x) => occurs(v, k) || occurs(v, x),
         Ty::Fn(ps, r) => ps.iter().any(|t| occurs(v, t)) || occurs(v, r),
+        Ty::Result(t) => occurs(v, t),
         _ => false,
     }
 }

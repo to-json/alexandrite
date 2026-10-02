@@ -20,6 +20,8 @@ pub struct Opts {
 thread_local! {
     /// Each interface's implementor types (in tag order), for `lty`.
     static IFACES: RefCell<HashMap<String, Vec<Ty>>> = RefCell::new(HashMap::new());
+    /// Every error type (enums), in tag order.
+    static ERRORS: RefCell<Vec<Ty>> = const { RefCell::new(Vec::new()) };
     /// Every lambda literal: (enclosing function, block start, fn type, capture types).
     static LAMBDAS: RefCell<Vec<(String, u32, Ty, Vec<Ty>)>> = const { RefCell::new(Vec::new()) };
 }
@@ -31,6 +33,7 @@ fn lambda_sites(t: &Ty) -> Vec<(usize, Vec<Ty>)> {
 
 pub fn lower(p: &TProgram, sm: &SourceMap, opts: &Opts) -> LProgram {
     IFACES.with(|m| *m.borrow_mut() = p.ifaces.iter().map(|(k, v)| (k.clone(), v.iter().map(|(t, _)| t.clone()).collect())).collect());
+    ERRORS.with(|e| *e.borrow_mut() = p.errors.clone());
     LAMBDAS.with(|l| {
         *l.borrow_mut() = p.funcs.iter().flat_map(|f| f.lambdas.iter().map(move |(lo, t, caps)| (f.cname.clone(), *lo, t.clone(), caps.iter().map(|c| f.locals[*c].ty.clone()).collect()))).collect();
     });
@@ -39,20 +42,42 @@ pub fn lower(p: &TProgram, sm: &SourceMap, opts: &Opts) -> LProgram {
         let lf = if f.external {
             let mut lw = Lw::new(p, sm, opts, f, f.overflow, ErrPath::Return(vec![]), &prog);
             let params = f.params.iter().map(|l| lw.var_of(*l)).collect();
-            LFunc { name: f.cname.clone(), params, vars: lw.vars, ret: lty(&f.ret, f.overflow), fallible: f.fallible, body: vec![], external: true, is_main: false, labels: 0 }
+            LFunc { name: f.cname.clone(), params, vars: lw.vars, ret: fn_ret(f), fallible: false, body: vec![], external: true, is_main: false, labels: 0 }
         } else {
             let path = if f.is_main { ErrPath::Die(vec![]) } else { ErrPath::Return(vec![]) };
             let mut lw = Lw::new(p, sm, opts, f, f.overflow, path, &prog);
+            if f.fallible && !f.is_main {
+                lw.res = Some(ok_lty(lty(&f.ret, f.overflow)));
+            }
             let params: Vec<V> = f.params.iter().map(|l| lw.var_of(*l)).collect();
             lw.analyze_facts(&f.body);
-            let body = lw.body_with_return(&f.body, !f.is_main && f.ret != Ty::Unit);
-            LFunc { name: f.cname.clone(), params, vars: lw.vars, ret: lty(&f.ret, f.overflow), fallible: f.fallible, body, external: false, is_main: f.is_main, labels: lw.labels }
+            let mut body = lw.body_with_return(&f.body, !f.is_main && f.ret != Ty::Unit);
+            if lw.res.is_some() && f.ret == Ty::Unit {
+                // Falling off the end of a fallible def that returns nothing.
+                body.push(LS::Return(Some(lw.ok_result(LE::B(false)))));
+            }
+            LFunc { name: f.cname.clone(), params, vars: lw.vars, ret: fn_ret(f), fallible: false, body, external: false, is_main: f.is_main, labels: lw.labels }
         };
         prog.borrow_mut().funcs.push(lf);
     }
     let mut prog = prog.into_inner();
     prog.uses_pint = p.funcs.iter().any(|f| f.overflow == Overflow::Promote);
     prog
+}
+
+/// A fallible function returns (ok, value, error).
+fn result_lty(ok: LTy, mode: Overflow) -> LTy {
+    LTy::Tup(vec![LTy::Bool, ok_lty(ok), lty(&Ty::Error, mode)])
+}
+
+/// The value slot of a Result (nothing is a Bool placeholder).
+fn ok_lty(t: LTy) -> LTy {
+    if t == LTy::Unit { LTy::Bool } else { t }
+}
+
+fn fn_ret(f: &TFunc) -> LTy {
+    let t = lty(&f.ret, f.overflow);
+    if f.fallible && !f.is_main { result_lty(t, f.overflow) } else { t }
 }
 
 pub fn lty(t: &Ty, mode: Overflow) -> LTy {
@@ -74,6 +99,9 @@ pub fn lty(t: &Ty, mode: Overflow) -> LTy {
         Ty::Unit | Ty::Never | Ty::Yielder(_) | Ty::Var(_) => LTy::Unit,
         Ty::Array(t) | Ty::Fixed(t, _) | Ty::Seq(t, _) => LTy::Arr(Box::new(lty(t, mode))),
         Ty::Map(k, v) => crate::mapgen::map_ty(&lty(k, mode), &lty(v, mode)),
+        // Error: (type tag, location, wrap context, then each error type's value).
+        Ty::Error => LTy::Tup([LTy::I64, LTy::Str, LTy::Str].into_iter().chain(ERRORS.with(|e| e.borrow().clone()).iter().map(|t| lty(t, mode))).collect()),
+        Ty::Result(t) => result_lty(lty(t, mode), mode),
         Ty::Fn(..) => LTy::Tup(std::iter::once(LTy::I64).chain(lambda_sites(t).iter().map(|(_, caps)| LTy::Tup(caps.iter().map(|c| lty(c, mode)).collect()))).collect()),
         Ty::Iface(n) => {
             let impls = IFACES.with(|m| m.borrow().get(n).cloned().unwrap_or_default());
@@ -116,6 +144,8 @@ struct Lw<'a> {
     fixed_len: HashMap<LocalId, i64>,
     facts: HashMap<LocalId, Fact>,
     prog: &'a RefCell<LProgram>,
+    /// In a fallible function: the ok value's type (returns are wrapped).
+    res: Option<LTy>,
 }
 
 /// A stage of a pipeline with its pre-loop state.
@@ -147,6 +177,7 @@ impl<'a> Lw<'a> {
             fixed_len: HashMap::new(),
             facts: HashMap::new(),
             prog,
+            res: None,
         }
     }
 
@@ -330,6 +361,7 @@ impl<'a> Lw<'a> {
                             v = lw.bind(v, t);
                             lw.emit_defers(0);
                         }
+                        let v = if lw.res.is_some() { lw.ok_result(v) } else { v };
                         lw.emit(LS::Return(Some(v)));
                         continue;
                     }
@@ -463,7 +495,17 @@ impl<'a> Lw<'a> {
                     v = v.map(|(x, t)| (self.bind(x, t.clone()), t));
                     self.emit_defers(0);
                 }
-                self.emit(LS::Return(v.map(|(x, _)| x)));
+                let v = v.map(|(x, _)| x);
+                let v = match (&self.res, v) {
+                    (Some(_), v) => Some(self.ok_result(v.unwrap_or(LE::B(false)))),
+                    (None, v) => v,
+                };
+                self.emit(LS::Return(v));
+            }
+            TStmt::Fail(e, _) => {
+                let v = self.expr(e);
+                let v = self.bind(v, self.lty(&Ty::Error));
+                self.fail(v);
             }
             TStmt::Defer(e) => {
                 if self.defers.is_empty() {
@@ -536,10 +578,7 @@ impl<'a> Lw<'a> {
                 if self.promote() {
                     LE::PArith(Op::Sub, Box::new(LE::ToP(Box::new(LE::I(0)))), Box::new(v))
                 } else if self.try_arith {
-                    let dst = self.tmp(LTy::I64);
-                    let path = self.err_path();
-                    self.emit(LS::TryArith { dst, op: Op::Sub, a: LE::I(0), b: v, loc: self.loc(e.span), path });
-                    LE::Var(dst)
+                    self.checked_arith(Op::Sub, LE::I(0), v, e.span)
                 } else {
                     LE::Neg(Box::new(v), self.ovf(e.span))
                 }
@@ -634,7 +673,7 @@ impl<'a> Lw<'a> {
             TK::Try(inner) => self.try_expr(inner),
             TK::Puts(x) => {
                 let v = self.expr(x);
-                if matches!(x.ty, Ty::Opt(_) | Ty::Map(..) | Ty::Array(_) | Ty::Fixed(..) | Ty::Struct(..) | Ty::Tuple(_) | Ty::Enum(..) | Ty::Iface(_)) {
+                if matches!(x.ty, Ty::Opt(_) | Ty::Map(..) | Ty::Array(_) | Ty::Fixed(..) | Ty::Struct(..) | Ty::Tuple(_) | Ty::Enum(..) | Ty::Iface(_) | Ty::Error) {
                     let s = self.to_s(v, &x.ty);
                     self.emit(LS::Puts(s, LTy::Str));
                     return LE::Unit;
@@ -827,6 +866,159 @@ impl<'a> Lw<'a> {
         }
     }
 
+    /// A successful Result of this function's type.
+    fn ok_result(&mut self, v: LE) -> LE {
+        let ok = self.res.clone().expect("in a fallible function");
+        let rt = result_lty(ok.clone(), self.mode);
+        let et = self.lty(&Ty::Error);
+        LE::Tup(rt, vec![LE::B(true), v, zero_le(&et)])
+    }
+
+    /// Leave with error `err` (an Error value): return it from a fallible
+    /// function, or print it and exit 1 at the top level.
+    fn fail(&mut self, err: LE) {
+        let path = self.err_path();
+        self.block(path.cleanup());
+        match (&path, self.res.clone()) {
+            (ErrPath::Return(_), Some(ok)) => {
+                let rt = result_lty(ok.clone(), self.mode);
+                self.emit(LS::Return(Some(LE::Tup(rt, vec![LE::B(false), zero_le(&ok), err]))));
+            }
+            _ => {
+                let msg = self.error_message(err.clone());
+                let loc = LE::Field(Box::new(err), 1);
+                self.emit(LS::Die(LE::Rt(Rt::StrCat, vec![LE::S("error: ".into()), msg, LE::S(" (".into()), loc, LE::S(")".into())])));
+            }
+        }
+    }
+
+    fn block(&mut self, ss: &[LS]) {
+        for s in ss {
+            self.emit(s.clone());
+        }
+    }
+
+    fn fail_if(&mut self, cond: LE, err: LE) {
+        let body = self.sub(|lw| {
+            let e = lw.bind(err, lw.lty(&Ty::Error));
+            lw.fail(e);
+        });
+        self.emit(LS::If(cond, body, vec![]));
+    }
+
+    /// If Result `r` failed, propagate its error.
+    fn unwrap_result(&mut self, r: LE) {
+        let err = LE::Field(Box::new(r.clone()), 2);
+        let body = self.sub(|lw| lw.fail(err));
+        self.emit(LS::If(LE::Not(Box::new(LE::Field(Box::new(r), 0))), body, vec![]));
+    }
+
+    /// An Error holding `v`, a value of error type `k`, raised at `sp`.
+    fn error_value(&mut self, k: usize, v: LE, sp: Span) -> LE {
+        let et = self.lty(&Ty::Error);
+        let LTy::Tup(ts) = &et else { unreachable!() };
+        let mut fields = vec![LE::I(k as i64), LE::S(self.loc(sp)), LE::S(String::new())];
+        for (j, t) in ts[3..].iter().enumerate() {
+            fields.push(if j == k { v.clone() } else { zero_le(t) });
+        }
+        LE::Tup(et, fields)
+    }
+
+    /// An Error of builtin type `ty`, variant `j`.
+    fn make_error(&mut self, ty: &str, j: usize, vals: Vec<LE>, sp: Span) -> LE {
+        let errors = ERRORS.with(|e| e.borrow().clone());
+        let k = errors.iter().position(|t| t.type_name() == Some(ty)).expect("builtin error");
+        let Ty::Enum(_, vs) = &errors[k] else { unreachable!() };
+        let et = self.lty(&errors[k]);
+        let mut slots = vec![LE::I(j as i64)];
+        let mut vals = vals.into_iter();
+        for (vk, (_, fs)) in vs.iter().enumerate() {
+            for (_, ft) in fs {
+                slots.push(if vk == j { vals.next().unwrap() } else { zero_le(&self.lty(ft)) });
+            }
+        }
+        let v = LE::Tup(et, slots);
+        self.error_value(k, v, sp)
+    }
+
+    /// File.read's error for status `st` (1 = not found, else failed).
+    fn io_error(&mut self, st: LE, path: LE, sp: Span) -> LE {
+        let nf = self.make_error("IoError", 0, vec![path.clone()], sp);
+        let failed = self.make_error("IoError", 1, vec![path], sp);
+        LE::Cond(Box::new(LE::Cmp(Op::Eq, Box::new(st), Box::new(LE::I(1)), LTy::I64)), Box::new(nf), Box::new(failed))
+    }
+
+    /// `a op b` under `~`: overflow becomes an ArithError.
+    fn checked_arith(&mut self, op: Op, a: LE, b: LE, sp: Span) -> LE {
+        let a = self.bind(a, LTy::I64);
+        let b = self.bind(b, LTy::I64);
+        let r = self.tmp(LTy::I64);
+        self.emit(LS::Set(r, LE::Arith(op, Box::new(a.clone()), Box::new(b.clone()), Ovf::Wrap)));
+        let neg = |x: LE| LE::Cmp(Op::Lt, Box::new(x), Box::new(LE::I(0)), LTy::I64);
+        let xor = |x: LE, y: LE| LE::Prim(Prim::Xor, vec![x, y]);
+        let and = |x: LE, y: LE| LE::Prim(Prim::And, vec![x, y]);
+        let rv = LE::Var(r);
+        let cond = match op {
+            Op::Add => neg(and(xor(a.clone(), rv.clone()), xor(b.clone(), rv.clone()))),
+            Op::Sub => neg(and(xor(a.clone(), b.clone()), xor(a.clone(), rv.clone()))),
+            _ => {
+                // a != 0 && (a == -1 ? b == MIN : r / a != b)
+                let eq = |x: LE, y: LE| LE::Cmp(Op::Eq, Box::new(x), Box::new(y), LTy::I64);
+                let div = LE::Arith(Op::Div, Box::new(rv.clone()), Box::new(a.clone()), Ovf::Unchecked);
+                let inner = LE::Cond(Box::new(eq(a.clone(), LE::I(-1))), Box::new(eq(b.clone(), LE::I(i64::MIN))), Box::new(LE::Not(Box::new(eq(div, b.clone())))));
+                LE::Cond(Box::new(eq(a.clone(), LE::I(0))), Box::new(LE::B(false)), Box::new(inner))
+            }
+        };
+        let err = self.make_error("ArithError", 0, vec![], sp);
+        self.fail_if(cond, err);
+        rv
+    }
+
+    /// An Error's message (wrap context first), via a generated function.
+    fn error_message(&mut self, e: LE) -> LE {
+        let name = "__error_message".to_string();
+        let exists = self.prog.borrow().funcs.iter().any(|f| f.name == name);
+        if !exists {
+            let et = self.lty(&Ty::Error);
+            // Reserve the name first (to_s of an error may need it).
+            self.prog.borrow_mut().funcs.push(LFunc { name: name.clone(), params: vec![], vars: vec![], ret: LTy::Str, fallible: false, body: vec![], external: false, is_main: false, labels: 0 });
+            let mut w = Lw::new(self.p, self.sm, self.opts, self.f, self.mode, ErrPath::Die(vec![]), self.prog);
+            let pe = w.new_var("e", et);
+            let s = w.new_var("s", LTy::Str);
+            let errors = ERRORS.with(|x| x.borrow().clone());
+            let mut body = vec![LS::Set(s, LE::S(String::new()))];
+            for (k, t) in errors.iter().enumerate() {
+                let v = LE::Field(Box::new(LE::Var(pe)), 3 + k);
+                let arm = w.sub(|w| {
+                    let m = match (w.p.messages.get(&k), t.type_name().unwrap_or("")) {
+                        (Some(&fid), _) => LE::Call(w.p.funcs[fid].cname.clone(), vec![v.clone()]),
+                        (None, "IoError") => {
+                            let p = LE::Field(Box::new(v.clone()), 1);
+                            let p2 = LE::Field(Box::new(v.clone()), 2);
+                            let tag = LE::Field(Box::new(v.clone()), 0);
+                            LE::Cond(
+                                Box::new(LE::Cmp(Op::Eq, Box::new(tag), Box::new(LE::I(0)), LTy::I64)),
+                                Box::new(LE::Rt(Rt::StrCat, vec![LE::S("File.read: no such file `".into()), p, LE::S("`".into())])),
+                                Box::new(LE::Rt(Rt::StrCat, vec![LE::S("File.read: cannot read `".into()), p2, LE::S("`".into())])),
+                            )
+                        }
+                        (None, "ArithError") => LE::Cond(Box::new(LE::Cmp(Op::Eq, Box::new(LE::Field(Box::new(v.clone()), 0)), Box::new(LE::I(0)), LTy::I64)), Box::new(LE::S("overflow".into())), Box::new(LE::S("division by zero".into()))),
+                        (None, "Failure") => LE::Field(Box::new(v.clone()), 1),
+                        (None, _) => w.to_s(v.clone(), t),
+                    };
+                    w.emit(LS::Set(s, m));
+                });
+                body.push(LS::If(LE::Cmp(Op::Eq, Box::new(LE::Field(Box::new(LE::Var(pe)), 0)), Box::new(LE::I(k as i64)), LTy::I64), arm, vec![]));
+            }
+            body.push(LS::Return(Some(LE::Rt(Rt::StrCat, vec![LE::Field(Box::new(LE::Var(pe)), 2), LE::Var(s)]))));
+            let func = LFunc { name: name.clone(), params: vec![pe], vars: std::mem::take(&mut w.vars), ret: LTy::Str, fallible: false, body, external: false, is_main: false, labels: w.labels };
+            let mut prog = self.prog.borrow_mut();
+            let slot = prog.funcs.iter().position(|f| f.name == name).unwrap();
+            prog.funcs[slot] = func;
+        }
+        LE::Call(name, vec![e])
+    }
+
     /// The code point of the `cl`-byte UTF-8 sequence at `s[i]`.
     fn decode_rune(&mut self, s: &LE, i: V, cl: V) -> LE {
         let byte = |k: i64| {
@@ -904,19 +1096,39 @@ impl<'a> Lw<'a> {
         let path = self.err_path();
         match &inner.kind {
             TK::Call(fid, args) => {
+                let _ = path;
                 let f = &self.p.funcs[*fid];
                 let name = f.cname.clone();
-                let ret = self.lty(&f.ret);
+                let rt = fn_ret(f);
+                let unit = f.ret == Ty::Unit;
                 let args = args.iter().map(|a| self.arg(a)).collect();
-                let dst = if ret == LTy::Unit { None } else { Some(self.tmp(ret)) };
-                self.emit(LS::TryCall { dst, f: name, args, path });
-                dst.map_or(LE::Unit, LE::Var)
+                let r = self.tmp(rt);
+                self.emit(LS::Set(r, LE::Call(name, args)));
+                self.unwrap_result(LE::Var(r));
+                if unit { LE::Unit } else { LE::Field(Box::new(LE::Var(r)), 1) }
             }
             TK::M(M::FileRead, None, args, _) => {
+                let _ = path;
                 let p = self.expr(&args[0]);
-                let dst = self.tmp(LTy::Str);
-                self.emit(LS::TryRead { dst, path_arg: p, loc: self.loc(inner.span), path });
-                LE::Var(dst)
+                let p = self.bind(p, LTy::Str);
+                let st = self.tmp(LTy::I64);
+                self.emit(LS::Set(st, LE::Rt(Rt::FileStatus, vec![p.clone()])));
+                let err = self.io_error(LE::Var(st), p.clone(), inner.span);
+                let body = self.sub(|lw| {
+                    let e = lw.bind(err, lw.lty(&Ty::Error));
+                    lw.fail(e);
+                });
+                self.emit(LS::If(LE::Cmp(Op::Ne, Box::new(LE::Var(st)), Box::new(LE::I(0)), LTy::I64), body, vec![]));
+                LE::Rt(Rt::FileRead, vec![p])
+            }
+            _ if matches!(inner.ty, Ty::Result(_)) => {
+                let _ = path;
+                let Ty::Result(t) = &inner.ty else { unreachable!() };
+                let unit = **t == Ty::Unit;
+                let v = self.expr(inner);
+                let v = self.bind(v, self.lty(&inner.ty));
+                self.unwrap_result(v.clone());
+                if unit { LE::Unit } else { LE::Field(Box::new(v), 1) }
             }
             _ => {
                 let saved = std::mem::replace(&mut self.try_arith, true);
@@ -1013,10 +1225,7 @@ impl<'a> Lw<'a> {
             BinOp::Add | BinOp::Sub | BinOp::Mul if wrap_mode => wrap_to(k, LE::Arith(lop, Box::new(a), Box::new(b), Ovf::Wrap)),
             _ if k == IntKind::I64 => {
                 if self.try_arith {
-                    let dst = self.tmp(LTy::I64);
-                    let path = self.err_path();
-                    self.emit(LS::TryArith { dst, op: lop, a, b, loc: self.loc(sp), path });
-                    return LE::Var(dst);
+                    return self.checked_arith(lop, a, b, sp);
                 }
                 if proven {
                     return LE::Arith(lop, Box::new(a), Box::new(b), Ovf::Unchecked);
@@ -1049,8 +1258,8 @@ impl<'a> Lw<'a> {
                 let b = self.bind(b, LTy::I64);
                 let zero = LE::Cmp(Op::Eq, Box::new(b.clone()), Box::new(LE::I(0)), LTy::I64);
                 if self.try_arith {
-                    let path = self.err_path();
-                    self.emit(LS::FailIf { cond: zero, loc: self.loc(sp), path });
+                    let err = self.make_error("ArithError", 1, vec![], sp);
+                    self.fail_if(zero, err);
                 } else {
                     self.emit(LS::If(zero, vec![LS::Panic("division by zero".into(), self.loc(sp))], vec![]));
                 }
@@ -1100,8 +1309,9 @@ impl<'a> Lw<'a> {
     fn overflow_if(&mut self, cond: LE, k: IntKind, sp: Span) {
         let loc = self.loc(sp);
         if self.try_arith {
-            let path = self.err_path();
-            self.emit(LS::FailIf { cond, loc, path });
+            let _ = loc;
+            let err = self.make_error("ArithError", 0, vec![], sp);
+            self.fail_if(cond, err);
         } else {
             self.emit(LS::If(cond, vec![LS::Panic(format!("overflow ({})", k.name()), loc)], vec![]));
         }
@@ -1255,6 +1465,9 @@ impl<'a> Lw<'a> {
     fn to_s(&mut self, v: LE, t: &Ty) -> LE {
         if let Some(&fid) = self.p.stringers.get(&t.show()) {
             return LE::Call(self.p.funcs[fid].cname.clone(), vec![v]);
+        }
+        if *t == Ty::Error {
+            return self.error_message(v);
         }
         match t {
             Ty::Opt(inner) => {
@@ -1751,7 +1964,77 @@ impl<'a> Lw<'a> {
                 LE::Unit
             }
             EnumNew => self.generator(e, blk.unwrap()),
-            FileRead => unreachable!("File.read is always under try"),
+            FileRead => {
+                // Without `~`: a `~Str` value.
+                let p = self.expr(&args[0]);
+                let p = self.bind(p, LTy::Str);
+                let st = self.tmp(LTy::I64);
+                self.emit(LS::Set(st, LE::Rt(Rt::FileStatus, vec![p.clone()])));
+                let ok = LE::Cmp(Op::Eq, Box::new(LE::Var(st)), Box::new(LE::I(0)), LTy::I64);
+                let err = self.io_error(LE::Var(st), p.clone(), sp);
+                let et = self.lty(&Ty::Error);
+                let rt = self.lty(&e.ty);
+                LE::Tup(rt, vec![ok.clone(), LE::Cond(Box::new(ok.clone()), Box::new(LE::Rt(Rt::FileRead, vec![p])), Box::new(LE::S(String::new()))), LE::Cond(Box::new(ok), Box::new(zero_le(&et)), Box::new(err))])
+            }
+            ToError(k) => {
+                let v = self.arg(recv.unwrap());
+                self.error_value(k, v, sp)
+            }
+            ErrMessage => {
+                let v = self.expr(recv.unwrap());
+                self.error_message(v)
+            }
+            ErrWrap => {
+                let et = self.lty(&Ty::Error);
+                let v = self.expr(recv.unwrap());
+                let v = self.bind(v, et.clone());
+                let c = self.expr(&args[0]);
+                let LTy::Tup(ts) = &et else { unreachable!() };
+                let fields = (0..ts.len()).map(|i| if i == 2 { LE::Rt(Rt::StrCat, vec![c.clone(), LE::S(": ".into()), LE::Field(Box::new(v.clone()), 2)]) } else { LE::Field(Box::new(v.clone()), i) }).collect();
+                LE::Tup(et, fields)
+            }
+            ErrIs(k) => {
+                let v = self.expr(recv.unwrap());
+                LE::Cmp(Op::Eq, Box::new(LE::Field(Box::new(v), 0)), Box::new(LE::I(k as i64)), LTy::I64)
+            }
+            ErrAs(k) => {
+                let v = self.expr(recv.unwrap());
+                LE::Field(Box::new(v), 3 + k)
+            }
+            ResOk | ResErr | ResIsOk | ResUnwrap | ResUnwrapOr | ResRescue => {
+                let r = recv.unwrap();
+                let rv = self.expr(r);
+                let rv = self.bind(rv, self.lty(&r.ty));
+                let ok = LE::Field(Box::new(rv.clone()), 0);
+                let val = LE::Field(Box::new(rv.clone()), 1);
+                let err = LE::Field(Box::new(rv.clone()), 2);
+                match m {
+                    ResIsOk => ok,
+                    ResOk => LE::Tup(self.lty(&e.ty), vec![ok, val]),
+                    ResErr => LE::Tup(self.lty(&e.ty), vec![LE::Not(Box::new(ok)), err]),
+                    ResUnwrapOr => {
+                        let d = self.expr(&args[0]);
+                        LE::Cond(Box::new(ok), Box::new(val), Box::new(d))
+                    }
+                    ResUnwrap => {
+                        let msg = self.error_message(err);
+                        let die = LS::Die(LE::Rt(Rt::StrCat, vec![LE::S("unwrap of an error: ".into()), msg, LE::S(format!(" ({})", self.loc(sp)))]));
+                        self.emit(LS::If(LE::Not(Box::new(ok)), vec![die], vec![]));
+                        val
+                    }
+                    _ => {
+                        let out = self.tmp(self.lty(&e.ty));
+                        self.emit(LS::Set(out, val));
+                        let b = blk.unwrap();
+                        let body = self.sub(|lw| {
+                            let v = lw.inline_block(b, &[err], &[], None);
+                            lw.emit(LS::Set(out, v));
+                        });
+                        self.emit(LS::If(LE::Not(Box::new(ok)), body, vec![]));
+                        LE::Var(out)
+                    }
+                }
+            }
             _ => unreachable!("stage {m:?} used as a value; the checker materializes these"),
         }
     }
@@ -2442,21 +2725,45 @@ impl<'a> Lw<'a> {
             LTy::Arr(t) => *t,
             _ => unreachable!(),
         };
+        // A block using `~` returns a Result per element; the first error
+        // propagates after all workers finish.
+        let fallible = format!("{:?}", b.body).contains("Try(");
         let mut w = Lw::new(self.p, self.sm, self.opts, self.f, self.mode, ErrPath::Return(vec![]), self.prog);
+        if fallible {
+            w.res = Some(ok_lty(out_ty.clone()));
+        }
         let param = w.new_var("x", in_ty.clone());
         let (body_stmts, v) = w.sub_val(|w| w.inline_block(b, &[LE::Var(param)], &[], None));
         let mut body = body_stmts;
+        let v = if fallible { w.ok_result(v) } else { v };
         body.push(LS::Return(Some(v)));
-        let fallible = contains_try(&body);
+        let wret = if fallible { result_lty(out_ty.clone(), self.mode) } else { out_ty.clone() };
         let mut prog = self.prog.borrow_mut();
         let id = prog.workers.len();
-        let func = LFunc { name: format!("worker{id}"), params: vec![param], vars: std::mem::take(&mut w.vars), ret: out_ty.clone(), fallible, body, external: false, is_main: false, labels: w.labels };
+        let func = LFunc { name: format!("worker{id}"), params: vec![param], vars: std::mem::take(&mut w.vars), ret: wret.clone(), fallible: false, body, external: false, is_main: false, labels: w.labels };
         prog.workers.push(LWorker { id, input: in_ty, func });
         drop(prog);
-        let dst = self.tmp(LTy::Arr(Box::new(out_ty)));
+        let dst = self.tmp(LTy::Arr(Box::new(wret)));
         let path = self.err_path();
         self.emit(LS::Pmap { dst, arr, worker: id, path });
-        LE::Var(dst)
+        if !fallible {
+            return LE::Var(dst);
+        }
+        let out = self.tmp(LTy::Arr(Box::new(out_ty.clone())));
+        self.emit(LS::Set(out, LE::ArrWithCap(out_ty, Box::new(LE::Len(Box::new(LE::Var(dst)))))));
+        let i = self.tmp(LTy::I64);
+        self.emit(LS::Set(i, LE::I(0)));
+        let l = self.label();
+        let body = self.sub(|lw| {
+            lw.emit(LS::If(LE::Cmp(Op::Ge, Box::new(LE::Var(i)), Box::new(LE::Len(Box::new(LE::Var(dst)))), LTy::I64), vec![LS::Break(l)], vec![]));
+            let r = LE::Index { arr: Box::new(LE::Var(dst)), idx: Box::new(LE::Var(i)), check: None };
+            let r = lw.bind(r, lw.vars[dst].ty.clone().arr_elem_lty());
+            lw.unwrap_result(r.clone());
+            lw.emit(LS::Push(out, LE::Field(Box::new(r), 1)));
+            lw.emit(LS::Set(i, LE::Arith(Op::Add, Box::new(LE::Var(i)), Box::new(LE::I(1)), Ovf::Unchecked)));
+        });
+        self.emit(LS::Loop(l, body));
+        LE::Var(out)
     }
 }
 

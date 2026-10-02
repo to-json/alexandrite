@@ -107,6 +107,9 @@ pub struct Def {
     pub params: Vec<Param>,
     pub ret: Option<TypeExpr>,
     pub fallible: bool,
+    /// A fallible def's error set: None = inferred (`~T`), names otherwise
+    /// (`~T<ParseError | IoError>`; `Error` = open).
+    pub errs: Option<Vec<String>>,
     pub pure: bool,
     pub body: Vec<Stmt>,
 }
@@ -149,6 +152,8 @@ pub enum Bound {
 pub struct EnumDef {
     pub name: String,
     pub span: Span,
+    /// Declared with `error`: its values are errors (they convert to `Error`).
+    pub error: bool,
     pub tparams: Vec<TParam>,
     pub variants: Vec<(String, Vec<(String, TypeExpr, Span)>, Span)>,
 }
@@ -188,6 +193,8 @@ pub enum TypeExpr {
     Fixed(Box<TypeExpr>, Box<Expr>, Span),
     /// `Name[T, ...]`: a generic type applied (`Map[Str, Int]`).
     App(String, Vec<TypeExpr>, Span),
+    /// `~T`, `~T<E | F>`: a fallible T (a Result value when held).
+    Result(Box<TypeExpr>, Option<Vec<String>>, Span),
     /// `(A, B) -> R`: a function value (a lambda).
     Fn(Vec<TypeExpr>, Box<TypeExpr>, Span),
 }
@@ -210,6 +217,8 @@ pub enum StmtKind {
     Next,
     Break(Option<Expr>),
     Return(Option<Expr>),
+    /// `fail e`: return error `e` from a fallible def.
+    Fail(Expr),
     /// `defer e`: run when the enclosing block exits.
     Defer(Expr),
 }

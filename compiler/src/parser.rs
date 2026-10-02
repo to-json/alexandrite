@@ -19,6 +19,7 @@ fn generic_self(methods: &mut [Def]) {
 
 /// A def whose body may be missing (an interface's required method).
 pub struct DefSig {
+    pub errs: Option<Vec<String>>,
     pub name: String,
     pub span: Span,
     pub tparams: Vec<TParam>,
@@ -148,6 +149,11 @@ impl<'a> Parser<'a> {
                     let e = self.enum_def(&mut m.defs)?;
                     m.enums.push(e);
                 }
+                Tok::Ident(kw) if kw == "error" && matches!(self.peek_at(1), Tok::Const(_)) => {
+                    let mut e = self.enum_def(&mut m.defs)?;
+                    e.error = true;
+                    m.enums.push(e);
+                }
                 Tok::Kw(Kw::Interface) => {
                     let i = self.iface_def(&mut m.defs)?;
                     m.ifaces.push(i);
@@ -179,7 +185,7 @@ impl<'a> Parser<'a> {
     fn def_in(&mut self, owner: Option<&str>) -> PResult<Def> {
         let d = self.def_sig(owner.map(|o| (o, false)))?;
         let Some(body) = d.body else { unreachable!("a body is required outside interfaces") };
-        Ok(Def { name: d.name, span: d.span, tparams: d.tparams, name_span: d.name_span, params: d.params, ret: d.ret, fallible: d.fallible, pure: d.pure, body })
+        Ok(Def { name: d.name, span: d.span, tparams: d.tparams, name_span: d.name_span, params: d.params, ret: d.ret, fallible: d.fallible, errs: d.errs, pure: d.pure, body })
     }
 
     /// A def's signature and body. In an interface (`owner.1`), `self` is
@@ -242,12 +248,24 @@ impl<'a> Parser<'a> {
             }
             self.expect_op(")")?;
         }
-        let (mut ret, mut fallible) = (None, false);
+        let (mut ret, mut fallible, mut errs) = (None, false, None);
         if self.eat_op("->") {
-            ret = Some(self.type_expr()?);
-            if self.eat_op("!") {
-                fallible = true;
+            match self.type_expr()? {
+                TypeExpr::Result(t, e, _) => {
+                    fallible = true;
+                    errs = e;
+                    ret = Some(*t);
+                }
+                t => ret = Some(t),
             }
+            if self.is_op("!") {
+                return Err(Diag::new(self.span(), "a fallible return type is now written `-> ~T` (or `-> ~T<ErrorType>`)"));
+            }
+        } else if self.is_op("~") {
+            // `def f ~ { }`: fallible, returning nothing.
+            self.bump();
+            fallible = true;
+            ret = None;
         }
         let body = if in_iface && !self.is_op("{") {
             None
@@ -255,7 +273,7 @@ impl<'a> Parser<'a> {
             Some(self.braced_stmts()?)
         };
         self.scopes.pop();
-        Ok(DefSig { name, span: start.to(self.prev_span()), tparams, name_span, params, ret, fallible, pure, body })
+        Ok(DefSig { name, span: start.to(self.prev_span()), tparams, name_span, params, ret, fallible, errs, pure, body })
     }
 
     /// `[T, U: Shape, N: like Int]` after a type or def name (no space before `[`).
@@ -318,7 +336,7 @@ impl<'a> Parser<'a> {
             let short = d.name.rsplit_once('.').map_or(d.name.clone(), |(_, m)| m.to_string());
             methods.push((short, d.params[1..].to_vec(), d.ret.clone(), has_body, d.name_span));
             if let Some(body) = d.body {
-                defaults.push(Def { name: d.name, span: d.span, tparams: d.tparams, name_span: d.name_span, params: d.params, ret: d.ret, fallible: d.fallible, pure: d.pure, body });
+                defaults.push(Def { name: d.name, span: d.span, tparams: d.tparams, name_span: d.name_span, params: d.params, ret: d.ret, fallible: d.fallible, errs: d.errs, pure: d.pure, body });
             }
         }
         Ok(IfaceDef { name, span: start.to(self.prev_span()), methods })
@@ -381,7 +399,7 @@ impl<'a> Parser<'a> {
         if !tparams.is_empty() {
             generic_self(&mut methods[first_method..]);
         }
-        Ok(EnumDef { name, span: start.to(self.prev_span()), tparams, variants })
+        Ok(EnumDef { name, span: start.to(self.prev_span()), error: false, tparams, variants })
     }
 
     fn struct_def(&mut self, methods: &mut Vec<Def>) -> PResult<StructDef> {
@@ -427,6 +445,28 @@ impl<'a> Parser<'a> {
 
     fn type_expr(&mut self) -> PResult<TypeExpr> {
         let sp = self.span();
+        if self.eat_op("~") {
+            let t = self.type_expr()?;
+            let errs = if self.is_op("<") && !self.space_before() {
+                self.bump();
+                let mut es = vec![];
+                loop {
+                    let esp = self.span();
+                    match self.bump().tok {
+                        Tok::Const(n) => es.push(n),
+                        t => return Err(Diag::new(esp, format!("expected an error type, found {}", describe(&t)))),
+                    }
+                    if !self.eat_op("|") {
+                        break;
+                    }
+                }
+                self.expect_op(">")?;
+                Some(es)
+            } else {
+                None
+            };
+            return Ok(TypeExpr::Result(Box::new(t), errs, sp.to(self.prev_span())));
+        }
         if self.is_op("(") {
             // `(A, B) -> R`
             self.bump();
@@ -519,6 +559,10 @@ impl<'a> Parser<'a> {
             Tok::Kw(Kw::Return) => {
                 self.bump();
                 StmtKind::Return(if self.at_stmt_end() { None } else { Some(self.expr()?) })
+            }
+            Tok::Ident(n) if n == "fail" && !self.is_local("fail") && !matches!(self.peek_at(1), Tok::Op("(") | Tok::Op("=")) => {
+                self.bump();
+                StmtKind::Fail(self.expr()?)
             }
             Tok::Kw(Kw::Def) | Tok::Kw(Kw::Fn) | Tok::Attr(_) => return Err(Diag::new(start, "methods can only be defined at the top level")),
             Tok::Kw(Kw::Defer) => {
@@ -931,10 +975,19 @@ impl<'a> Parser<'a> {
             return Ok(self.mk(ExprKind::BitNot(Box::new(e)), full));
         }
         if self.is_kw(Kw::Try) {
+            return Err(Diag::new(self.span(), "`try` is now `~`: `~f(x)`, `x.~m(y)`, `~(a * b)`"));
+        }
+        if self.is_op("~") {
+            // `~f(x)`, `~File.read(p)`, `~(a * b)`, `~r`: the `~` takes the
+            // next call (not the whole chain); the chain continues after it.
             let sp = self.bump().span;
-            let e = self.unary()?;
+            let mut e = self.primary()?;
+            if matches!(e.kind, ExprKind::Const(_) | ExprKind::TypeApp(..)) && self.is_op(".") {
+                e = self.postfix_step(e)?.expect("a `.` step");
+            }
             let full = sp.to(e.span);
-            return Ok(self.mk(ExprKind::Try(Box::new(e)), full));
+            let t = self.mk(ExprKind::Try(Box::new(e)), full);
+            return self.postfix_from(t);
         }
         if self.is_op("!") {
             return self.not();
@@ -953,8 +1006,53 @@ impl<'a> Parser<'a> {
     }
 
     fn postfix(&mut self) -> PResult<Expr> {
-        let mut e = self.primary()?;
+        let e = self.primary()?;
+        self.postfix_from(e)
+    }
+
+    /// One `.name(args)` step, if one follows.
+    /// After `.~`: the call.
+    fn postfix_step_named(&mut self, e: Expr) -> PResult<Expr> {
+        self.bump(); // `~`
+        let name_span = self.span();
+        let name = match self.bump().tok {
+            Tok::Ident(n) => n,
+            t => return Err(Diag::new(name_span, format!("expected a method name after `.~`, found {}", describe(&t)))),
+        };
+        let (args, block_sym) = if self.is_op("(") && !self.space_before() { self.call_args()? } else { (vec![], None) };
+        let block = self.maybe_block()?;
+        let sp = e.span.to(self.prev_span());
+        Ok(self.mk(ExprKind::Call { recv: Some(Box::new(e)), name, name_span, args, block, block_sym }, sp))
+    }
+
+    fn postfix_step(&mut self, e: Expr) -> PResult<Option<Expr>> {
+        if !self.is_op(".") {
+            return Ok(None);
+        }
+        self.bump();
+        self.skip_line_continuation();
+        let name_span = self.span();
+        let name = match self.bump().tok {
+            Tok::Ident(n) | Tok::Const(n) => n,
+            t => return Err(Diag::new(name_span, format!("expected a method name after `.`, found {}", describe(&t)))),
+        };
+        let (args, block_sym) = if self.is_op("(") && !self.space_before() { self.call_args()? } else { (vec![], None) };
+        let block = self.maybe_block()?;
+        let sp = e.span.to(self.prev_span());
+        Ok(Some(self.mk(ExprKind::Call { recv: Some(Box::new(e)), name, name_span, args, block, block_sym }, sp)))
+    }
+
+    fn postfix_from(&mut self, mut e: Expr) -> PResult<Expr> {
         loop {
+            if self.is_op(".") && matches!(self.peek_at(1), Tok::Op("~")) {
+                // `x.~m(y)`: propagate this call's error.
+                let tsp = self.toks[self.pos + 1].span;
+                self.bump();
+                let call = self.postfix_step_named(e)?;
+                let sp = tsp.to(call.span);
+                e = self.mk(ExprKind::Try(Box::new(call)), sp);
+                continue;
+            }
             if self.is_op("?.") {
                 // Optional chaining: the call happens only if the receiver is present.
                 self.bump();
@@ -1103,7 +1201,7 @@ impl<'a> Parser<'a> {
             Tok::Int(_) | Tok::BigInt(_) | Tok::Float(..) | Tok::Str(_) | Tok::Interp(_) | Tok::Ident(_) | Tok::Const(_) | Tok::Sym(_) => true,
             Tok::Kw(Kw::Case) => true,
             Tok::Kw(Kw::True | Kw::False | Kw::Nil | Kw::None | Kw::Try) => true,
-            Tok::Op("(") | Tok::Op("[") => true,
+            Tok::Op("(") | Tok::Op("[") | Tok::Op("~") | Tok::Op("->") => true,
             // `puts -x` (Ruby): a minus right before its operand starts an argument.
             Tok::Op("-") | Tok::Op("^") => !self.toks[(self.pos + 1).min(self.toks.len() - 1)].space_before,
             _ => false,

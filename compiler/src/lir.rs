@@ -23,6 +23,16 @@ pub enum LTy {
     Gen(Box<LTy>),
 }
 
+impl LTy {
+    /// The element type of an array type.
+    pub fn arr_elem_lty(self) -> LTy {
+        match self {
+            LTy::Arr(t) => *t,
+            t => panic!("not an array: {t:?}"),
+        }
+    }
+}
+
 pub type V = usize;
 pub type Label = usize;
 

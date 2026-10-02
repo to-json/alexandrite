@@ -1,0 +1,227 @@
+# Package unicode: Go's unicode, with alx idioms (S2).
+#
+# Classification and simple case mapping for the whole of Unicode 17.0.0, with
+# the same answers as Go's package (the tables in tables.alx are generated from
+# it): every function agrees with Go for every code point, 0 through 0x10FFFF.
+#
+# Coverage limits:
+#   - Only the predicates and mappings below. There are no named RangeTables
+#     (`unicode.Latin`, `unicode.Han`, ...), no `is`/`in`/`is_one_of`, no
+#     script or property tables other than the general categories used here.
+#   - Case mapping is *simple* (one rune to one rune), as in Go: to_upper('ß')
+#     is 'ß', not "SS". Special casing and locale rules (Turkish dotless i) are
+#     not provided; neither are full case folds.
+#   - Out-of-range runes (negative, above MAX_RUNE) are in no class and map to
+#     themselves; surrogates are in no class.
+#
+# Lookups are binary searches over compact range tables (see tables.alx for the
+# encoding), with fast paths for ASCII.
+
+pub MAX_RUNE: Rune = 0x10FFFF          # the largest valid code point
+pub REPLACEMENT_CHAR: Rune = 0xFFFD    # what an invalid encoding decodes to
+pub MAX_ASCII: Rune = 0x7F
+pub MAX_LATIN1: Rune = 0xFF
+pub VERSION = "17.0.0"                 # the Unicode version of the tables
+
+CASE_UPPER = 0
+CASE_LOWER = 1
+CASE_TITLE = 2
+CASE_ALT = 10_000_000   # in CASE_RANGES: the range alternates upper/lower
+CASE_BIAS = 1_000_000   # CASE_RANGES deltas are stored plus this
+
+# The 4-digit base-57 number at byte offset `i` of table `t`.
+def d4(t: Str, i: Int) -> Int {
+  (t[i].to_i - 35) * 185193 + (t[i + 1].to_i - 35) * 3249 + (t[i + 2].to_i - 35) * 57 + (t[i + 3].to_i - 35)
+}
+
+# Whether `r` is in the range table `t` (10 chars per entry).
+def in_ranges(t: Str, r: Rune) -> Bool {
+  return false if r < 0
+  c = r.to_i
+  lo = 0
+  hi = t.size / 10
+  while lo < hi {
+    m = (lo + hi) / 2
+    off = m * 10
+    first = d4(t, off)
+    if c < first {
+      hi = m
+    } else {
+      if c <= d4(t, off + 4) {
+        stride = (t[off + 8].to_i - 35) * 57 + (t[off + 9].to_i - 35)
+        return (c - first) % stride == 0
+      }
+      lo = m + 1
+    }
+  }
+  false
+}
+
+# Maps `r` through CASE_RANGES for case `k` (CASE_UPPER, CASE_LOWER, CASE_TITLE).
+def map_case(k: Int, r: Rune) -> Rune {
+  return r if r < 0 || r > 0x10FFFF
+  t = CASE_RANGES
+  c = r.to_i
+  lo = 0
+  hi = t.size / 20
+  while lo < hi {
+    m = (lo + hi) / 2
+    off = m * 20
+    first = d4(t, off)
+    if c < first {
+      hi = m
+    } else {
+      if c <= d4(t, off + 4) {
+        dv = d4(t, off + 8 + k * 4)
+        if dv == CASE_ALT {
+          odd = k == CASE_LOWER ? 1 : 0
+          return (first + (((c - first) & ^1) | odd)).to_i32
+        }
+        return (c + dv - CASE_BIAS).to_i32
+      }
+      lo = m + 1
+    }
+  }
+  r
+}
+
+# Whether `r` is a letter (category L).
+pub def is_letter(r: Rune) -> Bool {
+  if r < 0x80 {
+    return (r >= 0x41 && r <= 0x5A) || (r >= 0x61 && r <= 0x7A)
+  }
+  in_ranges(LETTER_RANGES, r)
+}
+
+# Whether `r` is a decimal digit (category Nd).
+pub def is_digit(r: Rune) -> Bool {
+  if r < 0x80 {
+    return r >= 0x30 && r <= 0x39
+  }
+  in_ranges(DIGIT_RANGES, r)
+}
+
+# Whether `r` is a number (categories Nd, Nl, No).
+pub def is_number(r: Rune) -> Bool {
+  if r < 0x80 {
+    return r >= 0x30 && r <= 0x39
+  }
+  in_ranges(NUMBER_RANGES, r)
+}
+
+# Whether `r` is white space (Unicode's White_Space property): \t \n \v \f \r,
+# space, U+0085, U+00A0, U+1680, U+2000..U+200A, U+2028, U+2029, U+202F,
+# U+205F, U+3000.
+pub def is_space(r: Rune) -> Bool {
+  if r < 0x100 {
+    return r == 0x20 || (r >= 9 && r <= 13) || r == 0x85 || r == 0xA0
+  }
+  in_ranges(SPACE_RANGES, r)
+}
+
+# Whether `r` is an upper case letter (category Lu).
+pub def is_upper(r: Rune) -> Bool {
+  if r < 0x80 {
+    return r >= 0x41 && r <= 0x5A
+  }
+  in_ranges(UPPER_RANGES, r)
+}
+
+# Whether `r` is a lower case letter (category Ll).
+pub def is_lower(r: Rune) -> Bool {
+  if r < 0x80 {
+    return r >= 0x61 && r <= 0x7A
+  }
+  in_ranges(LOWER_RANGES, r)
+}
+
+# Whether `r` is a title case letter (category Lt).
+pub def is_title(r: Rune) -> Bool {
+  in_ranges(TITLE_RANGES, r)
+}
+
+# Whether `r` is a punctuation character (category P).
+pub def is_punct(r: Rune) -> Bool {
+  in_ranges(PUNCT_RANGES, r)
+}
+
+# Whether `r` is a control character (category Cc: U+0000..U+001F, U+007F..U+009F).
+pub def is_control(r: Rune) -> Bool {
+  (r >= 0 && r < 0x20) || (r >= 0x7F && r < 0xA0)
+}
+
+# Whether `r` is a mark (categories Mn, Mc, Me).
+pub def is_mark(r: Rune) -> Bool {
+  in_ranges(MARK_RANGES, r)
+}
+
+# Whether `r` is a symbol (category S).
+pub def is_symbol(r: Rune) -> Bool {
+  in_ranges(SYMBOL_RANGES, r)
+}
+
+# Whether `r` is printable by Go's definition: letters, marks, numbers,
+# punctuation, symbols and the ASCII space. Other spaces are not printable.
+pub def is_print(r: Rune) -> Bool {
+  if r < 0x80 {
+    return r >= 0x20 && r < 0x7F
+  }
+  is_letter(r) || is_mark(r) || is_number(r) || is_punct(r) || is_symbol(r)
+}
+
+# Whether `r` is a graphic character: printable, or a space separator (Zs).
+pub def is_graphic(r: Rune) -> Bool {
+  return true if is_print(r)
+  r == 0xA0 || r == 0x1680 || (r >= 0x2000 && r <= 0x200A) || r == 0x202F || r == 0x205F || r == 0x3000
+}
+
+# The upper case form of `r` (simple mapping; `r` itself if it has none).
+pub def to_upper(r: Rune) -> Rune {
+  if r < 0x80 {
+    return r >= 0x61 && r <= 0x7A ? r - 32 : r
+  }
+  map_case(CASE_UPPER, r)
+}
+
+# The lower case form of `r` (simple mapping; `r` itself if it has none).
+pub def to_lower(r: Rune) -> Rune {
+  if r < 0x80 {
+    return r >= 0x41 && r <= 0x5A ? r + 32 : r
+  }
+  map_case(CASE_LOWER, r)
+}
+
+# The title case form of `r` (simple mapping; `r` itself if it has none).
+pub def to_title(r: Rune) -> Rune {
+  if r < 0x80 {
+    return r >= 0x61 && r <= 0x7A ? r - 32 : r
+  }
+  map_case(CASE_TITLE, r)
+}
+
+# Iterates over the runes that are equivalent to `r` under simple case folding:
+# the next one in the orbit, the smallest one greater than `r` or, if there is
+# none, the smallest. `simple_fold('K')` is 'k', then U+212A (Kelvin sign),
+# then 'K' again. A rune with no case equivalents folds to itself.
+pub def simple_fold(r: Rune) -> Rune {
+  return r if r < 0 || r > 0x10FFFF
+  t = CASE_ORBIT
+  c = r.to_i
+  lo = 0
+  hi = t.size / 8
+  while lo < hi {
+    m = (lo + hi) / 2
+    off = m * 8
+    from = d4(t, off)
+    if c < from {
+      hi = m
+    } else if c > from {
+      lo = m + 1
+    } else {
+      return d4(t, off + 4).to_i32
+    }
+  }
+  l = to_lower(r)
+  return l if l != r
+  to_upper(r)
+}

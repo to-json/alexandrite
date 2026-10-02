@@ -746,6 +746,7 @@ fn type_names(t: &TypeExpr, out: &mut Vec<String>) {
             type_names(r, out);
         }
         TypeExpr::Result(t, _, _) => type_names(t, out),
+        TypeExpr::Tuple(ts, _) => ts.iter().for_each(|t| type_names(t, out)),
     }
 }
 
@@ -890,6 +891,7 @@ pub fn type_from(t: &TypeExpr, structs: &Structs, consts: &Consts) -> R<Ty> {
             Ok(Ty::Handle(q))
         }
         TypeExpr::Fn(ps, r, _) => Ok(Ty::Fn(ps.iter().map(type_from).collect::<R<Vec<_>>>()?, Box::new(type_from(r)?))),
+        TypeExpr::Tuple(ts, _) => Ok(Ty::Tuple(ts.iter().map(type_from).collect::<R<Vec<_>>>()?)),
         TypeExpr::Opt(t, _) => Ok(Ty::Opt(Box::new(type_from(t)?))),
         TypeExpr::App(n, args, sp) => match (n.as_str(), args.as_slice()) {
             ("Map", [k, v]) => {
@@ -1391,6 +1393,30 @@ impl<'w, 'a> FnCx<'w, 'a> {
     fn stmt(&mut self, s: &Stmt) -> R<TStmt> {
         Ok(match &s.kind {
             StmtKind::Expr(e) => TStmt::Expr(self.expr(e)?),
+            StmtKind::MultiAssign(targets, values) if values.len() == 1 && targets.len() > 1 => {
+                // `a, b = f()`: destructure a tuple.
+                let v = self.value(&values[0])?;
+                let ts = match self.resolve(&v.ty) {
+                    Ty::Tuple(ts) if ts.len() == targets.len() => ts,
+                    Ty::Tuple(ts) => return Err(Diag::new(s.span, format!("{} names but the value is a {}-tuple", targets.len(), ts.len()))),
+                    _ => return Err(Diag::new(s.span, format!("{} names but 1 value", targets.len()))),
+                };
+                let whole_ty = v.ty.clone();
+                let tmp = self.declare("$tuple", whole_ty.clone());
+                let init = self.mk(TK::Assign(tmp, Box::new(v)), whole_ty.clone(), s.span);
+                let mut ids = vec![];
+                let mut gets = vec![];
+                for (k, ((name, sp), t)) in targets.iter().zip(&ts).enumerate() {
+                    if name == "_" {
+                        continue;
+                    }
+                    ids.push(self.assign_local(name, *sp, t, sp_node(sp))?);
+                    let l = self.mk(TK::Local(tmp), whole_ty.clone(), *sp);
+                    gets.push(self.mk(TK::M(M::TupleGet(k), Some(Box::new(l)), vec![], None), t.clone(), *sp));
+                }
+                let seq = vec![TStmt::Expr(init), TStmt::MultiAssign(ids, gets)];
+                TStmt::Expr(self.mk(TK::Seq(seq), Ty::Unit, s.span))
+            }
             StmtKind::MultiAssign(targets, values) => {
                 if targets.len() != values.len() {
                     return Err(Diag::new(s.span, format!("{} names but {} values", targets.len(), values.len())));
@@ -1897,6 +1923,14 @@ impl<'w, 'a> FnCx<'w, 'a> {
             }
             ExprKind::If(c, a, b) => return self.if_value(c, a, b, sp),
             ExprKind::KwArg(n, nsp, _) => return Err(Diag::new(*nsp, format!("keyword argument `{n}:` outside `Struct.new`")).note("keyword arguments name struct fields: `Body.new(x: 1.0, mass: m)`")),
+            ExprKind::Tuple(items) => {
+                let mut vals = vec![];
+                for it in items {
+                    vals.push(self.value(it)?);
+                }
+                let ty = Ty::Tuple(vals.iter().map(|v| v.ty.clone()).collect());
+                self.mk(TK::M(M::StructNew, None, vals, None), ty, sp)
+            }
             ExprKind::Array(items) => {
                 let el = self.site(e.id, 0);
                 let mut out = vec![];

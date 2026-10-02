@@ -650,6 +650,9 @@ impl<'a> Parser<'a> {
                 }
             }
             self.expect_op(")")?;
+            if ps.len() >= 2 && !self.is_op("->") {
+                return Ok(TypeExpr::Tuple(ps, sp.to(self.prev_span())));
+            }
             self.expect_op("->")?;
             let r = self.type_expr()?;
             return Ok(TypeExpr::Fn(ps, Box::new(r), sp.to(self.prev_span())));
@@ -1506,6 +1509,20 @@ impl<'a> Parser<'a> {
                 self.skip_newlines();
                 let mut e = self.expr()?;
                 self.skip_newlines();
+                if self.is_op(",") {
+                    let mut items = vec![e];
+                    while self.eat_op(",") {
+                        self.skip_newlines();
+                        if self.is_op(")") {
+                            break;
+                        }
+                        items.push(self.expr()?);
+                        self.skip_newlines();
+                    }
+                    self.expect_op(")")?;
+                    self.in_cond = saved;
+                    return Ok(self.mk(ExprKind::Tuple(items), sp.to(self.prev_span())));
+                }
                 self.expect_op(")")?;
                 self.in_cond = saved;
                 // Parenthesized expressions keep their inner id, but the span

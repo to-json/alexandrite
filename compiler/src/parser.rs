@@ -116,7 +116,7 @@ impl<'a> Parser<'a> {
     // ---------- module ----------
 
     fn module(&mut self, file: u32) -> PResult<Module> {
-        let mut m = Module { file, overflow: Overflow::Abort, requires: vec![], defs: vec![], structs: vec![], enums: vec![], ifaces: vec![], consts: vec![], main: vec![] };
+        let mut m = Module { file, overflow: Overflow::Abort, imports: vec![], public: Default::default(), defs: vec![], structs: vec![], enums: vec![], ifaces: vec![], consts: vec![], main: vec![] };
         self.skip_newlines();
         while let Tok::Directive(name, arg) = self.peek().clone() {
             let sp = self.bump().span;
@@ -133,12 +133,65 @@ impl<'a> Parser<'a> {
             match self.peek().clone() {
                 Tok::Eof => break,
                 Tok::Kw(Kw::Require) => {
-                    self.bump();
-                    let sp = self.span();
+                    return Err(Diag::new(self.span(), "`require` is now `import \"path\"` (a package directory)"));
+                }
+                Tok::Ident(kw) if kw == "import" && matches!(self.peek_at(1), Tok::Str(_) | Tok::Ident(_)) => {
+                    let sp = self.bump().span;
+                    let alias = match self.peek().clone() {
+                        Tok::Ident(a) => {
+                            self.bump();
+                            Some(a)
+                        }
+                        _ => None,
+                    };
                     match self.bump().tok {
-                        Tok::Str(s) => m.requires.push((s, sp)),
-                        _ => return Err(Diag::new(sp, "`require` takes a string path")),
+                        Tok::Str(s) => m.imports.push(Import { alias, path: s, span: sp.to(self.prev_span()) }),
+                        _ => return Err(Diag::new(sp, "`import` takes a string path: `import \"geom\"`")),
                     }
+                }
+                Tok::Ident(kw) if kw == "pub" => {
+                    // `pub def`, `pub struct`, `pub enum`, `pub error`, `pub interface`, `pub NAME = ...`
+                    self.bump();
+                    let before = (m.defs.len(), m.structs.len(), m.enums.len(), m.ifaces.len(), m.consts.len());
+                    match self.peek().clone() {
+                        Tok::Attr(_) | Tok::Kw(Kw::Def) | Tok::Kw(Kw::Fn) => {
+                            let mut d = self.def()?;
+                            d.public = true;
+                            m.defs.push(d);
+                        }
+                        Tok::Kw(Kw::Struct) => {
+                            let s = self.struct_def(&mut m.defs)?;
+                            m.public.insert(s.name.clone());
+                            m.structs.push(s);
+                        }
+                        Tok::Kw(Kw::Enum) => {
+                            let e = self.enum_def(&mut m.defs)?;
+                            m.public.insert(e.name.clone());
+                            m.enums.push(e);
+                        }
+                        Tok::Ident(kw) if kw == "error" => {
+                            let mut e = self.enum_def(&mut m.defs)?;
+                            e.error = true;
+                            m.public.insert(e.name.clone());
+                            m.enums.push(e);
+                        }
+                        Tok::Kw(Kw::Interface) => {
+                            let i = self.iface_def(&mut m.defs)?;
+                            m.public.insert(i.name.clone());
+                            m.ifaces.push(i);
+                        }
+                        Tok::Const(name) if matches!(self.peek_at(1), Tok::Op("=") | Tok::Op(":")) => {
+                            let sp = self.bump().span;
+                            let ty = if self.eat_op(":") { Some(self.type_expr()?) } else { None };
+                            self.expect_op("=")?;
+                            self.skip_line_continuation();
+                            let value = self.expr()?;
+                            m.public.insert(name.clone());
+                            m.consts.push(ConstDef { name, span: sp, ty, value });
+                        }
+                        t => return Err(Diag::new(self.span(), format!("`pub` goes before a declaration, found {}", describe(&t)))),
+                    }
+                    let _ = before;
                 }
                 Tok::Attr(_) | Tok::Kw(Kw::Def) | Tok::Kw(Kw::Fn) => m.defs.push(self.def()?),
                 Tok::Kw(Kw::Struct) => {
@@ -185,7 +238,7 @@ impl<'a> Parser<'a> {
     fn def_in(&mut self, owner: Option<&str>) -> PResult<Def> {
         let d = self.def_sig(owner.map(|o| (o, false)))?;
         let Some(body) = d.body else { unreachable!("a body is required outside interfaces") };
-        Ok(Def { name: d.name, span: d.span, tparams: d.tparams, name_span: d.name_span, params: d.params, ret: d.ret, fallible: d.fallible, errs: d.errs, pure: d.pure, body })
+        Ok(Def { public: false, name: d.name, span: d.span, tparams: d.tparams, name_span: d.name_span, params: d.params, ret: d.ret, fallible: d.fallible, errs: d.errs, pure: d.pure, body })
     }
 
     /// A def's signature and body. In an interface (`owner.1`), `self` is
@@ -336,7 +389,7 @@ impl<'a> Parser<'a> {
             let short = d.name.rsplit_once('.').map_or(d.name.clone(), |(_, m)| m.to_string());
             methods.push((short, d.params[1..].to_vec(), d.ret.clone(), has_body, d.name_span));
             if let Some(body) = d.body {
-                defaults.push(Def { name: d.name, span: d.span, tparams: d.tparams, name_span: d.name_span, params: d.params, ret: d.ret, fallible: d.fallible, errs: d.errs, pure: d.pure, body });
+                defaults.push(Def { public: true, name: d.name, span: d.span, tparams: d.tparams, name_span: d.name_span, params: d.params, ret: d.ret, fallible: d.fallible, errs: d.errs, pure: d.pure, body });
             }
         }
         Ok(IfaceDef { name, span: start.to(self.prev_span()), methods })
@@ -360,6 +413,13 @@ impl<'a> Parser<'a> {
             }
             if self.eat_op("}") {
                 break;
+            }
+            if matches!(self.peek(), Tok::Ident(p) if p == "pub") && matches!(self.peek_at(1), Tok::Attr(_) | Tok::Kw(Kw::Def) | Tok::Kw(Kw::Fn)) {
+                self.bump();
+                let mut d = self.def_in(Some(&name))?;
+                d.public = true;
+                methods.push(d);
+                continue;
             }
             if matches!(self.peek(), Tok::Attr(_) | Tok::Kw(Kw::Def) | Tok::Kw(Kw::Fn)) {
                 methods.push(self.def_in(Some(&name))?);
@@ -420,6 +480,13 @@ impl<'a> Parser<'a> {
             }
             if self.eat_op("}") {
                 break;
+            }
+            if matches!(self.peek(), Tok::Ident(p) if p == "pub") && matches!(self.peek_at(1), Tok::Attr(_) | Tok::Kw(Kw::Def) | Tok::Kw(Kw::Fn)) {
+                self.bump();
+                let mut d = self.def_in(Some(&name))?;
+                d.public = true;
+                methods.push(d);
+                continue;
             }
             if matches!(self.peek(), Tok::Attr(_) | Tok::Kw(Kw::Def) | Tok::Kw(Kw::Fn)) {
                 methods.push(self.def_in(Some(&name))?);
@@ -493,7 +560,17 @@ impl<'a> Parser<'a> {
                 TypeExpr::Array(Box::new(inner), sp.to(self.prev_span()))
             }
         } else {
-            match self.bump().tok {
+            let mut tok = self.bump().tok;
+            // `geom.Point`: a type from an imported package.
+            if let Tok::Ident(pkg) = &tok {
+                if self.is_op(".") && matches!(self.peek_at(1), Tok::Const(_)) {
+                    self.bump();
+                    if let Tok::Const(n) = self.bump().tok {
+                        tok = Tok::Const(format!("{pkg}.{n}"));
+                    }
+                }
+            }
+            match tok {
                 Tok::Const(n) if self.is_op("[") && !self.space_before() => {
                     self.bump();
                     let mut args = vec![self.type_expr()?];
@@ -574,7 +651,11 @@ impl<'a> Parser<'a> {
                 return self.for_rest(start);
             }
             Tok::Kw(Kw::Struct) | Tok::Kw(Kw::Enum) => return Err(Diag::new(start, "types can only be defined at the top level")),
-            Tok::Ident(name) if matches!(self.peek_at(1), Tok::Op(":")) && matches!(self.peek_at(2), Tok::Const(_) | Tok::Op("[") | Tok::Op("(")) => {
+            Tok::Ident(name)
+                if matches!(self.peek_at(1), Tok::Op(":"))
+                    && (matches!(self.peek_at(2), Tok::Const(_) | Tok::Op("[") | Tok::Op("(") | Tok::Op("~"))
+                        || (matches!(self.peek_at(2), Tok::Ident(_)) && matches!(self.peek_at(3), Tok::Op(".")) && matches!(self.peek_at(4), Tok::Const(_)))) =>
+            {
                 // `x: T = e`
                 let sp = self.bump().span;
                 self.bump();
@@ -982,7 +1063,8 @@ impl<'a> Parser<'a> {
             // next call (not the whole chain); the chain continues after it.
             let sp = self.bump().span;
             let mut e = self.primary()?;
-            if matches!(e.kind, ExprKind::Const(_) | ExprKind::TypeApp(..)) && self.is_op(".") {
+            let pkg = matches!(&e.kind, ExprKind::Name(n) if !self.is_local(n));
+            if (pkg || matches!(e.kind, ExprKind::Const(_) | ExprKind::TypeApp(..))) && self.is_op(".") {
                 e = self.postfix_step(e)?.expect("a `.` step");
             }
             let full = sp.to(e.span);
@@ -1078,6 +1160,31 @@ impl<'a> Parser<'a> {
                     Tok::Const(n) => n,
                     t => return Err(Diag::new(name_span, format!("expected a method name after `.`, found {}", describe(&t)))),
                 };
+                // `geom.Stack[Int].new`: a package's generic type applied.
+                let pkg = match &e.kind {
+                    ExprKind::Name(a) => Some(a.clone()),
+                    ExprKind::Call { recv: None, name: a, args, block: None, .. } if args.is_empty() => Some(a.clone()),
+                    _ => None,
+                };
+                if let Some(pkg) = pkg.filter(|_| name.chars().next().is_some_and(|c| c.is_uppercase()) && self.is_op("[") && !self.space_before()) {
+                    let save = self.pos;
+                    self.bump();
+                    let mut targs = vec![];
+                    let ok = loop {
+                        match self.type_expr() {
+                            Ok(t) => targs.push(t),
+                            Err(_) => break false,
+                        }
+                        if !self.eat_op(",") {
+                            break self.eat_op("]") && self.is_op(".");
+                        }
+                    };
+                    if ok {
+                        e = self.mk(ExprKind::TypeApp(format!("{pkg}.{name}"), targs), e.span.to(self.prev_span()));
+                        continue;
+                    }
+                    self.pos = save;
+                }
                 let (args, block_sym) = if self.is_op("(") && !self.space_before() { self.call_args()? } else { (vec![], None) };
                 let block = self.maybe_block()?;
                 let sp = e.span.to(self.prev_span());

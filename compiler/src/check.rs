@@ -27,6 +27,74 @@ pub struct DefInfo {
     pub def: Def,
     pub overflow: Overflow,
     pub external: Option<ExternSig>,
+    /// The package it belongs to ("" = the main file).
+    pub pkg: String,
+}
+
+thread_local! {
+    /// The package whose code is being checked (names resolve there first).
+    static PKG: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
+    /// Every package's imports (alias → path), and the public names.
+    static PKGS: std::cell::RefCell<(HashMap<String, HashMap<String, String>>, std::collections::HashSet<String>)> = std::cell::RefCell::new(Default::default());
+}
+
+pub fn set_packages(public: std::collections::HashSet<String>, imports: HashMap<String, HashMap<String, String>>) {
+    PKGS.with(|p| *p.borrow_mut() = (imports, public));
+}
+
+/// Enter package `pkg`; returns the previous one, for `leave_pkg`.
+pub fn enter_pkg(pkg: &str) -> String {
+    PKG.with(|p| std::mem::replace(&mut *p.borrow_mut(), pkg.to_string()))
+}
+pub fn leave_pkg(prev: String) {
+    PKG.with(|p| *p.borrow_mut() = prev);
+}
+pub fn current_pkg() -> String {
+    PKG.with(|p| p.borrow().clone())
+}
+
+/// The package part of a qualified name (`geom.Point` → `geom`).
+pub fn pkg_of(name: &str) -> String {
+    match name.split_once('.') {
+        Some((p, _)) if !p.chars().next().is_some_and(|c| c.is_uppercase()) => p.to_string(),
+        _ => String::new(),
+    }
+}
+
+/// The import path an alias names in the current package.
+pub fn import_path(alias: &str) -> Option<String> {
+    let pkg = current_pkg();
+    PKGS.with(|p| p.borrow().0.get(&pkg).and_then(|m| m.get(alias).cloned()))
+}
+
+pub fn is_public(q: &str) -> bool {
+    PKGS.with(|p| p.borrow().1.contains(q))
+}
+
+/// Resolve a declared name as written in the current package: `alias.N`
+/// through its imports (must be `pub`), else the package's own `N`, else a
+/// main-file or builtin `N`.
+pub fn resolve_name(n: &str, sp: Span, exists: &dyn Fn(&str) -> bool) -> R<String> {
+    if let Some((alias, rest)) = n.split_once('.') {
+        if let Some(path) = import_path(alias) {
+            let q = format!("{path}.{rest}");
+            if exists(&q) {
+                if !is_public(&q) {
+                    return Err(Diag::new(sp, format!("`{n}` isn't public; its package must declare it `pub`")));
+                }
+                return Ok(q);
+            }
+            return Err(Diag::new(sp, format!("package `{alias}` has no `{rest}`")));
+        }
+    }
+    let pkg = current_pkg();
+    if !pkg.is_empty() {
+        let q = format!("{pkg}.{n}");
+        if exists(&q) {
+            return Ok(q);
+        }
+    }
+    Ok(n.to_string())
 }
 
 pub struct World<'a> {
@@ -93,7 +161,11 @@ impl<'a> World<'a> {
             if self.consts.contains_key(&d.name) || self.structs.contains_key(&d.name) {
                 return Err(Diag::new(d.span, format!("`{}` is already defined", d.name)));
             }
-            let v = self.eval_const(&d.value)?;
+            let prev = enter_pkg(&pkg_of(&d.name));
+            let v = self.eval_const(&d.value);
+            leave_pkg(prev);
+            let v = v?;
+            let prev = enter_pkg(&pkg_of(&d.name));
             let ty = match &d.ty {
                 Some(te) => {
                     let t = type_from(te, &self.structs, &self.consts)?;
@@ -117,6 +189,7 @@ impl<'a> World<'a> {
                 }
                 None => None,
             };
+            leave_pkg(prev);
             self.consts.insert(d.name.clone(), (v, ty));
         }
         Ok(())
@@ -155,8 +228,12 @@ impl<'a> World<'a> {
                 let mut names = vec![];
                 type_names(te, &mut names);
                 for n in names {
-                    if by_name.contains_key(n.as_str()) {
-                        resolve(&n, by_name, done, visiting, consts)?;
+                    let q = resolve_name(&n, Span::default(), &|q| by_name.contains_key(q)).unwrap_or(n);
+                    if by_name.contains_key(q.as_str()) {
+                        let prev = enter_pkg(&pkg_of(&q));
+                        let r = resolve(&q, by_name, done, visiting, consts);
+                        leave_pkg(prev);
+                        r?;
                     }
                 }
                 out.push((f.clone(), type_from(te, done, consts)?));
@@ -176,6 +253,7 @@ impl<'a> World<'a> {
                 return Err(Diag::new(span, format!("`{name}` contains itself; it is a value, so it can't (recursive types come with the memory model)")));
             }
             visiting.push(name.to_string());
+            let prev = enter_pkg(&pkg_of(name));
             let t = match d {
                 Def::S(s) => Ty::Struct(name.to_string(), fields_of(&s.fields, by_name, done, visiting, consts)?),
                 Def::E(e) => {
@@ -186,6 +264,7 @@ impl<'a> World<'a> {
                     Ty::Enum(name.to_string(), vs)
                 }
             };
+            leave_pkg(prev);
             visiting.pop();
             done.insert(name.to_string(), t.clone());
             Ok(t)
@@ -248,6 +327,16 @@ impl<'a> World<'a> {
     /// Resolve interface method signatures (after structs).
     pub fn add_iface_sigs(&mut self, defs: &[IfaceDef]) -> R<()> {
         for d in defs {
+            let prev = enter_pkg(&pkg_of(&d.name));
+            let r = self.add_iface_sig(d);
+            leave_pkg(prev);
+            r?;
+        }
+        Ok(())
+    }
+
+    fn add_iface_sig(&mut self, d: &IfaceDef) -> R<()> {
+        {
             let mut ms = vec![];
             for (name, params, ret, default, span) in &d.methods {
                 if name.ends_with('!') {
@@ -323,7 +412,7 @@ impl<'a> World<'a> {
     pub fn bind(&mut self, def: usize, args: &[Ty], sp: Span) -> R<Vec<(String, Option<Ty>)>> {
         let d = &self.defs[def].def;
         let mut b: Vec<(String, Ty)> = vec![];
-        if let (Some((owner, _)), Some(self_t)) = (d.name.split_once('.'), args.first()) {
+        if let (Some((owner, _)), Some(self_t)) = (d.name.rsplit_once('.'), args.first()) {
             if let Some(g) = generic(owner) {
                 let st = self_t.arr_elem().filter(|_| d.name.ends_with('!')).unwrap_or_else(|| self_t.clone());
                 if let Some((_, targs)) = inst_args(&st) {
@@ -395,6 +484,10 @@ impl<'a> World<'a> {
         let mut out = vec![];
         for i in 0..self.defs.len() {
             let d = &self.defs[i].def;
+            if !d.public {
+                continue;
+            }
+            let prev = enter_pkg(&self.defs[i].pkg);
             let mut tys = vec![];
             for p in &d.params {
                 match &p.ty {
@@ -404,6 +497,7 @@ impl<'a> World<'a> {
                     }
                 }
             }
+            leave_pkg(prev);
             let name = d.name.clone();
             let id = self.instance(i, tys, d.name_span)?;
             out.push((name, id));
@@ -442,6 +536,13 @@ impl<'a> World<'a> {
         }
         let def_ast = info.def.clone();
         let overflow = info.overflow;
+        let prev_pkg = enter_pkg(&info.pkg);
+        let r = self.instance_in_pkg(id, def, args, def_ast, overflow, call_span);
+        leave_pkg(prev_pkg);
+        r
+    }
+
+    fn instance_in_pkg(&mut self, id: FuncId, def: usize, args: Vec<Ty>, def_ast: Def, overflow: Overflow, call_span: Span) -> R<FuncId> {
         let saved = match self.bind(def, &args, call_span) {
             Ok(s) => s,
             Err(e) => {
@@ -529,7 +630,7 @@ pub fn eval_const(consts: &Consts, e: &Expr) -> R<CVal> {
         ExprKind::Float(v, t) => CVal::Num(consts::parse_float(t).map_or(ConstVal::Float(num_rational::BigRational::from_float(*v).unwrap_or_default()), ConstVal::Float)),
         ExprKind::Str(s) => CVal::Str(s.clone()),
         ExprKind::Bool(b) => CVal::Bool(*b),
-        ExprKind::Const(c) => match consts.get(c) {
+        ExprKind::Const(c) => match consts.get(&resolve_name(c, e.span, &|q| consts.contains_key(q))?) {
             Some((v, _)) => v.clone(),
             None => return Err(Diag::new(e.span, format!("`{c}` isn't a constant defined above"))),
         },
@@ -570,6 +671,7 @@ pub fn cname(s: &str) -> String {
             '<' => o.push_str("_lt"),
             '>' => o.push_str("_gt"),
             '[' => o.push_str("_idx"),
+            ',' | ' ' => o.push('_'),
             ']' => {}
             c => o.push(c),
         }
@@ -718,7 +820,13 @@ pub fn bind_tparams(te: &TypeExpr, t: &Ty, tps: &[TParam], out: &mut HashMap<Str
 pub fn type_from(t: &TypeExpr, structs: &Structs, consts: &Consts) -> R<Ty> {
     let type_from = |t| type_from(t, structs, consts);
     match t {
-        TypeExpr::Named(n, sp) if !structs.contains_key(n) && generic(n).is_some() => Err(Diag::new(*sp, format!("`{n}` is generic: give its type arguments (`{n}[...]`)"))),
+        TypeExpr::Named(n, sp) if !matches!(n.as_str(), "Float" | "Bool" | "Str" | "Error") && IntKind::from_name(n).is_none() && !structs.contains_key(n) => {
+            let q = resolve_name(n, *sp, &|q| structs.contains_key(q) || generic(q).is_some())?;
+            if generic(&q).is_some() && !structs.contains_key(&q) {
+                return Err(Diag::new(*sp, format!("`{n}` is generic: give its type arguments (`{n}[...]`)")));
+            }
+            structs.get(&q).cloned().ok_or_else(|| Diag::new(*sp, format!("unknown type `{n}`")))
+        }
         TypeExpr::Named(n, sp) => match n.as_str() {
             "Float" => Ok(Ty::Float),
             "Bool" => Ok(Ty::Bool),
@@ -742,9 +850,10 @@ pub fn type_from(t: &TypeExpr, structs: &Structs, consts: &Consts) -> R<Ty> {
                 Ok(Ty::Map(Box::new(kt), Box::new(type_from(v)?)))
             }
             ("Map", _) => Err(Diag::new(*sp, "`Map` takes two types: `Map[K, V]`")),
-            (g, _) if generic(g).is_some() => {
+            (g, _) if generic(&resolve_name(g, *sp, &|q| generic(q).is_some())?).is_some() => {
+                let g = resolve_name(g, *sp, &|q| generic(q).is_some())?;
                 let targs = args.iter().map(type_from).collect::<R<Vec<_>>>()?;
-                instantiate(g, &generic(g).unwrap(), targs, *sp, structs, consts)
+                instantiate(&g, &generic(&g).unwrap(), targs, *sp, structs, consts)
             }
             _ => Err(Diag::new(*sp, format!("unknown generic type `{n}`"))),
         },
@@ -1012,6 +1121,7 @@ impl<'w, 'a> FnCx<'w, 'a> {
         let lambdas = self.lambdas.iter().map(|(lo, t, c)| (*lo, self.resolve(t), c.clone())).collect();
         // A declared error set must cover what the body can fail with.
         if let Some(Some(declared)) = def.map(|d| d.errs.clone()) {
+            let declared: Vec<String> = declared.iter().map(|n| resolve_name(n, Span::default(), &|q| self.w.structs.contains_key(q)).unwrap_or_else(|_| n.clone())).collect();
             if !declared.iter().any(|e| e == "Error") {
                 for e in &self.errs {
                     if !declared.contains(e) {
@@ -1149,7 +1259,7 @@ impl<'w, 'a> FnCx<'w, 'a> {
             };
             last = match &t {
                 TStmt::Expr(e) => e.ty.clone(),
-                TStmt::Next(_) | TStmt::Break(..) | TStmt::Return(..) => Ty::Never,
+                TStmt::Next(_) | TStmt::Break(..) | TStmt::Return(..) | TStmt::Fail(..) => Ty::Never,
                 _ => Ty::Unit,
             };
             out.push(t);
@@ -1334,7 +1444,7 @@ impl<'w, 'a> FnCx<'w, 'a> {
                 Some(id) => self.mk(TK::Local(id), self.locals[id].ty.clone(), sp),
                 None => return self.call(None, n, sp, &[], None, None, sp),
             },
-            ExprKind::Const(c) => match self.w.consts.get(c).cloned() {
+            ExprKind::Const(c) => match self.w.consts.get(&resolve_name(c, sp, &|q| self.w.consts.contains_key(q))?).cloned() {
                 Some((v, ty)) => return self.const_value(v, ty, sp),
                 None => return Err(Diag::new(sp, format!("`{c}` is not a value; call a method on it (`{c}.new`, ...)"))),
             },
@@ -2364,6 +2474,19 @@ impl<'w, 'a> FnCx<'w, 'a> {
         })
     }
 
+    /// `geom` in `geom.area(x)`: an imported package's name (not a local).
+    fn pkg_alias(&self, e: &Expr) -> Option<String> {
+        let a = match &e.kind {
+            ExprKind::Name(a) => a,
+            ExprKind::Call { recv: None, name, args, block: None, .. } if args.is_empty() => name,
+            _ => return None,
+        };
+        if self.lookup(a).is_some() {
+            return None;
+        }
+        import_path(a)
+    }
+
     /// The struct type of `self` in a method.
     fn self_struct(&self) -> Option<Ty> {
         let id = self.lookup("self")?;
@@ -2824,8 +2947,38 @@ impl<'w, 'a> FnCx<'w, 'a> {
 
     #[allow(clippy::too_many_arguments)]
     fn call(&mut self, recv: Option<&Expr>, name: &str, name_span: Span, args: &[Expr], block: Option<&Block>, bsym: Option<&(String, Span)>, sp: Span) -> R<TExpr> {
+        // `geom.area(x)`, `geom.PI`, `geom.Point.new(...)`: through an import.
+        if let Some(r) = recv {
+            if let Some(path) = self.pkg_alias(r) {
+                let q = format!("{path}.{name}");
+                if name.chars().next().is_some_and(|c| c.is_uppercase()) {
+                    if self.w.consts.contains_key(&q) && args.is_empty() {
+                        if !is_public(&q) {
+                            return Err(Diag::new(name_span, format!("`{name}` isn't public; its package must declare it `pub`")));
+                        }
+                        let (v, ty) = self.w.consts[&q].clone();
+                        return self.const_value(v, ty, sp);
+                    }
+                    return Err(Diag::new(name_span, format!("`{name}` is a type (or isn't in that package); call a method on it")));
+                }
+                if !self.w.by_name.contains_key(&q) {
+                    return Err(Diag::new(name_span, format!("package `{}` has no `{name}`", path)));
+                }
+                return self.global_call(&q, name_span, args, block, bsym, sp);
+            }
+            if let ExprKind::Call { recv: Some(r2), name: tn, args: a2, block: None, name_span: tsp, .. } = &r.kind {
+                if a2.is_empty() && tn.chars().next().is_some_and(|c| c.is_uppercase()) {
+                    if let Some(path) = self.pkg_alias(r2) {
+                        let alias_q = format!("{}.{tn}", match &r2.kind { ExprKind::Name(a) => a.clone(), ExprKind::Call { name, .. } => name.clone(), _ => unreachable!() });
+                        let _ = path;
+                        return self.const_call(&alias_q, *tsp, name, name_span, args, block, sp);
+                    }
+                }
+            }
+        }
         // `Stack[Int].new`: a generic type with explicit arguments.
         if let Some(Expr { kind: ExprKind::TypeApp(c, tes), span: csp, .. }) = recv {
+            let c = &resolve_name(c, *csp, &|q| generic(q).is_some())?;
             let Some(g) = generic(c) else {
                 return Err(Diag::new(*csp, format!("`{c}` isn't a generic type")));
             };
@@ -2947,6 +3100,8 @@ impl<'w, 'a> FnCx<'w, 'a> {
                 }
             }
         }
+        let resolved = resolve_name(name, name_span, &|q| self.w.by_name.contains_key(q))?;
+        let name = resolved.as_str();
         let Some(&def) = self.w.by_name.get(name) else {
             let mut msg = format!("undefined local variable or method `{name}`");
             let cands: Vec<String> = self.scopes.iter().flat_map(|s| s.keys().cloned()).chain(self.w.by_name.keys().cloned()).collect();
@@ -2966,7 +3121,12 @@ impl<'w, 'a> FnCx<'w, 'a> {
         for (a, p) in args.iter().zip(&d.params) {
             // A declared type (when it doesn't mention type parameters) guides literals.
             let v = match (&p.ty, self.w.defs[def].external.is_none()) {
-                (Some(t), true) => match type_from(t, &self.w.structs, &self.w.consts) {
+                (Some(t), true) => match {
+                    let prev = enter_pkg(&self.w.defs[def].pkg);
+                    let r = type_from(t, &self.w.structs, &self.w.consts);
+                    leave_pkg(prev);
+                    r
+                } {
                     Ok(t) => self.value_as(a, &t)?,
                     Err(_) => self.value(a)?,
                 },
@@ -2980,15 +3140,28 @@ impl<'w, 'a> FnCx<'w, 'a> {
     /// Call def `def` with checked arguments (a method's include `self`).
     fn call_def(&mut self, def: usize, name: &str, name_span: Span, args: Vec<TExpr>, sp: Span) -> R<TExpr> {
         let d = self.w.defs[def].def.clone();
+        if !d.public && self.w.defs[def].pkg != current_pkg() {
+            let shown = d.name.rsplit('/').next().unwrap_or(&d.name);
+            return Err(Diag::new(name_span, format!("`{shown}` isn't public; its package must declare it `pub def`")));
+        }
         let ext = self.w.defs[def].external.as_ref().map(|e| e.params.clone());
         if args.len() != d.params.len() {
             let own = usize::from(d.params.first().is_some_and(|p| p.name == "self"));
             return Err(Diag::new(name_span, format!("`{name}` takes {} argument(s), got {}", d.params.len() - own, args.len() - own)));
         }
         let arg_tys: Vec<Ty> = args.iter().map(|a| self.resolve(&a.ty)).collect();
-        let saved = self.w.bind(def, &arg_tys, sp)?;
+        // The callee's signature means what it means in its own package.
+        let prev = enter_pkg(&self.w.defs[def].pkg);
+        let saved = match self.w.bind(def, &arg_tys, sp) {
+            Ok(s) => s,
+            Err(e) => {
+                leave_pkg(prev);
+                return Err(e);
+            }
+        };
         let r = self.call_def_args(name_span, &d, ext, args);
         self.w.unbind(saved);
+        leave_pkg(prev);
         let targs = r?;
         self.call_def_inst(def, name, name_span, targs, sp, &d)
     }
@@ -3058,6 +3231,8 @@ impl<'w, 'a> FnCx<'w, 'a> {
     }
 
     fn const_call(&mut self, c: &str, csp: Span, name: &str, name_span: Span, args: &[Expr], block: Option<&Block>, sp: Span) -> R<TExpr> {
+        let resolved = resolve_name(c, csp, &|q| self.w.structs.contains_key(q) || generic(q).is_some())?;
+        let c = resolved.as_str();
         if let (Some(g), false) = (generic(c), self.w.structs.contains_key(c)) {
             // `Stack.new(items: [1])`: infer the type arguments from the values
             // (or from the type the value is wanted as).

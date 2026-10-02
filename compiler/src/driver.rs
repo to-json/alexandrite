@@ -107,17 +107,20 @@ fn frontend(file: &str) -> Result<(front::Loaded, crate::tast::TProgram), String
     Ok((l, p))
 }
 
-/// Compile each required library to a cached object; return extern
-/// definitions (from the generated headers) and the objects to link.
+/// Compile each separable imported package to a cached object; return
+/// extern definitions (from the generated headers) and the objects to link.
 fn libraries(l: &front::Loaded, o: &Options, cache: &Path, inc: &Path) -> Result<(Vec<crate::check::DefInfo>, Vec<PathBuf>), String> {
     let mut externs = vec![];
     let mut objs = vec![];
     let ver = concat!(env!("CARGO_PKG_VERSION"), "-", env!("CARGO_PKG_NAME"));
     let me = std::env::current_exe().ok().and_then(|p| std::fs::metadata(p).ok()).and_then(|m| m.modified().ok()).map(|t| format!("{t:?}")).unwrap_or_default();
-    for (i, (req, path, m)) in l.libs.iter().enumerate() {
-        let text = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
+    for (i, pkg) in l.pkgs.iter().enumerate() {
+        if !front::separable(pkg) {
+            continue;
+        }
+        let req = &pkg.path;
         let flags = o.cflags().join(" ");
-        let h = hash_of(&[&text, RT_H, ver, &me, &format!("{:?}", m.overflow), &flags]);
+        let h = hash_of(&[&pkg.source, RT_H, ver, &me, &format!("{:?}", pkg.module.overflow), &flags]);
         let name = req.replace(['/', '.'], "_");
         let obj = cache.join(format!("lib-{name}-{}-{h}.o", o.mode()));
         let hdr = cache.join(format!("lib-{name}-{h}.alxh"));
@@ -135,11 +138,11 @@ fn libraries(l: &front::Loaded, o: &Options, cache: &Path, inc: &Path) -> Result
             if !st.success() {
                 return Err(format!("clang failed on {}", c_path.display()));
             }
-            std::fs::write(&hdr, front::header(&tp, &exports, m.overflow)).map_err(|e| e.to_string())?;
+            std::fs::write(&hdr, front::header(&tp, &exports, pkg.module.overflow)).map_err(|e| e.to_string())?;
         }
         let text = std::fs::read_to_string(&hdr).map_err(|e| e.to_string())?;
-        let span = l.main.requires[i].1;
-        externs.extend(front::parse_header(&text, l.main.overflow, span)?);
+        let span = l.main.imports.iter().find(|m| m.path.trim_end_matches('/') == pkg.path).map_or_else(Default::default, |m| m.span);
+        externs.extend(front::parse_header(&text, l.main.overflow, span, &pkg.path)?);
         objs.push(obj);
     }
     Ok((externs, objs))
@@ -189,8 +192,8 @@ fn build(file: &str, o: &Options) -> Result<PathBuf, ExitCode> {
         let _ = std::fs::write(path, &c);
     }
     if let Some(path) = &o.emit_rust {
-        // The oracle sees the whole program from source, libraries included.
-        match front::check_program(&l, front::lib_defs(&l)) {
+        // The oracle sees the whole program from source, packages included.
+        match front::check_program(&l, vec![]) {
             Ok(whole) => {
                 let lw = lower::lower(&whole, &l.sm, &lower::Opts { release: o.release });
                 let _ = std::fs::write(path, crate::rgen::emit(&lw));

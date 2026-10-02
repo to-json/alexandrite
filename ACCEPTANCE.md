@@ -75,9 +75,9 @@ sieve[0] = sieve[1] = false
 }
 puts sieve.each_index.select { sieve[it] }.sum
 
-# pe007.alx: reuses a helper from a local library file
-require "lib/primes"   # `using` is taken by refinements
-puts primes.lazy.drop(10_000).first
+# pe007.alx: reuses a helper from a local package (lib/primes/)
+import "lib/primes"
+puts primes.all.lazy.drop(10_000).first
 ```
 
 | case | expected | budget |
@@ -88,7 +88,7 @@ puts primes.lazy.drop(10_000).first
 **Pass if:**
 - Output matches and the budgets hold.
 - Indexing in the sieve's inner loop is bounds-checked in debug builds. In release builds, the checks the prover can discharge (`step` stays below `limit`, and the array size is `limit`) are removed. Count them in the emitted C.
-- `lib/primes.alx` compiles once and is reused on later runs: its header is a separate-compilation boundary, and the second run doesn't rebuild it.
+- The `lib/primes` package compiles once and is reused on later runs: its header is a separate-compilation boundary, and the second run doesn't rebuild it.
 
 **Exercises:** mutable arrays, `step`, `each_index`, the prover removing checks, modules and headers, build caching. **Needs phases** 1–6.
 

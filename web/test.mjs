@@ -6,7 +6,7 @@ import { initSync, compile, set_file, begin_run, take_stdout, take_stderr } from
 const here = new URL('.', import.meta.url).pathname;
 const cases = here + '../acceptance/cases/';
 const wasm = initSync({ module: readFileSync(here + 'www/pkg/alx_web_bg.wasm') });
-set_file('lib/primes.alx', readFileSync(cases + 'lib/primes.alx'));
+set_file('lib/primes/primes.alx', readFileSync(cases + 'lib/primes/primes.alx'));
 set_file('fixtures/names.txt', readFileSync(cases + 'fixtures/names.txt'));
 
 export function run(name, src) {

@@ -86,7 +86,10 @@ pub enum Overflow {
 pub struct Module {
     pub file: u32,
     pub overflow: Overflow,
-    pub requires: Vec<(String, Span)>,
+    /// `import "path"` / `import alias "path"`.
+    pub imports: Vec<Import>,
+    /// Top-level names declared `pub` (types, constants; defs carry a flag).
+    pub public: std::collections::HashSet<String>,
     pub defs: Vec<Def>,
     pub structs: Vec<StructDef>,
     pub enums: Vec<EnumDef>,
@@ -107,11 +110,25 @@ pub struct Def {
     pub params: Vec<Param>,
     pub ret: Option<TypeExpr>,
     pub fallible: bool,
+    /// `pub def`: visible from other packages.
+    pub public: bool,
     /// A fallible def's error set: None = inferred (`~T`), names otherwise
     /// (`~T<ParseError | IoError>`; `Error` = open).
     pub errs: Option<Vec<String>>,
     pub pure: bool,
     pub body: Vec<Stmt>,
+}
+
+#[derive(Debug, Clone)]
+pub struct Import {
+    pub alias: Option<String>,
+    pub path: String,
+    pub span: Span,
+}
+
+/// The name a package is known by in an importing file.
+pub fn import_name(i: &Import) -> String {
+    i.alias.clone().unwrap_or_else(|| i.path.rsplit('/').next().unwrap_or(&i.path).to_string())
 }
 
 #[derive(Debug, Clone)]

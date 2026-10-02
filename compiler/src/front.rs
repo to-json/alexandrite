@@ -1,6 +1,7 @@
-//! Front end: load, parse (with `require`d libraries), check, prove.
+//! Front end: load, parse (with imported packages), check, prove.
 
-use crate::ast::{Module, NodeId, Overflow};
+use crate::ast::{import_name, Import, Module, NodeId, Overflow};
+use std::collections::{HashMap, HashSet};
 use crate::check::{DefInfo, World};
 use crate::diag::{Diag, SourceMap, Span};
 use crate::tast::TProgram;
@@ -10,8 +11,18 @@ use std::path::{Path, PathBuf};
 pub struct Loaded {
     pub sm: SourceMap,
     pub main: Module,
-    /// Required libraries: (path as written, resolved file, module).
-    pub libs: Vec<(String, PathBuf, Module)>,
+    /// Imported packages (in dependency order), declarations qualified.
+    pub pkgs: Vec<Package>,
+    /// Each file's overflow mode (directives are per file).
+    pub overflow: HashMap<u32, Overflow>,
+}
+
+pub struct Package {
+    /// The import path, also the prefix of every name it declares.
+    pub path: String,
+    pub module: Module,
+    /// All its source text (for build caching).
+    pub source: String,
 }
 
 pub fn parse_file(sm: &mut SourceMap, display: String, text: String, next_id: &mut NodeId) -> Result<Module, Diag> {
@@ -21,11 +32,31 @@ pub fn parse_file(sm: &mut SourceMap, display: String, text: String, next_id: &m
 }
 
 pub fn load(path: &Path, display: &str) -> Result<Loaded, (SourceMap, Diag)> {
-    load_with(path, display, &|p| std::fs::read_to_string(p))
+    let list = |p: &Path| -> std::io::Result<Vec<PathBuf>> {
+        let mut v: Vec<PathBuf> = std::fs::read_dir(p)?.filter_map(|e| e.ok().map(|e| e.path())).collect();
+        v.sort();
+        Ok(v)
+    };
+    load_with(path, display, &|p| std::fs::read_to_string(p), &list)
 }
 
-/// `load`, reading files through `read` (the browser has no file system).
-pub fn load_with(path: &Path, display: &str, read: &dyn Fn(&Path) -> std::io::Result<String>) -> Result<Loaded, (SourceMap, Diag)> {
+/// The module root (the nearest directory up with an `alx.mod`) and the
+/// module path it declares.
+fn module_root(dir: &Path, read: &dyn Fn(&Path) -> std::io::Result<String>) -> (PathBuf, Option<String>) {
+    let mut d = Some(dir);
+    while let Some(x) = d {
+        if let Ok(text) = read(&x.join("alx.mod")) {
+            let module = text.lines().find_map(|l| l.trim().strip_prefix("module ").map(|m| m.trim().trim_matches('"').to_string()));
+            return (x.to_path_buf(), module);
+        }
+        d = x.parent();
+    }
+    (dir.to_path_buf(), None)
+}
+
+/// `load`, reading files through `read` and listing directories through
+/// `list` (the browser has no file system).
+pub fn load_with(path: &Path, display: &str, read: &dyn Fn(&Path) -> std::io::Result<String>, list: &dyn Fn(&Path) -> std::io::Result<Vec<PathBuf>>) -> Result<Loaded, (SourceMap, Diag)> {
     let mut sm = SourceMap::default();
     let mut next_id = 0;
     let text = match read(path) {
@@ -41,38 +72,145 @@ pub fn load_with(path: &Path, display: &str, read: &dyn Fn(&Path) -> std::io::Re
         Err(d) => return Err((sm, d)),
     };
     let dir = path.parent().unwrap_or(Path::new("."));
-    let mut libs = vec![];
-    for (req, sp) in &main.requires {
-        let file = dir.join(format!("{req}.alx"));
-        let text = match read(&file) {
-            Ok(t) => t,
-            Err(_) => return Err((sm, Diag::new(*sp, format!("cannot find `{req}` (looked for `{}`)", file.display())))),
-        };
-        let shown = format!("{req}.alx");
-        match parse_file(&mut sm, shown, text, &mut next_id) {
-            Ok(m) => {
-                if !m.main.is_empty() {
-                    let sp = m.main[0].span;
-                    return Err((sm, Diag::new(sp, "a required library may only contain definitions")));
-                }
-                libs.push((req.clone(), file, m));
-            }
-            Err(d) => return Err((sm, d)),
+    let (root, module) = module_root(dir, read);
+    let mut overflow = HashMap::from([(main.file, main.overflow)]);
+    let mut pkgs: Vec<Package> = vec![];
+    let mut visiting: Vec<String> = vec![];
+    let imports = main.imports.clone();
+    for imp in &imports {
+        if let Err(d) = load_pkg(imp, &root, module.as_deref(), &mut sm, &mut next_id, &mut pkgs, &mut visiting, &mut overflow, read, list, Path::new(display).parent().unwrap_or(Path::new(""))) {
+            return Err((sm, d));
         }
     }
-    Ok(Loaded { sm, main, libs })
+    Ok(Loaded { sm, main, pkgs, overflow })
 }
 
-/// Check the whole program with every library's source in the same world.
+/// Where an import path lives: under the module root (its module path
+/// prefix optional), or relative (`./x`) to the importing file.
+fn pkg_dir(path: &str, root: &Path, module: Option<&str>) -> PathBuf {
+    if let Some(m) = module {
+        if let Some(rest) = path.strip_prefix(m).and_then(|r| r.strip_prefix('/')) {
+            return root.join(rest);
+        }
+    }
+    root.join(path)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn load_pkg(
+    imp: &Import,
+    root: &Path,
+    module: Option<&str>,
+    sm: &mut SourceMap,
+    next_id: &mut NodeId,
+    pkgs: &mut Vec<Package>,
+    visiting: &mut Vec<String>,
+    overflow: &mut HashMap<u32, Overflow>,
+    read: &dyn Fn(&Path) -> std::io::Result<String>,
+    list: &dyn Fn(&Path) -> std::io::Result<Vec<PathBuf>>,
+    shown_root: &Path,
+) -> Result<(), Diag> {
+    let path = imp.path.trim_end_matches('/').to_string();
+    if pkgs.iter().any(|p| p.path == path) {
+        return Ok(());
+    }
+    if visiting.contains(&path) {
+        return Err(Diag::new(imp.span, format!("import cycle: {} -> {path}", visiting.join(" -> "))));
+    }
+    let dir = pkg_dir(&path, root, module);
+    let files: Vec<PathBuf> = match list(&dir) {
+        Ok(fs) => fs.into_iter().filter(|f| f.extension().is_some_and(|e| e == "alx") && !f.to_string_lossy().ends_with("_test.alx")).collect(),
+        Err(_) => vec![],
+    };
+    if files.is_empty() {
+        return Err(Diag::new(imp.span, format!("cannot find package `{path}` (looked for .alx files in `{}`)", dir.display())));
+    }
+    visiting.push(path.clone());
+    let mut merged: Option<Module> = None;
+    let mut source = String::new();
+    for f in &files {
+        let text = read(f).map_err(|e| Diag::new(imp.span, format!("cannot read `{}`: {e}", f.display())))?;
+        source.push_str(&text);
+        let shown = shown_root.join(f.strip_prefix(root).unwrap_or(f)).display().to_string();
+        let m = parse_file(sm, shown, text, next_id)?;
+        if let Some(s) = m.main.first() {
+            return Err(Diag::new(s.span, format!("a package (`{path}`) holds only declarations; move statements into a def")));
+        }
+        overflow.insert(m.file, m.overflow);
+        for i in &m.imports {
+            load_pkg(i, root, module, sm, next_id, pkgs, visiting, overflow, read, list, shown_root)?;
+        }
+        merged = Some(match merged {
+            None => m,
+            Some(mut acc) => {
+                acc.imports.extend(m.imports);
+                acc.public.extend(m.public);
+                acc.defs.extend(m.defs);
+                acc.structs.extend(m.structs);
+                acc.enums.extend(m.enums);
+                acc.ifaces.extend(m.ifaces);
+                acc.consts.extend(m.consts);
+                acc
+            }
+        });
+    }
+    visiting.pop();
+    let mut m = merged.unwrap();
+    qualify(&mut m, &path);
+    pkgs.push(Package { path, module: m, source });
+    Ok(())
+}
+
+/// Prefix every name a package declares with its path (`geom.area`).
+fn qualify(m: &mut Module, p: &str) {
+    let q = |n: &str| format!("{p}.{n}");
+    for d in &mut m.defs {
+        d.name = q(&d.name);
+    }
+    for s in &mut m.structs {
+        s.name = q(&s.name);
+    }
+    for e in &mut m.enums {
+        e.name = q(&e.name);
+    }
+    for i in &mut m.ifaces {
+        i.name = q(&i.name);
+    }
+    for c in &mut m.consts {
+        c.name = q(&c.name);
+    }
+    m.public = m.public.iter().map(|n| q(n)).collect();
+}
+
+/// Check the whole program, every imported package in the same world.
+/// `externs`: the interface of packages compiled separately (whose
+/// declarations are then left out).
 pub fn check_program(l: &Loaded, externs: Vec<DefInfo>) -> Result<TProgram, Diag> {
-    let mut defs: Vec<DefInfo> = l.main.defs.iter().map(|d| DefInfo { def: d.clone(), overflow: l.main.overflow, external: None }).collect();
+    let ov = |file: u32| l.overflow.get(&file).copied().unwrap_or(Overflow::Abort);
+    let ext: HashSet<String> = externs.iter().map(|d| d.pkg.clone()).collect();
+    let ext_names: Vec<String> = externs.iter().map(|d| d.def.name.clone()).collect();
+    let mut defs: Vec<DefInfo> = l.main.defs.iter().map(|d| DefInfo { def: d.clone(), overflow: ov(d.span.file), external: None, pkg: String::new() }).collect();
+    for p in l.pkgs.iter().filter(|p| !ext.contains(&p.path)) {
+        defs.extend(p.module.defs.iter().map(|d| DefInfo { def: d.clone(), overflow: ov(d.span.file), external: None, pkg: p.path.clone() }));
+    }
     defs.extend(externs);
+    // Visibility and each package's imports.
+    let mut public: HashSet<String> = l.pkgs.iter().flat_map(|p| p.module.public.iter().cloned()).collect();
+    public.extend(l.pkgs.iter().flat_map(|p| p.module.defs.iter().filter(|d| d.public).map(|d| d.name.clone())));
+    public.extend(ext_names);
+    let mut imports: HashMap<String, HashMap<String, String>> = HashMap::new();
+    imports.insert(String::new(), l.main.imports.iter().map(|i| (import_name(i), i.path.trim_end_matches('/').to_string())).collect());
+    for p in &l.pkgs {
+        imports.insert(p.path.clone(), p.module.imports.iter().map(|i| (import_name(i), i.path.trim_end_matches('/').to_string())).collect());
+    }
+    crate::check::set_packages(public, imports);
     let mut w = World::new(&l.sm, defs)?;
-    let structs: Vec<_> = l.main.structs.iter().chain(l.libs.iter().flat_map(|(_, _, m)| m.structs.iter())).cloned().collect();
-    let consts: Vec<_> = l.libs.iter().flat_map(|(_, _, m)| m.consts.iter()).chain(l.main.consts.iter()).cloned().collect();
+    let all = || std::iter::once(&l.main).chain(l.pkgs.iter().filter(|p| !ext.contains(&p.path)).map(|p| &p.module));
+    let structs: Vec<_> = all().flat_map(|m| m.structs.iter()).cloned().collect();
+    let consts: Vec<_> = l.pkgs.iter().filter(|p| !ext.contains(&p.path)).flat_map(|p| p.module.consts.iter()).chain(l.main.consts.iter()).cloned().collect();
     w.add_consts(&consts)?;
-    let enums: Vec<_> = l.main.enums.iter().chain(l.libs.iter().flat_map(|(_, _, m)| m.enums.iter())).cloned().collect();
-    let ifaces: Vec<_> = l.main.ifaces.iter().chain(l.libs.iter().flat_map(|(_, _, m)| m.ifaces.iter())).cloned().collect();
+    let enums: Vec<_> = all().flat_map(|m| m.enums.iter()).cloned().collect();
+    let ifaces: Vec<_> = all().flat_map(|m| m.ifaces.iter()).cloned().collect();
     w.add_iface_names(&ifaces)?;
     w.add_builtin_errors();
     w.add_structs(&structs, &enums)?;
@@ -85,7 +223,7 @@ pub fn check_program(l: &Loaded, externs: Vec<DefInfo>) -> Result<TProgram, Diag
     let mut funcs: Vec<_> = w.funcs.into_iter().map(|f| f.expect("every instance checked")).collect();
     for f in funcs.iter_mut() {
         if !f.external {
-            f.overflow = if f.is_main { l.main.overflow } else { f.overflow_from(&l.main, &l.libs) };
+            f.overflow = if f.is_main { l.main.overflow } else { ov(f.span.file) };
         }
     }
     for f in &funcs {
@@ -94,22 +232,10 @@ pub fn check_program(l: &Loaded, externs: Vec<DefInfo>) -> Result<TProgram, Diag
     Ok(TProgram { funcs, main, ifaces, stringers, errors, messages })
 }
 
-/// Lib defs as world entries (checked from source).
-pub fn lib_defs(l: &Loaded) -> Vec<DefInfo> {
-    l.libs.iter().flat_map(|(_, _, m)| m.defs.iter().map(|d| DefInfo { def: d.clone(), overflow: m.overflow, external: None })).collect()
-}
-
-trait OverflowOf {
-    fn overflow_from(&self, main: &Module, libs: &[(String, PathBuf, Module)]) -> Overflow;
-}
-
-impl OverflowOf for crate::tast::TFunc {
-    fn overflow_from(&self, main: &Module, libs: &[(String, PathBuf, Module)]) -> Overflow {
-        if self.span.file == main.file {
-            return main.overflow;
-        }
-        libs.iter().find(|(_, _, m)| m.file == self.span.file).map_or(Overflow::Abort, |(_, _, m)| m.overflow)
-    }
+/// Kept for callers of the old library interface: packages are now
+/// checked from source with the program.
+pub fn lib_defs(_l: &Loaded) -> Vec<DefInfo> {
+    vec![]
 }
 
 // ---------- separately compiled libraries ----------
@@ -118,11 +244,28 @@ use crate::ast::{Def, Param};
 use crate::check::ExternSig;
 use crate::tast::Ty;
 
-/// Check a required library on its own: every def is an export.
+/// Can package `p` be compiled on its own, behind a header? Its exports
+/// must be plain (non-generic, non-fallible) defs, and it may not declare
+/// types whose layout depends on the whole program (interfaces, errors) or
+/// import other packages.
+pub fn separable(p: &Package) -> bool {
+    let m = &p.module;
+    m.imports.is_empty()
+        && m.ifaces.is_empty()
+        && !m.enums.iter().any(|e| e.error || !e.tparams.is_empty())
+        && !m.structs.iter().any(|s| !s.tparams.is_empty())
+        && m.defs.iter().filter(|d| d.public).all(|d| d.tparams.is_empty() && !d.fallible && !d.name.contains("].") && d.params.iter().all(|p| p.ty.is_some()))
+        && m.defs.iter().any(|d| d.public)
+}
+
+/// Check a separable package on its own: its `pub` defs are the exports.
 /// Exported instances get stable, prefixed symbol names.
 pub fn check_library(l: &Loaded, idx: usize, prefix: &str) -> Result<(TProgram, Vec<(String, usize)>), Diag> {
-    let (_, _, m) = &l.libs[idx];
-    let defs = m.defs.iter().map(|d| DefInfo { def: d.clone(), overflow: m.overflow, external: None }).collect();
+    let pkg = &l.pkgs[idx];
+    let m = &pkg.module;
+    let ov = |file: u32| l.overflow.get(&file).copied().unwrap_or(Overflow::Abort);
+    let defs = m.defs.iter().map(|d| DefInfo { def: d.clone(), overflow: ov(d.span.file), external: None, pkg: pkg.path.clone() }).collect();
+    crate::check::set_packages(m.public.iter().cloned().chain(m.defs.iter().filter(|d| d.public).map(|d| d.name.clone())).collect(), HashMap::from([(pkg.path.clone(), HashMap::new())]));
     let mut w = World::new(&l.sm, defs)?;
     w.add_consts(&m.consts)?;
     w.add_iface_names(&m.ifaces)?;
@@ -136,7 +279,7 @@ pub fn check_library(l: &Loaded, idx: usize, prefix: &str) -> Result<(TProgram, 
     let errors = std::mem::take(&mut w.errors);
     let mut funcs: Vec<_> = w.funcs.into_iter().map(|f| f.expect("every instance checked")).collect();
     for f in funcs.iter_mut() {
-        f.overflow = m.overflow;
+        f.overflow = ov(f.span.file);
     }
     for (name, fid) in &exports {
         funcs[*fid].cname = format!("{prefix}_{}", crate::check::cname(name));
@@ -170,7 +313,7 @@ pub fn header(p: &TProgram, exports: &[(String, usize)], overflow: Overflow) -> 
 }
 
 /// Parse a header back into extern definitions.
-pub fn parse_header(text: &str, overflow: Overflow, span: Span) -> Result<Vec<DefInfo>, String> {
+pub fn parse_header(text: &str, overflow: Overflow, span: Span, pkg: &str) -> Result<Vec<DefInfo>, String> {
     let mut out = vec![];
     for line in text.lines().filter(|l| l.starts_with("def ")) {
         let rest = &line[4..];
@@ -187,6 +330,7 @@ pub fn parse_header(text: &str, overflow: Overflow, span: Span) -> Result<Vec<De
         }
         let ptys = params.iter().map(|p| parse_ty(p.trim())).collect::<Result<Vec<_>, _>>()?;
         let def = Def {
+            public: true,
             name: name.trim().to_string(),
             span,
             tparams: vec![],
@@ -199,7 +343,7 @@ pub fn parse_header(text: &str, overflow: Overflow, span: Span) -> Result<Vec<De
             body: vec![],
         };
         let sig = ExternSig { params: ptys, ret: parse_ty(ret.trim())?, fallible: def.fallible, pure: def.pure, symbol };
-        out.push(DefInfo { def, overflow, external: Some(sig) });
+        out.push(DefInfo { def, overflow, external: Some(sig), pkg: pkg.to_string() });
     }
     Ok(out)
 }
@@ -239,7 +383,7 @@ fn parse_ty(s: &str) -> Result<Ty, String> {
         "Str" => Ty::Str,
         "nil" => Ty::Unit,
         "Range[Int]" => Ty::Range,
-        _ if s.starts_with("Array[") => Ty::arr(parse_ty(inner("Array[").unwrap())?),
+        _ if s.starts_with('[') && s.ends_with(']') && !s.contains(';') => Ty::arr(parse_ty(&s[1..s.len() - 1])?),
         _ if s.starts_with("Enumerator[") => Ty::Gen(Box::new(parse_ty(inner("Enumerator[").unwrap())?)),
         _ if s.starts_with('(') && s.ends_with(')') => {
             let (parts, _) = split_params(&format!("{})", &s[1..s.len() - 1]))?;

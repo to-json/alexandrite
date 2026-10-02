@@ -31,7 +31,15 @@ pub fn compile(name: &str, source: &str) -> Result<Vec<u8>, String> {
             None => Err(std::io::Error::new(std::io::ErrorKind::NotFound, "not found")),
         }
     };
-    let l = alx::front::load_with(Path::new(name), name, &read).map_err(|(sm, d)| sm.render(&d))?;
+    // Packages: the files under a directory in the virtual file system.
+    let list = |p: &Path| -> std::io::Result<Vec<std::path::PathBuf>> {
+        let dir = p.to_string_lossy().trim_start_matches("./").trim_end_matches('/').to_string();
+        let prefix = if dir.is_empty() || dir == "." { String::new() } else { format!("{dir}/") };
+        let mut v: Vec<std::path::PathBuf> = rt::st().files.keys().filter(|k| k.starts_with(&prefix) && !k[prefix.len()..].contains('/')).map(std::path::PathBuf::from).collect();
+        v.sort();
+        Ok(v)
+    };
+    let l = alx::front::load_with(Path::new(name), name, &read, &list).map_err(|(sm, d)| sm.render(&d))?;
     let p = alx::front::check_program(&l, alx::front::lib_defs(&l)).map_err(|d| l.sm.render(&d))?;
     let lp = alx::lower::lower(&p, &l.sm, &alx::lower::Opts { release: false });
     wasmgen::emit(&lp).map_err(|e| format!("internal compiler error: {e}"))

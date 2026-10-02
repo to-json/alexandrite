@@ -21,6 +21,43 @@ pub struct ExternSig {
     pub fallible: bool,
     pub pure: bool,
     pub symbol: String,
+    /// An `extern def` (a C function), not a separately compiled alexandrite package.
+    pub ffi: bool,
+}
+
+/// The signature of an `extern def`: C-compatible parameter types and result.
+pub fn ffi_sig(d: &Def) -> R<ExternSig> {
+    fn scalar(t: &TypeExpr, ok_str: bool) -> R<Ty> {
+        let bad = |sp: Span| Diag::new(sp, "an `extern def` takes and returns C types: Int, I8..I32, U8..U64, Float, Bool, Ptr, and (parameters only) Str and [Byte]");
+        match t {
+            TypeExpr::Named(n, sp) => match n.as_str() {
+                "Float" => Ok(Ty::Float),
+                "Bool" => Ok(Ty::Bool),
+                "Ptr" => Ok(Ty::Ptr),
+                "Str" if ok_str => Ok(Ty::Str),
+                "Str" => Err(Diag::new(*sp, "an `extern def` can't return a Str: return a Ptr and copy it with `Str.from_cstr(p)`")),
+                n => IntKind::from_name(n).map(Ty::of_kind).ok_or_else(|| bad(*sp)),
+            },
+            TypeExpr::Array(e, sp) if ok_str => match &**e {
+                TypeExpr::Named(n, _) if IntKind::from_name(n) == Some(IntKind::U8) => Ok(Ty::arr(Ty::IntK(IntKind::U8))),
+                _ => Err(Diag::new(*sp, "an `extern def` takes only a [Byte] array (a pointer to its first element)")),
+            },
+            TypeExpr::Named(_, sp) | TypeExpr::Array(_, sp) | TypeExpr::Opt(_, sp) | TypeExpr::Fixed(_, _, sp) | TypeExpr::App(_, _, sp) | TypeExpr::Result(_, _, sp) | TypeExpr::Handle(_, sp) | TypeExpr::Fn(_, _, sp) | TypeExpr::Tuple(_, sp) => Err(bad(*sp)),
+        }
+    }
+    let mut params = vec![];
+    for p in &d.params {
+        let Some(t) = &p.ty else {
+            return Err(Diag::new(p.span, format!("`extern def {}`: parameter `{}` needs a type", d.name, p.name)));
+        };
+        params.push(scalar(t, true)?);
+    }
+    let ret = match &d.ret {
+        None => Ty::Unit,
+        Some(TypeExpr::Named(n, _)) if n == "Unit" => Ty::Unit,
+        Some(t) => scalar(t, false)?,
+    };
+    Ok(ExternSig { params, ret, fallible: false, pure: false, symbol: d.ffi.clone().unwrap_or_default(), ffi: true })
 }
 
 pub struct DefInfo {
@@ -233,7 +270,7 @@ impl<'a> World<'a> {
         let enums: Vec<&EnumDef> = enums.iter().filter(|d| d.tparams.is_empty()).collect();
         let all = defs.iter().copied().map(|d| (d.name.as_str(), d.span, Def::S(d))).chain(enums.iter().copied().map(|d| (d.name.as_str(), d.span, Def::E(d))));
         for (name, span, d) in all {
-            if by_name.contains_key(name) || self.structs.contains_key(name) || self.consts.contains_key(name) || ["Int", "Float", "Bool", "Str", "Array", "Map", "Math", "File", "Time", "Test", "Enumerator", "Error"].contains(&name) {
+            if by_name.contains_key(name) || self.structs.contains_key(name) || self.consts.contains_key(name) || ["Int", "Float", "Bool", "Str", "Array", "Map", "Math", "File", "Time", "Test", "Enumerator", "Error", "Ptr"].contains(&name) {
                 return Err(Diag::new(span, format!("`{name}` is already defined")));
             }
             by_name.insert(name, d);
@@ -552,18 +589,19 @@ impl<'a> World<'a> {
         let info = &self.defs[def];
         if let Some(ext) = &info.external {
             let f = TFunc {
-                cname: ext.symbol.clone(),
+                cname: if ext.ffi { format!("f{}_{}", id, cname(&info.def.name)) } else { ext.symbol.clone() },
                 src_name: info.def.name.clone(),
                 params: (0..ext.params.len()).collect(),
                 locals: ext.params.iter().enumerate().map(|(i, t)| Local { name: format!("p{i}"), ty: t.clone(), reassigned: 0, mutated: false, pushed: false, user: false }).collect(),
                 ret: ext.ret.clone(),
                 fallible: ext.fallible,
                 pure: ext.pure,
-                io: !ext.pure,
+                io: ext.ffi || !ext.pure,
                 body: vec![],
                 overflow: info.overflow,
                 span: info.def.span,
-                external: true,
+                external: !ext.ffi,
+                ffi: ext.ffi.then(|| ext.symbol.clone()),
                 is_main: false,
                 lambdas: vec![],
                 errs: if ext.fallible { vec!["Error".into()] } else { vec![] },
@@ -880,7 +918,7 @@ fn sugar_shape_fits(te: &TypeExpr, t: &Ty) -> bool {
 pub fn type_from(t: &TypeExpr, structs: &Structs, consts: &Consts) -> R<Ty> {
     let type_from = |t| type_from(t, structs, consts);
     match t {
-        TypeExpr::Named(n, sp) if !matches!(n.as_str(), "Float" | "Bool" | "Str" | "Error" | "Unit") && IntKind::from_name(n).is_none() && !structs.contains_key(n) => {
+        TypeExpr::Named(n, sp) if !matches!(n.as_str(), "Float" | "Bool" | "Str" | "Error" | "Unit" | "Ptr") && IntKind::from_name(n).is_none() && !structs.contains_key(n) => {
             let q = resolve_name(n, *sp, &|q| structs.contains_key(q) || generic(q).is_some())?;
             if generic(&q).is_some() && !structs.contains_key(&q) {
                 return Err(Diag::new(*sp, format!("`{n}` is generic: give its type arguments (`{n}[...]`)")));
@@ -893,6 +931,7 @@ pub fn type_from(t: &TypeExpr, structs: &Structs, consts: &Consts) -> R<Ty> {
             "Str" => Ok(Ty::Str),
             "Error" => Ok(Ty::Error),
             "Unit" => Ok(Ty::Unit),
+            "Ptr" => Ok(Ty::Ptr),
             _ => match IntKind::from_name(n) {
                 Some(k) => Ok(Ty::of_kind(k)),
                 None => structs.get(n).cloned().ok_or_else(|| Diag::new(*sp, format!("unknown type `{n}`"))),
@@ -1279,6 +1318,7 @@ impl<'w, 'a> FnCx<'w, 'a> {
             overflow: Overflow::Abort,
             span: Span::default(),
             external: false,
+            ffi: None,
             is_main: self.is_main,
         })
     }
@@ -3347,7 +3387,7 @@ impl<'w, 'a> FnCx<'w, 'a> {
                 return Err(Diag::new(sp, format!("`{}` on {sn}: define `def {m}(other)` inside `struct {sn}`", op.text())));
             }
         }
-        if let (BinOp::Eq | BinOp::Ne, Ty::Handle(_)) = (op, &lres) {
+        if let (BinOp::Eq | BinOp::Ne, Ty::Handle(_) | Ty::Ptr) = (op, &lres) {
             if !self.unify(&l.ty, &r.ty) {
                 return Err(Diag::new(sp, format!("`{}` between {} and {}", op.text(), lres.show(), self.resolve(&r.ty).show())));
             }
@@ -4052,6 +4092,42 @@ impl<'w, 'a> FnCx<'w, 'a> {
                 let el = a[1].ty.clone();
                 Ok(self.mk(TK::M(M::ArrayNew, None, a, None), Ty::arr(el), sp))
             }
+            ("Ptr", "null") => {
+                if !args.is_empty() {
+                    return Err(Diag::new(sp, "`Ptr.null` takes no arguments"));
+                }
+                Ok(self.mk(TK::M(M::PtrNull, None, vec![], None), Ty::Ptr, sp))
+            }
+            ("Str", "from_cstr") | ("Str", "from_ptr") => {
+                let a = argv(self)?;
+                let (m, want) = if name == "from_cstr" { (M::StrFromCstr, 1) } else { (M::StrFromPtr, 2) };
+                if a.len() != want {
+                    let sig = if want == 1 { "`Str.from_cstr(p)` takes a Ptr" } else { "`Str.from_ptr(p, n)` takes a Ptr and a byte count" };
+                    return Err(Diag::new(sp, sig));
+                }
+                self.expect(&a[0].ty, &Ty::Ptr, a[0].span, &format!("`Str.{name}` pointer"))?;
+                if want == 2 {
+                    self.expect(&a[1].ty, &Ty::Int, a[1].span, "`Str.from_ptr` length")?;
+                }
+                self.impure = true;
+                Ok(self.mk(TK::M(m, None, a, None), Ty::Str, sp))
+            }
+            ("C", "errno") => {
+                if !args.is_empty() {
+                    return Err(Diag::new(sp, "`C.errno` takes no arguments"));
+                }
+                self.impure = true;
+                Ok(self.mk(TK::M(M::CErrno, None, vec![], None), Ty::Int, sp))
+            }
+            ("C", "strerror") => {
+                let a = argv(self)?;
+                if a.len() != 1 {
+                    return Err(Diag::new(sp, "`C.strerror` takes one argument, the errno value"));
+                }
+                self.expect(&a[0].ty, &Ty::Int, a[0].span, "`C.strerror` argument")?;
+                self.impure = true;
+                Ok(self.mk(TK::M(M::CStrerror, None, a, None), Ty::Str, sp))
+            }
             ("Time", "now_ns") => {
                 if !args.is_empty() {
                     return Err(Diag::new(sp, "`Time.now_ns` takes no arguments"));
@@ -4365,6 +4441,16 @@ impl<'w, 'a> FnCx<'w, 'a> {
                 self.expect(&a[0].ty, el, a[0].span, "yielded value")?;
                 return Ok(mk_m(self, M::Yield, recv, a, None, Ty::Unit));
             }
+        }
+        // Ptr: `p.null?`
+        if rt == Ty::Ptr {
+            return match (name, args.len()) {
+                ("null?", 0) => {
+                    let z = self.mk(TK::M(M::PtrNull, None, vec![], None), Ty::Ptr, sp);
+                    Ok(self.mk(TK::Bin(BinOp::Eq, Box::new(recv), Box::new(z)), Ty::Bool, sp))
+                }
+                _ => Err(Diag::new(name_span, format!("no method `{name}` on Ptr; it has `null?` and `==`"))),
+            };
         }
         // Optionals
         if let Ty::Opt(inner) = &rt {

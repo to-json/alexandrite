@@ -140,6 +140,8 @@ pub struct Def {
     /// (`~T<ParseError | IoError>`; `Error` = open).
     pub errs: Option<Vec<String>>,
     pub pure: bool,
+    /// `extern def`: a C function, bound to this link name; no body.
+    pub ffi: Option<String>,
     pub body: Vec<Stmt>,
 }
 

@@ -87,6 +87,7 @@ GROUPS = {
     "fmt": "L1",
     "tuples": "L1",
     "funcvalues": "L1",
+    "ffi": "L2",
 }
 
 
@@ -402,6 +403,9 @@ def main():
         negative_compile("pe004.bad", "A4")
         negative_runtime("pe020.bad", "A3")
         negative_runtime("pe022.missing", "A5")
+        negative_compile("ffi.bad1", "L2")
+        negative_compile("ffi.bad2", "L2")
+        negative_compile("ffi.bad3", "L2")
         negative_compile("ints.bad1", "M1")
         negative_compile("ints.bad2", "M1")
         negative_runtime("ints.overflow", "M1")

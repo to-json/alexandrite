@@ -125,6 +125,14 @@ mod rt {
         pub fn to_vec(&self) -> Vec<T> {
             self.buf.lock().unwrap()[self.off..self.off + self.len].to_vec()
         }
+        /// Write back bytes a C function changed (extern calls borrow a [Byte]
+        /// as a plain byte buffer; the oracle holds every integer as i64).
+        pub fn store_bytes(&self, b: &[u8]) where T: From<u8> {
+            let mut g = self.buf.lock().unwrap();
+            for (i, x) in b.iter().enumerate().take(self.len) {
+                g[self.off + i] = T::from(*x);
+            }
+        }
         /// `a[s, n]`: shares storage, capacity 0 (appending copies).
         pub fn slice(&self, s: usize, n: usize) -> Self {
             Sl { buf: self.buf.clone(), off: self.off + s, len: n, cap: 0 }
@@ -324,6 +332,70 @@ mod rt {
             Ok(b) => Str(b.into()),
             Err(_) => Str::lit(b""),
         }
+    }
+
+    // ---- C foreign functions (`extern def`) ----
+    thread_local! {
+        /// errno as it was right after the last extern call on this thread.
+        static ERRNO: std::cell::Cell<i64> = const { std::cell::Cell::new(0) };
+    }
+    #[cfg(target_os = "macos")]
+    unsafe extern "C" {
+        #[link_name = "__error"]
+        fn errno_loc() -> *mut i32;
+    }
+    #[cfg(not(target_os = "macos"))]
+    unsafe extern "C" {
+        #[link_name = "__errno_location"]
+        fn errno_loc() -> *mut i32;
+    }
+    pub fn clear_errno() {
+        unsafe { *errno_loc() = 0 };
+    }
+    pub fn save_errno() {
+        let e = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+        ERRNO.with(|c| c.set(e as i64));
+    }
+    pub fn errno() -> i64 {
+        ERRNO.with(|c| c.get())
+    }
+    pub fn strerror_str(n: i64) -> Str {
+        // std's formatting appends " (os error N)"; strip it to get C's text.
+        let s = std::io::Error::from_raw_os_error(n as i32).to_string();
+        let t = match s.rfind(" (os error") {
+            Some(i) => &s[..i],
+            None => &s,
+        };
+        Str::lit(t.as_bytes())
+    }
+    pub fn str_from_cstr(p: i64) -> Str {
+        if p == 0 {
+            return Str::lit(b"");
+        }
+        unsafe { Str::lit(std::ffi::CStr::from_ptr(p as usize as *const std::ffi::c_char).to_bytes()) }
+    }
+    pub fn str_from_ptr(p: i64, n: i64) -> Str {
+        if p == 0 || n <= 0 {
+            return Str::lit(b"");
+        }
+        unsafe { Str::lit(std::slice::from_raw_parts(p as usize as *const u8, n as usize)) }
+    }
+    unsafe extern "C" {
+        #[link_name = "open"]
+        fn libc_open(path: *const std::ffi::c_char, flags: i32, ...) -> i32;
+        #[link_name = "fcntl"]
+        fn libc_fcntl(fd: i32, cmd: i32, ...) -> i32;
+    }
+    // The C runtime's non-variadic wrappers (see alx.h).
+    pub unsafe fn shim_alx_sys_open(path: *const std::ffi::c_char, flags: i32, mode: i32) -> i32 {
+        unsafe { libc_open(path, flags, mode as u32) }
+    }
+    pub unsafe fn shim_alx_sys_fcntl(fd: i32, cmd: i32, arg: i64) -> i32 {
+        unsafe { libc_fcntl(fd, cmd, arg as std::ffi::c_long) }
+    }
+    pub unsafe fn shim_alx_sys_const(name: *const std::ffi::c_char) -> i64 {
+        let n = unsafe { std::ffi::CStr::from_ptr(name) }.to_bytes();
+        super::sys_consts().iter().find(|(k, _)| k.as_bytes() == n).map_or(-1, |(_, v)| *v)
     }
 
     pub fn now_ns() -> i64 {

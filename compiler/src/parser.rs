@@ -28,6 +28,7 @@ pub struct DefSig {
     pub ret: Option<TypeExpr>,
     pub fallible: bool,
     pub pure: bool,
+    pub ffi: Option<String>,
     pub body: Option<Vec<Stmt>>,
 }
 
@@ -40,12 +41,14 @@ pub struct Parser<'a> {
     in_cond: bool,
     /// File-level `using`s so far (defs below see them).
     usings: Vec<String>,
+    /// Parsing an `extern def`: no body, an optional `= "symbol"`.
+    extern_mode: bool,
 }
 
 type PResult<T> = Result<T, Diag>;
 
 pub fn parse(file: u32, toks: &[Token], next_id: &mut NodeId) -> PResult<Module> {
-    let mut p = Parser { toks, pos: 0, next_id, scopes: vec![HashSet::new()], in_cond: false, usings: vec![] };
+    let mut p = Parser { toks, pos: 0, next_id, scopes: vec![HashSet::new()], in_cond: false, usings: vec![], extern_mode: false };
     p.module(file)
 }
 
@@ -180,7 +183,7 @@ impl<'a> Parser<'a> {
                         }
                     }
                     let span = start.to(self.prev_span());
-                    let def = Def { public: false, using: self.usings.clone(), name: name.clone(), span, tparams: vec![], name_span, params: vec![], ret: None, fallible: true, errs: None, pure: false, body };
+                    let def = Def { public: false, using: self.usings.clone(), name: name.clone(), span, tparams: vec![], name_span, params: vec![], ret: None, fallible: true, errs: None, pure: false, ffi: None, body };
                     m.tests.push(TestDecl { kind, name, span, outputs, def });
                 }
                 Tok::Ident(kw) if kw == "pub" => {
@@ -190,6 +193,11 @@ impl<'a> Parser<'a> {
                     match self.peek().clone() {
                         Tok::Attr(_) | Tok::Kw(Kw::Def) | Tok::Kw(Kw::Fn) => {
                             let mut d = self.def()?;
+                            d.public = true;
+                            m.defs.push(d);
+                        }
+                        Tok::Ident(kw) if kw == "extern" && matches!(self.peek_at(1), Tok::Kw(Kw::Def)) => {
+                            let mut d = self.extern_def()?;
                             d.public = true;
                             m.defs.push(d);
                         }
@@ -233,6 +241,7 @@ impl<'a> Parser<'a> {
                     let _ = before;
                 }
                 Tok::Attr(_) | Tok::Kw(Kw::Def) | Tok::Kw(Kw::Fn) => m.defs.push(self.def()?),
+                Tok::Ident(kw) if kw == "extern" && matches!(self.peek_at(1), Tok::Kw(Kw::Def)) => m.defs.push(self.extern_def()?),
                 Tok::Kw(Kw::Struct) => {
                     let s = self.struct_def(&mut m.defs)?;
                     m.structs.push(s);
@@ -273,11 +282,28 @@ impl<'a> Parser<'a> {
         self.def_in(None)
     }
 
+    /// `extern def name(p: T, ...) -> R [= "symbol"]`: a C function.
+    fn extern_def(&mut self) -> PResult<Def> {
+        let sp = self.bump().span; // `extern`
+        if !self.is_kw(Kw::Def) {
+            return Err(Diag::new(sp, "`extern` goes before `def`: `extern def write(fd: I32, buf: [Byte], n: Int) -> Int`"));
+        }
+        self.extern_mode = true;
+        let d = self.def_sig(None);
+        self.extern_mode = false;
+        let d = d?;
+        let sym = d.ffi.clone().unwrap_or_else(|| d.name.clone());
+        if d.fallible || !d.tparams.is_empty() {
+            return Err(Diag::new(d.name_span, "an `extern def` can't be fallible or generic"));
+        }
+        Ok(Def { public: false, using: self.usings.clone(), name: d.name, span: sp.to(self.prev_span()), tparams: vec![], name_span: d.name_span, params: d.params, ret: d.ret, fallible: false, errs: None, pure: d.pure, ffi: Some(sym), body: vec![] })
+    }
+
     /// A def; inside `struct Owner { }` it is a method taking `self`.
     fn def_in(&mut self, owner: Option<&str>) -> PResult<Def> {
         let d = self.def_sig(owner.map(|o| (o, false)))?;
         let Some(body) = d.body else { unreachable!("a body is required outside interfaces") };
-        Ok(Def { public: false, using: self.usings.clone(), name: d.name, span: d.span, tparams: d.tparams, name_span: d.name_span, params: d.params, ret: d.ret, fallible: d.fallible, errs: d.errs, pure: d.pure, body })
+        Ok(Def { public: false, using: self.usings.clone(), name: d.name, span: d.span, tparams: d.tparams, name_span: d.name_span, params: d.params, ret: d.ret, fallible: d.fallible, errs: d.errs, pure: d.pure, ffi: d.ffi, body })
     }
 
     /// A def's signature and body. In an interface (`owner.1`), `self` is
@@ -359,13 +385,25 @@ impl<'a> Parser<'a> {
             fallible = true;
             ret = None;
         }
-        let body = if in_iface && !self.is_op("{") {
+        let mut ffi = None;
+        let body = if self.extern_mode {
+            if self.eat_op("=") {
+                match self.bump().tok {
+                    Tok::Str(s) => ffi = Some(s),
+                    _ => return Err(Diag::new(self.prev_span(), "`extern def f(...) = \"symbol\"`: the link name is a string literal")),
+                }
+            }
+            if self.is_op("{") {
+                return Err(Diag::new(self.span(), "an `extern def` has no body: it is a C function"));
+            }
+            None
+        } else if in_iface && !self.is_op("{") {
             None
         } else {
             Some(self.braced_stmts()?)
         };
         self.scopes.pop();
-        Ok(DefSig { name, span: start.to(self.prev_span()), tparams, name_span, params, ret, fallible, errs, pure, body })
+        Ok(DefSig { name, span: start.to(self.prev_span()), tparams, name_span, params, ret, fallible, errs, pure, ffi, body })
     }
 
     /// `[T, U: Shape, N: like Int]` after a type or def name (no space before `[`).
@@ -475,7 +513,7 @@ impl<'a> Parser<'a> {
             let short = d.name.rsplit_once('.').map_or(d.name.clone(), |(_, m)| m.to_string());
             methods.push((short, d.params[1..].to_vec(), d.ret.clone(), has_body, d.name_span));
             if let Some(body) = d.body {
-                defaults.push(Def { public: true, using: self.usings.clone(), name: d.name, span: d.span, tparams: d.tparams, name_span: d.name_span, params: d.params, ret: d.ret, fallible: d.fallible, errs: d.errs, pure: d.pure, body });
+                defaults.push(Def { public: true, using: self.usings.clone(), name: d.name, span: d.span, tparams: d.tparams, name_span: d.name_span, params: d.params, ret: d.ret, fallible: d.fallible, errs: d.errs, pure: d.pure, ffi: d.ffi, body });
             }
         }
         Ok(IfaceDef { name, span: start.to(self.prev_span()), methods })
@@ -1508,7 +1546,7 @@ impl<'a> Parser<'a> {
                         IPiece::Lit(s) => parts.push(InterpPart::Lit(s)),
                         IPiece::Code(src, base) => {
                             let toks = crate::lexer::lex_at(sp.file, &src, base)?;
-                            let mut sub = Parser { toks: &toks, pos: 0, next_id: self.next_id, scopes: self.scopes.clone(), in_cond: false, usings: vec![] };
+                            let mut sub = Parser { toks: &toks, pos: 0, next_id: self.next_id, scopes: self.scopes.clone(), in_cond: false, usings: vec![], extern_mode: false };
                             sub.skip_newlines();
                             let e = sub.expr()?;
                             sub.skip_newlines();

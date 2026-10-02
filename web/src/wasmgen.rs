@@ -273,7 +273,23 @@ fn uses_concurrency(p: &LProgram) -> bool {
     })
 }
 
+/// Does the program call C (`extern def`, `C.errno`, `Str.from_cstr`...)? The
+/// browser has no C library.
+fn uses_ffi(p: &LProgram) -> bool {
+    if !p.externs.is_empty() {
+        return true;
+    }
+    let funcs = p.funcs.iter().chain(p.gens.iter().map(|g| &g.func)).chain(p.workers.iter().map(|w| &w.func));
+    funcs.into_iter().any(|f| {
+        let d = format!("{:?}", f.body);
+        ["Rt(Errno", "Rt(Strerror", "Rt(StrFromCstr", "Rt(StrFromPtr"].iter().any(|k| d.contains(k))
+    })
+}
+
 pub fn emit(p: &LProgram) -> Result<Vec<u8>, String> {
+    if uses_ffi(p) {
+        return Err("`extern def` and the C library aren't available in the browser".into());
+    }
     if uses_concurrency(p) {
         return Err("spawn, channels, Mutex and Atomic aren't available in the browser yet".into());
     }
@@ -1090,6 +1106,7 @@ impl<'c, 'p> Fx<'c, 'p> {
 
     fn ty(&self, e: &LE) -> LTy {
         match e {
+            LE::Ffi(..) => unreachable!("rejected by uses_ffi"),
             LE::LockNew => LTy::Lock,
             LE::AtomicNew(_) => LTy::Atomic,
             LE::AtomicLoad(_) | LE::AtomicRmw(..) => LTy::I64,
@@ -1164,6 +1181,7 @@ impl<'c, 'p> Fx<'c, 'p> {
             LE::RegionOf(_) => self.i64c(0),
             // The browser never frees: regions are no-ops (handle 0).
             LE::RegionProgram => self.i64c(0),
+            LE::Ffi(..) => unreachable!("rejected by uses_ffi"),
             LE::ChanNew(..) | LE::ChanLen(_) | LE::LockNew | LE::AtomicNew(_) | LE::AtomicLoad(_) | LE::AtomicRmw(..) | LE::AtomicCas(..) => unreachable!("rejected by uses_concurrency"),
             LE::Var(v) => {
                 let ls = self.vars[*v].clone();
@@ -1640,6 +1658,7 @@ impl<'c, 'p> Fx<'c, 'p> {
             Rt::FToS => call_ret(self, "alxr_f_to_s", 2),
             Rt::U64ToS => call_ret(self, "alxr_u64_to_s", 2),
             Rt::IntFmt => call_ret(self, "alxr_int_fmt", 2),
+            Rt::Errno | Rt::Strerror | Rt::StrFromCstr | Rt::StrFromPtr => unreachable!("rejected by uses_ffi"),
             Rt::NowNs | Rt::CapBegin => {
                 self.ins().i64_const(0);
             }

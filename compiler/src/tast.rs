@@ -53,6 +53,8 @@ pub enum Ty {
     Tuple(Vec<Ty>),
     /// `T?`: a T or nothing (no nil anywhere else).
     Opt(Box<Ty>),
+    /// `Ptr`: an opaque C pointer (pointer-sized; no deref in alexandrite).
+    Ptr,
     /// A user struct (a value): its name and fields, in order.
     Struct(String, Vec<(String, Ty)>),
     /// Range[Int]
@@ -79,6 +81,7 @@ impl Ty {
             Ty::Int => "Int".into(),
             Ty::IntK(k) => k.name().into(),
             Ty::Float => "Float".into(),
+            Ty::Ptr => "Ptr".into(),
             Ty::Struct(n, _) | Ty::Enum(n, _) | Ty::Iface(n) => n.clone(),
             Ty::Opt(t) => format!("{}?", t.show()),
             Ty::Bool => "Bool".into(),
@@ -344,6 +347,16 @@ pub enum M {
     FileRead,
     /// `Time.now_ns`: a monotonic clock in nanoseconds.
     NowNs,
+    /// `Ptr.null`.
+    PtrNull,
+    /// `Str.from_cstr(p)`: a copy of the NUL-terminated string at `p`.
+    StrFromCstr,
+    /// `Str.from_ptr(p, n)`: a copy of the `n` bytes at `p`.
+    StrFromPtr,
+    /// `C.errno`: errno as saved right after the last `extern def` call on this thread.
+    CErrno,
+    /// `C.strerror(n)`.
+    CStrerror,
     /// `Test.begin_capture` / `Test.end_capture`: capture what `puts` prints.
     CapBegin,
     CapEnd,
@@ -513,6 +526,8 @@ pub struct TFunc {
     pub span: Span,
     /// Defined in a separately compiled library: emit an extern prototype.
     pub external: bool,
+    /// An `extern def`: the C symbol it calls (the function has no body).
+    pub ffi: Option<String>,
     pub is_main: bool,
     /// Lambda literals in this function: (block span start, fn type, captured locals).
     pub lambdas: Vec<(u32, Ty, Vec<LocalId>)>,

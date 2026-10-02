@@ -136,3 +136,13 @@ void alxj_lock(AlxLock *l) { alx_lock(l); }
 void alxj_unlock(AlxLock *l) { alx_unlock(l); }
 int64_t *alxj_atomic_new(int64_t v) { return alx_atomic_new(v); }
 int64_t alxj_select(AlxSelCase *cases, int64_t n, int64_t has_default, const char *loc) { return alx_select(cases, n, has_default != 0, loc); }
+
+/* ---------- C foreign functions ---------- */
+void alxj_ffi_enter(void) { alx_ffi_enter(); }
+void alxj_ffi_save_errno(void) { alx_ffi_save_errno(); }
+void *alxj_cstr_new(const AlxStr *s) { return alx_cstr_new(*s); }
+void alxj_cstr_free(void *p) { free(p); }
+int64_t alxj_errno(void) { return alx_ffi_errno_; }
+void alxj_strerror(AlxStr *out, int64_t n) { *out = alx_strerror(n); }
+void alxj_str_from_cstr(AlxStr *out, const char *p) { *out = alx_str_from_cstr(p); }
+void alxj_str_from_ptr(AlxStr *out, const char *p, int64_t n) { *out = alx_str_from_ptr(p, n); }

@@ -12,6 +12,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <errno.h>
 
 typedef struct { const char *ptr; int64_t len; } AlxStr;
 typedef struct { int64_t lo, hi; bool excl; } AlxRange;
@@ -282,5 +283,36 @@ AlxStr alx_rune_to_s(int64_t r);
 AlxStr alx_str_from_bytes(const uint8_t *p, int64_t n);
 void alx_puts_u64(int64_t bits);
 Arr_PInt alx_p_digits(AlxPInt a, const char *loc);
+
+/* ---------- C foreign functions (`extern def`) ----------
+ * The generated C declares each extern under a private name bound to the real
+ * link name, so it never clashes with a system header:
+ *   extern int64_t alx_ffi_0(int32_t, uint8_t *) __asm__(ALX_SYM("write"));
+ * ALX_SYM adds the platform's leading underscore (macOS) via __USER_LABEL_PREFIX__. */
+#define ALX_STR2_(x) #x
+#define ALX_STR_(x) ALX_STR2_(x)
+#define ALX_SYM(s) ALX_STR_(__USER_LABEL_PREFIX__) s
+/* errno as it was right after the last extern call on this thread. */
+extern _Thread_local int alx_ffi_errno_;
+static inline void alx_ffi_save_errno(void) { alx_ffi_errno_ = errno; }
+/* Before each extern call: flush our stdout buffer, so what `puts` printed
+ * comes out before what the C function writes; and zero errno. */
+void alx_ffi_enter(void);
+/* A malloc'd NUL-terminated copy of s (free it with free()). */
+char *alx_cstr_new(AlxStr s);
+AlxStr alx_strerror(int64_t n);
+/* Copies; a NULL pointer gives the empty string. */
+AlxStr alx_str_from_cstr(const char *p);
+AlxStr alx_str_from_ptr(const char *p, int64_t n);
+/* Non-variadic wrappers for variadic libc functions (std calls these as
+ * `extern def`s): open(2) and fcntl(2) pass their last argument differently
+ * on arm64 macOS, so alexandrite never calls a variadic function directly. */
+int32_t alx_sys_open(const char *path, int32_t flags, int32_t mode);
+int32_t alx_sys_fcntl(int32_t fd, int32_t cmd, int64_t arg);
+/* Platform constants by name (O_CREAT, SEEK_END, ENOENT, S_IFDIR, CLOCK_MONOTONIC, ...);
+ * -1 if the name is unknown here. */
+int64_t alx_sys_const(const char *name);
+int64_t alx_sys_const_count(void);
+const char *alx_sys_const_name(int64_t i);
 
 #endif

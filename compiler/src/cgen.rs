@@ -96,6 +96,10 @@ pub fn emit(p: &LProgram) -> String {
     }
     // Prototypes.
     let mut protos = String::new();
+    for (i, x) in p.externs.iter().enumerate() {
+        let params: Vec<&str> = x.params.iter().map(|t| ffi_cty(*t)).collect();
+        let _ = writeln!(protos, "extern {} alx_ffi_{i}({}) __asm__(ALX_SYM({:?}));", ffi_cty(x.ret), if params.is_empty() { "void".into() } else { params.join(", ") }, x.sym);
+    }
     for f in &p.funcs {
         let _ = writeln!(protos, "{};", proto(f));
     }
@@ -130,6 +134,28 @@ pub fn emit(p: &LProgram) -> String {
         let _ = writeln!(s, "int main(void) {{\n    alx_init();\n    {main}();\n    fflush(stdout);\n    return 0;\n}}");
     }
     s
+}
+
+/// The C type of an `extern def` parameter or result.
+fn ffi_cty(t: FfiTy) -> &'static str {
+    match t {
+        FfiTy::Int(k) => match k {
+            IntKind::I8 => "int8_t",
+            IntKind::I16 => "int16_t",
+            IntKind::I32 => "int32_t",
+            IntKind::I64 => "int64_t",
+            IntKind::U8 => "uint8_t",
+            IntKind::U16 => "uint16_t",
+            IntKind::U32 => "uint32_t",
+            IntKind::U64 => "uint64_t",
+        },
+        FfiTy::F64 => "double",
+        FfiTy::Bool => "bool",
+        FfiTy::Str => "const char *",
+        FfiTy::Bytes => "uint8_t *",
+        FfiTy::Ptr => "void *",
+        FfiTy::Unit => "void",
+    }
 }
 
 fn proto(f: &LFunc) -> String {
@@ -719,6 +745,35 @@ impl FnEmit<'_> {
             LE::Not(x) => format!("(!{})", self.e(x)),
             LE::Cond(c, a, b) => format!("({} ? {} : {})", self.e(c), self.e(a), self.e(b)),
             LE::Call(f, args) => format!("{f}({})", args.iter().map(|x| self.e(x)).collect::<Vec<_>>().join(", ")),
+            LE::Ffi(i, args) => {
+                let x = &self.p.externs[*i];
+                let (mut pre, mut post, mut cargs) = (String::new(), String::new(), vec![]);
+                for (k, (t, a)) in x.params.iter().zip(args).enumerate() {
+                    let ae = self.e(a);
+                    match t {
+                        FfiTy::Str => {
+                            let _ = write!(pre, "AlxStr a{k}_ = {ae}; char *c{k}_ = alx_cstr_new(a{k}_); ");
+                            let _ = write!(post, "free(c{k}_); ");
+                            cargs.push(format!("c{k}_"));
+                        }
+                        FfiTy::Bytes => {
+                            let _ = write!(pre, "__auto_type a{k}_ = {ae}; ");
+                            cargs.push(format!("(uint8_t *)a{k}_.ptr"));
+                        }
+                        FfiTy::Ptr => cargs.push(format!("(void *)(intptr_t)({ae})")),
+                        FfiTy::Int(_) => cargs.push(format!("({})({ae})", ffi_cty(*t))),
+                        _ => cargs.push(ae),
+                    }
+                }
+                let call = format!("alx_ffi_{i}({})", cargs.join(", "));
+                let (get, val) = match x.ret {
+                    FfiTy::Unit => (format!("{call};"), "(int8_t)0".to_string()),
+                    FfiTy::Ptr => (format!("void *r_ = {call};"), "(int64_t)(intptr_t)r_".to_string()),
+                    FfiTy::Int(_) => (format!("{} r_ = {call};", ffi_cty(x.ret)), "(int64_t)r_".to_string()),
+                    t => (format!("{} r_ = {call};", ffi_cty(t)), "r_".to_string()),
+                };
+                format!("({{ {pre}alx_ffi_enter(); {get} alx_ffi_save_errno(); {post}{val}; }})")
+            }
             LE::Rt(rt, args) => {
                 let a: Vec<String> = args.iter().map(|x| self.e(x)).collect();
                 let s = |f: &str| format!("{f}({})", a.join(", "));
@@ -771,6 +826,10 @@ impl FnEmit<'_> {
                     Rt::FileStatus => s("alx_file_status"),
                     Rt::FileRead => s("alx_file_read_or_empty"),
                     Rt::NowNs => s("alx_now_ns"),
+                    Rt::Errno => "((int64_t)alx_ffi_errno_)".into(),
+                    Rt::Strerror => s("alx_strerror"),
+                    Rt::StrFromCstr => format!("alx_str_from_cstr((const char *)(intptr_t)({}))", a[0]),
+                    Rt::StrFromPtr => format!("alx_str_from_ptr((const char *)(intptr_t)({}), {})", a[0], a[1]),
                     Rt::CapBegin => s("alx_cap_begin"),
                     Rt::CapEnd => s("alx_cap_end"),
                     Rt::StrFromBytes => format!("alx_str_from_bytes((const uint8_t *)({0}).ptr, ({0}).len)", a[0]),

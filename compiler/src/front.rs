@@ -412,6 +412,12 @@ fn qualify(m: &mut Module, p: &str) {
     m.public = m.public.iter().map(|n| q(n)).collect();
 }
 
+/// A def's entry in the world: an `extern def` carries its C signature.
+fn def_info(d: &Def, overflow: Overflow, pkg: &str) -> Result<DefInfo, Diag> {
+    let external = if d.ffi.is_some() { Some(crate::check::ffi_sig(d)?) } else { None };
+    Ok(DefInfo { def: d.clone(), overflow, external, pkg: pkg.to_string() })
+}
+
 /// Check the whole program, every imported package in the same world.
 /// `externs`: the interface of packages compiled separately (whose
 /// declarations are then left out).
@@ -419,9 +425,11 @@ pub fn check_program(l: &Loaded, externs: Vec<DefInfo>) -> Result<TProgram, Diag
     let ov = |file: u32| l.overflow.get(&file).copied().unwrap_or(Overflow::Abort);
     let ext: HashSet<String> = externs.iter().map(|d| d.pkg.clone()).collect();
     let ext_names: Vec<String> = externs.iter().map(|d| d.def.name.clone()).collect();
-    let mut defs: Vec<DefInfo> = l.main.defs.iter().map(|d| DefInfo { def: d.clone(), overflow: ov(d.span.file), external: None, pkg: String::new() }).collect();
+    let mut defs: Vec<DefInfo> = l.main.defs.iter().map(|d| def_info(d, ov(d.span.file), "")).collect::<Result<_, _>>()?;
     for p in l.pkgs.iter().filter(|p| !ext.contains(&p.path)) {
-        defs.extend(p.module.defs.iter().map(|d| DefInfo { def: d.clone(), overflow: ov(d.span.file), external: None, pkg: p.path.clone() }));
+        for d in &p.module.defs {
+            defs.push(def_info(d, ov(d.span.file), &p.path)?);
+        }
     }
     defs.extend(externs);
     // T3: a package's public defs spell their parameter types.
@@ -535,7 +543,7 @@ pub fn check_library(l: &Loaded, idx: usize, prefix: &str) -> Result<(TProgram, 
     let pkg = &l.pkgs[idx];
     let m = &pkg.module;
     let ov = |file: u32| l.overflow.get(&file).copied().unwrap_or(Overflow::Abort);
-    let defs = m.defs.iter().map(|d| DefInfo { def: d.clone(), overflow: ov(d.span.file), external: None, pkg: pkg.path.clone() }).collect();
+    let defs = m.defs.iter().map(|d| def_info(d, ov(d.span.file), &pkg.path)).collect::<Result<Vec<_>, _>>()?;
     crate::check::set_packages(m.public.iter().cloned().chain(m.defs.iter().filter(|d| d.public).map(|d| d.name.clone())).collect(), HashMap::from([(pkg.path.clone(), HashMap::new())]));
     let mut w = World::new(&l.sm, defs)?;
     w.add_consts(&m.consts)?;
@@ -612,9 +620,10 @@ pub fn parse_header(text: &str, overflow: Overflow, span: Span, pkg: &str) -> Re
             fallible: flags.contains(&"fallible"),
             errs: Some(vec!["Error".into()]),
             pure: flags.contains(&"pure"),
+            ffi: None,
             body: vec![],
         };
-        let sig = ExternSig { params: ptys, ret: parse_ty(ret.trim())?, fallible: def.fallible, pure: def.pure, symbol };
+        let sig = ExternSig { params: ptys, ret: parse_ty(ret.trim())?, fallible: def.fallible, pure: def.pure, symbol, ffi: false };
         out.push(DefInfo { def, overflow, external: Some(sig), pkg: pkg.to_string() });
     }
     Ok(out)

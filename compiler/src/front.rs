@@ -349,6 +349,14 @@ pub fn check_program(l: &Loaded, externs: Vec<DefInfo>) -> Result<TProgram, Diag
         defs.extend(p.module.defs.iter().map(|d| DefInfo { def: d.clone(), overflow: ov(d.span.file), external: None, pkg: p.path.clone() }));
     }
     defs.extend(externs);
+    // T3: a package's public defs spell their parameter types.
+    for p in &l.pkgs {
+        for d in p.module.defs.iter().filter(|d| d.public) {
+            if let Some(q) = d.params.iter().find(|q| q.ty.is_none() && q.name != "self") {
+                return Err(Diag::new(q.span, format!("`pub def` parameters need types: `{}: Type`", q.name)));
+            }
+        }
+    }
     // Visibility and each package's imports.
     let mut public: HashSet<String> = l.pkgs.iter().flat_map(|p| p.module.public.iter().cloned()).collect();
     public.extend(l.pkgs.iter().flat_map(|p| p.module.defs.iter().filter(|d| d.public).map(|d| d.name.clone())));

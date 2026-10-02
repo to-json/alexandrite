@@ -2591,7 +2591,7 @@ impl<'a> Lw<'a> {
                 // Bools are 0/1 in the cell.
                 let Ty::Atomic(vt) = (if m == AtomicNew { e.ty.clone() } else { recv.unwrap().ty.clone() }) else { unreachable!() };
                 let is_bool = *vt == Ty::Bool;
-                let mut val_in = |lw: &mut Self, a: &TExpr| {
+                let val_in = |lw: &mut Self, a: &TExpr| {
                     let v = lw.expr(a);
                     if is_bool { LE::Cond(Box::new(v), Box::new(LE::I(1)), Box::new(LE::I(0))) } else { lw.int_in(v, a.span) }
                 };

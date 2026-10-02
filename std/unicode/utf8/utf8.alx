@@ -1,0 +1,213 @@
+# Package utf8: Go's unicode/utf8, with alx idioms (S2).
+#
+# Strings are arbitrary bytes (S6); these functions read them as UTF-8.
+# Invalid encodings decode as (RUNE_ERROR, 1), exactly like Go: overlong
+# forms, surrogates (U+D800..U+DFFF), values above U+10FFFF, stray
+# continuation bytes and truncated sequences.
+#
+# Beyond Go's API, `decode_rune_at(s, i)` reads at a byte offset without
+# slicing, for scanning loops. The `[U8]` variants (`valid`, `rune_count`,
+# `decode_rune`, `decode_last_rune`, `full_rune`) copy into a Str first.
+
+pub RUNE_ERROR: Rune = 0xFFFD # what an invalid encoding decodes to
+pub RUNE_SELF: Rune = 0x80    # below this, a rune is its own single byte
+pub MAX_RUNE: Rune = 0x10FFFF # the largest valid code point
+pub UTF_MAX = 4               # the longest encoding, in bytes
+
+# The number of bytes needed to encode `r`, or -1 if `r` isn't a valid rune
+# (negative, a surrogate, or above MAX_RUNE).
+pub def rune_len(r: Rune) -> Int {
+  if r < 0 {
+    -1
+  } else if r < 0x80 {
+    1
+  } else if r < 0x800 {
+    2
+  } else if r >= 0xD800 && r <= 0xDFFF {
+    -1
+  } else if r < 0x10000 {
+    3
+  } else if r <= 0x10FFFF {
+    4
+  } else {
+    -1
+  }
+}
+
+# Whether `r` is a legal Unicode code point (not a surrogate, in range).
+pub def valid_rune(r: Rune) -> Bool {
+  (r >= 0 && r < 0xD800) || (r > 0xDFFF && r <= 0x10FFFF)
+}
+
+# Whether `b` can begin an encoded rune (it isn't a continuation byte).
+pub def rune_start(b: Byte) -> Bool {
+  (b & 0xC0) != 0x80
+}
+
+# Decodes the rune starting at byte offset `i` of `s`. Returns (rune, size).
+# An empty remainder gives (RUNE_ERROR, 0); an invalid encoding gives
+# (RUNE_ERROR, 1).
+pub def decode_rune_at(s: Str, i: Int) -> (Rune, Int) {
+  n = s.size - i
+  if n <= 0 {
+    return (RUNE_ERROR, 0)
+  }
+  b0 = s[i].to_i
+  if b0 < 0x80 {
+    return (b0.to_i32, 1)
+  }
+  if b0 < 0xC2 || b0 > 0xF4 {
+    return (RUNE_ERROR, 1)
+  }
+  if b0 < 0xE0 {
+    return (RUNE_ERROR, 1) if n < 2
+    b1 = s[i + 1].to_i
+    return (RUNE_ERROR, 1) if (b1 & 0xC0) != 0x80
+    return ((((b0 & 0x1F) << 6) | (b1 & 0x3F)).to_i32, 2)
+  }
+  if b0 < 0xF0 {
+    return (RUNE_ERROR, 1) if n < 3
+    b1 = s[i + 1].to_i
+    b2 = s[i + 2].to_i
+    lo = b0 == 0xE0 ? 0xA0 : 0x80
+    hi = b0 == 0xED ? 0x9F : 0xBF
+    return (RUNE_ERROR, 1) if b1 < lo || b1 > hi
+    return (RUNE_ERROR, 1) if (b2 & 0xC0) != 0x80
+    return ((((b0 & 0x0F) << 12) | ((b1 & 0x3F) << 6) | (b2 & 0x3F)).to_i32, 3)
+  }
+  return (RUNE_ERROR, 1) if n < 4
+  b1 = s[i + 1].to_i
+  b2 = s[i + 2].to_i
+  b3 = s[i + 3].to_i
+  lo = b0 == 0xF0 ? 0x90 : 0x80
+  hi = b0 == 0xF4 ? 0x8F : 0xBF
+  return (RUNE_ERROR, 1) if b1 < lo || b1 > hi
+  return (RUNE_ERROR, 1) if (b2 & 0xC0) != 0x80 || (b3 & 0xC0) != 0x80
+  r = ((b0 & 0x07) << 18) | ((b1 & 0x3F) << 12) | ((b2 & 0x3F) << 6) | (b3 & 0x3F)
+  (r.to_i32, 4)
+}
+
+# Decodes the first rune of `s`. Returns (rune, size in bytes).
+pub def decode_rune_in_string(s: Str) -> (Rune, Int) {
+  decode_rune_at(s, 0)
+}
+
+# Decodes the last rune of `s`. Returns (rune, size). An empty string gives
+# (RUNE_ERROR, 0); an invalid final encoding gives (RUNE_ERROR, 1).
+pub def decode_last_rune_in_string(s: Str) -> (Rune, Int) {
+  end_ = s.size
+  return (RUNE_ERROR, 0) if end_ == 0
+  last = s[end_ - 1]
+  return (last.to_i32, 1) if last < 0x80
+  lim = end_ - 4
+  lim = 0 if lim < 0
+  start = end_ - 2
+  while start >= lim {
+    break if rune_start(s[start])
+    start -= 1
+  }
+  start = 0 if start < 0
+  r, size = decode_rune_at(s, start)
+  return (RUNE_ERROR, 1) if start + size != end_
+  (r, size)
+}
+
+# Whether `s` begins with a full encoding of a rune. An invalid encoding
+# counts as a full (width-1) rune, as in Go.
+pub def full_rune_in_string(s: Str) -> Bool {
+  n = s.size
+  return false if n == 0
+  b0 = s[0].to_i
+  return true if b0 < 0xC2 || b0 > 0xF4
+  need = b0 < 0xE0 ? 2 : (b0 < 0xF0 ? 3 : 4)
+  return true if n >= need
+  # truncated: full only if what is there already can't be valid
+  if n >= 2 {
+    b1 = s[1].to_i
+    lo = 0x80
+    hi = 0xBF
+    if b0 == 0xE0 {
+      lo = 0xA0
+    } else if b0 == 0xED {
+      hi = 0x9F
+    } else if b0 == 0xF0 {
+      lo = 0x90
+    } else if b0 == 0xF4 {
+      hi = 0x8F
+    }
+    return true if b1 < lo || b1 > hi
+  }
+  if n >= 3 {
+    return true if (s[2].to_i & 0xC0) != 0x80
+  }
+  false
+}
+
+# The number of runes in `s`. Each invalid byte counts as one rune.
+pub def rune_count_in_string(s: Str) -> Int {
+  count = 0
+  i = 0
+  n = s.size
+  while i < n {
+    if s[i] < 0x80 {
+      i += 1
+    } else {
+      _, size = decode_rune_at(s, i)
+      i += size
+    }
+    count += 1
+  }
+  count
+}
+
+# Whether `s` consists entirely of valid UTF-8.
+pub def valid_string(s: Str) -> Bool {
+  i = 0
+  n = s.size
+  while i < n {
+    if s[i] < 0x80 {
+      i += 1
+    } else {
+      r, size = decode_rune_at(s, i)
+      return false if r == 0xFFFD && size == 1
+      i += size
+    }
+  }
+  true
+}
+
+# Appends the UTF-8 encoding of `r` to `buf`. An invalid rune encodes
+# RUNE_ERROR (U+FFFD).
+pub def append_rune(buf: [U8], r: Rune) -> [U8] {
+  c = r
+  c = 0xFFFD if !valid_rune(c)
+  if c < 0x80 {
+    buf << c.as_u8
+  } else if c < 0x800 {
+    buf << (0xC0 | (c >> 6)).as_u8
+    buf << (0x80 | (c & 0x3F)).as_u8
+  } else if c < 0x10000 {
+    buf << (0xE0 | (c >> 12)).as_u8
+    buf << (0x80 | ((c >> 6) & 0x3F)).as_u8
+    buf << (0x80 | (c & 0x3F)).as_u8
+  } else {
+    buf << (0xF0 | (c >> 18)).as_u8
+    buf << (0x80 | ((c >> 12) & 0x3F)).as_u8
+    buf << (0x80 | ((c >> 6) & 0x3F)).as_u8
+    buf << (0x80 | (c & 0x3F)).as_u8
+  }
+  buf
+}
+
+# The UTF-8 encoding of `r` as bytes. An invalid rune encodes U+FFFD.
+pub def encode_rune(r: Rune) -> [U8] {
+  buf: [U8] = []
+  append_rune(buf, r)
+}
+
+# The `[U8]` flavours of the Str functions above.
+pub def valid(b: [U8]) -> Bool { valid_string(Str.from_bytes(b)) }
+pub def rune_count(b: [U8]) -> Int { rune_count_in_string(Str.from_bytes(b)) }
+pub def full_rune(b: [U8]) -> Bool { full_rune_in_string(Str.from_bytes(b)) }
+pub def decode_rune(b: [U8]) -> (Rune, Int) { decode_rune_in_string(Str.from_bytes(b)) }
+pub def decode_last_rune(b: [U8]) -> (Rune, Int) { decode_last_rune_in_string(Str.from_bytes(b)) }

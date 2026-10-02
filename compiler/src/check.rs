@@ -1453,6 +1453,9 @@ impl<'w, 'a> FnCx<'w, 'a> {
                     let mut ids = vec![];
                     let mut parts = vec![];
                     for (k, ((name, nsp), t)) in targets.iter().zip(&ts).enumerate() {
+                        if name == "_" {
+                            continue;
+                        }
                         let whole = self.mk(TK::Local(tmp), tt.clone(), *nsp);
                         parts.push(self.mk(TK::M(M::TupleGet(k), Some(Box::new(whole)), vec![], None), t.clone(), *nsp));
                         ids.push(self.assign_local(name, *nsp, t, sp_node(nsp))?);
@@ -2480,6 +2483,15 @@ impl<'w, 'a> FnCx<'w, 'a> {
                 let a = self.coerce_branch(a, &rb)?;
                 (a, b)
             }
+            // `c ? x : 0` with x a U8: the literal takes the other branch's type.
+            (Ty::Int, t) if t.int_kind().is_some() && matches!(a.kind, TK::Const(_)) => {
+                let a = self.coerce(a, &rb)?;
+                (a, b)
+            }
+            (t, Ty::Int) if t.int_kind().is_some() && matches!(b.kind, TK::Const(_)) => {
+                let b = self.coerce(b, &ra)?;
+                (a, b)
+            }
             _ => (a, b),
         })
     }
@@ -2886,6 +2898,13 @@ impl<'w, 'a> FnCx<'w, 'a> {
                 }
             }
             return Ok(self.mk(TK::Array(vs), w, e.span));
+        }
+        if let (ExprKind::ArrayRepeat(v, n), Ty::Array(el)) = (&e.kind, &w) {
+            // `[0; 800]` as a `[U8]`: the fill takes the element type.
+            let v = self.value_as(v, el)?;
+            self.expect(&v.ty, el, v.span, "array element")?;
+            let n = self.index_value(n)?;
+            return Ok(self.mk(TK::M(M::ArrayNew, None, vec![n, v], None), w.clone(), e.span));
         }
         let saved = self.want_hint.replace(w.clone());
         let v = self.value(e);
@@ -4450,7 +4469,7 @@ impl<'w, 'a> FnCx<'w, 'a> {
         if let Ty::Atomic(t) = &rt {
             let t = (**t).clone();
             self.impure = true;
-            let mut val = |ck: &mut Self, a: &Expr| -> R<TExpr> {
+            let val = |ck: &mut Self, a: &Expr| -> R<TExpr> {
                 let v = ck.value_as(a, &t)?;
                 ck.expect(&v.ty, &t, v.span, "atomic value")?;
                 Ok(v)

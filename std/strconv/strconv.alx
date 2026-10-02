@@ -1,0 +1,303 @@
+# Package strconv: Go's strconv, with alx idioms (S2).
+#
+#   Go                              alx
+#   Atoi(s) (int, error)            atoi(s) -> ~Int<NumError>
+#   ParseInt(s, base, bits)         parse_int(s, base, bit_size) -> ~Int<NumError>
+#   ParseUint(s, base, bits)        parse_uint(s, base, bit_size) -> ~U64<NumError>
+#   ParseBool / FormatBool          parse_bool(s) -> ~Bool<NumError> / format_bool(b)
+#   ParseFloat(s, bits)             parse_float(s) / parse_float_bits(s, bit_size)
+#   FormatFloat(f, 'f', -1, 64)     format_float(f, "f", -1, 64)
+#   Quote / Unquote ...             quote, quote_to_ascii, quote_to_graphic, quote_rune, unquote, ...
+#
+# Differences from Go, all consequences of `~T` replacing (T, error):
+#   - On a range error Go returns the clamped value together with the error
+#     (ParseInt("999", 10, 8) gives 127 and ErrRange). A `~T` carries one or
+#     the other, so you get only the error; see `NumError.ErrRange`.
+#   - Function names inside error messages are snake_case ("atoi", "parse_int").
+#   - The `fmt` argument of format_float is a one-character Str, not a byte.
+#   - There are no append_* variants and no complex-number functions.
+#
+# Method sugar applies to the functions whose first parameter is a Str, so
+# "42".atoi and "ff".parse_int(16, 64) work.
+
+# The ways a number conversion fails, after Go's *NumError. Every variant
+# carries the failing function's name and the offending input.
+pub error NumError {
+  ErrSyntax(func_name: Str, num: Str)          # the input isn't a valid number
+  ErrRange(func_name: Str, num: Str)           # the value doesn't fit the target type
+  ErrBase(func_name: Str, num: Str, base: Int) # base is not 0 or 2..36
+  ErrBitSize(func_name: Str, num: Str, bit_size: Int)
+
+  def message -> Str {
+    case self {
+      ErrSyntax(f, n) => "strconv.#{f}: parsing #{quote(n)}: invalid syntax"
+      ErrRange(f, n) => "strconv.#{f}: parsing #{quote(n)}: value out of range"
+      ErrBase(f, n, b) => "strconv.#{f}: parsing #{quote(n)}: invalid base #{b}"
+      ErrBitSize(f, n, b) => "strconv.#{f}: parsing #{quote(n)}: invalid bit size #{b}"
+    }
+  }
+}
+
+# The largest Int that fits in an Int (Go's strconv.IntSize is 64).
+pub INT_SIZE = 64
+
+# Status codes of the parsing cores.
+ST_OK = 0
+ST_SYNTAX = 1
+ST_RANGE = 2
+ST_BASE = 3
+ST_BITSIZE = 4
+
+DIGITS = "0123456789abcdefghijklmnopqrstuvwxyz"
+
+# The NumError for a failed core: `st` is one of the ST_ codes.
+def num_error(st: Int, fn_name: Str, s: Str, base: Int, bit_size: Int) -> NumError {
+  case st {
+    ST_RANGE => NumError.ErrRange(func_name: fn_name, num: s)
+    ST_BASE => NumError.ErrBase(func_name: fn_name, num: s, base: base)
+    ST_BITSIZE => NumError.ErrBitSize(func_name: fn_name, num: s, bit_size: bit_size)
+    _ => NumError.ErrSyntax(func_name: fn_name, num: s)
+  }
+}
+
+# Whether underscores in `s0` are placed as Go allows: only between digits
+# or after a base prefix.
+def underscore_ok(s0: Str) -> Bool {
+  s = s0
+  # optional sign
+  if s.size >= 1 && (s[0] == 45 || s[0] == 43) {
+    s = s[1...s.size]
+  }
+  # optional base prefix
+  i = 0
+  saw = 94 # '^': start of number
+  hex = false
+  if s.size >= 2 && s[0] == 48 {
+    c1 = s[1] | 32
+    if c1 == 98 || c1 == 111 || c1 == 120 {
+      i = 2
+      saw = 48 # the prefix counts as a digit for separators
+      hex = c1 == 120
+    }
+  }
+  # number proper
+  while i < s.size {
+    c = s[i]
+    if (c >= 48 && c <= 57) || (hex && (c | 32) >= 97 && (c | 32) <= 102) {
+      saw = 48
+      i += 1
+      next
+    }
+    if c == 95 {
+      return false if saw != 48
+      saw = 95
+      i += 1
+      next
+    }
+    return false if saw == 95
+    saw = 33
+    i += 1
+  }
+  saw != 95
+}
+
+# The core of parse_uint: (value, status). On a range error the value is the
+# largest for bit_size.
+def parse_uint_core(s: Str, base0: Int, bit_size0: Int) -> (U64, Int) {
+  return (0, ST_SYNTAX) if s.size == 0
+  max64: U64 = 18446744073709551615
+  base = base0
+  base0z = base0 == 0
+  str = s
+  if base >= 2 && base <= 36 {
+    # valid
+  } else if base == 0 {
+    # look for a base prefix
+    base = 10
+    if s[0] == 48 {
+      c1 = s.size >= 3 ? (s[1] | 32) : 0
+      if c1 == 98 {
+        base = 2
+        str = s[2...s.size]
+      } else if c1 == 111 {
+        base = 8
+        str = s[2...s.size]
+      } else if c1 == 120 {
+        base = 16
+        str = s[2...s.size]
+      } else {
+        base = 8
+        str = s[1...s.size]
+      }
+    }
+  } else {
+    return (0, ST_BASE)
+  }
+  bit_size = bit_size0
+  if bit_size == 0 {
+    bit_size = INT_SIZE
+  } else if bit_size < 0 || bit_size > 64 {
+    return (0, ST_BITSIZE)
+  }
+  base_u = base.to_u64
+  # Cutoff is the smallest number such that cutoff*base > maxUint64.
+  cutoff = max64 / base_u + 1
+  max_val = max64
+  if bit_size < 64 {
+    one: U64 = 1
+    max_val = (one << bit_size) - 1
+  }
+  underscores = false
+  n: U64 = 0
+  i = 0
+  while i < str.size {
+    c = str[i].to_i
+    d = 0
+    if c == 95 && base0z {
+      underscores = true
+      i += 1
+      next
+    }
+    if c >= 48 && c <= 57 {
+      d = c - 48
+    } else if (c | 32) >= 97 && (c | 32) <= 122 {
+      d = (c | 32) - 97 + 10
+    } else {
+      return (0, ST_SYNTAX)
+    }
+    return (0, ST_SYNTAX) if d >= base
+    return (max_val, ST_RANGE) if n >= cutoff
+    n = n *% base_u
+    n1 = n +% d.to_u64
+    return (max_val, ST_RANGE) if n1 < n || n1 > max_val
+    n = n1
+    i += 1
+  }
+  return (0, ST_SYNTAX) if underscores && !underscore_ok(s)
+  (n, ST_OK)
+}
+
+# The core of parse_int: (value, status).
+def parse_int_core(s: Str, base: Int, bit_size0: Int) -> (Int, Int) {
+  return (0, ST_SYNTAX) if s.size == 0
+  neg = false
+  body = s
+  if s[0] == 43 {
+    body = s[1...s.size]
+  } else if s[0] == 45 {
+    neg = true
+    body = s[1...s.size]
+  }
+  un, st = parse_uint_core(body, base, bit_size0)
+  return (0, st) if st != ST_OK && st != ST_RANGE
+  bit_size = bit_size0 == 0 ? INT_SIZE : bit_size0
+  cutoff: U64 = 9223372036854775808
+  if bit_size < 64 {
+    one: U64 = 1
+    cutoff = one << (bit_size - 1)
+  }
+  # (After a range error `un` is the largest value for bit_size, so the checks
+  # below report it; with bit_size 1 Go's code falls through to success, and so
+  # does this.)
+  if !neg && un >= cutoff {
+    return ((cutoff - 1).as_i64, ST_RANGE)
+  }
+  if neg && un > cutoff {
+    return (0 -% cutoff.as_i64, ST_RANGE)
+  }
+  n = un.as_i64
+  (neg ? 0 -% n : n, ST_OK)
+}
+
+# Parses `s` as an unsigned integer in the given base (0 means: from the
+# prefix, 0x 0o 0b or a leading 0, with underscores allowed) that fits in
+# bit_size bits (0 means 64).
+pub def parse_uint(s: Str, base: Int, bit_size: Int) -> ~U64<NumError> {
+  v, st = parse_uint_core(s, base, bit_size)
+  fail num_error(st, "parse_uint", s, base, bit_size) if st != ST_OK
+  v
+}
+
+# Parses `s` as a signed integer in the given base (0 means: from the prefix,
+# 0x 0o 0b or a leading 0, with underscores allowed) that fits in bit_size
+# bits (0 means 64). An optional sign is accepted.
+pub def parse_int(s: Str, base: Int, bit_size: Int) -> ~Int<NumError> {
+  v, st = parse_int_core(s, base, bit_size)
+  fail num_error(st, "parse_int", s, base, bit_size) if st != ST_OK
+  v
+}
+
+# `parse_int(s, 10, 0)`.
+pub def atoi(s: Str) -> ~Int<NumError> {
+  n = s.size
+  if n > 0 && n < 19 {
+    # fast path for small integers that fit without overflow
+    i = 0
+    neg = false
+    if s[0] == 45 || s[0] == 43 {
+      neg = s[0] == 45
+      i = 1
+      fail NumError.ErrSyntax(func_name: "atoi", num: s) if n == 1
+    }
+    v = 0
+    while i < n {
+      d = s[i].to_i - 48
+      fail NumError.ErrSyntax(func_name: "atoi", num: s) if d < 0 || d > 9
+      v = v * 10 + d
+      i += 1
+    }
+    return neg ? -v : v
+  }
+  v, st = parse_int_core(s, 10, 0)
+  fail num_error(st, "atoi", s, 10, 0) if st != ST_OK
+  v
+}
+
+# The string form of `u` in the given base (2..36), lower case.
+pub def format_uint(u: U64, base: Int) -> Str {
+  assert base >= 2 && base <= 36
+  return u.to_s if base == 10
+  buf: [U8] = [0; 64]
+  i = 64
+  b = base.to_u64
+  v = u
+  while v >= b {
+    i -= 1
+    buf[i] = DIGITS[(v % b).to_i]
+    v = v / b
+  }
+  i -= 1
+  buf[i] = DIGITS[v.to_i]
+  Str.from_bytes(buf[i...64])
+}
+
+# The string form of `i` in the given base (2..36), lower case, with a
+# leading '-' for negatives.
+pub def format_int(i: Int, base: Int) -> Str {
+  assert base >= 2 && base <= 36
+  if i >= 0 {
+    return format_uint(i.as_u64, base)
+  }
+  "-" + format_uint((0 -% i).as_u64, base)
+}
+
+# `format_int(i, 10)`.
+pub def itoa(i: Int) -> Str {
+  i.to_s
+}
+
+# 1, t, T, TRUE, true, True are true; 0, f, F, FALSE, false, False are false.
+pub def parse_bool(s: Str) -> ~Bool<NumError> {
+  if s == "1" || s == "t" || s == "T" || s == "TRUE" || s == "true" || s == "True" {
+    return true
+  }
+  if s == "0" || s == "f" || s == "F" || s == "FALSE" || s == "false" || s == "False" {
+    return false
+  }
+  fail NumError.ErrSyntax(func_name: "parse_bool", num: s)
+}
+
+# "true" or "false".
+pub def format_bool(b: Bool) -> Str {
+  b ? "true" : "false"
+}

@@ -1,0 +1,321 @@
+# Decimal and hexadecimal string to float conversion, after Go's strconv/atof.go.
+#
+# Precision: the result is the correctly rounded (nearest, ties to even)
+# binary64 or binary32 value, for every input. Two paths produce it:
+#   - exact: a mantissa below 2^52 and a decimal exponent small enough that
+#     one multiplication or division by an exactly-representable power of ten
+#     (10^0 .. 10^22) is a single correctly-rounded operation (Clinger);
+#   - everything else: the exact decimal expansion in a multiprecision Dec,
+#     shifted by powers of two and rounded (Go's slow path). That is
+#     correct but not fast (microseconds to tens of microseconds per number).
+# There is no Eisel-Lemire fast path.
+
+# The parsed pieces of a float literal: value = mantissa * base^exp, where
+# base is 10 (hex == false) or 2.
+struct FloatRead {
+  mantissa: U64
+  exp: Int
+  neg: Bool
+  trunc: Bool
+  hex: Bool
+  n: Int
+  ok: Bool
+}
+
+# Length of the common prefix of `s` and the lower-case `prefix`, ignoring the
+# case of `s`.
+def common_prefix_len_ignore_case(s: Str, prefix: Str) -> Int {
+  n = prefix.size < s.size ? prefix.size : s.size
+  i = 0
+  while i < n {
+    c = s[i]
+    c = c + 32 if c >= 65 && c <= 90
+    return i if c != prefix[i]
+    i += 1
+  }
+  n
+}
+
+# inf, infinity and nan, possibly signed, any case. Returns (value, consumed,
+# ok).
+def special(s0: Str) -> (Float, Int, Bool) {
+  return (0.0, 0, false) if s0.size == 0
+  s = s0
+  sign = 1
+  nsign = 0
+  c = s[0]
+  inf_ok = c == 105 || c == 73
+  if c == 43 || c == 45 {
+    sign = -1 if c == 45
+    nsign = 1
+    s = s[1...s.size]
+    inf_ok = true
+  }
+  if inf_ok {
+    n = common_prefix_len_ignore_case(s, "infinity")
+    # anything longer than "inf" is fine, but without "infinity" only consume "inf"
+    n = 3 if n > 3 && n < 8
+    if n == 3 || n == 8 {
+      return (sign < 0 ? neg_inf() : pos_inf(), nsign + n, true)
+    }
+  } else if c == 110 || c == 78 {
+    if common_prefix_len_ignore_case(s, "nan") == 3 {
+      return (nan_value(), 3, true)
+    }
+  }
+  (0.0, 0, false)
+}
+
+def neg_inf -> Float {
+  pos_inf() * -1.0
+}
+
+# Reads the mantissa and exponent of a decimal or hexadecimal float at the
+# start of `s`; the number may be followed by other characters. `n` is the
+# number of bytes consumed.
+def read_float(s: Str) -> FloatRead {
+  mantissa: U64 = 0
+  neg = false
+  trunc = false
+  hex = false
+  exp = 0
+  i = 0
+  bad = FloatRead.new(mantissa: 0, exp: 0, neg: false, trunc: false, hex: false, n: 0, ok: false)
+  underscores = false
+  if i >= s.size {
+    return bad
+  }
+  if s[i] == 43 {
+    i += 1
+  } else if s[i] == 45 {
+    neg = true
+    i += 1
+  }
+  base: U64 = 10
+  max_mant_digits = 19
+  exp_char: Byte = 101
+  if i + 2 < s.size && s[i] == 48 && (s[i + 1] | 32) == 120 {
+    base = 16
+    max_mant_digits = 16
+    i += 2
+    exp_char = 112
+    hex = true
+  }
+  sawdot = false
+  sawdigits = false
+  nd = 0
+  nd_mant = 0
+  dp = 0
+  while i < s.size {
+    c = s[i]
+    if c == 95 {
+      underscores = true
+      i += 1
+      next
+    }
+    if c == 46 {
+      break if sawdot
+      sawdot = true
+      dp = nd
+      i += 1
+      next
+    }
+    if c >= 48 && c <= 57 {
+      sawdigits = true
+      if c == 48 && nd == 0 {
+        dp -= 1
+        i += 1
+        next
+      }
+      nd += 1
+      if nd_mant < max_mant_digits {
+        mantissa = mantissa * base + (c - 48).to_u64
+        nd_mant += 1
+      } else if c != 48 {
+        trunc = true
+      }
+      i += 1
+      next
+    }
+    if hex && (c | 32) >= 97 && (c | 32) <= 102 {
+      sawdigits = true
+      nd += 1
+      if nd_mant < max_mant_digits {
+        mantissa = mantissa * 16 + ((c | 32) - 97 + 10).to_u64
+        nd_mant += 1
+      } else {
+        trunc = true
+      }
+      i += 1
+      next
+    }
+    break
+  }
+  return FloatRead.new(mantissa: 0, exp: 0, neg: false, trunc: false, hex: false, n: i, ok: false) unless sawdigits
+  dp = nd unless sawdot
+  if hex {
+    dp = dp * 4
+    nd_mant = nd_mant * 4
+  }
+  # optional exponent moves the point
+  if i < s.size && (s[i] | 32) == exp_char {
+    i += 1
+    return FloatRead.new(mantissa: 0, exp: 0, neg: false, trunc: false, hex: false, n: i, ok: false) if i >= s.size
+    esign = 1
+    if s[i] == 43 {
+      i += 1
+    } else if s[i] == 45 {
+      i += 1
+      esign = -1
+    }
+    if i >= s.size || s[i] < 48 || s[i] > 57 {
+      return FloatRead.new(mantissa: 0, exp: 0, neg: false, trunc: false, hex: false, n: i, ok: false)
+    }
+    e = 0
+    while i < s.size && ((s[i] >= 48 && s[i] <= 57) || s[i] == 95) {
+      if s[i] == 95 {
+        underscores = true
+      } else if e < 10000 {
+        e = e * 10 + s[i].to_i - 48
+      }
+      i += 1
+    }
+    dp += e * esign
+  } else if hex {
+    # a hex float must have an exponent
+    return FloatRead.new(mantissa: 0, exp: 0, neg: false, trunc: false, hex: false, n: i, ok: false)
+  }
+  exp = dp - nd_mant if mantissa != 0
+  if underscores && !underscore_ok(s[0...i]) {
+    return FloatRead.new(mantissa: 0, exp: 0, neg: false, trunc: false, hex: false, n: i, ok: false)
+  }
+  FloatRead.new(mantissa: mantissa, exp: exp, neg: neg, trunc: trunc, hex: hex, n: i, ok: true)
+}
+
+# 10^n for 0 <= n <= 22, exactly.
+def pow10(n: Int) -> Float {
+  p = 1.0
+  i = 0
+  while i < n {
+    p = p * 10.0
+    i += 1
+  }
+  p
+}
+
+# Converts mantissa * 10^exp with at most one float operation, when that
+# operation is exact on its inputs and so correctly rounded.
+def atof64_exact(mantissa: U64, exp0: Int, neg: Bool) -> (Float, Bool) {
+  no = (0.0, false)
+  return no if (mantissa >> 52) != 0
+  f = mantissa.to_f
+  f = f * -1.0 if neg
+  exp = exp0
+  if exp == 0 {
+    return (f, true)
+  }
+  if exp > 0 && exp <= 15 + 22 {
+    # an integer times 10^k; move some zeros into the integer part if needed
+    if exp > 22 {
+      f = f * pow10(exp - 22)
+      exp = 22
+    }
+    return no if f > 1e15 || f < -1e15
+    return (f * pow10(exp), true)
+  }
+  if exp < 0 && exp >= -22 {
+    return (f / pow10(-exp), true)
+  }
+  no
+}
+
+# A hexadecimal float literal's mantissa and exponent, rounded to the format.
+# Returns (value, overflow).
+def atof_hex(mantissa0: U64, exp0: Int, neg: Bool, trunc: Bool, fl: FloatInfo) -> (Float, Bool) {
+  max_exp = (1 << fl.expbits) + fl.bias - 2
+  min_exp = fl.bias + 1
+  mantissa = mantissa0
+  exp = exp0 + fl.mantbits # mantissa is now implicitly divided by 2^mantbits
+  # Bring the mantissa to a leading 1 bit followed by mantbits bits, plus two
+  # rounding bits, the lowest of which records whether any lower bit was set.
+  while mantissa != 0 && (mantissa >> (fl.mantbits + 2)) == 0 {
+    mantissa = mantissa << 1
+    exp -= 1
+  }
+  mantissa = mantissa | 1 if trunc
+  while (mantissa >> (1 + fl.mantbits + 2)) != 0 {
+    mantissa = (mantissa >> 1) | (mantissa & 1)
+    exp += 1
+  }
+  # If the exponent is too negative, denormalize in hopes of making it representable.
+  while mantissa > 1 && exp < min_exp - 2 {
+    mantissa = (mantissa >> 1) | (mantissa & 1)
+    exp += 1
+  }
+  # Round using the two bottom bits.
+  round = mantissa & 3
+  mantissa = mantissa >> 2
+  round = round | (mantissa & 1) # ties to even
+  exp += 2
+  one: U64 = 1
+  if round == 3 {
+    mantissa += 1
+    if mantissa == (one << (1 + fl.mantbits)) {
+      mantissa = mantissa >> 1
+      exp += 1
+    }
+  }
+  if (mantissa >> fl.mantbits) == 0 {
+    exp = fl.bias
+  }
+  if exp > max_exp {
+    return (neg ? neg_inf() : pos_inf(), true)
+  }
+  (make_float(mantissa, exp, neg, fl), false)
+}
+
+# The core of parse_float_bits: (value, bytes consumed, status).
+def atof_core(s: Str, bit_size: Int) -> (Float, Int, Int) {
+  val, n, ok = special(s)
+  return (val, n, ST_OK) if ok
+  fl = float_info(bit_size)
+  r = read_float(s)
+  return (0.0, r.n, ST_SYNTAX) unless r.ok
+  if r.hex {
+    f, ovf = atof_hex(r.mantissa, r.exp, r.neg, r.trunc, fl)
+    return (f, r.n, ovf ? ST_RANGE : ST_OK)
+  }
+  if bit_size == 64 && !r.trunc {
+    f, ok = atof64_exact(r.mantissa, r.exp, r.neg)
+    return (f, r.n, ST_OK) if ok
+  }
+  # Slow fallback: exact decimal expansion.
+  d = new_dec()
+  return (0.0, r.n, ST_SYNTAX) unless d.set!(s[0...r.n])
+  mant, e, ovf = d.float_bits!(fl)
+  if ovf {
+    return (r.neg ? neg_inf() : pos_inf(), r.n, ST_RANGE)
+  }
+  (make_float(mant, e, d.neg, fl), r.n, ST_OK)
+}
+
+# Converts `s` to the nearest float of the given size: 64 for a Float, 32 for
+# a Float whose value is exactly a float32. Accepts decimal forms
+# ("1.5", "-2e10", ".5", "1_000.5"), hexadecimal forms ("0x1.8p3"), and (case
+# insensitively) "inf", "+Inf", "-infinity" and "nan". If `s` is well
+# formed but beyond the largest finite float, fails with ErrRange (Go returns
+# ±Inf along with the error; a `~Float` carries only the error).
+pub def parse_float_bits(s: Str, bit_size: Int) -> ~Float<NumError> {
+  f, n, st = atof_core(s, bit_size == 32 ? 32 : 64)
+  fail NumError.ErrSyntax(func_name: "parse_float", num: s) if st == ST_SYNTAX || n != s.size
+  fail NumError.ErrRange(func_name: "parse_float", num: s) if st == ST_RANGE
+  f
+}
+
+# `parse_float_bits(s, 64)`.
+pub def parse_float(s: Str) -> ~Float<NumError> {
+  f, n, st = atof_core(s, 64)
+  fail NumError.ErrSyntax(func_name: "parse_float", num: s) if st == ST_SYNTAX || n != s.size
+  fail NumError.ErrRange(func_name: "parse_float", num: s) if st == ST_RANGE
+  f
+}

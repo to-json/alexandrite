@@ -2523,6 +2523,10 @@ impl<'w, 'a> FnCx<'w, 'a> {
                 }
                 TK::M(M::VariantNew(0), None, slots, None)
             }
+            Ty::Tuple(ts) => {
+                let vals = ts.clone().iter().map(|t| self.zero_of(t, sp)).collect::<Option<Vec<_>>>()?;
+                TK::M(M::TupleNew, None, vals, None)
+            }
             Ty::Fixed(el, n) => {
                 let z = self.zero_of(el, sp)?;
                 TK::M(M::ArrayNew, None, vec![self.mk(TK::Int(*n as i64), Ty::Int, sp), z], None)

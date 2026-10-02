@@ -1,0 +1,126 @@
+import "strings"
+
+def raw(b: [Byte]) -> Str { Str.from_bytes(b) }
+
+def fl(v: Float) -> Str {
+  e = new_encoder()
+  e.float!(v)
+  r = e.finish!
+  r.unwrap_or("ERR")
+}
+
+test "quote" {
+  assert_eq quote("hi"), "\"hi\""
+  assert_eq quote("a\"b\\c"), "\"a\\\"b\\\\c\""
+  assert_eq quote("\n\r\t\b\f"), "\"\\n\\r\\t\\b\\f\""
+  assert_eq quote("\x01\x1f"), "\"\\u0001\\u001f\""
+  assert_eq quote("<a&b>"), "\"\\u003ca\\u0026b\\u003e\""
+  assert_eq quote_raw("<a&b>"), "\"<a&b>\""
+  assert_eq quote("é世"), "\"é世\""
+  assert_eq quote("\u2028\u2029"), "\"\\u2028\\u2029\""
+  assert_eq quote(raw([97, 255, 98])), "\"a\\ufffdb\""
+  assert_eq quote(""), "\"\""
+}
+
+test "floats like Go" {
+  assert_eq fl(0.0), "0"
+  assert_eq fl(1.0), "1"
+  assert_eq fl(-3.0), "-3"
+  assert_eq fl(1.5), "1.5"
+  assert_eq fl(0.1), "0.1"
+  assert_eq fl(100000.0), "100000"
+  assert_eq fl(1.0e20), "100000000000000000000"
+  assert_eq fl(1.0e21), "1e+21"
+  assert_eq fl(1.0e22), "1e+22"
+  assert_eq fl(0.000001), "0.000001"
+  assert_eq fl(0.0000001), "1e-7"
+  assert_eq fl(1.5e-9), "1.5e-9"
+  assert_eq fl(123456789.125), "123456789.125"
+  assert_eq fl(3.141592653589793), "3.141592653589793"
+  assert_eq fl(-0.5), "-0.5"
+}
+
+test "NaN and infinity fail" {
+  inf = 1.0e308 * 10.0
+  e = new_encoder()
+  e.float!(inf)
+  r = e.finish!
+  assert r.err?
+  assert_eq r.err?.message || "", "json: unsupported value: +Inf"
+}
+
+test "valid and errors" {
+  assert valid("{}")
+  assert valid(" [1, 2.5e3, -0, true, false, null, \"x\"] ")
+  assert valid("\"\\u00e9\\n\"")
+  assert !valid("")
+  assert !valid("{")
+  assert !valid("[1,]")
+  assert !valid("{\"a\":1,}")
+  assert !valid("01")
+  assert !valid("1.")
+  assert !valid("\"a")
+  assert !valid("nul")
+  assert !valid("{} x")
+  assert_eq check("").err?.message || "", "unexpected end of JSON input"
+  assert_eq check("x").err?.message || "", "invalid character 'x' looking for beginning of value"
+  assert_eq check("[1 2]").err?.message || "", "invalid character '2' after array element"
+  assert_eq check("{\"a\" 1}").err?.message || "", "invalid character '1' after object key"
+  assert_eq check("{\"a\":1 \"b\"}").err?.message || "", "invalid character '\"' after object key:value pair"
+  assert_eq check("{1:2}").err?.message || "", "invalid character '1' looking for beginning of object key string"
+  assert_eq check("\"\\x\"").err?.message || "", "invalid character 'x' in string escape code"
+  assert_eq check("\"\\u12g4\"").err?.message || "", "invalid character 'g' in \\u hexadecimal character escape"
+  assert_eq check("tru").err?.message || "", "unexpected end of JSON input"
+  assert_eq check("trux").err?.message || "", "invalid character 'x' in literal true (expecting 'e')"
+  assert_eq check("-").err?.message || "", "unexpected end of JSON input"
+  assert_eq check("-x").err?.message || "", "invalid character 'x' in numeric literal"
+  assert_eq check("1.x").err?.message || "", "invalid character 'x' after decimal point in numeric literal"
+  assert_eq check("1ex").err?.message || "", "invalid character 'x' in exponent of numeric literal"
+  assert_eq check("{} x").err?.message || "", "invalid character 'x' after top-level value"
+  assert_eq check("\"a\nb\"").err?.message || "", "invalid character '\\n' in string literal"
+}
+
+test "indent and compact" {
+  assert_eq ~indent("{\"a\":[1,2],\"b\":{},\"c\":[]}", "", "  "), "{\n  \"a\": [\n    1,\n    2\n  ],\n  \"b\": {},\n  \"c\": []\n}"
+  assert_eq ~indent("[1]", ">", "\t"), "[\n>\t1\n>]"
+  assert_eq ~compact(" { \"a\" : [ 1 , \"x y\" ] } "), "{\"a\":[1,\"x y\"]}"
+  assert indent("{", "", " ").err?
+  assert_eq ~indent("1", "", " "), "1"
+  assert_eq ~indent("\"a b\"", "", " "), "\"a b\""
+}
+
+test "dynamic values" {
+  v = ~parse(" {\"name\": \"ann\", \"n\": 3, \"f\": 2.5, \"ok\": true, \"nil\": null, \"xs\": [1, [2], {\"k\": \"v\"}]} ")
+  assert v.object?
+  assert_eq v.size, 6
+  assert_eq v.get("name").unwrap.as_str || "", "ann"
+  assert_eq v.get("n").unwrap.as_int || -1, 3
+  assert_eq v.get("f").unwrap.as_float || 0.0, 2.5
+  assert_eq v.get("f").unwrap.as_int || -1, -1
+  assert_eq v.get("ok").unwrap.as_bool || false, true
+  assert v.get("nil").unwrap.null?
+  assert v.get("missing").none?
+  xs = v.get("xs").unwrap
+  assert xs.array?
+  assert_eq xs.size, 3
+  assert_eq xs.at(0).unwrap.as_int || 0, 1
+  assert_eq xs.at(1).unwrap.at(0).unwrap.as_int || 0, 2
+  assert_eq xs.at(2).unwrap.get("k").unwrap.as_str || "", "v"
+  assert xs.at(3).none?
+  assert_eq v.keys.join(","), "name,n,f,ok,nil,xs"
+  assert_eq v.to_s, "{\"name\":\"ann\",\"n\":3,\"f\":2.5,\"ok\":true,\"nil\":null,\"xs\":[1,[2],{\"k\":\"v\"}]}"
+  assert_eq (~parse("[]")).~to_json, "[]"
+  assert_eq ~parse("12345678901234567890").to_s, "12345678901234567890"
+  assert parse("[1,").err?
+  assert_eq parse("[1,").err?.message || "", "unexpected end of JSON input"
+}
+
+test "deep nesting" {
+  s = strings.repeat("[", 5000) + strings.repeat("]", 5000)
+  assert valid(s)
+  assert valid(strings.repeat("[", 10000) + strings.repeat("]", 10000))
+  assert !valid(strings.repeat("[", 10001) + strings.repeat("]", 10001))
+  v = ~parse(s)
+  assert v.array?
+}
+

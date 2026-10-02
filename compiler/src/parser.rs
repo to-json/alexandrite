@@ -340,6 +340,9 @@ impl<'a> Parser<'a> {
         }
         for job in &jobs {
             let text = crate::derive::json_source(job, &alias, &types)?;
+            if std::env::var("ALX_DERIVE_DEBUG").is_ok() {
+                eprintln!("{text}");
+            }
             let mut toks = crate::lexer::lex(job.span.file, &text).map_err(|d| Diag::new(job.span, format!("derive(Json) on `{}` made code that doesn't lex: {}\n{text}", job.name, d.msg)))?;
             for t in &mut toks {
                 t.span = job.span;

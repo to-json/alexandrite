@@ -109,70 +109,87 @@ def hex4(s: Str, p: Int) -> Int {
 }
 
 # Skips one value starting at p (after whitespace) while checking its syntax;
-# returns the index after it. `depth` counts open arrays and objects.
+# returns the index after it. Iterative (an explicit stack of open arrays and
+# objects), so nesting depth is bounded by MAX_DEPTH, not by the call stack.
 def skip_value(s: Str, p0: Int, depth: Int) -> ~Int<JsonError> {
   n = s.size
-  p = skip_ws(s, p0)
-  fail err_eof(p) if p >= n
-  c = s[p]
-  if c == 34 {
-    return ~string_end(s, p)
-  }
-  if c == 123 {
-    fail JsonError.Invalid(msg: "exceeded max depth", offset: p) if depth >= MAX_DEPTH
-    p = skip_ws(s, p + 1)
+  stack: [Byte] = []
+  sp = 0
+  p = p0
+  loop {
+    p = skip_ws(s, p)
     fail err_eof(p) if p >= n
-    if s[p] == 125 {
-      return p + 1
+    c = s[p]
+    if c == 123 || c == 91 {
+      fail JsonError.Invalid(msg: "exceeded max depth", offset: p) if sp + depth >= MAX_DEPTH
+      close = c == 123 ? 125 : 93
+      p = skip_ws(s, p + 1)
+      fail err_eof(p) if p >= n
+      if s[p].to_i != close {
+        if sp < stack.size {
+          stack[sp] = c
+        } else {
+          stack << c
+        }
+        sp += 1
+        if c == 123 {
+          fail err_char(s[p], "looking for beginning of object key string", p) if s[p] != 34
+          p = ~string_end(s, p)
+          p = skip_ws(s, p)
+          fail err_eof(p) if p >= n
+          fail err_char(s[p], "after object key", p) if s[p] != 58
+          p += 1
+        }
+        next
+      }
+      p += 1
+    } else if c == 34 {
+      p = ~string_end(s, p)
+    } else if c == 116 {
+      p = ~literal_end(s, p, "true")
+    } else if c == 102 {
+      p = ~literal_end(s, p, "false")
+    } else if c == 110 {
+      p = ~literal_end(s, p, "null")
+    } else if c == 45 || is_digit(c) {
+      p = ~number_end(s, p)
+    } else {
+      fail begin_value_err(s, p)
     }
+    # A value ended at p: close containers and find the next value.
     loop {
+      return p if sp == 0
+      p = skip_ws(s, p)
+      fail err_eof(p) if p >= n
+      top = stack[sp - 1]
+      c = s[p]
+      if top == 91 {
+        if c == 93 {
+          sp -= 1
+          p += 1
+          next
+        }
+        fail err_char(c, "after array element", p) if c != 44
+        p += 1
+        break
+      }
+      if c == 125 {
+        sp -= 1
+        p += 1
+        next
+      }
+      fail err_char(c, "after object key:value pair", p) if c != 44
+      p = skip_ws(s, p + 1)
+      fail err_eof(p) if p >= n
       fail err_char(s[p], "looking for beginning of object key string", p) if s[p] != 34
       p = ~string_end(s, p)
       p = skip_ws(s, p)
       fail err_eof(p) if p >= n
       fail err_char(s[p], "after object key", p) if s[p] != 58
-      p = ~skip_value(s, p + 1, depth + 1)
-      p = skip_ws(s, p)
-      fail err_eof(p) if p >= n
-      if s[p] == 125 {
-        return p + 1
-      }
-      fail err_char(s[p], "after object key:value pair", p) if s[p] != 44
-      p = skip_ws(s, p + 1)
-      fail err_eof(p) if p >= n
-    }
-  }
-  if c == 91 {
-    fail JsonError.Invalid(msg: "exceeded max depth", offset: p) if depth >= MAX_DEPTH
-    p = skip_ws(s, p + 1)
-    fail err_eof(p) if p >= n
-    if s[p] == 93 {
-      return p + 1
-    }
-    loop {
-      p = ~skip_value(s, p, depth + 1)
-      p = skip_ws(s, p)
-      fail err_eof(p) if p >= n
-      if s[p] == 93 {
-        return p + 1
-      }
-      fail err_char(s[p], "after array element", p) if s[p] != 44
       p += 1
+      break
     }
   }
-  if c == 116 {
-    return ~literal_end(s, p, "true")
-  }
-  if c == 102 {
-    return ~literal_end(s, p, "false")
-  }
-  if c == 110 {
-    return ~literal_end(s, p, "null")
-  }
-  if c == 45 || is_digit(c) {
-    return ~number_end(s, p)
-  }
-  fail begin_value_err(s, p)
 }
 
 # The index after the string literal starting at p (s[p] is the opening quote),
@@ -291,7 +308,7 @@ pub struct Decoder {
       self.st[0].pos = ~literal_end(s, p, "null")
       return false
     }
-    e = ~skip_value(s, p, 0)
+    _ = ~skip_value(s, p, 0)
     fail type_err(p, kind_word(c), "Bool")
   }
 

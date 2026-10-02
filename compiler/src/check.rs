@@ -746,6 +746,7 @@ fn type_names(t: &TypeExpr, out: &mut Vec<String>) {
             type_names(r, out);
         }
         TypeExpr::Result(t, _, _) => type_names(t, out),
+        TypeExpr::Tuple(ts, _) => ts.iter().for_each(|t| type_names(t, out)),
     }
 }
 
@@ -907,6 +908,7 @@ pub fn type_from(t: &TypeExpr, structs: &Structs, consts: &Consts) -> R<Ty> {
             Ok(Ty::Handle(q))
         }
         TypeExpr::Fn(ps, r, _) => Ok(Ty::Fn(ps.iter().map(type_from).collect::<R<Vec<_>>>()?, Box::new(type_from(r)?))),
+        TypeExpr::Tuple(ts, _) => Ok(Ty::Tuple(ts.iter().map(type_from).collect::<R<Vec<_>>>()?)),
         TypeExpr::Opt(t, _) => Ok(Ty::Opt(Box::new(type_from(t)?))),
         TypeExpr::App(n, args, sp) => match (n.as_str(), args.as_slice()) {
             ("Map", [k, v]) => {
@@ -1411,6 +1413,29 @@ impl<'w, 'a> FnCx<'w, 'a> {
         Ok(match &s.kind {
             StmtKind::Expr(e) => TStmt::Expr(self.expr(e)?),
             StmtKind::MultiAssign(targets, values) => {
+                // `a, b = pair`: take a tuple apart.
+                if values.len() == 1 && targets.len() > 1 {
+                    let v = self.value(&values[0])?;
+                    let Ty::Tuple(ts) = self.resolve(&v.ty) else {
+                        return Err(Diag::new(values[0].span, format!("{} names but one value, a {} (only a tuple can be taken apart)", targets.len(), self.resolve(&v.ty).show())));
+                    };
+                    if ts.len() != targets.len() {
+                        return Err(Diag::new(s.span, format!("{} names for a tuple of {}", targets.len(), ts.len())));
+                    }
+                    let tt = Ty::Tuple(ts.clone());
+                    let n = self.locals.len();
+                    let tmp = self.declare(&format!("_tuple{n}"), tt.clone());
+                    let take = self.mk(TK::Assign(tmp, Box::new(v)), tt.clone(), s.span);
+                    let mut ids = vec![];
+                    let mut parts = vec![];
+                    for (k, ((name, nsp), t)) in targets.iter().zip(&ts).enumerate() {
+                        let whole = self.mk(TK::Local(tmp), tt.clone(), *nsp);
+                        parts.push(self.mk(TK::M(M::TupleGet(k), Some(Box::new(whole)), vec![], None), t.clone(), *nsp));
+                        ids.push(self.assign_local(name, *nsp, t, sp_node(nsp))?);
+                    }
+                    let unit = self.mk(TK::Unit, Ty::Unit, s.span);
+                    return Ok(TStmt::Expr(self.mk(TK::Seq(vec![TStmt::Expr(take), TStmt::MultiAssign(ids, parts), TStmt::Expr(unit)]), Ty::Unit, s.span)));
+                }
                 if targets.len() != values.len() {
                     return Err(Diag::new(s.span, format!("{} names but {} values", targets.len(), values.len())));
                 }
@@ -1521,8 +1546,8 @@ impl<'w, 'a> FnCx<'w, 'a> {
                 if self.is_main {
                     return Err(Diag::new(s.span, "`return` at the top level"));
                 }
-                let v = v.as_ref().map(|v| self.value(v)).transpose()?;
                 let rt = self.ret.clone();
+                let v = v.as_ref().map(|v| self.value_as(v, &rt)).transpose()?;
                 let v = v.map(|v| self.coerce(v, &rt)).transpose()?;
                 let t = v.as_ref().map_or(Ty::Unit, |v| v.ty.clone());
                 self.expect(&t, &rt, s.span, "return value")?;
@@ -1588,6 +1613,11 @@ impl<'w, 'a> FnCx<'w, 'a> {
                 None => self.mk(TK::Float(*v), Ty::Float, sp),
             },
             ExprKind::Str(s) => self.mk(TK::Str(s.clone()), Ty::Str, sp),
+            ExprKind::Tuple(items) => {
+                let vals = items.iter().map(|x| self.value(x)).collect::<R<Vec<_>>>()?;
+                let t = Ty::Tuple(vals.iter().map(|v| v.ty.clone()).collect());
+                self.mk(TK::M(M::TupleNew, None, vals, None), t, sp)
+            }
             ExprKind::Bool(b) => self.mk(TK::Bool(*b), Ty::Bool, sp),
             ExprKind::Nil => self.mk(TK::Unit, Ty::Unit, sp),
             ExprKind::Sym(s) => return Err(Diag::new(sp, format!("symbol `:{s}` can only be used as a block (`&:{s}`) or with `reduce`"))),
@@ -1618,6 +1648,15 @@ impl<'w, 'a> FnCx<'w, 'a> {
                         let k = self.value(i)?;
                         return self.call_def(def, "[]", sp, vec![a, k], sp);
                     }
+                }
+                // `t[0]`: a tuple's element (the index is a literal).
+                if let Ty::Tuple(ts) = &at {
+                    let k = match &i.kind {
+                        ExprKind::Int(k) if (*k as usize) < ts.len() && *k >= 0 => *k as usize,
+                        _ => return Err(Diag::new(i.span, format!("a tuple's index is a literal from 0 to {}", ts.len() - 1))),
+                    };
+                    let t = ts[k].clone();
+                    return Ok(self.mk(TK::M(M::TupleGet(k), Some(Box::new(a)), vec![], None), t, sp));
                 }
                 if let Ty::Pool(t) = &at {
                     let h = self.value(i)?;
@@ -2730,6 +2769,27 @@ impl<'w, 'a> FnCx<'w, 'a> {
     /// each element against it (so `[Circle.new, Square.new]` can be `[Shape]`).
     fn value_as(&mut self, e: &Expr, want: &Ty) -> R<TExpr> {
         let w = self.resolve(want);
+        // A tuple literal checks each element against its slot (`T?` too).
+        if let ExprKind::Tuple(items) = &e.kind {
+            let slots = match &w {
+                Ty::Tuple(ts) => Some(ts.clone()),
+                Ty::Opt(inner) => match self.resolve(inner) {
+                    Ty::Tuple(ts) => Some(ts),
+                    _ => None,
+                },
+                _ => None,
+            };
+            if let Some(ts) = slots.filter(|ts| ts.len() == items.len()) {
+                let mut vs = vec![];
+                for (x, t) in items.iter().zip(&ts) {
+                    let v = self.value_as(x, t)?;
+                    self.expect(&v.ty, t, v.span, "tuple element")?;
+                    vs.push(v);
+                }
+                let tv = self.mk(TK::M(M::TupleNew, None, vs, None), Ty::Tuple(ts), e.span);
+                return self.coerce(tv, &w);
+            }
+        }
         if let (ExprKind::Array(items), Some(el)) = (&e.kind, w.arr_elem()) {
             let mut vs = vec![];
             for x in items {

@@ -2544,6 +2544,11 @@ impl<'a> Lw<'a> {
                     }
                 }
             }
+            TupleNew => {
+                let lt = self.lty(&e.ty);
+                let vs = args.iter().map(|a| self.arg(a)).collect();
+                LE::Tup(lt, vs)
+            }
             PrintStr => {
                 let s = self.expr(&args[0]);
                 self.emit(LS::Print(s));

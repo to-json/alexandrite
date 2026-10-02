@@ -308,6 +308,8 @@ pub enum M {
     /// lock; `v` is the value, changed in place; the result is copied out).
     MutexNew,
     Lock,
+    /// `(a, b)`: a tuple of the args.
+    TupleNew,
     /// `fmt.print*`: write a Str (args[0]) to stdout, no newline added.
     PrintStr,
     /// `Atomic.new(v)`; `load`, `store(v)`, `add(n)` (the new value),

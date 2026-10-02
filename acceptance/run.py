@@ -85,6 +85,7 @@ GROUPS = {
     "sharing": "R6",
     "sync": "R6",
     "fmt": "L1",
+    "tuples": "L1",
 }
 
 

@@ -650,6 +650,15 @@ impl<'a> Parser<'a> {
                 }
             }
             self.expect_op(")")?;
+            if !self.is_op("->") && ps.len() >= 2 {
+                // `(A, B)`, `(A, B)?`: a tuple.
+                let t = TypeExpr::Tuple(ps, sp.to(self.prev_span()));
+                if self.is_op("?") && !self.space_before() {
+                    self.bump();
+                    return Ok(TypeExpr::Opt(Box::new(t), sp.to(self.prev_span())));
+                }
+                return Ok(t);
+            }
             self.expect_op("->")?;
             let r = self.type_expr()?;
             return Ok(TypeExpr::Fn(ps, Box::new(r), sp.to(self.prev_span())));
@@ -740,7 +749,22 @@ impl<'a> Parser<'a> {
             }
             Tok::Kw(Kw::Return) => {
                 self.bump();
-                StmtKind::Return(if self.at_stmt_end() { None } else { Some(self.expr()?) })
+                StmtKind::Return(if self.at_stmt_end() {
+                    None
+                } else {
+                    // `return a, b`: a tuple, as Go returns several results.
+                    let first = self.expr()?;
+                    if self.is_op(",") {
+                        let tsp = first.span;
+                        let mut items = vec![first];
+                        while self.eat_op(",") {
+                            items.push(self.expr()?);
+                        }
+                        Some(self.mk(ExprKind::Tuple(items), tsp.to(self.prev_span())))
+                    } else {
+                        Some(first)
+                    }
+                })
             }
             Tok::Ident(n) if n == "fail" && !self.is_local("fail") && !matches!(self.peek_at(1), Tok::Op("(") | Tok::Op("=")) => {
                 self.bump();
@@ -1506,6 +1530,18 @@ impl<'a> Parser<'a> {
                 self.skip_newlines();
                 let mut e = self.expr()?;
                 self.skip_newlines();
+                // `(a, b)`: a tuple.
+                if self.is_op(",") {
+                    let mut items = vec![e];
+                    while self.eat_op(",") {
+                        self.skip_newlines();
+                        items.push(self.expr()?);
+                        self.skip_newlines();
+                    }
+                    self.expect_op(")")?;
+                    self.in_cond = saved;
+                    return Ok(self.mk(ExprKind::Tuple(items), sp.to(self.prev_span())));
+                }
                 self.expect_op(")")?;
                 self.in_cond = saved;
                 // Parenthesized expressions keep their inner id, but the span

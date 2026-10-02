@@ -232,6 +232,7 @@ pub fn texpr_word(t: &TypeExpr) -> String {
         TypeExpr::Result(e, _, _) => format!("Res{}", texpr_word(e)),
         TypeExpr::Handle(n, _) => format!("H{}", n.replace(['.', '/'], "_")),
         TypeExpr::Fn(ps, r, _) => format!("Fn{}To{}", ps.iter().map(texpr_word).collect::<String>(), texpr_word(r)),
+        TypeExpr::Tuple(ts, _) => format!("Tup{}End", ts.iter().map(texpr_word).collect::<String>()),
     }
 }
 
@@ -285,6 +286,8 @@ pub enum TypeExpr {
     Handle(String, Span),
     /// `(A, B) -> R`: a function value (a lambda).
     Fn(Vec<TypeExpr>, Box<TypeExpr>, Span),
+    /// `(A, B)`: a tuple (Go's multiple results, held as one value).
+    Tuple(Vec<TypeExpr>, Span),
 }
 
 #[derive(Debug, Clone)]
@@ -434,6 +437,8 @@ pub enum ExprKind {
     OpAssign(BinOp, Box<Expr>, Box<Expr>),
     Try(Box<Expr>),
     Array(Vec<Expr>),
+    /// `(a, b)`: a tuple.
+    Tuple(Vec<Expr>),
     /// `name: value` in an argument list (`Body.new(x: 1.0)`).
     KwArg(String, Span, Box<Expr>),
     /// `"a #{x} b"`

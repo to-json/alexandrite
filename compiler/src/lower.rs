@@ -2283,6 +2283,14 @@ impl<'a> Lw<'a> {
             FloatAbs => LE::Rt(Rt::FAbs, vec![self.expr(recv.unwrap())]),
             FloatToS => LE::Rt(Rt::FToS, vec![self.expr(recv.unwrap())]),
             Sqrt => LE::Rt(Rt::FSqrt, vec![self.expr(&args[0])]),
+            // math block: libm calls and bit casts (receiver first, then args)
+            Math(f) => {
+                let mut v: Vec<LE> = recv.into_iter().map(|r| self.expr(r)).collect();
+                v.extend(args.iter().map(|a| self.expr(a)));
+                LE::Rt(Rt::Math(f), v)
+            }
+            FloatBits => LE::Rt(Rt::FBits, vec![self.expr(recv.unwrap())]),
+            FloatFromBits => LE::Rt(Rt::FFromBits, vec![self.expr(recv.unwrap())]),
             StructNew => {
                 let t = self.lty(&e.ty);
                 let vs = args.iter().map(|a| self.arg(a)).collect();

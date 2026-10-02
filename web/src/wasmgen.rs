@@ -78,6 +78,7 @@ const RT: &[(&str, &str)] = &[
     ("alxr_str_pad", "jjjj>"),
     ("alxr_str_quote", "jj>"),
     ("alxr_f_to_i", "fjj>j"),
+    ("alxr_math", "fffj>f"),
     ("alxr_str_cat", "jj>"),
     ("alxr_umulhi", "jj>j"),
     ("alxr_puts_u64", "j>"),
@@ -1121,7 +1122,8 @@ impl<'c, 'p> Fx<'c, 'p> {
             LE::Rt(r, args) => match r {
                 Rt::IntToS | Rt::PIntToS | Rt::StrRev | Rt::StrDelete | Rt::FToS | Rt::FFmt | Rt::FFmtE | Rt::StrPad | Rt::StrQuote | Rt::StrCat | Rt::U64ToS | Rt::IntFmt | Rt::RuneToS | Rt::StrFromBytes | Rt::FileRead | Rt::CapEnd => LTy::Str,
                 Rt::FileStatus | Rt::NowNs | Rt::CapBegin => LTy::I64,
-                Rt::IntToF | Rt::FSqrt | Rt::FAbs => LTy::F64,
+                Rt::IntToF | Rt::FSqrt | Rt::FAbs | Rt::Math(_) | Rt::FFromBits => LTy::F64,
+                Rt::FBits => LTy::IntK(IntKind::U64),
                 Rt::StrByte => {
                     if matches!(args[2], LE::I(0)) {
                         LTy::I64
@@ -1606,6 +1608,34 @@ impl<'c, 'p> Fx<'c, 'p> {
             Rt::FAbs => {
                 self.e(&args[0]);
                 self.ins().f64_abs();
+            }
+            Rt::Math(f) => {
+                for a in args {
+                    self.e(a);
+                }
+                match f {
+                    MathFn::Floor => drop(self.ins().f64_floor()),
+                    MathFn::Ceil => drop(self.ins().f64_ceil()),
+                    MathFn::Trunc => drop(self.ins().f64_trunc()),
+                    MathFn::RoundEven => drop(self.ins().f64_nearest()),
+                    MathFn::Copysign => drop(self.ins().f64_copysign()),
+                    _ => {
+                        // The host function takes three Floats and the function id.
+                        for _ in args.len()..3 {
+                            self.ins().f64_const(0.0.into());
+                        }
+                        self.i64c(f as u8 as i64);
+                        self.rt("alxr_math");
+                    }
+                }
+            }
+            Rt::FBits => {
+                self.e(&args[0]);
+                self.ins().i64_reinterpret_f64();
+            }
+            Rt::FFromBits => {
+                self.e(&args[0]);
+                self.ins().f64_reinterpret_i64();
             }
             Rt::FToS => call_ret(self, "alxr_f_to_s", 2),
             Rt::U64ToS => call_ret(self, "alxr_u64_to_s", 2),

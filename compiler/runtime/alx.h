@@ -269,6 +269,8 @@ AlxStr alx_str_pad(AlxStr s, int64_t width, int64_t flags);
 AlxStr alx_str_quote(AlxStr s);
 void alx_print_str(AlxStr s);
 int64_t alx_f_to_i(double x, const char *loc);
+static inline int64_t alx_f_bits(double x) { int64_t b; memcpy(&b, &x, 8); return b; }
+static inline double alx_f_from_bits(int64_t b) { double x; memcpy(&x, &b, 8); return x; }
 void alx_puts_f64(double x);
 AlxStr alx_str_cat(int64_t n, const AlxStr *parts);
 

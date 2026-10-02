@@ -45,6 +45,84 @@ mod rt {
 }
 type RtFn = unsafe extern "C" fn();
 
+/// libm, called by pointer from JIT code (math block).
+mod libm {
+    unsafe extern "C" {
+        pub fn sin(x: f64) -> f64;
+        pub fn cos(x: f64) -> f64;
+        pub fn tan(x: f64) -> f64;
+        pub fn asin(x: f64) -> f64;
+        pub fn acos(x: f64) -> f64;
+        pub fn atan(x: f64) -> f64;
+        pub fn atan2(x: f64, y: f64) -> f64;
+        pub fn sinh(x: f64) -> f64;
+        pub fn cosh(x: f64) -> f64;
+        pub fn tanh(x: f64) -> f64;
+        pub fn asinh(x: f64) -> f64;
+        pub fn acosh(x: f64) -> f64;
+        pub fn atanh(x: f64) -> f64;
+        pub fn exp(x: f64) -> f64;
+        pub fn exp2(x: f64) -> f64;
+        pub fn expm1(x: f64) -> f64;
+        pub fn log(x: f64) -> f64;
+        pub fn log2(x: f64) -> f64;
+        pub fn log10(x: f64) -> f64;
+        pub fn log1p(x: f64) -> f64;
+        pub fn pow(x: f64, y: f64) -> f64;
+        pub fn cbrt(x: f64) -> f64;
+        pub fn hypot(x: f64, y: f64) -> f64;
+        pub fn round(x: f64) -> f64;
+        pub fn fmod(x: f64, y: f64) -> f64;
+        pub fn remainder(x: f64, y: f64) -> f64;
+        pub fn nextafter(x: f64, y: f64) -> f64;
+        pub fn erf(x: f64) -> f64;
+        pub fn erfc(x: f64) -> f64;
+        pub fn tgamma(x: f64) -> f64;
+        pub fn lgamma(x: f64) -> f64;
+    }
+}
+
+/// The libm function behind a `MathFn` that Cranelift has no instruction for.
+fn libm_ptr(f: MathFn) -> RtFn {
+    use MathFn::*;
+    let p = match f {
+        Sin => libm::sin as usize,
+        Cos => libm::cos as usize,
+        Tan => libm::tan as usize,
+        Asin => libm::asin as usize,
+        Acos => libm::acos as usize,
+        Atan => libm::atan as usize,
+        Atan2 => libm::atan2 as usize,
+        Sinh => libm::sinh as usize,
+        Cosh => libm::cosh as usize,
+        Tanh => libm::tanh as usize,
+        Asinh => libm::asinh as usize,
+        Acosh => libm::acosh as usize,
+        Atanh => libm::atanh as usize,
+        Exp => libm::exp as usize,
+        Exp2 => libm::exp2 as usize,
+        Expm1 => libm::expm1 as usize,
+        Log => libm::log as usize,
+        Log2 => libm::log2 as usize,
+        Log10 => libm::log10 as usize,
+        Log1p => libm::log1p as usize,
+        Pow => libm::pow as usize,
+        Cbrt => libm::cbrt as usize,
+        Hypot => libm::hypot as usize,
+        Round => libm::round as usize,
+        Fmod => libm::fmod as usize,
+        Remainder => libm::remainder as usize,
+        Nextafter => libm::nextafter as usize,
+        Erf => libm::erf as usize,
+        Erfc => libm::erfc as usize,
+        Gamma => libm::tgamma as usize,
+        Lgamma => libm::lgamma as usize,
+        Floor | Ceil | Trunc | RoundEven | Fma | Copysign => unreachable!("native"),
+    };
+    unsafe { std::mem::transmute::<usize, RtFn>(p) }
+}
+
+
 /// C layout of a type: size, alignment, its scalars (offset, SSA type) and
 /// how each sits in memory (narrow integers are stored at their own width
 /// but held as I64 in registers).
@@ -973,7 +1051,8 @@ impl Fx<'_, '_, '_> {
             LE::Rt(rt, args) => match rt {
                 Rt::IntToS | Rt::PIntToS | Rt::StrRev | Rt::StrDelete | Rt::FToS | Rt::FFmt | Rt::FFmtE | Rt::StrPad | Rt::StrQuote | Rt::StrCat | Rt::U64ToS | Rt::IntFmt | Rt::RuneToS | Rt::StrFromBytes | Rt::FileRead | Rt::CapEnd => LTy::Str,
                 Rt::FileStatus | Rt::NowNs | Rt::CapBegin => LTy::I64,
-                Rt::IntToF | Rt::FSqrt | Rt::FAbs => LTy::F64,
+                Rt::IntToF | Rt::FSqrt | Rt::FAbs | Rt::Math(_) | Rt::FFromBits => LTy::F64,
+                Rt::FBits => LTy::IntK(IntKind::U64),
                 Rt::StrByte => {
                     if matches!(args[2], LE::I(0)) {
                         LTy::I64
@@ -1548,6 +1627,26 @@ impl Fx<'_, '_, '_> {
             Rt::FAbs => {
                 let v = self.e1(&args[0]);
                 vec![self.b.ins().fabs(v)]
+            }
+            Rt::Math(f) => {
+                let a: Vec<Value> = args.iter().map(|x| self.e1(x)).collect();
+                vec![match f {
+                    MathFn::Floor => self.b.ins().floor(a[0]),
+                    MathFn::Ceil => self.b.ins().ceil(a[0]),
+                    MathFn::Trunc => self.b.ins().trunc(a[0]),
+                    MathFn::RoundEven => self.b.ins().nearest(a[0]),
+                    MathFn::Fma => self.b.ins().fma(a[0], a[1], a[2]),
+                    MathFn::Copysign => self.b.ins().fcopysign(a[0], a[1]),
+                    _ => self.call_rt_t(libm_ptr(f), &a, Some(F64)).unwrap(),
+                }]
+            }
+            Rt::FBits => {
+                let v = self.e1(&args[0]);
+                vec![self.b.ins().bitcast(I64, MemFlagsData::new(), v)]
+            }
+            Rt::FFromBits => {
+                let v = self.e1(&args[0]);
+                vec![self.b.ins().bitcast(F64, MemFlagsData::new(), v)]
             }
             Rt::FileStatus => {
                 let v = self.e(&args[0]);

@@ -125,6 +125,14 @@ mod rt {
         pub fn to_vec(&self) -> Vec<T> {
             self.buf.lock().unwrap()[self.off..self.off + self.len].to_vec()
         }
+        /// Write back bytes a C function changed (extern calls borrow a [Byte]
+        /// as a plain byte buffer; the oracle holds every integer as i64).
+        pub fn store_bytes(&self, b: &[u8]) where T: From<u8> {
+            let mut g = self.buf.lock().unwrap();
+            for (i, x) in b.iter().enumerate().take(self.len) {
+                g[self.off + i] = T::from(*x);
+            }
+        }
         /// `a[s, n]`: shares storage, capacity 0 (appending copies).
         pub fn slice(&self, s: usize, n: usize) -> Self {
             Sl { buf: self.buf.clone(), off: self.off + s, len: n, cap: 0 }
@@ -323,6 +331,117 @@ mod rt {
         match std::fs::read(String::from_utf8_lossy(&p.0).to_string()) {
             Ok(b) => Str(b.into()),
             Err(_) => Str::lit(b""),
+        }
+    }
+
+    // ---- C foreign functions (`extern def`) ----
+    thread_local! {
+        /// errno as it was right after the last extern call on this thread.
+        static ERRNO: std::cell::Cell<i64> = const { std::cell::Cell::new(0) };
+    }
+    #[cfg(target_os = "macos")]
+    unsafe extern "C" {
+        #[link_name = "__error"]
+        fn errno_loc() -> *mut i32;
+    }
+    #[cfg(not(target_os = "macos"))]
+    unsafe extern "C" {
+        #[link_name = "__errno_location"]
+        fn errno_loc() -> *mut i32;
+    }
+    pub fn clear_errno() {
+        unsafe { *errno_loc() = 0 };
+    }
+    pub fn save_errno() {
+        let e = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+        ERRNO.with(|c| c.set(e as i64));
+    }
+    pub fn errno() -> i64 {
+        ERRNO.with(|c| c.get())
+    }
+    pub fn strerror_str(n: i64) -> Str {
+        // std's formatting appends " (os error N)"; strip it to get C's text.
+        let s = std::io::Error::from_raw_os_error(n as i32).to_string();
+        let t = match s.rfind(" (os error") {
+            Some(i) => &s[..i],
+            None => &s,
+        };
+        Str::lit(t.as_bytes())
+    }
+    pub fn str_from_cstr(p: i64) -> Str {
+        if p == 0 {
+            return Str::lit(b"");
+        }
+        unsafe { Str::lit(std::ffi::CStr::from_ptr(p as usize as *const std::ffi::c_char).to_bytes()) }
+    }
+    pub fn str_from_ptr(p: i64, n: i64) -> Str {
+        if p == 0 || n <= 0 {
+            return Str::lit(b"");
+        }
+        unsafe { Str::lit(std::slice::from_raw_parts(p as usize as *const u8, n as usize)) }
+    }
+    unsafe extern "C" {
+        #[link_name = "open"]
+        fn libc_open(path: *const std::ffi::c_char, flags: i32, ...) -> i32;
+        #[link_name = "fcntl"]
+        fn libc_fcntl(fd: i32, cmd: i32, ...) -> i32;
+    }
+    // The C runtime's non-variadic wrappers (see alx.h).
+    pub unsafe fn shim_alx_sys_open(path: *const std::ffi::c_char, flags: i32, mode: i32) -> i32 {
+        unsafe { libc_open(path, flags, mode as u32) }
+    }
+    pub unsafe fn shim_alx_sys_fcntl(fd: i32, cmd: i32, arg: i64) -> i32 {
+        unsafe { libc_fcntl(fd, cmd, arg as std::ffi::c_long) }
+    }
+    pub unsafe fn shim_alx_sys_const(name: *const std::ffi::c_char) -> i64 {
+        let n = unsafe { std::ffi::CStr::from_ptr(name) }.to_bytes();
+        super::sys_consts().iter().find(|(k, _)| k.as_bytes() == n).map_or(-1, |(_, v)| *v)
+    }
+
+    // The C runtime's program arguments, sleeping and clocks (alx.h).
+    fn args_c() -> &'static [std::ffi::CString] {
+        static A: std::sync::OnceLock<Vec<std::ffi::CString>> = std::sync::OnceLock::new();
+        A.get_or_init(|| std::env::args().map(|a| std::ffi::CString::new(a).unwrap_or_default()).collect())
+    }
+    pub unsafe fn shim_alx_argc() -> i64 {
+        args_c().len() as i64
+    }
+    pub unsafe fn shim_alx_argv(i: i64) -> *mut std::ffi::c_void {
+        args_c().get(i as usize).map_or(std::ptr::null_mut(), |c| c.as_ptr() as *mut std::ffi::c_void)
+    }
+    pub unsafe fn shim_alx_sleep_ns(ns: i64) {
+        if ns > 0 {
+            std::thread::sleep(std::time::Duration::from_nanos(ns as u64));
+        }
+    }
+    pub unsafe fn shim_alx_wall_ns() -> i64 {
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos() as i64)
+    }
+    pub unsafe fn shim_alx_mono_ns() -> i64 {
+        static T0: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+        T0.get_or_init(std::time::Instant::now).elapsed().as_nanos() as i64
+    }
+    #[repr(C)]
+    struct Tm {
+        f: [i32; 9],
+        gmtoff: i64,
+        zone: *const std::ffi::c_char,
+    }
+    unsafe extern "C" {
+        fn localtime_r(t: *const i64, out: *mut Tm) -> *mut Tm;
+    }
+    fn local_tm(sec: i64) -> Option<Tm> {
+        let mut tm = Tm { f: [0; 9], gmtoff: 0, zone: std::ptr::null() };
+        let r = unsafe { localtime_r(&sec, &mut tm) };
+        if r.is_null() { None } else { Some(tm) }
+    }
+    pub unsafe fn shim_alx_local_offset(sec: i64) -> i64 {
+        local_tm(sec).map_or(0, |t| t.gmtoff)
+    }
+    pub unsafe fn shim_alx_local_zone(sec: i64) -> *mut std::ffi::c_void {
+        match local_tm(sec) {
+            Some(t) if !t.zone.is_null() => t.zone as *mut std::ffi::c_void,
+            _ => c"UTC".as_ptr() as *mut std::ffi::c_void,
         }
     }
 

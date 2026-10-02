@@ -40,6 +40,8 @@ mod rt {
         alxj_puts_f64, alxj_f_to_s, alxj_f_fmt, alxj_f_fmt_e, alxj_str_pad, alxj_str_quote, alxj_f_to_i, alxj_str_cat,
         alxj_puts_u64, alxj_u64_to_s, alxj_int_fmt, alxj_f_to_u64, alxj_rune_to_s, alxj_str_from_bytes,
         alxj_die_str, alxj_panic_str, alxj_exit, alxj_now_ns, alxj_cap_begin, alxj_cap_end, alxj_file_status, alxj_file_read_or_empty,
+        alxj_ffi_enter, alxj_ffi_save_errno, alxj_cstr_new, alxj_cstr_free, alxj_errno, alxj_strerror, alxj_str_from_cstr, alxj_str_from_ptr,
+        alx_sys_open, alx_sys_fcntl, alx_sys_const, alx_argc, alx_argv, alx_sleep_ns, alx_wall_ns, alx_mono_ns, alx_local_offset, alx_local_zone,
         alxj_spawn, alxj_task_wait, alxj_lock_new, alxj_lock, alxj_unlock, alxj_atomic_new, alxj_chan_new, alxj_chan_len, alxj_chan_send, alxj_chan_recv, alxj_chan_close, alxj_select,
     );
 }
@@ -198,6 +200,42 @@ struct Decls<'p> {
     /// A worker's input and result types (for `spawn`).
     worker_in: HashMap<usize, LTy>,
     worker_out: HashMap<usize, LTy>,
+    /// The program's C functions (address, signature), by `LE::Ffi` index.
+    externs: Vec<(usize, FfiSig)>,
+}
+
+/// The address of a C symbol: this executable's own runtime shims, else the
+/// process's global symbols (libc and anything loaded).
+fn resolve_c_symbol(name: &str) -> Option<usize> {
+    let own = match name {
+        "alx_sys_open" => Some(rt::alx_sys_open as usize),
+        "alx_sys_fcntl" => Some(rt::alx_sys_fcntl as usize),
+        "alx_sys_const" => Some(rt::alx_sys_const as usize),
+        "alx_argc" => Some(rt::alx_argc as usize),
+        "alx_argv" => Some(rt::alx_argv as usize),
+        "alx_sleep_ns" => Some(rt::alx_sleep_ns as usize),
+        "alx_wall_ns" => Some(rt::alx_wall_ns as usize),
+        "alx_mono_ns" => Some(rt::alx_mono_ns as usize),
+        "alx_local_offset" => Some(rt::alx_local_offset as usize),
+        "alx_local_zone" => Some(rt::alx_local_zone as usize),
+        _ => None,
+    };
+    if own.is_some() {
+        return own;
+    }
+    let c = CString::new(name).ok()?;
+    let p = unsafe { libc::dlsym(libc::RTLD_DEFAULT, c.as_ptr()) };
+    (!p.is_null()).then_some(p as usize)
+}
+
+/// The Cranelift type of a C integer kind, and whether it is signed.
+fn ffi_int_ty(k: IntKind) -> Type {
+    match k.bits() {
+        8 => I8,
+        16 => cranelift_codegen::ir::types::I16,
+        32 => cranelift_codegen::ir::types::I32,
+        _ => I64,
+    }
 }
 
 unsafe extern "C" {
@@ -227,7 +265,12 @@ pub fn run(p: &LProgram) -> Result<(), String> {
     let isa = cranelift_native::builder().map_err(|e| format!("jit: {e}"))?.finish(settings::Flags::new(fb)).map_err(|e| format!("jit: {e}"))?;
     let mut m = JITModule::new(JITBuilder::with_isa(isa, default_libcall_names()));
 
-    let mut d = Decls { funcs: HashMap::new(), gens: HashMap::new(), workers: HashMap::new(), worker_in: HashMap::new(), worker_out: HashMap::new() };
+    let mut externs = vec![];
+    for x in &p.externs {
+        let addr = resolve_c_symbol(&x.sym).ok_or_else(|| format!("undefined extern symbol `{}` (no such C function in this process)", x.sym))?;
+        externs.push((addr, x.clone()));
+    }
+    let mut d = Decls { funcs: HashMap::new(), gens: HashMap::new(), workers: HashMap::new(), worker_in: HashMap::new(), worker_out: HashMap::new(), externs };
     for f in &p.funcs {
         if f.external {
             return Err(format!("jit: external function `{}`", f.name));
@@ -437,6 +480,75 @@ impl Fx<'_, '_, '_> {
         let fp = self.ic(f as usize as i64);
         let call = self.b.ins().call_indirect(sig, fp, &args);
         if ret.is_some() { Some(self.b.inst_results(call)[0]) } else { None }
+    }
+
+    /// A call to a C function with the platform's C ABI: narrow integers are
+    /// passed at their own width and extended as the ABI requires (`sext` /
+    /// `uext`; Apple arm64 callers extend to 32 bits), results are extended
+    /// back to a register. Strings are NUL-terminated copies freed after the
+    /// call; errno is saved right after it.
+    fn ffi_call(&mut self, i: usize, args: &[LE]) -> Vec<Value> {
+        let (addr, x) = self.d.externs[i].clone();
+        let vals: Vec<Vec<Value>> = args.iter().map(|a| self.e(a)).collect();
+        let mut sig = self.m.make_signature();
+        let (mut cargs, mut frees) = (vec![], vec![]);
+        for (t, v) in x.params.iter().zip(&vals) {
+            match t {
+                FfiTy::Str => {
+                    let p = self.spill(&LTy::Str, v);
+                    let c = self.call_rt(rt::alxj_cstr_new, &[p], true).unwrap();
+                    frees.push(c);
+                    sig.params.push(AbiParam::new(I64));
+                    cargs.push(c);
+                }
+                FfiTy::Bytes | FfiTy::Ptr | FfiTy::Int(IntKind::I64 | IntKind::U64) => {
+                    sig.params.push(AbiParam::new(I64));
+                    cargs.push(v[0]);
+                }
+                FfiTy::Int(k) => {
+                    let ty = ffi_int_ty(*k);
+                    let r = self.b.ins().ireduce(ty, v[0]);
+                    sig.params.push(if k.signed() { AbiParam::new(ty).sext() } else { AbiParam::new(ty).uext() });
+                    cargs.push(r);
+                }
+                FfiTy::F64 => {
+                    sig.params.push(AbiParam::new(F64));
+                    cargs.push(v[0]);
+                }
+                FfiTy::Bool => {
+                    sig.params.push(AbiParam::new(I8).uext());
+                    cargs.push(v[0]);
+                }
+                FfiTy::Unit => unreachable!(),
+            }
+        }
+        let ret_ty = match x.ret {
+            FfiTy::Unit => None,
+            FfiTy::Ptr | FfiTy::Int(IntKind::I64 | IntKind::U64) => Some(I64),
+            FfiTy::Int(k) => Some(ffi_int_ty(k)),
+            FfiTy::F64 => Some(F64),
+            FfiTy::Bool => Some(I8),
+            _ => unreachable!(),
+        };
+        if let Some(t) = ret_ty {
+            sig.returns.push(AbiParam::new(t));
+        }
+        let sigref = self.b.import_signature(sig);
+        self.call_rt(rt::alxj_ffi_enter, &[], false);
+        let fp = self.ic(addr as i64);
+        let call = self.b.ins().call_indirect(sigref, fp, &cargs);
+        let r = ret_ty.map(|_| self.b.inst_results(call)[0]);
+        self.call_rt(rt::alxj_ffi_save_errno, &[], false);
+        for c in frees {
+            self.call_rt(rt::alxj_cstr_free, &[c], false);
+        }
+        match (x.ret, r) {
+            (FfiTy::Int(k), Some(r)) if k.bits() < 64 => {
+                vec![if k.signed() { self.b.ins().sextend(I64, r) } else { self.b.ins().uextend(I64, r) }]
+            }
+            (_, Some(r)) => vec![r],
+            (_, None) => vec![],
+        }
     }
 
     fn fref(&mut self, id: FuncId) -> FuncRef {
@@ -1063,8 +1175,9 @@ impl Fx<'_, '_, '_> {
             },
             LE::Cond(_, a, _) => self.ty(a),
             LE::Call(f, _) => self.d.funcs[f.as_str()].1.ret.clone(),
+            LE::Ffi(i, _) => self.d.externs[*i].1.ret.lty(),
             LE::Rt(rt, args) => match rt {
-                Rt::IntToS | Rt::PIntToS | Rt::StrRev | Rt::StrDelete | Rt::FToS | Rt::FFmt | Rt::FFmtE | Rt::StrPad | Rt::StrQuote | Rt::StrCat | Rt::U64ToS | Rt::IntFmt | Rt::RuneToS | Rt::StrFromBytes | Rt::FileRead | Rt::CapEnd => LTy::Str,
+                Rt::IntToS | Rt::PIntToS | Rt::StrRev | Rt::StrDelete | Rt::FToS | Rt::FFmt | Rt::FFmtE | Rt::StrPad | Rt::StrQuote | Rt::StrCat | Rt::U64ToS | Rt::IntFmt | Rt::RuneToS | Rt::StrFromBytes | Rt::FileRead | Rt::CapEnd | Rt::Strerror | Rt::StrFromCstr | Rt::StrFromPtr => LTy::Str,
                 Rt::FileStatus | Rt::NowNs | Rt::CapBegin => LTy::I64,
                 Rt::IntToF | Rt::FSqrt | Rt::FAbs | Rt::Math(_) | Rt::FFromBits => LTy::F64,
                 Rt::FBits => LTy::IntK(IntKind::U64),
@@ -1467,6 +1580,7 @@ impl Fx<'_, '_, '_> {
                 let call = self.b.ins().call(fr, &av);
                 self.b.inst_results(call).to_vec()
             }
+            LE::Ffi(i, args) => self.ffi_call(*i, args),
             LE::Rt(r, args) => self.rt_expr(*r, args),
             LE::Index { arr, idx, check } => {
                 let et = elem(&self.ty(arr)).clone();
@@ -1669,6 +1783,19 @@ impl Fx<'_, '_, '_> {
                 vec![self.call_rt(rt::alxj_file_status, &[ps], true).unwrap()]
             }
             Rt::NowNs => vec![self.call_rt(rt::alxj_now_ns, &[], true).unwrap()],
+            Rt::Errno => vec![self.call_rt(rt::alxj_errno, &[], true).unwrap()],
+            Rt::Strerror | Rt::StrFromCstr => {
+                let v = self.e1(&args[0]);
+                let out = self.slot(16);
+                self.call_rt(if r == Rt::Strerror { rt::alxj_strerror } else { rt::alxj_str_from_cstr }, &[out, v], false);
+                self.load(&s, out, 0)
+            }
+            Rt::StrFromPtr => {
+                let (p, n) = (self.e1(&args[0]), self.e1(&args[1]));
+                let out = self.slot(16);
+                self.call_rt(rt::alxj_str_from_ptr, &[out, p, n], false);
+                self.load(&s, out, 0)
+            }
             Rt::CapBegin => vec![self.call_rt(rt::alxj_cap_begin, &[], true).unwrap()],
             Rt::CapEnd => {
                 let out = self.slot(16);

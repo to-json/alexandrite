@@ -41,7 +41,9 @@ pub fn lower(p: &TProgram, sm: &SourceMap, opts: &Opts) -> LProgram {
     // R1: where each allocation lives (unless turned off, for comparison).
     let placement = if std::env::var_os("ALX_NO_REGIONS").is_some() { vec![] } else { crate::regions::analyze(p) };
     for (fi, f) in p.funcs.iter().enumerate() {
-        let lf = if f.external {
+        let lf = if let Some(sym) = &f.ffi {
+            ffi_wrapper(p, sm, opts, f, sym, &prog)
+        } else if f.external {
             let mut lw = Lw::new(p, sm, opts, f, f.overflow, ErrPath::Return(vec![]), &prog);
             let params = f.params.iter().map(|l| lw.var_of(*l)).collect();
             LFunc { name: f.cname.clone(), params, vars: lw.vars, ret: fn_ret(f), body: vec![], external: true, is_main: false, labels: 0 }
@@ -75,6 +77,49 @@ pub fn lower(p: &TProgram, sm: &SourceMap, opts: &Opts) -> LProgram {
     let mut prog = prog.into_inner();
     prog.uses_pint = p.funcs.iter().any(|f| f.overflow == Overflow::Promote);
     prog
+}
+
+/// An `extern def` as a function: its body is one C call, with Ints
+/// converted to machine words (and back) in a `#![overflow(promote)]` file.
+fn ffi_wrapper(p: &TProgram, sm: &SourceMap, opts: &Opts, f: &TFunc, sym: &str, prog: &RefCell<LProgram>) -> LFunc {
+    let mut lw = Lw::new(p, sm, opts, f, f.overflow, ErrPath::Return(vec![]), prog);
+    let params: Vec<V> = f.params.iter().map(|l| lw.var_of(*l)).collect();
+    let ffi_ty = |t: &Ty| match t {
+        Ty::Int => FfiTy::Int(IntKind::I64),
+        Ty::IntK(k) => FfiTy::Int(*k),
+        Ty::Float => FfiTy::F64,
+        Ty::Bool => FfiTy::Bool,
+        Ty::Str => FfiTy::Str,
+        Ty::Array(_) => FfiTy::Bytes,
+        Ty::Ptr => FfiTy::Ptr,
+        _ => FfiTy::Unit,
+    };
+    let promote = f.overflow == Overflow::Promote;
+    let (mut tys, mut args) = (vec![], vec![]);
+    for (l, v) in f.params.iter().zip(&params) {
+        let t = &f.locals[*l].ty;
+        tys.push(ffi_ty(t));
+        let a = LE::Var(*v);
+        args.push(if promote && *t == Ty::Int { LE::Rt(Rt::PToI64, vec![a, LE::Loc(sym.to_string())]) } else { a });
+    }
+    let sig = FfiSig { sym: sym.to_string(), params: tys, ret: ffi_ty(&f.ret) };
+    let idx = {
+        let mut pr = prog.borrow_mut();
+        match pr.externs.iter().position(|x| *x == sig) {
+            Some(i) => i,
+            None => {
+                pr.externs.push(sig);
+                pr.externs.len() - 1
+            }
+        }
+    };
+    let call = LE::Ffi(idx, args);
+    let body = match &f.ret {
+        Ty::Unit => vec![LS::Eval(call)],
+        Ty::Int if promote => vec![LS::Return(Some(LE::ToP(Box::new(call))))],
+        _ => vec![LS::Return(Some(call))],
+    };
+    LFunc { name: f.cname.clone(), params, vars: lw.vars, ret: fn_ret(f), body, external: false, is_main: false, labels: 0 }
 }
 
 /// A pool's header: slots (generation, value), live count, the contents'
@@ -148,7 +193,7 @@ pub fn lty(t: &Ty, mode: Overflow) -> LTy {
         // A one-element array (shared, like a map) of (lock, value).
         Ty::Mutex(t) => LTy::Arr(Box::new(LTy::Tup(vec![LTy::Lock, lty(t, mode)]))),
         Ty::Atomic(_) => LTy::Atomic,
-        Ty::Handle(_) => LTy::I64,
+        Ty::Handle(_) | Ty::Ptr => LTy::I64,
         Ty::Chan(t) => LTy::Chan(Box::new(lty(t, mode))),
         Ty::Fn(..) => LTy::Tup(std::iter::once(LTy::I64).chain(lambda_sites(t).iter().map(|(_, caps)| LTy::Tup(caps.iter().map(|c| lty(c, mode)).collect()))).collect()),
         Ty::Iface(n) => {
@@ -856,7 +901,7 @@ impl<'a> Lw<'a> {
                 self.emit(LS::SetIndex { arr: var, idx: iv, val: vv.clone(), check });
                 vv
             }
-            TK::Bin(op @ (BinOp::Eq | BinOp::Ne), a, b) if matches!(a.ty, Ty::Handle(_)) => {
+            TK::Bin(op @ (BinOp::Eq | BinOp::Ne), a, b) if matches!(a.ty, Ty::Handle(_) | Ty::Ptr) => {
                 let (x, y) = (self.expr(a), self.expr(b));
                 LE::Cmp(if *op == BinOp::Eq { Op::Eq } else { Op::Ne }, Box::new(x), Box::new(y), LTy::I64)
             }
@@ -2802,6 +2847,24 @@ impl<'a> Lw<'a> {
                 let c = self.expr(&args[0]);
                 self.emit(LS::Exit(c));
                 LE::Unit
+            }
+            PtrNull => LE::I(0),
+            CErrno | CStrerror | StrFromCstr | StrFromPtr => {
+                let (rt, ty, n) = match m {
+                    CErrno => (Rt::Errno, LTy::I64, 0),
+                    CStrerror => (Rt::Strerror, LTy::Str, 1),
+                    StrFromCstr => (Rt::StrFromCstr, LTy::Str, 1),
+                    _ => (Rt::StrFromPtr, LTy::Str, 2),
+                };
+                let mut a = vec![];
+                for (i, x) in args.iter().enumerate().take(n) {
+                    let v = self.expr(x);
+                    a.push(if x.ty == Ty::Int { self.int_in(v, sp) } else { v });
+                    let _ = i;
+                }
+                let t = self.tmp(ty.clone());
+                self.emit(LS::Set(t, LE::Rt(rt, a)));
+                if ty == LTy::I64 && self.lty(&e.ty) == LTy::PInt { LE::ToP(Box::new(LE::Var(t))) } else { LE::Var(t) }
             }
             NowNs | CapBegin | CapEnd => {
                 let (rt, ty) = match m {

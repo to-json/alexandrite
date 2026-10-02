@@ -4,8 +4,11 @@
 #include <assert.h>
 #include <errno.h>
 #include <pthread.h>
+#include <fcntl.h>
 #include <setjmp.h>
 #include <signal.h>
+#include <sys/stat.h>
+#include <time.h>
 #include <sys/mman.h>
 #include <unistd.h>
 
@@ -1678,4 +1681,73 @@ const char *alx_local_zone(int64_t unix_sec) {
     struct tm tm;
     if (!localtime_r(&t, &tm) || !tm.tm_zone) return "UTC";
     return tm.tm_zone;
+}
+
+/* ---------- C foreign functions (extern def) ---------- */
+
+_Thread_local int alx_ffi_errno_;
+
+void alx_ffi_enter(void) {
+    fflush(stdout);
+    errno = 0; /* so C.errno is 0 after a call that set nothing */
+}
+
+char *alx_cstr_new(AlxStr s) {
+    char *p = malloc((size_t)s.len + 1);
+    if (!p) alx_panic("out of memory", "extern call");
+    if (s.len) memcpy(p, s.ptr, (size_t)s.len);
+    p[s.len] = 0;
+    return p;
+}
+
+AlxStr alx_str_from_cstr(const char *p) {
+    if (!p) { AlxStr e = { "", 0 }; return e; }
+    return alx_str_from_bytes((const uint8_t *)p, (int64_t)strlen(p));
+}
+
+AlxStr alx_str_from_ptr(const char *p, int64_t n) {
+    if (!p || n <= 0) { AlxStr e = { "", 0 }; return e; }
+    return alx_str_from_bytes((const uint8_t *)p, n);
+}
+
+AlxStr alx_strerror(int64_t n) {
+    static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER; /* strerror isn't thread-safe */
+    pthread_mutex_lock(&mu);
+    AlxStr s = alx_str_from_cstr(strerror((int)n));
+    pthread_mutex_unlock(&mu);
+    return s;
+}
+
+int32_t alx_sys_open(const char *path, int32_t flags, int32_t mode) { return open(path, flags, (mode_t)mode); }
+int32_t alx_sys_fcntl(int32_t fd, int32_t cmd, int64_t arg) { return fcntl(fd, cmd, (long)arg); }
+
+typedef struct { const char *name; int64_t val; } SysConst;
+#define SC(x) { #x, (int64_t)(x) },
+static const SysConst sys_consts[] = {
+    SC(O_RDONLY) SC(O_WRONLY) SC(O_RDWR) SC(O_CREAT) SC(O_EXCL) SC(O_TRUNC) SC(O_APPEND) SC(O_NONBLOCK) SC(O_CLOEXEC)
+#ifdef O_DIRECTORY
+    SC(O_DIRECTORY)
+#endif
+#ifdef O_SYNC
+    SC(O_SYNC)
+#endif
+    SC(SEEK_SET) SC(SEEK_CUR) SC(SEEK_END)
+    SC(F_GETFD) SC(F_SETFD) SC(F_GETFL) SC(F_SETFL) SC(FD_CLOEXEC)
+    SC(EPERM) SC(ENOENT) SC(ESRCH) SC(EINTR) SC(EIO) SC(ENXIO) SC(E2BIG) SC(ENOEXEC) SC(EBADF) SC(ECHILD)
+    SC(EAGAIN) SC(ENOMEM) SC(EACCES) SC(EFAULT) SC(EBUSY) SC(EEXIST) SC(EXDEV) SC(ENODEV) SC(ENOTDIR)
+    SC(EISDIR) SC(EINVAL) SC(ENFILE) SC(EMFILE) SC(ENOTTY) SC(EFBIG) SC(ENOSPC) SC(ESPIPE) SC(EROFS)
+    SC(EMLINK) SC(EPIPE) SC(EDOM) SC(ERANGE) SC(EWOULDBLOCK) SC(ENAMETOOLONG) SC(ENOSYS) SC(ENOTEMPTY)
+    SC(ELOOP) SC(ETIMEDOUT) SC(ECONNREFUSED) SC(ECONNRESET) SC(EADDRINUSE)
+    SC(S_IFMT) SC(S_IFREG) SC(S_IFDIR) SC(S_IFLNK) SC(S_IFIFO) SC(S_IFCHR) SC(S_IFBLK) SC(S_IFSOCK)
+    SC(S_IRWXU) SC(S_IRUSR) SC(S_IWUSR) SC(S_IXUSR) SC(S_IRWXG) SC(S_IRWXO)
+    SC(CLOCK_REALTIME) SC(CLOCK_MONOTONIC)
+};
+#undef SC
+
+int64_t alx_sys_const_count(void) { return (int64_t)(sizeof sys_consts / sizeof sys_consts[0]); }
+const char *alx_sys_const_name(int64_t i) { return sys_consts[i].name; }
+int64_t alx_sys_const(const char *name) {
+    for (size_t i = 0; i < sizeof sys_consts / sizeof sys_consts[0]; i++)
+        if (strcmp(sys_consts[i].name, name) == 0) return sys_consts[i].val;
+    return -1;
 }

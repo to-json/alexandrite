@@ -101,7 +101,7 @@ pub fn allocates(e: &TExpr, promote: bool) -> bool {
             // Scalars, reads, and terminals that produce an element or a number
             // (their blocks' allocations are sites of their own).
             M::TupleGet(_) | M::OptPresent | M::OptGet | M::Unwrap | M::EnumTag | M::Size | M::MapSize | M::MapHas | M::ChanLen | M::ResIsOk | M::ErrIs(_) | M::ErrAs(_)
-                | M::Even | M::Odd | M::IntSqrt | M::ToF | M::FloatToI | M::Conv(..) | M::FloatAbs | M::Sqrt | M::Math(_) | M::FloatBits | M::FloatFromBits | M::NowNs
+                | M::Even | M::Odd | M::IntSqrt | M::ToF | M::FloatToI | M::Conv(..) | M::FloatAbs | M::Sqrt | M::Math(_) | M::FloatBits | M::FloatFromBits | M::NowNs | M::PtrNull | M::CErrno
                 | M::Sum | M::Max | M::Min | M::MaxBy | M::MinBy | M::Count | M::All | M::Any | M::Include | M::First | M::Last | M::Find | M::Each | M::Loop | M::Step
                 | M::ChanClose | M::CapBegin | M::Exit
         ) || (promote && e.ty == Ty::Int),
@@ -401,7 +401,7 @@ fn contains_int(t: &Ty) -> bool {
 pub fn has_storage(t: &Ty) -> bool {
     match t {
         // An atomic is a runtime cell outside every region.
-        Ty::Int | Ty::IntK(_) | Ty::Float | Ty::Bool | Ty::Unit | Ty::Range | Ty::Never | Ty::Handle(_) | Ty::Atomic(_) => false,
+        Ty::Int | Ty::IntK(_) | Ty::Float | Ty::Bool | Ty::Unit | Ty::Range | Ty::Never | Ty::Handle(_) | Ty::Atomic(_) | Ty::Ptr => false,
         Ty::Opt(t) => has_storage(t),
         Ty::Tuple(ts) => ts.iter().any(has_storage),
         Ty::Struct(_, fs) => fs.iter().any(|(_, t)| has_storage(t)),

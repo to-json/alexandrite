@@ -115,6 +115,10 @@ pub enum LE {
     Cond(Box<LE>, Box<LE>, Box<LE>),
     /// Call a non-fallible user function.
     Call(String, Vec<LE>),
+    /// Call the C function `LProgram::externs[i]` (an `extern def`). Flushes
+    /// stdout first (so output interleaves in program order) and saves errno
+    /// right after the call (read back by `Rt::Errno`).
+    Ffi(usize, Vec<LE>),
     /// Runtime helper (named per backend).
     Rt(Rt, Vec<LE>),
     Index { arr: Box<LE>, idx: Box<LE>, check: Option<String> },
@@ -165,6 +169,46 @@ pub enum LE {
     /// Bytes allocated in a region so far (chunks in use + large blocks),
     /// I64. Used to decide when a container's region is worth compacting.
     RegionBytes(Box<LE>),
+}
+
+/// The C-side type of an `extern def` parameter or result.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FfiTy {
+    /// An integer of this kind (`I64` = `int64_t`; narrower kinds are the exact C types).
+    Int(IntKind),
+    F64,
+    Bool,
+    /// Parameter only: a NUL-terminated copy (`const char *`), valid for the call.
+    Str,
+    /// Parameter only: a `[Byte]` as a pointer to its first element.
+    Bytes,
+    /// An opaque pointer (`void *`); I64 in registers.
+    Ptr,
+    Unit,
+}
+
+impl FfiTy {
+    /// The type of the value in a LIR register.
+    pub fn lty(self) -> LTy {
+        match self {
+            FfiTy::Int(IntKind::I64) | FfiTy::Ptr => LTy::I64,
+            FfiTy::Int(k) => LTy::IntK(k),
+            FfiTy::F64 => LTy::F64,
+            FfiTy::Bool => LTy::Bool,
+            FfiTy::Str => LTy::Str,
+            FfiTy::Bytes => LTy::Arr(Box::new(LTy::IntK(IntKind::U8))),
+            FfiTy::Unit => LTy::Unit,
+        }
+    }
+}
+
+/// A C function an `extern def` calls.
+#[derive(Clone, Debug, PartialEq)]
+pub struct FfiSig {
+    /// The link name (without the platform's leading underscore).
+    pub sym: String,
+    pub params: Vec<FfiTy>,
+    pub ret: FfiTy,
 }
 
 /// A case of `LS::Select`.
@@ -240,6 +284,14 @@ pub enum Rt {
     FileRead,
     /// (): monotonic clock, nanoseconds (I64).
     NowNs,
+    /// (): errno as saved right after the last `Ffi` call on this thread (I64).
+    Errno,
+    /// (n): `strerror(n)` copied into a Str.
+    Strerror,
+    /// (p): a Str copy of the NUL-terminated string at pointer `p`.
+    StrFromCstr,
+    /// (p, n): a Str copy of the `n` bytes at pointer `p`.
+    StrFromPtr,
     /// (): start capturing everything `puts` prints (I64, always 0). Process-wide.
     CapBegin,
     /// (): stop capturing; the Str of what was printed since `CapBegin`.
@@ -395,6 +447,8 @@ pub struct LProgram {
     pub uses_pint: bool,
     /// Map instantiations generated so far (see mapgen), by K/V.
     pub maps: Vec<String>,
+    /// The C functions of `extern def`s (what `LE::Ffi` indexes).
+    pub externs: Vec<FfiSig>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

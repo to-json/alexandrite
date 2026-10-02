@@ -295,13 +295,39 @@ pub fn lex_at(file: u32, src: &str, base: u32) -> Result<Vec<Token>, Diag> {
                     break;
                 }
                 if b[i] == b'\\' && q == b'"' && i + 1 < b.len() {
-                    s.push(match b[i + 1] {
-                        b'n' => '\n',
-                        b't' => '\t',
-                        b'0' => '\0',
-                        o => o as char,
-                    });
-                    i += 2;
+                    // Go's escapes; `\x` up to 7f (a Str is UTF-8 text here),
+                    // `\u` / `\U` code points; punctuation stands for itself.
+                    let hex = |from: usize, n: usize| -> Option<u32> {
+                        let h = b.get(from..from + n)?;
+                        u32::from_str_radix(std::str::from_utf8(h).ok()?, 16).ok()
+                    };
+                    let (ch, len) = match b[i + 1] {
+                        b'n' => ('\n', 2),
+                        b't' => ('\t', 2),
+                        b'r' => ('\r', 2),
+                        b'0' => ('\0', 2),
+                        b'a' => ('\x07', 2),
+                        b'b' => ('\x08', 2),
+                        b'f' => ('\x0c', 2),
+                        b'v' => ('\x0b', 2),
+                        b'e' => ('\x1b', 2),
+                        b'x' => match hex(i + 2, 2) {
+                            Some(v) if v < 0x80 => (char::from(v as u8), 4),
+                            Some(_) => return Err(Diag::new(sp(i, i + 4), "`\\x` escapes above 7f would make invalid UTF-8; write the character, use `\\u`, or build bytes with `Str.from_bytes`")),
+                            None => return Err(Diag::new(sp(i, i + 2), "`\\x` needs two hex digits")),
+                        },
+                        b'u' | b'U' => {
+                            let n = if b[i + 1] == b'u' { 4 } else { 8 };
+                            match hex(i + 2, n).and_then(char::from_u32) {
+                                Some(c) => (c, 2 + n),
+                                None => return Err(Diag::new(sp(i, i + 2), format!("`\\{}` needs {n} hex digits naming a valid code point", b[i + 1] as char))),
+                            }
+                        }
+                        o if o.is_ascii_alphanumeric() => return Err(Diag::new(sp(i, i + 2), format!("unknown escape `\\{}`", o as char))),
+                        o => (o as char, 2),
+                    };
+                    s.push(ch);
+                    i += len;
                     continue;
                 }
                 if q == b'"' && b[i] == b'#' && b.get(i + 1) == Some(&b'{') {

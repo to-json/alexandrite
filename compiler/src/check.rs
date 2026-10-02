@@ -553,10 +553,12 @@ impl<'a> World<'a> {
             let me = if m.name.ends_with('!') { Ty::arr(t.clone()) } else { t.clone() };
             let args: Vec<Ty> = std::iter::once(me).chain(m.params.iter().cloned()).collect();
             let fid = self.instance(def, args, sp)?;
-            let ret = match &self.funcs[fid] {
-                Some(f) => f.ret.clone(),
-                None => self.sigs.get(&fid).map(|s| s.0.clone()).unwrap_or(Ty::Unit),
+            let (ret, fallible) = match &self.funcs[fid] {
+                Some(f) => (f.ret.clone(), f.fallible),
+                None => self.sigs.get(&fid).map(|s| (s.0.clone(), s.1)).unwrap_or((Ty::Unit, false)),
             };
+            // A fallible method's call is a held `~T`.
+            let ret = if fallible { Ty::Result(Box::new(ret)) } else { ret };
             if ret != m.ret {
                 self.impls.get_mut(iface).unwrap().pop();
                 return Err(Diag::new(sp, format!("{tn}.{} returns {}, but {iface}.{} returns {}", m.name, ret.show(), m.name, m.ret.show())));
@@ -3187,7 +3189,12 @@ impl<'w, 'a> FnCx<'w, 'a> {
         for a in args {
             targs.push(self.value(a)?);
         }
-        let call = self.call_def(def, name, name_span, targs, sp)?;
+        // The receiver is written back after the call, so a fallible call
+        // is held (a `~T`) here; an enclosing `~` propagates it after.
+        let saved = std::mem::replace(&mut self.under_try, false);
+        let call = self.call_def(def, name, name_span, targs, sp);
+        self.under_try = saved;
+        let call = call?;
         let rty = call.ty.clone();
         if matches!(self.resolve(&rty), Ty::Unit) {
             let tl = self.mk(TK::Local(tid), Ty::arr(pty.clone()), sp);

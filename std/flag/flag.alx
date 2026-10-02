@@ -27,6 +27,10 @@
 # The program's own arguments: `flag.args_of_program` (argv without argv[0]),
 # `fs.parse_program!` = `fs.parse!(args_of_program)`.
 #
+# A FlagSet is a handle on shared state (GO-VS-RUBY D36): copies are the same
+# set, so a set passed to a function that defines flags or parses keeps the
+# result. Make one with `new_set` (the zero value has no state).
+#
 # Differences from Go: no Duration/Uint/Int64 flags (no time package yet; use
 # `var!` with your own Value), no global CommandLine set, no ContinueOnError
 # policy (parse! always returns the error and never exits or prints), no
@@ -85,12 +89,22 @@ struct Flag {
   given: Bool
 }
 
-pub struct FlagSet {
-  name: Str
+# The mutable part of a FlagSet, kept in a one-element slice (D36).
+struct SetState {
   flags: [Flag]
   vals: [Value]
   rest: [Str]
   parsed: Bool
+}
+
+pub struct FlagSet {
+  name: Str
+  cell: [SetState]
+
+  def flags -> [Flag] { cell[0].flags }
+  def vals -> [Value] { cell[0].vals }
+  def rest -> [Str] { cell[0].rest }
+  def parsed -> Bool { cell[0].parsed }
 
   def add!(name: Str, usage: Str, kind: Int, defv: Str) -> Int {
     if name.size == 0 || name[0] == 45 || name.contains("=") {
@@ -99,7 +113,7 @@ pub struct FlagSet {
     for fl in flags {
       panic "flag redefined: #{name}" if fl.name == name
     }
-    self.flags << Flag.new(name: name, usage: usage, kind: kind, defv: defv, b: false, i: 0, f: 0.0, s: "", list: [], vidx: -1, given: false)
+    self.cell[0].flags << Flag.new(name: name, usage: usage, kind: kind, defv: defv, b: false, i: 0, f: 0.0, s: "", list: [], vidx: -1, given: false)
     flags.size - 1
   }
 
@@ -122,22 +136,22 @@ pub struct FlagSet {
   # Defines a bool flag with a default.
   pub def bool!(name: Str, value: Bool, usage: Str) {
     i = add!(name, usage, K_BOOL, "#{value}")
-    self.flags[i].b = value
+    self.cell[0].flags[i].b = value
   }
 
   pub def int!(name: Str, value: Int, usage: Str) {
     i = add!(name, usage, K_INT, "#{value}")
-    self.flags[i].i = value
+    self.cell[0].flags[i].i = value
   }
 
   pub def float!(name: Str, value: Float, usage: Str) {
     i = add!(name, usage, K_FLOAT, "#{value}")
-    self.flags[i].f = value
+    self.cell[0].flags[i].f = value
   }
 
   pub def str!(name: Str, value: Str, usage: Str) {
     i = add!(name, usage, K_STR, value)
-    self.flags[i].s = value
+    self.cell[0].flags[i].s = value
   }
 
   # A flag that may repeat; every occurrence is collected, in order.
@@ -148,8 +162,8 @@ pub struct FlagSet {
   # A flag with a user-defined Value; its current to_s is the default.
   pub def var!(name: Str, v: Value, usage: Str) {
     i = add!(name, usage, K_VAR, v.to_s)
-    self.vals << v
-    self.flags[i].vidx = vals.size - 1
+    self.cell[0].vals << v
+    self.cell[0].flags[i].vidx = vals.size - 1
   }
 
   pub def get_bool(name: Str) -> Bool { flags[must(name, K_BOOL)].b }
@@ -228,36 +242,36 @@ pub struct FlagSet {
         }
         v = r.unwrap
       }
-      self.flags[i].b = v
+      self.cell[0].flags[i].b = v
     } else if k == K_INT {
       ri = strconv.parse_int(value, 0, 64)
       if e2 = ri.err {
         return FlagError.BadValue(nm, value, num_why(e2))
       }
-      self.flags[i].i = ri.unwrap
+      self.cell[0].flags[i].i = ri.unwrap
     } else if k == K_FLOAT {
       rf = strconv.parse_float(value)
       if e3 = rf.err {
         return FlagError.BadValue(nm, value, num_why(e3))
       }
-      self.flags[i].f = rf.unwrap
+      self.cell[0].flags[i].f = rf.unwrap
     } else if k == K_STR {
-      self.flags[i].s = value
+      self.cell[0].flags[i].s = value
     } else if k == K_LIST {
-      self.flags[i].list << value
+      self.cell[0].flags[i].list << value
     } else {
-      if why = self.vals[fl.vidx].set!(value) {
+      if why = self.cell[0].vals[fl.vidx].set!(value) {
         return FlagError.BadValue(nm, value, why)
       }
     }
-    self.flags[i].given = true
+    self.cell[0].flags[i].given = true
     none
   }
 
   # Parses args (without the program name). Stops at the first non-flag
   # argument; the rest is available as `args`.
   def run!(args: [Str]) -> FlagError? {
-    self.parsed = true
+    self.cell[0].parsed = true
     p = 0
     while p < args.size {
       s = args[p]
@@ -302,7 +316,7 @@ pub struct FlagSet {
         return e if e.present?
       }
     }
-    self.rest = args[p...args.size]
+    self.cell[0].rest = args[p...args.size]
     none
   }
 
@@ -326,7 +340,8 @@ pub struct FlagSet {
 
 # A new, empty set. `name` is shown in the usage header.
 pub def new_set(name: Str) -> FlagSet {
-  FlagSet.new(name: name, flags: [], vals: [], rest: [], parsed: false)
+  cell: [SetState] = [SetState.new(flags: [], vals: [], rest: [], parsed: false)]
+  FlagSet.new(name: name, cell: cell)
 }
 
 extern def alx_argc -> Int

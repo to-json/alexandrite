@@ -175,41 +175,50 @@ def lower_rune(r: Int) -> Int {
 
 # ------------------------------------------------------------------- Builder
 # A growable byte buffer: appends are amortized O(1), to_s copies once.
+# State sharing (GO-VS-RUBY D36): the bytes live in a one-element slice `st`, so
+# copies of a Builder are the same builder (Go's *strings.Builder). The zero
+# value `Builder.new` has no state yet: it reads as empty and its first write
+# creates the state, so copies taken before that first write don't share it
+# (write once, or use `new_builder`, before handing out copies).
 pub struct Builder {
-  buf: [Byte]
+  st: [[Byte]]
+
+  # (Writers create the state of a zero-value Builder inline, `if st.size == 0`.)
 
   # Appends s[a...b] (bytes).
   def put_str!(s: Str, a: Int, b: Int) {
+    if st.size == 0 { self.st = [[]] }
     i = a
     while i < b {
-      self.buf << s[i]
+      self.st[0] << s[i]
       i += 1
     }
   }
 
   # Appends the UTF-8 encoding of rune value c (invalid values become U+FFFD).
   def put_rune!(c: Int) -> Int {
+    if st.size == 0 { self.st = [[]] }
     r = c
     r = 0xFFFD if !valid_rune(r)
     if r < 0x80 {
-      self.buf << r.as_u8
+      self.st[0] << r.as_u8
       return 1
     }
     if r < 0x800 {
-      self.buf << (0xC0 | (r >> 6)).as_u8
-      self.buf << (0x80 | (r & 0x3F)).as_u8
+      self.st[0] << (0xC0 | (r >> 6)).as_u8
+      self.st[0] << (0x80 | (r & 0x3F)).as_u8
       return 2
     }
     if r < 0x10000 {
-      self.buf << (0xE0 | (r >> 12)).as_u8
-      self.buf << (0x80 | ((r >> 6) & 0x3F)).as_u8
-      self.buf << (0x80 | (r & 0x3F)).as_u8
+      self.st[0] << (0xE0 | (r >> 12)).as_u8
+      self.st[0] << (0x80 | ((r >> 6) & 0x3F)).as_u8
+      self.st[0] << (0x80 | (r & 0x3F)).as_u8
       return 3
     }
-    self.buf << (0xF0 | (r >> 18)).as_u8
-    self.buf << (0x80 | ((r >> 12) & 0x3F)).as_u8
-    self.buf << (0x80 | ((r >> 6) & 0x3F)).as_u8
-    self.buf << (0x80 | (r & 0x3F)).as_u8
+    self.st[0] << (0xF0 | (r >> 18)).as_u8
+    self.st[0] << (0x80 | ((r >> 12) & 0x3F)).as_u8
+    self.st[0] << (0x80 | ((r >> 6) & 0x3F)).as_u8
+    self.st[0] << (0x80 | (r & 0x3F)).as_u8
     4
   }
 
@@ -219,23 +228,32 @@ pub struct Builder {
     s.size
   }
   pub def write_byte!(b: Byte) {
-    self.buf << b
+    if st.size == 0 { self.st = [[]] }
+    self.st[0] << b
   }
   # Appends r as UTF-8; returns the number of bytes written.
   pub def write_rune!(r: Rune) -> Int { put_rune!(r.to_i) }
   # The accumulated string (a copy).
-  pub def to_s -> Str { Str.from_bytes(buf) }
-  pub def string -> Str { Str.from_bytes(buf) }
+  pub def to_s -> Str { st.size == 0 ? "" : Str.from_bytes(st[0]) }
+  pub def string -> Str { st.size == 0 ? "" : Str.from_bytes(st[0]) }
   # Bytes written so far.
-  pub def size -> Int { buf.size }
+  pub def size -> Int { st.size == 0 ? 0 : st[0].size }
   pub def reset! {
-    self.buf = []
+    if st.size > 0 {
+      self.st[0] = []
+    }
   }
   # Go's Grow(n). There is no capacity primitive yet; appends are already
   # amortized O(1), so this only validates n.
   pub def grow!(n: Int) {
     assert n >= 0
   }
+}
+
+# A Builder whose state exists already, so copies share it from the start.
+pub def new_builder -> Builder {
+  cell: [[Byte]] = [[]]
+  Builder.new(st: cell)
 }
 
 # ------------------------------------------------------------------- search
@@ -650,11 +668,11 @@ def map_case(s: Str, up: Bool) -> Str {
     c = s[i].to_i
     if c < 0x80 {
       if up && c >= 97 && c <= 122 {
-        b.buf << (c - 32).as_u8
+        b.write_byte!((c - 32).as_u8)
       } else if !up && c >= 65 && c <= 90 {
-        b.buf << (c + 32).as_u8
+        b.write_byte!((c + 32).as_u8)
       } else {
-        b.buf << s[i]
+        b.write_byte!(s[i])
       }
       i += 1
     } else {

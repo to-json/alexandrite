@@ -14,7 +14,9 @@
 #    Latin Extended-A, Greek, Cyrillic) at the cost of one Str round trip.
 #  - Builtin methods win over method sugar, so a name that is also a builtin
 #    array method (`map`, `repeat`...) is called qualified: `bytes.map(f, b)`.
-#  - Buffer (Go's bytes.Buffer) follows the io shape of GO-VS-RUBY F3: end of
+#  - Buffer (Go's bytes.Buffer) is a handle on shared state: copies of a Buffer
+#    are the same buffer (D36); see the Buffer section for the zero value. It
+#    follows the io shape of GO-VS-RUBY F3: end of
 #    data is not an error. `read!` returns 0 at EOF (and for an empty p);
 #    `read_byte!`, `read_rune!`, `read_string!`, `read_bytes!` return none at
 #    EOF. `read_string!(delim)` returns the text through the delimiter, or the
@@ -610,63 +612,92 @@ pub def trim_space(s: [Byte]) -> [Byte] {
 
 # -------------------------------------------------------------------- Buffer
 # A growable byte buffer with a read offset (Go's bytes.Buffer). Writes append;
-# reads consume from the front. The zero value is an empty buffer.
-pub struct Buffer {
+# reads consume from the front.
+#
+# State sharing (GO-VS-RUBY D36): the buffer's bytes and read offset live in a
+# one-element slice `st`, so every copy of a Buffer (a function argument, an
+# io.Reader / io.Writer value, a struct field) is the same buffer, like Go's
+# *bytes.Buffer. Mutating methods keep their `!` (the checker wants it for any
+# write through `self`) and need a variable receiver, but the variable may be
+# a copy.
+# The zero value `Buffer.new` has no state yet: it reads as empty, and its
+# first write creates the state. Copies taken BEFORE that first write don't
+# share it, so make the buffer with `new_buffer` / `new_buffer_string` (or
+# write once) before handing out copies.
+struct BufState {
   buf: [Byte]
   off: Int
+}
+
+pub struct Buffer {
+  st: [BufState]
+
+  # (Writers create the state of a zero-value Buffer inline, `if st.size == 0`:
+  # a helper `!` call per write would add a cell to the region each time.)
 
   # Appends p; returns len(p).
   pub def write!(p: [Byte]) -> Int {
+    if st.size == 0 { self.st = [BufState.new(buf: [], off: 0)] }
     n = p.size
     i = 0
     while i < n {
-      self.buf << p[i]
+      self.st[0].buf << p[i]
       i += 1
     }
     n
   }
   # Appends s; returns the number of bytes written.
   pub def write_string!(s: Str) -> Int {
+    if st.size == 0 { self.st = [BufState.new(buf: [], off: 0)] }
     n = s.size
     i = 0
     while i < n {
-      self.buf << s[i]
+      self.st[0].buf << s[i]
       i += 1
     }
     n
   }
   pub def write_byte!(c: Byte) {
-    self.buf << c
+    if st.size == 0 { self.st = [BufState.new(buf: [], off: 0)] }
+    self.st[0].buf << c
   }
   # Appends r as UTF-8 (invalid values become U+FFFD); returns bytes written.
   pub def write_rune!(r: Rune) -> Int {
-    before = buf.size
-    self.buf = put_rune(buf, r.to_i)
-    buf.size - before
+    if st.size == 0 { self.st = [BufState.new(buf: [], off: 0)] }
+    before = st[0].buf.size
+    self.st[0].buf = put_rune(st[0].buf, r.to_i)
+    st[0].buf.size - before
   }
 
   # Unread bytes.
-  pub def size -> Int { buf.size - off }
-  pub def len -> Int { buf.size - off }
+  pub def size -> Int { st.size == 0 ? 0 : st[0].buf.size - st[0].off }
+  pub def len -> Int { st.size == 0 ? 0 : st[0].buf.size - st[0].off }
   # Capacity: the length (no capacity primitive yet).
-  pub def cap -> Int { buf.size }
+  pub def cap -> Int { st.size == 0 ? 0 : st[0].buf.size }
   # The unread portion, aliasing the buffer; valid until the next write.
-  pub def bytes -> [Byte] { buf[off...buf.size] }
-  pub def to_s -> Str { Str.from_bytes(buf[off...buf.size]) }
-  pub def string -> Str { Str.from_bytes(buf[off...buf.size]) }
+  pub def bytes -> [Byte] {
+    return empty_bytes if st.size == 0
+    st[0].buf[st[0].off...st[0].buf.size]
+  }
+  pub def to_s -> Str { Str.from_bytes(bytes) }
+  pub def string -> Str { Str.from_bytes(bytes) }
 
   pub def reset! {
-    self.buf = []
-    self.off = 0
+    if st.size > 0 {
+      self.st[0].buf = []
+      self.st[0].off = 0
+    }
   }
   # Keeps only the first n unread bytes. Panics unless 0 <= n <= size.
   pub def truncate!(n: Int) {
-    assert n >= 0 && n <= buf.size - off, "truncate out of range"
-    if n == 0 {
-      self.buf = []
-      self.off = 0
-    } else {
-      self.buf = buf[0...off + n]
+    assert n >= 0 && n <= size, "truncate out of range"
+    if st.size > 0 {
+      if n == 0 {
+        self.st[0].buf = []
+        self.st[0].off = 0
+      } else {
+        self.st[0].buf = st[0].buf[0...st[0].off + n]
+      }
     }
   }
   pub def grow!(n: Int) {
@@ -676,14 +707,17 @@ pub struct Buffer {
   # Reads up to p.size bytes into p; returns the count, 0 at EOF (or if p is
   # empty).
   pub def read!(p: [Byte]) -> Int {
-    avail = buf.size - off
+    return 0 if st.size == 0
+    off = st[0].off
+    avail = st[0].buf.size - off
     n = p.size < avail ? p.size : avail
     return 0 if n == 0
-    copy(p[0...n], buf[off...off + n])
-    self.off = off + n
-    if off == buf.size {
-      self.buf = []
-      self.off = 0
+    copy(p[0...n], st[0].buf[off...off + n])
+    if off + n == st[0].buf.size {
+      self.st[0].buf = []
+      self.st[0].off = 0
+    } else {
+      self.st[0].off = off + n
     }
     n
   }
@@ -691,57 +725,69 @@ pub struct Buffer {
   # consumes them.
   pub def next!(n: Int) -> [Byte] {
     assert n >= 0, "negative count"
-    avail = buf.size - off
+    return empty_bytes if st.size == 0
+    off = st[0].off
+    avail = st[0].buf.size - off
     m = n < avail ? n : avail
-    out = buf[off...off + m]
-    self.off = off + m
+    out = st[0].buf[off...off + m]
+    self.st[0].off = off + m
     out
   }
   pub def read_byte! -> Byte? {
-    return none if off >= buf.size
-    c = buf[off]
-    self.off = off + 1
+    return none if st.size == 0
+    off = st[0].off
+    return none if off >= st[0].buf.size
+    c = st[0].buf[off]
+    self.st[0].off = off + 1
     c
   }
   # The next rune and its width in bytes; none at EOF. Invalid UTF-8 reads as
   # (U+FFFD, 1).
   pub def read_rune! -> (Rune, Int)? {
-    return none if off >= buf.size
-    v = dec(buf, off)
-    self.off = off + (v & 7)
+    return none if st.size == 0
+    off = st[0].off
+    return none if off >= st[0].buf.size
+    v = dec(st[0].buf, off)
+    self.st[0].off = off + (v & 7)
     ((v >> 3).as_i32, v & 7)
   }
   # Reads through the first delim (included), or to the end if there is none;
   # none if nothing was left.
   pub def read_bytes!(delim: Byte) -> [Byte]? {
-    return none if off >= buf.size
+    return none if st.size == 0
+    off = st[0].off
+    n = st[0].buf.size
+    return none if off >= n
     i = off
-    while i < buf.size && buf[i] != delim {
+    while i < n && st[0].buf[i] != delim {
       i += 1
     }
-    e = i < buf.size ? i + 1 : i
-    out = clone(buf[off...e])
-    self.off = e
+    e = i < n ? i + 1 : i
+    out = clone(st[0].buf[off...e])
+    self.st[0].off = e
     out
   }
   pub def read_string!(delim: Byte) -> Str? {
-    return none if off >= buf.size
+    return none if st.size == 0
+    off = st[0].off
+    n = st[0].buf.size
+    return none if off >= n
     i = off
-    while i < buf.size && buf[i] != delim {
+    while i < n && st[0].buf[i] != delim {
       i += 1
     }
-    e = i < buf.size ? i + 1 : i
-    out = Str.from_bytes(buf[off...e])
-    self.off = e
+    e = i < n ? i + 1 : i
+    out = Str.from_bytes(st[0].buf[off...e])
+    self.st[0].off = e
     out
   }
 }
 
-# A Buffer holding a copy of b, ready to read.
+# A Buffer holding a copy of b, ready to read and write; copies share it.
 pub def new_buffer(b: [Byte]) -> Buffer {
-  Buffer.new(buf: clone(b), off: 0)
+  Buffer.new(st: [BufState.new(buf: clone(b), off: 0)])
 }
 
 pub def new_buffer_string(s: Str) -> Buffer {
-  Buffer.new(buf: s.bytes.to_a, off: 0)
+  Buffer.new(st: [BufState.new(buf: s.bytes.to_a, off: 0)])
 }

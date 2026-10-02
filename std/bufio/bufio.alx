@@ -7,10 +7,15 @@
 #    fail on an I/O error, are none at the end, else hold the value.
 #    `read_string!(delim)` includes the delimiter, `read_line!` drops "\n" or
 #    "\r\n".
-#  - A Reader, Writer or Scanner is a value with state: call its `!` methods
-#    on a variable. The io.Reader / io.Writer it wraps is held by value, so
-#    wrap handles whose state lives outside the value (`os.File`, `os.stdin`)
-#    or objects you won't touch again.
+#  - A Reader, Writer or Scanner is a handle on shared state (GO-VS-RUBY D36):
+#    its mutable fields live in a one-element slice, so copies are the same
+#    reader / writer / scanner. Pass one to a function and what the callee
+#    consumed (or buffered) is seen by the caller. Call its `!` methods on a
+#    variable (which may be a copy). Make them with `new_reader`,
+#    `new_writer`, `new_scanner`; a zero-value struct has no state.
+#    The io.Reader / io.Writer it wraps is held as a copy too, so it shares
+#    state when it is a std type (`bytes.Buffer`, `os.File`) or follows the
+#    same convention.
 #  - A bufio.Reader is not itself an io.Reader (it holds one, and a closed
 #    sum can't contain itself): read from it with its own methods.
 #  - A Writer must be `flush!`ed; nothing happens at exit.
@@ -53,24 +58,34 @@ def zeros(n: Int) -> [Byte] {
 
 # ---------------------------------------------------------------------- Reader
 
-pub struct Reader {
+# The mutable part of a Reader, kept in a one-element slice (D36).
+struct ReaderState {
   rd: io.Reader
-  buf: [Byte]
   r: Int
   w: Int
   last: Int
+}
+
+pub struct Reader {
+  cell: [ReaderState]
+  buf: [Byte]
+
+  def rd -> io.Reader { cell[0].rd }
+  def r -> Int { cell[0].r }
+  def w -> Int { cell[0].w }
+  def last -> Int { cell[0].last }
 
   # Slides the unread bytes to the front and reads once more; returns the
   # number of bytes read (0 at the end of input).
   def fill! -> ~Int {
     if r > 0 {
       copy(buf[0...w - r], buf[r...w])
-      self.w = w - r
-      self.r = 0
+      self.cell[0].w = w - r
+      self.cell[0].r = 0
     }
     fail BufioError.BufferFull if w >= buf.size
-    n = self.rd.~read!(buf[w...buf.size])
-    self.w = w + n
+    n = self.cell[0].rd.~read!(buf[w...buf.size])
+    self.cell[0].w = w + n
     n
   }
 
@@ -79,21 +94,21 @@ pub struct Reader {
     return 0 if p.size == 0
     if r == w {
       if p.size >= buf.size {
-        got = self.rd.~read!(p)
-        self.last = p[got - 1].to_i if got > 0
+        got = self.cell[0].rd.~read!(p)
+        self.cell[0].last = p[got - 1].to_i if got > 0
         return got
       }
-      self.r = 0
-      self.w = 0
-      n = self.rd.~read!(buf)
+      self.cell[0].r = 0
+      self.cell[0].w = 0
+      n = self.cell[0].rd.~read!(buf)
       return 0 if n == 0
-      self.w = n
+      self.cell[0].w = n
     }
     n = w - r
     n = p.size if n > p.size
     copy(p[0...n], buf[r...r + n])
-    self.r = r + n
-    self.last = buf[r - 1].to_i
+    self.cell[0].r = r + n
+    self.cell[0].last = buf[r - 1].to_i
     n
   }
 
@@ -104,8 +119,8 @@ pub struct Reader {
       return none if n == 0
     }
     c = buf[r]
-    self.r = r + 1
-    self.last = c.to_i
+    self.cell[0].r = r + 1
+    self.cell[0].last = c.to_i
     c
   }
 
@@ -113,12 +128,12 @@ pub struct Reader {
   pub def unread_byte! -> ~Unit {
     fail BufioError.InvalidUnread if last < 0 || (r == 0 && w > 0)
     if r > 0 {
-      self.r = r - 1
+      self.cell[0].r = r - 1
     } else {
-      self.w = 1
+      self.cell[0].w = 1
     }
     self.buf[r] = last.as_u8
-    self.last = -1
+    self.cell[0].last = -1
   }
 
   # The next rune and its width in bytes (invalid UTF-8 reads as U+FFFD, 1),
@@ -131,15 +146,15 @@ pub struct Reader {
     return none if r == w
     c = buf[r]
     if c < 0x80 {
-      self.r = r + 1
-      self.last = c.to_i
+      self.cell[0].r = r + 1
+      self.cell[0].last = c.to_i
       return (c.as_i32, 1)
     }
     e = w
     e = r + 4 if e > r + 4
     rr, size = utf8.decode_rune(buf[r...e])
-    self.r = r + size
-    self.last = buf[r - 1].to_i
+    self.cell[0].r = r + size
+    self.cell[0].last = buf[r - 1].to_i
     (rr, size)
   }
 
@@ -168,7 +183,7 @@ pub struct Reader {
       }
       k = w - r
       k = left if k > left
-      self.r = r + k
+      self.cell[0].r = r + k
       left -= k
     }
     n - left
@@ -182,10 +197,10 @@ pub struct Reader {
 
   # Discards buffered data and reads from rd2 instead.
   pub def reset!(rd2: io.Reader) {
-    self.rd = rd2
-    self.r = 0
-    self.w = 0
-    self.last = -1
+    self.cell[0].rd = rd2
+    self.cell[0].r = 0
+    self.cell[0].w = 0
+    self.cell[0].last = -1
   }
 
   # Index of the first delim in buf[from...w], or -1.
@@ -205,8 +220,8 @@ pub struct Reader {
     if i >= 0 {
       out = zeros(i + 1 - r)
       copy(out, buf[r...i + 1])
-      self.r = i + 1
-      self.last = delim.to_i
+      self.cell[0].r = i + 1
+      self.cell[0].last = delim.to_i
       return out
     }
     acc: [Byte] = []
@@ -216,7 +231,7 @@ pub struct Reader {
         acc << buf[k]
         k += 1
       }
-      self.r = w
+      self.cell[0].r = w
       n = self.~fill!
       break if n == 0
       i = index_delim(delim, r)
@@ -226,12 +241,12 @@ pub struct Reader {
           acc << buf[k]
           k += 1
         }
-        self.r = i + 1
+        self.cell[0].r = i + 1
         break
       }
     }
     return none if acc.size == 0
-    self.last = acc[acc.size - 1].to_i
+    self.cell[0].last = acc[acc.size - 1].to_i
     acc
   }
 
@@ -240,8 +255,8 @@ pub struct Reader {
     i = index_delim(delim, r)
     if i >= 0 {
       s = Str.from_bytes(buf[r...i + 1])
-      self.r = i + 1
-      self.last = delim.to_i
+      self.cell[0].r = i + 1
+      self.cell[0].last = delim.to_i
       return s
     }
     b = self.~read_bytes!(delim)
@@ -259,8 +274,8 @@ pub struct Reader {
       e = i
       e = i - 1 if e > r && buf[e - 1] == 13
       s = Str.from_bytes(buf[r...e])
-      self.r = i + 1
-      self.last = 10
+      self.cell[0].r = i + 1
+      self.cell[0].last = 10
       return s
     }
     line = self.~read_string!(10)
@@ -278,7 +293,8 @@ pub struct Reader {
 pub def new_reader_size(rd: io.Reader, size: Int) -> Reader {
   n = size
   n = 16 if n < 16
-  Reader.new(rd: rd, buf: zeros(n), r: 0, w: 0, last: -1)
+  cell: [ReaderState] = [ReaderState.new(rd: rd, r: 0, w: 0, last: -1)]
+  Reader.new(cell: cell, buf: zeros(n))
 }
 
 pub def new_reader(rd: io.Reader) -> Reader {
@@ -287,20 +303,28 @@ pub def new_reader(rd: io.Reader) -> Reader {
 
 # ---------------------------------------------------------------------- Writer
 
-pub struct Writer {
+# The mutable part of a Writer, kept in a one-element slice (D36).
+struct WriterState {
   wr: io.Writer
-  buf: [Byte]
   n: Int
+}
+
+pub struct Writer {
+  cell: [WriterState]
+  buf: [Byte]
+
+  def wr -> io.Writer { cell[0].wr }
+  def n -> Int { cell[0].n }
 
   # Writes all buffered data to the underlying writer.
   pub def flush! -> ~Unit {
     off = 0
     while off < n {
-      m = self.wr.~write!(buf[off...n])
+      m = self.cell[0].wr.~write!(buf[off...n])
       fail io.StreamError.ShortWrite if m <= 0
       off += m
     }
-    self.n = 0
+    self.cell[0].n = 0
   }
 
   # Buffers p (writing through when it is larger than the buffer); returns
@@ -309,14 +333,14 @@ pub struct Writer {
     off = 0
     while off < p.size {
       if n == 0 && p.size - off >= buf.size {
-        m = self.wr.~write!(p[off...p.size])
+        m = self.cell[0].wr.~write!(p[off...p.size])
         fail io.StreamError.ShortWrite if m <= 0
         off += m
       } else {
         k = buf.size - n
         k = p.size - off if k > p.size - off
         copy(buf[n...n + k], p[off...off + k])
-        self.n = n + k
+        self.cell[0].n = n + k
         off += k
         if n == buf.size {
           self.~flush!
@@ -336,7 +360,7 @@ pub struct Writer {
         self.buf[n + i] = s[off + i]
         i += 1
       }
-      self.n = n + k
+      self.cell[0].n = n + k
       off += k
       if n == buf.size {
         self.~flush!
@@ -350,7 +374,7 @@ pub struct Writer {
       self.~flush!
     }
     self.buf[n] = c
-    self.n = n + 1
+    self.cell[0].n = n + 1
   }
 
   # Writes r as UTF-8; returns the byte count.
@@ -369,15 +393,16 @@ pub struct Writer {
 
   # Drops unflushed data and writes to wr2 instead.
   pub def reset!(wr2: io.Writer) {
-    self.wr = wr2
-    self.n = 0
+    self.cell[0].wr = wr2
+    self.cell[0].n = 0
   }
 }
 
 pub def new_writer_size(wr: io.Writer, size: Int) -> Writer {
   k = size
   k = 1 if k < 1
-  Writer.new(wr: wr, buf: zeros(k), n: 0)
+  cell: [WriterState] = [WriterState.new(wr: wr, n: 0)]
+  Writer.new(cell: cell, buf: zeros(k))
 }
 
 pub def new_writer(wr: io.Writer) -> Writer {
@@ -398,8 +423,8 @@ pub enum Split {
   Bytes
 }
 
-pub struct Scanner {
-  src: io.Reader
+# The mutable part of a Scanner, kept in a one-element slice (D36).
+struct ScannerState {
   buf: [Byte]
   start: Int
   stop: Int
@@ -410,10 +435,26 @@ pub struct Scanner {
   eof: Bool
   fail_kind: Int
   fail_msg: Str
+}
+
+pub struct Scanner {
+  src: io.Reader
+  cell: [ScannerState]
+
+  def buf -> [Byte] { cell[0].buf }
+  def start -> Int { cell[0].start }
+  def stop -> Int { cell[0].stop }
+  def ts -> Int { cell[0].ts }
+  def te -> Int { cell[0].te }
+  def mode -> Int { cell[0].mode }
+  def max_tok -> Int { cell[0].max_tok }
+  def eof -> Bool { cell[0].eof }
+  def fail_kind -> Int { cell[0].fail_kind }
+  def fail_msg -> Str { cell[0].fail_msg }
 
   # Sets the mode (before the first scan!).
   pub def split!(how: Split) {
-    self.mode = case how {
+    self.cell[0].mode = case how {
       Lines => 0
       Words => 1
       Runes => 2
@@ -423,7 +464,7 @@ pub struct Scanner {
 
   # The largest token allowed (and so the largest buffer), at least 16.
   pub def buffer!(max: Int) {
-    self.max_tok = max < 16 ? 16 : max
+    self.cell[0].max_tok = max < 16 ? 16 : max
   }
 
   # Advances to the next token; false at the end of input or on an error (see
@@ -434,10 +475,10 @@ pub struct Scanner {
     loop {
       if stop > start || eof {
         st, a, b, ns = cut_token(buf, start, stop, eof, mode)
-        self.start = ns
+        self.cell[0].start = ns
         if st == 1 {
-          self.ts = a
-          self.te = b
+          self.cell[0].ts = a
+          self.cell[0].te = b
           res = true
           break
         }
@@ -448,31 +489,31 @@ pub struct Scanner {
       # Make room: slide, then grow.
       if start > 0 && (stop == buf.size || start > buf.size / 2) {
         copy(buf[0...stop - start], buf[start...stop])
-        self.stop = stop - start
-        self.start = 0
+        self.cell[0].stop = stop - start
+        self.cell[0].start = 0
       }
       if stop == buf.size {
         if buf.size >= max_tok {
-          self.fail_kind = 1
+          self.cell[0].fail_kind = 1
           break
         }
         nb = buf.size * 2
         nb = max_tok if nb > max_tok
         bigger = zeros(nb)
         copy(bigger[0...stop], buf[0...stop])
-        self.buf = bigger
+        self.cell[0].buf = bigger
       }
       got = self.src.read!(buf[stop...buf.size])
       if got.err? {
-        self.fail_kind = 2
-        self.fail_msg = got.err.unwrap.message
+        self.cell[0].fail_kind = 2
+        self.cell[0].fail_msg = got.err.unwrap.message
         break
       }
       n = got.unwrap
       if n == 0 {
-        self.eof = true
+        self.cell[0].eof = true
       } else {
-        self.stop = stop + n
+        self.cell[0].stop = stop + n
       }
     }
     res
@@ -574,5 +615,6 @@ def cut_token(buf: [Byte], start: Int, stop: Int, eof: Bool, mode: Int) -> (Int,
 }
 
 pub def new_scanner(src: io.Reader) -> Scanner {
-  Scanner.new(src: src, buf: zeros(DEFAULT_SIZE), start: 0, stop: 0, ts: 0, te: 0, mode: 0, max_tok: MAX_SCAN_TOKEN_SIZE, eof: false, fail_kind: 0, fail_msg: "")
+  cell: [ScannerState] = [ScannerState.new(buf: zeros(DEFAULT_SIZE), start: 0, stop: 0, ts: 0, te: 0, mode: 0, max_tok: MAX_SCAN_TOKEN_SIZE, eof: false, fail_kind: 0, fail_msg: "")]
+  Scanner.new(src: src, cell: cell)
 }

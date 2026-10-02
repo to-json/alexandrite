@@ -75,6 +75,7 @@ GROUPS = {
     "types": "M4",
     "errors": "M5",
     "packages": "M6",
+    "refinements": "M6",
 }
 
 
@@ -266,6 +267,7 @@ def main():
         negative_compile("packages.bad1", "M6")
         negative_compile("packages.bad2", "M6")
         negative_compile("packages.bad3", "M6")
+        negative_compile("refinements.bad1", "M6")
     if not filt or "A3" in filt:
         print("== A3 promote overhead", flush=True)
         promote_overhead()

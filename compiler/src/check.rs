@@ -119,6 +119,8 @@ pub struct World<'a> {
     pub stringers: HashMap<String, FuncId>,
     /// Error types (enums), in tag order: builtins first, then `error` decls.
     pub errors: Vec<Ty>,
+    /// Refinements by (qualified) name: each target type with its methods.
+    pub refines: HashMap<String, Vec<(Ty, HashMap<String, usize>)>>,
 }
 
 #[derive(Clone, Debug)]
@@ -152,7 +154,7 @@ impl<'a> World<'a> {
         }
         GENERICS.with(|g| g.borrow_mut().clear());
         INSTS.with(|g| g.borrow_mut().clear());
-        Ok(World { sm, defs, by_name, instances: HashMap::new(), funcs: vec![], sigs: HashMap::new(), fatal: None, structs: HashMap::new(), consts: HashMap::new(), ifaces: HashMap::new(), impls: HashMap::new(), stringers: HashMap::new(), errors: vec![] })
+        Ok(World { sm, defs, by_name, instances: HashMap::new(), funcs: vec![], sigs: HashMap::new(), fatal: None, structs: HashMap::new(), consts: HashMap::new(), ifaces: HashMap::new(), impls: HashMap::new(), stringers: HashMap::new(), errors: vec![], refines: HashMap::new() })
     }
 
     /// Evaluate top-level constants, in order (each may use earlier ones).
@@ -276,6 +278,27 @@ impl<'a> World<'a> {
         for e in enums.iter().filter(|e| e.error) {
             let t = self.structs[&e.name].clone();
             self.errors.push(t);
+        }
+        Ok(())
+    }
+
+    /// Resolve refinement targets (after structs).
+    pub fn add_refines(&mut self, defs: &[RefineDef]) -> R<()> {
+        for r in defs {
+            let prev = enter_pkg(&pkg_of(&r.name));
+            let t = type_from(&r.target, &self.structs, &self.consts);
+            leave_pkg(prev);
+            let t = t?;
+            let word = texpr_word(&r.target);
+            let mut ms = HashMap::new();
+            for m in &r.methods {
+                ms.insert(m.clone(), self.by_name[&refine_def_name(&r.name, &word, m)]);
+            }
+            let entry = self.refines.entry(r.name.clone()).or_default();
+            match entry.iter_mut().find(|(x, _)| *x == t) {
+                Some((_, old)) => old.extend(ms),
+                None => entry.push((t, ms)),
+            }
         }
         Ok(())
     }
@@ -673,6 +696,8 @@ pub fn cname(s: &str) -> String {
             '[' => o.push_str("_idx"),
             ',' | ' ' => o.push('_'),
             ']' => {}
+            '@' => o.push_str("_r_"),
+            '#' => o.push_str("_m_"),
             c => o.push(c),
         }
     }
@@ -893,6 +918,8 @@ struct FnCx<'w, 'a> {
     /// Kind of each enclosing loop-ish construct, innermost last.
     loops: Vec<LoopKind>,
     n_params: usize,
+    /// Active refinements: (scope depth where `using` appeared, name).
+    usings: Vec<(usize, String)>,
     /// Error types this function can fail with ("Error" = any).
     errs: std::collections::BTreeSet<String>,
     /// Inside a lambda's body (no `~` there yet).
@@ -953,6 +980,7 @@ impl<'w, 'a> FnCx<'w, 'a> {
             fn_name: def.map_or("main".into(), |d| d.name.clone()),
             want_hint: None,
             errs: Default::default(),
+            usings: def.map_or_else(Vec::new, |d| d.using.iter().map(|u| (0, resolve_name(u, Span::default(), &|_| true).unwrap_or_else(|_| u.clone()))).collect()),
             in_lambda: false,
             lambdas: vec![],
             method: def.filter(|d| d.params.first().is_some_and(|p| p.name == "self")).map(|d| d.name.ends_with('!')),
@@ -1310,7 +1338,7 @@ impl<'w, 'a> FnCx<'w, 'a> {
                 self.scopes.push(HashMap::new());
                 let bind = opt.map(|(_, name, tmp, ty)| self.opt_bind(&name, tmp, &ty, s.span));
                 let r = self.body(body);
-                self.scopes.pop();
+                self.pop_scope();
                 self.loops.pop();
                 let (mut b, _) = r?;
                 if let Some(bind) = bind {
@@ -1323,7 +1351,7 @@ impl<'w, 'a> FnCx<'w, 'a> {
                     self.scopes.push(HashMap::new());
                     let bind = self.opt_bind(&name, tmp, &ty, s.span);
                     let r = self.body(a);
-                    self.scopes.pop();
+                    self.pop_scope();
                     let (mut ta, _) = r?;
                     ta.insert(0, bind);
                     let (tb, _) = self.body(b)?;
@@ -1349,6 +1377,14 @@ impl<'w, 'a> FnCx<'w, 'a> {
                     return Err(Diag::new(s.span, "`break` outside a loop or block"));
                 }
                 TStmt::Break(v.as_ref().map(|v| self.value(v)).transpose()?, s.span)
+            }
+            StmtKind::Using(n) => {
+                let q = resolve_name(n, s.span, &|q| self.w.refines.contains_key(q))?;
+                if !self.w.refines.contains_key(&q) {
+                    return Err(Diag::new(s.span, format!("no refinement `{n}`; declare it with `refine {n} for Type {{ ... }}`")));
+                }
+                self.usings.push((self.scopes.len(), q));
+                TStmt::Expr(self.mk(TK::Unit, Ty::Unit, s.span))
             }
             StmtKind::Fail(v) => {
                 if !self.is_main && !self.fallible_decl {
@@ -2361,7 +2397,7 @@ impl<'w, 'a> FnCx<'w, 'a> {
             let own_start = self.locals.len();
             self.scopes.push(HashMap::new());
             let r = self.body(&blk.body);
-            self.scopes.pop();
+            self.pop_scope();
             r.map(|(body, _)| {
                 let ty = match body.last() {
                     Some(TStmt::Expr(e)) => e.ty.clone(),
@@ -2485,6 +2521,24 @@ impl<'w, 'a> FnCx<'w, 'a> {
             return None;
         }
         import_path(a)
+    }
+
+    fn pop_scope(&mut self) {
+        self.scopes.pop();
+        let depth = self.scopes.len();
+        self.usings.retain(|(d, _)| *d <= depth);
+    }
+
+    /// A method from an active refinement, innermost `using` first.
+    fn refined(&self, t: &Ty, name: &str) -> Option<usize> {
+        for (_, r) in self.usings.iter().rev() {
+            if let Some(entries) = self.w.refines.get(r) {
+                if let Some(def) = entries.iter().find(|(x, _)| x == t).and_then(|(_, ms)| ms.get(name)) {
+                    return Some(*def);
+                }
+            }
+        }
+        None
     }
 
     /// The struct type of `self` in a method.
@@ -2643,7 +2697,7 @@ impl<'w, 'a> FnCx<'w, 'a> {
                 self.scopes.push(HashMap::new());
                 let bind = self.opt_bind(&name, tmp, &ty, sp);
                 let ta = self.seq_body(a, sp);
-                self.scopes.pop();
+                self.pop_scope();
                 let mut ta = ta?;
                 if let TK::Seq(ss) = &mut ta.kind {
                     ss.insert(0, bind);
@@ -2701,7 +2755,7 @@ impl<'w, 'a> FnCx<'w, 'a> {
             pre.push(TStmt::Expr(self.mk(TK::Assign(id, Box::new(v)), t, sp)));
         }
         let r = self.body(body);
-        self.scopes.pop();
+        self.pop_scope();
         let (ss, ty) = r?;
         let mut ss: Vec<TStmt> = pre.into_iter().chain(ss).collect();
         if let Some(TStmt::Expr(e)) = ss.last_mut() {
@@ -3059,7 +3113,7 @@ impl<'w, 'a> FnCx<'w, 'a> {
                 self.loops.push(LoopKind::While);
                 self.scopes.push(HashMap::new());
                 let (body, _) = self.body(&b.body)?;
-                self.scopes.pop();
+                self.pop_scope();
                 self.loops.pop();
                 let blk = TBlock { params: vec![], destructure: false, body, pure: true, span: b.span , own: (0, 0) };
                 return Ok(self.mk(TK::M(M::Loop, None, vec![], Some(Box::new(blk))), Ty::Unit, sp));
@@ -3437,7 +3491,7 @@ impl<'w, 'a> FnCx<'w, 'a> {
                 let pure = !self.impure;
                 self.impure = saved || self.impure;
                 self.loops.pop();
-                self.scopes.pop();
+                self.pop_scope();
                 let blk = TBlock { params: vec![y], destructure: false, body, pure, span: b.span, own: (own_start, self.locals.len()) };
                 Ok(self.mk(TK::M(M::EnumNew, None, vec![], Some(Box::new(blk))), Ty::Gen(Box::new(el)), sp))
             }
@@ -3489,12 +3543,12 @@ impl<'w, 'a> FnCx<'w, 'a> {
                     destructure = true;
                 }
                 t => {
-                    self.scopes.pop();
+                    self.pop_scope();
                     return Err(Diag::new(b.span, format!("block takes {} parameters but each element is {}", b.params.len(), t.show())));
                 }
             }
         } else {
-            self.scopes.pop();
+            self.pop_scope();
             return Err(Diag::new(b.span, format!("block takes {} parameter(s), expected {}", b.params.len(), params.len())));
         }
         self.loops.push(LoopKind::Block);
@@ -3503,7 +3557,7 @@ impl<'w, 'a> FnCx<'w, 'a> {
         let pure = !self.impure;
         self.impure = saved || self.impure;
         self.loops.pop();
-        self.scopes.pop();
+        self.pop_scope();
         let (mut body, ty) = r?;
         let own = (own_start, self.locals.len());
         // The block's value: materialize unless it feeds flat_map (caller decides).
@@ -3520,7 +3574,7 @@ impl<'w, 'a> FnCx<'w, 'a> {
         let p = self.declare("_sym", elem.clone());
         let recv = self.mk(TK::Local(p), elem.clone(), sym.1);
         let body = self.method(recv, &sym.0, sym.1, &[], None, None, sym.1);
-        self.scopes.pop();
+        self.pop_scope();
         let body = body?;
         let ty = body.ty.clone();
         Ok((TBlock { params: vec![p], destructure: false, body: vec![TStmt::Expr(body)], pure: true, span: sym.1 , own: (0, 0) }, ty))
@@ -3560,6 +3614,16 @@ impl<'w, 'a> FnCx<'w, 'a> {
             self.unresolved = true;
             let t = self.fresh();
             return Ok(self.mk(TK::Unit, t, sp));
+        }
+        if let Some(def) = self.refined(&rt, name) {
+            if block.is_some() {
+                return Err(Diag::new(sp, format!("`{name}` doesn't take a block")));
+            }
+            let mut targs = vec![recv];
+            for a in args {
+                targs.push(self.value(a)?);
+            }
+            return self.call_def(def, name, name_span, targs, sp);
         }
         let argv = |cx: &mut Self| args.iter().map(|a| cx.value(a)).collect::<R<Vec<_>>>();
         let mk_m = |cx: &mut Self, m: M, r: TExpr, a: Vec<TExpr>, b: Option<TBlock>, ty: Ty| cx.mk(TK::M(m, Some(Box::new(r)), a, b.map(Box::new)), ty, sp);
@@ -4015,7 +4079,7 @@ impl<'w, 'a> FnCx<'w, 'a> {
                             self.scopes.push(HashMap::new());
                             let a = self.declare("_acc", el.clone());
                             let x = self.declare("_x", el.clone());
-                            self.scopes.pop();
+                            self.pop_scope();
                             let la = self.mk(TK::Local(a), el.clone(), sp);
                             let lx = self.mk(TK::Local(x), el.clone(), sp);
                             let body = self.binary(bop, la, lx, sp)?;

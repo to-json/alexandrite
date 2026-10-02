@@ -149,6 +149,7 @@ fn load_pkg(
                 acc.structs.extend(m.structs);
                 acc.enums.extend(m.enums);
                 acc.ifaces.extend(m.ifaces);
+                acc.refines.extend(m.refines);
                 acc.consts.extend(m.consts);
                 acc
             }
@@ -166,6 +167,9 @@ fn qualify(m: &mut Module, p: &str) {
     let q = |n: &str| format!("{p}.{n}");
     for d in &mut m.defs {
         d.name = q(&d.name);
+    }
+    for r in &mut m.refines {
+        r.name = q(&r.name);
     }
     for s in &mut m.structs {
         s.name = q(&s.name);
@@ -215,6 +219,8 @@ pub fn check_program(l: &Loaded, externs: Vec<DefInfo>) -> Result<TProgram, Diag
     w.add_builtin_errors();
     w.add_structs(&structs, &enums)?;
     w.add_iface_sigs(&ifaces)?;
+    let refines: Vec<_> = all().flat_map(|m| m.refines.iter()).cloned().collect();
+    w.add_refines(&refines)?;
     let main = w.check_main(&l.main.main, l.main.overflow, Span { file: l.main.file, lo: 0, hi: 0 })?;
     let messages = w.message_instances()?;
     let ifaces = std::mem::take(&mut w.impls);
@@ -331,6 +337,7 @@ pub fn parse_header(text: &str, overflow: Overflow, span: Span, pkg: &str) -> Re
         let ptys = params.iter().map(|p| parse_ty(p.trim())).collect::<Result<Vec<_>, _>>()?;
         let def = Def {
             public: true,
+            using: vec![],
             name: name.trim().to_string(),
             span,
             tparams: vec![],

@@ -93,6 +93,8 @@ pub struct Module {
     pub defs: Vec<Def>,
     pub structs: Vec<StructDef>,
     pub enums: Vec<EnumDef>,
+    /// `refine Name for Type { defs }` (the defs are in `defs`).
+    pub refines: Vec<RefineDef>,
     pub ifaces: Vec<IfaceDef>,
     /// `NAME = expr` at the top level: compile-time constants (Go's exact rules).
     pub consts: Vec<ConstDef>,
@@ -112,6 +114,8 @@ pub struct Def {
     pub fallible: bool,
     /// `pub def`: visible from other packages.
     pub public: bool,
+    /// Refinements active where it is declared (file-level `using`s above it).
+    pub using: Vec<String>,
     /// A fallible def's error set: None = inferred (`~T`), names otherwise
     /// (`~T<ParseError | IoError>`; `Error` = open).
     pub errs: Option<Vec<String>>,
@@ -186,6 +190,34 @@ pub struct IfaceDef {
     pub methods: Vec<(String, Vec<Param>, Option<TypeExpr>, bool, Span)>,
 }
 
+/// `refine Name for Type { def m ... }`: methods on an existing type,
+/// visible only where `using Name` is in effect. Its defs are named
+/// `refine_def_name(Name, m)` and take `self: Type`.
+#[derive(Debug, Clone)]
+pub struct RefineDef {
+    pub name: String,
+    pub target: TypeExpr,
+    pub methods: Vec<String>,
+    pub span: Span,
+}
+
+/// A type expression as an identifier-safe word (`Str`, `ArrInt`, `MapStrInt`).
+pub fn texpr_word(t: &TypeExpr) -> String {
+    match t {
+        TypeExpr::Named(n, _) => n.replace(['.', '/'], "_"),
+        TypeExpr::Array(e, _) => format!("Arr{}", texpr_word(e)),
+        TypeExpr::Opt(e, _) => format!("Opt{}", texpr_word(e)),
+        TypeExpr::Fixed(e, _, _) => format!("Fixed{}", texpr_word(e)),
+        TypeExpr::App(n, args, _) => format!("{n}{}", args.iter().map(texpr_word).collect::<String>()),
+        TypeExpr::Result(e, _, _) => format!("Res{}", texpr_word(e)),
+        TypeExpr::Fn(ps, r, _) => format!("Fn{}To{}", ps.iter().map(texpr_word).collect::<String>(), texpr_word(r)),
+    }
+}
+
+pub fn refine_def_name(refinement: &str, target: &str, m: &str) -> String {
+    format!("{refinement}@{target}#{m}")
+}
+
 /// Methods are defs named `Type.name` whose first parameter is `self`.
 /// In a `!` method `self` is a one-element slice holding the receiver, so
 /// writes reach the caller (Go's pointer receiver).
@@ -238,6 +270,8 @@ pub enum StmtKind {
     Fail(Expr),
     /// `defer e`: run when the enclosing block exits.
     Defer(Expr),
+    /// `using Refinement`: active for the rest of the enclosing block.
+    Using(String),
 }
 
 #[derive(Debug, Clone)]

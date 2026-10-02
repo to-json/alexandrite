@@ -38,12 +38,14 @@ pub struct Parser<'a> {
     scopes: Vec<HashSet<String>>,
     /// Inside an `if`/`while` condition: `{` is a block only if `|` follows.
     in_cond: bool,
+    /// File-level `using`s so far (defs below see them).
+    usings: Vec<String>,
 }
 
 type PResult<T> = Result<T, Diag>;
 
 pub fn parse(file: u32, toks: &[Token], next_id: &mut NodeId) -> PResult<Module> {
-    let mut p = Parser { toks, pos: 0, next_id, scopes: vec![HashSet::new()], in_cond: false };
+    let mut p = Parser { toks, pos: 0, next_id, scopes: vec![HashSet::new()], in_cond: false, usings: vec![] };
     p.module(file)
 }
 
@@ -116,7 +118,7 @@ impl<'a> Parser<'a> {
     // ---------- module ----------
 
     fn module(&mut self, file: u32) -> PResult<Module> {
-        let mut m = Module { file, overflow: Overflow::Abort, imports: vec![], public: Default::default(), defs: vec![], structs: vec![], enums: vec![], ifaces: vec![], consts: vec![], main: vec![] };
+        let mut m = Module { file, overflow: Overflow::Abort, imports: vec![], public: Default::default(), defs: vec![], structs: vec![], enums: vec![], refines: vec![], ifaces: vec![], consts: vec![], main: vec![] };
         self.skip_newlines();
         while let Tok::Directive(name, arg) = self.peek().clone() {
             let sp = self.bump().span;
@@ -134,6 +136,10 @@ impl<'a> Parser<'a> {
                 Tok::Eof => break,
                 Tok::Kw(Kw::Require) => {
                     return Err(Diag::new(self.span(), "`require` is now `import \"path\"` (a package directory)"));
+                }
+                Tok::Ident(kw) if kw == "refine" && matches!(self.peek_at(1), Tok::Const(_)) => {
+                    let r = self.refine_def(&mut m.defs)?;
+                    m.refines.push(r);
                 }
                 Tok::Ident(kw) if kw == "import" && matches!(self.peek_at(1), Tok::Str(_) | Tok::Ident(_)) => {
                     let sp = self.bump().span;
@@ -179,6 +185,11 @@ impl<'a> Parser<'a> {
                             let i = self.iface_def(&mut m.defs)?;
                             m.public.insert(i.name.clone());
                             m.ifaces.push(i);
+                        }
+                        Tok::Ident(kw) if kw == "refine" => {
+                            let r = self.refine_def(&mut m.defs)?;
+                            m.public.insert(r.name.clone());
+                            m.refines.push(r);
                         }
                         Tok::Const(name) if matches!(self.peek_at(1), Tok::Op("=") | Tok::Op(":")) => {
                             let sp = self.bump().span;
@@ -238,7 +249,7 @@ impl<'a> Parser<'a> {
     fn def_in(&mut self, owner: Option<&str>) -> PResult<Def> {
         let d = self.def_sig(owner.map(|o| (o, false)))?;
         let Some(body) = d.body else { unreachable!("a body is required outside interfaces") };
-        Ok(Def { public: false, name: d.name, span: d.span, tparams: d.tparams, name_span: d.name_span, params: d.params, ret: d.ret, fallible: d.fallible, errs: d.errs, pure: d.pure, body })
+        Ok(Def { public: false, using: self.usings.clone(), name: d.name, span: d.span, tparams: d.tparams, name_span: d.name_span, params: d.params, ret: d.ret, fallible: d.fallible, errs: d.errs, pure: d.pure, body })
     }
 
     /// A def's signature and body. In an interface (`owner.1`), `self` is
@@ -364,6 +375,53 @@ impl<'a> Parser<'a> {
         Ok(out)
     }
 
+    /// `refine Name for Type { def ... }`
+    fn refine_def(&mut self, defs: &mut Vec<Def>) -> PResult<RefineDef> {
+        let start = self.bump().span;
+        let sp = self.span();
+        let name = match self.bump().tok {
+            Tok::Const(n) => n,
+            t => return Err(Diag::new(sp, format!("expected a refinement name (capitalized), found {}", describe(&t)))),
+        };
+        if !self.is_kw(Kw::For) {
+            return Err(Diag::new(self.span(), "expected `for`: `refine Name for Type { ... }`"));
+        }
+        self.bump();
+        let target = self.type_expr()?;
+        let tshow = texpr_word(&target);
+        self.expect_op("{")?;
+        let mut methods = vec![];
+        // The refinement's own methods see each other.
+        self.usings.push(name.clone());
+        loop {
+            self.skip_newlines();
+            if self.eat_op("}") {
+                break;
+            }
+            let public = if matches!(self.peek(), Tok::Ident(p) if p == "pub") {
+                self.bump();
+                true
+            } else {
+                false
+            };
+            if !matches!(self.peek(), Tok::Attr(_) | Tok::Kw(Kw::Def) | Tok::Kw(Kw::Fn)) {
+                self.usings.pop();
+                return Err(Diag::new(self.span(), format!("a refinement holds `def`s, found {}", describe(self.peek()))));
+            }
+            let mut d = self.def_in(Some(&name))?;
+            let m = d.name.rsplit_once('.').map_or(d.name.clone(), |(_, m)| m.to_string());
+            d.name = refine_def_name(&name, &tshow, &m);
+            d.public = public;
+            if let Some(p) = d.params.first_mut() {
+                p.ty = Some(if m.ends_with('!') { TypeExpr::Array(Box::new(target.clone()), p.span) } else { target.clone() });
+            }
+            methods.push(m);
+            defs.push(d);
+        }
+        self.usings.pop();
+        Ok(RefineDef { name, target, methods, span: start.to(self.prev_span()) })
+    }
+
     fn iface_def(&mut self, defaults: &mut Vec<Def>) -> PResult<IfaceDef> {
         let start = self.bump().span;
         let sp = self.span();
@@ -389,7 +447,7 @@ impl<'a> Parser<'a> {
             let short = d.name.rsplit_once('.').map_or(d.name.clone(), |(_, m)| m.to_string());
             methods.push((short, d.params[1..].to_vec(), d.ret.clone(), has_body, d.name_span));
             if let Some(body) = d.body {
-                defaults.push(Def { public: true, name: d.name, span: d.span, tparams: d.tparams, name_span: d.name_span, params: d.params, ret: d.ret, fallible: d.fallible, errs: d.errs, pure: d.pure, body });
+                defaults.push(Def { public: true, using: self.usings.clone(), name: d.name, span: d.span, tparams: d.tparams, name_span: d.name_span, params: d.params, ret: d.ret, fallible: d.fallible, errs: d.errs, pure: d.pure, body });
             }
         }
         Ok(IfaceDef { name, span: start.to(self.prev_span()), methods })
@@ -645,6 +703,25 @@ impl<'a> Parser<'a> {
             Tok::Kw(Kw::Defer) => {
                 self.bump();
                 StmtKind::Defer(self.expr()?)
+            }
+            Tok::Ident(kw) if kw == "using" && matches!(self.peek_at(1), Tok::Const(_) | Tok::Ident(_)) && !self.is_local("using") => {
+                self.bump();
+                let sp = self.span();
+                let mut name = match self.bump().tok {
+                    Tok::Const(n) | Tok::Ident(n) => n,
+                    _ => unreachable!(),
+                };
+                if self.eat_op(".") {
+                    match self.bump().tok {
+                        Tok::Const(n) => name = format!("{name}.{n}"),
+                        t => return Err(Diag::new(sp, format!("expected a refinement name, found {}", describe(&t)))),
+                    }
+                }
+                // At the top level it also applies to the defs below.
+                if self.scopes.len() == 1 {
+                    self.usings.push(name.clone());
+                }
+                StmtKind::Using(name)
             }
             Tok::Kw(Kw::For) => {
                 self.bump();
@@ -1330,7 +1407,7 @@ impl<'a> Parser<'a> {
                         IPiece::Lit(s) => parts.push(InterpPart::Lit(s)),
                         IPiece::Code(src, base) => {
                             let toks = crate::lexer::lex_at(sp.file, &src, base)?;
-                            let mut sub = Parser { toks: &toks, pos: 0, next_id: self.next_id, scopes: self.scopes.clone(), in_cond: false };
+                            let mut sub = Parser { toks: &toks, pos: 0, next_id: self.next_id, scopes: self.scopes.clone(), in_cond: false, usings: vec![] };
                             sub.skip_newlines();
                             let e = sub.expr()?;
                             sub.skip_newlines();

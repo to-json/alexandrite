@@ -1,0 +1,327 @@
+# Float to string conversion, after Go's strconv/ftoa.go.
+#
+# Every conversion goes through the exact decimal expansion of the float (a
+# Dec, see decimal.alx), so the results are correct for every input: the
+# shortest digits that round-trip (precision -1), or the exactly-rounded
+# digits (ties to even) for a given precision. There are no Ryu fast paths;
+# a conversion costs a few microseconds to tens of microseconds.
+
+# Largest finite float64.
+MAX_FLOAT = 1.7976931348623157e308
+
+# Rounds `d` to the shortest digit string that still reads back as the same
+# float of format fl (mant, exp as from round_to_format).
+def round_shortest(d: Dec, mant: U64, exp: Int, fl: FloatInfo) -> Dec {
+  if mant == 0 {
+    d.nd = 0
+    return d
+  }
+  # If the number is already shortest, stop now.
+  minexp = fl.bias + 1
+  if exp > minexp && 332 * (d.dp - d.nd) >= 100 * (exp - fl.mantbits) {
+    return d
+  }
+  one: U64 = 1
+  # The upper bound is halfway to the next float: (mant*2+1) << (exp-mantbits-1).
+  upper = new_dec()
+  upper.assign!(mant * 2 + 1)
+  upper.shift!(exp - fl.mantbits - 1)
+  # The lower bound is halfway to the previous float, which is mant-1 unless
+  # that drops the significant bit and exp isn't the minimum.
+  mantlo: U64 = 0
+  explo = 0
+  if mant > (one << fl.mantbits) || exp == minexp {
+    mantlo = mant - 1
+    explo = exp
+  } else {
+    mantlo = mant * 2 - 1
+    explo = exp - 1
+  }
+  lower = new_dec()
+  lower.assign!(mantlo * 2 + 1)
+  lower.shift!(explo - fl.mantbits - 1)
+  # The bounds are possible outputs only if the mantissa is even (ties to even).
+  inclusive = mant % 2 == 0
+  # upperdelta tracks whether rounding up would stay within the upper bound:
+  # 0: digits of d and upper agree so far; 1: they differ by 1 in an earlier
+  # digit and everything after is 9 vs 0 so far; 2: rounding up exceeds it.
+  upperdelta = 0
+  ui = 0
+  while true {
+    # lower, d and upper may have the point at different places; upper is the
+    # longest, so iterate over its digits.
+    mi = ui - upper.dp + d.dp
+    break if mi >= d.nd
+    li = ui - upper.dp + lower.dp
+    l = 48
+    l = lower.d[li].to_i if li >= 0 && li < lower.nd
+    m = 48
+    m = d.d[mi].to_i if mi >= 0
+    u = 48
+    u = upper.d[ui].to_i if ui < upper.nd
+    # Okay to round down if lower has a different digit, or lower is inclusive
+    # and exactly the result of rounding down.
+    okdown = l != m || (inclusive && li + 1 == lower.nd)
+    if upperdelta == 0 && m + 1 < u {
+      upperdelta = 2
+    } else if upperdelta == 0 && m != u {
+      upperdelta = 1
+    } else if upperdelta == 1 && (m != 57 || u != 48) {
+      upperdelta = 2
+    }
+    # Okay to round up if upper has a different digit and either upper is
+    # inclusive or bigger than the result of rounding up.
+    okup = upperdelta > 0 && (inclusive || upperdelta > 1 || ui + 1 < upper.nd)
+    if okdown && okup {
+      d.round!(mi + 1)
+      return d
+    } else if okdown {
+      d.round_down!(mi + 1)
+      return d
+    } else if okup {
+      d.round_up!(mi + 1)
+      return d
+    }
+    ui += 1
+  }
+  d
+}
+
+# Appends the ASCII decimal of `n` (>= 0), padded to at least `width` digits
+# with zeros.
+def push_int(buf: [U8], n: Int, width: Int) -> [U8] {
+  s = n.to_s
+  k = s.size
+  while k < width {
+    buf << 48
+    k += 1
+  }
+  for b in s.bytes {
+    buf << b
+  }
+  buf
+}
+
+# %e: -d.ddddde±dd
+def fmt_e(buf: [U8], neg: Bool, d: Dec, prec: Int, fmt: Byte) -> [U8] {
+  buf << 45 if neg
+  buf << (d.nd != 0 ? d.d[0] : 48)
+  if prec > 0 {
+    buf << 46
+    i = 1
+    m = d.nd < prec + 1 ? d.nd : prec + 1
+    while i < m {
+      buf << d.d[i]
+      i += 1
+    }
+    while i <= prec {
+      buf << 48
+      i += 1
+    }
+  }
+  buf << fmt
+  exp = d.dp - 1
+  exp = 0 if d.nd == 0
+  if exp < 0 {
+    buf << 45
+    exp = -exp
+  } else {
+    buf << 43
+  }
+  push_int(buf, exp, 2)
+}
+
+# %f: -ddddddd.ddddd
+def fmt_f(buf: [U8], neg: Bool, d: Dec, prec: Int) -> [U8] {
+  buf << 45 if neg
+  if d.dp > 0 {
+    m = d.nd < d.dp ? d.nd : d.dp
+    i = 0
+    while i < m {
+      buf << d.d[i]
+      i += 1
+    }
+    while m < d.dp {
+      buf << 48
+      m += 1
+    }
+  } else {
+    buf << 48
+  }
+  if prec > 0 {
+    buf << 46
+    i = 0
+    while i < prec {
+      j = d.dp + i
+      buf << (j >= 0 && j < d.nd ? d.d[j] : 48)
+      i += 1
+    }
+  }
+  buf
+}
+
+# %b: -ddddddddp±ddd
+def fmt_b(buf: [U8], neg: Bool, mant: U64, exp: Int, fl: FloatInfo) -> [U8] {
+  buf << 45 if neg
+  for b in mant.to_s.bytes {
+    buf << b
+  }
+  buf << 112
+  e = exp - fl.mantbits
+  if e >= 0 {
+    buf << 43
+  } else {
+    buf << 45
+    e = -e
+  }
+  push_int(buf, e, 1)
+}
+
+# %x: -0x1.yyyyyyyyp±ddd or -0x0p+0
+def fmt_x(buf: [U8], prec: Int, fmt: Byte, neg: Bool, mant0: U64, exp0: Int, fl: FloatInfo) -> [U8] {
+  one: U64 = 1
+  mant = mant0
+  exp = exp0
+  exp = 0 if mant == 0
+  # Shift digits so the leading 1 (if any) is at bit 1<<60.
+  mant = mant << (60 - fl.mantbits)
+  while mant != 0 && (mant & (one << 60)) == 0 {
+    mant = mant << 1
+    exp -= 1
+  }
+  # Round if requested.
+  if prec >= 0 && prec < 15 {
+    shift = prec * 4
+    extra = (mant << shift) & ((one << 60) - 1)
+    mant = mant >> (60 - shift)
+    low = extra | (mant & 1)
+    mant += 1 if low > (one << 59)
+    mant = mant << (60 - shift)
+    if (mant & (one << 61)) != 0 {
+      # wrapped around
+      mant = mant >> 1
+      exp += 1
+    }
+  }
+  hex = fmt == 88 ? "0123456789ABCDEF" : "0123456789abcdef"
+  buf << 45 if neg
+  buf << 48
+  buf << fmt
+  buf << (48 + ((mant >> 60) & 1).to_i).as_u8
+  # fraction
+  mant = mant << 4
+  if prec < 0 && mant != 0 {
+    buf << 46
+    while mant != 0 {
+      buf << hex[((mant >> 60) & 15).to_i]
+      mant = mant << 4
+    }
+  } else if prec > 0 {
+    buf << 46
+    i = 0
+    while i < prec {
+      buf << hex[((mant >> 60) & 15).to_i]
+      mant = mant << 4
+      i += 1
+    }
+  }
+  pch: Byte = 112
+  pch = 80 if fmt == 88
+  buf << pch
+  if exp < 0 {
+    buf << 45
+    exp = -exp
+  } else {
+    buf << 43
+  }
+  push_int(buf, exp, 2)
+}
+
+# Formats the digits `d` according to fmt, with precision prec.
+def format_digits(buf: [U8], shortest: Bool, neg: Bool, d: Dec, prec0: Int, fmt: Byte) -> [U8] {
+  prec = prec0
+  if fmt == 101 || fmt == 69 {
+    return fmt_e(buf, neg, d, prec, fmt)
+  }
+  if fmt == 102 {
+    return fmt_f(buf, neg, d, prec)
+  }
+  # g or G
+  eprec = prec
+  eprec = d.nd if eprec > d.nd && d.nd >= d.dp
+  # %e is used if the exponent is less than -4 or at least the precision; if
+  # the precision was the shortest possible, use precision 6 for this decision.
+  eprec = 6 if shortest
+  exp = d.dp - 1
+  if exp < -4 || exp >= eprec {
+    prec = d.nd if prec > d.nd
+    return fmt_e(buf, neg, d, prec - 1, fmt - 2)
+  }
+  prec = d.nd if prec > d.dp
+  frac = d.nd - d.dp
+  fmt_f(buf, neg, d, frac > 0 ? frac : 0)
+}
+
+# The string form of `f` in format `fmt` ("e", "E", "f", "g", "G", "b", "x",
+# "X"), with `prec` digits and for a float of `bit_size` (32 or 64) bits:
+#   e: -d.dddde+dd (prec digits after the point)
+#   f: -ddd.dddd   (prec digits after the point)
+#   g: %e for large exponents, %f otherwise (prec significant digits)
+#   b: the binary exponent form -ddddp±ddd;  x: hexadecimal -0x1.yyyyp±dd
+# A prec of -1 gives the smallest number of digits that reads back as exactly
+# `f` (as a float of bit_size bits). Infinities and NaN print as "+Inf",
+# "-Inf" and "NaN". An unknown fmt gives "%" followed by it.
+pub def format_float(f: Float, fmt: Str, prec: Int, bit_size: Int) -> Str {
+  assert bit_size == 32 || bit_size == 64
+  fl = float_info(bit_size)
+  return "NaN" if f != f
+  return "+Inf" if f > MAX_FLOAT
+  return "-Inf" if f < -MAX_FLOAT
+  neg = f < 0.0 || (f == 0.0 && 1.0 / f < 0.0)
+  a = neg ? -f : f
+  mant: U64 = 0
+  exp = fl.bias + 1
+  if a > 0.0 {
+    m, q = decompose(a)
+    ovf = false
+    mant, exp, ovf = round_to_format(m, q, fl)
+    return neg ? "-Inf" : "+Inf" if ovf
+  }
+  buf: [U8] = []
+  c = fmt.size == 1 ? fmt[0] : 0
+  if c == 98 {
+    return Str.from_bytes(fmt_b(buf, neg, mant, exp, fl))
+  }
+  if c == 120 || c == 88 {
+    return Str.from_bytes(fmt_x(buf, prec, c, neg, mant, exp, fl))
+  }
+  if !(c == 101 || c == 69 || c == 102 || c == 103 || c == 71) {
+    return "%" + fmt
+  }
+  d = new_dec()
+  d.assign!(mant)
+  d.shift!(exp - fl.mantbits)
+  shortest = prec < 0
+  p = prec
+  if shortest {
+    d = round_shortest(d, mant, exp, fl)
+    # precision for shortest representation mode
+    if c == 101 || c == 69 {
+      p = d.nd - 1
+    } else if c == 102 {
+      p = d.nd - d.dp > 0 ? d.nd - d.dp : 0
+    } else {
+      p = d.nd
+    }
+  } else {
+    if c == 101 || c == 69 {
+      d.round!(p + 1)
+    } else if c == 102 {
+      d.round!(d.dp + p)
+    } else {
+      p = 1 if p == 0
+      d.round!(p)
+    }
+  }
+  Str.from_bytes(format_digits(buf, shortest, neg, d, p, c))
+}

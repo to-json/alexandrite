@@ -1,0 +1,471 @@
+# Multiprecision decimal numbers and IEEE float plumbing, after Go's
+# strconv/decimal.go. For float parsing and formatting only.
+#
+# A Dec holds the exact decimal expansion of a binary float: digits d[0...nd]
+# (ASCII, big-endian, no leading or trailing zero) with the decimal point
+# before digit index dp. The only operations are assign and binary shifts, which
+# is enough because 2 divides 10: shifting a float's integer mantissa by its
+# binary exponent is exact. Everything here is plain Int and U64 arithmetic; no
+# access to a float's bits is needed (`decompose` and `make_float` scale by
+# exact powers of two).
+
+DEC_CAP = 800  # digits kept; beyond this a nonzero tail sets `trunc`
+MAX_SHIFT = 56 # largest single shift: 9 << 56 and its carries fit an Int
+
+struct FloatInfo {
+  mantbits: Int
+  expbits: Int
+  bias: Int
+}
+
+# The layout of a 32- or 64-bit IEEE float.
+def float_info(bit_size: Int) -> FloatInfo {
+  if bit_size == 32 {
+    FloatInfo.new(mantbits: 23, expbits: 8, bias: -127)
+  } else {
+    FloatInfo.new(mantbits: 52, expbits: 11, bias: -1023)
+  }
+}
+
+struct Dec {
+  d: [U8]
+  tmp: [U8]
+  nd: Int
+  dp: Int
+  neg: Bool
+  trunc: Bool
+
+  # Trim trailing zeros; zero has dp == 0.
+  def trim! {
+    while nd > 0 && d[nd - 1] == 48 {
+      self.nd -= 1
+    }
+    if nd == 0 {
+      self.dp = 0
+    }
+  }
+
+  # Assign v to self.
+  def assign!(v: U64) {
+    buf: [U8] = [0; 24]
+    x = v
+    n = 0
+    while x > 0 {
+      q = x / 10
+      buf[n] = (x - q * 10).as_u8 + 48
+      n += 1
+      x = q
+    }
+    self.nd = 0
+    i = n - 1
+    while i >= 0 {
+      self.d[nd] = buf[i]
+      self.nd += 1
+      i -= 1
+    }
+    self.dp = nd
+    self.trim!
+  }
+
+  # Binary shift right (/ 2) by k bits, k <= MAX_SHIFT.
+  def right_shift!(k: Int) {
+    r = 0
+    w = 0
+    n = 0
+    while (n >> k) == 0 {
+      if r >= nd {
+        if n == 0 {
+          self.nd = 0
+          return
+        }
+        while (n >> k) == 0 {
+          n = n * 10
+          r += 1
+        }
+        break
+      }
+      n = n * 10 + d[r].to_i - 48
+      r += 1
+    }
+    self.dp -= r - 1
+    mask = (1 << k) - 1
+    while r < nd {
+      dig = n >> k
+      n = n & mask
+      self.d[w] = (dig + 48).as_u8
+      w += 1
+      n = n * 10 + d[r].to_i - 48
+      r += 1
+    }
+    while n > 0 {
+      dig = n >> k
+      n = n & mask
+      if w < DEC_CAP {
+        self.d[w] = (dig + 48).as_u8
+        w += 1
+      } else if dig > 0 {
+        self.trunc = true
+      }
+      n = n * 10
+    }
+    self.nd = w
+    self.trim!
+  }
+
+  # Binary shift left (* 2) by k bits, k <= MAX_SHIFT. Digits are produced
+  # least significant first into `tmp`, then copied back.
+  def left_shift!(k: Int) {
+    n = 0
+    j = 0
+    r = nd - 1
+    while r >= 0 {
+      n += (d[r].to_i - 48) << k
+      quo = n / 10
+      self.tmp[j] = (n - 10 * quo).as_u8
+      j += 1
+      n = quo
+      r -= 1
+    }
+    while n > 0 {
+      quo = n / 10
+      self.tmp[j] = (n - 10 * quo).as_u8
+      j += 1
+      n = quo
+    }
+    lim = j < DEC_CAP ? j : DEC_CAP
+    x = 0
+    while x < lim {
+      self.d[x] = tmp[j - 1 - x] + 48
+      x += 1
+    }
+    y = 0
+    while y < j - lim {
+      self.trunc = true if tmp[y] != 0
+      y += 1
+    }
+    self.dp += j - nd
+    self.nd = lim
+    self.trim!
+  }
+
+  # Binary shift left (k > 0) or right (k < 0).
+  def shift!(k: Int) {
+    return if nd == 0
+    m = k
+    if m > 0 {
+      while m > MAX_SHIFT {
+        self.left_shift!(MAX_SHIFT)
+        m -= MAX_SHIFT
+      }
+      self.left_shift!(m)
+    } else if m < 0 {
+      while m < -MAX_SHIFT {
+        self.right_shift!(MAX_SHIFT)
+        m += MAX_SHIFT
+      }
+      self.right_shift!(-m)
+    }
+  }
+
+  # If we chop at keep digits, should we round up?
+  def should_round_up(keep: Int) -> Bool {
+    return false if keep < 0 || keep >= nd
+    if d[keep] == 53 && keep + 1 == nd {
+      # exactly halfway: round to even, unless digits were dropped
+      return true if trunc
+      return keep > 0 && (d[keep - 1].to_i - 48) % 2 != 0
+    }
+    d[keep] >= 53
+  }
+
+  # Round to keep digits (or fewer). keep == 0 rounds just left of the digits.
+  def round!(keep: Int) {
+    return if keep < 0 || keep >= nd
+    if self.should_round_up(keep) {
+      self.round_up!(keep)
+    } else {
+      self.round_down!(keep)
+    }
+  }
+
+  def round_down!(keep: Int) {
+    return if keep < 0 || keep >= nd
+    self.nd = keep
+    self.trim!
+  }
+
+  def round_up!(keep: Int) {
+    return if keep < 0 || keep >= nd
+    i = keep - 1
+    while i >= 0 {
+      if d[i] < 57 {
+        self.d[i] = d[i] + 1
+        self.nd = i + 1
+        return
+      }
+      i -= 1
+    }
+    # all 9s: a single 1 with the point moved
+    self.d[0] = 49
+    self.nd = 1
+    self.dp += 1
+    return
+  }
+
+  # The integer part, rounded appropriately. No guarantees about overflow.
+  def rounded_integer -> U64 {
+    return 18446744073709551615 if dp > 20
+    n: U64 = 0
+    i = 0
+    while i < dp && i < nd {
+      n = n * 10 + (d[i].to_i - 48).to_u64
+      i += 1
+    }
+    while i < dp {
+      n = n * 10
+      i += 1
+    }
+    n += 1 if self.should_round_up(dp)
+    n
+  }
+
+  # Parse a decimal number (readFloat has already vetted underscores).
+  # Returns false on a syntax error.
+  def set!(s: Str) -> Bool {
+    i = 0
+    self.neg = false
+    self.trunc = false
+    self.nd = 0
+    self.dp = 0
+    return false if i >= s.size
+    if s[i] == 43 {
+      i += 1
+    } else if s[i] == 45 {
+      self.neg = true
+      i += 1
+    }
+    sawdot = false
+    sawdigits = false
+    while i < s.size {
+      c = s[i]
+      if c == 95 {
+        i += 1
+        next
+      }
+      if c == 46 {
+        return false if sawdot
+        sawdot = true
+        self.dp = nd
+        i += 1
+        next
+      }
+      break unless c >= 48 && c <= 57
+      sawdigits = true
+      if c == 48 && nd == 0 {
+        self.dp -= 1
+        i += 1
+        next
+      }
+      if nd < DEC_CAP {
+        self.d[nd] = c
+        self.nd += 1
+      } else if c != 48 {
+        self.trunc = true
+      }
+      i += 1
+    }
+    return false unless sawdigits
+    self.dp = nd unless sawdot
+    if i < s.size && (s[i] | 32) == 101 {
+      i += 1
+      return false if i >= s.size
+      esign = 1
+      if s[i] == 43 {
+        i += 1
+      } else if s[i] == 45 {
+        i += 1
+        esign = -1
+      }
+      return false if i >= s.size || s[i] < 48 || s[i] > 57
+      e = 0
+      while i < s.size && ((s[i] >= 48 && s[i] <= 57) || s[i] == 95) {
+        if s[i] != 95 && e < 10000 {
+          e = e * 10 + s[i].to_i - 48
+        }
+        i += 1
+      }
+      self.dp += e * esign
+    }
+    i == s.size
+  }
+
+  # The float nearest this decimal, as (mantissa, exponent, overflow) in
+  # Go's convention: value = mant * 2^(exp - mantbits), with the hidden bit in
+  # mant for normal numbers; a denormal has mant < 2^mantbits and exp ==
+  # bias + 1... see `make_float`. Consumes self.
+  def float_bits!(fl: FloatInfo) -> (U64, Int, Bool) {
+    one: U64 = 1
+    maxfield = (1 << fl.expbits) - 1
+    if nd == 0 {
+      return (0, fl.bias + 1, false)
+    }
+    # Obvious overflow / underflow (the bounds are those for 64-bit floats).
+    return (0, maxfield + fl.bias, true) if dp > 310
+    return (0, fl.bias + 1, false) if dp < -330
+    # Scale by powers of two until in range [0.5, 1.0).
+    exp = 0
+    while dp > 0 {
+      n = dp >= 9 ? 27 : pow_step(dp)
+      self.shift!(-n)
+      exp += n
+    }
+    while dp < 0 || (dp == 0 && d[0] < 53) {
+      n = -dp >= 9 ? 27 : pow_step(-dp)
+      self.shift!(n)
+      exp -= n
+    }
+    # Our range is [0.5, 1) but the float range is [1, 2).
+    exp -= 1
+    # Minimum representable exponent is bias + 1; move up if smaller.
+    if exp < fl.bias + 1 {
+      n = fl.bias + 1 - exp
+      self.shift!(-n)
+      exp += n
+    }
+    return (0, maxfield + fl.bias, true) if exp - fl.bias >= maxfield
+    # Extract 1 + mantbits bits.
+    self.shift!(1 + fl.mantbits)
+    mant = self.rounded_integer
+    # Rounding might have added a bit; shift down.
+    if mant == (one << (fl.mantbits + 1)) {
+      mant = mant >> 1
+      exp += 1
+      return (0, maxfield + fl.bias, true) if exp - fl.bias >= maxfield
+    }
+    # Denormalized?
+    exp = fl.bias + 1 if (mant >> fl.mantbits) == 0
+    (mant, exp, false)
+  }
+}
+
+# Powers of two to scale by while normalizing, indexed by the decimal point.
+def pow_step(k: Int) -> Int {
+  case k {
+    0 => 1
+    1 => 3
+    2 => 6
+    3 => 9
+    4 => 13
+    5 => 16
+    6 => 19
+    7 => 23
+    _ => 26
+  }
+}
+
+def new_dec -> Dec {
+  d: [U8] = [0; 800]
+  tmp: [U8] = [0; 840]
+  Dec.new(d: d, tmp: tmp, nd: 0, dp: 0, neg: false, trunc: false)
+}
+
+# 2^e, exactly, for -1074 <= e <= 1023.
+def pow2(e: Int) -> Float {
+  p = 1.0
+  n = e
+  while n >= 64 {
+    p = p * 18446744073709551616.0
+    n -= 64
+  }
+  while n > 0 {
+    p = p * 2.0
+    n -= 1
+  }
+  while n <= -64 {
+    p = p / 18446744073709551616.0
+    n += 64
+  }
+  while n < 0 {
+    p = p / 2.0
+    n += 1
+  }
+  p
+}
+
+# The float with the given mantissa and exponent in Go's convention (see
+# `Dec.float_bits!`): infinity when the exponent field would be all ones.
+def make_float(mant: U64, exp: Int, neg: Bool, fl: FloatInfo) -> Float {
+  maxfield = (1 << fl.expbits) - 1
+  v = 0.0
+  if (mant >> fl.mantbits) == 0 {
+    v = mant.to_f * pow2(fl.bias + 1 - fl.mantbits)
+  } else if exp - fl.bias >= maxfield {
+    v = pos_inf()
+  } else {
+    v = mant.to_f * pow2(exp - fl.mantbits)
+  }
+  neg ? v * -1.0 : v
+}
+
+def pos_inf -> Float {
+  big = 1.7976931348623157e308
+  big * 10.0
+}
+
+def nan_value -> Float {
+  z = 0.0
+  z / z
+}
+
+# Splits a finite positive float into (m, q) with f = m * 2^q and
+# 2^52 <= m < 2^53 (scaling by powers of two is exact).
+def decompose(f: Float) -> (U64, Int) {
+  x = f
+  q = 0
+  while x >= 166153499473114484112975882535043072.0 { # 2^117
+    x = x / 18446744073709551616.0
+    q += 64
+  }
+  while x >= 9007199254740992.0 {
+    x = x / 2.0
+    q += 1
+  }
+  while x < 0.00048828125 { # 2^-11
+    x = x * 18446744073709551616.0
+    q -= 64
+  }
+  while x < 4503599627370496.0 {
+    x = x * 2.0
+    q -= 1
+  }
+  (x.to_u64, q)
+}
+
+# Rounds (m, q) from `decompose` to the float format fl, half to even.
+# Returns (mant, exp, overflow) in Go's convention. A float32 value stored in
+# a Float is rounded to float32 this way.
+def round_to_format(m: U64, q: Int, fl: FloatInfo) -> (U64, Int, Bool) {
+  one: U64 = 1
+  exp = q + 52
+  minexp = fl.bias + 1
+  shift = 52 - fl.mantbits
+  if exp < minexp {
+    shift += minexp - exp
+    exp = minexp
+  }
+  mant: U64 = 0
+  if shift == 0 {
+    mant = m
+  } else if shift < 55 {
+    quo = m >> shift
+    rem = m - (quo << shift)
+    half = one << (shift - 1)
+    mant = quo
+    mant += 1 if rem > half || (rem == half && (quo & 1) == 1)
+  }
+  if mant == (one << (fl.mantbits + 1)) {
+    mant = mant >> 1
+    exp += 1
+  }
+  (mant, exp, exp > -fl.bias)
+}

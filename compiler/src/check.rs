@@ -1528,8 +1528,11 @@ impl<'w, 'a> FnCx<'w, 'a> {
                 if self.is_main {
                     return Err(Diag::new(s.span, "`return` at the top level"));
                 }
-                let v = v.as_ref().map(|v| self.value(v)).transpose()?;
                 let rt = self.ret.clone();
+                let v = v
+                    .as_ref()
+                    .map(|v| if matches!(v.kind, ExprKind::Tuple(_)) { self.value_as(v, &rt) } else { self.value(v) })
+                    .transpose()?;
                 let v = v.map(|v| self.coerce(v, &rt)).transpose()?;
                 let t = v.as_ref().map_or(Ty::Unit, |v| v.ty.clone());
                 self.expect(&t, &rt, s.span, "return value")?;
@@ -2406,6 +2409,15 @@ impl<'w, 'a> FnCx<'w, 'a> {
                 let a = self.coerce_branch(a, &rb)?;
                 (a, b)
             }
+            // `c ? x : 0` with x a U8: the literal takes the other branch's type.
+            (Ty::Int, t) if t.int_kind().is_some() && matches!(a.kind, TK::Const(_)) => {
+                let a = self.coerce(a, &rb)?;
+                (a, b)
+            }
+            (t, Ty::Int) if t.int_kind().is_some() && matches!(b.kind, TK::Const(_)) => {
+                let b = self.coerce(b, &ra)?;
+                (a, b)
+            }
             _ => (a, b),
         })
     }
@@ -2758,6 +2770,25 @@ impl<'w, 'a> FnCx<'w, 'a> {
                 }
             }
             return Ok(self.mk(TK::Array(vs), w, e.span));
+        }
+        if let (ExprKind::Tuple(items), Ty::Tuple(ts)) = (&e.kind, &w) {
+            if items.len() == ts.len() {
+                // `(0, 1)` as a `(U64, Int)`: each element takes its type.
+                let mut vs = vec![];
+                for (x, t) in items.iter().zip(ts) {
+                    let v = self.value_as(x, t)?;
+                    self.expect(&v.ty, t, v.span, "tuple element")?;
+                    vs.push(v);
+                }
+                return Ok(self.mk(TK::M(M::StructNew, None, vs, None), w.clone(), e.span));
+            }
+        }
+        if let (ExprKind::ArrayRepeat(v, n), Ty::Array(el)) = (&e.kind, &w) {
+            // `[0; 800]` as a `[U8]`: the fill takes the element type.
+            let v = self.value_as(v, el)?;
+            self.expect(&v.ty, el, v.span, "array element")?;
+            let n = self.index_value(n)?;
+            return Ok(self.mk(TK::M(M::ArrayNew, None, vec![n, v], None), w.clone(), e.span));
         }
         let saved = self.want_hint.replace(w.clone());
         let v = self.value(e);

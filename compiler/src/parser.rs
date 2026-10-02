@@ -626,6 +626,13 @@ impl<'a> Parser<'a> {
                     let esp = self.span();
                     match self.bump().tok {
                         Tok::Const(n) => es.push(n),
+                        // `pkg.NumError`: an error type from an imported package.
+                        Tok::Ident(pkg) if self.is_op(".") && matches!(self.peek_at(1), Tok::Const(_)) => {
+                            self.bump();
+                            if let Tok::Const(n) = self.bump().tok {
+                                es.push(format!("{pkg}.{n}"));
+                            }
+                        }
                         t => return Err(Diag::new(esp, format!("expected an error type, found {}", describe(&t)))),
                     }
                     if !self.eat_op("|") {

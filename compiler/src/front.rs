@@ -647,7 +647,10 @@ fn parse_ty(s: &str) -> Result<Ty, String> {
             let (parts, _) = split_params(&format!("{})", &s[1..s.len() - 1]))?;
             Ty::Tuple(parts.iter().map(|p| parse_ty(p)).collect::<Result<_, _>>()?)
         }
-        _ => return Err(format!("bad header type `{s}`")),
+        _ => match crate::ast::IntKind::from_name(s) {
+            Some(k) => Ty::of_kind(k),
+            None => return Err(format!("bad header type `{s}`")),
+        },
     })
 }
 

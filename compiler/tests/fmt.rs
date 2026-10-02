@@ -30,19 +30,8 @@ fn acceptance_cases_are_fixed_points() {
         let out = format(&src).unwrap_or_else(|e| panic!("{}: {e}", p.display()));
         assert_eq!(norm_tokens(&src).unwrap(), norm_tokens(&out).unwrap(), "tokens changed: {}", p.display());
         assert_eq!(format(&out).unwrap(), out, "not idempotent: {}", p.display());
-        // The cases align trailing comments in columns; the formatter uses one space.
-        // Anything beyond that is a real style difference.
-        let unalign = |s: &str| {
-            s.lines()
-                .map(|l| {
-                    let body = l.trim_start();
-                    format!("{}{}", &l[..l.len() - body.len()], body.split_whitespace().collect::<Vec<_>>().join(" "))
-                })
-                .collect::<Vec<_>>()
-                .join("\n")
-        };
-        if unalign(&out) != unalign(&src) {
-            let diff: Vec<String> = src.lines().zip(out.lines()).filter(|(a, b)| unalign(a) != unalign(b)).map(|(a, b)| format!("  - {a}\n  + {b}")).collect();
+        if out != src {
+            let diff: Vec<String> = src.lines().zip(out.lines()).filter(|(a, b)| a != b).map(|(a, b)| format!("  - {a}\n  + {b}")).collect();
             bad.push(format!("{}\n{}", p.display(), diff.join("\n")));
         }
     }
@@ -98,6 +87,13 @@ fn generics_and_unary() {
     check("def *(k: Int) -> V2 { 1 }\ndef <=>(o: V2) -> Int { 0 }\n", "def *(k: Int) -> V2 { 1 }\ndef <=>(o: V2) -> Int { 0 }\n");
     check("xs.map(&:to_i)\nputs -x\nputs !a\nf(*args)\n", "xs.map(&:to_i)\nputs -x\nputs !a\nf(*args)\n");
     check("case n {\n1|2=>\"a\"\n_=>\"b\"\n}\n", "case n {\n  1 | 2 => \"a\"\n  _ => \"b\"\n}\n");
+}
+
+#[test]
+fn trailing_comments_align_in_runs() {
+    check("a = 1 # x\nbbb = 2 # y\n\nc = 3    # z\n", "a = 1   # x\nbbb = 2 # y\n\nc = 3 # z\n");
+    check("a = 1 # x\n# full\nbbb = 2 # y\n", "a = 1 # x\n# full\nbbb = 2 # y\n");
+    check("def f {  # c\n  x = 1 # d\n}\n", "def f { # c\n  x = 1 # d\n}\n");
 }
 
 #[test]

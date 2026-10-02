@@ -18,6 +18,7 @@ enum Line {
 
 struct Code {
     text: String,
+    comment: Option<String>,
     /// Bracket tokens in order.
     brackets: Vec<&'static str>,
     lead_closers: usize,
@@ -226,16 +227,12 @@ pub fn format(src: &str) -> Result<String, String> {
                 (None, None) => lines.push(Line::Blank),
                 (None, Some(c)) => lines.push(Line::Comment(c)),
                 (Some(f), c) => {
-                    if let Some(c) = c {
-                        text.push(' ');
-                        text.push_str(&c);
-                    }
                     let l = i - 1;
                     let lead_closers = toks[f..=l].iter().take_while(|t| op(&t.tok).is_some_and(|o| matches!(o, ")" | "]" | "}"))).count();
                     let lead_cont = op(&toks[f].tok).is_some_and(|o| matches!(o, "." | "?." | "&&" | "||"));
                     let trail_cont = op(&toks[l].tok).is_some_and(|o| matches!(o, "&&" | "||" | "+" | "-" | "*" | "/" | "=" | "." | "?." | "<<" | "==" | "!="));
                     let ends_open = op(&toks[l].tok).is_some_and(|o| matches!(o, "{" | "(" | "["));
-                    lines.push(Line::Code(Code { text: std::mem::take(&mut text), brackets: std::mem::take(&mut brackets), lead_closers, lead_cont, trail_cont, ends_open }));
+                    lines.push(Line::Code(Code { text: std::mem::take(&mut text), comment: c, brackets: std::mem::take(&mut brackets), lead_closers, lead_cont, trail_cont, ends_open }));
                 }
             }
             first = None;
@@ -311,6 +308,7 @@ fn layout(lines: Vec<Line>) -> String {
     let mut last_blank = true; // suppresses leading blanks
     let mut last_open = false;
     let mut out_lines: Vec<String> = Vec::new();
+    let mut trail: Vec<Option<String>> = Vec::new();
     let level = |stack: &Vec<usize>| {
         let mut n = 0;
         let mut prev = usize::MAX;
@@ -360,7 +358,9 @@ fn layout(lines: Vec<Line>) -> String {
                         }
                     }
                 }
+                trail.resize(out_lines.len(), None);
                 out_lines.push(format!("{}{}", "  ".repeat(lv), c.text));
+                trail.push(c.comment);
                 cont = c.trail_cont;
                 last_blank = false;
                 last_open = c.ends_open;
@@ -370,10 +370,32 @@ fn layout(lines: Vec<Line>) -> String {
     while out_lines.last().is_some_and(|s| s.is_empty()) {
         out_lines.pop();
     }
+    trail.resize(out_lines.len(), None);
+    // gofmt-style: a run of consecutive lines with trailing comments shares one
+    // comment column, one space past the longest code part.
     let mut out = String::new();
-    for l in out_lines {
-        out.push_str(&l);
-        out.push('\n');
+    let mut i = 0;
+    while i < out_lines.len() {
+        let mut j = i;
+        // A line that opens a block starts a new section.
+        while j < out_lines.len() && trail[j].is_some() && (j == i || !out_lines[j].ends_with(['{', '(', '['])) {
+            j += 1;
+        }
+        if j == i {
+            out.push_str(&out_lines[i]);
+            out.push('\n');
+            i += 1;
+            continue;
+        }
+        let w = out_lines[i..j].iter().map(|l| l.chars().count()).max().unwrap_or(0) + 1;
+        for k in i..j {
+            let pad = w - out_lines[k].chars().count();
+            out.push_str(&out_lines[k]);
+            out.push_str(&" ".repeat(pad));
+            out.push_str(trail[k].as_deref().unwrap_or(""));
+            out.push('\n');
+        }
+        i = j;
     }
     out
 }

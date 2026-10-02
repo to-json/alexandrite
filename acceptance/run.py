@@ -185,6 +185,13 @@ def modules():
     check("M6", "modtest missing cache dir error", "isn't in the module cache" in r.stderr and r.returncode == 1, r.stderr.strip()[:200])
 
 
+def fmt_check():
+    paths = sorted(str(p) for p in CASES.glob("*.alx"))
+    paths += [str(CASES / "pkgs"), str(CASES / "lib")]
+    r, _ = run([ALX, "fmt", "--check", *paths])
+    check("M8", "alx fmt --check: cases are canonically formatted", r.returncode == 0 and r.stdout == "", f"exit {r.returncode}: {r.stdout.strip()[:200]}")
+
+
 def promote_overhead():
     tmp = WORK / "promote"
     tmp.mkdir(exist_ok=True)
@@ -298,6 +305,7 @@ def main():
         print("== modules", flush=True)
         modules()
         warnings()
+        fmt_check()
     if not filt or "A3" in filt:
         print("== A3 promote overhead", flush=True)
         promote_overhead()

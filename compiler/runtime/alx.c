@@ -19,7 +19,7 @@
 
 size_t alx_allocs;
 bool alx_counting;
-_Thread_local char *alx_bump_cur, *alx_bump_end;
+_Thread_local struct AlxTls alx_tls;
 static size_t mem_held, mem_peak;
 static bool alx_memstats;
 
@@ -64,15 +64,13 @@ enum { ALX_FREE_CAP = 4 };  /* chunks kept per thread (4 MB) */
 /* Chunks and large blocks start with a 16-byte header. */
 typedef AlxBlk Blk;   /* struct AlxRegion and AlxBlk: alx.h */
 
-static _Thread_local AlxRegion tl_prog;
-_Thread_local AlxRegion *alx_tl_cur;           /* NULL = program region */
+#define tl_prog alx_tl_prog
 #define tl_cur alx_tl_cur
-static _Thread_local AlxRegion *tl_pool;       /* spare region structs */
+#define tl_pool alx_tl_pool
 static _Thread_local Blk *tl_free;             /* free chunks */
 /* Pooled region structs that kept their only chunk (a frame that allocated a
  * little): reusing one costs no registry or free-list work. */
-static _Thread_local int tl_ncached;
-enum { ALX_CACHED_CAP = 8 };
+#define tl_ncached alx_tl_ncached
 static _Thread_local int tl_nfree;
 
 /* Granule registry: this thread's map from 1 MB granule number to the region
@@ -141,37 +139,25 @@ static void reg_del(uintptr_t g) {
 }
 static void reg_blk(const void *b, size_t size, AlxRegion *r) {
     uintptr_t g0 = (uintptr_t)b >> 20, g1 = ((uintptr_t)b + size - 1) >> 20;
+    alx_tls.last_g = 0; /* alx_region_of's cached answer may be stale */
     for (uintptr_t g = g0; g <= g1; g++) { if (r) reg_put(g, r); else reg_del(g); }
 }
 
-AlxRegion *alx_region_of(const void *p) {
+AlxRegion *alx_region_of_slow(const void *p) {
     if (p && tl_reg_n) {
         uintptr_t g = (uintptr_t)p >> 20;
         size_t m = tl_reg_cap - 1, i = reg_hash(g, m);
         for (RegEnt *e; (e = &tl_reg[i])->g; i = (i + 1) & m)
-            if (e->g == g) return e->r;
+            if (e->g == g) {
+                alx_tls.last_g = g;
+                alx_tls.last_r = e->r;
+                return e->r;
+            }
     }
     return &tl_prog;
 }
 
 static inline AlxRegion *cur_region(void) { return tl_cur ? tl_cur : &tl_prog; }
-
-AlxRegion *alx_region_program(void) { return &tl_prog; }
-AlxRegion *alx_region_cur(void) { return cur_region(); }
-
-void alx_region_set(AlxRegion *r) {
-    AlxRegion *c = cur_region();
-    if (c == r) return;
-    c->cur = alx_bump_cur; c->end = alx_bump_end;
-    alx_bump_cur = r->cur; alx_bump_end = r->end;
-    tl_cur = r;
-}
-
-AlxRegion *alx_region_use(AlxRegion *r) {
-    AlxRegion *p = cur_region();
-    alx_region_set(r);
-    return p;
-}
 
 static AlxRegion *region_alloc(void) {
     AlxRegion *r = tl_pool;
@@ -194,7 +180,7 @@ static AlxRegion *region_alloc(void) {
     return r;
 }
 
-AlxRegion *alx_region_enter(void) {
+AlxRegion *alx_region_enter_slow(void) {
     AlxRegion *r = region_alloc();
     alx_region_set(r);
     return r;
@@ -284,7 +270,7 @@ void alx_region_reset_slow(AlxRegion *mark, void *larges) {
     alx_bump_cur = cur; alx_bump_end = end;
 }
 
-void alx_region_exit(AlxRegion *r, AlxRegion *saved) {
+void alx_region_exit_slow(AlxRegion *r, AlxRegion *saved) {
     AlxRegion *c = cur_region();
     if (c != r && c != saved) { c->cur = alx_bump_cur; c->end = alx_bump_end; }
     if (c != saved) { alx_bump_cur = saved->cur; alx_bump_end = saved->end; }
@@ -297,12 +283,6 @@ void alx_region_free(AlxRegion *r) {
     for (AlxRegion *c = cur_region(); c; c = c->parent)
         assert(c != r && "alx_region_free of a region that is (inside) the current one");
     region_release(r);
-}
-
-int64_t alx_region_bytes(AlxRegion *r) {
-    if (!r->cbase) return (int64_t)r->counted;
-    char *cur = r == cur_region() ? alx_bump_cur : r->cur;
-    return (int64_t)(r->counted + (size_t)(cur - r->cbase));
 }
 
 /* `n` is rounded to 16 already. */
@@ -445,7 +425,7 @@ AlxStr alx_str_rev(AlxStr s) {
     return r;
 }
 
-bool alx_str_eq(AlxStr a, AlxStr b) { return a.len == b.len && (a.len == 0 || memcmp(a.ptr, b.ptr, (size_t)a.len) == 0); }
+bool alx_str_eq_slow(AlxStr a, AlxStr b) { return a.len == b.len && (a.len == 0 || memcmp(a.ptr, b.ptr, (size_t)a.len) == 0); }
 
 int alx_str_cmp(AlxStr a, AlxStr b) {
     int64_t n = a.len < b.len ? a.len : b.len;
@@ -489,8 +469,13 @@ Arr_Str alx_str_split(AlxStr s, AlxStr sep) {
         return a;
     }
     int64_t start = 0;
+    char c0 = sep.ptr[0];
     for (int64_t i = 0; i + sep.len <= s.len;) {
-        if (memcmp(s.ptr + i, sep.ptr, (size_t)sep.len) == 0) {
+        /* The next place the separator's first byte occurs. */
+        const char *hit = memchr(s.ptr + i, c0, (size_t)(s.len - sep.len + 1 - i));
+        if (!hit) break;
+        i = hit - s.ptr;
+        if (sep.len == 1 || memcmp(s.ptr + i + 1, sep.ptr + 1, (size_t)sep.len - 1) == 0) {
             AlxStr part = { s.ptr + start, i - start };
             Arr_Str_push(&a, part);
             i += sep.len;
@@ -788,15 +773,49 @@ int64_t alx_f_to_i(double x, const char *loc) {
 
 void alx_puts_f64(double x) { alx_puts_str(alx_f_to_s(x)); }
 
+/* The end of the last string alx_str_cat made. When the first part is that
+ * string and nothing was allocated after it (it ends at the bump pointer),
+ * the rest is appended in place: `s += x` in a loop is linear. Only the most
+ * recent concatenation qualifies, so no other string can be using the bytes
+ * past its end. */
+#define tl_last_cat alx_last_cat
+
 AlxStr alx_str_cat(int64_t n, const AlxStr *parts) {
     int64_t len = 0;
     for (int64_t i = 0; i < n; i++) len += parts[i].len;
+    const char *f = parts[0].ptr;
+    if (n >= 2 && f && parts[0].len > 0 && f + parts[0].len == tl_last_cat) {
+        char *top = alx_bump_cur;
+        size_t had = ((size_t)parts[0].len + 15) & ~(size_t)15, need = ((size_t)len + 15) & ~(size_t)15;
+        if ((char *)f + had == top && (size_t)(alx_bump_end - (char *)f) >= need) {
+            alx_bump_cur = (char *)f + need;
+            int64_t o = parts[0].len;
+            for (int64_t i = 1; i < n; i++) {
+                int64_t m = parts[i].len;
+                if (m <= 16) {
+                    for (int64_t k = 0; k < m; k++) ((char *)f)[o + k] = parts[i].ptr[k];
+                } else {
+                    memmove((char *)f + o, parts[i].ptr, (size_t)m);
+                }
+                o += m;
+            }
+            tl_last_cat = f + len;
+            AlxStr s = { f, len };
+            return s;
+        }
+    }
     char *p = alx_alloc((size_t)len);
     int64_t o = 0;
     for (int64_t i = 0; i < n; i++) {
-        if (parts[i].len) memcpy(p + o, parts[i].ptr, (size_t)parts[i].len);
-        o += parts[i].len;
+        int64_t m = parts[i].len;
+        if (m <= 16) {
+            for (int64_t k = 0; k < m; k++) p[o + k] = parts[i].ptr[k];
+        } else {
+            memcpy(p + o, parts[i].ptr, (size_t)m);
+        }
+        o += m;
     }
+    tl_last_cat = p + len;
     AlxStr s = { p, len };
     return s;
 }

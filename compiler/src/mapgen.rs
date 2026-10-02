@@ -22,9 +22,13 @@ pub const COUNT: usize = 4;
 /// compaction.
 pub const REGION: usize = 5;
 pub const LIVE_BYTES: usize = 6;
+/// The entry the last successful lookup found (-1: none): `m[k] = f(m[k])`
+/// and repeated lookups of one key skip the hash. Checked against the key,
+/// so a stale index is harmless.
+pub const LAST: usize = 7;
 
 pub fn header(k: &LTy, v: &LTy) -> LTy {
-    LTy::Tup(vec![LTy::Arr(Box::new(k.clone())), LTy::Arr(Box::new(v.clone())), LTy::Arr(Box::new(LTy::Bool)), LTy::Arr(Box::new(LTy::I64)), LTy::I64, LTy::Region, LTy::I64])
+    LTy::Tup(vec![LTy::Arr(Box::new(k.clone())), LTy::Arr(Box::new(v.clone())), LTy::Arr(Box::new(LTy::Bool)), LTy::Arr(Box::new(LTy::I64)), LTy::I64, LTy::Region, LTy::I64, LTy::I64])
 }
 
 pub fn map_ty(k: &LTy, v: &LTy) -> LTy {
@@ -182,6 +186,7 @@ fn gen_new(n: &MapFns, k: &LTy, v: &LTy) -> LFunc {
             LE::I(0),
             LE::RegionProgram,
             LE::I(0),
+            LE::I(-1),
         ],
     );
     body.push(LS::Set(m, LE::ArrLit(header(k, v), vec![h])));
@@ -198,18 +203,34 @@ fn gen_find(n: &MapFns, k: &LTy, v: &LTy) -> LFunc {
     let mask = fb.var("mask", LTy::I64);
     let s = fb.var("s", LTy::I64);
     let slots = fb.var("slots", LTy::Arr(b(LTy::I64)));
-    let mut body = hash(&mut fb, k, var(key), h);
+    // The last entry found, if it's this key.
+    let last = fb.var("last", LTy::I64);
+    let mut body = vec![LS::Set(last, hdr(m, LAST))];
+    let hit = LE::Cond(
+        b(cmp(Op::Ge, var(last), LE::I(0))),
+        b(LE::Cond(
+            b(cmp(Op::Lt, var(last), LE::Len(b(hdr(m, KEYS))))),
+            b(LE::Cond(b(idx(hdr(m, LIVE), var(last))), b(keq(k, idx(hdr(m, KEYS), var(last)), var(key))), b(LE::B(false)))),
+            b(LE::B(false)),
+        )),
+        b(LE::B(false)),
+    );
+    body.push(LS::If(hit, vec![LS::Return(Some(var(last)))], vec![]));
+    body.extend(hash(&mut fb, k, var(key), h));
     body.push(LS::Set(slots, hdr(m, SLOTS)));
     body.push(LS::Set(mask, add(LE::Len(b(var(slots))), LE::I(-1))));
     body.push(LS::Set(h, and(var(h), var(mask))));
     let l = fb.label();
-    let found = LE::Cond(b(idx(hdr(m, LIVE), var(s))), b(keq(k, idx(hdr(m, KEYS), var(s)), var(key))), b(LE::B(false)));
+    // Slots: an entry index, -1 empty (the chain ends), -2 a deleted entry's
+    // tombstone (the chain goes on). Live entries are exactly those slots
+    // point at, so no `live` load here.
+    let found = LE::Cond(b(cmp(Op::Ge, var(s), LE::I(0))), b(keq(k, idx(hdr(m, KEYS), var(s)), var(key))), b(LE::B(false)));
     body.push(LS::Loop(
         l,
         vec![
             LS::Set(s, idx(var(slots), var(h))),
-            LS::If(cmp(Op::Lt, var(s), LE::I(0)), vec![LS::Return(Some(LE::I(-1)))], vec![]),
-            LS::If(found, vec![LS::Return(Some(var(s)))], vec![]),
+            LS::If(cmp(Op::Eq, var(s), LE::I(-1)), vec![LS::Return(Some(LE::I(-1)))], vec![]),
+            LS::If(found, vec![set_field(m, LAST, var(s)), LS::Return(Some(var(s)))], vec![]),
             LS::Set(h, and(add(var(h), LE::I(1)), var(mask))),
         ],
     ));
@@ -293,7 +314,11 @@ fn gen_set(n: &MapFns, k: &LTy, v: &LTy) -> LFunc {
     body.push(LS::Set(vals, hdr(m, VALS)));
     body.push(LS::Set(live, hdr(m, LIVE)));
     body.push(LS::Set(slots, hdr(m, SLOTS)));
-    body.push(LS::Push(keys, var(key)));
+    // A new Str key is copied into the map's storage: what the caller passed
+    // can then die with the caller's iteration (strings are immutable, so
+    // the copy can't be told apart).
+    let stored_key = if *k == LTy::Str { LE::Rt(Rt::StrCat, vec![var(key)]) } else { var(key) };
+    body.push(LS::Push(keys, stored_key));
     body.push(LS::Push(vals, var(val)));
     body.push(LS::Push(live, LE::B(true)));
     body.extend(place_slot(&mut fb, k, slots, var(key), add(LE::Len(b(var(keys))), LE::I(-1))));
@@ -312,16 +337,30 @@ fn gen_del(n: &MapFns, k: &LTy, v: &LTy) -> LFunc {
     let m = fb.var("m", map_ty(k, v));
     let key = fb.var("key", k.clone());
     let e = fb.var("e", LTy::I64);
+    let h = fb.var("h", LTy::I64);
+    let mask = fb.var("mask", LTy::I64);
+    let slots = fb.var("slots", LTy::Arr(b(LTy::I64)));
+    // The slot pointing at entry e becomes a tombstone (-2).
+    let mut tomb = hash(&mut fb, k, var(key), h);
+    tomb.push(LS::Set(slots, hdr(m, SLOTS)));
+    tomb.push(LS::Set(mask, add(LE::Len(b(var(slots))), LE::I(-1))));
+    tomb.push(LS::Set(h, and(var(h), var(mask))));
+    let l = fb.label();
+    tomb.push(LS::Loop(
+        l,
+        vec![
+            LS::If(cmp(Op::Eq, idx(var(slots), var(h)), var(e)), vec![LS::SetIndex { arr: slots, idx: var(h), val: LE::I(-2), check: None }, LS::Break(l)], vec![]),
+            LS::Set(h, and(add(var(h), LE::I(1)), var(mask))),
+        ],
+    ));
+    let mut hit = vec![
+        LS::SetPlace { var: m, steps: vec![Step::Index(LE::I(0), None), Step::Field(LIVE), Step::Index(var(e), None)], val: LE::B(false) },
+        set_field(m, COUNT, add(hdr(m, COUNT), LE::I(-1))),
+    ];
+    hit.extend(tomb);
     let body = vec![
         LS::Set(e, LE::Call(n.find.clone(), vec![var(m), var(key)])),
-        LS::If(
-            cmp(Op::Ge, var(e), LE::I(0)),
-            vec![
-                LS::SetPlace { var: m, steps: vec![Step::Index(LE::I(0), None), Step::Field(LIVE), Step::Index(var(e), None)], val: LE::B(false) },
-                set_field(m, COUNT, add(hdr(m, COUNT), LE::I(-1))),
-            ],
-            vec![],
-        ),
+        LS::If(cmp(Op::Ge, var(e), LE::I(0)), hit, vec![]),
         LS::Return(Some(var(e))),
     ];
     fb.func(&n.del, vec![m, key], LTy::I64, body)

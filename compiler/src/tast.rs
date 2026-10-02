@@ -536,6 +536,9 @@ pub struct TFunc {
     pub is_main: bool,
     /// Lambda literals in this function: (block span start, fn type, captured locals).
     pub lambdas: Vec<(u32, Ty, Vec<LocalId>)>,
+    /// Per lambda (by block span start): its parameters and the range of
+    /// locals its body declares (parameters included).
+    pub lambda_info: Vec<(u32, Vec<LocalId>, (usize, usize))>,
     /// The error types it can fail with ("Error" = any).
     pub errs: Vec<String>,
 }

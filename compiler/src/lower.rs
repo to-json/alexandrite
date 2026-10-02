@@ -95,6 +95,7 @@ pub fn lower(p: &TProgram, sm: &SourceMap, opts: &Opts) -> LProgram {
     });
     GLOBALS.with(|g| g.borrow_mut().clear());
     let prog = RefCell::new(LProgram::default());
+
     // R1: where each allocation lives (unless turned off, for comparison).
     let placement = if std::env::var_os("ALX_NO_REGIONS").is_some() { vec![] } else { crate::regions::analyze(p) };
     for (fi, f) in p.funcs.iter().enumerate() {
@@ -114,6 +115,7 @@ pub fn lower(p: &TProgram, sm: &SourceMap, opts: &Opts) -> LProgram {
             lw.analyze_facts(&f.body);
             // The call's own region: entered here, exited on every way out.
             let mut prologue = vec![];
+            let mut frame_var: Option<(V, V)> = None;
             if let Some(pl) = placement.get(fi).filter(|pl| !pl.sites.is_empty()) {
                 if light_frame(f, pl) {
                     // Allocations of the frame go in the region current at the
@@ -133,11 +135,13 @@ pub fn lower(p: &TProgram, sm: &SourceMap, opts: &Opts) -> LProgram {
                     prologue.push(LS::RegionEnter { region: frame, saved: dest });
                     lw.frame = Some((frame, dest));
                 }
+                frame_var = lw.frame.filter(|_| lw.light.is_none()).map(|(f, d)| (f, d));
                 lw.place = Some(pl);
             }
             let mut body = lw.body_with_return(&f.body, !f.is_main && f.ret != Ty::Unit);
             prologue.append(&mut body);
             let mut body = prologue;
+            let _ = frame_var;
             if lw.res.is_some() && f.ret == Ty::Unit {
                 // Falling off the end of a fallible def that returns nothing.
                 body.push(LS::Return(Some(lw.ok_result(LE::B(false)))));
@@ -156,7 +160,58 @@ pub fn lower(p: &TProgram, sm: &SourceMap, opts: &Opts) -> LProgram {
         main.body.splice(0..0, init);
     }
     prog.globals = globals.into_iter().map(|(_, t)| t).collect();
+    drop_idle_regions(&mut prog);
     prog
+}
+
+/// Regions nothing is allocated in while they're current (a call's frame,
+/// a loop's iteration region) aren't made, and region switches around
+/// nothing are dropped. Functions whose results carry storage may allocate
+/// in their caller's current region; unknown callees count as allocating.
+fn drop_idle_regions(prog: &mut LProgram) {
+    let known: std::collections::HashSet<String> = prog.funcs.iter().map(|f| f.name.clone()).collect();
+    let storage: std::collections::HashSet<String> = prog.funcs.iter().filter(|f| lty_has_storage(&f.ret)).map(|f| f.name.clone()).collect();
+    let rets = (storage, known);
+    // Callees taking something with storage could store into it (in its
+    // region, which may be the one an iteration's mark is on).
+    let storage_params: std::collections::HashSet<String> = prog.funcs.iter().filter(|f| f.params.iter().any(|p| lty_has_storage(&f.vars[*p].ty))).map(|f| f.name.clone()).collect();
+    for f in prog.funcs.iter_mut().filter(|f| !f.external) {
+        let mut regions = vec![];
+        collect_enters(&f.body, &mut regions);
+        for (region, saved) in regions {
+            // main's frame is where the program's region use starts.
+            if f.is_main && f.vars.get(region).is_some_and(|v| v.name == "frame") {
+                continue;
+            }
+            if !frame_allocates(&f.body, region, &rets) {
+                drop_frame(&mut f.body, region, saved);
+            } else if f.vars.get(region).is_some_and(|v| v.name == "iter") && iter_light_ok(&f.body, region, &rets, &storage_params) {
+                let mark = f.vars.len();
+                f.vars.push(LVar { name: "imark".into(), ty: LTy::Region });
+                f.vars.push(LVar { name: "ilarges".into(), ty: LTy::Region });
+                light_iter(&mut f.body, region, mark, mark + 1);
+            }
+        }
+        drop_idle_switches(&mut f.body, &rets);
+    }
+}
+
+fn collect_enters(ss: &[LS], out: &mut Vec<(V, V)>) {
+    for s in ss {
+        match s {
+            LS::RegionEnter { region, saved } => {
+                if !out.iter().any(|(r, _)| r == region) {
+                    out.push((*region, *saved));
+                }
+            }
+            LS::If(_, a, b) => {
+                collect_enters(a, out);
+                collect_enters(b, out);
+            }
+            LS::Loop(_, b) => collect_enters(b, out),
+            _ => {}
+        }
+    }
 }
 
 /// An `extern def` as a function: its body is one C call, with Ints
@@ -1455,7 +1510,7 @@ impl<'a> Lw<'a> {
                 let keep = self.tmp(LTy::Str);
                 let saved = self.tmp(LTy::Region);
                 self.emit(LS::RegionUse { region: LE::RegionProgram, saved });
-                self.emit(LS::Set(keep, LE::Rt(Rt::StrCat, vec![text, LE::S(String::new())])));
+                self.emit(LS::Set(keep, LE::Rt(Rt::StrCat, vec![text])));
                 self.emit(LS::RegionRestore(saved));
                 self.block(path.cleanup());
                 self.emit(LS::Die(LE::Var(keep)));
@@ -1477,7 +1532,8 @@ impl<'a> Lw<'a> {
             return v;
         }
         match t {
-            LTy::Str => LE::Rt(Rt::StrCat, vec![v, LE::S(String::new())]),
+            // (A one-part concatenation always copies.)
+            LTy::Str => LE::Rt(Rt::StrCat, vec![v]),
             LTy::PInt => v,
             LTy::Tup(ts) => {
                 let x = self.bind(v, t.clone());
@@ -4363,4 +4419,322 @@ fn zero_le(t: &LTy) -> LE {
         LTy::Range => LE::Range(Box::new(LE::I(0)), Box::new(LE::I(0)), false),
         LTy::Gen(_) => panic!("an optional generator has no zero value yet"),
     }
+}
+
+fn lty_has_storage(t: &LTy) -> bool {
+    match t {
+        LTy::Str | LTy::Arr(_) | LTy::PInt | LTy::Gen(_) => true,
+        LTy::Tup(ts) => ts.iter().any(lty_has_storage),
+        _ => false,
+    }
+}
+
+/// Can evaluating `e` allocate in the current region? (Conservative: only
+/// forms known not to are cleared.)
+fn le_allocates(e: &LE, rets: &(std::collections::HashSet<String>, std::collections::HashSet<String>)) -> bool {
+    let any = |xs: &[LE]| xs.iter().any(|x| le_allocates(x, rets));
+    let one = |x: &LE| le_allocates(x, rets);
+    match e {
+        LE::Var(_) | LE::I(_) | LE::F(_) | LE::B(_) | LE::S(_) | LE::Loc(_) | LE::Unit | LE::RegionProgram | LE::Global(_) => false,
+        LE::Tup(_, xs) | LE::Prim(_, xs) => any(xs),
+        LE::Field(x, _) | LE::Neg(x, _) | LE::FNeg(x) | LE::Not(x) | LE::Len(x) | LE::RangeField(x, _) | LE::ChanLen(x) | LE::AtomicLoad(x) | LE::RegionOf(x) | LE::RegionBytes(x) => one(x),
+        LE::Arith(_, a, b, _) | LE::Cmp(_, a, b, _) | LE::FArith(_, a, b) | LE::Range(a, b, _) => one(a) || one(b),
+        LE::Cond(a, b, c) => one(a) || one(b) || one(c),
+        LE::Index { arr, idx, .. } => one(arr) || one(idx),
+        LE::Call(name, args) => !rets.1.contains(name) || rets.0.contains(name) || any(args),
+        LE::Rt(r, args) => !matches!(r, Rt::RegionCur | Rt::Even | Rt::Isqrt | Rt::SatAdd) || any(args),
+        _ => true,
+    }
+}
+
+/// Does anything allocate while `frame` is the current region?
+fn frame_allocates(body: &[LS], frame: V, rets: &(std::collections::HashSet<String>, std::collections::HashSet<String>)) -> bool {
+    // saved var -> was the frame current when it was saved
+    fn walk(ss: &[LS], cur: &mut bool, saved: &mut HashMap<V, bool>, frame: V, rets: &(std::collections::HashSet<String>, std::collections::HashSet<String>)) -> bool {
+        for s in ss {
+            let alloc = |e: &LE| le_allocates(e, rets);
+            let hit = match s {
+                LS::RegionEnter { region, saved: sv } => {
+                    saved.insert(*sv, *cur);
+                    *cur = *region == frame;
+                    false
+                }
+                LS::RegionExit { saved: sv, .. } => {
+                    *cur = saved.get(sv).copied().unwrap_or(true);
+                    false
+                }
+                LS::RegionUse { region, saved: sv } => {
+                    saved.insert(*sv, *cur);
+                    *cur = matches!(region, LE::Var(v) if *v == frame);
+                    alloc(region) && *cur
+                }
+                LS::RegionRestore(sv) => {
+                    *cur = saved.get(sv).copied().unwrap_or(true);
+                    false
+                }
+                LS::Set(_, e) | LS::Eval(e) | LS::Puts(e, _) | LS::Print(e) | LS::PanicStr(e) | LS::Exit(e) | LS::Die(e) | LS::Lock(e) | LS::Unlock(e) => *cur && alloc(e),
+                LS::Return(e) => *cur && e.as_ref().is_some_and(alloc),
+                LS::SetIndex { idx, val, .. } => *cur && (alloc(idx) || alloc(val)),
+                LS::AtomicStore(a, b) => *cur && (alloc(a) || alloc(b)),
+                LS::If(c, a, b) => {
+                    if *cur && alloc(c) {
+                        return true;
+                    }
+                    let (mut ca, mut cb) = (*cur, *cur);
+                    if walk(a, &mut ca, saved, frame, rets) || walk(b, &mut cb, saved, frame, rets) {
+                        return true;
+                    }
+                    *cur = ca || cb;
+                    false
+                }
+                LS::Loop(_, b) => {
+                    // Twice: the state at the end of the body flows back to its start.
+                    let mut c = *cur;
+                    if walk(b, &mut c, saved, frame, rets) {
+                        return true;
+                    }
+                    let mut c2 = *cur || c;
+                    if walk(b, &mut c2, saved, frame, rets) {
+                        return true;
+                    }
+                    *cur = *cur || c2;
+                    false
+                }
+                LS::Break(_) | LS::Continue(_) | LS::Panic(..) | LS::RegionFree(_) => false,
+                _ => *cur,
+            };
+            if hit {
+                return true;
+            }
+        }
+        false
+    }
+    let mut cur = false;
+    let mut saved = HashMap::new();
+    walk(body, &mut cur, &mut saved, frame, rets)
+}
+
+/// Replaces the frame's enter with "the frame is the caller's current
+/// region" and removes its exits (nothing was allocated in it).
+fn drop_frame(body: &mut Vec<LS>, frame: V, dest: V) {
+    fn walk(ss: &mut Vec<LS>, frame: V, dest: V) {
+        let mut out = Vec::with_capacity(ss.len());
+        for s in ss.drain(..) {
+            match s {
+                LS::RegionEnter { region, saved } if region == frame => {
+                    let _ = dest;
+                    out.push(LS::Set(saved, LE::Rt(Rt::RegionCur, vec![])));
+                    out.push(LS::Set(frame, LE::Var(saved)));
+                }
+                LS::RegionExit { region, .. } if region == frame => {}
+                LS::If(c, mut a, mut b) => {
+                    walk(&mut a, frame, dest);
+                    walk(&mut b, frame, dest);
+                    out.push(LS::If(c, a, b));
+                }
+                LS::Loop(l, mut b) => {
+                    walk(&mut b, frame, dest);
+                    out.push(LS::Loop(l, b));
+                }
+                o => out.push(o),
+            }
+        }
+        *ss = out;
+    }
+    walk(body, frame, dest);
+}
+
+/// Does anything in `ss` allocate (whatever region is current)?
+fn stmts_allocate(ss: &[LS], rets: &(std::collections::HashSet<String>, std::collections::HashSet<String>)) -> bool {
+    let alloc = |e: &LE| le_allocates(e, rets);
+    ss.iter().any(|s| match s {
+        LS::Set(_, e) | LS::Eval(e) | LS::Puts(e, _) | LS::Print(e) | LS::Lock(e) | LS::Unlock(e) => alloc(e),
+        LS::SetIndex { idx, val, .. } => alloc(idx) || alloc(val),
+        LS::If(c, a, b) => alloc(c) || stmts_allocate(a, rets) || stmts_allocate(b, rets),
+        LS::Loop(_, b) => stmts_allocate(b, rets),
+        LS::Break(_) | LS::Continue(_) => false,
+        _ => true,
+    })
+}
+
+/// `RegionUse` ... `RegionRestore` with nothing allocated in between (a
+/// value built in place, say) switches regions for nothing: dropped.
+fn drop_idle_switches(ss: &mut Vec<LS>, rets: &(std::collections::HashSet<String>, std::collections::HashSet<String>)) {
+    for s in ss.iter_mut() {
+        match s {
+            LS::If(_, a, b) => {
+                drop_idle_switches(a, rets);
+                drop_idle_switches(b, rets);
+            }
+            LS::Loop(_, b) => drop_idle_switches(b, rets),
+            _ => {}
+        }
+    }
+    let mut i = 0;
+    while i < ss.len() {
+        if let LS::RegionUse { region, saved } = &ss[i] {
+            let saved = *saved;
+            let pure_region = !matches!(region, LE::Call(..) | LE::Rt(..));
+            if let Some(j) = ss[i + 1..].iter().position(|t| matches!(t, LS::RegionRestore(v) if *v == saved)).map(|k| i + 1 + k) {
+                let rest = format!("{:?}", &ss[j + 1..]);
+                let used_later = rest.contains(&format!("RegionRestore({saved})")) || rest.contains(&format!("Var({saved})"));
+                if pure_region && !used_later && !stmts_allocate(&ss[i + 1..j], rets) {
+                    ss.remove(j);
+                    ss.remove(i);
+                    continue;
+                }
+            }
+        }
+        i += 1;
+    }
+}
+
+/// Can loop iteration region `r` be a mark/reset on the region current at
+/// the loop instead of a region of its own? Only if, while it's open, every
+/// allocation goes to it (none while some other existing region is made
+/// current) and no call could store into a container through its arguments.
+fn iter_light_ok(body: &[LS], r: V, rets: &(std::collections::HashSet<String>, std::collections::HashSet<String>), storage_params: &std::collections::HashSet<String>) -> bool {
+    #[derive(Clone, Copy, PartialEq)]
+    enum St {
+        Closed,
+        Mine,
+        Fresh,
+        Other,
+    }
+    fn calls_storing(e: &LE, sp: &std::collections::HashSet<String>) -> bool {
+        let mut hit = false;
+        visit_le(e, &mut |x| {
+            if let LE::Call(n, _) = x {
+                if sp.contains(n) {
+                    hit = true;
+                }
+            }
+            if matches!(x, LE::Ffi(..)) {
+                hit = true;
+            }
+        });
+        hit
+    }
+    fn walk(ss: &[LS], st: &mut St, saved: &mut HashMap<V, St>, r: V, rets: &(std::collections::HashSet<String>, std::collections::HashSet<String>), sp: &std::collections::HashSet<String>) -> bool {
+        for s in ss {
+            let alloc = |e: &LE| le_allocates(e, rets);
+            let open = *st != St::Closed;
+            let bad = match s {
+                LS::RegionEnter { region, saved: sv } => {
+                    saved.insert(*sv, *st);
+                    *st = if *region == r { St::Mine } else if open { St::Fresh } else { St::Closed };
+                    false
+                }
+                LS::RegionExit { region, saved: sv } => {
+                    *st = if *region == r { St::Closed } else { saved.get(sv).copied().unwrap_or(St::Other) };
+                    false
+                }
+                LS::RegionUse { region, saved: sv } => {
+                    saved.insert(*sv, *st);
+                    if open {
+                        *st = if matches!(region, LE::Var(v) if *v == r) { St::Mine } else { St::Other };
+                    }
+                    false
+                }
+                LS::RegionRestore(sv) => {
+                    if open {
+                        *st = saved.get(sv).copied().unwrap_or(St::Other);
+                    }
+                    false
+                }
+                LS::If(c, a, b) => {
+                    if open && ((*st == St::Other && alloc(c)) || calls_storing(c, sp)) {
+                        return false;
+                    }
+                    let (mut sa, mut sb) = (*st, *st);
+                    if !walk(a, &mut sa, saved, r, rets, sp) || !walk(b, &mut sb, saved, r, rets, sp) {
+                        return false;
+                    }
+                    *st = if sa == sb { sa } else if sa == St::Closed || sb == St::Closed { St::Other } else { St::Other };
+                    false
+                }
+                LS::Loop(_, b) => {
+                    let mut c = *st;
+                    if !walk(b, &mut c, saved, r, rets, sp) {
+                        return false;
+                    }
+                    let mut c2 = if c == *st { c } else { St::Other };
+                    if *st != St::Closed && c2 == St::Other && *st == St::Closed {
+                        c2 = St::Other;
+                    }
+                    if !walk(b, &mut c2, saved, r, rets, sp) {
+                        return false;
+                    }
+                    *st = c2;
+                    false
+                }
+                _ if !open => false,
+                LS::Break(_) | LS::Continue(_) | LS::Panic(..) => false,
+                LS::Set(_, e) | LS::Eval(e) | LS::Return(Some(e)) | LS::Puts(e, _) | LS::Print(e) | LS::Die(e) | LS::PanicStr(e) | LS::Exit(e) => calls_storing(e, sp) || (*st == St::Other && alloc(e)),
+                LS::Return(None) => false,
+                LS::SetIndex { idx, val, .. } => calls_storing(idx, sp) || calls_storing(val, sp) || (*st == St::Other && (alloc(idx) || alloc(val))),
+                LS::Push(_, e) => calls_storing(e, sp) || *st == St::Other,
+                _ => true,
+            };
+            if bad {
+                return false;
+            }
+        }
+        true
+    }
+    let mut st = St::Closed;
+    walk(body, &mut st, &mut HashMap::new(), r, rets, storage_params)
+}
+
+fn visit_le(e: &LE, f: &mut dyn FnMut(&LE)) {
+    f(e);
+    match e {
+        LE::Tup(_, xs) | LE::Prim(_, xs) | LE::Call(_, xs) | LE::Ffi(_, xs) | LE::Rt(_, xs) | LE::ArrLit(_, xs) | LE::GenNew(_, xs) => xs.iter().for_each(|x| visit_le(x, f)),
+        LE::Field(x, _) | LE::Neg(x, _) | LE::FNeg(x) | LE::Not(x) | LE::Len(x) | LE::RangeField(x, _) | LE::ChanLen(x) | LE::AtomicLoad(x) | LE::RegionOf(x) | LE::RegionBytes(x) | LE::RegionNew(x) | LE::ToP(x) | LE::AtomicNew(x) | LE::ArrWithCap(_, x) | LE::ChanNew(_, x) => visit_le(x, f),
+        LE::Arith(_, a, b, _) | LE::Cmp(_, a, b, _) | LE::FArith(_, a, b) | LE::PArith(_, a, b) | LE::Range(a, b, _) | LE::AtomicRmw(_, a, b) | LE::ArrNew(_, a, b, _) => {
+            visit_le(a, f);
+            visit_le(b, f);
+        }
+        LE::Cond(a, b, c) | LE::Slice(_, a, b, c) | LE::AtomicCas(a, b, c) => {
+            visit_le(a, f);
+            visit_le(b, f);
+            visit_le(c, f);
+        }
+        LE::Index { arr, idx, .. } => {
+            visit_le(arr, f);
+            visit_le(idx, f);
+        }
+        _ => {}
+    }
+}
+
+/// Iteration region `r` becomes a mark (enter) and a reset (exit) on the
+/// region current at the loop; `r` itself names that region.
+fn light_iter(ss: &mut Vec<LS>, r: V, mark: V, larges: V) {
+    let mut out = Vec::with_capacity(ss.len());
+    for s in ss.drain(..) {
+        match s {
+            LS::RegionEnter { region, saved } if region == r => {
+                out.push(LS::Set(saved, LE::Rt(Rt::RegionCur, vec![])));
+                out.push(LS::Set(mark, LE::Rt(Rt::RegionMark, vec![])));
+                out.push(LS::Set(larges, LE::Rt(Rt::RegionMarkLarges, vec![])));
+                // (After the mark: on the program region it opens a region.)
+                out.push(LS::Set(r, LE::Rt(Rt::RegionCur, vec![])));
+            }
+            LS::RegionExit { region, .. } if region == r => {
+                out.push(LS::Eval(LE::Rt(Rt::RegionReset, vec![LE::Var(mark), LE::Var(larges)])));
+            }
+            LS::If(c, mut a, mut b) => {
+                light_iter(&mut a, r, mark, larges);
+                light_iter(&mut b, r, mark, larges);
+                out.push(LS::If(c, a, b));
+            }
+            LS::Loop(l, mut b) => {
+                light_iter(&mut b, r, mark, larges);
+                out.push(LS::Loop(l, b));
+            }
+            o => out.push(o),
+        }
+    }
+    *ss = out;
 }

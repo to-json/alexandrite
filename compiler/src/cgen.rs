@@ -858,6 +858,7 @@ impl FnEmit<'_> {
                     Rt::FFmtE => s("alx_f_fmt_e"),
                     Rt::StrPad => s("alx_str_pad"),
                     Rt::StrQuote => s("alx_str_quote"),
+                    Rt::StrCat if a.len() == 2 => format!("alx_str_cat2({}, {})", a[0], a[1]),
                     Rt::StrCat => format!("alx_str_cat({}, (AlxStr[]){{{}}})", a.len(), a.join(", ")),
                     Rt::U64ToS => s("alx_u64_to_s"),
                     Rt::IntFmt => s("alx_int_fmt"),

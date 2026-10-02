@@ -17,6 +17,10 @@ const outputPanel = $('outputPanel');
 
 let current = EXAMPLES.find((e) => e.id === DEFAULT) ?? EXAMPLES[0];
 
+// ── Hue ──
+
+$('hue').oninput = (e) => document.documentElement.style.setProperty('--hue', e.target.value);
+
 // ── Examples ──
 
 for (const group of [...new Set(EXAMPLES.map((e) => e.group))]) {

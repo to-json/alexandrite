@@ -30,7 +30,6 @@ typedef struct AlxGen { bool (*next)(struct AlxGen *self, void *out); } AlxGen;
  * in the current region. The current region's bump cursor lives in the
  * thread-locals below (saved into the region struct when it is switched
  * out), so the fast path is a bump. Handles are thread-local. */
-extern _Thread_local char *alx_bump_cur, *alx_bump_end;
 typedef struct AlxBlk { struct AlxBlk *next; size_t size; } AlxBlk;
 typedef struct AlxRegion AlxRegion;
 struct AlxRegion {
@@ -41,7 +40,26 @@ struct AlxRegion {
     size_t counted;        /* bytes used in older chunks + large blocks */
     AlxRegion *parent, *child, *sib, *sib_prev;   /* child regions (R3) */
 };
-extern _Thread_local AlxRegion *alx_tl_cur;    /* NULL = the program region */
+/* The hot thread-locals, in one struct: on macOS every thread-local costs
+ * an address lookup per function that uses it, so they share one. */
+struct AlxTls {
+    char *bump_cur, *bump_end;  /* the current region's bump cursor */
+    AlxRegion *cur;             /* the current region; NULL = the program region */
+    AlxRegion *pool;            /* spare region structs (some keep a chunk) */
+    int ncached;                /* how many of them kept a chunk */
+    const char *last_cat;       /* end of the last alx_str_cat result */
+    uintptr_t last_g;           /* alx_region_of's last granule (0: none) */
+    AlxRegion *last_r;          /* ... and its region */
+    AlxRegion prog;             /* this thread's program region */
+};
+extern _Thread_local struct AlxTls alx_tls;
+#define alx_bump_cur (alx_tls.bump_cur)
+#define alx_bump_end (alx_tls.bump_end)
+#define alx_tl_cur (alx_tls.cur)
+#define alx_tl_pool (alx_tls.pool)
+#define alx_tl_ncached (alx_tls.ncached)
+#define alx_last_cat (alx_tls.last_cat)
+#define alx_tl_prog (alx_tls.prog)
 enum { ALX_CHUNK_BYTES = 1 << 20 };
 extern bool alx_counting;
 extern size_t alx_allocs;
@@ -58,10 +76,11 @@ static inline void *alx_alloc(size_t bytes) {
 }
 void alx_init(void);
 
-AlxRegion *alx_region_program(void);         /* this thread's program region */
-AlxRegion *alx_region_cur(void);             /* the current region */
-AlxRegion *alx_region_enter(void);           /* fresh empty region, made current */
-void alx_region_exit(AlxRegion *r, AlxRegion *saved); /* free r; make saved current */
+static inline AlxRegion *alx_region_program(void) { return &alx_tl_prog; }
+/* the current region */
+static inline AlxRegion *alx_region_cur(void) { return alx_tl_cur ? alx_tl_cur : &alx_tl_prog; }
+AlxRegion *alx_region_enter_slow(void);
+void alx_region_exit_slow(AlxRegion *r, AlxRegion *saved);
 /* A mark in the current region, and rolling it back (freeing what was
  * allocated in it since): the frame of a call that allocates only for itself.
  * The mark is the bump position (or a tagged region of its own, in the
@@ -76,13 +95,68 @@ AlxRegion *alx_region_new_child(AlxRegion *parent);
  * parent. r must not be current (nor the program region). */
 void alx_region_free(AlxRegion *r);
 /* Bytes allocated in r so far (chunk bytes in use + large blocks); O(1). */
-int64_t alx_region_bytes(AlxRegion *r);
-AlxRegion *alx_region_use(AlxRegion *r);     /* make r current; returns previous */
-void alx_region_set(AlxRegion *r);           /* make r current */
+/* Bytes allocated in r (what compaction compares against). */
+static inline int64_t alx_region_bytes(AlxRegion *r) {
+    if (!r->cbase) return (int64_t)r->counted;
+    char *cur = r == alx_region_cur() ? alx_bump_cur : r->cur;
+    return (int64_t)(r->counted + (size_t)(cur - r->cbase));
+}
+/* make r current */
+static inline void alx_region_set(AlxRegion *r) {
+    AlxRegion *c = alx_region_cur();
+    if (c == r) return;
+    c->cur = alx_bump_cur; c->end = alx_bump_end;
+    alx_bump_cur = r->cur; alx_bump_end = r->end;
+    alx_tl_cur = r;
+}
+/* make r current; returns previous */
+static inline AlxRegion *alx_region_use(AlxRegion *r) {
+    AlxRegion *p = alx_region_cur();
+    alx_region_set(r);
+    return p;
+}
+/* Region structs freed with their one chunk wait here for the next enter. */
+enum { ALX_CACHED_CAP = 8 };
+/* A fresh empty region, made current. The common case (a pooled struct that
+ * kept its chunk) is inline. */
+static inline AlxRegion *alx_region_enter(void) {
+    AlxRegion *r = alx_tl_pool;
+    if (__builtin_expect(r && r->chunks, 1)) {
+        alx_tl_pool = r->pool_next;
+        alx_tl_ncached--;
+        r->cbase = (char *)r->chunks + 16;
+        r->cur = r->cbase;
+        r->end = (char *)r->chunks + ALX_CHUNK_BYTES;
+        r->larges = NULL; r->pool_next = NULL; r->counted = 0;
+        r->parent = r->child = r->sib = r->sib_prev = NULL;
+        alx_region_set(r);
+        return r;
+    }
+    return alx_region_enter_slow();
+}
+/* Free r (everything in it); make saved current. Inline when r is current
+ * and holds one chunk and nothing else: the struct keeps it, pooled. */
+static inline void alx_region_exit(AlxRegion *r, AlxRegion *saved) {
+    if (__builtin_expect(alx_region_cur() == r && r != saved && !r->child && !r->parent && !r->larges && r->chunks && !r->chunks->next && alx_tl_ncached < ALX_CACHED_CAP, 1)) {
+        alx_bump_cur = saved->cur; alx_bump_end = saved->end;
+        alx_tl_cur = saved;
+        alx_tl_ncached++;
+        r->pool_next = alx_tl_pool; alx_tl_pool = r;
+        return;
+    }
+    alx_region_exit_slow(r, saved);
+}
 /* The region of this thread whose chunk or large block contains p (interior
  * pointers included); else (NULL, literals, stack, malloc, other threads) the
  * program region. O(1) expected. */
-AlxRegion *alx_region_of(const void *p);
+AlxRegion *alx_region_of_slow(const void *p);
+/* The region holding p (the program region if none): the last answer is
+ * kept for its 1 MB granule. */
+static inline AlxRegion *alx_region_of(const void *p) {
+    uintptr_t g = (uintptr_t)p >> 20;
+    if (g && g == alx_tls.last_g) return alx_tls.last_r;  /* (granule 0 is never a region's) */
+    return alx_region_of_slow(p);
+}
 /* Stats (all threads): bytes held in chunks/large blocks, live regions + free lists. */
 size_t alx_mem_held(void);
 size_t alx_mem_peak(void);
@@ -179,7 +253,18 @@ ALX_ARR(bool, Arr_Bool)
 /* ---------- strings ---------- */
 static inline AlxStr alx_str_lit(const char *p, int64_t n) { AlxStr s = { p, n }; return s; }
 AlxStr alx_str_rev(AlxStr s);
-bool alx_str_eq(AlxStr a, AlxStr b);
+bool alx_str_eq_slow(AlxStr a, AlxStr b);
+/* Short strings (map keys, words) compare inline. */
+static inline bool alx_str_eq(AlxStr a, AlxStr b) {
+    if (a.len != b.len) return false;
+    if (a.ptr == b.ptr || a.len == 0) return true;
+    if (a.len <= 16) {
+        for (int64_t i = 0; i < a.len; i++)
+            if (a.ptr[i] != b.ptr[i]) return false;
+        return true;
+    }
+    return alx_str_eq_slow(a, b);
+}
 static inline AlxStr alx_int_to_s(int64_t v) {
     char buf[24], *e = buf + sizeof buf, *q = e;
     uint64_t u = v < 0 ? -(uint64_t)v : (uint64_t)v;
@@ -309,6 +394,27 @@ static inline int64_t alx_f_bits(double x) { int64_t b; memcpy(&b, &x, 8); retur
 static inline double alx_f_from_bits(int64_t b) { double x; memcpy(&x, &b, 8); return x; }
 void alx_puts_f64(double x);
 AlxStr alx_str_cat(int64_t n, const AlxStr *parts);
+/* a + b; appends in place when a is the last concatenation and ends at the
+ * bump pointer (see alx_str_cat). */
+static inline AlxStr alx_str_cat2(AlxStr a, AlxStr b) {
+    /* Strings are immutable: "" + b is b. (A copy is a one-part alx_str_cat.) */
+    if (a.len == 0) return b;
+    if (b.len == 0) return a;
+    if (a.len > 0 && a.ptr + a.len == alx_last_cat && b.len <= 64) {
+        char *f = (char *)a.ptr, *top = alx_bump_cur;
+        size_t len = (size_t)(a.len + b.len);
+        size_t had = ((size_t)a.len + 15) & ~(size_t)15, need = (len + 15) & ~(size_t)15;
+        if (f + had == top && (size_t)(alx_bump_end - f) >= need) {
+            alx_bump_cur = f + need;
+            for (int64_t k = 0; k < b.len; k++) f[a.len + k] = b.ptr[k];
+            alx_last_cat = f + len;
+            AlxStr s = { f, (int64_t)len };
+            return s;
+        }
+    }
+    AlxStr parts[2] = { a, b };
+    return alx_str_cat(2, parts);
+}
 
 /* ---------- sized integers ---------- */
 AlxStr alx_u64_to_s(int64_t bits);

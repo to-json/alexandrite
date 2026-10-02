@@ -22,12 +22,23 @@ const PE = [
 ];
 const BENCHMARKS = [
   ['nbody', 'n-body', 'The Benchmarks Game classic: structs, Floats, 1,000,000 steps of a 5-body orbit.'],
+  ['bintrees', 'binary trees', 'Another Benchmarks Game classic: @Node handles into pools, short-lived trees freed a pool at a time.'],
+  ['wordfreq', 'word frequencies', 'A Map[Str, Int] over 1,000,000 words.'],
+  ['strchurn', 'string churn', '200,000 interpolated lines built, joined and split again.'],
 ];
 const TOUR = [
   ['ints', 'numbers', 'Go\'s integer types, exact constants, bit operations.'],
   ['syntax', 'everyday syntax', 'for-in, case, if expressions, interpolation, defer.'],
   ['collections', 'collections', 'Slices and fixed arrays, byte strings, ordered maps, T?.'],
   ['types', 'types', 'Methods, operators, enums, interfaces, generics, lambdas.'],
+  ['tuples', 'tuples', 'Multiple results as values.'],
+  ['closures', 'closures', 'Lambdas capture variables, not copies.'],
+  ['funcvalues', 'function values', 'Named defs and blocks where a function is wanted.'],
+  ['pools', 'pools', 'Recursive data through @T handles: a binary search tree.'],
+  ['fmt', 'fmt', 'Go\'s format verbs, flags, widths, errorf.'],
+  ['math', 'math', 'The math package.'],
+  ['jsondemo', 'json', 'encoding/json on compile-time derives: no reflection.'],
+  ['pure', 'purity', 'Pure code is proven safe or explicitly fallible.'],
   ['errors', 'errors', '`error` types, `fail`, `~` propagation, declared error sets, Results.'],
   ['packages', 'packages', 'Directory packages (bundled under pkgs/), `pub`, refinements across packages.'],
   ['refinements', 'refinements', 'Methods on existing types, active only under `using`.'],
@@ -36,6 +47,7 @@ const MISTAKES = [
   ['pe001.typo', 'a typo', 'Did-you-mean suggestions name the line and column.'],
   ['pe004.bad', 'a type error', '`palindrome?` takes an Int, not a Str.'],
   ['pe014.bad1', 'I/O in a #[pure] function', 'Purity is checked: pure functions can run in parallel.'],
+  ['jsondemo.bad1', 'an underivable field', '#[derive(Json)] needs every field type to derive Json too.'],
   ['pe014.bad2', 'unproven arithmetic', 'A #[pure] function must prove 3 * n + 1 fits in 64 bits, or check it with `~(...)`.'],
   ['pe020.bad', 'overflow at run time', 'Without #![overflow(promote)], 100! overflows 64 bits: a panic naming the line.'],
 ];

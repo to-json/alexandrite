@@ -229,6 +229,10 @@ impl<'a> Graph<'a> {
                 let avs: Vec<Node> = per_arg.iter().flatten().copied().collect();
                 match m {
                     // Stored where it outlives the call.
+                    // A call through a function value whose lambdas all keep
+                    // their parameters to themselves: the arguments stay put
+                    // (the result may still be one of them, below).
+                    M::FnCall if recv.as_ref().is_some_and(|r| clean_fn(&r.ty)) => {}
                     M::ChanSend | M::Yield | M::Spawn | M::EnumNew | M::FnCall | M::Pmap => {
                         self.flow(&rv, &[Node::Global]);
                         self.flow(&avs, &[Node::Global]);
@@ -266,7 +270,14 @@ impl<'a> Graph<'a> {
                     // lives as long as the receiver.
                     M::Push | M::MapSet | M::MapDel | M::CopyInto | M::PoolAdd | M::PoolSet | M::PoolRemove => {
                         self.mutations.push((rv.clone(), self.loops.clone()));
-                        let mut stored = avs.clone();
+                        // A Str map key is copied when it's inserted, and a
+                        // deleted key isn't kept: only the value is stored.
+                        let key_copied = match m {
+                            M::MapDel => true,
+                            M::MapSet => args.first().is_some_and(|a| a.ty == Ty::Str),
+                            _ => false,
+                        };
+                        let mut stored: Vec<Node> = if key_copied { per_arg.iter().skip(1).flatten().copied().collect() } else { avs.clone() };
                         stored.push(site(e));
                         self.flow(&stored, &rv);
                         if *m == M::CopyInto && per_arg.len() >= 2 {
@@ -540,7 +551,62 @@ pub fn aliases(p: &TProgram) -> Vec<HashMap<LocalId, (Vec<LocalId>, Vec<LocalId>
         .collect()
 }
 
+thread_local! {
+    /// Function types (by Debug text) whose every lambda keeps its
+    /// parameters to itself: nothing they're given escapes the call.
+    static CLEAN_FNS: std::cell::RefCell<std::collections::HashSet<String>> = std::cell::RefCell::new(Default::default());
+}
+
+fn clean_fn(t: &Ty) -> bool {
+    CLEAN_FNS.with(|c| c.borrow().contains(&format!("{t:?}")))
+}
+
+/// The function types all of whose lambdas' parameters reach only the
+/// lambda's own locals (not the program region, a return, a caller or a
+/// captured variable).
+fn clean_fn_types(p: &TProgram, sums: &[Summary]) -> std::collections::HashSet<String> {
+    let mut dirty: std::collections::HashSet<String> = Default::default();
+    let mut all: std::collections::HashSet<String> = Default::default();
+    for f in p.funcs.iter().filter(|f| !f.external) {
+        if f.lambdas.is_empty() {
+            continue;
+        }
+        let g = graph(f, sums, &p.ifaces);
+        for (lo, ty, _) in &f.lambdas {
+            let key = format!("{ty:?}");
+            all.insert(key.clone());
+            let Some((_, params, (own_lo, own_hi))) = f.lambda_info.iter().find(|(l, _, _)| l == lo) else {
+                dirty.insert(key);
+                continue;
+            };
+            let escapes = params.iter().any(|pl| {
+                reaches_from(&g, Node::Local(*pl)).iter().any(|n| match n {
+                    Node::Local(x) => *x < *own_lo || *x >= *own_hi,
+                    Node::Global | Node::Ret | Node::Caller(_) => true,
+                    _ => false,
+                })
+            });
+            if escapes {
+                dirty.insert(key);
+            }
+        }
+    }
+    all.retain(|k| !dirty.contains(k));
+    all
+}
+
 fn summaries(p: &TProgram) -> Vec<Summary> {
+    CLEAN_FNS.with(|c| c.borrow_mut().clear());
+    let first = summaries_with(p);
+    let clean = clean_fn_types(p, &first);
+    if clean.is_empty() {
+        return first;
+    }
+    CLEAN_FNS.with(|c| *c.borrow_mut() = clean);
+    summaries_with(p)
+}
+
+fn summaries_with(p: &TProgram) -> Vec<Summary> {
     // Summaries to a fixpoint, starting from "nothing flows anywhere".
     let mut sums: Vec<Summary> = p
         .funcs

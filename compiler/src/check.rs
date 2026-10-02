@@ -728,6 +728,7 @@ impl<'a> World<'a> {
                 ffi: ext.ffi.then(|| ext.symbol.clone()),
                 is_main: false,
                 lambdas: vec![],
+                lambda_info: vec![],
                 errs: if ext.fallible { vec!["Error".into()] } else { vec![] },
             };
             self.funcs[id] = Some(f);
@@ -1166,6 +1167,7 @@ struct FnCx<'w, 'a> {
     cells: Option<Vec<(LocalId, Ty)>>,
     /// Lambda literals checked so far: (block span start, fn type, captures).
     lambdas: Vec<(u32, Ty, Vec<LocalId>)>,
+    lambda_info: Vec<(u32, Vec<LocalId>, (usize, usize))>,
     /// The type the expression being checked is wanted as (for inferring
     /// a generic constructor's type arguments).
     want_hint: Option<Ty>,
@@ -1230,6 +1232,7 @@ impl<'w, 'a> FnCx<'w, 'a> {
             lock_floor: None,
             cells: None,
             lambdas: vec![],
+            lambda_info: vec![],
             method: def.filter(|d| d.params.first().is_some_and(|p| p.name == "self")).map(|d| d.name.ends_with('!')),
             block_unused: false,
             is_main: def.is_none(),
@@ -1476,6 +1479,7 @@ impl<'w, 'a> FnCx<'w, 'a> {
         }
         Ok(TFunc {
             lambdas,
+            lambda_info: self.lambda_info.clone(),
             errs,
             cname: String::new(),
             src_name: self.fn_name.clone(),
@@ -2998,6 +3002,9 @@ impl<'w, 'a> FnCx<'w, 'a> {
         let lo = blk.span.lo;
         self.lambdas.retain(|(l, _, _)| *l != lo);
         self.lambdas.push((lo, ty.clone(), caps.clone()));
+        self.lambda_info.retain(|(l, _, _)| *l != lo);
+        let own_lo = tb.own.0.min(tb.params.iter().copied().min().unwrap_or(tb.own.0));
+        self.lambda_info.push((lo, tb.params.clone(), (own_lo, tb.own.1)));
         let cap_es = caps.iter().map(|l| self.mk(TK::Local(*l), self.locals[*l].ty.clone(), sp)).collect();
         Ok(self.mk(TK::M(M::Lambda, None, cap_es, Some(Box::new(tb))), ty, sp))
     }

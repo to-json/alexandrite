@@ -131,3 +131,23 @@ The logic: **fallibility is a prefix** ("approximately do this", "you'll probabl
 | D29 | Warnings | unused locals (assigned, never read) and unused imports; `_` / `_name` silences; `--strict` and `alx test` make them errors (Go's compile errors, softened per P3) | M8 |
 | D30 | `alx fmt` | token-based and meaning-preserving (re-lexed and compared on every run): 2-space indent by bracket nesting, Go-ish operator spacing, at most one blank line, line breaks never added or removed, trailing comments aligned in runs (gofmt). No options | M8 |
 | D31 | `alx test` | `*_test.alx` in a package's directory, compiled with the package (tests see private names); `test "name" { }`, `bench "name" { }` (with `-bench`), `example "name" { } outputs "text"`; `assert cond`, `assert_eq got, want`; each test runs as its own task, so one failure or panic doesn't stop the run; Go-style output and exit status | M8 |
+
+## Memory model and the next push (user, 2026-10-01)
+
+| # | Question | Decision |
+|---|---|---|
+| R1 | Reclamation | **hybrid: regions by default, refcounts for escapees.** Scope-, iteration-, task- and request-shaped values live in regions freed at once; values the compiler can't place (stored into long-lived churning containers, unknown lifetimes) are refcounted instead of rejected |
+| R2 | Ownership in source | **invisible unless ambiguous**: moves, copies and regions are inferred; you write something only to override or when the compiler can't decide |
+| R3 | Recursive / graph data | **`@T` handles into pools** (DESIGN.md's identity model); dangling use is a compile error |
+| R4 | Shared mutable state | **channels + `Mutex[T]` / `Atomic[T]` owning their data**; unsynchronized sharing across tasks is a compile error |
+| R5 | Captures | **Go-like: by reference, checked**; escaping lambdas keep captures alive (region extended or refcounted); `spawn` bodies still move/copy (task boundary). Replaces D16 |
+| R6 | Slice aliasing | **keep Go sharing (C1)**; regions/refcounts keep backing arrays alive while any alias lives |
+| R7 | Pointer receivers | **`!` methods through interfaces** (the interface value is a place, written back) |
+| R8 | Reporting | **silent, plus `alx explain mem`** showing each allocation's region or refcount and why; a lint for refcounting in hot loops |
+| R9 | Order | **memory model first**, then the standard library |
+| R10 | Backends | **alx's own checker enforces the model**; C + JIT stay primary; Rust stays the oracle (with the model expressed as safe Rust) |
+| S1 | Stdlib first wave | **text & data core**: strings, strconv, unicode/utf8, bytes, slices/maps/sort, math, fmt, errors |
+| S2 | API shape | **Go names (snake_case), alx idioms**: `~T` for (T, error), `T?` for (T, bool), Enumerable, method sugar alongside package functions |
+| S3 | Reflection | **compile-time derives** (`#[derive(Json)]`), no runtime type info |
+| S4 | I/O model (server wave) | **M:N tasks + event loop**, blocking-looking I/O that parks the task; no user-visible async |
+| P8 | Process | same as the Go-parity push: a doc per milestone on the notebook, Sonnet agents for self-contained pieces, go until done. D5–D31 all kept |

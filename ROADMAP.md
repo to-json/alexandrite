@@ -18,3 +18,19 @@ Every decision these milestones implement is in `GO-VS-RUBY.md`. Each milestone 
 **Status (2026-10-01): all eight milestones are done** — see `docs/milestones/` and the notebook. Next: the memory model (pools, the move/region checker), then porting Go's standard library.
 
 Order is by dependency: numbers and syntax first (small, everything uses them), then collections (C1 changes array semantics under everything), then types, errors (which use enums and interfaces), packages, concurrency (which uses all of it) and tooling.
+
+# Next: the memory model, then the standard library
+
+Decisions R1–R10 and S1–S4 in `GO-VS-RUBY.md`.
+
+| # | Milestone | Contents |
+|---|---|---|
+| R1 | **Scoped regions** | runtime regions (chunked arenas, per thread); escape analysis; allocations that can't outlive a function call or a loop iteration go in that scope's region and are freed when it ends; everything else stays in the program region (today's behavior). Bounded memory for loops and call-heavy code |
+| R2 | **Returns and placement** | escaping values are placed in the region they escape to (region parameters: a function allocates its result in the caller's region); fewer values reach the program region |
+| R3 | **Refcounts for escapees** | values stored into long-lived containers and fields are refcounted: replacing or deleting them frees them (Map, slice elements, struct fields); long-running loops with caches stay bounded |
+| R4 | **Captures, receivers, pools** | captures by reference (R5); `!` methods through interfaces (R7); `@T` handles and pools for recursive and graph data (R3) |
+| R5 | **Sharing** | `Mutex[T]`, `Atomic[T]`; moves into `spawn` and channels; unsynchronized sharing is a compile error |
+| R6 | **Explain** | `alx explain mem`: each allocation's region or refcount and why; the hot-loop refcount lint |
+| L1 | **Text & data core** | strings, strconv, unicode/utf8, bytes, slices, maps, sort, math, fmt, errors — Go's APIs, alx idioms (S2) |
+| L2 | **Systems core** | os, io, bufio, path/filepath, time, flag; FFI to libc |
+| L3 | **Server core** | M:N scheduler + event loop (S4), net, net/http, context, sync, encoding/json via derives (S3) |

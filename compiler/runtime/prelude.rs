@@ -1407,6 +1407,10 @@ mod rt {
             self.to_string().bytes().rev().map(|b| PInt::from_i64((b - b'0') as i64)).collect()
         }
         pub fn div(&self, o: &PInt, loc: &str) -> PInt {
+            // A divisor of ±1 is exact at any size (MIN / -1 promotes).
+            if o.mag == [1] {
+                return PInt { neg: (self.neg != o.neg) && !self.mag.is_empty(), mag: self.mag.clone() };
+            }
             PInt::from_i64(div(self.to_i64(loc), o.to_i64(loc), loc))
         }
         pub fn rem(&self, o: &PInt, loc: &str) -> PInt {

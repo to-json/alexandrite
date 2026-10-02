@@ -1715,7 +1715,7 @@ impl<'a> Lw<'a> {
         let k = a.ty.int_kind().unwrap_or(IntKind::I64);
         if at == LTy::PInt {
             if op.is_arith() || is_cmp(op) {
-                return LE::PArith(lop, Box::new(av), Box::new(bv));
+                return self.parith(op, av, bv, e.span);
             }
             // Bit operations on a promoted Int work on its 64-bit value.
             let (x, y) = (self.int_in(av, a.span), self.int_in_t(bv, &b.ty, b.span));
@@ -1769,7 +1769,9 @@ impl<'a> Lw<'a> {
                 wrap_to(k, LE::Arith(lop, Box::new(a), Box::new(b), Ovf::Wrap))
             }
             BinOp::Add | BinOp::Sub | BinOp::Mul if wrap_mode => wrap_to(k, LE::Arith(lop, Box::new(a), Box::new(b), Ovf::Wrap)),
-            _ if k == IntKind::I64 => {
+            // Under `~`, Div and Rem take the checked path below (zero
+            // divisor, MIN / -1); checked_arith only knows Add/Sub/Mul.
+            _ if k == IntKind::I64 && !(self.try_arith && matches!(op, BinOp::Div | BinOp::Rem)) => {
                 if self.try_arith {
                     return self.checked_arith(lop, a, b, sp);
                 }
@@ -1811,6 +1813,17 @@ impl<'a> Lw<'a> {
                 }
                 if k == IntKind::U64 {
                     return LE::Prim(if op == BinOp::Div { Prim::UDiv } else { Prim::URem }, vec![a, b]);
+                }
+                if k == IntKind::I64 && op == BinOp::Div {
+                    // Only reached under `~`. MIN / -1 doesn't fit in 64 bits:
+                    // an ArithError, or MIN in a wrap file (as Go).
+                    let eq = |x: LE, y: i64| LE::Cmp(Op::Eq, Box::new(x), Box::new(LE::I(y)), LTy::I64);
+                    let ovf = LE::Cmp(Op::And, Box::new(eq(a.clone(), i64::MIN)), Box::new(eq(b.clone(), -1)), LTy::Bool);
+                    if wrap_mode {
+                        return LE::Cond(Box::new(ovf), Box::new(LE::I(i64::MIN)), Box::new(LE::Arith(lop, Box::new(a), Box::new(b), Ovf::Unchecked)));
+                    }
+                    self.overflow_if(ovf, k, sp);
+                    return LE::Arith(lop, Box::new(a), Box::new(b), Ovf::Unchecked);
                 }
                 let r = self.tmp(LTy::I64);
                 self.emit(LS::Set(r, LE::Arith(lop, Box::new(a), Box::new(b), Ovf::Unchecked)));
@@ -1955,6 +1968,21 @@ impl<'a> Lw<'a> {
         val
     }
 
+    /// `a op b` on promoted Ints. Under `~`, a zero divisor is an
+    /// ArithError (nothing else can fail: there is no overflow).
+    fn parith(&mut self, op: BinOp, a: LE, b: LE, sp: Span) -> LE {
+        let lop = op_of(op);
+        if self.try_arith && matches!(op, BinOp::Div | BinOp::Rem) {
+            let a = self.bind(a, LTy::PInt);
+            let b = self.bind(b, LTy::PInt);
+            let zero = LE::PArith(Op::Eq, Box::new(b.clone()), Box::new(LE::ToP(Box::new(LE::I(0)))));
+            let err = self.make_error("ArithError", 1, vec![], sp);
+            self.fail_if(zero, err);
+            return LE::PArith(lop, Box::new(a), Box::new(b));
+        }
+        LE::PArith(lop, Box::new(a), Box::new(b))
+    }
+
     /// `a op b` on already-lowered operands of type `t`.
     fn arith_le(&mut self, op: crate::ast::BinOp, a: LE, b: LE, t: &LTy, sp: Span) -> LE {
         use crate::ast::BinOp as B;
@@ -1962,7 +1990,7 @@ impl<'a> Lw<'a> {
         let _ = B::Add;
         match t {
             LTy::F64 => LE::FArith(lop, Box::new(a), Box::new(b)),
-            LTy::PInt if op.is_arith() => LE::PArith(lop, Box::new(a), Box::new(b)),
+            LTy::PInt if op.is_arith() => self.parith(op, a, b, sp),
             LTy::PInt => {
                 let (x, y) = (self.int_in(a, sp), self.int_in(b, sp));
                 let r = self.int_op(op, IntKind::I64, IntKind::I64, x, y, sp, false);

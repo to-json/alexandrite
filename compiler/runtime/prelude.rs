@@ -50,17 +50,28 @@ mod rt {
         }
     }
 
-    pub fn panic(what: &str, loc: &str) -> ! {
+    thread_local! {
+        /// True on threads started by `task_spawn`.
+        static IN_TASK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+    /// A runtime failure. On the main thread: flush stdout, print `text` to
+    /// stderr and abort. On a task thread: print nothing and unwind with
+    /// `text` as the payload; `task_spawn` catches it and `Task::wait`
+    /// reports it as `Err(text)`.
+    pub fn fail(text: String) -> ! {
+        if IN_TASK.with(|t| t.get()) {
+            std::panic::resume_unwind(Box::new(text))
+        }
         use std::io::Write;
         let _ = std::io::stdout().flush();
-        eprintln!("alexandrite: {what} at {loc}");
+        eprintln!("{text}");
         std::process::abort()
     }
+    pub fn panic(what: &str, loc: &str) -> ! {
+        fail(format!("alexandrite: {what} at {loc}"))
+    }
     pub fn overflow(loc: &str) -> ! {
-        use std::io::Write;
-        let _ = std::io::stdout().flush();
-        eprintln!("alexandrite: overflow at {loc}\nhint: add `#![overflow(promote)]` to this file to promote to bignums");
-        std::process::abort()
+        fail(format!("alexandrite: overflow at {loc}\nhint: add `#![overflow(promote)]` to this file to promote to bignums"))
     }
     pub fn die_str(s: Str) -> ! {
         use std::io::Write;
@@ -452,6 +463,397 @@ mod rt {
             }
         });
         out
+    }
+
+    // ---------- tasks and channels ----------
+
+    use std::collections::VecDeque;
+    use std::sync::{Condvar, Mutex, MutexGuard};
+
+    fn lk<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+        m.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    struct TaskInner<T> {
+        res: Mutex<Option<Result<T, Str>>>,
+        cv: Condvar,
+    }
+    /// Handle to a spawned task; clones refer to the same task.
+    pub struct Task<T>(Arc<TaskInner<T>>);
+    impl<T> Clone for Task<T> {
+        fn clone(&self) -> Self {
+            Task(self.0.clone())
+        }
+    }
+    /// The zero value: a task that already failed ("wait on a task that was never started").
+    impl<T> Default for Task<T> {
+        fn default() -> Self {
+            Task(Arc::new(TaskInner {
+                res: Mutex::new(Some(Err(Str::lit(b"alexandrite: wait on a task that was never started")))),
+                cv: Condvar::new(),
+            }))
+        }
+    }
+    impl<T: Clone> Task<T> {
+        /// Block until the task finishes: Ok(result) or Err(panic message).
+        /// Repeatable.
+        pub fn wait(&self) -> Result<T, Str> {
+            let mut g = lk(&self.0.res);
+            loop {
+                if let Some(r) = &*g {
+                    return r.clone();
+                }
+                g = self.0.cv.wait(g).unwrap_or_else(|e| e.into_inner());
+            }
+        }
+    }
+
+    fn panic_text(p: Box<dyn std::any::Any + Send>) -> String {
+        match p.downcast::<String>() {
+            Ok(s) => *s,
+            Err(p) => match p.downcast::<&'static str>() {
+                Ok(s) => format!("alexandrite: internal error: {s}"),
+                Err(_) => "alexandrite: internal error".to_string(),
+            },
+        }
+    }
+
+    /// Run `f(env)` on a new thread. Alexandrite panics in the task unwind
+    /// quietly (see `fail`) and become the task's `Err`; Rust's own panic
+    /// message is suppressed on task threads by a hook installed once.
+    pub fn task_spawn<E: Send + 'static, T: Send + 'static>(f: fn(E) -> T, env: E) -> Task<T> {
+        static HOOK: std::sync::Once = std::sync::Once::new();
+        HOOK.call_once(|| {
+            let prev = std::panic::take_hook();
+            std::panic::set_hook(Box::new(move |info| {
+                if !IN_TASK.with(|t| t.get()) {
+                    prev(info)
+                }
+            }));
+        });
+        let inner = Arc::new(TaskInner { res: Mutex::new(None), cv: Condvar::new() });
+        let me = inner.clone();
+        std::thread::spawn(move || {
+            IN_TASK.with(|t| t.set(true));
+            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(env)));
+            let r = r.map_err(|p| Str::lit(panic_text(p).as_bytes()));
+            *lk(&me.res) = Some(r);
+            me.cv.notify_all();
+        });
+        Task(inner)
+    }
+
+    struct ChanState<T> {
+        buf: VecDeque<T>,
+        cap: usize,
+        closed: bool,
+        /// Receivers blocked in `recv` or in a blocking `select`.
+        recv_waiting: usize,
+        /// Values ever taken / ever deposited by an unbuffered send (tickets).
+        taken: u64,
+        deposited: u64,
+    }
+    struct ChanInner<T> {
+        st: Mutex<ChanState<T>>,
+        cv: Condvar,
+    }
+    /// Channel handle; clones refer to the same channel.
+    pub struct Chan<T>(Arc<ChanInner<T>>);
+    impl<T> Clone for Chan<T> {
+        fn clone(&self) -> Self {
+            Chan(self.0.clone())
+        }
+    }
+    /// The zero value: a closed, unbuffered channel (send panics, recv gives ok = false).
+    impl<T> Default for Chan<T> {
+        fn default() -> Self {
+            let c = Chan::new(0);
+            lk(&c.0.st).closed = true;
+            c
+        }
+    }
+
+    /// Every channel operation bumps this and wakes blocked selects.
+    static EPOCH: (Mutex<u64>, Condvar) = (Mutex::new(0), Condvar::new());
+    fn bump() {
+        *lk(&EPOCH.0) += 1;
+        EPOCH.1.notify_all();
+    }
+    fn epoch() -> u64 {
+        *lk(&EPOCH.0)
+    }
+    fn epoch_wait(seen: u64) {
+        let g = lk(&EPOCH.0);
+        if *g == seen {
+            // The timeout is a safety net, not the mechanism.
+            let _ = EPOCH.1.wait_timeout(g, std::time::Duration::from_millis(20));
+        }
+    }
+    fn closed_send() -> ! {
+        fail("alexandrite: send on a closed channel".to_string())
+    }
+
+    impl<T> Chan<T> {
+        pub fn new(cap: i64) -> Chan<T> {
+            Chan(Arc::new(ChanInner {
+                st: Mutex::new(ChanState { buf: VecDeque::new(), cap: cap.max(0) as usize, closed: false, recv_waiting: 0, taken: 0, deposited: 0 }),
+                cv: Condvar::new(),
+            }))
+        }
+        pub fn len(&self) -> i64 {
+            let g = lk(&self.0.st);
+            if g.cap == 0 { 0 } else { g.buf.len() as i64 }
+        }
+        pub fn close(&self, loc: &str) {
+            let mut g = lk(&self.0.st);
+            if g.closed {
+                drop(g);
+                panic("close of a closed channel", loc);
+            }
+            g.closed = true;
+            drop(g);
+            self.0.cv.notify_all();
+            bump();
+        }
+        /// After depositing into an unbuffered channel: wait until taken.
+        fn await_taken(&self, mut g: MutexGuard<'_, ChanState<T>>, ticket: u64) {
+            loop {
+                if g.taken > ticket {
+                    return;
+                }
+                if g.closed {
+                    // Undelivered: withdraw it and fail like Go's blocked sender.
+                    g.buf.clear();
+                    drop(g);
+                    closed_send();
+                }
+                g = self.0.cv.wait(g).unwrap_or_else(|e| e.into_inner());
+            }
+        }
+        pub fn send(&self, x: T, loc: &str) {
+            let mut g = lk(&self.0.st);
+            if g.cap == 0 {
+                loop {
+                    if g.closed {
+                        drop(g);
+                        panic("send on a closed channel", loc);
+                    }
+                    if g.buf.is_empty() {
+                        break;
+                    }
+                    g = self.0.cv.wait(g).unwrap_or_else(|e| e.into_inner());
+                }
+                g.buf.push_back(x);
+                let ticket = g.deposited;
+                g.deposited += 1;
+                self.0.cv.notify_all();
+                bump();
+                self.await_taken(g, ticket);
+            } else {
+                loop {
+                    if g.closed {
+                        drop(g);
+                        panic("send on a closed channel", loc);
+                    }
+                    if g.buf.len() < g.cap {
+                        break;
+                    }
+                    g = self.0.cv.wait(g).unwrap_or_else(|e| e.into_inner());
+                }
+                g.buf.push_back(x);
+                drop(g);
+                self.0.cv.notify_all();
+                bump();
+            }
+        }
+        /// Non-blocking send for `select`: Err(x) if not ready. (Unbuffered:
+        /// ready only when a receiver is waiting; then blocks until taken.)
+        fn try_send(&self, x: T) -> Result<(), T> {
+            let mut g = lk(&self.0.st);
+            if g.closed {
+                drop(g);
+                closed_send();
+            }
+            if g.cap == 0 {
+                if !(g.buf.is_empty() && g.recv_waiting > 0) {
+                    return Err(x);
+                }
+                g.buf.push_back(x);
+                let ticket = g.deposited;
+                g.deposited += 1;
+                self.0.cv.notify_all();
+                bump();
+                self.await_taken(g, ticket);
+            } else {
+                if g.buf.len() >= g.cap {
+                    return Err(x);
+                }
+                g.buf.push_back(x);
+                drop(g);
+                self.0.cv.notify_all();
+                bump();
+            }
+            Ok(())
+        }
+        fn pop(&self, g: &mut MutexGuard<'_, ChanState<T>>) -> Option<T> {
+            let x = g.buf.pop_front();
+            if x.is_some() {
+                g.taken += 1;
+            }
+            x
+        }
+        /// Blocking receive: Some(value), or None once closed and drained.
+        pub fn recv(&self) -> Option<T> {
+            let mut g = lk(&self.0.st);
+            let mut registered = false;
+            loop {
+                if let Some(x) = self.pop(&mut g) {
+                    if registered {
+                        g.recv_waiting -= 1;
+                    }
+                    drop(g);
+                    self.0.cv.notify_all();
+                    bump();
+                    return Some(x);
+                }
+                if g.closed {
+                    if registered {
+                        g.recv_waiting -= 1;
+                    }
+                    return None;
+                }
+                if !registered {
+                    registered = true;
+                    g.recv_waiting += 1;
+                    // Unbuffered senders in `select` poll recv_waiting.
+                    drop(g);
+                    bump();
+                    g = lk(&self.0.st);
+                    continue;
+                }
+                g = self.0.cv.wait(g).unwrap_or_else(|e| e.into_inner());
+            }
+        }
+        /// Non-blocking receive for `select`: Some(Some(v)) / Some(None) =
+        /// closed and drained / None = not ready.
+        fn try_recv(&self) -> Option<Option<T>> {
+            let mut g = lk(&self.0.st);
+            if let Some(x) = self.pop(&mut g) {
+                drop(g);
+                self.0.cv.notify_all();
+                bump();
+                return Some(Some(x));
+            }
+            if g.closed { Some(None) } else { None }
+        }
+        fn reg(&self, d: i64) {
+            let mut g = lk(&self.0.st);
+            g.recv_waiting = (g.recv_waiting as i64 + d) as usize;
+        }
+    }
+
+    /// One case of a `select`, type-erased.
+    pub trait SelCase {
+        /// Try to run the case; true if it ran.
+        fn try_run(&mut self) -> bool;
+        /// Register (+1) / deregister (-1) as a blocked receiver.
+        fn reg(&self, d: i64) {}
+    }
+    pub struct SelSend<T>(Chan<T>, Option<T>);
+    impl<T> SelSend<T> {
+        pub fn new(ch: Chan<T>, x: T) -> Self {
+            SelSend(ch, Some(x))
+        }
+    }
+    impl<T> SelCase for SelSend<T> {
+        fn try_run(&mut self) -> bool {
+            let x = self.1.take().unwrap();
+            match self.0.try_send(x) {
+                Ok(()) => true,
+                Err(x) => {
+                    self.1 = Some(x);
+                    false
+                }
+            }
+        }
+    }
+    pub struct SelRecv<T>(Chan<T>, Option<Option<T>>);
+    impl<T> SelRecv<T> {
+        pub fn new(ch: Chan<T>) -> Self {
+            SelRecv(ch, None)
+        }
+        /// Some(value), or None if the channel was closed and drained.
+        pub fn result(&mut self) -> Option<T> {
+            self.1.take().unwrap()
+        }
+    }
+    impl<T> SelCase for SelRecv<T> {
+        fn try_run(&mut self) -> bool {
+            match self.0.try_recv() {
+                Some(r) => {
+                    self.1 = Some(r);
+                    true
+                }
+                None => false,
+            }
+        }
+        fn reg(&self, d: i64) {
+            self.0.reg(d)
+        }
+    }
+
+    fn rand_u64() -> u64 {
+        use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+        static S: AtomicU64 = AtomicU64::new(0x9E37_79B9_7F4A_7C15);
+        let mut x = S.load(Relaxed);
+        loop {
+            let mut y = x;
+            y ^= y << 13;
+            y ^= y >> 7;
+            y ^= y << 17;
+            match S.compare_exchange_weak(x, y, Relaxed, Relaxed) {
+                Ok(_) => return y,
+                Err(c) => x = c,
+            }
+        }
+    }
+
+    /// Run one ready case (random among ready ones); returns its index, or
+    /// `cases.len()` if none was ready and `default` is set; else blocks.
+    pub fn select(cases: &mut [&mut dyn SelCase], default: bool) -> i64 {
+        let n = cases.len();
+        let mut order: Vec<usize> = (0..n).collect();
+        for i in (1..n).rev() {
+            order.swap(i, (rand_u64() % (i as u64 + 1)) as usize);
+        }
+        let mut registered = false;
+        loop {
+            let seen = epoch();
+            for &i in &order {
+                if cases[i].try_run() {
+                    if registered {
+                        for c in cases.iter() {
+                            c.reg(-1);
+                        }
+                    }
+                    return i as i64;
+                }
+            }
+            if default {
+                return n as i64;
+            }
+            if !registered {
+                // Announce ourselves as a receiver (unbuffered senders need
+                // one), wake pollers, and re-poll with a fresh snapshot.
+                registered = true;
+                for c in cases.iter() {
+                    c.reg(1);
+                }
+                bump();
+                continue;
+            }
+            epoch_wait(seen);
+        }
     }
 
     // ---------- bignums: sign + magnitude in base 1e9 ----------

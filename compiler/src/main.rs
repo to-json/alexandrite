@@ -5,7 +5,7 @@ pub use alx::{cgen, check, front, lir, lower, rgen, tast};
 
 use std::process::ExitCode;
 
-const USAGE: &str = "usage: alx run [--release] [--sanitize] [--expect VALUE] [--emit-c FILE] [--emit-rust FILE] [-v] file.alx
+const USAGE: &str = "usage: alx run [--release] [--sanitize] [--expect VALUE] [--emit-c FILE] [--emit-rust FILE] [-v] file.alx [--] [program args...]
        alx build [--release] [--sanitize] [-o OUT] file.alx
        alx check file.alx
        alx explain mem file.alx
@@ -61,6 +61,16 @@ fn main() -> ExitCode {
             "--emit-c" => o.emit_c = val(),
             "--emit-rust" => o.emit_rust = val(),
             "-o" => o.out = val(),
+            // `alx run file.alx a b`: after the file, `--` or the first
+            // argument that isn't one of alx's flags starts the program's own.
+            "--" if cmd == "run" && file.is_some() => {
+                o.args = args[i + 1..].to_vec();
+                break;
+            }
+            _ if cmd == "run" && file.is_some() => {
+                o.args = args[i..].to_vec();
+                break;
+            }
             f if !f.starts_with('-') => file = Some(f.to_string()),
             f => {
                 eprintln!("unknown flag `{f}`\n{USAGE}");

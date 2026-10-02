@@ -1569,6 +1569,15 @@ int64_t *alx_atomic_new(int64_t v) {
     return a;
 }
 
+/* ---------- the program's arguments (os.args) ---------- */
+
+static int g_argc;
+static char **g_argv;
+void alx_set_args(int argc, char **argv) { g_argc = argc; g_argv = argv; }
+int64_t alx_argc(void) { return g_argc; }
+/* NULL past the end. */
+const char *alx_argv(int64_t i) { return i >= 0 && i < g_argc ? g_argv[i] : NULL; }
+
 /* ---------- sleeping (time.sleep) ---------- */
 
 /* A task asleep parks on a deadline-ordered list; one timer thread wakes

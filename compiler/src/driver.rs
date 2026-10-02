@@ -24,6 +24,8 @@ pub struct Options {
     pub out: Option<String>,
     /// Warnings are errors.
     pub strict: bool,
+    /// The program's own arguments (`alx run file.alx a b`).
+    pub args: Vec<String>,
 }
 
 /// Print a program's warnings; under `--strict` they fail the build.
@@ -361,6 +363,8 @@ fn run_loaded(l: front::Loaded, o: &Options) -> ExitCode {
     let lp = lower::lower(&p, &l.sm, &lower::Opts { release: false });
     log(o, "jit");
     let Some(want) = &o.expect else {
+        let argv: Vec<String> = std::iter::once(l.sm.files[0].name.clone()).chain(o.args.iter().cloned()).collect();
+        crate::jit::set_args(&argv);
         return match crate::jit::run(&lp) {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {
@@ -420,12 +424,12 @@ pub fn run(file: &str, o: &Options) -> ExitCode {
     match &o.expect {
         None => {
             use std::os::unix::process::CommandExt;
-            let err = Command::new(&cwd_bin).exec();
+            let err = Command::new(&cwd_bin).args(&o.args).exec();
             eprintln!("alx: cannot run {}: {err}", bin.display());
             ExitCode::from(3)
         }
         Some(want) => {
-            let out = match Command::new(&cwd_bin).stderr(Stdio::inherit()).output() {
+            let out = match Command::new(&cwd_bin).args(&o.args).stderr(Stdio::inherit()).output() {
                 Ok(o) => o,
                 Err(e) => {
                     eprintln!("alx: cannot run {}: {e}", bin.display());

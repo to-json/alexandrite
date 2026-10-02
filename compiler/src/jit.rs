@@ -200,6 +200,21 @@ struct Decls<'p> {
     worker_out: HashMap<usize, LTy>,
 }
 
+unsafe extern "C" {
+    fn alx_set_args(argc: i32, argv: *const *const std::os::raw::c_char);
+}
+
+/// The program's arguments (argv[0] first), for `os.args`.
+pub fn set_args(args: &[String]) {
+    let cs: Vec<std::ffi::CString> = args.iter().map(|a| std::ffi::CString::new(a.as_str()).unwrap_or_default()).collect();
+    let ptrs: Vec<*const std::os::raw::c_char> = cs.iter().map(|c| c.as_ptr()).collect();
+    // The runtime keeps the pointers: leak them for the program's lifetime.
+    let n = ptrs.len() as i32;
+    let ptrs = Box::leak(ptrs.into_boxed_slice());
+    std::mem::forget(cs);
+    unsafe { alx_set_args(n, ptrs.as_ptr()) }
+}
+
 /// Compile the program and run it in this process. Returns only if the
 /// program finishes normally (panics abort; uncaught errors exit 1).
 pub fn run(p: &LProgram) -> Result<(), String> {

@@ -270,6 +270,9 @@ AlxStr alx_str_quote(AlxStr s);
 void alx_print_str(AlxStr s);
 /* Sleep: a task parks (its worker runs others); a plain thread sleeps. */
 void alx_sleep_ns(int64_t ns);
+void alx_set_args(int argc, char **argv);
+int64_t alx_argc(void);
+const char *alx_argv(int64_t i);
 int64_t alx_f_to_i(double x, const char *loc);
 static inline int64_t alx_f_bits(double x) { int64_t b; memcpy(&b, &x, 8); return b; }
 static inline double alx_f_from_bits(int64_t b) { double x; memcpy(&x, &b, 8); return x; }

@@ -127,7 +127,7 @@ pub fn emit(p: &LProgram) -> String {
     s.push('\n');
     s.push_str(&g.out);
     if !main.is_empty() {
-        let _ = writeln!(s, "int main(void) {{\n    alx_init();\n    {main}();\n    fflush(stdout);\n    return 0;\n}}");
+        let _ = writeln!(s, "int main(int argc, char **argv) {{\n    alx_set_args(argc, argv);\n    alx_init();\n    {main}();\n    fflush(stdout);\n    return 0;\n}}");
     }
     s
 }

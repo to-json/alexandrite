@@ -202,33 +202,11 @@ pub enum Step {
 }
 
 #[derive(Clone, Debug)]
-pub enum ErrPath {
-    /// In a fallible function: return the error. The statements are the
-    /// deferred code of every enclosing block, run first.
-    Return(Vec<LS>),
-    /// At the top level: print the error and exit 1 (after the deferred code).
-    Die(Vec<LS>),
-}
-
-impl ErrPath {
-    pub fn cleanup(&self) -> &[LS] {
-        match self {
-            ErrPath::Return(c) | ErrPath::Die(c) => c,
-        }
-    }
-    pub fn is_return(&self) -> bool {
-        matches!(self, ErrPath::Return(_))
-    }
-}
-
-#[derive(Clone, Debug)]
 pub enum LS {
     Set(V, LE),
     SetIndex { arr: V, idx: LE, val: LE, check: Option<String> },
     /// `var[i].f... = val`: a write through index and field steps.
     SetPlace { var: V, steps: Vec<Step>, val: LE },
-    /// If `cond`, fail with an overflow error at `loc` (sized arithmetic under `~`).
-    FailIf { cond: LE, loc: String, path: ErrPath },
     Push(V, LE),
     Eval(LE),
     If(LE, Vec<LS>, Vec<LS>),
@@ -236,17 +214,11 @@ pub enum LS {
     Break(Label),
     Continue(Label),
     Return(Option<LE>),
-    /// `dst = a op b`, failing to the error path on overflow (`try`).
-    TryArith { dst: V, op: Op, a: LE, b: LE, loc: String, path: ErrPath },
-    /// `dst = f(args)` for a fallible user function.
-    TryCall { dst: Option<V>, f: String, args: Vec<LE>, path: ErrPath },
-    /// `dst = File.read(path)`.
-    TryRead { dst: V, path_arg: LE, loc: String, path: ErrPath },
     /// Pull the next element of a generator into `dst`, or break `label`.
     NextOrBreak { source: LE, dst: V, label: Label },
     Yield(LE),
     /// `dst = arr.pmap { worker }`.
-    Pmap { dst: V, arr: LE, worker: usize, path: ErrPath },
+    Pmap { dst: V, arr: LE, worker: usize },
     Puts(LE, LTy),
     Panic(String, String),
     /// Flush stdout, print the Str and a newline to stderr, exit 1.
@@ -260,7 +232,6 @@ pub struct LFunc {
     pub params: Vec<V>,
     pub vars: Vec<LVar>,
     pub ret: LTy,
-    pub fallible: bool,
     pub body: Vec<LS>,
     pub external: bool,
     pub is_main: bool,

@@ -42,8 +42,6 @@ pub struct State {
     bigs: Vec<Box<BigInt>>,
     pub out: String,
     pub err: String,
-    /// The pending error of a fallible call: (tag, detail, loc).
-    error: (u8, String, String),
     pub files: HashMap<String, Vec<u8>>,
     /// Kept alive for the program's lifetime: string literals and locations.
     pub consts: Vec<Box<[u8]>>,
@@ -68,7 +66,6 @@ pub fn reset() {
     s.bigs.clear();
     s.out.clear();
     s.err.clear();
-    s.error = (0, String::new(), String::new());
 }
 
 /// A thrown run: what JS sees. stderr already holds the message.
@@ -181,43 +178,6 @@ pub extern "C" fn alxr_overflow(lp: i64, ln: i64) {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn alxr_err_overflow(lp: i64, ln: i64) {
-    st().error = (1, String::new(), loc(lp, ln));
-}
-
-/// An uncaught error at the top level: print it and exit 1.
-#[unsafe(no_mangle)]
-pub extern "C" fn alxr_die() {
-    let s = st();
-    let (tag, detail, at) = s.error.clone();
-    let msg = match tag {
-        1 => format!("error: overflow ({at})\n"),
-        2 => format!("File.read: no such file `{detail}` ({at})\n"),
-        _ => format!("error ({at})\n"),
-    };
-    s.err.push_str(&msg);
-    stop(Stop::Exit1)
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn alxr_file_read(p: i64, n: i64, lp: i64, ln: i64) -> i32 {
-    let path = String::from_utf8_lossy(bytes(p, n)).into_owned();
-    let s = st();
-    let key = path.trim_start_matches("./").to_string();
-    match s.files.get(&key) {
-        Some(data) => {
-            let data = data.clone();
-            ret_str(&data);
-            1
-        }
-        None => {
-            s.error = (2, path, loc(lp, ln));
-            0
-        }
-    }
-}
-
-#[unsafe(no_mangle)]
 pub extern "C" fn alxr_die_str(p: i64, n: i64) {
     let s = st();
     s.err.push_str(&String::from_utf8_lossy(bytes(p, n)));
@@ -265,18 +225,6 @@ pub extern "C" fn alxr_pow(a: i64, b: i64, lp: i64, ln: i64) -> i64 {
         panic_msg("negative exponent", &loc(lp, ln));
     }
     try_pow(a, b).unwrap_or_else(|| overflow_at(&loc(lp, ln)))
-}
-
-/// Ok flag; the value in RET[0].
-#[unsafe(no_mangle)]
-pub extern "C" fn alxr_try_pow(a: i64, b: i64) -> i32 {
-    match try_pow(a, b) {
-        Some(r) => {
-            ret(&[r]);
-            1
-        }
-        None => 0,
-    }
 }
 
 /// a * b; RET[0] = 1 if it overflowed.

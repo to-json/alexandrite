@@ -94,7 +94,7 @@ pub fn emit(p: &LProgram) -> String {
         let _ = writeln!(protos, "static AlxGen *gen{}_new({});", gn.id, if caps.is_empty() { "void".into() } else { caps.join(", ") });
     }
     for w in &p.workers {
-        let _ = writeln!(protos, "static bool worker{}(const void *in_, void *out_, AlxErr *err_);", w.id);
+        let _ = writeln!(protos, "static void worker{}(const void *in_, void *out_);", w.id);
     }
     // Bodies.
     for gn in &p.gens {
@@ -123,17 +123,10 @@ pub fn emit(p: &LProgram) -> String {
 }
 
 fn proto(f: &LFunc) -> String {
-    let mut params: Vec<String> = f.params.iter().map(|v| format!("{} {}", cty(&f.vars[*v].ty), vname(f, *v))).collect();
+    let params: Vec<String> = f.params.iter().map(|v| format!("{} {}", cty(&f.vars[*v].ty), vname(f, *v))).collect();
     let linkage = if f.external || f.name.starts_with("alx_lib_") { "" } else { "static " };
     if f.is_main {
         return format!("static void {}(void)", f.name);
-    }
-    if f.fallible {
-        if f.ret != LTy::Unit {
-            params.push(format!("{} *out_", cty(&f.ret)));
-        }
-        params.push("AlxErr *err_".into());
-        return format!("{linkage}bool {}({})", f.name, if params.is_empty() { "void".into() } else { params.join(", ") });
     }
     let ret = if f.ret == LTy::Unit { "void".to_string() } else { cty(&f.ret) };
     format!("{linkage}{ret} {}({})", f.name, if params.is_empty() { "void".into() } else { params.join(", ") })
@@ -165,7 +158,6 @@ fn c_str(s: &str) -> String {
 #[derive(Clone, Copy, PartialEq)]
 enum Ctx {
     Plain,
-    Fallible,
     Main,
     Gen,
     Worker,
@@ -209,8 +201,6 @@ impl Gen<'_> {
     fn func(&mut self, f: &LFunc) {
         let ctx = if f.is_main {
             Ctx::Main
-        } else if f.fallible {
-            Ctx::Fallible
         } else {
             Ctx::Plain
         };
@@ -225,9 +215,6 @@ impl Gen<'_> {
         if f.ret != LTy::Unit && !matches!(f.body.last(), Some(LS::Return(_))) {
             let _ = writeln!(e.out, "    alx_panic(\"function ended without a value\", \"{}\");", f.name);
         }
-        if ctx == Ctx::Fallible && f.ret == LTy::Unit {
-            let _ = writeln!(e.out, "    return true;");
-        }
         self.out.push_str(&e.out);
         self.out.push_str("}\n\n");
     }
@@ -235,8 +222,7 @@ impl Gen<'_> {
     fn worker(&mut self, w: &LWorker) {
         let f = &w.func;
         let mut e = FnEmit { f, ctx: Ctx::Worker, in_gen: false, yields: 0, out: String::new(), ind: 1 };
-        let _ = writeln!(self.out, "static bool worker{}(const void *in_, void *out_, AlxErr *err_) {{", w.id);
-        let _ = err_unused();
+        let _ = writeln!(self.out, "static void worker{}(const void *in_, void *out_) {{", w.id);
         for (i, v) in f.vars.iter().enumerate() {
             if f.params.contains(&i) {
                 let _ = writeln!(e.out, "    {} {} = *(const {} *)in_;", cty(&v.ty), vname(f, i), cty_mem(&v.ty));
@@ -244,9 +230,7 @@ impl Gen<'_> {
                 let _ = writeln!(e.out, "    {} {} = {};", cty(&v.ty), vname(f, i), zero(&v.ty));
             }
         }
-        let _ = writeln!(e.out, "    (void)err_;");
         e.block(&f.body);
-        let _ = writeln!(e.out, "    return true;");
         self.out.push_str(&e.out);
         self.out.push_str("}\n\n");
     }
@@ -280,8 +264,6 @@ impl Gen<'_> {
     }
 }
 
-fn err_unused() {}
-
 impl FnEmit<'_> {
     fn line(&mut self, s: &str) {
         for _ in 0..self.ind {
@@ -298,14 +280,6 @@ impl FnEmit<'_> {
     fn block(&mut self, ss: &[LS]) {
         for s in ss {
             self.stmt(s);
-        }
-    }
-
-    fn err_path(&mut self, path: &ErrPath, e: &str) {
-        self.block(path.cleanup());
-        match (path.is_return(), self.ctx) {
-            (true, Ctx::Fallible | Ctx::Worker) => self.line(&format!("{{ *err_ = {e}; return false; }}")),
-            _ => self.line(&format!("alx_die({e});")),
         }
     }
 
@@ -334,14 +308,6 @@ impl FnEmit<'_> {
                 }
                 let x = self.e(val);
                 self.line(&format!("{lv} = {x};"));
-            }
-            LS::FailIf { cond, loc, path } => {
-                let c = self.e(cond);
-                self.line(&format!("if ({c}) {{"));
-                self.ind += 1;
-                self.err_path(path, &format!("alx_err_overflow({})", c_str(loc)));
-                self.ind -= 1;
-                self.line("}");
             }
             LS::Push(v, e) => {
                 let ty = ty_name(&self.f.vars[*v].ty);
@@ -381,12 +347,11 @@ impl FnEmit<'_> {
             LS::Break(l) => self.line(&format!("goto brk_{l};")),
             LS::Continue(l) => self.line(&format!("goto cont_{l};")),
             LS::Return(v) => match (self.ctx, v) {
-                (Ctx::Fallible | Ctx::Worker, Some(v)) => {
+                (Ctx::Worker, Some(v)) => {
                     let x = self.e(v);
-                    let t = if self.ctx == Ctx::Worker { cty_mem(&self.f.ret) } else { cty(&self.f.ret) };
-                    self.line(&format!("{{ *({t} *)out_ = {x}; return true; }}"));
+                    let t = cty_mem(&self.f.ret);
+                    self.line(&format!("{{ *({t} *)out_ = {x}; return; }}"));
                 }
-                (Ctx::Fallible | Ctx::Worker, None) => self.line("return true;"),
                 (Ctx::Plain, Some(v)) => {
                     let x = self.e(v);
                     self.line(&format!("return {x};"));
@@ -394,53 +359,6 @@ impl FnEmit<'_> {
                 (Ctx::Gen, _) => self.line("{ g->state = -1; return false; }"),
                 _ => self.line("return;"),
             },
-            LS::TryArith { dst, op, a, b, loc, path } => {
-                let f = match op {
-                    Op::Add => "alx_try_add",
-                    Op::Sub => "alx_try_sub",
-                    Op::Mul => "alx_try_mul",
-                    Op::Div => "alx_try_div",
-                    Op::Rem => "alx_try_rem",
-                    Op::Pow => "alx_try_pow",
-                    _ => unreachable!(),
-                };
-                let (a, b, d) = (self.e(a), self.e(b), self.v(*dst));
-                self.line(&format!("if (!{f}({a}, {b}, &{d})) {{"));
-                self.ind += 1;
-                self.err_path(path, &format!("alx_err_overflow({})", c_str(loc)));
-                self.ind -= 1;
-                self.line("}");
-            }
-            LS::TryCall { dst, f, args, path } => {
-                let mut a: Vec<String> = args.iter().map(|x| self.e(x)).collect();
-                if let Some(d) = dst {
-                    a.push(format!("&{}", self.v(*d)));
-                }
-                a.push("&e_".into());
-                self.line("{");
-                self.ind += 1;
-                self.line("AlxErr e_;");
-                self.line(&format!("if (!{f}({})) {{", a.join(", ")));
-                self.ind += 1;
-                self.err_path(path, "e_");
-                self.ind -= 1;
-                self.line("}");
-                self.ind -= 1;
-                self.line("}");
-            }
-            LS::TryRead { dst, path_arg, loc, path } => {
-                let (p, d) = (self.e(path_arg), self.v(*dst));
-                self.line("{");
-                self.ind += 1;
-                self.line("AlxErr e_;");
-                self.line(&format!("if (!alx_file_read({p}, {}, &{d}, &e_)) {{", c_str(loc)));
-                self.ind += 1;
-                self.err_path(path, "e_");
-                self.ind -= 1;
-                self.line("}");
-                self.ind -= 1;
-                self.line("}");
-            }
             LS::NextOrBreak { source, dst, label } => {
                 let (g, d) = (self.e(source), self.v(*dst));
                 self.line(&format!("if (!({g})->next(({g}), &{d})) goto brk_{label};"));
@@ -454,7 +372,7 @@ impl FnEmit<'_> {
                 self.line("return true;");
                 self.out.push_str(&format!("y{k}:;\n"));
             }
-            LS::Pmap { dst, arr, worker, path } => {
+            LS::Pmap { dst, arr, worker } => {
                 let d = self.v(*dst);
                 let dt = self.f.vars[*dst].ty.clone();
                 let LTy::Arr(out_t) = &dt else { unreachable!() };
@@ -464,12 +382,7 @@ impl FnEmit<'_> {
                 self.line(&format!("__typeof__({a}) in_ = {a};"));
                 self.line(&format!("{d} = {}_cap(in_.len);", ty_name(&dt)));
                 self.line(&format!("{d}.len = in_.len;"));
-                self.line("AlxErr e_;");
-                self.line(&format!("if (!alx_pmap(in_.ptr, in_.len, sizeof *in_.ptr, {d}.ptr, sizeof({}), worker{worker}, &e_)) {{", cty_mem(out_t)));
-                self.ind += 1;
-                self.err_path(path, "e_");
-                self.ind -= 1;
-                self.line("}");
+                self.line(&format!("alx_pmap(in_.ptr, in_.len, sizeof *in_.ptr, {d}.ptr, sizeof({}), worker{worker});", cty_mem(out_t)));
                 self.ind -= 1;
                 self.line("}");
             }

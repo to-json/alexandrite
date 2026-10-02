@@ -29,13 +29,6 @@ mod rt {
         pub excl: bool,
     }
 
-    #[derive(Clone, Debug)]
-    pub enum AlxErr {
-        Overflow(&'static str),
-        NotFound(Str, &'static str),
-        Io(Str, &'static str),
-    }
-
     /// Enumerator: a shared, resumable iterator.
     pub struct Gen<T>(pub Rc<RefCell<Box<dyn Iterator<Item = T>>>>);
     impl<T> Clone for Gen<T> {
@@ -69,16 +62,6 @@ mod rt {
         eprintln!("alexandrite: overflow at {loc}\nhint: add `#![overflow(promote)]` to this file to promote to bignums");
         std::process::abort()
     }
-    pub fn die(e: AlxErr) -> ! {
-        use std::io::Write;
-        let _ = std::io::stdout().flush();
-        match e {
-            AlxErr::NotFound(p, loc) => eprintln!("File.read: no such file `{}` ({loc})", String::from_utf8_lossy(&p.0)),
-            AlxErr::Io(p, loc) => eprintln!("File.read: cannot read `{}` ({loc})", String::from_utf8_lossy(&p.0)),
-            AlxErr::Overflow(loc) => eprintln!("error: overflow ({loc})"),
-        }
-        std::process::exit(1)
-    }
     pub fn die_str(s: Str) -> ! {
         use std::io::Write;
         let _ = std::io::stdout().flush();
@@ -87,10 +70,6 @@ mod rt {
         let _ = e.write_all(b"\n");
         std::process::exit(1)
     }
-    pub fn err_overflow(loc: &'static str) -> AlxErr {
-        AlxErr::Overflow(loc)
-    }
-
     /// A Go slice: a window (off, len, cap) onto shared storage. Clones share
     /// the storage; `push` writes in place while there's capacity, else copies.
     #[derive(Debug)]
@@ -198,15 +177,6 @@ mod rt {
     }
     pub fn neg(a: i64, loc: &str) -> i64 {
         a.checked_neg().unwrap_or_else(|| overflow(loc))
-    }
-    pub fn try_add(a: i64, b: i64) -> Option<i64> {
-        a.checked_add(b)
-    }
-    pub fn try_sub(a: i64, b: i64) -> Option<i64> {
-        a.checked_sub(b)
-    }
-    pub fn try_mul(a: i64, b: i64) -> Option<i64> {
-        a.checked_mul(b)
     }
     pub fn try_div(a: i64, b: i64) -> Option<i64> {
         if b == 0 {
@@ -316,15 +286,6 @@ mod rt {
     pub fn str_byte(s: &Str, i: i64) -> i64 {
         s.0[i as usize] as i64
     }
-    pub fn file_read(p: Str, loc: &'static str) -> Result<Str, AlxErr> {
-        let path = String::from_utf8_lossy(&p.0).to_string();
-        match std::fs::read(&path) {
-            Ok(b) => Ok(Str(b.into())),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(AlxErr::NotFound(p, loc)),
-            Err(_) => Err(AlxErr::Io(p, loc)),
-        }
-    }
-
     pub fn file_status(p: Str) -> i64 {
         match std::fs::read(String::from_utf8_lossy(&p.0).to_string()) {
             Ok(_) => 0,
@@ -474,33 +435,23 @@ mod rt {
         println!("{}", v.to_string());
     }
 
-    pub fn pmap<T: Clone + Sync, R: Clone + Send + Default>(xs: &Sl<T>, f: fn(T) -> Result<R, AlxErr>) -> Result<Sl<R>, AlxErr> {
-        pmap_v(&xs.to_vec(), f).map(Sl::from)
+    pub fn pmap<T: Clone + Sync, R: Clone + Send + Default>(xs: &Sl<T>, f: fn(T) -> R) -> Sl<R> {
+        Sl::from(pmap_v(&xs.to_vec(), f))
     }
-    fn pmap_v<T: Clone + Sync, R: Clone + Send + Default>(xs: &[T], f: fn(T) -> Result<R, AlxErr>) -> Result<Vec<R>, AlxErr> {
+    fn pmap_v<T: Clone + Sync, R: Clone + Send + Default>(xs: &[T], f: fn(T) -> R) -> Vec<R> {
         let mut out = vec![R::default(); xs.len()];
         let workers = std::thread::available_parallelism().map_or(4, |n| n.get());
         let chunk = xs.len().div_ceil(workers).max(1);
-        let mut errs: Vec<Option<AlxErr>> = vec![None; xs.len().div_ceil(chunk)];
         std::thread::scope(|s| {
-            for ((src, dst), err) in xs.chunks(chunk).zip(out.chunks_mut(chunk)).zip(errs.iter_mut()) {
+            for (src, dst) in xs.chunks(chunk).zip(out.chunks_mut(chunk)) {
                 s.spawn(move || {
                     for (x, o) in src.iter().zip(dst) {
-                        match f(x.clone()) {
-                            Ok(v) => *o = v,
-                            Err(e) => {
-                                *err = Some(e);
-                                return;
-                            }
-                        }
+                        *o = f(x.clone());
                     }
                 });
             }
         });
-        match errs.into_iter().flatten().next() {
-            Some(e) => Err(e),
-            None => Ok(out),
-        }
+        out
     }
 
     // ---------- bignums: sign + magnitude in base 1e9 ----------

@@ -50,29 +50,6 @@ void alx_overflow(const char *loc) {
     abort();
 }
 
-AlxErr alx_err_overflow(const char *loc) {
-    AlxErr e = { ALX_ERR_OVERFLOW, { "", 0 }, loc };
-    return e;
-}
-
-void alx_die(AlxErr e) {
-    fflush(stdout);
-    switch (e.tag) {
-    case ALX_ERR_NOT_FOUND:
-        fprintf(stderr, "File.read: no such file `%.*s` (%s)\n", (int)e.detail.len, e.detail.ptr, e.loc);
-        break;
-    case ALX_ERR_IO:
-        fprintf(stderr, "File.read: cannot read `%.*s` (%s)\n", (int)e.detail.len, e.detail.ptr, e.loc);
-        break;
-    case ALX_ERR_OVERFLOW:
-        fprintf(stderr, "error: overflow (%s)\n", e.loc);
-        break;
-    default:
-        fprintf(stderr, "error (%s)\n", e.loc);
-    }
-    exit(1);
-}
-
 void alx_die_str(AlxStr msg) {
     fflush(stdout);
     fwrite(msg.ptr, 1, (size_t)msg.len, stderr);
@@ -215,15 +192,14 @@ static int cmp_str(const void *a, const void *b) { return alx_str_cmp(*(const Al
 void alx_sort_i64(Arr_I64 *a) { if (a->len > 1) qsort(a->ptr, (size_t)a->len, sizeof(int64_t), cmp_i64); }
 void alx_sort_str(Arr_Str *a) { if (a->len > 1) qsort(a->ptr, (size_t)a->len, sizeof(AlxStr), cmp_str); }
 
-bool alx_file_read(AlxStr path, const char *loc, AlxStr *out, AlxErr *err) {
+/* Read a whole file. On failure returns false and sets *not_found (ENOENT vs. any other error). */
+static bool file_read(AlxStr path, AlxStr *out, bool *not_found) {
     char *cpath = alx_alloc((size_t)path.len + 1);
     memcpy(cpath, path.ptr, (size_t)path.len);
     cpath[path.len] = 0;
     FILE *f = fopen(cpath, "rb");
     if (!f) {
-        err->tag = errno == ENOENT ? ALX_ERR_NOT_FOUND : ALX_ERR_IO;
-        err->detail = path;
-        err->loc = loc;
+        *not_found = errno == ENOENT;
         return false;
     }
     fseek(f, 0, SEEK_END);
@@ -239,15 +215,15 @@ bool alx_file_read(AlxStr path, const char *loc, AlxStr *out, AlxErr *err) {
 
 int64_t alx_file_status(AlxStr path) {
     AlxStr out;
-    AlxErr err;
-    if (alx_file_read(path, "", &out, &err)) return 0;
-    return err.tag == ALX_ERR_NOT_FOUND ? 1 : 2;
+    bool not_found = false;
+    if (file_read(path, &out, &not_found)) return 0;
+    return not_found ? 1 : 2;
 }
 
 AlxStr alx_file_read_or_empty(AlxStr path) {
     AlxStr out;
-    AlxErr err;
-    if (alx_file_read(path, "", &out, &err)) return out;
+    bool not_found;
+    if (file_read(path, &out, &not_found)) return out;
     AlxStr e = { "", 0 };
     return e;
 }
@@ -402,23 +378,15 @@ typedef struct {
     int64_t lo, hi;
     size_t in_size, out_size;
     AlxWorker fn;
-    AlxErr err;
-    bool ok;
 } PmapJob;
 
 static void *pmap_run(void *arg) {
     PmapJob *j = arg;
-    j->ok = true;
-    for (int64_t i = j->lo; i < j->hi; i++) {
-        if (!j->fn(j->in + (size_t)i * j->in_size, j->out + (size_t)i * j->out_size, &j->err)) {
-            j->ok = false;
-            break;
-        }
-    }
+    for (int64_t i = j->lo; i < j->hi; i++) j->fn(j->in + (size_t)i * j->in_size, j->out + (size_t)i * j->out_size);
     return NULL;
 }
 
-bool alx_pmap(const void *in, int64_t n, size_t in_size, void *out, size_t out_size, AlxWorker fn, AlxErr *err) {
+void alx_pmap(const void *in, int64_t n, size_t in_size, void *out, size_t out_size, AlxWorker fn) {
     long cpus = sysconf(_SC_NPROCESSORS_ONLN);
     const char *forced = getenv("ALX_THREADS");
     if (forced && atol(forced) > 0) cpus = atol(forced);
@@ -430,17 +398,9 @@ bool alx_pmap(const void *in, int64_t n, size_t in_size, void *out, size_t out_s
     int64_t chunk = (n + threads - 1) / threads;
     for (int64_t t = 0; t < threads; t++) {
         int64_t lo = t * chunk, hi = lo + chunk > n ? n : lo + chunk;
-        jobs[t] = (PmapJob){ in, out, lo, hi, in_size, out_size, fn, { 0 }, true };
+        jobs[t] = (PmapJob){ in, out, lo, hi, in_size, out_size, fn };
         if (t > 0) pthread_create(&tids[t], NULL, pmap_run, &jobs[t]);
     }
     pmap_run(&jobs[0]);
     for (int64_t t = 1; t < threads; t++) pthread_join(tids[t], NULL);
-    /* Report the error of the lowest-numbered failing element's chunk. */
-    for (int64_t t = 0; t < threads; t++) {
-        if (!jobs[t].ok) {
-            *err = jobs[t].err;
-            return false;
-        }
-    }
-    return true;
 }

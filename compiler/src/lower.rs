@@ -42,7 +42,7 @@ pub fn lower(p: &TProgram, sm: &SourceMap, opts: &Opts) -> LProgram {
         let lf = if f.external {
             let mut lw = Lw::new(p, sm, opts, f, f.overflow, ErrPath::Return(vec![]), &prog);
             let params = f.params.iter().map(|l| lw.var_of(*l)).collect();
-            LFunc { name: f.cname.clone(), params, vars: lw.vars, ret: fn_ret(f), fallible: false, body: vec![], external: true, is_main: false, labels: 0 }
+            LFunc { name: f.cname.clone(), params, vars: lw.vars, ret: fn_ret(f), body: vec![], external: true, is_main: false, labels: 0 }
         } else {
             let path = if f.is_main { ErrPath::Die(vec![]) } else { ErrPath::Return(vec![]) };
             let mut lw = Lw::new(p, sm, opts, f, f.overflow, path, &prog);
@@ -56,7 +56,7 @@ pub fn lower(p: &TProgram, sm: &SourceMap, opts: &Opts) -> LProgram {
                 // Falling off the end of a fallible def that returns nothing.
                 body.push(LS::Return(Some(lw.ok_result(LE::B(false)))));
             }
-            LFunc { name: f.cname.clone(), params, vars: lw.vars, ret: fn_ret(f), fallible: false, body, external: false, is_main: f.is_main, labels: lw.labels }
+            LFunc { name: f.cname.clone(), params, vars: lw.vars, ret: fn_ret(f), body, external: false, is_main: f.is_main, labels: lw.labels }
         };
         prog.borrow_mut().funcs.push(lf);
     }
@@ -981,7 +981,7 @@ impl<'a> Lw<'a> {
         if !exists {
             let et = self.lty(&Ty::Error);
             // Reserve the name first (to_s of an error may need it).
-            self.prog.borrow_mut().funcs.push(LFunc { name: name.clone(), params: vec![], vars: vec![], ret: LTy::Str, fallible: false, body: vec![], external: false, is_main: false, labels: 0 });
+            self.prog.borrow_mut().funcs.push(LFunc { name: name.clone(), params: vec![], vars: vec![], ret: LTy::Str, body: vec![], external: false, is_main: false, labels: 0 });
             let mut w = Lw::new(self.p, self.sm, self.opts, self.f, self.mode, ErrPath::Die(vec![]), self.prog);
             let pe = w.new_var("e", et);
             let s = w.new_var("s", LTy::Str);
@@ -1011,7 +1011,7 @@ impl<'a> Lw<'a> {
                 body.push(LS::If(LE::Cmp(Op::Eq, Box::new(LE::Field(Box::new(LE::Var(pe)), 0)), Box::new(LE::I(k as i64)), LTy::I64), arm, vec![]));
             }
             body.push(LS::Return(Some(LE::Rt(Rt::StrCat, vec![LE::Field(Box::new(LE::Var(pe)), 2), LE::Var(s)]))));
-            let func = LFunc { name: name.clone(), params: vec![pe], vars: std::mem::take(&mut w.vars), ret: LTy::Str, fallible: false, body, external: false, is_main: false, labels: w.labels };
+            let func = LFunc { name: name.clone(), params: vec![pe], vars: std::mem::take(&mut w.vars), ret: LTy::Str, body, external: false, is_main: false, labels: w.labels };
             let mut prog = self.prog.borrow_mut();
             let slot = prog.funcs.iter().position(|f| f.name == name).unwrap();
             prog.funcs[slot] = func;
@@ -1839,7 +1839,7 @@ impl<'a> Lw<'a> {
                 let (mut body, v) = w.sub_val(|w| w.inline_block(b, &pvs, &[], None));
                 let ret = w.lty(rt);
                 body.push(LS::Return(if ret == LTy::Unit { None } else { Some(v) }));
-                let func = LFunc { name: format!("__lambda_{g}"), params, vars: std::mem::take(&mut w.vars), ret, fallible: false, body, external: false, is_main: false, labels: w.labels };
+                let func = LFunc { name: format!("__lambda_{g}"), params, vars: std::mem::take(&mut w.vars), ret, body, external: false, is_main: false, labels: w.labels };
                 self.prog.borrow_mut().funcs.push(func);
                 let lt = self.lty(&e.ty);
                 let LTy::Tup(ts) = &lt else { unreachable!() };
@@ -2701,7 +2701,7 @@ impl<'a> Lw<'a> {
         let body = g.sub(|g| g.stmts(&b.body));
         let mut prog = self.prog.borrow_mut();
         let id = prog.gens.len();
-        let func = LFunc { name: format!("gen{id}"), params: vec![], vars: g.vars, ret: LTy::Unit, fallible: false, body, external: false, is_main: false, labels: g.labels };
+        let func = LFunc { name: format!("gen{id}"), params: vec![], vars: g.vars, ret: LTy::Unit, body, external: false, is_main: false, labels: g.labels };
         prog.gens.push(LGen { id, elem, captures: cap_vars, func });
         drop(prog);
         let vals = caps.iter().map(|l| LE::Var(self.var_of(*l))).collect();
@@ -2740,12 +2740,11 @@ impl<'a> Lw<'a> {
         let wret = if fallible { result_lty(out_ty.clone(), self.mode) } else { out_ty.clone() };
         let mut prog = self.prog.borrow_mut();
         let id = prog.workers.len();
-        let func = LFunc { name: format!("worker{id}"), params: vec![param], vars: std::mem::take(&mut w.vars), ret: wret.clone(), fallible: false, body, external: false, is_main: false, labels: w.labels };
+        let func = LFunc { name: format!("worker{id}"), params: vec![param], vars: std::mem::take(&mut w.vars), ret: wret.clone(), body, external: false, is_main: false, labels: w.labels };
         prog.workers.push(LWorker { id, input: in_ty, func });
         drop(prog);
         let dst = self.tmp(LTy::Arr(Box::new(wret)));
-        let path = self.err_path();
-        self.emit(LS::Pmap { dst, arr, worker: id, path });
+        self.emit(LS::Pmap { dst, arr, worker: id });
         if !fallible {
             return LE::Var(dst);
         }
@@ -2781,14 +2780,21 @@ fn isqrt(n: i64) -> i64 {
     x
 }
 
-fn contains_try(ss: &[LS]) -> bool {
-    ss.iter().any(|s| match s {
-        LS::TryArith { .. } | LS::TryCall { .. } | LS::TryRead { .. } => true,
-        LS::If(_, a, b) => contains_try(a) || contains_try(b),
-        LS::Loop(_, b) => contains_try(b),
-        LS::Pmap { .. } => true,
-        _ => false,
-    })
+#[derive(Clone, Debug)]
+enum ErrPath {
+    /// In a fallible function: return the error. The statements are the
+    /// deferred code of every enclosing block, run first.
+    Return(Vec<LS>),
+    /// At the top level: print the error and exit 1 (after the deferred code).
+    Die(Vec<LS>),
+}
+
+impl ErrPath {
+    pub fn cleanup(&self) -> &[LS] {
+        match self {
+            ErrPath::Return(c) | ErrPath::Die(c) => c,
+        }
+    }
 }
 
 pub(crate) fn collect_locals_stmt(s: &TStmt, out: &mut Vec<LocalId>) {

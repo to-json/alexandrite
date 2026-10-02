@@ -53,7 +53,6 @@ fn loc(s: &str) -> String {
 #[derive(Clone, Copy, PartialEq)]
 enum Ctx {
     Plain,
-    Fallible,
     Main,
     Gen,
     Worker,
@@ -77,7 +76,7 @@ pub fn emit(p: &LProgram) -> String {
     for w in &p.workers {
         let f = &w.func;
         let param = f.params[0];
-        let _ = writeln!(out, "fn worker{}(v{param}: {}) -> Result<{}, AlxErr> {{", w.id, rty(&w.input), rty(&f.ret));
+        let _ = writeln!(out, "fn worker{}(v{param}: {}) -> {} {{", w.id, rty(&w.input), rty(&f.ret));
         let mut e = FnEmit { f, ctx: Ctx::Worker, out: String::new(), ind: 1 };
         e.decls(&f.params);
         e.block(&f.body);
@@ -87,18 +86,8 @@ pub fn emit(p: &LProgram) -> String {
     }
     for f in &p.funcs {
         let params: Vec<String> = f.params.iter().map(|v| format!("v{v}: {}", rty(&f.vars[*v].ty))).collect();
-        let ctx = if f.is_main {
-            Ctx::Main
-        } else if f.fallible {
-            Ctx::Fallible
-        } else {
-            Ctx::Plain
-        };
-        let ret = match ctx {
-            Ctx::Fallible => format!(" -> Result<{}, AlxErr>", rty(&f.ret)),
-            _ if f.ret != LTy::Unit => format!(" -> {}", rty(&f.ret)),
-            _ => String::new(),
-        };
+        let ctx = if f.is_main { Ctx::Main } else { Ctx::Plain };
+        let ret = if f.ret != LTy::Unit { format!(" -> {}", rty(&f.ret)) } else { String::new() };
         let _ = writeln!(out, "fn {}({}){} {{", f.name, params.join(", "), ret);
         let mut e = FnEmit { f, ctx, out: String::new(), ind: 1 };
         // Parameters are rebindable locals.
@@ -108,8 +97,7 @@ pub fn emit(p: &LProgram) -> String {
         e.decls(&f.params);
         e.block(&f.body);
         match ctx {
-            Ctx::Fallible if f.ret == LTy::Unit => e.line("Ok(())"),
-            Ctx::Fallible | Ctx::Plain if f.ret != LTy::Unit => e.line("unreachable!()"),
+            Ctx::Plain if f.ret != LTy::Unit => e.line("unreachable!()"),
             _ => {}
         }
         out.push_str(&e.out);
@@ -148,14 +136,6 @@ impl FnEmit<'_> {
     fn block(&mut self, ss: &[LS]) {
         for s in ss {
             self.stmt(s);
-        }
-    }
-
-    fn err_path(&mut self, path: &ErrPath, e: &str) {
-        self.block(path.cleanup());
-        match (path, self.ctx) {
-            (ErrPath::Return(_), Ctx::Fallible | Ctx::Worker) => self.line(&format!("return Err({e});")),
-            _ => self.line(&format!("die({e});")),
         }
     }
 
@@ -203,14 +183,6 @@ impl FnEmit<'_> {
                 }
                 self.line(&format!("{code} {lv} = x_; {} }}", "});".repeat(opens)));
             }
-            LS::FailIf { cond, loc: l, path } => {
-                let c = self.e(cond);
-                self.line(&format!("if {c} {{"));
-                self.ind += 1;
-                self.err_path(path, &format!("err_overflow({})", loc(l)));
-                self.ind -= 1;
-                self.line("}");
-            }
             LS::Push(v, e) => {
                 let x = self.e(e);
                 self.line(&format!("{{ let x_ = {x}; v{v}.push(x_); }}"));
@@ -247,47 +219,10 @@ impl FnEmit<'_> {
             LS::Return(v) => {
                 let x = v.as_ref().map(|v| self.e(v));
                 match (self.ctx, x) {
-                    (Ctx::Fallible | Ctx::Worker, Some(x)) => self.line(&format!("return Ok({x});")),
-                    (Ctx::Fallible | Ctx::Worker, None) => self.line("return Ok(Default::default());"),
+                    (Ctx::Worker, Some(x)) => self.line(&format!("return {x};")),
                     (Ctx::Plain, Some(x)) => self.line(&format!("return {x};")),
                     _ => self.line("return;"),
                 }
-            }
-            LS::TryArith { dst, op, a, b, loc: l, path } => {
-                let f = match op {
-                    Op::Add => "try_add",
-                    Op::Sub => "try_sub",
-                    Op::Mul => "try_mul",
-                    Op::Div => "try_div",
-                    Op::Rem => "try_rem",
-                    _ => "try_pow",
-                };
-                let (a, b) = (self.e(a), self.e(b));
-                self.line(&format!("match {f}({a}, {b}) {{ Some(r_) => v{dst} = r_, None => {{"));
-                self.ind += 1;
-                self.err_path(path, &format!("err_overflow({})", loc(l)));
-                self.ind -= 1;
-                self.line("} }");
-            }
-            LS::TryCall { dst, f, args, path } => {
-                let a: Vec<String> = args.iter().map(|x| self.e(x)).collect();
-                let set = match dst {
-                    Some(d) => format!("v{d} = r_"),
-                    None => "{}".into(),
-                };
-                self.line(&format!("match {f}({}) {{ Ok(r_) => {set}, Err(e_) => {{", a.join(", ")));
-                self.ind += 1;
-                self.err_path(path, "e_");
-                self.ind -= 1;
-                self.line("} }");
-            }
-            LS::TryRead { dst, path_arg, loc: l, path } => {
-                let p = self.e(path_arg);
-                self.line(&format!("match file_read({p}, {}) {{ Ok(r_) => v{dst} = r_, Err(e_) => {{", loc(l)));
-                self.ind += 1;
-                self.err_path(path, "e_");
-                self.ind -= 1;
-                self.line("} }");
             }
             LS::NextOrBreak { source, dst, label } => {
                 let g = self.e(source);
@@ -297,13 +232,9 @@ impl FnEmit<'_> {
                 let x = self.e(e);
                 self.line(&format!("yield {x};"));
             }
-            LS::Pmap { dst, arr, worker, path } => {
+            LS::Pmap { dst, arr, worker } => {
                 let a = self.e(arr);
-                self.line(&format!("match pmap(&{a}, worker{worker}) {{ Ok(r_) => v{dst} = r_, Err(e_) => {{"));
-                self.ind += 1;
-                self.err_path(path, "e_");
-                self.ind -= 1;
-                self.line("} }");
+                self.line(&format!("v{dst} = pmap(&{a}, worker{worker});"));
             }
             LS::Puts(e, t) => {
                 let x = self.e(e);

@@ -20,9 +20,6 @@ typedef struct { int64_t lo, hi; bool excl; } AlxRange;
 typedef struct AlxBig AlxBig;
 typedef struct { int64_t v; AlxBig *big; } AlxPInt;
 
-enum { ALX_ERR_OVERFLOW = 1, ALX_ERR_NOT_FOUND, ALX_ERR_IO };
-typedef struct { int tag; AlxStr detail; const char *loc; } AlxErr;
-
 /* Generators: every generator state begins with this. */
 typedef struct AlxGen { bool (*next)(struct AlxGen *self, void *out); } AlxGen;
 
@@ -48,8 +45,6 @@ void alx_init(void);
 /* ---------- panics ---------- */
 _Noreturn void alx_panic(const char *what, const char *loc);
 _Noreturn void alx_overflow(const char *loc);
-_Noreturn void alx_die(AlxErr e);
-AlxErr alx_err_overflow(const char *loc);
 
 static inline int64_t alx_idx(int64_t i, int64_t n, const char *loc) {
     if ((uint64_t)i >= (uint64_t)n) alx_panic("index out of bounds", loc);
@@ -75,20 +70,6 @@ static inline int64_t alx_rem(int64_t a, int64_t b, const char *loc) {
 }
 static inline int64_t alx_neg(int64_t a, const char *loc) { if (a == INT64_MIN) alx_overflow(loc); return -a; }
 int64_t alx_pow(int64_t a, int64_t b, const char *loc);
-static inline bool alx_try_add(int64_t a, int64_t b, int64_t *r) { return !__builtin_add_overflow(a, b, r); }
-static inline bool alx_try_sub(int64_t a, int64_t b, int64_t *r) { return !__builtin_sub_overflow(a, b, r); }
-static inline bool alx_try_mul(int64_t a, int64_t b, int64_t *r) { return !__builtin_mul_overflow(a, b, r); }
-static inline bool alx_try_div(int64_t a, int64_t b, int64_t *r) {
-    if (b == 0 || (a == INT64_MIN && b == -1)) return false;
-    *r = a / b;
-    return true;
-}
-static inline bool alx_try_rem(int64_t a, int64_t b, int64_t *r) {
-    if (b == 0) return false;
-    if (b == -1) { *r = 0; return true; }
-    *r = a % b;
-    return true;
-}
 bool alx_try_pow(int64_t a, int64_t b, int64_t *r);
 /* Wrapping (#![overflow(wrap)]): through unsigned, no UB. */
 static inline int64_t alx_wadd(int64_t a, int64_t b) { return (int64_t)((uint64_t)a + (uint64_t)b); }
@@ -194,7 +175,6 @@ void alx_sort_str(Arr_Str *a);
 _Noreturn void alx_die_str(AlxStr msg);
 int64_t alx_file_status(AlxStr path);
 AlxStr alx_file_read_or_empty(AlxStr path);
-bool alx_file_read(AlxStr path, const char *loc, AlxStr *out, AlxErr *err);
 
 /* ---------- output ---------- */
 void alx_puts_i64(int64_t v);
@@ -203,8 +183,8 @@ void alx_puts_bool(bool b);
 void alx_puts_pint(AlxPInt v);
 
 /* ---------- parallel map ---------- */
-typedef bool (*AlxWorker)(const void *in, void *out, AlxErr *err);
-bool alx_pmap(const void *in, int64_t n, size_t in_size, void *out, size_t out_size, AlxWorker fn, AlxErr *err);
+typedef void (*AlxWorker)(const void *in, void *out);
+void alx_pmap(const void *in, int64_t n, size_t in_size, void *out, size_t out_size, AlxWorker fn);
 
 /* ---------- bignums (promote mode) ---------- */
 AlxPInt alx_p_from(int64_t v);

@@ -60,10 +60,6 @@ void alxj_digits(Arr_I64 *out, int64_t v, const char *loc) { *out = alx_digits(v
 int64_t alxj_try_pow(int64_t a, int64_t b, int64_t *r) { return alx_try_pow(a, b, r); }
 
 /* ---------- errors ---------- */
-void alxj_err_overflow(AlxErr *out, const char *loc) { *out = alx_err_overflow(loc); }
-void alxj_die(const AlxErr *e) { alx_die(*e); }
-int64_t alxj_file_read(const AlxStr *path, const char *loc, AlxStr *out, AlxErr *err) { return alx_file_read(*path, loc, out, err); }
-
 void alxj_die_str(const AlxStr *s) { alx_die_str(*s); }
 int64_t alxj_file_status(const AlxStr *path) { return alx_file_status(*path); }
 void alxj_file_read_or_empty(AlxStr *out, const AlxStr *path) { *out = alx_file_read_or_empty(*path); }
@@ -72,8 +68,8 @@ void alxj_file_read_or_empty(AlxStr *out, const AlxStr *path) { *out = alx_file_
 void alxj_puts_str(const AlxStr *s) { alx_puts_str(*s); }
 void alxj_puts_bool(int64_t b) { alx_puts_bool(b != 0); }
 void alxj_puts_unit(void) { puts(""); }
-int64_t alxj_pmap(const void *in, int64_t n, int64_t in_size, void *out, int64_t out_size, AlxWorker fn, AlxErr *err) {
-    return alx_pmap(in, n, (size_t)in_size, out, (size_t)out_size, fn, err);
+void alxj_pmap(const void *in, int64_t n, int64_t in_size, void *out, int64_t out_size, AlxWorker fn) {
+    alx_pmap(in, n, (size_t)in_size, out, (size_t)out_size, fn);
 }
 void alxj_finish(void) { fflush(stdout); }
 

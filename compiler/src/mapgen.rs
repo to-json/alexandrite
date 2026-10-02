@@ -75,7 +75,7 @@ impl Fb {
         self.labels - 1
     }
     fn func(self, name: &str, params: Vec<V>, ret: LTy, body: Vec<LS>) -> LFunc {
-        LFunc { name: name.into(), params, vars: self.vars, ret, fallible: false, body, external: false, is_main: false, labels: self.labels }
+        LFunc { name: name.into(), params, vars: self.vars, ret, body, external: false, is_main: false, labels: self.labels }
     }
 }
 

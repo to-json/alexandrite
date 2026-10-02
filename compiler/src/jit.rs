@@ -31,8 +31,8 @@ mod rt {
         alx_init, alx_panic, alx_overflow, alx_pow, alx_isqrt, alx_sort_i64, alx_sort_str, alx_puts_i64,
         alxj_alloc, alxj_zalloc, alxj_arr_alloc, alxj_arr_grow, alxj_arr_new, alxj_arr_copy,
         alxj_int_to_s, alxj_str_rev, alxj_str_delete, alxj_str_split, alxj_str_to_i, alxj_str_charlen, alxj_str_sub,
-        alxj_str_eq, alxj_str_cmp, alxj_str_is_pal, alxj_int_ndigits, alxj_digits, alxj_try_pow,
-        alxj_err_overflow, alxj_die, alxj_file_read, alxj_puts_str, alxj_puts_bool, alxj_puts_unit, alxj_pmap, alxj_finish,
+        alxj_str_eq, alxj_str_cmp, alxj_str_is_pal, alxj_int_ndigits, alxj_digits,
+        alxj_puts_str, alxj_puts_bool, alxj_puts_unit, alxj_pmap, alxj_finish,
         alxj_p_add, alxj_p_sub, alxj_p_mul, alxj_p_div, alxj_p_rem, alxj_p_pow, alxj_p_cmp, alxj_p_even, alxj_p_to_i64,
         alxj_p_to_s, alxj_p_ndigits, alxj_p_digits, alxj_puts_pint,
         alxj_puts_f64, alxj_f_to_s, alxj_f_fmt, alxj_f_to_i, alxj_str_cat,
@@ -41,8 +41,6 @@ mod rt {
     );
 }
 type RtFn = unsafe extern "C" fn();
-
-const ERR_SIZE: u32 = 32; // sizeof(AlxErr)
 
 /// C layout of a type: size, alignment, its scalars (offset, SSA type) and
 /// how each sits in memory (narrow integers are stored at their own width
@@ -105,15 +103,9 @@ fn elem(t: &LTy) -> &LTy {
 #[derive(Clone, Copy, PartialEq)]
 enum Kind {
     Plain,
-    Fallible,
     Main,
     Gen,
     Worker,
-}
-
-enum ErrSrc {
-    Overflow(Value),
-    At(Value),
 }
 
 struct Decls<'p> {
@@ -157,13 +149,7 @@ pub fn run(p: &LProgram) -> Result<(), String> {
     let mut strs = Strs::default();
     let mut jobs: Vec<(FuncId, &LFunc, Kind, Option<&LGen>)> = vec![];
     for f in &p.funcs {
-        let k = if f.is_main {
-            Kind::Main
-        } else if f.fallible {
-            Kind::Fallible
-        } else {
-            Kind::Plain
-        };
+        let k = if f.is_main { Kind::Main } else { Kind::Plain };
         jobs.push((d.funcs[f.name.as_str()].0, f, k, None));
     }
     for g in &p.gens {
@@ -212,16 +198,8 @@ fn user_sig(m: &JITModule, f: &LFunc) -> Signature {
             s.params.push(AbiParam::new(t));
         }
     }
-    if f.fallible {
-        if f.ret != LTy::Unit {
-            s.params.push(AbiParam::new(I64));
-        }
-        s.params.push(AbiParam::new(I64));
-        s.returns.push(AbiParam::new(I8).uext());
-    } else {
-        for (_, t) in lay(&f.ret).fields {
-            s.returns.push(AbiParam::new(t));
-        }
+    for (_, t) in lay(&f.ret).fields {
+        s.returns.push(AbiParam::new(t));
     }
     s
 }
@@ -234,11 +212,10 @@ fn gen_sig(m: &JITModule) -> Signature {
     s
 }
 
-/// `bool worker(const void *in, void *out, AlxErr *err)`, called by alx_pmap.
+/// `void worker(const void *in, void *out)`, called by alx_pmap.
 fn worker_sig(m: &JITModule) -> Signature {
     let mut s = m.make_signature();
-    s.params.extend([AbiParam::new(I64), AbiParam::new(I64), AbiParam::new(I64)]);
-    s.returns.push(AbiParam::new(I8).uext());
+    s.params.extend([AbiParam::new(I64), AbiParam::new(I64)]);
     s
 }
 
@@ -357,11 +334,6 @@ impl Fx<'_, '_, '_> {
         let fp = self.ic(f as usize as i64);
         let call = self.b.ins().call_indirect(sig, fp, &args);
         if ret.is_some() { Some(self.b.inst_results(call)[0]) } else { None }
-    }
-
-    fn rt_bool(&mut self, f: RtFn, args: &[Value]) -> Value {
-        let r = self.call_rt(f, args, true).unwrap();
-        self.b.ins().icmp_imm_s(IntCC::NotEqual, r, 0)
     }
 
     fn fref(&mut self, id: FuncId) -> FuncRef {
@@ -527,9 +499,8 @@ impl Fx<'_, '_, '_> {
                 self.b.ins().return_(&[]);
                 self.fresh();
             }
-            Kind::Worker | Kind::Fallible if f.ret == LTy::Unit || self.kind == Kind::Worker => {
-                let one = self.b.ins().iconst(I8, 1);
-                self.b.ins().return_(&[one]);
+            Kind::Worker => {
+                self.b.ins().return_(&[]);
                 self.fresh();
             }
             Kind::Gen => self.gen_finish(),
@@ -567,47 +538,6 @@ impl Fx<'_, '_, '_> {
         }
     }
 
-    /// The error path: return the error to the caller, or print it and exit.
-    fn err_path(&mut self, path: &ErrPath, src: ErrSrc) {
-        self.block(path.cleanup());
-        let ret = path.is_return() && matches!(self.kind, Kind::Fallible | Kind::Worker);
-        if ret {
-            let errp = *self.params.last().unwrap();
-            match src {
-                ErrSrc::Overflow(loc) => {
-                    self.call_rt(rt::alxj_err_overflow, &[errp, loc], false);
-                }
-                ErrSrc::At(p) => {
-                    for o in (0..ERR_SIZE as i32).step_by(8) {
-                        let w = self.b.ins().load(I64, MemFlagsData::trusted(), p, o);
-                        self.b.ins().store(MemFlagsData::trusted(), w, errp, o);
-                    }
-                }
-            }
-            let z = self.b.ins().iconst(I8, 0);
-            self.b.ins().return_(&[z]);
-        } else {
-            let p = match src {
-                ErrSrc::Overflow(loc) => {
-                    let p = self.slot(ERR_SIZE);
-                    self.call_rt(rt::alxj_err_overflow, &[p, loc], false);
-                    p
-                }
-                ErrSrc::At(p) => p,
-            };
-            self.call_rt(rt::alxj_die, &[p], false);
-            self.b.ins().trap(TrapCode::unwrap_user(1));
-        }
-        self.fresh();
-    }
-
-    fn fail_if(&mut self, cond: Value, path: &ErrPath, src: impl FnOnce(&mut Self) -> ErrSrc) {
-        self.cold_if(cond, |s| {
-            let e = src(s);
-            s.err_path(path, e);
-        });
-    }
-
     // ---------- statements ----------
 
     fn stmt(&mut self, s: &LS) {
@@ -623,10 +553,6 @@ impl Fx<'_, '_, '_> {
                 let et = elem(&self.f.vars[*arr].ty).clone();
                 let addr = self.elem_addr(&a, i, &et, check.as_deref());
                 self.store(&et, &x, addr, 0);
-            }
-            LS::FailIf { cond, loc, path } => {
-                let c = self.e1(cond);
-                self.fail_if(c, path, |s| ErrSrc::Overflow(s.cstr(loc)));
             }
             LS::SetPlace { var, steps, val } => {
                 let x = self.e(val);
@@ -724,15 +650,13 @@ impl Fx<'_, '_, '_> {
             }
             LS::Return(v) => {
                 match (self.kind, v) {
-                    (Kind::Fallible | Kind::Worker, v) => {
+                    (Kind::Worker, v) => {
                         if let Some(v) = v {
                             let x = self.e(v);
-                            let outp = if self.kind == Kind::Worker { self.params[1] } else { self.params[self.params.len() - 2] };
                             let rt = self.f.ret.clone();
-                            self.store(&rt, &x, outp, 0);
+                            self.store(&rt, &x, self.params[1], 0);
                         }
-                        let one = self.b.ins().iconst(I8, 1);
-                        self.b.ins().return_(&[one]);
+                        self.b.ins().return_(&[]);
                     }
                     (Kind::Plain, Some(v)) => {
                         let x = self.e(v);
@@ -747,65 +671,6 @@ impl Fx<'_, '_, '_> {
                     }
                 }
                 self.fresh();
-            }
-            LS::TryArith { dst, op, a, b, loc, path } => {
-                let (a, b) = (self.e1(a), self.e1(b));
-                let r = match op {
-                    Op::Add | Op::Sub | Op::Mul => {
-                        let (r, of) = match op {
-                            Op::Add => self.b.ins().sadd_overflow(a, b),
-                            Op::Sub => self.b.ins().ssub_overflow(a, b),
-                            _ => self.b.ins().smul_overflow(a, b),
-                        };
-                        self.fail_if(of, path, |s| ErrSrc::Overflow(s.cstr(loc)));
-                        r
-                    }
-                    Op::Div | Op::Rem => {
-                        let bad = self.div_bad(*op, a, b);
-                        self.fail_if(bad, path, |s| ErrSrc::Overflow(s.cstr(loc)));
-                        self.floor_divrem(*op, a, b)
-                    }
-                    _ => {
-                        let out = self.slot(8);
-                        let ok = self.rt_bool(rt::alxj_try_pow, &[a, b, out]);
-                        let bad = self.b.ins().icmp_imm_s(IntCC::Equal, ok, 0);
-                        self.fail_if(bad, path, |s| ErrSrc::Overflow(s.cstr(loc)));
-                        self.b.ins().load(I64, MemFlagsData::trusted(), out, 0)
-                    }
-                };
-                self.set(*dst, &[r]);
-            }
-            LS::TryCall { dst, f, args, path } => {
-                let (id, callee) = self.d.funcs[f.as_str()];
-                let mut av = vec![];
-                for a in args {
-                    av.extend(self.e(a));
-                }
-                let out = if callee.ret != LTy::Unit { Some(self.slot(lay(&callee.ret).size)) } else { None };
-                av.extend(out);
-                let errp = self.slot(ERR_SIZE);
-                av.push(errp);
-                let fr = self.fref(id);
-                let call = self.b.ins().call(fr, &av);
-                let ok = self.b.inst_results(call)[0];
-                let bad = self.b.ins().icmp_imm_s(IntCC::Equal, ok, 0);
-                self.fail_if(bad, path, |_| ErrSrc::At(errp));
-                if let (Some(d), Some(out)) = (dst, out) {
-                    let vals = self.load(&callee.ret.clone(), out, 0);
-                    self.set(*d, &vals);
-                }
-            }
-            LS::TryRead { dst, path_arg, loc, path } => {
-                let pv = self.e(path_arg);
-                let ps = self.spill(&LTy::Str, &pv);
-                let l = self.cstr(loc);
-                let out = self.slot(16);
-                let errp = self.slot(ERR_SIZE);
-                let ok = self.rt_bool(rt::alxj_file_read, &[ps, l, out, errp]);
-                let bad = self.b.ins().icmp_imm_s(IntCC::Equal, ok, 0);
-                self.fail_if(bad, path, |_| ErrSrc::At(errp));
-                let vals = self.load(&LTy::Str, out, 0);
-                self.set(*dst, &vals);
             }
             LS::NextOrBreak { source, dst, label } => {
                 let g = self.e1(source);
@@ -841,7 +706,7 @@ impl Fx<'_, '_, '_> {
                 self.b.switch_to_block(blk);
                 // Variables were reloaded from the state at entry.
             }
-            LS::Pmap { dst, arr, worker, path } => {
+            LS::Pmap { dst, arr, worker } => {
                 let at = self.ty(arr);
                 let a = self.e(arr);
                 let in_esz = lay(elem(&at)).size as i64;
@@ -849,13 +714,10 @@ impl Fx<'_, '_, '_> {
                 let out_esz = lay(&out_t).size as i64;
                 let (ie, oe) = (self.ic(in_esz), self.ic(out_esz));
                 let outp = self.call_rt(rt::alxj_arr_alloc, &[a[1], oe], true).unwrap();
-                let errp = self.slot(ERR_SIZE);
                 let wid = self.d.workers[worker];
                 let fr = self.fref(wid);
                 let wf = self.b.ins().func_addr(I64, fr);
-                let ok = self.rt_bool(rt::alxj_pmap, &[a[0], a[1], ie, outp, oe, wf, errp]);
-                let bad = self.b.ins().icmp_imm_s(IntCC::Equal, ok, 0);
-                self.fail_if(bad, path, |_| ErrSrc::At(errp));
+                self.call_rt(rt::alxj_pmap, &[a[0], a[1], ie, outp, oe, wf], false);
                 self.set(*dst, &[outp, a[1], a[1]]);
             }
             LS::Puts(e, t) => {
@@ -985,18 +847,6 @@ impl Fx<'_, '_, '_> {
         }
         let off = self.b.ins().imul_imm_s(i, lay(et).size as i64);
         self.b.ins().iadd(a[0], off)
-    }
-
-    /// Division by zero, or MIN / -1 (Div only): the cases that fail.
-    fn div_bad(&mut self, op: Op, a: Value, b: Value) -> Value {
-        let z = self.b.ins().icmp_imm_s(IntCC::Equal, b, 0);
-        if op == Op::Rem {
-            return z;
-        }
-        let m1 = self.b.ins().icmp_imm_s(IntCC::Equal, b, -1);
-        let mn = self.b.ins().icmp_imm_s(IntCC::Equal, a, i64::MIN);
-        let both = self.b.ins().band(m1, mn);
-        self.b.ins().bor(z, both)
     }
 
     /// Truncating division / remainder (Go semantics); `b` is nonzero, and

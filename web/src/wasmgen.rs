@@ -33,14 +33,10 @@ const RT: &[(&str, &str)] = &[
     ("alxr_copy", "jjj>j"),
     ("alxr_panic", "jjjj>"),
     ("alxr_overflow", "jj>"),
-    ("alxr_err_overflow", "jj>"),
-    ("alxr_die", ">"),
-    ("alxr_file_read", "jjjj>i"),
     ("alxr_die_str", "jj>"),
     ("alxr_file_status", "jj>j"),
     ("alxr_file_read_or_empty", "jj>"),
     ("alxr_pow", "jjjj>j"),
-    ("alxr_try_pow", "jj>i"),
     ("alxr_mul_chk", "jj>j"),
     ("alxr_isqrt", "jjj>j"),
     ("alxr_digits", "jjj>"),
@@ -192,7 +188,6 @@ fn gen_offsets(f: &LFunc) -> (Vec<u32>, u32) {
 #[derive(Clone, Copy, PartialEq)]
 enum Kind {
     Plain,
-    Fallible,
     Main,
     Gen,
     Worker,
@@ -203,11 +198,6 @@ enum Frame {
     Brk(Label),
     Cont(Label),
     Other,
-}
-
-enum ErrSrc<'s> {
-    Overflow(&'s str),
-    Pending,
 }
 
 /// Module-wide state.
@@ -252,12 +242,7 @@ fn user_sig(f: &LFunc) -> (Vec<ValType>, Vec<ValType>) {
         return (vec![], vec![]);
     }
     let params: Vec<ValType> = f.params.iter().flat_map(|v| vts(&f.vars[*v].ty)).collect();
-    let mut results = vec![];
-    if f.fallible {
-        results.push(I);
-    }
-    results.extend(vts(&f.ret));
-    (params, results)
+    (params, vts(&f.ret))
 }
 
 fn gen_sig(g: &LGen) -> (Vec<ValType>, Vec<ValType>) {
@@ -268,9 +253,7 @@ fn gen_sig(g: &LGen) -> (Vec<ValType>, Vec<ValType>) {
 
 fn worker_sig(w: &LWorker) -> (Vec<ValType>, Vec<ValType>) {
     let p = w.func.params[0];
-    let mut r = vec![I];
-    r.extend(vts(&w.func.ret));
-    (vts(&w.func.vars[p].ty), r)
+    (vts(&w.func.vars[p].ty), vts(&w.func.ret))
 }
 
 pub fn emit(p: &LProgram) -> Result<Vec<u8>, String> {
@@ -313,13 +296,7 @@ pub fn emit(p: &LProgram) -> Result<Vec<u8>, String> {
     let mut code = CodeSection::new();
     let mut jobs: Vec<(&LFunc, Kind, Option<&LGen>, Option<&LWorker>)> = vec![];
     for f in &p.funcs {
-        let k = if f.is_main {
-            Kind::Main
-        } else if f.fallible {
-            Kind::Fallible
-        } else {
-            Kind::Plain
-        };
+        let k = if f.is_main { Kind::Main } else { Kind::Plain };
         jobs.push((f, k, None, None));
     }
     for g in &p.gens {
@@ -554,30 +531,11 @@ impl<'c, 'p> Fx<'c, 'p> {
         self.ins().unreachable();
     }
 
-    /// Results of this function on failure / falling off: ok flag + zeros.
+    /// Result types of this function (a generator: its element type).
     fn ret_types(&self) -> Vec<ValType> {
         match self.kind {
             Kind::Gen => vts(&self.lgen.unwrap().elem),
             _ => vts(&self.f.ret),
-        }
-    }
-
-    /// Inside a block that must not fall through: report the error.
-    fn err_path(&mut self, path: &ErrPath, src: ErrSrc) {
-        self.block(path.cleanup());
-        let ret = path.is_return() && matches!(self.kind, Kind::Fallible | Kind::Worker);
-        if let ErrSrc::Overflow(loc) = src {
-            self.str_const(loc);
-            self.rt("alxr_err_overflow");
-        }
-        if ret {
-            self.ins().i32_const(0);
-            let ts = self.ret_types();
-            self.zeros(&ts);
-            self.ins().return_();
-        } else {
-            self.rt("alxr_die");
-            self.ins().unreachable();
         }
     }
 
@@ -616,11 +574,7 @@ impl<'c, 'p> Fx<'c, 'p> {
         match self.kind {
             Kind::Main => {}
             Kind::Plain if f.ret == LTy::Unit => {}
-            Kind::Fallible if f.ret == LTy::Unit => {
-                self.ins().i32_const(1);
-            }
             Kind::Worker => {
-                self.ins().i32_const(1);
                 let ts = self.ret_types();
                 self.zeros(&ts);
             }
@@ -744,12 +698,6 @@ impl<'c, 'p> Fx<'c, 'p> {
                 let addr = self.elem_addr(a[0], a[1], i, &et, check.as_deref());
                 self.store(&et, addr, 0, &x);
             }
-            LS::FailIf { cond, loc, path } => {
-                self.e(cond);
-                self.if_(vec![]);
-                self.err_path(path, ErrSrc::Overflow(loc));
-                self.end();
-            }
             LS::SetPlace { var, steps, val } => {
                 let x = self.eval_locals(val);
                 // Through the variable's own locals until the first index,
@@ -848,20 +796,7 @@ impl<'c, 'p> Fx<'c, 'p> {
                 self.ins().br(d);
             }
             LS::Return(v) => match self.kind {
-                Kind::Fallible | Kind::Worker => {
-                    self.ins().i32_const(1);
-                    match v {
-                        Some(v) => {
-                            self.e(v);
-                        }
-                        None => {
-                            let ts = self.ret_types();
-                            self.zeros(&ts);
-                        }
-                    }
-                    self.ins().return_();
-                }
-                Kind::Plain => {
+                Kind::Plain | Kind::Worker => {
                     if let Some(v) = v {
                         self.e(v);
                     }
@@ -872,76 +807,6 @@ impl<'c, 'p> Fx<'c, 'p> {
                     self.ins().return_();
                 }
             },
-            LS::TryArith { dst, op, a, b, loc, path } => {
-                self.e(a);
-                let ta = self.pop(&[W])[0];
-                self.e(b);
-                let tb = self.pop(&[W])[0];
-                match op {
-                    Op::Add | Op::Sub => {
-                        let r = self.add_sub(*op, ta, tb);
-                        self.ovf_test(*op, ta, tb, r);
-                        self.if_(vec![]);
-                        self.err_path(path, ErrSrc::Overflow(loc));
-                        self.end();
-                        self.ins().local_get(r);
-                    }
-                    Op::Mul => {
-                        self.mul_checked(ta, tb, |s| {
-                            s.if_(vec![]);
-                            s.err_path(path, ErrSrc::Overflow(loc));
-                            s.end();
-                        });
-                    }
-                    Op::Div | Op::Rem => {
-                        self.div_bad(*op, ta, tb);
-                        self.if_(vec![]);
-                        self.err_path(path, ErrSrc::Overflow(loc));
-                        self.end();
-                        self.floor_divrem(*op, ta, tb);
-                    }
-                    _ => {
-                        self.ins().local_get(ta).local_get(tb);
-                        self.rt("alxr_try_pow");
-                        self.ins().i32_eqz();
-                        self.if_(vec![]);
-                        self.err_path(path, ErrSrc::Overflow(loc));
-                        self.end();
-                        self.ret_words(1);
-                    }
-                }
-                self.set_var(*dst);
-            }
-            LS::TryCall { dst, f, args, path } => {
-                let (idx, callee) = self.cx.funcs[f.as_str()];
-                for a in args {
-                    self.e(a);
-                }
-                self.ins().call(idx);
-                let vals = self.pop(&vts(&callee.ret));
-                let ok = self.pop(&[I])[0];
-                self.ins().local_get(ok).i32_eqz();
-                self.if_(vec![]);
-                self.err_path(path, ErrSrc::Pending);
-                self.end();
-                if let Some(d) = dst {
-                    if !vals.is_empty() {
-                        self.get(&vals);
-                        self.set_var(*d);
-                    }
-                }
-            }
-            LS::TryRead { dst, path_arg, loc, path } => {
-                self.e(path_arg);
-                self.str_const(loc);
-                self.rt("alxr_file_read");
-                self.ins().i32_eqz();
-                self.if_(vec![]);
-                self.err_path(path, ErrSrc::Pending);
-                self.end();
-                self.ret_words(2);
-                self.set_var(*dst);
-            }
             LS::NextOrBreak { source, dst, label } => {
                 self.e(source);
                 let g = self.pop(&[W])[0];
@@ -960,7 +825,7 @@ impl<'c, 'p> Fx<'c, 'p> {
                 self.set_var(*dst);
             }
             LS::Yield(_) => unreachable!("wasmgen: yield outside a generator"),
-            LS::Pmap { dst, arr, worker, path } => {
+            LS::Pmap { dst, arr, worker } => {
                 // Sequential in the browser (no threads without cross-origin isolation).
                 let (widx, w) = self.cx.workers[worker];
                 let it = self.f.vars[*dst].ty.clone();
@@ -983,11 +848,6 @@ impl<'c, 'p> Fx<'c, 'p> {
                 self.load(&in_t, addr, 0);
                 self.ins().call(widx);
                 let vals = self.pop(&vts(&out_t));
-                let ok = self.pop(&[I])[0];
-                self.ins().local_get(ok).i32_eqz();
-                self.if_(vec![]);
-                self.err_path(path, ErrSrc::Pending);
-                self.end();
                 self.ins().local_get(out).local_get(i).i64_const(oesz).i64_mul().i64_add().local_set(addr);
                 self.store(&out_t, addr, 0, &vals);
                 self.ins().local_get(i).i64_const(1).i64_add().local_set(i).br(0);
@@ -1077,14 +937,6 @@ impl<'c, 'p> Fx<'c, 'p> {
         on_ovf(self);
         self.ins().local_get(r);
         self.end();
-    }
-
-    /// Push: b == 0, or (Div) a == MIN && b == -1.
-    fn div_bad(&mut self, op: Op, a: u32, b: u32) {
-        self.ins().local_get(b).i64_eqz();
-        if op == Op::Div {
-            self.ins().local_get(a).i64_const(i64::MIN).i64_eq().local_get(b).i64_const(-1).i64_eq().i32_and().i32_or();
-        }
     }
 
     /// Push truncating a / b or a % b (Go); b != 0, and not (Div) MIN / -1.

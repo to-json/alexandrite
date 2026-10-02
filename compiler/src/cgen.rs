@@ -507,6 +507,14 @@ impl FnEmit<'_> {
                 self.line(&format!("alx_die_str({x});"));
             }
             LS::Panic(msg, loc) => self.line(&format!("alx_panic({}, {});", c_str(msg), c_str(loc))),
+            LS::Exit(e) => {
+                let x = self.e(e);
+                self.line(&format!("exit((int)({x}));"));
+            }
+            LS::PanicStr(e) => {
+                let x = self.e(e);
+                self.line(&format!("alx_panic_str({x});"));
+            }
             LS::SortInPlace(v, el) => {
                 let f = match el {
                     LTy::I64 => "alx_sort_i64",
@@ -704,6 +712,9 @@ impl FnEmit<'_> {
                     Rt::RuneToS => s("alx_rune_to_s"),
                     Rt::FileStatus => s("alx_file_status"),
                     Rt::FileRead => s("alx_file_read_or_empty"),
+                    Rt::NowNs => s("alx_now_ns"),
+                    Rt::CapBegin => s("alx_cap_begin"),
+                    Rt::CapEnd => s("alx_cap_end"),
                     Rt::StrFromBytes => format!("alx_str_from_bytes((const uint8_t *)({0}).ptr, ({0}).len)", a[0]),
                 }
             }

@@ -171,6 +171,10 @@ fn build(file: &str, o: &Options) -> Result<PathBuf, ExitCode> {
             return Err(ExitCode::from(1));
         }
     };
+    build_loaded(l, file, o)
+}
+
+fn build_loaded(l: front::Loaded, file: &str, o: &Options) -> Result<PathBuf, ExitCode> {
     let cache = cache_dir(Path::new(file));
     let fail = |m: String| {
         eprintln!("alx: {m}");
@@ -257,6 +261,64 @@ pub fn build_only(file: &str, o: &Options) -> ExitCode {
     }
 }
 
+/// `100ms`, `2s`, `1.5s`, `250us`, `1000ns`, or bare seconds.
+pub fn parse_duration_ns(s: &str) -> Option<i64> {
+    let s = s.trim();
+    let (num, mult) = if let Some(n) = s.strip_suffix("ms") {
+        (n, 1e6)
+    } else if let Some(n) = s.strip_suffix("us") {
+        (n, 1e3)
+    } else if let Some(n) = s.strip_suffix("ns") {
+        (n, 1.0)
+    } else if let Some(n) = s.strip_suffix('s') {
+        (n, 1e9)
+    } else {
+        (s, 1e9)
+    };
+    let v: f64 = num.parse().ok()?;
+    (v > 0.0).then_some((v * mult) as i64)
+}
+
+/// `alx test [path]`: the tests of a directory (or one `_test.alx` file),
+/// compiled together with the package beside them and run by a generated
+/// runner. JIT by default, the C backend with `--release`.
+pub fn test(target: &str, t: &front::TestOpts, o: &Options) -> ExitCode {
+    let path = Path::new(target);
+    let (dir, only) = if path.is_dir() { (path.to_path_buf(), None) } else { (path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new(".")).to_path_buf(), Some(path)) };
+    let shown = if only.is_some() { path.parent().map(|p| p.to_string_lossy().to_string()).filter(|s| !s.is_empty()).unwrap_or_else(|| ".".into()) } else { target.trim_end_matches('/').to_string() };
+    let shown = if shown.is_empty() { "/".to_string() } else { shown };
+    if only.is_some() && !target.ends_with("_test.alx") {
+        eprintln!("alx: `{target}` is not a `*_test.alx` file or a directory");
+        return ExitCode::from(2);
+    }
+    let (l, all) = match front::load_tests(&dir, &shown, only, t) {
+        Ok((l, n, total)) => (l, n == total),
+        Err((sm, d)) => {
+            eprint!("{}", sm.render(&d));
+            return ExitCode::from(1);
+        }
+    };
+    // Warnings are errors in tests (P3).
+    // Bodies that aren't run aren't checked, so only a full run can judge unused imports.
+    let strict = Options { strict: all, release: o.release, sanitize: o.sanitize, verbose: o.verbose, ..Default::default() };
+    if o.release || o.sanitize {
+        let file = dir.join("alx_test.alx").to_string_lossy().to_string();
+        let bin = match build_loaded(l, &file, &strict) {
+            Ok(b) => b,
+            Err(c) => return c,
+        };
+        let bin = if bin.is_relative() { Path::new(".").join(&bin) } else { bin };
+        return match Command::new(&bin).status() {
+            Ok(s) => ExitCode::from(s.code().unwrap_or(1) as u8),
+            Err(e) => {
+                eprintln!("alx: cannot run {}: {e}", bin.display());
+                ExitCode::from(3)
+            }
+        };
+    }
+    run_loaded(l, &strict)
+}
+
 /// `alx run` without --release/--sanitize: whole program from source,
 /// compiled in memory by the Cranelift JIT, run in this process.
 fn run_jit(file: &str, o: &Options) -> ExitCode {
@@ -267,6 +329,10 @@ fn run_jit(file: &str, o: &Options) -> ExitCode {
             return ExitCode::from(1);
         }
     };
+    run_loaded(l, o)
+}
+
+fn run_loaded(l: front::Loaded, o: &Options) -> ExitCode {
     let p = match front::check_program(&l, front::lib_defs(&l)) {
         Ok(p) => p,
         Err(d) => {

@@ -1,6 +1,6 @@
 //! Front end: load, parse (with imported packages), check, prove.
 
-use crate::ast::{import_name, Import, Module, NodeId, Overflow};
+use crate::ast::{import_name, Import, Module, NodeId, Overflow, TestDecl, TestKind};
 use std::collections::{HashMap, HashSet};
 use crate::check::{DefInfo, World};
 use crate::diag::{Diag, SourceMap, Span};
@@ -231,6 +231,9 @@ pub fn load_with(path: &Path, display: &str, read: &dyn Fn(&Path) -> std::io::Re
         Ok(m) => m,
         Err(d) => return Err((sm, d)),
     };
+    if let Some(t) = main.tests.first() {
+        return Err((sm, not_a_test_file(t)));
+    }
     let dir = path.parent().unwrap_or(Path::new("."));
     let mods = match load_mods(dir, read) {
         Ok(m) => m,
@@ -287,6 +290,9 @@ fn load_pkg(
         if let Some(s) = m.main.first() {
             return Err(Diag::new(s.span, format!("a package (`{path}`) holds only declarations; move statements into a def")));
         }
+        if let Some(t) = m.tests.first() {
+            return Err(not_a_test_file(t));
+        }
         overflow.insert(m.file, m.overflow);
         for i in &m.imports {
             load_pkg(i, mods, sm, next_id, pkgs, visiting, overflow, read, list, shown_root)?;
@@ -294,14 +300,7 @@ fn load_pkg(
         merged = Some(match merged {
             None => m,
             Some(mut acc) => {
-                acc.imports.extend(m.imports);
-                acc.public.extend(m.public);
-                acc.defs.extend(m.defs);
-                acc.structs.extend(m.structs);
-                acc.enums.extend(m.enums);
-                acc.ifaces.extend(m.ifaces);
-                acc.refines.extend(m.refines);
-                acc.consts.extend(m.consts);
+                merge_decls(&mut acc, m);
                 acc
             }
         });
@@ -311,6 +310,44 @@ fn load_pkg(
     qualify(&mut m, &path);
     pkgs.push(Package { path, module: m, source });
     Ok(())
+}
+
+fn merge_decls(acc: &mut Module, m: Module) {
+    acc.imports.extend(m.imports);
+    acc.public.extend(m.public);
+    acc.defs.extend(m.defs);
+    acc.structs.extend(m.structs);
+    acc.enums.extend(m.enums);
+    acc.ifaces.extend(m.ifaces);
+    acc.refines.extend(m.refines);
+    acc.consts.extend(m.consts);
+}
+
+fn not_a_test_file(t: &TestDecl) -> Diag {
+    let kw = match t.kind {
+        TestKind::Test => "test",
+        TestKind::Bench => "bench",
+        TestKind::Example => "example",
+    };
+    Diag::new(t.span, format!("`{kw}` blocks belong in a `*_test.alx` file"))
+}
+
+/// One test, benchmark or example of an `alx test` run.
+pub struct TestItem {
+    pub kind: TestKind,
+    pub name: String,
+    /// The def holding the body.
+    pub func: String,
+    pub outputs: Option<String>,
+}
+
+/// What `alx test` was asked for.
+pub struct TestOpts {
+    /// Only tests and examples whose name contains this.
+    pub run: Option<String>,
+    /// Benchmarks run only when set: `.` for all, else a substring of the name.
+    pub bench: Option<String>,
+    pub bench_ns: i64,
 }
 
 /// Prefix every name a package declares with its path (`geom.area`).
@@ -569,4 +606,212 @@ fn parse_ty(s: &str) -> Result<Ty, String> {
         }
         _ => return Err(format!("bad header type `{s}`")),
     })
+}
+
+// ---------- alx test ----------
+
+/// An alx string literal for `s`.
+fn alx_quote(s: &str) -> String {
+    let mut o = String::from("\"");
+    for c in s.chars() {
+        match c {
+            '\\' => o.push_str("\\\\"),
+            '"' => o.push_str("\\\""),
+            '#' => o.push_str("\\#"),
+            '\n' => o.push_str("\\n"),
+            '\t' => o.push_str("\\t"),
+            '\0' => o.push_str("\\0"),
+            c => o.push(c),
+        }
+    }
+    o.push('"');
+    o
+}
+
+const RUNNER_HELPERS: &str = r#"
+def __alx_rtrim(s: Str) -> Str {
+  b = s.bytes
+  n = b.size
+  while n > 0 && (b[n - 1] == 10 || b[n - 1] == 32 || b[n - 1] == 13 || b[n - 1] == 9) {
+    n -= 1
+  }
+  s[0...n]
+}
+
+def __alx_msg(m: Str) -> Str {
+  if m.size >= 13 && m[0...13] == "alexandrite: " {
+    return m[13..]
+  }
+  m
+}
+
+def __alx_secs(ns: Int) -> Str {
+  format("%.2f", ns.to_f / 1000000000.0)
+}
+
+def __alx_secs3(ns: Int) -> Str {
+  format("%.3f", ns.to_f / 1000000000.0)
+}
+
+def __alx_fail(name: Str, ns: Int, m: Str) -> Int {
+  puts "--- FAIL: #{name} (#{__alx_secs(ns)}s)"
+  for line in m.split("\n") {
+    puts "    #{line}"
+  }
+  1
+}
+
+def __alx_pass(name: Str, ns: Int) -> Int {
+  puts "--- PASS: #{name} (#{__alx_secs(ns)}s)"
+  0
+}
+"#;
+
+/// The runner: a program (in alx) that runs each item as its own task.
+fn runner_source(items: &[TestItem], dir: &str, o: &TestOpts) -> String {
+    let mut s = String::from(RUNNER_HELPERS);
+    s.push_str("\n__fails = 0\n__start = Time.now_ns\n");
+    let order = [TestKind::Test, TestKind::Bench, TestKind::Example];
+    for kind in order {
+        for it in items.iter().filter(|i| i.kind == kind) {
+            let name = alx_quote(&it.name);
+            let f = &it.func;
+            match kind {
+                TestKind::Test | TestKind::Example => {
+                    let ex = kind == TestKind::Example;
+                    s.push_str(&format!("puts \"=== RUN   \" + {name}\n__t0 = Time.now_ns\n"));
+                    if ex {
+                        s.push_str("Test.begin_capture\n");
+                    }
+                    s.push_str(&format!("__r = (spawn {{ ~{f}(); 0 }}).wait\n"));
+                    if ex {
+                        s.push_str("__got = __alx_rtrim(Test.end_capture)\n");
+                    }
+                    s.push_str("__d = Time.now_ns - __t0\n");
+                    s.push_str(&format!("if __e = __r.err {{\n  __fails += 1\n  __alx_fail({name}, __d, __alx_msg(\"#{{__e}}\"))\n}} else {{\n"));
+                    if ex {
+                        let want = alx_quote(it.outputs.as_deref().unwrap_or("").trim_end());
+                        s.push_str(&format!("  if __got == {want} {{\n    __alx_pass({name}, __d)\n  }} else {{\n    __fails += 1\n    __alx_fail({name}, __d, \"got:\\n#{{__got}}\\nwant:\\n\" + {want})\n  }}\n"));
+                    } else {
+                        s.push_str(&format!("  __alx_pass({name}, __d)\n"));
+                    }
+                    s.push_str("}\n");
+                }
+                TestKind::Bench => {
+                    let bname = alx_quote(&format!("Benchmark{}", it.name.replace(' ', "_")));
+                    s.push_str(&format!(
+                        "__n = 1\n__done = false\n__bname = {bname}\nwhile __done == false {{\n  __t0 = Time.now_ns\n  __r = (spawn {{ __i = 0; while __i < __n {{ ~{f}(); __i += 1 }}; 0 }}).wait\n  __d = Time.now_ns - __t0\n  if __e = __r.err {{\n    __fails += 1\n    __alx_fail(__bname, __d, __alx_msg(\"#{{__e}}\"))\n    __done = true\n  }} else {{\n    if __d >= {} || __n >= 1000000000 {{\n      puts \"#{{__bname}}   #{{__n}}   #{{format(\"%.1f\", __d.to_f / __n.to_f)}} ns/op\"\n      __done = true\n    }} else {{\n      __pred = __n * 2\n      if __d > 0 {{\n        __pred = ({}.to_f * __n.to_f / __d.to_f).to_i\n        __pred = __pred + __pred / 5\n      }}\n      if __pred > __n * 100 {{\n        __pred = __n * 100\n      }}\n      if __pred <= __n {{\n        __pred = __n + 1\n      }}\n      if __pred > 1000000000 {{\n        __pred = 1000000000\n      }}\n      __n = __pred\n    }}\n  }}\n}}\n",
+                        o.bench_ns, o.bench_ns
+                    ));
+                }
+            }
+        }
+    }
+    let dir = alx_quote(dir);
+    s.push_str(&format!(
+        "__total = Time.now_ns - __start\nif __fails > 0 {{\n  puts \"FAIL\"\n  puts \"FAIL   \" + {dir} + \" #{{__alx_secs3(__total)}}s\"\n  Test.exit(1)\n}}\nputs \"PASS\"\nputs \"ok     \" + {dir} + \" #{{__alx_secs3(__total)}}s\"\n"
+    ));
+    s
+}
+
+/// Load the tests of directory `dir` (or the one test file `only` in it):
+/// the package's other `.alx` files and the test files are merged into one
+/// module (tests see the package's private names), then a generated runner.
+/// `dir_shown` is how the directory was written on the command line.
+pub fn load_tests(dir: &Path, dir_shown: &str, only: Option<&Path>, o: &TestOpts) -> Result<(Loaded, usize, usize), (SourceMap, Diag)> {
+    let mut sm = SourceMap::default();
+    let fail = |sm: SourceMap, msg: String| Err((sm, Diag::new(Span::default(), msg)));
+    let mut files: Vec<PathBuf> = match std::fs::read_dir(dir) {
+        Ok(rd) => rd.filter_map(|e| e.ok().map(|e| e.path())).filter(|p| p.extension().is_some_and(|e| e == "alx")).collect(),
+        Err(e) => {
+            sm.add(dir_shown.into(), String::new());
+            return fail(sm, format!("cannot read `{dir_shown}`: {e}"));
+        }
+    };
+    files.sort();
+    let is_test = |p: &Path| p.to_string_lossy().ends_with("_test.alx");
+    let tests: Vec<PathBuf> = match only {
+        Some(f) => vec![f.to_path_buf()],
+        None => files.iter().filter(|p| is_test(p)).cloned().collect(),
+    };
+    if tests.is_empty() {
+        sm.add(dir_shown.into(), String::new());
+        return fail(sm, format!("no `*_test.alx` files in `{dir_shown}`"));
+    }
+    let shown = |f: &Path| {
+        let name = f.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+        if dir_shown == "." || dir_shown.is_empty() { name } else { format!("{}/{name}", dir_shown.trim_end_matches('/')) }
+    };
+    let mut next_id = 0;
+    let mut overflow = HashMap::new();
+    let mut acc: Option<Module> = None;
+    let mut decls: Vec<TestDecl> = vec![];
+    for f in files.iter().filter(|p| !is_test(p)).chain(tests.iter()) {
+        let text = match std::fs::read_to_string(f) {
+            Ok(t) => t,
+            Err(e) => {
+                sm.add(shown(f), String::new());
+                return fail(sm, format!("cannot read `{}`: {e}", f.display()));
+            }
+        };
+        let test_file = is_test(f);
+        let mut m = match parse_file(&mut sm, shown(f), text, &mut next_id) {
+            Ok(m) => m,
+            Err(d) => return Err((sm, d)),
+        };
+        if let Some(s) = m.main.first() {
+            let why = if test_file { "a test file holds only declarations and test blocks; move statements into a `test`" } else { "a package holds only declarations; move statements into a def" };
+            return Err((sm, Diag::new(s.span, why)));
+        }
+        overflow.insert(m.file, m.overflow);
+        decls.append(&mut m.tests);
+        match &mut acc {
+            None => acc = Some(m),
+            Some(a) => merge_decls(a, m),
+        }
+    }
+    let mut acc = acc.unwrap();
+    // Every body becomes a def; pick what to run.
+    let mut items = vec![];
+    let total = decls.len();
+    for (k, mut t) in decls.into_iter().enumerate() {
+        let func = format!("__alx_t{k}");
+        t.def.name = func.clone();
+        acc.defs.push(t.def);
+        let wanted = match t.kind {
+            TestKind::Bench => o.bench.as_ref().is_some_and(|b| b == "." || t.name.contains(b.as_str())),
+            _ => o.run.as_ref().is_none_or(|r| t.name.contains(r.as_str())),
+        };
+        if wanted {
+            items.push(TestItem { kind: t.kind, name: t.name, func, outputs: t.outputs });
+        }
+    }
+    let (n, total) = (items.len(), total);
+    let mut runner = match parse_file(&mut sm, "<alx test>".into(), runner_source(&items, dir_shown, o), &mut next_id) {
+        Ok(m) => m,
+        Err(d) => return Err((sm, d)),
+    };
+    let read = |p: &Path| std::fs::read_to_string(p);
+    let mods = match load_mods(dir, &read) {
+        Ok(m) => m,
+        Err(d) => return Err((sm, d)),
+    };
+    // The runner is the main module; the merged declarations join it.
+    let imports = acc.imports.clone();
+    merge_decls(&mut runner, acc);
+    let list = |p: &Path| -> std::io::Result<Vec<PathBuf>> {
+        let mut v: Vec<PathBuf> = std::fs::read_dir(p)?.filter_map(|e| e.ok().map(|e| e.path())).collect();
+        v.sort();
+        Ok(v)
+    };
+    let mut pkgs: Vec<Package> = vec![];
+    let mut visiting: Vec<String> = vec![];
+    let root = if dir_shown == "." { PathBuf::new() } else { PathBuf::from(dir_shown) };
+    for imp in &imports {
+        if let Err(d) = load_pkg(imp, &mods, &mut sm, &mut next_id, &mut pkgs, &mut visiting, &mut overflow, &read, &list, &root) {
+            return Err((sm, d));
+        }
+    }
+    overflow.insert(runner.file, Overflow::Abort);
+    Ok((Loaded { sm, main: runner, pkgs, overflow }, n, total))
 }

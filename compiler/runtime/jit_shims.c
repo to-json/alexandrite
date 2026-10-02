@@ -61,6 +61,11 @@ int64_t alxj_try_pow(int64_t a, int64_t b, int64_t *r) { return alx_try_pow(a, b
 
 /* ---------- errors ---------- */
 void alxj_die_str(const AlxStr *s) { alx_die_str(*s); }
+void alxj_exit(int64_t code) { exit((int)code); }
+void alxj_panic_str(const AlxStr *m) { alx_panic_str(*m); }
+int64_t alxj_now_ns(void) { return alx_now_ns(); }
+int64_t alxj_cap_begin(void) { return alx_cap_begin(); }
+void alxj_cap_end(AlxStr *out) { *out = alx_cap_end(); }
 int64_t alxj_file_status(const AlxStr *path) { return alx_file_status(*path); }
 void alxj_file_read_or_empty(AlxStr *out, const AlxStr *path) { *out = alx_file_read_or_empty(*path); }
 

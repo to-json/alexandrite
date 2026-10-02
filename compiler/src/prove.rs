@@ -65,7 +65,7 @@ fn scan_assigns(e: &TExpr, c: &mut HashSet<LocalId>) {
 
 pub(crate) fn each_child(e: &TExpr, f: &mut dyn FnMut(&TExpr)) {
     match &e.kind {
-        TK::Assign(_, v) | TK::Neg(v) | TK::Not(v) | TK::Try(v) | TK::Puts(v) | TK::Some(v) => f(v),
+        TK::Assign(_, v) | TK::Neg(v) | TK::Not(v) | TK::Try(v) | TK::Puts(v) | TK::Panic(v) | TK::Some(v) => f(v),
         TK::IndexAssign(_, i, v) => {
             f(i);
             f(v);

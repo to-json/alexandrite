@@ -44,6 +44,8 @@ void alx_init(void);
 
 /* ---------- panics ---------- */
 _Noreturn void alx_panic(const char *what, const char *loc);
+/* A panic with a computed message (no "alexandrite: " prefix). */
+_Noreturn void alx_panic_str(AlxStr msg);
 _Noreturn void alx_overflow(const char *loc);
 
 static inline int64_t alx_idx(int64_t i, int64_t n, const char *loc) {
@@ -175,6 +177,10 @@ void alx_sort_str(Arr_Str *a);
 _Noreturn void alx_die_str(AlxStr msg);
 int64_t alx_file_status(AlxStr path);
 AlxStr alx_file_read_or_empty(AlxStr path);
+/* Test support: a monotonic clock, and process-wide capture of stdout. */
+int64_t alx_now_ns(void);
+int64_t alx_cap_begin(void);
+AlxStr alx_cap_end(void);
 
 /* ---------- output ---------- */
 void alx_puts_i64(int64_t v);

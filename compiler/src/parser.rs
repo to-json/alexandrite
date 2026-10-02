@@ -118,7 +118,7 @@ impl<'a> Parser<'a> {
     // ---------- module ----------
 
     fn module(&mut self, file: u32) -> PResult<Module> {
-        let mut m = Module { file, overflow: Overflow::Abort, imports: vec![], public: Default::default(), defs: vec![], structs: vec![], enums: vec![], refines: vec![], ifaces: vec![], consts: vec![], main: vec![] };
+        let mut m = Module { file, overflow: Overflow::Abort, imports: vec![], public: Default::default(), defs: vec![], structs: vec![], enums: vec![], refines: vec![], ifaces: vec![], consts: vec![], main: vec![], tests: vec![] };
         self.skip_newlines();
         while let Tok::Directive(name, arg) = self.peek().clone() {
             let sp = self.bump().span;
@@ -154,6 +154,34 @@ impl<'a> Parser<'a> {
                         Tok::Str(s) => m.imports.push(Import { alias, path: s, span: sp.to(self.prev_span()) }),
                         _ => return Err(Diag::new(sp, "`import` takes a string path: `import \"geom\"`")),
                     }
+                }
+                Tok::Ident(kw) if matches!(kw.as_str(), "test" | "bench" | "example") && matches!(self.peek_at(1), Tok::Str(_)) && matches!(self.peek_at(2), Tok::Op("{")) && !self.is_local(&kw) => {
+                    let start = self.bump().span;
+                    let Tok::Str(name) = self.bump().tok else { unreachable!() };
+                    let name_span = self.prev_span();
+                    self.scopes.push(HashSet::new());
+                    let body = self.braced_stmts();
+                    self.scopes.pop();
+                    let body = body?;
+                    let kind = match kw.as_str() {
+                        "test" => TestKind::Test,
+                        "bench" => TestKind::Bench,
+                        _ => TestKind::Example,
+                    };
+                    let mut outputs = None;
+                    if kind == TestKind::Example {
+                        if !matches!(self.peek(), Tok::Ident(o) if o == "outputs") {
+                            return Err(Diag::new(self.span(), "an `example` ends with `outputs \"expected text\"`"));
+                        }
+                        self.bump();
+                        match self.bump().tok {
+                            Tok::Str(s) => outputs = Some(s),
+                            _ => return Err(Diag::new(self.prev_span(), "`outputs` takes a string literal")),
+                        }
+                    }
+                    let span = start.to(self.prev_span());
+                    let def = Def { public: false, using: self.usings.clone(), name: name.clone(), span, tparams: vec![], name_span, params: vec![], ret: None, fallible: true, errs: None, pure: false, body };
+                    m.tests.push(TestDecl { kind, name, span, outputs, def });
                 }
                 Tok::Ident(kw) if kw == "pub" => {
                     // `pub def`, `pub struct`, `pub enum`, `pub error`, `pub interface`, `pub NAME = ...`

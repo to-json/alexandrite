@@ -232,7 +232,7 @@ impl<'a> World<'a> {
         let enums: Vec<&EnumDef> = enums.iter().filter(|d| d.tparams.is_empty()).collect();
         let all = defs.iter().copied().map(|d| (d.name.as_str(), d.span, Def::S(d))).chain(enums.iter().copied().map(|d| (d.name.as_str(), d.span, Def::E(d))));
         for (name, span, d) in all {
-            if by_name.contains_key(name) || self.structs.contains_key(name) || self.consts.contains_key(name) || ["Int", "Float", "Bool", "Str", "Array", "Map", "Math", "File", "Enumerator", "Error"].contains(&name) {
+            if by_name.contains_key(name) || self.structs.contains_key(name) || self.consts.contains_key(name) || ["Int", "Float", "Bool", "Str", "Array", "Map", "Math", "File", "Time", "Test", "Enumerator", "Error"].contains(&name) {
                 return Err(Diag::new(span, format!("`{name}` is already defined")));
             }
             by_name.insert(name, d);
@@ -1311,6 +1311,7 @@ impl<'w, 'a> FnCx<'w, 'a> {
             ),
             TK::Try(x) => TK::Try(b(x)),
             TK::Puts(x) => TK::Puts(b(x)),
+            TK::Panic(x) => TK::Panic(b(x)),
             TK::Array(xs) => TK::Array(xs.into_iter().map(|a| self.zonk(a)).collect()),
             TK::Format(ps, xs) => TK::Format(ps, xs.into_iter().map(|a| self.zonk(a)).collect()),
             TK::Seq(ss) => TK::Seq(self.zonk_stmts(ss)),
@@ -3282,6 +3283,45 @@ impl<'w, 'a> FnCx<'w, 'a> {
                 let v = self.show_value(v)?;
                 return Ok(self.mk(TK::Puts(Box::new(v)), Ty::Unit, sp));
             }
+            "assert" if self.w.by_name.get("assert").is_none() => {
+                if args.len() != 1 {
+                    return Err(Diag::new(sp, "`assert` takes one argument: `assert cond`"));
+                }
+                let c = self.value(&args[0])?;
+                self.expect(&c.ty, &Ty::Bool, c.span, "`assert` condition")?;
+                let text = format!("assertion failed: {} at {}", self.w.sm.snippet(args[0].span).trim(), self.w.sm.loc(sp));
+                let msg = self.mk(TK::Str(text), Ty::Str, sp);
+                let fail = self.mk(TK::Panic(Box::new(msg)), Ty::Unit, sp);
+                let neg = self.mk(TK::Not(Box::new(c)), Ty::Bool, sp);
+                return Ok(self.mk(TK::Seq(vec![TStmt::If(neg, vec![TStmt::Expr(fail)], vec![])]), Ty::Unit, sp));
+            }
+            "assert_eq" if self.w.by_name.get("assert_eq").is_none() => {
+                if args.len() != 2 {
+                    return Err(Diag::new(sp, "`assert_eq` takes two arguments: `assert_eq actual, expected`"));
+                }
+                let a = self.value(&args[0])?;
+                let b = self.value(&args[1])?;
+                let b = self.coerce(b, &a.ty)?;
+                let (aid, s1) = self.opt_tmp(a.clone(), sp);
+                let (bid, s2) = self.opt_tmp(b.clone(), sp);
+                let la = self.mk(TK::Local(aid), a.ty.clone(), sp);
+                let lb = self.mk(TK::Local(bid), b.ty.clone(), sp);
+                let eq = self.binary(BinOp::Eq, la.clone(), lb.clone(), sp)?;
+                let mut vals = vec![];
+                for (v, x) in [(la, &args[0]), (lb, &args[1])] {
+                    let v = self.show_value(v)?;
+                    let t = self.resolve(&v.ty);
+                    if !printable(&t) {
+                        return Err(Diag::new(x.span, format!("can't show a {} in `assert_eq` yet", t.show())));
+                    }
+                    vals.push(v);
+                }
+                let pieces = vec![FmtPiece::Lit(format!("assert_eq failed at {}: got ", self.w.sm.loc(sp))), FmtPiece::Str(0), FmtPiece::Lit(", want ".into()), FmtPiece::Str(1)];
+                let msg = self.mk(TK::Format(pieces, vals), Ty::Str, sp);
+                let fail = self.mk(TK::Panic(Box::new(msg)), Ty::Unit, sp);
+                let neg = self.mk(TK::Not(Box::new(eq)), Ty::Bool, sp);
+                return Ok(self.mk(TK::Seq(vec![s1, s2, TStmt::If(neg, vec![TStmt::Expr(fail)], vec![])]), Ty::Unit, sp));
+            }
             "loop" => {
                 let Some(b) = block else { return Err(Diag::new(sp, "`loop` needs a block")) };
                 self.loops.push(LoopKind::While);
@@ -3636,6 +3676,27 @@ impl<'w, 'a> FnCx<'w, 'a> {
                 self.expect(&a[0].ty, &Ty::Int, a[0].span, "Array.new size")?;
                 let el = a[1].ty.clone();
                 Ok(self.mk(TK::M(M::ArrayNew, None, a, None), Ty::arr(el), sp))
+            }
+            ("Time", "now_ns") => {
+                if !args.is_empty() {
+                    return Err(Diag::new(sp, "`Time.now_ns` takes no arguments"));
+                }
+                self.impure = true;
+                Ok(self.mk(TK::M(M::NowNs, None, vec![], None), Ty::Int, sp))
+            }
+            ("Test", "exit") => {
+                let a = argv(self)?;
+                if a.len() != 1 {
+                    return Err(Diag::new(sp, "`Test.exit` takes one argument, the status"));
+                }
+                self.expect(&a[0].ty, &Ty::Int, a[0].span, "Test.exit status")?;
+                self.impure = true;
+                Ok(self.mk(TK::M(M::Exit, None, a, None), Ty::Unit, sp))
+            }
+            ("Test", "begin_capture") | ("Test", "end_capture") => {
+                self.impure = true;
+                let (m, ty) = if name == "begin_capture" { (M::CapBegin, Ty::Unit) } else { (M::CapEnd, Ty::Str) };
+                Ok(self.mk(TK::M(m, None, vec![], None), ty, sp))
             }
             ("File", "read") => {
                 if self.pure_decl {

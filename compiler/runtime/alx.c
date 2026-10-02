@@ -57,6 +57,18 @@ void alx_panic(const char *what, const char *loc) {
     abort();
 }
 
+void alx_panic_str(AlxStr msg) {
+    if (tl_task) {
+        size_t n = (size_t)msg.len + 14;
+        char *m = malloc(n);
+        if (m) snprintf(m, n, "alexandrite: %.*s", (int)msg.len, msg.ptr);
+        task_panic(m);
+    }
+    fflush(stdout);
+    fprintf(stderr, "alexandrite: %.*s\n", (int)msg.len, msg.ptr);
+    abort();
+}
+
 void alx_overflow(const char *loc) {
     static const char hint[] = "hint: add `#![overflow(promote)]` to this file to promote to bignums";
     if (tl_task) {
@@ -246,6 +258,47 @@ AlxStr alx_file_read_or_empty(AlxStr path) {
     if (file_read(path, &out, &not_found)) return out;
     AlxStr e = { "", 0 };
     return e;
+}
+
+/* ---------- test support ---------- */
+
+int64_t alx_now_ns(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec * 1000000000 + ts.tv_nsec;
+}
+
+/* Capture redirects file descriptor 1 into an anonymous file, so it sees
+ * everything printed by any backend's `puts`. One capture at a time. */
+static FILE *cap_file;
+static int cap_saved = -1;
+
+int64_t alx_cap_begin(void) {
+    fflush(stdout);
+    if (cap_file) return 0;
+    cap_file = tmpfile();
+    if (!cap_file) return 0;
+    cap_saved = dup(1);
+    dup2(fileno(cap_file), 1);
+    return 0;
+}
+
+AlxStr alx_cap_end(void) {
+    AlxStr e = { "", 0 };
+    if (!cap_file) return e;
+    fflush(stdout);
+    dup2(cap_saved, 1);
+    close(cap_saved);
+    cap_saved = -1;
+    fflush(cap_file);
+    long n = ftell(cap_file);
+    fseek(cap_file, 0, SEEK_SET);
+    char *p = alx_alloc((size_t)(n > 0 ? n : 1));
+    size_t got = n > 0 ? fread(p, 1, (size_t)n, cap_file) : 0;
+    fclose(cap_file);
+    cap_file = NULL;
+    AlxStr out = { p, (int64_t)got };
+    return out;
 }
 
 /* ---------- floats ---------- */

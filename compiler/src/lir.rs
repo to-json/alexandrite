@@ -187,6 +187,12 @@ pub enum Rt {
     FileStatus,
     /// (path): the file's contents; empty on failure (check `FileStatus` first).
     FileRead,
+    /// (): monotonic clock, nanoseconds (I64).
+    NowNs,
+    /// (): start capturing everything `puts` prints (I64, always 0). Process-wide.
+    CapBegin,
+    /// (): stop capturing; the Str of what was printed since `CapBegin`.
+    CapEnd,
 }
 
 /// Primitive integer operations on i64 registers. The lowering builds Go's
@@ -243,6 +249,11 @@ pub enum LS {
     Pmap { dst: V, arr: LE, worker: usize },
     Puts(LE, LTy),
     Panic(String, String),
+    /// Panic with a computed message (a Str, without the `alexandrite: `
+    /// prefix, which the runtime adds). Task-aware like `Panic`.
+    PanicStr(LE),
+    /// Flush stdout and exit the process with this status (an I64).
+    Exit(LE),
     /// Start a task running `workers[worker]` on `env` (a value of the
     /// worker's `input` type, copied); `dst` (an `LTy::Task`) gets its handle.
     /// A panic inside the task ends only that task (see `Wait`); a panic on

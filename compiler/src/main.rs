@@ -8,7 +8,8 @@ use std::process::ExitCode;
 const USAGE: &str = "usage: alx run [--release] [--sanitize] [--expect VALUE] [--emit-c FILE] [--emit-rust FILE] [-v] file.alx
        alx build [--release] [--sanitize] [-o OUT] file.alx
        alx check file.alx
-       alx fmt [--check] [files|dirs...]";
+       alx fmt [--check] [files|dirs...]
+       alx test [--release] [-run NAME] [-bench NAME] [-benchtime DUR] [dir | file_test.alx]";
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -21,6 +22,10 @@ fn main() -> ExitCode {
     }
     let mut o = driver::Options::default();
     let mut file = None;
+    let mut t = alx::front::TestOpts { run: None, bench: None, bench_ns: 500_000_000 };
+    if let Some(v) = std::env::var("ALX_BENCHTIME").ok().and_then(|v| driver::parse_duration_ns(&v)) {
+        t.bench_ns = v;
+    }
     let mut i = 1;
     while i < args.len() {
         let a = args[i].as_str();
@@ -34,6 +39,15 @@ fn main() -> ExitCode {
             "-v" | "--verbose" => o.verbose = true,
             "--strict" => o.strict = true,
             "--expect" => o.expect = val(),
+            "-run" => t.run = val(),
+            "-bench" => t.bench = val(),
+            "-benchtime" => match val().as_deref().and_then(driver::parse_duration_ns) {
+                Some(ns) => t.bench_ns = ns,
+                None => {
+                    eprintln!("alx: `-benchtime` takes a duration like `100ms` or `2s`");
+                    return ExitCode::from(2);
+                }
+            },
             "--emit-c" => o.emit_c = val(),
             "--emit-rust" => o.emit_rust = val(),
             "-o" => o.out = val(),
@@ -44,6 +58,9 @@ fn main() -> ExitCode {
             }
         }
         i += 1;
+    }
+    if cmd == "test" {
+        return driver::test(file.as_deref().unwrap_or("."), &t, &o);
     }
     let Some(file) = file else {
         eprintln!("{USAGE}");

@@ -896,6 +896,18 @@ impl<'c, 'p> Fx<'c, 'p> {
                 self.ins().unreachable();
             }
             LS::Panic(msg, loc) => self.panic(msg, loc),
+            LS::Exit(e) => {
+                self.e(e);
+                self.ins().drop();
+                self.str_const("");
+                self.rt("alxr_die_str");
+                self.ins().unreachable();
+            }
+            LS::PanicStr(e) => {
+                self.e(e);
+                self.rt("alxr_die_str");
+                self.ins().unreachable();
+            }
             LS::SortInPlace(v, el) => {
                 let a = self.vars[*v].clone();
                 self.ins().local_get(a[0]).local_get(a[1]);
@@ -1088,8 +1100,8 @@ impl<'c, 'p> Fx<'c, 'p> {
             LE::Cond(_, a, _) => self.ty(a),
             LE::Call(f, _) => self.cx.funcs[f.as_str()].1.ret.clone(),
             LE::Rt(r, args) => match r {
-                Rt::IntToS | Rt::PIntToS | Rt::StrRev | Rt::StrDelete | Rt::FToS | Rt::FFmt | Rt::StrCat | Rt::U64ToS | Rt::IntFmt | Rt::RuneToS | Rt::StrFromBytes | Rt::FileRead => LTy::Str,
-                Rt::FileStatus => LTy::I64,
+                Rt::IntToS | Rt::PIntToS | Rt::StrRev | Rt::StrDelete | Rt::FToS | Rt::FFmt | Rt::StrCat | Rt::U64ToS | Rt::IntFmt | Rt::RuneToS | Rt::StrFromBytes | Rt::FileRead | Rt::CapEnd => LTy::Str,
+                Rt::FileStatus | Rt::NowNs | Rt::CapBegin => LTy::I64,
                 Rt::IntToF | Rt::FSqrt | Rt::FAbs => LTy::F64,
                 Rt::StrByte => {
                     if matches!(args[2], LE::I(0)) {
@@ -1574,6 +1586,10 @@ impl<'c, 'p> Fx<'c, 'p> {
             Rt::FToS => call_ret(self, "alxr_f_to_s", 2),
             Rt::U64ToS => call_ret(self, "alxr_u64_to_s", 2),
             Rt::IntFmt => call_ret(self, "alxr_int_fmt", 2),
+            Rt::NowNs | Rt::CapBegin => {
+                self.ins().i64_const(0);
+            }
+            Rt::CapEnd => self.str_const(""),
             Rt::FileStatus => call(self, "alxr_file_status"),
             Rt::FileRead => call_ret(self, "alxr_file_read_or_empty", 2),
             Rt::RuneToS => call_ret(self, "alxr_rune_to_s", 2),

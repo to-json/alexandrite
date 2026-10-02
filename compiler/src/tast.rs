@@ -301,6 +301,13 @@ pub enum M {
     MapKeys,
     MapValues,
     FileRead,
+    /// `Time.now_ns`: a monotonic clock in nanoseconds.
+    NowNs,
+    /// `Test.begin_capture` / `Test.end_capture`: capture what `puts` prints.
+    CapBegin,
+    CapEnd,
+    /// `Test.exit(code)`.
+    Exit,
     EnumNew,
     Loop,
 }
@@ -345,6 +352,8 @@ pub enum TK {
     M(M, Option<Box<TExpr>>, Vec<TExpr>, Option<Box<TBlock>>),
     Try(Box<TExpr>),
     Puts(Box<TExpr>),
+    /// Panic with this Str message (`assert`, `assert_eq`).
+    Panic(Box<TExpr>),
     Array(Vec<TExpr>),
     /// `place = v`, or `place op= v`: a local, then index and field steps.
     PlaceAssign(LocalId, Vec<TStep>, Option<BinOp>, Box<TExpr>),

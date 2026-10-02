@@ -464,6 +464,9 @@ pub fn check_program(l: &Loaded, externs: Vec<DefInfo>) -> Result<TProgram, Diag
     // Imports nothing refers to (packages compiled separately count as used).
     let mods = std::iter::once((String::new(), &l.main)).chain(l.pkgs.iter().filter(|p| !ext.contains(&p.path)).map(|p| (p.path.clone(), &p.module)));
     for (pkg, m) in mods {
+        if !pkg.is_empty() && is_std(&pkg) {
+            continue; // std packages import what only their uninstantiated generics use
+        }
         for i in &m.imports {
             let alias = import_name(i);
             if !crate::check::import_used(&pkg, &alias) && !ext.contains(i.path.trim_end_matches('/')) {

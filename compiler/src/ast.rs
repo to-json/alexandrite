@@ -90,6 +90,7 @@ pub struct Module {
     pub defs: Vec<Def>,
     pub structs: Vec<StructDef>,
     pub enums: Vec<EnumDef>,
+    pub ifaces: Vec<IfaceDef>,
     /// `NAME = expr` at the top level: compile-time constants (Go's exact rules).
     pub consts: Vec<ConstDef>,
     /// Top-level statements, run in order (the implicit `main`).
@@ -100,6 +101,8 @@ pub struct Module {
 pub struct Def {
     pub name: String,
     pub span: Span,
+    /// `def f[T, U: Shape]`: explicit type parameters (bounds checked per instance).
+    pub tparams: Vec<TParam>,
     pub name_span: Span,
     pub params: Vec<Param>,
     pub ret: Option<TypeExpr>,
@@ -121,7 +124,24 @@ pub struct ConstDef {
 pub struct StructDef {
     pub name: String,
     pub span: Span,
+    pub tparams: Vec<TParam>,
     pub fields: Vec<(String, TypeExpr, Span)>,
+}
+
+/// A type parameter: `T`, `T: Shape` (an interface), `T: like Int`.
+#[derive(Debug, Clone)]
+pub struct TParam {
+    pub name: String,
+    pub bound: Option<Bound>,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone)]
+pub enum Bound {
+    /// Implements this interface.
+    Iface(String),
+    /// `like Int`: any integer type; `like Float`: Float.
+    Like(String),
 }
 
 /// `enum Name { Variant(field: T, ...), Bare, ... }`: a sum type (a value).
@@ -129,7 +149,19 @@ pub struct StructDef {
 pub struct EnumDef {
     pub name: String,
     pub span: Span,
+    pub tparams: Vec<TParam>,
     pub variants: Vec<(String, Vec<(String, TypeExpr, Span)>, Span)>,
+}
+
+/// `interface Name { def m(x: T) -> R; def d -> R { default } }`: satisfied
+/// structurally. Required methods have no body; defaults are defs named
+/// `Name.m` whose `self` is generic (the concrete type).
+#[derive(Debug, Clone)]
+pub struct IfaceDef {
+    pub name: String,
+    pub span: Span,
+    /// Every method's signature (defaults too): name, params (after self), ret, has a default.
+    pub methods: Vec<(String, Vec<Param>, Option<TypeExpr>, bool, Span)>,
 }
 
 /// Methods are defs named `Type.name` whose first parameter is `self`.
@@ -156,6 +188,8 @@ pub enum TypeExpr {
     Fixed(Box<TypeExpr>, Box<Expr>, Span),
     /// `Name[T, ...]`: a generic type applied (`Map[Str, Int]`).
     App(String, Vec<TypeExpr>, Span),
+    /// `(A, B) -> R`: a function value (a lambda).
+    Fn(Vec<TypeExpr>, Box<TypeExpr>, Span),
 }
 
 #[derive(Debug, Clone)]
@@ -313,6 +347,10 @@ pub enum ExprKind {
     None,
     /// `[v; n]`: n copies of v (a fixed-size array)
     ArrayRepeat(Box<Expr>, Box<Expr>),
+    /// `->(x: T) -> R { body }`: a lambda (escapes; captures copies).
+    Lambda(Vec<Param>, Option<TypeExpr>, Box<Block>),
+    /// `Stack[Int]` before `.new`: a generic type with explicit arguments.
+    TypeApp(String, Vec<TypeExpr>),
     /// `{k => v, ...}` / `{name: v}` (a Str key) / `{}`
     MapLit(Vec<(Expr, Expr)>),
     /// The index of a reslice: `a[lo...hi]`, `a[lo..]`, `a[...hi]`

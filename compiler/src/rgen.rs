@@ -18,6 +18,7 @@ fn rty(t: &LTy) -> String {
         LTy::Str => "Str".into(),
         LTy::Unit => "()".into(),
         LTy::Arr(t) => format!("Sl<{}>", rty(t)),
+        LTy::Tup(ts) if ts.is_empty() => "()".into(),
         LTy::Tup(ts) => format!("({},)", ts.iter().map(rty).collect::<Vec<_>>().join(", ")),
         LTy::Range => "AlxRange".into(),
         LTy::Gen(t) => format!("Gen<{}>", rty(t)),
@@ -399,6 +400,7 @@ impl FnEmit<'_> {
             LE::S(s) => format!("Str::lit({})", lit(s)),
             LE::Loc(s) => loc(s),
             LE::Unit => "()".into(),
+            LE::Tup(_, vs) if vs.is_empty() => "()".into(),
             LE::Tup(_, vs) => format!("({},)", vs.iter().map(|x| self.e(x)).collect::<Vec<_>>().join(", ")),
             LE::Field(x, i) => format!("{}.{i}.clone()", self.place(x)),
             LE::Arith(op, a, b, ovf) => {

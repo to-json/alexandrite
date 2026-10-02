@@ -7,6 +7,29 @@ use crate::diag::{Diag, Span};
 use crate::lexer::{IPiece, Kw, Tok, Token};
 use std::collections::HashSet;
 
+/// Methods of a generic type take `self` untyped: each instance is checked
+/// with the concrete type.
+fn generic_self(methods: &mut [Def]) {
+    for m in methods {
+        if let Some(p) = m.params.first_mut() {
+            p.ty = None;
+        }
+    }
+}
+
+/// A def whose body may be missing (an interface's required method).
+pub struct DefSig {
+    pub name: String,
+    pub span: Span,
+    pub tparams: Vec<TParam>,
+    pub name_span: Span,
+    pub params: Vec<Param>,
+    pub ret: Option<TypeExpr>,
+    pub fallible: bool,
+    pub pure: bool,
+    pub body: Option<Vec<Stmt>>,
+}
+
 pub struct Parser<'a> {
     toks: &'a [Token],
     pos: usize,
@@ -92,7 +115,7 @@ impl<'a> Parser<'a> {
     // ---------- module ----------
 
     fn module(&mut self, file: u32) -> PResult<Module> {
-        let mut m = Module { file, overflow: Overflow::Abort, requires: vec![], defs: vec![], structs: vec![], enums: vec![], consts: vec![], main: vec![] };
+        let mut m = Module { file, overflow: Overflow::Abort, requires: vec![], defs: vec![], structs: vec![], enums: vec![], ifaces: vec![], consts: vec![], main: vec![] };
         self.skip_newlines();
         while let Tok::Directive(name, arg) = self.peek().clone() {
             let sp = self.bump().span;
@@ -125,6 +148,10 @@ impl<'a> Parser<'a> {
                     let e = self.enum_def(&mut m.defs)?;
                     m.enums.push(e);
                 }
+                Tok::Kw(Kw::Interface) => {
+                    let i = self.iface_def(&mut m.defs)?;
+                    m.ifaces.push(i);
+                }
                 Tok::Const(name) if matches!(self.peek_at(1), Tok::Op("=") | Tok::Op(":")) => {
                     // `NAME = expr` / `NAME: Type = expr`: a constant.
                     let sp = self.bump().span;
@@ -150,6 +177,16 @@ impl<'a> Parser<'a> {
 
     /// A def; inside `struct Owner { }` it is a method taking `self`.
     fn def_in(&mut self, owner: Option<&str>) -> PResult<Def> {
+        let d = self.def_sig(owner.map(|o| (o, false)))?;
+        let Some(body) = d.body else { unreachable!("a body is required outside interfaces") };
+        Ok(Def { name: d.name, span: d.span, tparams: d.tparams, name_span: d.name_span, params: d.params, ret: d.ret, fallible: d.fallible, pure: d.pure, body })
+    }
+
+    /// A def's signature and body. In an interface (`owner.1`), `self` is
+    /// generic and the body may be left out.
+    fn def_sig(&mut self, owner: Option<(&str, bool)>) -> PResult<DefSig> {
+        let in_iface = owner.is_some_and(|o| o.1);
+        let owner = owner.map(|o| o.0);
         let start = self.span();
         let mut pure = false;
         while let Tok::Attr(a) = self.peek().clone() {
@@ -175,13 +212,14 @@ impl<'a> Parser<'a> {
             Tok::Op("[") if owner.is_some() && self.eat_op("]") => "[]".to_string(),
             t => return Err(Diag::new(name_span, format!("expected a method name, found {}", describe(&t)))),
         };
+        let tparams = self.tparams()?;
         self.scopes.push(HashSet::new());
         let mut params = vec![];
         if let Some(o) = owner {
             let t = TypeExpr::Named(o.to_string(), name_span);
             let ty = if name.ends_with('!') { TypeExpr::Array(Box::new(t), name_span) } else { t };
             self.declare("self");
-            params.push(Param { name: "self".into(), ty: Some(ty), span: name_span });
+            params.push(Param { name: "self".into(), ty: if in_iface { None } else { Some(ty) }, span: name_span });
         }
         let name = match owner {
             Some(o) => method_name(o, &name),
@@ -211,9 +249,79 @@ impl<'a> Parser<'a> {
                 fallible = true;
             }
         }
-        let body = self.braced_stmts()?;
+        let body = if in_iface && !self.is_op("{") {
+            None
+        } else {
+            Some(self.braced_stmts()?)
+        };
         self.scopes.pop();
-        Ok(Def { name, span: start.to(self.prev_span()), name_span, params, ret, fallible, pure, body })
+        Ok(DefSig { name, span: start.to(self.prev_span()), tparams, name_span, params, ret, fallible, pure, body })
+    }
+
+    /// `[T, U: Shape, N: like Int]` after a type or def name (no space before `[`).
+    fn tparams(&mut self) -> PResult<Vec<TParam>> {
+        let mut out = vec![];
+        if !(self.is_op("[") && !self.space_before()) {
+            return Ok(out);
+        }
+        self.bump();
+        loop {
+            let sp = self.span();
+            let name = match self.bump().tok {
+                Tok::Const(n) => n,
+                t => return Err(Diag::new(sp, format!("expected a type parameter (capitalized), found {}", describe(&t)))),
+            };
+            let bound = if self.eat_op(":") {
+                let bsp = self.span();
+                match self.bump().tok {
+                    Tok::Ident(l) if l == "like" => match self.bump().tok {
+                        Tok::Const(t) => Some(Bound::Like(t)),
+                        t => return Err(Diag::new(bsp, format!("expected a type after `like`, found {}", describe(&t)))),
+                    },
+                    Tok::Const(i) => Some(Bound::Iface(i)),
+                    t => return Err(Diag::new(bsp, format!("expected a bound (an interface, or `like Int`), found {}", describe(&t)))),
+                }
+            } else {
+                None
+            };
+            out.push(TParam { name, bound, span: sp });
+            if !self.eat_op(",") {
+                break;
+            }
+        }
+        self.expect_op("]")?;
+        Ok(out)
+    }
+
+    fn iface_def(&mut self, defaults: &mut Vec<Def>) -> PResult<IfaceDef> {
+        let start = self.bump().span;
+        let sp = self.span();
+        let name = match self.bump().tok {
+            Tok::Const(n) => n,
+            t => return Err(Diag::new(sp, format!("expected an interface name (capitalized), found {}", describe(&t)))),
+        };
+        self.expect_op("{")?;
+        let mut methods = vec![];
+        loop {
+            self.skip_newlines();
+            while self.eat_op(",") || self.eat_op(";") {
+                self.skip_newlines();
+            }
+            if self.eat_op("}") {
+                break;
+            }
+            if !matches!(self.peek(), Tok::Kw(Kw::Def)) {
+                return Err(Diag::new(self.span(), format!("an interface holds `def`s, found {}", describe(self.peek()))));
+            }
+            let d = self.def_sig(Some((&name, true)))?;
+            let has_body = d.body.is_some();
+            let short = d.name.rsplit_once('.').map_or(d.name.clone(), |(_, m)| m.to_string());
+            methods.push((short, d.params[1..].to_vec(), d.ret.clone(), has_body, d.name_span));
+            if let Some(body) = d.body {
+                defaults.push(Def { name: d.name, span: d.span, tparams: d.tparams, name_span: d.name_span, params: d.params, ret: d.ret, fallible: d.fallible, pure: d.pure, body });
+            }
+        }
+        Ok(IfaceDef { name, span: start.to(self.prev_span()), methods })
     }
 
     fn enum_def(&mut self, methods: &mut Vec<Def>) -> PResult<EnumDef> {
@@ -223,6 +331,8 @@ impl<'a> Parser<'a> {
             Tok::Const(n) => n,
             t => return Err(Diag::new(sp, format!("expected an enum name (capitalized), found {}", describe(&t)))),
         };
+        let tparams = self.tparams()?;
+        let first_method = methods.len();
         self.expect_op("{")?;
         let mut variants: Vec<(String, Vec<(String, TypeExpr, Span)>, Span)> = vec![];
         loop {
@@ -268,7 +378,10 @@ impl<'a> Parser<'a> {
             }
             variants.push((vname, fields, vsp));
         }
-        Ok(EnumDef { name, span: start.to(self.prev_span()), variants })
+        if !tparams.is_empty() {
+            generic_self(&mut methods[first_method..]);
+        }
+        Ok(EnumDef { name, span: start.to(self.prev_span()), tparams, variants })
     }
 
     fn struct_def(&mut self, methods: &mut Vec<Def>) -> PResult<StructDef> {
@@ -278,6 +391,8 @@ impl<'a> Parser<'a> {
             Tok::Const(n) => n,
             t => return Err(Diag::new(sp, format!("expected a struct name (capitalized), found {}", describe(&t)))),
         };
+        let tparams = self.tparams()?;
+        let first_method = methods.len();
         self.expect_op("{")?;
         let mut fields: Vec<(String, TypeExpr, Span)> = vec![];
         loop {
@@ -304,11 +419,29 @@ impl<'a> Parser<'a> {
             }
             fields.push((fname, ty, fsp));
         }
-        Ok(StructDef { name, span: start.to(self.prev_span()), fields })
+        if !tparams.is_empty() {
+            generic_self(&mut methods[first_method..]);
+        }
+        Ok(StructDef { name, span: start.to(self.prev_span()), tparams, fields })
     }
 
     fn type_expr(&mut self) -> PResult<TypeExpr> {
         let sp = self.span();
+        if self.is_op("(") {
+            // `(A, B) -> R`
+            self.bump();
+            let mut ps = vec![];
+            while !self.is_op(")") {
+                ps.push(self.type_expr()?);
+                if !self.eat_op(",") {
+                    break;
+                }
+            }
+            self.expect_op(")")?;
+            self.expect_op("->")?;
+            let r = self.type_expr()?;
+            return Ok(TypeExpr::Fn(ps, Box::new(r), sp.to(self.prev_span())));
+        }
         let base = if self.eat_op("[") {
             let inner = self.type_expr()?;
             if self.eat_op(";") {
@@ -397,7 +530,7 @@ impl<'a> Parser<'a> {
                 return self.for_rest(start);
             }
             Tok::Kw(Kw::Struct) | Tok::Kw(Kw::Enum) => return Err(Diag::new(start, "types can only be defined at the top level")),
-            Tok::Ident(name) if matches!(self.peek_at(1), Tok::Op(":")) && matches!(self.peek_at(2), Tok::Const(_) | Tok::Op("[")) => {
+            Tok::Ident(name) if matches!(self.peek_at(1), Tok::Op(":")) && matches!(self.peek_at(2), Tok::Const(_) | Tok::Op("[") | Tok::Op("(")) => {
                 // `x: T = e`
                 let sp = self.bump().span;
                 self.bump();
@@ -1017,6 +1150,27 @@ impl<'a> Parser<'a> {
             Tok::Kw(Kw::False) => self.mk(ExprKind::Bool(false), sp),
             Tok::Kw(Kw::Nil) => self.mk(ExprKind::Nil, sp),
             Tok::Kw(Kw::None) => self.mk(ExprKind::None, sp),
+            Tok::Const(c) if self.is_op("[") && !self.space_before() => {
+                // `Stack[Int].new`: a generic type applied, if what follows fits.
+                let save = self.pos;
+                self.bump();
+                let mut args = vec![];
+                let ok = loop {
+                    match self.type_expr() {
+                        Ok(t) => args.push(t),
+                        Err(_) => break false,
+                    }
+                    if !self.eat_op(",") {
+                        break self.eat_op("]") && self.is_op(".") && matches!(self.peek_at(1), Tok::Const(_) | Tok::Ident(_));
+                    }
+                };
+                if ok {
+                    self.mk(ExprKind::TypeApp(c, args), sp.to(self.prev_span()))
+                } else {
+                    self.pos = save;
+                    self.mk(ExprKind::Const(c), sp)
+                }
+            }
             Tok::Const(c) => self.mk(ExprKind::Const(c), sp),
             Tok::Op("(") => {
                 let saved = std::mem::replace(&mut self.in_cond, false);
@@ -1029,6 +1183,34 @@ impl<'a> Parser<'a> {
                 // covers the parens (used when quoting source).
                 e.span = sp.to(self.prev_span());
                 e
+            }
+            Tok::Op("->") => {
+                // `->(x: Int, y) -> Int { ... }` / `-> { ... }`
+                self.scopes.push(HashSet::new());
+                let mut params = vec![];
+                if self.eat_op("(") {
+                    while !self.is_op(")") {
+                        let psp = self.span();
+                        let pname = match self.bump().tok {
+                            Tok::Ident(n) => n,
+                            t => return Err(Diag::new(psp, format!("expected a parameter name, found {}", describe(&t)))),
+                        };
+                        let ty = if self.eat_op(":") { Some(self.type_expr()?) } else { None };
+                        self.declare(&pname);
+                        params.push(Param { name: pname, ty, span: psp });
+                        if !self.eat_op(",") {
+                            break;
+                        }
+                    }
+                    self.expect_op(")")?;
+                }
+                let ret = if self.eat_op("->") { Some(self.type_expr()?) } else { None };
+                let bsp = self.span();
+                let body = self.braced_stmts()?;
+                self.scopes.pop();
+                let id = self.id();
+                let block = Block { id, params: params.iter().map(|p| (p.name.clone(), p.span)).collect(), body, span: bsp.to(self.prev_span()) };
+                self.mk(ExprKind::Lambda(params, ret, Box::new(block)), sp.to(self.prev_span()))
             }
             Tok::Op("{") => {
                 let mut pairs = vec![];
@@ -1092,6 +1274,12 @@ impl<'a> Parser<'a> {
             }
             Tok::Ident(name) => {
                 if self.is_local(&name) {
+                    // `f(x)` on a local: calling a lambda.
+                    if self.is_op("(") && !self.space_before() {
+                        let (args, block_sym) = self.call_args()?;
+                        let full = sp.to(self.prev_span());
+                        return Ok(self.mk(ExprKind::Call { recv: None, name, name_span: sp, args, block: None, block_sym }, full));
+                    }
                     return Ok(self.mk(ExprKind::Name(name), sp));
                 }
                 // Call forms: f(args), f { block }, f arg.

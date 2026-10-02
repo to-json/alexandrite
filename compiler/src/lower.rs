@@ -17,7 +17,23 @@ pub struct Opts {
     pub release: bool,
 }
 
+thread_local! {
+    /// Each interface's implementor types (in tag order), for `lty`.
+    static IFACES: RefCell<HashMap<String, Vec<Ty>>> = RefCell::new(HashMap::new());
+    /// Every lambda literal: (enclosing function, block start, fn type, capture types).
+    static LAMBDAS: RefCell<Vec<(String, u32, Ty, Vec<Ty>)>> = const { RefCell::new(Vec::new()) };
+}
+
+/// The sites (global index) of lambdas of function type `t`, in tag order.
+fn lambda_sites(t: &Ty) -> Vec<(usize, Vec<Ty>)> {
+    LAMBDAS.with(|l| l.borrow().iter().enumerate().filter(|(_, s)| s.2 == *t).map(|(g, s)| (g, s.3.clone())).collect())
+}
+
 pub fn lower(p: &TProgram, sm: &SourceMap, opts: &Opts) -> LProgram {
+    IFACES.with(|m| *m.borrow_mut() = p.ifaces.iter().map(|(k, v)| (k.clone(), v.iter().map(|(t, _)| t.clone()).collect())).collect());
+    LAMBDAS.with(|l| {
+        *l.borrow_mut() = p.funcs.iter().flat_map(|f| f.lambdas.iter().map(move |(lo, t, caps)| (f.cname.clone(), *lo, t.clone(), caps.iter().map(|c| f.locals[*c].ty.clone()).collect()))).collect();
+    });
     let prog = RefCell::new(LProgram::default());
     for f in &p.funcs {
         let lf = if f.external {
@@ -58,6 +74,11 @@ pub fn lty(t: &Ty, mode: Overflow) -> LTy {
         Ty::Unit | Ty::Never | Ty::Yielder(_) | Ty::Var(_) => LTy::Unit,
         Ty::Array(t) | Ty::Fixed(t, _) | Ty::Seq(t, _) => LTy::Arr(Box::new(lty(t, mode))),
         Ty::Map(k, v) => crate::mapgen::map_ty(&lty(k, mode), &lty(v, mode)),
+        Ty::Fn(..) => LTy::Tup(std::iter::once(LTy::I64).chain(lambda_sites(t).iter().map(|(_, caps)| LTy::Tup(caps.iter().map(|c| lty(c, mode)).collect()))).collect()),
+        Ty::Iface(n) => {
+            let impls = IFACES.with(|m| m.borrow().get(n).cloned().unwrap_or_default());
+            LTy::Tup(std::iter::once(LTy::I64).chain(impls.iter().map(|t| lty(t, mode))).collect())
+        }
         Ty::Enum(_, vs) => LTy::Tup(std::iter::once(LTy::I64).chain(vs.iter().flat_map(|(_, fs)| fs.iter().map(|(_, t)| lty(t, mode)))).collect()),
         Ty::Tuple(ts) => LTy::Tup(ts.iter().map(|t| lty(t, mode)).collect()),
         Ty::Range => LTy::Range,
@@ -613,7 +634,7 @@ impl<'a> Lw<'a> {
             TK::Try(inner) => self.try_expr(inner),
             TK::Puts(x) => {
                 let v = self.expr(x);
-                if matches!(x.ty, Ty::Opt(_) | Ty::Map(..) | Ty::Array(_) | Ty::Fixed(..) | Ty::Struct(..) | Ty::Tuple(_) | Ty::Enum(..)) {
+                if matches!(x.ty, Ty::Opt(_) | Ty::Map(..) | Ty::Array(_) | Ty::Fixed(..) | Ty::Struct(..) | Ty::Tuple(_) | Ty::Enum(..) | Ty::Iface(_)) {
                     let s = self.to_s(v, &x.ty);
                     self.emit(LS::Puts(s, LTy::Str));
                     return LE::Unit;
@@ -1232,6 +1253,9 @@ impl<'a> Lw<'a> {
     }
 
     fn to_s(&mut self, v: LE, t: &Ty) -> LE {
+        if let Some(&fid) = self.p.stringers.get(&t.show()) {
+            return LE::Call(self.p.funcs[fid].cname.clone(), vec![v]);
+        }
         match t {
             Ty::Opt(inner) => {
                 let lt = self.lty(t);
@@ -1259,6 +1283,21 @@ impl<'a> Lw<'a> {
                 });
                 self.emit(LS::Loop(l, body));
                 LE::Rt(Rt::StrCat, vec![LE::Var(s), LE::S("]".into())])
+            }
+            Ty::Iface(n) => {
+                let impls = self.p.ifaces.get(n).cloned().unwrap_or_default();
+                let lt = self.lty(t);
+                let x = self.bind(v, lt);
+                let s = self.tmp(LTy::Str);
+                self.emit(LS::Set(s, LE::S(String::new())));
+                for (k, (it, _)) in impls.iter().enumerate() {
+                    let body = self.sub(|lw| {
+                        let v = lw.to_s(LE::Field(Box::new(x.clone()), k + 1), it);
+                        lw.emit(LS::Set(s, v));
+                    });
+                    self.emit(LS::If(LE::Cmp(Op::Eq, Box::new(LE::Field(Box::new(x.clone()), 0)), Box::new(LE::I(k as i64)), LTy::I64), body, vec![]));
+                }
+                LE::Var(s)
             }
             Ty::Enum(_, vs) => {
                 // `Red`, `Circle(2)`.
@@ -1563,6 +1602,111 @@ impl<'a> Lw<'a> {
                 let absent = LE::Not(Box::new(LE::Field(Box::new(v.clone()), 0)));
                 self.emit(LS::If(absent, vec![LS::Panic("unwrap of none".into(), self.loc(sp))], vec![]));
                 LE::Field(Box::new(v), 1)
+            }
+            Lambda => {
+                let b = blk.unwrap();
+                let lo = b.span.lo;
+                let g = LAMBDAS.with(|l| l.borrow().iter().position(|s| s.0 == self.f.cname && s.1 == lo)).expect("lambda registered");
+                let sites = lambda_sites(&e.ty);
+                let tag = sites.iter().position(|(x, _)| *x == g).unwrap();
+                // The body becomes its own function: captures first, then params.
+                let Ty::Fn(pts, rt) = &e.ty else { unreachable!() };
+                let mut w = Lw::new(self.p, self.sm, self.opts, self.f, self.mode, ErrPath::Return(vec![]), self.prog);
+                let mut params = vec![];
+                for a in args {
+                    let TK::Local(l) = a.kind else { unreachable!() };
+                    params.push(w.var_of(l));
+                }
+                let mut pvs = vec![];
+                for pt in pts {
+                    let v = w.new_var("p", w.lty(pt));
+                    params.push(v);
+                    pvs.push(LE::Var(v));
+                }
+                let (mut body, v) = w.sub_val(|w| w.inline_block(b, &pvs, &[], None));
+                let ret = w.lty(rt);
+                body.push(LS::Return(if ret == LTy::Unit { None } else { Some(v) }));
+                let func = LFunc { name: format!("__lambda_{g}"), params, vars: std::mem::take(&mut w.vars), ret, fallible: false, body, external: false, is_main: false, labels: w.labels };
+                self.prog.borrow_mut().funcs.push(func);
+                let lt = self.lty(&e.ty);
+                let LTy::Tup(ts) = &lt else { unreachable!() };
+                let caps: Vec<LE> = args.iter().map(|a| self.arg(a)).collect();
+                let mut vals = vec![LE::I(tag as i64)];
+                for (j, t) in ts[1..].iter().enumerate() {
+                    vals.push(if j == tag { LE::Tup(t.clone(), caps.clone()) } else { zero_le(t) });
+                }
+                LE::Tup(lt, vals)
+            }
+            FnCall => {
+                let f = recv.unwrap();
+                let fv = self.expr(f);
+                let fv = self.bind(fv, self.lty(&f.ty));
+                let mut avs = vec![];
+                for a in args {
+                    let v = self.arg(a);
+                    avs.push(self.bind(v, self.lty(&a.ty)));
+                }
+                let rt = self.lty(&e.ty);
+                let out = if rt == LTy::Unit { None } else { Some(self.tmp(rt.clone())) };
+                if let Some(o) = out {
+                    self.emit(LS::Set(o, zero_le(&rt)));
+                }
+                let tag = LE::Field(Box::new(fv.clone()), 0);
+                for (k, (g, caps)) in lambda_sites(&f.ty).iter().enumerate() {
+                    let env = LE::Field(Box::new(fv.clone()), k + 1);
+                    let cargs = (0..caps.len()).map(|j| LE::Field(Box::new(env.clone()), j)).chain(avs.iter().cloned()).collect();
+                    let call = LE::Call(format!("__lambda_{g}"), cargs);
+                    let st = match out {
+                        Some(o) => LS::Set(o, call),
+                        None => LS::Eval(call),
+                    };
+                    self.emit(LS::If(LE::Cmp(Op::Eq, Box::new(tag.clone()), Box::new(LE::I(k as i64)), LTy::I64), vec![st], vec![]));
+                }
+                match out {
+                    Some(o) => LE::Var(o),
+                    None => LE::Unit,
+                }
+            }
+            ToIface(k) => {
+                let lt = self.lty(&e.ty);
+                let LTy::Tup(ts) = &lt else { unreachable!() };
+                let v = self.arg(recv.unwrap());
+                let mut vals = vec![LE::I(k as i64)];
+                for (j, t) in ts[1..].iter().enumerate() {
+                    vals.push(if j == k { v.clone() } else { zero_le(t) });
+                }
+                LE::Tup(lt, vals)
+            }
+            IfaceCall(mi) => {
+                let r = recv.unwrap();
+                let Ty::Iface(iname) = &r.ty else { unreachable!() };
+                let impls = self.p.ifaces.get(iname).cloned().unwrap_or_default();
+                let rv = self.expr(r);
+                let rv = self.bind(rv, self.lty(&r.ty));
+                let mut avs = vec![];
+                for a in args {
+                    let v = self.arg(a);
+                    avs.push(self.bind(v, self.lty(&a.ty)));
+                }
+                let rt = self.lty(&e.ty);
+                let out = if rt == LTy::Unit { None } else { Some(self.tmp(rt.clone())) };
+                if let Some(o) = out {
+                    self.emit(LS::Set(o, zero_le(&rt)));
+                }
+                let tag = LE::Field(Box::new(rv.clone()), 0);
+                for (k, (_, fids)) in impls.iter().enumerate() {
+                    let f = &self.p.funcs[fids[mi]];
+                    let call = LE::Call(f.cname.clone(), std::iter::once(LE::Field(Box::new(rv.clone()), k + 1)).chain(avs.iter().cloned()).collect());
+                    let st = match out {
+                        Some(o) => LS::Set(o, call),
+                        None => LS::Eval(call),
+                    };
+                    self.emit(LS::If(LE::Cmp(Op::Eq, Box::new(tag.clone()), Box::new(LE::I(k as i64)), LTy::I64), vec![st], vec![]));
+                }
+                match out {
+                    Some(o) => LE::Var(o),
+                    None => LE::Unit,
+                }
             }
             VariantNew(k) => {
                 let lt = self.lty(&e.ty);
@@ -2340,7 +2484,7 @@ fn contains_try(ss: &[LS]) -> bool {
     })
 }
 
-fn collect_locals_stmt(s: &TStmt, out: &mut Vec<LocalId>) {
+pub(crate) fn collect_locals_stmt(s: &TStmt, out: &mut Vec<LocalId>) {
     match s {
         TStmt::Expr(e) => collect_locals(e, out),
         TStmt::MultiAssign(ls, es) => {

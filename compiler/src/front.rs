@@ -72,8 +72,13 @@ pub fn check_program(l: &Loaded, externs: Vec<DefInfo>) -> Result<TProgram, Diag
     let consts: Vec<_> = l.libs.iter().flat_map(|(_, _, m)| m.consts.iter()).chain(l.main.consts.iter()).cloned().collect();
     w.add_consts(&consts)?;
     let enums: Vec<_> = l.main.enums.iter().chain(l.libs.iter().flat_map(|(_, _, m)| m.enums.iter())).cloned().collect();
+    let ifaces: Vec<_> = l.main.ifaces.iter().chain(l.libs.iter().flat_map(|(_, _, m)| m.ifaces.iter())).cloned().collect();
+    w.add_iface_names(&ifaces)?;
     w.add_structs(&structs, &enums)?;
+    w.add_iface_sigs(&ifaces)?;
     let main = w.check_main(&l.main.main, l.main.overflow, Span { file: l.main.file, lo: 0, hi: 0 })?;
+    let ifaces = std::mem::take(&mut w.impls);
+    let stringers = std::mem::take(&mut w.stringers);
     let mut funcs: Vec<_> = w.funcs.into_iter().map(|f| f.expect("every instance checked")).collect();
     for f in funcs.iter_mut() {
         if !f.external {
@@ -83,7 +88,7 @@ pub fn check_program(l: &Loaded, externs: Vec<DefInfo>) -> Result<TProgram, Diag
     for f in &funcs {
         prove::prove(f, &l.sm)?;
     }
-    Ok(TProgram { funcs, main })
+    Ok(TProgram { funcs, main, ifaces, stringers })
 }
 
 /// Lib defs as world entries (checked from source).
@@ -117,8 +122,12 @@ pub fn check_library(l: &Loaded, idx: usize, prefix: &str) -> Result<(TProgram, 
     let defs = m.defs.iter().map(|d| DefInfo { def: d.clone(), overflow: m.overflow, external: None }).collect();
     let mut w = World::new(&l.sm, defs)?;
     w.add_consts(&m.consts)?;
+    w.add_iface_names(&m.ifaces)?;
     w.add_structs(&m.structs, &m.enums)?;
+    w.add_iface_sigs(&m.ifaces)?;
     let exports = w.check_exports()?;
+    let ifaces = std::mem::take(&mut w.impls);
+    let stringers = std::mem::take(&mut w.stringers);
     let mut funcs: Vec<_> = w.funcs.into_iter().map(|f| f.expect("every instance checked")).collect();
     for f in funcs.iter_mut() {
         f.overflow = m.overflow;
@@ -129,7 +138,7 @@ pub fn check_library(l: &Loaded, idx: usize, prefix: &str) -> Result<(TProgram, 
     for f in &funcs {
         prove::prove(f, &l.sm)?;
     }
-    Ok((TProgram { funcs, main: usize::MAX }, exports))
+    Ok((TProgram { funcs, main: usize::MAX, ifaces, stringers }, exports))
 }
 
 /// The generated header: one line per export.
@@ -174,6 +183,7 @@ pub fn parse_header(text: &str, overflow: Overflow, span: Span) -> Result<Vec<De
         let def = Def {
             name: name.trim().to_string(),
             span,
+            tparams: vec![],
             name_span: span,
             params: (0..ptys.len()).map(|i| Param { name: format!("p{i}"), ty: None, span }).collect(),
             ret: None,

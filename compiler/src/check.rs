@@ -44,6 +44,20 @@ pub struct World<'a> {
     pub structs: Structs,
     /// Top-level constants: value and declared type (None = untyped, Go).
     pub consts: HashMap<String, (CVal, Option<Ty>)>,
+    /// Interfaces: each method's name, parameter types (after self), return type, has a default.
+    pub ifaces: HashMap<String, Vec<IfaceMethod>>,
+    /// Each interface's implementors so far, with their method instances.
+    pub impls: HashMap<String, Vec<(Ty, Vec<FuncId>)>>,
+    pub stringers: HashMap<String, FuncId>,
+}
+
+#[derive(Clone, Debug)]
+pub struct IfaceMethod {
+    pub name: String,
+    pub params: Vec<Ty>,
+    pub ret: Ty,
+    pub default: bool,
+    pub span: Span,
 }
 
 #[derive(Clone, Debug)]
@@ -66,7 +80,9 @@ impl<'a> World<'a> {
                 return Err(Diag::new(d.def.name_span, format!("`{}` is defined twice", d.def.name)));
             }
         }
-        Ok(World { sm, defs, by_name, instances: HashMap::new(), funcs: vec![], sigs: HashMap::new(), fatal: None, structs: HashMap::new(), consts: HashMap::new() })
+        GENERICS.with(|g| g.borrow_mut().clear());
+        INSTS.with(|g| g.borrow_mut().clear());
+        Ok(World { sm, defs, by_name, instances: HashMap::new(), funcs: vec![], sigs: HashMap::new(), fatal: None, structs: HashMap::new(), consts: HashMap::new(), ifaces: HashMap::new(), impls: HashMap::new(), stringers: HashMap::new() })
     }
 
     /// Evaluate top-level constants, in order (each may use earlier ones).
@@ -116,7 +132,15 @@ impl<'a> World<'a> {
             E(&'d EnumDef),
         }
         let mut by_name: HashMap<&str, Def> = HashMap::new();
-        let all = defs.iter().map(|d| (d.name.as_str(), d.span, Def::S(d))).chain(enums.iter().map(|d| (d.name.as_str(), d.span, Def::E(d))));
+        for d in defs.iter().filter(|d| !d.tparams.is_empty()) {
+            GENERICS.with(|g| g.borrow_mut().insert(d.name.clone(), GenDef::S(d.clone())));
+        }
+        for d in enums.iter().filter(|d| !d.tparams.is_empty()) {
+            GENERICS.with(|g| g.borrow_mut().insert(d.name.clone(), GenDef::E(d.clone())));
+        }
+        let defs: Vec<&StructDef> = defs.iter().filter(|d| d.tparams.is_empty()).collect();
+        let enums: Vec<&EnumDef> = enums.iter().filter(|d| d.tparams.is_empty()).collect();
+        let all = defs.iter().copied().map(|d| (d.name.as_str(), d.span, Def::S(d))).chain(enums.iter().copied().map(|d| (d.name.as_str(), d.span, Def::E(d))));
         for (name, span, d) in all {
             if by_name.contains_key(name) || self.structs.contains_key(name) || self.consts.contains_key(name) || ["Int", "Float", "Bool", "Str", "Array", "Map", "Math", "File", "Enumerator"].contains(&name) {
                 return Err(Diag::new(span, format!("`{name}` is already defined")));
@@ -169,6 +193,153 @@ impl<'a> World<'a> {
             resolve(n, &by_name, &mut self.structs, &mut vec![], &self.consts)?;
         }
         Ok(())
+    }
+
+    /// Declare interface names (before structs, whose fields may use them).
+    pub fn add_iface_names(&mut self, defs: &[IfaceDef]) -> R<()> {
+        for d in defs {
+            if self.structs.contains_key(&d.name) || self.consts.contains_key(&d.name) {
+                return Err(Diag::new(d.span, format!("`{}` is already defined", d.name)));
+            }
+            self.structs.insert(d.name.clone(), Ty::Iface(d.name.clone()));
+        }
+        Ok(())
+    }
+
+    /// Resolve interface method signatures (after structs).
+    pub fn add_iface_sigs(&mut self, defs: &[IfaceDef]) -> R<()> {
+        for d in defs {
+            let mut ms = vec![];
+            for (name, params, ret, default, span) in &d.methods {
+                if name.ends_with('!') {
+                    return Err(Diag::new(*span, "interface methods can't mutate their receiver yet (`!`)"));
+                }
+                let mut ps = vec![];
+                for p in params {
+                    let Some(t) = &p.ty else {
+                        return Err(Diag::new(p.span, format!("interface methods spell their parameter types: `{}: Type`", p.name)));
+                    };
+                    ps.push(type_from(t, &self.structs, &self.consts)?);
+                }
+                let ret = match ret {
+                    Some(t) => type_from(t, &self.structs, &self.consts)?,
+                    None => Ty::Unit,
+                };
+                ms.push(IfaceMethod { name: name.clone(), params: ps, ret, default: *default, span: *span });
+            }
+            self.ifaces.insert(d.name.clone(), ms);
+        }
+        Ok(())
+    }
+
+    /// Make `t` an implementor of interface `iface` (checking it has every
+    /// method), returning its tag.
+    fn implement(&mut self, iface: &str, t: &Ty, sp: Span) -> R<usize> {
+        if let Some(k) = self.impls.get(iface).and_then(|v| v.iter().position(|(x, _)| x == t)) {
+            return Ok(k);
+        }
+        let Some(tn) = t.type_name().filter(|_| matches!(t, Ty::Struct(..) | Ty::Enum(..))) else {
+            return Err(Diag::new(sp, format!("{} can't satisfy {iface}: only structs and enums have methods", t.show())));
+        };
+        let tn = tn.to_string();
+        let methods = self.ifaces[iface].clone();
+        let impls = self.impls.entry(iface.to_string()).or_default();
+        impls.push((t.clone(), vec![]));
+        let k = impls.len() - 1;
+        let mut fids = vec![];
+        for m in &methods {
+            let own = self.by_name.get(&method_name(&tn, &m.name)).copied();
+            let def = match (own, m.default) {
+                (Some(d), _) => d,
+                (None, true) => self.by_name[&method_name(iface, &m.name)],
+                (None, false) => {
+                    self.impls.get_mut(iface).unwrap().pop();
+                    return Err(Diag::new(sp, format!("{tn} doesn't satisfy {iface}: it has no method `{}`", m.name)).note(format!("{iface} needs: {}", methods.iter().filter(|m| !m.default).map(|m| m.name.as_str()).collect::<Vec<_>>().join(", "))));
+                }
+            };
+            let nparams = self.defs[def].def.params.len();
+            if nparams != m.params.len() + 1 {
+                self.impls.get_mut(iface).unwrap().pop();
+                return Err(Diag::new(sp, format!("{tn}.{} takes {} argument(s), but {iface}.{} takes {}", m.name, nparams - 1, m.name, m.params.len())));
+            }
+            let args: Vec<Ty> = std::iter::once(t.clone()).chain(m.params.iter().cloned()).collect();
+            let fid = self.instance(def, args, sp)?;
+            let ret = match &self.funcs[fid] {
+                Some(f) => f.ret.clone(),
+                None => self.sigs.get(&fid).map(|s| s.0.clone()).unwrap_or(Ty::Unit),
+            };
+            if ret != m.ret {
+                self.impls.get_mut(iface).unwrap().pop();
+                return Err(Diag::new(sp, format!("{tn}.{} returns {}, but {iface}.{} returns {}", m.name, ret.show(), m.name, m.ret.show())));
+            }
+            fids.push(fid);
+        }
+        self.impls.get_mut(iface).unwrap()[k].1 = fids;
+        Ok(k)
+    }
+
+    /// Bind a def's type parameters for checking an instance with `args`:
+    /// a generic type's method takes them from `self`; a generic def from
+    /// its declared parameter types. Returns what to restore.
+    pub fn bind(&mut self, def: usize, args: &[Ty], sp: Span) -> R<Vec<(String, Option<Ty>)>> {
+        let d = &self.defs[def].def;
+        let mut b: Vec<(String, Ty)> = vec![];
+        if let (Some((owner, _)), Some(self_t)) = (d.name.split_once('.'), args.first()) {
+            if let Some(g) = generic(owner) {
+                let st = self_t.arr_elem().filter(|_| d.name.ends_with('!')).unwrap_or_else(|| self_t.clone());
+                if let Some((_, targs)) = inst_args(&st) {
+                    b.extend(g.tparams().iter().map(|p| p.name.clone()).zip(targs));
+                }
+            }
+        }
+        if !d.tparams.is_empty() {
+            let mut out = HashMap::new();
+            for (p, t) in d.params.iter().zip(args) {
+                if let Some(te) = &p.ty {
+                    bind_tparams(te, t, &d.tparams, &mut out);
+                }
+            }
+            for tp in &d.tparams {
+                let Some(t) = out.get(&tp.name) else {
+                    return Err(Diag::new(tp.span, format!("can't infer `{}` from the arguments of `{}`", tp.name, d.name)));
+                };
+                check_bound(tp, t, sp)?;
+                b.push((tp.name.clone(), t.clone()));
+            }
+            let tps = d.tparams.clone();
+            for tp in &tps {
+                if let Some(Bound::Iface(i)) = &tp.bound {
+                    let t = out[&tp.name].clone();
+                    if !self.ifaces.contains_key(i) {
+                        return Err(Diag::new(tp.span, format!("`{i}` isn't an interface")));
+                    }
+                    self.implement(i, &t, sp)?;
+                }
+            }
+        }
+        Ok(b.into_iter().map(|(n, t)| {
+            let old = self.structs.insert(n.clone(), t);
+            (n, old)
+        }).collect())
+    }
+
+    pub fn unbind(&mut self, saved: Vec<(String, Option<Ty>)>) {
+        for (n, old) in saved.into_iter().rev() {
+            match old {
+                Some(t) => self.structs.insert(n, t),
+                None => self.structs.remove(&n),
+            };
+        }
+    }
+
+    /// An interface default named `m` that a value of type `tn` can use.
+    fn default_for(&self, tn: &str, m: &str) -> Option<usize> {
+        for (iname, ms) in &self.ifaces {
+            if ms.iter().any(|x| x.name == m && x.default) && ms.iter().filter(|x| !x.default).all(|x| self.by_name.contains_key(&method_name(tn, &x.name))) {
+                return self.by_name.get(&method_name(iname, m)).copied();
+            }
+        }
+        None
     }
 
     pub fn check_main(&mut self, main: &[Stmt], overflow: Overflow, span: Span) -> R<FuncId> {
@@ -224,17 +395,34 @@ impl<'a> World<'a> {
                 span: info.def.span,
                 external: true,
                 is_main: false,
+                lambdas: vec![],
             };
             self.funcs[id] = Some(f);
             return Ok(id);
         }
         let def_ast = info.def.clone();
         let overflow = info.overflow;
+        let saved = match self.bind(def, &args, call_span) {
+            Ok(s) => s,
+            Err(e) => {
+                self.instances.remove(&(def, args.clone()));
+                return Err(e);
+            }
+        };
         if let Some(ret) = &def_ast.ret {
-            self.sigs.insert(id, (type_from(ret, &self.structs, &self.consts)?, def_ast.fallible, def_ast.pure));
+            let r = type_from(ret, &self.structs, &self.consts);
+            let r = match r {
+                Ok(r) => r,
+                Err(e) => {
+                    self.unbind(saved);
+                    return Err(e);
+                }
+            };
+            self.sigs.insert(id, (r, def_ast.fallible, def_ast.pure));
         }
-        let _ = call_span;
-        let f = match self.check_fn(id, Some(&def_ast), &args, &def_ast.body, overflow, def_ast.span) {
+        let f = self.check_fn(id, Some(&def_ast), &args, &def_ast.body, overflow, def_ast.span);
+        self.unbind(saved);
+        let f = match f {
             Ok(f) => f,
             Err(e) => {
                 self.fatal.get_or_insert(e.clone());
@@ -352,7 +540,7 @@ pub fn cname(s: &str) -> String {
 /// Values `puts` and interpolation can show.
 pub fn printable(t: &Ty) -> bool {
     match t {
-        Ty::Int | Ty::IntK(_) | Ty::Float | Ty::Str | Ty::Bool | Ty::Var(_) => true,
+        Ty::Int | Ty::IntK(_) | Ty::Float | Ty::Str | Ty::Bool | Ty::Var(_) | Ty::Iface(_) => true,
         Ty::Opt(t) | Ty::Array(t) | Ty::Fixed(t, _) => printable(t),
         Ty::Map(k, v) => printable(k) && printable(v),
         Ty::Struct(_, fs) => fs.iter().all(|(_, t)| printable(t)),
@@ -370,12 +558,126 @@ fn type_names(t: &TypeExpr, out: &mut Vec<String>) {
         TypeExpr::Named(n, _) => out.push(n.clone()),
         TypeExpr::Array(t, _) | TypeExpr::Opt(t, _) | TypeExpr::Fixed(t, _, _) => type_names(t, out),
         TypeExpr::App(_, ts, _) => ts.iter().for_each(|t| type_names(t, out)),
+        TypeExpr::Fn(ps, r, _) => {
+            ps.iter().for_each(|t| type_names(t, out));
+            type_names(r, out);
+        }
+    }
+}
+
+/// A generic struct or enum, instantiated on use.
+#[derive(Clone)]
+pub enum GenDef {
+    S(StructDef),
+    E(EnumDef),
+}
+
+impl GenDef {
+    pub fn tparams(&self) -> &[TParam] {
+        match self {
+            GenDef::S(d) => &d.tparams,
+            GenDef::E(d) => &d.tparams,
+        }
+    }
+}
+
+thread_local! {
+    /// Generic types by name.
+    pub static GENERICS: std::cell::RefCell<HashMap<String, GenDef>> = std::cell::RefCell::new(HashMap::new());
+    /// Generic instances: `Stack[Int]` → (`Stack`, [Int]).
+    pub static INSTS: std::cell::RefCell<HashMap<String, (String, Vec<Ty>)>> = std::cell::RefCell::new(HashMap::new());
+    static DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+pub fn generic(n: &str) -> Option<GenDef> {
+    GENERICS.with(|g| g.borrow().get(n).cloned())
+}
+
+/// The type arguments of a generic instance type (`Stack[Int]` → [Int]).
+pub fn inst_args(t: &Ty) -> Option<(String, Vec<Ty>)> {
+    let n = match t {
+        Ty::Struct(n, _) | Ty::Enum(n, _) => n,
+        _ => return None,
+    };
+    INSTS.with(|m| m.borrow().get(n).cloned())
+}
+
+/// `Name[args]` for a generic struct or enum.
+pub fn instantiate(n: &str, g: &GenDef, targs: Vec<Ty>, sp: Span, structs: &Structs, consts: &Consts) -> R<Ty> {
+    let tps = g.tparams();
+    if tps.len() != targs.len() {
+        return Err(Diag::new(sp, format!("`{n}` takes {} type argument(s), got {}", tps.len(), targs.len())));
+    }
+    for (tp, t) in tps.iter().zip(&targs) {
+        check_bound(tp, t, sp)?;
+    }
+    if DEPTH.with(|d| d.get()) > 16 {
+        return Err(Diag::new(sp, format!("`{n}` contains itself; it is a value, so it can't (recursive types come with the memory model)")));
+    }
+    let name = format!("{n}[{}]", targs.iter().map(Ty::show).collect::<Vec<_>>().join(", "));
+    let mut env = structs.clone();
+    for (tp, t) in tps.iter().zip(&targs) {
+        env.insert(tp.name.clone(), t.clone());
+    }
+    DEPTH.with(|d| d.set(d.get() + 1));
+    let fields = |fs: &[(String, TypeExpr, Span)]| fs.iter().map(|(f, te, _)| Ok((f.clone(), type_from(te, &env, consts)?))).collect::<R<Vec<_>>>();
+    let r = match g {
+        GenDef::S(d) => fields(&d.fields).map(|fs| Ty::Struct(name.clone(), fs)),
+        GenDef::E(d) => d.variants.iter().map(|(v, fs, _)| Ok((v.clone(), fields(fs)?))).collect::<R<Vec<_>>>().map(|vs| Ty::Enum(name.clone(), vs)),
+    };
+    DEPTH.with(|d| d.set(d.get() - 1));
+    let t = r?;
+    INSTS.with(|m| m.borrow_mut().insert(name, (n.to_string(), targs)));
+    Ok(t)
+}
+
+/// A type argument meets its parameter's bound (`like Int`; interfaces are
+/// checked where the instance is made, by `World::bind`).
+pub fn check_bound(tp: &TParam, t: &Ty, sp: Span) -> R<()> {
+    match &tp.bound {
+        Some(Bound::Like(k)) => {
+            let ok = match k.as_str() {
+                "Int" => t.int_kind().is_some() || matches!(t, Ty::Var(_)),
+                "Float" => matches!(t, Ty::Float | Ty::Var(_)),
+                _ => return Err(Diag::new(tp.span, format!("`like {k}`: only `like Int` and `like Float` are bounds"))),
+            };
+            if !ok {
+                return Err(Diag::new(sp, format!("{} needs `{}` to be like {k}, not {}", tp.name, tp.name, t.show())));
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
+/// Bind type parameters by matching a declared type against an actual one.
+pub fn bind_tparams(te: &TypeExpr, t: &Ty, tps: &[TParam], out: &mut HashMap<String, Ty>) {
+    match (te, t) {
+        (TypeExpr::Named(n, _), t) if tps.iter().any(|p| p.name == *n) => {
+            out.entry(n.clone()).or_insert_with(|| t.clone());
+        }
+        (TypeExpr::Array(e, _), Ty::Array(x)) | (TypeExpr::Opt(e, _), Ty::Opt(x)) | (TypeExpr::Fixed(e, _, _), Ty::Fixed(x, _)) => bind_tparams(e, x, tps, out),
+        (TypeExpr::App(n, args, _), Ty::Map(k, v)) if n == "Map" && args.len() == 2 => {
+            bind_tparams(&args[0], k, tps, out);
+            bind_tparams(&args[1], v, tps, out);
+        }
+        (TypeExpr::App(n, args, _), t) => {
+            if let Some((base, targs)) = inst_args(t) {
+                if base == *n {
+                    for (a, x) in args.iter().zip(&targs) {
+                        bind_tparams(a, x, tps, out);
+                    }
+                }
+            }
+        }
+        _ => {}
     }
 }
 
 pub fn type_from(t: &TypeExpr, structs: &Structs, consts: &Consts) -> R<Ty> {
     let type_from = |t| type_from(t, structs, consts);
     match t {
+        TypeExpr::Named(n, sp) if !structs.contains_key(n) && generic(n).is_some() => Err(Diag::new(*sp, format!("`{n}` is generic: give its type arguments (`{n}[...]`)"))),
         TypeExpr::Named(n, sp) => match n.as_str() {
             "Float" => Ok(Ty::Float),
             "Bool" => Ok(Ty::Bool),
@@ -386,6 +688,7 @@ pub fn type_from(t: &TypeExpr, structs: &Structs, consts: &Consts) -> R<Ty> {
             },
         },
         TypeExpr::Array(t, _) => Ok(Ty::arr(type_from(t)?)),
+        TypeExpr::Fn(ps, r, _) => Ok(Ty::Fn(ps.iter().map(type_from).collect::<R<Vec<_>>>()?, Box::new(type_from(r)?))),
         TypeExpr::Opt(t, _) => Ok(Ty::Opt(Box::new(type_from(t)?))),
         TypeExpr::App(n, args, sp) => match (n.as_str(), args.as_slice()) {
             ("Map", [k, v]) => {
@@ -396,6 +699,10 @@ pub fn type_from(t: &TypeExpr, structs: &Structs, consts: &Consts) -> R<Ty> {
                 Ok(Ty::Map(Box::new(kt), Box::new(type_from(v)?)))
             }
             ("Map", _) => Err(Diag::new(*sp, "`Map` takes two types: `Map[K, V]`")),
+            (g, _) if generic(g).is_some() => {
+                let targs = args.iter().map(type_from).collect::<R<Vec<_>>>()?;
+                instantiate(g, &generic(g).unwrap(), targs, *sp, structs, consts)
+            }
             _ => Err(Diag::new(*sp, format!("unknown generic type `{n}`"))),
         },
         TypeExpr::Fixed(t, n, _) => {
@@ -434,6 +741,11 @@ struct FnCx<'w, 'a> {
     /// Kind of each enclosing loop-ish construct, innermost last.
     loops: Vec<LoopKind>,
     n_params: usize,
+    /// Lambda literals checked so far: (block span start, fn type, captures).
+    lambdas: Vec<(u32, Ty, Vec<LocalId>)>,
+    /// The type the expression being checked is wanted as (for inferring
+    /// a generic constructor's type arguments).
+    want_hint: Option<Ty>,
     /// In a method: `Some(true)` for a `!` method (`self` is a one-element
     /// slice holding the receiver), `Some(false)` for one taking a copy.
     method: Option<bool>,
@@ -483,6 +795,8 @@ impl<'w, 'a> FnCx<'w, 'a> {
             const_err: std::cell::RefCell::new(None),
             pure_decl: def.is_some_and(|d| d.pure),
             fn_name: def.map_or("main".into(), |d| d.name.clone()),
+            want_hint: None,
+            lambdas: vec![],
             method: def.filter(|d| d.params.first().is_some_and(|p| p.name == "self")).map(|d| d.name.ends_with('!')),
             is_main: def.is_none(),
             ret: Ty::Unit,
@@ -525,6 +839,7 @@ impl<'w, 'a> FnCx<'w, 'a> {
             Ty::Array(t) => Ty::arr(self.resolve(t)),
             Ty::Fixed(t, n) => Ty::Fixed(Box::new(self.resolve(t)), *n),
             Ty::Map(k, v) => Ty::Map(Box::new(self.resolve(k)), Box::new(self.resolve(v))),
+            Ty::Fn(ps, r) => Ty::Fn(ps.iter().map(|t| self.resolve(t)).collect(), Box::new(self.resolve(r))),
             Ty::Seq(t, l) => Ty::seq(self.resolve(t), *l),
             Ty::Gen(t) => Ty::Gen(Box::new(self.resolve(t))),
             Ty::Opt(t) => Ty::Opt(Box::new(self.resolve(t))),
@@ -550,6 +865,10 @@ impl<'w, 'a> FnCx<'w, 'a> {
             (Ty::Seq(x, _), Ty::Seq(y, _)) => self.unify(x, y),
             (Ty::Fixed(x, n), Ty::Fixed(y, m)) if n == m => self.unify(x, y),
             (Ty::Map(k1, v1), Ty::Map(k2, v2)) => self.unify(k1, k2) && self.unify(v1, v2),
+            (Ty::Fn(p1, r1), Ty::Fn(p2, r2)) if p1.len() == p2.len() => {
+                let pairs: Vec<_> = p1.iter().cloned().zip(p2.iter().cloned()).collect();
+                pairs.iter().all(|(x, y)| self.unify(x, y)) && self.unify(r1, r2)
+            }
             (Ty::Tuple(xs), Ty::Tuple(ys)) if xs.len() == ys.len() => {
                 let pairs: Vec<_> = xs.iter().cloned().zip(ys.iter().cloned()).collect();
                 pairs.iter().all(|(x, y)| self.unify(x, y))
@@ -639,7 +958,9 @@ impl<'w, 'a> FnCx<'w, 'a> {
         if let Some(e) = self.const_err.borrow_mut().take() {
             return Err(e);
         }
+        let lambdas = self.lambdas.iter().map(|(lo, t, c)| (*lo, self.resolve(t), c.clone())).collect();
         Ok(TFunc {
+            lambdas,
             cname: String::new(),
             src_name: self.fn_name.clone(),
             params,
@@ -787,8 +1108,7 @@ impl<'w, 'a> FnCx<'w, 'a> {
             }
             StmtKind::Decl(name, nsp, te, e) => {
                 let ty = type_from(te, &self.w.structs, &self.w.consts)?;
-                let v = self.value(e)?;
-                let v = self.coerce(v, &ty)?;
+                let v = self.value_as(e, &ty)?;
                 if !self.unify(&v.ty, &ty) {
                     return Err(Diag::new(e.span, format!("`{name}` is declared {}, but this is {}", ty.show(), self.resolve(&v.ty).show())));
                 }
@@ -981,6 +1301,8 @@ impl<'w, 'a> FnCx<'w, 'a> {
                 };
                 self.mk(TK::Index(Box::new(a), Box::new(i)), el, sp)
             }
+            ExprKind::Lambda(params, ret, blk) => return self.lambda(params, ret.as_ref(), blk, sp),
+            ExprKind::TypeApp(c, _) => return Err(Diag::new(sp, format!("`{c}[...]` is a type; call `.new` on it"))),
             ExprKind::SliceRange(..) => return Err(Diag::new(sp, "a range with an open end only works inside `[ ]`, to slice")),
             ExprKind::ArrayRepeat(v, n) => {
                 let v = self.value(v)?;
@@ -1317,6 +1639,15 @@ impl<'w, 'a> FnCx<'w, 'a> {
     /// an Int variable needs `.to_f` or `.to_u8`.
     fn coerce(&mut self, e: TExpr, want: &Ty) -> R<TExpr> {
         let want = self.resolve(want);
+        // A struct or enum where an interface is wanted is wrapped (Go's implicit conversion).
+        if let Ty::Iface(iname) = &want {
+            let et = self.resolve(&e.ty);
+            if matches!(et, Ty::Struct(..) | Ty::Enum(..)) && !et.has_var() {
+                let k = self.w.implement(iname, &et, e.span)?;
+                let sp = e.span;
+                return Ok(self.mk(TK::M(M::ToIface(k), Some(Box::new(e)), vec![], None), want.clone(), sp));
+            }
+        }
         // A T where a T? is wanted is present.
         if let Ty::Opt(inner) = &want {
             let et = self.resolve(&e.ty);
@@ -1659,7 +1990,34 @@ impl<'w, 'a> FnCx<'w, 'a> {
     }
 
     /// A struct with a `to_s` method prints through it (Go's Stringer).
+    /// Instantiate `to_s` for every struct or enum inside `t` that has one.
+    fn stringers(&mut self, t: &Ty, sp: Span) -> R<()> {
+        let t = self.resolve(t);
+        if t.has_var() || self.w.stringers.contains_key(&t.show()) {
+            return Ok(());
+        }
+        if let Some(tn) = t.type_name() {
+            if let Some(&def) = self.w.by_name.get(&method_name(tn, "to_s")) {
+                let fid = self.w.instance(def, vec![t.clone()], sp)?;
+                self.w.stringers.insert(t.show(), fid);
+                return Ok(());
+            }
+        }
+        match &t {
+            Ty::Array(e) | Ty::Fixed(e, _) | Ty::Opt(e) => self.stringers(e, sp),
+            Ty::Map(k, v) => {
+                self.stringers(k, sp)?;
+                self.stringers(v, sp)
+            }
+            Ty::Tuple(ts) => ts.iter().try_for_each(|x| self.stringers(x, sp)),
+            Ty::Struct(_, fs) => fs.clone().iter().try_for_each(|(_, x)| self.stringers(x, sp)),
+            Ty::Enum(_, vs) => vs.clone().iter().flat_map(|(_, fs)| fs.iter().map(|(_, x)| x.clone())).collect::<Vec<_>>().iter().try_for_each(|x| self.stringers(x, sp)),
+            _ => Ok(()),
+        }
+    }
+
     fn show_value(&mut self, v: TExpr) -> R<TExpr> {
+        self.stringers(&v.ty.clone(), v.span)?;
         if let Some(sn) = self.resolve(&v.ty).type_name().map(str::to_string) {
             if let Some(&def) = self.w.by_name.get(&method_name(&sn, "to_s")) {
                 let sp = v.span;
@@ -1715,6 +2073,120 @@ impl<'w, 'a> FnCx<'w, 'a> {
         Ok(self.mk(TK::Seq(vec![s1, s2, TStmt::Expr(e)]), Ty::Bool, sp))
     }
 
+    /// `->(x: T) -> R { ... }`: parameter types come from annotations or
+    /// from the function type it is wanted as.
+    fn lambda(&mut self, params: &[Param], ret: Option<&TypeExpr>, blk: &Block, sp: Span) -> R<TExpr> {
+        let hint = match self.want_hint.clone().map(|t| self.resolve(&t)) {
+            Some(Ty::Fn(ps, r)) if ps.len() == params.len() => Some((ps, *r)),
+            _ => None,
+        };
+        let mut ptys = vec![];
+        for (i, p) in params.iter().enumerate() {
+            ptys.push(match (&p.ty, &hint) {
+                (Some(t), _) => type_from(t, &self.w.structs, &self.w.consts)?,
+                (None, Some((ps, _))) => ps[i].clone(),
+                (None, None) => return Err(Diag::new(p.span, format!("give `{}` a type (`{}: Int`), or use the lambda where a function type is expected", p.name, p.name))),
+            });
+        }
+        // `return` inside returns from the lambda.
+        let rvar = match (ret, &hint) {
+            (Some(t), _) => type_from(t, &self.w.structs, &self.w.consts)?,
+            (None, Some((_, r))) => r.clone(),
+            (None, None) => self.fresh(),
+        };
+        let saved_ret = std::mem::replace(&mut self.ret, rvar.clone());
+        let saved_main = std::mem::replace(&mut self.is_main, false);
+        let saved = self.want_hint.take();
+        let saved_loops = std::mem::take(&mut self.loops);
+        let r = if ptys.is_empty() {
+            let own_start = self.locals.len();
+            self.scopes.push(HashMap::new());
+            let r = self.body(&blk.body);
+            self.scopes.pop();
+            r.map(|(body, _)| {
+                let ty = match body.last() {
+                    Some(TStmt::Expr(e)) => e.ty.clone(),
+                    _ => Ty::Unit,
+                };
+                (TBlock { params: vec![], destructure: false, body, pure: false, span: blk.span, own: (own_start, self.locals.len()) }, ty)
+            })
+        } else {
+            self.block_n(blk, &ptys, false)
+        };
+        self.loops = saved_loops;
+        self.want_hint = saved;
+        self.ret = saved_ret;
+        self.is_main = saved_main;
+        let (mut tb, bt) = r?;
+        if ret.is_none() && hint.is_none() && !matches!(self.resolve(&bt), Ty::Never) && !self.unify(&rvar, &bt) {
+            return Err(Diag::new(sp, format!("this lambda returns {} and {}", self.resolve(&rvar).show(), self.resolve(&bt).show())));
+        }
+        let rt = self.resolve(&rvar);
+        if rt != Ty::Unit {
+            if let Some(TStmt::Expr(last)) = tb.body.pop() {
+                let last = self.coerce(last, &rt)?;
+                self.expect(&last.ty, &rt, last.span, "lambda result")?;
+                tb.body.push(TStmt::Expr(last));
+            } else {
+                return Err(Diag::new(sp, format!("this lambda should return {}", rt.show())));
+            }
+        }
+        // Captured: locals used inside that were declared outside.
+        let mut used = vec![];
+        for s in &tb.body {
+            crate::lower::collect_locals_stmt(s, &mut used);
+        }
+        used.sort_unstable();
+        used.dedup();
+        let caps: Vec<LocalId> = used.into_iter().filter(|l| *l < tb.own.0 || *l >= tb.own.1).filter(|l| !tb.params.contains(l)).collect();
+        let ty = Ty::Fn(ptys, Box::new(rt));
+        let lo = blk.span.lo;
+        self.lambdas.retain(|(l, _, _)| *l != lo);
+        self.lambdas.push((lo, ty.clone(), caps.clone()));
+        let cap_es = caps.iter().map(|l| self.mk(TK::Local(*l), self.locals[*l].ty.clone(), sp)).collect();
+        Ok(self.mk(TK::M(M::Lambda, None, cap_es, Some(Box::new(tb))), ty, sp))
+    }
+
+    fn fn_call(&mut self, f: TExpr, args: &[Expr], sp: Span) -> R<TExpr> {
+        let Ty::Fn(ps, r) = self.resolve(&f.ty) else { unreachable!() };
+        if args.len() != ps.len() {
+            return Err(Diag::new(sp, format!("this {} takes {} argument(s), got {}", f.ty.show(), ps.len(), args.len())));
+        }
+        let mut targs = vec![];
+        for (a, p) in args.iter().zip(&ps) {
+            let v = self.value_as(a, p)?;
+            self.expect(&v.ty, p, v.span, "argument")?;
+            targs.push(v);
+        }
+        self.impure = true;
+        Ok(self.mk(TK::M(M::FnCall, Some(Box::new(f)), targs, None), *r, sp))
+    }
+
+    /// A value checked against a known type: array and map literals check
+    /// each element against it (so `[Circle.new, Square.new]` can be `[Shape]`).
+    fn value_as(&mut self, e: &Expr, want: &Ty) -> R<TExpr> {
+        let w = self.resolve(want);
+        if let (ExprKind::Array(items), Some(el)) = (&e.kind, w.arr_elem()) {
+            let mut vs = vec![];
+            for x in items {
+                let v = self.value_as(x, &el)?;
+                self.expect(&v.ty, &el, v.span, "array element")?;
+                vs.push(v);
+            }
+            if let Ty::Fixed(_, n) = &w {
+                if vs.len() as u64 != *n {
+                    return Err(Diag::new(e.span, format!("{} elements where {} needs {n}", vs.len(), w.show())));
+                }
+            }
+            return Ok(self.mk(TK::Array(vs), w, e.span));
+        }
+        let saved = self.want_hint.replace(w.clone());
+        let v = self.value(e);
+        self.want_hint = saved;
+        let v = v?;
+        self.coerce(v, &w)
+    }
+
     /// The struct type of `self` in a method.
     fn self_struct(&self) -> Option<Ty> {
         let id = self.lookup("self")?;
@@ -1740,6 +2212,14 @@ impl<'w, 'a> FnCx<'w, 'a> {
         }
         let call = self.call_def(def, name, name_span, targs, sp)?;
         let rty = call.ty.clone();
+        if matches!(self.resolve(&rty), Ty::Unit) {
+            let tl = self.mk(TK::Local(tid), Ty::arr(pty.clone()), sp);
+            let z = self.mk(TK::Int(0), Ty::Int, sp);
+            let back = self.mk(TK::Index(Box::new(tl), Box::new(z)), pty.clone(), sp);
+            let wb = if steps.is_empty() { self.mk(TK::Assign(id, Box::new(back)), pty, sp) } else { self.mk(TK::PlaceAssign(id, steps, None, Box::new(back)), pty, sp) };
+            let u = self.mk(TK::Unit, Ty::Unit, sp);
+            return Ok(self.mk(TK::Seq(vec![s1, TStmt::Expr(call), TStmt::Expr(wb), TStmt::Expr(u)]), Ty::Unit, sp));
+        }
         let (rid, s2) = self.opt_tmp(call, sp);
         let tl = self.mk(TK::Local(tid), Ty::arr(pty.clone()), sp);
         let z = self.mk(TK::Int(0), Ty::Int, sp);
@@ -2167,6 +2647,15 @@ impl<'w, 'a> FnCx<'w, 'a> {
 
     #[allow(clippy::too_many_arguments)]
     fn call(&mut self, recv: Option<&Expr>, name: &str, name_span: Span, args: &[Expr], block: Option<&Block>, bsym: Option<&(String, Span)>, sp: Span) -> R<TExpr> {
+        // `Stack[Int].new`: a generic type with explicit arguments.
+        if let Some(Expr { kind: ExprKind::TypeApp(c, tes), span: csp, .. }) = recv {
+            let Some(g) = generic(c) else {
+                return Err(Diag::new(*csp, format!("`{c}` isn't a generic type")));
+            };
+            let targs = tes.iter().map(|t| type_from(t, &self.w.structs, &self.w.consts)).collect::<R<Vec<_>>>()?;
+            let t = instantiate(c, &g, targs, *csp, &self.w.structs, &self.w.consts)?;
+            return self.const_call_named(c, Some(t), *csp, name, name_span, args, block, sp);
+        }
         // Constant receivers: Int.sqrt, Array.new, File.read, Enumerator.new.
         if let Some(Expr { kind: ExprKind::Const(c), span: csp, .. }) = recv {
             if !self.w.consts.contains_key(c) {
@@ -2176,6 +2665,27 @@ impl<'w, 'a> FnCx<'w, 'a> {
         let Some(recv) = recv else {
             return self.global_call(name, name_span, args, block, bsym, sp);
         };
+        // `a.b << x`, `grid[i] << x`: push through a place (read the slice
+        // header, push, write it back).
+        if matches!(name, "<<" | "push") && args.len() == 1 && block.is_none() {
+            let is_local = matches!(&recv.kind, ExprKind::Name(n) if self.lookup(n).is_some() && !(n == "self" && self.method.is_some()));
+            if !is_local && matches!(self.peek_ty(recv), Some(Ty::Array(_))) {
+                let (id, steps, pty) = self.place(recv)?;
+                let cur = self.place_read(id, &steps, &pty, recv.span);
+                let (tid, s1) = self.opt_tmp(cur, recv.span);
+                self.locals[tid].pushed = true;
+                self.locals[tid].mutated = true;
+                let el = self.resolve(&pty).arr_elem().unwrap();
+                let x = self.value(&args[0])?;
+                let x = self.coerce(x, &el)?;
+                self.expect(&x.ty, &el, x.span, "pushed value")?;
+                let tl = self.mk(TK::Local(tid), pty.clone(), recv.span);
+                let push = self.mk(TK::M(M::Push, Some(Box::new(tl)), vec![x], None), Ty::Unit, sp);
+                let back = self.mk(TK::Local(tid), pty.clone(), sp);
+                let wb = if steps.is_empty() { self.mk(TK::Assign(id, Box::new(back)), pty, sp) } else { self.mk(TK::PlaceAssign(id, steps, None, Box::new(back)), pty, sp) };
+                return Ok(self.mk(TK::Seq(vec![s1, TStmt::Expr(push), TStmt::Expr(wb)]), Ty::Unit, sp));
+            }
+        }
         if name.ends_with('!') {
             let st = match &recv.kind {
                 ExprKind::Name(n) if n == "self" && self.method.is_some() => self.self_struct(),
@@ -2195,6 +2705,12 @@ impl<'w, 'a> FnCx<'w, 'a> {
     }
 
     fn global_call(&mut self, name: &str, name_span: Span, args: &[Expr], block: Option<&Block>, bsym: Option<&(String, Span)>, sp: Span) -> R<TExpr> {
+        if let Some(id) = self.lookup(name) {
+            if let Ty::Fn(..) = self.resolve(&self.locals[id].ty) {
+                let f = self.mk(TK::Local(id), self.locals[id].ty.clone(), name_span);
+                return self.fn_call(f, args, sp);
+            }
+        }
         match name {
             "puts" | "print" | "p" => {
                 if self.pure_decl {
@@ -2241,9 +2757,14 @@ impl<'w, 'a> FnCx<'w, 'a> {
         // Inside a method, a bare name is a field or method of `self`.
         if self.method.is_some() && self.lookup("self").is_some() {
             let st = self.self_struct();
-            if let Some(Ty::Struct(sn, fs)) = &st {
+            let tn = st.as_ref().and_then(|t| t.type_name()).map(str::to_string);
+            if let Some(sn) = &tn {
+                let fs: Vec<(String, Ty)> = match &st {
+                    Some(Ty::Struct(_, fs)) => fs.clone(),
+                    _ => vec![],
+                };
                 let is_field = args.is_empty() && block.is_none() && fs.iter().any(|(f, _)| f == name);
-                if is_field || self.w.by_name.contains_key(&method_name(sn, name)) {
+                if is_field || self.w.by_name.contains_key(&method_name(sn, name)) || self.w.default_for(sn, name).is_some() {
                     let me = Expr { kind: ExprKind::Name("self".into()), span: name_span, id: NodeId::MAX };
                     return self.call(Some(&me), name, name_span, args, block, bsym, sp);
                 }
@@ -2264,7 +2785,18 @@ impl<'w, 'a> FnCx<'w, 'a> {
         if args.len() != d.params.len() {
             return Err(Diag::new(name_span, format!("`{name}` takes {} argument(s), got {}", d.params.len(), args.len())));
         }
-        let targs = args.iter().map(|a| self.value(a)).collect::<R<Vec<_>>>()?;
+        let mut targs = vec![];
+        for (a, p) in args.iter().zip(&d.params) {
+            // A declared type (when it doesn't mention type parameters) guides literals.
+            let v = match (&p.ty, self.w.defs[def].external.is_none()) {
+                (Some(t), true) => match type_from(t, &self.w.structs, &self.w.consts) {
+                    Ok(t) => self.value_as(a, &t)?,
+                    Err(_) => self.value(a)?,
+                },
+                _ => self.value(a)?,
+            };
+            targs.push(v);
+        }
         self.call_def(def, name, name_span, targs, sp)
     }
 
@@ -2276,6 +2808,16 @@ impl<'w, 'a> FnCx<'w, 'a> {
             let own = usize::from(d.params.first().is_some_and(|p| p.name == "self"));
             return Err(Diag::new(name_span, format!("`{name}` takes {} argument(s), got {}", d.params.len() - own, args.len() - own)));
         }
+        let arg_tys: Vec<Ty> = args.iter().map(|a| self.resolve(&a.ty)).collect();
+        let saved = self.w.bind(def, &arg_tys, sp)?;
+        let r = self.call_def_args(name_span, &d, ext, args);
+        self.w.unbind(saved);
+        let targs = r?;
+        self.call_def_inst(def, name, name_span, targs, sp, &d)
+    }
+
+    fn call_def_args(&mut self, name_span: Span, d: &Def, ext: Option<Vec<Ty>>, args: Vec<TExpr>) -> R<Vec<TExpr>> {
+        let name = &d.name;
         let mut targs = vec![];
         for (i, (v, p)) in args.into_iter().zip(&d.params).enumerate() {
             let want = match (&ext, &p.ty) {
@@ -2294,6 +2836,10 @@ impl<'w, 'a> FnCx<'w, 'a> {
             }
             targs.push(v);
         }
+        Ok(targs)
+    }
+
+    fn call_def_inst(&mut self, def: usize, name: &str, name_span: Span, targs: Vec<TExpr>, sp: Span, d: &Def) -> R<TExpr> {
         let arg_tys: Vec<Ty> = targs.iter().map(|a| self.resolve(&a.ty)).collect();
         if arg_tys.iter().any(Ty::has_var) {
             let t = self.unknown(sp, "this call's arguments")?;
@@ -2336,8 +2882,58 @@ impl<'w, 'a> FnCx<'w, 'a> {
     }
 
     fn const_call(&mut self, c: &str, csp: Span, name: &str, name_span: Span, args: &[Expr], block: Option<&Block>, sp: Span) -> R<TExpr> {
+        if let (Some(g), false) = (generic(c), self.w.structs.contains_key(c)) {
+            // `Stack.new(items: [1])`: infer the type arguments from the values
+            // (or from the type the value is wanted as).
+            let fields: Vec<(String, TypeExpr, Span)> = match (&g, name) {
+                (GenDef::S(d), "new") => d.fields.clone(),
+                (GenDef::E(d), v) => match d.variants.iter().find(|(n, _, _)| n == v) {
+                    Some((_, fs, _)) => fs.clone(),
+                    None => return Err(Diag::new(name_span, format!("{c} has no variant `{v}`"))),
+                },
+                _ => return Err(Diag::new(name_span, format!("no method `{name}` on {c}"))),
+            };
+            let mut out = HashMap::new();
+            if let Some((base, targs)) = self.want_hint.clone().and_then(|t| inst_args(&self.resolve(&t))) {
+                if base == c {
+                    for (tp, t) in g.tparams().iter().zip(targs) {
+                        out.insert(tp.name.clone(), t);
+                    }
+                }
+            }
+            for (i, a) in args.iter().enumerate() {
+                let (te, v) = match &a.kind {
+                    ExprKind::KwArg(n, _, v) => match fields.iter().find(|(f, _, _)| f == n) {
+                        Some((_, te, _)) => (te, v.as_ref()),
+                        None => continue,
+                    },
+                    _ => match fields.get(i) {
+                        Some((_, te, _)) => (te, a),
+                        None => continue,
+                    },
+                };
+                let v = self.value(v)?;
+                let t = self.resolve(&v.ty);
+                bind_tparams(te, &t, g.tparams(), &mut out);
+            }
+            let mut targs = vec![];
+            for tp in g.tparams() {
+                match out.get(&tp.name) {
+                    Some(t) if !t.has_var() => targs.push(t.clone()),
+                    _ => return Err(Diag::new(sp, format!("can't infer `{}` for {c}; write `{c}[...].{name}` or declare the type", tp.name))),
+                }
+            }
+            let t = instantiate(c, &g, targs, sp, &self.w.structs, &self.w.consts)?;
+            return self.const_call_named(c, Some(t), csp, name, name_span, args, block, sp);
+        }
+        self.const_call_named(c, None, csp, name, name_span, args, block, sp)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn const_call_named(&mut self, c: &str, named: Option<Ty>, csp: Span, name: &str, name_span: Span, args: &[Expr], block: Option<&Block>, sp: Span) -> R<TExpr> {
         let argv = |cx: &mut Self| args.iter().map(|a| cx.value(a)).collect::<R<Vec<_>>>();
-        if let Some(et @ Ty::Enum(..)) = self.w.structs.get(c).cloned() {
+        let named = named.or_else(|| self.w.structs.get(c).cloned());
+        if let Some(et @ Ty::Enum(..)) = named.clone() {
             let Ty::Enum(_, vs) = &et else { unreachable!() };
             let Some(k) = vs.iter().position(|(v, _)| v == name) else {
                 return Err(Diag::new(name_span, format!("{c} has no variant `{name}`; its variants are {}", vs.iter().map(|(v, _)| v.as_str()).collect::<Vec<_>>().join(", "))));
@@ -2378,7 +2974,7 @@ impl<'w, 'a> FnCx<'w, 'a> {
             }
             return Ok(self.mk(TK::M(M::VariantNew(k), None, slots, None), et.clone(), sp));
         }
-        if let (Some(st), "new") = (self.w.structs.get(c).cloned(), name) {
+        if let (Some(st @ Ty::Struct(..)), "new") = (named.clone(), name) {
             let Ty::Struct(_, fields) = &st else { unreachable!() };
             if args.is_empty() || args.iter().any(|a| matches!(a.kind, ExprKind::KwArg(..))) {
                 // Keywords: any subset of fields, in any order; the rest are zero (Go).
@@ -2719,7 +3315,8 @@ impl<'w, 'a> FnCx<'w, 'a> {
                 }
                 return Ok(mk_m(self, M::TupleGet(k), recv, vec![], None, ft));
             }
-            if let Some(&def) = self.w.by_name.get(&method_name(sn, name)) {
+            let base = rt.type_name().unwrap_or(sn);
+            if let Some(&def) = self.w.by_name.get(&method_name(base, name)).or(self.w.default_for(base, name).as_ref()) {
                 if name.ends_with('!') {
                     return Err(Diag::new(recv.span, format!("`{name}` changes its receiver; call it on a variable")));
                 }
@@ -2734,8 +3331,31 @@ impl<'w, 'a> FnCx<'w, 'a> {
             }
             return Err(self.no_field(sn, fs, name, name_span));
         }
+        if let (Ty::Fn(..), "call") = (&rt, name) {
+            return self.fn_call(recv, args, sp);
+        }
+        if let Ty::Iface(iname) = &rt {
+            let ms = self.w.ifaces[iname].clone();
+            let Some(k) = ms.iter().position(|m| m.name == name) else {
+                return Err(Diag::new(name_span, format!("no method `{name}` on {iname}; it has {}", ms.iter().map(|m| m.name.as_str()).collect::<Vec<_>>().join(", "))));
+            };
+            let m = &ms[k];
+            if args.len() != m.params.len() {
+                return Err(Diag::new(name_span, format!("`{iname}.{name}` takes {} argument(s), got {}", m.params.len(), args.len())));
+            }
+            let mut targs = vec![];
+            for (a, pt) in args.iter().zip(&m.params) {
+                let v = self.value(a)?;
+                let v = self.coerce(v, pt)?;
+                self.expect(&v.ty, pt, v.span, &format!("`{iname}.{name}` argument"))?;
+                targs.push(v);
+            }
+            self.impure = true;
+            return Ok(mk_m(self, M::IfaceCall(k), recv, targs, None, m.ret.clone()));
+        }
         if let Ty::Enum(en, vs) = &rt {
-            if let Some(&def) = self.w.by_name.get(&method_name(en, name)) {
+            let base = rt.type_name().unwrap_or(en);
+            if let Some(&def) = self.w.by_name.get(&method_name(base, name)).or(self.w.default_for(base, name).as_ref()) {
                 if name.ends_with('!') {
                     return Err(Diag::new(recv.span, format!("`{name}` changes its receiver; call it on a variable")));
                 }
@@ -2968,7 +3588,10 @@ impl<'w, 'a> FnCx<'w, 'a> {
                 }
                 "max_by" | "min_by" => {
                     let (blk, kt) = self.any_block(block, bsym, &el, sp, name)?;
-                    self.expect(&kt, &Ty::Int, blk.span, &format!("`{name}` key"))?;
+                    let k = self.resolve(&kt);
+                    if !(k.int_kind().is_some() || matches!(k, Ty::Float | Ty::Str)) {
+                        self.expect(&kt, &Ty::Int, blk.span, &format!("`{name}` key"))?;
+                    }
                     return Ok(mk_m(self, if name == "max_by" { M::MaxBy } else { M::MinBy }, recv, vec![], Some(blk), el));
                 }
                 "first" => {
@@ -3194,6 +3817,7 @@ fn occurs(v: u32, t: &Ty) -> bool {
         Ty::Array(t) | Ty::Fixed(t, _) | Ty::Seq(t, _) | Ty::Gen(t) | Ty::Yielder(t) | Ty::Opt(t) => occurs(v, t),
         Ty::Tuple(ts) => ts.iter().any(|t| occurs(v, t)),
         Ty::Map(k, x) => occurs(v, k) || occurs(v, x),
+        Ty::Fn(ps, r) => ps.iter().any(|t| occurs(v, t)) || occurs(v, r),
         _ => false,
     }
 }

@@ -109,3 +109,10 @@ The logic: **fallibility is a prefix** ("approximately do this", "you'll probabl
 | D7 | `[v; n]` fill | a fill holding storage (a slice, a fixed array, a struct with one) is evaluated once per element, so `[[0; 3]; 3]` is three independent rows (Rust's `vec![v; n]` clones; Go's `make` gives nil rows) | M3 |
 | D8 | Map printing and keys | `puts m` prints Go's `map[k:v ...]` in insertion order (Go sorts); keys are integer types, Str or Bool for now; `m[k] op= v` reads a missing key as V's zero (Go) | M3 |
 | D9 | `copy(dst, src)` | Go's: copies `min(len)` elements, returns the count, overlapping slices behave like memmove | M3 |
+| D10 | Fields inside methods | read bare (`x`, Ruby's attribute style); writes spell `self.x = ...` and only a `!` method may write. Assigning to a bare field name is an error rather than a new local, so it can't silently shadow | M4 |
+| D11 | Receivers | a `!` method needs a variable (or field/element path) as its receiver, Go's addressability rule; a plain method gets a copy and assigning to `self` in one is an error pointing at `!` | M4 |
+| D12 | Interface values | a closed sum over the program's implementors (whole-program compile), so no boxing or GC; a struct/enum converts implicitly where the interface is wanted; interface methods can't be `!` yet | M4 |
+| D13 | Equality and ordering | structs, tuples and enums compare field by field (Go's comparable types); slice/map fields aren't comparable unless the type defines `def ==`; `def <=>` gives `< <= > >=` | M4 |
+| D14 | Printing | Go's `%v`: slices `[1 2]`, structs `{1 2}`, maps `map[k:v]`; enums print as `Circle(1)` / `Red`; a type's `to_s` is used everywhere it's printed, nested too (Go's `Stringer`) | M4 |
+| D15 | Generic instances | written `Stack[Int]`; type arguments inferred from constructor values or the declared type, else spelled `Stack[Int].new`; bounds `T: Shape` and `T: like Int` are checked per instance | M4 |
+| D16 | Lambdas | `->(x: T) -> R { }`, type `(T) -> R`, called `f(x)` or `f.call(x)`; captures are **copies** for now (slices and maps still share), revisited with the memory model; `return` returns from the lambda | M4 |

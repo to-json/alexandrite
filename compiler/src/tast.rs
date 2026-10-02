@@ -1,7 +1,8 @@
 //! Typed tree produced by the checker: one `TFunc` per function instance
 //! (monomorphized), every expression typed, every call resolved.
 
-pub use crate::ast::IntKind;
+pub use std::collections::HashMap;
+use crate::ast::IntKind;
 use crate::ast::{BinOp, Overflow};
 use num_bigint::BigInt;
 use num_rational::BigRational;
@@ -24,6 +25,12 @@ pub enum Ty {
     /// `enum`: its name and variants (each with its fields). A value: the
     /// tag, then every variant's fields side by side.
     Enum(String, Vec<(String, Vec<(String, Ty)>)>),
+    /// A function value (`(A, B) -> R`): one of the program's lambda
+    /// literals of this type, with its captured values.
+    Fn(Vec<Ty>, Box<Ty>),
+    /// An interface value: one of the types converted to it (closed world:
+    /// the program's implementors, see `TProgram::ifaces`).
+    Iface(String),
     /// `Map[K, V]`: ordered (insertion order), shared like a Go map.
     Map(Box<Ty>, Box<Ty>),
     Tuple(Vec<Ty>),
@@ -55,7 +62,7 @@ impl Ty {
             Ty::Int => "Int".into(),
             Ty::IntK(k) => k.name().into(),
             Ty::Float => "Float".into(),
-            Ty::Struct(n, _) | Ty::Enum(n, _) => n.clone(),
+            Ty::Struct(n, _) | Ty::Enum(n, _) | Ty::Iface(n) => n.clone(),
             Ty::Opt(t) => format!("{}?", t.show()),
             Ty::Bool => "Bool".into(),
             Ty::Str => "Str".into(),
@@ -63,6 +70,7 @@ impl Ty {
             Ty::Array(t) => format!("[{}]", t.show()),
             Ty::Fixed(t, n) => format!("[{}; {n}]", t.show()),
             Ty::Map(k, v) => format!("Map[{}, {}]", k.show(), v.show()),
+            Ty::Fn(ps, r) => format!("({}) -> {}", ps.iter().map(Ty::show).collect::<Vec<_>>().join(", "), r.show()),
             Ty::Tuple(ts) => format!("({})", ts.iter().map(Ty::show).collect::<Vec<_>>().join(", ")),
             Ty::Range => "Range[Int]".into(),
             Ty::Seq(t, true) => format!("Lazy[{}]", t.show()),
@@ -79,6 +87,7 @@ impl Ty {
             Ty::Array(t) | Ty::Fixed(t, _) | Ty::Seq(t, _) | Ty::Gen(t) | Ty::Yielder(t) | Ty::Opt(t) => t.has_var(),
             Ty::Tuple(ts) => ts.iter().any(Ty::has_var),
             Ty::Map(k, v) => k.has_var() || v.has_var(),
+            Ty::Fn(ps, r) => ps.iter().any(Ty::has_var) || r.has_var(),
             _ => false,
         }
     }
@@ -96,7 +105,8 @@ impl Ty {
     /// The name of a struct or enum (methods live under it).
     pub fn type_name(&self) -> Option<&str> {
         match self {
-            Ty::Struct(n, _) | Ty::Enum(n, _) => Some(n),
+            // A generic instance (`Stack[Int]`) has its type's methods.
+            Ty::Struct(n, _) | Ty::Enum(n, _) => Some(n.split('[').next().unwrap_or(n)),
             _ => None,
         }
     }
@@ -226,6 +236,14 @@ pub enum M {
     /// `m.fetch(k, d)`, `m[k] = v`, `delete` (V?), `key?`, `size`, `keys`, `values`.
     /// An enum value's variant index.
     EnumTag,
+    /// A lambda literal (the block); args are its captured locals.
+    Lambda,
+    /// Call a function value: recv is the function, args its arguments.
+    FnCall,
+    /// Wrap a concrete value as implementor `k` of its interface type.
+    ToIface(usize),
+    /// Call method `k` (declaration order) of an interface value.
+    IfaceCall(usize),
     /// Build variant `k` of an enum: args are every slot after the tag.
     VariantNew(usize),
     /// `find { pred }` → T? (a select stage, then this terminal).
@@ -368,9 +386,17 @@ pub struct TFunc {
     /// Defined in a separately compiled library: emit an extern prototype.
     pub external: bool,
     pub is_main: bool,
+    /// Lambda literals in this function: (block span start, fn type, captured locals).
+    pub lambdas: Vec<(u32, Ty, Vec<LocalId>)>,
 }
 
 pub struct TProgram {
     pub funcs: Vec<TFunc>,
     pub main: FuncId,
+    /// Each interface's implementors, in tag order, with the instance of
+    /// each of its methods (in declaration order).
+    pub ifaces: HashMap<String, Vec<(Ty, Vec<FuncId>)>>,
+    /// `to_s` instances of types that are printed (by `Ty::show`), so
+    /// printing a slice of them uses each element's `to_s` (Go's Stringer).
+    pub stringers: HashMap<String, FuncId>,
 }

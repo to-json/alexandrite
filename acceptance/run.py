@@ -180,6 +180,18 @@ def memory():
         check(ms, f"bounded memory: {prog}", ok, f"peak {peak} bytes, stdout {r2.stdout.strip()[:40]!r}")
 
 
+def std_tests():
+    """L1+: every std package's own tests pass, on the JIT and in release builds."""
+    std = ROOT / "std"
+    pkgs = sorted({f.parent for f in std.rglob("*_test.alx")})
+    for d in pkgs:
+        name = str(d.relative_to(std))
+        for mode in ([], ["--release"]):
+            r, _ = run([ALX, "test", *mode, str(d)], cwd=ROOT)
+            label = "release" if mode else "jit"
+            check("L1", f"std/{name} tests ({label})", r.returncode == 0, r.stdout[-300:] + r.stderr[-300:])
+
+
 def explain():
     """R7: `alx explain mem` names each allocation's region and why."""
     r, _ = run([ALX, "explain", "mem", "explain.alx"], cwd=CASES / "mem")
@@ -411,6 +423,7 @@ def main():
         warnings()
         memory()
         explain()
+        std_tests()
         tasks_memory()
         fmt_check()
         print("== alx test", flush=True)

@@ -9,6 +9,7 @@ const PRELUDE: &str = include_str!("../runtime/prelude.rs");
 
 fn rty(t: &LTy) -> String {
     match t {
+        LTy::Task(_) | LTy::Chan(_) => unimplemented!("M7: task/channel types in the Rust oracle"),
         // Every integer kind is an i64 here (bit pattern for U64): the
         // oracle checks meaning, not memory layout.
         LTy::I64 | LTy::IntK(_) => "i64".into(),
@@ -141,6 +142,7 @@ impl FnEmit<'_> {
 
     fn stmt(&mut self, s: &LS) {
         match s {
+            LS::Spawn { .. } | LS::Wait { .. } | LS::ChanSend { .. } | LS::ChanRecv { .. } | LS::ChanClose { .. } | LS::Select { .. } => unimplemented!("M7: tasks and channels in the Rust oracle"),
             LS::Set(v, e) => {
                 let x = self.e(e);
                 self.line(&format!("v{v} = {x};"));
@@ -272,6 +274,7 @@ impl FnEmit<'_> {
 
     fn e(&self, e: &LE) -> String {
         match e {
+            LE::ChanNew(..) | LE::ChanLen(_) => unimplemented!("M7: channels in the Rust oracle"),
             LE::Var(v) => self.var(*v),
             LE::I(i) => {
                 if *i == i64::MIN {

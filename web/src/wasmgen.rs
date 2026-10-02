@@ -126,6 +126,7 @@ struct Lay {
 fn lay(t: &LTy) -> Lay {
     let words = |n: u32| Lay { size: 8 * n, align: 8, fields: (0..n).map(|i| (8 * i, F::Wd)).collect() };
     match t {
+        LTy::Task(_) | LTy::Chan(_) => words(1),
         LTy::I64 | LTy::Gen(_) => words(1),
         LTy::F64 => Lay { size: 8, align: 8, fields: vec![(0, F::Fl)] },
         LTy::IntK(k) if k.bits() == 64 => words(1),
@@ -684,6 +685,7 @@ impl<'c, 'p> Fx<'c, 'p> {
 
     fn stmt(&mut self, s: &LS) {
         match s {
+            LS::Spawn { .. } | LS::Wait { .. } | LS::ChanSend { .. } | LS::ChanRecv { .. } | LS::ChanClose { .. } | LS::Select { .. } => unimplemented!("M7: tasks and channels in the browser"),
             LS::Set(v, e) => {
                 self.e(e);
                 self.set_var(*v);
@@ -1051,6 +1053,8 @@ impl<'c, 'p> Fx<'c, 'p> {
 
     fn ty(&self, e: &LE) -> LTy {
         match e {
+            LE::ChanNew(t, _) => LTy::Chan(Box::new(t.clone())),
+            LE::ChanLen(_) => LTy::I64,
             LE::Var(v) => self.f.vars[*v].ty.clone(),
             LE::I(_) | LE::Arith(..) | LE::Neg(..) | LE::Len(_) => LTy::I64,
             LE::F(_) | LE::FArith(..) | LE::FNeg(_) | LE::Prim(Prim::UToF, _) => LTy::F64,
@@ -1109,6 +1113,7 @@ impl<'c, 'p> Fx<'c, 'p> {
         let t = self.ty(e);
         let out = vts(&t);
         match e {
+            LE::ChanNew(..) | LE::ChanLen(_) => unimplemented!("M7: channels in the browser"),
             LE::Var(v) => {
                 let ls = self.vars[*v].clone();
                 self.get(&ls);

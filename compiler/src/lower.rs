@@ -2916,6 +2916,7 @@ fn out_of_range(k: IntKind, r: LE) -> LE {
 /// The zero value of a LIR type, as an expression.
 fn zero_le(t: &LTy) -> LE {
     match t {
+        LTy::Task(_) | LTy::Chan(_) => unimplemented!("M7: zero value of a task/channel handle"),
         LTy::I64 | LTy::IntK(_) => LE::I(0),
         LTy::F64 => LE::F(0.0),
         LTy::Bool => LE::B(false),

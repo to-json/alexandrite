@@ -21,6 +21,12 @@ pub enum LTy {
     Tup(Vec<LTy>),
     Range,
     Gen(Box<LTy>),
+    /// A handle to a spawned task that produces a value of this type
+    /// (pointer-sized; copies refer to the same task).
+    Task(Box<LTy>),
+    /// A handle to a channel carrying values of this type (pointer-sized;
+    /// copies refer to the same channel; safe to use from any task).
+    Chan(Box<LTy>),
 }
 
 impl LTy {
@@ -115,6 +121,22 @@ pub enum LE {
     GenNew(usize, Vec<LE>),
     /// Convert I64 to PInt.
     ToP(Box<LE>),
+    /// A new channel of `LTy` values with buffer capacity `cap` (an I64 >= 0).
+    /// Capacity 0 is unbuffered: a send completes only when a receiver takes
+    /// the value (Go's rendezvous).
+    ChanNew(LTy, Box<LE>),
+    /// The number of values buffered in a channel right now (I64).
+    ChanLen(Box<LE>),
+}
+
+/// A case of `LS::Select`.
+#[derive(Clone, Debug)]
+pub enum SelCase {
+    /// Send `val` on `ch` (a closed channel panics, as `ChanSend` does).
+    Send { ch: LE, val: LE },
+    /// Receive from `ch` into `val`; `ok` is false (and `val` untouched)
+    /// if the channel is closed and drained.
+    Recv { ch: LE, ok: V, val: V },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -221,6 +243,29 @@ pub enum LS {
     Pmap { dst: V, arr: LE, worker: usize },
     Puts(LE, LTy),
     Panic(String, String),
+    /// Start a task running `workers[worker]` on `env` (a value of the
+    /// worker's `input` type, copied); `dst` (an `LTy::Task`) gets its handle.
+    /// A panic inside the task ends only that task (see `Wait`); a panic on
+    /// the main thread still aborts the process.
+    Spawn { dst: V, worker: usize, env: LE },
+    /// Block until `task` finishes. If it returned, `ok` = true and `val` =
+    /// its result; if it panicked, `ok` = false and `msg` = the panic message
+    /// (`val` untouched). Waiting again gives the same answer.
+    Wait { task: LE, ok: V, val: V, msg: V },
+    /// Send `val` on `ch`: blocks while the buffer is full (unbuffered: until
+    /// a receiver takes it). Sending on a closed channel panics at `loc`.
+    ChanSend { ch: LE, val: LE, loc: String },
+    /// Receive from `ch`: blocks until a value arrives (`ok` = true, `val` =
+    /// it) or the channel is closed and drained (`ok` = false, `val` untouched).
+    ChanRecv { ch: LE, ok: V, val: V },
+    /// Close `ch`; receivers drain what's buffered, then see `ok` = false.
+    /// Closing twice panics at `loc`.
+    ChanClose { ch: LE, loc: String },
+    /// Run one ready case, chosen fairly (random among the ready ones);
+    /// `dst` = its index. If none is ready: with `default`, run none and set
+    /// `dst` = `cases.len()`; otherwise block until one is. The case
+    /// expressions are evaluated once, before waiting, in order.
+    Select { cases: Vec<SelCase>, default: bool, dst: V },
     /// Flush stdout, print the Str and a newline to stderr, exit 1.
     Die(LE),
     SortInPlace(V, LTy),

@@ -6,6 +6,7 @@ use std::fmt::Write;
 
 pub fn ty_name(t: &LTy) -> String {
     match t {
+        LTy::Task(_) | LTy::Chan(_) => unimplemented!("M7: task/channel types in C"),
         LTy::I64 => "I64".into(),
         LTy::IntK(k) => k.name().into(),
         LTy::F64 => "F64".into(),
@@ -22,6 +23,7 @@ pub fn ty_name(t: &LTy) -> String {
 
 pub fn cty(t: &LTy) -> String {
     match t {
+        LTy::Task(_) | LTy::Chan(_) => unimplemented!("M7: task/channel types in C"),
         LTy::I64 | LTy::IntK(_) => "int64_t".into(),
         LTy::F64 => "double".into(),
         LTy::PInt => "AlxPInt".into(),
@@ -285,6 +287,7 @@ impl FnEmit<'_> {
 
     fn stmt(&mut self, s: &LS) {
         match s {
+            LS::Spawn { .. } | LS::Wait { .. } | LS::ChanSend { .. } | LS::ChanRecv { .. } | LS::ChanClose { .. } | LS::Select { .. } => unimplemented!("M7: tasks and channels in C"),
             LS::Set(v, e) => {
                 let x = self.e(e);
                 let v = self.v(*v);
@@ -429,6 +432,7 @@ impl FnEmit<'_> {
 
     fn e(&self, e: &LE) -> String {
         match e {
+            LE::ChanNew(..) | LE::ChanLen(_) => unimplemented!("M7: channels in C"),
             LE::Var(v) => self.v(*v),
             LE::I(i) => {
                 if *i == i64::MIN {

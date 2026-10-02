@@ -62,6 +62,7 @@ enum Mem {
 fn lay(t: &LTy) -> Lay {
     let words = |n: u32| Lay { size: 8 * n, align: 8, fields: (0..n).map(|i| (8 * i, I64)).collect(), mem: vec![Mem::Full; n as usize] };
     match t {
+        LTy::Task(_) | LTy::Chan(_) => words(1),
         LTy::I64 | LTy::Gen(_) => words(1),
         LTy::F64 => Lay { size: 8, align: 8, fields: vec![(0, F64)], mem: vec![Mem::Full] },
         LTy::IntK(k) if k.bits() == 64 => words(1),
@@ -542,6 +543,7 @@ impl Fx<'_, '_, '_> {
 
     fn stmt(&mut self, s: &LS) {
         match s {
+            LS::Spawn { .. } | LS::Wait { .. } | LS::ChanSend { .. } | LS::ChanRecv { .. } | LS::ChanClose { .. } | LS::Select { .. } => unimplemented!("M7: tasks and channels in the JIT"),
             LS::Set(v, e) => {
                 let x = self.e(e);
                 self.set(*v, &x);
@@ -780,6 +782,8 @@ impl Fx<'_, '_, '_> {
 
     fn ty(&self, e: &LE) -> LTy {
         match e {
+            LE::ChanNew(t, _) => LTy::Chan(Box::new(t.clone())),
+            LE::ChanLen(_) => LTy::I64,
             LE::Var(v) => self.f.vars[*v].ty.clone(),
             LE::I(_) | LE::Loc(_) | LE::Arith(..) | LE::Neg(..) | LE::Len(_) => LTy::I64,
             LE::F(_) | LE::FArith(..) | LE::FNeg(_) | LE::Prim(Prim::UToF, _) => LTy::F64,
@@ -979,6 +983,7 @@ impl Fx<'_, '_, '_> {
 
     fn e(&mut self, e: &LE) -> Vec<Value> {
         match e {
+            LE::ChanNew(..) | LE::ChanLen(_) => unimplemented!("M7: channels in the JIT"),
             LE::Var(v) => self.get(*v),
             LE::I(i) => vec![self.ic(*i)],
             LE::F(v) => vec![self.b.ins().f64const(*v)],

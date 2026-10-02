@@ -82,6 +82,7 @@ GROUPS = {
     "writers": "R4",
     "pools": "R4",
     "asserts": "M8",
+    "sharing": "R6",
 }
 
 
@@ -339,6 +340,10 @@ def main():
     if not filt or "neg" in filt:
         print("== negative cases", flush=True)
         negative_compile("pe014.bad1", "A4")
+        negative_compile("sharing.bad1", "R6")
+        negative_compile("sharing.bad2", "R6")
+        negative_compile("sharing.bad3", "R6")
+        negative_compile("sharing.bad4", "R6")
         negative_compile("pe014.bad2", "A4")
         negative_compile("pe004.bad", "A4")
         negative_runtime("pe020.bad", "A3")

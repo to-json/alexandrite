@@ -261,8 +261,19 @@ impl<'a> Graph<'a> {
                         }
                     }
                 }
-                v.extend(rv);
-                v.extend(avs);
+                // A task handle doesn't share its captures' storage (they
+                // went to the task, through Global).
+                // A copy of a flat slice or map is fresh storage.
+                let flat_copy = *m == M::Dup
+                    && match &e.ty {
+                        Ty::Array(t) => !has_storage(t),
+                        Ty::Map(k, t) => !has_storage(k) && !has_storage(t),
+                        _ => false,
+                    };
+                if *m != M::Spawn && !flat_copy {
+                    v.extend(rv);
+                    v.extend(avs);
+                }
             }
             TK::Seq(ss) => {
                 for s in ss {
@@ -410,6 +421,60 @@ fn graph<'a>(f: &'a TFunc, sums: &'a [Summary]) -> Graph<'a> {
 
 /// Placement for every function of the program.
 pub fn analyze(p: &TProgram) -> Vec<FnPlacement> {
+    let sums = summaries(p);
+    analyze_with(p, &sums)
+}
+
+/// For every local of every function: the locals sharing storage with it
+/// (itself included), and the parameters whose caller-owned storage it
+/// shares. Aliasing in either direction counts; the paths stop at returns,
+/// globals and callers.
+pub fn aliases(p: &TProgram) -> Vec<HashMap<LocalId, (Vec<LocalId>, Vec<LocalId>)>> {
+    let sums = summaries(p);
+    p.funcs
+        .iter()
+        .map(|f| {
+            let mut out = HashMap::new();
+            if f.external {
+                return out;
+            }
+            let g = graph(f, &sums);
+            let mut adj: HashMap<Node, Vec<Node>> = HashMap::new();
+            for (a, bs) in &g.edges {
+                for b in bs {
+                    adj.entry(*a).or_default().push(*b);
+                    adj.entry(*b).or_default().push(*a);
+                }
+            }
+            for l in 0..f.locals.len() {
+                let (mut locals, mut callers) = (vec![l], vec![]);
+                let mut seen = vec![Node::Local(l)];
+                let mut stack = vec![Node::Local(l)];
+                while let Some(n) = stack.pop() {
+                    for m in adj.get(&n).into_iter().flatten() {
+                        if seen.contains(m) {
+                            continue;
+                        }
+                        seen.push(*m);
+                        match m {
+                            Node::Caller(q) => callers.push(*q),
+                            Node::Ret | Node::Global => {}
+                            Node::Local(x) => {
+                                locals.push(*x);
+                                stack.push(*m);
+                            }
+                            _ => stack.push(*m),
+                        }
+                    }
+                }
+                out.insert(l, (locals, callers));
+            }
+            out
+        })
+        .collect()
+}
+
+fn summaries(p: &TProgram) -> Vec<Summary> {
     // Summaries to a fixpoint, starting from "nothing flows anywhere".
     let mut sums: Vec<Summary> = p
         .funcs
@@ -447,13 +512,17 @@ pub fn analyze(p: &TProgram) -> Vec<FnPlacement> {
             break;
         }
     }
+    sums
+}
+
+fn analyze_with(p: &TProgram, sums: &[Summary]) -> Vec<FnPlacement> {
     p.funcs
         .iter()
         .map(|f| {
             if f.external {
                 return FnPlacement::default();
             }
-            let g = graph(f, &sums);
+            let g = graph(f, sums);
             let fresh = fresh_locals(f, &g);
             let mut out = FnPlacement::default();
             for s in &g.sites {

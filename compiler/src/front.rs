@@ -446,6 +446,8 @@ pub fn check_program(l: &Loaded, externs: Vec<DefInfo>) -> Result<TProgram, Diag
     let mut p = TProgram { funcs, main, ifaces, stringers, errors, messages, warnings };
     // R5: lambdas see the variables they capture, not copies.
     crate::capture::convert(&mut p);
+    // R6: what goes to another task isn't used here afterwards.
+    crate::sharing::check(&p, &l.sm)?;
     Ok(p)
 }
 

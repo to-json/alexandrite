@@ -18,4 +18,5 @@ pub mod parser;
 pub mod prove;
 pub mod regions;
 pub mod rgen;
+pub mod sharing;
 pub mod tast;

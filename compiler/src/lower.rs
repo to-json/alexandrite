@@ -171,11 +171,12 @@ struct Lw<'a> {
     iter_open: Vec<(usize, V, V)>,
     /// For the next inlined block: the defer depth its `next` unwinds to.
     next_depth: Option<usize>,
+    /// Inside a store into a container: the container's region (R2).
+    into: Vec<V>,
 }
 
 /// A stage of a pipeline with its pre-loop state.
 struct Stage<'t> {
-    m: M,
     node: &'t TExpr,
     counter: Option<V>,
     limit: Option<V>,
@@ -209,6 +210,7 @@ impl<'a> Lw<'a> {
             iter_vars: HashMap::new(),
             iter_open: vec![],
             next_depth: None,
+            into: vec![],
         }
     }
 
@@ -604,6 +606,35 @@ impl<'a> Lw<'a> {
     // ---------- expressions ----------
 
     fn expr(&mut self, e: &TExpr) -> LE {
+        // R2: storing into a container whose storage is the caller's: what's
+        // stored (and any growth) goes in the region the container lives in.
+        if self.place.is_some_and(|pl| pl.into) && self.frame.is_some() {
+            let root = match &e.kind {
+                TK::M(M::Push | M::MapSet | M::MapDel | M::CopyInto, Some(r), ..) => match &r.kind {
+                    TK::Local(l) => Some(*l),
+                    _ => None,
+                },
+                TK::M(M::CopyInto, None, args, _) => match args.first().map(|a| &a.kind) {
+                    Some(TK::Local(l)) => Some(*l),
+                    _ => None,
+                },
+                TK::IndexAssign(l, ..) | TK::PlaceAssign(l, ..) => Some(*l),
+                _ => None,
+            };
+            if let Some(l) = root.filter(|l| matches!(self.lty(&self.f.locals[*l].ty), LTy::Arr(_) | LTy::Str)) {
+                let r = self.tmp(LTy::Region);
+                let v = self.var_of(l);
+                self.emit(LS::Set(r, LE::RegionOf(Box::new(LE::Var(v)))));
+                self.into.push(r);
+                let out = self.expr_placed(e);
+                self.into.pop();
+                return out;
+            }
+        }
+        self.expr_placed(e)
+    }
+
+    fn expr_placed(&mut self, e: &TExpr) -> LE {
         // R1: an allocation that must live elsewhere than the current
         // region is made with that region current (and forced to a value
         // before switching back: LIR expressions run where they're used).
@@ -622,6 +653,10 @@ impl<'a> Lw<'a> {
                         Place::Iter(k) => LE::Var(self.iter_vars[&k].0),
                         Place::Frame => LE::Var(frame),
                         Place::Ret => LE::Var(dest),
+                        Place::Into(_) => match self.into.last() {
+                            Some(r) => LE::Var(*r),
+                            None => LE::RegionProgram,
+                        },
                         Place::Global => LE::RegionProgram,
                     };
                     let saved = self.tmp(LTy::Region);
@@ -2790,7 +2825,7 @@ impl<'a> Lw<'a> {
             } else {
                 None
             };
-            st.push(Stage { m: *m, node: s, counter, limit });
+            st.push(Stage { node: s, counter, limit });
         }
         let base_lty = self.lty(&base.ty);
         let promote = self.promote();

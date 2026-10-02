@@ -793,6 +793,30 @@ impl<'a> Lw<'a> {
         // R1: an allocation that must live elsewhere than the current
         // region is made with that region current (and forced to a value
         // before switching back: LIR expressions run where they're used).
+        if let Some((region, class)) = self.site_region(e) {
+            let saved = self.tmp(LTy::Region);
+            self.emit(LS::RegionUse { region, saved });
+            let prev = std::mem::replace(&mut self.ambient, class);
+            let v = self.expr_in(e);
+            let lt = self.lty(&e.ty);
+            let v = if lt == LTy::Unit {
+                if !matches!(v, LE::Unit | LE::Var(_) | LE::I(_) | LE::B(_)) {
+                    self.emit(LS::Eval(v));
+                }
+                LE::Unit
+            } else {
+                self.bind(v, lt)
+            };
+            self.ambient = prev;
+            self.emit(LS::RegionRestore(saved));
+            return v;
+        }
+        self.expr_in(e)
+    }
+
+    /// The region an allocating expression must be made in, when that isn't
+    /// the current one (and its placement class).
+    fn site_region(&mut self, e: &TExpr) -> Option<(LE, crate::regions::Place)> {
         if let (Some(pl), Some((frame, dest))) = (self.place, self.frame) {
             if crate::regions::allocates(e, self.promote()) {
                 use crate::regions::Place;
@@ -820,26 +844,11 @@ impl<'a> Lw<'a> {
                         },
                         Place::Global => LE::RegionProgram,
                     };
-                    let saved = self.tmp(LTy::Region);
-                    self.emit(LS::RegionUse { region, saved });
-                    let prev = std::mem::replace(&mut self.ambient, class);
-                    let v = self.expr_in(e);
-                    let lt = self.lty(&e.ty);
-                    let v = if lt == LTy::Unit {
-                        if !matches!(v, LE::Unit | LE::Var(_) | LE::I(_) | LE::B(_)) {
-                            self.emit(LS::Eval(v));
-                        }
-                        LE::Unit
-                    } else {
-                        self.bind(v, lt)
-                    };
-                    self.ambient = prev;
-                    self.emit(LS::RegionRestore(saved));
-                    return v;
+                    return Some((region, class));
                 }
             }
         }
-        self.expr_in(e)
+        None
     }
 
     fn expr_in(&mut self, e: &TExpr) -> LE {
@@ -1768,9 +1777,21 @@ impl<'a> Lw<'a> {
                 let name = f.cname.clone();
                 let rt = fn_ret(f);
                 let unit = f.ret == Ty::Unit;
+                // The result lives where the call's site is placed (as for
+                // any call: `~f()` returned from here goes to the caller).
+                let placed = self.site_region(inner);
+                let restore = placed.map(|(region, class)| {
+                    let saved = self.tmp(LTy::Region);
+                    self.emit(LS::RegionUse { region, saved });
+                    (saved, std::mem::replace(&mut self.ambient, class))
+                });
                 let args = args.iter().map(|a| self.arg(a)).collect();
                 let r = self.tmp(rt);
                 self.emit(LS::Set(r, LE::Call(name, args)));
+                if let Some((saved, prev)) = restore {
+                    self.ambient = prev;
+                    self.emit(LS::RegionRestore(saved));
+                }
                 self.unwrap_result(LE::Var(r));
                 if unit { LE::Unit } else { LE::Field(Box::new(LE::Var(r)), 1) }
             }

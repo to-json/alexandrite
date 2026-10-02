@@ -54,6 +54,34 @@ fn lit_le(e: &TExpr, t: &LTy) -> LE {
     }
 }
 
+/// Whether a function's frame can be a mark in its caller's region: nothing
+/// it allocates outlives the call. Its parameters and result hold no storage
+/// (so no callee can store into the caller's objects through them, and
+/// nothing is returned), nothing is placed in the caller's or a parameter's
+/// region, and it can't fail (an error is copied out to the caller).
+fn light_frame(f: &TFunc, pl: &crate::regions::FnPlacement) -> bool {
+    use crate::regions::{contains_int, has_storage, Place};
+    let promote = f.overflow == Overflow::Promote;
+    let storage = |t: &Ty| has_storage(t) || (promote && contains_int(t));
+    !f.is_main
+        && !f.fallible
+        && !pl.into
+        && pl.owners.is_empty()
+        && !storage(&f.ret)
+        && f.params.iter().all(|p| !storage(&f.locals[*p].ty))
+        && pl.sites.values().all(|p| !matches!(p, Place::Ret | Place::Into(_)))
+}
+
+/// What an Error points to: (tag, where, context, each error type's value).
+fn error_body(mode: Overflow) -> LTy {
+    LTy::Tup([LTy::I64, LTy::Str, LTy::Str].into_iter().chain(ERRORS.with(|e| e.borrow().clone()).iter().map(|t| lty(t, mode))).collect())
+}
+
+/// An Error value's body (it's a one-element array).
+fn err_body(e: LE) -> LE {
+    LE::Index { arr: Box::new(e), idx: Box::new(LE::I(0)), check: None }
+}
+
 /// The sites (global index) of lambdas of function type `t`, in tag order.
 fn lambda_sites(t: &Ty) -> Vec<(usize, Vec<Ty>)> {
     LAMBDAS.with(|l| l.borrow().iter().enumerate().filter(|(_, s)| s.2 == *t).map(|(g, s)| (g, s.3.clone())).collect())
@@ -87,10 +115,25 @@ pub fn lower(p: &TProgram, sm: &SourceMap, opts: &Opts) -> LProgram {
             // The call's own region: entered here, exited on every way out.
             let mut prologue = vec![];
             if let Some(pl) = placement.get(fi).filter(|pl| !pl.sites.is_empty()) {
-                let (frame, dest) = (lw.new_var("frame", LTy::Region), lw.new_var("dest", LTy::Region));
-                prologue.push(LS::RegionEnter { region: frame, saved: dest });
+                if light_frame(f, pl) {
+                    // Allocations of the frame go in the region current at the
+                    // call, above a mark; the way out rolls it back.
+                    let (mark, larges, dest) = (lw.new_var("mark", LTy::Region), lw.new_var("larges", LTy::Region), lw.new_var("dest", LTy::Region));
+                    // (The region itself is only named from inside loops that
+                    // have iteration regions of their own.)
+                    if !pl.loops.is_empty() {
+                        prologue.push(LS::Set(dest, LE::Rt(Rt::RegionCur, vec![])));
+                    }
+                    prologue.push(LS::Set(mark, LE::Rt(Rt::RegionMark, vec![])));
+                    prologue.push(LS::Set(larges, LE::Rt(Rt::RegionMarkLarges, vec![])));
+                    lw.light = Some((mark, larges));
+                    lw.frame = Some((dest, dest));
+                } else {
+                    let (frame, dest) = (lw.new_var("frame", LTy::Region), lw.new_var("dest", LTy::Region));
+                    prologue.push(LS::RegionEnter { region: frame, saved: dest });
+                    lw.frame = Some((frame, dest));
+                }
                 lw.place = Some(pl);
-                lw.frame = Some((frame, dest));
             }
             let mut body = lw.body_with_return(&f.body, !f.is_main && f.ret != Ty::Unit);
             prologue.append(&mut body);
@@ -221,7 +264,9 @@ pub fn lty(t: &Ty, mode: Overflow) -> LTy {
         Ty::Array(t) | Ty::Fixed(t, _) | Ty::Seq(t, _) => LTy::Arr(Box::new(lty(t, mode))),
         Ty::Map(k, v) => crate::mapgen::map_ty(&lty(k, mode), &lty(v, mode)),
         // Error: (type tag, location, wrap context, then each error type's value).
-        Ty::Error => LTy::Tup([LTy::I64, LTy::Str, LTy::Str].into_iter().chain(ERRORS.with(|e| e.borrow().clone()).iter().map(|t| lty(t, mode))).collect()),
+        // Boxed: a one-element array of (tag, where, context, each error
+        // type's value). A Result carries one pointer, and a success none.
+        Ty::Error => LTy::Arr(Box::new(error_body(mode))),
         Ty::Result(t) => result_lty(lty(t, mode), mode),
         Ty::Task(t) => LTy::Task(Box::new(ok_lty(lty(t, mode)))),
         // A pool: a one-element array (shared, like a map) holding the slots
@@ -280,6 +325,9 @@ struct Lw<'a> {
     /// and the caller's (`dest`), and the class whose region is current.
     place: Option<&'a crate::regions::FnPlacement>,
     frame: Option<(V, V)>,
+    /// A light frame: a mark in the caller's region instead of a region
+    /// of its own (see `light_frame`).
+    light: Option<(V, V)>,
     ambient: crate::regions::Place,
     /// Each loop's iteration region (and the region saved when entering it).
     iter_vars: HashMap<usize, (V, V)>,
@@ -322,6 +370,7 @@ impl<'a> Lw<'a> {
             res: None,
             place: None,
             frame: None,
+            light: None,
             ambient: crate::regions::Place::Frame,
             iter_vars: HashMap::new(),
             iter_open: vec![],
@@ -436,6 +485,21 @@ impl<'a> Lw<'a> {
                     }
                 }
             }
+        }
+    }
+
+    /// `then` is `x / 2^s` (s >= 1) and `cond` is `x.even?`, for an I64 local x
+    /// (s == 1 only: evenness says nothing about higher bits).
+    fn even_halving<'e>(&self, cond: &TExpr, then: &'e TExpr) -> Option<(&'e TExpr, i64)> {
+        if self.promote() {
+            return None;
+        }
+        let TK::M(M::Even, Some(r), _, _) = &cond.kind else { return None };
+        let TK::Local(l) = r.kind else { return None };
+        let TK::Bin(BinOp::Div, x, k) = &then.kind else { return None };
+        match (&x.kind, &k.kind) {
+            (TK::Local(m), TK::Int(2)) if *m == l && x.ty == Ty::Int => Some((x, 1)),
+            _ => None,
         }
     }
 
@@ -602,7 +666,9 @@ impl<'a> Lw<'a> {
         }
         // Leaving the function: its region goes too.
         if from == 0 {
-            if let Some((frame, dest)) = self.frame {
+            if let Some((mark, larges)) = self.light {
+                self.emit(LS::Eval(LE::Rt(Rt::RegionReset, vec![LE::Var(mark), LE::Var(larges)])));
+            } else if let Some((frame, dest)) = self.frame {
                 self.emit(LS::RegionExit { region: frame, saved: dest });
             }
         }
@@ -821,6 +887,11 @@ impl<'a> Lw<'a> {
     /// The region an allocating expression must be made in, when that isn't
     /// the current one (and its placement class).
     fn site_region(&mut self, e: &TExpr) -> Option<(LE, crate::regions::Place)> {
+        // A call whose result holds no storage: where it's made doesn't matter
+        // (the callee places its own allocations).
+        if matches!(e.kind, TK::Call(..)) && !crate::regions::has_storage(&e.ty) && !(self.promote() && crate::regions::contains_int(&e.ty)) {
+            return None;
+        }
         if let (Some(pl), Some((frame, dest))) = (self.place, self.frame) {
             if crate::regions::allocates(e, self.promote()) {
                 use crate::regions::Place;
@@ -986,7 +1057,15 @@ impl<'a> Lw<'a> {
             }
             TK::Ternary(c, a, b) => {
                 let cv = self.expr(c);
-                let (sa, va) = self.sub_val(|lw| lw.expr(a));
+                let (sa, va) = match self.even_halving(c, a) {
+                    // `x.even? ? x / 2^s : ..`: x is even there, so the
+                    // division is a plain shift (no rounding fix-up).
+                    Some((x, s)) => {
+                        let xv = self.expr(x);
+                        (vec![], LE::Prim(Prim::ShrS, vec![xv, LE::I(s)]))
+                    }
+                    None => self.sub_val(|lw| lw.expr(a)),
+                };
                 let (sb, vb) = self.sub_val(|lw| lw.expr(b));
                 // A value-less `if` (branches end in calls returning nothing):
                 // run the branch expressions as statements.
@@ -1345,7 +1424,7 @@ impl<'a> Lw<'a> {
             _ => {
                 // The message first: cleanup may free what the error refers to.
                 let msg = self.error_message(err.clone());
-                let loc = LE::Field(Box::new(err), 1);
+                let loc = LE::Field(Box::new(err_body(err)), 1);
                 let text = LE::Rt(Rt::StrCat, vec![LE::S("error: ".into()), msg, LE::S(" (".into()), loc, LE::S(")".into())]);
                 let text = self.bind(text, LTy::Str);
                 // Printed from the program region (the frame is gone by then).
@@ -1498,13 +1577,13 @@ impl<'a> Lw<'a> {
 
     /// An Error holding `v`, a value of error type `k`, raised at `sp`.
     fn error_value(&mut self, k: usize, v: LE, sp: Span) -> LE {
-        let et = self.lty(&Ty::Error);
-        let LTy::Tup(ts) = &et else { unreachable!() };
+        let bt = error_body(self.mode);
+        let LTy::Tup(ts) = &bt else { unreachable!() };
         let mut fields = vec![LE::I(k as i64), LE::S(self.loc(sp)), LE::S(String::new())];
         for (j, t) in ts[3..].iter().enumerate() {
             fields.push(if j == k { v.clone() } else { zero_le(t) });
         }
-        LE::Tup(et, fields)
+        LE::ArrLit(bt.clone(), vec![LE::Tup(bt, fields)])
     }
 
     /// An Error of builtin type `ty`, variant `j`.
@@ -1541,16 +1620,25 @@ impl<'a> Lw<'a> {
         let xor = |x: LE, y: LE| LE::Prim(Prim::Xor, vec![x, y]);
         let and = |x: LE, y: LE| LE::Prim(Prim::And, vec![x, y]);
         let rv = LE::Var(r);
-        let cond = match op {
-            Op::Add => neg(and(xor(a.clone(), rv.clone()), xor(b.clone(), rv.clone()))),
-            Op::Sub => neg(and(xor(a.clone(), b.clone()), xor(a.clone(), rv.clone()))),
-            _ => {
-                // a != 0 && (a == -1 ? b == MIN : r / a != b)
-                let eq = |x: LE, y: LE| LE::Cmp(Op::Eq, Box::new(x), Box::new(y), LTy::I64);
-                let div = LE::Arith(Op::Div, Box::new(rv.clone()), Box::new(a.clone()), Ovf::Unchecked);
-                let inner = LE::Cond(Box::new(eq(a.clone(), LE::I(-1))), Box::new(eq(b.clone(), LE::I(i64::MIN))), Box::new(LE::Not(Box::new(eq(div, b.clone())))));
-                LE::Cond(Box::new(eq(a.clone(), LE::I(0))), Box::new(LE::B(false)), Box::new(inner))
+        let cmp = |c: Op, x: LE, k: i64| LE::Cmp(c, Box::new(x), Box::new(LE::I(k)), LTy::I64);
+        let cond = match (op, &b) {
+            // A constant operand: one compare against the bound.
+            (Op::Add, LE::I(k)) if *k > 0 => cmp(Op::Gt, a.clone(), i64::MAX - k),
+            (Op::Add, LE::I(k)) if *k < 0 => cmp(Op::Lt, a.clone(), i64::MIN - k),
+            (Op::Sub, LE::I(k)) if *k > 0 => cmp(Op::Lt, a.clone(), i64::MIN + k),
+            (Op::Sub, LE::I(k)) if *k < 0 && *k != i64::MIN => cmp(Op::Gt, a.clone(), i64::MAX + k),
+            (Op::Add | Op::Sub, LE::I(0)) => LE::B(false),
+            (Op::Mul, _) if const_factor(&a, &b).is_some_and(|k| k > 0) => {
+                // x * k fits iff MIN / k <= x <= MAX / k: one unsigned compare.
+                let k = const_factor(&a, &b).unwrap();
+                let x = if matches!(a, LE::I(_)) { b.clone() } else { a.clone() };
+                let (lo, hi) = (i64::MIN / k, i64::MAX / k);
+                let off = LE::Arith(Op::Sub, Box::new(x), Box::new(LE::I(lo)), Ovf::Wrap);
+                LE::Not(Box::new(LE::Prim(Prim::ULe, vec![off, LE::I(hi.wrapping_sub(lo))])))
             }
+            (Op::Add, _) => neg(and(xor(a.clone(), rv.clone()), xor(b.clone(), rv.clone()))),
+            (Op::Sub, _) => neg(and(xor(a.clone(), b.clone()), xor(a.clone(), rv.clone()))),
+            _ => LE::Prim(Prim::MulOvf, vec![a.clone(), b.clone()]),
         };
         let err = self.make_error("ArithError", 0, vec![], sp);
         self.fail_if(cond, err);
@@ -1571,7 +1659,7 @@ impl<'a> Lw<'a> {
             let errors = ERRORS.with(|x| x.borrow().clone());
             let mut body = vec![LS::Set(s, LE::S(String::new()))];
             for (k, t) in errors.iter().enumerate() {
-                let v = LE::Field(Box::new(LE::Var(pe)), 3 + k);
+                let v = LE::Field(Box::new(err_body(LE::Var(pe))), 3 + k);
                 let arm = w.sub(|w| {
                     let m = match (w.p.messages.get(&k), t.type_name().unwrap_or("")) {
                         (Some(&fid), _) => LE::Call(w.p.funcs[fid].cname.clone(), vec![v.clone()]),
@@ -1597,9 +1685,9 @@ impl<'a> Lw<'a> {
                     };
                     w.emit(LS::Set(s, m));
                 });
-                body.push(LS::If(LE::Cmp(Op::Eq, Box::new(LE::Field(Box::new(LE::Var(pe)), 0)), Box::new(LE::I(k as i64)), LTy::I64), arm, vec![]));
+                body.push(LS::If(LE::Cmp(Op::Eq, Box::new(LE::Field(Box::new(err_body(LE::Var(pe))), 0)), Box::new(LE::I(k as i64)), LTy::I64), arm, vec![]));
             }
-            body.push(LS::Return(Some(LE::Rt(Rt::StrCat, vec![LE::Field(Box::new(LE::Var(pe)), 2), LE::Var(s)]))));
+            body.push(LS::Return(Some(LE::Rt(Rt::StrCat, vec![LE::Field(Box::new(err_body(LE::Var(pe))), 2), LE::Var(s)]))));
             let func = LFunc { name: name.clone(), params: vec![pe], vars: std::mem::take(&mut w.vars), ret: LTy::Str, body, external: false, is_main: false, labels: w.labels };
             let mut prog = self.prog.borrow_mut();
             let slot = prog.funcs.iter().position(|f| f.name == name).unwrap();
@@ -3199,20 +3287,22 @@ impl<'a> Lw<'a> {
             }
             ErrWrap => {
                 let et = self.lty(&Ty::Error);
+                let bt = error_body(self.mode);
                 let v = self.expr(recv.unwrap());
-                let v = self.bind(v, et.clone());
+                let v = self.bind(v, et);
                 let c = self.expr(&args[0]);
-                let LTy::Tup(ts) = &et else { unreachable!() };
-                let fields = (0..ts.len()).map(|i| if i == 2 { LE::Rt(Rt::StrCat, vec![c.clone(), LE::S(": ".into()), LE::Field(Box::new(v.clone()), 2)]) } else { LE::Field(Box::new(v.clone()), i) }).collect();
-                LE::Tup(et, fields)
+                let LTy::Tup(ts) = &bt else { unreachable!() };
+                let b = err_body(v);
+                let fields = (0..ts.len()).map(|i| if i == 2 { LE::Rt(Rt::StrCat, vec![c.clone(), LE::S(": ".into()), LE::Field(Box::new(b.clone()), 2)]) } else { LE::Field(Box::new(b.clone()), i) }).collect();
+                LE::ArrLit(bt.clone(), vec![LE::Tup(bt, fields)])
             }
             ErrIs(k) => {
                 let v = self.expr(recv.unwrap());
-                LE::Cmp(Op::Eq, Box::new(LE::Field(Box::new(v), 0)), Box::new(LE::I(k as i64)), LTy::I64)
+                LE::Cmp(Op::Eq, Box::new(LE::Field(Box::new(err_body(v)), 0)), Box::new(LE::I(k as i64)), LTy::I64)
             }
             ErrAs(k) => {
                 let v = self.expr(recv.unwrap());
-                LE::Field(Box::new(v), 3 + k)
+                LE::Field(Box::new(err_body(v)), 3 + k)
             }
             ResOk | ResErr | ResIsOk | ResUnwrap | ResUnwrapOr | ResRescue => {
                 let r = recv.unwrap();
@@ -4020,26 +4110,21 @@ impl<'a> Lw<'a> {
         let func = LFunc { name: format!("worker{id}"), params: vec![param], vars: std::mem::take(&mut w.vars), ret: wret.clone(), body, external: false, is_main: false, labels: w.labels };
         prog.workers.push(LWorker { id, input: in_ty, func });
         drop(prog);
-        let dst = self.tmp(LTy::Arr(Box::new(wret)));
-        self.emit(LS::Pmap { dst, arr, worker: id });
-        if !fallible {
-            return LE::Var(dst);
+        let dst = self.tmp(LTy::Arr(Box::new(out_ty)));
+        let err = fallible.then(|| self.tmp(wret));
+        self.emit(LS::Pmap { dst, arr, worker: id, err });
+        if let Some(err) = err {
+            self.unwrap_result(LE::Var(err));
         }
-        let out = self.tmp(LTy::Arr(Box::new(out_ty.clone())));
-        self.emit(LS::Set(out, LE::ArrWithCap(out_ty, Box::new(LE::Len(Box::new(LE::Var(dst)))))));
-        let i = self.tmp(LTy::I64);
-        self.emit(LS::Set(i, LE::I(0)));
-        let l = self.label();
-        let body = self.sub(|lw| {
-            lw.emit(LS::If(LE::Cmp(Op::Ge, Box::new(LE::Var(i)), Box::new(LE::Len(Box::new(LE::Var(dst)))), LTy::I64), vec![LS::Break(l)], vec![]));
-            let r = LE::Index { arr: Box::new(LE::Var(dst)), idx: Box::new(LE::Var(i)), check: None };
-            let r = lw.bind(r, lw.vars[dst].ty.clone().arr_elem_lty());
-            lw.unwrap_result(r.clone());
-            lw.emit(LS::Push(out, LE::Field(Box::new(r), 1)));
-            lw.emit(LS::Set(i, LE::Arith(Op::Add, Box::new(LE::Var(i)), Box::new(LE::I(1)), Ovf::Unchecked)));
-        });
-        self.emit(LS::Loop(l, body));
-        LE::Var(out)
+        LE::Var(dst)
+    }
+}
+
+/// The constant operand of a multiplication, if one is.
+fn const_factor(a: &LE, b: &LE) -> Option<i64> {
+    match (a, b) {
+        (LE::I(k), _) | (_, LE::I(k)) => Some(*k),
+        _ => None,
     }
 }
 

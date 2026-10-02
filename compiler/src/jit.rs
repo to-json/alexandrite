@@ -30,11 +30,11 @@ macro_rules! runtime {
 mod rt {
     runtime!(
         alx_init, alx_panic, alx_overflow, alx_pow, alx_isqrt, alx_sort_i64, alx_sort_str, alx_puts_i64,
-        alxj_region_cur, alxj_region_enter, alxj_region_exit, alxj_region_use, alxj_region_set, alxj_region_program, alxj_region_of, alxj_region_new_child, alxj_region_free, alxj_region_bytes,
+        alxj_region_cur, alxj_region_mark, alxj_region_mark_larges, alxj_region_reset, alxj_region_enter, alxj_region_exit, alxj_region_use, alxj_region_set, alxj_region_program, alxj_region_of, alxj_region_new_child, alxj_region_free, alxj_region_bytes,
         alxj_alloc, alxj_zalloc, alxj_arr_alloc, alxj_arr_grow, alxj_arr_new, alxj_arr_copy,
         alxj_int_to_s, alxj_str_rev, alxj_str_delete, alxj_str_split, alxj_str_join, alxj_str_to_i, alxj_str_charlen, alxj_str_sub,
         alxj_str_eq, alxj_str_cmp, alxj_str_is_pal, alxj_int_ndigits, alxj_digits,
-        alxj_puts_str, alxj_print_str, alxj_puts_bool, alxj_puts_unit, alxj_pmap, alxj_finish,
+        alxj_puts_str, alxj_print_str, alxj_puts_bool, alxj_puts_unit, alxj_pmap, alxj_pmap_try, alxj_finish,
         alxj_p_add, alxj_p_sub, alxj_p_mul, alxj_p_div, alxj_p_rem, alxj_p_pow, alxj_p_cmp, alxj_p_even, alxj_p_to_i64,
         alxj_p_to_s, alxj_p_ndigits, alxj_p_digits, alxj_puts_pint,
         alxj_puts_f64, alxj_f_to_s, alxj_f_fmt, alxj_f_fmt_e, alxj_str_pad, alxj_str_quote, alxj_f_to_i, alxj_str_cat,
@@ -340,7 +340,12 @@ pub fn run(p: &LProgram) -> Result<(), String> {
             fx.b.seal_all_blocks();
             fx.b.finalize(fcfg);
         }
+        let dump = std::env::var("ALX_JIT_DUMP").is_ok_and(|d| f.name.contains(d.as_str()));
+        ctx.set_disasm(dump);
         m.define_function(id, &mut ctx).map_err(|e| format!("jit: {}: {e:?}", f.name))?;
+        if dump {
+            eprintln!("{}\n{}", ctx.func, ctx.compiled_code().and_then(|c| c.vcode.clone()).unwrap_or_default());
+        }
         m.clear_context(&mut ctx);
     }
     m.finalize_definitions().map_err(|e| e.to_string())?;
@@ -1084,7 +1089,7 @@ impl Fx<'_, '_, '_> {
                 self.b.switch_to_block(blk);
                 // Variables were reloaded from the state at entry.
             }
-            LS::Pmap { dst, arr, worker } => {
+            LS::Pmap { dst, arr, worker, err } => {
                 let at = self.ty(arr);
                 let a = self.e(arr);
                 let in_esz = lay(elem(&at)).size as i64;
@@ -1095,7 +1100,20 @@ impl Fx<'_, '_, '_> {
                 let wid = self.d.workers[worker];
                 let fr = self.fref(wid);
                 let wf = self.b.ins().func_addr(I64, fr);
-                self.call_rt(rt::alxj_pmap, &[a[0], a[1], ie, outp, oe, wf], false);
+                match err {
+                    None => {
+                        self.call_rt(rt::alxj_pmap, &[a[0], a[1], ie, outp, oe, wf], false);
+                    }
+                    Some(e) => {
+                        let rt_ = self.f.vars[*e].ty.clone();
+                        let rl = lay(&rt_);
+                        let ep = self.slot(rl.size);
+                        let (rs, vo) = (self.ic(rl.size as i64), self.ic(field_offset(&rt_, 1) as i64));
+                        self.call_rt(rt::alxj_pmap_try, &[a[0], a[1], ie, outp, oe, wf, rs, vo, ep], false);
+                        let vals = self.load(&rt_, ep, 0);
+                        self.set(*e, &vals);
+                    }
+                }
                 self.set(*dst, &[outp, a[1], a[1]]);
             }
             LS::Print(e) => {
@@ -1188,7 +1206,7 @@ impl Fx<'_, '_, '_> {
             LE::Var(v) => self.f.vars[*v].ty.clone(),
             LE::I(_) | LE::Loc(_) | LE::Arith(..) | LE::Neg(..) | LE::Len(_) => LTy::I64,
             LE::F(_) | LE::FArith(..) | LE::FNeg(_) | LE::Prim(Prim::UToF, _) => LTy::F64,
-            LE::Prim(Prim::ULt | Prim::ULe, _) => LTy::Bool,
+            LE::Prim(Prim::ULt | Prim::ULe | Prim::MulOvf, _) => LTy::Bool,
             LE::Prim(..) => LTy::I64,
             LE::B(_) | LE::Cmp(..) | LE::Not(_) => LTy::Bool,
             LE::S(_) => LTy::Str,
@@ -1208,6 +1226,8 @@ impl Fx<'_, '_, '_> {
             LE::Rt(rt, args) => match rt {
                 Rt::IntToS | Rt::PIntToS | Rt::StrRev | Rt::StrDelete | Rt::StrJoin | Rt::FToS | Rt::FFmt | Rt::FFmtE | Rt::StrPad | Rt::StrQuote | Rt::StrCat | Rt::U64ToS | Rt::IntFmt | Rt::RuneToS | Rt::StrFromBytes | Rt::FileRead | Rt::CapEnd | Rt::Strerror | Rt::StrFromCstr | Rt::StrFromPtr => LTy::Str,
                 Rt::FileStatus | Rt::NowNs | Rt::CapBegin => LTy::I64,
+                Rt::RegionCur | Rt::RegionMark | Rt::RegionMarkLarges => LTy::Region,
+                Rt::RegionReset => LTy::Unit,
                 Rt::IntToF | Rt::FSqrt | Rt::FAbs | Rt::Math(_) | Rt::FFromBits => LTy::F64,
                 Rt::FBits => LTy::IntK(IntKind::U64),
                 Rt::StrByte => {
@@ -1274,7 +1294,22 @@ impl Fx<'_, '_, '_> {
         }
     }
 
+    /// a * b, where b is the constant k if known: 2^s and 2^s + 1 as shifts
+    /// (a shorter dependency chain than a multiply).
+    fn imul_k(&mut self, a: Value, b: Value, k: Option<i64>) -> Value {
+        match k {
+            Some(k) if k > 1 && (k as u64).is_power_of_two() => self.b.ins().ishl_imm_s(a, k.trailing_zeros() as i64),
+            Some(k) if k > 2 && ((k - 1) as u64).is_power_of_two() => {
+                let sh = self.b.ins().ishl_imm_s(a, (k - 1).trailing_zeros() as i64);
+                self.b.ins().iadd(a, sh)
+            }
+            _ => self.b.ins().imul(a, b),
+        }
+    }
+
     fn arith(&mut self, op: Op, a: &LE, b: &LE, ovf: &Ovf) -> Value {
+        // A constant operand on the right (multiplication commutes).
+        let (a, b) = if op == Op::Mul && matches!(a, LE::I(_)) && !matches!(b, LE::I(_)) { (b, a) } else { (a, b) };
         let konst = if let LE::I(k) = b { Some(*k) } else { None };
         let (av, bv) = (self.e1(a), self.e1(b));
         let loc = match ovf {
@@ -1285,18 +1320,50 @@ impl Fx<'_, '_, '_> {
         match op {
             Op::Add | Op::Sub | Op::Mul => match ovf {
                 Ovf::Panic(loc) => {
-                    let (r, of) = match op {
-                        Op::Add => self.b.ins().sadd_overflow(av, bv),
-                        Op::Sub => self.b.ins().ssub_overflow(av, bv),
-                        _ => self.b.ins().smul_overflow(av, bv),
+                    // Checks as plain compares (Cranelift fuses them into the
+                    // branch; its overflow flags go through a cset).
+                    let (r, of) = match (op, konst) {
+                        (Op::Add | Op::Sub, Some(0)) => (av, None),
+                        (Op::Add, Some(k)) => {
+                            let r = self.b.ins().iadd(av, bv);
+                            let of = if k > 0 { self.b.ins().icmp_imm_s(IntCC::SignedGreaterThan, av, i64::MAX - k) } else { self.b.ins().icmp_imm_s(IntCC::SignedLessThan, av, i64::MIN - k) };
+                            (r, Some(of))
+                        }
+                        (Op::Sub, Some(k)) if k != i64::MIN => {
+                            let r = self.b.ins().isub(av, bv);
+                            let of = if k > 0 { self.b.ins().icmp_imm_s(IntCC::SignedLessThan, av, i64::MIN + k) } else { self.b.ins().icmp_imm_s(IntCC::SignedGreaterThan, av, i64::MAX + k) };
+                            (r, Some(of))
+                        }
+                        (Op::Add | Op::Sub, _) => {
+                            // Overflow iff the result's sign differs from both
+                            // operands' (add) / from a's and b's differs from a's (sub).
+                            let (r, x) = if op == Op::Add {
+                                let r = self.b.ins().iadd(av, bv);
+                                (r, self.b.ins().bxor(bv, r))
+                            } else {
+                                let r = self.b.ins().isub(av, bv);
+                                (r, self.b.ins().bxor(av, bv))
+                            };
+                            let y = self.b.ins().bxor(av, r);
+                            let m = self.b.ins().band(x, y);
+                            (r, Some(self.b.ins().icmp_imm_s(IntCC::SignedLessThan, m, 0)))
+                        }
+                        _ => {
+                            let r = self.imul_k(av, bv, konst);
+                            let hi = self.b.ins().smulhi(av, bv);
+                            let sign = self.b.ins().sshr_imm_s(r, 63);
+                            (r, Some(self.b.ins().icmp(IntCC::NotEqual, hi, sign)))
+                        }
                     };
-                    self.overflow_if(of, &loc.clone());
+                    if let Some(of) = of {
+                        self.overflow_if(of, &loc.clone());
+                    }
                     r
                 }
                 _ => match op {
                     Op::Add => self.b.ins().iadd(av, bv),
                     Op::Sub => self.b.ins().isub(av, bv),
-                    _ => self.b.ins().imul(av, bv),
+                    _ => self.imul_k(av, bv, konst),
                 },
             },
             Op::Div | Op::Rem => {
@@ -1466,6 +1533,12 @@ impl Fx<'_, '_, '_> {
                     Prim::Shl => ins.ishl(a[0], a[1]),
                     Prim::ShrS => ins.sshr(a[0], a[1]),
                     Prim::ShrU => ins.ushr(a[0], a[1]),
+                    Prim::MulOvf => {
+                        // Shares the product with the wrapping multiply beside it.
+                        let (lo, hi) = (ins.imul(a[0], a[1]), self.b.ins().smulhi(a[0], a[1]));
+                        let sign = self.b.ins().sshr_imm_s(lo, 63);
+                        self.b.ins().icmp(IntCC::NotEqual, hi, sign)
+                    }
                     Prim::ULt => ins.icmp(IntCC::UnsignedLessThan, a[0], a[1]),
                     Prim::ULe => ins.icmp(IntCC::UnsignedLessThanOrEqual, a[0], a[1]),
                     Prim::UDiv => ins.udiv(a[0], a[1]),
@@ -1643,6 +1716,10 @@ impl Fx<'_, '_, '_> {
                 let p = self.call_rt(rt::alxj_arr_new, &[nv, fp, ez, l], true).unwrap();
                 vec![p, nv, nv]
             }
+            LE::ArrWithCap(_, n) if matches!(**n, LE::I(k) if k <= 0) => {
+                let z = self.ic(0);
+                vec![z, z, z]
+            }
             LE::ArrWithCap(t, n) => {
                 let nv = self.e1(n);
                 let ez = self.ic(lay(t).size as i64);
@@ -1818,6 +1895,15 @@ impl Fx<'_, '_, '_> {
                 vec![self.call_rt(rt::alxj_file_status, &[ps], true).unwrap()]
             }
             Rt::NowNs => vec![self.call_rt(rt::alxj_now_ns, &[], true).unwrap()],
+            Rt::RegionCur => vec![self.call_rt(rt::alxj_region_cur, &[], true).unwrap()],
+            Rt::RegionMark => vec![self.call_rt(rt::alxj_region_mark, &[], true).unwrap()],
+            Rt::RegionMarkLarges => vec![self.call_rt(rt::alxj_region_mark_larges, &[], true).unwrap()],
+            Rt::RegionReset => {
+                let m = self.e1(&args[0]);
+                let l = self.e1(&args[1]);
+                self.call_rt(rt::alxj_region_reset, &[m, l], false);
+                vec![]
+            }
             Rt::Errno => vec![self.call_rt(rt::alxj_errno, &[], true).unwrap()],
             Rt::Strerror | Rt::StrFromCstr => {
                 let v = self.e1(&args[0]);

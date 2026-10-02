@@ -455,6 +455,11 @@ pub extern "C" fn alxr_puts_i64(v: i64) {
 }
 
 #[unsafe(no_mangle)]
+pub extern "C" fn alxr_mul_ovf(a: i64, b: i64) -> i32 {
+    a.checked_mul(b).is_none() as i32
+}
+
+#[unsafe(no_mangle)]
 pub extern "C" fn alxr_print_str(p: i64, n: i64) {
     let b = bytes(p, n);
     st().out.push_str(&String::from_utf8_lossy(b));

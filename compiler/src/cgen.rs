@@ -210,7 +210,6 @@ struct FnEmit<'f> {
     f: &'f LFunc,
     ctx: Ctx,
     /// In a generator: variables are fields of `g`.
-    in_gen: bool,
     yields: usize,
     out: String,
     ind: usize,
@@ -247,7 +246,7 @@ impl Gen<'_> {
         } else {
             Ctx::Plain
         };
-        let mut e = FnEmit { p: self.p, f, ctx, in_gen: false, yields: 0, out: String::new(), ind: 1 };
+        let mut e = FnEmit { p: self.p, f, ctx, yields: 0, out: String::new(), ind: 1 };
         let _ = writeln!(self.out, "{} {{", proto(f));
         for (i, v) in f.vars.iter().enumerate() {
             if !f.params.contains(&i) {
@@ -264,7 +263,7 @@ impl Gen<'_> {
 
     fn worker(&mut self, w: &LWorker) {
         let f = &w.func;
-        let mut e = FnEmit { p: self.p, f, ctx: Ctx::Worker, in_gen: false, yields: 0, out: String::new(), ind: 1 };
+        let mut e = FnEmit { p: self.p, f, ctx: Ctx::Worker, yields: 0, out: String::new(), ind: 1 };
         let _ = writeln!(self.out, "static void worker{}(const void *in_, void *out_) {{", w.id);
         for (i, v) in f.vars.iter().enumerate() {
             if f.params.contains(&i) {
@@ -286,11 +285,18 @@ impl Gen<'_> {
             let _ = writeln!(self.out, "    {} {};", cty(&v.ty), vname(f, i));
         }
         let _ = writeln!(self.out, "}} Gen{id};\n");
-        let mut e = FnEmit { p: self.p, f, ctx: Ctx::Gen, in_gen: true, yields: 0, out: String::new(), ind: 1 };
+        let mut e = FnEmit { p: self.p, f, ctx: Ctx::Gen, yields: 0, out: String::new(), ind: 1 };
         e.block(&f.body);
         let n = e.yields;
         let elem = cty(&gn.elem);
-        let _ = writeln!(self.out, "static bool gen{id}_next(AlxGen *g_, void *out_) {{\n    Gen{id} *g = (Gen{id} *)g_;\n    {elem} *out = out_;\n    (void)out;\n    switch (g->state) {{\n    case 0: goto start;");
+        let _ = writeln!(self.out, "static bool gen{id}_next(AlxGen *g_, void *out_) {{\n    Gen{id} *g = (Gen{id} *)g_;\n    {elem} *out = out_;\n    (void)out;");
+        // The state lives in C locals while running (array stores can't
+        // alias them), saved back to the struct at each yield.
+        for (i, v) in f.vars.iter().enumerate() {
+            let n = vname(f, i);
+            let _ = writeln!(self.out, "    {} {n} = g->{n};", cty(&v.ty));
+        }
+        let _ = writeln!(self.out, "    switch (g->state) {{\n    case 0: goto start;");
         for k in 1..=n {
             let _ = writeln!(self.out, "    case {k}: goto y{k};");
         }
@@ -317,7 +323,7 @@ impl FnEmit<'_> {
     }
 
     fn v(&self, v: V) -> String {
-        if self.in_gen { format!("g->{}", vname(self.f, v)) } else { vname(self.f, v) }
+        vname(self.f, v)
     }
 
     /// The static type of a (channel-valued) expression.
@@ -545,10 +551,14 @@ impl FnEmit<'_> {
                 let x = self.e(e);
                 self.line(&format!("*out = {x};"));
                 self.line(&format!("g->state = {k};"));
+                for i in 0..self.f.vars.len() {
+                    let n = vname(self.f, i);
+                    self.line(&format!("g->{n} = {n};"));
+                }
                 self.line("return true;");
                 self.out.push_str(&format!("y{k}:;\n"));
             }
-            LS::Pmap { dst, arr, worker } => {
+            LS::Pmap { dst, arr, worker, err } => {
                 let d = self.v(*dst);
                 let dt = self.f.vars[*dst].ty.clone();
                 let LTy::Arr(out_t) = &dt else { unreachable!() };
@@ -558,7 +568,17 @@ impl FnEmit<'_> {
                 self.line(&format!("__typeof__({a}) in_ = {a};"));
                 self.line(&format!("{d} = {}_cap(in_.len);", ty_name(&dt)));
                 self.line(&format!("{d}.len = in_.len;"));
-                self.line(&format!("alx_pmap(in_.ptr, in_.len, sizeof *in_.ptr, {d}.ptr, sizeof({}), worker{worker});", cty_mem(out_t)));
+                match err {
+                    None => self.line(&format!("alx_pmap(in_.ptr, in_.len, sizeof *in_.ptr, {d}.ptr, sizeof({}), worker{worker});", cty_mem(out_t))),
+                    Some(e) => {
+                        let ev = self.v(*e);
+                        let rt = cty_mem(&self.f.vars[*e].ty);
+                        self.line(&format!(
+                            "alx_pmap_try(in_.ptr, in_.len, sizeof *in_.ptr, {d}.ptr, sizeof({}), worker{worker}, sizeof({rt}), offsetof({rt}, f1), &{ev});",
+                            cty_mem(out_t)
+                        ));
+                    }
+                }
                 self.ind -= 1;
                 self.line("}");
             }
@@ -661,6 +681,7 @@ impl FnEmit<'_> {
                     Prim::Shl => format!("((int64_t)({} << ({})))", u(&a[0]), a[1]),
                     Prim::ShrS => format!("({} >> ({}))", a[0], a[1]),
                     Prim::ShrU => format!("((int64_t)({} >> ({})))", u(&a[0]), a[1]),
+                    Prim::MulOvf => format!("alx_mul_ovf({}, {})", a[0], a[1]),
                     Prim::ULt => format!("({} < {})", u(&a[0]), u(&a[1])),
                     Prim::ULe => format!("({} <= {})", u(&a[0]), u(&a[1])),
                     Prim::UDiv => format!("((int64_t)({} / {}))", u(&a[0]), u(&a[1])),
@@ -845,6 +866,10 @@ impl FnEmit<'_> {
                     Rt::FileStatus => s("alx_file_status"),
                     Rt::FileRead => s("alx_file_read_or_empty"),
                     Rt::NowNs => s("alx_now_ns"),
+                    Rt::RegionCur => s("alx_region_cur"),
+                    Rt::RegionMark => s("alx_region_mark"),
+                    Rt::RegionMarkLarges => s("alx_region_mark_larges"),
+                    Rt::RegionReset => s("alx_region_reset"),
                     Rt::Errno => "((int64_t)alx_ffi_errno_)".into(),
                     Rt::Strerror => s("alx_strerror"),
                     Rt::StrFromCstr => format!("alx_str_from_cstr((const char *)(intptr_t)({}))", a[0]),

@@ -62,21 +62,17 @@ enum { ALX_FREE_CAP = 4 };  /* chunks kept per thread (4 MB) */
 #endif
 
 /* Chunks and large blocks start with a 16-byte header. */
-typedef struct Blk { struct Blk *next; size_t size; } Blk;
-
-struct AlxRegion {
-    char *cur, *end;       /* bump position; valid only while not current */
-    Blk *chunks, *larges;
-    AlxRegion *pool_next;
-    char *cbase;           /* payload start of the newest chunk (NULL: none) */
-    size_t counted;        /* bytes used in older chunks + large blocks */
-    AlxRegion *parent, *child, *sib, *sib_prev;   /* child regions (R3) */
-};
+typedef AlxBlk Blk;   /* struct AlxRegion and AlxBlk: alx.h */
 
 static _Thread_local AlxRegion tl_prog;
-static _Thread_local AlxRegion *tl_cur;        /* NULL = program region */
+_Thread_local AlxRegion *alx_tl_cur;           /* NULL = program region */
+#define tl_cur alx_tl_cur
 static _Thread_local AlxRegion *tl_pool;       /* spare region structs */
 static _Thread_local Blk *tl_free;             /* free chunks */
+/* Pooled region structs that kept their only chunk (a frame that allocated a
+ * little): reusing one costs no registry or free-list work. */
+static _Thread_local int tl_ncached;
+enum { ALX_CACHED_CAP = 8 };
 static _Thread_local int tl_nfree;
 
 /* Granule registry: this thread's map from 1 MB granule number to the region
@@ -183,9 +179,17 @@ static AlxRegion *region_alloc(void) {
     else {
         r = malloc(sizeof *r);
         if (!r) alx_panic("out of memory", "runtime");
+        r->chunks = NULL;
     }
-    r->cur = r->end = NULL; r->chunks = r->larges = NULL; r->pool_next = NULL;
-    r->cbase = NULL; r->counted = 0;
+    if (r->chunks) {
+        /* It kept its chunk (still registered to it): start it over. */
+        tl_ncached--;
+        r->cbase = (char *)r->chunks + ALX_HDR;
+        r->cur = r->cbase; r->end = (char *)r->chunks + ALX_CHUNK;
+    } else {
+        r->cur = r->end = NULL; r->cbase = NULL;
+    }
+    r->larges = NULL; r->pool_next = NULL; r->counted = 0;
     r->parent = r->child = r->sib = r->sib_prev = NULL;
     return r;
 }
@@ -214,6 +218,12 @@ static void region_release(AlxRegion *r) {
         if (r->sib) r->sib->sib_prev = r->sib_prev;
         r->parent = NULL;
     }
+    /* One chunk, nothing else: keep it with the struct for the next region. */
+    if (r->chunks && !r->chunks->next && !r->larges && tl_ncached < ALX_CACHED_CAP) {
+        tl_ncached++;
+        r->pool_next = tl_pool; tl_pool = r;
+        return;
+    }
     for (Blk *b = r->chunks, *n; b; b = n) {
         n = b->next;
         reg_blk(b, ALX_CHUNK, NULL);
@@ -223,6 +233,55 @@ static void region_release(AlxRegion *r) {
     for (Blk *b = r->larges, *n; b; b = n) { n = b->next; reg_blk(b, b->size, NULL); mem_sub(b->size); free(b); }
     r->chunks = r->larges = NULL;
     r->pool_next = tl_pool; tl_pool = r;
+}
+
+/* A light frame (a call that allocates only for itself): instead of a region
+ * of its own, a mark in the current one (its bump position and its newest
+ * large block), rolled back on the way out. The common cases are inline in
+ * alx.h; these handle the rest. */
+
+/* In the program region (shared by this thread's tasks: one parked inside the
+ * call could see another allocate above the mark), a real region instead,
+ * tagged in the low bit. */
+AlxRegion *alx_region_mark_slow(void) {
+    return (AlxRegion *)((uintptr_t)alx_region_enter() | 1);
+}
+
+void alx_region_reset_slow(AlxRegion *mark, void *larges) {
+    if ((uintptr_t)mark & 1) {
+        alx_region_exit((AlxRegion *)((uintptr_t)mark & ~(uintptr_t)1), alx_region_program());
+        return;
+    }
+    AlxRegion *c = cur_region();
+    char *m = (char *)mark;
+    /* Chunks added since the mark (those that don't hold it) go, except the
+     * first of them, kept empty for the next call. */
+    Blk *keep = NULL;
+    while (c->chunks && !(m >= (char *)c->chunks && m <= (char *)c->chunks + ALX_CHUNK)) {
+        Blk *b = c->chunks;
+        c->chunks = b->next;
+        if (keep) {
+            reg_blk(keep, ALX_CHUNK, NULL);
+            if (tl_nfree < ALX_FREE_CAP) { if (!tl_free_armed) arm_free(); keep->next = tl_free; tl_free = keep; tl_nfree++; }
+            else { mem_sub(keep->size); free(keep); }
+        }
+        keep = b;
+    }
+    char *cur = m, *end = c->chunks ? (char *)c->chunks + ALX_CHUNK : NULL;
+    if (keep) {
+        keep->next = c->chunks;
+        c->chunks = keep;
+        if (c->cbase && m) c->counted += (size_t)(m - c->cbase);
+        c->cbase = (char *)keep + ALX_HDR;
+        cur = c->cbase;
+        end = (char *)keep + ALX_CHUNK;
+    }
+    while ((void *)c->larges != larges && c->larges) {
+        Blk *b = c->larges;
+        c->larges = b->next;
+        reg_blk(b, b->size, NULL); mem_sub(b->size); free(b);
+    }
+    alx_bump_cur = cur; alx_bump_end = end;
 }
 
 void alx_region_exit(AlxRegion *r, AlxRegion *saved) {
@@ -797,21 +856,50 @@ void alx_puts_str(AlxStr s) {
 void alx_puts_bool(bool b) { puts(b ? "true" : "false"); }
 void alx_print_str(AlxStr s) { fwrite(s.ptr, 1, (size_t)s.len, stdout); }
 
-/* ---------- parallel map ---------- */
+/* ---------- parallel map ----------
+ * Threads claim blocks of BLK items from a shared counter, so uneven work
+ * (and slower efficiency cores) doesn't leave one thread with the tail. */
 
 typedef struct {
     const char *in;
     char *out;
-    int64_t lo, hi;
+    int64_t n, blk;
+    int64_t next;
     size_t in_size, out_size;
     AlxWorker fn;
+    size_t res_size, val_off; /* fallible workers (alx_pmap_try) */
+    char *err;
+    int64_t err_i;
+    pthread_mutex_t err_mu;
 } PmapJob;
 
 static _Thread_local bool tl_uncounted;
 
 static void *pmap_run(void *arg) {
     PmapJob *j = arg;
-    for (int64_t i = j->lo; i < j->hi; i++) j->fn(j->in + (size_t)i * j->in_size, j->out + (size_t)i * j->out_size);
+    for (;;) {
+        int64_t lo = __atomic_fetch_add(&j->next, j->blk, __ATOMIC_RELAXED);
+        if (lo >= j->n) break;
+        int64_t hi = lo + j->blk > j->n ? j->n : lo + j->blk;
+        if (!j->err) {
+            for (int64_t i = lo; i < hi; i++) j->fn(j->in + (size_t)i * j->in_size, j->out + (size_t)i * j->out_size);
+            continue;
+        }
+        _Alignas(16) char res[j->res_size];
+        for (int64_t i = lo; i < hi; i++) {
+            j->fn(j->in + (size_t)i * j->in_size, res);
+            if (*(bool *)res) {
+                memcpy(j->out + (size_t)i * j->out_size, res + j->val_off, j->out_size);
+            } else {
+                pthread_mutex_lock(&j->err_mu);
+                if (i < j->err_i) {
+                    j->err_i = i;
+                    memcpy(j->err, res, j->res_size);
+                }
+                pthread_mutex_unlock(&j->err_mu);
+            }
+        }
+    }
     return NULL;
 }
 
@@ -820,23 +908,35 @@ static void *pmap_thread(void *arg) {
     return pmap_run(arg);
 }
 
-void alx_pmap(const void *in, int64_t n, size_t in_size, void *out, size_t out_size, AlxWorker fn) {
+static void pmap_go(PmapJob *job) {
     long cpus = sysconf(_SC_NPROCESSORS_ONLN);
     const char *forced = getenv("ALX_THREADS");
     if (forced && atol(forced) > 0) cpus = atol(forced);
-    int64_t threads = cpus > 0 ? cpus : 4;
+    int64_t n = job->n, threads = cpus > 0 ? cpus : 4;
     if (threads > 64) threads = 64;
     if (n < threads * 64) threads = n / 64 + 1;
-    PmapJob jobs[64];
     pthread_t tids[64];
-    int64_t chunk = (n + threads - 1) / threads;
-    for (int64_t t = 0; t < threads; t++) {
-        int64_t lo = t * chunk, hi = lo + chunk > n ? n : lo + chunk;
-        jobs[t] = (PmapJob){ in, out, lo, hi, in_size, out_size, fn };
-        if (t > 0) pthread_create(&tids[t], NULL, pmap_thread, &jobs[t]);
-    }
-    pmap_run(&jobs[0]);
+    job->blk = n / (threads * 16);
+    if (job->blk < 1) job->blk = 1;
+    for (int64_t t = 1; t < threads; t++) pthread_create(&tids[t], NULL, pmap_thread, job);
+    pmap_run(job);
     for (int64_t t = 1; t < threads; t++) pthread_join(tids[t], NULL);
+}
+
+void alx_pmap(const void *in, int64_t n, size_t in_size, void *out, size_t out_size, AlxWorker fn) {
+    PmapJob job = { .in = in, .out = out, .n = n, .in_size = in_size, .out_size = out_size, .fn = fn };
+    pmap_go(&job);
+}
+
+void alx_pmap_try(const void *in, int64_t n, size_t in_size, void *out, size_t val_size, AlxWorker fn,
+                  size_t res_size, size_t val_off, void *err) {
+    PmapJob job = { .in = in, .out = out, .n = n, .in_size = in_size, .out_size = val_size, .fn = fn,
+                    .res_size = res_size, .val_off = val_off, .err = err, .err_i = INT64_MAX };
+    memset(err, 0, res_size);
+    *(bool *)err = true;
+    pthread_mutex_init(&job.err_mu, NULL);
+    pmap_go(&job);
+    pthread_mutex_destroy(&job.err_mu);
 }
 
 /* ---------- tasks and channels ----------

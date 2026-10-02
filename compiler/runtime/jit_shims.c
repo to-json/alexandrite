@@ -7,6 +7,9 @@
 typedef struct { void *ptr; int64_t len; int64_t cap; } AnyArr;
 
 void *alxj_region_cur(void) { return alx_region_cur(); }
+void *alxj_region_mark(void) { return alx_region_mark(); }
+void *alxj_region_mark_larges(void) { return alx_region_mark_larges(); }
+void alxj_region_reset(void *m, void *l) { alx_region_reset(m, l); }
 void *alxj_region_enter(void) { return alx_region_enter(); }
 void alxj_region_exit(void *r, void *saved) { alx_region_exit(r, saved); }
 void *alxj_region_use(void *r) { return alx_region_use(r); }
@@ -88,6 +91,10 @@ void alxj_puts_bool(int64_t b) { alx_puts_bool(b != 0); }
 void alxj_puts_unit(void) { puts(""); }
 void alxj_pmap(const void *in, int64_t n, int64_t in_size, void *out, int64_t out_size, AlxWorker fn) {
     alx_pmap(in, n, (size_t)in_size, out, (size_t)out_size, fn);
+}
+void alxj_pmap_try(const void *in, int64_t n, int64_t in_size, void *out, int64_t val_size, AlxWorker fn,
+                   int64_t res_size, int64_t val_off, void *err) {
+    alx_pmap_try(in, n, (size_t)in_size, out, (size_t)val_size, fn, (size_t)res_size, (size_t)val_off, err);
 }
 void alxj_finish(void) { fflush(stdout); }
 

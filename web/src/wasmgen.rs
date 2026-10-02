@@ -38,6 +38,7 @@ const RT: &[(&str, &str)] = &[
     ("alxr_file_read_or_empty", "jj>"),
     ("alxr_pow", "jjjj>j"),
     ("alxr_mul_chk", "jj>j"),
+    ("alxr_mul_ovf", "jj>i"),
     ("alxr_isqrt", "jjj>j"),
     ("alxr_digits", "jjj>"),
     ("alxr_int_to_s", "j>"),
@@ -881,15 +882,23 @@ impl<'c, 'p> Fx<'c, 'p> {
                 self.set_var(*dst);
             }
             LS::Yield(_) => unreachable!("wasmgen: yield outside a generator"),
-            LS::Pmap { dst, arr, worker } => {
+            LS::Pmap { dst, arr, worker, err } => {
                 // Sequential in the browser (no threads without cross-origin isolation).
                 let (widx, w) = self.cx.workers[worker];
                 let it = self.f.vars[*dst].ty.clone();
                 let in_t = w.func.vars[w.func.params[0]].ty.clone();
                 let out_t = elem(&it).clone();
+                // A fallible worker returns a Result: (ok, value, error).
+                let res_t = err.map(|e| self.f.vars[e].ty.clone());
                 let (iesz, oesz) = (lay(&in_t).size as i64, lay(&out_t).size as i64);
                 self.e(arr);
                 let a = self.pop(&[W, W, W]);
+                if let Some(e) = err {
+                    self.zeros(&vts(res_t.as_ref().unwrap()));
+                    self.set_var(*e);
+                    let ok = self.vars[*e][0];
+                    self.ins().i32_const(1).local_set(ok);
+                }
                 let out = self.local(W);
                 self.ins().local_get(a[1]).i64_const(oesz).i64_mul();
                 self.rt("alxr_alloc");
@@ -903,7 +912,20 @@ impl<'c, 'p> Fx<'c, 'p> {
                 self.ins().local_get(a[0]).local_get(i).i64_const(iesz).i64_mul().i64_add().local_set(addr);
                 self.load(&in_t, addr, 0);
                 self.ins().call(widx);
-                let vals = self.pop(&vts(&out_t));
+                let vals = match &res_t {
+                    None => self.pop(&vts(&out_t)),
+                    Some(rt) => {
+                        let rv = self.pop(&vts(rt));
+                        let e = err.unwrap();
+                        self.ins().local_get(rv[0]).i32_eqz().if_(BlockType::Empty);
+                        self.frames.push(Frame::Other);
+                        self.get(&rv);
+                        self.set_var(e);
+                        self.ins().br(2);
+                        self.end();
+                        rv[1..1 + vts(&out_t).len()].to_vec()
+                    }
+                };
                 self.ins().local_get(out).local_get(i).i64_const(oesz).i64_mul().i64_add().local_set(addr);
                 self.store(&out_t, addr, 0, &vals);
                 self.ins().local_get(i).i64_const(1).i64_add().local_set(i).br(0);
@@ -1138,7 +1160,7 @@ impl<'c, 'p> Fx<'c, 'p> {
             LE::Var(v) => self.f.vars[*v].ty.clone(),
             LE::I(_) | LE::Arith(..) | LE::Neg(..) | LE::Len(_) => LTy::I64,
             LE::F(_) | LE::FArith(..) | LE::FNeg(_) | LE::Prim(Prim::UToF, _) => LTy::F64,
-            LE::Prim(Prim::ULt | Prim::ULe, _) => LTy::Bool,
+            LE::Prim(Prim::ULt | Prim::ULe | Prim::MulOvf, _) => LTy::Bool,
             LE::Prim(..) => LTy::I64,
             LE::Loc(_) | LE::S(_) => LTy::Str,
             LE::B(_) | LE::Cmp(..) | LE::Not(_) => LTy::Bool,
@@ -1157,6 +1179,8 @@ impl<'c, 'p> Fx<'c, 'p> {
             LE::Rt(r, args) => match r {
                 Rt::IntToS | Rt::PIntToS | Rt::StrRev | Rt::StrDelete | Rt::StrJoin | Rt::FToS | Rt::FFmt | Rt::FFmtE | Rt::StrPad | Rt::StrQuote | Rt::StrCat | Rt::U64ToS | Rt::IntFmt | Rt::RuneToS | Rt::StrFromBytes | Rt::FileRead | Rt::CapEnd => LTy::Str,
                 Rt::FileStatus | Rt::NowNs | Rt::CapBegin => LTy::I64,
+                Rt::RegionCur | Rt::RegionMark | Rt::RegionMarkLarges => LTy::Region,
+                Rt::RegionReset => LTy::Unit,
                 Rt::IntToF | Rt::FSqrt | Rt::FAbs | Rt::Math(_) | Rt::FFromBits => LTy::F64,
                 Rt::FBits => LTy::IntK(IntKind::U64),
                 Rt::StrByte => {
@@ -1262,6 +1286,7 @@ impl<'c, 'p> Fx<'c, 'p> {
                     Prim::ULt => {
                         self.ins().i64_lt_u();
                     }
+                    Prim::MulOvf => self.rt("alxr_mul_ovf"),
                     Prim::ULe => {
                         self.ins().i64_le_u();
                     }
@@ -1685,9 +1710,11 @@ impl<'c, 'p> Fx<'c, 'p> {
             Rt::U64ToS => call_ret(self, "alxr_u64_to_s", 2),
             Rt::IntFmt => call_ret(self, "alxr_int_fmt", 2),
             Rt::Errno | Rt::Strerror | Rt::StrFromCstr | Rt::StrFromPtr => unreachable!("rejected by uses_ffi"),
-            Rt::NowNs | Rt::CapBegin => {
+            Rt::NowNs | Rt::CapBegin | Rt::RegionCur | Rt::RegionMark | Rt::RegionMarkLarges => {
                 self.ins().i64_const(0);
             }
+            // The browser has no regions: nothing to roll back.
+            Rt::RegionReset => {}
             Rt::CapEnd => self.str_const(""),
             Rt::FileStatus => call(self, "alxr_file_status"),
             Rt::FileRead => call_ret(self, "alxr_file_read_or_empty", 2),

@@ -435,9 +435,15 @@ impl FnEmit<'_> {
                 let x = self.e(e);
                 self.line(&format!("yield {x};"));
             }
-            LS::Pmap { dst, arr, worker } => {
+            LS::Pmap { dst, arr, worker, err } => {
                 let a = self.e(arr);
-                self.line(&format!("v{dst} = pmap(&{a}, worker{worker});"));
+                match err {
+                    None => self.line(&format!("v{dst} = pmap(&{a}, worker{worker});")),
+                    Some(e) => self.line(&format!(
+                        "{{ let r_ = pmap(&{a}, worker{worker}).to_vec(); let mut o_ = Vec::with_capacity(r_.len()); v{e} = Default::default(); v{e}.0 = true; \
+                         for x_ in r_ {{ if !x_.0 {{ v{e} = x_; break; }} o_.push(x_.1); }} v{dst} = Sl::from(o_); }}"
+                    )),
+                }
             }
             LS::Print(e) => {
                 let x = self.e(e);
@@ -539,6 +545,7 @@ impl FnEmit<'_> {
                     Prim::Shl => format!("(({}).wrapping_shl(({}) as u32))", a[0], a[1]),
                     Prim::ShrS => format!("(({}) >> ({}))", a[0], a[1]),
                     Prim::ShrU => format!("(({} >> ({})) as i64)", u(&a[0]), a[1]),
+                    Prim::MulOvf => format!("(({}).checked_mul({}).is_none())", a[0], a[1]),
                     Prim::ULt => format!("({} < {})", u(&a[0]), u(&a[1])),
                     Prim::ULe => format!("({} <= {})", u(&a[0]), u(&a[1])),
                     Prim::UDiv => format!("(({} / {}) as i64)", u(&a[0]), u(&a[1])),
@@ -682,6 +689,8 @@ impl FnEmit<'_> {
                     Rt::FileStatus => call("file_status"),
                     Rt::FileRead => call("file_read_or_empty"),
                     Rt::NowNs => call("now_ns"),
+                    Rt::RegionCur | Rt::RegionMark | Rt::RegionMarkLarges => "()".to_string(),
+                    Rt::RegionReset => "()".to_string(),
                     Rt::Errno => call("errno"),
                     Rt::Strerror => call("strerror_str"),
                     Rt::StrFromCstr => call("str_from_cstr"),

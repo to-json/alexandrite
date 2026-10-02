@@ -31,6 +31,18 @@ typedef struct AlxGen { bool (*next)(struct AlxGen *self, void *out); } AlxGen;
  * thread-locals below (saved into the region struct when it is switched
  * out), so the fast path is a bump. Handles are thread-local. */
 extern _Thread_local char *alx_bump_cur, *alx_bump_end;
+typedef struct AlxBlk { struct AlxBlk *next; size_t size; } AlxBlk;
+typedef struct AlxRegion AlxRegion;
+struct AlxRegion {
+    char *cur, *end;       /* bump position; valid only while not current */
+    AlxBlk *chunks, *larges;
+    AlxRegion *pool_next;
+    char *cbase;           /* payload start of the newest chunk (NULL: none) */
+    size_t counted;        /* bytes used in older chunks + large blocks */
+    AlxRegion *parent, *child, *sib, *sib_prev;   /* child regions (R3) */
+};
+extern _Thread_local AlxRegion *alx_tl_cur;    /* NULL = the program region */
+enum { ALX_CHUNK_BYTES = 1 << 20 };
 extern bool alx_counting;
 extern size_t alx_allocs;
 void *alx_alloc_slow(size_t bytes);
@@ -46,11 +58,16 @@ static inline void *alx_alloc(size_t bytes) {
 }
 void alx_init(void);
 
-typedef struct AlxRegion AlxRegion;
 AlxRegion *alx_region_program(void);         /* this thread's program region */
 AlxRegion *alx_region_cur(void);             /* the current region */
 AlxRegion *alx_region_enter(void);           /* fresh empty region, made current */
 void alx_region_exit(AlxRegion *r, AlxRegion *saved); /* free r; make saved current */
+/* A mark in the current region, and rolling it back (freeing what was
+ * allocated in it since): the frame of a call that allocates only for itself.
+ * The mark is the bump position (or a tagged region of its own, in the
+ * program region) and the newest large block. */
+AlxRegion *alx_region_mark_slow(void);
+void alx_region_reset_slow(AlxRegion *mark, void *larges);
 /* A fresh empty child region of parent (not made current). Freed with its
  * parent (alx_region_exit / alx_region_free of it, recursively), or earlier by
  * alx_region_free. The program region may be a parent. */
@@ -87,6 +104,7 @@ static inline int64_t alx_idx(int64_t i, int64_t n, const char *loc) {
 /* ---------- Int arithmetic ---------- */
 static inline int64_t alx_add(int64_t a, int64_t b, const char *loc) { int64_t r; if (__builtin_add_overflow(a, b, &r)) alx_overflow(loc); return r; }
 static inline int64_t alx_sub(int64_t a, int64_t b, const char *loc) { int64_t r; if (__builtin_sub_overflow(a, b, &r)) alx_overflow(loc); return r; }
+static inline bool alx_mul_ovf(int64_t a, int64_t b) { int64_t r; return __builtin_mul_overflow(a, b, &r); }
 static inline int64_t alx_mul(int64_t a, int64_t b, const char *loc) { int64_t r; if (__builtin_mul_overflow(a, b, &r)) alx_overflow(loc); return r; }
 static inline int64_t alx_div(int64_t a, int64_t b, const char *loc) {
     if (b == 0) alx_panic("division by zero", loc);
@@ -220,6 +238,11 @@ void alx_puts_pint(AlxPInt v);
 /* ---------- parallel map ---------- */
 typedef void (*AlxWorker)(const void *in, void *out);
 void alx_pmap(const void *in, int64_t n, size_t in_size, void *out, size_t out_size, AlxWorker fn);
+/* fn writes a Result (a bool at offset 0, the value at val_off, res_size in
+ * all): out gets the values; err the Result of the lowest failing index,
+ * or a zeroed one with the bool true when nothing fails. */
+void alx_pmap_try(const void *in, int64_t n, size_t in_size, void *out, size_t val_size, AlxWorker fn,
+                  size_t res_size, size_t val_off, void *err);
 
 /* ---------- tasks and channels ---------- */
 typedef struct AlxTask AlxTask;
@@ -357,5 +380,30 @@ int64_t alx_sock_peer_addr(int64_t fd, uint8_t *out);
 int64_t alx_sock_set_nodelay(int64_t fd, int64_t on);
 int64_t alx_sock_shutdown(int64_t fd, int64_t how);
 int64_t alx_sock_lookup(const char *host, uint8_t *out, int64_t n);
+
+
+
+/* Light frames (see alx_region_mark_slow). */
+static inline AlxRegion *alx_region_mark(void) {
+    if (!alx_tl_cur) return alx_region_mark_slow();
+    return (AlxRegion *)alx_bump_cur;
+}
+static inline void *alx_region_mark_larges(void) {
+    return alx_tl_cur ? (void *)alx_tl_cur->larges : NULL;
+}
+static inline void alx_region_reset(AlxRegion *mark, void *larges) {
+    char *m = (char *)mark, *b = alx_bump_cur;
+    AlxRegion *c = alx_tl_cur;
+    /* Still in the chunk it was made in, no large block since: just the
+     * bump position back. */
+    if (c && m && b && !((uintptr_t)m & 1) && (void *)c->larges == larges) {
+        char *cb = (char *)((uintptr_t)(b - 1) & ~(uintptr_t)(ALX_CHUNK_BYTES - 1));
+        if (m >= cb && m <= b) {
+            alx_bump_cur = m;
+            return;
+        }
+    }
+    alx_region_reset_slow(mark, larges);
+}
 
 #endif

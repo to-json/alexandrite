@@ -425,7 +425,7 @@ impl<'a> Graph<'a> {
 }
 
 /// Does the type contain an Int (a bignum, in promote mode)?
-fn contains_int(t: &Ty) -> bool {
+pub fn contains_int(t: &Ty) -> bool {
     match t {
         Ty::Int => true,
         Ty::Opt(t) => contains_int(t),

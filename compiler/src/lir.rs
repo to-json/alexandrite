@@ -288,6 +288,14 @@ pub enum Rt {
     FileRead,
     /// (): monotonic clock, nanoseconds (I64).
     NowNs,
+    /// (): the current region (Region).
+    RegionCur,
+    /// (): a mark in the current region (Region): the frame of a light call.
+    RegionMark,
+    /// (): the second half of a mark: the current region's newest large block.
+    RegionMarkLarges,
+    /// (mark, larges): free what the current region got since the mark (Unit).
+    RegionReset,
     /// (): errno as saved right after the last `Ffi` call on this thread (I64).
     Errno,
     /// (n): `strerror(n)` copied into a Str.
@@ -316,6 +324,8 @@ pub enum Prim {
     Shl,
     ShrS,
     ShrU,
+    /// Whether the signed product a * b overflows (Bool).
+    MulOvf,
     /// Unsigned comparisons (as u64).
     ULt,
     ULe,
@@ -353,7 +363,10 @@ pub enum LS {
     NextOrBreak { source: LE, dst: V, label: Label },
     Yield(LE),
     /// `dst = arr.pmap { worker }`.
-    Pmap { dst: V, arr: LE, worker: usize },
+    /// `dst` = the worker applied to each element. With `err`, the worker
+    /// returns a Result: `dst` gets the ok values and `err` the Result of the
+    /// lowest failing index (its field 0 true when nothing failed).
+    Pmap { dst: V, arr: LE, worker: usize, err: Option<V> },
     Puts(LE, LTy),
     /// Write a Str to stdout as it is (no newline added).
     Print(LE),

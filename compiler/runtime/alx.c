@@ -4,6 +4,7 @@
 #include <assert.h>
 #include <errno.h>
 #include <pthread.h>
+#include <sched.h>
 #include <fcntl.h>
 #include <setjmp.h>
 #include <signal.h>
@@ -1015,6 +1016,34 @@ static void enqueue(AlxTask *t) {
     if (w->idle) idle_wake(w);
 }
 
+/* Let the other tasks queued on this worker run before going on (a task
+ * that never blocks would otherwise starve them: tasks are pinned). Outside
+ * a task: give the CPU away once. */
+static void sw_out(AlxTask *t, bool dying);
+static AlxTask *tq_pop(TQ *q);
+void alx_task_yield(void) {
+    AlxTask *t = tl_task;
+    if (!t) {
+        sched_yield();
+        return;
+    }
+    pthread_mutex_lock(&g_mu);
+    if (!t->home->q.head) {
+        /* Nothing queued here: take a task that hasn't started yet, if any
+         * (the worker runs its own queue first). */
+        AlxTask *n = tq_pop(&g_newq);
+        if (!n) {
+            pthread_mutex_unlock(&g_mu);
+            return;
+        }
+        n->home = t->home;
+        tq_push(&t->home->q, n);
+    }
+    tq_push(&t->home->q, t);
+    pthread_mutex_unlock(&g_mu);
+    sw_out(t, false);
+}
+
 static Parker *g_main_p;
 /* Tasks asleep on a timer: they'll wake on their own, so not a deadlock. */
 static int64_t g_sleepers;
@@ -1530,6 +1559,10 @@ int64_t alx_select(AlxSelCase *cs, int64_t n, bool has_default, const char *loc)
         }
         if (has_default) {
             pthread_mutex_unlock(&g_mu);
+            /* A loop polling with `else` never parks: now and then, let the
+             * tasks waiting for this worker (and the lock) run. */
+            static _Thread_local unsigned polls;
+            if ((++polls & 15) == 0) alx_task_yield();
             return n;
         }
         WNode **hs[n ? n : 1];

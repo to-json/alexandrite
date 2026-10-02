@@ -4791,12 +4791,18 @@ impl<'w, 'a> FnCx<'w, 'a> {
                 if name.ends_with('!') {
                     return Err(Diag::new(recv.span, format!("`{name}` changes its receiver; call it on a variable")));
                 }
-                if block.is_some() {
-                    return Err(Diag::new(sp, format!("`{name}` doesn't take a block")));
-                }
                 let mut targs = vec![recv];
                 for a in args {
                     targs.push(self.value(a)?);
+                }
+                // A block for a last parameter of function type.
+                if let Some(b) = block {
+                    let d = &self.w.defs[def].def;
+                    if d.params.len() != targs.len() + 1 || !matches!(d.params.last().and_then(|p| p.ty.as_ref()), Some(TypeExpr::Fn(..))) {
+                        return Err(Diag::new(sp, format!("`{name}` doesn't take a block")));
+                    }
+                    let f = self.block_as_lambda(def, &targs, b)?;
+                    targs.push(f);
                 }
                 return self.call_def(def, name, name_span, targs, sp);
             }

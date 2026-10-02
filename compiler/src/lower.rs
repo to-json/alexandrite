@@ -2635,6 +2635,10 @@ impl<'a> Lw<'a> {
                 }
                 let (mut body, v) = w.sub_val(|w| w.inline_block(b, &pvs, &[], None));
                 let ret = w.lty(rt);
+                // A Unit body's last expression still runs (it's a call, say).
+                if ret == LTy::Unit && !matches!(v, LE::Unit | LE::Var(_) | LE::I(_) | LE::B(_)) {
+                    body.push(LS::Eval(v.clone()));
+                }
                 body.push(LS::Return(if ret == LTy::Unit { None } else { Some(v) }));
                 let func = LFunc { name: format!("__lambda_{g}"), params, vars: std::mem::take(&mut w.vars), ret, body, external: false, is_main: false, labels: w.labels };
                 self.prog.borrow_mut().funcs.push(func);

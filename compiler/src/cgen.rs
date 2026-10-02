@@ -484,6 +484,13 @@ impl FnEmit<'_> {
                 let v = self.v(*v);
                 self.line(&format!("{ty}_push(&{v}, {x});"));
             }
+            // A discarded tuple: its parts (its C type may not be declared).
+            LS::Eval(LE::Tup(_, vs)) => {
+                for v in vs {
+                    let x = self.e(v);
+                    self.line(&format!("(void)({x});"));
+                }
+            }
             LS::Eval(e) => {
                 let x = self.e(e);
                 self.line(&format!("(void)({x});"));

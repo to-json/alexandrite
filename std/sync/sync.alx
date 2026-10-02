@@ -1,0 +1,86 @@
+# Package sync: Go's sync, over alexandrite's own Mutex[T], Atomic[T] and
+# channels (R6). Every type here is a handle: copies share the same state,
+# so a WaitGroup or Once can be captured by tasks.
+#
+# Differences from Go:
+#   - The language's `Mutex[T]` guards a value and is held for a block
+#     (`m.lock { |v| ... }`); there's no separate Lock/Unlock that could be
+#     left held. `sync.Lock` is the same thing without a value (named Lock:
+#     `Mutex` is the language's own).
+#   - `Once.do` takes a block (or a function).
+
+# Waits for a collection of tasks to finish (Go's WaitGroup): `add` before
+# starting each, `done` when each finishes, `wait` until the count is 0.
+pub struct WaitGroup {
+  st: Mutex[WgState]
+
+  # Add `delta` (may be negative) to the count. A negative count panics.
+  pub def add(delta: Int) {
+    st.lock { |s|
+      s.n += delta
+      assert s.n >= 0, "sync: negative WaitGroup counter"
+      if s.n == 0 {
+        s.ch.close
+        s.ch = Chan[Bool].new
+      }
+    }
+  }
+
+  # One task finished: `add(-1)`.
+  pub def done {
+    add(-1)
+  }
+
+  # Block (the task parks) until the count is 0.
+  pub def wait {
+    ch = st.lock { |s| s.n == 0 ? none : s.ch }
+    if c = ch {
+      c.recv
+    }
+  }
+}
+
+struct WgState {
+  n: Int
+  ch: Chan[Bool]
+}
+
+pub def new_wait_group -> WaitGroup {
+  WaitGroup.new(st: Mutex.new(WgState.new(n: 0, ch: Chan[Bool].new)))
+}
+
+# Runs a function exactly once (Go's Once), however many tasks call `do`.
+pub struct Once {
+  st: Mutex[Bool]
+
+  # Run `f` unless it already ran; every caller returns after it has.
+  pub def do(f: () -> Unit) {
+    st.lock { |ran|
+      if !ran {
+        f()
+      }
+      ran = true
+    }
+  }
+
+  pub def done? -> Bool {
+    st.lock { |ran| ran }
+  }
+}
+
+pub def new_once -> Once {
+  Once.new(st: Mutex.new(false))
+}
+
+# A mutual-exclusion lock without a guarded value: `l.with { ... }`.
+pub struct Lock {
+  m: Mutex[Bool]
+
+  pub def with(f: () -> Unit) {
+    m.lock { |_| f() }
+  }
+}
+
+pub def new_lock -> Lock {
+  Lock.new(m: Mutex.new(false))
+}

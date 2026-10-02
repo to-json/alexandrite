@@ -515,6 +515,9 @@ pub fn aliases(p: &TProgram) -> Vec<HashMap<LocalId, (Vec<LocalId>, Vec<LocalId>
                             // A mutex is a wall: what it guards is reached
                             // only under its lock.
                             Node::Local(x) if matches!(f.locals[*x].ty, Ty::Mutex(_)) => {}
+                            // Nor does a value with no shared storage (a struct of
+                            // scalars, strings and handles) carry an alias on.
+                            Node::Local(x) if !crate::sharing::shares(&f.locals[*x].ty) && *x != l => {}
                             Node::Local(x) => {
                                 locals.push(*x);
                                 stack.push(*m);

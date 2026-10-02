@@ -273,9 +273,15 @@ impl Ck<'_> {
                 // Nothing outside the block may keep hold of the guarded value.
                 if let Some(v) = b.params.first() {
                     let (comp, _) = self.al.get(v).cloned().unwrap_or_default();
+                    // Only a store inside the block can make an outer variable
+                    // hold the guarded value.
+                    let mut written = vec![];
+                    for st in &b.body {
+                        crate::prove::stmt_exprs(st, &mut |e| written_locals(e, &mut written));
+                    }
                     for x in comp {
                         let inside = (b.own.0..b.own.1).contains(&x) || x == *v;
-                        if !inside && shares(&self.f.locals[x].ty) {
+                        if !inside && written.contains(&x) && shares(&self.f.locals[x].ty) {
                             let mut d = Diag::new(b.span, format!("`{}` would keep a reference into the value `lock` guards, past the end of the block", self.name(x)));
                             d.notes.push(format!("store a copy (`{}.dup`), or return what you need from the block (its value is copied out)", self.name(*v)));
                             self.fail(d);
@@ -359,4 +365,28 @@ fn locals_read(e: &TExpr, out: &mut Vec<LocalId>) {
         return;
     }
     crate::prove::each_child(e, &mut |c| locals_read(c, out));
+}
+
+/// The locals an expression assigns or stores into (blocks included).
+fn written_locals(e: &TExpr, out: &mut Vec<LocalId>) {
+    match &e.kind {
+        TK::Assign(l, _) | TK::IndexAssign(l, ..) | TK::PlaceAssign(l, ..) => out.push(*l),
+        TK::M(M::Push | M::MapSet | M::CopyInto | M::PoolAdd | M::PoolSet, Some(r), ..) => {
+            if let TK::Local(l) = r.kind {
+                out.push(l);
+            }
+        }
+        _ => {}
+    }
+    if let TK::M(_, _, _, Some(b)) = &e.kind {
+        for s in &b.body {
+            crate::prove::stmt_exprs(s, &mut |x| written_locals(x, out));
+        }
+    }
+    if let TK::Seq(ss) = &e.kind {
+        for s in ss {
+            crate::prove::stmt_exprs(s, &mut |x| written_locals(x, out));
+        }
+    }
+    crate::prove::each_child(e, &mut |c| written_locals(c, out));
 }

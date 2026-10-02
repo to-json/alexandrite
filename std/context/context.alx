@@ -1,0 +1,135 @@
+# Package context: Go's context — cancellation and deadlines that flow
+# from a parent to everything derived from it.
+#
+#   ctx, cancel = context.with_cancel(context.background)
+#   spawn { work(ctx) }        # work selects on ctx.done
+#   cancel()
+#
+# A Context is a handle: copies share its state, and it can be captured by
+# tasks. A derived context watches its parent with a small task of its own
+# (a select on the parent's `done` and its own), so cancelling a parent
+# cancels every context derived from it. Not shipped: values (`with_value`).
+
+import "time"
+
+pub error ContextError {
+  # `cancel` was called (on this context or a parent).
+  Canceled
+  # The deadline passed.
+  DeadlineExceeded
+}
+
+pub struct Context {
+  st: Mutex[CtxState]
+  # Unix nanoseconds; 0 = no deadline.
+  deadline_ns: Int
+  # `background`/`todo`: never cancelled.
+  root: Bool
+
+  # A channel closed when the context is cancelled (or its deadline
+  # passes); receiving from it then gives none at once.
+  pub def done -> Chan[Bool] {
+    st.lock { |s| s.done }
+  }
+
+  # Why it was cancelled; none while it's live.
+  pub def err -> ContextError? {
+    st.lock { |s|
+      s.why == 1 ? ContextError.Canceled : (s.why == 2 ? ContextError.DeadlineExceeded : none)
+    }
+  }
+
+  # The deadline, if it has one (Unix nanoseconds).
+  pub def deadline -> Int? {
+    deadline_ns == 0 ? none : deadline_ns
+  }
+
+  # Whether it has been cancelled.
+  pub def done? -> Bool {
+    st.lock { |s| s.why != 0 }
+  }
+}
+
+struct CtxState {
+  done: Chan[Bool]
+  # 0 live, 1 cancelled, 2 deadline exceeded.
+  why: Int
+}
+
+def fresh(deadline_ns: Int, root: Bool) -> Context {
+  Context.new(st: Mutex.new(CtxState.new(done: Chan[Bool].new, why: 0)), deadline_ns: deadline_ns, root: root)
+}
+
+# Cancel `c` for reason `why` (the first reason sticks).
+def stop(c: Context, why: Int) {
+  c.st.lock { |s|
+    if s.why == 0 {
+      s.why = why
+      s.done.close
+    }
+  }
+}
+
+# The root context: never cancelled, no deadline.
+pub def background -> Context {
+  fresh(0, true)
+}
+
+# Same as `background`, for code that hasn't decided yet (Go's TODO).
+pub def todo -> Context {
+  fresh(0, true)
+}
+
+# A child of `parent` and the function that cancels it (and what derives
+# from it). Calling the function again does nothing.
+pub def with_cancel(parent: Context) -> (Context, () -> Unit) {
+  c = derive(parent, parent.deadline_ns)
+  (c, ->() { stop(c, 1) })
+}
+
+# A child that is cancelled at `deadline_ns` (Unix nanoseconds) at the
+# latest.
+pub def with_deadline(parent: Context, deadline_ns: Int) -> (Context, () -> Unit) {
+  d = parent.deadline_ns != 0 && parent.deadline_ns < deadline_ns ? parent.deadline_ns : deadline_ns
+  c = derive(parent, d)
+  wait = d - time.now.unix_nano
+  if wait <= 0 {
+    stop(c, 2)
+  } else {
+    timer = time.after(time.duration(wait))
+    done = c.done
+    spawn {
+      select {
+        when timer.recv => stop(c, 2)
+        when done.recv => {}
+      }
+    }
+  }
+  (c, ->() { stop(c, 1) })
+}
+
+# A child cancelled after `timeout` at the latest.
+pub def with_timeout(parent: Context, timeout: time.Duration) -> (Context, () -> Unit) {
+  with_deadline(parent, time.now.unix_nano + timeout.nanoseconds)
+}
+
+# A child that follows its parent's cancellation.
+def derive(parent: Context, deadline_ns: Int) -> Context {
+  c = fresh(deadline_ns, false)
+  if parent.done? {
+    stop(c, parent.st.lock { |s| s.why })
+    return c
+  }
+  pd = parent.done
+  cd = c.done
+  # Roots never end: nothing to watch (a watcher would wait forever).
+  if !parent.root {
+    spawn {
+      select {
+        when pd.recv => stop(c, parent.st.lock { |s| s.why })
+        when cd.recv => {}
+      }
+    }
+  }
+  c
+}

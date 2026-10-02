@@ -31,7 +31,7 @@ Decisions R1–R10 and S1–S4 in `GO-VS-RUBY.md`.
 | R4 | **Captures, receivers, pools** | captures by reference (R5); `!` methods through interfaces (R7); `@T` handles and pools for recursive and graph data (R3) |
 | R5 | **M:N tasks** | stackful coroutines multiplexed over a worker thread per core (S4's scheduler; the I/O event loop comes with `net` in L3); channels, `select`, `wait` and deadlock detection park tasks instead of threads; region state (current region, bump pointer, granule registry) follows the task across threads. Millions of tasks |
 | R6 | **Sharing** | `Mutex[T]`, `Atomic[T]`; moves into `spawn` and channels; unsynchronized sharing is a compile error |
-| R7 | **Explain** | `alx explain mem`: each allocation's region or refcount and why; the hot-loop refcount lint |
+| R7 | **Explain** | `alx explain mem`: each allocation's region and why (what sends it to the program region); sites inside loops that pile up are marked |
 | L1 | **Text & data core** | strings, strconv, unicode/utf8, bytes, slices, maps, sort, math, fmt, errors — Go's APIs, alx idioms (S2) |
 | L2 | **Systems core** | os, io, bufio, path/filepath, time, flag; FFI to libc |
 | L3 | **Server core** | I/O event loop (netpoll) under R5's scheduler, net, net/http, context, sync, encoding/json via derives (S3) |

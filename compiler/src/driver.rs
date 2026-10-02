@@ -114,6 +114,21 @@ pub fn check_only(file: &str) -> ExitCode {
     }
 }
 
+/// `alx explain mem`: where each allocation lives, and why (R7).
+pub fn explain_mem(file: &str) -> ExitCode {
+    match frontend(file) {
+        Ok((l, p)) => {
+            let files: Vec<u32> = (0..l.sm.files.len() as u32).collect();
+            print!("{}", alx::regions::explain(&p, &l.sm, &files));
+            ExitCode::SUCCESS
+        }
+        Err(msg) => {
+            eprint!("{msg}");
+            ExitCode::from(1)
+        }
+    }
+}
+
 fn frontend(file: &str) -> Result<(front::Loaded, crate::tast::TProgram), String> {
     let l = front::load(Path::new(file), file).map_err(|(sm, d)| sm.render(&d))?;
     let externs = front::lib_defs(&l);

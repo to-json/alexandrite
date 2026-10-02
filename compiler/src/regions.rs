@@ -23,6 +23,7 @@
 //! memory, never toward freeing it early.
 
 use crate::tast::*;
+use std::fmt::Write;
 use std::collections::HashMap;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -123,6 +124,12 @@ struct Graph<'a> {
     mutations: Vec<(Vec<Node>, Vec<usize>)>,
     /// `c = Map/Pool literal`: the local and the site.
     defs: Vec<(LocalId, usize)>,
+    /// The expression being walked, and for each node sent to Global the
+    /// expression that sent it (for `alx explain mem`).
+    at: crate::diag::Span,
+    why_global: HashMap<Node, crate::diag::Span>,
+    /// Where each loop is (its condition, or the iterating call).
+    loop_at: HashMap<usize, crate::diag::Span>,
 }
 
 impl<'a> Graph<'a> {
@@ -138,6 +145,11 @@ impl<'a> Graph<'a> {
         self.flow(to, from);
     }
     fn flow(&mut self, from: &[Node], to: &[Node]) {
+        if to.contains(&Node::Global) {
+            for a in from {
+                self.why_global.entry(*a).or_insert(self.at);
+            }
+        }
         for a in from {
             for b in to {
                 self.edge(*a, *b);
@@ -149,7 +161,9 @@ impl<'a> Graph<'a> {
     /// the edges its effects create). A value with no storage (an Int, a
     /// Bool) refers to nothing.
     fn expr(&mut self, e: &TExpr) -> Vec<Node> {
+        let saved = std::mem::replace(&mut self.at, e.span);
         let v = self.expr_nodes(e);
+        self.at = saved;
         let promote = self.f.overflow == crate::ast::Overflow::Promote;
         if has_storage(&e.ty) || (promote && contains_int(&e.ty)) { v } else { vec![] }
     }
@@ -250,6 +264,7 @@ impl<'a> Graph<'a> {
                         let is_loop = matches!(m, M::Each | M::Loop);
                         if is_loop {
                             self.loops.push(e as *const TExpr as usize);
+                            self.loop_at.insert(e as *const TExpr as usize, e.span);
                             self.loop_bodies.insert(e as *const TExpr as usize, b.body.iter().map(|s| unsafe_stmt(s)).collect());
                         }
                         for s in &b.body {
@@ -339,6 +354,7 @@ impl<'a> Graph<'a> {
             TStmt::While(c, b) => {
                 self.expr(c);
                 let key = s as *const TStmt as usize;
+                self.loop_at.insert(key, c.span);
                 self.loops.push(key);
                 self.loop_bodies.insert(key, b.iter().map(|s| unsafe_stmt(s)).collect());
                 for s in b {
@@ -384,7 +400,8 @@ fn contains_int(t: &Ty) -> bool {
 /// Can a value of this type refer to heap storage?
 pub fn has_storage(t: &Ty) -> bool {
     match t {
-        Ty::Int | Ty::IntK(_) | Ty::Float | Ty::Bool | Ty::Unit | Ty::Range | Ty::Never | Ty::Handle(_) => false,
+        // An atomic is a runtime cell outside every region.
+        Ty::Int | Ty::IntK(_) | Ty::Float | Ty::Bool | Ty::Unit | Ty::Range | Ty::Never | Ty::Handle(_) | Ty::Atomic(_) => false,
         Ty::Opt(t) => has_storage(t),
         Ty::Tuple(ts) => ts.iter().any(has_storage),
         Ty::Struct(_, fs) => fs.iter().any(|(_, t)| has_storage(t)),
@@ -405,7 +422,7 @@ fn unsafe_ref<'b>(p: *const TExpr) -> &'b TExpr {
 }
 
 fn graph<'a>(f: &'a TFunc, sums: &'a [Summary]) -> Graph<'a> {
-    let mut g = Graph { f, sums, edges: HashMap::new(), sites: vec![], loops: vec![], site_loops: HashMap::new(), loop_bodies: HashMap::new(), mutations: vec![], defs: vec![] };
+    let mut g = Graph { f, sums, edges: HashMap::new(), sites: vec![], loops: vec![], site_loops: HashMap::new(), loop_bodies: HashMap::new(), mutations: vec![], defs: vec![], at: f.span, why_global: HashMap::new(), loop_at: HashMap::new() };
     // Writing into a parameter's storage writes into the caller's objects.
     for p in &f.params {
         g.edge(Node::Local(*p), Node::Caller(*p));
@@ -772,4 +789,101 @@ fn expr_spans(e: &TExpr, l: LocalId, out: &mut Vec<crate::diag::Span>) {
         }
     }
     crate::prove::each_child(e, &mut |c| expr_spans(c, l, out));
+}
+
+/// `alx explain mem`: every allocation site of the program's own code,
+/// the region it goes in, and why.
+pub fn explain(p: &TProgram, sm: &crate::diag::SourceMap, files: &[u32]) -> String {
+    let sums = summaries(p);
+    let placement = analyze_with(p, &sums);
+    let mut out = String::new();
+    let (mut total, mut hot) = (0, 0);
+    let line_col = |sp: crate::diag::Span| {
+        let (l, c) = sm.files[sp.file as usize].line_col(sp.lo);
+        format!("{l}:{c}")
+    };
+    for (f, pl) in p.funcs.iter().zip(&placement) {
+        if f.external || !files.contains(&f.span.file) {
+            continue;
+        }
+        let g = graph(f, &sums);
+        if g.sites.is_empty() {
+            continue;
+        }
+        let name = if f.is_main { "(top level)".to_string() } else { f.src_name.clone() };
+        let mut lines = String::new();
+        let mut sites: Vec<usize> = g.sites.clone();
+        sites.sort_by_key(|s| unsafe_ref(*s as *const TExpr).span.lo);
+        sites.dedup();
+        let mut shown = std::collections::HashSet::new();
+        for s in sites {
+            let e = unsafe_ref(s as *const TExpr);
+            let snip: String = sm.snippet(e.span).lines().next().unwrap_or("").chars().take(32).collect();
+            let in_loop = g.site_loops.get(&s).is_some_and(|l| !l.is_empty());
+            let loop_at = |key: usize| match g.loop_at.get(&key) {
+                Some(sp) => line_col(*sp),
+                None => "?".into(),
+            };
+            // Values without storage allocate nothing, except a store's growth.
+            let stores = matches!(e.kind, TK::IndexAssign(..) | TK::PlaceAssign(..) | TK::M(M::Push | M::MapSet | M::CopyInto | M::PoolAdd | M::PoolSet, ..));
+            if (!has_storage(&e.ty) && !stores) || !shown.insert((e.span.lo, e.span.hi)) {
+                continue;
+            }
+            let place = pl.sites.get(&s).copied().unwrap_or(Place::Frame);
+            let why = match place {
+                Place::Frame => {
+                    let when = if f.is_main { "the program ends".to_string() } else { format!("`{}` returns", f.src_name) };
+                    if in_loop {
+                        hot += 1;
+                        format!("frame: freed when {when}  << every iteration: piles up until then")
+                    } else {
+                        format!("frame: freed when {when}")
+                    }
+                }
+                Place::Iter(k) => format!("iteration of the loop at {}: freed each time round", loop_at(k)),
+                Place::Ret => "the caller's region: it's the result".to_string(),
+                Place::Into(c) if pl.owners.contains_key(&c) => {
+                    format!("`{}`'s own region: compacted at the loop at {}", f.locals[c].name, loop_at(pl.owners[&c].loop_key))
+                }
+                Place::Into(c) => format!("the region of `{}` (stored into it)", f.locals[c].name),
+                Place::Global => {
+                    total += 1;
+                    if in_loop {
+                        hot += 1;
+                    }
+
+                    // Find what sends it to the program region.
+                    let mut seen = vec![Node::Site(s)];
+                    let mut i = 0;
+                    let mut reason = None;
+                    while i < seen.len() && reason.is_none() {
+                        let n = seen[i];
+                        i += 1;
+                        if let Some(sp) = g.why_global.get(&n) {
+                            reason = Some(*sp);
+                        }
+                        for m in g.edges.get(&n).into_iter().flatten() {
+                            if !seen.contains(m) {
+                                seen.push(*m);
+                            }
+                        }
+                    }
+                    let via = match reason {
+                        Some(sp) => {
+                            let w: String = sm.snippet(sp).lines().next().unwrap_or("").chars().take(40).collect();
+                            format!("it reaches `{w}` at {}", line_col(sp))
+                        }
+                        None => "it's stored into more than one of the caller's objects".to_string(),
+                    };
+                    format!("program region, never freed: {via}{}", if in_loop { "  << every iteration: grows without bound" } else { "" })
+                }
+            };
+            let _ = writeln!(lines, "  {:<7} {:<34} {why}", line_col(e.span), snip);
+        }
+        if !lines.is_empty() {
+            let _ = writeln!(out, "{name}  {}\n{lines}", sm.files[f.span.file as usize].name);
+        }
+    }
+    let _ = writeln!(out, "{total} allocation site(s) in the program region; {hot} site(s) inside loops that pile up");
+    out
 }

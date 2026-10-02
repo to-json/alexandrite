@@ -8,6 +8,7 @@ use std::process::ExitCode;
 const USAGE: &str = "usage: alx run [--release] [--sanitize] [--expect VALUE] [--emit-c FILE] [--emit-rust FILE] [-v] file.alx
        alx build [--release] [--sanitize] [-o OUT] file.alx
        alx check file.alx
+       alx explain mem file.alx
        alx fmt [--check] [files|dirs...]
        alx test [--release] [-run NAME] [-bench NAME] [-benchtime DUR] [dir | file_test.alx]";
 
@@ -17,6 +18,15 @@ fn main() -> ExitCode {
         eprintln!("{USAGE}");
         return ExitCode::from(2);
     };
+    if cmd == "explain" {
+        return match (args.get(1).map(String::as_str), args.get(2)) {
+            (Some("mem"), Some(f)) => driver::explain_mem(f),
+            _ => {
+                eprintln!("usage: alx explain mem file.alx");
+                ExitCode::from(2)
+            }
+        };
+    }
     if cmd == "fmt" {
         return ExitCode::from(alx::fmt::cli(&args[1..]) as u8);
     }

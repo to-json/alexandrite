@@ -180,6 +180,20 @@ def memory():
         check(ms, f"bounded memory: {prog}", ok, f"peak {peak} bytes, stdout {r2.stdout.strip()[:40]!r}")
 
 
+def explain():
+    """R7: `alx explain mem` names each allocation's region and why."""
+    r, _ = run([ALX, "explain", "mem", "explain.alx"], cwd=CASES / "mem")
+    wants = [
+        "`cache`'s own region: compacted at the loop at 5:7",
+        "6:10    \"line #{i}\"",
+        "piles up until then",
+        "program region, never freed: it reaches `spawn { \"task #{i}\" }` at 11:7",
+        "1 allocation site(s) in the program region; 3 site(s) inside loops that pile up",
+    ]
+    missing = [w for w in wants if w not in r.stdout]
+    check("R7", "explain mem: regions and reasons", r.returncode == 0 and not missing, f"missing {missing}")
+
+
 def warnings():
     """Unused locals and imports warn; --strict makes them errors."""
     d = CASES / "warn"
@@ -376,6 +390,7 @@ def main():
         modules()
         warnings()
         memory()
+        explain()
         fmt_check()
         print("== alx test", flush=True)
         testing()

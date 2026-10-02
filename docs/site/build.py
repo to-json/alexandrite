@@ -19,9 +19,9 @@ def title_of(md, fallback):
 
 
 roadmap = (ROOT / "ROADMAP.md").read_text()
-done = {p.stem for p in (ROOT / "docs" / "milestones").glob("M*.md")}
+done = {p.stem for p in (ROOT / "docs" / "milestones").glob("*.md")}
 milestones = []
-for row in re.findall(r"^\| (M\d+) \| \*\*(.+?)\*\* \| (.+?) \|$", roadmap, re.M):
+for row in re.findall(r"^\| ([MRL]\d+) \| \*\*(.+?)\*\* \| (.+?) \|$", roadmap, re.M):
     mid, name, contents = row
     milestones.append({"id": mid.lower(), "num": mid, "name": name, "contents": contents, "done": mid in done})
 
@@ -29,7 +29,8 @@ docs = [
     {"id": "roadmap", "title": "Roadmap", "group": "plan", "md": roadmap},
     {"id": "decisions", "title": "Go vs Ruby decisions", "group": "plan", "md": (ROOT / "GO-VS-RUBY.md").read_text()},
 ]
-for p in sorted((ROOT / "docs" / "milestones").glob("M*.md"), key=lambda p: int(p.stem[1:])):
+order = {"M": 0, "R": 1, "L": 2}
+for p in sorted((ROOT / "docs" / "milestones").glob("*.md"), key=lambda p: (order.get(p.stem[0], 9), int(p.stem[1:]))):
     md = p.read_text()
     docs.append({"id": p.stem.lower(), "title": title_of(md, p.stem), "group": "log", "md": md})
 

@@ -1,0 +1,459 @@
+# Package net: Go's net for TCP, over the runtime's event loop (L3).
+#
+# Conventions:
+#  - Blocking-looking calls park the TASK, not the worker thread: `accept!`,
+#    `Conn.read!`, `Conn.write!` and `dial` wait for the socket through the
+#    runtime's poller (kqueue / epoll) while other tasks run. Ten thousand
+#    idle connections cost ten thousand parked tasks, not threads. Outside a
+#    task (main) the same calls block in poll(2).
+#  - Failures are `NetError` values (`~T` results) with Go-like messages:
+#    `dial tcp 127.0.0.1:1: connect: connection refused`. Match with `case`:
+#        case e { ConnRefused => ...; Timeout => ...; Closed => ...; _ => ... }
+#  - End of stream is not an error: `Conn.read!` returns 0 (GO-VS-RUBY F3).
+#  - `Conn` and `Listener` hold their descriptor in shared state (GO-VS-RUBY
+#    D36), so copies are the same connection: pass one to a function, or
+#    move it into `spawn` (R6: the spawner can't use it afterwards, which is
+#    Go's hand-off). `close!` on any copy closes them all; a task parked on
+#    the descriptor is woken and fails with `Closed`.
+#  - `Conn` is an io.Reader, io.Writer and io.Closer. `write!` writes all of
+#    its argument, retrying on partial writes.
+#  - Addresses are "host:port" strings; ":0" lets the system pick a port
+#    (`listener.addr` tells which). "" or "0.0.0.0" means any IPv4 address,
+#    "::" any IPv6 (dual-stack).
+#  - Networks: "tcp", "tcp4", "tcp6" (all the same here: the runtime prefers
+#    IPv4 when a name has several addresses and doesn't fall back to the next
+#    one). No UDP, no Unix sockets, no read/write deadlines yet.
+#  - `lookup_host` and the name resolution inside `dial` / `listen` (a name
+#    that isn't an IP address) call getaddrinfo, which BLOCKS the worker
+#    thread; numeric addresses don't wait.
+#  - SIGPIPE is ignored once the first socket is made, so a write to a closed
+#    peer fails with EPIPE instead of killing the process.
+
+import "strconv"
+import "strings"
+
+extern def c_read(fd: I32, buf: [Byte], n: Int) -> Int = "read"
+extern def c_write(fd: I32, buf: [Byte], n: Int) -> Int = "write"
+extern def alx_sys_const(name: Str) -> Int
+extern def alx_fd_wait(fd: Int, mode: Int) -> Int
+extern def alx_fd_close(fd: Int) -> Int
+extern def alx_sock_listen(host: Str, port: Int, backlog: Int) -> Int
+extern def alx_sock_accept(fd: Int, out: [Byte]) -> Int
+extern def alx_sock_connect(host: Str, port: Int) -> Int
+extern def alx_sock_error(fd: Int) -> Int
+extern def alx_sock_local_addr(fd: Int, out: [Byte]) -> Int
+extern def alx_sock_peer_addr(fd: Int, out: [Byte]) -> Int
+extern def alx_sock_set_nodelay(fd: Int, on: Int) -> Int
+extern def alx_sock_shutdown(fd: Int, how: Int) -> Int
+extern def alx_sock_lookup(host: Str, out: [Byte], n: Int) -> Int
+extern def alx_sleep_ns(ns: Int)
+
+# getaddrinfo's "host not found", as the runtime reports it (not an errno).
+NO_HOST = 100000
+
+def c(name: Str) -> Int { alx_sys_const(name) }
+
+# ---------------------------------------------------------------------- errors
+
+# What failed: the operation ("dial", "listen", "accept", "read", "write",
+# "close"), the address, the failing system call ("connect", "bind", ...; for
+# a bad address, the reason) and the errno (0: none).
+pub struct NetFailure {
+  op: Str
+  addr: Str
+  syscall: Str
+  code: Int
+}
+
+pub error NetError {
+  ConnRefused(at: NetFailure)
+  AddrInUse(at: NetFailure)
+  Timeout(at: NetFailure)
+  Closed(at: NetFailure)
+  # A malformed "host:port" (`at.syscall` is the reason).
+  BadAddr(at: NetFailure)
+  Other(at: NetFailure)
+
+  def message -> Str {
+    f = failure
+    describe(f, kind)
+  }
+
+  def kind -> Int {
+    case self {
+      ConnRefused => 0
+      AddrInUse => 0
+      Timeout => 1
+      Closed => 2
+      BadAddr => 3
+      Other => 0
+    }
+  }
+
+  # The failed call's details.
+  pub def failure -> NetFailure {
+    case self {
+      ConnRefused(at) => at
+      AddrInUse(at) => at
+      Timeout(at) => at
+      Closed(at) => at
+      BadAddr(at) => at
+      Other(at) => at
+    }
+  }
+
+  # The errno (0 for Timeout, Closed and BadAddr).
+  pub def errno -> Int {
+    f = failure
+    f.code
+  }
+}
+
+# C's message for an errno, in Go's lower case: "connection refused".
+pub def errno_message(code: Int) -> Str {
+  return "no such host" if code == NO_HOST
+  s = C.strerror(code)
+  return s if s.size == 0 || s[0] < 65 || s[0] > 90
+  return s if s.size > 1 && s[1] >= 65 && s[1] <= 90
+  b = s.bytes.to_a
+  b[0] = b[0] + 32
+  Str.from_bytes(b)
+}
+
+def describe(f: NetFailure, kind: Int) -> Str {
+  net = f.op == "dial" || f.op == "listen" ? " tcp" : ""
+  where = f.addr.size == 0 ? "" : " " + f.addr
+  head = "#{f.op}#{net}#{where}"
+  return "#{head}: i/o timeout" if kind == 1
+  return "#{head}: use of closed network connection" if kind == 2
+  return "address #{f.addr}: #{f.syscall}" if kind == 3
+  return "#{f.op}: #{f.syscall}: no such host" if f.code == NO_HOST
+  "#{head}: #{f.syscall}: #{errno_message(f.code)}"
+}
+
+# The NetError for errno `code` from `syscall` during `op` on `addr`.
+pub def net_error(op: Str, addr: Str, syscall: Str, code: Int) -> NetError {
+  at = NetFailure.new(op: op, addr: addr, syscall: syscall, code: code)
+  return NetError.ConnRefused(at) if code == c("ECONNREFUSED")
+  return NetError.AddrInUse(at) if code == c("EADDRINUSE")
+  return NetError.Closed(at) if code == c("EBADF")
+  return NetError.Timeout(at) if code == c("ETIMEDOUT")
+  NetError.Other(at)
+}
+
+def closed_error(op: Str, addr: Str) -> NetError {
+  NetError.Closed(NetFailure.new(op: op, addr: addr, syscall: "", code: 0))
+}
+
+def bad_addr(addr: Str, why: Str) -> NetError {
+  NetError.BadAddr(NetFailure.new(op: "address", addr: addr, syscall: why, code: 0))
+}
+
+pub def is_closed(e: Error) -> Bool {
+  case e {
+    Closed => true
+    _ => false
+  }
+}
+
+pub def is_timeout(e: Error) -> Bool {
+  case e {
+    Timeout => true
+    _ => false
+  }
+}
+
+pub def is_conn_refused(e: Error) -> Bool {
+  case e {
+    ConnRefused => true
+    _ => false
+  }
+}
+
+# ------------------------------------------------------------ host and port
+
+# Go's net.SplitHostPort: "host:port", "[v6addr]:port" or ":port".
+pub def split_host_port(hostport: Str) -> ~(Str, Str) {
+  n = hostport.size
+  fail bad_addr(hostport, "missing port in address") if n == 0
+  i = strings.last_index(hostport, ":")
+  fail bad_addr(hostport, "missing port in address") if i < 0
+  host = ""
+  if hostport[0] == 91 {
+    j = strings.index(hostport, "]")
+    fail bad_addr(hostport, "missing ']' in address") if j < 0
+    fail bad_addr(hostport, "missing port in address") if j + 1 == n
+    fail bad_addr(hostport, "too many colons in address") if j + 1 != i
+    host = hostport[1...j]
+    fail bad_addr(hostport, "unexpected '[' in address") if strings.contains(host, "[")
+  } else {
+    host = hostport[0...i]
+    fail bad_addr(hostport, "too many colons in address") if strings.contains(host, ":")
+    fail bad_addr(hostport, "unexpected '[' in address") if strings.contains(host, "[")
+    fail bad_addr(hostport, "unexpected ']' in address") if strings.contains(host, "]")
+  }
+  (host, hostport[i + 1...n])
+}
+
+# Go's net.JoinHostPort: an IPv6 host (one with a colon) gets brackets.
+pub def join_host_port(host: Str, port: Str) -> Str {
+  return "[#{host}]:#{port}" if strings.contains(host, ":")
+  "#{host}:#{port}"
+}
+
+def parse_port(addr: Str, port: Str) -> ~Int {
+  fail bad_addr(addr, "missing port in address") if port.size == 0
+  p = strconv.atoi(port).unwrap_or(-1)
+  fail bad_addr(addr, "invalid port #{port}") if p < 0 || p > 65535
+  p
+}
+
+def check_network(op: Str, network: Str, addr: Str) -> ~Unit {
+  ok = network == "tcp" || network == "tcp4" || network == "tcp6"
+  fail NetError.Other(NetFailure.new(op: op, addr: addr, syscall: "unknown network #{network}", code: 0)) unless ok
+}
+
+def zeros(n: Int) -> [Byte] {
+  b: [Byte] = [0; n]
+  b
+}
+
+# The address string a shim wrote into a 64-byte buffer (n: its length).
+def addr_of(b: [Byte], n: Int) -> Str {
+  return "" if n <= 0
+  Str.from_bytes(b[0...n])
+}
+
+# The NUL-terminated string in b.
+def cstr_of(b: [Byte]) -> Str {
+  n = 0
+  while n < b.size && b[n] != 0 {
+    n += 1
+  }
+  Str.from_bytes(b[0...n])
+}
+
+# Resolved addresses of a host name, IPv4 and IPv6 (blocks the worker).
+pub def lookup_host(host: Str) -> ~[Str] {
+  buf = zeros(4096)
+  n = alx_sock_lookup(host, buf, 4096)
+  fail net_error("lookup", host, "getaddrinfo", NO_HOST) if n < 0
+  out: [Str] = []
+  for line in strings.split(Str.from_bytes(buf[0...n]), "\n") {
+    out << line if line.size > 0
+  }
+  out
+}
+
+# ---------------------------------------------------------------------- Conn
+
+# A TCP connection. The descriptor lives in shared state (D36).
+pub struct Conn {
+  cell: [Int]
+  local: Str
+  remote: Str
+
+  # The descriptor; -1 once closed.
+  pub def fd -> Int { cell.size == 0 ? -1 : cell[0] }
+
+  pub def local_addr -> Str { local }
+  pub def remote_addr -> Str { remote }
+
+  # Reads up to p.size bytes, waiting for some; 0 at end of stream (the peer
+  # closed or shut down its write side).
+  pub def read!(p: [Byte]) -> ~Int {
+    return 0 if p.size == 0
+    loop {
+      f = fd
+      fail closed_error("read", remote) if f < 0
+      n = c_read(f.to_i32, p, p.size)
+      return n if n >= 0
+      code = C.errno
+      if code == c("EAGAIN") {
+        w = alx_fd_wait(f, 1)
+        fail net_error("read", remote, "read", -w) if w < 0
+      } else {
+        fail net_error("read", remote, "read", code) if code != c("EINTR")
+      }
+    }
+  }
+
+  # Writes all of p (waiting while the socket's buffer is full); p.size.
+  pub def write!(p: [Byte]) -> ~Int {
+    off = 0
+    while off < p.size {
+      f = fd
+      fail closed_error("write", remote) if f < 0
+      n = c_write(f.to_i32, p[off...p.size], p.size - off)
+      if n >= 0 {
+        off += n
+      } else {
+        code = C.errno
+        if code == c("EAGAIN") {
+          w = alx_fd_wait(f, 2)
+          fail net_error("write", remote, "write", -w) if w < 0
+        } else {
+          fail net_error("write", remote, "write", code) if code != c("EINTR")
+        }
+      }
+    }
+    p.size
+  }
+
+  pub def write_string!(s: Str) -> ~Int {
+    self.~write!(s.bytes.to_a)
+  }
+
+  # Closes the connection (every copy of it) and wakes tasks waiting on it.
+  # A second close fails with Closed.
+  pub def close! -> ~Unit {
+    f = fd
+    fail closed_error("close", remote) if f < 0
+    self.cell[0] = -1
+    r = alx_fd_close(f)
+    fail net_error("close", remote, "close", -r) if r < 0
+  }
+
+  # Shuts down the write side: the peer reads end of stream; this side can
+  # still read.
+  pub def close_write! -> ~Unit {
+    f = fd
+    fail closed_error("close", remote) if f < 0
+    r = alx_sock_shutdown(f, 1)
+    fail net_error("close", remote, "shutdown", -r) if r < 0
+  }
+
+  pub def set_nodelay(on: Bool) -> ~Unit {
+    f = fd
+    fail closed_error("set", remote) if f < 0
+    r = alx_sock_set_nodelay(f, on ? 1 : 0)
+    fail net_error("set", remote, "setsockopt", -r) if r < 0
+  }
+}
+
+def new_conn(fd: Int, local: Str, remote: Str) -> Conn {
+  cell: [Int] = [fd]
+  Conn.new(cell: cell, local: local, remote: remote)
+}
+
+# Waits for a non-blocking connect on fd to finish: 0 or the errno.
+def finish_connect(fd: Int) -> Int {
+  buf = zeros(64)
+  loop {
+    w = alx_fd_wait(fd, 2)
+    return -w if w < 0
+    e = alx_sock_error(fd)
+    return e if e != 0
+    r = alx_sock_peer_addr(fd, buf)
+    return 0 if r >= 0
+    return -r if -r != c("ENOTCONN")
+  }
+}
+
+# Connects to addr ("host:port") over "tcp".
+pub def dial(network: Str, addr: Str) -> ~Conn {
+  ~check_network("dial", network, addr)
+  host, portstr = ~split_host_port(addr)
+  port = ~parse_port(addr, portstr)
+  fd = alx_sock_connect(host, port)
+  fail net_error("dial", addr, "connect", -fd) if fd < 0
+  e = finish_connect(fd)
+  if e != 0 {
+    alx_fd_close(fd)
+    fail net_error("dial", addr, "connect", e)
+  }
+  buf = zeros(64)
+  local = addr_of(buf, alx_sock_local_addr(fd, buf))
+  new_conn(fd, local, addr)
+}
+
+# Like dial, but gives up with `Timeout` after d_ns nanoseconds. A timer task
+# closes the half-open socket; it stays asleep until d_ns has passed even if
+# the connect finished sooner.
+pub def dial_timeout(network: Str, addr: Str, d_ns: Int) -> ~Conn {
+  ~check_network("dial", network, addr)
+  host, portstr = ~split_host_port(addr)
+  port = ~parse_port(addr, portstr)
+  fd = alx_sock_connect(host, port)
+  fail net_error("dial", addr, "connect", -fd) if fd < 0
+  state = Atomic.new(0)
+  spawn {
+    alx_sleep_ns(d_ns)
+    alx_fd_close(fd) if state.compare_and_swap(0, 2)
+  }
+  e = finish_connect(fd)
+  if !state.compare_and_swap(0, 1) {
+    fail NetError.Timeout(NetFailure.new(op: "dial", addr: addr, syscall: "connect", code: 0))
+  }
+  if e != 0 {
+    alx_fd_close(fd)
+    fail net_error("dial", addr, "connect", e)
+  }
+  buf = zeros(64)
+  local = addr_of(buf, alx_sock_local_addr(fd, buf))
+  new_conn(fd, local, addr)
+}
+
+# ------------------------------------------------------------------ Listener
+
+# A TCP listening socket. The descriptor lives in shared state (D36).
+pub struct Listener {
+  cell: [Int]
+  # The bound address, "ip:port" (the real port after ":0").
+  addr: Str
+
+  pub def fd -> Int { cell.size == 0 ? -1 : cell[0] }
+
+  # The bound port, an Int: unlike `addr` (a Str, which the sharing check
+  # treats as part of the listener), it can be used after the listener has been
+  # moved into a task: `dial("tcp", "127.0.0.1:#{l.port}")`.
+  pub def port -> Int {
+    i = strings.last_index(addr, ":")
+    strconv.atoi(addr[i + 1...addr.size]).unwrap_or(0)
+  }
+
+  # Waits for the next connection and returns it.
+  pub def accept -> ~Conn {
+    buf = zeros(64)
+    loop {
+      f = fd
+      fail closed_error("accept", addr) if f < 0
+      r = alx_sock_accept(f, buf)
+      if r >= 0 {
+        lb = zeros(64)
+        local = addr_of(lb, alx_sock_local_addr(r, lb))
+        return new_conn(r, local, cstr_of(buf))
+      }
+      code = -r
+      if code == c("EAGAIN") {
+        w = alx_fd_wait(f, 1)
+        fail net_error("accept", addr, "accept", -w) if w < 0
+      } else {
+        fail net_error("accept", addr, "accept", code) if code != c("EINTR") && code != c("ECONNABORTED")
+      }
+    }
+  }
+
+  # Stops listening and wakes tasks blocked in accept! (they fail with
+  # Closed). A second close fails.
+  pub def close! -> ~Unit {
+    f = fd
+    fail closed_error("close", addr) if f < 0
+    self.cell[0] = -1
+    r = alx_fd_close(f)
+    fail net_error("close", addr, "close", -r) if r < 0
+  }
+}
+
+# Listens on addr ("host:port"; ":0" picks a free port) over "tcp".
+pub def listen(network: Str, addr: Str) -> ~Listener {
+  ~check_network("listen", network, addr)
+  host, portstr = ~split_host_port(addr)
+  port = ~parse_port(addr, portstr)
+  fd = alx_sock_listen(host, port, 1024)
+  fail net_error("listen", addr, "bind", -fd) if fd < 0
+  buf = zeros(64)
+  bound = addr_of(buf, alx_sock_local_addr(fd, buf))
+  cell: [Int] = [fd]
+  Listener.new(cell: cell, addr: bound)
+}

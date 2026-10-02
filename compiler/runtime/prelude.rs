@@ -538,6 +538,147 @@ mod rt {
         }
     }
 
+    // L3: the C runtime's event loop and socket shims (alx.h), over std::net.
+    // Tasks are OS threads here, so waiting is a plain poll(2).
+    #[repr(C)]
+    struct PollFd {
+        fd: i32,
+        events: i16,
+        revents: i16,
+    }
+    unsafe extern "C" {
+        fn poll(fds: *mut PollFd, n: std::ffi::c_ulong, ms: i32) -> i32;
+    }
+    pub unsafe fn shim_alx_fd_wait(fd: i64, mode: i64) -> i64 {
+        let mut p = PollFd { fd: fd as i32, events: if mode == 1 { 1 } else { 4 }, revents: 0 };
+        while unsafe { poll(&mut p, 1, -1) } < 0 {
+            let e = std::io::Error::last_os_error();
+            if e.raw_os_error() != Some(4) {
+                return neg_errno(&e);
+            }
+        }
+        0
+    }
+    pub unsafe fn shim_alx_fd_close(fd: i64) -> i64 {
+        if unsafe { close(fd as i32) } == 0 { 0 } else { neg_errno(&std::io::Error::last_os_error()) }
+    }
+    fn net_err(e: &std::io::Error) -> i64 {
+        match e.raw_os_error() {
+            Some(c) => -(c as i64),
+            None => -100000,
+        }
+    }
+    fn put_addr(a: std::net::SocketAddr, out: *mut u8) -> i64 {
+        let s = a.to_string();
+        unsafe {
+            std::ptr::copy_nonoverlapping(s.as_ptr(), out, s.len());
+            *out.add(s.len()) = 0;
+        }
+        s.len() as i64
+    }
+    fn host_str(h: *const std::ffi::c_char) -> String {
+        unsafe { std::ffi::CStr::from_ptr(h) }.to_string_lossy().into_owned()
+    }
+    pub unsafe fn shim_alx_sock_listen(host: *const std::ffi::c_char, port: i64, _backlog: i64) -> i64 {
+        use std::os::fd::IntoRawFd;
+        let mut h = host_str(host);
+        if h.is_empty() {
+            h = "0.0.0.0".into();
+        }
+        match std::net::TcpListener::bind((h.as_str(), port as u16)).and_then(|l| l.set_nonblocking(true).map(|_| l)) {
+            Ok(l) => l.into_raw_fd() as i64,
+            Err(e) => net_err(&e),
+        }
+    }
+    pub unsafe fn shim_alx_sock_accept(fd: i64, out: *mut u8) -> i64 {
+        use std::os::fd::{FromRawFd, IntoRawFd};
+        let l = std::mem::ManuallyDrop::new(unsafe { std::net::TcpListener::from_raw_fd(fd as i32) });
+        match l.accept() {
+            Ok((s, a)) => {
+                let _ = s.set_nonblocking(true);
+                put_addr(a, out);
+                s.into_raw_fd() as i64
+            }
+            Err(e) => net_err(&e),
+        }
+    }
+    pub unsafe fn shim_alx_sock_connect(host: *const std::ffi::c_char, port: i64) -> i64 {
+        use std::net::ToSocketAddrs;
+        use std::os::fd::IntoRawFd;
+        let mut h = host_str(host);
+        if h.is_empty() {
+            h = "127.0.0.1".into();
+        }
+        let addrs: Vec<_> = match (h.as_str(), port as u16).to_socket_addrs() {
+            Ok(a) => a.collect(),
+            Err(_) => return -100000,
+        };
+        let Some(a) = addrs.iter().find(|a| a.is_ipv4()).or(addrs.first()) else { return -100000 };
+        match std::net::TcpStream::connect(a).and_then(|s| s.set_nonblocking(true).map(|_| s)) {
+            Ok(s) => s.into_raw_fd() as i64,
+            Err(e) => net_err(&e),
+        }
+    }
+    fn with_stream<T>(fd: i64, f: impl FnOnce(&std::net::TcpStream) -> T) -> T {
+        use std::os::fd::FromRawFd;
+        let s = std::mem::ManuallyDrop::new(unsafe { std::net::TcpStream::from_raw_fd(fd as i32) });
+        f(&s)
+    }
+    pub unsafe fn shim_alx_sock_error(fd: i64) -> i64 {
+        with_stream(fd, |s| match s.take_error() {
+            Ok(None) => 0,
+            Ok(Some(e)) => e.raw_os_error().unwrap_or(5) as i64,
+            Err(e) => e.raw_os_error().unwrap_or(5) as i64,
+        })
+    }
+    pub unsafe fn shim_alx_sock_local_addr(fd: i64, out: *mut u8) -> i64 {
+        with_stream(fd, |s| match s.local_addr() {
+            Ok(a) => put_addr(a, out),
+            Err(e) => net_err(&e),
+        })
+    }
+    pub unsafe fn shim_alx_sock_peer_addr(fd: i64, out: *mut u8) -> i64 {
+        with_stream(fd, |s| match s.peer_addr() {
+            Ok(a) => put_addr(a, out),
+            Err(e) => net_err(&e),
+        })
+    }
+    pub unsafe fn shim_alx_sock_set_nodelay(fd: i64, on: i64) -> i64 {
+        with_stream(fd, |s| match s.set_nodelay(on != 0) {
+            Ok(()) => 0,
+            Err(e) => net_err(&e),
+        })
+    }
+    pub unsafe fn shim_alx_sock_shutdown(fd: i64, how: i64) -> i64 {
+        let h = match how {
+            0 => std::net::Shutdown::Read,
+            1 => std::net::Shutdown::Write,
+            _ => std::net::Shutdown::Both,
+        };
+        with_stream(fd, |s| match s.shutdown(h) {
+            Ok(()) => 0,
+            Err(e) => net_err(&e),
+        })
+    }
+    pub unsafe fn shim_alx_sock_lookup(host: *const std::ffi::c_char, out: *mut u8, n: i64) -> i64 {
+        use std::net::ToSocketAddrs;
+        let h = host_str(host);
+        let Ok(addrs) = (h.as_str(), 0u16).to_socket_addrs() else { return -100000 };
+        let mut len = 0usize;
+        for a in addrs {
+            let s = a.ip().to_string();
+            if len + s.len() + 1 > n as usize {
+                break;
+            }
+            unsafe {
+                std::ptr::copy_nonoverlapping(s.as_ptr(), out.add(len), s.len());
+                *out.add(len + s.len()) = b'\n';
+            }
+            len += s.len() + 1;
+        }
+        len as i64
+    }
+
     pub fn now_ns() -> i64 {
         static T0: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
         T0.get_or_init(std::time::Instant::now).elapsed().as_nanos() as i64

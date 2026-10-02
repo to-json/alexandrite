@@ -12,6 +12,7 @@
 #include <time.h>
 #include <sys/mman.h>
 #include <unistd.h>
+#include <sys/socket.h>
 
 /* ---------- memory ---------- */
 
@@ -1756,6 +1757,7 @@ static const SysConst sys_consts[] = {
     SC(S_IRWXU) SC(S_IRUSR) SC(S_IWUSR) SC(S_IXUSR) SC(S_IRWXG) SC(S_IRWXO)
     SC(CLOCK_REALTIME) SC(CLOCK_MONOTONIC)
     SC(O_NOFOLLOW) SC(EINPROGRESS) SC(ENOTSUP) SC(EOVERFLOW) SC(ETXTBSY) SC(EDQUOT) SC(ESTALE) SC(ENOBUFS)
+    SC(ECONNABORTED) SC(ENOTCONN) SC(EHOSTUNREACH) SC(ENETUNREACH) SC(EADDRNOTAVAIL) SC(EAFNOSUPPORT)
     SC(S_ISUID) SC(S_ISGID) SC(S_ISVTX) SC(S_IRGRP) SC(S_IWGRP) SC(S_IXGRP) SC(S_IROTH) SC(S_IWOTH) SC(S_IXOTH)
 };
 #undef SC
@@ -1834,4 +1836,339 @@ const char *alx_environ(int64_t i) {
     for (int64_t k = 0; k <= i; k++)
         if (!environ[k]) return NULL;
     return environ[i];
+}
+
+/* ======================================================================
+ * L3: the I/O event loop (netpoll) and sockets
+ * ======================================================================
+ * A task that would block on a non-blocking fd calls alx_fd_wait(fd, mode):
+ * it registers one-shot interest with the poller (kqueue on macOS/BSD, epoll
+ * on Linux) and parks like a sleeper, so its worker runs other tasks. One
+ * dedicated poller thread blocks in kevent/epoll_wait and, on readiness (or
+ * error/hangup), unparks the waiters. Parked I/O waiters count in g_sleepers
+ * (they will wake on their own, so they are not a deadlock). Outside a task
+ * (main, a plain thread) alx_fd_wait just poll(2)s.
+ *
+ * Waiters live in a hash table keyed by fd (g_mu guards it), so events are
+ * matched by (fd, mode) rather than by pointer: a stale event for a waiter
+ * that alx_fd_close already woke finds nothing and is ignored. Known limits:
+ * a woken waiter retries its syscall, so an fd closed and reused in between
+ * is not detected (Go uses fd refcounts); the Linux (epoll) path is UNTESTED. */
+#include <poll.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
+#include <arpa/inet.h>
+#include <netdb.h>
+#if defined(__linux__)
+#  include <sys/epoll.h>
+#  define ALX_EPOLL 1
+#else
+#  include <sys/event.h>
+#endif
+
+typedef struct IoWait { int fd, mode; Parker *p; struct IoWait *next; } IoWait;
+enum { IOW_BUCKETS = 1024 };
+static IoWait *g_iow[IOW_BUCKETS];
+static int g_pollfd = -1;
+static bool g_poller_started;
+
+#define IOW_B(fd) (&g_iow[(unsigned)(fd) % IOW_BUCKETS])
+
+static void iow_remove(IoWait *w) {
+    IoWait **pp = IOW_B(w->fd);
+    while (*pp && *pp != w) pp = &(*pp)->next;
+    if (*pp) *pp = w->next;
+}
+
+#ifdef ALX_EPOLL
+/* Arm (one-shot) for the union of the modes waited on this fd (g_mu held). */
+static int poll_arm(int fd) {
+    uint32_t ev = 0;
+    for (IoWait *w = *IOW_B(fd); w; w = w->next)
+        if (w->fd == fd) ev |= w->mode == 1 ? EPOLLIN : EPOLLOUT;
+    if (!ev) return 0;
+    struct epoll_event e;
+    memset(&e, 0, sizeof e);
+    e.events = ev | EPOLLONESHOT | EPOLLRDHUP;
+    e.data.fd = fd;
+    if (epoll_ctl(g_pollfd, EPOLL_CTL_MOD, fd, &e) == 0) return 0;
+    if (errno == ENOENT && epoll_ctl(g_pollfd, EPOLL_CTL_ADD, fd, &e) == 0) return 0;
+    return -errno;
+}
+#else
+/* kqueue filters are per (fd, mode); EV_ADD on an existing one just refreshes it. */
+static int poll_arm(int fd, int mode) {
+    struct kevent kev;
+    EV_SET(&kev, fd, mode == 1 ? EVFILT_READ : EVFILT_WRITE, EV_ADD | EV_ONESHOT, 0, 0, NULL);
+    return kevent(g_pollfd, &kev, 1, NULL, 0, NULL) < 0 ? -errno : 0;
+}
+#endif
+
+/* Wake every waiter of (fd, mode); mode 0 = all modes (g_mu held). */
+static void iow_wake(int fd, int mode) {
+    IoWait **pp = IOW_B(fd);
+    while (*pp) {
+        IoWait *w = *pp;
+        if (w->fd == fd && (mode == 0 || w->mode == mode)) {
+            *pp = w->next;
+            g_sleepers--;
+            unpark(w->p);
+        } else pp = &w->next;
+    }
+}
+
+static void *poller_main(void *arg) {
+    (void)arg;
+    tl_uncounted = true;
+    for (;;) {
+#ifdef ALX_EPOLL
+        struct epoll_event evs[64];
+        int n = epoll_wait(g_pollfd, evs, 64, -1);
+        if (n < 0) { if (errno == EINTR) continue; break; }
+        pthread_mutex_lock(&g_mu);
+        for (int i = 0; i < n; i++) {
+            int fd = evs[i].data.fd;
+            uint32_t e = evs[i].events;
+            bool err = e & (EPOLLERR | EPOLLHUP);
+            if (err || (e & (EPOLLIN | EPOLLRDHUP))) iow_wake(fd, 1);
+            if (err || (e & EPOLLOUT)) iow_wake(fd, 2);
+            poll_arm(fd); /* one-shot: re-arm for waiters still registered */
+        }
+        pthread_mutex_unlock(&g_mu);
+#else
+        struct kevent evs[64];
+        int n = kevent(g_pollfd, NULL, 0, evs, 64, NULL);
+        if (n < 0) { if (errno == EINTR) continue; break; }
+        pthread_mutex_lock(&g_mu);
+        for (int i = 0; i < n; i++)
+            iow_wake((int)evs[i].ident, evs[i].filter == EVFILT_READ ? 1 : 2);
+        pthread_mutex_unlock(&g_mu);
+#endif
+    }
+    return NULL;
+}
+
+/* g_mu held. */
+static bool poller_start(void) {
+    if (g_poller_started) return true;
+#ifdef ALX_EPOLL
+    g_pollfd = epoll_create1(EPOLL_CLOEXEC);
+#else
+    g_pollfd = kqueue();
+    if (g_pollfd >= 0) fcntl(g_pollfd, F_SETFD, FD_CLOEXEC);
+#endif
+    if (g_pollfd < 0) return false;
+    pthread_t th;
+    pthread_attr_t at;
+    pthread_attr_init(&at);
+    pthread_attr_setdetachstate(&at, PTHREAD_CREATE_DETACHED);
+    int rc = pthread_create(&th, &at, poller_main, NULL);
+    pthread_attr_destroy(&at);
+    if (rc != 0) alx_panic("cannot start the poller thread", "runtime");
+    g_poller_started = true;
+    return true;
+}
+
+/* Wait until fd is readable (mode 1) or writable (mode 2), or has an error or
+ * hung up (the caller retries its syscall and sees which). Parks the task;
+ * outside a task it blocks in poll(2). 0, or -errno if the fd can't be polled. */
+int64_t alx_fd_wait(int64_t fd, int64_t mode) {
+    if (!tl_task) {
+        struct pollfd pf;
+        pf.fd = (int)fd; pf.events = mode == 1 ? POLLIN : POLLOUT; pf.revents = 0;
+        while (poll(&pf, 1, -1) < 0)
+            if (errno != EINTR) return -errno;
+        return 0;
+    }
+    IoWait *w = malloc(sizeof *w);
+    if (!w) alx_panic("out of memory", "runtime");
+    Parker *p = cur_pk();
+    w->fd = (int)fd; w->mode = (int)mode; w->p = p;
+    pthread_mutex_lock(&g_mu);
+    if (!poller_start()) { int e = errno; pthread_mutex_unlock(&g_mu); free(w); return -e; }
+    IoWait **b = IOW_B(w->fd);
+    w->next = *b; *b = w;
+#ifdef ALX_EPOLL
+    int rc = poll_arm(w->fd);
+#else
+    int rc = poll_arm(w->fd, w->mode);
+#endif
+    if (rc < 0) { iow_remove(w); pthread_mutex_unlock(&g_mu); free(w); return rc; }
+    g_sleepers++;
+    p->parked = true; p->dead = false;
+    if (p->counted) g_runnable--;
+    pthread_mutex_unlock(&g_mu);
+    sw_out(p->task, false);
+    free(w);
+    return 0;
+}
+
+/* close(2) that first wakes every task waiting on fd (they retry and see
+ * EBADF). 0 or -errno. */
+int64_t alx_fd_close(int64_t fd) {
+    pthread_mutex_lock(&g_mu);
+    iow_wake((int)fd, 0);
+#ifdef ALX_EPOLL
+    if (g_poller_started) epoll_ctl(g_pollfd, EPOLL_CTL_DEL, (int)fd, NULL);
+#endif
+    pthread_mutex_unlock(&g_mu);
+    return close((int)fd) == 0 ? 0 : -errno;
+}
+
+/* ---------- sockets ---------- */
+
+/* getaddrinfo failed (host not found): a code that is no errno. */
+#define ALX_ENOHOST 100000
+
+static void sock_prep(int fd) {
+    int fl = fcntl(fd, F_GETFL, 0);
+    if (fl >= 0) fcntl(fd, F_SETFL, fl | O_NONBLOCK);
+    fcntl(fd, F_SETFD, FD_CLOEXEC);
+#ifdef SO_NOSIGPIPE
+    int one = 1;
+    setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof one);
+#endif
+}
+
+static void sigpipe_ignore(void) { signal(SIGPIPE, SIG_IGN); }
+static void sock_init(void) {
+    static pthread_once_t once = PTHREAD_ONCE_INIT;
+    pthread_once(&once, sigpipe_ignore);
+}
+
+/* "ip:port" or "[ip6]:port", NUL-terminated, into out (>= 64 bytes). Length. */
+static int64_t sock_fmt(const struct sockaddr_storage *ss, uint8_t *out) {
+    char h[INET6_ADDRSTRLEN] = "";
+    if (ss->ss_family == AF_INET6) {
+        const struct sockaddr_in6 *a = (const void *)ss;
+        inet_ntop(AF_INET6, &a->sin6_addr, h, sizeof h);
+        return snprintf((char *)out, 64, "[%s]:%d", h, ntohs(a->sin6_port));
+    }
+    const struct sockaddr_in *a = (const void *)ss;
+    inet_ntop(AF_INET, &a->sin_addr, h, sizeof h);
+    return snprintf((char *)out, 64, "%s:%d", h, ntohs(a->sin_port));
+}
+
+/* A TCP listening socket on host:port ("" or "0.0.0.0": any IPv4; "::": any
+ * IPv6, dual-stack). SO_REUSEADDR; non-blocking, close-on-exec. The fd, or
+ * -errno (-ALX_ENOHOST if host doesn't resolve). Resolution blocks the worker. */
+int64_t alx_sock_listen(const char *host, int64_t port, int64_t backlog) {
+    sock_init();
+    struct addrinfo hints, *res = NULL;
+    memset(&hints, 0, sizeof hints);
+    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_flags = AI_PASSIVE;
+    if (!host[0]) host = "0.0.0.0";
+    char ps[16];
+    snprintf(ps, sizeof ps, "%d", (int)port);
+    if (getaddrinfo(host, ps, &hints, &res) != 0) return -ALX_ENOHOST;
+    int err = EADDRNOTAVAIL, fd = -1;
+    for (struct addrinfo *a = res; a; a = a->ai_next) {
+        fd = socket(a->ai_family, a->ai_socktype, a->ai_protocol);
+        if (fd < 0) { err = errno; continue; }
+        int one = 1, zero = 0;
+        setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+        if (a->ai_family == AF_INET6) setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, &zero, sizeof zero);
+        if (bind(fd, a->ai_addr, a->ai_addrlen) == 0 && listen(fd, (int)backlog) == 0) { sock_prep(fd); break; }
+        err = errno;
+        close(fd);
+        fd = -1;
+    }
+    freeaddrinfo(res);
+    return fd >= 0 ? fd : -err;
+}
+
+/* Non-blocking accept: the new fd (non-blocking, close-on-exec) with the peer's
+ * "ip:port" in out (>= 64 bytes), or -errno (-EAGAIN: wait readable, retry). */
+int64_t alx_sock_accept(int64_t fd, uint8_t *out) {
+    struct sockaddr_storage ss;
+    socklen_t len = sizeof ss;
+    int c = accept((int)fd, (struct sockaddr *)&ss, &len);
+    if (c < 0) return -errno;
+    sock_prep(c);
+    sock_fmt(&ss, out);
+    return c;
+}
+
+/* Starts a TCP connection to host:port (IPv4 preferred when the name has
+ * several addresses; "" is 127.0.0.1) without waiting for it: the fd comes
+ * back at once, the caller waits writable and then reads alx_sock_error.
+ * Or -errno / -ALX_ENOHOST. Resolution blocks the worker. */
+int64_t alx_sock_connect(const char *host, int64_t port) {
+    sock_init();
+    struct addrinfo hints, *res = NULL;
+    memset(&hints, 0, sizeof hints);
+    hints.ai_socktype = SOCK_STREAM;
+    char ps[16];
+    snprintf(ps, sizeof ps, "%d", (int)port);
+    if (getaddrinfo(host[0] ? host : "127.0.0.1", ps, &hints, &res) != 0) return -ALX_ENOHOST;
+    struct addrinfo *pick = res;
+    for (struct addrinfo *a = res; a; a = a->ai_next)
+        if (a->ai_family == AF_INET) { pick = a; break; }
+    int fd = socket(pick->ai_family, pick->ai_socktype, pick->ai_protocol);
+    if (fd < 0) { int e = errno; freeaddrinfo(res); return -e; }
+    sock_prep(fd);
+    int rc = connect(fd, pick->ai_addr, pick->ai_addrlen);
+    int e = errno;
+    freeaddrinfo(res);
+    if (rc < 0 && e != EINPROGRESS) { close(fd); return -e; }
+    return fd;
+}
+
+/* SO_ERROR (and clears it): 0 if the connection succeeded. */
+int64_t alx_sock_error(int64_t fd) {
+    int err = 0;
+    socklen_t len = sizeof err;
+    if (getsockopt((int)fd, SOL_SOCKET, SO_ERROR, &err, &len) < 0) return errno;
+    return err;
+}
+
+int64_t alx_sock_local_addr(int64_t fd, uint8_t *out) {
+    struct sockaddr_storage ss;
+    socklen_t len = sizeof ss;
+    if (getsockname((int)fd, (struct sockaddr *)&ss, &len) < 0) return -errno;
+    return sock_fmt(&ss, out);
+}
+
+int64_t alx_sock_peer_addr(int64_t fd, uint8_t *out) {
+    struct sockaddr_storage ss;
+    socklen_t len = sizeof ss;
+    if (getpeername((int)fd, (struct sockaddr *)&ss, &len) < 0) return -errno;
+    return sock_fmt(&ss, out);
+}
+
+int64_t alx_sock_set_nodelay(int64_t fd, int64_t on) {
+    int v = on != 0;
+    return setsockopt((int)fd, IPPROTO_TCP, TCP_NODELAY, &v, sizeof v) < 0 ? -errno : 0;
+}
+
+/* how: 0 read side, 1 write side, 2 both. */
+int64_t alx_sock_shutdown(int64_t fd, int64_t how) {
+    return shutdown((int)fd, how == 0 ? SHUT_RD : how == 1 ? SHUT_WR : SHUT_RDWR) < 0 ? -errno : 0;
+}
+
+/* The addresses of host, one per line ("127.0.0.1\n::1\n"), into out (n bytes,
+ * truncated); the length, or -ALX_ENOHOST. Blocks the worker. */
+int64_t alx_sock_lookup(const char *host, uint8_t *out, int64_t n) {
+    struct addrinfo hints, *res = NULL;
+    memset(&hints, 0, sizeof hints);
+    hints.ai_socktype = SOCK_STREAM;
+    if (getaddrinfo(host, NULL, &hints, &res) != 0) return -ALX_ENOHOST;
+    int64_t len = 0;
+    for (struct addrinfo *a = res; a; a = a->ai_next) {
+        char h[INET6_ADDRSTRLEN];
+        const void *src;
+        if (a->ai_family == AF_INET6) src = &((struct sockaddr_in6 *)(void *)a->ai_addr)->sin6_addr;
+        else if (a->ai_family == AF_INET) src = &((struct sockaddr_in *)(void *)a->ai_addr)->sin_addr;
+        else continue;
+        if (!inet_ntop(a->ai_family, src, h, sizeof h)) continue;
+        size_t hl = strlen(h);
+        if (len + (int64_t)hl + 1 > n) break;
+        memcpy(out + len, h, hl);
+        len += (int64_t)hl;
+        out[len++] = '\n';
+    }
+    freeaddrinfo(res);
+    return len;
 }

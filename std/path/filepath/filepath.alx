@@ -1,10 +1,13 @@
 # Package filepath: Go's path/filepath for Unix systems (the separator is
-# `/`). `abs`, `walk_dir` and `glob` need the os package and come with it.
+# `/`). `abs`, `walk_dir` and `glob` use the os package.
 #
 # Differences from Go: `join` takes a [Str]; `split` returns a tuple; `rel`
-# fails with RelError.
+# fails with RelError; `walk_dir` takes a block (or function) returning a
+# WalkAction (Continue, SkipDir, Stop) instead of an error sentinel, and an
+# unreadable directory fails the whole walk.
 
 import "path"
+import "os"
 
 pub SEPARATOR = "/"
 pub LIST_SEPARATOR = ":"
@@ -116,4 +119,107 @@ pub def rel(base: Str, target: Str) -> ~Str<RelError> {
     return up
   }
   t[tl...ts]
+}
+
+# ------------------------------------------------------------ with the os package
+
+# An absolute path equal to `p`: joined to the working directory if relative,
+# then cleaned. (No symlink resolution; Go's Abs doesn't either.)
+pub def abs(p: Str) -> ~Str {
+  return clean(p) if is_abs(p)
+  wd = ~os.getwd
+  join([wd, p])
+}
+
+# What a walk_dir callback says to do next.
+pub enum WalkAction {
+  # Go on (into a directory, if the entry is one).
+  Continue
+  # Don't enter this directory; for a file, skip the rest of its directory.
+  SkipDir
+  # End the walk now; walk_dir returns normally.
+  Stop
+}
+
+# Walks the tree rooted at `root` (Go's WalkDir): calls f(path, entry) for the
+# root and then for every entry below it, in lexical order, a directory before
+# its contents; f's result steers the walk. Symbolic links are not followed.
+# An unreadable directory fails the walk with its error (Go passes the error to
+# f and lets it decide).
+#
+#   filepath.walk_dir("src") { |path, d|
+#     puts path if d.is_regular
+#     filepath.WalkAction.Continue
+#   }
+pub def walk_dir(root: Str, f: (Str, os.DirEntry) -> WalkAction) -> ~Unit {
+  info = ~os.lstat(root)
+  kind = 4
+  kind = 1 if info.is_regular
+  kind = 2 if info.is_dir
+  kind = 3 if info.is_symlink
+  top = os.DirEntry.new(name: base(root), dir: dir(root), kind: kind)
+  first = f(root, top)
+  return if first == WalkAction.Stop
+  return if first == WalkAction.SkipDir || !top.is_dir
+  frames: [[os.DirEntry]] = [~os.read_dir(root)]
+  next_at: [Int] = [0]
+  while frames.size > 0 {
+    k = frames.size - 1
+    i = next_at[k]
+    if i >= frames[k].size {
+      frames = frames[0...frames.size - 1]
+      next_at = next_at[0...next_at.size - 1]
+      next
+    }
+    next_at[k] = i + 1
+    en = frames[k][i]
+    p = en.path
+    act = f(p, en)
+    return if act == WalkAction.Stop
+    if act == WalkAction.SkipDir && !en.is_dir {
+      frames = frames[0...frames.size - 1]
+      next_at = next_at[0...next_at.size - 1]
+    } else if act == WalkAction.Continue && en.is_dir {
+      frames << ~os.read_dir(p)
+      next_at << 0
+    }
+  }
+}
+
+# The names of files matching the pattern (Go's Glob), sorted by directory and
+# name. Wildcards may appear in any element of the path. An unreadable
+# directory is skipped. A malformed pattern fails.
+pub def glob(pattern: Str) -> ~[Str] {
+  out: [Str] = []
+  if !has_meta(pattern) {
+    st = os.lstat(pattern)
+    out << pattern if st.ok?
+    return out
+  }
+  d, file = split(pattern)
+  dd0 = d
+  dd0 = d[0...d.size - 1] if d.size > 1
+  dirs = [dd0]
+  if has_meta(dd0) {
+    dirs = ~glob(dd0)
+  }
+  for dd in dirs {
+    entries = os.read_dir(dd.size == 0 ? "." : dd)
+    next if entries.err?
+    for en in entries.unwrap {
+      ok = ~match(file, en.name)
+      out << (dd.size == 0 ? en.name : join([dd, en.name])) if ok
+    }
+  }
+  out
+}
+
+def has_meta(p: Str) -> Bool {
+  i = 0
+  while i < p.size {
+    c = p[i]
+    return true if c == 42 || c == 63 || c == 91 || c == 92
+    i += 1
+  }
+  false
 }

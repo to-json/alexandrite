@@ -511,7 +511,14 @@ impl<'a> Parser<'a> {
             let d = self.def_sig(Some((&name, true)))?;
             let has_body = d.body.is_some();
             let short = d.name.rsplit_once('.').map_or(d.name.clone(), |(_, m)| m.to_string());
-            methods.push((short, d.params[1..].to_vec(), d.ret.clone(), has_body, d.name_span));
+            // A fallible method (`-> ~T`) is typed as a `~T` result in the interface.
+            let sret = if d.fallible {
+                let inner = d.ret.clone().unwrap_or(TypeExpr::Named("Unit".into(), d.name_span));
+                Some(TypeExpr::Result(Box::new(inner), None, d.name_span))
+            } else {
+                d.ret.clone()
+            };
+            methods.push((short, d.params[1..].to_vec(), sret, has_body, d.name_span));
             if let Some(body) = d.body {
                 defaults.push(Def { public: true, using: self.usings.clone(), name: d.name, span: d.span, tparams: d.tparams, name_span: d.name_span, params: d.params, ret: d.ret, fallible: d.fallible, errs: d.errs, pure: d.pure, ffi: d.ffi, body });
             }

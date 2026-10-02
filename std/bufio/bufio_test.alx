@@ -1,0 +1,330 @@
+import "os"
+import "bytes"
+
+# A reader over a string handing out at most `chunk` bytes per read.
+struct Slow {
+  data: Str
+  pos: Int
+  chunk: Int
+
+  def read!(p: [Byte]) -> ~Int {
+    n = data.size - pos
+    n = p.size if n > p.size
+    n = chunk if n > chunk
+    i = 0
+    while i < n {
+      p[i] = data[pos + i]
+      i += 1
+    }
+    self.pos = pos + n
+    n
+  }
+}
+
+# A reader failing after its data runs out.
+struct Broken {
+  data: Str
+  pos: Int
+
+  def read!(p: [Byte]) -> ~Int {
+    fail "wire cut" if pos >= data.size
+    n = data.size - pos
+    n = p.size if n > p.size
+    i = 0
+    while i < n {
+      p[i] = data[pos + i]
+      i += 1
+    }
+    self.pos = pos + n
+    n
+  }
+}
+
+# A writer recording what reached it.
+struct Sink {
+  data: [Byte]
+  calls: Int
+
+  def write!(p: [Byte]) -> Int {
+    for c in p {
+      self.data << c
+    }
+    self.calls = calls + 1
+    p.size
+  }
+}
+
+def rep(c: Byte, n: Int) -> Str {
+  b: [Byte] = [c; n]
+  Str.from_bytes(b)
+}
+
+def slow(s: Str, chunk: Int) -> Slow { Slow.new(data: s, pos: 0, chunk: chunk) }
+
+def tmp -> Str {
+  os.mkdir_temp("", "alx-bufio-test-*").unwrap
+}
+
+test "scanner lines" {
+  sc = new_scanner(slow("one\ntwo\r\n\nthree", 3))
+  got: [Str] = []
+  while sc.scan! {
+    got << sc.text
+  }
+  assert_eq got.size, 4
+  assert_eq got[0], "one"
+  assert_eq got[1], "two"
+  assert_eq got[2], ""
+  assert_eq got[3], "three"
+  assert sc.err.none?
+  assert !sc.scan!
+}
+
+test "scanner lines: trailing newline, empty input" {
+  sc = new_scanner(slow("a\nb\n", 100))
+  n = 0
+  while sc.scan! {
+    n += 1
+  }
+  assert_eq n, 2
+  sc2 = new_scanner(slow("", 100))
+  assert !sc2.scan!
+  assert sc2.err.none?
+  sc3 = new_scanner(slow("\n", 100))
+  assert sc3.scan!
+  assert_eq sc3.text, ""
+  assert !sc3.scan!
+}
+
+test "scanner words" {
+  sc = new_scanner(slow("  the quick\tbrown\n fox  jumps over　the lazy dog  ", 5))
+  sc.split!(Split.Words)
+  words: [Str] = []
+  while sc.scan! {
+    words << sc.text
+  }
+  assert_eq words.size, 9
+  assert_eq words[0], "the"
+  assert_eq words[3], "fox"
+  assert_eq words[5], "over"
+  assert_eq words[8], "dog"
+}
+
+test "scanner runes and bytes" {
+  sc = new_scanner(slow("aé世\U0001F600x", 2))
+  sc.split!(Split.Runes)
+  toks: [Str] = []
+  while sc.scan! {
+    toks << sc.text
+  }
+  assert_eq toks.size, 5
+  assert_eq toks[1], "é"
+  assert_eq toks[2], "世"
+  assert_eq toks[3], "\U0001F600"
+  sb = new_scanner(slow("héy", 1))
+  sb.split!(Split.Bytes)
+  n = 0
+  while sb.scan! {
+    n += 1
+  }
+  assert_eq n, 4
+}
+
+test "scanner: long tokens" {
+  long = rep(120, 100000)
+  sc = new_scanner(slow(long + "\nshort\n", 4096))
+  assert !sc.scan!
+  e = sc.err.unwrap
+  assert_eq e.message, "bufio.Scanner: token too long"
+  sc2 = new_scanner(slow(long + "\nshort\n", 4096))
+  sc2.buffer!(200000)
+  assert sc2.scan!
+  assert_eq sc2.text.size, 100000
+  assert sc2.scan!
+  assert_eq sc2.text, "short"
+  assert !sc2.scan!
+}
+
+test "scanner reports read errors" {
+  sc = new_scanner(Broken.new(data: "ok line\npartial", pos: 0))
+  assert sc.scan!
+  assert_eq sc.text, "ok line"
+  assert !sc.scan!
+  assert_eq sc.err.unwrap.message, "wire cut"
+}
+
+test "scanner bytes alias the buffer" {
+  sc = new_scanner(slow("abc\ndef\n", 8))
+  assert sc.scan!
+  assert_eq sc.bytes.size, 3
+  assert_eq sc.bytes[1], 98
+}
+
+test "scanner over a 100k line file" {
+  d = tmp
+  name = d + "/big.txt"
+  f = os.create(name).unwrap
+  w = new_writer(f)
+  i = 0
+  while i < 100000 {
+    w.write_string!("line number #{i}\n").unwrap
+    i += 1
+  }
+  w.flush!.unwrap
+  f.close!.unwrap
+  g = os.open(name).unwrap
+  sc = new_scanner(g)
+  n = 0
+  total = 0
+  last = ""
+  while sc.scan! {
+    n += 1
+    total += sc.bytes.size
+    last = sc.text
+  }
+  assert sc.err.none?
+  assert_eq n, 100000
+  assert_eq last, "line number 99999"
+  assert_eq total, os.stat(name).unwrap.size - 100000
+  g.close!.unwrap
+  os.remove_all(d).unwrap
+}
+
+test "reader: read, read_byte, unread_byte, peek, discard" {
+  br = new_reader_size(slow("hello, world", 4), 16)
+  buf: [Byte] = [0; 5]
+  assert_eq br.read!(buf).unwrap, 4
+  assert_eq br.peek!(3).unwrap.size, 3
+  assert_eq br.peek!(3).unwrap[0], 111
+  c = br.read_byte!.unwrap.unwrap
+  assert_eq c, 111
+  br.unread_byte!.unwrap
+  assert_eq br.read_byte!.unwrap.unwrap, 111
+  assert_eq br.discard!(2).unwrap, 2
+  assert_eq br.read_byte!.unwrap.unwrap, 119
+  assert_eq br.discard!(100).unwrap, 4
+  assert br.read_byte!.unwrap.none?
+  assert br.unread_byte!.ok?, "the last byte can be unread even at the end"
+  assert br.peek!(100).err?
+}
+
+test "reader: runes" {
+  br = new_reader(slow("aé世\U0001F600", 1))
+  r1, w1 = br.read_rune!.unwrap.unwrap
+  assert_eq r1, 97
+  assert_eq w1, 1
+  r2, w2 = br.read_rune!.unwrap.unwrap
+  assert_eq r2, 233
+  assert_eq w2, 2
+  r3, w3 = br.read_rune!.unwrap.unwrap
+  assert_eq r3, 0x4E16
+  assert_eq w3, 3
+  r4, w4 = br.read_rune!.unwrap.unwrap
+  assert_eq r4, 0x1F600
+  assert_eq w4, 4
+  assert br.read_rune!.unwrap.none?
+}
+
+test "reader: lines and delimiters" {
+  br = new_reader_size(slow("first\nsecond line is long enough\r\nlast", 6), 16)
+  assert_eq br.read_line!.unwrap.unwrap, "first"
+  assert_eq br.read_line!.unwrap.unwrap, "second line is long enough"
+  assert_eq br.read_line!.unwrap.unwrap, "last"
+  assert br.read_line!.unwrap.none?
+  b2 = new_reader(slow("a,b,,c", 2))
+  assert_eq b2.read_string!(44).unwrap.unwrap, "a,"
+  assert_eq b2.read_string!(44).unwrap.unwrap, "b,"
+  assert_eq b2.read_string!(44).unwrap.unwrap, ","
+  assert_eq b2.read_string!(44).unwrap.unwrap, "c"
+  assert b2.read_string!(44).unwrap.none?
+  b3 = new_reader_size(slow("0123456789abcdefghij;rest", 5), 16)
+  bs = b3.read_bytes!(59).unwrap.unwrap
+  assert_eq bs.size, 21
+  assert_eq b3.read_line!.unwrap.unwrap, "rest"
+}
+
+test "reader: errors" {
+  br = new_reader(Broken.new(data: "abc\ndef", pos: 0))
+  assert_eq br.read_line!.unwrap.unwrap, "abc"
+  e = br.read_line!.err
+  assert_eq e.unwrap.message, "wire cut"
+  b2 = new_reader_size(slow("x", 1), 16)
+  assert b2.unread_byte!.err?
+  assert b2.discard!(-1).err?
+}
+
+test "reader: large reads bypass the buffer" {
+  data = rep(121, 1000)
+  br = new_reader_size(slow(data, 1000), 16)
+  buf: [Byte] = [0; 500]
+  assert_eq br.read!(buf).unwrap, 500
+  assert_eq br.read!(buf).unwrap, 500
+  assert_eq br.read!(buf).unwrap, 0
+}
+
+test "writer: buffering and flush" {
+  sink = Sink.new(data: [], calls: 0)
+  w = new_writer_size(sink, 8)
+  assert_eq w.write_string!("abc").unwrap, 3
+  assert_eq w.buffered, 3
+  assert_eq w.available, 5
+  w.write_byte!(100).unwrap
+  assert_eq w.write_rune!(233).unwrap, 2
+  assert_eq w.buffered, 6
+  w.flush!.unwrap
+  assert_eq w.buffered, 0
+  # the writer holds its own copy of the sink; observe through a file instead
+  d = tmp
+  f = os.create(d + "/w.txt").unwrap
+  fw = new_writer_size(f, 8)
+  fw.write_string!("hello, ").unwrap
+  fw.write_string!("buffered world, longer than the buffer").unwrap
+  fw.write!("!!".bytes.to_a).unwrap
+  assert fw.buffered <= 8
+  fw.flush!.unwrap
+  f.close!.unwrap
+  assert_eq os.read_file_string(d + "/w.txt").unwrap, "hello, buffered world, longer than the buffer!!"
+  os.remove_all(d).unwrap
+}
+
+test "writer: big writes go straight through" {
+  d = tmp
+  f = os.create(d + "/big.bin").unwrap
+  fw = new_writer_size(f, 16)
+  big = rep(122, 1000)
+  assert_eq fw.write!(big.bytes.to_a).unwrap, 1000
+  assert_eq fw.buffered, 0
+  fw.write_string!("tail").unwrap
+  fw.flush!.unwrap
+  f.close!.unwrap
+  assert_eq os.stat(d + "/big.bin").unwrap.size, 1004
+  os.remove_all(d).unwrap
+}
+
+test "reader over a file, copy to a writer" {
+  d = tmp
+  os.write_file(d + "/in.txt", "alpha\nbeta\ngamma\n".bytes.to_a, 0o644).unwrap
+  f = os.open(d + "/in.txt").unwrap
+  br = new_reader(f)
+  lines: [Str] = []
+  loop {
+    line = br.read_line!.unwrap
+    break if line.none?
+    lines << line.unwrap
+  }
+  assert_eq lines.size, 3
+  assert_eq lines[2], "gamma"
+  f.close!.unwrap
+  os.remove_all(d).unwrap
+}
+
+test "bytes.Buffer under a scanner" {
+  buf = bytes.new_buffer_string("p q\nr s\n")
+  sc = new_scanner(buf)
+  sc.split!(Split.Words)
+  n = 0
+  while sc.scan! {
+    n += 1
+  }
+  assert_eq n, 4
+}

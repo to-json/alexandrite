@@ -270,7 +270,7 @@ impl<'a> World<'a> {
         let enums: Vec<&EnumDef> = enums.iter().filter(|d| d.tparams.is_empty()).collect();
         let all = defs.iter().copied().map(|d| (d.name.as_str(), d.span, Def::S(d))).chain(enums.iter().copied().map(|d| (d.name.as_str(), d.span, Def::E(d))));
         for (name, span, d) in all {
-            if by_name.contains_key(name) || self.structs.contains_key(name) || self.consts.contains_key(name) || ["Int", "Float", "Bool", "Str", "Array", "Map", "Math", "File", "Time", "Test", "Enumerator", "Error", "Ptr"].contains(&name) {
+            if by_name.contains_key(name) || self.structs.contains_key(name) || self.consts.contains_key(name) || ["Int", "Float", "Bool", "Str", "Array", "Map", "Math", "Time", "Test", "Enumerator", "Error", "Ptr"].contains(&name) {
                 return Err(Diag::new(span, format!("`{name}` is already defined")));
             }
             by_name.insert(name, d);
@@ -466,11 +466,14 @@ impl<'a> World<'a> {
             let me = if m.name.ends_with('!') { Ty::arr(t.clone()) } else { t.clone() };
             let args: Vec<Ty> = std::iter::once(me).chain(m.params.iter().cloned()).collect();
             let fid = self.instance(def, args, sp)?;
-            let ret = match &self.funcs[fid] {
-                Some(f) => f.ret.clone(),
-                None => self.sigs.get(&fid).map(|s| s.0.clone()).unwrap_or(Ty::Unit),
+            let (ret, fallible) = match &self.funcs[fid] {
+                Some(f) => (f.ret.clone(), f.fallible),
+                None => self.sigs.get(&fid).map(|s| (s.0.clone(), s.1)).unwrap_or((Ty::Unit, false)),
             };
-            if ret != m.ret {
+            // An infallible method satisfies a fallible interface method (it always succeeds).
+            let lifted = !fallible && m.ret == Ty::Result(Box::new(ret.clone()));
+            let ret = if fallible { Ty::Result(Box::new(ret)) } else { ret };
+            if ret != m.ret && !lifted {
                 self.impls.get_mut(iface).unwrap().pop();
                 return Err(Diag::new(sp, format!("{tn}.{} returns {}, but {iface}.{} returns {}", m.name, ret.show(), m.name, m.ret.show())));
             }
@@ -1704,6 +1707,8 @@ impl<'w, 'a> FnCx<'w, 'a> {
                     // (A bare name of a function with parameters can't be a call.)
                     let q = resolve_name(n, sp, &|q| self.w.by_name.contains_key(q)).unwrap_or_else(|_| n.clone());
                     let def = self.w.by_name.get(&q).map(|&d| self.w.defs[d].def.clone());
+                    // A field of the receiver shadows a function of the same name.
+                    let def = def.filter(|_| self.self_field(e).is_none());
                     if let Some(d) = def.filter(|d| !d.params.is_empty() && d.tparams.is_empty() && d.params.iter().all(|p| p.ty.is_some())) {
                         {
                             let id = NodeId::MAX;
@@ -3046,7 +3051,11 @@ impl<'w, 'a> FnCx<'w, 'a> {
         for a in args {
             targs.push(self.value(a)?);
         }
-        let call = self.call_def(def, name, name_span, targs, sp)?;
+        // A fallible `!` method called as `x.~m!()` is a held `~T` until the `~` takes it.
+        let held = std::mem::replace(&mut self.under_try, false);
+        let call = self.call_def(def, name, name_span, targs, sp);
+        self.under_try = held;
+        let call = call?;
         let rty = call.ty.clone();
         if matches!(self.resolve(&rty), Ty::Unit) {
             let tl = self.mk(TK::Local(tid), Ty::arr(pty.clone()), sp);

@@ -324,4 +324,17 @@ int64_t alx_sys_const(const char *name);
 int64_t alx_sys_const_count(void);
 const char *alx_sys_const_name(int64_t i);
 
+/* ---------- files and directories (std os) ---------- */
+/* stat(2)/lstat(2)/fstat(2) as ALX_STAT_FIELDS int64s (native endian) in out:
+ * mode, size, mtime_ns, atime_ns, ino, nlink. 0 or -errno. */
+#define ALX_STAT_FIELDS 6
+int32_t alx_sys_stat(const char *path, uint8_t *out, int32_t follow);
+int32_t alx_sys_fstat(int32_t fd, uint8_t *out);
+/* A directory handle or -errno; entries one at a time (NULL at the end). */
+int64_t alx_sys_dir_open(const char *path);
+const char *alx_sys_dir_next(int64_t h, uint8_t *kind);
+void alx_sys_dir_close(int64_t h);
+/* The i-th "NAME=value" of the environment, NULL past the end. */
+const char *alx_environ(int64_t i);
+
 #endif

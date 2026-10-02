@@ -131,6 +131,8 @@ The logic: **fallibility is a prefix** ("approximately do this", "you'll probabl
 | D29 | Warnings | unused locals (assigned, never read) and unused imports; `_` / `_name` silences; `--strict` and `alx test` make them errors (Go's compile errors, softened per P3) | M8 |
 | D30 | `alx fmt` | token-based and meaning-preserving (re-lexed and compared on every run): 2-space indent by bracket nesting, Go-ish operator spacing, at most one blank line, line breaks never added or removed, trailing comments aligned in runs (gofmt). No options | M8 |
 | D31 | `alx test` | `*_test.alx` in a package's directory, compiled with the package (tests see private names); `test "name" { }`, `bench "name" { }` (with `-bench`), `example "name" { } outputs "text"`; `assert cond`, `assert_eq got, want`; each test runs as its own task, so one failure or panic doesn't stop the run; Go-style output and exit status | M8 |
+| D32 | Fallible interface methods | an interface method may be fallible (`def read!(p: [Byte]) -> ~Int`); the call is a `~T` (`r.~read!(p)` propagates it); an implementor's infallible method with the same `T` satisfies it (it always succeeds), which is how `bytes.Buffer` is an `io.Reader` | L2 |
+| D33 | `os`/`io`/`bufio` shape | see the headers of `std/io`, `std/os`, `std/bufio`: EOF is `0` or `none`, structs are values so the free functions of `io` receive a copy of the reader/writer (state-in-the-kernel handles like `os.File` are unaffected), open flags are portable constants translated by `open_file` | L2 |
 
 ## Memory model and the next push (user, 2026-10-01)
 

@@ -140,7 +140,7 @@ mod rt {
                 }
             } else {
                 let mut v = self.to_vec();
-                let c = (self.cap * 2).max(4);
+                let c = (self.len * 2).max(4);
                 v.reserve(c - v.len());
                 v.push(x);
                 *self = Sl { buf: Arc::new(std::sync::Mutex::new(v)), off: 0, len: self.len, cap: c };

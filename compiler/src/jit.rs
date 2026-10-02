@@ -729,13 +729,14 @@ impl Fx<'_, '_, '_> {
                 let et = elem(&self.f.vars[*v].ty).clone();
                 let esz = lay(&et).size as i64;
                 let a = self.get(*v);
-                let full = self.b.ins().icmp(IntCC::Equal, a[1], a[2]);
+                // A slice's cap is 0: pushing to one always copies.
+                let full = self.b.ins().icmp(IntCC::SignedGreaterThanOrEqual, a[1], a[2]);
                 let (grow, cont) = (self.b.create_block(), self.b.create_block());
                 self.b.ins().brif(full, grow, &[], cont, &[]);
                 self.b.switch_to_block(grow);
-                let dbl = self.b.ins().ishl_imm_s(a[2], 1);
+                let dbl = self.b.ins().ishl_imm_s(a[1], 1);
                 let four = self.ic(4);
-                let nc = self.b.ins().select(a[2], dbl, four);
+                let nc = self.b.ins().select(a[1], dbl, four);
                 let ez = self.ic(esz);
                 let np = self.call_rt(rt::alxj_arr_grow, &[a[0], a[1], nc, ez], true).unwrap();
                 self.set(*v, &[np, a[1], nc]);

@@ -167,15 +167,15 @@ def negative_runtime(case, group):
 
 
 def memory():
-    """R1: call- and loop-heavy programs run in bounded memory (release builds)."""
+    """R1-R3: call-, loop- and churn-heavy programs run in bounded memory (release builds)."""
     d = CASES / "mem"
-    for prog, want in [("calls.alx", "12588314"), ("loops.alx", "1000000"), ("fill.alx", "140000")]:
+    for prog, want, ms in [("calls.alx", "12588314", "R1"), ("loops.alx", "1000000", "R1"), ("fill.alx", "140000", "R2"), ("churn.alx", "100", "R3"), ("pchurn.alx", "50", "R3")]:
         r, _ = run([ALX, "build", "--release", prog], cwd=d)
         binary = r.stdout.strip()
         r2, _ = run([binary], cwd=d, env={"ALX_MEMSTATS": "1"})
         peak = next((int(w.split("=")[1]) for w in r2.stderr.split() if w.startswith("peak=")), None)
         ok = r2.returncode == 0 and r2.stdout.splitlines()[:1] == [want] and peak is not None and peak <= 8 << 20
-        check("R1", f"bounded memory: {prog}", ok, f"peak {peak} bytes, stdout {r2.stdout.strip()[:40]!r}")
+        check(ms, f"bounded memory: {prog}", ok, f"peak {peak} bytes, stdout {r2.stdout.strip()[:40]!r}")
 
 
 def warnings():

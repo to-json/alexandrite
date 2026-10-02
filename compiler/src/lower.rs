@@ -77,8 +77,31 @@ pub fn lower(p: &TProgram, sm: &SourceMap, opts: &Opts) -> LProgram {
     prog
 }
 
+/// A pool's header: slots (generation, value), live count, the contents'
+/// region and its size after the last compaction (R3), and the free slots
+/// (an array and how many of it are in use). A slot is live while its
+/// generation is odd; a handle is its slot index | generation << 32, so a
+/// handle to a removed (or since reused) slot is caught.
 fn pool_header(t: LTy) -> LTy {
-    LTy::Tup(vec![LTy::Arr(Box::new(LTy::Tup(vec![LTy::Bool, t]))), LTy::I64])
+    LTy::Tup(vec![LTy::Arr(Box::new(LTy::Tup(vec![LTy::I64, t]))), LTy::I64, LTy::Region, LTy::I64, LTy::Arr(Box::new(LTy::I64)), LTy::I64])
+}
+const POOL_REGION: usize = 2;
+const POOL_LIVE_BYTES: usize = 3;
+const POOL_FREE: usize = 4;
+const POOL_FREE_N: usize = 5;
+
+/// A handle's slot index and generation.
+fn handle_index(h: LE) -> LE {
+    LE::Prim(Prim::And, vec![h, LE::I(0xffff_ffff)])
+}
+fn handle_gen(h: LE) -> LE {
+    LE::Prim(Prim::ShrU, vec![h, LE::I(32)])
+}
+fn make_handle(i: LE, generation: LE) -> LE {
+    LE::Prim(Prim::Or, vec![i, LE::Prim(Prim::Shl, vec![generation, LE::I(32)])])
+}
+fn gen_live(generation: LE) -> LE {
+    LE::Cmp(Op::Eq, Box::new(LE::Prim(Prim::And, vec![generation, LE::I(1)])), Box::new(LE::I(1)), LTy::I64)
 }
 
 /// A fallible function returns (ok, value, error).
@@ -548,8 +571,10 @@ impl<'a> Lw<'a> {
                 let l = self.label();
                 // Each iteration gets a fresh region: entered before the loop,
                 // renewed at the top of every iteration, left after it.
-                let open = self.open_iter(s as *const TStmt as usize);
+                let key = s as *const TStmt as usize;
+                let open = self.open_iter(key);
                 let inner = self.sub(|lw| {
+                    lw.compact_owners(key);
                     if let Some((r, sv, _)) = open {
                         lw.emit(LS::RegionExit { region: r, saved: sv });
                         lw.emit(LS::RegionEnter { region: r, saved: sv });
@@ -632,7 +657,11 @@ impl<'a> Lw<'a> {
             if let Some(l) = root.filter(|l| matches!(self.lty(&self.f.locals[*l].ty), LTy::Arr(_) | LTy::Str)) {
                 let r = self.tmp(LTy::Region);
                 let v = self.var_of(l);
-                self.emit(LS::Set(r, LE::RegionOf(Box::new(LE::Var(v)))));
+                let region = match self.owner_region(l) {
+                    Some(reg) => reg,
+                    None => LE::RegionOf(Box::new(LE::Var(v))),
+                };
+                self.emit(LS::Set(r, region));
                 self.into.push(r);
                 let out = self.expr_placed(e);
                 self.into.pop();
@@ -643,6 +672,33 @@ impl<'a> Lw<'a> {
     }
 
     fn expr_placed(&mut self, e: &TExpr) -> LE {
+        // R3: an owning container: its contents in a child region of this
+        // call's, its header (what variables point to) here.
+        if let (Some(pl), Some((frame, _))) = (self.place, self.frame) {
+            let me = e as *const TExpr as usize;
+            if pl.owners.values().any(|o| o.def_site == me) {
+                let r = self.tmp(LTy::Region);
+                self.emit(LS::Set(r, LE::RegionNew(Box::new(LE::Var(frame)))));
+                let saved = self.tmp(LTy::Region);
+                self.emit(LS::RegionUse { region: LE::Var(r), saved });
+                let lt = self.lty(&e.ty);
+                let inner = self.expr_in(e);
+                let inner = self.bind(inner, lt.clone());
+                self.emit(LS::RegionRestore(saved));
+                let LTy::Arr(h) = &lt else { unreachable!() };
+                let hdr = self.tmp(lt.clone());
+                let header = LE::Index { arr: Box::new(inner), idx: Box::new(LE::I(0)), check: None };
+                // The header is allocated here (in the call's region), not in r.
+                let fsaved = self.tmp(LTy::Region);
+                self.emit(LS::RegionUse { region: LE::Var(frame), saved: fsaved });
+                self.emit(LS::Set(hdr, LE::ArrLit((**h).clone(), vec![header])));
+                self.emit(LS::RegionRestore(fsaved));
+                let (rf, bf) = self.region_fields(&e.ty);
+                self.emit(LS::SetPlace { var: hdr, steps: vec![crate::lir::Step::Index(LE::I(0), None), crate::lir::Step::Field(rf)], val: LE::Var(r) });
+                self.emit(LS::SetPlace { var: hdr, steps: vec![crate::lir::Step::Index(LE::I(0), None), crate::lir::Step::Field(bf)], val: LE::RegionBytes(Box::new(LE::Var(r))) });
+                return LE::Var(hdr);
+            }
+        }
         // R1: an allocation that must live elsewhere than the current
         // region is made with that region current (and forced to a value
         // before switching back: LIR expressions run where they're used).
@@ -661,8 +717,9 @@ impl<'a> Lw<'a> {
                         Place::Iter(k) => LE::Var(self.iter_vars[&k].0),
                         Place::Frame => LE::Var(frame),
                         Place::Ret => LE::Var(dest),
-                        Place::Into(p) => match self.into.last() {
-                            Some(r) => LE::Var(*r),
+                        Place::Into(p) => match self.into.last().copied() {
+                            Some(r) => LE::Var(r),
+                            None if self.place.is_some_and(|pl| pl.owner_alias.contains_key(&p)) => self.owner_region(p).unwrap(),
                             // Where the parameter's own storage lives.
                             None if matches!(self.lty(&self.f.locals[p].ty), LTy::Arr(_) | LTy::Str) => {
                                 let v = self.var_of(p);
@@ -1334,6 +1391,89 @@ impl<'a> Lw<'a> {
         LE::Call(name, vec![e])
     }
 
+    /// (region field, live-bytes field) of a Map's or Pool's header.
+    fn region_fields(&self, t: &Ty) -> (usize, usize) {
+        match t {
+            Ty::Pool(_) => (POOL_REGION, POOL_LIVE_BYTES),
+            _ => (crate::mapgen::REGION, crate::mapgen::LIVE_BYTES),
+        }
+    }
+
+    /// The child region of the owning container local `l` refers to (R3).
+    fn owner_region(&mut self, l: LocalId) -> Option<LE> {
+        let c = *self.place?.owner_alias.get(&l)?;
+        let t = self.f.locals[c].ty.clone();
+        let (rf, _) = self.region_fields(&t);
+        let v = self.var_of(l);
+        Some(LE::Field(Box::new(LE::Index { arr: Box::new(LE::Var(v)), idx: Box::new(LE::I(0)), check: None }), rf))
+    }
+
+    /// At the end of an iteration of loop `key`: compact the containers that
+    /// own a region there, if their garbage outweighs their live contents.
+    fn compact_owners(&mut self, key: usize) {
+        let Some(pl) = self.place else { return };
+        let mut cs: Vec<LocalId> = pl.owners.iter().filter(|(_, o)| o.loop_key == key).map(|(c, _)| *c).collect();
+        cs.sort_unstable();
+        for c in cs {
+            let t = self.f.locals[c].ty.clone();
+            let (rf, bf) = self.region_fields(&t);
+            let cv = self.var_of(c);
+            let hdr = |f: usize| LE::Field(Box::new(LE::Index { arr: Box::new(LE::Var(cv)), idx: Box::new(LE::I(0)), check: None }), f);
+            let set = |f: usize, v: LE| LS::SetPlace { var: cv, steps: vec![crate::lir::Step::Index(LE::I(0), None), crate::lir::Step::Field(f)], val: v };
+            let used = LE::RegionBytes(Box::new(hdr(rf)));
+            let limit = LE::Arith(Op::Add, Box::new(LE::Arith(Op::Mul, Box::new(hdr(bf)), Box::new(LE::I(3)), Ovf::Unchecked)), Box::new(LE::I(65536)), Ovf::Unchecked);
+            let body = self.sub(|lw| {
+                let old = lw.tmp(LTy::Region);
+                lw.emit(LS::Set(old, hdr(rf)));
+                let fresh = lw.tmp(LTy::Region);
+                lw.emit(LS::Set(fresh, LE::RegionNew(Box::new(LE::RegionOf(Box::new(LE::Var(cv)))))));
+                let saved = lw.tmp(LTy::Region);
+                lw.emit(LS::RegionUse { region: LE::Var(fresh), saved });
+                match &t {
+                    Ty::Map(kt, vt) => {
+                        // A fresh map with copies of the live entries.
+                        let (fns, klt, vlt) = lw.map_fns(&t);
+                        let m2 = lw.tmp(lw.lty(&t));
+                        lw.emit(LS::Set(m2, LE::Call(fns.new.clone(), vec![hdr(crate::mapgen::COUNT)])));
+                        let set_fn = fns.set.clone();
+                        lw.map_each(&LE::Var(cv), kt, vt, |lw, k, v| {
+                            let k = lw.deep_copy(k, &klt);
+                            let v = lw.deep_copy(v, &vlt);
+                            lw.emit(LS::Eval(LE::Call(set_fn.clone(), vec![LE::Var(m2), k, v])));
+                        });
+                        lw.emit(LS::RegionRestore(saved));
+                        for f in 0..=crate::mapgen::COUNT {
+                            let nf = LE::Field(Box::new(LE::Index { arr: Box::new(LE::Var(m2)), idx: Box::new(LE::I(0)), check: None }), f);
+                            lw.emit(set(f, nf));
+                        }
+                    }
+                    _ => {
+                        // A pool keeps its slots (handles index them): copy them.
+                        let slots_t = match lw.lty(&t) {
+                            LTy::Arr(h) => match *h {
+                                LTy::Tup(hs) => hs[0].clone(),
+                                _ => unreachable!(),
+                            },
+                            _ => unreachable!(),
+                        };
+                        let copied = lw.deep_copy(hdr(0), &slots_t);
+                        let copied = lw.bind(copied, slots_t);
+                        let free_t = LTy::Arr(Box::new(LTy::I64));
+                        let free = lw.deep_copy(hdr(POOL_FREE), &free_t);
+                        let free = lw.bind(free, free_t);
+                        lw.emit(LS::RegionRestore(saved));
+                        lw.emit(set(0, copied));
+                        lw.emit(set(POOL_FREE, free));
+                    }
+                }
+                lw.emit(set(rf, LE::Var(fresh)));
+                lw.emit(LS::RegionFree(LE::Var(old)));
+                lw.emit(set(bf, LE::RegionBytes(Box::new(LE::Var(fresh)))));
+            });
+            self.emit(LS::If(LE::Cmp(Op::Gt, Box::new(used), Box::new(limit), LTy::I64), body, vec![]));
+        }
+    }
+
     /// The code point of the `cl`-byte UTF-8 sequence at `s[i]`.
     fn decode_rune(&mut self, s: &LE, i: V, cl: V) -> LE {
         let byte = |k: i64| {
@@ -1792,7 +1932,7 @@ impl<'a> Lw<'a> {
                 LE::Cond(Box::new(LE::Field(Box::new(v), 0)), Box::new(s), Box::new(LE::S("none".into())))
             }
             Ty::Str => v,
-            Ty::Handle(_) => LE::Rt(Rt::StrCat, vec![LE::S("@".into()), LE::Rt(Rt::IntToS, vec![v])]),
+            Ty::Handle(_) => LE::Rt(Rt::StrCat, vec![LE::S("@".into()), LE::Rt(Rt::IntToS, vec![handle_index(v)])]),
             Ty::Array(el) | Ty::Fixed(el, _) => {
                 // Go: `[1 2 3]`.
                 let lt = self.lty(t);
@@ -2272,7 +2412,7 @@ impl<'a> Lw<'a> {
                 let LTy::Arr(h) = &lt else { unreachable!() };
                 let LTy::Tup(hs) = &**h else { unreachable!() };
                 let LTy::Arr(slot) = &hs[0] else { unreachable!() };
-                LE::ArrLit((**h).clone(), vec![LE::Tup((**h).clone(), vec![LE::ArrWithCap((**slot).clone(), Box::new(LE::I(0))), LE::I(0)])])
+                LE::ArrLit((**h).clone(), vec![LE::Tup((**h).clone(), vec![LE::ArrWithCap((**slot).clone(), Box::new(LE::I(0))), LE::I(0), LE::RegionProgram, LE::I(0), LE::ArrWithCap(LTy::I64, Box::new(LE::I(0))), LE::I(0)])])
             }
             PoolAdd | PoolGet | PoolSet | PoolRemove | PoolSize => {
                 let r = recv.unwrap();
@@ -2294,18 +2434,33 @@ impl<'a> Lw<'a> {
                         // The value first: making it may add to this pool too.
                         let v = self.arg(&args[0]);
                         let v = self.bind(v, val_t.clone());
-                        let s = self.tmp(slots_t.clone());
-                        self.emit(LS::Set(s, hdr(0)));
-                        self.emit(LS::Push(s, LE::Tup((**slot_t).clone(), vec![LE::B(true), v])));
-                        self.emit(set_hdr(0, LE::Var(s)));
+                        let (idx, generation) = (self.tmp(LTy::I64), self.tmp(LTy::I64));
+                        // A free slot if there is one (its generation goes back to odd).
+                        let n = LE::Arith(Op::Sub, Box::new(hdr(POOL_FREE_N)), Box::new(LE::I(1)), Ovf::Unchecked);
+                        let reuse = vec![
+                            set_hdr(POOL_FREE_N, n),
+                            LS::Set(idx, LE::Index { arr: Box::new(hdr(POOL_FREE)), idx: Box::new(hdr(POOL_FREE_N)), check: None }),
+                            LS::Set(generation, LE::Arith(Op::Add, Box::new(LE::Field(Box::new(LE::Index { arr: Box::new(hdr(0)), idx: Box::new(LE::Var(idx)), check: None }), 0)), Box::new(LE::I(1)), Ovf::Unchecked)),
+                            LS::SetPlace { var: p, steps: vec![crate::lir::Step::Index(LE::I(0), None), crate::lir::Step::Field(0), crate::lir::Step::Index(LE::Var(idx), None)], val: LE::Tup((**slot_t).clone(), vec![LE::Var(generation), v.clone()]) },
+                        ];
+                        let fresh = self.sub(|lw| {
+                            let s = lw.tmp(slots_t.clone());
+                            lw.emit(LS::Set(s, hdr(0)));
+                            lw.emit(LS::Push(s, LE::Tup((**slot_t).clone(), vec![LE::I(1), v.clone()])));
+                            lw.emit(set_hdr(0, LE::Var(s)));
+                            lw.emit(LS::Set(idx, LE::Arith(Op::Sub, Box::new(LE::Len(Box::new(LE::Var(s)))), Box::new(LE::I(1)), Ovf::Unchecked)));
+                            lw.emit(LS::Set(generation, LE::I(1)));
+                        });
+                        self.emit(LS::If(LE::Cmp(Op::Gt, Box::new(hdr(POOL_FREE_N)), Box::new(LE::I(0)), LTy::I64), reuse, fresh));
                         self.emit(set_hdr(1, LE::Arith(Op::Add, Box::new(hdr(1)), Box::new(LE::I(1)), Ovf::Unchecked)));
-                        LE::Arith(Op::Sub, Box::new(LE::Len(Box::new(LE::Var(s)))), Box::new(LE::I(1)), Ovf::Unchecked)
+                        make_handle(LE::Var(idx), LE::Var(generation))
                     }
                     _ => {
                         // The slot, checked: in range and not removed (the new
                         // value first: making it may add to this pool).
                         let h = self.expr(&args[0]);
-                        let h = self.bind(h, LTy::I64);
+                        let hv = self.bind(h, LTy::I64);
+                        let h = self.bind(handle_index(hv.clone()), LTy::I64);
                         let newv = if m == PoolSet {
                             let v = self.arg(&args[1]);
                             Some(self.bind(v, val_t.clone()))
@@ -2314,7 +2469,7 @@ impl<'a> Lw<'a> {
                         };
                         let slot = self.tmp((**slot_t).clone());
                         self.emit(LS::Set(slot, LE::Index { arr: Box::new(hdr(0)), idx: Box::new(h.clone()), check: Some(loc.clone()) }));
-                        let live = LE::Field(Box::new(LE::Var(slot)), 0);
+                        let live = LE::Cmp(Op::Eq, Box::new(LE::Field(Box::new(LE::Var(slot)), 0)), Box::new(handle_gen(hv.clone())), LTy::I64);
                         if m != PoolRemove {
                             self.emit(LS::If(LE::Not(Box::new(live.clone())), vec![LS::Panic("use of a removed pool handle".into(), loc.clone())], vec![]));
                         }
@@ -2323,17 +2478,33 @@ impl<'a> Lw<'a> {
                             PoolGet => LE::Field(Box::new(LE::Var(slot)), 1),
                             PoolSet => {
                                 let v = newv.unwrap();
-                                self.emit(LS::SetPlace { var: p, steps: slot_step, val: LE::Tup((**slot_t).clone(), vec![LE::B(true), v]) });
+                                self.emit(LS::SetPlace { var: p, steps: slot_step, val: LE::Tup((**slot_t).clone(), vec![LE::Field(Box::new(LE::Var(slot)), 0), v]) });
                                 LE::Unit
                             }
                             _ => {
-                                // remove: leaves a tombstone; the value comes back if it was there.
+                                // remove: the slot's generation goes even and it joins
+                                // the free list; the value comes back if it was there.
+                                let was = self.bind(live, LTy::Bool);
+                                let free_step = |k: LE| vec![crate::lir::Step::Index(LE::I(0), None), crate::lir::Step::Field(POOL_FREE), crate::lir::Step::Index(k, None)];
+                                let push_free = self.sub(|lw| {
+                                    let fr = lw.tmp(LTy::Arr(Box::new(LTy::I64)));
+                                    lw.emit(LS::Set(fr, hdr(POOL_FREE)));
+                                    lw.emit(LS::Push(fr, h.clone()));
+                                    lw.emit(set_hdr(POOL_FREE, LE::Var(fr)));
+                                });
                                 let body = vec![
-                                    LS::SetPlace { var: p, steps: slot_step, val: LE::Tup((**slot_t).clone(), vec![LE::B(false), zero_le(&val_t)]) },
+                                    LS::SetPlace { var: p, steps: slot_step, val: LE::Tup((**slot_t).clone(), vec![LE::Arith(Op::Add, Box::new(LE::Field(Box::new(LE::Var(slot)), 0)), Box::new(LE::I(1)), Ovf::Unchecked), zero_le(&val_t)]) },
                                     set_hdr(1, LE::Arith(Op::Sub, Box::new(hdr(1)), Box::new(LE::I(1)), Ovf::Unchecked)),
+                                    LS::If(
+                                        LE::Cmp(Op::Lt, Box::new(hdr(POOL_FREE_N)), Box::new(LE::Len(Box::new(hdr(POOL_FREE)))), LTy::I64),
+                                        vec![LS::SetPlace { var: p, steps: free_step(hdr(POOL_FREE_N)), val: h.clone() }],
+                                        push_free,
+                                    ),
+                                    set_hdr(POOL_FREE_N, LE::Arith(Op::Add, Box::new(hdr(POOL_FREE_N)), Box::new(LE::I(1)), Ovf::Unchecked)),
                                 ];
-                                self.emit(LS::If(live.clone(), body, vec![]));
-                                LE::Tup(self.lty(&e.ty), vec![live, LE::Field(Box::new(LE::Var(slot)), 1)])
+                                self.emit(LS::If(was.clone(), body, vec![]));
+                                let rt = self.lty(&e.ty);
+                                self.bind(LE::Tup(rt.clone(), vec![was, LE::Field(Box::new(LE::Var(slot)), 1)]), rt)
                             }
                         }
                     }
@@ -2489,8 +2660,10 @@ impl<'a> Lw<'a> {
             Loop => {
                 let l = self.label();
                 let b = blk.unwrap();
-                let open = self.open_iter(e as *const TExpr as usize);
+                let key = e as *const TExpr as usize;
+                let open = self.open_iter(key);
                 let inner = self.sub(|lw| {
+                    lw.compact_owners(key);
                     if let Some((r, sv, _)) = open {
                         lw.emit(LS::RegionExit { region: r, saved: sv });
                         lw.emit(LS::RegionEnter { region: r, saved: sv });
@@ -2805,6 +2978,7 @@ impl<'a> Lw<'a> {
                         lw.emit(LS::Eval(v));
                     }
                     lw.close_iter(open);
+                    lw.compact_owners(e as *const TExpr as usize);
                     lw.break_target.pop();
                 }
                 All | Any => {
@@ -3163,8 +3337,8 @@ impl<'a> Lw<'a> {
                     let slot = LE::Var(slot);
                     let x = lw.tmp(tl.clone());
                     lw.emit(LS::Set(i, LE::Arith(Op::Add, Box::new(LE::Var(i)), Box::new(LE::I(1)), Ovf::Unchecked)));
-                    lw.emit(LS::If(LE::Not(Box::new(LE::Field(Box::new(slot.clone()), 0))), vec![LS::Continue(l)], vec![]));
-                    let h = LE::Arith(Op::Sub, Box::new(LE::Var(i)), Box::new(LE::I(1)), Ovf::Unchecked);
+                    lw.emit(LS::If(LE::Not(Box::new(gen_live(LE::Field(Box::new(slot.clone()), 0)))), vec![LS::Continue(l)], vec![]));
+                    let h = make_handle(LE::Arith(Op::Sub, Box::new(LE::Var(i)), Box::new(LE::I(1)), Ovf::Unchecked), LE::Field(Box::new(slot.clone()), 0));
                     lw.emit(LS::Set(x, LE::Tup(tl.clone(), vec![h, LE::Field(Box::new(slot), 1)])));
                     lw.apply(&st, 0, LE::Var(x), None, l, outer, k);
                 });

@@ -54,6 +54,17 @@ pub struct FnPlacement {
     pub loops: std::collections::HashSet<usize>,
     /// Some site is stored into a parameter's storage.
     pub into: bool,
+    /// R3: containers (Map or Pool locals) that own a child region for their
+    /// contents, compacted at the end of each iteration of `loop_key`; and
+    /// which locals refer to each one's header.
+    pub owners: HashMap<LocalId, Owner>,
+    pub owner_alias: HashMap<LocalId, LocalId>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct Owner {
+    pub loop_key: usize,
+    pub def_site: usize,
 }
 
 /// Per function: does parameter i flow to the result, or escape?
@@ -108,6 +119,10 @@ struct Graph<'a> {
     site_loops: HashMap<usize, Vec<usize>>,
     /// Each loop's body, for deciding which locals are fresh per iteration.
     loop_bodies: HashMap<usize, Vec<&'a TStmt>>,
+    /// Mutations of containers: the receiver's nodes and the loops around.
+    mutations: Vec<(Vec<Node>, Vec<usize>)>,
+    /// `c = Map/Pool literal`: the local and the site.
+    defs: Vec<(LocalId, usize)>,
 }
 
 impl<'a> Graph<'a> {
@@ -150,6 +165,9 @@ impl<'a> Graph<'a> {
         match &e.kind {
             TK::Local(l) => v.push(Node::Local(*l)),
             TK::Assign(l, x) => {
+                if matches!(x.kind, TK::M(M::MapNew | M::PoolNew, None, _, None)) {
+                    self.defs.push((*l, &**x as *const TExpr as usize));
+                }
                 let xv = self.expr(x);
                 self.alias(&xv, &[Node::Local(*l)]);
                 v.extend(xv);
@@ -194,7 +212,8 @@ impl<'a> Graph<'a> {
                     }
                     // Mutations of the receiver: what's stored (and any growth)
                     // lives as long as the receiver.
-                    M::Push | M::MapSet | M::MapDel | M::CopyInto | M::PoolAdd | M::PoolSet => {
+                    M::Push | M::MapSet | M::MapDel | M::CopyInto | M::PoolAdd | M::PoolSet | M::PoolRemove => {
+                        self.mutations.push((rv.clone(), self.loops.clone()));
                         let mut stored = avs.clone();
                         stored.push(site(e));
                         self.flow(&stored, &rv);
@@ -351,7 +370,7 @@ fn contains_int(t: &Ty) -> bool {
 /// Can a value of this type refer to heap storage?
 pub fn has_storage(t: &Ty) -> bool {
     match t {
-        Ty::Int | Ty::IntK(_) | Ty::Float | Ty::Bool | Ty::Unit | Ty::Range | Ty::Never => false,
+        Ty::Int | Ty::IntK(_) | Ty::Float | Ty::Bool | Ty::Unit | Ty::Range | Ty::Never | Ty::Handle(_) => false,
         Ty::Opt(t) => has_storage(t),
         Ty::Tuple(ts) => ts.iter().any(has_storage),
         Ty::Struct(_, fs) => fs.iter().any(|(_, t)| has_storage(t)),
@@ -372,7 +391,7 @@ fn unsafe_ref<'b>(p: *const TExpr) -> &'b TExpr {
 }
 
 fn graph<'a>(f: &'a TFunc, sums: &'a [Summary]) -> Graph<'a> {
-    let mut g = Graph { f, sums, edges: HashMap::new(), sites: vec![], loops: vec![], site_loops: HashMap::new(), loop_bodies: HashMap::new() };
+    let mut g = Graph { f, sums, edges: HashMap::new(), sites: vec![], loops: vec![], site_loops: HashMap::new(), loop_bodies: HashMap::new(), mutations: vec![], defs: vec![] };
     // Writing into a parameter's storage writes into the caller's objects.
     for p in &f.params {
         g.edge(Node::Local(*p), Node::Caller(*p));
@@ -459,6 +478,7 @@ pub fn analyze(p: &TProgram) -> Vec<FnPlacement> {
                 }
                 out.sites.insert(*s, place);
             }
+            owners(f, &g, &fresh, &mut out);
             out
         })
         .collect()
@@ -527,4 +547,154 @@ fn fresh_locals(f: &TFunc, g: &Graph) -> HashMap<usize, std::collections::HashSe
         out.insert(*key, ok);
     }
     out
+}
+
+/// R3: which Map/Pool locals own their contents' region. A container
+/// qualifies when it's made here (`c = {}` / `Pool[T].new`, once), stays in
+/// this call's frame, is mutated inside a loop, and nothing that refers to
+/// it or to its contents outlives that loop's iteration or the call: then,
+/// at the end of each iteration, its live contents can be copied to a fresh
+/// region and the old one freed without anything noticing.
+fn owners(f: &TFunc, g: &Graph, fresh: &HashMap<usize, std::collections::HashSet<LocalId>>, out: &mut FnPlacement) {
+    // Undirected neighbours (aliasing in either direction).
+    let mut adj: HashMap<Node, Vec<Node>> = HashMap::new();
+    for (a, bs) in &g.edges {
+        for b in bs {
+            adj.entry(*a).or_default().push(*b);
+            adj.entry(*b).or_default().push(*a);
+        }
+    }
+    for (c, def_site) in &g.defs {
+        let loc = &f.locals[*c];
+        if loc.reassigned > 0 || f.params.contains(c) || !matches!(loc.ty, Ty::Map(..) | Ty::Pool(_)) {
+            continue;
+        }
+        if g.defs.iter().filter(|(l, _)| l == c).count() != 1 || out.sites.get(def_site) != Some(&Place::Frame) {
+            continue;
+        }
+        // Everything connected to the container (stopping at the sinks).
+        let mut comp = vec![Node::Local(*c)];
+        let mut stack = vec![Node::Local(*c)];
+        let mut escapes = false;
+        while let Some(n) = stack.pop() {
+            for m in adj.get(&n).into_iter().flatten() {
+                match m {
+                    Node::Ret | Node::Global | Node::Caller(_) => escapes = true,
+                    _ if !comp.contains(m) => {
+                        comp.push(*m);
+                        stack.push(*m);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        if escapes {
+            continue;
+        }
+        // The loop: the innermost one around every mutation of it.
+        let muts: Vec<&Vec<usize>> = g.mutations.iter().filter(|(rv, _)| rv.iter().any(|n| comp.contains(n))).map(|(_, l)| l).collect();
+        if muts.is_empty() {
+            continue;
+        }
+        let mut common: Vec<usize> = muts[0].clone();
+        for l in &muts[1..] {
+            let n = common.iter().zip(l.iter()).take_while(|(a, b)| a == b).count();
+            common.truncate(n);
+        }
+        let Some(lk) = common.last().copied() else { continue };
+        // The def must be outside that loop (the container lives across it).
+        if g.site_loops.get(def_site).is_some_and(|ls| ls.contains(&lk)) {
+            continue;
+        }
+        // Every other local tied to it is gone at the end of an iteration,
+        // or only comes into use after the loop is over.
+        let ok = fresh.get(&lk).cloned().unwrap_or_default();
+        let locals: Vec<LocalId> = comp.iter().filter_map(|n| if let Node::Local(l) = n { Some(*l) } else { None }).collect();
+        let (lo, hi) = loop_extent(g, lk);
+        // Not when an enclosing loop comes back around to this one.
+        let nested = g.loop_bodies.keys().any(|k| *k != lk && {
+            let (a, b) = loop_extent(g, *k);
+            a <= lo && hi <= b
+        });
+        let after_only = |l: &LocalId| {
+            if nested {
+                return false;
+            }
+            let mut spans = vec![];
+            for st in &f.body {
+                local_spans(st, *l, &mut spans);
+            }
+            !spans.is_empty() && spans.iter().all(|sp| sp.lo > hi)
+        };
+        if !locals.iter().all(|l| l == c || ok.contains(l) || after_only(l)) {
+            continue;
+        }
+        out.owners.insert(*c, Owner { loop_key: lk, def_site: *def_site });
+        for l in &locals {
+            if *l != *c && f.locals[*l].ty == loc.ty {
+                out.owner_alias.insert(*l, *c);
+            }
+        }
+        out.owner_alias.insert(*c, *c);
+        // What's stored into it is allocated in its region.
+        for n in &comp {
+            if let Node::Site(s) = n {
+                if s != def_site && reaches_from(g, *n).contains(&Node::Local(*c)) {
+                    out.sites.insert(*s, Place::Into(*c));
+                    out.into = true;
+                }
+            }
+        }
+    }
+}
+
+/// The source extent of a loop's body.
+fn loop_extent(g: &Graph, key: usize) -> (u32, u32) {
+    let (mut lo, mut hi) = (u32::MAX, 0);
+    for st in g.loop_bodies.get(&key).into_iter().flatten() {
+        crate::prove::stmt_exprs(st, &mut |e| span_extent(e, &mut lo, &mut hi));
+    }
+    (lo, hi)
+}
+
+fn span_extent(e: &TExpr, lo: &mut u32, hi: &mut u32) {
+    *lo = (*lo).min(e.span.lo);
+    *hi = (*hi).max(e.span.hi);
+    if let TK::M(_, _, _, Some(b)) = &e.kind {
+        for s in &b.body {
+            crate::prove::stmt_exprs(s, &mut |x| span_extent(x, lo, hi));
+        }
+    }
+    crate::prove::each_child(e, &mut |c| span_extent(c, lo, hi));
+}
+
+/// Where local `l` is used or assigned.
+fn local_spans(s: &TStmt, l: LocalId, out: &mut Vec<crate::diag::Span>) {
+    if let TStmt::MultiAssign(ls, _) = s {
+        if ls.contains(&l) {
+            out.push(crate::diag::Span::default());
+        }
+    }
+    crate::prove::stmt_exprs(s, &mut |e| expr_spans(e, l, out));
+}
+
+fn expr_spans(e: &TExpr, l: LocalId, out: &mut Vec<crate::diag::Span>) {
+    match &e.kind {
+        TK::Local(x) | TK::Assign(x, _) | TK::IndexAssign(x, ..) | TK::PlaceAssign(x, ..) if *x == l => out.push(e.span),
+        _ => {}
+    }
+    if let TK::M(_, _, _, Some(b)) = &e.kind {
+        if b.params.contains(&l) {
+            out.push(b.span);
+        }
+        for s in &b.body {
+            local_spans(s, l, out);
+        }
+    }
+    if let TK::Seq(ss) = &e.kind {
+        for s in ss {
+            local_spans(s, l, out);
+        }
+    }
+    crate::prove::each_child(e, &mut |c| expr_spans(c, l, out));
 }

@@ -27,7 +27,7 @@ Decisions R1–R10 and S1–S4 in `GO-VS-RUBY.md`.
 |---|---|---|
 | R1 | **Scoped regions** | runtime regions (chunked arenas, per thread); escape analysis; allocations that can't outlive a function call or a loop iteration go in that scope's region and are freed when it ends; everything else stays in the program region (today's behavior). Bounded memory for loops and call-heavy code |
 | R2 | **Returns and placement** | escaping values are placed in the region they escape to (region parameters: a function allocates its result in the caller's region); fewer values reach the program region |
-| R3 | **Refcounts for escapees** | values stored into long-lived containers and fields are refcounted: replacing or deleting them frees them (Map, slice elements, struct fields); long-running loops with caches stay bounded |
+| R3 | **Containers that churn** | (R11, refining R1's refcounts) a Map or Pool made in a function and mutated in a loop owns a child region; live contents are compacted into a fresh region once garbage outweighs them. Pools reuse slots behind generational handles. Long-running loops with caches stay bounded. Done: churn.alx 24 MB → 3 MB |
 | R4 | **Captures, receivers, pools** | captures by reference (R5); `!` methods through interfaces (R7); `@T` handles and pools for recursive and graph data (R3) |
 | R5 | **Sharing** | `Mutex[T]`, `Atomic[T]`; moves into `spawn` and channels; unsynchronized sharing is a compile error |
 | R6 | **Explain** | `alx explain mem`: each allocation's region or refcount and why; the hot-loop refcount lint |

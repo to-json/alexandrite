@@ -17,9 +17,14 @@ pub const VALS: usize = 1;
 pub const LIVE: usize = 2;
 pub const SLOTS: usize = 3;
 pub const COUNT: usize = 4;
+/// The region holding the contents (R3: an owning map's child region;
+/// otherwise the program region, unused), and its size after the last
+/// compaction.
+pub const REGION: usize = 5;
+pub const LIVE_BYTES: usize = 6;
 
 pub fn header(k: &LTy, v: &LTy) -> LTy {
-    LTy::Tup(vec![LTy::Arr(Box::new(k.clone())), LTy::Arr(Box::new(v.clone())), LTy::Arr(Box::new(LTy::Bool)), LTy::Arr(Box::new(LTy::I64)), LTy::I64])
+    LTy::Tup(vec![LTy::Arr(Box::new(k.clone())), LTy::Arr(Box::new(v.clone())), LTy::Arr(Box::new(LTy::Bool)), LTy::Arr(Box::new(LTy::I64)), LTy::I64, LTy::Region, LTy::I64])
 }
 
 pub fn map_ty(k: &LTy, v: &LTy) -> LTy {
@@ -174,6 +179,8 @@ fn gen_new(n: &MapFns, k: &LTy, v: &LTy) -> LFunc {
             LE::ArrWithCap(v.clone(), b(var(cap))),
             LE::ArrWithCap(LTy::Bool, b(var(cap))),
             LE::ArrNew(LTy::I64, b(var(size)), b(LE::I(-1)), String::new()),
+            LE::I(0),
+            LE::RegionProgram,
             LE::I(0),
         ],
     );

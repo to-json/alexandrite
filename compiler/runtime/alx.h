@@ -117,8 +117,8 @@ int64_t alx_isqrt(int64_t n, const char *loc);
         return a;                                                                     \
     }                                                                                 \
     static inline void N##_push(N *a, T v) {                                          \
-        if (a->len == a->cap) {                                                       \
-            int64_t nc = a->cap ? 2 * a->cap : 4;                                     \
+        if (a->len >= a->cap) { /* a slice's cap is 0: it never writes past it */      \
+            int64_t nc = a->len ? 2 * a->len : 4;                                     \
             T *np = (T *)alx_alloc((size_t)nc * sizeof(T));                           \
             if (a->len) memcpy(np, a->ptr, (size_t)a->len * sizeof(T));               \
             a->ptr = np;                                                              \

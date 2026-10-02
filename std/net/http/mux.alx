@@ -1,0 +1,264 @@
+import "strings"
+import "slices"
+
+# Anything with a `serve_http` method answers requests.
+pub interface Handler {
+  def serve_http(w: ResponseWriter, r: Request)
+}
+
+# Segment kinds of a pattern.
+SEG_LIT = 3
+SEG_SINGLE = 2
+SEG_REST = 1
+SEG_END = 4
+
+struct Seg {
+  kind: Int
+  # The literal text, or the wildcard's name.
+  text: Str
+}
+
+struct Route {
+  pattern: Str
+  # "" matches every method.
+  method: Str
+  segs: [Seg]
+  # Trailing slash: matches the whole subtree.
+  prefix: Bool
+  handler: (ResponseWriter, Request) -> Unit
+}
+
+struct MuxState {
+  routes: [Route]
+}
+
+# What a lookup found. code: 0 matched, 404, 405 (`allow` lists the methods),
+# 301 (`location` is the cleaned or slash-added path).
+struct Match {
+  code: Int
+  handler: (ResponseWriter, Request) -> Unit
+  pvals: Map[Str, Str]
+  allow: Str
+  location: Str
+}
+
+# A request router with Go 1.22 patterns:
+#
+#   "/items/"            the subtree under /items/ (and a redirect from /items)
+#   "/items/{id}"        one segment, available as r.path_value("id")
+#   "/files/{path...}"   the rest of the path, slashes included
+#   "/{$}"               exactly "/"
+#   "GET /items/{id}"    only that method (GET also answers HEAD); a path that
+#                        matches only with another method gets 405 + Allow
+#
+# The most specific pattern wins: literal segments beat wildcards, the first
+# difference deciding; a longer pattern beats a subtree pattern it extends; a
+# pattern with a method beats one without. Host-qualified patterns are not
+# supported. Paths with "//", "." or ".." segments are redirected to their
+# cleaned form (301). A ServeMux is a handle: copies share the routes, and it
+# can be used from many tasks while registering more.
+pub struct ServeMux {
+  st: Mutex[MuxState]
+
+  # Registers `h` for `pattern`. A duplicate or malformed pattern panics.
+  pub def handle[H: Handler](pattern: Str, h: H) {
+    f = ->(w: ResponseWriter, r: Request) { h.serve_http(w, r) }
+    self.handle_func(pattern, f)
+  }
+
+  pub def handle_func(pattern: Str, f: (ResponseWriter, Request) -> Unit) {
+    rt = parse_pattern(pattern, f)
+    st.lock { |s|
+      for old in s.routes {
+        assert old.pattern != pattern, "http: multiple registrations for #{pattern}"
+      }
+      s.routes << rt
+    }
+  }
+
+  # The handler that would run for method and path (for tests): the
+  # matched pattern ("" if none) and the status of the lookup.
+  pub def lookup(method: Str, path: Str) -> (Str, Int) {
+    m = find(method, path)
+    pat = ""
+    if m.code == 0 { pat = m.allow }
+    (pat, m.code)
+  }
+
+  def find(method: Str, path: Str) -> Match {
+    st.lock { |s| route_lookup(s.routes, method, path) }
+  }
+
+  pub def serve_http(w: ResponseWriter, r: Request) {
+    clean = clean_path(r.path)
+    if r.path != "*" && clean != r.path {
+      loc = r.raw_query.size > 0 ? clean + "?" + r.raw_query : clean
+      redirect(w, r, loc, 301)
+      return
+    }
+    m = find(r.method, r.path)
+    if m.code == 0 {
+      rq = r
+      rq.pathvals = m.pvals
+      h = m.handler
+      h(w, rq)
+    } else if m.code == 301 {
+      loc = r.raw_query.size > 0 ? m.location + "?" + r.raw_query : m.location
+      redirect(w, r, loc, 301)
+    } else if m.code == 405 {
+      w.header.set!("Allow", m.allow)
+      error(w, "Method Not Allowed", 405)
+    } else {
+      not_found(w, r)
+    }
+  }
+}
+
+pub def new_serve_mux -> ServeMux {
+  ServeMux.new(st: Mutex.new(MuxState.new(routes: [])))
+}
+
+def noop(w: ResponseWriter, r: Request) {}
+
+def parse_pattern(pattern: Str, f: (ResponseWriter, Request) -> Unit) -> Route {
+  method = ""
+  rest = pattern
+  sp = strings.index_byte(pattern, 32)
+  slash = strings.index_byte(pattern, 47)
+  if sp >= 0 && (slash < 0 || sp < slash) {
+    method = pattern[0...sp]
+    rest = strings.trim_left(pattern[sp + 1...pattern.size], " ")
+  }
+  assert rest.size > 0 && rest[0] == 47, "http: invalid pattern #{pattern} (host patterns are not supported)"
+  parts = strings.split(rest[1...rest.size], "/")
+  segs: [Seg] = []
+  prefix = false
+  i = 0
+  while i < parts.size {
+    p = parts[i]
+    last = i == parts.size - 1
+    if p.size == 0 {
+      assert last, "http: invalid pattern #{pattern} (empty segment)"
+      prefix = true
+    } else if p == "{$}" {
+      assert last, "http: invalid pattern #{pattern} ({$} must be last)"
+      segs << Seg.new(kind: SEG_END, text: "")
+    } else if p.size > 2 && p[0] == 123 && p[p.size - 1] == 125 {
+      name = p[1...p.size - 1]
+      if strings.has_suffix(name, "...") {
+        assert last, "http: invalid pattern #{pattern} (... must be last)"
+        segs << Seg.new(kind: SEG_REST, text: name[0...name.size - 3])
+      } else {
+        segs << Seg.new(kind: SEG_SINGLE, text: name)
+      }
+    } else {
+      assert !strings.contains(p, "{") && !strings.contains(p, "}"), "http: invalid pattern #{pattern}"
+      segs << Seg.new(kind: SEG_LIT, text: p)
+    }
+    i += 1
+  }
+  Route.new(pattern: pattern, method: method, segs: segs, prefix: prefix, handler: f)
+}
+
+# Does the route match the path segments? Fills `pv` with wildcard values.
+def matches?(rt: Route, psegs: [Str], pv: Map[Str, Str]) -> Bool {
+  n = rt.segs.size
+  if n > 0 && rt.segs[n - 1].kind == SEG_REST {
+    return false if psegs.size < n
+  } else if rt.prefix {
+    return false if psegs.size < n + 1
+  } else {
+    return false if psegs.size != n
+  }
+  i = 0
+  while i < n {
+    sg = rt.segs[i]
+    if sg.kind == SEG_LIT {
+      return false if psegs[i] != sg.text
+    } else if sg.kind == SEG_SINGLE {
+      return false if psegs[i].size == 0
+      pv[sg.text] = psegs[i]
+    } else if sg.kind == SEG_END {
+      return false if psegs[i].size != 0
+    } else {
+      pv[sg.text] = strings.join(psegs[i...psegs.size], "/")
+    }
+    i += 1
+  }
+  true
+}
+
+def method_ok?(rt: Route, method: Str) -> Bool {
+  rt.method.size == 0 || rt.method == method || (rt.method == "GET" && method == "HEAD")
+}
+
+# Is a more specific than b (both match the same path)?
+def more_specific?(a: Route, b: Route) -> Bool {
+  n = a.segs.size < b.segs.size ? a.segs.size : b.segs.size
+  i = 0
+  while i < n {
+    return a.segs[i].kind > b.segs[i].kind if a.segs[i].kind != b.segs[i].kind
+    i += 1
+  }
+  return b.prefix if a.prefix != b.prefix
+  return a.segs.size > b.segs.size if a.segs.size != b.segs.size
+  a.method.size > 0 && b.method.size == 0
+}
+
+def route_lookup(routes: [Route], method: Str, path: Str) -> Match {
+  psegs = strings.split(path[1...path.size], "/")
+  best: [Route] = []
+  bpv: Map[Str, Str] = {}
+  allowed: [Str] = []
+  slash_loc = ""
+  for rt in routes {
+    pv: Map[Str, Str] = {}
+    if matches?(rt, psegs, pv) {
+      if method_ok?(rt, method) {
+        if best.size == 0 || more_specific?(rt, best[0]) {
+          best = [rt]
+          bpv = pv
+        }
+      } else if rt.method.size > 0 {
+        allowed << rt.method
+        allowed << "HEAD" if rt.method == "GET"
+      }
+    } else if rt.prefix && slash_loc.size == 0 && !strings.has_suffix(path, "/") && matches?(rt, strings.split(path[1...path.size] + "/", "/"), pv) {
+      slash_loc = path + "/"
+    }
+  }
+  if best.size > 0 {
+    return Match.new(code: 0, handler: best[0].handler, pvals: bpv, allow: best[0].pattern, location: "")
+  }
+  if allowed.size > 0 {
+    slices.sort(allowed)
+    uniq: [Str] = []
+    for a in allowed {
+      uniq << a if uniq.size == 0 || uniq[uniq.size - 1] != a
+    }
+    return Match.new(code: 405, handler: noop, pvals: bpv, allow: strings.join(uniq, ", "), location: "")
+  }
+  if slash_loc.size > 0 {
+    return Match.new(code: 301, handler: noop, pvals: bpv, allow: "", location: slash_loc)
+  }
+  Match.new(code: 404, handler: noop, pvals: bpv, allow: "", location: "")
+}
+
+# Go's path.Clean for a URL path, keeping a trailing slash.
+pub def clean_path(p: Str) -> Str {
+  return "/" if p.size == 0
+  return p if p == "*"
+  trailing = strings.has_suffix(p, "/") && p.size > 1
+  out: [Str] = []
+  for seg in strings.split(p, "/") {
+    next if seg.size == 0 || seg == "."
+    if seg == ".." {
+      out = out[0...out.size - 1] if out.size > 0
+    } else {
+      out << seg
+    }
+  }
+  r = "/" + strings.join(out, "/")
+  r += "/" if trailing && r.size > 1
+  r
+}

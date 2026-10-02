@@ -1,0 +1,272 @@
+import "bufio"
+import "strings"
+import "strconv"
+
+# Limits (the server answers 431 / 413 when a request goes over them).
+pub MAX_HEADER_BYTES = 1048576
+pub MAX_HEADERS = 200
+pub MAX_BODY_BYTES = 33554432
+
+# ----------------------------------------------------------------- Request
+
+# An HTTP request, as the server received it or as the client sends it.
+#
+#  - Server side: `url` is the request target as sent ("/items/7?x=1"),
+#    `path` its decoded path, `raw_query` the part after "?". `body` holds the
+#    whole body (read before the handler runs, up to MAX_BODY_BYTES).
+#  - Client side: `url` is the full URL ("http://host:port/path?q"); `path`
+#    and `raw_query` are filled in by `new_request`.
+pub struct Request {
+  method: Str
+  url: Str
+  path: Str
+  raw_query: Str
+  proto: Str
+  host: Str
+  header: Header
+  body: [Byte]
+  remote_addr: Str
+  # Values of the `{name}` wildcards of the pattern that matched.
+  pathvals: Map[Str, Str]
+
+  # The decoded value of query parameter `key` (the first one), if present.
+  pub def query(key: Str) -> Str? {
+    query_value(raw_query, key)
+  }
+
+  # What the matched pattern captured for `{name}` ("" if there is no such
+  # wildcard).
+  pub def path_value(name: Str) -> Str {
+    v = pathvals[name]
+    if s = v { return s }
+    ""
+  }
+
+  # The body as text.
+  pub def body_string -> Str {
+    Str.from_bytes(body)
+  }
+
+  # A form value: the query first, then a urlencoded body.
+  pub def form_value(key: Str) -> Str? {
+    if v = query(key) { return v }
+    if strings.has_prefix(header.get("Content-Type"), "application/x-www-form-urlencoded") {
+      return query_value(body_string, key)
+    }
+    none
+  }
+
+  pub def user_agent -> Str { header.get("User-Agent") }
+
+  # Whether the client asked to close the connection after this request.
+  def wants_close -> Bool {
+    conn = lower(header.get("Connection"))
+    if proto == "HTTP/1.0" {
+      return !strings.contains(conn, "keep-alive")
+    }
+    strings.contains(conn, "close")
+  }
+}
+
+# A request for `method` and a full "http://host:port/path?q" URL.
+pub def new_request(method: Str, url: Str, body: [Byte]) -> ~Request {
+  u = ~parse_url(url)
+  h = new_header
+  pv: Map[Str, Str] = {}
+  Request.new(method: method, url: url, path: u.path, raw_query: u.raw_query, proto: "HTTP/1.1", host: u.host_header, header: h, body: body, remote_addr: "", pathvals: pv)
+}
+
+# ---------------------------------------------------------------- Response
+
+# An HTTP response as the client sees it.
+pub struct Response {
+  status: Int
+  status_text: Str
+  proto: Str
+  header: Header
+  body: [Byte]
+
+  pub def body_string -> Str {
+    Str.from_bytes(body)
+  }
+
+  # 200 <= status < 300.
+  pub def ok? -> Bool { status >= 200 && status < 300 }
+}
+
+# ----------------------------------------------------------------- parsing
+
+def zeros(n: Int) -> [Byte] {
+  b: [Byte] = [0; n]
+  b
+}
+
+# Reads exactly n bytes.
+def read_n(br: bufio.Reader, n: Int) -> ~[Byte] {
+  buf = zeros(n)
+  got = 0
+  while got < n {
+    k = br.~read!(buf[got...n])
+    fail HttpError.Eof("body") if k == 0
+    got += k
+  }
+  buf
+}
+
+def token_byte?(c: Byte) -> Bool {
+  return true if (c >= 97 && c <= 122) || (c >= 65 && c <= 90) || (c >= 48 && c <= 57)
+  c == 33 || c == 35 || c == 36 || c == 37 || c == 38 || c == 39 || c == 42 || c == 43 || c == 45 || c == 46 || c == 94 || c == 95 || c == 96 || c == 124 || c == 126
+}
+
+def token?(s: Str) -> Bool {
+  return false if s.size == 0
+  for c in s.bytes {
+    return false unless token_byte?(c)
+  }
+  true
+}
+
+# Reads "Key: value" lines up to the blank line into h.
+def read_headers(br: bufio.Reader, h: Header) -> ~Unit {
+  total = 0
+  count = 0
+  loop {
+    ln = br.~read_line!
+    fail HttpError.Eof("headers") unless ln.present?
+    line = ln.unwrap
+    break if line.size == 0
+    total += line.size + 2
+    count += 1
+    fail HttpError.TooLarge("headers") if total > MAX_HEADER_BYTES || count > MAX_HEADERS
+    colon = strings.index_byte(line, 58)
+    fail HttpError.BadRequest("malformed header line") if colon <= 0
+    key = line[0...colon]
+    fail HttpError.BadRequest("invalid header name") unless token?(key)
+    h.add!(key, strings.trim(line[colon + 1...line.size], " \t"))
+  }
+}
+
+# Reads a chunked body (and its trailers, dropped).
+def read_chunked(br: bufio.Reader, limit: Int) -> ~[Byte] {
+  out: [Byte] = []
+  loop {
+    ln = br.~read_line!
+    fail HttpError.Eof("chunk size") unless ln.present?
+    size_s = ln.unwrap
+    if semi = strings.cut(size_s, ";") {
+      size_s, _ = semi
+    }
+    n = strconv.parse_int(strings.trim_space(size_s), 16, 64).unwrap_or(-1)
+    fail HttpError.BadRequest("invalid chunk size") if n < 0
+    if n == 0 {
+      loop {
+        t = br.~read_line!
+        fail HttpError.Eof("chunk trailer") unless t.present?
+        break if t.unwrap.size == 0
+      }
+      return out
+    }
+    fail HttpError.TooLarge("body") if out.size + n > limit
+    data = ~read_n(br, n)
+    for c in data { out << c }
+    crlf = br.~read_line!
+    fail HttpError.BadRequest("missing chunk terminator") unless crlf.present? && crlf.unwrap.size == 0
+  }
+}
+
+# Reads the body described by the headers; `until_eof` is for responses with
+# neither a length nor chunking (read to the end of the stream).
+def read_body(br: bufio.Reader, h: Header, until_eof: Bool) -> ~[Byte] {
+  te = lower(h.get("Transfer-Encoding"))
+  if strings.contains(te, "chunked") {
+    return ~read_chunked(br, MAX_BODY_BYTES)
+  }
+  cl = h.get("Content-Length")
+  if cl.size > 0 {
+    n = strconv.atoi(strings.trim_space(cl)).unwrap_or(-1)
+    fail HttpError.BadRequest("invalid Content-Length") if n < 0
+    fail HttpError.TooLarge("body") if n > MAX_BODY_BYTES
+    return ~read_n(br, n)
+  }
+  out: [Byte] = []
+  return out unless until_eof
+  buf = zeros(4096)
+  loop {
+    k = br.~read!(buf)
+    break if k == 0
+    fail HttpError.TooLarge("body") if out.size + k > MAX_BODY_BYTES
+    i = 0
+    while i < k {
+      out << buf[i]
+      i += 1
+    }
+  }
+  out
+}
+
+# Reads one request from br. none: the peer closed the connection before
+# sending anything. `remote` becomes `remote_addr`.
+def read_request(br: bufio.Reader, remote: Str) -> ~Request? {
+  ln = br.~read_line!
+  return none unless ln.present?
+  line = ln.unwrap
+  # Tolerate blank lines between requests (RFC 9112 2.2).
+  while line.size == 0 {
+    ln = br.~read_line!
+    return none unless ln.present?
+    line = ln.unwrap
+  }
+  fail HttpError.TooLarge("request line") if line.size > bufio.MAX_SCAN_TOKEN_SIZE
+  parts = strings.split(line, " ")
+  fail HttpError.BadRequest("malformed request line") if parts.size != 3
+  method = parts[0]
+  target = parts[1]
+  proto = parts[2]
+  fail HttpError.BadRequest("invalid method") unless token?(method)
+  fail HttpError.BadRequest("unsupported protocol #{proto}") unless proto == "HTTP/1.1" || proto == "HTTP/1.0"
+  fail HttpError.BadRequest("empty request target") if target.size == 0
+  h = new_header
+  ~read_headers(br, h)
+  rawpath = target
+  query = ""
+  host = h.get("Host")
+  if strings.has_prefix(target, "http://") {
+    u = ~parse_url(target)
+    rawpath = u.path.size == 0 ? "/" : u.path
+    query = u.raw_query
+    host = u.host_header
+  } else if target == "*" {
+    rawpath = "*"
+  } else {
+    fail HttpError.BadRequest("invalid request target") if target[0] != 47
+    if pq = strings.cut(target, "?") {
+      rawpath, query = pq
+    }
+  }
+  fail HttpError.BadRequest("missing Host header") if proto == "HTTP/1.1" && host.size == 0
+  path = ~unescape(rawpath, false)
+  body = ~read_body(br, h, false)
+  pv: Map[Str, Str] = {}
+  Request.new(method: method, url: target, path: path, raw_query: query, proto: proto, host: host, header: h, body: body, remote_addr: remote, pathvals: pv)
+}
+
+# Reads one response from br; `head` is true for a reply to HEAD.
+def read_response(br: bufio.Reader, head: Bool) -> ~Response {
+  ln = br.~read_line!
+  fail HttpError.Eof("status line") unless ln.present?
+  line = ln.unwrap
+  parts = strings.split_n(line, " ", 3)
+  fail HttpError.BadResponse("malformed status line") if parts.size < 2
+  proto = parts[0]
+  fail HttpError.BadResponse("unsupported protocol #{proto}") unless strings.has_prefix(proto, "HTTP/1.")
+  code = strconv.atoi(parts[1]).unwrap_or(-1)
+  fail HttpError.BadResponse("invalid status code") if code < 100 || code > 999
+  text = parts.size > 2 ? parts[2] : ""
+  h = new_header
+  ~read_headers(br, h)
+  body: [Byte] = []
+  if !head && code >= 200 && code != 204 && code != 304 {
+    body = ~read_body(br, h, true)
+  }
+  Response.new(status: code, status_text: text, proto: proto, header: h, body: body)
+}

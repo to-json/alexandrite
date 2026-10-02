@@ -1,0 +1,167 @@
+import "bufio"
+import "net"
+import "sync"
+
+extern def alx_sleep_ns(ns: Int)
+
+struct Ctl {
+  shutting: Bool
+  listeners: [net.Listener]
+  # Connections waiting for their next request (shutdown closes them).
+  idle: Map[Int, net.Conn]
+}
+
+# An HTTP/1.1 server: one task per connection, keep-alive, a handler per
+# request.
+#
+# A Server is a handle (every field is shared state), so one task can run
+# `serve` while another calls `shutdown`. The handler is copied into each
+# connection's task: state it needs to share across requests belongs in a
+# Mutex, an Atomic or a channel, not in captured variables.
+#
+# Gaps: no read/write timeouts (the net package has no deadlines), no TLS, no
+# HTTP/2, no hijacking, no streaming of request bodies (a body is read in full
+# before the handler runs), no `Expect: 100-continue`. A handler that panics
+# kills its connection's task, not the server; the connection is not closed and
+# `shutdown` will wait for it.
+pub struct Server {
+  mux: ServeMux
+  ctl: Mutex[Ctl]
+  wg: sync.WaitGroup
+
+  # Accepts connections on `ln` until `shutdown` (then returns ok) or the
+  # listener fails.
+  pub def serve(ln: net.Listener) -> ~Unit {
+    ctl.lock { |c| c.listeners << ln }
+    loop {
+      accepted = ln.accept
+      if e = accepted.err {
+        return if shutting? || net.is_closed(e)
+        # Likely out of descriptors: back off briefly, as Go does.
+        alx_sleep_ns(5000000)
+        next
+      }
+      conn = accepted.unwrap
+      wg.add(1)
+      s = self
+      spawn { serve_conn(conn, s) }
+    }
+  }
+
+  # Listens on addr ("host:port") and serves.
+  pub def listen_and_serve(addr: Str) -> ~Unit {
+    ln = ~net.listen("tcp", addr)
+    self.~serve(ln)
+  }
+
+  def shutting? -> Bool {
+    ctl.lock { |c| c.shutting }
+  }
+
+  # Stops accepting, closes idle keep-alive connections, and waits for the
+  # requests in flight to finish (their connections close afterwards).
+  pub def shutdown {
+    todo_l: [net.Listener] = []
+    todo_c: [net.Conn] = []
+    ctl.lock { |c|
+      c.shutting = true
+      for l in c.listeners { todo_l << l }
+      c.listeners = []
+      for _, cn in c.idle { todo_c << cn }
+      c.idle = {}
+    }
+    for l in todo_l { l.close! }
+    for cn in todo_c { cn.close! }
+    wg.wait
+  }
+}
+
+def new_server_mux(mux: ServeMux) -> Server {
+  c = Ctl.new(shutting: false, listeners: [], idle: {})
+  Server.new(mux: mux, ctl: Mutex.new(c), wg: sync.new_wait_group)
+}
+
+# A server for the mux's routes. (The mux is a handle: routes registered
+# later are served too.)
+pub def new_server(mux: ServeMux) -> Server {
+  new_server_mux(mux)
+}
+
+# A server for any Handler (it answers every path).
+pub def new_server_handler[H: Handler](h: H) -> Server {
+  mux = new_serve_mux
+  mux.handle("/", h)
+  new_server_mux(mux)
+}
+
+# A server for a handler function (it answers every path).
+pub def new_server_func(f: (ResponseWriter, Request) -> Unit) -> Server {
+  mux = new_serve_mux
+  mux.handle_func("/", f)
+  new_server_mux(mux)
+}
+
+# Serves `h` on an existing listener until it is closed.
+pub def serve(ln: net.Listener, mux: ServeMux) -> ~Unit {
+  s = new_server(mux)
+  s.~serve(ln)
+}
+
+# Listens on addr and serves `h`.
+pub def listen_and_serve(addr: Str, mux: ServeMux) -> ~Unit {
+  s = new_server(mux)
+  s.~listen_and_serve(addr)
+}
+
+def bad_status(e: Error) -> Int {
+  case e {
+    BadRequest => 400
+    TooLarge(w) => w == "headers" || w == "request line" ? 431 : 413
+    _ => 0
+  }
+}
+
+def write_error_reply(conn: net.Conn, code: Int, why: Str) {
+  body = "#{code} #{status_text(code)}: #{why}\n"
+  head = "HTTP/1.1 #{code} #{status_text(code)}\r\nContent-Type: text/plain; charset=utf-8\r\nConnection: close\r\nContent-Length: #{body.size}\r\n\r\n"
+  conn.write_string!(head + body)
+}
+
+def serve_conn(conn: net.Conn, srv: Server) {
+  defer srv.wg.done
+  defer conn.close!
+  conn.set_nodelay(true)
+  br = bufio.new_reader(conn)
+  fd = conn.fd
+  loop {
+    res = read_request(br, conn.remote_addr)
+    if e = res.err {
+      code = bad_status(e)
+      write_error_reply(conn, code, e.message) if code > 0
+      break
+    }
+    opt = res.unwrap
+    break unless opt.present?
+    req = opt.unwrap
+    srv.ctl.lock { |c| c.idle.delete(fd) }
+    http10 = req.proto == "HTTP/1.0"
+    w = new_response_writer(conn, req.method == "HEAD", !http10, req.wants_close || srv.shutting?)
+    srv.mux.serve_http(w, req)
+    done = w.finish!
+    break if done.err?
+    break unless done.unwrap
+    # Wait for the next request; shutdown closes us while we wait.
+    if br.buffered == 0 {
+      stop = srv.ctl.lock { |c|
+        if c.shutting {
+          true
+        } else {
+          c.idle[fd] = conn
+          false
+        }
+      }
+      break if stop
+    }
+  }
+  srv.ctl.lock { |c| c.idle.delete(fd) }
+}

@@ -1,0 +1,224 @@
+import "net"
+import "strings"
+
+def hello(w: ResponseWriter, r: Request) -> Unit {
+  w.write_string!("hello").unwrap
+}
+
+def item(w: ResponseWriter, r: Request) -> Unit {
+  w.header.set!("X-Item", r.path_value("id"))
+  w.write_string!("item #{r.path_value("id")} q=#{r.query("q") || "-"}").unwrap
+}
+
+def echo_post(w: ResponseWriter, r: Request) -> Unit {
+  w.write_header!(201)
+  w.write_string!("got #{r.body.size}: #{r.body_string}").unwrap
+}
+
+def big(w: ResponseWriter, r: Request) -> Unit {
+  line = strings.repeat("0123456789abcdef", 8)
+  i = 0
+  while i < 1000 {
+    w.write_string!(line).unwrap
+    i += 1
+  }
+}
+
+def streamed(w: ResponseWriter, r: Request) -> Unit {
+  w.write_string!("one,").unwrap
+  w.flush!.unwrap
+  w.write_string!("two,").unwrap
+  w.flush!.unwrap
+  w.write_string!("three").unwrap
+}
+
+def test_mux -> ServeMux {
+  mux = new_serve_mux
+  mux.handle_func("GET /hello", hello)
+  mux.handle_func("GET /items/{id}", item)
+  mux.handle_func("POST /items", echo_post)
+  mux.handle_func("GET /big", big)
+  mux.handle_func("GET /stream", streamed)
+  mux.handle_func("/inline") { |w, r|
+    w.header.set!("Content-Type", "application/json")
+    w.write_string!("{\"ok\":true}").unwrap
+  }
+  mux
+}
+
+# Starts a server for `mux` on a free port; returns the server and the port.
+def start(mux: ServeMux) -> (Server, Int) {
+  srv = new_server(mux)
+  ln = net.listen("tcp", "127.0.0.1:0").unwrap
+  port = ln.port
+  spawn { srv.serve(ln) }
+  (srv, port)
+}
+
+def url(port: Int, path: Str) -> Str {
+  "http://127.0.0.1:#{port}#{path}"
+}
+
+test "get, path values and query" {
+  srv, port = start(test_mux())
+  r = get(url(port, "/hello")).unwrap
+  assert_eq r.status, 200
+  assert_eq r.body_string, "hello"
+  assert_eq r.header.get("content-length"), "5"
+  assert_eq r.header.get("Content-Type"), "text/plain; charset=utf-8"
+  r = get(url(port, "/items/42?q=a%20b")).unwrap
+  assert_eq r.body_string, "item 42 q=a b"
+  assert_eq r.header.get("X-Item"), "42"
+  r = get(url(port, "/inline")).unwrap
+  assert_eq r.header.get("Content-Type"), "application/json"
+  srv.shutdown
+}
+
+test "post with a body" {
+  srv, port = start(test_mux())
+  r = post(url(port, "/items"), "text/plain", "some data").unwrap
+  assert_eq r.status, 201
+  assert_eq r.body_string, "got 9: some data"
+  srv.shutdown
+}
+
+test "404 and 405" {
+  srv, port = start(test_mux())
+  r = get(url(port, "/nope")).unwrap
+  assert_eq r.status, 404
+  assert_eq r.body_string, "404 page not found\n"
+  r = post(url(port, "/hello"), "text/plain", "x").unwrap
+  assert_eq r.status, 405
+  assert_eq r.header.get("Allow"), "GET, HEAD"
+  srv.shutdown
+}
+
+test "large and streamed responses are chunked" {
+  srv, port = start(test_mux())
+  r = get(url(port, "/big")).unwrap
+  assert_eq r.status, 200
+  assert_eq r.body.size, 128000
+  assert_eq r.header.get("Transfer-Encoding"), "chunked"
+  assert_eq r.header.get("Content-Length"), ""
+  r = get(url(port, "/stream")).unwrap
+  assert_eq r.body_string, "one,two,three"
+  assert_eq r.header.get("Transfer-Encoding"), "chunked"
+  srv.shutdown
+}
+
+test "head has no body" {
+  srv, port = start(test_mux())
+  r = head(url(port, "/hello")).unwrap
+  assert_eq r.status, 200
+  assert_eq r.body.size, 0
+  assert_eq r.header.get("Content-Length"), "5"
+  srv.shutdown
+}
+
+# Reads one response from a raw connection (length-framed only).
+def read_resp(br: bufio.Reader) -> Response {
+  read_response(br, false).unwrap
+}
+
+test "keep-alive: several requests on one connection" {
+  srv, port = start(test_mux())
+  c = net.dial("tcp", "127.0.0.1:#{port}").unwrap
+  br = bufio.new_reader(c)
+  i = 0
+  while i < 5 {
+    c.write_string!("GET /items/#{i} HTTP/1.1\r\nHost: x\r\n\r\n").unwrap
+    r = read_resp(br)
+    assert_eq r.status, 200
+    assert_eq r.body_string, "item #{i} q=-"
+    assert_eq r.header.get("Connection"), ""
+    i += 1
+  }
+  # Pipelined: two requests in one write.
+  c.write_string!("GET /hello HTTP/1.1\r\nHost: x\r\n\r\nGET /hello HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n").unwrap
+  assert_eq read_resp(br).body_string, "hello"
+  last = read_resp(br)
+  assert_eq last.body_string, "hello"
+  assert_eq last.header.get("Connection"), "close"
+  buf: [Byte] = [0; 16]
+  assert_eq br.read!(buf).unwrap, 0
+  c.close!.unwrap
+  srv.shutdown
+}
+
+test "malformed requests get 400" {
+  srv, port = start(test_mux())
+  bads = [
+    "GARBAGE\r\n\r\n",
+    "GET /x HTTP/9.9\r\nHost: x\r\n\r\n",
+    "GET /x HTTP/1.1\r\n\r\n",
+    "GET /x HTTP/1.1\r\nHost: x\r\nbroken header\r\n\r\n",
+    "GET /x HTTP/1.1\r\nHost: x\r\nContent-Length: abc\r\n\r\n",
+    "GET /%zz HTTP/1.1\r\nHost: x\r\n\r\n",
+    "GET x HTTP/1.1\r\nHost: x\r\n\r\n"
+  ]
+  for b in bads {
+    c = net.dial("tcp", "127.0.0.1:#{port}").unwrap
+    br = bufio.new_reader(c)
+    c.write_string!(b).unwrap
+    r = read_resp(br)
+    assert_eq r.status, 400
+    assert_eq r.header.get("Connection"), "close"
+    c.close!.unwrap
+  }
+  # The server is still fine.
+  assert_eq get(url(port, "/hello")).unwrap.status, 200
+  srv.shutdown
+}
+
+test "truncated request and abrupt close do not hurt the server" {
+  srv, port = start(test_mux())
+  c = net.dial("tcp", "127.0.0.1:#{port}").unwrap
+  c.write_string!("POST /items HTTP/1.1\r\nHost: x\r\nContent-Length: 100\r\n\r\nshort").unwrap
+  c.close!.unwrap
+  c2 = net.dial("tcp", "127.0.0.1:#{port}").unwrap
+  c2.close!.unwrap
+  assert_eq get(url(port, "/hello")).unwrap.status, 200
+  srv.shutdown
+}
+
+test "chunked request body" {
+  srv, port = start(test_mux())
+  c = net.dial("tcp", "127.0.0.1:#{port}").unwrap
+  br = bufio.new_reader(c)
+  c.write_string!("POST /items HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n6;ext=1\r\n world\r\n0\r\n\r\n").unwrap
+  r = read_resp(br)
+  assert_eq r.status, 201
+  assert_eq r.body_string, "got 11: hello world"
+  c.close!.unwrap
+  srv.shutdown
+}
+
+test "concurrent clients" {
+  srv, port = start(test_mux())
+  ts = (1..20).map { |i|
+    spawn {
+      ok = 0
+      j = 0
+      while j < 5 {
+        r = get("http://127.0.0.1:#{port}/items/#{i}").unwrap
+        ok += 1 if r.body_string == "item #{i} q=-"
+        j += 1
+      }
+      ok
+    }
+  }.to_a
+  assert_eq ts.sum { it.wait.unwrap }, 100
+  srv.shutdown
+}
+
+test "shutdown closes idle connections and refuses new ones" {
+  srv, port = start(test_mux())
+  c = net.dial("tcp", "127.0.0.1:#{port}").unwrap
+  br = bufio.new_reader(c)
+  c.write_string!("GET /hello HTTP/1.1\r\nHost: x\r\n\r\n").unwrap
+  assert_eq read_resp(br).status, 200
+  srv.shutdown
+  buf: [Byte] = [0; 16]
+  assert_eq br.read!(buf).unwrap_or(0), 0
+  assert get(url(port, "/hello")).err?
+}

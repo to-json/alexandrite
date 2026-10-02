@@ -443,7 +443,10 @@ pub fn check_program(l: &Loaded, externs: Vec<DefInfo>) -> Result<TProgram, Diag
     for f in &funcs {
         prove::prove(f, &l.sm)?;
     }
-    Ok(TProgram { funcs, main, ifaces, stringers, errors, messages, warnings })
+    let mut p = TProgram { funcs, main, ifaces, stringers, errors, messages, warnings };
+    // R5: lambdas see the variables they capture, not copies.
+    crate::capture::convert(&mut p);
+    Ok(p)
 }
 
 /// Kept for callers of the old library interface: packages are now

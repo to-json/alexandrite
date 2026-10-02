@@ -78,6 +78,8 @@ GROUPS = {
     "refinements": "M6",
     "concurrency": "M7",
     "regions": "R1",
+    "closures": "R4",
+    "writers": "R4",
     "asserts": "M8",
 }
 
@@ -166,7 +168,7 @@ def negative_runtime(case, group):
 def memory():
     """R1: call- and loop-heavy programs run in bounded memory (release builds)."""
     d = CASES / "mem"
-    for prog, want in [("calls.alx", "12588314"), ("loops.alx", "1000000")]:
+    for prog, want in [("calls.alx", "12588314"), ("loops.alx", "1000000"), ("fill.alx", "140000")]:
         r, _ = run([ALX, "build", "--release", prog], cwd=d)
         binary = r.stdout.strip()
         r2, _ = run([binary], cwd=d, env={"ALX_MEMSTATS": "1"})

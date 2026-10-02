@@ -3,6 +3,7 @@
 //! wasm32 (the in-browser compiler in `web/`). The native driver and the
 //! Cranelift JIT live in the `alx` binary.
 pub mod ast;
+pub mod capture;
 pub mod cgen;
 pub mod check;
 pub mod consts;

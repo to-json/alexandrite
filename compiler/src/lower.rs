@@ -653,8 +653,13 @@ impl<'a> Lw<'a> {
                         Place::Iter(k) => LE::Var(self.iter_vars[&k].0),
                         Place::Frame => LE::Var(frame),
                         Place::Ret => LE::Var(dest),
-                        Place::Into(_) => match self.into.last() {
+                        Place::Into(p) => match self.into.last() {
                             Some(r) => LE::Var(*r),
+                            // Where the parameter's own storage lives.
+                            None if matches!(self.lty(&self.f.locals[p].ty), LTy::Arr(_) | LTy::Str) => {
+                                let v = self.var_of(p);
+                                LE::RegionOf(Box::new(LE::Var(v)))
+                            }
                             None => LE::RegionProgram,
                         },
                         Place::Global => LE::RegionProgram,
@@ -2289,6 +2294,52 @@ impl<'a> Lw<'a> {
                     vals.push(if j == k { v.clone() } else { zero_le(t) });
                 }
                 LE::Tup(lt, vals)
+            }
+            IfaceCall(mi) if matches!(recv.unwrap().ty, Ty::Array(_)) => {
+                // A `!` method: the receiver is a one-element slice holding the
+                // interface value; each implementor's method gets a slice of its
+                // own type (in the same region), which is written back.
+                let r = recv.unwrap();
+                let Ty::Array(it) = &r.ty else { unreachable!() };
+                let Ty::Iface(iname) = &**it else { unreachable!() };
+                let impls = self.p.ifaces.get(iname).cloned().unwrap_or_default();
+                let TK::Local(tl) = r.kind else { unreachable!("the receiver is a temporary") };
+                let tv = self.var_of(tl);
+                let mut avs = vec![];
+                for a in args {
+                    let v = self.arg(a);
+                    avs.push(self.bind(v, self.lty(&a.ty)));
+                }
+                let rt = self.lty(&e.ty);
+                let out = if rt == LTy::Unit { None } else { Some(self.tmp(rt.clone())) };
+                if let Some(o) = out {
+                    self.emit(LS::Set(o, zero_le(&rt)));
+                }
+                let held = LE::Index { arr: Box::new(LE::Var(tv)), idx: Box::new(LE::I(0)), check: None };
+                let tag = LE::Field(Box::new(held.clone()), 0);
+                for (k, (ty, fids)) in impls.iter().enumerate() {
+                    let ct = self.lty(ty);
+                    let cell = self.tmp(LTy::Arr(Box::new(ct.clone())));
+                    let f = self.p.funcs[fids[mi]].cname.clone();
+                    let body = self.sub(|lw| {
+                        let saved = lw.tmp(LTy::Region);
+                        lw.emit(LS::RegionUse { region: LE::RegionOf(Box::new(LE::Var(tv))), saved });
+                        lw.emit(LS::Set(cell, LE::ArrLit(ct.clone(), vec![LE::Field(Box::new(held.clone()), k + 1)])));
+                        lw.emit(LS::RegionRestore(saved));
+                        let call = LE::Call(f.clone(), std::iter::once(LE::Var(cell)).chain(avs.iter().cloned()).collect());
+                        match out {
+                            Some(o) => lw.emit(LS::Set(o, call)),
+                            None => lw.emit(LS::Eval(call)),
+                        }
+                        let back = LE::Index { arr: Box::new(LE::Var(cell)), idx: Box::new(LE::I(0)), check: None };
+                        lw.emit(LS::SetPlace { var: tv, steps: vec![crate::lir::Step::Index(LE::I(0), None), crate::lir::Step::Field(k + 1)], val: back });
+                    });
+                    self.emit(LS::If(LE::Cmp(Op::Eq, Box::new(tag.clone()), Box::new(LE::I(k as i64)), LTy::I64), body, vec![]));
+                }
+                match out {
+                    Some(o) => LE::Var(o),
+                    None => LE::Unit,
+                }
             }
             IfaceCall(mi) => {
                 let r = recv.unwrap();

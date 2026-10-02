@@ -376,9 +376,6 @@ impl<'a> World<'a> {
         {
             let mut ms = vec![];
             for (name, params, ret, default, span) in &d.methods {
-                if name.ends_with('!') {
-                    return Err(Diag::new(*span, "interface methods can't mutate their receiver yet (`!`)"));
-                }
                 let mut ps = vec![];
                 for p in params {
                     let Some(t) = &p.ty else {
@@ -427,7 +424,9 @@ impl<'a> World<'a> {
                 self.impls.get_mut(iface).unwrap().pop();
                 return Err(Diag::new(sp, format!("{tn}.{} takes {} argument(s), but {iface}.{} takes {}", m.name, nparams - 1, m.name, m.params.len())));
             }
-            let args: Vec<Ty> = std::iter::once(t.clone()).chain(m.params.iter().cloned()).collect();
+            // A `!` method gets its receiver in a one-element slice.
+            let me = if m.name.ends_with('!') { Ty::arr(t.clone()) } else { t.clone() };
+            let args: Vec<Ty> = std::iter::once(me).chain(m.params.iter().cloned()).collect();
             let fid = self.instance(def, args, sp)?;
             let ret = match &self.funcs[fid] {
                 Some(f) => f.ret.clone(),
@@ -2743,6 +2742,36 @@ impl<'w, 'a> FnCx<'w, 'a> {
         Ok(self.mk(TK::Seq(vec![s1, s2, TStmt::Expr(wb), TStmt::Expr(r)]), rty, sp))
     }
 
+    /// `w.m!(args)` where `w` is an interface value in a place: dispatch on
+    /// a one-element slice holding the value, then write it back.
+    fn mutating_iface_call(&mut self, recv: &Expr, iname: &str, k: usize, m: &IfaceMethod, args: &[Expr], sp: Span) -> R<TExpr> {
+        let (id, steps, pty) = self.place(recv)?;
+        let cur = self.place_read(id, &steps, &pty, recv.span);
+        let arr = self.mk(TK::Array(vec![cur]), Ty::arr(pty.clone()), recv.span);
+        let (tid, s1) = self.opt_tmp(arr, recv.span);
+        if args.len() != m.params.len() {
+            return Err(Diag::new(sp, format!("`{iname}.{}` takes {} argument(s), got {}", m.name, m.params.len(), args.len())));
+        }
+        let mut targs = vec![];
+        for (a, pt) in args.iter().zip(&m.params) {
+            let v = self.value(a)?;
+            let v = self.coerce(v, pt)?;
+            self.expect(&v.ty, pt, v.span, "argument")?;
+            targs.push(v);
+        }
+        self.impure = true;
+        let tl = self.mk(TK::Local(tid), Ty::arr(pty.clone()), sp);
+        let call = self.mk(TK::M(M::IfaceCall(k), Some(Box::new(tl)), targs, None), m.ret.clone(), sp);
+        let rty = call.ty.clone();
+        let (rid, s2) = self.opt_tmp(call, sp);
+        let tl = self.mk(TK::Local(tid), Ty::arr(pty.clone()), sp);
+        let z = self.mk(TK::Int(0), Ty::Int, sp);
+        let back = self.mk(TK::Index(Box::new(tl), Box::new(z)), pty.clone(), sp);
+        let wb = if steps.is_empty() { self.mk(TK::Assign(id, Box::new(back)), pty, sp) } else { self.mk(TK::PlaceAssign(id, steps, None, Box::new(back)), pty, sp) };
+        let r = self.mk(TK::Local(rid), rty.clone(), sp);
+        Ok(self.mk(TK::Seq(vec![s1, s2, TStmt::Expr(wb), TStmt::Expr(r)]), rty, sp))
+    }
+
     /// The type of a local or a field path, without checking anything.
     fn peek_ty(&self, e: &Expr) -> Option<Ty> {
         if let Some(f) = self.self_field(e) {
@@ -3250,6 +3279,13 @@ impl<'w, 'a> FnCx<'w, 'a> {
                 ExprKind::Name(n) if n == "self" && self.method.is_some() => self.self_struct(),
                 _ => self.peek_ty(recv),
             };
+            if let Some(Ty::Iface(iname)) = &st {
+                // `w.write!(x)` on an interface value: the value is a place too.
+                let ms = self.w.ifaces[iname].clone();
+                if let Some(k) = ms.iter().position(|m| m.name == name) {
+                    return self.mutating_iface_call(recv, iname, k, &ms[k], args, sp);
+                }
+            }
             if let Some(sn) = st.as_ref().and_then(|t| t.type_name()) {
                 if let Some(&def) = self.w.by_name.get(&method_name(sn, name)) {
                     if block.is_some() {

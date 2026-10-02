@@ -1651,3 +1651,31 @@ void alx_sleep_ns(int64_t ns) {
     pthread_mutex_unlock(&g_mu);
     sw_out(p->task, false);
 }
+
+/* ---------- clocks (time) ---------- */
+
+/* Wall clock: nanoseconds since 1970-01-01 UTC. */
+int64_t alx_wall_ns(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    return (int64_t)ts.tv_sec * 1000000000 + ts.tv_nsec;
+}
+
+/* Monotonic clock: nanoseconds from an arbitrary start (for durations). */
+int64_t alx_mono_ns(void) { return mono_ns(); }
+
+/* The local time zone's offset from UTC, in seconds, at this Unix time. */
+int64_t alx_local_offset(int64_t unix_sec) {
+    time_t t = (time_t)unix_sec;
+    struct tm tm;
+    if (!localtime_r(&t, &tm)) return 0;
+    return (int64_t)tm.tm_gmtoff;
+}
+
+/* The local zone's abbreviation at this Unix time ("CET", "PDT"). */
+const char *alx_local_zone(int64_t unix_sec) {
+    time_t t = (time_t)unix_sec;
+    struct tm tm;
+    if (!localtime_r(&t, &tm) || !tm.tm_zone) return "UTC";
+    return tm.tm_zone;
+}

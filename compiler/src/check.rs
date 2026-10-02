@@ -3991,7 +3991,51 @@ impl<'w, 'a> FnCx<'w, 'a> {
     }
 
     #[allow(clippy::too_many_arguments)]
+    /// A method call; when the receiver's type has no such method, a
+    /// function of an imported standard package whose first parameter takes
+    /// the receiver (S2's method sugar: `s.has_prefix(p)` for
+    /// `strings.has_prefix(s, p)`).
     fn method(&mut self, recv: TExpr, name: &str, name_span: Span, args: &[Expr], block: Option<&Block>, bsym: Option<&(String, Span)>, sp: Span) -> R<TExpr> {
+        match self.method_builtin(recv.clone(), name, name_span, args, block, bsym, sp) {
+            Err(d) if d.msg.starts_with(&format!("no method `{name}`")) && block.is_none() && bsym.is_none() => {
+                let rt = self.resolve(&recv.ty);
+                let Some(def) = self.std_sugar(&rt, name)? else { return Err(d) };
+                let mut targs = vec![recv];
+                for a in args {
+                    targs.push(self.value(a)?);
+                }
+                self.call_def(def, name, name_span, targs, sp)
+            }
+            r => r,
+        }
+    }
+
+    /// The imported standard-package function `name` whose first parameter
+    /// takes a `t`.
+    fn std_sugar(&self, t: &Ty, name: &str) -> R<Option<usize>> {
+        let pkg = current_pkg();
+        let mut imports: Vec<(String, String)> = PKGS.with(|p| p.borrow().0.get(&pkg).map(|m| m.iter().map(|(a, p)| (a.clone(), p.clone())).collect()).unwrap_or_default());
+        imports.sort();
+        for (alias, path) in imports.iter().filter(|(_, p)| crate::front::is_std(p)) {
+            let Some(&def) = self.w.by_name.get(&format!("{path}.{name}")) else { continue };
+            let d = &self.w.defs[def].def;
+            if !d.public {
+                continue;
+            }
+            let fits = match d.params.first().and_then(|p| p.ty.as_ref()) {
+                None => false,
+                Some(_) if !d.tparams.is_empty() => true,
+                Some(te) => type_from(te, &self.w.structs, &self.w.consts).is_ok_and(|pt| pt == *t),
+            };
+            if fits {
+                USED.with(|u| u.borrow_mut().insert((pkg.clone(), alias.clone())));
+                return Ok(Some(def));
+            }
+        }
+        Ok(None)
+    }
+
+    fn method_builtin(&mut self, recv: TExpr, name: &str, name_span: Span, args: &[Expr], block: Option<&Block>, bsym: Option<&(String, Span)>, sp: Span) -> R<TExpr> {
         let rt = self.resolve(&recv.ty);
         if let Ty::Var(_) = rt {
             if self.strict {

@@ -187,6 +187,36 @@ fn load_mods(dir: &Path, read: ReadFn) -> Result<Mods, Diag> {
     Ok(Mods { root, module: main.module, deps })
 }
 
+/// The standard library's packages, embedded in the compiler.
+mod stdlib {
+    include!(concat!(env!("OUT_DIR"), "/std_files.rs"));
+}
+
+/// Where the embedded standard library appears as a directory.
+pub const STD_DIR: &str = "$std";
+
+/// The files of an embedded std package directory.
+fn std_list(dir: &Path) -> Option<Vec<PathBuf>> {
+    let rel = dir.strip_prefix(STD_DIR).ok()?.to_string_lossy().replace('\\', "/");
+    let fs: Vec<PathBuf> = stdlib::STD
+        .iter()
+        .filter(|(p, _)| p.rsplit_once('/').map(|(d, _)| d) == Some(rel.as_str()))
+        .map(|(p, _)| Path::new(STD_DIR).join(p))
+        .collect();
+    Some(fs)
+}
+
+fn std_read(f: &Path) -> Option<String> {
+    let rel = f.strip_prefix(STD_DIR).ok()?.to_string_lossy().replace('\\', "/");
+    stdlib::STD.iter().find(|(p, _)| *p == rel).map(|(_, t)| t.to_string())
+}
+
+/// Is `path` a package of the standard library?
+pub fn is_std(path: &str) -> bool {
+    let pre = format!("{path}/");
+    stdlib::STD.iter().any(|(p, _)| p.strip_prefix(&pre).is_some_and(|f| !f.contains('/')))
+}
+
 /// Where an import path lives: inside the main module (its module path
 /// prefix optional, or relative to the root), or inside the required module
 /// with the longest matching path.
@@ -210,6 +240,8 @@ fn pkg_dir(path: &str, imp: &Import, mods: &Mods, list: &dyn Fn(&Path) -> std::i
             Ok(dir.join(path[m.len()..].trim_start_matches('/')))
         }
         None if path.split('/').next().is_some_and(|s| s.contains('.')) => Err(Diag::new(imp.span, format!("no required module provides package `{path}`; add `require <module> <version>` to alx.mod"))),
+        // The module's own directory wins; otherwise the standard library.
+        None if is_std(path) && !list(&mods.root.join(path)).is_ok_and(|fs| fs.iter().any(|f| f.extension().is_some_and(|e| e == "alx"))) => Ok(Path::new(STD_DIR).join(path)),
         None => Ok(mods.root.join(path)),
     }
 }
@@ -272,7 +304,7 @@ fn load_pkg(
         return Err(Diag::new(imp.span, format!("import cycle: {} -> {path}", visiting.join(" -> "))));
     }
     let dir = pkg_dir(&path, imp, mods, list)?;
-    let files: Vec<PathBuf> = match list(&dir) {
+    let files: Vec<PathBuf> = match std_list(&dir).map(Ok).unwrap_or_else(|| list(&dir)) {
         Ok(fs) => fs.into_iter().filter(|f| f.extension().is_some_and(|e| e == "alx") && !f.to_string_lossy().ends_with("_test.alx")).collect(),
         Err(_) => vec![],
     };
@@ -283,9 +315,15 @@ fn load_pkg(
     let mut merged: Option<Module> = None;
     let mut source = String::new();
     for f in &files {
-        let text = read(f).map_err(|e| Diag::new(imp.span, format!("cannot read `{}`: {e}", f.display())))?;
+        let text = match std_read(f) {
+            Some(t) => t,
+            None => read(f).map_err(|e| Diag::new(imp.span, format!("cannot read `{}`: {e}", f.display())))?,
+        };
         source.push_str(&text);
-        let shown = shown_root.join(f.strip_prefix(&mods.root).unwrap_or(f)).display().to_string();
+        let shown = match f.strip_prefix(STD_DIR) {
+            Ok(rel) => format!("std/{}", rel.display()),
+            Err(_) => shown_root.join(f.strip_prefix(&mods.root).unwrap_or(f)).display().to_string(),
+        };
         let m = parse_file(sm, shown, text, next_id)?;
         if let Some(s) = m.main.first() {
             return Err(Diag::new(s.span, format!("a package (`{path}`) holds only declarations; move statements into a def")));

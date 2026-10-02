@@ -1,5 +1,7 @@
-//! Links the C runtime into `alx` itself, for the JIT behind `alx run`.
+//! Links the C runtime into `alx` itself, for the JIT behind `alx run`,
+//! and embeds the standard library's packages (`std/`).
 fn main() {
+    embed_std();
     if std::env::var("CARGO_CFG_TARGET_ARCH").as_deref() == Ok("wasm32") {
         return;
     }
@@ -16,4 +18,31 @@ fn main() {
         .flag("-w")
         .opt_level(2)
         .compile("alxrt");
+}
+
+/// `STD`: every `.alx` file under `std/`, as (path inside std, source).
+fn embed_std() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../std");
+    println!("cargo:rerun-if-changed={}", root.display());
+    let mut files = vec![];
+    let mut dirs = vec![root.clone()];
+    while let Some(d) = dirs.pop() {
+        for e in std::fs::read_dir(&d).into_iter().flatten().flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                dirs.push(p);
+            } else if p.extension().is_some_and(|x| x == "alx") {
+                files.push(p);
+            }
+        }
+    }
+    files.sort();
+    let mut out = String::from("pub static STD: &[(&str, &str)] = &[\n");
+    for f in &files {
+        let rel = f.strip_prefix(&root).unwrap().to_string_lossy().replace('\\', "/");
+        out.push_str(&format!("    ({rel:?}, include_str!({:?})),\n", f.canonicalize().unwrap()));
+    }
+    out.push_str("];\n");
+    let dst = std::path::Path::new(&std::env::var("OUT_DIR").unwrap()).join("std_files.rs");
+    std::fs::write(dst, out).unwrap();
 }

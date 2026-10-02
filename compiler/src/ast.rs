@@ -218,6 +218,21 @@ pub fn refine_def_name(refinement: &str, target: &str, m: &str) -> String {
     format!("{refinement}@{target}#{m}")
 }
 
+#[derive(Debug, Clone)]
+pub enum SelOp {
+    /// `when v = ch.recv` (v is a T?, none once closed) / `when ch.recv`.
+    Recv(Option<(String, Span)>, Expr),
+    /// `when ch.send(x)` / `when ch << x`.
+    Send(Expr, Expr),
+}
+
+#[derive(Debug, Clone)]
+pub struct SelArm {
+    pub op: SelOp,
+    pub body: Vec<Stmt>,
+    pub span: Span,
+}
+
 /// Methods are defs named `Type.name` whose first parameter is `self`.
 /// In a `!` method `self` is a one-element slice holding the receiver, so
 /// writes reach the caller (Go's pointer receiver).
@@ -409,6 +424,10 @@ pub enum ExprKind {
     ArrayRepeat(Box<Expr>, Box<Expr>),
     /// `->(x: T) -> R { body }`: a lambda (escapes; captures copies).
     Lambda(Vec<Param>, Option<TypeExpr>, Box<Block>),
+    /// `spawn { body }` / `spawn f(x)`: start a task (a `Task[T]`).
+    Spawn(Box<Block>),
+    /// `select { when v = ch.recv => ...; when ch.send(x) => ...; else => ... }`
+    Select(Vec<SelArm>, Option<Vec<Stmt>>),
     /// `Stack[Int]` before `.new`: a generic type with explicit arguments.
     TypeApp(String, Vec<TypeExpr>),
     /// `{k => v, ...}` / `{name: v}` (a Str key) / `{}`

@@ -74,6 +74,22 @@ fn each_child(e: &TExpr, f: &mut dyn FnMut(&TExpr)) {
             f(a);
             f(b);
         }
+        TK::Select(arms, d) => {
+            for a in arms {
+                match a {
+                    TSelArm::Recv { ch, body, .. } => {
+                        f(ch);
+                        body.iter().for_each(|s| stmt_exprs(s, f));
+                    }
+                    TSelArm::Send { ch, val, body } => {
+                        f(ch);
+                        f(val);
+                        body.iter().for_each(|s| stmt_exprs(s, f));
+                    }
+                }
+            }
+            d.iter().flatten().for_each(|s| stmt_exprs(s, f));
+        }
         TK::Slice(a, lo, hi, _) => {
             f(a);
             lo.iter().chain(hi.iter()).for_each(|x| f(x));

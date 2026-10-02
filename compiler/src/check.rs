@@ -310,6 +310,7 @@ impl<'a> World<'a> {
             ("IoError", vec![s("NotFound"), s("Failed")]),
             ("ArithError", vec![("Overflow".to_string(), vec![]), ("DivZero".to_string(), vec![])]),
             ("Failure", vec![("Msg".to_string(), vec![("message".to_string(), Ty::Str)])]),
+            ("TaskError", vec![("Panicked".to_string(), vec![("message".to_string(), Ty::Str)])]),
         ];
         for (n, vs) in builtins {
             let t = Ty::Enum(n.into(), vs);
@@ -875,6 +876,8 @@ pub fn type_from(t: &TypeExpr, structs: &Structs, consts: &Consts) -> R<Ty> {
                 Ok(Ty::Map(Box::new(kt), Box::new(type_from(v)?)))
             }
             ("Map", _) => Err(Diag::new(*sp, "`Map` takes two types: `Map[K, V]`")),
+            ("Chan", [t]) => Ok(Ty::Chan(Box::new(type_from(t)?))),
+            ("Task", [t]) => Ok(Ty::Task(Box::new(type_from(t)?))),
             (g, _) if generic(&resolve_name(g, *sp, &|q| generic(q).is_some())?).is_some() => {
                 let g = resolve_name(g, *sp, &|q| generic(q).is_some())?;
                 let targs = args.iter().map(type_from).collect::<R<Vec<_>>>()?;
@@ -1027,6 +1030,8 @@ impl<'w, 'a> FnCx<'w, 'a> {
             Ty::Map(k, v) => Ty::Map(Box::new(self.resolve(k)), Box::new(self.resolve(v))),
             Ty::Fn(ps, r) => Ty::Fn(ps.iter().map(|t| self.resolve(t)).collect(), Box::new(self.resolve(r))),
             Ty::Result(t) => Ty::Result(Box::new(self.resolve(t))),
+            Ty::Task(t) => Ty::Task(Box::new(self.resolve(t))),
+            Ty::Chan(t) => Ty::Chan(Box::new(self.resolve(t))),
             Ty::Seq(t, l) => Ty::seq(self.resolve(t), *l),
             Ty::Gen(t) => Ty::Gen(Box::new(self.resolve(t))),
             Ty::Opt(t) => Ty::Opt(Box::new(self.resolve(t))),
@@ -1052,7 +1057,7 @@ impl<'w, 'a> FnCx<'w, 'a> {
             (Ty::Seq(x, _), Ty::Seq(y, _)) => self.unify(x, y),
             (Ty::Fixed(x, n), Ty::Fixed(y, m)) if n == m => self.unify(x, y),
             (Ty::Map(k1, v1), Ty::Map(k2, v2)) => self.unify(k1, k2) && self.unify(v1, v2),
-            (Ty::Result(x), Ty::Result(y)) => self.unify(x, y),
+            (Ty::Result(x), Ty::Result(y)) | (Ty::Task(x), Ty::Task(y)) | (Ty::Chan(x), Ty::Chan(y)) => self.unify(x, y),
             (Ty::Fn(p1, r1), Ty::Fn(p2, r2)) if p1.len() == p2.len() => {
                 let pairs: Vec<_> = p1.iter().cloned().zip(p2.iter().cloned()).collect();
                 pairs.iter().all(|(x, y)| self.unify(x, y)) && self.unify(r1, r2)
@@ -1256,6 +1261,15 @@ impl<'w, 'a> FnCx<'w, 'a> {
             TK::Format(ps, xs) => TK::Format(ps, xs.into_iter().map(|a| self.zonk(a)).collect()),
             TK::Seq(ss) => TK::Seq(self.zonk_stmts(ss)),
             TK::Some(x) => TK::Some(b(x)),
+            TK::Select(arms, d) => TK::Select(
+                arms.into_iter()
+                    .map(|a| match a {
+                        TSelArm::Recv { ch, bind, body } => TSelArm::Recv { ch: self.zonk(ch), bind, body: self.zonk_stmts(body) },
+                        TSelArm::Send { ch, val, body } => TSelArm::Send { ch: self.zonk(ch), val: self.zonk(val), body: self.zonk_stmts(body) },
+                    })
+                    .collect(),
+                d.map(|d| self.zonk_stmts(d)),
+            ),
             TK::PlaceAssign(l, steps, op, v) => TK::PlaceAssign(
                 l,
                 steps
@@ -1524,6 +1538,8 @@ impl<'w, 'a> FnCx<'w, 'a> {
                 self.mk(TK::Index(Box::new(a), Box::new(i)), el, sp)
             }
             ExprKind::Lambda(params, ret, blk) => return self.lambda(params, ret.as_ref(), blk, sp),
+            ExprKind::Spawn(blk) => return self.spawn(blk, sp),
+            ExprKind::Select(arms, default) => return self.select(arms, default.as_deref(), sp),
             ExprKind::TypeApp(c, _) => return Err(Diag::new(sp, format!("`{c}[...]` is a type; call `.new` on it"))),
             ExprKind::SliceRange(..) => return Err(Diag::new(sp, "a range with an open end only works inside `[ ]`, to slice")),
             ExprKind::ArrayRepeat(v, n) => {
@@ -2458,6 +2474,92 @@ impl<'w, 'a> FnCx<'w, 'a> {
         Ok(self.mk(TK::M(M::FnCall, Some(Box::new(f)), targs, None), *r, sp))
     }
 
+    /// `spawn { body }`: the body runs on its own task, with copies of the
+    /// locals it uses (slices and maps still share storage). It may use `~`:
+    /// its errors become the task's result.
+    fn spawn(&mut self, blk: &Block, sp: Span) -> R<TExpr> {
+        let saved_errs = std::mem::take(&mut self.errs);
+        let saved_fallible = std::mem::replace(&mut self.fallible_decl, true);
+        let saved_main = std::mem::replace(&mut self.is_main, false);
+        let saved_lambda = std::mem::replace(&mut self.in_lambda, false);
+        let saved_loops = std::mem::take(&mut self.loops);
+        let rvar = self.fresh();
+        let saved_ret = std::mem::replace(&mut self.ret, rvar.clone());
+        let own_start = self.locals.len();
+        self.scopes.push(HashMap::new());
+        let r = self.body(&blk.body);
+        self.pop_scope();
+        self.ret = saved_ret;
+        self.loops = saved_loops;
+        self.in_lambda = saved_lambda;
+        self.is_main = saved_main;
+        self.fallible_decl = saved_fallible;
+        let body_errs = std::mem::replace(&mut self.errs, saved_errs);
+        let (body, _) = r?;
+        let bt = match body.last() {
+            Some(TStmt::Expr(e)) => e.ty.clone(),
+            _ => Ty::Unit,
+        };
+        let tb = TBlock { params: vec![], destructure: false, body, pure: false, span: blk.span, own: (own_start, self.locals.len()) };
+        let mut used = vec![];
+        for s in &tb.body {
+            crate::lower::collect_locals_stmt(s, &mut used);
+        }
+        used.sort_unstable();
+        used.dedup();
+        let caps: Vec<LocalId> = used.into_iter().filter(|l| *l < tb.own.0 || *l >= tb.own.1).collect();
+        let cap_es = caps.iter().map(|l| self.mk(TK::Local(*l), self.locals[*l].ty.clone(), sp)).collect();
+        // A body that can fail produces a ~T.
+        let produced = if body_errs.is_empty() { bt } else { Ty::Result(Box::new(bt)) };
+        self.impure = true;
+        Ok(self.mk(TK::M(M::Spawn, None, cap_es, Some(Box::new(tb))), Ty::Task(Box::new(produced)), sp))
+    }
+
+    /// `select { when v = ch.recv => ...; when ch.send(x) => ...; else => ... }`
+    fn select(&mut self, arms: &[SelArm], default: Option<&[Stmt]>, sp: Span) -> R<TExpr> {
+        let mut out = vec![];
+        for a in arms {
+            let arm = match &a.op {
+                SelOp::Recv(bind, ch) => {
+                    let c = self.value(ch)?;
+                    let Ty::Chan(t) = self.resolve(&c.ty) else {
+                        return Err(Diag::new(ch.span, format!("`select` receives from a channel, not {}", self.resolve(&c.ty).show())));
+                    };
+                    self.scopes.push(HashMap::new());
+                    let id = bind.as_ref().map(|(n, _)| self.declare(n, Ty::Opt(t.clone())));
+                    let r = self.body(&a.body);
+                    self.pop_scope();
+                    TSelArm::Recv { ch: c, bind: id, body: r?.0 }
+                }
+                SelOp::Send(ch, v) => {
+                    let c = self.value(ch)?;
+                    let Ty::Chan(t) = self.resolve(&c.ty) else {
+                        return Err(Diag::new(ch.span, format!("`select` sends on a channel, not {}", self.resolve(&c.ty).show())));
+                    };
+                    let v = self.value(v)?;
+                    let v = self.coerce(v, &t)?;
+                    self.expect(&v.ty, &t, v.span, "sent value")?;
+                    self.scopes.push(HashMap::new());
+                    let r = self.body(&a.body);
+                    self.pop_scope();
+                    TSelArm::Send { ch: c, val: v, body: r?.0 }
+                }
+            };
+            out.push(arm);
+        }
+        let d = match default {
+            Some(b) => {
+                self.scopes.push(HashMap::new());
+                let r = self.body(b);
+                self.pop_scope();
+                Some(r?.0)
+            }
+            None => None,
+        };
+        self.impure = true;
+        Ok(self.mk(TK::Select(out, d), Ty::Unit, sp))
+    }
+
     /// A value checked against a known type: array and map literals check
     /// each element against it (so `[Circle.new, Square.new]` can be `[Shape]`).
     fn value_as(&mut self, e: &Expr, want: &Ty) -> R<TExpr> {
@@ -3032,6 +3134,21 @@ impl<'w, 'a> FnCx<'w, 'a> {
         }
         // `Stack[Int].new`: a generic type with explicit arguments.
         if let Some(Expr { kind: ExprKind::TypeApp(c, tes), span: csp, .. }) = recv {
+            if c == "Chan" && tes.len() == 1 && name == "new" {
+                let t = type_from(&tes[0], &self.w.structs, &self.w.consts)?;
+                let cap = match args {
+                    [] => self.mk(TK::Int(0), Ty::Int, sp),
+                    [a] => {
+                        let v = self.value(a)?;
+                        let v = self.coerce(v, &Ty::Int)?;
+                        self.expect(&v.ty, &Ty::Int, v.span, "channel capacity")?;
+                        v
+                    }
+                    _ => return Err(Diag::new(sp, "`Chan[T].new` takes a capacity (or nothing: unbuffered)")),
+                };
+                self.impure = true;
+                return Ok(self.mk(TK::M(M::ChanNew, None, vec![cap], None), Ty::Chan(Box::new(t)), sp));
+            }
             let c = &resolve_name(c, *csp, &|q| generic(q).is_some())?;
             let Some(g) = generic(c) else {
                 return Err(Diag::new(*csp, format!("`{c}` isn't a generic type")));
@@ -3594,6 +3711,7 @@ impl<'w, 'a> FnCx<'w, 'a> {
             Ty::Range => Some((Ty::Int, false)),
             Ty::Array(t) | Ty::Fixed(t, _) => Some((*t, false)),
             Ty::Map(k, v) => Some((Ty::Tuple(vec![*k, *v]), false)),
+            Ty::Chan(t) => Some((*t, false)),
             Ty::Seq(t, l) => Some((*t, l)),
             Ty::Gen(t) => Some((*t, false)),
             Ty::Var(_) => {
@@ -3781,6 +3899,32 @@ impl<'w, 'a> FnCx<'w, 'a> {
                 }
                 _ => Err(Diag::new(name_span, format!("no method `{name}` on {}; handle it with `~`, ok, err, unwrap, unwrap_or, rescue", rt.show()))),
             };
+        }
+        if let Ty::Chan(t) = &rt {
+            let t = (**t).clone();
+            self.impure = true;
+            match (name, args.len()) {
+                ("send" | "<<", 1) => {
+                    let v = self.value(&args[0])?;
+                    let v = self.coerce(v, &t)?;
+                    self.expect(&v.ty, &t, v.span, "sent value")?;
+                    return Ok(mk_m(self, M::ChanSend, recv, vec![v], None, Ty::Unit));
+                }
+                ("recv", 0) => return Ok(mk_m(self, M::ChanRecv, recv, vec![], None, Ty::Opt(Box::new(t)))),
+                ("close", 0) => return Ok(mk_m(self, M::ChanClose, recv, vec![], None, Ty::Unit)),
+                ("size" | "length", 0) => return Ok(mk_m(self, M::ChanLen, recv, vec![], None, Ty::Int)),
+                _ if self.elem_of(&rt, sp)?.is_some() && SEQ_METHODS.contains(&name) => {}
+                _ => return Err(Diag::new(name_span, format!("no method `{name}` on {}; it has send (<<), recv, close, size, and the Enumerable methods", rt.show()))),
+            }
+        }
+        if let (Ty::Task(t), "wait", 0) = (&rt, name, args.len()) {
+            let inner = self.resolve(t);
+            let ok = match inner {
+                Ty::Result(x) => *x,
+                x => x,
+            };
+            self.impure = true;
+            return Ok(mk_m(self, M::TaskWait, recv, vec![], None, Ty::Result(Box::new(ok))));
         }
         if let (Ty::Fn(..), "call") = (&rt, name) {
             return self.fn_call(recv, args, sp);
@@ -4269,7 +4413,7 @@ fn occurs(v: u32, t: &Ty) -> bool {
         Ty::Tuple(ts) => ts.iter().any(|t| occurs(v, t)),
         Ty::Map(k, x) => occurs(v, k) || occurs(v, x),
         Ty::Fn(ps, r) => ps.iter().any(|t| occurs(v, t)) || occurs(v, r),
-        Ty::Result(t) => occurs(v, t),
+        Ty::Result(t) | Ty::Task(t) | Ty::Chan(t) => occurs(v, t),
         _ => false,
     }
 }

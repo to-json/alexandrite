@@ -140,6 +140,13 @@ pub enum LE {
     /// region. Used to store values into a caller's container: they go
     /// where the container's storage lives.
     RegionOf(Box<LE>),
+    /// A new *child* region of `parent` (not made current): freed together
+    /// with its parent (when the parent is exited or freed), or earlier by
+    /// `LS::RegionFree`. Used for a container that owns its contents (R3).
+    RegionNew(Box<LE>),
+    /// Bytes allocated in a region so far (chunks in use + large blocks),
+    /// I64. Used to decide when a container's region is worth compacting.
+    RegionBytes(Box<LE>),
 }
 
 /// A case of `LS::Select`.
@@ -278,6 +285,10 @@ pub enum LS {
     RegionUse { region: LE, saved: V },
     /// Make `saved` (from a `RegionUse`) current again.
     RegionRestore(V),
+    /// Free a child region (from `RegionNew`) now, everything in it at once,
+    /// and detach it from its parent. Nothing in it is used afterwards; it
+    /// is not current when freed.
+    RegionFree(LE),
     /// Start a task running `workers[worker]` on `env` (a value of the
     /// worker's `input` type, copied); `dst` (an `LTy::Task`) gets its handle.
     /// A panic inside the task ends only that task (see `Wait`); a panic on

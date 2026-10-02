@@ -699,6 +699,7 @@ impl<'c, 'p> Fx<'c, 'p> {
 
     fn stmt(&mut self, s: &LS) {
         match s {
+            LS::RegionFree(_) => {}
             LS::RegionEnter { .. } | LS::RegionExit { .. } | LS::RegionUse { .. } | LS::RegionRestore(_) => {}
             LS::Spawn { .. } | LS::Wait { .. } | LS::ChanSend { .. } | LS::ChanRecv { .. } | LS::ChanClose { .. } | LS::Select { .. } => unreachable!("rejected by uses_concurrency"),
             LS::Set(v, e) => {
@@ -1080,6 +1081,8 @@ impl<'c, 'p> Fx<'c, 'p> {
 
     fn ty(&self, e: &LE) -> LTy {
         match e {
+            LE::RegionNew(_) => LTy::Region,
+            LE::RegionBytes(_) => LTy::I64,
             LE::RegionOf(_) => LTy::Region,
             LE::RegionProgram => LTy::Region,
             LE::ChanNew(t, _) => LTy::Chan(Box::new(t.clone())),
@@ -1142,6 +1145,8 @@ impl<'c, 'p> Fx<'c, 'p> {
         let t = self.ty(e);
         let out = vts(&t);
         match e {
+            LE::RegionNew(_) => self.i64c(0),
+            LE::RegionBytes(_) => self.i64c(0),
             LE::RegionOf(_) => self.i64c(0),
             // The browser never frees: regions are no-ops (handle 0).
             LE::RegionProgram => self.i64c(0),

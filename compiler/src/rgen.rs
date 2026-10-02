@@ -144,6 +144,7 @@ impl FnEmit<'_> {
 
     fn stmt(&mut self, s: &LS) {
         match s {
+            LS::RegionFree(_) => {}
             // Rust owns its memory: regions are meaningless here.
             LS::RegionEnter { .. } | LS::RegionExit { .. } | LS::RegionUse { .. } | LS::RegionRestore(_) => {}
             LS::Spawn { dst, worker, env } => {
@@ -329,6 +330,8 @@ impl FnEmit<'_> {
 
     fn e(&self, e: &LE) -> String {
         match e {
+            LE::RegionNew(_) => "()".into(),
+            LE::RegionBytes(_) => "(0i64)".into(),
             LE::RegionOf(_) => "()".into(),
             LE::RegionProgram => "()".into(),
             LE::ChanNew(t, cap) => format!("Chan::<{}>::new({})", rty(t), self.e(cap)),

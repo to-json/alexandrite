@@ -551,6 +551,7 @@ impl Fx<'_, '_, '_> {
 
     fn stmt(&mut self, s: &LS) {
         match s {
+            LS::RegionFree(_) => unimplemented!("R3: child regions in the JIT"),
             LS::RegionEnter { region, saved } => {
                 let sv = self.call_rt(rt::alxj_region_cur, &[], true).unwrap();
                 self.set(*saved, &[sv]);
@@ -918,6 +919,8 @@ impl Fx<'_, '_, '_> {
 
     fn ty(&self, e: &LE) -> LTy {
         match e {
+            LE::RegionNew(_) => LTy::Region,
+            LE::RegionBytes(_) => LTy::I64,
             LE::RegionOf(_) => LTy::Region,
             LE::RegionProgram => LTy::Region,
             LE::ChanNew(t, _) => LTy::Chan(Box::new(t.clone())),
@@ -1121,6 +1124,7 @@ impl Fx<'_, '_, '_> {
 
     fn e(&mut self, e: &LE) -> Vec<Value> {
         match e {
+            LE::RegionNew(_) | LE::RegionBytes(_) => unimplemented!("R3: child regions in the JIT"),
             LE::RegionOf(x) => {
                 // Arr and Str both keep their data pointer in word 0.
                 let v = self.e(x);

@@ -334,18 +334,15 @@ pub extern "C" fn alxr_int_ndigits(v: i64) -> i64 {
 
 // ---------- strings ----------
 
+/// The valid UTF-8 sequence length at i, or 1 (decodes as U+FFFD).
 fn charlen(s: &[u8], i: usize) -> usize {
-    let c = s[i];
-    let n = if c < 0x80 {
-        1
-    } else if c < 0xE0 {
-        2
-    } else if c < 0xF0 {
-        3
-    } else {
-        4
+    let p = &s[i..];
+    let p = &p[..p.len().min(4)];
+    let valid = match std::str::from_utf8(p) {
+        Ok(t) => t,
+        Err(e) => std::str::from_utf8(&p[..e.valid_up_to()]).unwrap_or(""),
     };
-    n.min(s.len() - i)
+    valid.chars().next().map_or(1, |c| c.len_utf8())
 }
 
 fn rev(s: &[u8]) -> Vec<u8> {

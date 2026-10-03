@@ -514,10 +514,25 @@ int64_t alx_str_to_i(AlxStr s) {
     return neg ? -v : v;
 }
 
+/* The length of the UTF-8 sequence at i: 1 for ASCII and for anything
+ * invalid by Go's rules (bad lead or continuation bytes, overlong forms,
+ * surrogates, past U+10FFFF, truncated), which decodes as U+FFFD. */
 int64_t alx_str_charlen(AlxStr s, int64_t i) {
-    unsigned char c = (unsigned char)s.ptr[i];
-    int64_t n = c < 0x80 ? 1 : c < 0xE0 ? 2 : c < 0xF0 ? 3 : 4;
-    return i + n > s.len ? s.len - i : n;
+    const unsigned char *p = (const unsigned char *)s.ptr + i;
+    int64_t left = s.len - i;
+    unsigned char c = p[0];
+    if (c < 0x80) return 1;
+    int64_t n;
+    unsigned char lo = 0x80, hi = 0xBF;
+    if (c >= 0xC2 && c <= 0xDF) n = 2;
+    else if (c >= 0xE0 && c <= 0xEF) { n = 3; if (c == 0xE0) lo = 0xA0; if (c == 0xED) hi = 0x9F; }
+    else if (c >= 0xF0 && c <= 0xF4) { n = 4; if (c == 0xF0) lo = 0x90; if (c == 0xF4) hi = 0x8F; }
+    else return 1;
+    if (left < n) return 1;
+    if (p[1] < lo || p[1] > hi) return 1;
+    for (int64_t k = 2; k < n; k++)
+        if (p[k] < 0x80 || p[k] > 0xBF) return 1;
+    return n;
 }
 
 AlxStr alx_str_sub(AlxStr s, int64_t i, int64_t n) {

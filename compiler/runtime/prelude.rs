@@ -319,10 +319,17 @@ mod rt {
         }
         if neg { -v } else { v }
     }
+    /// The valid UTF-8 sequence length at i, or 1 (decodes as U+FFFD).
     pub fn str_charlen(s: &Str, i: i64) -> i64 {
-        let c = s.0[i as usize];
-        let n = if c < 0x80 { 1 } else if c < 0xE0 { 2 } else if c < 0xF0 { 3 } else { 4 };
-        n.min(s.0.len() as i64 - i)
+        let p = &s.0[i as usize..];
+        match std::str::from_utf8(&p[..p.len().min(4)]) {
+            Ok(t) => t.chars().next().map_or(1, |c| c.len_utf8() as i64),
+            Err(e) if e.valid_up_to() > 0 => {
+                let t = std::str::from_utf8(&p[..e.valid_up_to()]).unwrap();
+                t.chars().next().map_or(1, |c| c.len_utf8() as i64)
+            }
+            Err(_) => 1,
+        }
     }
     pub fn str_sub(s: &Str, i: i64, n: i64) -> Str {
         Str::lit(&s.0[i as usize..(i + n) as usize])

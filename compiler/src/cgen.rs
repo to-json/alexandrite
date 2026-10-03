@@ -904,6 +904,7 @@ impl FnEmit<'_> {
             }
             LE::Len(x) => format!("({}).len", self.e(x)),
             LE::ArrLit(t, vs) => {
+                LITERAL_TYPES.with(|l| l.borrow_mut().push(LTy::Arr(Box::new(t.clone()))));
                 let n = ty_name(&LTy::Arr(Box::new(t.clone())));
                 if vs.is_empty() {
                     format!("{n}_cap(0)")
@@ -911,8 +912,14 @@ impl FnEmit<'_> {
                     format!("{n}_lit({}, ({}[]){{{}}})", vs.len(), cty_mem(t), vs.iter().map(|x| self.e(x)).collect::<Vec<_>>().join(", "))
                 }
             }
-            LE::ArrNew(t, n, fill, loc) => format!("{}_new({}, {}, {})", ty_name(&LTy::Arr(Box::new(t.clone()))), self.e(n), self.e(fill), c_str(loc)),
-            LE::ArrWithCap(t, n) => format!("{}_cap({})", ty_name(&LTy::Arr(Box::new(t.clone()))), self.e(n)),
+            LE::ArrNew(t, n, fill, loc) => {
+                LITERAL_TYPES.with(|l| l.borrow_mut().push(LTy::Arr(Box::new(t.clone()))));
+                format!("{}_new({}, {}, {})", ty_name(&LTy::Arr(Box::new(t.clone()))), self.e(n), self.e(fill), c_str(loc))
+            }
+            LE::ArrWithCap(t, n) => {
+                LITERAL_TYPES.with(|l| l.borrow_mut().push(LTy::Arr(Box::new(t.clone()))));
+                format!("{}_cap({})", ty_name(&LTy::Arr(Box::new(t.clone()))), self.e(n))
+            }
             LE::Slice(t, a, start, len) => format!("(({}){{({}).ptr + {}, {}, 0}})", ty_name(t), self.e(a), self.e(start), self.e(len)),
             LE::Range(lo, hi, ex) => format!("((AlxRange){{{}, {}, {}}})", self.e(lo), self.e(hi), ex),
             LE::RangeField(r, k) => format!("({}).{}", self.e(r), ["lo", "hi", "excl"][*k as usize]),

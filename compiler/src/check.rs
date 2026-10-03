@@ -2465,6 +2465,20 @@ impl<'w, 'a> FnCx<'w, 'a> {
                 return Ok(self.mk(TK::M(M::TupleNew, None, vs, None), ty, sp));
             }
         }
+        // An array literal coerces element by element (`[128, 65]` as `[Byte]`,
+        // structs as `[Iface]`).
+        if let (TK::Array(items), Ty::Array(et)) = (&e.kind, &want) {
+            if self.resolve(&e.ty) != want {
+                let sp = e.span;
+                let mut vs = vec![];
+                for x in items.clone() {
+                    vs.push(self.coerce(x, et)?);
+                }
+                if vs.iter().all(|v| self.resolve(&v.ty) == **et) {
+                    return Ok(self.mk(TK::Array(vs), want.clone(), sp));
+                }
+            }
+        }
         if want == Ty::Error {
             let et = self.resolve(&e.ty);
             if let Some(k) = self.w.error_index(&et) {
@@ -4631,9 +4645,13 @@ impl<'w, 'a> FnCx<'w, 'a> {
                 Ok(self.mk(TK::M(M::IntSqrt, None, a, None), Ty::Int, sp))
             }
             ("Str", "from_bytes") => {
-                let a = argv(self)?;
+                let mut a = argv(self)?;
                 if a.len() != 1 {
                     return Err(Diag::new(sp, "`Str.from_bytes` takes one argument, a [Byte]"));
+                }
+                if matches!(a[0].kind, TK::Array(_)) {
+                    let x = a.remove(0);
+                    a.insert(0, self.coerce(x, &Ty::arr(Ty::IntK(IntKind::U8)))?);
                 }
                 match self.resolve(&a[0].ty) {
                     Ty::Array(t) | Ty::Fixed(t, _) if *t == Ty::IntK(IntKind::U8) => {}

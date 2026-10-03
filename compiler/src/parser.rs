@@ -1224,7 +1224,9 @@ impl<'a> Parser<'a> {
                     while matches!(self.peek_at(k), Tok::Ident(_) | Tok::Const(_)) && matches!(self.peek_at(k + 1), Tok::Op(".")) {
                         k += 2;
                     }
-                    let qualified = k > 0 && matches!(self.peek_at(k), Tok::Const(_)) && {
+                    // (`pkg.CONST` has no type part: it's a value.)
+                    let has_type = (0..k).step_by(2).any(|j| matches!(self.peek_at(j), Tok::Const(_)));
+                    let qualified = k > 0 && has_type && matches!(self.peek_at(k), Tok::Const(_)) && {
                         let after = self.peek_at(k + 1);
                         (matches!(after, Tok::Op("(")) && !self.space_before_at(k + 1)) || matches!(after, Tok::Op("=>") | Tok::Op("|"))
                     };

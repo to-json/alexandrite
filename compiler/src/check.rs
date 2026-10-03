@@ -1323,6 +1323,9 @@ struct FnCx<'w, 'a> {
     /// The type the expression being checked is wanted as (for inferring
     /// a generic constructor's type arguments).
     want_hint: Option<Ty>,
+    /// The declared result type, for the def body's last expression (an
+    /// array or tuple literal converts its elements to it).
+    tail_want: Option<Ty>,
     /// `R[Str].empty`: the type arguments a static method's call gives (consumed by `call_def`).
     owner_targs: Vec<Ty>,
     /// In a method: `Some(true)` for a `!` method (`self` is a one-element
@@ -1385,6 +1388,7 @@ impl<'w, 'a> FnCx<'w, 'a> {
             pure_decl: def.is_some_and(|d| d.pure),
             fn_name: def.map_or("main".into(), |d| d.name.clone()),
             want_hint: None,
+            tail_want: None,
             owner_targs: vec![],
             errs: Default::default(),
             decl_spans: vec![],
@@ -1533,6 +1537,9 @@ impl<'w, 'a> FnCx<'w, 'a> {
         // that must exist; otherwise a trailing `case`/`if` whose arms
         // disagree is a statement, and the function returns nothing.
         self.cells = Some(vec![]);
+        if def.is_some_and(|d| d.ret.is_some()) && !self.is_main {
+            self.tail_want = Some(self.ret.clone());
+        }
         let r = self.body_as(body, def.is_some_and(|d| d.ret.is_some()));
         let cells = self.cells.take().unwrap_or_default();
         let (mut stmts, tail_ty) = r?;
@@ -1778,9 +1785,14 @@ impl<'w, 'a> FnCx<'w, 'a> {
     fn body_as(&mut self, stmts: &[Stmt], used: bool) -> R<(Vec<TStmt>, Ty)> {
         let mut out = vec![];
         let mut last = Ty::Unit;
+        let tail_want = self.tail_want.take();
         for (i, s) in stmts.iter().enumerate() {
             let used = used && i + 1 == stmts.len();
             let t = match &s.kind {
+                StmtKind::Expr(e @ Expr { kind: ExprKind::Array(_) | ExprKind::Tuple(_), .. }) if used && tail_want.is_some() => {
+                    let w = tail_want.clone().unwrap();
+                    TStmt::Expr(self.value_as(e, &w)?)
+                }
                 // A trailing `if ... else ...` is the block's value (Ruby).
                 StmtKind::If(c, a, b) if i + 1 == stmts.len() && !b.is_empty() => TStmt::Expr(self.if_value(c, a, b, s.span, used)?),
                 StmtKind::Expr(Expr { kind: ExprKind::Case(subject, arms), span, .. }) => TStmt::Expr(self.case(subject.as_deref(), arms, *span, used)?),
@@ -2456,6 +2468,10 @@ impl<'w, 'a> FnCx<'w, 'a> {
                 let mut out = vec![];
                 for it in items {
                     let v = self.value(it)?;
+                    // Once an earlier element fixed the type (an interface,
+                    // say), later ones convert to it.
+                    let known = self.resolve(&el);
+                    let v = if known.has_var() { v } else { self.coerce(v, &known)? };
                     self.expect(&v.ty, &el, v.span, "array element")?;
                     out.push(v);
                 }

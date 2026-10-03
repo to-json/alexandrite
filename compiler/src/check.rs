@@ -2916,11 +2916,13 @@ impl<'w, 'a> FnCx<'w, 'a> {
         // whole case a Never.
         let mut case_ty = None;
         if let Some(d) = default.as_ref().filter(|_| has_default) {
-            let arm_tys: Vec<Ty> = conds.iter().map(|(_, b)| b.ty.clone()).chain(std::iter::once(d.ty.clone())).collect();
-            let ty = arm_tys.iter().find(|t| !matches!(self.resolve(t), Ty::Never)).cloned().unwrap_or_else(|| d.ty.clone());
-            if !self.unify(&d.ty, &ty) && used {
-                return Err(Diag::new(d.span, format!("this arm is {}, but the others are {}", self.resolve(&d.ty).show(), self.resolve(&ty).show())));
-            }
+            // The last arm's type, unless it is a Never: then the first
+            // other arm's that has a value.
+            let ty = if matches!(self.resolve(&d.ty), Ty::Never) {
+                conds.iter().map(|(_, b)| b.ty.clone()).find(|t| !matches!(self.resolve(t), Ty::Never)).unwrap_or_else(|| d.ty.clone())
+            } else {
+                d.ty.clone()
+            };
             case_ty = Some(ty.clone());
             for (_, b) in &conds {
                 if !self.unify(&b.ty, &ty) {

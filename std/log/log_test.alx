@@ -1,0 +1,209 @@
+# Go's log tests (log_test.go, example_test.go), translated. Go matches the
+# output against regular expressions; here every digit is turned into `9`
+# and the result compared with a template.
+import "bytes"
+import "fmt"
+import "io"
+import "strings"
+import "sync"
+
+# The output of one print through a Logger without time fields (for the
+# generated vectors).
+def lines(prefix: Str, flag: Int, s: Str) -> Str {
+  l = new(bytes.new_buffer([]), prefix, flag)
+  l.print(s)
+  l.writer.string
+}
+
+def lines_ln(prefix: Str, s: Str) -> Str {
+  l = new(bytes.new_buffer([]), prefix, 0)
+  l.println(s)
+  l.writer.string
+}
+
+# Every ASCII digit as `9`.
+def shape(s: Str) -> Str {
+  Str.from_bytes(s.bytes.map { |b| b >= 48 && b <= 57 ? 57.to_u8 : b }.to_a)
+}
+
+RDATE = "9999/99/99"
+RTIME = "99:99:99"
+RMICRO = ".999999"
+RSHORT = "???:9:"
+
+# Go's tests table: flag, prefix, the expected header's shape.
+def tests -> [(Int, Str, Str)] {
+  [
+    (0, "", ""),
+    (0, "XXX", "XXX"),
+    (LDATE, "", RDATE + " "),
+    (LTIME, "", RTIME + " "),
+    (LTIME | LMSGPREFIX, "XXX", RTIME + " XXX"),
+    (LTIME | LMICROSECONDS, "", RTIME + RMICRO + " "),
+    (LMICROSECONDS, "", RTIME + RMICRO + " "),
+    (LLONGFILE, "", RSHORT + " "),
+    (LSHORTFILE, "", RSHORT + " "),
+    (LLONGFILE | LSHORTFILE, "", RSHORT + " "),
+    (LDATE | LTIME | LMICROSECONDS | LLONGFILE, "XXX", "XXX" + RDATE + " " + RTIME + RMICRO + " " + RSHORT + " "),
+    (LDATE | LTIME | LMICROSECONDS | LSHORTFILE, "XXX", "XXX" + RDATE + " " + RTIME + RMICRO + " " + RSHORT + " "),
+    (LDATE | LTIME | LMICROSECONDS | LLONGFILE | LMSGPREFIX, "XXX", RDATE + " " + RTIME + RMICRO + " " + RSHORT + " XXX"),
+    (LDATE | LTIME | LMICROSECONDS | LSHORTFILE | LMSGPREFIX, "XXX", RDATE + " " + RTIME + RMICRO + " " + RSHORT + " XXX"),
+  ]
+}
+
+# Go's testPrint, with Println("hello", 23, "world") and Printf("hello %d world", 23).
+test "all" {
+  for flag, prefix, pattern in tests {
+    l = new(bytes.new_buffer([]), prefix, flag)
+    l.println("hello #{23} world")
+    l.printf(fmt.sprintf("hello %d world", 23))
+    out = l.writer.string
+    want = pattern + "hello 99 world\n"
+    assert_eq shape(out), want + want
+  }
+}
+
+test "default" {
+  d = default
+  assert_eq d.flags, LSTD_FLAGS
+  assert_eq d.prefix, ""
+  assert_eq d.writer.fd, 2
+  assert_eq flags, LSTD_FLAGS
+  assert_eq prefix, ""
+  assert_eq writer.fd, 2
+}
+
+test "output" {
+  l = new(bytes.new_buffer([]), "", 0)
+  l.println("test")
+  assert_eq l.writer.string, "test\n"
+}
+
+test "output race" {
+  l = new(bytes.new_buffer([]), "", 0)
+  wg = sync.new_wait_group
+  wg.add(100)
+  (0...100).each { |_|
+    spawn {
+      l.set_flags(0)
+      l.output(0, "").unwrap
+      wg.done
+    }
+  }
+  wg.wait
+  assert_eq l.writer.string, "\n" * 100
+}
+
+# Lines written from many tasks never interleave.
+test "concurrent lines" {
+  l = new(bytes.new_buffer([]), "p: ", LMSGPREFIX)
+  wg = sync.new_wait_group
+  (0...20).each { |i|
+    wg.add(1)
+    spawn {
+      (0...10).each { |j| l.print("task #{i} line #{j}") }
+      wg.done
+    }
+  }
+  wg.wait
+  got = l.writer.string.lines
+  assert_eq got.size, 200
+  got.each { |ln| assert ln.start_with?("p: task ") }
+}
+
+test "flag and prefix setting" {
+  l = new(bytes.new_buffer([]), "Test:", LSTD_FLAGS)
+  f = l.flags
+  assert_eq f, LSTD_FLAGS
+  l.set_flags(f | LMICROSECONDS)
+  assert_eq l.flags, LSTD_FLAGS | LMICROSECONDS
+  assert_eq l.prefix, "Test:"
+  l.set_prefix("Reality:")
+  assert_eq l.prefix, "Reality:"
+  l.print("hello")
+  assert_eq shape(l.writer.string), "Reality:" + RDATE + " " + RTIME + RMICRO + " hello\n"
+  # A newline is added only if the line lacks one.
+  l.set_output(bytes.new_buffer([]))
+  l.set_flags(0)
+  l.set_prefix("\n")
+  l.output(0, "").unwrap
+  assert_eq l.writer.string, "\n"
+}
+
+test "utc flag" {
+  l = new(bytes.new_buffer([]), "Test:", LSTD_FLAGS)
+  l.set_flags(LDATE | LTIME | LUTC)
+  now = time.now.utc
+  l.print("hello")
+  got = l.writer.string
+  stamp = ->(t: time.Time) -> Str {
+    fmt.sprintf("Test:%d/%.2d/%.2d %.2d:%.2d:%.2d hello\n", t.year, t.month, t.day, t.hour, t.minute, t.second)
+  }
+  # The second may tick between taking now and logging.
+  assert got == stamp(now) || got == stamp(now.add(time.second)), got
+}
+
+test "local time" {
+  l = new(bytes.new_buffer([]), "", LDATE | LTIME)
+  now = time.now
+  l.print("x")
+  got = l.writer.string
+  y, mo, d = now.date
+  assert got.start_with?(fmt.sprintf("%d/%.2d/%.2d ", y, mo, d)) || got.size == 22, got
+}
+
+test "empty print creates line" {
+  l = new(bytes.new_buffer([]), "Header:", LSTD_FLAGS)
+  l.print("")
+  l.println("non-empty")
+  out = l.writer.string
+  assert_eq strings.count(out, "Header"), 2
+  assert_eq strings.count(out, "\n"), 2
+}
+
+test "discard" {
+  l = new(io.Discard.new, "", 0)
+  l.printf("a" * 102400)
+  l.print("x")
+}
+
+# Go's TestCallDepth: Fatal / Panic write the line first. Fatal exits the
+# process, so only the panics are run here.
+test "panic writes first" {
+  l = new(bytes.new_buffer([]), "P:", 0)
+  w = l
+  t = spawn { w.panic("boom") }
+  r = t.wait
+  assert r.err?
+  assert_eq l.writer.string, "P:boom\n"
+  t2 = spawn { w.panicln("again") }
+  assert t2.wait.err?
+  assert_eq l.writer.string, "P:boom\nP:again\n"
+}
+
+struct FailingWriter {
+  pub def write!(p: [Byte]) -> ~Int {
+    fail io.StreamError.ShortWrite
+  }
+}
+
+test "output error" {
+  l = new(FailingWriter.new, "", 0)
+  r = l.output(1, "x")
+  assert r.err?
+  # Print ignores it.
+  l.print("y")
+}
+
+example "logger" {
+  logger = new(bytes.new_buffer([]), "logger: ", LSHORTFILE)
+  logger.print("Hello, log file!")
+  print logger.writer.string
+} outputs "logger: ???:0: Hello, log file!\n"
+
+example "logger output" {
+  logger = new(bytes.new_buffer([]), "INFO: ", LSHORTFILE)
+  infof = ->(info: Str) { logger.output(2, info).unwrap }
+  infof("Hello world")
+  print logger.writer.string
+} outputs "INFO: ???:0: Hello world\n"

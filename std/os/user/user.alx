@@ -1,0 +1,271 @@
+# Package user: Go's os/user — user and group lookups by name or ID.
+#
+#   Go                                      alx
+#   User{Uid, Gid, Username, Name, HomeDir} User (uid, gid, username, name, home_dir: Str)
+#   Group{Gid, Name}                        Group (gid, name)
+#   Current()                               current -> ~User
+#   Lookup(username) / LookupId(uid)        lookup(username) / lookup_id(uid) -> ~User
+#   LookupGroup(name) / LookupGroupId(gid)  lookup_group(name) / lookup_group_id(gid) -> ~Group
+#   (*User).GroupIds()                      u.group_ids -> ~[Str]
+#   UnknownUserError, UnknownUserIdError,   UserError.UnknownUser(name), UnknownUserId(uid),
+#     UnknownGroupError, UnknownGroupIdError  UnknownGroup(name), UnknownGroupId(gid)
+#
+# Lookups go through the C library (getpwuid_r, getpwnam_r, getgrgid_r,
+# getgrnam_r, getgrouplist: Go's cgo implementation), so directory services
+# (macOS Open Directory, NSS) are seen, through the runtime's alx_user_lookup
+# and alx_user_groups. Go's pure-Go parsers of /etc/passwd and /etc/group
+# (its osusergo build) are here too, as find_user_id / find_username /
+# find_group_id / find_group_name / list_groups_from over the file's text;
+# Go's tests of them are translated.
+#
+# Differences from Go:
+#  - IDs are strings, as in Go. The error values are UserError variants with
+#    Go's messages ("user: unknown user bob"); UnknownUserId keeps the ID as
+#    text.
+#  - current is not cached (Go caches it in a sync.Once; alexandrite has no
+#    package state). If the C library doesn't know the current uid, it falls
+#    back to $USER and $HOME, as Go's does.
+#  - Unix only; the browser backend has no FFI.
+
+import "os"
+import "strconv"
+import "strings"
+
+extern def alx_user_lookup(kind: Int, key: Str, out: [Byte], n: Int) -> Int
+extern def alx_user_groups(name: Str, gid: Int, out: [Byte], n: Int) -> Int
+extern def alx_sys_const(name: Str) -> Int
+
+pub error UserError {
+  UnknownUser(name: Str)
+  UnknownUserId(uid: Str)
+  UnknownGroup(name: Str)
+  UnknownGroupId(gid: Str)
+  # Anything else (an invalid ID, a failed lookup), with its message.
+  Failed(msg: Str)
+
+  def message -> Str {
+    case self {
+      UnknownUser(name) => "user: unknown user #{name}"
+      UnknownUserId(uid) => "user: unknown userid #{uid}"
+      UnknownGroup(name) => "group: unknown group #{name}"
+      UnknownGroupId(gid) => "group: unknown groupid #{gid}"
+      Failed(msg) => msg
+    }
+  }
+}
+
+# A user account (Go's User).
+pub struct User {
+  # The user ID (a decimal number on Unix).
+  uid: Str
+  # The primary group ID.
+  gid: Str
+  # The login name.
+  username: Str
+  # The user's real or display name (the GECOS field up to its first comma).
+  name: Str
+  home_dir: Str
+
+  # The group IDs the user is a member of, the primary group first.
+  pub def group_ids -> ~[Str] {
+    fail UserError.Failed("user: list groups: empty username") if username == ""
+    g = strconv.atoi(gid)
+    fail UserError.Failed("user: list groups for #{username}: invalid gid \"#{gid}\"") if g.err?
+    primary = g.unwrap
+    room = 64
+    loop {
+      # n 8-byte native-endian (little-endian) IDs.
+      out: [Byte] = [0; room * 8]
+      n = alx_user_groups(username, primary, out, room)
+      if n <= room {
+        ids = [gid]
+        (0...n).each { |i|
+          x = 0
+          (0...8).each { |k| x |= out[i * 8 + k].to_i << (8 * k) }
+          ids << x.to_s if x != primary
+        }
+        return ids
+      }
+      room = n
+    }
+  }
+}
+
+# A group (Go's Group).
+pub struct Group {
+  gid: Str
+  name: Str
+}
+
+# The NUL-separated fields alx_user_lookup writes, or none if not found.
+def lookup_fields(kind: Int, key: Str) -> ~[Str]? {
+  erange = -alx_sys_const("ERANGE")
+  room = 1024
+  buf: [Byte] = [0; room]
+  n = alx_user_lookup(kind, key, buf, room)
+  while n == erange {
+    room *= 4
+    bigger: [Byte] = [0; room]
+    buf = bigger
+    n = alx_user_lookup(kind, key, buf, room)
+  }
+  fail UserError.Failed("user: lookup #{key}: #{C.strerror(-n)}") if n < 0
+  return none if n == 0
+  strings.split(Str.from_bytes(buf[0...n - 1]), "\u0000")
+}
+
+def user_of(f: [Str]) -> User {
+  User.new(uid: f[0], gid: f[1], username: f[2], name: f[3], home_dir: f[4])
+}
+
+# The current user (Go's Current).
+pub def current -> ~User {
+  uid = os.getuid.to_s
+  if f = ~lookup_fields(0, uid) {
+    return user_of(f)
+  }
+  # Go's fallback: what the environment says.
+  name = os.getenv("USER") || ""
+  home = os.getenv("HOME") || ""
+  fail UserError.UnknownUserId(uid) if name == "" || home == ""
+  User.new(uid: uid, gid: os.getgid.to_s, username: name, name: "", home_dir: home)
+}
+
+# The user with this login name (Go's Lookup).
+pub def lookup(username: Str) -> ~User {
+  if f = ~lookup_fields(1, username) {
+    return user_of(f)
+  }
+  fail UserError.UnknownUser(username)
+}
+
+# The user with this ID (Go's LookupId).
+pub def lookup_id(uid: Str) -> ~User {
+  fail UserError.Failed("user: invalid userid #{uid}") if strconv.atoi(uid).err?
+  if f = ~lookup_fields(0, uid) {
+    return user_of(f)
+  }
+  fail UserError.UnknownUserId(uid)
+}
+
+# The group with this name (Go's LookupGroup).
+pub def lookup_group(name: Str) -> ~Group {
+  if f = ~lookup_fields(3, name) {
+    return Group.new(gid: f[0], name: f[1])
+  }
+  fail UserError.UnknownGroup(name)
+}
+
+# The group with this ID (Go's LookupGroupId).
+pub def lookup_group_id(gid: Str) -> ~Group {
+  fail UserError.Failed("group: invalid groupid #{gid}") if strconv.atoi(gid).err?
+  if f = ~lookup_fields(2, gid) {
+    return Group.new(gid: f[0], name: f[1])
+  }
+  fail UserError.UnknownGroupId(gid)
+}
+
+# ------------------------------------------- Go's pure parsers (osusergo)
+
+def numeric?(s: Str) -> Bool {
+  strconv.atoi(s).ok != none
+}
+
+# The lines of a colon file worth looking at: trimmed, without blanks and
+# comments.
+def colon_lines(text: Str) -> [Str] {
+  out: [Str] = []
+  for line in strings.split(text, "\n") {
+    l = strings.trim_space(line)
+    out << l if l.size > 0 && l[0] != 35
+  }
+  out
+}
+
+def match_group(line: Str, value: Str, idx: Int) -> Group? {
+  lead = idx > 0 ? ":" : ""
+  return none if !strings.contains(line, lead + value + ":") || strings.count(line, ":") < 3
+  parts = strings.split_n(line, ":", 4)
+  return none if parts.size < 4 || parts[0] == "" || parts[idx] != value || parts[0][0] == 43 || parts[0][0] == 45
+  return none if !numeric?(parts[2])
+  Group.new(name: parts[0], gid: parts[2])
+}
+
+def match_user(line: Str, value: Str, idx: Int) -> User? {
+  lead = idx > 0 ? ":" : ""
+  return none if !strings.contains(line, lead + value + ":") || strings.count(line, ":") < 6
+  parts = strings.split_n(line, ":", 7)
+  return none if parts.size < 6 || parts[idx] != value || parts[0] == "" || parts[0][0] == 43 || parts[0][0] == 45
+  return none if !numeric?(parts[2]) || !numeric?(parts[3])
+  name = parts[4]
+  i = strings.index(name, ",")
+  name = name[0...i] if i >= 0
+  User.new(username: parts[0], uid: parts[2], gid: parts[3], name: name, home_dir: parts[5])
+}
+
+# Go's findGroupId over the text of a group file.
+def find_group_id(id: Str, text: Str) -> ~Group {
+  for l in colon_lines(text) {
+    if g = match_group(l, id, 2) {
+      return g
+    }
+  }
+  fail UserError.UnknownGroupId(id)
+}
+
+def find_group_name(name: Str, text: Str) -> ~Group {
+  for l in colon_lines(text) {
+    if g = match_group(l, name, 0) {
+      return g
+    }
+  }
+  fail UserError.UnknownGroup(name)
+}
+
+def find_user_id(uid: Str, text: Str) -> ~User {
+  fail UserError.Failed("user: invalid userid #{uid}") if !numeric?(uid)
+  for l in colon_lines(text) {
+    if u = match_user(l, uid, 2) {
+      return u
+    }
+  }
+  fail UserError.UnknownUserId(uid)
+}
+
+def find_username(name: Str, text: Str) -> ~User {
+  for l in colon_lines(text) {
+    if u = match_user(l, name, 0) {
+      return u
+    }
+  }
+  fail UserError.UnknownUser(name)
+}
+
+# Go's listGroupsFromReader over the text of a group file.
+def list_groups_from(u: User, text: Str) -> ~[Str] {
+  fail UserError.Failed("user: list groups: empty username") if u.username == ""
+  pg = strconv.atoi(u.gid)
+  fail UserError.Failed("user: list groups for #{u.username}: invalid gid \"#{u.gid}\"") if pg.err?
+  primary = pg.unwrap
+  commas = "," + u.username + ","
+  first = commas[1...commas.size]
+  last = commas[0...commas.size - 1]
+  only = u.username
+  groups = [u.gid]
+  for raw in strings.split(text, "\n") {
+    line = strings.trim_space(raw)
+    next if line.size == 0 || line[0] == 35 || line[0] == 43 || line[0] == 45
+    li = strings.last_index(line, ":")
+    next if li == -1 || li == line.size - 1
+    head = line[0...li]
+    next if strings.count(head, ":") != 2
+    list = line[li + 1...line.size]
+    next if !(list == only || list.start_with?(first) || list.end_with?(last) || strings.contains(list, commas))
+    parts = strings.split(head, ":")
+    next if parts.size != 3 || parts[0].size == 0
+    g = strconv.atoi(parts[2])
+    next if g.err? || g.unwrap == primary
+    groups << parts[2]
+  }
+  groups
+}

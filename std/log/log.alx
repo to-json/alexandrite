@@ -1,0 +1,241 @@
+# Package log: Go's log — a simple logger writing a header and a message
+# per line.
+#
+#   Go                                      alx
+#   Ldate Ltime Lmicroseconds Llongfile     LDATE LTIME LMICROSECONDS LLONGFILE
+#     Lshortfile LUTC Lmsgprefix LstdFlags    LSHORTFILE LUTC LMSGPREFIX LSTD_FLAGS
+#   New(out, prefix, flag) *Logger          new(out, prefix, flag) -> Logger[W]
+#   l.Print(v...) / Printf / Println        l.print(s) / l.printf(s) / l.println(s)
+#   l.Fatal / Fatalf / Fatalln              l.fatal(s) / l.fatalf(s) / l.fatalln(s)
+#   l.Panic / Panicf / Panicln              l.panic(s) / l.panicf(s) / l.panicln(s)
+#   l.Output(calldepth, s) error            l.output(calldepth, s) -> ~Unit
+#   l.Flags / SetFlags / Prefix /           l.flags / set_flags(f) / prefix /
+#     SetPrefix / Writer / SetOutput          set_prefix(p) / writer / set_output(w)
+#   Default() *Logger                       default -> Logger[os.File] (stderr)
+#   Print, Printf, Println, Fatal..., Panic..., Output, Flags, Prefix, Writer
+#                                           the same names, on `default`
+#
+# A line is: the prefix (unless LMSGPREFIX), the date `2009/01/23 ` (LDATE),
+# the time `01:23:23 ` or `01:23:23.123123 ` (LTIME / LMICROSECONDS), the
+# file and line `???:0: ` (LSHORTFILE / LLONGFILE, see below), the prefix
+# (with LMSGPREFIX), then the message, and a newline if it doesn't end with
+# one. Times are local unless LUTC. A Logger is safe to use from many tasks:
+# each line is written whole, under the logger's lock.
+#
+# Differences from Go:
+#  - No variadic `any` arguments: every printing function takes one Str.
+#    Format it first, with interpolation or `fmt.sprintf` (whose arguments
+#    are checked at compile time): `l.print("got #{n} items")`,
+#    `l.printf(fmt.sprintf("%5d", n))`. `print(s)` and `printf(s)` write s
+#    (Go's Sprint of one string is that string); `println(s)` writes s and a
+#    newline (Go's Sprintln), so `println("x\n")` writes two newlines as in
+#    Go.
+#  - LSHORTFILE / LLONGFILE write `???:0` (what Go writes when
+#    runtime.Caller fails): alexandrite has no caller locations at run time.
+#    `calldepth` is accepted and ignored.
+#  - The package-level functions log to a fresh `default` logger (stderr,
+#    LSTD_FLAGS, no prefix): alexandrite has no mutable package state, so
+#    Go's SetOutput / SetFlags / SetPrefix on the standard logger don't
+#    exist. Make a Logger with `new` and pass it around instead.
+#  - A Logger is generic over its writer (any type with
+#    `write!(p: [Byte]) -> ~Int`, or an io.Writer value). It holds the
+#    writer under its lock, so the writer moves into the logger: read a
+#    buffer back with `l.writer` (a copy of it, taken under the lock).
+#    `set_output(w)` takes a writer of the same type.
+#  - `fatal*` exit with status 1 after writing (os.exit, as Go); `panic*`
+#    panic with the message after writing (no recover in alexandrite).
+#  - Write errors are returned by `output` and ignored by the print
+#    functions (as in Go).
+
+import "os"
+import "time"
+
+pub LDATE = 1
+pub LTIME = 2
+pub LMICROSECONDS = 4
+pub LLONGFILE = 8
+pub LSHORTFILE = 16
+pub LUTC = 32
+pub LMSGPREFIX = 64
+pub LSTD_FLAGS = 3
+
+struct LogState[W] {
+  prefix: Str
+  flag: Int
+  out: W
+
+  # A write to W, as a Result whether or not W's write! can fail.
+  def emit!(p: [Byte]) -> ~Int { self.out.~write!(p) }
+}
+
+# A logger: writes one line per call to its writer, under its lock. Copies
+# share the state (it is a handle), so a Logger can be captured by tasks.
+pub struct Logger[W] {
+  st: Mutex[LogState[W]]
+
+  # Writes s with the header, adding a newline if s doesn't end with one.
+  # `calldepth` is Go's frame count for LSHORTFILE / LLONGFILE (ignored:
+  # see the header).
+  pub def output(calldepth: Int, s: Str) -> ~Unit {
+    now = time.now
+    r = st.lock { |l|
+      line = format_header(now, l.prefix, l.flag, "???", 0) + s
+      line += "\n" if line.size == 0 || line[line.size - 1] != 10
+      res = l.emit!(line.bytes.to_a)
+      res.err
+    }
+    if e = r {
+      fail e
+    }
+  }
+
+  # Go's Print: s, then a newline if it doesn't end with one.
+  pub def print(s: Str) {
+    _ = output(2, s)
+  }
+
+  # Go's Printf (format with `fmt.sprintf` first).
+  pub def printf(s: Str) {
+    _ = output(2, s)
+  }
+
+  # Go's Println: s and a newline.
+  pub def println(s: Str) {
+    _ = output(2, s + "\n")
+  }
+
+  # print, then exit with status 1.
+  pub def fatal(s: Str) {
+    _ = output(2, s)
+    os.exit(1)
+  }
+
+  pub def fatalf(s: Str) {
+    _ = output(2, s)
+    os.exit(1)
+  }
+
+  pub def fatalln(s: Str) {
+    _ = output(2, s + "\n")
+    os.exit(1)
+  }
+
+  # print, then panic with s.
+  pub def panic(s: Str) {
+    _ = output(2, s)
+    raise(s)
+  }
+
+  pub def panicf(s: Str) {
+    _ = output(2, s)
+    raise(s)
+  }
+
+  pub def panicln(s: Str) {
+    _ = output(2, s + "\n")
+    raise(s + "\n")
+  }
+
+  pub def flags -> Int {
+    st.lock { |l| l.flag }
+  }
+
+  pub def set_flags(flag: Int) {
+    st.lock { |l| l.flag = flag }
+  }
+
+  pub def prefix -> Str {
+    st.lock { |l| l.prefix }
+  }
+
+  pub def set_prefix(prefix: Str) {
+    st.lock { |l| l.prefix = prefix }
+  }
+
+  # The output destination (a copy, taken under the lock).
+  pub def writer -> W {
+    st.lock { |l| l.out }
+  }
+
+  pub def set_output(w: W) {
+    st.lock { |l| l.out = w }
+  }
+}
+
+# A Logger writing to `out`, each line starting with `prefix` (or with the
+# prefix after the header, with LMSGPREFIX), with the header fields `flag`
+# selects.
+pub def new[W](out: W, prefix: Str, flag: Int) -> Logger[W] {
+  o = out.dup
+  Logger[W].new(st: Mutex.new(LogState[W].new(prefix: prefix, flag: flag, out: o)))
+}
+
+# The standard logger: stderr, LSTD_FLAGS, no prefix (a fresh one each call;
+# see the header).
+pub def default -> Logger[os.File] {
+  new(os.stderr, "", LSTD_FLAGS)
+}
+
+pub def print(s: Str) { default.print(s) }
+pub def printf(s: Str) { default.printf(s) }
+pub def println(s: Str) { default.println(s) }
+pub def fatal(s: Str) { default.fatal(s) }
+pub def fatalf(s: Str) { default.fatalf(s) }
+pub def fatalln(s: Str) { default.fatalln(s) }
+pub def panic(s: Str) { default.panic(s) }
+pub def panicf(s: Str) { default.panicf(s) }
+pub def panicln(s: Str) { default.panicln(s) }
+pub def output(calldepth: Int, s: Str) -> ~Unit { default.output(calldepth, s) }
+pub def flags -> Int { LSTD_FLAGS }
+pub def prefix -> Str { "" }
+pub def writer -> os.File { os.stderr }
+
+# Panics with s (a helper: the methods named panic hide the builtin).
+def raise(s: Str) {
+  assert false, s
+}
+
+# i in decimal, zero-padded to at least wid digits (Go's itoa).
+def itoa(i: Int, wid: Int) -> Str {
+  s = i.to_s
+  while s.size < wid {
+    s = "0" + s
+  }
+  s
+}
+
+# The line header for time t (Go's formatHeader): the prefix (unless
+# LMSGPREFIX), date, time, file:line, then the prefix with LMSGPREFIX.
+def format_header(t: time.Time, prefix: Str, flag: Int, file: Str, line: Int) -> Str {
+  out = ""
+  out += prefix if flag & LMSGPREFIX == 0
+  if flag & (LDATE | LTIME | LMICROSECONDS) != 0 {
+    tt = flag & LUTC != 0 ? t.utc : t
+    if flag & LDATE != 0 {
+      year, month, day = tt.date
+      out += "#{itoa(year, 4)}/#{itoa(month, 2)}/#{itoa(day, 2)} "
+    }
+    if flag & (LTIME | LMICROSECONDS) != 0 {
+      hour, min, sec = tt.clock
+      out += "#{itoa(hour, 2)}:#{itoa(min, 2)}:#{itoa(sec, 2)}"
+      out += ".#{itoa(tt.nanosecond / 1000, 6)}" if flag & LMICROSECONDS != 0
+      out += " "
+    }
+  }
+  if flag & (LSHORTFILE | LLONGFILE) != 0 {
+    f = file
+    if flag & LSHORTFILE != 0 {
+      i = file.size - 1
+      while i > 0 {
+        if file[i] == 47 {
+          f = file[i + 1...file.size]
+          break
+        }
+        i -= 1
+      }
+    }
+    out += "#{f}:#{line}: "
+  }
+  out += prefix if flag & LMSGPREFIX != 0
+  out
+}

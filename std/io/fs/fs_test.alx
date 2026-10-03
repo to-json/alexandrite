@@ -1,0 +1,153 @@
+# Go's io/fs tests without a MapFS (fs_test.go, format_test.go), and DirFS
+# over a temporary directory. The tests over fstest.MapFS (glob, readdir,
+# readfile, stat, sub, walk, readlink) are in std/testing/fstest/iofs_test.alx:
+# importing fstest here would compile a second io/fs.
+import "os"
+import "time"
+
+def valid_path_tests -> [(Str, Bool)] {
+  [
+    (".", true),
+    ("x", true),
+    ("x/y", true),
+    ("", false),
+    ("..", false),
+    ("/", false),
+    ("x/", false),
+    ("/x", false),
+    ("x/y/", false),
+    ("/x/y", false),
+    ("./", false),
+    ("./x", false),
+    ("x/.", false),
+    ("x/./y", false),
+    ("../", false),
+    ("../x", false),
+    ("x/..", false),
+    ("x/../y", false),
+    ("x//y", false),
+    ("x\\", true),
+    ("x\\y", true),
+    ("x:y", true),
+    ("\\x", true),
+  ]
+}
+
+test "valid path" {
+  for name, ok in valid_path_tests {
+    assert_eq valid_path?(name), ok
+  }
+  assert !valid_path?(Str.from_bytes([120, 255]))
+}
+
+def noon -> time.Time {
+  time.date(1970, 1, 1, 12, 0, 0, 0, time.utc)
+}
+
+# Go's formatTests: the FileInfo, FormatFileInfo, FormatDirEntry.
+def format_tests -> [(FileInfo, Str, Str)] {
+  [
+    (FileInfo.new(name: "hello.go", size: 100, mode: mode(0o644), mod_time: noon), "-rw-r--r-- 100 1970-01-01 12:00:00 hello.go", "- hello.go"),
+    (FileInfo.new(name: "home/gopher", size: 0, mode: mode(MODE_DIR | 0o755), mod_time: noon), "drwxr-xr-x 0 1970-01-01 12:00:00 home/gopher/", "d home/gopher/"),
+    (FileInfo.new(name: "big", size: 9223372036854775807, mode: mode(MODE_IRREGULAR | 0o644), mod_time: noon), "?rw-r--r-- 9223372036854775807 1970-01-01 12:00:00 big", "? big"),
+    (FileInfo.new(name: "small", size: -9223372036854775808, mode: mode(MODE_SOCKET | MODE_SETUID | 0o644), mod_time: noon), "Surw-r--r-- -9223372036854775808 1970-01-01 12:00:00 small", "S small"),
+  ]
+}
+
+test "format file info" {
+  for info, want, _ in format_tests {
+    assert_eq format_file_info(info), want
+    assert_eq info.to_s, want
+  }
+}
+
+test "format dir entry" {
+  for info, _, want in format_tests {
+    assert_eq format_dir_entry(file_info_to_dir_entry(info)), want
+  }
+}
+
+test "file mode" {
+  assert_eq mode(0).to_s, "----------"
+  assert_eq mode(MODE_DIR | 0o755).to_s, "drwxr-xr-x"
+  assert_eq mode(MODE_SYMLINK | 0o777).to_s, "Lrwxrwxrwx"
+  assert_eq mode(MODE_DEVICE | MODE_CHAR_DEVICE | 0o600).to_s, "Dcrw-------"
+  assert mode(MODE_DIR).is_dir?
+  assert !mode(MODE_DIR).is_regular?
+  assert mode(0o644).is_regular?
+  assert_eq mode(MODE_DIR | 0o755).perm, mode(0o755)
+  assert_eq mode(MODE_DIR | 0o755).type, mode(MODE_DIR)
+  assert_eq MODE_TYPE, MODE_DIR | MODE_SYMLINK | MODE_NAMED_PIPE | MODE_SOCKET | MODE_DEVICE | MODE_CHAR_DEVICE | MODE_IRREGULAR
+}
+
+test "errors" {
+  e = path_error("open", "x", "file does not exist")
+  assert_eq e.message, "open x: file does not exist"
+  assert is_not_exist(e)
+  assert !is_exist(e)
+  assert is_not_exist(FsError.NotExist)
+  assert is_permission(path_error("open", "x", "permission denied"))
+  assert_eq FsError.SkipDir.message, "skip this directory"
+  assert_eq FsError.SkipAll.message, "skip everything and stop the walk"
+  assert_eq FsError.Closed.message, "file already closed"
+}
+
+# A temporary tree: a/b.txt, a/c/d.txt, e.txt, a link.
+def make_tree -> ~Str {
+  dir = ~os.mkdir_temp("", "fstest")
+  ~os.mkdir_all(dir + "/a/c", 0o755)
+  ~os.write_file(dir + "/a/b.txt", "bee".bytes.to_a, 0o644)
+  ~os.write_file(dir + "/a/c/d.txt", "dee!".bytes.to_a, 0o600)
+  ~os.write_file(dir + "/e.txt", "".bytes.to_a, 0o644)
+  ~os.symlink("e.txt", dir + "/l")
+  dir
+}
+
+test "dir fs" {
+  dir = ~make_tree
+  fsys = dir_fs(dir)
+  assert_eq Str.from_bytes(~read_file(fsys, "a/b.txt")), "bee"
+  assert_eq Str.from_bytes(~read_file(fsys, "l")), ""
+  names = (~read_dir(fsys, ".")).map { |d| format_dir_entry(d) }.to_a
+  assert_eq names, ["d a/", "- e.txt", "L l"]
+  info = ~stat(fsys, "a/c/d.txt")
+  assert_eq info.name, "d.txt"
+  assert_eq info.size, 4
+  assert_eq info.mode.to_s, "-rw-------"
+  assert (~stat(fsys, "a")).is_dir
+  assert_eq (~lstat(fsys, "l")).mode.type, mode(MODE_SYMLINK)
+  assert_eq ~read_link(fsys, "l"), "e.txt"
+  r = read_file(fsys, "nope")
+  assert is_not_exist(r.err.unwrap)
+  assert_eq r.err.unwrap.message, "open nope: file does not exist"
+  bad = read_file(fsys, "../x")
+  assert is_invalid(bad.err.unwrap)
+  assert_eq ~glob(fsys, "a/*.txt"), ["a/b.txt"]
+  assert_eq ~glob(fsys, "*/*/*"), ["a/c/d.txt"]
+  # Open, read in pieces, read_dir! in pieces.
+  f = ~fsys.open("a/c/d.txt")
+  buf: [Byte] = [0; 3]
+  assert_eq ~f.read!(buf), 3
+  assert_eq ~f.read!(buf), 1
+  assert_eq ~f.read!(buf), 0
+  ~f.close!
+  d = ~fsys.open("a")
+  first = ~d.read_dir!(1)
+  assert_eq first.size, 1
+  rest = ~d.read_dir!(5)
+  assert_eq rest.size, 1
+  assert_eq (~d.read_dir!(1)).size, 0
+  ~d.close!
+  ~os.remove_all(dir)
+}
+
+test "dir fs walk" {
+  dir = ~make_tree
+  fsys = dir_fs(dir)
+  seen: [Str] = []
+  ~walk_dir(fsys, ".") { |p, d, err|
+    seen << p
+  }
+  assert_eq seen, [".", "a", "a/b.txt", "a/c", "a/c/d.txt", "e.txt", "l"]
+  ~os.remove_all(dir)
+}

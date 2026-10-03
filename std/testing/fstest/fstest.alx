@@ -1,0 +1,773 @@
+# Package fstest: Go's testing/fstest — an in-memory file system and a
+# checker for file system implementations.
+#
+#   Go                                      alx
+#   MapFS (map[string]*MapFile)             map_fs(files: Map[Str, MapFile]) -> MapFS
+#   MapFile{Data, Mode, ModTime, Sys}       MapFile.new(data:, mode:, mod_time:) (no Sys);
+#                                             map_file(data) / map_file_str(s) / map_dir
+#   MapFS.Open / ReadFile / ReadDir / Stat  open / read_file / read_dir / stat (fs's defaults)
+#     / Glob / ReadLink / Lstat / Sub         / glob / read_link / lstat; fs.sub(fsys, dir)
+#   TestFS(fsys, expected...) error         test_fs(fsys, expected) -> ~Unit<FstestError>
+#
+# MapFS follows Go's: paths are fs.valid_path? names; a directory exists if
+# it is in the map with fs.MODE_DIR or if some file's name has it as a
+# prefix (synthesised directories have mode MODE_DIR | 0o555); symlinks
+# (MODE_SYMLINK, data = target) are followed by open and described by lstat.
+#
+# Differences from Go:
+#  - `files` is a `Map[Str, MapFile]` (keys keep insertion order; MapFS
+#    sorts directory listings, as Go's does). Copies of a MapFS share the
+#    map, so adding to it after making the MapFS is seen, as in Go.
+#  - MapFile has no Sys field. Its zero mod_time is the zero time.Time.
+#  - TestFS checks every optional interface in Go only when the file system
+#    implements it; alx file systems always have them (fs.FS's default
+#    methods), so every check runs. Go's io.ReaderAt / io.Seeker checks of
+#    each file (through iotest.TestReader) aren't made: fs.File has neither.
+#  - Directory reads end with an empty slice, not io.EOF (fs's shape), and
+#    the checks expect that.
+#  - The errors are collected into one `FstestError.Failed` whose message
+#    is Go's ("TestFS found errors:\n" + one line per problem, and the
+#    "testing fs.Sub(fsys, dir): " prefix for the sub-tree check).
+
+import "io/fs"
+import "path"
+import "slices"
+import "strconv"
+import "strings"
+import "testing/iotest"
+import "time"
+import "unicode/utf8"
+
+# A file (or directory, or symlink) of a MapFS.
+pub struct MapFile {
+  data: [Byte]
+  mode: fs.FileMode
+  mod_time: time.Time
+}
+
+# A regular file holding data (mode 0).
+pub def map_file(data: [Byte]) -> MapFile {
+  MapFile.new(data: data, mode: fs.mode(0), mod_time: time.Time.new)
+}
+
+pub def map_file_str(s: Str) -> MapFile {
+  map_file(s.bytes.to_a)
+}
+
+# An explicit directory (mode MODE_DIR | 0o555).
+pub def map_dir -> MapFile {
+  e: [Byte] = []
+  MapFile.new(data: e, mode: fs.mode(fs.MODE_DIR | 0o555), mod_time: time.Time.new)
+}
+
+def synth_dir -> MapFile {
+  map_dir
+}
+
+def info_of(name: Str, f: MapFile) -> fs.FileInfo {
+  fs.FileInfo.new(name: path.base(name), size: f.data.size, mode: f.mode, mod_time: f.mod_time)
+}
+
+def entry_of(name: Str, f: MapFile) -> fs.DirEntry {
+  fs.file_info_to_dir_entry(info_of(name, f))
+}
+
+def by_name(a: (Str, MapFile), b: (Str, MapFile)) -> Int {
+  return -1 if a[0] < b[0]
+  return 1 if a[0] > b[0]
+  0
+}
+
+# An in-memory file system (Go's MapFS).
+pub struct MapFS {
+  files: Map[Str, MapFile]
+
+  pub def open(name: Str) -> ~fs.File {
+    fail fs.path_error("open", name, "file does not exist") if !fs.valid_path?(name)
+    real = resolve(name)
+    fail fs.path_error("open", name, "file does not exist") if real == none
+    rn = real.unwrap
+    file = files[rn]
+    if f = file {
+      if !f.mode.is_dir? {
+        return OpenMapFile.new(path: name, info: info_of(name, f), data: f.data, st: [0])
+      }
+    }
+    list: [(Str, MapFile)] = []
+    need: [Str] = []
+    if rn == "." {
+      files.each { |fname, f|
+        i = strings.index(fname, "/")
+        if i < 0 {
+          list << (fname, f) if fname != "."
+        } else {
+          need << fname[0...i] if !need.include?(fname[0...i])
+        }
+      }
+    } else {
+      prefix = rn + "/"
+      files.each { |fname, f|
+        if fname.start_with?(prefix) {
+          felem = fname[prefix.size...fname.size]
+          i = strings.index(felem, "/")
+          if i < 0 {
+            list << (felem, f)
+          } else {
+            n = felem[0...i]
+            need << n if !need.include?(n)
+          }
+        }
+      }
+      fail fs.path_error("open", name, "file does not exist") if file == none && list.size == 0 && need.size == 0
+    }
+    for n in need {
+      list << (n, synth_dir) if !list.any? { |e| e[0] == n }
+    }
+    slices.sort_func(list, by_name)
+    elem = name == "." ? "." : path.base(name)
+    entries = list.map { |e| entry_of(e[0], e[1]) }.to_a
+    MapDir.new(path: name, info: info_of(elem, file || synth_dir), entries: entries, st: [0])
+  }
+
+  # name with every symlink on the way resolved, or none (Go's
+  # resolveSymlinks).
+  def resolve(name: Str) -> Str? {
+    if f = files[name] {
+      if f.mode.type == fs.mode(fs.MODE_SYMLINK) {
+        target = Str.from_bytes(f.data)
+        return none if path.is_abs(target)
+        return resolve(path.join([path.dir(name), target]))
+      }
+    }
+    i = 0
+    while i < name.size {
+      j = strings.index(name[i...name.size], "/")
+      dir = ""
+      if j < 0 {
+        dir = name
+        i = name.size
+      } else {
+        dir = name[0...i + j]
+        i += j
+      }
+      if f = files[dir] {
+        if f.mode.type == fs.mode(fs.MODE_SYMLINK) {
+          target = Str.from_bytes(f.data)
+          return none if path.is_abs(target)
+          return resolve(path.join([path.dir(dir), target]) + name[i...name.size])
+        }
+      }
+      i += 1
+    }
+    fs.valid_path?(name) ? name : none
+  }
+
+  # The info of name without following a final symlink.
+  def lstat_info(name: Str) -> fs.FileInfo? {
+    return none if !fs.valid_path?(name)
+    real_dir = resolve(path.dir(name))
+    return none if real_dir == none
+    elem = path.base(name)
+    real = path.join([real_dir.unwrap, elem])
+    if f = files[real] {
+      return info_of(elem, f)
+    }
+    return info_of(elem, synth_dir) if real == "."
+    prefix = real + "/"
+    return info_of(elem, synth_dir) if files.keys.any? { |k| k.start_with?(prefix) }
+    none
+  }
+
+  pub def read_link(name: Str) -> ~Str {
+    info = lstat_info(name)
+    fail fs.path_error("readlink", name, "file does not exist") if info == none
+    i = info.unwrap
+    fail fs.path_error("readlink", name, "invalid argument") if i.mode.type != fs.mode(fs.MODE_SYMLINK)
+    real_dir = resolve(path.dir(name)) || "."
+    f = files[path.join([real_dir, path.base(name)])]
+    Str.from_bytes(f.unwrap.data)
+  }
+
+  pub def lstat(name: Str) -> ~fs.FileInfo {
+    info = lstat_info(name)
+    fail fs.path_error("lstat", name, "file does not exist") if info == none
+    info.unwrap
+  }
+}
+
+pub def map_fs(files: Map[Str, MapFile]) -> MapFS {
+  MapFS.new(files: files)
+}
+
+# An open regular file of a MapFS. `st[0]` is the read offset.
+pub struct OpenMapFile {
+  path: Str
+  info: fs.FileInfo
+  data: [Byte]
+  st: [Int]
+
+  pub def stat -> ~fs.FileInfo { info }
+  pub def close! -> ~Unit {}
+
+  pub def read!(p: [Byte]) -> ~Int {
+    off = st[0]
+    return 0 if off >= data.size
+    fail fs.path_error("read", path, "invalid argument") if off < 0
+    n = data.size - off
+    n = p.size if p.size < n
+    copy(p, data[off...off + n])
+    self.st[0] = off + n
+    n
+  }
+
+  # Go's Seek (whence 0, 1, 2).
+  pub def seek!(offset: Int, whence: Int) -> ~Int {
+    o = offset
+    o += st[0] if whence == 1
+    o += data.size if whence == 2
+    fail fs.path_error("seek", path, "invalid argument") if o < 0 || o > data.size
+    self.st[0] = o
+    o
+  }
+
+  # Go's ReadAt: the count read (short only at the end).
+  pub def read_at(p: [Byte], offset: Int) -> ~Int {
+    fail fs.path_error("read", path, "invalid argument") if offset < 0 || offset > data.size
+    n = data.size - offset
+    n = p.size if p.size < n
+    copy(p, data[offset...offset + n])
+    n
+  }
+}
+
+# An open directory of a MapFS. `st[0]` is how many entries were read.
+pub struct MapDir {
+  path: Str
+  info: fs.FileInfo
+  entries: [fs.DirEntry]
+  st: [Int]
+
+  pub def stat -> ~fs.FileInfo { info }
+  pub def close! -> ~Unit {}
+
+  pub def read!(p: [Byte]) -> ~Int {
+    fail fs.path_error("read", path, "invalid argument")
+  }
+
+  pub def read_dir!(count: Int) -> ~[fs.DirEntry] {
+    off = st[0]
+    n = entries.size - off
+    n = count if count > 0 && n > count
+    self.st[0] = off + n
+    entries[off...off + n]
+  }
+}
+
+# ------------------------------------------------------------------- TestFS
+
+pub error FstestError {
+  Failed(msg: Str)
+
+  def message -> Str {
+    case self {
+      Failed(msg) => msg
+    }
+  }
+}
+
+# Go's TestFS: walks fsys checking that every way of reading it agrees, and
+# that the expected files (and directories) are there. With nothing
+# expected, the file system must be empty. Then checks the sub-tree of the
+# first expected name that has a directory part through fs.sub.
+pub def test_fs[F](fsys: F, expected: [Str]) -> ~Unit {
+  ~test_fs_one(fsys, expected)
+  for name in expected {
+    i = strings.index(name, "/")
+    if i >= 0 {
+      dir = name[0...i]
+      dir_slash = name[0...i + 1]
+      sub_expected: [Str] = []
+      for n in expected {
+        sub_expected << n[dir_slash.size...n.size] if n.start_with?(dir_slash)
+      }
+      sub = ~fs.sub(fsys, dir)
+      r = test_fs_one(sub, sub_expected)
+      if e = r.err {
+        fail FstestError.Failed("testing fs.Sub(fsys, #{dir}): #{e.message}")
+      }
+      break
+    }
+  }
+}
+
+struct TesterState {
+  errors: [Str]
+  dirs: [Str]
+  files: [Str]
+}
+
+def test_fs_one[F](fsys: F, expected: [Str]) -> ~Unit {
+  e: [Str] = []
+  t = Tester[F].new(fsys: fsys, st: [TesterState.new(errors: e, dirs: e.dup, files: e.dup)])
+  t.check_dir!(".")
+  t.check_open!(".")
+  found: Map[Str, Bool] = {}
+  for d in t.st[0].dirs {
+    found[d] = true
+  }
+  for f in t.st[0].files {
+    found[f] = true
+  }
+  found.delete(".")
+  if expected.size == 0 && found.size > 0 {
+    list = found.keys
+    slices.sort(list)
+    list = list[0...10] + ["..."] if list.size > 15
+    t.errorf!("expected empty file system but found files:\n#{strings.join(list, "\n")}")
+  }
+  for name in expected {
+    t.errorf!("expected but not found: #{name}") if !found.include?(name)
+  }
+  errs = t.st[0].errors
+  return if errs.size == 0
+  fail FstestError.Failed("TestFS found errors:\n" + strings.join(errs, "\n"))
+}
+
+def format_entry(e: fs.DirEntry) -> Str {
+  "#{e.name} IsDir=#{e.is_dir} Type=#{e.type.to_s}"
+}
+
+def format_info_entry(i: fs.FileInfo) -> Str {
+  "#{i.name} IsDir=#{i.is_dir} Type=#{i.mode.type.to_s}"
+}
+
+def format_info(i: fs.FileInfo) -> Str {
+  "#{i.name} IsDir=#{i.is_dir} Mode=#{i.mode.to_s} Size=#{i.size} ModTime=#{i.mod_time.to_s}"
+}
+
+struct Tester[F] {
+  fsys: F
+  st: [TesterState]
+
+  def errorf!(msg: Str) {
+    self.st[0].errors << msg
+  }
+
+  def check_dir!(dir: Str) -> Unit {
+    self.st[0].dirs << dir
+    r = fsys.open(dir)
+    if e = r.err {
+      errorf!("#{dir}: Open: #{e.message}")
+      return
+    }
+    d = r.unwrap
+    lr = d.read_dir!(-1)
+    if e = lr.err {
+      d.close!
+      errorf!("#{dir}: ReadDir(-1): #{e.message}")
+      return
+    }
+    list = lr.unwrap
+    prefix = dir == "." ? "" : dir + "/"
+    for info in list {
+      name = info.name
+      if name == "." || name == ".." || name == "" {
+        errorf!("#{dir}: ReadDir: child has invalid name: `#{name}`")
+        next
+      }
+      if strings.contains(name, "/") {
+        errorf!("#{dir}: ReadDir: child name contains slash: `#{name}`")
+        next
+      }
+      if strings.contains(name, "\\") {
+        errorf!("#{dir}: ReadDir: child name contains backslash: `#{name}`")
+        next
+      }
+      p = prefix + name
+      check_stat!(p, info)
+      check_open!(p)
+      typ = info.type
+      if typ == fs.mode(fs.MODE_DIR) {
+        check_dir!(p)
+      } else if typ == fs.mode(fs.MODE_SYMLINK) {
+        self.st[0].files << p
+      } else {
+        check_file!(p)
+      }
+    }
+    # Reads at the end return nothing.
+    l2 = d.read_dir!(-1)
+    if (l2.ok || [info_placeholder]).size > 0 {
+      d.close!
+      errorf!("#{dir}: ReadDir(-1) at EOF = #{(l2.ok || []).size} entries, wanted 0 entries, nil")
+      return
+    }
+    l3 = d.read_dir!(1)
+    if (l3.ok || [info_placeholder]).size > 0 {
+      d.close!
+      errorf!("#{dir}: ReadDir(1) at EOF = #{(l3.ok || []).size} entries, wanted 0 entries, EOF")
+      return
+    }
+    cr = d.close!
+    if e = cr.err {
+      errorf!("#{dir}: Close: #{e.message}")
+    }
+    # Close twice is allowed to fail but must not crash.
+    _ = d.close!
+
+    # A second open reads the same list.
+    r2 = fsys.open(dir)
+    if e = r2.err {
+      errorf!("#{dir}: Open: #{e.message}")
+      return
+    }
+    d2 = r2.unwrap
+    l4 = d2.read_dir!(-1)
+    _ = d2.close!
+    if e = l4.err {
+      errorf!("#{dir}: second Open+ReadDir(-1): #{e.message}")
+      return
+    }
+    check_dir_list!(dir, "first Open+ReadDir(-1) vs second Open+ReadDir(-1)", list, l4.unwrap)
+
+    # A third reads it 1, then 2 at a time.
+    r3 = fsys.open(dir)
+    if e = r3.err {
+      errorf!("#{dir}: Open: #{e.message}")
+      return
+    }
+    d3 = r3.unwrap
+    acc: [fs.DirEntry] = []
+    loop {
+      n = acc.size > 0 ? 2 : 1
+      fr = d3.read_dir!(n)
+      if e = fr.err {
+        errorf!("#{dir}: third Open: ReadDir(#{n}) after #{acc.size}: #{e.message}")
+        _ = d3.close!
+        return
+      }
+      frag = fr.unwrap
+      if frag.size > n {
+        errorf!("#{dir}: third Open: ReadDir(#{n}) after #{acc.size}: #{frag.size} entries (too many)")
+        _ = d3.close!
+        return
+      }
+      break if frag.size == 0
+      acc = acc + frag
+    }
+    _ = d3.close!
+    check_dir_list!(dir, "first Open+ReadDir(-1) vs third Open+ReadDir(1,2) loop", list, acc)
+
+    # The file system's own read_dir: the same list, sorted.
+    fr2 = fsys.read_dir(dir)
+    if e = fr2.err {
+      errorf!("#{dir}: fsys.ReadDir: #{e.message}")
+      return
+    }
+    l5 = fr2.unwrap
+    check_dir_list!(dir, "first Open+ReadDir(-1) vs fsys.ReadDir", list, l5)
+    i = 0
+    while i + 1 < l5.size {
+      errorf!("#{dir}: fsys.ReadDir: list not sorted: #{l5[i].name} before #{l5[i + 1].name}") if l5[i].name >= l5[i + 1].name
+      i += 1
+    }
+    fr3 = fs.read_dir(fsys, dir)
+    if e = fr3.err {
+      errorf!("#{dir}: fs.ReadDir: #{e.message}")
+      return
+    }
+    check_dir_list!(dir, "first Open+ReadDir(-1) vs fs.ReadDir", list, fr3.unwrap)
+    check_glob!(dir, fr3.unwrap)
+  }
+
+  def check_glob!(dir: Str, list: [fs.DirEntry]) {
+    glob = ""
+    if dir != "." {
+      elems = strings.split(dir, "/")
+      out: [Str] = []
+      ei = 0
+      for e in elems {
+        pat = ""
+        j = 0
+        for r in e.runes {
+          c = Str.from_bytes(utf8.encode_rune(r))
+          if c == "*" || c == "?" || c == "\\" || c == "[" || c == "-" {
+            pat += "\\" + c
+          } else {
+            k = (ei + j) % 5
+            pat += c if k == 0
+            pat += "[#{c}]" if k == 1
+            pat += "[#{c}-#{c}]" if k == 2
+            pat += "[\\#{c}]" if k == 3
+            pat += "[\\#{c}-\\#{c}]" if k == 4
+          }
+          j += c.size
+        }
+        out << pat
+        ei += 1
+      }
+      glob = strings.join(out, "/") + "/"
+    }
+    bad = fsys.glob(glob + "nonexist/[]")
+    errorf!("#{dir}: Glob(`#{glob}nonexist/[]`): bad pattern not detected") if bad.err == none
+
+    c = 97
+    while c <= 122 {
+      ch = Str.from_bytes(utf8.encode_rune(c.to_i32))
+      have = list.any? { |d| strings.contains(d.name, ch) }
+      have_not = list.any? { |d| !strings.contains(d.name, ch) }
+      break if have && have_not
+      c += 1
+    }
+    c = 97 if c > 122
+    ch = Str.from_bytes(utf8.encode_rune(c.to_i32))
+    glob += "*" + ch + "*"
+    want: [Str] = []
+    for d in list {
+      want << path.join([dir, d.name]) if strings.contains(d.name, ch)
+    }
+    gr = fsys.glob(glob)
+    if e = gr.err {
+      errorf!("#{dir}: Glob(`#{glob}`): #{e.message}")
+      return
+    }
+    names = gr.unwrap
+    return if want == names
+    sorted = names.dup
+    slices.sort(sorted)
+    if sorted != names {
+      errorf!("#{dir}: Glob(`#{glob}`): unsorted output:\n#{strings.join(names, "\n")}")
+    }
+    problems: [Str] = []
+    wi = 0
+    ni = 0
+    while wi < want.size || ni < sorted.size {
+      if wi < want.size && ni < sorted.size && want[wi] == sorted[ni] {
+        wi += 1
+        ni += 1
+      } else if wi < want.size && (ni >= sorted.size || want[wi] < sorted[ni]) {
+        problems << "missing: " + want[wi]
+        wi += 1
+      } else {
+        problems << "extra: " + sorted[ni]
+        ni += 1
+      }
+    }
+    errorf!("#{dir}: Glob(`#{glob}`): wrong output:\n#{strings.join(problems, "\n")}")
+  }
+
+  def check_stat!(p: Str, entry: fs.DirEntry) {
+    r = fsys.open(p)
+    if e = r.err {
+      errorf!("#{p}: Open: #{e.message}")
+      return
+    }
+    file = r.unwrap
+    sr = file.stat
+    _ = file.close!
+    if e = sr.err {
+      errorf!("#{p}: Stat: #{e.message}")
+      return
+    }
+    info = sr.unwrap
+    fentry = format_entry(entry)
+    fientry = format_info_entry(info)
+    symlink = entry.type.bits & fs.MODE_SYMLINK != 0
+    if fentry != fientry && !symlink {
+      errorf!("#{p}: mismatch:\n\tentry = #{fentry}\n\tfile.Stat() = #{fientry}")
+    }
+    er = entry.info
+    if e = er.err {
+      errorf!("#{p}: entry.Info: #{e.message}")
+      return
+    }
+    einfo = er.unwrap
+    finfo = format_info(info)
+    if symlink {
+      feentry = format_info_entry(einfo)
+      errorf!("#{p}: mismatch\n\tentry = #{fentry}\n\tentry.Info() = #{feentry}\n") if fentry != feentry
+    } else {
+      feinfo = format_info(einfo)
+      errorf!("#{p}: mismatch:\n\tentry.Info() = #{feinfo}\n\tfile.Stat() = #{finfo}\n") if feinfo != finfo
+    }
+    s2 = fs.stat(fsys, p)
+    if e = s2.err {
+      errorf!("#{p}: fs.Stat: #{e.message}")
+      return
+    }
+    finfo2 = format_info(s2.unwrap)
+    errorf!("#{p}: fs.Stat(...) = #{finfo2}\n\twant #{finfo}") if finfo2 != finfo
+    s3 = fsys.stat(p)
+    if e = s3.err {
+      errorf!("#{p}: fsys.Stat: #{e.message}")
+      return
+    }
+    finfo3 = format_info(s3.unwrap)
+    errorf!("#{p}: fsys.Stat(...) = #{finfo3}\n\twant #{finfo}") if finfo3 != finfo
+    l = fsys.lstat(p)
+    if e = l.err {
+      errorf!("#{p}: fsys.Lstat: #{e.message}")
+      return
+    }
+    li = l.unwrap
+    fientry2 = format_info_entry(li)
+    errorf!("#{p}: mismatch:\n\tentry = #{fentry}\n\tfsys.Lstat(...) = #{fientry2}") if fentry != fientry2
+    feinfo2 = format_info(einfo)
+    finfo4 = format_info(li)
+    errorf!("#{p}: mismatch:\n\tentry.Info() = #{feinfo2}\n\tfsys.Lstat(...) = #{finfo4}\n") if feinfo2 != finfo4
+  }
+
+  def check_dir_list!(dir: Str, desc: Str, list1: [fs.DirEntry], list2: [fs.DirEntry]) {
+    old: Map[Str, fs.DirEntry] = {}
+    for e1 in list1 {
+      old[e1.name] = e1
+      check_mode!(dir, e1)
+    }
+    diffs: [Str] = []
+    for e2 in list2 {
+      if e1 = old[e2.name] {
+        if format_entry(e1) != format_entry(e2) {
+          diffs << "- " + format_entry(e1)
+          diffs << "+ " + format_entry(e2)
+        }
+        old.delete(e2.name)
+      } else {
+        check_mode!(dir, e2)
+        diffs << "+ " + format_entry(e2)
+      }
+    }
+    old.each { |_, e1| diffs << "- " + format_entry(e1) }
+    return if diffs.size == 0
+    slices.sort_func(diffs) { |a, b|
+      fa = strings.fields(a)
+      fb = strings.fields(b)
+      strings.compare(fa[1] + " " + fb[0], fb[1] + " " + fa[0])
+    }
+    errorf!("#{dir}: diff #{desc}:\n\t#{strings.join(diffs, "\n\t")}")
+  }
+
+  def check_mode!(dir: Str, e: fs.DirEntry) {
+    if e.is_dir != (e.type.bits & fs.MODE_DIR != 0) {
+      if e.is_dir {
+        errorf!("#{dir}: ReadDir returned #{e.name} with IsDir() = true, Type() & ModeDir = 0")
+      } else {
+        errorf!("#{dir}: ReadDir returned #{e.name} with IsDir() = false, Type() & ModeDir = ModeDir")
+      }
+    }
+  }
+
+  def check_file!(file: Str) {
+    self.st[0].files << file
+    r = fsys.open(file)
+    if e = r.err {
+      errorf!("#{file}: Open: #{e.message}")
+      return
+    }
+    f = r.unwrap
+    dr = read_all(f)
+    if e = dr.err {
+      _ = f.close!
+      errorf!("#{file}: Open+ReadAll: #{e.message}")
+      return
+    }
+    data = dr.unwrap
+    cr = f.close!
+    if e = cr.err {
+      errorf!("#{file}: Close: #{e.message}")
+    }
+    _ = f.close!
+    r2 = fsys.read_file(file)
+    if e = r2.err {
+      errorf!("#{file}: fsys.ReadFile: #{e.message}")
+      return
+    }
+    data2 = r2.unwrap
+    check_file_read!(file, "ReadAll vs fsys.ReadFile", data, data2)
+    # Changing what read_file returned doesn't change the file.
+    i = 0
+    while i < data2.size {
+      data2[i] = data2[i] +% 1
+      i += 1
+    }
+    r3 = fsys.read_file(file)
+    if e = r3.err {
+      errorf!("#{file}: second call to fsys.ReadFile: #{e.message}")
+      return
+    }
+    check_file_read!(file, "Readall vs second fsys.ReadFile", data, r3.unwrap)
+    for b in bad_paths(file) {
+      errorf!("#{file}: ReadFile(#{b}) succeeded, want error") if fsys.read_file(b).err == none
+    }
+    r4 = fs.read_file(fsys, file)
+    if e = r4.err {
+      errorf!("#{file}: fs.ReadFile: #{e.message}")
+      return
+    }
+    check_file_read!(file, "ReadAll vs fs.ReadFile", data, r4.unwrap)
+    r5 = fsys.open(file)
+    if e = r5.err {
+      errorf!("#{file}: second Open: #{e.message}")
+      return
+    }
+    f2 = r5.unwrap
+    tr = iotest.test_reader(f2, data)
+    _ = f2.close!
+    if e = tr.err {
+      errorf!("#{file}: failed TestReader:\n\t#{strings.replace_all(e.message, "\n", "\n\t")}")
+    }
+  }
+
+  def check_file_read!(file: Str, desc: Str, d1: [Byte], d2: [Byte]) {
+    if d1 != d2 {
+      errorf!("#{file}: #{desc}: different data returned\n\t#{strconv.quote(Str.from_bytes(d1))}\n\t#{strconv.quote(Str.from_bytes(d2))}")
+    }
+  }
+
+  def check_open!(file: Str) {
+    for b in bad_paths(file) {
+      r = fsys.open(b)
+      if f = r.ok {
+        g = f
+        _ = g.close!
+        errorf!("#{file}: Open(#{b}) succeeded, want error")
+      }
+    }
+  }
+}
+
+def info_placeholder -> fs.DirEntry {
+  fs.file_info_to_dir_entry(fs.FileInfo.new(name: "", size: 0, mode: fs.mode(0), mod_time: time.Time.new))
+}
+
+def read_all(f: fs.File) -> ~[Byte] {
+  src = f
+  out: [Byte] = []
+  chunk: [Byte] = [0; 512]
+  loop {
+    n = src.~read!(chunk)
+    break if n == 0
+    out = out + chunk[0...n]
+  }
+  out
+}
+
+# Go's checkBadPath names: invalid spellings of file.
+def bad_paths(file: Str) -> [Str] {
+  bad = ["/" + file, file + "/."]
+  bad << "/" if file == "."
+  i = strings.index(file, "/")
+  if i >= 0 {
+    bad << file[0...i] + "//" + file[i + 1...file.size]
+    bad << file[0...i] + "/./" + file[i + 1...file.size]
+    bad << file[0...i] + "\\" + file[i + 1...file.size]
+    bad << file[0...i] + "/../" + file
+  }
+  j = strings.last_index(file, "/")
+  if j >= 0 {
+    bad << file[0...j] + "//" + file[j + 1...file.size]
+    bad << file[0...j] + "/./" + file[j + 1...file.size]
+    bad << file[0...j] + "\\" + file[j + 1...file.size]
+    bad << file + "/../" + file[j + 1...file.size]
+  }
+  bad
+}

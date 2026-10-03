@@ -491,6 +491,12 @@ int64_t alx_sys_exec(const uint8_t *argv, int64_t argc, const uint8_t *env, int6
                      int64_t fd0, int64_t fd1, int64_t fd2);
 /* Blocks until a or b (either may be -1) is readable or hung up. 0 or -errno. */
 int64_t alx_sys_poll2(int64_t a, int64_t b);
+int64_t alx_sig_watch(int64_t mask);
+int64_t alx_sig_unwatch(int64_t rfd);
+int64_t alx_sig_reset(int64_t mask, int64_t how);
+int64_t alx_sig_ignored(int64_t sig);
+int64_t alx_user_lookup(int64_t kind, const char *key, uint8_t *out, int64_t n);
+int64_t alx_user_groups(const char *name, int64_t gid, uint8_t *out, int64_t n);
 
 /* ---------- the I/O event loop and sockets (std net, L3) ---------- */
 /* Wait until fd is readable (mode 1) or writable (mode 2) or in error: parks a

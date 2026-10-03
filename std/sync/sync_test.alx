@@ -1,3 +1,34 @@
+# Go's sync tests (waitgroup_test.go, once_test.go, oncefunc_test.go,
+# mutex_test.go, rwmutex_test.go, cond_test.go, map_test.go, pool_test.go,
+# example_test.go), translated. Every test is deterministic: tasks are
+# coordinated with channels and WaitGroups, never with sleeps.
+
+# Whether running f in its own task panics (Go's recover becomes a task's
+# wait), and the panic's message.
+def panic_message(f: () -> Unit) -> Str? {
+  g = f.dup
+  t = spawn { g() }
+  r = t.wait
+  if e = r.err {
+    m = e.message
+    m.start_with?("alexandrite: ") ? m[13...m.size] : m
+  } else {
+    none
+  }
+}
+
+# Whether a channel has a value ready (Go's `select { case <-c: ...; default: }`).
+def ready?(c: Chan[Bool]) -> Bool {
+  got = false
+  select {
+    when _ = c.recv => got = true
+    else => got = false
+  }
+  got
+}
+
+# ------------------------------------------------------------------ WaitGroup
+
 test "wait group" {
   wg = new_wait_group
   hits = Atomic.new(0)
@@ -17,6 +48,87 @@ test "wait group" {
   wg.wait
 }
 
+# Go's testWaitGroup / TestWaitGroup: two groups used as barriers, 8 times.
+test "wait group barrier" {
+  wg1 = new_wait_group
+  wg2 = new_wait_group
+  n = 16
+  (0...8).each { |_|
+    wg1.add(n)
+    wg2.add(n)
+    exited = Chan[Bool].new(n)
+    (0...n).each { |_|
+      spawn {
+        wg1.done
+        wg2.wait
+        exited << true
+      }
+    }
+    wg1.wait
+    (0...n).each { |_|
+      assert !ready?(exited), "WaitGroup released group too soon"
+      wg2.done
+    }
+    (0...n).each { |_| exited.recv }
+  }
+}
+
+test "wait group misuse" {
+  m = panic_message {
+    wg = new_wait_group
+    wg.add(1)
+    wg.done
+    wg.done
+  }
+  assert_eq m || "", "sync: negative WaitGroup counter"
+}
+
+test "wait group race" {
+  (0...200).each { |_|
+    wg = new_wait_group
+    n = Atomic.new(0)
+    wg.add(1)
+    spawn {
+      n.add(1)
+      wg.done
+    }
+    wg.add(1)
+    spawn {
+      n.add(1)
+      wg.done
+    }
+    wg.wait
+    assert_eq n.load, 2
+  }
+}
+
+test "wait group go" {
+  wg = new_wait_group
+  i = Atomic.new(0)
+  wg.go { i.add(1) }
+  wg.wait
+  assert_eq i.load, 1
+  (0...10).each { |_| wg.go { i.add(1) } }
+  wg.wait
+  assert_eq i.load, 11
+}
+
+example "wait group add and done" {
+  wg = new_wait_group
+  results = Mutex.new(0)
+  ["a", "b", "c"].each { |name|
+    wg.add(1)
+    spawn {
+      results.lock { |n| n += name.size }
+      wg.done
+    }
+  }
+  wg.wait
+  puts results.lock { |n| n }
+} outputs "3\n"
+
+# ----------------------------------------------------------------------- Once
+
 test "once" {
   o = new_once
   count = Atomic.new(0)
@@ -26,6 +138,82 @@ test "once" {
   assert o.done?
 }
 
+# Go's TestOnce: every caller returns only after the function has run.
+test "once waits for the first call" {
+  o = new_once
+  one = Atomic.new(0)
+  c = Chan[Bool].new
+  (0...10).each { |_|
+    spawn {
+      o.do { one.add(1) }
+      assert_eq one.load, 1
+      c << true
+    }
+  }
+  (0...10).each { |_| c.recv }
+  assert_eq one.load, 1
+}
+
+example "once" {
+  once = new_once
+  done = Chan[Bool].new
+  (0...10).each { |_|
+    spawn {
+      once.do { puts "Only once" }
+      done << true
+    }
+  }
+  (0...10).each { |_| done.recv }
+} outputs "Only once\n"
+
+test "once func" {
+  calls = Atomic.new(0)
+  f = once_func { calls.add(1) }
+  (0...10).each { |_| f.call }
+  assert_eq calls.load, 1
+}
+
+test "once value" {
+  calls = Atomic.new(0)
+  f = once_value { calls.add(1) }
+  (0...10).each { |_| assert_eq f.call, 1 }
+  assert_eq calls.load, 1
+}
+
+test "once values" {
+  calls = Atomic.new(0)
+  f = once_values {
+    c = calls.add(1)
+    (c, c + 1)
+  }
+  (0...10).each { |_|
+    v1, v2 = f.call
+    assert_eq v1, 1
+    assert_eq v2, 2
+  }
+  assert_eq calls.load, 1
+}
+
+example "once value" {
+  once = once_value {
+    sum = 0
+    (0...1000).each { |i| sum += i }
+    puts "Computed once: #{sum}"
+    sum
+  }
+  done = Chan[Bool].new
+  (0...10).each { |_|
+    spawn {
+      got = once.call
+      puts "want 499500 got #{got}" if got != 499500
+      done << true
+    }
+  }
+  (0...10).each { |_| done.recv }
+} outputs "Computed once: 499500\n"
+
+# ----------------------------------------------------------------------- Lock
+
 test "lock" {
   m = new_lock
   total = Atomic.new(0)
@@ -33,3 +221,654 @@ test "lock" {
   ts.each { it.wait }
   assert_eq total.load, 800
 }
+
+def hammer_lock(m: Lock, loops: Int, inside: Atomic[Int], c: Chan[Bool]) {
+  (0...loops).each { |i|
+    if i % 3 == 0 {
+      if m.try_lock? {
+        assert_eq inside.add(1), 1
+        inside.add(-1)
+        m.unlock
+      }
+      next
+    }
+    m.lock
+    assert_eq inside.add(1), 1
+    inside.add(-1)
+    m.unlock
+  }
+  c << true
+}
+
+# Go's TestMutex.
+test "mutex" {
+  m = new_lock
+  m.lock
+  assert !m.try_lock?, "TryLock succeeded with mutex locked"
+  m.unlock
+  assert m.try_lock?, "TryLock failed with mutex unlocked"
+  m.unlock
+  c = Chan[Bool].new
+  inside = Atomic.new(0)
+  (0...10).each { |_| spawn { hammer_lock(m, 1000, inside, c) } }
+  (0...10).each { |_| c.recv }
+}
+
+# Go's TestMutexMisuse (the Mutex cases).
+test "mutex misuse" {
+  assert_eq panic_message { new_lock.unlock } || "", "sync: unlock of unlocked mutex"
+  assert_eq panic_message {
+    mu = new_lock
+    mu.lock
+    mu.unlock
+    mu.unlock
+  } || "", "sync: unlock of unlocked mutex"
+  assert_eq panic_message { new_rw_mutex.unlock } || "", "sync: Unlock of unlocked RWMutex"
+  assert_eq panic_message { new_rw_mutex.runlock } || "", "sync: RUnlock of unlocked RWMutex"
+  assert_eq panic_message {
+    mu = new_rw_mutex
+    mu.rlock
+    mu.runlock
+    mu.runlock
+  } || "", "sync: RUnlock of unlocked RWMutex"
+  assert_eq panic_message {
+    mu = new_lock
+    mu.lock
+    mu.unlock
+  }, none
+}
+
+# Unlocked by another task than the one that locked it (allowed in Go).
+test "mutex handed over" {
+  m = new_lock
+  m.lock
+  t = spawn { m.unlock }
+  t.wait
+  assert m.try_lock?
+  m.unlock
+}
+
+# -------------------------------------------------------------------- RWMutex
+
+def parallel_reader(m: RWMutex, clocked: Chan[Bool], cunlock: Chan[Bool], cdone: Chan[Bool]) {
+  m.rlock
+  clocked << true
+  cunlock.recv
+  m.runlock
+  cdone << true
+}
+
+def do_test_parallel_readers(num_readers: Int) {
+  m = new_rw_mutex
+  clocked = Chan[Bool].new
+  cunlock = Chan[Bool].new
+  cdone = Chan[Bool].new
+  (0...num_readers).each { |_| spawn { parallel_reader(m, clocked, cunlock, cdone) } }
+  # Every reader holds the read lock at once.
+  (0...num_readers).each { |_| clocked.recv }
+  (0...num_readers).each { |_| cunlock << true }
+  (0...num_readers).each { |_| cdone.recv }
+}
+
+test "parallel readers" {
+  do_test_parallel_readers(1)
+  do_test_parallel_readers(3)
+  do_test_parallel_readers(4)
+}
+
+def rw_reader(rwm: RWMutex, iterations: Int, activity: Atomic[Int], cdone: Chan[Bool]) {
+  (0...iterations).each { |_|
+    rwm.rlock
+    n = activity.add(1)
+    assert n >= 1 && n < 10000, "wlock(#{n})"
+    activity.add(-1)
+    rwm.runlock
+  }
+  cdone << true
+}
+
+def rw_writer(rwm: RWMutex, iterations: Int, activity: Atomic[Int], cdone: Chan[Bool]) {
+  (0...iterations).each { |_|
+    rwm.lock
+    n = activity.add(10000)
+    assert_eq n, 10000
+    activity.add(-10000)
+    rwm.unlock
+  }
+  cdone << true
+}
+
+def hammer_rw_mutex(num_readers: Int, iterations: Int) {
+  # Number of active readers + 10000 * number of active writers.
+  activity = Atomic.new(0)
+  rwm = new_rw_mutex
+  cdone = Chan[Bool].new
+  spawn { rw_writer(rwm, iterations, activity, cdone) }
+  i = 0
+  while i < num_readers / 2 {
+    spawn { rw_reader(rwm, iterations, activity, cdone) }
+    i += 1
+  }
+  spawn { rw_writer(rwm, iterations, activity, cdone) }
+  while i < num_readers {
+    spawn { rw_reader(rwm, iterations, activity, cdone) }
+    i += 1
+  }
+  (0...2 + num_readers).each { |_| cdone.recv }
+}
+
+test "rw mutex" {
+  m = new_rw_mutex
+  m.lock
+  assert !m.try_lock?, "TryLock succeeded with mutex locked"
+  assert !m.try_rlock?, "TryRLock succeeded with mutex locked"
+  m.unlock
+  assert m.try_lock?, "TryLock failed with mutex unlocked"
+  m.unlock
+  assert m.try_rlock?, "TryRLock failed with mutex unlocked"
+  assert m.try_rlock?, "TryRLock failed with mutex rlocked"
+  assert !m.try_lock?, "TryLock succeeded with mutex rlocked"
+  m.runlock
+  m.runlock
+
+  n = 100
+  hammer_rw_mutex(1, n)
+  hammer_rw_mutex(3, n)
+  hammer_rw_mutex(10, n)
+  hammer_rw_mutex(5, n)
+}
+
+test "rlocker" {
+  wl = new_rw_mutex
+  rl: Locker = wl.rlocker
+  wlocked = Chan[Bool].new(1)
+  rlocked = Chan[Bool].new(1)
+  n = 10
+  spawn {
+    # Its own Locker value (an interface value is moved into a task).
+    trl: Locker = wl.rlocker
+    (0...n).each { |_|
+      trl.lock
+      trl.lock
+      rlocked << true
+      wl.lock
+      wlocked << true
+    }
+  }
+  (0...n).each { |_|
+    rlocked.recv
+    rl.unlock
+    assert !ready?(wlocked), "RLocker() didn't read-lock it"
+    rl.unlock
+    wlocked.recv
+    assert !ready?(rlocked), "RLocker() didn't respect the write lock"
+    wl.unlock
+  }
+}
+
+# A waiting writer keeps new readers out (Go's rule).
+test "rw mutex writer preference" {
+  m = new_rw_mutex
+  m.rlock
+  wrote = Chan[Bool].new(1)
+  spawn {
+    m.lock
+    wrote << true
+    m.unlock
+  }
+  # Wait until the writer is queued.
+  while m.st.lock { |s| s.wwait } == 0 {
+    t = spawn { 0 }
+    t.wait
+  }
+  assert !m.try_rlock?
+  m.runlock
+  wrote.recv
+  assert m.try_rlock?
+  m.runlock
+}
+
+test "rw mutex blocks" {
+  m = new_rw_mutex
+  count = Mutex.new(0)
+  wg = new_wait_group
+  (0...20).each { |i|
+    wg.add(1)
+    spawn {
+      if i % 4 == 0 {
+        m.with { count.lock { |c| c += 1 } }
+      } else {
+        m.read { count.lock { |c| c += 0 } }
+      }
+      wg.done
+    }
+  }
+  wg.wait
+  assert_eq count.lock { |c| c }, 5
+}
+
+# ----------------------------------------------------------------------- Cond
+
+test "cond signal" {
+  m = new_lock
+  c = new_cond(m)
+  n = 2
+  running = Chan[Bool].new(n)
+  awake = Chan[Bool].new(n)
+  (0...n).each { |_|
+    spawn {
+      m.lock
+      running << true
+      c.wait
+      awake << true
+      m.unlock
+    }
+  }
+  (0...n).each { |_| running.recv }
+  while n > 0 {
+    assert !ready?(awake), "goroutine not asleep"
+    m.lock
+    c.signal
+    m.unlock
+    awake.recv
+    assert !ready?(awake), "too many goroutines awake"
+    n -= 1
+  }
+  c.signal
+}
+
+test "cond signal generations" {
+  m = new_lock
+  c = new_cond(m)
+  n = 100
+  running = Chan[Bool].new(n)
+  awake = Chan[Int].new(n)
+  (0...n).each { |i|
+    spawn {
+      m.lock
+      running << true
+      c.wait
+      awake << i
+      m.unlock
+    }
+    if i > 0 {
+      a = awake.recv || -1
+      assert_eq a, i - 1
+    }
+    running.recv
+    m.lock
+    c.signal
+    m.unlock
+  }
+}
+
+test "cond broadcast" {
+  m = new_lock
+  c = new_cond(m)
+  n = 50
+  running = Chan[Int].new(n)
+  awake = Chan[Int].new(n)
+  exit = Atomic.new(false)
+  (0...n).each { |g|
+    spawn {
+      m.lock
+      while !exit.load {
+        running << g
+        c.wait
+        awake << g
+      }
+      m.unlock
+    }
+  }
+  (0...n).each { |i|
+    (0...n).each { |_| running.recv }
+    if i == n - 1 {
+      m.lock
+      exit.store(true)
+      m.unlock
+    }
+    m.lock
+    c.broadcast
+    m.unlock
+    seen = [false; n]
+    (0...n).each { |_|
+      g = awake.recv || 0
+      assert !seen[g], "goroutine woke up twice"
+      seen[g] = true
+    }
+  }
+  c.broadcast
+}
+
+# Go's TestRace: the lock is held across wait.
+test "cond race" {
+  x = Mutex.new(0)
+  m = new_lock
+  c = new_cond(m)
+  done = Chan[Bool].new
+  spawn {
+    c.l.lock
+    x.lock { |v| v = 1 }
+    c.wait
+    assert_eq x.lock { |v| v }, 2
+    x.lock { |v| v = 3 }
+    c.signal
+    c.l.unlock
+    done << true
+  }
+  spawn {
+    c.l.lock
+    loop {
+      if x.lock { |v| v } == 1 {
+        x.lock { |v| v = 2 }
+        c.signal
+        break
+      }
+      c.l.unlock
+      t = spawn { 0 }
+      t.wait
+      c.l.lock
+    }
+    c.l.unlock
+    done << true
+  }
+  spawn {
+    c.l.lock
+    loop {
+      if x.lock { |v| v } == 2 {
+        c.wait
+        assert_eq x.lock { |v| v }, 3
+        break
+      }
+      if x.lock { |v| v } == 3 {
+        break
+      }
+      c.l.unlock
+      t = spawn { 0 }
+      t.wait
+      c.l.lock
+    }
+    c.l.unlock
+    done << true
+  }
+  done.recv
+  done.recv
+  done.recv
+}
+
+# A Cond over an RWMutex's read half.
+test "cond over rlocker" {
+  rw = new_rw_mutex
+  c = new_cond(rw.rlocker)
+  woke = Chan[Bool].new(1)
+  started = Chan[Bool].new(1)
+  spawn {
+    c.l.lock
+    started << true
+    c.wait
+    c.l.unlock
+    woke << true
+  }
+  started.recv
+  # A reader can enter while the waiter is parked (it released its read lock).
+  loop {
+    break if c.waiters.lock { |ws| ws.size } == 1
+    t = spawn { 0 }
+    t.wait
+  }
+  assert rw.try_lock?
+  rw.unlock
+  c.broadcast
+  woke.recv
+}
+
+# ------------------------------------------------------------------ SharedMap
+
+test "shared map" {
+  m: SharedMap[Str, Int] = new_shared_map
+  assert_eq m.load("a"), none
+  m.store("a", 1)
+  assert_eq m.load("a"), 1
+  v, loaded = m.load_or_store("a", 2)
+  assert_eq v, 1
+  assert loaded
+  v2, loaded2 = m.load_or_store("b", 2)
+  assert_eq v2, 2
+  assert !loaded2
+  assert_eq m.swap("b", 3), 2
+  assert_eq m.swap("c", 4), none
+  assert m.compare_and_swap("c", 4, 5)
+  assert !m.compare_and_swap("c", 4, 6)
+  assert_eq m.load("c"), 5
+  assert !m.compare_and_delete("c", 4)
+  assert m.compare_and_delete("c", 5)
+  assert_eq m.load("c"), none
+  assert_eq m.load_and_delete("b"), 3
+  assert_eq m.load_and_delete("b"), none
+  m.delete("zz")
+  assert_eq m.size, 1
+  m.clear
+  assert_eq m.size, 0
+}
+
+# Go's TestCompareAndSwap_NonExistingKey.
+test "compare and swap non-existing key" {
+  m: SharedMap[Str, Int] = new_shared_map
+  assert !m.compare_and_swap("x", 0, 42), "CompareAndSwap on a non-existing key succeeded"
+  assert_eq m.load("x"), none
+}
+
+# Go's TestMapMatchesRWMutex / DeepCopy: random operation sequences give the
+# same results as a plain map (quick.Check's random calls, with a fixed
+# generator).
+test "shared map matches a plain map" {
+  seed = 12345
+  m: SharedMap[Int, Int] = new_shared_map
+  ref: Map[Int, Int] = {}
+  (0...3000).each { |_|
+    seed = (seed *% 6364136223846793005 +% 1442695040888963407)
+    op = (seed >> 33) % 9
+    k = (seed >> 40) % 8
+    v = (seed >> 20) % 5
+    case op {
+      0 => assert_eq m.load(k), ref[k]
+      1 => {
+        m.store(k, v)
+        ref[k] = v
+      }
+      2 => {
+        got, loaded = m.load_or_store(k, v)
+        if r = ref[k] {
+          assert_eq got, r
+          assert loaded
+        } else {
+          assert_eq got, v
+          assert !loaded
+          ref[k] = v
+        }
+      }
+      3 => {
+        assert_eq m.load_and_delete(k), ref[k]
+        ref.delete(k)
+      }
+      4 => {
+        m.delete(k)
+        ref.delete(k)
+      }
+      5 => {
+        assert_eq m.swap(k, v), ref[k]
+        ref[k] = v
+      }
+      6 => {
+        want = ref[k] == v
+        assert_eq m.compare_and_swap(k, v, v + 1), want
+        ref[k] = v + 1 if want
+      }
+      7 => {
+        want = ref[k] == v
+        assert_eq m.compare_and_delete(k, v), want
+        ref.delete(k) if want
+      }
+      _ => {
+        got: Map[Int, Int] = {}
+        m.range { |a, b|
+          got[a] = b
+          true
+        }
+        assert_eq got.size, ref.size
+        ref.each { |a, b| assert_eq got[a], b }
+      }
+    }
+  }
+}
+
+# Go's TestConcurrentRange: ranges see consistent values while writers run.
+test "concurrent range" {
+  map_size = 1 << 8
+  m: SharedMap[Int, Int] = new_shared_map
+  (1..map_size).each { |n| m.store(n, n) }
+  done = Atomic.new(false)
+  wg = new_wait_group
+  (0...4).each { |g|
+    wg.add(1)
+    spawn {
+      i = 0
+      while !done.load {
+        n = 1 + (i * 7 + g) % map_size
+        m.store(n, n * i * g)
+        i += 1
+      }
+      wg.done
+    }
+  }
+  (0...20).each { |_|
+    seen: Map[Int, Bool] = {}
+    m.range { |k, v|
+      assert v % k == 0, "while Storing multiples of #{k}, Range saw value #{v}"
+      assert !seen.include?(k), "Range visited key #{k} twice"
+      seen[k] = true
+      true
+    }
+    assert_eq seen.size, map_size
+  }
+  done.store(true)
+  wg.wait
+}
+
+# Go's TestMapRangeNestedCall: the map is usable from inside range.
+test "map range nested call" {
+  m: SharedMap[Int, Str] = new_shared_map
+  (0...3).each { |i| m.store(i, "a") }
+  m.range { |k, v|
+    m.range { |kk, vv|
+      if vv2 = m.load(kk) {
+        assert_eq vv2, vv
+      }
+      # Store, delete and store back the same pair.
+      m.store(42, "dummy")
+      m.delete(42)
+      true
+    }
+    m.store(k, v)
+    true
+  }
+  n = 0
+  m.range { |_, _|
+    n += 1
+    true
+  }
+  assert_eq n, 3
+}
+
+test "map range stops" {
+  m: SharedMap[Int, Int] = new_shared_map
+  (0...10).each { |i| m.store(i, i) }
+  n = 0
+  m.range { |_, _|
+    n += 1
+    n < 4
+  }
+  assert_eq n, 4
+}
+
+# Go's TestConcurrentClear.
+test "concurrent clear" {
+  m: SharedMap[Int, Int] = new_shared_map
+  wg = new_wait_group
+  wg.add(30)
+  (0...10).each { |i|
+    spawn {
+      m.store(i, i)
+      wg.done
+    }
+    spawn {
+      m.clear
+      wg.done
+    }
+    spawn {
+      m.delete(i)
+      wg.done
+    }
+  }
+  wg.wait
+  m.range { |k, v|
+    assert_eq k, v
+    true
+  }
+  m.clear
+  assert_eq m.size, 0
+}
+
+# ----------------------------------------------------------------------- Pool
+
+test "pool" {
+  p: ItemPool[Str] = new_pool { "new" }
+  assert_eq p.try_get, none
+  p.put("a")
+  p.put("b")
+  assert_eq p.get, "a"
+  assert_eq p.get, "b"
+  assert_eq p.try_get, none
+  (0...100).each { |_| p.put("c") }
+  assert_eq p.get, "c"
+  assert_eq p.get, "c"
+}
+
+test "pool new" {
+  i = Atomic.new(0)
+  p = new_pool { i.add(1) }
+  assert_eq p.get, 1
+  assert_eq p.get, 2
+  p.put(42)
+  assert_eq p.get, 42
+  assert_eq p.get, 3
+}
+
+# Go's TestPoolStress (smaller): concurrent put/get never loses or invents values.
+test "pool stress" {
+  p = new_pool { -1 }
+  wg = new_wait_group
+  (0...10).each { |g|
+    wg.add(1)
+    spawn {
+      v = g * 1000
+      (0...100).each { |j|
+        p.put(v + j)
+        x = p.get
+        assert x >= 0, "expected a pooled value"
+      }
+      wg.done
+    }
+  }
+  wg.wait
+}
+
+example "pool" {
+  buffers = new_pool { [0; 4] }
+  b = buffers.get
+  b[0] = 7
+  buffers.put(b)
+  c = buffers.get
+  puts c[0]
+  puts buffers.get[0]
+} outputs "7\n0\n"

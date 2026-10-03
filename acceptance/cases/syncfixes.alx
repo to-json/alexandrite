@@ -1,0 +1,86 @@
+# Compiler fixes found while porting sync, sync/atomic, log, io/fs,
+# testing/fstest and testing/iotest.
+import "sync"
+
+# 1. A generic function's block whose result decides a type parameter
+# (`once_value { 42 }`), and type parameters bound through function and
+# tuple types.
+def keep[T](f: () -> T) -> T {
+  f()
+}
+
+def pair_of[A, B](f: () -> (A, B)) -> (A, B) {
+  f()
+}
+
+puts keep { 40 + 2 }
+puts keep { "s" }
+a, b = pair_of { (1, "x") }
+puts "#{a} #{b}"
+
+# 2. The type a generic call's result is wanted as, for a type from another
+# package (`x: pkg.T[K, V] = pkg.make`).
+m: sync.SharedMap[Str, Int] = sync.new_shared_map
+m.store("k", 5)
+puts m.load("k") || 0
+
+# 3. An `if` statement whose arms end in a statement and in an optional
+# value: the statement is kept (it was dropped), and arms of different
+# types make a statement, not a miscompile.
+ref: Map[Int, Int] = {}
+(0...3).each { |i|
+  case i {
+    1 => {
+      ref[4] = 3 if ref[4] == none
+    }
+    2 => {
+      ref.delete(7)
+    }
+    _ => {}
+  }
+}
+puts ref[4] || -1
+
+# 4. An interface value whose implementors share no storage can go to
+# several tasks (a Cond's Locker).
+interface Bumper {
+  def bump -> Int
+}
+
+struct Counter {
+  n: Atomic[Int]
+  def bump -> Int { n.add(1) }
+}
+
+c = Counter.new(n: Atomic.new(0))
+bu: Bumper = c
+ts = (0...4).map { |_| spawn { bu.bump } }.to_a
+ts.each { it.wait }
+puts c.n.load
+
+# 5. A struct's `dup` is a deep copy that can go to a task; mutexes,
+# atomics and channels in it stay shared (they are handles).
+struct Bag {
+  items: [Int]
+  total: Mutex[Int]
+}
+
+def handed(b: Bag) -> Task[Int] {
+  mine = b.dup
+  spawn {
+    mine.items << 9
+    mine.total.lock { |t| t += mine.items.size }
+    mine.items.size
+  }
+}
+
+bag = Bag.new(items: [1, 2], total: Mutex.new(0))
+handed(bag).wait
+puts bag.items.size
+puts bag.total.lock { |t| t }
+
+# 6. `x == none` and `assert_eq x, none` on an optional whose value type has
+# no `==` (an Error).
+e: Error? = none
+puts e == none
+assert_eq e, none

@@ -1,0 +1,153 @@
+# Go's io/ioutil tests (ioutil_test.go, tempfile_test.go, example_test.go),
+# translated. Go reads its own source files; here a temporary tree.
+import "bytes"
+import "os"
+import "path"
+
+test "read file" {
+  assert read_file("rumpelstilzchen").err?
+  dir = ~temp_dir("", "ioutil")
+  name = dir + "/f.txt"
+  ~os.write_file(name, "0123456789".bytes.to_a, 0o644)
+  contents = ~read_file(name)
+  assert_eq contents.size, (~os.stat(name)).size
+  ~os.remove_all(dir)
+}
+
+test "write file" {
+  f = ~temp_file("", "ioutil-test")
+  filename = f.name
+  data = "Programming today is a race between software engineers striving to " +
+    "build bigger and better idiot-proof programs, and the Universe trying " +
+    "to produce bigger and better idiots. So far, the Universe is winning."
+  ~write_file(filename, data.bytes.to_a, 0o644)
+  assert_eq Str.from_bytes(~read_file(filename)), data
+  ~f.close!
+  ~os.remove(filename)
+}
+
+test "read only write file" {
+  return if os.getuid == 0
+  dir = ~temp_dir("", "TestReadOnlyWriteFile")
+  filename = path.join([dir, "blurp.txt"])
+  ~write_file(filename, "shmorp".bytes.to_a, 0o444)
+  assert write_file(filename, "florp".bytes.to_a, 0o444).err?, "Expected an error when writing to read-only file"
+  assert_eq Str.from_bytes(~read_file(filename)), "shmorp"
+  ~os.remove_all(dir)
+}
+
+test "read dir" {
+  assert read_dir("rumpelstilzchen").err?
+  dir = ~temp_dir("", "ioutil")
+  ~os.write_file(dir + "/io_test.go", [], 0o644)
+  ~os.mkdir(dir + "/ioutil", 0o755)
+  ~os.write_file(dir + "/a", [], 0o644)
+  list = ~read_dir(dir)
+  assert_eq list.map { |i| i.name }.to_a, ["a", "io_test.go", "ioutil"]
+  assert list.any? { |i| !i.is_dir && i.name == "io_test.go" }, "io_test.go file not found"
+  assert list.any? { |i| i.is_dir && i.name == "ioutil" }, "ioutil directory not found"
+  ~os.remove_all(dir)
+}
+
+test "temp file" {
+  dir = ~temp_dir("", "TestTempFile_BadDir")
+  r = temp_file(path.join([dir, "_not_exists_"]), "foo")
+  assert r.err?
+  ~os.remove_all(dir)
+}
+
+test "temp file pattern" {
+  for pattern, prefix, suffix in [("ioutil_test", "ioutil_test", ""), ("ioutil_test*", "ioutil_test", ""), ("ioutil_test*xyz", "ioutil_test", "xyz")] {
+    f = ~temp_file("", pattern)
+    base = path.base(f.name)
+    ~f.close!
+    ~os.remove(f.name)
+    assert base.start_with?(prefix) && base.end_with?(suffix), "TempFile pattern #{pattern} created bad name #{base}"
+  }
+}
+
+def bad_patterns -> [(Str, Bool)] {
+  [
+    ("ioutil*test", false),
+    ("ioutil_test*foo", false),
+    ("ioutil_test/foo", true),
+    ("ioutil_test*/foo", true),
+    ("ioutil_test/*foo", true),
+    ("/ioutil_test/*foo", true),
+    ("ioutil_test*foo/", true),
+  ]
+}
+
+test "temp file bad pattern" {
+  dir = ~temp_dir("", "TestTempFile_BadPattern")
+  for pattern, want_err in bad_patterns {
+    r = temp_file(dir, pattern)
+    if want_err {
+      assert r.err.unwrap.message.include?("pattern contains path separator"), pattern
+    } else {
+      f = ~r
+      ~f.close!
+    }
+  }
+  ~os.remove_all(dir)
+}
+
+def digits?(s: Str) -> Bool {
+  s.size > 0 && s.bytes.all? { |b| b >= 48 && b <= 57 }
+}
+
+test "temp dir" {
+  r = temp_dir("/_not_exists_", "foo")
+  assert r.err?
+  dir = os.temp_dir
+  for pattern, prefix, suffix in [("ioutil_test", "ioutil_test", ""), ("ioutil_test*", "ioutil_test", ""), ("ioutil_test*xyz", "ioutil_test", "xyz"), ("*xyz", "", "xyz")] {
+    name = ~temp_dir(dir, pattern)
+    ~os.remove(name)
+    start = path.join([dir, prefix])
+    start += "/" if prefix == ""
+    assert name.start_with?(start) && name.end_with?(suffix), name
+    assert digits?(name[start.size...name.size - suffix.size]), name
+  }
+}
+
+test "temp dir bad dir" {
+  dir = ~temp_dir("", "TestTempDir_BadDir")
+  bad_dir = path.join([dir, "not-exist"])
+  e = temp_dir(bad_dir, "foo").err.unwrap
+  assert os.is_not_exist(e)
+  assert_eq e.message, "mkdirtemp #{bad_dir}: no such file or directory"
+  ~os.remove_all(dir)
+}
+
+test "temp dir bad pattern" {
+  dir = ~temp_dir("", "TestTempDir_BadPattern")
+  for pattern, want_err in bad_patterns {
+    r = temp_dir(dir, pattern)
+    if want_err {
+      assert r.err.unwrap.message.include?("pattern contains path separator"), pattern
+    } else {
+      assert !r.err?, pattern
+    }
+  }
+  ~os.remove_all(dir)
+}
+
+test "nop closer and discard" {
+  r = nop_closer(bytes.new_buffer_string("abc"))
+  assert_eq Str.from_bytes(~read_all(r)), "abc"
+  ~r.close!
+  d = Discard.new
+  assert_eq d.write!("xyz".bytes.to_a), 3
+}
+
+example "read all" {
+  r = bytes.new_buffer_string("Go is a general-purpose language designed with systems programming in mind.")
+  print Str.from_bytes(read_all(r).unwrap)
+} outputs "Go is a general-purpose language designed with systems programming in mind."
+
+example "write file" {
+  dir = temp_dir("", "example").unwrap
+  write_file(dir + "/hello", "Hello, Gophers!".bytes.to_a, 0o644).unwrap
+  puts Str.from_bytes(read_file(dir + "/hello").unwrap)
+  os.remove_all(dir).unwrap
+} outputs "Hello, Gophers!\n"

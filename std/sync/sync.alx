@@ -1,13 +1,69 @@
 # Package sync: Go's sync, over alexandrite's own Mutex[T], Atomic[T] and
 # channels (R6). Every type here is a handle: copies share the same state,
-# so a WaitGroup or Once can be captured by tasks.
+# so a WaitGroup, Lock or Cond can be captured by any number of tasks.
+#
+#   Go                                  alx
+#   WaitGroup Add/Done/Wait/Go          new_wait_group -> WaitGroup: add, done, wait, go
+#   Once.Do(f)                          new_once -> Once: do { }, done?
+#   OnceFunc(f) / OnceValue(f) /        once_func(f) / once_value(f) / once_values(f)
+#     OnceValues(f): a func               -> OnceValue[T]: call
+#   Mutex Lock/Unlock/TryLock           new_lock -> Lock: lock, unlock, try_lock?, with { }
+#   RWMutex                             new_rw_mutex -> RWMutex: lock, unlock, rlock,
+#                                         runlock, try_lock?, try_rlock?, rlocker,
+#                                         with { } (writer), read { } (reader)
+#   Locker                              Locker (interface: lock, unlock)
+#   NewCond(l) / Cond Wait/Signal/      new_cond(l) -> Cond: wait, signal, broadcast, l
+#     Broadcast / Cond.L
+#   Map                                 new_shared_map[K, V] -> SharedMap[K, V]: load,
+#                                         store, load_or_store, load_and_delete,
+#                                         delete, swap, compare_and_swap,
+#                                         compare_and_delete, range, clear, size
+#   Pool{New: f} Get/Put                new_pool(f) -> ItemPool[T]: get, put, try_get
+#
+# How each maps onto the language:
+#  - `Lock` (Go's Mutex; the name Mutex is the language's own guarded-value
+#    lock) is a one-slot channel used as a semaphore: lock sends, unlock
+#    receives. Unlike the language's `Mutex[T].lock { }`, a Lock can be held
+#    across calls and released by another task, as Go's can. `with { }` holds
+#    it for a block. Waiting on it parks the task, so a self-deadlock is
+#    reported as "all tasks are asleep: deadlock", as in Go.
+#  - WaitGroup, RWMutex, Cond and Once keep their counters in a `Mutex[...]`
+#    and park waiters on channels that are closed to wake them (a closed
+#    channel wakes every receiver: Go's runtime semaphores).
+#  - Go's `sync/atomic` is the package `sync/atomic`, over `Atomic[T]`.
 #
 # Differences from Go:
-#   - The language's `Mutex[T]` guards a value and is held for a block
-#     (`m.lock { |v| ... }`); there's no separate Lock/Unlock that could be
-#     left held. `sync.Lock` is the same thing without a value (named Lock:
-#     `Mutex` is the language's own).
-#   - `Once.do` takes a block (or a function).
+#  - Names: Mutex -> Lock (the language's `Mutex[T]` guards a value), Map ->
+#    SharedMap (the builtin `Map[K, V]` is used inside), Pool -> ItemPool
+#    (`Pool[T]` is the language's handle pool). Zero values aren't usable:
+#    make each with its constructor (they hold shared state, GO-VS-RUBY D36).
+#  - OnceFunc / OnceValue / OnceValues return a `OnceValue[T]` whose `call`
+#    is Go's returned func: a closure can't hold a closure of its own type
+#    (a closure contains its captures), so the wrapper is a struct.
+#    (`once_func(f).call`, `once_value { 42 }.call`, `a, b = f.call`.)
+#  - `Once.do`, `once_func`, ... take a block (or a function). A panic in the
+#    function ends the task (alexandrite has no recover), so Go's re-panic
+#    behaviour of OnceFunc/OnceValue/OnceValues can't be observed.
+#  - `WaitGroup.go(f)` spawns `f` as a task, as Go 1.25's WaitGroup.Go.
+#  - SharedMap is a `Map[K, V]` under a lock (Go's is lock-free for reads).
+#    `range` calls the block on a snapshot taken under the lock, so the block
+#    may use the map (Go's Range allows that too). Keys keep insertion order.
+#    `size` is an addition (Go has none).
+#  - ItemPool has no garbage collector to empty it: items stay until taken.
+#    `get` calls the constructor when the pool is empty; `try_get` returns
+#    none instead (Go's Get without a New func returns nil).
+#  - Misuse is a panic with Go's message: "sync: negative WaitGroup
+#    counter", "sync: unlock of unlocked mutex", "sync: RUnlock of unlocked
+#    RWMutex", "sync: Unlock of unlocked RWMutex".
+#  - Go's Cond.L is `c.l`; Cond has no copy check (a copy is the same Cond).
+
+# Something that can be locked and unlocked (Go's Locker).
+pub interface Locker {
+  def lock
+  def unlock
+}
+
+# ------------------------------------------------------------------ WaitGroup
 
 # Waits for a collection of tasks to finish (Go's WaitGroup): `add` before
 # starting each, `done` when each finishes, `wait` until the count is 0.
@@ -16,14 +72,16 @@ pub struct WaitGroup {
 
   # Add `delta` (may be negative) to the count. A negative count panics.
   pub def add(delta: Int) {
-    st.lock { |s|
+    neg = st.lock { |s|
       s.n += delta
-      assert s.n >= 0, "sync: negative WaitGroup counter"
+      bad = s.n < 0
       if s.n == 0 {
         s.ch.close
         s.ch = Chan[Bool].new
       }
+      bad
     }
+    panic "sync: negative WaitGroup counter" if neg
   }
 
   # One task finished: `add(-1)`.
@@ -38,6 +96,17 @@ pub struct WaitGroup {
       c.recv
     }
   }
+
+  # Runs `f` in a new task, counted by the group (Go 1.25's WaitGroup.Go).
+  pub def go(f: () -> Unit) {
+    add(1)
+    g = f.dup
+    wg = self
+    spawn {
+      g()
+      wg.done
+    }
+  }
 }
 
 struct WgState {
@@ -49,7 +118,10 @@ pub def new_wait_group -> WaitGroup {
   WaitGroup.new(st: Mutex.new(WgState.new(n: 0, ch: Chan[Bool].new)))
 }
 
+# ----------------------------------------------------------------------- Once
+
 # Runs a function exactly once (Go's Once), however many tasks call `do`.
+# Callers that arrive while it runs wait for it to finish.
 pub struct Once {
   st: Mutex[Bool]
 
@@ -57,9 +129,9 @@ pub struct Once {
   pub def do(f: () -> Unit) {
     st.lock { |ran|
       if !ran {
+        ran = true
         f()
       }
-      ran = true
     }
   }
 
@@ -72,15 +144,442 @@ pub def new_once -> Once {
   Once.new(st: Mutex.new(false))
 }
 
-# A mutual-exclusion lock without a guarded value: `l.with { ... }`.
-pub struct Lock {
-  m: Mutex[Bool]
+struct OnceState[T] {
+  f: () -> T
+  v: T?
+}
 
+# `f` behind a Once (Go's OnceFunc / OnceValue / OnceValues result): `call`
+# runs `f` the first time and returns its value every time. Callers that
+# arrive while it runs wait for it.
+pub struct OnceValue[T] {
+  st: Mutex[OnceState[T]]
+
+  pub def call -> T {
+    st.lock { |s|
+      if v = s.v {
+        v
+      } else {
+        g = s.f
+        x = g()
+        s.v = x
+        x
+      }
+    }
+  }
+}
+
+# Go's OnceFunc: `f` runs at the first `call` only.
+pub def once_func(f: () -> Unit) -> OnceValue[Unit] {
+  once_value(f)
+}
+
+# Go's OnceValue: `call` returns the value of the first call of `f`.
+pub def once_value[T](f: () -> T) -> OnceValue[T] {
+  g = f.dup
+  OnceValue[T].new(st: Mutex.new(OnceState[T].new(f: g, v: none)))
+}
+
+# Go's OnceValues: once_value for a function returning a pair.
+pub def once_values[T, U](f: () -> (T, U)) -> OnceValue[(T, U)] {
+  once_value(f)
+}
+
+# ----------------------------------------------------------------------- Lock
+
+# A mutual-exclusion lock (Go's Mutex): `lock` / `unlock`, or `with { }`.
+pub struct Lock {
+  ch: Chan[Bool]
+
+  # Acquire the lock, parking until it is free.
+  pub def lock {
+    ch << true
+  }
+
+  # Release the lock. Unlocking an unlocked Lock panics.
+  pub def unlock {
+    held = false
+    select {
+      when _ = ch.recv => held = true
+      else => held = false
+    }
+    panic "sync: unlock of unlocked mutex" if !held
+  }
+
+  # Acquire the lock if it is free; report whether it was.
+  pub def try_lock? -> Bool {
+    got = false
+    select {
+      when ch.send(true) => got = true
+      else => got = false
+    }
+    got
+  }
+
+  # Run `f` holding the lock.
   pub def with(f: () -> Unit) {
-    m.lock { |_| f() }
+    lock
+    f()
+    unlock
   }
 }
 
 pub def new_lock -> Lock {
-  Lock.new(m: Mutex.new(false))
+  Lock.new(ch: Chan[Bool].new(1))
+}
+
+# -------------------------------------------------------------------- RWMutex
+
+struct RwState {
+  readers: Int
+  writer: Bool
+  # Writers waiting in `lock`: new readers wait behind them (Go's rule that a
+  # blocked Lock call excludes new readers).
+  wwait: Int
+  # Closed (and replaced) whenever the state changes, waking every waiter.
+  ch: Chan[Bool]
+}
+
+def rw_wake(s: RwState) -> RwState {
+  t = s
+  t.ch.close
+  t.ch = Chan[Bool].new
+  t
+}
+
+# A reader/writer lock (Go's RWMutex): any number of readers or one writer.
+pub struct RWMutex {
+  st: Mutex[RwState]
+
+  # Acquire for reading.
+  pub def rlock {
+    loop {
+      ch = st.lock { |s|
+        if !s.writer && s.wwait == 0 {
+          s.readers += 1
+          none
+        } else {
+          s.ch
+        }
+      }
+      if c = ch {
+        c.recv
+      } else {
+        break
+      }
+    }
+  }
+
+  # Release a read lock.
+  pub def runlock {
+    bad = st.lock { |s|
+      b = s.readers <= 0
+      if !b {
+        s.readers -= 1
+        s = rw_wake(s) if s.readers == 0
+      }
+      b
+    }
+    panic "sync: RUnlock of unlocked RWMutex" if bad
+  }
+
+  # Acquire for writing.
+  pub def lock {
+    st.lock { |s| s.wwait += 1 }
+    loop {
+      ch = st.lock { |s|
+        if !s.writer && s.readers == 0 {
+          s.writer = true
+          s.wwait -= 1
+          none
+        } else {
+          s.ch
+        }
+      }
+      if c = ch {
+        c.recv
+      } else {
+        break
+      }
+    }
+  }
+
+  # Release the write lock.
+  pub def unlock {
+    bad = st.lock { |s|
+      b = !s.writer
+      if !b {
+        s.writer = false
+        s = rw_wake(s)
+      }
+      b
+    }
+    panic "sync: Unlock of unlocked RWMutex" if bad
+  }
+
+  # Acquire for writing if no one holds the lock.
+  pub def try_lock? -> Bool {
+    st.lock { |s|
+      ok = !s.writer && s.readers == 0
+      s.writer = true if ok
+      ok
+    }
+  }
+
+  # Acquire for reading if no writer holds or waits for the lock.
+  pub def try_rlock? -> Bool {
+    st.lock { |s|
+      ok = !s.writer && s.wwait == 0
+      s.readers += 1 if ok
+      ok
+    }
+  }
+
+  # A Locker whose lock / unlock are this RWMutex's rlock / runlock.
+  pub def rlocker -> RLocker {
+    RLocker.new(rw: self)
+  }
+
+  # Run `f` holding the write lock.
+  pub def with(f: () -> Unit) {
+    lock
+    f()
+    unlock
+  }
+
+  # Run `f` holding a read lock.
+  pub def read(f: () -> Unit) {
+    rlock
+    f()
+    runlock
+  }
+}
+
+# The read half of an RWMutex as a Locker (Go's RWMutex.RLocker).
+pub struct RLocker {
+  rw: RWMutex
+
+  pub def lock {
+    rw.rlock
+  }
+
+  pub def unlock {
+    rw.runlock
+  }
+}
+
+pub def new_rw_mutex -> RWMutex {
+  RWMutex.new(st: Mutex.new(RwState.new(readers: 0, writer: false, wwait: 0, ch: Chan[Bool].new)))
+}
+
+# ----------------------------------------------------------------------- Cond
+
+# A condition variable (Go's Cond): tasks `wait` (holding `l`) until another
+# task calls `signal` (wakes one, the longest waiting) or `broadcast` (all).
+pub struct Cond {
+  # The lock held while observing or changing the condition (Go's Cond.L).
+  l: Locker
+  waiters: Mutex[[Chan[Bool]]]
+
+  # Release `l`, park until signalled, then take `l` again. Like Go's, a
+  # wake-up doesn't mean the condition holds: wait in a loop.
+  pub def wait {
+    me = Chan[Bool].new(1)
+    mine = me
+    waiters.lock { |ws| ws << mine }
+    lk = l
+    lk.unlock
+    me.recv
+    lk.lock
+  }
+
+  # Wake one waiting task, if any.
+  pub def signal {
+    first = waiters.lock { |ws|
+      if ws.size == 0 {
+        none
+      } else {
+        c = ws[0]
+        ws = ws[1...ws.size].dup
+        c
+      }
+    }
+    if c = first {
+      c << true
+    }
+  }
+
+  # Wake every waiting task.
+  pub def broadcast {
+    all = waiters.lock { |ws|
+      out = ws.dup
+      ws = []
+      out
+    }
+    all.each { |c| c << true }
+  }
+}
+
+pub def new_cond(l: Locker) -> Cond {
+  ws: [Chan[Bool]] = []
+  Cond.new(l: l, waiters: Mutex.new(ws))
+}
+
+# ------------------------------------------------------------------ SharedMap
+
+# A map safe for use by many tasks (Go's sync.Map).
+pub struct SharedMap[K, V] {
+  st: Mutex[Map[K, V]]
+
+  # The value stored for `key`, if any.
+  pub def load(key: K) -> V? {
+    st.lock { |m| m[key] }
+  }
+
+  pub def store(key: K, value: V) {
+    st.lock { |m| m[key] = value }
+  }
+
+  # The existing value (and true) if present; otherwise stores `value` and
+  # returns it (and false).
+  pub def load_or_store(key: K, value: V) -> (V, Bool) {
+    st.lock { |m|
+      if v = m[key] {
+        (v, true)
+      } else {
+        m[key] = value
+        (value, false)
+      }
+    }
+  }
+
+  # Deletes `key`, returning its previous value, if any.
+  pub def load_and_delete(key: K) -> V? {
+    st.lock { |m|
+      v = m[key]
+      m.delete(key)
+      v
+    }
+  }
+
+  pub def delete(key: K) {
+    st.lock { |m| m.delete(key) }
+  }
+
+  # Stores `value`, returning the previous value, if any.
+  pub def swap(key: K, value: V) -> V? {
+    st.lock { |m|
+      v = m[key]
+      m[key] = value
+      v
+    }
+  }
+
+  # Stores `new` if the value for `key` is `old`; reports whether it did.
+  pub def compare_and_swap(key: K, old: V, new: V) -> Bool {
+    st.lock { |m|
+      ok = false
+      if v = m[key] {
+        ok = v == old
+      }
+      m[key] = new if ok
+      ok
+    }
+  }
+
+  # Deletes `key` if its value is `old`; reports whether it did.
+  pub def compare_and_delete(key: K, old: V) -> Bool {
+    st.lock { |m|
+      ok = false
+      if v = m[key] {
+        ok = v == old
+      }
+      m.delete(key) if ok
+      ok
+    }
+  }
+
+  # Calls `f(key, value)` for each entry (a snapshot) until it returns false.
+  pub def range(f: (K, V) -> Bool) {
+    snap = st.lock { |m| m.to_a }
+    snap.each { |kv|
+      break if !f(kv[0], kv[1])
+    }
+  }
+
+  # Deletes every entry.
+  pub def clear {
+    st.lock { |m| m = {} }
+  }
+
+  # The number of entries (an addition: Go's Map has no Len).
+  pub def size -> Int {
+    st.lock { |m| m.size }
+  }
+}
+
+pub def new_shared_map[K, V] -> SharedMap[K, V] {
+  m: Map[K, V] = {}
+  SharedMap[K, V].new(st: Mutex.new(m))
+}
+
+# ----------------------------------------------------------------------- Pool
+
+struct PoolState[T] {
+  # Go's per-P private slot, then a last-in first-out stack (one P here).
+  private: T?
+  items: [T]
+  make: () -> T
+
+  def take! -> T? {
+    if v = private {
+      self.private = none
+      return v
+    }
+    return none if items.size == 0
+    x = items[items.size - 1]
+    self.items = items[0...items.size - 1].dup
+    x
+  }
+}
+
+# A set of reusable values (Go's Pool): `get` takes one (or makes one with the
+# constructor), `put` returns it. As Go's on one processor: the first value
+# put is the first taken, then the rest last-in first-out.
+pub struct ItemPool[T] {
+  st: Mutex[PoolState[T]]
+
+  # A pooled value, or a new one from the constructor (called holding the
+  # pool's lock: it must not use the pool).
+  pub def get -> T {
+    st.lock { |s|
+      v = s.take!
+      if x = v {
+        x
+      } else {
+        mk = s.make
+        mk()
+      }
+    }
+  }
+
+  # A pooled value, or none (Go's Get with no New func).
+  pub def try_get -> T? {
+    st.lock { |s| s.take! }
+  }
+
+  # Adds `x` to the pool.
+  pub def put(x: T) {
+    st.lock { |s|
+      full = s.private != none
+      s.items << x if full
+      s.private = x if !full
+    }
+  }
+}
+
+pub def new_pool[T](make: () -> T) -> ItemPool[T] {
+  items: [T] = []
+  mk = make.dup
+  ItemPool[T].new(st: Mutex.new(PoolState[T].new(private: none, items: items, make: mk)))
 }

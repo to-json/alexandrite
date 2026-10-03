@@ -98,11 +98,11 @@ test "large and streamed responses are chunked" {
   r = get(url(port, "/big")).unwrap
   assert_eq r.status, 200
   assert_eq r.body.size, 128000
-  assert_eq r.header.get("Transfer-Encoding"), "chunked"
+  assert_eq r.transfer_encoding, ["chunked"]
   assert_eq r.header.get("Content-Length"), ""
   r = get(url(port, "/stream")).unwrap
   assert_eq r.body_string, "one,two,three"
-  assert_eq r.header.get("Transfer-Encoding"), "chunked"
+  assert_eq r.transfer_encoding, ["chunked"]
   srv.shutdown
 }
 
@@ -130,7 +130,7 @@ test "keep-alive: several requests on one connection" {
     r = read_resp(br)
     assert_eq r.status, 200
     assert_eq r.body_string, "item #{i} q=-"
-    assert_eq r.header.get("Connection"), ""
+    assert !r.close
     i += 1
   }
   # Pipelined: two requests in one write.
@@ -138,31 +138,35 @@ test "keep-alive: several requests on one connection" {
   assert_eq read_resp(br).body_string, "hello"
   last = read_resp(br)
   assert_eq last.body_string, "hello"
-  assert_eq last.header.get("Connection"), "close"
+  assert last.close
   buf: [Byte] = [0; 16]
   assert_eq br.read!(buf).unwrap, 0
   c.close!.unwrap
   srv.shutdown
 }
 
-test "malformed requests get 400" {
+test "malformed requests get Go's error replies" {
   srv, port = start(test_mux())
   bads = [
-    "GARBAGE\r\n\r\n",
-    "GET /x HTTP/9.9\r\nHost: x\r\n\r\n",
-    "GET /x HTTP/1.1\r\n\r\n",
-    "GET /x HTTP/1.1\r\nHost: x\r\nbroken header\r\n\r\n",
-    "GET /x HTTP/1.1\r\nHost: x\r\nContent-Length: abc\r\n\r\n",
-    "GET /%zz HTTP/1.1\r\nHost: x\r\n\r\n",
-    "GET x HTTP/1.1\r\nHost: x\r\n\r\n"
+    ("GARBAGE\r\n\r\n", 400, "400 Bad Request"),
+    ("GET /x HTTP/9.9\r\nHost: x\r\n\r\n", 505, "505 HTTP Version Not Supported: unsupported protocol version"),
+    ("GET /x HTTP/1.1\r\n\r\n", 400, "400 Bad Request: missing required Host header"),
+    ("GET /x HTTP/1.1\r\nHost: x\r\nbroken header\r\n\r\n", 400, "400 Bad Request"),
+    ("GET /x HTTP/1.1\r\nHost: x\r\nContent-Length: abc\r\n\r\n", 400, "400 Bad Request"),
+    ("GET /%zz HTTP/1.1\r\nHost: x\r\n\r\n", 400, "400 Bad Request"),
+    ("GET x HTTP/1.1\r\nHost: x\r\n\r\n", 400, "400 Bad Request"),
+    ("GET / HTTP/1.1\r\nHost: a b\r\n\r\n", 400, "400 Bad Request: malformed Host header"),
+    ("GET / HTTP/1.1\r\nHost: x\r\nBad Name: v\r\n\r\n", 400, "400 Bad Request: invalid header name"),
+    ("POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: gzip\r\n\r\n", 501, "Unsupported transfer encoding")
   ]
   for b in bads {
     c = net.dial("tcp", "127.0.0.1:#{port}").unwrap
     br = bufio.new_reader(c)
-    c.write_string!(b).unwrap
+    c.write_string!(b[0]).unwrap
     r = read_resp(br)
-    assert_eq r.status, 400
-    assert_eq r.header.get("Connection"), "close"
+    assert_eq r.status, b[1]
+    assert_eq r.body_string, b[2]
+    assert r.close
     c.close!.unwrap
   }
   # The server is still fine.

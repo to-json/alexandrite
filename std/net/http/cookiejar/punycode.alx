@@ -1,0 +1,123 @@
+# Punycode (RFC 3492) for IDNA host names, after Go's cookiejar/punycode.go.
+import "strings"
+import "strconv"
+
+PC_BASE = 36
+PC_DAMP = 700
+PC_INITIAL_BIAS = 72
+PC_INITIAL_N = 128
+PC_SKEW = 38
+PC_TMAX = 26
+PC_TMIN = 1
+MAX_I32 = 2147483647
+
+pub error PunycodeError {
+  InvalidLabel(label: Str)
+
+  def message -> Str {
+    case self {
+      InvalidLabel(l) => "cookiejar: invalid label #{strconv.quote(l)}"
+    }
+  }
+}
+
+# The punycode encoding of s after prefix (Go's encode).
+def encode(prefix: Str, s: Str) -> ~Str {
+  out: [Byte] = prefix.bytes.to_a
+  delta = 0
+  n = PC_INITIAL_N
+  bias = PC_INITIAL_BIAS
+  b = 0
+  remaining = 0
+  rs = s.runes
+  for r in rs {
+    if r < 0x80 {
+      b += 1
+      out << r.as_u8
+    } else {
+      remaining += 1
+    }
+  }
+  h = b
+  out << 45 if b > 0
+  while remaining != 0 {
+    m = MAX_I32
+    for r in rs {
+      ri = r.to_i
+      m = ri if m > ri && ri >= n
+    }
+    delta += (m - n) * (h + 1)
+    fail PunycodeError.InvalidLabel(s) if delta > MAX_I32
+    n = m
+    for r in rs {
+      ri = r.to_i
+      if ri < n {
+        delta += 1
+        fail PunycodeError.InvalidLabel(s) if delta > MAX_I32
+        next
+      }
+      next if ri > n
+      q = delta
+      k = PC_BASE
+      loop {
+        t = k - bias
+        if t < PC_TMIN {
+          t = PC_TMIN
+        } else if t > PC_TMAX {
+          t = PC_TMAX
+        }
+        break if q < t
+        out << encode_digit(t + (q - t) % (PC_BASE - t))
+        q = (q - t) / (PC_BASE - t)
+        k += PC_BASE
+      }
+      out << encode_digit(q)
+      bias = adapt(delta, h + 1, h == b)
+      delta = 0
+      h += 1
+      remaining -= 1
+    }
+    delta += 1
+    n += 1
+  }
+  Str.from_bytes(out)
+}
+
+def encode_digit(digit: Int) -> Byte {
+  return (digit + 97).as_u8 if digit >= 0 && digit < 26
+  return (digit + 22).as_u8 if digit >= 26 && digit < 36
+  panic("cookiejar: internal error in punycode encoding")
+}
+
+def adapt(delta0: Int, num_points: Int, first_time: Bool) -> Int {
+  delta = first_time ? delta0 / PC_DAMP : delta0 / 2
+  delta += delta / num_points
+  k = 0
+  while delta > ((PC_BASE - PC_TMIN) * PC_TMAX) / 2 {
+    delta /= PC_BASE - PC_TMIN
+    k += PC_BASE
+  }
+  k + (PC_BASE - PC_TMIN + 1) * delta / (delta + PC_SKEW)
+}
+
+ACE_PREFIX = "xn--"
+
+def ascii?(s: Str) -> Bool {
+  for c in s.bytes {
+    return false if c >= 0x80
+  }
+  true
+}
+
+# s with each non-ASCII label punycode-encoded ("www.bücher.de" ->
+# "www.xn--bcher-kva.de"). Go's toASCII: no IDNA mapping or validation.
+def to_ascii(s: Str) -> ~Str {
+  return s if ascii?(s)
+  labels = strings.split(s, ".")
+  i = 0
+  while i < labels.size {
+    labels[i] = ~encode(ACE_PREFIX, labels[i]) unless ascii?(labels[i])
+    i += 1
+  }
+  strings.join(labels, ".")
+}

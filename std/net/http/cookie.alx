@@ -1,0 +1,454 @@
+# HTTP cookies, after Go's net/http/cookie.go (RFC 6265).
+#
+#   Go                                   alx
+#   Cookie{Name, Value, ...}             Cookie (snake_case fields; same_site an Int)
+#   (*Cookie).String() / Valid()         Cookie.to_s / Cookie.valid -> ~Unit
+#   ParseCookie(line)                    parse_cookie(line) -> ~[Cookie]
+#   ParseSetCookie(line)                 parse_set_cookie(line) -> ~Cookie
+#   SetCookie(w, c)                      set_cookie(w, c)
+#   (*Request).Cookies / Cookie / CookiesNamed / AddCookie
+#                                        request_cookies(r), request_cookie(r, name) -> ~Cookie,
+#                                        request_cookies_named(r, name), add_cookie(r, c)
+#   (*Response).Cookies()                response_cookies(resp)
+#   readSetCookies / readCookies         read_set_cookies(h), read_cookies(h, filter)
+#
+# Differences from Go: the Request/Response accessors are package functions
+# (they live in this file, next to the cookie code, instead of growing the
+# Request and Response structs); Go's log messages about dropped invalid
+# bytes and domains aren't printed; the GODEBUG httpcookiemaxnum setting
+# doesn't exist (the limit is Go's default, 3000).
+import "strconv"
+import "strings"
+import "time"
+import "net/netip"
+import "net/textproto"
+
+# Cookie.same_site values (Go's SameSite; 0 means unset).
+pub SAME_SITE_DEFAULT_MODE = 1
+pub SAME_SITE_LAX_MODE = 2
+pub SAME_SITE_STRICT_MODE = 3
+pub SAME_SITE_NONE_MODE = 4
+
+# Go's default limit on the number of cookies read from one header.
+pub COOKIE_MAX_NUM = 3000
+
+pub error CookieError {
+  Blank
+  EqualNotFound
+  InvalidName
+  InvalidValue
+  NumLimitExceeded
+  NotFound
+  # A Cookie.valid failure (Go's message).
+  Invalid(msg: Str)
+
+  def message -> Str {
+    case self {
+      Blank => "http: blank cookie"
+      EqualNotFound => "http: '=' not found in cookie"
+      InvalidName => "http: invalid cookie name"
+      InvalidValue => "http: invalid cookie value"
+      NumLimitExceeded => "http: number of cookies exceeded limit"
+      NotFound => "http: named cookie not present"
+      Invalid(m) => m
+    }
+  }
+}
+
+# An HTTP cookie as sent in a Set-Cookie header of a response or the Cookie
+# header of a request.
+pub struct Cookie {
+  name: Str
+  value: Str
+  # The value was quoted when parsed (it is written quoted again).
+  quoted: Bool
+  path: Str
+  domain: Str
+  # The zero Time when unset.
+  expires: time.Time
+  # The Expires attribute as read (reading only).
+  raw_expires: Str
+  # 0: no Max-Age attribute; < 0: "Max-Age=0" (delete now); > 0: seconds.
+  max_age: Int
+  secure: Bool
+  http_only: Bool
+  # One of the SAME_SITE_ constants, 0 if unset.
+  same_site: Int
+  partitioned: Bool
+  # The whole Set-Cookie line (reading only).
+  raw: Str
+  # Attribute-value pairs that weren't understood.
+  unparsed: [Str]
+
+  # The serialization for a Cookie header (name and value only) or a
+  # Set-Cookie header (with attributes); "" for an invalid name.
+  pub def to_s -> Str {
+    return "" unless token?(name)
+    b = strings.new_builder
+    b.write!(name)
+    b.write!("=")
+    b.write!(sanitize_cookie_value(value, quoted))
+    if path.size > 0 {
+      b.write!("; Path=")
+      b.write!(sanitize_cookie_path(path))
+    }
+    if domain.size > 0 && valid_cookie_domain?(domain) {
+      d = domain
+      d = d[1...d.size] if d[0] == 46
+      b.write!("; Domain=")
+      b.write!(d)
+    }
+    if valid_cookie_expires?(expires) {
+      b.write!("; Expires=")
+      b.write!(expires.utc.format(TIME_FORMAT))
+    }
+    if max_age > 0 {
+      b.write!("; Max-Age=")
+      b.write!(strconv.itoa(max_age))
+    } else if max_age < 0 {
+      b.write!("; Max-Age=0")
+    }
+    b.write!("; HttpOnly") if http_only
+    b.write!("; Secure") if secure
+    if same_site == SAME_SITE_NONE_MODE {
+      b.write!("; SameSite=None")
+    } else if same_site == SAME_SITE_LAX_MODE {
+      b.write!("; SameSite=Lax")
+    } else if same_site == SAME_SITE_STRICT_MODE {
+      b.write!("; SameSite=Strict")
+    }
+    b.write!("; Partitioned") if partitioned
+    b.to_s
+  }
+
+  pub def string -> Str { self.to_s }
+
+  # Fails with CookieError.Invalid when the cookie can't be sent as it is.
+  pub def valid -> ~Unit {
+    fail CookieError.Invalid("http: invalid Cookie.Name") unless token?(name)
+    fail CookieError.Invalid("http: invalid Cookie.Expires") if !expires.is_zero && !valid_cookie_expires?(expires)
+    for c in value.bytes {
+      fail CookieError.Invalid("http: invalid byte #{quote_byte(c)} in Cookie.Value") unless valid_cookie_value_byte?(c)
+    }
+    for c in path.bytes {
+      fail CookieError.Invalid("http: invalid byte #{quote_byte(c)} in Cookie.Path") unless valid_cookie_path_byte?(c)
+    }
+    fail CookieError.Invalid("http: invalid Cookie.Domain") if domain.size > 0 && !valid_cookie_domain?(domain)
+    fail CookieError.Invalid("http: partitioned cookies must be set with Secure") if partitioned && !secure
+  }
+}
+
+# Go's %q of a byte: 'x' or '\x00'.
+def quote_byte(c: Byte) -> Str {
+  strconv.quote_rune(c.to_i32)
+}
+
+def count_semis(s: Str) -> Int {
+  strings.count(s, ";")
+}
+
+# The cookies of a Cookie header line ("a=1; b=2"). Fails on the first
+# malformed pair.
+pub def parse_cookie(line: Str) -> ~[Cookie] {
+  nparts = count_semis(line) + 1
+  fail CookieError.NumLimitExceeded if nparts > COOKIE_MAX_NUM
+  fail CookieError.Blank if nparts == 1 && textproto.trim_string(line) == ""
+  out: [Cookie] = []
+  for s0 in strings.split(line, ";") {
+    s = textproto.trim_string(s0)
+    kv = strings.cut(s, "=")
+    fail CookieError.EqualNotFound unless kv.present?
+    name, raw = kv.unwrap
+    fail CookieError.InvalidName unless token?(name)
+    v, quoted, ok = parse_cookie_value(raw, true)
+    fail CookieError.InvalidValue unless ok
+    out << Cookie.new(name: name, value: v, quoted: quoted)
+  }
+  out
+}
+
+# Parses a Set-Cookie header line.
+pub def parse_set_cookie(line: Str) -> ~Cookie {
+  parts = strings.split(textproto.trim_string(line), ";")
+  fail CookieError.Blank if parts.size == 1 && parts[0] == ""
+  kv = strings.cut(textproto.trim_string(parts[0]), "=")
+  fail CookieError.EqualNotFound unless kv.present?
+  name0, raw = kv.unwrap
+  name = textproto.trim_string(name0)
+  fail CookieError.InvalidName unless token?(name)
+  v, quoted, ok = parse_cookie_value(raw, true)
+  fail CookieError.InvalidValue unless ok
+  c = Cookie.new(name: name, value: v, quoted: quoted, raw: line)
+  i = 1
+  while i < parts.size {
+    part = textproto.trim_string(parts[i])
+    i += 1
+    next if part.size == 0
+    attr = part
+    val0 = ""
+    if av = strings.cut(part, "=") {
+      attr, val0 = av
+    }
+    la = ascii_lower(attr)
+    next unless la.present?
+    lower_attr = la.unwrap
+    val, _, vok = parse_cookie_value(val0, false)
+    if !vok {
+      c.unparsed << part
+      next
+    }
+    if lower_attr == "samesite" {
+      lv = ascii_lower(val)
+      if l = lv {
+        if l == "lax" {
+          c.same_site = SAME_SITE_LAX_MODE
+        } else if l == "strict" {
+          c.same_site = SAME_SITE_STRICT_MODE
+        } else if l == "none" {
+          c.same_site = SAME_SITE_NONE_MODE
+        } else {
+          c.same_site = SAME_SITE_DEFAULT_MODE
+        }
+      } else {
+        c.same_site = SAME_SITE_DEFAULT_MODE
+      }
+      next
+    }
+    if lower_attr == "secure" {
+      c.secure = true
+      next
+    }
+    if lower_attr == "httponly" {
+      c.http_only = true
+      next
+    }
+    if lower_attr == "domain" {
+      c.domain = val
+      next
+    }
+    if lower_attr == "max-age" {
+      secs = strconv.atoi(val)
+      if secs.ok? && !(secs.unwrap != 0 && val[0] == 48) {
+        s = secs.unwrap
+        s = -1 if s <= 0
+        c.max_age = s
+        next
+      }
+    } else if lower_attr == "expires" {
+      c.raw_expires = val
+      t = time.parse(time.RFC1123, val)
+      t = time.parse("Mon, 02-Jan-2006 15:04:05 MST", val) if t.err?
+      if t.ok? {
+        c.expires = t.unwrap.utc
+        next
+      }
+      c.expires = time.Time.new
+    } else if lower_attr == "path" {
+      c.path = val
+      next
+    } else if lower_attr == "partitioned" {
+      c.partitioned = true
+      next
+    }
+    c.unparsed << part
+  }
+  c
+}
+
+# Go's ascii.ToLower: none unless every byte is printable ASCII.
+def ascii_lower(s: Str) -> Str? {
+  for c in s.bytes {
+    return none if c < 32 || c > 126
+  }
+  strings.to_lower(s)
+}
+
+# The cookies of every Set-Cookie line in h (bad lines are skipped).
+pub def read_set_cookies(h: Header) -> [Cookie] {
+  out: [Cookie] = []
+  lines = h.raw("Set-Cookie") || []
+  return out if lines.size == 0 || lines.size > COOKIE_MAX_NUM
+  for line in lines {
+    c = parse_set_cookie(line)
+    out << c.unwrap if c.ok?
+  }
+  out
+}
+
+# The cookies of h's Cookie lines; only those named `filter` unless it's "".
+pub def read_cookies(h: Header, filter: Str) -> [Cookie] {
+  out: [Cookie] = []
+  lines = h.raw("Cookie") || []
+  return out if lines.size == 0
+  count = 0
+  for line in lines {
+    count += count_semis(line) + 1
+  }
+  return out if count > COOKIE_MAX_NUM
+  for line0 in lines {
+    line = textproto.trim_string(line0)
+    while line.size > 0 {
+      part = line
+      rest = ""
+      if pr = strings.cut(line, ";") {
+        part, rest = pr
+      }
+      line = rest
+      part = textproto.trim_string(part)
+      next if part == ""
+      name = part
+      v0 = ""
+      if nv = strings.cut(part, "=") {
+        name, v0 = nv
+      }
+      name = textproto.trim_string(name)
+      next unless token?(name)
+      next if filter != "" && filter != name
+      v, quoted, ok = parse_cookie_value(v0, true)
+      next unless ok
+      out << Cookie.new(name: name, value: v, quoted: quoted)
+    }
+  }
+  out
+}
+
+# Adds a Set-Cookie header for c to w's header (nothing for an invalid name).
+pub def set_cookie(w: ResponseWriter, c: Cookie) {
+  v = c.to_s
+  w.header.add!("Set-Cookie", v) if v != ""
+}
+
+# The cookies sent with the request (Go's Request.Cookies).
+pub def request_cookies(r: Request) -> [Cookie] {
+  read_cookies(r.header, "")
+}
+
+# The cookies named `name` (Go's Request.CookiesNamed); none for "".
+pub def request_cookies_named(r: Request, name: Str) -> [Cookie] {
+  out: [Cookie] = []
+  return out if name == ""
+  read_cookies(r.header, name)
+}
+
+# The first cookie named `name`; CookieError.NotFound if there is none.
+pub def request_cookie(r: Request, name: Str) -> ~Cookie {
+  fail CookieError.NotFound if name == ""
+  cs = read_cookies(r.header, name)
+  fail CookieError.NotFound if cs.size == 0
+  cs[0]
+}
+
+# Adds c to the request's Cookie header (only its name and value; the name
+# and value are sanitized, attributes ignored).
+pub def add_cookie(r: Request, c: Cookie) {
+  s = sanitize_cookie_name(c.name) + "=" + sanitize_cookie_value(c.value, c.quoted)
+  h = r.header
+  old = h.get("Cookie")
+  if old != "" {
+    h.set!("Cookie", old + "; " + s)
+  } else {
+    h.set!("Cookie", s)
+  }
+}
+
+# The cookies set by the response's Set-Cookie headers.
+pub def response_cookies(resp: Response) -> [Cookie] {
+  read_set_cookies(resp.header)
+}
+
+def valid_cookie_domain?(v: Str) -> Bool {
+  return true if cookie_domain_name?(v)
+  return true if !strings.contains(v, ":") && netip.parse_addr(v).ok?
+  false
+}
+
+def valid_cookie_expires?(t: time.Time) -> Bool {
+  t.year >= 1601
+}
+
+# Whether s is a domain name (letters, digits, hyphens, dots; a letter
+# somewhere; labels of 1..63 bytes), optionally with a leading dot.
+pub def cookie_domain_name?(s0: Str) -> Bool {
+  s = s0
+  return false if s.size == 0 || s.size > 255
+  s = s[1...s.size] if s[0] == 46
+  last: Byte = 46
+  ok = false
+  partlen = 0
+  for c in s.bytes {
+    if (c >= 97 && c <= 122) || (c >= 65 && c <= 90) {
+      ok = true
+      partlen += 1
+    } else if c >= 48 && c <= 57 {
+      partlen += 1
+    } else if c == 45 {
+      return false if last == 46
+      partlen += 1
+    } else if c == 46 {
+      return false if last == 46 || last == 45
+      return false if partlen > 63 || partlen == 0
+      partlen = 0
+    } else {
+      return false
+    }
+    last = c
+  }
+  return false if last == 45 || partlen > 63
+  ok
+}
+
+def sanitize_cookie_name(n: Str) -> Str {
+  strings.replace_all(strings.replace_all(n, "\n", "-"), "\r", "-")
+}
+
+def sanitize_cookie_value(v0: Str, quoted: Bool) -> Str {
+  v = sanitize_by(v0, false)
+  return "\"" + v + "\"" if quoted || strings.contains_any(v, " ,")
+  v
+}
+
+def sanitize_cookie_path(v: Str) -> Str {
+  sanitize_by(v, true)
+}
+
+def valid_cookie_value_byte?(c: Byte) -> Bool {
+  c >= 0x20 && c < 0x7f && c != 34 && c != 59 && c != 92
+}
+
+def valid_cookie_path_byte?(c: Byte) -> Bool {
+  c >= 0x20 && c < 0x7f && c != 59
+}
+
+# v without the bytes that aren't valid cookie value (or path) bytes.
+def sanitize_by(v: Str, path: Bool) -> Str {
+  ok = true
+  for c in v.bytes {
+    good = path ? valid_cookie_path_byte?(c) : valid_cookie_value_byte?(c)
+    if !good {
+      ok = false
+      break
+    }
+  }
+  return v if ok
+  out: [Byte] = []
+  for c in v.bytes {
+    good = path ? valid_cookie_path_byte?(c) : valid_cookie_value_byte?(c)
+    out << c if good
+  }
+  Str.from_bytes(out)
+}
+
+# Go's parseCookieValue: the value (unquoted when allowed), whether it was
+# quoted, and whether it is valid.
+def parse_cookie_value(raw0: Str, allow_double_quote: Bool) -> (Str, Bool, Bool) {
+  raw = raw0
+  quoted = false
+  if allow_double_quote && raw.size > 1 && raw[0] == 34 && raw[raw.size - 1] == 34 {
+    raw = raw[1...raw.size - 1]
+    quoted = true
+  }
+  for c in raw.bytes {
+    return ("", quoted, false) unless valid_cookie_value_byte?(c)
+  }
+  (raw, quoted, true)
+}

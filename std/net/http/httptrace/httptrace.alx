@@ -1,0 +1,167 @@
+# Package httptrace: Go's net/http/httptrace, hooks that follow an HTTP
+# client request through its life (connection, request written, first
+# response byte).
+#
+#   trace = httptrace.ClientTrace.new(
+#     got_conn: [->(info: httptrace.GotConnInfo) { puts "conn #{info.conn.remote_addr}" }],
+#     wrote_request: [->(info: httptrace.WroteRequestInfo) { puts "sent" }])
+#   req = http.with_client_trace(~http.new_request("GET", url, []), trace)
+#   resp = ~http.new_client.do(req)
+#
+#   Go                                   alx
+#   ClientTrace{GetConn: f, ...}         ClientTrace.new(get_conn: [f], ...)
+#   WithClientTrace(ctx, t) ctx          http.with_client_trace(req, t) -> Request
+#                                        (with_client_trace(old, t) here, for any holder)
+#   ContextClientTrace(ctx) *ClientTrace http.client_trace(req) -> ClientTrace?
+#   (*ClientTrace).compose(old)          ClientTrace.compose(old) -> ClientTrace
+#   GotConnInfo, DNSStartInfo, DNSDoneInfo, WroteRequestInfo   same names, snake_case fields
+#
+# Differences from Go:
+#  - Each hook is a LIST of functions (empty: not set), not one func.
+#    Composing two traces concatenates the lists (the new trace's hooks
+#    first, then the old one's), which is what Go's compose builds out of
+#    closures; alx can't build that closure (a closure can't capture a
+#    closure of its own type: it would contain itself). The client calls
+#    the hooks through the `fire_*` methods.
+#  - alx's context carries no values (std/context), so a trace travels on
+#    the Request itself (`Request.trace`), not in its context; attaching a
+#    second trace composes it with the first exactly as WithClientTrace does.
+#  - A lambda's captures are copies (D16), so a hook that records something
+#    writes to shared storage (a slice, a strings.Builder, a channel, an
+#    Atomic).
+#  - What fires in alx's client (net/http client.alx): get_conn, dns_start /
+#    dns_done (only for a host name, not an IP literal: the client then
+#    resolves the name itself with net.lookup_host and dials the first
+#    address), connect_start / connect_done, got_conn (never reused: the
+#    client has no connection pool), wrote_header_field, wrote_headers,
+#    wrote_request, got_first_response_byte. Never fire: put_idle_conn (no
+#    pool), got_100_continue / wait_100_continue / got_1xx_response (the
+#    client doesn't send Expect: 100-continue or surface 1xx responses).
+#    The TLS hooks don't exist (no crypto/tls yet).
+#  - DNSDoneInfo.addrs are address strings (Go: []net.IPAddr); errors are
+#    `Error?` (Go: error, nil when none). GotConnInfo.idle_time is in
+#    nanoseconds.
+import "net"
+import "net/textproto"
+
+# Details of a connection the client got.
+pub struct GotConnInfo {
+  conn: net.Conn
+  # Taken from a pool of idle connections (always false: no pool).
+  reused: Bool
+  was_idle: Bool
+  # Nanoseconds it was idle.
+  idle_time: Int
+}
+
+pub struct DNSStartInfo {
+  host: Str
+}
+
+pub struct DNSDoneInfo {
+  addrs: [Str]
+  err: Error?
+  coalesced: Bool
+}
+
+pub struct WroteRequestInfo {
+  err: Error?
+}
+
+# The hooks; each is a list of functions, called in order (empty: unset).
+pub struct ClientTrace {
+  # Before a connection is made for "host:port".
+  get_conn: [(Str) -> Unit]
+  got_conn: [(GotConnInfo) -> Unit]
+  put_idle_conn: [(Error?) -> Unit]
+  got_first_response_byte: [() -> Unit]
+  got_100_continue: [() -> Unit]
+  # The first failure stops the chain (and the request).
+  got_1xx_response: [(Int, textproto.MIMEHeader) -> ~Unit]
+  dns_start: [(DNSStartInfo) -> Unit]
+  dns_done: [(DNSDoneInfo) -> Unit]
+  # (network, addr)
+  connect_start: [(Str, Str) -> Unit]
+  # (network, addr, err)
+  connect_done: [(Str, Str, Error?) -> Unit]
+  # (key, values) after each header field is written
+  wrote_header_field: [(Str, [Str]) -> Unit]
+  wrote_headers: [() -> Unit]
+  wait_100_continue: [() -> Unit]
+  wrote_request: [(WroteRequestInfo) -> Unit]
+
+  # This trace with each of old's hooks run after its own (Go's compose).
+  pub def compose(old: ClientTrace) -> ClientTrace {
+    ClientTrace.new(get_conn: get_conn + old.get_conn, got_conn: got_conn + old.got_conn, put_idle_conn: put_idle_conn + old.put_idle_conn, got_first_response_byte: got_first_response_byte + old.got_first_response_byte, got_100_continue: got_100_continue + old.got_100_continue, got_1xx_response: got_1xx_response + old.got_1xx_response, dns_start: dns_start + old.dns_start, dns_done: dns_done + old.dns_done, connect_start: connect_start + old.connect_start, connect_done: connect_done + old.connect_done, wrote_header_field: wrote_header_field + old.wrote_header_field, wrote_headers: wrote_headers + old.wrote_headers, wait_100_continue: wait_100_continue + old.wait_100_continue, wrote_request: wrote_request + old.wrote_request)
+  }
+
+  # Whether any hook about the network connection is set.
+  pub def has_net_hooks? -> Bool {
+    dns_start.size > 0 || dns_done.size > 0 || connect_start.size > 0 || connect_done.size > 0
+  }
+
+  pub def fire_get_conn(host_port: Str) {
+    for f in get_conn { f(host_port) }
+  }
+
+  pub def fire_got_conn(info: GotConnInfo) {
+    for f in got_conn { f(info) }
+  }
+
+  pub def fire_put_idle_conn(err: Error?) {
+    for f in put_idle_conn { f(err) }
+  }
+
+  pub def fire_got_first_response_byte {
+    for f in got_first_response_byte { f() }
+  }
+
+  pub def fire_got_100_continue {
+    for f in got_100_continue { f() }
+  }
+
+  pub def fire_got_1xx_response(code: Int, h: textproto.MIMEHeader) -> ~Unit {
+    for f in got_1xx_response { ~f(code, h) }
+  }
+
+  pub def fire_dns_start(info: DNSStartInfo) {
+    for f in dns_start { f(info) }
+  }
+
+  pub def fire_dns_done(info: DNSDoneInfo) {
+    for f in dns_done { f(info) }
+  }
+
+  pub def fire_connect_start(network: Str, addr: Str) {
+    for f in connect_start { f(network, addr) }
+  }
+
+  pub def fire_connect_done(network: Str, addr: Str, err: Error?) {
+    for f in connect_done { f(network, addr, err) }
+  }
+
+  pub def fire_wrote_header_field(key: Str, values: [Str]) {
+    for f in wrote_header_field { f(key, values) }
+  }
+
+  pub def fire_wrote_headers {
+    for f in wrote_headers { f() }
+  }
+
+  pub def fire_wait_100_continue {
+    for f in wait_100_continue { f() }
+  }
+
+  pub def fire_wrote_request(info: WroteRequestInfo) {
+    for f in wrote_request { f(info) }
+  }
+}
+
+# `trace` composed with an earlier trace (Go's WithClientTrace without the
+# context: the new trace's hooks run first).
+pub def with_client_trace(old: ClientTrace?, trace: ClientTrace) -> ClientTrace {
+  if o = old {
+    return trace.compose(o)
+  }
+  trace
+}

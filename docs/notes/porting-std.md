@@ -1,5 +1,7 @@
 # Porting a Go std package to alx
 
+Start with AGENTS.md at the repository root (commands, context hygiene, the language in one page, where the compiler keeps what). This file adds the porting rules.
+
 The rules every std port follows (user decisions 2026-10-03, GO-VS-RUBY S1–S4, D35–D46). Read the existing packages too: `std/strconv`, `std/strings`, `std/bytes`, `std/time` and `std/encoding/json` are the reference ports.
 
 ## Done means

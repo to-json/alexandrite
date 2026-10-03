@@ -1,0 +1,693 @@
+# Package mail: Go's net/mail, parsing of mail messages (RFC 5322, with
+# RFC 6532's UTF-8). As in Go: obsolete address forms (routes) aren't
+# parsed, folding white space (CFWS) is supported only where Go supports it,
+# no Unicode normalization, and a leading mbox "From " line is accepted.
+#
+#   m = ~mail.read_message(r)               # any io.Reader
+#   m.header.get("Subject")
+#   body = ~io.read_all(m.body)
+#   a = ~mail.parse_address("Alice <alice@example.com>")
+#   a.name, a.address, a.to_s               # "\"Alice\" <alice@example.com>"
+#
+#   Go                                    alx
+#   ReadMessage(r) (*Message, error)      read_message(r) -> ~Message[R]
+#   Message{Header, Body io.Reader}       Message[R]{header, body: textproto.Reader[R]}
+#   Header (map[string][]string)          Header (get, values, keys, date, address_list)
+#   ParseDate(s) (time.Time, error)       parse_date(s) -> ~time.Time
+#   ParseAddress / ParseAddressList       parse_address / parse_address_list
+#   AddressParser{WordDecoder}            AddressParser{word_decoder: mime.WordDecoder?}
+#   (*Address).String()                   Address.to_s (also `string`)
+#   ErrHeaderNotPresent                   MailError.HeaderNotPresent
+#
+# Differences from Go:
+#  - Message is generic over the reader (`Message[R]`): its body is the
+#    textproto.Reader the header was read with (it buffers R, and is itself an
+#    io.Reader), so the body streams as Go's does. See net/textproto for why
+#    readers are generic.
+#  - Errors are MailError values: `Msg` carries Go's message text ("mail: no
+#    angle-addr", "malformed header line: ..."), `CharsetNotSupported` is Go's
+#    charsetError; errors from a custom word decoder's charset reader pass
+#    through unchanged.
+#  - Go's ReadMessage returns the header read so far when the input ends
+#    without the blank line; so does this (the body is then empty).
+#  - Header is a struct around an insertion-ordered Map[Str, [Str]].
+#  - AddressParser's decoder is std/mime's WordDecoder, whose charset reader
+#    works on bytes (see mime).
+#
+# Not translated: the two benchmarks (BenchmarkConsumePhrase/Comment) are
+# kept as `bench` blocks; nothing else is skipped.
+
+import "io"
+import "mime"
+import "net/netip"
+import "net/textproto"
+import "strconv"
+import "strings"
+import "time"
+import "unicode/utf8"
+
+pub error MailError {
+  # Go's errors.New / fmt.Errorf texts.
+  Msg(text: Str)
+  # A word encoded in a charset nothing can convert (Go's charsetError).
+  CharsetNotSupported(charset: Str)
+  # Header.date / address_list on an absent header (ErrHeaderNotPresent).
+  HeaderNotPresent
+
+  def message -> Str {
+    case self {
+      Msg(t) => t
+      CharsetNotSupported(c) => "charset not supported: #{strconv.quote(c)}"
+      HeaderNotPresent => "mail: header not in message"
+    }
+  }
+}
+
+def err(t: Str) -> MailError { MailError.Msg(t) }
+
+# ------------------------------------------------------------------ messages
+
+# A parsed mail message: its header and the reader positioned at its body.
+pub struct Message[R] {
+  header: Header
+  body: textproto.Reader[R]
+}
+
+# Reads a message's header from r; the body is what follows it.
+pub def read_message[R: io.Reader](r: R) -> ~Message[R] {
+  tp = textproto.new_reader(r)
+  h, eof = ~read_header(tp)
+  fail io.StreamError.UnexpectedEof if eof && h.size == 0
+  Message.new(header: h, body: tp)
+}
+
+# Go's readHeader: more lenient than textproto's MIME header (any key a
+# colon ends, mbox "From " lines). The Bool: the input ended before the blank
+# line.
+def read_header[R](r: textproto.Reader[R]) -> ~(Header, Bool) {
+  h = new_header
+  pk = ~r.peek!(1)
+  if pk.size > 0 && (pk[0] == 32 || pk[0] == 9) {
+    line = ~r.read_line!
+    fail io.StreamError.UnexpectedEof unless line.present?
+    fail err("malformed initial line: #{strconv.quote(line.unwrap)}")
+  }
+  loop {
+    kvo = ~r.read_continued_line!
+    return (h, true) unless kvo.present?
+    kv = kvo.unwrap
+    return (h, false) if kv.size == 0
+    kpos = strings.index_byte(kv, 58)
+    fail err("malformed header line: #{strconv.quote(kv)}") if kpos < 0
+    key = textproto.canonical_mime_header_key(kv[0...kpos])
+    next if key.size == 0
+    value = strings.trim_left(kv[kpos + 1...kv.size], " \t")
+    if vs = h.m[key] {
+      vs << value
+      h.m[key] = vs
+    } else {
+      h.m[key] = [value]
+    }
+  }
+}
+
+# A mail message header: keys in canonical form mapped to their values.
+pub struct Header {
+  m: Map[Str, [Str]]
+
+  # The first value of key (canonicalized), "" if absent.
+  pub def get(key: Str) -> Str {
+    if vs = m[textproto.canonical_mime_header_key(key)] {
+      return vs.size == 0 ? "" : vs[0]
+    }
+    ""
+  }
+
+  # Every value of key (canonicalized).
+  pub def values(key: Str) -> [Str] {
+    m[textproto.canonical_mime_header_key(key)] || []
+  }
+
+  # The values under key exactly as written (Go's h[key]).
+  pub def raw(key: Str) -> [Str]? { m[key] }
+
+  # Sets key's values exactly as written (Go's h[key] = vs).
+  pub def set_raw!(key: Str, vs: [Str]) {
+    self.m[key] = vs
+  }
+
+  pub def size -> Int { m.size }
+
+  pub def keys -> [Str] {
+    out: [Str] = []
+    for k, _ in m { out << k }
+    out
+  }
+
+  # The Date header, parsed.
+  pub def date -> ~time.Time {
+    hdr = get("Date")
+    fail MailError.HeaderNotPresent if hdr.size == 0
+    ~parse_date(hdr)
+  }
+
+  # The addresses in the header `key`.
+  pub def address_list(key: Str) -> ~[Address] {
+    hdr = get(key)
+    fail MailError.HeaderNotPresent if hdr.size == 0
+    ~parse_address_list(hdr)
+  }
+
+  def ==(o: Header) -> Bool {
+    return false if m.size != o.m.size
+    for k, vs in m {
+      if ws = o.m[k] {
+        return false unless vs == ws
+      } else {
+        return false
+      }
+    }
+    true
+  }
+}
+
+pub def new_header -> Header {
+  mm: Map[Str, [Str]] = {}
+  Header.new(m: mm)
+}
+
+# ---------------------------------------------------------------------- dates
+
+def date_layouts -> [Str] {
+  out: [Str] = []
+  for dow in ["", "Mon, "] {
+    for day in ["2", "02"] {
+      for year in ["2006", "06"] {
+        for second in [":05", ""] {
+          for zone in ["-0700", "MST", "UT"] {
+            out << dow + day + " Jan " + year + " 15:04" + second + " " + zone
+          }
+        }
+      }
+    }
+  }
+  out
+}
+
+# Parses an RFC 5322 date ("Fri, 21 Nov 1997 09:55:06 -0600"), with an
+# optional day of week, one- or two-digit days, two- or four-digit years,
+# optional seconds, numeric or named zones, and a trailing comment.
+pub def parse_date(date0: Str) -> ~time.Time {
+  date = strings.replace_all(date0, "\r\n", "")
+  fail err("mail: header has a CR without LF") if strings.contains(date, "\r")
+  p = AddrParser.new(s: date, dec: none)
+  p.skip_space!
+  ind = strings.index_any(p.s, "+-")
+  if ind != -1 && p.s.size >= ind + 5 {
+    date = p.s[0...ind + 5]
+    p.s = p.s[ind + 5...p.s.size]
+  } else {
+    ti = strings.index(p.s, "T")
+    if ti == 0 {
+      ti = strings.index(p.s[1...p.s.size], "T")
+      ti += 1 if ti != -1
+    }
+    if ti != -1 && p.s.size >= ti + 5 {
+      date = p.s[0...ti + 1]
+      p.s = p.s[ti + 1...p.s.size]
+    }
+  }
+  fail err("mail: misformatted parenthetical comment") unless p.skip_cfws!
+  for layout in date_layouts {
+    t = time.parse(layout, date)
+    return t.unwrap if t.ok?
+  }
+  fail err("mail: header could not be parsed")
+}
+
+# ------------------------------------------------------------------ addresses
+
+# One mail address: a display name (may be empty) and the addr-spec
+# "user@domain".
+pub struct Address {
+  name: Str
+  address: Str
+
+  # The address formatted for a header: `"Name" <user@domain>`, the local
+  # part quoted when needed and a non-ASCII name RFC 2047-encoded.
+  pub def to_s -> Str {
+    at = strings.last_index(address, "@")
+    local = address
+    domain = ""
+    if at >= 0 {
+      local = address[0...at]
+      domain = address[at + 1...address.size]
+    }
+    quote_local = false
+    i = 0
+    while i < local.size {
+      r, size = utf8.decode_rune_at(local, i)
+      if !atext?(r, false) {
+        if r == 46 && i > 0 && local[i - 1] != 46 && i < local.size - 1 {
+          i += size
+          next
+        }
+        quote_local = true
+        break
+      }
+      i += size
+    }
+    local = quote_string(local) if quote_local
+    s = "<" + local + "@" + domain + ">"
+    return s if name.size == 0
+    all_printable = true
+    for r in name.runes {
+      if (!vchar?(r) && !wsp?(r)) || multibyte?(r) {
+        all_printable = false
+        break
+      }
+    }
+    return quote_string(name) + " " + s if all_printable
+    if strings.contains_any(name, "\"#$%&'(),.:;<>@[]^`{|}~") {
+      return mime.WordEncoder.BEncoding.encode("utf-8", name) + " " + s
+    }
+    mime.WordEncoder.QEncoding.encode("utf-8", name) + " " + s
+  }
+
+  pub def string -> Str { to_s }
+}
+
+# Parses one address ("Barry Gibbs <bg@example.com>").
+pub def parse_address(address: Str) -> ~Address {
+  p = AddrParser.new(s: address, dec: none)
+  ~p.parse_single_address!
+}
+
+# Parses a comma-separated list of addresses (groups are flattened).
+pub def parse_address_list(list: Str) -> ~[Address] {
+  p = AddrParser.new(s: list, dec: none)
+  ~p.parse_address_list!
+}
+
+# An address parser with a custom RFC 2047 word decoder (Go's
+# AddressParser).
+pub struct AddressParser {
+  word_decoder: mime.WordDecoder?
+
+  pub def parse(address: Str) -> ~Address {
+    p = AddrParser.new(s: address, dec: word_decoder)
+    ~p.parse_single_address!
+  }
+
+  pub def parse_list(list: Str) -> ~[Address] {
+    p = AddrParser.new(s: list, dec: word_decoder)
+    ~p.parse_address_list!
+  }
+}
+
+struct AddrParser {
+  s: Str
+  dec: mime.WordDecoder?
+
+  def parse_address_list! -> ~[Address] {
+    list: [Address] = []
+    loop {
+      self.skip_space!
+      next if self.consume!(44)
+      addrs = ~self.parse_address!(true)
+      for a in addrs { list << a }
+      fail err("mail: misformatted parenthetical comment") unless self.skip_cfws!
+      break if empty?
+      fail err("mail: expected comma") if peek != 44
+      while self.consume!(44) {
+        self.skip_space!
+      }
+      break if empty?
+    }
+    list
+  }
+
+  def parse_single_address! -> ~Address {
+    addrs = ~self.parse_address!(true)
+    fail err("mail: misformatted parenthetical comment") unless self.skip_cfws!
+    fail err("mail: expected single address, got #{strconv.quote(s)}") unless empty?
+    fail err("mail: empty group") if addrs.size == 0
+    fail err("mail: group with multiple addresses") if addrs.size > 1
+    addrs[0]
+  }
+
+  # One address or a group (when handle_group).
+  def parse_address!(handle_group: Bool) -> ~[Address] {
+    self.skip_space!
+    fail err("mail: no address") if empty?
+    # address = mailbox / group; mailbox = name-addr / addr-spec
+    spec = self.consume_addr_spec!
+    if spec.ok? {
+      display_name = ""
+      self.skip_space!
+      if !empty? && peek == 40 {
+        display_name = ~self.consume_display_name_comment!
+      }
+      return [Address.new(name: display_name, address: spec.unwrap)]
+    }
+    display_name = ""
+    if peek != 60 {
+      display_name = ~self.consume_phrase!
+    }
+    self.skip_space!
+    if handle_group && self.consume!(58) {
+      return ~self.consume_group_list!
+    }
+    if !self.consume!(60) {
+      atext = true
+      for r in display_name.runes {
+        if !atext?(r, true) {
+          atext = false
+          break
+        }
+      }
+      fail err("mail: missing '@' or angle-addr") if atext
+      fail err("mail: no angle-addr")
+    }
+    sp = ~self.consume_addr_spec!
+    fail err("mail: unclosed angle-addr") unless self.consume!(62)
+    [Address.new(name: display_name, address: sp)]
+  }
+
+  def consume_group_list! -> ~[Address] {
+    group: [Address] = []
+    self.skip_space!
+    if self.consume!(59) {
+      fail err("mail: misformatted parenthetical comment") unless self.skip_cfws!
+      return group
+    }
+    loop {
+      self.skip_space!
+      addrs = ~self.parse_address!(false)
+      for a in addrs { group << a }
+      fail err("mail: misformatted parenthetical comment") unless self.skip_cfws!
+      if self.consume!(59) {
+        fail err("mail: misformatted parenthetical comment") unless self.skip_cfws!
+        break
+      }
+      fail err("mail: expected comma") unless self.consume!(44)
+    }
+    group
+  }
+
+  # An addr-spec; on failure the parser is left where it was.
+  def consume_addr_spec! -> ~Str {
+    orig = s
+    r = self.addr_spec!
+    self.s = orig if r.err?
+    ~r
+  }
+
+  def addr_spec! -> ~Str {
+    self.skip_space!
+    fail err("mail: no addr-spec") if empty?
+    local_part = ""
+    if peek == 34 {
+      local_part = ~self.consume_quoted_string!
+      fail err("mail: empty quoted string in addr-spec") if local_part.size == 0
+    } else {
+      local_part = ~self.consume_atom!(true, false)
+    }
+    fail err("mail: missing @ in addr-spec") unless self.consume!(64)
+    self.skip_space!
+    fail err("mail: no domain in addr-spec") if empty?
+    domain = ""
+    if peek == 91 {
+      domain = ~self.consume_domain_literal!
+    } else {
+      domain = ~self.consume_atom!(true, false)
+    }
+    local_part + "@" + domain
+  }
+
+  # A phrase: words (atoms, quoted strings, encoded-words) joined by
+  # spaces; adjacent encoded-words are joined without one.
+  def consume_phrase! -> ~Str {
+    words: [Str] = []
+    sb = ""
+    other_err: Error? = none
+    loop {
+      if words.size > 0 {
+        fail err("mail: misformatted parenthetical comment") unless self.skip_cfws!
+      }
+      self.skip_space!
+      break if empty?
+      word = ""
+      encoded = false
+      if peek == 34 {
+        q = self.consume_quoted_string!
+        if e = q.err {
+          other_err = e
+          break
+        }
+        word = q.unwrap
+      } else {
+        a = self.consume_atom!(true, true)
+        if e = a.err {
+          other_err = e
+          break
+        }
+        d = self.decode_rfc2047_word(a.unwrap)
+        if e = d.err {
+          other_err = e
+          break
+        }
+        word, encoded = d.unwrap
+      }
+      if encoded {
+        sb = sb + word
+      } else if sb.size > 0 {
+        words << sb
+        sb = ""
+        words << word
+      } else {
+        words << word
+      }
+    }
+    words << sb if sb.size > 0
+    if e = other_err {
+      fail err("mail: missing word in phrase: #{e.message}") if words.size == 0
+    }
+    strings.join(words, " ")
+  }
+
+  def consume_quoted_string! -> ~Str {
+    i = 1
+    out: [Byte] = []
+    escaped = false
+    loop {
+      r, size = utf8.decode_rune_at(s, i)
+      fail err("mail: unclosed quoted-string") if size == 0
+      fail err("mail: invalid utf-8 in quoted-string: #{strconv.quote(s)}") if size == 1 && r == utf8.RUNE_ERROR
+      if escaped {
+        fail err("mail: bad character in quoted-string: #{strconv.quote_rune(r)}") if !vchar?(r) && !wsp?(r)
+        out = utf8.append_rune(out, r)
+        escaped = false
+      } else if qtext?(r) || wsp?(r) {
+        out = utf8.append_rune(out, r)
+      } else if r == 34 {
+        break
+      } else if r == 92 {
+        escaped = true
+      } else {
+        fail err("mail: bad character in quoted-string: #{strconv.quote_rune(r)}")
+      }
+      i += size
+    }
+    self.s = s[i + 1...s.size]
+    Str.from_bytes(out)
+  }
+
+  # An atom (dot: dots allowed; permissive: leading, trailing and double
+  # dots allowed).
+  def consume_atom!(dot: Bool, permissive: Bool) -> ~Str {
+    i = 0
+    loop {
+      r, size = utf8.decode_rune_at(s, i)
+      fail err("mail: invalid utf-8 in address: #{strconv.quote(s)}") if size == 1 && r == utf8.RUNE_ERROR
+      break if size == 0 || !atext?(r, dot)
+      i += size
+    }
+    fail err("mail: invalid string") if i == 0
+    atom = s[0...i]
+    self.s = s[i...s.size]
+    if !permissive {
+      fail err("mail: leading dot in atom") if strings.has_prefix(atom, ".")
+      fail err("mail: double dot in atom") if strings.contains(atom, "..")
+      fail err("mail: trailing dot in atom") if strings.has_suffix(atom, ".")
+    }
+    atom
+  }
+
+  def consume_domain_literal! -> ~Str {
+    fail err("mail: missing \"[\" in domain-literal") unless self.consume!(91)
+    dtext = s
+    dlen = 0
+    loop {
+      fail err("mail: unclosed domain-literal") if empty?
+      break if peek == 93
+      r, size = utf8.decode_rune_at(s, 0)
+      fail err("mail: invalid utf-8 in domain-literal: #{strconv.quote(s)}") if size == 1 && r == utf8.RUNE_ERROR
+      fail err("mail: bad character in domain-literal: #{strconv.quote_rune(r)}") unless dtext?(r)
+      dlen += size
+      self.s = s[size...s.size]
+    }
+    dtext = dtext[0...dlen]
+    fail err("mail: unclosed domain-literal") unless self.consume!(93)
+    if strings.has_prefix(dtext, "IPv6:") {
+      fail err("mail: invalid IPv6 address in domain-literal: #{strconv.quote(dtext)}") unless go_parse_ip?(dtext[5...dtext.size], false)
+    } else {
+      fail err("mail: invalid IP address in domain-literal: #{strconv.quote(dtext)}") unless go_parse_ip?(dtext, true)
+    }
+    "[" + dtext + "]"
+  }
+
+  def consume_display_name_comment! -> ~Str {
+    fail err("mail: comment does not start with (") unless self.consume!(40)
+    comment, ok = self.consume_comment!
+    fail err("mail: misformatted parenthetical comment") unless ok
+    words = strings.fields_func(comment) { |r| r == 32 || r == 9 }
+    idx = 0
+    while idx < words.size {
+      decoded, encoded = ~self.decode_rfc2047_word(words[idx])
+      words[idx] = decoded if encoded
+      idx += 1
+    }
+    strings.join(words, " ")
+  }
+
+  def consume!(c: Byte) -> Bool {
+    return false if empty? || peek != c
+    self.s = s[1...s.size]
+    true
+  }
+
+  def skip_space! {
+    self.s = strings.trim_left(s, " \t")
+  }
+
+  def peek -> Byte { s[0] }
+
+  def empty? -> Bool { s.size == 0 }
+
+  # Skips white space and comments; false on a malformed comment.
+  def skip_cfws! -> Bool {
+    self.skip_space!
+    loop {
+      break unless self.consume!(40)
+      _, ok = self.consume_comment!
+      return false unless ok
+      self.skip_space!
+    }
+    true
+  }
+
+  # The rest of a comment whose "(" was consumed; whether it was closed.
+  def consume_comment! -> (Str, Bool) {
+    depth = 1
+    out: [Byte] = []
+    loop {
+      break if empty? || depth == 0
+      if peek == 92 && s.size > 1 {
+        self.s = s[1...s.size]
+      } else if peek == 40 {
+        depth += 1
+      } else if peek == 41 {
+        depth -= 1
+      }
+      out << s[0] if depth > 0
+      self.s = s[1...s.size]
+    }
+    (Str.from_bytes(out), depth == 0)
+  }
+
+  # Decodes s if it is an encoded-word: (word, true); (s, false) if it
+  # isn't one; fails when its charset can't be converted.
+  def decode_rfc2047_word(w: Str) -> ~(Str, Bool) {
+    d = dec || mime.WordDecoder.new(charset_reader: none)
+    r = d.decode(w)
+    return (r.unwrap, true) if r.ok?
+    e = r.err.unwrap
+    # (value-returning helpers, not a statement `case` assigning in its
+    # arms: the C backend mistypes that; see the port report)
+    if c = unhandled_charset(e) {
+      fail MailError.CharsetNotSupported(c)
+    }
+    return (w, false) if malformed_word?(e)
+    # an error from the decoder's charset reader
+    fail e
+  }
+}
+
+def unhandled_charset(e: Error) -> Str? {
+  case e {
+    UnhandledCharset(c) => c
+    _ => none
+  }
+}
+
+def malformed_word?(e: Error) -> Bool {
+  case e {
+    InvalidWord => true
+    InvalidHexByte => true
+    Base64 => true
+    _ => false
+  }
+}
+
+def atext?(r: Rune, dot: Bool) -> Bool {
+  return dot if r == 46
+  # RFC 5322 3.2.3 specials
+  return false if r == 40 || r == 41 || r == 60 || r == 62 || r == 91 || r == 93 || r == 58 || r == 59 || r == 64 || r == 92 || r == 44 || r == 34
+  vchar?(r)
+}
+
+def qtext?(r: Rune) -> Bool {
+  return false if r == 92 || r == 34
+  vchar?(r)
+}
+
+def vchar?(r: Rune) -> Bool {
+  (r >= 33 && r <= 126) || multibyte?(r)
+}
+
+def multibyte?(r: Rune) -> Bool { r >= 0x80 }
+
+def wsp?(r: Rune) -> Bool { r == 32 || r == 9 }
+
+def dtext?(r: Rune) -> Bool {
+  return false if r == 91 || r == 93 || r == 92
+  vchar?(r)
+}
+
+# s quoted as an RFC 5322 quoted-string (bytes that are neither VCHAR nor
+# white space are dropped).
+def quote_string(s: Str) -> Str {
+  out: [Byte] = [34]
+  for r in s.runes {
+    if qtext?(r) || wsp?(r) {
+      out = utf8.append_rune(out, r)
+    } else if vchar?(r) {
+      out << 92
+      out = utf8.append_rune(out, r)
+    }
+  }
+  out << 34
+  Str.from_bytes(out)
+}
+
+# Go's net.ParseIP(s) != nil, and (to4) that it is an IPv4 address (or an
+# IPv4-mapped IPv6 one); without to4, that it is an IP address at all.
+def go_parse_ip?(s: Str, to4: Bool) -> Bool {
+  r = netip.parse_addr(s)
+  return false if r.err?
+  a = r.unwrap
+  return false if a.zone.size > 0
+  return a.is4? || a.is4in6? if to4
+  true
+}

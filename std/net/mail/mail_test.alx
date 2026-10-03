@@ -1,0 +1,177 @@
+# Go's net/mail tests: the tables of message_test.go are in
+# go_tables_test.alx (generated from them), the rest here, with the helpers
+# both files and vec_mail_test.alx use.
+import "bytes"
+import "io"
+import "mime"
+import "strings"
+import "time"
+
+def render_addrs(as: [Address]) -> Str {
+  strings.join(as.map { |a| a.name + "|" + a.address }.to_a, ";")
+}
+
+def render_header(h: Header) -> Str {
+  parts: [Str] = []
+  for k in h.keys.sort {
+    parts << k + "=[" + strings.join(h.raw(k) || [], "|") + "]"
+  }
+  strings.join(parts, ";")
+}
+
+def pa(s: Str) -> Str {
+  r = parse_address(s)
+  return "ERR " + r.err.unwrap.message if r.err?
+  a = r.unwrap
+  a.name + "|" + a.address
+}
+
+def pal(s: Str) -> Str {
+  r = parse_address_list(s)
+  return "ERR " + r.err.unwrap.message if r.err?
+  render_addrs(r.unwrap)
+}
+
+def pa_custom(s: Str) -> Str {
+  p = AddressParser.new(word_decoder: mime.WordDecoder.new(charset_reader: none))
+  r = p.parse(s)
+  return "ERR " + r.err.unwrap.message if r.err?
+  a = r.unwrap
+  a.name + "|" + a.address
+}
+
+# TestAddressParser's decoder: knows two more charsets, crudely.
+def test_parser -> AddressParser {
+  cr = ->(charset: Str, input: [Byte]) -> ~[Byte] {
+    out: [Byte] = []
+    for c in input {
+      if charset == "iso-8859-15" && c == 0xf6 {
+        out = out + "ö".bytes.to_a
+      } else if charset == "windows-1252" && c == 0xe9 {
+        out = out + "é".bytes.to_a
+      } else {
+        out << c
+      }
+    }
+    out
+  }
+  AddressParser.new(word_decoder: mime.WordDecoder.new(charset_reader: cr))
+}
+
+def ap_parse(s: Str) -> Str {
+  r = test_parser().parse(s)
+  return "ERR " + r.err.unwrap.message if r.err?
+  a = r.unwrap
+  a.name + "|" + a.address
+}
+
+def ap_parse_list(s: Str) -> Str {
+  r = test_parser().parse_list(s)
+  return "ERR " + r.err.unwrap.message if r.err?
+  render_addrs(r.unwrap)
+}
+
+def pd(s: Str) -> Int {
+  parse_date(s).unwrap.unix
+}
+
+def pd_err?(s: Str) -> Bool {
+  parse_date(s).err?
+}
+
+def hdr_date(s: Str) -> Int {
+  h = new_header
+  h.set_raw!("Date", [s])
+  h.date.unwrap.unix
+}
+
+def pds(s: Str) -> Str {
+  r = parse_date(s)
+  return "ERR " + r.err.unwrap.message if r.err?
+  r.unwrap.format(time.RFC3339)
+}
+
+def round_trip(s: Str) -> Str {
+  a = parse_address(s).unwrap
+  b = parse_address(a.to_s).unwrap
+  b.to_s
+}
+
+def fmt_round(name: Str, address: Str) -> Str {
+  s = Address.new(name: name, address: address).to_s
+  s + " => " + pa(s)
+}
+
+def read_msg(s: Str) -> Str {
+  r = read_message(bytes.new_buffer_string(s))
+  if e = r.err {
+    return e.message == "unexpected EOF" ? "ERR EOF" : "ERR " + e.message
+  }
+  m = r.unwrap
+  body = io.read_all(m.body).unwrap
+  render_header(m.header) + "\n" + Str.from_bytes(body)
+}
+
+test "empty address" {
+  assert parse_address("").err?
+  assert parse_address_list("").err?
+  assert parse_address_list(",").err?
+  assert parse_address_list("a@b c@d").err?
+}
+
+test "header address list and missing headers" {
+  m = read_message(bytes.new_buffer_string("To: Alice <alice@example.com>, bob@example.com\r\n\r\n")).unwrap
+  as = m.header.address_list("to").unwrap
+  assert_eq render_addrs(as), "Alice|alice@example.com;|bob@example.com"
+  assert_eq m.header.address_list("Cc").err.unwrap.message, "mail: header not in message"
+  assert_eq m.header.date.err.unwrap.message, "mail: header not in message"
+}
+
+test "read message errors" {
+  assert_eq read_msg(" leading space\r\n\r\n"), "ERR malformed initial line: \" leading space\""
+  assert_eq read_msg("no colon\r\n\r\n"), "ERR malformed header line: \"no colon\""
+  assert_eq read_msg(""), "ERR EOF"
+  # the input ends without a blank line: the header is kept
+  assert_eq read_msg("A: b"), "A=[b]\n"
+}
+
+example "parse address list" {
+  emails = parse_address_list("Alice <alice@example.com>, Bob <bob@example.com>, Eve <eve@example.com>").unwrap
+  for v in emails {
+    puts v.name + " " + v.address
+  }
+} outputs "Alice alice@example.com\nBob bob@example.com\nEve eve@example.com\n"
+
+example "parse address" {
+  e = parse_address("Alice <alice@example.com>").unwrap
+  puts e.name + " " + e.address
+} outputs "Alice alice@example.com\n"
+
+example "read message" {
+  msg = "Date: Mon, 23 Jun 2015 11:40:36 -0400\nFrom: Gopher <from@example.com>\nTo: Another Gopher <to@example.com>\nSubject: Gophers at Gophercon\n\nMessage body\n"
+  m = read_message(bytes.new_buffer_string(msg)).unwrap
+  header = m.header
+  puts "Date: " + header.get("Date")
+  puts "From: " + header.get("From")
+  puts "To: " + header.get("To")
+  puts "Subject: " + header.get("Subject")
+  body = io.read_all(m.body).unwrap
+  print Str.from_bytes(body)
+} outputs "Date: Mon, 23 Jun 2015 11:40:36 -0400\nFrom: Gopher <from@example.com>\nTo: Another Gopher <to@example.com>\nSubject: Gophers at Gophercon\nMessage body\n"
+
+example "parse date" {
+  t = parse_date("Wed, 09 Oct 2024 09:55:06 -0700").unwrap
+  puts t.format(time.RFC3339)
+} outputs "2024-10-09T09:55:06-07:00\n"
+
+bench "consume phrase" {
+  input = strings.repeat("=?utf-8?q?hello?= ", 100) + "<user@example.com>"
+  p = AddrParser.new(s: input, dec: none)
+  p.consume_phrase!
+}
+
+bench "consume comment" {
+  input = strings.repeat("(", 99) + "a" + strings.repeat(")", 100)
+  p = AddrParser.new(s: input, dec: none)
+  p.consume_comment!
+}

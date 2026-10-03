@@ -1,0 +1,315 @@
+# Go's net/mail message_test.go tables, translated by a generator (Go 1.27); do not edit by hand.
+import "strings"
+
+test "parsing" {
+  assert_eq read_msg("From: John Doe <jdoe@machine.example>\nTo: Mary Smith <mary@example.net>\nSubject: Saying Hello\nDate: Fri, 21 Nov 1997 09:55:06 -0600\nMessage-ID: <1234@local.machine.example>\n\nThis is a message just to say hello.\nSo, \"Hello\".\n"), "Date=[Fri, 21 Nov 1997 09:55:06 -0600];From=[John Doe <jdoe@machine.example>];Message-Id=[<1234@local.machine.example>];Subject=[Saying Hello];To=[Mary Smith <mary@example.net>]\nThis is a message just to say hello.\nSo, \"Hello\".\n"
+  assert_eq read_msg("Feedback-Type: abuse\nUser-Agent: SomeGenerator/1.0\nVersion: 1\n"), "Feedback-Type=[abuse];User-Agent=[SomeGenerator/1.0];Version=[1]\n"
+  assert_eq read_msg("From: iant@golang.org\nCustom/Header: v\n\nBody\n"), "Custom/Header=[v];From=[iant@golang.org]\nBody\n"
+  assert_eq read_msg("From iant@golang.org Mon Jun 19 00:00:00 2023\nFrom: iant@golang.org\n\nHello, gophers!\n"), "From=[iant@golang.org];From iant@golang.org Mon Jun 19 00=[00:00 2023]\nHello, gophers!\n"
+}
+
+test "date parsing" {
+  assert_eq pd("Fri, 21 Nov 1997 09:55:06 -0600"), 880127706
+  assert_eq hdr_date("Fri, 21 Nov 1997 09:55:06 -0600"), 880127706
+  assert_eq pd("21 Nov 97 09:55:06 GMT"), 880106106
+  assert_eq hdr_date("21 Nov 97 09:55:06 GMT"), 880106106
+  assert_eq pd("Fri, 21 Nov 1997 09:55:06 -0600 (MDT)"), 880127706
+  assert_eq hdr_date("Fri, 21 Nov 1997 09:55:06 -0600 (MDT)"), 880127706
+  assert_eq pd("Thu, 20 Nov 1997 09:55:06 -0600 (MDT)"), 880041306
+  assert_eq hdr_date("Thu, 20 Nov 1997 09:55:06 -0600 (MDT)"), 880041306
+  assert_eq pd("Thu, 20 Nov 1997 09:55:06 GMT (GMT)"), 880019706
+  assert_eq hdr_date("Thu, 20 Nov 1997 09:55:06 GMT (GMT)"), 880019706
+  assert_eq pd("Fri, 21 Nov 1997 09:55:06 +1300 (TOT)"), 880059306
+  assert_eq hdr_date("Fri, 21 Nov 1997 09:55:06 +1300 (TOT)"), 880059306
+}
+
+test "date parsing CFWS" {
+  assert pd_err?("   ")
+  assert_eq pd("   Fri, 21 Nov 1997 09:55:06 -0600"), 880127706
+  assert_eq pd("21 Nov 1997 09:55:06 -0600"), 880127706
+  assert pd_err?("Fri 21 Nov 1997 09:55:06 -0600")
+  assert_eq pd("Fri,        21 Nov 1997 09:55:06 -0600"), 880127706
+  assert_eq pd("Fri, 21 Nov       1997     09:55:06 -0600"), 880127706
+  assert !pd_err?("Fri, 21 Nov 1997 09:55:06           CST")
+  assert !pd_err?("Fri, 21 Nov 1997 09:55:06           CST (no leading FWS and a trailing CRLF) \r\n")
+  assert_eq pd("Fri, 21    Nov 1997    09:55:06 -0600 (MDT and non-US-ASCII signs éèç )"), 880127706
+  assert_eq pd("Fri, 21 Nov 1997 09:55:06 -0600    \r\n (thisisa(valid)cfws)   \t "), 880127706
+  assert pd_err?("Fri, 21 Nov 1997 \r 09:55:06 -0600    \r\n (thisisa(valid)cfws)   \t ")
+  assert_eq pd("Fri, 21 Nov 199\r\n7  09:55:06 -0600    \r\n (thisisa(valid)cfws)   \t "), 880127706
+  assert pd_err?("Fri, 21 Nov 1997 ù 09:55:06 -0600    \r\n (thisisa(valid)cfws)   \t ")
+  assert pd_err?("Fri, 21 Nov () 1997 09:55:06 -0600    \r\n (thisisa(valid)cfws)   \t ")
+  assert pd_err?("Fri, 21 Nov 1997 09:55:06 -060    \r\n (Thisisa(valid)cfws)   \t ")
+  assert pd_err?("Fri, 21  1997 09:55:06 -0600")
+  assert pd_err?("Fri, 21 OCT 1997 09:55:06 CST")
+  assert pd_err?("Fri, 21 Nov 1997 09:55:06 -060")
+  assert pd_err?("Fri, 21  1997 09:55:06 GT")
+  assert_eq pd("Tue, 26 May 2020 14:04:40 GMT"), 1590501880
+  assert_eq pd("Tue, 26 May 2020 14:04:40 UT"), 1590501880
+  assert_eq pd("Thu, 21 May 2020 14:04:40 UT"), 1590069880
+  assert pd_err?("Tue, 26 May 2020 14:04:40 XT")
+  assert pd_err?("Thu, 21 May 2020 14:04:40 XT")
+  assert_eq pd("Thu, 21 May 2020 14:04:40 UTC"), 1590069880
+  assert_eq pd("Fri, 21 Nov 1997 09:55:06 GMT (GMT)"), 880106106
+}
+
+test "address parsing error" {
+  assert strings.contains(pa("=?iso-8859-2?Q?Bogl=E1rka_Tak=E1cs?= <unknown@gmail.com>"), "charset not supported")
+  assert strings.contains(pa_custom("=?iso-8859-2?Q?Bogl=E1rka_Tak=E1cs?= <unknown@gmail.com>"), "charset not supported")
+  assert strings.contains(pa("a@gmail.com b@gmail.com"), "expected single address")
+  assert strings.contains(pa_custom("a@gmail.com b@gmail.com"), "expected single address")
+  assert strings.contains(pa(Str.from_bytes([237, 160, 128, 32, 60, 109, 105, 99, 114, 111, 64, 101, 120, 97, 109, 112, 108, 101, 46, 110, 101, 116, 62])), "invalid utf-8 in address")
+  assert strings.contains(pa_custom(Str.from_bytes([237, 160, 128, 32, 60, 109, 105, 99, 114, 111, 64, 101, 120, 97, 109, 112, 108, 101, 46, 110, 101, 116, 62])), "invalid utf-8 in address")
+  assert strings.contains(pa(Str.from_bytes([34, 237, 160, 128, 34, 32, 60, 104, 97, 108, 102, 45, 115, 117, 114, 114, 111, 103, 97, 116, 101, 64, 101, 120, 97, 109, 112, 108, 101, 46, 99, 111, 109, 62])), "invalid utf-8 in quoted-string")
+  assert strings.contains(pa_custom(Str.from_bytes([34, 237, 160, 128, 34, 32, 60, 104, 97, 108, 102, 45, 115, 117, 114, 114, 111, 103, 97, 116, 101, 64, 101, 120, 97, 109, 112, 108, 101, 46, 99, 111, 109, 62])), "invalid utf-8 in quoted-string")
+  assert strings.contains(pa(Str.from_bytes([34, 92, 128, 34, 32, 60, 101, 115, 99, 97, 112, 101, 100, 45, 105, 110, 118, 97, 108, 105, 100, 45, 117, 110, 105, 99, 111, 100, 101, 64, 101, 120, 97, 109, 112, 108, 101, 46, 110, 101, 116, 62])), "invalid utf-8 in quoted-string")
+  assert strings.contains(pa_custom(Str.from_bytes([34, 92, 128, 34, 32, 60, 101, 115, 99, 97, 112, 101, 100, 45, 105, 110, 118, 97, 108, 105, 100, 45, 117, 110, 105, 99, 111, 100, 101, 64, 101, 120, 97, 109, 112, 108, 101, 46, 110, 101, 116, 62])), "invalid utf-8 in quoted-string")
+  assert strings.contains(pa("\"\x00\" <null@example.net>"), "bad character in quoted-string")
+  assert strings.contains(pa_custom("\"\x00\" <null@example.net>"), "bad character in quoted-string")
+  assert strings.contains(pa("\"\\\x00\" <escaped-null@example.net>"), "bad character in quoted-string")
+  assert strings.contains(pa_custom("\"\\\x00\" <escaped-null@example.net>"), "bad character in quoted-string")
+  assert strings.contains(pa("John Doe"), "no angle-addr")
+  assert strings.contains(pa_custom("John Doe"), "no angle-addr")
+  assert strings.contains(pa("<jdoe#machine.example>"), "missing @ in addr-spec")
+  assert strings.contains(pa_custom("<jdoe#machine.example>"), "missing @ in addr-spec")
+  assert strings.contains(pa("John <middle> Doe <jdoe@machine.example>"), "missing @ in addr-spec")
+  assert strings.contains(pa_custom("John <middle> Doe <jdoe@machine.example>"), "missing @ in addr-spec")
+  assert strings.contains(pa("cfws@example.com ("), "misformatted parenthetical comment")
+  assert strings.contains(pa_custom("cfws@example.com ("), "misformatted parenthetical comment")
+  assert strings.contains(pa("empty group: ;"), "empty group")
+  assert strings.contains(pa_custom("empty group: ;"), "empty group")
+  assert strings.contains(pa("root group: embed group: null@example.com;"), "no angle-addr")
+  assert strings.contains(pa_custom("root group: embed group: null@example.com;"), "no angle-addr")
+  assert strings.contains(pa("group not closed: null@example.com"), "expected comma")
+  assert strings.contains(pa_custom("group not closed: null@example.com"), "expected comma")
+  assert strings.contains(pa("group: first@example.com, second@example.com;"), "group with multiple addresses")
+  assert strings.contains(pa_custom("group: first@example.com, second@example.com;"), "group with multiple addresses")
+  assert strings.contains(pa("john.doe"), "missing '@' or angle-addr")
+  assert strings.contains(pa_custom("john.doe"), "missing '@' or angle-addr")
+  assert strings.contains(pa("john.doe@"), "missing '@' or angle-addr")
+  assert strings.contains(pa_custom("john.doe@"), "missing '@' or angle-addr")
+  assert strings.contains(pa("John Doe@foo.bar"), "no angle-addr")
+  assert strings.contains(pa_custom("John Doe@foo.bar"), "no angle-addr")
+  assert strings.contains(pa(" group: null@example.com; (asd"), "misformatted parenthetical comment")
+  assert strings.contains(pa_custom(" group: null@example.com; (asd"), "misformatted parenthetical comment")
+  assert strings.contains(pa(" group: ; (asd"), "misformatted parenthetical comment")
+  assert strings.contains(pa_custom(" group: ; (asd"), "misformatted parenthetical comment")
+  assert strings.contains(pa("(John) Doe <jdoe@machine.example>"), "missing word in phrase:")
+  assert strings.contains(pa_custom("(John) Doe <jdoe@machine.example>"), "missing word in phrase:")
+  assert strings.contains(pa(Str.from_bytes([60, 106, 100, 111, 101, 64, 91, 237, 160, 128, 49, 57, 50, 46, 49, 54, 56, 46, 48, 46, 49, 93, 62])), "invalid utf-8 in domain-literal")
+  assert strings.contains(pa_custom(Str.from_bytes([60, 106, 100, 111, 101, 64, 91, 237, 160, 128, 49, 57, 50, 46, 49, 54, 56, 46, 48, 46, 49, 93, 62])), "invalid utf-8 in domain-literal")
+  assert strings.contains(pa("<jdoe@[[192.168.0.1]>"), "bad character in domain-literal")
+  assert strings.contains(pa_custom("<jdoe@[[192.168.0.1]>"), "bad character in domain-literal")
+  assert strings.contains(pa("<jdoe@[192.168.0.1>"), "unclosed domain-literal")
+  assert strings.contains(pa_custom("<jdoe@[192.168.0.1>"), "unclosed domain-literal")
+  assert strings.contains(pa("<jdoe@[256.0.0.1]>"), "invalid IP address in domain-literal")
+  assert strings.contains(pa_custom("<jdoe@[256.0.0.1]>"), "invalid IP address in domain-literal")
+  assert strings.contains(pa("<jdoe@[fd42::de:ad:be:ef]>"), "invalid IP address in domain-literal")
+  assert strings.contains(pa_custom("<jdoe@[fd42::de:ad:be:ef]>"), "invalid IP address in domain-literal")
+}
+
+test "address parsing" {
+  assert_eq pa("jdoe@machine.example"), "|jdoe@machine.example"
+  assert_eq pal("jdoe@machine.example"), "|jdoe@machine.example"
+  assert_eq pa("John Doe <jdoe@machine.example>"), "John Doe|jdoe@machine.example"
+  assert_eq pal("John Doe <jdoe@machine.example>"), "John Doe|jdoe@machine.example"
+  assert_eq pa("\"Joe Q. Public\" <john.q.public@example.com>"), "Joe Q. Public|john.q.public@example.com"
+  assert_eq pal("\"Joe Q. Public\" <john.q.public@example.com>"), "Joe Q. Public|john.q.public@example.com"
+  assert_eq pa("John (middle) Doe <jdoe@machine.example>"), "John Doe|jdoe@machine.example"
+  assert_eq pal("John (middle) Doe <jdoe@machine.example>"), "John Doe|jdoe@machine.example"
+  assert_eq pa("\"John (middle) Doe\" <jdoe@machine.example>"), "John (middle) Doe|jdoe@machine.example"
+  assert_eq pal("\"John (middle) Doe\" <jdoe@machine.example>"), "John (middle) Doe|jdoe@machine.example"
+  assert_eq pa("\"John <middle> Doe\" <jdoe@machine.example>"), "John <middle> Doe|jdoe@machine.example"
+  assert_eq pal("\"John <middle> Doe\" <jdoe@machine.example>"), "John <middle> Doe|jdoe@machine.example"
+  assert_eq pal("Mary Smith <mary@x.test>, jdoe@example.org, Who? <one@y.test>"), "Mary Smith|mary@x.test;|jdoe@example.org;Who?|one@y.test"
+  assert_eq pal("<boss@nil.test>, \"Giant; \\\"Big\\\" Box\" <sysservices@example.net>"), "|boss@nil.test;Giant; \"Big\" Box|sysservices@example.net"
+  assert_eq pa("Joe Q. Public <john.q.public@example.com>"), "Joe Q. Public|john.q.public@example.com"
+  assert_eq pal("Joe Q. Public <john.q.public@example.com>"), "Joe Q. Public|john.q.public@example.com"
+  assert_eq pa("group1: groupaddr1@example.com;"), "|groupaddr1@example.com"
+  assert_eq pal("group1: groupaddr1@example.com;"), "|groupaddr1@example.com"
+  assert_eq pal("empty group: ;"), ""
+  assert_eq pal("A Group:Ed Jones <c@a.test>,joe@where.test,John <jdoe@one.test>;"), "Ed Jones|c@a.test;|joe@where.test;John|jdoe@one.test"
+  assert_eq pal(" , joe@where.test,,John <jdoe@one.test>,"), "|joe@where.test;John|jdoe@one.test"
+  assert_eq pal(" , joe@where.test,,John <jdoe@one.test>,,"), "|joe@where.test;John|jdoe@one.test"
+  assert_eq pal("Group1: <addr1@example.com>;, Group 2: addr2@example.com;, John <addr3@example.com>"), "|addr1@example.com;|addr2@example.com;John|addr3@example.com"
+  assert_eq pa("=?iso-8859-1?q?J=F6rg_Doe?= <joerg@example.com>"), "Jörg Doe|joerg@example.com"
+  assert_eq pal("=?iso-8859-1?q?J=F6rg_Doe?= <joerg@example.com>"), "Jörg Doe|joerg@example.com"
+  assert_eq pa("=?us-ascii?q?J=6Frg_Doe?= <joerg@example.com>"), "Jorg Doe|joerg@example.com"
+  assert_eq pal("=?us-ascii?q?J=6Frg_Doe?= <joerg@example.com>"), "Jorg Doe|joerg@example.com"
+  assert_eq pa("=?utf-8?q?J=C3=B6rg_Doe?= <joerg@example.com>"), "Jörg Doe|joerg@example.com"
+  assert_eq pal("=?utf-8?q?J=C3=B6rg_Doe?= <joerg@example.com>"), "Jörg Doe|joerg@example.com"
+  assert_eq pa("=?utf-8?q?J=C3=B6rg?=  =?utf-8?q?Doe?= <joerg@example.com>"), "JörgDoe|joerg@example.com"
+  assert_eq pal("=?utf-8?q?J=C3=B6rg?=  =?utf-8?q?Doe?= <joerg@example.com>"), "JörgDoe|joerg@example.com"
+  assert_eq pa("=?ISO-8859-1?Q?Andr=E9?= Pirard <PIRARD@vm1.ulg.ac.be>"), "André Pirard|PIRARD@vm1.ulg.ac.be"
+  assert_eq pal("=?ISO-8859-1?Q?Andr=E9?= Pirard <PIRARD@vm1.ulg.ac.be>"), "André Pirard|PIRARD@vm1.ulg.ac.be"
+  assert_eq pa("=?ISO-8859-1?B?SvZyZw==?= <joerg@example.com>"), "Jörg|joerg@example.com"
+  assert_eq pal("=?ISO-8859-1?B?SvZyZw==?= <joerg@example.com>"), "Jörg|joerg@example.com"
+  assert_eq pa("=?UTF-8?B?SsO2cmc=?= <joerg@example.com>"), "Jörg|joerg@example.com"
+  assert_eq pal("=?UTF-8?B?SsO2cmc=?= <joerg@example.com>"), "Jörg|joerg@example.com"
+  assert_eq pa("Asem H. <noreply@example.com>"), "Asem H.|noreply@example.com"
+  assert_eq pal("Asem H. <noreply@example.com>"), "Asem H.|noreply@example.com"
+  assert_eq pa("\"Gø Pher\" <gopher@example.com>"), "Gø Pher|gopher@example.com"
+  assert_eq pal("\"Gø Pher\" <gopher@example.com>"), "Gø Pher|gopher@example.com"
+  assert_eq pa("µ <micro@example.com>"), "µ|micro@example.com"
+  assert_eq pal("µ <micro@example.com>"), "µ|micro@example.com"
+  assert_eq pa("Micro <µ@example.com>"), "Micro|µ@example.com"
+  assert_eq pal("Micro <µ@example.com>"), "Micro|µ@example.com"
+  assert_eq pa("Micro <micro@µ.example.com>"), "Micro|micro@µ.example.com"
+  assert_eq pal("Micro <micro@µ.example.com>"), "Micro|micro@µ.example.com"
+  assert_eq pa("\"\" <emptystring@example.com>"), "|emptystring@example.com"
+  assert_eq pal("\"\" <emptystring@example.com>"), "|emptystring@example.com"
+  assert_eq pa("<cfws@example.com> (CFWS (cfws))  (another comment)"), "|cfws@example.com"
+  assert_eq pal("<cfws@example.com> (CFWS (cfws))  (another comment)"), "|cfws@example.com"
+  assert_eq pal("<cfws@example.com> ()  (another comment), <cfws2@example.com> (another)"), "|cfws@example.com;|cfws2@example.com"
+  assert_eq pa("john@example.com (John Doe)"), "John Doe|john@example.com"
+  assert_eq pal("john@example.com (John Doe)"), "John Doe|john@example.com"
+  assert_eq pa("John Doe <john@example.com> (Joey)"), "John Doe|john@example.com"
+  assert_eq pal("John Doe <john@example.com> (Joey)"), "John Doe|john@example.com"
+  assert_eq pa("john@example.com(John Doe)"), "John Doe|john@example.com"
+  assert_eq pal("john@example.com(John Doe)"), "John Doe|john@example.com"
+  assert_eq pa("asjo@example.com (Adam =?utf-8?Q?Sj=C3=B8gren?=)"), "Adam Sjøgren|asjo@example.com"
+  assert_eq pal("asjo@example.com (Adam =?utf-8?Q?Sj=C3=B8gren?=)"), "Adam Sjøgren|asjo@example.com"
+  assert_eq pa("asjo@example.com (Adam\t=?utf-8?Q?Sj=C3=B8gren?=)"), "Adam Sjøgren|asjo@example.com"
+  assert_eq pal("asjo@example.com (Adam\t=?utf-8?Q?Sj=C3=B8gren?=)"), "Adam Sjøgren|asjo@example.com"
+  assert_eq pa("asjo@example.com (Adam =?utf-8?Q?Sj=C3=B8gren?= (Debian))"), "Adam Sjøgren (Debian)|asjo@example.com"
+  assert_eq pal("asjo@example.com (Adam =?utf-8?Q?Sj=C3=B8gren?= (Debian))"), "Adam Sjøgren (Debian)|asjo@example.com"
+  assert_eq pal("group (comment:): a@example.com, b@example.com;"), "|a@example.com;|b@example.com"
+  assert_eq pa("x(:\"):\"@a.example;(\"@b.example;"), "|@a.example;(@b.example"
+  assert_eq pal("x(:\"):\"@a.example;(\"@b.example;"), "|@a.example;(@b.example"
+  assert_eq pa("jdoe@[192.168.0.1]"), "|jdoe@[192.168.0.1]"
+  assert_eq pal("jdoe@[192.168.0.1]"), "|jdoe@[192.168.0.1]"
+  assert_eq pa("John Doe <jdoe@[192.168.0.1]>"), "John Doe|jdoe@[192.168.0.1]"
+  assert_eq pal("John Doe <jdoe@[192.168.0.1]>"), "John Doe|jdoe@[192.168.0.1]"
+  assert_eq pa("jdoe@[IPv6:fd42::dead:beef:1234]"), "|jdoe@[IPv6:fd42::dead:beef:1234]"
+  assert_eq pal("jdoe@[IPv6:fd42::dead:beef:1234]"), "|jdoe@[IPv6:fd42::dead:beef:1234]"
+  assert_eq pa("John Doe <jdoe@[IPv6:fd42::dead:beef:1234]>"), "John Doe|jdoe@[IPv6:fd42::dead:beef:1234]"
+  assert_eq pal("John Doe <jdoe@[IPv6:fd42::dead:beef:1234]>"), "John Doe|jdoe@[IPv6:fd42::dead:beef:1234]"
+}
+
+test "address parser" {
+  assert_eq ap_parse("jdoe@machine.example"), "|jdoe@machine.example"
+  assert_eq ap_parse_list("jdoe@machine.example"), "|jdoe@machine.example"
+  assert_eq ap_parse("John Doe <jdoe@machine.example>"), "John Doe|jdoe@machine.example"
+  assert_eq ap_parse_list("John Doe <jdoe@machine.example>"), "John Doe|jdoe@machine.example"
+  assert_eq ap_parse("\"Joe Q. Public\" <john.q.public@example.com>"), "Joe Q. Public|john.q.public@example.com"
+  assert_eq ap_parse_list("\"Joe Q. Public\" <john.q.public@example.com>"), "Joe Q. Public|john.q.public@example.com"
+  assert_eq ap_parse_list("Mary Smith <mary@x.test>, jdoe@example.org, Who? <one@y.test>"), "Mary Smith|mary@x.test;|jdoe@example.org;Who?|one@y.test"
+  assert_eq ap_parse_list("<boss@nil.test>, \"Giant; \\\"Big\\\" Box\" <sysservices@example.net>"), "|boss@nil.test;Giant; \"Big\" Box|sysservices@example.net"
+  assert_eq ap_parse("=?iso-8859-1?q?J=F6rg_Doe?= <joerg@example.com>"), "Jörg Doe|joerg@example.com"
+  assert_eq ap_parse_list("=?iso-8859-1?q?J=F6rg_Doe?= <joerg@example.com>"), "Jörg Doe|joerg@example.com"
+  assert_eq ap_parse("=?us-ascii?q?J=6Frg_Doe?= <joerg@example.com>"), "Jorg Doe|joerg@example.com"
+  assert_eq ap_parse_list("=?us-ascii?q?J=6Frg_Doe?= <joerg@example.com>"), "Jorg Doe|joerg@example.com"
+  assert_eq ap_parse("=?ISO-8859-15?Q?J=F6rg_Doe?= <joerg@example.com>"), "Jörg Doe|joerg@example.com"
+  assert_eq ap_parse_list("=?ISO-8859-15?Q?J=F6rg_Doe?= <joerg@example.com>"), "Jörg Doe|joerg@example.com"
+  assert_eq ap_parse("=?windows-1252?q?Andr=E9?= Pirard <PIRARD@vm1.ulg.ac.be>"), "André Pirard|PIRARD@vm1.ulg.ac.be"
+  assert_eq ap_parse_list("=?windows-1252?q?Andr=E9?= Pirard <PIRARD@vm1.ulg.ac.be>"), "André Pirard|PIRARD@vm1.ulg.ac.be"
+  assert_eq ap_parse("=?ISO-8859-15?B?SvZyZw==?= <joerg@example.com>"), "Jörg|joerg@example.com"
+  assert_eq ap_parse_list("=?ISO-8859-15?B?SvZyZw==?= <joerg@example.com>"), "Jörg|joerg@example.com"
+  assert_eq ap_parse("=?UTF-8?B?SsO2cmc=?= <joerg@example.com>"), "Jörg|joerg@example.com"
+  assert_eq ap_parse_list("=?UTF-8?B?SsO2cmc=?= <joerg@example.com>"), "Jörg|joerg@example.com"
+  assert_eq ap_parse("Asem H. <noreply@example.com>"), "Asem H.|noreply@example.com"
+  assert_eq ap_parse_list("Asem H. <noreply@example.com>"), "Asem H.|noreply@example.com"
+  assert_eq ap_parse("jdoe@[192.168.0.1]"), "|jdoe@[192.168.0.1]"
+  assert_eq ap_parse_list("jdoe@[192.168.0.1]"), "|jdoe@[192.168.0.1]"
+  assert_eq ap_parse("John Doe <jdoe@[192.168.0.1]>"), "John Doe|jdoe@[192.168.0.1]"
+  assert_eq ap_parse_list("John Doe <jdoe@[192.168.0.1]>"), "John Doe|jdoe@[192.168.0.1]"
+  assert_eq ap_parse("jdoe@[IPv6:fd42::dead:beef:1234]"), "|jdoe@[IPv6:fd42::dead:beef:1234]"
+  assert_eq ap_parse_list("jdoe@[IPv6:fd42::dead:beef:1234]"), "|jdoe@[IPv6:fd42::dead:beef:1234]"
+  assert_eq ap_parse("John Doe <jdoe@[IPv6:fd42::dead:beef:1234]>"), "John Doe|jdoe@[IPv6:fd42::dead:beef:1234]"
+  assert_eq ap_parse_list("John Doe <jdoe@[IPv6:fd42::dead:beef:1234]>"), "John Doe|jdoe@[IPv6:fd42::dead:beef:1234]"
+}
+
+test "address string" {
+  assert_eq Address.new(name: "", address: "bob@example.com").to_s, "<bob@example.com>"
+  assert_eq pa("<bob@example.com>"), "|bob@example.com"
+  assert_eq Address.new(name: "", address: "my@idiot@address@example.com").to_s, "<\"my@idiot@address\"@example.com>"
+  assert_eq pa("<\"my@idiot@address\"@example.com>"), "|my@idiot@address@example.com"
+  assert_eq Address.new(name: "", address: " @example.com").to_s, "<\" \"@example.com>"
+  assert_eq pa("<\" \"@example.com>"), "| @example.com"
+  assert_eq Address.new(name: "Bob", address: "bob@example.com").to_s, "\"Bob\" <bob@example.com>"
+  assert_eq pa("\"Bob\" <bob@example.com>"), "Bob|bob@example.com"
+  assert_eq Address.new(name: "Böb", address: "bob@example.com").to_s, "=?utf-8?q?B=C3=B6b?= <bob@example.com>"
+  assert_eq pa("=?utf-8?q?B=C3=B6b?= <bob@example.com>"), "Böb|bob@example.com"
+  assert_eq Address.new(name: "Bob Jane", address: "bob@example.com").to_s, "\"Bob Jane\" <bob@example.com>"
+  assert_eq pa("\"Bob Jane\" <bob@example.com>"), "Bob Jane|bob@example.com"
+  assert_eq Address.new(name: "Böb Jacöb", address: "bob@example.com").to_s, "=?utf-8?q?B=C3=B6b_Jac=C3=B6b?= <bob@example.com>"
+  assert_eq pa("=?utf-8?q?B=C3=B6b_Jac=C3=B6b?= <bob@example.com>"), "Böb Jacöb|bob@example.com"
+  assert_eq Address.new(name: "Rob", address: "").to_s, "\"Rob\" <@>"
+  assert_eq Address.new(name: "Rob", address: "@").to_s, "\"Rob\" <@>"
+  assert_eq Address.new(name: "Böb, Jacöb", address: "bob@example.com").to_s, "=?utf-8?b?QsO2YiwgSmFjw7Zi?= <bob@example.com>"
+  assert_eq pa("=?utf-8?b?QsO2YiwgSmFjw7Zi?= <bob@example.com>"), "Böb, Jacöb|bob@example.com"
+  assert_eq Address.new(name: "=??Q?x?=", address: "hello@world.com").to_s, "\"=??Q?x?=\" <hello@world.com>"
+  assert_eq pa("\"=??Q?x?=\" <hello@world.com>"), "=??Q?x?=|hello@world.com"
+  assert_eq Address.new(name: "=?hello", address: "hello@world.com").to_s, "\"=?hello\" <hello@world.com>"
+  assert_eq pa("\"=?hello\" <hello@world.com>"), "=?hello|hello@world.com"
+  assert_eq Address.new(name: "world?=", address: "hello@world.com").to_s, "\"world?=\" <hello@world.com>"
+  assert_eq pa("\"world?=\" <hello@world.com>"), "world?=|hello@world.com"
+  assert_eq Address.new(name: Str.from_bytes([237, 160, 128]), address: "invalid-utf8@example.net").to_s, "=?utf-8?q?=ED=A0=80?= <invalid-utf8@example.net>"
+  assert_eq pa("=?utf-8?q?=ED=A0=80?= <invalid-utf8@example.net>"), Str.from_bytes([237, 160, 128, 124, 105, 110, 118, 97, 108, 105, 100, 45, 117, 116, 102, 56, 64, 101, 120, 97, 109, 112, 108, 101, 46, 110, 101, 116])
+  assert_eq Address.new(name: "", address: "bob@[192.168.0.1]").to_s, "<bob@[192.168.0.1]>"
+  assert_eq pa("<bob@[192.168.0.1]>"), "|bob@[192.168.0.1]"
+  assert_eq Address.new(name: "Bob", address: "bob@[192.168.0.1]").to_s, "\"Bob\" <bob@[192.168.0.1]>"
+  assert_eq pa("\"Bob\" <bob@[192.168.0.1]>"), "Bob|bob@[192.168.0.1]"
+  assert_eq Address.new(name: "", address: "bob@[IPv6:fd42::dead:beef:1234]").to_s, "<bob@[IPv6:fd42::dead:beef:1234]>"
+  assert_eq pa("<bob@[IPv6:fd42::dead:beef:1234]>"), "|bob@[IPv6:fd42::dead:beef:1234]"
+  assert_eq Address.new(name: "Bob", address: "bob@[IPv6:fd42::dead:beef:1234]").to_s, "\"Bob\" <bob@[IPv6:fd42::dead:beef:1234]>"
+  assert_eq pa("\"Bob\" <bob@[IPv6:fd42::dead:beef:1234]>"), "Bob|bob@[IPv6:fd42::dead:beef:1234]"
+}
+
+test "address parsing and formatting" {
+  assert_eq round_trip("<Bob@example.com>"), "<Bob@example.com>"
+  assert_eq round_trip("<bob.bob@example.com>"), "<bob.bob@example.com>"
+  assert_eq round_trip("<\".bob\"@example.com>"), "<\".bob\"@example.com>"
+  assert_eq round_trip("<\" \"@example.com>"), "<\" \"@example.com>"
+  assert_eq round_trip("<some.mail-with-dash@example.com>"), "<some.mail-with-dash@example.com>"
+  assert_eq round_trip("<\"dot.and space\"@example.com>"), "<\"dot.and space\"@example.com>"
+  assert_eq round_trip("<\"very.unusual.@.unusual.com\"@example.com>"), "<\"very.unusual.@.unusual.com\"@example.com>"
+  assert_eq round_trip("<admin@mailserver1>"), "<admin@mailserver1>"
+  assert_eq round_trip("<postmaster@localhost>"), "<postmaster@localhost>"
+  assert_eq round_trip("<#!$%&'*+-/=?^_`{}|~@example.org>"), "<#!$%&'*+-/=?^_`{}|~@example.org>"
+  assert_eq round_trip("<\"very.(),:;<>[]\\\".VERY.\\\"very@\\\\ \\\"very\\\".unusual\"@strange.example.com>"), "<\"very.(),:;<>[]\\\".VERY.\\\"very@\\\\ \\\"very\\\".unusual\"@strange.example.com>"
+  assert_eq round_trip("<\"()<>[]:,;@\\\\\\\"!#$%&'*+-/=?^_{}| ~.a\"@example.org>"), "<\"()<>[]:,;@\\\\\\\"!#$%&'*+-/=?^_{}| ~.a\"@example.org>"
+  assert_eq round_trip("<\"Abc\\\\@def\"@example.com>"), "<\"Abc\\\\@def\"@example.com>"
+  assert_eq round_trip("<\"Joe\\\\Blow\"@example.com>"), "<\"Joe\\\\Blow\"@example.com>"
+  assert_eq round_trip("<test1/test2=test3@example.com>"), "<test1/test2=test3@example.com>"
+  assert_eq round_trip("<def!xyz%abc@example.com>"), "<def!xyz%abc@example.com>"
+  assert_eq round_trip("<_somename@example.com>"), "<_somename@example.com>"
+  assert_eq round_trip("<joe@uk>"), "<joe@uk>"
+  assert_eq round_trip("<~@example.com>"), "<~@example.com>"
+  assert_eq round_trip("<\"...\"@test.com>"), "<\"...\"@test.com>"
+  assert_eq round_trip("<\"john..doe\"@example.com>"), "<\"john..doe\"@example.com>"
+  assert_eq round_trip("<\"john.doe.\"@example.com>"), "<\"john.doe.\"@example.com>"
+  assert_eq round_trip("<\".john.doe\"@example.com>"), "<\".john.doe\"@example.com>"
+  assert_eq round_trip("<\".\"@example.com>"), "<\".\"@example.com>"
+  assert_eq round_trip("<\"..\"@example.com>"), "<\"..\"@example.com>"
+  assert_eq round_trip("<\"0:\"@0>"), "<\"0:\"@0>"
+  assert_eq round_trip("<Bob@[192.168.0.1]>"), "<Bob@[192.168.0.1]>"
+  assert pa("<Abc.example.com>").start_with?("ERR ")
+  assert pa("<A@b@c@example.com>").start_with?("ERR ")
+  assert pa("<a\"b(c)d,e:f;g<h>i[j\\k]l@example.com>").start_with?("ERR ")
+  assert pa("<just\"not\"right@example.com>").start_with?("ERR ")
+  assert pa("<this is\"not\\allowed@example.com>").start_with?("ERR ")
+  assert pa("<this\\ still\\\"not\\\\allowed@example.com>").start_with?("ERR ")
+  assert pa("<john..doe@example.com>").start_with?("ERR ")
+  assert pa("<john.doe@example..com>").start_with?("ERR ")
+  assert pa("<john.doe@example..com>").start_with?("ERR ")
+  assert pa("<john.doe.@example.com>").start_with?("ERR ")
+  assert pa("<john.doe.@.example.com>").start_with?("ERR ")
+  assert pa("<.john.doe@example.com>").start_with?("ERR ")
+  assert pa("<@example.com>").start_with?("ERR ")
+  assert pa("<.@example.com>").start_with?("ERR ")
+  assert pa("<test@.>").start_with?("ERR ")
+  assert pa("< @example.com>").start_with?("ERR ")
+  assert pa("<\"\"test\"\"blah\"\"@example.com>").start_with?("ERR ")
+  assert pa("<\"\"@0>").start_with?("ERR ")
+}
+
+test "address formatting and parsing" {
+  assert_eq pa(Address.new(name: "@lïce", address: "alice@example.com").to_s), "@lïce|alice@example.com"
+  assert_eq pa(Address.new(name: "Böb O'Connor", address: "bob@example.com").to_s), "Böb O'Connor|bob@example.com"
+  assert_eq pa(Address.new(name: "???", address: "bob@example.com").to_s), "???|bob@example.com"
+  assert_eq pa(Address.new(name: "Böb ???", address: "bob@example.com").to_s), "Böb ???|bob@example.com"
+  assert_eq pa(Address.new(name: "Böb (Jacöb)", address: "bob@example.com").to_s), "Böb (Jacöb)|bob@example.com"
+  assert_eq pa(Address.new(name: "à#$%&'(),.:;<>@[]^`{|}~'", address: "bob@example.com").to_s), "à#$%&'(),.:;<>@[]^`{|}~'|bob@example.com"
+  assert_eq pa(Address.new(name: "\"\\\x1f,\"", address: "0@0").to_s), "\"\\\x1f,\"|0@0"
+  assert_eq pa(Address.new(name: "naé, mée", address: "test.mail@gmail.com").to_s), "naé, mée|test.mail@gmail.com"
+}

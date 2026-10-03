@@ -1,0 +1,945 @@
+# Package url: Go's net/url — URL parsing (RFC 3986), query strings and
+# escaping.
+#
+#   Go                                  alx
+#   Parse(raw) (*URL, error)            parse(raw) -> ~Url<UrlError>
+#   ParseRequestURI(raw)                parse_request_uri(raw) -> ~Url<UrlError>
+#   URL{Scheme: ...}                    Url.new(scheme: ...): scheme, opaque, user (Userinfo?),
+#                                       host, path, raw_path, omit_host, force_query,
+#                                       raw_query, fragment, raw_fragment
+#   u.String() / Redacted()             u.to_s (also `string`) / redacted
+#   u.EscapedPath() / EscapedFragment() u.escaped_path / escaped_fragment
+#   u.IsAbs() / Hostname() / Port()     u.abs? / hostname / port
+#   u.Parse(ref) / ResolveReference     u.parse(ref) -> ~Url / u.resolve_reference(ref) -> Url
+#   u.Query() / RequestURI()            u.query -> Values / u.request_uri
+#   u.JoinPath(elem...) / JoinPath()    u.join_path(elems) -> Url / join_path(base, elems) -> ~Str
+#   u.MarshalBinary / AppendBinary      u.marshal_binary / append_binary(b)
+#   (*URL).UnmarshalBinary              unmarshal_binary(text) -> ~Url
+#   u.Clone()                           u.clone (Url is a value: any copy is a clone)
+#   User(name) / UserPassword(n, p)     user(name) / user_password(name, pass) -> Userinfo
+#   ui.Username() / Password() / String()   ui.username / password -> Str? / to_s
+#   Values (map[string][]string)        Values: v.get(k), set!(k, v), add!(k, v), del!(k),
+#                                       has?(k), encode, clone, size, m (the Map itself)
+#   ParseQuery(q) (Values, error)       parse_query(q) -> ~Values<ParseError>, and
+#                                       parse_query_lax(q) -> (Values, ParseError?)
+#   QueryEscape / QueryUnescape         query_escape(s) / query_unescape(s) -> ~Str<ParseError>
+#   PathEscape / PathUnescape           path_escape(s) / path_unescape(s) -> ~Str<ParseError>
+#   *Error{Op, URL, Err}                UrlError.Op(op, url, err: ParseError)
+#   EscapeError / InvalidHostError      ParseError.Escape(s) / ParseError.InvalidHost(s)
+#
+# Differences from Go:
+#  - Url is a value, not a pointer: there is no nil *URL (Go's Redacted and
+#    Clone accept nil), and resolve_reference / join_path / clone return new
+#    values as Go's do. A missing user is `none` (Go's nil *Userinfo).
+#  - ParseQuery returns the valid parameters together with the first error;
+#    a `~T` holds one or the other, so parse_query fails on the first error
+#    and parse_query_lax returns both, as Go's does.
+#  - Go's Error wraps any error and forwards Timeout/Temporary; UrlError.Op
+#    holds one of this package's ParseError causes, so there are no
+#    timeout? / temporary? methods (they would always be false).
+#  - The GODEBUG settings urlstrictcolons and urlmaxqueryparams don't exist:
+#    the defaults apply (colons in an http/https host are strict; at most
+#    10000 query parameters).
+#  - Errors made with errors.New / fmt.Errorf in Go are ParseError.Invalid
+#    with the same message ("invalid host: ..." carries netip's message).
+#  - No JSON or gob encoding (no reflection); use to_s / parse or
+#    marshal_binary / unmarshal_binary.
+#
+# Not translated: TestURLErrorImplementsNetError (needs foreign errors
+# inside url.Error), TestJSON and TestGob (reflection-based encoders),
+# TestParseStrictIpv6 and the GODEBUG cases of TestParseQueryLimits (GODEBUG).
+
+import "net/netip"
+import "path"
+import "strconv"
+import "strings"
+
+# What went wrong inside a URL or an escaped string.
+pub error ParseError {
+  # Go's EscapeError: a malformed %-escape (the bad escape itself).
+  Escape(s: Str)
+  # Go's InvalidHostError: a character a host name can't have.
+  InvalidHost(s: Str)
+  # Every other error, by its message (Go's errors.New / fmt.Errorf).
+  Invalid(msg: Str)
+
+  def message -> Str {
+    case self {
+      Escape(s) => "invalid URL escape #{strconv.quote(s)}"
+      InvalidHost(s) => "invalid character #{strconv.quote(s)} in host name"
+      Invalid(m) => m
+    }
+  }
+}
+
+# The ParseError inside an Error from this package's parsing functions.
+def as_parse_error(e: Error) -> ParseError {
+  case e {
+    Escape(s) => ParseError.Escape(s)
+    InvalidHost(s) => ParseError.InvalidHost(s)
+    Invalid(m) => ParseError.Invalid(m)
+    _ => ParseError.Invalid(e.message)
+  }
+}
+
+# Go's *url.Error: the operation, the URL and the cause.
+pub error UrlError {
+  Op(op: Str, url: Str, err: ParseError)
+
+  def message -> Str {
+    case self {
+      Op(op, u, e) => "#{op} #{strconv.quote(u)}: #{e.message}"
+    }
+  }
+}
+
+UPPER_HEX = "0123456789ABCDEF"
+
+# The encoding modes (bits of TABLE).
+ENCODE_PATH = 1
+ENCODE_PATH_SEGMENT = 2
+ENCODE_HOST = 4
+ENCODE_ZONE = 8
+ENCODE_USER_PASSWORD = 16
+ENCODE_QUERY_COMPONENT = 32
+ENCODE_FRAGMENT = 64
+HEX_CHAR = 128
+
+# For each byte, the modes in which it is NOT escaped, plus HEX_CHAR for hex
+# digits (Go's encoding_table.go, from gen_encoding_table.go's shouldEscape).
+TABLE: [U8; 256] = [
+  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+  0, 76, 12, 0, 95, 0, 95, 12, 76, 76, 76, 95, 93, 127, 127, 65,
+  255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 79, 93, 12, 95, 12, 64,
+  67, 255, 255, 255, 255, 255, 255, 127, 127, 127, 127, 127, 127, 127, 127, 127,
+  127, 127, 127, 127, 127, 127, 127, 127, 127, 127, 127, 12, 0, 12, 0, 127,
+  0, 255, 255, 255, 255, 255, 255, 127, 127, 127, 127, 127, 127, 127, 127, 127,
+  127, 127, 127, 127, 127, 127, 127, 127, 127, 127, 127, 0, 0, 0, 127, 0,
+  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+]
+
+def ishex?(c: Byte) -> Bool { TABLE[c] & HEX_CHAR != 0 }
+
+# Precondition: ishex?(c).
+def unhex(c: Byte) -> Byte { 9 * (c >> 6) + (c & 15) }
+
+def should_escape?(c: Byte, mode: Int) -> Bool { TABLE[c].to_i & mode == 0 }
+
+# Undoes query_escape: each "%AB" becomes the byte 0xAB and "+" a space.
+# Fails with ParseError.Escape when a % isn't followed by two hex digits.
+pub def query_unescape(s: Str) -> ~Str<ParseError> {
+  ~unescape(s, ENCODE_QUERY_COMPONENT)
+}
+
+# Undoes path_escape: each "%AB" becomes the byte 0xAB ("+" stays).
+pub def path_unescape(s: Str) -> ~Str<ParseError> {
+  ~unescape(s, ENCODE_PATH_SEGMENT)
+}
+
+def unescape(s: Str, mode: Int) -> ~Str<ParseError> {
+  # Count %, check that they're well-formed.
+  n = 0
+  has_plus = false
+  i = 0
+  while i < s.size {
+    c = s[i]
+    if c == 37 {
+      n += 1
+      if i + 2 >= s.size || !ishex?(s[i + 1]) || !ishex?(s[i + 2]) {
+        bad = s[i...s.size]
+        bad = bad[0...3] if bad.size > 3
+        fail ParseError.Escape(bad)
+      }
+      # Per RFC 3986 §2.1 the host can %-encode only non-ASCII bytes, but
+      # RFC 6874 allows %25 to escape a percent sign in IPv6 zone literals.
+      if mode == ENCODE_HOST && unhex(s[i + 1]) < 8 && s[i...i + 3] != "%25" {
+        fail ParseError.Escape(s[i...i + 3])
+      }
+      if mode == ENCODE_ZONE {
+        # RFC 6874 lets zones escape anything; we restrict %-escaped bytes
+        # to those valid in a host name unescaped (and Windows' spaces).
+        v = (unhex(s[i + 1]) << 4) | unhex(s[i + 2])
+        if s[i...i + 3] != "%25" && v != 32 && should_escape?(v, ENCODE_HOST) {
+          fail ParseError.Escape(s[i...i + 3])
+        }
+      }
+      i += 3
+    } else if c == 43 {
+      has_plus = mode == ENCODE_QUERY_COMPONENT
+      i += 1
+    } else {
+      if (mode == ENCODE_HOST || mode == ENCODE_ZONE) && c < 0x80 && should_escape?(c, mode) {
+        fail ParseError.InvalidHost(s[i...i + 1])
+      }
+      i += 1
+    }
+  }
+  return s if n == 0 && !has_plus
+  plus_as: Byte = mode == ENCODE_QUERY_COMPONENT ? 32 : 43
+  t: [Byte] = []
+  i = 0
+  while i < s.size {
+    c = s[i]
+    if c == 37 {
+      t << ((unhex(s[i + 1]) << 4) | unhex(s[i + 2]))
+      i += 2
+    } else if c == 43 {
+      t << plus_as
+    } else {
+      t << c
+    }
+    i += 1
+  }
+  Str.from_bytes(t)
+}
+
+# s escaped for a URL query component: space becomes "+", other bytes that
+# need it %XX.
+pub def query_escape(s: Str) -> Str { escape(s, ENCODE_QUERY_COMPONENT) }
+
+# s escaped for a URL path segment ("/" included): space becomes %20.
+pub def path_escape(s: Str) -> Str { escape(s, ENCODE_PATH_SEGMENT) }
+
+def escape(s: Str, mode: Int) -> Str {
+  space_count = 0
+  hex_count = 0
+  for c in s.bytes {
+    if should_escape?(c, mode) {
+      if c == 32 && mode == ENCODE_QUERY_COMPONENT {
+        space_count += 1
+      } else {
+        hex_count += 1
+      }
+    }
+  }
+  return s if space_count == 0 && hex_count == 0
+  t: [Byte] = []
+  for c in s.bytes {
+    if c == 32 && mode == ENCODE_QUERY_COMPONENT {
+      t << 43
+    } else if should_escape?(c, mode) {
+      t << 37
+      t << UPPER_HEX[c >> 4]
+      t << UPPER_HEX[c & 15]
+    } else {
+      t << c
+    }
+  }
+  Str.from_bytes(t)
+}
+
+# --------------------------------------------------------------- Userinfo
+
+# A username and an optional password (immutable).
+pub struct Userinfo {
+  name: Str
+  pass: Str
+  pass_set: Bool
+
+  pub def username -> Str { name }
+
+  # The password, if one is set.
+  pub def password -> Str? {
+    return pass if pass_set
+    none
+  }
+
+  # "username[:password]", escaped.
+  pub def to_s -> Str {
+    s = escape(name, ENCODE_USER_PASSWORD)
+    s = s + ":" + escape(pass, ENCODE_USER_PASSWORD) if pass_set
+    s
+  }
+
+  pub def string -> Str { to_s }
+}
+
+# A Userinfo with a username and no password.
+pub def user(username: Str) -> Userinfo { Userinfo.new(name: username, pass: "", pass_set: false) }
+
+# A Userinfo with a username and a password (RFC 2396 warns against it).
+pub def user_password(username: Str, password: Str) -> Userinfo { Userinfo.new(name: username, pass: password, pass_set: true) }
+
+# -------------------------------------------------------------------- Url
+
+# A parsed URL (technically, a URI reference):
+#   [scheme:][//[userinfo@]host][/]path[?query][#fragment]
+# or, when nothing follows the scheme's colon but a rootless path,
+#   scheme:opaque[?query][#fragment]
+# `path` and `fragment` are decoded; raw_path / raw_fragment keep the
+# original encoding when it differs from the default one (see escaped_path).
+pub struct Url {
+  scheme: Str
+  # encoded opaque data
+  opaque: Str
+  user: Userinfo?
+  # "host" or "host:port" (see hostname and port)
+  host: Str
+  # the path, decoded (relative paths may omit the leading slash)
+  path: Str
+  # an encoded path hint (see escaped_path)
+  raw_path: Str
+  # the URL has an empty host (authority): to_s writes no "//"
+  omit_host: Bool
+  # the URL had a "?" with nothing after it: to_s writes the "?"
+  force_query: Bool
+  # the query, still encoded, without the "?"
+  raw_query: Str
+  # the fragment, decoded, without the "#"
+  fragment: Str
+  # an encoded fragment hint (see escaped_fragment)
+  raw_fragment: Str
+
+  # Sets path and raw_path from the escaped path p; raw_path is set only
+  # when p isn't the default encoding of the path.
+  def set_path!(p: Str) -> ~Unit<ParseError> {
+    pth = ~unescape(p, ENCODE_PATH)
+    self.path = pth
+    self.raw_path = escape(pth, ENCODE_PATH) == p ? "" : p
+  }
+
+  def set_fragment!(f: Str) -> ~Unit<ParseError> {
+    frag = ~unescape(f, ENCODE_FRAGMENT)
+    self.fragment = frag
+    self.raw_fragment = escape(frag, ENCODE_FRAGMENT) == f ? "" : f
+  }
+
+  # The escaped path: raw_path when it is a valid escaping of path, else
+  # path escaped here.
+  pub def escaped_path -> Str {
+    if raw_path != "" && valid_encoded?(raw_path, ENCODE_PATH) {
+      if p = unescape(raw_path, ENCODE_PATH).ok {
+        return raw_path if p == path
+      }
+    }
+    return "*" if path == "*" # don't escape (Go issue 11202)
+    escape(path, ENCODE_PATH)
+  }
+
+  # The escaped fragment: raw_fragment when it is a valid escaping of
+  # fragment, else fragment escaped here.
+  pub def escaped_fragment -> Str {
+    if raw_fragment != "" && valid_encoded?(raw_fragment, ENCODE_FRAGMENT) {
+      if f = unescape(raw_fragment, ENCODE_FRAGMENT).ok {
+        return raw_fragment if f == fragment
+      }
+    }
+    escape(fragment, ENCODE_FRAGMENT)
+  }
+
+  # The URL as a string: scheme:opaque?query#fragment or
+  # scheme://userinfo@host/path?query#fragment, leaving out empty parts.
+  # Non-ASCII bytes in the host are escaped; the path is escaped_path.
+  pub def to_s -> Str {
+    buf = strings.new_builder
+    if scheme != "" {
+      buf.write!(scheme)
+      buf.write_byte!(58)
+    }
+    if opaque != "" {
+      buf.write!(opaque)
+    } else {
+      if scheme != "" || host != "" || user.present? {
+        if omit_host && host == "" && user.none? {
+          # omit empty host
+        } else {
+          buf.write!("//") if host != "" || path != "" || user.present?
+          if ui = user {
+            buf.write!(ui.to_s)
+            buf.write_byte!(64)
+          }
+          buf.write!(escape(host, ENCODE_HOST)) if host != ""
+        }
+      }
+      pth = escaped_path
+      if omit_host && host == "" && user.none? && strings.has_prefix(pth, "//") {
+        # Escape the first / of a path starting with "//" and no authority
+        # so that re-parsing doesn't make the path an authority.
+        buf.write!("%2F")
+        pth = pth[1...pth.size]
+      }
+      buf.write_byte!(47) if pth != "" && pth[0] != 47 && host != ""
+      if buf.size == 0 {
+        # RFC 3986 §4.2: a relative path whose first segment has a colon
+        # must start with a dot-segment, or it reads as a scheme.
+        segment = pth
+        if c = strings.cut(pth, "/") {
+          segment = c[0]
+        }
+        buf.write!("./") if strings.contains(segment, ":")
+      }
+      buf.write!(pth)
+    }
+    if force_query || raw_query != "" {
+      buf.write_byte!(63)
+      buf.write!(raw_query)
+    }
+    if fragment != "" {
+      buf.write_byte!(35)
+      buf.write!(escaped_fragment)
+    }
+    buf.to_s
+  }
+
+  pub def string -> Str { to_s }
+
+  # Like to_s, with any password replaced by "xxxxx".
+  pub def redacted -> Str {
+    ru = self
+    if ui = user {
+      ru.user = user_password(ui.name, "xxxxx") if ui.pass_set
+    }
+    ru.to_s
+  }
+
+  # Whether the URL is absolute (has a scheme).
+  pub def abs? -> Bool { scheme != "" }
+
+  # Parses ref in the context of this URL (see resolve_reference).
+  pub def parse(ref: Str) -> ~Url<UrlError> {
+    ref_url = ~parse_ref(ref)
+    resolve_reference(ref_url)
+  }
+
+  # ref resolved against this (absolute) base URL, per RFC 3986 §5.2. An
+  # absolute ref is returned as it is (copied).
+  pub def resolve_reference(ref: Url) -> Url {
+    url = ref
+    url.scheme = scheme if ref.scheme == ""
+    if ref.scheme != "" || ref.host != "" || ref.user.present? {
+      # The "absoluteURI" or "net_path" cases. The path is validly
+      # escaped, so set_path can't fail.
+      _ = url.set_path!(resolve_path(ref.escaped_path, ""))
+      return url
+    }
+    if ref.opaque != "" {
+      url.user = none
+      url.host = ""
+      url.path = ""
+      return url
+    }
+    if ref.path == "" && !ref.force_query && ref.raw_query == "" {
+      url.raw_query = raw_query
+      if ref.fragment == "" {
+        url.fragment = fragment
+        url.raw_fragment = raw_fragment
+      }
+    }
+    if ref.path == "" && opaque != "" {
+      url.opaque = opaque
+      url.user = none
+      url.host = ""
+      url.path = ""
+      return url
+    }
+    # The "abs_path" or "rel_path" cases.
+    url.host = host
+    url.user = user
+    _ = url.set_path!(resolve_path(escaped_path, ref.escaped_path))
+    url
+  }
+
+  # The decoded query (malformed pairs are dropped; see parse_query).
+  pub def query -> Values {
+    v, _ = parse_query_lax(raw_query)
+    v
+  }
+
+  # The encoded path?query or opaque?query of an HTTP request for this URL.
+  pub def request_uri -> Str {
+    result = opaque
+    if result == "" {
+      result = escaped_path
+      result = "/" if result == ""
+    } else if strings.has_prefix(result, "//") {
+      result = scheme + ":" + result
+    }
+    result = result + "?" + raw_query if force_query || raw_query != ""
+    result
+  }
+
+  # host without a valid port; IPv6 brackets are removed.
+  pub def hostname -> Str { split_host_port(host)[0] }
+
+  # The port of host, without the colon; "" when there's no valid numeric
+  # port.
+  pub def port -> Str { split_host_port(host)[1] }
+
+  # Go's MarshalBinary: the URL's text.
+  pub def marshal_binary -> [Byte] { to_s.bytes.to_a }
+
+  # b with the URL's text appended.
+  pub def append_binary(b: [Byte]) -> [Byte] {
+    out = b
+    for c in to_s.bytes {
+      out << c
+    }
+    out
+  }
+
+  # A copy (Url is a value; Go's Clone copies through pointers).
+  pub def clone -> Url { self }
+
+  # A new URL with elems (already escaped, as path_escape makes them) joined
+  # to the path, cleaned of ./ and ../ and of repeated slashes. A trailing
+  # slash of the last element is kept.
+  pub def join_path(elems: [Str]) -> Url {
+    r = join_path_r(elems)
+    r[0]
+  }
+
+  def join_path_r(elems0: [Str]) -> (Url, ParseError?) {
+    elems: [Str] = [escaped_path]
+    for e in elems0 {
+      elems << e
+    }
+    p = ""
+    if !strings.has_prefix(elems[0], "/") {
+      # Return a relative path if u is relative, but ensure that it
+      # contains no ../ elements.
+      elems[0] = "/" + elems[0]
+      j = path.join(elems)
+      p = j[1...j.size]
+    } else {
+      p = path.join(elems)
+    }
+    # path.join removes trailing slashes; keep at least one.
+    p = p + "/" if strings.has_suffix(elems[elems.size - 1], "/") && !strings.has_suffix(p, "/")
+    url = self
+    r = url.set_path!(p)
+    perr: ParseError? = none
+    perr = as_parse_error(r.err.unwrap) if r.err?
+    (url, perr)
+  }
+}
+
+# Splits off a valid numeric port; brackets around the host are removed.
+# Unlike net.split_host_port, an invalid port stays part of the host.
+def split_host_port(host_port: Str) -> (Str, Str) {
+  host = host_port
+  port = ""
+  colon = strings.last_index_byte(host, 58)
+  if colon != -1 && valid_optional_port?(host[colon...host.size]) {
+    port = host[colon + 1...host.size]
+    host = host[0...colon]
+  }
+  host = host[1...host.size - 1] if strings.has_prefix(host, "[") && strings.has_suffix(host, "]")
+  (host, port)
+}
+
+# Whether s is a valid encoded path or fragment for mode: no byte that
+# would be escaped, except the sub-delims, ":", "@", "[", "]" and "%".
+def valid_encoded?(s: Str, mode: Int) -> Bool {
+  for c in s.bytes {
+    # RFC 3986, Appendix A: pchar = unreserved / pct-encoded / sub-delims
+    # / ":" / "@". should_escape? isn't quite compliant, so check the
+    # sub-delims here.
+    next if c == 33 || c == 36 || c == 38 || c == 39 || c == 40 || c == 41 || c == 42 || c == 43 || c == 44 || c == 59 || c == 61 || c == 58 || c == 64
+    # [ ]: not in RFC 3986 but left alone by browsers; %: will decode
+    next if c == 91 || c == 93 || c == 37
+    return false if should_escape?(c, mode)
+  }
+  true
+}
+
+# Whether port is "" or matches /^:\d*$/.
+def valid_optional_port?(port: Str) -> Bool {
+  return true if port == ""
+  return false if port[0] != 58
+  for i in 1...port.size {
+    return false if port[i] < 48 || port[i] > 57
+  }
+  true
+}
+
+# Whether s is a valid userinfo per RFC 3986 §3.2.1 (escapes aren't
+# checked here). '@' is allowed, as Go allows it (Go issues 3439, 22655).
+def valid_userinfo?(s: Str) -> Bool {
+  for r in s.runes {
+    next if (r >= 65 && r <= 90) || (r >= 97 && r <= 122) || (r >= 48 && r <= 57)
+    next if r == 45 || r == 46 || r == 95 || r == 58 || r == 126 || r == 33 || r == 36 || r == 38 || r == 39 || r == 40 || r == 41 || r == 42 || r == 43 || r == 44 || r == 59 || r == 61 || r == 37 || r == 64
+    return false
+  }
+  true
+}
+
+def contains_ctl_byte?(s: Str) -> Bool {
+  for c in s.bytes {
+    return true if c < 32 || c == 0x7f
+  }
+  false
+}
+
+# Splits a leading "scheme:" off; ("", raw) when there isn't one.
+def get_scheme(raw: Str) -> ~(Str, Str)<ParseError> {
+  for i in 0...raw.size {
+    c = raw[i]
+    if (c >= 97 && c <= 122) || (c >= 65 && c <= 90) {
+      # letters are fine anywhere
+    } else if (c >= 48 && c <= 57) || c == 43 || c == 45 || c == 46 {
+      return ("", raw) if i == 0
+    } else if c == 58 {
+      fail ParseError.Invalid("missing protocol scheme") if i == 0
+      return (raw[0...i], raw[i + 1...raw.size])
+    } else {
+      # an invalid character: no valid scheme
+      return ("", raw)
+    }
+  }
+  ("", raw)
+}
+
+# (Url.parse can't call `parse`: inside Url that name is the method.)
+def parse_ref(raw: Str) -> ~Url<UrlError> { ~parse(raw) }
+
+# Parses raw, an absolute URL or a relative one, into a Url. A host and
+# path without a scheme can't always be told apart and may parse without an
+# error.
+pub def parse(raw: Str) -> ~Url<UrlError> {
+  # Cut off #frag
+  u = raw
+  frag = ""
+  if c = strings.cut(raw, "#") {
+    u, frag = c
+  }
+  r = parse_url(u, false)
+  fail UrlError.Op("parse", u, as_parse_error(r.err.unwrap)) if r.err?
+  url = r.unwrap
+  return url if frag == ""
+  fr = url.set_fragment!(frag)
+  fail UrlError.Op("parse", raw, as_parse_error(fr.err.unwrap)) if fr.err?
+  url
+}
+
+# Parses raw as received in an HTTP request: an absolute URI or an absolute
+# path, with no #fragment.
+pub def parse_request_uri(raw: Str) -> ~Url<UrlError> {
+  r = parse_url(raw, true)
+  fail UrlError.Op("parse", raw, as_parse_error(r.err.unwrap)) if r.err?
+  r.unwrap
+}
+
+def parse_url(raw: Str, via_request: Bool) -> ~Url<ParseError> {
+  fail ParseError.Invalid("net/url: invalid control character in URL") if contains_ctl_byte?(raw)
+  fail ParseError.Invalid("empty url") if raw == "" && via_request
+  url = Url.new
+  if raw == "*" {
+    url.path = "*"
+    return url
+  }
+  # Split off a possible leading "http:", "mailto:", etc. (it can't contain
+  # escaped characters).
+  sch, rest = ~get_scheme(raw)
+  url.scheme = strings.to_lower(sch)
+  if strings.has_suffix(rest, "?") && strings.count(rest, "?") == 1 {
+    url.force_query = true
+    rest = rest[0...rest.size - 1]
+  } else if c = strings.cut(rest, "?") {
+    rest = c[0]
+    url.raw_query = c[1]
+  }
+  if !strings.has_prefix(rest, "/") {
+    if url.scheme != "" {
+      # Rootless paths are opaque (RFC 3986).
+      url.opaque = rest
+      return url
+    }
+    fail ParseError.Invalid("invalid URI for request") if via_request
+    # Avoid confusion with malformed schemes, like cache_object:foo/bar
+    # (Go issue 16822): RFC 3986 §3.3 forbids a colon in the first segment
+    # of a relative-path reference.
+    segment = rest
+    if c = strings.cut(rest, "/") {
+      segment = c[0]
+    }
+    fail ParseError.Invalid("first path segment in URL cannot contain colon") if strings.contains(segment, ":")
+  }
+  if (url.scheme != "" || !via_request && !strings.has_prefix(rest, "///")) && strings.has_prefix(rest, "//") {
+    authority = rest[2...rest.size]
+    rest = ""
+    i = strings.index(authority, "/")
+    if i >= 0 {
+      rest = authority[i...authority.size]
+      authority = authority[0...i]
+    }
+    ui, h = ~parse_authority(url.scheme, authority)
+    url.user = ui
+    url.host = h
+  } else if url.scheme != "" && strings.has_prefix(rest, "/") {
+    # The URL has an empty host (authority), Go issue 46059.
+    url.omit_host = true
+  }
+  # Set path and, if needed, raw_path.
+  ~url.set_path!(rest)
+  url
+}
+
+def parse_authority(scheme: Str, authority: Str) -> ~(Userinfo?, Str)<ParseError> {
+  i = strings.last_index(authority, "@")
+  host_part = i < 0 ? authority : authority[i + 1...authority.size]
+  host = ~parse_host(scheme, host_part)
+  none_user: Userinfo? = none
+  return (none_user, host) if i < 0
+  userinfo = authority[0...i]
+  fail ParseError.Invalid("net/url: invalid userinfo") unless valid_userinfo?(userinfo)
+  if !strings.contains(userinfo, ":") {
+    name = ~unescape(userinfo, ENCODE_USER_PASSWORD)
+    return (user(name), host)
+  }
+  username, password = strings.cut(userinfo, ":") || (userinfo, "")
+  username = ~unescape(username, ENCODE_USER_PASSWORD)
+  password = ~unescape(password, ENCODE_USER_PASSWORD)
+  (user_password(username, password), host)
+}
+
+# Parses host[:port] (an authority without user information).
+def parse_host(scheme: Str, host: Str) -> ~Str<ParseError> {
+  open_bracket = strings.last_index(host, "[")
+  fail ParseError.Invalid("invalid IP-literal") if open_bracket > 0
+  if open_bracket == 0 {
+    # An IP-literal per RFC 3986 and RFC 6874: "[fe80::1]",
+    # "[fe80::1%25en0]", "[fe80::1]:80".
+    close_bracket = strings.last_index(host, "]")
+    fail ParseError.Invalid("missing ']' in host") if close_bracket < 0
+    colon_port = host[close_bracket + 1...host.size]
+    fail ParseError.Invalid("invalid port #{strconv.quote(colon_port)} after host") unless valid_optional_port?(colon_port)
+    unescaped_colon_port = ~unescape(colon_port, ENCODE_HOST)
+    hostname = host[open_bracket + 1...close_bracket]
+    # RFC 6874: %25 (an escaped percent) starts the zone, which may use any
+    # %-encoding it likes; the host part may %-encode only non-ASCII bytes.
+    unescaped_hostname = ""
+    zone_idx = strings.index(hostname, "%25")
+    if zone_idx >= 0 {
+      before = hostname[0...zone_idx]
+      after = hostname[zone_idx...hostname.size]
+      host_part = ~unescape(before, ENCODE_HOST)
+      zone_part = ~unescape(after, ENCODE_ZONE)
+      unescaped_hostname = host_part + zone_part
+    } else {
+      unescaped_hostname = ~unescape(hostname, ENCODE_HOST)
+    }
+    # RFC 3986: only an IPv6 address may be in brackets (IPv4-mapped ones
+    # included, plain IPv4 not).
+    ar = netip.parse_addr(unescaped_hostname)
+    fail ParseError.Invalid("invalid host: #{ar.err.unwrap.message}") if ar.err?
+    fail ParseError.Invalid("invalid IP-literal") if ar.unwrap.is4?
+    return "[" + unescaped_hostname + "]" + unescaped_colon_port
+  }
+  i = strings.index(host, ":")
+  if i != -1 {
+    last_colon = strings.last_index(host, ":")
+    if last_colon != i {
+      # RFC 3986 forbids colons in the host, but databases such as
+      # PostgreSQL and MongoDB use a comma-separated list of host:port
+      # there; colons are strict only for http and https (Go issues 75223,
+      # 78077).
+      i = last_colon unless scheme == "http" || scheme == "https"
+    }
+    colon_port = host[i...host.size]
+    fail ParseError.Invalid("invalid port #{strconv.quote(colon_port)} after host") unless valid_optional_port?(colon_port)
+  }
+  ~unescape(host, ENCODE_HOST)
+}
+
+# Applies the special path segments of ref to base, per RFC 3986.
+def resolve_path(base: Str, ref: Str) -> Str {
+  full = ""
+  if ref == "" {
+    full = base
+  } else if ref[0] != 47 {
+    i = strings.last_index(base, "/")
+    full = base[0...i + 1] + ref
+  } else {
+    full = ref
+  }
+  return "" if full == ""
+  dst: [Byte] = [47]
+  elem = ""
+  remaining = full
+  found = true
+  first = true
+  while found {
+    if c = strings.cut(remaining, "/") {
+      elem, remaining = c
+    } else {
+      elem = remaining
+      remaining = ""
+      found = false
+    }
+    if elem == "." {
+      first = false
+      next
+    }
+    if elem == ".." {
+      # drop the last segment
+      k = dst.size - 1
+      while k >= 1 && dst[k] != 47 {
+        k -= 1
+      }
+      dst = k >= 1 ? dst[0...k] : dst[0...1]
+      first = dst.size == 1
+    } else {
+      dst << 47 unless first
+      for c in elem.bytes {
+        dst << c
+      }
+      first = false
+    }
+  }
+  dst << 47 if elem == "." || elem == ".."
+  # We wrote an initial '/', but we don't want two.
+  return Str.from_bytes(dst[1...dst.size]) if dst.size > 1 && dst[1] == 47
+  Str.from_bytes(dst)
+}
+
+# Go's (*URL).UnmarshalBinary: parse(text).
+pub def unmarshal_binary(text: [Byte]) -> ~Url<UrlError> {
+  ~parse(Str.from_bytes(text))
+}
+
+# base with elems (already escaped) joined to its path and cleaned (see
+# Url.join_path), as a string.
+pub def join_path(base: Str, elems: [Str]) -> ~Str<UrlError | ParseError> {
+  url = ~parse(base)
+  res, err = url.join_path_r(elems)
+  if e = err {
+    fail e
+  }
+  res.to_s
+}
+
+# ----------------------------------------------------------------- Values
+
+# Query parameters or form values: each key maps to a list of values. Keys
+# are case-sensitive. `m` is the Map itself, for direct use.
+pub struct Values {
+  m: Map[Str, [Str]]
+
+  # The first value of key; "" when there is none.
+  pub def get(key: Str) -> Str {
+    vs = m[key] || []
+    vs.size == 0 ? "" : vs[0]
+  }
+
+  # Replaces the values of key with value.
+  pub def set!(key: Str, value: Str) {
+    self.m[key] = [value]
+  }
+
+  # Appends value to the values of key.
+  pub def add!(key: Str, value: Str) {
+    vs = m[key] || []
+    vs << value
+    self.m[key] = vs
+  }
+
+  # Removes key and its values.
+  pub def del!(key: Str) {
+    self.m.delete(key)
+  }
+
+  # Whether key is set (even with no values).
+  pub def has?(key: Str) -> Bool { m.key?(key) }
+
+  # The number of keys.
+  pub def size -> Int { m.size }
+
+  # A deep copy.
+  pub def clone -> Values {
+    out: Map[Str, [Str]] = {}
+    for k, vs in m {
+      c: [Str] = []
+      for v in vs {
+        c << v
+      }
+      out[k] = c
+    }
+    Values.new(m: out)
+  }
+
+  # The values URL-encoded ("bar=baz&foo=quux"), sorted by key.
+  pub def encode -> Str {
+    return "" if m.size == 0
+    keys: [Str] = []
+    for k, _ in m {
+      keys << k
+    }
+    buf = strings.new_builder
+    for k in keys.sort {
+      key_escaped = query_escape(k)
+      for v in m[k] || [] {
+        buf.write_byte!(38) if buf.size > 0
+        buf.write!(key_escaped)
+        buf.write_byte!(61)
+        buf.write!(query_escape(v))
+      }
+    }
+    buf.to_s
+  }
+}
+
+# Empty Values.
+pub def new_values -> Values {
+  m: Map[Str, [Str]] = {}
+  Values.new(m: m)
+}
+
+DEFAULT_MAX_PARAMS = 10000
+
+# Parses a URL-encoded query ("a=1&b=2"): every valid parameter, and the
+# first error found (a malformed escape, or a ";" separator, which is
+# invalid). A setting without "=" is a key with an empty value.
+pub def parse_query_lax(query: Str) -> (Values, ParseError?) {
+  m = new_values
+  err: ParseError? = none
+  if strings.count(query, "&") + 1 > DEFAULT_MAX_PARAMS {
+    return (m, ParseError.Invalid("number of URL query parameters exceeded limit"))
+  }
+  q = query
+  while q != "" {
+    key = q
+    q = ""
+    if c = strings.cut(key, "&") {
+      key, q = c
+    }
+    if strings.contains(key, ";") {
+      err = ParseError.Invalid("invalid semicolon separator in query")
+      next
+    }
+    next if key == ""
+    value = ""
+    if c = strings.cut(key, "=") {
+      key, value = c
+    }
+    kr = query_unescape(key)
+    if kr.err? {
+      err = as_parse_error(kr.err.unwrap) if err.none?
+      next
+    }
+    vr = query_unescape(value)
+    if vr.err? {
+      err = as_parse_error(vr.err.unwrap) if err.none?
+      next
+    }
+    m.add!(kr.unwrap, vr.unwrap)
+  }
+  (m, err)
+}
+
+# Parses a URL-encoded query; fails on the first error (see
+# parse_query_lax for the parameters found around errors).
+pub def parse_query(query: Str) -> ~Values<ParseError> {
+  m, err = parse_query_lax(query)
+  if e = err {
+    fail e
+  }
+  m
+}

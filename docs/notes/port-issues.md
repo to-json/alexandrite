@@ -15,7 +15,7 @@ Open problems agents reported; each gets fixed in a compiler round between waves
 | 9 | containers | `format` has no integer precision (`%.2d`) | open |
 | 10 | containers | static methods on generic structs (`def self.make(n) -> R[T]`) report "is recursive" | open |
 | 11 | containers | a generic function can't take its type only from the declared result (`x: R[Int] = mk(3)`); no explicit type arguments on calls | open |
-| 12 | containers | `==` on optionals isn't allowed | open |
+| 12 | containers | `==` on optionals isn't allowed | fixed: `T? == T?` and `T? == T` (the plain side is wrapped) |
 | 13 | hash | interface method result types aren't covariant (no `Cloner` interface) | open |
 | 14 | hash | an array literal mixing struct types doesn't convert to `[Iface]` even when declared | fixed: array literals coerce element-wise |
 | 15 | hash | `alx test` on the JIT accepts unused imports, `--release` rejects them | open |

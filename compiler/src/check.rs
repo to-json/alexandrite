@@ -3989,6 +3989,28 @@ impl<'w, 'a> FnCx<'w, 'a> {
             let ty = if op.is_arith() { Ty::Float } else { Ty::Bool };
             return Ok(self.mk(TK::Bin(op, Box::new(l), Box::new(r)), ty, sp));
         }
+        // `opt == value`: the plain side is wrapped (equal if opt holds it).
+        let (l, r, lt, rt) = if matches!(op, BinOp::Eq | BinOp::Ne) {
+            match (self.resolve(&lt), self.resolve(&rt)) {
+                (Ty::Opt(inner), other) if !matches!(other, Ty::Opt(_) | Ty::Var(_)) => {
+                    let r = self.coerce(r, &inner)?;
+                    let rsp = r.span;
+                    let r = self.mk(TK::Some(Box::new(r)), Ty::Opt(inner.clone()), rsp);
+                    let rt = r.ty.clone();
+                    (l, r, lt, rt)
+                }
+                (other, Ty::Opt(inner)) if !matches!(other, Ty::Opt(_) | Ty::Var(_)) => {
+                    let l = self.coerce(l, &inner)?;
+                    let lsp = l.span;
+                    let l = self.mk(TK::Some(Box::new(l)), Ty::Opt(inner.clone()), lsp);
+                    let lt = l.ty.clone();
+                    (l, r, lt, rt)
+                }
+                _ => (l, r, lt, rt),
+            }
+        } else {
+            (l, r, lt, rt)
+        };
         let mismatch = |cx: &Self| {
             let (a, b) = (cx.resolve(&l.ty), cx.resolve(&r.ty));
             let hint = match (a.int_kind(), b.int_kind()) {
@@ -4003,8 +4025,10 @@ impl<'w, 'a> FnCx<'w, 'a> {
                 if !self.unify(&lt, &rt) {
                     return Err(mismatch(self));
                 }
+                // Optionals: equal if both are none or both hold equal values.
                 if matches!(self.resolve(&lt), Ty::Opt(_)) {
-                    return Err(Diag::new(sp, "comparing a T? with `==`: test it with `present?` / `none?`, or unwrap it with `if x = ...`"));
+                    let eq = self.opt_eq(l, r, sp)?;
+                    return Ok(if op == BinOp::Ne { self.mk(TK::Not(Box::new(eq)), Ty::Bool, sp) } else { eq });
                 }
                 if matches!(self.resolve(&lt), Ty::Struct(..) | Ty::Tuple(_) | Ty::Array(_)) {
                     return Err(Diag::new(sp, format!("`{}` on {} values isn't supported yet; compare their fields", op.text(), self.resolve(&lt).show())));

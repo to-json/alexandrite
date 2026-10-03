@@ -2,29 +2,46 @@ import "bufio"
 import "net"
 import "strings"
 import "strconv"
+import nurl "net/url"
+import "net/netip"
+import "net/http/httptrace"
 
 # An HTTP/1.1 client. Each request opens its own connection and sends
 # `Connection: close` (no connection pool, no keep-alive on the client side).
 # Responses may be length-framed, chunked or read to end of stream. Redirects
 # (301, 302, 303, 307, 308) are followed up to `max_redirects` times, to http://
 # locations or paths on the same host. No timeouts (net has no deadlines), no
-# TLS (an https:// URL is an error), no proxies, no cookies.
+# TLS (an https:// URL is an error), no proxies. With a `jar`, cookies are
+# sent from it and Set-Cookie headers stored in it on every hop (Go's
+# Client.Jar); a request's trace hooks (httptrace) fire on every hop.
 pub struct Client {
   # 0 turns redirect following off.
   max_redirects: Int
+  # Where cookies come from and go to (none: no cookie handling).
+  jar: CookieJar?
 
   # Sends `req` and reads the whole response.
   pub def do(req: Request) -> ~Response {
     cur = req
     n = 0
     loop {
-      resp = ~send_once(cur)
+      sent = cur
+      if j = jar {
+        sent = with_jar_cookies(cur, j)
+      }
+      resp = ~send_once(sent)
+      if j = jar {
+        rc = read_set_cookies(resp.header)
+        pu = nurl.parse(cur.url)
+        j.set_cookies(pu.unwrap, rc) if rc.size > 0 && pu.ok?
+      }
       redirect = resp.status == 301 || resp.status == 302 || resp.status == 303 || resp.status == 307 || resp.status == 308
       loc = resp.header.get("Location")
       return resp if !redirect || loc.size == 0 || n >= max_redirects
       n += 1
       target = ~resolve_url(cur.url, loc)
       nxt = ~new_request(cur.method, target, cur.body)
+      nxt.trace = cur.trace
       for k in cur.header.keys {
         for v in cur.header.values(k) { nxt.header.add!(k, v) }
       }
@@ -63,9 +80,51 @@ pub def new_client -> Client {
   Client.new(max_redirects: 10)
 }
 
+# The request with the jar's cookies for its URL added to a copy of its
+# header.
+def with_jar_cookies(r: Request, j: CookieJar) -> Request {
+  out = r
+  out.header = r.header.clone
+  pu = nurl.parse(r.url)
+  if pu.ok? {
+    for c in j.cookies(pu.unwrap) {
+      add_cookie(out, c)
+    }
+  }
+  out
+}
+
+def ip_literal?(host: Str) -> Bool {
+  netip.parse_addr(host).ok?
+}
+
+# The address to dial for a host name resolved to `addrs` (the first IPv4
+# one, as the runtime prefers, else the first).
+def first_addr(addrs: [Str]) -> Str {
+  for a in addrs {
+    return a unless strings.contains(a, ":")
+  }
+  addrs[0]
+}
+
 def send_once(req: Request) -> ~Response {
   u = ~parse_url(req.url)
-  conn = ~net.dial("tcp", u.host_port)
+  tr = req.trace || httptrace.ClientTrace.new
+  tr.fire_get_conn(u.host_port)
+  addr = u.host_port
+  if (tr.dns_start.size > 0 || tr.dns_done.size > 0) && !ip_literal?(u.host) {
+    tr.fire_dns_start(httptrace.DNSStartInfo.new(host: u.host))
+    lr = net.lookup_host(u.host)
+    found: [Str] = lr.unwrap_or([])
+    tr.fire_dns_done(httptrace.DNSDoneInfo.new(addrs: found, err: lr.err, coalesced: false))
+    ~lr
+    addr = net.join_host_port(first_addr(found), strconv.itoa(u.port)) if found.size > 0
+  }
+  tr.fire_connect_start("tcp", addr)
+  dc = net.dial("tcp", addr)
+  tr.fire_connect_done("tcp", addr, dc.err)
+  conn = ~dc
+  tr.fire_got_conn(httptrace.GotConnInfo.new(conn: conn, reused: false, was_idle: false, idle_time: 0))
   bw = bufio.new_writer(conn)
   br = bufio.new_reader(conn)
   h = req.header.clone
@@ -74,18 +133,35 @@ def send_once(req: Request) -> ~Response {
   h.set!("User-Agent", "alx-http/1") unless h.has?("User-Agent")
   has_body = req.body.size > 0 || req.method == "POST" || req.method == "PUT" || req.method == "PATCH"
   h.set!("Content-Length", strconv.itoa(req.body.size)) if has_body
-  bw.~write_string!("#{req.method} #{u.request_uri} HTTP/1.1\r\n")
-  for k in h.keys {
-    for v in h.values(k) {
-      bw.~write_string!("#{k}: #{clean(v)}\r\n")
-    }
+  wr = write_request(bw, req, h, u, tr)
+  tr.fire_wrote_request(httptrace.WroteRequestInfo.new(err: wr.err))
+  if wr.err? {
+    conn.close!
+    ~wr
   }
-  bw.~write_string!("\r\n")
-  bw.~write!(req.body) if req.body.size > 0
-  bw.~flush!
+  pk = br.peek!(1)
+  tr.fire_got_first_response_byte if pk.ok? && pk.unwrap.size > 0
   resp = read_response(br, req.method == "HEAD")
   conn.close!
   ~resp
+}
+
+def write_request(bw: bufio.Writer, req: Request, h: Header, u: Url, tr: httptrace.ClientTrace) -> ~Unit {
+  w = bw
+  w.~write_string!("#{req.method} #{u.request_uri} HTTP/1.1\r\n")
+  for k in h.keys {
+    vs: [Str] = []
+    for v in h.values(k) {
+      cv = clean(v)
+      w.~write_string!("#{k}: #{cv}\r\n")
+      vs << cv
+    }
+    tr.fire_wrote_header_field(k, vs)
+  }
+  w.~write_string!("\r\n")
+  tr.fire_wrote_headers
+  w.~write!(req.body) if req.body.size > 0
+  w.~flush!
 }
 
 # One-off helpers using a default client.

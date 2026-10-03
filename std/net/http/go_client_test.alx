@@ -1,0 +1,238 @@
+# Go's client_test.go: the tests the current API supports, translated.
+import "net"
+import "strings"
+import "sync"
+
+def client_server(f: (ResponseWriter, Request) -> Unit) -> (Server, Str) {
+  srv = new_server_func(f)
+  ln = net.listen("tcp", "127.0.0.1:0").unwrap
+  port = ln.port
+  spawn { srv.serve(ln) }
+  (srv, "http://127.0.0.1:#{port}")
+}
+
+def robots(w: ResponseWriter, r: Request) -> Unit {
+  w.header.set!("Last-Modified", "sometime")
+  w.write_string!("User-agent: go\nDisallow: /something/").unwrap
+}
+
+# Go's TestClient and TestClientHead.
+test "client get and head" {
+  srv, base = client_server(robots)
+  r = get(base).unwrap
+  assert r.body_string.start_with?("User-agent:")
+  h = head(base).unwrap
+  assert h.header.has?("Last-Modified")
+  srv.shutdown
+}
+
+# The server half of Go's testRedirectsByMethod: logs each request and
+# answers ?code=N (with a Location built from ?next=a,b,...).
+def redirect_log_server(log: Chan[Str]) -> (Server, Str) {
+  base = Atomic.new(0)
+  srv = new_server_func(->(w: ResponseWriter, r: Request) {
+    entry = "#{r.method} #{r.request_uri} \"#{r.body_string}\""
+    cl = r.header.get("Content-Length")
+    if r.method == "GET" && r.body.size == 0 && (r.content_length != 0 || cl != "") {
+      entry += " (but with content-length = #{r.content_length}, \"#{cl}\")"
+    }
+    log << entry
+    q = r.parsed_url.query
+    v = q.get("code")
+    if v.size > 0 {
+      location = "http://127.0.0.1:#{base.load}/"
+      fin = q.get("next")
+      if fin.size > 0 {
+        first = fin
+        rest = ""
+        if c = strings.cut(fin, ",") {
+          first, rest = c
+        }
+        location = "#{location}?code=#{first}"
+        location = "#{location}&next=#{rest}" if rest.size > 0
+      }
+      code = v.to_i
+      w.header.set!("Location", location) if code / 100 == 3
+      w.write_header!(code)
+    }
+    return
+  })
+  ln = net.listen("tcp", "127.0.0.1:0").unwrap
+  port = ln.port
+  base.store(port)
+  spawn { srv.serve(ln) }
+  (srv, "http://127.0.0.1:#{port}")
+}
+
+def redirects_by_method(method: Str, table: [(Str, Int, Str)], want: [Str]) {
+  log = Chan[Str].new(100)
+  srv, base = redirect_log_server(log)
+  c = new_client
+  for t in table {
+    req = new_request(method, base + t[0], t[2].bytes.to_a).unwrap
+    res = c.do(req).unwrap
+    assert_eq res.status, t[1]
+  }
+  lines: [Str] = []
+  while log.size > 0 {
+    lines << log.recv.unwrap
+  }
+  got = strings.join(lines, "\n")
+  assert_eq got, strings.join(want, "\n")
+  srv.shutdown
+}
+
+# Go's TestPostRedirects.
+test "post redirects" {
+  table = [
+    ("/", 200, "first"),
+    ("/?code=301&next=302", 200, "c301"),
+    ("/?code=302&next=302", 200, "c302"),
+    ("/?code=303&next=301", 200, "c303wc301"),
+    ("/?code=304", 304, "c304"),
+    ("/?code=305", 305, "c305"),
+    ("/?code=307&next=303,308,302", 200, "c307"),
+    ("/?code=308&next=302,301", 200, "c308"),
+    ("/?code=404", 404, "c404")
+  ]
+  want = [
+    "POST / \"first\"",
+    "POST /?code=301&next=302 \"c301\"",
+    "GET /?code=302 \"\"",
+    "GET / \"\"",
+    "POST /?code=302&next=302 \"c302\"",
+    "GET /?code=302 \"\"",
+    "GET / \"\"",
+    "POST /?code=303&next=301 \"c303wc301\"",
+    "GET /?code=301 \"\"",
+    "GET / \"\"",
+    "POST /?code=304 \"c304\"",
+    "POST /?code=305 \"c305\"",
+    "POST /?code=307&next=303,308,302 \"c307\"",
+    "POST /?code=303&next=308,302 \"c307\"",
+    "GET /?code=308&next=302 \"\"",
+    "GET /?code=302 \"\"",
+    "GET / \"\"",
+    "POST /?code=308&next=302,301 \"c308\"",
+    "POST /?code=302&next=301 \"c308\"",
+    "GET /?code=301 \"\"",
+    "GET / \"\"",
+    "POST /?code=404 \"c404\""
+  ]
+  redirects_by_method("POST", table, want)
+}
+
+# Go's TestDeleteRedirects.
+test "delete redirects" {
+  table = [
+    ("/", 200, "first"),
+    ("/?code=301&next=302,308", 200, "c301"),
+    ("/?code=302&next=302", 200, "c302"),
+    ("/?code=303", 200, "c303"),
+    ("/?code=307&next=301,308,303,302,304", 304, "c307"),
+    ("/?code=308&next=307", 200, "c308"),
+    ("/?code=404", 404, "c404")
+  ]
+  want = [
+    "DELETE / \"first\"",
+    "DELETE /?code=301&next=302,308 \"c301\"",
+    "GET /?code=302&next=308 \"\"",
+    "GET /?code=308 \"\"",
+    "GET / \"\"",
+    "DELETE /?code=302&next=302 \"c302\"",
+    "GET /?code=302 \"\"",
+    "GET / \"\"",
+    "DELETE /?code=303 \"c303\"",
+    "GET / \"\"",
+    "DELETE /?code=307&next=301,308,303,302,304 \"c307\"",
+    "DELETE /?code=301&next=308,303,302,304 \"c307\"",
+    "GET /?code=308&next=303,302,304 \"\"",
+    "GET /?code=303&next=302,304 \"\"",
+    "GET /?code=302&next=304 \"\"",
+    "GET /?code=304 \"\"",
+    "DELETE /?code=308&next=307 \"c308\"",
+    "DELETE /?code=307 \"c308\"",
+    "DELETE / \"c308\"",
+    "DELETE /?code=404 \"c404\""
+  ]
+  redirects_by_method("DELETE", table, want)
+}
+
+# Go's TestClientRedirectTypes (the method of the follow-up request, seen
+# by the server instead of CheckRedirect, which alx's Client lacks).
+test "client redirect types" {
+  tests = [
+    ("POST", 301, "GET"), ("POST", 302, "GET"), ("POST", 303, "GET"), ("POST", 307, "POST"), ("POST", 308, "POST"),
+    ("HEAD", 301, "HEAD"), ("HEAD", 302, "HEAD"), ("HEAD", 303, "HEAD"), ("HEAD", 307, "HEAD"), ("HEAD", 308, "HEAD"),
+    ("GET", 301, "GET"), ("GET", 302, "GET"), ("GET", 303, "GET"), ("GET", 307, "GET"), ("GET", 308, "GET"),
+    ("DELETE", 301, "GET"), ("DELETE", 302, "GET"), ("DELETE", 303, "GET"), ("DELETE", 307, "DELETE"), ("DELETE", 308, "DELETE"),
+    ("PUT", 301, "GET"), ("PUT", 302, "GET"), ("PUT", 303, "GET"), ("PUT", 307, "PUT"), ("PUT", 308, "PUT"),
+    ("MADEUPMETHOD", 301, "GET"), ("MADEUPMETHOD", 302, "GET"), ("MADEUPMETHOD", 303, "GET"), ("MADEUPMETHOD", 307, "MADEUPMETHOD"), ("MADEUPMETHOD", 308, "MADEUPMETHOD")
+  ]
+  seen = Chan[Str].new(100)
+  srv, base = client_server(->(w: ResponseWriter, r: Request) {
+    if r.path == "/start" {
+      w.header.set!("Location", "/next")
+      w.write_header!((r.query("code") || "200").to_i)
+    } else {
+      seen << r.method
+    }
+    return
+  })
+  c = new_client
+  for t in tests {
+    req = new_request(t[0], "#{base}/start?code=#{t[1]}", []).unwrap
+    c.do(req).unwrap
+    got = seen.recv.unwrap
+    assert_eq got, t[2]
+  }
+  srv.shutdown
+}
+
+# Go's TestClientRedirectNoLocation.
+test "client redirect no location" {
+  for code in [301, 308] {
+    srv, base = client_server(->(w: ResponseWriter, r: Request) {
+      w.header.set!("Foo", "Bar")
+      w.write_header!((r.query("c") || "301").to_i)
+    })
+    res = get("#{base}/?c=#{code}").unwrap
+    assert_eq res.status, code
+    assert_eq res.header.get("Foo"), "Bar"
+    srv.shutdown
+  }
+}
+
+# Go's TestClientHeadContentLength.
+test "client head content length" {
+  srv, base = client_server(->(w: ResponseWriter, r: Request) {
+    if v = r.form_value("cl") {
+      w.header.set!("Content-Length", v)
+    }
+    return
+  })
+  for t in [("/?cl=1234", 1234), ("/?cl=0", 0), ("", -1)] {
+    res = head(base + t[0]).unwrap
+    assert_eq res.content_length, t[1]
+    assert_eq res.body.size, 0
+  }
+  srv.shutdown
+}
+
+# Go's TestEmptyPasswordAuth and TestBasicAuth (credentials in the URL).
+test "basic auth from the URL" {
+  srv, base = client_server(->(w: ResponseWriter, r: Request) {
+    if a = r.basic_auth {
+      w.write_string!("#{a[0]}:#{a[1]}")
+    }
+    return
+  })
+  host = base[7...base.size]
+  assert_eq get("http://gopher@#{host}/").unwrap.body_string, "gopher:"
+  assert_eq get("http://My%20User:My%20Pass@#{host}/").unwrap.body_string, "My User:My Pass"
+  # Go's TestBasicAuthHeadersPreserved: an explicit header wins.
+  req = new_request("GET", "http://My%20User@#{host}/", []).unwrap
+  req.set_basic_auth!("x", "y")
+  assert_eq new_client.do(req).unwrap.body_string, "x:y"
+  srv.shutdown
+}

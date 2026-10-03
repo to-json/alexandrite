@@ -36,3 +36,17 @@ Open problems agents reported; each gets fixed in a compiler round between waves
 | 30 | math/big | no mutable package globals (caches like Go's divisor table) | open (design) |
 | 31 | math/big | `format` has no `%g` | open |
 | 32 | math/big | a main file can't declare its own `Int`/`Float` (only packages can) | open (by design for now) |
+| N1 | net/rpc | `T.from_json(s)` inside a generic def (a static method on a type parameter) | fixed: resolved per instance (checker) |
+| N2 | net/rpc | passing a fallible def `-> ~R` where `(A) -> ~R` is wanted: "lambda result: expected R, got ~R" | fixed (checker) |
+| N3 | net/rpc, mail, multipart, httputil | type parameters didn't bind through `Mutex[S[T]]`/`Atomic`/`Chan`/`Pool` or another package's generic type (`textproto.Reader[R]`, and `Reader.new` inside its package when instantiated from outside) | fixed: `bind_tparams` (checker) |
+| N4 | net/rpc | `x: ~Reply = h.get` bound R to `~Reply` | fixed |
+| N5 | net/smtp | `spawn { f(x) }` with `f -> ~T` (T not Unit): bad C, lost value on the JIT | fixed: a checker error asking for `spawn { ~f(x) }` |
+| N6 | net/http/pprof | the JIT didn't resolve `alx_mem_held` / `alx_mem_peak` | fixed |
+| N7 | net/http audit | a `Mutex` captured by a lambda that moves into another task (`f.dup`, a handler in its request task) is copied: updates under `lock` there are lost (JIT and C); `Atomic` and `Chan` share | open (serious) |
+| N8 | httputil | `def f { spawn { 1 } }; t = spawn { f() }` crashes the compiler: "a task handle has no zero value" (`lower.rs` `zero_le`) | open (workaround: explicit `return`) |
+| N9 | cookiejar | `mu.lock { \|s\| if c { s.m.delete(k) } else { s.m[k] = 1 } }`: C emits `v = 0;` for the store arm (typed `Int?`) | open (workaround: end the block with `nil`) |
+| N10 | net/mail | C mistypes a statement `case` whose arms assign locals of different types (as in json-derive.md) | open |
+| N11 | net/http/cgi | spawning with a struct holding a lambda: the error suggests `h.dup`, which doesn't exist | open |
+| N12 | net/rpc | `r: Reply = client.call(..).unwrap` can't infer R through `.unwrap` | open |
+| N13 | httptest, httptrace, fcgi | a closure can't capture a value holding a closure of its own type (handler capturing its server, a director wrapping the old one, composed trace hooks) | open (design; see #2) |
+| N14 | sniff | `b("RIFF") + [0, 0, 0, 0]`: a literal after `+` on a `[Byte]` stays `[Int]` | open (workaround: a `[Byte]` parameter) |

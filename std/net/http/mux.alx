@@ -1,5 +1,6 @@
 import "strings"
 import "slices"
+import nurl "net/url"
 
 # Anything with a `serve_http` method answers requests.
 pub interface Handler {
@@ -33,7 +34,7 @@ struct MuxState {
 }
 
 # What a lookup found. code: 0 matched, 404, 405 (`allow` lists the methods),
-# 301 (`location` is the cleaned or slash-added path).
+# 307 (`location` is the cleaned or slash-added path; Go 1.22+ uses 307).
 pub struct Match {
   code: Int
   handler: (ResponseWriter, Request) -> Unit
@@ -55,7 +56,7 @@ pub struct Match {
 # difference deciding; a longer pattern beats a subtree pattern it extends; a
 # pattern with a method beats one without. Host-qualified patterns are not
 # supported. Paths with "//", "." or ".." segments are redirected to their
-# cleaned form (301). A ServeMux is a handle: copies share the routes, and it
+# cleaned form (307, as Go 1.22+). A ServeMux is a handle: copies share the routes, and it
 # can be used from many tasks while registering more.
 pub struct ServeMux {
   st: Mutex[MuxState]
@@ -86,7 +87,7 @@ pub struct ServeMux {
   }
 
   # Looks the request up: the match carries the handler (copied out of the
-  # mux), the path values, and the status (404, 405, 301) when none ran.
+  # mux), the path values, and the status (404, 405, 307) when none ran.
   pub def find(method: Str, path: Str) -> Match {
     st.lock { |s| route_lookup(s.routes, method, path) }
   }
@@ -94,13 +95,14 @@ pub struct ServeMux {
   # Answers a request: finds its route and runs it (see `dispatch` for a
   # caveat about where to call it from).
   pub def serve_http(w: ResponseWriter, r: Request) {
-    clean = clean_path(r.path)
-    if r.path != "*" && clean != r.path {
+    epath = r.escaped_path
+    clean = clean_path(epath)
+    if epath != "*" && r.method != "CONNECT" && clean != epath {
       loc = r.raw_query.size > 0 ? clean + "?" + r.raw_query : clean
-      redirect(w, r, loc, 301)
+      redirect(w, r, loc, 307)
       return
     }
-    m = find(r.method, r.path)
+    m = find(r.method, epath)
     dispatch(m, w, r)
   }
 }
@@ -117,11 +119,12 @@ pub def dispatch(m: Match, w: ResponseWriter, r: Request) {
   if m.code == 0 {
     rq = r
     rq.pathvals = m.pvals
+    rq.pattern = m.allow
     h = m.handler
     h(w, rq)
-  } else if m.code == 301 {
+  } else if m.code == 307 {
     loc = r.raw_query.size > 0 ? m.location + "?" + r.raw_query : m.location
-    redirect(w, r, loc, 301)
+    redirect(w, r, loc, 307)
   } else if m.code == 405 {
     w.header.set!("Allow", m.allow)
     error(w, "Method Not Allowed", 405)
@@ -169,7 +172,7 @@ def parse_pattern(pattern: Str, f: (ResponseWriter, Request) -> Unit) -> Route {
       }
     } else {
       assert !strings.contains(p, "{") && !strings.contains(p, "}"), "http: invalid pattern #{pattern}"
-      segs << Seg.new(kind: SEG_LIT, text: p)
+      segs << Seg.new(kind: SEG_LIT, text: unescape_seg(p))
     }
     i += 1
   }
@@ -221,12 +224,13 @@ def more_specific?(a: Route, b: Route) -> Bool {
   a.method.size > 0 && b.method.size == 0
 }
 
-def route_lookup(routes: [Route], method: Str, path: Str) -> Match {
-  psegs = strings.split(path[1...path.size], "/")
+# The most specific route matching the segments for the method (none if
+# there is none), its path values, and the methods of routes that match
+# the path with another method.
+def best_route(routes: [Route], method: Str, psegs: [Str]) -> ([Route], Map[Str, Str], [Str]) {
   best: [Route] = []
   bpv: Map[Str, Str] = {}
   allowed: [Str] = []
-  slash_loc = ""
   for rt in routes {
     pv: Map[Str, Str] = {}
     if matches?(rt, psegs, pv) {
@@ -239,8 +243,34 @@ def route_lookup(routes: [Route], method: Str, path: Str) -> Match {
         allowed << rt.method
         allowed << "HEAD" if rt.method == "GET"
       }
-    } else if rt.prefix && slash_loc.size == 0 && !strings.has_suffix(path, "/") && matches?(rt, strings.split(path[1...path.size] + "/", "/"), pv) {
-      slash_loc = path + "/"
+    }
+  }
+  (best, bpv, allowed)
+}
+
+# Go's exactMatch: the route matches the path without anything left for a
+# trailing multi wildcard ("/a/" or "/a/{x...}" exactly match "/a/" only).
+def exact_match?(rt: Route, psegs: [Str]) -> Bool {
+  n = rt.segs.size
+  if n > 0 && rt.segs[n - 1].kind == SEG_REST {
+    return psegs.size == n && psegs[n - 1].size == 0
+  }
+  return true unless rt.prefix
+  psegs.size == n + 1 && psegs[n].size == 0
+}
+
+def route_lookup(routes: [Route], method: Str, path0: Str) -> Match {
+  # (an empty path, as a CONNECT request's, looks up "/")
+  path = path0.size == 0 ? "/" : path0
+  psegs = path_segments(path[1...path.size])
+  best, bpv, allowed = best_route(routes, method, psegs)
+  # Go's matchOrRedirect: without an exact match, redirect to path + "/"
+  # when that matches exactly.
+  if (best.size == 0 || !exact_match?(best[0], psegs)) && !strings.has_suffix(path, "/") {
+    psegs2 = path_segments(path[1...path.size] + "/")
+    best2, _, _ = best_route(routes, method, psegs2)
+    if best2.size > 0 && exact_match?(best2[0], psegs2) {
+      return Match.new(code: 307, handler: noop, pvals: bpv, allow: "", location: path + "/")
     }
   }
   if best.size > 0 {
@@ -253,9 +283,6 @@ def route_lookup(routes: [Route], method: Str, path: Str) -> Match {
       uniq << a if uniq.size == 0 || uniq[uniq.size - 1] != a
     }
     return Match.new(code: 405, handler: noop, pvals: bpv, allow: strings.join(uniq, ", "), location: "")
-  }
-  if slash_loc.size > 0 {
-    return Match.new(code: 301, handler: noop, pvals: bpv, allow: "", location: slash_loc)
   }
   Match.new(code: 404, handler: noop, pvals: bpv, allow: "", location: "")
 }
@@ -277,4 +304,21 @@ pub def clean_path(p: Str) -> Str {
   r = "/" + strings.join(out, "/")
   r += "/" if trailing && r.size > 1
   r
+}
+
+# A path segment unescaped; kept as written if it doesn't unescape (Go
+# matches patterns and paths segment by segment, unescaped).
+def unescape_seg(s: Str) -> Str {
+  return s unless strings.contains(s, "%")
+  nurl.path_unescape(s).unwrap_or(s)
+}
+
+# The segments of an escaped path (without its leading "/"), unescaped one
+# by one, so "%2F" inside a segment doesn't split it.
+def path_segments(p: Str) -> [Str] {
+  out: [Str] = []
+  for s in strings.split(p, "/") {
+    out << unescape_seg(s)
+  }
+  out
 }

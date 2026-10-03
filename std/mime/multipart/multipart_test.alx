@@ -1,0 +1,751 @@
+# Go's mime/multipart tests (multipart_test.go, formdata_test.go,
+# writer_test.go, example_test.go), translated.
+import "bytes"
+import "io"
+import "mime"
+import "net/textproto"
+import "os"
+import "strconv"
+import "strings"
+
+def buf(s: Str) -> bytes.Buffer {
+  bytes.new_buffer_string(s)
+}
+
+def slurp[R](p: Part[R]) -> Str {
+  Str.from_bytes(io.read_all(p).unwrap)
+}
+
+def is_unexpected_eof(e: Error) -> Bool {
+  case e {
+    UnexpectedEof => true
+    _ => false
+  }
+}
+
+test "boundary line" {
+  mr = new_reader(buf(""), "myBoundary")
+  assert mr.boundary_delimiter_line!("--myBoundary\r\n".bytes.to_a)
+  assert mr.boundary_delimiter_line!("--myBoundary \r\n".bytes.to_a)
+  assert mr.boundary_delimiter_line!("--myBoundary \n".bytes.to_a)
+  assert !mr.boundary_delimiter_line!("--myBoundary bogus \n".bytes.to_a)
+  assert !mr.boundary_delimiter_line!("--myBoundary bogus--".bytes.to_a)
+}
+
+test "name accessors" {
+  tests = [
+    ("form-data; name=\"foo\"", "foo", ""),
+    (" form-data ; name=foo", "foo", ""),
+    ("FORM-DATA;name=\"foo\"", "foo", ""),
+    (" FORM-DATA ; name=\"foo\"", "foo", ""),
+    (" FORM-DATA ; name=\"foo\"", "foo", ""),
+    (" FORM-DATA ; name=foo", "foo", ""),
+    (" FORM-DATA ; filename=\"foo.txt\"; name=foo; baz=quux", "foo", "foo.txt"),
+    (" not-form-data ; filename=\"bar.txt\"; name=foo; baz=quux", "", "bar.txt")
+  ]
+  for t in tests {
+    body = "--b\r\nContent-Disposition: #{t[0]}\r\n\r\nx\r\n--b--\r\n"
+    mr = new_reader(buf(body), "b")
+    p = mr.next_part!.unwrap.unwrap
+    assert_eq p.form_name, t[1]
+    assert_eq p.file_name, t[2]
+  }
+}
+
+def long_line -> Str {
+  strings.repeat("\n\n\r\r\r\n\r\x00", (1 << 20) / 8)
+}
+
+def test_multipart_body(sep: Str) -> Str {
+  body = "\nThis is a multi-part message.  This line is ignored.\n--MyBoundary\nHeader1: value1\nHEADER2: value2\nfoo-bar: baz\n\nMy value\nThe end.\n--MyBoundary\nname: bigsection\n\n[longline]\n--MyBoundary\nHeader1: value1b\nHEADER2: value2b\nfoo-bar: bazb\n\nLine 1\nLine 2\nLine 3 ends in a newline, but just one.\n\n--MyBoundary\n\nnever read data\n--MyBoundary--\n\n\nuseless trailer\n"
+  body = strings.replace_all(body, "\n", sep)
+  strings.replace(body, "[longline]", long_line(), 1)
+}
+
+# Hands out one byte per read (Go's slowReader).
+struct SlowReader {
+  src: bytes.Buffer
+
+  pub def read!(p: [Byte]) -> Int {
+    return 0 if p.size == 0
+    s = src
+    s.read!(p[0...1])
+  }
+}
+
+def check_multipart[R: io.Reader](r: R, only_newlines: Bool) {
+  reader = new_reader(r, "MyBoundary")
+  adjust = ->(s: Str) -> Str { only_newlines ? strings.replace_all(s, "\r\n", "\n") : s }
+  part = reader.next_part!.unwrap.unwrap
+  assert_eq part.header.get("Header1"), "value1"
+  assert_eq part.header.get("foo-bar"), "baz"
+  assert_eq part.header.get("Foo-Bar"), "baz"
+  assert_eq slurp(part), adjust("My value\r\nThe end.")
+  part = reader.next_part!.unwrap.unwrap
+  assert_eq part.header.get("name"), "bigsection"
+  s = slurp(part)
+  assert_eq s.size, long_line().size
+  assert s == long_line(), "part2 long body didn't match"
+  part = reader.next_part!.unwrap.unwrap
+  assert_eq part.header.get("foo-bar"), "bazb"
+  assert_eq slurp(part), adjust("Line 1\r\nLine 2\r\nLine 3 ends in a newline, but just one.\r\n")
+  part = reader.next_part!.unwrap.unwrap
+  assert_eq reader.next_part!.unwrap.present?, false
+}
+
+test "multipart" {
+  check_multipart(buf(test_multipart_body("\r\n")), false)
+}
+
+test "multipart only newlines" {
+  check_multipart(buf(test_multipart_body("\n")), true)
+}
+
+test "multipart slow input" {
+  check_multipart(SlowReader.new(src: buf(test_multipart_body("\r\n"))), false)
+}
+
+test "various text line endings" {
+  tests = ["Foo\nBar", "Foo\nBar\n", "Foo\r\nBar", "Foo\r\nBar\r\n", "Foo\rBar", "Foo\rBar\r", "\x00\x01\x02\x09\x0a\x0b\x0c\x0d\x0e\x0f\x10"]
+  for expected in tests {
+    body = "--BOUNDARY\r\nContent-Disposition: form-data; name=\"value\"\r\n\r\n" + expected + "\r\n--BOUNDARY--\r\n"
+    reader = new_reader(buf(body), "BOUNDARY")
+    part = reader.next_part!.unwrap.unwrap
+    assert_eq slurp(part), expected
+    assert !reader.next_part!.unwrap.present?
+  }
+}
+
+# Never-ending zero bytes, counting what was read (Go's maliciousReader).
+struct MaliciousReader {
+  n: [Int]
+
+  pub def read!(b: [Byte]) -> Int {
+    self.n[0] = n[0] + b.size
+    assert n[0] < 1 << 20, "too much was read"
+    b.size
+  }
+}
+
+test "line limit" {
+  mr = MaliciousReader.new(n: [0])
+  r = new_reader(mr, "fooBoundary")
+  res = r.next_part!
+  assert res.err?
+  assert_eq res.err.unwrap.message, "multipart: NextPart: bufio: buffer full"
+  assert mr.n[0] < 1 << 20
+}
+
+test "multipart truncated" {
+  bodies = ["\nThis is a multi-part message.  This line is ignored.\n--MyBoundary\nfoo-bar: baz\n\nOh no, premature EOF!\n", "\nThis is a multi-part message.  This line is ignored.\n--MyBoundary\nfoo-bar: baz\n\nOh no, premature EOF!\n--MyBoundary-"]
+  for b0 in bodies {
+    body = strings.replace_all(b0, "\n", "\r\n")
+    r = new_reader(buf(body), "MyBoundary")
+    part = r.next_part!.unwrap.unwrap
+    res = io.copy(io.Discard.new, part)
+    assert res.err?
+    assert is_unexpected_eof(res.err.unwrap)
+  }
+}
+
+# Records whether it was read (Go's sentinelReader); reads nothing.
+struct Concat {
+  a: bytes.Buffer
+  b: bytes.Buffer
+  touched: [Bool]
+
+  # Reads a, then (once a is empty) notes the sentinel and reads b.
+  pub def read!(p: [Byte]) -> Int {
+    x = a
+    n = x.read!(p)
+    return n if n > 0
+    self.touched[0] = true
+    y = b
+    y.read!(p)
+  }
+}
+
+test "multipart stream readahead" {
+  body1 = "\nThis is a multi-part message.  This line is ignored.\n--MyBoundary\nfoo-bar: baz\n\nBody\n--MyBoundary\n"
+  body2 = "foo-bar: bop\n\nBody 2\n--MyBoundary--\n"
+  src = Concat.new(a: buf(body1), b: buf(body2), touched: [false])
+  reader = new_reader(src, "MyBoundary")
+  part = reader.next_part!.unwrap.unwrap
+  want = textproto.new_mime_header
+  want.set!("Foo-Bar", "baz")
+  assert_eq part.header, want
+  assert_eq slurp(part), "Body"
+  assert !src.touched[0], "Reader read past second boundary"
+  part = reader.next_part!.unwrap.unwrap
+  want2 = textproto.new_mime_header
+  want2.set!("Foo-Bar", "bop")
+  assert_eq part.header, want2
+  assert_eq slurp(part), "Body 2"
+}
+
+test "line continuation" {
+  body = "\n--Apple-Mail-2-292336769\nContent-Transfer-Encoding: 7bit\nContent-Type: text/plain;\n\tcharset=US-ASCII;\n\tdelsp=yes;\n\tformat=flowed\n\nI'm finding the same thing happening on my system (10.4.1).\n\n\n--Apple-Mail-2-292336769\nContent-Transfer-Encoding: quoted-printable\nContent-Type: text/html;\n\tcharset=ISO-8859-1\n\n<HTML><BODY>I'm finding the same thing =\nhappening on my system (10.4.1).=A0 But I built it with XCode =\n2.0.</BODY></=\nHTML>=\n\r\n--Apple-Mail-2-292336769--\n"
+  r = new_reader(buf(body), "Apple-Mail-2-292336769")
+  i = 0
+  while i < 2 {
+    part = r.next_part!.unwrap.unwrap
+    data = io.read_all(part).unwrap
+    assert data.size > 0
+    i += 1
+  }
+}
+
+test "quoted printable encoding" {
+  for cte in ["quoted-printable", "Quoted-PRINTABLE"] {
+    body = "--0016e68ee29c5d515f04cedf6733\r\nContent-Type: text/plain; charset=ISO-8859-1\r\nContent-Disposition: form-data; name=text\r\nContent-Transfer-Encoding: " + cte + "\r\n\r\nwords words words words words words words words words words words words wor=\r\nds words words words words words words words words words words words words =\r\nwords words words words words words words words words words words words wor=\r\nds words words words words words words words words words words words words =\r\nwords words words words words words words words words\r\n--0016e68ee29c5d515f04cedf6733\r\nContent-Type: text/plain; charset=ISO-8859-1\r\nContent-Disposition: form-data; name=submit\r\n\r\nSubmit\r\n--0016e68ee29c5d515f04cedf6733--"
+    r = new_reader(buf(body), "0016e68ee29c5d515f04cedf6733")
+    part = r.next_part!.unwrap.unwrap
+    assert !part.header.raw("Content-Transfer-Encoding").present?
+    assert_eq slurp(part), strings.trim_space(strings.repeat("words ", 59))
+  }
+}
+
+test "raw part" {
+  body = strings.replace_all("--0016e68ee29c5d515f04cedf6733\nContent-Type: text/plain; charset=\"utf-8\"\nContent-Transfer-Encoding: quoted-printable\n\n<div dir=3D\"ltr\">Hello World.</div>\n--0016e68ee29c5d515f04cedf6733\nContent-Type: text/plain; charset=\"utf-8\"\nContent-Transfer-Encoding: quoted-printable\n\n<div dir=3D\"ltr\">Hello World.</div>\n--0016e68ee29c5d515f04cedf6733--", "\n", "\r\n")
+  r = new_reader(buf(body), "0016e68ee29c5d515f04cedf6733")
+  part = r.next_raw_part!.unwrap.unwrap
+  assert part.header.raw("Content-Transfer-Encoding").present?
+  assert_eq slurp(part), "<div dir=3D\"ltr\">Hello World.</div>"
+  part = r.next_part!.unwrap.unwrap
+  assert !part.header.raw("Content-Transfer-Encoding").present?
+  assert_eq slurp(part), "<div dir=\"ltr\">Hello World.</div>"
+}
+
+# testdata/nested-mime from Go's tree, inline.
+def nested_mime -> Str {
+  "--e89a8ff1c1e83553e304be640612\r\nContent-Type: multipart/alternative; boundary=e89a8ff1c1e83553e004be640610\r\n\r\n--e89a8ff1c1e83553e004be640610\r\nContent-Type: text/plain; charset=UTF-8\r\n\r\n*body*\r\n\r\n--e89a8ff1c1e83553e004be640610\r\nContent-Type: text/html; charset=UTF-8\r\n\r\n<b>body</b>\r\n\r\n--e89a8ff1c1e83553e004be640610--\r\n--e89a8ff1c1e83553e304be640612\r\nContent-Type: image/png; name=\"x.png\"\r\nContent-Disposition: attachment; \r\n\tfilename=\"x.png\"\r\nContent-Transfer-Encoding: base64\r\nX-Attachment-Id: f_h1edgigu0\r\n\r\niVBORw0KGgoAAAANSUhEUgAAAagAAADrCAIAAACza5XhAAAKMWlDQ1BJQ0MgUHJvZmlsZQAASImd\r\nlndUU9kWh8+9N71QkhCKlNBraFICSA29SJEuKjEJEErAkAAiNkRUcERRkaYIMijggKNDkbEiioUB\r\n8b2kqeGaj4aTNftesu5mob4pr07ecMywRwLBvDCJOksqlUyldAZD7g9fxIZRWWPMvXRNJROJRBIG\r\nY7Vx0mva1HAwYqibdKONXye3dW4iUonhWFJnqK7OaanU1gGkErFYEgaj0cg8wK+zVPh2ziwnHy07\r\nU8lYTNapezSzOuevRwLB7CFkqQQCwaJDiBQIBIJFhwh8AoFg0SHUqQUCASRJKkwkhMy/JfODWPEJ\r\nBIJFhwh8AoFg0TFnQqQ55GtPFopcJsN97e1nYtNuIBYeGBgYCmYrmE3jZ05iaGAoMX0xzxkWz6Hv\r\nyO7WvrlwzA0uLzrD+VkKqViwl9IfTBVNFMyc/x9alloiPPlqhQAAAABJRU5ErkJggg==\r\n--e89a8ff1c1e83553e304be640612--\r\n"
+}
+
+test "nested" {
+  mr = new_reader(buf(nested_mime()), "e89a8ff1c1e83553e304be640612")
+  p = mr.next_part!.unwrap.unwrap
+  mr2 = new_reader(p, "e89a8ff1c1e83553e004be640610")
+  p2 = mr2.next_part!.unwrap.unwrap
+  assert_eq slurp(p2), "*body*\r\n"
+  p2 = mr2.next_part!.unwrap.unwrap
+  assert_eq slurp(p2), "<b>body</b>\r\n"
+  assert !mr2.next_part!.unwrap.present?
+  assert mr.next_part!.unwrap.present?
+  assert !mr.next_part!.unwrap.present?
+}
+
+def parts_of[R: io.Reader](r: R, sep: Str) -> ~[(textproto.MIMEHeader, Str)] {
+  mr = new_reader(r, sep)
+  out: [(textproto.MIMEHeader, Str)] = []
+  while p = ~mr.next_part! {
+    body = ~io.read_all(p)
+    out << (p.header, Str.from_bytes(body))
+  }
+  out
+}
+
+test "parse all sizes" {
+  max_size = 5 << 10
+  body = strings.repeat("a", max_size)
+  size = 0
+  while size < max_size {
+    b = bytes.new_buffer([])
+    w = new_writer(b)
+    part = w.create_form_field!("f").unwrap
+    part.write!(body[0...size].bytes.to_a).unwrap
+    part = w.create_form_field!("key").unwrap
+    part.write!("val".bytes.to_a).unwrap
+    w.close!.unwrap
+    got = parts_of(b, w.boundary).unwrap
+    assert_eq got.size, 2
+    assert got[0][1] == body[0...size], "size #{size}"
+    size += 7
+  }
+}
+
+test "no boundary" {
+  mr = new_reader(buf(""), "")
+  assert_eq mr.next_part!.err.unwrap.message, "multipart: boundary is empty"
+}
+
+test "empty body" {
+  mr = new_reader(buf(""), "b")
+  assert_eq mr.next_part!.err.unwrap.message, "multipart: NextPart: EOF"
+}
+
+# ---------------------------------------------------------------- formdata
+
+FILEA_CONTENTS = "This is a test file."
+FILEB_CONTENTS = "Another test file."
+TEXTA_VALUE = "foo"
+TEXTB_VALUE = "bar"
+
+def crlf(s: Str) -> Str { strings.replace_all(s, "\n", "\r\n") }
+
+def message_with_file_without_name -> Str {
+  "\n--MyBoundary\nContent-Disposition: form-data; name=\"hiddenfile\"; filename=\"\"\nContent-Type: text/plain\n\n" + FILEB_CONTENTS + "\n--MyBoundary--\n"
+}
+
+def message_with_file_name -> Str {
+  "\n--MyBoundary\nContent-Disposition: form-data; name=\"filea\"; filename=\"filea.txt\"\nContent-Type: text/plain\n\n" + FILEA_CONTENTS + "\n--MyBoundary--\n"
+}
+
+def message_with_text_content_type -> Str {
+  "\n--MyBoundary\nContent-Disposition: form-data; name=\"texta\"\nContent-Type: text/plain\n\n" + TEXTA_VALUE + "\n--MyBoundary\n"
+}
+
+def message -> Str {
+  "\n--MyBoundary\nContent-Disposition: form-data; name=\"filea\"; filename=\"filea.txt\"\nContent-Type: text/plain\n\n" + FILEA_CONTENTS + "\n--MyBoundary\nContent-Disposition: form-data; name=\"fileb\"; filename=\"fileb.txt\"\nContent-Type: text/plain\n\n" + FILEB_CONTENTS + "\n--MyBoundary\nContent-Disposition: form-data; name=\"texta\"\n\n" + TEXTA_VALUE + "\n--MyBoundary\nContent-Disposition: form-data; name=\"textb\"\n\n" + TEXTB_VALUE + "\n--MyBoundary--\n"
+}
+
+def check_file(fh: FileHeader, efn: Str, econtent: Str) -> File {
+  assert_eq fh.filename, efn
+  assert_eq fh.size, econtent.size
+  f = fh.open.unwrap
+  assert_eq Str.from_bytes(io.read_all(f).unwrap), econtent
+  f
+}
+
+test "read form" {
+  r = new_reader(buf(crlf(message())), "MyBoundary")
+  f = r.read_form!(25).unwrap
+  assert_eq f.value["texta"].unwrap[0], TEXTA_VALUE
+  assert_eq f.value["textb"].unwrap[0], TEXTB_VALUE
+  fd = check_file(f.file["filea"].unwrap[0], "filea.txt", FILEA_CONTENTS)
+  assert !fd.f.present?, "file is on disk, should not be"
+  fd.close!.unwrap
+  fh = f.file["fileb"].unwrap[0]
+  fd = check_file(fh, "fileb.txt", FILEB_CONTENTS)
+  assert fd.f.present?, "file should be on disk"
+  fd.close!.unwrap
+  assert os.stat(fh.tmpfile).ok?
+  f.remove_all.unwrap
+  assert os.stat(fh.tmpfile).err?
+}
+
+test "read form with nameless file" {
+  r = new_reader(buf(crlf(message_with_file_without_name())), "MyBoundary")
+  f = r.read_form!(25).unwrap
+  assert_eq f.value["hiddenfile"].unwrap[0], FILEB_CONTENTS
+}
+
+test "read form with file name, max memory overflow" {
+  r = new_reader(buf(crlf(message_with_file_name())), "MyBoundary")
+  f = r.read_form!(9223372036854775807).unwrap
+  fd = check_file(f.file["filea"].unwrap[0], "filea.txt", FILEA_CONTENTS)
+  assert !fd.f.present?
+}
+
+test "read form max memory overflow" {
+  r = new_reader(buf(crlf(message_with_text_content_type())), "MyBoundary")
+  f = r.read_form!(9223372036854775807).unwrap
+  assert_eq f.value["texta"].unwrap[0], TEXTA_VALUE
+}
+
+test "read form with text content type" {
+  r = new_reader(buf(crlf(message_with_text_content_type())), "MyBoundary")
+  f = r.read_form!(25).unwrap
+  assert_eq f.value["texta"].unwrap[0], TEXTA_VALUE
+}
+
+test "read form no read after EOF" {
+  body = "\n-----------------------------8d345eef0d38dc9\nContent-Disposition: form-data; name=\"version\"\n\n171\n-----------------------------8d345eef0d38dc9--"
+  mr = new_reader(buf(body), "---------------------------8d345eef0d38dc9")
+  f = mr.read_form!(32 << 20).unwrap
+  assert_eq f.value["version"].unwrap, ["171"]
+}
+
+test "read form non-file max memory" {
+  n = 10 << 20
+  large = strings.repeat("1", n)
+  body = crlf("--MyBoundary\nContent-Disposition: form-data; name=\"largetext\"\n\n" + large + "\n--MyBoundary--\n")
+  max_memory = 0
+  ok_at = -1
+  while max_memory < 256 && ok_at < 0 {
+    r = new_reader(buf(body), "MyBoundary")
+    f = r.read_form!(max_memory)
+    if f.ok? {
+      assert f.unwrap.value["largetext"].unwrap[0] == large
+      ok_at = max_memory
+    }
+    max_memory += 16
+  }
+  assert ok_at >= 128, "ReadForm(#{ok_at}) should hit the memory limit"
+}
+
+def too_large?(r: ~Form) -> Bool {
+  return false unless r.err?
+  r.err.unwrap.message == "multipart: message too large"
+}
+
+test "read form metadata too large" {
+  b = bytes.new_buffer([])
+  fw = new_writer(b)
+  w = fw.create_form_field!(strings.repeat("a", 10 << 20)).unwrap
+  w.write!("value".bytes.to_a).unwrap
+  fw.close!.unwrap
+  rr = new_reader(b, fw.boundary)
+  assert too_large?(rr.read_form!(0))
+  b = bytes.new_buffer([])
+  fw = new_writer(b)
+  h = textproto.new_mime_header
+  h.set!("Content-Disposition", "form-data; name=\"a\"")
+  h.set!("X-Foo", strings.repeat("a", 10 << 20))
+  w = fw.create_part!(h).unwrap
+  w.write!("value".bytes.to_a).unwrap
+  fw.close!.unwrap
+  rr = new_reader(b, fw.boundary)
+  assert too_large?(rr.read_form!(0))
+  b = bytes.new_buffer([])
+  fw = new_writer(b)
+  i = 0
+  while i < 1100 {
+    w = fw.create_form_field!("f").unwrap
+    w.write!("v".bytes.to_a).unwrap
+    i += 1
+  }
+  fw.close!.unwrap
+  rr = new_reader(b, fw.boundary)
+  assert too_large?(rr.read_form!(0))
+}
+
+def check_many_files(distinct: Bool) {
+  b = bytes.new_buffer([])
+  fw = new_writer(b)
+  num = 10
+  i = 0
+  while i < num {
+    w = fw.create_form_file!("#{i}", "#{i}").unwrap
+    w.write!("#{i}".bytes.to_a).unwrap
+    i += 1
+  }
+  fw.close!.unwrap
+  fr = new_reader(b, fw.boundary)
+  dir = os.mkdir_temp("", "multipart-test-*").unwrap
+  fr.set_temp_dir!(dir)
+  fr.set_distinct_files!(distinct)
+  form = fr.read_form!(0).unwrap
+  i = 0
+  while i < num {
+    fhs = form.file["#{i}"].unwrap
+    assert_eq fhs.size, 1
+    file = fhs[0].open.unwrap
+    assert_eq Str.from_bytes(io.read_all(file).unwrap), "#{i}"
+    file.close!.unwrap
+    i += 1
+  }
+  assert_eq os.read_dir(dir).unwrap.size, distinct ? num : 1
+  form.remove_all.unwrap
+  assert_eq os.read_dir(dir).unwrap.size, 0
+  os.remove_all(dir).unwrap
+}
+
+test "read form many files combined" {
+  check_many_files(false)
+}
+
+test "read form many files distinct" {
+  check_many_files(true)
+}
+
+test "read form limits" {
+  # (values, files, extra keys per file, max parts, max headers, want error)
+  tests = [
+    (1000, 0, 0, 1000, 10000, false),
+    (1001, 0, 0, 1000, 10000, true),
+    (500, 500, 0, 1000, 10000, false),
+    (501, 500, 0, 1000, 10000, true),
+    (0, 1000, 0, 1000, 10000, false),
+    (0, 1001, 0, 1000, 10000, true),
+    (0, 1, 9998, 1000, 10000, false),
+    (0, 1, 10000, 1000, 10000, true),
+    (100, 0, 0, 100, 10000, false),
+    (101, 0, 0, 100, 10000, true),
+    (0, 2, 48, 1000, 100, false),
+    (0, 2, 50, 1000, 100, true)
+  ]
+  for t in tests {
+    b = bytes.new_buffer([])
+    fw = new_writer(b)
+    i = 0
+    while i < t[0] {
+      w = fw.create_form_field!("field#{i}").unwrap
+      w.write_string!("value #{i}").unwrap
+      i += 1
+    }
+    i = 0
+    while i < t[1] {
+      h = textproto.new_mime_header
+      h.set!("Content-Disposition", "form-data; name=\"file#{i}\"; filename=\"file#{i}\"")
+      h.set!("Content-Type", "application/octet-stream")
+      j = 0
+      while j < t[2] {
+        h.set!("k#{j}", "v")
+        j += 1
+      }
+      w = fw.create_part!(h).unwrap
+      w.write_string!("value #{i}").unwrap
+      i += 1
+    }
+    fw.close!.unwrap
+    fr = new_reader(b, fw.boundary)
+    fr.set_max_parts!(t[3])
+    fr.set_max_headers!(t[4])
+    res = fr.read_form!(1 << 10)
+    if res.ok? {
+      res.unwrap.remove_all.unwrap
+    }
+    assert_eq res.err?, t[5]
+    assert too_large?(res) if t[5]
+  }
+}
+
+# Endless bytes after a prefix (Go's io.MultiReader(prefix, neverendingReader)).
+struct Endless {
+  prefix: bytes.Buffer
+  c: Byte
+
+  pub def read!(p: [Byte]) -> Int {
+    x = prefix
+    n = x.read!(p)
+    return n if n > 0
+    i = 0
+    while i < p.size {
+      p[i] = c
+      i += 1
+    }
+    p.size
+  }
+}
+
+test "read form endless header line" {
+  for prefix in ["X-", "X-Header: ", "X-Header: foo\r\n  "] {
+    s = "--boundary\r\nContent-Disposition: form-data; name=\"a\"\r\nContent-Type: text/plain\r\n" + prefix
+    r = new_reader(Endless.new(prefix: buf(s), c: 88), "boundary")
+    assert too_large?(r.read_form!(1 << 20)), "prefix #{prefix}"
+  }
+}
+
+# ------------------------------------------------------------------ writer
+
+test "writer" {
+  file_contents = "my file contents".bytes.to_a
+  b = bytes.new_buffer([])
+  w = new_writer(b)
+  part = w.create_form_file!("myfile", "my-file.txt").unwrap
+  part.write!(file_contents).unwrap
+  w.write_field!("key", "val").unwrap
+  assert part.write!("val".bytes.to_a).err?
+  w.close!.unwrap
+  s = b.to_s
+  assert s.size > 0
+  assert s[0] != 13 && s[0] != 10
+  r = new_reader(b, w.boundary)
+  p = r.next_part!.unwrap.unwrap
+  assert_eq p.form_name, "myfile"
+  assert_eq slurp(p), "my file contents"
+  p = r.next_part!.unwrap.unwrap
+  assert_eq p.form_name, "key"
+  assert_eq slurp(p), "val"
+  assert !r.next_part!.unwrap.present?
+}
+
+test "writer set boundary" {
+  tests = [
+    ("abc", true),
+    ("", false),
+    ("ungültig", false),
+    ("!", false),
+    (strings.repeat("x", 70), true),
+    (strings.repeat("x", 71), false),
+    ("bad!ascii!", false),
+    ("my-separator", true),
+    ("with space", true),
+    ("badspace ", false),
+    ("(boundary)", true)
+  ]
+  for t in tests {
+    b = bytes.new_buffer([])
+    w = new_writer(b)
+    got = w.set_boundary!(t[0]).ok?
+    assert_eq got, t[1]
+    if t[1] {
+      assert_eq w.boundary, t[0]
+      ct = w.form_data_content_type
+      mt, params = mime.parse_media_type(ct).unwrap
+      assert_eq mt, "multipart/form-data"
+      assert_eq params["boundary"] || "", t[0]
+      w.close!.unwrap
+      assert b.to_s.include?("\r\n--" + t[0] + "--\r\n")
+    }
+  }
+}
+
+test "set boundary after write" {
+  w = new_writer(bytes.new_buffer([]))
+  w.write_field!("a", "b").unwrap
+  assert_eq w.set_boundary!("x").err.unwrap.message, "mime: SetBoundary called after write"
+}
+
+test "random boundary" {
+  w = new_writer(bytes.new_buffer([]))
+  assert_eq w.boundary.size, 60
+  w2 = new_writer(bytes.new_buffer([]))
+  assert w.boundary != w2.boundary
+}
+
+test "sorted header" {
+  b = bytes.new_buffer([])
+  w = new_writer(b)
+  w.set_boundary!("MIMEBOUNDARY").unwrap
+  h = textproto.new_mime_header
+  h.set_raw!("A", ["2"])
+  h.set_raw!("B", ["5", "7", "6"])
+  h.set_raw!("C", ["4"])
+  h.set_raw!("M", ["3"])
+  h.set_raw!("Z", ["1"])
+  part = w.create_part!(h).unwrap
+  part.write!("foo".bytes.to_a).unwrap
+  w.close!.unwrap
+  assert_eq b.to_s, "--MIMEBOUNDARY\r\nA: 2\r\nB: 5\r\nB: 7\r\nB: 6\r\nC: 4\r\nM: 3\r\nZ: 1\r\n\r\nfoo\r\n--MIMEBOUNDARY--\r\n"
+}
+
+test "file content disposition" {
+  tests = [
+    ("somefield", "somefile.txt", "form-data; name=\"somefield\"; filename=\"somefile.txt\""),
+    ("field\"withquotes\"", "somefile.txt", "form-data; name=\"field\\\"withquotes\\\"\"; filename=\"somefile.txt\""),
+    ("somefield", "somefile\"withquotes\".txt", "form-data; name=\"somefield\"; filename=\"somefile\\\"withquotes\\\".txt\""),
+    ("somefield\\withbackslash", "somefile.txt", "form-data; name=\"somefield\\\\withbackslash\"; filename=\"somefile.txt\""),
+    ("somefield", "somefile\\withbackslash.txt", "form-data; name=\"somefield\"; filename=\"somefile\\\\withbackslash.txt\""),
+    ("a\rb\nc", "e\rf\ng", "form-data; name=\"a%0Db%0Ac\"; filename=\"e%0Df%0Ag\"")
+  ]
+  for t in tests {
+    assert_eq file_content_disposition(t[0], t[1]), t[2]
+  }
+}
+
+test "file seek and read_at" {
+  r = new_reader(buf(crlf(message())), "MyBoundary")
+  f = r.read_form!(25).unwrap
+  for name in ["filea", "fileb"] {
+    file = f.file[name].unwrap[0].open.unwrap
+    p: [Byte] = [0; 4]
+    assert_eq file.read_at(p, 3).unwrap, 4
+    assert_eq Str.from_bytes(p), name == "filea" ? "s is" : "ther"
+    assert_eq file.seek!(-5, io.SEEK_END).unwrap, (name == "filea" ? FILEA_CONTENTS.size : FILEB_CONTENTS.size) - 5
+    assert_eq Str.from_bytes(io.read_all(file).unwrap), name == "filea" ? "file." : "file."
+    file.close!.unwrap
+  }
+  f.remove_all.unwrap
+}
+
+example "new reader" {
+  body = "--foo\r\nFoo: one\r\n\r\nA section\r\n" + "--foo\r\nFoo: two\r\n\r\nAnd another\r\n" + "--foo--\r\n"
+  media_type, params = mime.parse_media_type("multipart/mixed; boundary=foo").unwrap
+  if media_type.start_with?("multipart/") {
+    mr = new_reader(bytes.new_buffer_string(body), params["boundary"] || "")
+    while p = mr.next_part!.unwrap {
+      data = io.read_all(p).unwrap
+      puts "Part #{strconv.quote(p.header.get("Foo"))}: #{strconv.quote(Str.from_bytes(data))}"
+    }
+  }
+} outputs "Part \"one\": \"A section\"\nPart \"two\": \"And another\"\n"
+
+# ----------------------------------------- helpers for vec_multipart_test
+
+def no_ops -> [(Str, Str, Str, Str)] {
+  out: [(Str, Str, Str, Str)] = []
+  out
+}
+
+def write_ops(boundary: Str, ops: [(Str, Str, Str, Str)]) -> Str {
+  b = bytes.new_buffer([])
+  w = new_writer(b)
+  w.set_boundary!(boundary).unwrap
+  for o in ops {
+    if o[0] == "F" {
+      w.write_field!(o[1], o[2]).unwrap
+    } else if o[0] == "FILE" {
+      p = w.create_form_file!(o[1], o[2]).unwrap
+      p.write_string!(o[3]).unwrap
+    } else {
+      h = textproto.new_mime_header
+      if o[1].size > 0 {
+        for kv in strings.split(o[1], "|") {
+          k, v = strings.cut(kv, ": ").unwrap
+          h.add!(k, v)
+        }
+      }
+      p = w.create_part!(h).unwrap
+      p.write_string!(o[2]).unwrap
+    }
+  }
+  w.close!.unwrap
+  b.to_s
+}
+
+def render_header(h: textproto.MIMEHeader) -> Str {
+  parts: [Str] = []
+  for k in h.sorted_keys {
+    parts << k + "=[" + strings.join(h.raw(k) || [], "|") + "]"
+  }
+  "{" + strings.join(parts, ";") + "}"
+}
+
+def parse_render(body: Str, boundary: Str, raw: Bool) -> Str {
+  r = new_reader(buf(body), boundary)
+  out: [Str] = []
+  loop {
+    np = raw ? r.next_raw_part! : r.next_part!
+    if e = np.err {
+      out << "ERR " + e.message
+      break
+    }
+    po = np.unwrap
+    break unless po.present?
+    p = po.unwrap
+    got: [Byte] = []
+    chunk: [Byte] = [0; 512]
+    fail_msg = ""
+    loop {
+      n = p.read!(chunk)
+      if e = n.err {
+        fail_msg = is_unexpected_eof(e) ? " UEOF" : " ERR " + e.message
+        break
+      }
+      break if n.unwrap == 0
+      got = got + chunk[0...n.unwrap]
+    }
+    out << render_header(p.header) + " form=" + p.form_name + " file=" + p.file_name + " body=<" + Str.from_bytes(got) + ">" + fail_msg
+    break if fail_msg.size > 0
+  }
+  strings.join(out, "\n")
+}
+
+def read_form_render(body: Str, boundary: Str, max_memory: Int) -> Str {
+  r = new_reader(buf(body), boundary)
+  res = r.read_form!(max_memory)
+  return "ERR " + res.err.unwrap.message if res.err?
+  f = res.unwrap
+  out: [Str] = []
+  for k in f.value.keys.sort {
+    out << "V " + k + "=[" + strings.join(f.value[k] || [], "|") + "]"
+  }
+  for k in f.file.keys.sort {
+    for fh in f.file[k] || [] {
+      fl = fh.open.unwrap
+      data = io.read_all(fl).unwrap
+      fl.close!.unwrap
+      out << "F #{k}=#{fh.filename} #{fh.size} <#{Str.from_bytes(data)}> #{render_header(fh.header)}"
+    }
+  }
+  f.remove_all.unwrap
+  strings.join(out, "\n")
+}
+
+def set_boundary_render(s: Str) -> Str {
+  w = new_writer(bytes.new_buffer([]))
+  r = w.set_boundary!(s)
+  return "ERR " + r.err.unwrap.message if r.err?
+  "OK " + w.form_data_content_type
+}

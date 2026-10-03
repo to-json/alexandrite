@@ -1,0 +1,228 @@
+# Forms (multipart/form-data), after Go's formdata.go.
+import "bytes"
+import "io"
+import "net/textproto"
+import "os"
+
+# A parsed multipart form: the values of plain fields and the headers of
+# file parts, by field name.
+pub struct Form {
+  value: Map[Str, [Str]]
+  file: Map[Str, [FileHeader]]
+
+  # Removes the temporary files of the form's file parts.
+  pub def remove_all -> ~Unit {
+    first: Error? = none
+    for _, fhs in file {
+      for fh in fhs {
+        next if fh.tmpfile.size == 0
+        r = os.remove(fh.tmpfile)
+        if e = r.err {
+          first = e if !first.present? && !os.is_not_exist(e)
+        }
+      }
+    }
+    if e = first {
+      fail e
+    }
+  }
+}
+
+# A file part of a form: its name, header and size. open reads it from
+# memory or from the temporary file it was spilled to.
+pub struct FileHeader {
+  filename: Str
+  header: textproto.MIMEHeader
+  size: Int
+  in_memory: Bool
+  content: [Byte]
+  tmpfile: Str
+  tmpoff: Int
+  tmpshared: Bool
+
+  # The file's contents.
+  pub def open -> ~File {
+    if in_memory {
+      return new_file_bytes(content)
+    }
+    f = ~os.open(tmpfile)
+    if tmpshared {
+      return new_file_section(f, tmpoff, size)
+    }
+    total = f.~stat.size
+    new_file_section(f, 0, total)
+  }
+}
+
+# The contents of a FileHeader (Go's File interface: Reader, ReaderAt,
+# Seeker, Closer): a section of memory or of a temporary file. Copies share
+# the read offset.
+pub struct File {
+  content: [Byte]
+  f: os.File?
+  off: Int
+  size: Int
+  pos: [Int]
+
+  pub def read!(p: [Byte]) -> ~Int {
+    n = self.~read_at(p, pos[0])
+    self.pos[0] = pos[0] + n
+    n
+  }
+
+  # Reads p.size bytes at offset `at` (fewer at the end).
+  pub def read_at(p: [Byte], at: Int) -> ~Int {
+    return 0 if at >= size || p.size == 0
+    n = p.size
+    n = size - at if n > size - at
+    if fl = f {
+      done = 0
+      while done < n {
+        k = fl.~read_at(p[done...n], off + at + done)
+        break if k == 0
+        done += k
+      }
+      return done
+    }
+    copy(p[0...n], content[off + at...off + at + n])
+    n
+  }
+
+  # Moves the read offset (whence: io.SEEK_START, SEEK_CURRENT, SEEK_END).
+  pub def seek!(offset: Int, whence: Int) -> ~Int {
+    base = 0
+    base = pos[0] if whence == io.SEEK_CURRENT
+    base = size if whence == io.SEEK_END
+    np = base + offset
+    fail io.StreamError.InvalidArgument("negative position") if np < 0
+    self.pos[0] = np
+    np
+  }
+
+  pub def close! -> ~Unit {
+    if fl = f {
+      g = fl
+      g.~close!
+    }
+  }
+}
+
+def new_file_bytes(b: [Byte]) -> File {
+  File.new(content: b, f: none, off: 0, size: b.size, pos: [0])
+}
+
+def new_file_section(f: os.File, off: Int, size: Int) -> File {
+  File.new(content: [], f: f, off: off, size: size, pos: [0])
+}
+
+# Go's mimeHeaderSize.
+def mime_header_size(h: textproto.MIMEHeader) -> Int {
+  size = 400
+  for k in h.keys {
+    size += k.size + 200
+    for v in (h.raw(k) || []) {
+      size += v.size
+    }
+  }
+  size
+}
+
+# Copies up to `limit` bytes of src into a new slice (Go's io.CopyN into a
+# bytes.Buffer, which stops at the end of src).
+def copy_n[S: io.Reader](src: S, limit: Int) -> ~[Byte] {
+  s = src
+  acc = bytes.new_buffer([])
+  return acc.bytes if limit <= 0
+  buf: [Byte] = [0; 32768]
+  while acc.size < limit {
+    want = limit - acc.size
+    want = buf.size if want > buf.size
+    n = s.~read!(buf[0...want])
+    break if n == 0
+    acc.write!(buf[0...n])
+  }
+  acc.bytes
+}
+
+# The state of a read_form! in progress, so failures can clean up.
+struct FormBuild {
+  file: os.File?
+  file_off: Int
+  disk_files: Int
+}
+
+# The loop of Go's readForm (Reader.read_form! sets up and cleans up).
+def build_form[R](mr: Reader[R], max_memory: Int, fb: [FormBuild], form: Form) -> ~Unit {
+  r = mr
+  combine = !r.st[0].distinct
+  max_parts = r.st[0].max_parts
+  max_headers = r.st[0].max_headers
+  max_file_memory = max_memory
+  max_file_memory -= 1 if max_file_memory == MAX_INT
+  max_memory_bytes = 0
+  if max_memory > MAX_INT - 10485760 {
+    max_memory_bytes = MAX_INT
+  } else {
+    max_memory_bytes = max_memory + 10485760
+    if max_memory_bytes <= 0 {
+      max_memory_bytes = max_memory < 0 ? 0 : MAX_INT
+    }
+  }
+  loop {
+    po = r.~next_part_limited!(false, max_memory_bytes, max_headers)
+    break unless po.present?
+    p = po.unwrap
+    fail MultipartError.MessageTooLarge if max_parts <= 0
+    max_parts -= 1
+    name = p.form_name
+    next if name.size == 0
+    filename = p.file_name
+    max_memory_bytes -= name.size + 200
+    fail MultipartError.MessageTooLarge if max_memory_bytes < 0
+    if filename.size == 0 {
+      lim = max_memory_bytes == MAX_INT ? MAX_INT : max_memory_bytes + 1
+      b = ~copy_n(p, lim)
+      max_memory_bytes -= b.size
+      fail MultipartError.MessageTooLarge if max_memory_bytes < 0
+      vs = form.value[name] || []
+      vs << Str.from_bytes(b)
+      form.value[name] = vs
+      next
+    }
+    max_memory_bytes -= mime_header_size(p.header) + 200 + 100
+    fail MultipartError.MessageTooLarge if max_memory_bytes < 0
+    for k in p.header.keys {
+      max_headers -= (p.header.raw(k) || []).size
+    }
+    b = ~copy_n(p, max_file_memory + 1)
+    fh = FileHeader.new(filename: filename, header: p.header, size: 0, in_memory: false, content: [], tmpfile: "", tmpoff: 0, tmpshared: false)
+    if b.size > max_file_memory {
+      if !fb[0].file.present? {
+        nf = ~os.create_temp(r.st[0].temp_dir, "multipart-")
+        fb[0].file = nf
+      }
+      f = fb[0].file.unwrap
+      fb[0].disk_files = fb[0].disk_files + 1
+      f.~write!(b)
+      rest = ~io.copy(f, p)
+      fh.tmpfile = f.name
+      fh.size = b.size + rest
+      fh.tmpoff = fb[0].file_off
+      fb[0].file_off = fb[0].file_off + fh.size
+      if !combine {
+        f.~close!
+        fb[0].file = none
+        fb[0].file_off = 0
+      }
+    } else {
+      fh.in_memory = true
+      fh.content = b
+      fh.size = b.size
+      max_file_memory -= b.size
+      max_memory_bytes -= b.size
+    }
+    fhs = form.file[name] || []
+    fhs << fh
+    form.file[name] = fhs
+  }
+}

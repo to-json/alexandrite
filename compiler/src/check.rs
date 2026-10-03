@@ -1142,7 +1142,10 @@ pub fn bind_tparams(te: &TypeExpr, t: &Ty, tps: &[TParam], out: &mut HashMap<Str
         }
         (TypeExpr::App(n, args, _), t) => {
             if let Some((base, targs)) = inst_args(t) {
-                if base == *n {
+                // (A package's own source names its generics unqualified:
+                // `ReaderState[R]` inside net/textproto is the instance
+                // `net/textproto.ReaderState[..]`.)
+                if base == *n || base.ends_with(&format!(".{n}")) {
                     for (a, x) in args.iter().zip(&targs) {
                         bind_tparams(a, x, tps, out);
                     }

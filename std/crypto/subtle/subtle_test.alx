@@ -1,0 +1,192 @@
+# Go's constant_time_test.go, xor_test.go and dit_test.go, translated.
+# testing/quick's random checks use seeded generator values (gen, in
+# vec_subtle_test.alx), and ConstantTimeByteEq is checked exhaustively.
+#
+# Not translated: TestXorBytesPanic (alx panics abort the program; a test
+# can't recover from one), TestXORBytesBoundary (slices that end at guard
+# pages; alx slices are bounds-checked), TestDITPanic and the other DIT tests
+# (they read the arm64 DIT bit, which alx doesn't set; see the header).
+
+struct CompareCase {
+  a: [Byte]
+  b: [Byte]
+  out: Int
+}
+
+test "constant time compare" {
+  cases = [
+    CompareCase.new(a: [], b: [], out: 1),
+    CompareCase.new(a: [0x11], b: [0x11], out: 1),
+    CompareCase.new(a: [0x12], b: [0x11], out: 0),
+    CompareCase.new(a: [0x11], b: [0x11, 0x12], out: 0),
+    CompareCase.new(a: [0x11, 0x12], b: [0x11], out: 0)
+  ]
+  for c in cases {
+    assert_eq constant_time_compare(c.a, c.b), c.out
+  }
+}
+
+def byte_eq(a: Byte, b: Byte) -> Int {
+  return 1 if a == b
+  0
+}
+
+test "constant time byte eq" {
+  assert_eq constant_time_byte_eq(0, 0), 1
+  assert_eq constant_time_byte_eq(0, 1), 0
+  assert_eq constant_time_byte_eq(1, 0), 0
+  assert_eq constant_time_byte_eq(0xff, 0xff), 1
+  assert_eq constant_time_byte_eq(0xff, 0xfe), 0
+  # quick.CheckEqual, exhaustively.
+  a = 0
+  while a < 256 {
+    b = 0
+    while b < 256 {
+      assert_eq constant_time_byte_eq(a.as_u8, b.as_u8), byte_eq(a.as_u8, b.as_u8)
+      b += 1
+    }
+    a += 1
+  }
+}
+
+def eq(a: I32, b: I32) -> Int {
+  return 1 if a == b
+  0
+}
+
+test "constant time eq" {
+  # quick.CheckEqual: random pairs, plus equal pairs and the extremes.
+  vals: [I32] = [0, 1, -1, 2147483647, -2147483648, 0x7f, -0x80]
+  i = 0
+  while i < 1000 {
+    vals << rand64(i.as_u64).as_i32
+    i += 1
+  }
+  for x in vals {
+    assert_eq constant_time_eq(x, x), 1
+    y = (x.as_i64 + 1).as_i32
+    assert_eq constant_time_eq(x, y), eq(x, y)
+  }
+  i = 0
+  while i + 1 < vals.size {
+    assert_eq constant_time_eq(vals[i], vals[i + 1]), eq(vals[i], vals[i + 1])
+    i += 1
+  }
+}
+
+def make_copy(v: Int, x0: [Byte], y0: [Byte]) -> [Byte] {
+  x = x0
+  y = y0
+  if x.size > y.size {
+    x = x[0...y.size]
+  } else {
+    y = y[0...x.size]
+  }
+  copy(x, y) if v == 1
+  x
+}
+
+def constant_time_copy_wrapper(v0: Int, x0: [Byte], y0: [Byte]) -> [Byte] {
+  x = x0
+  y = y0
+  if x.size > y.size {
+    x = x[0...y.size]
+  } else {
+    y = y[0...x.size]
+  }
+  v = v0 & 1
+  constant_time_copy(v, x, y)
+  x
+}
+
+test "constant time copy" {
+  i = 0
+  while i < 300 {
+    x = gen(i.as_u64 * 3, (rand64(i.as_u64) % 50).to_i)
+    y = gen(i.as_u64 * 3 + 1, (rand64(i.as_u64 + 7) % 50).to_i)
+    v = (rand64(i.as_u64 + 11) % 4).to_i
+    assert_eq constant_time_copy_wrapper(v, x + [], y), make_copy(v & 1, x + [], y)
+    i += 1
+  }
+}
+
+test "constant time less or eq" {
+  tests: [(Int, Int, Int)] = [(0, 0, 1), (1, 0, 0), (0, 1, 1), (10, 20, 1), (20, 10, 0), (10, 10, 1)]
+  for t in tests {
+    assert_eq constant_time_less_or_eq(t[0], t[1]), t[2]
+  }
+}
+
+test "constant time select" {
+  assert_eq constant_time_select(1, 7, 9), 7
+  assert_eq constant_time_select(0, 7, 9), 9
+  assert_eq constant_time_select(-5, 7, 9), 7
+}
+
+test "xor bytes" {
+  n = 1
+  while n <= 1024 {
+    align_p = 0
+    while align_p < 8 {
+      align_q = 0
+      while align_q < 8 {
+        align_d = 0
+        while align_d < 8 {
+          seed = (n * 512 + align_p * 64 + align_q * 8 + align_d).as_u64 * 4
+          p = gen(seed, align_p + n)[align_p...align_p + n]
+          q = gen(seed + 1, align_q + n)[align_q...align_q + n]
+          d = gen(seed + 2, align_d + n + 100)
+          want = d + []
+          i = 0
+          while i < n {
+            want[align_d + i] = p[i] ^ q[i]
+            i += 1
+          }
+          assert_eq xor_bytes(d[align_d...d.size], p, q), n
+          assert_eq d, want
+          p1 = p + []
+          assert_eq xor_bytes(p, p, q), n
+          assert_eq p, want[align_d...align_d + n]
+          assert_eq xor_bytes(q, p1, q), n
+          assert_eq q, want[align_d...align_d + n]
+          assert_eq xor_bytes(p, p, p), n
+          assert_eq p, [0.as_u8; n]
+          assert_eq xor_bytes(p1, q, q), n
+          assert_eq p1, [0.as_u8; n]
+          align_d += 1
+        }
+        align_q += 1
+      }
+      align_p += 1
+    }
+    # Go's -short stride above 16.
+    n += n > 16 ? 1 + (n >> 3) : 1
+  }
+}
+
+test "xor bytes lengths" {
+  # n is the shorter of x and y; dst may be longer.
+  dst = [0.as_u8; 10]
+  assert_eq xor_bytes(dst, [1, 2, 3], [1, 1]), 2
+  want: [Byte] = [0, 3, 0, 0, 0, 0, 0, 0, 0, 0]
+  assert_eq dst, want
+  assert_eq xor_bytes([], [], [1]), 0
+}
+
+test "with data independent timing" {
+  ran = [0]
+  with_data_independent_timing(->() {
+    with_data_independent_timing(->() { ran[0] = ran[0] + 1 })
+    ran[0] = ran[0] + 1
+  })
+  assert_eq ran[0], 2
+}
+
+bench "xor bytes 32KB" {
+  dst = [0.as_u8; 1 << 15]
+  xor_bytes(dst, [1.as_u8; 1 << 15], [2.as_u8; 1 << 15])
+}
+
+bench "constant time compare 1KB" {
+  constant_time_compare([1.as_u8; 1024], [1.as_u8; 1024])
+}

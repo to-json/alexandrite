@@ -885,6 +885,15 @@ impl<'a> Parser<'a> {
                 }
                 return Ok(t);
             }
+            if !self.is_op("->") && ps.len() == 1 {
+                // `(T)` groups: `((Int) -> Int)?` is an optional function.
+                let t = ps.pop().unwrap();
+                if self.is_op("?") && !self.space_before() {
+                    self.bump();
+                    return Ok(TypeExpr::Opt(Box::new(t), sp.to(self.prev_span())));
+                }
+                return Ok(t);
+            }
             self.expect_op("->")?;
             let r = self.type_expr()?;
             return Ok(TypeExpr::Fn(ps, Box::new(r), sp.to(self.prev_span())));
@@ -1190,10 +1199,32 @@ impl<'a> Parser<'a> {
                 pats.push(Pat::Value(self.expr()?));
             } else {
                 loop {
+                    // A qualified variant: `PErr.Bad(..)`, `pk.PErr.Bad(..)`. The
+                    // name keeps its type part (`PErr.Bad`), not the package.
+                    let mut k = 0;
+                    while matches!(self.peek_at(k), Tok::Ident(_) | Tok::Const(_)) && matches!(self.peek_at(k + 1), Tok::Op(".")) {
+                        k += 2;
+                    }
+                    let qualified = k > 0 && matches!(self.peek_at(k), Tok::Const(_)) && {
+                        let after = self.peek_at(k + 1);
+                        (matches!(after, Tok::Op("(")) && !self.space_before_at(k + 1)) || matches!(after, Tok::Op("=>") | Tok::Op("|"))
+                    };
+                    let mut qual = String::new();
+                    let qsp = self.span();
+                    if qualified {
+                        for _ in 0..k / 2 {
+                            if let Tok::Const(c) = self.bump().tok {
+                                qual.push_str(&c);
+                                qual.push('.');
+                            }
+                            self.bump();
+                        }
+                    }
                     if let Tok::Const(vname) = self.peek().clone() {
+                        let vname = format!("{qual}{vname}");
                         let paren = matches!(self.peek_at(1), Tok::Op("(")) && !self.space_before_at(1);
                         if paren || matches!(self.peek_at(1), Tok::Op("=>") | Tok::Op("|")) {
-                            let vsp = self.bump().span;
+                            let vsp = if qualified { qsp.to(self.bump().span) } else { self.bump().span };
                             let binds = if paren {
                                 self.bump();
                                 let mut bs = vec![];

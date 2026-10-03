@@ -13,7 +13,7 @@ use cranelift_codegen::ir::condcodes::IntCC;
 use cranelift_codegen::ir::condcodes::FloatCC;
 use cranelift_codegen::ir::AtomicRmwOp;
 use cranelift_codegen::ir::types::{F64, I8, I64};
-use cranelift_codegen::ir::{AbiParam, Block, BlockArg, FuncRef, InstBuilder, MemFlagsData, SigRef, Signature, StackSlotData, StackSlotKind, TrapCode, Type, Value};
+use cranelift_codegen::ir::{AbiParam, Block, BlockArg, FuncRef, InstBuilder, MemFlagsData, SigRef, Signature, StackSlot, StackSlotData, StackSlotKind, TrapCode, Type, Value};
 use cranelift_codegen::settings::{self, Configurable};
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
 use cranelift_jit::{JITBuilder, JITModule};
@@ -340,7 +340,7 @@ pub fn run(p: &LProgram) -> Result<(), String> {
         };
         {
             let b = FunctionBuilder::new(&mut ctx.func, &mut fbc);
-            let mut fx = Fx { b, m: &mut m, d: &d, strs: &mut strs, f, kind, lgen: g, vars: vec![], loops: HashMap::new(), params: vec![], gstate: None, resume: vec![], yields: 0, sigs: HashMap::new(), frefs: HashMap::new() };
+            let mut fx = Fx { b, m: &mut m, d: &d, strs: &mut strs, f, kind, lgen: g, vars: vec![], loops: HashMap::new(), params: vec![], gstate: None, resume: vec![], yields: 0, sigs: HashMap::new(), frefs: HashMap::new(), slot_pool: vec![] };
             fx.body();
             fx.b.seal_all_blocks();
             fx.b.finalize(fcfg);
@@ -431,6 +431,10 @@ struct Fx<'m, 'b, 'p> {
     yields: usize,
     sigs: HashMap<(Vec<Type>, Option<Type>), SigRef>,
     frefs: HashMap<FuncId, FuncRef>,
+    /// Stack slots for spills and runtime out-parameters: every use is over
+    /// within one statement, so each statement starts with all of them free
+    /// (without reuse, deep call chains overflowed a task's stack).
+    slot_pool: Vec<(StackSlot, u32, bool)>,
 }
 
 fn bargs(v: &[Value]) -> Vec<BlockArg> {
@@ -593,7 +597,18 @@ impl Fx<'_, '_, '_> {
     }
 
     fn slot(&mut self, size: u32) -> Value {
-        let ss = self.b.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, size.max(1), 3));
+        let size = size.max(1).next_multiple_of(8);
+        let ss = match self.slot_pool.iter_mut().find(|(_, n, used)| !*used && *n >= size) {
+            Some(e) => {
+                e.2 = true;
+                e.0
+            }
+            None => {
+                let ss = self.b.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, size, 3));
+                self.slot_pool.push((ss, size, true));
+                ss
+            }
+        };
         self.b.ins().stack_addr(I64, ss, 0)
     }
 
@@ -788,6 +803,9 @@ impl Fx<'_, '_, '_> {
     // ---------- statements ----------
 
     fn stmt(&mut self, s: &LS) {
+        for e in self.slot_pool.iter_mut() {
+            e.2 = false;
+        }
         match s {
             LS::SetGlobal(k, v) => {
                 let vals = self.e(v);

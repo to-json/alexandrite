@@ -2603,7 +2603,19 @@ impl<'w, 'a> FnCx<'w, 'a> {
             for pat in &arm.pats {
                 let local = |cx: &mut Self| subj.as_ref().map(|(id, ty)| cx.mk(TK::Local(*id), ty.clone(), arm.span));
                 let c = match pat {
-                    Pat::Variant(vn, bs, vsp) => {
+                    Pat::Variant(full, bs, vsp) => {
+                        // `Type.Variant`: the type part narrows (and checks) it.
+                        let (tq, vn) = match full.rsplit_once('.') {
+                            Some((t, v)) => (Some(t.to_string()), v.to_string()),
+                            None => (None, full.clone()),
+                        };
+                        let vn = &vn;
+                        let type_is = |t: &Ty, q: &str| t.type_name().is_some_and(|n| n == q || n.ends_with(&format!(".{q}")));
+                        if let (Some(q), Some(et)) = (&tq, &enum_ty) {
+                            if !type_is(et, q) {
+                                return Err(Diag::new(*vsp, format!("`{full}`: the case is over {}, not {q}", et.show())));
+                            }
+                        }
                         let variant = match &enum_ty {
                             Some(Ty::Enum(en, vs)) => match vs.iter().position(|(v, _)| v == vn) {
                                 Some(k) => Some((k, vs[k].1.clone())),
@@ -2640,13 +2652,13 @@ impl<'w, 'a> FnCx<'w, 'a> {
                                 // Over an Error: a variant of any error type, or an error type itself.
                                 let l = local(self).unwrap();
                                 let errors = self.w.errors.clone();
-                                if let Some(k) = errors.iter().position(|t| t.type_name() == Some(vn.as_str())) {
+                                if let Some(k) = errors.iter().position(|t| tq.is_none() && t.type_name() == Some(vn.as_str())).or_else(|| if tq.is_none() { errors.iter().position(|t| type_is(t, vn)) } else { None }) {
                                     if bs.is_some() {
                                         return Err(Diag::new(*vsp, format!("`{vn}` is an error type; match its variants to bind fields")));
                                     }
                                     self.mk(TK::M(M::ErrIs(k), Some(Box::new(l)), vec![], None), Ty::Bool, *vsp)
                                 } else {
-                                    let hits: Vec<(usize, usize)> = errors.iter().enumerate().filter_map(|(k, t)| match t {
+                                    let hits: Vec<(usize, usize)> = errors.iter().enumerate().filter(|(_, t)| tq.as_deref().is_none_or(|q| type_is(t, q))).filter_map(|(k, t)| match t {
                                         Ty::Enum(_, vs) => vs.iter().position(|(v, _)| v == vn).map(|j| (k, j)),
                                         _ => None,
                                     }).collect();

@@ -1,0 +1,178 @@
+# Go's encoding/ascii85 tests (ascii85_test.go), translated.
+import "bytes"
+import "io"
+
+def b(s: Str) -> [Byte] { s.bytes.to_a }
+def s(x: [Byte]) -> Str { Str.from_bytes(x) }
+
+BIG_DECODED = "Man is distinguished, not only by his reason, but by this singular passion from other animals, which is a lust of the mind, that by a perseverance of delight in the continued and indefatigable generation of knowledge, exceeds the short vehemence of any carnal pleasure."
+BIG_ENCODED = "9jqo^BlbD-BleB1DJ+*+F(f,q/0JhKF<GL>Cj@.4Gp$d7F!,L7@<6@)/0JDEF<G%<+EV:2F!,\nO<DJ+*.@<*K0@<6L(Df-\\0Ec5e;DffZ(EZee.Bl.9pF\"AGXBPCsi+DGm>@3BB/F*&OCAfu2/AKY\ni(DIb:@FD,*)+C]U=@3BN\#EcYf8ATD3s@q?d$AftVqCh[NqF<G:8+EV:.+Cf>-FD5W8ARlolDIa\nl(DId<j@<?3r@:F%a+D58'ATD4$Bl@l3De:,-DJs`8ARoFb/0JMK@qB4^F!,R<AKZ&-DfTqBG%G\n>uD.RTpAKYo'+CT/5+Cei\#DII?(E,9)oF*2M7/c\n"
+
+def pairs -> [(Str, Str)] {
+  [
+    # encode returns 0 when src is empty
+    ("", ""),
+    # Wikipedia example
+    (BIG_DECODED, BIG_ENCODED),
+    # Special case when shortening !!!!! to z.
+    ("\x00\x00\x00\x00", "z"),
+  ]
+}
+
+# A reader fed with chunks (like an io.Pipe): each read returns at most the
+# rest of the current chunk.
+struct ChunkReader {
+  st: [([Str], Int, Int)]
+
+  def read!(p: [Byte]) -> Int {
+    chunks = st[0][0]
+    i = st[0][1]
+    off = st[0][2]
+    return 0 if i >= chunks.size
+    c = chunks[i]
+    n = c.size - off
+    n = p.size if p.size < n
+    copy(p, b(c[off...off + n]))
+    if off + n == c.size {
+      self.st[0] = (chunks, i + 1, 0)
+    } else {
+      self.st[0] = (chunks, i, off + n)
+    }
+    n
+  }
+}
+
+def chunk_reader(chunks: [Str]) -> ChunkReader { ChunkReader.new(st: [(chunks, 0, 0)]) }
+
+# s without whitespace and control characters.
+def strip85(x: Str) -> Str {
+  out: [Byte] = []
+  for c in x.bytes {
+    out << c if c > 32
+  }
+  s(out)
+}
+
+test "Encode" {
+  for p in pairs {
+    buf: [Byte] = [0; max_encoded_len(p[0].size)]
+    n = encode(buf, b(p[0]))
+    assert_eq strip85(s(buf[0...n])), strip85(p[1])
+  }
+}
+
+test "Encoder" {
+  for p in pairs {
+    bb = bytes.new_buffer([])
+    enc = new_encoder(bb)
+    ~enc.write!(b(p[0]))
+    ~enc.close!
+    assert_eq strip85(bb.to_s), strip85(p[1])
+  }
+}
+
+test "EncoderBuffering" {
+  input = b(BIG_DECODED)
+  size = 1
+  while size <= 12 {
+    bb = bytes.new_buffer([])
+    enc = new_encoder(bb)
+    pos = 0
+    while pos < input.size {
+      e = pos + size
+      e = input.size if e > input.size
+      assert_eq ~enc.write!(input[pos...e]), e - pos
+      pos += size
+    }
+    ~enc.close!
+    assert_eq strip85(bb.to_s), strip85(BIG_ENCODED)
+    size += 1
+  }
+}
+
+test "Decode" {
+  for p in pairs {
+    dbuf: [Byte] = [0; 4 * p[1].size]
+    r = ~decode(dbuf, b(p[1]), true)
+    assert_eq r[1], p[1].size
+    assert_eq r[0], p[0].size
+    assert_eq s(dbuf[0...r[0]]), p[0]
+  }
+}
+
+test "Decoder" {
+  for p in pairs {
+    dbuf = ~io.read_all(new_decoder(bytes.new_buffer_string(p[1])))
+    assert_eq dbuf.size, p[0].size
+    assert_eq s(dbuf), p[0]
+  }
+}
+
+test "DecoderBuffering" {
+  size = 1
+  while size <= 12 {
+    dec = new_decoder(bytes.new_buffer_string(BIG_ENCODED))
+    buf: [Byte] = [0; BIG_DECODED.size + 12]
+    total = 0
+    loop {
+      break if total >= BIG_DECODED.size
+      n = ~dec.read!(buf[total...total + size])
+      break if n == 0
+      total += n
+    }
+    assert_eq s(buf[0...total]), BIG_DECODED
+    size += 1
+  }
+}
+
+test "DecodeCorrupt" {
+  for e in [("v", 0), ("!z!!!!!!!!!", 1)] {
+    dbuf: [Byte] = [0; 4 * e[0].size]
+    r = decode(dbuf, b(e[0]), true)
+    if err = r.err {
+      case err {
+        CorruptInput(off) => assert_eq off, e[1]
+        _ => assert false, "unexpected error #{err}"
+      }
+    } else {
+      assert false, "failed to detect corruption in #{e[0]}"
+    }
+  }
+}
+
+test "Big" {
+  n = 3 * 1000 + 1
+  alpha = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+  raw: [Byte] = [0; n]
+  i = 0
+  while i < n {
+    raw[i] = alpha[i % alpha.size]
+    i += 1
+  }
+  encoded = bytes.new_buffer([])
+  w = new_encoder(encoded)
+  assert_eq ~w.write!(raw), n
+  ~w.close!
+  decoded = ~io.read_all(new_decoder(encoded))
+  assert decoded == raw
+}
+
+test "DecoderInternalWhitespace" {
+  str = " " * 2048 + "z"
+  decoded = ~io.read_all(new_decoder(bytes.new_buffer_string(str)))
+  want: [Byte] = [0, 0, 0, 0]
+  assert_eq decoded, want
+}
+
+# Not in Go's tests: a corrupt stream, and an incomplete dst.
+test "decoder errors repeat" {
+  dec = new_decoder(bytes.new_buffer_string("87cURD]i,\"Ebo80v"))
+  p: [Byte] = [0; 64]
+  # The whole buffered input is decoded at once, so the error comes first.
+  assert_eq dec.read!(p).err?.message || "", "illegal ascii85 data at input byte 15"
+  assert_eq dec.read!(p).err?.message || "", "illegal ascii85 data at input byte 15"
+  short: [Byte] = [0; 5]
+  r = ~decode(short, b("87cURD]i,\"Ebo80"), true)
+  assert_eq r, (4, 5)
+  assert_eq s(short[0...4]), "Hell"
+}

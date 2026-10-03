@@ -1,0 +1,217 @@
+# Go's encoding/pem tests (pem_test.go, example_test.go), translated. The
+# test data (pem_data, certificate, ...) is in data_test.alx.
+import "bytes"
+import "encoding/hex"
+import "sort"
+import "strings"
+
+def bs(xs: [Byte]) -> [Byte] { xs }
+
+# A header map from alternating keys and values.
+def hdrs(kv: [Str]) -> Map[Str, Str] {
+  m: Map[Str, Str] = {}
+  i = 0
+  while i + 1 < kv.size {
+    m[kv[i]] = kv[i + 1]
+    i += 2
+  }
+  m
+}
+
+# A block as "type|k=v,...|hex bytes" with sorted headers; "none" for none
+# (Go's reflect.DeepEqual on blocks).
+def show(blk: Block?) -> Str {
+  if x = blk {
+    keys: [Str] = []
+    for k in x.headers.keys { keys << k }
+    sort.strings(keys)
+    kv: [Str] = []
+    for k in keys { kv << k + "=" + (x.headers[k] || "") }
+    return x.type + "|" + kv.join(",") + "|" + hex.encode_to_string(x.bytes)
+  }
+  "none"
+}
+
+def testing_key(s: Str) -> Str { strings.replace_all(s, "TESTING KEY", "PRIVATE KEY") }
+
+test "GetLine" {
+  tests = [
+    ("abc", "abc", ""),
+    ("abc\r", "abc\r", ""),
+    ("abc\n", "abc", ""),
+    ("abc\r\n", "abc", ""),
+    ("abc\nd", "abc", "d"),
+    ("abc\r\nd", "abc", "d"),
+    ("\nabc", "", "abc"),
+    ("\r\nabc", "", "abc"),
+    ("abc\t \nd", "abc", "d"),
+    ("\t abc\nd", "\t abc", "d"),
+    ("abc\n\t d", "abc", "\t d"),
+    ("abc\nd\t ", "abc", "d\t "),
+  ]
+  for t in tests {
+    r = get_line(b(t[0]))
+    assert_eq Str.from_bytes(r[0]), t[1]
+    assert_eq Str.from_bytes(r[1]), t[2]
+  }
+}
+
+test "Decode" {
+  r = decode(b(pem_data))
+  assert_eq show(r[0]), show(certificate)
+  r = decode(r[1])
+  assert_eq show(r[0]), show(private_key)
+  # Three empty blocks.
+  i = 0
+  while i < 3 {
+    r = decode(r[1])
+    if x = r[0] {
+      assert_eq x.type, "EMPTY"
+      assert_eq x.headers.size, 0
+      assert_eq x.bytes.size, 0
+    } else {
+      assert false, "#{i + 2} should be empty"
+    }
+    i += 1
+  }
+  r = decode(r[1])
+  if x = r[0] {
+    assert_eq x.type, "VALID HEADERS"
+    assert_eq x.headers.size, 1
+  } else {
+    assert false, "#5 expected single header block"
+  }
+  assert_eq r[1].size, 0
+  r2 = decode(b(pem_private_key2))
+  assert_eq show(r2[0]), show(private_key2)
+}
+
+test "BadDecode" {
+  tests = [
+    ("too few trailing dashes", "\n-----BEGIN FOO-----\ndGVzdA==\n-----END FOO----"),
+    ("too many trailing dashes", "\n-----BEGIN FOO-----\ndGVzdA==\n-----END FOO------"),
+    ("trailing non-whitespace", "\n-----BEGIN FOO-----\ndGVzdA==\n-----END FOO----- ."),
+    ("incorrect ending type", "\n-----BEGIN FOO-----\ndGVzdA==\n-----END BAR-----"),
+    ("missing ending space", "\n-----BEGIN FOO-----\ndGVzdA==\n-----ENDBAR-----"),
+    ("repeating begin", "-----BEGIN \n" * 10),
+    ("missing end line", "\n-----BEGIN FOO-----\nHeader: 1"),
+  ]
+  for t in tests {
+    r = decode(b(t[1]))
+    assert r[0].none?, "unexpected success while parsing #{t[0]}"
+    assert_eq Str.from_bytes(r[1]), t[1]
+  }
+}
+
+test "CVE202224675" {
+  # Prior to CVE-2022-24675, this input would cause a stack overflow.
+  input = b("-----BEGIN \n" * 10000000)
+  r = decode(input)
+  assert r[0].none?
+  assert r[1] == input
+}
+
+test "Encode" {
+  r = encode_to_memory(private_key2)
+  assert_eq Str.from_bytes(r || []), pem_private_key2
+}
+
+# Go's TestLineBreaker tests the 64-column line breaker under encode; here
+# the lines are cut while encoding, so the cases go through encode.
+test "LineBreaker" {
+  sixty_four = "0123456789012345678901234567890123456789012345678901234567890123"
+  # (base64 text length) -> lines: payloads whose encoding is 0, 4, 64, 68, 128 characters.
+  for n in [0, 3, 48, 51, 96] {
+    data: [Byte] = [0; n]
+    out = Str.from_bytes(encode_to_memory(Block.new(type: "T", headers: {}, bytes: data)).unwrap)
+    lines = out.split("\n")
+    body = lines[1...lines.size - 2]
+    for l in body {
+      assert l.size <= 64
+    }
+    assert_eq body.join(""), base64_of(data)
+  }
+  assert_eq sixty_four.size, 64
+}
+
+def base64_of(data: [Byte]) -> Str {
+  out = Str.from_bytes(encode_to_memory(Block.new(type: "T", headers: {}, bytes: data)).unwrap)
+  lines = out.split("\n")
+  lines[1...lines.size - 2].join("")
+}
+
+# Go's TestFuzz round-trips random blocks (testing/quick); random blocks are
+# also among the generated vectors. Here: the explicit empty block, and a
+# few blocks with headers.
+test "Fuzz" {
+  sevens: [Byte] = [7; 200]
+  blocks = [
+    Block.new(type: "EMPTY", headers: {}, bytes: []),
+    Block.new(type: "X", headers: hdrs(["a", "1", "Proc-Type", "4,ENCRYPTED", "b", "two words"]), bytes: bs([1, 2, 3])),
+    Block.new(type: "LONG", headers: {}, bytes: sevens),
+  ]
+  for blk in blocks {
+    buf = bytes.new_buffer([])
+    ~encode(buf, blk)
+    r = decode(buf.bytes)
+    assert_eq show(r[0]), show(blk)
+    assert_eq r[1].size, 0
+  }
+}
+
+test "BadEncode" {
+  blk = Block.new(type: "BAD", headers: hdrs(["X:Y", "Z"]), bytes: [])
+  buf = bytes.new_buffer([])
+  r = encode(buf, blk)
+  assert_eq r.err?.message || "", "pem: cannot encode a header key that contains a colon"
+  assert_eq buf.size, 0
+  assert encode_to_memory(blk).none?
+}
+
+test "DecodeStrangeCases" {
+  cases = [
+    ("invalid section (not base64)", "-----BEGIN COMMENT-----\nfoo foo foo\n-----END COMMENT-----\n-----BEGIN TEST BLOCK-----\naGVsbG8=\n-----END TEST BLOCK-----"),
+    ("leading garbage on block", "foo foo foo-----BEGIN CERTIFICATE-----\n-----END PUBLIC KEY-----\n-----BEGIN TEST BLOCK-----\naGVsbG8=\n-----END TEST BLOCK-----"),
+    ("leading garbage", "foo foo foo\n-----BEGIN TEST BLOCK-----\naGVsbG8=\n-----END TEST BLOCK-----"),
+    ("leading partial block", "foo foo foo\n-----END COMMENT-----\n-----BEGIN TEST BLOCK-----\naGVsbG8=\n-----END TEST BLOCK-----"),
+    ("multiple BEGIN", "-----BEGIN TEST BLOCK-----\n-----BEGIN TEST BLOCK-----\n-----BEGIN TEST BLOCK-----\naGVsbG8=\n-----END TEST BLOCK-----"),
+    ("multiple END", "-----BEGIN TEST BLOCK-----\naGVsbG8=\n-----END TEST BLOCK-----\n-----END TEST BLOCK-----\n-----END TEST BLOCK-----"),
+    ("leading malformed BEGIN", "-----BEGIN PUBLIC KEY\naGVsbG8=\n-----END PUBLIC KEY-----\n-----BEGIN TEST BLOCK-----\naGVsbG8=\n-----END TEST BLOCK-----"),
+  ]
+  for tc in cases {
+    r = decode(b(tc[1]))
+    if x = r[0] {
+      assert x.type == "TEST BLOCK", "#{tc[0]}: got type #{x.type}"
+      assert_eq Str.from_bytes(x.bytes), "hello"
+    } else {
+      assert false, "#{tc[0]}: expected valid block"
+    }
+  }
+}
+
+test "JustEnd" {
+  r = decode(b("\n-----END PUBLIC KEY-----"))
+  assert r[0].none?
+}
+
+test "MissingEndTrailer" {
+  input = b("-----BEGIN " + " " * 84 + "\n-----END ")
+  r = decode(input)
+  assert r[0].none?
+}
+
+example "Decode" {
+  pub_pem_data = b("\n-----BEGIN PUBLIC KEY-----\nMIICIjANBgkqhkiG9w0BAQEFAAOCAg8AMIICCgKCAgEAlRuRnThUjU8/prwYxbty\nWPT9pURI3lbsKMiB6Fn/VHOKE13p4D8xgOCADpdRagdT6n4etr9atzDKUSvpMtR3\nCP5noNc97WiNCggBjVWhs7szEe8ugyqF23XwpHQ6uV1LKH50m92MbOWfCtjU9p/x\nqhNpQQ1AZhqNy5Gevap5k8XzRmjSldNAFZMY7Yv3Gi+nyCwGwpVtBUwhuLzgNFK/\nyDtw2WcWmUU7NuC8Q6MWvPebxVtCfVp/iQU6q60yyt6aGOBkhAX0LpKAEhKidixY\nnP9PNVBvxgu3XZ4P36gZV6+ummKdBVnc3NqwBLu5+CcdRdusmHPHd5pHf4/38Z3/\n6qU2a/fPvWzceVTEgZ47QjFMTCTmCwNt29cvi7zZeQzjtwQgn4ipN9NibRH/Ax/q\nTbIzHfrJ1xa2RteWSdFjwtxi9C20HUkjXSeI4YlzQMH0fPX6KCE7aVePTOnB69I/\na9/q96DiXZajwlpq3wFctrs1oXqBp5DVrCIj8hU2wNgB7LtQ1mCtsYz//heai0K9\nPhE4X6hiE0YmeAZjR0uHl8M/5aW9xCoJ72+12kKpWAa0SFRWLy6FejNYCYpkupVJ\nyecLk/4L1W0l6jQQZnWErXZYe0PNFcmwGXy1Rep83kfBRNKRy5tvocalLlwXLdUk\nAIU+2GKjyT3iMuzZxxFxPFMCAwEAAQ==\n-----END PUBLIC KEY-----\nand some more")
+  r = decode(pub_pem_data)
+  if blk = r[0] {
+    # Go parses the key with crypto/x509; here: its type and size.
+    puts "Got a #{blk.type} of #{blk.bytes.size} bytes, with remaining data: #{Str.from_bytes(r[1])}"
+  }
+} outputs "Got a PUBLIC KEY of 550 bytes, with remaining data: and some more"
+
+example "Encode" {
+  blk = Block.new(type: "MESSAGE", headers: hdrs(["Animal", "Gopher"]), bytes: b("test"))
+  out = bytes.new_buffer([])
+  ~encode(out, blk)
+  print out.to_s
+} outputs "-----BEGIN MESSAGE-----\nAnimal: Gopher\n\ndGVzdA==\n-----END MESSAGE-----"

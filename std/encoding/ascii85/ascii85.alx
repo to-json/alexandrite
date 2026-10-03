@@ -1,0 +1,352 @@
+# Package ascii85: Go's encoding/ascii85 — the ascii85 data encoding as used
+# in the btoa tool and Adobe's PostScript and PDF document formats.
+#
+#   Go                                        alx
+#   Encode(dst, src) int                      encode(dst, src) -> Int
+#   MaxEncodedLen(n) int                      max_encoded_len(n) -> Int
+#   Decode(dst, src, flush) (ndst, nsrc int, err error)
+#                                             decode(dst, src, flush) -> ~(Int, Int)<Ascii85Error>
+#   NewEncoder(w) io.WriteCloser              new_encoder(w) -> Encoder[W]  (write!, close!)
+#   NewDecoder(r) io.Reader                   new_decoder(r) -> Decoder[R]  (read!)
+#   CorruptInputError(off)                    Ascii85Error.CorruptInput(offset)
+#
+# Messages are Go's ("illegal ascii85 data at input byte 4").
+#
+# Differences from Go:
+#  - Encoder and Decoder are generic over what they wrap (an alx interface
+#    value contains its implementors, so a type can't both hold an io.Writer
+#    and be one): any writer / reader works, including another Encoder /
+#    Decoder or an io.Writer / io.Reader value. They are io.Writer /
+#    io.Reader themselves, except one wrapping an io.Writer / io.Reader
+#    value (it would contain itself): use its methods directly. They share
+#    their state across copies (D36): make them with the constructors.
+#  - The Decoder follows io's shape: `read!` returns 0 at the end of the
+#    input. Errors (of the input or the data) repeat on later calls.
+#  - Encoder.write! writes all of p or fails (io.Writer's contract in alx);
+#    close! flushes a partial block and must be called.
+
+import "io"
+
+pub error Ascii85Error {
+  # The input isn't valid ascii85; `offset` is the byte where it goes wrong
+  # (Go's CorruptInputError).
+  CorruptInput(offset: Int)
+
+  def message -> Str {
+    case self {
+      CorruptInput(off) => "illegal ascii85 data at input byte #{off}"
+    }
+  }
+}
+
+def zeros(n: Int) -> [Byte] {
+  b: [Byte] = [0; n]
+  b
+}
+
+# Encodes src into at most max_encoded_len(src.size) bytes of dst; returns
+# the number of bytes written. The encoding handles 4-byte chunks, using a
+# special encoding for the last fragment, so it is unsuitable for streaming
+# (use new_encoder). Often ascii85-encoded data is wrapped in <~ and ~>
+# symbols; encode does not add these.
+pub def encode(dst: [Byte], src: [Byte]) -> Int {
+  return 0 if src.size == 0
+  n = 0
+  si = 0
+  di = 0
+  while si < src.size {
+    left = src.size - si
+    dst[di] = 0
+    dst[di + 1] = 0
+    dst[di + 2] = 0
+    dst[di + 3] = 0
+    dst[di + 4] = 0
+    # Unpack 4 bytes into a 32-bit value, big-endian.
+    v = src[si].to_i << 24
+    v |= src[si + 1].to_i << 16 if left >= 2
+    v |= src[si + 2].to_i << 8 if left >= 3
+    v |= src[si + 3].to_i if left >= 4
+    # Special case: zero (!!!!!) shortens to z.
+    if v == 0 && left >= 4 {
+      dst[di] = 122
+      di += 1
+      si += 4
+      n += 1
+      next
+    }
+    # Otherwise, 5 base 85 digits starting at !.
+    i = 4
+    while i >= 0 {
+      dst[di + i] = (33 + v % 85).as_u8
+      v /= 85
+      i -= 1
+    }
+    # If src was short, discard the low destination bytes.
+    m = 5
+    if left < 4 {
+      m -= 4 - left
+      si = src.size
+    } else {
+      si += 4
+    }
+    di += m
+    n += m
+  }
+  n
+}
+
+# The maximum length of an encoding of n source bytes.
+pub def max_encoded_len(n: Int) -> Int { ((n + 3) / 4) * 5 }
+
+# Decodes src into dst: (ndst, nsrc, error offset or -1). Go's Decode.
+def decode_core(dst: [Byte], src: [Byte], flush: Bool) -> (Int, Int, Int) {
+  v = 0
+  nb = 0
+  ndst = 0
+  nsrc = 0
+  i = 0
+  while i < src.size {
+    return (ndst, nsrc, -1) if dst.size - ndst < 4
+    c = src[i]
+    if c <= 32 {
+      i += 1
+      next
+    }
+    if c == 122 && nb == 0 {
+      nb = 5
+      v = 0
+    } else if c >= 33 && c <= 117 {
+      v = (v * 85 + (c.to_i - 33)) & 0xffffffff
+      nb += 1
+    } else {
+      return (0, 0, i)
+    }
+    if nb == 5 {
+      nsrc = i + 1
+      dst[ndst] = (v >> 24).as_u8
+      dst[ndst + 1] = (v >> 16).as_u8
+      dst[ndst + 2] = (v >> 8).as_u8
+      dst[ndst + 3] = v.as_u8
+      ndst += 4
+      nb = 0
+      v = 0
+    }
+    i += 1
+  }
+  if flush {
+    nsrc = src.size
+    if nb > 0 {
+      # The number of output bytes in the last fragment is the number of
+      # leftover input bytes - 1. Pad with u's (84) to round up.
+      return (0, 0, src.size) if nb == 1
+      j = nb
+      while j < 5 {
+        v = (v * 85 + 84) & 0xffffffff
+        j += 1
+      }
+      j = 0
+      while j < nb - 1 {
+        dst[ndst] = (v >> 24).as_u8
+        v = (v << 8) & 0xffffffff
+        ndst += 1
+        j += 1
+      }
+    }
+  }
+  (ndst, nsrc, -1)
+}
+
+# Decodes src into dst: (bytes written to dst, bytes consumed from src). The
+# bytes of src that are not ascii85 (whitespace) are skipped. If flush is
+# true, src is the end of the input and its final fragment is decoded;
+# otherwise decoding stops at the last whole 5-byte group (or 4 bytes short
+# of dst's end). Often ascii85-encoded data is wrapped in <~ and ~> symbols;
+# decode expects these to have been stripped by the caller.
+pub def decode(dst: [Byte], src: [Byte], flush: Bool) -> ~(Int, Int)<Ascii85Error> {
+  r = decode_core(dst, src, flush)
+  fail Ascii85Error.CorruptInput(offset: r[2]) if r[2] >= 0
+  (r[0], r[1])
+}
+
+# ------------------------------------------------------------------ Encoder
+
+struct EncoderState[W] {
+  w: W
+  err: Error?
+  # Buffered data waiting to be encoded.
+  buf: [Byte]
+  nbuf: Int
+  # Output buffer.
+  out: [Byte]
+}
+
+# An io.WriteCloser encoding what is written to it into W.
+pub struct Encoder[W] {
+  st: [EncoderState[W]]
+
+  # A write to W, as a Result whether or not W's write! can fail.
+  def put!(p: [Byte]) -> ~Int { self.st[0].w.~write!(p) }
+
+  # Writes p through, or records and fails with W's error.
+  def emit!(p: [Byte]) -> ~Unit {
+    r = put!(p)
+    if e = r.err {
+      self.st[0].err = e
+      fail e
+    }
+  }
+
+  # Encodes all of p; returns p.size. A partial block waits for more input
+  # or close!.
+  pub def write!(p0: [Byte]) -> ~Int {
+    if e = st[0].err {
+      fail e
+    }
+    p = p0
+    # Leading fringe.
+    if st[0].nbuf > 0 {
+      i = 0
+      while i < p.size && st[0].nbuf < 4 {
+        self.st[0].buf[st[0].nbuf] = p[i]
+        self.st[0].nbuf += 1
+        i += 1
+      }
+      p = p[i...p.size]
+      return p0.size if st[0].nbuf < 4
+      nout = encode(st[0].out, st[0].buf)
+      ~emit!(st[0].out[0...nout])
+      self.st[0].nbuf = 0
+    }
+    # Large interior chunks.
+    while p.size >= 4 {
+      nn = (st[0].out.size / 5) * 4
+      nn = p.size if nn > p.size
+      nn -= nn % 4
+      if nn > 0 {
+        nout = encode(st[0].out, p[0...nn])
+        ~emit!(st[0].out[0...nout])
+      }
+      p = p[nn...p.size]
+    }
+    # Trailing fringe.
+    copy(st[0].buf, p)
+    self.st[0].nbuf = p.size
+    p0.size
+  }
+
+  # Flushes any partial block. Call it when done.
+  pub def close! -> ~Unit {
+    if e = st[0].err {
+      fail e
+    }
+    if st[0].nbuf > 0 {
+      nout = encode(st[0].out, st[0].buf[0...st[0].nbuf])
+      self.st[0].nbuf = 0
+      ~emit!(st[0].out[0...nout])
+    }
+  }
+}
+
+# An ascii85 encoder writing to w. Data is written in blocks of 5 bytes, so
+# close! the encoder to flush the last partial block.
+pub def new_encoder[W](w: W) -> Encoder[W] {
+  Encoder.new(st: [EncoderState.new(w: w, err: none, buf: zeros(4), nbuf: 0, out: zeros(1024))])
+}
+
+# ------------------------------------------------------------------ Decoder
+
+struct DecoderState[R] {
+  r: R
+  # Sticky failure of the decoder, or the end of its output.
+  err: Error?
+  eof: Bool
+  # What the input reported: a failure, or its end.
+  read_err: Error?
+  read_eof: Bool
+  # Leftover input.
+  buf: [Byte]
+  nbuf: Int
+  # Leftover decoded output (a slice of outbuf).
+  out: [Byte]
+  outbuf: [Byte]
+}
+
+# An io.Reader decoding the ascii85 read from R.
+pub struct Decoder[R] {
+  st: [DecoderState[R]]
+
+  # A read from R, as a Result whether or not R's read! can fail.
+  def get!(p: [Byte]) -> ~Int { self.st[0].r.~read!(p) }
+
+  # Decodes into p; returns the count, 0 at the end of the input.
+  pub def read!(p: [Byte]) -> ~Int {
+    return 0 if p.size == 0
+    if e = st[0].err {
+      fail e
+    }
+    return 0 if st[0].eof
+    loop {
+      # Copy leftover output from the last decode.
+      if st[0].out.size > 0 {
+        n = copy(p, st[0].out)
+        self.st[0].out = st[0].out[n...st[0].out.size]
+        return n
+      }
+      # Decode the leftover input from the last read.
+      if st[0].nbuf > 0 {
+        flush = st[0].read_err.present? || st[0].read_eof
+        res = decode_core(st[0].outbuf, st[0].buf[0...st[0].nbuf], flush)
+        if res[2] >= 0 {
+          self.st[0].err = Ascii85Error.CorruptInput(offset: res[2])
+        } else if res[0] > 0 {
+          self.st[0].out = st[0].outbuf[0...res[0]]
+          left = st[0].nbuf - res[1]
+          copy(st[0].buf[0...left], st[0].buf[res[1]...st[0].nbuf])
+          self.st[0].nbuf = left
+          next # copy out and return
+        } else {
+          # Decode found nothing to return: compact the input by dropping
+          # whitespace, so the buffer doesn't fill with it.
+          off = 0
+          i = 0
+          while i < st[0].nbuf {
+            c = st[0].buf[i]
+            if c > 32 {
+              self.st[0].buf[off] = c
+              off += 1
+            }
+            i += 1
+          }
+          self.st[0].nbuf = off
+        }
+      }
+      # Out of input, out of decoded output. Check errors.
+      if e = st[0].err {
+        fail e
+      }
+      if e = st[0].read_err {
+        self.st[0].err = e
+        fail e
+      }
+      if st[0].read_eof {
+        self.st[0].eof = true
+        return 0
+      }
+      # Read more data.
+      r = get!(st[0].buf[st[0].nbuf...st[0].buf.size])
+      if e = r.err {
+        self.st[0].read_err = e
+      } else {
+        got = r.unwrap
+        self.st[0].read_eof = true if got == 0
+        self.st[0].nbuf += got
+      }
+    }
+    0
+  }
+}
+
+# A streaming ascii85 decoder reading from r.
+pub def new_decoder[R](r: R) -> Decoder[R] {
+  Decoder.new(st: [DecoderState.new(r: r, err: none, eof: false, read_err: none, read_eof: false, buf: zeros(1024), nbuf: 0, out: [], outbuf: zeros(1024))])
+}

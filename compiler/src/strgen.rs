@@ -172,17 +172,25 @@ fn generate(f: StrFn) -> LFunc {
             let s = fb.var("s", LTy::Str);
             let n = fb.var("n", LTy::I64);
             let out = fb.var("out", LTy::Str);
-            let i = fb.var("i", LTy::I64);
+            let acc = fb.var("acc", LTy::Str);
+            let k = fb.var("k", LTy::I64);
             body.push(LS::If(cmp(Op::Lt, var(n), LE::I(0)), vec![LS::Panic("negative argument to String#*".into(), "runtime".into())], vec![]));
+            // Binary powering: acc doubles (s, ss, ssss, ...) and is added to
+            // out for each set bit of n, so the work is linear in the result
+            // (appending s n times copied out n times).
             body.push(LS::Set(out, LE::S(String::new())));
-            body.push(LS::Set(i, LE::I(0)));
+            body.push(LS::Set(acc, var(s)));
+            body.push(LS::Set(k, var(n)));
             let l = fb.label();
+            let half = LE::Arith(Op::Div, b(var(k)), b(LE::I(2)), Ovf::Unchecked);
+            let odd = cmp(Op::Eq, LE::Arith(Op::Rem, b(var(k)), b(LE::I(2)), Ovf::Unchecked), LE::I(1));
             body.push(LS::Loop(
                 l,
                 vec![
-                    LS::If(cmp(Op::Ge, var(i), var(n)), vec![LS::Break(l)], vec![]),
-                    LS::Set(out, LE::Rt(Rt::StrCat, vec![var(out), var(s)])),
-                    LS::Set(i, add(var(i), LE::I(1))),
+                    LS::If(cmp(Op::Le, var(k), LE::I(0)), vec![LS::Break(l)], vec![]),
+                    LS::If(odd, vec![LS::Set(out, LE::Rt(Rt::StrCat, vec![var(out), var(acc)]))], vec![]),
+                    LS::Set(k, half),
+                    LS::If(cmp(Op::Gt, var(k), LE::I(0)), vec![LS::Set(acc, LE::Rt(Rt::StrCat, vec![var(acc), var(acc)]))], vec![]),
                 ],
             ));
             body.push(LS::Return(Some(var(out))));

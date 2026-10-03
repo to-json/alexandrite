@@ -1,0 +1,332 @@
+# Go's encoding/hex tests (hex_test.go, example_test.go), translated.
+import "bytes"
+import "io"
+
+def b(s: Str) -> [Byte] { s.bytes.to_a }
+def s(x: [Byte]) -> Str { Str.from_bytes(x) }
+def bs(xs: [Byte]) -> [Byte] { xs }
+
+# Go's encDecTests: (encoding, decoding).
+def enc_dec_tests -> [(Str, [Byte])] {
+  [
+    ("", bs([])),
+    ("0001020304050607", bs([0, 1, 2, 3, 4, 5, 6, 7])),
+    ("08090a0b0c0d0e0f", bs([8, 9, 10, 11, 12, 13, 14, 15])),
+    ("f0f1f2f3f4f5f6f7", bs([0xf0, 0xf1, 0xf2, 0xf3, 0xf4, 0xf5, 0xf6, 0xf7])),
+    ("f8f9fafbfcfdfeff", bs([0xf8, 0xf9, 0xfa, 0xfb, 0xfc, 0xfd, 0xfe, 0xff])),
+    ("67", b("g")),
+    ("e3a1", bs([0xe3, 0xa1])),
+  ]
+}
+
+# Go's errTests: input, the bytes decoded before the error, the error message
+# ("" for none).
+def err_tests -> [(Str, [Byte], Str)] {
+  [
+    ("", bs([]), ""),
+    ("0", bs([]), "encoding/hex: odd length hex string"),
+    ("zd4aa", bs([]), "encoding/hex: invalid byte: U+007A 'z'"),
+    ("d4aaz", bs([0xd4, 0xaa]), "encoding/hex: invalid byte: U+007A 'z'"),
+    ("30313", b("01"), "encoding/hex: odd length hex string"),
+    ("0g", bs([]), "encoding/hex: invalid byte: U+0067 'g'"),
+    ("00gg", bs([0]), "encoding/hex: invalid byte: U+0067 'g'"),
+    ("0\x01", bs([]), "encoding/hex: invalid byte: U+0001"),
+    ("ffeed", bs([0xff, 0xee]), "encoding/hex: odd length hex string"),
+  ]
+}
+
+def expected_hex_dump -> Str {
+  "00000000  1e 1f 20 21 22 23 24 25  26 27 28 29 2a 2b 2c 2d  |.. !\"#$%&'()*+,-|\n" +
+    "00000010  2e 2f 30 31 32 33 34 35  36 37 38 39 3a 3b 3c 3d  |./0123456789:;<=|\n" +
+    "00000020  3e 3f 40 41 42 43 44 45                           |>?@ABCDE|\n"
+}
+
+def dump_input -> [Byte] {
+  input: [Byte] = [0; 40]
+  i = 0
+  while i < 40 {
+    input[i] = (i + 30).as_u8
+    i += 1
+  }
+  input
+}
+
+# io.CopyBuffer with a small buffer: reads up to `size` bytes at a time.
+def copy_buf(dst: io.Writer, src: io.Reader, size: Int) -> ~Int {
+  w = dst
+  r = src
+  buf: [Byte] = [0; size]
+  total = 0
+  loop {
+    n = r.~read!(buf)
+    break if n == 0
+    w.~write!(buf[0...n])
+    total += n
+  }
+  total
+}
+
+# A reader fed with chunks (like an io.Pipe): each read returns at most the
+# rest of the current chunk.
+struct ChunkReader {
+  st: [([Str], Int, Int)]
+
+  def read!(p: [Byte]) -> Int {
+    chunks = st[0][0]
+    i = st[0][1]
+    off = st[0][2]
+    return 0 if i >= chunks.size
+    c = chunks[i]
+    n = c.size - off
+    n = p.size if p.size < n
+    copy(p, b(c[off...off + n]))
+    if off + n == c.size {
+      self.st[0] = (chunks, i + 1, 0)
+    } else {
+      self.st[0] = (chunks, i, off + n)
+    }
+    n
+  }
+}
+
+def chunk_reader(chunks: [Str]) -> ChunkReader { ChunkReader.new(st: [(chunks, 0, 0)]) }
+
+# A writer that fails every write.
+struct BadWriter {
+  def write!(p: [Byte]) -> ~Int {
+    fail "bad writer"
+    0
+  }
+}
+
+test "Encode" {
+  for t in enc_dec_tests {
+    dst: [Byte] = [0; encoded_len(t[1].size)]
+    n = encode(dst, t[1])
+    assert_eq n, dst.size
+    assert_eq s(dst), t[0]
+    dst2 = append_encode(b("lead"), t[1])
+    assert_eq s(dst2), "lead" + t[0]
+  }
+}
+
+test "Decode" {
+  # Uppercase hex characters too, since encode always writes lowercase.
+  tests = enc_dec_tests
+  tests << ("F8F9FAFBFCFDFEFF", bs([0xf8, 0xf9, 0xfa, 0xfb, 0xfc, 0xfd, 0xfe, 0xff]))
+  for t in tests {
+    dst: [Byte] = [0; decoded_len(t[0].size)]
+    n = ~decode(dst, b(t[0]))
+    assert_eq n, dst.size
+    assert_eq dst, t[1]
+    dst2 = ~append_decode(b("lead"), b(t[0]))
+    assert_eq s(dst2), "lead" + s(t[1])
+  }
+}
+
+test "EncodeToString" {
+  for t in enc_dec_tests {
+    assert_eq encode_to_string(t[1]), t[0]
+  }
+}
+
+test "DecodeString" {
+  for t in enc_dec_tests {
+    assert_eq ~decode_string(t[0]), t[1]
+  }
+}
+
+test "DecodeErr" {
+  for t in err_tests {
+    out: [Byte] = [0; t[0].size + 10]
+    r = decode(out, b(t[0]))
+    if t[2] == "" {
+      assert_eq r.ok || -1, t[1].size
+    } else {
+      assert_eq r.err?.message || "", t[2]
+    }
+    # The bytes before the error are in out, as in Go.
+    assert_eq out[0...t[1].size], t[1]
+  }
+}
+
+test "DecodeStringErr" {
+  for t in err_tests {
+    r = decode_string(t[0])
+    if t[2] == "" {
+      assert_eq r.ok || b("?"), t[1]
+    } else {
+      assert_eq r.err?.message || "", t[2]
+    }
+  }
+}
+
+test "EncoderDecoder" {
+  for multiplier in [1, 128, 192] {
+    for t in enc_dec_tests {
+      input = bytes.repeat(t[1], multiplier)
+      output = t[0] * multiplier
+      buf = bytes.new_buffer([])
+      enc = new_encoder(buf)
+      n = ~copy_buf(enc, bytes.new_buffer(input), 7)
+      assert_eq n, input.size
+      assert_eq buf.to_s, output
+      dec = new_decoder(buf)
+      dec_buf = bytes.new_buffer([])
+      ~copy_buf(dec_buf, dec, 7)
+      assert_eq dec_buf.bytes, input
+    }
+  }
+}
+
+test "DecoderErr" {
+  for t in err_tests {
+    dec = new_decoder(bytes.new_buffer_string(t[0]))
+    # Collect what's read before the error.
+    out: [Byte] = []
+    p: [Byte] = [0; 64]
+    msg = ""
+    loop {
+      r = dec.read!(p)
+      if e = r.err {
+        msg = e.message
+        break
+      }
+      n = r.unwrap
+      break if n == 0
+      out = out + p[0...n]
+    }
+    # The decoder reads a stream, so it reports io.ErrUnexpectedEOF instead
+    # of ErrLength.
+    want = t[2]
+    want = "unexpected EOF" if want == "encoding/hex: odd length hex string"
+    assert_eq out, t[1]
+    assert_eq msg, want
+    # The error is sticky.
+    if want != "" {
+      assert_eq dec.read!(p).err?.message || "", want
+    }
+    # io.read_all passes the error on.
+    r2 = io.read_all(new_decoder(bytes.new_buffer_string(t[0])))
+    assert_eq r2.err?.message || "", want
+  }
+}
+
+test "Dumper" {
+  input = dump_input
+  stride = 1
+  while stride < input.size {
+    out = bytes.new_buffer([])
+    d = dumper(out)
+    done = 0
+    while done < input.size {
+      todo = done + stride
+      todo = input.size if todo > input.size
+      ~d.write!(input[done...todo])
+      done = todo
+    }
+    ~d.close!
+    assert out.to_s == expected_hex_dump, "stride #{stride}"
+    stride += 1
+  }
+}
+
+test "Dumper_doubleclose" {
+  out = bytes.new_buffer([])
+  d = dumper(out)
+  ~d.write!(b("gopher"))
+  ~d.close!
+  ~d.close!
+  r = d.write!(b("gopher"))
+  assert_eq r.err?.message || "", "encoding/hex: dumper closed"
+  ~d.close!
+  assert_eq out.to_s, "00000000  67 6f 70 68 65 72                                 |gopher|\n"
+}
+
+test "Dumper_earlyclose" {
+  out = bytes.new_buffer([])
+  d = dumper(out)
+  ~d.close!
+  r = d.write!(b("gopher"))
+  assert r.err?
+  assert_eq out.to_s, ""
+}
+
+test "Dump" {
+  assert_eq dump(dump_input), expected_hex_dump
+  assert_eq dump([]), ""
+}
+
+# Not in Go's tests: errors of the wrapped writer.
+test "encoder and dumper pass on writer errors" {
+  enc = new_encoder(BadWriter.new)
+  assert_eq enc.write!(b("abc")).err?.message || "", "bad writer"
+  assert_eq enc.write!(b("abc")).err?.message || "", "bad writer"
+  assert_eq enc.write!([]).err?.message || "", "bad writer"
+  d = dumper(BadWriter.new)
+  assert_eq d.write!(b("abc")).err?.message || "", "bad writer"
+}
+
+# Not in Go's tests: a decoder over a decoder, and over an interface value.
+test "decoders nest" {
+  inner = new_decoder(bytes.new_buffer_string("3638363936613662"))
+  outer = new_decoder(inner)
+  assert_eq s(~io.read_all(outer)), "hijk"
+  # Over an io.Reader value it works, but is not itself an io.Reader (an
+  # interface value can't hold something holding that interface).
+  r: io.Reader = bytes.new_buffer_string("4142")
+  d = new_decoder(r)
+  p: [Byte] = [0; 8]
+  assert_eq ~d.read!(p), 2
+  assert_eq s(p[0...2]), "AB"
+  assert_eq ~d.read!(p), 0
+}
+
+test "invalid byte messages" {
+  assert_eq HexError.InvalidByte(b: 0xe9).message, "encoding/hex: invalid byte: U+00E9 'é'"
+  assert_eq HexError.InvalidByte(b: 0xad).message, "encoding/hex: invalid byte: U+00AD"
+  assert_eq HexError.InvalidByte(b: 0x7f).message, "encoding/hex: invalid byte: U+007F"
+  assert_eq HexError.InvalidByte(b: 0x20).message, "encoding/hex: invalid byte: U+0020 ' '"
+}
+
+example "Encode" {
+  src = b("Hello Gopher!")
+  dst: [Byte] = [0; encoded_len(src.size)]
+  encode(dst, src)
+  puts s(dst)
+} outputs "48656c6c6f20476f7068657221"
+
+example "Decode" {
+  src = b("48656c6c6f20476f7068657221")
+  dst: [Byte] = [0; decoded_len(src.size)]
+  n = ~decode(dst, src)
+  puts s(dst[0...n])
+} outputs "Hello Gopher!"
+
+example "DecodeString" {
+  decoded = ~decode_string("48656c6c6f20476f7068657221")
+  puts s(decoded)
+} outputs "Hello Gopher!"
+
+example "Dump" {
+  print dump(b("Go is an open source programming language."))
+} outputs "00000000  47 6f 20 69 73 20 61 6e  20 6f 70 65 6e 20 73 6f  |Go is an open so|\n00000010  75 72 63 65 20 70 72 6f  67 72 61 6d 6d 69 6e 67  |urce programming|\n00000020  20 6c 61 6e 67 75 61 67  65 2e                    | language.|"
+
+example "Dumper" {
+  lines = [
+    "Go is an open source programming language.",
+    "\n",
+    "We encourage all Go users to subscribe to golang-announce.",
+  ]
+  out = bytes.new_buffer([])
+  d = dumper(out)
+  for line in lines {
+    ~d.write!(b(line))
+  }
+  ~d.close!
+  print out.to_s
+} outputs "00000000  47 6f 20 69 73 20 61 6e  20 6f 70 65 6e 20 73 6f  |Go is an open so|\n00000010  75 72 63 65 20 70 72 6f  67 72 61 6d 6d 69 6e 67  |urce programming|\n00000020  20 6c 61 6e 67 75 61 67  65 2e 0a 57 65 20 65 6e  | language..We en|\n00000030  63 6f 75 72 61 67 65 20  61 6c 6c 20 47 6f 20 75  |courage all Go u|\n00000040  73 65 72 73 20 74 6f 20  73 75 62 73 63 72 69 62  |sers to subscrib|\n00000050  65 20 74 6f 20 67 6f 6c  61 6e 67 2d 61 6e 6e 6f  |e to golang-anno|\n00000060  75 6e 63 65 2e                                    |unce.|"
+
+example "EncodeToString" {
+  puts encode_to_string(b("Hello"))
+} outputs "48656c6c6f"

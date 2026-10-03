@@ -1,0 +1,554 @@
+# Go's encoding/base32 tests (base32_test.go, example_test.go), translated.
+import "bytes"
+import "io"
+import "strconv"
+import "strings"
+
+def b(s: Str) -> [Byte] { s.bytes.to_a }
+def s(x: [Byte]) -> Str { Str.from_bytes(x) }
+
+# Go's pairs: (decoded, encoded).
+def pairs -> [(Str, Str)] {
+  [
+    # RFC 4648 examples
+    ("", ""),
+    ("f", "MY======"),
+    ("fo", "MZXQ===="),
+    ("foo", "MZXW6==="),
+    ("foob", "MZXW6YQ="),
+    ("fooba", "MZXW6YTB"),
+    ("foobar", "MZXW6YTBOI======"),
+    # Wikipedia examples, converted to base32
+    ("sure.", "ON2XEZJO"),
+    ("sure", "ON2XEZI="),
+    ("sur", "ON2XE==="),
+    ("su", "ON2Q===="),
+    ("leasure.", "NRSWC43VOJSS4==="),
+    ("easure.", "MVQXG5LSMUXA===="),
+    ("asure.", "MFZXK4TFFY======"),
+    ("sure.", "ON2XEZJO"),
+  ]
+}
+
+BIG_DECODED = "Twas brillig, and the slithy toves"
+BIG_ENCODED = "KR3WC4ZAMJZGS3DMNFTSYIDBNZSCA5DIMUQHG3DJORUHSIDUN53GK4Y="
+
+# Go's badReader: hands out at most `limit` bytes per call (0: no limit);
+# errs[i] is what call i reports ("" nothing, "eof" the end, else a failure
+# with that message), and the end after the list. Go's reader returns the
+# report together with the data; an alx reader can't, so a report comes on
+# the call after the data.
+struct BadReader {
+  st: [(Str, [Str], Int, Int, Str)]
+
+  def read!(p: [Byte]) -> ~Int {
+    data = st[0][0]
+    errs = st[0][1]
+    called = st[0][2]
+    limit = st[0][3]
+    pending = st[0][4]
+    if pending != "" {
+      self.st[0] = (data, errs, called, limit, "")
+      return 0 if pending == "eof"
+      fail pending
+    }
+    lim = p.size
+    lim = limit if limit != 0 && limit < lim
+    lim = data.size if data.size < lim
+    copy(p, b(data[0...lim]))
+    report = called < errs.size ? errs[called] : "eof"
+    self.st[0] = (data[lim...data.size], errs, called + 1, limit, report)
+    if lim == 0 && report != "" {
+      self.st[0] = (data[lim...data.size], errs, called + 1, limit, "")
+      return 0 if report == "eof"
+      fail report
+    }
+    lim
+  }
+}
+
+def bad_reader(data: Str, errs: [Str], limit: Int) -> BadReader {
+  BadReader.new(st: [(data, errs, 0, limit, "")])
+}
+
+# An io.Pipe fed with chunks: each read returns at most the rest of the
+# current chunk.
+struct ChunkReader {
+  st: [([Str], Int, Int)]
+
+  def read!(p: [Byte]) -> Int {
+    chunks = st[0][0]
+    i = st[0][1]
+    off = st[0][2]
+    return 0 if i >= chunks.size
+    c = chunks[i]
+    n = c.size - off
+    n = p.size if p.size < n
+    copy(p, b(c[off...off + n]))
+    if off + n == c.size {
+      self.st[0] = (chunks, i + 1, 0)
+    } else {
+      self.st[0] = (chunks, i, off + n)
+    }
+    n
+  }
+}
+
+def chunk_reader(chunks: [Str]) -> ChunkReader { ChunkReader.new(st: [(chunks, 0, 0)]) }
+
+# Reads everything: (the bytes, the error message or "").
+def drain[R](d: Decoder[R], size: Int) -> ([Byte], Str) {
+  dec = d
+  out: [Byte] = []
+  p: [Byte] = [0; size]
+  loop {
+    r = dec.read!(p)
+    if e = r.err {
+      return (out, e.message)
+    }
+    n = r.unwrap
+    return (out, "") if n == 0
+    out = out + p[0...n]
+  }
+  (out, "")
+}
+
+test "Encode" {
+  for p in pairs {
+    assert_eq std_encoding.encode_to_string(b(p[0])), p[1]
+    assert_eq s(std_encoding.append_encode(b("lead"), b(p[0]))), "lead" + p[1]
+  }
+}
+
+test "Encoder" {
+  for p in pairs {
+    bb = bytes.new_buffer([])
+    enc = new_encoder(std_encoding, bb)
+    ~enc.write!(b(p[0]))
+    ~enc.close!
+    assert_eq bb.to_s, p[1]
+  }
+}
+
+test "EncoderBuffering" {
+  input = b(BIG_DECODED)
+  size = 1
+  while size <= 12 {
+    bb = bytes.new_buffer([])
+    enc = new_encoder(std_encoding, bb)
+    pos = 0
+    while pos < input.size {
+      e = pos + size
+      e = input.size if e > input.size
+      assert_eq ~enc.write!(input[pos...e]), e - pos
+      pos += size
+    }
+    ~enc.close!
+    assert_eq bb.to_s, BIG_ENCODED
+    size += 1
+  }
+}
+
+test "DecoderBufferingWithPadding" {
+  extra = 0
+  while extra <= 12 {
+    for p in pairs {
+      dec = new_decoder(std_encoding, bytes.new_buffer_string(p[1]))
+      buf: [Byte] = [0; p[0].size + extra]
+      n = ~dec.read!(buf)
+      assert_eq s(buf[0...n]), p[0]
+    }
+    extra += 1
+  }
+}
+
+test "DecoderBufferingWithoutPadding" {
+  extra = 0
+  while extra <= 12 {
+    for p in pairs {
+      encoded = strings.trim_right(p[1], "=")
+      dec = new_decoder(std_encoding.with_padding(NO_PADDING), bytes.new_buffer_string(encoded))
+      buf: [Byte] = [0; p[0].size + extra]
+      n = ~dec.read!(buf)
+      assert_eq s(buf[0...n]), p[0]
+    }
+    extra += 1
+  }
+}
+
+test "Decode" {
+  for p in pairs {
+    dbuf: [Byte] = [0; std_encoding.decoded_len(p[1].size)]
+    r = std_encoding.decode_core(dbuf, b(p[1]))
+    assert_eq r[2], -1
+    assert_eq r[0], p[0].size
+    if p[1].size > 0 {
+      assert_eq r[1], p[1][p[1].size - 1] == 61
+    }
+    assert_eq s(dbuf[0...r[0]]), p[0]
+    assert_eq s(~std_encoding.decode_string(p[1])), p[0]
+    assert_eq s(~std_encoding.append_decode(b("lead"), b(p[1]))), "lead" + p[0]
+    assert_eq s(~std_encoding.append_decode([], b(p[1]))), p[0]
+  }
+}
+
+test "Decoder" {
+  for p in pairs {
+    dec = new_decoder(std_encoding, bytes.new_buffer_string(p[1]))
+    dbuf: [Byte] = [0; std_encoding.decoded_len(p[1].size)]
+    count = ~dec.read!(dbuf)
+    assert_eq count, p[0].size
+    assert_eq s(dbuf[0...count]), p[0]
+    # Then the end of the input (Go's io.EOF).
+    assert_eq ~dec.read!(dbuf), 0 if dbuf.size > 0
+  }
+}
+
+test "Issue20044" {
+  # (data, errs, limit, want, want error, dbuflen)
+  cases = [
+    # Valid input data followed by an error: the data is decoded and the
+    # error propagated.
+    ("MY======", ["bad reader error"], 0, "f", "bad reader error", 0),
+    # A read error after input consisting of newlines only is propagated.
+    ("\n\n\n\n\n\n\n\n", ["bad reader error", ""], 0, "", "bad reader error", 0),
+    # Newlines, then valid data and an error.
+    ("\n\n\n\n\n\n\n\nMY======", ["", "bad reader error"], 0, "f", "bad reader error", 8),
+    # Invalid input data (too short) and an error: the reader's error.
+    ("MY=====", ["bad reader error"], 0, "", "bad reader error", 0),
+    # Invalid input data (too short) but no error: io.ErrUnexpectedEOF.
+    ("MY=====", [""], 0, "", "unexpected EOF", 0),
+    # Invalid input data and an error. Go reports the reader's error, which
+    # arrives together with the data; here it arrives after the data, and
+    # the decoding error comes first.
+    ("Ma======", ["bad reader error"], 0, "", "illegal base32 data at input byte 1", 0),
+    # Valid data and the end of the input.
+    ("MZXW6YTB", ["eof"], 0, "fooba", "", 0),
+    # Errors when decoder.read! is called many times.
+    ("NRSWC43VOJSS4===", ["", "bad reader error"], 0, "leasure.", "bad reader error", 1),
+    ("NRSWC43VOJSS4===", ["", "eof"], 0, "leasure.", "", 1),
+    # More than 8 bytes read at a time.
+    ("NRSWC43VOJSS4===", ["eof"], 0, "leasure.", "", 11),
+    ("NRSWC43VOJSS4===", ["bad reader error"], 0, "leasure.", "bad reader error", 11),
+    # Groups of bytes not divisible by 8: 11 bytes, then 5 and an error.
+    ("NRSWC43VOJSS4===", ["", "bad reader error"], 11, "leasure.", "bad reader error", 0),
+  ]
+  for tc in cases {
+    dec = new_decoder(std_encoding, bad_reader(tc[0], tc[1], tc[2]))
+    dbuflen = tc[5] > 0 ? tc[5] : std_encoding.decoded_len(tc[0].size)
+    # A read! into an empty slice returns 0 (io's convention) where Go's
+    # decoder still reads; read into one byte instead.
+    dbuflen = 1 if dbuflen == 0
+    res = drain(dec, dbuflen)
+    assert_eq s(res[0]), tc[3]
+    assert res[1] == tc[4], "case #{tc[0]} #{tc[1]}: got #{res[1]}"
+  }
+}
+
+test "DecoderError" {
+  for read_err in ["eof", ""] {
+    input = "MZXW6YTb"
+    dbuf: [Byte] = [0; std_encoding.decoded_len(input.size)]
+    dec = new_decoder(std_encoding, bad_reader(input, [read_err], 0))
+    r = dec.read!(dbuf)
+    if e = r.err {
+      case e {
+        CorruptInput(_) => assert true
+        _ => assert false, "corrupt input error expected, found #{e}"
+      }
+    } else {
+      assert false, "corrupt input error expected"
+    }
+  }
+}
+
+test "ReaderEOF" {
+  for read_err in ["eof", ""] {
+    input = "MZXW6YTB"
+    dec = new_decoder(std_encoding, bad_reader(input, ["", read_err], 0))
+    dbuf: [Byte] = [0; std_encoding.decoded_len(input.size)]
+    assert_eq ~dec.read!(dbuf), 5
+    assert_eq ~dec.read!(dbuf), 0
+    assert_eq ~dec.read!(dbuf), 0
+  }
+}
+
+test "DecoderBuffering" {
+  size = 1
+  while size <= 12 {
+    dec = new_decoder(std_encoding, bytes.new_buffer_string(BIG_ENCODED))
+    buf: [Byte] = [0; BIG_DECODED.size + 12]
+    total = 0
+    loop {
+      break if total >= BIG_DECODED.size
+      n = ~dec.read!(buf[total...total + size])
+      break if n == 0
+      total += n
+    }
+    assert_eq s(buf[0...total]), BIG_DECODED
+    size += 1
+  }
+}
+
+test "DecodeCorrupt" {
+  cases = [
+    ("", -1),
+    ("!!!!", 0),
+    ("x===", 0),
+    ("AA=A====", 2),
+    ("AAA=AAAA", 3),
+    ("MMMMMMMMM", 8),
+    ("MMMMMM", 0),
+    ("A=", 1),
+    ("AA=", 3),
+    ("AA==", 4),
+    ("AA===", 5),
+    ("AAAA=", 5),
+    ("AAAA==", 6),
+    ("AAAAA=", 6),
+    ("AAAAA==", 7),
+    ("A=======", 1),
+    ("AA======", -1),
+    ("AAA=====", 3),
+    ("AAAA====", -1),
+    ("AAAAA===", -1),
+    ("AAAAAA==", 6),
+    ("AAAAAAA=", -1),
+    ("AAAAAAAA", -1),
+  ]
+  for tc in cases {
+    dbuf: [Byte] = [0; std_encoding.decoded_len(tc[0].size)]
+    r = std_encoding.decode(dbuf, b(tc[0]))
+    if tc[1] == -1 {
+      assert r.ok?, "wrongly detected corruption in #{tc[0]}"
+      next
+    }
+    if e = r.err {
+      case e {
+        CorruptInput(off) => assert_eq off, tc[1]
+        _ => assert false, "unexpected error #{e}"
+      }
+    } else {
+      assert false, "failed to detect corruption in #{tc[0]}"
+    }
+  }
+}
+
+test "Big" {
+  n = 3 * 1000 + 1
+  alpha = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+  raw: [Byte] = [0; n]
+  i = 0
+  while i < n {
+    raw[i] = alpha[i % alpha.size]
+    i += 1
+  }
+  encoded = bytes.new_buffer([])
+  w = new_encoder(std_encoding, encoded)
+  assert_eq ~w.write!(raw), n
+  ~w.close!
+  decoded = ~io.read_all(new_decoder(std_encoding, encoded))
+  assert decoded == raw
+}
+
+test "NewLineCharacters" {
+  # Each of these should decode to "sure", without errors.
+  for e in ["ON2XEZI=", "ON2XEZI=\r", "ON2XEZI=\n", "ON2XEZI=\r\n", "ON2XEZ\r\nI=", "ON2X\rEZ\nI=", "ON2X\nEZ\rI=", "ON2XEZ\nI=", "ON2XEZI\n="] {
+    assert_eq s(~std_encoding.decode_string(e)), "sure"
+  }
+  # Each of these should decode to "foobar", without errors.
+  for e in ["MZXW6YTBOI======", "MZXW6YTBOI=\r\n====="] {
+    assert_eq s(~std_encoding.decode_string(e)), "foobar"
+  }
+}
+
+test "DecoderIssue4779" {
+  encoded = "JRXXEZLNEBUXA43VNUQGI33MN5ZCA43JOQQGC3LFOQWCAY3PNZZWKY3UMV2HK4\nRAMFSGS4DJONUWG2LOM4QGK3DJOQWCA43FMQQGI3YKMVUXK43NN5SCA5DFNVYG64RANFXGG2LENFSH\nK3TUEB2XIIDMMFRG64TFEBSXIIDEN5WG64TFEBWWCZ3OMEQGC3DJOF2WCLRAKV2CAZLONFWQUYLEEB\nWWS3TJNUQHMZLONFQW2LBAOF2WS4ZANZXXG5DSOVSCAZLYMVZGG2LUMF2GS33OEB2WY3DBNVRW6IDM\nMFRG64TJOMQG42LTNEQHK5AKMFWGS4LVNFYCAZLYEBSWCIDDN5WW233EN4QGG33OONSXC5LBOQXCAR\nDVNFZSAYLVORSSA2LSOVZGKIDEN5WG64RANFXAU4TFOBZGK2DFNZSGK4TJOQQGS3RAOZXWY5LQORQX\nIZJAOZSWY2LUEBSXG43FEBRWS3DMOVWSAZDPNRXXEZJAMV2SAZTVM5UWC5BANZ2WY3DBBJYGC4TJMF\n2HK4ROEBCXQY3FOB2GK5LSEBZWS3TUEBXWGY3BMVRWC5BAMN2XA2LEMF2GC5BANZXW4IDQOJXWSZDF\nNZ2CYIDTOVXHIIDJNYFGG5LMOBQSA4LVNEQG6ZTGNFRWSYJAMRSXGZLSOVXHIIDNN5WGY2LUEBQW42\nLNEBUWIIDFON2CA3DBMJXXE5LNFY==\n===="
+  encoded_short = strings.replace_all(encoded, "\n", "")
+  res1 = ~io.read_all(new_decoder(std_encoding, bytes.new_buffer_string(encoded)))
+  res2 = ~io.read_all(new_decoder(std_encoding, bytes.new_buffer_string(encoded_short)))
+  assert res1 == res2, "decoded results not equal"
+  assert res1.size > 0
+}
+
+test "WithCustomPadding" {
+  for p in pairs {
+    default_padding = std_encoding.encode_to_string(b(p[0]))
+    custom_padding = std_encoding.with_padding(64).encode_to_string(b(p[0]))
+    assert_eq custom_padding, strings.replace_all(default_padding, "=", "@")
+    assert_eq default_padding, p[1]
+  }
+}
+
+test "WithoutPadding" {
+  for p in pairs {
+    default_padding = std_encoding.encode_to_string(b(p[0]))
+    custom_padding = std_encoding.with_padding(NO_PADDING).encode_to_string(b(p[0]))
+    assert_eq custom_padding, strings.trim_right(default_padding, "=")
+    assert_eq default_padding, p[1]
+  }
+}
+
+test "DecodeWithPadding" {
+  encodings = [std_encoding, std_encoding.with_padding(45), std_encoding.with_padding(NO_PADDING)]
+  for enc in encodings {
+    for p in pairs {
+      encoded = enc.encode_to_string(b(p[0]))
+      assert_eq s(~enc.decode_string(encoded)), p[0]
+    }
+  }
+}
+
+test "DecodeWithWrongPadding" {
+  encoded = std_encoding.encode_to_string(b("foobar"))
+  assert std_encoding.with_padding(45).decode_string(encoded).err?
+  assert std_encoding.with_padding(NO_PADDING).decode_string(encoded).err?
+}
+
+test "BufferedDecodingSameError" {
+  # (chunk combinations, expected error); the prefix decodes the same way in each.
+  cases = [
+    # NBSWY3DPO5XXE3DE == helloworld; "ZZ" as extra input
+    ([["NBSW", "Y3DP", "O5XX", "E3DE", "ZZ"], ["NBSWY3DPO5XXE3DE", "ZZ"], ["NBSWY3DPO5XXE3DEZZ"], ["NBS", "WY3", "DPO", "5XX", "E3D", "EZZ"], ["NBSWY3DPO5XXE3", "DEZZ"]], "unexpected EOF"),
+    # "ZZY" as extra input
+    ([["NBSW", "Y3DP", "O5XX", "E3DE", "ZZY"], ["NBSWY3DPO5XXE3DE", "ZZY"], ["NBSWY3DPO5XXE3DEZZY"], ["NBS", "WY3", "DPO", "5XX", "E3D", "EZZY"], ["NBSWY3DPO5XXE3", "DEZZY"]], "unexpected EOF"),
+    # Normal case, this is valid input
+    ([["NBSW", "Y3DP", "O5XX", "E3DE"], ["NBSWY3DPO5XXE3DE"], ["NBS", "WY3", "DPO", "5XX", "E3D", "E"], ["NBSWY3DPO5XXE3", "DE"]], ""),
+    # MZXW6YTB = fooba
+    ([["MZXW6YTBZZ"], ["MZXW6YTBZ", "Z"], ["MZXW6YTB", "ZZ"], ["MZXW6YT", "BZZ"], ["MZXW6Y", "TBZZ"], ["MZXW6Y", "TB", "ZZ"], ["MZXW6", "YTBZZ"], ["MZXW6", "YTB", "ZZ"], ["MZXW6", "YT", "BZZ"]], "unexpected EOF"),
+    # Normal case, this is valid input
+    ([["MZXW6YTB"], ["MZXW6YT", "B"], ["MZXW6Y", "TB"], ["MZXW6", "YTB"], ["MZXW6", "YT", "B"], ["MZXW", "6YTB"], ["MZXW", "6Y", "TB"]], ""),
+  ]
+  for tc in cases {
+    for chunks in tc[0] {
+      r = io.read_all(new_decoder(std_encoding, chunk_reader(chunks)))
+      assert_eq r.err?.message || "", tc[1]
+    }
+  }
+}
+
+test "BufferedDecodingPadding" {
+  cases = [
+    (["I4======", "=="], "unexpected EOF"),
+    (["I4======N4======"], "illegal base32 data at input byte 2"),
+    (["I4======", "N4======"], "illegal base32 data at input byte 0"),
+    (["I4======", "========"], "illegal base32 data at input byte 0"),
+    (["I4I4I4I4", "I4======", "I4======"], "illegal base32 data at input byte 0"),
+  ]
+  for tc in cases {
+    r = io.read_all(new_decoder(std_encoding, chunk_reader(tc[0])))
+    assert_eq r.err?.message || "", tc[1]
+  }
+}
+
+test "EncodedLen" {
+  raw = std_encoding.with_padding(NO_PADDING)
+  std = std_encoding
+  tests = [
+    (std, 0, 0), (std, 1, 8), (std, 2, 8), (std, 3, 8), (std, 4, 8), (std, 5, 8),
+    (std, 6, 16), (std, 10, 16), (std, 11, 24),
+    (raw, 0, 0), (raw, 1, 2), (raw, 2, 4), (raw, 3, 5), (raw, 4, 7), (raw, 5, 8),
+    (raw, 6, 10), (raw, 7, 12), (raw, 10, 16), (raw, 11, 18),
+    # overflow
+    (raw, (9223372036854775807 - 4) / 8 + 1, 1844674407370955162),
+    (raw, 9223372036854775807 / 8 * 5 + 4, 9223372036854775807),
+  ]
+  for tt in tests {
+    assert_eq tt[0].encoded_len(tt[1]), tt[2]
+  }
+}
+
+test "DecodedLen" {
+  raw = std_encoding.with_padding(NO_PADDING)
+  std = std_encoding
+  tests = [
+    (std, 0, 0), (std, 8, 5), (std, 16, 10), (std, 24, 15),
+    (raw, 0, 0), (raw, 2, 1), (raw, 4, 2), (raw, 5, 3), (raw, 7, 4), (raw, 8, 5),
+    (raw, 10, 6), (raw, 12, 7), (raw, 16, 10), (raw, 18, 11),
+    # overflow
+    (raw, 9223372036854775807 / 5 + 1, 1152921504606846976),
+    (raw, 9223372036854775807, 5764607523034234879),
+  ]
+  for tt in tests {
+    assert_eq tt[0].decoded_len(tt[1]), tt[2]
+  }
+}
+
+test "WithoutPaddingClose" {
+  for enc in [std_encoding, std_encoding.with_padding(NO_PADDING)] {
+    for p in pairs {
+      buf = bytes.new_buffer([])
+      w = new_encoder(enc, buf)
+      ~w.write!(b(p[0]))
+      ~w.close!
+      expected = p[1]
+      expected = strings.replace_all(expected, "=", "") if enc.padding == NO_PADDING
+      assert_eq buf.to_s, expected
+    }
+  }
+}
+
+test "DecodeReadAll" {
+  for p in pairs {
+    for enc in [std_encoding, std_encoding.with_padding(NO_PADDING)] {
+      encoded = p[1]
+      encoded = strings.replace_all(encoded, "=", "") if enc.padding == NO_PADDING
+      got = ~io.read_all(new_decoder(enc, bytes.new_buffer_string(encoded)))
+      assert_eq s(got), p[0]
+    }
+  }
+}
+
+test "DecodeSmallBuffer" {
+  size = 1
+  while size < 200 {
+    for p in pairs {
+      for enc in [std_encoding, std_encoding.with_padding(NO_PADDING)] {
+        encoded = p[1]
+        encoded = strings.replace_all(encoded, "=", "") if enc.padding == NO_PADDING
+        res = drain(new_decoder(enc, bytes.new_buffer_string(encoded)), size)
+        assert_eq res[1], ""
+        assert_eq s(res[0]), p[0]
+      }
+    }
+    size += 1
+  }
+}
+
+# Not in Go's tests.
+test "hex_encoding" {
+  assert_eq hex_encoding.encode_to_string(b("foobar")), "CPNMUOJ1E8======"
+  assert_eq s(~hex_encoding.decode_string("CPNMUOJ1E8======")), "foobar"
+}
+
+example "Encoding_EncodeToString" {
+  puts std_encoding.encode_to_string(b("any + old & data"))
+} outputs "MFXHSIBLEBXWYZBAEYQGIYLUME======"
+
+example "Encoding_Encode" {
+  data = b("Hello, world!")
+  dst: [Byte] = [0; std_encoding.encoded_len(data.size)]
+  std_encoding.encode(dst, data)
+  puts s(dst)
+} outputs "JBSWY3DPFQQHO33SNRSCC==="
+
+example "Encoding_DecodeString" {
+  data = ~std_encoding.decode_string("ONXW2ZJAMRQXIYJAO5UXI2BAAAQGC3TEEDX3XPY=")
+  puts strconv.quote(s(data))
+} outputs "\"some data with \\x00 and \\ufeff\""
+
+example "Encoding_Decode" {
+  str = "JBSWY3DPFQQHO33SNRSCC==="
+  dst: [Byte] = [0; std_encoding.decoded_len(str.size)]
+  n = ~std_encoding.decode(dst, b(str))
+  puts strconv.quote(s(dst[0...n]))
+} outputs "\"Hello, world!\""
+
+example "NewEncoder" {
+  out = bytes.new_buffer([])
+  enc = new_encoder(std_encoding, out)
+  ~enc.write!(b("foo\x00bar"))
+  # Must close the encoder when finished to flush any partial blocks.
+  ~enc.close!
+  puts out.to_s
+} outputs "MZXW6ADCMFZA===="

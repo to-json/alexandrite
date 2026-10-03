@@ -84,6 +84,7 @@ fn heredoc_and_unicode_survive() {
 #[test]
 fn generics_and_unary() {
     check("def p(s: Str) -> ~Int<A|B> { 1 }\n", "def p(s: Str) -> ~Int<A | B> { 1 }\n");
+    check("def q(s: Str) -> ~[Byte]<HexError> { 1 }\n", "def q(s: Str) -> ~[Byte]<HexError> { 1 }\n");
     check("def *(k: Int) -> V2 { 1 }\ndef <=>(o: V2) -> Int { 0 }\n", "def *(k: Int) -> V2 { 1 }\ndef <=>(o: V2) -> Int { 0 }\n");
     check("xs.map(&:to_i)\nputs -x\nputs !a\nf(*args)\n", "xs.map(&:to_i)\nputs -x\nputs !a\nf(*args)\n");
     check("case n {\n1|2=>\"a\"\n_=>\"b\"\n}\n", "case n {\n  1 | 2 => \"a\"\n  _ => \"b\"\n}\n");

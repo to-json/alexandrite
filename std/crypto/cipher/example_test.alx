@@ -1,0 +1,166 @@
+import "bytes"
+import "crypto/aes"
+import "crypto/rand"
+import "encoding/hex"
+import "io"
+import "os"
+
+# Go's crypto/cipher example_test.go. ExampleNewGCM_encrypt,
+# ExampleNewCBCEncrypter and ExampleNewCFBEncrypter print random output (Go
+# has no Output comment for them, so doesn't run them); they are examples
+# here that check their round trip instead.
+
+example "new gcm encrypt" {
+  # Load your secret key from a safe place and reuse it across multiple
+  # seal/open calls. If you want to convert a passphrase to a key, use a
+  # suitable package like bcrypt or scrypt.
+  key = hex.decode_string("6368616e676520746869732070617373776f726420746f206120736563726574").unwrap
+  plaintext = "exampleplaintext".bytes.to_a
+  block = aes.new_cipher(key).unwrap
+  aesgcm = new_gcm(block).unwrap
+  # Never use more than 2^32 random nonces with a given key because of the
+  # risk of a repeat.
+  nonce = [0.as_u8; aesgcm.nonce_size]
+  rand.read(nonce)
+  ciphertext = aesgcm.seal([], nonce, plaintext, [])
+  puts ciphertext.size
+  puts Str.from_bytes(aesgcm.open([], nonce, ciphertext, []).unwrap)
+} outputs "32\nexampleplaintext\n"
+
+example "new gcm decrypt" {
+  key = hex.decode_string("6368616e676520746869732070617373776f726420746f206120736563726574").unwrap
+  ciphertext = hex.decode_string("c3aaa29f002ca75870806e44086700f62ce4d43e902b3888e23ceff797a7a471").unwrap
+  nonce = hex.decode_string("64a9433eae7ccceee2fc0eda").unwrap
+  block = aes.new_cipher(key).unwrap
+  aesgcm = new_gcm(block).unwrap
+  plaintext = aesgcm.open([], nonce, ciphertext, []).unwrap
+  puts Str.from_bytes(plaintext)
+} outputs "exampleplaintext\n"
+
+example "new cbc decrypter" {
+  key = hex.decode_string("6368616e676520746869732070617373").unwrap
+  ciphertext = hex.decode_string("73c86d43a9d700a253a96c85b0f6b03ac9792e0e757f869cca306bd3cba1c62b").unwrap
+  block = aes.new_cipher(key).unwrap
+  # The IV needs to be unique, but not secure. Therefore it's common to
+  # include it at the beginning of the ciphertext.
+  panic("ciphertext too short") if ciphertext.size < aes.BLOCK_SIZE
+  iv = ciphertext[0...aes.BLOCK_SIZE]
+  ciphertext = ciphertext[aes.BLOCK_SIZE...ciphertext.size]
+  # CBC mode always works in whole blocks.
+  panic("ciphertext is not a multiple of the block size") if ciphertext.size % aes.BLOCK_SIZE != 0
+  mode = new_cbc_decrypter(block, iv)
+  # crypt_blocks! can work in-place if the two arguments are the same.
+  mode.crypt_blocks!(ciphertext, ciphertext)
+  # If the original plaintext lengths are not a multiple of the block size,
+  # padding would have to be added when encrypting, which would be removed
+  # at this point (see RFC 5246 section 6.2.3.2).
+  puts Str.from_bytes(ciphertext)
+} outputs "exampleplaintext\n"
+
+example "new cbc encrypter" {
+  key = hex.decode_string("6368616e676520746869732070617373").unwrap
+  plaintext = "exampleplaintext".bytes.to_a
+  panic("plaintext is not a multiple of the block size") if plaintext.size % aes.BLOCK_SIZE != 0
+  block = aes.new_cipher(key).unwrap
+  # The IV needs to be unique, but not secure. Therefore it's common to
+  # include it at the beginning of the ciphertext.
+  ciphertext = [0.as_u8; aes.BLOCK_SIZE + plaintext.size]
+  iv = ciphertext[0...aes.BLOCK_SIZE]
+  rand.read(iv)
+  mode = new_cbc_encrypter(block, iv)
+  mode.crypt_blocks!(ciphertext[aes.BLOCK_SIZE...ciphertext.size], plaintext)
+  # It's important to remember that ciphertexts must be authenticated (i.e.
+  # by using crypto/hmac) as well as being encrypted in order to be secure.
+  back = ciphertext[aes.BLOCK_SIZE...ciphertext.size] + []
+  dec = new_cbc_decrypter(block, iv)
+  dec.crypt_blocks!(back, back)
+  puts Str.from_bytes(back)
+} outputs "exampleplaintext\n"
+
+example "new cfb decrypter" {
+  key = hex.decode_string("6368616e676520746869732070617373").unwrap
+  ciphertext = hex.decode_string("7dd015f06bec7f1b8f6559dad89f4131da62261786845100056b353194ad").unwrap
+  block = aes.new_cipher(key).unwrap
+  panic("ciphertext too short") if ciphertext.size < aes.BLOCK_SIZE
+  iv = ciphertext[0...aes.BLOCK_SIZE]
+  ciphertext = ciphertext[aes.BLOCK_SIZE...ciphertext.size]
+  stream = new_cfb_decrypter(block, iv)
+  # xor_key_stream! can work in-place if the two arguments are the same.
+  stream.xor_key_stream!(ciphertext, ciphertext)
+  puts Str.from_bytes(ciphertext)
+} outputs "some plaintext\n"
+
+example "new cfb encrypter" {
+  key = hex.decode_string("6368616e676520746869732070617373").unwrap
+  plaintext = "some plaintext".bytes.to_a
+  block = aes.new_cipher(key).unwrap
+  ciphertext = [0.as_u8; aes.BLOCK_SIZE + plaintext.size]
+  iv = ciphertext[0...aes.BLOCK_SIZE]
+  rand.read(iv)
+  stream = new_cfb_encrypter(block, iv)
+  stream.xor_key_stream!(ciphertext[aes.BLOCK_SIZE...ciphertext.size], plaintext)
+  back = [0.as_u8; plaintext.size]
+  dec = new_cfb_decrypter(block, iv)
+  dec.xor_key_stream!(back, ciphertext[aes.BLOCK_SIZE...ciphertext.size])
+  puts Str.from_bytes(back)
+} outputs "some plaintext\n"
+
+example "new ctr" {
+  key = hex.decode_string("6368616e676520746869732070617373").unwrap
+  plaintext = "some plaintext".bytes.to_a
+  block = aes.new_cipher(key).unwrap
+  ciphertext = [0.as_u8; aes.BLOCK_SIZE + plaintext.size]
+  iv = ciphertext[0...aes.BLOCK_SIZE]
+  rand.read(iv)
+  stream = new_ctr(block, iv)
+  stream.xor_key_stream!(ciphertext[aes.BLOCK_SIZE...ciphertext.size], plaintext)
+  # CTR mode is the same for both encryption and decryption, so we can also
+  # decrypt that ciphertext with new_ctr.
+  plaintext2 = [0.as_u8; plaintext.size]
+  stream = new_ctr(block, iv)
+  stream.xor_key_stream!(plaintext2, ciphertext[aes.BLOCK_SIZE...ciphertext.size])
+  puts Str.from_bytes(plaintext2)
+} outputs "some plaintext\n"
+
+example "new ofb" {
+  key = hex.decode_string("6368616e676520746869732070617373").unwrap
+  plaintext = "some plaintext".bytes.to_a
+  block = aes.new_cipher(key).unwrap
+  ciphertext = [0.as_u8; aes.BLOCK_SIZE + plaintext.size]
+  iv = ciphertext[0...aes.BLOCK_SIZE]
+  rand.read(iv)
+  stream = new_ofb(block, iv)
+  stream.xor_key_stream!(ciphertext[aes.BLOCK_SIZE...ciphertext.size], plaintext)
+  # OFB mode is the same for both encryption and decryption.
+  plaintext2 = [0.as_u8; plaintext.size]
+  stream = new_ofb(block, iv)
+  stream.xor_key_stream!(plaintext2, ciphertext[aes.BLOCK_SIZE...ciphertext.size])
+  puts Str.from_bytes(plaintext2)
+} outputs "some plaintext\n"
+
+example "stream reader" {
+  key = hex.decode_string("6368616e676520746869732070617373").unwrap
+  encrypted = hex.decode_string("cf0495cc6f75dafc23948538e79904a9").unwrap
+  b_reader = bytes.new_buffer(encrypted)
+  block = aes.new_cipher(key).unwrap
+  # If the key is unique for each ciphertext, then it's ok to use a zero IV.
+  iv = [0.as_u8; aes.BLOCK_SIZE]
+  stream = new_ofb(block, iv)
+  reader = StreamReader.new(s: stream, r: b_reader)
+  # Note that this example is simplistic in that it omits any
+  # authentication of the encrypted data.
+  io.copy(os.stdout, reader).unwrap
+  puts ""
+} outputs "some secret text\n"
+
+example "stream writer" {
+  key = hex.decode_string("6368616e676520746869732070617373").unwrap
+  b_reader = bytes.new_buffer("some secret text".bytes.to_a)
+  block = aes.new_cipher(key).unwrap
+  iv = [0.as_u8; aes.BLOCK_SIZE]
+  stream = new_ofb(block, iv)
+  out = bytes.new_buffer([])
+  writer = StreamWriter.new(s: stream, w: out)
+  io.copy(writer, b_reader).unwrap
+  puts hex.encode_to_string(out.bytes)
+} outputs "cf0495cc6f75dafc23948538e79904a9\n"

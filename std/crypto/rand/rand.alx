@@ -7,8 +7,8 @@
 #   rand.Reader (io.Reader)             reader() -> Reader (an io.Reader)
 #   rand.Read(b) (n int, err error)     read(b) -> Int (never fails)
 #   rand.Text() string                  text() -> Str
-#   rand.Int(rand, max *big.Int)        (not yet: needs math/big)
-#   rand.Prime(rand, bits)              (not yet: needs math/big)
+#   rand.Int(rand, max *big.Int)        int(r, max) -> ~big.Int   (r: any reader)
+#   rand.Prime(rand, bits)              prime(bits) -> ~big.Int<RandError>
 #
 # Differences from Go:
 #   - Go's Reader is a package variable that a program (or a test) may
@@ -22,8 +22,17 @@
 #   - Go runs the OS bytes through its FIPS 140 DRBG (and reads the OS only
 #     to seed it); here every read goes to the OS, whose generator is itself
 #     a cryptographic DRBG.
-#   - Int and Prime need arbitrary-precision integers (math/big), which alx's
-#     std doesn't have yet; they come with math/big.
+#   - Prime takes no reader: since Go 1.26 Prime ignores its Reader
+#     argument and always reads the secure source (unless
+#     GODEBUG=cryptocustomrand=1, which alx doesn't have). Its error for
+#     bits < 2 is RandError.PrimeSize with Go's message.
+#   - int(r, max) is generic over the reader (any type with a `read!`
+#     returning Int or ~Int), as Go takes any io.Reader; a reader that ends
+#     early fails with io's UnexpectedEof (Go's io.ReadFull error). It
+#     panics if max <= 0, as Go's does.
+
+import "io"
+import "math/big"
 
 extern def c_getentropy(buf: [Byte], n: Int) -> I32 = "getentropy"
 
@@ -75,4 +84,92 @@ pub def text -> Str {
     i += 1
   }
   Str.from_bytes(src)
+}
+
+# The error of prime.
+pub error RandError {
+  PrimeSize
+
+  def message -> Str {
+    case self {
+      PrimeSize => "crypto/rand: prime size must be at least 2-bit"
+    }
+  }
+}
+
+# Fills p from r, failing with io's UnexpectedEof if r ends first.
+def read_full[R](r: R, p: [Byte]) -> ~Unit {
+  rd = r
+  off = 0
+  while off < p.size {
+    n = rd.~read!(p[off...p.size])
+    fail io.StreamError.UnexpectedEof if n == 0
+    off += n
+  }
+}
+
+# A uniform random value in [0, max), from the bytes of r. It panics if
+# max <= 0, and fails if reading r does.
+pub def int[R](r: R, max: big.Int) -> ~big.Int {
+  panic("crypto/rand: argument to Int is <= 0") if max.sign <= 0
+  n = big.Int.new
+  n.sub!(max, big.new_int(1))
+  # bit_len is the maximum bit length needed to encode a value < max.
+  bit_len = n.bit_len
+  # The only valid result is 0.
+  return n if bit_len == 0
+  # k is the maximum byte length needed to encode a value < max.
+  k = (bit_len + 7) / 8
+  # b is the number of bits in the most significant byte of max-1.
+  b = bit_len % 8
+  b = 8 if b == 0
+  buf = [0.as_u8; k]
+  while true {
+    ~read_full(r, buf)
+    # Clear bits in the first byte to increase the probability that the
+    # candidate is < max.
+    buf[0] = buf[0] & ((1 << b) - 1).as_u8
+    n.set_bytes!(buf)
+    return n if n.cmp(max) < 0
+  }
+  n
+}
+
+# A number of the given bit length that is prime with high probability,
+# made from the secure source. Fails if bits < 2.
+pub def prime(bits: Int) -> ~big.Int<RandError> {
+  fail RandError.PrimeSize if bits < 2
+  prime_from(reader(), bits).unwrap
+}
+
+# Go's Prime loop over the bytes of r (what Go 1.25 and earlier, or
+# GODEBUG=cryptocustomrand=1, read from the Reader argument); bits >= 2.
+def prime_from[R](r: R, bits: Int) -> ~big.Int {
+  b = bits % 8
+  b = 8 if b == 0
+  buf = [0.as_u8; (bits + 7) / 8]
+  p = big.Int.new
+  while true {
+    ~read_full(r, buf)
+    # Clear bits in the first byte to make sure the candidate has a size
+    # <= bits.
+    buf[0] = buf[0] & ((1 << b) - 1).as_u8
+    # Don't let the value be too small, i.e, set the most significant two
+    # bits. Setting the top two bits, rather than just the top bit, means
+    # that when two of these values are multiplied together, the result
+    # isn't ever one bit short.
+    if b >= 2 {
+      buf[0] = buf[0] | (3 << (b - 2)).as_u8
+    } else {
+      # Here b == 1, because b cannot be zero.
+      buf[0] = buf[0] | 1
+      buf[1] = buf[1] | 0x80 if buf.size > 1
+    }
+    # Make the value odd since an even number this large certainly isn't
+    # prime.
+    buf[buf.size - 1] = buf[buf.size - 1] | 1
+    p.set_bytes!(buf)
+    return p if p.probably_prime?(20)
+  }
+  p
 }

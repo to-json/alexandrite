@@ -1,0 +1,322 @@
+# Go's io/fs tests over MapFS and os.DirFS (glob_test.go,
+# readdir_test.go, readfile_test.go, readlink_test.go, stat_test.go,
+# sub_test.go, walk_test.go, example_test.go), translated. Go's
+# `readFileOnly{testFsys}` wrappers (an FS whose Open fails but which has
+# the method) become structs defining the method; `openOnly` is a struct
+# with only `open`, so it gets FS's default methods.
+import "os"
+import "path"
+import "strings"
+import "io/fs"
+import "time"
+
+def mfs(pairs: [(Str, MapFile)]) -> MapFS {
+  files: Map[Str, MapFile] = {}
+  for k, v in pairs {
+    files[k] = v
+  }
+  map_fs(files)
+}
+
+def mf(data: Str, bits: U32) -> MapFile {
+  MapFile.new(data: data.bytes.to_a, mode: fs.mode(bits), mod_time: time.now)
+}
+
+def test_fsys -> MapFS {
+  mfs([("hello.txt", mf("hello, world", 0o456)), ("sub/goodbye.txt", mf("goodbye, world", 0o456))])
+}
+
+def not_exist -> fs.FsError { fs.FsError.NotExist }
+
+struct OpenOnly {
+  m: MapFS
+  pub def open(name: Str) -> ~fs.File { m.~open(name) }
+}
+
+struct ReadFileOnly {
+  m: MapFS
+  pub def open(name: Str) -> ~fs.File { fail not_exist }
+  pub def read_file(name: Str) -> ~[Byte] { m.~read_file(name) }
+}
+
+struct ReadDirOnly {
+  m: MapFS
+  pub def open(name: Str) -> ~fs.File { fail not_exist }
+  pub def read_dir(name: Str) -> ~[fs.DirEntry] { m.~read_dir(name) }
+}
+
+struct StatOnly {
+  m: MapFS
+  pub def open(name: Str) -> ~fs.File { fail not_exist }
+  pub def stat(name: Str) -> ~fs.FileInfo { m.~stat(name) }
+}
+
+struct GlobOnly {
+  m: MapFS
+  pub def open(name: Str) -> ~fs.File { fail not_exist }
+  pub def glob(pattern: Str) -> ~[Str] { m.~glob(pattern) }
+}
+
+test "read file" {
+  assert_eq Str.from_bytes(~fs.read_file(ReadFileOnly.new(m: test_fsys), "hello.txt")), "hello, world"
+  assert_eq Str.from_bytes(~fs.read_file(OpenOnly.new(m: test_fsys), "hello.txt")), "hello, world"
+  sb = ~fs.sub(test_fsys, ".")
+  assert_eq Str.from_bytes(~fs.read_file(sb, "hello.txt")), "hello, world"
+}
+
+def error_path(e: Error) -> Str {
+  case e {
+    fs.FsError.Path(at) => at.path
+    _ => ""
+  }
+}
+
+test "read file path" {
+  dir = ~os.mkdir_temp("", "fstest")
+  fsys = fs.dir_fs(dir)
+  e1 = fs.read_file(fsys, "non-existent").err.unwrap
+  e2 = fs.read_file(OpenOnlyDir.new(d: fsys), "non-existent").err.unwrap
+  assert_eq error_path(e1), error_path(e2)
+  assert_eq error_path(e1), "non-existent"
+  d1 = fs.read_dir(fsys, "non-existent").err.unwrap
+  d2 = fs.read_dir(OpenOnlyDir.new(d: fsys), "non-existent").err.unwrap
+  assert_eq error_path(d1), error_path(d2)
+  ~os.remove_all(dir)
+}
+
+# Go's struct{ FS }{fsys} over a fs.DirFS: only open.
+struct OpenOnlyDir {
+  d: fs.DirFS
+  pub def open(name: Str) -> ~fs.File { d.~open(name) }
+}
+
+test "read dir" {
+  check = ->(dirs: [fs.DirEntry]) {
+    assert_eq dirs.map { |d| d.name }.to_a, ["hello.txt", "sub"]
+  }
+  check(~fs.read_dir(ReadDirOnly.new(m: test_fsys), "."))
+  check(~fs.read_dir(OpenOnly.new(m: test_fsys), "."))
+  check(~fs.read_dir(~fs.sub(test_fsys, "."), "."))
+}
+
+test "file info to dir entry" {
+  fsys = mfs([("notadir.txt", mf("hello, world", 0)), ("adir", mf("", fs.MODE_DIR))])
+  for p, want_mode, want_dir in [("notadir.txt", 0.to_u32, false), ("adir", fs.MODE_DIR, true)] {
+    fi = ~fs.stat(fsys, p)
+    d = fs.file_info_to_dir_entry(fi)
+    assert_eq d.type, fs.mode(want_mode)
+    assert_eq d.name, p
+    assert_eq d.is_dir, want_dir
+  }
+}
+
+test "stat" {
+  assert_eq (~fs.stat(StatOnly.new(m: test_fsys), "hello.txt")).mode, fs.mode(0o456)
+  assert_eq (~fs.stat(OpenOnly.new(m: test_fsys), "hello.txt")).mode, fs.mode(0o456)
+}
+
+test "sub" {
+  for s in [~fs.sub(OpenOnly.new(m: test_fsys), "sub")] {
+    assert_eq Str.from_bytes(~fs.read_file(s, "goodbye.txt")), "goodbye, world"
+    assert_eq (~fs.read_dir(s, ".")).map { |d| d.name }.to_a, ["goodbye.txt"]
+    e = s.open("nonexist").err.unwrap
+    assert_eq error_path(e), "nonexist"
+    assert fs.is_invalid(s.open("./").err.unwrap)
+  }
+  s2 = ~fs.sub(test_fsys, "sub")
+  assert_eq Str.from_bytes(~fs.read_file(s2, "goodbye.txt")), "goodbye, world"
+  assert_eq error_path(s2.open("nonexist").err.unwrap), "nonexist"
+  # A fs.sub of a fs.sub is one level (Go's subFS.Sub).
+  s3 = ~s2.sub(".")
+  assert_eq Str.from_bytes(~fs.read_file(s3, "goodbye.txt")), "goodbye, world"
+  assert fs.is_invalid(fs.sub(test_fsys, "../x").err.unwrap)
+}
+
+def link_fs -> MapFS {
+  mfs([
+    ("foo", mf("bar", fs.MODE_SYMLINK | 0o777)),
+    ("bar", mf("Hello, World!\n", 0o644)),
+    ("dir/parentlink", mf("../bar", fs.MODE_SYMLINK | 0o777)),
+    ("dir/link", mf("file", fs.MODE_SYMLINK | 0o777)),
+    ("dir/file", mf("Hello, World!\n", 0o644)),
+  ])
+}
+
+test "read link" {
+  t = link_fs
+  assert_eq ~fs.read_link(t, "foo"), "bar"
+  assert_eq ~fs.read_link(t, "dir/parentlink"), "../bar"
+  assert_eq ~fs.read_link(t, "dir/link"), "file"
+  s = ~fs.sub(t, "dir")
+  assert_eq ~fs.read_link(s, "link"), "file"
+  assert_eq ~fs.read_link(s, "parentlink"), "../bar"
+  # No ReadLinkFS: ErrInvalid.
+  r = fs.read_link(OpenOnly.new(m: t), "foo")
+  assert_eq r.err.unwrap.message, "readlink foo: invalid argument"
+}
+
+test "lstat" {
+  t = link_fs
+  assert_eq (~fs.lstat(t, "foo")).mode, fs.mode(fs.MODE_SYMLINK | 0o777)
+  assert_eq (~fs.lstat(t, "bar")).mode, fs.mode(0o644)
+  s = ~fs.sub(t, "dir")
+  assert_eq (~fs.lstat(s, "link")).mode, fs.mode(fs.MODE_SYMLINK | 0o777)
+}
+
+test "glob dir fs" {
+  dir = ~os.mkdir_temp("", "fstest")
+  ~os.mkdir(dir + "/fs", 0o755)
+  ~os.write_file(dir + "/fs/glob.go", [], 0o644)
+  ~os.write_file(dir + "/fs/walk.go", [], 0o644)
+  here = fs.dir_fs(dir + "/fs")
+  up = fs.dir_fs(dir)
+  for fsys, pat, want in [(here, "glob.go", "glob.go"), (here, "gl?b.go", "glob.go"), (here, "gl\\ob.go", "glob.go"), (here, "*", "glob.go"), (up, "*/glob.go", "fs/glob.go")] {
+    assert (~fs.glob(fsys, pat)).include?(want), pat
+  }
+  for pat in ["no_match", "../*/no_match", "\\*"] {
+    assert_eq (~fs.glob(here, pat)).size, 0
+  }
+  # Go's TestGlobError and TestCVE202230630.
+  for pat in ["[]", "nonexist/[]", "/*" + "/" * 10001] {
+    r = fs.glob(here, pat)
+    bad = case r.err.unwrap {
+      path.PathError.ErrBadPattern => true
+      _ => false
+    }
+    assert bad, pat
+  }
+  ~os.remove_all(dir)
+}
+
+test "glob method" {
+  assert_eq ~fs.glob(GlobOnly.new(m: test_fsys), "*.txt"), ["hello.txt"]
+  assert_eq ~fs.glob(OpenOnly.new(m: test_fsys), "*.txt"), ["hello.txt"]
+}
+
+# Go's walk tree: testdata/{a, b/, c, d/{x, y/, z/{u, v}}}.
+def tree_paths -> [(Str, Bool)] {
+  [
+    ("testdata", true), ("testdata/a", false), ("testdata/b", true), ("testdata/c", false), ("testdata/d", true),
+    ("testdata/d/x", false), ("testdata/d/y", true), ("testdata/d/z", true), ("testdata/d/z/u", false), ("testdata/d/z/v", false),
+  ]
+}
+
+def make_walk_tree -> MapFS {
+  files: Map[Str, MapFile] = {}
+  for p, is_dir in tree_paths {
+    files[p] = is_dir ? map_dir : map_file([])
+  }
+  map_fs(files)
+}
+
+test "walk dir" {
+  fsys = make_walk_tree
+  marks: Map[Str, Int] = {}
+  errs: [Str] = []
+  ~fs.walk_dir(fsys, ".") { |p, d, err|
+    marks[d.unwrap.name] = (marks[d.unwrap.name] || 0) + 1
+    if e = err {
+      errs << e.message
+    }
+  }
+  assert_eq errs.size, 0
+  for p, _ in tree_paths {
+    assert_eq marks[path.base(p)] || 0, 1
+  }
+  # Visiting order.
+  order: [Str] = []
+  ~fs.walk_dir(fsys, "testdata") { |p, d, err| order << p }
+  assert_eq order, tree_paths.map { |t| t[0] }.to_a
+}
+
+test "walk dir skip" {
+  fsys = make_walk_tree
+  order: [Str] = []
+  ~fs.walk_dir(fsys, "testdata") { |p, d, err|
+    order << p
+    fail fs.FsError.SkipDir if p == "testdata/d"
+  }
+  assert_eq order, ["testdata", "testdata/a", "testdata/b", "testdata/c", "testdata/d"]
+  order2: [Str] = []
+  ~fs.walk_dir(fsys, "testdata") { |p, d, err|
+    order2 << p
+    fail fs.FsError.SkipAll if p == "testdata/b"
+  }
+  assert_eq order2, ["testdata", "testdata/a", "testdata/b"]
+  # SkipDir on a file skips the rest of its directory.
+  order3: [Str] = []
+  ~fs.walk_dir(fsys, "testdata/d") { |p, d, err|
+    order3 << p
+    fail fs.FsError.SkipDir if p == "testdata/d/x"
+  }
+  assert_eq order3, ["testdata/d", "testdata/d/x"]
+  # Any other failure stops the walk and is returned.
+  r = fs.walk_dir(fsys, "testdata") { |p, d, err| fail fs.FsError.Closed if p == "testdata/c" }
+  assert_eq r.err.unwrap.message, "file already closed"
+  # A missing root is reported to the block, with no entry.
+  seen: [Str] = []
+  ~fs.walk_dir(fsys, "nope") { |p, d, err|
+    assert d == none
+    seen << err.unwrap.message
+  }
+  assert_eq seen, ["open nope: file does not exist"]
+}
+
+test "walk dir symlink" {
+  fsys = mfs([
+    ("link", mf("dir", fs.MODE_SYMLINK)),
+    ("dir/a", mf("", 0)),
+    ("dir/b/c", mf("", 0)),
+    ("dir/d", mf("b", fs.MODE_SYMLINK)),
+  ])
+  want: Map[Str, fs.FileMode] = {}
+  want["link"] = fs.mode(fs.MODE_DIR)
+  want["link/a"] = fs.mode(0)
+  want["link/b"] = fs.mode(fs.MODE_DIR)
+  want["link/b/c"] = fs.mode(0)
+  want["link/d"] = fs.mode(fs.MODE_SYMLINK)
+  marks: Map[Str, Int] = {}
+  ~fs.walk_dir(fsys, "link") { |p, d, err|
+    marks[p] = (marks[p] || 0) + 1
+    assert want.include?(p), "Unexpected path #{p} in walk"
+    assert d.unwrap.type == want[p].unwrap, "#{p} entry type"
+    assert err == none
+  }
+  want.each { |p, _| assert_eq marks[p] || 0, 1 }
+}
+
+test "issue 51617" {
+  dir = ~os.mkdir_temp("", "fstest")
+  ~os.mkdir(dir + "/a", 0o755)
+  ~os.mkdir(dir + "/a/bad", 0o755)
+  ~os.mkdir(dir + "/a/next", 0o755)
+  ~os.chmod(dir + "/a/bad", 0)
+  saw: [Str] = []
+  r = fs.walk_dir(fs.dir_fs(dir), ".") { |p, d, err|
+    fail fs.FsError.SkipDir if err != none
+    saw << p if d.unwrap.is_dir
+  }
+  ~os.chmod(dir + "/a/bad", 0o700)
+  ~os.remove_all(dir)
+  ~r
+  assert_eq saw, [".", "a", "a/bad", "a/next"]
+}
+
+example "glob" {
+  fsys = mfs([("file.txt", mf("", 0)), ("file.go", mf("", 0)), ("dir/file.txt", mf("", 0)), ("dir/file.go", mf("", 0)), ("dir/subdir/x.go", mf("", 0))])
+  for pattern in ["*.txt", "*.go", "dir/*.go", "dir/*/x.go"] {
+    m = fs.glob(fsys, pattern).unwrap
+    puts "\"#{pattern}\" matches: [#{strings.join(m, " ")}]"
+  }
+} outputs "\"*.txt\" matches: [file.txt]\n\"*.go\" matches: [file.go]\n\"dir/*.go\" matches: [dir/file.go]\n\"dir/*/x.go\" matches: [dir/subdir/x.go]\n"
+
+example "read file" {
+  fsys = mfs([("hello.txt", mf("Hello, World!\n", 0))])
+  print Str.from_bytes(fs.read_file(fsys, "hello.txt").unwrap)
+} outputs "Hello, World!\n"
+
+example "valid path" {
+  for p in [".", "x", "x/y/z", "", "..", "/x", "x/", "x//y", "x/./y", "x/../y"] {
+    puts "ValidPath(\"#{p}\") = #{fs.valid_path?(p)}"
+  }
+} outputs "ValidPath(\".\") = true\nValidPath(\"x\") = true\nValidPath(\"x/y/z\") = true\nValidPath(\"\") = false\nValidPath(\"..\") = false\nValidPath(\"/x\") = false\nValidPath(\"x/\") = false\nValidPath(\"x//y\") = false\nValidPath(\"x/./y\") = false\nValidPath(\"x/../y\") = false\n"

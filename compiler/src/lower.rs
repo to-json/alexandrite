@@ -1482,6 +1482,18 @@ impl<'a> Lw<'a> {
     /// infallible method satisfying a fallible interface method always succeeds.
     fn iface_result(&mut self, e: &TExpr, fid: FuncId, call: LE) -> (Vec<LS>, LE) {
         let f = &self.p.funcs[fid];
+        // A covariant result (`def clone -> Hash` returning a Digest): wrap it.
+        if let (Ty::Iface(n), Ty::Struct(..) | Ty::Enum(..)) = (&e.ty, &f.ret) {
+            let impls = self.p.ifaces.get(n).cloned().unwrap_or_default();
+            let k = impls.iter().position(|(t, _)| *t == f.ret).expect("covariant result implements the interface");
+            let lt = self.lty(&e.ty);
+            let LTy::Tup(ts) = &lt else { unreachable!() };
+            let mut vals = vec![LE::I(k as i64)];
+            for (j, t) in ts[1..].iter().enumerate() {
+                vals.push(if j == k { call.clone() } else { zero_le(t) });
+            }
+            return (vec![], LE::Tup(lt, vals));
+        }
         let Ty::Result(t) = &e.ty else { return (vec![], call) };
         if f.fallible {
             return (vec![], call);

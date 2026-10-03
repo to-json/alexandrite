@@ -587,7 +587,16 @@ impl<'a> World<'a> {
             // An infallible method satisfies a fallible interface method (it always succeeds).
             let lifted = !fallible && m.ret == Ty::Result(Box::new(ret.clone()));
             let ret = if fallible { Ty::Result(Box::new(ret)) } else { ret };
-            if ret != m.ret && !lifted {
+            // Covariant results: a `Digest` satisfies `def clone -> Hash` when
+            // Digest is a Hash (the call through the interface wraps it).
+            let covariant = match (&ret, &m.ret) {
+                (Ty::Struct(..) | Ty::Enum(..), Ty::Iface(j)) => {
+                    let j = j.clone();
+                    self.implement(&j, &ret, sp).is_ok()
+                }
+                _ => false,
+            };
+            if ret != m.ret && !lifted && !covariant {
                 self.impls.get_mut(iface).unwrap().pop();
                 return Err(Diag::new(sp, format!("{tn}.{} returns {}, but {iface}.{} returns {}", m.name, ret.show(), m.name, m.ret.show())));
             }

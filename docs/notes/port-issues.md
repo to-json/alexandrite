@@ -16,9 +16,9 @@ Open problems agents reported; each gets fixed in a compiler round between waves
 | 10 | containers | static methods on generic structs (`def self.make(n) -> R[T]`) report "is recursive" | fixed: a static method is generic over its type's parameters (`R.make(3, v)`, `R[Byte].make(2, 7)`) |
 | 11 | containers | a generic function can't take its type only from the declared result (`x: R[Int] = mk(3)`); no explicit type arguments on calls | fixed: parameters the arguments don't decide come from the wanted type (declarations, returns, arguments); `R[T].static` gives them explicitly. Explicit `f[T](..)` on plain defs: not added (the wanted type covers the uses so far) |
 | 12 | containers | `==` on optionals isn't allowed | fixed: `T? == T?` and `T? == T` (the plain side is wrapped) |
-| 13 | hash | interface method result types aren't covariant (no `Cloner` interface) | open |
+| 13 | hash | interface method result types aren't covariant (no `Cloner` interface) | fixed: a struct/enum result satisfies an interface result it implements (wrapped at dispatch); fallible covariant results (`-> ~Iface`) not yet |
 | 14 | hash | an array literal mixing struct types doesn't convert to `[Iface]` even when declared | fixed: array literals coerce element-wise |
-| 15 | hash | `alx test` on the JIT accepts unused imports, `--release` rejects them | open |
+| 15 | hash | `alx test` on the JIT accepts unused imports, `--release` rejects them | not reproduced (both agree; std packages skip the check) |
 | 16 | hash | maphash's `getentropy` FFI on wasm | check |
 | 17 | (main) | an array literal `[128, 65]` doesn't adapt to a `[Byte]` parameter (`Str.from_bytes([128, 65])`); a typed local works | fixed: array literals coerce element-wise; C declares array types used only by literals |
 | 18 | (main) | a keyword (`next`) can't name a struct field or a named argument | fixed: keywords name fields (`next: T`, `N.new(next: x)`, `self.next`); fmt treats `.kw` as a value |

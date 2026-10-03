@@ -1,0 +1,79 @@
+# multipart/form-data requests (Go's request_test.go multipart cases, over
+# an in-process loopback server).
+import "bytes"
+import "io"
+import "mime/multipart"
+import "net"
+
+def multipart_body -> (Str, [Byte]) {
+  b = bytes.new_buffer([])
+  w = multipart.new_writer(b)
+  w.set_boundary!("xYzZY").unwrap
+  w.write_field!("texta", "foo").unwrap
+  w.write_field!("textb", "bar").unwrap
+  fw = w.create_form_file!("filea", "filea.txt").unwrap
+  fw.write_string!("This is a test file.").unwrap
+  w.close!.unwrap
+  (w.form_data_content_type, b.bytes)
+}
+
+def form_request(ct: Str, body: [Byte]) -> Request {
+  r = new_request("POST", "http://example.com/upload", body).unwrap
+  r.header.set!("Content-Type", ct)
+  r
+}
+
+test "multipart reader and form" {
+  ct, body = multipart_body()
+  req = form_request(ct, body)
+  mr = multipart_reader(req).unwrap
+  p = mr.next_part!.unwrap.unwrap
+  assert_eq p.form_name, "texta"
+  assert_eq Str.from_bytes(io.read_all(p).unwrap), "foo"
+  form = parse_multipart_form(req, 1 << 20).unwrap
+  assert_eq form.value["texta"].unwrap, ["foo"]
+  assert_eq form.value["textb"].unwrap, ["bar"]
+  f, fh = form_file(req, "filea").unwrap
+  assert_eq fh.filename, "filea.txt"
+  assert_eq Str.from_bytes(io.read_all(f).unwrap), "This is a test file."
+  assert_eq form_file(req, "missing").err.unwrap.message, "http: no such file"
+}
+
+test "multipart errors" {
+  r = form_request("text/plain", [])
+  assert_eq multipart_reader(r).err.unwrap.message, "request Content-Type isn't multipart/form-data"
+  r = form_request("multipart/mixed; boundary=foo", [])
+  assert_eq multipart_reader(r).err.unwrap.message, "request Content-Type isn't multipart/form-data"
+  r = form_request("multipart/form-data", [])
+  assert_eq multipart_reader(r).err.unwrap.message, "no multipart boundary param in Content-Type"
+  r2 = new_request("POST", "http://example.com/", []).unwrap
+  assert_eq parse_multipart_form(r2, 100).err.unwrap.message, "request Content-Type isn't multipart/form-data"
+}
+
+test "multipart upload to a loopback server" {
+  mux = new_serve_mux
+  mux.handle_func("POST /upload") { |w, r|
+    res = parse_multipart_form(r, 1 << 20)
+    if e = res.err {
+      error(w, e.message, 400)
+    } else {
+      form = res.unwrap
+      ff = form_file(r, "filea").unwrap
+      f, fh = ff
+      data = io.read_all(f).unwrap
+      w.write_string!("#{form.value["texta"].unwrap[0]} #{form.value["textb"].unwrap[0]} #{fh.filename}=#{Str.from_bytes(data)}").unwrap
+    }
+    nil
+  }
+  srv = new_server(mux)
+  ln = net.listen("tcp", "127.0.0.1:0").unwrap
+  port = ln.port
+  spawn { srv.serve(ln) }
+  ct, body = multipart_body()
+  resp = post_bytes("http://127.0.0.1:#{port}/upload", ct, body).unwrap
+  assert_eq resp.status, 200
+  assert_eq resp.body_string, "foo bar filea.txt=This is a test file."
+  resp = post("http://127.0.0.1:#{port}/upload", "text/plain", "x").unwrap
+  assert_eq resp.status, 400
+  srv.shutdown
+}

@@ -1,0 +1,310 @@
+# Go's net/http/httptest tests (httptest_test.go, recorder_test.go,
+# server_test.go, example_test.go), translated where they apply.
+import "bufio"
+import "net"
+import "net/http"
+
+def check_req(r: http.Request, method: Str, host: Str, path: Str, uri: Str, cl: Int, body: Str) {
+  assert_eq r.method, method
+  assert_eq r.host, host
+  assert_eq r.path, path
+  assert_eq r.request_uri, uri
+  assert_eq r.proto, "HTTP/1.1"
+  assert_eq r.remote_addr, "192.0.2.1:1234"
+  assert_eq r.header.size, 0
+  assert_eq r.content_length, cl
+  assert_eq r.body_string, body
+}
+
+test "new request" {
+  check_req(new_request("GET", "/", []), "GET", "example.com", "/", "/", 0, "")
+}
+
+test "new request with context" {
+  # empty method means GET
+  check_req(new_request("", "/", []), "GET", "example.com", "/", "/", 0, "")
+  # GET with full URL
+  r = new_request("GET", "http://foo.com/path/%2f/bar/", [])
+  check_req(r, "GET", "foo.com", "/path///bar/", "http://foo.com/path/%2f/bar/", 0, "")
+  # GET with full https URL (no TLS state in alx)
+  check_req(new_request("GET", "https://foo.com/path/", []), "GET", "foo.com", "/path/", "https://foo.com/path/", 0, "")
+  # POST with known length
+  check_req(new_request("POST", "/", "foo".bytes.to_a), "POST", "example.com", "/", "/", 3, "foo")
+  # OPTIONS *
+  check_req(new_request("OPTIONS", "*", []), "OPTIONS", "example.com", "*", "*", 0, "")
+}
+
+test "new request panics on a bad target" {
+  t = spawn { new_request("GET", "not a url", []) }
+  assert t.wait.err?
+}
+
+def run(f: (http.ResponseWriter, http.Request) -> Unit) -> ResponseRecorder {
+  r = new_request("GET", "http://foo.com/", [])
+  rec = new_recorder
+  rec.serve(f, r)
+  rec
+}
+
+test "recorder" {
+  # 200 default
+  rec = run(->(w: http.ResponseWriter, r: http.Request) {})
+  assert_eq rec.code, 200
+  assert_eq rec.body_string, ""
+  # first code only
+  rec = run(->(w: http.ResponseWriter, r: http.Request) {
+    w.write_header!(201)
+    w.write_header!(202)
+    w.write_string!("hi").unwrap
+  })
+  assert_eq rec.code, 201
+  assert_eq rec.body_string, "hi"
+  # write sends 200
+  rec = run(->(w: http.ResponseWriter, r: http.Request) {
+    w.write_string!("hi first").unwrap
+    w.write_header!(201)
+    w.write_header!(202)
+  })
+  assert_eq rec.code, 200
+  assert_eq rec.body_string, "hi first"
+  assert !rec.flushed?
+  assert_eq rec.result.header.get("Content-Type"), "text/plain; charset=utf-8"
+  # flush
+  rec = run(->(w: http.ResponseWriter, r: http.Request) {
+    w.flush!.unwrap
+    w.write_header!(201)
+  })
+  assert_eq rec.code, 200
+  assert rec.flushed?
+  assert_eq rec.result.content_length, -1
+  # Content-Type detection
+  rec = run(->(w: http.ResponseWriter, r: http.Request) { w.write_string!("<html>").unwrap })
+  assert_eq rec.result.header.get("Content-Type"), "text/html; charset=utf-8"
+  # no Content-Type detection with Transfer-Encoding
+  rec = run(->(w: http.ResponseWriter, r: http.Request) {
+    w.header.set!("Transfer-Encoding", "some encoding")
+    w.write_string!("<html>").unwrap
+  })
+  assert_eq rec.result.header.get("Content-Type"), ""
+  # no Content-Type detection if set explicitly
+  rec = run(->(w: http.ResponseWriter, r: http.Request) {
+    w.header.set!("Content-Type", "some/type")
+    w.write_string!("<html>").unwrap
+  })
+  assert_eq rec.result.header.get("Content-Type"), "some/type"
+  # Header is not changed after write
+  rec = run(->(w: http.ResponseWriter, r: http.Request) {
+    hdr = w.header
+    hdr.set!("Key", "correct")
+    w.write_header!(200)
+    hdr.set!("Key", "incorrect")
+  })
+  assert_eq rec.result.header.get("Key"), "correct"
+  # Trailer headers are correctly recorded
+  rec = run(->(w: http.ResponseWriter, r: http.Request) {
+    w.header.set!("Non-Trailer", "correct")
+    w.header.set!("Trailer", "Trailer-A, Trailer-B")
+    w.header.add!("Trailer", "Trailer-C")
+    w.write_string!("<html>").unwrap
+    w.header.set!("Non-Trailer", "incorrect")
+    w.header.set!("Trailer-A", "valuea")
+    w.header.set!("Trailer-C", "valuec")
+    w.header.set!("Trailer-NotDeclared", "should be omitted")
+    w.header.set!("Trailer:Trailer-D", "with prefix")
+  })
+  res = rec.result
+  assert_eq rec.code, 200
+  assert_eq res.header.get("Content-Type"), "text/html; charset=utf-8"
+  assert_eq res.header.get("Non-Trailer"), "correct"
+  for k in ["Trailer-A", "Trailer-B", "Trailer-C", "Trailer-NotDeclared"] {
+    assert !res.header.has?(k), "unexpected header #{k}"
+  }
+  assert_eq res.trailer.get("Trailer-A"), "valuea"
+  assert_eq res.trailer.get("Trailer-C"), "valuec"
+  for k in ["Non-Trailer", "Trailer-B", "Trailer-NotDeclared"] {
+    assert !res.trailer.has?(k), "unexpected trailer #{k}"
+  }
+  assert_eq res.trailer.get("Trailer-D"), "with prefix"
+  # Header set without any write
+  rec = run(->(w: http.ResponseWriter, r: http.Request) { w.header.set!("X-Foo", "1") })
+  assert_eq rec.header_map.get("X-Foo"), "1"
+  assert_eq rec.result.header.get("X-Foo"), "1"
+  assert_eq rec.result.status, 200
+  assert_eq rec.result.status_text, "OK"
+  # HeaderMap vs final headers
+  rec = run(->(w: http.ResponseWriter, r: http.Request) {
+    h = w.header
+    h.set!("X-Foo", "1")
+    w.write_string!("hi").unwrap
+    h.set!("X-Foo", "2")
+    h.set!("X-Bar", "2")
+  })
+  assert_eq rec.header_map.get("X-Foo"), "2"
+  assert_eq rec.header_map.get("X-Bar"), "2"
+  assert_eq rec.result.header.get("X-Foo"), "1"
+  assert !rec.result.header.has?("X-Bar")
+  # setting Content-Length header
+  rec = run(->(w: http.ResponseWriter, r: http.Request) {
+    w.header.set!("Content-Length", "9")
+    w.write_string!("Some body").unwrap
+  })
+  assert_eq rec.code, 200
+  assert_eq rec.body_string, "Some body"
+  assert_eq rec.result.content_length, 9
+}
+
+def is_body_not_allowed(e: Error) -> Bool {
+  case e {
+    BodyNotAllowed => true
+    _ => false
+  }
+}
+
+test "body not allowed" {
+  rec = new_recorder
+  w = rec.writer
+  w.write_header!(204)
+  assert is_body_not_allowed(w.write!("hello ".bytes.to_a).err.unwrap)
+  assert is_body_not_allowed(w.write_string!("world").err.unwrap)
+  assert_eq rec.body_string, "hello world"
+}
+
+test "parse content length" {
+  assert_eq parse_content_length("3"), 3
+  assert_eq parse_content_length("+3"), -1
+  assert_eq parse_content_length("-3"), -1
+  assert_eq parse_content_length("9223372036854775807"), 9223372036854775807
+  assert_eq parse_content_length("9223372036854775808"), -1
+}
+
+def write_header_panics?(bad: Int) -> Bool {
+  t = spawn {
+    rec = new_recorder
+    w = rec.writer
+    w.write_header!(bad)
+  }
+  t.wait.err?
+}
+
+test "recorder panics on non-XXX status code" {
+  for bad in [-100, 0, 99, 1000, 20000] {
+    assert write_header_panics?(bad), "want a panic for #{bad}"
+  }
+}
+
+def hello(w: http.ResponseWriter, r: http.Request) -> Unit {
+  w.write_string!("hello").unwrap
+}
+
+test "server" {
+  ts = new_server_func(hello)
+  res = http.get(ts.url).unwrap
+  assert_eq res.body_string, "hello"
+  ts.close
+}
+
+test "server manual start" {
+  ts = new_unstarted_server_func(hello)
+  assert_eq ts.url, ""
+  ts.start
+  assert ts.url.start_with?("http://127.0.0.1:")
+  assert_eq http.get(ts.url).unwrap.body_string, "hello"
+  t = spawn { ts.start }
+  assert t.wait.err?, "a second start panics"
+  ts.close
+}
+
+test "get after close" {
+  ts = new_server_func(hello)
+  assert_eq http.get(ts.url).unwrap.body_string, "hello"
+  ts.close
+  assert http.get(ts.url).err?
+}
+
+test "server close blocking" {
+  ts = new_server_func(hello)
+  addr = "127.0.0.1:#{ts.listener.port}"
+  # one connection that sends nothing, one idle after a request
+  cnew = net.dial("tcp", addr).unwrap
+  cidle = net.dial("tcp", addr).unwrap
+  cidle.write_string!("HEAD / HTTP/1.1\r\nHost: foo\r\n\r\n").unwrap
+  http.read_response(bufio.new_reader(cidle), true).unwrap
+  ts.close
+  cnew.close!
+  cidle.close!
+}
+
+test "server close client connections" {
+  ask = Chan[Bool].new(1)
+  done = Chan[Bool].new(1)
+  # (a handler can't capture the server that holds it: another task closes
+  # the connections when the handler asks)
+  s = new_server_func(->(w: http.ResponseWriter, r: http.Request) {
+    ask << true
+    done.recv
+  })
+  closer = spawn {
+    ask.recv
+    s.close_client_connections
+    done << true
+  }
+  assert http.get(s.url).err?
+  closer.wait.unwrap
+  s.close
+}
+
+test "server client" {
+  ts = new_server_func(hello)
+  c = ts.client
+  assert_eq c.get(ts.url).unwrap.body_string, "hello"
+  ts.close
+}
+
+test "server with a mux and a closed unstarted server" {
+  mux = http.new_serve_mux
+  mux.handle_func("GET /items/{id}") { |w, r|
+    w.write_string!("item #{r.path_value("id")}").unwrap
+  }
+  ts = new_server(mux)
+  assert_eq http.get(ts.url + "/items/7").unwrap.body_string, "item 7"
+  assert_eq http.get(ts.url + "/nope").unwrap.status, 404
+  ts.close
+  ts.close
+  u = new_unstarted_server(mux)
+  u.close
+}
+
+test "recorder with a mux" {
+  mux = http.new_serve_mux
+  mux.handle_func("GET /items/{id}") { |w, r|
+    w.write_string!("item #{r.path_value("id")}").unwrap
+  }
+  rec = new_recorder
+  rec.serve_mux(mux, new_request("GET", "/items/9", []))
+  assert_eq rec.body_string, "item 9"
+  rec2 = new_recorder
+  rec2.serve_mux(mux, new_request("POST", "/items/9", []))
+  assert_eq rec2.code, 405
+}
+
+example "response recorder" {
+  handler = ->(w: http.ResponseWriter, r: http.Request) {
+    w.write_string!("<html><body>Hello World!</body></html>").unwrap
+  }
+  req = new_request("GET", "http://example.com/foo", [])
+  w = new_recorder
+  handler(w.writer, req)
+  resp = w.result
+  puts resp.status
+  puts resp.header.get("Content-Type")
+  puts resp.body_string
+} outputs "200\ntext/html; charset=utf-8\n<html><body>Hello World!</body></html>\n"
+
+example "server" {
+  ts = new_server_func(->(w: http.ResponseWriter, r: http.Request) {
+    w.write_string!("Hello, client\n").unwrap
+  })
+  res = http.get(ts.url).unwrap
+  print res.body_string
+  ts.close
+} outputs "Hello, client\n"

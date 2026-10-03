@@ -7,8 +7,11 @@ extern def alx_sleep_ns(ns: Int)
 struct Ctl {
   shutting: Bool
   listeners: [net.Listener]
-  # Connections waiting for their next request (shutdown closes them).
+  # Connections waiting for their first or next request (shutdown closes
+  # them).
   idle: Map[Int, net.Conn]
+  # Every open connection (close_client_connections closes them).
+  all: Map[Int, net.Conn]
 }
 
 # An HTTP/1.1 server: one task per connection, keep-alive, a handler per
@@ -74,10 +77,20 @@ pub struct Server {
     for cn in todo_c { cn.close! }
     wg.wait
   }
+
+  # Closes every open connection now, idle or busy (Go's httptest
+  # CloseClientConnections; a request in flight loses its connection).
+  pub def close_client_connections {
+    todo_c: [net.Conn] = []
+    ctl.lock { |c|
+      for _, cn in c.all { todo_c << cn }
+    }
+    for cn in todo_c { cn.close! }
+  }
 }
 
 def new_server_mux(mux: ServeMux) -> Server {
-  c = Ctl.new(shutting: false, listeners: [], idle: {})
+  c = Ctl.new(shutting: false, listeners: [], idle: {}, all: {})
   Server.new(mux: mux, ctl: Mutex.new(c), wg: sync.new_wait_group)
 }
 
@@ -170,6 +183,21 @@ def serve_conn(conn: net.Conn, srv: Server) {
   br = bufio.new_reader(conn)
   fd = conn.fd
   last_post = false
+  # A connection that hasn't sent its first request yet is idle too:
+  # shutdown closes it rather than waiting for it.
+  late = srv.ctl.lock { |c|
+    c.all[fd] = conn
+    if c.shutting {
+      true
+    } else {
+      c.idle[fd] = conn
+      false
+    }
+  }
+  if late {
+    srv.ctl.lock { |c| c.all.delete(fd) }
+    return
+  }
   loop {
     res = read_request_head(br, last_post)
     if e = res.err {
@@ -258,5 +286,9 @@ def serve_conn(conn: net.Conn, srv: Server) {
       break if stop
     }
   }
-  srv.ctl.lock { |c| c.idle.delete(fd) }
+  srv.ctl.lock { |c|
+    c.idle.delete(fd)
+    c.all.delete(fd)
+    nil
+  }
 }

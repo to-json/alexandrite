@@ -1,0 +1,245 @@
+# The chunked transfer coding (RFC 9112 7.1), after Go's
+# net/http/internal/chunked.go (re-exported by net/http/httputil).
+import "io"
+import "net/textproto"
+import "strconv"
+
+# The longest chunk-size line accepted, "\r\n" included (Go's maxLineLength
+# with bufio's 4096-byte buffer).
+MAX_CHUNK_LINE = 4096
+
+pub error ChunkedError {
+  # A chunk-size line longer than 4096 bytes (Go's ErrLineTooLong).
+  LineTooLong
+  # Malformed chunked data; Go's message.
+  Malformed(msg: Str)
+
+  def message -> Str {
+    case self {
+      LineTooLong => "header line too long"
+      Malformed(m) => m
+    }
+  }
+}
+
+struct ChunkedState[R] {
+  rd: textproto.Reader[R]
+  # Unread bytes in the current chunk.
+  n: Int
+  # The last chunk was read.
+  eof: Bool
+  # The error to report once the bytes before it are delivered.
+  err: Error?
+  # The "\r\n" after a chunk's data is still to be checked.
+  check_end: Bool
+  # Chunk overhead beyond the data (Go's malicious-sender check).
+  excess: Int
+}
+
+# Decodes a chunked body (Go's NewChunkedReader): read! returns the data, 0
+# after the last (zero-size) chunk; trailers after it are not consumed.
+# Copies share state.
+pub struct ChunkedReader[R] {
+  st: [ChunkedState[R]]
+
+  def begin_chunk! {
+    line_r = read_chunk_line(st[0].rd)
+    if e = line_r.err {
+      self.st[0].err = e
+      return
+    }
+    line = line_r.unwrap
+    self.st[0].excess = st[0].excess + line.size + 2
+    k = line.size
+    while k > 0 && (line[k - 1] == 32 || line[k - 1] == 9) {
+      k -= 1
+    }
+    j = 0
+    while j < k && line[j] != 59 {
+      j += 1
+    }
+    nr = parse_hex_uint(line[0...j])
+    if e = nr.err {
+      self.st[0].err = e
+      return
+    }
+    nu = nr.unwrap
+    # (alx sizes are Ints)
+    if nu > 9223372036854775807 {
+      self.st[0].err = ChunkedError.Malformed("http chunk length too large")
+      return
+    }
+    n = nu.as_i64
+    self.st[0].n = n
+    ex = st[0].excess - 16 - 2 * n
+    ex = 0 if ex < 0
+    self.st[0].excess = ex
+    if ex > 16 * 1024 {
+      self.st[0].err = ChunkedError.Malformed("chunked encoding contains too much non-data")
+      return
+    }
+    self.st[0].eof = true if n == 0
+  }
+
+  def header_available -> Bool {
+    rd = st[0].rd
+    k = rd.buffered
+    return false if k == 0
+    pk = rd.peek!(k)
+    return false if pk.err?
+    for c in pk.unwrap {
+      return true if c == 10
+    }
+    false
+  }
+
+  # Reads decoded body bytes into p; 0 at the end of the body.
+  pub def read!(p: [Byte]) -> ~Int {
+    b = p
+    n = 0
+    loop {
+      break if st[0].eof || st[0].err.present?
+      rd = st[0].rd
+      if st[0].check_end {
+        break if n > 0 && rd.buffered < 2
+        c1 = rd.read_byte!
+        c2 = c1.ok? && c1.unwrap.present? ? rd.read_byte! : c1
+        if e = c1.err {
+          self.st[0].err = e
+          break
+        }
+        if e = c2.err {
+          self.st[0].err = e
+          break
+        }
+        if !c1.unwrap.present? || !c2.unwrap.present? {
+          self.st[0].err = io.StreamError.UnexpectedEof
+          break
+        }
+        if c1.unwrap.unwrap != 13 || c2.unwrap.unwrap != 10 {
+          self.st[0].err = ChunkedError.Malformed("malformed chunked encoding")
+          break
+        }
+        self.st[0].check_end = false
+      }
+      if st[0].n == 0 {
+        break if n > 0 && !header_available
+        self.begin_chunk!
+        next
+      }
+      break if b.size == 0
+      k = b.size
+      k = st[0].n if k > st[0].n
+      r = rd.read!(b[0...k])
+      if e = r.err {
+        self.st[0].err = e
+        break
+      }
+      n0 = r.unwrap
+      if n0 == 0 {
+        self.st[0].err = io.StreamError.UnexpectedEof
+        break
+      }
+      n += n0
+      b = b[n0...b.size]
+      self.st[0].n = st[0].n - n0
+      self.st[0].check_end = true if st[0].n == 0
+    }
+    return n if n > 0
+    if e = st[0].err {
+      fail e
+    }
+    0
+  }
+}
+
+# A ChunkedReader over r.
+pub def new_chunked_reader[R: io.Reader](r: R) -> ChunkedReader[R] {
+  st: [ChunkedState[R]] = [ChunkedState.new(rd: textproto.new_reader(r), n: 0, eof: false, err: none, check_end: false, excess: 0)]
+  ChunkedReader.new(st: st)
+}
+
+# Reads a chunk-size line without its "\r\n" (Go's readChunkLine).
+def read_chunk_line[R](rd0: textproto.Reader[R]) -> ~[Byte] {
+  rd = rd0
+  line: [Byte] = []
+  loop {
+    c = ~rd.read_byte!
+    fail io.StreamError.UnexpectedEof unless c.present?
+    ch = c.unwrap
+    fail ChunkedError.LineTooLong if line.size >= MAX_CHUNK_LINE
+    break if ch == 10
+    line << ch
+  }
+  i = 0
+  while i < line.size && line[i] != 13 {
+    i += 1
+  }
+  fail ChunkedError.Malformed("chunked line ends with bare LF") if i == line.size
+  fail ChunkedError.Malformed("invalid CR in chunked line") if i != line.size - 1
+  line[0...line.size - 1]
+}
+
+def parse_hex_uint(v: [Byte]) -> ~U64 {
+  fail ChunkedError.Malformed("empty hex number for chunk length") if v.size == 0
+  n: U64 = 0
+  i = 0
+  while i < v.size {
+    c = v[i]
+    d = 0
+    if c >= 48 && c <= 57 {
+      d = c.to_i - 48
+    } else if c >= 97 && c <= 102 {
+      d = c.to_i - 87
+    } else if c >= 65 && c <= 70 {
+      d = c.to_i - 55
+    } else {
+      fail ChunkedError.Malformed("invalid byte in chunk length")
+    }
+    fail ChunkedError.Malformed("http chunk length too large") if i == 16
+    n = (n << 4) | d.as_u64
+    i += 1
+  }
+  n
+}
+
+struct ChunkedWriterState[W] {
+  wire: W
+}
+
+# Encodes writes as chunks (Go's NewChunkedWriter): each non-empty write! is
+# one chunk; close! writes the last chunk "0\r\n" (not the trailer's final
+# "\r\n", as in Go). Copies share state.
+pub struct ChunkedWriter[W] {
+  st: [ChunkedWriterState[W]]
+
+  def put!(p: [Byte]) -> ~Unit {
+    off = 0
+    while off < p.size {
+      k = self.st[0].wire.~write!(p[off...p.size])
+      fail io.StreamError.ShortWrite if k <= 0
+      off += k
+    }
+  }
+
+  pub def write!(data: [Byte]) -> ~Int {
+    return 0 if data.size == 0
+    self.~put!((strconv.format_int(data.size, 16) + "\r\n").bytes.to_a)
+    self.~put!(data)
+    self.~put!([13, 10])
+    data.size
+  }
+
+  pub def write_string!(s: Str) -> ~Int {
+    self.~write!(s.bytes.to_a)
+  }
+
+  pub def close! -> ~Unit {
+    self.~put!([48, 13, 10])
+  }
+}
+
+pub def new_chunked_writer[W: io.Writer](w: W) -> ChunkedWriter[W] {
+  st: [ChunkedWriterState[W]] = [ChunkedWriterState.new(wire: w)]
+  ChunkedWriter.new(st: st)
+}

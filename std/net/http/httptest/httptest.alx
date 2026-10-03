@@ -1,0 +1,259 @@
+# Package httptest: Go's net/http/httptest, utilities for HTTP testing.
+#
+#   req = httptest.new_request("GET", "http://example.com/foo", [])
+#   rec = httptest.new_recorder
+#   handler(rec.writer, req)                 # Go: handler(rec, req)
+#   resp = rec.result                        # status 200, the body, ...
+#
+#   ts = httptest.new_server_func { |w, r| w.write_string!("hello") }
+#   r = http.get(ts.url)                     # a real loopback server
+#   ts.close
+#
+#   Go                                     alx
+#   NewRequest(method, target, body)       new_request(method, target, body: [Byte]) -> http.Request
+#   NewRecorder() *ResponseRecorder        new_recorder -> ResponseRecorder
+#   rec.Code / HeaderMap / Body / Flushed  rec.code / header_map / body (body_string) / flushed?
+#   rec.Result() *http.Response            rec.result -> http.Response
+#   DefaultRemoteAddr                      DEFAULT_REMOTE_ADDR
+#   NewServer(handler)                     new_server(mux), new_server_func(f), new_server_handler(h)
+#   NewUnstartedServer(handler)            new_unstarted_server(mux) (also _func, _handler)
+#   (*Server).Start / Close / URL          start / close / url
+#   (*Server).Listener / Config / Client   listener / config / client
+#   (*Server).CloseClientConnections       close_client_connections
+#
+# Differences from Go:
+#  - Handlers take a concrete http.ResponseWriter (net/http's ResponseWriter
+#    is a struct, not an interface), so a ResponseRecorder can't be passed
+#    in its place: pass `rec.writer`, a ResponseWriter in MODE_RECORD whose
+#    state the recorder reads. `rec.serve(handler_fn, req)` and
+#    `rec.serve_mux(mux, req)` do it for you.
+#  - The recorder's fields are read through methods; Code can't be set (Go
+#    tests that assign Code, HeaderMap or Body = nil aren't translated).
+#  - new_request takes the body as bytes; content_length is its size (Go:
+#    known for bytes/strings readers, -1 otherwise). An invalid target panics,
+#    as in Go. A target "https://..." sets no TLS state (alx has no TLS).
+#  - TLS servers (NewTLSServer, StartTLS, Certificate, EnableHTTP2) and
+#    NewTestServer's in-memory network are not ported: net has no TLS and
+#    no fake network. Servers bind 127.0.0.1:0.
+#  - Close is http.Server.shutdown: stops accepting, closes idle and
+#    not-yet-active connections, waits for requests in flight. Go also
+#    clears the client's idle connections; alx's client has no pool.
+#  - Server.client is a plain http.Client (Go's has a Transport bound to
+#    the server).
+#
+# Not translated: the TLS / HTTP/2 / in-memory-network server tests,
+# TestCloseHijackedConnection (no hijacking), TestServerZeroValueClose (no
+# zero-value Server), the panic-propagation tests (testing.TB integration),
+# TestClientExampleCom (in-memory network), ExampleServer_hTTP2 and
+# ExampleNewTLSServer.
+
+import "net"
+import "net/http"
+import "net/textproto"
+import "strconv"
+import "strings"
+import nurl "net/url"
+
+# The remote address recorded for requests made by new_request's callers in
+# Go's recorder docs ("1.2.3.4").
+pub DEFAULT_REMOTE_ADDR = "1.2.3.4"
+
+# A server-side request for handler tests (Go's NewRequest): `target` is a
+# path ("/foo?x=1") or an absolute URL ("http://host/foo"); method "" means
+# GET. remote_addr is "192.0.2.1:1234", the host "example.com" unless the
+# target names one, the protocol HTTP/1.1. Panics on an invalid target.
+pub def new_request(method0: Str, target: Str, body: [Byte]) -> http.Request {
+  method = method0 == "" ? "GET" : method0
+  pr = nurl.parse_request_uri(target)
+  if pr.err? {
+    assert false, "invalid NewRequest arguments; #{pr.err.unwrap.message}"
+  }
+  u = pr.unwrap
+  host = u.host
+  host = "example.com" if host == ""
+  pv: Map[Str, Str] = {}
+  te: [Str] = []
+  http.Request.new(method: method, url: target, path: u.path, raw_query: u.raw_query, proto: "HTTP/1.1", host: host, header: http.new_header, body: body, remote_addr: "192.0.2.1:1234", pathvals: pv, request_uri: target, content_length: body.size, transfer_encoding: te, close: false, trailer: http.new_header)
+}
+
+# Header fields that may not be trailers (httpguts.ValidTrailerHeader).
+BAD_TRAILERS = ["Authorization", "Cache-Control", "Connection", "Content-Encoding", "Content-Length", "Content-Range", "Content-Type", "Expect", "Host", "Keep-Alive", "Max-Forwards", "Pragma", "Proxy-Authenticate", "Proxy-Authorization", "Proxy-Connection", "Range", "Realm", "Te", "Trailer", "Transfer-Encoding", "Www-Authenticate"]
+
+# The prefix of header keys that name undeclared trailers (Go's
+# http.TrailerPrefix).
+pub TRAILER_PREFIX = "Trailer:"
+
+# Records what a handler does with its ResponseWriter, for tests.
+pub struct ResponseRecorder {
+  # Pass this to the handler (Go passes the recorder itself).
+  writer: http.ResponseWriter
+
+  # The status the handler set; 200 if it set none (Go's Code).
+  pub def code -> Int {
+    s = writer.status
+    s == 0 ? 200 : s
+  }
+
+  # The header the handler is writing (Go's HeaderMap): changes after the
+  # status was set show up here but not in `result`.
+  pub def header_map -> http.Header { writer.header }
+
+  # The body written (Go's Body).
+  pub def body -> [Byte] { writer.recorded_body }
+
+  pub def body_string -> Str { Str.from_bytes(writer.recorded_body) }
+
+  # Whether the handler called flush! (Go's Flushed).
+  pub def flushed? -> Bool { writer.flushed? }
+
+  # Runs handler f on r with this recorder's writer.
+  pub def serve(f: (http.ResponseWriter, http.Request) -> Unit, r: http.Request) {
+    f(writer, r)
+  }
+
+  # Runs mux on r with this recorder's writer.
+  pub def serve_mux(mux: http.ServeMux, r: http.Request) {
+    mux.serve_http(writer, r)
+  }
+
+  # The response the handler produced (Go's Result): the status, the header
+  # as it was when the status was set, the body, Content-Length parsed from
+  # the header (-1 if absent or invalid) and the trailers: keys declared in
+  # "Trailer" and keys prefixed TRAILER_PREFIX, with the values the handler
+  # set by the end.
+  pub def result -> http.Response {
+    snap = writer.wrote_header? ? writer.recorded_header : writer.header.clone
+    trailer = http.new_header
+    live = writer.header
+    for decl in snap.values("Trailer") {
+      for k0 in strings.split(decl, ",") {
+        k = http.canonical_header_key(textproto.trim_string(k0))
+        next if BAD_TRAILERS.include?(k)
+        if vv = live.raw(k) {
+          c: [Str] = []
+          for v in vv { c << v }
+          trailer.set_raw!(k, c)
+        }
+      }
+    }
+    for k in live.keys {
+      next unless strings.has_prefix(k, TRAILER_PREFIX)
+      for v in live.raw(k) || [] {
+        trailer.add!(strings.trim_prefix(k, TRAILER_PREFIX), v)
+      }
+    }
+    te: [Str] = []
+    http.Response.new(status: code, status_text: http.status_text(code), proto: "HTTP/1.1", header: snap, body: body, content_length: parse_content_length(snap.get("Content-Length")), transfer_encoding: te, close: false, trailer: trailer, request_method: "")
+  }
+}
+
+pub def new_recorder -> ResponseRecorder {
+  ResponseRecorder.new(writer: http.new_recording_writer)
+}
+
+# A Content-Length value: its number, or -1 if it's absent or not a plain
+# decimal number in Int range ("+3" and "-3" are -1).
+def parse_content_length(cl0: Str) -> Int {
+  cl = textproto.trim_string(cl0)
+  return -1 if cl == ""
+  for c in cl.bytes {
+    return -1 if c < 48 || c > 57
+  }
+  n = strconv.parse_uint(cl, 10, 63)
+  return -1 if n.err?
+  n.unwrap.to_i
+}
+
+# ---------------------------------------------------------------- Server
+
+# An HTTP server listening on a loopback port, for end-to-end tests. A
+# handle: copies share it.
+pub struct Server {
+  # The listening socket (127.0.0.1, a port the system picked).
+  listener: net.Listener
+  # The http.Server serving it.
+  config: http.Server
+  # 0 not started, 1 serving, 2 closed.
+  state: Atomic[Int]
+
+  # "http://127.0.0.1:port" once started ("" before).
+  pub def url -> Str {
+    state.load == 0 ? "" : "http://127.0.0.1:#{listener.port}"
+  }
+
+  # Starts serving (new_unstarted_server). Panics if already started.
+  pub def start {
+    assert state.compare_and_swap(0, 1), "Server already started"
+    srv = config
+    ln = listener
+    spawn { srv.serve(ln) }
+    return
+  }
+
+  # Shuts the server down and waits for requests in flight to finish.
+  pub def close {
+    prev = state.swap(2)
+    return if prev == 2
+    if prev == 1 {
+      config.shutdown
+    } else {
+      # (an unstarted server's listener isn't known to config)
+      ln = listener
+      ln.close!
+    }
+  }
+
+  # Closes every client connection now (Go's CloseClientConnections).
+  pub def close_client_connections {
+    config.close_client_connections
+  }
+
+  # A client for this server.
+  pub def client -> http.Client { http.new_client }
+}
+
+def new_local_listener -> net.Listener {
+  r = net.listen("tcp", "127.0.0.1:0")
+  if r.err? {
+    assert false, "httptest: failed to listen on a port: #{r.err.unwrap.message}"
+  }
+  r.unwrap
+}
+
+def wrap(cfg: http.Server) -> Server {
+  Server.new(listener: new_local_listener, config: cfg, state: Atomic.new(0))
+}
+
+# A started server for the mux's routes.
+pub def new_server(mux: http.ServeMux) -> Server {
+  s = new_unstarted_server(mux)
+  s.start
+  s
+}
+
+# A started server answering every path with f.
+pub def new_server_func(f: (http.ResponseWriter, http.Request) -> Unit) -> Server {
+  s = new_unstarted_server_func(f)
+  s.start
+  s
+}
+
+# A started server for any http.Handler.
+pub def new_server_handler[H: http.Handler](h: H) -> Server {
+  s = wrap(http.new_server_handler(h))
+  s.start
+  s
+}
+
+# A server that isn't serving yet: change `config` if needed, then start.
+pub def new_unstarted_server(mux: http.ServeMux) -> Server {
+  wrap(http.new_server(mux))
+}
+
+pub def new_unstarted_server_func(f: (http.ResponseWriter, http.Request) -> Unit) -> Server {
+  wrap(http.new_server_func(f))
+}
+
+pub def new_unstarted_server_handler[H: http.Handler](h: H) -> Server {
+  wrap(http.new_server_handler(h))
+}

@@ -1,0 +1,314 @@
+# ReverseProxy, after Go's reverseproxy.go.
+#
+#   target = nurl.parse("http://127.0.0.1:9000/base").unwrap
+#   proxy = httputil.new_single_host_reverse_proxy(target)
+#   mux.handle("/", proxy)                   # a ReverseProxy is an http.Handler
+#
+# Differences from Go:
+#  - Director and Rewrite return the request they changed (alx passes
+#    structs by value): `director: (http.Request) -> http.Request`,
+#    `rewrite: (ProxyRequest) -> ProxyRequest`.
+#  - The transport is a function `(http.Request) -> ~http.Response`; the
+#    default sends with an http.Client that doesn't follow redirects.
+#  - alx's client reads the whole response before returning it, so the
+#    response isn't streamed: the proxy writes the body in one piece and,
+#    for a negative flush_interval, a "text/event-stream" response or one of
+#    unknown length, flushes it right away (the client then sees chunked
+#    coding). flush_interval > 0 behaves like 0.
+#  - Trailers aren't forwarded: alx's client drops a chunked body's
+#    trailer. 1xx responses aren't relayed.
+#  - Protocol upgrades (Connection: Upgrade, WebSockets) need connection
+#    hijacking, which alx's server doesn't have: such a request gets the
+#    error handler with "proxy: protocol upgrades are not supported".
+#  - The default error handler doesn't log (Go logs "http: proxy error: ...";
+#    ErrorLog isn't ported); set error_handler to see the error.
+#
+# Not translated (reverseproxy_test.go): the flush-interval timing tests,
+# cancellation, BufferPool and CopyBuffer error tests, the panic tests,
+# WebSocket / upgrade / hijack tests, 1xx tests and trailer checks (above),
+# cookie checks (no SetCookie in this net/http), TestReverseProxy's "hangup"
+# mode (hijacking; a dead backend port covers the 502).
+import "net"
+import "strings"
+import "net/http"
+import "net/textproto"
+import nurl "net/url"
+
+# Hop-by-hop headers, removed from what is forwarded (RFC 9110 7.6.1).
+HOP_HEADERS = ["Connection", "Proxy-Connection", "Keep-Alive", "Proxy-Authenticate", "Proxy-Authorization", "Te", "Trailer", "Transfer-Encoding", "Upgrade"]
+
+# A request being proxied, for ReverseProxy.rewrite (Go's ProxyRequest):
+# `incoming` is the request the proxy received (don't change it), `out` the
+# one it will send.
+pub struct ProxyRequest {
+  incoming: http.Request
+  out: http.Request
+
+  # Routes out to target: scheme and host from it, its path joined before
+  # out's, its query before out's; out.host becomes the target's (Go clears
+  # Out.Host so the URL's host is sent).
+  pub def set_url!(target: nurl.Url) {
+    o = out
+    o = rewrite_request_url(o, target)
+    o.host = target.host
+    self.out = o
+  }
+
+  # Sets X-Forwarded-For (the client's IP after any prior values),
+  # X-Forwarded-Host (the incoming Host) and X-Forwarded-Proto ("http").
+  pub def set_xforwarded! {
+    h = out.header
+    hp = net.split_host_port(incoming.remote_addr)
+    if hp.ok? {
+      ip, _ = hp.unwrap
+      prior = h.raw("X-Forwarded-For") || []
+      ip = strings.join(prior, ", ") + ", " + ip if prior.size > 0
+      h.set!("X-Forwarded-For", ip)
+    } else {
+      h.del!("X-Forwarded-For")
+    }
+    h.set!("X-Forwarded-Host", incoming.host)
+    h.set!("X-Forwarded-Proto", "http")
+  }
+}
+
+# An HTTP handler that sends each request to another server and relays the
+# response (Go's ReverseProxy). Set exactly one of director and rewrite.
+pub struct ReverseProxy {
+  # Changes the outgoing request (its URL must become absolute). After it the
+  # hop-by-hop headers are removed and X-Forwarded-For is appended to.
+  director: ((http.Request) -> http.Request)?
+  # Changes the outgoing request after the hop-by-hop headers and any
+  # Forwarded / X-Forwarded-* headers were removed.
+  rewrite: ((ProxyRequest) -> ProxyRequest)?
+  # Sends the request (default: an http.Client not following redirects).
+  transport: ((http.Request) -> ~http.Response)?
+  # Changes the backend's response; failing calls error_handler.
+  modify_response: ((http.Response) -> ~http.Response)?
+  # Answers when the backend can't be reached or modify_response fails
+  # (default: 502 Bad Gateway).
+  error_handler: ((http.ResponseWriter, http.Request, Error) -> Unit)?
+  # Nanoseconds between flushes while copying; negative: flush at once.
+  flush_interval: Int
+
+  def fail_with(rw: http.ResponseWriter, req: http.Request, e: Error) {
+    if h = error_handler {
+      h(rw, req, e)
+    } else {
+      w = rw
+      w.write_header!(502)
+    }
+  }
+
+  pub def serve_http(rw: http.ResponseWriter, req: http.Request) {
+    out = req
+    out.header = req.header.clone
+    out.header.del!("Host")
+    out.trailer = http.new_header
+    pv: Map[Str, Str] = {}
+    out.pathvals = pv
+    if director.present? == rewrite.present? {
+      fail_with(rw, req, Failure.Msg("ReverseProxy must have exactly one of Director or Rewrite set"))
+      return
+    }
+    if d = director {
+      out = d(out)
+    }
+    out.close = false
+    up = upgrade_type(out.header)
+    if up != "" {
+      fail_with(rw, req, Failure.Msg("proxy: protocol upgrades are not supported"))
+      return
+    }
+    remove_hop_by_hop_headers(out.header)
+    if values_contain_token?(req.header.values("Te"), "trailers") {
+      out.header.set!("Te", "trailers")
+    }
+    if rw_fn = rewrite {
+      for k in ["Forwarded", "X-Forwarded-For", "X-Forwarded-Host", "X-Forwarded-Proto"] {
+        out.header.del!(k)
+      }
+      out = with_query(out, clean_query_params(out.raw_query))
+      pr = rw_fn(ProxyRequest.new(incoming: req, out: out))
+      out = pr.out
+    } else {
+      hp = net.split_host_port(req.remote_addr)
+      if hp.ok? {
+        ip, _ = hp.unwrap
+        prior = out.header.raw("X-Forwarded-For")
+        # A key present with no values means "don't add it" (Go's nil).
+        omit = prior.present? && prior.unwrap.size == 0
+        pv2 = prior || []
+        ip = strings.join(pv2, ", ") + ", " + ip if pv2.size > 0
+        out.header.set!("X-Forwarded-For", ip) unless omit
+      }
+    }
+    out.header.set!("User-Agent", "") unless out.header.has?("User-Agent")
+    res_r = send(out)
+    if e = res_r.err {
+      fail_with(rw, out, e)
+      return
+    }
+    res = res_r.unwrap
+    remove_hop_by_hop_headers(res.header)
+    if m = modify_response {
+      mr = m(res)
+      if e = mr.err {
+        fail_with(rw, out, e)
+        return
+      }
+      res = mr.unwrap
+    }
+    w = rw
+    for k in res.header.keys {
+      for v in res.header.raw(k) || [] {
+        w.header.add!(k, v)
+      }
+    }
+    w.write_header!(res.status)
+    w.write!(res.body) if res.body.size > 0
+    w.flush! if flush_interval_for(res) < 0
+  }
+
+  def send(r: http.Request) -> ~http.Response {
+    if t = transport {
+      return ~t(r)
+    }
+    c = http.Client.new(max_redirects: 0)
+    c.~do(r)
+  }
+
+  def flush_interval_for(res: http.Response) -> Int {
+    ct = res.header.get("Content-Type")
+    base = strings.trim_space(strings.to_lower(strings.split(ct, ";")[0]))
+    return -1 if base == "text/event-stream"
+    return -1 if res.content_length == -1
+    flush_interval
+  }
+}
+
+# A proxy routing every request to target (Go's
+# NewSingleHostReverseProxy): scheme and host from target, target's path
+# joined before the request's, target's query before the request's. The
+# Host header is the incoming one (use rewrite + set_url! to send the
+# target's).
+pub def new_single_host_reverse_proxy(target: nurl.Url) -> ReverseProxy {
+  d = ->(r: http.Request) -> http.Request { rewrite_request_url(r, target) }
+  ReverseProxy.new(director: d, rewrite: none, transport: none, modify_response: none, error_handler: none, flush_interval: 0)
+}
+
+# out with its URL re-aimed at target (Go's rewriteRequestURL).
+pub def rewrite_request_url(r: http.Request, target: nurl.Url) -> http.Request {
+  out = r
+  pu = nurl.parse(r.url)
+  u = pu.unwrap_or(nurl.Url.new)
+  u.scheme = target.scheme
+  u.host = target.host
+  p, rp = join_url_path(target, u)
+  u.path = p
+  u.raw_path = rp
+  tq = target.raw_query
+  if tq == "" || u.raw_query == "" {
+    u.raw_query = tq + u.raw_query
+  } else {
+    u.raw_query = tq + "&" + u.raw_query
+  }
+  out.url = u.to_s
+  out.path = u.path
+  out.raw_query = u.raw_query
+  out
+}
+
+def with_query(r: http.Request, q: Str) -> http.Request {
+  out = r
+  return out if q == r.raw_query
+  pu = nurl.parse(r.url)
+  return out if pu.err?
+  u = pu.unwrap
+  u.raw_query = q
+  out.url = u.to_s
+  out.raw_query = q
+  out
+}
+
+# a + b with exactly one slash between them (Go's singleJoiningSlash).
+pub def single_joining_slash(a: Str, b: Str) -> Str {
+  aslash = strings.has_suffix(a, "/")
+  bslash = strings.has_prefix(b, "/")
+  return a + b[1...b.size] if aslash && bslash
+  return a + "/" + b if !aslash && !bslash
+  a + b
+}
+
+# The joined (path, raw_path) of two URLs (Go's joinURLPath).
+pub def join_url_path(a: nurl.Url, b: nurl.Url) -> (Str, Str) {
+  if a.raw_path == "" && b.raw_path == "" {
+    return (single_joining_slash(a.path, b.path), "")
+  }
+  apath = a.escaped_path
+  bpath = b.escaped_path
+  aslash = strings.has_suffix(apath, "/")
+  bslash = strings.has_prefix(bpath, "/")
+  if aslash && bslash {
+    return (a.path + b.path[1...b.path.size], apath + bpath[1...bpath.size])
+  }
+  if !aslash && !bslash {
+    return (a.path + "/" + b.path, apath + "/" + bpath)
+  }
+  (a.path + b.path, apath + bpath)
+}
+
+# Removes the hop-by-hop headers and those named in Connection.
+pub def remove_hop_by_hop_headers(h0: http.Header) {
+  h = h0
+  for f in h.raw("Connection") || [] {
+    for sf in strings.split(f, ",") {
+      s = textproto.trim_string(sf)
+      h.del!(s) if s != ""
+    }
+  }
+  for f in HOP_HEADERS {
+    h.del!(f)
+  }
+}
+
+def values_contain_token?(vs: [Str], token: Str) -> Bool {
+  for v in vs {
+    for part in strings.split(v, ",") {
+      return true if strings.equal_fold(textproto.trim_string(part), token)
+    }
+  }
+  false
+}
+
+def upgrade_type(h: http.Header) -> Str {
+  return "" unless values_contain_token?(h.raw("Connection") || [], "Upgrade")
+  h.get("Upgrade")
+}
+
+def hex?(c: Byte) -> Bool {
+  (c >= 48 && c <= 57) || (c >= 97 && c <= 102) || (c >= 65 && c <= 70)
+}
+
+# A query re-encoded when it has ";", a bad escape or over 10,000 parameters
+# (Go's cleanQueryParams: the backend then sees what the proxy parsed).
+pub def clean_query_params(s: Str) -> Str {
+  return reencode(s) if strings.count(s, "&") + 1 > 10000
+  i = 0
+  while i < s.size {
+    c = s[i]
+    return reencode(s) if c == 59
+    if c == 37 {
+      return reencode(s) if i + 2 >= s.size || !hex?(s[i + 1]) || !hex?(s[i + 2])
+      i += 3
+    } else {
+      i += 1
+    }
+  }
+  s
+}
+
+def reencode(s: Str) -> Str {
+  v, _ = nurl.parse_query_lax(s)
+  v.encode
+}

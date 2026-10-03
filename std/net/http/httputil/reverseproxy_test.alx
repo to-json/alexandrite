@@ -1,0 +1,399 @@
+# Go's reverseproxy_test.go, translated where it applies (see
+# reverseproxy.alx for what isn't). Backend handlers can't fail the test
+# from their task, so they report what they saw in response headers.
+import "net"
+import "strings"
+import "net/http"
+import "net/http/httptest"
+import nurl "net/url"
+
+FAKE_HOP_HEADER = "X-Fake-Hop-Header-For-Test"
+
+def must_url(s: Str) -> nurl.Url { nurl.parse(s).unwrap }
+
+def send(method: Str, url: Str, host: Str, pairs: [(Str, Str)]) -> http.Response {
+  r = http.new_request(method, url, []).unwrap
+  r.host = host if host != ""
+  for p in pairs {
+    r.header.add!(p[0], p[1])
+  }
+  c = http.Client.new(max_redirects: 0)
+  c.do(r).unwrap
+}
+
+def backend_main(w: http.ResponseWriter, r: http.Request) -> Unit {
+  w.header.set!("X-Saw-Te", r.header.get("Te"))
+  w.header.set!("X-Saw-Connection", strings.join(r.header.values("Connection"), "|"))
+  w.header.set!("X-Saw-Upgrade", r.header.get("Upgrade"))
+  w.header.set!("X-Saw-Proxy-Connection", r.header.get("Proxy-Connection"))
+  w.header.set!("X-Saw-Xff", r.header.get("X-Forwarded-For"))
+  w.header.set!("X-Saw-Host", r.host)
+  w.header.set!("X-Saw-Te-Encoding", strings.join(r.transfer_encoding, ","))
+  w.header.set!("Trailers", "not a special header field name")
+  w.header.set!("X-Foo", "bar")
+  w.header.add!("X-Multi-Value", "foo")
+  w.header.add!("X-Multi-Value", "bar")
+  w.write_header!(404)
+  w.write_string!("I am the backend").unwrap
+}
+
+test "reverse proxy" {
+  backend = httptest.new_server_func(backend_main)
+  proxy = new_single_host_reverse_proxy(must_url(backend.url))
+  frontend = httptest.new_server_handler(proxy)
+  res = send("GET", frontend.url, "some-name", [("Connection", "close, TE"), ("Te", "foo"), ("Te", "bar, trailers"), ("Proxy-Connection", "should be deleted"), ("Upgrade", "foo")])
+  assert_eq res.status, 404
+  assert_eq res.body_string, "I am the backend"
+  assert_eq res.header.get("X-Foo"), "bar"
+  assert_eq res.header.get("Trailers"), "not a special header field name"
+  assert_eq res.header.values("X-Multi-Value").size, 2
+  # what the backend saw
+  assert_eq res.header.get("X-Saw-Te"), "trailers"
+  assert_eq res.header.get("X-Saw-Upgrade"), ""
+  assert_eq res.header.get("X-Saw-Proxy-Connection"), ""
+  assert_eq res.header.get("X-Saw-Host"), "some-name"
+  assert_eq res.header.get("X-Saw-Xff"), "127.0.0.1"
+  assert_eq res.header.get("X-Saw-Te-Encoding"), ""
+  # alx's client always asks to close; the proxy doesn't forward that
+  assert_eq res.header.get("X-Saw-Connection"), "close"
+  frontend.close
+  backend.close
+}
+
+# The response-side halves of TestReverseProxy and the Connection-stripping
+# tests: alx's client always closes, and a closing server replaces the
+# backend's Connection header (as Go's does), so the backend's response is
+# made up by the transport here.
+test "hop-by-hop headers of the response are removed" {
+  proxy = new_single_host_reverse_proxy(must_url("http://backend.invalid"))
+  proxy.transport = ->(r: http.Request) -> ~http.Response {
+    h = http.new_header
+    h.set!("X-Foo", "bar")
+    h.set!(FAKE_HOP_HEADER, "foo")
+    h.add!("Connection", FAKE_HOP_HEADER)
+    h.add!("Connection", "Upgrade, X-Fake-Connection-Token")
+    h.add!("Connection", "")
+    h.add!("Connection", "X-Some-Conn-Header")
+    h.set!("X-Some-Conn-Header", "should be deleted")
+    h.set!("X-Fake-Connection-Token", "should be deleted")
+    h.set!("Upgrade", "foo")
+    h.set!("Trailers", "not a special header field name")
+    fail "unreachable" if r.method == ""
+    http.Response.new(status: 404, status_text: "Not Found", proto: "HTTP/1.1", header: h, body: "I am the backend".bytes.to_a, content_length: 16, transfer_encoding: [], close: false, trailer: http.new_header, request_method: r.method)
+  }
+  frontend = httptest.new_server_handler(proxy)
+  res = send("GET", frontend.url, "", [])
+  assert_eq res.status, 404
+  assert_eq res.body_string, "I am the backend"
+  assert_eq res.header.get("X-Foo"), "bar"
+  assert_eq res.header.get("Trailers"), "not a special header field name"
+  for k in [FAKE_HOP_HEADER, "X-Some-Conn-Header", "X-Fake-Connection-Token", "Upgrade"] {
+    assert_eq res.header.get(k), ""
+  }
+  # (read_response moves "Connection: close" to `close`, as Go does)
+  assert_eq res.header.get("Connection"), ""
+  assert res.close
+  frontend.close
+}
+
+test "reverse proxy to a dead backend gives 502" {
+  ln = net.listen("tcp", "127.0.0.1:0").unwrap
+  port = ln.port
+  ln.close!.unwrap
+  proxy = new_single_host_reverse_proxy(must_url("http://127.0.0.1:#{port}"))
+  frontend = httptest.new_server_handler(proxy)
+  res = send("GET", frontend.url + "/?mode=hangup", "", [])
+  assert_eq res.status, 502
+  frontend.close
+}
+
+test "reverse proxy strips headers present in Connection" {
+  backend = httptest.new_server_func(->(w: http.ResponseWriter, r: http.Request) {
+    w.header.set!("X-Saw", r.header.get("X-Fake-Connection-Token") + "|" + r.header.get("X-Some-Conn-Header"))
+    w.header.add!("Connection", "Upgrade, X-Fake-Connection-Token")
+    w.header.add!("Connection", "X-Some-Conn-Header")
+    w.header.set!("X-Some-Conn-Header", "should be deleted")
+    w.header.set!("X-Fake-Connection-Token", "should be deleted")
+    w.write_string!("I am the backend").unwrap
+  })
+  proxy = new_single_host_reverse_proxy(must_url(backend.url))
+  # the proxy mustn't change the incoming request's headers
+  frontend = httptest.new_server_func(->(w: http.ResponseWriter, r: http.Request) {
+    proxy.serve_http(w, r)
+    w.header.set!("X-In-After", r.header.get("X-Some-Conn-Header") + "|" + r.header.get("X-Fake-Connection-Token"))
+  })
+  res = send("GET", frontend.url, "", [("Connection", "Upgrade, X-Fake-Connection-Token"), ("Connection", "X-Some-Conn-Header"), ("X-Some-Conn-Header", "should be deleted"), ("X-Fake-Connection-Token", "should be deleted")])
+  assert_eq res.body_string, "I am the backend"
+  assert_eq res.header.get("X-Saw"), "|"
+  assert_eq res.header.get("X-In-After"), "should be deleted|should be deleted"
+  frontend.close
+  backend.close
+}
+
+test "reverse proxy strips empty connection" {
+  backend = httptest.new_server_func(->(w: http.ResponseWriter, r: http.Request) {
+    w.header.set!("X-Saw", r.header.get("X-Some-Conn-Header"))
+    w.header.add!("Connection", "")
+    w.header.add!("Connection", "X-Some-Conn-Header")
+    w.header.set!("X-Some-Conn-Header", "should be deleted")
+    w.write_string!("I am the backend").unwrap
+  })
+  proxy = new_single_host_reverse_proxy(must_url(backend.url))
+  frontend = httptest.new_server_handler(proxy)
+  res = send("GET", frontend.url, "", [("Connection", ""), ("Connection", "X-Some-Conn-Header"), ("X-Some-Conn-Header", "should be deleted")])
+  assert_eq res.body_string, "I am the backend"
+  assert_eq res.header.get("X-Saw"), ""
+  frontend.close
+  backend.close
+}
+
+def saw_xff(w: http.ResponseWriter, r: http.Request) -> Unit {
+  w.header.set!("X-Saw-Xff", r.header.get("X-Forwarded-For"))
+  w.header.set!("X-Saw-Forwarded", r.header.get("Forwarded") + "|" + r.header.get("X-Forwarded-Host") + "|" + r.header.get("X-Forwarded-Proto"))
+  w.header.set!("X-Saw-Host", r.host)
+  w.write_header!(404)
+  w.write_string!("I am the backend").unwrap
+}
+
+test "X-Forwarded-For" {
+  backend = httptest.new_server_func(saw_xff)
+  frontend = httptest.new_server_handler(new_single_host_reverse_proxy(must_url(backend.url)))
+  res = send("GET", frontend.url, "", [("X-Forwarded-For", "client ip")])
+  assert_eq res.status, 404
+  assert_eq res.body_string, "I am the backend"
+  assert_eq res.header.get("X-Saw-Xff"), "client ip, 127.0.0.1"
+  frontend.close
+  backend.close
+}
+
+test "X-Forwarded-For omitted when present without values" {
+  backend = httptest.new_server_func(saw_xff)
+  target = must_url(backend.url)
+  proxy = new_single_host_reverse_proxy(target)
+  # (Go wraps the old Director; a closure can't capture a closure of its own
+  # type in alx, so this one repeats it)
+  proxy.director = ->(r: http.Request) -> http.Request {
+    x = r
+    x.header.set_raw!("X-Forwarded-For", [])
+    rewrite_request_url(x, target)
+  }
+  frontend = httptest.new_server_handler(proxy)
+  res = send("GET", frontend.url, "some-name", [])
+  assert_eq res.header.get("X-Saw-Xff"), ""
+  frontend.close
+  backend.close
+}
+
+test "rewrite strips forwarded headers" {
+  backend = httptest.new_server_func(saw_xff)
+  target = must_url(backend.url)
+  proxy = ReverseProxy.new(director: none, rewrite: ->(pr: ProxyRequest) -> ProxyRequest {
+    p = pr
+    p.set_url!(target)
+    p
+    }, transport: none, modify_response: none, error_handler: none, flush_interval: 0)
+  frontend = httptest.new_server_handler(proxy)
+  res = send("GET", frontend.url, "some-name", [("Forwarded", "x"), ("X-Forwarded-For", "x"), ("X-Forwarded-Host", "x"), ("X-Forwarded-Proto", "x")])
+  assert_eq res.header.get("X-Saw-Xff"), ""
+  assert_eq res.header.get("X-Saw-Forwarded"), "||"
+  # set_url! sends the target's host
+  assert_eq res.header.get("X-Saw-Host"), target.host
+  frontend.close
+  backend.close
+}
+
+test "set X-Forwarded" {
+  backend = httptest.new_server_func(saw_xff)
+  target = must_url(backend.url)
+  proxy = ReverseProxy.new(director: none, rewrite: ->(pr: ProxyRequest) -> ProxyRequest {
+    p = pr
+    p.set_url!(target)
+    p.set_xforwarded!
+    p
+    }, transport: none, modify_response: none, error_handler: none, flush_interval: 0)
+  frontend = httptest.new_server_handler(proxy)
+  res = send("GET", frontend.url, "some-name", [("X-Forwarded-For", "old")])
+  assert_eq res.header.get("X-Saw-Xff"), "127.0.0.1"
+  assert_eq res.header.get("X-Saw-Forwarded"), "|some-name|http"
+  frontend.close
+  backend.close
+}
+
+test "reverse proxy query" {
+  backend = httptest.new_server_func(->(w: http.ResponseWriter, r: http.Request) {
+    w.header.set!("X-Got-Query", r.raw_query)
+    w.write_string!("hi").unwrap
+  })
+  tests = [("", "", ""), ("?sta=tic", "?us=er", "sta=tic&us=er"), ("", "?us=er", "us=er"), ("?sta=tic", "", "sta=tic")]
+  for t in tests {
+    frontend = httptest.new_server_handler(new_single_host_reverse_proxy(must_url(backend.url + t[0])))
+    res = send("GET", frontend.url + t[1], "", [])
+    assert_eq res.header.get("X-Got-Query"), t[2]
+    frontend.close
+  }
+  backend.close
+}
+
+test "nil body and post" {
+  backend = httptest.new_server_func(->(w: http.ResponseWriter, r: http.Request) {
+    w.header.set!("X-Len", "#{r.body.size}")
+    w.write_string!(r.body_string).unwrap
+  })
+  frontend = httptest.new_server_handler(new_single_host_reverse_proxy(must_url(backend.url)))
+  res = send("GET", frontend.url, "", [])
+  assert_eq res.header.get("X-Len"), "0"
+  body = strings.repeat("x", 100000)
+  r = http.post(frontend.url, "text/plain", body).unwrap
+  assert_eq r.status, 200
+  assert_eq r.body_string, body
+  frontend.close
+  backend.close
+}
+
+test "user agent header" {
+  backend = httptest.new_server_func(->(w: http.ResponseWriter, r: http.Request) {
+    w.header.set!("X-Ua", r.header.get("User-Agent"))
+    w.header.set!("X-Has-Ua", "#{r.header.has?("User-Agent")}")
+  })
+  frontend = httptest.new_server_handler(new_single_host_reverse_proxy(must_url(backend.url)))
+  res = send("GET", frontend.url, "", [("User-Agent", "explicit")])
+  assert_eq res.header.get("X-Ua"), "explicit"
+  r = http.new_request("GET", frontend.url, []).unwrap
+  r.header.set!("User-Agent", "")
+  res2 = http.Client.new(max_redirects: 0).do(r).unwrap
+  assert_eq res2.header.get("X-Has-Ua"), "false"
+  frontend.close
+  backend.close
+}
+
+test "modify response" {
+  backend = httptest.new_server_func(->(w: http.ResponseWriter, r: http.Request) {
+    w.header.add!("X-Hit-Mod", "#{r.path == "/mod"}")
+  })
+  base = new_single_host_reverse_proxy(must_url(backend.url))
+  proxy = base
+  proxy.modify_response = ->(resp: http.Response) -> ~http.Response {
+    fail "modify error" if resp.header.get("X-Hit-Mod") != "true"
+    resp
+  }
+  frontend = httptest.new_server_handler(proxy)
+  for t in [("/mod", 200), ("/schedule-error", 502)] {
+    res = send("GET", frontend.url + t[0], "", [])
+    assert_eq res.status, t[1]
+  }
+  frontend.close
+  backend.close
+}
+
+def error_handler_case(transport: (http.Request) -> ~http.Response, handler: ((http.ResponseWriter, http.Request, Error) -> Unit)?, want: Int) {
+  backend = httptest.new_server_func(->(w: http.ResponseWriter, r: http.Request) {
+    w.write_header!(418)
+  })
+  proxy = new_single_host_reverse_proxy(must_url(backend.url))
+  proxy.transport = transport
+  proxy.error_handler = handler
+  frontend = httptest.new_server_handler(proxy)
+  res = send("GET", frontend.url, "", [])
+  assert_eq res.status, want
+  frontend.close
+  backend.close
+}
+
+test "reverse proxy error handler" {
+  failing = ->(r: http.Request) -> ~http.Response {
+    fail "some error" if r.method != ""
+    c = http.Client.new(max_redirects: 0)
+    c.~do(r)
+  }
+  passing = ->(r: http.Request) -> ~http.Response {
+    c = http.Client.new(max_redirects: 0)
+    c.~do(r)
+  }
+  custom = ->(w: http.ResponseWriter, r: http.Request, e: Error) {
+    w.write_header!(e.message == "some error" ? 503 : 500)
+  }
+  # default ErrorHandler
+  error_handler_case(failing, none, 502)
+  # default ErrorHandler, no error
+  error_handler_case(passing, none, 418)
+  # custom ErrorHandler
+  error_handler_case(failing, custom, 503)
+  error_handler_case(passing, custom, 418)
+}
+
+test "single joining slash" {
+  for t in [("https://www.google.com/", "/favicon.ico", "https://www.google.com/favicon.ico"), ("https://www.google.com", "/favicon.ico", "https://www.google.com/favicon.ico"), ("https://www.google.com", "favicon.ico", "https://www.google.com/favicon.ico"), ("https://www.google.com", "", "https://www.google.com/"), ("", "favicon.ico", "/favicon.ico")] {
+    assert_eq single_joining_slash(t[0], t[1]), t[2]
+  }
+}
+
+test "join URL path" {
+  tests = [
+    ("", "", "/", ""),
+    ("/a", "b", "/a/b", ""),
+    ("/a/", "/b", "/a/b", ""),
+    ("/a/", "b", "/a/b", ""),
+    ("/a%2Fb", "c", "/a/b/c", "/a%2Fb/c"),
+    ("/a%2Fb/", "/c", "/a/b/c", "/a%2Fb/c"),
+    ("a", "/b%2Fc", "a/b/c", "a/b%2Fc"),
+    ("a%2Fb", "c%2Fd", "a/b/c/d", "a%2Fb/c%2Fd"),
+    ("/a/", "/b%2Fc", "/a/b/c", "/a/b%2Fc")
+  ]
+  for t in tests {
+    p, rp = join_url_path(must_url(t[0]), must_url(t[1]))
+    assert_eq p, t[2]
+    assert_eq rp, t[3]
+  }
+}
+
+test "set URL" {
+  backend = httptest.new_server_func(->(w: http.ResponseWriter, r: http.Request) {
+    w.write_string!(r.host).unwrap
+  })
+  target = must_url(backend.url)
+  proxy = ReverseProxy.new(director: none, rewrite: ->(pr: ProxyRequest) -> ProxyRequest {
+    p = pr
+    p.set_url!(target)
+    p
+    }, transport: none, modify_response: none, error_handler: none, flush_interval: 0)
+  frontend = httptest.new_server_handler(proxy)
+  res = send("GET", frontend.url, "", [])
+  assert_eq res.body_string, target.host
+  frontend.close
+  backend.close
+}
+
+test "director and rewrite both or neither" {
+  frontend = httptest.new_server_handler(ReverseProxy.new(director: none, rewrite: none, transport: none, modify_response: none, error_handler: none, flush_interval: 0))
+  assert_eq send("GET", frontend.url, "", []).status, 502
+  frontend.close
+}
+
+test "query parameter smuggling" {
+  backend = httptest.new_server_func(->(w: http.ResponseWriter, r: http.Request) {
+    w.header.set!("X-Q", r.raw_query)
+  })
+  target = must_url(backend.url)
+  rewrite = ReverseProxy.new(director: none, rewrite: ->(pr: ProxyRequest) -> ProxyRequest {
+    p = pr
+    p.set_url!(target)
+    p
+    }, transport: none, modify_response: none, error_handler: none, flush_interval: 0)
+  frontend = httptest.new_server_handler(rewrite)
+  res = send("GET", frontend.url + "/?a=1&a=2;b=3", "", [])
+  assert_eq res.header.get("X-Q"), "a=1"
+  frontend.close
+  # a director leaves the query as it was
+  frontend2 = httptest.new_server_handler(new_single_host_reverse_proxy(target))
+  res2 = send("GET", frontend2.url + "/?a=1&a=2;b=3", "", [])
+  assert_eq res2.header.get("X-Q"), "a=1&a=2;b=3"
+  frontend2.close
+  backend.close
+}
+
+test "clean query params" {
+  assert_eq clean_query_params("a=1&b=2"), "a=1&b=2"
+  assert_eq clean_query_params("a=%zz&b=2"), "b=2"
+  assert_eq clean_query_params("a=1;b=2"), ""
+  assert_eq clean_query_params("b=%41&a=1"), "b=%41&a=1"
+}

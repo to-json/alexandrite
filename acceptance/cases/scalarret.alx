@@ -1,0 +1,146 @@
+#![overflow(wrap)]
+# Found by the public-key crypto port: `return nil if c` in a def returning
+# nothing (C rejected `return 0;` in a void function), and values without
+# storage (a struct or tuple of U64s) built per call, which needn't mark and
+# reset a region in their def (field arithmetic returns them per operation).
+
+def f(x: Int) {
+  return nil if x > 1
+  puts "small #{x}"
+}
+
+f(0)
+f(5)
+
+struct E {
+  a: U64
+  b: U64
+
+  def plus(x: E) -> E { E.new(a: a + x.a, b: b + x.b) }
+}
+
+def mul(x: U64, y: U64) -> (U64, U64) { (x.__mulhi(y), x * y) }
+
+# Builds a storage-less value and a string in one def: the string still
+# lives in a region that is reset when the call returns.
+def mixed(e: E) -> E {
+  s = "#{e.a}-#{e.b}"
+  E.new(a: e.a + s.size.as_u64, b: e.b)
+}
+
+e = E.new(a: 1, b: 2)
+i = 0
+while i < 1000 {
+  e = e.plus(E.new(a: 3, b: 4))
+  hi, lo = mul(e.a, 0xFFFFFFFFFFFFFFFF)
+  e = E.new(a: e.a ^ hi, b: e.b + lo)
+  e = mixed(e)
+  i += 1
+}
+puts e.a
+puts e.b
+
+# `return ~f(x) if c` / `return nil if c` in a def returning ~Unit (the JIT
+# returned the Unit value as a result payload).
+error RErr {
+  Bad(n: Int)
+  Other
+
+  def message -> Str { "e" }
+}
+
+def inner(x: Int) -> ~Unit {
+  fail RErr.Bad(n: x) if x > 5
+  nil
+}
+
+def outer(x: Int) -> ~Unit {
+  return ~inner(x) if x == 1
+  ~inner(x + 10)
+}
+
+def outer2(x: Int) -> ~Unit {
+  return nil if x == 1
+  ~inner(x + 10)
+  nil
+}
+
+def check(n: Int) -> ~Unit<RErr> {
+  fail RErr.Bad(n: n) if n > 3
+}
+
+def run(n: Int) -> ~Unit<RErr> {
+  return ~check(n) if n == 1
+  fail RErr.Other if n == 2
+  ~check(n)
+}
+
+puts outer(1).ok?
+puts outer(2).ok?
+puts outer2(1).ok?
+puts outer2(2).ok?
+puts run(1).err?
+puts run(5).err?
+
+# A field named like a builtin (`p`) is the field when read bare.
+struct K {
+  p: Int
+
+  def same?(x: K) -> Bool { p == x.p }
+}
+
+puts K.new(p: 1).same?(K.new(p: 1))
+
+# An array literal whose first element is already an interface value (or
+# the def's last expression, with a declared [Iface] result) converts later
+# struct elements.
+interface IfI {
+  def f -> Int
+}
+
+struct AImpl {
+  def f -> Int { 1 }
+}
+
+struct BImpl {
+  def f -> Int { 2 }
+}
+
+def mk_a -> IfI { AImpl.new }
+
+def all -> [IfI] { [mk_a(), BImpl.new] }
+
+def all2 -> [IfI] { [AImpl.new, BImpl.new] }
+
+def all3 -> [IfI] {
+  xs: [IfI] = [mk_a(), BImpl.new]
+  xs
+}
+
+puts all().size
+puts all2().size
+puts all3().size
+
+# Later elements take the first element's integer type (issue #25).
+bs = [0xee.as_u8, 1, 1]
+puts bs[1] + 254
+ws = [0.as_u32, 1, 4000000000]
+puts ws[2] + ws[1]
+
+# case arms take the wanted type (a declaration's, a def's result): array
+# literals become [Byte] (found by crypto/rsa's hash prefixes).
+def prefix(h: Int) -> [Byte] {
+  case h {
+    1 => [0x30, 0x20, 0xff]
+    2 => [0x30, 0x31]
+    _ => []
+  }
+}
+
+xb: [Byte] = case 2 {
+  1 => [1, 2]
+  _ => [3]
+}
+puts prefix(1)
+puts prefix(2).size
+puts xb

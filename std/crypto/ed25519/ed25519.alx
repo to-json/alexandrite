@@ -1,0 +1,429 @@
+#![overflow(wrap)]
+# Package ed25519: Go's crypto/ed25519, the Ed25519 signature algorithm
+# (https://ed25519.cr.yp.to/), merged with crypto/internal/fips140/ed25519
+# (the algorithm; Go's structure is kept inside: InternalPrivateKey,
+# InternalPublicKey, sign_with_dom, verify_with_dom). The group arithmetic
+# is crypto/internal/fips140/edwards25519.
+#
+# The functions are also compatible with the "Ed25519" function defined in
+# RFC 8032. Unlike RFC 8032's formulation, the private key representation
+# includes a public key suffix to make multiple signing operations with the
+# same key more efficient. RFC 8032's private key is the "seed" here.
+#
+# Operations involving private keys use constant-time algorithms.
+#
+#   Go                                        alx
+#   PublicKeySize, PrivateKeySize,            PUBLIC_KEY_SIZE, PRIVATE_KEY_SIZE,
+#   SignatureSize, SeedSize                   SIGNATURE_SIZE, SEED_SIZE
+#   PublicKey ([]byte)                        PublicKey (a struct around the bytes)
+#   PublicKey(b) / []byte(pub)                PublicKey.new(b) / pub.bytes
+#   pub.Equal(x crypto.PublicKey) bool        pub.equal?(x: PublicKey) -> Bool
+#   PrivateKey ([]byte)                       PrivateKey (a struct around the bytes)
+#   PrivateKey(b) / []byte(priv)              PrivateKey.new(b) / priv.bytes
+#   priv.Public() crypto.PublicKey            priv.public -> crypto.PublicKey
+#   priv.Public().(PublicKey)                 priv.public_key -> PublicKey
+#   priv.Equal(x crypto.PrivateKey) bool      priv.equal?(x: PrivateKey) -> Bool
+#   priv.Seed() []byte                        priv.seed -> [Byte]
+#   priv.Sign(rand, message, opts)            priv.sign(rand, message, opts: crypto.SignerOpts) -> ~[Byte]
+#     with opts of type *Options              priv.sign_options(rand, message, opts: Options) -> ~[Byte]
+#   Options{Hash: h, Context: c}              Options.new(hash: h, context: c) (hash: crypto.Hash?)
+#   opts.HashFunc()                           opts.hash_func -> crypto.Hash?
+#   GenerateKey(rand) (PublicKey, PrivateKey, error)
+#                                             generate_key(rand: io.Reader) -> ~(PublicKey, PrivateKey)
+#   NewKeyFromSeed(seed) PrivateKey           new_key_from_seed(seed) -> PrivateKey
+#   Sign(priv, message) []byte                sign(priv, message) -> [Byte]
+#   Verify(pub, message, sig) bool            verify(pub, message, sig) -> Bool
+#   VerifyWithOptions(pub, m, sig, *Options)  verify_with_options(pub, m, sig, opts: Options) -> ~Unit<Ed25519Error>
+#
+# PrivateKey is a crypto.Signer (structurally). Errors are Ed25519Error
+# variants with Go's messages. Panics (bad key or seed lengths in sign,
+# verify and new_key_from_seed) have Go's messages too.
+#
+# Test hooks (Go's internal entry points that tests use; not Go API):
+#   new_internal_private_key_from_seed(seed) / new_internal_private_key(b)
+#   new_internal_public_key(b), sign_internal(k, msg),
+#   sign_ph(k, msg, ctx), sign_ctx(k, msg, ctx), verify_internal(k, msg, sig),
+#   verify_ph(k, msg, sig, ctx), verify_ctx(k, msg, sig, ctx),
+#   fips140_cast() (the FIPS 140 known-answer self-test, run by the tests).
+#
+# Differences from Go:
+#   - PublicKey and PrivateKey are structs holding the bytes, not named
+#     byte slices: Go's conversions are PublicKey.new(b) / .bytes.
+#   - generate_key honours its rand argument (Go's GODEBUG
+#     cryptocustomrand=1 behaviour): the seed is read from it, so the result
+#     equals new_key_from_seed of the first 32 bytes, as Go documents. Pass
+#     `rand.reader()` (crypto/rand) for Go's nil. Go's default path (DRBG
+#     plus FIPS pairwise consistency test) gives keys with the same
+#     distribution. randutil.MaybeReadByte is not involved (Go doesn't use
+#     it here either).
+#   - Sign ignores rand, as in Go. The crypto.Signer method `sign` can't
+#     look inside its crypto.SignerOpts for an *Options (no type
+#     assertions): it signs with an empty context (Ed25519, or Ed25519ph
+#     when opts.hash_func is crypto.SHA512); sign_options takes the Options
+#     with its context (Ed25519ctx / Ed25519ph with context).
+#   - equal? takes the same key type (no crypto.PublicKey `any` argument
+#     and type assertion): comparing with another type is a compile error
+#     instead of false.
+#   - No expanded-key cache (Go's privateKeyCache keyed by the slice's
+#     address; alx has no mutable package state): each sign re-derives the
+#     scalar and prefix from the seed (one SHA-512 of 32 bytes).
+#   - No FIPS 140 module: no service indicator, no self-test before the
+#     first use (fips140_cast is the same check, exercised by the tests),
+#     no pairwise consistency test at key generation, and Ed25519ctx is
+#     always allowed (no FIPS 140-only mode).
+#
+# Timing: as crypto/internal/fips140/edwards25519 (constant-time scalar
+# base multiplication and scalar arithmetic; verification is variable time
+# on public inputs). Key comparisons use crypto/subtle.
+
+import "io"
+import "crypto"
+import "crypto/sha512"
+import "crypto/subtle"
+import "crypto/internal/fips140/edwards25519"
+
+# The size, in bytes, of public keys as used in this package.
+pub PUBLIC_KEY_SIZE = 32
+# The size, in bytes, of private keys as used in this package.
+pub PRIVATE_KEY_SIZE = 64
+# The size, in bytes, of signatures generated and verified by this package.
+pub SIGNATURE_SIZE = 64
+# The size, in bytes, of private key seeds. These are the private key
+# representations used by RFC 8032.
+pub SEED_SIZE = 32
+
+SHA512_SIZE = 64
+
+# Errors of signing and verifying.
+pub error Ed25519Error {
+  BadSeedLength(n: Int)
+  BadPrivateKeyLength(n: Int)
+  BadPublicKeyLength(n: Int)
+  BadPublicKey
+  BadPhMessageHashLength(n: Int)
+  BadPhContextLength(n: Int)
+  BadCtxContextLength(n: Int)
+  BadSignatureLength(n: Int)
+  InvalidSignature
+  SignOptsHash
+  VerifyOptsHash
+
+  def message -> Str {
+    case self {
+      BadSeedLength(n) => "ed25519: bad seed length: #{n}"
+      BadPrivateKeyLength(n) => "ed25519: bad private key length: #{n}"
+      BadPublicKeyLength(n) => "ed25519: bad public key length: #{n}"
+      BadPublicKey => "ed25519: bad public key"
+      BadPhMessageHashLength(n) => "ed25519: bad Ed25519ph message hash length: #{n}"
+      BadPhContextLength(n) => "ed25519: bad Ed25519ph context length: #{n}"
+      BadCtxContextLength(n) => "ed25519: bad Ed25519ctx context length: #{n}"
+      BadSignatureLength(n) => "ed25519: bad signature length: #{n}"
+      InvalidSignature => "ed25519: invalid signature"
+      SignOptsHash => "ed25519: expected opts.HashFunc() zero (unhashed message, for standard Ed25519) or SHA-512 (for Ed25519ph)"
+      VerifyOptsHash => "ed25519: expected opts.Hash zero (unhashed message, for standard Ed25519) or SHA-512 (for Ed25519ph)"
+    }
+  }
+}
+
+# An Ed25519 public key (PUBLIC_KEY_SIZE bytes).
+pub struct PublicKey {
+  key: [Byte]
+
+  # The key's bytes.
+  pub def bytes -> [Byte] { key }
+
+  # Whether pub and x have the same value.
+  pub def equal?(x: PublicKey) -> Bool { subtle.constant_time_compare(key, x.key) == 1 }
+}
+
+# An Ed25519 private key (PRIVATE_KEY_SIZE bytes: the seed, then the public
+# key). A crypto.Signer.
+pub struct PrivateKey {
+  key: [Byte]
+
+  # The key's bytes.
+  pub def bytes -> [Byte] { key }
+
+  # The public key corresponding to priv (as a crypto.PublicKey).
+  pub def public -> crypto.PublicKey { public_key }
+
+  # The public key corresponding to priv.
+  pub def public_key -> PublicKey {
+    pk = [0.as_u8; PUBLIC_KEY_SIZE]
+    copy(pk, key[32...key.size])
+    PublicKey.new(pk)
+  }
+
+  # Whether priv and x have the same value.
+  pub def equal?(x: PrivateKey) -> Bool { subtle.constant_time_compare(key, x.key) == 1 }
+
+  # The private key seed corresponding to priv, for interoperability with
+  # RFC 8032 (whose private keys are seeds).
+  pub def seed -> [Byte] { key[0...SEED_SIZE] + [] }
+
+  # Signs message with priv; rand is ignored. If opts.hash_func is
+  # crypto.SHA512, the pre-hashed variant Ed25519ph is used and message is
+  # expected to be a SHA-512 hash; otherwise opts.hash_func must be none
+  # and the message must not be hashed, as Ed25519 performs two passes over
+  # messages to be signed. The context is empty: see sign_options.
+  pub def sign(rand: io.Reader, message: [Byte], opts: crypto.SignerOpts) -> ~[Byte] {
+    ~sign_with(self, message, opts.hash_func, "")
+  }
+
+  # Signs message with priv as sign does, with the hash and the context of
+  # opts: a non-empty context selects Ed25519ctx (or is the Ed25519ph
+  # context). rand is ignored.
+  pub def sign_options(rand: io.Reader, message: [Byte], opts: Options) -> ~[Byte] {
+    ~sign_with(self, message, opts.hash, opts.context)
+  }
+}
+
+def sign_with(priv: PrivateKey, message: [Byte], hash: crypto.Hash?, context: Str) -> ~[Byte]<Ed25519Error> {
+  k = ~new_internal_private_key(priv.key)
+  return ~sign_ph(k, message, context) if hash == crypto.SHA512 # Ed25519ph
+  fail Ed25519Error.SignOptsHash if hash != none
+  return ~sign_ctx(k, message, context) if context != "" # Ed25519ctx
+  sign_internal(k, message)                              # Ed25519
+}
+
+# Selects Ed25519 variants for sign_options and verify_with_options.
+pub struct Options {
+  # none for regular Ed25519, or crypto.SHA512 for Ed25519ph.
+  hash: crypto.Hash?
+  # If not empty, selects Ed25519ctx or provides the context string for
+  # Ed25519ph. It can be at most 255 bytes in length.
+  context: Str
+
+  # The hash (a crypto.SignerOpts).
+  pub def hash_func -> crypto.Hash? { hash }
+}
+
+# A public/private key pair using entropy from random: the first SEED_SIZE
+# bytes read from it are the seed, as new_key_from_seed. Pass
+# `rand.reader()` (crypto/rand) for a secure source (Go's nil).
+pub def generate_key(random: io.Reader) -> ~(PublicKey, PrivateKey) {
+  seed = [0.as_u8; SEED_SIZE]
+  ~io.read_exact(random, seed)
+  private_key = new_key_from_seed(seed)
+  (private_key.public_key, private_key)
+}
+
+# The private key for a seed. Panics if seed is not SEED_SIZE bytes. For
+# interoperability with RFC 8032, whose private keys are seeds.
+pub def new_key_from_seed(seed: [Byte]) -> PrivateKey {
+  r = new_internal_private_key_from_seed(seed)
+  # new_internal_private_key_from_seed fails only if the seed length is
+  # incorrect.
+  panic("ed25519: bad seed length: #{seed.size}") if r.err?
+  PrivateKey.new(r.unwrap.bytes)
+}
+
+# The signature of message by private_key. Panics if private_key is not
+# PRIVATE_KEY_SIZE bytes.
+pub def sign(private_key: PrivateKey, message: [Byte]) -> [Byte] {
+  r = new_internal_private_key(private_key.key)
+  if e = r.err {
+    panic("ed25519: bad private key: #{e.message}")
+  }
+  sign_internal(r.unwrap, message)
+}
+
+# Whether sig is a valid signature of message by public_key. Panics if
+# public_key is not PUBLIC_KEY_SIZE bytes.
+#
+# The inputs are not considered confidential, and may leak through timing
+# side channels, or if an attacker has control of part of the inputs.
+pub def verify(public_key: PublicKey, message: [Byte], sig: [Byte]) -> Bool {
+  !verify_with_options(public_key, message, sig, Options.new).err?
+}
+
+# Succeeds if sig is a valid signature of message by public_key. Panics if
+# public_key is not PUBLIC_KEY_SIZE bytes.
+#
+# If opts.hash is crypto.SHA512, the pre-hashed variant Ed25519ph is used
+# and message is expected to be a SHA-512 hash; otherwise opts.hash must be
+# none and the message must not be hashed, as Ed25519 performs two passes
+# over messages to be signed.
+#
+# The inputs are not considered confidential, and may leak through timing
+# side channels, or if an attacker has control of part of the inputs.
+pub def verify_with_options(public_key: PublicKey, message: [Byte], sig: [Byte], opts: Options) -> ~Unit<Ed25519Error> {
+  l = public_key.key.size
+  panic("ed25519: bad public key length: #{l}") if l != PUBLIC_KEY_SIZE
+  k = ~new_internal_public_key(public_key.key)
+  return ~verify_ph(k, message, sig, opts.context) if opts.hash == crypto.SHA512 # Ed25519ph
+  fail Ed25519Error.VerifyOptsHash if opts.hash != none
+  return ~verify_ctx(k, message, sig, opts.context) if opts.context != "" # Ed25519ctx
+  ~verify_internal(k, message, sig)                                       # Ed25519
+}
+
+# ---- crypto/internal/fips140/ed25519 ----
+#
+# See https://blog.mozilla.org/warner/2011/11/29/ed25519-keys/ for the
+# components of the keys and the moving parts of the algorithm.
+
+# An expanded private key (Go's internal ed25519.PrivateKey).
+pub struct InternalPrivateKey {
+  seed: [Byte]
+  pub_key: [Byte]
+  s: edwards25519.Scalar
+  prefix: [Byte]
+
+  # The seed followed by the public key.
+  pub def bytes -> [Byte] { seed + pub_key }
+
+  # The public key bytes.
+  pub def public_key -> [Byte] { pub_key + [] }
+}
+
+# A decoded public key (Go's internal ed25519.PublicKey).
+pub struct InternalPublicKey {
+  a: edwards25519.Point
+  a_bytes: [Byte]
+
+  # The encoding.
+  pub def bytes -> [Byte] { a_bytes + [] }
+}
+
+def sha512_of(parts: [[Byte]]) -> [Byte] {
+  h = sha512.new()
+  for p in parts {
+    h.write!(p)
+  }
+  h.sum([])
+}
+
+# The expanded key for a seed (Go's NewPrivateKeyFromSeed).
+pub def new_internal_private_key_from_seed(seed: [Byte]) -> ~InternalPrivateKey<Ed25519Error> {
+  fail Ed25519Error.BadSeedLength(n: seed.size) if seed.size != SEED_SIZE
+  h = sha512_of([seed])
+  s = edwards25519.Scalar.set_bytes_with_clamping(h[0...32]).unwrap
+  aa = edwards25519.scalar_base_mult(s)
+  InternalPrivateKey.new(seed: seed + [], pub_key: aa.bytes, s: s, prefix: h[32...64])
+}
+
+# The expanded key for a 64-byte private key (Go's NewPrivateKey).
+pub def new_internal_private_key(priv: [Byte]) -> ~InternalPrivateKey<Ed25519Error> {
+  fail Ed25519Error.BadPrivateKeyLength(n: priv.size) if priv.size != PRIVATE_KEY_SIZE
+  seed = priv[0...32] + []
+  h = sha512_of([seed])
+  s = edwards25519.Scalar.set_bytes_with_clamping(h[0...32]).unwrap
+  # The public key point is not decompressed here, because it takes > 20%
+  # of the time of a signature generation. Signing doesn't use it as a
+  # point anyway.
+  InternalPrivateKey.new(seed: seed, pub_key: priv[32...64] + [], s: s, prefix: h[32...64])
+}
+
+# The decoded public key (Go's NewPublicKey).
+pub def new_internal_public_key(pub_bytes: [Byte]) -> ~InternalPublicKey<Ed25519Error> {
+  fail Ed25519Error.BadPublicKeyLength(n: pub_bytes.size) if pub_bytes.size != PUBLIC_KEY_SIZE
+  # set_bytes checks that the point is on the curve.
+  r = edwards25519.Point.set_bytes(pub_bytes)
+  fail Ed25519Error.BadPublicKey if r.err?
+  InternalPublicKey.new(a: r.unwrap, a_bytes: pub_bytes + [])
+}
+
+# Domain separation prefixes used to disambiguate
+# Ed25519/Ed25519ph/Ed25519ctx. See RFC 8032, Section 2 and Section 5.1.
+# Pure Ed25519 has none; Ed25519ph's is dom2(phflag=1) and Ed25519ctx's
+# dom2(phflag=0), each followed by the uint8-length prefixed context.
+DOM_PURE = 0
+DOM_PH = 1
+DOM_CTX = 2
+
+def dom_prefix(dom: Int, context: Str) -> [Byte] {
+  return [] if dom == DOM_PURE
+  out = "SigEd25519 no Ed25519 collisions".bytes
+  out << (dom == DOM_PH ? 1 : 0).as_u8
+  out << context.size.as_u8
+  out + context.bytes
+}
+
+# The Ed25519 signature of message (Go's internal Sign).
+pub def sign_internal(priv: InternalPrivateKey, message: [Byte]) -> [Byte] {
+  sign_with_dom(priv, message, DOM_PURE, "")
+}
+
+# The Ed25519ph signature of a SHA-512 message hash (Go's SignPH).
+pub def sign_ph(priv: InternalPrivateKey, message: [Byte], context: Str) -> ~[Byte]<Ed25519Error> {
+  fail Ed25519Error.BadPhMessageHashLength(n: message.size) if message.size != SHA512_SIZE
+  fail Ed25519Error.BadPhContextLength(n: context.size) if context.size > 255
+  sign_with_dom(priv, message, DOM_PH, context)
+}
+
+# The Ed25519ctx signature of message (Go's SignCtx). Per RFC 8032,
+# Section 5.1, the context SHOULD NOT be empty.
+pub def sign_ctx(priv: InternalPrivateKey, message: [Byte], context: Str) -> ~[Byte]<Ed25519Error> {
+  fail Ed25519Error.BadCtxContextLength(n: context.size) if context.size > 255
+  sign_with_dom(priv, message, DOM_CTX, context)
+}
+
+def sign_with_dom(priv: InternalPrivateKey, message: [Byte], dom: Int, context: Str) -> [Byte] {
+  prefix = dom_prefix(dom, context)
+  message_digest = sha512_of([prefix, priv.prefix, message])
+  r = edwards25519.Scalar.set_uniform_bytes(message_digest).unwrap
+
+  rr = edwards25519.scalar_base_mult(r).bytes
+
+  hram_digest = sha512_of([prefix, rr, priv.pub_key, message])
+  k = edwards25519.Scalar.set_uniform_bytes(hram_digest).unwrap
+
+  s = k.multiply_add(priv.s, r)
+
+  rr + s.bytes
+}
+
+# Succeeds if sig is a valid Ed25519 signature (Go's internal Verify).
+pub def verify_internal(pub_key: InternalPublicKey, message: [Byte], sig: [Byte]) -> ~Unit<Ed25519Error> {
+  ~verify_with_dom(pub_key, message, sig, DOM_PURE, "")
+}
+
+# Succeeds if sig is a valid Ed25519ph signature of a SHA-512 message hash
+# (Go's VerifyPH).
+pub def verify_ph(pub_key: InternalPublicKey, message: [Byte], sig: [Byte], context: Str) -> ~Unit<Ed25519Error> {
+  fail Ed25519Error.BadPhMessageHashLength(n: message.size) if message.size != SHA512_SIZE
+  fail Ed25519Error.BadPhContextLength(n: context.size) if context.size > 255
+  ~verify_with_dom(pub_key, message, sig, DOM_PH, context)
+}
+
+# Succeeds if sig is a valid Ed25519ctx signature (Go's VerifyCtx).
+pub def verify_ctx(pub_key: InternalPublicKey, message: [Byte], sig: [Byte], context: Str) -> ~Unit<Ed25519Error> {
+  fail Ed25519Error.BadCtxContextLength(n: context.size) if context.size > 255
+  ~verify_with_dom(pub_key, message, sig, DOM_CTX, context)
+}
+
+def verify_with_dom(pub_key: InternalPublicKey, message: [Byte], sig: [Byte], dom: Int, context: Str) -> ~Unit<Ed25519Error> {
+  fail Ed25519Error.BadSignatureLength(n: sig.size) if sig.size != SIGNATURE_SIZE
+  fail Ed25519Error.InvalidSignature if sig[63] & 224 != 0
+
+  hram_digest = sha512_of([dom_prefix(dom, context), sig[0...32], pub_key.a_bytes, message])
+  k = edwards25519.Scalar.set_uniform_bytes(hram_digest).unwrap
+
+  sr = edwards25519.Scalar.set_canonical_bytes(sig[32...64])
+  fail Ed25519Error.InvalidSignature if sr.err?
+
+  # [S]B = R + [k]A --> [k](-A) + [S]B = R
+  minus_a = pub_key.a.negate
+  rr = edwards25519.var_time_double_scalar_base_mult(k, minus_a, sr.unwrap)
+
+  fail Ed25519Error.InvalidSignature if sig[0...32] != rr.bytes
+}
+
+# The FIPS 140 known-answer self-test (Go's fipsSelfTest CAST "Ed25519 sign
+# and verify"): true if signing and verifying a fixed message with a fixed
+# seed give the expected signature.
+pub def fips140_cast -> Bool {
+  seed: [Byte] = [0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10, 0x11, 0x12,
+    0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f, 0x20]
+  msg = "CAST".bytes
+  want: [Byte] = [0xbd, 0xe7, 0xa5, 0xf3, 0x40, 0x73, 0xb9, 0x5a, 0x2e, 0x6d, 0x63, 0x20, 0x0a, 0xd5, 0x92, 0x9b, 0xa2, 0x3d,
+    0x00, 0x44, 0xb4, 0xc5, 0xfd, 0x62, 0x1d, 0x5e, 0x33, 0x2f, 0xe4, 0x61, 0x42, 0x31, 0x5b, 0x10, 0x53, 0x13, 0x4d, 0xcb,
+    0xd1, 0x1b, 0x2a, 0xf6, 0xcd, 0x0e, 0xdb, 0x9a, 0xd3, 0x1e, 0x35, 0xdb, 0x0b, 0xcf, 0x58, 0x90, 0x4f, 0xd7, 0x69, 0x38,
+    0xed, 0x30, 0x51, 0x0f, 0xaa, 0x03]
+  k = new_internal_private_key_from_seed(seed).unwrap
+  pub_key = new_internal_public_key(k.public_key)
+  return false if pub_key.err?
+  sig = sign_internal(k, msg)
+  return false if sig != want
+  !verify_internal(pub_key.unwrap, msg, sig).err?
+}

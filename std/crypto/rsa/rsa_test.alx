@@ -1,0 +1,378 @@
+# Go's rsa_test.go. Where Go's tests set GODEBUG=rsa1024min=0 they call
+# the private *_g variants with min1024 = false (alx has no GODEBUG).
+# Go's key generation loops over every size from 32 to 560 bits (in
+# parallel); here a sample of sizes runs. x509 marshalling round trips
+# (MarshalPKCS8PrivateKey, ParsePKIXPublicKey) are left out: no
+# crypto/x509 yet. AllocsPerRun (TestAllocations) has no equivalent.
+
+import "crypto"
+import "crypto/sha256"
+import "crypto/sha512"
+import "math/big"
+
+test "KeyGeneration" {
+  for size in [128, 512, 1024, 2048] {
+    if size < 1024 {
+      assert generate_key(crand(), size).err?, "GenerateKey(#{size}) succeeded without GODEBUG"
+    }
+    priv = generate_key_g(crand(), size, false).unwrap
+    assert_eq priv.n.bit_len, size
+    key_basics(priv, false)
+  }
+}
+
+test "3PrimeKeyGeneration" {
+  priv = generate_multi_prime_key_g(crand(), 3, 256, false).unwrap
+  key_basics(priv, false)
+  priv = generate_multi_prime_key(crand(), 3, 1024).unwrap
+  key_basics(priv, true)
+}
+
+test "4PrimeKeyGeneration" {
+  priv = generate_multi_prime_key_g(crand(), 4, 256, false).unwrap
+  key_basics(priv, false)
+}
+
+test "NPrimeKeyGeneration" {
+  # Go: prime sizes of 64 bits and n up to 23 (16 / 16 in short mode).
+  prime_size = 16
+  for n in 5...16 {
+    r = generate_multi_prime_key_g(crand(), n, 64 + n * prime_size, false)
+    assert r.ok?, "failed to generate #{n}-prime key"
+    key_basics(r.unwrap, false)
+  }
+}
+
+test "ImpossibleKeyGeneration" {
+  # Generating or validating toy keys doesn't loop forever or panic.
+  for i in 0...32 {
+    _ = generate_key_g(crand(), i, false)
+    _ = generate_multi_prime_key_g(crand(), 3, i, false)
+    _ = generate_multi_prime_key_g(crand(), 4, i, false)
+    _ = generate_multi_prime_key_g(crand(), 5, i, false)
+  }
+}
+
+test "TinyKeyGeneration" {
+  # Go runs 10000 (outside short mode).
+  for _i in 0...300 {
+    k = generate_key_g(crand(), 32, false).unwrap
+    assert k.validate.ok?, "Validate(32): #{err_text(k.validate)}"
+  }
+}
+
+test "GnuTLSKey" {
+  # A key from `certtool --generate-privkey --bits 128`: de != 1 mod
+  # phi(n), but = 1 mod the order of the group.
+  key_basics(test_gnutls_key(), false)
+}
+
+# Go's testKeyBasics.
+def key_basics(priv: PrivateKey, min1024: Bool) {
+  v = priv.validate
+  assert v.ok?, "Validate() failed: #{err_text(v)}"
+  assert priv.d.cmp(priv.n) <= 0, "private exponent too large"
+  msg = "hi!".bytes
+  enc = encrypt_pkcs1v15_g(crand(), priv.public_key, msg, min1024)
+  assert enc.ok?, "EncryptPKCS1v15: #{err_text(enc)}"
+  dec = decrypt_pkcs1v15_g(nil_reader(), priv, enc.unwrap, min1024)
+  assert dec.ok?, "DecryptPKCS1v15: #{err_text(dec)}"
+  assert_eq dec.unwrap, msg
+}
+
+test "Everything" {
+  # Go's short mode: the real sizes.
+  everything(test1024_key(), true)
+  everything(test2048_key(), true)
+  # Go generates every size from 32 to 560 bits.
+  for size in [32, 33, 47, 64, 100, 127, 128, 200, 255, 256, 257, 300, 384, 400, 450, 511, 512, 513, 520, 559, 560] {
+    priv = generate_key_g(crand(), size, false).unwrap
+    assert_eq priv.n.bit_len, size
+    everything(priv, false)
+  }
+}
+
+def is_too_long[T](r: ~T) -> Bool { err_text(r) == "crypto/rsa: message too long for RSA key size" }
+
+# Go's testEverything.
+def everything(priv: PrivateKey, min1024: Bool) {
+  validate_err = priv.validate
+  assert validate_err.ok? || priv.primes.size < 2, "Validate() failed: #{err_text(validate_err)}"
+
+  msg = "test".bytes
+  enc = encrypt_pkcs1v15_g(crand(), priv.public_key, msg, min1024)
+  assert enc.ok? || is_too_long(enc), "EncryptPKCS1v15: #{err_text(enc)}"
+  if c = enc.ok {
+    dec = decrypt_pkcs1v15_g(nil_reader(), priv, c, min1024)
+    assert dec.ok?, "DecryptPKCS1v15: #{err_text(dec)}"
+    sk = decrypt_pkcs1v15_session_key_g(nil_reader(), priv, c, [0.as_u8; 4], min1024)
+    assert sk.ok?, "DecryptPKCS1v15SessionKey: #{err_text(sk)}"
+    assert_eq dec.unwrap, msg
+  }
+
+  label = "label".bytes
+  enc = encrypt_oaep_g(sha256.new(), sha256.new(), crand(), priv.public_key, msg, label, min1024)
+  assert enc.ok? || is_too_long(enc), "EncryptOAEP: #{err_text(enc)}"
+  if c = enc.ok {
+    dec = decrypt_oaep_g(sha256.new(), sha256.new(), priv, c, label, min1024)
+    assert dec.ok?, "DecryptOAEP: #{err_text(dec)}"
+    assert_eq dec.unwrap, msg
+  }
+
+  hash_msg = "crypto/rsa: input must be hashed message"
+  assert_eq err_text(sign_pkcs1v15_g(nil_reader(), priv, crypto.SHA256, msg, min1024)), hash_msg
+
+  hash = sha256.sum256(msg).to_a
+  sr = sign_pkcs1v15_g(nil_reader(), priv, crypto.SHA256, hash, min1024)
+  assert sr.ok? || is_too_long(sr), "SignPKCS1v15: #{err_text(sr)}"
+  if sig = sr.ok {
+    r = verify_pkcs1v15_g(priv.public_key, crypto.SHA256, hash, sig, min1024)
+    assert r.ok?, "VerifyPKCS1v15: #{err_text(r)}"
+    sig[1] ^= 0x80
+    assert verify_pkcs1v15_g(priv.public_key, crypto.SHA256, hash, sig, min1024).err?, "VerifyPKCS1v15 success for tampered signature"
+    sig[1] ^= 0x80
+    hash[1] ^= 0x80
+    assert verify_pkcs1v15_g(priv.public_key, crypto.SHA256, hash, sig, min1024).err?, "VerifyPKCS1v15 success for tampered message"
+    hash[1] ^= 0x80
+  }
+
+  for sl in [PSS_SALT_LENGTH_AUTO, PSS_SALT_LENGTH_EQUALS_HASH] {
+    opts = PSSOptions.new(salt_length: sl, hash: none)
+    sr = sign_pss_g(crand(), priv, crypto.SHA256, hash, opts, min1024)
+    assert sr.ok? || is_too_long(sr), "SignPSS: #{err_text(sr)}"
+    if sig = sr.ok {
+      r = verify_pss_g(priv.public_key, crypto.SHA256, hash, sig, opts, min1024)
+      assert r.ok?, "VerifyPSS: #{err_text(r)}"
+      sig[1] ^= 0x80
+      assert verify_pss_g(priv.public_key, crypto.SHA256, hash, sig, opts, min1024).err?, "VerifyPSS success for tampered signature"
+      sig[1] ^= 0x80
+      hash[1] ^= 0x80
+      assert verify_pss_g(priv.public_key, crypto.SHA256, hash, sig, opts, min1024).err?, "VerifyPSS success for tampered message"
+      hash[1] ^= 0x80
+    }
+  }
+
+  # An input above the modulus fails, whether or not it is longer.
+  opts = PSSOptions.new(salt_length: PSS_SALT_LENGTH_EQUALS_HASH, hash: none)
+  c = [0xff.as_u8; priv.size]
+  assert verify_pss_g(priv.public_key, crypto.SHA256, hash, c, opts, min1024).err?, "VerifyPSS accepted a large signature"
+  assert decrypt_pkcs1v15_g(nil_reader(), priv, c, min1024).err?, "DecryptPKCS1v15 accepted a large ciphertext"
+  c << 0xff
+  assert verify_pss_g(priv.public_key, crypto.SHA256, hash, c, opts, min1024).err?, "VerifyPSS accepted a long signature"
+  assert decrypt_pkcs1v15_g(nil_reader(), priv, c, min1024).err?, "DecryptPKCS1v15 accepted a long ciphertext"
+}
+
+test "KeyTooSmall" {
+  k = test512_key()
+  buf = [0.as_u8; 512 / 8]
+  errs = [
+    err_text(k.sign(crand(), buf, crypto.SHA512)),
+    err_text(k.sign(crand(), buf, PSSOptions.new(salt_length: PSS_SALT_LENGTH_EQUALS_HASH, hash: none))),
+    err_text(k.decrypt(crand(), buf, PKCS1v15DecryptOptions.new)),
+    err_text(k.decrypt(crand(), buf, OAEPOptions.new(hash: crypto.SHA512, mgf_hash: none, label: []))),
+    err_text(verify_pkcs1v15(k.public_key, crypto.SHA512, buf, buf)),
+    err_text(verify_pss(k.public_key, crypto.SHA512, buf, buf, PSSOptions.new(salt_length: PSS_SALT_LENGTH_EQUALS_HASH, hash: none))),
+    err_text(sign_pkcs1v15(crand(), k, crypto.SHA512, buf)),
+    err_text(sign_pss(crand(), k, crypto.SHA512, buf, PSSOptions.new(salt_length: PSS_SALT_LENGTH_EQUALS_HASH, hash: none))),
+    err_text(encrypt_pkcs1v15(crand(), k.public_key, buf)),
+    err_text(encrypt_oaep(sha512.new(), crand(), k.public_key, buf, [])),
+    err_text(decrypt_pkcs1v15(nil_reader(), k, buf)),
+    err_text(decrypt_oaep(sha512.new(), nil_reader(), k, buf, [])),
+    err_text(decrypt_pkcs1v15_session_key(nil_reader(), k, buf, buf)),
+  ]
+  for e in errs {
+    assert e.include?("insecure"), "unexpected error: #{e}"
+  }
+}
+
+# ---- OAEP (Go's TestEncryptOAEP, TestDecryptOAEP, ...) ----
+
+test "EncryptOAEP" {
+  sha1 = crypto.SHA1.new
+  i = 0
+  for test in oaep_data() {
+    public = PublicKey.new(n: big_hex(test.modulus), e: test.e)
+    j = 0
+    for message in test.msgs {
+      random_source = bytes_reader(message.seed)
+      out = encrypt_oaep_g(sha1, sha1, random_source, public, message.input, [], false)
+      assert out.ok?, "##{i},#{j} error: #{err_text(out)}"
+      assert_eq to_hex(out.unwrap), to_hex(message.out)
+      j += 1
+    }
+    i += 1
+  }
+}
+
+def oaep_private(test: OaepKey) -> PrivateKey {
+  PrivateKey.new(public_key: PublicKey.new(n: big_hex(test.modulus), e: test.e), d: big_hex(test.d), primes: [], precomputed: PrecomputedValues.new)
+}
+
+test "DecryptOAEP" {
+  sha1 = crypto.SHA1.new
+  for test in oaep_data() {
+    private = oaep_private(test)
+    for message in test.msgs {
+      out = decrypt_oaep_g(sha1, sha1, private, message.out, [], false)
+      assert out.ok?, err_text(out)
+      assert_eq out.unwrap, message.input
+      # Decrypt with a random reader (Go: "with blinding"; ignored).
+      out = decrypt_oaep(sha1, crand(), private, message.out, [])
+      assert out.err? || out.unwrap == message.input
+    }
+  }
+}
+
+test "2DecryptOAEP" {
+  msg: [Byte] = [0xed, 0x36, 0x90, 0x8d, 0xbe, 0xfc, 0x35, 0x40, 0x70, 0x4f, 0xf5, 0x9d, 0x6e, 0xc2, 0xeb, 0xf5, 0x27, 0xae, 0x65, 0xb0, 0x59, 0x29, 0x45,
+    0x25, 0x8c, 0xc1, 0x91, 0x22]
+  input = unhex("722684c9cfd6a896043e34072c4fe652be463ccf79210964e733669bf8142243fe8e528be05f98ef54ac6bc626ac5b1b4b7d2ed769285a2f4a95896cc75395c7d289046f94749b090df4612eab48574abf95cbff15e2a06658f746f8c70bb51ea7ba36cedd3641986e10f93b70bba1da0040d5a53f8764327cbc50520e4f21bd")
+  priv = oaep_private(oaep_data()[0])
+  out = priv.decrypt_g(crand(), input, OAEPOptions.new(hash: crypto.SHA256, mgf_hash: crypto.SHA1, label: []), false)
+  assert out.ok?, "error: #{err_text(out)}"
+  assert_eq out.unwrap, msg
+}
+
+test "EncryptDecryptOAEP" {
+  sha256h = sha256.new()
+  for test in oaep_data() {
+    priv = oaep_private(test)
+    j = 0
+    for message in test.msgs {
+      label = "hi##{j}".bytes
+      enc = encrypt_oaep_g(sha256h, sha256h, crand(), priv.public_key, message.input, label, false).unwrap
+      dec = decrypt_oaep_g(sha256h, sha256h, priv, enc, label, false).unwrap
+      assert_eq dec, message.input
+      # A different hash for MGF1.
+      o = OAEPOptions.new(hash: crypto.SHA256, mgf_hash: crypto.SHA1, label: label)
+      enc = encrypt_oaep_with_options_g(crand(), priv.public_key, message.input, o, false).unwrap
+      dec = priv.decrypt_g(crand(), enc, o, false).unwrap
+      assert_eq dec, message.input
+      # No MGF1 hash.
+      o2 = OAEPOptions.new(hash: crypto.SHA256, mgf_hash: none, label: label)
+      enc = encrypt_oaep_with_options_g(crand(), priv.public_key, message.input, o2, false).unwrap
+      dec = decrypt_oaep_g(sha256h, sha256h, priv, enc, label, false).unwrap
+      assert_eq dec, message.input
+      j += 1
+    }
+  }
+}
+
+test "PSmallerThanQ" {
+  # A 256-bit P and a 257-bit Q.
+  everything(test_p_smaller_than_q_key(), false)
+}
+
+test "LargeSizeDifference" {
+  # 768-bit P and 256-bit Q, then the reverse.
+  everything(test_large_diff_key1(), true)
+  everything(test_large_diff_key2(), true)
+}
+
+def key_only_d -> PrivateKey {
+  k = test2048_key()
+  PrivateKey.new(public_key: k.public_key, d: k.d, primes: [], precomputed: PrecomputedValues.new)
+}
+
+def key_without_precomputed -> PrivateKey {
+  k = test2048_key()
+  PrivateKey.new(public_key: k.public_key, d: k.d, primes: k.primes, precomputed: PrecomputedValues.new)
+}
+
+def key_with_precomputed -> PrivateKey {
+  k = test2048_key()
+  pc = PrecomputedValues.new(dp: k.precomputed.dp, dq: k.precomputed.dq, qinv: k.precomputed.qinv, crt_values: [], fips: none)
+  PrivateKey.new(public_key: k.public_key, d: k.d, primes: k.primes, precomputed: pc)
+}
+
+test "NotPrecomputed" {
+  # OnlyD
+  everything(key_only_d(), true)
+  k = key_only_d()
+  k.precompute!
+  everything(k, true)
+  # Primes
+  everything(key_without_precomputed(), true)
+  k = key_without_precomputed()
+  k.precompute!
+  assert k.precomputed.dp != none && k.precomputed.dq != none && k.precomputed.qinv != none, "Precomputed values should not be nil after Precompute()"
+  everything(k, true)
+  # AllValues
+  everything(key_with_precomputed(), true)
+  k = key_without_precomputed()
+  k.precompute!
+  assert k.precomputed.dp != none && k.precomputed.dq != none && k.precomputed.qinv != none, "Precomputed values should not be nil after Precompute()"
+  everything(k, true)
+}
+
+def modified(k0: PrivateKey) {
+  k = k0
+  assert k.validate.err?, "Validate should have failed"
+  k.precompute!
+  assert k.validate.err?, "Validate should have failed after Precompute()"
+}
+
+def plus2(x: big.Int) -> big.Int {
+  z = big.Int.new
+  z.add!(x, big.new_int(2))
+}
+
+test "ModifiedPrivateKey" {
+  assert test512_key().validate.ok?, "test512Key should be valid"
+  # PublicKey mismatch
+  k = test512_key()
+  k.public_key = test512_key_two().public_key
+  modified(k)
+  # Precomputed mismatch
+  k = test512_key()
+  k.precomputed = test512_key_two().precomputed
+  modified(k)
+  # D+2, D=0 (and Go's D nil, the same here)
+  k = test512_key()
+  k.d = plus2(k.d)
+  modified(k)
+  k = test512_key()
+  k.d = big.Int.new
+  modified(k)
+  # N+2, N=0 (and nil)
+  k = test512_key()
+  k.public_key.n = plus2(k.public_key.n)
+  modified(k)
+  k = test512_key()
+  k.public_key.n = big.Int.new
+  modified(k)
+  # P+2, P=0 (and nil); Q+2, Q=0 (and nil)
+  for i in [0, 1] {
+    k = test512_key()
+    k.primes = k.primes.clone
+    k.primes[i] = plus2(k.primes[i])
+    modified(k)
+    k = test512_key()
+    k.primes = k.primes.clone
+    k.primes[i] = big.Int.new
+    modified(k)
+  }
+  # E+2, E=0
+  k = test512_key()
+  k.public_key.e += 2
+  modified(k)
+  k = test512_key()
+  k.public_key.e = 0
+  modified(k)
+}
+
+# A reader over fixed bytes (Go's bytes.NewReader).
+struct BytesReader {
+  st: [([Byte], Int)]
+
+  pub def read!(p: [Byte]) -> Int {
+    b, off = self.st[0]
+    n = b.size - off
+    n = p.size if p.size < n
+    copy(p, b[off...off + n])
+    self.st[0] = (b, off + n)
+    n
+  }
+}
+
+def bytes_reader(b: [Byte]) -> BytesReader { BytesReader.new(st: [(b, 0)]) }

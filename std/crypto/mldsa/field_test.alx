@@ -1,0 +1,339 @@
+#![overflow(wrap)]
+import "crypto/sha3"
+import "encoding/hex"
+import "math/big"
+
+# Go's crypto/internal/fips140/mldsa/field_test.go, translated. Go's
+# interestingValues in its non-short form (18 values); the exhaustive loops
+# over [0, q) are kept.
+
+struct Interesting {
+  v: U32
+  m: U32
+}
+
+def interesting_values -> [Interesting] {
+  values: [Interesting] = []
+  vs: [U32] = [0, 1, 2, 3, Q - 3, Q - 2, Q - 1, Q / 2, (Q + 1) / 2]
+  for v in vs {
+    values << Interesting.new(v: v, m: field_to_montgomery(v).unwrap)
+    # also values with an interesting Montgomery representation
+    values << Interesting.new(v: field_from_montgomery(v), m: v)
+  }
+  values
+}
+
+test "ToFromMontgomery" {
+  a: U32 = 0
+  bad = 0
+  while a < Q {
+    m = field_to_montgomery(a).unwrap
+    exp = ((a.as_u64 << 32) % Q64).as_u32
+    bad += 1 if m != exp || field_from_montgomery(m) != a
+    a += 1
+  }
+  assert_eq bad, 0
+}
+
+test "FieldAdd" {
+  bad = 0
+  for a in interesting_values() {
+    b: U32 = 0
+    while b < Q {
+      bad += 1 if field_add(a.m, b) != (a.m + b) % Q
+      b += 1
+    }
+  }
+  assert_eq bad, 0
+}
+
+test "FieldSub" {
+  bad = 0
+  for a in interesting_values() {
+    b: U32 = 0
+    while b < Q {
+      bad += 1 if field_sub(a.m, b) != (a.m + Q - b) % Q
+      b += 1
+    }
+  }
+  assert_eq bad, 0
+}
+
+test "FieldSubToMontgomery" {
+  bad = 0
+  for a in interesting_values() {
+    b: U32 = 0
+    while b < Q {
+      diff = (a.v + Q - b) % Q
+      exp = ((diff.as_u64 << 32) % Q64).as_u32
+      bad += 1 if field_sub_to_montgomery(a.v, b) != exp
+      b += 1
+    }
+  }
+  assert_eq bad, 0
+}
+
+test "FieldReduceOnce" {
+  bad = 0
+  a: U32 = 0
+  while a < 2 * Q {
+    exp = a < Q ? a : a - Q
+    bad += 1 if field_reduce_once(a) != exp
+    a += 1
+  }
+  assert_eq bad, 0
+}
+
+test "FieldMul" {
+  bad = 0
+  for a in interesting_values() {
+    b: U32 = 0
+    while b < Q {
+      got = field_from_montgomery(field_montgomery_mul(a.m, b))
+      exp = ((a.v.as_u64 * field_from_montgomery(b).as_u64) % Q64).as_u32
+      bad += 1 if got != exp
+      b += 1
+    }
+  }
+  assert_eq bad, 0
+}
+
+test "FieldToMontgomeryOverflow" {
+  vs: [U32] = [Q, Q + 1, Q + 2, (1 << 23) - 1, 1 << 23, Q + (1 << 23), Q + (1 << 31), 0xffffffff]
+  for v in vs {
+    assert field_to_montgomery(v) == none, "field_to_montgomery(#{v}) accepted"
+  }
+}
+
+test "FieldMulSub" {
+  vals = interesting_values()
+  for a in vals {
+    for b in vals {
+      for c in vals {
+        got = field_from_montgomery(field_montgomery_mul_sub(a.m, b.m, c.m))
+        exp = ((a.v.as_u64 * (b.v.as_u64 + Q64 - c.v.as_u64)) % Q64).as_u32
+        assert_eq got, exp
+      }
+    }
+  }
+}
+
+test "FieldAddMul" {
+  vals = interesting_values()
+  bad = 0
+  for a in vals {
+    for b in vals {
+      for c in vals {
+        for d in vals {
+          got = field_from_montgomery(field_montgomery_add_mul(a.m, b.m, c.m, d.m))
+          exp = ((a.v.as_u64 * b.v.as_u64 + c.v.as_u64 * d.v.as_u64) % Q64).as_u32
+          bad += 1 if got != exp
+        }
+      }
+    }
+  }
+  assert_eq bad, 0
+}
+
+def bit_rev8(n: Byte) -> Byte {
+  r: Byte = 0
+  r = r | ((n >> 7) & 0b0000_0001)
+  r = r | ((n >> 5) & 0b0000_0010)
+  r = r | ((n >> 3) & 0b0000_0100)
+  r = r | ((n >> 1) & 0b0000_1000)
+  r = r | ((n << 1) & 0b0001_0000)
+  r = r | ((n << 3) & 0b0010_0000)
+  r = r | ((n << 5) & 0b0100_0000)
+  r = r | ((n << 7) & 0b1000_0000)
+  r
+}
+
+def centered_mod(x: U32, m: U32) -> I32 {
+  y = x % m
+  return y.as_i32 - m.as_i32 if y > m / 2
+  y.as_i32
+}
+
+def reduce_mod_q(x: I32) -> U32 {
+  y = x % Q.as_i32
+  return (y + Q.as_i32).as_u32 if y < 0
+  y.as_u32
+}
+
+test "CenteredMod" {
+  bad = 0
+  x: U32 = 0
+  while x < Q * 2 {
+    bad += 1 if reduce_mod_q(centered_mod(x, Q)) != x % Q
+    x += 1
+  }
+  x = 0
+  while x < Q {
+    bad += 1 if field_centered_mod(field_to_montgomery(x).unwrap) != centered_mod(x, Q)
+    x += 1
+  }
+  assert_eq bad, 0
+}
+
+test "InfinityNorm" {
+  bad = 0
+  x: U32 = 0
+  while x < Q {
+    exp = centered_mod(x, Q)
+    exp = 0 - exp if exp < 0
+    bad += 1 if field_infinity_norm(field_to_montgomery(x).unwrap) != exp.as_u32
+    x += 1
+  }
+  assert_eq bad, 0
+}
+
+test "Constants" {
+  assert_eq field_from_montgomery(ONE), 1.as_u32
+  assert_eq field_from_montgomery(MINUS_ONE), Q - 1
+  assert_eq field_infinity_norm(ONE), 1.as_u32
+  assert_eq field_infinity_norm(MINUS_ONE), 1.as_u32
+  assert_eq PUBLIC_KEY_SIZE44, pub_key_size(params44())
+  assert_eq PUBLIC_KEY_SIZE65, pub_key_size(params65())
+  assert_eq PUBLIC_KEY_SIZE87, pub_key_size(params87())
+  assert_eq SIGNATURE_SIZE44, sig_size(params44())
+  assert_eq SIGNATURE_SIZE65, sig_size(params65())
+  assert_eq SIGNATURE_SIZE87, sig_size(params87())
+}
+
+test "Power2Round" {
+  bad = 0
+  x: U32 = 0
+  while x < Q {
+    rr = field_to_montgomery(x).unwrap
+    t1 = power2_round_hi(rr)
+    t0 = power2_round_lo(rr)
+    hi = field_to_montgomery(t1 << 13)
+    if hi == none {
+      bad += 1
+    } else {
+      bad += 1 if field_from_montgomery(field_add(hi.unwrap, t0)) != x
+    }
+    x += 1
+  }
+  assert_eq bad, 0
+}
+
+# Decompose straight from FIPS 204: (r1, r0).
+def spec_decompose(rr: U32, p: Params) -> (U32, I32) {
+  r = field_from_montgomery(rr)
+  gamma2 = (Q - 1) / p.gamma2.as_u32
+  r0 = centered_mod(r, 2 * gamma2)
+  diff = r.as_i32 - r0
+  return (0.as_u32, r0 - 1) if diff == (Q - 1).as_i32
+  panic("mldsa: internal error: invalid decomposition") if diff < 0 || diff.as_u32 % gamma2 != 0
+  (diff.as_u32 / (2 * gamma2), r0)
+}
+
+def check_decompose(p: Params) -> Int {
+  bad = 0
+  gamma2 = (Q - 1) / p.gamma2.as_u32
+  x: U32 = 0
+  while x < Q {
+    rr = field_to_montgomery(x).unwrap
+    spec = spec_decompose(rr, p)
+    r1 = spec[0]
+    r0 = spec[1]
+    # r ≡ r1 * (2 * γ2) + r0 mod q
+    bad += 1 if reduce_mod_q((r1 * 2 * gamma2).as_i32 + r0) != x
+    got = p.gamma2 == 88 ? decompose88(rr) : decompose32(rr)
+    max_r1 = p.gamma2 == 88 ? 43.as_u8 : 15.as_u8
+    bad += 1 if got[0] > max_r1 || got[0].as_u32 != r1 || got[1] != r0
+    x += 1
+  }
+  bad
+}
+
+test "Decompose/ML-DSA-44" {
+  assert_eq check_decompose(params44()), 0
+}
+
+test "Decompose/ML-DSA-65,87" {
+  assert_eq check_decompose(params65()), 0
+}
+
+test "Zetas" {
+  zeta = big.new_int(1753)
+  q = big.new_int(Q.to_i)
+  k = 0
+  while k < 256 {
+    exp = big.Int.new
+    exp.exp!(zeta, big.new_int(bit_rev8(k.as_u8).to_i), q)
+    got = field_from_montgomery(ZETAS[k])
+    assert big.new_int(got.to_i).cmp(exp) == 0, "zetas[#{k}] = #{got}, expected #{exp.to_s}"
+    k += 1
+  }
+}
+
+# Appends the decimal form of x and a newline to buf at off; returns the
+# new offset.
+def put_decimal(buf: [Byte], off: Int, x: Int) -> Int {
+  o = off
+  v = x
+  if v < 0 {
+    buf[o] = 45
+    o += 1
+    v = 0 - v
+  }
+  tmp = [0.as_u8; 12]
+  n = 0
+  while true {
+    tmp[n] = (48 + v % 10).as_u8
+    n += 1
+    v = v / 10
+    break if v == 0
+  }
+  while n > 0 {
+    n -= 1
+    buf[o] = tmp[n]
+    o += 1
+  }
+  buf[o] = 10
+  o + 1
+}
+
+# The hash of 12 values for every r in ℤq as decimal lines: r mod± q,
+# ||r||∞, Power2Round(r), and HighBits, UseHint(1, ·), LowBits and
+# ||LowBits||∞ for both γ2 (documented at https://c2sp.org/CCTV/ML-DSA).
+test "Accumulated" {
+  o = sha3.new_shake128()
+  buf = [0.as_u8; 65536]
+  off = 0
+  bad = 0
+  x: U32 = 0
+  while x < Q {
+    r = field_to_montgomery(x).unwrap
+    off = put_decimal(buf, off, field_centered_mod(r).to_i)
+    off = put_decimal(buf, off, field_infinity_norm(r).to_i)
+    off = put_decimal(buf, off, power2_round_hi(r).to_i)
+    off = put_decimal(buf, off, field_from_montgomery(power2_round_lo(r)).to_i)
+
+    d = decompose88(r)
+    bad += 1 if high_bits88(field_from_montgomery(r)) != d[0] || use_hint88(r, 0) != d[0]
+    off = put_decimal(buf, off, d[0].to_i)
+    off = put_decimal(buf, off, use_hint88(r, 1).to_i)
+    off = put_decimal(buf, off, d[1].to_i)
+    off = put_decimal(buf, off, constant_time_abs(d[1]).to_i)
+
+    d = decompose32(r)
+    bad += 1 if high_bits32(field_from_montgomery(r)) != d[0] || use_hint32(r, 0) != d[0]
+    off = put_decimal(buf, off, d[0].to_i)
+    off = put_decimal(buf, off, use_hint32(r, 1).to_i)
+    off = put_decimal(buf, off, d[1].to_i)
+    off = put_decimal(buf, off, constant_time_abs(d[1]).to_i)
+    if off > 65536 - 256 {
+      o.write!(buf[0...off]).unwrap
+      off = 0
+    }
+    x += 1
+  }
+  o.write!(buf[0...off]).unwrap
+  assert_eq bad, 0
+  sum = [0.as_u8; 32]
+  o.read!(sum)
+  assert_eq hex.encode_to_string(sum), "f930663417278156ab05d940294a77210a809c924d8ab63ec72f4526247602c7"
+}

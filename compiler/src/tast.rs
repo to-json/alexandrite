@@ -432,6 +432,9 @@ pub enum TK {
     Seq(Vec<TStmt>),
     /// The absent value of a T?.
     None,
+    /// The all-zero value of the type (an interface value: its first
+    /// implementor's zero).
+    Zero,
     /// A present T?.
     Some(Box<TExpr>),
     /// `select { when ... }`: the arms, then the `else` body if any.

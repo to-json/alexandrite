@@ -1,0 +1,968 @@
+#![overflow(wrap)]
+# Package bigmod: Go's crypto/internal/fips140/bigmod, constant-time modular
+# arithmetic on natural numbers for RSA (and ECDSA scalars): Nat (a number
+# with an announced length in 64-bit limbs) and Modulus (a modulus with its
+# Montgomery constants). Go's generic code (nat.go, nat_noasm.go), on [U64]
+# limbs.
+#
+#   Go                                     alx
+#   NewNat() *Nat                          new_nat() -> Nat
+#   x.Bits() / x.SetBits(y)                x.bits / x.set_bits!(y)
+#   x.Bytes(m)                             x.bytes(m) -> [Byte]
+#   x.SetBytes(b, m) (*Nat, error)         x.set_bytes!(b, m) -> ~Nat<BigmodError>
+#   x.SetOverflowingBytes(b, m)            x.set_overflowing_bytes!(b, m) -> ~Nat<BigmodError>
+#   x.SetUint(y)                           x.set_uint!(y)
+#   x.Equal(y) / IsZero / IsOne            x.equal(y) / is_zero / is_one     (choice: U64 1 or 0)
+#   x.IsMinusOne(m) / IsOdd                x.is_minus_one(m) / is_odd        (choice)
+#   x.TrailingZeroBitsVarTime()            x.trailing_zero_bits_var_time -> Int
+#   x.ShiftRightVarTime(n)                 x.shift_right_var_time!(n)
+#   x.BitLenVarTime()                      x.bit_len_var_time -> Int
+#   x.Mod(y, m) / x.ExpandFor(m)           x.mod!(y, m) / x.expand_for!(m)
+#   x.Sub(y, m) / SubOne / Add / Mul       x.sub!(y, m) / sub_one!(m) / add!(y, m) / mul!(y, m)
+#   x.Exp(y, e, m)                         x.exp!(y, e, m)
+#   x.ExpShortVarTime(y, e, m)             x.exp_short_var_time!(y, e: U64, m)
+#   x.InverseVarTime(a, m) (*Nat, bool)    x.inverse_var_time!(a, m) -> Nat?
+#   x.GCDVarTime(a, b) (*Nat, error)       x.gcd_var_time!(a, b) -> ~Nat<BigmodError>
+#   x.ShiftRightByOne()                    x.shift_right_by_one!
+#   x.DivShortVarTime(y) uint              x.div_short_var_time!(y: U64) -> U64
+#   NewModulus(b) (*Modulus, error)        new_modulus(b) -> ~Modulus<BigmodError>
+#   NewModulusProduct(a, b)                new_modulus_product(a, b) -> ~Modulus<BigmodError>
+#   m.Size() / BitLen() / Nat()            m.size / m.bit_len / m.nat
+#
+# The unexported helpers keep Go's names in snake_case (expand!, reset!,
+# set!, cmp_geq, assign!, shift_in!, montgomery_mul!, add_mul_vvw, ...),
+# except Go's raw `add`/`sub` (x += y, returning the carry), which would
+# collide with Add/Sub: they are raw_add!/raw_sub!.
+#
+# Values. A Nat is a struct holding its limbs slice; copies of a Nat share
+# the limbs (slices share storage), so a copy behaves like Go's *Nat as
+# long as nobody resizes it: methods that change the announced length
+# (reset!, expand!, set!, ...) replace the slice of the variable they are
+# called on only. As in Go, every method that modifies x also returns it
+# (Go's chaining `NewNat().set(x).Op()` becomes `t = new_nat(); t.set!(x);
+# t.op!()`, since a `!` method needs a variable receiver). A Modulus is a
+# value too; it is never modified after construction.
+#
+# Timing. Go's constant-time structure is kept: no branches or indexing on
+# secret limbs, carries and comparisons computed arithmetically (the
+# math/bits formulas), selections with masks (choice/ct_mask/ct_eq). As
+# crypto/subtle's header says, alx (and the C compiler behind --release)
+# make no promise that the generated code is free of secret-dependent
+# branches; Go's guarantees rest on its own compiler the same way. Lengths
+# (announced sizes) and anything named VarTime are public, as in Go.
+#
+# Differences from Go:
+#   - Limbs are always 64 bits (Go's _W is the platform word).
+#   - No preallocated capacity (Go's NewNat reserves 2048 bits so it can
+#     live on the stack): reset! reuses the limbs when the length matches
+#     and allocates otherwise.
+#   - No assembly: addMulVVW1024/1536/2048 are the generic add_mul_vvw, and
+#     montgomery_mul fuses Go's two addMulVVW passes per limb into one loop
+#     (same arithmetic, one pass over T). maybe_subtract_modulus and Sub
+#     select with a mask over m instead of copying x into a temporary (same
+#     result, no allocation).
+#   - choice is a U64 (1 or 0); YES/NO are constants and not_choice(c) is
+#     Go's not(c).
+#   - Errors are BigmodError variants with Go's messages.
+
+import "math/bits"
+
+# Bits per limb (Go's _W) and bytes per limb (_S).
+W = 64
+S = 8
+
+# choice values (Go's yes / no).
+pub YES: U64 = 1
+pub NO: U64 = 0
+
+# Errors with Go's messages.
+pub error BigmodError {
+  # SetBytes of a value >= m.
+  OverflowsModulus
+  # SetBytes / SetOverflowingBytes of a value longer than m.
+  OverflowsModulusSize
+  # NewModulus of 0 or 1.
+  ModulusTooSmall
+  # extendedGCD with a zero operand.
+  GcdZero
+  # extendedGCD with two even operands.
+  GcdBothEven
+
+  def message -> Str {
+    case self {
+      OverflowsModulus => "input overflows the modulus"
+      OverflowsModulusSize => "input overflows the modulus size"
+      ModulusTooSmall => "modulus must be > 1"
+      GcdZero => "extendedGCD: a or m is zero"
+      GcdBothEven => "extendedGCD: both a and m are even"
+    }
+  }
+}
+
+# Go's not(c) on a choice.
+pub def not_choice(c: U64) -> U64 { 1 ^ c }
+
+# All ones if on is YES, all zeros otherwise.
+pub def ct_mask(on: U64) -> U64 { 0 - on }
+
+# YES if x == y, NO otherwise, in time independent of the values.
+pub def ct_eq(x: U64, y: U64) -> U64 {
+  # If x != y, then either x - y or y - x will generate a borrow.
+  d1 = x - y
+  c1 = ((^x & y) | (^(x ^ y) & d1)) >> 63
+  d2 = y - x
+  c2 = ((^y & x) | (^(y ^ x) & d2)) >> 63
+  not_choice(c1 | c2)
+}
+
+# The big-endian 64-bit value of b[0...8].
+def be_u64(b: [Byte], i: Int) -> U64 {
+  (b[i].to_u64 << 56) | (b[i + 1].to_u64 << 48) | (b[i + 2].to_u64 << 40) | (b[i + 3].to_u64 << 32) |
+  (b[i + 4].to_u64 << 24) | (b[i + 5].to_u64 << 16) | (b[i + 6].to_u64 << 8) | b[i + 7].to_u64
+}
+
+# A natural number with an announced length (its number of limbs).
+# Operations may leak the length, but not the value of the limbs.
+pub struct Nat {
+  # Little-endian base 2^64 limbs.
+  limbs: [U64]
+
+  # x zero-extended to n limbs (panics if x has more).
+  def expand!(n: Int) -> Nat {
+    sz = self.limbs.size
+    panic("bigmod: internal error: shrinking nat") if sz > n
+    if sz < n {
+      nl = [0.as_u64; n]
+      copy(nl, self.limbs)
+      self.limbs = nl
+    }
+    self
+  }
+
+  # x = 0 with n limbs, reusing the limbs when there are n already.
+  def reset!(n: Int) -> Nat {
+    l = self.limbs
+    if l.size == n {
+      i = 0
+      while i < n {
+        l[i] = 0
+        i += 1
+      }
+    } else {
+      self.limbs = [0.as_u64; n]
+    }
+    self
+  }
+
+  # x = b (big-endian bytes), with the length of the value (leading zero
+  # limbs trimmed).
+  def reset_to_bytes!(b: [Byte]) -> Nat {
+    reset!((b.size + S - 1) / S)
+    panic("bigmod: internal error: bad arithmetic") if !set_limbs_from_bytes(self.limbs, b)
+    trim!
+  }
+
+  # Drops the most significant zero limbs.
+  def trim!() -> Nat {
+    n = self.limbs.size
+    while n > 0 && self.limbs[n - 1] == 0 {
+      n -= 1
+    }
+    self.limbs = self.limbs[0...n] if n < self.limbs.size
+    self
+  }
+
+  # x = y, with y's length.
+  def set!(y: Nat) -> Nat {
+    reset!(y.limbs.size)
+    copy(self.limbs, y.limbs)
+    self
+  }
+
+  # The limbs (little-endian), shared with x.
+  pub def bits -> [U64] { self.limbs }
+
+  # x = y (little-endian limbs), with y's length.
+  pub def set_bits!(y: [U64]) -> Nat {
+    reset!(y.size)
+    copy(self.limbs, y)
+    self
+  }
+
+  # x as big-endian bytes, zero-extended to m.size. x must have m's length
+  # and be <= m.
+  pub def bytes(m: Modulus) -> [Byte] {
+    i = m.size
+    out = [0.as_u8; i]
+    for l in self.limbs {
+      limb = l
+      j = 0
+      while j < S {
+        i -= 1
+        if i < 0 {
+          break if limb == 0
+          panic("bigmod: modulus is smaller than nat")
+        }
+        out[i] = limb.as_u8
+        limb >>= 8
+        j += 1
+      }
+    }
+    out
+  }
+
+  # x = b (big-endian bytes), with m's length. Fails if b >= m.
+  pub def set_bytes!(b: [Byte], m: Modulus) -> ~Nat<BigmodError> {
+    reset_for!(m)
+    fail BigmodError.OverflowsModulusSize if !set_limbs_from_bytes(self.limbs, b)
+    fail BigmodError.OverflowsModulus if cmp_geq(m.mnat) == YES
+    self
+  }
+
+  # x = b mod m, with m's length, for b of at most m's bit length (values
+  # up to 2^bitlen(m) - 1 are reduced). Fails if b is longer.
+  pub def set_overflowing_bytes!(b: [Byte], m: Modulus) -> ~Nat<BigmodError> {
+    reset_for!(m)
+    fail BigmodError.OverflowsModulusSize if !set_limbs_from_bytes(self.limbs, b)
+    l = self.limbs
+    ml = m.mnat.limbs
+    fail BigmodError.OverflowsModulusSize if bit_len(l[l.size - 1]) > bit_len(ml[ml.size - 1])
+    maybe_subtract_modulus!(NO, m)
+    self
+  }
+
+  # x = y, one limb.
+  pub def set_uint!(y: U64) -> Nat {
+    reset!(1)
+    self.limbs[0] = y
+    self
+  }
+
+  # YES if x == y (same lengths), NO otherwise.
+  pub def equal(y: Nat) -> U64 {
+    xl = self.limbs
+    yl = y.limbs
+    size = xl.size
+    eq = YES
+    i = 0
+    while i < size {
+      eq &= ct_eq(xl[i], yl[i])
+      i += 1
+    }
+    eq
+  }
+
+  # YES if x == 0.
+  pub def is_zero -> U64 {
+    xl = self.limbs
+    z = YES
+    i = 0
+    while i < xl.size {
+      z &= ct_eq(xl[i], 0)
+      i += 1
+    }
+    z
+  }
+
+  # YES if x == 1.
+  pub def is_one -> U64 {
+    xl = self.limbs
+    return NO if xl.size == 0
+    one = ct_eq(xl[0], 1)
+    i = 1
+    while i < xl.size {
+      one &= ct_eq(xl[i], 0)
+      i += 1
+    }
+    one
+  }
+
+  # YES if x == -1 mod m (x reduced, with m's length).
+  pub def is_minus_one(m: Modulus) -> U64 {
+    minus_one = m.nat
+    minus_one.sub_one!(m)
+    equal(minus_one)
+  }
+
+  # YES if x is odd.
+  pub def is_odd -> U64 {
+    return NO if self.limbs.size == 0
+    self.limbs[0] & 1
+  }
+
+  # The number of trailing zero bits (leaks it).
+  pub def trailing_zero_bits_var_time -> Int {
+    t = 0
+    for l in self.limbs {
+      if l == 0 {
+        t += W
+        next
+      }
+      t += bits.trailing_zeros64(l)
+      break
+    }
+    t
+  }
+
+  # YES if x >= y (same lengths).
+  def cmp_geq(y: Nat) -> U64 {
+    xl = self.limbs
+    yl = y.limbs
+    size = xl.size
+    c: U64 = 0
+    i = 0
+    while i < size {
+      a = xl[i]
+      b = yl[i]
+      d = a - b - c
+      c = ((^a & b) | (^(a ^ b) & d)) >> 63
+      i += 1
+    }
+    not_choice(c)
+  }
+
+  # x = y if on is YES; unchanged otherwise (same lengths).
+  def assign!(on: U64, y: Nat) -> Nat {
+    xl = self.limbs
+    yl = y.limbs
+    size = xl.size
+    mask = ct_mask(on)
+    i = 0
+    while i < size {
+      a = xl[i]
+      xl[i] = a ^ (mask & (a ^ yl[i]))
+      i += 1
+    }
+    self
+  }
+
+  # x += y (same lengths), returning the carry (Go's add).
+  def raw_add!(y: Nat) -> U64 {
+    add_limbs(self.limbs, y.limbs, ct_mask(YES))
+  }
+
+  # x -= y (same lengths), returning the borrow (Go's sub).
+  def raw_sub!(y: Nat) -> U64 {
+    sub_limbs(self.limbs, y.limbs, ct_mask(YES))
+  }
+
+  # x = x >> n, keeping the length (leaks n).
+  pub def shift_right_var_time!(n: Int) -> Nat {
+    xl = self.limbs
+    size = xl.size
+    shift = n % W
+    shift_limbs = n / W
+    avail = shift_limbs < size ? size - shift_limbs : 0
+    i = 0
+    while i < size {
+      if i >= avail {
+        xl[i] = 0
+      } else {
+        v = xl[i + shift_limbs] >> shift
+        v |= xl[i + shift_limbs + 1] << (W - shift) if i + 1 < avail && shift != 0
+        xl[i] = v
+      }
+      i += 1
+    }
+    self
+  }
+
+  # The actual bit length of x (leaks it, but nothing more).
+  pub def bit_len_var_time -> Int {
+    xl = self.limbs
+    i = xl.size - 1
+    while i >= 0 {
+      return i * W + bit_len(xl[i]) if xl[i] != 0
+      i -= 1
+    }
+    0
+  }
+
+  # x = x << 64 + y mod m (x reduced mod m).
+  def shift_in!(y: U64, m: Modulus) -> Nat {
+    d = new_nat()
+    d.reset_for!(m)
+    ml = m.mnat.limbs
+    size = ml.size
+    xl = self.limbs
+    dl = d.limbs
+    # Each iteration computes x = 2x + b mod m, b a bit of y, as both 2x + b
+    # and 2x + b - m; the next iteration (and the final assign) picks one
+    # by whether 2x + b overflowed m.
+    need_sub = NO
+    i = W - 1
+    while i >= 0 {
+      carry = (y >> i) & 1
+      borrow: U64 = 0
+      mask = ct_mask(need_sub)
+      j = 0
+      while j < size {
+        xj = xl[j]
+        l = xj ^ (mask & (xj ^ dl[j]))
+        s = l + l + carry
+        carry = ((l & l) | ((l | l) & ^s)) >> 63
+        xl[j] = s
+        mj = ml[j]
+        dd = s - mj - borrow
+        borrow = ((^s & mj) | (^(s ^ mj) & dd)) >> 63
+        dl[j] = dd
+        j += 1
+      }
+      need_sub = not_choice(borrow) | carry
+      i -= 1
+    }
+    assign!(need_sub, d)
+  }
+
+  # out = x mod m, with m's length, for x of any size.
+  pub def mod!(x: Nat, m: Modulus) -> Nat {
+    reset_for!(m)
+    xl = x.limbs
+    ol = self.limbs
+    # From the most significant limb down, insert each at the bottom,
+    # shifting the rest up by 64 bits. The first N - 1 limbs fit without
+    # reducing: place them directly.
+    i = xl.size - 1
+    start = m.mnat.limbs.size - 2
+    start = i if i < start
+    j = start
+    while j >= 0 {
+      ol[j] = xl[i]
+      i -= 1
+      j -= 1
+    }
+    # Shift in the rest, reducing every time.
+    while i >= 0 {
+      shift_in!(xl[i], m)
+      i -= 1
+    }
+    self
+  }
+
+  # x zero-extended to m's length (x no longer than m).
+  pub def expand_for!(m: Modulus) -> Nat { expand!(m.mnat.limbs.size) }
+
+  # x = 0 with m's length.
+  def reset_for!(m: Modulus) -> Nat { reset!(m.mnat.limbs.size) }
+
+  # x -= m if x >= m or always is YES (x < 2m, with m's length). always is
+  # usually the carry of an operation that overflowed x's size.
+  def maybe_subtract_modulus!(always: U64, m: Modulus) {
+    xl = self.limbs
+    ml = m.mnat.limbs
+    # The borrow of x - m: set when x < m.
+    c: U64 = 0
+    i = 0
+    while i < xl.size {
+      a = xl[i]
+      b = ml[i]
+      d = a - b - c
+      c = ((^a & b) | (^(a ^ b) & d)) >> 63
+      i += 1
+    }
+    keep = not_choice(c) | always
+    sub_limbs(xl, ml, ct_mask(keep))
+  }
+
+  # x = x - y mod m (both reduced, with m's length).
+  pub def sub!(y: Nat, m: Modulus) -> Nat {
+    underflow = sub_limbs(self.limbs, y.limbs, ct_mask(YES))
+    # If the subtraction underflowed, add m.
+    add_limbs(self.limbs, m.mnat.limbs, ct_mask(underflow))
+    self
+  }
+
+  # x = x - 1 mod m (x with m's length).
+  pub def sub_one!(m: Modulus) -> Nat {
+    one = new_nat()
+    one.expand_for!(m)
+    one.limbs[0] = 1
+    sub!(one, m)
+  }
+
+  # x = x + y mod m (both reduced, with m's length).
+  pub def add!(y: Nat, m: Modulus) -> Nat {
+    overflow = add_limbs(self.limbs, y.limbs, ct_mask(YES))
+    maybe_subtract_modulus!(overflow, m)
+    self
+  }
+
+  # x = x * R mod m, R = 2^(64 n), n = m's length (x reduced).
+  def montgomery_representation!(m: Modulus) -> Nat {
+    # A Montgomery multiplication (a * b / R) by R * R is a multiplication
+    # by R.
+    montgomery_mul!(self, m.rr, m)
+  }
+
+  # x = x / R mod m (x reduced).
+  def montgomery_reduction!(m: Modulus) -> Nat {
+    # Montgomery-multiplying by 1 divides by R.
+    one = new_nat()
+    one.expand_for!(m)
+    one.limbs[0] = 1
+    montgomery_mul!(self, one, m)
+  }
+
+  # x = a * b / R mod m (a Montgomery multiplication); a and b reduced,
+  # with m's length; x is resized to m's length and may be a or b.
+  def montgomery_mul!(a: Nat, b: Nat, m: Modulus) -> Nat {
+    ml = m.mnat.limbs
+    n = ml.size
+    al = a.limbs
+    bl = b.limbs
+    t = [0.as_u64; n * 2]
+    m0inv = m.m0inv
+    # Word-by-word Montgomery multiplication (Gueron, "Efficient Software
+    # Implementations of Modular Exponentiation", Algorithm 4). Go runs
+    # two addMulVVW passes per limb of b (T[i:n+i] += a * d, then
+    # T[i:n+i] += m * Y with Y = T[i] * m0inv); they are fused here: Y
+    # only needs the new T[i], which is T[i] + a[0] * d.
+    c: U64 = 0
+    i = 0
+    while i < n {
+      d = bl[i]
+      y = (t[i] + al[0] * d) * m0inv
+      c1: U64 = 0
+      c2: U64 = 0
+      j = 0
+      while j < n {
+        k = i + j
+        aj = al[j]
+        lo = aj * d
+        hi = aj.__mulhi(d)
+        s = lo + t[k]
+        k1: U64 = s < lo ? 1 : 0
+        s2 = s + c1
+        k2: U64 = s2 < s ? 1 : 0
+        c1 = hi + k1 + k2
+        mj = ml[j]
+        plo = mj * y
+        phi = mj.__mulhi(y)
+        u = plo + s2
+        k3: U64 = u < plo ? 1 : 0
+        u2 = u + c2
+        k4: U64 = u2 < u ? 1 : 0
+        c2 = phi + k3 + k4
+        t[k] = u2
+        j += 1
+      }
+      # The two row carries and the running carry go into T[n + i].
+      s = c1 + c2
+      sc = ((c1 & c2) | ((c1 | c2) & ^s)) >> 63
+      s2 = s + c
+      sc2 = ((s & c) | ((s | c) & ^s2)) >> 63
+      t[n + i] = s2
+      c = sc | sc2
+      i += 1
+    }
+    # Step 7: the top half of T, minus m when x >= m or T overflowed.
+    reset!(n)
+    copy(self.limbs, t[n...n * 2])
+    maybe_subtract_modulus!(c, m)
+    self
+  }
+
+  # x = x * y mod m (both reduced, with m's length).
+  pub def mul!(y: Nat, m: Modulus) -> Nat {
+    if m.odd {
+      # A Montgomery multiplication by a value out of the Montgomery domain
+      # takes the result out of it.
+      xr = new_nat()
+      xr.set!(self)
+      xr.montgomery_representation!(m)
+      return montgomery_mul!(xr, y, m)
+    }
+    n = m.mnat.limbs.size
+    xl = self.limbs
+    yl = y.limbs
+    t = [0.as_u64; n * 2]
+    # T = x * y
+    i = 0
+    while i < n {
+      t[n + i] = add_mul_vvw(t[i...n + i], xl[0...n], yl[i])
+      i += 1
+    }
+    # x = T mod m
+    mod!(Nat.new(limbs: t), m)
+  }
+
+  # out = x^e mod m; e big-endian bytes, x reduced; m must be odd.
+  pub def exp!(x: Nat, e: [Byte], m: Modulus) -> Nat {
+    panic("bigmod: modulus for Exp must be odd") if !m.odd
+    # A 4-bit window: table[i] = x^(i+1) in the Montgomery domain.
+    table: [Nat] = []
+    t0 = new_nat()
+    t0.set!(x)
+    t0.montgomery_representation!(m)
+    table << t0
+    i = 1
+    while i < 15 {
+      ti = new_nat()
+      ti.montgomery_mul!(table[i - 1], t0, m)
+      table << ti
+      i += 1
+    }
+    reset_for!(m)
+    self.limbs[0] = 1
+    montgomery_representation!(m)
+    tmp = new_nat()
+    tmp.expand_for!(m)
+    for b in e {
+      for j in [4, 0] {
+        # Square four times.
+        montgomery_mul!(self, self, m)
+        montgomery_mul!(self, self, m)
+        montgomery_mul!(self, self, m)
+        montgomery_mul!(self, self, m)
+        # Select x^k in constant time from the table.
+        k = ((b >> j) & 0b1111).to_u64
+        ti = 0
+        while ti < 15 {
+          tmp.assign!(ct_eq(k, (ti + 1).as_u64), table[ti])
+          ti += 1
+        }
+        # Multiply by x^k, discarding the result if k = 0.
+        tmp.montgomery_mul!(self, tmp, m)
+        assign!(not_choice(ct_eq(k, 0)), tmp)
+      }
+    }
+    montgomery_reduction!(m)
+  }
+
+  # out = x^e mod m for a short public exponent (leaks e); x reduced; m
+  # must be odd.
+  pub def exp_short_var_time!(x: Nat, e: U64, m: Modulus) -> Nat {
+    panic("bigmod: modulus for ExpShortVarTime must be odd") if !m.odd
+    # A plain square-and-multiply chain, skipping the leading zeros.
+    xr = new_nat()
+    xr.set!(x)
+    xr.montgomery_representation!(m)
+    set!(xr)
+    i = W - bits.len64(e) + 1
+    while i < W {
+      montgomery_mul!(self, self, m)
+      montgomery_mul!(self, xr, m) if (e >> (W - i - 1)) & 1 != 0
+      i += 1
+    }
+    montgomery_reduction!(m)
+  }
+
+  # x = a^-1 mod m, or none (x unchanged) if a isn't invertible. a reduced
+  # mod m, of any length; x gets m's length.
+  pub def inverse_var_time!(a: Nat, m: Modulus) -> Nat? {
+    r = extended_gcd(a, m.mnat)
+    return none if r.err?
+    u, aa = r.unwrap
+    return none if u.is_one == NO
+    set!(aa)
+  }
+
+  # x = GCD(a, b), a and b non-zero and at least one odd; x gets the
+  # larger length. On failure x is unchanged.
+  pub def gcd_var_time!(a: Nat, b: Nat) -> ~Nat<BigmodError> {
+    u, _a = ~extended_gcd(a, b)
+    set!(u)
+  }
+
+  # x = x >> 1, keeping the length.
+  pub def shift_right_by_one! -> Nat {
+    rshift1(self.limbs, 0)
+    self
+  }
+
+  # x = x / y, returning the remainder (panics if y is 0).
+  pub def div_short_var_time!(y: U64) -> U64 {
+    panic("bigmod: division by zero") if y == 0
+    r: U64 = 0
+    xl = self.limbs
+    i = xl.size - 1
+    while i >= 0 {
+      q, rr = bits.div64(r, xl[i], y)
+      xl[i] = q
+      r = rr
+      i -= 1
+    }
+    r
+  }
+}
+
+# A new Nat of length zero.
+pub def new_nat -> Nat { Nat.new(limbs: []) }
+
+# Sets limbs (zeroed) from big-endian b; false if b doesn't fit.
+def set_limbs_from_bytes(l: [U64], b: [Byte]) -> Bool {
+  i = b.size
+  k = 0
+  while k < l.size && i >= S {
+    l[k] = be_u64(b, i - S)
+    i -= S
+    k += 1
+  }
+  s = 0
+  while s < W && k < l.size && i > 0 {
+    l[k] |= b[i - 1].to_u64 << s
+    i -= 1
+    s += 8
+  }
+  i == 0
+}
+
+# x += y & mask (same lengths), returning the carry (0 when mask is 0).
+def add_limbs(x: [U64], y: [U64], mask: U64) -> U64 {
+  c: U64 = 0
+  i = 0
+  n = x.size
+  while i < n {
+    a = x[i]
+    b = y[i] & mask
+    s = a + b + c
+    c = ((a & b) | ((a | b) & ^s)) >> 63
+    x[i] = s
+    i += 1
+  }
+  c
+}
+
+# x -= y & mask (same lengths), returning the borrow.
+def sub_limbs(x: [U64], y: [U64], mask: U64) -> U64 {
+  c: U64 = 0
+  i = 0
+  n = x.size
+  while i < n {
+    a = x[i]
+    b = y[i] & mask
+    d = a - b - c
+    c = ((^a & b) | (^(a ^ b) & d)) >> 63
+    x[i] = d
+    i += 1
+  }
+  c
+}
+
+# z += x * y (same lengths), returning the carry word: one row of a
+# schoolbook multiplication.
+pub def add_mul_vvw(z: [U64], x: [U64], y: U64) -> U64 {
+  carry: U64 = 0
+  i = 0
+  n = z.size
+  while i < n {
+    xi = x[i]
+    lo = xi * y
+    hi = xi.__mulhi(y)
+    s = lo + z[i]
+    k1: U64 = s < lo ? 1 : 0
+    s2 = s + carry
+    k2: U64 = s2 < s ? 1 : 0
+    carry = hi + k1 + k2
+    z[i] = s2
+    i += 1
+  }
+  carry
+}
+
+# The bit length of n, leaking only that (no table lookups).
+def bit_len(n: U64) -> Int {
+  l = 0
+  v = n
+  while v != 0 {
+    l += 1
+    v >>= 1
+  }
+  l
+}
+
+# a = a >> 1 with carry shifted into the top bit.
+def rshift1(a: [U64], carry: U64) {
+  size = a.size
+  i = 0
+  while i < size {
+    v = a[i] >> 1
+    if i + 1 < size {
+      v |= a[i + 1] << (W - 1)
+    } else {
+      v |= carry << (W - 1)
+    }
+    a[i] = v
+    i += 1
+  }
+}
+
+# A modulus with its Montgomery constants. It leaks its bit length and
+# parity, not its value.
+pub struct Modulus {
+  # The modulus, without padding (Go's nat field).
+  mnat: Nat
+  # Whether m is odd; the fields below are only set then.
+  odd: Bool
+  # -m[0]^-1 mod 2^64.
+  m0inv: U64
+  # R*R mod m, for montgomery_representation.
+  rr: Nat
+
+  # The size of m in bytes.
+  pub def size -> Int { (self.bit_len + 7) / 8 }
+
+  # The size of m in bits.
+  pub def bit_len -> Int { self.mnat.bit_len_var_time }
+
+  # m as a new Nat (a copy).
+  pub def nat -> Nat {
+    n = new_nat()
+    n.set!(self.mnat)
+  }
+}
+
+# R*R mod m, R = 2^(64 n), n = m's length.
+def compute_rr(m: Modulus) -> Nat {
+  rr = new_nat()
+  rr.expand_for!(m)
+  n = rr.limbs.size
+  mlen = m.bit_len
+  log_r = W * n
+  # Start at 2^floor(log2 m), the highest bit we can set without reducing,
+  # and double up to R mod m.
+  rr.limbs[n - 1] = 1.as_u64 << ((mlen - 1) % W)
+  i = mlen - 1
+  while i < log_r {
+    rr.add!(rr, m)
+    i += 1
+  }
+  # Then from R to R*R: doublings for the top bits of the exponent log_r,
+  # a square-and-double chain for the rest (the threshold is Go's).
+  threshold = n / 4
+  k = 64
+  while (log_r >> k) <= threshold {
+    k -= 1
+  }
+  j = 0
+  while j < (log_r >> k) {
+    rr.add!(rr, m)
+    j += 1
+  }
+  while k > 0 {
+    rr.montgomery_mul!(rr, rr, m)
+    k -= 1
+    rr.add!(rr, m) if (log_r >> k) & 1 != 0
+  }
+  rr
+}
+
+# -x^-1 mod 2^64, x odd.
+def minus_inverse_mod_w(x: U64) -> U64 {
+  # Each iteration doubles the correct low bits (three are right to start).
+  y = x
+  i = 0
+  while i < 5 {
+    y = y * (2 - x * y)
+    i += 1
+  }
+  0 - y
+}
+
+# A Modulus from big-endian bytes; fails unless m > 1. Leaks the bit
+# length and the parity.
+pub def new_modulus(b: [Byte]) -> ~Modulus<BigmodError> {
+  n = new_nat()
+  n.reset_to_bytes!(b)
+  ~new_modulus_nat(n)
+}
+
+# The Modulus a * b (big-endian bytes); fails unless the product is > 1.
+pub def new_modulus_product(a: [Byte], b: [Byte]) -> ~Modulus<BigmodError> {
+  x = new_nat()
+  x.reset_to_bytes!(a)
+  y = new_nat()
+  y.reset_to_bytes!(b)
+  n = new_nat()
+  xn = x.limbs.size
+  n.reset!(xn + y.limbs.size)
+  nl = n.limbs
+  i = 0
+  while i < y.limbs.size {
+    nl[i + xn] = add_mul_vvw(nl[i...i + xn], x.limbs, y.limbs[i])
+    i += 1
+  }
+  n.trim!
+  ~new_modulus_nat(n)
+}
+
+def new_modulus_nat(n: Nat) -> ~Modulus<BigmodError> {
+  fail BigmodError.ModulusTooSmall if n.is_zero == YES || n.is_one == YES
+  m = Modulus.new(mnat: n, odd: false, m0inv: 0, rr: new_nat())
+  if n.is_odd == YES {
+    m.odd = true
+    m.m0inv = minus_inverse_mod_w(n.limbs[0])
+    m.rr = compute_rr(m)
+  }
+  m
+}
+
+# u and A with u = GCD(a, m) = A*a - B*m; u has the larger length, A has
+# m's. Fails if a or m is zero, or both are even.
+def extended_gcd(a: Nat, m: Nat) -> ~(Nat, Nat)<BigmodError> {
+  # The extended binary GCD of the Handbook of Applied Cryptography,
+  # Algorithm 14.61, as adapted by BoringSSL to bound the coefficients and
+  # avoid negative numbers (see Go's comment and
+  # https://github.com/mit-plv/fiat-crypto/pull/333/files).
+  fail BigmodError.GcdZero if a.is_zero == YES || m.is_zero == YES
+  fail BigmodError.GcdBothEven if a.is_odd == NO && m.is_odd == NO
+  size = a.limbs.size > m.limbs.size ? a.limbs.size : m.limbs.size
+  u = new_nat()
+  u.set!(a)
+  u.expand!(size)
+  v = new_nat()
+  v.set!(m)
+  v.expand!(size)
+  aa = new_nat()
+  aa.reset!(m.limbs.size)
+  aa.limbs[0] = 1
+  bb = new_nat()
+  bb.reset!(a.limbs.size)
+  cc = new_nat()
+  cc.reset!(m.limbs.size)
+  dd = new_nat()
+  dd.reset!(a.limbs.size)
+  dd.limbs[0] = 1
+  mm = Modulus.new(mnat: m, odd: false, m0inv: 0, rr: new_nat())
+  am = Modulus.new(mnat: a, odd: false, m0inv: 0, rr: new_nat())
+  # Invariants: u = A*a - B*m, v = D*m - C*a, 0 < u <= a, 0 <= v <= m,
+  # 0 <= A < m, 0 <= B <= a, 0 <= C < m, 0 <= D <= a.
+  loop {
+    # If both are odd, subtract the smaller from the larger (from v if
+    # equal, for the exit condition).
+    if u.is_odd == YES && v.is_odd == YES {
+      if v.cmp_geq(u) == NO {
+        u.raw_sub!(v)
+        aa.add!(cc, mm)
+        bb.add!(dd, am)
+      } else {
+        v.raw_sub!(u)
+        cc.add!(aa, mm)
+        dd.add!(bb, am)
+      }
+    }
+    # Exactly one of u and v is now even.
+    panic("bigmod: internal error: u and v are not in the expected state") if u.is_odd == v.is_odd
+    # Halve the even one and adjust its coefficients.
+    if u.is_odd == NO {
+      rshift1(u.limbs, 0)
+      if aa.is_odd == YES || bb.is_odd == YES {
+        rshift1(aa.limbs, aa.raw_add!(m))
+        rshift1(bb.limbs, bb.raw_add!(a))
+      } else {
+        rshift1(aa.limbs, 0)
+        rshift1(bb.limbs, 0)
+      }
+    } else {
+      rshift1(v.limbs, 0)
+      if cc.is_odd == YES || dd.is_odd == YES {
+        rshift1(cc.limbs, cc.raw_add!(m))
+        rshift1(dd.limbs, dd.raw_add!(a))
+      } else {
+        rshift1(cc.limbs, 0)
+        rshift1(dd.limbs, 0)
+      }
+    }
+    return (u, aa) if v.is_zero == YES
+  }
+}

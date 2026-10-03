@@ -1,0 +1,202 @@
+# Package elliptic: Go's crypto/elliptic, the NIST P-224, P-256, P-384 and
+# P-521 prime-order curves (short-form Weierstrass, a = -3) behind Go's
+# legacy big.Int API. As in Go, the named curves are implemented by
+# crypto/internal/fips140/nistec (constant time); CurveParams has the generic,
+# variable-time math/big implementation. Deprecated in Go in favour of
+# crypto/ecdh and crypto/ecdsa; kept for compatibility.
+#
+#   Go                                        alx
+#   type Curve interface                      Curve (interface; implemented by
+#                                             NistCurve and CurveParams)
+#   c.Params() *CurveParams                   c.params -> CurveParams
+#   c.IsOnCurve(x, y) bool                    c.on_curve?(x, y) -> Bool
+#   c.Add(x1, y1, x2, y2) (x, y)              c.add(x1, y1, x2, y2) -> (big.Int, big.Int)
+#   c.Double(x1, y1) (x, y)                   c.double(x1, y1) -> (big.Int, big.Int)
+#   c.ScalarMult(x1, y1, k) (x, y)            c.scalar_mult(x1, y1, k) -> (big.Int, big.Int)
+#   c.ScalarBaseMult(k) (x, y)                c.scalar_base_mult(k) -> (big.Int, big.Int)
+#   P224() / P256() / P384() / P521()         p224() / p256() / p384() / p521() -> Curve
+#   CurveParams{P, N, B, Gx, Gy, BitSize, Name}  CurveParams fields p, n, b, gx, gy, bit_size, name
+#   GenerateKey(curve, rand) (priv, x, y, err)   generate_key(curve, rand) -> ~([Byte], big.Int, big.Int)
+#   Marshal / MarshalCompressed(curve, x, y)  marshal / marshal_compressed(curve, x, y) -> [Byte]
+#   Unmarshal / UnmarshalCompressed(c, data)  unmarshal / unmarshal_compressed(c, data) -> (big.Int, big.Int)?
+#
+# Differences from Go:
+#   - *big.Int values are math/big's value Ints; results are fresh values.
+#     Unmarshal's (nil, nil) is none.
+#   - Go upgrades a *CurveParams to the specific implementation when it is
+#     the pointer returned by Params() of a named curve (matchesSpecificCurve
+#     compares pointers). alx values have no identity, so a CurveParams is
+#     always the generic math/big implementation: p256().params.scalar_mult
+#     is the slow, variable-time path (Go's tests make that path with a copy
+#     of the params). Use the Curve from p256() etc.
+#   - p224() etc. build their CurveParams (parsing the constants) on each
+#     call; Go builds them once (sync.Once) and returns the same pointer, so
+#     curves compare equal by identity there. Compare params.name instead.
+#   - The named curves are NistCurve values (Go's unexported
+#     nistCurve[Point]); which curve it is lives in a field, and each method
+#     dispatches to the nistec point type.
+#   - unmarshal and unmarshal_compressed always take Go's generic path (Go
+#     type-asserts the named curves to a faster nistec-based unmarshaler;
+#     alx has no type assertions on interface values). The results are the
+#     same: the generic path checks the range and calls on_curve?, which the
+#     named curves answer with nistec.
+#   - generate_key honours its rand argument (alx has no GODEBUG; this is
+#     Go's behaviour for a non-default reader) and doesn't call
+#     randutil.MaybeReadByte.
+#   - Curve has a defaulted method nist_bits (not in Go): the bit size of a
+#     named curve, 0 for a CurveParams. Go's packages recognise the named
+#     curves by comparing with the singletons (`c == elliptic.P256()`);
+#     crypto/ecdsa asks nist_bits instead.
+#   - Panics have Go's messages ("crypto/elliptic: attempted operation on
+#     invalid point", ...).
+import "io"
+import "math/big"
+
+# The interface of a short-form Weierstrass curve with a=-3. Only the curves
+# of this package (and CurveParams for them) are valid implementations.
+pub interface Curve {
+  # The parameters of the curve.
+  def params -> CurveParams
+  # Whether (x, y) lies on the curve. Deprecated in Go: use crypto/ecdh.
+  def on_curve?(x: big.Int, y: big.Int) -> Bool
+  # The sum of (x1,y1) and (x2,y2).
+  def add(x1: big.Int, y1: big.Int, x2: big.Int, y2: big.Int) -> (big.Int, big.Int)
+  # 2*(x,y).
+  def double(x1: big.Int, y1: big.Int) -> (big.Int, big.Int)
+  # k*(x,y), where k is a number in big-endian form.
+  def scalar_mult(x1: big.Int, y1: big.Int, k: [Byte]) -> (big.Int, big.Int)
+  # k*G, where G is the base point of the group and k is an integer in
+  # big-endian form.
+  def scalar_base_mult(k: [Byte]) -> (big.Int, big.Int)
+  # 224, 256, 384 or 521 when this is one of the named curves (p224() ...
+  # p521(), implemented by nistec), 0 otherwise (a CurveParams). Not in Go:
+  # Go's crypto/ecdsa and crypto/ecdh compare the Curve with the singleton
+  # elliptic.P256() etc.; alx values have no identity, so they ask this.
+  def nist_bits -> Int { 0 }
+}
+
+MASK: [Byte; 8] = [0xff, 0x1, 0x3, 0x7, 0xf, 0x1f, 0x3f, 0x7f]
+
+# A public/private key pair. The private key is generated using the given
+# reader, which must return random data (callers pass crypto/rand's
+# reader() for Go's rand.Reader). Deprecated in Go: use crypto/ecdh or
+# crypto/ecdsa.
+pub def generate_key(curve: Curve, rand: io.Reader) -> ~([Byte], big.Int, big.Int) {
+  n = curve.params.n
+  bit_size = n.bit_len
+  byte_len = (bit_size + 7) / 8
+  priv = [0.as_u8; byte_len]
+  while true {
+    ~io.read_full(rand, priv)
+    # We have to mask off any excess bits in the case that the size of the
+    # underlying field is not a whole number of bytes.
+    priv[0] = priv[0] & MASK[bit_size % 8]
+    # This is because, in tests, rand will return all zeros and we don't
+    # want to get the point at infinity and loop forever.
+    priv[1] = priv[1] ^ 0x42
+    # If the scalar is out of range, sample another random number.
+    k = big.Int.new
+    k.set_bytes!(priv)
+    next if k.cmp(n) >= 0
+    x, y = curve.scalar_base_mult(priv)
+    return (priv, x, y)
+  }
+  panic("unreachable")
+}
+
+# Converts a point on the curve into the uncompressed form specified in SEC
+# 1, Version 2.0, Section 2.3.3. If the point is not on the curve (or is the
+# conventional point at infinity), the behavior is undefined (Go: the point
+# at infinity encodes as zeros; other invalid points panic).
+pub def marshal(curve: Curve, x: big.Int, y: big.Int) -> [Byte] {
+  panic_if_not_on_curve(curve, x, y)
+  byte_len = (curve.params.bit_size + 7) / 8
+  ret = [0.as_u8; 1 + 2 * byte_len]
+  ret[0] = 4 # uncompressed point
+  x.fill_bytes(ret[1...1 + byte_len])
+  y.fill_bytes(ret[1 + byte_len...1 + 2 * byte_len])
+  ret
+}
+
+# Converts a point on the curve into the compressed form specified in SEC 1,
+# Version 2.0, Section 2.3.3. If the point is not on the curve (or is the
+# conventional point at infinity), the behavior is undefined.
+pub def marshal_compressed(curve: Curve, x: big.Int, y: big.Int) -> [Byte] {
+  panic_if_not_on_curve(curve, x, y)
+  byte_len = (curve.params.bit_size + 7) / 8
+  compressed = [0.as_u8; 1 + byte_len]
+  compressed[0] = y.bit(0).as_u8 | 2
+  x.fill_bytes(compressed[1...compressed.size])
+  compressed
+}
+
+# Converts a point, serialized by marshal, into an x, y pair. It is an error
+# if the point is not in uncompressed form, is not on the curve, or is the
+# point at infinity. On error, none.
+pub def unmarshal(curve: Curve, data: [Byte]) -> (big.Int, big.Int)? {
+  byte_len = (curve.params.bit_size + 7) / 8
+  return none if data.size != 1 + 2 * byte_len
+  return none if data[0] != 4 # uncompressed form
+  p = curve.params.p
+  x = big.Int.new
+  x.set_bytes!(data[1...1 + byte_len])
+  y = big.Int.new
+  y.set_bytes!(data[1 + byte_len...data.size])
+  return none if x.cmp(p) >= 0 || y.cmp(p) >= 0
+  return none if !curve.on_curve?(x, y)
+  (x, y)
+}
+
+# Converts a point, serialized by marshal_compressed, into an x, y pair. It
+# is an error if the point is not in compressed form, is not on the curve,
+# or is the point at infinity. On error, none.
+pub def unmarshal_compressed(curve: Curve, data: [Byte]) -> (big.Int, big.Int)? {
+  byte_len = (curve.params.bit_size + 7) / 8
+  return none if data.size != 1 + byte_len
+  return none if data[0] != 2 && data[0] != 3 # compressed form
+  p = curve.params.p
+  x = big.Int.new
+  x.set_bytes!(data[1...data.size])
+  return none if x.cmp(p) >= 0
+  # y² = x³ - 3x + b
+  y = curve.params.polynomial(x)
+  r = y.mod_sqrt!(y, p)
+  return none if r == none
+  if y.bit(0).as_u8 != data[0] & 1 {
+    y.neg!(y)
+    y.mod!(y, p)
+  }
+  return none if !curve.on_curve?(x, y)
+  (x, y)
+}
+
+def panic_if_not_on_curve(curve: Curve, x: big.Int, y: big.Int) {
+  # (0, 0) is the point at infinity by convention. It's ok to operate on it,
+  # although IsOnCurve is documented to return false for it. See Issue 37294.
+  return nil if x.sign == 0 && y.sign == 0
+  panic("crypto/elliptic: attempted operation on invalid point") if !curve.on_curve?(x, y)
+  nil
+}
+
+# A Curve which implements NIST P-224 (FIPS 186-3, section D.2.2), also
+# known as secp224r1. The CurveParams.name of this Curve is "P-224".
+# Multiple invocations of this function return the same value, so it can
+# be used for equality checks and switch statements. The cryptographic
+# operations are implemented using constant-time algorithms.
+pub def p224 -> Curve { NistCurve.new(bits: 224, prm: p224_params()) }
+
+# A Curve which implements NIST P-256 (FIPS 186-3, section D.2.3), also
+# known as secp256r1 or prime256v1. The CurveParams.name of this Curve is
+# "P-256". The cryptographic operations are implemented using constant-time
+# algorithms.
+pub def p256 -> Curve { NistCurve.new(bits: 256, prm: p256_params()) }
+
+# A Curve which implements NIST P-384 (FIPS 186-3, section D.2.4), also
+# known as secp384r1. The CurveParams.name of this Curve is "P-384". The
+# cryptographic operations are implemented using constant-time algorithms.
+pub def p384 -> Curve { NistCurve.new(bits: 384, prm: p384_params()) }
+
+# A Curve which implements NIST P-521 (FIPS 186-3, section D.2.5), also
+# known as secp521r1. The CurveParams.name of this Curve is "P-521". The
+# cryptographic operations are implemented using constant-time algorithms.
+pub def p521 -> Curve { NistCurve.new(bits: 521, prm: p521_params()) }

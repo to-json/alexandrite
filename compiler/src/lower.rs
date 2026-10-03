@@ -873,7 +873,17 @@ impl<'a> Lw<'a> {
                     v = v.map(|(x, t)| (self.bind(x, t.clone()), t));
                     self.emit_defers(0);
                 }
-                let v = v.map(|(x, _)| x);
+                // `return nil` (or any Unit value) from a def returning
+                // nothing: evaluate it, return no value (C's void).
+                let v = match v {
+                    Some((x, LTy::Unit)) => {
+                        if !matches!(x, LE::Unit) {
+                            self.emit(LS::Eval(x));
+                        }
+                        None
+                    }
+                    v => v.map(|(x, _)| x),
+                };
                 let v = match (&self.res, v) {
                     (Some(_), v) => Some(self.ok_result(v.unwrap_or(LE::B(false)))),
                     (None, v) => v,
@@ -996,7 +1006,8 @@ impl<'a> Lw<'a> {
     fn site_region(&mut self, e: &TExpr) -> Option<(LE, crate::regions::Place)> {
         // A call whose result holds no storage: where it's made doesn't matter
         // (the callee places its own allocations).
-        if matches!(e.kind, TK::Call(..)) && !crate::regions::has_storage(&e.ty) && !(self.promote() && crate::regions::contains_int(&e.ty)) {
+        let ctor = matches!(e.kind, TK::Call(..) | TK::M(M::StructNew | M::TupleNew | M::VariantNew(_) | M::EnumNew, ..));
+        if ctor && !crate::regions::has_storage(&e.ty) && !(self.promote() && crate::regions::contains_int(&e.ty)) {
             return None;
         }
         // In a lambda's body, what the analysis sends to the program region
@@ -1061,6 +1072,7 @@ impl<'a> Lw<'a> {
             TK::PlaceAssign(l, steps, op, v) => self.place_assign(*l, steps, *op, v, e),
             TK::Format(pieces, args) => self.format(pieces, args),
             TK::Seq(ss) => self.scoped_value(ss, &e.ty),
+            TK::Zero => zero_le(&self.lty(&e.ty)),
             TK::None => {
                 let t = self.lty(&e.ty);
                 let LTy::Tup(ts) = &t else { unreachable!() };

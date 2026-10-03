@@ -1,0 +1,373 @@
+#![overflow(wrap)]
+# Go's crypto/internal/fips140/rsa (rsa.go, pkcs1v15.go): the RSA
+# primitives on bigmod values that the public API in rsa.alx wraps. The
+# names keep Go's (FipsPublicKey is Go's fips140/rsa.PublicKey, ...); see
+# rsa.alx for the package header.
+
+import "crypto/internal/fips140/bigmod"
+
+# Go's fips140/rsa.PublicKey.
+struct FipsPublicKey {
+  n: bigmod.Modulus
+  e: Int
+
+  # The modulus size in bytes.
+  def size -> Int { (self.n.bit_len + 7) / 8 }
+}
+
+# Go's fips140/rsa.PrivateKey. has_crt is false for deprecated multi-prime
+# keys (Go's dP == nil); p, q, dp, dq and qinv are only set when it is
+# true.
+struct FipsPrivateKey {
+  pubk: FipsPublicKey
+  d: bigmod.Nat
+  has_crt: Bool
+  p: bigmod.Modulus
+  q: bigmod.Modulus
+  # d mod (p - 1) and d mod (q - 1), big-endian (exponents for Nat.exp!).
+  dp: [Byte]
+  dq: [Byte]
+  # q^-1 mod p
+  qinv: bigmod.Nat
+  # Whether the key complies with FIPS 186-5 / SP 800-56B (Go records
+  # it; nothing here depends on it).
+  fips_approved: Bool
+
+  def public_key -> FipsPublicKey { self.pubk }
+
+  # The key's parameters, big-endian (Go's Export): (N, e, d, P, Q, dP,
+  # dQ, qInv); the last five are empty for keys without CRT values.
+  def export -> ([Byte], Int, [Byte], [Byte], [Byte], [Byte], [Byte], [Byte]) {
+    nn = self.pubk.n
+    nb = nn.nat.bytes(nn)
+    db = self.d.bytes(nn)
+    return (nb, self.pubk.e, db, [], [], [], [], []) if !self.has_crt
+    pp = self.p
+    qq = self.q
+    (nb, self.pubk.e, db, pp.nat.bytes(pp), qq.nat.bytes(qq), self.dp.clone, self.dq.clone, self.qinv.bytes(pp))
+  }
+}
+
+# A placeholder Modulus for keys without CRT values (never used).
+def no_modulus -> bigmod.Modulus { bigmod.new_modulus([3]).unwrap }
+
+def fips_err(msg: Str) -> RsaError { RsaError.Invalid(msg: msg) }
+
+# Go's NewPrivateKey: from big-endian N, e, d, P, Q.
+def fips_new_private_key(nb: [Byte], e: Int, d: [Byte], pb: [Byte], qb: [Byte]) -> ~FipsPrivateKey {
+  n = ~bigmod.new_modulus(nb)
+  p = ~bigmod.new_modulus(pb)
+  q = ~bigmod.new_modulus(qb)
+  dn = bigmod.new_nat()
+  ~dn.set_bytes!(d, n)
+  ~fips_new_private_key_m(n, e, dn, p, q)
+}
+
+def fips_new_private_key_m(n: bigmod.Modulus, e: Int, d: bigmod.Nat, p: bigmod.Modulus, q: bigmod.Modulus) -> ~FipsPrivateKey {
+  p_minus_one = p.nat
+  p_minus_one.sub_one!(p)
+  p_minus_one_mod = ~bigmod.new_modulus(p_minus_one.bytes(p))
+  t = bigmod.new_nat()
+  t.mod!(d, p_minus_one_mod)
+  dp = t.bytes(p_minus_one_mod)
+
+  q_minus_one = q.nat
+  q_minus_one.sub_one!(q)
+  q_minus_one_mod = ~bigmod.new_modulus(q_minus_one.bytes(q))
+  t2 = bigmod.new_nat()
+  t2.mod!(d, q_minus_one_mod)
+  dq = t2.bytes(q_minus_one_mod)
+
+  # Constant-time inversion modulo the prime p by Fermat's little
+  # theorem: qInv = q^(p-2) mod p.
+  fail fips_err("crypto/rsa: p is even") if p.nat.is_odd == 0
+  p_minus_two = p.nat
+  p_minus_two.sub_one!(p)
+  p_minus_two.sub_one!(p)
+  qinv = bigmod.new_nat()
+  qinv.mod!(q.nat, p)
+  qinv.exp!(qinv, p_minus_two.bytes(p), p)
+
+  pk = FipsPrivateKey.new(pubk: FipsPublicKey.new(n: n, e: e), d: d, has_crt: true, p: p, q: q, dp: dp, dq: dq, qinv: qinv)
+  pk.fips_approved = ~check_private_key(pk)
+  pk
+}
+
+# Go's NewPrivateKeyWithPrecomputation.
+def fips_new_private_key_with_precomputation(nb: [Byte], e: Int, d: [Byte], pb: [Byte], qb: [Byte], dp: [Byte], dq: [Byte], qinv: [Byte]) -> ~FipsPrivateKey {
+  n = ~bigmod.new_modulus(nb)
+  p = ~bigmod.new_modulus(pb)
+  q = ~bigmod.new_modulus(qb)
+  dn = bigmod.new_nat()
+  ~dn.set_bytes!(d, n)
+  qi = bigmod.new_nat()
+  ~qi.set_bytes!(qinv, p)
+  pk = FipsPrivateKey.new(pubk: FipsPublicKey.new(n: n, e: e), d: dn, has_crt: true, p: p, q: q, dp: dp, dq: dq, qinv: qi)
+  pk.fips_approved = ~check_private_key(pk)
+  pk
+}
+
+# Go's NewPrivateKeyWithoutCRT (deprecated multi-prime keys).
+def fips_new_private_key_without_crt(nb: [Byte], e: Int, d: [Byte]) -> ~FipsPrivateKey {
+  n = ~bigmod.new_modulus(nb)
+  dn = bigmod.new_nat()
+  ~dn.set_bytes!(d, n)
+  pk = FipsPrivateKey.new(pubk: FipsPublicKey.new(n: n, e: e), d: dn, has_crt: false, p: no_modulus(), q: no_modulus(), dp: [], dq: [], qinv: bigmod.new_nat())
+  pk.fips_approved = ~check_private_key(pk)
+  pk
+}
+
+# Go's checkPrivateKey: validates priv; returns whether it is
+# FIPS-approved (Go sets priv.fipsApproved).
+def check_private_key(priv: FipsPrivateKey) -> ~Bool {
+  approved = ~check_public_key(priv.pubk)
+  # Legacy and deprecated multi-prime keys.
+  return false if !priv.has_crt
+  nn = priv.pubk.n
+  p = priv.p
+  q = priv.q
+
+  # FIPS 186-5, Section 5.1: p and q of the same bit length.
+  approved = false if p.bit_len != q.bit_len
+
+  # pq = 0 mod N (and p < N, q < N).
+  pn = bigmod.new_nat()
+  pn.expand_for!(nn)
+  fail fips_err("crypto/rsa: invalid prime") if pn.set_bytes!(p.nat.bytes(p), nn).err?
+  qn = bigmod.new_nat()
+  qn.expand_for!(nn)
+  fail fips_err("crypto/rsa: invalid prime") if qn.set_bytes!(q.nat.bytes(q), nn).err?
+  fail fips_err("crypto/rsa: p * q != n") if pn.mul!(qn, nn).is_zero != 1
+
+  # de = 1 mod p-1 and de = 1 mod q-1: e is invertible modulo lambda(N)
+  # and a^de = a mod N. This checks dP, dQ and e.
+  pm1n = p.nat
+  pm1n.sub_one!(p)
+  pm1 = bigmod.new_modulus(pm1n.bytes(p)).ok
+  fail fips_err("crypto/rsa: invalid prime") if pm1 == none
+  p_minus1 = pm1.unwrap
+  dpn = bigmod.new_nat()
+  fail fips_err("crypto/rsa: invalid CRT exponent") if dpn.set_bytes!(priv.dp, p_minus1).err?
+  de = bigmod.new_nat()
+  de.set_uint!(priv.pubk.e.as_u64)
+  de.expand_for!(p_minus1)
+  de.mul!(dpn, p_minus1)
+  fail fips_err("crypto/rsa: invalid CRT exponent") if de.is_one != 1
+
+  qm1n = q.nat
+  qm1n.sub_one!(q)
+  qm1 = bigmod.new_modulus(qm1n.bytes(q)).ok
+  fail fips_err("crypto/rsa: invalid prime") if qm1 == none
+  q_minus1 = qm1.unwrap
+  dqn = bigmod.new_nat()
+  fail fips_err("crypto/rsa: invalid CRT exponent") if dqn.set_bytes!(priv.dq, q_minus1).err?
+  de.set_uint!(priv.pubk.e.as_u64)
+  de.expand_for!(q_minus1)
+  de.mul!(dqn, q_minus1)
+  fail fips_err("crypto/rsa: invalid CRT exponent") if de.is_one != 1
+
+  # qInv * q = 1 mod p.
+  qp = bigmod.new_nat()
+  if qp.set_overflowing_bytes!(q.nat.bytes(q), p).err? {
+    # q >= 2^ceil(log2(p))
+    qp.mod!(q.nat, p)
+  }
+  fail fips_err("crypto/rsa: invalid CRT coefficient") if qp.mul!(priv.qinv, p).is_one != 1
+
+  # d against dP and dQ, though d itself is never used.
+  dp1 = bigmod.new_nat()
+  dp1.mod!(priv.d, p_minus1)
+  fail fips_err("crypto/rsa: d does not match dP") if dp1.equal(dpn) != 1
+  dq1 = bigmod.new_nat()
+  dq1.mod!(priv.d, q_minus1)
+  fail fips_err("crypto/rsa: d does not match dQ") if dq1.equal(dqn) != 1
+
+  # |p - q| > 2^(nlen/2 - 100): close primes make N easy to factor with
+  # Fermat's method.
+  diff = bigmod.new_nat()
+  qp2 = bigmod.new_nat()
+  if qp2.set_bytes!(q.nat.bytes(q), p).err? {
+    # q > p
+    pq = bigmod.new_nat()
+    fail fips_err("crypto/rsa: p == q") if pq.set_bytes!(p.nat.bytes(p), q).err?
+    # diff = 0 - p mod q = q - p
+    diff.expand_for!(q)
+    diff.sub!(pq, q)
+  } else {
+    # p > q: diff = 0 - q mod p = p - q
+    diff.expand_for!(p)
+    diff.sub!(qp2, p)
+  }
+  # Leaks only the magnitude of p - q (not adaptively).
+  fail fips_err("crypto/rsa: |p - q| too small") if diff.bit_len_var_time <= nn.bit_len / 2 - 100
+
+  # d > 2^(nlen/2) (small d attacks).
+  fail fips_err("crypto/rsa: d too small") if priv.d.bit_len_var_time <= nn.bit_len / 2
+  approved
+}
+
+# Go's checkPublicKey: fails for unusable keys; returns whether the key
+# is FIPS-approved.
+def check_public_key(pubk: FipsPublicKey) -> ~Bool {
+  approved = true
+  nn = pubk.n
+  fail fips_err("crypto/rsa: public modulus is even") if nn.nat.is_odd == 0
+  # FIPS 186-5, Section 5.1: an even bit length of at least 2048.
+  approved = false if nn.bit_len < 2048
+  approved = false if nn.bit_len % 2 == 1
+  fail fips_err("crypto/rsa: public exponent too small or negative") if pubk.e < 2
+  # e must be invertible modulo lambda(pq), so odd.
+  fail fips_err("crypto/rsa: public exponent is even") if pubk.e & 1 == 0
+  # FIPS 186-5, Section 5.5(e): 2^16 < e < 2^256.
+  approved = false if pubk.e <= 1 << 16
+  # e fits in 32 bits, as in Go on every platform.
+  fail fips_err("crypto/rsa: public exponent too large") if pubk.e > (1 << 31) - 1
+  approved
+}
+
+# Go's Encrypt: the RSA public key operation.
+def fips_encrypt(pubk: FipsPublicKey, plaintext: [Byte]) -> ~[Byte] {
+  ~check_public_key(pubk)
+  ~fips_encrypt_raw(pubk, plaintext)
+}
+
+def fips_encrypt_raw(pubk: FipsPublicKey, plaintext: [Byte]) -> ~[Byte] {
+  nn = pubk.n
+  m = bigmod.new_nat()
+  ~m.set_bytes!(plaintext, nn)
+  out = bigmod.new_nat()
+  out.exp_short_var_time!(m, pubk.e.as_u64, nn)
+  out.bytes(nn)
+}
+
+# Go's DecryptWithoutCheck / DecryptWithCheck: the RSA private key
+# operation; with check, m^e is compared with the ciphertext to catch
+# faults in the CRT computation.
+def fips_decrypt(priv: FipsPrivateKey, ciphertext: [Byte], check: Bool) -> ~[Byte] {
+  nn = priv.pubk.n
+  c = bigmod.new_nat()
+  fail RsaError.Decryption if c.set_bytes!(ciphertext, nn).err?
+  m = bigmod.new_nat()
+  if !priv.has_crt {
+    # Legacy path for deprecated multi-prime keys.
+    m.exp!(c, priv.d.bytes(nn), nn)
+  } else {
+    pp = priv.p
+    qq = priv.q
+    t0 = bigmod.new_nat()
+    # m = c ^ Dp mod p
+    t0.mod!(c, pp)
+    m.exp!(t0, priv.dp, pp)
+    # m2 = c ^ Dq mod q
+    m2 = bigmod.new_nat()
+    t0.mod!(c, qq)
+    m2.exp!(t0, priv.dq, qq)
+    # m = m - m2 mod p
+    t0.mod!(m2, pp)
+    m.sub!(t0, pp)
+    # m = m * Qinv mod p
+    m.mul!(priv.qinv, pp)
+    # m = m * q mod N
+    m.expand_for!(nn)
+    t0.mod!(qq.nat, nn)
+    m.mul!(t0, nn)
+    # m = m + m2 mod N
+    m2.expand_for!(nn)
+    m.add!(m2, nn)
+  }
+  if check {
+    c1 = bigmod.new_nat()
+    c1.exp_short_var_time!(m, priv.pubk.e.as_u64, nn)
+    fail RsaError.Decryption if c1.equal(c) != 1
+  }
+  m.bytes(nn)
+}
+
+# ---- PKCS #1 v1.5 signatures (Go's fips140/rsa/pkcs1v15.go) ----
+
+def bs(b: [Byte]) -> [Byte] { b }
+
+# The DER prefix of a DigestInfo for each hash name, before the digest.
+def hash_prefix(hash: Str) -> [Byte]? {
+  case hash {
+    "MD5" => bs([0x30, 0x20, 0x30, 0x0c, 0x06, 0x08, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x02, 0x05, 0x05, 0x00, 0x04, 0x10])
+    "SHA-1" => bs([0x30, 0x21, 0x30, 0x09, 0x06, 0x05, 0x2b, 0x0e, 0x03, 0x02, 0x1a, 0x05, 0x00, 0x04, 0x14])
+    "SHA-224" => bs([0x30, 0x2d, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x04, 0x05, 0x00, 0x04, 0x1c])
+    "SHA-256" => bs([0x30, 0x31, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01, 0x05, 0x00, 0x04, 0x20])
+    "SHA-384" => bs([0x30, 0x41, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x02, 0x05, 0x00, 0x04, 0x30])
+    "SHA-512" => bs([0x30, 0x51, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x03, 0x05, 0x00, 0x04, 0x40])
+    "SHA-512/224" => bs([0x30, 0x2d, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x05, 0x05, 0x00, 0x04, 0x1C])
+    "SHA-512/256" => bs([0x30, 0x31, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x06, 0x05, 0x00, 0x04, 0x20])
+    "SHA3-224" => bs([0x30, 0x2d, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x07, 0x05, 0x00, 0x04, 0x1C])
+    "SHA3-256" => bs([0x30, 0x31, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x08, 0x05, 0x00, 0x04, 0x20])
+    "SHA3-384" => bs([0x30, 0x41, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x09, 0x05, 0x00, 0x04, 0x30])
+    "SHA3-512" => bs([0x30, 0x51, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x0a, 0x05, 0x00, 0x04, 0x40])
+    # The TLS special case, without an ASN.1 prefix.
+    "MD5+SHA1" => bs([])
+    "RIPEMD-160" => bs([0x30, 0x20, 0x30, 0x08, 0x06, 0x06, 0x28, 0xcf, 0x06, 0x03, 0x00, 0x31, 0x04, 0x14])
+    _ => none
+  }
+}
+
+def hash_size(hash: Str) -> Int {
+  case hash {
+    "MD5" => 16
+    "SHA-1" => 20
+    "RIPEMD-160" => 20
+    "SHA-224" => 28
+    "SHA-512/224" => 28
+    "SHA3-224" => 28
+    "SHA-256" => 32
+    "SHA-512/256" => 32
+    "SHA3-256" => 32
+    "SHA-384" => 48
+    "SHA3-384" => 48
+    "SHA-512" => 64
+    "SHA3-512" => 64
+    "MD5+SHA1" => 36
+    _ => -1
+  }
+}
+
+# Go's fips140/rsa.SignPKCS1v15: hash is a crypto.Hash name ("SHA-256"),
+# or "" to sign hashed as it is.
+def fips_sign_pkcs1v15(priv: FipsPrivateKey, hash: Str, hashed: [Byte]) -> ~[Byte] {
+  em = ~pkcs1v15_construct_em(priv.pubk, hash, hashed)
+  ~fips_decrypt(priv, em, true)
+}
+
+def pkcs1v15_construct_em(pubk: FipsPublicKey, hash: Str, hashed: [Byte]) -> ~[Byte] {
+  prefix: [Byte] = []
+  if hash != "" {
+    pr = hash_prefix(hash)
+    fail fips_err("crypto/rsa: unsupported hash function") if pr == none
+    prefix = pr.unwrap
+    fail fips_err("crypto/rsa: hashed message length does not match hash function") if hashed.size != hash_size(hash)
+  }
+  # EM = 0x00 || 0x01 || PS || 0x00 || T
+  k = pubk.size
+  fail RsaError.MessageTooLong if k < prefix.size + hashed.size + 2 + 8 + 1
+  em = [0.as_u8; k]
+  em[1] = 1
+  i = 2
+  while i < k - prefix.size - hashed.size - 1 {
+    em[i] = 0xff
+    i += 1
+  }
+  copy(em[k - prefix.size - hashed.size...k], prefix)
+  copy(em[k - hashed.size...k], hashed)
+  em
+}
+
+# Go's fips140/rsa.VerifyPKCS1v15.
+def fips_verify_pkcs1v15(pubk: FipsPublicKey, hash: Str, hashed: [Byte], sig: [Byte]) -> ~Unit {
+  ~check_public_key(pubk)
+  # RFC 8017 Section 8.2.2: the signature must be k octets.
+  fail RsaError.Verification if pubk.size != sig.size
+  em = fips_encrypt_raw(pubk, sig)
+  fail RsaError.Verification if em.err?
+  expected = pkcs1v15_construct_em(pubk, hash, hashed)
+  fail RsaError.Verification if expected.err?
+  fail RsaError.Verification if em.unwrap != expected.unwrap
+  nil
+}

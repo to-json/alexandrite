@@ -1,0 +1,782 @@
+#![overflow(wrap)]
+# Package rsa: Go's crypto/rsa, RSA encryption and signatures as in
+# PKCS #1 / RFC 8017: PKCS #1 v1.5 and OAEP encryption, PKCS #1 v1.5 and
+# PSS signatures, key generation. Go's crypto/internal/fips140/rsa (the
+# primitives on crypto/internal/fips140/bigmod) is merged in: fips.alx,
+# keygen.alx, pkcs1v22.alx. Keys are Go's raw structs, with math/big
+# integers where Go's API has *big.Int.
+#
+#   Go                                        alx
+#   PublicKey{N, E} / pub.Size()              PublicKey{n, e} / pub.size
+#   pub.Equal(x crypto.PublicKey)             pub.equal?(x: PublicKey)
+#   PrivateKey{PublicKey, D, Primes,          PrivateKey{public_key, d, primes,
+#     Precomputed}                              precomputed}; priv.n / priv.e / priv.size
+#   priv.Public() crypto.PublicKey            priv.public -> PublicKey
+#   priv.Equal(x crypto.PrivateKey)           priv.equal?(x: PrivateKey)
+#   priv.Sign(rand, digest, opts)             priv.sign(random, digest, opts) -> ~[Byte]
+#   priv.Decrypt(rand, ciphertext, opts)      priv.decrypt(random, ciphertext, opts) -> ~[Byte]
+#   priv.Validate() error                     priv.validate -> ~Unit
+#   priv.Precompute()                         priv.precompute!
+#   PrecomputedValues{Dp, Dq, Qinv, CRTValues} PrecomputedValues{dp, dq, qinv: big.Int?, crt_values}
+#   CRTValue{Exp, Coeff, R}                   CRTValue{exp, coeff, r}
+#   GenerateKey(rand, bits)                   generate_key(random, bits) -> ~PrivateKey
+#   GenerateMultiPrimeKey(rand, n, bits)      generate_multi_prime_key(random, n, bits)
+#   SignPKCS1v15(rand, priv, hash, hashed)    sign_pkcs1v15(random, priv, hash: crypto.Hash?, hashed)
+#   VerifyPKCS1v15(pub, hash, hashed, sig)    verify_pkcs1v15(pub, hash: crypto.Hash?, hashed, sig) -> ~Unit
+#   SignPSS(rand, priv, hash, digest, opts)   sign_pss(random, priv, hash, digest, opts: PSSOptions?)
+#   VerifyPSS(pub, hash, digest, sig, opts)   verify_pss(pub, hash, digest, sig, opts: PSSOptions?) -> ~Unit
+#   PSSOptions{SaltLength, Hash}              PSSOptions{salt_length, hash: crypto.Hash?}
+#   PSSSaltLengthAuto / EqualsHash            PSS_SALT_LENGTH_AUTO / PSS_SALT_LENGTH_EQUALS_HASH
+#   EncryptOAEP(hash, rand, pub, msg, label)  encrypt_oaep(hash, random, pub, msg, label)
+#   EncryptOAEPWithOptions(rand, pub, msg, o) encrypt_oaep_with_options(random, pub, msg, opts)
+#   DecryptOAEP(hash, rand, priv, ct, label)  decrypt_oaep(hash, random, priv, ciphertext, label)
+#   OAEPOptions{Hash, MGFHash, Label}         OAEPOptions{hash, mgf_hash: crypto.Hash?, label}
+#   EncryptPKCS1v15(rand, pub, msg)           encrypt_pkcs1v15(random, pub, msg)
+#   DecryptPKCS1v15(rand, priv, ct)           decrypt_pkcs1v15(random, priv, ciphertext)
+#   DecryptPKCS1v15SessionKey(rand, p, c, k)  decrypt_pkcs1v15_session_key(random, priv, ciphertext, key) -> ~Unit
+#   PKCS1v15DecryptOptions{SessionKeyLen}     PKCS1v15DecryptOptions{session_key_len}
+#   ErrMessageTooLong / ErrDecryption /       RsaError.MessageTooLong / Decryption /
+#     ErrVerification                           Verification (other errors: RsaError.Invalid(msg))
+#
+# A PrivateKey is a crypto.Signer and a crypto.Decrypter; PSSOptions are
+# crypto.SignerOpts, OAEPOptions and PKCS1v15DecryptOptions are
+# crypto.DecrypterOpts.
+#
+# Randomness: every rand/random parameter is honored, as in Go with
+# GODEBUG=cryptocustomrand=1 (Go 1.26+ ignores it by default and uses its
+# DRBG); pass crypto/rand's rand.reader() for the default. Go's
+# randutil.MaybeReadByte isn't applied (Go doesn't apply it to these
+# functions either). Key generation reads its prime candidates from
+# random and its Miller-Rabin bases from crypto/rand (Go: its DRBG), so
+# keys are a function of random's bytes (Go's c2sp.org/det-keygen vectors
+# reproduce). The `random` arguments Go documents as "legacy and ignored"
+# (DecryptOAEP, DecryptPKCS1v15, ...) are ignored here too.
+#
+# Timing: private key operations are constant time (bigmod's windowed
+# exponentiation with the CRT, masked selections in the padding checks)
+# except key generation and deprecated multi-prime keys, as in Go. As
+# crypto/subtle's header says, alx and the C compiler behind --release
+# don't promise the absence of secret-dependent branches the way Go's
+# compiler is relied on to.
+#
+# Differences from Go:
+#   - Values, not pointers: PrivateKey embeds no PublicKey; its public
+#     half is the field public_key (priv.n, priv.e and priv.size read it).
+#     precompute! changes the variable it is called on.
+#   - No nil *big.Int: a zero N, D or prime stands for Go's nil (the
+#     same "missing ..." / "... is nil" errors); Precomputed's Dp, Dq,
+#     Qinv are optionals (none = nil).
+#   - crypto.Hash(0) ("sign the message itself") is a none crypto.Hash?
+#     (sign_pkcs1v15 / verify_pkcs1v15 take crypto.Hash?); a PSSOptions
+#     hash of none is Go's zero Hash.
+#   - Go's Sign and Decrypt type-switch on their options; alx has no type
+#     assertions, so crypto.SignerOpts has a defaulted method
+#     pss_salt_length (none unless the opts are PSSOptions) and
+#     crypto.DecrypterOpts has oaep_options and pkcs1v15_session_key_len
+#     (none unless the opts are OAEPOptions / PKCS1v15DecryptOptions).
+#     Go's nil opts for Decrypt (PKCS #1 v1.5) is PKCS1v15DecryptOptions.new.
+#   - Equal takes the concrete type (PublicKey / PrivateKey) instead of a
+#     crypto.PublicKey / crypto.PrivateKey that it would type-assert;
+#     public returns the concrete PublicKey (a crypto.PublicKey).
+#   - The minimum key size of 1024 bits is always enforced by the public
+#     functions: alx has no GODEBUG (rsa1024min=0). The package's tests use
+#     the private *_g variants with min1024 = false where Go's tests set
+#     rsa1024min=0.
+#   - No FIPS 140 mode, BoringCrypto, service indicators or pairwise
+#     consistency tests (fips140only, RecordApproved, PCT): the default
+#     (non-FIPS) behavior of Go.
+#   - GenerateMultiPrimeKey uses a port of crypto/rand.Prime (alx's
+#     crypto/rand has none) reading from random; its ProbablyPrime is
+#     math/big's.
+#   - Errors are RsaError variants with Go's messages; bigmod and io
+#     errors (e.g. "input overflows the modulus", "unexpected EOF")
+#     propagate as they do in Go.
+
+import "crypto"
+import "crypto/internal/fips140/bigmod"
+import "crypto/subtle"
+import "hash"
+import "io"
+import "math/big"
+
+# Errors of the package (Go's error values and errors.New messages).
+pub error RsaError {
+  # Go's ErrMessageTooLong.
+  MessageTooLong
+  # Go's ErrDecryption (deliberately vague).
+  Decryption
+  # Go's ErrVerification (deliberately vague).
+  Verification
+  # A key below the 1024-bit minimum.
+  KeyTooSmall(size: Int)
+  # Go's internal errDivisorTooLarge (key generation retries on it).
+  DivisorTooLarge
+  # Any other error, with Go's message.
+  Invalid(msg: Str)
+
+  def message -> Str {
+    case self {
+      MessageTooLong => "crypto/rsa: message too long for RSA key size"
+      Decryption => "crypto/rsa: decryption error"
+      Verification => "crypto/rsa: verification error"
+      KeyTooSmall(size) => "crypto/rsa: #{size}-bit keys are insecure (see https://go.dev/pkg/crypto/rsa#hdr-Minimum_key_size)"
+      DivisorTooLarge => "divisor too large"
+      Invalid(msg) => msg
+    }
+  }
+}
+
+def invalid(msg: Str) -> RsaError { RsaError.Invalid(msg: msg) }
+
+# PSSOptions.salt_length: as large as possible when signing, detected
+# when verifying (in FIPS mode Go caps it at the hash length).
+pub PSS_SALT_LENGTH_AUTO = 0
+# PSSOptions.salt_length: the length of the hash.
+pub PSS_SALT_LENGTH_EQUALS_HASH = -1
+
+# The public part of an RSA key. N and E are not secret.
+pub struct PublicKey {
+  # The modulus.
+  n: big.Int
+  # The public exponent.
+  e: Int
+
+  # The modulus size in bytes (the size of signatures and ciphertexts).
+  pub def size -> Int { (self.n.bit_len + 7) / 8 }
+
+  # Whether x is the same key.
+  pub def equal?(x: PublicKey) -> Bool { big_int_equal(self.n, x.n) && self.e == x.e }
+}
+
+# Options for OAEP encryption and decryption (a crypto.DecrypterOpts).
+pub struct OAEPOptions {
+  # The hash of the OAEP padding.
+  hash: crypto.Hash
+  # The hash of MGF1; none: hash.
+  mgf_hash: crypto.Hash?
+  # A string that must be the same when encrypting and decrypting.
+  label: [Byte]
+
+  # The crypto.DecrypterOpts hook that stands for Go's type switch.
+  pub def oaep_options -> (crypto.Hash, crypto.Hash?, [Byte])? { (self.hash, self.mgf_hash, self.label) }
+}
+
+# Options for creating and verifying PSS signatures (a crypto.SignerOpts).
+pub struct PSSOptions {
+  # The salt length in bytes, or PSS_SALT_LENGTH_AUTO /
+  # PSS_SALT_LENGTH_EQUALS_HASH.
+  salt_length: Int
+  # The message digest's hash; when set, it overrides sign_pss's hash.
+  # Required by PrivateKey.sign.
+  hash: crypto.Hash?
+
+  # The hash (crypto.SignerOpts).
+  pub def hash_func -> crypto.Hash? { self.hash }
+
+  # The crypto.SignerOpts hook that stands for Go's type switch.
+  pub def pss_salt_length -> Int? { self.salt_length }
+}
+
+def pss_salt_length_of(opts: PSSOptions?) -> Int {
+  if o = opts {
+    return o.salt_length
+  }
+  PSS_SALT_LENGTH_AUTO
+}
+
+# Options for PKCS #1 v1.5 decryption through crypto.Decrypter.
+# Deprecated in Go: PKCS #1 v1.5 encryption is dangerous; use OAEP.
+pub struct PKCS1v15DecryptOptions {
+  # The length of the session key being decrypted. If not zero, a padding
+  # error makes Decrypt return a random key of this length instead of an
+  # error, in constant time.
+  session_key_len: Int
+
+  # The crypto.DecrypterOpts hook that stands for Go's type switch.
+  pub def pkcs1v15_session_key_len -> Int? { self.session_key_len }
+}
+
+# Precomputed values that speed up private key operations.
+pub struct PrecomputedValues {
+  # D mod (P-1), D mod (Q-1).
+  dp: big.Int?
+  dq: big.Int?
+  # Q^-1 mod P
+  qinv: big.Int?
+  # The CRT values of the third and later primes. Deprecated: filled in
+  # by precompute! but unused (multi-prime keys don't use the CRT).
+  crt_values: [CRTValue]
+  # The internal key.
+  fips: FipsPrivateKey?
+}
+
+# The precomputed CRT values of one prime of a multi-prime key.
+pub struct CRTValue {
+  # D mod (prime-1).
+  exp: big.Int
+  # R * Coeff = 1 mod Prime.
+  coeff: big.Int
+  # The product of the primes before this one (including p and q).
+  r: big.Int
+}
+
+# An RSA private key. Don't change its fields after precompute!.
+pub struct PrivateKey {
+  # The public part.
+  public_key: PublicKey
+  # The private exponent.
+  d: big.Int
+  # The prime factors of N (at least two).
+  primes: [big.Int]
+  # Values precompute! fills in.
+  precomputed: PrecomputedValues
+
+  # The modulus (Go's promoted N).
+  pub def n -> big.Int { self.public_key.n }
+  # The public exponent (Go's promoted E).
+  pub def e -> Int { self.public_key.e }
+  # The modulus size in bytes.
+  pub def size -> Int { self.public_key.size }
+
+  # The public key (crypto.Signer, crypto.Decrypter).
+  pub def public -> PublicKey { self.public_key }
+
+  # Whether x has the same values (Precomputed is ignored).
+  pub def equal?(x: PrivateKey) -> Bool {
+    return false if !self.public_key.equal?(x.public_key) || !big_int_equal(self.d, x.d)
+    return false if self.primes.size != x.primes.size
+    i = 0
+    while i < self.primes.size {
+      return false if !big_int_equal(self.primes[i], x.primes[i])
+      i += 1
+    }
+    true
+  }
+
+  # Signs digest (the message hashed with opts.hash_func): PSS if opts are
+  # PSSOptions, PKCS #1 v1.5 otherwise (crypto.Signer).
+  pub def sign(random: io.Reader, digest: [Byte], opts: crypto.SignerOpts) -> ~[Byte] { ~self.sign_g(random, digest, opts, true) }
+
+  def sign_g(random: io.Reader, digest: [Byte], opts: crypto.SignerOpts, min1024: Bool) -> ~[Byte] {
+    if sl = opts.pss_salt_length {
+      po = PSSOptions.new(salt_length: sl, hash: opts.hash_func)
+      return ~sign_pss_g(random, self, opts.hash_func, digest, po, min1024)
+    }
+    ~sign_pkcs1v15_g(random, self, opts.hash_func, digest, min1024)
+  }
+
+  # Decrypts ciphertext: OAEP for OAEPOptions, PKCS #1 v1.5 for
+  # PKCS1v15DecryptOptions (crypto.Decrypter).
+  pub def decrypt(random: io.Reader, ciphertext: [Byte], opts: crypto.DecrypterOpts) -> ~[Byte] {
+    ~self.decrypt_g(random, ciphertext, opts, true)
+  }
+
+  def decrypt_g(random: io.Reader, ciphertext: [Byte], opts: crypto.DecrypterOpts, min1024: Bool) -> ~[Byte] {
+    if o = opts.oaep_options {
+      h = o[0]
+      fail invalid("rsa: requested hash function unavailable: #{h.to_s}") if !h.available?
+      mgf = o[1] || h
+      fail invalid("rsa: requested hash function unavailable: #{mgf.to_s}") if !mgf.available?
+      return ~decrypt_oaep_g(h.new, mgf.new, self, ciphertext, o[2], min1024)
+    }
+    if l = opts.pkcs1v15_session_key_len {
+      if l > 0 {
+        plaintext = [0.as_u8; l]
+        ~io.read_exact(random, plaintext)
+        ~decrypt_pkcs1v15_session_key_g(random, self, ciphertext, plaintext, min1024)
+        return plaintext
+      }
+      return ~decrypt_pkcs1v15_g(random, self, ciphertext, min1024)
+    }
+    fail invalid("crypto/rsa: invalid options for Decrypt")
+  }
+
+  # Basic checks of the key: fails with a description of the problem.
+  # Faster after precompute!.
+  pub def validate -> ~Unit {
+    # Keys with only d work, but can't be marshalled: rejected here.
+    fail invalid("crypto/rsa: missing primes") if self.primes.size < 2
+    # A consistent fips key was validated when it was made.
+    if !precomputed_is_consistent {
+      fail invalid("crypto/rsa: precomputed values are inconsistent with the key") if self.precomputed.fips != none
+      ~self.compute_precomputed
+    }
+    nil
+  }
+
+  def precomputed_is_consistent -> Bool {
+    f = self.precomputed.fips
+    return false if f == none
+    xn, xe, xd, xp, xq, xdp, xdq, xqinv = f.unwrap.export
+    return false if !big_int_equal_to_bytes(self.public_key.n, xn) || self.public_key.e != xe || !big_int_equal_to_bytes(self.d, xd)
+    return xp.size == 0 && xq.size == 0 && xdp.size == 0 && xdq.size == 0 && xqinv.size == 0 if self.primes.size != 2
+    big_int_equal_to_bytes(self.primes[0], xp) && big_int_equal_to_bytes(self.primes[1], xq) &&
+      opt_equal_to_bytes(self.precomputed.dp, xdp) && opt_equal_to_bytes(self.precomputed.dq, xdq) &&
+      opt_equal_to_bytes(self.precomputed.qinv, xqinv)
+  }
+
+  # Computes the values that speed up later private key operations. Safe
+  # on unvalidated keys; run validate afterwards to see any problem
+  # (Precompute reports none). A no-op on a precomputed key.
+  pub def precompute! {
+    return nil if precomputed_is_consistent
+    r = self.compute_precomputed
+    if v = r.ok {
+      self.precomputed = v
+    } else {
+      # No way to report it: validate re-runs and reports it.
+      self.precomputed.fips = none
+    }
+  }
+
+  # Go's precompute: the PrecomputedValues for the key (doesn't change it).
+  def compute_precomputed -> ~PrecomputedValues {
+    fail invalid("crypto/rsa: missing public modulus") if self.public_key.n.sign == 0
+    fail invalid("crypto/rsa: missing private exponent") if self.d.sign == 0
+    return ~self.precompute_legacy if self.primes.size != 2
+    fail invalid("crypto/rsa: prime P is nil") if self.primes[0].sign == 0
+    fail invalid("crypto/rsa: prime Q is nil") if self.primes[1].sign == 0
+    pc = self.precomputed
+    # The CRT values are already there: use them.
+    if pc.dp != none && pc.dq != none && pc.qinv != none {
+      k = ~fips_new_private_key_with_precomputation(self.public_key.n.bytes, self.public_key.e, self.d.bytes, self.primes[0].bytes,
+        self.primes[1].bytes, pc.dp.unwrap.bytes, pc.dq.unwrap.bytes, pc.qinv.unwrap.bytes)
+      return PrecomputedValues.new(dp: pc.dp, dq: pc.dq, qinv: pc.qinv, crt_values: [], fips: k)
+    }
+    k = ~fips_new_private_key(self.public_key.n.bytes, self.public_key.e, self.d.bytes, self.primes[0].bytes, self.primes[1].bytes)
+    _n, _e, _d, _p, _q, dp, dq, qinv = k.export
+    PrecomputedValues.new(dp: from_bytes(dp), dq: from_bytes(dq), qinv: from_bytes(qinv), crt_values: [], fips: k)
+  }
+
+  def precompute_legacy -> ~PrecomputedValues {
+    k = ~fips_new_private_key_without_crt(self.public_key.n.bytes, self.public_key.e, self.d.bytes)
+    pc = PrecomputedValues.new(dp: none, dq: none, qinv: none, crt_values: [], fips: k)
+    return pc if self.primes.size < 2
+    # Keep Mod and ModInverse below from panicking.
+    for prime in self.primes {
+      fail invalid("crypto/rsa: prime factor is nil") if prime.sign == 0
+      fail invalid("crypto/rsa: prime factor is <= 1") if prime.cmp(big.new_int(1)) <= 0
+    }
+    one = big.new_int(1)
+    dp = big.Int.new
+    dp.sub!(self.primes[0], one)
+    dp.mod!(self.d, dp)
+    dq = big.Int.new
+    dq.sub!(self.primes[1], one)
+    dq.mod!(self.d, dq)
+    qi = big.Int.new
+    qinv = qi.mod_inverse!(self.primes[1], self.primes[0])
+    fail invalid("crypto/rsa: prime factors are not relatively prime") if qinv == none
+    r = big.Int.new
+    r.mul!(self.primes[0], self.primes[1])
+    crt: [CRTValue] = []
+    i = 2
+    while i < self.primes.size {
+      prime = self.primes[i]
+      ex = big.Int.new
+      ex.sub!(prime, one)
+      ex.mod!(self.d, ex)
+      co = big.Int.new
+      coeff = co.mod_inverse!(r, prime)
+      fail invalid("crypto/rsa: prime factors are not relatively prime") if coeff == none
+      rr = big.Int.new
+      rr.set!(r)
+      crt << CRTValue.new(exp: ex, coeff: coeff.unwrap, r: rr)
+      r.mul!(r, prime)
+      i += 1
+    }
+    PrecomputedValues.new(dp: dp, dq: dq, qinv: qinv, crt_values: crt, fips: k)
+  }
+}
+
+def from_bytes(b: [Byte]) -> big.Int {
+  z = big.Int.new
+  z.set_bytes!(b)
+}
+
+# a == b, leaking only their bit lengths.
+def big_int_equal(a: big.Int, b: big.Int) -> Bool { subtle.constant_time_compare(a.bytes, b.bytes) == 1 }
+
+# a == b with b's leading zero bytes ignored, leaking only bit lengths.
+def big_int_equal_to_bytes(a: big.Int, b: [Byte]) -> Bool {
+  return false if a.bit_len > b.size * 8
+  buf = a.fill_bytes([0.as_u8; b.size])
+  subtle.constant_time_compare(buf, b) == 1
+}
+
+def opt_equal_to_bytes(a: big.Int?, b: [Byte]) -> Bool {
+  if v = a {
+    return big_int_equal_to_bytes(v, b)
+  }
+  false
+}
+
+# Go's checkKeySize (GODEBUG rsa1024min=0 is min1024 = false).
+def check_key_size(size: Int, min1024: Bool) -> ~Unit {
+  fail RsaError.KeyTooSmall(size: size) if size < 1024 && min1024
+  nil
+}
+
+def check_public_key_size(k: PublicKey, min1024: Bool) -> ~Unit {
+  fail invalid("crypto/rsa: missing public modulus") if k.n.sign == 0
+  ~check_key_size(k.n.bit_len, min1024)
+}
+
+def fips_public_key(pubk: PublicKey) -> ~FipsPublicKey {
+  n = ~bigmod.new_modulus(pubk.n.bytes)
+  FipsPublicKey.new(n: n, e: pubk.e)
+}
+
+# The internal key of priv: the precomputed one, or computed now (priv
+# is unchanged).
+def fips_private_key(priv: PrivateKey) -> ~FipsPrivateKey {
+  if f = priv.precomputed.fips {
+    return f
+  }
+  pc = ~priv.compute_precomputed
+  pc.fips.unwrap
+}
+
+# A new RSA private key of the given size, at least 1024 bits. The prime
+# candidates are read from random (see the header).
+pub def generate_key(random: io.Reader, bits: Int) -> ~PrivateKey { ~generate_key_g(random, bits, true) }
+
+def generate_key_g(random: io.Reader, bits: Int, min1024: Bool) -> ~PrivateKey {
+  ~check_key_size(bits, min1024)
+  kr = fips_generate_key(random, bits)
+  if bits < 256 && kr.err? {
+    # Toy-sized keys can hit p == q or d <= 2^(nlen/2) with non-negligible
+    # probability: retry up to 8 times in all.
+    i = 1
+    while i < 8 && kr.err? {
+      kr = fips_generate_key(random, bits)
+      i += 1
+    }
+  }
+  k = ~kr
+  n, e, d, p, q, dp, dq, qinv = k.export
+  PrivateKey.new(
+    public_key: PublicKey.new(n: from_bytes(n), e: e),
+    d: from_bytes(d),
+    primes: [from_bytes(p), from_bytes(q)],
+    precomputed: PrecomputedValues.new(dp: from_bytes(dp), dq: from_bytes(dq), qinv: from_bytes(qinv), crt_values: [], fips: k),
+  )
+}
+
+# A multi-prime RSA key of the given size. Deprecated in Go for more than
+# two primes (security, compatibility and performance: no CRT); with two
+# primes it is generate_key.
+pub def generate_multi_prime_key(random: io.Reader, nprimes: Int, bits: Int) -> ~PrivateKey {
+  ~generate_multi_prime_key_g(random, nprimes, bits, true)
+}
+
+def generate_multi_prime_key_g(random: io.Reader, nprimes: Int, bits: Int, min1024: Bool) -> ~PrivateKey {
+  return ~generate_key_g(random, bits, min1024) if nprimes == 2
+  fail invalid("crypto/rsa: GenerateMultiPrimeKey: nprimes must be >= 2") if nprimes < 2
+  if bits < 64 {
+    prime_limit = (1.as_u64 << (bits / nprimes)).to_f
+    # pi approximates the number of primes below prime_limit; only a
+    # quarter start with 0b11, and a factor of two keeps the search short.
+    pi = prime_limit / (prime_limit.__log - 1.0)
+    pi /= 4.0
+    pi /= 2.0
+    fail invalid("crypto/rsa: too few primes of given length to generate an RSA key") if pi <= nprimes.to_f
+  }
+  primes: [big.Int] = []
+  d = big.Int.new
+  n = big.Int.new
+  loop {
+    todo = bits
+    # Each prime is 2^len * 0.11...; for many primes the product can lose
+    # bits, which this shift compensates for (the mean of 0.11... is 7/8).
+    todo += (nprimes - 2) / 5 if nprimes >= 7
+    primes = []
+    i = 0
+    while i < nprimes {
+      p = ~rand_prime(random, todo / (nprimes - i))
+      primes << p
+      todo -= p.bit_len
+      i += 1
+    }
+    # Pairwise distinct.
+    dup = false
+    i = 0
+    while i < primes.size {
+      j = 0
+      while j < i {
+        dup = true if primes[i].cmp(primes[j]) == 0
+        j += 1
+      }
+      i += 1
+    }
+    next if dup
+    n = big.new_int(1)
+    totient = big.new_int(1)
+    pminus1 = big.Int.new
+    for prime in primes {
+      n.mul!(n, prime)
+      pminus1.sub!(prime, big.new_int(1))
+      totient.mul!(totient, pminus1)
+    }
+    # Can't happen for two primes (top bits set); hopefully rare beyond.
+    next if n.bit_len != bits
+    dd = big.Int.new
+    if dv = dd.mod_inverse!(big.new_int(65537), totient) {
+      d = dv
+      break
+    }
+  }
+  priv = PrivateKey.new(public_key: PublicKey.new(n: n, e: 65537), d: d, primes: primes, precomputed: PrecomputedValues.new)
+  priv.precompute!
+  ~priv.validate
+  priv
+}
+
+# ---- PKCS #1 v1.5 signatures ----
+
+# The RSASSA-PKCS1-V1_5-SIGN signature of hashed, the message hashed with
+# hash (none: hashed is signed as it is, for interoperability only).
+# Deterministic; random is ignored (legacy).
+pub def sign_pkcs1v15(random: io.Reader, priv: PrivateKey, hash: crypto.Hash?, hashed: [Byte]) -> ~[Byte] {
+  ~sign_pkcs1v15_g(random, priv, hash, hashed, true)
+}
+
+def sign_pkcs1v15_g(_random: io.Reader, priv: PrivateKey, hash: crypto.Hash?, hashed: [Byte], min1024: Bool) -> ~[Byte] {
+  hash_name = ""
+  if h = hash {
+    fail invalid("crypto/rsa: input must be hashed message") if hashed.size != h.size
+    hash_name = h.to_s
+  }
+  ~check_public_key_size(priv.public_key, min1024)
+  k = ~fips_private_key(priv)
+  ~fips_sign_pkcs1v15(k, hash_name, hashed)
+}
+
+# Verifies an RSA PKCS #1 v1.5 signature of hashed (none hash: hashed is
+# the message itself). The inputs are not secret.
+pub def verify_pkcs1v15(pubk: PublicKey, hash: crypto.Hash?, hashed: [Byte], sig: [Byte]) -> ~Unit {
+  ~verify_pkcs1v15_g(pubk, hash, hashed, sig, true)
+}
+
+def verify_pkcs1v15_g(pubk: PublicKey, hash: crypto.Hash?, hashed: [Byte], sig: [Byte], min1024: Bool) -> ~Unit {
+  hash_name = ""
+  if h = hash {
+    fail invalid("crypto/rsa: input must be hashed message") if hashed.size != h.size
+    hash_name = h.to_s
+  }
+  ~check_public_key_size(pubk, min1024)
+  k = ~fips_public_key(pubk)
+  ~fips_verify_pkcs1v15(k, hash_name, hashed, sig)
+}
+
+# ---- PSS signatures ----
+
+def unavailable(h: crypto.Hash?) -> RsaError {
+  if hv = h {
+    return invalid("crypto/rsa: requested hash function unavailable: #{hv.to_s}")
+  }
+  invalid("crypto/rsa: requested hash function unavailable: unknown hash value 0")
+}
+
+# The PSS signature of digest (the message hashed with hash, or with
+# opts.hash when set). The salt is read from random. opts none: defaults.
+pub def sign_pss(random: io.Reader, priv: PrivateKey, hash: crypto.Hash?, digest: [Byte], opts: PSSOptions?) -> ~[Byte] {
+  ~sign_pss_g(random, priv, hash, digest, opts, true)
+}
+
+def sign_pss_g(random: io.Reader, priv: PrivateKey, hash0: crypto.Hash?, digest: [Byte], opts: PSSOptions?, min1024: Bool) -> ~[Byte] {
+  ~check_public_key_size(priv.public_key, min1024)
+  hash = hash0
+  if o = opts {
+    hash = o.hash if o.hash != none
+  }
+  fail unavailable(hash) if hash == none || !hash.unwrap.available?
+  h = hash.unwrap.new
+  k = ~fips_private_key(priv)
+  salt_length = pss_salt_length_of(opts)
+  if salt_length == PSS_SALT_LENGTH_AUTO {
+    salt_length = ~pss_max_salt_length(k.public_key, h)
+  } else if salt_length == PSS_SALT_LENGTH_EQUALS_HASH {
+    salt_length = h.size
+  } else {
+    # Positive, or below -1 (an error).
+    fail invalid("crypto/rsa: invalid PSS salt length") if salt_length <= 0
+  }
+  ~fips_sign_pss(random, k, h, digest, salt_length)
+}
+
+# Verifies a PSS signature of digest (the message hashed with hash;
+# opts.hash is ignored). opts none: defaults. The inputs are not secret.
+pub def verify_pss(pubk: PublicKey, hash: crypto.Hash, digest: [Byte], sig: [Byte], opts: PSSOptions?) -> ~Unit {
+  ~verify_pss_g(pubk, hash, digest, sig, opts, true)
+}
+
+def verify_pss_g(pubk: PublicKey, hash: crypto.Hash, digest: [Byte], sig: [Byte], opts: PSSOptions?, min1024: Bool) -> ~Unit {
+  ~check_public_key_size(pubk, min1024)
+  fail unavailable(hash) if !hash.available?
+  h = hash.new
+  k = ~fips_public_key(pubk)
+  salt_length = pss_salt_length_of(opts)
+  sl = salt_length
+  if salt_length == PSS_SALT_LENGTH_AUTO {
+    sl = PSS_SALT_LENGTH_AUTODETECT
+  } else if salt_length == PSS_SALT_LENGTH_EQUALS_HASH {
+    sl = h.size
+  } else {
+    fail invalid("crypto/rsa: salt length cannot be negative") if salt_length < 0
+  }
+  ~fips_verify_pss(k, h, digest, sig, sl)
+}
+
+# ---- OAEP encryption ----
+
+# Encrypts msg with RSA-OAEP using hash (for the padding and MGF1). The
+# seed is read from random. label is bound to the ciphertext but not
+# encrypted. msg can be at most pub.size - 2 * hash.size - 2 bytes.
+pub def encrypt_oaep(hash: hash.Hash, random: io.Reader, pubk: PublicKey, msg: [Byte], label: [Byte]) -> ~[Byte] {
+  ~encrypt_oaep_g(hash, hash, random, pubk, msg, label, true)
+}
+
+# encrypt_oaep with the hashes (and label) of opts: for a MGF1 hash that
+# differs from the OAEP hash.
+pub def encrypt_oaep_with_options(random: io.Reader, pubk: PublicKey, msg: [Byte], opts: OAEPOptions) -> ~[Byte] {
+  ~encrypt_oaep_with_options_g(random, pubk, msg, opts, true)
+}
+
+def encrypt_oaep_with_options_g(random: io.Reader, pubk: PublicKey, msg: [Byte], opts: OAEPOptions, min1024: Bool) -> ~[Byte] {
+  fail invalid("crypto/rsa: requested hash function unavailable: #{opts.hash.to_s}") if !opts.hash.available?
+  mgf = opts.mgf_hash || opts.hash
+  fail invalid("crypto/rsa: requested hash function unavailable: #{mgf.to_s}") if !mgf.available?
+  ~encrypt_oaep_g(opts.hash.new, mgf.new, random, pubk, msg, opts.label, min1024)
+}
+
+def encrypt_oaep_g(hash: hash.Hash, mgf_hash: hash.Hash, random: io.Reader, pubk: PublicKey, msg: [Byte], label: [Byte], min1024: Bool) -> ~[Byte] {
+  ~check_public_key_size(pubk, min1024)
+  k = ~fips_public_key(pubk)
+  r = fips_encrypt_oaep(hash, mgf_hash, random, k, msg, label)
+  # Go resets the hashes when it's done.
+  h1 = hash
+  h1.reset!
+  h2 = mgf_hash
+  h2.reset!
+  ~r
+}
+
+# Decrypts an RSA-OAEP ciphertext (hash as for encrypt_oaep; random is
+# ignored, legacy). label must be the one used to encrypt.
+pub def decrypt_oaep(hash: hash.Hash, random: io.Reader, priv: PrivateKey, ciphertext: [Byte], label: [Byte]) -> ~[Byte] {
+  _ = random
+  r = decrypt_oaep_g(hash, hash, priv, ciphertext, label, true)
+  h1 = hash
+  h1.reset!
+  ~r
+}
+
+def decrypt_oaep_g(hash: hash.Hash, mgf_hash: hash.Hash, priv: PrivateKey, ciphertext: [Byte], label: [Byte], min1024: Bool) -> ~[Byte] {
+  ~check_public_key_size(priv.public_key, min1024)
+  k = ~fips_private_key(priv)
+  ~fips_decrypt_oaep(hash, mgf_hash, k, ciphertext, label)
+}
+
+# ---- PKCS #1 v1.5 encryption (deprecated in Go: use OAEP) ----
+
+# Encrypts msg with RSA and PKCS #1 v1.5 padding; msg is at most
+# pub.size - 11 bytes. The padding is read from random. Deprecated in Go.
+pub def encrypt_pkcs1v15(random: io.Reader, pubk: PublicKey, msg: [Byte]) -> ~[Byte] { ~encrypt_pkcs1v15_g(random, pubk, msg, true) }
+
+def encrypt_pkcs1v15_g(random: io.Reader, pubk: PublicKey, msg: [Byte], min1024: Bool) -> ~[Byte] {
+  ~check_public_key_size(pubk, min1024)
+  k = pubk.size
+  fail RsaError.MessageTooLong if msg.size > k - 11
+  # EM = 0x00 || 0x02 || PS || 0x00 || M
+  em = [0.as_u8; k]
+  em[1] = 2
+  ~non_zero_random_bytes(em[2...k - msg.size - 1], random)
+  em[k - msg.size - 1] = 0
+  copy(em[k - msg.size...k], msg)
+  fk = ~fips_public_key(pubk)
+  ~fips_encrypt(fk, em)
+}
+
+# Decrypts a PKCS #1 v1.5 ciphertext (random is ignored, legacy).
+# Deprecated in Go: whether it fails reveals secret information
+# (Bleichenbacher); use OAEP.
+pub def decrypt_pkcs1v15(random: io.Reader, priv: PrivateKey, ciphertext: [Byte]) -> ~[Byte] {
+  ~decrypt_pkcs1v15_g(random, priv, ciphertext, true)
+}
+
+def decrypt_pkcs1v15_g(_random: io.Reader, priv: PrivateKey, ciphertext: [Byte], min1024: Bool) -> ~[Byte] {
+  ~check_public_key_size(priv.public_key, min1024)
+  valid, out, index = ~decrypt_pkcs1v15_raw(priv, ciphertext)
+  fail RsaError.Decryption if valid == 0
+  out[index...out.size]
+}
+
+# Decrypts a session key with PKCS #1 v1.5 padding into key, in constant
+# time: with valid padding (and a plaintext of key's length) the
+# plaintext is copied into key, otherwise key is unchanged. Fails only
+# for public reasons (a wrong length, a ciphertext above the modulus).
+# Callers fill key with random bytes beforehand. Deprecated in Go; see
+# Go's documentation for the conditions under which it helps.
+pub def decrypt_pkcs1v15_session_key(random: io.Reader, priv: PrivateKey, ciphertext: [Byte], key: [Byte]) -> ~Unit {
+  ~decrypt_pkcs1v15_session_key_g(random, priv, ciphertext, key, true)
+}
+
+def decrypt_pkcs1v15_session_key_g(_random: io.Reader, priv: PrivateKey, ciphertext: [Byte], key: [Byte], min1024: Bool) -> ~Unit {
+  ~check_public_key_size(priv.public_key, min1024)
+  k = priv.size
+  fail RsaError.Decryption if k - (key.size + 3 + 8) < 0
+  valid, em, index = ~decrypt_pkcs1v15_raw(priv, ciphertext)
+  # Impossible: decrypt_pkcs1v15_raw returns the full block.
+  fail RsaError.Decryption if em.size != k
+  v = valid & subtle.constant_time_eq((em.size - index).as_i32, key.size.as_i32)
+  subtle.constant_time_copy(v, key, em[em.size - key.size...em.size])
+  nil
+}
+
+# Go's decryptPKCS1v15: (valid 1/0, the whole decrypted block, the
+# message's index in it). The block is returned either way so it can be
+# read in constant time.
+def decrypt_pkcs1v15_raw(priv: PrivateKey, ciphertext: [Byte]) -> ~(Int, [Byte], Int) {
+  k = priv.size
+  fail RsaError.Decryption if k < 11
+  fk = ~fips_private_key(priv)
+  emr = fips_decrypt(fk, ciphertext, false)
+  fail RsaError.Decryption if emr.err?
+  em = emr.unwrap
+  first_byte_is_zero = subtle.constant_time_byte_eq(em[0], 0)
+  second_byte_is_two = subtle.constant_time_byte_eq(em[1], 2)
+  # Then non-zero random octets, a 0, and the message:
+  #   looking_for_index: 1 while still looking for the zero
+  #   index: the offset of the first zero
+  looking_for_index = 1
+  index = 0
+  i = 2
+  while i < em.size {
+    equals0 = subtle.constant_time_byte_eq(em[i], 0)
+    index = subtle.constant_time_select(looking_for_index & equals0, i, index)
+    looking_for_index = subtle.constant_time_select(equals0, 0, looking_for_index)
+    i += 1
+  }
+  # PS is at least 8 bytes, starting two bytes in.
+  valid_ps = subtle.constant_time_less_or_eq(2 + 8, index)
+  valid = first_byte_is_zero & second_byte_is_two & (^looking_for_index & 1) & valid_ps
+  index = subtle.constant_time_select(valid, index + 1, 0)
+  (valid, em, index)
+}
+
+# Fills s with non-zero random octets from random (Go's
+# nonZeroRandomBytes; exported for tests in Go's export_test.go).
+def non_zero_random_bytes(s: [Byte], random: io.Reader) -> ~Unit {
+  ~io.read_exact(random, s)
+  i = 0
+  while i < s.size {
+    while s[i] == 0 {
+      ~io.read_exact(random, s[i...i + 1])
+      # A PRNG returning only zeros (in tests) would loop forever.
+      s[i] ^= 0x42
+    }
+    i += 1
+  }
+  nil
+}

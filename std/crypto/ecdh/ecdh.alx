@@ -1,0 +1,216 @@
+# Package ecdh: Go's crypto/ecdh, Elliptic Curve Diffie-Hellman over NIST
+# curves (P-256, P-384, P-521, via crypto/internal/fips140/nistec) and
+# Curve25519 (X25519, via crypto/internal/fips140/edwards25519/field). Go's
+# crypto/internal/fips140/ecdh (the NIST key handling) is merged in
+# (nist.alx).
+#
+#   Go                                        alx
+#   ecdh.P256() / P384() / P521() / X25519()  p256() / p384() / p521() / x25519() -> Curve
+#   c.GenerateKey(rand) (*PrivateKey, error)  c.generate_key(rand: io.Reader) -> ~PrivateKey
+#   c.NewPrivateKey(key)                      c.new_private_key(key) -> ~PrivateKey
+#   c.NewPublicKey(key)                       c.new_public_key(key) -> ~PublicKey
+#   c.String()                                c.to_s
+#   k.ECDH(remote) ([]byte, error)            k.ecdh(remote) -> ~[Byte]
+#   k.Bytes() / PublicKey() / Public()        k.bytes / k.public_key / k.public
+#   k.Curve() / k.Equal(x)                    k.curve / k.equal?(x)
+#   pub.Bytes() / Curve() / Equal(x)          pub.bytes / pub.curve / pub.equal?(x)
+#   KeyExchanger                              KeyExchanger (interface)
+#
+# Timing: private key operations are constant time (nistec scalar
+# multiplication, the X25519 Montgomery ladder with masked swaps); input
+# validation branches only on public data. See nistec, fiat and field for the
+# caveats about alx's backends.
+#
+# Differences from Go:
+#   - Curve is a struct naming one of the four curves, not an interface (Go's
+#     has an unexported method, so only these four can implement it anyway);
+#     curves compare with `==`.
+#   - generate_key honours its rand argument (Go's behaviour with
+#     GODEBUG=cryptocustomrand=1; callers pass crypto/rand's reader() for
+#     Go's rand.Reader). randutil.MaybeReadByte is not called, so exactly
+#     the key size is read per attempt.
+#   - Equal takes the same key type (Go: crypto.PublicKey/PrivateKey and a
+#     type assertion); public returns a crypto.PublicKey.
+#   - No BoringCrypto, no FIPS 140-only mode, no CAST/PCT self-tests (alx has
+#     no FIPS 140 module: see crypto/fips140).
+#   - The fips140/ecdh internals (P-224 included, which the public package
+#     doesn't expose) are package functions taking a curve id: nist_* in
+#     nist.alx, used by the tests as Go's internal tests use them.
+#   - Errors are EcdhError values with Go's messages, or a nistec /
+#     fiat error for a public key that doesn't decode (as in Go).
+import "crypto"
+import "crypto/subtle"
+import "io"
+
+# Errors of this package (Go's errors.New messages).
+pub error EcdhError {
+  InvalidPrivateKey
+  InvalidPublicKey
+  CurveMismatch
+  MismatchedCurves
+  IdentityElement
+  InvalidPrivateKeySize
+  LowOrderPoint
+
+  def message -> Str {
+    case self {
+      InvalidPrivateKey => "crypto/ecdh: invalid private key"
+      InvalidPublicKey => "crypto/ecdh: invalid public key"
+      CurveMismatch => "crypto/ecdh: private key and public key curves do not match"
+      MismatchedCurves => "crypto/ecdh: mismatched curves"
+      IdentityElement => "crypto/ecdh: public key is the identity element"
+      InvalidPrivateKeySize => "crypto/ecdh: invalid private key size"
+      LowOrderPoint => "crypto/ecdh: bad X25519 remote ECDH input: low order point"
+    }
+  }
+}
+
+# Curve ids (the NIST ones are also nist.alx's curve ids).
+P224_ID = 224
+P256_ID = 256
+P384_ID = 384
+P521_ID = 521
+X25519_ID = 25519
+
+# One of the curves of this package. Make it with p256(), p384(), p521() or
+# x25519().
+pub struct Curve {
+  id: Int
+
+  # The curve's name: "P-256", "P-384", "P-521" or "X25519".
+  pub def to_s -> Str {
+    return "X25519" if id == X25519_ID
+    "P-#{id}"
+  }
+
+  # A random private key, read from rand (Go's GenerateKey). For NIST
+  # curves the key is drawn by rejection sampling.
+  pub def generate_key(rand: io.Reader) -> ~PrivateKey {
+    if id == X25519_ID {
+      key = [0.as_u8; X25519_PRIVATE_KEY_SIZE]
+      ~io.read_full(rand, key)
+      return ~new_private_key(key)
+    }
+    d = ~nist_generate_key(id, rand)
+    q = ~nist_public_from_private(id, d)
+    PrivateKey.new(curve: self, private_key: d, pubk: PublicKey.new(curve: self, public_key: q))
+  }
+
+  # The private key encoded in key. For NIST curves, key must be the
+  # fixed-length big-endian scalar in [1, N-1]; for X25519, 32 bytes (any).
+  pub def new_private_key(key: [Byte]) -> ~PrivateKey {
+    if id == X25519_ID {
+      fail EcdhError.InvalidPrivateKeySize if key.size != X25519_PRIVATE_KEY_SIZE
+      public_key = [0.as_u8; X25519_PUBLIC_KEY_SIZE]
+      basepoint = [0.as_u8; 32]
+      basepoint[0] = 9
+      x25519_scalar_mult(public_key, key, basepoint)
+      return PrivateKey.new(curve: self, private_key: clone_bytes(key), pubk: PublicKey.new(curve: self, public_key: public_key))
+    }
+    d = ~nist_new_private_key(id, key)
+    q = ~nist_public_from_private(id, d)
+    PrivateKey.new(curve: self, private_key: d, pubk: PublicKey.new(curve: self, public_key: q))
+  }
+
+  # The public key encoded in key. For NIST curves, key must be an
+  # uncompressed point on the curve (SEC 1); for X25519, 32 bytes (any).
+  pub def new_public_key(key: [Byte]) -> ~PublicKey {
+    if id == X25519_ID {
+      fail EcdhError.InvalidPublicKey if key.size != X25519_PUBLIC_KEY_SIZE
+      return PublicKey.new(curve: self, public_key: clone_bytes(key))
+    }
+    fail EcdhError.InvalidPublicKey if key.size == 0 || key[0] != 4
+    ~nist_new_public_key(id, key)
+    PublicKey.new(curve: self, public_key: clone_bytes(key))
+  }
+}
+
+# The curve P-256 (FIPS 186-3, section D.2.3), also known as secp256r1 or
+# prime256v1.
+pub def p256 -> Curve { Curve.new(id: P256_ID) }
+
+# The curve P-384 (FIPS 186-3, section D.2.4), also known as secp384r1.
+pub def p384 -> Curve { Curve.new(id: P384_ID) }
+
+# The curve P-521 (FIPS 186-3, section D.2.5), also known as secp521r1.
+pub def p521 -> Curve { Curve.new(id: P521_ID) }
+
+# The X25519 function over Curve25519 (RFC 7748, Section 5). Multiple
+# invocations return the same value. Private keys are 32 bytes (any value);
+# public keys are 32 bytes (any value, low order points fail at ecdh).
+pub def x25519 -> Curve { Curve.new(id: X25519_ID) }
+
+# An ECDH public key, usually a peer's ECDH share sent over the wire.
+# Points at infinity can't be represented.
+pub struct PublicKey {
+  curve: Curve
+  public_key: [Byte]
+
+  # A copy of the encoding of the public key: the uncompressed SEC 1 point
+  # for NIST curves, the 32-byte u-coordinate for X25519.
+  pub def bytes -> [Byte] { clone_bytes(public_key) }
+
+  # Whether x has the same curve and value (constant time in the value).
+  pub def equal?(x: PublicKey) -> Bool {
+    curve == x.curve && subtle.constant_time_compare(public_key, x.public_key) == 1
+  }
+}
+
+# The interface of a private key that can do ECDH (Go's KeyExchanger).
+pub interface KeyExchanger {
+  def public_key -> PublicKey
+  def curve -> Curve
+  def ecdh(remote: PublicKey) -> ~[Byte]
+}
+
+# An ECDH private key, usually kept secret.
+pub struct PrivateKey {
+  curve: Curve
+  private_key: [Byte]
+  pubk: PublicKey
+
+  # The ECDH shared secret of the key and remote: the x coordinate of the
+  # shared point for NIST curves (SEC 1, Version 2.0, Section 3.3.1) and the
+  # X25519 output (RFC 7748, Section 6.1). Fails if the curves differ, and
+  # for X25519 if the result is the all-zero value (a low order point).
+  pub def ecdh(remote: PublicKey) -> ~[Byte] {
+    fail EcdhError.CurveMismatch if curve != remote.curve
+    if curve.id == X25519_ID {
+      out = [0.as_u8; X25519_SHARED_SECRET_SIZE]
+      x25519_scalar_mult(out, private_key, remote.public_key)
+      fail EcdhError.LowOrderPoint if is_zero(out)
+      return out
+    }
+    ~nist_ecdh(curve.id, private_key, pubk.public_key, remote.public_key)
+  }
+
+  # A copy of the encoding of the private key.
+  pub def bytes -> [Byte] { clone_bytes(private_key) }
+
+  # Whether x has the same curve and value (constant time in the value).
+  pub def equal?(x: PrivateKey) -> Bool {
+    curve == x.curve && subtle.constant_time_compare(private_key, x.private_key) == 1
+  }
+
+  # The public key of the private key.
+  pub def public_key -> PublicKey { pubk }
+
+  # The public key, as a crypto.PublicKey.
+  pub def public -> crypto.PublicKey { pubk }
+}
+
+# Whether every byte of x is zero (constant time).
+def is_zero(x: [Byte]) -> Bool {
+  acc: Byte = 0
+  for b in x {
+    acc = acc | b
+  }
+  acc == 0
+}
+
+# A copy of b (Go's bytes.Clone).
+def clone_bytes(b: [Byte]) -> [Byte] {
+  out = [0.as_u8; b.size]
+  copy(out, b)
+  out
+}

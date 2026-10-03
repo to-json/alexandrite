@@ -1,0 +1,876 @@
+#![overflow(wrap)]
+# Package mldsa: Go's crypto/mldsa, the post-quantum ML-DSA signature scheme
+# of FIPS 204 (ML-DSA-44, ML-DSA-65 and ML-DSA-87). Pure alx: Go's
+# crypto/mldsa (mldsa.go and mldsa_fips140v1.26.go, the file a default Go
+# 1.27 build compiles: its build tag is !fips140v1.0; mldsa_fips140v1.0.go
+# is the stub for the frozen v1.0.0 FIPS module, which has no ML-DSA)
+# merged with crypto/internal/fips140/mldsa (mldsa.go, field.go in
+# field.alx, semiexpanded.go in semiexpanded.alx).
+#
+#   Go                                        alx
+#   mldsa.PrivateKeySize, MLDSA44PublicKeySize, ... (constants)
+#                                             PRIVATE_KEY_SIZE, MLDSA44_PUBLIC_KEY_SIZE, ...
+#   mldsa.Parameters                          Parameters (a struct, compared with ==)
+#   MLDSA44() / MLDSA65() / MLDSA87()         mldsa44 / mldsa65 / mldsa87 -> Parameters
+#   params.PublicKeySize() / SignatureSize()  params.public_key_size / signature_size
+#   params.String()                           params.to_s
+#   mldsa.Options{Context: s}                 Options.new(context: s)
+#   opts.HashFunc() crypto.Hash               opts.hash_func -> crypto.Hash? (none)
+#   GenerateKey(params) (*PrivateKey, error)  generate_key(params) -> ~PrivateKey
+#   NewPrivateKey(params, seed)               new_private_key(params, seed) -> ~PrivateKey
+#   sk.Public() crypto.PublicKey              sk.public -> crypto.PublicKey
+#   sk.PublicKey() *PublicKey                 sk.public_key -> PublicKey
+#   sk.Equal(x crypto.PrivateKey) bool        sk.equal?(x: PrivateKey) -> Bool
+#   sk.Bytes() []byte                         sk.bytes -> [Byte] (the 32-byte seed)
+#   sk.Sign(rand, msg, opts)                  sk.sign(rand, msg, opts: crypto.SignerOpts) -> ~[Byte]
+#     with opts of type *Options              sk.sign_options(rand, msg, opts: Options) -> ~[Byte]
+#   sk.SignDeterministic(msg, opts)           sk.sign_deterministic(msg, opts: crypto.SignerOpts)
+#     with opts of type *Options              sk.sign_deterministic_options(msg, opts: Options)
+#   NewPublicKey(params, encoding)            new_public_key(params, encoding) -> ~PublicKey
+#   pk.Bytes() / Equal(x) / Parameters()      pk.bytes / equal?(x: PublicKey) / parameters
+#   Verify(pk, msg, sig, opts *Options) error verify(pk, msg, sig, opts: Options) -> ~Unit
+#
+# PrivateKey is a crypto.Signer (structurally). Errors are MldsaError, with
+# Go's messages.
+#
+# Test hooks: the entry points of crypto/internal/fips140/mldsa that Go's
+# tests use, public here as Go's crypto/mlkem/mlkemtest-style hooks (they
+# are not part of Go's public API):
+#   testing_only_sign_with_random(sk, msg, context, random)  (32 random bytes)
+#   testing_only_sign_external_mu_with_random(sk, mu, random)
+#   verify_external_mu(pk, mu, sig)  (Go's internal VerifyExternalMu)
+#   testing_only_new_private_key_from_semi_expanded(sk) -> ~PrivateKey
+#   testing_only_private_key_semi_expanded_bytes(sk) -> [Byte]
+#
+# Differences from Go:
+#   - Sign honours its rand argument: the 32 bytes of hedging randomness
+#     (rnd of FIPS 204) are read from it (Go ignores the argument and reads
+#     its DRBG). Pass `rand.reader()` from crypto/rand for Go's behaviour; a
+#     deterministic reader gives reproducible signatures, the same as Go's
+#     TestingOnlySignWithRandom. A failing or short reader fails the sign
+#     with its error. GenerateKey takes no reader in Go and reads
+#     crypto/rand here.
+#   - Go's Sign and SignDeterministic look for a *Options inside the
+#     crypto.SignerOpts (a type assertion) to find the context string. alx
+#     can't ask an interface value for its type, so `sign` and
+#     `sign_deterministic` (the crypto.Signer shape) always use the empty
+#     context, and `sign_options` / `sign_deterministic_options` take an
+#     Options with the context. Go's nil opts is `Options.new` (or any
+#     SignerOpts whose hash_func is none). opts.hash_func == crypto.MLDSAMu
+#     signs a 64-byte external μ (RFC 9881) as in Go; any other hash is
+#     InvalidSignerOpts.
+#   - Equal takes the same key type (no crypto.PrivateKey / PublicKey `any`
+#     and no type assertion): comparing with another type is a compile
+#     error instead of false. There are no nil keys (Go's "mldsa: nil
+#     public key" can't happen); the zero values PrivateKey.new and
+#     PublicKey.new fail as Go's zero values do (ZeroPrivateKey,
+#     ZeroPublicKey).
+#   - No FIPS 140 module: no self-test (Go's cast.go CAST is `fips140_cast`
+#     in internal_test.alx), no pairwise consistency test at key
+#     generation, no service indicator.
+#   - Go's testingOnlyRejectionReason (a package variable tests set) is a
+#     `trace` argument of sign_internal: a 4-element slice counting the
+#     rejections by reason (z, r0, ct0, h), or empty.
+#   - testing_only_new_private_key_from_semi_expanded fills the unused seed
+#     with bytes from crypto/rand, as Go fills it from its DRBG.
+#
+# Timing: see field.alx. Signing is constant time in the secrets except
+# for what FIPS 204 allows to leak (which rejection check failed); key
+# comparisons use crypto/subtle.
+
+import "io"
+import "crypto"
+import "crypto/rand"
+import "crypto/sha3"
+import "crypto/subtle"
+
+pub PRIVATE_KEY_SIZE = 32
+
+pub MLDSA44_PUBLIC_KEY_SIZE = 1312
+pub MLDSA65_PUBLIC_KEY_SIZE = 1952
+pub MLDSA87_PUBLIC_KEY_SIZE = 2592
+
+pub MLDSA44_SIGNATURE_SIZE = 2420
+pub MLDSA65_SIGNATURE_SIZE = 3309
+pub MLDSA87_SIGNATURE_SIZE = 4627
+
+# One of the fixed parameter sets of FIPS 204. mldsa44 is the one most
+# applications should use. Values compare with ==.
+pub struct Parameters {
+  name: Str
+  pk_size: Int
+  sig_size: Int
+
+  # The size of public keys for this parameter set, in bytes.
+  pub def public_key_size -> Int { pk_size }
+
+  # The size of signatures for this parameter set, in bytes.
+  pub def signature_size -> Int { sig_size }
+
+  # The name of the parameter set ("ML-DSA-44").
+  pub def to_s -> Str { name }
+}
+
+# The ML-DSA-44 parameter set.
+pub def mldsa44 -> Parameters {
+  Parameters.new(name: "ML-DSA-44", pk_size: MLDSA44_PUBLIC_KEY_SIZE, sig_size: MLDSA44_SIGNATURE_SIZE)
+}
+
+# The ML-DSA-65 parameter set.
+pub def mldsa65 -> Parameters {
+  Parameters.new(name: "ML-DSA-65", pk_size: MLDSA65_PUBLIC_KEY_SIZE, sig_size: MLDSA65_SIGNATURE_SIZE)
+}
+
+# The ML-DSA-87 parameter set.
+pub def mldsa87 -> Parameters {
+  Parameters.new(name: "ML-DSA-87", pk_size: MLDSA87_PUBLIC_KEY_SIZE, sig_size: MLDSA87_SIGNATURE_SIZE)
+}
+
+# Options for signing and verifying.
+pub struct Options {
+  # Distinguishes signatures made for different purposes: at most 255
+  # bytes, empty by default. Signing and verifying must use the same one.
+  context: Str
+
+  # none: ML-DSA signs the message itself (a crypto.SignerOpts).
+  pub def hash_func -> crypto.Hash? { none }
+}
+
+# ---- internal parameters (Go's crypto/internal/fips140/mldsa) ----
+
+struct Params {
+  # dimensions of A
+  k: Int
+  l: Int
+  # bound for secret coefficients
+  eta: Int
+  # log₂(γ₁), where [-γ₁+1, γ₁] is the bound of y
+  gamma1: Int
+  # denominator of γ₂ = (q - 1) / gamma2
+  gamma2: Int
+  # collision strength
+  lambda: Int
+  # number of non-zero coefficients in the challenge
+  tau: Int
+  # max number of hints in MakeHint
+  omega: Int
+}
+
+def params44 -> Params { Params.new(k: 4, l: 4, eta: 2, gamma1: 17, gamma2: 88, lambda: 128, tau: 39, omega: 80) }
+def params65 -> Params { Params.new(k: 6, l: 5, eta: 4, gamma1: 19, gamma2: 32, lambda: 192, tau: 49, omega: 55) }
+def params87 -> Params { Params.new(k: 8, l: 7, eta: 2, gamma1: 19, gamma2: 32, lambda: 256, tau: 60, omega: 75) }
+
+# ρ + k × n × 10-bit coefficients of t₁.
+def pub_key_size(p: Params) -> Int { 32 + p.k * N * 10 / 8 }
+
+# challenge + l × n × (γ₁+1)-bit coefficients of z + hint.
+def sig_size(p: Params) -> Int { p.lambda / 4 + p.l * N * (p.gamma1 + 1) / 8 + p.omega + p.k }
+
+PUBLIC_KEY_SIZE44 = 32 + 4 * 256 * 10 / 8
+PUBLIC_KEY_SIZE65 = 32 + 6 * 256 * 10 / 8
+PUBLIC_KEY_SIZE87 = 32 + 8 * 256 * 10 / 8
+SIGNATURE_SIZE44 = 128 / 4 + 4 * 256 * (17 + 1) / 8 + 80 + 4
+SIGNATURE_SIZE65 = 192 / 4 + 5 * 256 * (19 + 1) / 8 + 55 + 6
+SIGNATURE_SIZE87 = 256 / 4 + 7 * 256 * (19 + 1) / 8 + 75 + 8
+
+def params_for(params: Parameters) -> Params? {
+  return params44() if params == mldsa44()
+  return params65() if params == mldsa65()
+  return params87() if params == mldsa87()
+  none
+}
+
+def params_name(p: Params) -> Str {
+  return "ML-DSA-44" if p == params44()
+  return "ML-DSA-65" if p == params65()
+  return "ML-DSA-87" if p == params87()
+  panic("mldsa: internal error: unknown parameters")
+}
+
+# ---- keys ----
+
+# An ML-DSA public key.
+pub struct PublicKey {
+  raw: [Byte]
+  prm: Params
+  # the public key hash
+  tr: [Byte]
+
+  # The public key encoding.
+  pub def bytes -> [Byte] { raw + [] }
+
+  # Whether pk and x are the same key (the same encoding).
+  pub def equal?(x: PublicKey) -> Bool {
+    prm == x.prm && subtle.constant_time_compare(raw, x.raw) == 1
+  }
+
+  # The parameter set of this key.
+  pub def parameters -> Parameters {
+    n = params_name(prm)
+    return mldsa44() if n == "ML-DSA-44"
+    return mldsa65() if n == "ML-DSA-65"
+    mldsa87()
+  }
+}
+
+# An in-memory ML-DSA private key: the seed and its expansion. A
+# crypto.Signer.
+pub struct PrivateKey {
+  seed: [Byte]
+  pk: PublicKey
+  # Â, k × l NTT elements
+  a: [U32]
+  # NTT(t₁ ⋅ 2ᵈ), k elements
+  t1: [U32]
+  # NTT(s₁), l elements; NTT(s₂), NTT(t₀), k elements
+  s1: [U32]
+  s2: [U32]
+  t0: [U32]
+  # K, the 32-byte signing seed
+  kk: [Byte]
+
+  # The public key (as a crypto.PublicKey).
+  pub def public -> crypto.PublicKey { public_key }
+
+  # The public key.
+  pub def public_key -> PublicKey {
+    PublicKey.new(raw: pk.raw + [], prm: pk.prm, tr: pk.tr + [])
+  }
+
+  # Whether sk and x are the same key (derived from the same seed).
+  pub def equal?(x: PrivateKey) -> Bool {
+    pk.raw == x.pk.raw && subtle.constant_time_compare(seed, x.seed) == 1
+  }
+
+  # The private key seed.
+  pub def bytes -> [Byte] { seed + [] }
+
+  # A signature of message, with hedging randomness read from rand. With
+  # opts.hash_func none the message is signed directly with the empty
+  # context (use sign_options for a context); with crypto.MLDSAMu message
+  # must be a 64-byte pre-hashed μ. The crypto.Signer method.
+  pub def sign(rand: io.Reader, message: [Byte], opts: crypto.SignerOpts) -> ~[Byte] {
+    fail MldsaError.ZeroPrivateKey if seed.size == 0
+    h = opts.hash_func
+    random = [0.as_u8; 32]
+    if h == none {
+      ~io.read_full(rand, random)
+      return ~sign_with_random(self, message, "", random)
+    }
+    fail MldsaError.InvalidSignerOpts if h != crypto.MLDSAMu
+    ~io.read_full(rand, random)
+    ~sign_external_mu_with_random(self, message, random)
+  }
+
+  # A signature of message with the context of opts (Go's Sign with
+  # *Options), with hedging randomness read from rand.
+  pub def sign_options(rand: io.Reader, message: [Byte], opts: Options) -> ~[Byte] {
+    fail MldsaError.ZeroPrivateKey if seed.size == 0
+    random = [0.as_u8; 32]
+    ~io.read_full(rand, random)
+    ~sign_with_random(self, message, opts.context, random)
+  }
+
+  # Like sign, but deterministic (no hedging randomness).
+  pub def sign_deterministic(message: [Byte], opts: crypto.SignerOpts) -> ~[Byte] {
+    fail MldsaError.ZeroPrivateKey if seed.size == 0
+    h = opts.hash_func
+    random = [0.as_u8; 32]
+    return ~sign_with_random(self, message, "", random) if h == none
+    fail MldsaError.InvalidSignerOpts if h != crypto.MLDSAMu
+    ~sign_external_mu_with_random(self, message, random)
+  }
+
+  # Like sign_options, but deterministic.
+  pub def sign_deterministic_options(message: [Byte], opts: Options) -> ~[Byte] {
+    fail MldsaError.ZeroPrivateKey if seed.size == 0
+    ~sign_with_random(self, message, opts.context, [0.as_u8; 32])
+  }
+}
+
+# A new random private key.
+pub def generate_key(params: Parameters) -> ~PrivateKey {
+  p = params_for(params)
+  fail MldsaError.InvalidParameters if p == none
+  seed = [0.as_u8; 32]
+  rand.read(seed)
+  new_private_key_internal(seed, p.unwrap)
+}
+
+# The private key with the given seed (PRIVATE_KEY_SIZE bytes).
+pub def new_private_key(params: Parameters, seed: [Byte]) -> ~PrivateKey {
+  p = params_for(params)
+  fail MldsaError.InvalidParameters if p == none
+  fail MldsaError.InvalidSeedLength if seed.size != 32
+  new_private_key_internal(seed + [], p.unwrap)
+}
+
+# The public key with the given encoding.
+pub def new_public_key(params: Parameters, encoding: [Byte]) -> ~PublicKey {
+  p = params_for(params)
+  fail MldsaError.InvalidParameters if p == none
+  ~new_public_key_internal(encoding, p.unwrap)
+}
+
+# Whether signature is a valid signature of message by pk (with the
+# context of opts); fails with the reason if not.
+pub def verify(pk: PublicKey, message: [Byte], signature: [Byte], opts: Options) -> ~Unit {
+  fail MldsaError.ZeroPublicKey if pk.raw.size == 0
+  mu = ~compute_message_hash(pk.tr, message, opts.context)
+  ~verify_internal(pk, mu, signature)
+}
+
+# Test hook: Go's internal VerifyExternalMu, verifying a signature of a
+# 64-byte external μ.
+pub def verify_external_mu(pk: PublicKey, mu: [Byte], signature: [Byte]) -> ~Unit {
+  fail MldsaError.ZeroPublicKey if pk.raw.size == 0
+  fail MldsaError.MessageHashLength if mu.size != 64
+  ~verify_internal(pk, mu, signature)
+}
+
+# Test hook: Go's TestingOnlySignWithRandom.
+pub def testing_only_sign_with_random(sk: PrivateKey, msg: [Byte], context: Str, random: [Byte]) -> ~[Byte] {
+  fail MldsaError.ZeroPrivateKey if sk.seed.size == 0
+  ~sign_with_random(sk, msg, context, random)
+}
+
+# Test hook: Go's TestingOnlySignExternalMuWithRandom.
+pub def testing_only_sign_external_mu_with_random(sk: PrivateKey, mu: [Byte], random: [Byte]) -> ~[Byte] {
+  fail MldsaError.ZeroPrivateKey if sk.seed.size == 0
+  ~sign_external_mu_with_random(sk, mu, random)
+}
+
+def sign_with_random(sk: PrivateKey, msg: [Byte], context: Str, random: [Byte]) -> ~[Byte] {
+  mu = ~compute_message_hash(sk.pk.tr, msg, context)
+  fail MldsaError.RandomLength if random.size != 32
+  sign_internal(sk, mu, random, [])
+}
+
+def sign_external_mu_with_random(sk: PrivateKey, mu: [Byte], random: [Byte]) -> ~[Byte] {
+  fail MldsaError.MessageHashLength if mu.size != 64
+  fail MldsaError.RandomLength if random.size != 32
+  sign_internal(sk, mu, random, [])
+}
+
+def new_private_key_internal(seed: [Byte], p: Params) -> PrivateKey {
+  k = p.k
+  l = p.l
+  xi = sha3.new_shake256()
+  absorb(xi, seed)
+  absorb(xi, [k.as_u8, l.as_u8])
+  rho = [0.as_u8; 32]
+  rhos = [0.as_u8; 64]
+  kk = [0.as_u8; 32]
+  xi.read!(rho)
+  xi.read!(rhos)
+  xi.read!(kk)
+
+  a = [0.as_u32; k * l * N]
+  compute_matrix_a(a, rho, p)
+
+  s1 = [0.as_u32; l * N]
+  r = 0
+  while r < l {
+    sample_bounded_poly(poly(s1, r), rhos, r.as_u8, p)
+    ntt(poly(s1, r))
+    r += 1
+  }
+  s2 = [0.as_u32; k * N]
+  r = 0
+  while r < k {
+    sample_bounded_poly(poly(s2, r), rhos, (l + r).as_u8, p)
+    ntt(poly(s2, r))
+    r += 1
+  }
+
+  # t = NTT⁻¹(Â ∘ ŝ₁ + ŝ₂); (t₁, t₀) = Power2Round(t); t̂₀ = NTT(t₀)
+  t1 = [0.as_u32; k * N]
+  t0 = [0.as_u32; k * N]
+  t = [0.as_u32; N]
+  i = 0
+  while i < k {
+    copy(t, poly(s2, i))
+    j = 0
+    while j < l {
+      ntt_mul_acc(t, poly(a, i * l + j), poly(s1, j))
+      j += 1
+    }
+    inverse_ntt(t)
+    t1i = poly(t1, i)
+    t0i = poly(t0, i)
+    c = 0
+    while c < N {
+      t1i[c] = power2_round_hi(t[c])
+      t0i[c] = power2_round_lo(t[c])
+      c += 1
+    }
+    ntt(t0i)
+    i += 1
+  }
+
+  raw = pk_encode(rho, t1, p)
+  tr = compute_public_key_hash(raw)
+  t1_hat = compute_t1_hat(t1, k)
+  pk = PublicKey.new(raw: raw, prm: p, tr: tr)
+  PrivateKey.new(seed: seed, pk: pk, a: a, t1: t1_hat, s1: s1, s2: s2, t0: t0, kk: kk)
+}
+
+# Â from ρ: A[r*l+s] = SampleNTT(ρ, s, r).
+def compute_matrix_a(a: [U32], rho: [Byte], p: Params) {
+  r = 0
+  while r < p.k {
+    s = 0
+    while s < p.l {
+      sample_ntt(poly(a, r * p.l + s), rho, s.as_u8, r.as_u8)
+      s += 1
+    }
+    r += 1
+  }
+  nil
+}
+
+# tr = SHAKE256(pk, 64).
+def compute_public_key_hash(pk: [Byte]) -> [Byte] {
+  h = sha3.new_shake256()
+  absorb(h, pk)
+  tr = [0.as_u8; 64]
+  h.read!(tr)
+  tr
+}
+
+# NTT(t₁ ⋅ 2ᵈ) of the k polynomials of t1 (standard form, ≤ 2¹⁰ - 1).
+def compute_t1_hat(t1: [U32], k: Int) -> [U32] {
+  out = [0.as_u32; k * N]
+  i = 0
+  while i < k {
+    src = poly(t1, i)
+    w = poly(out, i)
+    j = 0
+    while j < N {
+      # t₁ ⋅ 2ᵈ ≤ 2ᵈ(2¹⁰ - 1) < q
+      w[j] = field_montgomery_mul(src[j] << 13, RR)
+      j += 1
+    }
+    ntt(w)
+    i += 1
+  }
+  out
+}
+
+# pkEncode: ρ and the 10-bit coefficients of t₁.
+def pk_encode(rho: [Byte], t1: [U32], p: Params) -> [Byte] {
+  pk = [0.as_u8; pub_key_size(p)]
+  copy(pk, rho)
+  o = 32
+  i = 0
+  while i < p.k * N {
+    c0 = t1[i]
+    c1 = t1[i + 1]
+    c2 = t1[i + 2]
+    c3 = t1[i + 3]
+    pk[o] = c0.as_u8
+    pk[o + 1] = ((c0 >> 8) | (c1 << 2)).as_u8
+    pk[o + 2] = ((c1 >> 6) | (c2 << 4)).as_u8
+    pk[o + 3] = ((c2 >> 4) | (c3 << 6)).as_u8
+    pk[o + 4] = (c3 >> 2).as_u8
+    o += 5
+    i += 4
+  }
+  pk
+}
+
+# pkDecode: t₁ (k × N, standard form) from the encoding; returns ρ.
+def pk_decode(pk: [Byte], t1: [U32], p: Params) -> ~[Byte] {
+  fail MldsaError.InvalidPublicKeyLength if pk.size != pub_key_size(p)
+  o = 32
+  i = 0
+  while i < p.k * N {
+    b0 = pk[o].as_u32
+    b1 = pk[o + 1].as_u32
+    b2 = pk[o + 2].as_u32
+    b3 = pk[o + 3].as_u32
+    b4 = pk[o + 4].as_u32
+    t1[i] = b0 | ((b1 & 0b11) << 8)
+    t1[i + 1] = (b1 >> 2) | ((b2 & 0b1111) << 6)
+    t1[i + 2] = (b2 >> 4) | ((b3 & 0b111111) << 4)
+    t1[i + 3] = (b3 >> 6) | (b4 << 2)
+    o += 5
+    i += 4
+  }
+  pk[0...32]
+}
+
+# A public key from its encoding. A and t1Hat are not precomputed (they
+# would make the key over 68 KB); verify computes them.
+def new_public_key_internal(pk: [Byte], p: Params) -> ~PublicKey {
+  fail MldsaError.InvalidPublicKeyLength if pk.size != pub_key_size(p)
+  PublicKey.new(raw: pk + [], prm: p, tr: compute_public_key_hash(pk))
+}
+
+# μ = SHAKE256(tr || 0 || len(ctx) || ctx || msg, 64).
+def compute_message_hash(tr: [Byte], msg: [Byte], context: Str) -> ~[Byte] {
+  fail MldsaError.ContextTooLong if context.size > 255
+  h = sha3.new_shake256()
+  absorb(h, tr)
+  # the ML-DSA / HashML-DSA domain separator, then the context length
+  absorb(h, [0.as_u8, context.size.as_u8])
+  absorb(h, context.bytes.to_a)
+  absorb(h, msg)
+  mu = [0.as_u8; 64]
+  h.read!(mu)
+  mu
+}
+
+# Rejection reasons, the indices of a trace slice.
+REJECT_Z = 0
+REJECT_R0 = 1
+REJECT_CT0 = 2
+REJECT_H = 3
+
+# Scratch space of the signing loop, allocated once per signature.
+struct SignState {
+  y: [U32]
+  y_hat: [U32]
+  w: [U32]
+  w1: [Byte]
+  w1_buf: [Byte]
+  v: [Byte]
+  ch: [Byte]
+  c: [U32]
+  cs: [U32]
+  z: [U32]
+  r0: [U32]
+  ct0: [U32]
+  h: [Byte]
+}
+
+# Sign_internal of FIPS 204 with μ and rnd given. trace, if not empty,
+# counts the rejections by reason (REJECT_Z ...).
+def sign_internal(sk: PrivateKey, mu: [Byte], random: [Byte], trace: [Int]) -> [Byte] {
+  p = sk.pk.prm
+  k = p.k
+  l = p.l
+  h = sha3.new_shake256()
+  absorb(h, sk.kk)
+  absorb(h, random)
+  absorb(h, mu)
+  nonce = [0.as_u8; 64]
+  h.read!(nonce)
+
+  st = SignState.new(y: [0.as_u32; l * N], y_hat: [0.as_u32; l * N], w: [0.as_u32; k * N],
+    w1: [0.as_u8; N], w1_buf: [0.as_u8; 6 * N / 8], v: [0.as_u8; (p.gamma1 + 1) * N / 8],
+    ch: [0.as_u8; p.lambda / 4], c: [0.as_u32; N], cs: [0.as_u32; N], z: [0.as_u32; l * N],
+    r0: [0.as_u32; N], ct0: [0.as_u32; k * N], h: [0.as_u8; k * N])
+  kappa = 0
+  while true {
+    # Main rejection sampling loop. Leaking rejected signatures leaks the
+    # key, but we are free to leak rejected ch values, which check caused
+    # the rejection and which coefficient failed it (not its value or
+    # sign): Dilithium round 3 specification, Section 5.5.
+    reason = sign_attempt(sk, mu, nonce, kappa, h, st)
+    kappa += l
+    if reason < 0 {
+      return sig_encode(st.ch, st.z, st.h, p)
+    }
+    trace[reason] = trace[reason] + 1 if trace.size > 0
+  }
+  []
+}
+
+# One attempt of the signing loop with counter κ; -1 if it produced a
+# signature (in st.ch, st.z, st.h), else the rejection reason.
+def sign_attempt(sk: PrivateKey, mu: [Byte], nonce: [Byte], kappa: Int, h: sha3.SHAKE, st: SignState) -> Int {
+  p = sk.pk.prm
+  k = p.k
+  l = p.l
+  beta = (p.tau * p.eta).as_u32
+  gamma1: U32 = 1.as_u32 << p.gamma1.as_u32
+  g1b = gamma1 - beta
+  gamma2 = (Q - 1) / p.gamma2.as_u32
+  g2b = gamma2 - beta
+  hh = h
+
+  r = 0
+  while r < l {
+    counter = kappa + r
+    hh.reset!
+    absorb(hh, nonce)
+    absorb(hh, [counter.as_u8, (counter >> 8).as_u8])
+    hh.read!(st.v)
+    bit_unpack(poly(st.y, r), st.v, p)
+    r += 1
+  }
+
+  # w = NTT⁻¹(Â ∘ NTT(y))
+  copy(st.y_hat, st.y)
+  i = 0
+  while i < l {
+    ntt(poly(st.y_hat, i))
+    i += 1
+  }
+  i = 0
+  while i < k {
+    wi = poly(st.w, i)
+    zero(wi)
+    j = 0
+    while j < l {
+      ntt_mul_acc(wi, poly(sk.a, i * l + j), poly(st.y_hat, j))
+      j += 1
+    }
+    inverse_ntt(wi)
+    i += 1
+  }
+
+  hh.reset!
+  absorb(hh, mu)
+  i = 0
+  while i < k {
+    high_bits(st.w1, poly(st.w, i), p)
+    w1_encode(hh, st.w1, p, st.w1_buf)
+    i += 1
+  }
+  hh.read!(st.ch)
+
+  # sample_in_ball is not constant time, but leaking rejected ch values is
+  # acceptable (see above).
+  sample_in_ball(st.c, st.ch, p)
+  ntt(st.c)
+
+  # z = y + NTT⁻¹(ĉ ∘ ŝ₁); reject if ||z||∞ ≥ γ1 − β
+  i = 0
+  while i < l {
+    ntt_mul(st.cs, st.c, poly(sk.s1, i))
+    inverse_ntt(st.cs)
+    zi = poly(st.z, i)
+    poly_add(zi, poly(st.y, i), st.cs)
+    return REJECT_Z if coefficients_exceed_bound(zi, g1b)
+    i += 1
+  }
+
+  # reject if ||LowBits(w − cs2)||∞ ≥ γ2 − β; keeps cs2 in st.ct0 for the
+  # hints below
+  i = 0
+  while i < k {
+    cs2 = poly(st.ct0, i)
+    ntt_mul(cs2, st.c, poly(sk.s2, i))
+    inverse_ntt(cs2)
+    poly_sub(st.r0, poly(st.w, i), cs2)
+    return REJECT_R0 if low_bits_exceed_bound(st.r0, g2b, p)
+    i += 1
+  }
+
+  # reject if ||ct0||∞ ≥ γ2; then the hints, from ct0, w and cs2
+  count1s = 0
+  i = 0
+  while i < k {
+    ntt_mul(st.cs, st.c, poly(sk.t0, i))
+    inverse_ntt(st.cs)
+    return REJECT_CT0 if coefficients_exceed_bound(st.cs, gamma2)
+    count1s += make_hint(st.h[i * N...(i + 1) * N], st.cs, poly(st.w, i), poly(st.ct0, i), p)
+    i += 1
+  }
+  # reject if the number of hints > ω
+  return REJECT_H if count1s > p.omega
+  -1
+}
+
+def zero(f: [U32]) {
+  i = 0
+  while i < f.size {
+    f[i] = 0
+    i += 1
+  }
+  nil
+}
+
+# w1Encode of FIPS 204, written into h (buf is scratch, ≥ 6 × N / 8).
+def w1_encode(h: sha3.SHAKE, w: [Byte], p: Params, buf: [Byte]) {
+  if p.gamma2 == 32 {
+    # coefficients ≤ (q − 1)/(2γ2) − 1 = 15, four bits each
+    i = 0
+    while i < N {
+      buf[i / 2] = w[i] | (w[i + 1] << 4)
+      i += 2
+    }
+    absorb(h, buf[0...4 * N / 8])
+  } else if p.gamma2 == 88 {
+    # coefficients ≤ (q − 1)/(2γ2) − 1 = 43, six bits each
+    i = 0
+    while i < N {
+      b0 = w[i]
+      b1 = w[i + 1]
+      b2 = w[i + 2]
+      b3 = w[i + 3]
+      o = 3 * i / 4
+      buf[o] = b0 | (b1 << 6)
+      buf[o + 1] = (b1 >> 2) | (b2 << 4)
+      buf[o + 2] = (b2 >> 4) | (b3 << 2)
+      i += 4
+    }
+    absorb(h, buf[0...6 * N / 8])
+  } else {
+    panic("mldsa: internal error: unsupported γ2")
+  }
+  nil
+}
+
+def coefficients_exceed_bound(w: [U32], bound: U32) -> Bool {
+  i = 0
+  while i < N {
+    return true if field_infinity_norm(w[i]) >= bound
+    i += 1
+  }
+  false
+}
+
+def low_bits_exceed_bound(w: [U32], bound: U32, p: Params) -> Bool {
+  i = 0
+  if p.gamma2 == 32 {
+    while i < N {
+      return true if constant_time_abs(low_bits32(w[i])) >= bound
+      i += 1
+    }
+  } else if p.gamma2 == 88 {
+    while i < N {
+      return true if constant_time_abs(low_bits88(w[i])) >= bound
+      i += 1
+    }
+  } else {
+    panic("mldsa: internal error: unsupported γ2")
+  }
+  false
+}
+
+def verify_internal(pk: PublicKey, mu: [Byte], sig: [Byte]) -> ~Unit {
+  p = pk.prm
+  k = p.k
+  l = p.l
+  beta = (p.tau * p.eta).as_u32
+  gamma1: U32 = 1.as_u32 << p.gamma1.as_u32
+  g1b = gamma1 - beta
+
+  t1 = [0.as_u32; k * N]
+  rho = ~pk_decode(pk.raw, t1, p)
+  a = [0.as_u32; k * l * N]
+  compute_matrix_a(a, rho, p)
+  t1_hat = compute_t1_hat(t1, k)
+
+  z = [0.as_u32; l * N]
+  hint = [0.as_u8; k * N]
+  ch = ~sig_decode(sig, z, hint, p)
+
+  c = [0.as_u32; N]
+  sample_in_ball(c, ch, p)
+  ntt(c)
+
+  # w = Â ∘ NTT(z) − NTT(c) ∘ NTT(t₁ ⋅ 2ᵈ)
+  z_hat = z + []
+  i = 0
+  while i < l {
+    ntt(poly(z_hat, i))
+    i += 1
+  }
+  h = sha3.new_shake256()
+  absorb(h, mu)
+  w = [0.as_u32; N]
+  ct = [0.as_u32; N]
+  w1 = [0.as_u8; N]
+  buf = [0.as_u8; 6 * N / 8]
+  i = 0
+  while i < k {
+    zero(w)
+    j = 0
+    while j < l {
+      ntt_mul_acc(w, poly(a, i * l + j), poly(z_hat, j))
+      j += 1
+    }
+    ntt_mul(ct, c, poly(t1_hat, i))
+    poly_sub(w, w, ct)
+    inverse_ntt(w)
+    # the hints h give w₁ from w(approx)
+    use_hint(w1, w, hint[i * N...(i + 1) * N], p)
+    w1_encode(h, w1, p, buf)
+    i += 1
+  }
+  computed_ch = [0.as_u8; p.lambda / 4]
+  h.read!(computed_ch)
+
+  i = 0
+  while i < l {
+    fail MldsaError.InvalidSignature if coefficients_exceed_bound(poly(z, i), g1b)
+    i += 1
+  }
+  fail MldsaError.InvalidSignature if ch != computed_ch
+}
+
+# sigEncode: ch, the packed z and the hints.
+def sig_encode(ch: [Byte], z: [U32], h: [Byte], p: Params) -> [Byte] {
+  sig = [0.as_u8; sig_size(p)]
+  copy(sig, ch)
+  o = ch.size
+  i = 0
+  while i < p.l {
+    o = bit_pack(sig, o, poly(z, i), p)
+    i += 1
+  }
+  hint_encode(sig[o...sig.size], h, p)
+  sig
+}
+
+# sigDecode: z and the hints h from sig; returns ch.
+def sig_decode(sig: [Byte], z: [U32], h: [Byte], p: Params) -> ~[Byte] {
+  fail MldsaError.InvalidSignatureLength if sig.size != sig_size(p)
+  o = p.lambda / 4
+  ch = sig[0...o]
+  length = (p.gamma1 + 1) * N / 8
+  i = 0
+  while i < p.l {
+    bit_unpack(poly(z, i), sig[o...o + length], p)
+    o += length
+    i += 1
+  }
+  ~hint_decode(sig[o...sig.size], h, p)
+  ch
+}
+
+# The hints of h (k × N bytes, 0 or 1) as ω indices and k limits, into y.
+def hint_encode(y: [Byte], h: [Byte], p: Params) {
+  idx = 0
+  i = 0
+  while i < p.k {
+    j = 0
+    while j < N {
+      if h[i * N + j] != 0 {
+        y[idx] = j.as_u8
+        idx += 1
+      }
+      j += 1
+    }
+    y[p.omega + i] = idx.as_u8
+    i += 1
+  }
+  nil
+}
+
+# The hints from their encoding y into h (zeroed, k × N bytes).
+def hint_decode(y: [Byte], h: [Byte], p: Params) -> ~Unit {
+  omega = p.omega
+  fail MldsaError.InvalidSignatureHintLength if y.size != omega + p.k
+  idx = 0
+  i = 0
+  while i < p.k {
+    limit = y[omega + i].to_i
+    fail MldsaError.InvalidSignatureEncoding if limit < idx || limit > omega
+    first = idx
+    while idx < limit {
+      fail MldsaError.InvalidSignatureEncoding if idx > first && y[idx - 1] >= y[idx]
+      h[i * N + y[idx].to_i] = 1
+      idx += 1
+    }
+    i += 1
+  }
+  while idx < omega {
+    fail MldsaError.InvalidSignatureEncoding if y[idx] != 0
+    idx += 1
+  }
+}

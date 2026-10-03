@@ -203,13 +203,40 @@ mod stdlib {
     include!(concat!(env!("OUT_DIR"), "/std_files.rs"));
 }
 
+/// The standard library's files: the embedded copy, or, when
+/// `ALX_STD_DIR` names a directory, the `.alx` files under it (read once), so
+/// std edits can be tried without rebuilding the compiler.
+fn std_files() -> &'static [(String, String)] {
+    static FILES: std::sync::OnceLock<Vec<(String, String)>> = std::sync::OnceLock::new();
+    FILES.get_or_init(|| {
+        let Some(root) = std::env::var_os("ALX_STD_DIR").map(PathBuf::from) else {
+            return stdlib::STD.iter().map(|(p, t)| (p.to_string(), t.to_string())).collect();
+        };
+        let mut out = vec![];
+        let mut dirs = vec![root.clone()];
+        while let Some(d) = dirs.pop() {
+            for e in std::fs::read_dir(&d).into_iter().flatten().flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    dirs.push(p);
+                } else if p.extension().is_some_and(|x| x == "alx") {
+                    let rel = p.strip_prefix(&root).unwrap().to_string_lossy().replace('\\', "/");
+                    out.push((rel, std::fs::read_to_string(&p).unwrap_or_default()));
+                }
+            }
+        }
+        out.sort();
+        out
+    })
+}
+
 /// Where the embedded standard library appears as a directory.
 pub const STD_DIR: &str = "$std";
 
 /// The files of an embedded std package directory.
 fn std_list(dir: &Path) -> Option<Vec<PathBuf>> {
     let rel = dir.strip_prefix(STD_DIR).ok()?.to_string_lossy().replace('\\', "/");
-    let fs: Vec<PathBuf> = stdlib::STD
+    let fs: Vec<PathBuf> = std_files()
         .iter()
         .filter(|(p, _)| p.rsplit_once('/').map(|(d, _)| d) == Some(rel.as_str()))
         .map(|(p, _)| Path::new(STD_DIR).join(p))
@@ -219,13 +246,13 @@ fn std_list(dir: &Path) -> Option<Vec<PathBuf>> {
 
 fn std_read(f: &Path) -> Option<String> {
     let rel = f.strip_prefix(STD_DIR).ok()?.to_string_lossy().replace('\\', "/");
-    stdlib::STD.iter().find(|(p, _)| *p == rel).map(|(_, t)| t.to_string())
+    std_files().iter().find(|(p, _)| *p == rel).map(|(_, t)| t.to_string())
 }
 
 /// Is `path` a package of the standard library?
 pub fn is_std(path: &str) -> bool {
     let pre = format!("{path}/");
-    stdlib::STD.iter().any(|(p, _)| p.strip_prefix(&pre).is_some_and(|f| !f.contains('/')))
+    std_files().iter().any(|(p, _)| p.strip_prefix(&pre).is_some_and(|f| !f.contains('/')))
 }
 
 /// Where an import path lives: inside the main module (its module path
@@ -895,8 +922,10 @@ pub fn load_tests(dir: &Path, dir_shown: &str, only: Option<&Path>, o: &TestOpts
         }
         acc.defs.push(t.def);
         let wanted = match t.kind {
-            TestKind::Bench => o.bench.as_ref().is_some_and(|b| b == "." || t.name.contains(b.as_str())),
-            _ => o.run.as_ref().is_none_or(|r| t.name.contains(r.as_str())),
+            // `a|b` matches names containing a or b (the alternation of Go's
+            // regexp filters; the parts are plain substrings).
+            TestKind::Bench => o.bench.as_ref().is_some_and(|b| b == "." || b.split('|').any(|p| t.name.contains(p))),
+            _ => o.run.as_ref().is_none_or(|r| r.split('|').any(|p| t.name.contains(p))),
         };
         if wanted {
             items.push(TestItem { kind: t.kind, name: t.name, func, outputs: t.outputs });

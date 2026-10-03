@@ -1341,6 +1341,9 @@ struct FnCx<'w, 'a> {
     /// The type the expression being checked is wanted as (for inferring
     /// a generic constructor's type arguments).
     want_hint: Option<Ty>,
+    /// The declared result type, for the def body's last expression (an
+    /// array or tuple literal converts its elements to it).
+    tail_want: Option<Ty>,
     /// `R[Str].empty`: the type arguments a static method's call gives (consumed by `call_def`).
     owner_targs: Vec<Ty>,
     /// In a method: `Some(true)` for a `!` method (`self` is a one-element
@@ -1403,6 +1406,7 @@ impl<'w, 'a> FnCx<'w, 'a> {
             pure_decl: def.is_some_and(|d| d.pure),
             fn_name: def.map_or("main".into(), |d| d.name.clone()),
             want_hint: None,
+            tail_want: None,
             owner_targs: vec![],
             errs: Default::default(),
             decl_spans: vec![],
@@ -1551,6 +1555,9 @@ impl<'w, 'a> FnCx<'w, 'a> {
         // that must exist; otherwise a trailing `case`/`if` whose arms
         // disagree is a statement, and the function returns nothing.
         self.cells = Some(vec![]);
+        if def.is_some_and(|d| d.ret.is_some()) && !self.is_main {
+            self.tail_want = Some(self.ret.clone());
+        }
         let r = self.body_as(body, def.is_some_and(|d| d.ret.is_some()));
         let cells = self.cells.take().unwrap_or_default();
         let (mut stmts, tail_ty) = r?;
@@ -1796,9 +1803,20 @@ impl<'w, 'a> FnCx<'w, 'a> {
     fn body_as(&mut self, stmts: &[Stmt], used: bool) -> R<(Vec<TStmt>, Ty)> {
         let mut out = vec![];
         let mut last = Ty::Unit;
+        let tail_want = self.tail_want.take();
         for (i, s) in stmts.iter().enumerate() {
             let used = used && i + 1 == stmts.len();
             let t = match &s.kind {
+                StmtKind::Expr(e @ Expr { kind: ExprKind::Array(_) | ExprKind::Tuple(_), .. }) if used && tail_want.is_some() => {
+                    let w = tail_want.clone().unwrap();
+                    TStmt::Expr(self.value_as(e, &w)?)
+                }
+                StmtKind::Expr(Expr { kind: ExprKind::Case(subject, arms), span, .. }) if used && tail_want.is_some() => {
+                    let saved = self.want_hint.replace(tail_want.clone().unwrap());
+                    let r = self.case(subject.as_deref(), arms, *span, used);
+                    self.want_hint = saved;
+                    TStmt::Expr(r?)
+                }
                 // A trailing `if ... else ...` is the block's value (Ruby).
                 StmtKind::If(c, a, b) if i + 1 == stmts.len() && !b.is_empty() => TStmt::Expr(self.if_value(c, a, b, s.span, used)?),
                 StmtKind::Expr(Expr { kind: ExprKind::Case(subject, arms), span, .. }) => TStmt::Expr(self.case(subject.as_deref(), arms, *span, used)?),
@@ -2478,8 +2496,12 @@ impl<'w, 'a> FnCx<'w, 'a> {
                 let mut out = vec![];
                 for it in items {
                     let v = self.value(it)?;
-                    let elr = self.resolve(&el);
-                    let v = if is_complex(&elr) { self.coerce(v, &elr)? } else { v };
+                    // Once an earlier element fixed the type (an interface,
+                    // say), later ones convert to it.
+                    let known = self.resolve(&el);
+                    // (Not an Int or Float: those may be untyped literals the
+                    // whole array still converts from, `n: [U64] = [1, 1 << 63]`.)
+                    let v = if known.has_var() || matches!(known, Ty::Int | Ty::Float) { v } else { self.coerce(v, &known)? };
                     self.expect(&v.ty, &el, v.span, "array element")?;
                     out.push(v);
                 }
@@ -2772,6 +2794,10 @@ impl<'w, 'a> FnCx<'w, 'a> {
                 let vals = fs.clone().iter().map(|(_, ft)| self.zero_of(ft, sp)).collect::<Option<Vec<_>>>()?;
                 TK::M(M::StructNew, None, vals, None)
             }
+            // An interface's zero is all-zero storage: its first implementor's
+            // zero value (filling another variant's slots of an enum, or a
+            // field a keyword `new` leaves out; Go's would be nil).
+            Ty::Iface(_) => TK::Zero,
             _ => return None,
         };
         Some(self.mk(kind, t.clone(), sp))
@@ -2781,6 +2807,9 @@ impl<'w, 'a> FnCx<'w, 'a> {
     /// `used`: the case's value is required. If not (a statement), its arms
     /// may be of different types (it then has no value), as an `if`'s may.
     fn case(&mut self, subject: Option<&Expr>, arms: &[CaseArm], sp: Span, used: bool) -> R<TExpr> {
+        // The type the case's value must have, when known (a declaration's,
+        // a def's result): arms convert to it (`[0x30, 0x31]` as [Byte]).
+        let want = if used { self.want_hint.take().map(|t| self.resolve(&t)).filter(|t| !t.has_var()) } else { None };
         let mut pre = vec![];
         let subj = match subject {
             Some(s) => {
@@ -2987,6 +3016,17 @@ impl<'w, 'a> FnCx<'w, 'a> {
                 }
                 conds = lifted;
                 default = Some(lift(self, default.unwrap())?);
+            }
+        }
+        if let Some(w) = &want {
+            let mut conv = vec![];
+            for (c, b) in conds {
+                let b = if matches!(self.resolve(&b.ty), Ty::Never) { b } else { self.coerce_branch(b, w)? };
+                conv.push((c, b));
+            }
+            conds = conv;
+            if let Some(d) = default.take() {
+                default = Some(if matches!(self.resolve(&d.ty), Ty::Never) { d } else { self.coerce_branch(d, w)? });
             }
         }
         // Arms that disagree: an error if the value is wanted, else a statement (no value).
@@ -3877,6 +3917,7 @@ impl<'w, 'a> FnCx<'w, 'a> {
     /// `used`: the value is required, so the branches must agree; otherwise
     /// (a statement) they may differ and the `if` then has no value.
     fn if_value(&mut self, c: &Expr, a: &[Stmt], b: &[Stmt], sp: Span, used: bool) -> R<TExpr> {
+        let want = if used && !b.is_empty() { self.want_hint.take().map(|t| self.resolve(&t)).filter(|t| !t.has_var()) } else { None };
         let (c, ta) = match self.opt_let(c)? {
             Some((cond, name, tmp, ty)) => {
                 self.scopes.push(HashMap::new());
@@ -3896,6 +3937,14 @@ impl<'w, 'a> FnCx<'w, 'a> {
             }
         };
         let tb = self.seq_body(b, sp, used)?;
+        let (ta, tb) = match &want {
+            Some(w) => {
+                let ta = if matches!(self.resolve(&ta.ty), Ty::Never) { ta } else { self.coerce_branch(ta, w)? };
+                let tb = if matches!(self.resolve(&tb.ty), Ty::Never) { tb } else { self.coerce_branch(tb, w)? };
+                (ta, tb)
+            }
+            None => (ta, tb),
+        };
         // A discarded value isn't joined: coercing one branch to the other's
         // type (an Int branch to the other's Error?) would mistype it.
         let (ta, tb) = if used { self.join(ta, tb)? } else { (ta, tb) };
@@ -4464,6 +4513,14 @@ impl<'w, 'a> FnCx<'w, 'a> {
             if let Ty::Fn(..) = self.resolve(&self.locals[id].ty) {
                 let f = self.mk(TK::Local(id), self.locals[id].ty.clone(), name_span);
                 return self.fn_call(f, args, sp);
+            }
+        }
+        // A field of the receiver named like a builtin (`p`, `print`) is the
+        // field when used bare.
+        if args.is_empty() && block.is_none() {
+            let bare = Expr { kind: ExprKind::Name(name.to_string()), span: name_span, id: NodeId::MAX };
+            if let Some(f) = self.self_field(&bare) {
+                return self.expr(&f);
             }
         }
         match name {

@@ -1,0 +1,258 @@
+#![overflow(wrap)]
+# Go's crypto/internal/fips140/mlkem/field_test.go.
+
+import "crypto/rand"
+import "math/big"
+import "strconv"
+
+test "FieldReduce" {
+  a: U32 = 0
+  while a < 2 * Q * Q {
+    got = field_reduce(a)
+    exp = (a % Q).as_u16
+    assert got == exp, "reduce(#{a}) = #{got}, expected #{exp}"
+    a += 1
+  }
+}
+
+test "FieldAdd" {
+  a: U16 = 0
+  while a < Q {
+    b: U16 = 0
+    while b < Q {
+      got = field_add(a, b)
+      exp = (a + b) % Q
+      assert got == exp, "#{a} + #{b} = #{got}, expected #{exp}"
+      b += 1
+    }
+    a += 1
+  }
+}
+
+test "FieldSub" {
+  a: U16 = 0
+  while a < Q {
+    b: U16 = 0
+    while b < Q {
+      got = field_sub(a, b)
+      exp = (a - b + Q) % Q
+      assert got == exp, "#{a} - #{b} = #{got}, expected #{exp}"
+      b += 1
+    }
+    a += 1
+  }
+}
+
+test "FieldMul" {
+  a: U16 = 0
+  while a < Q {
+    b: U16 = 0
+    while b < Q {
+      got = field_mul(a, b)
+      exp = ((a.as_u32 * b.as_u32) % Q).as_u16
+      assert got == exp, "#{a} * #{b} = #{got}, expected #{exp}"
+      b += 1
+    }
+    a += 1
+  }
+}
+
+test "DecompressCompress" {
+  for bits in [1, 4, 10] {
+    a: U16 = 0
+    while a.to_i < (1 << bits) {
+      f = decompress(a, bits)
+      assert f < Q, "decompress(#{a}, #{bits}) = #{f} >= q"
+      got = compress(f, bits)
+      assert got == a, "compress(decompress(#{a}, #{bits}), #{bits}) = #{got}"
+      a += 1
+    }
+
+    a = 0
+    while a < Q {
+      c = compress(a, bits)
+      assert c.to_i < (1 << bits), "compress(#{a}, #{bits}) = #{c} >= 2^bits"
+      got = decompress(c, bits)
+      diff = [a - got, got - a, a - got + Q, got - a + Q].min
+      ceil = Q / (1 << bits)
+      assert diff.to_i <= ceil, "decompress(compress(#{a}, #{bits}), #{bits}) = #{got} (diff #{diff}, max diff #{ceil})"
+      a += 1
+    }
+  }
+}
+
+# round((2ᵈ / q) * x) mod 2ᵈ with exact rationals.
+def compress_rat(x: U16, d: Int) -> U16 {
+  panic("x out of range") if x >= Q
+  panic("d out of range") if d <= 0 || d >= 12
+  precise = big.new_rat((1 << d) * x.to_i, Q) # (2ᵈ / q) * x == (2ᵈ * x) / q
+  # FloatString rounds halves away from 0, and our result should always be
+  # positive, so it should work as we expect. (There's no direct way to
+  # round a Rat.)
+  rounded = strconv.parse_int(precise.float_string(0), 10, 64).unwrap
+  # If we rounded up, `rounded` may be equal to 2ᵈ, so we perform a final
+  # reduction.
+  (rounded % (1 << d)).as_u16
+}
+
+test "Compress" {
+  d = 1
+  while d < 12 {
+    n = 0
+    while n < Q {
+      expected = compress_rat(n.as_u16, d)
+      result = compress(n.as_u16, d)
+      assert result == expected, "compress(#{n}, #{d}): got #{result}, expected #{expected}"
+      n += 1
+    }
+    d += 1
+  }
+}
+
+# round((q / 2ᵈ) * y) mod q with exact rationals.
+def decompress_rat(y: U16, d: Int) -> U16 {
+  panic("y out of range") if y.to_i >= 1 << d
+  panic("d out of range") if d <= 0 || d >= 12
+  precise = big.new_rat(Q * y.to_i, 1 << d) # (q / 2ᵈ) * y  ==  (q * y) / 2ᵈ
+  rounded = strconv.parse_int(precise.float_string(0), 10, 64).unwrap
+  # If we rounded up, `rounded` may be equal to q, so we perform a final
+  # reduction.
+  (rounded % Q).as_u16
+}
+
+test "Decompress" {
+  d = 1
+  while d < 12 {
+    n = 0
+    while n < (1 << d) {
+      expected = decompress_rat(n.as_u16, d)
+      result = decompress(n.as_u16, d)
+      assert result == expected, "decompress(#{n}, #{d}): got #{result}, expected #{expected}"
+      n += 1
+    }
+    d += 1
+  }
+}
+
+# A random ring element (Go uses math/rand/v2, which alx's std doesn't
+# have: the coefficients come from crypto/rand, reduced mod q).
+def random_ring_element -> [U16] {
+  b = [0.as_u8; 2 * N]
+  rand.read(b)
+  r = new_poly()
+  i = 0
+  while i < N {
+    r[i] = ((b[2 * i].as_u16 | (b[2 * i + 1].as_u16 << 8)) % Q)
+    i += 1
+  }
+  r
+}
+
+def encode_with(d: Int, f: [U16]) -> [Byte] {
+  out = [0.as_u8; d * N / 8]
+  ring_compress_and_encode(out, f, d)
+  out
+}
+
+def encode_special(d: Int, f: [U16]) -> [Byte] {
+  out = [0.as_u8; d * N / 8]
+  case d {
+    1 => ring_compress_and_encode1(out, f)
+    4 => ring_compress_and_encode4(out, f)
+    5 => ring_compress_and_encode5(out, f)
+    10 => ring_compress_and_encode10(out, f)
+    _ => ring_compress_and_encode11(out, f)
+  }
+  out
+}
+
+def decode_special(d: Int, b: [Byte]) -> [U16] {
+  case d {
+    1 => ring_decode_and_decompress1(b)
+    4 => ring_decode_and_decompress4(b)
+    5 => ring_decode_and_decompress5(b)
+    10 => ring_decode_and_decompress10(b)
+    _ => ring_decode_and_decompress11(b)
+  }
+}
+
+test "EncodeDecode" {
+  f = random_ring_element()
+  b = [0.as_u8; 12 * N / 8]
+  rand.read(b)
+
+  # Compare ring_compress_and_encode to ring_compress_and_encodeN (Go
+  # compares 10, 4 and 1; 5 and 11 call the generic one).
+  for d in [10, 4, 1] {
+    assert_eq encode_with(d, f), encode_special(d, f)
+  }
+
+  # Compare ring_decode_and_decompress to ring_decode_and_decompressN.
+  for d in [10, 4, 1] {
+    sz = d * N / 8
+    assert_eq ring_decode_and_decompress(b[0...sz], d), decode_special(d, b[0...sz])
+  }
+
+  # Round-trip ring_compress_and_encode and ring_decode_and_decompress.
+  d = 1
+  while d < 12 {
+    encoding_size = d * N / 8
+    g = ring_decode_and_decompress(b[0...encoding_size], d)
+    out = encode_with(d, g)
+    assert out == b[0...encoding_size], "roundtrip failed for d = #{d}"
+    d += 1
+  }
+
+  # Round-trip ring_compress_and_encodeN and ring_decode_and_decompressN.
+  for d2 in [10, 4, 1, 5, 11] {
+    sz = d2 * N / 8
+    g = decode_special(d2, b[0...sz])
+    assert encode_special(d2, g) == b[0...sz], "roundtrip failed for specialized #{d2}"
+  }
+
+  # Round-trip poly_byte_encode and poly_byte_decode (not in Go's test).
+  enc = [0.as_u8; ENCODING_SIZE12]
+  poly_byte_encode(enc, f)
+  g = new_poly()
+  assert poly_byte_decode(g, enc), "decode"
+  assert_eq g, f
+}
+
+def bit_rev7(n: Int) -> Int {
+  panic("not 7 bits") if n >> 7 != 0
+  r = 0
+  r = r | ((n >> 6) & 0b0000_0001)
+  r = r | ((n >> 4) & 0b0000_0010)
+  r = r | ((n >> 2) & 0b0000_0100)
+  r = r | (n & 0b0000_1000)
+  r = r | ((n << 2) & 0b0001_0000)
+  r = r | ((n << 4) & 0b0010_0000)
+  r = r | ((n << 6) & 0b0100_0000)
+  r
+}
+
+test "Zetas" {
+  zeta = big.new_int(17)
+  q = big.new_int(Q)
+  k = 0
+  while k < 128 {
+    # ζ^BitRev7(k) mod q
+    exp = big.Int.new
+    exp.exp!(zeta, big.new_int(bit_rev7(k)), q)
+    assert big.new_int(ZETAS[k].to_i).cmp(exp) == 0, "zetas[#{k}] = #{ZETAS[k]}, expected #{exp.to_s}"
+    k += 1
+  }
+}
+
+test "Gammas" {
+  zeta = big.new_int(17)
+  q = big.new_int(Q)
+  k = 0
+  while k < 128 {
+    # ζ^2BitRev7(i)+1
+    exp = big.Int.new
+    exp.exp!(zeta, big.new_int(bit_rev7(k) * 2 + 1), q)
+    assert big.new_int(GAMMAS[k].to_i).cmp(exp) == 0, "gammas[#{k}] = #{GAMMAS[k]}, expected #{exp.to_s}"
+    k += 1
+  }
+}

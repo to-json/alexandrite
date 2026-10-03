@@ -1,0 +1,930 @@
+#![overflow(wrap)]
+# Package hpke: Go's crypto/hpke, Hybrid Public Key Encryption (HPKE) as
+# specified in RFC 9180, base mode only, plus the post-quantum KEMs of
+# draft-ietf-hpke-pq (ML-KEM-768/1024 and the MLKEM768-X25519,
+# MLKEM768-P256 and MLKEM1024-P384 hybrids) and the SHAKE KDFs of
+# draft-ietf-hpke-pq.
+#
+#   Go                                        alx
+#   hpke.KEM / KDF / AEAD (interfaces)        KEM / KDF / AEAD (structs naming one algorithm)
+#   NewKEM(id) / NewKDF(id) / NewAEAD(id)     new_kem(id) / new_kdf(id) / new_aead(id) -> ~T
+#   DHKEM(curve)                              dhkem(curve: ecdh.Curve) -> KEM
+#   MLKEM768() / MLKEM1024()                  mlkem768() / mlkem1024()
+#   MLKEM768X25519() / MLKEM768P256()         mlkem768_x25519() / mlkem768_p256()
+#   MLKEM1024P384()                           mlkem1024_p384()
+#   HKDFSHA256() / HKDFSHA384() / HKDFSHA512() hkdf_sha256() / hkdf_sha384() / hkdf_sha512()
+#   SHAKE128() / SHAKE256()                   shake128() / shake256()
+#   AES128GCM() / AES256GCM()                 aes128_gcm() / aes256_gcm()
+#   ChaCha20Poly1305() / ExportOnly()         chacha20_poly1305() / export_only()
+#   kem.ID() / kdf.ID() / aead.ID()           id -> U16
+#   kem.GenerateKey()                         kem.generate_key -> ~PrivateKey
+#   kem.NewPublicKey(b) / NewPrivateKey(b)    kem.new_public_key(b) / kem.new_private_key(b)
+#   kem.DeriveKeyPair(ikm)                    kem.derive_key_pair(ikm) -> ~PrivateKey
+#   pk.KEM() / pk.Bytes()                     pk.kem / pk.bytes
+#   k.KEM() / k.Bytes() / k.PublicKey()       k.kem / k.bytes -> ~[Byte] / k.public_key
+#   NewDHKEMPublicKey(pub *ecdh.PublicKey)    new_dhkem_public_key(pub) -> ~PublicKey
+#   NewDHKEMPrivateKey(priv ecdh.KeyExchanger) new_dhkem_private_key(priv: ecdh.PrivateKey) -> ~PrivateKey
+#   NewMLKEMPublicKey / NewMLKEMPrivateKey    new_mlkem768_public_key(ek) / new_mlkem1024_public_key(ek),
+#                                             new_mlkem768_private_key(dk) / new_mlkem1024_private_key(dk)
+#   NewHybridPublicKey(pq, t)                 new_hybrid768_public_key(pq, t) / new_hybrid1024_public_key(pq, t)
+#   NewHybridPrivateKey(pq, t)                new_hybrid768_private_key(pq, t) / new_hybrid1024_private_key(pq, t)
+#   NewSender(pk, kdf, aead, info)            new_sender(pk, kdf, aead, info) -> ~([Byte], Sender)
+#   NewRecipient(enc, k, kdf, aead, info)     new_recipient(enc, k, kdf, aead, info) -> ~Recipient
+#   s.Seal(aad, pt) / r.Open(aad, ct)         s.seal!(aad, pt) -> ~[Byte] / r.open!(aad, ct) -> ~[Byte]
+#   s.Export(ctx, l) / r.Export(ctx, l)       s.export(ctx, l) / r.export(ctx, l) -> ~[Byte]
+#   Seal(pk, kdf, aead, info, pt)             seal(pk, kdf, aead, info, pt) -> ~[Byte]
+#   Open(k, kdf, aead, info, ct)              open(k, kdf, aead, info, ct) -> ~[Byte]
+#
+# Timing: the KEMs are crypto/ecdh and crypto/mlkem (constant time; see
+# their headers); the KDFs are HMAC and SHAKE; the AEADs are in
+# aead_impl.alx (GHASH, ChaCha20 and Poly1305 constant time, AES the
+# table-driven generic code, which is not). Tag checks use crypto/subtle.
+#
+# Differences from Go:
+#   - KEM, KDF and AEAD are structs naming one of the algorithms (by id),
+#     not interfaces: Go's have unexported methods, so only this package's
+#     algorithms implement them anyway. They compare with `==` (Go's
+#     TestSingletons). An unsupported curve gives the KEM with id 0, whose
+#     operations fail with "unsupported curve" (Go's unsupportedCurveKEM).
+#   - PublicKey and PrivateKey are structs holding the key of their KEM
+#     (Go: interfaces over unexported types). The DH private key is a
+#     crypto/ecdh PrivateKey (Go takes any ecdh.KeyExchanger and fails in
+#     Bytes when it isn't a *ecdh.PrivateKey; with no type assertions alx
+#     takes the concrete key). Go's NewMLKEMPublicKey / NewHybridPublicKey
+#     type-switch on a crypto.Encapsulator; here there is one function per
+#     ML-KEM parameter set.
+#   - Sender and Recipient keep their sequence number in shared storage
+#     (GO-VS-RUBY D36): copies are the same context, as Go's pointers are.
+#     seal! / open! advance it.
+#   - Randomness (the ephemeral DH key, ML-KEM encapsulation, generate_key)
+#     comes from crypto/rand, as in Go (whose API takes no rand). Go's tests
+#     swap in derandomized encapsulation through package variables
+#     (testingOnlyGenerateKey / testingOnlyEncapsulate); alx has no mutable
+#     package state, so new_sender_derandomized(pk, kdf, aead, info,
+#     rand_bytes) is a public test hook doing what Go's
+#     setupDerandomizedEncap does. Use it only for known-answer tests.
+#   - The AEADs are private implementations (aead_impl.alx) until
+#     crypto/aes, crypto/cipher and chacha20poly1305 are ported; Open's
+#     authentication errors carry Go's messages ("cipher: message
+#     authentication failed", "chacha20poly1305: message authentication
+#     failed").
+#   - export takes the exporter context as bytes ([Byte]; Go: string).
+#   - No FIPS 140-only mode (fips140.WithoutEnforcement around the hybrid
+#     KEMs' ECDH is a no-op in alx anyway).
+
+import "crypto/ecdh"
+import "crypto/hmac"
+import "crypto/mlkem"
+import "crypto/rand"
+import "crypto/sha256"
+import "crypto/sha3"
+import "crypto/sha512"
+
+# Errors of this package (Go's messages).
+pub error HpkeError {
+  UnsupportedKEM
+  UnsupportedKDF(id: U16)
+  UnsupportedAEAD(id: U16)
+  UnsupportedCurve
+  ExportOnlyInstantiation
+  InvalidLength
+  CiphertextTooShort
+  InvalidKeySize
+  InvalidPublicKeySize
+  InvalidEncapsulatedKeySize
+  InvalidHybridSecretLength
+  SeedNotAvailable
+  GcmAuthFailed
+  ChaChaAuthFailed
+
+  def message -> Str {
+    case self {
+      UnsupportedKEM => "unsupported KEM"
+      UnsupportedKDF(id) => format("unsupported KDF %04x", id)
+      UnsupportedAEAD(id) => format("unsupported AEAD %04x", id)
+      UnsupportedCurve => "unsupported curve"
+      ExportOnlyInstantiation => "export-only instantiation"
+      InvalidLength => "invalid length"
+      CiphertextTooShort => "ciphertext too short"
+      InvalidKeySize => "invalid key size"
+      InvalidPublicKeySize => "invalid public key size"
+      InvalidEncapsulatedKeySize => "invalid encapsulated key size"
+      InvalidHybridSecretLength => "hpke: invalid hybrid KEM secret length"
+      SeedNotAvailable => "private key seed not available"
+      GcmAuthFailed => "cipher: message authentication failed"
+      ChaChaAuthFailed => "chacha20poly1305: message authentication failed"
+    }
+  }
+}
+
+# ---- ids ----
+
+KEM_P256 = 0x0010
+KEM_P384 = 0x0011
+KEM_P521 = 0x0012
+KEM_X25519 = 0x0020
+KEM_MLKEM768 = 0x0041
+KEM_MLKEM1024 = 0x0042
+KEM_MLKEM768_X25519 = 0x647a
+KEM_MLKEM768_P256 = 0x0050
+KEM_MLKEM1024_P384 = 0x0051
+
+KDF_HKDF_SHA256 = 0x0001
+KDF_HKDF_SHA384 = 0x0002
+KDF_HKDF_SHA512 = 0x0003
+KDF_SHAKE128 = 0x0010
+KDF_SHAKE256 = 0x0011
+
+AEAD_AES128GCM = 0x0001
+AEAD_AES256GCM = 0x0002
+AEAD_CHACHA20POLY1305 = 0x0003
+AEAD_EXPORT_ONLY = 0xFFFF
+
+def be16(v: Int) -> [Byte] { [(v >> 8).as_u8, v.as_u8] }
+
+def str_bytes(s: Str) -> [Byte] { s.bytes.to_a }
+
+# ---- KDF ----
+
+# A key derivation function (RFC 9180 section 7.2, and the SHAKE KDFs of
+# draft-ietf-hpke-pq).
+pub struct KDF {
+  kid: Int
+
+  # The KDF's HPKE identifier.
+  pub def id -> U16 { kid.as_u16 }
+
+  # Nh: the hash's output size (for SHAKE, the KDF's security size).
+  def size -> Int {
+    case kid {
+      KDF_HKDF_SHA256 => 32
+      KDF_HKDF_SHA384 => 48
+      KDF_SHAKE128 => 32
+      _ => 64
+    }
+  }
+
+  def one_stage? -> Bool { kid == KDF_SHAKE128 || kid == KDF_SHAKE256 }
+
+  def labeled_extract(suite_id: [Byte], salt: [Byte], label: Str, input_key: [Byte]) -> [Byte] {
+    ikm = str_bytes("HPKE-v1") + suite_id + str_bytes(label) + input_key
+    hkdf_extract(kid, ikm, salt)
+  }
+
+  def labeled_expand(suite_id: [Byte], random_key: [Byte], label: Str, info: [Byte], length: Int) -> [Byte] {
+    li = be16(length) + str_bytes("HPKE-v1") + suite_id + str_bytes(label) + info
+    hkdf_expand(kid, random_key, li, length)
+  }
+
+  def labeled_derive(suite_id: [Byte], input_key: [Byte], label: Str, context: [Byte], length: Int) -> [Byte] {
+    h = kid == KDF_SHAKE128 ? sha3.new_shake128() : sha3.new_shake256()
+    h.write!(input_key).unwrap
+    h.write!(str_bytes("HPKE-v1")).unwrap
+    h.write!(suite_id).unwrap
+    h.write!(be16(label.size)).unwrap
+    h.write!(str_bytes(label)).unwrap
+    h.write!(be16(length)).unwrap
+    h.write!(context).unwrap
+    out = [0.as_u8; length]
+    h.read!(out)
+    out
+  }
+}
+
+def hmac_extract[H](h: () -> H, ikm: [Byte], salt: [Byte]) -> [Byte] {
+  s = salt
+  if s.size == 0 {
+    s = [0.as_u8; h().size]
+  }
+  m = hmac.new(h, s)
+  m.write!(ikm)
+  m.sum([])
+}
+
+def hmac_expand[H](h: () -> H, prk: [Byte], info: [Byte], length: Int) -> [Byte] {
+  out: [Byte] = []
+  m = hmac.new(h, prk)
+  t: [Byte] = []
+  counter = 0
+  while out.size < length {
+    counter += 1
+    m.reset!
+    m.write!(t)
+    m.write!(info)
+    m.write!([counter.as_u8])
+    t = m.sum([])
+    n = length - out.size
+    n = t.size if n > t.size
+    out = out + t[0...n]
+  }
+  out
+}
+
+# HKDF-Extract with the KDF's hash (RFC 5869).
+def hkdf_extract(kid: Int, ikm: [Byte], salt: [Byte]) -> [Byte] {
+  case kid {
+    KDF_HKDF_SHA256 => hmac_extract(->() -> sha256.Digest { sha256.new() }, ikm, salt)
+    KDF_HKDF_SHA384 => hmac_extract(->() -> sha512.Digest { sha512.new384() }, ikm, salt)
+    _ => hmac_extract(->() -> sha512.Digest { sha512.new() }, ikm, salt)
+  }
+}
+
+# HKDF-Expand with the KDF's hash (RFC 5869).
+def hkdf_expand(kid: Int, prk: [Byte], info: [Byte], length: Int) -> [Byte] {
+  case kid {
+    KDF_HKDF_SHA256 => hmac_expand(->() -> sha256.Digest { sha256.new() }, prk, info, length)
+    KDF_HKDF_SHA384 => hmac_expand(->() -> sha512.Digest { sha512.new384() }, prk, info, length)
+    _ => hmac_expand(->() -> sha512.Digest { sha512.new() }, prk, info, length)
+  }
+}
+
+# The KDF with HPKE identifier id.
+pub def new_kdf(id: U16) -> ~KDF<HpkeError> {
+  k = id.to_i64
+  if k == KDF_HKDF_SHA256 || k == KDF_HKDF_SHA384 || k == KDF_HKDF_SHA512 || k == KDF_SHAKE128 || k == KDF_SHAKE256 {
+    return KDF.new(kid: k)
+  }
+  fail HpkeError.UnsupportedKDF(id: id)
+}
+
+# HKDF-SHA256 (id 0x0001).
+pub def hkdf_sha256 -> KDF { KDF.new(kid: KDF_HKDF_SHA256) }
+
+# HKDF-SHA384 (id 0x0002).
+pub def hkdf_sha384 -> KDF { KDF.new(kid: KDF_HKDF_SHA384) }
+
+# HKDF-SHA512 (id 0x0003).
+pub def hkdf_sha512 -> KDF { KDF.new(kid: KDF_HKDF_SHA512) }
+
+# The SHAKE128 one-stage KDF (id 0x0010).
+pub def shake128 -> KDF { KDF.new(kid: KDF_SHAKE128) }
+
+# The SHAKE256 one-stage KDF (id 0x0011).
+pub def shake256 -> KDF { KDF.new(kid: KDF_SHAKE256) }
+
+# ---- AEAD ----
+
+# An authenticated encryption algorithm (RFC 9180 section 7.3).
+pub struct AEAD {
+  aid: Int
+
+  # The AEAD's HPKE identifier.
+  pub def id -> U16 { aid.as_u16 }
+
+  # Nk.
+  def key_size -> Int {
+    case aid {
+      AEAD_AES128GCM => 16
+      AEAD_EXPORT_ONLY => 0
+      _ => 32
+    }
+  }
+
+  # Nn.
+  def nonce_size -> Int { aid == AEAD_EXPORT_ONLY ? 0 : 12 }
+
+  def seal(key: [Byte], nonce: [Byte], plaintext: [Byte], aad: [Byte]) -> [Byte] {
+    return chacha20poly1305_seal(key, nonce, plaintext, aad) if aid == AEAD_CHACHA20POLY1305
+    gcm_seal(key, nonce, plaintext, aad)
+  }
+
+  def open(key: [Byte], nonce: [Byte], ciphertext: [Byte], aad: [Byte]) -> ~[Byte]<HpkeError> {
+    if aid == AEAD_CHACHA20POLY1305 {
+      if p = chacha20poly1305_open(key, nonce, ciphertext, aad) {
+        return p
+      }
+      fail HpkeError.ChaChaAuthFailed
+    }
+    if p = gcm_open(key, nonce, ciphertext, aad) {
+      return p
+    }
+    fail HpkeError.GcmAuthFailed
+  }
+}
+
+# The AEAD with HPKE identifier id.
+pub def new_aead(id: U16) -> ~AEAD<HpkeError> {
+  a = id.to_i64
+  if a == AEAD_AES128GCM || a == AEAD_AES256GCM || a == AEAD_CHACHA20POLY1305 || a == AEAD_EXPORT_ONLY {
+    return AEAD.new(aid: a)
+  }
+  fail HpkeError.UnsupportedAEAD(id: id)
+}
+
+# AES-128-GCM (id 0x0001).
+pub def aes128_gcm -> AEAD { AEAD.new(aid: AEAD_AES128GCM) }
+
+# AES-256-GCM (id 0x0002).
+pub def aes256_gcm -> AEAD { AEAD.new(aid: AEAD_AES256GCM) }
+
+# ChaCha20-Poly1305 (id 0x0003).
+pub def chacha20_poly1305 -> AEAD { AEAD.new(aid: AEAD_CHACHA20POLY1305) }
+
+# The export-only mode (id 0xFFFF): contexts can only export secrets.
+pub def export_only -> AEAD { AEAD.new(aid: AEAD_EXPORT_ONLY) }
+
+# ---- KEM ----
+
+# A key encapsulation mechanism (RFC 9180 section 7.1, draft-ietf-hpke-pq).
+pub struct KEM {
+  kid: Int
+
+  # The KEM's HPKE identifier (0 for the unsupported-curve KEM).
+  pub def id -> U16 { kid.as_u16 }
+
+  def dh? -> Bool { kid == KEM_P256 || kid == KEM_P384 || kid == KEM_P521 || kid == KEM_X25519 }
+
+  def pure_mlkem? -> Bool { kid == KEM_MLKEM768 || kid == KEM_MLKEM1024 }
+
+  def hybrid? -> Bool { kid == KEM_MLKEM768_X25519 || kid == KEM_MLKEM768_P256 || kid == KEM_MLKEM1024_P384 }
+
+  # The curve of a DH or hybrid KEM.
+  def curve -> ecdh.Curve {
+    case kid {
+      KEM_P256 => ecdh.p256()
+      KEM_MLKEM768_P256 => ecdh.p256()
+      KEM_P384 => ecdh.p384()
+      KEM_MLKEM1024_P384 => ecdh.p384()
+      KEM_P521 => ecdh.p521()
+      _ => ecdh.x25519()
+    }
+  }
+
+  # The KDF of a DH KEM.
+  def dh_kdf -> KDF {
+    case kid {
+      KEM_P384 => hkdf_sha384()
+      KEM_P521 => hkdf_sha512()
+      _ => hkdf_sha256()
+    }
+  }
+
+  # Nsecret.
+  def n_secret -> Int {
+    case kid {
+      KEM_P384 => 48
+      KEM_P521 => 64
+      _ => 32
+    }
+  }
+
+  # Nsk.
+  def n_sk -> Int {
+    case kid {
+      KEM_P384 => 48
+      KEM_P521 => 66
+      _ => 32
+    }
+  }
+
+  # The size of the curve's public key (Npk of the DH part).
+  def curve_point_size -> Int {
+    case kid {
+      KEM_P256 => 65
+      KEM_MLKEM768_P256 => 65
+      KEM_P384 => 97
+      KEM_MLKEM1024_P384 => 97
+      KEM_P521 => 133
+      _ => 32
+    }
+  }
+
+  def curve_seed_size -> Int { kid == KEM_MLKEM1024_P384 ? 48 : 32 }
+
+  def k1024? -> Bool { kid == KEM_MLKEM1024 || kid == KEM_MLKEM1024_P384 }
+
+  def pq_encaps_key_size -> Int { k1024? ? mlkem.ENCAPSULATION_KEY_SIZE1024 : mlkem.ENCAPSULATION_KEY_SIZE768 }
+
+  def pq_ciphertext_size -> Int { k1024? ? mlkem.CIPHERTEXT_SIZE1024 : mlkem.CIPHERTEXT_SIZE768 }
+
+  # The hybrid KEM's label in the shared secret.
+  def label -> Str {
+    case kid {
+      KEM_MLKEM768_X25519 => "\\.//^\\"
+      KEM_MLKEM768_P256 => "MLKEM768-P256"
+      _ => "MLKEM1024-P384"
+    }
+  }
+
+  # Nenc: the encapsulated key's size.
+  def enc_size -> Int {
+    return curve_point_size if dh?
+    return pq_ciphertext_size if pure_mlkem?
+    return pq_ciphertext_size + curve_point_size if hybrid?
+    0
+  }
+
+  def kem_suite_id -> [Byte] { str_bytes("KEM") + be16(kid) }
+
+  # A new random private key.
+  pub def generate_key -> ~PrivateKey {
+    fail HpkeError.UnsupportedCurve if kid == 0
+    if dh? {
+      priv = ~curve.generate_key(rand.reader())
+      return PrivateKey.new(kem: self, t: priv)
+    }
+    if hybrid? {
+      seed = [0.as_u8; 32]
+      rand.read(seed)
+      return ~new_private_key(seed)
+    }
+    if kid == KEM_MLKEM768 {
+      return PrivateKey.new(kem: self, dk768: mlkem.generate_key768())
+    }
+    PrivateKey.new(kem: self, dk1024: mlkem.generate_key1024())
+  }
+
+  # The public key encoded in data.
+  pub def new_public_key(data: [Byte]) -> ~PublicKey {
+    fail HpkeError.UnsupportedCurve if kid == 0
+    if dh? {
+      pub = ~curve.new_public_key(data)
+      return PublicKey.new(kem: self, t: pub)
+    }
+    if pure_mlkem? {
+      if kid == KEM_MLKEM768 {
+        return PublicKey.new(kem: self, ek768: ~mlkem.new_encapsulation_key768(data))
+      }
+      return PublicKey.new(kem: self, ek1024: ~mlkem.new_encapsulation_key1024(data))
+    }
+    fail HpkeError.InvalidPublicKeySize if data.size != pq_encaps_key_size + curve_point_size
+    n = pq_encaps_key_size
+    pq_part = data[0...n]
+    t_part = data[n...data.size]
+    if k1024? {
+      ek4 = ~mlkem.new_encapsulation_key1024(pq_part)
+      t4 = ~curve.new_public_key(t_part)
+      return PublicKey.new(kem: self, t: t4, ek1024: ek4)
+    }
+    ek = ~mlkem.new_encapsulation_key768(pq_part)
+    t = ~curve.new_public_key(t_part)
+    PublicKey.new(kem: self, t: t, ek768: ek)
+  }
+
+  # The private key encoded in data: the curve's private key for DH KEMs,
+  # the 64-byte seed for ML-KEM, the 32-byte seed for the hybrids.
+  pub def new_private_key(data: [Byte]) -> ~PrivateKey {
+    fail HpkeError.UnsupportedCurve if kid == 0
+    if dh? {
+      priv = ~curve.new_private_key(data)
+      return PrivateKey.new(kem: self, t: priv)
+    }
+    if pure_mlkem? {
+      if kid == KEM_MLKEM768 {
+        return PrivateKey.new(kem: self, dk768: ~mlkem.new_decapsulation_key768(data))
+      }
+      return PrivateKey.new(kem: self, dk1024: ~mlkem.new_decapsulation_key1024(data))
+    }
+    fail HpkeError.InvalidHybridSecretLength if data.size != 32
+    s = sha3.new_shake256()
+    s.write!(data).unwrap
+    seed_pq = [0.as_u8; mlkem.SEED_SIZE]
+    s.read!(seed_pq)
+    seed_t = [0.as_u8; curve_seed_size]
+    loop {
+      s.read!(seed_t)
+      r = curve.new_private_key(seed_t)
+      if t = r.ok {
+        seed = data.dup
+        if k1024? {
+          return PrivateKey.new(kem: self, t: t, dk1024: ~mlkem.new_decapsulation_key1024(seed_pq), seed: seed)
+        }
+        return PrivateKey.new(kem: self, t: t, dk768: ~mlkem.new_decapsulation_key768(seed_pq), seed: seed)
+      }
+    }
+  }
+
+  # The key pair derived from the input keying material ikm (RFC 9180
+  # section 7.1.3; draft-ietf-hpke-pq for the ML-KEM and hybrid KEMs).
+  pub def derive_key_pair(ikm: [Byte]) -> ~PrivateKey {
+    fail HpkeError.UnsupportedCurve if kid == 0
+    sid = kem_suite_id
+    if pure_mlkem? {
+      dk = shake256().labeled_derive(sid, ikm, "DeriveKeyPair", [], 64)
+      return ~new_private_key(dk)
+    }
+    if hybrid? {
+      dk = shake256().labeled_derive(sid, ikm, "DeriveKeyPair", [], 32)
+      return ~new_private_key(dk)
+    }
+    kdf = dh_kdf
+    prk = kdf.labeled_extract(sid, [], "dkp_prk", ikm)
+    if kid == KEM_X25519 {
+      s = kdf.labeled_expand(sid, prk, "sk", [], n_sk)
+      return ~new_private_key(s)
+    }
+    counter = 0
+    while counter < 4 {
+      s = kdf.labeled_expand(sid, prk, "candidate", [counter.as_u8], n_sk)
+      if kid == KEM_P521 {
+        s[0] = s[0] & 0x01
+      }
+      r = new_private_key(s)
+      if k = r.ok {
+        return k
+      }
+      counter += 1
+    }
+    panic("chance of four rejections is < 2^-128")
+  }
+
+  # The DH KEM's ExtractAndExpand (RFC 9180 section 4.1).
+  def extract_and_expand(dh_key: [Byte], kem_context: [Byte]) -> [Byte] {
+    sid = kem_suite_id
+    kdf = dh_kdf
+    eae_prk = kdf.labeled_extract(sid, [], "eae_prk", dh_key)
+    kdf.labeled_expand(sid, eae_prk, "shared_secret", kem_context, n_secret)
+  }
+
+  # The hybrid KEM's shared secret (draft-ietf-hpke-pq).
+  def hybrid_shared_secret(ss_pq: [Byte], ss_t: [Byte], ct_t: [Byte], ek_t: [Byte]) -> [Byte] {
+    h = sha3.new256()
+    h.write!(ss_pq)
+    h.write!(ss_t)
+    h.write!(ct_t)
+    h.write!(ek_t)
+    h.write!(str_bytes(label))
+    h.sum([])
+  }
+}
+
+# The KEM with HPKE identifier id.
+pub def new_kem(id: U16) -> ~KEM<HpkeError> {
+  k = id.to_i64
+  ids = [KEM_P256, KEM_P384, KEM_P521, KEM_X25519, KEM_MLKEM768, KEM_MLKEM1024, KEM_MLKEM768_X25519, KEM_MLKEM768_P256,
+    KEM_MLKEM1024_P384]
+  fail HpkeError.UnsupportedKEM if !ids.include?(k)
+  KEM.new(kid: k)
+}
+
+# The DHKEM of curve with its RFC 9180 KDF (P-256, P-384, P-521, X25519).
+pub def dhkem(curve: ecdh.Curve) -> KEM {
+  return KEM.new(kid: KEM_P256) if curve == ecdh.p256()
+  return KEM.new(kid: KEM_P384) if curve == ecdh.p384()
+  return KEM.new(kid: KEM_P521) if curve == ecdh.p521()
+  return KEM.new(kid: KEM_X25519) if curve == ecdh.x25519()
+  KEM.new(kid: 0)
+}
+
+# ML-KEM-768 (id 0x0041).
+pub def mlkem768 -> KEM { KEM.new(kid: KEM_MLKEM768) }
+
+# ML-KEM-1024 (id 0x0042).
+pub def mlkem1024 -> KEM { KEM.new(kid: KEM_MLKEM1024) }
+
+# The MLKEM768-X25519 hybrid, also known as X-Wing (id 0x647a).
+pub def mlkem768_x25519 -> KEM { KEM.new(kid: KEM_MLKEM768_X25519) }
+
+# The MLKEM768-P256 hybrid (id 0x0050).
+pub def mlkem768_p256 -> KEM { KEM.new(kid: KEM_MLKEM768_P256) }
+
+# The MLKEM1024-P384 hybrid (id 0x0051).
+pub def mlkem1024_p384 -> KEM { KEM.new(kid: KEM_MLKEM1024_P384) }
+
+# ---- keys ----
+
+# A KEM public key (the recipient's).
+pub struct PublicKey {
+  kem: KEM
+  t: ecdh.PublicKey?
+  ek768: mlkem.EncapsulationKey768?
+  ek1024: mlkem.EncapsulationKey1024?
+
+  # The public key's encoding.
+  pub def bytes -> [Byte] {
+    out: [Byte] = []
+    if e = ek768 {
+      out = out + e.bytes
+    }
+    if e4 = ek1024 {
+      out = out + e4.bytes
+    }
+    if t2 = t {
+      out = out + t2.bytes
+    }
+    out
+  }
+
+  # The ML-KEM part's encapsulation, derandomized with random when given.
+  def pq_encap(random: [Byte]?) -> ([Byte], [Byte]) {
+    if e = ek768 {
+      if r = random {
+        return mlkem.encapsulate768(e, r).unwrap
+      }
+      return e.encapsulate
+    }
+    e4 = ek1024.unwrap
+    if r = random {
+      return mlkem.encapsulate1024(e4, r).unwrap
+    }
+    e4.encapsulate
+  }
+
+  # (shared secret, encapsulated key). eph and pq_rand derandomize the
+  # ephemeral DH key and the ML-KEM encapsulation (test hooks).
+  def encap(eph: ecdh.PrivateKey?, pq_rand: [Byte]?) -> ~([Byte], [Byte]) {
+    if kem.pure_mlkem? {
+      ss, ct = pq_encap(pq_rand)
+      return (ss, ct)
+    }
+    pub = t.unwrap
+    sk_e = eph || ~pub.curve.generate_key(rand.reader())
+    ss_t = ~sk_e.ecdh(pub)
+    ct_t = sk_e.public_key.bytes
+    if kem.dh? {
+      kem_context = ct_t + pub.bytes
+      return (kem.extract_and_expand(ss_t, kem_context), ct_t)
+    }
+    ss_pq, ct_pq = pq_encap(pq_rand)
+    ss = kem.hybrid_shared_secret(ss_pq, ss_t, ct_t, pub.bytes)
+    (ss, ct_pq + ct_t)
+  }
+}
+
+# A KEM private key (the recipient's).
+pub struct PrivateKey {
+  kem: KEM
+  t: ecdh.PrivateKey?
+  dk768: mlkem.DecapsulationKey768?
+  dk1024: mlkem.DecapsulationKey1024?
+  # The hybrid KEMs' 32-byte seed, when known.
+  seed: [Byte]?
+
+  # The private key's encoding: the curve's private key (X25519 keys are
+  # clamped), the ML-KEM seed, or the hybrid seed.
+  pub def bytes -> ~[Byte] {
+    if kem.hybrid? {
+      if s = seed {
+        return s
+      }
+      fail HpkeError.SeedNotAvailable
+    }
+    if d = dk768 {
+      return d.bytes
+    }
+    if d4 = dk1024 {
+      return d4.bytes
+    }
+    b = t.unwrap.bytes
+    if kem.kid == KEM_X25519 {
+      b[0] = b[0] & 248
+      b[31] = b[31] & 127
+      b[31] = b[31] | 64
+    }
+    b
+  }
+
+  # The matching public key.
+  pub def public_key -> PublicKey {
+    pt: ecdh.PublicKey? = none
+    if k = t {
+      pt = k.public_key
+    }
+    e768: mlkem.EncapsulationKey768? = none
+    if d = dk768 {
+      e768 = d.encapsulation_key
+    }
+    e1024: mlkem.EncapsulationKey1024? = none
+    if d4 = dk1024 {
+      e1024 = d4.encapsulation_key
+    }
+    PublicKey.new(kem: kem, t: pt, ek768: e768, ek1024: e1024)
+  }
+
+  def decap(enc: [Byte]) -> ~[Byte] {
+    if kem.pure_mlkem? {
+      if d = dk768 {
+        return ~d.decapsulate(enc)
+      }
+      return ~dk1024.unwrap.decapsulate(enc)
+    }
+    k = t.unwrap
+    if kem.dh? {
+      pub_e = ~k.curve.new_public_key(enc)
+      dh = ~k.ecdh(pub_e)
+      kem_context = enc + k.public_key.bytes
+      return kem.extract_and_expand(dh, kem_context)
+    }
+    fail HpkeError.InvalidEncapsulatedKeySize if enc.size != kem.pq_ciphertext_size + kem.curve_point_size
+    n = kem.pq_ciphertext_size
+    ct_pq = enc[0...n]
+    ct_t = enc[n...enc.size]
+    ss_pq: [Byte] = []
+    if d = dk768 {
+      ss_pq = ~d.decapsulate(ct_pq)
+    } else {
+      ss_pq = ~dk1024.unwrap.decapsulate(ct_pq)
+    }
+    pub_e = ~k.curve.new_public_key(ct_t)
+    ss_t = ~k.ecdh(pub_e)
+    kem.hybrid_shared_secret(ss_pq, ss_t, ct_t, k.public_key.bytes)
+  }
+}
+
+# The DHKEM public key of an ECDH public key (on P-256, P-384, P-521 or
+# X25519).
+pub def new_dhkem_public_key(pub: ecdh.PublicKey) -> ~PublicKey<HpkeError> {
+  kem = dhkem(pub.curve)
+  fail HpkeError.UnsupportedCurve if kem.kid == 0
+  PublicKey.new(kem: kem, t: pub)
+}
+
+# The DHKEM private key of an ECDH private key.
+pub def new_dhkem_private_key(priv: ecdh.PrivateKey) -> ~PrivateKey<HpkeError> {
+  kem = dhkem(priv.curve)
+  fail HpkeError.UnsupportedCurve if kem.kid == 0
+  PrivateKey.new(kem: kem, t: priv)
+}
+
+# The ML-KEM-768 KEM public key of ek.
+pub def new_mlkem768_public_key(ek: mlkem.EncapsulationKey768) -> PublicKey { PublicKey.new(kem: mlkem768(), ek768: ek) }
+
+# The ML-KEM-1024 KEM public key of ek.
+pub def new_mlkem1024_public_key(ek: mlkem.EncapsulationKey1024) -> PublicKey { PublicKey.new(kem: mlkem1024(), ek1024: ek) }
+
+# The ML-KEM-768 KEM private key of dk.
+pub def new_mlkem768_private_key(dk: mlkem.DecapsulationKey768) -> PrivateKey { PrivateKey.new(kem: mlkem768(), dk768: dk) }
+
+# The ML-KEM-1024 KEM private key of dk.
+pub def new_mlkem1024_private_key(dk: mlkem.DecapsulationKey1024) -> PrivateKey { PrivateKey.new(kem: mlkem1024(), dk1024: dk) }
+
+# The hybrid public key of an ML-KEM-768 key and an X25519 or P-256 key.
+pub def new_hybrid768_public_key(pq: mlkem.EncapsulationKey768, t: ecdh.PublicKey) -> ~PublicKey<HpkeError> {
+  if t.curve == ecdh.x25519() {
+    return PublicKey.new(kem: mlkem768_x25519(), t: t, ek768: pq)
+  }
+  fail HpkeError.UnsupportedCurve if t.curve != ecdh.p256()
+  PublicKey.new(kem: mlkem768_p256(), t: t, ek768: pq)
+}
+
+# The hybrid public key of an ML-KEM-1024 key and a P-384 key.
+pub def new_hybrid1024_public_key(pq: mlkem.EncapsulationKey1024, t: ecdh.PublicKey) -> ~PublicKey<HpkeError> {
+  fail HpkeError.UnsupportedCurve if t.curve != ecdh.p384()
+  PublicKey.new(kem: mlkem1024_p384(), t: t, ek1024: pq)
+}
+
+# The hybrid private key of an ML-KEM-768 key and an X25519 or P-256 key
+# (its seed isn't known, so bytes fails).
+pub def new_hybrid768_private_key(pq: mlkem.DecapsulationKey768, t: ecdh.PrivateKey) -> ~PrivateKey<HpkeError> {
+  if t.curve == ecdh.x25519() {
+    return PrivateKey.new(kem: mlkem768_x25519(), t: t, dk768: pq)
+  }
+  fail HpkeError.UnsupportedCurve if t.curve != ecdh.p256()
+  PrivateKey.new(kem: mlkem768_p256(), t: t, dk768: pq)
+}
+
+# The hybrid private key of an ML-KEM-1024 key and a P-384 key.
+pub def new_hybrid1024_private_key(pq: mlkem.DecapsulationKey1024, t: ecdh.PrivateKey) -> ~PrivateKey<HpkeError> {
+  fail HpkeError.UnsupportedCurve if t.curve != ecdh.p384()
+  PrivateKey.new(kem: mlkem1024_p384(), t: t, dk1024: pq)
+}
+
+# ---- contexts ----
+
+# The encryption context shared by Sender and Recipient (RFC 9180 5.1).
+struct Context {
+  suite_id: [Byte]
+  kdf: KDF
+  aead: AEAD
+  key: [Byte]
+  base_nonce: [Byte]
+  exp_secret: [Byte]
+  # The sequence number (shared storage: copies are one context).
+  seq: [U64]
+
+  def next_nonce -> [Byte] {
+    nonce = [0.as_u8; aead.nonce_size]
+    s = seq[0]
+    i = 0
+    while i < 8 {
+      nonce[nonce.size - 1 - i] = (s >> (8 * i)).as_u8
+      i += 1
+    }
+    i = 0
+    while i < base_nonce.size {
+      nonce[i] = nonce[i] ^ base_nonce[i]
+      i += 1
+    }
+    nonce
+  }
+
+  def export(exporter_context: [Byte], length: Int) -> ~[Byte]<HpkeError> {
+    fail HpkeError.InvalidLength if length < 0 || length > 0xFFFF
+    return kdf.labeled_derive(suite_id, exp_secret, "sec", exporter_context, length) if kdf.one_stage?
+    kdf.labeled_expand(suite_id, exp_secret, "sec", exporter_context, length)
+  }
+}
+
+def suite_id(kem_id: Int, kdf_id: Int, aead_id: Int) -> [Byte] {
+  str_bytes("HPKE") + be16(kem_id) + be16(kdf_id) + be16(aead_id)
+}
+
+def new_context(shared_secret: [Byte], kem_id: Int, kdf: KDF, aead: AEAD, info: [Byte]) -> Context {
+  sid = suite_id(kem_id, kdf.kid, aead.aid)
+  nk = aead.key_size
+  nn = aead.nonce_size
+  seq: [U64] = [0]
+  if kdf.one_stage? {
+    secrets = be16(0) + be16(shared_secret.size) + shared_secret
+    ks_context = [0.as_u8] + be16(0) + be16(info.size) + info
+    secret = kdf.labeled_derive(sid, secrets, "secret", ks_context, nk + nn + kdf.size)
+    return Context.new(suite_id: sid, kdf: kdf, aead: aead, key: secret[0...nk], base_nonce: secret[nk...nk + nn],
+      exp_secret: secret[nk + nn...secret.size], seq: seq)
+  }
+  psk_id_hash = kdf.labeled_extract(sid, [], "psk_id_hash", [])
+  info_hash = kdf.labeled_extract(sid, [], "info_hash", info)
+  ks_context = [0.as_u8] + psk_id_hash + info_hash
+  secret = kdf.labeled_extract(sid, shared_secret, "secret", [])
+  key = kdf.labeled_expand(sid, secret, "key", ks_context, nk)
+  base_nonce = kdf.labeled_expand(sid, secret, "base_nonce", ks_context, nn)
+  exp_secret = kdf.labeled_expand(sid, secret, "exp", ks_context, kdf.size)
+  Context.new(suite_id: sid, kdf: kdf, aead: aead, key: key, base_nonce: base_nonce, exp_secret: exp_secret, seq: seq)
+}
+
+# The sending side of an HPKE context (RFC 9180 5.2).
+pub struct Sender {
+  ctx: Context
+
+  # Encrypts and authenticates plaintext with additional data aad, and
+  # advances the sequence number. Fails for the export-only AEAD.
+  pub def seal!(aad: [Byte], plaintext: [Byte]) -> ~[Byte]<HpkeError> {
+    fail HpkeError.ExportOnlyInstantiation if ctx.aead.aid == AEAD_EXPORT_ONLY
+    ct = ctx.aead.seal(ctx.key, ctx.next_nonce, plaintext, aad)
+    c = ctx
+    c.seq[0] = c.seq[0] + 1
+    ct
+  }
+
+  # A secret of length bytes for exporter_context (RFC 9180 5.3).
+  pub def export(exporter_context: [Byte], length: Int) -> ~[Byte]<HpkeError> { ~ctx.export(exporter_context, length) }
+}
+
+# The receiving side of an HPKE context.
+pub struct Recipient {
+  ctx: Context
+
+  # Decrypts and authenticates ciphertext with additional data aad, and
+  # advances the sequence number on success.
+  pub def open!(aad: [Byte], ciphertext: [Byte]) -> ~[Byte]<HpkeError> {
+    fail HpkeError.ExportOnlyInstantiation if ctx.aead.aid == AEAD_EXPORT_ONLY
+    pt = ~ctx.aead.open(ctx.key, ctx.next_nonce, ciphertext, aad)
+    c = ctx
+    c.seq[0] = c.seq[0] + 1
+    pt
+  }
+
+  # A secret of length bytes for exporter_context (RFC 9180 5.3).
+  pub def export(exporter_context: [Byte], length: Int) -> ~[Byte]<HpkeError> { ~ctx.export(exporter_context, length) }
+}
+
+# A sender context for pk: (the encapsulated key to send, the context).
+pub def new_sender(pk: PublicKey, kdf: KDF, aead: AEAD, info: [Byte]) -> ~([Byte], Sender) {
+  ss, enc = ~pk.encap(none, none)
+  (enc, Sender.new(ctx: new_context(ss, pk.kem.kid, kdf, aead, info)))
+}
+
+# A recipient context for the encapsulated key enc and the private key k.
+pub def new_recipient(enc: [Byte], k: PrivateKey, kdf: KDF, aead: AEAD, info: [Byte]) -> ~Recipient {
+  ss = ~k.decap(enc)
+  Recipient.new(ctx: new_context(ss, k.kem.kid, kdf, aead, info))
+}
+
+# One-shot: the encapsulated key followed by the sealed plaintext (no
+# additional data).
+pub def seal(pk: PublicKey, kdf: KDF, aead: AEAD, info: [Byte], plaintext: [Byte]) -> ~[Byte] {
+  enc, s = ~new_sender(pk, kdf, aead, info)
+  ct = ~s.seal!([], plaintext)
+  enc + ct
+}
+
+# One-shot: opens what seal made for the private key k.
+pub def open(k: PrivateKey, kdf: KDF, aead: AEAD, info: [Byte], ciphertext: [Byte]) -> ~[Byte] {
+  n = k.kem.enc_size
+  fail HpkeError.CiphertextTooShort if ciphertext.size < n
+  enc = ciphertext[0...n]
+  ct = ciphertext[n...ciphertext.size]
+  r = ~new_recipient(enc, k, kdf, aead, info)
+  ~r.open!([], ct)
+}
+
+# Test hook (Go's setupDerandomizedEncap): a sender whose encapsulation is
+# derived from rand_bytes (RFC 9180's ikmE for DH KEMs; the ML-KEM
+# randomness, then the curve's private key, for the hybrids). Only for
+# known-answer tests.
+pub def new_sender_derandomized(pk: PublicKey, kdf: KDF, aead: AEAD, info: [Byte], rand_bytes: [Byte]) -> ~([Byte], Sender) {
+  kem = pk.kem
+  eph: ecdh.PrivateKey? = none
+  pq_rand: [Byte]? = none
+  if kem.dh? {
+    r = ~kem.derive_key_pair(rand_bytes)
+    eph = r.t
+  } else if kem.pure_mlkem? {
+    pq_rand = rand_bytes
+  } else {
+    pq_rand = rand_bytes[0...32]
+    t_end = kem.kid == KEM_MLKEM768_P256 ? 64 : rand_bytes.size
+    eph = ~kem.curve.new_private_key(rand_bytes[32...t_end])
+  }
+  ss, enc = ~pk.encap(eph, pq_rand)
+  (enc, Sender.new(ctx: new_context(ss, kem.kid, kdf, aead, info)))
+}

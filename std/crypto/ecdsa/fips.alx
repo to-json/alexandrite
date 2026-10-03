@@ -1,0 +1,442 @@
+#![overflow(wrap)]
+# Go's crypto/internal/fips140/ecdsa (ecdsa.go, ecdsa_noasm.go, cast.go),
+# merged into crypto/ecdsa: ECDSA over the nistec curves with bigmod
+# scalars, hedged and deterministic (RFC 6979) nonces from an HMAC_DRBG
+# (hmacdrbg.alx). The names are Go's in snake_case, with Fips in front of
+# the types that would collide with crypto/ecdsa's (FipsPrivateKey,
+# FipsPublicKey). See ecdsa.alx's header for the differences from Go.
+#
+# Timing: as Go, the private scalar and the nonce are handled by bigmod
+# (constant time in the values) and by nistec's constant-time scalar
+# multiplications; only lengths and public data are branched on.
+
+import "crypto/internal/fips140/bigmod"
+import "crypto/internal/fips140/nistec"
+import "hash"
+import "io"
+
+P224_ID = "P-224"
+P256_ID = "P-256"
+P384_ID = "P-384"
+P521_ID = "P-521"
+
+P224_ORDER: [Byte; 28] = [
+  0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+  0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x16, 0xa2,
+  0xe0, 0xb8, 0xf0, 0x3e, 0x13, 0xdd, 0x29, 0x45,
+  0x5c, 0x5c, 0x2a, 0x3d,
+]
+
+P256_ORDER: [Byte; 32] = [
+  0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00,
+  0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+  0xbc, 0xe6, 0xfa, 0xad, 0xa7, 0x17, 0x9e, 0x84,
+  0xf3, 0xb9, 0xca, 0xc2, 0xfc, 0x63, 0x25, 0x51,
+]
+
+P384_ORDER: [Byte; 48] = [
+  0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+  0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+  0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+  0xc7, 0x63, 0x4d, 0x81, 0xf4, 0x37, 0x2d, 0xdf,
+  0x58, 0x1a, 0x0d, 0xb2, 0x48, 0xb0, 0xa7, 0x7a,
+  0xec, 0xec, 0x19, 0x6a, 0xcc, 0xc5, 0x29, 0x73,
+]
+
+P521_ORDER: [Byte; 66] = [
+  0x01, 0xff,
+  0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+  0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+  0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+  0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xfa,
+  0x51, 0x86, 0x87, 0x83, 0xbf, 0x2f, 0x96, 0x6b,
+  0x7f, 0xcc, 0x01, 0x48, 0xf7, 0x09, 0xa5, 0xd0,
+  0x3b, 0xb5, 0xc9, 0xb8, 0x89, 0x9c, 0x47, 0xae,
+  0xbb, 0x6f, 0xb7, 0x1e, 0x91, 0x38, 0x64, 0x09,
+]
+
+# One of the NIST curves with its order (Go's Curve[P]). Go's type
+# parameter P (the nistec point type) is the bit size here: the point
+# operations below dispatch on it.
+struct Curve {
+  curve: Str
+  bits: Int
+  n: bigmod.Modulus
+  n_minus2: [Byte]
+}
+
+# Go's precomputeParams.
+def make_curve(id: Str, bits: Int, order: [Byte]) -> Curve {
+  r = bigmod.new_modulus(order)
+  panic(r.err.unwrap.message) if r.err?
+  n = r.unwrap
+  two = bigmod.new_nat()
+  two.set_bytes!([2.as_u8], n).unwrap
+  nm2 = bigmod.new_nat()
+  nm2.expand_for!(n)
+  nm2.sub!(two, n)
+  Curve.new(curve: id, bits: bits, n: n, n_minus2: nm2.bytes(n))
+}
+
+# Go's P224() etc. Go builds each once (sync.OnceValue); alx has no
+# mutable package state, so each call builds the modulus again.
+def fips_p224 -> Curve { make_curve(P224_ID, 224, P224_ORDER) }
+def fips_p256 -> Curve { make_curve(P256_ID, 256, P256_ORDER) }
+def fips_p384 -> Curve { make_curve(P384_ID, 384, P384_ORDER) }
+def fips_p521 -> Curve { make_curve(P521_ID, 521, P521_ORDER) }
+
+# The curve with this bit size (224, 256, 384 or 521).
+def fips_curve(bits: Int) -> Curve {
+  return fips_p224() if bits == 224
+  return fips_p256() if bits == 256
+  return fips_p384() if bits == 384
+  fips_p521()
+}
+
+# An ECDSA private key of the internal API: d is the scalar as
+# bigmod's Bytes output (the length of the order).
+struct FipsPrivateKey {
+  pubk: FipsPublicKey
+  d: [Byte]
+
+  def bytes -> [Byte] { d }
+
+  def public_key -> FipsPublicKey { pubk }
+}
+
+# An ECDSA public key of the internal API: q is the uncompressed nistec
+# encoding of the point.
+struct FipsPublicKey {
+  curve: Str
+  q: [Byte]
+
+  def bytes -> [Byte] { q }
+}
+
+# An ECDSA signature: r and s big-endian, the length of the order.
+struct Signature {
+  r: [Byte]
+  s: [Byte]
+}
+
+# --- Point operations (Go's Point[P] methods), dispatching on the curve.
+
+# Fails unless q is a valid encoding of a point of the curve (SetBytes).
+def point_check(bits: Int, q: [Byte]) -> ~Unit {
+  if bits == 224 {
+    ~nistec.P224Point.from_bytes(q)
+  } else if bits == 256 {
+    ~nistec.P256Point.from_bytes(q)
+  } else if bits == 384 {
+    ~nistec.P384Point.from_bytes(q)
+  } else {
+    ~nistec.P521Point.from_bytes(q)
+  }
+  nil
+}
+
+# k*G, encoded uncompressed (x_only false: Bytes) or as its x coordinate
+# (x_only true: BytesX, which fails for the point at infinity).
+def base_mult(bits: Int, k: [Byte], x_only: Bool) -> ~[Byte] {
+  if bits == 224 {
+    p224 = ~nistec.P224Point.scalar_base_mult(k)
+    return ~p224.bytes_x if x_only
+    return p224.bytes
+  }
+  if bits == 256 {
+    p256 = ~nistec.P256Point.scalar_base_mult(k)
+    return ~p256.bytes_x if x_only
+    return p256.bytes
+  }
+  if bits == 384 {
+    p384 = ~nistec.P384Point.scalar_base_mult(k)
+    return ~p384.bytes_x if x_only
+    return p384.bytes
+  }
+  p521 = ~nistec.P521Point.scalar_base_mult(k)
+  return ~p521.bytes_x if x_only
+  p521.bytes
+}
+
+# The x coordinate of u1*G + u2*Q (verifyGeneric's p₁ + p₂); fails for the
+# point at infinity.
+def combined_mult_x(bits: Int, q: [Byte], u1: [Byte], u2: [Byte]) -> ~[Byte] {
+  if bits == 224 {
+    q224 = ~nistec.P224Point.from_bytes(q)
+    p1_224 = ~nistec.P224Point.scalar_base_mult(u1)
+    p2_224 = ~q224.scalar_mult(u2)
+    return p1_224.add(p2_224).~bytes_x
+  }
+  if bits == 256 {
+    q256 = ~nistec.P256Point.from_bytes(q)
+    p1_256 = ~nistec.P256Point.scalar_base_mult(u1)
+    p2_256 = ~q256.scalar_mult(u2)
+    return p1_256.add(p2_256).~bytes_x
+  }
+  if bits == 384 {
+    q384 = ~nistec.P384Point.from_bytes(q)
+    p1_384 = ~nistec.P384Point.scalar_base_mult(u1)
+    p2_384 = ~q384.scalar_mult(u2)
+    return p1_384.add(p2_384).~bytes_x
+  }
+  q521 = ~nistec.P521Point.from_bytes(q)
+  p1_521 = ~nistec.P521Point.scalar_base_mult(u1)
+  p2_521 = ~q521.scalar_mult(u2)
+  p1_521.add(p2_521).~bytes_x
+}
+
+# --- Keys.
+
+# Go's NewPrivateKey: a private key from the fixed-length big-endian
+# scalar D and the encoded public point Q.
+def new_fips_private_key(c: Curve, d: [Byte], q: [Byte]) -> ~FipsPrivateKey {
+  pubk = ~new_fips_public_key(c, q)
+  fail EcdsaError.InvalidPrivateKeyLength if d.size != c.n.size
+  dn = bigmod.new_nat()
+  ~dn.set_bytes!(d, c.n)
+  fail EcdsaError.PrivateKeyZero if dn.is_zero == 1
+  FipsPrivateKey.new(pubk: pubk, d: dn.bytes(c.n))
+}
+
+# Go's NewPublicKey: a public key from the compressed or uncompressed
+# encoding of the point. SetBytes checks that Q is on the curve with
+# reduced coordinates (SP 800-89, Section 5.3.2).
+def new_fips_public_key(c: Curve, q: [Byte]) -> ~FipsPublicKey {
+  fail EcdsaError.InvalidPublicKeyEncoding if q.size < 1 || q[0] == 0
+  ~point_check(c.bits, q)
+  FipsPublicKey.new(curve: c.curve, q: q)
+}
+
+# Go's GenerateKey: a new key pair from rand (FIPS 186-5, Appendix A.2.2).
+# Go's FIPS pairwise consistency test (fipsPCT) runs only in FIPS 140 mode,
+# which alx doesn't have.
+def fips_generate_key(c: Curve, rand: io.Reader) -> ~FipsPrivateKey {
+  k, q, _ = ~random_point(c, Source.new(rand: rand), false)
+  FipsPrivateKey.new(pubk: FipsPublicKey.new(curve: c.curve, q: q), d: k.bytes(c.n))
+}
+
+# Where random_point's candidate bytes come from: a reader (Go's
+# drbg.ReadWithReader, which is io.ReadFull for a custom reader) when rand
+# is set, else the HMAC_DRBG drbg.
+struct Source {
+  rand: io.Reader?
+  drbg: HmacDrbg
+}
+
+def source_fill(src: Source, b: [Byte]) -> ~Unit {
+  if r = src.rand {
+    ~io.read_exact(r, b)
+  } else {
+    d = src.drbg
+    d.generate!(b)
+  }
+  nil
+}
+
+# Go's randomPoint: a random scalar k in [1, N) by rejection sampling and
+# k*G (FIPS 186-5, Appendices A.2.2, A.3.2 and A.3.3, then Step 5 of
+# Section 6.4.1). The point is encoded uncompressed, or (x_only) as its x
+# coordinate. The third result counts the rejected candidates (Go's tests
+# hook testingOnlyRejectionSamplingLooped for this).
+def random_point(c: Curve, src: Source, x_only: Bool) -> ~(bigmod.Nat, [Byte], Int) {
+  loops = 0
+  while true {
+    b = [0.as_u8; c.n.size]
+    ~source_fill(src, b)
+
+    # Take only the leftmost bits of the generated random value. This is
+    # both necessary to increase the chance of the random value being in
+    # the correct range and to match the specification. It's unfortunate
+    # that we need to do a shift instead of a mask, but see the comment on
+    # right_shift.
+    #
+    # These are the most dangerous lines in the package and maybe in the
+    # library: a single bit of bias in the selection of nonces would likely
+    # lead to key recovery, but no tests would fail. Look but DO NOT TOUCH.
+    excess = b.size * 8 - c.n.bit_len
+    if excess > 0 {
+      # Just to be safe, assert that this only happens for the one curve
+      # that doesn't have a round number of bits.
+      panic("ecdsa: internal error: unexpectedly masking off bits") if c.curve != P521_ID
+      b = right_shift(b, excess)
+    }
+
+    # FIPS 186-5, Appendix A.4.2 makes us check x <= N - 2 and then return
+    # x + 1. Note that it follows that 0 < x + 1 < N. Instead, set_bytes!
+    # checks that k < N, and we explicitly check 0 != k. Since k can't be
+    # negative, this is strictly equivalent. None of this matters anyway
+    # because the chance of selecting zero is cryptographically negligible.
+    k = bigmod.new_nat()
+    if k.set_bytes!(b, c.n).ok? && k.is_zero == 0 {
+      p = ~base_mult(c.bits, k.bytes(c.n), x_only)
+      return (k, p, loops)
+    }
+    loops += 1
+  }
+  panic("unreachable")
+}
+
+# --- Signing.
+
+# Go's Sign: signs hash (the result of hashing a larger message with the
+# hash function h) with priv, hedging the nonce with entropy from rand as
+# draft-irtf-cfrg-det-sigs-with-noise-04, Section 4 specifies. A hash
+# longer than the order is truncated to its bit length.
+def fips_sign(c: Curve, h: () -> hash.Hash, priv: FipsPrivateKey, rand: io.Reader, hash: [Byte]) -> ~Signature {
+  fail EcdsaError.KeyCurveMismatch(which: "private") if priv.pubk.curve != c.curve
+  fail EcdsaError.EmptyHash if hash.size == 0
+
+  # Random ECDSA is dangerous, because a failure of the RNG would
+  # immediately leak the private key. Instead, we use a "hedged" approach,
+  # as specified in draft-irtf-cfrg-det-sigs-with-noise-04, Section 4. This
+  # has also the advantage of closely resembling Deterministic ECDSA.
+  z = [0.as_u8; priv.d.size]
+  ~io.read_exact(rand, z)
+
+  # See https://github.com/cfrg/draft-irtf-cfrg-det-sigs-with-noise/issues/6
+  # for the FIPS compliance of this method. In short Z is entropy from the
+  # main DRBG, of length 3/2 of security_strength, so the nonce is optional
+  # per SP 800-90Ar1, Section 8.6.7, and the rest is a personalization
+  # string, which per SP 800-90Ar1, Section 8.7.1 may contain secret
+  # information.
+  drbg = new_drbg(h, z, [], Personalization.BlockAligned([priv.d, bits2octets(c, hash)]))
+  ~sign_generic(c, priv, drbg, hash)
+}
+
+# Go's SignDeterministic: Deterministic ECDSA (FIPS 186-5, RFC 6979) of
+# hash with priv, the nonce derived with an HMAC_DRBG over h.
+def fips_sign_deterministic(c: Curve, h: () -> hash.Hash, priv: FipsPrivateKey, hash: [Byte]) -> ~Signature {
+  fail EcdsaError.KeyCurveMismatch(which: "private") if priv.pubk.curve != c.curve
+  fail EcdsaError.EmptyHash if hash.size == 0
+  drbg = new_drbg(h, priv.d, bits2octets(c, hash), Personalization.Plain([])) # RFC 6979, Section 3.3
+  ~sign_generic(c, priv, drbg, hash)
+}
+
+# bits2octets as specified in FIPS 186-5, Appendix B.2.4 or RFC 6979,
+# Section 2.3.4. See RFC 6979, Section 3.5 for the rationale.
+def bits2octets(c: Curve, hash: [Byte]) -> [Byte] {
+  e = hash_to_nat(c, hash)
+  e.bytes(c.n)
+}
+
+# Go's signGeneric (FIPS 186-5, Section 6.4.1); also Go's sign, which is
+# signGeneric on platforms without assembly.
+def sign_generic(c: Curve, priv: FipsPrivateKey, drbg: HmacDrbg, hash: [Byte]) -> ~Signature {
+  k, rx, _ = ~random_point(c, Source.new(rand: none, drbg: drbg), true)
+
+  # kInv = k⁻¹
+  k_inv = inverse(c, k)
+
+  r = bigmod.new_nat()
+  ~r.set_overflowing_bytes!(rx, c.n)
+
+  # The spec wants us to retry here, but the chance of hitting this
+  # condition on a large prime-order group like the NIST curves we support
+  # is cryptographically negligible. If we hit it, something is awfully
+  # wrong.
+  fail EcdsaError.RIsZero if r.is_zero == 1
+
+  e = hash_to_nat(c, hash)
+
+  s = bigmod.new_nat()
+  ~s.set_bytes!(priv.d, c.n)
+  s.mul!(r, c.n)
+  s.add!(e, c.n)
+  s.mul!(k_inv, c.n)
+
+  # Again, the chance of this happening is cryptographically negligible.
+  fail EcdsaError.SIsZero if s.is_zero == 1
+
+  Signature.new(r: r.bytes(c.n), s: s.bytes(c.n))
+}
+
+# k⁻¹ modulo the order of the curve: P-256's dedicated inversion (Go's
+# ordInverse, nistec.P256OrdInverse), else Fermat's method (k^(N-2)).
+def inverse(c: Curve, k: bigmod.Nat) -> bigmod.Nat {
+  k_inv = bigmod.new_nat()
+  kb = k.bits
+  if c.bits == 256 && kb.size == 4 {
+    k64 = [kb[0], kb[1], kb[2], kb[3]]
+    nistec.p256_ord_inverse(k64)
+    k_inv.set_bits!(k64)
+    return k_inv
+  }
+  # Calculate the inverse of s in GF(N) using Fermat's method
+  # (exponentiation modulo P - 2, per Euler's theorem)
+  k_inv.exp!(k, c.n_minus2, c.n)
+  k_inv
+}
+
+# Go's hashToNat: the left-most bits of hash as a Nat modulo N (FIPS 186-5,
+# Section 6.4.1, point 2 and Section 6.4.2, point 3).
+def hash_to_nat(c: Curve, hash: [Byte]) -> bigmod.Nat {
+  # ECDSA asks us to take the left-most log2(N) bits of hash, and use them
+  # as an integer modulo N. This is the absolute worst of all worlds: we
+  # still have to reduce, because the result might still overflow N, but
+  # to take the left-most bits for P-521 we have to do a right shift.
+  h = hash
+  size = c.n.size
+  if h.size >= size {
+    h = h[0...size]
+    excess = h.size * 8 - c.n.bit_len
+    h = right_shift(h, excess) if excess > 0
+  }
+  e = bigmod.new_nat()
+  r = e.set_overflowing_bytes!(h, c.n)
+  panic("ecdsa: internal error: truncated hash is too long") if r.err?
+  e
+}
+
+# The right shift necessary for bits2int, which takes the leftmost bits of
+# either the hash or HMAC_DRBG output. Returns a shifted copy of b.
+#
+# Note how taking the rightmost bits would have been as easy as masking
+# the first byte, but we can't have nice things.
+def right_shift(b: [Byte], shift: Int) -> [Byte] {
+  panic("ecdsa: internal error: shift can only be by 1 to 7 bits") if shift <= 0 || shift >= 8
+  out = b + []
+  i = out.size - 1
+  while i >= 0 {
+    out[i] = out[i] >> shift
+    out[i] = out[i] | (out[i - 1] << (8 - shift)) if i > 0
+    i -= 1
+  }
+  out
+}
+
+# --- Verification.
+
+# Go's Verify: succeeds if sig is a valid signature of hash by pub. The
+# inputs are not considered confidential.
+def fips_verify(c: Curve, pubk: FipsPublicKey, hash: [Byte], sig: Signature) -> ~Unit {
+  fail EcdsaError.KeyCurveMismatch(which: "public") if pubk.curve != c.curve
+  fail EcdsaError.EmptyHash if hash.size == 0
+  ~verify_generic(c, pubk, hash, sig)
+}
+
+# Go's verifyGeneric (FIPS 186-5, Section 6.4.2).
+def verify_generic(c: Curve, pubk: FipsPublicKey, hash: [Byte], sig: Signature) -> ~Unit {
+  r = bigmod.new_nat()
+  ~r.set_bytes!(sig.r, c.n)
+  fail EcdsaError.SignatureRIsZero if r.is_zero == 1
+  s = bigmod.new_nat()
+  ~s.set_bytes!(sig.s, c.n)
+  fail EcdsaError.SignatureSIsZero if s.is_zero == 1
+
+  e = hash_to_nat(c, hash)
+
+  # w = s⁻¹
+  w = inverse(c, s)
+
+  # p₁ = [e * s⁻¹]G, p₂ = [r * s⁻¹]Q
+  e.mul!(w, c.n)
+  w.mul!(r, c.n)
+  # BytesX fails for the point at infinity. (Go decodes Q first; the
+  # decoding here is part of combined_mult_x.)
+  rx = ~combined_mult_x(c.bits, pubk.q, e.bytes(c.n), w.bytes(c.n))
+
+  v = bigmod.new_nat()
+  ~v.set_overflowing_bytes!(rx, c.n)
+  fail EcdsaError.DidNotVerify if v.equal(r) != 1
+  nil
+}

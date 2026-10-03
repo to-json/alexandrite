@@ -178,7 +178,11 @@ impl<'a> Graph<'a> {
         // A call whose result has no storage (an Int, a Bool, ...) puts nothing in the
         // caller's region: not an allocation site, so a loop of such calls needs no
         // iteration region (a scanner calling `skip_ws(s, p)` per byte).
-        let scalar_call = matches!(e.kind, TK::Call(..)) && !promote && !has_storage(&e.ty);
+        // The same goes for building a tuple, struct or enum value without
+        // storage (`(hi, lo)` or a struct of U64s returned per call): it
+        // allocates nothing, so it needs no region of its own.
+        let ctor = matches!(e.kind, TK::Call(..) | TK::M(M::StructNew | M::TupleNew | M::VariantNew(_) | M::EnumNew, ..));
+        let scalar_call = ctor && !has_storage(&e.ty) && !(promote && contains_int(&e.ty));
         if allocates(e, promote) && !scalar_call {
             let s = site(e);
             self.sites.push(e as *const TExpr as usize);

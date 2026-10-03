@@ -1,0 +1,240 @@
+#![overflow(wrap)]
+# Package dsa: Go's crypto/dsa, the Digital Signature Algorithm of FIPS
+# 186-3, on math/big (as in Go). Not constant time.
+#
+# Deprecated in Go: DSA is a legacy algorithm (use crypto/ed25519);
+# 1024-bit moduli are weak, bigger ones not widely supported, and FIPS
+# 186-5 no longer approves DSA for signing.
+#
+#   Go                                        alx
+#   Parameters{P, Q, G}                       Parameters{p, q, g}
+#   PublicKey{Parameters, Y}                  PublicKey{parameters, y}
+#   PrivateKey{PublicKey, X}                  PrivateKey{public_key, x}
+#   ParameterSizes L1024N160 ... L3072N256    ParameterSizes (an enum), L1024N160 ... constants
+#   GenerateParameters(params, rand, sizes)   generate_parameters(random, sizes) -> ~Parameters
+#   GenerateKey(priv, rand) error             generate_key(priv, random) -> ~PrivateKey
+#   Sign(rand, priv, hash) (r, s, err)        sign(random, priv, hash) -> ~(big.Int, big.Int)
+#   Verify(pub, hash, r, s) bool              verify(pub, hash, r, s) -> Bool
+#   ErrInvalidPublicKey                       DsaError.InvalidPublicKey
+#
+# Differences from Go:
+#   - Values instead of pointers: generate_parameters returns the
+#     Parameters and generate_key returns priv with X and Y set (Go fills
+#     the structs it is given). PublicKey and PrivateKey don't embed: their
+#     parts are the fields parameters and public_key.
+#   - No nil *big.Int: a zero P, Q or G stands for Go's nil
+#     ("parameters not set up before generating key").
+#   - random is honored, as in Go with GODEBUG=cryptocustomrand=1 (Go 1.26+
+#     ignores it in Sign by default); randutil.MaybeReadByte isn't applied.
+#     Pass crypto/rand's rand.reader() for the default.
+#   - ParameterSizes is an enum, so Go's "invalid ParameterSizes" can't
+#     happen. No FIPS 140-only mode.
+
+import "io"
+import "math/big"
+
+# Errors of the package, with Go's messages.
+pub error DsaError {
+  # Go's ErrInvalidPublicKey: a key this code can't use.
+  InvalidPublicKey
+  # Generating a key with unset parameters.
+  ParametersNotSet
+
+  def message -> Str {
+    case self {
+      InvalidPublicKey => "crypto/dsa: invalid public key"
+      ParametersNotSet => "crypto/dsa: parameters not set up before generating key"
+    }
+  }
+}
+
+# The domain parameters of a key (shareable between keys). The bit length
+# of Q must be a multiple of 8.
+pub struct Parameters {
+  p: big.Int
+  q: big.Int
+  g: big.Int
+}
+
+# A DSA public key.
+pub struct PublicKey {
+  parameters: Parameters
+  y: big.Int
+}
+
+# A DSA private key.
+pub struct PrivateKey {
+  public_key: PublicKey
+  x: big.Int
+}
+
+# The bit lengths of the primes of a parameter set (FIPS 186-3, 4.2).
+pub enum ParameterSizes {
+  L1024N160
+  L2048N224
+  L2048N256
+  L3072N256
+}
+
+pub L1024N160 = ParameterSizes.L1024N160
+pub L2048N224 = ParameterSizes.L2048N224
+pub L2048N256 = ParameterSizes.L2048N256
+pub L3072N256 = ParameterSizes.L3072N256
+
+# Miller-Rabin rounds: the largest of FIPS 186-3's table C.1.
+NUM_MR_TESTS = 64
+
+# A random, valid set of parameters. Can take many seconds. (It doesn't
+# use FIPS 186-3's verification seed, as in Go.)
+pub def generate_parameters(random: io.Reader, sizes: ParameterSizes) -> ~Parameters {
+  l, n = case sizes {
+    L1024N160 => (1024, 160)
+    L2048N224 => (2048, 224)
+    L2048N256 => (2048, 256)
+    L3072N256 => (3072, 256)
+  }
+  q_bytes = [0.as_u8; n / 8]
+  p_bytes = [0.as_u8; l / 8]
+  q = big.Int.new
+  p = big.Int.new
+  rem = big.Int.new
+  one = big.new_int(1)
+  found = false
+  while !found {
+    ~io.read_exact(random, q_bytes)
+    q_bytes[q_bytes.size - 1] |= 1
+    q_bytes[0] |= 0x80
+    q.set_bytes!(q_bytes)
+    next if !q.probably_prime?(NUM_MR_TESTS)
+    i = 0
+    while i < 4 * l {
+      i += 1
+      ~io.read_exact(random, p_bytes)
+      p_bytes[p_bytes.size - 1] |= 1
+      p_bytes[0] |= 0x80
+      p.set_bytes!(p_bytes)
+      rem.mod!(p, q)
+      rem.sub!(rem, one)
+      p.sub!(p, rem)
+      next if p.bit_len < l
+      next if !p.probably_prime?(NUM_MR_TESTS)
+      found = true
+      break
+    }
+  }
+  h = big.new_int(2)
+  g = big.Int.new
+  pm1 = big.Int.new
+  pm1.sub!(p, one)
+  e = big.Int.new
+  e.div!(pm1, q)
+  loop {
+    g.exp!(h, e, p)
+    if g.cmp(one) == 0 {
+      h.add!(h, one)
+      next
+    }
+    return Parameters.new(p: p, q: q, g: g)
+  }
+}
+
+# priv with a new key pair (X and Y) for its parameters, which must be
+# valid (see generate_parameters).
+pub def generate_key(priv: PrivateKey, random: io.Reader) -> ~PrivateKey {
+  params = priv.public_key.parameters
+  fail DsaError.ParametersNotSet if params.p.sign == 0 || params.q.sign == 0 || params.g.sign == 0
+  x = big.Int.new
+  x_bytes = [0.as_u8; params.q.bit_len / 8]
+  loop {
+    ~io.read_exact(random, x_bytes)
+    x.set_bytes!(x_bytes)
+    break if x.sign != 0 && x.cmp(params.q) < 0
+  }
+  y = big.Int.new
+  y.exp!(params.g, x, params.p)
+  PrivateKey.new(public_key: PublicKey.new(parameters: params, y: y), x: x)
+}
+
+# k^-1 mod P by Fermat (P prime): closer to constant time than Euclid
+# (math/big itself isn't constant time).
+def fermat_inverse(k: big.Int, p: big.Int) -> big.Int {
+  p_minus2 = big.Int.new
+  p_minus2.sub!(p, big.new_int(2))
+  z = big.Int.new
+  z.exp!(k, p_minus2, p).unwrap
+}
+
+# Signs hash (the hash of a longer message) with priv: the signature
+# (r, s). The private key is only as safe as random's entropy. FIPS 186-3
+# 4.6 truncates the hash to the byte length of Q; this doesn't. An
+# attacker-controlled key may cost arbitrary CPU.
+pub def sign(random: io.Reader, priv: PrivateKey, hash: [Byte]) -> ~(big.Int, big.Int) {
+  params = priv.public_key.parameters
+  n = params.q.bit_len
+  fail DsaError.InvalidPublicKey if params.q.sign <= 0 || params.p.sign <= 0 || params.g.sign <= 0 || priv.x.sign <= 0 || n % 8 != 0
+  n >>= 3
+  r = big.Int.new
+  s = big.Int.new
+  attempts = 10
+  while attempts > 0 {
+    k = big.Int.new
+    buf = [0.as_u8; n]
+    loop {
+      ~io.read_exact(random, buf)
+      k.set_bytes!(buf)
+      # Q >= 128 (by the checks above), so this ends quickly.
+      break if k.sign > 0 && k.cmp(params.q) < 0
+    }
+    k_inv = fermat_inverse(k, params.q)
+    r = big.Int.new
+    r.exp!(params.g, k, params.p)
+    r.mod!(r, params.q)
+    if r.sign == 0 {
+      attempts -= 1
+      next
+    }
+    z = k
+    z.set_bytes!(hash)
+    s = big.Int.new
+    s.mul!(priv.x, r)
+    s.add!(s, z)
+    s.mod!(s, params.q)
+    s.mul!(s, k_inv)
+    s.mod!(s, params.q)
+    break if s.sign != 0
+    attempts -= 1
+  }
+  # Only degenerate keys need more than a few attempts.
+  fail DsaError.InvalidPublicKey if attempts == 0
+  (r, s)
+}
+
+# Whether (r, s) is a valid signature of hash for pub. FIPS 186-3 4.6
+# truncates the hash to the byte length of Q; this doesn't.
+pub def verify(pubk: PublicKey, hash: [Byte], r: big.Int, s: big.Int) -> Bool {
+  params = pubk.parameters
+  # FIPS 186-3, section 4.7
+  return false if params.p.sign == 0
+  return false if r.sign < 1 || r.cmp(params.q) >= 0
+  return false if s.sign < 1 || s.cmp(params.q) >= 0
+  wi = big.Int.new
+  wo = wi.mod_inverse!(s, params.q)
+  return false if wo == none
+  w = wo.unwrap
+  return false if params.q.bit_len % 8 != 0
+  z = big.Int.new
+  z.set_bytes!(hash)
+  u1 = big.Int.new
+  u1.mul!(z, w)
+  u1.mod!(u1, params.q)
+  u2 = big.Int.new
+  u2.mul!(r, w)
+  u2.mod!(u2, params.q)
+  v = big.Int.new
+  v.exp!(params.g, u1, params.p)
+  u2.exp!(pubk.y, u2, params.p)
+  v.mul!(v, u2)
+  v.mod!(v, params.p)
+  v.mod!(v, params.q)
+  v.cmp(r) == 0
+}

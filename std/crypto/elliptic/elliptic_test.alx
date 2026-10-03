@@ -1,0 +1,292 @@
+# Go's crypto/elliptic/elliptic_test.go. testAllCurves runs every check on
+# the four named curves and on a copy of their CurveParams (the generic
+# implementation), as Go does outside -short mode.
+import "bytes"
+import "crypto/rand"
+import "encoding/hex"
+import "math/big"
+
+# The CurveParams of c (which, unlike in Go, is never upgraded to the
+# specific implementation anyway).
+def generic_params_for_curve(c: Curve) -> CurveParams { c.params }
+
+def all_curves -> [Curve] {
+  cs: [Curve] = []
+  for c in [p256(), p224(), p384(), p521()] {
+    cs << c
+    g: Curve = generic_params_for_curve(c)
+    cs << g
+  }
+  cs
+}
+
+def is_infinity(x: big.Int, y: big.Int) -> Bool { x.sign == 0 && y.sign == 0 }
+
+def bigi(v: Int) -> big.Int { big.new_int(v) }
+
+test "on curve" {
+  for curve in all_curves() {
+    assert curve.on_curve?(curve.params.gx, curve.params.gy), "basepoint is not on the curve"
+  }
+}
+
+test "off curve" {
+  for curve in all_curves() {
+    x = bigi(1)
+    y = bigi(1)
+    assert !curve.on_curve?(x, y), "point off curve is claimed to be on the curve"
+    byte_len = (curve.params.bit_size + 7) / 8
+    b = [0.as_u8; 1 + 2 * byte_len]
+    b[0] = 4 # uncompressed point
+    x.fill_bytes(b[1...1 + byte_len])
+    y.fill_bytes(b[1 + byte_len...1 + 2 * byte_len])
+    assert unmarshal(curve, b) == none, "unmarshaling a point not on the curve succeeded"
+  }
+}
+
+def check_infinity(curve: Curve) {
+  x0 = big.Int.new
+  y0 = big.Int.new
+  xg = curve.params.gx
+  yg = curve.params.gy
+
+  r = curve.scalar_mult(xg, yg, curve.params.n.bytes)
+  assert is_infinity(r[0], r[1]), "x^q != ∞"
+  r = curve.scalar_mult(xg, yg, [0.as_u8])
+  assert is_infinity(r[0], r[1]), "x^0 != ∞"
+
+  r = curve.scalar_mult(x0, y0, [1.as_u8, 2.as_u8, 3.as_u8])
+  assert is_infinity(r[0], r[1]), "∞^k != ∞"
+  r = curve.scalar_mult(x0, y0, [0.as_u8])
+  assert is_infinity(r[0], r[1]), "∞^0 != ∞"
+
+  r = curve.scalar_base_mult(curve.params.n.bytes)
+  assert is_infinity(r[0], r[1]), "b^q != ∞"
+  r = curve.scalar_base_mult([0.as_u8])
+  assert is_infinity(r[0], r[1]), "b^0 != ∞"
+
+  r = curve.double(x0, y0)
+  assert is_infinity(r[0], r[1]), "2∞ != ∞"
+  # There is no other point of order two on the NIST curves (as they have
+  # cofactor one), so Double can't otherwise return the point at infinity.
+
+  n_minus_one = big.Int.new
+  n_minus_one.sub!(curve.params.n, bigi(1))
+  r = curve.scalar_mult(xg, yg, n_minus_one.bytes)
+  r = curve.add(r[0], r[1], xg, yg)
+  assert is_infinity(r[0], r[1]), "x^(q-1) + x != ∞"
+  r = curve.add(xg, yg, x0, y0)
+  assert r[0].cmp(xg) == 0 && r[1].cmp(yg) == 0, "x+∞ != x"
+  r = curve.add(x0, y0, xg, yg)
+  assert r[0].cmp(xg) == 0 && r[1].cmp(yg) == 0, "∞+x != x"
+
+  assert !curve.on_curve?(x0, y0), "IsOnCurve(∞) == true"
+
+  assert unmarshal(curve, marshal(curve, x0, y0)) == none, "Unmarshal(Marshal(∞)) did not return an error"
+  # We don't test UnmarshalCompressed(MarshalCompressed(∞)) because there are
+  # two valid points with x = 0.
+  assert unmarshal(curve, [0.as_u8]) == none, "Unmarshal(∞) did not return an error"
+  byte_len = (curve.params.bit_size + 7) / 8
+  buf = [0.as_u8; byte_len * 2 + 1]
+  buf[0] = 4 # Uncompressed format.
+  assert unmarshal(curve, buf) == none, "Unmarshal((0,0)) did not return an error"
+  nil
+}
+
+test "infinity" {
+  for curve in all_curves() {
+    check_infinity(curve)
+  }
+}
+
+test "marshal" {
+  for curve in all_curves() {
+    k = generate_key(curve, rand.reader()).unwrap
+    x = k[1]
+    y = k[2]
+    serialized = marshal(curve, x, y)
+    xy = unmarshal(curve, serialized)
+    assert xy != none, "failed to unmarshal"
+    xx, yy = xy.unwrap
+    assert xx.cmp(x) == 0 && yy.cmp(y) == 0, "unmarshal returned different values"
+  }
+}
+
+def check_unmarshal_to_large_coordinates(curve: Curve) {
+  p = curve.params.p
+  byte_len = (p.bit_len + 7) / 8
+
+  # Set x to be greater than curve's parameter P – specifically, to P+5.
+  # Set y to mod_sqrt(x^3 - 3x + B)) so that (x mod P = 5 , y) is on the
+  # curve.
+  x = big.Int.new
+  x.add!(p, bigi(5))
+  y = curve.params.polynomial(x)
+  y.mod_sqrt!(y, p)
+
+  invalid = [0.as_u8; byte_len * 2 + 1]
+  invalid[0] = 4 # uncompressed encoding
+  x.fill_bytes(invalid[1...1 + byte_len])
+  y.fill_bytes(invalid[1 + byte_len...invalid.size])
+
+  assert unmarshal(curve, invalid) == none, "Unmarshal accepts invalid X coordinate"
+
+  if curve.params.name == "P-256" {
+    # This is a point on the curve with a small y value, small enough that
+    # we can add p and still be within 32 bytes.
+    x.set_string!("31931927535157963707678568152204072984517581467226068221761862915403492091210", 10)
+    y.set_string!("5208467867388784005506817585327037698770365050895731383201516607147", 10)
+    y.add!(y, p)
+    assert p.cmp(y) <= 0 && y.bit_len == 256, "y not within expected range"
+    # marshal
+    x.fill_bytes(invalid[1...1 + byte_len])
+    y.fill_bytes(invalid[1 + byte_len...invalid.size])
+    assert unmarshal(curve, invalid) == none, "Unmarshal accepts invalid Y coordinate"
+  }
+  nil
+}
+
+test "unmarshal to large coordinates" {
+  # See https://golang.org/issues/20482.
+  for curve in all_curves() {
+    check_unmarshal_to_large_coordinates(curve)
+  }
+}
+
+# Values that are not valid field elements (negative or bigger than P) are
+# expected to return false from on_curve?; all other behavior is undefined.
+def check_invalid_coordinates(curve: Curve) {
+  p = curve.params.p
+  k = generate_key(curve, rand.reader()).unwrap
+  x = k[1]
+  y = k[2]
+  xx = big.Int.new
+  yy = big.Int.new
+
+  # Check if the sign is getting dropped.
+  xx.neg!(x)
+  assert !curve.on_curve?(xx, y), "IsOnCurve(-x, y) unexpectedly returned true"
+  yy.neg!(y)
+  assert !curve.on_curve?(x, yy), "IsOnCurve(x, -y) unexpectedly returned true"
+
+  # Check if negative values are reduced modulo P.
+  xx.sub!(x, p)
+  assert !curve.on_curve?(xx, y), "IsOnCurve(x-P, y) unexpectedly returned true"
+  yy.sub!(y, p)
+  assert !curve.on_curve?(x, yy), "IsOnCurve(x, y-P) unexpectedly returned true"
+
+  # Check if positive values are reduced modulo P.
+  xx.add!(x, p)
+  assert !curve.on_curve?(xx, y), "IsOnCurve(x+P, y) unexpectedly returned true"
+  yy.add!(y, p)
+  assert !curve.on_curve?(x, yy), "IsOnCurve(x, y+P) unexpectedly returned true"
+
+  # Check if the overflow is dropped.
+  big535 = big.Int.new
+  big535.lsh!(bigi(1), 535)
+  xx.add!(x, big535)
+  assert !curve.on_curve?(xx, y), "IsOnCurve(x+2⁵³⁵, y) unexpectedly returned true"
+  yy.add!(y, big535)
+  assert !curve.on_curve?(x, yy), "IsOnCurve(x, y+2⁵³⁵) unexpectedly returned true"
+
+  # Check if P is treated like zero (if possible).
+  # y^2 = x^3 - 3x + B
+  # y = mod_sqrt(x^3 - 3x + B)
+  # y = mod_sqrt(B) if x = 0
+  # If there is no modsqrt, there is no point with x = 0, can't test x = P.
+  y0 = big.Int.new
+  if r = y0.mod_sqrt!(curve.params.b, p) {
+    assert curve.on_curve?(bigi(0), r), "(0, mod_sqrt(B)) is not on the curve?"
+    assert !curve.on_curve?(p, r), "IsOnCurve(P, y) unexpectedly returned true"
+  }
+  nil
+}
+
+test "invalid coordinates" {
+  for curve in all_curves() {
+    check_invalid_coordinates(curve)
+  }
+}
+
+def check_marshal_compressed(curve: Curve, x: big.Int, y: big.Int, want: [Byte]?) {
+  assert curve.on_curve?(x, y), "invalid test point"
+  got = marshal_compressed(curve, x, y)
+  if w = want {
+    assert got == w, "got unexpected MarshalCompressed result: got #{hex.encode_to_string(got)}, want #{hex.encode_to_string(w)}"
+  }
+  xy = unmarshal_compressed(curve, got)
+  assert xy != none, "UnmarshalCompressed failed unexpectedly"
+  xx, yy = xy.unwrap
+  assert curve.on_curve?(xx, yy), "UnmarshalCompressed returned a point not on the curve"
+  assert xx.cmp(x) == 0 && yy.cmp(y) == 0, "point did not round-trip correctly: got (#{xx}, #{yy}), want (#{x}, #{y})"
+  nil
+}
+
+def bigd(s: Str) -> big.Int {
+  v = big.Int.new
+  v.set_string!(s, 10)
+  v
+}
+
+test "marshal compressed" {
+  # P-256/03
+  data = hex.decode_string("031e3987d9f9ea9d7dd7155a56a86b2009e1e0ab332f962d10d8beb6406ab1ad79").unwrap
+  x = bigd("13671033352574878777044637384712060483119675368076128232297328793087057702265")
+  y = bigd("66200849279091436748794323380043701364391950689352563629885086590854940586447")
+  check_marshal_compressed(p256(), x, y, data)
+  # P-256/02
+  data = hex.decode_string("021e3987d9f9ea9d7dd7155a56a86b2009e1e0ab332f962d10d8beb6406ab1ad79").unwrap
+  y = bigd("49591239931264812013903123569363872165694192725937750565648544718012157267504")
+  check_marshal_compressed(p256(), x, y, data)
+  # Invalid
+  data = hex.decode_string("02fd4bf61763b46581fd9174d623516cf3c81edd40e29ffa2777fb6cb0ae3ce535").unwrap
+  assert unmarshal_compressed(p256(), data) == none, "expected an error for invalid encoding"
+
+  for curve in all_curves() {
+    k = generate_key(curve, rand.reader()).unwrap
+    check_marshal_compressed(curve, k[1], k[2], none)
+  }
+}
+
+test "large is on curve" {
+  for curve in all_curves() {
+    large = big.Int.new
+    large.lsh!(bigi(1), 1000)
+    assert !curve.on_curve?(large, large), "(2^1000, 2^1000) is reported on the curve"
+  }
+}
+
+test "generate key deterministic" {
+  # generate_key honours its reader: an all-zero source gives priv[1] = 0x42.
+  z = bytes.new_buffer([0.as_u8; 200])
+  k = generate_key(p256(), z).unwrap
+  assert_eq k[0].size, 32
+  assert_eq k[0][1], 0x42
+  x, y = p256().scalar_base_mult(k[0])
+  assert x.cmp(k[1]) == 0 && y.cmp(k[2]) == 0
+}
+
+bench "P256 scalar base mult" {
+  p256().scalar_base_mult([0x5a.as_u8; 32])
+}
+
+bench "P256 scalar mult" {
+  c = p256()
+  c.scalar_mult(c.params.gx, c.params.gy, [0x5a.as_u8; 32])
+}
+
+bench "P384 scalar base mult" {
+  p384().scalar_base_mult([0x5a.as_u8; 48])
+}
+
+bench "P256 marshal unmarshal" {
+  c = p256()
+  buf = marshal(c, c.params.gx, c.params.gy)
+  unmarshal(c, buf).unwrap
+}
+
+bench "P256 marshal unmarshal compressed" {
+  c = p256()
+  buf = marshal_compressed(c, c.params.gx, c.params.gy)
+  unmarshal_compressed(c, buf).unwrap
+}

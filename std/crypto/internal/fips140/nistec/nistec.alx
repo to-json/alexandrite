@@ -1,0 +1,75 @@
+#![overflow(wrap)]
+# Package nistec: Go's crypto/internal/fips140/nistec, the elliptic curves
+# P-224, P-256, P-384 and P-521 of NIST SP 800-186 over the fiat field
+# elements (not math/big), with constant-time, byte slice-based safe APIs.
+# Group operations use complete addition formulas; the point at infinity is
+# handled and encoded according to SEC 1, Version 2.0, and invalid curve
+# points can't be represented. This is Go's portable code (what Go builds
+# with -tags purego); there is no assembly P-256.
+#
+#   Go                                  alx
+#   NewP256Point() *P256Point           new_p256_point() -> P256Point (infinity)
+#   p.SetGenerator()                    P256Point.generator
+#   p.SetBytes(b) (*P256Point, error)   P256Point.from_bytes(b) -> ~P256Point
+#   p.Set(q)                            p = q (points are values)
+#   p.Bytes() / BytesCompressed()       p.bytes / p.bytes_compressed -> [Byte]
+#   p.BytesX() ([]byte, error)          p.bytes_x -> ~[Byte]
+#   q.Add(p1, p2) / q.Double(p)         p1.add(p2) / p.double
+#   q.Select(p1, p2, cond)              P256Point.select(p1, p2, cond)
+#   p.ScalarMult(q, scalar)             q.scalar_mult(scalar) -> ~P256Point
+#   p.ScalarBaseMult(scalar)            P256Point.scalar_base_mult(scalar) -> ~P256Point
+#   P256OrdInverse(k *[4]uint64)        p256_ord_inverse(k: [U64]) (in place)
+#
+# The same for P224Point, P384Point and P521Point (p224.alx, p384.alx and
+# p521.alx are generated from Go's generate.go output by a translator, like
+# the formulas in p256.alx).
+#
+# Timing: scalar multiplications are constant time in the scalar as in Go:
+# fixed windows, table lookups that scan every entry with masked selects,
+# complete formulas with no exceptional cases. Decoding (from_bytes) and
+# encoding branch only on public data. See crypto/internal/fips140/nistec/fiat
+# for the field arithmetic and its caveats (alx's C and Cranelift backends
+# give no formal constant-time guarantee, as crypto/subtle's header says).
+#
+# Differences from Go:
+#   - Points are plain values (three fiat elements): operations return new
+#     points instead of setting a receiver. Set is assignment; SetGenerator
+#     and SetBytes are the statics generator and from_bytes.
+#   - Generator tables: Go builds the P-224/P-384/P-521 tables of multiples of
+#     G lazily (sync.Once). alx has no mutable package state, so they are
+#     generated array constants (p224_table.alx etc., from Go's
+#     crypto/elliptic), stored as affine points (z = 1): the points are the
+#     same, so results are identical. The constants are built once (D32), and
+#     a table lookup reads them in place. P-256 uses Go's own precomputed
+#     table (p256_table.go) the same way. The curve constants b and the
+#     generators are Montgomery-limb literals instead of SetBytes calls.
+#   - P-224's square root uses constant powers g^(2^j) (Go builds them once
+#     with sync.Once): a generated constant too.
+#   - Errors are NistecError values with Go's messages, or the fiat.FiatError
+#     of a coordinate that doesn't decode.
+
+# Errors of the point decoders and encoders.
+pub error NistecError {
+  # An encoding of unknown form or length (Go: "invalid P256 point encoding").
+  InvalidEncoding(curve: Str)
+  # A compressed encoding whose x has no y (Go: "invalid P256 compressed
+  # point encoding").
+  InvalidCompressedEncoding(curve: Str)
+  # The coordinates are not on the curve (Go: "P256 point not on curve").
+  NotOnCurve(curve: Str)
+  # bytes_x of the point at infinity.
+  Infinity(curve: Str)
+  # A scalar of the wrong length for scalar_base_mult (and P-256's
+  # scalar_mult).
+  InvalidScalarLength
+
+  def message -> Str {
+    case self {
+      InvalidEncoding(curve) => "invalid #{curve} point encoding"
+      InvalidCompressedEncoding(curve) => "invalid #{curve} compressed point encoding"
+      NotOnCurve(curve) => "#{curve} point not on curve"
+      Infinity(curve) => "#{curve} point is the point at infinity"
+      InvalidScalarLength => "invalid scalar length"
+    }
+  }
+}

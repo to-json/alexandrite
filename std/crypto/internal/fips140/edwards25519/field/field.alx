@@ -1,0 +1,572 @@
+#![overflow(wrap)]
+# Package field: Go's crypto/internal/fips140/edwards25519/field, fast
+# arithmetic modulo 2^255-19 with five 51-bit limbs (the pure-Go code of
+# fe.go and fe_generic.go; Go's amd64 assembly is not ported).
+#
+# Go's Element is mutated through pointer receivers (`v.Add(a, b)` sets v);
+# here an Element is an immutable value of five U64 fields, and every
+# operation returns a new Element, so aliasing can't arise:
+#
+#   Go                                  alx
+#   new(Element) / v.Zero() / v.One()   Element.new / zero() / one()
+#   v.Set(a)                            v = a
+#   v.SetBytes(x) (*Element, error)     set_bytes(x) -> ~Element<FieldError>
+#   v.Bytes() []byte                    v.bytes -> [Byte]
+#   v.Equal(u) int                      v.equal(u) -> Int
+#   v.Add(a, b) / v.Subtract(a, b)      a.add(b) / a.subtract(b)
+#   v.Negate(a) / v.Invert(a)           a.negate / a.invert
+#   v.Multiply(x, y) / v.Square(x)      x.multiply(y) / x.square
+#   v.SquareN(x, n)                     x.square_n(n)
+#   v.Mult32(x, y uint32)               x.mult_32(y: U32)
+#   v.Pow22523(x)                       x.pow22523
+#   v.Absolute(u) / v.IsNegative() int  u.absolute / v.is_negative -> Int
+#   v.Select(a, b, cond)                select(a, b, cond) -> Element
+#   v.Swap(u, cond)                     swap(v, u, cond) -> (Element, Element)
+#   r.SqrtRatio(u, v) (*Element, int)   sqrt_ratio(u, v) -> (Element, Int)
+#   (unexported limbs)                  from_limbs(l0, .., l4) (alx addition)
+#
+# Differences from Go:
+#   - Values instead of pointer receivers (above). Element is a value type,
+#     so `==` compares limbs (not the field value: use equal).
+#   - from_limbs is an addition: alx has no package variables, so packages
+#     that need Element constants (edwards25519's d, tables) build them from
+#     limbs instead of decoding bytes at every use.
+#   - equal compares the reduced limbs in constant time instead of the
+#     encoded bytes, and is_negative reads the reduced low limb instead of
+#     encoding: the same results without allocating.
+#   - swap returns the swapped pair (Go swaps v and u in place).
+#
+# Timing: the code keeps Go's constant-time structure: no branches or
+# memory indexing on secret values; select and swap use masks. The carries
+# of the 128-bit accumulations are comparisons (`lo < p ? 1 : 0`), which C
+# compilers and the JIT lower to flag reads (setb/cset), not branches. As in
+# crypto/subtle, alx (and the C compiler behind --release) give no formal
+# guarantee that this stays branch-free, as Go's compiler gives none either.
+
+MASK_LOW_51_BITS: U64 = (1 << 51) - 1
+ONE: U64 = 1
+ZERO: U64 = 0
+
+# Errors of set_bytes.
+pub error FieldError {
+  InvalidSize
+
+  def message -> Str {
+    case self {
+      InvalidSize => "edwards25519: invalid field element input size"
+    }
+  }
+}
+
+# An element of the field GF(2^255-19): the integer
+#   l0 + l1*2^51 + l2*2^102 + l3*2^153 + l4*2^204.
+# Between operations, all limbs are lower than 2^52. The zero value
+# (Element.new) is a valid zero element.
+pub struct Element {
+  l0: U64
+  l1: U64
+  l2: U64
+  l3: U64
+  l4: U64
+
+  # v reduced modulo 2^255-19 (canonical limbs).
+  def reduce -> Element {
+    v = light(l0, l1, l2, l3, l4)
+    # After the light reduction v < 2^255 + 2^13 * 19, but we need
+    # v < 2^255 - 19. If v >= 2^255 - 19, then v + 19 >= 2^255, which
+    # generates a carry: c is 0 if v < 2^255 - 19, and 1 otherwise.
+    c = (v.l0 + 19) >> 51
+    c = (v.l1 + c) >> 51
+    c = (v.l2 + c) >> 51
+    c = (v.l3 + c) >> 51
+    c = (v.l4 + c) >> 51
+    # If c = 0 this is a no-op; otherwise it applies the reduction identity
+    # to the carry.
+    r0 = v.l0 + 19 * c
+    r1 = v.l1 + (r0 >> 51)
+    r0 = r0 & MASK_LOW_51_BITS
+    r2 = v.l2 + (r1 >> 51)
+    r1 = r1 & MASK_LOW_51_BITS
+    r3 = v.l3 + (r2 >> 51)
+    r2 = r2 & MASK_LOW_51_BITS
+    r4 = v.l4 + (r3 >> 51)
+    r3 = r3 & MASK_LOW_51_BITS
+    # no additional carry
+    r4 = r4 & MASK_LOW_51_BITS
+    Element.new(r0, r1, r2, r3, r4)
+  }
+
+  # self + b.
+  pub def add(b: Element) -> Element {
+    light(l0 + b.l0, l1 + b.l1, l2 + b.l2, l3 + b.l3, l4 + b.l4)
+  }
+
+  # self - b.
+  pub def subtract(b: Element) -> Element {
+    # Add 2 * p first, so that the subtraction won't underflow, then
+    # subtract b (which can be up to 2^255 + 2^13 * 19).
+    light((l0 + 0xFFFFFFFFFFFDA) - b.l0, (l1 + 0xFFFFFFFFFFFFE) - b.l1, (l2 + 0xFFFFFFFFFFFFE) - b.l2,
+      (l3 + 0xFFFFFFFFFFFFE) - b.l3, (l4 + 0xFFFFFFFFFFFFE) - b.l4)
+  }
+
+  # -self.
+  pub def negate -> Element {
+    light(0xFFFFFFFFFFFDA - l0, 0xFFFFFFFFFFFFE - l1, 0xFFFFFFFFFFFFE - l2, 0xFFFFFFFFFFFFE - l3,
+      0xFFFFFFFFFFFFE - l4)
+  }
+
+  # 1/self mod p; zero if self is zero.
+  pub def invert -> Element {
+    # Exponentiation with exponent p - 2: 254 squarings and 11
+    # multiplications, grouping squarings to use square_n.
+    z = self
+    t1 = z.square         # 2
+    t = t1.square         # 4
+    t = t.square          # 8
+    t2 = t.multiply(z)    # 9
+    z11 = t2.multiply(t1) # 11
+    t = z11.square        # 22
+    t0 = t.multiply(t2)   # 31 = 2^5 - 2^0
+
+    t = t0.square_n(5)  # 2^10 - 2^5
+    t2 = t.multiply(t0) # 2^10 - 1
+
+    t = t2.square_n(5)  # 2^15 - 2^5
+    t0 = t.multiply(t0) # 2^15 - 1
+
+    t = t0.square_n(15) # 2^30 - 2^15
+    t1 = t.multiply(t0) # 2^30 - 1
+
+    t = t1.square_n(30) # 2^60 - 2^30
+    t0 = t.multiply(t1) # 2^60 - 1
+
+    t = t0.square_n(60) # 2^120 - 2^60
+    t1 = t.multiply(t0) # 2^120 - 1
+
+    t = t1.square_n(120) # 2^240 - 2^120
+    t = t.multiply(t1)   # 2^240 - 1
+
+    t = t.square_n(10) # 2^250 - 2^10
+    t = t.multiply(t2) # 2^250 - 1
+
+    t = t.square_n(5) # 2^255 - 2^5
+
+    t.multiply(z11) # 2^255 - 21
+  }
+
+  # The canonical 32-byte little-endian encoding.
+  pub def bytes -> [Byte] {
+    t = reduce
+    # Pack five 51-bit limbs into four 64-bit words.
+    u0 = (t.l1 << 51) | t.l0
+    u1 = (t.l2 << (102 - 64)) | (t.l1 >> (64 - 51))
+    u2 = (t.l3 << (153 - 128)) | (t.l2 >> (128 - 102))
+    u3 = (t.l4 << (204 - 192)) | (t.l3 >> (192 - 153))
+    out = [0.as_u8; 32]
+    put_le64(out, 0, u0)
+    put_le64(out, 8, u1)
+    put_le64(out, 16, u2)
+    put_le64(out, 24, u3)
+    out
+  }
+
+  # 1 if self and u are equal (as field elements), and 0 otherwise.
+  pub def equal(u: Element) -> Int {
+    a = reduce
+    b = u.reduce
+    d = (a.l0 ^ b.l0) | (a.l1 ^ b.l1) | (a.l2 ^ b.l2) | (a.l3 ^ b.l3) | (a.l4 ^ b.l4)
+    # (d | -d) has its top bit set exactly when d != 0.
+    (((d | (0 - d)) >> 63) ^ 1).as_i64
+  }
+
+  # 1 if self is negative (odd when reduced), and 0 otherwise.
+  pub def is_negative -> Int { (reduce.l0 & 1).as_i64 }
+
+  # |self|.
+  pub def absolute -> Element { select(negate, self, is_negative) }
+
+  # self * y.
+  pub def multiply(b: Element) -> Element {
+    a0 = l0
+    a1 = l1
+    a2 = l2
+    a3 = l3
+    a4 = l4
+    b0 = b.l0
+    b1 = b.l1
+    b2 = b.l2
+    b3 = b.l3
+    b4 = b.l4
+    a1_19 = a1 * 19
+    a2_19 = a2 * 19
+    a3_19 = a3 * 19
+    a4_19 = a4 * 19
+    # Columnar multiplication with the reduction identity applied on the
+    # fly (a * 2^255 + b = a * 19 + b), into five 128-bit columns:
+    #   r0 = a0*b0 + 19*(a1*b4 + a2*b3 + a3*b2 + a4*b1)
+    #   r1 = a0*b1 + a1*b0 + 19*(a2*b4 + a3*b3 + a4*b2)
+    #   r2 = a0*b2 + a1*b1 + a2*b0 + 19*(a3*b4 + a4*b3)
+    #   r3 = a0*b3 + a1*b2 + a2*b1 + a3*b0 + 19*a4*b4
+    #   r4 = a0*b4 + a1*b3 + a2*b2 + a3*b1 + a4*b0
+    # Each column is (rNhi, rNlo); the largest, r0, is below 2^111.
+    r0lo = a0 *% b0
+    r0hi = a0.__mulhi(b0)
+    p = a1_19 *% b4
+    r0lo = r0lo + p
+    c = r0lo < p ? ONE : ZERO
+    r0hi = r0hi + a1_19.__mulhi(b4) + c
+    p = a2_19 *% b3
+    r0lo = r0lo + p
+    c = r0lo < p ? ONE : ZERO
+    r0hi = r0hi + a2_19.__mulhi(b3) + c
+    p = a3_19 *% b2
+    r0lo = r0lo + p
+    c = r0lo < p ? ONE : ZERO
+    r0hi = r0hi + a3_19.__mulhi(b2) + c
+    p = a4_19 *% b1
+    r0lo = r0lo + p
+    c = r0lo < p ? ONE : ZERO
+    r0hi = r0hi + a4_19.__mulhi(b1) + c
+    r1lo = a0 *% b1
+    r1hi = a0.__mulhi(b1)
+    p = a1 *% b0
+    r1lo = r1lo + p
+    c = r1lo < p ? ONE : ZERO
+    r1hi = r1hi + a1.__mulhi(b0) + c
+    p = a2_19 *% b4
+    r1lo = r1lo + p
+    c = r1lo < p ? ONE : ZERO
+    r1hi = r1hi + a2_19.__mulhi(b4) + c
+    p = a3_19 *% b3
+    r1lo = r1lo + p
+    c = r1lo < p ? ONE : ZERO
+    r1hi = r1hi + a3_19.__mulhi(b3) + c
+    p = a4_19 *% b2
+    r1lo = r1lo + p
+    c = r1lo < p ? ONE : ZERO
+    r1hi = r1hi + a4_19.__mulhi(b2) + c
+    r2lo = a0 *% b2
+    r2hi = a0.__mulhi(b2)
+    p = a1 *% b1
+    r2lo = r2lo + p
+    c = r2lo < p ? ONE : ZERO
+    r2hi = r2hi + a1.__mulhi(b1) + c
+    p = a2 *% b0
+    r2lo = r2lo + p
+    c = r2lo < p ? ONE : ZERO
+    r2hi = r2hi + a2.__mulhi(b0) + c
+    p = a3_19 *% b4
+    r2lo = r2lo + p
+    c = r2lo < p ? ONE : ZERO
+    r2hi = r2hi + a3_19.__mulhi(b4) + c
+    p = a4_19 *% b3
+    r2lo = r2lo + p
+    c = r2lo < p ? ONE : ZERO
+    r2hi = r2hi + a4_19.__mulhi(b3) + c
+    r3lo = a0 *% b3
+    r3hi = a0.__mulhi(b3)
+    p = a1 *% b2
+    r3lo = r3lo + p
+    c = r3lo < p ? ONE : ZERO
+    r3hi = r3hi + a1.__mulhi(b2) + c
+    p = a2 *% b1
+    r3lo = r3lo + p
+    c = r3lo < p ? ONE : ZERO
+    r3hi = r3hi + a2.__mulhi(b1) + c
+    p = a3 *% b0
+    r3lo = r3lo + p
+    c = r3lo < p ? ONE : ZERO
+    r3hi = r3hi + a3.__mulhi(b0) + c
+    p = a4_19 *% b4
+    r3lo = r3lo + p
+    c = r3lo < p ? ONE : ZERO
+    r3hi = r3hi + a4_19.__mulhi(b4) + c
+    r4lo = a0 *% b4
+    r4hi = a0.__mulhi(b4)
+    p = a1 *% b3
+    r4lo = r4lo + p
+    c = r4lo < p ? ONE : ZERO
+    r4hi = r4hi + a1.__mulhi(b3) + c
+    p = a2 *% b2
+    r4lo = r4lo + p
+    c = r4lo < p ? ONE : ZERO
+    r4hi = r4hi + a2.__mulhi(b2) + c
+    p = a3 *% b1
+    r4lo = r4lo + p
+    c = r4lo < p ? ONE : ZERO
+    r4hi = r4hi + a3.__mulhi(b1) + c
+    p = a4 *% b0
+    r4lo = r4lo + p
+    c = r4lo < p ? ONE : ZERO
+    r4hi = r4hi + a4.__mulhi(b0) + c
+    c0 = (r0hi << 13) | (r0lo >> 51)
+    c1 = (r1hi << 13) | (r1lo >> 51)
+    c2 = (r2hi << 13) | (r2lo >> 51)
+    c3 = (r3hi << 13) | (r3lo >> 51)
+    c4 = (r4hi << 13) | (r4lo >> 51)
+    rr0 = (r0lo & MASK_LOW_51_BITS) + c4 * 19
+    rr1 = (r1lo & MASK_LOW_51_BITS) + c0
+    rr2 = (r2lo & MASK_LOW_51_BITS) + c1
+    rr3 = (r3lo & MASK_LOW_51_BITS) + c2
+    rr4 = (r4lo & MASK_LOW_51_BITS) + c3
+    # One last carry chain: the carries fit in the room above 2^51.
+    Element.new((rr0 & MASK_LOW_51_BITS) + (rr4 >> 51) * 19, (rr1 & MASK_LOW_51_BITS) + (rr0 >> 51),
+      (rr2 & MASK_LOW_51_BITS) + (rr1 >> 51), (rr3 & MASK_LOW_51_BITS) + (rr2 >> 51),
+      (rr4 & MASK_LOW_51_BITS) + (rr3 >> 51))
+  }
+
+  # self * self.
+  pub def square -> Element { square_n(1) }
+
+  # self^(2^n); n must be positive.
+  pub def square_n(n: Int) -> Element {
+    x0 = self.l0
+    x1 = self.l1
+    x2 = self.l2
+    x3 = self.l3
+    x4 = self.l4
+    i = 0
+    while i < n {
+      # As multiply, with the symmetric terms grouped:
+      #   r0 = x0*x0 + 38*(x1*x4 + x2*x3)
+      #   r1 = 2*x0*x1 + 38*x2*x4 + 19*x3*x3
+      #   r2 = 2*x0*x2 + x1*x1 + 38*x3*x4
+      #   r3 = 2*x0*x3 + 2*x1*x2 + 19*x4*x4
+      #   r4 = 2*x0*x4 + 2*x1*x3 + x2*x2
+      x0_2 = x0 * 2
+      x1_2 = x1 * 2
+      x1_38 = x1 * 38
+      x2_38 = x2 * 38
+      x3_38 = x3 * 38
+      x3_19 = x3 * 19
+      x4_19 = x4 * 19
+      r0lo = x0 *% x0
+      r0hi = x0.__mulhi(x0)
+      p = x1_38 *% x4
+      r0lo = r0lo + p
+      c = r0lo < p ? ONE : ZERO
+      r0hi = r0hi + x1_38.__mulhi(x4) + c
+      p = x2_38 *% x3
+      r0lo = r0lo + p
+      c = r0lo < p ? ONE : ZERO
+      r0hi = r0hi + x2_38.__mulhi(x3) + c
+      r1lo = x0_2 *% x1
+      r1hi = x0_2.__mulhi(x1)
+      p = x2_38 *% x4
+      r1lo = r1lo + p
+      c = r1lo < p ? ONE : ZERO
+      r1hi = r1hi + x2_38.__mulhi(x4) + c
+      p = x3_19 *% x3
+      r1lo = r1lo + p
+      c = r1lo < p ? ONE : ZERO
+      r1hi = r1hi + x3_19.__mulhi(x3) + c
+      r2lo = x0_2 *% x2
+      r2hi = x0_2.__mulhi(x2)
+      p = x1 *% x1
+      r2lo = r2lo + p
+      c = r2lo < p ? ONE : ZERO
+      r2hi = r2hi + x1.__mulhi(x1) + c
+      p = x3_38 *% x4
+      r2lo = r2lo + p
+      c = r2lo < p ? ONE : ZERO
+      r2hi = r2hi + x3_38.__mulhi(x4) + c
+      r3lo = x0_2 *% x3
+      r3hi = x0_2.__mulhi(x3)
+      p = x1_2 *% x2
+      r3lo = r3lo + p
+      c = r3lo < p ? ONE : ZERO
+      r3hi = r3hi + x1_2.__mulhi(x2) + c
+      p = x4_19 *% x4
+      r3lo = r3lo + p
+      c = r3lo < p ? ONE : ZERO
+      r3hi = r3hi + x4_19.__mulhi(x4) + c
+      r4lo = x0_2 *% x4
+      r4hi = x0_2.__mulhi(x4)
+      p = x1_2 *% x3
+      r4lo = r4lo + p
+      c = r4lo < p ? ONE : ZERO
+      r4hi = r4hi + x1_2.__mulhi(x3) + c
+      p = x2 *% x2
+      r4lo = r4lo + p
+      c = r4lo < p ? ONE : ZERO
+      r4hi = r4hi + x2.__mulhi(x2) + c
+      c0 = (r0hi << 13) | (r0lo >> 51)
+      c1 = (r1hi << 13) | (r1lo >> 51)
+      c2 = (r2hi << 13) | (r2lo >> 51)
+      c3 = (r3hi << 13) | (r3lo >> 51)
+      c4 = (r4hi << 13) | (r4lo >> 51)
+      rr0 = (r0lo & MASK_LOW_51_BITS) + c4 * 19
+      rr1 = (r1lo & MASK_LOW_51_BITS) + c0
+      rr2 = (r2lo & MASK_LOW_51_BITS) + c1
+      rr3 = (r3lo & MASK_LOW_51_BITS) + c2
+      rr4 = (r4lo & MASK_LOW_51_BITS) + c3
+      x0 = (rr0 & MASK_LOW_51_BITS) + (rr4 >> 51) * 19
+      x1 = (rr1 & MASK_LOW_51_BITS) + (rr0 >> 51)
+      x2 = (rr2 & MASK_LOW_51_BITS) + (rr1 >> 51)
+      x3 = (rr3 & MASK_LOW_51_BITS) + (rr2 >> 51)
+      x4 = (rr4 & MASK_LOW_51_BITS) + (rr3 >> 51)
+      i += 1
+    }
+    Element.new(x0, x1, x2, x3, x4)
+  }
+
+  # self * y.
+  pub def mult_32(y: U32) -> Element {
+    b = y.as_u64
+    # mul51: lo + hi * 2^51 = a * b.
+    m0 = l0 *% b
+    h0 = (l0.__mulhi(b) << 13) | (m0 >> 51)
+    m1 = l1 *% b
+    h1 = (l1.__mulhi(b) << 13) | (m1 >> 51)
+    m2 = l2 *% b
+    h2 = (l2.__mulhi(b) << 13) | (m2 >> 51)
+    m3 = l3 *% b
+    h3 = (l3.__mulhi(b) << 13) | (m3 >> 51)
+    m4 = l4 *% b
+    h4 = (l4.__mulhi(b) << 13) | (m4 >> 51)
+    # The hi parts are only 32 bits plus any previous excess, so the carry
+    # propagation can be skipped.
+    Element.new((m0 & MASK_LOW_51_BITS) + 19 * h4, (m1 & MASK_LOW_51_BITS) + h0, (m2 & MASK_LOW_51_BITS) + h1,
+      (m3 & MASK_LOW_51_BITS) + h2, (m4 & MASK_LOW_51_BITS) + h3)
+  }
+
+  # self^((p-5)/8), where (p-5)/8 is 2^252-3.
+  pub def pow22523 -> Element {
+    x = self
+    t0 = x.square        # x^2
+    t1 = x.multiply(t0)  # x^3
+    t0 = t1.square       # x^6
+    t0 = t0.square       # x^12
+    t0 = t1.multiply(t0) # x^15
+    t0 = t0.square       # x^30
+    t0 = x.multiply(t0)  # x^31 = 2^5 - 1
+
+    t1 = t0.square_n(5)  # 2^10 - 2^5
+    t1 = t1.multiply(t0) # 2^10 - 1
+
+    t2 = t1.square_n(5)  # 2^15 - 2^5
+    t0 = t2.multiply(t0) # 2^15 - 1
+
+    t2 = t0.square_n(15) # 2^30 - 2^15
+    t2 = t2.multiply(t0) # 2^30 - 1
+
+    t0 = t2.square_n(30) # 2^60 - 2^30
+    t0 = t0.multiply(t2) # 2^60 - 1
+
+    t2 = t0.square_n(60) # 2^120 - 2^60
+    t2 = t2.multiply(t0) # 2^120 - 1
+
+    t0 = t2.square_n(120) # 2^240 - 2^120
+    t0 = t0.multiply(t2)  # 2^240 - 1
+
+    t0 = t0.square_n(10) # 2^250 - 2^10
+    t0 = t0.multiply(t1) # 2^250 - 1
+
+    t0 = t0.square_n(2) # 2^252 - 4
+    t0.multiply(x)      # 2^252 - 3
+  }
+}
+
+# The light reduction (Go's carryPropagate): brings the limbs below 52 bits
+# by applying the reduction identity (a * 2^255 + b = a * 19 + b) to the l4
+# carry. (l4>>51) is at most 13 bits, so (l4>>51)*19 is at most 18 bits and
+# the final l0 at most 52 bits; similarly for the rest.
+def light(l0: U64, l1: U64, l2: U64, l3: U64, l4: U64) -> Element {
+  Element.new((l0 & MASK_LOW_51_BITS) + (l4 >> 51) * 19, (l1 & MASK_LOW_51_BITS) + (l0 >> 51),
+    (l2 & MASK_LOW_51_BITS) + (l1 >> 51), (l3 & MASK_LOW_51_BITS) + (l2 >> 51),
+    (l4 & MASK_LOW_51_BITS) + (l3 >> 51))
+}
+
+# The element with the given limbs (each below 2^52). alx addition: the
+# way to write Element constants.
+pub def from_limbs(l0: U64, l1: U64, l2: U64, l3: U64, l4: U64) -> Element {
+  Element.new(l0, l1, l2, l3, l4)
+}
+
+# 0.
+pub def zero -> Element { Element.new }
+
+# 1.
+pub def one -> Element { Element.new(1, 0, 0, 0, 0) }
+
+def le64(x: [Byte], i: Int) -> U64 {
+  x[i].as_u64 | (x[i + 1].as_u64 << 8) | (x[i + 2].as_u64 << 16) | (x[i + 3].as_u64 << 24) |
+  (x[i + 4].as_u64 << 32) | (x[i + 5].as_u64 << 40) | (x[i + 6].as_u64 << 48) | (x[i + 7].as_u64 << 56)
+}
+
+def put_le64(b: [Byte], i: Int, v: U64) {
+  b[i] = v.as_u8
+  b[i + 1] = (v >> 8).as_u8
+  b[i + 2] = (v >> 16).as_u8
+  b[i + 3] = (v >> 24).as_u8
+  b[i + 4] = (v >> 32).as_u8
+  b[i + 5] = (v >> 40).as_u8
+  b[i + 6] = (v >> 48).as_u8
+  b[i + 7] = (v >> 56).as_u8
+}
+
+# The element encoded by x, a 32-byte little-endian encoding. Fails with
+# InvalidSize if x is not 32 bytes long.
+#
+# Consistent with RFC 7748, the most significant bit (the high bit of the
+# last byte) is ignored, and non-canonical values (2^255-19 through
+# 2^255-1) are accepted. This is laxer than RFC 8032, but consistent with
+# most Ed25519 implementations.
+pub def set_bytes(x: [Byte]) -> ~Element<FieldError> {
+  fail FieldError.InvalidSize if x.size != 32
+  # Bits 0:51 (bytes 0:8, bits 0:64, shift 0, mask 51).
+  l0 = le64(x, 0) & MASK_LOW_51_BITS
+  # Bits 51:102 (bytes 6:14, bits 48:112, shift 3, mask 51).
+  l1 = (le64(x, 6) >> 3) & MASK_LOW_51_BITS
+  # Bits 102:153 (bytes 12:20, bits 96:160, shift 6, mask 51).
+  l2 = (le64(x, 12) >> 6) & MASK_LOW_51_BITS
+  # Bits 153:204 (bytes 19:27, bits 152:216, shift 1, mask 51).
+  l3 = (le64(x, 19) >> 1) & MASK_LOW_51_BITS
+  # Bits 204:255 (bytes 24:32, bits 192:256, shift 12, mask 51).
+  l4 = (le64(x, 24) >> 12) & MASK_LOW_51_BITS
+  Element.new(l0, l1, l2, l3, l4)
+}
+
+# 0xffffffffffffffff if cond is 1, and 0 if cond is 0.
+def mask64_bits(cond: Int) -> U64 { ^(cond.as_u64 - 1) }
+
+# a if cond == 1, and b if cond == 0.
+pub def select(a: Element, b: Element, cond: Int) -> Element {
+  m = mask64_bits(cond)
+  Element.new((m & a.l0) | (^m & b.l0), (m & a.l1) | (^m & b.l1), (m & a.l2) | (^m & b.l2), (m & a.l3) | (^m & b.l3),
+    (m & a.l4) | (^m & b.l4))
+}
+
+# (u, v) if cond == 1, and (v, u) unchanged if cond == 0.
+pub def swap(v: Element, u: Element, cond: Int) -> (Element, Element) {
+  (select(u, v, cond), select(v, u, cond))
+}
+
+# sqrt_m1 is 2^((p-1)/4), which squared is equal to -1 by Euler's Criterion.
+def sqrt_m1 -> Element {
+  Element.new(1718705420411056, 234908883556509, 2233514472574048, 2117202627021982, 765476049583133)
+}
+
+# The non-negative square root of the ratio of u and v, and 1 if u/v is
+# square. If u/v is not square, the root is set according to Section 4.3
+# of draft-irtf-cfrg-ristretto255-decaf448-00, and the flag is 0.
+pub def sqrt_ratio(u: Element, v: Element) -> (Element, Int) {
+  # r = (u * v3) * (u * v7)^((p-5)/8)
+  v2 = v.square
+  uv3 = u.multiply(v2.multiply(v))
+  uv7 = uv3.multiply(v2.square)
+  rr = uv3.multiply(uv7.pow22523)
+
+  check = v.multiply(rr.square) # check = v * r^2
+
+  u_neg = u.negate
+  correct_sign_sqrt = check.equal(u)
+  flipped_sign_sqrt = check.equal(u_neg)
+  flipped_sign_sqrt_i = check.equal(u_neg.multiply(sqrt_m1))
+
+  r_prime = rr.multiply(sqrt_m1) # r_prime = SQRT_M1 * r
+  # r = CT_SELECT(r_prime IF flipped_sign_sqrt | flipped_sign_sqrt_i ELSE r)
+  rr = select(r_prime, rr, flipped_sign_sqrt | flipped_sign_sqrt_i)
+
+  (rr.absolute, correct_sign_sqrt | flipped_sign_sqrt) # the nonnegative square root
+}

@@ -4383,6 +4383,14 @@ impl<'w, 'a> FnCx<'w, 'a> {
                 return self.fn_call(f, args, sp);
             }
         }
+        // A field of the receiver named like a builtin (`p`, `print`) is the
+        // field when used bare.
+        if args.is_empty() && block.is_none() {
+            let bare = Expr { kind: ExprKind::Name(name.to_string()), span: name_span, id: NodeId::MAX };
+            if let Some(f) = self.self_field(&bare) {
+                return self.expr(&f);
+            }
+        }
         match name {
             "puts" | "print" | "p" => {
                 if self.pure_decl {

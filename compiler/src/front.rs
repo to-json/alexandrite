@@ -901,8 +901,10 @@ pub fn load_tests(dir: &Path, dir_shown: &str, only: Option<&Path>, o: &TestOpts
         }
         acc.defs.push(t.def);
         let wanted = match t.kind {
-            TestKind::Bench => o.bench.as_ref().is_some_and(|b| b == "." || t.name.contains(b.as_str())),
-            _ => o.run.as_ref().is_none_or(|r| t.name.contains(r.as_str())),
+            // `a|b` matches names containing a or b (the alternation of Go's
+            // regexp filters; the parts are plain substrings).
+            TestKind::Bench => o.bench.as_ref().is_some_and(|b| b == "." || b.split('|').any(|p| t.name.contains(p))),
+            _ => o.run.as_ref().is_none_or(|r| r.split('|').any(|p| t.name.contains(p))),
         };
         if wanted {
             items.push(TestItem { kind: t.kind, name: t.name, func, outputs: t.outputs });

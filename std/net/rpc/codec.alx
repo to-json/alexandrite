@@ -1,0 +1,119 @@
+# The default codecs: JSON lines (Go's are gob streams; see the package
+# header).
+import "encoding/json"
+import "io"
+import "net/textproto"
+
+#[derive(Json)]
+struct WireRequest {
+  #[json("ServiceMethod")] service_method: Str
+  #[json("Seq")] seq: Int
+}
+
+#[derive(Json)]
+struct WireResponse {
+  #[json("ServiceMethod")] service_method: Str
+  #[json("Seq")] seq: Int
+  #[json("Error")] error: Str
+}
+
+def read_text_line[C](rd: Mutex[textproto.Reader[C]]) -> ~Str? {
+  r = rd.lock { |x| x.read_line! }
+  ~r
+}
+
+def write_lines[C](wr: Mutex[textproto.Writer[C]], a: Str, b: Str) -> ~Unit {
+  r = wr.lock { |w|
+    r1 = w.print_line!(a)
+    if r1.err? {
+      r1
+    } else {
+      w.print_line!(b)
+    }
+  }
+  ~r
+}
+
+def close_conn[C](conn: Mutex[C], closed: Atomic[Int]) -> ~Unit {
+  return unless closed.compare_and_swap(0, 1)
+  r = conn.lock { |c| c.close! }
+  ~r
+}
+
+# The server side of the default codec over a connection C. Its state is in
+# Mutexes, so the server's per-call tasks may share it.
+pub struct LineServerCodec[C] {
+  rd: Mutex[textproto.Reader[C]]
+  wr: Mutex[textproto.Writer[C]]
+  conn: Mutex[C]
+  closed: Atomic[Int]
+
+  pub def read_request_header! -> ~Request? {
+    l = ~read_text_line(rd)
+    return none unless l.present?
+    w = WireRequest.from_json(l.unwrap)
+    fail RpcError.Failure("rpc: server cannot decode request: " + w.err.unwrap.message) if w.err?
+    h = w.unwrap
+    Request.new(service_method: h.service_method, seq: h.seq)
+  }
+
+  pub def read_request_body!(want: Bool) -> ~Str {
+    l = ~read_text_line(rd)
+    fail io.StreamError.UnexpectedEof unless l.present?
+    l.unwrap
+  }
+
+  pub def write_response!(r: Response, body: Str) -> ~Unit {
+    wr0 = WireResponse.new(service_method: r.service_method, seq: r.seq, error: r.error)
+    h = wr0.~to_json
+    ~write_lines(wr, h, body)
+  }
+
+  # Closes the connection (once; later calls do nothing, as Go's).
+  pub def close! -> ~Unit {
+    ~close_conn(conn, closed)
+  }
+}
+
+# The server codec of the default wire format over conn.
+pub def new_server_codec[C: io.ReadWriteCloser](conn: C) -> LineServerCodec[C] {
+  LineServerCodec.new(rd: Mutex.new(textproto.new_reader(conn)), wr: Mutex.new(textproto.new_writer(conn)), conn: Mutex.new(conn), closed: Atomic.new(0))
+}
+
+# The client side of the default codec over a connection C.
+pub struct LineClientCodec[C] {
+  rd: Mutex[textproto.Reader[C]]
+  wr: Mutex[textproto.Writer[C]]
+  conn: Mutex[C]
+  closed: Atomic[Int]
+
+  pub def write_request!(r: Request, body: Str) -> ~Unit {
+    wq0 = WireRequest.new(service_method: r.service_method, seq: r.seq)
+    h = wq0.~to_json
+    ~write_lines(wr, h, body)
+  }
+
+  pub def read_response_header! -> ~Response? {
+    l = ~read_text_line(rd)
+    return none unless l.present?
+    w = WireResponse.from_json(l.unwrap)
+    fail RpcError.Failure("rpc: cannot decode response: " + w.err.unwrap.message) if w.err?
+    h = w.unwrap
+    Response.new(service_method: h.service_method, seq: h.seq, error: h.error)
+  }
+
+  pub def read_response_body! -> ~Str {
+    l = ~read_text_line(rd)
+    fail io.StreamError.UnexpectedEof unless l.present?
+    l.unwrap
+  }
+
+  pub def close! -> ~Unit {
+    ~close_conn(conn, closed)
+  }
+}
+
+# The client codec of the default wire format over conn.
+pub def new_client_codec[C: io.ReadWriteCloser](conn: C) -> LineClientCodec[C] {
+  LineClientCodec.new(rd: Mutex.new(textproto.new_reader(conn)), wr: Mutex.new(textproto.new_writer(conn)), conn: Mutex.new(conn), closed: Atomic.new(0))
+}

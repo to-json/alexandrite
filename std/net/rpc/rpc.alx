@@ -1,0 +1,554 @@
+# Package rpc: Go's net/rpc, calls of a server's registered methods across
+# a connection, with explicit registration instead of reflection.
+#
+#   #[derive(Json)] struct Args { a: Int; b: Int }
+#   #[derive(Json)] struct Reply { c: Int }
+#
+#   svc = rpc.new_service("Arith")
+#   svc.method!("Add", add)              # def add(a: Args) -> ~Reply (or a lambda)
+#   server = rpc.new_server
+#   server.~register(svc)
+#   ln = ~net.listen("tcp", "127.0.0.1:0")
+#   spawn { server.accept(ln) }
+#
+#   client = ~rpc.dial("tcp", addr)
+#   r: Reply = client.~call("Arith.Add", Args.new(a: 7, b: 8))
+#   done = client.go("Arith.Mul", Args.new(a: 7, b: 8), none)
+#   c = done.recv.unwrap                  # a Call
+#   r2: Reply = c.~result
+#
+#   Go                                        alx
+#   Register(rcvr) (methods found by          new_service(name) + svc.method!(name, f)
+#     reflection: func (t *T) M(args A,         + server.register(svc); f is (A) -> ~R,
+#     reply *R) error)                          A and R have to_json / Type.from_json
+#   RegisterName(name, rcvr)                  server.register_name(name, svc)
+#   (no Go equivalent)                        server.register_func("Svc.Method", f)
+#   NewServer                                 new_server
+#   (*Server).ServeConn / ServeCodec / ServeRequest / Accept
+#                                             serve_conn / serve_codec / serve_request / accept
+#   DefaultServer and the package functions   none (no mutable package state, port-issues #30)
+#   NewClient / NewClientWithCodec / Dial     new_client / new_client_with_codec / dial
+#   (*Client).Call(m, args, &reply) error     call(m, args) -> ~R (R from the wanted type)
+#   (*Client).Go(m, args, &reply, done) *Call go(m, args, done: Chan[Call]?) -> Chan[Call]
+#   Call{ServiceMethod, Args, Reply, Error}   Call{service_method, args, reply, error};
+#                                             c.result -> ~R decodes the reply
+#   ServerError, ErrShutdown                  RpcError.ServerError(msg), RpcError.Shutdown
+#   ServerCodec / ClientCodec                 the interfaces of the same names (below)
+#   Request / Response                        Request / Response (service_method, seq, error)
+#
+# Differences from Go:
+#  - No reflection (GO-VS-RUBY S3): a service's methods are registered one by
+#    one, each a function `(A) -> ~R` (Go's `func (t *T) M(args A, reply *R)
+#    error`: the reply is the result, a failure's message is the error string
+#    the client sees). A and R are anything with `to_json` and a static
+#    `from_json` (`#[derive(Json)]` types, json.Value): bodies cross the codec
+#    as JSON text. Builtin types (Int, Str, [T], maps) aren't such types: wrap
+#    them in a derived struct, or use json.Value. Go's registration-time
+#    checks of method signatures are compile-time type checks here; the
+#    registration errors Go has for names remain (no service name, no
+#    methods, service already defined).
+#  - The default wire codec isn't gob (no encoding/gob in alx yet): it is JSON
+#    lines, `{"ServiceMethod":"Arith.Add","Seq":0}\r\n{"a":7,"b":8}\r\n` for a
+#    request and `{"ServiceMethod":"Arith.Add","Seq":0,"Error":""}\r\n{...}\r\n`
+#    for a response (the body after an error is `{}`, Go's invalidRequest).
+#    It doesn't talk to Go's gob-based net/rpc; net/rpc/jsonrpc does talk to
+#    Go's jsonrpc.
+#  - Bodies are JSON text, so a body of the wrong type is a decode error only
+#    when the JSON doesn't fit (unknown keys are skipped, missing ones are
+#    zero): Go's "Bad type" test (gob rejects mismatched struct types) has no
+#    counterpart.
+#  - Codecs are generic parameters (`Client[C]`, `serve_codec[C]`), not
+#    interface values: the client reads in a task of its own while callers
+#    write, and the server answers in a task per call, so a codec must be safe
+#    to share between tasks: keep its state in Mutexes / Atomics, as the
+#    codecs here do (an interface value or a slice could not cross into those
+#    tasks, R4). Codec bodies are JSON text: ServerCodec.read_request_body!
+#    returns it and write_response! takes it; the client side likewise.
+#  - Client.go returns the done channel (Go returns the *Call whose Done is
+#    that channel): receive the Call from it. A Call is sent once, without
+#    blocking (dropped if the channel is full, as Go does).
+#  - No HTTP transport (HandleHTTP, DialHTTP, DialHTTPPath, the /debug/rpc
+#    page of debug.go): it needs net/http's connection hijacking, which alx's
+#    net/http doesn't have. num_calls(service_method) reports the debug page's
+#    call counts.
+#  - A method that panics kills its call's task (Go: the server process);
+#    the client's call then waits until the connection closes.
+#
+# Not translated (server_test.go, client_test.go): TestHTTP and the HTTP parts
+# of TestTCPClose / TestErrorAfterClientClose (no HTTP transport; both run
+# over TCP instead), TestBuiltinTypes (map/slice/array replies of builtin
+# types; replies here are derived types or json.Value), the "Bad type" part of
+# TestRPC (above), TestRegistrationError (Go's signature checks are
+# compile-time type errors here), TestCountMallocs* and the benchmarks (Go
+# runtime statistics), TestGobError (gob).
+
+import "encoding/json"
+import "io"
+import "net"
+import "net/textproto"
+import "strings"
+import "sync"
+
+pub error RpcError {
+  # The server answered with an error (Go's ServerError): the message is the
+  # server's text.
+  ServerError(msg: Str)
+  # The client is closed or the server stopped (Go's ErrShutdown).
+  Shutdown
+  # Any other failure (Go's errors.New values): the message is msg.
+  Failure(msg: Str)
+
+  def message -> Str {
+    case self {
+      ServerError(m) => m
+      Shutdown => "connection is shut down"
+      Failure(m) => m
+    }
+  }
+}
+
+# A request header (Go's Request): the method and the client's sequence
+# number.
+pub struct Request {
+  service_method: Str
+  seq: Int
+}
+
+# A response header (Go's Response): an error message, "" if none.
+pub struct Response {
+  service_method: Str
+  seq: Int
+  error: Str
+}
+
+# The server side of a codec. Bodies are JSON text.
+pub interface ServerCodec {
+  # The next request header; none at the end of input.
+  def read_request_header! -> ~Request?
+  # The body of the request just read (`want` false: read and drop it, Go's
+  # ReadRequestBody(nil)).
+  def read_request_body!(want: Bool) -> ~Str
+  def write_response!(r: Response, body: Str) -> ~Unit
+  def close! -> ~Unit
+}
+
+# The client side of a codec. Bodies are JSON text.
+pub interface ClientCodec {
+  def write_request!(r: Request, body: Str) -> ~Unit
+  # The next response header; none at the end of input.
+  def read_response_header! -> ~Response?
+  # The body of the response just read.
+  def read_response_body! -> ~Str
+  def close! -> ~Unit
+}
+
+# ------------------------------------------------------------------ services
+
+struct Method {
+  f: (Str) -> ~Str
+  calls: Atomic[Int]
+}
+
+# A named set of methods (Go: the receiver passed to Register).
+pub struct Service {
+  name: Str
+  methods: Map[Str, Method]
+
+  # Adds method `name`: f takes the call's argument and returns its reply;
+  # a failure is reported to the client as RpcError.ServerError(its message).
+  pub def method![A, R](name: Str, f: (A) -> ~R) {
+    g = ->(body: Str) -> ~Str {
+      a = ~A.from_json(body)
+      r = ~f(a)
+      ~r.to_json
+    }
+    self.methods[name] = Method.new(f: g, calls: Atomic.new(0))
+  }
+
+  pub def method_names -> [Str] {
+    out: [Str] = []
+    for k, _ in methods { out << k }
+    out
+  }
+}
+
+pub def new_service(name: Str) -> Service {
+  m: Map[Str, Method] = {}
+  Service.new(name: name, methods: m)
+}
+
+struct ServerState {
+  services: Map[Str, Service]
+}
+
+# What a server's lookup found: the method (when `error` is "").
+struct Found {
+  f: (Str) -> ~Str
+  calls: Atomic[Int]
+  error: Str
+}
+
+def no_method(body: Str) -> ~Str {
+  fail RpcError.Failure("rpc: no method")
+}
+
+# An RPC server: registered services and the loops serving them. A handle:
+# copies share the registrations.
+pub struct Server {
+  st: Mutex[ServerState]
+
+  # Registers svc under its own name (Go's Register).
+  pub def register(svc: Service) -> ~Unit {
+    ~register_name(svc.name, svc)
+  }
+
+  # Registers svc under `name` (Go's RegisterName).
+  pub def register_name(name: Str, svc: Service) -> ~Unit {
+    fail RpcError.Failure("rpc.Register: no service name for type #{svc.name}") if name == ""
+    fail RpcError.Failure("rpc.Register: type #{name} has no exported methods of suitable type") if svc.methods.size == 0
+    s = Service.new(name: name, methods: svc.methods)
+    dup = st.lock { |x|
+      if x.services.key?(name) {
+        true
+      } else {
+        x.services[name] = s
+        false
+      }
+    }
+    fail RpcError.Failure("rpc: service already defined: #{name}") if dup
+  }
+
+  # Registers one method, "Service.Method" (the service is made on first
+  # use; the method replaces one of the same name).
+  pub def register_func[A, R](service_method: Str, f: (A) -> ~R) -> ~Unit {
+    dot = strings.last_index(service_method, ".")
+    fail RpcError.Failure("rpc: service/method request ill-formed: #{service_method}") if dot < 0
+    sname = service_method[0...dot]
+    mname = service_method[dot + 1...service_method.size]
+    one = new_service(sname)
+    one.method!(mname, f)
+    m = one.methods[mname].unwrap
+    st.lock { |x|
+      if svc = x.services[sname] {
+        ms = svc.methods
+        ms[mname] = m
+      } else {
+        x.services[sname] = one
+      }
+    }
+  }
+
+  # How many times "Service.Method" has been called (0 if unknown); the
+  # counts of Go's debug page.
+  pub def num_calls(service_method: Str) -> Int {
+    f = find(service_method)
+    f.error == "" ? f.calls.load : 0
+  }
+
+  def find(service_method: Str) -> Found {
+    dot = strings.last_index(service_method, ".")
+    if dot < 0 {
+      return Found.new(f: no_method, calls: Atomic.new(0), error: "rpc: service/method request ill-formed: #{service_method}")
+    }
+    sname = service_method[0...dot]
+    mname = service_method[dot + 1...service_method.size]
+    st.lock { |x|
+      if svc = x.services[sname] {
+        if m = svc.methods[mname] {
+          Found.new(f: m.f, calls: m.calls, error: "")
+        } else {
+          Found.new(f: no_method, calls: Atomic.new(0), error: "rpc: can't find method #{service_method}")
+        }
+      } else {
+        Found.new(f: no_method, calls: Atomic.new(0), error: "rpc: can't find service #{service_method}")
+      }
+    }
+  }
+
+  # Serves conn with the default (JSON lines) codec until the client hangs
+  # up.
+  pub def serve_conn[C: io.ReadWriteCloser](conn: C) {
+    self.serve_codec(new_server_codec(conn))
+  }
+
+  # Serves requests from codec until it fails or ends, each call in a task
+  # of its own; waits for the calls to finish, then closes the codec.
+  pub def serve_codec[C: ServerCodec](codec: C) {
+    wg = sync.new_wait_group
+    sending = Mutex.new(0)
+    loop {
+      cd = codec
+      hdr = cd.read_request_header!
+      break if hdr.err?
+      opt = hdr.unwrap
+      break unless opt.present?
+      req = opt.unwrap
+      found = find(req.service_method)
+      if found.error != "" {
+        cd.read_request_body!(false)
+        send_response(sending, codec, req, "{}", found.error)
+        next
+      }
+      body = cd.read_request_body!(true)
+      if body.err? {
+        send_response(sending, codec, req, "{}", body.err.unwrap.message)
+        next
+      }
+      text = body.unwrap
+      f = found.f
+      calls = found.calls
+      wg.add(1)
+      c2 = codec
+      s2 = sending
+      w2 = wg
+      spawn {
+        defer w2.done
+        calls.add(1)
+        r = f(text)
+        if r.err? {
+          send_response(s2, c2, req, "{}", r.err.unwrap.message)
+        } else {
+          send_response(s2, c2, req, r.unwrap, "")
+        }
+      }
+    }
+    wg.wait
+    cd = codec
+    cd.close!
+  }
+
+  # Serves one request from codec, in this task (Go's ServeRequest). Fails
+  # with the request's error (after answering it), or at the end of input.
+  pub def serve_request[C: ServerCodec](codec: C) -> ~Unit {
+    sending = Mutex.new(0)
+    cd = codec
+    opt = ~cd.read_request_header!
+    fail RpcError.Failure("EOF") unless opt.present?
+    req = opt.unwrap
+    found = find(req.service_method)
+    if found.error != "" {
+      cd.read_request_body!(false)
+      send_response(sending, codec, req, "{}", found.error)
+      fail RpcError.Failure(found.error)
+    }
+    text = cd.~read_request_body!(true)
+    found.calls.add(1)
+    f = found.f
+    r = f(text)
+    if r.err? {
+      send_response(sending, codec, req, "{}", r.err.unwrap.message)
+    } else {
+      send_response(sending, codec, req, r.unwrap, "")
+    }
+  }
+
+  # Accepts connections on ln and serves each in a task, until ln fails.
+  pub def accept(ln: net.Listener) {
+    loop {
+      c = ln.accept
+      break if c.err?
+      conn = c.unwrap
+      s = self
+      spawn { s.serve_conn(conn) }
+    }
+  }
+}
+
+def send_response[C: ServerCodec](sending: Mutex[Int], codec: C, req: Request, body: Str, errmsg: Str) {
+  resp = Response.new(service_method: req.service_method, seq: req.seq, error: errmsg)
+  sending.lock { |_|
+    cd = codec
+    cd.write_response!(resp, body)
+  }
+}
+
+pub def new_server -> Server {
+  sv: Map[Str, Service] = {}
+  Server.new(st: Mutex.new(ServerState.new(services: sv)))
+}
+
+# ------------------------------------------------------------------- client
+
+# A finished call (Go's Call): the reply as JSON text, or the error.
+pub struct Call {
+  service_method: Str
+  # The arguments, as sent (JSON text).
+  args: Str
+  # The reply (JSON text; "" after an error).
+  reply: Str
+  error: RpcError?
+
+  # The reply decoded as an R, or the call's error.
+  pub def result[R] -> ~R {
+    if e = error { fail e }
+    r = R.from_json(reply)
+    fail RpcError.Failure("reading body " + r.err.unwrap.message) if r.err?
+    r.unwrap
+  }
+}
+
+struct Pending {
+  service_method: Str
+  args: Str
+  done: Chan[Call]
+}
+
+struct ClientState {
+  seq: Int
+  pending: Map[Int, Pending]
+  # The user called close!.
+  closing: Bool
+  # The server told us to stop (the connection ended).
+  shutdown: Bool
+}
+
+# An RPC client over a codec C. A handle: copies share the connection, and
+# several tasks may call through one client at once.
+pub struct Client[C] {
+  codec: C
+  st: Mutex[ClientState]
+  # Serializes request writes (Go's reqMutex).
+  reqs: Mutex[Int]
+
+  # Calls service_method with args and waits for the reply (R comes from
+  # the wanted type: `r: Reply = ~client.call("Arith.Add", args)`).
+  pub def call[A, R](service_method: Str, args: A) -> ~R {
+    done = go(service_method, args, Chan[Call].new(1))
+    c = done.recv.unwrap
+    r: R = c.~result
+    r
+  }
+
+  # Starts calling service_method; the finished Call arrives on the returned
+  # channel (`done`, or a new one with room for 10 calls).
+  pub def go[A](service_method: Str, args: A, done: Chan[Call]?) -> Chan[Call] {
+    ch = done || Chan[Call].new(10)
+    a = args.to_json
+    if a.err? {
+      deliver(ch, Call.new(service_method: service_method, args: "", reply: "", error: RpcError.Failure(a.err.unwrap.message)))
+      return ch
+    }
+    send(Pending.new(service_method: service_method, args: a.unwrap, done: ch))
+    ch
+  }
+
+  def send(p: Pending) {
+    reqs.lock { |_|
+      seq = st.lock { |s|
+        if s.shutdown || s.closing {
+          -1
+        } else {
+          n = s.seq
+          s.seq = n + 1
+          s.pending[n] = p
+          n
+        }
+      }
+      if seq < 0 {
+        deliver(p.done, Call.new(service_method: p.service_method, args: p.args, reply: "", error: RpcError.Shutdown))
+      } else {
+        cd = codec
+        w = cd.write_request!(Request.new(service_method: p.service_method, seq: seq), p.args)
+        if w.err? {
+          gone: Pending? = st.lock { |s| s.pending.delete(seq) }
+          if q = gone {
+            deliver(q.done, Call.new(service_method: q.service_method, args: q.args, reply: "", error: RpcError.Failure(w.err.unwrap.message)))
+          }
+        }
+      }
+    }
+  }
+
+  # Closes the connection; calls still waiting fail. A second close fails
+  # with Shutdown.
+  pub def close! -> ~Unit {
+    was = st.lock { |s|
+      c = s.closing
+      s.closing = true
+      c
+    }
+    fail RpcError.Shutdown if was
+    cd = codec
+    cd.~close!
+  }
+}
+
+def deliver(ch: Chan[Call], c: Call) {
+  select {
+    when ch.send(c) => nil
+    else => nil
+  }
+}
+
+# The client's reading loop (Go's input).
+def client_input[C: ClientCodec](cl: Client[C]) {
+  cd = cl.codec
+  err = RpcError.Failure("")
+  eof = false
+  loop {
+    h = cd.read_response_header!
+    if h.err? {
+      err = RpcError.Failure(h.err.unwrap.message)
+      break
+    }
+    ho = h.unwrap
+    if !ho.present? {
+      eof = true
+      break
+    }
+    resp = ho.unwrap
+    seq = resp.seq
+    call: Pending? = cl.st.lock { |s| s.pending.delete(seq) }
+    body = cd.read_response_body!
+    if body.err? {
+      err = RpcError.Failure("reading error body: " + body.err.unwrap.message)
+      if p = call {
+        deliver(p.done, Call.new(service_method: p.service_method, args: p.args, reply: "", error: err))
+      }
+      break
+    }
+    if p = call {
+      if resp.error != "" {
+        deliver(p.done, Call.new(service_method: p.service_method, args: p.args, reply: "", error: RpcError.ServerError(resp.error)))
+      } else {
+        deliver(p.done, Call.new(service_method: p.service_method, args: p.args, reply: body.unwrap, error: none))
+      }
+    }
+  }
+  res: ([Pending], Bool) = cl.reqs.lock { |_|
+    cl.st.lock { |s|
+      s.shutdown = true
+      out: [Pending] = []
+      for _, p in s.pending { out << p }
+      s.pending = {}
+      (out, s.closing)
+    }
+  }
+  left, closing = res
+  if eof {
+    err = closing ? RpcError.Shutdown : RpcError.Failure("unexpected EOF")
+  }
+  for p in left {
+    deliver(p.done, Call.new(service_method: p.service_method, args: p.args, reply: "", error: err))
+  }
+}
+
+# A client over codec; a task of its own reads the responses.
+pub def new_client_with_codec[C: ClientCodec](codec: C) -> Client[C] {
+  pm: Map[Int, Pending] = {}
+  cl = Client.new(codec: codec, st: Mutex.new(ClientState.new(seq: 0, pending: pm, closing: false, shutdown: false)), reqs: Mutex.new(0))
+  c2 = cl
+  spawn { client_input(c2) }
+  cl
+}
+
+# A client over conn with the default (JSON lines) codec.
+pub def new_client[C: io.ReadWriteCloser](conn: C) -> Client[LineClientCodec[C]] {
+  new_client_with_codec(new_client_codec(conn))
+}
+
+# Connects to addr and makes a client with the default codec.
+pub def dial(network: Str, addr: Str) -> ~Client[LineClientCodec[net.Conn]] {
+  c = ~net.dial(network, addr)
+  new_client(c)
+}

@@ -1140,13 +1140,15 @@ pub fn bind_tparams(te: &TypeExpr, t: &Ty, tps: &[TParam], out: &mut HashMap<Str
                 }
             }
         }
+        // `Mutex[State[T]]`, `Chan[T]`, ...: through the builtin containers.
+        (TypeExpr::App(n, args, _), Ty::Mutex(x) | Ty::Atomic(x) | Ty::Chan(x) | Ty::Pool(x)) if args.len() == 1 && matches!(n.as_str(), "Mutex" | "Atomic" | "Chan" | "Pool") => {
+            bind_tparams(&args[0], x, tps, out);
+        }
         (TypeExpr::App(n, args, _), t) => {
             if let Some((base, targs)) = inst_args(t) {
-                // `pkg.Name[T]` written in another package names the
-                // instance's base qualified by its import path
-                // (`net/textproto.Reader`); inside that package it is
-                // written unqualified (`Reader[R]`).
-                if base == *n || base.ends_with(&format!("/{n}")) || base.ends_with(&format!(".{n}")) {
+                // (a type of another package is known by its qualified name)
+                let last = |s: &str| s.rsplit('.').next().unwrap_or(s).to_string();
+                if base == *n || last(&base) == last(n) {
                     for (a, x) in args.iter().zip(&targs) {
                         bind_tparams(a, x, tps, out);
                     }
@@ -2081,9 +2083,18 @@ impl<'w, 'a> FnCx<'w, 'a> {
                                 kind: ExprKind::Call { recv: None, name: n.clone(), name_span: sp, args: names.iter().map(|a| Expr { id, kind: ExprKind::Name(a.clone()), span: sp }).collect(), block: None, block_sym: None },
                                 span: sp,
                             };
+                            // A fallible def: the lambda is fallible too, and its
+                            // body (which produces the T of `~T`) propagates.
+                            let call = if d.fallible { Expr { id, kind: ExprKind::Try(Box::new(call)), span: sp } } else { call };
+                            let ret = if d.fallible {
+                                let t = d.ret.clone().unwrap_or(TypeExpr::Named("Unit".into(), sp));
+                                Some(TypeExpr::Result(Box::new(t), d.errs.clone(), sp))
+                            } else {
+                                d.ret.clone()
+                            };
                             let body = Block { id, params: names.iter().map(|a| (a.clone(), sp)).collect(), body: vec![Stmt { kind: StmtKind::Expr(call), span: sp }], span: sp };
                             let params = names.into_iter().zip(&d.params).map(|(name, p)| Param { name, ty: p.ty.clone(), span: sp }).collect();
-                            let lam = Expr { id, kind: ExprKind::Lambda(params, d.ret.clone(), Box::new(body)), span: sp };
+                            let lam = Expr { id, kind: ExprKind::Lambda(params, ret, Box::new(body)), span: sp };
                             return self.expr(&lam);
                         }
                     }
@@ -4657,6 +4668,12 @@ impl<'w, 'a> FnCx<'w, 'a> {
         let mut from_ret: HashMap<String, Ty> = d.tparams.iter().map(|tp| tp.name.clone()).zip(owner_targs.iter().cloned()).collect();
         if let (Some(want), Some(ret)) = (self.want_hint.clone(), d.ret.as_ref()) {
             let want = self.resolve(&want);
+            // A fallible def's `ret` is the T of its `~T`: a held `~T` wanted
+            // (`x: ~Args = h.get`) binds through the Result.
+            let want = match want {
+                Ty::Result(x) if d.fallible => *x,
+                w => w,
+            };
             bind_tparams(ret, &want, &d.tparams, &mut from_ret);
         }
         let mut extra = vec![];
@@ -4802,6 +4819,14 @@ impl<'w, 'a> FnCx<'w, 'a> {
     fn const_call_named(&mut self, c: &str, named: Option<Ty>, csp: Span, name: &str, name_span: Span, args: &[Expr], block: Option<&Block>, sp: Span) -> R<TExpr> {
         let argv = |cx: &mut Self| args.iter().map(|a| cx.value(a)).collect::<R<Vec<_>>>();
         let named = named.or_else(|| self.w.structs.get(c).cloned());
+        // `T.from_json(s)` inside a generic def: `T` is bound to a concrete type in
+        // this instance, whose static methods are found under its own name.
+        let real: Option<String> = named
+            .as_ref()
+            .and_then(|t| t.type_name())
+            .filter(|tn| *tn != c && !self.w.by_name.contains_key(&method_name(c, name)) && self.w.by_name.contains_key(&method_name(tn, name)))
+            .map(str::to_string);
+        let c = real.as_deref().unwrap_or(c);
         // `Point.from_json(s)`: a static method (`def self.from_json`), a def of the
         // type without a receiver.
         if named.is_some() {

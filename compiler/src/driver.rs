@@ -51,7 +51,7 @@ impl Options {
         }
     }
     fn cflags(&self) -> Vec<&'static str> {
-        let mut f = vec!["-std=gnu11", "-fwrapv", "-w"];
+        let mut f = vec!["-std=gnu11", "-fwrapv", "-w", "-ffp-contract=off"];
         if self.sanitize {
             f.extend(["-O1", "-g", "-fsanitize=address,undefined", "-fno-sanitize-recover=all", "-fno-omit-frame-pointer"]);
         } else if self.release {

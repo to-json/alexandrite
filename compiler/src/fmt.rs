@@ -46,7 +46,7 @@ fn op(t: &Tok) -> Option<&'static str> {
 
 fn value_end(t: &Tok) -> bool {
     match t {
-        Tok::Ident(_) | Tok::Const(_) | Tok::Int(_) | Tok::BigInt(_) | Tok::Float(..) | Tok::Str(_) | Tok::Interp(_) | Tok::Cmd(_) | Tok::Sym(_) => true,
+        Tok::Ident(_) | Tok::Const(_) | Tok::Int(_) | Tok::BigInt(_) | Tok::Float(..) | Tok::Imag(..) | Tok::Str(_) | Tok::Interp(_) | Tok::Cmd(_) | Tok::Sym(_) => true,
         Tok::Kw(k) => matches!(k, Kw::True | Kw::False | Kw::Nil | Kw::None),
         Tok::Op(o) => matches!(*o, ")" | "]" | "}"),
         _ => false,
@@ -54,7 +54,7 @@ fn value_end(t: &Tok) -> bool {
 }
 
 fn wordish(t: &Tok) -> bool {
-    matches!(t, Tok::Ident(_) | Tok::Const(_) | Tok::Int(_) | Tok::BigInt(_) | Tok::Float(..) | Tok::Str(_) | Tok::Interp(_) | Tok::Cmd(_) | Tok::Sym(_) | Tok::Kw(_))
+    matches!(t, Tok::Ident(_) | Tok::Const(_) | Tok::Int(_) | Tok::BigInt(_) | Tok::Float(..) | Tok::Imag(..) | Tok::Str(_) | Tok::Interp(_) | Tok::Cmd(_) | Tok::Sym(_) | Tok::Kw(_))
 }
 
 const ALWAYS_BIN: &[&str] = &[

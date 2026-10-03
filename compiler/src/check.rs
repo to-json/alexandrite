@@ -1180,6 +1180,11 @@ fn in_current_pkg(n: &str, structs: &Structs) -> bool {
 /// own type; the builtins stay reachable as `I64` and `F64`. (A main file
 /// can't: its type names aren't qualified, so they would collide with the
 /// builtins'. `alx test` checks such a package under its import path.)
+/// The builtin `Complex` (D53, declared in builtin.alx).
+pub fn is_complex(t: &Ty) -> bool {
+    matches!(t, Ty::Struct(n, _) if n == "Complex")
+}
+
 pub const SHADOWABLE: [&str; 2] = ["Int", "Float"];
 
 /// Does `n` name a builtin type that the current code shadows with its own?
@@ -2286,6 +2291,10 @@ impl<'w, 'a> FnCx<'w, 'a> {
                 if t == Ty::Float || t.int_kind().is_some() {
                     return Ok(self.mk(TK::Neg(Box::new(x)), t, sp));
                 }
+                if is_complex(&t) {
+                    let def = self.w.by_name[&method_name("Complex", "__neg")];
+                    return self.call_def(def, "__neg", sp, vec![x], sp);
+                }
                 self.expect(&x.ty, &Ty::Int, x.span, "negation")?;
                 self.mk(TK::Neg(Box::new(x)), Ty::Int, sp)
             }
@@ -2456,6 +2465,8 @@ impl<'w, 'a> FnCx<'w, 'a> {
                 let mut out = vec![];
                 for it in items {
                     let v = self.value(it)?;
+                    let elr = self.resolve(&el);
+                    let v = if is_complex(&elr) { self.coerce(v, &elr)? } else { v };
                     self.expect(&v.ty, &el, v.span, "array element")?;
                     out.push(v);
                 }
@@ -2686,6 +2697,13 @@ impl<'w, 'a> FnCx<'w, 'a> {
             return Ok(self.mk(TK::Array(items), want, e.span));
         }
         let TK::Const(v) = &e.kind else { return Ok(e) };
+        // A numeric constant where a Complex is wanted: `Complex.new(v, 0)`.
+        if is_complex(&want) {
+            let sp = e.span;
+            let re = self.coerce(e, &Ty::Float)?;
+            let im = self.coerce(self.mk(TK::Const(ConstVal::Int(0.into())), Ty::Int, sp), &Ty::Float)?;
+            return Ok(self.mk(TK::M(M::StructNew, None, vec![re, im], None), want.clone(), sp));
+        }
         match &want {
             Ty::Float => {
                 let q = match v {
@@ -4025,6 +4043,22 @@ impl<'w, 'a> FnCx<'w, 'a> {
             self.expect(&r.ty, &Ty::Bool, r.span, &format!("`{}`", op.text()))?;
             return Ok(self.mk(TK::Bin(op, Box::new(l), Box::new(r)), Ty::Bool, sp));
         }
+        // Complex (D53): a numeric constant on either side adapts (`c * 2`, `1 + 2i`).
+        let (l, r) = {
+            let (lt, rt) = (self.resolve(&l.ty), self.resolve(&r.ty));
+            if is_complex(&lt) && !is_complex(&rt) && matches!(r.kind, TK::Const(_)) {
+                let r = self.coerce(r, &lt)?;
+                (l, r)
+            } else if is_complex(&rt) && !is_complex(&lt) && matches!(l.kind, TK::Const(_)) {
+                let l = self.coerce(l, &rt)?;
+                (l, r)
+            } else {
+                if (is_complex(&lt) != is_complex(&rt)) && matches!(lt.clone(), Ty::Float | Ty::Int | Ty::IntK(_)) | matches!(rt.clone(), Ty::Float | Ty::Int | Ty::IntK(_)) && matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Eq | BinOp::Ne) {
+                    return Err(Diag::new(sp, format!("`{}` between {} and {}: make the number a Complex with `Complex.new(x, 0)` (Go's complex(x, 0))", op.text(), lt.show(), rt.show())));
+                }
+                (l, r)
+            }
+        };
         // Operators on structs: their methods (`def +(o)`, `def ==(o)`, `def <=>(o)`).
         let lres = self.resolve(&l.ty);
         if let Some(sn) = lres.type_name() {

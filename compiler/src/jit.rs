@@ -250,7 +250,38 @@ fn resolve_c_symbol(name: &str) -> Option<usize> {
         return own;
     }
     let c = CString::new(name).ok()?;
-    let p = unsafe { libc::dlsym(libc::RTLD_DEFAULT, c.as_ptr()) };
+    let mut p = unsafe { libc::dlsym(libc::RTLD_DEFAULT, c.as_ptr()) };
+    if p.is_null() {
+        static DIRS_LOADED: std::sync::Once = std::sync::Once::new();
+        DIRS_LOADED.call_once(|| {
+            let mut libs = vec![
+                "libraylib.so".to_string(),
+                "raylib/src/libraylib.so".to_string(),
+                "/home/j/alexandrite/raylib/src/libraylib.so".to_string(),
+            ];
+            if let Ok(exe) = std::env::current_exe() {
+                if let Some(parent) = exe.parent() {
+                    let ws = parent.join("../../raylib/src/libraylib.so");
+                    if ws.exists() {
+                        libs.push(ws.to_string_lossy().to_string());
+                    }
+                }
+            }
+            if let Ok(extra) = std::env::var("ALX_LIBS") {
+                for l in extra.split(':') {
+                    libs.insert(0, l.to_string());
+                }
+            }
+            for lib in libs {
+                if let Ok(cstr) = CString::new(lib) {
+                    unsafe {
+                        libc::dlopen(cstr.as_ptr(), libc::RTLD_NOW | libc::RTLD_GLOBAL);
+                    }
+                }
+            }
+        });
+        p = unsafe { libc::dlsym(libc::RTLD_DEFAULT, c.as_ptr()) };
+    }
     (!p.is_null()).then_some(p as usize)
 }
 

@@ -265,6 +265,33 @@ fn build_loaded(l: front::Loaded, file: &str, o: &Options) -> Result<PathBuf, Ex
     if o.release && !o.sanitize {
         cmd.arg(if cfg!(target_os = "macos") { "-Wl,-dead_strip" } else { "-Wl,--gc-sections" });
     }
+    let uses_raylib = lp.externs.iter().any(|x| {
+        matches!(x.sym.as_str(), "InitWindow" | "CloseWindow" | "BeginDrawing" | "EndDrawing" | "ClearBackground" | "WindowShouldClose")
+    });
+    if uses_raylib || std::env::var_os("ALX_RAYLIB").is_some() {
+        let rl_path = Path::new("raylib/src");
+        let ws_path = Path::new("/home/j/alexandrite/raylib/src");
+        if rl_path.exists() {
+            cmd.arg(format!("-L{}", rl_path.display()));
+            if let Ok(canon) = rl_path.canonicalize() {
+                cmd.arg(format!("-Wl,-rpath,{}", canon.display()));
+            } else {
+                cmd.arg(format!("-Wl,-rpath,{}", rl_path.display()));
+            }
+        } else if ws_path.exists() {
+            cmd.arg(format!("-L{}", ws_path.display()));
+            cmd.arg(format!("-Wl,-rpath,{}", ws_path.display()));
+        }
+        cmd.arg("-lraylib");
+        if !cfg!(target_os = "macos") {
+            cmd.arg("-lGL").arg("-lX11");
+        }
+    }
+    if let Ok(ldflags) = std::env::var("ALX_LDFLAGS") {
+        for arg in ldflags.split_whitespace() {
+            cmd.arg(arg);
+        }
+    }
     log(o, &format!("{stem}: compiling"));
     let st = cmd.status().map_err(|e| fail(format!("cannot run clang: {e}")))?;
     if !st.success() {

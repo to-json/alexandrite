@@ -1,0 +1,113 @@
+import "bytes"
+import "crypto"
+import "crypto/sha256"
+import "encoding/base64"
+import "encoding/hex"
+
+# Go's crypto/mldsa/mldsa_wycheproof_test.go, translated: the helpers here,
+# the vectors (converted from the Wycheproof JSON files) in
+# vec_wycheproof{44,65,87}_test.alx.
+#
+#   TestVerifyWycheproof                  wv: all 180 ML-DSA-44 tests; for
+#     ML-DSA-65 and -87, of each run of tests with the same result and flags
+#     in a group the first 10 and every 5th after (123 of 210 and 133 of
+#     241), which trims the long InfinityNormViolation, ZeroPublicKey and
+#     ManySteps runs (the full files would be 5 MB of alx).
+#   TestSignSeedWycheproof and            ws: all tests; signatures and
+#   TestMLDSASignSeedRandomizedWycheproof     public keys are compared by
+#                                             SHA-256 (the vectors carry them
+#                                             in full)
+#   TestMLDSANoSeedWycheproof             wn: every group's key
+#
+# Go's ShouldPass is result == "valid" (these files have no "acceptable").
+
+def d64(s: Str) -> [Byte] { base64.std_encoding.decode_string(s).unwrap }
+
+def dh(s: Str) -> [Byte] { hex.decode_string(s).unwrap }
+
+def sha256_hex(b: [Byte]) -> Str {
+  d = sha256.new()
+  d.write!(b)
+  hex.encode_to_string(d.sum([]))
+}
+
+# One verify test: public key pk, hex msg and ctx, base64 sig.
+def wv(params: Parameters, pk: [Byte], id: Int, msg: Str, c: Str, sig: Str, valid: Bool) {
+  r = new_public_key(params, pk)
+  if r.err? {
+    assert !valid, "tc #{id}: NewPublicKey: #{r.err.unwrap.message}"
+    return
+  }
+  pub = r.unwrap
+  assert pub.bytes == pk, "tc #{id}: public key roundtrip mismatch"
+  opts = Options.new(context: Str.from_bytes(dh(c)))
+  err = verify(pub, dh(msg), d64(sig), opts).err?
+  assert err == !valid, "tc #{id}: verify: valid #{valid}, failed #{err}"
+}
+
+# One sign test with a seed key: Go's runSignTest (deterministic, skipped
+# for Randomized tests) and runRandomizedSignTest (with rnd, zero if none),
+# and sign_options with rnd from a reader.
+def ws(params: Parameters, seed: Str, pk_hash: Str, id: Int, has_msg: Bool, msg: Str, c: Str, mu: Str, rnd: Str, sig_hash: Str, valid: Bool, randomized: Bool) {
+  r = new_private_key(params, dh(seed))
+  if r.err? {
+    assert !valid, "tc #{id}: NewPrivateKey: #{r.err.unwrap.message}"
+    return
+  }
+  priv = r.unwrap
+  # the sign vectors double as key generation vectors
+  assert pk_hash == "" || sha256_hex(priv.public_key.bytes) == pk_hash, "tc #{id}: public key mismatch"
+  opts = Options.new(context: Str.from_bytes(dh(c)))
+  m = dh(msg)
+  mu_b = dh(mu)
+  random = rnd == "" ? [0.as_u8; 32] : dh(rnd)
+
+  if !randomized {
+    check_sign(id, priv, has_msg, mu != "", sig_hash, valid,
+      priv.sign_deterministic_options(m, opts), priv.sign_deterministic(mu_b, crypto.MLDSAMu))
+    if has_msg && valid {
+      sig = priv.sign_deterministic_options(m, opts).unwrap
+      assert verify(priv.public_key, m, sig, opts).ok?, "tc #{id}: verify of own signature"
+    }
+  }
+  check_sign(id, priv, has_msg, mu != "", sig_hash, valid,
+    testing_only_sign_with_random(priv, m, opts.context, random),
+    testing_only_sign_external_mu_with_random(priv, mu_b, random))
+  check_sign(id, priv, has_msg, mu != "", sig_hash, valid,
+    priv.sign_options(bytes.new_buffer(random + []), m, opts),
+    priv.sign(bytes.new_buffer(random + []), mu_b, crypto.MLDSAMu))
+  if valid && mu != "" {
+    sig = testing_only_sign_external_mu_with_random(priv, mu_b, random).unwrap
+    assert verify_external_mu(priv.public_key, mu_b, sig).ok?, "tc #{id}: verify_external_mu of own signature"
+  }
+}
+
+# The results of signing the message (if has_msg) and μ (if has_mu)
+# against the expected hash.
+def check_sign(id: Int, priv: PrivateKey, has_msg: Bool, has_mu: Bool, sig_hash: Str, valid: Bool, by_msg: ~[Byte], by_mu: ~[Byte]) {
+  failed = (has_msg && by_msg.err?) || (has_mu && by_mu.err?)
+  if failed || !valid {
+    assert failed == !valid, "tc #{id}: sign: valid #{valid}, failed #{failed}"
+    return
+  }
+  if has_msg {
+    assert sha256_hex(by_msg.unwrap) == sig_hash, "tc #{id}: signature mismatch (msg)"
+  }
+  if has_mu {
+    assert sha256_hex(by_mu.unwrap) == sig_hash, "tc #{id}: signature mismatch (mu)"
+  }
+}
+
+# One semi-expanded key (base64) and the hash of its public key; valid
+# when some test of the group expects success.
+def wn(sk: Str, pk_hash: Str, valid: Bool) {
+  r = testing_only_new_private_key_from_semi_expanded(d64(sk))
+  if r.err? {
+    assert !valid, "semi-expanded key rejected: #{r.err.unwrap.message}"
+    return
+  }
+  priv = r.unwrap
+  assert pk_hash == "" || sha256_hex(priv.public_key.bytes) == pk_hash, "public key mismatch"
+  # the expansion round-trips
+  assert testing_only_private_key_semi_expanded_bytes(priv) == d64(sk), "semi-expanded encoding round trip"
+}

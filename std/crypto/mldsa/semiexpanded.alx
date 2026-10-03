@@ -1,0 +1,211 @@
+#![overflow(wrap)]
+# The semi-expanded private key format of FIPS 204 (Go's
+# crypto/internal/fips140/mldsa/semiexpanded.go), for testing: ACVP and
+# Wycheproof provide and expect such keys. Seeds are the format for storage
+# and exchange.
+
+import "crypto/rand"
+
+# The number of bits needed to represent x (Go's bits.Len).
+def bit_len(x: Int) -> Int {
+  n = 0
+  v = x
+  while v > 0 {
+    n += 1
+    v = v >> 1
+  }
+  n
+}
+
+def semi_expanded_priv_key_size(p: Params) -> Int {
+  eta_bitlen = bit_len(p.eta) + 1
+  # ρ + K + tr + l × n × η-bit coefficients of s₁ + k × n × η-bit
+  # coefficients of s₂ + k × n × 13-bit coefficients of t₀
+  32 + 32 + 64 + p.l * N * eta_bitlen / 8 + p.k * N * eta_bitlen / 8 + p.k * N * 13 / 8
+}
+
+# Test hook (Go's TestingOnlyNewPrivateKeyFromSemiExpanded): a PrivateKey
+# from a semi-expanded private key encoding. It rejects inconsistent keys.
+# The key's bytes (its seed) are random, not a seed of the key.
+pub def testing_only_new_private_key_from_semi_expanded(sk: [Byte]) -> ~PrivateKey {
+  p = params44()
+  if sk.size == semi_expanded_priv_key_size(params44()) {
+    p = params44()
+  } else if sk.size == semi_expanded_priv_key_size(params65()) {
+    p = params65()
+  } else if sk.size == semi_expanded_priv_key_size(params87()) {
+    p = params87()
+  } else {
+    fail MldsaError.InvalidSemiExpandedSize
+  }
+  k = p.k
+  l = p.l
+
+  rho = sk[0...32] + []
+  kk = sk[32...64] + []
+  tr = sk[64...128] + []
+  o = 128
+  s1 = [0.as_u32; l * N]
+  s2 = [0.as_u32; k * N]
+  t0 = [0.as_u32; k * N]
+  length = N * bit_len(p.eta * 2) / 8
+  i = 0
+  while i < l {
+    ~bit_unpack_slow(poly(s1, i), sk[o...o + length], p.eta, p.eta)
+    o += length
+    i += 1
+  }
+  i = 0
+  while i < k {
+    ~bit_unpack_slow(poly(s2, i), sk[o...o + length], p.eta, p.eta)
+    o += length
+    i += 1
+  }
+  # 2^(d-1)
+  bound = 1 << (13 - 1)
+  length = N * 13 / 8
+  i = 0
+  while i < k {
+    ~bit_unpack_slow(poly(t0, i), sk[o...o + length], bound - 1, bound)
+    o += length
+    i += 1
+  }
+
+  a = [0.as_u32; k * l * N]
+  compute_matrix_a(a, rho, p)
+  s1_hat = s1 + []
+  s2_hat = s2 + []
+  t0_hat = t0 + []
+  i = 0
+  while i < l {
+    ntt(poly(s1_hat, i))
+    i += 1
+  }
+  i = 0
+  while i < k {
+    ntt(poly(s2_hat, i))
+    ntt(poly(t0_hat, i))
+    i += 1
+  }
+
+  # Something must go in the seed, and random bytes are safer than
+  # anything predictable.
+  seed = [0.as_u8; 32]
+  rand.read(seed)
+
+  # t1 has to be recomputed from ρ, s1 and s2 to make the public key; t0
+  # and tr are checked against it (FIPS 204 says skDecode should only see
+  # trusted input, but this checks everything).
+  t1 = [0.as_u32; k * N]
+  t = [0.as_u32; N]
+  i = 0
+  while i < k {
+    copy(t, poly(s2_hat, i))
+    j = 0
+    while j < l {
+      ntt_mul_acc(t, poly(a, i * l + j), poly(s1_hat, j))
+      j += 1
+    }
+    inverse_ntt(t)
+    t1i = poly(t1, i)
+    t0i = poly(t0, i)
+    c = 0
+    while c < N {
+      t1i[c] = power2_round_hi(t[c])
+      fail MldsaError.InconsistentT0 if power2_round_lo(t[c]) != t0i[c]
+      c += 1
+    }
+    i += 1
+  }
+
+  raw = pk_encode(rho, t1, p)
+  fail MldsaError.InconsistentPublicKeyHash if compute_public_key_hash(raw) != tr
+  pk = PublicKey.new(raw: raw, prm: p, tr: tr)
+  PrivateKey.new(seed: seed, pk: pk, a: a, t1: compute_t1_hat(t1, k), s1: s1_hat, s2: s2_hat, t0: t0_hat, kk: kk)
+}
+
+# Test hook (Go's TestingOnlyPrivateKeySemiExpandedBytes): the
+# semi-expanded encoding of sk.
+pub def testing_only_private_key_semi_expanded_bytes(sk: PrivateKey) -> [Byte] {
+  p = sk.pk.prm
+  out: [Byte] = []
+  out = out + sk.pk.raw[0...32]
+  out = out + sk.kk
+  out = out + sk.pk.tr
+  t = [0.as_u32; N]
+  i = 0
+  while i < p.l {
+    copy(t, poly(sk.s1, i))
+    inverse_ntt(t)
+    out = bit_pack_slow(out, t, p.eta, p.eta)
+    i += 1
+  }
+  i = 0
+  while i < p.k {
+    copy(t, poly(sk.s2, i))
+    inverse_ntt(t)
+    out = bit_pack_slow(out, t, p.eta, p.eta)
+    i += 1
+  }
+  bound = 1 << (13 - 1)
+  i = 0
+  while i < p.k {
+    copy(t, poly(sk.t0, i))
+    inverse_ntt(t)
+    out = bit_pack_slow(out, t, bound - 1, bound)
+    i += 1
+  }
+  out
+}
+
+# BitPack(r, a, b): each b − r[i] (in [0, a + b]) in bitlen(a + b) bits,
+# little-endian, appended to buf.
+def bit_pack_slow(buf: [Byte], r: [U32], a: Int, b: Int) -> [Byte] {
+  bitlen = bit_len(a + b)
+  panic("mldsa: internal error: invalid bitlen") if bitlen <= 0 || bitlen > 16
+  out = buf
+  acc: U32 = 0
+  acc_bits = 0
+  i = 0
+  while i < N {
+    w = (b.as_i32 - field_centered_mod(r[i])).as_u32
+    acc = acc | (w << acc_bits.as_u32)
+    acc_bits += bitlen
+    while acc_bits >= 8 {
+      out << acc.as_u8
+      acc = acc >> 8
+      acc_bits -= 8
+    }
+    i += 1
+  }
+  out << acc.as_u8 if acc_bits > 0
+  out
+}
+
+# BitUnpack(v, a, b) into r; fails on a coefficient over a + b.
+def bit_unpack_slow(r: [U32], v: [Byte], a: Int, b: Int) -> ~Unit {
+  bitlen = bit_len(a + b)
+  panic("mldsa: internal error: invalid bitlen") if bitlen <= 0 || bitlen > 16
+  fail MldsaError.InvalidUnpackLength if v.size != N * bitlen / 8
+  mask: U32 = ((1 << bitlen) - 1).as_u32
+  max_value = (a + b).as_u32
+  acc: U32 = 0
+  acc_bits = 0
+  vi = 0
+  i = 0
+  while i < N {
+    while acc_bits < bitlen {
+      if vi < v.size {
+        acc = acc | (v[vi].as_u32 << acc_bits.as_u32)
+        vi += 1
+        acc_bits += 8
+      }
+    }
+    w = acc & mask
+    fail MldsaError.CoefficientOutOfRange if w > max_value
+    r[i] = field_sub_to_montgomery(b.as_u32, w)
+    acc = acc >> bitlen.as_u32
+    acc_bits -= bitlen
+    i += 1
+  }
+}

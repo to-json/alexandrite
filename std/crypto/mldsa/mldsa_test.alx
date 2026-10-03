@@ -1,0 +1,291 @@
+import "crypto"
+import "crypto/rand"
+import "crypto/sha3"
+import "encoding/hex"
+
+# Go's crypto/mldsa/mldsa_test.go, translated (the benchmarks are in
+# bench_test.alx).
+#
+# Not translated or changed:
+#   - TestAccumulated: the 100-vector runs are here; the 10k runs (Go skips
+#     them in -short mode) and the 60M runs (behind a flag) are not.
+#   - TestAllocations: allocation counting.
+#   - TestSign's crypto.Hash(0) case: alx's Hash has no zero value (its
+#     hash_func is never none; the fake opts with none covers the path).
+#   - TestEqualWrongType's comparisons with other types are compile errors
+#     in alx (Equal takes the same key type); the distinct-keys part is
+#     kept.
+#   - TestUninitialized's "typed nil opts" cases: alx has no nil pointers;
+#     sign/sign_deterministic with Options.new are the same path.
+#   - Contexts: Go passes &Options{Context: c} to Sign; here
+#     sign_options / sign_deterministic_options (see the header).
+
+def b(s: Str) -> [Byte] { s.bytes.to_a }
+
+def all_parameters -> [Parameters] { [mldsa44(), mldsa65(), mldsa87()] }
+
+def ctx(c: Str) -> Options { Options.new(context: c) }
+
+# A crypto.SignerOpts whose hash_func is h, to drive the dispatch of sign
+# without Options.
+struct FakeSignerOpts {
+  h: crypto.Hash?
+
+  def hash_func -> crypto.Hash? { h }
+}
+
+def check_accumulated(params: Parameters, n: Int, expected: Str) {
+  s = sha3.new_shake128()
+  o = sha3.new_shake128()
+  seed = [0.as_u8; PRIVATE_KEY_SIZE]
+  msg: [Byte] = []
+  i = 0
+  while i < n {
+    s.read!(seed)
+    dk = new_private_key(params, seed).unwrap
+    pk = dk.public_key.bytes
+    o.write!(pk).unwrap
+    sig = dk.sign_deterministic(msg, Options.new).unwrap
+    o.write!(sig).unwrap
+    pub = new_public_key(params, pk).unwrap
+    assert pub == dk.public_key, "public key mismatch"
+    verify(dk.public_key, msg, sig, Options.new).unwrap
+    i += 1
+  }
+  sum = [0.as_u8; 32]
+  o.read!(sum)
+  assert_eq hex.encode_to_string(sum), expected
+}
+
+test "Accumulated/ML-DSA-44/100" {
+  check_accumulated(mldsa44(), 100, "d51148e1f9f4fa1a723a6cf42e25f2a99eb5c1b378b3d2dbbd561b1203beeae4")
+}
+
+test "Accumulated/ML-DSA-65/100" {
+  check_accumulated(mldsa65(), 100, "8358a1843220194417cadbc2651295cd8fc65125b5a5c1a239a16dc8b57ca199")
+}
+
+test "Accumulated/ML-DSA-87/100" {
+  check_accumulated(mldsa87(), 100, "8c3ad714777622b8f21ce31bb35f71394f23bc0fcf3c78ace5d608990f3b061b")
+}
+
+test "GenerateKey" {
+  for params in all_parameters() {
+    k1 = generate_key(params).unwrap
+    k2 = generate_key(params).unwrap
+    assert !k1.equal?(k2), "two generated keys are equal"
+    k1x = new_private_key(params, k1.bytes).unwrap
+    assert k1.equal?(k1x), "generated key and re-parsed key are not equal"
+  }
+}
+
+test "ParametersIdentity" {
+  assert mldsa44() == mldsa44() && mldsa65() == mldsa65() && mldsa87() == mldsa87(), "different values across calls"
+  assert mldsa44() != mldsa65() && mldsa65() != mldsa87() && mldsa44() != mldsa87(), "distinct sets compare equal"
+}
+
+# μ = SHAKE256(SHAKE256(pk, 64) || 0x00 || ctxlen || ctx || msg, 64), FIPS
+# 204, for the external μ signing path.
+def compute_mu(pk: [Byte], c: [Byte], msg: [Byte]) -> [Byte] {
+  tr = sha3.new_shake256()
+  tr.write!(pk).unwrap
+  tr_out = [0.as_u8; 64]
+  tr.read!(tr_out)
+  h = sha3.new_shake256()
+  h.write!(tr_out).unwrap
+  h.write!([0.as_u8, c.size.as_u8]).unwrap
+  h.write!(c).unwrap
+  h.write!(msg).unwrap
+  out = [0.as_u8; 64]
+  h.read!(out)
+  out
+}
+
+test "Sign" {
+  for params in all_parameters() {
+    sk = generate_key(params).unwrap
+    pk = sk.public_key
+    msg = b("test message")
+    r = rand.reader()
+
+    # Go's nil opts and &Options{} are equivalent, and interoperate with an
+    # empty Verify context
+    sig1 = sk.sign(r, msg, Options.new).unwrap
+    assert_eq sig1.size, params.signature_size
+    verify(pk, msg, sig1, Options.new).unwrap
+    sig2 = sk.sign_options(r, msg, Options.new).unwrap
+    verify(pk, msg, sig2, Options.new).unwrap
+
+    # a non-Options SignerOpts whose hash_func is none signs directly
+    sig3 = sk.sign(r, msg, FakeSignerOpts.new(h: none)).unwrap
+    verify(pk, msg, sig3, Options.new).unwrap
+
+    # a wrong hash_func fails
+    assert sk.sign(r, msg, crypto.SHA256).err?, "Sign with crypto.SHA256 opts: want error"
+    assert sk.sign_deterministic(msg, crypto.SHA256).err?, "SignDeterministic with crypto.SHA256 opts: want error"
+    assert sk.sign(r, msg, FakeSignerOpts.new(h: crypto.SHA256)).err?, "Sign with fake SHA256 opts: want error"
+
+    # deterministic signing with either form agrees byte for byte
+    det_a = sk.sign_deterministic(msg, Options.new).unwrap
+    det_b = sk.sign_deterministic_options(msg, Options.new).unwrap
+    assert det_a == det_b, "SignDeterministic with nil and &Options{} differ"
+
+    # a different context gives a different signature, which only verifies
+    # with that context
+    det_ctx = sk.sign_deterministic_options(msg, ctx("ctx")).unwrap
+    assert det_ctx != det_a, "SignDeterministic with empty and non-empty context match"
+    assert verify(pk, msg, det_ctx, Options.new).err?, "Verify of context signature with empty context"
+    verify(pk, msg, det_ctx, ctx("ctx")).unwrap
+
+    # a context over 255 bytes is rejected
+    long_ctx = "x" * 256
+    assert sk.sign_options(r, msg, ctx(long_ctx)).err?, "Sign with 256-byte context"
+    assert sk.sign_deterministic_options(msg, ctx(long_ctx)).err?, "SignDeterministic with 256-byte context"
+    assert verify(pk, msg, det_a, ctx(long_ctx)).err?, "Verify with 256-byte context"
+
+    # a tampered signature doesn't verify
+    sig_tampered = sig1 + []
+    sig_tampered[sig_tampered.size / 2] = sig_tampered[sig_tampered.size / 2] ^ 1
+    assert verify(pk, msg, sig_tampered, Options.new).err?, "Verify of tampered signature"
+
+    # nor a modified message
+    msg_tampered = msg + []
+    msg_tampered[0] = msg_tampered[0] ^ 1
+    assert verify(pk, msg_tampered, sig1, Options.new).err?, "Verify of modified message"
+
+    # nor a signature by another key
+    sk_other = generate_key(params).unwrap
+    sig_other = sk_other.sign_deterministic(msg, Options.new).unwrap
+    assert verify(pk, msg, sig_other, Options.new).err?, "Verify of signature from a different key"
+  }
+}
+
+test "ExternalMu" {
+  for params in all_parameters() {
+    sk = generate_key(params).unwrap
+    pk = sk.public_key
+    pk_bytes = pk.bytes
+    msg = b("hello mu")
+    r = rand.reader()
+
+    for c in ["", "ctx"] {
+      mu = compute_mu(pk_bytes, b(c), msg)
+      sig = sk.sign(r, mu, crypto.MLDSAMu).unwrap
+      verify(pk, msg, sig, ctx(c)).unwrap
+      det_sig = sk.sign_deterministic(mu, crypto.MLDSAMu).unwrap
+      verify(pk, msg, det_sig, ctx(c)).unwrap
+      det_sig2 = sk.sign_deterministic(mu, crypto.MLDSAMu).unwrap
+      assert det_sig == det_sig2, "SignDeterministic(MLDSAMu) is not deterministic"
+    }
+
+    # μ computed under one context doesn't verify under another
+    mu_a = compute_mu(pk_bytes, b("a"), msg)
+    sig_a = sk.sign(r, mu_a, crypto.MLDSAMu).unwrap
+    assert verify(pk, msg, sig_a, ctx("b")).err?, "MLDSAMu(ctx=a) signature verified with ctx=b"
+
+    sig_tampered = sig_a + []
+    sig_tampered[sig_tampered.size / 2] = sig_tampered[sig_tampered.size / 2] ^ 1
+    assert verify(pk, msg, sig_tampered, ctx("a")).err?, "tampered MLDSAMu signature verified"
+
+    # a μ of the wrong length is rejected
+    assert sk.sign(r, [0.as_u8; 32], crypto.MLDSAMu).err?, "Sign(MLDSAMu) with 32-byte input"
+    assert sk.sign_deterministic([0.as_u8; 32], crypto.MLDSAMu).err?, "SignDeterministic(MLDSAMu) with 32-byte input"
+  }
+}
+
+struct PublicKeyCase {
+  params: Parameters
+  name: Str
+  pk_size: Int
+  sig_size: Int
+}
+
+test "PublicKey" {
+  cases = [PublicKeyCase.new(params: mldsa44(), name: "ML-DSA-44", pk_size: MLDSA44_PUBLIC_KEY_SIZE, sig_size: MLDSA44_SIGNATURE_SIZE),
+    PublicKeyCase.new(params: mldsa65(), name: "ML-DSA-65", pk_size: MLDSA65_PUBLIC_KEY_SIZE, sig_size: MLDSA65_SIGNATURE_SIZE),
+    PublicKeyCase.new(params: mldsa87(), name: "ML-DSA-87", pk_size: MLDSA87_PUBLIC_KEY_SIZE, sig_size: MLDSA87_SIGNATURE_SIZE)]
+  for tc in cases {
+    assert_eq tc.params.to_s, tc.name
+    assert_eq tc.params.public_key_size, tc.pk_size
+    assert_eq tc.params.signature_size, tc.sig_size
+
+    sk = generate_key(tc.params).unwrap
+    pk = sk.public_key
+    assert pk.parameters == tc.params, "PublicKey.parameters"
+    assert_eq pk.bytes.size, tc.params.public_key_size
+    assert_eq sk.bytes.size, PRIVATE_KEY_SIZE
+
+    # round trips through new_private_key / new_public_key
+    sk2 = new_private_key(tc.params, sk.bytes).unwrap
+    assert sk.equal?(sk2), "PrivateKey round-trip not equal"
+    pk2 = new_public_key(tc.params, pk.bytes).unwrap
+    assert pk.equal?(pk2), "PublicKey round-trip not equal"
+  }
+}
+
+test "PublicIsASigner" {
+  # Go's `var _ crypto.Signer = (*PrivateKey)(nil)` and Public() returning
+  # the PublicKey
+  sk = generate_key(mldsa44()).unwrap
+  signer: crypto.Signer = sk
+  msg = b("signer")
+  sig = signer.sign(rand.reader(), msg, Options.new).unwrap
+  verify(sk.public_key, msg, sig, Options.new).unwrap
+  sig = crypto.sign_message(signer, rand.reader(), msg, Options.new).unwrap
+  verify(sk.public_key, msg, sig, Options.new).unwrap
+}
+
+test "EqualWrongType" {
+  # (comparisons with other types don't compile in alx)
+  sk = generate_key(mldsa44()).unwrap
+  sk2 = generate_key(mldsa44()).unwrap
+  assert !sk.equal?(sk2), "two random PrivateKeys are Equal"
+  assert !sk.public_key.equal?(sk2.public_key), "two random PublicKeys are Equal"
+}
+
+test "InvalidParameters" {
+  zero = Parameters.new
+  assert generate_key(zero).err?, "GenerateKey(zero Parameters)"
+  assert new_private_key(zero, [0.as_u8; PRIVATE_KEY_SIZE]).err?, "NewPrivateKey(zero Parameters)"
+  assert new_public_key(zero, [0.as_u8; MLDSA44_PUBLIC_KEY_SIZE]).err?, "NewPublicKey(zero Parameters)"
+}
+
+test "InvalidSize" {
+  for params in all_parameters() {
+    assert new_private_key(params, [0.as_u8; PRIVATE_KEY_SIZE - 1]).err?, "short seed"
+    assert new_private_key(params, [0.as_u8; PRIVATE_KEY_SIZE + 1]).err?, "long seed"
+    assert new_public_key(params, [0.as_u8; params.public_key_size - 1]).err?, "short encoding"
+    assert new_public_key(params, [0.as_u8; params.public_key_size + 1]).err?, "long encoding"
+
+    sk = generate_key(params).unwrap
+    msg = b("test message")
+    sig = sk.sign_deterministic(msg, Options.new).unwrap
+    assert verify(sk.public_key, msg, sig[0...sig.size - 1], Options.new).err?, "short signature"
+    assert verify(sk.public_key, msg, sig + [0.as_u8], Options.new).err?, "long signature"
+  }
+
+  # an ML-DSA-65 public key encoding is rejected as ML-DSA-44 (lengths)
+  sk65 = generate_key(mldsa65()).unwrap
+  assert new_public_key(mldsa44(), sk65.public_key.bytes).err?, "NewPublicKey(MLDSA44, MLDSA65 encoding)"
+}
+
+test "Uninitialized" {
+  msg = b("attacker-controlled message")
+  sig = [0.as_u8; MLDSA44_SIGNATURE_SIZE]
+  pk = PublicKey.new
+  assert verify(pk, msg, [], Options.new).err?, "empty signature"
+  assert verify(pk, msg, sig, Options.new).err?, "full length signature"
+  assert verify(pk, msg, sig, ctx("ctx")).err?, "full length signature/with context"
+  assert verify_external_mu(pk, [0.as_u8; 64], sig).err?, "external mu"
+
+  sk = PrivateKey.new
+  m = b("message")
+  r = rand.reader()
+  assert sk.sign(r, m, Options.new).err?, "Sign/nil opts"
+  assert sk.sign_options(r, m, Options.new).err?, "Sign/empty opts"
+  assert sk.sign(r, m, FakeSignerOpts.new(h: crypto.MLDSAMu)).err?, "Sign/mu opts"
+  assert sk.sign_deterministic(m, Options.new).err?, "SignDeterministic/nil opts"
+  assert sk.sign_deterministic_options(m, Options.new).err?, "SignDeterministic/empty opts"
+  assert sk.sign_deterministic(m, FakeSignerOpts.new(h: crypto.MLDSAMu)).err?, "SignDeterministic/mu opts"
+  assert testing_only_sign_with_random(sk, m, "", [0.as_u8; 32]).err?, "sign with random"
+}

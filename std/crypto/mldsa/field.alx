@@ -1,0 +1,786 @@
+#![overflow(wrap)]
+# The arithmetic of ML-DSA (Go's crypto/internal/fips140/mldsa/field.go):
+# the field ℤq, q = 2²³ - 2¹³ + 1, in the Montgomery domain, the NTT, the
+# samplers of FIPS 204, the bit packings and the hint functions.
+#
+# A field element is a U32 in [0, q) holding n * 2³² mod q. A ring element
+# (a polynomial of R_q) and an NTT element (of T_q) are both 256 U32s; this
+# port keeps them in [U32] slices, usually windows `poly(buf, i)` of one
+# larger slice holding a whole vector, and transforms them in place (Go
+# passes [256]fieldElement arrays by value: alx's fixed arrays are heap
+# allocated, issue #26, so the slices are allocated once per operation and
+# reused). The tuple results of Go's helpers (power2Round, decompose,
+# coeffFromHalfByte) are split into separate functions or inlined (tuples
+# cost a region mark/reset in loops, issue #29).
+#
+# Timing: as in Go, the arithmetic on secrets uses no branches or indexing
+# by secret values (masks and the select helpers below instead of ifs);
+# sampleInBall, useHint and the rejection checks are variable time where
+# Go's are (they only see public or discarded values). alx compiles to C or
+# its own JIT, which make no promise to keep a mask a mask, the same caveat
+# as crypto/subtle's.
+
+import "crypto/sha3"
+
+Q: U32 = 8380417
+Q64: U64 = 8380417
+# R² mod q, aka R in the Montgomery domain (R = 2³²).
+RR: U32 = 2365951
+# -q⁻¹ mod R.
+Q_NEG_INV: U32 = 4236238847
+# R mod q, aka 1 in the Montgomery domain.
+ONE: U32 = 4193792
+# (q - 1) * R mod q, aka -1 in the Montgomery domain.
+MINUS_ONE: U32 = 4186625
+# 256⁻¹ * R mod q.
+INV_N: U32 = 16382
+
+N = 256
+
+# Errors of the field and of key and signature decoding.
+pub error MldsaError {
+  InvalidParameters
+  InvalidSeedLength
+  InvalidPublicKeyLength
+  ContextTooLong
+  MessageHashLength
+  RandomLength
+  InvalidSignatureLength
+  InvalidSignature
+  InvalidSignatureEncoding
+  InvalidSignatureHintLength
+  ZeroPrivateKey
+  ZeroPublicKey
+  InvalidSignerOpts
+  UnreducedFieldElement
+  InvalidSemiExpandedSize
+  InvalidUnpackLength
+  CoefficientOutOfRange
+  InconsistentT0
+  InconsistentPublicKeyHash
+
+  def message -> Str {
+    case self {
+      InvalidParameters => "mldsa: invalid parameters"
+      InvalidSeedLength => "mldsa: invalid seed length"
+      InvalidPublicKeyLength => "mldsa: invalid public key length"
+      ContextTooLong => "mldsa: context too long"
+      MessageHashLength => "mldsa: invalid message hash length"
+      RandomLength => "mldsa: invalid random length"
+      InvalidSignatureLength => "mldsa: invalid signature length"
+      InvalidSignature => "mldsa: invalid signature"
+      InvalidSignatureEncoding => "mldsa: invalid signature encoding"
+      InvalidSignatureHintLength => "mldsa: internal error: invalid signature hint length"
+      ZeroPrivateKey => "mldsa: zero private key"
+      ZeroPublicKey => "mldsa: zero public key"
+      InvalidSignerOpts => "mldsa: invalid SignerOpts"
+      UnreducedFieldElement => "mldsa: unreduced field element"
+      InvalidSemiExpandedSize => "mldsa: invalid semi-expanded private key size"
+      InvalidUnpackLength => "mldsa: invalid input length for bitUnpackSlow"
+      CoefficientOutOfRange => "mldsa: coefficient out of range"
+      InconsistentT0 => "mldsa: semi-expanded private key inconsistent with t0"
+      InconsistentPublicKeyHash => "mldsa: semi-expanded private key inconsistent with public key hash"
+    }
+  }
+}
+
+# ---- constant-time helpers (Go's crypto/internal/constanttime) ----
+
+# yes if a <= b, no otherwise, in constant time.
+def ct_select_le(a: I32, b: I32, yes: I32, no: I32) -> I32 {
+  # all ones if a > b (b - a < 0), zero otherwise
+  mask = ((b.as_i64 - a.as_i64) >> 63).as_i32
+  (no & mask) | (yes & ^mask)
+}
+
+# yes if a == b, no otherwise, in constant time.
+def ct_select_eq(a: U32, b: U32, yes: U32, no: U32) -> U32 {
+  x = (a ^ b).as_u64
+  eq = ((x - 1) >> 63).as_u32
+  mask = 0.as_u32 - eq
+  (yes & mask) | (no & ^mask)
+}
+
+# 1 if a == b, 0 otherwise.
+def ct_byte_eq(a: Byte, b: Byte) -> Byte {
+  z = (a ^ b).as_u32
+  ((z - 1) >> 31).as_u8
+}
+
+# |x|, in constant time.
+def constant_time_abs(x: I32) -> U32 {
+  ct_select_le(0, x, x, 0 - x).as_u32
+}
+
+# ---- the field ----
+
+# a converted to the Montgomery domain, or none if a >= q.
+def field_to_montgomery(a: U32) -> U32? {
+  return none if a >= Q
+  field_montgomery_mul(a, RR)
+}
+
+# a - b converted to the Montgomery domain; a and b must be < q.
+def field_sub_to_montgomery(a: U32, b: U32) -> U32 {
+  field_montgomery_mul(a - b + Q, RR)
+}
+
+# a in Montgomery form back to the standard representation.
+def field_from_montgomery(a: U32) -> U32 {
+  field_montgomery_reduce(a.as_u64)
+}
+
+# r mod± q: r reduced to [−(q−1)/2, (q−1)/2].
+def field_centered_mod(r: U32) -> I32 {
+  x = field_from_montgomery(r).as_i32
+  ct_select_le(x, (Q / 2).as_i32, x, x - Q.as_i32)
+}
+
+# ||r||∞: the absolute value of r centered around 0.
+def field_infinity_norm(r: U32) -> U32 {
+  x = field_from_montgomery(r).as_i32
+  ct_select_le(x, (Q / 2).as_i32, x, Q.as_i32 - x).as_u32
+}
+
+# a reduced once; a < 2q.
+def field_reduce_once(a: U32) -> U32 {
+  x = a - Q
+  x + (Q & (0.as_u32 - (x >> 31)))
+}
+
+def field_add(a: U32, b: U32) -> U32 { field_reduce_once(a + b) }
+
+def field_sub(a: U32, b: U32) -> U32 { field_reduce_once(a - b + Q) }
+
+# a * b * R⁻¹ mod q.
+def field_montgomery_mul(a: U32, b: U32) -> U32 {
+  field_montgomery_reduce(a.as_u64 * b.as_u64)
+}
+
+# x * R⁻¹ mod q for x < q * R.
+def field_montgomery_reduce(x: U64) -> U32 {
+  t = x.as_u32 * Q_NEG_INV
+  u = (x + t.as_u64 * Q64) >> 32
+  field_reduce_once(u.as_u32)
+}
+
+# a * (b - c), fused to save a reduction.
+def field_montgomery_mul_sub(a: U32, b: U32, c: U32) -> U32 {
+  field_montgomery_reduce(a.as_u64 * (b - c + Q).as_u64)
+}
+
+# a * b + c * d, fused to save reductions.
+def field_montgomery_add_mul(a: U32, b: U32, c: U32, d: U32) -> U32 {
+  field_montgomery_reduce(a.as_u64 * b.as_u64 + c.as_u64 * d.as_u64)
+}
+
+# ---- polynomials ----
+
+# Polynomial i of a vector stored back to back in buf.
+def poly(buf: [U32], i: Int) -> [U32] { buf[i * N...(i + 1) * N] }
+
+# s = a + b (s may be a or b).
+def poly_add(s: [U32], a: [U32], b: [U32]) {
+  i = 0
+  while i < N {
+    s[i] = field_add(a[i], b[i])
+    i += 1
+  }
+  nil
+}
+
+# s = a - b (s may be a or b).
+def poly_sub(s: [U32], a: [U32], b: [U32]) {
+  i = 0
+  while i < N {
+    s[i] = field_sub(a[i], b[i])
+    i += 1
+  }
+  nil
+}
+
+# p = a ∘ b (NTT multiplication; p may be a or b).
+def ntt_mul(p: [U32], a: [U32], b: [U32]) {
+  i = 0
+  while i < N {
+    p[i] = field_montgomery_mul(a[i], b[i])
+    i += 1
+  }
+  nil
+}
+
+# acc = acc + a ∘ b (Go's polyAdd(acc, nttMul(a, b))).
+def ntt_mul_acc(acc: [U32], a: [U32], b: [U32]) {
+  i = 0
+  while i < N {
+    acc[i] = field_add(acc[i], field_montgomery_mul(a[i], b[i]))
+    i += 1
+  }
+  nil
+}
+
+# NTT of f, in place (FIPS 203, Algorithm 9, as Go's ntt).
+def ntt(f: [U32]) {
+  m = 0
+  ln = 128
+  while ln >= 8 {
+    start = 0
+    while start < 256 {
+      m += 1
+      zeta = ZETAS[m]
+      j = start
+      e = start + ln
+      while j < e {
+        t = field_montgomery_mul(zeta, f[j + ln])
+        f[j + ln] = field_sub(f[j], t)
+        f[j] = field_add(f[j], t)
+        t = field_montgomery_mul(zeta, f[j + 1 + ln])
+        f[j + 1 + ln] = field_sub(f[j + 1], t)
+        f[j + 1] = field_add(f[j + 1], t)
+        j += 2
+      }
+      start += 2 * ln
+    }
+    ln = ln / 2
+  }
+  start = 0
+  while start < 256 {
+    m += 1
+    zeta = ZETAS[m]
+    t = field_montgomery_mul(zeta, f[start + 4])
+    f[start + 4] = field_sub(f[start], t)
+    f[start] = field_add(f[start], t)
+    t = field_montgomery_mul(zeta, f[start + 5])
+    f[start + 5] = field_sub(f[start + 1], t)
+    f[start + 1] = field_add(f[start + 1], t)
+    t = field_montgomery_mul(zeta, f[start + 6])
+    f[start + 6] = field_sub(f[start + 2], t)
+    f[start + 2] = field_add(f[start + 2], t)
+    t = field_montgomery_mul(zeta, f[start + 7])
+    f[start + 7] = field_sub(f[start + 3], t)
+    f[start + 3] = field_add(f[start + 3], t)
+    start += 8
+  }
+  start = 0
+  while start < 256 {
+    m += 1
+    zeta = ZETAS[m]
+    t = field_montgomery_mul(zeta, f[start + 2])
+    f[start + 2] = field_sub(f[start], t)
+    f[start] = field_add(f[start], t)
+    t = field_montgomery_mul(zeta, f[start + 3])
+    f[start + 3] = field_sub(f[start + 1], t)
+    f[start + 1] = field_add(f[start + 1], t)
+    start += 4
+  }
+  start = 0
+  while start < 256 {
+    m += 1
+    zeta = ZETAS[m]
+    t = field_montgomery_mul(zeta, f[start + 1])
+    f[start + 1] = field_sub(f[start], t)
+    f[start] = field_add(f[start], t)
+    start += 2
+  }
+  nil
+}
+
+# NTT⁻¹ of f, in place (FIPS 203, Algorithm 10, as Go's inverseNTT).
+def inverse_ntt(f: [U32]) {
+  m = 255
+  start = 0
+  while start < 256 {
+    zeta = ZETAS[m]
+    m -= 1
+    t = f[start]
+    f[start] = field_add(t, f[start + 1])
+    f[start + 1] = field_montgomery_mul_sub(zeta, f[start + 1], t)
+    start += 2
+  }
+  start = 0
+  while start < 256 {
+    zeta = ZETAS[m]
+    m -= 1
+    t = f[start]
+    f[start] = field_add(t, f[start + 2])
+    f[start + 2] = field_montgomery_mul_sub(zeta, f[start + 2], t)
+    t = f[start + 1]
+    f[start + 1] = field_add(t, f[start + 3])
+    f[start + 3] = field_montgomery_mul_sub(zeta, f[start + 3], t)
+    start += 4
+  }
+  start = 0
+  while start < 256 {
+    zeta = ZETAS[m]
+    m -= 1
+    t = f[start]
+    f[start] = field_add(t, f[start + 4])
+    f[start + 4] = field_montgomery_mul_sub(zeta, f[start + 4], t)
+    t = f[start + 1]
+    f[start + 1] = field_add(t, f[start + 5])
+    f[start + 5] = field_montgomery_mul_sub(zeta, f[start + 5], t)
+    t = f[start + 2]
+    f[start + 2] = field_add(t, f[start + 6])
+    f[start + 6] = field_montgomery_mul_sub(zeta, f[start + 6], t)
+    t = f[start + 3]
+    f[start + 3] = field_add(t, f[start + 7])
+    f[start + 7] = field_montgomery_mul_sub(zeta, f[start + 7], t)
+    start += 8
+  }
+  ln = 8
+  while ln < 256 {
+    start = 0
+    while start < 256 {
+      zeta = ZETAS[m]
+      m -= 1
+      j = start
+      e = start + ln
+      while j < e {
+        t = f[j]
+        f[j] = field_add(t, f[j + ln])
+        # -z * (t - f[j + ln]) = z * (f[j + ln] - t)
+        f[j + ln] = field_montgomery_mul_sub(zeta, f[j + ln], t)
+        t = f[j + 1]
+        f[j + 1] = field_add(t, f[j + 1 + ln])
+        f[j + 1 + ln] = field_montgomery_mul_sub(zeta, f[j + 1 + ln], t)
+        j += 2
+      }
+      start += 2 * ln
+    }
+    ln *= 2
+  }
+  i = 0
+  while i < N {
+    f[i] = field_montgomery_mul(f[i], INV_N)
+    i += 1
+  }
+  nil
+}
+
+# ---- sampling ----
+
+# Absorbs p into the SHAKE h (writing before reading never fails).
+def absorb(h: sha3.SHAKE, p: [Byte]) {
+  s = h
+  s.write!(p).unwrap
+  nil
+}
+
+# Samples an NTT element uniformly from rho and the indices s and r into a
+# (Step 3 of ExpandA, RejNTTPoly and CoeffFromThreeBytes of FIPS 204).
+def sample_ntt(a: [U32], rho: [Byte], s: Byte, r: Byte) {
+  g = sha3.new_shake128()
+  absorb(g, rho)
+  absorb(g, [s, r])
+  # buffered reads, matching the rate of SHAKE-128
+  buf = [0.as_u8; 168]
+  off = 168
+  j = 0
+  while j < N {
+    if off >= 168 {
+      g.read!(buf)
+      off = 0
+    }
+    v = buf[off].as_u32 | (buf[off + 1].as_u32 << 8) | (buf[off + 2].as_u32 << 16)
+    off += 3
+    v = v & 0x7fffff
+    if v < Q {
+      a[j] = field_montgomery_mul(v, RR)
+      j += 1
+    }
+  }
+  nil
+}
+
+# CoeffFromHalfByte of FIPS 204: b in [0, 15] to a coefficient in [−η, η]
+# (Montgomery form), or 0xffffffff if b is rejected.
+def coeff_from_half_byte(b: Byte, eta: Int) -> U32 {
+  panic("internal error: half-byte out of range") if b > 15
+  if eta == 2 {
+    return 0xffffffff.as_u32 if b > 14
+    # b % 5 by Barrett reduction, to avoid a potentially variable-time
+    # division: ⌈2¹⁶ / 5⌉ = 0x3334.
+    quotient = (b.as_u32 * 0x3334) >> 16
+    remainder = b.as_u32 - quotient * 5
+    return field_sub_to_montgomery(2, remainder)
+  }
+  panic("internal error: unsupported η") if eta != 4
+  return 0xffffffff.as_u32 if b > 8
+  field_sub_to_montgomery(4, b.as_u32)
+}
+
+# Samples a polynomial with coefficients in [−η, η] from rho and the index
+# r into a (RejBoundedPoly and CoeffFromHalfByte of FIPS 204).
+def sample_bounded_poly(a: [U32], rho: [Byte], r: Byte, p: Params) {
+  h = sha3.new_shake256()
+  absorb(h, rho)
+  absorb(h, [r, 0.as_u8])
+  buf = [0.as_u8; 136]
+  off = 136
+  j = 0
+  while true {
+    if off >= 136 {
+      h.read!(buf)
+      off = 0
+    }
+    z0 = buf[off] & 0x0f
+    z1 = buf[off] >> 4
+    off += 1
+    c = coeff_from_half_byte(z0, p.eta)
+    if c != 0xffffffff.as_u32 {
+      a[j] = c
+      j += 1
+    }
+    break if j >= N
+    c = coeff_from_half_byte(z1, p.eta)
+    if c != 0xffffffff.as_u32 {
+      a[j] = c
+      j += 1
+    }
+    break if j >= N
+  }
+  nil
+}
+
+# Samples a polynomial with τ coefficients in {−1, 1} and the rest 0 into c
+# (SampleInBall). Not constant time. Go reads H one byte at a time; this
+# reads it a block at a time, which gives the same stream.
+def sample_in_ball(c: [U32], rho: [Byte], p: Params) {
+  i = 0
+  while i < N {
+    c[i] = 0
+    i += 1
+  }
+  h = sha3.new_shake256()
+  absorb(h, rho)
+  buf = [0.as_u8; 136]
+  h.read!(buf)
+  s = buf[0...8]
+  off = 8
+  i = 256 - p.tau
+  while i < 256 {
+    if off >= 136 {
+      buf = [0.as_u8; 136]
+      h.read!(buf)
+      off = 0
+    }
+    j = buf[off].to_i
+    off += 1
+    if j > i {
+      next
+    }
+    c[i] = c[j]
+    # c[j] = (−1) ^ h[i+τ−256], the bits of s in little-endian order
+    bit_idx = i + p.tau - 256
+    bit = (s[bit_idx / 8] >> (bit_idx % 8)) & 1
+    c[j] = bit == 0 ? ONE : MINUS_ONE
+    i += 1
+  }
+  nil
+}
+
+# ---- rounding ----
+
+# The high part r1 of Power2Round(r) (FIPS 204): the top 10 bits, rounded.
+def power2_round_hi(r: U32) -> U32 {
+  rr = field_from_montgomery(r)
+  # add 2¹² - 1 to round r1 up by one if r0 > 2¹²
+  (rr + (1 << 12) - 1) >> 13
+}
+
+# The low part r0 of Power2Round(r), in Montgomery form.
+def power2_round_lo(r: U32) -> U32 {
+  rr = field_from_montgomery(r)
+  r1 = (rr + (1 << 12) - 1) >> 13
+  field_sub_to_montgomery(rr, r1 << 13)
+}
+
+# HighBits for γ2 = (q - 1) / 32, of x in standard form; in [0, 15].
+def high_bits32(x: U32) -> Byte {
+  r1 = (x + 127) >> 7
+  r1 = (r1 * 1025 + (1 << 21)) >> 22
+  (r1 & 0b1111).as_u8
+}
+
+# HighBits for γ2 = (q - 1) / 88, of x in standard form; in [0, 43].
+def high_bits88(x: U32) -> Byte {
+  r1 = (x + 127) >> 7
+  r1 = (r1 * 11275 + (1 << 23)) >> 24
+  ct_select_eq(r1, 44, 0, r1).as_u8
+}
+
+# The low part r0 of Decompose(r) for γ2 = (q - 1) / 32 (r1 is high_bits32).
+def low_bits32(r: U32) -> I32 {
+  x = field_from_montgomery(r)
+  r1 = high_bits32(x)
+  r0 = x.as_i32 - r1.as_i32 * 2 * (Q - 1).as_i32 / 32
+  ct_select_le((Q / 2 + 1).as_i32, r0, r0 - Q.as_i32, r0)
+}
+
+# The low part r0 of Decompose(r) for γ2 = (q - 1) / 88 (r1 is high_bits88).
+def low_bits88(r: U32) -> I32 {
+  x = field_from_montgomery(r)
+  r1 = high_bits88(x)
+  r0 = x.as_i32 - r1.as_i32 * 2 * (Q - 1).as_i32 / 88
+  ct_select_le((Q / 2 + 1).as_i32, r0, r0 - Q.as_i32, r0)
+}
+
+# Decompose(r) for γ2 = (q - 1) / 32: (r1, r0).
+def decompose32(r: U32) -> (Byte, I32) { (high_bits32(field_from_montgomery(r)), low_bits32(r)) }
+
+# Decompose(r) for γ2 = (q - 1) / 88: (r1, r0).
+def decompose88(r: U32) -> (Byte, I32) { (high_bits88(field_from_montgomery(r)), low_bits88(r)) }
+
+# UseHint for γ2 = (q - 1) / 32.
+def use_hint32(r: U32, hint: Byte) -> Byte {
+  r1 = high_bits32(field_from_montgomery(r))
+  if hint == 1 {
+    if low_bits32(r) > 0 {
+      r1 = (r1 + 1) % 16
+    } else {
+      # wrapping is fine: it is modulo 256, a multiple of 16
+      r1 = (r1 - 1) % 16
+    }
+  }
+  r1
+}
+
+# UseHint for γ2 = (q - 1) / 88.
+def use_hint88(r: U32, hint: Byte) -> Byte {
+  r1 = high_bits88(field_from_montgomery(r))
+  if hint == 1 {
+    if low_bits88(r) > 0 {
+      if r1 == 43 {
+        r1 = 0
+      } else {
+        r1 += 1
+      }
+    } else {
+      if r1 == 0 {
+        r1 = 43
+      } else {
+        r1 -= 1
+      }
+    }
+  }
+  r1
+}
+
+# MakeHint for γ2 = (q - 1) / 32.
+def make_hint32(ct0: U32, w: U32, cs2: U32) -> Byte {
+  # v1 = HighBits(r + z) = HighBits(w - cs2 + ct0 - ct0) = HighBits(w - cs2)
+  r_plus_z = field_sub(w, cs2)
+  v1 = high_bits32(field_from_montgomery(r_plus_z))
+  # r1 = HighBits(r) = HighBits(w - cs2 + ct0)
+  r1 = high_bits32(field_from_montgomery(field_add(r_plus_z, ct0)))
+  ct_byte_eq(v1, r1) ^ 1
+}
+
+# MakeHint for γ2 = (q - 1) / 88.
+def make_hint88(ct0: U32, w: U32, cs2: U32) -> Byte {
+  r_plus_z = field_sub(w, cs2)
+  v1 = high_bits88(field_from_montgomery(r_plus_z))
+  r1 = high_bits88(field_from_montgomery(field_add(r_plus_z, ct0)))
+  ct_byte_eq(v1, r1) ^ 1
+}
+
+# HighBits of each coefficient of r, into w (N bytes).
+def high_bits(w: [Byte], r: [U32], p: Params) {
+  i = 0
+  if p.gamma2 == 32 {
+    while i < N {
+      w[i] = high_bits32(field_from_montgomery(r[i]))
+      i += 1
+    }
+  } else if p.gamma2 == 88 {
+    while i < N {
+      w[i] = high_bits88(field_from_montgomery(r[i]))
+      i += 1
+    }
+  } else {
+    panic("mldsa: internal error: unsupported γ2")
+  }
+  nil
+}
+
+# UseHint of each coefficient of r with the hints h, into w. Not constant
+# time.
+def use_hint(w: [Byte], r: [U32], h: [Byte], p: Params) {
+  i = 0
+  if p.gamma2 == 32 {
+    while i < N {
+      w[i] = use_hint32(r[i], h[i])
+      i += 1
+    }
+  } else if p.gamma2 == 88 {
+    while i < N {
+      w[i] = use_hint88(r[i], h[i])
+      i += 1
+    }
+  } else {
+    panic("mldsa: internal error: unsupported γ2")
+  }
+  nil
+}
+
+# MakeHint of each coefficient, into h; returns the number of ones.
+def make_hint(h: [Byte], ct0: [U32], w: [U32], cs2: [U32], p: Params) -> Int {
+  count = 0
+  i = 0
+  if p.gamma2 == 32 {
+    while i < N {
+      h[i] = make_hint32(ct0[i], w[i], cs2[i])
+      count += h[i].to_i
+      i += 1
+    }
+  } else if p.gamma2 == 88 {
+    while i < N {
+      h[i] = make_hint88(ct0[i], w[i], cs2[i])
+      count += h[i].to_i
+      i += 1
+    }
+  } else {
+    panic("mldsa: internal error: unsupported γ2")
+  }
+  count
+}
+
+# ---- bit packing ----
+
+# BitPack(r mod± q, 2^γ1-1, 2^γ1) of r into out[off...]; returns the end.
+# r must have coefficients in [−2^γ1+1, 2^γ1], as Sign guarantees.
+def bit_pack(out: [Byte], off: Int, r: [U32], p: Params) -> Int {
+  return bit_pack18(out, off, r) if p.gamma1 == 17
+  return bit_pack20(out, off, r) if p.gamma1 == 19
+  panic("mldsa: internal error: unsupported γ1")
+}
+
+# BitPack(r mod± q, 2¹⁷-1, 2¹⁷): little-endian 18-bit chunks.
+def bit_pack18(v: [Byte], off: Int, r: [U32]) -> Int {
+  b: I32 = 1 << 17
+  o = off
+  i = 0
+  while i < N {
+    # b - [−2¹⁷+1, 2¹⁷] = [0, 2¹⁸-1]
+    w0 = (b - field_centered_mod(r[i])).as_u32
+    v[o] = w0.as_u8
+    v[o + 1] = (w0 >> 8).as_u8
+    v[o + 2] = (w0 >> 16).as_u8
+    w1 = (b - field_centered_mod(r[i + 1])).as_u32
+    v[o + 2] = v[o + 2] | (w1 << 2).as_u8
+    v[o + 3] = (w1 >> 6).as_u8
+    v[o + 4] = (w1 >> 14).as_u8
+    w2 = (b - field_centered_mod(r[i + 2])).as_u32
+    v[o + 4] = v[o + 4] | (w2 << 4).as_u8
+    v[o + 5] = (w2 >> 4).as_u8
+    v[o + 6] = (w2 >> 12).as_u8
+    w3 = (b - field_centered_mod(r[i + 3])).as_u32
+    v[o + 6] = v[o + 6] | (w3 << 6).as_u8
+    v[o + 7] = (w3 >> 2).as_u8
+    v[o + 8] = (w3 >> 10).as_u8
+    o += 9
+    i += 4
+  }
+  o
+}
+
+# BitPack(r mod± q, 2¹⁹-1, 2¹⁹): little-endian 20-bit chunks.
+def bit_pack20(v: [Byte], off: Int, r: [U32]) -> Int {
+  b: I32 = 1 << 19
+  o = off
+  i = 0
+  while i < N {
+    w0 = (b - field_centered_mod(r[i])).as_u32
+    v[o] = w0.as_u8
+    v[o + 1] = (w0 >> 8).as_u8
+    v[o + 2] = (w0 >> 16).as_u8
+    w1 = (b - field_centered_mod(r[i + 1])).as_u32
+    v[o + 2] = v[o + 2] | (w1 << 4).as_u8
+    v[o + 3] = (w1 >> 4).as_u8
+    v[o + 4] = (w1 >> 12).as_u8
+    o += 5
+    i += 2
+  }
+  o
+}
+
+# BitUnpack(v, 2^γ1-1, 2^γ1) into r: each γ1+1 bits, little-endian, to a
+# coefficient in [-2^γ1+1, 2^γ1].
+def bit_unpack(r: [U32], v: [Byte], p: Params) {
+  if p.gamma1 == 17 {
+    bit_unpack18(r, v)
+  } else if p.gamma1 == 19 {
+    bit_unpack20(r, v)
+  } else {
+    panic("mldsa: internal error: unsupported γ1")
+  }
+  nil
+}
+
+# BitUnpack(v, 2¹⁷-1, 2¹⁷).
+def bit_unpack18(r: [U32], v: [Byte]) {
+  panic("mldsa: internal error: invalid bitUnpack18 input length") if v.size != 18 * N / 8
+  b: U32 = 1 << 17
+  mask: U32 = (1 << 18) - 1
+  o = 0
+  i = 0
+  while i < N {
+    w0 = v[o].as_u32 | (v[o + 1].as_u32 << 8) | (v[o + 2].as_u32 << 16)
+    r[i] = field_sub_to_montgomery(b, w0 & mask)
+    w1 = (v[o + 2].as_u32 >> 2) | (v[o + 3].as_u32 << 6) | (v[o + 4].as_u32 << 14)
+    r[i + 1] = field_sub_to_montgomery(b, w1 & mask)
+    w2 = (v[o + 4].as_u32 >> 4) | (v[o + 5].as_u32 << 4) | (v[o + 6].as_u32 << 12)
+    r[i + 2] = field_sub_to_montgomery(b, w2 & mask)
+    w3 = (v[o + 6].as_u32 >> 6) | (v[o + 7].as_u32 << 2) | (v[o + 8].as_u32 << 10)
+    r[i + 3] = field_sub_to_montgomery(b, w3 & mask)
+    o += 9
+    i += 4
+  }
+  nil
+}
+
+# BitUnpack(v, 2¹⁹-1, 2¹⁹).
+def bit_unpack20(r: [U32], v: [Byte]) {
+  panic("mldsa: internal error: invalid bitUnpack20 input length") if v.size != 20 * N / 8
+  b: U32 = 1 << 19
+  mask: U32 = (1 << 20) - 1
+  o = 0
+  i = 0
+  while i < N {
+    w0 = v[o].as_u32 | (v[o + 1].as_u32 << 8) | (v[o + 2].as_u32 << 16)
+    r[i] = field_sub_to_montgomery(b, w0 & mask)
+    w1 = (v[o + 2].as_u32 >> 4) | (v[o + 3].as_u32 << 4) | (v[o + 4].as_u32 << 12)
+    r[i + 1] = field_sub_to_montgomery(b, w1 & mask)
+    o += 5
+    i += 2
+  }
+  nil
+}
+
+# The zetas ζ^BitRev₈(k) mod q for each index k, in the Montgomery domain.
+ZETAS: [U32; 256] = [4193792, 25847, 5771523, 7861508, 237124, 7602457, 7504169, 466468, 1826347, 2353451,
+  8021166, 6288512, 3119733, 5495562, 3111497, 2680103, 2725464, 1024112, 7300517, 3585928,
+  7830929, 7260833, 2619752, 6271868, 6262231, 4520680, 6980856, 5102745, 1757237, 8360995,
+  4010497, 280005, 2706023, 95776, 3077325, 3530437, 6718724, 4788269, 5842901, 3915439,
+  4519302, 5336701, 3574422, 5512770, 3539968, 8079950, 2348700, 7841118, 6681150, 6736599,
+  3505694, 4558682, 3507263, 6239768, 6779997, 3699596, 811944, 531354, 954230, 3881043,
+  3900724, 5823537, 2071892, 5582638, 4450022, 6851714, 4702672, 5339162, 6927966, 3475950,
+  2176455, 6795196, 7122806, 1939314, 4296819, 7380215, 5190273, 5223087, 4747489, 126922,
+  3412210, 7396998, 2147896, 2715295, 5412772, 4686924, 7969390, 5903370, 7709315, 7151892,
+  8357436, 7072248, 7998430, 1349076, 1852771, 6949987, 5037034, 264944, 508951, 3097992,
+  44288, 7280319, 904516, 3958618, 4656075, 8371839, 1653064, 5130689, 2389356, 8169440,
+  759969, 7063561, 189548, 4827145, 3159746, 6529015, 5971092, 8202977, 1315589, 1341330,
+  1285669, 6795489, 7567685, 6940675, 5361315, 4499357, 4751448, 3839961, 2091667, 3407706,
+  2316500, 3817976, 5037939, 2244091, 5933984, 4817955, 266997, 2434439, 7144689, 3513181,
+  4860065, 4621053, 7183191, 5187039, 900702, 1859098, 909542, 819034, 495491, 6767243,
+  8337157, 7857917, 7725090, 5257975, 2031748, 3207046, 4823422, 7855319, 7611795, 4784579,
+  342297, 286988, 5942594, 4108315, 3437287, 5038140, 1735879, 203044, 2842341, 2691481,
+  5790267, 1265009, 4055324, 1247620, 2486353, 1595974, 4613401, 1250494, 2635921, 4832145,
+  5386378, 1869119, 1903435, 7329447, 7047359, 1237275, 5062207, 6950192, 7929317, 1312455,
+  3306115, 6417775, 7100756, 1917081, 5834105, 7005614, 1500165, 777191, 2235880, 3406031,
+  7838005, 5548557, 6709241, 6533464, 5796124, 4656147, 594136, 4603424, 6366809, 2432395,
+  2454455, 8215696, 1957272, 3369112, 185531, 7173032, 5196991, 162844, 1616392, 3014001,
+  810149, 1652634, 4686184, 6581310, 5341501, 3523897, 3866901, 269760, 2213111, 7404533,
+  1717735, 472078, 7953734, 1723600, 6577327, 1910376, 6712985, 7276084, 8119771, 4546524,
+  5441381, 6144432, 7959518, 6094090, 183443, 7403526, 1612842, 4834730, 7826001, 3919660,
+  8332111, 7018208, 3937738, 1400424, 7534263, 1976782]

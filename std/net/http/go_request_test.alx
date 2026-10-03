@@ -1,0 +1,376 @@
+# Go's header_test.go, request_test.go, server_test.go and http_test.go:
+# the tests the current API supports, translated.
+import "bufio"
+import "encoding/base64"
+import "bytes"
+import "net"
+import "strings"
+import "time"
+
+def hdr_of(pairs: [(Str, [Str])]) -> Header {
+  h = new_header
+  for p in pairs {
+    h.set_raw!(p[0], p[1])
+  }
+  h
+}
+
+# Go's TestHeaderWrite (headerWriteTests).
+test "header write" {
+  tests = [
+    (hdr_of([]), [], ""),
+    (hdr_of([("Content-Type", ["text/html; charset=UTF-8"]), ("Content-Length", ["0"])]), [], "Content-Length: 0\r\nContent-Type: text/html; charset=UTF-8\r\n"),
+    (hdr_of([("Content-Length", ["0", "1", "2"])]), [], "Content-Length: 0\r\nContent-Length: 1\r\nContent-Length: 2\r\n"),
+    (hdr_of([("Expires", ["-1"]), ("Content-Length", ["0"]), ("Content-Encoding", ["gzip"])]), ["Content-Length"], "Content-Encoding: gzip\r\nExpires: -1\r\n"),
+    (hdr_of([("Expires", ["-1"]), ("Content-Length", ["0", "1", "2"]), ("Content-Encoding", ["gzip"])]), ["Content-Length"], "Content-Encoding: gzip\r\nExpires: -1\r\n"),
+    (hdr_of([("Expires", ["-1"]), ("Content-Length", ["0"]), ("Content-Encoding", ["gzip"])]), ["Content-Length", "Expires", "Content-Encoding"], ""),
+    (hdr_of([("Nil", []), ("Empty", []), ("Blank", [""]), ("Double-Blank", ["", ""])]), [], "Blank: \r\nDouble-Blank: \r\nDouble-Blank: \r\n"),
+    (hdr_of([("k1", ["1a", "1b"]), ("k2", ["2a", "2b"]), ("k3", ["3a", "3b"]), ("k4", ["4a", "4b"]), ("k5", ["5a", "5b"]), ("k6", ["6a", "6b"]), ("k7", ["7a", "7b"]), ("k8", ["8a", "8b"]), ("k9", ["9a", "9b"])]), ["k5"], "k1: 1a\r\nk1: 1b\r\nk2: 2a\r\nk2: 2b\r\nk3: 3a\r\nk3: 3b\r\nk4: 4a\r\nk4: 4b\r\nk6: 6a\r\nk6: 6b\r\nk7: 7a\r\nk7: 7b\r\nk8: 8a\r\nk8: 8b\r\nk9: 9a\r\nk9: 9b\r\n"),
+    (hdr_of([("Content-Type", ["text/html; charset=UTF-8"]), ("NewlineInValue", ["1\r\nBar: 2"]), ("NewlineInKey\r\n", ["1"]), ("Colon:InKey", ["1"]), ("Evil: 1\r\nSmuggledValue", ["1"])]), [], "Content-Type: text/html; charset=UTF-8\r\nNewlineInValue: 1  Bar: 2\r\n")
+  ]
+  for t in tests {
+    buf = bytes.new_buffer([])
+    t[0].write_subset(buf, t[1]).unwrap
+    assert_eq buf.to_s, t[2]
+  }
+}
+
+# Go's TestParseTime.
+test "parse time" {
+  expect = time.date(1994, 11, 6, 8, 49, 37, 0, time.utc)
+  tests = [
+    ("", true),
+    ("invalid", true),
+    ("1994-11-06T08:49:37Z00:00", true),
+    ("Sun, 06 Nov 1994 08:49:37 GMT", false),
+    ("Sunday, 06-Nov-94 08:49:37 GMT", false),
+    ("Sun Nov  6 08:49:37 1994", false)
+  ]
+  for t in tests {
+    d = parse_time(hdr_of([("Date", [t[0]])]).get("Date"))
+    assert_eq d.err?, t[1]
+    assert d.unwrap.equal(expect) unless t[1]
+  }
+}
+
+# Go's TestHasToken.
+test "has token" {
+  tests = [
+    ("", "", false), ("", "foo", false), ("foo", "foo", true), ("foo ", "foo", true), (" foo", "foo", true),
+    (" foo ", "foo", true), ("foo,bar", "foo", true), ("bar,foo", "foo", true), ("bar, foo", "foo", true),
+    ("bar,foo, baz", "foo", true), ("bar, foo,baz", "foo", true), ("bar,foo, baz", "foo", true),
+    ("bar, foo, baz", "foo", true), ("FOO", "foo", true), ("FOO ", "foo", true), (" FOO", "foo", true),
+    (" FOO ", "foo", true), ("FOO,BAR", "foo", true), ("BAR,FOO", "foo", true), ("BAR, FOO", "foo", true),
+    ("BAR,FOO, baz", "foo", true), ("BAR, FOO,BAZ", "foo", true), ("BAR,FOO, BAZ", "foo", true),
+    ("BAR, FOO, BAZ", "foo", true), ("foobar", "foo", false), ("barfoo ", "foo", false)
+  ]
+  for t in tests {
+    assert_eq has_token?(t[0], t[1]), t[2]
+  }
+}
+
+# Go's TestCloneOrMakeHeader / TestNilHeaderClone: a clone is equal and
+# independent.
+test "header clone" {
+  h = hdr_of([("Foo", ["bar"])])
+  c = h.clone
+  assert_eq c, h
+  c.set!("Foo", "baz")
+  assert_eq h.get("Foo"), "bar"
+  assert_eq new_header.clone.size, 0
+}
+
+def req_with_body(method: Str, url: Str, body: Str) -> Request {
+  new_request(method, url, body.bytes.to_a).unwrap
+}
+
+# Go's TestQuery.
+test "query" {
+  r = req_with_body("GET", "http://www.google.com/search?q=foo&q=bar", "")
+  assert_eq r.form_value("q").unwrap, "foo"
+}
+
+# Go's TestParseFormSemicolonSeparator.
+test "parse form semicolon separator" {
+  for method in ["POST", "PATCH", "PUT", "GET"] {
+    r = req_with_body(method, "http://www.google.com/search?q=foo;q=bar&a=1", "q")
+    assert r.parse_form!.err?
+    assert_eq r.form.m.keys, ["a"]
+    assert_eq r.form.get("a"), "1"
+  }
+}
+
+# Go's TestParseFormQuery.
+test "parse form query" {
+  r = req_with_body("POST", "http://www.google.com/search?q=foo&q=bar&both=x&prio=1&orphan=nope&empty=not", "z=post&both=y&prio=2&=nokey&orphan&empty=&")
+  r.header.set!("Content-Type", "application/x-www-form-urlencoded; param=value")
+  assert_eq r.form_value("q").unwrap, "foo"
+  assert_eq r.form_value("z").unwrap, "post"
+  r.parse_form!.unwrap
+  assert !r.post_form.has?("q")
+  assert_eq r.post_form_value("z").unwrap, "post"
+  assert_eq r.form.m["q"].unwrap, ["foo", "bar"]
+  assert_eq r.form.m["both"].unwrap, ["y", "x"]
+  assert_eq r.form_value("prio").unwrap, "2"
+  assert_eq r.form.m["orphan"].unwrap, ["", "nope"]
+  assert_eq r.form.m["empty"].unwrap, ["", "not"]
+  assert_eq r.form.m[""].unwrap, ["nokey"]
+}
+
+# Go's TestParseFormQueryMethods.
+test "parse form query methods" {
+  for method in ["POST", "PATCH", "PUT", "FOO"] {
+    r = req_with_body(method, "http://www.google.com/search", "foo=bar")
+    r.header.set!("Content-Type", "application/x-www-form-urlencoded; param=value")
+    want = method == "FOO" ? "" : "bar"
+    assert_eq r.form_value("foo") || "", want
+  }
+}
+
+# Go's TestParseFormUnknownContentType.
+test "parse form unknown content type" {
+  tests = [("text/plain", ""), ("", ""), ("text/plain; boundary=", "mime: invalid media parameter"), ("application/unknown", "")]
+  for t in tests {
+    r = req_with_body("POST", "http://x/", "body")
+    r.header.set!("Content-Type", t[0]) if t[0].size > 0
+    res = r.parse_form!
+    if t[1].size == 0 {
+      assert res.ok?
+    } else {
+      assert_eq res.err.unwrap.message, t[1]
+    }
+  }
+}
+
+# Go's TestParseFormInitializeOnError: form and post_form exist after a
+# failed parse.
+test "parse form initialize on error" {
+  r = req_with_body("POST", "http://www.google.com/search?q=foo", "")
+  r.parse_form!
+  assert_eq r.form.get("q"), "foo"
+  assert_eq r.post_form.size, 0
+}
+
+# Go's TestSetBasicAuth, TestGetBasicAuth, TestParseBasicAuth.
+test "basic auth" {
+  r = req_with_body("GET", "http://example.com/", "")
+  r.set_basic_auth!("Aladdin", "open sesame")
+  assert_eq r.header.get("Authorization"), "Basic QWxhZGRpbjpvcGVuIHNlc2FtZQ=="
+  for t in [("Aladdin", "open sesame"), ("Aladdin", "open:sesame"), ("", "")] {
+    r2 = req_with_body("GET", "http://example.com/", "")
+    r2.set_basic_auth!(t[0], t[1])
+    assert_eq r2.basic_auth.unwrap, t
+  }
+  assert req_with_body("GET", "http://example.com/", "").basic_auth.none?
+
+  tests = [
+    ("Basic " + base64_std("Aladdin:open sesame"), "Aladdin", "open sesame", true),
+    ("BASIC " + base64_std("Aladdin:open sesame"), "Aladdin", "open sesame", true),
+    ("basic " + base64_std("Aladdin:open sesame"), "Aladdin", "open sesame", true),
+    ("Basic " + base64_std("Aladdin:open:sesame"), "Aladdin", "open:sesame", true),
+    ("Basic " + base64_std(":"), "", "", true),
+    ("Basic" + base64_std("Aladdin:open sesame"), "", "", false),
+    (base64_std("Aladdin:open sesame"), "", "", false),
+    ("Basic ", "", "", false),
+    ("Basic Aladdin:open sesame", "", "", false),
+    ("Digest username=\"Aladdin\"", "", "", false)
+  ]
+  for t in tests {
+    r3 = req_with_body("GET", "http://example.com/", "")
+    r3.header.set!("Authorization", t[0])
+    got = r3.basic_auth
+    assert_eq got.present?, t[3]
+    assert_eq got.unwrap, (t[1], t[2]) if t[3]
+  }
+}
+
+def base64_std(s: Str) -> Str {
+  base64.std_encoding.encode_to_string(s.bytes.to_a)
+}
+
+# Go's TestRequestInvalidMethod (the NewRequest part).
+test "request invalid method" {
+  assert new_request("bad method", "http://foo.com/", []).err?
+  assert_eq new_request("", "http://foo.com/", []).unwrap.method, "GET"
+}
+
+# Go's TestStarRequest (the reading part).
+test "star request" {
+  br = bufio.new_reader(bytes.new_buffer_string("M-SEARCH * HTTP/1.1\r\n\r\n"))
+  r = read_request(br).unwrap.unwrap
+  assert_eq r.content_length, 0
+  assert_eq r.request_uri, "*"
+  assert_eq r.parsed_url.path, "*"
+}
+
+# Go's TestPathValueNoMatch.
+test "path value no match" {
+  r = req_with_body("GET", "http://x/", "")
+  assert_eq r.path_value("x"), ""
+  r.set_path_value!("x", "a")
+  assert_eq r.path_value("x"), "a"
+}
+
+# Go's TestCleanPath.
+test "clean path (Go's table)" {
+  for t in [("//", "/"), ("/x", "/x"), ("//x", "/x"), ("x//", "/x/"), ("a//b/////c", "/a/b/c"), ("/foo/../bar/./..//baz", "/baz")] {
+    assert_eq clean_path(t[0]), t[1]
+  }
+}
+
+# Go's TestEmptyServeMux.
+test "empty serve mux" {
+  mux = new_serve_mux
+  pat, code = mux.lookup("GET", "/")
+  assert_eq pat, ""
+  assert_eq code, 404
+}
+
+def start_mux(mux: ServeMux) -> (Server, Int) {
+  srv = new_server(mux)
+  ln = net.listen("tcp", "127.0.0.1:0").unwrap
+  port = ln.port
+  spawn { srv.serve(ln) }
+  (srv, port)
+}
+
+# One raw request; the response.
+def raw_req(port: Int, method: Str, target: Str) -> Response {
+  c = net.dial("tcp", "127.0.0.1:#{port}").unwrap
+  br = bufio.new_reader(c)
+  c.write_string!("#{method} #{target} HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n").unwrap
+  r = read_response(br, false).unwrap
+  c.close!.unwrap
+  r
+}
+
+# Go's TestFindHandler, over the wire (a handler answers with its number;
+# a redirect with its Location). Go's "//foo" pattern isn't accepted by
+# alx's mux (an empty segment), so its cases are left out.
+test "find handler" {
+  mux = new_serve_mux
+  mux.handle_func("/") { |w, r| w.write_string!("1") }
+  mux.handle_func("/foo/") { |w, r| w.write_string!("2") }
+  mux.handle_func("/foo") { |w, r| w.write_string!("3") }
+  mux.handle_func("/bar/") { |w, r| w.write_string!("4") }
+  srv, port = start_mux(mux)
+  tests = [
+    ("GET", "/", "1"),
+    ("GET", "//", "307 /"),
+    ("GET", "/foo/../bar/./..//baz", "307 /baz"),
+    ("GET", "/foo", "3"),
+    ("GET", "/foo/x", "2"),
+    ("GET", "/bar/x", "4"),
+    ("GET", "/bar", "307 /bar/"),
+    ("CONNECT", "/", "1"),
+    ("CONNECT", "//", "1"),
+    ("CONNECT", "/foo/../bar/./..//baz", "2"),
+    ("CONNECT", "/foo", "3"),
+    ("CONNECT", "/foo/x", "2"),
+    ("CONNECT", "/bar/x", "4"),
+    ("CONNECT", "/bar", "307 /bar/")
+  ]
+  for t in tests {
+    r = raw_req(port, t[0], t[1])
+    got = r.status == 307 ? "307 #{r.header.get("Location")}" : r.body_string
+    assert_eq got, t[2]
+  }
+  srv.shutdown
+}
+
+# Go's TestPathValueAndPattern.
+test "path value and pattern" {
+  tests = [
+    ("/{a}/is/{b}/{c...}", "/now/is/the/time/for/all", "a=now b=the c=time/for/all d="),
+    ("/names/{name}/{other...}", "/names/%2fjohn/address", "name=/john other=address"),
+    ("/names/{name}/{other...}", "/names/john%2Fdoe/there/is%2F/more", "name=john/doe other=there/is//more"),
+    ("/names/{name}/{other...}", "/names/n/*", "name=n other=*")
+  ]
+  for t in tests {
+    mux = new_serve_mux
+    names = strings.split(t[2], " ").map { |kv| strings.split(kv, "=")[0] }.to_a
+    mux.handle_func(t[0]) { |w, r|
+      parts: [Str] = []
+      for n in names {
+        parts << "#{n}=#{r.path_value(n)}"
+      }
+      w.write_string!(strings.join(parts, " ") + "|" + r.pattern)
+    }
+    srv, port = start_mux(mux)
+    r = raw_req(port, "GET", t[1])
+    assert_eq r.body_string, t[2] + "|" + t[0]
+    srv.shutdown
+  }
+}
+
+# Go's TestStatus (405 responses and the Allow header).
+test "status and allow" {
+  mux = new_serve_mux
+  mux.handle_func("GET /g") { |w, r| }
+  mux.handle_func("POST /p") { |w, r| }
+  mux.handle_func("PATCH /p") { |w, r| }
+  mux.handle_func("PUT /r") { |w, r| }
+  mux.handle_func("GET /r/") { |w, r| }
+  srv, port = start_mux(mux)
+  tests = [
+    ("GET", "/g", 200, ""), ("HEAD", "/g", 200, ""), ("POST", "/g", 405, "GET, HEAD"),
+    ("GET", "/x", 404, ""), ("GET", "/p", 405, "PATCH, POST"), ("GET", "/./p", 405, "PATCH, POST"),
+    ("GET", "/r/", 200, ""), ("GET", "/r", 200, ""), ("HEAD", "/r/", 200, ""), ("HEAD", "/r", 200, ""),
+    ("PUT", "/r/", 405, "GET, HEAD"), ("PUT", "/r", 200, "")
+  ]
+  c = new_client
+  for t in tests {
+    req = new_request(t[0], "http://127.0.0.1:#{port}#{t[1]}", []).unwrap
+    res = c.do(req).unwrap
+    assert_eq res.status, t[2]
+    assert_eq res.header.get("Allow"), t[3]
+  }
+  srv.shutdown
+}
+
+# Go's TestServerValidatesHostHeader (serve_test.go).
+test "server validates host header" {
+  srv = new_server_func(->(w: ResponseWriter, r: Request) {})
+  ln = net.listen("tcp", "127.0.0.1:0").unwrap
+  port = ln.port
+  spawn { srv.serve(ln) }
+  xff = Str.from_bytes([0xFF])
+  tests = [
+    ("HTTP/0.9", "", 505),
+    ("HTTP/1.1", "", 400),
+    ("HTTP/1.1", "Host: \r\n", 200),
+    ("HTTP/1.1", "Host: 1.2.3.4\r\n", 200),
+    ("HTTP/1.1", "Host: foo.com\r\n", 200),
+    ("HTTP/1.1", "Host: foo-bar_baz.com\r\n", 200),
+    ("HTTP/1.1", "Host: foo.com:80\r\n", 200),
+    ("HTTP/1.1", "Host: ::1\r\n", 200),
+    ("HTTP/1.1", "Host: [::1]\r\n", 200),
+    ("HTTP/1.1", "Host: [::1]:80\r\n", 200),
+    ("HTTP/1.1", "Host: [::1%25en0]:80\r\n", 200),
+    ("HTTP/1.1", "Host: 1.2.3.4\r\n", 200),
+    ("HTTP/1.1", "Host: \x06\r\n", 400),
+    ("HTTP/1.1", "Host: " + xff + "\r\n", 400),
+    ("HTTP/1.1", "Host: {\r\n", 400),
+    ("HTTP/1.1", "Host: }\r\n", 400),
+    ("HTTP/1.1", "Host: first\r\nHost: second\r\n", 400),
+    ("HTTP/1.0", "", 200),
+    ("HTTP/1.0", "Host: first\r\nHost: second\r\n", 400),
+    ("HTTP/1.0", "Host: " + xff + "\r\n", 400),
+    ("PRI * HTTP/2.0", "", 200),
+    ("CONNECT golang.org:443 HTTP/1.1", "", 200),
+    ("PRI / HTTP/2.0", "", 505),
+    ("GET / HTTP/2.0", "", 505),
+    ("GET / HTTP/3.0", "", 505)
+  ]
+  for t in tests {
+    line = t[0].start_with?("HTTP/") ? "GET / " + t[0] : t[0]
+    cn = net.dial("tcp", "127.0.0.1:#{port}").unwrap
+    br = bufio.new_reader(cn)
+    cn.write_string!(line + "\r\n" + t[1] + "\r\n").unwrap
+    cn.close_write!.unwrap
+    r = read_response(br, false).unwrap
+    assert r.status == t[2], "#{line} #{t[1]}: got #{r.status}"
+    cn.close!.unwrap
+  }
+  srv.shutdown
+}

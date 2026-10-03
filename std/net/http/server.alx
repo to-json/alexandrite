@@ -113,18 +113,54 @@ pub def listen_and_serve(addr: Str, mux: ServeMux) -> ~Unit {
   s.~listen_and_serve(addr)
 }
 
-def bad_status(e: Error) -> Int {
+ERROR_HEADERS = "\r\nContent-Type: text/plain; charset=utf-8\r\nConnection: close\r\n\r\n"
+
+# Answers a request that couldn't be read, as Go's conn.serve does; network
+# read errors get no answer.
+def write_error_reply(conn: net.Conn, e: Error) {
+  msg = ""
   case e {
-    BadRequest => 400
-    TooLarge(w) => w == "headers" || w == "request line" ? 431 : 413
-    _ => 0
+    HeadersTooLarge => msg = "HTTP/1.1 431 Request Header Fields Too Large" + ERROR_HEADERS + "431 Request Header Fields Too Large"
+    TooLarge => msg = "HTTP/1.1 413 Request Entity Too Large" + ERROR_HEADERS + "413 Request Entity Too Large"
+    UnsupportedTE => msg = "HTTP/1.1 501 Not Implemented" + ERROR_HEADERS + "Unsupported transfer encoding"
+    Status(code, text) => msg = "HTTP/1.1 #{code} #{status_text(code)}: #{text}" + ERROR_HEADERS + "#{code} #{status_text(code)}: #{text}"
+    net.NetError.ConnRefused => msg = ""
+    net.NetError.AddrInUse => msg = ""
+    net.NetError.Timeout => msg = ""
+    net.NetError.Closed => msg = ""
+    net.NetError.BadAddr => msg = ""
+    net.NetError.Other => msg = ""
+    _ => msg = "HTTP/1.1 400 Bad Request" + ERROR_HEADERS + "400 Bad Request"
   }
+  conn.write_string!(msg) if msg.size > 0
 }
 
-def write_error_reply(conn: net.Conn, code: Int, why: Str) {
-  body = "#{code} #{status_text(code)}: #{why}\n"
-  head = "HTTP/1.1 #{code} #{status_text(code)}\r\nContent-Type: text/plain; charset=utf-8\r\nConnection: close\r\nContent-Length: #{body.size}\r\n\r\n"
-  conn.write_string!(head + body)
+# Go's httpguts.ValidHostHeader: no byte outside the URI host characters.
+pub def valid_host_header?(h: Str) -> Bool {
+  for c in h.bytes {
+    ok = (c >= 48 && c <= 57) || (c >= 97 && c <= 122) || (c >= 65 && c <= 90)
+    ok = ok || c == 33 || c == 36 || c == 37 || c == 38 || c == 39 || c == 40 || c == 41 || c == 42 || c == 43 || c == 44 || c == 45 || c == 46 || c == 58 || c == 59 || c == 61 || c == 91 || c == 93 || c == 95 || c == 126
+    return false unless ok
+  }
+  true
+}
+
+# The checks Go's server makes after reading a request (conn.readRequest).
+def server_check(req: Request) -> HttpError? {
+  h2_preface = req.proto_major == 2 && req.proto_minor == 0 && req.method == "PRI" && req.request_uri == "*"
+  return HttpError.Status(505, "unsupported protocol version") if req.proto_major != 1 && !h2_preface
+  hosts = req.header.raw("Host") || []
+  if req.proto_at_least?(1, 1) && hosts.size == 0 && !h2_preface && req.method != "CONNECT" {
+    return HttpError.Status(400, "missing required Host header")
+  }
+  return HttpError.Status(400, "malformed Host header") if hosts.size == 1 && !valid_host_header?(hosts[0])
+  for k in req.header.keys {
+    return HttpError.Status(400, "invalid header name") unless valid_header_field_name?(k)
+    for v in req.header.raw(k) || [] {
+      return HttpError.Status(400, "invalid header value") unless valid_header_field_value?(v)
+    }
+  }
+  none
 }
 
 def serve_conn(conn: net.Conn, srv: Server) {
@@ -133,35 +169,72 @@ def serve_conn(conn: net.Conn, srv: Server) {
   conn.set_nodelay(true)
   br = bufio.new_reader(conn)
   fd = conn.fd
+  last_post = false
   loop {
-    res = read_request(br, conn.remote_addr)
+    res = read_request_head(br, last_post)
     if e = res.err {
-      code = bad_status(e)
-      write_error_reply(conn, code, e.message) if code > 0
+      write_error_reply(conn, e)
       break
     }
     opt = res.unwrap
     break unless opt.present?
     req = opt.unwrap
+    if bad = server_check(req) {
+      write_error_reply(conn, bad)
+      break
+    }
+    req.header.del_raw!("Host")
+    req.remote_addr = conn.remote_addr
+    last_post = req.method == "POST"
     srv.ctl.lock { |c| c.idle.delete(fd) }
     http10 = req.proto == "HTTP/1.0"
+    expect = req.header.get("Expect")
+    if expect.size > 0 && !has_token?(expect, "100-continue") {
+      # Go's sendExpectationFailed
+      w = new_response_writer(conn, false, !http10, true)
+      w.header.set!("Connection", "close")
+      w.write_header!(417)
+      w.finish!
+      break
+    }
+    if expect.size > 0 && req.proto_at_least?(1, 1) && req.content_length != 0 {
+      conn.write_string!("HTTP/1.1 100 Continue\r\n\r\n")
+    }
+    body = read_request_body(br, req)
+    if e = body.err {
+      write_error_reply(conn, e)
+      break
+    }
+    req.body = body.unwrap
     w = new_response_writer(conn, req.method == "HEAD", !http10, req.wants_close || srv.shutting?)
-    clean = clean_path(req.path)
-    if req.path != "*" && clean != req.path {
+    epath = req.escaped_path
+    clean = req.method == "CONNECT" || epath == "*" ? epath : clean_path(epath)
+    m = srv.mux.find(req.method, clean)
+    if req.request_uri == "*" && req.method != "PRI" {
+      # Go's globalOptionsHandler for OPTIONS *, and ServeMux's 400 for any
+      # other method with "*"
+      if req.method == "OPTIONS" {
+        w.header.set!("Content-Length", "0")
+        w.write_header!(200)
+      } else {
+        w.header.set!("Connection", "close") if req.proto_at_least?(1, 1)
+        w.write_header!(400)
+      }
+    } else if m.code != 307 && clean != epath {
       loc = req.raw_query.size > 0 ? clean + "?" + req.raw_query : clean
-      redirect(w, req, loc, 301)
+      redirect(w, req, loc, 307)
     } else {
-      m = srv.mux.find(req.method, req.path)
       # (Inline, not `dispatch(m, w, req)`: see the compiler caveat on
       # `dispatch` in mux.alx.)
       if m.code == 0 {
         rq = req
         rq.pathvals = m.pvals
+        rq.pattern = m.allow
         h = m.handler
         h(w, rq)
-      } else if m.code == 301 {
+      } else if m.code == 307 {
         loc = req.raw_query.size > 0 ? m.location + "?" + req.raw_query : m.location
-        redirect(w, req, loc, 301)
+        redirect(w, req, loc, 307)
       } else if m.code == 405 {
         w.header.set!("Allow", m.allow)
         error(w, "Method Not Allowed", 405)

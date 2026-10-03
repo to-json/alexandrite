@@ -2,10 +2,13 @@ import "bufio"
 import "strings"
 import "strconv"
 import "net/http/httptrace"
+import "encoding/base64"
+import nurl "net/url"
+import "mime"
 
 # Limits (the server answers 431 / 413 when a request goes over them).
 pub MAX_HEADER_BYTES = 1048576
-pub MAX_HEADERS = 200
+pub MAX_HEADERS = 500
 pub MAX_BODY_BYTES = 33554432
 
 # ----------------------------------------------------------------- Request
@@ -32,10 +35,119 @@ pub struct Request {
   # Client side: hooks that follow the request (net/http/httptrace; Go keeps
   # them in the request's context). See with_client_trace.
   trace: httptrace.ClientTrace?
+  # Go's fields, filled in by read_request (the server) and new_request:
+  # the request target as sent (Go's RequestURI; server side only), the
+  # parsed URL (Go's URL), the protocol version, the declared body length
+  # (-1: unknown, e.g. chunked), the transfer codings ("chunked"), whether
+  # the connection closes after this request, and the trailer (keys
+  # declared in "Trailer", values filled in after a chunked body).
+  request_uri: Str
+  parsed_url: nurl.Url
+  proto_major: Int
+  proto_minor: Int
+  content_length: Int
+  transfer_encoding: [Str]
+  close: Bool
+  trailer: Header
+  # The parsed query and urlencoded body (after parse_form!; Go's Form),
+  # and the body's values only (Go's PostForm).
+  form: nurl.Values
+  post_form: nurl.Values
+  form_parsed: Bool
+  # The ServeMux pattern that matched (Go's Pattern).
+  pattern: Str
+
+  # The path as escaped in the request (the mux matches it segment by
+  # segment, unescaped, as Go's does).
+  pub def escaped_path -> Str {
+    return parsed_url.escaped_path if parsed_url.path.size > 0 || parsed_url.raw_path.size > 0
+    path
+  }
+
+  # Sets what path_value(name) returns (Go's SetPathValue).
+  pub def set_path_value!(name: Str, value: Str) {
+    self.pathvals[name] = value
+  }
 
   # The decoded value of query parameter `key` (the first one), if present.
   pub def query(key: Str) -> Str? {
     query_value(raw_query, key)
+  }
+
+  # Whether the request's protocol is at least major.minor.
+  pub def proto_at_least?(major: Int, minor: Int) -> Bool {
+    proto_major > major || (proto_major == major && proto_minor >= minor)
+  }
+
+  # The Referer header.
+  pub def referer -> Str { header.get("Referer") }
+
+  # The user name and password of a "Basic" Authorization header, if the
+  # request has a valid one (Go's BasicAuth).
+  pub def basic_auth -> (Str, Str)? {
+    parse_basic_auth(header.get("Authorization"))
+  }
+
+  # Sets the Authorization header to "Basic base64(user:pass)".
+  pub def set_basic_auth!(username: Str, password: Str) {
+    header.set!("Authorization", "Basic " + base64.std_encoding.encode_to_string((username + ":" + password).bytes.to_a))
+  }
+
+  # Parses the query and, for POST, PUT and PATCH with an urlencoded body,
+  # the body into `form` (body values first) and `post_form` (Go's
+  # ParseForm). Malformed pairs are skipped; the first one's error is
+  # returned after both are filled in, as Go does. A second call does
+  # nothing.
+  pub def parse_form! -> ~Unit {
+    return if form_parsed
+    self.form_parsed = true
+    first: Error? = none
+    pf = nurl.new_values
+    if method == "POST" || method == "PUT" || method == "PATCH" {
+      ct = header.get("Content-Type")
+      ct = "application/octet-stream" if ct.size == 0
+      mt = ""
+      pm = mime.parse_media_type(ct)
+      if e = pm.err {
+        first = e
+      } else {
+        mt, _ = pm.unwrap
+      }
+      if mt == "application/x-www-form-urlencoded" {
+        if body.size > 10485760 {
+          first = HttpError.Protocol("http: POST too large")
+        } else {
+          v, e = nurl.parse_query_lax(body_string)
+          pf = v
+          if x = e { first = x }
+        }
+      }
+    }
+    self.post_form = pf
+    f = nurl.new_values
+    for k, vs in pf.m {
+      for v in vs { f.add!(k, v) }
+    }
+    q, qe = nurl.parse_query_lax(raw_query)
+    if first.none? {
+      if x = qe { first = x }
+    }
+    for k, vs in q.m {
+      for v in vs { f.add!(k, v) }
+    }
+    self.form = f
+    if e = first {
+      fail e
+    }
+  }
+
+  # The first value of `key` in the urlencoded body (POST, PUT, PATCH), if
+  # any (Go's PostFormValue).
+  pub def post_form_value(key: Str) -> Str? {
+    r = self
+    _ = r.parse_form!
+    return none unless r.post_form.has?(key)
+    r.post_form.get(key)
   }
 
   # What the matched pattern captured for `{name}` ("" if there is no such
@@ -52,32 +164,34 @@ pub struct Request {
   }
 
   # A form value: the query first, then a urlencoded body.
+  # (Go's FormValue: the body's values come before the query's.)
   pub def form_value(key: Str) -> Str? {
-    if v = query(key) { return v }
-    if strings.has_prefix(header.get("Content-Type"), "application/x-www-form-urlencoded") {
-      return query_value(body_string, key)
-    }
-    none
+    r = self
+    _ = r.parse_form!
+    return none unless r.form.has?(key)
+    r.form.get(key)
   }
 
   pub def user_agent -> Str { header.get("User-Agent") }
 
-  # Whether the client asked to close the connection after this request.
+  # Whether the client asked to close the connection after this request
+  # (Go's shouldClose: "Connection: close", or HTTP/1.0 without
+  # keep-alive).
   def wants_close -> Bool {
-    conn = lower(header.get("Connection"))
-    if proto == "HTTP/1.0" {
-      return !strings.contains(conn, "keep-alive")
-    }
-    strings.contains(conn, "close")
+    close || should_close(proto_major, proto_minor, header, false)
   }
 }
 
 # A request for `method` and a full "http://host:port/path?q" URL.
-pub def new_request(method: Str, url: Str, body: [Byte]) -> ~Request {
+pub def new_request(method0: Str, url: Str, body: [Byte]) -> ~Request {
+  # (Go's NewRequest: "" means GET; a method must be a token)
+  method = method0.size == 0 ? "GET" : method0
+  fail HttpError.Protocol("net/http: invalid method #{strconv.quote(method)}") unless token?(method)
   u = ~parse_url(url)
   h = new_header
   pv: Map[Str, Str] = {}
-  Request.new(method: method, url: url, path: u.path, raw_query: u.raw_query, proto: "HTTP/1.1", host: u.host_header, header: h, body: body, remote_addr: "", pathvals: pv)
+  pu = nurl.parse(strings.contains(url, "://") ? url : "http://" + url).unwrap_or(nurl.Url.new)
+  Request.new(method: method, url: url, path: u.path, raw_query: u.raw_query, proto: "HTTP/1.1", host: u.host_header, header: h, body: body, remote_addr: "", pathvals: pv, parsed_url: pu, proto_major: 1, proto_minor: 1, content_length: body.size, trailer: new_header, form: nurl.new_values, post_form: nurl.new_values)
 }
 
 # ---------------------------------------------------------------- Response
@@ -89,6 +203,22 @@ pub struct Response {
   proto: Str
   header: Header
   body: [Byte]
+  # Go's fields, filled in by read_response: Status ("200 OK"), the
+  # protocol version, the declared body length (-1: unknown), the transfer
+  # codings, whether the connection closes after it (a "Connection: close"
+  # header is removed from `header`, as Go does), and the trailer.
+  status_str: Str
+  proto_major: Int
+  proto_minor: Int
+  content_length: Int
+  transfer_encoding: [Str]
+  close: Bool
+  trailer: Header
+
+  # Whether the response's protocol is at least major.minor.
+  pub def proto_at_least?(major: Int, minor: Int) -> Bool {
+    proto_major > major || (proto_major == major && proto_minor >= minor)
+  }
 
   pub def body_string -> Str {
     Str.from_bytes(body)
@@ -128,149 +258,4 @@ def token?(s: Str) -> Bool {
     return false unless token_byte?(c)
   }
   true
-}
-
-# Reads "Key: value" lines up to the blank line into h.
-def read_headers(br: bufio.Reader, h: Header) -> ~Unit {
-  total = 0
-  count = 0
-  loop {
-    ln = br.~read_line!
-    fail HttpError.Eof("headers") unless ln.present?
-    line = ln.unwrap
-    break if line.size == 0
-    total += line.size + 2
-    count += 1
-    fail HttpError.TooLarge("headers") if total > MAX_HEADER_BYTES || count > MAX_HEADERS
-    colon = strings.index_byte(line, 58)
-    fail HttpError.BadRequest("malformed header line") if colon <= 0
-    key = line[0...colon]
-    fail HttpError.BadRequest("invalid header name") unless token?(key)
-    h.add!(key, strings.trim(line[colon + 1...line.size], " \t"))
-  }
-}
-
-# Reads a chunked body (and its trailers, dropped).
-def read_chunked(br: bufio.Reader, limit: Int) -> ~[Byte] {
-  out: [Byte] = []
-  loop {
-    ln = br.~read_line!
-    fail HttpError.Eof("chunk size") unless ln.present?
-    size_s = ln.unwrap
-    if semi = strings.cut(size_s, ";") {
-      size_s, _ = semi
-    }
-    n = strconv.parse_int(strings.trim_space(size_s), 16, 64).unwrap_or(-1)
-    fail HttpError.BadRequest("invalid chunk size") if n < 0
-    if n == 0 {
-      loop {
-        t = br.~read_line!
-        fail HttpError.Eof("chunk trailer") unless t.present?
-        break if t.unwrap.size == 0
-      }
-      return out
-    }
-    fail HttpError.TooLarge("body") if out.size + n > limit
-    data = ~read_n(br, n)
-    for c in data { out << c }
-    crlf = br.~read_line!
-    fail HttpError.BadRequest("missing chunk terminator") unless crlf.present? && crlf.unwrap.size == 0
-  }
-}
-
-# Reads the body described by the headers; `until_eof` is for responses with
-# neither a length nor chunking (read to the end of the stream).
-def read_body(br: bufio.Reader, h: Header, until_eof: Bool) -> ~[Byte] {
-  te = lower(h.get("Transfer-Encoding"))
-  if strings.contains(te, "chunked") {
-    return ~read_chunked(br, MAX_BODY_BYTES)
-  }
-  cl = h.get("Content-Length")
-  if cl.size > 0 {
-    n = strconv.atoi(strings.trim_space(cl)).unwrap_or(-1)
-    fail HttpError.BadRequest("invalid Content-Length") if n < 0
-    fail HttpError.TooLarge("body") if n > MAX_BODY_BYTES
-    return ~read_n(br, n)
-  }
-  out: [Byte] = []
-  return out unless until_eof
-  buf = zeros(4096)
-  loop {
-    k = br.~read!(buf)
-    break if k == 0
-    fail HttpError.TooLarge("body") if out.size + k > MAX_BODY_BYTES
-    i = 0
-    while i < k {
-      out << buf[i]
-      i += 1
-    }
-  }
-  out
-}
-
-# Reads one request from br. none: the peer closed the connection before
-# sending anything. `remote` becomes `remote_addr`.
-def read_request(br: bufio.Reader, remote: Str) -> ~Request? {
-  ln = br.~read_line!
-  return none unless ln.present?
-  line = ln.unwrap
-  # Tolerate blank lines between requests (RFC 9112 2.2).
-  while line.size == 0 {
-    ln = br.~read_line!
-    return none unless ln.present?
-    line = ln.unwrap
-  }
-  fail HttpError.TooLarge("request line") if line.size > bufio.MAX_SCAN_TOKEN_SIZE
-  parts = strings.split(line, " ")
-  fail HttpError.BadRequest("malformed request line") if parts.size != 3
-  method = parts[0]
-  target = parts[1]
-  proto = parts[2]
-  fail HttpError.BadRequest("invalid method") unless token?(method)
-  fail HttpError.BadRequest("unsupported protocol #{proto}") unless proto == "HTTP/1.1" || proto == "HTTP/1.0"
-  fail HttpError.BadRequest("empty request target") if target.size == 0
-  h = new_header
-  ~read_headers(br, h)
-  rawpath = target
-  query = ""
-  host = h.get("Host")
-  if strings.has_prefix(target, "http://") {
-    u = ~parse_url(target)
-    rawpath = u.path.size == 0 ? "/" : u.path
-    query = u.raw_query
-    host = u.host_header
-  } else if target == "*" {
-    rawpath = "*"
-  } else {
-    fail HttpError.BadRequest("invalid request target") if target[0] != 47
-    if pq = strings.cut(target, "?") {
-      rawpath, query = pq
-    }
-  }
-  fail HttpError.BadRequest("missing Host header") if proto == "HTTP/1.1" && host.size == 0
-  path = ~unescape(rawpath, false)
-  body = ~read_body(br, h, false)
-  pv: Map[Str, Str] = {}
-  Request.new(method: method, url: target, path: path, raw_query: query, proto: proto, host: host, header: h, body: body, remote_addr: remote, pathvals: pv)
-}
-
-# Reads one response from br; `head` is true for a reply to HEAD.
-pub def read_response(br: bufio.Reader, head: Bool) -> ~Response {
-  ln = br.~read_line!
-  fail HttpError.Eof("status line") unless ln.present?
-  line = ln.unwrap
-  parts = strings.split_n(line, " ", 3)
-  fail HttpError.BadResponse("malformed status line") if parts.size < 2
-  proto = parts[0]
-  fail HttpError.BadResponse("unsupported protocol #{proto}") unless strings.has_prefix(proto, "HTTP/1.")
-  code = strconv.atoi(parts[1]).unwrap_or(-1)
-  fail HttpError.BadResponse("invalid status code") if code < 100 || code > 999
-  text = parts.size > 2 ? parts[2] : ""
-  h = new_header
-  ~read_headers(br, h)
-  body: [Byte] = []
-  if !head && code >= 200 && code != 204 && code != 304 {
-    body = ~read_body(br, h, true)
-  }
-  Response.new(status: code, status_text: text, proto: proto, header: h, body: body)
 }

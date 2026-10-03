@@ -175,13 +175,36 @@ fn ffi_cty(t: FfiTy) -> &'static str {
 }
 
 fn proto(f: &LFunc) -> String {
-    let params: Vec<String> = f.params.iter().map(|v| format!("{} {}", cty(&f.vars[*v].ty), vname(f, *v))).collect();
+    proto_named(f, false)
+}
+
+/// The prototype; with `copies`, aggregate parameters get the names
+/// `a<v>` and the body starts by copying them into the usual locals (see
+/// `Gen::func`).
+fn proto_named(f: &LFunc, copies: bool) -> String {
+    let params: Vec<String> = f
+        .params
+        .iter()
+        .map(|v| {
+            let t = &f.vars[*v].ty;
+            if copies && aggregate(t) {
+                format!("{} a{v}", cty(t))
+            } else {
+                format!("{} {}", cty(t), vname(f, *v))
+            }
+        })
+        .collect();
     let linkage = if f.external || f.name.starts_with("alx_lib_") { "" } else { "static " };
     if f.is_main {
         return format!("static void {}(void)", f.name);
     }
     let ret = if f.ret == LTy::Unit { "void".to_string() } else { cty(&f.ret) };
     format!("{linkage}{ret} {}({})", f.name, if params.is_empty() { "void".into() } else { params.join(", ") })
+}
+
+/// A C struct type (passed by value as an aggregate).
+fn aggregate(t: &LTy) -> bool {
+    matches!(t, LTy::Arr(_) | LTy::Tup(_) | LTy::Str)
 }
 
 fn vname(f: &LFunc, v: V) -> String {
@@ -257,10 +280,17 @@ impl Gen<'_> {
             Ctx::Plain
         };
         let mut e = FnEmit { p: self.p, f, ctx, yields: 0, out: String::new(), ind: 1 };
-        let _ = writeln!(self.out, "{} {{", proto(f));
+        let _ = writeln!(self.out, "{} {{", proto_named(f, true));
         for (i, v) in f.vars.iter().enumerate() {
             if !f.params.contains(&i) {
                 let _ = writeln!(e.out, "    {} {} = {};", cty(&v.ty), vname(f, i), zero(&v.ty));
+            } else if aggregate(&v.ty) {
+                // A by-value struct parameter (a slice, a Str, a tuple) is
+                // passed in memory the callee doesn't own on most ABIs, so
+                // the C compiler must assume stores through its data
+                // pointer may change it, and reloads it in loops. A local
+                // copy (whose address is never taken) lives in registers.
+                let _ = writeln!(e.out, "    {} {} = a{i};", cty(&v.ty), vname(f, i));
             }
         }
         e.block(&f.body);

@@ -1,0 +1,519 @@
+#![overflow(wrap)]
+# Go's arith_test.go, translated. Go checks its assembly against the
+# portable "_g" code; alx has one implementation, checked here against the
+# reference versions of the tests (written with math/bits), with the same
+# guard words around every slice. Benchmarks are in bench_test.alx.
+
+import "math/bits"
+
+M_: U64 = 0xffffffffffffffff
+MAGIC0: U64 = 0x123450
+MAGIC1: U64 = 0x543210
+
+# A deterministic word source (Go uses PCG(1, 2); any will do).
+struct WordRand {
+  st: [U64]
+
+  def next! -> U64 {
+    x = st[0] + 0x9e3779b97f4a7c15
+    self.st[0] = x
+    z = x
+    z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9
+    z = (z ^ (z >> 27)) * 0x94d049bb133111eb
+    z ^ (z >> 31)
+  }
+}
+
+def new_word_rand(seed: U64) -> WordRand { WordRand.new(st: [seed]) }
+
+# Go's nats: all-zero, all-ones, every combination of `words` (none if
+# words is empty) and 10 random vectors of the given size.
+def nats(words: [U64], size: I64, rnd: WordRand) -> [[U64]] {
+  out: [[U64]] = []
+  if size == 0 {
+    e: [U64] = []
+    out << e
+    return out
+  }
+  out << nat_make(size)
+  ones = nat_make(size)
+  for i in 0...size {
+    ones[i] = M_
+  }
+  out << ones
+  if words.size > 0 {
+    w = nat_make(size)
+    gen_nats(words, w, 0, out)
+  }
+  r = rnd
+  for _k in 0...10 {
+    w = nat_make(size)
+    for i in 0...size {
+      w[i] = r.next!
+    }
+    out << w
+  }
+  out
+}
+
+def gen_nats(words: [U64], w: [U64], i: I64, out: [[U64]]) -> Unit {
+  o = out
+  if i >= w.size {
+    o << nat_set(w)
+    return
+  }
+  for x in words {
+    w[i] = x
+    gen_nats(words, w, i + 1, o)
+  }
+}
+
+# nats appends through a slice argument, which (as in Go) doesn't grow
+# the caller's slice: collect through a one-element holder instead.
+def all_nats(words: [U64], size: I64, rnd: WordRand) -> [[U64]] {
+  if size == 0 || words.size == 0 {
+    return nats(words, size, rnd)
+  }
+  out: [[U64]] = []
+  out << nat_make(size)
+  ones = nat_make(size)
+  for i in 0...size {
+    ones[i] = M_
+  }
+  out << ones
+  n = 1
+  for _k in 0...size {
+    n *= words.size
+  }
+  for k in 0...n {
+    w = nat_make(size)
+    c = k
+    for i in 0...size {
+      w[size - 1 - i] = words[c % words.size]
+      c /= words.size
+    }
+    out << w
+  }
+  r = rnd
+  for _k in 0...10 {
+    w = nat_make(size)
+    for i in 0...size {
+      w[i] = r.next!
+    }
+    out << w
+  }
+  out
+}
+
+def words_for(size: I64, lim1: I64, lim2: I64) -> [U64] {
+  return t_words4 if size <= lim1
+  return t_words2 if size <= lim2
+  e: [U64] = []
+  e
+}
+
+def set_slice(x: [U64], id: U64, orig: [U64]) -> Unit {
+  x[0] = MAGIC0 + id
+  copy(x[1...x.size - 1], orig)
+  x[x.size - 1] = MAGIC1 + id
+}
+
+def check_slice(x: [U64], id: U64, orig: [U64], check_orig: Bool) -> Bool {
+  return false if x[0] != MAGIC0 + id
+  return false if x[x.size - 1] != MAGIC1 + id
+  return false if check_orig && x[1...x.size - 1] != orig
+  true
+}
+
+# ---- reference implementations (Go's _g / _ref versions) ----
+
+def ref_add_vv(z: [U64], x: [U64], y: [U64]) -> U64 {
+  c: U64 = 0
+  for i in 0...z.size {
+    s, cc = bits.add64(x[i], y[i], c)
+    z[i] = s
+    c = cc
+  }
+  c
+}
+
+def ref_sub_vv(z: [U64], x: [U64], y: [U64]) -> U64 {
+  c: U64 = 0
+  for i in 0...z.size {
+    s, cc = bits.sub64(x[i], y[i], c)
+    z[i] = s
+    c = cc
+  }
+  c
+}
+
+def ref_add_vw(z: [U64], x: [U64], y: U64) -> U64 {
+  c = y
+  for i in 0...z.size {
+    s, cc = bits.add64(x[i], c, 0)
+    z[i] = s
+    c = cc
+  }
+  c
+}
+
+def ref_sub_vw(z: [U64], x: [U64], y: U64) -> U64 {
+  c = y
+  for i in 0...z.size {
+    s, cc = bits.sub64(x[i], c, 0)
+    z[i] = s
+    c = cc
+  }
+  c
+}
+
+def ref_lsh_vu(z: [U64], x: [U64], s: I64) -> U64 {
+  if s == 0 {
+    copy(z, x)
+    return 0
+  }
+  return 0 if z.size == 0
+  sh = 64 - s
+  c = x[z.size - 1] >> sh
+  i = z.size - 1
+  while i > 0 {
+    z[i] = (x[i] << s) | (x[i - 1] >> sh)
+    i -= 1
+  }
+  z[0] = x[0] << s
+  c
+}
+
+def ref_rsh_vu(z: [U64], x: [U64], s: I64) -> U64 {
+  if s == 0 {
+    copy(z, x)
+    return 0
+  }
+  return 0 if z.size == 0
+  sh = 64 - s
+  c = x[0] << sh
+  for i in 1...z.size {
+    z[i - 1] = (x[i - 1] >> s) | (x[i] << sh)
+  }
+  z[z.size - 1] = x[z.size - 1] >> s
+  c
+}
+
+def ref_mul_add_www(x: U64, y: U64, c: U64) -> (U64, U64) {
+  hi, lo = bits.mul64(x, y)
+  lo2, cc = bits.add64(lo, c, 0)
+  (hi + cc, lo2)
+}
+
+def ref_mul_add_vww(z: [U64], x: [U64], y: U64, r: U64) -> U64 {
+  c = r
+  for i in 0...z.size {
+    hi, lo = ref_mul_add_www(x[i], y, c)
+    z[i] = lo
+    c = hi
+  }
+  c
+}
+
+def ref_add_mul_vvww(z: [U64], x: [U64], y: [U64], m: U64, a: U64) -> U64 {
+  c = a
+  for i in 0...z.size {
+    z1, z0 = ref_mul_add_www(y[i], m, x[i])
+    lo, cc = bits.add64(z0, c, 0)
+    z[i] = lo
+    c = cc + z1
+  }
+  c
+}
+
+# ---- the generic checkers (Go's testVV, testVW, testVWW, testVVWW) ----
+
+# kind: 0 add_vv, 1 sub_vv
+def check_vv(kind: I64) -> Bool {
+  rnd = new_word_rand(1)
+  for size in 0...100 {
+    xx = nat_make(size + 2)
+    yy = nat_make(size + 2)
+    zz0 = nat_make(size + 2)
+    words = words_for(size, 5, 10)
+    xs = all_nats(words, size, rnd)
+    for x in xs {
+      for y in xs {
+        want_z = nat_make(size)
+        want_c: U64 = 0
+        if kind == 0 {
+          want_c = ref_add_vv(want_z, x, y)
+        } else {
+          want_c = ref_sub_vv(want_z, x, y)
+        }
+        for inplace in [false, true] {
+          set_slice(xx, 1, x)
+          set_slice(yy, 2, y)
+          zz = zz0
+          if inplace {
+            zz = xx
+          } else {
+            for i in 0...zz.size {
+              zz[i] = 0x9876
+            }
+          }
+          zz[0] = MAGIC0 + 3
+          zz[zz.size - 1] = MAGIC1 + 3
+          c: U64 = 0
+          if kind == 0 {
+            c = add_vv(zz[1...1 + size], xx[1...1 + size], yy[1...1 + size])
+          } else {
+            c = sub_vv(zz[1...1 + size], xx[1...1 + size], yy[1...1 + size])
+          }
+          return false if zz[1...1 + size] != want_z || c != want_c
+          return false if !inplace && !check_slice(xx, 1, x, true)
+          return false if !check_slice(yy, 2, y, true)
+          return false if !check_slice(zz, 3, x, false)
+        }
+      }
+    }
+  }
+  true
+}
+
+# kind: 0 add_vw, 1 sub_vw, 2 lsh_vu, 3 rsh_vu
+def check_vw(kind: I64, ws: [U64]) -> Bool {
+  rnd = new_word_rand(2)
+  for size in 0...100 {
+    xx = nat_make(size + 2)
+    zz0 = nat_make(size + 2)
+    words = words_for(size, 5, 10)
+    for x in all_nats(words, size, rnd) {
+      for w in ws {
+        want_z = nat_make(size)
+        want_c: U64 = 0
+        if kind == 0 {
+          want_c = ref_add_vw(want_z, x, w)
+        } elsif kind == 1 {
+          want_c = ref_sub_vw(want_z, x, w)
+        } elsif kind == 2 {
+          want_c = ref_lsh_vu(want_z, x, w.to_i64)
+        } else {
+          want_c = ref_rsh_vu(want_z, x, w.to_i64)
+        }
+        for inplace in [false, true] {
+          set_slice(xx, 1, x)
+          zz = zz0
+          if inplace {
+            zz = xx
+          } else {
+            for i in 0...zz.size {
+              zz[i] = 0x9876
+            }
+          }
+          zz[0] = MAGIC0 + 2
+          zz[zz.size - 1] = MAGIC1 + 2
+          c: U64 = 0
+          z = zz[1...1 + size]
+          xv = xx[1...1 + size]
+          if kind == 0 {
+            c = add_vw(z, xv, w)
+          } elsif kind == 1 {
+            c = sub_vw(z, xv, w)
+          } elsif kind == 2 {
+            c = lsh_vu(z, xv, w.to_i64)
+          } else {
+            c = rsh_vu(z, xv, w.to_i64)
+          }
+          return false if z != want_z || c != want_c
+          return false if !inplace && !check_slice(xx, 1, x, true)
+          return false if !check_slice(zz, 2, x, false)
+        }
+      }
+    }
+  }
+  true
+}
+
+def check_vww(ys: [U64]) -> Bool {
+  rnd = new_word_rand(3)
+  for size in 0...100 {
+    xx = nat_make(size + 2)
+    zz0 = nat_make(size + 2)
+    words = words_for(size, 5, 10)
+    for x in all_nats(words, size, rnd) {
+      for y in ys {
+        for r in ys {
+          want_z = nat_make(size)
+          want_c = ref_mul_add_vww(want_z, x, y, r)
+          for inplace in [false, true] {
+            set_slice(xx, 1, x)
+            zz = zz0
+            if inplace {
+              zz = xx
+            } else {
+              for i in 0...zz.size {
+                zz[i] = 0x9876
+              }
+            }
+            zz[0] = MAGIC0 + 2
+            zz[zz.size - 1] = MAGIC1 + 2
+            z = zz[1...1 + size]
+            c = mul_add_vww(z, xx[1...1 + size], y, r)
+            return false if z != want_z || c != want_c
+            return false if !inplace && !check_slice(xx, 1, x, true)
+            return false if !check_slice(zz, 2, x, false)
+          }
+        }
+      }
+    }
+  }
+  true
+}
+
+def check_vvww(ms: [U64], as_: [U64]) -> Bool {
+  rnd = new_word_rand(4)
+  for size in 0...100 {
+    xx = nat_make(size + 2)
+    yy = nat_make(size + 2)
+    zz0 = nat_make(size + 2)
+    words = words_for(size, 3, 7)
+    xs = all_nats(words, size, rnd)
+    for x in xs {
+      for y in xs {
+        for m in ms {
+          for a in as_ {
+            want_z = nat_make(size)
+            want_c = ref_add_mul_vvww(want_z, x, y, m, a)
+            for inplace in [false, true] {
+              set_slice(xx, 1, x)
+              set_slice(yy, 2, y)
+              zz = zz0
+              if inplace {
+                zz = xx
+              } else {
+                for i in 0...zz.size {
+                  zz[i] = 0x9876
+                }
+              }
+              zz[0] = MAGIC0 + 3
+              zz[zz.size - 1] = MAGIC1 + 3
+              z = zz[1...1 + size]
+              c = add_mul_vvww(z, xx[1...1 + size], yy[1...1 + size], m, a)
+              return false if z != want_z || c != want_c
+              return false if !inplace && !check_slice(xx, 1, x, true)
+              return false if !check_slice(yy, 2, y, true)
+              return false if !check_slice(zz, 3, x, false)
+            }
+          }
+        }
+      }
+    }
+  }
+  true
+}
+
+def shift_words -> [U64] {
+  ws: [U64] = []
+  for s in t_shifts {
+    ws << s.as_u64
+  }
+  ws
+}
+
+test "AddVV" { assert check_vv(0), "addVV" }
+test "SubVV" { assert check_vv(1), "subVV" }
+test "AddVW" { assert check_vw(0, t_words4), "addVW" }
+test "SubVW" { assert check_vw(1, t_words4), "subVW" }
+test "LshVU" { assert check_vw(2, shift_words), "lshVU" }
+test "RshVU" { assert check_vw(3, shift_words), "rshVU" }
+test "MulAddVWW" { assert check_vww(t_muls), "mulAddVWW" }
+test "AddMulVVWW" { assert check_vvww(t_muls, t_adds), "addMulVVWW" }
+
+test "ShiftOverlap" {
+  for a in t_arglsh_vu {
+    b = nat_set(a.d)
+    z = b[a.zp...a.zp + a.l]
+    x = b[a.xp...a.xp + a.l]
+    c = lsh_vu(z, x, a.s)
+    assert_eq z, a.r
+    assert_eq c, a.c
+  }
+  for a in t_argrsh_vu {
+    b = nat_set(a.d)
+    z = b[a.zp...a.zp + a.l]
+    x = b[a.xp...a.xp + a.l]
+    c = rsh_vu(z, x, a.s)
+    assert_eq z, a.r
+    assert_eq c, a.c
+  }
+}
+
+test "Issue31084" {
+  n = 165
+  p = nat_exp_nn(nw([5]), nw([165]), nat_zero, false)
+  p = nat_lsh(p, n)
+  assert_eq Str.from_bytes(nat_utoa(p, 10)), "1" + "0" * n
+}
+
+ISSUE42838_VALUE = "159309191113245227702888039776771180559110455519261878607388585338616290151305816094308987472018268594098344692611135542392730712890625"
+
+test "Issue42838" {
+  s = 192
+  z, _b, _c = nat_scan(new_byte_reader(ISSUE42838_VALUE), 0, false).unwrap
+  z = nat_lsh(z, s)
+  assert_eq Str.from_bytes(nat_utoa(z, 10)), "1" + "0" * s
+}
+
+test "FunVWW" {
+  for a in t_prod_vww {
+    z = nat_make(a.z.size)
+    c = ref_mul_add_vww(z, a.x, a.y, a.r)
+    assert_eq z, a.z
+    assert_eq c, a.c
+    z2 = nat_make(a.z.size)
+    c2 = mul_add_vww(z2, a.x, a.y, a.r)
+    assert_eq z2, a.z
+    assert_eq c2, a.c
+    if a.y != 0 && a.r < a.y {
+      # divWVW: (c, z) / y = x, remainder r
+      q = nat_make(a.x.size)
+      r = div_wvw(q, a.c, a.z, a.y)
+      assert_eq q, a.x
+      assert_eq r, a.r
+    }
+  }
+}
+
+test "MulWW" {
+  for t in t_mul_ww_tests {
+    q, r = mul_ww(t.x, t.y)
+    assert_eq q, t.q
+    assert_eq r, t.r
+  }
+}
+
+test "MulAddWWW" {
+  for t in t_mul_add_www_tests {
+    q, r = mul_add_www(t.x, t.y, t.c)
+    assert_eq q, t.q
+    assert_eq r, t.r
+  }
+}
+
+test "DivWW" {
+  for t in t_div_ww_tests {
+    rec = reciprocal_word(t.y)
+    q, r = div_ww(t.x1, t.x0, t.y, rec)
+    assert_eq q, t.q
+    assert_eq r, t.r
+  }
+  rnd = new_word_rand(5)
+  bad = 0
+  for _i in 0...65536 {
+    x1 = rnd.next!
+    x0 = rnd.next!
+    y = rnd.next!
+    next if x1 >= y
+    rec = reciprocal_word(y)
+    q, r = div_ww(x1, x0, y, rec)
+    qw, rw = bits.div64(x1, x0, y)
+    bad += 1 if q != qw || r != rw
+  }
+  assert_eq bad, 0
+}

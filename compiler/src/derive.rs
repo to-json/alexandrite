@@ -285,6 +285,9 @@ impl<'a> Gen<'a> {
 
     fn classify(&self, t: &'a TypeExpr) -> GResult<Ty<'a>> {
         Ok(match t {
+            // A module's own `Int`/`Float` (math/big's) shadows the builtin;
+            // it brings its own json_enc / json_dec.
+            TypeExpr::Named(n, _) if self.shadowed(n) => Ty::Named(n),
             TypeExpr::Named(n, _) => {
                 if let Some(k) = IntKind::from_name(n) {
                     Ty::Int(k)
@@ -376,9 +379,15 @@ impl<'a> Gen<'a> {
         })
     }
 
+    /// Does the module declare its own type named like a builtin (`Int`)?
+    fn shadowed(&self, n: &str) -> bool {
+        crate::check::SHADOWABLE.contains(&n) && self.types.local.contains_key(n)
+    }
+
     /// A test for "empty" (Go's omitempty), or None if the type is never empty.
     fn empty(&self, t: &TypeExpr, x: &str) -> Option<String> {
         match t {
+            TypeExpr::Named(n, _) if self.shadowed(n) => None,
             TypeExpr::Named(n, _) if IntKind::from_name(n).is_some() => Some(format!("{x} == 0")),
             TypeExpr::Named(n, _) if n == "Float" => Some(format!("{x} == 0.0")),
             TypeExpr::Named(n, _) if n == "Bool" => Some(format!("!{x}")),
@@ -759,6 +768,7 @@ impl<'a> Gen<'a> {
     /// A spelled zero value for a primitive/container type.
     fn zero(&self, t: &TypeExpr) -> Option<String> {
         Some(match t {
+            TypeExpr::Named(n, _) if self.shadowed(n) => format!("{n}.json_zero"),
             TypeExpr::Named(n, _) if IntKind::from_name(n).is_some() => "0".into(),
             TypeExpr::Named(n, _) if n == "Float" => "0.0".into(),
             TypeExpr::Named(n, _) if n == "Bool" => "false".into(),

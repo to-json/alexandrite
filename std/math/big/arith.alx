@@ -1,0 +1,355 @@
+#![overflow(wrap)]
+# Word-level arithmetic: Go's arith.go (the portable "_g" versions), on
+# [U64] slices. Carries are computed with comparisons (`c: U64 = s < x ? 1 :
+# 0`), which C compilers turn into add-with-carry; the 128-bit product's high
+# word is the `__mulhi` intrinsic.
+#
+# The vector functions write through z, which may be the same slice as x
+# (or y) as in Go; they never allocate.
+
+# Bits per word (Go's _W) and bytes per word (_S).
+W = 64
+S = 8
+
+# Go's _M: the largest Word.
+MASK: U64 = 0xffffffffffffffff
+ONE: U64 = 1
+
+# x * y as (hi, lo).
+def mul_ww(x: U64, y: U64) -> (U64, U64) { (x.__mulhi(y), x * y) }
+
+# x * y + c as (hi, lo).
+def mul_add_www(x: U64, y: U64, c: U64) -> (U64, U64) {
+  hi = x.__mulhi(y)
+  lo = x * y
+  s = lo + c
+  cc: U64 = s < lo ? 1 : 0
+  (hi + cc, s)
+}
+
+# The number of leading zero bits of x.
+def nlz(x: U64) -> I64 {
+  return 64 if x == 0
+  n = 0
+  y = x
+  if y >> 32 == 0 {
+    n += 32
+    y <<= 32
+  }
+  if y >> 48 == 0 {
+    n += 16
+    y <<= 16
+  }
+  if y >> 56 == 0 {
+    n += 8
+    y <<= 8
+  }
+  if y >> 60 == 0 {
+    n += 4
+    y <<= 4
+  }
+  if y >> 62 == 0 {
+    n += 2
+    y <<= 2
+  }
+  if y >> 63 == 0 {
+    n += 1
+  }
+  n
+}
+
+# The number of trailing zero bits of x (64 for 0).
+def ntz(x: U64) -> I64 {
+  return 64 if x == 0
+  n = 0
+  y = x
+  if y & 0xffffffff == 0 {
+    n += 32
+    y >>= 32
+  }
+  if y & 0xffff == 0 {
+    n += 16
+    y >>= 16
+  }
+  if y & 0xff == 0 {
+    n += 8
+    y >>= 8
+  }
+  if y & 0xf == 0 {
+    n += 4
+    y >>= 4
+  }
+  if y & 3 == 0 {
+    n += 2
+    y >>= 2
+  }
+  if y & 1 == 0 {
+    n += 1
+  }
+  n
+}
+
+# The number of bits needed to represent x.
+def word_len(x: U64) -> I64 { 64 - nlz(x) }
+
+# z = x + y (all the same length), returning the carry.
+def add_vv(z: [U64], x: [U64], y: [U64]) -> U64 {
+  panic("addVV len") if x.size != z.size || y.size != z.size
+  c: U64 = 0
+  i = 0
+  n = z.size
+  while i < n {
+    xi = x[i]
+    s = xi + y[i]
+    c1: U64 = s < xi ? 1 : 0
+    t = s + c
+    c2: U64 = t < s ? 1 : 0
+    z[i] = t
+    c = c1 | c2
+    i += 1
+  }
+  c
+}
+
+# z = x - y (all the same length), returning the borrow.
+def sub_vv(z: [U64], x: [U64], y: [U64]) -> U64 {
+  panic("subVV len") if x.size != z.size || y.size != z.size
+  c: U64 = 0
+  i = 0
+  n = z.size
+  while i < n {
+    xi = x[i]
+    yi = y[i]
+    d = xi - yi
+    c1: U64 = xi < yi ? 1 : 0
+    t = d - c
+    c2: U64 = d < c ? 1 : 0
+    z[i] = t
+    c = c1 | c2
+    i += 1
+  }
+  c
+}
+
+# z = x + y (a word), returning the carry.
+def add_vw(z: [U64], x: [U64], y: U64) -> U64 {
+  panic("addVW len") if x.size != z.size
+  n = z.size
+  return y if n == 0
+  x0 = x[0]
+  s = x0 + y
+  z[0] = s
+  if s >= x0 {
+    copy(z[1...n], x[1...n])
+    return 0
+  }
+  i = 1
+  while i < n {
+    xi = x[i]
+    if xi != MASK {
+      z[i] = xi + 1
+      copy(z[i + 1...n], x[i + 1...n])
+      return 0
+    }
+    z[i] = 0
+    i += 1
+  }
+  1
+}
+
+# z = x - y (a word), returning the borrow.
+def sub_vw(z: [U64], x: [U64], y: U64) -> U64 {
+  panic("subVW len") if x.size != z.size
+  n = z.size
+  return y if n == 0
+  x0 = x[0]
+  z[0] = x0 - y
+  if x0 >= y {
+    copy(z[1...n], x[1...n])
+    return 0
+  }
+  i = 1
+  while i < n {
+    xi = x[i]
+    if xi != 0 {
+      z[i] = xi - 1
+      copy(z[i + 1...n], x[i + 1...n])
+      return 0
+    }
+    z[i] = MASK
+    i += 1
+  }
+  1
+}
+
+# z = x << s (0 <= s < 64), returning the bits shifted out of the top.
+def lsh_vu(z: [U64], x: [U64], s0: I64) -> U64 {
+  panic("lshVU len") if x.size != z.size
+  if s0 == 0 {
+    copy(z, x)
+    return 0
+  }
+  n = z.size
+  return 0 if n == 0
+  s = s0 & 63
+  sh = (64 - s) & 63
+  c = x[n - 1] >> sh
+  i = n - 1
+  while i > 0 {
+    z[i] = (x[i] << s) | (x[i - 1] >> sh)
+    i -= 1
+  }
+  z[0] = x[0] << s
+  c
+}
+
+# z = x >> s (0 <= s < 64), returning the bits shifted out of the bottom
+# (in the top bits of the result).
+def rsh_vu(z: [U64], x: [U64], s0: I64) -> U64 {
+  panic("rshVU len") if x.size != z.size
+  if s0 == 0 {
+    copy(z, x)
+    return 0
+  }
+  n = z.size
+  return 0 if n == 0
+  s = s0 & 63
+  sh = (64 - s) & 63
+  c = x[0] << sh
+  i = 1
+  while i < n {
+    z[i - 1] = (x[i - 1] >> s) | (x[i] << sh)
+    i += 1
+  }
+  z[n - 1] = x[n - 1] >> s
+  c
+}
+
+# z = x * y + r, returning the carry word.
+def mul_add_vww(z: [U64], x: [U64], y: U64, r: U64) -> U64 {
+  panic("mulAddVWW len") if x.size != z.size
+  c = r
+  i = 0
+  n = z.size
+  while i < n {
+    xi = x[i]
+    hi = xi.__mulhi(y)
+    lo = xi * y
+    s = lo + c
+    cc: U64 = s < lo ? 1 : 0
+    z[i] = s
+    c = hi + cc
+    i += 1
+  }
+  c
+}
+
+# z = x + y * m + a, returning the carry word.
+def add_mul_vvww(z: [U64], x: [U64], y: [U64], m: U64, a: U64) -> U64 {
+  panic("addMulVVWW len") if x.size != z.size || y.size != z.size
+  c = a
+  i = 0
+  n = z.size
+  while i < n {
+    yi = y[i]
+    hi = yi.__mulhi(m)
+    lo = yi * m
+    lo2 = lo + x[i]
+    c1: U64 = lo2 < lo ? 1 : 0
+    lo3 = lo2 + c
+    c2: U64 = lo3 < lo2 ? 1 : 0
+    z[i] = lo3
+    c = hi + c1 + c2
+    i += 1
+  }
+  c
+}
+
+# q = (x1<<64 + x0) / y, r = the remainder, given x1 < y and m the
+# reciprocal of y (reciprocal_word): Go's divWW.
+def div_ww(x1_: U64, x0_: U64, y_: U64, m: U64) -> (U64, U64) {
+  x1 = x1_
+  x0 = x0_
+  y = y_
+  s = nlz(y)
+  if s != 0 {
+    x1 = (x1 << s) | (x0 >> (64 - s))
+    x0 <<= s
+    y <<= s
+  }
+  d = y
+  # t1 = hi(m * x1) + x1 + carry(lo(m * x1) + x0)
+  t1 = m.__mulhi(x1)
+  t0 = m * x1
+  s0 = t0 + x0
+  c: U64 = s0 < t0 ? 1 : 0
+  t1 = t1 + x1 + c
+  qq = t1
+  # r = x - d * q
+  dq1 = d.__mulhi(qq)
+  dq0 = d * qq
+  r0 = x0 - dq0
+  b: U64 = x0 < dq0 ? 1 : 0
+  r1 = x1 - dq1 - b
+  if r1 != 0 {
+    qq += 1
+    r0 -= d
+  }
+  if r0 >= d {
+    qq += 1
+    r0 -= d
+  }
+  (qq, r0 >> s)
+}
+
+# The reciprocal of the divisor: (2^128 - 1) / d1' - 2^64, with d1' = d1
+# shifted to have its top bit set.
+def reciprocal_word(d1: U64) -> U64 {
+  u = d1 << nlz(d1)
+  x1 = ^u
+  rec, _r = div128(x1, MASK, u)
+  rec
+}
+
+# (hi<<64 + lo) / y for hi < y: a 128-by-64 division (math/bits.Div64).
+def div128(hi: U64, lo: U64, y0: U64) -> (U64, U64) {
+  panic("integer divide by zero") if y0 == 0
+  panic("integer overflow") if y0 <= hi
+  return (lo / y0, lo % y0) if hi == 0
+  s = nlz(y0)
+  y = y0 << s
+  two32: U64 = 1 << 32
+  mask32: U64 = two32 - 1
+  yn1 = y >> 32
+  yn0 = y & mask32
+  un32 = (hi << s) | (lo >> (64 - s))
+  un10 = lo << s
+  un1 = un10 >> 32
+  un0 = un10 & mask32
+  q1 = un32 / yn1
+  rhat = un32 - q1 * yn1
+  while q1 >= two32 || q1 * yn0 > two32 * rhat + un1 {
+    q1 -= 1
+    rhat += yn1
+    break if rhat >= two32
+  }
+  un21 = un32 * two32 + un1 - q1 * y
+  q0 = un21 / yn1
+  rhat = un21 - q0 * yn1
+  while q0 >= two32 || q0 * yn0 > two32 * rhat + un0 {
+    q0 -= 1
+    rhat += yn1
+    break if rhat >= two32
+  }
+  (q1 * two32 + q0, (un21 * two32 + un0 - q0 * y) >> s)
+}
+
+def imin(a: I64, b: I64) -> I64 {
+  return a if a < b
+  b
+}
+
+def imax(a: I64, b: I64) -> I64 {
+  return a if a > b
+  b
+}

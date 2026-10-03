@@ -6079,7 +6079,15 @@ impl<'w, 'a> FnCx<'w, 'a> {
                     }
                     FmtPiece::Exp(k, prec.unwrap_or(6), verb == "E")
                 }
-                _ => return Err(Diag::new(*fsp, format!("unsupported directive `%{spec}`")).note("supported so far (Go's fmt verbs): %v, %d, %s, %q, %t, %f, %e, %E, %x, %X, %o, %b, %c, %T, %%, with flags `-+0 `, a width and a precision")),
+                // `%g`: Go's shortest form, which is how a Float shows (`%v`).
+                "g" if prec.is_none() => {
+                    if t != Ty::Float {
+                        return Err(bad("a Float"));
+                    }
+                    FmtPiece::Str(k)
+                }
+                "g" | "G" => return Err(Diag::new(*fsp, format!("`%{spec}`: only `%g` (shortest, as Go) so far; no precision or `%G`"))),
+                _ => return Err(Diag::new(*fsp, format!("unsupported directive `%{spec}`")).note("supported so far (Go's fmt verbs): %v, %d, %s, %q, %t, %f, %e, %E, %g, %x, %X, %o, %b, %c, %T, %%, with flags `-+0 `, a width and a precision")),
             };
             // Integer precision: minimum digits; Go ignores the 0 flag then.
             let int_verb = matches!(verb, "d" | "i" | "x" | "X" | "o" | "b");

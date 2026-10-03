@@ -34,5 +34,5 @@ Open problems agents reported; each gets fixed in a compiler round between waves
 | 28 | math/big | no add-with-carry: big Mul/String ~2x Go | open (perf) |
 | 29 | math/big | tuple-returning functions get region mark/reset even when they don't allocate (`bits.add64` slow in loops) | open (perf) |
 | 30 | math/big | no mutable package globals (caches like Go's divisor table) | open (design) |
-| 31 | math/big | `format` has no `%g` | open |
+| 31 | math/big | `format` has no `%g` | fixed: `%g` (shortest, as Go); `%.Ng` and `%G` not yet |
 | 32 | math/big | a main file can't declare its own `Int`/`Float` (only packages can) | open (by design for now) |

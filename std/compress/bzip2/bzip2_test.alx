@@ -1,0 +1,155 @@
+# Go's bzip2_test.go.
+import "encoding/base64"
+import "encoding/hex"
+import "fmt"
+import "hash/crc32"
+import "io"
+import "os"
+import "strings"
+
+def h(s: Str) -> [Byte] { hex.decode_string(s).unwrap }
+
+def load(file: Str) -> [Byte] {
+  data = os.read_file(file).unwrap
+  return data if !strings.has_suffix(file, ".base64")
+  # Go's internal/obscuretestdata: base64-encoded test files.
+  base64.std_encoding().decode_string(strings.trim_space(Str.from_bytes(data))).unwrap
+}
+
+# Reads a slice without copying it.
+struct SliceReader {
+  data: [Byte]
+  st: [Int]
+
+  pub def read!(p: [Byte]) -> Int {
+    n = copy(p, data[st[0]...data.size])
+    self.st[0] += n
+    n
+  }
+}
+
+def slice_reader(data: [Byte]) -> SliceReader { SliceReader.new(data: data, st: [0]) }
+
+test "Reader" {
+  sawtooth: [Byte] = [0; 1 << 20]
+  i = 0
+  while i < sawtooth.size {
+    sawtooth[i] = i.as_u8
+    i += 1
+  }
+  zeros1m: [Byte] = [0; 1 << 20]
+  zeros32: [Byte] = [0; 32]
+  e: [Byte] = []
+  # (description, input, output, fail)
+  vectors = [
+    ("hello world",
+      h("425a68393141592653594eece83600000251800010400006449080200031064c" +
+          "4101a7a9a580bb9431f8bb9229c28482776741b0"),
+      "hello world\n".bytes.to_a, false),
+    ("concatenated files",
+      h("425a68393141592653594eece83600000251800010400006449080200031064c" +
+          "4101a7a9a580bb9431f8bb9229c28482776741b0425a68393141592653594eec" +
+          "e83600000251800010400006449080200031064c4101a7a9a580bb9431f8bb92" +
+          "29c28482776741b0"),
+      "hello world\nhello world\n".bytes.to_a, false),
+    ("32B zeros",
+      h("425a6839314159265359b5aa5098000000600040000004200021008283177245" +
+          "385090b5aa5098"),
+      zeros32, false),
+    ("1MiB zeros",
+      h("425a683931415926535938571ce50008084000c0040008200030cc0529a60806" +
+          "c4201e2ee48a70a12070ae39ca"),
+      zeros1m, false),
+    ("random data", load("testdata/pass-random1.bz2"), load("testdata/pass-random1.bin"), false),
+    ("random data - full symbol range", load("testdata/pass-random2.bz2"), load("testdata/pass-random2.bin"), false),
+    ("random data - uses RLE1 stage",
+      h("425a6839314159265359d992d0f60000137dfe84020310091c1e280e100e0428" +
+          "01099210094806c0110002e70806402000546034000034000000f28300000320" +
+          "00d3403264049270eb7a9280d308ca06ad28f6981bee1bf8160727c7364510d7" +
+          "3a1e123083421b63f031f63993a0f40051fbf177245385090d992d0f60"),
+      h("92d5652616ac444a4a04af1a8a3964aca0450d43d6cf233bd03233f4ba92f871" +
+          "9e6c2a2bd4f5f88db07ecd0da3a33b263483db9b2c158786ad6363be35d17335" +
+          "ba"), false),
+    ("1MiB sawtooth", load("testdata/pass-sawtooth.bz2"), sawtooth, false),
+    ("RLE2 buffer overrun - issue 5747", load("testdata/fail-issue5747.bz2.base64"), e, true),
+    ("out-of-range selector - issue 8363",
+      h("425a68393141592653594eece83600000251800010400006449080200031064c" +
+          "4101a7a9a580bb943117724538509000000000"), e, true),
+    ("bad block size - issue 13941",
+      h("425a683131415926535936dc55330063ffc0006000200020a40830008b0008b8" +
+          "bb9229c28481b6e2a998"), e, true),
+    ("bad huffman delta",
+      h("425a6836314159265359b1f7404b000000400040002000217d184682ee48a70a" +
+          "12163ee80960"), e, true),
+  ]
+  i = 0
+  for v in vectors {
+    r = io.read_all(new_reader(slice_reader(v[1])))
+    assert r.err? == v[3], "test #{i} (#{v[0]}): fail = #{r.err?}, want #{v[3]}"
+    if !v[3] {
+      assert r.unwrap_or(e) == v[2], "test #{i} (#{v[0]}): output mismatch"
+    }
+    i += 1
+  }
+}
+
+test "BitReader" {
+  # (bits to read, value, fail)
+  vectors = [(1, 1, false), (1, 0, false), (1, 1, false), (5, 11, false), (32, 0x12345678, false),
+    (15, 14495, false), (3, 6, false), (6, 13, false), (1, 0, true)]
+  br = new_bit_reader(slice_reader(h("ab12345678713f8d")))
+  i = 0
+  for v in vectors {
+    val = br.read_bits!(v[0])
+    assert (!br.err.none?) == v[2], "test #{i}: failure mismatch"
+    assert val == v[1], "test #{i}: read_bits!(#{v[0]}) = #{val}, want #{v[1]}" if !v[2]
+    i += 1
+  }
+}
+
+test "MTF" {
+  # (index, symbol)
+  vectors = [(1, 1), (0, 1), (1, 0), (4, 4), (1, 0)]
+  mtf: [Byte] = [0, 1, 2, 3, 4]
+  i = 0
+  for v in vectors {
+    sym = mtf_decode(mtf, v[0])
+    assert sym.to_i == v[1], "test #{i}: decode(#{v[0]}) = #{sym}, want #{v[1]}"
+    i += 1
+  }
+}
+
+test "ZeroRead" {
+  r = new_reader(slice_reader(h("425a6839314159265359b5aa5098000000600040000004200021008283177245385090b5aa5098")))
+  e: [Byte] = []
+  assert_eq ~r.read!(e), 0
+}
+
+# Go's BenchmarkDecodeDigits / Newton / Rand.
+bench "DecodeDigits" {
+  io.read_all(new_reader(slice_reader(load("testdata/e.txt.bz2")))).unwrap
+}
+
+bench "DecodeNewton" {
+  io.read_all(new_reader(slice_reader(load("testdata/Isaac.Newton-Opticks.txt.bz2")))).unwrap
+}
+
+bench "DecodeRand" {
+  io.read_all(new_reader(slice_reader(load("testdata/random.data.bz2")))).unwrap
+}
+
+# The size and CRC-32 of the decompression of `data`.
+def bunzip2_sum(data: [Byte]) -> Str {
+  out = io.read_all(new_reader(slice_reader(data))).unwrap
+  "#{out.size} #{fmt.sprintf("%08x", crc32.checksum_ieee(out))}"
+}
+
+test "testdata files" {
+  # The benchmark inputs decompress (sizes and CRC-32 from Go).
+  assert_eq bunzip2_sum(load("testdata/e.txt.bz2")), "100003 8dc3bbcb"
+  assert_eq bunzip2_sum(load("testdata/Isaac.Newton-Opticks.txt.bz2")), "567198 de1864c0"
+  assert_eq bunzip2_sum(load("testdata/random.data.bz2")), "16384 f2e49a4a"
+}
+
+# bunzip2_sum of hex data (the generated vectors).
+def vec_bunzip2(hx: Str) -> Str { bunzip2_sum(h(hx)) }

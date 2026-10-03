@@ -329,14 +329,20 @@ pub fn test(target: &str, t: &front::TestOpts, o: &Options) -> ExitCode {
             Ok(b) => b,
             Err(c) => return c,
         };
-        let bin = if bin.is_relative() { Path::new(".").join(&bin) } else { bin };
-        return match Command::new(&bin).status() {
+        let bin = std::fs::canonicalize(&bin).unwrap_or(bin);
+        // Tests run in the package's directory, as Go's do (testdata/ paths).
+        return match Command::new(&bin).current_dir(&dir).status() {
             Ok(s) => ExitCode::from(s.code().unwrap_or(1) as u8),
             Err(e) => {
                 eprintln!("alx: cannot run {}: {e}", bin.display());
                 ExitCode::from(3)
             }
         };
+    }
+    // Tests run in the package's directory, as Go's do (testdata/ paths).
+    if let Err(e) = std::env::set_current_dir(&dir) {
+        eprintln!("alx: cannot enter {}: {e}", dir.display());
+        return ExitCode::from(3);
     }
     run_loaded(l, &strict)
 }

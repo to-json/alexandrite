@@ -1,0 +1,630 @@
+#![overflow(wrap)]
+# Package bzip2: Go's compress/bzip2, bzip2 decompression (as in Go, there
+# is no compressor).
+#
+#   Go                                  alx
+#   NewReader(r) io.Reader              new_reader(r) -> Reader[R]
+#   (reader).Read                       r.read!
+#   StructuralError(s)                  Bzip2Error.Structural(msg)
+#
+# Error messages are Go's ("bzip2 data invalid: ...").
+#
+# Differences from Go:
+#  - read! returns 0 at the end of the stream (alx's io shape; Go: io.EOF).
+#    Input that ends early fails with io.StreamError.UnexpectedEof.
+#  - The Reader buffers its input (Go does too unless the input is an
+#    io.ByteReader), so it may read past the end of the bzip2 stream.
+#  - Errors are sticky: after a failure every read! fails the same way (Go
+#    repeats input errors but may try to go on after some structural ones).
+#  - Reader is generic over what it wraps and shares its state across
+#    copies (see compress/flate).
+
+import "io"
+import "slices"
+
+BZIP2_FILE_MAGIC = 0x425a
+BZIP2_BLOCK_MAGIC: U64 = 0x314159265359
+BZIP2_FINAL_MAGIC: U64 = 0x177245385090
+INVALID_NODE_VALUE = 0xffff
+
+pub error Bzip2Error {
+  # Invalid bzip2 data (Go's StructuralError).
+  Structural(msg: Str)
+
+  def message -> Str {
+    case self {
+      Structural(msg) => "bzip2 data invalid: #{msg}"
+    }
+  }
+}
+
+def structural(msg: Str) -> Error { Bzip2Error.Structural(msg: msg) }
+
+# The CRC table: polynomial 0x04C11DB7, most significant bit first.
+def make_crctab -> [U32] {
+  tab: [U32] = [0; 256]
+  i = 0
+  while i < 256 {
+    crc = i.as_u32 << 24
+    j = 0
+    while j < 8 {
+      if crc & 0x80000000 != 0 {
+        crc = (crc << 1) ^ 0x04C11DB7
+      } else {
+        crc = crc << 1
+      }
+      j += 1
+    }
+    tab[i] = crc
+    i += 1
+  }
+  tab
+}
+
+def update_crc(tab: [U32], val: U32, b: [Byte]) -> U32 {
+  crc = ^val
+  for v in b {
+    crc = tab[((crc >> 24).as_u8 ^ v).to_i] ^ (crc << 8)
+  }
+  ^crc
+}
+
+# ---- the bit reader (Go's bit_reader.go) ----
+
+struct BitReader[R] {
+  r: R
+  inbuf: [Byte]
+  ipos: Int
+  iend: Int
+  in_eof: Bool
+  in_err: Error?
+  n: U64
+  bits: Int
+  # The first error (io.StreamError.UnexpectedEof at the end of input).
+  err: Error?
+
+  def get!(p: [Byte]) -> ~Int { self.r.~read!(p) }
+
+  # The next raw byte, or -1 at the end of the input or on an error (in
+  # in_err).
+  def read_byte! -> Int {
+    if ipos == iend {
+      return -1 if in_eof || !in_err.none?
+      res = get!(inbuf)
+      if e = res.err {
+        self.in_err = e
+        return -1
+      }
+      k = res.unwrap_or(0)
+      if k == 0 {
+        self.in_eof = true
+        return -1
+      }
+      self.ipos = 0
+      self.iend = k
+    }
+    c = inbuf[ipos]
+    self.ipos += 1
+    c.to_i
+  }
+
+  # The next `nbits` bits (at most 64), most significant first; 0 on an
+  # error (in err).
+  def read_bits64!(nbits: Int) -> U64 {
+    while nbits > bits {
+      c = read_byte!
+      if c < 0 {
+        if e = in_err {
+          self.err = e
+        } else {
+          self.err = io.StreamError.UnexpectedEof
+        }
+        return 0
+      }
+      self.n = (n << 8) | c.as_u64
+      self.bits += 8
+    }
+    # Go's (1 << bits) - 1 for bits == 64 is all ones.
+    mask: U64 = nbits >= 64 ? 0xffffffffffffffff : (1.as_u64 << nbits) - 1
+    v = (n >> (bits - nbits)) & mask
+    self.bits -= nbits
+    v
+  }
+
+  def read_bits!(nbits: Int) -> Int { read_bits64!(nbits).to_i }
+
+  def read_bit! -> Bool { read_bits!(1) != 0 }
+}
+
+def new_bit_reader[R](r: R) -> BitReader[R] {
+  ib: [Byte] = [0; 4096]
+  BitReader[R].new(r: r, inbuf: ib, ipos: 0, iend: 0, in_eof: false, in_err: none, n: 0, bits: 0, err: none)
+}
+
+# ---- Huffman trees (Go's huffman.go) ----
+
+# A tree in arrays: node i has children left[i] / right[i], or, where a
+# child is INVALID_NODE_VALUE, the leaf value left_value[i] /
+# right_value[i]. Node 0 is the root.
+struct HuffmanTree {
+  left: [Int]
+  right: [Int]
+  left_value: [Int]
+  right_value: [Int]
+  next_node: Int
+}
+
+# The next symbol of br, decoded with t.
+def tree_decode[R](t: HuffmanTree, br: BitReader[R]) -> (Int, BitReader[R]) {
+  b = br
+  node = 0
+  loop {
+    bit = 0
+    if b.bits > 0 {
+      # Get the next bit, fast path.
+      b.bits -= 1
+      bit = ((b.n >> (b.bits & 63)) & 1).to_i
+    } else {
+      bit = b.read_bits!(1)
+    }
+    l = t.left[node]
+    r = t.right[node]
+    nxt = bit == 1 ? l : r
+    if nxt == INVALID_NODE_VALUE {
+      # A leaf.
+      return (bit == 1 ? t.left_value[node] : t.right_value[node], b)
+    }
+    node = nxt
+  }
+}
+
+# A tree from code lengths (lengths.size >= 2).
+def new_huffman_tree(lengths: [Byte]) -> ~HuffmanTree {
+  # Sort (length, value) pairs, packed as length << 16 | value.
+  pairs: [Int] = []
+  i = 0
+  while i < lengths.size {
+    pairs << ((lengths[i].to_i << 16) | i)
+    i += 1
+  }
+  slices.sort(pairs)
+  # Assign codes from the end (the longest), as Go's.
+  code = 0
+  length = 32
+  # codes: code << 14 | code length << 9 | value, sorted by code.
+  codes: [Int] = [0; lengths.size]
+  i = pairs.size - 1
+  while i >= 0 {
+    pl = pairs[i] >> 16
+    length = pl if length > pl
+    codes[i] = (code << 14) | (length << 9) | (pairs[i] & 0xffff)
+    code = (code + (1 << (32 - length))) & 0xffffffff
+    i -= 1
+  }
+  slices.sort(codes)
+  n = codes.size
+  t = HuffmanTree.new(left: zints(n), right: zints(n), left_value: zints(n), right_value: zints(n), next_node: 0)
+  _, t2 = ~build_huffman_node(t, codes, 0, n, 0)
+  t2
+}
+
+def zints(n: Int) -> [Int] {
+  b: [Int] = [0; n]
+  b
+}
+
+# Builds the node for codes[lo...hi] at `level`: (node index, tree).
+def build_huffman_node(t0: HuffmanTree, codes: [Int], lo: Int, hi: Int, level: Int) -> ~(Int, HuffmanTree) {
+  t = t0
+  test = 1 << (31 - level)
+  # Partition: codes with the level bit clear go left.
+  first_right = hi
+  i = lo
+  while i < hi {
+    if (codes[i] >> 14) & test != 0 {
+      first_right = i
+      break
+    }
+    i += 1
+  }
+  nleft = first_right - lo
+  nright = hi - first_right
+  if nleft == 0 || nright == 0 {
+    # A tree with all codes on one side: there are no symbols.
+    fail structural("empty Huffman tree") if hi - lo < 2
+    # Equal symbols in the tree are invalid.
+    fail structural("equal symbols in Huffman tree") if level == 31
+    return ~build_huffman_node(t, codes, lo, hi, level + 1)
+  }
+  node = t.next_node
+  t.next_node += 1
+  if nleft == 1 {
+    t.left[node] = INVALID_NODE_VALUE
+    t.left_value[node] = codes[lo] & 0x1ff
+  } else {
+    l, t1 = ~build_huffman_node(t, codes, lo, first_right, level + 1)
+    t = t1
+    t.left[node] = l
+  }
+  if nright == 1 {
+    t.right[node] = INVALID_NODE_VALUE
+    t.right_value[node] = codes[first_right] & 0x1ff
+  } else {
+    r, t1 = ~build_huffman_node(t, codes, first_right, hi, level + 1)
+    t = t1
+    t.right[node] = r
+  }
+  (node, t)
+}
+
+# ---- move-to-front (Go's move_to_front.go) ----
+
+# The symbol at n, moved to the front.
+def mtf_decode(m: [Byte], n: Int) -> Byte {
+  b = m[n]
+  i = n
+  while i > 0 {
+    m[i] = m[i - 1]
+    i -= 1
+  }
+  m[0] = b
+  b
+}
+
+# ---- the reader (Go's bzip2.go) ----
+
+struct Decompressor[R] {
+  br: BitReader[R]
+  file_crc: U32
+  block_crc: U32
+  want_block_crc: U32
+  # The bzip2 header has been read.
+  setup_done: Bool
+  eof: Bool
+  # The block size in bytes (900 * 1000 for level 9).
+  block_size: Int
+  # The C array of the inverse BWT.
+  c: [Int]
+  # bzip2's tt: the BWT output, with the P array in the upper 24 bits.
+  tt: [U32]
+  # The index of the next output byte in tt.
+  t_pos: U32
+  # The data still to go through the run-length decoding: tt[0...pre_rle].
+  pre_rle: Int
+  pre_rle_used: Int
+  # The last byte value seen, the repeats of it seen, the copies of it to
+  # output.
+  last_byte: Int
+  byte_repeats: Int
+  repeats: Int
+  crctab: [U32]
+  err: Error?
+
+  # Reads the stream header (the magic, unless continuing).
+  def setup!(need_magic: Bool) -> ~Unit {
+    if need_magic {
+      fail structural("bad magic value") if self.br.read_bits!(16) != BZIP2_FILE_MAGIC
+    }
+    fail structural("non-Huffman entropy encoding") if self.br.read_bits!(8) != 104
+    level = self.br.read_bits!(8)
+    fail structural("invalid compression level") if level < 49 || level > 57
+    self.file_crc = 0
+    self.block_size = 100 * 1000 * (level - 48)
+    self.tt = zu32(block_size) if block_size > tt.size
+  }
+
+  # Output from the current block: the run-length decoding.
+  def read_from_block!(buf: [Byte]) -> Int {
+    # bzip2 is a block-based format: data from this block is returned until
+    # it runs out, then the caller reads the next block.
+    n = 0
+    tab = self.tt
+    while (repeats > 0 || pre_rle_used < pre_rle) && n < buf.size {
+      # Output the repeats of the last byte, if any.
+      if repeats > 0 {
+        buf[n] = last_byte.as_u8
+        n += 1
+        self.repeats -= 1
+        self.last_byte = -1 if repeats == 0
+        next
+      }
+      self.t_pos = tab[t_pos.to_i]
+      bv = t_pos.as_u8
+      self.t_pos = t_pos >> 8
+      self.pre_rle_used += 1
+      # After four equal bytes, the fifth is a repeat count.
+      if byte_repeats == 3 {
+        self.repeats = bv.to_i
+        self.byte_repeats = 0
+        next
+      }
+      if last_byte == bv.to_i {
+        self.byte_repeats += 1
+      } else {
+        self.byte_repeats = 0
+      }
+      self.last_byte = bv.to_i
+      buf[n] = bv
+      n += 1
+    }
+    n
+  }
+
+  def read_inner!(buf: [Byte]) -> ~Int {
+    loop {
+      n = read_from_block!(buf)
+      if n > 0 || buf.size == 0 {
+        self.block_crc = update_crc(crctab, block_crc, buf[0...n])
+        return n
+      }
+      # The block is done: check its CRC and go on to the next.
+      fail structural("block checksum mismatch") if block_crc != want_block_crc
+      magic = self.br.read_bits64!(48)
+      if magic == BZIP2_BLOCK_MAGIC {
+        ~read_block!
+      } else if magic == BZIP2_FINAL_MAGIC {
+        want_file_crc = self.br.read_bits64!(32).as_u32
+        if e = br.err {
+          fail e
+        }
+        fail structural("file checksum mismatch") if file_crc != want_file_crc
+        # Skip to the byte boundary; a concatenated file may follow.
+        self.br.read_bits!(br.bits % 8) if br.bits % 8 != 0
+        b = self.br.read_byte!
+        if b < 0 {
+          if e = br.in_err {
+            fail e
+          }
+          self.eof = true
+          return 0
+        }
+        z = self.br.read_byte!
+        if z < 0 {
+          if e = br.in_err {
+            fail e
+          }
+          fail io.StreamError.UnexpectedEof
+        }
+        fail structural("bad magic value in continuation file") if b != 66 || z != 90
+        ~setup!(false)
+      } else {
+        fail structural("bad magic value found")
+      }
+    }
+  }
+
+  def read!(buf: [Byte]) -> ~Int {
+    if e = err {
+      fail e
+    }
+    return 0 if eof
+    if !setup_done {
+      r = setup!(true)
+      if e = br.err {
+        self.err = e
+        fail e
+      }
+      if e = r.err {
+        self.err = e
+        fail e
+      }
+      self.setup_done = true
+    }
+    res = read_inner!(buf)
+    if e = br.err {
+      self.err = e
+      fail e
+    }
+    if e = res.err {
+      self.err = e
+      fail e
+    }
+    res.unwrap_or(0)
+  }
+
+  # Reads a block (bzip2's format: an undocumented mess; see
+  # https://en.wikipedia.org/wiki/Bzip2).
+  def read_block! -> ~Unit {
+    self.want_block_crc = self.br.read_bits64!(32).as_u32
+    self.block_crc = 0
+    self.file_crc = ((file_crc << 1) | (file_crc >> 31)) ^ want_block_crc
+    # Randomized files are deprecated and unsupported.
+    fail structural("deprecated randomized files") if self.br.read_bits!(1) != 0
+    orig_ptr = self.br.read_bits!(24)
+    # The symbols used: a 16-bit map of which 16-symbol ranges are present,
+    # then 16 bits for each of those.
+    symbol_range_used_bitmap = self.br.read_bits!(16)
+    symbol_present: [Bool] = [false; 256]
+    num_symbols = 0
+    sym_range = 0
+    while sym_range < 16 {
+      if symbol_range_used_bitmap & (1 << (15 - sym_range)) != 0 {
+        bs = self.br.read_bits!(16)
+        symbol = 0
+        while symbol < 16 {
+          if bs & (1 << (15 - symbol)) != 0 {
+            symbol_present[16 * sym_range + symbol] = true
+            num_symbols += 1
+          }
+          symbol += 1
+        }
+      }
+      sym_range += 1
+    }
+    fail structural("no symbols in input") if num_symbols == 0
+    # The Huffman trees, then which tree each 50 symbols use (the selectors,
+    # move-to-front coded).
+    num_huffman_trees = self.br.read_bits!(3)
+    fail structural("invalid number of Huffman trees") if num_huffman_trees < 2 || num_huffman_trees > 6
+    num_selectors = self.br.read_bits!(15)
+    tree_indexes: [Byte] = [0; num_selectors]
+    mtf_tree: [Byte] = [0; num_huffman_trees]
+    i = 0
+    while i < num_huffman_trees {
+      mtf_tree[i] = i.as_u8
+      i += 1
+    }
+    i = 0
+    while i < num_selectors {
+      ci = 0
+      loop {
+        break if self.br.read_bits!(1) == 0
+        ci += 1
+      }
+      fail structural("tree index too large") if ci >= num_huffman_trees
+      tree_indexes[i] = mtf_decode(mtf_tree, ci)
+      i += 1
+    }
+    # The symbols in use, in order.
+    symbols: [Byte] = [0; num_symbols]
+    next_symbol = 0
+    i = 0
+    while i < 256 {
+      if symbol_present[i] {
+        symbols[next_symbol] = i.as_u8
+        next_symbol += 1
+      }
+      i += 1
+    }
+    mtf = symbols
+    # RUNA and RUNB.
+    num_symbols += 2
+    trees: [HuffmanTree] = []
+    lengths: [Byte] = [0; num_symbols]
+    i = 0
+    while i < num_huffman_trees {
+      # Delta-coded code lengths.
+      length = self.br.read_bits!(5)
+      j = 0
+      while j < num_symbols {
+        loop {
+          fail structural("Huffman length out of range") if length < 1 || length > 20
+          break if !self.br.read_bit!
+          if self.br.read_bit! {
+            length -= 1
+          } else {
+            length += 1
+          }
+        }
+        lengths[j] = length.as_u8
+        j += 1
+      }
+      trees << ~new_huffman_tree(lengths)
+      i += 1
+    }
+    # The next tree index to use.
+    selector_index = 1
+    fail structural("no tree selectors given") if tree_indexes.size == 0
+    fail structural("tree selector out of range") if tree_indexes[0].to_i >= trees.size
+    current = trees[tree_indexes[0].to_i]
+    # The index in tt.
+    buf_index = 0
+    repeat = 0
+    repeat_power = 0
+    cc = self.c
+    i = 0
+    while i < 256 {
+      cc[i] = 0
+      i += 1
+    }
+    tab = self.tt
+    bsize = block_size
+    # The symbols decoded with the current tree.
+    decoded = 0
+    loop {
+      if decoded == 50 {
+        fail structural("insufficient selector indices for number of symbols") if selector_index >= num_selectors
+        fail structural("tree selector out of range") if tree_indexes[selector_index].to_i >= trees.size
+        current = trees[tree_indexes[selector_index].to_i]
+        selector_index += 1
+        decoded = 0
+      }
+      v, b2 = tree_decode(current, br)
+      self.br = b2
+      decoded += 1
+      if v < 2 {
+        # A run of the first MTF symbol: RUNA / RUNB digits of a bijective
+        # base-2 number.
+        repeat_power = 1 if repeat == 0
+        repeat += repeat_power << v
+        repeat_power = repeat_power << 1
+        # Limit the repeat count (as Go: the longest input bzip2 makes).
+        fail structural("repeat count too large") if repeat > 2 * 1024 * 1024
+        next
+      }
+      if repeat > 0 {
+        # The run ended: output it.
+        fail structural("repeats past end of block") if repeat > bsize - buf_index
+        k = 0
+        while k < repeat {
+          b = mtf[0]
+          tab[buf_index] = b.as_u32
+          cc[b.to_i] += 1
+          buf_index += 1
+          k += 1
+        }
+        repeat = 0
+      }
+      # The end of the block.
+      break if v == num_symbols - 1
+      # Symbol 2 is MTF index 1, and so on.
+      b = mtf_decode(mtf, v - 1)
+      fail structural("data exceeds block size") if buf_index >= bsize
+      tab[buf_index] = b.as_u32
+      cc[b.to_i] += 1
+      buf_index += 1
+    }
+    fail structural("origPtr out of bounds") if orig_ptr >= buf_index
+    # The inverse BWT, into the top 24 bits of tt.
+    self.pre_rle = buf_index
+    self.pre_rle_used = 0
+    self.t_pos = inverse_bwt(tab, buf_index, orig_ptr, cc)
+    self.last_byte = -1
+    self.byte_repeats = 0
+    self.repeats = 0
+  }
+}
+
+# The inverse Burrows-Wheeler transform (Go's inverseBWT): tt[i] gets the
+# next index in its upper 24 bits; returns the starting index.
+def inverse_bwt(tt: [U32], n: Int, orig_ptr: Int, c: [Int]) -> U32 {
+  sum = 0
+  i = 0
+  while i < 256 {
+    sum += c[i]
+    c[i] = sum - c[i]
+    i += 1
+  }
+  i = 0
+  while i < n {
+    b = (tt[i] & 0xff).to_i
+    tt[c[b]] = tt[c[b]] | (i.as_u32 << 8)
+    c[b] += 1
+    i += 1
+  }
+  tt[orig_ptr] >> 8
+}
+
+def zu32(n: Int) -> [U32] {
+  b: [U32] = [0; n]
+  b
+}
+
+# Decompresses the bzip2 data read from R (Go's NewReader result).
+pub struct Reader[R] {
+  st: [Decompressor[R]]
+
+  # Decompresses into p; returns the count, 0 at the end of the stream.
+  pub def read!(p: [Byte]) -> ~Int {
+    self.st[0].~read!(p)
+  }
+}
+
+# A Reader decompressing the bzip2 data read from r (one or more
+# concatenated bzip2 streams).
+pub def new_reader[R](r: R) -> Reader[R] {
+  tt: [U32] = []
+  Reader[R].new(st: [Decompressor[R].new(br: new_bit_reader(r), file_crc: 0, block_crc: 0, want_block_crc: 0,
+    setup_done: false, eof: false, block_size: 0, c: zints(256), tt: tt, t_pos: 0, pre_rle: 0, pre_rle_used: 0,
+    last_byte: 0, byte_repeats: 0, repeats: 0, crctab: make_crctab(), err: none)])
+}

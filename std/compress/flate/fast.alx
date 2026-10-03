@@ -1,0 +1,1040 @@
+#![overflow(wrap)]
+# The level 1-6 encoders (Go's deflatefast.go and level1.go ... level6.go).
+#
+# Level 1: one small table, 5-byte hashes, sparse indexing.
+# Level 2: one big table, 5-byte hashes, indexing about every 2 bytes.
+# Level 3: one medium table, 5-byte hashes, 2 candidates per entry.
+# Level 4: two tables, 4/7-byte hashes, 1 candidate per entry.
+# Level 5: two tables, 4/7-byte hashes, 2 candidates per 7-byte entry.
+# Level 6: two tables, 4/7-byte hashes, full indexing, checks repeats.
+#
+# Go's tables of tableEntry / tableEntryPrev are [I32] here; a
+# tableEntryPrev at hash h is (cur, prev) = (t[2h], t[2h + 1]).
+
+import mbits "math/bits"
+
+# Bits of the hash tables.
+TABLE_BITS = 15
+TABLE_SIZE = 32768
+L2_TABLE_BITS = 17
+L3_TABLE_BITS = 16
+# The smallest match offset.
+BASE_MATCH_OFFSET = 1
+# The smallest match length per RFC section 3.2.5.
+BASE_MATCH_LENGTH = 3
+# The largest match offset.
+MAX_MATCH_OFFSET = 32768
+# The history preallocated.
+ALLOC_HISTORY = MAX_STORE_BLOCK_SIZE * 5
+# The buffer offset at which the history is reset.
+BUFFER_RESET = (1 << 31) - ALLOC_HISTORY - MAX_STORE_BLOCK_SIZE - 1
+INPUT_MARGIN = 12 - 1
+MIN_NON_LITERAL_BLOCK_SIZE = 1 + 1 + INPUT_MARGIN
+
+PRIME4: U32 = 2654435761
+PRIME5: U64 = 889523592379
+PRIME7: U64 = 58295818150454627
+
+def hash4(u: U64, b: Int) -> Int {
+  ((u.as_u32 * PRIME4) >> (32 - b)).to_i
+}
+
+def hash5(u: U64, b: Int) -> Int {
+  (((u << 24) * PRIME5) >> (64 - b)).to_i
+}
+
+def hash7(u: U64, b: Int) -> Int {
+  (((u << 8) * PRIME7) >> (64 - b)).to_i
+}
+
+def load32(b: [Byte], i: Int) -> U32 {
+  b[i].as_u32 | (b[i + 1].as_u32 << 8) | (b[i + 2].as_u32 << 16) | (b[i + 3].as_u32 << 24)
+}
+
+def load64(b: [Byte], i: Int) -> U64 {
+  b[i].as_u64 | (b[i + 1].as_u64 << 8) | (b[i + 2].as_u64 << 16) | (b[i + 3].as_u64 << 24) | (b[i + 4].as_u64 << 32) | (b[i + 5].as_u64 << 40) | (b[i + 6].as_u64 << 48) | (b[i + 7].as_u64 << 56)
+}
+
+# The length of the common prefix of src[s...end] and src[t...] (t <= s).
+def match_len(src: [Byte], s: Int, t: Int, end: Int) -> Int {
+  n = 0
+  left = end - s
+  while left >= 8 {
+    diff = load64(src, s + n) ^ load64(src, t + n)
+    if diff != 0 {
+      return n + (mbits.trailing_zeros64(diff) >> 3)
+    }
+    n += 8
+    left -= 8
+  }
+  while n < end - s && src[s + n] == src[t + n] {
+    n += 1
+  }
+  n
+}
+
+# Go's matchLenLong.
+def match_len_long(s: Int, t: Int, src: [Byte]) -> Int {
+  match_len(src, s, t, src.size)
+}
+
+# Go's matchLenLimited: at most 254.
+def match_len_limited(s: Int, t: Int, src: [Byte]) -> Int {
+  end = s + MAX_MATCH_LENGTH - 4
+  end = src.size if end > src.size
+  match_len(src, s, t, end)
+}
+
+# Appends the literals src[from...to] to dst.
+def emit_literals(dst: Tokens, src: [Byte], from: Int, to: Int) -> Int {
+  toks = dst.toks
+  lh = dst.lit_hist
+  n = dst.n
+  i = from
+  while i < to {
+    v = src[i]
+    toks[n] = v.as_u32
+    lh[v.to_i] += 1
+    n += 1
+    i += 1
+  }
+  n
+}
+
+# (cur, prev) at h becomes (v, cur).
+def push2(t: [I32], h: Int, v: Int) {
+  t[2 * h + 1] = t[2 * h]
+  t[2 * h] = v.as_i32
+  nil
+}
+
+def new_fast_enc(level: Int) -> FastEnc {
+  t: [I32] = []
+  bt: [I32] = []
+  if level == 1 {
+    t = zi32(TABLE_SIZE)
+  } else if level == 2 {
+    t = zi32(1 << L2_TABLE_BITS)
+  } else if level == 3 {
+    t = zi32(2 << L3_TABLE_BITS)
+  } else if level == 4 {
+    t = zi32(TABLE_SIZE)
+    bt = zi32(TABLE_SIZE)
+  } else {
+    t = zi32(TABLE_SIZE)
+    bt = zi32(2 * TABLE_SIZE)
+  }
+  h: [Byte] = []
+  FastEnc.new(level: level, hist: h, hist_len: 0, cur: MAX_STORE_BLOCK_SIZE, table: t, btable: bt)
+}
+
+def zero_i32(xs: [I32]) {
+  i = 0
+  while i < xs.size {
+    xs[i] = 0
+    i += 1
+  }
+  nil
+}
+
+# Moves the entries of t down by cur - MAX_MATCH_OFFSET, zeroing those at
+# or below min_off.
+def shift_table(t: [I32], min_off: Int, cur: Int) {
+  i = 0
+  while i < t.size {
+    v = t[i].to_i
+    if v <= min_off {
+      v = 0
+    } else {
+      v = v - cur + MAX_MATCH_OFFSET
+    }
+    t[i] = v.as_i32
+    i += 1
+  }
+  nil
+}
+
+# Like shift_table for (cur, prev) pairs where prev is dropped with cur
+# (levels 5 and 6).
+def shift_table_prev(t: [I32], min_off: Int, cur: Int) {
+  i = 0
+  while i < t.size {
+    c = t[i].to_i
+    p = t[i + 1].to_i
+    if c <= min_off {
+      c = 0
+      p = 0
+    } else {
+      c = c - cur + MAX_MATCH_OFFSET
+      if p <= min_off {
+        p = 0
+      } else {
+        p = p - cur + MAX_MATCH_OFFSET
+      }
+    }
+    t[i] = c.as_i32
+    t[i + 1] = p.as_i32
+    i += 2
+  }
+  nil
+}
+
+# A level 1-6 encoder: the match tables and the history of earlier blocks
+# (Go's fastEncL1 ... fastEncL6 with their fastGen).
+struct FastEnc {
+  level: Int
+  # History: hist[0...hist_len]; hist.size is the capacity.
+  hist: [Byte]
+  hist_len: Int
+  cur: Int
+  table: [I32]
+  btable: [I32]
+
+  # Appends src to the history; returns where it starts.
+  def add_block!(src: [Byte]) -> Int {
+    if hist_len + src.size > hist.size {
+      if hist.size == 0 {
+        self.hist = zbytes(ALLOC_HISTORY)
+      } else {
+        # Move down.
+        offset = hist_len - MAX_MATCH_OFFSET
+        copy(hist[0...MAX_MATCH_OFFSET], hist[offset...offset + MAX_MATCH_OFFSET])
+        self.cur += offset
+        self.hist_len = MAX_MATCH_OFFSET
+      }
+    }
+    s = hist_len
+    copy(hist[s...s + src.size], src)
+    self.hist_len += src.size
+    s
+  }
+
+  # Starts a new stream: nothing earlier is matched.
+  def reset! {
+    self.hist = zbytes(ALLOC_HISTORY) if hist.size < ALLOC_HISTORY
+    # Offset the position so everything is out of reach.
+    self.cur += MAX_MATCH_OFFSET + hist_len if cur <= BUFFER_RESET
+    self.hist_len = 0
+    nil
+  }
+
+  # Protects against cur wraparound.
+  def protect! {
+    while cur >= BUFFER_RESET {
+      if hist_len == 0 {
+        zero_i32(table)
+        zero_i32(btable)
+        self.cur = MAX_MATCH_OFFSET
+        break
+      }
+      # Shift down everything in the tables that isn't already too far away.
+      min_off = cur + hist_len - MAX_MATCH_OFFSET
+      if level == 3 {
+        shift_table(table, min_off, cur)
+      } else if level >= 5 {
+        shift_table(table, min_off, cur)
+        shift_table_prev(btable, min_off, cur)
+      } else {
+        shift_table(table, min_off, cur)
+        shift_table(btable, min_off, cur)
+      }
+      self.cur = MAX_MATCH_OFFSET
+    }
+    nil
+  }
+
+  # Encodes src into dst (whose n must be 0); returns dst's new n. A block
+  # too small to encode only sets n to its size, as Go's does.
+  def encode!(dst: Tokens, src: [Byte]) -> Int {
+    protect!
+    s = add_block!(src)
+    return src.size if src.size < MIN_NON_LITERAL_BLOCK_SIZE
+    case level {
+      1 => encode_l1(dst, s)
+      2 => encode_l2(dst, s)
+      3 => encode_l3(dst, s)
+      4 => encode_l4(dst, s)
+      5 => encode_l5(dst, s)
+      _ => encode_l6(dst, s)
+    }
+  }
+
+  def encode_l1(dst0: Tokens, s0: Int) -> Int {
+    dst = dst0
+    src = hist[0...hist_len]
+    tab = self.table
+    cr = self.cur
+    s = s0
+    next_emit = s
+    s_limit = src.size - INPUT_MARGIN
+    cv = load64(src, s)
+    finished = false
+    while !finished {
+      next_s = s
+      t = 0
+      found = false
+      loop {
+        next_hash = hash5(cv, TABLE_BITS)
+        cand = tab[next_hash].to_i
+        next_s = s + 2 + ((s - next_emit) >> 5)
+        break if next_s > s_limit
+        now = load64(src, next_s)
+        tab[next_hash] = (s + cr).as_i32
+        next_hash = hash5(now, TABLE_BITS)
+        t = cand - cr
+        if s - t < MAX_MATCH_OFFSET && cv.as_u32 == load32(src, t) {
+          tab[next_hash] = (next_s + cr).as_i32
+          found = true
+          break
+        }
+        # Do one right away.
+        cv = now
+        s = next_s
+        next_s += 1
+        cand = tab[next_hash].to_i
+        now = now >> 8
+        tab[next_hash] = (s + cr).as_i32
+        t = cand - cr
+        if s - t < MAX_MATCH_OFFSET && cv.as_u32 == load32(src, t) {
+          tab[next_hash] = (next_s + cr).as_i32
+          found = true
+          break
+        }
+        cv = now
+        s = next_s
+      }
+      break if !found
+      loop {
+        # A 4-byte match at s: extend it.
+        l = match_len_long(s + 4, t + 4, src) + 4
+        # Extend backwards.
+        while t > 0 && s > next_emit && src[t - 1] == src[s - 1] {
+          s -= 1
+          t -= 1
+          l += 1
+        }
+        dst.n = emit_literals(dst, src, next_emit, s) if next_emit < s
+        dst.add_match_long!(l, (s - t - BASE_MATCH_OFFSET).as_u32)
+        s += l
+        next_emit = s
+        s = next_s + 1 if next_s >= s
+        if s >= s_limit {
+          # Index the first pair after the match end.
+          if s + l + 8 < src.size {
+            tab[hash5(load64(src, s), TABLE_BITS)] = (s + cr).as_i32
+          }
+          finished = true
+          break
+        }
+        # Update the table at s - 2 and at s, and check for a match at s.
+        x = load64(src, s - 2)
+        o = cr + s - 2
+        tab[hash5(x, TABLE_BITS)] = o.as_i32
+        x = x >> 16
+        curr_hash = hash5(x, TABLE_BITS)
+        cand = tab[curr_hash].to_i
+        tab[curr_hash] = (o + 2).as_i32
+        t = cand - cr
+        if s - t > MAX_MATCH_OFFSET || x.as_u32 != load32(src, t) {
+          cv = x >> 8
+          s += 1
+          break
+        }
+      }
+    }
+    if next_emit < src.size {
+      # If nothing was added, don't encode literals.
+      return 0 if dst.n == 0
+      dst.n = emit_literals(dst, src, next_emit, src.size)
+    }
+    dst.n
+  }
+
+  def encode_l2(dst0: Tokens, s0: Int) -> Int {
+    dst = dst0
+    src = hist[0...hist_len]
+    tab = self.table
+    cr = self.cur
+    s = s0
+    next_emit = s
+    s_limit = src.size - INPUT_MARGIN
+    cv = load64(src, s)
+    finished = false
+    while !finished {
+      next_s = s
+      cand = 0
+      found = false
+      loop {
+        next_hash = hash5(cv, L2_TABLE_BITS)
+        s = next_s
+        next_s = s + 2 + ((s - next_emit) >> 5)
+        break if next_s > s_limit
+        cand = tab[next_hash].to_i
+        now = load64(src, next_s)
+        tab[next_hash] = (s + cr).as_i32
+        next_hash = hash5(now, L2_TABLE_BITS)
+        if s - (cand - cr) < MAX_MATCH_OFFSET && cv.as_u32 == load32(src, cand - cr) {
+          tab[next_hash] = (next_s + cr).as_i32
+          found = true
+          break
+        }
+        # Do one right away.
+        cv = now
+        s = next_s
+        next_s += 1
+        cand = tab[next_hash].to_i
+        now = now >> 8
+        tab[next_hash] = (s + cr).as_i32
+        if s - (cand - cr) < MAX_MATCH_OFFSET && cv.as_u32 == load32(src, cand - cr) {
+          found = true
+          break
+        }
+        cv = now
+      }
+      break if !found
+      loop {
+        t = cand - cr
+        l = match_len_long(s + 4, t + 4, src) + 4
+        while t > 0 && s > next_emit && src[t - 1] == src[s - 1] {
+          s -= 1
+          t -= 1
+          l += 1
+        }
+        dst.n = emit_literals(dst, src, next_emit, s) if next_emit < s
+        dst.add_match_long!(l, (s - t - BASE_MATCH_OFFSET).as_u32)
+        s += l
+        next_emit = s
+        s = next_s + 1 if next_s >= s
+        if s >= s_limit {
+          if s + l + 8 < src.size {
+            tab[hash5(load64(src, s), L2_TABLE_BITS)] = (s + cr).as_i32
+          }
+          finished = true
+          break
+        }
+        # Store every second hash in-between, offset by 1.
+        i = s - l + 2
+        while i < s - 5 {
+          x = load64(src, i)
+          tab[hash5(x, L2_TABLE_BITS)] = (cr + i).as_i32
+          x = x >> 16
+          tab[hash5(x, L2_TABLE_BITS)] = (cr + i + 2).as_i32
+          x = x >> 16
+          tab[hash5(x, L2_TABLE_BITS)] = (cr + i + 4).as_i32
+          i += 7
+        }
+        # Update the table at s - 2 to s.
+        x = load64(src, s - 2)
+        o = cr + s - 2
+        prev_hash = hash5(x, L2_TABLE_BITS)
+        prev_hash2 = hash5(x >> 8, L2_TABLE_BITS)
+        tab[prev_hash] = o.as_i32
+        tab[prev_hash2] = (o + 1).as_i32
+        curr_hash = hash5(x >> 16, L2_TABLE_BITS)
+        cand = tab[curr_hash].to_i
+        tab[curr_hash] = (o + 2).as_i32
+        if s - (cand - cr) > MAX_MATCH_OFFSET || (x >> 16).as_u32 != load32(src, cand - cr) {
+          cv = x >> 24
+          s += 1
+          break
+        }
+      }
+    }
+    if next_emit < src.size {
+      return 0 if dst.n == 0
+      dst.n = emit_literals(dst, src, next_emit, src.size)
+    }
+    dst.n
+  }
+
+  def encode_l3(dst0: Tokens, s0: Int) -> Int {
+    dst = dst0
+    src = hist[0...hist_len]
+    tab = self.table
+    cr = self.cur
+    s = s0
+    next_emit = s
+    s_limit = src.size - INPUT_MARGIN
+    cv = load64(src, s)
+    finished = false
+    while !finished {
+      next_s = s
+      cand = 0
+      found = false
+      loop {
+        next_hash = hash5(cv, L3_TABLE_BITS)
+        s = next_s
+        next_s = s + 1 + ((s - next_emit) >> 7)
+        break if next_s > s_limit
+        c_cur = tab[2 * next_hash].to_i
+        c_prev = tab[2 * next_hash + 1].to_i
+        now = load64(src, next_s)
+        # A safe offset distance until s + 4.
+        min_offset = cr + s - (MAX_MATCH_OFFSET - 4)
+        tab[2 * next_hash + 1] = c_cur.as_i32
+        tab[2 * next_hash] = (s + cr).as_i32
+        # Check both candidates.
+        cand = c_cur
+        if cand < min_offset {
+          cv = now
+          # The previous one is also invalid.
+          next
+        }
+        if cv.as_u32 == load32(src, cand - cr) {
+          if c_prev < min_offset || cv.as_u32 != load32(src, c_prev - cr) {
+            found = true
+            break
+          }
+          # Both match and are valid: pick the longest.
+          offset = s - (cand - cr)
+          o2 = s - (c_prev - cr)
+          l1 = match_len(src, s + 4, s - offset + 4, src.size)
+          l2 = match_len(src, s + 4, s - o2 + 4, src.size)
+          cand = c_prev if l2 > l1
+          found = true
+          break
+        } else {
+          # Only checked if the value mismatches: the offset is always
+          # invalid otherwise.
+          cand = c_prev
+          if cand > min_offset && cv.as_u32 == load32(src, cand - cr) {
+            found = true
+            break
+          }
+        }
+        cv = now
+      }
+      break if !found
+      loop {
+        t = cand - cr
+        l = match_len_long(s + 4, t + 4, src) + 4
+        while t > 0 && s > next_emit && src[t - 1] == src[s - 1] {
+          s -= 1
+          t -= 1
+          l += 1
+        }
+        dst.n = emit_literals(dst, src, next_emit, s) if next_emit < s
+        dst.add_match_long!(l, (s - t - BASE_MATCH_OFFSET).as_u32)
+        s += l
+        next_emit = s
+        s = next_s + 1 if next_s >= s
+        if s >= s_limit {
+          t += l
+          # Index the first pair after the match end.
+          if t + 8 < src.size && t > 0 {
+            cv = load64(src, t)
+            push2(tab, hash5(cv, L3_TABLE_BITS), cr + t)
+          }
+          finished = true
+          break
+        }
+        # Store every 5th hash in-between.
+        i = s - l + 2
+        while i < s - 5 {
+          push2(tab, hash5(load64(src, i), L3_TABLE_BITS), cr + i)
+          i += 6
+        }
+        # Update the table at s - 2 to s.
+        x = load64(src, s - 2)
+        push2(tab, hash5(x, L3_TABLE_BITS), cr + s - 2)
+        x = x >> 8
+        push2(tab, hash5(x, L3_TABLE_BITS), cr + s - 1)
+        x = x >> 8
+        curr_hash = hash5(x, L3_TABLE_BITS)
+        c_cur = tab[2 * curr_hash].to_i
+        c_prev = tab[2 * curr_hash + 1].to_i
+        cv = x
+        tab[2 * curr_hash + 1] = c_cur.as_i32
+        tab[2 * curr_hash] = (s + cr).as_i32
+        # Check both candidates.
+        cand = c_cur
+        min_offset = cr + s - (MAX_MATCH_OFFSET - 4)
+        if cand > min_offset {
+          # A match at cr...
+          next if cv.as_u32 == load32(src, cand - cr)
+          cand = c_prev
+          # ... or at prev.
+          next if cand > min_offset && cv.as_u32 == load32(src, cand - cr)
+        }
+        cv = x >> 8
+        s += 1
+        break
+      }
+    }
+    if next_emit < src.size {
+      return 0 if dst.n == 0
+      dst.n = emit_literals(dst, src, next_emit, src.size)
+    }
+    dst.n
+  }
+
+  def encode_l4(dst0: Tokens, s0: Int) -> Int {
+    dst = dst0
+    src = hist[0...hist_len]
+    tab = self.table
+    bt = self.btable
+    cr = self.cur
+    s = s0
+    next_emit = s
+    s_limit = src.size - INPUT_MARGIN
+    cv = load64(src, s)
+    loop {
+      next_s = s
+      t = 0
+      found = false
+      loop {
+        next_hash_s = hash4(cv, TABLE_BITS)
+        next_hash_l = hash7(cv, TABLE_BITS)
+        s = next_s
+        next_s = s + 1 + ((s - next_emit) >> 6)
+        break if next_s > s_limit
+        # A short and a long candidate.
+        s_cand = tab[next_hash_s].to_i
+        l_cand = bt[next_hash_l].to_i
+        nxt = load64(src, next_s)
+        tab[next_hash_s] = (s + cr).as_i32
+        bt[next_hash_l] = (s + cr).as_i32
+        t = l_cand - cr
+        if s - t < MAX_MATCH_OFFSET && cv.as_u32 == load32(src, t) {
+          # A long match: use that.
+          found = true
+          break
+        }
+        t = s_cand - cr
+        if s - t < MAX_MATCH_OFFSET && cv.as_u32 == load32(src, t) {
+          # A 4-byte match; is the next long candidate better?
+          l_cand = bt[hash7(nxt, TABLE_BITS)].to_i
+          l_off = l_cand - cr
+          if next_s - l_off < MAX_MATCH_OFFSET && load32(src, l_off) == nxt.as_u32 {
+            l1 = match_len(src, s + 4, t + 4, src.size)
+            l2 = match_len(src, next_s + 4, next_s - l_off + 4, src.size)
+            if l2 > l1 {
+              s = next_s
+              t = l_cand - cr
+            }
+          }
+          found = true
+          break
+        }
+        cv = nxt
+      }
+      break if !found
+      # Extend the 4-byte match.
+      l = match_len_long(s + 4, t + 4, src) + 4
+      while t > 0 && s > next_emit && src[t - 1] == src[s - 1] {
+        s -= 1
+        t -= 1
+        l += 1
+      }
+      dst.n = emit_literals(dst, src, next_emit, s) if next_emit < s
+      dst.add_match_long!(l, (s - t - BASE_MATCH_OFFSET).as_u32)
+      s += l
+      next_emit = s
+      s = next_s + 1 if next_s >= s
+      if s >= s_limit {
+        # Index the first pair after the match end.
+        if s + 8 < src.size {
+          cv = load64(src, s)
+          tab[hash4(cv, TABLE_BITS)] = (s + cr).as_i32
+          bt[hash7(cv, TABLE_BITS)] = (s + cr).as_i32
+        }
+        break
+      }
+      # Store every 3rd hash in-between.
+      i = next_s
+      if i < s - 1 {
+        c = load64(src, i)
+        bt[hash7(c, TABLE_BITS)] = (i + cr).as_i32
+        bt[hash7(c >> 8, TABLE_BITS)] = (i + cr + 1).as_i32
+        tab[hash4(c >> 8, TABLE_BITS)] = (i + cr + 1).as_i32
+        i += 3
+        while i < s - 1 {
+          c = load64(src, i)
+          bt[hash7(c, TABLE_BITS)] = (i + cr).as_i32
+          bt[hash7(c >> 8, TABLE_BITS)] = (i + cr + 1).as_i32
+          tab[hash4(c >> 8, TABLE_BITS)] = (i + cr + 1).as_i32
+          i += 3
+        }
+      }
+      # Update the tables at s - 1 and at s.
+      x = load64(src, s - 1)
+      o = cr + s - 1
+      tab[hash4(x, TABLE_BITS)] = o.as_i32
+      bt[hash7(x, TABLE_BITS)] = o.as_i32
+      cv = x >> 8
+    }
+    if next_emit < src.size {
+      return 0 if dst.n == 0
+      dst.n = emit_literals(dst, src, next_emit, src.size)
+    }
+    dst.n
+  }
+
+  def encode_l5(dst0: Tokens, s0: Int) -> Int {
+    dst = dst0
+    src = hist[0...hist_len]
+    tab = self.table
+    bt = self.btable
+    cr = self.cur
+    s = s0
+    next_emit = s
+    s_limit = src.size - INPUT_MARGIN
+    cv = load64(src, s)
+    loop {
+      next_s = s
+      l = 0
+      t = 0
+      found = false
+      loop {
+        next_hash_s = hash4(cv, TABLE_BITS)
+        next_hash_l = hash7(cv, TABLE_BITS)
+        s = next_s
+        next_s = s + 1 + ((s - next_emit) >> 6)
+        break if next_s > s_limit
+        # A short and a long candidate.
+        s_cand = tab[next_hash_s].to_i
+        l_cur = bt[2 * next_hash_l].to_i
+        l_prev = bt[2 * next_hash_l + 1].to_i
+        nxt = load64(src, next_s)
+        tab[next_hash_s] = (s + cr).as_i32
+        push2(bt, next_hash_l, s + cr)
+        next_hash_s = hash4(nxt, TABLE_BITS)
+        next_hash_l = hash7(nxt, TABLE_BITS)
+        t = l_cur - cr
+        if s - t < MAX_MATCH_OFFSET {
+          if cv.as_u32 == load32(src, t) {
+            # Store the next match.
+            tab[next_hash_s] = (next_s + cr).as_i32
+            push2(bt, next_hash_l, next_s + cr)
+            t2 = l_prev - cr
+            if s - t2 < MAX_MATCH_OFFSET && cv.as_u32 == load32(src, t2) {
+              l = match_len_limited(s + 4, t + 4, src) + 4
+              ml1 = match_len_limited(s + 4, t2 + 4, src) + 4
+              if ml1 > l {
+                t = t2
+                l = ml1
+              }
+            }
+            found = true
+            break
+          }
+          t = l_prev - cr
+          if s - t < MAX_MATCH_OFFSET && cv.as_u32 == load32(src, t) {
+            # Store the next match.
+            tab[next_hash_s] = (next_s + cr).as_i32
+            push2(bt, next_hash_l, next_s + cr)
+            found = true
+            break
+          }
+        }
+        t = s_cand - cr
+        if s - t < MAX_MATCH_OFFSET && cv.as_u32 == load32(src, t) {
+          # A 4-byte match.
+          l = match_len_limited(s + 4, t + 4, src) + 4
+          n_cur = bt[2 * next_hash_l].to_i
+          n_prev = bt[2 * next_hash_l + 1].to_i
+          # Store the next match.
+          tab[next_hash_s] = (next_s + cr).as_i32
+          push2(bt, next_hash_l, next_s + cr)
+          # Is the next long candidate better?
+          t2 = n_cur - cr
+          if next_s - t2 < MAX_MATCH_OFFSET {
+            done = false
+            if load32(src, t2) == nxt.as_u32 {
+              ml = match_len_limited(next_s + 4, t2 + 4, src) + 4
+              if ml > l {
+                t = t2
+                s = next_s
+                l = ml
+                done = true
+              }
+            }
+            if !done {
+              # Or the previous long one?
+              t2 = n_prev - cr
+              if next_s - t2 < MAX_MATCH_OFFSET && load32(src, t2) == nxt.as_u32 {
+                ml = match_len_limited(next_s + 4, t2 + 4, src) + 4
+                if ml > l {
+                  t = t2
+                  s = next_s
+                  l = ml
+                }
+              }
+            }
+          }
+          found = true
+          break
+        }
+        cv = nxt
+      }
+      break if !found
+      if l == 0 {
+        # Extend the 4-byte match.
+        l = match_len_long(s + 4, t + 4, src) + 4
+      } else if l == MAX_MATCH_LENGTH {
+        l += match_len_long(s + l, t + l, src)
+      }
+      # Is there a better match ending further?
+      s_at = s + l
+      if l < 30 && s_at < s_limit {
+        # Allow some bytes at the beginning to mismatch (2 is the sweet
+        # spot); extending backwards picks them up if they do match.
+        skip_beginning = 2
+        e_long = bt[2 * hash7(load64(src, s_at), TABLE_BITS)].to_i
+        t2 = e_long - cr - l + skip_beginning
+        s2 = s + skip_beginning
+        off = s2 - t2
+        if t2 >= 0 && off < MAX_MATCH_OFFSET && off > 0 {
+          l2 = match_len_long(s2, t2, src)
+          if l2 > l {
+            t = t2
+            l = l2
+            s = s2
+          }
+        }
+      }
+      # Extend backwards.
+      while t > 0 && s > next_emit && src[t - 1] == src[s - 1] {
+        s -= 1
+        t -= 1
+        l += 1
+      }
+      dst.n = emit_literals(dst, src, next_emit, s) if next_emit < s
+      dst.add_match_long!(l, (s - t - BASE_MATCH_OFFSET).as_u32)
+      s += l
+      next_emit = s
+      s = next_s + 1 if next_s >= s
+      break if s >= s_limit
+      # Store every 3rd hash in-between.
+      i = s - l + 1
+      if i < s - 1 {
+        c = load64(src, i)
+        tab[hash4(c, TABLE_BITS)] = (i + cr).as_i32
+        push2(bt, hash7(c, TABLE_BITS), i + cr)
+        # A long one at i + 1.
+        c = c >> 8
+        push2(bt, hash7(c, TABLE_BITS), i + cr + 1)
+        # Only enough bits for a short one at i + 2.
+        c = c >> 8
+        tab[hash4(c, TABLE_BITS)] = (i + cr + 2).as_i32
+        # Skip one, or we risk hitting s.
+        i += 4
+        while i < s - 1 {
+          c = load64(src, i)
+          push2(bt, hash7(c, TABLE_BITS), i + cr)
+          tab[hash4(c >> 8, TABLE_BITS)] = (i + cr + 1).as_i32
+          i += 3
+        }
+      }
+      # Update the tables at s - 1 and at s.
+      x = load64(src, s - 1)
+      o = cr + s - 1
+      tab[hash4(x, TABLE_BITS)] = o.as_i32
+      push2(bt, hash7(x, TABLE_BITS), o)
+      cv = x >> 8
+    }
+    if next_emit < src.size {
+      return 0 if dst.n == 0
+      dst.n = emit_literals(dst, src, next_emit, src.size)
+    }
+    dst.n
+  }
+
+  def encode_l6(dst0: Tokens, s0: Int) -> Int {
+    dst = dst0
+    src = hist[0...hist_len]
+    tab = self.table
+    bt = self.btable
+    cr = self.cur
+    s = s0
+    next_emit = s
+    s_limit = src.size - INPUT_MARGIN
+    cv = load64(src, s)
+    # Repeat must be > 1 and within range.
+    repeat = 1
+    loop {
+      next_s = s
+      l = 0
+      t = 0
+      found = false
+      loop {
+        next_hash_s = hash4(cv, TABLE_BITS)
+        next_hash_l = hash7(cv, TABLE_BITS)
+        s = next_s
+        next_s = s + 1 + ((s - next_emit) >> 7)
+        break if next_s > s_limit
+        # A short and a long candidate.
+        s_cand = tab[next_hash_s].to_i
+        l_cur = bt[2 * next_hash_l].to_i
+        l_prev = bt[2 * next_hash_l + 1].to_i
+        nxt = load64(src, next_s)
+        tab[next_hash_s] = (s + cr).as_i32
+        push2(bt, next_hash_l, s + cr)
+        # The hashes of `nxt`.
+        next_hash_s = hash4(nxt, TABLE_BITS)
+        next_hash_l = hash7(nxt, TABLE_BITS)
+        t = l_cur - cr
+        if s - t < MAX_MATCH_OFFSET {
+          if cv.as_u32 == load32(src, t) {
+            # The long candidate matches at least 4 bytes; store the next
+            # match.
+            tab[next_hash_s] = (next_s + cr).as_i32
+            push2(bt, next_hash_l, next_s + cr)
+            # Check the previous long candidate as well.
+            t2 = l_prev - cr
+            if s - t2 < MAX_MATCH_OFFSET && cv.as_u32 == load32(src, t2) {
+              l = match_len_limited(s + 4, t + 4, src) + 4
+              ml1 = match_len_limited(s + 4, t2 + 4, src) + 4
+              if ml1 > l {
+                t = t2
+                l = ml1
+              }
+            }
+            found = true
+            break
+          }
+          # The current value didn't match; does the previous long one?
+          t = l_prev - cr
+          if s - t < MAX_MATCH_OFFSET && cv.as_u32 == load32(src, t) {
+            tab[next_hash_s] = (next_s + cr).as_i32
+            push2(bt, next_hash_l, next_s + cr)
+            found = true
+            break
+          }
+        }
+        t = s_cand - cr
+        if s - t < MAX_MATCH_OFFSET && cv.as_u32 == load32(src, t) {
+          # A 4-byte match.
+          l = match_len_limited(s + 4, t + 4, src) + 4
+          # The next long candidate (at next_s).
+          n_cur = bt[2 * next_hash_l].to_i
+          n_prev = bt[2 * next_hash_l + 1].to_i
+          # Store the next match.
+          tab[next_hash_s] = (next_s + cr).as_i32
+          push2(bt, next_hash_l, next_s + cr)
+          # Check a repeat at s + 1.
+          t2 = s - repeat + 1
+          done = false
+          if load32(src, t2) == (cv >> 8).as_u32 {
+            ml = match_len_limited(s + 4 + 1, t2 + 4, src) + 4
+            if ml > l {
+              t = t2
+              l = ml
+              s += 1
+              # Not worth checking more.
+              done = true
+            }
+          }
+          if !done {
+            # Is the next long candidate better?
+            t2 = n_cur - cr
+            if next_s - t2 < MAX_MATCH_OFFSET {
+              if load32(src, t2) == nxt.as_u32 {
+                ml = match_len_limited(next_s + 4, t2 + 4, src) + 4
+                if ml > l {
+                  t = t2
+                  s = next_s
+                  l = ml
+                  # This is ok, but check the previous one as well.
+                }
+              }
+              # Or the previous long one?
+              t2 = n_prev - cr
+              if next_s - t2 < MAX_MATCH_OFFSET && load32(src, t2) == nxt.as_u32 {
+                ml = match_len_limited(next_s + 4, t2 + 4, src) + 4
+                if ml > l {
+                  t = t2
+                  s = next_s
+                  l = ml
+                }
+              }
+            }
+          }
+          found = true
+          break
+        }
+        cv = nxt
+      }
+      break if !found
+      # Extend the 4-byte match.
+      if l == 0 {
+        l = match_len_long(s + 4, t + 4, src) + 4
+      } else if l == MAX_MATCH_LENGTH {
+        l += match_len_long(s + l, t + l, src)
+      }
+      # Is there a better match ending further?
+      s_at = s + l
+      if s_at < s_limit {
+        skip_beginning = 2
+        h = hash7(load64(src, s_at), TABLE_BITS)
+        e_cur = bt[2 * h].to_i
+        e_prev = bt[2 * h + 1].to_i
+        # The current entry.
+        t2 = e_cur - cr - l + skip_beginning
+        s2 = s + skip_beginning
+        off = s2 - t2
+        if off < MAX_MATCH_OFFSET {
+          if off > 0 && t2 >= 0 {
+            l2 = match_len_long(s2, t2, src)
+            if l2 > l {
+              t = t2
+              l = l2
+              s = s2
+            }
+          }
+          # The previous entry.
+          t2 = e_prev - cr - l + skip_beginning
+          off = s2 - t2
+          if off > 0 && off < MAX_MATCH_OFFSET && t2 >= 0 {
+            l2 = match_len_long(s2, t2, src)
+            if l2 > l {
+              t = t2
+              l = l2
+              s = s2
+            }
+          }
+        }
+      }
+      # Extend backwards.
+      while t > 0 && s > next_emit && src[t - 1] == src[s - 1] {
+        s -= 1
+        t -= 1
+        l += 1
+      }
+      dst.n = emit_literals(dst, src, next_emit, s) if next_emit < s
+      dst.add_match_long!(l, (s - t - BASE_MATCH_OFFSET).as_u32)
+      repeat = s - t
+      s += l
+      next_emit = s
+      s = next_s + 1 if next_s >= s
+      if s >= s_limit {
+        # Index after the match end.
+        i = next_s + 1
+        while i < src.size - 8 {
+          c = load64(src, i)
+          tab[hash4(c, TABLE_BITS)] = (i + cr).as_i32
+          push2(bt, hash7(c, TABLE_BITS), i + cr)
+          i += 2
+        }
+        break
+      }
+      # Store every long hash in-between, and every second short one.
+      i = next_s + 1
+      while i < s - 1 {
+        c = load64(src, i)
+        h1 = hash7(c, TABLE_BITS)
+        h2 = hash7(c >> 8, TABLE_BITS)
+        tab[hash4(c, TABLE_BITS)] = (i + cr).as_i32
+        push2(bt, h1, i + cr)
+        push2(bt, h2, i + cr + 1)
+        i += 2
+      }
+      cv = load64(src, s)
+    }
+    if next_emit < src.size {
+      return 0 if dst.n == 0
+      dst.n = emit_literals(dst, src, next_emit, src.size)
+    }
+    dst.n
+  }
+}

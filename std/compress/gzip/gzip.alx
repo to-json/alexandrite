@@ -1,0 +1,470 @@
+#![overflow(wrap)]
+# Package gzip: Go's compress/gzip, reading and writing gzip files (RFC 1952).
+#
+#   Go                                      alx
+#   gzip.Header{Comment, Extra, ModTime,    Header (comment, extra: [Byte]?,
+#     Name, OS}                               mod_time: time.Time, name, os)
+#   NoCompression ... HuffmanOnly           NO_COMPRESSION ... HUFFMAN_ONLY
+#   NewReader(r) (*Reader, error)           new_reader(r) -> ~Reader[R]?
+#   z.Header (embedded)                     z.header
+#   z.Read / Close                          z.read! / close!
+#   z.Reset(r) error                        z.reset!(r) -> ~Bool
+#   z.Multistream(ok)                       z.multistream!(ok)
+#   NewWriter(w) *Writer                    new_writer(w) -> Writer[W]
+#   NewWriterLevel(w, level)                new_writer_level(w, level) -> ~Writer[W]<GzipError>
+#   w.Header (embedded, set before writing) w.header (a plain field: set it
+#                                             on the variable before the
+#                                             first write!)
+#   w.Write / Flush / Close / Reset(w)      w.write! / flush! / close! / reset!(w)
+#   ErrChecksum / ErrHeader                 GzipError.Checksum / Header
+#   (fmt.Errorf invalid level)              GzipError.InvalidLevel(level)
+#   (errors.New writer header errors)       GzipError.ExtraTooLarge / NonLatin1
+#
+# Error messages are Go's.
+#
+# Differences from Go:
+#  - The end of the input is not an error (alx's io shape): new_reader is
+#    none when the input is empty (Go: io.EOF), reset! is false then, and
+#    read! returns 0 at the end of the last member. Input that ends inside a
+#    member fails with io.StreamError.UnexpectedEof.
+#  - Reader and Writer are generic over what they wrap (`Reader[R]`, like
+#    flate's): an alx interface value contains its implementors, so a type
+#    can't both hold an io.Reader and be one. They are io.Reader /
+#    io.WriteCloser themselves (except over an io.Reader / io.Writer value)
+#    and share their state across copies (D36); `header` is a plain field of
+#    the handle.
+#  - The Reader reads its input through flate's buffer, so it may read past
+#    the end of the gzip stream (Go does too, unless the input is an
+#    io.ByteReader).
+#  - Where Go returns data together with an error, read! returns the data
+#    and fails on the next call.
+#  - Header.extra is optional (Go's nil vs empty Extra decides whether the
+#    header has an extra field).
+
+import "compress/flate"
+import "hash/crc32"
+import "io"
+import "time"
+import "unicode/utf8"
+
+ID1: Byte = 0x1f
+ID2: Byte = 0x8b
+DEFLATE: Byte = 8
+FLAG_TEXT: Byte = 1 << 0
+FLAG_HDR_CRC: Byte = 1 << 1
+FLAG_EXTRA: Byte = 1 << 2
+FLAG_NAME: Byte = 1 << 3
+FLAG_COMMENT: Byte = 1 << 4
+
+pub NO_COMPRESSION = 0
+pub BEST_SPEED = 1
+pub BEST_COMPRESSION = 9
+pub DEFAULT_COMPRESSION = -1
+pub HUFFMAN_ONLY = -2
+
+pub error GzipError {
+  # A checksum or size mismatch in the trailer (Go's ErrChecksum).
+  Checksum
+  # An invalid header (Go's ErrHeader).
+  Header
+  # A compression level outside [-2, 9].
+  InvalidLevel(level: Int)
+  # Header.extra longer than 65535 bytes.
+  ExtraTooLarge
+  # A header string with NUL or a character beyond Latin-1.
+  NonLatin1
+
+  def message -> Str {
+    case self {
+      Checksum => "gzip: invalid checksum"
+      Header => "gzip: invalid header"
+      InvalidLevel(level) => "gzip: invalid compression level: #{level}"
+      ExtraTooLarge => "gzip.Write: Extra data is too large"
+      NonLatin1 => "gzip.Write: non-Latin-1 header string"
+    }
+  }
+}
+
+# The gzip file header (RFC 1952). Strings are UTF-8, stored as Latin-1, so
+# they must be NUL-free and within Latin-1.
+pub struct Header {
+  comment: Str
+  # The extra field; none: no extra field.
+  extra: [Byte]?
+  # The modification time; the zero Time: none recorded.
+  mod_time: time.Time
+  name: Str
+  # The operating system (255: unknown).
+  os: Byte
+}
+
+def le16(b: [Byte], i: Int) -> Int { b[i].to_i | (b[i + 1].to_i << 8) }
+
+def le32(b: [Byte], i: Int) -> U32 {
+  b[i].as_u32 | (b[i + 1].as_u32 << 8) | (b[i + 2].as_u32 << 16) | (b[i + 3].as_u32 << 24)
+}
+
+def put_le32(b: [Byte], i: Int, v: U32) {
+  b[i] = v.as_u8
+  b[i + 1] = (v >> 8).as_u8
+  b[i + 2] = (v >> 16).as_u8
+  b[i + 3] = (v >> 24).as_u8
+}
+
+def update_crc(crc: U32, p: [Byte]) -> U32 {
+  crc32.update(crc, crc32.ieee_table(), p)
+}
+
+# ---------------------------------------------------------------- Reader
+
+struct ReaderState[R] {
+  z: flate.Reader[R]
+  # CRC-32 (IEEE) and size of the member's data so far.
+  digest: U32
+  size: U32
+  buf: [Byte]
+  err: Error?
+  eof: Bool
+  multistream: Bool
+}
+
+# Decompresses a gzip stream read from R: one or more members, read as one
+# (see multistream!).
+pub struct Reader[R] {
+  # The header of the first member; set by new_reader and reset!.
+  header: Header
+  st: [ReaderState[R]]
+
+  # Raw input bytes: fewer than p.size only at the end of the input.
+  def input!(p: [Byte]) -> ~Int {
+    self.st[0].z.~read_input!(p)
+  }
+
+  # A NUL-terminated Latin-1 string, as UTF-8.
+  def read_string! -> ~Str {
+    bf = st[0].buf
+    need_conv = false
+    i = 0
+    loop {
+      fail GzipError.Header if i >= bf.size
+      n = ~input!(bf[i...i + 1])
+      fail io.StreamError.UnexpectedEof if n == 0
+      need_conv = true if bf[i] > 0x7f
+      if bf[i] == 0 {
+        # The digest covers the terminating NUL.
+        self.st[0].digest = update_crc(st[0].digest, bf[0...i + 1])
+        if need_conv {
+          out: [Byte] = []
+          for v in bf[0...i] {
+            out = utf8.append_rune(out, v.to_i.as_i32)
+          }
+          return Str.from_bytes(out)
+        }
+        return Str.from_bytes(bf[0...i])
+      }
+      i += 1
+    }
+  }
+
+  # Reads a member's header; none at the end of the input (before any of
+  # it).
+  def read_header! -> ~Header? {
+    bf = st[0].buf
+    n = ~input!(bf[0...10])
+    return none if n == 0
+    fail io.StreamError.UnexpectedEof if n < 10
+    fail GzipError.Header if bf[0] != ID1 || bf[1] != ID2 || bf[2] != DEFLATE
+    hdr = Header.new()
+    flg = bf[3]
+    t = le32(bf, 4).to_i
+    hdr.mod_time = time.unix(t, 0) if t > 0
+    # bf[8] is XFL, ignored.
+    hdr.os = bf[9]
+    self.st[0].digest = crc32.checksum_ieee(bf[0...10])
+    if flg & FLAG_EXTRA != 0 {
+      fail io.StreamError.UnexpectedEof if ~input!(bf[0...2]) < 2
+      self.st[0].digest = update_crc(st[0].digest, bf[0...2])
+      data: [Byte] = [0; le16(bf, 0)]
+      fail io.StreamError.UnexpectedEof if ~input!(data) < data.size
+      self.st[0].digest = update_crc(st[0].digest, data)
+      hdr.extra = data
+    }
+    hdr.name = ~read_string! if flg & FLAG_NAME != 0
+    hdr.comment = ~read_string! if flg & FLAG_COMMENT != 0
+    if flg & FLAG_HDR_CRC != 0 {
+      fail io.StreamError.UnexpectedEof if ~input!(bf[0...2]) < 2
+      fail GzipError.Header if le16(bf, 0).as_u32 != st[0].digest & 0xffff
+    }
+    self.st[0].digest = 0
+    self.st[0].z.restart!([])
+    hdr
+  }
+
+  # Decompresses into p; returns the count, 0 at the end of the stream.
+  # Fails with GzipError.Checksum when a member's data doesn't match its
+  # trailer (the data is returned first; the error comes at the end).
+  pub def read!(p: [Byte]) -> ~Int {
+    if e = st[0].err {
+      fail e
+    }
+    return 0 if st[0].eof || p.size == 0
+    loop {
+      r = self.st[0].z.read!(p)
+      if e = r.err {
+        self.st[0].err = e
+        fail e
+      }
+      n = r.unwrap_or(0)
+      if n > 0 {
+        self.st[0].digest = update_crc(st[0].digest, p[0...n])
+        self.st[0].size += n.as_u32
+        return n
+      }
+      # The end of a member: its trailer.
+      bf = st[0].buf
+      t = input!(bf[0...8])
+      if e = t.err {
+        self.st[0].err = e
+        fail e
+      }
+      if t.unwrap_or(0) < 8 {
+        self.st[0].err = io.StreamError.UnexpectedEof
+        fail io.StreamError.UnexpectedEof
+      }
+      if le32(bf, 0) != st[0].digest || le32(bf, 4) != st[0].size {
+        self.st[0].err = GzipError.Checksum
+        fail GzipError.Checksum
+      }
+      self.st[0].digest = 0
+      self.st[0].size = 0
+      if !st[0].multistream {
+        self.st[0].eof = true
+        return 0
+      }
+      # The next member, if any.
+      h = read_header!
+      if e = h.err {
+        self.st[0].err = e
+        fail e
+      }
+      if h.unwrap.none? {
+        self.st[0].eof = true
+        return 0
+      }
+    }
+  }
+
+  # Doesn't close the underlying reader; fails with the stream's error.
+  pub def close! -> ~Unit {
+    self.st[0].z.~close!
+  }
+
+  # Discards the state and starts over on r, as new_reader(r) would; false
+  # when r holds no gzip member.
+  pub def reset!(r: R) -> ~Bool {
+    self.st[0].z.reset!(r, [])
+    self.st[0].digest = 0
+    self.st[0].size = 0
+    self.st[0].err = none
+    self.st[0].eof = false
+    self.st[0].multistream = true
+    self.header = Header.new()
+    h = read_header!
+    if e = h.err {
+      self.st[0].err = e
+      fail e
+    }
+    if hdr = h.unwrap {
+      self.header = hdr
+      return true
+    }
+    self.st[0].eof = true
+    false
+  }
+
+  # Whether the reader reads all members as one stream (the default), or
+  # stops after each: read! then returns 0 at the end of a member, and
+  # reset! on the same input starts the next one. Go's Multistream.
+  pub def multistream!(ok: Bool) {
+    self.st[0].multistream = ok
+  }
+}
+
+# A Reader of the gzip stream in r, its first header read; none when r is
+# empty. Fails on a bad or truncated header.
+pub def new_reader[R](r: R) -> ~Reader[R]? {
+  z: Reader[R]? = ~open_reader(flate.new_reader(r))
+  z
+}
+
+# Like new_reader, but reads r only as far as the gzip stream goes (one
+# byte at a time): what follows stays in r. This is Go's behaviour when r is
+# an io.ByteReader, which multistream!(false) with reset! on the same input
+# relies on.
+pub def new_reader_exact[R](r: R) -> ~Reader[R]? {
+  z: Reader[R]? = ~open_reader(flate.new_reader_exact(r))
+  z
+}
+
+def open_reader[R](fr: flate.Reader[R]) -> ~Reader[R]? {
+  bf: [Byte] = [0; 512]
+  z = Reader[R].new(header: Header.new(), st: [ReaderState[R].new(z: fr, digest: 0, size: 0, buf: bf, err: none, eof: false, multistream: true)])
+  h = z.~read_header!
+  if hdr = h {
+    z.header = hdr
+    return z
+  }
+  none
+}
+
+# ---------------------------------------------------------------- Writer
+
+struct WriterState[W] {
+  z: flate.Writer[W]
+  level: Int
+  wrote_header: Bool
+  closed: Bool
+  # CRC-32 (IEEE) and size of the data written.
+  digest: U32
+  size: U32
+  err: Error?
+}
+
+# Compresses what is written to it into a gzip stream on W (Go's Writer).
+pub struct Writer[W] {
+  # The header, written at the first write!, flush! or close!.
+  header: Header
+  st: [WriterState[W]]
+
+  def put!(p: [Byte]) -> ~Unit {
+    self.st[0].z.~write_raw!(p)
+  }
+
+  # A Latin-1 string and its NUL.
+  def put_latin1!(s: Str) -> ~Unit {
+    out: [Byte] = []
+    for v in s.runes {
+      fail GzipError.NonLatin1 if v == 0 || v > 0xff
+      out << v.as_u8
+    }
+    out << 0
+    ~put!(out)
+  }
+
+  def write_header! -> ~Unit {
+    self.st[0].wrote_header = true
+    bf: [Byte] = [0; 10]
+    bf[0] = ID1
+    bf[1] = ID2
+    bf[2] = DEFLATE
+    bf[3] = bf[3] | FLAG_EXTRA if header.extra.some?
+    bf[3] = bf[3] | FLAG_NAME if header.name != ""
+    bf[3] = bf[3] | FLAG_COMMENT if header.comment != ""
+    if header.mod_time.after(time.unix(0, 0)) {
+      put_le32(bf, 4, header.mod_time.unix.as_u32)
+    }
+    if st[0].level == BEST_COMPRESSION {
+      bf[8] = 2
+    } else if st[0].level == BEST_SPEED {
+      bf[8] = 4
+    }
+    bf[9] = header.os
+    ~put!(bf)
+    if extra = header.extra {
+      fail GzipError.ExtraTooLarge if extra.size > 0xffff
+      ~put!([extra.size.as_u8, (extra.size >> 8).as_u8])
+      ~put!(extra)
+    }
+    ~put_latin1!(header.name) if header.name != ""
+    ~put_latin1!(header.comment) if header.comment != ""
+  }
+
+  def ensure_header! -> ~Unit {
+    return if st[0].wrote_header
+    r = write_header!
+    if e = r.err {
+      self.st[0].err = e
+      fail e
+    }
+  }
+
+  # Compresses p; returns p.size. Writes the header first if needed.
+  pub def write!(p: [Byte]) -> ~Int {
+    if e = st[0].err {
+      fail e
+    }
+    ~ensure_header!
+    self.st[0].size += p.size.as_u32
+    self.st[0].digest = update_crc(st[0].digest, p)
+    r = self.st[0].z.write!(p)
+    if e = r.err {
+      self.st[0].err = e
+      fail e
+    }
+    p.size
+  }
+
+  # Flushes pending data (flate's flush!); mostly for network protocols.
+  # Does nothing after close!.
+  pub def flush! -> ~Unit {
+    if e = st[0].err {
+      fail e
+    }
+    return if st[0].closed
+    ~ensure_header!
+    r = self.st[0].z.flush!
+    if e = r.err {
+      self.st[0].err = e
+      fail e
+    }
+  }
+
+  # Flushes and writes the trailer; doesn't close the underlying writer.
+  # Closing again does nothing.
+  pub def close! -> ~Unit {
+    if e = st[0].err {
+      fail e
+    }
+    return if st[0].closed
+    self.st[0].closed = true
+    ~ensure_header!
+    r = self.st[0].z.close!
+    if e = r.err {
+      self.st[0].err = e
+      fail e
+    }
+    bf: [Byte] = [0; 8]
+    put_le32(bf, 0, st[0].digest)
+    put_le32(bf, 4, st[0].size)
+    t = put!(bf)
+    if e = t.err {
+      self.st[0].err = e
+      fail e
+    }
+  }
+
+  # Discards the state (and the header) and starts over on w, with the same
+  # level.
+  pub def reset!(w: W) {
+    self.header = Header.new(os: 255)
+    self.st[0].z.reset!(w)
+    self.st[0].wrote_header = false
+    self.st[0].closed = false
+    self.st[0].digest = 0
+    self.st[0].size = 0
+    self.st[0].err = none
+  }
+}
+
+# A Writer at the default level. Set its header before the first write!.
+pub def new_writer[W](w: W) -> Writer[W] {
+  new_writer_level(w, DEFAULT_COMPRESSION).unwrap
+}
+
+# A Writer at `level` (as flate's levels); other levels fail with
+# InvalidLevel.
+pub def new_writer_level[W](w: W, level: Int) -> ~Writer[W]<GzipError> {
+  fail GzipError.InvalidLevel(level: level) if level < HUFFMAN_ONLY || level > BEST_COMPRESSION
+  z = flate.new_writer(w, level).unwrap
+  Writer[W].new(header: Header.new(os: 255), st: [WriterState[W].new(z: z, level: level, wrote_header: false, closed: false, digest: 0, size: 0, err: none)])
+}

@@ -1,0 +1,318 @@
+#![overflow(wrap)]
+# Package zlib: Go's compress/zlib, reading and writing zlib format
+# compressed data (RFC 1950).
+#
+#   Go                                        alx
+#   NoCompression ... HuffmanOnly             NO_COMPRESSION ... HUFFMAN_ONLY
+#   NewReader(r) (io.ReadCloser, error)       new_reader(r) -> ~Reader[R]
+#   NewReaderDict(r, dict)                    new_reader_dict(r, dict) -> ~Reader[R]
+#   (reader).Read / Close                     z.read! / close!
+#   Resetter.Reset(r, dict) error             z.reset!(r, dict) -> ~Unit
+#   NewWriter(w) *Writer                      new_writer(w) -> Writer[W]
+#   NewWriterLevel(w, level)                  new_writer_level(w, level) -> ~Writer[W]<ZlibError>
+#   NewWriterLevelDict(w, level, dict)        new_writer_level_dict(w, level, dict) -> ~Writer[W]<ZlibError>
+#   w.Write / Flush / Close / Reset(w)        w.write! / flush! / close! / reset!(w)
+#   ErrChecksum / ErrDictionary / ErrHeader   ZlibError.Checksum / Dictionary / Header
+#   (fmt.Errorf invalid level)                ZlibError.InvalidLevel(level)
+#
+# Error messages are Go's.
+#
+# Differences from Go:
+#  - read! returns 0 at the end of the stream (alx's io shape; Go: io.EOF).
+#    Input that ends early fails with io.StreamError.UnexpectedEof. Where Go
+#    returns data together with an error, read! returns the data and fails
+#    on the next call.
+#  - Reader and Writer are generic over what they wrap (see flate), and
+#    share their state across copies.
+#  - The Reader reads its input through flate's buffer, so it may read past
+#    the end of the zlib stream; new_reader_exact reads only what it uses
+#    (Go's behaviour when the input is an io.ByteReader).
+#  - A nil and an empty dictionary are the same: no dictionary. (Go writes
+#    an FDICT header for a non-nil empty dictionary.)
+
+import "compress/flate"
+import "io"
+import "hash/adler32"
+
+DEFLATE: Byte = 8
+MAX_WINDOW: Byte = 7
+
+pub NO_COMPRESSION = 0
+pub BEST_SPEED = 1
+pub BEST_COMPRESSION = 9
+pub DEFAULT_COMPRESSION = -1
+pub HUFFMAN_ONLY = -2
+
+pub error ZlibError {
+  # The checksum doesn't match (Go's ErrChecksum).
+  Checksum
+  # The stream needs a dictionary other than the one given (Go's
+  # ErrDictionary).
+  Dictionary
+  # An invalid header (Go's ErrHeader).
+  Header
+  # A compression level outside [-2, 9].
+  InvalidLevel(level: Int)
+
+  def message -> Str {
+    case self {
+      Checksum => "zlib: invalid checksum"
+      Dictionary => "zlib: invalid dictionary"
+      Header => "zlib: invalid header"
+      InvalidLevel(level) => "zlib: invalid compression level: #{level}"
+    }
+  }
+}
+
+def be32(b: [Byte]) -> U32 {
+  (b[0].as_u32 << 24) | (b[1].as_u32 << 16) | (b[2].as_u32 << 8) | b[3].as_u32
+}
+
+def put_be32(b: [Byte], v: U32) {
+  b[0] = (v >> 24).as_u8
+  b[1] = (v >> 16).as_u8
+  b[2] = (v >> 8).as_u8
+  b[3] = v.as_u8
+}
+
+# ---------------------------------------------------------------- Reader
+
+struct ReaderState[R] {
+  z: flate.Reader[R]
+  digest: adler32.Digest
+  scratch: [Byte]
+  err: Error?
+  eof: Bool
+}
+
+# Decompresses a zlib stream read from R.
+pub struct Reader[R] {
+  st: [ReaderState[R]]
+
+  def fail_with!(e: Error) -> ~Int {
+    self.st[0].err = e
+    fail e
+  }
+
+  # Decompresses into p; returns the count, 0 at the end of the stream.
+  pub def read!(p: [Byte]) -> ~Int {
+    if e = st[0].err {
+      fail e
+    }
+    return 0 if st[0].eof || p.size == 0
+    r = self.st[0].z.read!(p)
+    if e = r.err {
+      return ~fail_with!(e)
+    }
+    n = r.unwrap_or(0)
+    if n > 0 {
+      self.st[0].digest.write!(p[0...n])
+      return n
+    }
+    # The end of the deflate stream: the checksum.
+    sc = st[0].scratch
+    t = self.st[0].z.read_input!(sc)
+    if e = t.err {
+      return ~fail_with!(e)
+    }
+    if t.unwrap_or(0) < 4 {
+      return ~fail_with!(io.StreamError.UnexpectedEof)
+    }
+    if be32(sc) != st[0].digest.sum32 {
+      return ~fail_with!(ZlibError.Checksum)
+    }
+    self.st[0].eof = true
+    0
+  }
+
+  # Doesn't close the underlying reader; fails with the stream's error.
+  pub def close! -> ~Unit {
+    if e = st[0].err {
+      fail e
+    }
+    self.st[0].z.~close!
+  }
+
+  # Discards the state and starts over on r with dict, as new_reader_dict
+  # would.
+  pub def reset!(r: R, dict: [Byte]) -> ~Unit {
+    self.st[0].z.reset!(r, [])
+    ~start!(dict)
+  }
+
+  # Reads the header and sets up the decompressor.
+  def start!(dict: [Byte]) -> ~Unit {
+    self.st[0].err = none
+    self.st[0].eof = false
+    self.st[0].digest = adler32.new()
+    r = header!(dict)
+    if e = r.err {
+      self.st[0].err = e
+      fail e
+    }
+  }
+
+  def header!(dict: [Byte]) -> ~Unit {
+    sc = st[0].scratch
+    fail io.StreamError.UnexpectedEof if self.st[0].z.~read_input!(sc[0...2]) < 2
+    h = (sc[0].to_i << 8) | sc[1].to_i
+    if (sc[0] & 0x0f) != DEFLATE || (sc[0] >> 4) > MAX_WINDOW || h % 31 != 0 {
+      fail ZlibError.Header
+    }
+    have_dict = sc[1] & 0x20 != 0
+    if have_dict {
+      fail io.StreamError.UnexpectedEof if self.st[0].z.~read_input!(sc) < 4
+      fail ZlibError.Dictionary if be32(sc) != adler32.checksum(dict)
+      self.st[0].z.restart!(dict)
+    } else {
+      self.st[0].z.restart!([])
+    }
+  }
+}
+
+def open_reader[R](fr: flate.Reader[R], dict: [Byte]) -> ~Reader[R] {
+  sc: [Byte] = [0; 4]
+  z = Reader[R].new(st: [ReaderState[R].new(z: fr, digest: adler32.new(), scratch: sc, err: none, eof: false)])
+  ~z.start!(dict)
+  z
+}
+
+# A Reader of the zlib stream in r; fails on a bad or truncated header.
+pub def new_reader[R](r: R) -> ~Reader[R] {
+  z: Reader[R] = ~open_reader(flate.new_reader(r), [])
+  z
+}
+
+# Like new_reader, with the preset dictionary for a stream that needs one
+# (it's ignored otherwise); a stream needing another fails with
+# ZlibError.Dictionary.
+pub def new_reader_dict[R](r: R, dict: [Byte]) -> ~Reader[R] {
+  z: Reader[R] = ~open_reader(flate.new_reader(r), dict)
+  z
+}
+
+# Like new_reader_dict, but reads r only as far as the stream goes: what
+# follows stays in r (Go's behaviour when r is an io.ByteReader).
+pub def new_reader_exact[R](r: R, dict: [Byte]) -> ~Reader[R] {
+  z: Reader[R] = ~open_reader(flate.new_reader_exact(r), dict)
+  z
+}
+
+# ---------------------------------------------------------------- Writer
+
+struct WriterState[W] {
+  z: flate.Writer[W]
+  level: Int
+  dict: [Byte]
+  digest: adler32.Digest
+  err: Error?
+  wrote_header: Bool
+}
+
+# Compresses what is written to it into a zlib stream on W (Go's Writer).
+pub struct Writer[W] {
+  st: [WriterState[W]]
+
+  def write_header! -> ~Unit {
+    self.st[0].wrote_header = true
+    sc: [Byte] = [0x78, 0]
+    level = st[0].level
+    # The compression level, as zlib's FLEVEL.
+    if level == -2 || level == 0 || level == 1 {
+      sc[1] = 0 << 6
+    } else if level >= 2 && level <= 5 {
+      sc[1] = 1 << 6
+    } else if level == 6 || level == -1 {
+      sc[1] = 2 << 6
+    } else {
+      sc[1] = 3 << 6
+    }
+    sc[1] = sc[1] | (1 << 5) if st[0].dict.size > 0
+    sc[1] += (31 - ((sc[0].to_i << 8) | sc[1].to_i) % 31).as_u8
+    self.st[0].z.~write_raw!(sc)
+    if st[0].dict.size > 0 {
+      d: [Byte] = [0; 4]
+      put_be32(d, adler32.checksum(st[0].dict))
+      self.st[0].z.~write_raw!(d)
+    }
+  }
+
+  def ensure_header! -> ~Unit {
+    if e = st[0].err {
+      fail e
+    }
+    return if st[0].wrote_header
+    r = write_header!
+    if e = r.err {
+      self.st[0].err = e
+      fail e
+    }
+  }
+
+  # Compresses p; returns p.size. Writes the header first if needed.
+  pub def write!(p: [Byte]) -> ~Int {
+    ~ensure_header!
+    return 0 if p.size == 0
+    r = self.st[0].z.write!(p)
+    if e = r.err {
+      self.st[0].err = e
+      fail e
+    }
+    self.st[0].digest.write!(p)
+    p.size
+  }
+
+  # Flushes pending data (flate's flush!).
+  pub def flush! -> ~Unit {
+    ~ensure_header!
+    r = self.st[0].z.flush!
+    if e = r.err {
+      self.st[0].err = e
+      fail e
+    }
+  }
+
+  # Flushes and writes the checksum; doesn't close the underlying writer.
+  pub def close! -> ~Unit {
+    ~ensure_header!
+    r = self.st[0].z.close!
+    if e = r.err {
+      self.st[0].err = e
+      fail e
+    }
+    d: [Byte] = [0; 4]
+    put_be32(d, st[0].digest.sum32)
+    t = self.st[0].z.write_raw!(d)
+    if e = t.err {
+      self.st[0].err = e
+      fail e
+    }
+  }
+
+  # Discards the state and starts over on w, with the same level and
+  # dictionary.
+  pub def reset!(w: W) {
+    self.st[0].z.reset!(w)
+    self.st[0].digest.reset!
+    self.st[0].err = none
+    self.st[0].wrote_header = false
+  }
+}
+
+# A Writer at the default level.
+pub def new_writer[W](w: W) -> Writer[W] {
+  new_writer_level_dict(w, DEFAULT_COMPRESSION, []).unwrap
+}
+
+# A Writer at `level` (as flate's levels).
+pub def new_writer_level[W](w: W, level: Int) -> ~Writer[W]<ZlibError> {
+  z: Writer[W] = ~new_writer_level_dict(w, level, [])
+  z
+}
+
+# A Writer at `level` with a preset dictionary (none if empty).
+pub def new_writer_level_dict[W](w: W, level: Int, dict: [Byte]) -> ~Writer[W]<ZlibError> {
+  fail ZlibError.InvalidLevel(level: level) if level < HUFFMAN_ONLY || level > BEST_COMPRESSION
+  z = flate.new_writer_dict(w, level, dict).unwrap
+  Writer[W].new(st: [WriterState[W].new(z: z, level: level, dict: dict, digest: adler32.new(), err: none, wrote_header: false)])
+}

@@ -1,0 +1,559 @@
+#![overflow(wrap)]
+# Package lzw: Go's compress/lzw, the Lempel-Ziv-Welch compressed data
+# format of T. A. Welch, "A Technique for High-Performance Data
+# Compression" (Computer, 17(6), June 1984), as used by GIF, TIFF and PDF:
+# variable-width codes up to 12 bits, the first two non-literal codes being
+# clear and EOF. (Not the "LZW" of UNIX compress.)
+#
+#   Go                                      alx
+#   Order, LSB, MSB                         LSB, MSB (Ints)
+#   NewReader(r, order, litWidth)           new_reader(r, order, lit_width) -> Reader[R]
+#   r.Read / Close / Reset(src, o, w)       r.read! / close! / reset!(src, o, w)
+#   NewWriter(w, order, litWidth)           new_writer(w, order, lit_width) -> Writer[W]
+#   w.Write / Close / Reset(dst, o, w)      w.write! / close! / reset!(dst, o, w)
+#   errors (invalid code, closed, ...)      LzwError.InvalidCode / Closed / UnknownOrder /
+#                                           LitWidthRange(w) / ByteTooLarge
+#
+# Error messages are Go's.
+#
+# Differences from Go:
+#  - read! returns 0 at the end of the stream (alx's io shape; Go: io.EOF).
+#    Input that ends before the EOF code fails with
+#    io.StreamError.UnexpectedEof.
+#  - The Reader buffers its input (Go does too unless the input is an
+#    io.ByteReader), so it may read past the end of the stream; the Writer
+#    buffers its output and writes it at close! (as Go's bufio.Writer does
+#    for a writer that has no WriteByte and Flush).
+#  - Reader and Writer are generic over what they wrap and share their
+#    state across copies (see compress/flate).
+#  - Where Go returns data together with an error, read! returns the data
+#    and fails on the next call.
+
+import "io"
+
+# Least significant bits first (GIF).
+pub LSB = 0
+# Most significant bits first (TIFF, PDF).
+pub MSB = 1
+
+MAX_WIDTH = 12
+DECODER_INVALID_CODE = 0xffff
+FLUSH_BUFFER = 1 << MAX_WIDTH
+
+pub error LzwError {
+  InvalidCode
+  # A read or write after close!.
+  Closed
+  UnknownOrder
+  LitWidthRange(width: Int)
+  # A byte not representable in lit_width bits, written.
+  ByteTooLarge
+
+  def message -> Str {
+    case self {
+      InvalidCode => "lzw: invalid code"
+      Closed => "lzw: reader/writer is closed"
+      UnknownOrder => "lzw: unknown order"
+      LitWidthRange(width) => "lzw: litWidth #{width} out of range"
+      ByteTooLarge => "lzw: input byte too large for the litWidth"
+    }
+  }
+}
+
+# ---------------------------------------------------------------- Reader
+
+struct Decoder[R] {
+  r: R
+  inbuf: [Byte]
+  ipos: Int
+  iend: Int
+  in_eof: Bool
+  in_err: Error?
+  bits: U32
+  n_bits: Int
+  width: Int
+  order: Int
+  # The width in bits of literal codes.
+  lit_width: Int
+  err: Error?
+  eof: Bool
+  clear: Int
+  eof_code: Int
+  hi: Int
+  overflow: Int
+  last: Int
+  # Each code c in [lo, hi] expands to two or more bytes: the expansion of
+  # prefix[c] and then suffix[c].
+  suffix: [Byte]
+  prefix: [Int]
+  # output[0...o] is decoded and not yet returned; the end of output holds
+  # an expansion being built backwards.
+  output: [Byte]
+  o: Int
+  to_read: [Byte]
+
+  def get!(p: [Byte]) -> ~Int { self.r.~read!(p) }
+
+  # The next input byte, or -1 (the end of input or an error, in in_err).
+  def next_byte! -> Int {
+    if ipos == iend {
+      return -1 if in_eof || !in_err.none?
+      res = get!(inbuf)
+      if e = res.err {
+        self.in_err = e
+        return -1
+      }
+      n = res.unwrap_or(0)
+      if n == 0 {
+        self.in_eof = true
+        return -1
+      }
+      self.ipos = 0
+      self.iend = n
+    }
+    c = inbuf[ipos]
+    self.ipos += 1
+    c.to_i
+  }
+
+  # The next code, or -1 at the end of input.
+  def read_code! -> Int {
+    if order == LSB {
+      while n_bits < width {
+        x = next_byte!
+        return -1 if x < 0
+        self.bits = bits | (x.as_u32 << n_bits)
+        self.n_bits += 8
+      }
+      code = (bits & ((1 << width) - 1).as_u32).to_i
+      self.bits = bits >> width
+      self.n_bits -= width
+      return code
+    }
+    while n_bits < width {
+      x = next_byte!
+      return -1 if x < 0
+      self.bits = bits | (x.as_u32 << (24 - n_bits))
+      self.n_bits += 8
+    }
+    code = (bits >> (32 - width)).to_i
+    self.bits = bits << width
+    self.n_bits -= width
+    code
+  }
+
+  # Decodes codes until the output buffer fills, the end, or an error.
+  def decode! {
+    loop {
+      code = read_code!
+      if code < 0 {
+        if e = in_err {
+          self.err = e
+        } else {
+          self.err = io.StreamError.UnexpectedEof
+        }
+        break
+      }
+      if code < clear {
+        # A literal.
+        self.output[o] = code.as_u8
+        self.o += 1
+        if last != DECODER_INVALID_CODE {
+          # Save what the hi code expands to.
+          self.suffix[hi] = code.as_u8
+          self.prefix[hi] = last
+        }
+      } else if code == clear {
+        self.width = 1 + lit_width
+        self.hi = eof_code
+        self.overflow = 1 << width
+        self.last = DECODER_INVALID_CODE
+        next
+      } else if code == eof_code {
+        self.eof = true
+        break
+      } else if code <= hi {
+        c = code
+        i = output.size - 1
+        if code == hi && last != DECODER_INVALID_CODE {
+          # code == hi is a special case which expands to the last
+          # expansion followed by the head of the last expansion. To find
+          # the head, walk the prefix chain to the literal.
+          c = last
+          while c >= clear {
+            c = prefix[c]
+          }
+          self.output[i] = c.as_u8
+          i -= 1
+          c = last
+        }
+        # Copy the suffix chain into output, then the literal.
+        while c >= clear {
+          self.output[i] = suffix[c]
+          i -= 1
+          c = prefix[c]
+        }
+        self.output[i] = c.as_u8
+        self.o += copy(output[o...output.size], output[i...output.size])
+        if last != DECODER_INVALID_CODE {
+          # Save what the hi code expands to.
+          self.suffix[hi] = c.as_u8
+          self.prefix[hi] = last
+        }
+      } else {
+        self.err = LzwError.InvalidCode
+        break
+      }
+      self.last = code
+      self.hi += 1
+      if hi >= overflow {
+        if hi > overflow {
+          panic("unreachable")
+        }
+        if width == MAX_WIDTH {
+          self.last = DECODER_INVALID_CODE
+          # Undo the hi += 1: hi stays at 4095 so it doesn't overflow.
+          self.hi -= 1
+        } else {
+          self.width += 1
+          self.overflow = 1 << width
+        }
+      }
+      break if o >= FLUSH_BUFFER
+    }
+    # Flush pending output.
+    self.to_read = output[0...o]
+    self.o = 0
+  }
+
+  def read!(b: [Byte]) -> ~Int {
+    loop {
+      if to_read.size > 0 {
+        n = copy(b, to_read)
+        self.to_read = to_read[n...to_read.size]
+        return n
+      }
+      return 0 if eof
+      if e = err {
+        fail e
+      }
+      decode!
+    }
+  }
+}
+
+def new_decoder[R](src: R, order: Int, lit_width: Int) -> Decoder[R] {
+  d = Decoder[R].new(r: src, inbuf: zbytes(4096), ipos: 0, iend: 0, in_eof: false, in_err: none,
+    bits: 0, n_bits: 0, width: 0, order: order, lit_width: lit_width, err: none, eof: false,
+    clear: 0, eof_code: 0, hi: 0, overflow: 0, last: DECODER_INVALID_CODE,
+    suffix: zbytes(1 << MAX_WIDTH), prefix: zints(1 << MAX_WIDTH), output: zbytes(2 * (1 << MAX_WIDTH)), o: 0, to_read: [])
+  if order != LSB && order != MSB {
+    d.err = LzwError.UnknownOrder
+    return d
+  }
+  if lit_width < 2 || 8 < lit_width {
+    d.err = LzwError.LitWidthRange(width: lit_width)
+    return d
+  }
+  d.width = 1 + lit_width
+  d.clear = 1 << lit_width
+  d.eof_code = d.clear + 1
+  d.hi = d.clear + 1
+  d.overflow = 1 << d.width
+  d
+}
+
+def zbytes(n: Int) -> [Byte] {
+  b: [Byte] = [0; n]
+  b
+}
+
+def zints(n: Int) -> [Int] {
+  b: [Int] = [0; n]
+  b
+}
+
+# Decompresses LZW data read from R (Go's lzw.Reader).
+pub struct Reader[R] {
+  st: [Decoder[R]]
+
+  # Decompresses into p; returns the count, 0 at the end of the stream.
+  pub def read!(p: [Byte]) -> ~Int {
+    self.st[0].~read!(p)
+  }
+
+  # Later reads fail with LzwError.Closed. Doesn't close the underlying
+  # reader.
+  pub def close! -> ~Unit {
+    self.st[0].err = LzwError.Closed
+    self.st[0].eof = false
+    self.st[0].to_read = []
+  }
+
+  # Starts over on src, as new_reader(src, order, lit_width) would.
+  pub def reset!(src: R, order: Int, lit_width: Int) {
+    self.st[0] = new_decoder(src, order, lit_width)
+  }
+
+  # The next code to be assigned (for tests).
+  def hi -> Int { st[0].hi }
+}
+
+# A Reader decompressing the LZW data in r, written with `order` and
+# literal codes of lit_width bits (2 to 8; 8 for arbitrary bytes). A bad
+# order or width makes every read fail.
+pub def new_reader[R](r: R, order: Int, lit_width: Int) -> Reader[R] {
+  Reader[R].new(st: [new_decoder(r, order, lit_width)])
+}
+
+# ---------------------------------------------------------------- Writer
+
+# The largest code.
+MAX_CODE = (1 << 12) - 1
+INVALID_CODE: U32 = 0xffffffff
+# The hash table size: about 4x MAX_CODE, a power of 2.
+TABLE_SIZE = 4 * (1 << 12)
+TABLE_MASK: U32 = (4 * (1 << 12)) - 1
+# An unused entry (0 can't be a valid entry: it would be the clear code for
+# lit_width 0, not allowed).
+INVALID_ENTRY: U32 = 0
+OUT_BUFFER = 4096
+
+struct Encoder[W] {
+  w: W
+  out: [Byte]
+  nout: Int
+  lit_width: Int
+  order: Int
+  n_bits: Int
+  width: Int
+  bits: U32
+  # The code to be assigned next and the code that needs a wider width.
+  hi: U32
+  overflow: U32
+  # The accumulated code at the end of the most recent write!, or
+  # INVALID_CODE if none yet.
+  saved_code: U32
+  err: Error?
+  closed: Bool
+  # Maps key (code << 8 | literal) to code: entries are key << 12 | code.
+  table: [U32]
+
+  def put!(p: [Byte]) -> ~Int { self.w.~write!(p) }
+
+  # Writes the buffered output; false on an error (in err).
+  def flush_out! -> Bool {
+    return true if nout == 0
+    r = put!(out[0...nout])
+    self.nout = 0
+    if e = r.err {
+      self.err = e
+      return false
+    }
+    true
+  }
+
+  def write_byte!(c: Byte) -> Bool {
+    return false if nout == out.size && !flush_out!
+    self.out[nout] = c
+    self.nout += 1
+    true
+  }
+
+  # Writes one code; false on an error.
+  def write_code!(c: U32) -> Bool {
+    if order == LSB {
+      self.bits = bits | (c << n_bits)
+      self.n_bits += width
+      while n_bits >= 8 {
+        return false if !write_byte!(bits.as_u8)
+        self.bits = bits >> 8
+        self.n_bits -= 8
+      }
+      return true
+    }
+    self.bits = bits | (c << (32 - width - n_bits))
+    self.n_bits += width
+    while n_bits >= 8 {
+      return false if !write_byte!((bits >> 24).as_u8)
+      self.bits = bits << 8
+      self.n_bits -= 8
+    }
+    true
+  }
+
+  # Increments hi; at the largest code, writes a clear code and resets the
+  # table: 1 then (Go's errOutOfCodes), -1 on a write error, else 0.
+  def inc_hi! -> Int {
+    self.hi += 1
+    if hi == overflow {
+      self.width += 1
+      self.overflow = overflow << 1
+    }
+    if hi == MAX_CODE.as_u32 {
+      clear = 1.as_u32 << lit_width
+      return -1 if !write_code!(clear)
+      self.width = lit_width + 1
+      self.hi = clear + 1
+      self.overflow = clear << 1
+      i = 0
+      while i < table.size {
+        self.table[i] = INVALID_ENTRY
+        i += 1
+      }
+      return 1
+    }
+    0
+  }
+
+  def write!(p0: [Byte]) -> ~Int {
+    if e = err {
+      fail e
+    }
+    return 0 if p0.size == 0
+    max_lit = ((1 << lit_width) - 1).as_u8
+    if max_lit != 0xff {
+      for x in p0 {
+        if x > max_lit {
+          self.err = LzwError.ByteTooLarge
+          fail LzwError.ByteTooLarge
+        }
+      }
+    }
+    n = p0.size
+    p = p0
+    code = saved_code
+    if code == INVALID_CODE {
+      # Start with a clear code, as in libtiff and libgif.
+      clear = 1.as_u32 << lit_width
+      if !write_code!(clear) {
+        fail err.unwrap
+      }
+      code = p[0].as_u32
+      p = p[1...p.size]
+    }
+    tab = table
+    for x in p {
+      literal = x.as_u32
+      key = (code << 8) | literal
+      # A hit in the table: key's code.
+      hash = ((key >> 12) ^ key) & TABLE_MASK
+      found = false
+      hh = hash
+      t = tab[hh.to_i]
+      while t != INVALID_ENTRY {
+        if key == t >> 12 {
+          code = t & MAX_CODE.as_u32
+          found = true
+          break
+        }
+        hh = (hh + 1) & TABLE_MASK
+        t = tab[hh.to_i]
+      }
+      next if found
+      # Otherwise: write the current code and add key to the table.
+      if !write_code!(code) {
+        fail err.unwrap
+      }
+      code = literal
+      r = inc_hi!
+      if r < 0 {
+        fail err.unwrap
+      }
+      next if r == 1
+      loop {
+        if tab[hash.to_i] == INVALID_ENTRY {
+          tab[hash.to_i] = (key << 12) | hi
+          break
+        }
+        hash = (hash + 1) & TABLE_MASK
+      }
+    }
+    self.saved_code = code
+    n
+  }
+
+  def close! -> ~Unit {
+    return if closed
+    if e = err {
+      fail e
+    }
+    self.closed = true
+    self.err = LzwError.Closed
+    if saved_code != INVALID_CODE {
+      # Write the saved code, as well as the implicit code.
+      fail_write! if !write_code!(saved_code)
+      fail_write! if inc_hi! < 0
+    } else {
+      # Write the starting clear code, as w.write! did not.
+      clear = 1.as_u32 << lit_width
+      fail_write! if !write_code!(clear)
+    }
+    # Write the eof code.
+    eof = (1.as_u32 << lit_width) + 1
+    fail_write! if !write_code!(eof)
+    # Write the final bits.
+    if n_bits > 0 {
+      self.bits = bits >> 24 if order == MSB
+      fail_write! if !write_byte!(bits.as_u8)
+    }
+    fail_write! if !flush_out!
+  }
+
+  # Fails with the write error in err.
+  def fail_write! -> ~Unit {
+    e = err.unwrap
+    self.err = e
+    fail e
+  }
+}
+
+def new_encoder[W](dst: W, order: Int, lit_width: Int) -> Encoder[W] {
+  e = Encoder[W].new(w: dst, out: zbytes(OUT_BUFFER), nout: 0, lit_width: 0, order: order, n_bits: 0, width: 0, bits: 0,
+    hi: 0, overflow: 0, saved_code: INVALID_CODE, err: none, closed: false, table: zu32(TABLE_SIZE))
+  if order != LSB && order != MSB {
+    e.err = LzwError.UnknownOrder
+    return e
+  }
+  if lit_width < 2 || 8 < lit_width {
+    e.err = LzwError.LitWidthRange(width: lit_width)
+    return e
+  }
+  e.width = 1 + lit_width
+  e.lit_width = lit_width
+  e.hi = ((1 << lit_width) + 1).as_u32
+  e.overflow = (1 << (lit_width + 1)).as_u32
+  e
+}
+
+def zu32(n: Int) -> [U32] {
+  b: [U32] = [0; n]
+  b
+}
+
+# Compresses to W (Go's lzw.Writer).
+pub struct Writer[W] {
+  st: [Encoder[W]]
+
+  # Compresses p; returns p.size. Every byte must fit in lit_width bits.
+  pub def write!(p: [Byte]) -> ~Int {
+    self.st[0].~write!(p)
+  }
+
+  # Writes the end of the stream and the buffered output; later writes
+  # fail with LzwError.Closed. Doesn't close the underlying writer.
+  pub def close! -> ~Unit {
+    self.st[0].~close!
+  }
+
+  # Starts over on dst, as new_writer(dst, order, lit_width) would.
+  pub def reset!(dst: W, order: Int, lit_width: Int) {
+    self.st[0] = new_encoder(dst, order, lit_width)
+  }
+}
+
+# A Writer compressing to w with `order` and literal codes of lit_width bits
+# (2 to 8). A bad order or width makes every write fail.
+pub def new_writer[W](w: W, order: Int, lit_width: Int) -> Writer[W] {
+  Writer[W].new(st: [new_encoder(w, order, lit_width)])
+}

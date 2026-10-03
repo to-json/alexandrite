@@ -1,0 +1,218 @@
+#![overflow(wrap)]
+# DEFLATE tokens (Go's token.go): literals and matches, with the histograms
+# of the codes they use.
+#
+# A token is a U32:
+#   bits 0-16  xoffset = offset - MIN_OFFSET_SIZE, or the literal
+#   bits 16-22 offset code
+#   bits 22-30 xlength = length - 3
+#   bits 30-32 type: 0 literal, 1 match
+
+import "math"
+
+LENGTH_SHIFT = 22
+OFFSET_MASK: U32 = 0x3fffff
+MATCH_TYPE: U32 = 0x40000000
+MATCH_OFFSET_ONLY_MASK: U32 = 0xffff
+
+# The offset code of offset `off` (offset - 1).
+def offset_code(off: U32) -> U32 {
+  return OFFSET_CODES[off.to_i] if off < 256
+  OFFSET_CODES14[((off >> 7) & 0xff).to_i]
+}
+
+def zero_u16(xs: [U16]) {
+  i = 0
+  while i < xs.size {
+    xs[i] = 0
+    i += 1
+  }
+  nil
+}
+
+def new_tokens -> Tokens {
+  eh: [U16] = [0; 32]
+  oh: [U16] = [0; 32]
+  lh: [U16] = [0; 256]
+  ts: [U32] = [0; 65536]
+  Tokens.new(extra_hist: eh, off_hist: oh, lit_hist: lh, n: 0, toks: ts)
+}
+
+# The tokens of a block and their histograms (Go's tokens). Only `n` is
+# held in the struct: a copy shares everything else.
+struct Tokens {
+  # Codes 256 and up.
+  extra_hist: [U16]
+  # Offset codes.
+  off_hist: [U16]
+  # Codes 0-255.
+  lit_hist: [U16]
+  n: Int
+  toks: [U32]
+
+  def reset! {
+    return if n == 0
+    self.n = 0
+    zero_u16(lit_hist)
+    zero_u16(extra_hist)
+    zero_u16(off_hist)
+    nil
+  }
+
+  def add_literal!(lit: Byte) {
+    self.toks[n] = lit.as_u32
+    self.lit_hist[lit.to_i] += 1
+    self.n += 1
+    nil
+  }
+
+  def add_match!(xlength: U32, xoffset0: U32) {
+    oc = offset_code(xoffset0)
+    xoffset = xoffset0 | (oc << 16)
+    self.extra_hist[LENGTH_CODES1[(xlength & 0xff).to_i].to_i] += 1
+    self.off_hist[(oc & 31).to_i] += 1
+    self.toks[n] = MATCH_TYPE | (xlength << LENGTH_SHIFT) | xoffset
+    self.n += 1
+    nil
+  }
+
+  # Adds a match of length xlength0 (no base subtracted; may be longer than
+  # 258) at offset xoffset0 + 1.
+  def add_match_long!(xlength0: Int, xoffset0: U32) {
+    oc = offset_code(xoffset0)
+    xoffset = xoffset0 | (oc << 16)
+    xlength = xlength0
+    while xlength > 0 {
+      xl = xlength
+      if xl > 258 {
+        # At least 3 must be left for the next round.
+        if xl > 258 + 3 {
+          xl = 258
+        } else {
+          xl = 258 - 3
+        }
+      }
+      xlength -= xl
+      xl -= 3
+      self.extra_hist[LENGTH_CODES1[xl & 0xff].to_i] += 1
+      self.off_hist[(oc & 31).to_i] += 1
+      self.toks[n] = MATCH_TYPE | (xl.as_u32 << LENGTH_SHIFT) | xoffset
+      self.n += 1
+    }
+    nil
+  }
+
+  def add_eob! {
+    self.toks[n] = END_BLOCK_MARKER.as_u32
+    self.extra_hist[0] += 1
+    self.n += 1
+    nil
+  }
+
+  # An estimate of the minimum size of an optimal compression of the tokens
+  # (Go's EstimatedBits): at least 1 and at most 15 bits per symbol.
+  def estimated_bits -> Int {
+    shannon = 0.0
+    bits = 0
+    n_matches = 0
+    total = n
+    if total > 0 {
+      inv_total = f32r(1.0 / total.to_f)
+      for v in lit_hist {
+        if v > 0 {
+          nf = v.to_i.to_f
+          shannon = f32_fma(sym_cost(f32r(nf * inv_total)), nf, shannon)
+        }
+      }
+      # Just add 15 for EOB.
+      shannon = f32r(shannon + 15.0)
+      i = 1
+      while i < LITERAL_COUNT - 256 {
+        v = extra_hist[i]
+        if v > 0 {
+          nf = v.to_i.to_f
+          shannon = f32_fma(sym_cost(f32r(nf * inv_total)), nf, shannon)
+          bits += LENGTH_EXTRA_BITS[(i - 1) & 31].to_i * v.to_i
+          n_matches += v.to_i
+        }
+        i += 1
+      }
+    }
+    if n_matches > 0 {
+      inv_total = f32r(1.0 / n_matches.to_f)
+      i = 0
+      while i < OFFSET_CODE_COUNT {
+        v = off_hist[i]
+        if v > 0 {
+          nf = v.to_i.to_f
+          shannon = f32_fma(sym_cost(f32r(nf * inv_total)), nf, shannon)
+          bits += OFFSET_EXTRA_BITS[i & 31].to_i * v.to_i
+        }
+        i += 1
+      }
+    }
+    shannon.to_i + bits
+  }
+}
+
+# ---- float32 arithmetic, emulated exactly in Float ----
+#
+# Go computes EstimatedBits in float32, and on arm64 fuses `a*b + c` into
+# one rounding (FMADDS / FNMSUBS). These helpers reproduce that bit for bit:
+# every float32 product is exact in a Float, so rounding a Float result to
+# float32 once gives float32's own result.
+
+# x rounded to the nearest float32 (ties to even); x must be 0 or in
+# float32's normal range.
+def f32r(x: Float) -> Float {
+  return x if x == 0.0
+  b = math.float64bits(x)
+  low = b & 0x1fffffff
+  r = b & 0xffffffffe0000000
+  if low > 0x10000000 || (low == 0x10000000 && (r >> 29) & 1 == 1) {
+    r += 0x20000000
+  }
+  math.float64frombits(r)
+}
+
+# float32(a*b + c) with one rounding (a, b, c float32 values).
+def f32_fma(a: Float, b: Float, c: Float) -> Float {
+  f32r(math.fma(a, b, c))
+}
+
+# The float32 bit pattern of a positive normal float32 value x.
+def f32bits(x: Float) -> Int {
+  b = math.float64bits(x)
+  e = ((b >> 52) & 0x7ff).to_i - 1023 + 127
+  (e << 23) | ((b >> 29) & 0x7fffff).to_i
+}
+
+# The float32 with the bit pattern u (positive, normal).
+def f32frombits(u: Int) -> Float {
+  e = ((u >> 23) & 255) - 127 + 1023
+  math.float64frombits((e.as_u64 << 52) | ((u & 0x7fffff).as_u64 << 29))
+}
+
+# min(15, max(1, -mFastLog2(x))): the estimated bits of a symbol of
+# probability x.
+def sym_cost(x: Float) -> Float {
+  c = -fast_log2(x)
+  c = 1.0 if c < 1.0
+  c = 15.0 if c > 15.0
+  c
+}
+
+# Go's mFastLog2: a fast approximation of log2(val) (stackoverflow 28730362).
+def fast_log2(val: Float) -> Float {
+  ux = f32bits(val)
+  log2 = (((ux >> 23) & 255) - 128).to_f
+  ux = ux & 0x807fffff
+  ux += 127 << 23
+  uval = f32frombits(ux)
+  c1 = f32r(-0.34484843)
+  c2 = f32r(2.02466578)
+  c3 = f32r(0.67487759)
+  t = f32_fma(c1, uval, c2)
+  t = f32_fma(t, uval, -c3)
+  f32r(log2 + t)
+}

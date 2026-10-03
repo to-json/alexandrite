@@ -1,0 +1,253 @@
+# Go's reader_test.go and writer_test.go.
+import "bytes"
+import "encoding/hex"
+import "fmt"
+import "hash/crc32"
+import "io"
+import "os"
+import "strings"
+
+def b(s: Str) -> [Byte] { s.bytes.to_a }
+
+def h(s: Str) -> [Byte] { hex.decode_string(s).unwrap }
+
+def read(file: Str) -> [Byte] { os.read_file(file).unwrap }
+
+# Reads a slice without copying it.
+struct SliceReader {
+  data: [Byte]
+  st: [Int]
+
+  pub def read!(p: [Byte]) -> Int {
+    n = copy(p, data[st[0]...data.size])
+    self.st[0] += n
+    n
+  }
+}
+
+def slice_reader(data: [Byte]) -> SliceReader { SliceReader.new(data: data, st: [0]) }
+
+def unexpected_eof?(e: Error) -> Bool {
+  case e {
+    io.StreamError.UnexpectedEof => true
+    _ => false
+  }
+}
+
+# (description "name;order;width", raw (hex), compressed (hex), error)
+def lzw_tests -> [(Str, Str, Str, Str)] {
+  [
+    ("empty;LSB;8", "", "0101", ""),
+    ("empty;MSB;8", "", "8080", ""),
+    ("tobe;LSB;7", "544f42454f524e4f54544f42454f52544f42454f524e4f54", "544f42454f524e4f548284868b85878981", ""),
+    ("tobe;LSB;8", "544f42454f524e4f54544f42454f52544f42454f524e4f54", "549e0829f2448a932754041234b8b0e0c1840101", ""),
+    ("tobe;MSB;7", "544f42454f524e4f54544f42454f52544f42454f524e4f54", "544f42454f524e4f548284868b85878981", ""),
+    ("tobe;MSB;8", "544f42454f524e4f54544f42454f52544f42454f524e4f54", "2a13c8445279489c4f2a40a090685c160f098080", ""),
+    ("tobe-truncated;LSB;8", "544f42454f524e4f54544f42454f52544f42454f524e4f54", "549e0829f2448a93275404", "eof"),
+    ("gif;LSB;8", "28ffffff28ffffffffffffffffffff", "0051fc1b2870a0c1830101", ""),
+    ("pdf;MSB;8", "2d2d2d2d2d412d2d2d42", "800b6050220c0c8501", ""),
+  ]
+}
+
+def order_of(s: Str) -> Int { s == "LSB" ? LSB : MSB }
+
+# ---- reader_test.go ----
+
+test "Reader" {
+  bf = bytes.new_buffer([])
+  for tt in lzw_tests() {
+    d = strings.split(tt[0], ";")
+    rc = new_reader(slice_reader(h(tt[2])), order_of(d[1]), d[2].to_i)
+    bf.reset!
+    r = io.copy(bf, rc)
+    s = hex.encode_to_string(bf.bytes)
+    if e = r.err {
+      assert tt[3] == "eof" && unexpected_eof?(e), "#{tt[0]}: io.copy: #{e.message} want #{tt[3]}"
+      assert bf.size > 0 && strings.has_prefix(tt[1], s), "got #{bf.size} bytes, want a non-empty prefix"
+      next
+    }
+    assert_eq s, tt[1]
+  }
+}
+
+test "ReaderReset" {
+  bf = bytes.new_buffer([])
+  for tt in lzw_tests() {
+    d = strings.split(tt[0], ";")
+    order = order_of(d[1])
+    lw = d[2].to_i
+    rc = new_reader(slice_reader(h(tt[2])), order, lw)
+    bf.reset!
+    r = io.copy(bf, rc)
+    b1 = bf.bytes
+    if e = r.err {
+      assert tt[3] == "eof" && unexpected_eof?(e), "#{tt[0]}: io.copy: #{e.message}"
+      next
+    }
+    bf.reset!
+    rc.reset!(slice_reader(h(tt[2])), order, lw)
+    ~io.copy(bf, rc)
+    assert bf.bytes == b1, "bytes read were not the same"
+  }
+}
+
+# Endless zeros.
+struct DevZero {
+  pub def read!(p: [Byte]) -> Int {
+    i = 0
+    while i < p.size {
+      p[i] = 0
+      i += 1
+    }
+    p.size
+  }
+}
+
+test "HiCodeDoesNotOverflow" {
+  r = new_reader(DevZero.new, LSB, 8)
+  bf: [Byte] = [0; 1024]
+  old_hi = 0
+  i = 0
+  while i < 100 {
+    n = 0
+    while n < bf.size {
+      n += ~r.read!(bf[n...bf.size])
+    }
+    assert r.hi >= old_hi, "i=#{i}: hi=#{r.hi} decreased from previous value #{old_hi}"
+    old_hi = r.hi
+    i += 1
+  }
+}
+
+# Once hi reaches 4095, later codes don't save expansions.
+test "NoLongerSavingPriorExpansions" {
+  iterations = [(9, 512 - 257), (10, 1024 - 512), (11, 2048 - 1024), (12, 4096 - 2048)]
+  n_codes = 0
+  n_bits = 0
+  for e in iterations {
+    n_codes += e[1]
+    n_bits += e[1] * e[0]
+  }
+  assert_eq n_codes, 3839
+  assert_eq n_bits, 43255
+  input: [Byte] = [0; 5406]
+  input = input + h("80ff0f08")
+  r = new_reader(slice_reader(input), LSB, 8)
+  n_decoded = ~io.copy(io.Discard.new, r)
+  assert_eq n_decoded, n_codes + 2
+}
+
+# ---- writer_test.go ----
+
+FILENAMES = ["testdata/gettysburg.txt", "testdata/e.txt", "testdata/pi.txt"]
+
+# Compresses a file in 4096-byte writes and reads it back (Go pipes a
+# writer goroutine to the reader; here they run one after the other).
+def test_file(fname: Str, order: Int, lit_width: Int) -> ~Unit {
+  golden = ~os.read_file(fname)
+  buf = bytes.new_buffer([])
+  w = new_writer(buf, order, lit_width)
+  i = 0
+  while i < golden.size {
+    j = i + 4096
+    j = golden.size if j > golden.size
+    ~w.write!(golden[i...j])
+    i = j
+  }
+  ~w.close!
+  r = new_reader(buf, order, lit_width)
+  b1 = ~io.read_all(r)
+  ~r.close!
+  assert b1.size == golden.size, "#{fname} (order=#{order} litWidth=#{lit_width}): length mismatch #{b1.size} != #{golden.size}"
+  assert b1 == golden, "#{fname} (order=#{order} litWidth=#{lit_width}): mismatch"
+}
+
+test "Writer" {
+  for fname in FILENAMES {
+    for order in [LSB, MSB] {
+      lw = 6
+      while lw <= 8 {
+        ~test_file(fname, order, lw) if !(fname == "testdata/gettysburg.txt" && lw == 6)
+        lw += 1
+      }
+    }
+  }
+}
+
+test "WriterReset" {
+  for order in [LSB, MSB] {
+    lw = 6
+    while lw <= 8 {
+      data = lw == 6 ? h("010203") : b("lorem ipsum dolor sit amet")
+      buf = bytes.new_buffer([])
+      w = new_writer(buf, order, lw)
+      ~w.write!(data)
+      ~w.close!
+      b1 = buf.bytes
+      buf.reset!
+      w.reset!(buf, order, lw)
+      ~w.write!(data)
+      ~w.close!
+      assert buf.bytes == b1, "bytes written were not same"
+      lw += 1
+    }
+  }
+}
+
+test "WriterReturnValues" {
+  w = new_writer(io.Discard.new, LSB, 8)
+  assert_eq ~w.write!(b("asdf")), 4
+}
+
+test "SmallLitWidth" {
+  w = new_writer(io.Discard.new, LSB, 2)
+  assert w.write!(h("03")).ok?, "write a byte < 1<<2"
+  assert w.write!(h("04")).err?, "write a byte >= 1<<2: got no error"
+}
+
+test "StartsWithClearCode" {
+  for empty in [false, true] {
+    buf = bytes.new_buffer([])
+    w = new_writer(buf, LSB, 7)
+    ~w.write!(b("Hi")) if !empty
+    ~w.close!
+    want = empty ? h("8081") : h("80") + b("Hi") + h("81")
+    assert buf.bytes == want, "empty=#{empty}: got #{buf.bytes}"
+  }
+}
+
+# ---- helpers of the generated vectors ----
+
+# A deterministic byte generator.
+def rand_bytes(n: Int, seed: U64, mask: Int) -> [Byte] {
+  out: [Byte] = [0; n]
+  x = seed
+  i = 0
+  while i < n {
+    x = x *% 6364136223846793005 +% 1442695040888963407
+    out[i] = ((x >> 33).to_i & mask).as_u8
+    i += 1
+  }
+  out
+}
+
+# Compresses data, checks the round trip, and returns the output's hex, or
+# its size and CRC-32 when long.
+def vec_lzw(data: [Byte], order: Int, lw: Int) -> Str {
+  buf = bytes.new_buffer([])
+  w = new_writer(buf, order, lw)
+  w.write!(data).unwrap
+  w.close!.unwrap
+  out = buf.bytes
+  back = io.read_all(new_reader(slice_reader(out), order, lw)).unwrap
+  assert back == data, "round trip"
+  return hex.encode_to_string(out) if out.size <= 96
+  "#{out.size} #{fmt.sprintf("%08x", crc32.checksum_ieee(out))}"
+}
+
+bench "Encoder/1e5" {
+  data = read("testdata/e.txt")
+  w = new_writer(io.Discard.new, LSB, 8)
+  w.write!(data).unwrap
+  w.close!.unwrap
+}

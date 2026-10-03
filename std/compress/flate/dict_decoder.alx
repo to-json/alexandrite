@@ -1,0 +1,138 @@
+#![overflow(wrap)]
+# The LZ77 sliding dictionary of the decompressor (Go's dict_decoder.go).
+#
+# Literal insertions go in with write_byte! (or write_slice / write_mark!);
+# backward copies (dist, length) with try_write_copy! / write_copy!. The
+# length may exceed the distance: the copy then repeats its own output
+# (run-length encoding). For speed there are no checks: the invariants of
+# each method must hold.
+
+def new_dict_decoder(size: Int, dict: [Byte]) -> DictDecoder {
+  h: [Byte] = []
+  dd = DictDecoder.new(hist: h, wr_pos: 0, rd_pos: 0, full: false)
+  dd.init!(size, dict)
+  dd
+}
+
+struct DictDecoder {
+  # The sliding window history.
+  hist: [Byte]
+  # Invariant: 0 <= rd_pos <= wr_pos <= hist.size.
+  # The current output position.
+  wr_pos: Int
+  # hist[0...rd_pos] has been emitted.
+  rd_pos: Int
+  # A full window has been written.
+  full: Bool
+
+  # A window of `size` bytes, holding the end of `dict` if given.
+  def init!(size: Int, dict0: [Byte]) {
+    self.wr_pos = 0
+    self.rd_pos = 0
+    self.full = false
+    self.hist = zbytes(size) if hist.size != size
+    dict = dict0
+    dict = dict[dict.size - hist.size...dict.size] if dict.size > hist.size
+    self.wr_pos = copy(hist, dict)
+    if wr_pos == hist.size {
+      self.wr_pos = 0
+      self.full = true
+    }
+    self.rd_pos = wr_pos
+    nil
+  }
+
+  # The amount of history in the dictionary.
+  def hist_size -> Int {
+    return hist.size if full
+    wr_pos
+  }
+
+  # The bytes read_flush! would return.
+  def avail_read -> Int { wr_pos - rd_pos }
+
+  # The space left in the output buffer.
+  def avail_write -> Int { hist.size - wr_pos }
+
+  # The free part of the buffer, to write into (then write_mark!).
+  def write_slice -> [Byte] { hist[wr_pos...hist.size] }
+
+  # Advances the write position by cnt (0 <= cnt <= avail_write).
+  def write_mark!(cnt: Int) {
+    self.wr_pos += cnt
+    nil
+  }
+
+  # Writes one byte (avail_write > 0).
+  def write_byte!(c: Byte) {
+    self.hist[wr_pos] = c
+    self.wr_pos += 1
+    nil
+  }
+
+  # Copies `length` bytes from `dist` back to the output; returns the count
+  # copied, less than length if the buffer fills (0 < dist <= hist_size).
+  def write_copy!(dist: Int, length: Int) -> Int {
+    h = hist
+    dst_base = wr_pos
+    dst_pos = dst_base
+    src_pos = dst_pos - dist
+    end_pos = dst_pos + length
+    end_pos = h.size if end_pos > h.size
+    # The non-overlapping part after the destination (when dist wraps
+    # around the buffer): a plain copy.
+    if src_pos < 0 {
+      src_pos += h.size
+      dst_pos += copy(h[dst_pos...end_pos], h[src_pos...h.size])
+      src_pos = 0
+    }
+    # The possibly overlapping part: a forward copy, repeating as it goes.
+    while dst_pos < end_pos {
+      dst_pos += copy(h[dst_pos...end_pos], h[src_pos...dst_pos])
+    }
+    self.wr_pos = dst_pos
+    dst_pos - dst_base
+  }
+
+  # write_copy! for short distances that don't wrap; 0 if it can't.
+  def try_write_copy!(dist: Int, length: Int) -> Int {
+    dst_pos = wr_pos
+    end_pos = dst_pos + length
+    return 0 if dst_pos < dist || end_pos > hist.size
+    h = hist
+    dst_base = dst_pos
+    src_pos = dst_pos - dist
+    if length <= 32 {
+      # Short: a byte loop (a forward copy, so overlap repeats as LZ77
+      # wants) beats calling memmove.
+      i = 0
+      while i < length {
+        h[dst_pos + i] = h[src_pos + i]
+        i += 1
+      }
+      dst_pos = end_pos
+    } else if dist >= length {
+      copy(h[dst_pos...end_pos], h[src_pos...src_pos + length])
+      dst_pos = end_pos
+    } else {
+      while dst_pos < end_pos {
+        dst_pos += copy(h[dst_pos...end_pos], h[src_pos...dst_pos])
+      }
+    }
+    self.wr_pos = dst_pos
+    dst_pos - dst_base
+  }
+
+  # The history ready to be emitted; it must be consumed before any other
+  # call.
+  def read_flush! -> [Byte] {
+    to_read = hist[rd_pos...wr_pos]
+    self.rd_pos = wr_pos
+    if wr_pos == hist.size {
+      self.wr_pos = 0
+      self.rd_pos = 0
+      self.full = true
+    }
+    to_read
+  }
+}

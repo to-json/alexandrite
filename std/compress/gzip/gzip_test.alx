@@ -1,0 +1,348 @@
+# Go's gzip_test.go and gunzip_test.go (the gunzipTests table is in
+# gunzip_table_test.alx).
+#
+# Not translated: TestGZIPFilesHaveZeroMTimes (issue14937_test.go) checks
+# the .gz files of a Go checkout (there are none here).
+import "bytes"
+import "compress/flate"
+import "encoding/base64"
+import "encoding/hex"
+import "io"
+import "os"
+import "time"
+
+def b(s: Str) -> [Byte] { s.bytes.to_a }
+
+def by(c: Byte) -> [Byte] { [c] }
+
+def h(s: Str) -> [Byte] { hex.decode_string(s).unwrap }
+
+def unexpected_eof?(e: Error) -> Bool {
+  case e {
+    io.StreamError.UnexpectedEof => true
+    _ => false
+  }
+}
+
+# Whether e is the error named in the gunzip table.
+def table_error?(e: Error, name: Str) -> Bool {
+  case e {
+    io.StreamError.UnexpectedEof => name == "eof"
+    GzipError.Checksum => name == "checksum"
+    GzipError.Header => name == "header"
+    _ => false
+  }
+}
+
+# Reads a slice without copying it.
+struct SliceReader {
+  data: [Byte]
+  st: [Int]
+
+  pub def read!(p: [Byte]) -> Int {
+    n = copy(p, data[st[0]...data.size])
+    self.st[0] += n
+    n
+  }
+}
+
+def slice_reader(data: [Byte]) -> SliceReader { SliceReader.new(data: data, st: [0]) }
+
+# ---- gzip_test.go ----
+
+# An empty payload still forms a valid gzip stream.
+test "Empty" {
+  buf = bytes.new_buffer([])
+  ew = new_writer(buf)
+  ~ew.close!
+  r = (~new_reader(buf)).unwrap
+  assert r.header == Header.new(os: 255), "header mismatch: #{r.header}"
+  data = ~io.read_all(r)
+  assert_eq data.size, 0
+  ~r.close!
+}
+
+# Gzipping and then gunzipping is the identity.
+test "RoundTrip" {
+  buf = bytes.new_buffer([])
+  w = new_writer(buf)
+  w.header.comment = "comment"
+  w.header.extra = b("extra")
+  w.header.mod_time = time.unix(100000000, 0)
+  w.header.name = "name"
+  ~w.write!(b("payload"))
+  ~w.close!
+  r = (~new_reader(buf)).unwrap
+  data = ~io.read_all(r)
+  assert_eq Str.from_bytes(data), "payload"
+  assert_eq r.header.comment, "comment"
+  assert_eq r.header.extra.unwrap, b("extra")
+  assert_eq r.header.mod_time.unix, 100000000
+  assert_eq r.header.name, "name"
+  ~r.close!
+}
+
+# The conversions to and from Latin-1.
+test "Latin1" {
+  latin1: [Byte] = [0xc4, 117, 0xdf, 101, 114, 117, 110, 103, 0]
+  utf8 = "Äußerung"
+  z = (~new_reader(slice_reader(h("1f8b08080000000000ff") + latin1 + h("030000000000000000000000")))).unwrap
+  assert_eq z.header.name, utf8
+  bf = bytes.new_buffer([])
+  c = new_writer(bf)
+  ~c.put_latin1!(utf8)
+  assert_eq bf.bytes, latin1
+}
+
+# Metadata representable in Latin-1 survives a round trip.
+test "Latin1RoundTrip" {
+  cases = [
+    (b(""), true),
+    (b("ASCII is OK"), true),
+    (b("unless it contains a NUL") + by(0), false),
+    (b("no matter where ") + by(0) + b(" occurs"), false),
+    (by(0) + by(0) + by(0), false),
+    (b("Látin-1 also passes (U+00E1)"), true),
+    (b("but LĀtin Extended-A (U+0100) does not"), false),
+    (b("neither does 日本語"), false),
+    (b("invalid UTF-8 also ") + by(0xff) + b("ails"), false),
+    (by(0) + b(" as does Látin-1 with NUL"), false),
+  ]
+  for tc in cases {
+    name = Str.from_bytes(tc[0])
+    buf = bytes.new_buffer([])
+    w = new_writer(buf)
+    w.header.name = name
+    err = w.close!
+    assert err.ok? == tc[1], "Writer.close!: name = #{name}"
+    next if !tc[1]
+    r = (~new_reader(buf)).unwrap
+    ~io.read_all(r)
+    assert_eq r.header.name, name
+    ~r.close!
+  }
+}
+
+test "WriterFlush" {
+  buf = bytes.new_buffer([])
+  w = new_writer(buf)
+  w.header.comment = "comment"
+  w.header.extra = b("extra")
+  w.header.mod_time = time.unix(100000000, 0)
+  w.header.name = "name"
+  n0 = buf.size
+  assert n0 == 0, "buffer size = #{n0} before writes; want 0"
+  ~w.flush!
+  n1 = buf.size
+  assert n1 != 0, "no data after first flush"
+  ~w.write!(b("x"))
+  n2 = buf.size
+  assert n1 == n2, "after writing a single byte, size changed from #{n1} to #{n2}; want no change"
+  ~w.flush!
+  n3 = buf.size
+  assert n2 != n3, "flush didn't flush any data"
+  ~w.close!
+}
+
+# Concatenated gzip files form a valid gzip file.
+test "Concat" {
+  buf = bytes.new_buffer([])
+  w = new_writer(buf)
+  ~w.write!(b("hello "))
+  ~w.close!
+  w = new_writer(buf)
+  ~w.write!(b("world\n"))
+  ~w.close!
+  r = (~new_reader(buf)).unwrap
+  data = ~io.read_all(r)
+  assert_eq Str.from_bytes(data), "hello world\n"
+}
+
+test "WriterReset" {
+  buf = bytes.new_buffer([])
+  buf2 = bytes.new_buffer([])
+  z = new_writer(buf)
+  msg = b("hello world")
+  ~z.write!(msg)
+  ~z.close!
+  z.reset!(buf2)
+  ~z.write!(msg)
+  ~z.close!
+  assert_eq buf2.to_s, buf.to_s
+}
+
+# Accepts n bytes, then fails (Go's limitedWriter).
+struct LimitedWriter {
+  st: [Int]
+
+  pub def write!(p: [Byte]) -> ~Int {
+    n = st[0]
+    if n < p.size {
+      self.st[0] = 0
+      fail io.StreamError.ShortWrite
+    }
+    self.st[0] -= p.size
+    p.size
+  }
+}
+
+# write! never returns more than the input's size.
+test "LimitedWrite" {
+  msg = b("a")
+  lim = 2
+  while lim < 20 {
+    z = new_writer(LimitedWriter.new(st: [lim]))
+    n = z.write!(msg).unwrap_or(0)
+    assert n <= msg.size, "write = #{n}, want #{msg.size} or less"
+    z.reset!(LimitedWriter.new(st: [lim]))
+    z.header = Header.new(comment: "comment", extra: b("extra"), mod_time: time.now, name: "name", os: 1)
+    n = z.write!(msg).unwrap_or(0)
+    assert n <= msg.size, "write = #{n}, want #{msg.size} or less"
+    lim += 1
+  }
+}
+
+# ---- gunzip_test.go ----
+
+test "Decompressor" {
+  bf = bytes.new_buffer([])
+  for tt in gunzip_tests() {
+    gz = h(tt[3])
+    # new_reader.
+    r2 = (~new_reader(slice_reader(gz))).unwrap
+    assert_eq r2.header.name, tt[0]
+    bf.reset!
+    res = io.copy(bf, r2)
+    if e = res.err {
+      assert table_error?(e, tt[4]), "#{tt[1]}: io.copy: #{e.message} want #{tt[4]}"
+    } else {
+      assert tt[4] == "", "#{tt[1]}: io.copy: no error, want #{tt[4]}"
+    }
+    assert_eq hex.encode_to_string(bf.bytes), tt[2]
+    # reset!.
+    ~r2.reset!(slice_reader(gz))
+    assert_eq r2.header.name, tt[0]
+    bf.reset!
+    res = io.copy(bf, r2)
+    if e = res.err {
+      assert table_error?(e, tt[4]), "#{tt[1]}: io.copy: #{e.message} want #{tt[4]}"
+    } else {
+      assert tt[4] == "", "#{tt[1]}: io.copy: no error, want #{tt[4]}"
+    }
+    assert_eq hex.encode_to_string(bf.bytes), tt[2]
+  }
+}
+
+# A corrupt file fails rather than hangs (Go also times it out after a
+# second).
+test "Issue6550" {
+  f = ~os.open("testdata/issue6550.gz.base64")
+  gz = (~new_reader(base64.new_decoder(base64.std_encoding(), f))).unwrap
+  assert io.copy(io.Discard.new, gz).err?, "copy succeeded"
+  ~f.close!
+}
+
+test "MultistreamFalse" {
+  tt = gunzip_tests()[3]
+  assert_eq tt[1], "hello.txt x2"
+  br = slice_reader(h(tt[3]))
+  # Two streams of "hello world\n", then the end.
+  hello = "hello world\n"
+  r = (~new_reader_exact(br)).unwrap
+  r.multistream!(false)
+  data = ~io.read_all(r)
+  assert_eq Str.from_bytes(data), hello
+  assert ~r.reset!(br), "second reset"
+  r.multistream!(false)
+  data = ~io.read_all(r)
+  assert_eq Str.from_bytes(data), hello
+  assert !(~r.reset!(br)), "third reset: want the end of the input"
+}
+
+# Zero members are fine (Go: io.EOF).
+test "NilStream" {
+  r = ~new_reader(slice_reader([]))
+  assert r.none?, "new_reader on an empty stream: got a reader, want none"
+}
+
+test "TruncatedStreams" {
+  cases = [
+    ("original", h("1f8b08040009" + "6e8800ff0700666f6f20626172cb48cdc9c9d75128cf2fca490104" + "3a72abff0c000000")),
+    ("truncated name", h("1f8b08100000000000ff01")),
+    ("truncated comment", h("1f8b08080000000000ff01")),
+  ]
+  # At least one byte in the stream.
+  for tc in cases {
+    data = tc[1]
+    i = 1
+    while i < data.size {
+      r = new_reader(slice_reader(data[0...i]))
+      if e = r.err {
+        assert unexpected_eof?(e), "new_reader(#{tc[0]}-#{i}) on truncated stream: got #{e.message}"
+        i += 1
+        next
+      }
+      if z = r.unwrap {
+        res = io.copy(io.Discard.new, z)
+        assert res.err? && unexpected_eof?(res.err.unwrap), "io.copy(#{tc[0]}-#{i}) on truncated stream"
+      }
+      i += 1
+    }
+  }
+}
+
+# Many empty members don't exhaust the stack (CVE-2022-30631). Go uses 4e6
+# members; 4e5 keep the JIT run short and show the same.
+test "CVE202230631" {
+  empty = h("1f8b0800a78f4362000303000000000000000000")
+  r = bytes.repeat(empty, 400000)
+  z = (~new_reader(slice_reader(r))).unwrap
+  bf: [Byte] = [0; 10]
+  assert_eq ~z.read!(bf), 0
+}
+
+# ---- example_test.go ----
+#
+# Not translated: Example_compressingReader (an HTTP test server and
+# io.Pipe).
+
+example "writerReader" {
+  buf = bytes.new_buffer([])
+  zw = new_writer(buf)
+  # Setting the header fields is optional.
+  zw.header.name = "a-new-hope.txt"
+  zw.header.comment = "an epic space opera by George Lucas"
+  zw.header.mod_time = time.date(1977, 5, 25, 0, 0, 0, 0, time.utc)
+  ~zw.write!(b("A long time ago in a galaxy far, far away..."))
+  ~zw.close!
+  zr = (~new_reader(buf)).unwrap
+  print "Name: #{zr.header.name}\nComment: #{zr.header.comment}\nModTime: #{zr.header.mod_time.utc}\n\n"
+  print Str.from_bytes(~io.read_all(zr))
+  ~zr.close!
+} outputs "Name: a-new-hope.txt\nComment: an epic space opera by George Lucas\nModTime: 1977-05-25 00:00:00 +0000 UTC\n\nA long time ago in a galaxy far, far away..."
+
+example "Reader_Multistream" {
+  buf = bytes.new_buffer([])
+  zw = new_writer(buf)
+  files = [
+    ("file-1.txt", "file-header-1", time.date(2006, 2, 1, 3, 4, 5, 0, time.utc), "Hello Gophers - 1"),
+    ("file-2.txt", "file-header-2", time.date(2007, 3, 2, 4, 5, 6, 1, time.utc), "Hello Gophers - 2"),
+  ]
+  for file in files {
+    zw.header.name = file[0]
+    zw.header.comment = file[1]
+    zw.header.mod_time = file[2]
+    ~zw.write!(b(file[3]))
+    ~zw.close!
+    zw.reset!(buf)
+  }
+  zr = (~new_reader_exact(buf)).unwrap
+  loop {
+    zr.multistream!(false)
+    print "Name: #{zr.header.name}\nComment: #{zr.header.comment}\nModTime: #{zr.header.mod_time.utc}\n\n"
+    print Str.from_bytes(~io.read_all(zr))
+    print "\n\n"
+    break if !(~zr.reset!(buf))
+  }
+  ~zr.close!
+} outputs "Name: file-1.txt\nComment: file-header-1\nModTime: 2006-02-01 03:04:05 +0000 UTC\n\nHello Gophers - 1\n\nName: file-2.txt\nComment: file-header-2\nModTime: 2007-03-02 04:05:06 +0000 UTC\n\nHello Gophers - 2\n\n"

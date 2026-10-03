@@ -1,0 +1,205 @@
+# Go's reader_test.go, writer_test.go and example_test.go.
+import "bytes"
+import "encoding/hex"
+import "io"
+import "os"
+
+def b(s: Str) -> [Byte] { s.bytes.to_a }
+
+def h(s: Str) -> [Byte] { hex.decode_string(s).unwrap }
+
+# Reads a slice without copying it.
+struct SliceReader {
+  data: [Byte]
+  st: [Int]
+
+  pub def read!(p: [Byte]) -> Int {
+    n = copy(p, data[st[0]...data.size])
+    self.st[0] += n
+    n
+  }
+}
+
+def slice_reader(data: [Byte]) -> SliceReader { SliceReader.new(data: data, st: [0]) }
+
+# Whether e is the error named in the table.
+def table_error?(e: Error, name: Str) -> Bool {
+  case e {
+    io.StreamError.UnexpectedEof => name == "eof"
+    ZlibError.Checksum => name == "checksum"
+    ZlibError.Header => name == "header"
+    ZlibError.Dictionary => name == "dictionary"
+    _ => false
+  }
+}
+
+# ---- reader_test.go ----
+
+test "Decompressor" {
+  # (description, raw, compressed (hex), dictionary (hex), error)
+  tests = [
+    ("truncated empty", "", "", "", "eof"),
+    ("truncated dict", "", "78bb", "00", "eof"),
+    ("truncated checksum", "", "78bb000100" + "01ca48cdc9c9d75128cf2fca49010400" + "00ffff", "00", "eof"),
+    ("empty", "", "789c030000000001", "", ""),
+    ("goodbye", "goodbye, world", "789c4bcfcf4f49aa4cd55128cf2fca490100" + "28a5055e", "", ""),
+    ("bad header (CINFO)", "", "8898030000000001", "", "header"),
+    ("bad header (FCHECK)", "", "789f030000000001", "", "header"),
+    ("bad checksum", "", "789c0300000000ff", "", "checksum"),
+    ("not enough data", "", "789c03000000", "", "eof"),
+    ("excess data is silently ignored", "", "789c030000000001789cff", "", ""),
+    ("dictionary", "Hello, World!\n", "78bb1c320427f300b175201c452e0024120474",
+      "48656c6c6f20576f726c640a", ""),
+    ("wrong dictionary", "", "78bb1c320427f300b175201c452e0024120474", "48656c6c", "dictionary"),
+    ("truncated zlib stream amid raw-block", "hello", "789c000c00f3ff68656c6c6f", "", "eof"),
+    ("truncated zlib stream amid fixed-block", "He", "789cf248cd", "", "eof"),
+  ]
+  bf = bytes.new_buffer([])
+  for tt in tests {
+    zr0 = new_reader_dict(slice_reader(h(tt[2])), h(tt[3]))
+    if e = zr0.err {
+      assert table_error?(e, tt[4]), "#{tt[0]}: new_reader: #{e.message}"
+      next
+    }
+    zr = zr0.unwrap
+    # Read and check the data.
+    bf.reset!
+    r = io.copy(bf, zr)
+    if e = r.err {
+      assert table_error?(e, tt[4]), "#{tt[0]}: io.copy: #{e.message} want #{tt[4]}"
+      next
+    }
+    assert tt[4] == "", "#{tt[0]}: no error, want #{tt[4]}"
+    assert_eq bf.to_s, tt[1]
+    # The end is sticky.
+    one: [Byte] = [0]
+    assert_eq ~zr.read!(one), 0
+    assert zr.close!.ok?, "#{tt[0]}: close failed"
+  }
+}
+
+# ---- writer_test.go ----
+
+FILENAMES = ["testdata/gettysburg.txt", "testdata/e.txt", "testdata/pi.txt"]
+
+# Compresses b0 and reads it back (Go pipes a writer goroutine to the
+# reader; here they run one after the other).
+def test_level_dict(fname: Str, b0: [Byte], level: Int, d: Str) -> ~Unit {
+  dict = b(d)
+  buf = bytes.new_buffer([])
+  zw = ~new_writer_level_dict(buf, level, dict)
+  ~zw.write!(b0)
+  ~zw.close!
+  zr = ~new_reader_dict(buf, dict)
+  b1 = ~io.read_all(zr)
+  ~zr.close!
+  assert b0.size == b1.size, "#{fname} (level=#{level}, dict=#{d}): length mismatch #{b0.size} versus #{b1.size}"
+  assert b0 == b1, "#{fname} (level=#{level}, dict=#{d}): mismatch"
+}
+
+def test_file_level_dict(fname: Str, level: Int, d: Str) -> ~Unit {
+  ~test_level_dict(fname, ~os.read_file(fname), level, d)
+}
+
+def test_file_level_dict_reset(fname: Str, level: Int, dict: [Byte]) -> ~Unit {
+  b0 = ~os.read_file(fname)
+  buf = bytes.new_buffer([])
+  zw = ~new_writer_level_dict(buf, level, dict)
+  ~zw.write!(b0)
+  ~zw.close!
+  out = buf.to_s
+  buf2 = bytes.new_buffer([])
+  zw.reset!(buf2)
+  ~zw.write!(b0)
+  ~zw.close!
+  assert buf2.to_s == out, "#{fname} (level=#{level}): different output after reset (got #{buf2.size} bytes, expected #{out.size})"
+}
+
+test "Writer" {
+  data = ["test a reasonable sized string that can be compressed"]
+  i = 0
+  for s in data {
+    tag = "##{i}"
+    ~test_level_dict(tag, b(s), DEFAULT_COMPRESSION, "")
+    ~test_level_dict(tag, b(s), NO_COMPRESSION, "")
+    ~test_level_dict(tag, b(s), HUFFMAN_ONLY, "")
+    level = BEST_SPEED
+    while level <= BEST_COMPRESSION {
+      ~test_level_dict(tag, b(s), level, "")
+      level += 1
+    }
+    i += 1
+  }
+}
+
+test "WriterBig" {
+  for fname in FILENAMES {
+    ~test_file_level_dict(fname, DEFAULT_COMPRESSION, "")
+    ~test_file_level_dict(fname, NO_COMPRESSION, "")
+    ~test_file_level_dict(fname, HUFFMAN_ONLY, "")
+    level = BEST_SPEED
+    while level <= BEST_COMPRESSION {
+      ~test_file_level_dict(fname, level, "")
+      level += 1
+    }
+  }
+}
+
+test "WriterDict" {
+  dictionary = "0123456789."
+  for fname in FILENAMES {
+    ~test_file_level_dict(fname, DEFAULT_COMPRESSION, dictionary)
+    ~test_file_level_dict(fname, NO_COMPRESSION, dictionary)
+    ~test_file_level_dict(fname, HUFFMAN_ONLY, dictionary)
+    level = BEST_SPEED
+    while level <= BEST_COMPRESSION {
+      ~test_file_level_dict(fname, level, dictionary)
+      level += 1
+    }
+  }
+}
+
+test "WriterReset" {
+  dictionary = b("0123456789.")
+  for fname in FILENAMES {
+    ~test_file_level_dict_reset(fname, NO_COMPRESSION, [])
+    ~test_file_level_dict_reset(fname, DEFAULT_COMPRESSION, [])
+    ~test_file_level_dict_reset(fname, HUFFMAN_ONLY, [])
+    ~test_file_level_dict_reset(fname, NO_COMPRESSION, dictionary)
+    ~test_file_level_dict_reset(fname, DEFAULT_COMPRESSION, dictionary)
+    ~test_file_level_dict_reset(fname, HUFFMAN_ONLY, dictionary)
+    level = BEST_SPEED
+    while level <= BEST_COMPRESSION {
+      ~test_file_level_dict_reset(fname, level, [])
+      level += 1
+    }
+  }
+}
+
+test "WriterDictIsUsed" {
+  input = b("Lorem ipsum dolor sit amet, consectetur adipisicing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua.")
+  buf = bytes.new_buffer([])
+  compressor = ~new_writer_level_dict(buf, BEST_COMPRESSION, input)
+  ~compressor.write!(input)
+  ~compressor.close!
+  expected_max_size = 25
+  assert buf.size <= expected_max_size, "result too large (got #{buf.size}, want <= #{expected_max_size} bytes): is the dictionary being used?"
+}
+
+# ---- example_test.go ----
+
+example "NewWriter" {
+  bf = bytes.new_buffer([])
+  w = new_writer(bf)
+  ~w.write!(b("hello, world\n"))
+  ~w.close!
+  puts bf.bytes
+} outputs "[120 156 0 13 0 242 255 104 101 108 108 111 44 32 119 111 114 108 100 10 3 0 33 231 4 147]"
+
+example "NewReader" {
+  buff: [Byte] = [120, 156, 0, 13, 0, 242, 255, 104, 101, 108, 108, 111,
+    44, 32, 119, 111, 114, 108, 100, 10, 3, 0, 33, 231, 4, 147]
+  r = ~new_reader(slice_reader(buff))
+  print Str.from_bytes(~io.read_all(r))
+  ~r.close!
+} outputs "hello, world\n"

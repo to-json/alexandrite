@@ -1,0 +1,593 @@
+# Go's flate_test.go, inflate_test.go, dict_decoder_test.go and
+# reader_test.go, with helpers for the other test files.
+#
+# Not translated: TestReaderReusesReaderBuffer (checks that Go wraps a
+# non-ByteReader in a reused bufio.Reader; the Reader here always owns its
+# input buffer) and BenchmarkWriterMemUsage (allocation counting).
+# Adapted: TestReaderEarlyEOF (alx reports the end with a later 0, not with
+# the data), TestWriterReset (field comparisons instead of
+# reflect.DeepEqual), TestMaxStackSize (no debug.SetMaxStack), and
+# TestVeryLongSparseChunk, Writer_Reset, Deterministic, DeflateFast_Reset
+# at Go's -short sizes or smaller (the full sizes take minutes on the JIT).
+import "bytes"
+import "encoding/hex"
+import "fmt"
+import "hash/crc32"
+import "io"
+import "strings"
+
+# ---- helpers ----
+
+def h(s: Str) -> [Byte] { hex.decode_string(s).unwrap }
+
+def b(s: Str) -> [Byte] { s.bytes.to_a }
+
+def s(bs: [Byte]) -> Str { Str.from_bytes(bs) }
+
+def compress(data: [Byte], level: Int) -> [Byte] {
+  buf = bytes.new_buffer([])
+  w = new_writer(buf, level).unwrap
+  w.write!(data).unwrap
+  w.close!.unwrap
+  buf.bytes
+}
+
+def inflate(data: [Byte]) -> ~[Byte] {
+  io.~read_all(new_reader(bytes.new_buffer(data)))
+}
+
+def unexpected_eof?(e: Error) -> Bool {
+  case e {
+    io.StreamError.UnexpectedEof => true
+    _ => false
+  }
+}
+
+# A deterministic byte generator (Go's tests use math/rand; only the
+# randomness matters).
+def rand_bytes(n: Int, seed: U64, mask: Int) -> [Byte] {
+  out: [Byte] = [0; n]
+  x = seed
+  i = 0
+  while i < n {
+    x = x *% 6364136223846793005 +% 1442695040888963407
+    out[i] = ((x >> 33).to_i & mask).as_u8
+    i += 1
+  }
+  out
+}
+
+# Reads into p until at least min bytes (Go's io.ReadAtLeast).
+def read_at_least[R](r: R, p: [Byte], min: Int) -> ~Int {
+  rr = r
+  n = 0
+  while n < min {
+    k = rr.~read!(p[n...p.size])
+    fail io.StreamError.UnexpectedEof if k == 0
+    n += k
+  }
+  n
+}
+
+# A buffer that fails when read empty before it is closed: a reader that
+# reads past what was flushed would block in Go's syncBuffer.
+struct SyncState {
+  buf: bytes.Buffer
+  closed: Bool
+}
+
+struct SyncBuffer {
+  st: [SyncState]
+
+  def read!(p: [Byte]) -> ~Int {
+    n = self.st[0].buf.read!(p)
+    if n == 0 && p.size > 0 && !st[0].closed {
+      fail "read past the flushed data"
+    }
+    n
+  }
+
+  def write!(p: [Byte]) -> Int { self.st[0].buf.write!(p) }
+
+  def close! {
+    self.st[0].closed = true
+    nil
+  }
+}
+
+def new_sync_buffer -> SyncBuffer {
+  SyncBuffer.new(st: [SyncState.new(buf: bytes.new_buffer([]), closed: false)])
+}
+
+# Writes to two writers (Go's io.MultiWriter).
+struct MultiWriter[A, B] {
+  a: A
+  b: B
+
+  def write!(p: [Byte]) -> ~Int {
+    self.a.~write!(p)
+    self.b.~write!(p)
+  }
+}
+
+# Fails exactly at the nth write (Go's failWriter).
+struct FailWriter {
+  st: [Int]
+
+  def write!(p: [Byte]) -> ~Int {
+    self.st[0] -= 1
+    fail "IO error" if st[0] == -1
+    p.size
+  }
+}
+
+def fail_writer(n: Int) -> FailWriter { FailWriter.new(st: [n]) }
+
+def io_error?(e: Error) -> Bool { e.message == "IO error" }
+
+# ---- flate_test.go ----
+
+test "Issue5915" {
+  bits = [4, 0, 0, 6, 4, 3, 2, 3, 3, 4, 4, 5, 0, 0, 0, 0, 5, 5, 6,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 11, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 7, 8, 6, 0, 11, 0, 8, 0, 6, 6, 10, 8]
+  hd = new_huffman_decoder()
+  assert !hd.init!(bits), "given sequence of bits is bad, and should not succeed"
+}
+
+test "Issue5962" {
+  bits = [4, 0, 0, 6, 4, 3, 2, 3, 3, 4, 4, 5, 0, 0, 0, 0,
+    5, 5, 6, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 11]
+  hd = new_huffman_decoder()
+  assert !hd.init!(bits), "given sequence of bits is bad, and should not succeed"
+}
+
+test "Issue6255" {
+  bits1 = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 11]
+  bits2 = [11, 13]
+  hd = new_huffman_decoder()
+  assert hd.init!(bits1), "given sequence of bits is good and should succeed"
+  assert !hd.init!(bits2), "given sequence of bits is bad and should not succeed"
+}
+
+test "InvalidEncoding" {
+  hd = new_huffman_decoder()
+  assert hd.init!([1]), "failed to initialize Huffman decoder"
+  e: [Byte] = []
+  f = new_inflater(bytes.new_buffer([0xff]), e)
+  assert f.huff_sym!(hd) < 0, "should have rejected invalid bit sequence"
+  assert !f.eb[0].err.none?
+}
+
+test "InvalidBits" {
+  oversubscribed = [1, 2, 3, 4, 4, 5]
+  incomplete = [1, 2, 4, 4]
+  hd = new_huffman_decoder()
+  assert !hd.init!(oversubscribed), "should reject oversubscribed bit-length set"
+  assert !hd.init!(incomplete), "should reject incomplete bit-length set"
+}
+
+test "Streams" {
+  # (description, hex of the DEFLATE stream, hex of the result or "fail")
+  cases = [
+    ("degenerate HCLenTree",
+      "05e0010000000000100000000000000000000000000000000000000000000000" +
+        "00000000000000000004",
+      "fail"),
+    ("complete HCLenTree, empty HLitTree, empty HDistTree",
+      "05e0010400000000000000000000000000000000000000000000000000000000" +
+        "00000000000000000010",
+      "fail"),
+    ("empty HCLenTree",
+      "05e0010000000000000000000000000000000000000000000000000000000000" +
+        "00000000000000000010",
+      "fail"),
+    ("complete HCLenTree, complete HLitTree, empty HDistTree, use missing HDist symbol",
+      "000100feff000de0010400000000100000000000000000000000000000000000" +
+        "0000000000000000000000000000002c",
+      "fail"),
+    ("complete HCLenTree, complete HLitTree, degenerate HDistTree, use missing HDist symbol",
+      "000100feff000de0010000000000000000000000000000000000000000000000" +
+        "00000000000000000610000000004070",
+      "fail"),
+    ("complete HCLenTree, empty HLitTree, empty HDistTree",
+      "05e0010400000000100400000000000000000000000000000000000000000000" +
+        "0000000000000000000000000008",
+      "fail"),
+    ("complete HCLenTree, empty HLitTree, degenerate HDistTree",
+      "05e0010400000000100400000000000000000000000000000000000000000000" +
+        "0000000000000000000800000008",
+      "fail"),
+    ("complete HCLenTree, degenerate HLitTree, degenerate HDistTree, use missing HLit symbol",
+      "05e0010400000000100000000000000000000000000000000000000000000000" +
+        "0000000000000000001c",
+      "fail"),
+    ("complete HCLenTree, complete HLitTree, too large HDistTree",
+      "edff870500000000200400000000000000000000000000000000000000000000" +
+        "000000000000000000080000000000000004",
+      "fail"),
+    ("complete HCLenTree, complete HLitTree, empty HDistTree, excessive repeater code",
+      "edfd870500000000200400000000000000000000000000000000000000000000" +
+        "000000000000000000e8b100",
+      "fail"),
+    ("complete HCLenTree, complete HLitTree, empty HDistTree of normal length 30",
+      "05fd01240000000000f8ffffffffffffffffffffffffffffffffffffffffffff" +
+        "ffffffffffffffffff07000000fe01",
+      ""),
+    ("complete HCLenTree, complete HLitTree, empty HDistTree of excessive length 31",
+      "05fe01240000000000f8ffffffffffffffffffffffffffffffffffffffffffff" +
+        "ffffffffffffffffff07000000fc03",
+      "fail"),
+    ("complete HCLenTree, over-subscribed HLitTree, empty HDistTree",
+      "05e001240000000000fcffffffffffffffffffffffffffffffffffffffffffff" +
+        "ffffffffffffffffff07f00f",
+      "fail"),
+    ("complete HCLenTree, under-subscribed HLitTree, empty HDistTree",
+      "05e001240000000000fcffffffffffffffffffffffffffffffffffffffffffff" +
+        "fffffffffcffffffff07f00f",
+      "fail"),
+    ("complete HCLenTree, complete HLitTree with single code, empty HDistTree",
+      "05e001240000000000f8ffffffffffffffffffffffffffffffffffffffffffff" +
+        "ffffffffffffffffff07f00f",
+      "01"),
+    ("complete HCLenTree, complete HLitTree with multiple codes, empty HDistTree",
+      "05e301240000000000f8ffffffffffffffffffffffffffffffffffffffffffff" +
+        "ffffffffffffffffff07807f",
+      "01"),
+    ("complete HCLenTree, complete HLitTree, degenerate HDistTree, use valid HDist symbol",
+      "000100feff000de0010400000000100000000000000000000000000000000000" +
+        "0000000000000000000000000000003c",
+      "00000000"),
+    ("complete HCLenTree, degenerate HLitTree, degenerate HDistTree",
+      "05e0010400000000100000000000000000000000000000000000000000000000" +
+        "0000000000000000000c",
+      ""),
+    ("complete HCLenTree, degenerate HLitTree, empty HDistTree",
+      "05e0010400000000100000000000000000000000000000000000000000000000" +
+        "00000000000000000004",
+      ""),
+    ("complete HCLenTree, complete HLitTree, empty HDistTree, spanning repeater code",
+      "edfd870500000000200400000000000000000000000000000000000000000000" +
+        "000000000000000000e8b000",
+      ""),
+    ("complete HCLenTree with length codes, complete HLitTree, empty HDistTree",
+      "ede0010400000000100000000000000000000000000000000000000000000000" +
+        "0000000000000000000400004000",
+      ""),
+    ("complete HCLenTree, complete HLitTree, degenerate HDistTree, use valid HLit symbol 284 with count 31",
+      "000100feff00ede0010400000000100000000000000000000000000000000000" +
+        "000000000000000000000000000000040000407f00",
+      "0000000000000000000000000000000000000000000000000000000000000000" +
+        "0000000000000000000000000000000000000000000000000000000000000000" +
+        "0000000000000000000000000000000000000000000000000000000000000000" +
+        "0000000000000000000000000000000000000000000000000000000000000000" +
+        "0000000000000000000000000000000000000000000000000000000000000000" +
+        "0000000000000000000000000000000000000000000000000000000000000000" +
+        "0000000000000000000000000000000000000000000000000000000000000000" +
+        "0000000000000000000000000000000000000000000000000000000000000000" +
+        "000000"),
+    ("complete HCLenTree, complete HLitTree, degenerate HDistTree, use valid HLit and HDist symbols",
+      "0cc2010d00000082b0ac4aff0eb07d27060000ffff",
+      "616263616263"),
+    ("fixed block, use reserved symbol 287", "33180700", "fail"),
+    ("raw block", "010100feff11", "11"),
+    ("issue 10426 - over-subscribed HCLenTree causes a hang", "344c4a4e494d4b070000ff2e2eff2e2e2e2e2eff", "fail"),
+    ("issue 11030 - empty HDistTree unexpectedly leads to error", "05c0070600000080400fff37a0ca", ""),
+    ("issue 11033 - empty HDistTree unexpectedly leads to error",
+      "050fb109c020cca5d017dcbca044881ee1034ec149c8980bbc413c2ab35be9dc" +
+        "b1473449922449922411202306ee97b0383a521b4ffdcf3217f9f7d3adb701",
+      "3130303634342068652e706870005d05355f7ed957ff084a90925d19e3ebc6d0" +
+        "c6d7"),
+  ]
+  for tc in cases {
+    r = inflate(h(tc[1]))
+    if tc[2] == "fail" {
+      assert r.err?, "#{tc[0]}: got nil error, want non-nil"
+    } else {
+      assert r.ok?, "#{tc[0]}: unexpected error"
+      if data = r.ok {
+        assert_eq hex.encode_to_string(data), tc[2]
+      }
+    }
+  }
+}
+
+test "TruncatedStreams" {
+  data = h("000c00f3ff68656c6c6f2c20776f726c64010000ffff")
+  i = 0
+  while i < data.size - 1 {
+    r = io.copy(io.Discard.new, new_reader(bytes.new_buffer(data[0...i])))
+    if e = r.err {
+      assert unexpected_eof?(e), "copy(#{i}) on truncated stream: got #{e.message}"
+    } else {
+      assert false, "copy(#{i}) on truncated stream: no error"
+    }
+    i += 1
+  }
+}
+
+# TestReaderEarlyEOF checks that Go's Read returns io.EOF together with the
+# last data; an alx reader reports the end with a later 0, so this checks
+# that the data is all there and is followed by exactly that.
+test "ReaderEarlyEOF" {
+  test_sizes = [1, 2, 3, 4, 5, 6, 7, 8, 100, 1000, 10000, 100000, 128, 1024, 16384, 131072,
+    WINDOW_SIZE * 1, WINDOW_SIZE * 2, WINDOW_SIZE * 3]
+  max_size = 0
+  for n in test_sizes {
+    max_size = n if max_size < n
+  }
+  read_buf: [Byte] = [0; 40]
+  data: [Byte] = [0; max_size]
+  i = 0
+  while i < data.size {
+    data[i] = i.as_u8
+    i += 1
+  }
+  for sz in test_sizes {
+    for flush in [true, false] {
+      buf = bytes.new_buffer([])
+      w = ~new_writer(buf, 5)
+      ~w.write!(data[0...sz])
+      ~w.flush! if flush
+      ~w.close!
+      r = new_reader(buf)
+      total = 0
+      loop {
+        n = ~r.read!(read_buf)
+        break if n == 0
+        assert_eq read_buf[0...n], data[total...total + n]
+        total += n
+      }
+      assert_eq total, sz
+      assert_eq ~r.read!(read_buf), 0
+    }
+  }
+}
+
+# ---- inflate_test.go ----
+
+test "Reset" {
+  ss = ["lorem ipsum izzle fo rizzle", "the quick brown fox jumped over"]
+  deflated = [bytes.new_buffer([]), bytes.new_buffer([])]
+  i = 0
+  while i < ss.size {
+    w = ~new_writer(deflated[i], 1)
+    ~w.write!(b(ss[i]))
+    ~w.close!
+    i += 1
+  }
+  inflated = [bytes.new_buffer([]), bytes.new_buffer([])]
+  f = new_reader(deflated[0])
+  ~io.copy(inflated[0], f)
+  f.reset!(deflated[1], [])
+  ~io.copy(inflated[1], f)
+  ~f.close!
+  i = 0
+  while i < ss.size {
+    assert_eq inflated[i].to_s, ss[i]
+    i += 1
+  }
+}
+
+test "ReaderTruncated" {
+  vectors = [
+    ("00", ""),
+    ("000c", ""),
+    ("000c00", ""),
+    ("000c00f3ff", ""),
+    ("000c00f3ff68656c6c6f", "68656c6c6f"),
+    ("000c00f3ff68656c6c6f2c20776f726c64", "68656c6c6f2c20776f726c64"),
+    ("02", ""),
+    ("f248cd", "4865"),
+    ("f248cd993061c28409", "48656c9090909090"),
+    ("f248cd993061c2840900", "48656c9090909090"),
+  ]
+  for v in vectors {
+    zr = new_reader(bytes.new_buffer(h(v[0])))
+    out = bytes.new_buffer([])
+    r = io.copy(out, zr)
+    if e = r.err {
+      assert unexpected_eof?(e), "#{v[0]}: error mismatch: got #{e.message}, want unexpected EOF"
+    } else {
+      assert false, "#{v[0]}: no error"
+    }
+    assert_eq hex.encode_to_string(out.bytes), v[1]
+  }
+}
+
+test "ResetDict" {
+  dict = b("the lorem fox")
+  ss = ["lorem ipsum izzle fo rizzle", "the quick brown fox jumped over"]
+  deflated = [bytes.new_buffer([]), bytes.new_buffer([])]
+  i = 0
+  while i < ss.size {
+    w = ~new_writer_dict(deflated[i], DEFAULT_COMPRESSION, dict)
+    ~w.write!(b(ss[i]))
+    ~w.close!
+    i += 1
+  }
+  inflated = [bytes.new_buffer([]), bytes.new_buffer([])]
+  f = new_reader(bytes.new_buffer([]))
+  i = 0
+  while i < ss.size {
+    f.reset!(deflated[i], dict)
+    ~io.copy(inflated[i], f)
+    i += 1
+  }
+  ~f.close!
+  i = 0
+  while i < ss.size {
+    assert_eq inflated[i].to_s, ss[i]
+    i += 1
+  }
+}
+
+# ---- dict_decoder_test.go ----
+
+test "DictDecoder" {
+  abc = "ABC\n"
+  fox = "The quick brown fox jumped over the lazy dog!\n"
+  poem = "The Road Not Taken\nRobert Frost\n" +
+    "\n" +
+    "Two roads diverged in a yellow wood,\n" +
+    "And sorry I could not travel both\n" +
+    "And be one traveler, long I stood\n" +
+    "And looked down one as far as I could\n" +
+    "To where it bent in the undergrowth;\n" +
+    "\n" +
+    "Then took the other, as just as fair,\n" +
+    "And having perhaps the better claim,\n" +
+    "Because it was grassy and wanted wear;\n" +
+    "Though as for that the passing there\n" +
+    "Had worn them really about the same,\n" +
+    "\n" +
+    "And both that morning equally lay\n" +
+    "In leaves no step had trodden black.\n" +
+    "Oh, I kept the first for another day!\n" +
+    "Yet knowing how way leads on to way,\n" +
+    "I doubted if I should ever come back.\n" +
+    "\n" +
+    "I shall be telling this with a sigh\n" +
+    "Somewhere ages and ages hence:\n" +
+    "Two roads diverged in a wood, and I-\n" +
+    "I took the one less traveled by,\n" +
+    "And that has made all the difference.\n"
+  # (backward distance or 0 for an insertion, length)
+  poem_refs = [
+    (0, 38), (33, 3), (0, 48), (79, 3), (0, 11), (34, 5), (0, 6), (23, 7),
+    (0, 8), (50, 3), (0, 2), (69, 3), (34, 5), (0, 4), (97, 3), (0, 4),
+    (43, 5), (0, 6), (7, 4), (88, 7), (0, 12), (80, 3), (0, 2), (141, 4),
+    (0, 1), (196, 3), (0, 3), (157, 3), (0, 6), (181, 3), (0, 2), (23, 3),
+    (77, 3), (28, 5), (128, 3), (110, 4), (70, 3), (0, 4), (85, 6), (0, 2),
+    (182, 6), (0, 4), (133, 3), (0, 7), (47, 5), (0, 20), (112, 5), (0, 1),
+    (58, 3), (0, 8), (59, 3), (0, 4), (173, 3), (0, 5), (114, 3), (0, 4),
+    (92, 5), (0, 2), (71, 3), (0, 2), (76, 5), (0, 1), (46, 3), (96, 4),
+    (130, 4), (0, 3), (360, 3), (0, 3), (178, 5), (0, 7), (75, 3), (0, 3),
+    (45, 6), (0, 6), (299, 6), (180, 3), (70, 6), (0, 1), (48, 3), (66, 4),
+    (0, 3), (47, 5), (0, 9), (325, 3), (0, 1), (359, 3), (318, 3), (0, 2),
+    (199, 3), (0, 1), (344, 3), (0, 3), (248, 3), (0, 10), (310, 3), (0, 3),
+    (93, 6), (0, 3), (252, 3), (157, 4), (0, 2), (273, 5), (0, 14), (99, 4),
+    (0, 1), (464, 4), (0, 2), (92, 4), (495, 3), (0, 1), (322, 4), (16, 4),
+    (0, 3), (402, 3), (0, 2), (237, 4), (0, 2), (432, 4), (0, 1), (483, 5),
+    (0, 2), (294, 4), (0, 2), (306, 3), (113, 5), (0, 1), (26, 4), (164, 3),
+    (488, 4), (0, 1), (542, 3), (248, 6), (0, 5), (205, 3), (0, 8), (48, 3),
+    (449, 6), (0, 2), (192, 3), (328, 4), (9, 5), (433, 3), (0, 3), (622, 25),
+    (615, 5), (46, 5), (0, 2), (104, 3), (475, 10), (549, 3), (0, 4), (597, 8),
+    (314, 3), (0, 1), (473, 6), (317, 5), (0, 1), (400, 3), (0, 3), (109, 3),
+    (151, 3), (48, 4), (0, 4), (125, 3), (108, 3), (0, 2),
+  ]
+  got = bytes.new_buffer([])
+  want = bytes.new_buffer([])
+  e: [Byte] = []
+  dd = new_dict_decoder(1 << 11, e)
+  write_copy = ->(dist: Int, length0: Int) {
+    length = length0
+    while length > 0 {
+      cnt = dd.try_write_copy!(dist, length)
+      cnt = dd.write_copy!(dist, length) if cnt == 0
+      length -= cnt
+      got.write!(dd.read_flush!) if dd.avail_write == 0
+    }
+  }
+  write_string = ->(str0: Str) {
+    str = b(str0)
+    while str.size > 0 {
+      cnt = copy(dd.write_slice, str)
+      str = str[cnt...str.size]
+      dd.write_mark!(cnt)
+      got.write!(dd.read_flush!) if dd.avail_write == 0
+    }
+  }
+  write_string(".")
+  want.write_byte!(46)
+  str = poem
+  for rf in poem_refs {
+    if rf[0] == 0 {
+      write_string(str[0...rf[1]])
+    } else {
+      write_copy(rf[0], rf[1])
+    }
+    str = str[rf[1]...str.size]
+  }
+  want.write_string!(poem)
+  write_copy(dd.hist_size, 33)
+  want.write!(want.bytes[0...33])
+  write_string(abc)
+  write_copy(abc.size, 59 * abc.size)
+  want.write_string!(abc * 60)
+  write_string(fox)
+  write_copy(fox.size, 9 * fox.size)
+  want.write_string!(fox * 10)
+  write_string(".")
+  write_copy(1, 9)
+  want.write_string!("." * 10)
+  write_string(strings.to_upper(poem))
+  write_copy(poem.size, 7 * poem.size)
+  want.write_string!(strings.to_upper(poem) * 8)
+  write_copy(dd.hist_size, 10)
+  wb = want.bytes
+  want.write!(wb[wb.size - dd.hist_size...wb.size - dd.hist_size + 10])
+  got.write!(dd.read_flush!)
+  assert got.to_s == want.to_s, "final string mismatch"
+}
+
+# ---- reader_test.go ----
+
+test "NlitOutOfRange" {
+  # Doesn't panic.
+  _ = io.copy(io.Discard.new, new_reader(bytes.new_buffer(h(
+    "fcfe36e75e1cefb3555877b656b543f46ff2d2e63d99a0858c48ebf8da83042a75c4f80f1211b9b44b09a0be8b914c"))))
+}
+
+# Reads a slice without copying it (bytes.new_buffer copies).
+struct SliceReader {
+  data: [Byte]
+  st: [Int]
+
+  def read!(p: [Byte]) -> Int {
+    n = copy(p, data[st[0]...data.size])
+    self.st[0] += n
+    n
+  }
+}
+
+def slice_reader(data: [Byte]) -> SliceReader { SliceReader.new(data: data, st: [0]) }
+
+# The fox text of the generated vectors: every 37th byte changed.
+def fox_text -> [Byte] {
+  fox = b("the quick brown fox jumps over the lazy dog " * 2000)
+  i = 0
+  while i < fox.size {
+    fox[i] = (65 + i % 26).as_u8
+    i += 37
+  }
+  fox
+}
+
+# Compresses data as the generated vectors do (in chunks if chunk > 0,
+# flushing after each if flush; with a dictionary if given), checks the
+# round trip, and returns the hex of the output, or its size and CRC-32
+# when longer than 96 bytes.
+def vec_deflate(data: [Byte], level: Int, chunk: Int, flush: Bool, dict: [Byte]?) -> Str {
+  buf = bytes.new_buffer([])
+  d: [Byte] = dict || []
+  w = new_writer_dict(buf, level, d).unwrap
+  if chunk <= 0 {
+    w.write!(data).unwrap
+  } else {
+    i = 0
+    while i < data.size {
+      j = i + chunk
+      j = data.size if j > data.size
+      w.write!(data[i...j]).unwrap
+      w.flush!.unwrap if flush
+      i += chunk
+    }
+  }
+  w.close!.unwrap
+  out = buf.bytes
+  back = io.read_all(new_reader_dict(bytes.new_buffer(out), d)).unwrap
+  assert back == data, "round trip at level #{level}"
+  return hex.encode_to_string(out) if out.size <= 96
+  "#{out.size} #{fmt.sprintf("%08x", crc32.checksum_ieee(out))}"
+}

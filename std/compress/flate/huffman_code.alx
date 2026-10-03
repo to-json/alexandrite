@@ -1,0 +1,279 @@
+#![overflow(wrap)]
+# Huffman code generation (Go's huffman_code.go).
+#
+# An hcode is a U32: the bit length in the low byte, the (bit-reversed) code
+# above it. Literal nodes are packed as freq << 16 | literal, so sorting the
+# packed values sorts by (freq, literal) as Go's comparison does.
+
+import mbits "math/bits"
+import "slices"
+
+MAX_BITS_LIMIT = 16
+# The number of valid literals.
+LITERAL_COUNT = 286
+MAX_I32 = 2147483647
+MAX_NODE: U32 = 0xffffffff
+
+def hcode_len(h: U32) -> Int { (h & 0xff).to_i }
+
+def new_hcode(code: Int, length: Int) -> U32 {
+  length.as_u32 | (code.as_u32 << 8)
+}
+
+# The b-bit reversal of x.
+def reverse_bits(x: Int, b: Int) -> Int {
+  mbits.reverse16((x << ((16 - b) & 15)).as_u16).to_i
+}
+
+def new_huffman_encoder(size: Int) -> HuffmanEncoder {
+  codes: [U32] = [0; size]
+  bc: [Int] = [0; 17]
+  cache: [U32] = [0; LITERAL_COUNT + 1]
+  HuffmanEncoder.new(codes: codes, bit_count: bc, freqcache: cache)
+}
+
+# The codes of the fixed literal/length table (RFC 1951 3.2.6).
+def fixed_literal_codes -> [U32] {
+  codes: [U32] = [0; LITERAL_COUNT]
+  ch = 0
+  while ch < LITERAL_COUNT {
+    b = 0
+    size = 0
+    if ch < 144 {
+      # size 8, 000110000  .. 10111111
+      b = ch + 48
+      size = 8
+    } else if ch < 256 {
+      # size 9, 110010000 .. 111111111
+      b = ch + 400 - 144
+      size = 9
+    } else if ch < 280 {
+      # size 7, 0000000 .. 0010111
+      b = ch - 256
+      size = 7
+    } else {
+      # size 8, 11000000 .. 11000111
+      b = ch + 192 - 280
+      size = 8
+    }
+    codes[ch] = new_hcode(reverse_bits(b, size), size)
+    ch += 1
+  }
+  codes
+}
+
+# The codes of the fixed offset table.
+def fixed_offset_codes -> [U32] {
+  codes: [U32] = [0; 30]
+  ch = 0
+  while ch < 30 {
+    codes[ch] = new_hcode(reverse_bits(ch, 5), 5)
+    ch += 1
+  }
+  codes
+}
+
+# The number of bits needed to encode freq with codes.
+def bit_length(codes: [U32], freq: [U16]) -> Int {
+  total = 0
+  i = 0
+  while i < freq.size {
+    f = freq[i]
+    if f != 0 {
+      total += f.to_i * hcode_len(codes[i])
+    }
+    i += 1
+  }
+  total
+}
+
+# The number of bits needed to encode freq with codes, or MAX_I32 if a
+# symbol in freq has no code.
+def can_encode_len(codes: [U32], freq: [U16]) -> Int {
+  total = 0
+  i = 0
+  while i < freq.size {
+    f = freq[i]
+    if f != 0 {
+      code = codes[i]
+      return MAX_I32 if code == 0
+      total += f.to_i * hcode_len(code)
+    }
+    i += 1
+  }
+  total
+}
+
+# Counts the bytes of b into h[0...256].
+def histogram(b: [Byte], h: [U16]) {
+  for t in b {
+    h[t.to_i] += 1
+  }
+  nil
+}
+
+# A Huffman code generator for a frequency table (RFC 1951 3.2.2).
+struct HuffmanEncoder {
+  codes: [U32]
+  bit_count: [Int]
+  # A reusable buffer for the longest frequency table.
+  freqcache: [U32]
+
+  # The number of bits needed to encode b; unset codes count 1 bit.
+  def bit_length_raw(b: [Byte]) -> Int {
+    total = 0
+    for f in b {
+      l = hcode_len(codes[f.to_i])
+      total += l > 1 ? l : 1
+    }
+    total
+  }
+
+  # Go's bitCounts: list[i] the number of literals to encode with i bits.
+  # list[0...n] holds the nonzero nodes in increasing order, n >= 3.
+  def bit_counts!(list: [U32], n: Int, max_bits0: Int) -> [Int] {
+    list[n] = MAX_NODE
+    max_bits = max_bits0
+    # The tree can't be deeper than n - 1.
+    max_bits = n - 1 if max_bits > n - 1
+    # Per level: the frequency of the last node, of the next character, of
+    # the next pair (from the level below), and the chains still needed.
+    last_freq: [Int] = [0; 17]
+    next_char: [Int] = [0; 17]
+    next_pair: [Int] = [0; 17]
+    needed: [Int] = [0; 17]
+    # leaf[i * 16 + j]: the literals left of the level j ancestor of the
+    # rightmost node at level i.
+    leaf: [Int] = [0; 17 * 16]
+    level = 1
+    while level <= max_bits {
+      last_freq[level] = (list[1] >> 16).to_i
+      next_char[level] = (list[2] >> 16).to_i
+      next_pair[level] = (list[0] >> 16).to_i + (list[1] >> 16).to_i
+      leaf[level * 16 + level] = 2
+      next_pair[level] = MAX_I32 if level == 1
+      level += 1
+    }
+    # 2n - 2 items are needed at the top level; 2 are already there.
+    needed[max_bits] = 2 * n - 4
+    level = max_bits
+    while level < 16 {
+      if next_pair[level] == MAX_I32 && next_char[level] == MAX_I32 {
+        # Out of leaves and pairs: this level is done for good.
+        needed[level] = 0
+        next_pair[level + 1] = MAX_I32
+        level += 1
+        next
+      }
+      prev_freq = last_freq[level]
+      if next_char[level] < next_pair[level] {
+        # The next item on this row is a leaf node.
+        nn = leaf[level * 16 + level] + 1
+        last_freq[level] = next_char[level]
+        leaf[level * 16 + level] = nn
+        e = list[nn]
+        if (e & 0xffff) < 0xffff {
+          next_char[level] = (e >> 16).to_i
+        } else {
+          next_char[level] = MAX_I32
+        }
+      } else {
+        # The next item is a pair from the previous row.
+        last_freq[level] = next_pair[level]
+        save = leaf[level * 16 + level]
+        copy(leaf[level * 16...level * 16 + 16], leaf[(level - 1) * 16...level * 16])
+        leaf[level * 16 + level] = save
+        needed[level - 1] = 2
+      }
+      needed[level] -= 1
+      if needed[level] == 0 {
+        # Done with this level: continue one up.
+        break if level == max_bits
+        next_pair[level + 1] = prev_freq + last_freq[level]
+        level += 1
+      } else {
+        # If we stole from below, move down temporarily to replenish it.
+        while needed[level - 1] > 0 {
+          level -= 1
+        }
+      }
+    }
+    if leaf[max_bits * 16 + max_bits] != n {
+      panic("leafCounts[maxBits][maxBits] != n")
+    }
+    bc = self.bit_count
+    b = 1
+    level = max_bits
+    while level > 0 {
+      # The number of literals needing at least b bits.
+      bc[b] = leaf[max_bits * 16 + level] - leaf[max_bits * 16 + level - 1]
+      b += 1
+      level -= 1
+    }
+    bc[0...max_bits + 1]
+  }
+
+  # Assigns codes to the literals by bit count (RFC 1951 3.2.2).
+  def assign_encoding_and_size!(bit_count: [Int], list: [U32], count: Int) {
+    code = 0
+    end = count
+    lits: [Int] = []
+    n = 0
+    while n < bit_count.size {
+      b = bit_count[n]
+      code = (code << 1) & 0xffff
+      if n == 0 || b == 0 {
+        n += 1
+        next
+      }
+      # list[end - b...end] get b bits and the codes code, code + 1, ...
+      # in literal order.
+      lits = []
+      i = end - b
+      while i < end {
+        lits << (list[i] & 0xffff).to_i
+        i += 1
+      }
+      slices.sort(lits)
+      for lit in lits {
+        self.codes[lit] = new_hcode(reverse_bits(code, n), n)
+        code = (code + 1) & 0xffff
+      }
+      end -= b
+      n += 1
+    }
+    nil
+  }
+
+  # Makes these codes the Huffman code for freq, with at most max_bits bits
+  # per literal.
+  def generate!(freq: [U16], max_bits: Int) {
+    list = freqcache
+    count = 0
+    i = 0
+    while i < freq.size {
+      f = freq[i]
+      if f != 0 {
+        list[count] = (f.as_u32 << 16) | i.as_u32
+        count += 1
+      } else {
+        self.codes[i] = 0
+      }
+      i += 1
+    }
+    list[count] = 0
+    if count <= 2 {
+      # Two or fewer literals: everything has bit length 1, in literal order.
+      j = 0
+      while j < count {
+        self.codes[(list[j] & 0xffff).to_i] = new_hcode(j, 1)
+        j += 1
+      }
+      return
+    }
+    slices.sort(list[0...count])
+    bc = bit_counts!(list, count, max_bits)
+    assign_encoding_and_size!(bc, list, count)
+    nil
+  }
+}

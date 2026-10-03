@@ -1,0 +1,778 @@
+#![overflow(wrap)]
+# The compressor (Go's deflate.go): levels 0 (stored), -2 (Huffman only),
+# 1-6 (the fast encoders) and 7-9 (lazy matching on hash chains).
+
+pub NO_COMPRESSION = 0
+pub BEST_SPEED = 1
+pub BEST_COMPRESSION = 9
+pub DEFAULT_COMPRESSION = -1
+# Only Huffman entropy coding, no match searching: for data already
+# compressed by an LZ-style algorithm without entropy coding (Snappy, LZ4).
+# The output is still RFC 1951 compliant.
+pub HUFFMAN_ONLY = -2
+
+LOG_WINDOW_SIZE = 15
+WINDOW_SIZE = 1 << LOG_WINDOW_SIZE
+WINDOW_MASK = WINDOW_SIZE - 1
+# The smallest match the compressor looks for.
+MIN_MATCH_LENGTH = 4
+# The longest match.
+MAX_MATCH_LENGTH = 258
+# The shortest offset that makes any sense.
+MIN_OFFSET_SIZE = 1
+# The most tokens encoded at a time (levels 7-9).
+MAX_FLATE_BLOCK_TOKENS = 1 << 15
+MAX_STORE_BLOCK_SIZE = 65535
+HASH_BITS = 17
+HASH_SIZE = 1 << HASH_BITS
+HASH_MASK: U32 = (1 << HASH_BITS) - 1
+MAX_HASH_OFFSET = 1 << 28
+
+MODE_STORE = 0
+MODE_HUFF = 1
+MODE_FAST = 2
+MODE_LAZY = 3
+
+# The hash of the first 4 bytes of b[i...].
+def hash4_at(b: [Byte], i: Int) -> Int {
+  hash4u(load32(b, i), HASH_BITS)
+}
+
+def hash4u(u: U32, h: Int) -> Int {
+  ((u * PRIME4) >> (32 - h)).to_i
+}
+
+# dst[i] = the hash of b[i...i + 4] for every i <= b.size - 4.
+def bulk_hash4(b: [Byte], dst: [U32]) {
+  return if b.size < 4
+  hb = load32(b, 0)
+  dst[0] = (hb * PRIME4) >> (32 - HASH_BITS)
+  end = b.size - 4 + 1
+  i = 1
+  while i < end {
+    hb = (hb >> 8) | (b[i + 3].as_u32 << 24)
+    dst[i] = (hb * PRIME4) >> (32 - HASH_BITS)
+    i += 1
+  }
+  nil
+}
+
+def new_compressor[W](w: W, level0: Int) -> ~Compressor[W]<FlateError> {
+  level = level0
+  e: [I32] = []
+  hm: [U32] = []
+  win: [Byte] = []
+  d = Compressor[W].new(
+    level: 0,
+    good: 0,
+    lazy: 0,
+    nice: 0,
+    chain: 0,
+    has_h: false,
+    h: new_huffman_encoder(0),
+    w: new_bit_writer(w),
+    mode: MODE_STORE,
+    window: win,
+    window_end: 0,
+    block_start: 0,
+    err: none,
+    closed: false,
+    tokens: new_tokens(),
+    has_fast: false,
+    fast: FastEnc.new(level: 0, hist: win, hist_len: 0, cur: 0, table: e, btable: e),
+    length: 0,
+    offset: 0,
+    max_insert_index: 0,
+    chain_head: 0,
+    hash_offset: 0,
+    literal_counter: 0,
+    index: 0,
+    hash_match: hm,
+    hash_head: e,
+    hash_prev: e,
+    sync: false,
+    byte_available: false
+  )
+  if level == NO_COMPRESSION {
+    d.window = zbytes(MAX_STORE_BLOCK_SIZE)
+    d.mode = MODE_STORE
+  } else if level == HUFFMAN_ONLY {
+    d.w.log_new_table_penalty = 10
+    d.window = zbytes(32 << 10)
+    d.mode = MODE_HUFF
+  } else if level == DEFAULT_COMPRESSION || (1 <= level && level <= 6) {
+    level = 6 if level == DEFAULT_COMPRESSION
+    d.w.log_new_table_penalty = 7
+    d.fast = new_fast_enc(level)
+    d.has_fast = true
+    d.window = zbytes(MAX_STORE_BLOCK_SIZE)
+    d.mode = MODE_FAST
+  } else if 7 <= level && level <= 9 {
+    d.w.log_new_table_penalty = 8
+    # Go's levels[7...9]: good, lazy, nice, chain.
+    if level == 7 {
+      d.good = 8
+      d.lazy = 12
+      d.nice = 16
+      d.chain = 24
+    } else if level == 8 {
+      d.good = 16
+      d.lazy = 30
+      d.nice = 40
+      d.chain = 64
+    } else {
+      d.good = 32
+      d.lazy = 258
+      d.nice = 258
+      d.chain = 1024
+    }
+    d.hash_match = zu32(MAX_MATCH_LENGTH + MIN_MATCH_LENGTH)
+    d.hash_head = zi32(HASH_SIZE)
+    d.hash_prev = zi32(WINDOW_SIZE)
+    d.window = zbytes(2 * WINDOW_SIZE)
+    d.byte_available = false
+    d.index = 0
+    d.hash_offset = 1
+    d.length = MIN_MATCH_LENGTH - 1
+    d.offset = 0
+    d.chain_head = -1
+    d.mode = MODE_LAZY
+  } else {
+    fail FlateError.InvalidLevel(level: level)
+  }
+  d.level = level
+  d
+}
+
+# The state of a Writer (Go's compressor, with its advancedState inline).
+struct Compressor[W] {
+  # The level, and levels 7-9's parameters: a "good enough" match length;
+  # no lazy search above `lazy`; stop looking above `nice`; the most hash
+  # chain entries to search.
+  level: Int
+  good: Int
+  lazy: Int
+  nice: Int
+  chain: Int
+  # The literal coder used to estimate costs (levels 7-9), once made.
+  has_h: Bool
+  h: HuffmanEncoder
+  w: BitWriter[W]
+  mode: Int
+  # The current window, filled up to window_end; the current tokens start
+  # at block_start.
+  window: [Byte]
+  window_end: Int
+  block_start: Int
+  # A stateful error.
+  err: Error?
+  closed: Bool
+  tokens: Tokens
+  has_fast: Bool
+  fast: FastEnc
+  # Levels 7-9 (Go's advancedState).
+  length: Int
+  offset: Int
+  max_insert_index: Int
+  chain_head: Int
+  hash_offset: Int
+  # Consecutive literals; wraps after 64K.
+  literal_counter: U16
+  # Unprocessed input is window[index...window_end].
+  index: Int
+  hash_match: [U32]
+  # hash_head[h]: the latest position (+ hash_offset) with hash h;
+  # hash_prev[p & WINDOW_MASK]: the one before p with the same hash.
+  hash_head: [I32]
+  hash_prev: [I32]
+  # A flush was requested.
+  sync: Bool
+  # window[index - 1] still needs processing.
+  byte_available: Bool
+
+  # Adds b to the window (levels 7-9), shifting it when needed.
+  def fill_deflate!(b: [Byte]) -> Int {
+    if index >= 2 * WINDOW_SIZE - (MIN_MATCH_LENGTH + MAX_MATCH_LENGTH) {
+      # Shift the window by WINDOW_SIZE.
+      copy(window[0...WINDOW_SIZE], window[WINDOW_SIZE...2 * WINDOW_SIZE])
+      self.index -= WINDOW_SIZE
+      self.window_end -= WINDOW_SIZE
+      if block_start >= WINDOW_SIZE {
+        self.block_start -= WINDOW_SIZE
+      } else {
+        self.block_start = MAX_I32
+      }
+      self.hash_offset += WINDOW_SIZE
+      if hash_offset > MAX_HASH_OFFSET {
+        delta = hash_offset - 1
+        self.hash_offset -= delta
+        self.chain_head -= delta
+        hp = hash_prev
+        i = 0
+        while i < hp.size {
+          v = hp[i].to_i - delta
+          hp[i] = (v > 0 ? v : 0).as_i32
+          i += 1
+        }
+        hh = hash_head
+        i = 0
+        while i < hh.size {
+          v = hh[i].to_i - delta
+          hh[i] = (v > 0 ? v : 0).as_i32
+          i += 1
+        }
+      }
+    }
+    n = copy(window[window_end...window.size], b)
+    self.window_end += n
+    n
+  }
+
+  # Writes the tokens as a block starting at block_start and ending at
+  # index in the window; false on a write error (in err).
+  def write_block!(idx: Int, eof: Bool) -> Bool {
+    if idx > 0 || eof {
+      win: [Byte]? = none
+      win = window[block_start...idx] if block_start <= idx
+      self.block_start = idx
+      self.w.write_block_dynamic!(tokens, eof, win, sync)
+      self.err = w.err
+      return err.none?
+    }
+    true
+  }
+
+  # Fills the window with a preset dictionary and indexes it (after a
+  # start or reset).
+  def fill_window!(b0: [Byte]) {
+    # Nothing to do in store-only or Huffman-only mode.
+    return if level <= 0
+    b = b0
+    if has_fast {
+      # Encode the last data, discarding the result.
+      b = b[b.size - MAX_MATCH_OFFSET...b.size] if b.size > MAX_MATCH_OFFSET
+      self.tokens.n = self.fast.encode!(tokens, b)
+      self.tokens.reset!
+      return
+    }
+    # Too much: cut it.
+    b = b[b.size - WINDOW_SIZE...b.size] if b.size > WINDOW_SIZE
+    n = copy(window[window_end...window.size], b)
+    # 256 hashes at a time.
+    loops = (n + 256 - MIN_MATCH_LENGTH) / 256
+    j = 0
+    while j < loops {
+      startindex = j * 256
+      end = startindex + 256 + MIN_MATCH_LENGTH - 1
+      end = n if end > n
+      tocheck = window[startindex...end]
+      dst_size = tocheck.size - MIN_MATCH_LENGTH + 1
+      if dst_size > 0 {
+        dst = hash_match[0...dst_size]
+        bulk_hash4(tocheck, dst)
+        i = 0
+        while i < dst_size {
+          di = i + startindex
+          new_h = (dst[i] & HASH_MASK).to_i
+          # The chain points to the previous position with the same hash.
+          self.hash_prev[di & WINDOW_MASK] = hash_head[new_h]
+          self.hash_head[new_h] = (di + hash_offset).as_i32
+          i += 1
+        }
+      }
+      j += 1
+    }
+    self.window_end += n
+    self.index = n
+    # The dictionary is not part of the first block (Go 1.27 leaves
+    # block_start at 0, so a stored first block includes the dictionary
+    # and the output is corrupt; see the header).
+    self.block_start = n
+    nil
+  }
+
+  # The longest match at pos along the hash chain from prev_head, looking
+  # at no more than `chain` entries: (length, offset, found).
+  def find_match(pos: Int, prev_head: Int, lookahead: Int) -> (Int, Int, Bool) {
+    min_match_look = lookahead < MAX_MATCH_LENGTH ? lookahead : MAX_MATCH_LENGTH
+    win = window
+    win_len = pos + min_match_look
+    # Stop at a match at least `nice` long.
+    nc = nice
+    nc = win_len - pos if nc > win_len - pos
+    tries = chain
+    best_len = MIN_MATCH_LENGTH - 1
+    w_end = win[pos + best_len]
+    min_index = pos - WINDOW_SIZE
+    min_index = 0 if min_index < 0
+    best_off = 0
+    ok = false
+    # The minimum gain to accept a match.
+    c_gain = 4
+    i = prev_head
+    hp = hash_prev
+    while tries > 0 {
+      if w_end == win[i + best_len] {
+        n = match_len(win, pos, i, win_len)
+        if n > best_len {
+          accept = true
+          if chain >= 100 {
+            # The gain over emitting literals; the base cost is 3.
+            new_gain = h.bit_length_raw(win[pos...pos + n]) - OFFSET_EXTRA_BITS[offset_code((pos - i).as_u32).to_i].to_i - 3 - LENGTH_EXTRA_BITS[LENGTH_CODES[(n - 3) & 255].to_i].to_i
+            if new_gain <= c_gain {
+              accept = false
+            } else {
+              c_gain = new_gain
+            }
+          }
+          if accept {
+            best_len = n
+            best_off = pos - i
+            ok = true
+            # Good enough: don't look for a better one.
+            break if n >= nc
+            w_end = win[pos + n]
+          }
+        }
+      }
+      # hash_prev[i & WINDOW_MASK] is already overwritten: stop.
+      break if i <= min_index
+      i = hp[i & WINDOW_MASK].to_i - hash_offset
+      break if i < min_index
+      tries -= 1
+    }
+    (best_len, best_off, ok)
+  }
+
+  # Writes buf as a stored block; false on a write error.
+  def write_stored_block!(buf: [Byte]) -> Bool {
+    self.w.write_stored_header!(buf.size, false)
+    if e = w.err {
+      self.err = e
+      return false
+    }
+    self.w.write_bytes!(buf)
+    self.err = w.err
+    err.none?
+  }
+
+  # Inserts the hash of window[index...] into the chains.
+  def insert_index! {
+    hh = hash4_at(window, index)
+    ch = hash_head[hh].to_i
+    self.chain_head = ch
+    self.hash_prev[index & WINDOW_MASK] = ch.as_i32
+    self.hash_head[hh] = (index + hash_offset).as_i32
+    nil
+  }
+
+  # Is there a better match at the end of the previous one? If so, emit
+  # the skipped literals and adjust the match: (length, offset).
+  def try_better_match_at_end!(prev_length0: Int, prev_offset0: Int, lookahead: Int) -> (Int, Int) {
+    # Checking starts CHECK_OFF into the match: up to two more literals,
+    # which a better match may pay for. A better match extends backwards.
+    check_off = 2
+    prev_length = prev_length0
+    prev_offset = prev_offset0
+    return (prev_length, prev_offset) if prev_length >= MAX_MATCH_LENGTH - check_off
+    prev_index = index - 1
+    return (prev_length, prev_offset) if prev_index + prev_length >= max_insert_index
+    la = lookahead < MAX_MATCH_LENGTH + check_off ? lookahead : MAX_MATCH_LENGTH + check_off
+    end = la + prev_index
+    min_index = index - WINDOW_SIZE
+    min_index = 0 if min_index < 0
+    hh = hash4_at(window, prev_index + prev_length)
+    ch2 = hash_head[hh].to_i - hash_offset - prev_length
+    if prev_index - ch2 == prev_offset || ch2 <= min_index + check_off {
+      return (prev_length, prev_offset)
+    }
+    # matchLen(window[prev_index + 2...end], window[ch2 + 2...]).
+    ml = match_len(window, prev_index + check_off, ch2 + check_off, end)
+    return (prev_length, prev_offset) if ml <= prev_length
+    prev_length = ml
+    prev_offset = prev_index - ch2
+    i = check_off - 1
+    while i >= 0 {
+      if prev_length >= MAX_MATCH_LENGTH || window[prev_index + i] != window[ch2 + i] {
+        j = 0
+        while j < i + 1 {
+          self.tokens.add_literal!(window[prev_index + j])
+          if tokens.n == MAX_FLATE_BLOCK_TOKENS {
+            return (prev_length, prev_offset) if !write_block!(index, false)
+            self.tokens.reset!
+          }
+          self.index += 1
+          insert_index! if index < max_insert_index
+          j += 1
+        }
+        break
+      }
+      prev_length += 1
+      i -= 1
+    }
+    (prev_length, prev_offset)
+  }
+
+  # Emits extra literals during long runs of incompressible data, skipping
+  # futile match searches; false on a write error.
+  def skip_literals! -> Bool {
+    n = literal_counter.to_i - chain
+    return true if n <= 0
+    n = 1 + (n >> 6)
+    k = 0
+    while k < n {
+      break if index >= window_end - 1
+      self.tokens.add_literal!(window[index - 1])
+      if tokens.n == MAX_FLATE_BLOCK_TOKENS {
+        return false if !write_block!(index, false)
+        self.tokens.reset!
+      }
+      insert_index! if index < max_insert_index
+      self.index += 1
+      k += 1
+    }
+    self.tokens.add_literal!(window[index - 1])
+    self.byte_available = false
+    if tokens.n == MAX_FLATE_BLOCK_TOKENS {
+      return false if !write_block!(index, false)
+      self.tokens.reset!
+    }
+    true
+  }
+
+  # Encodes the window with lazy matching (levels 7-9): a match is held
+  # back to see whether the next position gives a better one.
+  def deflate_lazy! {
+    return if window_end - index < MIN_MATCH_LENGTH + MAX_MATCH_LENGTH && !sync
+    if window_end != index && chain > 100 {
+      # The literal coder estimates the cost of a literal.
+      if !has_h {
+        self.h = new_huffman_encoder(MAX_FLATE_BLOCK_TOKENS)
+        self.has_h = true
+      }
+      tmp: [U16] = [0; 256]
+      to_index = window_end - index
+      to_index = MAX_FLATE_BLOCK_TOKENS if to_index > MAX_FLATE_BLOCK_TOKENS
+      i = index
+      while i < index + to_index {
+        tmp[window[i].to_i] += 1
+        i += 1
+      }
+      self.h.generate!(tmp, 15)
+    }
+    self.max_insert_index = window_end - (MIN_MATCH_LENGTH - 1)
+    loop {
+      lookahead = window_end - index
+      if lookahead < MIN_MATCH_LENGTH + MAX_MATCH_LENGTH {
+        return if !sync
+        if lookahead == 0 {
+          # Flush the current output block, if any.
+          if byte_available {
+            # One pending token.
+            self.tokens.add_literal!(window[index - 1])
+            self.byte_available = false
+          }
+          if tokens.n > 0 {
+            return if !write_block!(index, false)
+            self.tokens.reset!
+          }
+          return
+        }
+      }
+      insert_index! if index < max_insert_index
+      prev_length = length
+      prev_offset = offset
+      self.length = MIN_MATCH_LENGTH - 1
+      self.offset = 0
+      min_index = index - WINDOW_SIZE
+      min_index = 0 if min_index < 0
+      if chain_head - hash_offset >= min_index && lookahead > prev_length && prev_length < lazy {
+        new_length, new_offset, ok = find_match(index, chain_head - hash_offset, lookahead)
+        if ok {
+          self.length = new_length
+          self.offset = new_offset
+        }
+      }
+      if prev_length >= MIN_MATCH_LENGTH && length <= prev_length {
+        prev_length, prev_offset = try_better_match_at_end!(prev_length, prev_offset, lookahead)
+        return if !err.none?
+        # The previous match is better: output it.
+        self.tokens.add_match!((prev_length - 3).as_u32, (prev_offset - MIN_OFFSET_SIZE).as_u32)
+        # Insert the strings up to the end of the match (index and index - 1
+        # are already in). Without enough lookahead the last two aren't.
+        new_index = index + prev_length - 1
+        end = new_index < max_insert_index ? new_index : max_insert_index
+        end += MIN_MATCH_LENGTH - 1
+        startindex = index + 1
+        startindex = max_insert_index if startindex > max_insert_index
+        dst_size = end - startindex - MIN_MATCH_LENGTH + 1
+        if dst_size > 0 {
+          dst = hash_match[0...dst_size]
+          bulk_hash4(window[startindex...end], dst)
+          i = 0
+          while i < dst_size {
+            di = i + startindex
+            new_h = (dst[i] & HASH_MASK).to_i
+            self.hash_prev[di & WINDOW_MASK] = hash_head[new_h]
+            self.hash_head[new_h] = (di + hash_offset).as_i32
+            i += 1
+          }
+        }
+        self.index = new_index
+        self.byte_available = false
+        self.length = MIN_MATCH_LENGTH - 1
+        if tokens.n == MAX_FLATE_BLOCK_TOKENS {
+          return if !write_block!(index, false)
+          self.tokens.reset!
+        }
+        self.literal_counter = 0
+        next
+      }
+      self.literal_counter = 0 if length >= MIN_MATCH_LENGTH
+      if byte_available {
+        self.literal_counter += 1
+        self.tokens.add_literal!(window[index - 1])
+        if tokens.n == MAX_FLATE_BLOCK_TOKENS {
+          return if !write_block!(index, false)
+          self.tokens.reset!
+        }
+        self.index += 1
+        return if !skip_literals!
+      } else {
+        self.index += 1
+        self.byte_available = true
+      }
+    }
+    nil
+  }
+
+  # Stores the window once it is full, or on sync.
+  def store! {
+    if window_end > 0 && (window_end == MAX_STORE_BLOCK_SIZE || sync) {
+      write_stored_block!(window[0...window_end])
+      self.window_end = 0
+    }
+    nil
+  }
+
+  # Appends b to the window; returns the count copied.
+  def fill_block!(b: [Byte]) -> Int {
+    n = copy(window[window_end...window.size], b)
+    self.window_end += n
+    n
+  }
+
+  # Huffman-codes the window once it is full, or on sync.
+  def deflate_huff! {
+    return if (window_end < window.size && !sync) || window_end == 0
+    self.w.write_block_huff!(false, window[0...window_end], sync)
+    self.err = w.err
+    self.window_end = 0
+    nil
+  }
+
+  # Encodes the window with a fast encoder (levels 1-6) once it is full, or
+  # on sync.
+  def deflate_fast! {
+    # Only full windows are compressed, unless syncing.
+    if window_end < window.size {
+      return if !sync
+      # Extremely small sizes.
+      if window_end < 128 {
+        return if window_end == 0
+        if window_end <= 32 {
+          write_stored_block!(window[0...window_end])
+        } else {
+          self.w.write_block_huff!(false, window[0...window_end], true)
+          self.err = w.err
+        }
+        self.tokens.reset!
+        self.window_end = 0
+        self.fast.reset!
+        return
+      }
+    }
+    self.tokens.n = self.fast.encode!(tokens, window[0...window_end])
+    if tokens.n == 0 {
+      # No matches: store the block as is.
+      write_stored_block!(window[0...window_end])
+    } else if tokens.n > window_end - (window_end >> 4) {
+      # Less than 1/16th removed: Huffman-code the block.
+      self.w.write_block_huff!(false, window[0...window_end], sync)
+      self.err = w.err
+    } else {
+      self.w.write_block_dynamic!(tokens, false, window[0...window_end], sync)
+      self.err = w.err
+    }
+    self.tokens.reset!
+    self.window_end = 0
+    nil
+  }
+
+  def step! {
+    case mode {
+      MODE_STORE => store!
+      MODE_HUFF => deflate_huff!
+      MODE_FAST => deflate_fast!
+      _ => deflate_lazy!
+    }
+    nil
+  }
+
+  def fill!(b: [Byte]) -> Int {
+    return fill_deflate!(b) if mode == MODE_LAZY
+    fill_block!(b)
+  }
+
+  # Adds b to the compressor.
+  def write!(b0: [Byte]) -> ~Int {
+    if e = err {
+      fail e
+    }
+    n = b0.size
+    b = b0
+    while b.size > 0 {
+      step! if window_end == window.size || sync
+      k = fill!(b)
+      b = b[k...b.size]
+      if e = err {
+        fail e
+      }
+    }
+    n
+  }
+
+  # Writes the window and an empty stored block, byte-aligning the output.
+  def sync_flush! -> ~Unit {
+    if e = err {
+      fail e
+    }
+    self.sync = true
+    step!
+    if err.none? {
+      self.w.write_stored_header!(0, false)
+      self.w.flush!
+      self.err = w.err
+    }
+    self.sync = false
+    if e = err {
+      fail e
+    }
+  }
+
+  # Starts a new stream into w.
+  def reset!(dst: W) {
+    self.w.reset!(dst)
+    self.sync = false
+    self.err = none
+    self.closed = false
+    self.window_end = 0
+    # Fast encoders only need a few things reset.
+    if has_fast {
+      self.fast.reset!
+      self.tokens.reset!
+      return
+    }
+    return if chain == 0
+    self.chain_head = -1
+    zero_i32(hash_head)
+    zero_i32(hash_prev)
+    self.hash_offset = 1
+    self.index = 0
+    self.block_start = 0
+    self.byte_available = false
+    self.tokens.reset!
+    self.length = MIN_MATCH_LENGTH - 1
+    self.offset = 0
+    self.literal_counter = 0
+    self.max_insert_index = 0
+    nil
+  }
+
+  # Flushes the pending data and writes the final block.
+  def close! -> ~Unit {
+    return if closed
+    if e = err {
+      fail e
+    }
+    self.sync = true
+    step!
+    if e = err {
+      fail e
+    }
+    self.w.write_stored_header!(0, true)
+    if e = w.err {
+      fail e
+    }
+    self.w.flush!
+    if e = w.err {
+      fail e
+    }
+    self.closed = true
+    self.err = FlateError.WriterClosed
+  }
+}
+
+# Compresses what is written to it into W (Go's flate.Writer).
+pub struct Writer[W] {
+  st: [Compressor[W]]
+  dict: [Byte]
+
+  # Compresses p; returns p.size. Data may stay buffered until flush! or
+  # close!.
+  pub def write!(p: [Byte]) -> ~Int {
+    self.st[0].~write!(p)
+  }
+
+  # Writes out all pending data and an empty stored block (Z_SYNC_FLUSH):
+  # a reader of the output so far sees everything written. Flushing with
+  # nothing pending still writes a 4-byte sync marker.
+  pub def flush! -> ~Unit {
+    self.st[0].~sync_flush!
+  }
+
+  # Flushes and writes the final block. Later writes fail with
+  # FlateError.WriterClosed; closing again does nothing.
+  pub def close! -> ~Unit {
+    self.st[0].~close!
+  }
+
+  # Discards the state and starts a new stream into dst, with the same
+  # level and dictionary.
+  pub def reset!(dst: W) {
+    self.st[0].reset!(dst)
+    self.st[0].fill_window!(dict)
+    nil
+  }
+
+  # Writes p straight to the underlying writer (gzip and zlib write their
+  # headers and trailers this way). Only between streams: before the first
+  # write! or after close!.
+  pub def write_raw!(p: [Byte]) -> ~Unit {
+    self.st[0].w.~put!(p)
+    nil
+  }
+}
+
+# A Writer compressing into w at `level`: NO_COMPRESSION (0, stored
+# blocks), BEST_SPEED (1) to BEST_COMPRESSION (9), DEFAULT_COMPRESSION (-1,
+# level 6) or HUFFMAN_ONLY (-2). Other levels fail with InvalidLevel.
+#
+# The exact bytes written are not a compatibility promise (as in Go), but
+# they are Go's for every level.
+pub def new_writer[W](w: W, level: Int) -> ~Writer[W]<FlateError> {
+  d = ~new_compressor(w, level)
+  e: [Byte] = []
+  Writer[W].new(st: [d], dict: e)
+}
+
+# Like new_writer, with a preset dictionary: the Writer behaves as if dict
+# had been written to it without producing output. Only a reader with the
+# same dictionary (new_reader_dict) can decompress the output.
+pub def new_writer_dict[W](w: W, level: Int, dict: [Byte]) -> ~Writer[W]<FlateError> {
+  d = ~new_compressor(w, level)
+  d.fill_window!(dict)
+  cl: [Byte] = [0; dict.size]
+  copy(cl, dict)
+  Writer[W].new(st: [d], dict: cl)
+}

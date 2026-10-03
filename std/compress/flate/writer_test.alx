@@ -1,0 +1,209 @@
+# Go's writer_test.go.
+import "bytes"
+import "io"
+import "os"
+
+# Fails after n writes (Go's errorWriter).
+struct ErrorWriter {
+  st: [Int]
+
+  def write!(p: [Byte]) -> ~Int {
+    fail "io: read/write on closed pipe" if st[0] <= 0
+    self.st[0] -= 1
+    p.size
+  }
+}
+
+# Copies src to dst through buf (Go's io.CopyBuffer).
+def copy_buffer[W, R](dst: W, src: R, buf: [Byte]) -> ~Int {
+  d = dst
+  r = src
+  total = 0
+  loop {
+    n = r.~read!(buf)
+    break if n == 0
+    d.~write!(buf[0...n])
+    total += n
+  }
+  total
+}
+
+# Lines of text, n of them (the input of several of Go's tests).
+def text_lines(n: Int, f: Str) -> [Byte] {
+  buf = bytes.new_buffer([])
+  i = 0
+  while i < n {
+    if f == "asdasfasf" {
+      buf.write_string!("asdasfasf#{i}#{i}fghfgujyut#{i}yutyu\n")
+    } else {
+      buf.write_string!("asdfasdfasdfasdf#{i}#{i}fghfgujyut#{i}yutyu\n")
+    }
+    i += 1
+  }
+  buf.bytes
+}
+
+# Errors from the underlying writer are passed on.
+test "WriteError" {
+  input = text_lines(65536 * 4, "asdasfasf")
+  copy_buf: [Byte] = [0; 128]
+  l = 0
+  while l < 10 {
+    fl = 1
+    while fl <= 256 {
+      # Fail after `fl` writes.
+      ew = ErrorWriter.new(st: [fl])
+      w = ~new_writer(ew, l)
+      r = copy_buffer(w, slice_reader(input), copy_buf)
+      assert r.err?, "level #{l} fl #{fl}: expected an error, writer was #{ew.st[0]}, copied #{r.unwrap_or(-1)}"
+      assert w.write!([1, 2, 2, 3, 4, 5]).err?, "level #{l}: expected an error"
+      assert w.flush!.err?, "level #{l}: expected an error on flush"
+      assert w.close!.err?, "level #{l}: expected an error on close"
+      w.reset!(ErrorWriter.new(st: [1 << 40]))
+      n2 = w.write!([1, 2, 3, 4, 5, 6])
+      assert n2.ok?, "level #{l}: got unexpected error after reset"
+      assert n2.unwrap_or(0) > 0, "level #{l}: got 0 length write, expected > 0"
+      fl *= 2
+    }
+    l += 1
+  }
+}
+
+# Encoding across the wraparound of the fast encoders' offsets. Go's
+# short-mode sizes (offset 256 only, a 2.6 MB input).
+test "Writer_Reset" {
+  input = text_lines(65536, "asdasfasf")
+  l = 0
+  while l < 10 {
+    offset = 256
+    while offset <= 256 {
+      w = ~new_writer(io.Discard.new, l)
+      break if !w.st[0].has_fast
+      # Skip ahead to close to the wraparound.
+      i = 0
+      while i < (BUFFER_RESET - input.size - offset - MAX_MATCH_OFFSET) / MAX_MATCH_OFFSET {
+        w.st[0].fast.reset!
+        i += 1
+      }
+      w.st[0].fast.reset!
+      ~w.write!(input)
+      i = 0
+      while i < 50 {
+        # Skip ahead again: this should wrap around.
+        w.st[0].fast.reset!
+        i += 1
+      }
+      w.st[0].fast.reset!
+      ~w.write!(input)
+      i = 0
+      while i < (4294967295 - BUFFER_RESET) / MAX_MATCH_OFFSET {
+        w.st[0].fast.reset!
+        i += 1
+      }
+      ~w.write!(input)
+      ~w.close!
+      offset *= 2
+    }
+    l += 1
+  }
+}
+
+# Two runs produce the same output when written in different sizes. Go's
+# short-mode size.
+def test_deterministic(level: Int) -> ~Unit {
+  length = (MAX_STORE_BLOCK_SIZE * 30 + 500) / 10
+  # A random but compressible stream.
+  t1 = rand_bytes(length, 1, 7)
+  b1 = bytes.new_buffer([])
+  w = ~new_writer(b1, level)
+  # A very small prime-sized buffer.
+  cbuf: [Byte] = [0; 787]
+  ~copy_buffer(w, bytes.new_buffer(t1), cbuf)
+  ~w.close!
+  # A different size, bigger than a block, and prime.
+  b2 = bytes.new_buffer([])
+  cbuf2: [Byte] = [0; 81761]
+  w2 = ~new_writer(b2, level)
+  ~copy_buffer(w2, bytes.new_buffer(t1), cbuf2)
+  ~w2.close!
+  assert b1.bytes == b2.bytes, "level #{level} did not produce deterministic result, len(a) = #{b1.size}, len(b) = #{b2.size}"
+  # All at once (Go: io.WriterTo).
+  b3 = bytes.new_buffer([])
+  w3 = ~new_writer(b3, level)
+  ~w3.write!(t1)
+  ~w3.close!
+  assert b1.bytes == b3.bytes, "level #{level} (one write) did not produce deterministic result"
+}
+
+test "Deterministic" {
+  i = 0
+  while i <= 9 {
+    ~test_deterministic(i)
+    i += 1
+  }
+  ~test_deterministic(-2)
+}
+
+# Encoding is the same across a wraparound of the table offset
+# (https://github.com/golang/go/issues/34121). Go's short mode: offset 256.
+test "DeflateFast_Reset" {
+  input = text_lines(65536, "asdfasdfasdfasdf")
+  level = 1
+  # An encode with a clean buffer to compare.
+  want = bytes.new_buffer([])
+  w = ~new_writer(want, level)
+  ~w.write!(input)
+  ~w.write!(input)
+  ~w.write!(input)
+  ~w.close!
+  offset = 256
+  while offset <= 256 {
+    w2 = ~new_writer(bytes.new_buffer([]), level)
+    # Reset until right before the wraparound; each reset adds
+    # MAX_MATCH_OFFSET to the offset.
+    i = 0
+    while i < (BUFFER_RESET - input.size - offset - MAX_MATCH_OFFSET) / MAX_MATCH_OFFSET {
+      w2.st[0].reset!(bytes.new_buffer([]))
+      i += 1
+    }
+    got = bytes.new_buffer([])
+    w2.reset!(got)
+    i = 0
+    while i < 3 {
+      ~w2.write!(input)
+      i += 1
+    }
+    ~w2.close!
+    assert got.bytes == want.bytes, "output did not match at wraparound, len(want) = #{want.size}, len(got) = #{got.size}"
+    offset *= 2
+  }
+}
+
+# Go's BenchmarkEncode: e.txt and the Opticks text at 1e4, 1e5 and 1e6
+# bytes, Huffman-only, speed, default and best compression.
+def bench_input(file: Str, n: Int) -> [Byte] {
+  buf0 = os.read_file(file).unwrap
+  buf1: [Byte] = []
+  i = 0
+  while i < n {
+    k = buf0.size
+    k = n - i if k > n - i
+    buf1 = buf1 + buf0[0...k]
+    i += buf0.size
+  }
+  buf1
+}
+
+bench "Encode/Digits/Speed/1e6" {
+  data = bench_input("testdata/e.txt", 1000000)
+  w = new_writer(io.Discard.new, BEST_SPEED).unwrap
+  w.write!(data).unwrap
+  w.close!.unwrap
+}
+
+bench "Encode/Newton/Default/1e6" {
+  data = bench_input("testdata/Isaac.Newton-Opticks.txt", 1000000)
+  w = new_writer(io.Discard.new, DEFAULT_COMPRESSION).unwrap
+  w.write!(data).unwrap
+  w.close!.unwrap
+}

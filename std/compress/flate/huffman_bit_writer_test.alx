@@ -1,0 +1,145 @@
+# Go's huffman_bit_writer_test.go: block encodings against Go's reference
+# files in testdata/ (the token lists are in block_tokens_test.alx). Go's
+# -update flag (rewriting the references) isn't ported.
+import "bytes"
+import "os"
+import "path/filepath"
+import "strings"
+
+struct HuffTest {
+  tokens: [U32]
+  # The file of input data matching the tokens.
+  input: Str
+  # The file of the expected output with the input available.
+  want: Str
+  # The file of the expected output without the input.
+  want_no_input: Str
+}
+
+# Tokens from unindexed tokens (Go's indexTokens).
+def index_tokens_from(input: [U32]) -> Tokens {
+  t = new_tokens()
+  for tok in input {
+    if tok < MATCH_TYPE {
+      t.add_literal!(tok.as_u8)
+      next
+    }
+    t.add_match!((tok >> LENGTH_SHIFT) & 0xff, tok & OFFSET_MASK & MATCH_OFFSET_ONLY_MASK)
+  }
+  t
+}
+
+def read(file: Str) -> [Byte] { os.read_file(file).unwrap }
+
+test "BlockHuff" {
+  for input in filepath.glob("testdata/huffman-*.in").unwrap {
+    out = strings.trim_suffix(input, ".in") + ".golden"
+    all = read(input)
+    buf = bytes.new_buffer([])
+    bw = new_bit_writer(buf)
+    bw.log_new_table_penalty = 8
+    bw.write_block_huff!(false, all, false)
+    bw.flush!
+    want = read(out)
+    assert buf.bytes == want, "#{input} != #{out}"
+    # The same output after a reset.
+    buf.reset!
+    bw.reset!(buf)
+    bw.write_block_huff!(false, all, false)
+    bw.flush!
+    assert buf.bytes == want, "after reset #{input} != #{out}"
+    test_writer_eof("huff", HuffTest.new(tokens: [], input: input, want: "", want_no_input: ""), true)
+  }
+}
+
+def write_to_type[W](ttype: Str, bw0: BitWriter[W], tok: Tokens, input: [Byte]?) -> BitWriter[W] {
+  bw = bw0
+  if ttype == "wb" {
+    bw.write_block!(tok, false, input)
+  } else if ttype == "dyn" {
+    bw.write_block_dynamic!(tok, false, input, false)
+  } else {
+    bw.write_block_dynamic!(tok, false, input, true)
+  }
+  assert bw.err.none?, "#{ttype}: write error"
+  bw.flush!
+  assert bw.err.none?, "#{ttype}: flush error"
+  bw
+}
+
+def test_block(test0: HuffTest, ttype: Str) {
+  want_file = strings.replace_all(test0.want, "%s", ttype)
+  want_ni_file = strings.replace_all(test0.want_no_input, "%s", ttype)
+  if test0.input != "" {
+    input = read(test0.input)
+    want = read(want_file)
+    buf = bytes.new_buffer([])
+    bw = new_bit_writer(buf)
+    bw = write_to_type(ttype, bw, index_tokens_from(test0.tokens), input)
+    assert buf.bytes == want, "writeBlock did not yield the expected result for #{want_file} with input"
+    # The same output after a reset.
+    buf.reset!
+    bw.reset!(buf)
+    bw = write_to_type(ttype, bw, index_tokens_from(test0.tokens), input)
+    bw.flush!
+    assert buf.bytes == want, "reset: writeBlock did not yield the expected result for #{want_file} with input"
+    test_writer_eof("wb", test0, true)
+  }
+  want_ni = read(want_ni_file)
+  buf = bytes.new_buffer([])
+  bw = new_bit_writer(buf)
+  bw = write_to_type(ttype, bw, index_tokens_from(test0.tokens), none)
+  got = buf.bytes
+  assert got == want_ni, "writeBlock did not yield the expected result for #{want_ni_file} without input"
+  assert got[0] & 1 != 1, "got unexpected EOF"
+  # The same output after a reset.
+  buf.reset!
+  bw.reset!(buf)
+  bw = write_to_type(ttype, bw, index_tokens_from(test0.tokens), none)
+  bw.flush!
+  assert buf.bytes == want_ni, "reset: writeBlock did not yield the expected result for #{want_ni_file} without input"
+  test_writer_eof("wb", test0, false)
+  nil
+}
+
+# Whether the written block is marked final.
+def test_writer_eof(ttype: Str, test0: HuffTest, use_input: Bool) {
+  return if use_input && test0.input == ""
+  input: [Byte]? = none
+  input = read(test0.input) if use_input
+  buf = bytes.new_buffer([])
+  bw = new_bit_writer(buf)
+  tokens = index_tokens_from(test0.tokens)
+  if ttype == "wb" {
+    bw.write_block!(tokens, true, input)
+  } else if ttype == "dyn" {
+    bw.write_block_dynamic!(tokens, true, input, true)
+  } else {
+    bw.write_block_huff!(true, input || [], true)
+  }
+  assert bw.err.none?, "write error"
+  bw.flush!
+  assert bw.err.none?, "flush error"
+  got = buf.bytes
+  assert got.size > 0, "no output received"
+  assert got.size == 0 || got[0] & 1 == 1, "block not marked with EOF for input #{test0.input}"
+  nil
+}
+
+test "WriteBlock" {
+  for t in write_block_tests() {
+    test_block(t, "wb")
+  }
+}
+
+test "WriteBlockDynamic" {
+  for t in write_block_tests() {
+    test_block(t, "dyn")
+  }
+}
+
+test "WriteBlockDynamicSync" {
+  for t in write_block_tests() {
+    test_block(t, "sync")
+  }
+}

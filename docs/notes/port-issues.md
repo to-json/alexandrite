@@ -36,3 +36,8 @@ Open problems agents reported; each gets fixed in a compiler round between waves
 | 30 | math/big | no mutable package globals (caches like Go's divisor table) | open (design) |
 | 31 | math/big | `format` has no `%g` | fixed: `%g` (shortest, as Go); `%.Ng` and `%G` not yet |
 | 32 | math/big | a main file can't declare its own `Int`/`Float` (only packages can) | open (by design for now) |
+| 33 | compress | `Gen.new(st: [State.new(r: r)])` inside a generic constructor sometimes can't infer the type parameter ("can't infer `R`"), depending on the instantiating program (base64.new_decoder over an os.File); explicit `Gen[R].new` / `State[R].new` works. Also a generic def can't infer `R` from a `pkg.Gen[R]` parameter | open (worked around: explicit type arguments; base64 fixed) |
+| 34 | compress | calling a `!` method on self (or a field path) copies the whole receiver struct in and out of a one-element cell per call; with big structs (an `Error?` field is hundreds of bytes) hot `!` helpers cost more than their work (flate's decoder was 2.5x slower until its hot loop used locals) | open (perf) |
+| 35 | compress | `b[i] \| b[i+1] << 8 ...` keeps 8 bounds checks (wrapping adds hide the relation); indexing an 8-byte view `w = b[i...i+8]` lets clang drop them (15x on a load64 microbenchmark) | open (perf; workaround documented) |
+| 36 | compress | a method without a declared result whose last statement is an assignment returns Int, so an early bare `return` then fails "returns nil, but its last expression is Int" | open (workaround: end with `nil`) |
+| 37 | compress | `alx test` ran tests in the caller's directory, so `testdata/` paths failed | fixed: tests run in the package directory (JIT and --release), as Go's do |

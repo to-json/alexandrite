@@ -1,0 +1,93 @@
+# Go's example_test.go.
+import "bytes"
+import "io"
+import "strings"
+
+# reset! discards the compressor or decompressor state and reuses what was
+# allocated.
+example "reset" {
+  proverbs = [
+    "Don't communicate by sharing memory, share memory by communicating.\n",
+    "Concurrency is not parallelism.\n",
+    "The bigger the interface, the weaker the abstraction.\n",
+    "Documentation is for users.\n",
+  ]
+  bf = bytes.new_buffer([])
+  zw = ~new_writer(bf, DEFAULT_COMPRESSION)
+  zr = new_reader(bf)
+  for p in proverbs {
+    bf.reset!
+    # Reset the compressor and encode from some input.
+    zw.reset!(bf)
+    ~zw.write!(b(p))
+    ~zw.close!
+    # Reset the decompressor and decode to some output.
+    zr.reset!(bf, [])
+    print s(~io.read_all(zr))
+    ~zr.close!
+  }
+} outputs "Don't communicate by sharing memory, share memory by communicating.\nConcurrency is not parallelism.\nThe bigger the interface, the weaker the abstraction.\nDocumentation is for users.\n"
+
+# A preset dictionary can improve the compression ratio; compressor and
+# decompressor must agree on it.
+example "dictionary" {
+  # Substrings expected in the data.
+  dict = "<?xml version=\"1.0\"?>" + "<book>" + "<data>" + "<meta name=\"" + "\" content=\""
+  data = "<?xml version=\"1.0\"?>\n" +
+    "<book>\n" +
+    "\t<meta name=\"title\" content=\"The Go Programming Language\"/>\n" +
+    "\t<meta name=\"authors\" content=\"Alan Donovan and Brian Kernighan\"/>\n" +
+    "\t<meta name=\"published\" content=\"2015-10-26\"/>\n" +
+    "\t<meta name=\"isbn\" content=\"978-0134190440\"/>\n" +
+    "\t<data>...</data>\n" +
+    "</book>\n"
+  bf = bytes.new_buffer([])
+  # Compress with the dictionary.
+  zw = ~new_writer_dict(bf, DEFAULT_COMPRESSION, b(dict))
+  ~io.copy(zw, slice_reader(b(data)))
+  ~zw.close!
+  # The decompressor must use the same dictionary.
+  puts "Decompressed output using the dictionary:"
+  zr = new_reader_dict(bytes.new_buffer(bf.bytes), b(dict))
+  print s(~io.read_all(zr))
+  ~zr.close!
+  puts ""
+  # Replace the dictionary's bytes by '#' to show what it matched.
+  puts "Substrings matched by the dictionary are marked with #:"
+  hash_dict = b(dict)
+  i = 0
+  while i < hash_dict.size {
+    hash_dict[i] = 35
+    i += 1
+  }
+  zr2 = new_reader_dict(bf, hash_dict)
+  print s(~io.read_all(zr2))
+  ~zr2.close!
+} outputs "Decompressed output using the dictionary:\n<?xml version=\"1.0\"?>\n<book>\n\t<meta name=\"title\" content=\"The Go Programming Language\"/>\n\t<meta name=\"authors\" content=\"Alan Donovan and Brian Kernighan\"/>\n\t<meta name=\"published\" content=\"2015-10-26\"/>\n\t<meta name=\"isbn\" content=\"978-0134190440\"/>\n\t<data>...</data>\n</book>\n\nSubstrings matched by the dictionary are marked with #:\n#####################\n######\n\t############title\" content=\"The Go Programming Language\"/#\n\t############authors\" content=\"Alan Donovan and Brian Kernighan\"/#\n\t############published\" content=\"2015-10-26\"/#\n\t############isbn\" content=\"978-0134190440\"/#\n\t######...</#####\n</book>\n"
+
+# DEFLATE over a connection: every flush! lets the receiver read all that
+# was sent. Go runs transmitter and receiver as goroutines over an io.Pipe;
+# here they take turns over a buffer that fails if read past what was sent.
+example "synchronization" {
+  conn = new_sync_buffer()
+  zw = ~new_writer(conn, BEST_SPEED)
+  zr = new_reader(conn)
+  bf: [Byte] = [0; 256]
+  for m in strings.fields("A long time ago in a galaxy far, far away...") {
+    # A simple framing: the message length, then the message.
+    bf[0] = copy(bf[1...bf.size], b(m)).as_u8
+    ~zw.write!(bf[0...1 + m.size])
+    # The receiver can read all data sent so far.
+    ~zw.flush!
+    # Receive: the length, then the message.
+    ~read_at_least(zr, bf[0...1], 1)
+    n = bf[0].to_i
+    ~read_at_least(zr, bf[0...n], n)
+    puts "Received #{n} bytes: #{s(bf[0...n])}"
+  }
+  ~zw.close!
+  conn.close!
+  # The transmitter closed the stream.
+  assert_eq ~zr.read!(bf), 0
+  ~zr.close!
+} outputs "Received 1 bytes: A\nReceived 4 bytes: long\nReceived 4 bytes: time\nReceived 3 bytes: ago\nReceived 2 bytes: in\nReceived 1 bytes: a\nReceived 6 bytes: galaxy\nReceived 4 bytes: far,\nReceived 3 bytes: far\nReceived 7 bytes: away...\n"

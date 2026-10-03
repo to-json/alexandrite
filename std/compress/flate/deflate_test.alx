@@ -1,0 +1,600 @@
+# Go's deflate_test.go.
+import "bytes"
+import "io"
+import "os"
+
+def large_data_chunk -> [Byte] {
+  result: [Byte] = [0; 100000]
+  i = 0
+  while i < result.size {
+    result[i] = ((i * i) & 0xff).as_u8
+    i += 1
+  }
+  result
+}
+
+# (input, level, output)
+def deflate_tests -> [([Byte], Int, [Byte])] {
+  xs: [([Byte], Int, [Byte])] = [
+    ([], 0, [0x3, 0x0]),
+    ([0x11], BEST_COMPRESSION, [0x12, 0x4, 0xc, 0x0]),
+    ([0x11], BEST_COMPRESSION, [0x12, 0x4, 0xc, 0x0]),
+    ([0x11], BEST_COMPRESSION, [0x12, 0x4, 0xc, 0x0]),
+    ([0x11], 0, [0x0, 0x1, 0x0, 0xfe, 0xff, 0x11, 0x3, 0x0]),
+    ([0x11, 0x12], 0, [0x0, 0x2, 0x0, 0xfd, 0xff, 0x11, 0x12, 0x3, 0x0]),
+    ([0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11], 0,
+      [0x0, 0x8, 0x0, 0xf7, 0xff, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x3, 0x0]),
+    ([], 1, [0x3, 0x0]),
+    ([0x11], BEST_COMPRESSION, [0x12, 0x4, 0xc, 0x0]),
+    ([0x11, 0x12], BEST_COMPRESSION, [0x12, 0x14, 0x2, 0xc, 0x0]),
+    ([0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11], BEST_COMPRESSION, [0x12, 0x84, 0x1, 0xc0, 0x0]),
+    ([], 9, [0x3, 0x0]),
+    ([0x11], 9, [0x12, 0x4, 0xc, 0x0]),
+    ([0x11, 0x12], 9, [0x12, 0x14, 0x2, 0xc, 0x0]),
+    ([0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11], 9, [0x12, 0x84, 0x1, 0xc0, 0x0]),
+  ]
+  xs
+}
+
+def deflate_inflate_tests -> [[Byte]] {
+  xs: [[Byte]] = [
+    [],
+    [0x11],
+    [0x11, 0x12],
+    [0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11],
+    [0x11, 0x10, 0x13, 0x41, 0x21, 0x21, 0x41, 0x13, 0x87, 0x78, 0x13],
+    large_data_chunk(),
+  ]
+  xs
+}
+
+test "BulkHash4" {
+  for x in deflate_tests() {
+    y0 = x[2]
+    next if y0.size < MIN_MATCH_LENGTH
+    yy = y0 + y0
+    j = 4
+    while j < yy.size {
+      y = yy[0...j]
+      dst: [U32] = [0; y.size - MIN_MATCH_LENGTH + 1]
+      i = 0
+      while i < dst.size {
+        dst[i] = (i + 100).as_u32
+        i += 1
+      }
+      bulk_hash4(y, dst)
+      i = 0
+      while i < dst.size {
+        want = hash4u(load32(y, i), HASH_BITS).as_u32
+        assert dst[i] == want, "len #{y.size} index #{i}: got #{dst[i]} want #{want}"
+        i += 1
+      }
+      j += 1
+    }
+  }
+}
+
+test "Deflate" {
+  i = 0
+  for tc in deflate_tests() {
+    buf = bytes.new_buffer([])
+    w = ~new_writer(buf, tc[1])
+    ~w.write!(tc[0])
+    ~w.close!
+    assert buf.bytes == tc[2], "#{i}: deflate(#{tc[1]}, #{tc[0]}) = #{buf.bytes}, want #{tc[2]}"
+    i += 1
+  }
+}
+
+test "WriterClose" {
+  buf = bytes.new_buffer([])
+  zw = ~new_writer(buf, 6)
+  c = zw.write!(b("Test"))
+  assert c.ok? && c.unwrap == 4, "write to not closed writer"
+  ~zw.close!
+  after_close = buf.size
+  assert zw.write!(b("Test")).err?, "write to closed writer"
+  assert zw.flush!.err?, "flush to closed writer"
+  ~zw.close!
+  assert_eq buf.size, after_close
+}
+
+# Zeros followed by 1 << 16 ones (Go's sparseReader).
+struct SparseReader {
+  st: [(Int, Int)]
+
+  def read!(p: [Byte]) -> Int {
+    l = st[0][0]
+    cur = st[0][1]
+    return 0 if cur >= l
+    n = p.size
+    nc = cur + n
+    if nc > l {
+      n -= nc - l
+      nc = l
+    }
+    i = 0
+    while i < n {
+      p[i] = cur + i >= l - (1 << 16) ? 1 : 0
+      i += 1
+    }
+    self.st[0] = (l, nc)
+    n
+  }
+}
+
+# Go streams 2.3 GB; this is the same shape at 1/100th of the size (the
+# full size runs for minutes on the JIT).
+test "VeryLongSparseChunk" {
+  w = ~new_writer(io.Discard.new, 1)
+  ~io.copy(w, SparseReader.new(st: [(23000000, 0)]))
+}
+
+# Go's testSync: writes half the input, flushes and reads it back without
+# reading past what was flushed; then the rest.
+def test_sync(level: Int, input: [Byte], name: Str) -> ~Unit {
+  return if input.size == 0
+  buf = new_sync_buffer()
+  buf1 = bytes.new_buffer([])
+  w = ~new_writer(MultiWriter.new(a: buf, b: buf1), level)
+  r = new_reader(buf)
+  # Write half the input and read back.
+  i = 0
+  while i < 2 {
+    lo = 0
+    hi = 0
+    if i == 0 {
+      hi = (input.size + 1) / 2
+    } else {
+      lo = (input.size + 1) / 2
+      hi = input.size
+    }
+    ~w.write!(input[lo...hi])
+    if i == 0 {
+      ~w.flush!
+    } else {
+      ~w.close!
+      buf.close!
+    }
+    out: [Byte] = [0; hi - lo + 1]
+    m = ~read_at_least(r, out, hi - lo)
+    assert m == hi - lo, "testSync/#{i} (#{level}, #{input.size}, #{name}): read #{hi - lo}: #{m}"
+    assert input[lo...hi] == out[0...hi - lo], "testSync/#{i}: read wrong bytes"
+    i += 1
+  }
+  out: [Byte] = [0; 10]
+  n = ~r.read!(out)
+  assert n == 0, "testSync (#{level}, #{input.size}, #{name}): final read: #{n}"
+  assert buf.st[0].buf.size == 0, "testSync (#{level}, #{input.size}, #{name}): extra data at end"
+  ~r.close!
+  # The stream works for an ordinary reader too.
+  r2 = new_reader(buf1)
+  got = ~io.read_all(r2)
+  ~r2.close!
+  assert input == got, "testSync: decompress(compress(data)) != data: level=#{level} input=#{name}"
+}
+
+def test_to_from_with_level_and_limit(level: Int, input: [Byte], name: Str, limit: Int) -> ~Unit {
+  buffer = bytes.new_buffer([])
+  w = ~new_writer(buffer, level)
+  ~w.write!(input)
+  ~w.close!
+  if limit > 0 {
+    assert buffer.size <= limit, "level: #{level}, len(compress(data)) = #{buffer.size} > limit = #{limit}"
+  }
+  r = new_reader(buffer)
+  out = ~io.read_all(r)
+  ~r.close!
+  assert input == out, "decompress(compress(data)) != data: level=#{level} input=#{name}"
+  ~test_sync(level, input, name)
+}
+
+def test_to_from_with_limit(input: [Byte], name: Str, limit: [Int]) -> ~Unit {
+  i = 0
+  while i < 10 {
+    ~test_to_from_with_level_and_limit(i, input, name, limit[i])
+    i += 1
+  }
+  ~test_to_from_with_level_and_limit(-2, input, name, limit[10])
+}
+
+test "DeflateInflate" {
+  i = 0
+  for tc in deflate_inflate_tests() {
+    ~test_to_from_with_limit(tc, "##{i}", [0; 11])
+    i += 1
+  }
+}
+
+test "ReverseBits" {
+  # (in, bit count, out)
+  cases = [(1, 1, 1), (1, 2, 2), (1, 3, 4), (1, 4, 8), (1, 5, 16), (17, 5, 17), (257, 9, 257), (29, 5, 23)]
+  for c in cases {
+    assert_eq reverse_bits(c[0], c[1]), c[2]
+  }
+}
+
+test "DeflateInflateString" {
+  # (file, label, the compressed size limit of levels 0-9 and -2)
+  cases = [
+    ("testdata/e.txt", "2.718281828...",
+      [100018, 67900, 50960, 51150, 50930, 50790, 50790, 50790, 50790, 50790, 43683 + 100]),
+    ("testdata/Isaac.Newton-Opticks.txt", "Isaac.Newton-Opticks",
+      [567248, 218338, 201354, 199101, 190627, 182587, 179765, 174982, 173422, 173422, 325240]),
+  ]
+  for tc in cases {
+    gold = ~os.read_file(tc[0])
+    ~test_to_from_with_limit(gold, tc[1], tc[2])
+  }
+}
+
+test "ReaderDict" {
+  dict = "hello world"
+  text = "hello again world"
+  buf = bytes.new_buffer([])
+  w = ~new_writer(buf, 5)
+  ~w.write!(b(dict))
+  ~w.flush!
+  buf.reset!
+  ~w.write!(b(text))
+  ~w.close!
+  r = new_reader_dict(buf, b(dict))
+  data = ~io.read_all(r)
+  assert_eq s(data), "hello again world"
+}
+
+test "WriterDict" {
+  dict = "hello world Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua."
+  text = "hello world again Lorem ipsum dolor sit amet"
+  # Sensitive to algorithms that skip data for speed: levels 4-8.
+  l = 4
+  while l < 9 {
+    buf = bytes.new_buffer([])
+    w = ~new_writer(buf, l)
+    ~w.write!(b(dict))
+    ~w.flush!
+    buf.reset!
+    ~w.write!(b(text))
+    ~w.close!
+    b1 = bytes.new_buffer([])
+    w1 = ~new_writer_dict(b1, l, b(dict))
+    ~w1.write!(b(text))
+    ~w1.close!
+    assert b1.bytes == buf.bytes, "level=#{l}: writer wrote #{b1.bytes}, want #{buf.bytes}"
+    l += 1
+  }
+}
+
+# https://golang.org/issue/2508
+test "Regression2508" {
+  w = ~new_writer(io.Discard.new, 1)
+  bf: [Byte] = [0; 1024]
+  i = 0
+  while i < 131072 {
+    ~w.write!(bf)
+    i += 1
+  }
+  ~w.close!
+}
+
+# Go compares the reset Writer with a new one by reflect.DeepEqual; this
+# compares the state fields that reset! restores.
+test "WriterReset" {
+  level = -2
+  while level <= 9 {
+    if level == -1 {
+      level += 1
+      next
+    }
+    w = ~new_writer(io.Discard.new, level)
+    bf = b("hello world")
+    i = 0
+    while i < 1024 {
+      ~w.write!(bf)
+      i += 1
+    }
+    w.reset!(io.Discard.new)
+    wref = ~new_writer(io.Discard.new, level)
+    d = w.st[0]
+    dr = wref.st[0]
+    assert d.tokens.n == 0, "level #{level} Writer not reset after Reset: #{d.tokens.n} tokens were present"
+    assert d.window_end == dr.window_end && d.index == dr.index && d.block_start == dr.block_start, "level #{level}: window not reset"
+    assert d.sync == dr.sync && d.byte_available == dr.byte_available && d.err.none?, "level #{level}: flags not reset"
+    assert d.length == dr.length && d.offset == dr.offset && d.hash_offset == dr.hash_offset && d.chain_head == dr.chain_head, "level #{level}: match state not reset"
+    assert d.hash_head == dr.hash_head && d.hash_prev == dr.hash_prev, "level #{level}: hash chains not reset"
+    assert d.w.nbits == dr.w.nbits && d.w.nbytes == dr.w.nbytes && d.w.bits == dr.w.bits && d.w.prev_header == dr.w.prev_header, "level #{level}: bit writer not reset"
+    assert d.fast.hist_len == 0, "level #{level}: history not reset"
+    level += 1
+  }
+  i = HUFFMAN_ONLY
+  while i <= BEST_COMPRESSION {
+    ~test_reset_output("dict=0/level=#{i}", i, [], false)
+    i += 1
+  }
+  dict = b("we are the world - how are you?" * 3)
+  i = HUFFMAN_ONLY
+  while i <= BEST_COMPRESSION {
+    ~test_reset_output("dict=1/level=#{i}", i, dict, true)
+    i += 1
+  }
+}
+
+def test_reset_output(name: Str, level: Int, dict: [Byte], use_dict: Bool) -> ~Unit {
+  buf = bytes.new_buffer([])
+  w = use_dict ? ~new_writer_dict(buf, level, dict) : ~new_writer(buf, level)
+  bf = b("hello world - how are you doing?")
+  i = 0
+  while i < 1024 {
+    ~w.write!(bf)
+    i += 1
+  }
+  ~w.close!
+  out1 = buf.bytes
+  buf2 = bytes.new_buffer([])
+  w.reset!(buf2)
+  i = 0
+  while i < 1024 {
+    ~w.write!(bf)
+    i += 1
+  }
+  ~w.close!
+  out2 = buf2.bytes
+  assert out1.size == out2.size, "#{name}: got #{out2.size}, expected #{out1.size} bytes"
+  assert out1 == out2, "#{name}: output mismatch after reset"
+}
+
+# Round trips with write sizes near the thresholds of the compressor (0,
+# 16, 128) and near MAX_STORE_BLOCK_SIZE (65535).
+test "BestSpeed" {
+  abc: [Byte] = [0; 128]
+  i = 0
+  while i < 128 {
+    abc[i] = i.as_u8
+    i += 1
+  }
+  abcabc = bytes.repeat(abc, 131072 / abc.size)
+  cases = [
+    [65536, 0],
+    [65536, 1],
+    [65536, 1, 256],
+    [65536, 1, 65536],
+    [65536, 14],
+    [65536, 15],
+    [65536, 16],
+    [65536, 16, 256],
+    [65536, 16, 65536],
+    [65536, 127],
+    [65536, 128],
+    [65536, 128, 256],
+    [65536, 128, 65536],
+    [65536, 129],
+    [65536, 65536, 256],
+    [65536, 65536, 65536],
+  ]
+  ci = 0
+  for tc in cases {
+    for first_n in [1, 65534, 65535, 65536, 65537, 131072] {
+      tc[0] = first_n
+      for flush in [false, true] {
+        buf = bytes.new_buffer([])
+        want: [Byte] = []
+        w = ~new_writer(buf, BEST_SPEED)
+        for n in tc {
+          want = want + abcabc[0...n]
+          ~w.write!(abcabc[0...n])
+          ~w.flush! if flush
+        }
+        ~w.close!
+        r = new_reader(buf)
+        got = ~io.read_all(r)
+        ~r.close!
+        assert got == want, "i=#{ci}, firstN=#{first_n}, flush=#{flush}: corruption during deflate-then-inflate"
+      }
+    }
+    ci += 1
+  }
+}
+
+test "WriterPersistentWriteError" {
+  d0 = ~os.read_file("testdata/Isaac.Newton-Opticks.txt")
+  d = d0[0...10000]
+  zw = ~new_writer(fail_writer(1 << 40), DEFAULT_COMPRESSION)
+  # Sweep over the write that fails: the Writer's errors must be
+  # persistent although the failWriter's aren't.
+  i = 0
+  while i < 1000 {
+    fw = fail_writer(i)
+    zw.reset!(fw)
+    werr = zw.write!(d).err
+    cerr = zw.close!.err
+    ferr = zw.flush!.err
+    if e = werr {
+      assert io_error?(e), "test #{i}, mismatching Write error: #{e.message}"
+    }
+    if fw.st[0] < 0 {
+      assert cerr.some? && io_error?(cerr.unwrap), "test #{i}, mismatching Close error"
+      assert ferr.some? && io_error?(ferr.unwrap), "test #{i}, mismatching Flush error"
+    }
+    # The whole stream was written: done.
+    break if fw.st[0] >= 0
+    i += 1
+  }
+}
+
+test "WriterPersistentFlushError" {
+  zw = ~new_writer(fail_writer(0), DEFAULT_COMPRESSION)
+  flush_err = zw.flush!.err
+  close_err = zw.close!.err
+  write_err = zw.write!(b("Test")).err
+  for e in [close_err, flush_err, write_err] {
+    assert e.some? && io_error?(e.unwrap), "error doesn't match"
+  }
+}
+
+test "WriterPersistentCloseError" {
+  # An error from the underlying writer when closing persists across calls.
+  zw = ~new_writer(fail_writer(0), DEFAULT_COMPRESSION)
+  close_err = zw.close!.err
+  flush_err = zw.flush!.err
+  write_err = zw.write!(b("Test")).err
+  for e in [close_err, flush_err, write_err] {
+    assert e.some? && io_error?(e.unwrap), "error doesn't match"
+  }
+  # After closing, writes and flushes fail with WriterClosed; closes don't.
+  zw.reset!(fail_writer(1 << 40))
+  assert zw.close!.ok?, "first call to close returned error"
+  assert zw.close!.ok?, "second call to close returned error"
+  flush_err = zw.flush!.err
+  write_err = zw.write!(b("Test")).err
+  for e in [flush_err, write_err] {
+    assert e.some? && e.unwrap.message == "flate: closed writer", "error doesn't match"
+  }
+}
+
+test "BestSpeedMatch" {
+  # (previous, current, t, s, want)
+  z = ->(n: Int) -> [Byte] {
+    r: [Byte] = [0; n]
+    r
+  }
+  cases: [([Byte], [Byte], Int, Int, Int)] = [
+    ([0, 0, 0, 1, 2], [3, 4, 5, 0, 1, 2, 3, 4, 5], -3, 3, 6),
+    ([0, 0, 0, 1, 2], [2, 4, 5, 0, 1, 2, 3, 4, 5], -3, 3, 3),
+    ([0, 0, 0, 1, 1], [3, 4, 5, 0, 1, 2, 3, 4, 5], -3, 3, 2),
+    ([0, 0, 0, 1, 2], [2, 2, 2, 2, 1, 2, 3, 4, 5], -1, 0, 4),
+    ([0, 0, 0, 1, 2, 3, 4, 5, 2, 2], [2, 2, 2, 2, 1, 2, 3, 4, 5], -7, 4, 5),
+    ([9, 9, 9, 9, 9], [2, 2, 2, 2, 1, 2, 3, 4, 5], -1, 0, 0),
+    ([9, 9, 9, 9, 9], [9, 2, 2, 2, 1, 2, 3, 4, 5], 0, 1, 0),
+    ([], [2, 2, 2, 2, 1, 2, 3, 4, 5], 0, 1, 3),
+    ([3, 4, 5], [3, 4, 5], -3, 0, 3),
+    (z(1000), z(1000), -1000, 0, MAX_MATCH_LENGTH - 4),
+    (z(200), z(500), -200, 0, MAX_MATCH_LENGTH - 4),
+    (z(200), z(500), 0, 1, MAX_MATCH_LENGTH - 4),
+    (z(MAX_MATCH_LENGTH - 4), z(500), -(MAX_MATCH_LENGTH - 4), 0, MAX_MATCH_LENGTH - 4),
+    (z(200), z(500), -200, 400, 100),
+    (z(10), z(500), 200, 400, 100),
+  ]
+  i = 0
+  for c in cases {
+    prev: [Byte] = c[0]
+    cur: [Byte] = c[1]
+    e = new_fast_enc(1)
+    e.add_block!(prev)
+    e.add_block!(cur)
+    got = match_len_limited(c[3] + prev.size, c[2] + prev.size, e.hist[0...e.hist_len])
+    assert got == c[4], "test #{i}: match length, want #{c[4]}, got #{got}"
+    i += 1
+  }
+}
+
+test "BestSpeedMaxMatchOffset" {
+  abc = "abcdefgh"
+  xyz = "stuvwxyz"
+  input_margin = 16 - 1
+  for match_before in [false, true] {
+    for extra in [0, input_margin - 1, input_margin, input_margin + 1, 2 * input_margin] {
+      offset_adj = -5
+      while offset_adj <= 5 {
+        offset = MAX_MATCH_OFFSET + offset_adj
+        # abc, about MAX_MATCH_OFFSET zeros, maybe xyz, abc, 0-30 zeros:
+        # the two abc are `offset` apart.
+        src: [Byte] = [0; offset + abc.size + extra]
+        copy(src, b(abc))
+        copy(src[offset - xyz.size...src.size], b(xyz)) if !match_before
+        copy(src[offset...src.size], b(abc))
+        buf = bytes.new_buffer([])
+        w = ~new_writer(buf, BEST_SPEED)
+        ~w.write!(src)
+        ~w.close!
+        r = new_reader(buf)
+        dst = ~io.read_all(r)
+        ~r.close!
+        assert dst == src, "matchBefore=#{match_before}, extra=#{extra}, offsetAdj=#{offset_adj}: bytes differ after round-tripping"
+        offset_adj += 1
+      }
+    }
+  }
+}
+
+# Whether shifting the offsets keeps the matches and drops those out of
+# range (https://github.com/golang/go/issues/4142).
+test "BestSpeedShiftOffsets" {
+  level = 1
+  while level <= 6 {
+    enc = new_fast_enc(level)
+    # Data that can't have internal matches.
+    test_data = rand_bytes(100, 0, 255)
+    val_or_len = ->(v: Int) -> Int { v == 0 ? test_data.size : v }
+    # Encode with a clean state; the second part should pick up matches
+    # from the first.
+    first = new_tokens()
+    second = new_tokens()
+    first.n = enc.encode!(first, test_data)
+    second.n = enc.encode!(second, test_data)
+    want_first = val_or_len(first.n)
+    want_second = val_or_len(second.n)
+    assert want_first > want_second, "test needs matches between inputs to be generated, #{want_first} == #{want_second}"
+    # Forward the current position to just before the wraparound.
+    enc.hist = []
+    enc.hist_len = 0
+    enc.cur = BUFFER_RESET - test_data.size
+    # Part 1 before the wrap should match the clean state.
+    got_tokens = new_tokens()
+    got_tokens.n = enc.encode!(got_tokens, test_data)
+    got = val_or_len(got_tokens.n)
+    assert want_first == got, "level #{level}: got #{got}, want #{want_first} tokens"
+    # About to wrap.
+    assert enc.cur + enc.hist_len == BUFFER_RESET, "level #{level}: want e.cur to be at bufferReset"
+    # Part 2 should match the clean state as well, even wrapped.
+    got_tokens.reset!
+    got_tokens.n = enc.encode!(got_tokens, test_data)
+    got = val_or_len(got_tokens.n)
+    assert want_second == got, "level #{level}: got #{got}, want #{want_second} tokens"
+    # Wrapped.
+    assert enc.cur < BUFFER_RESET, "level #{level}: want e.cur to be < bufferReset, got #{enc.cur}"
+    # Forward the current buffer, leaving the matches at the bottom.
+    enc.cur = BUFFER_RESET
+    enc.hist = []
+    enc.hist_len = 0
+    # No matches are picked up.
+    got_tokens.reset!
+    got_tokens.n = enc.encode!(got_tokens, test_data)
+    got = val_or_len(got_tokens.n)
+    assert want_first == got, "level #{level}: got #{got}, want #{want_first} tokens"
+    level += 1
+  }
+}
+
+# Go's TestMaxStackSize limits the goroutine stack (debug.SetMaxStack),
+# which alx has no equivalent of; the writes it makes are the same.
+test "MaxStackSize" {
+  bf: [Byte] = [0; 1 << 20]
+  level = HUFFMAN_ONLY
+  while level <= BEST_COMPRESSION {
+    zw = ~new_writer(io.Discard.new, level)
+    n = ~zw.write!(bf)
+    assert n == bf.size, "level #{level}, write = #{n}"
+    ~zw.close!
+    zw.reset!(io.Discard.new)
+    level += 1
+  }
+}
+
+# Not from Go: Go 1.27 writes a corrupt stream here (levels 7-9 put the
+# dictionary in a stored first block); see the header of flate.alx.
+test "WriterDictStoredBlock" {
+  dict = b("hello, world 0123456789 abc")
+  for n in [1000, 30000, 100000] {
+    data = rand_bytes(n, 2, 255)
+    level = -2
+    while level <= 9 {
+      buf = bytes.new_buffer([])
+      w = ~new_writer_dict(buf, level, dict)
+      ~w.write!(data)
+      ~w.close!
+      got = ~io.read_all(new_reader_dict(buf, dict))
+      assert got == data, "n=#{n} level=#{level}: round trip"
+      level += 1
+    }
+  }
+}

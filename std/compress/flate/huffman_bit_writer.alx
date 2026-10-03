@@ -1,0 +1,851 @@
+#![overflow(wrap)]
+# The block writer (Go's huffman_bit_writer.go): encodes tokens and bytes
+# as DEFLATE blocks, reusing a Huffman table across blocks when that is
+# smaller than writing a new one.
+
+# The largest offset code.
+OFFSET_CODE_COUNT = 30
+# The special code that marks the end of a block.
+END_BLOCK_MARKER = 256
+# The first length code.
+LENGTH_CODES_START = 257
+# The number of codegen codes.
+CODEGEN_CODE_COUNT = 19
+BAD_CODE: Byte = 255
+# Below this many tokens, check whether the fixed table is smaller.
+MAX_PREDEFINED_TOKENS = 250
+# Buffered bytes are written once there are this many (a multiple of 6).
+BUFFER_FLUSH_SIZE = 246
+LENGTH_EXTRA_BITS_MIN_CODE = 8
+OFFSET_EXTRA_BITS_MIN_CODE = 4
+
+def new_bit_writer[W](w: W) -> BitWriter[W] {
+  by: [Byte] = [0; 256 + 8]
+  lf: [U16] = [0; LENGTH_CODES_START + 32]
+  of: [U16] = [0; 32]
+  cf: [U16] = [0; CODEGEN_CODE_COUNT]
+  cg: [Byte] = [0; LITERAL_COUNT + OFFSET_CODE_COUNT + 1]
+  huff_off: [U32] = [0; OFFSET_CODE_COUNT]
+  # The offset code for Huffman-only blocks: one used code.
+  huff_off[0] = new_hcode(0, 1)
+  BitWriter[W].new(
+    writer: w,
+    bits: 0,
+    nbits: 0,
+    nbytes: 0,
+    wrote_huffman: false,
+    literal_encoding: new_huffman_encoder(LITERAL_COUNT),
+    tmp_lit_encoding: new_huffman_encoder(LITERAL_COUNT),
+    offset_encoding: new_huffman_encoder(OFFSET_CODE_COUNT),
+    codegen_encoding: new_huffman_encoder(CODEGEN_CODE_COUNT),
+    err: none,
+    prev_header: 0,
+    log_new_table_penalty: 0,
+    bytes: by,
+    literal_freq: lf,
+    offset_freq: of,
+    codegen_freq: cf,
+    codegen: cg,
+    fixed_lit: fixed_literal_codes(),
+    fixed_off: fixed_offset_codes(),
+    huff_off: huff_off
+  )
+}
+
+def store_le64(b: [Byte], i: Int, v: U64) {
+  w = b[i...i + 8]
+  w[0] = v.as_u8
+  w[1] = (v >> 8).as_u8
+  w[2] = (v >> 16).as_u8
+  w[3] = (v >> 24).as_u8
+  w[4] = (v >> 32).as_u8
+  w[5] = (v >> 40).as_u8
+  w[6] = (v >> 48).as_u8
+  w[7] = (v >> 56).as_u8
+}
+
+# Writes DEFLATE blocks to W (Go's huffmanBitWriter).
+struct BitWriter[W] {
+  writer: W
+  # Pending output: bytes[0...nbytes], then the low nbits of bits.
+  bits: U64
+  nbits: Int
+  nbytes: Int
+  # The current table only codes literals (offsets are invalid).
+  wrote_huffman: Bool
+  literal_encoding: HuffmanEncoder
+  tmp_lit_encoding: HuffmanEncoder
+  offset_encoding: HuffmanEncoder
+  codegen_encoding: HuffmanEncoder
+  # A failed write; sticky.
+  err: Error?
+  # Nonzero: the current table may be reused, and an EOB is still owed.
+  prev_header: Int
+  # log2 of the penalty reduction for new tables.
+  log_new_table_penalty: Int
+  bytes: [Byte]
+  literal_freq: [U16]
+  offset_freq: [U16]
+  codegen_freq: [U16]
+  # One extra entry for the end marker.
+  codegen: [Byte]
+  fixed_lit: [U32]
+  fixed_off: [U32]
+  huff_off: [U32]
+
+  def failed? -> Bool { !err.none? }
+
+  def reset!(writer: W) {
+    self.writer = writer
+    self.bits = 0
+    self.nbits = 0
+    self.nbytes = 0
+    self.err = none
+    self.prev_header = 0
+    self.wrote_huffman = false
+    nil
+  }
+
+  def put!(p: [Byte]) -> ~Int { self.writer.~write!(p) }
+
+  # Writes b to the output, ignoring the queued bytes; errors are sticky.
+  def write!(b: [Byte]) {
+    return if failed?
+    r = put!(b)
+    if e = r.err {
+      self.err = e
+    }
+    nil
+  }
+
+  # Whether the current tables can code the tokens of t.
+  def can_reuse?(t: Tokens) -> Bool {
+    oc = offset_encoding.codes
+    i = 0
+    while i < OFFSET_CODE_COUNT {
+      return false if t.off_hist[i] != 0 && oc[i] == 0
+      i += 1
+    }
+    lc = literal_encoding.codes
+    i = 0
+    while i < LITERAL_COUNT - 256 {
+      return false if t.extra_hist[i] != 0 && lc[256 + i] == 0
+      i += 1
+    }
+    i = 0
+    while i < 256 {
+      return false if t.lit_hist[i] != 0 && lc[i] == 0
+      i += 1
+    }
+    true
+  }
+
+  # Writes out the pending bits, with an EOB if the block isn't ended.
+  def flush! {
+    if failed? {
+      self.nbits = 0
+      return
+    }
+    if prev_header > 0 {
+      # We owe an EOB.
+      write_code!(literal_encoding.codes[END_BLOCK_MARKER])
+      self.prev_header = 0
+    }
+    n = nbytes
+    while nbits != 0 {
+      self.bytes[n] = bits.as_u8
+      self.bits = bits >> 8
+      if nbits > 8 {
+        self.nbits -= 8
+      } else {
+        self.nbits = 0
+      }
+      n += 1
+    }
+    self.bits = 0
+    write!(bytes[0...n]) if n > 0
+    self.nbytes = 0
+    nil
+  }
+
+  # Writes the low nb bits of b.
+  def write_bits!(b: U64, nb: Int) {
+    self.bits = bits | (b << (nbits & 63))
+    self.nbits += nb
+    flush_bits! if nbits >= 48
+    nil
+  }
+
+  # Writes bytes directly; the bit stream must be at a byte boundary.
+  def write_bytes!(bs: [Byte]) {
+    return if failed?
+    n = nbytes
+    if nbits & 7 != 0 {
+      self.err = FlateError.Internal(msg: "writeBytes with unfinished bits")
+      return
+    }
+    while nbits != 0 {
+      self.bytes[n] = bits.as_u8
+      self.bits = bits >> 8
+      self.nbits -= 8
+      n += 1
+    }
+    write!(bytes[0...n]) if n != 0
+    self.nbytes = 0
+    write!(bs)
+    nil
+  }
+
+  # RFC 1951 3.2.7's run-length encoding of the literal and offset code
+  # lengths, into codegen (ended by BAD_CODE) and codegen_freq.
+  def generate_codegen!(num_literals: Int, num_offsets: Int, lit_codes: [U32], off_codes: [U32]) {
+    zero_u16(codegen_freq)
+    cg = codegen
+    i = 0
+    while i < num_literals {
+      cg[i] = lit_codes[i].as_u8
+      i += 1
+    }
+    i = 0
+    while i < num_offsets {
+      cg[num_literals + i] = off_codes[i].as_u8
+      i += 1
+    }
+    cg[num_literals + num_offsets] = BAD_CODE
+    size = cg[0]
+    count = 1
+    out_index = 0
+    in_index = 1
+    while size != BAD_CODE {
+      # Invariant: `count` copies of size have no output yet.
+      next_size = cg[in_index]
+      in_index += 1
+      if next_size == size {
+        count += 1
+        next
+      }
+      # Codegen for `count` copies of size.
+      if size != 0 {
+        cg[out_index] = size
+        out_index += 1
+        self.codegen_freq[size.to_i] += 1
+        count -= 1
+        while count >= 3 {
+          n = count < 6 ? count : 6
+          cg[out_index] = 16
+          out_index += 1
+          cg[out_index] = (n - 3).as_u8
+          out_index += 1
+          self.codegen_freq[16] += 1
+          count -= n
+        }
+      } else {
+        while count >= 11 {
+          n = count < 138 ? count : 138
+          cg[out_index] = 18
+          out_index += 1
+          cg[out_index] = (n - 11).as_u8
+          out_index += 1
+          self.codegen_freq[18] += 1
+          count -= n
+        }
+        if count >= 3 {
+          # 3 <= count <= 10
+          cg[out_index] = 17
+          out_index += 1
+          cg[out_index] = (count - 3).as_u8
+          out_index += 1
+          self.codegen_freq[17] += 1
+          count = 0
+        }
+      }
+      count -= 1
+      while count >= 0 {
+        cg[out_index] = size
+        out_index += 1
+        self.codegen_freq[size.to_i] += 1
+        count -= 1
+      }
+      size = next_size
+      count = 1
+    }
+    cg[out_index] = BAD_CODE
+    nil
+  }
+
+  # The number of codegen codes to write.
+  def codegens -> Int {
+    num = CODEGEN_CODE_COUNT
+    while num > 4 && codegen_freq[CODEGEN_ORDER[num - 1]] == 0 {
+      num -= 1
+    }
+    num
+  }
+
+  # The size of the dynamic header with the current encodings, in bits.
+  def header_size -> Int {
+    num = codegens
+    3 + 5 + 5 + 4 + (3 * num) + bit_length(codegen_encoding.codes, codegen_freq) + codegen_freq[16].to_i * 2 + codegen_freq[17].to_i * 3 + codegen_freq[18].to_i * 7
+  }
+
+  # The bits of the data with the given tables (no header).
+  def dynamic_reuse_size(lit_codes: [U32], off_codes: [U32]) -> Int {
+    bit_length(lit_codes, literal_freq) + bit_length(off_codes, offset_freq)
+  }
+
+  # The bits of a dynamic block with the given tables.
+  def dynamic_size(lit_codes: [U32], off_codes: [U32], extra_bits: Int) -> Int {
+    header_size + bit_length(lit_codes, literal_freq) + bit_length(off_codes, offset_freq) + extra_bits
+  }
+
+  # The extra bits written after length and offset codes.
+  def extra_bit_size -> Int {
+    total = 0
+    i = 0
+    while i < LITERAL_COUNT - 257 {
+      total += literal_freq[257 + i].to_i * LENGTH_EXTRA_BITS[i & 31].to_i
+      i += 1
+    }
+    i = 0
+    while i < OFFSET_CODE_COUNT {
+      total += offset_freq[i].to_i * OFFSET_EXTRA_BITS[i & 31].to_i
+      i += 1
+    }
+    total
+  }
+
+  # The bits of a fixed-table block.
+  def fixed_size(extra_bits: Int) -> Int {
+    3 + bit_length(fixed_lit, literal_freq) + bit_length(fixed_off, offset_freq) + extra_bits
+  }
+
+  # The bits of a stored block of `input`, and whether it fits in one.
+  def stored_size(input: [Byte]?) -> (Int, Bool) {
+    if inp = input {
+      return ((inp.size + 5) * 8, true) if inp.size <= MAX_STORE_BLOCK_SIZE
+    }
+    (0, false)
+  }
+
+  def write_code!(c: U32) {
+    self.bits = bits | ((c >> 8).as_u64 << (nbits & 63))
+    self.nbits += (c & 0xff).to_i
+    flush_bits! if nbits >= 48
+    nil
+  }
+
+  # Moves 48 accumulated bits to the byte buffer.
+  def flush_bits! {
+    b = bits
+    self.bits = bits >> 48
+    self.nbits -= 48
+    n = nbytes
+    store_le64(bytes, n, b)
+    n += 6
+    if n >= BUFFER_FLUSH_SIZE {
+      # On an earlier error, nbytes stays (as in Go).
+      return if failed?
+      write!(bytes[0...n])
+      n = 0
+    }
+    self.nbytes = n
+    nil
+  }
+
+  def write_dynamic_header!(num_literals: Int, num_offsets: Int, num_codegens: Int, is_eof: Bool) {
+    return if failed?
+    first_bits: U64 = is_eof ? 5 : 4
+    write_bits!(first_bits, 3)
+    write_bits!((num_literals - 257).as_u64, 5)
+    write_bits!((num_offsets - 1).as_u64, 5)
+    write_bits!((num_codegens - 4).as_u64, 4)
+    i = 0
+    while i < num_codegens {
+      value = hcode_len(codegen_encoding.codes[CODEGEN_ORDER[i]])
+      write_bits!(value.as_u64, 3)
+      i += 1
+    }
+    i = 0
+    loop {
+      code_word = codegen[i].to_i
+      i += 1
+      break if code_word == BAD_CODE.to_i
+      write_code!(codegen_encoding.codes[code_word])
+      if code_word == 16 {
+        write_bits!(codegen[i].as_u64, 2)
+        i += 1
+      } else if code_word == 17 {
+        write_bits!(codegen[i].as_u64, 3)
+        i += 1
+      } else if code_word == 18 {
+        write_bits!(codegen[i].as_u64, 7)
+        i += 1
+      }
+    }
+    nil
+  }
+
+  # A stored block header; an empty final stored block is written as a
+  # fixed block instead (10 bits instead of 5 bytes).
+  def write_stored_header!(length: Int, is_eof: Bool) {
+    return if failed?
+    if prev_header > 0 {
+      # We owe an EOB.
+      write_code!(literal_encoding.codes[END_BLOCK_MARKER])
+      self.prev_header = 0
+    }
+    if length == 0 && is_eof {
+      write_fixed_header!(is_eof)
+      # EOB: 7 bits, value 0.
+      write_bits!(0, 7)
+      flush!
+      return
+    }
+    flag: U64 = is_eof ? 1 : 0
+    write_bits!(flag, 3)
+    flush!
+    write_bits!(length.as_u64, 16)
+    write_bits!((length ^ 0xffff).as_u64 & 0xffff, 16)
+    nil
+  }
+
+  def write_fixed_header!(is_eof: Bool) {
+    return if failed?
+    if prev_header > 0 {
+      # We owe an EOB.
+      write_code!(literal_encoding.codes[END_BLOCK_MARKER])
+      self.prev_header = 0
+    }
+    value: U64 = is_eof ? 3 : 2
+    write_bits!(value, 3)
+    nil
+  }
+
+  # Writes the tokens as one block with the smallest encoding (fixed,
+  # dynamic or stored if `input` is given).
+  def write_block!(tokens: Tokens, eof: Bool, input: [Byte]?) {
+    return if failed?
+    tok = tokens
+    tok.add_eob!
+    if prev_header > 0 {
+      # We owe an EOB.
+      write_code!(literal_encoding.codes[END_BLOCK_MARKER])
+      self.prev_header = 0
+    }
+    num_literals, num_offsets = index_tokens!(tok)
+    generate!
+    extra_bits = 0
+    stored, storable = stored_size(input)
+    extra_bits = extra_bit_size if storable
+    # The fixed table is the baseline.
+    use_fixed = true
+    size = MAX_I32
+    size = fixed_size(extra_bits) if tok.n < MAX_PREDEFINED_TOKENS
+    generate_codegen!(num_literals, num_offsets, literal_encoding.codes, offset_encoding.codes)
+    self.codegen_encoding.generate!(codegen_freq, 7)
+    num_codegens = codegens
+    dyn = dynamic_size(literal_encoding.codes, offset_encoding.codes, extra_bits)
+    if dyn < size {
+      size = dyn
+      use_fixed = false
+    }
+    if storable && stored <= size {
+      write_stored_header!(input_size(input), eof)
+      write_bytes!(input || [])
+      return
+    }
+    if use_fixed {
+      write_fixed_header!(eof)
+      write_tokens!(tok.toks[0...tok.n], fixed_lit, fixed_off)
+    } else {
+      write_dynamic_header!(num_literals, num_offsets, num_codegens, eof)
+      write_tokens!(tok.toks[0...tok.n], literal_encoding.codes, offset_encoding.codes)
+    }
+    nil
+  }
+
+  # Writes the tokens with a dynamic table, reusing the previous one when
+  # that is estimated to be smaller (the block isn't ended unless sync).
+  def write_block_dynamic!(tokens: Tokens, eof: Bool, input: [Byte]?, sync0: Bool) {
+    return if failed?
+    tok = tokens
+    sync = sync0 || eof
+    if sync {
+      tok.add_eob!
+    } else {
+      # Make sure an EOB can always be written.
+      tok.extra_hist[0] = 1
+    }
+    # A Huffman-only table can't be reused, nor one when this is the end.
+    if (wrote_huffman || eof) && prev_header > 0 {
+      write_code!(literal_encoding.codes[END_BLOCK_MARKER])
+      self.prev_header = 0
+      self.wrote_huffman = false
+    }
+    if prev_header > 0 && !can_reuse?(tok) {
+      write_code!(literal_encoding.codes[END_BLOCK_MARKER])
+      self.prev_header = 0
+    }
+    num_literals, num_offsets = index_tokens!(tok)
+    extra_bits = 0
+    ssize, storable = stored_size(input)
+    extra_bits = extra_bit_size if storable || prev_header > 0
+    size = 0
+    # Reuse the previous table?
+    if prev_header > 0 {
+      # The size with a new table, estimated from the previous header size
+      # plus a penalty, as the estimate is for an optimal table.
+      new_size = prev_header + tok.estimated_bits
+      new_size += hcode_len(literal_encoding.codes[END_BLOCK_MARKER]) + (new_size >> log_new_table_penalty)
+      reuse_size = dynamic_reuse_size(literal_encoding.codes, offset_encoding.codes) + extra_bits
+      if new_size < reuse_size {
+        # Write the EOB we owe.
+        write_code!(literal_encoding.codes[END_BLOCK_MARKER])
+        size = new_size
+        self.prev_header = 0
+      } else {
+        size = reuse_size
+      }
+      # Small blocks can be smaller with the fixed table.
+      if tok.n < MAX_PREDEFINED_TOKENS {
+        pre_size = fixed_size(extra_bits) + 7
+        if pre_size < size {
+          if storable && ssize <= size {
+            write_stored_header!(input_size(input), eof)
+            write_bytes!(input || [])
+            return
+          }
+          write_fixed_header!(eof)
+          tok.add_eob! if !sync
+          write_tokens!(tok.toks[0...tok.n], fixed_lit, fixed_off)
+          return
+        }
+      }
+      if storable && ssize <= size {
+        write_stored_header!(input_size(input), eof)
+        write_bytes!(input || [])
+        return
+      }
+    }
+    # A new table.
+    if prev_header == 0 {
+      self.literal_freq[END_BLOCK_MARKER] = 1
+      generate!
+      generate_codegen!(num_literals, num_offsets, literal_encoding.codes, offset_encoding.codes)
+      self.codegen_encoding.generate!(codegen_freq, 7)
+      num_codegens = codegens
+      size = dynamic_size(literal_encoding.codes, offset_encoding.codes, extra_bits)
+      # Fixed or stored, if the table doesn't pay for itself.
+      if tok.n < MAX_PREDEFINED_TOKENS {
+        pre_size = fixed_size(extra_bits)
+        if pre_size <= size {
+          if storable && ssize <= pre_size {
+            write_stored_header!(input_size(input), eof)
+            write_bytes!(input || [])
+            return
+          }
+          write_fixed_header!(eof)
+          tok.add_eob! if !sync
+          write_tokens!(tok.toks[0...tok.n], fixed_lit, fixed_off)
+          return
+        }
+      }
+      if storable && ssize <= size {
+        write_stored_header!(input_size(input), eof)
+        write_bytes!(input || [])
+        return
+      }
+      write_dynamic_header!(num_literals, num_offsets, num_codegens, eof)
+      self.prev_header = header_size if !sync
+      self.wrote_huffman = false
+    }
+    self.prev_header = 0 if sync
+    write_tokens!(tok.toks[0...tok.n], literal_encoding.codes, offset_encoding.codes)
+    nil
+  }
+
+  # Copies the histograms of t into literal_freq / offset_freq; returns the
+  # number of literal and offset codes used.
+  def index_tokens!(t: Tokens) -> (Int, Int) {
+    copy(literal_freq[0...256], t.lit_hist)
+    copy(literal_freq[256...288], t.extra_hist)
+    copy(offset_freq, t.off_hist)
+    return (0, 0) if t.n == 0
+    num_literals = literal_freq.size
+    while literal_freq[num_literals - 1] == 0 {
+      num_literals -= 1
+    }
+    num_offsets = offset_freq.size
+    while num_offsets > 0 && offset_freq[num_offsets - 1] == 0 {
+      num_offsets -= 1
+    }
+    if num_offsets == 0 {
+      # No matches: count one offset so the offset tree can be encoded.
+      self.offset_freq[0] = 1
+      num_offsets = 1
+    }
+    (num_literals, num_offsets)
+  }
+
+  # The literal and offset encodings from the histograms.
+  def generate! {
+    self.literal_encoding.generate!(literal_freq[0...LITERAL_COUNT], 15)
+    self.offset_encoding.generate!(offset_freq[0...OFFSET_CODE_COUNT], 15)
+    nil
+  }
+
+  # Writes tokens with the given codes; a final END_BLOCK_MARKER is written
+  # last.
+  def write_tokens!(tokens: [U32], len_codes: [U32], off_codes: [U32]) {
+    return if failed?
+    return if tokens.size == 0
+    toks = tokens
+    defer_eob = false
+    if toks[toks.size - 1] == END_BLOCK_MARKER.as_u32 {
+      toks = toks[0...toks.size - 1]
+      defer_eob = true
+    }
+    bs = bytes
+    b = bits
+    nb = nbits
+    nby = nbytes
+    for t in toks {
+      if t < 256 {
+        c = len_codes[t.to_i]
+        b = b | ((c >> 8).as_u64 << (nb & 63))
+        nb += (c & 0xff).to_i
+        if nb >= 48 {
+          store_le64(bs, nby, b)
+          b = b >> 48
+          nb -= 48
+          nby += 6
+          if nby >= BUFFER_FLUSH_SIZE {
+            if failed? {
+              return
+            }
+            write!(bs[0...nby])
+            nby = 0
+          }
+        }
+        next
+      }
+      # The length.
+      length = ((t >> LENGTH_SHIFT) & 0xff).to_i
+      len_code = LENGTH_CODES[length].to_i & 31
+      c = len_codes[LENGTH_CODES_START + len_code]
+      b = b | ((c >> 8).as_u64 << (nb & 63))
+      nb += (c & 0xff).to_i
+      if nb >= 48 {
+        store_le64(bs, nby, b)
+        b = b >> 48
+        nb -= 48
+        nby += 6
+        if nby >= BUFFER_FLUSH_SIZE {
+          if failed? {
+            return
+          }
+          write!(bs[0...nby])
+          nby = 0
+        }
+      }
+      if len_code >= LENGTH_EXTRA_BITS_MIN_CODE {
+        extra_length = (length - LENGTH_BASE[len_code].to_i) & 0xff
+        b = b | (extra_length.as_u64 << (nb & 63))
+        nb += LENGTH_EXTRA_BITS[len_code].to_i
+        if nb >= 48 {
+          store_le64(bs, nby, b)
+          b = b >> 48
+          nb -= 48
+          nby += 6
+          if nby >= BUFFER_FLUSH_SIZE {
+            if failed? {
+              return
+            }
+            write!(bs[0...nby])
+            nby = 0
+          }
+        }
+      }
+      # The offset.
+      offset = t & OFFSET_MASK
+      off_code = ((offset >> 16) & 31).to_i
+      c = off_codes[off_code]
+      b = b | ((c >> 8).as_u64 << (nb & 63))
+      nb += (c & 0xff).to_i
+      if nb >= 48 {
+        store_le64(bs, nby, b)
+        b = b >> 48
+        nb -= 48
+        nby += 6
+        if nby >= BUFFER_FLUSH_SIZE {
+          if failed? {
+            return
+          }
+          write!(bs[0...nby])
+          nby = 0
+        }
+      }
+      if off_code >= OFFSET_EXTRA_BITS_MIN_CODE {
+        comb = OFFSET_COMBINED[off_code]
+        b = b | (((offset - (comb >> 8)) & MATCH_OFFSET_ONLY_MASK).as_u64 << (nb & 63))
+        nb += (comb & 0xff).to_i
+        if nb >= 48 {
+          store_le64(bs, nby, b)
+          b = b >> 48
+          nb -= 48
+          nby += 6
+          if nby >= BUFFER_FLUSH_SIZE {
+            if failed? {
+              return
+            }
+            write!(bs[0...nby])
+            nby = 0
+          }
+        }
+      }
+    }
+    self.bits = b
+    self.nbits = nb
+    self.nbytes = nby
+    write_code!(len_codes[END_BLOCK_MARKER]) if defer_eob
+    nil
+  }
+
+  # Writes input as Huffman-coded literals, or stored if that gains little.
+  def write_block_huff!(eof: Bool, input: [Byte], sync: Bool) {
+    return if failed?
+    zero_u16(literal_freq)
+    zero_u16(offset_freq) if !wrote_huffman
+    num_literals = END_BLOCK_MARKER + 1
+    num_offsets = 1
+    # 70 bytes; see https://stackoverflow.com/a/25454430
+    guess_header_size_bits = 70 * 8
+    histogram(input, literal_freq)
+    ssize, storable = stored_size(input)
+    if storable && input.size > 1024 {
+      # Quick check for incompressible content: are all frequencies close
+      # to the average? (This mostly triggers on random data.)
+      abs = 0.0
+      avg = input.size.to_f / 256.0
+      mx = (input.size * 2).to_f
+      i = 0
+      while i < 256 {
+        diff = literal_freq[i].to_i.to_f - avg
+        abs = math.fma(diff, diff, abs)
+        break if abs >= mx
+        i += 1
+      }
+      if abs < mx {
+        # No chance we can compress this.
+        write_stored_header!(input.size, eof)
+        write_bytes!(input)
+        return
+      }
+    }
+    self.literal_freq[END_BLOCK_MARKER] = 1
+    self.tmp_lit_encoding.generate!(literal_freq[0...num_literals], 15)
+    est_bits = can_encode_len(tmp_lit_encoding.codes, literal_freq[0...num_literals])
+    if est_bits < MAX_I32 {
+      est_bits += prev_header
+      est_bits += guess_header_size_bits if prev_header == 0
+      est_bits += est_bits >> log_new_table_penalty
+    }
+    # Store, if we don't get a reasonable improvement.
+    if storable && ssize <= est_bits {
+      write_stored_header!(input.size, eof)
+      write_bytes!(input)
+      return
+    }
+    if prev_header > 0 {
+      reuse_size = can_encode_len(literal_encoding.codes, literal_freq[0...256])
+      if est_bits < reuse_size {
+        # We owe an EOB.
+        write_code!(literal_encoding.codes[END_BLOCK_MARKER])
+        self.prev_header = 0
+      }
+    }
+    if prev_header == 0 {
+      # Use the new table: swap.
+      t = literal_encoding
+      self.literal_encoding = tmp_lit_encoding
+      self.tmp_lit_encoding = t
+      generate_codegen!(num_literals, num_offsets, literal_encoding.codes, huff_off)
+      self.codegen_encoding.generate!(codegen_freq, 7)
+      num_codegens = codegens
+      write_dynamic_header!(num_literals, num_offsets, num_codegens, eof)
+      self.wrote_huffman = true
+      self.prev_header = header_size
+    }
+    encoding = literal_encoding.codes
+    bs = bytes
+    b = bits
+    nb = nbits
+    nby = nbytes
+    # Three codes per round.
+    i = 0
+    n = input.size
+    while n - i > 3 {
+      # At least 48 bits must be free.
+      if nb >= 8 {
+        k = nb >> 3
+        store_le64(bs, nby, b)
+        b = b >> ((k * 8) & 63)
+        nb -= k * 8
+        nby += k
+      }
+      if nby >= BUFFER_FLUSH_SIZE {
+        if failed? {
+          return
+        }
+        write!(bs[0...nby])
+        nby = 0
+      }
+      a = encoding[input[i].to_i]
+      c2 = encoding[input[i + 1].to_i]
+      b = b | ((a >> 8).as_u64 << (nb & 63))
+      b = b | ((c2 >> 8).as_u64 << ((nb + (a & 0xff).to_i) & 63))
+      c3 = encoding[input[i + 2].to_i]
+      nb += (c2 & 0xff).to_i + (a & 0xff).to_i
+      b = b | ((c3 >> 8).as_u64 << (nb & 63))
+      nb += (c3 & 0xff).to_i
+      i += 3
+    }
+    # The rest.
+    while i < n {
+      if nb >= 48 {
+        store_le64(bs, nby, b)
+        b = b >> 48
+        nb -= 48
+        nby += 6
+        if nby >= BUFFER_FLUSH_SIZE {
+          if failed? {
+            return
+          }
+          write!(bs[0...nby])
+          nby = 0
+        }
+      }
+      c = encoding[input[i].to_i]
+      b = b | ((c >> 8).as_u64 << (nb & 63))
+      nb += (c & 0xff).to_i
+      i += 1
+    }
+    self.bits = b
+    self.nbits = nb
+    self.nbytes = nby
+    flush_bits! if nbits >= 48
+    if eof || sync {
+      write_code!(literal_encoding.codes[END_BLOCK_MARKER])
+      self.prev_header = 0
+      self.wrote_huffman = false
+    }
+    nil
+  }
+}
+
+def input_size(input: [Byte]?) -> Int {
+  if inp = input {
+    return inp.size
+  }
+  0
+}

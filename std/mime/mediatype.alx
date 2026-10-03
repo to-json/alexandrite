@@ -1,0 +1,295 @@
+# Media types and their parameters (RFC 1521, 2045, 2183, 2231), after Go's
+# mime/mediatype.go and grammar.go.
+import "strings"
+import "unicode"
+
+UPPER_HEX = "0123456789ABCDEF"
+
+# Whether c is a tspecial of RFC 1521 / 2045.
+def tspecial?(c: Byte) -> Bool {
+  c == 40 || c == 41 || c == 60 || c == 62 || c == 64 || c == 44 || c == 59 || c == 58 || c == 92 || c == 34 || c == 47 || c == 91 || c == 93 || c == 63 || c == 61
+}
+
+# Whether c may appear in a token: a printable ASCII byte that isn't a space
+# or a tspecial.
+def token_char?(c: Byte) -> Bool {
+  c > 32 && c < 127 && !tspecial?(c)
+}
+
+# Whether s is a non-empty token.
+def token?(s: Str) -> Bool {
+  return false if s.size == 0
+  for c in s.bytes {
+    return false unless token_char?(c)
+  }
+  true
+}
+
+# Whether s has a byte outside printable ASCII (tab is fine).
+def needs_encoding?(s: Str) -> Bool {
+  for c in s.bytes {
+    # (a byte >= 0x80 starts a rune > '~', or an invalid one: U+FFFD)
+    return true if (c < 32 || c > 126) && c != 9
+  }
+  false
+}
+
+# The media type `t` and parameters `param` formatted per RFC 2045 and
+# 2616 ("text/html; charset=utf-8"): type and parameter names lower-cased,
+# parameters sorted by name, values quoted when they aren't tokens and
+# RFC 2231-encoded when they aren't ASCII. "" when t or a name isn't a valid
+# token.
+pub def format_media_type(t: Str, param: Map[Str, Str]) -> Str {
+  b = strings.new_builder
+  if ms = strings.cut(t, "/") {
+    major, sub = ms
+    return "" if !token?(major) || !token?(sub)
+    b.write!(strings.to_lower(major))
+    b.write_byte!(47)
+    b.write!(strings.to_lower(sub))
+  } else {
+    return "" unless token?(t)
+    b.write!(strings.to_lower(t))
+  }
+  keys: [Str] = []
+  for k, _ in param {
+    keys << k
+  }
+  for attribute in keys.sort {
+    value = param[attribute] || ""
+    b.write!("; ")
+    return "" unless token?(attribute)
+    b.write!(strings.to_lower(attribute))
+    need_enc = needs_encoding?(value)
+    b.write_byte!(42) if need_enc
+    b.write_byte!(61)
+    if need_enc {
+      b.write!("utf-8''")
+      offset = 0
+      for index in 0...value.size {
+        ch = value[index]
+        if ch <= 32 || ch >= 0x7F || ch == 42 || ch == 39 || ch == 37 || tspecial?(ch) {
+          b.write!(value[offset...index])
+          offset = index + 1
+          b.write_byte!(37)
+          b.write_byte!(UPPER_HEX[ch >> 4])
+          b.write_byte!(UPPER_HEX[ch & 15])
+        }
+      }
+      b.write!(value[offset...value.size])
+      next
+    }
+    if token?(value) {
+      b.write!(value)
+      next
+    }
+    b.write_byte!(34)
+    offset = 0
+    for index in 0...value.size {
+      c = value[index]
+      if c == 34 || c == 92 {
+        b.write!(value[offset...index])
+        offset = index
+        b.write_byte!(92)
+      }
+    }
+    b.write!(value[offset...value.size])
+    b.write_byte!(34)
+  }
+  b.to_s
+}
+
+def check_media_type_disposition(s: Str) -> ~Unit<MimeError> {
+  typ, rest = consume_token(s)
+  fail MimeError.NoMediaType if typ == ""
+  return if rest == ""
+  r = strings.cut_prefix(rest, "/")
+  fail MimeError.NoSlashAfterFirstToken if r.none?
+  subtype, rest2 = consume_token(r || "")
+  fail MimeError.NoTokenAfterSlash if subtype == ""
+  fail MimeError.UnexpectedContentAfterMediaSubtype if rest2 != ""
+}
+
+def trim_left_space(s: Str) -> Str {
+  strings.trim_left_func(s, ->(r: Rune) -> Bool { unicode.is_space(r) })
+}
+
+# Parses a media type value and its optional parameters per RFC 1521: the
+# type (lower case, trimmed) and the parameters (names lower case). RFC 2231
+# continuations and encodings are decoded (us-ascii and utf-8 only). A
+# malformed parameter fails with InvalidMediaParameter, which carries the
+# media type.
+pub def parse_media_type(v: Str) -> ~(Str, Map[Str, Str])<MimeError> {
+  base = v
+  k = strings.index_byte(v, 59)
+  base = v[0...k] if k >= 0
+  mediatype = strings.trim_space(strings.to_lower(base))
+  ~check_media_type_disposition(mediatype)
+  params: Map[Str, Str] = {}
+  # base name -> (piece name -> value) for "name*..." parameters
+  continuation: Map[Str, Map[Str, Str]] = {}
+  rest_v = v[base.size...v.size]
+  while rest_v.size > 0 {
+    rest_v = trim_left_space(rest_v)
+    break if rest_v.size == 0
+    key, value, rest = consume_media_param(rest_v)
+    if key == "" {
+      # Ignore a trailing semicolon.
+      break if strings.trim_space(rest) == ";"
+      fail MimeError.InvalidMediaParameter(mediatype)
+    }
+    if bn = strings.cut(key, "*") {
+      base_name = bn[0]
+      pmap = continuation[base_name] || {}
+      if old = pmap[key] {
+        fail MimeError.DuplicateParamName if old != value
+      }
+      pmap[key] = value
+      continuation[base_name] = pmap
+    } else {
+      if old = params[key] {
+        fail MimeError.DuplicateParamName if old != value
+      }
+      params[key] = value
+    }
+    rest_v = rest
+  }
+  for key, piece_map in continuation {
+    single_part_key = key + "*"
+    if sv = piece_map[single_part_key] {
+      if decv = decode_2231_enc(sv) {
+        params[key] = decv
+      }
+      next
+    }
+    buf = strings.new_builder
+    valid = false
+    n = 0
+    loop {
+      simple_part = "#{key}*#{n}"
+      if pv = piece_map[simple_part] {
+        valid = true
+        buf.write!(pv)
+        n += 1
+        next
+      }
+      ev = piece_map[simple_part + "*"]
+      break if ev.none?
+      valid = true
+      if n == 0 {
+        if decv = decode_2231_enc(ev || "") {
+          buf.write!(decv)
+        }
+      } else {
+        buf.write!(percent_hex_unescape(ev || "") || "")
+      }
+      n += 1
+    }
+    params[key] = buf.to_s if valid
+  }
+  (mediatype, params)
+}
+
+# Decodes an RFC 2231 extended value: charset'language'percent-encoded.
+def decode_2231_enc(v: Str) -> Str? {
+  c1 = strings.cut(v, "'")
+  return none if c1.none?
+  charset, v2 = c1 || ("", "")
+  c2 = strings.cut(v2, "'")
+  return none if c2.none?
+  _, ext_other_vals = c2 || ("", "")
+  cs = strings.to_lower(charset)
+  # Only us-ascii and utf-8 are handled.
+  return none if cs != "us-ascii" && cs != "utf-8"
+  percent_hex_unescape(ext_other_vals)
+}
+
+# The leading token of v and the rest.
+def consume_token(v: Str) -> (Str, Str) {
+  for i in 0...v.size {
+    return (v[0...i], v[i...v.size]) unless token_char?(v[i])
+  }
+  (v, "")
+}
+
+# A token or a quoted string (RFC 2616 2.2) at the start of v, and the rest;
+# ("", v) when there isn't one.
+def consume_value(v: Str) -> (Str, Str) {
+  return ("", "") if v == ""
+  return consume_token(v) if v[0] != 34
+  buf: [Byte] = []
+  i = 1
+  while i < v.size {
+    r = v[i]
+    return (Str.from_bytes(buf), v[i + 1...v.size]) if r == 34
+    # Like MSIE, a backslash escapes only a tspecial: "\a" stays "\a".
+    if r == 92 && i + 1 < v.size && tspecial?(v[i + 1]) {
+      buf << v[i + 1]
+      i += 2
+      next
+    }
+    return ("", v) if r == 13 || r == 10
+    buf << v[i]
+    i += 1
+  }
+  # Unterminated quoted string.
+  ("", v)
+}
+
+# One "; name=value" at the start of v: (name lower-cased, value, rest), or
+# ("", "", v) when there isn't one.
+def consume_media_param(v: Str) -> (Str, Str, Str) {
+  rest = trim_left_space(v)
+  r1 = strings.cut_prefix(rest, ";")
+  return ("", "", v) if r1.none?
+  rest = trim_left_space(r1 || "")
+  param, rest2 = consume_token(rest)
+  param = strings.to_lower(param)
+  return ("", "", v) if param == ""
+  rest = trim_left_space(rest2)
+  r2 = strings.cut_prefix(rest, "=")
+  return ("", "", v) if r2.none?
+  rest = trim_left_space(r2 || "")
+  value, rest3 = consume_value(rest)
+  return ("", "", v) if value == "" && rest3 == rest
+  (param, value, rest3)
+}
+
+def ishex?(c: Byte) -> Bool {
+  (c >= 48 && c <= 57) || (c >= 97 && c <= 102) || (c >= 65 && c <= 70)
+}
+
+def unhex(c: Byte) -> Byte {
+  return c - 48 if c >= 48 && c <= 57
+  return c - 87 if c >= 97 && c <= 102
+  return c - 55 if c >= 65 && c <= 70
+  0
+}
+
+# Decodes %XX escapes; none on a malformed escape.
+def percent_hex_unescape(s: Str) -> Str? {
+  percents = 0
+  i = 0
+  while i < s.size {
+    if s[i] != 37 {
+      i += 1
+      next
+    }
+    percents += 1
+    return none if i + 2 >= s.size || !ishex?(s[i + 1]) || !ishex?(s[i + 2])
+    i += 3
+  }
+  return s if percents == 0
+  t: [Byte] = []
+  i = 0
+  while i < s.size {
+    if s[i] == 37 {
+      t << (unhex(s[i + 1]) << 4 | unhex(s[i + 2]))
+      i += 3
+    } else {
+      t << s[i]
+      i += 1
+    }
+  }
+  Str.from_bytes(t)
+}

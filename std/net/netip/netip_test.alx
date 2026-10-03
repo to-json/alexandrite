@@ -1,0 +1,1225 @@
+# Go's net/netip tests (netip_test.go, netip_pkg_test.go, uint128_test.go,
+# slow_test.go, fuzz_test.go's seed corpus), translated.
+import "slices"
+import "strconv"
+import "strings"
+
+def must_ip(s: Str) -> Addr { must_parse_addr(s) }
+def must_prefix(s: Str) -> Prefix { must_parse_prefix(s) }
+def must_ip_port(s: Str) -> AddrPort { must_parse_addr_port(s) }
+
+def mk_addr(hi: U64, lo: U64, z: Int, zone: Str) -> Addr { Addr.new(hi: hi, lo: lo, z: z, zn: zone) }
+
+def must_ips(strs: [Str]) -> [Addr] {
+  res: [Addr] = []
+  for s in strs {
+    res << must_ip(s)
+  }
+  res
+}
+
+def b16(xs: [Byte]) -> [Byte; 16] {
+  a: [Byte; 16] = [0; 16]
+  for i in 0...xs.size {
+    a[i] = xs[i]
+  }
+  a
+}
+
+def bytes_of(s: Str) -> [Byte] { s.bytes.to_a }
+
+# Summaries for the generated vectors (vec_netip_test.alx).
+def b01(x: Bool) -> Str { x ? "1" : "0" }
+
+def hexs(bs: [Byte]) -> Str {
+  out = ""
+  for c in bs {
+    out = out + hex2(c)
+  }
+  out
+}
+
+def asum(ip: Addr) -> Str {
+  return "invalid" unless ip.valid?
+  flags = b01(ip.is4?) + b01(ip.is6?) + b01(ip.is4in6?) + b01(ip.global_unicast?) + b01(ip.interface_local_multicast?) + b01(ip.link_local_multicast?) + b01(ip.link_local_unicast?) + b01(ip.loopback?) + b01(ip.multicast?) + b01(ip.private?) + b01(ip.unspecified?)
+  "#{ip}|#{ip.string_expanded}|#{ip.bit_len}|#{flags}|#{ip.unmap}|#{ip.next_addr}|#{ip.prev_addr}|#{hexs(ip.marshal_binary)}|#{ip.zone}"
+}
+
+def asum_p(s: Str) -> Str {
+  r = parse_addr(s)
+  r.err? ? "ERR #{r.err.unwrap.message}" : asum(r.unwrap)
+}
+
+def psum(p: Prefix) -> Str {
+  return "invalid" unless p.valid?
+  "#{p}|#{p.bits}|#{p.addr}|#{p.masked}|#{b01(p.single_ip?)}|#{hexs(p.marshal_binary)}"
+}
+
+def psum_p(s: Str) -> Str {
+  r = parse_prefix(s)
+  r.err? ? "ERR #{r.err.unwrap.message}" : psum(r.unwrap)
+}
+
+def psum_ab(a: Str, bits: Int) -> Str {
+  r = must_parse_addr(a).prefix(bits)
+  r.err? ? "ERR #{r.err.unwrap.message}" : psum(r.unwrap)
+}
+
+def apsum_p(s: Str) -> Str {
+  r = parse_addr_port(s)
+  return "ERR #{r.err.unwrap.message}" if r.err?
+  ap = r.unwrap
+  "#{ap}|#{ap.addr}|#{ap.port}|#{hexs(ap.marshal_binary)}"
+}
+
+# ------------------------------------------------------------ slow_test.go
+
+def parse_ipv4_slow(s: Str) -> ~Addr {
+  fs = strings.split(s, ".")
+  fail "netaddr.ParseIP(#{strconv.quote(s)}): invalid IP address" if fs.size != 4
+  ret: [Byte; 4] = [0, 0, 0, 0]
+  for i in 0...4 {
+    ret[i] = ~strconv.parse_uint(fs[i], 10, 8).as_u8
+  }
+  addr_from4(ret)
+}
+
+def parse_word(s: Str) -> ~(Byte, Byte) {
+  fail "parseWord(#{strconv.quote(s)}): invalid word" if s.size > 4
+  ret = ~strconv.parse_uint(s, 16, 16)
+  ((ret >> 8).as_u8, ret.as_u8)
+}
+
+def hex2(b: Byte) -> Str {
+  h = "0123456789abcdef"
+  Str.from_bytes([h[b >> 4], h[b & 15]])
+}
+
+def normalize_ipv6_slow(orig: Str) -> ~Str {
+  s = orig
+  # Find and convert an IPv4 address in the final field, if any.
+  i = strings.last_index(s, ":")
+  fail "netaddr.ParseIP(#{strconv.quote(orig)}): invalid IP address" if i == -1
+  if strings.contains(s[i + 1...s.size], ".") {
+    ip = ~parse_ipv4_slow(s[i + 1...s.size])
+    a4 = ip.as4
+    s = "#{s[0...i]}:#{hex2(a4[0])}#{hex2(a4[1])}:#{hex2(a4[2])}#{hex2(a4[3])}"
+  }
+  # Find and expand a ::, if any.
+  fs = strings.split(s, "::")
+  if fs.size == 2 {
+    lhs = fs[0]
+    rhs = fs[1]
+    # Found a ::, figure out how many zero blocks need to be inserted.
+    nblocks = strings.count(lhs, ":") + strings.count(rhs, ":")
+    nblocks += 1 if lhs != ""
+    nblocks += 1 if rhs != ""
+    fail "netaddr.ParseIP(#{strconv.quote(orig)}): address too long" if nblocks > 7
+    out: [Str] = []
+    # Either side of the :: can be empty. We don't want empty fields to
+    # feature in the final normalized address.
+    out << lhs if lhs != ""
+    for _ in 0...8 - nblocks {
+      out << "0"
+    }
+    out << rhs if rhs != ""
+    s = strings.join(out, ":")
+  } else if fs.size > 2 {
+    # Too many ::
+    fail "netaddr.ParseIP(#{strconv.quote(orig)}): invalid IP address"
+  }
+  s
+}
+
+# The slow-but-readable parser of slow_test.go.
+def parse_ip_slow(s0: Str) -> ~Addr {
+  s = s0
+  # Identify and strip out the zone, if any. There should be 0 or 1 '%'.
+  zone = ""
+  fs = strings.split(s, "%")
+  if fs.size == 2 {
+    s = fs[0]
+    zone = fs[1]
+    fail "netaddr.ParseIP(#{strconv.quote(s)}): no zone after zone specifier" if zone == ""
+  } else if fs.size > 2 {
+    fail "netaddr.ParseIP(#{strconv.quote(s)}): too many zone specifiers"
+  }
+  # IPv4 by itself is easy to do in a helper.
+  if strings.count(s, ":") == 0 {
+    fail "netaddr.ParseIP(#{strconv.quote(s)}): IPv4 addresses cannot have a zone" if zone != ""
+    return ~parse_ipv4_slow(s)
+  }
+  normal = ~normalize_ipv6_slow(s)
+  # At this point, we've normalized the address back into 8 hex fields of
+  # 16 bits each. Parse that.
+  fs = strings.split(normal, ":")
+  fail "netaddr.ParseIP(#{strconv.quote(s)}): wrong size address" if fs.size != 8
+  ret: [Byte; 16] = [0; 16]
+  for i in 0...fs.size {
+    a, b = ~parse_word(fs[i])
+    ret[i * 2] = a
+    ret[i * 2 + 1] = b
+  }
+  addr_from16(ret).with_zone(zone)
+}
+
+# ------------------------------------------------------------ netip_test.go
+
+test "parse addr" {
+  # (in, ip, str, want_err); str "" means in.
+  valid_ips = [
+    # Basic zero IPv4 address.
+    ("0.0.0.0", mk_addr(0, 0xffff00000000, Z4, ""), "", ""),
+    # Basic non-zero IPv4 address.
+    ("192.168.140.255", mk_addr(0, 0xffffc0a88cff, Z4, ""), "", ""),
+    # IPv4 address in windows-style "print all the digits" form.
+    ("010.000.015.001", Addr.new, "", "ParseAddr(\"010.000.015.001\"): IPv4 field has octet with leading zero"),
+    # IPv4 address with a silly amount of leading zeros.
+    ("000001.00000002.00000003.000000004", Addr.new, "", "ParseAddr(\"000001.00000002.00000003.000000004\"): IPv4 field has octet with leading zero"),
+    # 4-in-6 with octet with leading zero
+    ("::ffff:1.2.03.4", Addr.new, "", "ParseAddr(\"::ffff:1.2.03.4\"): IPv4 field has octet with leading zero"),
+    # 4-in-6 with octet with unexpected character
+    ("::ffff:1.2.3.z", Addr.new, "", "ParseAddr(\"::ffff:1.2.3.z\"): unexpected character (at \"z\")"),
+    # Basic zero IPv6 address.
+    ("::", mk_addr(0, 0, Z6, ""), "", ""),
+    # Localhost IPv6.
+    ("::1", mk_addr(0, 1, Z6, ""), "", ""),
+    # Fully expanded IPv6 address.
+    ("fd7a:115c:a1e0:ab12:4843:cd96:626b:430b", mk_addr(0xfd7a115ca1e0ab12, 0x4843cd96626b430b, Z6, ""), "", ""),
+    # IPv6 with elided fields in the middle.
+    ("fd7a:115c::626b:430b", mk_addr(0xfd7a115c00000000, 0x00000000626b430b, Z6, ""), "", ""),
+    # IPv6 with elided fields at the end.
+    ("fd7a:115c:a1e0:ab12:4843:cd96::", mk_addr(0xfd7a115ca1e0ab12, 0x4843cd9600000000, Z6, ""), "", ""),
+    # IPv6 with single elided field at the end.
+    ("fd7a:115c:a1e0:ab12:4843:cd96:626b::", mk_addr(0xfd7a115ca1e0ab12, 0x4843cd96626b0000, Z6, ""), "fd7a:115c:a1e0:ab12:4843:cd96:626b:0", ""),
+    # IPv6 with single elided field in the middle.
+    ("fd7a:115c:a1e0::4843:cd96:626b:430b", mk_addr(0xfd7a115ca1e00000, 0x4843cd96626b430b, Z6, ""), "fd7a:115c:a1e0:0:4843:cd96:626b:430b", ""),
+    # IPv6 with the trailing 32 bits written as IPv4 dotted decimal. (4in6)
+    ("::ffff:192.168.140.255", mk_addr(0, 0x0000ffffc0a88cff, Z6, ""), "::ffff:192.168.140.255", ""),
+    # IPv6 with a zone specifier.
+    ("fd7a:115c:a1e0:ab12:4843:cd96:626b:430b%eth0", mk_addr(0xfd7a115ca1e0ab12, 0x4843cd96626b430b, Z6, "eth0"), "", ""),
+    # IPv6 with dotted decimal and zone specifier.
+    ("1:2::ffff:192.168.140.255%eth1", mk_addr(0x0001000200000000, 0x0000ffffc0a88cff, Z6, "eth1"), "1:2::ffff:c0a8:8cff%eth1", ""),
+    # 4-in-6 with zone
+    ("::ffff:192.168.140.255%eth1", mk_addr(0, 0x0000ffffc0a88cff, Z6, "eth1"), "::ffff:192.168.140.255%eth1", ""),
+    # IPv6 with capital letters.
+    ("FD9E:1A04:F01D::1", mk_addr(0xfd9e1a04f01d0000, 0x1, Z6, ""), "fd9e:1a04:f01d::1", ""),
+  ]
+  for t in valid_ips {
+    input = t[0]
+    r = parse_addr(input)
+    if r.err? {
+      assert_eq r.err.unwrap.message, t[3]
+      next
+    }
+    assert t[3] == "", "wanted error #{t[3]}; got none"
+    got = r.unwrap
+    assert_eq got, t[1]
+    # Check that ParseAddr is a pure function.
+    assert_eq parse_addr(input).unwrap, got
+    # Check that ParseAddr(ip.String()) is the identity function.
+    assert_eq parse_addr(got.to_s).unwrap, got
+    # Check that the slow-but-readable parser produces the same result.
+    assert_eq parse_ip_slow(input).unwrap, got
+    # Check that the parsed IP formats as expected.
+    wants = t[2] == "" ? input : t[2]
+    assert_eq got.to_s, wants
+    # Check that AppendTo matches MarshalText.
+    assert_eq got.append_to([]), got.marshal_text
+    # MarshalText / UnmarshalText work like ParseAddr / String (Go checks
+    # this through encoding/json).
+    assert_eq unmarshal_addr_text(bytes_of(input)).unwrap, got
+    assert_eq Str.from_bytes(got.marshal_text), wants
+  }
+
+  invalid_ips = [
+    "",    # Empty string
+    "bad", # Garbage non-IP
+    # Single number. Some parsers accept this as an IPv4 address in
+    # big-endian uint32 form, but we don't.
+    "1234",
+    "1.2.3.4%eth0", # IPv4 with a zone specifier
+    # IPv4 field must have at least one digit
+    ".1.2.3",
+    "1.2.3.",
+    "1..2.3",
+    "1.2.3.4.5",           # IPv4 address too long
+    "0300.0250.0214.0377", # IPv4 in dotted octal form
+    "0xc0.0xa8.0x8c.0xff", # IPv4 in dotted hex form
+    "192.168.12345",       # IPv4 in class B form
+    # IPv4 in class B form, with a small enough number to be parseable as
+    # a regular dotted decimal field.
+    "127.0.1",
+    "192.1234567", # IPv4 in class A form
+    # IPv4 in class A form, with a small enough number to be parseable as
+    # a regular dotted decimal field.
+    "127.1",
+    "192.168.300.1",      # IPv4 field has value >255
+    "192.168.0.1.5.6",    # IPv4 with too many fields
+    "1:2:3:4:5:6:7",      # IPv6 with not enough fields
+    "1:2:3:4:5:6:7:8:9",  # IPv6 with too many fields
+    "1:2:3:4::5:6:7:8",   # IPv6 with 8 fields and a :: expander
+    "fe801::1",           # IPv6 with a field bigger than 2b
+    "fe80:tail:scal:e::", # IPv6 with non-hex values in field
+    "fe80::1%",           # IPv6 with a zone delimiter but no zone.
+    # IPv6 (without ellipsis) with too many fields for trailing embedded IPv4.
+    "ffff:ffff:ffff:ffff:ffff:ffff:ffff:192.168.140.255",
+    # IPv6 (with ellipsis) with too many fields for trailing embedded IPv4.
+    "ffff::ffff:ffff:ffff:ffff:ffff:ffff:192.168.140.255",
+    "::ffff:192.168.140.bad",       # IPv6 with invalid embedded IPv4.
+    "fe80::1::1",                   # IPv6 with multiple ellipsis ::.
+    "fe80:1?:1",                    # IPv6 with invalid non hex/colon character.
+    "fe80:",                        # IPv6 with truncated bytes after single colon.
+    "0:0:0:0:0:ffff:0:00000",       # IPv6 with 5 zeros in last group
+    "0:0:0:0:00000:ffff:127.1.2.3", # IPv6 with 5 zeros in one group and embedded IPv4
+  ]
+  for s in invalid_ips {
+    assert parse_addr(s).err?, "parse_addr(#{s}) want error"
+    assert parse_ip_slow(s).err?, "parse_ip_slow(#{s}) want error"
+    next if s == ""
+    assert unmarshal_addr_text(bytes_of(s)).err?, "unmarshal_addr_text(#{s}) want error"
+  }
+}
+
+test "addr from slice" {
+  tests: [([Byte], Addr?)] = [
+    ([10, 0, 0, 1], must_ip("10.0.0.1")),
+    ([0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01], must_ip("fe80::01")),
+    ([0, 1, 2], none),
+    ([], none),
+  ]
+  for t in tests {
+    got = addr_from_slice(t[0])
+    assert_eq got.present?, t[1].present?
+    if g = got {
+      assert_eq g, t[1] || Addr.new
+    }
+  }
+}
+
+test "ipv4 constructors" {
+  assert_eq addr_from4([1, 2, 3, 4]), must_parse_addr("1.2.3.4")
+}
+
+test "addr append text" {
+  tests = [
+    (Addr.new, ""), # zero IP
+    (must_ip("1.2.3.4"), "1.2.3.4"),
+    (must_ip("fd7a:115c:a1e0:ab12:4843:cd96:626b:430b"), "fd7a:115c:a1e0:ab12:4843:cd96:626b:430b"),
+    (must_ip("::ffff:192.168.140.255"), "::ffff:192.168.140.255"),
+    (must_ip("::ffff:192.168.140.255%en0"), "::ffff:192.168.140.255%en0"),
+  ]
+  for t in tests {
+    mt: [Byte] = [0, 0, 0, 0]
+    mt = t[0].append_text(mt)
+    assert_eq Str.from_bytes(mt[4...mt.size]), t[1]
+  }
+}
+
+test "addr marshal unmarshal binary" {
+  tests = [("", 0), ("1.2.3.4", 4), ("fd7a:115c:a1e0:ab12:4843:cd96:626b:430b", 16), ("::ffff:c000:0280", 16), ("::ffff:c000:0280%eth0", 20)]
+  for t in tests {
+    ip = t[0].size > 0 ? must_ip(t[0]) : Addr.new
+    b = ip.marshal_binary
+    assert_eq b.size, t[1]
+    assert_eq unmarshal_addr_binary(b).unwrap, ip
+    ba: [Byte] = [0, 0, 0, 0]
+    ba = ip.append_binary(ba)
+    ba = ba[4...ba.size]
+    assert_eq ba.size, t[1]
+    assert_eq unmarshal_addr_binary(ba).unwrap, ip
+  }
+  # Cannot unmarshal from unexpected IP length.
+  for n in [3, 5] {
+    ones: [Byte] = [1; n]
+    assert unmarshal_addr_binary(ones).err?, "unmarshaled from unexpected IP length #{n}"
+  }
+}
+
+test "addr port marshal text string" {
+  tests = [
+    (must_ip_port("1.2.3.4:80"), "1.2.3.4:80"),
+    (must_ip_port("[::]:80"), "[::]:80"),
+    (must_ip_port("[1::CAFE]:80"), "[1::cafe]:80"),
+    (must_ip_port("[1::CAFE%en0]:80"), "[1::cafe%en0]:80"),
+    (must_ip_port("[::FFFF:192.168.140.255]:80"), "[::ffff:192.168.140.255]:80"),
+    (must_ip_port("[::FFFF:192.168.140.255%en0]:80"), "[::ffff:192.168.140.255%en0]:80"),
+  ]
+  for t in tests {
+    assert_eq t[0].to_s, t[1]
+    assert_eq Str.from_bytes(t[0].marshal_text), t[1]
+    mt: [Byte] = [0, 0, 0, 0]
+    mt = t[0].append_text(mt)
+    assert_eq Str.from_bytes(mt[4...mt.size]), t[1]
+  }
+}
+
+test "addr port marshal unmarshal binary" {
+  tests = [("1.2.3.4:51820", 4 + 2), ("[fd7a:115c:a1e0:ab12:4843:cd96:626b:430b]:80", 16 + 2), ("[::ffff:c000:0280]:65535", 16 + 2), ("[::ffff:c000:0280%eth0]:1", 20 + 2)]
+  for t in tests {
+    ipport = t[0].size > 0 ? must_ip_port(t[0]) : AddrPort.new
+    b = ipport.marshal_binary
+    assert_eq b.size, t[1]
+    assert_eq unmarshal_addr_port_binary(b).unwrap, ipport
+    ba: [Byte] = [0, 0, 0, 0]
+    ba = ipport.append_binary(ba)
+    ba = ba[4...ba.size]
+    assert_eq ba.size, t[1]
+    assert_eq unmarshal_addr_port_binary(ba).unwrap, ipport
+  }
+  # Cannot unmarshal from unexpected lengths.
+  for n in [3, 7] {
+    ones: [Byte] = [1; n]
+    assert unmarshal_addr_port_binary(ones).err?, "unmarshaled from unexpected length #{n}"
+  }
+}
+
+test "prefix marshal text string" {
+  tests = [
+    (must_prefix("1.2.3.4/24"), "1.2.3.4/24"),
+    (must_prefix("fd7a:115c:a1e0:ab12:4843:cd96:626b:430b/118"), "fd7a:115c:a1e0:ab12:4843:cd96:626b:430b/118"),
+    (must_prefix("::ffff:c000:0280/96"), "::ffff:192.0.2.128/96"),
+    (must_prefix("::ffff:192.168.140.255/8"), "::ffff:192.168.140.255/8"),
+    (prefix_from(must_ip("::ffff:c000:0280").with_zone("eth0"), 37), "::ffff:192.0.2.128/37"), # Zone should be stripped
+  ]
+  for t in tests {
+    assert_eq t[0].to_s, t[1]
+    assert_eq Str.from_bytes(t[0].marshal_text), t[1]
+    mt: [Byte] = [0, 0, 0, 0]
+    mt = t[0].append_text(mt)
+    assert_eq Str.from_bytes(mt[4...mt.size]), t[1]
+  }
+}
+
+test "prefix marshal unmarshal binary" {
+  tests = [
+    (must_prefix("1.2.3.4/24"), 4 + 1),
+    (must_prefix("fd7a:115c:a1e0:ab12:4843:cd96:626b:430b/118"), 16 + 1),
+    (must_prefix("::ffff:c000:0280/96"), 16 + 1),
+    (prefix_from(must_ip("::ffff:c000:0280").with_zone("eth0"), 37), 16 + 1), # Zone should be stripped
+  ]
+  tests << (prefix_from(tests[0][0].addr, 33), tests[0][1])
+  tests << (prefix_from(tests[1][0].addr, 129), tests[1][1])
+  for t in tests {
+    prefix = t[0]
+    b = prefix.marshal_binary
+    assert_eq b.size, t[1]
+    assert_eq unmarshal_prefix_binary(b).unwrap, prefix
+    ba: [Byte] = [0, 0, 0, 0]
+    ba = prefix.append_binary(ba)
+    ba = ba[4...ba.size]
+    assert_eq ba.size, t[1]
+    assert_eq unmarshal_prefix_binary(ba).unwrap, prefix
+  }
+  # Cannot unmarshal from unexpected lengths.
+  for n in [3, 6] {
+    ones: [Byte] = [1; n]
+    assert unmarshal_prefix_binary(ones).err?, "unmarshaled from unexpected length #{n}"
+  }
+}
+
+test "addr marshal unmarshal" {
+  # Only the cases where marshaling diverges from parse_addr / to_s: an
+  # empty text is the zero Addr, and the zero Addr marshals to "".
+  ip = unmarshal_addr_text([]).unwrap
+  assert_eq ip, Addr.new
+  assert_eq ip.marshal_text.size, 0
+}
+
+test "addr from16" {
+  assert_eq addr_from16(b16([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1])), mk_addr(0, 1, Z6, "")
+  assert_eq addr_from16(b16([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 1, 2, 3, 4])), mk_addr(0, 0xffff01020304, Z6, "")
+}
+
+test "ip properties" {
+  nil_ip = Addr.new
+  unicast4 = must_ip("192.0.2.1")
+  unicast6 = must_ip("2001:db8::1")
+  unicast_zone6 = must_ip("2001:db8::1%eth0")
+  unicast6_unassigned = must_ip("4000::1") # not in 2000::/3.
+  multicast4 = must_ip("224.0.0.1")
+  multicast6 = must_ip("ff02::1")
+  multicast_zone6 = must_ip("ff02::1%eth0")
+  llu4 = must_ip("169.254.0.1")
+  llu6 = must_ip("fe80::1")
+  llu6_last = must_ip("febf:ffff:ffff:ffff:ffff:ffff:ffff:ffff")
+  llu_zone6 = must_ip("fe80::1%eth0")
+  loopback4 = must_ip("127.0.0.1")
+  ilm6 = must_ip("ff01::1")
+  ilm_zone6 = must_ip("ff01::1%eth0")
+  private4a = must_ip("10.0.0.1")
+  private4b = must_ip("172.16.0.1")
+  private4c = must_ip("192.168.1.1")
+  private6 = must_ip("fd00::1")
+  private6mapped4a = must_ip("::ffff:10.0.0.1")
+  private6mapped4b = must_ip("::ffff:172.16.0.1")
+  private6mapped4c = must_ip("::ffff:192.168.1.1")
+  # (name, ip, globalUnicast, interfaceLocalMulticast, linkLocalMulticast,
+  #  linkLocalUnicast, loopback, multicast, private, unspecified)
+  tests = [
+    ("nil", nil_ip, false, false, false, false, false, false, false, false),
+    ("unicast v4Addr", unicast4, true, false, false, false, false, false, false, false),
+    ("unicast v6 mapped v4Addr", addr_from16(unicast4.as16), true, false, false, false, false, false, false, false),
+    ("unicast v6Addr", unicast6, true, false, false, false, false, false, false, false),
+    ("unicast v6AddrZone", unicast_zone6, true, false, false, false, false, false, false, false),
+    ("unicast v6Addr unassigned", unicast6_unassigned, true, false, false, false, false, false, false, false),
+    ("multicast v4Addr", multicast4, false, false, true, false, false, true, false, false),
+    ("multicast v6 mapped v4Addr", addr_from16(multicast4.as16), false, false, true, false, false, true, false, false),
+    ("multicast v6Addr", multicast6, false, false, true, false, false, true, false, false),
+    ("multicast v6AddrZone", multicast_zone6, false, false, true, false, false, true, false, false),
+    ("link-local unicast v4Addr", llu4, false, false, false, true, false, false, false, false),
+    ("link-local unicast v6 mapped v4Addr", addr_from16(llu4.as16), false, false, false, true, false, false, false, false),
+    ("link-local unicast v6Addr", llu6, false, false, false, true, false, false, false, false),
+    ("link-local unicast v6Addr upper bound", llu6_last, false, false, false, true, false, false, false, false),
+    ("link-local unicast v6AddrZone", llu_zone6, false, false, false, true, false, false, false, false),
+    ("loopback v4Addr", loopback4, false, false, false, false, true, false, false, false),
+    ("loopback v6Addr", ipv6_loopback, false, false, false, false, true, false, false, false),
+    ("loopback v6 mapped v4Addr", addr_from16(ipv6_loopback.as16), false, false, false, false, true, false, false, false),
+    ("interface-local multicast v6Addr", ilm6, false, true, false, false, false, true, false, false),
+    ("interface-local multicast v6AddrZone", ilm_zone6, false, true, false, false, false, true, false, false),
+    ("private v4Addr 10/8", private4a, true, false, false, false, false, false, true, false),
+    ("private v4Addr 172.16/12", private4b, true, false, false, false, false, false, true, false),
+    ("private v4Addr 192.168/16", private4c, true, false, false, false, false, false, true, false),
+    ("private v6Addr", private6, true, false, false, false, false, false, true, false),
+    ("private v6 mapped v4Addr 10/8", private6mapped4a, true, false, false, false, false, false, true, false),
+    ("private v6 mapped v4Addr 172.16/12", private6mapped4b, true, false, false, false, false, false, true, false),
+    ("private v6 mapped v4Addr 192.168/16", private6mapped4c, true, false, false, false, false, false, true, false),
+    ("unspecified v4Addr", ipv4_unspecified, false, false, false, false, false, false, false, true),
+    ("unspecified v6Addr", ipv6_unspecified, false, false, false, false, false, false, false, true),
+  ]
+  for t in tests {
+    ip = t[1]
+    assert ip.global_unicast? == t[2], "global_unicast?(#{t[0]})"
+    assert ip.interface_local_multicast? == t[3], "interface_local_multicast?(#{t[0]})"
+    assert ip.link_local_multicast? == t[4], "link_local_multicast?(#{t[0]})"
+    assert ip.link_local_unicast? == t[5], "link_local_unicast?(#{t[0]})"
+    assert ip.loopback? == t[6], "loopback?(#{t[0]})"
+    assert ip.multicast? == t[7], "multicast?(#{t[0]})"
+    assert ip.private? == t[8], "private?(#{t[0]})"
+    assert ip.unspecified? == t[9], "unspecified?(#{t[0]})"
+  }
+}
+
+test "addr well known" {
+  # (Go compares with net's IPv4zero, IPv6linklocalallnodes, ... String.)
+  assert_eq ipv4_unspecified.to_s, "0.0.0.0"
+  assert_eq ipv6_link_local_all_nodes.to_s, "ff02::1"
+  assert_eq ipv6_link_local_all_routers.to_s, "ff02::2"
+  assert_eq ipv6_loopback.to_s, "::1"
+  assert_eq ipv6_unspecified.to_s, "::"
+}
+
+test "addr less compare" {
+  tests = [
+    (Addr.new, Addr.new, false),
+    (Addr.new, must_ip("1.2.3.4"), true),
+    (must_ip("1.2.3.4"), Addr.new, false),
+    (must_ip("1.2.3.4"), must_ip("0102:0304::0"), true),
+    (must_ip("0102:0304::0"), must_ip("1.2.3.4"), false),
+    (must_ip("1.2.3.4"), must_ip("1.2.3.4"), false),
+    (must_ip("::1"), must_ip("::2"), true),
+    (must_ip("::1"), must_ip("::1%foo"), true),
+    (must_ip("::1%foo"), must_ip("::2"), true),
+    (must_ip("::2"), must_ip("::3"), true),
+    (must_ip("::"), must_ip("0.0.0.0"), false),
+    (must_ip("0.0.0.0"), must_ip("::"), true),
+    (must_ip("::1%a"), must_ip("::1%b"), true),
+    (must_ip("::1%a"), must_ip("::1%a"), false),
+    (must_ip("::1%b"), must_ip("::1%a"), false),
+    # Issue 68113: an IPv4 address and a v4-mapped IPv6 address differing
+    # only in their kind are unequal.
+    (must_ip("::ffff:11.1.1.12"), must_ip("11.1.1.12"), false),
+  ]
+  for t in tests {
+    a = t[0]
+    b = t[1]
+    got = a.less?(b)
+    assert_eq got, t[2]
+    c = a.compare(b)
+    assert c == -1, "less?(#{a}, #{b}) = true, but compare = #{c}" if got
+    assert c >= -1 && c <= 1, "bogus compare #{c}"
+    assert a == b, "compare(#{a}, #{b}) = 0 but not equal" if c == 0
+    assert b.less?(a), "compare(#{a}, #{b}) = 1 but b.less?(a) isn't true" if c == 1
+    # Also check inverse.
+    assert !b.less?(a), "less? both ways: #{a}, #{b}" if got == t[2] && got
+    assert (c == 0) == (a == b)
+  }
+  # And just sort.
+  values = [must_ip("::1"), must_ip("::2"), Addr.new, must_ip("1.2.3.4"), must_ip("8.8.8.8"), must_ip("::1%foo")]
+  slices.sort_func(values) { |a, b| a.compare(b) }
+  assert_eq "#{values}", "[invalid IP 1.2.3.4 8.8.8.8 ::1 ::1%foo ::2]"
+}
+
+test "addr port compare" {
+  tests = [
+    (AddrPort.new, AddrPort.new, 0),
+    (AddrPort.new, must_ip_port("1.2.3.4:80"), -1),
+    (must_ip_port("1.2.3.4:80"), must_ip_port("1.2.3.4:80"), 0),
+    (must_ip_port("[::1]:80"), must_ip_port("[::1]:80"), 0),
+    (must_ip_port("1.2.3.4:80"), must_ip_port("2.3.4.5:22"), -1),
+    (must_ip_port("[::1]:80"), must_ip_port("[::2]:22"), -1),
+    (must_ip_port("1.2.3.4:80"), must_ip_port("1.2.3.4:443"), -1),
+    (must_ip_port("[::1]:80"), must_ip_port("[::1]:443"), -1),
+    (must_ip_port("1.2.3.4:80"), must_ip_port("[0102:0304::0]:80"), -1),
+  ]
+  for t in tests {
+    got = t[0].compare(t[1])
+    assert_eq got, t[2]
+    # Also check inverse.
+    assert_eq t[1].compare(t[0]), -1 * t[2]
+  }
+  # And just sort.
+  values = [must_ip_port("[::1]:80"), must_ip_port("[::2]:80"), AddrPort.new, must_ip_port("1.2.3.4:443"), must_ip_port("8.8.8.8:8080"), must_ip_port("[::1%foo]:1024")]
+  slices.sort_func(values) { |a, b| a.compare(b) }
+  assert_eq "#{values}", "[invalid AddrPort 1.2.3.4:443 8.8.8.8:8080 [::1]:80 [::1%foo]:1024 [::2]:80]"
+}
+
+test "prefix compare" {
+  tests = [
+    (Prefix.new, Prefix.new, 0),
+    (Prefix.new, must_prefix("1.2.3.0/24"), -1),
+    (must_prefix("1.2.3.0/24"), must_prefix("1.2.3.0/24"), 0),
+    (must_prefix("fe80::/64"), must_prefix("fe80::/64"), 0),
+    (must_prefix("1.2.3.0/24"), must_prefix("1.2.4.0/24"), -1),
+    (must_prefix("fe80::/64"), must_prefix("fe90::/64"), -1),
+    (must_prefix("1.2.0.0/16"), must_prefix("1.2.0.0/24"), -1),
+    (must_prefix("fe80::/48"), must_prefix("fe80::/64"), -1),
+    (must_prefix("1.2.3.0/24"), must_prefix("fe80::/8"), -1),
+    (must_prefix("1.2.3.0/24"), must_prefix("1.2.3.4/24"), -1),
+    (must_prefix("1.2.3.0/24"), must_prefix("1.2.3.0/28"), -1),
+  ]
+  for t in tests {
+    assert_eq t[0].compare(t[1]), t[2]
+    # Also check inverse.
+    assert_eq t[1].compare(t[0]), -1 * t[2]
+  }
+  # And just sort.
+  values = [must_prefix("1.2.3.0/24"), must_prefix("fe90::/64"), must_prefix("fe80::/64"), must_prefix("1.2.0.0/16"), Prefix.new, must_prefix("fe80::/48"), must_prefix("1.2.0.0/24"), must_prefix("1.2.3.4/24"), must_prefix("1.2.3.0/28")]
+  slices.sort_func(values) { |a, b| a.compare(b) }
+  assert_eq "#{values}", "[invalid Prefix 1.2.0.0/16 1.2.0.0/24 1.2.3.0/24 1.2.3.4/24 1.2.3.0/28 fe80::/48 fe80::/64 fe90::/64]"
+  # Lists from IANA's IPv4 special registry and IPv6 address space, to
+  # verify that the sort order matches IANA's conventional ordering.
+  iana = ["0.0.0.0/8", "127.0.0.0/8", "10.0.0.0/8", "203.0.113.0/24", "169.254.0.0/16", "192.0.0.0/24", "240.0.0.0/4", "192.0.2.0/24", "192.0.0.170/32", "198.18.0.0/15", "192.0.0.8/32", "0.0.0.0/32", "192.0.0.9/32", "198.51.100.0/24", "192.168.0.0/16", "192.0.0.10/32", "192.175.48.0/24", "192.52.193.0/24", "100.64.0.0/10", "255.255.255.255/32", "192.31.196.0/24", "172.16.0.0/12", "192.0.0.0/29", "192.88.99.0/24", "fec0::/10", "6000::/3", "fe00::/9", "8000::/3", "0000::/8", "0400::/6", "f800::/6", "e000::/4", "ff00::/8", "a000::/3", "fc00::/7", "1000::/4", "0800::/5", "4000::/3", "0100::/8", "c000::/3", "fe80::/10", "0200::/7", "f000::/5", "2000::/3"]
+  values = []
+  for s in iana {
+    values << must_prefix(s)
+  }
+  slices.sort_func(values) { |a, b| a.compare(b) }
+  assert_eq "#{values}", "[0.0.0.0/8 0.0.0.0/32 10.0.0.0/8 100.64.0.0/10 127.0.0.0/8 169.254.0.0/16 172.16.0.0/12 192.0.0.0/24 192.0.0.0/29 192.0.0.8/32 192.0.0.9/32 192.0.0.10/32 192.0.0.170/32 192.0.2.0/24 192.31.196.0/24 192.52.193.0/24 192.88.99.0/24 192.168.0.0/16 192.175.48.0/24 198.18.0.0/15 198.51.100.0/24 203.0.113.0/24 240.0.0.0/4 255.255.255.255/32 ::/8 100::/8 200::/7 400::/6 800::/5 1000::/4 2000::/3 4000::/3 6000::/3 8000::/3 a000::/3 c000::/3 e000::/4 f000::/5 f800::/6 fc00::/7 fe00::/9 fe80::/10 fec0::/10 ff00::/8]"
+}
+
+test "ip string expanded" {
+  tests = [
+    (Addr.new, "invalid IP"),
+    (must_ip("192.0.2.1"), "192.0.2.1"),
+    (must_ip("::ffff:192.0.2.1"), "0000:0000:0000:0000:0000:ffff:c000:0201"),
+    (must_ip("2001:db8::1"), "2001:0db8:0000:0000:0000:0000:0000:0001"),
+    (must_ip("2001:db8::1%eth0"), "2001:0db8:0000:0000:0000:0000:0000:0001%eth0"),
+  ]
+  for t in tests {
+    assert_eq t[0].string_expanded, t[1]
+  }
+}
+
+# (ip, bits, p, ok) subtests of TestPrefixMasking for IPv6 with a zone.
+def masking_ipv6(zone0: Str) -> [(Addr, Int, Prefix, Bool)] {
+  zone = zone0 == "" ? "" : "%" + zone0
+  [
+    (must_ip("2001:db8::1#{zone}"), 255, Prefix.new, false),
+    (must_ip("2001:db8::1#{zone}"), 32, must_prefix("2001:db8::/32"), true),
+    (must_ip("fe80::dead:beef:dead:beef#{zone}"), 96, must_prefix("fe80::dead:beef:0:0/96"), true),
+    (must_ip("aaaa::#{zone}"), 4, must_prefix("a000::/4"), true),
+    (must_ip("::#{zone}"), 63, must_prefix("::/63"), true),
+  ]
+}
+
+test "prefix masking" {
+  families = [
+    # nil
+    [(Addr.new, 255, Prefix.new, true), (Addr.new, 16, Prefix.new, true)],
+    # IPv4
+    [
+      (must_ip("192.0.2.0"), 255, Prefix.new, false),
+      (must_ip("192.0.2.0"), 16, must_prefix("192.0.0.0/16"), true),
+      (must_ip("255.255.255.255"), 20, must_prefix("255.255.240.0/20"), true),
+      # Partially masking one byte that contains both 1s and 0s on either
+      # side of the mask limit.
+      (must_ip("100.98.156.66"), 10, must_prefix("100.64.0.0/10"), true),
+    ],
+    masking_ipv6(""),
+    masking_ipv6("eth0"),
+  ]
+  for subtests in families {
+    for st in subtests {
+      orig = st[0].to_s
+      r = st[0].prefix(st[1])
+      assert r.ok? == st[3], "prefix(#{st[0]}, #{st[1]}): ok #{r.ok?}"
+      next if r.err?
+      assert_eq r.unwrap, st[2]
+      # Ensure st.ip is not mutated.
+      assert_eq st[0].to_s, orig
+    }
+  }
+}
+
+test "prefix marshal unmarshal" {
+  for s in ["", "1.2.3.4/32", "0.0.0.0/0", "::/0", "::1/128", "2001:db8::/32"] {
+    p = unmarshal_prefix_text(bytes_of(s)).unwrap
+    assert_eq Str.from_bytes(p.marshal_text), s
+  }
+}
+
+test "prefix unmarshal text non zero" {
+  assert unmarshal_prefix_text(bytes_of("xxx")).err?
+}
+
+test "is4 and is6" {
+  tests = [
+    (Addr.new, false, false),
+    (must_ip("1.2.3.4"), true, false),
+    (must_ip("127.0.0.2"), true, false),
+    (must_ip("::1"), false, true),
+    (must_ip("::ffff:192.0.2.128"), false, true),
+    (must_ip("::fffe:c000:0280"), false, true),
+    (must_ip("::1%eth0"), false, true),
+  ]
+  for t in tests {
+    assert_eq t[0].is4?, t[1]
+    assert_eq t[0].is6?, t[2]
+  }
+}
+
+test "is4in6" {
+  tests = [
+    (Addr.new, false, Addr.new),
+    (must_ip("::ffff:c000:0280"), true, must_ip("192.0.2.128")),
+    (must_ip("::ffff:192.0.2.128"), true, must_ip("192.0.2.128")),
+    (must_ip("::ffff:192.0.2.128%eth0"), true, must_ip("192.0.2.128")),
+    (must_ip("::fffe:c000:0280"), false, must_ip("::fffe:c000:0280")),
+    (must_ip("::ffff:127.1.2.3"), true, must_ip("127.1.2.3")),
+    (must_ip("::ffff:7f01:0203"), true, must_ip("127.1.2.3")),
+    (must_ip("0:0:0:0:0000:ffff:127.1.2.3"), true, must_ip("127.1.2.3")),
+    (must_ip("0:0:0:0::ffff:127.1.2.3"), true, must_ip("127.1.2.3")),
+    (must_ip("::1"), false, must_ip("::1")),
+    (must_ip("1.2.3.4"), false, must_ip("1.2.3.4")),
+  ]
+  for t in tests {
+    assert_eq t[0].is4in6?, t[1]
+    assert_eq t[0].unmap, t[2]
+  }
+}
+
+test "prefix masked" {
+  tests = [
+    (must_prefix("192.168.0.255/24"), must_prefix("192.168.0.0/24")),
+    (must_prefix("2100::/3"), must_prefix("2000::/3")),
+    (prefix_from(must_ip("2000::"), 129), Prefix.new),
+    (prefix_from(must_ip("1.2.3.4"), 33), Prefix.new),
+  ]
+  for t in tests {
+    assert_eq t[0].masked, t[1]
+  }
+}
+
+test "prefix" {
+  # (prefix, ip, bits, str, contains, not_contains)
+  tests = [
+    ("192.168.0.0/24", must_ip("192.168.0.0"), 24, "", must_ips(["192.168.0.1", "192.168.0.55"]), must_ips(["192.168.1.1", "1.1.1.1"])),
+    ("192.168.1.1/32", must_ip("192.168.1.1"), 32, "", must_ips(["192.168.1.1"]), must_ips(["192.168.1.2"])),
+    # CGNAT range; prefix not multiple of 8
+    ("100.64.0.0/10", must_ip("100.64.0.0"), 10, "", must_ips(["100.64.0.0", "100.64.0.1", "100.81.251.94", "100.100.100.100", "100.127.255.254", "100.127.255.255"]), must_ips(["100.63.255.255", "100.128.0.0"])),
+    ("2001:db8::/96", must_ip("2001:db8::"), 96, "", must_ips(["2001:db8::aaaa:bbbb", "2001:db8::1"]), must_ips(["2001:db8::1:aaaa:bbbb", "2001:db9::"])),
+    ("0.0.0.0/0", must_ip("0.0.0.0"), 0, "", must_ips(["192.168.0.1", "1.1.1.1"]), must_ips(["2001:db8::1"]) + [Addr.new]),
+    ("::/0", must_ip("::"), 0, "", must_ips(["::1", "2001:db8::1"]), must_ips(["192.0.2.1"])),
+    ("2000::/3", must_ip("2000::"), 3, "", must_ips(["2001:db8::1"]), must_ips(["fe80::1"])),
+  ]
+  for t in tests {
+    prefix = ~parse_prefix(t[0])
+    assert_eq prefix.addr, t[1]
+    assert_eq prefix.bits, t[2]
+    for ip in t[4] {
+      assert prefix.contains?(ip), "#{prefix} does not contain #{ip}"
+    }
+    for ip in t[5] {
+      assert !prefix.contains?(ip), "#{prefix} contains #{ip}"
+    }
+    want = t[3] == "" ? t[0] : t[3]
+    assert_eq prefix.to_s, want
+    assert_eq prefix.append_to([]), prefix.marshal_text
+  }
+}
+
+test "prefix from invalid bits" {
+  v4 = must_parse_addr("1.2.3.4")
+  v6 = must_parse_addr("66::66")
+  tests = [(v4, 0, 0), (v6, 0, 0), (v4, 1, 1), (v4, 33, -1), (v6, 33, 33), (v6, 127, 127), (v6, 128, 128), (v4, 254, -1), (v4, 255, -1), (v4, -1, -1), (v6, -1, -1), (v4, -5, -1), (v6, -5, -1)]
+  for t in tests {
+    assert_eq prefix_from(t[0], t[1]).bits, t[2]
+  }
+}
+
+test "parse prefix error" {
+  tests = [
+    ("192.168.0.0", "no '/'"),
+    ("1.257.1.1/24", "value >255"),
+    ("1.1.1.0/q", "bad bits"),
+    ("1.1.1.0/-1", "bad bits"),
+    ("1.1.1.0/33", "out of range"),
+    ("2001::/129", "out of range"),
+    # Zones are not allowed: https://go.dev/issue/51899
+    ("1.1.1.0%a/24", "unexpected character"),
+    ("2001:db8::%a/32", "zones cannot be present"),
+    ("1.1.1.0/+32", "bad bits"),
+    ("1.1.1.0/-32", "bad bits"),
+    ("1.1.1.0/032", "bad bits"),
+    ("1.1.1.0/0032", "bad bits"),
+  ]
+  for t in tests {
+    r = parse_prefix(t[0])
+    assert r.err?, "no error for #{t[0]}"
+    got = r.err.unwrap.message
+    assert strings.contains(got, t[1]), "error is missing substring #{t[1]}: #{got}"
+  }
+}
+
+test "prefix is single ip" {
+  tests = [(must_prefix("127.0.0.1/32"), true), (must_prefix("127.0.0.1/31"), false), (must_prefix("127.0.0.1/0"), false), (must_prefix("::1/128"), true), (must_prefix("::1/127"), false), (must_prefix("::1/0"), false), (Prefix.new, false)]
+  for t in tests {
+    assert_eq t[0].single_ip?, t[1]
+  }
+}
+
+test "as4" {
+  tests: [(Addr, [Byte; 4], Bool)] = [
+    (must_ip("1.2.3.4"), [1, 2, 3, 4], false),
+    (addr_from16(must_ip("1.2.3.4").as16), [1, 2, 3, 4], false), # IPv4-in-IPv6
+    (must_ip("0.0.0.0"), [0, 0, 0, 0], false),
+    (Addr.new, [0, 0, 0, 0], true),
+    (must_ip("::1"), [0, 0, 0, 0], true),
+  ]
+  for t in tests {
+    ip = t[0]
+    # A panic ends only its task: run as4 in one to see it (Go recovers).
+    task = spawn { ip.as4 }
+    r = task.wait
+    assert_eq r.err?, t[2]
+    if v = r.ok {
+      assert_eq v, t[1]
+    }
+  }
+}
+
+test "prefix overlaps" {
+  tests = [
+    (Prefix.new, must_prefix("1.2.0.0/16"), false),               # first zero
+    (must_prefix("1.2.0.0/16"), Prefix.new, false),               # second zero
+    (must_prefix("::0/3"), must_prefix("0.0.0.0/3"), false),      # different families
+    (must_prefix("1.2.0.0/16"), must_prefix("1.2.0.0/16"), true), # equal
+    (must_prefix("1.2.0.0/16"), must_prefix("1.2.3.0/24"), true),
+    (must_prefix("1.2.3.0/24"), must_prefix("1.2.0.0/16"), true),
+    (must_prefix("1.2.0.0/16"), must_prefix("1.2.3.0/32"), true),
+    (must_prefix("1.2.3.0/32"), must_prefix("1.2.0.0/16"), true),
+    # Match /0 either order
+    (must_prefix("1.2.3.0/32"), must_prefix("0.0.0.0/0"), true),
+    (must_prefix("0.0.0.0/0"), must_prefix("1.2.3.0/32"), true),
+    (must_prefix("1.2.3.0/32"), must_prefix("5.5.5.5/0"), true), # normalization not required; /0 means true
+    # IPv6 overlapping
+    (must_prefix("5::1/128"), must_prefix("5::0/8"), true),
+    (must_prefix("5::0/8"), must_prefix("5::1/128"), true),
+    # IPv6 not overlapping
+    (must_prefix("1::1/128"), must_prefix("2::2/128"), false),
+    (must_prefix("0100::0/8"), must_prefix("::1/128"), false),
+    # IPv4-mapped IPv6 addresses should not overlap with IPv4.
+    (prefix_from(addr_from16(must_ip("1.2.0.0").as16), 16), must_prefix("1.2.3.0/24"), false),
+    # Invalid prefixes
+    (prefix_from(must_ip("1.2.3.4"), 33), must_prefix("1.2.3.0/24"), false),
+    (prefix_from(must_ip("2000::"), 129), must_prefix("2000::/64"), false),
+  ]
+  for t in tests {
+    assert_eq t[0].overlaps?(t[1]), t[2]
+    # Overlaps is commutative
+    assert_eq t[1].overlaps?(t[0]), t[2]
+  }
+}
+
+test "prefix string" {
+  tests = [(Prefix.new, "invalid Prefix"), (prefix_from(Addr.new, 8), "invalid Prefix"), (prefix_from(must_parse_addr("1.2.3.4"), 88), "invalid Prefix")]
+  for t in tests {
+    assert_eq t[0].to_s, t[1]
+  }
+}
+
+test "addr port string" {
+  tests = [
+    (must_parse_addr_port("127.0.0.1:80"), "127.0.0.1:80"),
+    (must_parse_addr_port("[0000::0]:8080"), "[::]:8080"),
+    (must_parse_addr_port("[FFFF::1]:8080"), "[ffff::1]:8080"),
+    (AddrPort.new, "invalid AddrPort"),
+    (addr_port_from(Addr.new, 80), "invalid AddrPort"),
+  ]
+  for t in tests {
+    assert_eq t[0].to_s, t[1]
+  }
+}
+
+test "as slice" {
+  tests: [(Addr, [Byte])] = [(Addr.new, []), (must_ip("1.2.3.4"), [1, 2, 3, 4]), (must_ip("ffff::1"), [0xff, 0xff, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1])]
+  for t in tests {
+    assert_eq t[0].as_slice, t[1]
+  }
+}
+
+# The allocation tests (TestNoAllocs, TestAddrStringAllocs,
+# TestParsePrefixAllocs) count Go heap allocations; they run here as
+# correctness checks of the same calls.
+test "no allocs: same calls succeed" {
+  assert_eq addr_from4([1, 2, 3, 4]), must_parse_addr("1.2.3.4")
+  assert addr_from16(b16([])).valid?
+  assert parse_addr("1.2.3.4").ok?
+  assert parse_addr("::1").ok?
+  assert must_parse_addr("1.2.3.4").valid?
+  assert !must_parse_addr("1.2.3.4").zero?
+  assert must_parse_addr("1.2.3.4").bit_len != 8
+  assert must_parse_addr("1.2.3.4").zone == ""
+  assert must_parse_addr("fe80::1").zone == ""
+  assert must_parse_addr("fe80::1%zone").zone == "zone"
+  assert must_parse_addr("1.2.3.4").compare(must_parse_addr("2.3.4.5")) != 0
+  assert must_parse_addr("1.2.3.4").less?(must_parse_addr("2.3.4.5"))
+  assert must_parse_addr("ffff::2.3.4.5").unmap.is6?
+  assert must_parse_addr("fe80::1").with_zone("").valid?
+  assert must_parse_addr("1.2.3.4").prefix(20).ok?
+  assert must_parse_addr("fe80::1").prefix(64).ok?
+  assert_eq must_parse_addr("1.2.3.4").as4, [1, 2, 3, 4]
+  assert_eq must_parse_addr("1.2.3.4").next_addr, must_parse_addr("1.2.3.5")
+  assert_eq must_parse_addr("1.2.3.4").prev_addr, must_parse_addr("1.2.3.3")
+  assert_eq addr_port_from(addr_from4([1, 2, 3, 4]), 22).to_s, "1.2.3.4:22"
+  assert parse_addr_port("[::1]:1234").ok?
+  assert_eq prefix_from(addr_from4([1, 2, 3, 4]), 32).to_s, "1.2.3.4/32"
+  assert parse_prefix("1.2.3.4/20").ok?
+  assert parse_prefix("fe80::1/64").ok?
+  assert must_parse_prefix("1.2.3.0/24").contains?(must_parse_addr("1.2.3.4"))
+  assert must_parse_prefix("1.2.3.0/24").overlaps?(must_parse_prefix("1.2.0.0/16"))
+  assert !must_parse_prefix("1.2.0.0/16").zero?
+  assert must_parse_prefix("1.2.3.4/32").single_ip?
+  assert_eq must_parse_prefix("1.2.3.4/16").masked.to_s, "1.2.0.0/16"
+  assert_eq must_parse_addr("::ffff:192.168.1.1%eth0").to_s, "::ffff:192.168.1.1%eth0"
+}
+
+bench "parse addr" {
+  must_parse_addr("192.168.1.1")
+  must_parse_addr("2001:db8::1")
+  must_parse_addr("fe80::1%eth0")
+}
+
+bench "addr string" {
+  must_ip("2001:db8::1").to_s
+}
+
+bench "prefix masking" {
+  must_ip("2001:db8::1").prefix(64).unwrap
+}
+
+bench "binary marshal round trip" {
+  unmarshal_addr_binary(must_ip("2001:db8::1%eth0").marshal_binary).unwrap
+}
+
+bench "parse addr port" {
+  must_parse_addr_port("[2001:db8::1]:80")
+}
+
+# -------------------------------------------------------- netip_pkg_test.go
+
+test "prefix valid" {
+  v4 = must_parse_addr("1.2.3.4")
+  v6 = must_parse_addr("::1")
+  tests = [
+    (prefix_from(v4, -2), false),
+    (prefix_from(v4, -1), false),
+    (prefix_from(v4, 0), true),
+    (prefix_from(v4, 32), true),
+    (prefix_from(v4, 33), false),
+    (prefix_from(v6, -2), false),
+    (prefix_from(v6, -1), false),
+    (prefix_from(v6, 0), true),
+    (prefix_from(v6, 32), true),
+    (prefix_from(v6, 128), true),
+    (prefix_from(v6, 129), false),
+    (prefix_from(Addr.new, -2), false),
+    (prefix_from(Addr.new, -1), false),
+    (prefix_from(Addr.new, 0), false),
+    (prefix_from(Addr.new, 32), false),
+    (prefix_from(Addr.new, 128), false),
+  ]
+  for t in tests {
+    got = t[0].valid?
+    assert_eq got, t[1]
+    # There is only one invalid Prefix representation per Addr.
+    assert_eq t[0], prefix_from(t[0].addr, -1) unless got
+  }
+}
+
+def next_prev_tests -> [(Addr, Addr, Addr)] {
+  [
+    (must_ip("10.0.0.1"), must_ip("10.0.0.2"), must_ip("10.0.0.0")),
+    (must_ip("10.0.0.255"), must_ip("10.0.1.0"), must_ip("10.0.0.254")),
+    (must_ip("127.0.0.1"), must_ip("127.0.0.2"), must_ip("127.0.0.0")),
+    (must_ip("254.255.255.255"), must_ip("255.0.0.0"), must_ip("254.255.255.254")),
+    (must_ip("255.255.255.255"), Addr.new, must_ip("255.255.255.254")),
+    (must_ip("0.0.0.0"), must_ip("0.0.0.1"), Addr.new),
+    (must_ip("::"), must_ip("::1"), Addr.new),
+    (must_ip("::%x"), must_ip("::1%x"), Addr.new),
+    (must_ip("::1"), must_ip("::2"), must_ip("::")),
+    (must_ip("ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff"), Addr.new, must_ip("ffff:ffff:ffff:ffff:ffff:ffff:ffff:fffe")),
+  ]
+}
+
+def do_next_prev -> Bool {
+  ok = true
+  for t in next_prev_tests {
+    ip = t[0]
+    ok = ok && ip.next_addr == t[1] && ip.prev_addr == t[2]
+    ok = ok && ip.next_addr.prev_addr == ip unless ip.next_addr.zero?
+    ok = ok && ip.prev_addr.next_addr == ip unless ip.prev_addr.zero?
+  }
+  ok
+}
+
+test "ip next prev" {
+  for t in next_prev_tests {
+    ip = t[0]
+    assert_eq ip.next_addr, t[1]
+    assert_eq ip.prev_addr, t[2]
+    assert_eq ip.next_addr.prev_addr, ip unless ip.next_addr.zero?
+    assert_eq ip.prev_addr.next_addr, ip unless ip.prev_addr.zero?
+  }
+  assert do_next_prev
+  for ip in [must_ip("0.0.0.0"), must_ip("::")] {
+    assert ip.prev_addr.zero?, "#{ip}.prev_addr not zero"
+  }
+  all_ff: [Byte; 16] = [0xff; 16]
+  for ip in [must_ip("255.255.255.255"), addr_from16(all_ff)] {
+    assert ip.next_addr.zero?, "#{ip}.next_addr not zero"
+  }
+}
+
+bench "ip next prev" {
+  do_next_prev
+}
+
+test "ip bit len" {
+  tests = [(Addr.new, 0), (must_ip("0.0.0.0"), 32), (must_ip("10.0.0.1"), 32), (must_ip("::"), 128), (must_ip("fed0::1"), 128), (must_ip("::ffff:10.0.0.1"), 128)]
+  for t in tests {
+    assert_eq t[0].bit_len, t[1]
+  }
+}
+
+test "prefix contains" {
+  tests = [
+    (must_prefix("9.8.7.6/0"), must_ip("9.8.7.6"), true),
+    (must_prefix("9.8.7.6/16"), must_ip("9.8.7.6"), true),
+    (must_prefix("9.8.7.6/16"), must_ip("9.8.6.4"), true),
+    (must_prefix("9.8.7.6/16"), must_ip("9.9.7.6"), false),
+    (must_prefix("9.8.7.6/32"), must_ip("9.8.7.6"), true),
+    (must_prefix("9.8.7.6/32"), must_ip("9.8.7.7"), false),
+    (must_prefix("9.8.7.6/32"), must_ip("9.8.7.7"), false),
+    (must_prefix("::1/0"), must_ip("::1"), true),
+    (must_prefix("::1/0"), must_ip("::2"), true),
+    (must_prefix("::1/127"), must_ip("::1"), true),
+    (must_prefix("::1/127"), must_ip("::2"), false),
+    (must_prefix("::1/128"), must_ip("::1"), true),
+    (must_prefix("::1/127"), must_ip("::2"), false),
+    # Zones ignored: https://go.dev/issue/51899
+    (Prefix.new(ip: must_ip("1.2.3.4").with_zone("a"), bits1: 32), must_ip("1.2.3.4"), true),
+    (Prefix.new(ip: must_ip("::1").with_zone("a"), bits1: 128), must_ip("::1"), true),
+    # invalid IP
+    (must_prefix("::1/0"), Addr.new, false),
+    (must_prefix("1.2.3.4/0"), Addr.new, false),
+    # invalid Prefix
+    (prefix_from(must_ip("::1"), 129), must_ip("::1"), false),
+    (prefix_from(must_ip("1.2.3.4"), 33), must_ip("1.2.3.4"), false),
+    (prefix_from(Addr.new, 0), must_ip("1.2.3.4"), false),
+    (prefix_from(Addr.new, 32), must_ip("1.2.3.4"), false),
+    (prefix_from(Addr.new, 128), must_ip("::1"), false),
+    # wrong IP family
+    (must_prefix("::1/0"), must_ip("1.2.3.4"), false),
+    (must_prefix("1.2.3.4/0"), must_ip("::1"), false),
+  ]
+  for t in tests {
+    assert t[0].contains?(t[1]) == t[2], "(#{t[0]}).contains?(#{t[1]}) want #{t[2]}"
+  }
+}
+
+test "parse ip error" {
+  tests = [("localhost", ""), ("500.0.0.1", "field has value >255"), ("::gggg%eth0", "must have at least one digit"), ("fe80::1cc0:3e8c:119f:c2e1%", "zone must be a non-empty string"), ("%eth0", "missing IPv6 address")]
+  for t in tests {
+    r = parse_addr(t[0])
+    assert r.err?, "no error for #{t[0]}"
+    e = r.err.unwrap
+    is_parse = case e {
+      ParseAddr(_, _, _) => true
+      _ => false
+    }
+    assert is_parse, "error type is not ParseAddr"
+    want = t[1] == "" ? "unable to parse IP" : t[1]
+    assert strings.contains(e.message, want), "error is missing substring #{want}: #{e.message}"
+  }
+}
+
+test "parse addr port" {
+  # (in, want, want_err)
+  tests = [
+    ("1.2.3.4:1234", addr_port_from(must_ip("1.2.3.4"), 1234), false),
+    ("1.1.1.1:123456", AddrPort.new, true),
+    ("1.1.1.1:-123", AddrPort.new, true),
+    ("[::1]:1234", addr_port_from(must_ip("::1"), 1234), false),
+    ("[1.2.3.4]:1234", AddrPort.new, true),
+    ("fe80::1:1234", AddrPort.new, true),
+    # if we need to parse this form, there should be a separate function
+    # that explicitly allows it
+    (":0", AddrPort.new, true),
+  ]
+  for t in tests {
+    r = parse_addr_port(t[0])
+    assert_eq r.err?, t[2]
+    next if r.err?
+    got = r.unwrap
+    assert_eq got, t[1]
+    assert_eq got.to_s, t[0]
+    assert_eq got.append_to([]), got.marshal_text
+    # Text marshaling (Go checks it through encoding/json).
+    assert_eq unmarshal_addr_port_text(bytes_of(t[0])).unwrap, t[1]
+    assert_eq Str.from_bytes(got.marshal_text), t[0]
+  }
+}
+
+test "addr port marshal unmarshal" {
+  ipp = unmarshal_addr_port_text([]).unwrap
+  assert_eq ipp, AddrPort.new
+  assert_eq ipp.marshal_text.size, 0
+  assert_eq ipp.append_to([]), ipp.marshal_text
+}
+
+test "ipv6 accessor" {
+  a: [Byte; 16] = [0; 16]
+  for i in 0...16 {
+    a[i] = (i + 1).as_u8
+  }
+  ip = addr_from16(a)
+  for i in 0...16 {
+    assert_eq ip.v6(i), (i + 1).as_u8
+  }
+}
+
+# ---------------------------------------------------------- uint128_test.go
+
+test "uint128 add sub" {
+  m = MAX64
+  tests = [
+    (u128(0, 0), 1, u128(0, 1)),
+    (u128(0, 1), 1, u128(0, 2)),
+    (u128(1, 0), 1, u128(1, 1)),
+    (u128(0, m), 1, u128(1, 0)),
+    (u128(m, m), 1, u128(0, 0)),
+    (u128(0, 0), -1, u128(m, m)),
+    (u128(0, 1), -1, u128(0, 0)),
+    (u128(0, 2), -1, u128(0, 1)),
+    (u128(1, 0), -1, u128(0, m)),
+    (u128(1, 1), -1, u128(1, 0)),
+  ]
+  for t in tests {
+    got = t[1] == 1 ? t[0].add_one : t[0].sub_one
+    assert_eq got, t[2]
+  }
+}
+
+test "bits set from" {
+  m = MAX64
+  tests = [(0, u128(m, m)), (1, u128(m >> 1, m)), (63, u128(1, m)), (64, u128(0, m)), (65, u128(0, m >> 1)), (127, u128(0, 1)), (128, u128(0, 0))]
+  for t in tests {
+    assert_eq u128(0, 0).bits_set_from(t[0]), t[1]
+  }
+}
+
+test "bits cleared from" {
+  m = MAX64
+  top: U64 = 1 << 63
+  tests = [(0, u128(0, 0)), (1, u128(top, 0)), (63, u128(m - 1, 0)), (64, u128(m, 0)), (65, u128(m, top)), (127, u128(m, m - 1)), (128, u128(m, m))]
+  for t in tests {
+    assert_eq u128(m, m).bits_cleared_from(t[0]), t[1]
+  }
+}
+
+# ------------------------------------------------------------- fuzz_test.go
+
+def check_addr_encoding(ip: Addr) -> Bool {
+  ok = true
+  if ip.valid? {
+    # text round trip
+    buf = ip.marshal_text
+    y = unmarshal_addr_text(buf).unwrap
+    ok = ok && y == ip && y.marshal_text == buf
+    # binary round trip
+    bb = ip.marshal_binary
+    yb = unmarshal_addr_binary(bb).unwrap
+    ok = ok && yb == ip && yb.marshal_binary == bb
+    ok = ok && Str.from_bytes(buf) == ip.to_s
+    # string / parse round trip
+    p = parse_addr(ip.to_s).unwrap
+    ok = ok && p == ip && p.to_s == ip.to_s
+  }
+  ok && ip.append_to([]) == ip.marshal_text
+}
+
+def check_addr_port_encoding(ap: AddrPort) -> Bool {
+  ok = true
+  if ap.valid? {
+    buf = ap.marshal_text
+    y = unmarshal_addr_port_text(buf).unwrap
+    ok = ok && y == ap && y.marshal_text == buf
+    bb = ap.marshal_binary
+    yb = unmarshal_addr_port_binary(bb).unwrap
+    ok = ok && yb == ap && yb.marshal_binary == bb
+    ok = ok && Str.from_bytes(buf) == ap.to_s
+    p = parse_addr_port(ap.to_s).unwrap
+    ok = ok && p == ap && p.to_s == ap.to_s
+  }
+  ok && ap.append_to([]) == ap.marshal_text
+}
+
+def check_prefix_encoding(pf: Prefix) -> Bool {
+  ok = true
+  if pf.valid? {
+    buf = pf.marshal_text
+    y = unmarshal_prefix_text(buf).unwrap
+    ok = ok && y == pf && y.marshal_text == buf
+    bb = pf.marshal_binary
+    yb = unmarshal_prefix_binary(bb).unwrap
+    ok = ok && yb == pf && yb.marshal_binary == bb
+    ok = ok && Str.from_bytes(buf) == pf.to_s
+    p = parse_prefix(pf.to_s).unwrap
+    ok = ok && p == pf && p.to_s == pf.to_s
+  }
+  ok && pf.append_to([]) == pf.marshal_text
+}
+
+CORPUS = ["0.0.0.0", "192.168.140.255", "010.000.015.001", "000001.00000002.00000003.000000004", "::ffff:1.2.03.4", "::", "::1", "fd7a:115c:a1e0:ab12:4843:cd96:626b:430b", "fd7a:115c::626b:430b", "fd7a:115c:a1e0:ab12:4843:cd96::", "fd7a:115c:a1e0:ab12:4843:cd96:626b::", "fd7a:115c:a1e0:ab12:4843:cd96:626b:0", "fd7a:115c:a1e0::4843:cd96:626b:430b", "fd7a:115c:a1e0:0:4843:cd96:626b:430b", "::ffff:192.168.140.255", "::ffff:192.168.140.255", "fd7a:115c:a1e0:ab12:4843:cd96:626b:430b%eth0", "1:2::ffff:192.168.140.255%eth1", "1:2::ffff:c0a8:8cff%eth1", "FD9E:1A04:F01D::1", "fd9e:1a04:f01d::1", "", "bad", "1234", "1.2.3.4%eth0", ".1.2.3", "1.2.3.", "1..2.3", "1.2.3.4.5", "0300.0250.0214.0377", "0xc0.0xa8.0x8c.0xff", "192.168.12345", "127.0.1", "192.1234567", "127.1", "192.168.300.1", "192.168.0.1.5.6", "1:2:3:4:5:6:7", "1:2:3:4:5:6:7:8:9", "1:2:3:4::5:6:7:8", "fe801::1", "fe80:tail:scal:e::", "fe80::1%", "::ffff:0:0%0", "ffff:ffff:ffff:ffff:ffff:ffff:ffff:192.168.140.255", "ffff::ffff:ffff:ffff:ffff:ffff:ffff:192.168.140.255", "::ffff:192.168.140.bad", "fe80::1::1", "fe80:1?:1", "fe80:", "1.2.3.4:51820", "[fd7a:115c:a1e0:ab12:4843:cd96:626b:430b]:80", "[::ffff:c000:0280]:65535", "[::ffff:c000:0280%eth0]:1", "1.2.3.4/24", "fd7a:115c:a1e0:ab12:4843:cd96:626b:430b/118", "::ffff:c000:0280/96", "::ffff:c000:0280%eth0/37"]
+
+# FuzzParse over its seed corpus (the comparisons with net.ParseIP are in
+# the generated vectors).
+test "fuzz parse corpus" {
+  for s in CORPUS {
+    ip = parse_addr(s).unwrap_or(Addr.new)
+    assert check_addr_encoding(ip), "addr encoding of #{s}"
+    # .next_addr.prev_addr and .prev_addr.next_addr preserve the IP.
+    assert ip.next_addr.prev_addr == ip, "next.prev_addr of #{s}" if ip.valid? && ip.next_addr.valid?
+    assert ip.prev_addr.next_addr == ip, "prev.next_addr of #{s}" if ip.valid? && ip.prev_addr.valid?
+    if port = parse_addr_port(s).ok {
+      assert check_addr_port_encoding(port), "addr port encoding of #{s}"
+    }
+    assert check_addr_port_encoding(addr_port_from(ip, 80)), "addr port 80 of #{s}"
+    if ipp = parse_prefix(s).ok {
+      assert check_prefix_encoding(ipp), "prefix encoding of #{s}"
+    }
+    assert check_prefix_encoding(prefix_from(ip, 8)), "prefix /8 of #{s}"
+  }
+}

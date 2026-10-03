@@ -1,0 +1,125 @@
+# The quoted-printable encoder, after Go's mime/quotedprintable/writer.go.
+import "io"
+
+LINE_MAX_LEN = 76
+UPPER_HEX = "0123456789ABCDEF"
+
+struct WriterState {
+  w: io.Writer
+  i: Int
+  line: [Byte]
+  cr: Bool
+}
+
+def qp_ws?(b: Byte) -> Bool { b == 32 || b == 9 }
+
+# A quoted-printable encoder; close! it to flush the last line.
+pub struct Writer {
+  # Binary mode treats the input as pure binary: end-of-line bytes are
+  # encoded like any other byte.
+  binary: Bool
+  st: [WriterState]
+
+  # Encodes p; returns p.size.
+  pub def write!(p: [Byte]) -> ~Int {
+    n = 0
+    i = 0
+    while i < p.size {
+      b = p[i]
+      if (b >= 33 && b <= 126 && b != 61) || qp_ws?(b) || (!binary && (b == 10 || b == 13)) {
+        # simple bytes are written in batches
+        i += 1
+        next
+      }
+      if i > n {
+        ~raw!(p[n...i])
+        n = i
+      }
+      ~encode!(b)
+      n += 1
+      i += 1
+    }
+    ~raw!(p[n...p.size]) if n < p.size
+    p.size
+  }
+
+  # Like write!, for a string.
+  pub def write_string!(s: Str) -> ~Int {
+    self.~write!(s.bytes.to_a)
+  }
+
+  # Encodes a trailing space or tab and flushes the last line. It does not
+  # close the underlying writer.
+  pub def close! -> ~Unit {
+    ~check_last_byte!
+    ~flush!
+  }
+
+  def raw!(p: [Byte]) -> ~Unit {
+    for b in p {
+      if b == 10 || b == 13 {
+        # after a \r the CRLF is already there
+        if st[0].cr && b == 10 {
+          self.st[0].cr = false
+          next
+        }
+        self.st[0].cr = true if b == 13
+        ~check_last_byte!
+        ~insert_crlf!
+        next
+      }
+      ~insert_soft_line_break! if st[0].i == LINE_MAX_LEN - 1
+      i = st[0].i
+      self.st[0].line[i] = b
+      self.st[0].i = i + 1
+      self.st[0].cr = false
+    }
+  }
+
+  def encode!(b: Byte) -> ~Unit {
+    ~insert_soft_line_break! if LINE_MAX_LEN - 1 - st[0].i < 3
+    i = st[0].i
+    self.st[0].line[i] = 61
+    self.st[0].line[i + 1] = UPPER_HEX[b >> 4]
+    self.st[0].line[i + 2] = UPPER_HEX[b & 15]
+    self.st[0].i = i + 3
+  }
+
+  def check_last_byte! -> ~Unit {
+    i = st[0].i
+    return if i == 0
+    b = st[0].line[i - 1]
+    if qp_ws?(b) {
+      self.st[0].i = i - 1
+      ~encode!(b)
+    }
+  }
+
+  def insert_soft_line_break! -> ~Unit {
+    i = st[0].i
+    self.st[0].line[i] = 61
+    self.st[0].i = i + 1
+    ~insert_crlf!
+  }
+
+  def insert_crlf! -> ~Unit {
+    i = st[0].i
+    self.st[0].line[i] = 13
+    self.st[0].line[i + 1] = 10
+    self.st[0].i = i + 2
+    ~flush!
+  }
+
+  def flush! -> ~Unit {
+    i = st[0].i
+    ~io.write_all(st[0].w, st[0].line[0...i])
+    self.st[0].i = 0
+  }
+}
+
+# A Writer encoding to w.
+pub def new_writer(w: io.Writer) -> Writer {
+  line: [Byte] = [0; 78]
+  st: [WriterState] = [WriterState.new(w: w, i: 0, line: line, cr: false)]
+  Writer.new(binary: false, st: st)
+}

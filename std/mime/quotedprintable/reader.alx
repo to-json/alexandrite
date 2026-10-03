@@ -1,0 +1,225 @@
+# Package quotedprintable: Go's mime/quotedprintable, the quoted-printable
+# encoding of RFC 2045.
+#
+#   Go                              alx
+#   NewReader(r) *Reader            new_reader(r: io.Reader) -> Reader
+#   (*Reader).Read(p)               Reader.read!(p) -> ~Int (0 at the end)
+#   NewWriter(w) *Writer            new_writer(w: io.Writer) -> Writer
+#   (*Writer).Binary                Writer.binary (a field, as in Go)
+#   (*Writer).Write(p) / Close()    Writer.write!(p) -> ~Int / Writer.close! -> ~Unit
+#
+# Differences from Go:
+#  - End of input is not an error (see io): read! returns 0 at the end.
+#  - Go's Read returns the bytes decoded so far together with an error. A
+#    `~Int` holds one or the other, so read! returns the decoded bytes first
+#    and fails on the next call (and every call after it). io.copy and
+#    io.read_all therefore deliver everything that was decoded before the
+#    error, exactly as in Go.
+#  - Go's errors are fmt.Errorf values; here they are QpError variants with
+#    Go's messages, plus io.StreamError.UnexpectedEof for Go's
+#    io.ErrUnexpectedEOF.
+#  - Go reads lines with bufio.Reader.ReadSlice, so a line over 4096 bytes
+#    fails with bufio.ErrBufferFull; here lines may be any length.
+#  - Reader is generic over the reader it decodes (`Reader[T]`; new_reader
+#    infers T): an interface value can't hold a reader that itself holds an
+#    io.Reader (GO-VS-RUBY D12), and a Reader should be usable as one.
+#  - Reader and Writer share their state across copies (GO-VS-RUBY D36).
+#
+# Not translated: TestExhaustive's optional comparison with the external
+# `qprint` program (the exhaustive table itself is translated).
+
+import "io"
+import "strconv"
+
+pub error QpError {
+  # A byte after "=" that is not a hex digit.
+  InvalidHexByte(b: Byte)
+  # A control byte that must have been escaped.
+  InvalidUnescapedByte(b: Byte)
+  # Something other than white space after a soft line break "=".
+  InvalidBytesAfterEquals(rest: Str)
+
+  def message -> Str {
+    case self {
+      InvalidHexByte(b) => "quotedprintable: invalid hex byte 0x#{hex2(b)}"
+      InvalidUnescapedByte(b) => "quotedprintable: invalid unescaped byte 0x#{hex2(b)} in body"
+      InvalidBytesAfterEquals(r) => "quotedprintable: invalid bytes after =: #{strconv.quote(r)}"
+    }
+  }
+}
+
+LOWER_HEX = "0123456789abcdef"
+
+def hex2(b: Byte) -> Str {
+  Str.from_bytes([LOWER_HEX[b >> 4], LOWER_HEX[b & 15]])
+}
+
+# The value of a hex digit (either case; lower case is lax), or -1.
+def from_hex(b: Byte) -> Int {
+  return b.to_i - 48 if b >= 48 && b <= 57
+  return b.to_i - 55 if b >= 65 && b <= 70
+  return b.to_i - 87 if b >= 97 && b <= 102
+  -1
+}
+
+def qp_discard_ws?(b: Byte) -> Bool {
+  b == 10 || b == 13 || b == 32 || b == 9
+}
+
+struct ReaderState[T] {
+  src: T
+  # Bytes read from src and not yet split into lines.
+  buf: [Byte]
+  src_eof: Bool
+  # The rest of the current line, consumed before more of src.
+  line: [Byte]
+  # The underlying reader is exhausted.
+  eof: Bool
+  # The error to report on the next read (Go's rerr, or an error found after
+  # some bytes were already decoded).
+  pending: Error?
+}
+
+# A quoted-printable decoder.
+pub struct Reader[T] {
+  st: [ReaderState[T]]
+
+  # Decodes into p; returns the count, 0 at the end of input. Deviations from
+  # RFC 2045, all Go's:
+  #  1. "=\n" is a soft line break as well as "=\r\n";
+  #  2. a '\r' or '\n' not preceded by '=' passes through;
+  #  3. a soft line break ("=") may end the message;
+  #  4. "=" not followed by two hex digits is a literal "=", unless at the
+  #     end of a line.
+  pub def read!(p: [Byte]) -> ~Int {
+    n = 0
+    while n < p.size {
+      if st[0].line.size == 0 {
+        if e = st[0].pending {
+          return n if n > 0
+          fail e
+        }
+        return n if st[0].eof
+        ~next_line!
+        next
+      }
+      line = st[0].line
+      b = line[0]
+      if b == 61 {
+        # '='
+        if line.size < 3 {
+          if line.size >= 2 && line[1] != 13 && line[1] != 10 {
+            b = 61
+          } else {
+            return ~stop!(n, io.StreamError.UnexpectedEof)
+          }
+        } else {
+          hb = from_hex(line[1])
+          lb = from_hex(line[2])
+          if hb < 0 || lb < 0 {
+            if line[1] != 13 && line[1] != 10 {
+              b = 61
+            } else {
+              return ~stop!(n, QpError.InvalidHexByte(hb < 0 ? line[1] : line[2]))
+            }
+          } else {
+            b = (hb * 16 + lb).as_u8
+            self.st[0].line = line[2...line.size]
+          }
+        }
+      } else if b == 9 || b == 13 || b == 10 || b >= 0x80 {
+        # passes through (bytes >= 0x80 are accepted, Go issue 22597)
+      } else if b < 32 || b > 126 {
+        return ~stop!(n, QpError.InvalidUnescapedByte(b))
+      }
+      p[n] = b
+      l2 = st[0].line
+      self.st[0].line = l2[1...l2.size]
+      n += 1
+    }
+    n
+  }
+
+  # Records `e` and returns n when bytes were decoded; fails with it otherwise.
+  def stop!(n: Int, e: Error) -> ~Int {
+    if n > 0 {
+      self.st[0].pending = e
+      return n
+    }
+    self.st[0].pending = e
+    fail e
+  }
+
+  # The next line of the input, with its "\n" (none on the last line).
+  def read_line! -> ~[Byte] {
+    start = 0
+    loop {
+      buf = st[0].buf
+      i = start
+      while i < buf.size && buf[i] != 10 {
+        i += 1
+      }
+      if i < buf.size {
+        self.st[0].buf = buf[i + 1...buf.size]
+        return buf[0...i + 1]
+      }
+      if st[0].src_eof {
+        self.st[0].buf = []
+        return buf
+      }
+      start = buf.size
+      chunk: [Byte] = [0; 4096]
+      n = self.st[0].src.~read!(chunk)
+      if n == 0 {
+        self.st[0].src_eof = true
+      } else {
+        self.st[0].buf = buf + chunk[0...n]
+      }
+    }
+  }
+
+  # Reads the next line from src into `line`, handling soft line breaks and
+  # trailing white space.
+  def next_line! -> ~Unit {
+    whole = ~read_line!
+    has_lf = whole.size > 0 && whole[whole.size - 1] == 10
+    has_cr = has_lf && whole.size > 1 && whole[whole.size - 2] == 13
+    self.st[0].eof = true unless has_lf
+    eof = st[0].eof
+    # trim white space on the right
+    k = whole.size
+    while k > 0 && qp_discard_ws?(whole[k - 1]) {
+      k -= 1
+    }
+    line = whole[0...k]
+    if k > 0 && whole[k - 1] == 61 {
+      # soft line break: only white space may follow it
+      j = k
+      while j < whole.size && (whole[j] == 32 || whole[j] == 9) {
+        j += 1
+      }
+      right = whole[j...whole.size]
+      line = whole[0...k - 1]
+      lf_next = right.size >= 1 && right[0] == 10
+      crlf_next = right.size >= 2 && right[0] == 13 && right[1] == 10
+      if !lf_next && !crlf_next && !(right.size == 0 && line.size > 0 && eof) {
+        self.st[0].pending = QpError.InvalidBytesAfterEquals(Str.from_bytes(right))
+      }
+    } else if has_lf {
+      out: [Byte] = []
+      for c in line {
+        out << c
+      }
+      out << 13 if has_cr
+      out << 10
+      line = out
+    }
+    self.st[0].line = line
+  }
+}
+
+# A Reader decoding quoted-printable data from r.
+pub def new_reader[T: io.Reader](r: T) -> Reader[T] {
+  st: [ReaderState[T]] = [ReaderState.new(src: r, buf: [], src_eof: false, line: [], eof: false, pending: none)]
+  Reader.new(st: st)
+}

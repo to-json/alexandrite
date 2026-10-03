@@ -1,0 +1,395 @@
+# RFC 2047 encoded-words, after Go's mime/encodedword.go.
+import "strings"
+import "unicode/utf8"
+
+# How a WordEncoder encodes: Go's BEncoding ('b', base64) and QEncoding
+# ('q', the Q encoding of RFC 2047).
+pub enum WordEncoder {
+  BEncoding
+  QEncoding
+
+  # `s` as an encoded-word for `charset`, or `s` itself when it is printable
+  # ASCII (tab allowed). Words longer than RFC 2047 allows are split.
+  pub def encode(charset: Str, s: Str) -> Str {
+    return s unless needs_encoding?(s)
+    encode_word(self, charset, s)
+  }
+
+  # The encoding's letter in an encoded-word.
+  pub def letter -> Byte {
+    b: Byte = 113
+    b = 98 if self == WordEncoder.BEncoding
+    b
+  }
+}
+
+MAX_ENCODED_WORD_LEN = 75
+# maxEncodedWordLen - len("=?UTF-8?q?") - len("?=")
+MAX_CONTENT_LEN = 63
+# base64.StdEncoding.DecodedLen(MAX_CONTENT_LEN)
+MAX_BASE64_LEN = 45
+
+def encode_word(e: WordEncoder, charset: Str, s: Str) -> Str {
+  buf: [Byte] = []
+  buf = open_word(buf, e, charset)
+  if e == WordEncoder.BEncoding {
+    buf = b_encode(buf, e, charset, s)
+  } else {
+    buf = q_encode(buf, e, charset, s)
+  }
+  buf = append_str(buf, "?=")
+  Str.from_bytes(buf)
+}
+
+def append_str(buf: [Byte], s: Str) -> [Byte] {
+  out = buf
+  for c in s.bytes {
+    out << c
+  }
+  out
+}
+
+def open_word(buf: [Byte], e: WordEncoder, charset: Str) -> [Byte] {
+  out = append_str(buf, "=?")
+  out = append_str(out, charset)
+  out << 63
+  out << e.letter
+  out << 63
+  out
+}
+
+def split_word(buf: [Byte], e: WordEncoder, charset: Str) -> [Byte] {
+  out = append_str(buf, "?=")
+  out << 32
+  open_word(out, e, charset)
+}
+
+def utf8_charset?(charset: Str) -> Bool {
+  strings.equal_fold(charset, "UTF-8")
+}
+
+def b_encode(buf: [Byte], e: WordEncoder, charset: Str, s: Str) -> [Byte] {
+  # Only UTF-8 can be split safely between runes.
+  if !utf8_charset?(charset) || base64_encoded_len(s.size) <= MAX_CONTENT_LEN {
+    return append_str(buf, base64_encode(s))
+  }
+  out = buf
+  current_len = 0
+  last = 0
+  i = 0
+  while i < s.size {
+    _, rune_len = utf8.decode_rune_at(s, i)
+    if current_len + rune_len <= MAX_BASE64_LEN {
+      current_len += rune_len
+    } else {
+      out = append_str(out, base64_encode(s[last...i]))
+      out = split_word(out, e, charset)
+      last = i
+      current_len = rune_len
+    }
+    i += rune_len
+  }
+  append_str(out, base64_encode(s[last...s.size]))
+}
+
+def q_encode(buf: [Byte], e: WordEncoder, charset: Str, s: Str) -> [Byte] {
+  # Only UTF-8 can be split safely between runes.
+  return write_q_string(buf, s) unless utf8_charset?(charset)
+  out = buf
+  current_len = 0
+  i = 0
+  while i < s.size {
+    b = s[i]
+    rune_len = 1
+    enc_len = 1
+    if !(b >= 32 && b <= 126 && b != 61 && b != 63 && b != 95) {
+      _, rl = utf8.decode_rune_at(s, i)
+      rune_len = rl
+      enc_len = 3 * rune_len
+    }
+    if current_len + enc_len > MAX_CONTENT_LEN {
+      out = split_word(out, e, charset)
+      current_len = 0
+    }
+    out = write_q_string(out, s[i...i + rune_len])
+    current_len += enc_len
+    i += rune_len
+  }
+  out
+}
+
+def write_q_string(buf: [Byte], s: Str) -> [Byte] {
+  out = buf
+  for b in s.bytes {
+    if b == 32 {
+      out << 95
+    } else if b >= 33 && b <= 126 && b != 61 && b != 63 && b != 95 {
+      out << b
+    } else {
+      out << 61
+      out << UPPER_HEX[b >> 4]
+      out << UPPER_HEX[b & 15]
+    }
+  }
+  out
+}
+
+# Decodes RFC 2047 encoded-words. Words in UTF-8, ISO-8859-1 and US-ASCII
+# are decoded by the package; for other charsets set `charset_reader`,
+# which gets the lower-cased charset and the word's bytes and returns them
+# as UTF-8 (Go's CharsetReader, over bytes instead of an io.Reader).
+pub struct WordDecoder {
+  charset_reader: ((Str, [Byte]) -> ~[Byte])?
+
+  # Decodes one encoded-word ("=?charset?enc?text?=").
+  pub def decode(word0: Str) -> ~Str {
+    # See https://tools.ietf.org/html/rfc2047#section-2 for details.
+    # Our decoder is permissive, we accept empty encoded-text.
+    if word0.size < 8 || !strings.has_prefix(word0, "=?") || !strings.has_suffix(word0, "?=") || strings.count(word0, "?") != 4 {
+      fail MimeError.InvalidWord
+    }
+    word = word0[2...word0.size - 2]
+    # split word "UTF-8?q?text" into "UTF-8", 'q', and "text"
+    charset, text = strings.cut(word, "?") || (word, "")
+    fail MimeError.InvalidWord if charset == ""
+    encoding, text2 = strings.cut(text, "?") || (text, "")
+    fail MimeError.InvalidWord if encoding.size != 1
+    content = ~decode_text(encoding[0], text2)
+    ~convert(charset, content)
+  }
+
+  # Decodes every encoded-word of a header value. Words that can't be
+  # decoded stay as they are; white space between two encoded-words is
+  # dropped. Fails only when charset conversion fails.
+  pub def decode_header(header0: Str) -> ~Str {
+    # If there is no encoded-word, return before creating a buffer.
+    i0 = strings.index(header0, "=?")
+    return header0 if i0 == -1
+    buf: [Byte] = append_str([], header0[0...i0])
+    header = header0[i0...header0.size]
+    between_words = false
+    loop {
+      start = strings.index(header, "=?")
+      break if start == -1
+      cur = start + 2
+      i = strings.index(header[cur...header.size], "?")
+      break if i == -1
+      charset = header[cur...cur + i]
+      cur += i + 1
+      break if header.size < cur + 4 # len("Q??=")
+      encoding = header[cur]
+      cur += 1
+      break if header[cur] != 63
+      cur += 1
+      j = strings.index(header[cur...header.size], "?=")
+      break if j == -1
+      text = header[cur...cur + j]
+      end = cur + j + 2
+      res = decode_text(encoding, text)
+      if !res.ok? {
+        between_words = false
+        buf = append_str(buf, header[0...end])
+        header = header[end...header.size]
+        next
+      }
+      # Write characters before the encoded-word. White-space and newline
+      # characters separating two encoded-words must be deleted.
+      if start > 0 && (!between_words || non_whitespace?(header[0...start])) {
+        buf = append_str(buf, header[0...start])
+      }
+      buf = append_str(buf, ~convert(charset, res.unwrap))
+      header = header[end...header.size]
+      between_words = true
+    }
+    buf = append_str(buf, header) if header.size > 0
+    Str.from_bytes(buf)
+  }
+
+  def convert(charset: Str, content: [Byte]) -> ~Str {
+    if strings.equal_fold("utf-8", charset) {
+      return Str.from_bytes(content)
+    }
+    if strings.equal_fold("iso-8859-1", charset) {
+      out: [Byte] = []
+      for c in content {
+        out = utf8.append_rune(out, c.to_i32)
+      }
+      return Str.from_bytes(out)
+    }
+    if strings.equal_fold("us-ascii", charset) {
+      out: [Byte] = []
+      for c in content {
+        if c >= 0x80 {
+          out = utf8.append_rune(out, 0xFFFD)
+        } else {
+          out << c
+        }
+      }
+      return Str.from_bytes(out)
+    }
+    if f = charset_reader {
+      return Str.from_bytes(~f(strings.to_lower(charset), content))
+    }
+    fail MimeError.UnhandledCharset(charset)
+  }
+}
+
+def non_whitespace?(s: Str) -> Bool {
+  for b in s.bytes {
+    # Encoded-words can only be separated by linear white space which does
+    # not include vertical tabs (\v).
+    return true unless b == 32 || b == 9 || b == 10 || b == 13
+  }
+  false
+}
+
+def decode_text(encoding: Byte, text: Str) -> ~[Byte]<MimeError> {
+  if encoding == 66 || encoding == 98 {
+    return ~base64_decode(text)
+  }
+  if encoding == 81 || encoding == 113 {
+    return ~q_decode(text)
+  }
+  fail MimeError.InvalidWord
+}
+
+# Decodes a Q-encoded string.
+def q_decode(s: Str) -> ~[Byte]<MimeError> {
+  dec: [Byte] = []
+  i = 0
+  while i < s.size {
+    c = s[i]
+    if c == 95 {
+      dec << 32
+    } else if c == 61 {
+      fail MimeError.InvalidWord if i + 2 >= s.size
+      hb = from_hex(s[i + 1])
+      fail MimeError.InvalidHexByte(s[i + 1]) if hb < 0
+      lb = from_hex(s[i + 2])
+      fail MimeError.InvalidHexByte(s[i + 2]) if lb < 0
+      dec << (hb * 16 + lb).as_u8
+      i += 2
+    } else if (c <= 126 && c >= 32) || c == 10 || c == 13 || c == 9 {
+      dec << c
+    } else {
+      fail MimeError.InvalidWord
+    }
+    i += 1
+  }
+  dec
+}
+
+def from_hex(b: Byte) -> Int {
+  return b.to_i - 48 if b >= 48 && b <= 57
+  return b.to_i - 55 if b >= 65 && b <= 70
+  return b.to_i - 87 if b >= 97 && b <= 102
+  -1
+}
+
+# ------------------------------------------------- base64 (StdEncoding)
+
+B64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+
+def base64_encoded_len(n: Int) -> Int { (n + 2) / 3 * 4 }
+
+def base64_encode(s: Str) -> Str {
+  out: [Byte] = []
+  i = 0
+  n = s.size
+  while i + 3 <= n {
+    v = (s[i].to_i << 16) | (s[i + 1].to_i << 8) | s[i + 2].to_i
+    out << B64[(v >> 18) & 63]
+    out << B64[(v >> 12) & 63]
+    out << B64[(v >> 6) & 63]
+    out << B64[v & 63]
+    i += 3
+  }
+  rem = n - i
+  if rem > 0 {
+    v = s[i].to_i << 16
+    v = v | (s[i + 1].to_i << 8) if rem == 2
+    out << B64[(v >> 18) & 63]
+    out << B64[(v >> 12) & 63]
+    out << (rem == 2 ? B64[(v >> 6) & 63] : 61)
+    out << 61
+  }
+  Str.from_bytes(out)
+}
+
+def b64_val(c: Byte) -> Int {
+  return c.to_i - 65 if c >= 65 && c <= 90
+  return c.to_i - 71 if c >= 97 && c <= 122
+  return c.to_i + 4 if c >= 48 && c <= 57
+  return 62 if c == 43
+  return 63 if c == 47
+  -1
+}
+
+# Decodes standard, padded base64 as Go's StdEncoding.DecodeString does:
+# '\r' and '\n' are skipped; any other stray byte, missing or misplaced
+# padding fail with Base64(offset) (trailing bits are not checked: not Strict).
+def base64_decode(s: Str) -> ~[Byte]<MimeError> {
+  out: [Byte] = []
+  si = 0
+  n = s.size
+  loop {
+    # Read one quantum of up to four characters.
+    dbuf: [Int] = [0, 0, 0, 0]
+    dlen = 4
+    j = 0
+    done = false
+    while j < 4 {
+      while si < n && (s[si] == 10 || s[si] == 13) {
+        si += 1
+      }
+      if si == n {
+        if j == 0 {
+          return out
+        }
+        fail MimeError.Base64(si - j)
+      }
+      c = s[si]
+      si += 1
+      v = b64_val(c)
+      if v >= 0 {
+        dbuf[j] = v
+        j += 1
+        next
+      }
+      if c == 61 && j >= 2 {
+        # '=' padding: one or two of them end the input.
+        if j == 2 {
+          while si < n && (s[si] == 10 || s[si] == 13) {
+            si += 1
+          }
+          fail MimeError.Base64(n) if si == n
+          fail MimeError.Base64(si - 1) if s[si] != 61
+          si += 1
+        }
+        while si < n && (s[si] == 10 || s[si] == 13) {
+          si += 1
+        }
+        fail MimeError.Base64(si) if si < n
+        dlen = j
+        done = true
+        break
+      }
+      fail MimeError.Base64(si - 1)
+    }
+    val = (dbuf[0] << 18) | (dbuf[1] << 12) | (dbuf[2] << 6) | dbuf[3]
+    b0 = (val >> 16) & 255
+    b1 = (val >> 8) & 255
+    b2 = val & 255
+    if dlen == 4 {
+      out << b0.as_u8
+      out << b1.as_u8
+      out << b2.as_u8
+    } else if dlen == 3 {
+      out << b0.as_u8
+      out << b1.as_u8
+    } else if dlen == 2 {
+      out << b0.as_u8
+    }
+    return out if done
+  }
+}

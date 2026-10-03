@@ -1,0 +1,239 @@
+# Go's mime/quotedprintable tests (reader_test.go, writer_test.go,
+# example_test.go), translated.
+import "bytes"
+import "io"
+import "strings"
+
+# Decodes `s` with io.copy as Go's tests do: (output, error message or "").
+def decode(s: Str) -> (Str, Str) {
+  buf = bytes.new_buffer([])
+  r = io.copy(buf, new_reader(bytes.new_buffer_string(s)))
+  msg = r.err? ? r.err.unwrap.message : ""
+  (buf.to_s, msg)
+}
+
+# The bytes a hex string spells (for inputs that aren't valid UTF-8).
+def hx(h: Str) -> Str {
+  out: [Byte] = []
+  i = 0
+  while i + 1 < h.size {
+    out << (from_hex(h[i]) * 16 + from_hex(h[i + 1])).as_u8
+    i += 2
+  }
+  Str.from_bytes(out)
+}
+
+# `s` encoded by a Writer (binary mode or not), closed.
+def qp_enc(s: Str, binary: Bool) -> Str {
+  buf = bytes.new_buffer([])
+  w = new_writer(buf)
+  w.binary = binary
+  w.write!(s.bytes.to_a).unwrap
+  w.close!.unwrap
+  buf.to_s
+}
+
+def qp_dec(s: Str) -> (Str, Str) { decode(s) }
+
+test "reader" {
+  ff: [Byte] = [0xff]
+  xff = Str.from_bytes(ff)
+  # (in, want, err)
+  tests = [
+    ("", "", ""),
+    ("foo bar", "foo bar", ""),
+    ("foo bar=3D", "foo bar=", ""),
+    ("foo bar=3d", "foo bar=", ""), # lax.
+    ("foo bar=\n", "foo bar", ""),
+    ("foo bar\n", "foo bar\n", ""), # somewhat lax.
+    ("foo bar=0", "foo bar=0", ""), # lax
+    ("foo bar=0D=0A", "foo bar\r\n", ""),
+    (" A B        \r\n C ", " A B\r\n C", ""),
+    (" A B =\r\n C ", " A B  C", ""),
+    (" A B =\n C ", " A B  C", ""), # lax. treating LF as CRLF
+    ("foo=\nbar", "foobar", ""),
+    ("foo\x00bar", "foo", "quotedprintable: invalid unescaped byte 0x00 in body"),
+    ("foo bar" + xff, "foo bar" + xff, ""),
+    # Equal sign.
+    ("=3D30\n", "=30\n", ""),
+    ("=00=FF0=\n", "\x00" + xff + "0", ""),
+    # Trailing whitespace
+    ("foo  \n", "foo\n", ""),
+    ("foo  \n\nfoo =\n\nfoo=20\n\n", "foo\n\nfoo \nfoo \n\n", ""),
+    # Bare \n and \r pass through, though RFC 2045 6.7 (4) forbids them.
+    ("foo\nbar", "foo\nbar", ""),
+    ("foo\rbar", "foo\rbar", ""),
+    ("foo\r\nbar", "foo\r\nbar", ""),
+    # Different types of soft line-breaks.
+    ("foo=\r\nbar", "foobar", ""),
+    ("foo=\nbar", "foobar", ""),
+    ("foo=\rbar", "foo", "quotedprintable: invalid hex byte 0x0d"),
+    ("foo=\r\r\r \nbar", "foo", "quotedprintable: invalid bytes after =: \"\\r\\r\\r \\n\""),
+    # Issue 15486, accept trailing soft line-break at end of input.
+    ("foo=", "foo", ""),
+    ("=", "", "quotedprintable: invalid bytes after =: \"\""),
+    # Example from RFC 2045:
+    ("Now's the time =\nfor all folk to come=\n to the aid of their country.", "Now's the time for all folk to come to the aid of their country.", ""),
+    ("accept UTF-8 right quotation mark: ’", "accept UTF-8 right quotation mark: ’", ""),
+    # Transport padding
+    ("foo= \r\nbar", "foobar", ""),
+    ("foo=\t \r\nbar", "foobar", ""),
+  ]
+  for t in tests {
+    got, err = decode(t[0])
+    assert_eq got, t[1]
+    assert_eq err, t[2]
+  }
+}
+
+# Calls `f` with every string of `length` bytes over `alpha`.
+def every_sequence(base: Str, alpha: Str, length: Int, out: [Str]) -> [Str] {
+  acc = out
+  if base.size == length {
+    acc << base
+    return acc
+  }
+  for i in 0...alpha.size {
+    acc = every_sequence(base + alpha[i...i + 1], alpha, length, acc)
+  }
+  acc
+}
+
+# Go's badSoftRx, `=([^\r\n]+?\n)|([^\r\n]+$)|(\r$)|(\r[^\n]+\n)|( \r\n)`,
+# matched by hand (alx has no regexp yet).
+def bad_soft?(s: Str) -> Bool {
+  n = s.size
+  return false if n == 0
+  return true if s[n - 1] != 10 # [^\r\n]+$ or \r$
+  return true if strings.contains(s, " \r\n")
+  for i in 0...n {
+    if s[i] == 61 || s[i] == 13 {
+      j = i + 1
+      while j < n && s[j] != 10 && (s[i] == 13 || s[j] != 13) {
+        j += 1
+      }
+      return true if j < n && j > i + 1 && s[j] == 10
+    }
+  }
+  false
+}
+
+test "exhaustive" {
+  res: Map[Str, Int] = {}
+  seqs = every_sequence("", "0A \r\n=", 6, [])
+  for s in seqs {
+    next if strings.has_suffix(s, "=") || strings.contains(s, "==")
+    _, err = decode(s)
+    if err != "" {
+      err = "invalid bytes after =" if strings.contains(err, "invalid bytes after =:")
+      res[err] += 1
+      if strings.contains(err, "invalid hex byte ") {
+        next if strings.has_suffix(err, "0x20") && (strings.contains(s, "=0 ") || strings.contains(s, "=A ") || strings.contains(s, "= "))
+        next if strings.has_suffix(err, "0x3d") && (strings.contains(s, "=0=") || strings.contains(s, "=A="))
+        next if strings.has_suffix(err, "0x0a") || strings.has_suffix(err, "0x0d")
+      }
+      next if strings.contains(err, "unexpected EOF")
+      next if err == "invalid bytes after =" && bad_soft?(s)
+      assert false, "decode(#{s}) = #{err}"
+      next
+    }
+    res["OK"] += 1
+  }
+  outcomes: [Str] = []
+  for k, v in res {
+    outcomes << "#{k}: #{v}"
+  }
+  outcomes = outcomes.sort
+  want = "OK: 30638\ninvalid bytes after =: 2243\nquotedprintable: invalid hex byte 0x0d: 2050\nunexpected EOF: 194"
+  assert_eq strings.join(outcomes, "\n"), want
+}
+
+def test_writer(binary: Bool) {
+  # (in, want, want_binary)
+  tests = [
+    ("", "", ""),
+    ("foo bar", "foo bar", ""),
+    ("foo bar=", "foo bar=3D", ""),
+    ("foo bar\r", "foo bar\r\n", "foo bar=0D"),
+    ("foo bar\r\r", "foo bar\r\n\r\n", "foo bar=0D=0D"),
+    ("foo bar\n", "foo bar\r\n", "foo bar=0A"),
+    ("foo bar\r\n", "foo bar\r\n", "foo bar=0D=0A"),
+    ("foo bar\r\r\n", "foo bar\r\n\r\n", "foo bar=0D=0D=0A"),
+    ("foo bar ", "foo bar=20", ""),
+    ("foo bar\t", "foo bar=09", ""),
+    ("foo bar  ", "foo bar =20", ""),
+    ("foo bar \n", "foo bar=20\r\n", "foo bar =0A"),
+    ("foo bar \r", "foo bar=20\r\n", "foo bar =0D"),
+    ("foo bar \r\n", "foo bar=20\r\n", "foo bar =0D=0A"),
+    ("foo bar  \n", "foo bar =20\r\n", "foo bar  =0A"),
+    ("foo bar  \n ", "foo bar =20\r\n=20", "foo bar  =0A=20"),
+    ("¡Hola Señor!", "=C2=A1Hola Se=C3=B1or!", ""),
+    ("\t !\"#$%&'()*+,-./ :;<>?@[\\]^_`{|}~", "\t !\"#$%&'()*+,-./ :;<>?@[\\]^_`{|}~", ""),
+    ("a" * 75, "a" * 75, ""),
+    ("a" * 76, "a" * 75 + "=\r\na", ""),
+    ("a" * 72 + "=", "a" * 72 + "=3D", ""),
+    ("a" * 73 + "=", "a" * 73 + "=\r\n=3D", ""),
+    ("a" * 74 + "=", "a" * 74 + "=\r\n=3D", ""),
+    ("a" * 75 + "=", "a" * 75 + "=\r\n=3D", ""),
+    (" " * 73, " " * 72 + "=20", ""),
+    (" " * 74, " " * 73 + "=\r\n=20", ""),
+    (" " * 75, " " * 74 + "=\r\n=20", ""),
+    (" " * 76, " " * 75 + "=\r\n=20", ""),
+    (" " * 77, " " * 75 + "=\r\n =20", ""),
+  ]
+  for t in tests {
+    buf = bytes.new_buffer([])
+    w = new_writer(buf)
+    want = t[1]
+    if binary {
+      w.binary = true
+      want = t[2] if t[2] != ""
+    }
+    assert w.write!(t[0].bytes.to_a).ok?
+    assert w.close!.ok?
+    assert_eq buf.to_s, want
+  }
+}
+
+test "writer" {
+  test_writer(false)
+}
+
+test "writer binary" {
+  test_writer(true)
+}
+
+def test_msg -> Str {
+  "Quoted-Printable (QP) est un format d'encodage de données codées sur 8 bits, qui utilise exclusivement les caractères alphanumériques imprimables du code ASCII (7 bits).\r\n" + "\r\n" + "En effet, les différents codages comprennent de nombreux caractères qui ne sont pas représentables en ASCII (par exemple les caractères accentués), ainsi que des caractères dits « non-imprimables ».\r\n" + "\r\n" + "L'encodage Quoted-Printable permet de remédier à ce problème, en procédant de la manière suivante :\r\n" + "\r\n" + "Un octet correspondant à un caractère imprimable de l'ASCII sauf le signe égal (donc un caractère de code ASCII entre 33 et 60 ou entre 62 et 126) ou aux caractères de saut de ligne (codes ASCII 13 et 10) ou une suite de tabulations et espaces non situées en fin de ligne (de codes ASCII respectifs 9 et 32) est représenté tel quel.\r\n" + "Un octet qui ne correspond pas à la définition ci-dessus (caractère non imprimable de l'ASCII, tabulation ou espaces non suivies d'un caractère imprimable avant la fin de la ligne ou signe égal) est représenté par un signe égal, suivi de son numéro, exprimé en hexadécimal.\r\n" + "Enfin, un signe égal suivi par un saut de ligne (donc la suite des trois caractères de codes ASCII 61, 13 et 10) peut être inséré n'importe où, afin de limiter la taille des lignes produites si nécessaire. Une limite de 76 caractères par ligne est généralement respectée.\r\n"
+}
+
+test "round trip" {
+  buf = bytes.new_buffer([])
+  w = new_writer(buf)
+  ~w.write!(test_msg.bytes.to_a)
+  ~w.close!
+  got = ~io.read_all(new_reader(buf))
+  assert_eq Str.from_bytes(got), test_msg
+}
+
+bench "writer" {
+  buf = bytes.new_buffer([])
+  w = new_writer(buf)
+  w.write!(test_msg.bytes.to_a).unwrap
+  w.close!.unwrap
+}
+
+example "new_reader" {
+  for s in ["=48=65=6C=6C=6F=2C=20=47=6F=70=68=65=72=73=21", "invalid escape: <b style=\"font-size: 200%\">hello</b>", "Hello, Gophers! This symbol will be unescaped: =3D and this will be written in =\r\none line."] {
+    b = io.read_all(new_reader(bytes.new_buffer_string(s)))
+    puts "#{Str.from_bytes(b.unwrap)} <nil>"
+  }
+} outputs "Hello, Gophers! <nil>\ninvalid escape: <b style=\"font-size: 200%\">hello</b> <nil>\nHello, Gophers! This symbol will be unescaped: = and this will be written in one line. <nil>\n"
+
+example "new_writer" {
+  buf = bytes.new_buffer([])
+  w = new_writer(buf)
+  w.write!("These symbols will be escaped: = \t".bytes.to_a).unwrap
+  w.close!.unwrap
+  puts buf.to_s
+} outputs "These symbols will be escaped: =3D =09\n"

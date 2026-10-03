@@ -2441,6 +2441,18 @@ impl<'w, 'a> FnCx<'w, 'a> {
     /// an Int variable needs `.to_f` or `.to_u8`.
     fn coerce(&mut self, e: TExpr, want: &Ty) -> R<TExpr> {
         let want = self.resolve(want);
+        // `c ? 1 : 0` where a U64 is wanted: constant branches take the type
+        // (Go's untyped constants, through the conditional).
+        if let TK::Ternary(..) = &e.kind {
+            if self.resolve(&e.ty) != want && (want.int_kind().is_some() || want == Ty::Float) {
+                let sp = e.span;
+                let TK::Ternary(c, a, b) = e.kind else { unreachable!() };
+                let a = self.coerce(*a, &want)?;
+                let b = self.coerce(*b, &want)?;
+                let ty = if self.resolve(&a.ty) == want && self.resolve(&b.ty) == want { want.clone() } else { a.ty.clone() };
+                return Ok(self.mk(TK::Ternary(c, Box::new(a), Box::new(b)), ty, sp));
+            }
+        }
         // A tuple literal coerces element by element (`(1, "a")` as `(U8, Str)`).
         if let (TK::M(M::TupleNew, None, items, None), Ty::Tuple(ts)) = (&e.kind, &want) {
             if items.len() == ts.len() && self.resolve(&e.ty) != want {
@@ -2692,10 +2704,19 @@ impl<'w, 'a> FnCx<'w, 'a> {
                                     }
                                     self.mk(TK::M(M::ErrIs(k), Some(Box::new(l)), vec![], None), Ty::Bool, *vsp)
                                 } else {
-                                    let hits: Vec<(usize, usize)> = errors.iter().enumerate().filter(|(_, t)| tq.as_deref().is_none_or(|q| type_is(t, q))).filter_map(|(k, t)| match t {
+                                    let mut hits: Vec<(usize, usize)> = errors.iter().enumerate().filter(|(_, t)| tq.as_deref().is_none_or(|q| type_is(t, q))).filter_map(|(k, t)| match t {
                                         Ty::Enum(_, vs) => vs.iter().position(|(v, _)| v == vn).map(|j| (k, j)),
                                         _ => None,
                                     }).collect();
+                                    // Several packages may name a variant alike: the
+                                    // current package's own error types win.
+                                    if hits.len() > 1 {
+                                        let pkg = current_pkg();
+                                        let own: Vec<(usize, usize)> = hits.iter().copied().filter(|&(k, _)| errors[k].type_name().is_some_and(|n| pkg_of(n) == pkg)).collect();
+                                        if !own.is_empty() {
+                                            hits = own;
+                                        }
+                                    }
                                     let (k, j) = match hits.as_slice() {
                                         [one] => *one,
                                         [] => return Err(Diag::new(*vsp, format!("no error type has a variant `{vn}`"))),

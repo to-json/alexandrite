@@ -898,7 +898,8 @@ impl<'a> Parser<'a> {
                 return Ok(t);
             }
             if !self.is_op("->") && ps.len() == 1 {
-                // `(T)` groups: `((Int) -> Int)?` is an optional function.
+                // `(T)`, `((A) -> R)?`: a parenthesized type (an optional
+                // function type needs the parentheses).
                 let t = ps.pop().unwrap();
                 if self.is_op("?") && !self.space_before() {
                     self.bump();

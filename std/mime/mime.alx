@@ -1,0 +1,292 @@
+# Package mime: Go's mime — media types, their file extensions, and the
+# encoded-words of RFC 2047.
+#
+#   Go                                      alx
+#   TypeByExtension(ext) string             type_by_extension(ext) -> Str
+#   ExtensionsByType(typ) ([]string, error) extensions_by_type(typ) -> ~[Str]
+#   AddExtensionType(ext, typ) error        Types.add_extension_type!(ext, typ) -> ~Unit
+#   FormatMediaType(t, param) string        format_media_type(t, param: Map[Str, Str]) -> Str
+#   ParseMediaType(v) (mt, params, error)   parse_media_type(v) -> ~(Str, Map[Str, Str])<MimeError>
+#   ErrInvalidMediaParameter                MimeError.InvalidMediaParameter(media_type)
+#   WordEncoder, BEncoding, QEncoding       WordEncoder.BEncoding / .QEncoding, `encode(charset, s)`
+#   WordDecoder{CharsetReader}              WordDecoder.new(charset_reader: ...), `decode`, `decode_header`
+#
+# Differences from Go:
+#  - No global, mutable type table. The package functions answer from Go's
+#    builtin table only (they don't read the system's mime.types or globs2
+#    files). For a table you can change, make a `Types` value:
+#    `builtin_types` (Go's table), `system_types` (the builtin table plus the
+#    system files, as Go's first TypeByExtension call loads them on Unix) or
+#    `new_types` (empty), then `add_extension_type!`, `load_mime_types!`
+#    (the text of a mime.types file), `load_mime_globs!` (the text of a
+#    freedesktop globs2 file), `type_by_extension`, `extensions_by_type`.
+#  - ParseMediaType returns the media type together with
+#    ErrInvalidMediaParameter; a `~T` holds one or the other, so the media
+#    type rides in the error: `MimeError.InvalidMediaParameter(media_type)`.
+#    Its message is Go's ("mime: invalid media parameter").
+#  - FormatMediaType's map is a Map[Str, Str]; a missing map (Go's nil) is
+#    an empty one.
+#  - WordDecoder's CharsetReader is a lambda `(Str, [Byte]) -> ~[Byte]`: it
+#    gets the lower-cased charset and the decoded bytes and returns the UTF-8
+#    text, instead of wrapping an io.Reader (alx has no strings.Reader and
+#    closures over readers buy nothing here).
+#  - Go's base64 decoding errors (base64.CorruptInputError) are
+#    MimeError.Base64(at) with the same message; mime carries its own small
+#    standard base64 coder until encoding/base64 is ported.
+#  - Errors made with fmt.Errorf or errors.New in Go are MimeError variants
+#    with the same messages.
+#
+# Not translated: TestLookupMallocs (allocation counting needs
+# testing.AllocsPerRun), and the Windows / Plan 9 registry tests.
+
+import "os"
+import "strings"
+
+pub error MimeError {
+  NoMediaType
+  NoSlashAfterFirstToken
+  NoTokenAfterSlash
+  UnexpectedContentAfterMediaSubtype
+  # A malformed parameter after a valid media type (Go's
+  # ErrInvalidMediaParameter, returned with that media type).
+  InvalidMediaParameter(media_type: Str)
+  DuplicateParamName
+  # A malformed RFC 2047 encoded-word.
+  InvalidWord
+  InvalidHexByte(b: Byte)
+  UnhandledCharset(charset: Str)
+  # base64 input that isn't valid (Go's base64.CorruptInputError).
+  Base64(at: Int)
+  ExtensionMissingDot(ext: Str)
+
+  def message -> Str {
+    case self {
+      NoMediaType => "mime: no media type"
+      NoSlashAfterFirstToken => "mime: expected slash after first token"
+      NoTokenAfterSlash => "mime: expected token after slash"
+      UnexpectedContentAfterMediaSubtype => "mime: unexpected content after media subtype"
+      InvalidMediaParameter(_) => "mime: invalid media parameter"
+      DuplicateParamName => "mime: duplicate parameter name"
+      InvalidWord => "mime: invalid RFC 2047 encoded-word"
+      InvalidHexByte(b) => "mime: invalid hex byte #{hex_byte(b)}"
+      UnhandledCharset(c) => "mime: unhandled charset #{quote(c)}"
+      Base64(at) => "illegal base64 data at input byte #{at}"
+      ExtensionMissingDot(e) => "mime: extension #{quote(e)} missing leading dot"
+    }
+  }
+}
+
+LOWER_HEX = "0123456789abcdef"
+
+# Go's %#02x of a byte: 0x0, 0x3d.
+def hex_byte(b: Byte) -> Str {
+  return "0x" + Str.from_bytes([LOWER_HEX[b]]) if b < 16
+  "0x" + Str.from_bytes([LOWER_HEX[b >> 4], LOWER_HEX[b & 15]])
+}
+
+# Go's %q for the ASCII strings these messages hold.
+def quote(s: Str) -> Str {
+  out: [Byte] = [34]
+  for c in s.bytes {
+    if c == 34 || c == 92 {
+      out << 92
+      out << c
+    } else if c < 32 || c >= 127 {
+      out << 92
+      out << 120
+      out << LOWER_HEX[c >> 4]
+      out << LOWER_HEX[c & 15]
+    } else {
+      out << c
+    }
+  }
+  out << 34
+  Str.from_bytes(out)
+}
+
+# Go's builtin table (type.go's builtinTypesLower), sorted by extension.
+BUILTIN_EXTS = [".ai", ".apk", ".apng", ".avif", ".bin", ".bmp", ".com", ".css", ".csv", ".doc", ".docx", ".ehtml", ".eml", ".eps", ".exe", ".flac", ".gif", ".gz", ".htm", ".html", ".ico", ".ics", ".jfif", ".jpeg", ".jpg", ".js", ".json", ".m4a", ".mjs", ".mp3", ".mp4", ".oga", ".ogg", ".ogv", ".opus", ".pdf", ".pjp", ".pjpeg", ".png", ".ppt", ".pptx", ".ps", ".rdf", ".rtf", ".shtml", ".svg", ".text", ".tif", ".tiff", ".txt", ".vtt", ".wasm", ".wav", ".weba", ".webm", ".webp", ".xbl", ".xbm", ".xht", ".xhtml", ".xls", ".xlsx", ".xml", ".xsl", ".zip"]
+BUILTIN_TYPES = ["application/postscript", "application/vnd.android.package-archive", "image/apng", "image/avif", "application/octet-stream", "image/bmp", "application/octet-stream", "text/css; charset=utf-8", "text/csv; charset=utf-8", "application/msword", "application/vnd.openxmlformats-officedocument.wordprocessingml.document", "text/html; charset=utf-8", "message/rfc822", "application/postscript", "application/octet-stream", "audio/flac", "image/gif", "application/gzip", "text/html; charset=utf-8", "text/html; charset=utf-8", "image/vnd.microsoft.icon", "text/calendar; charset=utf-8", "image/jpeg", "image/jpeg", "image/jpeg", "text/javascript; charset=utf-8", "application/json", "audio/mp4", "text/javascript; charset=utf-8", "audio/mpeg", "video/mp4", "audio/ogg", "audio/ogg", "video/ogg", "audio/ogg", "application/pdf", "image/jpeg", "image/jpeg", "image/png", "application/vnd.ms-powerpoint", "application/vnd.openxmlformats-officedocument.presentationml.presentation", "application/postscript", "application/rdf+xml", "application/rtf", "text/html; charset=utf-8", "image/svg+xml", "text/plain; charset=utf-8", "image/tiff", "image/tiff", "text/plain; charset=utf-8", "text/vtt; charset=utf-8", "application/wasm", "audio/wav", "audio/webm", "video/webm", "image/webp", "text/xml; charset=utf-8", "image/x-xbitmap", "application/xhtml+xml", "application/xhtml+xml", "application/vnd.ms-excel", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", "text/xml; charset=utf-8", "text/xml; charset=utf-8", "application/zip"]
+
+# The builtin table's index of `ext` (exact match), or -1.
+def builtin_index(ext: Str) -> Int {
+  lo = 0
+  hi = BUILTIN_EXTS.size
+  while lo < hi {
+    mid = (lo + hi) / 2
+    c = strings.compare(BUILTIN_EXTS[mid], ext)
+    return mid if c == 0
+    if c < 0 {
+      lo = mid + 1
+    } else {
+      hi = mid
+    }
+  }
+  -1
+}
+
+# ASCII lower case, or none when s has a byte >= 0x80.
+def ascii_lower(s: Str) -> Str? {
+  need = false
+  for c in s.bytes {
+    return none if c >= 0x80
+    need = true if c >= 65 && c <= 90
+  }
+  return s unless need
+  out: [Byte] = []
+  for c in s.bytes {
+    out << (c >= 65 && c <= 90 ? c + 32 : c)
+  }
+  Str.from_bytes(out)
+}
+
+# The MIME type of the file extension `ext` (with its leading dot, ".html"),
+# from Go's builtin table; "" when unknown. The lookup is exact first, then
+# case-insensitive. Types for text have "; charset=utf-8".
+pub def type_by_extension(ext: Str) -> Str {
+  i = builtin_index(ext)
+  return BUILTIN_TYPES[i] if i >= 0
+  lower = ascii_lower(ext) || strings.to_lower(ext)
+  i = builtin_index(lower)
+  return BUILTIN_TYPES[i] if i >= 0
+  ""
+}
+
+# The extensions Go's builtin table lists for MIME type `typ` (its
+# parameters are ignored), sorted; empty when none.
+pub def extensions_by_type(typ: Str) -> ~[Str] {
+  just, _ = ~parse_media_type(typ)
+  out: [Str] = []
+  for i in 0...BUILTIN_EXTS.size {
+    t = BUILTIN_TYPES[i]
+    k = strings.index_byte(t, 59)
+    t = t[0...k] if k >= 0
+    out << BUILTIN_EXTS[i] if t == just
+  }
+  out
+}
+
+# A table of extensions and MIME types you can add to (Go's package-level
+# table, as a value).
+pub struct Types {
+  # extension as given -> type
+  types: Map[Str, Str]
+  # lower-cased extension -> type
+  lower: Map[Str, Str]
+  # media type without parameters -> lower-cased extensions, in order added
+  exts: Map[Str, [Str]]
+
+  # The MIME type of extension `ext`: exact match first, then
+  # case-insensitive; "" when unknown.
+  pub def type_by_extension(ext: Str) -> Str {
+    if t = types[ext] {
+      return t
+    }
+    lower[ascii_lower(ext) || strings.to_lower(ext)] || ""
+  }
+
+  # The extensions associated with MIME type `typ` (whose parameters are
+  # ignored), sorted; empty when none.
+  pub def extensions_by_type(typ: Str) -> ~[Str] {
+    just, _ = ~parse_media_type(typ)
+    xs = exts[just] || []
+    xs.sort
+  }
+
+  # Associates extension `ext` (with its leading dot) with MIME type `typ`.
+  # A text/ type without a charset gets "; charset=utf-8".
+  pub def add_extension_type!(ext: Str, typ: Str) -> ~Unit {
+    fail MimeError.ExtensionMissingDot(ext) unless strings.has_prefix(ext, ".")
+    self.~set_extension_type!(ext, typ)
+  }
+
+  def set_extension_type!(ext: Str, mime_type: Str) -> ~Unit {
+    just, param = ~parse_media_type(mime_type)
+    typ = mime_type
+    if strings.has_prefix(mime_type, "text/") && (param["charset"] || "") == "" {
+      param["charset"] = "utf-8"
+      typ = format_media_type(just, param)
+    }
+    ext_lower = strings.to_lower(ext)
+    self.types[ext] = typ
+    self.lower[ext_lower] = typ
+    xs = exts[just] || []
+    for v in xs {
+      return if v == ext_lower
+    }
+    xs << ext_lower
+    self.exts[just] = xs
+  }
+
+  # Adds the entries of a mime.types file (its text): lines of a type
+  # followed by extensions without dots; "#" starts a comment.
+  pub def load_mime_types!(text: Str) {
+    for line in strings.split(text, "\n") {
+      fields = strings.fields(line)
+      next if fields.size <= 1 || fields[0][0] == 35
+      mime_type = fields[0]
+      for ext in fields[1...fields.size] {
+        break if ext[0] == 35
+        _ = self.set_extension_type!("." + ext, mime_type)
+      }
+    }
+  }
+
+  # Adds the entries of a freedesktop.org globs2 file (its text): lines of
+  # weight:type:glob; only "*.ext" globs without wildcards count, and an
+  # extension already present keeps its type.
+  pub def load_mime_globs!(text: Str) {
+    for line in strings.split(text, "\n") {
+      fields = strings.split(strings.trim_suffix(line, "\r"), ":")
+      next if fields.size < 3 || fields[0].size < 1 || fields[2].size < 3
+      next if fields[0][0] == 35 || fields[2][0] != 42 || fields[2][1] != 46
+      ext = fields[2][1...fields[2].size]
+      next if strings.contains_any(ext, "?*[")
+      next if types.key?(ext)
+      _ = self.set_extension_type!(ext, fields[1])
+    }
+  }
+}
+
+# An empty table.
+pub def new_types -> Types {
+  Types.new(types: {}, lower: {}, exts: {})
+}
+
+# A table holding Go's builtin types.
+pub def builtin_types -> Types {
+  t = new_types
+  for i in 0...BUILTIN_EXTS.size {
+    ext = BUILTIN_EXTS[i]
+    typ = BUILTIN_TYPES[i]
+    t.types[ext] = typ
+    t.lower[ext] = typ
+    k = strings.index_byte(typ, 59)
+    just = k >= 0 ? typ[0...k] : typ
+    xs = t.exts[just] || []
+    xs << ext
+    t.exts[just] = xs
+  }
+  t
+}
+
+GLOBS_FILES = ["/usr/local/share/mime/globs2", "/usr/share/mime/globs2"]
+TYPES_FILES = ["/etc/mime.types", "/etc/apache2/mime.types", "/etc/apache/mime.types", "/etc/httpd/conf/mime.types"]
+
+# The builtin table plus the system's files, as Go loads them on Unix: the
+# first globs2 file found, else every mime.types file found.
+pub def system_types -> Types {
+  t = builtin_types
+  for f in GLOBS_FILES {
+    if r = os.read_file(f).ok {
+      t.load_mime_globs!(Str.from_bytes(r))
+      return t
+    }
+  }
+  for f in TYPES_FILES {
+    if r = os.read_file(f).ok {
+      t.load_mime_types!(Str.from_bytes(r))
+    }
+  }
+  t
+}

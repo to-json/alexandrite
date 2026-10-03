@@ -190,6 +190,8 @@ pub struct Local {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum M {
+    /// A Ruby string convenience (see strgen.rs; the code is its StrFn).
+    StrHelper(u8),
     // stages
     Select,
     Reject,
@@ -197,6 +199,8 @@ pub enum M {
     FlatMap,
     TakeWhile,
     Drop,
+    /// `step(n)`: every n-th element, from the first (Ruby's Range#step).
+    StepBy,
     Take,
     EachWithIndex,
     Lazy,
@@ -374,7 +378,7 @@ pub enum M {
 impl M {
     pub fn is_stage(self) -> bool {
         use M::*;
-        matches!(self, Select | Reject | Map | FlatMap | TakeWhile | Drop | Take | EachWithIndex | Lazy | EachIndex | EachCons | Chars | Bytes | Runes)
+        matches!(self, Select | Reject | Map | FlatMap | TakeWhile | Drop | Take | StepBy | EachWithIndex | Lazy | EachIndex | EachCons | Chars | Bytes | Runes)
     }
 }
 

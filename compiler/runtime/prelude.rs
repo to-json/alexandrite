@@ -1676,6 +1676,26 @@ mod rt {
     }
 
     impl PInt {
+        /// Str#to_i in promote mode: Ruby's rules, any number of digits.
+        pub fn from_str_ruby(s: &Str) -> PInt {
+            let b: &[u8] = &s.0;
+            let mut i = 0;
+            while i < b.len() && matches!(b[i], b' ' | b'\t' | b'\n') {
+                i += 1;
+            }
+            let mut neg = false;
+            if i < b.len() && (b[i] == b'-' || b[i] == b'+') {
+                neg = b[i] == b'-';
+                i += 1;
+            }
+            let mut r = PInt::from_i64(0);
+            let ten = PInt::from_i64(10);
+            while i < b.len() && b[i].is_ascii_digit() {
+                r = r.mul(&ten).add(&PInt::from_i64((b[i] - b'0') as i64));
+                i += 1;
+            }
+            if neg { PInt::from_i64(0).sub(&r) } else { r }
+        }
         pub fn from_i64(v: i64) -> PInt {
             let mut mag = vec![];
             let mut u = v.unsigned_abs();

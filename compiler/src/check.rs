@@ -1190,12 +1190,12 @@ const SEQ_METHODS: &[&str] = &[
     "select", "filter", "reject", "find", "map", "flat_map", "take_while", "drop", "take", "each_with_index", "lazy", "sum", "max", "min", "max_by", "min_by",
     "first", "to_a", "each", "reduce", "inject", "all?", "any?", "count", "include?", "sort", "size", "length",
 ];
-const ARRAY_EXTRA: &[&str] = &["each_index", "each_cons", "pmap", "last", "<<", "dup"];
+const ARRAY_EXTRA: &[&str] = &["each_index", "each_cons", "pmap", "last", "<<", "dup", "reverse"];
 const INT_METHODS: &[&str] = &["to_s", "to_f", "to_i", "to_u8", "to_i32", "to_u32", "to_u64", "as_u8", "as_i32", "as_u32", "as_u64", "even?", "odd?", "digits", "step"];
 const FLOAT_METHODS: &[&str] = &["to_s", "to_f", "to_i", "abs", "sqrt"];
 /// `fmt` functions the compiler provides (std/fmt/fmt.alx documents them).
 const FMT_BUILTINS: &[&str] = &["sprintf", "printf", "sprint", "sprintln", "print", "println", "errorf"];
-const STR_METHODS: &[&str] = &["chars", "bytes", "runes", "size", "length", "reverse", "delete", "split", "to_i", "to_s"];
+const STR_METHODS: &[&str] = &["chars", "bytes", "runes", "size", "length", "reverse", "delete", "split", "to_i", "to_s", "strip", "lstrip", "rstrip", "lines", "start_with?", "end_with?", "include?"];
 
 fn lev(a: &str, b: &str) -> usize {
     let (a, b): (Vec<char>, Vec<char>) = (a.chars().collect(), b.chars().collect());
@@ -1637,7 +1637,16 @@ impl<'w, 'a> FnCx<'w, 'a> {
 
     fn stmt(&mut self, s: &Stmt) -> R<TStmt> {
         Ok(match &s.kind {
-            StmtKind::Expr(e) => TStmt::Expr(self.expr(e)?),
+            StmtKind::Expr(e) => {
+                let te = self.expr(e)?;
+                if let TK::M(M::Reverse, Some(r), ..) = &te.kind {
+                    if matches!(self.resolve(&r.ty), Ty::Array(_)) {
+                        let d = Diag::new(te.span, "`reverse` makes a new slice, and this one is dropped").note("`xs.reverse!` reverses in place");
+                        self.w.warnings.push(d);
+                    }
+                }
+                TStmt::Expr(te)
+            }
             StmtKind::PlaceMultiAssign(targets, values) => {
                 if targets.len() != values.len() {
                     return Err(Diag::new(s.span, format!("{} places but {} values", targets.len(), values.len())));
@@ -2882,7 +2891,7 @@ impl<'w, 'a> FnCx<'w, 'a> {
         let (rid, s2) = self.opt_tmp(r, sp);
         let mut acc: Option<TExpr> = None;
         for (k, ft) in fts.iter().enumerate() {
-            if matches!(self.resolve(ft), Ty::Array(_) | Ty::Map(..) | Ty::Fixed(..)) {
+            if matches!(self.resolve(ft), Ty::Map(..)) {
                 return Err(Diag::new(sp, format!("`==` on {}: its field of type {} can't be compared; define `def ==(other)`", t.show(), ft.show())));
             }
             let a = self.mk(TK::Local(lid), t.clone(), sp);
@@ -2897,6 +2906,33 @@ impl<'w, 'a> FnCx<'w, 'a> {
         }
         let e = acc.unwrap_or_else(|| self.mk(TK::Bool(true), Ty::Bool, sp));
         Ok(self.mk(TK::Seq(vec![s1, s2, TStmt::Expr(e)]), Ty::Bool, sp))
+    }
+
+    /// `a == b` on slices: `a.size == b.size && (0...a.size).all? { a[i] == b[i] }`.
+    fn arr_eq(&mut self, l: TExpr, r: TExpr, sp: Span) -> R<TExpr> {
+        let t = self.resolve(&l.ty);
+        let el = match &t {
+            Ty::Array(e) | Ty::Fixed(e, _) => (**e).clone(),
+            _ => unreachable!(),
+        };
+        let (lid, s1) = self.opt_tmp(l, sp);
+        let (rid, s2) = self.opt_tmp(r, sp);
+        let side = |cx: &mut Self, id: LocalId| cx.mk(TK::Local(id), t.clone(), sp);
+        let (la, lb) = (side(self, lid), side(self, rid));
+        let size = |cx: &mut Self, x: TExpr| cx.mk(TK::M(M::Size, Some(Box::new(x)), vec![], None), Ty::Int, sp);
+        let (na, nb) = (size(self, la.clone()), size(self, lb.clone()));
+        let same_size = self.binary(BinOp::Eq, na.clone(), nb, sp)?;
+        let i = self.declare(&format!("_eqi{}_{}", sp.lo, self.locals.len()), Ty::Int);
+        let li = self.mk(TK::Local(i), Ty::Int, sp);
+        let ea = self.mk(TK::Index(Box::new(la), Box::new(li.clone())), el.clone(), sp);
+        let eb = self.mk(TK::Index(Box::new(lb), Box::new(li)), el, sp);
+        let body = self.binary(BinOp::Eq, ea, eb, sp)?;
+        let zero = self.mk(TK::Int(0), Ty::Int, sp);
+        let range = self.mk(TK::Range(Box::new(zero), Box::new(na), true), Ty::Range, sp);
+        let blk = TBlock { params: vec![i], destructure: false, body: vec![TStmt::Expr(body)], pure: false, span: sp, own: (i, i + 1) };
+        let all = self.mk(TK::M(M::All, Some(Box::new(range)), vec![], Some(Box::new(blk))), Ty::Bool, sp);
+        let both = self.mk(TK::Bin(BinOp::And, Box::new(same_size), Box::new(all)), Ty::Bool, sp);
+        Ok(self.mk(TK::Seq(vec![s1, s2, TStmt::Expr(both)]), Ty::Bool, sp))
     }
 
     /// Two T? are equal if both are absent or both hold equal values.
@@ -3759,6 +3795,20 @@ impl<'w, 'a> FnCx<'w, 'a> {
             let t = l.ty.clone();
             return Ok(self.mk(TK::Bin(op, Box::new(l), Box::new(r)), t, sp));
         }
+        // `s * n`: s repeated n times (Ruby's String#*, Go's strings.Repeat).
+        if op == BinOp::Mul && lres == Ty::Str {
+            let r = self.coerce(r, &Ty::Int)?;
+            self.expect(&r.ty, &Ty::Int, r.span, "the count in `Str * n`")?;
+            return Ok(self.mk(TK::M(M::StrHelper(7), Some(Box::new(l)), vec![r], None), Ty::Str, sp));
+        }
+        // Slices and fixed arrays compare element by element (Ruby's Array#==).
+        if matches!(op, BinOp::Eq | BinOp::Ne) && matches!(lres, Ty::Array(_) | Ty::Fixed(..)) {
+            if !self.unify(&l.ty, &r.ty) {
+                return Err(Diag::new(sp, format!("`{}` between {} and {}", op.text(), lres.show(), self.resolve(&r.ty).show())));
+            }
+            let eq = self.arr_eq(l, r, sp)?;
+            return Ok(if op == BinOp::Ne { self.mk(TK::Not(Box::new(eq)), Ty::Bool, sp) } else { eq });
+        }
         if matches!(op, BinOp::Eq | BinOp::Ne) && matches!(lres, Ty::Struct(..) | Ty::Tuple(_) | Ty::Enum(..)) {
             if !self.unify(&l.ty, &r.ty) {
                 return Err(Diag::new(sp, format!("`{}` between {} and {}", op.text(), lres.show(), self.resolve(&r.ty).show())));
@@ -4035,6 +4085,15 @@ impl<'w, 'a> FnCx<'w, 'a> {
                 }
                 let v = self.value(&args[0])?;
                 let v = self.show_value(v)?;
+                if name == "print" {
+                    // No newline (Ruby's print, Go's fmt.Print): the text as "#{v}".
+                    let t = self.resolve(&v.ty);
+                    if !printable(&t) {
+                        return Err(Diag::new(args[0].span, format!("can't print a {} yet", t.show())));
+                    }
+                    let text = self.mk(TK::Format(vec![FmtPiece::Str(0)], vec![v]), Ty::Str, sp);
+                    return Ok(self.mk(TK::M(M::PrintStr, None, vec![text], None), Ty::Unit, sp));
+                }
                 return Ok(self.mk(TK::Puts(Box::new(v)), Ty::Unit, sp));
             }
             "panic" if self.w.by_name.get("panic").is_none() => {
@@ -5175,6 +5234,32 @@ impl<'w, 'a> FnCx<'w, 'a> {
                 "to_i" => return Ok(mk_m(self, M::ToI, recv, vec![], None, Ty::Int)),
                 "size" | "length" => return Ok(mk_m(self, M::Size, recv, vec![], None, Ty::Int)),
                 "reverse" => return Ok(mk_m(self, M::Reverse, recv, vec![], None, Ty::Str)),
+                // Ruby's conveniences (Go: strings.TrimSpace, HasPrefix, ...).
+                "strip" | "lstrip" | "rstrip" | "lines" => {
+                    if !args.is_empty() {
+                        return Err(Diag::new(sp, format!("`{name}` takes no arguments")));
+                    }
+                    let (code, ty) = match name {
+                        "strip" => (0, Ty::Str),
+                        "lstrip" => (1, Ty::Str),
+                        "rstrip" => (2, Ty::Str),
+                        _ => (6, Ty::arr(Ty::Str)),
+                    };
+                    return Ok(mk_m(self, M::StrHelper(code), recv, vec![], None, ty));
+                }
+                "start_with?" | "end_with?" | "include?" => {
+                    let a = argv(self)?;
+                    if a.len() != 1 {
+                        return Err(Diag::new(sp, format!("`{name}` takes one string")));
+                    }
+                    self.expect(&a[0].ty, &Ty::Str, a[0].span, name)?;
+                    let code = match name {
+                        "start_with?" => 3,
+                        "end_with?" => 4,
+                        _ => 5,
+                    };
+                    return Ok(mk_m(self, M::StrHelper(code), recv, a, None, Ty::Bool));
+                }
                 "chars" => return Ok(mk_m(self, M::Chars, recv, vec![], None, Ty::seq(Ty::Str, false))),
                 "bytes" => return Ok(mk_m(self, M::Bytes, recv, vec![], None, Ty::seq(Ty::IntK(IntKind::U8), false))),
                 "runes" => return Ok(mk_m(self, M::Runes, recv, vec![], None, Ty::seq(Ty::IntK(IntKind::I32), false))),
@@ -5202,6 +5287,18 @@ impl<'w, 'a> FnCx<'w, 'a> {
             let el = (**el).clone();
             match name {
                 "dup" | "clone" => return Ok(mk_m(self, M::Dup, recv, vec![], None, rt.clone())),
+                // A new slice, last element first (Ruby's; slices.reverse
+                // reverses in place, as Go's does).
+                "reverse" => return Ok(mk_m(self, M::Reverse, recv, vec![], None, rt.clone())),
+                // In place (Ruby's reverse!; slices.reverse(xs) is Go's).
+                "reverse!" => {
+                    let (id, s1) = self.opt_tmp(recv, sp);
+                    let at = self.mk(TK::Local(id), rt.clone(), sp);
+                    let rev = mk_m(self, M::Reverse, at.clone(), vec![], None, rt.clone());
+                    let copy = self.mk(TK::M(M::CopyInto, None, vec![at, rev], None), Ty::Int, sp);
+                    let unit = self.mk(TK::Unit, Ty::Unit, sp);
+                    return Ok(self.mk(TK::Seq(vec![s1, TStmt::Expr(copy), TStmt::Expr(unit)]), Ty::Unit, sp));
+                }
                 "<<" | "push" => {
                     let mut a = argv(self)?;
                     if a.len() != 1 {
@@ -5275,6 +5372,14 @@ impl<'w, 'a> FnCx<'w, 'a> {
                     };
                     return Ok(mk_m(self, M::FlatMap, recv, vec![], Some(blk), seq(inner)));
                 }
+                "step" => {
+                    let a = argv(self)?;
+                    if a.len() != 1 || block.is_some() {
+                        return Err(Diag::new(sp, "`step(n)` takes one argument (every n-th element; use it in a chain or `for`)"));
+                    }
+                    self.expect(&a[0].ty, &Ty::Int, a[0].span, name)?;
+                    return Ok(mk_m(self, M::StepBy, recv, a, None, seq(el)));
+                }
                 "drop" | "take" => {
                     let a = argv(self)?;
                     if a.len() != 1 {
@@ -5346,15 +5451,28 @@ impl<'w, 'a> FnCx<'w, 'a> {
                 }
                 "reduce" | "inject" => {
                     let a = args;
-                    let (init, op) = match (a, block, bsym) {
+                    let (mut init, op) = match (a, block, bsym) {
                         ([Expr { kind: ExprKind::Sym(s), span, .. }], None, None) => (None, Some((s.clone(), *span))),
                         ([init, Expr { kind: ExprKind::Sym(s), span, .. }], None, None) => (Some(self.value(init)?), Some((s.clone(), *span))),
                         ([], Some(_), None) => (None, None),
                         ([init], Some(_), None) => (Some(self.value(init)?), None),
                         _ => return Err(Diag::new(sp, "`reduce` takes a symbol (`reduce(:*)`) or a block")),
                     };
-                    if let Some(i) = &init {
-                        self.expect(&i.ty, &el, i.span, "reduce initial value")?;
+                    // With a block and a start value, the accumulator is the
+                    // start value's type (Ruby's inject: `bytes.reduce(0) { |n, b|
+                    // n * 10 + b.to_i }` sums into an Int). A numeric constant
+                    // over Floats is a Float. The symbol form folds elements.
+                    let mut acc_ty = el.clone();
+                    if let Some(i) = init.take() {
+                        let i = if op.is_none() && !(matches!(i.kind, TK::Const(_) | TK::Int(_)) && self.resolve(&el) == Ty::Float) {
+                            acc_ty = self.resolve(&i.ty);
+                            i
+                        } else {
+                            let c = self.coerce(i, &el)?;
+                            self.expect(&c.ty, &el, c.span, "reduce initial value")?;
+                            c
+                        };
+                        init = Some(i);
                     }
                     let blk = match op {
                         Some((s, ssp)) => {
@@ -5374,12 +5492,12 @@ impl<'w, 'a> FnCx<'w, 'a> {
                             TBlock { params: vec![a, x], destructure: false, body: vec![TStmt::Expr(body)], pure: true, span: ssp , own: (0, 0) }
                         }
                         None => {
-                            let (b, t) = self.block_n(block.unwrap(), &[el.clone(), el.clone()], false)?;
-                            self.expect(&t, &el, b.span, "reduce block")?;
+                            let (b, t) = self.block_n(block.unwrap(), &[acc_ty.clone(), el.clone()], false)?;
+                            self.expect(&t, &acc_ty, b.span, "reduce block")?;
                             b
                         }
                     };
-                    return Ok(mk_m(self, M::Reduce, recv, init.into_iter().collect(), Some(blk), el));
+                    return Ok(mk_m(self, M::Reduce, recv, init.into_iter().collect(), Some(blk), acc_ty));
                 }
                 "all?" | "any?" => {
                     let (blk, bt) = self.any_block(block, bsym, &el, sp, name)?;

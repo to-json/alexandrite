@@ -5,6 +5,8 @@
 //! its `main`.
 
 mod rt;
+mod sched;
+mod suspend;
 mod wasmgen;
 
 use std::path::Path;
@@ -14,7 +16,7 @@ use wasm_bindgen::prelude::*;
 /// program, e.g. `lib/primes.alx`, `fixtures/names.txt`).
 #[wasm_bindgen]
 pub fn set_file(path: &str, data: &[u8]) {
-    rt::st().files.insert(path.to_string(), data.to_vec());
+    rt::sh().files.insert(path.to_string(), data.to_vec());
 }
 
 /// Compile `source` (shown as `name` in messages) to a WebAssembly module.
@@ -26,7 +28,7 @@ pub fn compile(name: &str, source: &str) -> Result<Vec<u8>, String> {
         if key == name {
             return Ok(source.to_string());
         }
-        match rt::st().files.get(&key) {
+        match rt::sh().files.get(&key) {
             Some(b) => Ok(String::from_utf8_lossy(b).into_owned()),
             None => Err(std::io::Error::new(std::io::ErrorKind::NotFound, "not found")),
         }
@@ -35,14 +37,27 @@ pub fn compile(name: &str, source: &str) -> Result<Vec<u8>, String> {
     let list = |p: &Path| -> std::io::Result<Vec<std::path::PathBuf>> {
         let dir = p.to_string_lossy().trim_start_matches("./").trim_end_matches('/').to_string();
         let prefix = if dir.is_empty() || dir == "." { String::new() } else { format!("{dir}/") };
-        let mut v: Vec<std::path::PathBuf> = rt::st().files.keys().filter(|k| k.starts_with(&prefix) && !k[prefix.len()..].contains('/')).map(std::path::PathBuf::from).collect();
+        let mut v: Vec<std::path::PathBuf> = rt::sh().files.keys().filter(|k| k.starts_with(&prefix) && !k[prefix.len()..].contains('/')).map(std::path::PathBuf::from).collect();
         v.sort();
         Ok(v)
     };
     let l = alx::front::load_with(Path::new(name), name, &read, &list).map_err(|(sm, d)| sm.render(&d))?;
     let p = alx::front::check_program(&l, alx::front::lib_defs(&l)).map_err(|d| l.sm.render(&d))?;
     let lp = alx::lower::lower(&p, &l.sm, &alx::lower::Opts { release: false });
-    wasmgen::emit(&lp).map_err(|e| if e.contains("aren't available in the browser") { format!("error: {e}") } else { format!("internal compiler error: {e}") })
+    wasmgen::emit(&lp).map_err(|e| if e.contains("available in the browser") { format!("error: {e}") } else { format!("internal compiler error: {e}") })
+}
+
+/// This thread's RET address: the `rt.ret` global a program instance on
+/// this thread imports.
+#[wasm_bindgen]
+pub fn ret_address() -> u32 {
+    rt::ret_addr() as u32
+}
+
+/// A helper thread starts a run: free its arena from the previous one.
+#[wasm_bindgen]
+pub fn thread_reset() {
+    rt::reset_local();
 }
 
 /// Start a run: fresh memory region and output buffers.
@@ -53,10 +68,10 @@ pub fn begin_run() {
 
 #[wasm_bindgen]
 pub fn take_stdout() -> String {
-    std::mem::take(&mut rt::st().out)
+    std::mem::take(&mut rt::sh().out)
 }
 
 #[wasm_bindgen]
 pub fn take_stderr() -> String {
-    std::mem::take(&mut rt::st().err)
+    std::mem::take(&mut rt::sh().err)
 }

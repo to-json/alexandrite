@@ -135,6 +135,32 @@ bool alx_p_even(AlxPInt a) {
     return mp_iseven(&a.big->m);
 }
 
+/* Str#to_i in promote mode: Ruby's rules (leading blanks, a sign, digits up
+ * to the first non-digit; none is 0), any number of digits. */
+AlxPInt alx_p_from_str(AlxStr s) {
+    int64_t i = 0;
+    while (i < s.len && (s.ptr[i] == ' ' || s.ptr[i] == '\t' || s.ptr[i] == '\n')) i++;
+    bool neg = false;
+    if (i < s.len && (s.ptr[i] == '-' || s.ptr[i] == '+')) neg = s.ptr[i++] == '-';
+    int64_t start = i;
+    while (i < s.len && s.ptr[i] >= '0' && s.ptr[i] <= '9') i++;
+    if (i - start <= 18) {
+        int64_t v = 0;
+        for (int64_t k = start; k < i; k++) v = v * 10 + (s.ptr[k] - '0');
+        return alx_p_from(neg ? -v : v);
+    }
+    char *buf = malloc((size_t)(i - start) + 2);
+    if (!buf) alx_panic("out of memory", "runtime");
+    size_t o = 0;
+    if (neg) buf[o++] = '-';
+    memcpy(buf + o, s.ptr + start, (size_t)(i - start));
+    buf[o + (size_t)(i - start)] = 0;
+    AlxBig *b = new_big();
+    check(mp_read_radix(&b->m, buf, 10));
+    free(buf);
+    return normalize(b);
+}
+
 AlxStr alx_p_to_s(AlxPInt a) {
     if (!a.big) return alx_int_to_s(a.v);
     int size = 0;

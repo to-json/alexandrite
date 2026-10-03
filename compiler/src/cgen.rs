@@ -846,6 +846,7 @@ impl FnEmit<'_> {
                     Rt::Even => s("alx_even"),
                     Rt::PEven => s("alx_p_even"),
                     Rt::PToI64 => s("alx_p_to_i64"),
+                    Rt::PFromStr => s("alx_p_from_str"),
                     Rt::IntToF => format!("((double)({}))", a[0]),
                     Rt::FToI => s("alx_f_to_i"),
                     Rt::FSqrt => s("sqrt"),

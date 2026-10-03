@@ -36,7 +36,7 @@ mod rt {
         alxj_str_eq, alxj_str_cmp, alxj_str_is_pal, alxj_int_ndigits, alxj_digits,
         alxj_puts_str, alxj_print_str, alxj_puts_bool, alxj_puts_unit, alxj_pmap, alxj_pmap_try, alxj_finish,
         alxj_p_add, alxj_p_sub, alxj_p_mul, alxj_p_div, alxj_p_rem, alxj_p_pow, alxj_p_cmp, alxj_p_even, alxj_p_to_i64,
-        alxj_p_to_s, alxj_p_ndigits, alxj_p_digits, alxj_puts_pint,
+        alxj_p_to_s, alxj_p_from_str, alxj_p_ndigits, alxj_p_digits, alxj_puts_pint,
         alxj_puts_f64, alxj_f_to_s, alxj_f_fmt, alxj_f_fmt_e, alxj_str_pad, alxj_str_quote, alxj_f_to_i, alxj_str_cat,
         alxj_puts_u64, alxj_u64_to_s, alxj_int_fmt, alxj_f_to_u64, alxj_rune_to_s, alxj_str_from_bytes,
         alxj_die_str, alxj_panic_str, alxj_exit, alxj_now_ns, alxj_cap_begin, alxj_cap_end, alxj_file_status, alxj_file_read_or_empty,
@@ -1245,6 +1245,7 @@ impl Fx<'_, '_, '_> {
                 Rt::StrSplit => LTy::Arr(Box::new(LTy::Str)),
                 Rt::Digits => LTy::Arr(Box::new(LTy::I64)),
                 Rt::PDigits => LTy::Arr(Box::new(LTy::PInt)),
+                Rt::PFromStr => LTy::PInt,
                 Rt::ArrCopy => self.ty(&args[0]),
                 Rt::Even | Rt::PEven => LTy::Bool,
                 _ => LTy::I64,
@@ -1780,6 +1781,7 @@ impl Fx<'_, '_, '_> {
                 self.load(&s, out, 0)
             }
             Rt::PIntToS => self.pint_call(rt::alxj_p_to_s, Some(&s), &[&args[0]], None),
+            Rt::PFromStr => self.pint_call(rt::alxj_p_from_str, Some(&LTy::PInt), &[&args[0]], None),
             Rt::StrRev => self.pint_call(rt::alxj_str_rev, Some(&s), &[&args[0]], None),
             Rt::StrDelete => self.pint_call(rt::alxj_str_delete, Some(&s), &[&args[0], &args[1]], None),
             Rt::StrSplit => self.pint_call(rt::alxj_str_split, Some(&LTy::Arr(Box::new(LTy::Str))), &[&args[0], &args[1]], None),

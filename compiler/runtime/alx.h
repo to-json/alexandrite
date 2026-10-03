@@ -359,6 +359,7 @@ int64_t alx_select(AlxSelCase *cases, int64_t n, bool has_default, const char *l
 
 /* ---------- bignums (promote mode) ---------- */
 AlxPInt alx_p_from(int64_t v);
+AlxPInt alx_p_from_str(AlxStr s);
 int64_t alx_p_to_i64(AlxPInt a, const char *loc);
 AlxPInt alx_p_add(AlxPInt a, AlxPInt b);
 AlxPInt alx_p_sub(AlxPInt a, AlxPInt b);

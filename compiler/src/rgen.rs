@@ -669,6 +669,7 @@ impl FnEmit<'_> {
                     Rt::Even => call("even"),
                     Rt::PEven => format!("({}).even()", a[0]),
                     Rt::PToI64 => format!("({}).to_i64({})", a[0], a[1]),
+                    Rt::PFromStr => format!("PInt::from_str_ruby(&{})", a[0]),
                     Rt::IntToF => format!("(({}) as f64)", a[0]),
                     Rt::FToI => call("f_to_i"),
                     Rt::FSqrt => format!("({}).sqrt()", a[0]),

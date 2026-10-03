@@ -109,6 +109,7 @@ int64_t alxj_p_cmp(const AlxPInt *a, const AlxPInt *b) { return alx_p_cmp(*a, *b
 int64_t alxj_p_even(const AlxPInt *a) { return alx_p_even(*a); }
 int64_t alxj_p_to_i64(const AlxPInt *a, const char *loc) { return alx_p_to_i64(*a, loc); }
 void alxj_p_to_s(AlxStr *out, const AlxPInt *a) { *out = alx_p_to_s(*a); }
+void alxj_p_from_str(AlxPInt *out, const AlxStr *s) { *out = alx_p_from_str(*s); }
 int64_t alxj_p_ndigits(const AlxPInt *a) { return alx_p_ndigits(*a); }
 void alxj_p_digits(Arr_PInt *out, const AlxPInt *a, const char *loc) { *out = alx_p_digits(*a, loc); }
 void alxj_puts_pint(const AlxPInt *a) { alx_puts_pint(*a); }

@@ -170,7 +170,15 @@ pub fn lower(p: &TProgram, sm: &SourceMap, opts: &Opts) -> LProgram {
 /// in their caller's current region; unknown callees count as allocating.
 fn drop_idle_regions(prog: &mut LProgram) {
     let known: std::collections::HashSet<String> = prog.funcs.iter().map(|f| f.name.clone()).collect();
-    let storage: std::collections::HashSet<String> = prog.funcs.iter().filter(|f| lty_has_storage(&f.ret)).map(|f| f.name.clone()).collect();
+    // Calls that may allocate in the caller's current region: results with
+    // storage, and the generated map helpers that grow the map (they rely on
+    // the caller making the map's region current around them).
+    let storage: std::collections::HashSet<String> = prog
+        .funcs
+        .iter()
+        .filter(|f| lty_has_storage(&f.ret) || f.name.starts_with("__map_set_") || f.name.starts_with("__map_new_"))
+        .map(|f| f.name.clone())
+        .collect();
     let rets = (storage, known);
     // Callees taking something with storage could store into it (in its
     // region, which may be the one an iteration's mark is on).
@@ -2624,6 +2632,36 @@ impl<'a> Lw<'a> {
                 };
                 LE::Index { arr: Box::new(av), idx: Box::new(idx), check }
             }
+            StrHelper(code) => {
+                use crate::strgen::StrFn;
+                let f = [StrFn::Strip, StrFn::Lstrip, StrFn::Rstrip, StrFn::StartWith, StrFn::EndWith, StrFn::Include, StrFn::Lines, StrFn::Repeat][code as usize];
+                let name = crate::strgen::instantiate(&mut self.prog.borrow_mut(), f);
+                let mut av = vec![self.expr(recv.unwrap())];
+                for a in args {
+                    let v = self.expr(a);
+                    av.push(if f == StrFn::Repeat { self.int_in(v, a.span) } else { v });
+                }
+                LE::Call(name.into(), av)
+            }
+            Reverse if matches!(recv.unwrap().ty, Ty::Array(_)) => {
+                let r = recv.unwrap();
+                let at = self.lty(&r.ty);
+                let et = at.clone().arr_elem_lty();
+                let v = self.expr(r);
+                let v = self.bind(v, at.clone());
+                let out = self.tmp(at);
+                self.emit(LS::Set(out, LE::ArrWithCap(et, Box::new(LE::Len(Box::new(v.clone()))))));
+                let i = self.tmp(LTy::I64);
+                self.emit(LS::Set(i, LE::Len(Box::new(v.clone()))));
+                let l = self.label();
+                let body = self.sub(|lw| {
+                    lw.emit(LS::If(LE::Cmp(Op::Le, Box::new(LE::Var(i)), Box::new(LE::I(0)), LTy::I64), vec![LS::Break(l)], vec![]));
+                    lw.emit(LS::Set(i, LE::Arith(Op::Add, Box::new(LE::Var(i)), Box::new(LE::I(-1)), Ovf::Unchecked)));
+                    lw.emit(LS::Push(out, LE::Index { arr: Box::new(v.clone()), idx: Box::new(LE::Var(i)), check: None }));
+                });
+                self.emit(LS::Loop(l, body));
+                LE::Var(out)
+            }
             Reverse => {
                 let v = self.expr(recv.unwrap());
                 LE::Rt(Rt::StrRev, vec![v])
@@ -2635,7 +2673,11 @@ impl<'a> Lw<'a> {
             }
             ToI => {
                 let v = self.expr(recv.unwrap());
-                self.int_out(LE::Rt(Rt::StrToI, vec![v]))
+                if self.promote() && e.ty == Ty::Int {
+                    LE::Rt(Rt::PFromStr, vec![v])
+                } else {
+                    self.int_out(LE::Rt(Rt::StrToI, vec![v]))
+                }
             }
             Delete | Split => {
                 let v = self.expr(recv.unwrap());
@@ -3708,7 +3750,12 @@ impl<'a> Lw<'a> {
                     let (s, v) = lw.sub_val(|lw| lw.inline_block(blk.unwrap(), &[LE::Var(a), x.clone()], &[], None));
                     let mut s = s;
                     s.push(LS::Set(a, v));
-                    lw.emit(LS::If(LE::Var(h), s, vec![LS::Set(a, x), LS::Set(h, LE::B(true))]));
+                    if args.is_empty() {
+                        lw.emit(LS::If(LE::Var(h), s, vec![LS::Set(a, x), LS::Set(h, LE::B(true))]));
+                    } else {
+                        // A start value: the accumulator may be another type.
+                        lw.block(&s);
+                    }
                 }
                 _ => unreachable!(),
             }
@@ -3807,18 +3854,21 @@ impl<'a> Lw<'a> {
         let mut st: Vec<Stage> = vec![];
         for s in stages {
             let TK::M(m, _, args, _) = &s.kind else { unreachable!() };
-            let counter = if matches!(m, M::Drop | M::Take | M::EachWithIndex) {
+            let counter = if matches!(m, M::Drop | M::Take | M::StepBy | M::EachWithIndex) {
                 let c = self.tmp(LTy::I64);
                 self.emit(LS::Set(c, LE::I(0)));
                 Some(c)
             } else {
                 None
             };
-            let limit = if matches!(m, M::Drop | M::Take) {
+            let limit = if matches!(m, M::Drop | M::Take | M::StepBy) {
                 let n = self.expr(&args[0]);
                 let n = self.int_in(n, args[0].span);
                 let nv = self.tmp(LTy::I64);
                 self.emit(LS::Set(nv, n));
+                if *m == M::StepBy {
+                    self.guard(LE::Cmp(Op::Le, Box::new(LE::Var(nv)), Box::new(LE::I(0)), LTy::I64), "`step` must be positive", s.span, "ArithError", 0);
+                }
                 Some(nv)
             } else {
                 None
@@ -3936,23 +3986,35 @@ impl<'a> Lw<'a> {
                 self.emit(LS::Set(i, lo));
                 self.emit(LS::Set(h, hi));
                 let l = own_label.unwrap_or_else(|| self.label());
-                let bounded = matches!(fact, Some(Fact::Interval(_, b)) if b < i64::MAX);
+                // A first `step(n)` stage: the loop counts by n instead.
+                let by = st.first().filter(|s| matches!(s.node.kind, TK::M(M::StepBy, ..))).and_then(|s| s.limit);
+                let first = if by.is_some() { 1 } else { 0 };
+                let fact = if by.is_some() { None } else { fact };
+                let bounded = by.is_none() && matches!(fact, Some(Fact::Interval(_, b)) if b < i64::MAX);
                 let body = self.sub(|lw| {
                     let stop = if excl { Op::Ge } else { Op::Gt };
                     lw.emit(LS::If(LE::Cmp(stop, Box::new(LE::Var(i)), Box::new(LE::Var(h)), LTy::I64), vec![LS::Break(l)], vec![]));
                     let x = lw.tmp(LTy::I64);
                     lw.emit(LS::Set(x, LE::Var(i)));
-                    if bounded {
+                    if let Some(n) = by {
+                        // Counting by n: the last element is the one less than n
+                        // from the end (an unsigned distance, so nothing
+                        // overflows); after it the loop stops.
+                        let gap = LE::Arith(Op::Sub, Box::new(LE::Var(h)), Box::new(LE::Var(i)), Ovf::Wrap);
+                        let last = LE::Prim(Prim::ULt, vec![gap, LE::Var(n)]);
+                        let step = LE::Arith(Op::Add, Box::new(LE::Var(i)), Box::new(LE::Var(n)), Ovf::Wrap);
+                        lw.emit(LS::If(last, vec![LS::Set(h, LE::I(i64::MIN))], vec![LS::Set(i, step)]));
+                    } else if bounded {
                         lw.emit(LS::Set(i, LE::Arith(Op::Add, Box::new(LE::Var(i)), Box::new(LE::I(1)), Ovf::Unchecked)));
                     } else {
                         lw.emit(LS::Set(i, LE::Rt(Rt::SatAdd, vec![LE::Var(i), LE::I(1)])));
                     }
                     // Inclusive range ending at i64::MAX: stop after it.
-                    if !excl && !bounded {
+                    if !excl && !bounded && by.is_none() {
                         lw.emit(LS::If(LE::Cmp(Op::Eq, Box::new(LE::Var(x)), Box::new(LE::I(i64::MAX)), LTy::I64), vec![LS::Set(h, LE::I(i64::MIN))], vec![]));
                     }
                     let xv = if promote { LE::ToP(Box::new(LE::Var(x))) } else { LE::Var(x) };
-                    lw.apply(&st, 0, xv, fact, l, outer, k);
+                    lw.apply(&st, first, xv, fact, l, outer, k);
                 });
                 self.emit(LS::Loop(l, body));
             }
@@ -4120,6 +4182,16 @@ impl<'a> Lw<'a> {
                     vec![LS::Set(c, LE::Arith(Op::Add, Box::new(LE::Var(c)), Box::new(LE::I(1)), Ovf::Unchecked)), LS::Continue(inner)],
                     vec![],
                 ));
+                self.apply(st, i + 1, x, fact, inner, outer, k);
+            }
+            M::StepBy => {
+                // Every n-th: the counter counts down from n - 1 to 0.
+                let c = s.counter.unwrap();
+                let n = s.limit.unwrap();
+                let skip = LE::Cmp(Op::Gt, Box::new(LE::Var(c)), Box::new(LE::I(0)), LTy::I64);
+                let dec = LS::Set(c, LE::Arith(Op::Add, Box::new(LE::Var(c)), Box::new(LE::I(-1)), Ovf::Unchecked));
+                self.emit(LS::If(skip, vec![dec, LS::Continue(inner)], vec![]));
+                self.emit(LS::Set(c, LE::Arith(Op::Add, Box::new(LE::Var(n)), Box::new(LE::I(-1)), Ovf::Unchecked)));
                 self.apply(st, i + 1, x, fact, inner, outer, k);
             }
             M::Take => {

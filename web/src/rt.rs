@@ -16,56 +16,76 @@ use num_integer::Integer;
 use num_traits::{One, Signed, ToPrimitive, Zero};
 use std::cell::UnsafeCell;
 use std::collections::HashMap;
+use std::sync::{LazyLock, Mutex, MutexGuard};
 
-/// Single-threaded global state (wasm32 without threads).
-pub struct G<T>(UnsafeCell<T>);
-unsafe impl<T> Sync for G<T> {}
-impl<T> G<T> {
-    #[allow(clippy::mut_from_ref)]
-    fn get(&self) -> &mut T {
-        unsafe { &mut *self.0.get() }
-    }
-}
-
-/// Aggregate results: up to three words.
-pub static RET: G<[i64; 4]> = G(UnsafeCell::new([0; 4]));
-
-pub fn ret_addr() -> i64 {
-    RET.0.get() as usize as i64
-}
-
-#[derive(Default)]
-pub struct State {
+/// Per-thread state: the arena this thread allocates from, aggregate
+/// results, bignum bookkeeping. With threads (the `atomics` build) each
+/// worker has its own; values still move freely between threads (one
+/// shared memory), only who bumps where is per thread.
+pub struct Local {
+    /// Aggregate results: up to three words (read back by generated code
+    /// at `ret_addr()`, which each thread's program instance imports).
+    ret: [i64; 4],
     chunks: Vec<Vec<u8>>,
     cur: usize,
     end: usize,
     bigs: Vec<Box<BigInt>>,
+    /// 10**k, filled on demand.
+    p10: Vec<BigInt>,
+}
+
+thread_local! {
+    static LOCAL: UnsafeCell<Local> = const { UnsafeCell::new(Local { ret: [0; 4], chunks: Vec::new(), cur: 0, end: 0, bigs: Vec::new(), p10: Vec::new() }) };
+}
+
+/// This thread's state (never shared: no other thread touches it).
+pub fn lo() -> &'static mut Local {
+    LOCAL.with(|l| unsafe { &mut *l.get() })
+}
+
+pub fn ret_addr() -> i64 {
+    lo().ret.as_ptr() as usize as i64
+}
+
+/// State shared by every thread of a run.
+#[derive(Default)]
+pub struct Shared {
     pub out: String,
     pub err: String,
     pub files: HashMap<String, Vec<u8>>,
     /// Kept alive for the program's lifetime: string literals and locations.
     pub consts: Vec<Box<[u8]>>,
-    /// 10**k, filled on demand.
-    p10: Vec<BigInt>,
+    /// Where `Test.begin_capture` started capturing stdout.
+    pub cap: Option<usize>,
 }
 
-pub static ST: G<Option<State>> = G(UnsafeCell::new(None));
+static SHARED: LazyLock<Mutex<Shared>> = LazyLock::new(|| Mutex::new(Shared::default()));
 
-pub fn st() -> &'static mut State {
-    ST.get().get_or_insert_with(State::default)
+/// The shared state, locked (don't hold it across a call that may lock it).
+pub fn sh() -> MutexGuard<'static, Shared> {
+    SHARED.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 const CHUNK: usize = 1 << 20;
 
+/// Free this thread's arena (the previous run's memory).
+pub fn reset_local() {
+    let l = lo();
+    l.chunks.clear();
+    l.cur = 0;
+    l.end = 0;
+    l.bigs.clear();
+}
+
 /// Start a run: drop the previous run's memory and output.
 pub fn reset() {
-    let s = st();
-    s.chunks.clear();
-    s.cur = 0;
-    s.end = 0;
-    s.bigs.clear();
+    reset_local();
+    let mut s = sh();
     s.out.clear();
     s.err.clear();
+    s.cap = None;
+    drop(s);
+    crate::sched::reset();
 }
 
 /// A thrown run: what JS sees. stderr already holds the message.
@@ -73,20 +93,28 @@ pub fn reset() {
 pub enum Stop {
     Abort,
     Exit1,
+    /// A spawned task panicked: the scheduler records it and runs the rest.
+    Task,
+    /// A `pmap` element panicked on a helper thread: the caller re-raises it.
+    Pmap,
 }
 
-fn stop(how: Stop) -> ! {
+/// Throw to JS, through the program's frames. Rust destructors don't run:
+/// the caller must not hold a lock.
+pub(crate) fn stop(how: Stop) -> ! {
     wasm_bindgen::throw_str(match how {
         Stop::Abort => "alx:abort",
         Stop::Exit1 => "alx:exit1",
+        Stop::Task => "alx:task",
+        Stop::Pmap => "alx:pmap",
     })
 }
 
 // ---------- memory ----------
 
-fn alloc(n: usize) -> usize {
+pub(crate) fn alloc(n: usize) -> usize {
     let n = (n.max(1) + 7) & !7;
-    let s = st();
+    let s = lo();
     if s.end - s.cur < n {
         let size = n.max(CHUNK);
         let mut v = Vec::<u8>::with_capacity(size);
@@ -104,21 +132,21 @@ fn alloc(n: usize) -> usize {
     p
 }
 
-fn bytes<'a>(p: i64, n: i64) -> &'a [u8] {
+pub(crate) fn bytes<'a>(p: i64, n: i64) -> &'a [u8] {
     if n <= 0 { &[] } else { unsafe { std::slice::from_raw_parts(p as usize as *const u8, n as usize) } }
 }
 
-fn new_bytes(b: &[u8]) -> i64 {
+pub(crate) fn new_bytes(b: &[u8]) -> i64 {
     let p = alloc(b.len());
     unsafe { std::ptr::copy_nonoverlapping(b.as_ptr(), p as *mut u8, b.len()) };
     p as i64
 }
 
-fn ret(words: &[i64]) {
-    RET.get()[..words.len()].copy_from_slice(words);
+pub(crate) fn ret(words: &[i64]) {
+    lo().ret[..words.len()].copy_from_slice(words);
 }
 
-fn ret_str(b: &[u8]) {
+pub(crate) fn ret_str(b: &[u8]) {
     ret(&[new_bytes(b), b.len() as i64]);
 }
 
@@ -158,12 +186,23 @@ fn loc(lp: i64, ln: i64) -> String {
 }
 
 pub fn panic_msg(what: &str, at: &str) -> ! {
-    st().err.push_str(&format!("alexandrite: {what} at {at}\n"));
-    stop(Stop::Abort)
+    abort_with(format!("alexandrite: {what} at {at}"))
 }
 
 fn overflow_at(at: &str) -> ! {
-    st().err.push_str(&format!("alexandrite: overflow at {at}\nhint: add `#![overflow(promote)]` to this file to promote to bignums\n"));
+    abort_with(format!("alexandrite: overflow at {at}\nhint: add `#![overflow(promote)]` to this file to promote to bignums"))
+}
+
+/// A panic: in a spawned task it ends only the task (the message goes to
+/// `wait`); anywhere else it prints and aborts the run.
+pub(crate) fn abort_with(msg: String) -> ! {
+    crate::sched::task_panic(&msg);
+    {
+        let mut s = sh();
+        s.err.push_str(&msg);
+        s.err.push('\n');
+    }
+    // Throwing skips destructors: no lock may be held from here on.
     stop(Stop::Abort)
 }
 
@@ -179,9 +218,11 @@ pub extern "C" fn alxr_overflow(lp: i64, ln: i64) {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn alxr_die_str(p: i64, n: i64) {
-    let s = st();
-    s.err.push_str(&String::from_utf8_lossy(bytes(p, n)));
-    s.err.push('\n');
+    {
+        let mut s = sh();
+        s.err.push_str(&String::from_utf8_lossy(bytes(p, n)));
+        s.err.push('\n');
+    }
     stop(Stop::Exit1)
 }
 
@@ -189,14 +230,14 @@ pub extern "C" fn alxr_die_str(p: i64, n: i64) {
 pub extern "C" fn alxr_file_status(p: i64, n: i64) -> i64 {
     let path = String::from_utf8_lossy(bytes(p, n)).into_owned();
     let key = path.trim_start_matches("./");
-    if st().files.contains_key(key) { 0 } else { 1 }
+    if sh().files.contains_key(key) { 0 } else { 1 }
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn alxr_file_read_or_empty(p: i64, n: i64) {
     let path = String::from_utf8_lossy(bytes(p, n)).into_owned();
     let key = path.trim_start_matches("./");
-    let data = st().files.get(key).cloned().unwrap_or_default();
+    let data = sh().files.get(key).cloned().unwrap_or_default();
     ret_str(&data);
 }
 
@@ -449,7 +490,7 @@ pub extern "C" fn alxr_sort_str(p: i64, len: i64) {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn alxr_puts_i64(v: i64) {
-    let s = st();
+    let mut s = sh();
     s.out.push_str(&v.to_string());
     s.out.push('\n');
 }
@@ -462,13 +503,13 @@ pub extern "C" fn alxr_mul_ovf(a: i64, b: i64) -> i32 {
 #[unsafe(no_mangle)]
 pub extern "C" fn alxr_print_str(p: i64, n: i64) {
     let b = bytes(p, n);
-    st().out.push_str(&String::from_utf8_lossy(b));
+    sh().out.push_str(&String::from_utf8_lossy(b));
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn alxr_puts_str(p: i64, n: i64) {
     let b = bytes(p, n);
-    let s = st();
+    let mut s = sh();
     s.out.push_str(&String::from_utf8_lossy(b));
     if b.last() != Some(&b'\n') {
         s.out.push('\n');
@@ -477,12 +518,12 @@ pub extern "C" fn alxr_puts_str(p: i64, n: i64) {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn alxr_puts_bool(b: i32) {
-    st().out.push_str(if b != 0 { "true\n" } else { "false\n" });
+    sh().out.push_str(if b != 0 { "true\n" } else { "false\n" });
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn alxr_puts_unit() {
-    st().out.push('\n');
+    sh().out.push('\n');
 }
 
 // ---------- bignums (promote mode) ----------
@@ -499,7 +540,7 @@ fn pint(x: BigInt) -> [i64; 2] {
         None => {
             let bx = Box::new(x);
             let p = &*bx as *const BigInt as usize as i64;
-            st().bigs.push(bx);
+            lo().bigs.push(bx);
             [0, p]
         }
     }
@@ -507,6 +548,28 @@ fn pint(x: BigInt) -> [i64; 2] {
 
 fn ret_p(x: BigInt) {
     ret(&pint(x));
+}
+
+/// Str#to_i in promote mode: Ruby's rules, any number of digits.
+#[unsafe(no_mangle)]
+pub extern "C" fn alxr_p_from_str(p: i64, n: i64) {
+    let s = bytes(p, n);
+    let mut i = 0;
+    while i < s.len() && matches!(s[i], b' ' | b'\t' | b'\n') {
+        i += 1;
+    }
+    let mut neg = false;
+    if i < s.len() && (s[i] == b'-' || s[i] == b'+') {
+        neg = s[i] == b'-';
+        i += 1;
+    }
+    let start = i;
+    while i < s.len() && s[i].is_ascii_digit() {
+        i += 1;
+    }
+    let digits = std::str::from_utf8(&s[start..i]).unwrap_or("0");
+    let v: BigInt = if digits.is_empty() { BigInt::from(0) } else { digits.parse().unwrap_or_default() };
+    ret_p(if neg { -v } else { v });
 }
 
 #[unsafe(no_mangle)]
@@ -620,7 +683,7 @@ pub extern "C" fn alxr_p_ndigits(v: i64, b: i64) -> i64 {
 }
 
 fn p10(k: usize) -> &'static BigInt {
-    let t = &mut st().p10;
+    let t = &mut lo().p10;
     if t.is_empty() {
         t.push(BigInt::one());
     }
@@ -628,7 +691,7 @@ fn p10(k: usize) -> &'static BigInt {
         let next = t.last().unwrap() * 10u32;
         t.push(next);
     }
-    &st().p10[k]
+    &lo().p10[k]
 }
 
 #[unsafe(no_mangle)]
@@ -704,7 +767,7 @@ pub extern "C" fn alxr_umulhi(a: i64, b: i64) -> i64 {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn alxr_puts_u64(v: i64) {
-    let s = st();
+    let mut s = sh();
     s.out.push_str(&(v as u64).to_string());
     s.out.push('\n');
 }
@@ -758,7 +821,7 @@ pub extern "C" fn alxr_rune_to_s(r: i64) {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn alxr_puts_f64(x: f64) {
-    let s = st();
+    let mut s = sh();
     s.out.push_str(&go_float(x));
     s.out.push('\n');
 }
@@ -849,7 +912,7 @@ pub extern "C" fn alxr_str_cat(p: i64, n: i64) {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn alxr_puts_pint(v: i64, b: i64) {
-    let s = st();
+    let mut s = sh();
     s.out.push_str(&p_string(v, b));
     s.out.push('\n');
 }

@@ -20,4 +20,5 @@ pub mod prove;
 pub mod regions;
 pub mod rgen;
 pub mod sharing;
+pub mod strgen;
 pub mod tast;

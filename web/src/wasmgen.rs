@@ -15,10 +15,11 @@
 //! and reloaded on entry.
 
 use crate::rt;
+use crate::suspend::{self, Info};
 use alx::lir::*;
 use std::collections::HashMap;
 use wasm_encoder::{
-    BlockType, CodeSection, ConstExpr, ElementSection, Elements, EntityType, ExportKind, ExportSection, Function, FunctionSection, ImportSection, InstructionSink, MemArg, MemoryType, Module, RefType, TableSection, TableType, TypeSection, ValType,
+    BlockType, CodeSection, ConstExpr, ElementSection, Elements, EntityType, ExportKind, ExportSection, Function, FunctionSection, GlobalSection, GlobalType, ImportSection, InstructionSink, MemArg, MemoryType, Module, RefType, TableSection, TableType, TypeSection, ValType,
 };
 
 const W: ValType = ValType::I64;
@@ -70,6 +71,7 @@ const RT: &[(&str, &str)] = &[
     ("alxr_p_even", "jj>i"),
     ("alxr_p_to_i64", "jjjj>j"),
     ("alxr_p_to_s", "jj>"),
+    ("alxr_p_from_str", "jj>"),
     ("alxr_p_ndigits", "jj>j"),
     ("alxr_p_digits", "jjjj>"),
     ("alxr_puts_pint", "jj>"),
@@ -89,7 +91,52 @@ const RT: &[(&str, &str)] = &[
     ("alxr_f_to_u64", "fjj>j"),
     ("alxr_rune_to_s", "j>"),
     ("alxr_str_from_bytes", "jj>"),
+    ("alxr_panic_str", "jj>"),
+    ("alxr_cap_begin", ">j"),
+    ("alxr_cap_end", ">"),
+    ("alxr_now_ns", ">j"),
+    ("alxr_wall_ns", ">j"),
+    ("alxr_local_offset", "j>j"),
+    ("alxr_local_zone", "j>j"),
+    ("alxr_str_from_cstr", "j>"),
+    // tasks (sched.rs)
+    ("alxr_task_begin", "i>j"),
+    ("alxr_task_resuming", ">i"),
+    ("alxr_task_env", ">j"),
+    ("alxr_task_done", "j>"),
+    ("alxr_task_suspended", ">"),
+    ("alxr_frame_push", "j>j"),
+    ("alxr_frame_pop", "j>j"),
+    ("alxr_spawn", "jj>j"),
+    ("alxr_wait", "j>i"),
+    ("alxr_chan_new", "j>j"),
+    ("alxr_chan_len", "j>j"),
+    ("alxr_chan_send", "jjjj>i"),
+    ("alxr_chan_recv", "j>i"),
+    ("alxr_chan_close", "jjj>"),
+    ("alxr_select", "jji>j"),
+    ("alxr_lock_new", ">j"),
+    ("alxr_lock", "j>i"),
+    ("alxr_unlock", "j>"),
+    ("alxr_sleep", "j>i"),
+    // pmap on threads (sched.rs)
+    ("alxr_pmap_begin", "jjjj>j"),
+    ("alxr_pmap_claim", "j>j"),
+    ("alxr_pmap_chunk_done", "j>"),
+    ("alxr_pmap_fail", "jjj>"),
+    ("alxr_pmap_wait", "j>j"),
+    ("alxr_pmap_job", ">j"),
 ];
+
+/// Imported global: the address of this thread's RET (aggregate results).
+const RETG: u32 = 0;
+/// The program's own global: 0 running, 1 unwinding a suspending task
+/// (saving frames), 2 rewinding one (restoring them).
+const MODE: u32 = 1;
+/// The threaded build (`atomics`): the memory is shared, atomics are atomic.
+const MT: bool = cfg!(target_feature = "atomics");
+const UNWIND: i32 = 1;
+const REWIND: i32 = 2;
 
 fn sig_of(s: &str) -> (Vec<ValType>, Vec<ValType>) {
     let (a, r) = s.split_once('>').unwrap();
@@ -172,18 +219,14 @@ fn elem(t: &LTy) -> &LTy {
     }
 }
 
-fn count_yields(s: &LS) -> usize {
-    match s {
-        LS::Yield(_) => 1,
-        LS::If(_, a, b) => a.iter().map(count_yields).sum::<usize>() + b.iter().map(count_yields).sum::<usize>(),
-        LS::Loop(_, b) => b.iter().map(count_yields).sum(),
-        _ => 0,
-    }
-}
-
 /// Generator state: next-function table index, state, then every variable.
 fn gen_offsets(f: &LFunc) -> (Vec<u32>, u32) {
-    let mut off = 16u32;
+    var_offsets(f, 16)
+}
+
+/// Every variable's offset after `start` header bytes; the total size.
+fn var_offsets(f: &LFunc, start: u32) -> (Vec<u32>, u32) {
+    let mut off = start;
     let mut offs = vec![];
     for v in &f.vars {
         let l = lay(&v.ty);
@@ -218,12 +261,21 @@ struct Ctx<'p> {
     gens: HashMap<usize, (u32, u32, &'p LGen)>, // func index, table index
     workers: HashMap<usize, (u32, &'p LWorker)>,
     consts: HashMap<String, (i64, i64)>,
-    ret: i64,
     /// Each global's type and address in the runtime's memory.
     globals: Vec<(LTy, i64)>,
+    tys: Tys,
+    info: Info,
+    /// Each extern's symbol.
+    externs: Vec<String>,
+    /// Each pmap worker's chunk function (threads).
+    chunks: HashMap<usize, u32>,
 }
 
 impl Ctx<'_> {
+    fn info_sym(&self, i: usize) -> String {
+        self.externs[i].clone()
+    }
+
     fn ty(&mut self, params: Vec<ValType>, results: Vec<ValType>) -> u32 {
         let key = (params, results);
         if let Some(i) = self.type_idx.get(&key) {
@@ -242,7 +294,7 @@ impl Ctx<'_> {
         }
         let b: Box<[u8]> = s.as_bytes().to_vec().into_boxed_slice();
         let c = (b.as_ptr() as usize as i64, b.len() as i64);
-        rt::st().consts.push(b);
+        rt::sh().consts.push(b);
         self.consts.insert(s.to_string(), c);
         c
     }
@@ -267,45 +319,20 @@ fn worker_sig(w: &LWorker) -> (Vec<ValType>, Vec<ValType>) {
     (vts(&w.func.vars[p].ty), vts(&w.func.ret))
 }
 
-/// Does the program use tasks or channels? (Checked on the Debug form of the
-/// IR: the browser has no threads, so these are rejected up front.)
-fn uses_concurrency(p: &LProgram) -> bool {
-    let funcs = p.funcs.iter().chain(p.gens.iter().map(|g| &g.func)).chain(p.workers.iter().map(|w| &w.func));
-    funcs.into_iter().any(|f| {
-        let d = format!("{:?}", f.body);
-        ["Spawn {", "Wait {", "ChanSend {", "ChanRecv {", "ChanClose {", "Select {", "ChanNew(", "ChanLen(", "LockNew", "AtomicNew("].iter().any(|k| d.contains(k))
-    })
-}
-
-/// Does the program call C (`extern def`, `C.errno`, `Str.from_cstr`...)? The
-/// browser has no C library.
-fn uses_ffi(p: &LProgram) -> bool {
-    if !p.externs.is_empty() {
-        return true;
-    }
-    let funcs = p.funcs.iter().chain(p.gens.iter().map(|g| &g.func)).chain(p.workers.iter().map(|w| &w.func));
-    funcs.into_iter().any(|f| {
-        let d = format!("{:?}", f.body);
-        ["Rt(Errno", "Rt(Strerror", "Rt(StrFromCstr", "Rt(StrFromPtr"].iter().any(|k| d.contains(k))
-    })
-}
-
 pub fn emit(p: &LProgram) -> Result<Vec<u8>, String> {
-    if uses_ffi(p) {
-        return Err("`extern def` and the C library aren't available in the browser".into());
-    }
-    if uses_concurrency(p) {
-        return Err("spawn, channels, Mutex and Atomic aren't available in the browser yet".into());
-    }
-    rt::st().consts.clear();
-    let mut cx = Ctx { types: vec![], type_idx: HashMap::new(), rt_idx: HashMap::new(), funcs: HashMap::new(), gens: HashMap::new(), workers: HashMap::new(), consts: HashMap::new(), ret: rt::ret_addr(), globals: vec![] };
+    let mut owned = p.clone();
+    let info = suspend::prepare(&mut owned)?;
+    let p = &owned;
+    rt::sh().consts.clear();
+    let mut cx = Ctx { types: vec![], type_idx: HashMap::new(), rt_idx: HashMap::new(), funcs: HashMap::new(), gens: HashMap::new(), workers: HashMap::new(), consts: HashMap::new(), globals: vec![], tys: Tys::new(p), info, externs: p.externs.iter().map(|x| x.sym.clone()).collect(), chunks: HashMap::new() };
     for t in &p.globals {
         let b: Box<[u8]> = vec![0u8; lay(t).size.next_multiple_of(8) as usize].into_boxed_slice();
         cx.globals.push((t.clone(), b.as_ptr() as usize as i64));
-        rt::st().consts.push(b);
+        rt::sh().consts.push(b);
     }
     let mut imports = ImportSection::new();
-    imports.import("env", "memory", EntityType::Memory(MemoryType { minimum: 1, maximum: None, memory64: false, shared: false, page_size_log2: None }));
+    imports.import("env", "memory", EntityType::Memory(MemoryType { minimum: 1, maximum: MT.then_some(65536), memory64: false, shared: MT, page_size_log2: None }));
+    imports.import("rt", "ret", EntityType::Global(GlobalType { val_type: I, mutable: false, shared: false }));
     for (k, (name, sig)) in RT.iter().enumerate() {
         let (a, r) = sig_of(sig);
         let t = cx.ty(a, r);
@@ -332,6 +359,26 @@ pub fn emit(p: &LProgram) -> Result<Vec<u8>, String> {
         order.push((next, worker_sig(w)));
         next += 1;
     }
+    // run_task(t): run (or resume) task t; see sched.rs.
+    let run_task = cx.info.sched.then(|| {
+        order.push((next, (vec![I], vec![])));
+        next += 1;
+        next - 1
+    });
+    // With threads, pmap runs in chunks on every thread: a chunk function
+    // per worker, and run_pmap for helpers (see sched.rs).
+    let par = MT && cx.info.sched && !cx.info.pmapped.is_empty();
+    let mut run_pmap = None;
+    if par {
+        for &w in &cx.info.pmapped.clone() {
+            cx.chunks.insert(w, next);
+            order.push((next, (vec![W; 5], vec![])));
+            next += 1;
+        }
+        order.push((next, (vec![], vec![])));
+        run_pmap = Some(next);
+        next += 1;
+    }
     let mut fsec = FunctionSection::new();
     for (_, (a, r)) in &order {
         let t = cx.ty(a.clone(), r.clone());
@@ -354,10 +401,27 @@ pub fn emit(p: &LProgram) -> Result<Vec<u8>, String> {
         let func = Fx::new(&mut cx, f, kind, g, w).body();
         code.function(&func);
     }
-
     let main = p.funcs.iter().find(|f| f.is_main).ok_or("no main")?;
+    if run_task.is_some() {
+        code.function(&run_task_body(&mut cx, main));
+    }
+    if par {
+        for &w in &cx.info.pmapped.clone() {
+            code.function(&pmap_chunk_body(&mut cx, w));
+        }
+        code.function(&run_pmap_body(&mut cx));
+    }
+
     let mut exports = ExportSection::new();
     exports.export("main", ExportKind::Func, cx.funcs[main.name.as_str()].0);
+    if let Some(i) = run_task {
+        exports.export("run_task", ExportKind::Func, i);
+    }
+    if let Some(i) = run_pmap {
+        exports.export("run_pmap", ExportKind::Func, i);
+    }
+    let mut globals = GlobalSection::new();
+    globals.global(GlobalType { val_type: I, mutable: true, shared: false }, &ConstExpr::i32_const(0));
 
     let mut tables = TableSection::new();
     tables.table(TableType { element_type: RefType::FUNCREF, table64: false, minimum: p.gens.len() as u64, maximum: Some(p.gens.len() as u64), shared: false });
@@ -372,12 +436,175 @@ pub fn emit(p: &LProgram) -> Result<Vec<u8>, String> {
         types.ty().function(a.iter().copied(), r.iter().copied());
     }
     let mut m = Module::new();
-    m.section(&types).section(&imports).section(&fsec).section(&tables).section(&exports);
+    m.section(&types).section(&imports).section(&fsec).section(&tables).section(&globals).section(&exports);
     if !p.gens.is_empty() {
         m.section(&elems);
     }
     m.section(&code);
     Ok(m.finish())
+}
+
+/// `run_task(t)`: run task `t` (main, or a spawned worker on its
+/// environment) until it returns or suspends. A suspended task has frames
+/// saved: this rewinds into them instead of starting over.
+fn run_task_body<'p>(cx: &mut Ctx<'p>, main: &'p LFunc) -> Function {
+    let spawned = cx.info.spawned.clone();
+    let mut fx = shim(cx, "run_task", 1);
+    let w = fx.local(W);
+    fx.ins().local_get(0);
+    fx.rt("alxr_task_begin");
+    fx.ins().local_set(w);
+    fx.rt("alxr_task_resuming");
+    fx.if_(vec![]);
+    fx.ins().i32_const(REWIND).global_set(MODE);
+    fx.end();
+    // Unwound: the task is parked (or requeued); back to the scheduler.
+    let unwound = |fx: &mut Fx| {
+        fx.ins().global_get(MODE).i32_const(UNWIND).i32_eq();
+        fx.if_(vec![]);
+        fx.ins().i32_const(0).global_set(MODE);
+        fx.rt("alxr_task_suspended");
+        fx.ins().return_();
+        fx.end();
+    };
+    let main_idx = fx.cx.funcs[main.name.as_str()].0;
+    fx.ins().local_get(w).i64_const(-1).i64_eq();
+    fx.if_(vec![]);
+    fx.ins().call(main_idx);
+    unwound(&mut fx);
+    fx.i64c(0);
+    fx.rt("alxr_task_done");
+    fx.ins().return_();
+    fx.end();
+    for id in spawned {
+        let (widx, wk) = fx.cx.workers[&id];
+        let in_t = wk.input.clone();
+        let out_t = wk.func.ret.clone();
+        fx.ins().local_get(w).i64_const(id as i64).i64_eq();
+        fx.if_(vec![]);
+        fx.ins().global_get(MODE).i32_const(REWIND).i32_eq();
+        fx.if_(vts(&in_t));
+        fx.zeros(&vts(&in_t));
+        fx.else_();
+        let env = fx.local(W);
+        fx.rt("alxr_task_env");
+        fx.ins().local_set(env);
+        fx.load(&in_t, env, 0);
+        fx.end();
+        fx.ins().call(widx);
+        let vals = fx.pop(&vts(&out_t));
+        unwound(&mut fx);
+        let p = fx.local(W);
+        fx.i64c(lay(&out_t).size as i64);
+        fx.rt("alxr_alloc");
+        fx.ins().local_set(p);
+        fx.store(&out_t, p, 0, &vals);
+        fx.ins().local_get(p);
+        fx.rt("alxr_task_done");
+        fx.ins().return_();
+        fx.end();
+    }
+    fx.ins().end();
+    let mut func = Function::new_with_locals_types(fx.locals.iter().copied());
+    func.raw(fx.code.iter().copied());
+    func
+}
+
+/// A function built by hand (not from LIR) with `nparams` i64 parameters.
+fn shim<'c, 'p>(cx: &'c mut Ctx<'p>, name: &str, nparams: u32) -> Fx<'c, 'p> {
+    let f: &'static LFunc = Box::leak(Box::new(LFunc { name: name.into(), params: vec![], vars: vec![], ret: LTy::Unit, body: vec![], external: false, is_main: false, labels: 0 }));
+    let mut fx = Fx::new(cx, f, Kind::Plain, None, None);
+    fx.nparams = nparams;
+    fx
+}
+
+fn finish(fx: Fx) -> Function {
+    let mut fx = fx;
+    fx.ins().end();
+    let mut func = Function::new_with_locals_types(fx.locals.iter().copied());
+    func.raw(fx.code.iter().copied());
+    func
+}
+
+/// `chunk(job, in, out, lo, hi)`: pmap worker `id` over elements lo..hi.
+/// A failing element (fallible worker) is reported and ends the chunk.
+fn pmap_chunk_body(cx: &mut Ctx, id: usize) -> Function {
+    let (widx, w) = cx.workers[&id];
+    let (out_t, res_t) = cx.info.pmap_tys[&id].clone();
+    let in_t = w.input.clone();
+    let (iesz, oesz) = (lay(&in_t).size as i64, lay(&out_t).size as i64);
+    let mut fx = shim(cx, "pmap_chunk", 5);
+    let (job, inp, out, i, hi) = (0, 1, 2, 3, 4);
+    let addr = fx.local(W);
+    fx.ins().block(BlockType::Empty).loop_(BlockType::Empty);
+    fx.frames.push(Frame::Other);
+    fx.frames.push(Frame::Other);
+    fx.ins().local_get(i).local_get(hi).i64_ge_s().br_if(1);
+    fx.ins().local_get(inp).local_get(i).i64_const(iesz).i64_mul().i64_add().local_set(addr);
+    fx.load(&in_t, addr, 0);
+    fx.ins().call(widx);
+    let vals = match &res_t {
+        None => fx.pop(&vts(&out_t)),
+        Some(rt) => {
+            let rv = fx.pop(&vts(rt));
+            fx.ins().local_get(rv[0]).i32_eqz();
+            fx.if_(vec![]);
+            let p = fx.local(W);
+            fx.i64c(lay(rt).size as i64);
+            fx.rt("alxr_alloc");
+            fx.ins().local_set(p);
+            fx.store(rt, p, 0, &rv);
+            fx.ins().local_get(job).local_get(i).local_get(p);
+            fx.rt("alxr_pmap_fail");
+            fx.ins().br(2);
+            fx.end();
+            rv[1..1 + vts(&out_t).len()].to_vec()
+        }
+    };
+    fx.ins().local_get(out).local_get(i).i64_const(oesz).i64_mul().i64_add().local_set(addr);
+    fx.store(&out_t, addr, 0, &vals);
+    fx.ins().local_get(i).i64_const(1).i64_add().local_set(i).br(0);
+    fx.end();
+    fx.end();
+    fx.ins().local_get(job);
+    fx.rt("alxr_pmap_chunk_done");
+    finish(fx)
+}
+
+/// `run_pmap()`: a helper thread works on open pmap jobs until none are left.
+fn run_pmap_body(cx: &mut Ctx) -> Function {
+    let ws = cx.info.pmapped.clone();
+    let mut fx = shim(cx, "run_pmap", 0);
+    let (job, w, inp, out, lo) = (fx.local(W), fx.local(W), fx.local(W), fx.local(W), fx.local(W));
+    fx.ins().loop_(BlockType::Empty);
+    fx.frames.push(Frame::Other);
+    fx.rt("alxr_pmap_job");
+    fx.ins().local_tee(job).i64_const(0).i64_lt_s();
+    fx.if_(vec![]);
+    fx.ins().return_();
+    fx.end();
+    fx.ret_words(3);
+    fx.ins().local_set(out).local_set(inp).local_set(w);
+    for id in ws {
+        let chunk = fx.cx.chunks[&id];
+        fx.ins().local_get(w).i64_const(id as i64).i64_eq();
+        fx.if_(vec![]);
+        fx.ins().block(BlockType::Empty).loop_(BlockType::Empty);
+        fx.frames.push(Frame::Other);
+        fx.frames.push(Frame::Other);
+        fx.ins().local_get(job);
+        fx.rt("alxr_pmap_claim");
+        fx.ins().local_tee(lo).i64_const(0).i64_lt_s().br_if(1);
+        fx.ins().local_get(job).local_get(inp).local_get(out).local_get(lo);
+        fx.ret_words(1);
+        fx.ins().call(chunk).br(0);
+        fx.end();
+        fx.end();
+        fx.end();
+    }
+    fx.ins().br(0);
+    fx.end();
+    finish(fx)
 }
 
 struct Fx<'c, 'p> {
@@ -395,6 +622,11 @@ struct Fx<'c, 'p> {
     resume: u32,
     offs: Vec<u32>,
     ny: usize,
+    /// This function can suspend its task (see sched.rs): it saves and
+    /// restores a frame laid out by `foffs` (after the resume point).
+    susp: bool,
+    foffs: Vec<u32>,
+    fsize: u32,
 }
 
 fn mem(off: u32, f: F) -> MemArg {
@@ -413,7 +645,13 @@ impl<'c, 'p> Fx<'c, 'p> {
             Kind::Worker => worker_sig(w.unwrap()).0,
             _ => user_sig(f).0,
         };
-        let mut fx = Fx { cx, f, kind, lgen, nparams: params.len() as u32, locals: vec![], vars: vec![], code: vec![], frames: vec![], g: 0, resume: 0, offs: vec![], ny: 0 };
+        let susp = match kind {
+            Kind::Plain | Kind::Main => cx.info.funcs.contains(&f.name),
+            Kind::Worker => w.is_some_and(|w| cx.info.workers.contains(&w.id)),
+            Kind::Gen => false,
+        };
+        let (foffs, fsize) = if susp { var_offsets(f, 8) } else { (vec![], 0) };
+        let mut fx = Fx { cx, f, kind, lgen, nparams: params.len() as u32, locals: vec![], vars: vec![], code: vec![], frames: vec![], g: 0, resume: 0, offs: vec![], ny: 0, susp, foffs, fsize };
         // Parameters are the parameter variables' locals, in parameter order.
         let pvars: Vec<V> = if kind == Kind::Gen { vec![] } else { f.params.clone() };
         let mut vars: Vec<Option<Vec<u32>>> = vec![None; f.vars.len()];
@@ -546,9 +784,8 @@ impl<'c, 'p> Fx<'c, 'p> {
 
     /// Push RET[0..n] (words).
     fn ret_words(&mut self, n: u32) {
-        let r = self.cx.ret as i32;
         for k in 0..n {
-            self.ins().i32_const(r).i64_load(mem(8 * k, F::Wd));
+            self.ins().global_get(RETG).i64_load(mem(8 * k, F::Wd));
         }
     }
 
@@ -611,7 +848,25 @@ impl<'c, 'p> Fx<'c, 'p> {
                 let r = self.resume;
                 self.ins().local_get(st).i32_wrap_i64().local_set(r);
             }
-            Kind::Worker => {}
+            _ if self.susp => {
+                // Resuming: restore this call's frame and continue at its point.
+                self.resume = self.local(I);
+                self.ins().global_get(MODE).i32_const(REWIND).i32_eq();
+                self.if_(vec![]);
+                let p = self.local(W);
+                self.i64c(self.fsize as i64);
+                self.rt("alxr_frame_pop");
+                self.ins().local_set(p);
+                let r = self.resume;
+                self.addr(p);
+                self.ins().i64_load(mem(0, F::Wd)).i32_wrap_i64().local_set(r);
+                for (i, v) in f.vars.iter().enumerate() {
+                    let off = self.foffs[i];
+                    self.load(&v.ty, p, off);
+                    self.set_var(i);
+                }
+                self.end();
+            }
             _ => {}
         }
         self.block(&f.body);
@@ -644,13 +899,13 @@ impl<'c, 'p> Fx<'c, 'p> {
     }
 
     fn block(&mut self, ss: &[LS]) {
-        if self.kind != Kind::Gen {
+        if self.kind != Kind::Gen && !self.susp {
             for s in ss {
                 self.stmt(s);
             }
             return;
         }
-        let counts: Vec<usize> = ss.iter().map(count_yields).collect();
+        let counts: Vec<usize> = ss.iter().map(|s| self.points(s)).collect();
         let last_y = counts.iter().rposition(|c| *c > 0);
         for (i, s) in ss.iter().enumerate() {
             let c = counts[i];
@@ -674,6 +929,231 @@ impl<'c, 'p> Fx<'c, 'p> {
                 self.end();
             }
         }
+    }
+
+    /// Whether `s` is itself a place this function can suspend at (not a yield).
+    fn is_point(&self, s: &LS) -> bool {
+        if !self.susp {
+            return false;
+        }
+        match s {
+            LS::Set(_, e) | LS::Eval(e) => match e {
+                LE::Call(f, _) => self.cx.info.funcs.contains(f),
+                LE::Ffi(i, _) => Some(*i) == self.cx.info.sleep,
+                _ => false,
+            },
+            _ => suspend::blocking(s),
+        }
+    }
+
+    /// Yields and suspension points in `s`: the places a generator or a
+    /// suspending function re-enters at.
+    fn points(&self, s: &LS) -> usize {
+        match s {
+            LS::Yield(_) => 1,
+            LS::If(_, a, b) => a.iter().chain(b).map(|s| self.points(s)).sum(),
+            LS::Loop(_, b) => b.iter().map(|s| self.points(s)).sum(),
+            _ => self.is_point(s) as usize,
+        }
+    }
+
+    /// Unwinding: save every variable and the point `k` to resume at.
+    fn save_frame(&mut self, k: usize) {
+        let f = self.f;
+        let p = self.local(W);
+        self.i64c(self.fsize as i64);
+        self.rt("alxr_frame_push");
+        self.ins().local_set(p);
+        self.addr(p);
+        self.ins().i64_const(k as i64).i64_store(mem(0, F::Wd));
+        for (i, v) in f.vars.iter().enumerate() {
+            let (ls, off) = (self.vars[i].clone(), self.foffs[i]);
+            self.store(&v.ty, p, off, &ls);
+        }
+    }
+
+    /// Return to the caller while unwinding (any value of the right type).
+    fn ret_unwind(&mut self) {
+        if self.kind != Kind::Main {
+            let ts = self.ret_types();
+            self.zeros(&ts);
+        }
+        self.ins().return_();
+    }
+
+    /// After a blocking operation left its status in `st` (i32, or i64 for
+    /// select): -1 means suspend, so start unwinding.
+    fn suspend_if(&mut self, st: u32, wide: bool, k: usize) {
+        self.ins().local_get(st);
+        if wide {
+            self.ins().i64_const(-1).i64_eq();
+        } else {
+            self.ins().i32_const(-1).i32_eq();
+        }
+        self.if_(vec![]);
+        self.ins().i32_const(UNWIND).global_set(MODE);
+        self.save_frame(k);
+        self.ret_unwind();
+        self.end();
+    }
+
+    /// A suspension point: a call that can suspend, or a blocking operation.
+    /// Resuming here (resume == k) calls again without evaluating the
+    /// arguments (the callee restores its own frame), or runs the operation
+    /// again (its operands are variables).
+    fn point(&mut self, s: &LS) {
+        self.ny += 1;
+        let k = self.ny;
+        let r = self.resume;
+        if let LS::Set(_, LE::Call(f, args)) | LS::Eval(LE::Call(f, args)) = s {
+            let (idx, callee) = self.cx.funcs[f.as_str()];
+            let pts = user_sig(callee).0;
+            self.ins().local_get(r).i32_const(k as i32).i32_eq();
+            self.if_(pts.clone());
+            self.ins().i32_const(0).local_set(r);
+            self.zeros(&pts);
+            self.else_();
+            for a in args {
+                self.e(a);
+            }
+            self.end();
+            self.ins().call(idx);
+            let vals = self.pop(&vts(&callee.ret));
+            self.ins().global_get(MODE).i32_const(UNWIND).i32_eq();
+            self.if_(vec![]);
+            self.save_frame(k);
+            self.ret_unwind();
+            self.end();
+            if let LS::Set(v, _) = s {
+                self.get(&vals);
+                self.set_var(*v);
+            }
+            return;
+        }
+        self.ins().local_get(r).i32_const(k as i32).i32_eq();
+        self.if_(vec![]);
+        self.ins().i32_const(0).local_set(r).i32_const(0).global_set(MODE);
+        self.end();
+        match s {
+            LS::Eval(LE::Ffi(_, args)) => {
+                self.e(&args[0]);
+                self.rt("alxr_sleep");
+                let st = self.pop(&[I])[0];
+                self.suspend_if(st, false, k);
+            }
+            LS::Wait { task, ok, val, msg } => {
+                self.e(task);
+                self.rt("alxr_wait");
+                let st = self.pop(&[I])[0];
+                self.suspend_if(st, false, k);
+                self.ins().local_get(st);
+                self.set_var(*ok);
+                self.ins().local_get(st);
+                self.if_(vec![]);
+                let vt = self.f.vars[*val].ty.clone();
+                self.ret_words(1);
+                let p = self.pop(&[W])[0];
+                self.load(&vt, p, 0);
+                self.set_var(*val);
+                self.else_();
+                self.ret_words(2);
+                self.set_var(*msg);
+                self.end();
+            }
+            LS::ChanSend { ch, val, loc } => {
+                let p = self.boxed(val);
+                self.e(ch);
+                self.ins().local_get(p);
+                self.str_const(loc);
+                self.rt("alxr_chan_send");
+                let st = self.pop(&[I])[0];
+                self.suspend_if(st, false, k);
+            }
+            LS::ChanRecv { ch, ok, val } => {
+                self.e(ch);
+                self.rt("alxr_chan_recv");
+                let st = self.pop(&[I])[0];
+                self.suspend_if(st, false, k);
+                self.ins().local_get(st);
+                self.set_var(*ok);
+                self.ins().local_get(st);
+                self.if_(vec![]);
+                let vt = self.f.vars[*val].ty.clone();
+                self.ret_words(1);
+                let p = self.pop(&[W])[0];
+                self.load(&vt, p, 0);
+                self.set_var(*val);
+                self.end();
+            }
+            LS::Select { cases, default, dst } => {
+                // Cases: (kind 0 send / 1 recv, channel, value pointer).
+                let buf = self.local(W);
+                self.i64c(24 * cases.len().max(1) as i64);
+                self.rt("alxr_alloc");
+                self.ins().local_set(buf);
+                for (i, c) in cases.iter().enumerate() {
+                    let at = 24 * i as u32;
+                    let (kind, ch, p) = match c {
+                        SelCase::Send { ch, val } => (0, ch, Some(self.boxed(val))),
+                        SelCase::Recv { ch, .. } => (1, ch, None),
+                    };
+                    self.addr(buf);
+                    self.ins().i64_const(kind).i64_store(mem(at, F::Wd));
+                    let chv = self.eval_locals(ch)[0];
+                    self.addr(buf);
+                    self.ins().local_get(chv).i64_store(mem(at + 8, F::Wd));
+                    if let Some(p) = p {
+                        self.addr(buf);
+                        self.ins().local_get(p).i64_store(mem(at + 16, F::Wd));
+                    }
+                }
+                self.ins().local_get(buf).i64_const(cases.len() as i64).i32_const(*default as i32);
+                self.rt("alxr_select");
+                let st = self.pop(&[W])[0];
+                self.suspend_if(st, true, k);
+                for (i, c) in cases.iter().enumerate() {
+                    if let SelCase::Recv { ok, val, .. } = c {
+                        self.ins().local_get(st).i64_const(i as i64).i64_eq();
+                        self.if_(vec![]);
+                        self.ins().global_get(RETG).i64_load(mem(8, F::Wd)).i32_wrap_i64();
+                        self.set_var(*ok);
+                        self.ins().global_get(RETG).i64_load(mem(8, F::Wd)).i64_const(0).i64_ne();
+                        self.if_(vec![]);
+                        let vt = self.f.vars[*val].ty.clone();
+                        self.ret_words(1);
+                        let p = self.pop(&[W])[0];
+                        self.load(&vt, p, 0);
+                        self.set_var(*val);
+                        self.end();
+                        self.end();
+                    }
+                }
+                self.ins().local_get(st);
+                if vts(&self.f.vars[*dst].ty) == [I] {
+                    self.ins().i32_wrap_i64();
+                }
+                self.set_var(*dst);
+            }
+            LS::Lock(l) => {
+                self.e(l);
+                self.rt("alxr_lock");
+                let st = self.pop(&[I])[0];
+                self.suspend_if(st, false, k);
+            }
+            _ => unreachable!("wasmgen: not a suspension point"),
+        }
+    }
+
+    /// A copy of the value in fresh memory: its address (a local).
+    fn boxed(&mut self, e: &LE) -> u32 {
+        let t = self.ty(e);
+        let x = self.eval_locals(e);
+        let p = self.local(W);
+        self.i64c(lay(&t).size as i64);
+        self.rt("alxr_alloc");
+        self.ins().local_set(p);
+        self.store(&t, p, 0, &x);
+        p
     }
 
     /// A statement containing yields, in a generator.
@@ -701,8 +1181,9 @@ impl<'c, 'p> Fx<'c, 'p> {
                 self.ins().i32_const(0).local_set(r);
                 self.end();
             }
+            _ if self.is_point(s) => self.point(s),
             LS::If(c, a, b) => {
-                let ca: usize = a.iter().map(count_yields).sum();
+                let ca: usize = a.iter().map(|s| self.points(s)).sum();
                 self.ins().local_get(r).i32_eqz();
                 self.if_(vec![I]);
                 self.e(c);
@@ -740,7 +1221,38 @@ impl<'c, 'p> Fx<'c, 'p> {
             }
             LS::RegionFree(_) => {}
             LS::RegionEnter { .. } | LS::RegionExit { .. } | LS::RegionUse { .. } | LS::RegionRestore(_) => {}
-            LS::Spawn { .. } | LS::Wait { .. } | LS::ChanSend { .. } | LS::ChanRecv { .. } | LS::ChanClose { .. } | LS::Select { .. } | LS::Lock(_) | LS::Unlock(_) | LS::AtomicStore(..) => unreachable!("rejected by uses_concurrency"),
+            LS::Spawn { dst, worker, env } => {
+                let p = self.boxed(env);
+                self.i64c(*worker as i64);
+                self.ins().local_get(p);
+                self.rt("alxr_spawn");
+                self.set_var(*dst);
+            }
+            LS::ChanClose { ch, loc } => {
+                self.e(ch);
+                self.str_const(loc);
+                self.rt("alxr_chan_close");
+            }
+            LS::Unlock(l) => {
+                self.e(l);
+                self.rt("alxr_unlock");
+            }
+            LS::AtomicStore(a, v) => {
+                let a = self.eval_locals(a)[0];
+                let v = self.eval_locals(v)[0];
+                self.addr(a);
+                self.ins().local_get(v);
+                if MT {
+                    self.ins().i64_atomic_store(mem(0, F::Wd));
+                } else {
+                    self.ins().i64_store(mem(0, F::Wd));
+                }
+            }
+            // Blocking outside a suspending function: only in code that
+            // can't run (an unreachable generator).
+            LS::Wait { .. } | LS::ChanSend { .. } | LS::ChanRecv { .. } | LS::Select { .. } | LS::Lock(_) => {
+                self.ins().unreachable();
+            }
             LS::Set(v, e) => {
                 self.e(e);
                 self.set_var(*v);
@@ -882,8 +1394,54 @@ impl<'c, 'p> Fx<'c, 'p> {
                 self.set_var(*dst);
             }
             LS::Yield(_) => unreachable!("wasmgen: yield outside a generator"),
+            LS::Pmap { dst, arr, worker, err } if self.cx.chunks.contains_key(worker) => {
+                // On threads: claim chunks until none are left (helpers claim
+                // them too), then wait for the ones they took.
+                let chunk = self.cx.chunks[worker];
+                let it = self.f.vars[*dst].ty.clone();
+                let oesz = lay(elem(&it)).size as i64;
+                self.e(arr);
+                let a = self.pop(&[W, W, W]);
+                let (out, job, lo) = (self.local(W), self.local(W), self.local(W));
+                self.ins().local_get(a[1]).i64_const(oesz).i64_mul();
+                self.rt("alxr_alloc");
+                self.ins().local_set(out);
+                self.ins().i64_const(*worker as i64).local_get(a[0]).local_get(a[1]).local_get(out);
+                self.rt("alxr_pmap_begin");
+                self.ins().local_set(job).block(BlockType::Empty).loop_(BlockType::Empty);
+                self.frames.push(Frame::Other);
+                self.frames.push(Frame::Other);
+                self.ins().local_get(job);
+                self.rt("alxr_pmap_claim");
+                self.ins().local_tee(lo).i64_const(0).i64_lt_s().br_if(1);
+                self.ins().local_get(job).local_get(a[0]).local_get(out).local_get(lo);
+                self.ret_words(1);
+                self.ins().call(chunk).br(0);
+                self.end();
+                self.end();
+                self.ins().local_get(job);
+                self.rt("alxr_pmap_wait");
+                let st = self.pop(&[W])[0];
+                if let Some(e) = err {
+                    let rt = self.f.vars[*e].ty.clone();
+                    self.ins().local_get(st).i64_const(0).i64_ge_s();
+                    self.if_(vec![]);
+                    self.ret_words(1);
+                    let p = self.pop(&[W])[0];
+                    self.load(&rt, p, 0);
+                    self.set_var(*e);
+                    self.else_();
+                    self.zeros(&vts(&rt));
+                    self.set_var(*e);
+                    let ok = self.vars[*e][0];
+                    self.ins().i32_const(1).local_set(ok);
+                    self.end();
+                }
+                self.ins().local_get(out).local_get(a[1]).local_get(a[1]);
+                self.set_var(*dst);
+            }
             LS::Pmap { dst, arr, worker, err } => {
-                // Sequential in the browser (no threads without cross-origin isolation).
+                // Sequential without threads.
                 let (widx, w) = self.cx.workers[worker];
                 let it = self.f.vars[*dst].ty.clone();
                 let in_t = w.func.vars[w.func.params[0]].ty.clone();
@@ -972,7 +1530,7 @@ impl<'c, 'p> Fx<'c, 'p> {
             }
             LS::PanicStr(e) => {
                 self.e(e);
-                self.rt("alxr_die_str");
+                self.rt("alxr_panic_str");
                 self.ins().unreachable();
             }
             LS::SortInPlace(v, el) => {
@@ -1144,73 +1702,7 @@ impl<'c, 'p> Fx<'c, 'p> {
     // ---------- expressions ----------
 
     fn ty(&self, e: &LE) -> LTy {
-        match e {
-            LE::Ffi(..) => unreachable!("rejected by uses_ffi"),
-            LE::Global(k) => self.cx.globals[*k].0.clone(),
-            LE::LockNew => LTy::Lock,
-            LE::AtomicNew(_) => LTy::Atomic,
-            LE::AtomicLoad(_) | LE::AtomicRmw(..) => LTy::I64,
-            LE::AtomicCas(..) => LTy::Bool,
-            LE::RegionNew(_) => LTy::Region,
-            LE::RegionBytes(_) => LTy::I64,
-            LE::RegionOf(_) => LTy::Region,
-            LE::RegionProgram => LTy::Region,
-            LE::ChanNew(t, _) => LTy::Chan(Box::new(t.clone())),
-            LE::ChanLen(_) => LTy::I64,
-            LE::Var(v) => self.f.vars[*v].ty.clone(),
-            LE::I(_) | LE::Arith(..) | LE::Neg(..) | LE::Len(_) => LTy::I64,
-            LE::F(_) | LE::FArith(..) | LE::FNeg(_) | LE::Prim(Prim::UToF, _) => LTy::F64,
-            LE::Prim(Prim::ULt | Prim::ULe | Prim::MulOvf, _) => LTy::Bool,
-            LE::Prim(..) => LTy::I64,
-            LE::Loc(_) | LE::S(_) => LTy::Str,
-            LE::B(_) | LE::Cmp(..) | LE::Not(_) => LTy::Bool,
-            LE::Unit => LTy::Unit,
-            LE::Tup(t, _) => t.clone(),
-            LE::Field(x, i) => match self.ty(x) {
-                LTy::Tup(ts) => ts[*i].clone(),
-                t => panic!("wasmgen: field of {t:?}"),
-            },
-            LE::PArith(op, ..) => match op {
-                Op::Eq | Op::Ne | Op::Lt | Op::Le | Op::Gt | Op::Ge => LTy::Bool,
-                _ => LTy::PInt,
-            },
-            LE::Cond(_, a, _) => self.ty(a),
-            LE::Call(f, _) => self.cx.funcs[f.as_str()].1.ret.clone(),
-            LE::Rt(r, args) => match r {
-                Rt::IntToS | Rt::PIntToS | Rt::StrRev | Rt::StrDelete | Rt::StrJoin | Rt::FToS | Rt::FFmt | Rt::FFmtE | Rt::StrPad | Rt::StrQuote | Rt::StrCat | Rt::U64ToS | Rt::IntFmt | Rt::RuneToS | Rt::StrFromBytes | Rt::FileRead | Rt::CapEnd => LTy::Str,
-                Rt::FileStatus | Rt::NowNs | Rt::CapBegin => LTy::I64,
-                Rt::RegionCur | Rt::RegionMark | Rt::RegionMarkLarges => LTy::Region,
-                Rt::RegionReset => LTy::Unit,
-                Rt::IntToF | Rt::FSqrt | Rt::FAbs | Rt::Math(_) | Rt::FFromBits => LTy::F64,
-                Rt::FBits => LTy::IntK(IntKind::U64),
-                Rt::StrByte => {
-                    if matches!(args[2], LE::I(0)) {
-                        LTy::I64
-                    } else {
-                        LTy::Str
-                    }
-                }
-                Rt::StrSplit => LTy::Arr(Box::new(LTy::Str)),
-                Rt::Digits => LTy::Arr(Box::new(LTy::I64)),
-                Rt::PDigits => LTy::Arr(Box::new(LTy::PInt)),
-                Rt::ArrCopy => self.ty(&args[0]),
-                Rt::Even | Rt::PEven => LTy::Bool,
-                _ => LTy::I64,
-            },
-            LE::Index { arr, .. } => elem(&self.ty(arr)).clone(),
-            LE::ArrLit(t, _) | LE::ArrNew(t, ..) | LE::ArrWithCap(t, _) => LTy::Arr(Box::new(t.clone())),
-            LE::Slice(t, ..) => t.clone(),
-            LE::Range(..) => LTy::Range,
-            LE::RangeField(_, k) => {
-                if *k == 2 {
-                    LTy::Bool
-                } else {
-                    LTy::I64
-                }
-            }
-            LE::GenNew(id, _) => LTy::Gen(Box::new(self.cx.gens[id].2.elem.clone())),
-            LE::ToP(_) => LTy::PInt,
-        }
+        ty_of(&self.cx.tys, &self.f.vars, e)
     }
 
     /// Evaluate onto the stack; returns the pushed value types.
@@ -1223,7 +1715,26 @@ impl<'c, 'p> Fx<'c, 'p> {
             LE::RegionOf(_) => self.i64c(0),
             // The browser never frees: regions are no-ops (handle 0).
             LE::RegionProgram => self.i64c(0),
-            LE::Ffi(..) => unreachable!("rejected by uses_ffi"),
+            LE::Ffi(i, args) => {
+                for a in args {
+                    self.e(a);
+                }
+                let sym = self.cx.info_sym(*i);
+                match sym.as_str() {
+                    "alx_wall_ns" => self.rt("alxr_wall_ns"),
+                    "alx_mono_ns" => self.rt("alxr_now_ns"),
+                    "alx_local_offset" => self.rt("alxr_local_offset"),
+                    "alx_local_zone" => self.rt("alxr_local_zone"),
+                    "alx_sleep_ns" => {
+                        self.rt("alxr_sleep");
+                        self.ins().drop();
+                    }
+                    // Unreachable: `suspend::prepare` refuses programs that call these.
+                    _ => {
+                        self.ins().unreachable();
+                    }
+                }
+            }
             LE::Global(k) => {
                 let (t, at) = self.cx.globals[*k].clone();
                 let base = self.local(W);
@@ -1231,7 +1742,84 @@ impl<'c, 'p> Fx<'c, 'p> {
                 self.ins().local_set(base);
                 self.load(&t, base, 0);
             }
-            LE::ChanNew(..) | LE::ChanLen(_) | LE::LockNew | LE::AtomicNew(_) | LE::AtomicLoad(_) | LE::AtomicRmw(..) | LE::AtomicCas(..) => unreachable!("rejected by uses_concurrency"),
+            LE::ChanNew(_, cap) => {
+                self.e(cap);
+                self.rt("alxr_chan_new");
+            }
+            LE::ChanLen(ch) => {
+                self.e(ch);
+                self.rt("alxr_chan_len");
+            }
+            LE::LockNew => self.rt("alxr_lock_new"),
+            // Without threads atomics are plain loads and stores.
+            LE::AtomicNew(v) => {
+                let x = self.eval_locals(v)[0];
+                let p = self.local(W);
+                self.i64c(8);
+                self.rt("alxr_alloc");
+                self.ins().local_set(p);
+                self.addr(p);
+                self.ins().local_get(x).i64_store(mem(0, F::Wd)).local_get(p);
+            }
+            LE::AtomicLoad(a) if MT => {
+                self.e(a);
+                self.ins().i32_wrap_i64().i64_atomic_load(mem(0, F::Wd));
+            }
+            LE::AtomicRmw(op, a, d) if MT => {
+                let a = self.eval_locals(a)[0];
+                let d = self.eval_locals(d)[0];
+                self.addr(a);
+                self.ins().local_get(d);
+                match op {
+                    AtomicOp::Add => {
+                        self.ins().i64_atomic_rmw_add(mem(0, F::Wd)).local_get(d).i64_add();
+                    }
+                    AtomicOp::Swap => {
+                        self.ins().i64_atomic_rmw_xchg(mem(0, F::Wd));
+                    }
+                }
+            }
+            LE::AtomicCas(a, old, new) if MT => {
+                let a = self.eval_locals(a)[0];
+                let o = self.eval_locals(old)[0];
+                let n = self.eval_locals(new)[0];
+                self.addr(a);
+                self.ins().local_get(o).local_get(n).i64_atomic_rmw_cmpxchg(mem(0, F::Wd)).local_get(o).i64_eq();
+            }
+            LE::AtomicLoad(a) => {
+                self.e(a);
+                self.ins().i32_wrap_i64().i64_load(mem(0, F::Wd));
+            }
+            LE::AtomicRmw(op, a, d) => {
+                let a = self.eval_locals(a)[0];
+                let d = self.eval_locals(d)[0];
+                let old = self.local(W);
+                self.addr(a);
+                self.ins().i64_load(mem(0, F::Wd)).local_set(old);
+                self.addr(a);
+                match op {
+                    AtomicOp::Add => {
+                        self.ins().local_get(old).local_get(d).i64_add().i64_store(mem(0, F::Wd));
+                        self.ins().local_get(old).local_get(d).i64_add();
+                    }
+                    AtomicOp::Swap => {
+                        self.ins().local_get(d).i64_store(mem(0, F::Wd)).local_get(old);
+                    }
+                }
+            }
+            LE::AtomicCas(a, old, new) => {
+                let a = self.eval_locals(a)[0];
+                let o = self.eval_locals(old)[0];
+                let n = self.eval_locals(new)[0];
+                self.addr(a);
+                self.ins().i64_load(mem(0, F::Wd)).local_get(o).i64_eq();
+                self.if_(vec![I]);
+                self.addr(a);
+                self.ins().local_get(n).i64_store(mem(0, F::Wd)).i32_const(1);
+                self.else_();
+                self.ins().i32_const(0);
+                self.end();
+            }
             LE::Var(v) => {
                 let ls = self.vars[*v].clone();
                 self.get(&ls);
@@ -1643,6 +2231,7 @@ impl<'c, 'p> Fx<'c, 'p> {
             Rt::Isqrt => call(self, "alxr_isqrt"),
             Rt::Digits => call_ret(self, "alxr_digits", 3),
             Rt::PDigits => call_ret(self, "alxr_p_digits", 3),
+            Rt::PFromStr => call_ret(self, "alxr_p_from_str", 2),
             Rt::SatAdd => {
                 let a = self.eval_locals(&args[0])[0];
                 let b = self.eval_locals(&args[1])[0];
@@ -1709,13 +2298,19 @@ impl<'c, 'p> Fx<'c, 'p> {
             Rt::FToS => call_ret(self, "alxr_f_to_s", 2),
             Rt::U64ToS => call_ret(self, "alxr_u64_to_s", 2),
             Rt::IntFmt => call_ret(self, "alxr_int_fmt", 2),
-            Rt::Errno | Rt::Strerror | Rt::StrFromCstr | Rt::StrFromPtr => unreachable!("rejected by uses_ffi"),
-            Rt::NowNs | Rt::CapBegin | Rt::RegionCur | Rt::RegionMark | Rt::RegionMarkLarges => {
+            // Unreachable: `suspend::prepare` refuses programs that use these.
+            Rt::Errno | Rt::Strerror | Rt::StrFromPtr => {
+                self.ins().unreachable();
+            }
+            Rt::StrFromCstr => call_ret(self, "alxr_str_from_cstr", 2),
+            Rt::NowNs => call(self, "alxr_now_ns"),
+            Rt::CapBegin => call(self, "alxr_cap_begin"),
+            Rt::RegionCur | Rt::RegionMark | Rt::RegionMarkLarges => {
                 self.ins().i64_const(0);
             }
             // The browser has no regions: nothing to roll back.
             Rt::RegionReset => {}
-            Rt::CapEnd => self.str_const(""),
+            Rt::CapEnd => call_ret(self, "alxr_cap_end", 2),
             Rt::FileStatus => call(self, "alxr_file_status"),
             Rt::FileRead => call_ret(self, "alxr_file_read_or_empty", 2),
             Rt::RuneToS => call_ret(self, "alxr_rune_to_s", 2),
@@ -1744,6 +2339,93 @@ impl<'c, 'p> Fx<'c, 'p> {
                 self.ret_words(2);
             }
         }
+    }
+}
+
+/// What `ty_of` needs to know about the program.
+pub(crate) struct Tys {
+    pub rets: HashMap<String, LTy>,
+    pub gens: HashMap<usize, LTy>,
+    pub globals: Vec<LTy>,
+    /// Each extern's result type.
+    pub ffi: Vec<LTy>,
+}
+
+impl Tys {
+    pub fn new(p: &LProgram) -> Tys {
+        Tys { rets: p.funcs.iter().map(|f| (f.name.clone(), f.ret.clone())).collect(), gens: p.gens.iter().map(|g| (g.id, g.elem.clone())).collect(), globals: p.globals.clone(), ffi: p.externs.iter().map(|x| x.ret.lty()).collect() }
+    }
+}
+
+pub(crate) fn ty_of(tys: &Tys, vars: &[LVar], e: &LE) -> LTy {
+    let ty = |e: &LE| ty_of(tys, vars, e);
+    match e {
+        LE::Ffi(i, _) => tys.ffi[*i].clone(),
+        LE::Global(k) => tys.globals[*k].clone(),
+        LE::LockNew => LTy::Lock,
+        LE::AtomicNew(_) => LTy::Atomic,
+        LE::AtomicLoad(_) | LE::AtomicRmw(..) => LTy::I64,
+        LE::AtomicCas(..) => LTy::Bool,
+        LE::RegionNew(_) => LTy::Region,
+        LE::RegionBytes(_) => LTy::I64,
+        LE::RegionOf(_) => LTy::Region,
+        LE::RegionProgram => LTy::Region,
+        LE::ChanNew(t, _) => LTy::Chan(Box::new(t.clone())),
+        LE::ChanLen(_) => LTy::I64,
+        LE::Var(v) => vars[*v].ty.clone(),
+        LE::I(_) | LE::Arith(..) | LE::Neg(..) | LE::Len(_) => LTy::I64,
+        LE::F(_) | LE::FArith(..) | LE::FNeg(_) | LE::Prim(Prim::UToF, _) => LTy::F64,
+        LE::Prim(Prim::ULt | Prim::ULe | Prim::MulOvf, _) => LTy::Bool,
+        LE::Prim(..) => LTy::I64,
+        LE::Loc(_) | LE::S(_) => LTy::Str,
+        LE::B(_) | LE::Cmp(..) | LE::Not(_) => LTy::Bool,
+        LE::Unit => LTy::Unit,
+        LE::Tup(t, _) => t.clone(),
+        LE::Field(x, i) => match ty(x) {
+            LTy::Tup(ts) => ts[*i].clone(),
+            t => panic!("wasmgen: field of {t:?}"),
+        },
+        LE::PArith(op, ..) => match op {
+            Op::Eq | Op::Ne | Op::Lt | Op::Le | Op::Gt | Op::Ge => LTy::Bool,
+            _ => LTy::PInt,
+        },
+        LE::Cond(_, a, _) => ty(a),
+        LE::Call(f, _) => tys.rets[f.as_str()].clone(),
+        LE::Rt(r, args) => match r {
+            Rt::IntToS | Rt::PIntToS | Rt::StrRev | Rt::StrDelete | Rt::StrJoin | Rt::FToS | Rt::FFmt | Rt::FFmtE | Rt::StrPad | Rt::StrQuote | Rt::StrCat | Rt::U64ToS | Rt::IntFmt | Rt::RuneToS | Rt::StrFromBytes | Rt::FileRead | Rt::CapEnd => LTy::Str,
+            Rt::FileStatus | Rt::NowNs | Rt::CapBegin => LTy::I64,
+            Rt::RegionCur | Rt::RegionMark | Rt::RegionMarkLarges => LTy::Region,
+            Rt::RegionReset => LTy::Unit,
+            Rt::IntToF | Rt::FSqrt | Rt::FAbs | Rt::Math(_) | Rt::FFromBits => LTy::F64,
+            Rt::FBits => LTy::IntK(IntKind::U64),
+            Rt::StrByte => {
+                if matches!(args[2], LE::I(0)) {
+                    LTy::I64
+                } else {
+                    LTy::Str
+                }
+            }
+            Rt::StrSplit => LTy::Arr(Box::new(LTy::Str)),
+            Rt::Digits => LTy::Arr(Box::new(LTy::I64)),
+            Rt::PDigits => LTy::Arr(Box::new(LTy::PInt)),
+            Rt::PFromStr => LTy::PInt,
+            Rt::ArrCopy => ty(&args[0]),
+            Rt::Even | Rt::PEven => LTy::Bool,
+            _ => LTy::I64,
+        },
+        LE::Index { arr, .. } => elem(&ty(arr)).clone(),
+        LE::ArrLit(t, _) | LE::ArrNew(t, ..) | LE::ArrWithCap(t, _) => LTy::Arr(Box::new(t.clone())),
+        LE::Slice(t, ..) => t.clone(),
+        LE::Range(..) => LTy::Range,
+        LE::RangeField(_, k) => {
+            if *k == 2 {
+                LTy::Bool
+            } else {
+                LTy::I64
+            }
+        }
+        LE::GenNew(id, _) => LTy::Gen(Box::new(tys.gens[id].clone())),
+        LE::ToP(_) => LTy::PInt,
     }
 }
 

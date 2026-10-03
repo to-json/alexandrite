@@ -245,6 +245,8 @@ pub enum Rt {
     Even,
     PEven,
     PToI64,
+    /// Str#to_i in promote mode: any number of digits.
+    PFromStr,
     /// Int → Float
     IntToF,
     /// Float → Int: (x, loc); truncates, fails on NaN/inf/out of range.

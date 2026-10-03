@@ -2834,6 +2834,7 @@ impl<'a> Lw<'a> {
                 LE::Rt(Rt::Math(f), v)
             }
             FloatBits => LE::Rt(Rt::FBits, vec![self.expr(recv.unwrap())]),
+            UMulHi => LE::Prim(Prim::UMulHi, vec![self.expr(recv.unwrap()), self.expr(&args[0])]),
             FloatFromBits => LE::Rt(Rt::FFromBits, vec![self.expr(recv.unwrap())]),
             StructNew => {
                 let t = self.lty(&e.ty);

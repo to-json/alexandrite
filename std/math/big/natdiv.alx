@@ -1,0 +1,274 @@
+#![overflow(wrap)]
+# Multi-precision division (Go's natdiv.go): schoolbook long division with
+# 3-by-2-word quotient guesses (Knuth's algorithm D) and, for divisors of
+# DIV_RECURSIVE_THRESHOLD words or more, Burnikel-Ziegler style recursive
+# division over "wide digits". See the long comment in Go's natdiv.go for
+# the derivation.
+
+DIV_RECURSIVE_THRESHOLD = 40
+
+# (u / v, u % v). Panics ("division by zero") if v is zero.
+def nat_div(u: [U64], v: [U64]) -> ([U64], [U64]) { nat_div_t(u, v, DIV_RECURSIVE_THRESHOLD) }
+
+# nat_div with Go's divRecursiveThreshold as a parameter.
+def nat_div_t(u: [U64], v: [U64], rthr: I64) -> ([U64], [U64]) {
+  panic("division by zero") if v.size == 0
+  if v.size == 1 {
+    q, r2 = nat_div_w(u, v[0])
+    return (q, nat_set_word(r2))
+  }
+  return (nat_zero, nat_set(u)) if nat_cmp(u, v) < 0
+  div_large(u, v, rthr)
+}
+
+# u % v.
+def nat_rem(u: [U64], v: [U64]) -> [U64] {
+  _q, r = nat_div(u, v)
+  r
+}
+
+# (x / y, x % y) for a word y.
+def nat_div_w(x: [U64], y: U64) -> ([U64], U64) {
+  m = x.size
+  panic("division by zero") if y == 0
+  return (nat_set(x), 0) if y == 1
+  return (nat_zero, 0) if m == 0
+  z = nat_make(m)
+  r = div_wvw(z, 0, x, y)
+  (nat_norm(z), r)
+}
+
+# x % d for a word d.
+def nat_mod_w(x: [U64], d: U64) -> U64 {
+  q = nat_make(x.size)
+  div_wvw(q, 0, x, d)
+}
+
+# z = (xn<<(64 len(x)) + x) / y, returning the remainder; xn < y.
+def div_wvw(z: [U64], xn: U64, x: [U64], y: U64) -> U64 {
+  r = xn
+  if x.size == 1 {
+    qq, rr = div128(r, x[0], y)
+    z[0] = qq
+    return rr
+  }
+  rec = reciprocal_word(y)
+  # div_ww inlined: y is normalized once.
+  s = nlz(y)
+  d = y << s
+  i = z.size - 1
+  if s == 0 {
+    while i >= 0 {
+      x1 = r
+      x0 = x[i]
+      t1 = rec.__mulhi(x1)
+      t0 = rec * x1
+      s0 = t0 + x0
+      c: U64 = s0 < t0 ? 1 : 0
+      qq = t1 + x1 + c
+      dq1 = d.__mulhi(qq)
+      dq0 = d * qq
+      r0 = x0 - dq0
+      b: U64 = x0 < dq0 ? 1 : 0
+      r1 = x1 - dq1 - b
+      if r1 != 0 {
+        qq += 1
+        r0 -= d
+      }
+      if r0 >= d {
+        qq += 1
+        r0 -= d
+      }
+      z[i] = qq
+      r = r0
+      i -= 1
+    }
+    return r
+  }
+  # Keep the remainder scaled by 2^s between steps (it is < y).
+  sh = 64 - s
+  while i >= 0 {
+    xi = x[i]
+    x1 = (r << s) | (xi >> sh)
+    x0 = xi << s
+    t1 = rec.__mulhi(x1)
+    t0 = rec * x1
+    s0 = t0 + x0
+    c: U64 = s0 < t0 ? 1 : 0
+    qq = t1 + x1 + c
+    dq1 = d.__mulhi(qq)
+    dq0 = d * qq
+    r0 = x0 - dq0
+    b: U64 = x0 < dq0 ? 1 : 0
+    r1 = x1 - dq1 - b
+    if r1 != 0 {
+      qq += 1
+      r0 -= d
+    }
+    if r0 >= d {
+      qq += 1
+      r0 -= d
+    }
+    z[i] = qq
+    r = r0 >> s
+    i -= 1
+  }
+  r
+}
+
+# u / v and u % v for len(v) >= 2 and u >= v.
+def div_large(u_in: [U64], v_in: [U64], rthr: I64) -> ([U64], [U64]) {
+  n = v_in.size
+  m = u_in.size - n
+  shift = nlz(v_in[n - 1])
+  v = nat_make(n)
+  u = nat_make(u_in.size + 1)
+  if shift == 0 {
+    copy(v, v_in)
+    copy(u[0...u_in.size], u_in)
+    u[u_in.size] = 0
+  } else {
+    lsh_vu(v, v_in, shift)
+    u[u_in.size] = lsh_vu(u[0...u_in.size], u_in, shift)
+  }
+  q = nat_make(m + 1)
+  if n < rthr {
+    div_basic(q, u, v)
+  } else {
+    div_recursive(q, u, v, rthr)
+  }
+  q = nat_norm(q)
+  rsh_vu(u, u, shift) if shift != 0
+  (q, nat_norm(u))
+}
+
+# q = u / v and u = u % v (in place), by long division; v normalized
+# (top bit set), len(q) == len(u) - len(v) + 1 (or one less).
+def div_basic(q: [U64], u: [U64], v: [U64]) -> Unit {
+  n = v.size
+  m = u.size - n
+  qhatv = nat_make(n + 1)
+  vn1 = v[n - 1]
+  rec = reciprocal_word(vn1)
+  vn2 = v[n - 2]
+  ujn: U64 = 0
+  j = m
+  while j >= 0 {
+    qhat = MASK
+    if ujn != vn1 {
+      qh, rh = div_ww(ujn, u[j + n - 1], vn1, rec)
+      qhat = qh
+      rhat = rh
+      x1 = qhat.__mulhi(vn2)
+      x2 = qhat * vn2
+      ujn2 = u[j + n - 2]
+      while x1 > rhat || (x1 == rhat && x2 > ujn2) {
+        qhat -= 1
+        prev_rhat = rhat
+        rhat += vn1
+        break if rhat < prev_rhat
+        x1 -= 1 if vn2 > x2
+        x2 -= vn2
+      }
+    }
+    qhatv[n] = mul_add_vww(qhatv[0...n], v, qhat, 0)
+    qhl = qhatv.size
+    if j + qhl > u.size && qhatv[n] == 0 {
+      qhl -= 1
+    }
+    uj = u[j...j + qhl]
+    c = sub_vv(uj, uj, qhatv[0...qhl])
+    if c != 0 {
+      ujn_ = u[j...j + n]
+      c2 = add_vv(ujn_, ujn_, v)
+      if n < qhl {
+        u[j + n] += c2
+      }
+      qhat -= 1
+    }
+    ujn = u[j + n - 1]
+    if !(j == m && m == q.size && qhat == 0) {
+      q[j] = qhat
+    }
+    j -= 1
+  }
+}
+
+def div_recursive(z: [U64], u: [U64], v: [U64], rthr: I64) -> Unit {
+  for i in 0...z.size {
+    z[i] = 0
+  }
+  div_recursive_step(z, u, v, 0, rthr)
+}
+
+# z = u / v and u = u % v (in place), recursively; see Go's natdiv.go.
+def div_recursive_step(z: [U64], u0: [U64], v0: [U64], depth: I64, rthr: I64) -> Unit {
+  u = nat_norm(u0)
+  v = nat_norm(v0)
+  if u.size == 0 {
+    for i in 0...z.size {
+      z[i] = 0
+    }
+    return
+  }
+  n = v.size
+  if n < rthr {
+    div_basic(z, u, v)
+    return
+  }
+  m = u.size - n
+  return if m < 0
+  b = n / 2
+  qhat0 = nat_make(b + 1)
+  j = m
+  while j > b {
+    s = b - 1
+    uu = u[j - b...u.size]
+    qhat = qhat0
+    for i in 0...qhat.size {
+      qhat[i] = 0
+    }
+    div_recursive_step(qhat, uu[s...b + n], v[s...v.size], depth + 1, rthr)
+    qhat = nat_norm(qhat)
+    qhatv = nat_mul(qhat, v[0...s])
+    for _i in 0...2 {
+      break if nat_cmp(qhatv, nat_norm(uu)) <= 0
+      sub_vw(qhat, qhat, 1)
+      qhatv = nat_sub(qhatv, nat_norm(v[0...s]))
+      add_to(uu[s...uu.size], v[s...v.size])
+    }
+    panic("impossible") if nat_cmp(qhatv, nat_norm(uu)) > 0
+    lq = qhatv.size
+    c = sub_vv(uu[0...lq], uu[0...lq], qhatv)
+    if c > 0 {
+      rest = uu[lq...uu.size]
+      sub_vw(rest, rest, c)
+    }
+    add_to(z[j - b...z.size], qhat)
+    j -= b
+  }
+  s = b - 1
+  qhat = qhat0
+  for i in 0...qhat.size {
+    qhat[i] = 0
+  }
+  div_recursive_step(qhat, nat_norm(u[s...u.size]), v[s...v.size], depth + 1, rthr)
+  qhat = nat_norm(qhat)
+  qhatv = nat_mul(qhat, v[0...s])
+  for _i in 0...2 {
+    if nat_cmp(qhatv, nat_norm(u)) > 0 {
+      sub_vw(qhat, qhat, 1)
+      qhatv = nat_sub(qhatv, nat_norm(v[0...s]))
+      add_to(u[s...u.size], v[s...v.size])
+    }
+  }
+  panic("impossible") if nat_cmp(qhatv, nat_norm(u)) > 0
+  lq = qhatv.size
+  c = sub_vv(u[0...lq], u[0...lq], qhatv)
+  if c > 0 {
+    rest = u[lq...u.size]
+    c = sub_vw(rest, rest, c)
+  }
+  panic("impossible") if c > 0
+  add_to(z, nat_norm(qhat))
+}

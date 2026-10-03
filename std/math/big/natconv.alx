@@ -1,0 +1,371 @@
+#![overflow(wrap)]
+# Conversions between nats and strings (Go's natconv.go).
+
+import "math"
+
+DIGITS = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+
+# The largest number base accepted for string conversions.
+pub MAX_BASE = 62
+MAX_BASE_SMALL = 36
+
+# Number of words treated as one block by the divide-and-conquer
+# conversion.
+LEAF_SIZE = 8
+
+# The largest power p of b that fits in a word, and its exponent n.
+def max_pow(b: U64) -> (U64, I64) {
+  p = b
+  n = 1
+  mx = MASK / b
+  while p <= mx {
+    p *= b
+    n += 1
+  }
+  (p, n)
+}
+
+# x**n for words (wrapping).
+def pow_w(x0: U64, n0: I64) -> U64 {
+  p: U64 = 1
+  x = x0
+  n = n0
+  while n > 0 {
+    p *= x if n & 1 != 0
+    x *= x
+    n >>= 1
+  }
+  p
+}
+
+# A reader of bytes from a string, with one byte of push-back (Go's
+# strings.Reader as an io.ByteScanner). Copies share the position.
+pub struct ByteReader {
+  s: [Byte]
+  st: [I64]
+
+  # The next byte, or none at the end.
+  pub def read_byte! -> Byte? {
+    i = st[0]
+    return none if i >= s.size
+    self.st[0] = i + 1
+    s[i]
+  }
+
+  # Steps back one byte.
+  pub def unread_byte! -> Unit {
+    self.st[0] -= 1 if st[0] > 0
+  }
+
+  # The bytes not read yet.
+  pub def rest -> Str { Str.from_bytes(s[st[0]...s.size]) }
+
+  # The number of bytes not read yet.
+  pub def len -> I64 { s.size - st[0] }
+}
+
+# A ByteReader over s.
+pub def new_byte_reader(s: Str) -> ByteReader { ByteReader.new(s: s.bytes, st: [0]) }
+
+# Scans a number in base `base` (0: Go's prefixes 0b, 0o, 0x, 0, and `_`
+# separators; with frac_ok a '.' and no '0' octal prefix), up to the first
+# byte that can't belong to it. Returns the value, the base found, and
+# the digit count (or, for a number with a '.', minus the number of
+# fractional digits), and an error code (0, SCAN_NO_DIGITS or
+# SCAN_INVAL_SEP; the other results are still set, as in Go's nat.scan).
+def nat_scan_raw(r: ByteReader, base: I64, frac_ok0: Bool) -> ([U64], I64, I64, I64) {
+  rd = r
+  frac_ok = frac_ok0
+  base_ok = base == 0 || (!frac_ok && 2 <= base && base <= MAX_BASE) || (frac_ok && (base == 2 || base == 8 || base == 10 || base == 16))
+  panic("invalid number base #{base}") if !base_ok
+  prev: Byte = 46 # '.'
+  inval_sep = false
+  count = 0
+  chq = rd.read_byte!
+  b = base
+  prefix: Byte = 0
+  if base == 0 {
+    b = 10
+    if ch0 = chq {
+      if ch0 == 48 { # '0'
+        prev = 48
+        count = 1
+        chq = rd.read_byte!
+        if ch = chq {
+          if ch == 98 || ch == 66 {
+            b = 2
+            prefix = 98
+          } elsif ch == 111 || ch == 79 {
+            b = 8
+            prefix = 111
+          } elsif ch == 120 || ch == 88 {
+            b = 16
+            prefix = 120
+          } elsif !frac_ok {
+            b = 8
+            prefix = 48
+          }
+          if prefix != 0 {
+            count = 0
+            chq = rd.read_byte! if prefix != 48
+          }
+        }
+      }
+    }
+  }
+  z: [U64] = []
+  b1 = b.to_u64
+  bn: U64 = 0
+  n = 0
+  if b == 2 {
+    n = W
+  } elsif b == 4 {
+    n = W / 2
+  } elsif b == 16 {
+    n = W / 4
+  } else {
+    bn, n = max_pow(b1)
+  }
+  di: U64 = 0
+  i = 0
+  dp = -1
+  while true {
+    ch: Byte = 0
+    if c = chq {
+      ch = c
+    } else {
+      break
+    }
+    if ch == 46 && frac_ok {
+      frac_ok = false
+      inval_sep = true if prev == 95
+      prev = 46
+      dp = count
+    } elsif ch == 95 && base == 0 {
+      inval_sep = true if prev != 48
+      prev = 95
+    } else {
+      d1: U64 = MAX_BASE.to_u64 + 1
+      if 48 <= ch && ch <= 57 {
+        d1 = (ch - 48).to_u64
+      } elsif 97 <= ch && ch <= 122 {
+        d1 = (ch - 97 + 10).to_u64
+      } elsif 65 <= ch && ch <= 90 {
+        if b <= MAX_BASE_SMALL {
+          d1 = (ch - 65 + 10).to_u64
+        } else {
+          d1 = (ch - 65 + MAX_BASE_SMALL.to_u8).to_u64
+        }
+      }
+      if d1 >= b1 {
+        rd.unread_byte!
+        break
+      }
+      prev = 48
+      count += 1
+      di = di * b1 + d1
+      i += 1
+      if i == n {
+        if bn == 0 {
+          z << di
+        } else {
+          z = nat_mul_add_ww(z, bn, di)
+        }
+        di = 0
+        i = 0
+      }
+    }
+    chq = rd.read_byte!
+  }
+  err = 0
+  err = SCAN_INVAL_SEP if inval_sep || prev == 95
+  if count == 0 {
+    return (nat_zero, 10, 1, err) if prefix == 48
+    err = SCAN_NO_DIGITS
+  }
+  if bn == 0 {
+    if i > 0 {
+      z << di * pow_w(b1, n - i)
+    }
+    z = z.reverse
+    z = nat_norm(z)
+    if i > 0 {
+      z = nat_rsh(z, (n - i) * (W / n))
+    }
+  } else {
+    if i > 0 {
+      z = nat_mul_add_ww(z, pow_w(b1, i), di)
+    }
+  }
+  count = dp - count if dp >= 0
+  (nat_norm(z), b, count, err)
+}
+
+SCAN_NO_DIGITS = 1
+SCAN_INVAL_SEP = 2
+
+# nat_scan_raw, failing on an error (Go's callers stop at err != nil).
+def nat_scan(r: ByteReader, base: I64, frac_ok: Bool) -> ~([U64], I64, I64)<BigError> {
+  z, b, count, err = nat_scan_raw(r, base, frac_ok)
+  fail BigError.NoDigits if err == SCAN_NO_DIGITS
+  fail BigError.InvalSep if err == SCAN_INVAL_SEP
+  (z, b, count)
+}
+
+# x in base `base` (2..62), lowercase digits first.
+def nat_utoa(x: [U64], base: I64) -> [Byte] { nat_itoa(x, false, base) }
+
+# x in base `base`, with a leading '-' if neg.
+def nat_itoa(x: [U64], neg: Bool, base: I64) -> [Byte] {
+  panic("invalid base") if base < 2 || base > MAX_BASE
+  if x.size == 0 {
+    z: [Byte] = [48]
+    return z
+  }
+  i = (nat_bit_len(x).to_f / math.log2(base.to_f)).to_i + 1
+  i += 1 if neg
+  s: [Byte] = [0; i]
+  b = base.to_u64
+  if b == b & (0 - b) {
+    shift = ntz(b)
+    mask: U64 = (ONE << shift) - 1
+    w = x[0]
+    nbits = W
+    for k in 1...x.size {
+      while nbits >= shift {
+        i -= 1
+        s[i] = DIGITS[(w & mask).to_i64]
+        w >>= shift
+        nbits -= shift
+      }
+      if nbits == 0 {
+        w = x[k]
+        nbits = W
+      } else {
+        w |= x[k] << nbits
+        i -= 1
+        s[i] = DIGITS[(w & mask).to_i64]
+        w = x[k] >> (shift - nbits)
+        nbits = W - (shift - nbits)
+      }
+    }
+    while w != 0 {
+      i -= 1
+      s[i] = DIGITS[(w & mask).to_i64]
+      w >>= shift
+    }
+  } else {
+    bb, ndigits = max_pow(b)
+    table = divisors(x.size, b, ndigits, bb)
+    convert_words(nat_set(x), s, b, ndigits, bb, table)
+    i = 0
+    while s[i] == 48 {
+      i += 1
+    }
+  }
+  if neg {
+    i -= 1
+    s[i] = 45
+  }
+  s[i...s.size]
+}
+
+# A divisor for the divide-and-conquer conversion: bbb = bb^(2^k...) and
+# its bit and digit lengths.
+struct Divisor {
+  bbb: [U64]
+  nbits: I64
+  ndigits: I64
+}
+
+# Writes the digits of q into s (right-aligned, zero-padded on the left):
+# Go's convertWords, recursive over the divisors table.
+def convert_words(q0: [U64], s0: [Byte], b: U64, ndigits: I64, bb: U64, table: [Divisor]) -> Unit {
+  q = q0
+  s = s0
+  if table.size > 0 {
+    index = table.size - 1
+    while q.size > LEAF_SIZE {
+      max_length = nat_bit_len(q)
+      min_length = max_length >> 1
+      while index > 0 && table[index - 1].nbits > min_length {
+        index -= 1
+      }
+      if table[index].nbits >= max_length && nat_cmp(table[index].bbb, q) >= 0 {
+        index -= 1
+        panic("internal inconsistency") if index < 0
+      }
+      qq, r = nat_div(q, table[index].bbb)
+      q = qq
+      h = s.size - table[index].ndigits
+      convert_words(r, s[h...s.size], b, ndigits, bb, table[0...index])
+      s = s[0...h]
+    }
+  }
+  i = s.size
+  if b == 10 {
+    while q.size > 0 {
+      qq, r0 = nat_div_w(q, bb)
+      q = qq
+      r = r0
+      j = 0
+      while j < ndigits && i > 0 {
+        i -= 1
+        t = r / 10
+        s[i] = (r - t * 10).as_u8 + 48
+        r = t
+        j += 1
+      }
+    }
+  } else {
+    while q.size > 0 {
+      qq, r0 = nat_div_w(q, bb)
+      q = qq
+      r = r0
+      j = 0
+      while j < ndigits && i > 0 {
+        i -= 1
+        s[i] = DIGITS[(r % b).to_i64]
+        r /= b
+        j += 1
+      }
+    }
+  }
+  while i > 0 {
+    i -= 1
+    s[i] = 48
+  }
+}
+
+# The divisors bb^(LEAF_SIZE * 2^k) for converting an m-word number, or
+# none for small numbers. (Go caches the base-10 table; this computes it
+# per conversion.)
+def divisors(m: I64, b: U64, ndigits: I64, bb: U64) -> [Divisor] {
+  table: [Divisor] = []
+  return table if LEAF_SIZE == 0 || m <= LEAF_SIZE
+  k = 1
+  words = LEAF_SIZE
+  while words < m >> 1 && k < 64 {
+    k += 1
+    words <<= 1
+  }
+  for i in 0...k {
+    d = Divisor.new
+    if i == 0 {
+      d.bbb = nat_exp_nn(nat_set_word(bb), nat_set_word(LEAF_SIZE.to_u64), nat_zero, false)
+      d.ndigits = ndigits * LEAF_SIZE
+    } else {
+      d.bbb = nat_sqr(table[i - 1].bbb)
+      d.ndigits = 2 * table[i - 1].ndigits
+    }
+    # optimization: exploit aggregated extra bits in macro blocks
+    larger = nat_set(d.bbb)
+    while mul_add_vww(larger, larger, b, 0) == 0 {
+      d.bbb = nat_set(larger)
+      d.ndigits += 1
+    }
+    d.nbits = nat_bit_len(d.bbb)
+    table << d
+  }
+  table
+}

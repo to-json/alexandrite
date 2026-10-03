@@ -1,0 +1,361 @@
+#![overflow(wrap)]
+# Go's nat_test.go, translated. Go's thresholds are package variables its
+# tests change; here the multiplication, squaring and division entry
+# points take them as parameters (nat_mul_t, nat_sqr_t, nat_div_t).
+# Not translated: TestMulUnbalanced (measures heap allocation with
+# runtime.MemStats, which alx doesn't have); FuzzExpMont (a fuzz target;
+# vec_exp_test.alx compares Exp with the slow path on random operands).
+
+import "math/bits"
+
+# Go's natFromString.
+def nfs(s: Str) -> [U64] {
+  x, _b, _c = nat_scan(new_byte_reader(s), 0, false).unwrap
+  x
+}
+
+def nat_eq?(x: [U64], y: [U64]) -> Bool { nat_cmp(nat_norm(x), nat_norm(y)) == 0 }
+
+test "Cmp" {
+  for a in t_cmp_tests {
+    assert_eq nat_cmp(a.x, a.y), a.r
+  }
+}
+
+struct ArgNN {
+  z: [U64]
+  x: [U64]
+  y: [U64]
+}
+
+def sum_nn -> [ArgNN] {
+  t: [ArgNN] = []
+  for a in t_sum_nn {
+    t << ArgNN.new(z: a.z, x: a.x, y: a.y)
+  }
+  t
+}
+
+# Go's testMul: schoolbook multiplication with math/bits.
+def test_mul(x: [U64], y: [U64]) -> [U64] {
+  z = nat_make(x.size + y.size)
+  for i in 0...x.size {
+    for j in 0...y.size {
+      hi, lo = bits.mul64(x[i], y[j])
+      k = i + j
+      s, c = bits.add64(z[k], lo, 0)
+      z[k] = s
+      k += 1
+      while hi != 0 || c != 0 {
+        s2, c2 = bits.add64(z[k], hi, c)
+        hi = 0
+        c = c2
+        z[k] = s2
+        k += 1
+      }
+    }
+  }
+  nat_norm(z)
+}
+
+# A permutation of x (Go uses rand.Perm).
+def permute(x: [U64], seed: U64) -> Unit {
+  r = new_word_rand(seed)
+  i = x.size - 1
+  while i > 0 {
+    j = (r.next! % (i + 1).as_u64).to_i64
+    t = x[i]
+    x[i] = x[j]
+    x[j] = t
+    i -= 1
+  }
+}
+
+# Go's prodTests plus prodNNExtra.
+def prod_nn -> [ArgNN] {
+  tests: [ArgNN] = []
+  for size in 0...10 {
+    x: [U64] = []
+    y: [U64] = []
+    for i in 0...size {
+      x << (i + 1).as_u64
+      y << (i + 1 + size).as_u64
+    }
+    permute(x, size.as_u64)
+    permute(y, size.as_u64 + 100)
+    x = nat_norm(x)
+    y = nat_norm(y)
+    tests << ArgNN.new(z: test_mul(x, y), x: x, y: y)
+  }
+  words: [U64] = [0, 1, 2, 3, 4, M_, M_ - 1, M_ - 2, M_ - 3]
+  r = new_word_rand(7)
+  for size in 1...10 {
+    for _k in 0...10 {
+      x = nat_make(size)
+      y = nat_make(size)
+      for i in 0...size {
+        x[i] = words[(r.next! % 9).to_i64]
+        y[i] = words[(r.next! % 9).to_i64]
+      }
+      x = nat_norm(x)
+      y = nat_norm(y)
+      tests << ArgNN.new(z: test_mul(x, y), x: x, y: y)
+    }
+  }
+  for a in t_prod_nn_extra {
+    tests << ArgNN.new(z: a.z, x: a.x, y: a.y)
+  }
+  tests << ArgNN.new(z: nfs("11790184577738583171520872861412518665678211592275841109096961"), x: nfs("515377520732011331036461129765621272702107522001"), y: nfs("22876792454961"))
+  tests << ArgNN.new(z: nfs("1" * 70000), x: nfs("1" + ("0" * 699 + "1") * 99), y: nfs("1" * 700))
+  tests << ArgNN.new(z: nfs("1" * 20000), x: nfs("1" + "0" * 9999 + "1"), y: nfs("1" * 10000))
+  tests
+}
+
+test "Set" {
+  for a in sum_nn {
+    assert nat_eq?(nat_set(a.z), a.z), "set"
+  }
+}
+
+test "Add" {
+  for a in sum_nn {
+    assert nat_eq?(nat_add(a.x, a.y), a.z), "add"
+    assert nat_eq?(nat_add(a.y, a.x), a.z), "add symmetric"
+  }
+}
+
+test "Sub" {
+  for a in sum_nn {
+    assert nat_eq?(nat_sub(a.z, a.y), a.x), "sub"
+    assert nat_eq?(nat_sub(a.z, a.x), a.y), "sub symmetric"
+  }
+}
+
+test "NatMul" {
+  tests = prod_nn
+  # Basic
+  for a in tests {
+    next if a.z.size >= 100
+    assert nat_eq?(nat_mul_t(a.x, a.y, 1000000000), a.z), "basic mul"
+    assert nat_eq?(nat_mul_t(a.y, a.x, 1000000000), a.z), "basic mul symmetric"
+  }
+  # Karatsuba
+  for a in tests {
+    assert nat_eq?(nat_mul_t(a.x, a.y, 2), a.z), "karatsuba"
+    assert nat_eq?(nat_mul_t(a.y, a.x, 2), a.z), "karatsuba symmetric"
+  }
+  # Mul
+  for a in tests {
+    assert nat_eq?(nat_mul(a.x, a.y), a.z), "mul"
+    assert nat_eq?(nat_mul(a.y, a.x), a.z), "mul symmetric"
+  }
+}
+
+def sqr_ok?(x: [U64], bthr: I64, kthr: I64) -> Bool { nat_eq?(nat_sqr_t(x, bthr, kthr), nat_mul(x, x)) }
+
+test "NatSqr" {
+  tests = prod_nn
+  for a in tests {
+    next if a.z.size >= 100
+    assert sqr_ok?(a.x, 0, 1000000000) && sqr_ok?(a.y, 0, 1000000000) && sqr_ok?(a.z, 0, 1000000000), "basicSqr"
+  }
+  for a in tests {
+    assert sqr_ok?(a.x, 2, 2) && sqr_ok?(a.y, 2, 2) && sqr_ok?(a.z, 2, 2), "karatsubaSqr"
+  }
+  for a in tests {
+    assert sqr_ok?(a.x, BASIC_SQR_THRESHOLD, KARATSUBA_SQR_THRESHOLD) && sqr_ok?(a.y, BASIC_SQR_THRESHOLD, KARATSUBA_SQR_THRESHOLD) && sqr_ok?(a.z, BASIC_SQR_THRESHOLD, KARATSUBA_SQR_THRESHOLD), "sqr"
+  }
+}
+
+test "MulRangeN" {
+  for r in t_mul_ranges_n {
+    assert_eq Str.from_bytes(nat_utoa(nat_mul_range(r.a, r.b), 10)), r.prod
+  }
+}
+
+test "NLZ" {
+  x: U64 = 1 << 63
+  for i in 0..64 {
+    assert_eq nlz(x), i
+    x >>= 1
+  }
+}
+
+test "ShiftLeft" {
+  for t in t_left_shift_tests {
+    z = nat_lsh(t.in_, t.shift)
+    for j in 0...t.out.size {
+      assert j < z.size && z[j] == t.out[j], "lsh #{natstr(t.in_)} by #{t.shift}"
+    }
+  }
+}
+
+test "ShiftRight" {
+  for t in t_right_shift_tests {
+    z = nat_rsh(t.in_, t.shift)
+    for j in 0...t.out.size {
+      assert j < z.size && z[j] == t.out[j], "rsh #{natstr(t.in_)} by #{t.shift}"
+    }
+  }
+}
+
+test "ModW" {
+  for t in t_mod_w_tests32 + t_mod_w_tests64 {
+    a = iv(t.in_)
+    d = iv(t.dividend)
+    o = iv(t.out)
+    assert_eq nat_mod_w(a.abs, d.abs[0]), o.abs[0]
+  }
+}
+
+test "Montgomery" {
+  one = new_int(1)
+  b_ = i_lsh(one, 64)
+  for t in t_montgomery_tests {
+    x = nfs(t.x)
+    y = nfs(t.y)
+    m = nfs(t.m)
+    while x.size < m.size {
+      x << 0
+    }
+    while y.size < m.size {
+      y << 0
+    }
+    assert nat_cmp(nat_norm(x), m) <= 0, "x > m"
+    assert nat_cmp(nat_norm(y), m) <= 0, "y > m"
+    out = nfs(t.out64)
+    # t.out64 == x * y * 2^(-64 len(m)) mod m
+    xi = Int.new(abs: nat_norm(x))
+    yi = Int.new(abs: nat_norm(y))
+    mi = Int.new(abs: m)
+    inv = Int.new
+    inv.mod_inverse!(i_lsh(one, m.size * W), mi)
+    p = i_mod(i_mul(xi, i_mul(yi, inv)), mi)
+    assert_eq nat_cmp(out, nat_norm(p.abs)), 0
+    k = i_mod(Int.new(abs: m), b_)
+    k = i_sub(b_, k)
+    k = i_mod(k, b_)
+    kinv = Int.new
+    kinv.mod_inverse!(k, b_)
+    k0 = kinv.uint64
+    assert_eq k0, t.k0
+    z = nat_norm(montgomery(nat_make(2 * m.size), x, y, m, k0, m.size))
+    assert_eq nat_cmp(z, out), 0
+  }
+}
+
+test "ExpNN" {
+  for t in t_exp_nn_tests {
+    x = nfs(t.x)
+    y = nfs(t.y)
+    out = nfs(t.out)
+    m = nat_zero
+    m = nfs(t.m) if t.m.size > 0
+    z = nat_exp_nn(x, y, m, false)
+    assert_eq Str.from_bytes(nat_utoa(z, 10)), Str.from_bytes(nat_utoa(out, 10))
+  }
+}
+
+def fibo(n: I64) -> [U64] {
+  return nat_zero if n == 0
+  return nw([1]) if n == 1
+  f0 = nat_zero
+  f1 = nw([1])
+  for _i in 1...n {
+    f2 = nat_add(f0, f1)
+    f0 = f1
+    f1 = f2
+  }
+  f1
+}
+
+test "Fibo" {
+  i = 0
+  for want in t_fibo_nums {
+    assert_eq Str.from_bytes(nat_utoa(fibo(i * 10), 10)), want
+    i += 1
+  }
+}
+
+test "Bit" {
+  for t in t_bit_tests {
+    assert_eq nat_bit(nfs(t.x), t.i).to_i64, t.want
+  }
+}
+
+test "Sticky" {
+  for t in t_sticky_tests {
+    x = nfs(t.x)
+    assert_eq nat_sticky(x, t.i).to_i64, t.want
+    if t.want == 1 {
+      for d in 1..3 {
+        assert_eq nat_sticky(x, t.i + d), 1
+      }
+    }
+  }
+}
+
+test "NatSubMod2N" {
+  for t in t_sub_mod2n_tests {
+    x0 = nfs(t.x)
+    y0 = nfs(t.y)
+    want = nfs(t.z)
+    x = nat_set(x0)
+    y = nat_set(y0)
+    z = nat_sub_mod2n(x, y, t.n)
+    assert_eq nat_cmp(z, want), 0
+    assert_eq nat_cmp(x, x0), 0
+    assert_eq nat_cmp(y, y0), 0
+  }
+}
+
+def rnd_nat1(n: I64, r: WordRand) -> [U64] {
+  rr = r
+  x = nat_make(n)
+  for i in 0...n {
+    x[i] = rr.next!
+  }
+  x = nat_norm(x)
+  x = nw([1]) if x.size == 0
+  x
+}
+
+test "NatDiv" {
+  sizes = [1, 2, 5, 8, 15, 25, 40, 65, 100, 200, 500, 800, 1500, 2500, 4000, 6500, 10000]
+  r = new_word_rand(11)
+  for i in sizes {
+    for j in sizes {
+      a = rnd_nat1(i, r)
+      b = rnd_nat1(j, r)
+      b[0] = 2 if b.size == 1 && b[0] == 1
+      c = rnd_nat1(b.size, r)
+      if c.size == b.size && c[c.size - 1] >= b[b.size - 1] {
+        c[c.size - 1] = 0
+        c = nat_norm(c)
+      }
+      x = nat_add(nat_mul(a, b), c)
+      q, rem = nat_div(x, b)
+      assert nat_cmp(q, a) == 0, "wrong quotient for #{i}/#{j}"
+      assert nat_cmp(rem, c) == 0, "wrong remainder for #{i}/#{j}"
+    }
+  }
+}
+
+test "Issue37499" {
+  u = nfs("0x2b6c385a05be027f5c22005b63c42a1165b79ff510e1706b39f8489c1d28e57bb5ba4ef9fd9387a3e344402c0a453381")
+  v = nfs("0x2b6c385a05be027f5c22005b63c42a1165b79ff510e1706c")
+  q = nat_make(8)
+  uu = nat_set(u)
+  div_basic(q, uu, v)
+  q = nat_norm(q)
+  assert_eq Str.from_bytes(nat_utoa(q, 16)), "fffffffffffffffffffffffffffffffffffffffffffffffb"
+}
+
+test "Issue42552" {
+  u = nfs(ISSUE42552_U)
+  v = nfs(ISSUE42552_V)
+  q, r = nat_div(u, v)
+  # Go only checks that this doesn't panic; check the result too.
+  assert_eq nat_cmp(nat_add(nat_mul(q, v), r), u), 0
+  assert nat_cmp(r, v) < 0, "remainder < divisor"
+}

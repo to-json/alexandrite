@@ -1,0 +1,165 @@
+# Go's alias_test.go, translated. Go checks that every operation gives
+# the same result when the receiver is also an operand (z.Add(z, y)) and
+# leaves the other operands alone. Ints are values here, so aliasing
+# can't corrupt anything; the test still checks that `v.op!(v, y)` and
+# `v.op!(x, v)` agree with `v.op!(x, y)`, on random operands from Go's
+# math/rand source (Go uses testing/quick).
+
+def rnd_int(r: GoRand, nonzero: Bool, positive: Bool) -> Int {
+  rr = r
+  n = new_int(1)
+  n.lsh!(n, (rr.int63! % 80).to_i64)
+  n.rand!(rr, n)
+  n.neg!(n) if !positive && rr.int63! % 4 == 0
+  n.set_int64!(1) if nonzero && n.sign == 0
+  n
+}
+
+def rnd_prime(r: GoRand) -> Int {
+  rr = r
+  bits = (rr.int63! % 62).to_i64 + 2
+  while true {
+    p = new_int(1)
+    p.lsh!(p, bits)
+    p.rand!(rr, p)
+    p.set_bit!(p, bits - 1, 1)
+    p.set_bit!(p, 0, 1) if bits > 1
+    return p if p.probably_prime?(20)
+  }
+  new_int(2)
+}
+
+# op codes for two-operand ops
+def op2(op: Str, x: Int, y: Int, m: Int) -> Int? {
+  z = Int.new
+  r: Int? = none
+  case op {
+    "Add" => r = z.add!(x, y)
+    "Sub" => r = z.sub!(x, y)
+    "Mul" => r = z.mul!(x, y)
+    "And" => r = z.and!(x, y)
+    "AndNot" => r = z.and_not!(x, y)
+    "Or" => r = z.or!(x, y)
+    "Xor" => r = z.xor!(x, y)
+    "Quo" => r = z.quo!(x, y)
+    "Rem" => r = z.rem!(x, y)
+    "Div" => r = z.div!(x, y)
+    "Mod" => r = z.mod!(x, y)
+    "GCD" => r = z.gcd!(x, y)
+    "ModInverse" => r = z.mod_inverse!(x, y)
+    "ModSqrt" => r = z.mod_sqrt!(x, y)
+    "Exp-XY" => r = z.exp!(x, y, m)
+    "Exp-XZ" => r = z.exp!(x, m, y)
+    _ => r = z.exp!(m, x, y)
+  }
+  r
+}
+
+# The same op with the receiver aliasing x (which = 0) or y (which = 1).
+def op2_aliased(op: Str, x: Int, y: Int, m: Int, which: I64) -> Int? {
+  v = x
+  v = y if which == 1
+  r: Int? = none
+  case op {
+    "Add" => r = v.add!(which == 0 ? v : x, which == 1 ? v : y)
+    "Sub" => r = v.sub!(which == 0 ? v : x, which == 1 ? v : y)
+    "Mul" => r = v.mul!(which == 0 ? v : x, which == 1 ? v : y)
+    "And" => r = v.and!(which == 0 ? v : x, which == 1 ? v : y)
+    "AndNot" => r = v.and_not!(which == 0 ? v : x, which == 1 ? v : y)
+    "Or" => r = v.or!(which == 0 ? v : x, which == 1 ? v : y)
+    "Xor" => r = v.xor!(which == 0 ? v : x, which == 1 ? v : y)
+    "Quo" => r = v.quo!(which == 0 ? v : x, which == 1 ? v : y)
+    "Rem" => r = v.rem!(which == 0 ? v : x, which == 1 ? v : y)
+    "Div" => r = v.div!(which == 0 ? v : x, which == 1 ? v : y)
+    "Mod" => r = v.mod!(which == 0 ? v : x, which == 1 ? v : y)
+    "GCD" => r = v.gcd!(which == 0 ? v : x, which == 1 ? v : y)
+    "ModInverse" => r = v.mod_inverse!(which == 0 ? v : x, which == 1 ? v : y)
+    "ModSqrt" => r = v.mod_sqrt!(which == 0 ? v : x, which == 1 ? v : y)
+    "Exp-XY" => r = v.exp!(which == 0 ? v : x, which == 1 ? v : y, m)
+    "Exp-XZ" => r = v.exp!(which == 0 ? v : x, m, which == 1 ? v : y)
+    _ => r = v.exp!(m, which == 0 ? v : x, which == 1 ? v : y)
+  }
+  r
+}
+
+def same?(a: Int?, b: Int?) -> Bool {
+  if av = a {
+    if bv = b {
+      return av.cmp(bv) == 0
+    }
+    return false
+  }
+  b.none?
+}
+
+test "Aliasing" {
+  r = new_go_rand(1)
+  ops = [("Add", 100), ("Sub", 100), ("Mul", 100), ("And", 100), ("AndNot", 100), ("Or", 100), ("Xor", 100), ("Quo", 100), ("Rem", 100), ("Div", 100), ("Mod", 100), ("GCD", 100), ("ModInverse", 20), ("ModSqrt", 4), ("Exp-XY", 2), ("Exp-XZ", 2), ("Exp-YZ", 2)]
+  for o in ops {
+    op = o[0]
+    for _k in 0...o[1] {
+      x = rnd_int(r, false, false)
+      y = rnd_int(r, op == "Quo" || op == "Rem" || op == "Div" || op == "Mod" || op == "ModInverse" || op == "Exp-XZ" || op == "Exp-YZ", false)
+      m = rnd_int(r, op == "Exp-XY", false)
+      y = rnd_prime(r) if op == "ModSqrt"
+      if op == "Exp-YZ" {
+        m = rnd_int(r, false, false)
+      }
+      x0 = x
+      y0 = y
+      want = op2(op, x, y, m)
+      assert same?(op2_aliased(op, x, y, m, 0), want), "#{op}(#{x}, #{y}): receiver = x"
+      assert same?(op2_aliased(op, x, y, m, 1), want), "#{op}(#{x}, #{y}): receiver = y"
+      assert x.cmp(x0) == 0 && y.cmp(y0) == 0, "#{op}: operands changed"
+    }
+  }
+  # one-operand ops
+  for _k in 0...100 {
+    x = rnd_int(r, false, false)
+    n = (r.int63! % 1024).to_i64
+    b = (r.int63! % 2).to_i64
+    v = x
+    assert_eq v.abs!(v).cmp(i_abs(x)), 0
+    v = x
+    assert_eq v.neg!(v).cmp(i_neg(x)), 0
+    v = x
+    nz = Int.new
+    assert_eq v.not!(v).cmp(nz.not!(x)), 0
+    v = x
+    assert_eq v.lsh!(v, n).cmp(i_lsh(x, n)), 0
+    v = x
+    assert_eq v.rsh!(v, n).cmp(i_rsh(x, n)), 0
+    v = x
+    sb = Int.new
+    assert_eq v.set_bit!(v, n, b).cmp(sb.set_bit!(x, n, b)), 0
+    v = x
+    assert_eq v.set!(v).cmp(x), 0
+    p = i_abs(x)
+    v = p
+    sq = Int.new
+    assert_eq v.sqrt!(v).cmp(sq.sqrt!(p)), 0
+    if x.sign > 0 {
+      v = x
+      seed = r.int63!
+      ra = Int.new
+      assert_eq v.rand!(new_go_rand(seed), v).cmp(ra.rand!(new_go_rand(seed), x)), 0
+    }
+  }
+}
+
+def int_of_bytes(b: [Byte]) -> Int {
+  z = Int.new
+  z.set_bytes!(b)
+}
+
+test "Issue72043" {
+  # Go only checks these Exp calls don't fail; y == 1 makes the result x mod z.
+  cases = [(bs([0xb, 0x40, 0x70, 0x8b, 0x64, 0x78, 0x29, 0x9e, 0xd0]), bs([0xe, 0x91, 0x4d, 0xaa, 0x69, 0x60, 0x51, 0x42, 0x9, 0xa1, 0xf6, 0xfa, 0x5, 0x97, 0x1c, 0x5e, 0x18, 0xaa, 0x91, 0x87, 0x1f, 0xe4, 0x70, 0x84, 0x54, 0x97, 0x3a, 0xc9, 0xe1, 0x92, 0xd4, 0xf3, 0xdf, 0x79, 0x90, 0x18, 0xdd, 0xdf, 0x19, 0x44, 0xf3, 0xf, 0x9d, 0xa6, 0xf, 0xd9])), (bs([0x7, 0xd6, 0x79, 0xc5, 0x30, 0xc2, 0x1f, 0x39, 0x5e, 0x3d, 0xd2, 0x52, 0xc6, 0xfb, 0xa7, 0xe2, 0x8a, 0x37, 0xdd]), bs([0x1c, 0x44, 0xba, 0x75, 0xfa, 0xe5, 0x3a, 0x56, 0xc0, 0x94, 0xa, 0x1e, 0x8f, 0xbd, 0xad, 0xdb, 0x17, 0xb8, 0x2b, 0x46, 0xf8, 0x69, 0xc1, 0x54, 0x25, 0x68, 0x53, 0xb5, 0xd5, 0x89, 0x6c, 0x16, 0xef, 0xf2, 0x83, 0x3e, 0x55, 0xa7, 0x54, 0x32, 0xbd, 0xa7, 0x70, 0x13, 0xa4, 0xfa])), (bs([0x8, 0x6f, 0xc5, 0x74, 0x83, 0x56, 0xa5, 0x6e, 0xfe, 0x7b, 0x32, 0xfb, 0x69, 0x4, 0x3, 0x51, 0xf5, 0x2c, 0x41, 0x7, 0xf7, 0xbb, 0x89, 0x8e]), bs([0x34, 0xe1, 0x5f, 0xd0, 0xa7, 0xf8, 0x34, 0x7c, 0x3c, 0x63, 0x82, 0x1e, 0xc3, 0x84, 0x9f, 0xa, 0x70, 0x22, 0xd3, 0xc8, 0x24, 0x64, 0x2b, 0xd7, 0x59, 0x20, 0xf2, 0xdd, 0xb5, 0xb2, 0xfa, 0x11, 0x2e, 0x98, 0x95]))]
+  for c in cases {
+    x = int_of_bytes(c[0])
+    z = int_of_bytes(c[1])
+    v = Int.new
+    v.exp!(x, new_int(1), z)
+    assert_eq v.cmp(i_mod(x, z)), 0
+  }
+}

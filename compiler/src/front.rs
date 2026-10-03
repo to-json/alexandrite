@@ -720,15 +720,15 @@ def __alx_msg(m: Str) -> Str {
   m
 }
 
-def __alx_secs(ns: Int) -> Str {
+def __alx_secs(ns: I64) -> Str {
   format("%.2f", ns.to_f / 1000000000.0)
 }
 
-def __alx_secs3(ns: Int) -> Str {
+def __alx_secs3(ns: I64) -> Str {
   format("%.3f", ns.to_f / 1000000000.0)
 }
 
-def __alx_fail(name: Str, ns: Int, m: Str) -> Int {
+def __alx_fail(name: Str, ns: I64, m: Str) -> I64 {
   puts "--- FAIL: #{name} (#{__alx_secs(ns)}s)"
   for line in m.split("\n") {
     puts "    #{line}"
@@ -736,7 +736,7 @@ def __alx_fail(name: Str, ns: Int, m: Str) -> Int {
   1
 }
 
-def __alx_pass(name: Str, ns: Int) -> Int {
+def __alx_pass(name: Str, ns: I64) -> I64 {
   puts "--- PASS: #{name} (#{__alx_secs(ns)}s)"
   0
 }
@@ -846,12 +846,28 @@ pub fn load_tests(dir: &Path, dir_shown: &str, only: Option<&Path>, o: &TestOpts
         }
     }
     let mut acc = acc.unwrap();
+    // A package declaring a type with a builtin's name (math/big's `Int`)
+    // can't be merged into the runner's main module, where the name would
+    // clash with the builtin: it is checked as a package of its own (under
+    // its import path), with its tests made public for the runner to call.
+    let shadow = acc.structs.iter().map(|s| &s.name).chain(acc.enums.iter().map(|e| &e.name)).any(|n| crate::check::SHADOWABLE.contains(&n.as_str()));
+    let own_path = {
+        let d = dir_shown.trim_end_matches('/');
+        match d.strip_prefix("std/") {
+            Some(p) => p.to_string(),
+            None => format!("_test/{}", d.rsplit('/').next().unwrap_or(d)),
+        }
+    };
     // Every body becomes a def; pick what to run.
     let mut items = vec![];
     let total = decls.len();
     for (k, mut t) in decls.into_iter().enumerate() {
-        let func = format!("__alx_t{k}");
+        let mut func = format!("__alx_t{k}");
         t.def.name = func.clone();
+        if shadow {
+            t.def.public = true;
+            func = format!("__alx_pkg.{func}");
+        }
         acc.defs.push(t.def);
         let wanted = match t.kind {
             TestKind::Bench => o.bench.as_ref().is_some_and(|b| b == "." || t.name.contains(b.as_str())),
@@ -873,7 +889,14 @@ pub fn load_tests(dir: &Path, dir_shown: &str, only: Option<&Path>, o: &TestOpts
     };
     // The runner is the main module; the merged declarations join it.
     let imports = acc.imports.clone();
-    merge_decls(&mut runner, acc);
+    let own = if shadow {
+        qualify(&mut acc, &own_path);
+        runner.imports.push(Import { alias: Some("__alx_pkg".into()), path: own_path.clone(), span: Span::default() });
+        Some(acc)
+    } else {
+        merge_decls(&mut runner, acc);
+        None
+    };
     let list = |p: &Path| -> std::io::Result<Vec<PathBuf>> {
         let mut v: Vec<PathBuf> = std::fs::read_dir(p)?.filter_map(|e| e.ok().map(|e| e.path())).collect();
         v.sort();
@@ -886,6 +909,10 @@ pub fn load_tests(dir: &Path, dir_shown: &str, only: Option<&Path>, o: &TestOpts
         if let Err(d) = load_pkg(imp, &mods, &mut sm, &mut next_id, &mut pkgs, &mut visiting, &mut overflow, &read, &list, &root) {
             return Err((sm, d));
         }
+    }
+    if let Some(m) = own {
+        pkgs.retain(|p| p.path != own_path);
+        pkgs.push(Package { path: own_path, module: m, source: String::new() });
     }
     overflow.insert(runner.file, Overflow::Abort);
     Ok((Loaded { sm, main: runner, pkgs, overflow }, n, total))

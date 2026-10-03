@@ -234,6 +234,8 @@ pub enum M {
     Split,
     Even,
     Odd,
+    /// `u.__mulhi(v)` (U64): the high word of the 128-bit product (math/bits, math/big).
+    UMulHi,
     Digits,
     Step,
     Push,

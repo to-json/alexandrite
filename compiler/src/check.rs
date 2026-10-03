@@ -31,7 +31,7 @@ pub fn ffi_sig(d: &Def) -> R<ExternSig> {
         let bad = |sp: Span| Diag::new(sp, "an `extern def` takes and returns C types: Int, I8..I32, U8..U64, Float, Bool, Ptr, and (parameters only) Str and [Byte]");
         match t {
             TypeExpr::Named(n, sp) => match n.as_str() {
-                "Float" => Ok(Ty::Float),
+                "Float" | "F64" => Ok(Ty::Float),
                 "Bool" => Ok(Ty::Bool),
                 "Ptr" => Ok(Ty::Ptr),
                 "Str" if ok_str => Ok(Ty::Str),
@@ -356,7 +356,7 @@ impl<'a> World<'a> {
         let enums: Vec<&EnumDef> = enums.iter().filter(|d| d.tparams.is_empty()).collect();
         let all = defs.iter().copied().map(|d| (d.name.as_str(), d.span, Def::S(d))).chain(enums.iter().copied().map(|d| (d.name.as_str(), d.span, Def::E(d))));
         for (name, span, d) in all {
-            if by_name.contains_key(name) || self.structs.contains_key(name) || self.consts.contains_key(name) || ["Int", "Float", "Bool", "Str", "Array", "Map", "Math", "Test", "Enumerator", "Error", "Ptr"].contains(&name) {
+            if by_name.contains_key(name) || self.structs.contains_key(name) || self.consts.contains_key(name) || ["Int", "Float", "Bool", "Str", "Array", "Map", "Math", "Test", "Enumerator", "Error", "Ptr", "F64"].iter().any(|b| *b == name && !SHADOWABLE.contains(b)) {
                 return Err(Diag::new(span, format!("`{name}` is already defined")));
             }
             by_name.insert(name, d);
@@ -1069,11 +1069,22 @@ fn in_current_pkg(n: &str, structs: &Structs) -> bool {
     !p.is_empty() && structs.contains_key(&format!("{p}.{n}"))
 }
 
+/// Builtin type names a package may declare a type of its own with
+/// (math/big's `Int` and `Float`). Inside that package (or a main file that
+/// declares one) the name means its own type; the builtins stay reachable
+/// as `I64` and `F64`.
+pub const SHADOWABLE: [&str; 2] = ["Int", "Float"];
+
+/// Does `n` name a builtin type that the current code shadows with its own?
+pub fn shadowed(n: &str, structs: &Structs) -> bool {
+    SHADOWABLE.contains(&n) && (in_current_pkg(n, structs) || (current_pkg().is_empty() && structs.contains_key(n)))
+}
+
 pub fn type_from(t: &TypeExpr, structs: &Structs, consts: &Consts) -> R<Ty> {
     let type_from = |t| type_from(t, structs, consts);
     match t {
         // A package's own type wins over a main-file type of the same name.
-        TypeExpr::Named(n, sp) if !matches!(n.as_str(), "Float" | "Bool" | "Str" | "Error" | "Unit" | "Ptr") && IntKind::from_name(n).is_none() && (!structs.contains_key(n) || in_current_pkg(n, structs)) => {
+        TypeExpr::Named(n, sp) if shadowed(n, structs) || (!matches!(n.as_str(), "Float" | "F64" | "Bool" | "Str" | "Error" | "Unit" | "Ptr") && IntKind::from_name(n).is_none() && (!structs.contains_key(n) || in_current_pkg(n, structs))) => {
             let q = resolve_name(n, *sp, &|q| structs.contains_key(q) || generic(q).is_some())?;
             if generic(&q).is_some() && !structs.contains_key(&q) {
                 return Err(Diag::new(*sp, format!("`{n}` is generic: give its type arguments (`{n}[...]`)")));
@@ -1081,7 +1092,7 @@ pub fn type_from(t: &TypeExpr, structs: &Structs, consts: &Consts) -> R<Ty> {
             structs.get(&q).cloned().ok_or_else(|| Diag::new(*sp, format!("unknown type `{n}`")))
         }
         TypeExpr::Named(n, sp) => match n.as_str() {
-            "Float" => Ok(Ty::Float),
+            "Float" | "F64" => Ok(Ty::Float),
             "Bool" => Ok(Ty::Bool),
             "Str" => Ok(Ty::Str),
             "Error" => Ok(Ty::Error),
@@ -5937,6 +5948,7 @@ impl<'w, 'a> FnCx<'w, 'a> {
         let (m, ty, arity) = match (rt, n) {
             (Ty::Float, "bits") => (M::FloatBits, Ty::IntK(IntKind::U64), 1),
             (Ty::IntK(IntKind::U64), "from_bits") => (M::FloatFromBits, Ty::Float, 1),
+            (Ty::IntK(IntKind::U64), "mulhi") => (M::UMulHi, Ty::IntK(IntKind::U64), 2),
             (Ty::Float, _) => {
                 let f = crate::lir::MathFn::by_name(n)?;
                 (M::Math(f), Ty::Float, f.arity())
@@ -5949,9 +5961,10 @@ impl<'w, 'a> FnCx<'w, 'a> {
             }
             let mut targs = vec![];
             for a in args {
+                let want = if m == M::UMulHi { Ty::IntK(IntKind::U64) } else { Ty::Float };
                 let v = self.value(a)?;
-                let v = self.coerce(v, &Ty::Float)?;
-                self.expect(&v.ty, &Ty::Float, v.span, name)?;
+                let v = self.coerce(v, &want)?;
+                self.expect(&v.ty, &want, v.span, name)?;
                 targs.push(v);
             }
             Ok(self.mk(TK::M(m, Some(Box::new(recv.clone())), targs, None), ty, sp))

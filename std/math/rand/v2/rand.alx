@@ -1,0 +1,407 @@
+#![overflow(wrap)]
+# Package rand: Go's math/rand/v2, pseudo-random numbers for simulations and
+# tests (not for security-sensitive work; see crypto/rand). The same seed
+# gives exactly Go's sequence, for every source and distribution.
+#
+# `import "math/rand/v2"` names the package `rand` (a major-version path
+# element names the element before it, as Go's package clause does).
+#
+#   Go                                     alx
+#   type Source interface{ Uint64() }      interface Source { def uint64! -> U64 }
+#   rand.New(src) *Rand                    rand.new(src) -> Rand
+#   r.Int64() / Int32() / Int()            r.int64! -> I64 / r.int32! -> I32 / r.int! -> Int
+#   r.Uint64() / Uint32() / Uint()         r.uint64! -> U64 / r.uint32! -> U32 / r.uint! -> U64
+#   r.Int64N(n) / Int32N(n) / IntN(n)      r.int64_n!(n) / r.int32_n!(n) / r.int_n!(n)
+#   r.Uint64N(n) / Uint32N(n) / UintN(n)   r.uint64_n!(n) / r.uint32_n!(n) / r.uint_n!(n)
+#   rand.N[Int](n) (generic)               r.n!(n) / rand.n(n), T: like Int
+#   r.Float64() / Float32()                r.float64! / r.float32! (both Float)
+#   r.NormFloat64() / ExpFloat64()         r.norm_float64! / r.exp_float64!
+#   r.Perm(n) []int                        r.perm!(n) -> [Int]
+#   r.Shuffle(n, swap)                     r.shuffle!(n) { |i, j| ... }
+#   rand.NewPCG(s1, s2) *PCG               rand.new_pcg(s1, s2) -> PCG
+#   p.Seed / Uint64 / MarshalBinary ...    p.seed! / p.uint64! / p.marshal_binary
+#     / AppendBinary / UnmarshalBinary       / p.append_binary(b) / p.unmarshal_binary!(b)
+#   rand.NewChaCha8(seed [32]byte)         rand.new_chacha8(seed: [Byte; 32]) -> ChaCha8
+#   c.Seed / Uint64 / Read / Marshal...    c.seed! / c.uint64! / c.read!(p) -> Int / ...
+#   rand.NewZipf(r, s, v, imax) *Zipf      rand.new_zipf(r, s, v, imax) -> Zipf? (Go's nil = none)
+#   z.Uint64()                             z.uint64!
+#   rand.Int64() ... (top level)           rand.int64, rand.int_n(n), rand.float64, ...
+#
+# The methods that draw from the source end in `!`: they change its state.
+# Every source keeps its state in shared slices, so copies of a Rand, PCG or
+# ChaCha8 are the same generator, as Go's pointers are (GO-VS-RUBY D36).
+#
+# Differences from Go:
+#   - alx has no float32 or uint: float32! returns the float32 value as a
+#     Float (exactly Go's value); Uint/UintN are U64. The ziggurat's float32
+#     arithmetic (NormFloat64, ExpFloat64) is reproduced with f32(), which
+#     rounds a Float to the nearest float32 (correct for one + - * of
+#     float32 operands, as Go's float32 operations are).
+#   - The top-level functions draw from the operating system (getentropy(3),
+#     8 bytes per value; perm and shuffle from a ChaCha8 seeded with 32 bytes
+#     of it) instead of Go's per-thread runtime ChaCha8, because alx has no
+#     mutable package globals. They are slower than Go's (a system call per
+#     value) and, like any FFI, aren't available in the browser (wasm refuses
+#     programs that call them; the seeded sources work there).
+#   - Go's zero PCG and ChaCha8 are usable; here they come from new_pcg and
+#     new_chacha8 (`PCG.new` has no state). MarshalBinary and AppendBinary
+#     never fail in Go, so they return [Byte]; UnmarshalBinary returns
+#     ~Unit<RandError> with Go's messages.
+#   - N is generic over `like Int` types; Go's also takes time.Duration,
+#     which is a struct here (use time.Duration.new(r.n!(d.ns))).
+#   - uint32n (Go's path for 32-bit platforms) is not ported: Go's results
+#     are those of a 64-bit platform.
+
+import "math"
+import "math/bits"
+
+pub error RandError {
+  InvalidPCG
+  InvalidChaCha8
+  InvalidReadBuf
+
+  def message -> Str {
+    case self {
+      InvalidPCG => "invalid PCG encoding"
+      InvalidChaCha8 => "invalid ChaCha8 encoding"
+      InvalidReadBuf => "invalid ChaCha8 Read buffer encoding"
+    }
+  }
+}
+
+# A source of uniformly-distributed pseudo-random U64 values in [0, 1<<64).
+pub interface Source {
+  def uint64! -> U64
+}
+
+# A source of random numbers, with the distributions.
+pub struct Rand {
+  src: Source
+
+  # A non-negative pseudo-random 63-bit integer.
+  pub def int64! -> I64 { (self.src.uint64! &^ (1 << 63)).as_i64 }
+
+  # A pseudo-random 32-bit value.
+  pub def uint32! -> U32 { (self.src.uint64! >> 32).as_u32 }
+
+  # A pseudo-random 64-bit value.
+  pub def uint64! -> U64 { self.src.uint64! }
+
+  # A non-negative pseudo-random 31-bit integer.
+  pub def int32! -> I32 { (self.src.uint64! >> 33).as_i32 }
+
+  # A non-negative pseudo-random Int.
+  pub def int! -> Int { (self.src.uint64! << 1 >> 1).as_i64 }
+
+  # A pseudo-random U64 (Go's uint).
+  pub def uint! -> U64 { self.src.uint64! }
+
+  # A pseudo-random number in [0, n); panics if n <= 0.
+  pub def int64_n!(n: I64) -> I64 {
+    panic("invalid argument to Int64N") if n <= 0
+    self.uint64n!(n.as_u64).as_i64
+  }
+
+  # A pseudo-random number in [0, n); panics if n == 0.
+  pub def uint64_n!(n: U64) -> U64 {
+    panic("invalid argument to Uint64N") if n == 0
+    self.uint64n!(n)
+  }
+
+  # A pseudo-random number in [0, n), unbiased (Lemire's multiply-shift
+  # with rejection).
+  def uint64n!(n: U64) -> U64 {
+    return self.src.uint64! & (n - 1) if n & (n - 1) == 0
+    # (hi, lo) = bits.Mul64(x, n), inline.
+    x = self.src.uint64!
+    lo = x * n
+    if lo < n {
+      thresh = (0 - n) % n
+      while lo < thresh {
+        x = self.src.uint64!
+        lo = x * n
+      }
+    }
+    x.__mulhi(n)
+  }
+
+  # A pseudo-random number in [0, n); panics if n <= 0.
+  pub def int32_n!(n: I32) -> I32 {
+    panic("invalid argument to Int32N") if n <= 0
+    self.uint64n!(n.as_u64).as_i32
+  }
+
+  # A pseudo-random number in [0, n); panics if n == 0.
+  pub def uint32_n!(n: U32) -> U32 {
+    panic("invalid argument to Uint32N") if n == 0
+    self.uint64n!(n.as_u64).as_u32
+  }
+
+  # A pseudo-random number in [0, n); panics if n <= 0.
+  pub def int_n!(n: Int) -> Int {
+    panic("invalid argument to IntN") if n <= 0
+    self.uint64n!(n.as_u64).as_i64
+  }
+
+  # A pseudo-random number in [0, n); panics if n == 0.
+  pub def uint_n!(n: U64) -> U64 {
+    panic("invalid argument to UintN") if n == 0
+    self.uint64n!(n)
+  }
+
+  # A pseudo-random number in [0, bound) of any integer type; panics if
+  # bound <= 0.
+  pub def n![T: like Int](bound: T) -> T {
+    panic("invalid argument to N") if bound <= 0
+    u = self.uint64n!(bound.as_u64)
+    # u < bound, so it fits T: rebuild it bit by bit in T's arithmetic.
+    r = bound - bound
+    k = 63 - bits.leading_zeros64(u)
+    while k >= 0 {
+      r = r + r
+      r = r + 1 if (u >> k) & 1 == 1
+      k -= 1
+    }
+    r
+  }
+
+  # A pseudo-random number in [0.0, 1.0).
+  pub def float64! -> Float { (self.src.uint64! << 11 >> 11).as_i64.to_f / 9007199254740992.0 }
+
+  # A pseudo-random float32 in [0.0, 1.0), as a Float.
+  pub def float32! -> Float { (self.uint32! << 8 >> 8).to_i.to_f / 16777216.0 }
+
+  # A pseudo-random permutation of the integers [0, n).
+  pub def perm!(n: Int) -> [Int] {
+    p: [Int] = [0; n]
+    for i in 0...n { p[i] = i }
+    i = n - 1
+    while i > 0 {
+      j = self.uint64n!((i + 1).as_u64).as_i64
+      t = p[i]
+      p[i] = p[j]
+      p[j] = t
+      i -= 1
+    }
+    p
+  }
+
+  # Pseudo-randomizes the order of n elements; swap swaps the elements
+  # with indexes i and j. Panics if n < 0.
+  pub def shuffle!(n: Int, swap: (Int, Int) -> Unit) {
+    panic("invalid argument to Shuffle") if n < 0
+    i = n - 1
+    while i > 0 {
+      j = self.uint64n!((i + 1).as_u64).as_i64
+      swap(i, j)
+      i -= 1
+    }
+  }
+
+  # A normally distributed Float in [-MAX_FLOAT64, +MAX_FLOAT64], mean 0,
+  # standard deviation 1 (Marsaglia & Tsang's ziggurat, Go's tables).
+  pub def norm_float64! -> Float {
+    while true {
+      u = self.src.uint64!
+      j = u.as_i32
+      i = ((u >> 32) & 0x7F).as_i64
+      x = j.to_i.to_f * WN[i]
+      return x if abs_int32(j) < KN[i]
+      if i == 0 {
+        while true {
+          x = -math.log(self.float64!) * (1.0 / RN)
+          y = -math.log(self.float64!)
+          break if y + y >= x * x
+        }
+        return j > 0 ? RN + x : -RN - x
+      }
+      d = f32(FN[i - 1] - FN[i])
+      if f32(FN[i] + f32(f32(self.float64!) * d)) < f32(math.exp(-0.5 * x * x)) {
+        return x
+      }
+    }
+    0.0
+  }
+
+  # An exponentially distributed Float in (0, +MAX_FLOAT64], rate 1, mean 1
+  # (Marsaglia & Tsang's ziggurat, Go's tables).
+  pub def exp_float64! -> Float {
+    while true {
+      u = self.src.uint64!
+      j = u.as_u32
+      i = ((u >> 32) & 0xFF).as_i64
+      x = j.to_i.to_f * WE[i]
+      return x if j < KE[i]
+      return RE - math.log(self.float64!) if i == 0
+      d = f32(FE[i - 1] - FE[i])
+      if f32(FE[i] + f32(f32(self.float64!) * d)) < f32(math.exp(-x)) {
+        return x
+      }
+    }
+    0.0
+  }
+}
+
+# A new Rand drawing from src.
+pub def new(src: Source) -> Rand { Rand.new(src: src) }
+
+RN = 3.442619855899
+RE = 7.69711747013104972
+
+def abs_int32(i: I32) -> U32 {
+  v = i.to_i
+  v = -v if v < 0
+  v.as_u32
+}
+
+# x rounded to the nearest float32 (ties to even), as a Float: Go's
+# float32(x). Exact for every float32 operation done in Float first.
+def f32(x: Float) -> Float {
+  a = x.abs
+  return x if a != a || a == 0.0 || a - a != 0.0
+  b = a.__bits
+  r = 0.0
+  if b >> 52 >= 897 {
+    # A normal float32: keep 23 of the 52 fraction bits.
+    rem = b & 0x1FFFFFFF
+    m = b >> 29
+    m += 1 if rem > 0x10000000 || (rem == 0x10000000 && m & 1 == 1)
+    m <<= 29
+    m = 0x7FF0000000000000 if m >> 52 > 1150
+    r = m.__from_bits
+  } else {
+    # A float32 subnormal: a multiple of 2^-149.
+    up: U64 = 0x4940000000000000   # 2^149
+    down: U64 = 0x36A0000000000000 # 2^-149
+    big: U64 = 0x4330000000000000  # 2^52
+    q = a * up.__from_bits
+    r = (q + big.__from_bits - big.__from_bits) * down.__from_bits
+  }
+  x < 0.0 ? -r : r
+}
+
+# ---- the top-level functions: the operating system's randomness ----
+
+extern def c_getentropy(buf: [Byte], n: Int) -> I32 = "getentropy"
+
+# Fills buf (at most 256 bytes) from the operating system.
+def entropy(buf: [Byte]) {
+  panic("rand: getentropy failed") if c_getentropy(buf, buf.size) != 0
+}
+
+# A Source reading the operating system's randomness.
+struct OsSource {
+  def uint64! -> U64 {
+    buf: [Byte] = [0; 8]
+    entropy(buf)
+    w: U64 = 0
+    for k in 0...8 { w |= buf[k].as_u64 << (8 * k) }
+    w
+  }
+}
+
+def os_rand -> Rand { Rand.new(src: OsSource.new) }
+
+# A ChaCha8 Rand seeded from the operating system.
+def seeded_rand -> Rand {
+  seed: [Byte; 32] = [0; 32]
+  buf: [Byte] = [0; 32]
+  entropy(buf)
+  for k in 0...32 { seed[k] = buf[k] }
+  Rand.new(src: new_chacha8(seed))
+}
+
+pub def int64 -> I64 {
+  r = os_rand()
+  r.int64!
+}
+
+pub def uint32 -> U32 {
+  r = os_rand()
+  r.uint32!
+}
+
+pub def uint64_n(n: U64) -> U64 {
+  r = os_rand()
+  r.uint64_n!(n)
+}
+
+pub def uint32_n(n: U32) -> U32 {
+  r = os_rand()
+  r.uint32_n!(n)
+}
+
+pub def uint64 -> U64 {
+  r = os_rand()
+  r.uint64!
+}
+
+pub def int32 -> I32 {
+  r = os_rand()
+  r.int32!
+}
+
+pub def int -> Int {
+  r = os_rand()
+  r.int!
+}
+
+pub def uint -> U64 {
+  r = os_rand()
+  r.uint!
+}
+
+pub def int64_n(n: I64) -> I64 {
+  r = os_rand()
+  r.int64_n!(n)
+}
+
+pub def int32_n(n: I32) -> I32 {
+  r = os_rand()
+  r.int32_n!(n)
+}
+
+pub def int_n(n: Int) -> Int {
+  r = os_rand()
+  r.int_n!(n)
+}
+
+pub def uint_n(n: U64) -> U64 {
+  r = os_rand()
+  r.uint_n!(n)
+}
+
+pub def n[T: like Int](bound: T) -> T {
+  r = os_rand()
+  r.n!(bound)
+}
+
+pub def float64 -> Float {
+  r = os_rand()
+  r.float64!
+}
+
+pub def float32 -> Float {
+  r = os_rand()
+  r.float32!
+}
+
+pub def perm(n: Int) -> [Int] {
+  r = seeded_rand()
+  r.perm!(n)
+}
+
+pub def shuffle(n: Int, swap: (Int, Int) -> Unit) {
+  r = seeded_rand()
+  r.shuffle!(n, swap)
+}
+
+pub def norm_float64 -> Float {
+  r = os_rand()
+  r.norm_float64!
+}
+
+pub def exp_float64 -> Float {
+  r = os_rand()
+  r.exp_float64!
+}

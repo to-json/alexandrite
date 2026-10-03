@@ -9,6 +9,9 @@ pub enum Tok {
     BigInt(String),
     /// Value and source text.
     Float(f64, String),
+    /// An imaginary literal (`2i`, `1.5e3i`): the value and text of its
+    /// coefficient (Go's imaginary literals; decimal forms only).
+    Imag(f64, String),
     /// A double-quoted string with `#{...}` parts.
     Interp(Vec<IPiece>),
     /// A command literal: `` `cat #{f} | grep -c x` ``.
@@ -252,6 +255,14 @@ pub fn lex_at(file: u32, src: &str, base: u32) -> Result<Vec<Token>, Diag> {
                     }
                 }
             }
+            // `2i`, `1.5i`: an imaginary literal (the `i` ends the word).
+            if i < b.len() && b[i] == b'i' && !(i + 1 < b.len() && (b[i + 1].is_ascii_alphanumeric() || b[i + 1] == b'_' || b[i + 1] == b'?' || b[i + 1] == b'!')) {
+                let v: f64 = s.parse().map_err(|_| Diag::new(sp(start, i), "malformed imaginary literal"))?;
+                i += 1;
+                out.push(Token { tok: Tok::Imag(v, s), span: sp(start, i), space_before: space });
+                space = false;
+                continue;
+            }
             if float {
                 let v: f64 = s.parse().map_err(|_| Diag::new(sp(start, i), "malformed Float literal"))?;
                 out.push(Token { tok: Tok::Float(v, s), span: sp(start, i), space_before: space });
@@ -439,7 +450,7 @@ pub fn lex_at(file: u32, src: &str, base: u32) -> Result<Vec<Token>, Diag> {
         }
         // Symbols: `:name`, `:*`; but not `a ? b : c` (space after colon).
         if c == b':' && i + 1 < b.len() && !b[i + 1].is_ascii_whitespace() {
-            let prev_is_value = matches!(out.last().map(|t| &t.tok), Some(Tok::Ident(_) | Tok::Int(_) | Tok::BigInt(_) | Tok::Float(..) | Tok::Op(")") | Tok::Op("]")));
+            let prev_is_value = matches!(out.last().map(|t| &t.tok), Some(Tok::Ident(_) | Tok::Int(_) | Tok::BigInt(_) | Tok::Float(..) | Tok::Imag(..) | Tok::Op(")") | Tok::Op("]")));
             if !prev_is_value || space {
                 let mut j = i + 1;
                 if b[j].is_ascii_alphabetic() || b[j] == b'_' {

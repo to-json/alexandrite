@@ -1497,6 +1497,18 @@ impl<'a> Parser<'a> {
                     let (v, t) = (-v, format!("-{t}"));
                     return Ok(self.mk(ExprKind::Float(v, t), full));
                 }
+                // `-2i` is the constant (0, -2) (Go), not -(0+2i) = (-0, -2).
+                ExprKind::Call { recv: Some(r), name, args, .. } if name == "__imag" && matches!(&r.kind, ExprKind::Const(c) if c == "Complex") && matches!(args.as_slice(), [Expr { kind: ExprKind::Float(..), .. }]) => {
+                    let mut e = e.clone();
+                    if let ExprKind::Call { args, .. } = &mut e.kind {
+                        if let ExprKind::Float(v, t) = &args[0].kind {
+                            let (v, t) = (-v, format!("-{t}"));
+                            args[0].kind = ExprKind::Float(v, t);
+                        }
+                    }
+                    e.span = full;
+                    return Ok(e);
+                }
                 _ => {}
             }
             return Ok(self.mk(ExprKind::Neg(Box::new(e)), full));
@@ -1786,7 +1798,7 @@ impl<'a> Parser<'a> {
             return false;
         }
         match self.peek() {
-            Tok::Int(_) | Tok::BigInt(_) | Tok::Float(..) | Tok::Str(_) | Tok::Interp(_) | Tok::Cmd(_) | Tok::Ident(_) | Tok::Const(_) | Tok::Sym(_) => true,
+            Tok::Int(_) | Tok::BigInt(_) | Tok::Float(..) | Tok::Imag(..) | Tok::Str(_) | Tok::Interp(_) | Tok::Cmd(_) | Tok::Ident(_) | Tok::Const(_) | Tok::Sym(_) => true,
             Tok::Kw(Kw::Case) => true,
             Tok::Kw(Kw::True | Kw::False | Kw::Nil | Kw::None | Kw::Try) => true,
             Tok::Op("(") | Tok::Op("[") | Tok::Op("~") | Tok::Op("->") => true,
@@ -1803,6 +1815,12 @@ impl<'a> Parser<'a> {
             Tok::Int(v) => self.mk(ExprKind::Int(v), sp),
             Tok::BigInt(t) => self.mk(ExprKind::BigInt(t), sp),
             Tok::Float(v, t) => self.mk(ExprKind::Float(v, t), sp),
+            // `2i`: `Complex.__imag(2.0)`, a Complex with real part +0 (Go).
+            Tok::Imag(v, t) => {
+                let k = self.mk(ExprKind::Float(v, t), sp);
+                let recv = self.mk(ExprKind::Const("Complex".into()), sp);
+                self.mk(ExprKind::Call { recv: Some(Box::new(recv)), name: "__imag".into(), name_span: sp, args: vec![k], block: None, block_sym: None }, sp)
+            }
             Tok::Str(s) => self.mk(ExprKind::Str(s), sp),
             Tok::Interp(pieces) => self.interp(pieces, sp)?,
             Tok::Cmd(cparts) => {
@@ -2130,6 +2148,7 @@ pub fn describe(t: &Tok) -> String {
         Tok::Int(v) => format!("`{v}`"),
         Tok::BigInt(t) => format!("`{t}`"),
         Tok::Float(_, t) => format!("`{t}`"),
+        Tok::Imag(_, t) => format!("`{t}i`"),
         Tok::Str(_) | Tok::Interp(_) => "a string".into(),
         Tok::Cmd(_) => "a command literal".into(),
         Tok::Ident(n) | Tok::Const(n) => format!("`{n}`"),

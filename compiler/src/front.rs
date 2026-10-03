@@ -31,6 +31,17 @@ pub fn parse_file(sm: &mut SourceMap, display: String, text: String, next_id: &m
     parser::parse(f, &toks, next_id)
 }
 
+/// The builtin declarations (`Complex`), parsed with every program.
+const BUILTINS: &str = include_str!("builtin.alx");
+
+/// Merge the builtin declarations into the main module.
+fn add_builtins(sm: &mut SourceMap, next_id: &mut NodeId, main: &mut Module, overflow: &mut HashMap<u32, Overflow>) -> Result<(), Diag> {
+    let b = parse_file(sm, "<builtin>".into(), BUILTINS.to_string(), next_id)?;
+    overflow.insert(b.file, b.overflow);
+    merge_decls(main, b);
+    Ok(())
+}
+
 pub fn load(path: &Path, display: &str) -> Result<Loaded, (SourceMap, Diag)> {
     let list = |p: &Path| -> std::io::Result<Vec<PathBuf>> {
         let mut v: Vec<PathBuf> = std::fs::read_dir(p)?.filter_map(|e| e.ok().map(|e| e.path())).collect();
@@ -272,6 +283,10 @@ pub fn load_with(path: &Path, display: &str, read: &dyn Fn(&Path) -> std::io::Re
         Err(d) => return Err((sm, d)),
     };
     let mut overflow = HashMap::from([(main.file, main.overflow)]);
+    let mut main = main;
+    if let Err(d) = add_builtins(&mut sm, &mut next_id, &mut main, &mut overflow) {
+        return Err((sm, d));
+    }
     let mut pkgs: Vec<Package> = vec![];
     let mut visiting: Vec<String> = vec![];
     let imports = main.imports.clone();
@@ -534,6 +549,12 @@ pub fn separable(p: &Package) -> bool {
         && m.defs.iter().any(|d| d.public)
         // Array constants live in globals the program's main sets up.
         && !m.consts.iter().any(|c| matches!(c.value.kind, crate::ast::ExprKind::Array(_) | crate::ast::ExprKind::ArrayRepeat(..)))
+        // The builtin Complex is declared with the program.
+        && !uses_complex(&p.source)
+}
+
+fn uses_complex(src: &str) -> bool {
+    src.contains("Complex") || lexer::lex(0, src).map_or(true, |ts| ts.iter().any(|t| matches!(t.tok, lexer::Tok::Imag(..))))
 }
 
 fn header_type(t: &crate::ast::TypeExpr) -> bool {
@@ -919,6 +940,9 @@ pub fn load_tests(dir: &Path, dir_shown: &str, only: Option<&Path>, o: &TestOpts
         pkgs.push(Package { path: own_path, module: m, source: String::new() });
     }
     overflow.insert(runner.file, Overflow::Abort);
+    if let Err(d) = add_builtins(&mut sm, &mut next_id, &mut runner, &mut overflow) {
+        return Err((sm, d));
+    }
     Ok((Loaded { sm, main: runner, pkgs, overflow }, n, total))
 }
 

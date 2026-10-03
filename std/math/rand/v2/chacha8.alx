@@ -1,0 +1,349 @@
+#![overflow(wrap)]
+# ChaCha8: Go's math/rand/v2 ChaCha8 source, with internal/chacha8rand's
+# State, generic block function, Marshal and Unmarshal, byte for byte.
+# See rand.alx for the API mapping.
+
+CTR_INC = 4  # the counter grows by 4 between blocks
+CTR_MAX = 16 # reseed when it reaches 16
+CHUNK = 32   # each block makes 32 U64s
+RESEED = 4   # reseed with 4 words
+
+# Slots of ChaCha8.ctr.
+AT_I = 0  # next index into buf
+AT_N = 1  # number of usable words in buf
+AT_C = 2  # block counter
+AT_RL = 3 # bytes of read_buf not yet returned by read!
+
+# A ChaCha8-based cryptographically strong random number generator: a
+# Source, and an io.Reader. All its state is in slices, so copies share it
+# (Go's *ChaCha8, GO-VS-RUBY D36).
+pub struct ChaCha8 {
+  buf: [U64]
+  seed_words: [U64]
+  ctr: [Int]
+  read_buf: [Byte]
+
+  # Reseeds it to behave like new_chacha8(seed).
+  pub def seed!(seed: [Byte; 32]) {
+    init64(self, words_of(seed))
+    self.ctr[AT_RL] = 0
+    for k in 0...8 { self.read_buf[k] = 0 }
+  }
+
+  # A uniformly distributed random U64.
+  pub def uint64! -> U64 {
+    while true {
+      i = ctr[AT_I]
+      if i < ctr[AT_N] {
+        self.ctr[AT_I] = i + 1
+        return buf[i]
+      }
+      refill(self)
+    }
+    0
+  }
+
+  # Fills p with random bytes (Go's Read: never fails, always fills p).
+  pub def read!(p: [Byte]) -> Int {
+    n = 0
+    q = p
+    rl = ctr[AT_RL]
+    if rl > 0 {
+      n = copy(q, read_buf[8 - rl...8])
+      self.ctr[AT_RL] = rl - n
+      q = q[n...q.size]
+    }
+    while q.size >= 8 {
+      put_le64(q, 0, self.uint64!)
+      q = q[8...q.size]
+      n += 8
+    }
+    if q.size > 0 {
+      put_le64(read_buf, 0, self.uint64!)
+      n += copy(q, read_buf)
+      self.ctr[AT_RL] = 8 - q.size
+    }
+    n
+  }
+
+  # Go's UnmarshalBinary: restores a state from marshal_binary's encoding.
+  pub def unmarshal_binary!(data: [Byte]) -> ~Unit<RandError> {
+    d = data
+    if has_prefix(d, "readbuf:") {
+      d = d[8...d.size]
+      fail RandError.InvalidReadBuf if d.size == 0 || d.size < 1 + d[0].to_i
+      k = d[0].to_i
+      b = d[1...1 + k]
+      d = d[1 + k...d.size]
+      self.ctr[AT_RL] = copy(read_buf[8 - b.size...8], b)
+    }
+    ~unmarshal(self, d)
+  }
+
+  # Go's AppendBinary: b with the state's encoding appended.
+  pub def append_binary(b: [Byte]) -> [Byte] {
+    out = b
+    rl = ctr[AT_RL]
+    if rl > 0 {
+      out = out + "readbuf:".bytes
+      out << rl.as_u8
+      out = out + read_buf[8 - rl...8]
+    }
+    out + marshal(self)
+  }
+
+  # Go's MarshalBinary (which never fails).
+  pub def marshal_binary -> [Byte] { append_binary([]) }
+}
+
+# A new ChaCha8 seeded with the 32 bytes of seed.
+pub def new_chacha8(seed: [Byte; 32]) -> ChaCha8 {
+  buf: [U64] = [0; CHUNK]
+  words: [U64] = [0; 4]
+  rb: [Byte] = [0; 8]
+  c = ChaCha8.new(buf: buf, seed_words: words, ctr: [0; 4], read_buf: rb)
+  init64(c, words_of(seed))
+  c
+}
+
+def words_of(seed: [Byte; 32]) -> [U64] {
+  out: [U64] = []
+  for k in 0...4 {
+    w: U64 = 0
+    for b in 0...8 { w |= seed[k * 8 + b].as_u64 << (8 * b) }
+    out << w
+  }
+  out
+}
+
+def has_prefix(d: [Byte], p: Str) -> Bool {
+  return false if d.size < p.size
+  for k in 0...p.size {
+    return false if d[k] != p[k]
+  }
+  true
+}
+
+def put_le64(b: [Byte], at: Int, v: U64) {
+  for k in 0...8 { b[at + k] = (v >> (8 * k)).as_u8 }
+}
+
+def put_be64(b: [Byte], at: Int, v: U64) {
+  for k in 0...8 { b[at + k] = (v >> (56 - 8 * k)).as_u8 }
+}
+
+def le64(b: [Byte], at: Int) -> U64 {
+  w: U64 = 0
+  for k in 0...8 { w |= b[at + k].as_u64 << (8 * k) }
+  w
+}
+
+def be64(b: [Byte], at: Int) -> U64 {
+  w: U64 = 0
+  for k in 0...8 { w = (w << 8) | b[at + k].as_u64 }
+  w
+}
+
+# State.Init64: a fresh state from four seed words.
+def init64(c: ChaCha8, seed: [U64]) {
+  copy(c.seed_words, seed)
+  block(c.seed_words, c.buf, 0)
+  c.ctr[AT_C] = 0
+  c.ctr[AT_I] = 0
+  c.ctr[AT_N] = CHUNK
+}
+
+# State.Refill: the next block (reseeding from the last block's tail every
+# CTR_MAX / CTR_INC blocks).
+def refill(c: ChaCha8) {
+  ctr = c.ctr
+  ctr[AT_C] += CTR_INC
+  if ctr[AT_C] == CTR_MAX {
+    for k in 0...RESEED { c.seed_words[k] = c.buf[CHUNK - RESEED + k] }
+    ctr[AT_C] = 0
+  }
+  block(c.seed_words, c.buf, ctr[AT_C].as_u32)
+  ctr[AT_I] = 0
+  ctr[AT_N] = ctr[AT_C] == CTR_MAX - CTR_INC ? CHUNK - RESEED : CHUNK
+}
+
+# chacha8rand.Marshal.
+def marshal(c: ChaCha8) -> [Byte] {
+  data: [Byte] = [0; 48]
+  copy(data, "chacha8:".bytes)
+  used = (c.ctr[AT_C] / CTR_INC) * CHUNK + c.ctr[AT_I]
+  put_be64(data, 8, used.as_u64)
+  for k in 0...4 { put_le64(data, (2 + k) * 8, c.seed_words[k]) }
+  data
+}
+
+# chacha8rand.Unmarshal.
+def unmarshal(c: ChaCha8, data: [Byte]) -> ~Unit<RandError> {
+  fail RandError.InvalidChaCha8 if data.size != 48 || !has_prefix(data, "chacha8:")
+  used = be64(data, 8)
+  fail RandError.InvalidChaCha8 if used > ((CTR_MAX / CTR_INC) * CHUNK - RESEED).as_u64
+  for k in 0...4 { c.seed_words[k] = le64(data, (2 + k) * 8) }
+  u = used.to_i
+  ctr = c.ctr
+  ctr[AT_C] = CTR_INC * (u / CHUNK)
+  block(c.seed_words, c.buf, ctr[AT_C].as_u32)
+  ctr[AT_I] = u % CHUNK
+  ctr[AT_N] = ctr[AT_C] == CTR_MAX - CTR_INC ? CHUNK - RESEED : CHUNK
+}
+
+# Stores word v of an odd or even lane into its half of buf[at].
+def put(buf: [U64], at: Int, v: U32, odd: Bool) {
+  if odd {
+    buf[at] |= v.as_u64 << 32
+  } else {
+    buf[at] = v.as_u64
+  }
+}
+
+# chacha8rand's block_generic: four interleaved ChaCha8 blocks (counters
+# counter..counter+3); their 32-bit words, in Go's little-endian memory
+# order, are the 32 U64s of buf.
+def block(seed: [U64], buf: [U64], counter: U32) {
+  k0 = seed[0].as_u32
+  k1 = (seed[0] >> 32).as_u32
+  k2 = seed[1].as_u32
+  k3 = (seed[1] >> 32).as_u32
+  k4 = seed[2].as_u32
+  k5 = (seed[2] >> 32).as_u32
+  k6 = seed[3].as_u32
+  k7 = (seed[3] >> 32).as_u32
+  for lane in 0...4 {
+    x0: U32 = 0x61707865
+    x1: U32 = 0x3320646e
+    x2: U32 = 0x79622d32
+    x3: U32 = 0x6b206574
+    x4 = k0
+    x5 = k1
+    x6 = k2
+    x7 = k3
+    x8 = k4
+    x9 = k5
+    x10 = k6
+    x11 = k7
+    x12 = counter + lane.as_u32
+    x13: U32 = 0
+    x14: U32 = 0
+    x15: U32 = 0
+    for _ in 0...4 {
+      x0 += x4
+      x12 ^= x0
+      x12 = (x12 << 16) | (x12 >> 16)
+      x8 += x12
+      x4 ^= x8
+      x4 = (x4 << 12) | (x4 >> 20)
+      x0 += x4
+      x12 ^= x0
+      x12 = (x12 << 8) | (x12 >> 24)
+      x8 += x12
+      x4 ^= x8
+      x4 = (x4 << 7) | (x4 >> 25)
+      x1 += x5
+      x13 ^= x1
+      x13 = (x13 << 16) | (x13 >> 16)
+      x9 += x13
+      x5 ^= x9
+      x5 = (x5 << 12) | (x5 >> 20)
+      x1 += x5
+      x13 ^= x1
+      x13 = (x13 << 8) | (x13 >> 24)
+      x9 += x13
+      x5 ^= x9
+      x5 = (x5 << 7) | (x5 >> 25)
+      x2 += x6
+      x14 ^= x2
+      x14 = (x14 << 16) | (x14 >> 16)
+      x10 += x14
+      x6 ^= x10
+      x6 = (x6 << 12) | (x6 >> 20)
+      x2 += x6
+      x14 ^= x2
+      x14 = (x14 << 8) | (x14 >> 24)
+      x10 += x14
+      x6 ^= x10
+      x6 = (x6 << 7) | (x6 >> 25)
+      x3 += x7
+      x15 ^= x3
+      x15 = (x15 << 16) | (x15 >> 16)
+      x11 += x15
+      x7 ^= x11
+      x7 = (x7 << 12) | (x7 >> 20)
+      x3 += x7
+      x15 ^= x3
+      x15 = (x15 << 8) | (x15 >> 24)
+      x11 += x15
+      x7 ^= x11
+      x7 = (x7 << 7) | (x7 >> 25)
+      x0 += x5
+      x15 ^= x0
+      x15 = (x15 << 16) | (x15 >> 16)
+      x10 += x15
+      x5 ^= x10
+      x5 = (x5 << 12) | (x5 >> 20)
+      x0 += x5
+      x15 ^= x0
+      x15 = (x15 << 8) | (x15 >> 24)
+      x10 += x15
+      x5 ^= x10
+      x5 = (x5 << 7) | (x5 >> 25)
+      x1 += x6
+      x12 ^= x1
+      x12 = (x12 << 16) | (x12 >> 16)
+      x11 += x12
+      x6 ^= x11
+      x6 = (x6 << 12) | (x6 >> 20)
+      x1 += x6
+      x12 ^= x1
+      x12 = (x12 << 8) | (x12 >> 24)
+      x11 += x12
+      x6 ^= x11
+      x6 = (x6 << 7) | (x6 >> 25)
+      x2 += x7
+      x13 ^= x2
+      x13 = (x13 << 16) | (x13 >> 16)
+      x8 += x13
+      x7 ^= x8
+      x7 = (x7 << 12) | (x7 >> 20)
+      x2 += x7
+      x13 ^= x2
+      x13 = (x13 << 8) | (x13 >> 24)
+      x8 += x13
+      x7 ^= x8
+      x7 = (x7 << 7) | (x7 >> 25)
+      x3 += x4
+      x14 ^= x3
+      x14 = (x14 << 16) | (x14 >> 16)
+      x9 += x14
+      x4 ^= x9
+      x4 = (x4 << 12) | (x4 >> 20)
+      x3 += x4
+      x14 ^= x3
+      x14 = (x14 << 8) | (x14 >> 24)
+      x9 += x14
+      x4 ^= x9
+      x4 = (x4 << 7) | (x4 >> 25)
+    }
+    half = lane / 2
+    odd = lane % 2 == 1
+    put(buf, 0 + half, x0, odd)
+    put(buf, 2 + half, x1, odd)
+    put(buf, 4 + half, x2, odd)
+    put(buf, 6 + half, x3, odd)
+    put(buf, 8 + half, x4 + k0, odd)
+    put(buf, 10 + half, x5 + k1, odd)
+    put(buf, 12 + half, x6 + k2, odd)
+    put(buf, 14 + half, x7 + k3, odd)
+    put(buf, 16 + half, x8 + k4, odd)
+    put(buf, 18 + half, x9 + k5, odd)
+    put(buf, 20 + half, x10 + k6, odd)
+    put(buf, 22 + half, x11 + k7, odd)
+    put(buf, 24 + half, x12, odd)
+    put(buf, 26 + half, x13, odd)
+    put(buf, 28 + half, x14, odd)
+    put(buf, 30 + half, x15, odd)
+  }
+}

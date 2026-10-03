@@ -15,6 +15,7 @@ fn main() {
         .include(format!("{rt}/libtommath"))
         .flag("-std=gnu11")
         .flag("-fwrapv")
+        .flag("-ffp-contract=off")
         .flag("-w")
         .opt_level(2)
         .compile("alxrt");

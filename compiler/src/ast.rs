@@ -154,7 +154,20 @@ pub struct Import {
 
 /// The name a package is known by in an importing file.
 pub fn import_name(i: &Import) -> String {
-    i.alias.clone().unwrap_or_else(|| i.path.rsplit('/').next().unwrap_or(&i.path).to_string())
+    i.alias.clone().unwrap_or_else(|| default_import_name(&i.path))
+}
+
+/// A path's default alias: its last element, except that a major-version
+/// suffix (`math/rand/v2`) names the element before it (`rand`), as Go's
+/// package names do.
+pub fn default_import_name(path: &str) -> String {
+    let mut parts = path.trim_end_matches('/').rsplit('/');
+    let last = parts.next().unwrap_or(path);
+    let version = last.len() > 1 && last.starts_with('v') && last[1..].bytes().all(|b| b.is_ascii_digit());
+    match parts.next() {
+        Some(prev) if version => prev.to_string(),
+        _ => last.to_string(),
+    }
 }
 
 #[derive(Debug, Clone)]

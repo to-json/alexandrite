@@ -1,0 +1,794 @@
+# Elementary functions: Go's portable implementations (exp.go, log.go,
+# sin.go, ... from FreeBSD's msun and Cephes), line for line, so results
+# are bit-identical with Go's pure-Go math (and identical on every alx
+# backend). Go's amd64 build swaps in assembly for Exp, Log and Hypot, and
+# its arm64 compiler fuses a*b+c; neither changes what these return except
+# in the last bit of some results, and Go's own tests allow that.
+
+import "math/bits"
+
+# ---- exponentials ----
+
+# e**x.
+pub def exp(x: Float) -> Float {
+  ln2_hi = 6.93147180369123816490e-01
+  ln2_lo = 1.90821492927058770002e-10
+  log2e = 1.44269504088896338700e+00
+  overflow = 7.09782712893383973096e+02
+  underflow = -7.45133219101941108420e+02
+  near_zero = 3.725290298461914e-09 # 1.0 / (1 << 28)
+  return x if is_nan(x)
+  return inf(1) if x > overflow
+  return 0.0 if x < underflow
+  return 1.0 + x if -near_zero < x && x < near_zero
+  k = 0
+  if x < 0.0 {
+    k = (log2e * x - 0.5).to_i
+  } else if x > 0.0 {
+    k = (log2e * x + 0.5).to_i
+  }
+  hi = x - k.to_f * ln2_hi
+  lo = k.to_f * ln2_lo
+  expmulti(hi, lo, k)
+}
+
+# 2**x.
+pub def exp2(x: Float) -> Float {
+  ln2_hi = 6.93147180369123816490e-01
+  ln2_lo = 1.90821492927058770002e-10
+  overflow = 1.0239999999999999e+03
+  underflow = -1.0740e+03
+  return x if is_nan(x)
+  return inf(1) if x > overflow
+  return 0.0 if x < underflow
+  k = 0
+  if x > 0.0 {
+    k = (x + 0.5).to_i
+  } else if x < 0.0 {
+    k = (x - 0.5).to_i
+  }
+  t = x - k.to_f
+  hi = t * ln2_hi
+  lo = -t * ln2_lo
+  expmulti(hi, lo, k)
+}
+
+# e**r * 2**k, where r = hi - lo and |r| <= ln(2)/2.
+def expmulti(hi: Float, lo: Float, k: Int) -> Float {
+  p1 = 1.66666666666666657415e-01
+  p2 = -2.77777777770155933842e-03
+  p3 = 6.61375632143793436117e-05
+  p4 = -1.65339022054652515390e-06
+  p5 = 4.13813679705723846039e-08
+  r = hi - lo
+  t = r * r
+  c = r - t * (p1 + t * (p2 + t * (p3 + t * (p4 + t * p5))))
+  y = 1.0 - ((lo - (r * c) / (2.0 - c)) - hi)
+  ldexp(y, k)
+}
+
+# e**x - 1, accurate for x near 0.
+pub def expm1(x: Float) -> Float {
+  othreshold = 7.09782712893383973096e+02
+  ln2_x56 = 3.88162421113569373274e+01
+  ln2_half_x3 = 1.03972077083991796413e+00
+  ln2_half = 3.46573590279972654709e-01
+  ln2_hi = 6.93147180369123816490e-01
+  ln2_lo = 1.90821492927058770002e-10
+  inv_ln2 = 1.44269504088896338700e+00
+  tiny = 5.551115123125783e-17 # 1.0 / (1 << 54)
+  q1 = -3.33333333333331316428e-02
+  q2 = 1.58730158725481460165e-03
+  q3 = -7.93650757867487942473e-05
+  q4 = 4.00821782732936239552e-06
+  q5 = -2.01099218183624371326e-07
+  return x if is_inf(x, 1) || is_nan(x)
+  return -1.0 if is_inf(x, -1)
+  absx = x
+  sign = false
+  if x < 0.0 {
+    absx = -absx
+    sign = true
+  }
+  if absx >= ln2_x56 {
+    return -1.0 if sign
+    return inf(1) if absx >= othreshold
+  }
+  c = 0.0
+  k = 0
+  if absx > ln2_half {
+    hi = 0.0
+    lo = 0.0
+    if absx < ln2_half_x3 {
+      if !sign {
+        hi = x - ln2_hi
+        lo = ln2_lo
+        k = 1
+      } else {
+        hi = x + ln2_hi
+        lo = -ln2_lo
+        k = -1
+      }
+    } else {
+      if !sign {
+        k = (inv_ln2 * x + 0.5).to_i
+      } else {
+        k = (inv_ln2 * x - 0.5).to_i
+      }
+      t = k.to_f
+      hi = x - t * ln2_hi
+      lo = t * ln2_lo
+    }
+    x = hi - lo
+    c = (hi - x) - lo
+  } else if absx < tiny {
+    return x
+  } else {
+    k = 0
+  }
+  hfx = 0.5 * x
+  hxs = x * hfx
+  r1 = 1.0 + hxs * (q1 + hxs * (q2 + hxs * (q3 + hxs * (q4 + hxs * q5))))
+  t = 3.0 - r1 * hfx
+  e = hxs * ((r1 - t) / (6.0 - x * t))
+  return x - (x * e - hxs) if k == 0
+  e = (x * (e - c) - c)
+  e -= hxs
+  if k == -1 {
+    return 0.5 * (x - e) - 0.5
+  } else if k == 1 {
+    return -2.0 * (e - (x + 0.5)) if x < -0.25
+    return 1.0 + 2.0 * (x - e)
+  } else if k <= -2 || k > 56 {
+    y = 1.0 - (e - x)
+    return float64frombits(float64bits(y) +% (k.as_u64 << 52)) - 1.0
+  }
+  if k < 20 {
+    b: U64 = 0x20000000000000
+    t = float64frombits(0x3ff0000000000000 - (b >> k)) # 1 - 2**-k
+    y = t - (e - x)
+    return float64frombits(float64bits(y) +% (k.as_u64 << 52))
+  }
+  t = float64frombits((0x3ff - k).as_u64 << 52) # 2**-k
+  y = x - (e + t)
+  y += 1.0
+  float64frombits(float64bits(y) +% (k.as_u64 << 52))
+}
+
+# ---- logarithms ----
+
+# The natural logarithm of x.
+pub def log(x: Float) -> Float {
+  ln2_hi = 6.93147180369123816490e-01
+  ln2_lo = 1.90821492927058770002e-10
+  l1 = 6.666666666666735130e-01
+  l2 = 3.999999999940941908e-01
+  l3 = 2.857142874366239149e-01
+  l4 = 2.222219843214978396e-01
+  l5 = 1.818357216161805012e-01
+  l6 = 1.531383769920937332e-01
+  l7 = 1.479819860511658591e-01
+  return x if is_nan(x) || is_inf(x, 1)
+  return nan if x < 0.0
+  return inf(-1) if x == 0.0
+  f1, ki = frexp(x)
+  if f1 < SQRT2 / 2 {
+    f1 *= 2.0
+    ki -= 1
+  }
+  f = f1 - 1.0
+  k = ki.to_f
+  s = f / (2.0 + f)
+  s2 = s * s
+  s4 = s2 * s2
+  t1 = s2 * (l1 + s4 * (l3 + s4 * (l5 + s4 * l7)))
+  t2 = s4 * (l2 + s4 * (l4 + s4 * l6))
+  r = t1 + t2
+  hfsq = 0.5 * f * f
+  k * ln2_hi - ((hfsq - (s * (hfsq + r) + k * ln2_lo)) - f)
+}
+
+# The decimal logarithm of x.
+pub def log10(x: Float) -> Float { log(x) * (1 / LN10) }
+
+# The binary logarithm of x (exact for powers of two).
+pub def log2(x: Float) -> Float {
+  frac, ex = frexp(x)
+  return (ex - 1).to_f if frac == 0.5
+  log(frac) * (1 / LN2) + ex.to_f
+}
+
+# log(1 + x), accurate for x near 0.
+pub def log1p(x: Float) -> Float {
+  sqrt2_m1 = 4.142135623730950488017e-01
+  sqrt2_half_m1 = -2.928932188134524755992e-01
+  small = 1.862645149230957e-09 # 1.0 / (1 << 29)
+  tiny = 5.551115123125783e-17  # 1.0 / (1 << 54)
+  two53 = 9007199254740992.0    # 1 << 53
+  ln2_hi = 6.93147180369123816490e-01
+  ln2_lo = 1.90821492927058770002e-10
+  lp1 = 6.666666666666735130e-01
+  lp2 = 3.999999999940941908e-01
+  lp3 = 2.857142874366239149e-01
+  lp4 = 2.222219843214978396e-01
+  lp5 = 1.818357216161805012e-01
+  lp6 = 1.531383769920937332e-01
+  lp7 = 1.479819860511658591e-01
+  return nan if x < -1.0 || is_nan(x)
+  return inf(-1) if x == -1.0
+  return inf(1) if is_inf(x, 1)
+  absx = x.abs
+  f = 0.0
+  iu: U64 = 0
+  k = 1
+  if absx < sqrt2_m1 {
+    if absx < small {
+      return x if absx < tiny
+      return x - x * x * 0.5
+    }
+    if x > sqrt2_half_m1 {
+      k = 0
+      f = x
+      iu = 1
+    }
+  }
+  c = 0.0
+  if k != 0 {
+    u = 0.0
+    if absx < two53 {
+      u = 1.0 + x
+      iu = float64bits(u)
+      k = (iu >> 52).to_i - 1023
+      if k > 0 {
+        c = 1.0 - (u - x)
+      } else {
+        c = x - (u - 1.0)
+      }
+      c /= u
+    } else {
+      u = x
+      iu = float64bits(u)
+      k = (iu >> 52).to_i - 1023
+      c = 0.0
+    }
+    iu &= 0x000fffffffffffff
+    if iu < 0x0006a09e667f3bcd {
+      u = float64frombits(iu | 0x3ff0000000000000)
+    } else {
+      k += 1
+      u = float64frombits(iu | 0x3fe0000000000000)
+      iu = (0x0010000000000000 - iu) >> 2
+    }
+    f = u - 1.0
+  }
+  hfsq = 0.5 * f * f
+  if iu == 0 { # |f| < 2**-20
+    if f == 0.0 {
+      return 0.0 if k == 0
+      c += k.to_f * ln2_lo
+      return k.to_f * ln2_hi + c
+    }
+    r = hfsq * (1.0 - 0.66666666666666666 * f)
+    return f - r if k == 0
+    return k.to_f * ln2_hi - ((r - (k.to_f * ln2_lo + c)) - f)
+  }
+  s = f / (2.0 + f)
+  z = s * s
+  r = z * (lp1 + z * (lp2 + z * (lp3 + z * (lp4 + z * (lp5 + z * (lp6 + z * lp7))))))
+  return f - (hfsq - s * (hfsq + r)) if k == 0
+  k.to_f * ln2_hi - ((hfsq - (s * (hfsq + r) + (k.to_f * ln2_lo + c))) - f)
+}
+
+# sqrt(p*p + q*q), overflowing only if the result does.
+pub def hypot(p: Float, q: Float) -> Float {
+  p = p.abs
+  q = q.abs
+  return inf(1) if is_inf(p, 1) || is_inf(q, 1)
+  return nan if is_nan(p) || is_nan(q)
+  if p < q {
+    t = p
+    p = q
+    q = t
+  }
+  return 0.0 if p == 0.0
+  q = q / p
+  p * (1.0 + q * q).sqrt
+}
+
+# ---- trigonometry ----
+
+SIN_C: [Float] = [
+  1.58962301576546568060e-10,
+  -2.50507477628578072866e-8,
+  2.75573136213857245213e-6,
+  -1.98412698295895385996e-4,
+  8.33333333332211858878e-3,
+  -1.66666666666666307295e-1,
+]
+
+COS_C: [Float] = [
+  -1.13585365213876817300e-11,
+  2.08757008419747316778e-9,
+  -2.75573141792967388112e-7,
+  2.48015872888517045348e-5,
+  -1.38888888888730564116e-3,
+  4.16666666666665929218e-2,
+]
+
+# Pi/4 split into three parts.
+PI4A = 7.85398125648498535156e-1
+PI4B = 3.77489470793079817668e-8
+PI4C = 2.69515142907905952645e-15
+
+# Arguments at or above this use Payne-Hanek reduction.
+REDUCE_THRESHOLD = 536870912.0 # 1 << 29
+
+def sin_poly(z: Float, zz: Float) -> Float {
+  z + z * zz * ((((((SIN_C[0] * zz) + SIN_C[1]) * zz + SIN_C[2]) * zz + SIN_C[3]) * zz + SIN_C[4]) * zz + SIN_C[5])
+}
+
+def cos_poly(zz: Float) -> Float {
+  1.0 - 0.5 * zz + zz * zz * ((((((COS_C[0] * zz) + COS_C[1]) * zz + COS_C[2]) * zz + COS_C[3]) * zz + COS_C[4]) * zz + COS_C[5])
+}
+
+# The octant j and the remainder z of x (x >= 0) modulo Pi/4, with zeros
+# mapped to the origin (j even).
+def octant(x: Float) -> (U64, Float) {
+  return trig_reduce(x) if x >= REDUCE_THRESHOLD
+  j = (x * (4 / PI)).to_u64 # integer part of x/(Pi/4)
+  y = j.to_f
+  if j & 1 == 1 {
+    j += 1
+    y += 1.0
+  }
+  j &= 7
+  (j, ((x - y * PI4A) - y * PI4B) - y * PI4C)
+}
+
+# The cosine of x (radians).
+pub def cos(x: Float) -> Float {
+  return nan if is_nan(x) || is_inf(x, 0)
+  sign = false
+  x = x.abs
+  j, z = octant(x)
+  if j > 3 {
+    j -= 4
+    sign = !sign
+  }
+  sign = !sign if j > 1
+  zz = z * z
+  y = (j == 1 || j == 2) ? sin_poly(z, zz) : cos_poly(zz)
+  sign ? -y : y
+}
+
+# The sine of x (radians).
+pub def sin(x: Float) -> Float {
+  return x if x == 0.0 || is_nan(x)
+  return nan if is_inf(x, 0)
+  sign = false
+  if x < 0.0 {
+    x = -x
+    sign = true
+  }
+  j, z = octant(x)
+  if j > 3 {
+    sign = !sign
+    j -= 4
+  }
+  zz = z * z
+  y = (j == 1 || j == 2) ? cos_poly(zz) : sin_poly(z, zz)
+  sign ? -y : y
+}
+
+# sin(x) and cos(x), together.
+pub def sincos(x: Float) -> (Float, Float) {
+  return (x, 1.0) if x == 0.0
+  return (nan, nan) if is_nan(x) || is_inf(x, 0)
+  sin_sign = false
+  cos_sign = false
+  if x < 0.0 {
+    x = -x
+    sin_sign = true
+  }
+  j, z = octant(x)
+  if j > 3 {
+    j -= 4
+    sin_sign = !sin_sign
+    cos_sign = !cos_sign
+  }
+  cos_sign = !cos_sign if j > 1
+  zz = z * z
+  c = cos_poly(zz)
+  s = sin_poly(z, zz)
+  if j == 1 || j == 2 {
+    t = s
+    s = c
+    c = t
+  }
+  c = -c if cos_sign
+  s = -s if sin_sign
+  (s, c)
+}
+
+TAN_P: [Float] = [
+  -1.30936939181383777646e4,
+  1.15351664838587416140e6,
+  -1.79565251976484877988e7,
+]
+
+TAN_Q: [Float] = [
+  1.00000000000000000000e0,
+  1.36812963470692954678e4,
+  -1.32089234440210967447e6,
+  2.50083801823357915839e7,
+  -5.38695755929454629881e7,
+]
+
+# The tangent of x (radians).
+pub def tan(x: Float) -> Float {
+  return x if x == 0.0 || is_nan(x)
+  return nan if is_inf(x, 0)
+  sign = false
+  if x < 0.0 {
+    x = -x
+    sign = true
+  }
+  j: U64 = 0
+  z = 0.0
+  if x >= REDUCE_THRESHOLD {
+    j, z = trig_reduce(x)
+  } else {
+    j = (x * (4 / PI)).to_u64
+    y = j.to_f
+    if j & 1 == 1 {
+      j += 1
+      y += 1.0
+    }
+    z = ((x - y * PI4A) - y * PI4B) - y * PI4C
+  }
+  zz = z * z
+  y = z
+  if zz > 1e-14 {
+    y = z + z * (zz * (((TAN_P[0] * zz) + TAN_P[1]) * zz + TAN_P[2]) / ((((zz + TAN_Q[1]) * zz + TAN_Q[2]) * zz + TAN_Q[3]) * zz + TAN_Q[4]))
+  }
+  y = -1.0 / y if j & 2 == 2
+  sign ? -y : y
+}
+
+# 4/Pi's bits, for Payne-Hanek reduction.
+M_PI4: [U64] = [
+  0x0000000000000001,
+  0x45f306dc9c882a53,
+  0xf84eafa3ea69bb81,
+  0xb6c52b3278872083,
+  0xfca2c757bd778ac3,
+  0x6e48dc74849ba5c0,
+  0x0c925dd413a32439,
+  0xfc3bd63962534e7d,
+  0xd1046bea5d768909,
+  0xd338e04d68befc82,
+  0x7323ac7306a673e9,
+  0x3908bf177bf25076,
+  0x3ff12fffbc0b301f,
+  0xde5e2316b414da3e,
+  0xda6cfd9e4f96136e,
+  0x9e8c7ecd3cbfd45a,
+  0xea4f758fd7cbe2f6,
+  0x7a0e73ef14a525d4,
+  0xd7f6bf623f1aba10,
+  0xac06608df8f6d757,
+]
+
+# Payne-Hanek: x (huge, finite) reduced modulo Pi/4: the octant and the
+# remainder.
+def trig_reduce(x: Float) -> (U64, Float) {
+  pi4 = PI / 4
+  return (0, x) if x < pi4
+  one: U64 = 1
+  ix = float64bits(x)
+  ex = ((ix >> 52) & 0x7FF).to_i - 1023 - 52
+  ix &^= 0x7FF0000000000000
+  ix |= one << 52
+  digit = (ex + 61) / 64
+  bitshift = (ex + 61) % 64
+  z0 = (M_PI4[digit] << bitshift) | (M_PI4[digit + 1] >> (64 - bitshift))
+  z1 = (M_PI4[digit + 1] << bitshift) | (M_PI4[digit + 2] >> (64 - bitshift))
+  z2 = (M_PI4[digit + 2] << bitshift) | (M_PI4[digit + 3] >> (64 - bitshift))
+  z2hi, _z2lo = bits.mul64(z2, ix)
+  z1hi, z1lo = bits.mul64(z1, ix)
+  z0lo = z0 *% ix
+  lo, c = bits.add64(z1lo, z2hi, 0)
+  hi, _c = bits.add64(z0lo, z1hi, c)
+  j = hi >> 61
+  hi = hi << 3 | lo >> 61
+  lz = bits.leading_zeros64(hi)
+  e = (1023 - (lz + 1)).as_u64
+  hi = (hi << (lz + 1)) | (lo >> (64 - (lz + 1)))
+  hi >>= 64 - 52
+  hi |= e << 52
+  z = float64frombits(hi)
+  if j & 1 == 1 {
+    j += 1
+    j &= 7
+    z -= 1.0
+  }
+  (j, z * pi4)
+}
+
+# ---- inverse trigonometry ----
+
+# atan(x) for 0 <= x <= 0.66.
+def xatan(x: Float) -> Float {
+  p0 = -8.750608600031904122785e-01
+  p1 = -1.615753718733365076637e+01
+  p2 = -7.500855792314704667340e+01
+  p3 = -1.228866684490136173410e+02
+  p4 = -6.485021904942025371773e+01
+  q0 = 2.485846490142306297962e+01
+  q1 = 1.650270098316988542046e+02
+  q2 = 4.328810604912902668951e+02
+  q3 = 4.853903996359136964868e+02
+  q4 = 1.945506571482613964425e+02
+  z = x * x
+  z = z * ((((p0 * z + p1) * z + p2) * z + p3) * z + p4) / (((((z + q0) * z + q1) * z + q2) * z + q3) * z + q4)
+  x * z + x
+}
+
+# atan(x) for x >= 0, with range reduction.
+def satan(x: Float) -> Float {
+  morebits = 6.123233995736765886130e-17 # pi/2 = PIO2 + morebits
+  tan3pio8 = 2.41421356237309504880      # tan(3*pi/8)
+  return xatan(x) if x <= 0.66
+  return PI / 2 - xatan(1.0 / x) + morebits if x > tan3pio8
+  PI / 4 + xatan((x - 1.0) / (x + 1.0)) + 0.5 * morebits
+}
+
+# The arctangent of x, in [-Pi/2, Pi/2].
+pub def atan(x: Float) -> Float {
+  return x if x == 0.0
+  return satan(x) if x > 0.0
+  -satan(-x)
+}
+
+# The arcsine of x, in [-Pi/2, Pi/2].
+pub def asin(x: Float) -> Float {
+  return x if x == 0.0
+  sign = false
+  if x < 0.0 {
+    x = -x
+    sign = true
+  }
+  return nan if x > 1.0
+  temp = (1.0 - x * x).sqrt
+  if x > 0.7 {
+    temp = PI / 2 - satan(temp / x)
+  } else {
+    temp = satan(x / temp)
+  }
+  sign ? -temp : temp
+}
+
+# The arccosine of x, in [0, Pi].
+pub def acos(x: Float) -> Float { PI / 2 - asin(x) }
+
+# The arctangent of y/x, using both signs to pick the quadrant: in [-Pi, Pi].
+pub def atan2(y: Float, x: Float) -> Float {
+  return nan if is_nan(y) || is_nan(x)
+  if y == 0.0 {
+    return copysign(0.0, y) if x >= 0.0 && !signbit(x)
+    return copysign(PI, y)
+  }
+  return copysign(PI / 2, y) if x == 0.0
+  if is_inf(x, 0) {
+    if is_inf(x, 1) {
+      return copysign(PI / 4, y) if is_inf(y, 0)
+      return copysign(0.0, y)
+    }
+    return copysign(3 * PI / 4, y) if is_inf(y, 0)
+    return copysign(PI, y)
+  }
+  return copysign(PI / 2, y) if is_inf(y, 0)
+  q = atan(y / x)
+  if x < 0.0 {
+    return q + PI if q <= 0.0
+    return q - PI
+  }
+  q
+}
+
+# ---- hyperbolic ----
+
+# The hyperbolic sine of x.
+pub def sinh(x: Float) -> Float {
+  p0 = -0.6307673640497716991184787251e+6
+  p1 = -0.8991272022039509355398013511e+5
+  p2 = -0.2894211355989563807284660366e+4
+  p3 = -0.2630563213397497062819489e+2
+  q0 = -0.6307673640497716991212077277e+6
+  q1 = 0.1521517378790019070696485176e+5
+  q2 = -0.173678953558233699533450911e+3
+  sign = false
+  if x < 0.0 {
+    x = -x
+    sign = true
+  }
+  temp = 0.0
+  if x > 21.0 {
+    temp = exp(x) * 0.5
+  } else if x > 0.5 {
+    ex = exp(x)
+    temp = (ex - 1.0 / ex) * 0.5
+  } else {
+    sq = x * x
+    temp = (((p3 * sq + p2) * sq + p1) * sq + p0) * x
+    temp = temp / (((sq + q2) * sq + q1) * sq + q0)
+  }
+  sign ? -temp : temp
+}
+
+# The hyperbolic cosine of x.
+pub def cosh(x: Float) -> Float {
+  x = x.abs
+  return exp(x) * 0.5 if x > 21.0
+  ex = exp(x)
+  (ex + 1.0 / ex) * 0.5
+}
+
+# The hyperbolic tangent of x.
+pub def tanh(x: Float) -> Float {
+  maxlog = 8.8029691931113054295988e+01 # log(2**127)
+  z = x.abs
+  if z > 0.5 * maxlog {
+    return -1.0 if x < 0.0
+    return 1.0
+  } else if z >= 0.625 {
+    s = exp(2.0 * z)
+    z = 1.0 - 2.0 / (s + 1.0)
+    z = -z if x < 0.0
+  } else {
+    return x if x == 0.0
+    s = x * x
+    z = x + x * s * ((-9.64399179425052238628e-1 * s + -9.92877231001918586564e1) * s + -1.61468768441708447952e3) / (((s + 1.12811678491632931402e2) * s + 2.23548839060100448583e3) * s + 4.84406305325125486048e3)
+  }
+  z
+}
+
+# The inverse hyperbolic sine of x.
+pub def asinh(x: Float) -> Float {
+  ln2 = 6.93147180559945286227e-01
+  near_zero = 3.725290298461914e-09 # 1.0 / (1 << 28)
+  large = 268435456.0               # 1 << 28
+  return x if is_nan(x) || is_inf(x, 0)
+  sign = false
+  if x < 0.0 {
+    x = -x
+    sign = true
+  }
+  temp = 0.0
+  if x > large {
+    temp = log(x) + ln2
+  } else if x > 2.0 {
+    temp = log(2.0 * x + 1.0 / ((x * x + 1.0).sqrt + x))
+  } else if x < near_zero {
+    temp = x
+  } else {
+    temp = log1p(x + x * x / (1.0 + (1.0 + x * x).sqrt))
+  }
+  sign ? -temp : temp
+}
+
+# The inverse hyperbolic cosine of x.
+pub def acosh(x: Float) -> Float {
+  large = 268435456.0 # 1 << 28
+  return nan if x < 1.0 || is_nan(x)
+  return 0.0 if x == 1.0
+  return log(x) + LN2 if x >= large
+  return log(2.0 * x - 1.0 / (x + (x * x - 1.0).sqrt)) if x > 2.0
+  t = x - 1.0
+  log1p(t + (2.0 * t + t * t).sqrt)
+}
+
+# The inverse hyperbolic tangent of x.
+pub def atanh(x: Float) -> Float {
+  near_zero = 3.725290298461914e-09 # 1.0 / (1 << 28)
+  return nan if x < -1.0 || x > 1.0 || is_nan(x)
+  return inf(1) if x == 1.0
+  return inf(-1) if x == -1.0
+  sign = false
+  if x < 0.0 {
+    x = -x
+    sign = true
+  }
+  temp = 0.0
+  if x < near_zero {
+    temp = x
+  } else if x < 0.5 {
+    temp = x + x
+    temp = 0.5 * log1p(temp + temp * x / (1.0 - x))
+  } else {
+    temp = 0.5 * log1p((x + x) / (1.0 - x))
+  }
+  sign ? -temp : temp
+}
+
+# ---- powers ----
+
+def odd_int?(x: Float) -> Bool {
+  return false if x.abs >= 9007199254740992.0 # 1 << 53
+  xi, xf = modf(x)
+  xf == 0.0 && xi.to_i & 1 == 1
+}
+
+# x**y, with Go's special cases (pow(x, ±0) = 1, pow(1, y) = 1, ...).
+pub def pow(x: Float, y: Float) -> Float {
+  return 1.0 if y == 0.0 || x == 1.0
+  return x if y == 1.0
+  return nan if is_nan(x) || is_nan(y)
+  if x == 0.0 {
+    if y < 0.0 {
+      return inf(-1) if signbit(x) && odd_int?(y)
+      return inf(1)
+    } else if y > 0.0 {
+      return x if signbit(x) && odd_int?(y)
+      return 0.0
+    }
+  } else if is_inf(y, 0) {
+    return 1.0 if x == -1.0
+    return 0.0 if (x.abs < 1.0) == is_inf(y, 1)
+    return inf(1)
+  } else if is_inf(x, 0) {
+    return pow(1.0 / x, -y) if is_inf(x, -1) # pow(-0, -y)
+    return 0.0 if y < 0.0
+    return inf(1) if y > 0.0
+  } else if y == 0.5 {
+    return x.sqrt
+  } else if y == -0.5 {
+    return 1.0 / x.sqrt
+  }
+  yi, yf = modf(y.abs)
+  return nan if yf != 0.0 && x < 0.0
+  if yi >= 9223372036854775808.0 { # 1 << 63
+    # yi is a large even int: the result is 0, 1 or Inf.
+    return 1.0 if x == -1.0
+    return 0.0 if (x.abs < 1.0) == (y > 0.0)
+    return inf(1)
+  }
+  # ans = a1 * 2**ae (= 1 for now).
+  a1 = 1.0
+  ae = 0
+  # ans *= x**yf
+  if yf != 0.0 {
+    if yf > 0.5 {
+      yf -= 1.0
+      yi += 1.0
+    }
+    a1 = exp(yf * log(x))
+  }
+  # ans *= x**yi, by repeated squaring, tracking the exponent separately.
+  x1, xe = frexp(x)
+  i = yi.to_i
+  while i != 0 {
+    if xe < -4096 || 4096 < xe {
+      # Catastrophic overflow or underflow: let ldexp handle it.
+      ae += xe
+      break
+    }
+    if i & 1 == 1 {
+      a1 *= x1
+      ae += xe
+    }
+    x1 *= x1
+    xe <<= 1
+    if x1 < 0.5 {
+      x1 += x1
+      xe -= 1
+    }
+    i >>= 1
+  }
+  # ans = a1 * 2**ae; if y < 0 { ans = 1 / ans } (in place).
+  if y < 0.0 {
+    a1 = 1.0 / a1
+    ae = -ae
+  }
+  ldexp(a1, ae)
+}

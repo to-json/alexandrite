@@ -1180,6 +1180,11 @@ fn in_current_pkg(n: &str, structs: &Structs) -> bool {
 /// own type; the builtins stay reachable as `I64` and `F64`. (A main file
 /// can't: its type names aren't qualified, so they would collide with the
 /// builtins'. `alx test` checks such a package under its import path.)
+/// The builtin `Complex` (D53, declared in builtin.alx).
+pub fn is_complex(t: &Ty) -> bool {
+    matches!(t, Ty::Struct(n, _) if n == "Complex")
+}
+
 pub const SHADOWABLE: [&str; 2] = ["Int", "Float"];
 
 /// Does `n` name a builtin type that the current code shadows with its own?
@@ -2286,6 +2291,10 @@ impl<'w, 'a> FnCx<'w, 'a> {
                 if t == Ty::Float || t.int_kind().is_some() {
                     return Ok(self.mk(TK::Neg(Box::new(x)), t, sp));
                 }
+                if is_complex(&t) {
+                    let def = self.w.by_name[&method_name("Complex", "__neg")];
+                    return self.call_def(def, "__neg", sp, vec![x], sp);
+                }
                 self.expect(&x.ty, &Ty::Int, x.span, "negation")?;
                 self.mk(TK::Neg(Box::new(x)), Ty::Int, sp)
             }
@@ -2456,6 +2465,8 @@ impl<'w, 'a> FnCx<'w, 'a> {
                 let mut out = vec![];
                 for it in items {
                     let v = self.value(it)?;
+                    let elr = self.resolve(&el);
+                    let v = if is_complex(&elr) { self.coerce(v, &elr)? } else { v };
                     self.expect(&v.ty, &el, v.span, "array element")?;
                     out.push(v);
                 }
@@ -2686,6 +2697,13 @@ impl<'w, 'a> FnCx<'w, 'a> {
             return Ok(self.mk(TK::Array(items), want, e.span));
         }
         let TK::Const(v) = &e.kind else { return Ok(e) };
+        // A numeric constant where a Complex is wanted: `Complex.new(v, 0)`.
+        if is_complex(&want) {
+            let sp = e.span;
+            let re = self.coerce(e, &Ty::Float)?;
+            let im = self.coerce(self.mk(TK::Const(ConstVal::Int(0.into())), Ty::Int, sp), &Ty::Float)?;
+            return Ok(self.mk(TK::M(M::StructNew, None, vec![re, im], None), want.clone(), sp));
+        }
         match &want {
             Ty::Float => {
                 let q = match v {
@@ -3574,7 +3592,7 @@ impl<'w, 'a> FnCx<'w, 'a> {
 
     /// `recv.m!(args)`: call a mutating method on a place, through a
     /// one-element slice, and write the receiver back.
-    fn mutating_call(&mut self, recv: &Expr, def: usize, name: &str, name_span: Span, args: &[Expr], sp: Span) -> R<TExpr> {
+    fn mutating_call(&mut self, recv: &Expr, def: usize, name: &str, name_span: Span, args: &[Expr], block: Option<&Block>, sp: Span) -> R<TExpr> {
         let (id, steps, pty) = self.place(recv).map_err(|d| {
             if matches!(recv.kind, ExprKind::Name(_) | ExprKind::Index(..) | ExprKind::Call { .. }) { d } else { Diag::new(recv.span, format!("`{name}` changes its receiver; call it on a variable")) }
         })?;
@@ -3603,6 +3621,15 @@ impl<'w, 'a> FnCx<'w, 'a> {
         };
         let mut targs = vec![self.mk(TK::Local(tid), Ty::arr(pty.clone()), recv.span)];
         targs.extend(vals);
+        // A block for a last parameter of function type (`r.shuffle!(n) { |i, j| }`).
+        if let Some(b) = block {
+            let d = &self.w.defs[def].def;
+            if d.params.len() != targs.len() + 1 || !matches!(d.params.last().and_then(|p| p.ty.as_ref()), Some(TypeExpr::Fn(..))) {
+                return Err(Diag::new(sp, format!("`{name}` doesn't take a block")));
+            }
+            let f = self.block_as_lambda(def, &targs, b)?;
+            targs.push(f);
+        }
         // The receiver is written back after the call, so a fallible call
         // is held (a `~T`) here; an enclosing `~` propagates it after.
         let saved = std::mem::replace(&mut self.under_try, false);
@@ -4025,6 +4052,22 @@ impl<'w, 'a> FnCx<'w, 'a> {
             self.expect(&r.ty, &Ty::Bool, r.span, &format!("`{}`", op.text()))?;
             return Ok(self.mk(TK::Bin(op, Box::new(l), Box::new(r)), Ty::Bool, sp));
         }
+        // Complex (D53): a numeric constant on either side adapts (`c * 2`, `1 + 2i`).
+        let (l, r) = {
+            let (lt, rt) = (self.resolve(&l.ty), self.resolve(&r.ty));
+            if is_complex(&lt) && !is_complex(&rt) && matches!(r.kind, TK::Const(_)) {
+                let r = self.coerce(r, &lt)?;
+                (l, r)
+            } else if is_complex(&rt) && !is_complex(&lt) && matches!(l.kind, TK::Const(_)) {
+                let l = self.coerce(l, &rt)?;
+                (l, r)
+            } else {
+                if (is_complex(&lt) != is_complex(&rt)) && matches!(lt.clone(), Ty::Float | Ty::Int | Ty::IntK(_)) | matches!(rt.clone(), Ty::Float | Ty::Int | Ty::IntK(_)) && matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Eq | BinOp::Ne) {
+                    return Err(Diag::new(sp, format!("`{}` between {} and {}: make the number a Complex with `Complex.new(x, 0)` (Go's complex(x, 0))", op.text(), lt.show(), rt.show())));
+                }
+                (l, r)
+            }
+        };
         // Operators on structs: their methods (`def +(o)`, `def ==(o)`, `def <=>(o)`).
         let lres = self.resolve(&l.ty);
         if let Some(sn) = lres.type_name() {
@@ -4365,10 +4408,7 @@ impl<'w, 'a> FnCx<'w, 'a> {
             }
             if let Some(sn) = st.as_ref().and_then(|t| t.type_name()) {
                 if let Some(&def) = self.w.by_name.get(&method_name(sn, name)) {
-                    if block.is_some() {
-                        return Err(Diag::new(sp, format!("`{name}` doesn't take a block")));
-                    }
-                    return self.mutating_call(recv, def, name, name_span, args, sp);
+                    return self.mutating_call(recv, def, name, name_span, args, block, sp);
                 }
             }
         }
@@ -5964,10 +6004,13 @@ impl<'w, 'a> FnCx<'w, 'a> {
         let Some(Expr { kind: ExprKind::Str(fmt), span: fsp, .. }) = args.first() else {
             return Err(Diag::new(sp, format!("`{name}` takes a format string literal first")));
         };
-        let vals = args[1..].iter().map(|a| self.value(a)).collect::<R<Vec<_>>>()?;
+        let mut vals = args[1..].iter().map(|a| self.value(a)).collect::<R<Vec<_>>>()?;
         let mut pieces = vec![];
         let mut lit = String::new();
         let mut k = 0;
+        // Complex arguments of `%f`/`%e` (D53): held in temporaries, their parts shown as extra arguments.
+        let mut pre: Vec<TStmt> = vec![];
+        let mut extra: Vec<TExpr> = vec![];
         let mut it = fmt.chars().peekable();
         while let Some(c) = it.next() {
             if c != '%' {
@@ -6016,6 +6059,26 @@ impl<'w, 'a> FnCx<'w, 'a> {
                 rest = &r[n..];
             }
             let verb = rest;
+            // Go's fmtComplex: `(` real, imag with a sign, `i)`, each part formatted by the verb.
+            if is_complex(&t) && matches!(verb, "f" | "F" | "e" | "E") {
+                let z = self.mk(TK::Int(0), Ty::Int, sp);
+                let v = std::mem::replace(&mut vals[k], z);
+                let ty = v.ty.clone();
+                let (lid, st) = self.opt_tmp(v, sp);
+                pre.push(st);
+                pieces.push(FmtPiece::Lit("(".into()));
+                for (part, plus) in [(0, plus), (1, true)] {
+                    let l = self.mk(TK::Local(lid), ty.clone(), sp);
+                    let e = self.mk(TK::M(M::TupleGet(part), Some(Box::new(l)), vec![], None), Ty::Float, sp);
+                    let j = args.len() - 1 + extra.len();
+                    extra.push(e);
+                    let inner = if matches!(verb, "f" | "F") { FmtPiece::Fixed(j, prec.unwrap_or(6)) } else { FmtPiece::Exp(j, prec.unwrap_or(6), verb == "E") };
+                    pieces.push(if width > 0 || plus || space { FmtPiece::Padded { inner: Box::new(inner), width, left, zero: zero && !left, plus, space: space && !plus } } else { inner });
+                }
+                pieces.push(FmtPiece::Lit("i)".into()));
+                k += 1;
+                continue;
+            }
             let bad = |what: &str| Diag::new(v.span, format!("`%{spec}` needs {what}, got {}", t.show()));
             let numeric = t.int_kind().is_some() || t == Ty::Float;
             let piece = match verb {
@@ -6118,12 +6181,18 @@ impl<'w, 'a> FnCx<'w, 'a> {
         if k != vals.len() {
             return Err(Diag::new(sp, format!("`{name}`: {} directive(s) but {} argument(s)", k, vals.len())));
         }
+        vals.extend(extra);
         let vals = vals
             .into_iter()
             .enumerate()
             .map(|(i, v)| if pieces.iter().any(|p| p.wants_float() && p.arg() == Some(i)) { self.coerce(v, &Ty::Float) } else { Ok(v) })
             .collect::<R<Vec<_>>>()?;
-        Ok(self.mk(TK::Format(pieces, vals), Ty::Str, sp))
+        let f = self.mk(TK::Format(pieces, vals), Ty::Str, sp);
+        if pre.is_empty() {
+            return Ok(f);
+        }
+        pre.push(TStmt::Expr(f));
+        Ok(self.mk(TK::Seq(pre), Ty::Str, sp))
     }
 
     /// `fmt.sprintf` and friends (std/fmt): builtins over `format`.

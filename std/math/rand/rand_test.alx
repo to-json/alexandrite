@@ -1,0 +1,562 @@
+# Translated from Go's math/rand rand_test.go, auto_test.go, race_test.go
+# and example_test.go (export_test.go's hooks are the package's private
+# names: KN/WN/FN, KE/WE/FE, lemire_int31n!).
+
+import "math"
+import "slices"
+import "strconv"
+import "strings"
+
+NUM_TEST_SAMPLES = 10000
+
+struct StatsResults {
+  mean: Float
+  stddev: Float
+  close_enough: Float
+  max_error: Float
+
+  # Whether the mean and stddev are similar to expected's; prints why not.
+  def similar?(expected: StatsResults) -> Bool {
+    if !near_equal(mean, expected.mean, expected.close_enough, expected.max_error) {
+      puts "mean #{mean} != #{expected.mean} (allowed error #{expected.close_enough}, #{expected.max_error})"
+      return false
+    }
+    if !near_equal(stddev, expected.stddev, expected.close_enough, expected.max_error) {
+      puts "stddev #{stddev} != #{expected.stddev} (allowed error #{expected.close_enough}, #{expected.max_error})"
+      return false
+    }
+    true
+  }
+}
+
+def test_seeds -> [Int] { [1, 1754801282, 1698661970, 1550503961] }
+
+def near_equal(a: Float, b: Float, close_enough: Float, max_error: Float) -> Bool {
+  abs_diff = math.abs(a - b)
+  return true if abs_diff < close_enough
+  abs_diff / math.max(math.abs(a), math.abs(b)) < max_error
+}
+
+def get_stats_results(samples: [Float]) -> StatsResults {
+  sum = 0.0
+  squaresum = 0.0
+  for s in samples {
+    sum += s
+    squaresum += s * s
+  }
+  mean = sum / samples.size.to_f
+  StatsResults.new(mean: mean, stddev: math.sqrt(squaresum / samples.size.to_f - mean * mean))
+}
+
+def sample_distribution_ok?(samples: [Float], expected: StatsResults) -> Bool {
+  get_stats_results(samples).similar?(expected)
+}
+
+def sample_slice_distributions_ok?(samples: [Float], nslices: Int, expected: StatsResults) -> Bool {
+  chunk = samples.size / nslices
+  ok = true
+  for i in 0...nslices {
+    low = i * chunk
+    high = i == nslices - 1 ? samples.size - 1 : (i + 1) * chunk
+    ok = false if !sample_distribution_ok?(samples[low...high], expected)
+  }
+  ok
+}
+
+# ---- normal distribution ----
+
+def generate_normal_samples(nsamples: Int, mean: Float, stddev: Float, seed: Int) -> [Float] {
+  r = new(new_source(seed))
+  (0...nsamples).map { r.norm_float64!() * stddev + mean }
+}
+
+def normal_distribution_ok?(nsamples: Int, mean: Float, stddev: Float, seed: Int) -> Bool {
+  samples = generate_normal_samples(nsamples, mean, stddev, seed)
+  error_scale = math.max(1.0, stddev)
+  expected = StatsResults.new(mean: mean, stddev: stddev, close_enough: 0.10 * error_scale, max_error: 0.08 * error_scale)
+  a = sample_distribution_ok?(samples, expected)
+  b = sample_slice_distributions_ok?(samples, 2, expected)
+  c = sample_slice_distributions_ok?(samples, 7, expected)
+  a && b && c
+}
+
+test "StandardNormalValues" {
+  for seed in test_seeds() {
+    assert normal_distribution_ok?(NUM_TEST_SAMPLES, 0.0, 1.0, seed), "seed #{seed}"
+  }
+}
+
+test "NonStandardNormalValues" {
+  sd = 0.5
+  while sd < 1000.0 {
+    m = 0.5
+    while m < 1000.0 {
+      for seed in test_seeds() {
+        assert normal_distribution_ok?(NUM_TEST_SAMPLES, m, sd, seed), "m=#{m} sd=#{sd} seed #{seed}"
+      }
+      m *= 2.0
+    }
+    sd *= 2.0
+  }
+}
+
+# ---- exponential distribution ----
+
+def generate_exponential_samples(nsamples: Int, rate: Float, seed: Int) -> [Float] {
+  r = new(new_source(seed))
+  (0...nsamples).map { r.exp_float64!() / rate }
+}
+
+def exponential_distribution_ok?(nsamples: Int, rate: Float, seed: Int) -> Bool {
+  mean = 1.0 / rate
+  samples = generate_exponential_samples(nsamples, rate, seed)
+  error_scale = math.max(1.0, 1.0 / rate)
+  expected = StatsResults.new(mean: mean, stddev: mean, close_enough: 0.10 * error_scale, max_error: 0.20 * error_scale)
+  a = sample_distribution_ok?(samples, expected)
+  b = sample_slice_distributions_ok?(samples, 2, expected)
+  c = sample_slice_distributions_ok?(samples, 7, expected)
+  a && b && c
+}
+
+test "StandardExponentialValues" {
+  for seed in test_seeds() {
+    assert exponential_distribution_ok?(NUM_TEST_SAMPLES, 1.0, seed), "seed #{seed}"
+  }
+}
+
+test "NonStandardExponentialValues" {
+  rate = 0.05
+  while rate < 10.0 {
+    for seed in test_seeds() {
+      assert exponential_distribution_ok?(NUM_TEST_SAMPLES, rate, seed), "rate #{rate} seed #{seed}"
+    }
+    rate *= 2.0
+  }
+}
+
+# ---- table generation ----
+
+def init_norm -> ([U32], [Float], [Float]) {
+  m1 = 2147483648.0
+  dn = RN
+  tn = dn
+  vn = 9.91256303526217e-3
+  kn = [0.as_u32; 128]
+  wn = [0.0; 128]
+  fnt = [0.0; 128]
+  q = vn / math.exp(-0.5 * dn * dn)
+  kn[0] = (dn / q * m1).to_u32
+  kn[1] = 0
+  wn[0] = f32(q / m1)
+  wn[127] = f32(dn / m1)
+  fnt[0] = 1.0
+  fnt[127] = f32(math.exp(-0.5 * dn * dn))
+  i = 126
+  while i >= 1 {
+    dn = math.sqrt(-2.0 * math.log(vn / dn + math.exp(-0.5 * dn * dn)))
+    kn[i + 1] = (dn / tn * m1).to_u32
+    tn = dn
+    fnt[i] = f32(math.exp(-0.5 * dn * dn))
+    wn[i] = f32(dn / m1)
+    i -= 1
+  }
+  (kn, wn, fnt)
+}
+
+def init_exp -> ([U32], [Float], [Float]) {
+  m2 = 4294967296.0
+  de = RE
+  te = de
+  ve = 3.9496598225815571993e-3
+  ke = [0.as_u32; 256]
+  we = [0.0; 256]
+  fe = [0.0; 256]
+  q = ve / math.exp(-de)
+  ke[0] = (de / q * m2).to_u32
+  ke[1] = 0
+  we[0] = f32(q / m2)
+  we[255] = f32(de / m2)
+  fe[0] = 1.0
+  fe[255] = f32(math.exp(-de))
+  i = 254
+  while i >= 1 {
+    de = -math.log(ve / de + math.exp(-de))
+    ke[i + 1] = (de / te * m2).to_u32
+    te = de
+    fe[i] = f32(math.exp(-de))
+    we[i] = f32(de / m2)
+    i -= 1
+  }
+  (ke, we, fe)
+}
+
+# The first index where the slices disagree, or -1.
+def compare_u32_slices(s1: [U32], s2: [U32]) -> Int {
+  return [s1.size, s2.size].min + 1 if s1.size != s2.size
+  for i in 0...s1.size { return i if s1[i] != s2[i] }
+  -1
+}
+
+def compare_f32_slices(s1: [Float], s2: [Float]) -> Int {
+  return [s1.size, s2.size].min + 1 if s1.size != s2.size
+  for i in 0...s1.size { return i if !near_equal(s1[i], s2[i], 0.0, 1e-7) }
+  -1
+}
+
+test "NormTables" {
+  t = init_norm()
+  kn: [U32] = []
+  wn: [Float] = []
+  fnt: [Float] = []
+  for i in 0...128 {
+    kn << KN[i]
+    wn << WN[i]
+    fnt << FN[i]
+  }
+  assert_eq compare_u32_slices(kn, t[0]), -1
+  assert_eq compare_f32_slices(wn, t[1]), -1
+  assert_eq compare_f32_slices(fnt, t[2]), -1
+}
+
+test "ExpTables" {
+  t = init_exp()
+  ke: [U32] = []
+  we: [Float] = []
+  fe: [Float] = []
+  for i in 0...256 {
+    ke << KE[i]
+    we << WE[i]
+    fe << FE[i]
+  }
+  assert_eq compare_u32_slices(ke, t[0]), -1
+  assert_eq compare_f32_slices(we, t[1]), -1
+  assert_eq compare_f32_slices(fe, t[2]), -1
+}
+
+test "Float32" {
+  # Go checks 10e6 calls on builders (issue 6721 came after 7533753); 1e6 here.
+  r = new(new_source(1))
+  for ct in 0...1000000 {
+    f = r.float32!()
+    assert f < 1.0, "float32! should be in [0, 1): #{ct} #{f}"
+  }
+}
+
+# ---- read! ----
+
+def read_uniformity_ok?(n: Int, seed: Int) -> Bool {
+  r = new(new_source(seed))
+  buf = [0.as_u8; n]
+  return false if r.read!(buf) != n
+  mean = 255.0 / 2.0
+  stddev = 256.0 / math.sqrt(12.0)
+  error_scale = stddev / math.sqrt(n.to_f)
+  expected = StatsResults.new(mean: mean, stddev: stddev, close_enough: 0.10 * error_scale, max_error: 0.08 * error_scale)
+  samples = buf.map { it.to_f }
+  sample_distribution_ok?(samples, expected)
+}
+
+test "ReadUniformity" {
+  for seed in test_seeds() {
+    for n in [2, 4, 7, 64, 1024, 1 << 16, 1 << 20] {
+      assert read_uniformity_ok?(n, seed), "n=#{n} seed #{seed}"
+    }
+  }
+}
+
+test "ReadEmpty" {
+  r = new(new_source(1))
+  buf: [Byte] = []
+  assert_eq r.read!(buf), 0
+}
+
+test "ReadByOneByte" {
+  # Go reads through iotest.OneByteReader.
+  r = new(new_source(1))
+  b1 = [0.as_u8; 100]
+  for i in 0...100 { assert_eq r.read!(b1[i...i + 1]), 1 }
+  r = new(new_source(1))
+  b2 = [0.as_u8; 100]
+  r.read!(b2)
+  assert_eq b1, b2
+}
+
+test "ReadSeedReset" {
+  r = new(new_source(42))
+  b1 = [0.as_u8; 128]
+  r.read!(b1)
+  r.seed!(42)
+  b2 = [0.as_u8; 128]
+  r.read!(b2)
+  assert_eq b1, b2
+}
+
+test "ShuffleSmall" {
+  # n = 0 and n = 1 never call swap.
+  r = new(new_source(1))
+  calls = 0
+  for n in 0..1 {
+    r.shuffle!(n) { |i, j| calls += 1 }
+  }
+  assert_eq calls, 0
+}
+
+# A permutation of [0, n) as an Int in [0, n!) (its Lehmer code); s is changed.
+def encode_perm(s: [Int]) -> Int {
+  for i in 0...s.size {
+    x = s[i]
+    for j in i + 1...s.size { s[j] -= 1 if s[j] > x }
+  }
+  m = 0
+  fact = 1
+  i = s.size - 1
+  while i >= 0 {
+    m += s[i] * fact
+    fact *= s.size - i
+    i -= 1
+  }
+  m
+}
+
+# Chi-squared samples of 1000 draws each from gen over [0, nfact), checked
+# against the normal distribution with nfact-1 degrees of freedom.
+def uniform_ok?(nfact: Int, gen: () -> Int) -> Bool {
+  nsamples = [10 * nfact, 200].max
+  samples = [0.0; nsamples]
+  for k in 0...nsamples {
+    iters = 1000
+    counts = [0; nfact]
+    for _ in 0...iters { counts[gen()] += 1 }
+    want = iters.to_f / nfact.to_f
+    chi2 = 0.0
+    for have in counts {
+      e = have.to_f - want
+      chi2 += e * e
+    }
+    samples[k] = chi2 / want
+  }
+  dof = (nfact - 1).to_f
+  sd = math.sqrt(2.0 * dof)
+  expected = StatsResults.new(mean: dof, stddev: sd, close_enough: 0.10 * math.max(1.0, sd), max_error: 0.08)
+  sample_distribution_ok?(samples, expected)
+}
+
+test "UniformFactorial" {
+  r = new(new_source(test_seeds()[0]))
+  # Go runs n = 3..6 (3 with -short); 3..4 keeps this test fast.
+  for n in 3..4 {
+    nfact = 1
+    for i in 2..n { nfact *= i }
+    p = [0; n]
+    assert uniform_ok?(nfact, ->() -> Int { r.int31n!(nfact.as_i32).to_i }), "n=#{n} Int31n"
+    assert uniform_ok?(nfact, ->() -> Int { r.lemire_int31n!(nfact.as_i32).to_i }), "n=#{n} int31n"
+    assert uniform_ok?(nfact, ->() -> Int { encode_perm(r.perm!(n)) }), "n=#{n} Perm"
+    shuffled = ->() -> Int {
+      for i in 0...n { p[i] = i }
+      r.shuffle!(n) { |i, j| p[i], p[j] = p[j], p[i] }
+      encode_perm(p)
+    }
+    assert uniform_ok?(nfact, shuffled), "n=#{n} Shuffle"
+  }
+}
+
+test "SeedNop" {
+  # The GODEBUG unset case: the global seed is a no-op (Go 1.24+), so
+  # re-seeding doesn't repeat the output. (randseednop=0 isn't supported.)
+  seed(1)
+  before = int63()
+  seed(1)
+  after = int63()
+  assert before != after, "global seed should be a no-op"
+}
+
+# ---- auto_test.go ----
+
+test "Auto" {
+  # Ten values from the global source don't appear in Seed(1)'s output.
+  out = (0...10).map { int63() }
+  seed(1)
+  r = new(new_source(1))
+  found = 0
+  for _ in 0...1000 {
+    x = r.int63!()
+    if x == out[found] {
+      found += 1
+      assert found < out.size, "found unseeded output in Seed(1) output"
+    }
+  }
+}
+
+# ---- race_test.go: the top-level functions from several tasks ----
+
+test "Concurrent" {
+  tasks = (0...10).map { |i|
+    spawn {
+      buf = [0.as_u8; 997]
+      total = 0
+      for j in 0...10 {
+        s = 0
+        s +%= exp_float64().to_i
+        s +%= float32().to_i
+        s +%= float64().to_i
+        s +%= intn(int() + 1)
+        s +%= int31n(int31() + 1).to_i
+        s +%= int63n(int63() + 1)
+        s +%= norm_float64().to_i
+        s +%= uint32().to_i
+        s +%= uint64().as_i64
+        for v in perm(10) { s +%= v }
+        read(buf)
+        for b in buf { s +%= b.to_i }
+        seed((i * j) *% s)
+        total +%= s
+      }
+      total
+    }
+  }
+  for t in tasks { t.wait.unwrap }
+}
+
+# ---- custom sources ----
+
+# A Source without its own uint64!: Rand.uint64! combines two int63! values
+# (Go's fallback for a Source that isn't a Source64).
+struct Counter {
+  st: [Int]
+
+  def int63! -> Int {
+    self.st[0] += 1
+    st[0] * 0x123456789
+  }
+
+  def seed!(seed: Int) {
+    self.st[0] = seed
+    return
+  }
+}
+
+test "Source without uint64" {
+  r = new(Counter.new(st: [0]))
+  a = (0x123456789).as_u64
+  b = (2 * 0x123456789).as_u64
+  assert_eq r.uint64!(), a >> 31 | b << 32
+  r.seed!(0)
+  assert_eq r.int63!(), 0x123456789
+}
+
+test "new_source is an RngSource" {
+  s = new_source(7)
+  r = new(new_source(7))
+  for _ in 0...5 { assert_eq s.int63!(), r.int63!() }
+  s.seed!(7)
+  r.seed!(7)
+  assert_eq s.uint64!(), r.uint64!()
+}
+
+test "panics are Go's" {
+  # (Checked by message in the source: n <= 0 panics "invalid argument to ...".)
+  r = new(new_source(1))
+  assert_eq r.intn!(1), 0
+  assert_eq r.int63n!(1), 0
+  assert_eq r.int31n!(1), 0
+}
+
+test "zipf none" {
+  r = new(new_source(1))
+  assert new_zipf(r, 1.0, 1.0, 10).none?, "s <= 1"
+  assert new_zipf(r, 2.0, 0.5, 10).none?, "v < 1"
+}
+
+test "f32" {
+  # float32 rounding: ties to even, subnormals, overflow, signs.
+  assert_eq f32(1.0), 1.0
+  assert_eq f32(0.1), 0.10000000149011612
+  assert_eq f32(1.0 + 1.0 / 16777216.0), 1.0
+  assert_eq f32(1.0 + 3.0 / 16777216.0), 1.0000002384185791
+  assert_eq f32(-0.1), -0.10000000149011612
+  assert_eq f32(1e-46), 0.0
+  assert_eq f32(1e-45), 1.401298464324817e-45
+  assert_eq f32(3.4028235e38), 3.4028234663852886e38
+  assert f32(3.4028236e38) > 1e308, "overflow to +Inf"
+  assert_eq f32(1e-40), 9.99994610111476e-41
+}
+
+# ---- example_test.go ----
+
+def answers -> [Str] {
+  ["It is certain", "It is decidedly so", "Without a doubt", "Yes definitely", "You may rely on it",
+    "As I see it yes", "Most likely", "Outlook good", "Yes", "Signs point to yes",
+    "Reply hazy try again", "Ask again later", "Better not tell you now", "Cannot predict now",
+    "Concentrate and ask again", "Don't count on it", "My reply is no", "My sources say no",
+    "Outlook not so good", "Very doubtful"]
+}
+
+test "Example (magic 8-ball)" {
+  a = answers()
+  said = a[intn(a.size)]
+  assert slices.contains(a, said), said
+}
+
+def f32s(x: Float) -> Str { strconv.format_float(x, "g", -1, 32) }
+
+def show(name: Str, a: Str, b: Str, c: Str) {
+  puts strings.trim_right(format("%-12s%-20s%-20s%s", name, a, b, c), " ")
+}
+
+example "Example_rand" {
+  r = new(new_source(99))
+  show("Float32", f32s(r.float32!()), f32s(r.float32!()), f32s(r.float32!()))
+  show("Float64", "#{r.float64!()}", "#{r.float64!()}", "#{r.float64!()}")
+  show("ExpFloat64", "#{r.exp_float64!()}", "#{r.exp_float64!()}", "#{r.exp_float64!()}")
+  show("NormFloat64", "#{r.norm_float64!()}", "#{r.norm_float64!()}", "#{r.norm_float64!()}")
+  show("Int31", "#{r.int31!()}", "#{r.int31!()}", "#{r.int31!()}")
+  show("Int63", "#{r.int63!()}", "#{r.int63!()}", "#{r.int63!()}")
+  show("Uint32", "#{r.uint32!()}", "#{r.uint32!()}", "#{r.uint32!()}")
+  show("Intn(10)", "#{r.intn!(10)}", "#{r.intn!(10)}", "#{r.intn!(10)}")
+  show("Int31n(10)", "#{r.int31n!(10)}", "#{r.int31n!(10)}", "#{r.int31n!(10)}")
+  show("Int63n(10)", "#{r.int63n!(10)}", "#{r.int63n!(10)}", "#{r.int63n!(10)}")
+  show("Perm", "#{r.perm!(5)}", "#{r.perm!(5)}", "#{r.perm!(5)}")
+} outputs <<~EOS
+  Float32     0.2635776           0.6358173           0.6718283
+  Float64     0.628605430454327   0.4504798828572669  0.9562755949377957
+  ExpFloat64  0.3362240648200941  1.4256072328483647  0.24354758816173044
+  NormFloat64 0.17233959114940064 1.577014951434847   0.04259129641113857
+  Int31       1501292890          1486668269          182840835
+  Int63       3546343826724305832 5724354148158589552 5239846799706671610
+  Uint32      2760229429          296659907           1922395059
+  Intn(10)    1                   2                   5
+  Int31n(10)  4                   7                   8
+  Int63n(10)  7                   6                   3
+  Perm        [1 4 2 3 0]         [4 2 1 3 0]         [1 2 4 0 3]
+  
+EOS
+
+test "ExamplePerm (unordered)" {
+  p = perm(3)
+  slices.sort(p)
+  assert_eq p, [0, 1, 2]
+}
+
+test "ExampleShuffle" {
+  words = strings.fields("ink runs from the corners of my mouth")
+  shuffle(words.size) { |i, j| words[i], words[j] = words[j], words[i] }
+  sorted = words.dup
+  slices.sort(sorted)
+  want = strings.fields("ink runs from the corners of my mouth")
+  slices.sort(want)
+  assert_eq sorted, want
+}
+
+test "ExampleShuffle_slicesInUnison" {
+  numbers = "12345".bytes.to_a
+  letters = "ABCDE".bytes.to_a
+  shuffle(numbers.size) { |i, j|
+    numbers[i], numbers[j] = numbers[j], numbers[i]
+    letters[i], letters[j] = letters[j], letters[i]
+  }
+  for i in 0...numbers.size { assert_eq numbers[i] - 48, letters[i] - 64 }
+}
+
+test "ExampleIntn" {
+  for _ in 0...3 { assert intn(100) < 100, "intn" }
+}

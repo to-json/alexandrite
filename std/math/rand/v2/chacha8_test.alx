@@ -1,0 +1,175 @@
+# Go's chacha8_test.go and internal/chacha8rand's rand_test.go (the output
+# and marshal vectors are in vec_chacha8_test.alx).
+
+import "crypto/sha256"
+import "strconv"
+import "text/tabwriter"
+import "bytes"
+
+CHACHA8_OUTLEN = 2976
+
+def chacha8_hash -> [Byte] { hx("bfec3d418b829afe5df2d8887d1508348409c293b73758d7efd841dd995fe021") }
+
+test "ChaCha8 Seed restarts the sequence" {
+  p = new_chacha8(chacha8_seed())
+  first: [U64] = []
+  for _ in 0...200 { first << p.uint64! }
+  p.seed!(chacha8_seed())
+  for x in first { assert_eq p.uint64!, x }
+}
+
+test "ChaCha8 read" {
+  p = new_chacha8(chacha8_seed())
+  buf: [Byte] = [0; CHACHA8_OUTLEN]
+  assert_eq p.read!(buf), buf.size
+  assert_eq sha256.sum256(buf).to_a, chacha8_hash()
+
+  # One byte at a time (Go: io.ReadFull(iotest.OneByteReader(p), buf)).
+  p.seed!(chacha8_seed())
+  buf = [0.as_u8; CHACHA8_OUTLEN]
+  for k in 0...buf.size { assert_eq p.read!(buf[k...k + 1]), 1 }
+  assert_eq sha256.sum256(buf).to_a, chacha8_hash()
+
+  p.seed!(chacha8_seed())
+  assert_eq p.read!([]), 0
+
+  # Random-sized reads, with random marshal round trips in between.
+  all: [Byte] = []
+  n = 0
+  while n < CHACHA8_OUTLEN {
+    if int_n(2) == 0 {
+      out = p.marshal_binary
+      p = new_chacha8(zero_seed()) if int_n(2) == 0
+      p.unmarshal_binary!(out).unwrap
+    }
+    size = int_n(100)
+    size = CHACHA8_OUTLEN - n if n + size > CHACHA8_OUTLEN
+    b: [Byte] = [0; size]
+    n += size
+    assert_eq p.read!(b), size
+    all = all + b
+  }
+  assert_eq sha256.sum256(all).to_a, chacha8_hash()
+}
+
+test "ChaCha8 marshal round trips at every position" {
+  # internal/chacha8rand TestMarshal: a fresh state from each encoding
+  # continues the sequence (past several reseeds).
+  p = new_chacha8(chacha8_seed())
+  want = new_chacha8(chacha8_seed())
+  for _ in 0...300 {
+    enc = p.marshal_binary
+    p = new_chacha8(zero_seed())
+    p.unmarshal_binary!(enc).unwrap
+    assert_eq p.uint64!, want.uint64!
+  }
+}
+
+test "ChaCha8 unmarshal errors" {
+  p = new_chacha8(chacha8_seed())
+  good = p.marshal_binary
+  assert_eq p.unmarshal_binary!(good[0...47]).err.unwrap.message, "invalid ChaCha8 encoding"
+  bad = good.dup
+  bad[0] = 0x43
+  assert_eq p.unmarshal_binary!(bad).err.unwrap.message, "invalid ChaCha8 encoding"
+  # used beyond the last usable word of a reseed period.
+  big = good.dup
+  big[15] = 125
+  assert_eq p.unmarshal_binary!(big).err.unwrap.message, "invalid ChaCha8 encoding"
+  big[15] = 124
+  assert p.unmarshal_binary!(big).ok?
+  assert_eq p.unmarshal_binary!("readbuf:".bytes).err.unwrap.message, "invalid ChaCha8 Read buffer encoding"
+  assert_eq p.unmarshal_binary!("readbuf:".bytes + hx("090102")).err.unwrap.message, "invalid ChaCha8 Read buffer encoding"
+}
+
+test "ChaCha8 marshal keeps the read buffer" {
+  p = new_chacha8(chacha8_seed())
+  b: [Byte] = [0; 3]
+  p.read!(b)
+  enc = p.marshal_binary
+  assert_eq enc[0...8], "readbuf:".bytes
+  assert_eq enc[8], 5
+  q = new_chacha8(zero_seed())
+  q.unmarshal_binary!(enc).unwrap
+  x: [Byte] = [0; 13]
+  y: [Byte] = [0; 13]
+  p.read!(x)
+  q.read!(y)
+  assert_eq x, y
+}
+
+test "ChaCha8 copies share state" {
+  p = new_chacha8(chacha8_seed())
+  q = p
+  a = p.uint64!
+  b = q.uint64!
+  r = new_chacha8(chacha8_seed())
+  assert_eq a, r.uint64!
+  assert_eq b, r.uint64!
+}
+
+test "ChaCha8 as a Rand source" {
+  r = new(new_chacha8(chacha8_seed()))
+  p = new_chacha8(chacha8_seed())
+  assert_eq r.uint64!, p.uint64!
+  assert_eq r.int64!, (p.uint64! & 0x7fffffffffffffff).as_i64
+}
+
+bench "ChaCha8" {
+  p = new_chacha8(seed_of(hx("0102030405000000000000000000000000000000000000000000000000000000")))
+  t: U64 = 0
+  for _ in 0...1000000 { t = t +% p.uint64! }
+  assert t != 0
+}
+
+bench "ChaCha8 read" {
+  p = new_chacha8(chacha8_seed())
+  buf: [Byte] = [0; 32]
+  t = 0
+  for _ in 0...100000 {
+    p.read!(buf)
+    t += buf[0].to_i
+  }
+  assert t > 0
+}
+
+# Go's Example_rand (a tabwriter table of every distribution).
+example "rand" {
+  r = new(new_pcg(1, 2))
+  b = bytes.new_buffer_string("")
+  w = tabwriter.new_writer(b, 1, 1, 1, 0x20, 0)
+  f = ->(x: Float) -> Str { strconv.format_float(x, "g", -1, 32) }
+  g = ->(x: Float) -> Str { strconv.format_float(x, "g", -1, 64) }
+  w.write_string!("Float32\t#{f(r.float32!)}\t#{f(r.float32!)}\t#{f(r.float32!)}\n").unwrap
+  w.write_string!("Float64\t#{g(r.float64!)}\t#{g(r.float64!)}\t#{g(r.float64!)}\n").unwrap
+  w.write_string!("ExpFloat64\t#{g(r.exp_float64!)}\t#{g(r.exp_float64!)}\t#{g(r.exp_float64!)}\n").unwrap
+  w.write_string!("NormFloat64\t#{g(r.norm_float64!)}\t#{g(r.norm_float64!)}\t#{g(r.norm_float64!)}\n").unwrap
+  w.write_string!("Int32\t#{r.int32!}\t#{r.int32!}\t#{r.int32!}\n").unwrap
+  w.write_string!("Int64\t#{r.int64!}\t#{r.int64!}\t#{r.int64!}\n").unwrap
+  w.write_string!("Uint32\t#{r.uint32!}\t#{r.uint32!}\t#{r.uint32!}\n").unwrap
+  w.write_string!("IntN(10)\t#{r.int_n!(10)}\t#{r.int_n!(10)}\t#{r.int_n!(10)}\n").unwrap
+  w.write_string!("Int32N(10)\t#{r.int32_n!(10)}\t#{r.int32_n!(10)}\t#{r.int32_n!(10)}\n").unwrap
+  w.write_string!("Int64N(10)\t#{r.int64_n!(10)}\t#{r.int64_n!(10)}\t#{r.int64_n!(10)}\n").unwrap
+  w.write_string!("Perm\t#{r.perm!(5)}\t#{r.perm!(5)}\t#{r.perm!(5)}\n").unwrap
+  w.flush!.unwrap
+  print b.string
+} outputs "Float32     0.95955694          0.8076733            0.8135684\nFloat64     0.4297927436037299  0.797802349388613    0.3883664855410056\nExpFloat64  0.43463410545541104 0.5513632046504593   0.7426404617374481\nNormFloat64 -0.9303318111676635 -0.04750789419852852 0.22248301107582735\nInt32       2020777787          260808523            851126509\nInt64       5231057920893523323 4257872588489500903  158397175702351138\nUint32      314478343           1418758728           208955345\nIntN(10)    6                   2                    0\nInt32N(10)  3                   7                    7\nInt64N(10)  8                   9                    4\nPerm        [0 3 1 4 2]         [4 1 2 0 3]          [4 3 2 0 1]\n"
+
+# Go's ExamplePerm, ExampleN, ExampleShuffle, ExampleIntN (random output, so
+# Go checks none; here they must run).
+test "examples with random output" {
+  for value in perm(3) { assert value >= 0 && value < 3 }
+  v: I64 = 100
+  assert n(v) < 100
+  words = "ink runs from the corners of my mouth".split(" ")
+  shuffle(words.size) { |i, j| words[i], words[j] = words[j], words[i] }
+  assert_eq words.size, 8
+  numbers = "12345".bytes.to_a
+  letters = "ABCDE".bytes.to_a
+  shuffle(numbers.size) { |i, j|
+    numbers[i], numbers[j] = numbers[j], numbers[i]
+    letters[i], letters[j] = letters[j], letters[i]
+  }
+  for i in 0...numbers.size { assert_eq numbers[i] - 49, letters[i] - 65 }
+  assert int_n(100) < 100
+}

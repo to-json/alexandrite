@@ -1,0 +1,91 @@
+# Go's net/http/pprof TestHandlers, translated with alx's answers (see the
+# package header), plus a test over a server.
+import "net"
+import "net/http"
+import "strings"
+
+def run(f: (http.ResponseWriter, http.Request) -> Unit, path: Str) -> http.ResponseWriter {
+  req = http.new_request("GET", "http://example.com" + path, []).unwrap
+  w = http.new_recording_writer
+  f(w, req)
+  w
+}
+
+test "handlers" {
+  # (path, handler, status, content type, content disposition, body or "")
+  tests = [
+    ("/debug/pprof/<script>scripty<script>", index, 404, "text/plain; charset=utf-8", "", "Unknown profile\n"),
+    ("/debug/pprof/heap", index, 200, "application/octet-stream", "attachment; filename=\"heap\"", ""),
+    ("/debug/pprof/heap?debug=1", index, 200, "text/plain; charset=utf-8", "", ""),
+    ("/debug/pprof/rusage?debug=1", index, 200, "text/plain; charset=utf-8", "", ""),
+    ("/debug/pprof/cmdline", cmdline, 200, "text/plain; charset=utf-8", "", ""),
+    ("/debug/pprof/profile?seconds=1", profile, 501, "text/plain; charset=utf-8", "", "Could not enable CPU profiling: alx has no CPU profiler\n"),
+    ("/debug/pprof/symbol", symbol, 200, "text/plain; charset=utf-8", "", ""),
+    ("/debug/pprof/trace", trace, 501, "text/plain; charset=utf-8", "", "Could not enable tracing: alx has no execution tracer\n"),
+    ("/debug/pprof/mutex", index, 501, "text/plain; charset=utf-8", "", "Profile mutex is not available in alx (no Go runtime profiler)\n"),
+    ("/debug/pprof/block?seconds=1", index, 501, "text/plain; charset=utf-8", "", "Profile block is not available in alx (no Go runtime profiler)\n"),
+    ("/debug/pprof/goroutine?seconds=1", index, 501, "text/plain; charset=utf-8", "", "Profile goroutine is not available in alx (no Go runtime profiler)\n"),
+    ("/debug/pprof/heap?seconds=0", index, 400, "text/plain; charset=utf-8", "", "invalid value for \"seconds\" - must be a positive integer\n"),
+    ("/debug/pprof/heap?seconds=1&debug=1", index, 400, "text/plain; charset=utf-8", "", "seconds and debug params are incompatible\n"),
+    ("/debug/pprof/", index, 200, "text/html; charset=utf-8", "", "")
+  ]
+  for t in tests {
+    w = run(t[1], t[0])
+    code = w.status == 0 ? 200 : w.status
+    assert_eq code, t[2]
+    h = w.recorded_header
+    assert_eq h.get("X-Content-Type-Options"), "nosniff"
+    assert_eq h.get("Content-Type"), t[3]
+    assert_eq h.get("Content-Disposition"), t[4]
+    next if code == 200
+    assert_eq h.get("X-Go-Pprof"), "1"
+    assert_eq Str.from_bytes(w.recorded_body), t[5]
+  }
+}
+
+test "profile bodies" {
+  heap = Str.from_bytes(run(index, "/debug/pprof/heap?debug=1").recorded_body)
+  assert heap.start_with?("alx heap profile\n# HeldBytes = ")
+  assert strings.contains(heap, "# PeakHeldBytes = ")
+  ru = Str.from_bytes(run(index, "/debug/pprof/rusage").recorded_body)
+  for k in ["UserNs", "SysNs", "MaxRSSBytes", "MinorFaults", "MajorFaults", "VoluntaryCtxSwitches", "InvoluntaryCtxSwitches"] {
+    assert strings.contains(ru, "# #{k} = "), k
+  }
+  rss = snapshot("rusage")[2][1]
+  assert rss > 1000000, "peak RSS should be over 1 MB, got #{rss}"
+  idx = Str.from_bytes(run(index, "/debug/pprof/").recorded_body)
+  assert strings.contains(idx, "Types of profiles available:")
+  assert strings.contains(idx, "<a href='heap?debug=1'>heap</a>")
+  assert strings.contains(idx, "<a href='trace?debug=1'>trace</a>")
+  assert_eq Str.from_bytes(run(symbol, "/debug/pprof/symbol?0x1234").recorded_body), "num_symbols: 0\n"
+}
+
+test "delta profile" {
+  w = run(index, "/debug/pprof/rusage?seconds=1")
+  assert_eq w.status, 200
+  assert_eq w.recorded_header.get("Content-Disposition"), "attachment; filename=\"rusage-delta\""
+  assert Str.from_bytes(w.recorded_body).start_with?("alx rusage profile (delta)\n")
+}
+
+test "registered on a server" {
+  mux = http.new_serve_mux
+  register(mux)
+  mux.handle("GET /debug/pprof/heap-handler", handler("heap"))
+  srv = http.new_server(mux)
+  ln = net.listen("tcp", "127.0.0.1:0").unwrap
+  port = ln.port
+  spawn { srv.serve(ln) }
+  base = "http://127.0.0.1:#{port}/debug/pprof/"
+  r = http.get(base).unwrap
+  assert_eq r.status, 200
+  assert strings.contains(r.body_string, "Profile Descriptions:")
+  assert_eq http.get(base + "heap?debug=1").unwrap.status, 200
+  assert_eq http.get(base + "heap-handler?debug=1").unwrap.status, 200
+  assert_eq http.get(base + "profile").unwrap.status, 501
+  assert_eq http.get(base + "nope").unwrap.status, 404
+  c = http.get(base + "cmdline").unwrap
+  assert_eq c.status, 200
+  assert c.body_string.size > 0
+  assert_eq http.post(base + "symbol", "text/plain", "0x1").unwrap.status, 405
+  srv.shutdown
+}

@@ -1,0 +1,421 @@
+# Package hex: Go's encoding/hex — hexadecimal encoding and decoding.
+#
+#   Go                                      alx
+#   EncodedLen(n) / DecodedLen(x)           encoded_len(n) / decoded_len(x)
+#   Encode(dst, src) int                    encode(dst, src) -> Int
+#   AppendEncode(dst, src) []byte           append_encode(dst, src) -> [Byte]
+#   EncodeToString(src) string              encode_to_string(src) -> Str
+#   Decode(dst, src) (int, error)           decode(dst, src) -> ~Int<HexError>
+#   AppendDecode(dst, src) ([]byte, error)  append_decode(dst, src) -> ~[Byte]<HexError>
+#   DecodeString(s) ([]byte, error)         decode_string(s) -> ~[Byte]<HexError>
+#   Dump(data) string                       dump(data) -> Str
+#   Dumper(w) io.WriteCloser                dumper(w) -> Dumper[W]   (write!, close!)
+#   NewEncoder(w) io.Writer                 new_encoder(w) -> Encoder[W]   (write!)
+#   NewDecoder(r) io.Reader                 new_decoder(r) -> Decoder[R]   (read!)
+#   InvalidByteError(b)                     HexError.InvalidByte(b)
+#   ErrLength                               HexError.ErrLength
+#   errors.New("encoding/hex: dumper closed")  HexError.DumperClosed
+#
+# Error messages are Go's ("encoding/hex: invalid byte: U+0067 'g'").
+#
+# Differences from Go:
+#  - A `~T` carries a value or an error, not both: on malformed input Go's
+#    Decode / DecodeString / AppendDecode also return the bytes decoded before
+#    the error; alx returns only the error. `decode` has already written
+#    those bytes into dst, as Go's does.
+#  - Encoder, Decoder and Dumper are generic over what they wrap
+#    (`Decoder[R]` holds an R, like Rust's BufReader<R>): an alx interface
+#    value contains its implementors, so a type can't both hold an io.Reader
+#    and be one. Any reader / writer works, including another Decoder or a
+#    plain io.Reader / io.Writer value. They are io.Reader / io.Writer /
+#    io.WriteCloser themselves, except one wrapping an io.Reader / io.Writer
+#    value (it would contain itself): use its methods directly. They share
+#    their state across copies (D36), so make them with the constructors.
+#  - The streaming Decoder follows io's shape: `read!` returns 0 at the end of
+#    the input. An odd-length input fails with io.StreamError.UnexpectedEof
+#    (Go's io.ErrUnexpectedEOF), a bad character with HexError.InvalidByte.
+#    Where Go returns bytes together with an error, `read!` returns the bytes
+#    and fails on the next call. An error from the wrapped reader or writer
+#    is passed on, and repeated by every later call.
+#  - Encoder.write! writes all of p or fails (io.Writer's contract in alx).
+
+import "bytes"
+import "io"
+import "unicode"
+import "unicode/utf8"
+
+HEXTABLE = "0123456789abcdef"
+
+pub error HexError {
+  # A byte that is not a hexadecimal digit (Go's InvalidByteError).
+  InvalidByte(b: Byte)
+  # An odd-length input to decode / decode_string (Go's ErrLength).
+  ErrLength
+  # A write to a closed Dumper.
+  DumperClosed
+
+  def message -> Str {
+    case self {
+      InvalidByte(b) => "encoding/hex: invalid byte: #{fmt_sharp_u(b.to_i)}"
+      ErrLength => "encoding/hex: odd length hex string"
+      DumperClosed => "encoding/hex: dumper closed"
+    }
+  }
+}
+
+# fmt's %#U: "U+0041 'A'", without the quoted character when unprintable.
+def fmt_sharp_u(r: Int) -> Str {
+  digits = "0123456789ABCDEF"
+  h: [Byte] = []
+  v = r
+  while v > 0 || h.size < 4 {
+    h << digits[v & 15]
+    v >>= 4
+  }
+  out = "U+" + Str.from_bytes(h.reverse)
+  if unicode.is_print(r.as_i32) {
+    b: [Byte] = []
+    b = utf8.append_rune(b, r.as_i32)
+    out = out + " '" + Str.from_bytes(b) + "'"
+  }
+  out
+}
+
+def zeros(n: Int) -> [Byte] {
+  b: [Byte] = [0; n]
+  b
+}
+
+# The value of hex digit c, or 255.
+def unhex(c: Byte) -> Byte {
+  if c >= 48 && c <= 57 {
+    return c - 48
+  }
+  if c >= 97 && c <= 102 {
+    return c - 87
+  }
+  if c >= 65 && c <= 70 {
+    return c - 55
+  }
+  255
+}
+
+# The length of an encoding of n source bytes: n * 2.
+pub def encoded_len(n: Int) -> Int { n * 2 }
+
+# Encodes src into encoded_len(src.size) bytes of dst; returns that count.
+pub def encode(dst: [Byte], src: [Byte]) -> Int {
+  j = 0
+  for v in src {
+    dst[j] = HEXTABLE[(v >> 4).to_i]
+    dst[j + 1] = HEXTABLE[(v & 15).to_i]
+    j += 2
+  }
+  src.size * 2
+}
+
+# Appends the hexadecimal encoding of src to dst and returns the result.
+pub def append_encode(dst: [Byte], src: [Byte]) -> [Byte] {
+  out = dst
+  for v in src {
+    out << HEXTABLE[(v >> 4).to_i]
+    out << HEXTABLE[(v & 15).to_i]
+  }
+  out
+}
+
+# The hexadecimal encoding of src.
+pub def encode_to_string(src: [Byte]) -> Str {
+  dst: [Byte] = [0; src.size * 2]
+  encode(dst, src)
+  Str.from_bytes(dst)
+}
+
+# The length of a decoding of x source bytes: x / 2.
+pub def decoded_len(x: Int) -> Int { x / 2 }
+
+# Decodes src into dst: (bytes written, status) where status is -1 for
+# success, -2 for odd length, else the offending byte.
+def decode_core(dst: [Byte], src: [Byte]) -> (Int, Int) {
+  i = 0
+  j = 0
+  while j < src.size - 1 {
+    a = unhex(src[j])
+    b = unhex(src[j + 1])
+    return (i, src[j].to_i) if a > 15
+    return (i, src[j + 1].to_i) if b > 15
+    dst[i] = (a << 4) | b
+    i += 1
+    j += 2
+  }
+  if src.size % 2 == 1 {
+    # Check for an invalid char before reporting bad length, since the
+    # invalid char (if present) is an earlier problem.
+    return (i, src[j].to_i) if unhex(src[j]) > 15
+    return (i, -2)
+  }
+  (i, -1)
+}
+
+def status_error(st: Int) -> HexError {
+  return HexError.ErrLength if st == -2
+  HexError.InvalidByte(b: st.as_u8)
+}
+
+# Decodes src into dst (which needs decoded_len(src.size) bytes); returns the
+# number of bytes written. src must hold only hex digits (either case) and
+# have even length. On malformed input the bytes before the error are already
+# in dst.
+pub def decode(dst: [Byte], src: [Byte]) -> ~Int<HexError> {
+  r = decode_core(dst, src)
+  fail status_error(r[1]) if r[1] != -1
+  r[0]
+}
+
+# Appends the decoding of src to dst and returns the result.
+pub def append_decode(dst: [Byte], src: [Byte]) -> ~[Byte]<HexError> {
+  buf: [Byte] = [0; src.size / 2]
+  r = decode_core(buf, src)
+  fail status_error(r[1]) if r[1] != -1
+  dst + buf
+}
+
+# The bytes represented by the hexadecimal string s.
+pub def decode_string(s: Str) -> ~[Byte]<HexError> {
+  buf: [Byte] = [0; s.size / 2]
+  r = decode_core(buf, s.bytes.to_a)
+  fail status_error(r[1]) if r[1] != -1
+  buf
+}
+
+# A hex dump of data, in the format of `hexdump -C`.
+pub def dump(data: [Byte]) -> Str {
+  return "" if data.size == 0
+  buf = bytes.new_buffer([])
+  d = dumper(buf)
+  d.write!(data).unwrap
+  d.close!.unwrap
+  buf.to_s
+}
+
+# Hexadecimal characters buffered by Encoder and Decoder.
+BUFFER_SIZE = 1024
+
+struct EncoderState[W] {
+  w: W
+  err: Error?
+  out: [Byte]
+}
+
+# An io.Writer writing the lowercase hexadecimal encoding of its input to W.
+pub struct Encoder[W] {
+  st: [EncoderState[W]]
+
+  # A write to W, as a Result whether or not W's write! can fail.
+  def put!(p: [Byte]) -> ~Int { self.st[0].w.~write!(p) }
+
+  # Encodes all of p to the wrapped writer; returns p.size.
+  pub def write!(p: [Byte]) -> ~Int {
+    if e = st[0].err {
+      fail e
+    }
+    off = 0
+    while off < p.size {
+      chunk = BUFFER_SIZE / 2
+      chunk = p.size - off if p.size - off < chunk
+      n = encode(st[0].out, p[off...off + chunk])
+      r = put!(st[0].out[0...n])
+      if e = r.err {
+        self.st[0].err = e
+        fail e
+      }
+      off += chunk
+    }
+    p.size
+  }
+}
+
+# An io.Writer that writes lowercase hexadecimal characters to w.
+pub def new_encoder[W](w: W) -> Encoder[W] {
+  Encoder.new(st: [EncoderState.new(w: w, err: none, out: zeros(BUFFER_SIZE))])
+}
+
+struct DecoderState[R] {
+  r: R
+  # A failure of the input or of the decoding; repeated once `inb` is spent.
+  err: Error?
+  eof: Bool
+  # Encoded bytes not yet decoded (a slice of arr).
+  inb: [Byte]
+  arr: [Byte]
+}
+
+# An io.Reader decoding the hexadecimal characters read from R.
+pub struct Decoder[R] {
+  st: [DecoderState[R]]
+
+  # A read from R, as a Result whether or not R's read! can fail.
+  def get!(p: [Byte]) -> ~Int { self.st[0].r.~read!(p) }
+
+  # Decodes into p; returns the count, 0 at the end of the input.
+  pub def read!(p: [Byte]) -> ~Int {
+    return 0 if p.size == 0
+    # Fill the internal buffer with enough bytes to decode.
+    while st[0].inb.size < 2 && st[0].err.none? && !st[0].eof {
+      arr = st[0].arr
+      num_copy = copy(arr, st[0].inb) # 0 or 1 bytes
+      r = get!(arr[num_copy...arr.size])
+      num_read = 0
+      if v = r.ok {
+        num_read = v
+      } else if e = r.err {
+        self.st[0].err = e
+      }
+      self.st[0].inb = arr[0...num_copy + num_read]
+      if num_read == 0 && st[0].err.none? {
+        self.st[0].eof = true
+        inb = st[0].inb
+        if inb.size % 2 != 0 {
+          c = inb[inb.size - 1]
+          if unhex(c) > 15 {
+            self.st[0].err = HexError.InvalidByte(b: c)
+          } else {
+            self.st[0].err = io.StreamError.UnexpectedEof
+          }
+        }
+      }
+    }
+    # Decode the internal buffer into p.
+    inb = st[0].inb
+    q = p.size
+    q = inb.size / 2 if q > inb.size / 2
+    res = decode_core(p, inb[0...q * 2])
+    num_dec = res[0]
+    if res[1] != -1 {
+      # A decode error: discard the rest of the input.
+      self.st[0].inb = []
+      self.st[0].err = status_error(res[1])
+    } else {
+      self.st[0].inb = inb[2 * num_dec...inb.size]
+    }
+    if st[0].inb.size < 2 && num_dec == 0 {
+      # Only expose errors once the buffer is consumed.
+      if e = st[0].err {
+        fail e
+      }
+    }
+    num_dec
+  }
+}
+
+# An io.Reader that decodes the hexadecimal characters read from r, which
+# must hold an even number of them.
+pub def new_decoder[R](r: R) -> Decoder[R] {
+  Decoder.new(st: [DecoderState.new(r: r, err: none, eof: false, inb: [], arr: zeros(BUFFER_SIZE))])
+}
+
+struct DumperState[W] {
+  w: W
+  right_chars: [Byte]
+  buf: [Byte]
+  # Bytes in the current line.
+  used: Int
+  # Bytes in total.
+  n: Int
+  closed: Bool
+}
+
+def to_char(b: Byte) -> Byte {
+  return 46 if b < 32 || b > 126
+  b
+}
+
+# An io.WriteCloser writing a hex dump of its input to W, in the format of
+# `hexdump -C`. close! writes the last, partial line.
+pub struct Dumper[W] {
+  st: [DumperState[W]]
+
+  # Dumps data; returns data.size. Fails after close!.
+  pub def write!(data: [Byte]) -> ~Int {
+    fail HexError.DumperClosed if st[0].closed
+    # Output lines look like:
+    # 00000010  2e 2f 30 31 32 33 34 35  36 37 38 39 3a 3b 3c 3d  |./0123456789:;<=|
+    # ^ offset                          ^ extra space              ^ ASCII of line.
+    buf = st[0].buf
+    rc = st[0].right_chars
+    n = 0
+    for c in data {
+      if st[0].used == 0 {
+        # At the beginning of a line, the current offset in hex.
+        h = st[0].n
+        buf[0] = (h >> 24).as_u8
+        buf[1] = (h >> 16).as_u8
+        buf[2] = (h >> 8).as_u8
+        buf[3] = h.as_u8
+        encode(buf[4...12], buf[0...4])
+        buf[12] = 32
+        buf[13] = 32
+        self.st[0].w.~write!(buf[4...14])
+      }
+      buf[0] = HEXTABLE[(c >> 4).to_i]
+      buf[1] = HEXTABLE[(c & 15).to_i]
+      buf[2] = 32
+      l = 3
+      if st[0].used == 7 {
+        # An additional space after the 8th byte.
+        buf[3] = 32
+        l = 4
+      } else if st[0].used == 15 {
+        # At the end of the line, an extra space and the bar for the right column.
+        buf[3] = 32
+        buf[4] = 124
+        l = 5
+      }
+      self.st[0].w.~write!(buf[0...l])
+      n += 1
+      rc[st[0].used] = to_char(c)
+      self.st[0].used += 1
+      self.st[0].n += 1
+      if st[0].used == 16 {
+        rc[16] = 124
+        rc[17] = 10
+        self.st[0].w.~write!(rc)
+        self.st[0].used = 0
+      }
+    }
+    n
+  }
+
+  # Finishes the dump; later writes fail. Closing twice does nothing.
+  pub def close! -> ~Unit {
+    return if st[0].closed
+    self.st[0].closed = true
+    return if st[0].used == 0
+    buf = st[0].buf
+    rc = st[0].right_chars
+    buf[0] = 32
+    buf[1] = 32
+    buf[2] = 32
+    buf[3] = 32
+    buf[4] = 124
+    n_bytes = st[0].used
+    while st[0].used < 16 {
+      l = 3
+      if st[0].used == 7 {
+        l = 4
+      } else if st[0].used == 15 {
+        l = 5
+      }
+      self.st[0].w.~write!(buf[0...l])
+      self.st[0].used += 1
+    }
+    rc[n_bytes] = 124
+    rc[n_bytes + 1] = 10
+    self.st[0].w.~write!(rc[0...n_bytes + 2])
+  }
+}
+
+# A Dumper writing a hex dump of everything written to it to w.
+pub def dumper[W](w: W) -> Dumper[W] {
+  Dumper.new(st: [DumperState.new(w: w, right_chars: zeros(18), buf: zeros(14), used: 0, n: 0, closed: false)])
+}

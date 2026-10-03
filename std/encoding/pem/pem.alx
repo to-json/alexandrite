@@ -1,0 +1,235 @@
+# Package pem: Go's encoding/pem — the PEM data encoding, which originated in
+# Privacy Enhanced Mail. Its most common use today is in TLS keys and
+# certificates (RFC 1421).
+#
+#   Go                                        alx
+#   Block{Type, Headers, Bytes}               Block.new(type:, headers:, bytes:)
+#   Decode(data) (p *Block, rest []byte)      decode(data) -> (Block?, [Byte])
+#   Encode(out, b) error                      encode(out, b) -> ~Unit
+#   EncodeToMemory(b) []byte                  encode_to_memory(b) -> [Byte]?
+#   errors.New("pem: cannot encode a header key that contains a colon")
+#                                             PemError.ColonInKey
+#
+# Differences from Go:
+#  - Block.headers is a Map[Str, Str], which keeps insertion order: decode
+#    fills it in the order of the input. encode writes "Proc-Type" first and
+#    the other keys sorted, as Go does.
+#  - encode_to_memory is none where Go returns nil (a key containing ":").
+#  - encode builds the whole block and writes it with one `write!`, so on an
+#    invalid header nothing is written (as in Go) and a failing writer sees
+#    one call. It is generic over the writer (any `write!` works).
+
+import "bytes"
+import "encoding/base64"
+import "sort"
+import "strings"
+
+pub error PemError {
+  # A header key contains ":", the key/value separator.
+  ColonInKey
+
+  def message -> Str {
+    case self {
+      ColonInKey => "pem: cannot encode a header key that contains a colon"
+    }
+  }
+}
+
+# A PEM encoded structure:
+#
+#   -----BEGIN Type-----
+#   Headers
+#   base64-encoded Bytes
+#   -----END Type-----
+#
+# where Headers is a possibly empty sequence of Key: Value lines.
+pub struct Block {
+  # The type, taken from the preamble (i.e. "RSA PRIVATE KEY").
+  type: Str
+  # Optional headers.
+  headers: Map[Str, Str]
+  # The decoded bytes of the contents. Typically a DER encoded ASN.1 structure.
+  bytes: [Byte]
+}
+
+def b(s: Str) -> [Byte] { s.bytes.to_a }
+
+# The first line of data, without its end of line ("\n" or "\r\n") and
+# trailing spaces and tabs: (line, rest, bytes consumed).
+def get_line(data: [Byte]) -> ([Byte], [Byte], Int) {
+  i = bytes.index_byte(data, 10)
+  j = 0
+  if i < 0 {
+    i = data.size
+    j = i
+  } else {
+    j = i + 1
+    i -= 1 if i > 0 && data[i - 1] == 13
+  }
+  (bytes.trim_right(data[0...i], " \t"), data[j...data.size], j)
+}
+
+# data with the spaces and tabs removed.
+def remove_spaces_and_tabs(data: [Byte]) -> [Byte] {
+  return data if !bytes.contains_any(data, " \t")
+  out: [Byte] = []
+  for c in data {
+    out << c if c != 32 && c != 9
+  }
+  out
+}
+
+PEM_START = "\n-----BEGIN "
+PEM_END = "\n-----END "
+PEM_END_OF_LINE = "-----"
+
+# Finds the next PEM formatted block (certificate, private key etc) in data:
+# (the block, the rest of the input). If no PEM data is found, the block is
+# none and the whole input is the rest.
+pub def decode(data: [Byte]) -> (Block?, [Byte]) {
+  # pem_start begins with a newline. However, at the very beginning of the
+  # byte array, we'll accept the start string without it.
+  rest = data
+  pem_start = b(PEM_START)
+  pem_end = b(PEM_END)
+  pem_eol = b(PEM_END_OF_LINE)
+  end_trailer_index = 0
+  loop {
+    # If we've already tried parsing a block, skip past the END we already
+    # saw.
+    return (none, data) if end_trailer_index < 0 || end_trailer_index > rest.size
+    rest = rest[end_trailer_index...rest.size]
+
+    # Find the first END line, and then find the last BEGIN line before the
+    # end line. This lets us skip any repeated BEGIN lines that don't have
+    # a matching END.
+    end_index = bytes.index(rest, pem_end)
+    return (none, data) if end_index < 0
+    end_trailer_index = end_index + pem_end.size
+    begin_index = bytes.last_index(rest[0...end_index], pem_start[1...pem_start.size])
+    next if begin_index < 0 || (begin_index > 0 && rest[begin_index - 1] != 10)
+    rest = rest[begin_index + pem_start.size - 1...rest.size]
+    end_index -= begin_index + pem_start.size - 1
+    end_trailer_index -= begin_index + pem_start.size - 1
+
+    tl = get_line(rest)
+    type_line = tl[0]
+    rest = tl[1]
+    end_index -= tl[2]
+    end_trailer_index -= tl[2]
+    next if !bytes.has_suffix(type_line, pem_eol)
+    type_line = type_line[0...type_line.size - pem_eol.size]
+
+    headers: Map[Str, Str] = {}
+    complete = true
+    loop {
+      # This loop terminates because get_line's second result is always
+      # smaller than its argument.
+      if rest.size == 0 {
+        complete = false
+        break
+      }
+      gl = get_line(rest)
+      line = gl[0]
+      kv = bytes.cut(line, b(":"))
+      if pair = kv {
+        key = bytes.trim_space(pair[0])
+        val = bytes.trim_space(pair[1])
+        headers[Str.from_bytes(key)] = Str.from_bytes(val)
+        rest = gl[1]
+        end_index -= gl[2]
+        end_trailer_index -= gl[2]
+      } else {
+        break
+      }
+    }
+    return (none, data) if !complete
+
+    # If there were headers, there must be a newline between the headers
+    # and the END line, so end_index should be >= 0.
+    next if headers.size > 0 && end_index < 0
+
+    # After the "-----" of the ending line, there should be the same type
+    # and then a final five dashes.
+    end_trailer = rest[end_trailer_index...rest.size]
+    end_trailer_len = type_line.size + pem_eol.size
+    next if end_trailer.size < end_trailer_len
+
+    rest_of_end_line = end_trailer[end_trailer_len...end_trailer.size]
+    end_trailer = end_trailer[0...end_trailer_len]
+    next if !bytes.has_prefix(end_trailer, type_line) || !bytes.has_suffix(end_trailer, pem_eol)
+
+    # The line must end with only whitespace.
+    next if get_line(rest_of_end_line)[0].size != 0
+
+    content: [Byte] = []
+    if end_index > 0 {
+      base64_data = remove_spaces_and_tabs(rest[0...end_index])
+      buf: [Byte] = [0; base64.std_encoding.decoded_len(base64_data.size)]
+      r = base64.std_encoding.decode(buf, base64_data)
+      next if r.err?
+      content = buf[0...r.unwrap]
+    }
+
+    # the -1 is because we might have only matched pem_end without the
+    # leading newline if the PEM block was empty.
+    after = get_line(rest[end_index + pem_end.size - 1...rest.size])
+    return (Block.new(type: Str.from_bytes(type_line), headers: headers, bytes: content), after[1])
+  }
+  (none, data)
+}
+
+PEM_LINE_LENGTH = 64
+
+def header_line(out: [Byte], k: Str, v: Str) -> [Byte] { out + b(k + ": " + v + "\n") }
+
+# The PEM encoding of block.
+def encode_bytes(blk: Block) -> ~[Byte]<PemError> {
+  # Check for invalid block before writing any output.
+  for k in blk.headers.keys {
+    fail PemError.ColonInKey if strings.contains(k, ":")
+  }
+  out = b(PEM_START[1...PEM_START.size] + blk.type + "-----\n")
+  if blk.headers.size > 0 {
+    proc_type = "Proc-Type"
+    h: [Str] = []
+    has_proc_type = false
+    for k in blk.headers.keys {
+      if k == proc_type {
+        has_proc_type = true
+        next
+      }
+      h << k
+    }
+    # The Proc-Type header must be written first. See RFC 1421, section 4.6.1.1.
+    out = header_line(out, proc_type, blk.headers[proc_type] || "") if has_proc_type
+    # For consistency of output, write other headers sorted by key.
+    sort.strings(h)
+    for k in h {
+      out = header_line(out, k, blk.headers[k] || "")
+    }
+    out << 10
+  }
+  # The base64 text, in lines of 64 characters.
+  text = base64.std_encoding.encode_to_string(blk.bytes)
+  i = 0
+  while i < text.size {
+    e = i + PEM_LINE_LENGTH
+    e = text.size if e > text.size
+    out = out + b(text[i...e])
+    out << 10
+    i = e
+  }
+  out + b(PEM_END[1...PEM_END.size] + blk.type + "-----\n")
+}
+
+# Writes the PEM encoding of blk to out. Fails, writing nothing, if a header
+# key contains ":".
+pub def encode[W](out: W, blk: Block) -> ~Unit {
+  w = out
+  data = ~encode_bytes(blk)
+  w.~write!(data)
+}
+
+# The PEM encoding of blk; none if a header key contains ":".
+pub def encode_to_memory(blk: Block) -> [Byte]? { encode_bytes(blk).ok }

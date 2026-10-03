@@ -1,0 +1,541 @@
+# Package base32: Go's encoding/base32 — base32 encoding as in RFC 4648.
+#
+#   Go                                        alx
+#   StdEncoding, HexEncoding                  std_encoding, hex_encoding
+#   NewEncoding(alphabet) *Encoding           new_encoding(alphabet) -> Encoding
+#   enc.WithPadding(r)                        enc.with_padding(r)
+#   StdPadding, NoPadding                     STD_PADDING, NO_PADDING
+#   enc.EncodedLen(n) / enc.DecodedLen(n)     enc.encoded_len(n) / enc.decoded_len(n)
+#   enc.Encode(dst, src)                      enc.encode(dst, src)
+#   enc.AppendEncode(dst, src) []byte         enc.append_encode(dst, src) -> [Byte]
+#   enc.EncodeToString(src) string            enc.encode_to_string(src) -> Str
+#   enc.Decode(dst, src) (int, error)         enc.decode(dst, src) -> ~Int<Base32Error>
+#   enc.AppendDecode(dst, src)                enc.append_decode(dst, src) -> ~[Byte]<Base32Error>
+#   enc.DecodeString(s) ([]byte, error)       enc.decode_string(s) -> ~[Byte]<Base32Error>
+#   NewEncoder(enc, w) io.WriteCloser         new_encoder(enc, w) -> Encoder[W]  (write!, close!)
+#   NewDecoder(enc, r) io.Reader              new_decoder(enc, r) -> Decoder[R]  (read!)
+#   CorruptInputError(off)                    Base32Error.CorruptInput(offset)
+#
+# Messages are Go's ("illegal base32 data at input byte 4").
+#
+# Differences from Go:
+#  - The predefined encodings are functions (alx constants are compile-time
+#    values), and an Encoding is a value: with_padding returns a modified
+#    copy, as Go's does.
+#  - A padding character is a Rune; NO_PADDING is -1. Invalid alphabets and
+#    paddings panic with Go's messages.
+#  - A `~T` carries a value or an error, not both: on corrupt input Go's
+#    Decode / DecodeString also return the bytes decoded before the error;
+#    alx returns only the error. `decode` has already written those bytes
+#    into dst, as Go's does.
+#  - Encoder and Decoder are generic over what they wrap (an alx interface
+#    value contains its implementors, so a type can't both hold an io.Writer
+#    and be one): any writer / reader works, including another Encoder /
+#    Decoder or an io.Writer / io.Reader value. They are io.Writer /
+#    io.Reader themselves, except one wrapping an io.Writer / io.Reader
+#    value (it would contain itself): use its methods directly. They share
+#    their state across copies (D36): make them with the constructors.
+#  - The Decoder follows io's shape: `read!` returns 0 at the end of the
+#    input, and a truncated input fails with io.StreamError.UnexpectedEof.
+#    Where Go returns bytes together with an error, `read!` returns the bytes
+#    and fails on the next call. An alx reader reports its end or failure
+#    after its last bytes, never with them, so where a Go reader hands over
+#    data and an error in one call the Go decoder may report that error
+#    instead of a decoding error found in the data; this one decodes first.
+#  - Encoder.write! writes all of p or fails (io.Writer's contract in alx);
+#    close! flushes a partial block and must be called.
+
+import "io"
+
+pub STD_PADDING = 61 # '='
+pub NO_PADDING = -1
+
+pub error Base32Error {
+  # The input isn't valid base32; `offset` is the byte where it goes wrong
+  # (Go's CorruptInputError).
+  CorruptInput(offset: Int)
+
+  def message -> Str {
+    case self {
+      CorruptInput(off) => "illegal base32 data at input byte #{off}"
+    }
+  }
+}
+
+def zeros(n: Int) -> [Byte] {
+  b: [Byte] = [0; n]
+  b
+}
+
+# A radix 32 encoding/decoding scheme, defined by a 32-character alphabet.
+pub struct Encoding {
+  # The alphabet: symbol index to symbol byte.
+  alphabet: Str
+  # Symbol byte to index, 255 for bytes outside the alphabet.
+  decode_map: [Byte]
+  pad_char: Int
+
+  # A copy of the encoding using `padding` (a byte value, or NO_PADDING). It
+  # must not be "\r", "\n", above 0xff, or in the alphabet.
+  pub def with_padding(padding: Int) -> Encoding {
+    if padding < NO_PADDING || padding == 13 || padding == 10 || padding > 0xff {
+      panic "invalid padding"
+    }
+    if padding != NO_PADDING && decode_map[padding] != 255 {
+      panic "padding contained in alphabet"
+    }
+    e = self
+    e.pad_char = padding
+    e
+  }
+
+  # The padding character (NO_PADDING for none).
+  pub def padding -> Int { pad_char }
+
+  # Encodes src into encoded_len(src.size) bytes of dst.
+  pub def encode(dst: [Byte], src: [Byte]) {
+    return if src.size == 0
+    a = alphabet
+    si = 0
+    di = 0
+    while src.size - si >= 5 {
+      hi = (src[si].to_i << 24) | (src[si + 1].to_i << 16) | (src[si + 2].to_i << 8) | src[si + 3].to_i
+      lo = ((hi << 8) | src[si + 4].to_i) & 0xffffffff
+      dst[di] = a[(hi >> 27) & 0x1f]
+      dst[di + 1] = a[(hi >> 22) & 0x1f]
+      dst[di + 2] = a[(hi >> 17) & 0x1f]
+      dst[di + 3] = a[(hi >> 12) & 0x1f]
+      dst[di + 4] = a[(hi >> 7) & 0x1f]
+      dst[di + 5] = a[(hi >> 2) & 0x1f]
+      dst[di + 6] = a[(lo >> 5) & 0x1f]
+      dst[di + 7] = a[lo & 0x1f]
+      si += 5
+      di += 8
+    }
+    rem = src.size - si
+    return if rem == 0
+    # Encode the remaining bytes in reverse order.
+    val = 0
+    if rem >= 4 {
+      val |= src[si + 3].to_i
+      dst[di + 6] = a[(val << 3) & 0x1f]
+      dst[di + 5] = a[(val >> 2) & 0x1f]
+    }
+    if rem >= 3 {
+      val |= src[si + 2].to_i << 8
+      dst[di + 4] = a[(val >> 7) & 0x1f]
+    }
+    if rem >= 2 {
+      val |= src[si + 1].to_i << 16
+      dst[di + 3] = a[(val >> 12) & 0x1f]
+      dst[di + 2] = a[(val >> 17) & 0x1f]
+    }
+    val |= src[si].to_i << 24
+    dst[di + 1] = a[(val >> 22) & 0x1f]
+    dst[di] = a[(val >> 27) & 0x1f]
+    # Pad the final quantum.
+    if pad_char != NO_PADDING {
+      i = (rem * 8) / 5 + 1
+      while i < 8 {
+        dst[di + i] = pad_char.as_u8
+        i += 1
+      }
+    }
+  }
+
+  # Appends the encoding of src to dst and returns the result.
+  pub def append_encode(dst: [Byte], src: [Byte]) -> [Byte] {
+    buf = zeros(encoded_len(src.size))
+    encode(buf, src)
+    dst + buf
+  }
+
+  # The base32 encoding of src.
+  pub def encode_to_string(src: [Byte]) -> Str {
+    buf = zeros(encoded_len(src.size))
+    encode(buf, src)
+    Str.from_bytes(buf)
+  }
+
+  # The length in bytes of the encoding of n source bytes.
+  pub def encoded_len(n: Int) -> Int {
+    return (n / 5) * 8 + ((n % 5) * 8 + 4) / 5 if pad_char == NO_PADDING
+    ((n + 4) / 5) * 8
+  }
+
+  # The largest length in bytes of the decoding of n bytes of base32 data.
+  pub def decoded_len(n: Int) -> Int { decoded_len_pad(n, pad_char) }
+
+  # Decodes src (newlines already removed) into dst: (bytes written, whether
+  # the end-of-message padding was seen, error offset or -1). Go's decode.
+  def decode_core(dst: [Byte], src0: [Byte]) -> (Int, Bool, Int) {
+    src = src0
+    n = 0
+    end = false
+    dsti = 0
+    olen = src.size
+    while src.size > 0 && !end {
+      # Decode a quantum using the base32 alphabet.
+      dbuf: [Byte] = [0, 0, 0, 0, 0, 0, 0, 0]
+      dlen = 8
+      j = 0
+      while j < 8 {
+        if src.size == 0 {
+          # We have reached the end and are missing padding.
+          return (n, false, olen - src.size - j) if pad_char != NO_PADDING
+          # We have reached the end and are not expecting any padding.
+          dlen = j
+          end = true
+          break
+        }
+        c = src[0]
+        src = src[1...src.size]
+        if c.to_i == pad_char && j >= 2 && src.size < 8 {
+          # We've reached the end and there's padding.
+          return (n, false, olen) if src.size + j < 7 # not enough padding
+          k = 0
+          while k < 7 - j {
+            return (n, false, olen - src.size + k - 1) if src.size > k && src[k].to_i != pad_char # incorrect padding
+            k += 1
+          }
+          dlen = j
+          end = true
+          # 7, 5 and 2 are not valid padding lengths, and so 1, 3 and 6
+          # are not valid dlen values.
+          return (n, false, olen - src.size - 1) if dlen == 1 || dlen == 3 || dlen == 6
+          break
+        }
+        dbuf[j] = decode_map[c.to_i]
+        return (n, false, olen - src.size - 1) if dbuf[j] == 255
+        j += 1
+      }
+      # Pack 8x 5-bit source blocks into 5-byte destination quantum.
+      # Go's switch falls through from the case for dlen; other lengths
+      # (1, 3, 6: only without padding) write nothing.
+      stage = 0
+      stage = 5 if dlen == 8
+      stage = 4 if dlen == 7
+      stage = 3 if dlen == 5
+      stage = 2 if dlen == 4
+      stage = 1 if dlen == 2
+      if stage >= 5 {
+        dst[dsti + 4] = (dbuf[6] << 5) | dbuf[7]
+        n += 1
+      }
+      if stage >= 4 {
+        dst[dsti + 3] = (dbuf[4] << 7) | (dbuf[5] << 2) | (dbuf[6] >> 3)
+        n += 1
+      }
+      if stage >= 3 {
+        dst[dsti + 2] = (dbuf[3] << 4) | (dbuf[4] >> 1)
+        n += 1
+      }
+      if stage >= 2 {
+        dst[dsti + 1] = (dbuf[1] << 6) | (dbuf[2] << 1) | (dbuf[3] >> 4)
+        n += 1
+      }
+      if stage >= 1 {
+        dst[dsti] = (dbuf[0] << 3) | (dbuf[1] >> 2)
+        n += 1
+      }
+      dsti += 5
+    }
+    (n, end, -1)
+  }
+
+  # Decodes src into dst (which needs decoded_len(src.size) bytes); returns
+  # the number of bytes written. Newlines ("\r", "\n") are ignored. On
+  # corrupt input the bytes before the error are already in dst.
+  pub def decode(dst: [Byte], src: [Byte]) -> ~Int<Base32Error> {
+    r = decode_core(dst, strip_newlines(src))
+    fail Base32Error.CorruptInput(offset: r[2]) if r[2] >= 0
+    r[0]
+  }
+
+  # Appends the decoding of src to dst and returns the result.
+  pub def append_decode(dst: [Byte], src: [Byte]) -> ~[Byte]<Base32Error> {
+    buf = zeros(decoded_len_pad(src.size, NO_PADDING) + 5)
+    r = decode_core(buf, strip_newlines(src))
+    fail Base32Error.CorruptInput(offset: r[2]) if r[2] >= 0
+    dst + buf[0...r[0]]
+  }
+
+  # The bytes represented by the base32 string s.
+  pub def decode_string(s: Str) -> ~[Byte]<Base32Error> {
+    src = strip_newlines(s.bytes.to_a)
+    buf = zeros(src.size)
+    r = decode_core(buf, src)
+    fail Base32Error.CorruptInput(offset: r[2]) if r[2] >= 0
+    buf[0...r[0]]
+  }
+}
+
+# src without "\r" and "\n".
+def strip_newlines(src: [Byte]) -> [Byte] {
+  out: [Byte] = []
+  for c in src {
+    out << c if c != 13 && c != 10
+  }
+  out
+}
+
+def decoded_len_pad(n: Int, pad_char: Int) -> Int {
+  return (n / 8) * 5 + ((n % 8) * 5) / 8 if pad_char == NO_PADDING
+  (n / 8) * 5
+}
+
+# A new padded Encoding defined by the 32-byte alphabet, which must not
+# contain "\r", "\n" or duplicates.
+pub def new_encoding(encoder: Str) -> Encoding {
+  panic "encoding alphabet is not 32-bytes long" if encoder.size != 32
+  dm: [Byte] = [255; 256]
+  i = 0
+  while i < 32 {
+    c = encoder[i]
+    panic "encoding alphabet contains newline character" if c == 10 || c == 13
+    panic "encoding alphabet includes duplicate symbols" if dm[c.to_i] != 255
+    dm[c.to_i] = i.as_u8
+    i += 1
+  }
+  Encoding.new(alphabet: encoder, decode_map: dm, pad_char: STD_PADDING)
+}
+
+# The standard base32 encoding, as defined in RFC 4648.
+pub def std_encoding -> Encoding { new_encoding("ABCDEFGHIJKLMNOPQRSTUVWXYZ234567") }
+
+# The "Extended Hex Alphabet" defined in RFC 4648, typically used in DNS.
+pub def hex_encoding -> Encoding { new_encoding("0123456789ABCDEFGHIJKLMNOPQRSTUV") }
+
+# ------------------------------------------------------------------ Encoder
+
+struct EncoderState[W] {
+  enc: Encoding
+  w: W
+  err: Error?
+  # Buffered data waiting to be encoded.
+  buf: [Byte]
+  nbuf: Int
+  # Output buffer.
+  out: [Byte]
+}
+
+# An io.WriteCloser encoding what is written to it into W.
+pub struct Encoder[W] {
+  st: [EncoderState[W]]
+
+  # A write to W, as a Result whether or not W's write! can fail.
+  def put!(p: [Byte]) -> ~Int { self.st[0].w.~write!(p) }
+
+  # Writes p through, or records and fails with W's error.
+  def emit!(p: [Byte]) -> ~Unit {
+    r = put!(p)
+    if e = r.err {
+      self.st[0].err = e
+      fail e
+    }
+  }
+
+  # Encodes all of p; returns p.size. A partial block waits for more input
+  # or close!.
+  pub def write!(p0: [Byte]) -> ~Int {
+    if e = st[0].err {
+      fail e
+    }
+    enc = st[0].enc
+    p = p0
+    # Leading fringe.
+    if st[0].nbuf > 0 {
+      i = 0
+      while i < p.size && st[0].nbuf < 5 {
+        self.st[0].buf[st[0].nbuf] = p[i]
+        self.st[0].nbuf += 1
+        i += 1
+      }
+      p = p[i...p.size]
+      return p0.size if st[0].nbuf < 5
+      enc.encode(st[0].out, st[0].buf)
+      ~emit!(st[0].out[0...8])
+      self.st[0].nbuf = 0
+    }
+    # Large interior chunks.
+    while p.size >= 5 {
+      nn = (st[0].out.size / 8) * 5
+      if nn > p.size {
+        nn = p.size
+        nn -= nn % 5
+      }
+      enc.encode(st[0].out, p[0...nn])
+      ~emit!(st[0].out[0...(nn / 5) * 8])
+      p = p[nn...p.size]
+    }
+    # Trailing fringe.
+    copy(st[0].buf, p)
+    self.st[0].nbuf = p.size
+    p0.size
+  }
+
+  # Flushes any partial block (with padding, if the encoding has it). Call
+  # it when done.
+  pub def close! -> ~Unit {
+    if e = st[0].err {
+      fail e
+    }
+    if st[0].nbuf > 0 {
+      enc = st[0].enc
+      enc.encode(st[0].out, st[0].buf[0...st[0].nbuf])
+      n = enc.encoded_len(st[0].nbuf)
+      self.st[0].nbuf = 0
+      ~emit!(st[0].out[0...n])
+    }
+  }
+}
+
+# A base32 encoder writing to w. Data is written in blocks of 8 bytes, so
+# close! the encoder to flush the last partial block.
+pub def new_encoder[W](enc: Encoding, w: W) -> Encoder[W] {
+  Encoder.new(st: [EncoderState.new(enc: enc, w: w, err: none, buf: zeros(5), nbuf: 0, out: zeros(1024))])
+}
+
+# ------------------------------------------------------------------ Decoder
+
+struct DecoderState[R] {
+  enc: Encoding
+  r: R
+  # A failure (of the input or the data), or the end of the input (Go's
+  # d.err == io.EOF).
+  err: Error?
+  eof: Bool
+  # Saw the end of the message (padding).
+  end: Bool
+  # Leftover input.
+  buf: [Byte]
+  nbuf: Int
+  # Leftover decoded output (a slice of outbuf).
+  out: [Byte]
+  outbuf: [Byte]
+}
+
+# An io.Reader decoding the base32 read from R.
+pub struct Decoder[R] {
+  st: [DecoderState[R]]
+
+  # A read from R, as a Result whether or not R's read! can fail.
+  def get!(p: [Byte]) -> ~Int { self.st[0].r.~read!(p) }
+
+  # Reads from R with "\r" and "\n" dropped; 0 only at the end of R.
+  def read_filtered!(p: [Byte]) -> ~Int {
+    loop {
+      n = ~get!(p)
+      return 0 if n == 0
+      off = 0
+      i = 0
+      while i < n {
+        c = p[i]
+        if c != 13 && c != 10 {
+          p[off] = c
+          off += 1
+        }
+        i += 1
+      }
+      return off if off > 0
+    }
+    0
+  }
+
+  # Reads at least `min` bytes into buf unless the input ends or fails
+  # first (Go's readEncodedData); returns the count and leaves the outcome in
+  # err / eof.
+  def read_encoded!(buf: [Byte], min: Int, expects_padding: Bool) -> Int {
+    n = 0
+    while n < min && st[0].err.none? && !st[0].eof {
+      r = read_filtered!(buf[n...buf.size])
+      if e = r.err {
+        self.st[0].err = e
+      } else {
+        got = r.unwrap
+        self.st[0].eof = true if got == 0
+        n += got
+      }
+    }
+    # Data was read, less than min bytes, before the end: truncated input.
+    if st[0].eof && ((n < min && n > 0) || (expects_padding && min < 8 && n == 0)) {
+      self.st[0].eof = false
+      self.st[0].err = io.StreamError.UnexpectedEof
+    }
+    n
+  }
+
+  # The decoder's failure, or 0 at the end.
+  def stop! -> ~Int {
+    if e = st[0].err {
+      fail e
+    }
+    0
+  }
+
+  # Decodes into p; returns the count, 0 at the end of the input.
+  pub def read!(p: [Byte]) -> ~Int {
+    return 0 if p.size == 0
+    loop {
+      # Use leftover decoded output from the last read.
+      if st[0].out.size > 0 {
+        n = copy(p, st[0].out)
+        self.st[0].out = st[0].out[n...st[0].out.size]
+        return n
+      }
+      return ~stop! if st[0].err.present? || st[0].eof
+      enc = st[0].enc
+      # Read a chunk.
+      nn = ((p.size + 4) / 5) * 8
+      nn = 8 if nn < 8
+      nn = st[0].buf.size if nn > st[0].buf.size
+      # Minimum amount of bytes that needs to be read each cycle.
+      min = 1
+      expects_padding = false
+      if enc.pad_char != NO_PADDING {
+        min = 8 - st[0].nbuf
+        expects_padding = true
+      }
+      got = read_encoded!(st[0].buf[st[0].nbuf...nn], min, expects_padding)
+      self.st[0].nbuf += got
+      return ~stop! if st[0].nbuf < min
+      if got > 0 && st[0].end {
+        self.st[0].err = Base32Error.CorruptInput(offset: 0)
+        fail Base32Error.CorruptInput(offset: 0)
+      }
+      # Decode chunk into p, or into out and then p if p is too small.
+      nr = st[0].nbuf
+      nr = (st[0].nbuf / 8) * 8 if enc.pad_char != NO_PADDING
+      nw = enc.decoded_len(st[0].nbuf)
+      n = 0
+      res = (0, false, -1)
+      if nw > p.size {
+        res = enc.decode_core(st[0].outbuf, st[0].buf[0...nr])
+        self.st[0].out = st[0].outbuf[0...res[0]]
+        n = copy(p, st[0].out)
+        self.st[0].out = st[0].out[n...st[0].out.size]
+      } else {
+        res = enc.decode_core(p, st[0].buf[0...nr])
+        n = res[0]
+      }
+      self.st[0].end = res[1]
+      left = st[0].nbuf - nr
+      copy(st[0].buf[0...left], st[0].buf[nr...st[0].nbuf])
+      self.st[0].nbuf = left
+      if res[2] >= 0 && st[0].err.none? {
+        # A decoding error replaces the end of the input, not a read error.
+        self.st[0].eof = false
+        self.st[0].err = Base32Error.CorruptInput(offset: res[2])
+      }
+      return n if n > 0
+      return ~stop! if st[0].err.present? || st[0].eof
+    }
+    0
+  }
+}
+
+# A streaming base32 decoder reading from r. Newlines in the input are
+# ignored.
+pub def new_decoder[R](enc: Encoding, r: R) -> Decoder[R] {
+  Decoder.new(st: [DecoderState.new(enc: enc, r: r, err: none, eof: false, end: false, buf: zeros(1024), nbuf: 0, out: [], outbuf: zeros(640))])
+}

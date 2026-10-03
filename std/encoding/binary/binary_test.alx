@@ -1,0 +1,696 @@
+# Go's encoding/binary tests (binary_test.go, varint_test.go,
+# example_test.go), translated. Go's struct, pointer and array cases read and
+# write the struct's fields one Data at a time (see binary.alx's header).
+import "bytes"
+import "io"
+import "math"
+
+def bs(xs: [Byte]) -> [Byte] { xs }
+
+HEXDIGITS = "0123456789abcdef"
+
+# fmt's %x of a byte slice ("% x" with sep " ").
+def hexs(b: [Byte], sep: Str) -> Str {
+  parts: [Str] = []
+  for c in b {
+    parts << HEXDIGITS[(c >> 4).to_i...(c >> 4).to_i + 1] + HEXDIGITS[(c & 15).to_i...(c & 15).to_i + 1]
+  }
+  parts.join(sep)
+}
+
+# Go's test Struct, as a list of fields; the float32 and complex fields are
+# their bit patterns (alx has no float32): their bytes are the same.
+def struct_fields -> [Data] {
+  [
+    Data.I8s([0x01]),
+    Data.I16s([0x0203]),
+    Data.I32s([0x04050607]),
+    Data.I64s([0x08090a0b0c0d0e0f]),
+    Data.U8s([0x10]),
+    Data.U16s([0x1112]),
+    Data.U32s([0x13141516]),
+    Data.U64s([0x1718191a1b1c1d1e]),
+    Data.U32s([0x1f202122]),                                                                         # Float32
+    Data.F64s([math.float64frombits(0x232425262728292a)]),                                           # Float64
+    Data.U32s([0x2b2c2d2e, 0x2f303132]),                                                             # Complex64
+    Data.F64s([math.float64frombits(0x333435363738393a), math.float64frombits(0x3b3c3d3e3f404142)]), # Complex128
+    Data.U8s([0x43, 0x44, 0x45, 0x46]),                                                              # Array
+    Data.Bools([true]),
+    Data.Bools([true, false, true, false]),
+  ]
+}
+
+# Zero-valued slices of the same shapes, to read into.
+def zero_fields -> [Data] {
+  i8: [I8] = [0]
+  i16: [I16] = [0]
+  i32: [I32] = [0]
+  i64: [I64] = [0]
+  u8: [U8] = [0]
+  u16: [U16] = [0]
+  u32: [U32] = [0]
+  u64: [U64] = [0]
+  f32: [U32] = [0]
+  f64: [Float] = [0.0]
+  c64: [U32] = [0, 0]
+  c128: [Float] = [0.0, 0.0]
+  a: [U8] = [0, 0, 0, 0]
+  bo: [Bool] = [false]
+  ba: [Bool] = [false, false, false, false]
+  [Data.I8s(i8), Data.I16s(i16), Data.I32s(i32), Data.I64s(i64), Data.U8s(u8), Data.U16s(u16), Data.U32s(u32), Data.U64s(u64), Data.U32s(f32), Data.F64s(f64), Data.U32s(c64), Data.F64s(c128), Data.U8s(a), Data.Bools(bo), Data.Bools(ba)]
+}
+
+def big_bytes -> [Byte] {
+  [
+    1,
+    2, 3,
+    4, 5, 6, 7,
+    8, 9, 10, 11, 12, 13, 14, 15,
+    16,
+    17, 18,
+    19, 20, 21, 22,
+    23, 24, 25, 26, 27, 28, 29, 30,
+    31, 32, 33, 34,
+    35, 36, 37, 38, 39, 40, 41, 42,
+    43, 44, 45, 46, 47, 48, 49, 50,
+    51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66,
+    67, 68, 69, 70,
+    1,
+    1, 0, 1, 0,
+  ]
+}
+
+def little_bytes -> [Byte] {
+  [
+    1,
+    3, 2,
+    7, 6, 5, 4,
+    15, 14, 13, 12, 11, 10, 9, 8,
+    16,
+    18, 17,
+    22, 21, 20, 19,
+    30, 29, 28, 27, 26, 25, 24, 23,
+    34, 33, 32, 31,
+    42, 41, 40, 39, 38, 37, 36, 35,
+    46, 45, 44, 43, 50, 49, 48, 47,
+    58, 57, 56, 55, 54, 53, 52, 51, 66, 65, 64, 63, 62, 61, 60, 59,
+    67, 68, 69, 70,
+    1,
+    1, 0, 1, 0,
+  ]
+}
+
+# A Data's elements, printed (to compare two Datas).
+def show(d: Data) -> Str {
+  case d {
+    Bools(xs) => "#{xs}"
+    I8s(xs) => "#{xs}"
+    U8s(xs) => "#{xs}"
+    I16s(xs) => "#{xs}"
+    U16s(xs) => "#{xs}"
+    I32s(xs) => "#{xs}"
+    U32s(xs) => "#{xs}"
+    I64s(xs) => "#{xs}"
+    U64s(xs) => "#{xs}"
+    F64s(xs) => "#{xs.map { |f| math.float64bits(f) }}"
+  }
+}
+
+def shows(ds: [Data]) -> [Str] { ds.map { |d| show(d) } }
+
+# Go's encoders: write to a buffer, encode into a sized slice, append.
+def enc_write(order: ByteOrder, fields: [Data]) -> ~[Byte] {
+  buf = bytes.new_buffer([])
+  for f in fields {
+    ~write(buf, order, f)
+  }
+  buf.bytes
+}
+
+def enc_encode(order: ByteOrder, fields: [Data]) -> ~[Byte] {
+  total = 0
+  for f in fields { total += size(f) }
+  out: [Byte] = [0; total]
+  off = 0
+  for f in fields {
+    n = ~encode(out[off...out.size], order, f)
+    assert_eq n, size(f)
+    off += n
+  }
+  out
+}
+
+def enc_append(order: ByteOrder, fields: [Data]) -> ~[Byte] {
+  out: [Byte] = []
+  for f in fields {
+    out = append(out, order, f)
+  }
+  out
+}
+
+# Go's decoders: read from a reader, decode from a slice.
+def dec_read(order: ByteOrder, fields: [Data], b: [Byte]) -> ~Unit {
+  r = bytes.new_buffer(b)
+  for f in fields {
+    assert ~read(r, order, f)
+  }
+}
+
+def dec_decode(order: ByteOrder, fields: [Data], b: [Byte]) -> ~Unit {
+  off = 0
+  for f in fields {
+    n = ~decode(b[off...b.size], order, f)
+    assert_eq n, size(f)
+    off += n
+  }
+}
+
+def test_read(order: ByteOrder, b: [Byte]) -> ~Unit {
+  s1 = zero_fields
+  ~dec_read(order, s1, b)
+  assert_eq shows(s1), shows(struct_fields)
+  s2 = zero_fields
+  ~dec_decode(order, s2, b)
+  assert_eq shows(s2), shows(struct_fields)
+}
+
+def test_write(order: ByteOrder, b: [Byte]) -> ~Unit {
+  assert_eq ~enc_write(order, struct_fields), b
+  assert_eq ~enc_encode(order, struct_fields), b
+  assert_eq ~enc_append(order, struct_fields), b
+}
+
+test "LittleEndianRead" { ~test_read(ByteOrder.LittleEndian, little_bytes) }
+test "LittleEndianWrite" { ~test_write(ByteOrder.LittleEndian, little_bytes) }
+test "BigEndianRead" { ~test_read(ByteOrder.BigEndian, big_bytes) }
+test "BigEndianWrite" { ~test_write(ByteOrder.BigEndian, big_bytes) }
+
+def src_bytes -> [Byte] { [1, 2, 3, 4, 5, 6, 7, 8] }
+
+test "ReadSlice" {
+  slice: [I32] = [0, 0]
+  assert ~read(bytes.new_buffer(src_bytes), ByteOrder.BigEndian, Data.I32s(slice))
+  want: [I32] = [0x01020304, 0x05060708]
+  assert_eq slice, want
+  slice2: [I32] = [0, 0]
+  ~decode(src_bytes, ByteOrder.BigEndian, Data.I32s(slice2))
+  assert_eq slice2, want
+}
+
+test "WriteSlice" {
+  res: [I32] = [0x01020304, 0x05060708]
+  assert_eq ~enc_write(ByteOrder.BigEndian, [Data.I32s(res)]), src_bytes
+  assert_eq ~enc_encode(ByteOrder.BigEndian, [Data.I32s(res)]), src_bytes
+  assert_eq ~enc_append(ByteOrder.BigEndian, [Data.I32s(res)]), src_bytes
+}
+
+test "ReadBool" {
+  for t in [(0, false), (1, true), (2, true)] {
+    input: [Byte] = [t[0].as_u8]
+    res: [Bool] = [false]
+    ~dec_read(ByteOrder.BigEndian, [Data.Bools(res)], input)
+    assert_eq res[0], t[1]
+    res[0] = false
+    ~dec_decode(ByteOrder.BigEndian, [Data.Bools(res)], input)
+    assert_eq res[0], t[1]
+  }
+}
+
+test "ReadBoolSlice" {
+  input: [Byte] = [0, 1, 2, 255]
+  want: [Bool] = [false, true, true, true]
+  slice: [Bool] = [false, false, false, false]
+  ~dec_read(ByteOrder.BigEndian, [Data.Bools(slice)], input)
+  assert_eq slice, want
+  slice2: [Bool] = [false, false, false, false]
+  ~dec_decode(ByteOrder.BigEndian, [Data.Bools(slice2)], input)
+  assert_eq slice2, want
+}
+
+# Go's intArrays: [100] arrays of each integer type, filled with i * 0x07654321
+# (truncated), round-tripped through every encoder and decoder.
+def int_arrays(zero: Bool) -> [Data] {
+  i8: [I8] = []
+  i16: [I16] = []
+  i32: [I32] = []
+  i64: [I64] = []
+  u8: [U8] = []
+  u16: [U16] = []
+  u32: [U32] = []
+  u64: [U64] = []
+  i = 0
+  while i < 100 {
+    v = zero ? 0 : i * 0x07654321
+    i8 << v.as_i8
+    i16 << v.as_i16
+    i32 << v.as_i32
+    i64 << v
+    u8 << v.as_u8
+    u16 << v.as_u16
+    u32 << v.as_u32
+    u64 << v.as_u64
+    i += 1
+  }
+  [Data.I8s(i8), Data.I16s(i16), Data.I32s(i32), Data.I64s(i64), Data.U8s(u8), Data.U16s(u16), Data.U32s(u32), Data.U64s(u64)]
+}
+
+test "SliceRoundTrip" {
+  for enc in 0..3 {
+    for dec in 0..2 {
+      src = int_arrays(false)
+      k = 0
+      while k < src.size {
+        one = [src[k]]
+        buf = case enc {
+          0 => ~enc_write(ByteOrder.BigEndian, one)
+          1 => ~enc_encode(ByteOrder.BigEndian, one)
+          _ => ~enc_append(ByteOrder.BigEndian, one)
+        }
+        dst = [int_arrays(true)[k]]
+        if dec == 0 {
+          ~dec_read(ByteOrder.BigEndian, dst, buf)
+        } else {
+          ~dec_decode(ByteOrder.BigEndian, dst, buf)
+        }
+        assert_eq shows(dst), shows(one)
+        k += 1
+      }
+    }
+  }
+}
+
+# TestBlankFields: Go writes zeros for blank (`_`) fields and skips them on
+# reading. Field by field, a blank field is a zero-valued Data written, and
+# read into a throwaway.
+test "BlankFields" {
+  a: [U32] = [1234567890]
+  b: [Float] = [2.718281828]
+  c: [U8] = [42]
+  p0: [I32] = [0]
+  p1: [I16] = [0, 0, 0, 0]
+  p2: [U8] = [0; 7]
+  p3: [U32] = [0; 8] # struct { f [8]float32 }
+  fields = [Data.U32s(a), Data.I32s(p0), Data.F64s(b), Data.I16s(p1), Data.U8s(c), Data.U8s(p2), Data.U32s(p3)]
+  for enc in 0..3 {
+    buf = case enc {
+      0 => ~enc_write(ByteOrder.LittleEndian, fields)
+      1 => ~enc_encode(ByteOrder.LittleEndian, fields)
+      _ => ~enc_append(ByteOrder.LittleEndian, fields)
+    }
+    # Zero values were written for the blank fields.
+    probe = zero_like(fields)
+    ~dec_read(ByteOrder.LittleEndian, probe, buf)
+    assert_eq shows(probe), shows(fields)
+    assert_eq show(probe[1]), "[0]"
+  }
+}
+
+# Zero-valued copies of fields.
+def zero_like(fields: [Data]) -> [Data] {
+  out: [Data] = []
+  for f in fields {
+    n = f.count
+    out << case f {
+      Bools(_) => Data.Bools([false; n])
+      I8s(_) => {
+        z: [I8] = [0; n]
+        Data.I8s(z)
+      }
+      U8s(_) => {
+        z: [U8] = [0; n]
+        Data.U8s(z)
+      }
+      I16s(_) => {
+        z: [I16] = [0; n]
+        Data.I16s(z)
+      }
+      U16s(_) => {
+        z: [U16] = [0; n]
+        Data.U16s(z)
+      }
+      I32s(_) => {
+        z: [I32] = [0; n]
+        Data.I32s(z)
+      }
+      U32s(_) => {
+        z: [U32] = [0; n]
+        Data.U32s(z)
+      }
+      I64s(_) => {
+        z: [I64] = [0; n]
+        Data.I64s(z)
+      }
+      U64s(_) => {
+        z: [U64] = [0; n]
+        Data.U64s(z)
+      }
+      F64s(_) => Data.F64s([0.0; n])
+    }
+  }
+  out
+}
+
+test "ReadTruncated" {
+  data = "0123456789abcdef"
+  i = 0
+  while i <= data.size {
+    b1: [I32] = [0, 0, 0, 0]
+    r = read(bytes.new_buffer_string(data[0...i]), ByteOrder.LittleEndian, Data.I32s(b1))
+    if i == 0 {
+      # Go's io.EOF: nothing read.
+      assert_eq r.unwrap, false
+    } else if i == data.size {
+      assert_eq r.unwrap, true
+    } else {
+      assert_eq r.err?.message || "", "unexpected EOF"
+    }
+    # Go's struct { A, B, C, D byte; E int32; F float64 }, field by field:
+    # the end of the input after a field reads as the end (false).
+    rd = bytes.new_buffer_string(data[0...i])
+    abcd: [U8] = [0, 0, 0, 0]
+    e: [I32] = [0]
+    f: [Float] = [0.0]
+    msg = "ok"
+    for d in [Data.U8s(abcd), Data.I32s(e), Data.F64s(f)] {
+      r2 = read(rd, ByteOrder.LittleEndian, d)
+      if err = r2.err {
+        msg = err.message
+        break
+      }
+      if !r2.unwrap {
+        msg = "eof"
+        break
+      }
+    }
+    want = i == data.size ? "ok" : (i == 0 ? "eof" : (i == 4 || i == 8 ? "eof" : "unexpected EOF"))
+    assert msg == want, "i=#{i}: #{msg}"
+    i += 1
+  }
+}
+
+test "ByteOrder" {
+  buf: [Byte] = [0; 8]
+  for order in [ByteOrder.LittleEndian, ByteOrder.BigEndian] {
+    offset = 3
+    values: [U64] = [
+      0x0000000000000000,
+      0x0123456789abcdef,
+      0xfedcba9876543210,
+      0xffffffffffffffff,
+      0xaaaaaaaaaaaaaaaa,
+      math.float64bits(math.PI),
+      math.float64bits(math.E),
+    ]
+    for value in values {
+      want16 = value.as_u16
+      order.put_uint16(buf[0...2], want16)
+      assert_eq order.uint16(buf[0...2]), want16
+      buf = order.append_uint16(buf[0...offset], want16)
+      assert_eq order.uint16(buf[offset...buf.size]), want16
+      assert_eq buf.size, offset + 2
+
+      buf = buf + bs([0; 6])
+      want32 = value.as_u32
+      order.put_uint32(buf[0...4], want32)
+      assert_eq order.uint32(buf[0...4]), want32
+      buf = order.append_uint32(buf[0...offset], want32)
+      assert_eq order.uint32(buf[offset...buf.size]), want32
+      assert_eq buf.size, offset + 4
+
+      buf = buf + bs([0; 4])
+      order.put_uint64(buf[0...8], value)
+      assert_eq order.uint64(buf[0...8]), value
+      buf = order.append_uint64(buf[0...offset], value)
+      assert_eq order.uint64(buf[offset...buf.size]), value
+      assert_eq buf.size, offset + 8
+    }
+  }
+}
+
+test "NativeEndian" {
+  # The bytes of 0x12345678 in memory on a little-endian machine.
+  s: [Byte] = [0x78, 0x56, 0x34, 0x12]
+  assert_eq ByteOrder.NativeEndian.uint32(s), 0x12345678
+}
+
+test "String" {
+  assert_eq ByteOrder.LittleEndian.to_s, "LittleEndian"
+  assert_eq ByteOrder.BigEndian.to_s, "BigEndian"
+  assert_eq ByteOrder.NativeEndian.to_s, "NativeEndian"
+  assert_eq "#{ByteOrder.BigEndian}", "BigEndian"
+  assert_eq ByteOrder.LittleEndian.go_string, "binary.LittleEndian"
+  assert_eq ByteOrder.BigEndian.go_string, "binary.BigEndian"
+  assert_eq ByteOrder.NativeEndian.go_string, "binary.NativeEndian"
+}
+
+test "encode and decode need room" {
+  xs: [U32] = [1, 2]
+  small: [Byte] = [0; 7]
+  assert_eq encode(small, ByteOrder.BigEndian, Data.U32s(xs)).err?.message || "", "buffer too small"
+  assert_eq decode(small, ByteOrder.BigEndian, Data.U32s(xs)).err?.message || "", "buffer too small"
+  assert_eq size(Data.U32s(xs)), 8
+  assert_eq size(Data.Bools([true, false])), 2
+  assert_eq size(Data.F64s([])), 0
+}
+
+# ---------------------------------------------------------------- varint_test.go
+
+test "Constants" {
+  buf: [Byte] = [0; MAX_VARINT_LEN64]
+  assert_eq put_uvarint(buf, (1 << 16) - 1), MAX_VARINT_LEN16
+  assert_eq put_uvarint(buf, (1 << 32) - 1), MAX_VARINT_LEN32
+  assert_eq put_uvarint(buf, 18446744073709551615), MAX_VARINT_LEN64
+}
+
+def test_varint(x: Int) -> ~Unit {
+  buf: [Byte] = [0; MAX_VARINT_LEN64]
+  n = put_varint(buf, x)
+  r = varint(buf[0...n])
+  assert_eq r[0], x
+  assert_eq r[1], n
+  buf2 = append_varint("prefix".bytes.to_a, x)
+  assert_eq buf2, "prefix".bytes.to_a + buf[0...n]
+  y = (~read_varint(bytes.new_buffer(buf))).unwrap
+  assert_eq y, x
+}
+
+def test_uvarint(x: U64) -> ~Unit {
+  buf: [Byte] = [0; MAX_VARINT_LEN64]
+  n = put_uvarint(buf, x)
+  r = uvarint(buf[0...n])
+  assert_eq r[0], x
+  assert_eq r[1], n
+  buf2 = append_uvarint("prefix".bytes.to_a, x)
+  assert_eq buf2, "prefix".bytes.to_a + buf[0...n]
+  y = (~read_uvarint(bytes.new_buffer(buf))).unwrap
+  assert_eq y, x
+}
+
+def varint_tests -> [Int] {
+  [
+    -9223372036854775807 - 1,
+    -9223372036854775807,
+    -1,
+    0,
+    1,
+    2,
+    10,
+    20,
+    63,
+    64,
+    65,
+    127,
+    128,
+    129,
+    255,
+    256,
+    257,
+    9223372036854775807,
+  ]
+}
+
+test "Varint" {
+  for x in varint_tests {
+    ~test_varint(x)
+    ~test_varint(0 -% x)
+  }
+  x = 7
+  while x != 0 {
+    ~test_varint(x)
+    ~test_varint(0 -% x)
+    x = x << 1
+  }
+}
+
+test "Uvarint" {
+  for x in varint_tests {
+    ~test_uvarint(x.as_u64)
+  }
+  x: U64 = 7
+  while x != 0 {
+    ~test_uvarint(x)
+    x = x << 1
+  }
+}
+
+test "BufferTooSmall" {
+  full: [Byte] = [0x80, 0x80, 0x80, 0x80]
+  i = 0
+  while i <= full.size {
+    buf = full[0...i]
+    r = uvarint(buf)
+    assert_eq r, (0.as_u64, 0)
+    r2 = read_uvarint(bytes.new_buffer(buf))
+    if i == 0 {
+      # Go's io.EOF
+      assert r2.ok? && r2.unwrap.none?
+    } else {
+      assert_eq r2.err?.message || "", "unexpected EOF"
+    }
+    i += 1
+  }
+}
+
+test "BufferTooBigWithOverflow" {
+  b1000: [Byte] = [0xff; 1000]
+  b1000[999] = 0
+  max_minus_40: U64 = 18446744073709551615 - 40
+  tests = [
+    ("invalid: 1000 bytes", b1000, -11, 0.as_u64),
+    ("valid: math.MaxUint64-40", bs([0xd7, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x01]), 10, max_minus_40),
+    ("invalid: with more than MaxVarintLen64 bytes", bs([0xd7, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x01]), -11, 0.as_u64),
+    ("invalid: 10th byte", bs([0xd7, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x7f]), -10, 0.as_u64),
+  ]
+  for tt in tests {
+    r = uvarint(tt[1])
+    assert r[1] == tt[2], "#{tt[0]}: n = #{r[1]}"
+    assert r[0] == tt[3], "#{tt[0]}: value = #{r[0]}"
+  }
+}
+
+def test_overflow(buf: [Byte], n0: Int) {
+  r = uvarint(buf)
+  assert_eq r, (0.as_u64, n0)
+  rd = bytes.new_buffer(buf)
+  before = rd.size
+  r2 = read_uvarint(rd)
+  assert_eq r2.err?.message || "", "binary: varint overflows a 64-bit integer"
+  assert before - rd.size <= MAX_VARINT_LEN64, "read more than MaxVarintLen64 bytes"
+}
+
+test "Overflow" {
+  test_overflow(bs([0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x2]), -10)
+  test_overflow(bs([0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x1, 0, 0]), -11)
+  test_overflow(bs([0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]), -11) # 11 bytes, should overflow
+}
+
+test "NonCanonicalZero" {
+  assert_eq uvarint(bs([0x80, 0x80, 0x80, 0])), (0.as_u64, 4)
+}
+
+# Not in Go's tests: generic readers and writers.
+test "read and write through io values" {
+  buf = bytes.new_buffer([])
+  w: io.Writer = buf
+  xs: [U16] = [0xbeef, 0xcafe]
+  ~write(w, ByteOrder.BigEndian, Data.U16s(xs))
+  assert_eq hexs(buf.bytes, ""), "beefcafe"
+  r: io.Reader = buf
+  ys: [U16] = [0, 0]
+  assert ~read(r, ByteOrder.LittleEndian, Data.U16s(ys))
+  want: [U16] = [0xefbe, 0xfeca]
+  assert_eq ys, want
+  assert !~read(r, ByteOrder.LittleEndian, Data.U16s(ys))
+}
+
+# ---------------------------------------------------------------- examples
+
+example "Write" {
+  buf = bytes.new_buffer([])
+  ~write(buf, ByteOrder.LittleEndian, Data.F64s([math.PI]))
+  puts hexs(buf.bytes, " ")
+} outputs "18 2d 44 54 fb 21 09 40"
+
+example "Write_multi" {
+  buf = bytes.new_buffer([])
+  a: [U16] = [61374]
+  b: [I8] = [-54]
+  c: [U8] = [254]
+  for v in [Data.U16s(a), Data.I8s(b), Data.U8s(c)] {
+    ~write(buf, ByteOrder.LittleEndian, v)
+  }
+  puts hexs(buf.bytes, "")
+} outputs "beefcafe"
+
+example "Read" {
+  pi = [0.0]
+  b: [Byte] = [0x18, 0x2d, 0x44, 0x54, 0xfb, 0x21, 0x09, 0x40]
+  ~read(bytes.new_buffer(b), ByteOrder.LittleEndian, Data.F64s(pi))
+  puts pi[0]
+} outputs "3.141592653589793"
+
+example "Read_multi" {
+  b: [Byte] = [0x18, 0x2d, 0x44, 0x54, 0xfb, 0x21, 0x09, 0x40, 0xff, 0x01, 0x02, 0x03, 0xbe, 0xef]
+  r = bytes.new_buffer(b)
+  # struct { PI float64; Uate uint8; Mine [3]byte; Too uint16 }, field by field
+  pi = [0.0]
+  uate: [U8] = [0]
+  mine: [U8] = [0, 0, 0]
+  too: [U16] = [0]
+  for d in [Data.F64s(pi), Data.U8s(uate), Data.U8s(mine), Data.U16s(too)] {
+    ~read(r, ByteOrder.LittleEndian, d)
+  }
+  puts pi[0]
+  puts uate[0]
+  puts hexs(mine, " ")
+  puts too[0]
+} outputs "3.141592653589793\n255\n01 02 03\n61374"
+
+example "ByteOrder_put" {
+  b: [Byte] = [0; 4]
+  ByteOrder.LittleEndian.put_uint16(b[0...4], 0x03e8)
+  ByteOrder.LittleEndian.put_uint16(b[2...4], 0x07d0)
+  puts hexs(b, " ")
+} outputs "e8 03 d0 07"
+
+example "ByteOrder_get" {
+  b: [Byte] = [0xe8, 0x03, 0xd0, 0x07]
+  x1 = ByteOrder.LittleEndian.uint16(b[0...4])
+  x2 = ByteOrder.LittleEndian.uint16(b[2...4])
+  puts "0x#{hexs(bs([(x1 >> 8).as_u8, x1.as_u8]), "")} 0x#{hexs(bs([(x2 >> 8).as_u8, x2.as_u8]), "")}"
+} outputs "0x03e8 0x07d0"
+
+example "PutUvarint" {
+  buf: [Byte] = [0; MAX_VARINT_LEN64]
+  xs: [U64] = [1, 2, 127, 128, 255, 256]
+  for x in xs {
+    n = put_uvarint(buf, x)
+    puts hexs(buf[0...n], "")
+  }
+} outputs "01\n02\n7f\n8001\nff01\n8002"
+
+example "PutVarint" {
+  buf: [Byte] = [0; MAX_VARINT_LEN64]
+  for x in [-65, -64, -2, -1, 0, 1, 2, 63, 64] {
+    n = put_varint(buf, x)
+    puts hexs(buf[0...n], "")
+  }
+} outputs "8101\n7f\n03\n01\n00\n02\n04\n7e\n8001"
+
+example "Uvarint" {
+  inputs = [bs([0x01]), bs([0x02]), bs([0x7f]), bs([0x80, 0x01]), bs([0xff, 0x01]), bs([0x80, 0x02])]
+  for b in inputs {
+    r = uvarint(b)
+    puts "Uvarint did not consume all of in" if r[1] != b.size
+    puts r[0]
+  }
+} outputs "1\n2\n127\n128\n255\n256"
+
+example "Varint" {
+  inputs = [bs([0x81, 0x01]), bs([0x7f]), bs([0x03]), bs([0x01]), bs([0x00]), bs([0x02]), bs([0x04]), bs([0x7e]), bs([0x80, 0x01])]
+  for b in inputs {
+    r = varint(b)
+    puts "Varint did not consume all of in" if r[1] != b.size
+    puts r[0]
+  }
+} outputs "-65\n-64\n-2\n-1\n0\n1\n2\n63\n64"

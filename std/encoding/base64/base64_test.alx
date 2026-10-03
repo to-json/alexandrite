@@ -1,0 +1,440 @@
+# Go's encoding/base64 tests (base64_test.go, example_test.go), translated.
+import "bytes"
+import "io"
+import "strconv"
+import "strings"
+
+def b(s: Str) -> [Byte] { s.bytes.to_a }
+def s(x: [Byte]) -> Str { Str.from_bytes(x) }
+def bs(xs: [Byte]) -> [Byte] { xs }
+
+# Go's pairs: (decoded, encoded).
+def pairs -> [([Byte], Str)] {
+  [
+    # RFC 3548 examples
+    (bs([0x14, 0xfb, 0x9c, 0x03, 0xd9, 0x7e]), "FPucA9l+"),
+    (bs([0x14, 0xfb, 0x9c, 0x03, 0xd9]), "FPucA9k="),
+    (bs([0x14, 0xfb, 0x9c, 0x03]), "FPucAw=="),
+    # RFC 4648 examples
+    (b(""), ""),
+    (b("f"), "Zg=="),
+    (b("fo"), "Zm8="),
+    (b("foo"), "Zm9v"),
+    (b("foob"), "Zm9vYg=="),
+    (b("fooba"), "Zm9vYmE="),
+    (b("foobar"), "Zm9vYmFy"),
+    # Wikipedia examples
+    (b("sure."), "c3VyZS4="),
+    (b("sure"), "c3VyZQ=="),
+    (b("sur"), "c3Vy"),
+    (b("su"), "c3U="),
+    (b("leasure."), "bGVhc3VyZS4="),
+    (b("easure."), "ZWFzdXJlLg=="),
+    (b("asure."), "YXN1cmUu"),
+    (b("sure."), "c3VyZS4="),
+  ]
+}
+
+ENCODE_STD = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+
+def funny_encoding -> Encoding { new_encoding(ENCODE_STD).with_padding(64) }
+
+# The reference converters of Go's encodingTests: 0 std, 1 url, 2 raw,
+# 3 raw url, 4 funny.
+def conv(kind: Int, r: Str) -> Str {
+  case kind {
+    1 => strings.replace_all(strings.replace_all(r, "+", "-"), "/", "_")
+    2 => strings.trim_right(r, "=")
+    3 => strings.trim_right(conv(1, r), "=")
+    4 => strings.replace_all(r, "=", "@")
+    _ => r
+  }
+}
+
+def encoding_tests -> [(Encoding, Int)] {
+  [
+    (std_encoding, 0),
+    (url_encoding, 1),
+    (raw_std_encoding, 2),
+    (raw_url_encoding, 3),
+    (funny_encoding, 4),
+    (std_encoding.strict, 0),
+    (url_encoding.strict, 1),
+    (raw_std_encoding.strict, 2),
+    (raw_url_encoding.strict, 3),
+    (funny_encoding.strict, 4),
+  ]
+}
+
+BIG_DECODED = "Twas brillig, and the slithy toves"
+BIG_ENCODED = "VHdhcyBicmlsbGlnLCBhbmQgdGhlIHNsaXRoeSB0b3Zlcw=="
+
+# A reader returning scripted results: at most n bytes of the source, then
+# failing if the step says so (Go's faultInjectReader).
+struct FaultReader {
+  st: [(Str, [(Int, Bool)], Int)]
+
+  def read!(p: [Byte]) -> ~Int {
+    src = st[0][0]
+    steps = st[0][1]
+    k = st[0][2]
+    fail "test exhausted its script" if k >= steps.size
+    step = steps[k]
+    m = step[0]
+    m = p.size if m > p.size
+    m = src.size if m > src.size
+    copy(p, b(src[0...m]))
+    self.st[0] = (src[m...src.size], steps, k + 1)
+    # Go's reader returns data and the error together; here the error comes
+    # on the next call.
+    if step[1] && m == 0 {
+      fail "my error"
+    }
+    if step[1] {
+      self.st[0] = (src[m...src.size], steps + [(0, true)], k + 1)
+    }
+    m
+  }
+}
+
+# A reader fed with chunks (like an io.Pipe): each read returns at most the
+# rest of the current chunk.
+struct ChunkReader {
+  st: [([Str], Int, Int)]
+
+  def read!(p: [Byte]) -> Int {
+    chunks = st[0][0]
+    i = st[0][1]
+    off = st[0][2]
+    return 0 if i >= chunks.size
+    c = chunks[i]
+    n = c.size - off
+    n = p.size if p.size < n
+    copy(p, b(c[off...off + n]))
+    if off + n == c.size {
+      self.st[0] = (chunks, i + 1, 0)
+    } else {
+      self.st[0] = (chunks, i, off + n)
+    }
+    n
+  }
+}
+
+def chunk_reader(chunks: [Str]) -> ChunkReader { ChunkReader.new(st: [(chunks, 0, 0)]) }
+
+test "Encode" {
+  for p in pairs {
+    for tt in encoding_tests {
+      assert_eq tt[0].encode_to_string(p[0]), conv(tt[1], p[1])
+      assert_eq s(tt[0].append_encode(b("lead"), p[0])), "lead" + conv(tt[1], p[1])
+    }
+  }
+}
+
+test "Encoder" {
+  for p in pairs {
+    bb = bytes.new_buffer([])
+    enc = new_encoder(std_encoding, bb)
+    ~enc.write!(p[0])
+    ~enc.close!
+    assert_eq bb.to_s, p[1]
+  }
+}
+
+test "EncoderBuffering" {
+  input = b(BIG_DECODED)
+  size = 1
+  while size <= 12 {
+    bb = bytes.new_buffer([])
+    enc = new_encoder(std_encoding, bb)
+    pos = 0
+    while pos < input.size {
+      e = pos + size
+      e = input.size if e > input.size
+      n = ~enc.write!(input[pos...e])
+      assert_eq n, e - pos
+      pos += size
+    }
+    ~enc.close!
+    assert_eq bb.to_s, BIG_ENCODED
+    size += 1
+  }
+}
+
+test "Decode" {
+  for p in pairs {
+    for tt in encoding_tests {
+      enc = tt[0]
+      encoded = conv(tt[1], p[1])
+      dbuf: [Byte] = [0; enc.decoded_len(encoded.size)]
+      count = ~enc.decode(dbuf, b(encoded))
+      assert_eq count, p[0].size
+      assert_eq dbuf[0...count], p[0]
+      assert_eq ~enc.decode_string(encoded), p[0]
+      dst = ~enc.append_decode(b("lead"), b(encoded))
+      assert_eq dst, b("lead") + p[0]
+      dst2 = ~enc.append_decode([], b(encoded))
+      assert_eq dst2, p[0]
+    }
+  }
+}
+
+test "Decoder" {
+  for p in pairs {
+    dec = new_decoder(std_encoding, bytes.new_buffer_string(p[1]))
+    dbuf: [Byte] = [0; std_encoding.decoded_len(p[1].size)]
+    count = ~dec.read!(dbuf)
+    assert_eq count, p[0].size
+    assert_eq dbuf[0...count], p[0]
+    # Then the end of the input (Go's io.EOF).
+    assert_eq ~dec.read!(dbuf), 0 if dbuf.size > 0
+  }
+}
+
+test "DecoderBuffering" {
+  size = 1
+  while size <= 12 {
+    dec = new_decoder(std_encoding, bytes.new_buffer_string(BIG_ENCODED))
+    buf: [Byte] = [0; BIG_DECODED.size + 12]
+    total = 0
+    loop {
+      break if total >= BIG_DECODED.size
+      n = ~dec.read!(buf[total...total + size])
+      break if n == 0
+      total += n
+    }
+    assert_eq s(buf[0...total]), BIG_DECODED
+    size += 1
+  }
+}
+
+test "DecodeCorrupt" {
+  cases = [
+    ("", -1),
+    ("\n", -1),
+    ("AAA=\n", -1),
+    ("AAAA\n", -1),
+    ("!!!!", 0),
+    ("====", 0),
+    ("x===", 1),
+    ("=AAA", 0),
+    ("A=AA", 1),
+    ("AA=A", 2),
+    ("AA==A", 4),
+    ("AAA=AAAA", 4),
+    ("AAAAA", 4),
+    ("AAAAAA", 4),
+    ("A=", 1),
+    ("A==", 1),
+    ("AA=", 3),
+    ("AA==", -1),
+    ("AAA=", -1),
+    ("AAAA", -1),
+    ("AAAAAA=", 7),
+    ("YWJjZA=====", 8),
+    ("A!\n", 1),
+    ("A=\n", 1),
+  ]
+  for tc in cases {
+    dbuf: [Byte] = [0; std_encoding.decoded_len(tc[0].size)]
+    r = std_encoding.decode(dbuf, b(tc[0]))
+    if tc[1] == -1 {
+      assert r.ok?, "wrongly detected corruption in #{tc[0]}"
+      next
+    }
+    if e = r.err {
+      case e {
+        CorruptInput(off) => assert_eq off, tc[1]
+        _ => assert false, "unexpected error #{e}"
+      }
+    } else {
+      assert false, "failed to detect corruption in #{tc[0]}"
+    }
+    assert_eq r.err?.message || "", "illegal base64 data at input byte #{tc[1]}"
+  }
+}
+
+test "DecodeBounds" {
+  buf: [Byte] = [0; 32]
+  enc = std_encoding.encode_to_string(buf)
+  n = ~std_encoding.decode(buf, b(enc))
+  assert_eq n, buf.size
+}
+
+test "EncodedLen" {
+  tests = [
+    (raw_std_encoding, 0, 0),
+    (raw_std_encoding, 1, 2),
+    (raw_std_encoding, 2, 3),
+    (raw_std_encoding, 3, 4),
+    (raw_std_encoding, 7, 10),
+    (std_encoding, 0, 0),
+    (std_encoding, 1, 4),
+    (std_encoding, 2, 4),
+    (std_encoding, 3, 4),
+    (std_encoding, 4, 8),
+    (std_encoding, 7, 12),
+    # overflow
+    (raw_std_encoding, (9223372036854775807 - 5) / 8 + 1, 1537228672809129302),
+    (raw_std_encoding, 9223372036854775807 / 4 * 3 + 2, 9223372036854775807),
+  ]
+  for tt in tests {
+    assert_eq tt[0].encoded_len(tt[1]), tt[2]
+  }
+}
+
+test "DecodedLen" {
+  tests = [
+    (raw_std_encoding, 0, 0),
+    (raw_std_encoding, 2, 1),
+    (raw_std_encoding, 3, 2),
+    (raw_std_encoding, 4, 3),
+    (raw_std_encoding, 10, 7),
+    (std_encoding, 0, 0),
+    (std_encoding, 4, 3),
+    (std_encoding, 8, 6),
+    # overflow
+    (raw_std_encoding, 9223372036854775807 / 6 + 1, 1152921504606846976),
+    (raw_std_encoding, 9223372036854775807, 6917529027641081855),
+  ]
+  for tt in tests {
+    assert_eq tt[0].decoded_len(tt[1]), tt[2]
+  }
+}
+
+test "Big" {
+  n = 3 * 1000 + 1
+  alpha = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+  raw: [Byte] = [0; n]
+  i = 0
+  while i < n {
+    raw[i] = alpha[i % alpha.size]
+    i += 1
+  }
+  encoded = bytes.new_buffer([])
+  w = new_encoder(std_encoding, encoded)
+  assert_eq ~w.write!(raw), n
+  ~w.close!
+  decoded = ~io.read_all(new_decoder(std_encoding, encoded))
+  assert decoded == raw
+}
+
+test "NewLineCharacters" {
+  examples = [
+    "c3VyZQ==",
+    "c3VyZQ==\r",
+    "c3VyZQ==\n",
+    "c3VyZQ==\r\n",
+    "c3VyZ\r\nQ==",
+    "c3V\ryZ\nQ==",
+    "c3V\nyZ\rQ==",
+    "c3VyZ\nQ==",
+    "c3VyZQ\n==",
+    "c3VyZQ=\n=",
+    "c3VyZQ=\r\n\r\n=",
+  ]
+  for e in examples {
+    assert_eq s(~std_encoding.decode_string(e)), "sure"
+  }
+}
+
+test "DecoderIssue3577" {
+  r = FaultReader.new(st: [(BIG_ENCODED, [(5, false), (10, true), (0, true)], 0)])
+  res = io.read_all(new_decoder(std_encoding, r))
+  assert_eq res.err?.message || "", "my error"
+}
+
+test "DecoderIssue4779" {
+  encoded = "CP/EAT8AAAEF\nAQEBAQEBAAAAAAAAAAMAAQIEBQYHCAkKCwEAAQUBAQEBAQEAAAAAAAAAAQACAwQFBgcICQoLEAAB\nBAEDAgQCBQcGCAUDDDMBAAIRAwQhEjEFQVFhEyJxgTIGFJGhsUIjJBVSwWIzNHKC0UMHJZJT8OHx\nY3M1FqKygyZEk1RkRcKjdDYX0lXiZfKzhMPTdePzRieUpIW0lcTU5PSltcXV5fVWZnaGlqa2xtbm\n9jdHV2d3h5ent8fX5/cRAAICAQIEBAMEBQYHBwYFNQEAAhEDITESBEFRYXEiEwUygZEUobFCI8FS\n0fAzJGLhcoKSQ1MVY3M08SUGFqKygwcmNcLSRJNUoxdkRVU2dGXi8rOEw9N14/NGlKSFtJXE1OT0\npbXF1eX1VmZ2hpamtsbW5vYnN0dXZ3eHl6e3x//aAAwDAQACEQMRAD8A9VSSSSUpJJJJSkkkJ+Tj\n1kiy1jCJJDnAcCTykpKkuQ6p/jN6FgmxlNduXawwAzaGH+V6jn/R/wCt71zdn+N/qL3kVYFNYB4N\nji6PDVjWpKp9TSXnvTf8bFNjg3qOEa2n6VlLpj/rT/pf567DpX1i6L1hs9Py67X8mqdtg/rUWbbf\n+gkp0kkkklKSSSSUpJJJJT//0PVUkkklKVLq3WMDpGI7KzrNjADtYNXvI/Mqr/Pd/q9W3vaxjnvM\nNaCXE9gNSvGPrf8AWS3qmba5jjsJhoB0DAf0NDf6sevf+/lf8Hj0JJATfWT6/dV6oXU1uOLQeKKn\nEQP+Hubtfe/+R7Mf/g7f5xcocp++Z11JMCJPgFBxOg7/AOuqDx8I/ikpkXkmSdU8mJIJA/O8EMAy\nj+mSARB/17pKVXYWHXjsj7yIex0PadzXMO1zT5KHoNA3HT8ietoGhgjsfA+CSnvvqh/jJtqsrwOv\n2b6NGNzXfTYexzJ+nU7/ALkf4P8Awv6P9KvTQQ4AgyDqCF85Pho3CTB7eHwXoH+LT65uZbX9X+o2\nbqbPb06551Y4\n"
+  encoded_short = strings.replace_all(encoded, "\n", "")
+  res1 = ~io.read_all(new_decoder(std_encoding, bytes.new_buffer_string(encoded)))
+  res2 = ~io.read_all(new_decoder(std_encoding, bytes.new_buffer_string(encoded_short)))
+  assert res1 == res2, "decoded results not equal"
+  assert res1.size > 0
+}
+
+test "DecoderIssue7733" {
+  r = std_encoding.decode_string("YWJjZA=====")
+  assert_eq r.err?.message || "", "illegal base64 data at input byte 8"
+  # Go also returns the "abcd" decoded before the error; decode leaves it in dst.
+  dst: [Byte] = [0; 16]
+  assert std_encoding.decode(dst, b("YWJjZA=====")).err?
+  assert_eq s(dst[0...4]), "abcd"
+}
+
+test "DecoderIssue15656" {
+  r = std_encoding.strict.decode_string("WvLTlMrX9NpYDQlEIFlnDB==")
+  assert_eq r.err?.message || "", "illegal base64 data at input byte 22"
+  assert std_encoding.strict.decode_string("WvLTlMrX9NpYDQlEIFlnDA==").ok?
+  assert std_encoding.decode_string("WvLTlMrX9NpYDQlEIFlnDB==").ok?
+}
+
+test "DecoderRaw" {
+  source = "AAAAAA"
+  want: [Byte] = [0, 0, 0, 0]
+  # Direct.
+  assert_eq ~raw_url_encoding.decode_string(source), want
+  # Through a reader. Used to fail.
+  assert_eq ~io.read_all(new_decoder(raw_url_encoding, bytes.new_buffer_string(source))), want
+  # Should work with padding.
+  assert_eq ~io.read_all(new_decoder(url_encoding, bytes.new_buffer_string(source + "=="))), want
+}
+
+# Not in Go's tests: the panics' preconditions, padding, a truncated stream.
+test "with_padding and strict are copies" {
+  e = std_encoding
+  r = e.with_padding(NO_PADDING)
+  assert_eq e.padding, 61
+  assert_eq r.padding, -1
+  assert_eq e.encode_to_string(b("f")), "Zg=="
+  assert_eq r.encode_to_string(b("f")), "Zg"
+  assert_eq e.with_padding(42).encode_to_string(b("f")), "Zg**"
+}
+
+test "truncated stream" {
+  r = io.read_all(new_decoder(std_encoding, bytes.new_buffer_string("Zm9vYm")))
+  assert_eq r.err?.message || "", "unexpected EOF"
+  r2 = io.read_all(new_decoder(std_encoding, bytes.new_buffer_string("Zm9v!mFy")))
+  assert_eq r2.err?.message || "", "illegal base64 data at input byte 4"
+}
+
+example "Example" {
+  msg = "Hello, 世界"
+  encoded = std_encoding.encode_to_string(b(msg))
+  puts encoded
+  decoded = ~std_encoding.decode_string(encoded)
+  puts s(decoded)
+} outputs "SGVsbG8sIOS4lueVjA==\nHello, 世界"
+
+example "Encoding_EncodeToString" {
+  puts std_encoding.encode_to_string(b("any + old & data"))
+} outputs "YW55ICsgb2xkICYgZGF0YQ=="
+
+example "Encoding_Encode" {
+  data = b("Hello, world!")
+  dst: [Byte] = [0; std_encoding.encoded_len(data.size)]
+  std_encoding.encode(dst, data)
+  puts s(dst)
+} outputs "SGVsbG8sIHdvcmxkIQ=="
+
+example "Encoding_DecodeString" {
+  str = "c29tZSBkYXRhIHdpdGggACBhbmQg77u/"
+  data = ~std_encoding.decode_string(str)
+  puts strconv.quote(s(data))
+} outputs "\"some data with \\x00 and \\ufeff\""
+
+example "Encoding_Decode" {
+  str = "SGVsbG8sIHdvcmxkIQ=="
+  dst: [Byte] = [0; std_encoding.decoded_len(str.size)]
+  n = ~std_encoding.decode(dst, b(str))
+  puts s(dst[0...n])
+} outputs "Hello, world!"
+
+example "NewEncoder" {
+  out = bytes.new_buffer([])
+  enc = new_encoder(std_encoding, out)
+  ~enc.write!(b("foo\x00bar"))
+  # Must close the encoder when finished to flush any partial blocks.
+  ~enc.close!
+  puts out.to_s
+} outputs "Zm9vAGJhcg=="

@@ -1,0 +1,577 @@
+#![overflow(wrap)]
+# Package binary: Go's encoding/binary — translation between numbers and
+# byte sequences, and the encoding and decoding of varints.
+#
+#   Go                                        alx
+#   binary.LittleEndian / BigEndian / NativeEndian
+#                                             ByteOrder.LittleEndian / BigEndian / NativeEndian
+#   order.Uint16(b) / Uint32 / Uint64         order.uint16(b) -> U16 / uint32 / uint64
+#   order.PutUint16(b, v) / PutUint32 / ...   order.put_uint16(b, v) / put_uint32 / put_uint64
+#   order.AppendUint16(b, v) / ...            order.append_uint16(b, v) -> [Byte] / ...
+#   order.String() / GoString()               order.to_s / order.go_string
+#   ByteOrder, AppendByteOrder (interfaces)   ByteOrder (an enum with all the methods)
+#   Read(r, order, data) error                read(r, order, data: Data) -> ~Bool
+#   Write(w, order, data) error               write(w, order, data: Data) -> ~Unit
+#   Encode(buf, order, data) (int, error)     encode(buf, order, data: Data) -> ~Int<BinaryError>
+#   Decode(buf, order, data) (int, error)     decode(buf, order, data: Data) -> ~Int<BinaryError>
+#   Append(buf, order, data) ([]byte, error)  append(buf, order, data: Data) -> [Byte]
+#   Size(v) int                               size(data: Data) -> Int
+#   MaxVarintLen16 / 32 / 64                  MAX_VARINT_LEN16 / 32 / 64
+#   PutUvarint(buf, x) / PutVarint(buf, x)    put_uvarint(buf, x: U64) / put_varint(buf, x: Int) -> Int
+#   AppendUvarint / AppendVarint              append_uvarint(buf, x) / append_varint(buf, x) -> [Byte]
+#   Uvarint(buf) (uint64, int)                uvarint(buf) -> (U64, Int)
+#   Varint(buf) (int64, int)                  varint(buf) -> (Int, Int)
+#   ReadUvarint(r) (uint64, error)            read_uvarint(r) -> ~U64?
+#   ReadVarint(r) (int64, error)              read_varint(r) -> ~Int?
+#
+# Read, Write and their buffer forms take a `Data`: a slice of fixed-size
+# values, tagged with its element type (Go's `data any`, closed over the
+# types it accepts):
+#
+#   xs: [U32] = [0; 4]
+#   ok = ~binary.read(r, binary.ByteOrder.BigEndian, binary.Data.U32s(xs))  # fills xs
+#   ~binary.write(w, binary.ByteOrder.LittleEndian, binary.Data.F64s([math.PI]))
+#
+# Slices share storage (as Go's do), so `read` / `decode` fill the slice you
+# pass; a single value is a one-element slice.
+#
+# Differences from Go:
+#  - Go's Read/Write of a struct, a pointer, or an array walk the value with
+#    reflection, which alx doesn't have. Read or write such a value field by
+#    field (as the struct tests in binary_test.alx do): each fixed-size field
+#    is a Data, in declaration order, and Go's blank (`_`) fields are zero
+#    bytes. The natural replacement is a compile-time derive in the style of
+#    `#[derive(Json)]` (compiler/src/derive.rs), writing `binary_size`,
+#    `append_binary(order, buf)` and `decode_binary(order, buf)` for a struct
+#    of fixed-size fields; it doesn't exist yet.
+#  - There is no float32 or complex type in alx, so no F32s / C64s / C128s
+#    (write a float32's bits as a U32). Int is I64, so an [Int] is I64s (Go
+#    rejects its platform-sized int).
+#  - read returns false, having read nothing, when the input is already at
+#    its end (Go's io.EOF; in alx the end of input isn't an error), and
+#    fails with io.StreamError.UnexpectedEof when it ends part way.
+#  - read_uvarint / read_varint take any byte reader (a `read_byte!` returning
+#    Byte? or ~Byte?, as bytes.Buffer and bufio.Reader have). They are none
+#    when the input ends before the first byte (Go's io.EOF), and fail with
+#    UnexpectedEof part way, or BinaryError.Overflow. Go also returns the
+#    partial value with errOverflow; alx returns only the error.
+#  - A ByteOrder is an enum, not three types behind two interfaces: one
+#    value carries both the get/put and the append methods.
+#  - NativeEndian is little-endian: every target alx supports is.
+#  - The functions taking a reader or writer are generic over it (any
+#    `read!` / `write!` works, including a Decoder wrapping an io.Reader).
+
+import "io"
+
+pub MAX_VARINT_LEN16 = 3
+pub MAX_VARINT_LEN32 = 5
+pub MAX_VARINT_LEN64 = 10
+
+pub error BinaryError {
+  # A varint doesn't fit in 64 bits.
+  Overflow
+  # A buffer is smaller than the data (encode / decode).
+  BufferTooSmall
+
+  def message -> Str {
+    case self {
+      Overflow => "binary: varint overflows a 64-bit integer"
+      BufferTooSmall => "buffer too small"
+    }
+  }
+}
+
+# How a multi-byte number is laid out in bytes.
+pub enum ByteOrder {
+  LittleEndian
+  BigEndian
+  # The machine's own order: little-endian on every alx target.
+  NativeEndian
+
+  def big? -> Bool {
+    case self {
+      BigEndian => true
+      _ => false
+    }
+  }
+
+  # The 16-bit number in b[0...2]. Panics if b is shorter.
+  pub def uint16(b: [Byte]) -> U16 {
+    return (b[1].to_u16) | (b[0].to_u16 << 8) if big?
+    (b[0].to_u16) | (b[1].to_u16 << 8)
+  }
+
+  # Writes v into b[0...2]. Panics if b is shorter.
+  pub def put_uint16(b: [Byte], v: U16) {
+    if big? {
+      b[1] = v.as_u8
+      b[0] = (v >> 8).as_u8
+    } else {
+      b[1] = (v >> 8).as_u8
+      b[0] = v.as_u8
+    }
+  }
+
+  # b with v appended.
+  pub def append_uint16(b: [Byte], v: U16) -> [Byte] {
+    out = b
+    if big? {
+      out << (v >> 8).as_u8
+      out << v.as_u8
+    } else {
+      out << v.as_u8
+      out << (v >> 8).as_u8
+    }
+    out
+  }
+
+  # The 32-bit number in b[0...4]. Panics if b is shorter.
+  pub def uint32(b: [Byte]) -> U32 {
+    x = b[3] # early bounds check
+    if big? {
+      return x.to_u32 | (b[2].to_u32 << 8) | (b[1].to_u32 << 16) | (b[0].to_u32 << 24)
+    }
+    b[0].to_u32 | (b[1].to_u32 << 8) | (b[2].to_u32 << 16) | (x.to_u32 << 24)
+  }
+
+  # Writes v into b[0...4]. Panics if b is shorter.
+  pub def put_uint32(b: [Byte], v: U32) {
+    b[3] = 0 # early bounds check
+    i = 0
+    while i < 4 {
+      byte = (v >> (8 * i).as_u32).as_u8
+      if big? {
+        b[3 - i] = byte
+      } else {
+        b[i] = byte
+      }
+      i += 1
+    }
+  }
+
+  # b with v appended.
+  pub def append_uint32(b: [Byte], v: U32) -> [Byte] {
+    out = b
+    i = 0
+    while i < 4 {
+      sh = big? ? 8 * (3 - i) : 8 * i
+      out << (v >> sh.as_u32).as_u8
+      i += 1
+    }
+    out
+  }
+
+  # The 64-bit number in b[0...8]. Panics if b is shorter.
+  pub def uint64(b: [Byte]) -> U64 {
+    _x = b[7] # early bounds check
+    v: U64 = 0
+    i = 0
+    while i < 8 {
+      byte = big? ? b[7 - i] : b[i]
+      v |= byte.to_u64 << (8 * i).as_u64
+      i += 1
+    }
+    v
+  }
+
+  # Writes v into b[0...8]. Panics if b is shorter.
+  pub def put_uint64(b: [Byte], v: U64) {
+    b[7] = 0 # early bounds check
+    i = 0
+    while i < 8 {
+      byte = (v >> (8 * i).as_u64).as_u8
+      if big? {
+        b[7 - i] = byte
+      } else {
+        b[i] = byte
+      }
+      i += 1
+    }
+  }
+
+  # b with v appended.
+  pub def append_uint64(b: [Byte], v: U64) -> [Byte] {
+    out = b
+    i = 0
+    while i < 8 {
+      sh = big? ? 8 * (7 - i) : 8 * i
+      out << (v >> sh.as_u64).as_u8
+      i += 1
+    }
+    out
+  }
+
+  # "LittleEndian", "BigEndian" or "NativeEndian" (Go's String).
+  pub def to_s -> Str {
+    case self {
+      LittleEndian => "LittleEndian"
+      BigEndian => "BigEndian"
+      NativeEndian => "NativeEndian"
+    }
+  }
+
+  # "binary.LittleEndian", ... (Go's GoString).
+  pub def go_string -> Str { "binary." + to_s }
+}
+
+# A slice of fixed-size values for read / write / encode / decode / append
+# (Go's `data any`). Bools take one byte each: 1 or 0 written, non-zero is
+# true when read.
+pub enum Data {
+  Bools([Bool])
+  I8s([I8])
+  U8s([U8])
+  I16s([I16])
+  U16s([U16])
+  I32s([I32])
+  U32s([U32])
+  I64s([I64])
+  U64s([U64])
+  F64s([Float])
+
+  # Bytes per element.
+  def elem_size -> Int {
+    case self {
+      Bools(_) => 1
+      I8s(_) => 1
+      U8s(_) => 1
+      I16s(_) => 2
+      U16s(_) => 2
+      I32s(_) => 4
+      U32s(_) => 4
+      I64s(_) => 8
+      U64s(_) => 8
+      F64s(_) => 8
+    }
+  }
+
+  # Elements.
+  def count -> Int {
+    case self {
+      Bools(xs) => xs.size
+      I8s(xs) => xs.size
+      U8s(xs) => xs.size
+      I16s(xs) => xs.size
+      U16s(xs) => xs.size
+      I32s(xs) => xs.size
+      U32s(xs) => xs.size
+      I64s(xs) => xs.size
+      U64s(xs) => xs.size
+      F64s(xs) => xs.size
+    }
+  }
+}
+
+# How many bytes `data` encodes to.
+pub def size(data: Data) -> Int { data.count * data.elem_size }
+
+# Encodes data into bs, which holds exactly size(data) bytes.
+def encode_fast(bs: [Byte], order: ByteOrder, data: Data) {
+  case data {
+    Bools(xs) => {
+      i = 0
+      while i < xs.size {
+        bs[i] = 0
+        bs[i] = 1 if xs[i]
+        i += 1
+      }
+    }
+    I8s(xs) => {
+      i = 0
+      while i < xs.size {
+        bs[i] = xs[i].as_u8
+        i += 1
+      }
+    }
+    U8s(xs) => {
+      copy(bs, xs)
+    }
+    I16s(xs) => {
+      i = 0
+      while i < xs.size {
+        order.put_uint16(bs[2 * i...bs.size], xs[i].as_u16)
+        i += 1
+      }
+    }
+    U16s(xs) => {
+      i = 0
+      while i < xs.size {
+        order.put_uint16(bs[2 * i...bs.size], xs[i])
+        i += 1
+      }
+    }
+    I32s(xs) => {
+      i = 0
+      while i < xs.size {
+        order.put_uint32(bs[4 * i...bs.size], xs[i].as_u32)
+        i += 1
+      }
+    }
+    U32s(xs) => {
+      i = 0
+      while i < xs.size {
+        order.put_uint32(bs[4 * i...bs.size], xs[i])
+        i += 1
+      }
+    }
+    I64s(xs) => {
+      i = 0
+      while i < xs.size {
+        order.put_uint64(bs[8 * i...bs.size], xs[i].as_u64)
+        i += 1
+      }
+    }
+    U64s(xs) => {
+      i = 0
+      while i < xs.size {
+        order.put_uint64(bs[8 * i...bs.size], xs[i])
+        i += 1
+      }
+    }
+    F64s(xs) => {
+      i = 0
+      while i < xs.size {
+        order.put_uint64(bs[8 * i...bs.size], xs[i].__bits)
+        i += 1
+      }
+    }
+  }
+}
+
+# Decodes bs (exactly size(data) bytes) into data's slice.
+def decode_fast(bs: [Byte], order: ByteOrder, data: Data) {
+  case data {
+    Bools(xs) => {
+      i = 0
+      while i < xs.size {
+        xs[i] = bs[i] != 0
+        i += 1
+      }
+    }
+    I8s(xs) => {
+      i = 0
+      while i < xs.size {
+        xs[i] = bs[i].as_i8
+        i += 1
+      }
+    }
+    U8s(xs) => {
+      copy(xs, bs)
+    }
+    I16s(xs) => {
+      i = 0
+      while i < xs.size {
+        xs[i] = order.uint16(bs[2 * i...bs.size]).as_i16
+        i += 1
+      }
+    }
+    U16s(xs) => {
+      i = 0
+      while i < xs.size {
+        xs[i] = order.uint16(bs[2 * i...bs.size])
+        i += 1
+      }
+    }
+    I32s(xs) => {
+      i = 0
+      while i < xs.size {
+        xs[i] = order.uint32(bs[4 * i...bs.size]).as_i32
+        i += 1
+      }
+    }
+    U32s(xs) => {
+      i = 0
+      while i < xs.size {
+        xs[i] = order.uint32(bs[4 * i...bs.size])
+        i += 1
+      }
+    }
+    I64s(xs) => {
+      i = 0
+      while i < xs.size {
+        xs[i] = order.uint64(bs[8 * i...bs.size]).as_i64
+        i += 1
+      }
+    }
+    U64s(xs) => {
+      i = 0
+      while i < xs.size {
+        xs[i] = order.uint64(bs[8 * i...bs.size])
+        i += 1
+      }
+    }
+    F64s(xs) => {
+      i = 0
+      while i < xs.size {
+        xs[i] = order.uint64(bs[8 * i...bs.size]).__from_bits
+        i += 1
+      }
+    }
+  }
+}
+
+# Reads size(data) bytes from r and decodes them into data's slice. Returns
+# false, having read nothing, if r is already at its end; fails with
+# io.StreamError.UnexpectedEof if r ends part way.
+pub def read[R](r: R, order: ByteOrder, data: Data) -> ~Bool {
+  src = r
+  n = size(data)
+  bs: [Byte] = [0; n]
+  got = 0
+  while got < n {
+    m = src.~read!(bs[got...n])
+    break if m == 0
+    got += m
+  }
+  return false if got == 0 && n > 0
+  fail io.StreamError.UnexpectedEof if got < n
+  decode_fast(bs, order, data)
+  true
+}
+
+# Writes the encoding of data to w.
+pub def write[W](w: W, order: ByteOrder, data: Data) -> ~Unit {
+  dst = w
+  bs: [Byte] = [0; size(data)]
+  encode_fast(bs, order, data)
+  dst.~write!(bs)
+}
+
+# Encodes data into buf; returns the bytes written. Fails with
+# BinaryError.BufferTooSmall if buf is too small.
+pub def encode(buf: [Byte], order: ByteOrder, data: Data) -> ~Int<BinaryError> {
+  n = size(data)
+  fail BinaryError.BufferTooSmall if buf.size < n
+  encode_fast(buf[0...n], order, data)
+  n
+}
+
+# Decodes buf into data's slice; returns the bytes used. Fails with
+# BinaryError.BufferTooSmall if buf is too small.
+pub def decode(buf: [Byte], order: ByteOrder, data: Data) -> ~Int<BinaryError> {
+  n = size(data)
+  fail BinaryError.BufferTooSmall if buf.size < n
+  decode_fast(buf[0...n], order, data)
+  n
+}
+
+# buf with the encoding of data appended.
+pub def append(buf: [Byte], order: ByteOrder, data: Data) -> [Byte] {
+  bs: [Byte] = [0; size(data)]
+  encode_fast(bs, order, data)
+  buf + bs
+}
+
+# ------------------------------------------------------------------ varints
+#
+# Unsigned integers are serialized 7 bits at a time, starting with the least
+# significant bits; the most significant bit of each byte says whether more
+# bytes follow. Signed integers are zig-zag encoded first (0, -1, 1, -2, ...
+# become 0, 1, 2, 3, ...).
+
+# buf with the varint encoding of x appended.
+pub def append_uvarint(buf: [Byte], x0: U64) -> [Byte] {
+  out = buf
+  x = x0
+  while x >= 0x80 {
+    out << (x.as_u8 | 0x80)
+    x >>= 7
+  }
+  out << x.as_u8
+  out
+}
+
+# Encodes x into buf; returns the bytes written. Panics if buf is too small.
+pub def put_uvarint(buf: [Byte], x0: U64) -> Int {
+  x = x0
+  i = 0
+  while x >= 0x80 {
+    buf[i] = x.as_u8 | 0x80
+    x >>= 7
+    i += 1
+  }
+  buf[i] = x.as_u8
+  i + 1
+}
+
+# Decodes a U64 from buf: (value, bytes read). On error the value is 0 and
+# the count n is 0 if buf is too small, or -n if the value overflows 64
+# bits (n being the bytes read up to the overflow).
+pub def uvarint(buf: [Byte]) -> (U64, Int) {
+  x: U64 = 0
+  s: U64 = 0
+  i = 0
+  while i < buf.size {
+    return (0, -(i + 1)) if i == MAX_VARINT_LEN64 # overflow
+    b = buf[i]
+    if b < 0x80 {
+      return (0, -(i + 1)) if i == MAX_VARINT_LEN64 - 1 && b > 1 # overflow
+      return (x | (b.to_u64 << s), i + 1)
+    }
+    x |= (b & 0x7f).to_u64 << s
+    s += 7
+    i += 1
+  }
+  (0, 0)
+}
+
+# Zig-zag: 0, -1, 1, -2 ... as 0, 1, 2, 3 ...
+def zigzag(x: Int) -> U64 {
+  ux = x.as_u64 << 1
+  ux = ux ^ 0xffffffffffffffff if x < 0
+  ux
+}
+
+def unzigzag(ux: U64) -> Int {
+  x = (ux >> 1).as_i64
+  x = x ^ -1 if ux & 1 != 0
+  x
+}
+
+# buf with the varint encoding of x appended.
+pub def append_varint(buf: [Byte], x: Int) -> [Byte] { append_uvarint(buf, zigzag(x)) }
+
+# Encodes x into buf; returns the bytes written. Panics if buf is too small.
+pub def put_varint(buf: [Byte], x: Int) -> Int { put_uvarint(buf, zigzag(x)) }
+
+# Decodes an Int from buf: (value, bytes read), with uvarint's error counts.
+pub def varint(buf: [Byte]) -> (Int, Int) {
+  r = uvarint(buf)
+  (unzigzag(r[0]), r[1])
+}
+
+# Reads a varint-encoded U64 from r, a byte reader (bytes.Buffer,
+# bufio.Reader, ...). None if r is at its end; fails with
+# io.StreamError.UnexpectedEof if it ends inside the varint, and with
+# BinaryError.Overflow if the value doesn't fit in 64 bits.
+pub def read_uvarint[R](r: R) -> ~U64? {
+  src = r
+  x: U64 = 0
+  s: U64 = 0
+  i = 0
+  while i < MAX_VARINT_LEN64 {
+    got = src.~read_byte!
+    if b = got {
+      if b < 0x80 {
+        fail BinaryError.Overflow if i == MAX_VARINT_LEN64 - 1 && b > 1
+        return x | (b.to_u64 << s)
+      }
+      x |= (b & 0x7f).to_u64 << s
+      s += 7
+    } else {
+      return none if i == 0
+      fail io.StreamError.UnexpectedEof
+    }
+    i += 1
+  }
+  fail BinaryError.Overflow
+  none
+}
+
+# Reads a varint-encoded Int from r; like read_uvarint.
+pub def read_varint[R](r: R) -> ~Int? {
+  if ux = ~read_uvarint(r) {
+    return unzigzag(ux)
+  }
+  none
+}

@@ -3578,7 +3578,9 @@ impl<'w, 'a> FnCx<'w, 'a> {
             }
         };
         let tb = self.seq_body(b, sp, used)?;
-        let (ta, tb) = self.join(ta, tb)?;
+        // A discarded value isn't joined: coercing one branch to the other's
+        // type (an Int branch to the other's Error?) would mistype it.
+        let (ta, tb) = if used { self.join(ta, tb)? } else { (ta, tb) };
         let (ra, rb) = (self.resolve(&ta.ty), self.resolve(&tb.ty));
         let (ta, tb, ty) = if !b.is_empty() && self.unify(&ra, &rb) {
             let ty = if matches!(ra, Ty::Never) { rb } else { ra };

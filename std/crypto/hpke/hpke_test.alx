@@ -1,0 +1,195 @@
+# Go's hpke_test.go: Example, TestRoundTrip, TestSingletons. TestVectors is
+# vec_hpke_test.alx (generated from testdata/rfc9180.json and hpke-pq.json)
+# with the checks in check_vector below. TestRoundTrip's padSlice checks
+# (Seal/Open mustn't write past the length of their inputs) are kept in
+# spirit: alx's subslices have no spare capacity (D6), so the inputs are
+# checked unchanged instead.
+
+import "crypto/ecdh"
+import "crypto/sha3"
+import "encoding/hex"
+
+example "hpke" {
+  kem = mlkem768_x25519()
+  kdf = hkdf_sha256()
+  aead = aes256_gcm()
+  k = kem.generate_key.unwrap
+  public_key_bytes = k.public_key.bytes
+  pk = kem.new_public_key(public_key_bytes).unwrap
+  ct = seal(pk, kdf, aead, "example".bytes.to_a, "|-()-|".bytes.to_a).unwrap
+  pt = open(k, kdf, aead, "example".bytes.to_a, ct).unwrap
+  puts "Decrypted message: #{Str.from_bytes(pt)}"
+} outputs "Decrypted message: |-()-|"
+
+def all_kems -> [KEM] {
+  [dhkem(ecdh.p256()), dhkem(ecdh.p384()), dhkem(ecdh.p521()), dhkem(ecdh.x25519()), mlkem768(), mlkem1024(), mlkem768_p256(),
+    mlkem1024_p384(), mlkem768_x25519()]
+}
+
+def all_kdfs -> [KDF] { [hkdf_sha256(), hkdf_sha384(), hkdf_sha512(), shake128(), shake256()] }
+
+def all_aeads -> [AEAD] { [aes128_gcm(), aes256_gcm(), chacha20_poly1305()] }
+
+def b(s: Str) -> [Byte] { s.bytes.to_a }
+
+test "round trip" {
+  for kem in all_kems() {
+    k = kem.generate_key.unwrap
+    kb = k.bytes.unwrap
+    kk = kem.new_private_key(kb).unwrap
+    assert_eq kk.bytes.unwrap, kb
+    pk = kem.new_public_key(k.public_key.bytes).unwrap
+    assert_eq pk.bytes, k.public_key.bytes
+    for kdf in all_kdfs() {
+      for aead in all_aeads() {
+        info = b("info")
+        plaintext = b("plaintext")
+        c = seal(pk, kdf, aead, info, plaintext).unwrap
+        assert_eq open(kk, kdf, aead, info, c).unwrap, b("plaintext")
+        assert open(kk, kdf, aead, b("wrong"), c).err?, "wrong info opens"
+        c[c.size - 1] = c[c.size - 1] ^ 0xFF
+        assert open(kk, kdf, aead, info, c).err?, "corrupted ciphertext opens"
+        assert_eq info, b("info")
+        assert_eq plaintext, b("plaintext")
+        c = seal(k.public_key, kdf, aead, [], []).unwrap
+        assert_eq open(k, kdf, aead, [], c).unwrap.size, 0
+        enc, sender = new_sender(pk, kdf, aead, info).unwrap
+        aad = b("aad")
+        ct = sender.seal!(aad, plaintext).unwrap
+        recipient = new_recipient(enc, kk, kdf, aead, info).unwrap
+        assert_eq recipient.open!(aad, ct).unwrap, b("plaintext")
+        assert_eq aad, b("aad")
+      }
+    }
+  }
+}
+
+test "singletons" {
+  assert hkdf_sha256() == hkdf_sha256(), "HKDFSHA256"
+  assert hkdf_sha384() == hkdf_sha384(), "HKDFSHA384"
+  assert hkdf_sha512() == hkdf_sha512(), "HKDFSHA512"
+  assert aes128_gcm() == aes128_gcm(), "AES128GCM"
+  assert aes256_gcm() == aes256_gcm(), "AES256GCM"
+  assert chacha20_poly1305() == chacha20_poly1305(), "ChaCha20Poly1305"
+  assert export_only() == export_only(), "ExportOnly"
+  assert dhkem(ecdh.p256()) == dhkem(ecdh.p256()), "DHKEM(P-256)"
+  assert dhkem(ecdh.p384()) == dhkem(ecdh.p384()), "DHKEM(P-384)"
+  assert dhkem(ecdh.p521()) == dhkem(ecdh.p521()), "DHKEM(P-521)"
+  assert dhkem(ecdh.x25519()) == dhkem(ecdh.x25519()), "DHKEM(X25519)"
+  assert mlkem768() == mlkem768(), "MLKEM768"
+  assert mlkem1024() == mlkem1024(), "MLKEM1024"
+  assert mlkem768_x25519() == mlkem768_x25519(), "MLKEM768X25519"
+  assert mlkem768_p256() == mlkem768_p256(), "MLKEM768P256"
+  assert mlkem1024_p384() == mlkem1024_p384(), "MLKEM1024P384"
+}
+
+test "ids and errors" {
+  assert_eq new_kem(0x0021).err.unwrap.message, "unsupported KEM"
+  assert_eq new_kdf(0x0012).err.unwrap.message, "unsupported KDF 0012"
+  assert_eq new_aead(0x0004).err.unwrap.message, "unsupported AEAD 0004"
+  assert_eq new_kem(0x647a).unwrap, mlkem768_x25519()
+  assert_eq new_kdf(0x0011).unwrap.id, 0x0011.as_u16
+  assert_eq new_aead(0xFFFF).unwrap, export_only()
+  k = dhkem(ecdh.x25519()).generate_key.unwrap
+  assert_eq open(k, hkdf_sha256(), aes128_gcm(), [], [1.as_u8, 2]).err.unwrap.message, "ciphertext too short"
+  enc, s = new_sender(k.public_key, hkdf_sha256(), export_only(), []).unwrap
+  assert_eq s.seal!([], []).err.unwrap.message, "export-only instantiation"
+  r = new_recipient(enc, k, hkdf_sha256(), export_only(), []).unwrap
+  assert_eq r.open!([], []).err.unwrap.message, "export-only instantiation"
+  assert_eq s.export([], 70000).err.unwrap.message, "invalid length"
+  assert_eq s.export(b("ctx"), 32).unwrap, r.export(b("ctx"), 32).unwrap
+  assert_eq mlkem768_x25519().new_private_key([0.as_u8; 31]).err.unwrap.message, "hpke: invalid hybrid KEM secret length"
+}
+
+# Reads a length byte, then that many bytes (Go's drawRandomInput).
+def draw_random_input(r: sha3.SHAKE) -> [Byte] {
+  src = r
+  l = [0.as_u8]
+  src.read!(l)
+  out = [0.as_u8; l[0].to_i]
+  src.read!(out)
+  out
+}
+
+def hx(s: Str) -> [Byte] { hex.decode_string(s).unwrap }
+
+# One vector of Go's testVectors.
+def check_vector(kem_id: U16, kdf_id: U16, aead_id: U16, info_h: Str, ikm_e: Str, ikm_r: Str, sk_rm: Str, pk_rm: Str, enc_h: Str, acc_enc: Str, acc_exp: Str, encryptions: [(Str, Str, Str)], exports: [(Str, Int, Str)]) -> ~Unit {
+  kdf = ~new_kdf(kdf_id)
+  aead = ~new_aead(aead_id)
+  kem = ~new_kem(kem_id)
+  assert_eq kem.id, kem_id
+  pub_key_bytes = hx(pk_rm)
+  kem_sender = ~kem.new_public_key(pub_key_bytes)
+  assert kem_sender.kem == kem, "sender KEM"
+  assert_eq kem_sender.bytes, pub_key_bytes
+  info = hx(info_h)
+  encap, sender = ~new_sender_derandomized(kem_sender, kdf, aead, info, hx(ikm_e))
+  assert_eq encap.size, kem.enc_size
+  assert_eq hex.encode_to_string(encap), enc_h
+  priv_key_bytes = hx(sk_rm)
+  kem_recipient = ~kem.new_private_key(priv_key_bytes)
+  rb = ~kem_recipient.bytes
+  x25519 = kem_id.to_i64 == KEM_X25519
+  assert x25519 || rb == priv_key_bytes, "recipient bytes"
+  if x25519 {
+    kem2 = ~kem.new_private_key(rb)
+    assert_eq ~kem2.bytes, rb
+    assert_eq kem2.public_key.bytes, pub_key_bytes
+  }
+  assert_eq kem_recipient.public_key.bytes, pub_key_bytes
+  deriv = ~kem.derive_key_pair(hx(ikm_r))
+  db = ~deriv.bytes
+  assert x25519 || db == priv_key_bytes, "derived bytes"
+  assert_eq deriv.public_key.bytes, pub_key_bytes
+  recipient = ~new_recipient(encap, kem_recipient, kdf, aead, info)
+  if aead != export_only() && acc_enc.size != 0 {
+    source = sha3.new_shake128()
+    sink = sha3.new_shake128()
+    i = 0
+    while i < 1000 {
+      aad = draw_random_input(source)
+      plaintext = draw_random_input(source)
+      ciphertext = ~sender.seal!(aad, plaintext)
+      ~sink.write!(ciphertext)
+      assert_eq ~recipient.open!(aad, ciphertext), plaintext
+      i += 1
+    }
+    got = [0.as_u8; 16]
+    sink.read!(got)
+    assert_eq hex.encode_to_string(got), acc_enc
+  } else if aead != export_only() {
+    for e in encryptions {
+      aad = hx(e[0])
+      plaintext = hx(e[2])
+      ciphertext = ~sender.seal!(aad, plaintext)
+      assert_eq hex.encode_to_string(ciphertext), e[1]
+      assert_eq ~recipient.open!(aad, ciphertext), plaintext
+    }
+  } else {
+    assert sender.seal!([], []).err?, "export-only seal"
+    assert recipient.open!([], []).err?, "export-only open"
+  }
+  if acc_exp.size != 0 {
+    source = sha3.new_shake128()
+    sink = sha3.new_shake128()
+    l = 0
+    while l < 1000 {
+      context = draw_random_input(source)
+      value = ~sender.export(context, l)
+      ~sink.write!(value)
+      assert_eq ~recipient.export(context, l), value
+      l += 1
+    }
+    got = [0.as_u8; 16]
+    sink.read!(got)
+    assert_eq hex.encode_to_string(got), acc_exp
+  } else {
+    for x in exports {
+      context = hx(x[0])
+      value = ~sender.export(context, x[1])
+      assert_eq hex.encode_to_string(value), x[2]
+      assert_eq ~recipient.export(context, x[1]), value
+    }
+  }
+}

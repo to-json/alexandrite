@@ -1,0 +1,63 @@
+# multipart/form-data requests, after Go's Request.MultipartReader,
+# ParseMultipartForm and FormFile. They are free functions here (Request's
+# body is the whole body, read before the handler runs), and
+# parse_multipart_form returns the form instead of storing it in the
+# Request (Go's r.MultipartForm; its values aren't merged into a Form map,
+# which this Request doesn't have).
+import "bytes"
+import "mime"
+import "mime/multipart"
+
+# Go's defaultMaxMemory for FormFile.
+pub DEFAULT_MAX_MEMORY = 33554432
+
+pub error MultipartFormError {
+  # The Content-Type isn't multipart/form-data (Go's ErrNotMultipart).
+  NotMultipart
+  # The Content-Type has no boundary (Go's ErrMissingBoundary).
+  MissingBoundary
+  # form_file found no file under the key (Go's ErrMissingFile).
+  MissingFile
+
+  def message -> Str {
+    case self {
+      NotMultipart => "request Content-Type isn't multipart/form-data"
+      MissingBoundary => "no multipart boundary param in Content-Type"
+      MissingFile => "http: no such file"
+    }
+  }
+}
+
+# A reader over the parts of a multipart/form-data request body.
+pub def multipart_reader(r: Request) -> ~multipart.Reader[bytes.Buffer] {
+  v = r.header.get("Content-Type")
+  fail MultipartFormError.NotMultipart if v.size == 0
+  parsed = mime.parse_media_type(v)
+  fail MultipartFormError.NotMultipart if parsed.err?
+  d, params = parsed.unwrap
+  fail MultipartFormError.NotMultipart if d != "multipart/form-data"
+  boundary = params["boundary"]
+  fail MultipartFormError.MissingBoundary unless boundary.present?
+  multipart.new_reader(bytes.new_buffer(r.body), boundary.unwrap)
+}
+
+# Parses a multipart/form-data body: file parts up to max_memory bytes are
+# kept in memory, the rest in temporary files (remove them with the form's
+# remove_all).
+pub def parse_multipart_form(r: Request, max_memory: Int) -> ~multipart.Form {
+  mr = ~multipart_reader(r)
+  mr.~read_form!(max_memory)
+}
+
+# The first file uploaded under `key` and its header (Go's FormFile, with
+# DEFAULT_MAX_MEMORY).
+pub def form_file(r: Request, key: Str) -> ~(multipart.File, multipart.FileHeader) {
+  form = ~parse_multipart_form(r, DEFAULT_MAX_MEMORY)
+  if fhs = form.file[key] {
+    if fhs.size > 0 {
+      f = ~fhs[0].open
+      return (f, fhs[0])
+    }
+  }
+  fail MultipartFormError.MissingFile
+}

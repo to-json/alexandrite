@@ -1,0 +1,175 @@
+# Writer, after Go's writer.go.
+import "io"
+import "net/textproto"
+import "strings"
+
+struct WriterState[W] {
+  w: W
+  boundary: Str
+  # The id of the open part (0: none) and the last id handed out.
+  last: Int
+  ids: Int
+  # The open part's write error, reported when it is closed.
+  we: Error?
+}
+
+# A writer of a multipart body. Copies share state.
+pub struct Writer[W] {
+  st: [WriterState[W]]
+
+  # The boundary (random until set_boundary!).
+  pub def boundary -> Str { st[0].boundary }
+
+  # Replaces the random boundary; it must be 1 to 70 characters of
+  # [A-Za-z0-9'()+_,-./:=?] or spaces (not last), and be set before the
+  # first part.
+  pub def set_boundary!(b: Str) -> ~Unit {
+    fail MultipartError.BoundaryAfterWrite if st[0].ids > 0
+    fail MultipartError.InvalidBoundaryLength if b.size < 1 || b.size > 70
+    end_i = b.size - 1
+    i = 0
+    for c in b.bytes {
+      ok = (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || (c >= 48 && c <= 57)
+      ok = true if c == 39 || c == 40 || c == 41 || c == 43 || c == 95 || c == 44 || c == 45 || c == 46 || c == 47 || c == 58 || c == 61 || c == 63
+      ok = true if c == 32 && i != end_i
+      fail MultipartError.InvalidBoundaryChar unless ok
+      i += 1
+    }
+    self.st[0].boundary = b
+  }
+
+  # "multipart/form-data; boundary=..." (quoted when needed).
+  pub def form_data_content_type -> Str {
+    b = st[0].boundary
+    special = "()<>@,;:\\\"/[]?= "
+    q = false
+    for c in b.bytes {
+      q = true if strings.index_byte(special, c) >= 0
+    }
+    b = "\"" + b + "\"" if q
+    "multipart/form-data; boundary=" + b
+  }
+
+  def emit!(s: Str) -> ~Unit {
+    p = s.bytes.to_a
+    off = 0
+    while off < p.size {
+      n = self.st[0].w.~write!(p[off...p.size])
+      fail io.StreamError.ShortWrite if n <= 0
+      off += n
+    }
+  }
+
+  def close_last! -> ~Unit {
+    return if st[0].last == 0
+    self.st[0].last = 0
+    if e = st[0].we {
+      self.st[0].we = none
+      fail e
+    }
+  }
+
+  # Starts a new part with the given header (keys written sorted) and
+  # returns its writer; the previous part is finished.
+  pub def create_part!(header: textproto.MIMEHeader) -> ~PartWriter[W] {
+    first = st[0].ids == 0
+    self.~close_last!
+    b = strings.new_builder
+    if first {
+      b.write!("--#{st[0].boundary}\r\n")
+    } else {
+      b.write!("\r\n--#{st[0].boundary}\r\n")
+    }
+    for k in header.sorted_keys {
+      for v in header.raw(k) || [] {
+        b.write!("#{k}: #{v}\r\n")
+      }
+    }
+    b.write!("\r\n")
+    self.~emit!(b.to_s)
+    id = st[0].ids + 1
+    self.st[0].ids = id
+    self.st[0].last = id
+    PartWriter[W].new(mw: self, id: id)
+  }
+
+  # A part for a file field (Content-Type application/octet-stream).
+  pub def create_form_file!(fieldname: Str, filename: Str) -> ~PartWriter[W] {
+    h = textproto.new_mime_header
+    h.set!("Content-Disposition", file_content_disposition(fieldname, filename))
+    h.set!("Content-Type", "application/octet-stream")
+    self.~create_part!(h)
+  }
+
+  # A part for a plain form field.
+  pub def create_form_field!(fieldname: Str) -> ~PartWriter[W] {
+    h = textproto.new_mime_header
+    h.set!("Content-Disposition", "form-data; name=\"#{escape_quotes(fieldname)}\"")
+    self.~create_part!(h)
+  }
+
+  # A form field with its value.
+  pub def write_field!(fieldname: Str, value: Str) -> ~Unit {
+    p = self.~create_form_field!(fieldname)
+    p.~write!(value.bytes.to_a)
+    return
+  }
+
+  # Finishes the last part and writes the closing boundary.
+  pub def close! -> ~Unit {
+    self.~close_last!
+    self.~emit!("\r\n--#{st[0].boundary}--\r\n")
+  }
+
+  def part_write!(d: [Byte], id: Int) -> ~Int {
+    fail MultipartError.FinishedPart if st[0].last != id
+    r = write_to(self.st[0].w, d)
+    if e = r.err {
+      self.st[0].we = e
+      fail e
+    }
+    r.unwrap
+  }
+}
+
+# A Writer with a random boundary.
+pub def new_writer[W: io.Writer](w: W) -> Writer[W] {
+  e: Error? = none
+  st: [WriterState[W]] = [WriterState.new(w: w, boundary: random_boundary(), last: 0, ids: 0, we: e)]
+  Writer[W].new(st: st)
+}
+
+# The body of a part being written (Go's CreatePart io.Writer).
+pub struct PartWriter[W] {
+  mw: Writer[W]
+  id: Int
+
+  pub def write!(d: [Byte]) -> ~Int {
+    m = mw
+    m.~part_write!(d, id)
+  }
+
+  pub def write_string!(s: Str) -> ~Int {
+    m = mw
+    m.~part_write!(s.bytes.to_a, id)
+  }
+}
+
+# w.write!(d) as a held result (whether W's write! can fail or not).
+def write_to[W: io.Writer](w: W, d: [Byte]) -> ~Int {
+  x = w
+  x.~write!(d)
+}
+
+def escape_quotes(s: Str) -> Str {
+  x = strings.replace_all(s, "\\", "\\\\")
+  x = strings.replace_all(x, "\"", "\\\"")
+  x = strings.replace_all(x, "\r", "%0D")
+  strings.replace_all(x, "\n", "%0A")
+}
+
+# `form-data; name="field"; filename="file"` with quotes, backslashes, CR
+# and LF escaped.
+pub def file_content_disposition(fieldname: Str, filename: Str) -> Str {
+  "form-data; name=\"#{escape_quotes(fieldname)}\"; filename=\"#{escape_quotes(filename)}\""
+}

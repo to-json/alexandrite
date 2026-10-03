@@ -280,8 +280,16 @@ impl<'a> Graph<'a> {
                         let mut stored: Vec<Node> = if key_copied { per_arg.iter().skip(1).flatten().copied().collect() } else { avs.clone() };
                         stored.push(site(e));
                         self.flow(&stored, &rv);
-                        if *m == M::CopyInto && per_arg.len() >= 2 {
-                            // copy(dst, src): src's elements into dst.
+                        // copy(dst, src): src's elements into dst. Elements
+                        // without storage (a [U64], a [Byte]) are copied by
+                        // value: src needn't outlive dst (math/big copies
+                        // words between scratch and result buffers).
+                        let promote = self.f.overflow == crate::ast::Overflow::Promote;
+                        let flat = args.first().is_some_and(|a| match &a.ty {
+                            Ty::Array(t) | Ty::Fixed(t, _) => !has_storage(t) && !(promote && contains_int(t)),
+                            _ => false,
+                        });
+                        if *m == M::CopyInto && per_arg.len() >= 2 && !flat {
                             let (d, s) = (per_arg[0].clone(), per_arg[1].clone());
                             self.flow(&s, &d);
                         }

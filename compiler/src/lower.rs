@@ -882,6 +882,16 @@ impl<'a> Lw<'a> {
                 TK::IndexAssign(l, ..) | TK::PlaceAssign(l, ..) => Some(*l),
                 _ => None,
             };
+            // Storing a value without storage (a byte, a word) into an
+            // existing element, or copying such elements, allocates nothing:
+            // no region to look up (a hot loop's `s[i] = digit`).
+            let promote = self.promote();
+            let flat_store = match &e.kind {
+                TK::IndexAssign(_, _, x) | TK::PlaceAssign(_, _, _, x) => !crate::regions::has_storage(&x.ty) && !(promote && crate::regions::contains_int(&x.ty)),
+                TK::M(M::CopyInto, None, args, _) => args.first().is_some_and(|a| matches!(&a.ty, Ty::Array(t) | Ty::Fixed(t, _) if !crate::regions::has_storage(t) && !(promote && crate::regions::contains_int(t)))),
+                _ => false,
+            };
+            let root = if flat_store { None } else { root };
             if let Some(l) = root.filter(|l| matches!(self.lty(&self.f.locals[*l].ty), LTy::Arr(_) | LTy::Str)) {
                 let r = self.tmp(LTy::Region);
                 let v = self.var_of(l);

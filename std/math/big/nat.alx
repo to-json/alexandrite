@@ -142,6 +142,11 @@ def nat_mul(x: [U64], y: [U64]) -> [U64] { nat_mul_t(x, y, KARATSUBA_THRESHOLD) 
 
 # nat_mul with the Karatsuba threshold as a parameter (Go's tests vary
 # the package variable karatsubaThreshold).
+#
+# Karatsuba is Go 1.20's in-place version (natmul.go before Go 1.24 moved
+# to a stack allocator): one scratch buffer of 6k words for the k-word
+# Karatsuba core, the rest of an unbalanced product added in k-word
+# pieces.
 def nat_mul_t(x0: [U64], y0: [U64], thr: I64) -> [U64] {
   x = nat_norm(x0)
   y = nat_norm(y0)
@@ -150,60 +155,130 @@ def nat_mul_t(x0: [U64], y0: [U64], thr: I64) -> [U64] {
   return nat_mul_t(y, x, thr) if m < n
   return nat_zero if m == 0 || n == 0
   return nat_mul_add_ww(x, y[0], 0) if n == 1
-  z = nat_make(m + n)
   if n < thr {
+    z = nat_make(m + n)
     basic_mul(z, x, y)
     return nat_norm(z)
   }
-  karatsuba(z[0...2 * n], x[0...n], y, thr)
-  if n < m {
-    i = n
+  k = karatsuba_len(n, thr)
+  xk = x[0...k]
+  yk = y[0...k]
+  zbuf = nat_make(imax(6 * k, m + n))
+  karatsuba(zbuf, xk, yk, thr)
+  z = zbuf[0...m + n]
+  for i in 2 * k...z.size {
+    z[i] = 0
+  }
+  if k < n || m != n {
+    # add x0*y1*b^k, then the products of the remaining k-word pieces of x
+    # with y0 and y1
+    x0n = nat_norm(xk)
+    y1 = y[k...n]
+    t = nat_mul_t(x0n, y1, thr)
+    add_at(z, t, k)
+    y0n = nat_norm(yk)
+    i = k
     while i < m {
-      t = nat_mul_t(x[i...imin(i + n, m)], y, thr)
-      add_to(z[i...z.size], t)
-      i += n
+      xi = x[i...imin(i + k, m)]
+      xi = nat_norm(xi)
+      t = nat_mul_t(xi, y0n, thr)
+      add_at(z, t, i)
+      t = nat_mul_t(xi, y1, thr)
+      add_at(z, t, i + k)
+      i += k
     }
   }
   nat_norm(z)
 }
 
-# x and its sign as a signed difference: |a - b| and whether a < b.
-def nat_diff(a: [U64], b: [U64]) -> ([U64], Bool) {
-  return (nat_sub(b, a), true) if nat_cmp(a, b) < 0
-  (nat_sub(a, b), false)
+# The length Karatsuba uses for n words: n rounded down to (a number at
+# most thr) * 2^i.
+def karatsuba_len(n0: I64, thr: I64) -> I64 {
+  n = n0
+  i = 0
+  while n > thr {
+    n >>= 1
+    i += 1
+  }
+  n << i
 }
 
-# z = x * y with len(x) == len(y) == n and len(z) == 2n (Karatsuba).
+# z[0...n+n/2] += x (len(x) == n, carry into the upper half).
+def karatsuba_add(z: [U64], x: [U64], n: I64) -> Unit {
+  c = add_vv(z[0...n], z[0...n], x[0...n])
+  if c != 0 {
+    zz = z[n...n + (n >> 1)]
+    add_vw(zz, zz, c)
+  }
+}
+
+def karatsuba_sub(z: [U64], x: [U64], n: I64) -> Unit {
+  c = sub_vv(z[0...n], z[0...n], x[0...n])
+  if c != 0 {
+    zz = z[n...n + (n >> 1)]
+    sub_vw(zz, zz, c)
+  }
+}
+
+# z += x << (64 i), z long enough.
+def add_at(z: [U64], x: [U64], i: I64) -> Unit {
+  n = x.size
+  if n > 0 {
+    zi = z[i...i + n]
+    c = add_vv(zi, zi, x)
+    if c != 0 {
+      j = i + n
+      if j < z.size {
+        zj = z[j...z.size]
+        add_vw(zj, zj, c)
+      }
+    }
+  }
+}
+
+# z[0...2n] = x * y for len(x) == len(y) == n, with len(z) >= 6n scratch
+# (Go 1.20's karatsuba; n is karatsuba_len-shaped).
 def karatsuba(z: [U64], x: [U64], y: [U64], thr: I64) -> Unit {
   n = y.size
-  panic("bad karatsuba length") if x.size != n || z.size != 2 * n
-  if n < thr || n < 2 {
-    basic_mul(z, x, y)
+  if n & 1 != 0 || n < thr || n < 2 {
+    basic_mul(z[0...2 * n], x, y)
     return
   }
-  n2 = (n + 1) / 2
-  x0 = nat_norm(x[0...n2])
-  x1 = nat_norm(x[n2...n])
-  y0 = nat_norm(y[0...n2])
-  y1 = nat_norm(y[n2...n])
-  z0 = nat_mul_t(x0, y0, thr)
-  z2 = nat_mul_t(x1, y1, thr)
-  # z1 = x0*y1 + x1*y0 = z0 + z2 + (x0 - x1)(y1 - y0)
-  tx, txneg = nat_diff(x0, x1)
-  ty, tyneg = nat_diff(y1, y0)
-  p = nat_mul_t(tx, ty, thr)
-  z1 = nat_add(z0, z2)
-  if txneg != tyneg {
-    z1 = nat_sub(z1, p)
+  n2 = n >> 1
+  x1 = x[n2...n]
+  x0 = x[0...n2]
+  y1 = y[n2...n]
+  y0 = y[0...n2]
+  # z0 = x0*y0, z2 = x1*y1
+  karatsuba(z, x0, y0, thr)
+  karatsuba(z[n...z.size], x1, y1, thr)
+  # xd = |x1 - x0|, yd = |y0 - y1|, s the sign of (x1-x0)*(y0-y1)
+  s = 1
+  xd = z[2 * n...2 * n + n2]
+  if sub_vv(xd, x1, x0) != 0 {
+    s = -s
+    _c = sub_vv(xd, x0, x1)
+  }
+  yd = z[2 * n + n2...3 * n]
+  if sub_vv(yd, y0, y1) != 0 {
+    s = -s
+    _c2 = sub_vv(yd, y1, y0)
+  }
+  # p = xd*yd
+  p = z[n * 3...z.size]
+  karatsuba(p, xd, yd, thr)
+  # save z0, z2 in r
+  r = z[n * 4...z.size]
+  copy(r, z[0...n * 2])
+  # z = z0 + (z0 + z2 + s*p) b^n2 + z2 b^n
+  zh = z[n2...z.size]
+  karatsuba_add(zh, r, n)
+  karatsuba_add(zh, r[n...r.size], n)
+  if s > 0 {
+    karatsuba_add(zh, p, n)
   } else {
-    z1 = nat_add(z1, p)
+    karatsuba_sub(zh, p, n)
   }
-  for i in 0...z.size {
-    z[i] = 0
-  }
-  copy(z, z0)
-  add_to(z[2 * n2...z.size], z2)
-  add_to(z[n2...z.size], z1)
 }
 
 def nat_sqr(x: [U64]) -> [U64] { nat_sqr_t(x, BASIC_SQR_THRESHOLD, KARATSUBA_SQR_THRESHOLD) }
@@ -221,20 +296,38 @@ def nat_sqr_t(x0: [U64], bthr: I64, kthr: I64) -> [U64] {
     z[0] = d * d
     return nat_norm(z)
   }
-  z = nat_make(2 * n)
   if n < bthr && n < kthr {
+    z = nat_make(2 * n)
     basic_mul(z, x, x)
     return nat_norm(z)
   }
   if n < kthr {
+    z = nat_make(2 * n)
     basic_sqr(z, x, bthr)
     return nat_norm(z)
   }
-  karatsuba_sqr(z, x, bthr, kthr)
+  # Go 1.20: Karatsuba on the low k words, the rest added in.
+  k = karatsuba_len(n, kthr)
+  xk = x[0...k]
+  zbuf = nat_make(imax(6 * k, 2 * n))
+  karatsuba_sqr(zbuf, xk, bthr, kthr)
+  z = zbuf[0...2 * n]
+  for i in 2 * k...z.size {
+    z[i] = 0
+  }
+  if k < n {
+    x0n = nat_norm(xk)
+    x1 = x[k...n]
+    t = nat_mul(x0n, x1)
+    add_at(z, t, k)
+    add_at(z, t, k)
+    t = nat_sqr_t(x1, bthr, kthr)
+    add_at(z, t, 2 * k)
+  }
   nat_norm(z)
 }
 
-# z = x * x (len(z) == 2 len(x)), computing each cross product once.
+# z[0...2n] = x * x (len(z) == 2n), computing each cross product once.
 def basic_sqr(z: [U64], x: [U64], bthr: I64) -> Unit {
   n = x.size
   if n < bthr {
@@ -253,31 +346,35 @@ def basic_sqr(z: [U64], x: [U64], bthr: I64) -> Unit {
   }
   tt = t[1...2 * n - 1]
   t[2 * n - 1] = lsh_vu(tt, tt, 1)
-  _c = add_vv(z, z, t)
+  _c = add_vv(z[0...2 * n], z[0...2 * n], t)
 }
 
-# z = x * x with Karatsuba (len(z) == 2 len(x)).
+# z[0...2n] = x * x with Karatsuba, len(z) >= 6n scratch (Go 1.20's
+# karatsubaSqr).
 def karatsuba_sqr(z: [U64], x: [U64], bthr: I64, kthr: I64) -> Unit {
   n = x.size
-  panic("bad karatsubaSqr length") if z.size != 2 * n
-  if n < kthr || n < 2 {
-    basic_sqr(z, x, bthr)
+  if n & 1 != 0 || n < kthr || n < 2 {
+    basic_sqr(z[0...2 * n], x, bthr)
     return
   }
-  n2 = (n + 1) / 2
-  x0 = nat_norm(x[0...n2])
-  x1 = nat_norm(x[n2...n])
-  z0 = nat_sqr_t(x0, bthr, kthr)
-  z2 = nat_sqr_t(x1, bthr, kthr)
-  tx, _neg = nat_diff(x0, x1)
-  # z1 = z0 + z2 - (x0 - x1)^2
-  z1 = nat_sub(nat_add(z0, z2), nat_sqr_t(tx, bthr, kthr))
-  for i in 0...z.size {
-    z[i] = 0
+  n2 = n >> 1
+  x1 = x[n2...n]
+  x0 = x[0...n2]
+  karatsuba_sqr(z, x0, bthr, kthr)
+  karatsuba_sqr(z[n...z.size], x1, bthr, kthr)
+  # xd = |x1 - x0|
+  xd = z[2 * n...2 * n + n2]
+  if sub_vv(xd, x1, x0) != 0 {
+    _c = sub_vv(xd, x0, x1)
   }
-  copy(z, z0)
-  add_to(z[2 * n2...z.size], z2)
-  add_to(z[n2...z.size], z1)
+  p = z[n * 3...z.size]
+  karatsuba_sqr(p, xd, bthr, kthr)
+  r = z[n * 4...z.size]
+  copy(r, z[0...n * 2])
+  zh = z[n2...z.size]
+  karatsuba_add(zh, r, n)
+  karatsuba_add(zh, r[n...r.size], n)
+  karatsuba_sub(zh, p, n)
 }
 
 # The product of all integers in [a, b] (1 for an empty range).

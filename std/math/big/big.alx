@@ -1,9 +1,112 @@
 # Package big: Go's math/big — arbitrary-precision integers (Int),
 # rationals (Rat) and binary floating-point numbers (Float), in pure alx
-# on [U64] words (independent of the runtime's libtommath).
+# on [U64] words (independent of the runtime's libtommath, which only
+# `#![overflow(promote)]` uses). Go's algorithms throughout: schoolbook
+# and Karatsuba multiplication (Go 1.20's in-place Karatsuba), Knuth long
+# division with 3-by-2 quotient guesses and Burnikel-Ziegler recursive
+# division, Montgomery exponentiation with a 4-bit window (plus the
+# windowed and CRT paths for even moduli), Lehmer GCD, Miller-Rabin plus
+# strong Lucas (Baillie-PSW) primality, divide-and-conquer radix
+# conversion, and Go's Float rounding, decimal conversion and shortest
+# formatting.
 #
-# (The API map and the list of differences from Go are at the end of this
-# header; see HEADER below.)
+# Values. Int, Rat and Float are values (structs), not pointers. Go's
+# `z.Op(x, y) *T` is `z.op!(x, y) -> T`: it sets the variable z and also
+# returns the new value. `new(T).Op(...)` becomes `z = T.new` then
+# `z.op!(...)` (a `!` method needs a variable receiver). Results never
+# share storage that is later written, so copies are independent and
+# aliasing (z.add!(z, z)) is always fine.
+#
+#   Go                                   alx
+#   NewInt(x) / NewRat(a, b) / NewFloat  new_int(x) / new_rat(a, b) / new_float(f)
+#   z.SetInt64 / SetUint64 / Set         z.set_int64! / set_uint64! / set!
+#   z.SetBits(abs) / x.Bits()            z.set_bits!(abs) / x.bits (copies)
+#   z.SetString(s, base) (*Int, bool)    z.set_string!(s, base) -> Int?
+#   z.SetBytes / x.Bytes / x.FillBytes   set_bytes! / bytes / fill_bytes(buf)
+#   Abs Neg Add Sub Mul Quo Rem Div Mod  abs! neg! add! sub! mul! quo! rem! div! mod!
+#   z.QuoRem(x, y, r) (*Int, *Int)       z.quo_rem!(x, y) -> (Int, Int)   (q, r)
+#   z.DivMod(x, y, m) (*Int, *Int)       z.div_mod!(x, y) -> (Int, Int)   (d, m)
+#   z.Divide(x, y, r, mode)              z.divide!(x, y, mode) -> (Int, Int)
+#   Trunc / Floor / Round / Ceil         trunc / floor / round / ceil (functions)
+#   z.MulRange(a, b) / Binomial(n, k)    mul_range!(a, b) / binomial!(n, k)
+#   z.Exp(x, y, m) (nil m == 0)          z.exp!(x, y, m) -> Int?   (none: no inverse)
+#   z.GCD(nil, nil, a, b)                z.gcd!(a, b)
+#   z.GCD(x, y, a, b)                    z.gcd_xy!(a, b) -> (Int, Int, Int)   (d, x, y)
+#   z.ModInverse(g, n) / ModSqrt(x, p)   mod_inverse!(g, n) / mod_sqrt!(x, p) -> Int?
+#   Jacobi(x, y)                         jacobi(x, y)
+#   z.Rand(rnd, n)                       z.rand!(rnd, n)  (rnd: any `uint32! -> U32`)
+#   Lsh Rsh Bit SetBit (n uint)          lsh! rsh! bit set_bit! (counts are Int)
+#   And AndNot Or Xor Not Sqrt           and! and_not! or! xor! not! sqrt!
+#   Cmp CmpAbs Sign BitLen               cmp cmp_abs sign bit_len
+#   TrailingZeroBits                     trailing_zero_bits
+#   Int64 Uint64 IsInt64 IsUint64        int64 uint64 int64? uint64?
+#   x.Float64() (float64, Accuracy)      x.float64 -> (F64, Accuracy)
+#   ProbablyPrime(n)                     probably_prime?(n)
+#   Text(base) / Append / String         text(base) / append(buf, base) / to_s
+#   Format(fmt.State, verb)              x.format("%#08x")  (one verb, with text around)
+#   Scan(fmt.ScanState, verb)            z.scan!(reader, "x") -> ~Int<BigError>
+#   GobEncode/GobDecode                  gob_encode / gob_decode!(buf) -> ~...
+#   MarshalText/UnmarshalText/AppendText marshal_text / unmarshal_text! / append_text
+#   MarshalJSON/UnmarshalJSON            marshal_json / unmarshal_json!, plus
+#                                        encoding/json's protocol (json_enc,
+#                                        json_dec, ...): a big.Int, big.Rat or
+#                                        big.Float can be a field of a type
+#                                        that derives Json
+#   Rat: SetFrac SetFrac64 SetInt ...    set_frac! set_frac64! set_int! set_int64! set_uint64!
+#   Rat: SetFloat64 (nil if not finite)  set_float64!(f) -> Rat?
+#   Rat: Inv Num Denom IsInt             inv! num denom (copies) int?
+#   Rat: Float32 / Float64               float32 / float64 -> (F64, Bool)
+#   Rat: RatString FloatString FloatPrec rat_string float_string(n) float_prec
+#   Float: SetPrec SetMode Prec MinPrec  set_prec!(n) set_mode!(m) prec min_prec
+#   Float: Mode Acc Sign Signbit IsInf   mode acc sign signbit inf?
+#   Float: IsInt MantExp SetMantExp      int? mant_exp -> (Float, Int) set_mant_exp!(m, e)
+#   Float: SetInf Copy SetRat SetInt     set_inf! copy! set_rat! set_int!
+#   Float: Int(z) / Rat(z) (nil for Inf) int -> (Int?, Accuracy) / rat -> (Rat?, Accuracy)
+#   Float: Float32/Float64/Int64/Uint64  float32 / float64 / int64 / uint64 (with Accuracy)
+#   Float: Text(fmt, prec) / Append      text("g", prec) / append(buf, "g", prec)
+#   Float: Parse(s, base)                z.parse!(s, base) -> ~(Float, Int)<BigError>
+#   ParseFloat(s, base, prec, mode)      parse_float(s, base, prec, mode) -> ~(Float, Int)
+#   Float: SetString / Scan / Format     set_string!(s) -> Float? / scan! / format("%.10g")
+#   RoundingMode, Accuracy (+ String)    enums RoundingMode, Accuracy (to_s, to_i, from_i)
+#   MaxBase MaxExp MinExp MaxPrec        MAX_BASE MAX_EXP MIN_EXP MAX_PREC
+#   ErrNaN                               a panic with Go's message (see below)
+#   Word                                 U64
+#
+# Inside this package `Int` and `Float` are the package's types (alx lets a
+# package declare types named like these builtins); the builtins are
+# spelled I64 and F64 here. Other code writes big.Int and big.Float.
+#
+# Differences from Go:
+#  - Values instead of pointers (above). Methods that return extra results
+#    through *Int arguments (QuoRem, DivMod, Divide, GCD) return tuples;
+#    Rat.Num/Denom return copies, not pointers into the Rat; Int.Bits
+#    returns a copy and SetBits copies. There is no nil *Int / *Rat /
+#    *Float, so the "<nil>" forms of String and Format don't exist.
+#  - ErrNaN (Float operations that would produce a NaN: Inf - Inf, 0 * Inf,
+#    0/0, Inf/Inf, sqrt of a negative, NewFloat(NaN)) panics with Go's
+#    message; alx has no recover, so it can't be caught as a value.
+#  - fmt.Formatter / fmt.Scanner are methods taking the verb explicitly:
+#    x.format(spec) formats with the first verb in spec (flags, width,
+#    precision as Go's fmt), x.scan!(reader, verb) reads from a
+#    ByteReader (new_byte_reader(s)). fmt.Println(x) of a Float prints
+#    with %v (shortest 'g'); in alx `puts x` uses to_s, which is Go's
+#    String ('g' with 10 digits).
+#  - Float32 conversions (Rat.Float32, Float.Float32) return the float32
+#    value as an F64 (alx has no float32 type); it is exactly the value Go
+#    returns.
+#  - Rand takes any value with a `uint32! -> U32` method (alx has no
+#    math/rand yet); ProbablyPrime uses a port of Go's math/rand source
+#    seeded as Go seeds it, so it picks the same bases.
+#  - Encoding: gob_encode/gob_decode produce Go's GobEncode bytes (alx has
+#    no encoding/gob); there is no encoding/xml.
+#  - Go caches the base-10 conversion divisors in a global; alx has no
+#    mutable globals, so the first levels are constants (divisors10.alx)
+#    and larger ones are computed per conversion.
+#  - Inside this package, a type in one file that derives Json can't have
+#    an Int/Float field (the derive can't see another file's declaration);
+#    other packages are unaffected.
+#  - The aliasing and allocation checks of Go's tests (alias_test.go's
+#    pointer identities, AllocsPerRun) don't apply to values.
 
 import "strconv"
 

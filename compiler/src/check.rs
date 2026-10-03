@@ -356,7 +356,7 @@ impl<'a> World<'a> {
         let enums: Vec<&EnumDef> = enums.iter().filter(|d| d.tparams.is_empty()).collect();
         let all = defs.iter().copied().map(|d| (d.name.as_str(), d.span, Def::S(d))).chain(enums.iter().copied().map(|d| (d.name.as_str(), d.span, Def::E(d))));
         for (name, span, d) in all {
-            if by_name.contains_key(name) || self.structs.contains_key(name) || self.consts.contains_key(name) || ["Int", "Float", "Bool", "Str", "Array", "Map", "Math", "Test", "Enumerator", "Error", "Ptr", "F64"].iter().any(|b| *b == name && !SHADOWABLE.contains(b)) {
+            if by_name.contains_key(name) || self.structs.contains_key(name) || self.consts.contains_key(name) || ["Int", "Float", "Bool", "Str", "Array", "Map", "Math", "Test", "Enumerator", "Error", "Ptr", "F64"].contains(&name) {
                 return Err(Diag::new(span, format!("`{name}` is already defined")));
             }
             by_name.insert(name, d);
@@ -1070,14 +1070,15 @@ fn in_current_pkg(n: &str, structs: &Structs) -> bool {
 }
 
 /// Builtin type names a package may declare a type of its own with
-/// (math/big's `Int` and `Float`). Inside that package (or a main file that
-/// declares one) the name means its own type; the builtins stay reachable
-/// as `I64` and `F64`.
+/// (math/big's `Int` and `Float`). Inside that package the name means its
+/// own type; the builtins stay reachable as `I64` and `F64`. (A main file
+/// can't: its type names aren't qualified, so they would collide with the
+/// builtins'. `alx test` checks such a package under its import path.)
 pub const SHADOWABLE: [&str; 2] = ["Int", "Float"];
 
 /// Does `n` name a builtin type that the current code shadows with its own?
 pub fn shadowed(n: &str, structs: &Structs) -> bool {
-    SHADOWABLE.contains(&n) && (in_current_pkg(n, structs) || (current_pkg().is_empty() && structs.contains_key(n)))
+    SHADOWABLE.contains(&n) && in_current_pkg(n, structs)
 }
 
 pub fn type_from(t: &TypeExpr, structs: &Structs, consts: &Consts) -> R<Ty> {

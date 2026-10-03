@@ -1,5 +1,6 @@
 import "strings"
 import "strconv"
+import nurl "net/url"
 
 pub error HttpError {
   # A malformed request (the server answers 400).
@@ -27,92 +28,32 @@ pub error HttpError {
   }
 }
 
-def hex_val(c: Byte) -> Int {
-  return c.to_i - 48 if c >= 48 && c <= 57
-  return c.to_i - 87 if c >= 97 && c <= 102
-  return c.to_i - 55 if c >= 65 && c <= 70
-  -1
-}
-
-HEX = "0123456789ABCDEF"
-
-# Percent-decodes s. With `plus`, "+" is a space (query strings); paths keep it.
+# Percent-decodes s (net/url's query_unescape with `plus`, where "+" is a
+# space; else path_unescape, which keeps it). A malformed escape is a
+# BadRequest.
 pub def unescape(s: Str, plus: Bool) -> ~Str {
-  return s if !strings.contains(s, "%") && !(plus && strings.contains(s, "+"))
-  out: [Byte] = []
-  i = 0
-  n = s.size
-  while i < n {
-    c = s[i]
-    if c == 37 {
-      fail HttpError.BadRequest("invalid URL escape in #{s}") if i + 2 >= n
-      h = hex_val(s[i + 1])
-      l = hex_val(s[i + 2])
-      fail HttpError.BadRequest("invalid URL escape in #{s}") if h < 0 || l < 0
-      out << (h * 16 + l).as_u8
-      i += 3
-    } else if c == 43 && plus {
-      out << 32
-      i += 1
-    } else {
-      out << c
-      i += 1
-    }
-  }
-  Str.from_bytes(out)
+  r = plus ? nurl.query_unescape(s) : nurl.path_unescape(s)
+  fail HttpError.BadRequest("invalid URL escape in #{s}") if r.err?
+  r.unwrap
 }
 
-def unreserved(c: Byte) -> Bool {
-  (c >= 97 && c <= 122) || (c >= 65 && c <= 90) || (c >= 48 && c <= 57) || c == 45 || c == 95 || c == 46 || c == 126
-}
+# Escapes s for a query component (net/url's query_escape).
+pub def query_escape(s: Str) -> Str { nurl.query_escape(s) }
 
-# Escapes s for a query component: unreserved bytes stay, space is "+",
-# everything else is %XX.
-pub def query_escape(s: Str) -> Str {
-  escape(s, true)
-}
-
-# Escapes s for a path segment (space is %20).
-pub def path_escape(s: Str) -> Str {
-  escape(s, false)
-}
-
-def escape(s: Str, plus: Bool) -> Str {
-  out: [Byte] = []
-  for c in s.bytes {
-    if unreserved(c) {
-      out << c
-    } else if c == 32 && plus {
-      out << 43
-    } else {
-      out << 37
-      out << HEX[c.to_i >> 4]
-      out << HEX[c.to_i & 15]
-    }
-  }
-  Str.from_bytes(out)
-}
+# Escapes s for a path segment (net/url's path_escape).
+pub def path_escape(s: Str) -> Str { nurl.path_escape(s) }
 
 # The value of `key` in a raw query string ("a=1&b=2"), decoded; the first
-# one wins. none if absent or undecodable.
+# one wins. none if absent. Malformed pairs are skipped (net/url's
+# parse_query, as Go's Request.FormValue).
 pub def query_value(raw: Str, key: Str) -> Str? {
-  for part in strings.split(raw, "&") {
-    next if part.size == 0
-    k = part
-    v = ""
-    if kv = strings.cut(part, "=") {
-      k, v = kv
-    }
-    dk = unescape(k, true).unwrap_or(k)
-    if dk == key {
-      d = unescape(v, true)
-      return d.unwrap_or(v)
-    }
-  }
-  none
+  v, _ = nurl.parse_query_lax(raw)
+  return none unless v.has?(key)
+  v.get(key)
 }
 
-# Every (key, value) pair of a raw query string, decoded, in order.
+# Every (key, value) pair of a raw query string, decoded, in order (pairs
+# that don't decode are kept as written).
 pub def query_pairs(raw: Str) -> [(Str, Str)] {
   out: [(Str, Str)] = []
   for part in strings.split(raw, "&") {
@@ -122,7 +63,7 @@ pub def query_pairs(raw: Str) -> [(Str, Str)] {
     if kv = strings.cut(part, "=") {
       k, v = kv
     }
-    out << (unescape(k, true).unwrap_or(k), unescape(v, true).unwrap_or(v))
+    out << (nurl.query_unescape(k).unwrap_or(k), nurl.query_unescape(v).unwrap_or(v))
   }
   out
 }
@@ -132,6 +73,7 @@ pub struct Url {
   scheme: Str
   host: Str
   port: Int
+  # the path as escaped in the URL
   path: Str
   raw_query: Str
 
@@ -154,35 +96,27 @@ pub struct Url {
   }
 }
 
+# Parses an http URL (net/url's parse; a missing scheme means http).
 pub def parse_url(u: Str) -> ~Url {
-  rest = u
-  scheme = "http"
-  if i = strings.cut(u, "://") {
-    scheme, rest = i
-  }
-  fail HttpError.BadUrl("unsupported scheme #{scheme}") if scheme != "http"
-  fail HttpError.BadUrl("missing host in #{u}") if rest.size == 0
-  j = strings.index_any(rest, "/?")
-  hostport = rest
-  tail = ""
-  if j >= 0 {
-    hostport = rest[0...j]
-    tail = rest[j...rest.size]
-  }
-  path = tail
-  query = ""
-  if pq = strings.cut(tail, "?") {
-    path, query = pq
-  }
-  fail HttpError.BadUrl("missing host in #{u}") if hostport.size == 0
-  host = hostport
+  s = strings.contains(u, "://") ? u : "http://" + u
+  r = nurl.parse(s)
+  fail HttpError.BadUrl(r.err.unwrap.message) if r.err?
+  pu = r.unwrap
+  fail HttpError.BadUrl("unsupported scheme #{pu.scheme}") if pu.scheme != "http"
+  fail HttpError.BadUrl("missing host in #{u}") if pu.host.size == 0
   port = 80
-  c = strings.last_index(hostport, ":")
-  if c >= 0 && !strings.has_suffix(hostport, "]") {
-    host = hostport[0...c]
-    port = strconv.atoi(hostport[c + 1...hostport.size]).unwrap_or(-1)
+  if pu.port != "" {
+    port = strconv.atoi(pu.port).unwrap_or(-1)
     fail HttpError.BadUrl("invalid port in #{u}") if port < 0 || port > 65535
   }
-  host = host[1...host.size - 1] if host.size > 1 && host[0] == 91
-  Url.new(scheme: scheme, host: host, port: port, path: path, raw_query: query)
+  Url.new(scheme: pu.scheme, host: pu.hostname, port: port, path: pu.escaped_path, raw_query: pu.raw_query)
+}
+
+# `ref` (a redirect's Location) resolved against the URL `base`.
+pub def resolve_url(base: Str, ref: Str) -> ~Str {
+  b = nurl.parse(base)
+  fail HttpError.BadUrl(b.err.unwrap.message) if b.err?
+  r = nurl.parse(ref)
+  fail HttpError.BadUrl(r.err.unwrap.message) if r.err?
+  b.unwrap.resolve_reference(r.unwrap).to_s
 }

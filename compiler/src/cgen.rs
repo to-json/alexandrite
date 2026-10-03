@@ -19,7 +19,9 @@ pub fn ty_name(t: &LTy) -> String {
         LTy::Str => "Str".into(),
         LTy::Unit => "Unit".into(),
         LTy::Arr(t) => format!("Arr_{}", ty_name(t)),
-        LTy::Tup(ts) => format!("Tup_{}", ts.iter().map(ty_name).collect::<Vec<_>>().join("_")),
+        // The arity keeps nested tuples apart: Tup(Tup(A), B) and
+        // Tup(Tup(A, B)) would both be Tup_Tup_A_B.
+        LTy::Tup(ts) => format!("Tup{}_{}", ts.len(), ts.iter().map(ty_name).collect::<Vec<_>>().join("_")),
         LTy::Range => "Range".into(),
         LTy::Gen(t) => format!("Gen_{}", ty_name(t)),
     }

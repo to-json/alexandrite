@@ -581,19 +581,41 @@ impl<'a> Lw<'a> {
                 (Some(c), _) => Some((*c, *c)),
                 (_, Some(Fact::Interval(lo, hi))) => Some((*lo, *hi)),
                 (_, Some(Fact::IndexOf(arr))) => self.fixed_len.get(arr).map(|n| (0, n - 1)),
-                _ => None,
+                _ => ty_range(&e.ty),
             },
             TK::Bin(op, a, b) => {
-                let (a, b) = (self.interval(a)?, self.interval(b)?);
+                let (Some(a), Some(b)) = (self.interval(a), self.interval(b)) else { return ty_range(&e.ty) };
                 let combos = |f: fn(i64, i64) -> Option<i64>| -> Option<(i64, i64)> {
                     let vs = [f(a.0, b.0)?, f(a.0, b.1)?, f(a.1, b.0)?, f(a.1, b.1)?];
                     Some((*vs.iter().min()?, *vs.iter().max()?))
                 };
-                match op {
+                let r = match op {
                     BinOp::Add => combos(i64::checked_add),
                     BinOp::Sub => combos(i64::checked_sub),
                     BinOp::Mul => combos(i64::checked_mul),
+                    // x & y with a non-negative side: within [0, that side's max].
+                    BinOp::BitAnd if a.0 >= 0 && b.0 >= 0 => Some((0, a.1.min(b.1))),
+                    BinOp::BitAnd if a.0 >= 0 => Some((0, a.1)),
+                    BinOp::BitAnd if b.0 >= 0 => Some((0, b.1)),
+                    // A non-negative value shifted right by a constant count.
+                    BinOp::Shr if a.0 >= 0 && b.0 == b.1 && (0..64).contains(&b.0) => Some((a.0 >> b.0, a.1 >> b.0)),
                     _ => None,
+                };
+                // Wrapping or narrow arithmetic: the result type's range bounds it.
+                match (r, ty_range(&e.ty)) {
+                    (Some((lo, hi)), Some((tlo, thi))) if lo < tlo || hi > thi => Some((tlo, thi)),
+                    (None, t) => t,
+                    (r, _) => r,
+                }
+            }
+            // A conversion keeps a value that fits the target type; otherwise
+            // the result is somewhere in the target's range.
+            TK::M(M::Conv(..), Some(r), _, _) => {
+                let t = ty_range(&e.ty);
+                match (self.interval(r), t) {
+                    (Some((lo, hi)), Some((tlo, thi))) if lo >= tlo && hi <= thi => Some((lo, hi)),
+                    (Some((lo, hi)), None) if e.ty == Ty::Int && r.ty != Ty::IntK(crate::ast::IntKind::U64) => Some((lo, hi)),
+                    _ => t,
                 }
             }
             TK::M(M::IntSqrt, None, args, _) => self.interval(&args[0]).filter(|(lo, _)| *lo >= 0).map(|(lo, hi)| (isqrt(lo), isqrt(hi))),
@@ -605,7 +627,7 @@ impl<'a> Lw<'a> {
                 TK::Local(l) if matches!(r.ty, Ty::Array(_)) && self.f.locals[l].reassigned == 0 => self.fixed_len.get(&l).map(|n| (*n, *n)),
                 _ => None,
             },
-            _ => None,
+            _ => ty_range(&e.ty),
         }
     }
 
@@ -614,6 +636,14 @@ impl<'a> Lw<'a> {
         let loc = Some(self.loc(idx.span));
         if !self.opts.release {
             return loc;
+        }
+        // A `[T; N]` value has N elements, whatever expression made it.
+        if let Ty::Fixed(_, n) = &arr.ty {
+            if let Some((lo, hi)) = self.interval(idx) {
+                if lo >= 0 && (hi as u64) < *n {
+                    return None;
+                }
+            }
         }
         let TK::Local(a) = arr.kind else { return loc };
         if let TK::Local(i) = idx.kind {
@@ -4914,4 +4944,12 @@ fn light_iter(ss: &mut Vec<LS>, r: V, mark: V, larges: V) {
         }
     }
     *ss = out;
+}
+
+/// The range of an integer type narrower than 64 bits (I64, U64: none).
+fn ty_range(t: &Ty) -> Option<(i64, i64)> {
+    match t {
+        Ty::IntK(k) if k.bits() < 64 => Some((k.min() as i64, k.max() as i64)),
+        _ => None,
+    }
 }

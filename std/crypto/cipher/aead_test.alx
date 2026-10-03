@@ -1,0 +1,138 @@
+# Go's crypto/internal/cryptotest.TestAEAD, for an AEAD. Not translated:
+# the BufferOverlap subtest (it expects panics, which an alx test can't
+# catch). OutOfBounds places its buffers next to guard pages in Go; here
+# the same lengths just round-trip (alx slices are bounds-checked).
+
+def aead_lengths -> [Int] { [0, 156, 8192, 8193, 8208] }
+
+def seal_msg[A](aead: A, dst: [Byte], nonce: [Byte], plaintext: [Byte], add_data: [Byte]) -> [Byte] {
+  out = aead.seal(dst, nonce, plaintext, add_data)
+  assert out.size - dst.size <= plaintext.size + aead.overhead, "ciphertext exceeds plaintext by more than overhead"
+  out
+}
+
+def open_without_error[A](aead: A, dst: [Byte], nonce: [Byte], ciphertext: [Byte], add_data: [Byte]) -> [Byte] {
+  r = aead.open(dst, nonce, ciphertext, add_data)
+  assert r.ok?, "open failed on properly formed ciphertext"
+  r.unwrap
+}
+
+def deterministic?[A](aead: A) -> Bool {
+  nonce = [0.as_u8; aead.nonce_size]
+  ad = "additional data".bytes.to_a
+  pt = "plaintext".bytes.to_a
+  aead.seal([], nonce, pt, ad) == aead.seal([], nonce, pt, ad)
+}
+
+def check_aead[A](aead: A) {
+  ns = aead.nonce_size
+  seed: U64 = 700
+
+  # Roundtrip
+  for pt_len in aead_lengths() {
+    for ad_len in aead_lengths() {
+      seed += 3
+      nonce = gen(seed, ns)
+      before = gen(seed + 1, ad_len)
+      add_data = gen(seed + 2, pt_len)
+      ciphertext = seal_msg(aead, [], nonce, before, add_data)
+      after = open_without_error(aead, [], nonce, ciphertext, add_data)
+      assert_eq after, before
+    }
+  }
+
+  # OutOfBounds (without guard pages)
+  for pt_len in [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 127, 128, 129, 130, 131, 156, 8193] {
+    seed += 3
+    nonce = gen(seed, ns)
+    plaintext = gen(seed + 1, pt_len)
+    add_data = gen(seed + 2, 16)
+    ciphertext = seal_msg(aead, [], nonce, plaintext, add_data)
+    after = open_without_error(aead, [], nonce, ciphertext, add_data)
+    assert_eq after, plaintext
+  }
+
+  # InputNotModified
+  for pt_len in aead_lengths() {
+    for ad_len in aead_lengths() {
+      seed += 3
+      nonce = gen(seed, ns)
+      src = gen(seed + 1, pt_len)
+      before = src + []
+      add_data = gen(seed + 2, ad_len)
+      ciphertext = seal_msg(aead, [], nonce, src, add_data)
+      assert_eq src, before
+      before_ct = ciphertext + []
+      open_without_error(aead, [], nonce, ciphertext, add_data)
+      assert_eq ciphertext, before_ct
+    }
+  }
+
+  # AppendDst
+  det = deterministic?(aead)
+  for pt_len in aead_lengths() {
+    for ad_len in aead_lengths() {
+      seed += 4
+      nonce = gen(seed, ns)
+      prefixes = ["a".bytes.to_a, gen(seed + 1, 512)]
+      for prefix in prefixes {
+        plaintext = gen(seed + 2, pt_len)
+        add_data = gen(seed + 3, ad_len)
+        out = seal_msg(aead, prefix, nonce, plaintext, add_data)
+        assert_eq out[0...prefix.size], prefix
+        if det {
+          assert_eq out[prefix.size...out.size], seal_msg(aead, [], nonce, plaintext, add_data)
+        }
+        ciphertext = seal_msg(aead, [], nonce, plaintext, add_data)
+        opened = open_without_error(aead, prefix, nonce, ciphertext, add_data)
+        assert_eq opened[0...prefix.size], prefix
+        assert_eq opened[prefix.size...opened.size], plaintext
+      }
+    }
+  }
+
+  # WrongNonce
+  if ns != 0 {
+    for pt_len in aead_lengths() {
+      for ad_len in aead_lengths() {
+        seed += 3
+        nonce = gen(seed, ns)
+        plaintext = gen(seed + 1, pt_len)
+        add_data = gen(seed + 2, ad_len)
+        ciphertext = seal_msg(aead, [], nonce, plaintext, add_data)
+        alter = nonce + []
+        alter[ns - 1] = alter[ns - 1] +% 1
+        assert aead.open([], alter, ciphertext, add_data).err?, "open accepted a different nonce"
+      }
+    }
+  }
+
+  # WrongAddData
+  for pt_len in aead_lengths() {
+    for ad_len in aead_lengths() {
+      next if ad_len == 0
+      seed += 3
+      nonce = gen(seed, ns)
+      plaintext = gen(seed + 1, pt_len)
+      add_data = gen(seed + 2, ad_len)
+      ciphertext = seal_msg(aead, [], nonce, plaintext, add_data)
+      alter = add_data + []
+      alter[ad_len - 1] = alter[ad_len - 1] +% 1
+      assert aead.open([], nonce, ciphertext, alter).err?, "open accepted different additional data"
+    }
+  }
+
+  # WrongCiphertext
+  for pt_len in aead_lengths() {
+    for ad_len in aead_lengths() {
+      seed += 3
+      nonce = gen(seed, ns)
+      plaintext = gen(seed + 1, pt_len)
+      add_data = gen(seed + 2, ad_len)
+      ciphertext = seal_msg(aead, [], nonce, plaintext, add_data)
+      alter = ciphertext + []
+      alter[alter.size - 1] = alter[alter.size - 1] +% 1
+      assert aead.open([], nonce, alter, add_data).err?, "open accepted a different ciphertext"
+    }
+  }
+}

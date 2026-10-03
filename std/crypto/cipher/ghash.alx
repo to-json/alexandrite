@@ -1,0 +1,141 @@
+#![overflow(wrap)]
+# GHASH, the universal hash of GCM: Go's crypto/internal/fips140/aes/gcm
+# ghash.go. Constant-time: carry-less multiplication is done with ordinary
+# integer multiplication of masked values (no tables, no branches on data).
+
+# The constant-time carry-less product of two 32-bit integers (Go's
+# ghashMul). The technique is Thomas Pornin's (BearSSL,
+# https://www.bearssl.org/constanttime.html#ghash-for-gcm): the inputs are
+# split into four values each holding every fourth bit, so the carries of
+# the integer products land in the three-bit holes between them, and are
+# masked off. z_k collects the products x_i * y_j with i + j = k mod 4.
+def ghash_mul(x: U32, y: U32) -> U64 {
+  x0 = (x & 0x11111111).as_u64
+  x1 = (x & 0x22222222).as_u64
+  x2 = (x & 0x44444444).as_u64
+  x3 = (x & 0x88888888).as_u64
+  y0 = (y & 0x11111111).as_u64
+  y1 = (y & 0x22222222).as_u64
+  y2 = (y & 0x44444444).as_u64
+  y3 = (y & 0x88888888).as_u64
+  z0 = (x0 * y0) ^ (x1 * y3) ^ (x2 * y2) ^ (x3 * y1)
+  z1 = (x0 * y1) ^ (x1 * y0) ^ (x2 * y3) ^ (x3 * y2)
+  z2 = (x0 * y2) ^ (x1 * y1) ^ (x2 * y0) ^ (x3 * y3)
+  z3 = (x0 * y3) ^ (x1 * y2) ^ (x2 * y1) ^ (x3 * y0)
+  (z0 & 0x1111111111111111) | (z1 & 0x2222222222222222) | (z2 & 0x4444444444444444) | (z3 & 0x8888888888888888)
+}
+
+# GHASH of the inputs (each zero-padded to whole 16-byte blocks) under the
+# key hk (16 bytes), into out (16 bytes): the sum of the products of the
+# 128-bit blocks Y and H in GF(2^128), modulo the field polynomial.
+def ghash(out: [Byte], hk: [Byte], inputs: [[Byte]]) {
+  y = [0.as_u32; 4]
+  for input in inputs {
+    ghash_update(y, hk, input)
+  }
+  i = 0
+  while i < 4 {
+    put_be32(out, i * 4, y[3 - i])
+    i += 1
+  }
+  nil
+}
+
+# Go's GHASH(key, inputs...): the hash as a new 16-byte slice.
+def ghash_sum(key: [Byte], inputs: [[Byte]]) -> [Byte] {
+  out = [0.as_u8; 16]
+  ghash(out, key, inputs)
+  out
+}
+
+# Absorbs data (zero-padded to whole blocks) into the state y (four words,
+# least significant first).
+def ghash_update(y: [U32], hk: [Byte], data: [Byte]) {
+  n = data.size
+  return if n == 0
+  h3 = be32(hk, 0)
+  h2 = be32(hk, 4)
+  h1 = be32(hk, 8)
+  h0 = be32(hk, 12)
+  h01 = h0 ^ h1
+  h23 = h2 ^ h3
+  h02 = h0 ^ h2
+  h13 = h1 ^ h3
+  hall = h02 ^ h13
+  y0 = y[0]
+  y1 = y[1]
+  y2 = y[2]
+  y3 = y[3]
+  partial = [0.as_u8; 16]
+  off = 0
+  while off < n {
+    blk = data
+    bo = off
+    if n - off < 16 {
+      copy(partial, data[off...n])
+      blk = partial
+      bo = 0
+    }
+    y3 ^= be32(blk, bo)
+    y2 ^= be32(blk, bo + 4)
+    y1 ^= be32(blk, bo + 8)
+    y0 ^= be32(blk, bo + 12)
+    off += 16
+
+    # y*h as nine 32x32 products (Karatsuba twice):
+    #  lo = y0*h0, y2*h2, (y0^y2)*(h0^h2)
+    #  hi = y1*h1, y3*h3, (y1^y3)*(h1^h3)
+    #  sum = (y0^y1)*(h0^h1), (y2^y3)*(h2^h3), ((y0^y2)^(y1^y3))*((h0^h2)^(h1^h3))
+    y02 = y0 ^ y2
+    y13 = y1 ^ y3
+    lo0 = ghash_mul(y0, h0)
+    hi0 = ghash_mul(y1, h1)
+    sum0 = ghash_mul(y0 ^ y1, h01)
+    lo1 = ghash_mul(y2, h2)
+    hi1 = ghash_mul(y3, h3)
+    sum1 = ghash_mul(y2 ^ y3, h23)
+    lo2 = ghash_mul(y02, h02)
+    hi2 = ghash_mul(y13, h13)
+    sum2 = ghash_mul(y02 ^ y13, hall)
+
+    # The 128-bit terms from their 64-bit products.
+    mid = sum0 ^ lo0 ^ hi0
+    r00 = lo0 ^ (mid << 32)
+    r01 = hi0 ^ (mid >> 32)
+    mid = sum1 ^ lo1 ^ hi1
+    r10 = lo1 ^ (mid << 32)
+    r11 = hi1 ^ (mid >> 32)
+    mid = sum2 ^ lo2 ^ hi2
+    r20 = lo2 ^ (mid << 32)
+    r21 = hi2 ^ (mid >> 32)
+
+    # The middle term: add the high and low terms to the sum term, then
+    # fold it into the low term's high half and the high term's low half.
+    r20 ^= r00 ^ r10
+    r21 ^= r01 ^ r11
+    r01 ^= r20
+    r10 ^= r21
+
+    # The 256-bit product, shifted by one bit (GHASH's bit order).
+    z0 = r00 << 1
+    z1 = (r01 << 1) | (r00 >> 63)
+    z2 = (r10 << 1) | (r01 >> 63)
+    z3 = (r11 << 1) | (r10 >> 63)
+
+    # Reduce modulo the field polynomial: z0, z1 hold the high-degree terms.
+    z2 ^= z0 ^ (z0 >> 1) ^ (z0 >> 2) ^ (z0 >> 7)
+    z1 ^= (z0 << 63) ^ (z0 << 62) ^ (z0 << 57)
+    z3 ^= z1 ^ (z1 >> 1) ^ (z1 >> 2) ^ (z1 >> 7)
+    z2 ^= (z1 << 63) ^ (z1 << 62) ^ (z1 << 57)
+
+    y0 = z2.as_u32
+    y1 = (z2 >> 32).as_u32
+    y2 = z3.as_u32
+    y3 = (z3 >> 32).as_u32
+  }
+  y[0] = y0
+  y[1] = y1
+  y[2] = y2
+  y[3] = y3
+  nil
+}

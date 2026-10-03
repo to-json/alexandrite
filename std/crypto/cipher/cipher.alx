@@ -1,0 +1,183 @@
+#![overflow(wrap)]
+# Package cipher: Go's crypto/cipher, the standard block cipher modes that
+# can be wrapped around low-level block cipher implementations (see
+# https://csrc.nist.gov/groups/ST/toolkit/BCM/current_modes.html and NIST
+# Special Publication 800-38A). Pure alx: the generic code of Go's
+# crypto/cipher and crypto/internal/fips140/aes{,/gcm}.
+#
+#   Go                                  alx
+#   cipher.Block / Stream / BlockMode / AEAD
+#                                       Block / Stream / BlockMode / AEAD (interfaces)
+#   b.Encrypt(dst, src) / Decrypt       b.encrypt(dst, src) / b.decrypt(dst, src)
+#   s.XORKeyStream(dst, src)            s.xor_key_stream!(dst, src)
+#   m.CryptBlocks(dst, src)             m.crypt_blocks!(dst, src)
+#   a.NonceSize / Overhead              a.nonce_size / a.overhead
+#   a.Seal(dst, nonce, pt, ad) []byte   a.seal(dst, nonce, pt, ad) -> [Byte]
+#   a.Open(dst, nonce, ct, ad) ([]byte, error)
+#                                       a.open(dst, nonce, ct, ad) -> ~[Byte]<CipherError>
+#   NewCBCEncrypter(b, iv) BlockMode    new_cbc_encrypter(b, iv) -> CbcEncrypter[B]
+#   NewCBCDecrypter(b, iv) BlockMode    new_cbc_decrypter(b, iv) -> CbcDecrypter[B]
+#   (cbc).SetIV(iv)                     m.set_iv!(iv)
+#   NewCTR(b, iv) Stream                new_ctr(b, iv) -> Ctr[B]
+#   NewCFBEncrypter / NewCFBDecrypter   new_cfb_encrypter / new_cfb_decrypter -> Cfb[B]
+#   NewOFB(b, iv) Stream                new_ofb(b, iv) -> Ofb[B]
+#   NewGCM(b) (AEAD, error)             new_gcm(b) -> ~Gcm[B]<CipherError>
+#   NewGCMWithNonceSize(b, n)           new_gcm_with_nonce_size(b, n) -> ~Gcm[B]<CipherError>
+#   NewGCMWithTagSize(b, n)             new_gcm_with_tag_size(b, n) -> ~Gcm[B]<CipherError>
+#   NewGCMWithRandomNonce(b) (AEAD, error)
+#                                       new_gcm_with_random_nonce(b: aes.Block) -> GcmWithRandomNonce
+#   StreamReader{S, R}                  StreamReader[S, R].new(s:, r:)   (read!)
+#   StreamWriter{S, W, Err}             StreamWriter[S, W].new(s:, w:)   (write!, close!)
+#   "cipher: message authentication failed"
+#                                       CipherError.AuthFailed (and the other errors, Go's text)
+#
+# The constructors are generic over the block (and stream, reader, writer)
+# type: `cipher.new_gcm(aes_block)` is a Gcm[aes.Block], which calls the AES
+# code directly (no dynamic dispatch), and is itself an AEAD. Any type with
+# Block's methods works, including a cipher.Block value.
+#
+# Timing: GHASH is Go's constant-time carry-less multiplication (BearSSL's
+# masked-integer-multiply technique); tag comparison is
+# subtle.constant_time_compare. The block cipher's own timing is its own:
+# see crypto/aes (table-based, as Go's generic AES) and crypto/des.
+#
+# Differences from Go:
+#   - Constructors return the concrete mode types (Go: the interfaces); each
+#     satisfies its interface (BlockMode, Stream, AEAD) and converts where
+#     one is wanted. A mode wrapping a cipher.Block *interface value* can't
+#     itself become an interface value (an alx interface value can't contain
+#     an interface value, D12): call its methods directly, or wrap the
+#     concrete block type.
+#   - Go picks assembly or AES-specific implementations by asking at run
+#     time whether the Block is an *aes.Block or has NewCTR / NewGCM /
+#     NewCBCEncrypter methods (the "ctrAble", "gcmAble", "cbcEncAble"
+#     upgrades). alx has no run-time type assertions; generic code is
+#     specialised at compile time instead, and every block runs the generic
+#     modes (which give the same output as Go's AES-specific ones).
+#   - Seal and Open return a new slice holding dst followed by the output
+#     (Go appends into dst's spare capacity when it has some; alx slices
+#     have no capacity), so `seal(pt[0...0], ...)` doesn't reuse pt's
+#     storage. Open fails with CipherError.AuthFailed and writes nothing.
+#   - Aliasing checks: alx slices don't expose addresses, so the "invalid
+#     buffer overlap" panics can't happen; dst == src works, as in Go.
+#     Other inexact overlaps give unspecified output instead of a panic.
+#   - Stream and BlockMode methods mutate the mode's state, so they end in
+#     `!`; the state lives in shared storage (GO-VS-RUBY D36), so copies of
+#     a mode are the same mode, as Go's pointers are.
+#   - StreamReader / StreamWriter are generic over what they wrap, like
+#     encoding/hex's Encoder[W]. StreamWriter.close! requires W to have a
+#     close! method (Go asks at run time whether W is an io.Closer); the
+#     unused Err field is gone.
+#   - new_gcm_with_random_nonce takes an aes.Block (Go takes a Block and
+#     fails unless it is an *aes.Block), so it can't fail and returns the
+#     AEAD directly.
+#   - No FIPS 140 modes, service indicators or BoringCrypto.
+
+import "crypto/subtle"
+
+# A block cipher using a given key: it encrypts or decrypts individual
+# blocks. The mode implementations extend that capability to streams of
+# blocks.
+pub interface Block {
+  # The cipher's block size.
+  def block_size -> Int
+  # Encrypts the first block in src into dst. dst and src must overlap
+  # entirely or not at all.
+  def encrypt(dst: [Byte], src: [Byte])
+  # Decrypts the first block in src into dst. dst and src must overlap
+  # entirely or not at all.
+  def decrypt(dst: [Byte], src: [Byte])
+}
+
+# A stream cipher.
+pub interface Stream {
+  # XORs each byte of src with a byte from the cipher's key stream into
+  # dst. dst and src must overlap entirely or not at all. Panics if dst is
+  # shorter than src; a longer dst is fine and only dst[0...src.size]
+  # changes. Successive calls behave as if the concatenation of the src
+  # buffers was passed in one call.
+  def xor_key_stream!(dst: [Byte], src: [Byte])
+}
+
+# A block cipher running in a block-based mode (CBC, ECB etc).
+pub interface BlockMode {
+  # The mode's block size.
+  def block_size -> Int
+  # Encrypts or decrypts a number of blocks. src.size must be a multiple of
+  # the block size; dst and src must overlap entirely or not at all. Panics
+  # if dst is shorter than src. Successive calls behave as if the
+  # concatenation of the src buffers was passed in one call.
+  def crypt_blocks!(dst: [Byte], src: [Byte])
+}
+
+# A symmetric key encryption mode that provides authenticated encryption
+# with associated data.
+pub interface AEAD {
+  # The size of the nonce that must be passed to seal and open.
+  def nonce_size -> Int
+  # The maximum difference between the lengths of a plaintext and its
+  # ciphertext.
+  def overhead -> Int
+  # Encrypts and authenticates plaintext, authenticates the additional data
+  # and returns dst followed by the result. The nonce must be nonce_size
+  # bytes long and unique for all time, for a given key.
+  def seal(dst: [Byte], nonce: [Byte], plaintext: [Byte], additional_data: [Byte]) -> [Byte]
+  # Decrypts and authenticates ciphertext, authenticates the additional
+  # data and, if successful, returns dst followed by the plaintext. The
+  # nonce and additional data must match the ones passed to seal.
+  def open(dst: [Byte], nonce: [Byte], ciphertext: [Byte], additional_data: [Byte]) -> ~[Byte]
+}
+
+# The errors of the GCM constructors and AEAD.open (Go's messages).
+pub error CipherError {
+  AuthFailed
+  IncorrectTagSize
+  ZeroNonceSize
+  NeedsBlockSize16
+
+  def message -> Str {
+    case self {
+      AuthFailed => "cipher: message authentication failed"
+      IncorrectTagSize => "cipher: incorrect tag size given to GCM"
+      ZeroNonceSize => "cipher: the nonce can't have zero length"
+      NeedsBlockSize16 => "cipher: NewGCM requires 128-bit block cipher"
+    }
+  }
+}
+
+# dst[i] = x[i] ^ y[i] for i < n; the caller checked the lengths.
+def xor_n(dst: [Byte], x: [Byte], y: [Byte], n: Int) {
+  d = dst[0...n]
+  a = x[0...n]
+  b = y[0...n]
+  i = 0
+  while i < n {
+    d[i] = a[i] ^ b[i]
+    i += 1
+  }
+  nil
+}
+
+# subtle.xor_bytes: XORs min(x.size, y.size) bytes into dst; returns the
+# count.
+def xor_bytes(dst: [Byte], x: [Byte], y: [Byte]) -> Int {
+  subtle.xor_bytes(dst, x, y)
+}
+
+def be32(b: [Byte], i: Int) -> U32 {
+  (b[i].as_u32 << 24) | (b[i + 1].as_u32 << 16) | (b[i + 2].as_u32 << 8) | b[i + 3].as_u32
+}
+
+def put_be32(b: [Byte], i: Int, v: U32) {
+  d = b
+  d[i] = (v >> 24).as_u8
+  d[i + 1] = (v >> 16).as_u8
+  d[i + 2] = (v >> 8).as_u8
+  d[i + 3] = v.as_u8
+  nil
+}
+
+def put_be64(b: [Byte], i: Int, v: U64) {
+  put_be32(b, i, (v >> 32).as_u32)
+  put_be32(b, i + 4, v.as_u32)
+}

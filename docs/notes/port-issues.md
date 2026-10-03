@@ -34,7 +34,7 @@ Open problems agents reported; each gets fixed in a compiler round between waves
 | 28 | math/big | no add-with-carry: big Mul/String ~2x Go | open (perf) |
 | 29 | math/big | tuple-returning functions get region mark/reset even when they don't allocate (`bits.add64` slow in loops) | open (perf) |
 | 30 | math/big | no mutable package globals (caches like Go's divisor table) | open (design) |
-| 31 | math/big | `format` has no `%g` | open |
+| 31 | math/big | `format` has no `%g` | fixed: `%g` (shortest, as Go); `%.Ng` and `%G` not yet |
 | 32 | math/big | a main file can't declare its own `Int`/`Float` (only packages can) | open (by design for now) |
 | 33 | sync | a generic call's block that only decides the result type (`once_value { 42 }`) was refused; type parameters weren't bound through function or tuple types | fixed: an open result type is decided by the block's body; `bind_tparams` walks `Fn` and tuples |
 | 34 | sync | `x: pkg.T[K, V] = pkg.make` (wanted type from another package) didn't infer the type parameters | fixed: a qualified instance matches its unqualified declaration |

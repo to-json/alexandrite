@@ -2757,6 +2757,10 @@ impl<'w, 'a> FnCx<'w, 'a> {
                 let vals = fs.clone().iter().map(|(_, ft)| self.zero_of(ft, sp)).collect::<Option<Vec<_>>>()?;
                 TK::M(M::StructNew, None, vals, None)
             }
+            // An interface's zero is all-zero storage: its first implementor's
+            // zero value (filling another variant's slots of an enum, or a
+            // field a keyword `new` leaves out; Go's would be nil).
+            Ty::Iface(_) => TK::Zero,
             _ => return None,
         };
         Some(self.mk(kind, t.clone(), sp))

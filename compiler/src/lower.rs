@@ -1042,6 +1042,7 @@ impl<'a> Lw<'a> {
             TK::PlaceAssign(l, steps, op, v) => self.place_assign(*l, steps, *op, v, e),
             TK::Format(pieces, args) => self.format(pieces, args),
             TK::Seq(ss) => self.scoped_value(ss, &e.ty),
+            TK::Zero => zero_le(&self.lty(&e.ty)),
             TK::None => {
                 let t = self.lty(&e.ty);
                 let LTy::Tup(ts) = &t else { unreachable!() };

@@ -1,0 +1,360 @@
+# Package cookiejar: Go's net/http/cookiejar, an in-memory RFC 6265 cookie
+# jar for net/http's Client.
+#
+#   jar = cookiejar.new_jar(cookiejar.Options.new(public_suffix_list: my_list))
+#   client = http.Client.new(max_redirects: 10, jar: jar)
+#
+#   Go                                   alx
+#   New(&Options{PublicSuffixList: l})   new_jar(Options.new(public_suffix_list: l)) -> Jar
+#   New(nil)                             new_jar(Options.new)
+#   PublicSuffixList interface           PublicSuffixList (public_suffix(domain), to_s)
+#   (*Jar).SetCookies(u, cookies)        Jar.set_cookies(u: url.Url, cookies: [http.Cookie])
+#   (*Jar).Cookies(u) []*http.Cookie     Jar.cookies(u) -> [http.Cookie]
+#
+# A Jar implements http.CookieJar. It is a handle: its entries live in a
+# Mutex, so copies (the one in a Client, the caller's) are the same jar and
+# tasks may share it.
+#
+# Differences from Go: New never fails in Go either, so new_jar returns the
+# Jar itself; set_cookies_at / cookies_at take the current time explicitly
+# (Go's unexported setCookies / cookies, used by its tests). Without a public
+# suffix list (as in Go) any domain cookie whose domain isn't an IP is
+# accepted for its eTLD+1 by the last-label rule; use a real list in
+# production (alx has no golang.org/x/net/publicsuffix yet).
+#
+# All of jar_test.go and punycode_test.go is translated.
+import "strings"
+import "slices"
+import "cmp"
+import "time"
+import "net"
+import "net/netip"
+import "net/http"
+import nurl "net/url"
+
+# A public suffix list (https://publicsuffix.org): the public suffix of a
+# domain ("co.uk" for "www.bbc.co.uk"), and a description of the list.
+pub interface PublicSuffixList {
+  def public_suffix(domain: Str) -> Str
+  def to_s -> Str
+}
+
+pub struct Options {
+  # none: every domain cookie is accepted (see the package header).
+  public_suffix_list: PublicSuffixList?
+}
+
+pub error JarError {
+  IllegalDomain
+  MalformedDomain
+  BadHost
+
+  def message -> Str {
+    case self {
+      IllegalDomain => "cookiejar: illegal cookie domain attribute"
+      MalformedDomain => "cookiejar: malformed cookie domain attribute"
+      BadHost => "cookiejar: bad host"
+    }
+  }
+}
+
+struct Entry {
+  name: Str
+  value: Str
+  quoted: Bool
+  domain: Str
+  path: Str
+  same_site: Str
+  secure: Bool
+  http_only: Bool
+  persistent: Bool
+  host_only: Bool
+  expires: time.Time
+  creation: time.Time
+  last_access: time.Time
+  seq_num: Int
+
+  def id -> Str { "#{domain};#{path};#{name}" }
+
+  def should_send?(https: Bool, host: Str, path0: Str) -> Bool {
+    domain_match?(host) && path_match?(path0) && secure_match?(https)
+  }
+
+  def domain_match?(host: Str) -> Bool {
+    return true if domain == host
+    !host_only && has_dot_suffix?(host, domain)
+  }
+
+  def path_match?(request_path: Str) -> Bool {
+    return true if request_path == path
+    if strings.has_prefix(request_path, path) {
+      return true if path[path.size - 1] == 47
+      return true if request_path[path.size] == 47
+    }
+    false
+  }
+
+  def secure_match?(https: Bool) -> Bool {
+    return true if !secure || https
+    return true if localhost?(domain)
+    ip = netip.parse_addr(domain)
+    ip.ok? && ip.unwrap.loopback?
+  }
+}
+
+struct JarState {
+  entries: Map[Str, Map[Str, Entry]]
+  next_seq_num: Int
+}
+
+# An in-memory cookie jar (Go's Jar).
+pub struct Jar {
+  ps: PublicSuffixList?
+  st: Mutex[JarState]
+
+  # The cookies to send in a request for u.
+  pub def cookies(u: nurl.Url) -> [http.Cookie] {
+    cookies_at(u, time.now)
+  }
+
+  # Handles the cookies received in a response to a request for u.
+  pub def set_cookies(u: nurl.Url, cookies: [http.Cookie]) {
+    set_cookies_at(u, cookies, time.now)
+  }
+
+  # cookies at time `now` (Go's unexported cookies).
+  pub def cookies_at(u: nurl.Url, now: time.Time) -> [http.Cookie] {
+    out: [http.Cookie] = []
+    return out if u.scheme != "http" && u.scheme != "https"
+    hr = canonical_host(u.host)
+    return out if hr.err?
+    host = hr.unwrap
+    key = jar_key(host, ps)
+    https = u.scheme == "https"
+    path = u.path
+    path = "/" if path == ""
+    selected: [Entry] = st.lock { |s|
+      sel: [Entry] = []
+      if submap = s.entries[key] {
+        gone: [Str] = []
+        for id, e in submap {
+          if e.persistent && !e.expires.after(now) {
+            gone << id
+            next
+          }
+          next unless e.should_send?(https, host, path)
+          e2 = e
+          e2.last_access = now
+          submap[id] = e2
+          sel << e2
+        }
+        for id in gone {
+          submap.delete(id)
+        }
+        s.entries.delete(key) if submap.size == 0
+      }
+      sel
+    }
+    slices.sort_func(selected) { |a, b|
+      r = strings.compare(b.path, a.path)
+      r = a.creation.compare(b.creation) if r == 0
+      r = cmp.compare(a.seq_num, b.seq_num) if r == 0
+      r
+    }
+    for e in selected {
+      out << http.Cookie.new(name: e.name, value: e.value, quoted: e.quoted)
+    }
+    out
+  }
+
+  # set_cookies at time `now` (Go's unexported setCookies).
+  pub def set_cookies_at(u: nurl.Url, cookies: [http.Cookie], now: time.Time) {
+    return if cookies.size == 0
+    return if u.scheme != "http" && u.scheme != "https"
+    hr = canonical_host(u.host)
+    return if hr.err?
+    host = hr.unwrap
+    key = jar_key(host, ps)
+    def_path = default_path(u.path)
+    psl = ps
+    st.lock { |s|
+      sub: Map[Str, Entry] = s.entries[key] || {}
+      for c in cookies {
+        ne = new_entry(psl, c, now, def_path, host)
+        next if ne.err?
+        e, remove = ne.unwrap
+        id = e.id
+        if remove {
+          sub.delete(id)
+          next
+        }
+        if old = sub[id] {
+          e.creation = old.creation
+          e.seq_num = old.seq_num
+        } else {
+          e.creation = now
+          e.seq_num = s.next_seq_num
+          s.next_seq_num = s.next_seq_num + 1
+        }
+        e.last_access = now
+        sub[id] = e
+      }
+      if sub.size == 0 {
+        s.entries.delete(key)
+      } else {
+        s.entries[key] = sub
+      }
+      # (a block value ending in an if/else whose arms are a map delete and
+      # a map store miscompiles on C: the store arm becomes `= 0`)
+      nil
+    }
+    return
+  }
+}
+
+# An empty jar.
+pub def new_jar(o: Options) -> Jar {
+  m: Map[Str, Map[Str, Entry]] = {}
+  Jar.new(ps: o.public_suffix_list, st: Mutex.new(JarState.new(entries: m, next_seq_num: 0)))
+}
+
+def localhost?(host0: Str) -> Bool {
+  host = strings.trim_suffix(host0, ".")
+  idx = strings.last_index(host, ".")
+  host = host[idx + 1...host.size] if idx >= 0
+  strings.equal_fold(host, "localhost") && ascii_only?(host)
+}
+
+def ascii_only?(s: Str) -> Bool {
+  for c in s.bytes {
+    return false if c >= 0x80
+  }
+  true
+}
+
+# Whether s ends in "." + suffix (and is longer than that).
+def has_dot_suffix?(s: Str, suffix: Str) -> Bool {
+  s.size > suffix.size && s[s.size - suffix.size - 1] == 46 && s[s.size - suffix.size...s.size] == suffix
+}
+
+# The host without port and trailing dot, punycoded and lower-cased.
+def canonical_host(host0: Str) -> ~Str {
+  host = host0
+  if has_port?(host) {
+    h, _ = ~net.split_host_port(host)
+    host = h
+  }
+  host = strings.trim_suffix(host, ".")
+  encoded = ~to_ascii(host)
+  for c in encoded.bytes {
+    # (Go's ascii.ToLower: "" for a non-printable byte)
+    return "" if c < 32 || c > 126
+  }
+  strings.to_lower(encoded)
+}
+
+def has_port?(host: Str) -> Bool {
+  colons = strings.count(host, ":")
+  return false if colons == 0
+  return true if colons == 1
+  host[0] == 91 && strings.contains(host, "]:")
+}
+
+# The key of the entries map for host: its eTLD+1 (or the host itself).
+def jar_key(host: Str, psl: PublicSuffixList?) -> Str {
+  return host if ip?(host)
+  i = 0
+  if p = psl {
+    suffix = p.public_suffix(host)
+    return host if suffix == host
+    i = host.size - suffix.size
+    return host if i <= 0 || host[i - 1] != 46
+  } else {
+    i = strings.last_index(host, ".")
+    return host if i <= 0
+  }
+  prev_dot = strings.last_index(host[0...i - 1], ".")
+  host[prev_dot + 1...host.size]
+}
+
+def ip?(host: Str) -> Bool {
+  return true if strings.contains_any(host, ":%")
+  netip.parse_addr(host).ok?
+}
+
+# The directory part of a request path (RFC 6265 5.1.4).
+def default_path(path: Str) -> Str {
+  return "/" if path.size == 0 || path[0] != 47
+  i = strings.last_index(path, "/")
+  return "/" if i == 0
+  path[0...i]
+}
+
+def end_of_time -> time.Time {
+  time.date(9999, 12, 31, 23, 59, 59, 0, time.utc)
+}
+
+# The entry for cookie c received at `now` from `host` (default path
+# def_path), and whether c deletes it.
+def new_entry(psl: PublicSuffixList?, c: http.Cookie, now: time.Time, def_path: Str, host: Str) -> ~(Entry, Bool) {
+  e = Entry.new(name: c.name)
+  if c.path == "" || c.path[0] != 47 {
+    e.path = def_path
+  } else {
+    e.path = c.path
+  }
+  d, host_only = ~domain_and_type(psl, host, c.domain)
+  e.domain = d
+  e.host_only = host_only
+  if c.max_age < 0 {
+    return (e, true)
+  } else if c.max_age > 0 {
+    e.expires = now.add(time.second * c.max_age)
+    e.persistent = true
+  } else if c.expires.is_zero {
+    e.expires = end_of_time()
+    e.persistent = false
+  } else {
+    return (e, true) unless c.expires.after(now)
+    e.expires = c.expires
+    e.persistent = true
+  }
+  e.value = c.value
+  e.quoted = c.quoted
+  e.secure = c.secure
+  e.http_only = c.http_only
+  if c.same_site == http.SAME_SITE_DEFAULT_MODE {
+    e.same_site = "SameSite"
+  } else if c.same_site == http.SAME_SITE_STRICT_MODE {
+    e.same_site = "SameSite=Strict"
+  } else if c.same_site == http.SAME_SITE_LAX_MODE {
+    e.same_site = "SameSite=Lax"
+  }
+  (e, false)
+}
+
+# The cookie's domain and whether it is a host-only cookie (Go's
+# domainAndType).
+def domain_and_type(psl: PublicSuffixList?, host: Str, domain0: Str) -> ~(Str, Bool) {
+  return (host, true) if domain0 == ""
+  if ip?(host) {
+    fail JarError.IllegalDomain if host != domain0
+    return (host, true)
+  }
+  domain = strings.trim_prefix(domain0, ".")
+  fail JarError.MalformedDomain if domain.size == 0 || domain[0] == 46
+  for c in domain.bytes {
+    fail JarError.MalformedDomain if c < 32 || c > 126
+  }
+  domain = strings.to_lower(domain)
+  fail JarError.MalformedDomain if domain[domain.size - 1] == 46
+  if p = psl {
+    ps = p.public_suffix(domain)
+    if ps != "" && !has_dot_suffix?(domain, ps) {
+      return (host, true) if host == domain
+      fail JarError.IllegalDomain
+    }
+  }
+  fail JarError.IllegalDomain if host != domain && !has_dot_suffix?(host, domain)
+  (domain, false)
+}

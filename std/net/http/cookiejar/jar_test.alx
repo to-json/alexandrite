@@ -1,0 +1,129 @@
+# Go's net/http/cookiejar tests: the helpers of jar_test.go (the tables are
+# in vec_jar_test.alx, transcribed from Go's sources by a generator, plus
+# random sessions run through Go's jar), TestIssue19384, and the jar used by
+# net/http's Client against a loopback server.
+import "net"
+import "strings"
+import "time"
+import "net/http"
+import nurl "net/url"
+
+# Go's testPSL: "co.uk" and the default rule "*", with two intentional bugs.
+struct TestPSL {
+  def to_s -> Str { "testPSL" }
+
+  def public_suffix(d: Str) -> Str {
+    return "co.uk" if d == "co.uk" || strings.has_suffix(d, ".co.uk")
+    return "xy" if d == "www.buggy.psl"
+    return "com" if d == "www2.buggy.psl"
+    d[strings.last_index(d, ".") + 1...d.size]
+  }
+}
+
+def test_psl -> PublicSuffixList? {
+  p: PublicSuffixList = TestPSL.new
+  p
+}
+
+def new_test_jar -> Jar {
+  new_jar(Options.new(public_suffix_list: test_psl()))
+}
+
+def t_now -> time.Time {
+  time.date(2013, 1, 1, 12, 0, 0, 0, time.utc)
+}
+
+def must_parse_url(s: Str) -> nurl.Url {
+  u = nurl.parse(s).unwrap
+  assert u.scheme != "" && u.host != "", "Unable to parse URL #{s}."
+  u
+}
+
+def ch(h: Str) -> Str {
+  r = canonical_host(h)
+  r.err? ? "error" : r.unwrap
+}
+
+def dat(host: Str, domain: Str) -> Str {
+  r = domain_and_type(test_psl(), host, domain)
+  return "ERR " + r.err.unwrap.message if r.err?
+  d, ho = r.unwrap
+  "#{d}|#{ho}"
+}
+
+# Go's jarTest.run: set the cookies at t_now, check the jar's content at
+# t_now + 1001 ms, then each query n at t_now + (n+2) * 1001 ms.
+def run_jar_test(jar: Jar, desc: Str, from: Str, set_cookies: [Str], content: Str, queries: [(Str, Str)]) {
+  now = t_now()
+  cs: [http.Cookie] = []
+  for line in set_cookies {
+    h = http.new_header
+    h.add!("Set-Cookie", line)
+    got = http.read_set_cookies(h)
+    assert_eq got.size, 1
+    cs << got[0]
+  }
+  jar.set_cookies_at(must_parse_url(from), cs, now)
+  now = now.add(time.millisecond * 1001)
+  t = now
+  parts: [Str] = jar.st.lock { |s|
+    ps: [Str] = []
+    for _, sub in s.entries {
+      for _, e in sub {
+        next unless e.expires.after(t)
+        v = e.value
+        v = "\"" + v + "\"" if strings.contains_any(v, " ,") || e.quoted
+        ps << e.name + "=" + v
+      }
+    }
+    ps
+  }
+  assert_eq "#{desc} content: " + strings.join(parts.sort, " "), "#{desc} content: " + content
+  for qy in queries {
+    now = now.add(time.millisecond * 1001)
+    got = jar.cookies_at(must_parse_url(qy[0]), now).map { it.to_s }.to_a
+    assert_eq "#{desc} #{qy[0]}: " + strings.join(got, " "), "#{desc} #{qy[0]}: " + qy[1]
+  }
+}
+
+test "issue 19384" {
+  cookies = [http.Cookie.new(name: "name", value: "value")]
+  for host in ["", ".", "..", "..."] {
+    jar = new_jar(Options.new)
+    u = nurl.Url.new(scheme: "http", host: host, path: "/")
+    assert_eq jar.cookies(u).size, 0
+    jar.set_cookies(u, cookies)
+    got = jar.cookies(u)
+    assert_eq got.size, 1
+    assert_eq got[0].value, "value"
+  }
+}
+
+test "the jar as a Client's cookie jar" {
+  mux = http.new_serve_mux
+  mux.handle_func("/login") { |w, r|
+    http.set_cookie(w, http.Cookie.new(name: "session", value: "s1", path: "/"))
+    http.set_cookie(w, http.Cookie.new(name: "only_login", value: "x", path: "/login"))
+    http.redirect(w, r, "/home", 302)
+  }
+  mux.handle_func("/home") { |w, r|
+    w.write_string!(r.header.get("Cookie")).unwrap
+  }
+  mux.handle_func("/logout") { |w, r|
+    http.set_cookie(w, http.Cookie.new(name: "session", value: "", path: "/", max_age: -1))
+    w.write_string!("bye").unwrap
+  }
+  srv = http.new_server(mux)
+  ln = net.listen("tcp", "127.0.0.1:0").unwrap
+  port = ln.port
+  spawn { srv.serve(ln) }
+  jar = new_jar(Options.new)
+  c = http.Client.new(max_redirects: 10, jar: jar)
+  base = "http://127.0.0.1:#{port}"
+  assert_eq c.get(base + "/login").unwrap.body_string, "session=s1"
+  assert_eq c.get(base + "/home").unwrap.body_string, "session=s1"
+  assert_eq jar.cookies(must_parse_url(base + "/login")).map { it.name }.to_a, ["only_login", "session"]
+  assert_eq c.get(base + "/logout").unwrap.body_string, "bye"
+  assert_eq c.get(base + "/home").unwrap.body_string, ""
+  srv.shutdown
+}

@@ -1,0 +1,436 @@
+#![overflow(wrap)]
+# Go's nat_test.go. The testing/quick properties run over values from a
+# fixed splitmix64 stream (helpers_test.alx) instead of math/rand, and the
+# crypto/rand inputs of TestMul / TestRightShift come from the same
+# stream. TestInverse's testdata/mod_inv_tests.txt is vec_inverse_test.alx.
+
+import "math/big"
+
+# Sizes for the quick-check properties (testing/quick uses up to 50).
+def quick_sizes -> [Int] { [1, 2, 3, 4, 5, 7, 8, 13, 16, 17, 24, 32, 33, 50] }
+
+test "ModAddCommutative" {
+  g = new_gen(1)
+  for size in quick_sizes() {
+    for _r in 0...5 {
+      a = g.even_nat!(size)
+      b = g.even_nat!(size)
+      m = max_modulus(a.limbs.size)
+      a_plus_b = new_nat()
+      a_plus_b.set!(a)
+      a_plus_b.add!(b, m)
+      b_plus_a = new_nat()
+      b_plus_a.set!(b)
+      b_plus_a.add!(a, m)
+      assert a_plus_b.equal(b_plus_a) == 1, "a + b != b + a for size #{size}"
+    }
+  }
+}
+
+test "ModSubThenAddIdentity" {
+  g = new_gen(2)
+  for size in quick_sizes() {
+    for _r in 0...5 {
+      a = g.even_nat!(size)
+      b = g.even_nat!(size)
+      m = max_modulus(a.limbs.size)
+      original = new_nat()
+      original.set!(a)
+      a.sub!(b, m)
+      a.add!(b, m)
+      assert a.equal(original) == 1, "a - b + b != a for size #{size}"
+    }
+  }
+}
+
+test "MontgomeryRoundtrip" {
+  g = new_gen(3)
+  for size in quick_sizes() {
+    for _r in 0...5 {
+      a = g.even_nat!(size)
+      one = nat_of([0.as_u64; a.limbs.size])
+      one.limbs[0] = 1
+      a_plus_one = big.Int.new
+      a_plus_one.set_bytes!(nat_bytes(a))
+      a_plus_one.add!(a_plus_one, big.new_int(1))
+      m = new_modulus(a_plus_one.bytes).unwrap
+      monty = new_nat()
+      monty.set!(a)
+      monty.montgomery_representation!(m)
+      a_again = new_nat()
+      a_again.set!(monty)
+      a_again.montgomery_mul!(monty, one, m)
+      assert a.equal(a_again) == 1, "#{nat_string(a)} != #{nat_string(a_again)}"
+    }
+  }
+}
+
+test "ShiftIn" {
+  ff: [Byte] = [0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff]
+  m9: [Byte] = [0x06, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0d]
+  zero9 = [0.as_u8; 9]
+  x9: [Byte] = [0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff]
+  e9: [Byte] = [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x06]
+  examples: [([Byte], [Byte], [Byte], U64)] = [
+    ([13], [0], [2], 0xffffffffffffffff),
+    ([13], [7], [10], 0xffffffffffffffff),
+    (m9, zero9, x9, 0xffffffffffffffff),
+    (m9, x9, e9, 0),
+  ]
+  _ = ff
+  i = 0
+  for tt in examples {
+    m = modulus_from_bytes(tt[0])
+    got = nat_from_bytes(tt[1])
+    got.expand_for!(m)
+    got.shift_in!(tt[3], m)
+    exp = nat_from_bytes(tt[2])
+    exp.expand_for!(m)
+    assert got.equal(exp) == 1, "#{i}: got #{nat_string(got)}, expected #{nat_string(exp)}"
+    i += 1
+  }
+}
+
+test "ModulusAndNatSizes" {
+  # 126-bit values serialized as 128 bits: two limbs once leading zeros are
+  # stripped (the modulus), three if not (a Nat from the bytes).
+  m = modulus_from_bytes([0x3f, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff])
+  xb: [Byte] = [0x3f, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xfe]
+  x = nat_from_bytes(xb)
+  x.expand_for!(m) # must not panic for shrinking
+  y = new_nat()
+  assert y.set_bytes!(xb, m).ok?
+}
+
+test "SetBytes" {
+  tests: [([Byte], [Byte], Bool)] = [
+    ([0xff, 0xff], [0x00, 0x01], false),
+    ([0xff, 0xff], [0xff, 0xff], true),
+    ([0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff], [0x00, 0x01], false),
+    ([0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff], [0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xfe], false),
+    ([0xff, 0xff], [0xff, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00], true),
+    ([0xff, 0xff], [0xff, 0xff, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00], true),
+    ([0x7f, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff], [0x7f, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xfe], false),
+    ([0x7f, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff], [0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xfe], true),
+    ([0x7f, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff], [0x7f, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff], true),
+    ([0x7f, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff], [0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xfe], true),
+    ([0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xfd], [0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff], true),
+  ]
+  i = 0
+  for tt in tests {
+    m = modulus_from_bytes(tt[0])
+    x = new_nat()
+    r = x.set_bytes!(tt[1], m)
+    if r.err? {
+      assert tt[2], "#{i}: unexpected error: #{r.err.unwrap.message}"
+    } else {
+      assert !tt[2], "#{i}: unexpected success"
+      expected = nat_from_bytes(tt[1])
+      expected.expand_for!(m)
+      assert r.unwrap.equal(expected) == YES, "#{i}: got #{nat_string(r.unwrap)}, expected #{nat_string(expected)}"
+    }
+    i += 1
+  }
+
+  # quick.Check over random byte strings.
+  g = new_gen(4)
+  for n in 0...60 {
+    x_bytes = g.bytes!(n)
+    m = max_modulus(n * 8 / 64 + 1)
+    x = new_nat()
+    got = x.set_bytes!(x_bytes, m).unwrap
+    want = nat_from_bytes(x_bytes)
+    want.expand_for!(m)
+    assert got.equal(want) == YES, "set_bytes! of #{n} bytes"
+  }
+}
+
+test "Expand" {
+  sliced: [U64] = [1, 2, 3, 4]
+  examples: [([U64], Int, [U64])] = [([1, 2], 4, [1, 2, 0, 0]), (sliced[0...2], 4, [1, 2, 0, 0]), ([1, 2], 2, [1, 2])]
+  i = 0
+  for tt in examples {
+    got = nat_of(tt[0])
+    got.expand!(tt[1])
+    assert got.limbs.size == tt[2].size && got.equal(nat_of(tt[2])) == 1, "#{i}: got #{nat_string(got)}, expected #{tt[2]}"
+    i += 1
+  }
+  # Expanding a subslice must not write into the rest of the original.
+  want: [U64] = [1, 2, 3, 4]
+  assert sliced == want
+}
+
+test "Mod" {
+  m = modulus_from_bytes([0x06, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0d])
+  x = nat_from_bytes([0x40, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01])
+  out = new_nat()
+  out.mod!(x, m)
+  expected = nat_from_bytes([0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x09])
+  assert out.equal(expected) == 1, "#{nat_string(out)} != #{nat_string(expected)}"
+}
+
+test "ModSub" {
+  m = modulus_from_bytes([13])
+  x = nat_of([6])
+  y = nat_of([7])
+  x.sub!(y, m)
+  assert x.equal(nat_of([12])) == 1, nat_string(x)
+  x.sub!(y, m)
+  assert x.equal(nat_of([5])) == 1, nat_string(x)
+}
+
+test "ModAdd" {
+  m = modulus_from_bytes([13])
+  x = nat_of([6])
+  y = nat_of([7])
+  x.add!(y, m)
+  assert x.equal(nat_of([0])) == 1, nat_string(x)
+  x.add!(y, m)
+  assert x.equal(nat_of([7])) == 1, nat_string(x)
+}
+
+test "Exp" {
+  m = modulus_from_bytes([13])
+  x = nat_of([3])
+  out = nat_of([0])
+  out.exp!(x, [12], m)
+  assert out.equal(nat_of([1])) == 1, nat_string(out)
+}
+
+test "ExpShort" {
+  m = modulus_from_bytes([13])
+  x = nat_of([3])
+  out = nat_of([0])
+  out.exp_short_var_time!(x, 12, m)
+  assert out.equal(nat_of([1])) == 1, nat_string(out)
+}
+
+# Mul reduces results equal to or slightly above the modulus (Go issue
+# 13907).
+test "MulReductions" {
+  a = big.Int.new
+  a.set_string!("773608962677651230850240281261679752031633236267106044359907", 10).unwrap
+  b = big.Int.new
+  b.set_string!("180692823610368451951102211649591374573781973061758082626801", 10).unwrap
+  n = big.Int.new
+  n.mul!(a, b)
+  nm = new_modulus(n.bytes).unwrap
+  aa = set_big(new_nat(), a)
+  aa.expand_for!(nm)
+  bb = set_big(new_nat(), b)
+  bb.expand_for!(nm)
+  assert aa.mul!(bb, nm).is_zero == 1, "a * b mod (a * b) != 0"
+
+  i = big.Int.new
+  i.mod_inverse!(a, b)
+  nm = new_modulus(b.bytes).unwrap
+  aa = set_big(new_nat(), a)
+  aa.expand_for!(nm)
+  ii = set_big(new_nat(), i)
+  ii.expand_for!(nm)
+  one = set_big(new_nat(), big.new_int(1))
+  one.expand_for!(nm)
+  assert aa.mul!(ii, nm).equal(one) == 1, "a * inv(a) mod b != 1"
+}
+
+def check_mul(g: Gen, n: Int) {
+  gg = g
+  a = gg.bytes!(n)
+  b = gg.bytes!(n)
+  m = gg.bytes!(n)
+  # Pick the highest as the modulus.
+  if bytes_cmp(a, m) > 0 {
+    t = a
+    a = m
+    m = t
+  }
+  if bytes_cmp(b, m) > 0 {
+    t = b
+    b = m
+    m = t
+  }
+  mm = new_modulus(m).unwrap
+  x = new_nat()
+  x.set_bytes!(a, mm).unwrap
+  y = new_nat()
+  y.set_bytes!(b, mm).unwrap
+  x.mul!(y, mm)
+  got = x.bytes(mm)
+
+  m_big = big.Int.new
+  m_big.set_bytes!(m)
+  a_big = big.Int.new
+  a_big.set_bytes!(a)
+  b_big = big.Int.new
+  b_big.set_bytes!(b)
+  n_big = big.Int.new
+  n_big.mul!(a_big, b_big)
+  n_big.mod!(n_big, m_big)
+  want = [0.as_u8; got.size]
+  n_big.fill_bytes(want)
+  assert got == want, "got #{got}, want #{want}"
+}
+
+def bytes_cmp(a: [Byte], b: [Byte]) -> Int {
+  i = 0
+  while i < a.size {
+    return -1 if a[i] < b[i]
+    return 1 if a[i] > b[i]
+    i += 1
+  }
+  0
+}
+
+test "Mul" {
+  g = new_gen(5)
+  for _r in 0...4 {
+    # small, 1024, 1536, 2048 (even and odd moduli both occur).
+    check_mul(g, 760 / 8)
+    check_mul(g, 1024 / 8)
+    check_mul(g, 1536 / 8)
+    check_mul(g, 2048 / 8)
+  }
+}
+
+test "Is" {
+  m_four = modulus_from_bytes([4])
+  n = new_nat()
+  n.set_bytes!([3], m_four).unwrap
+  assert n.is_minus_one(m_four) == YES, "3 is not -1 mod 4"
+  assert n.is_zero == NO, "3 is zero"
+  assert n.is_one == NO, "3 is one"
+  assert n.is_odd == YES, "3 is not odd"
+  n.sub_one!(m_four)
+  assert n.is_minus_one(m_four) == NO, "2 is -1 mod 4"
+  assert n.is_zero == NO, "2 is zero"
+  assert n.is_one == NO, "2 is one"
+  assert n.is_odd == NO, "2 is odd"
+  n.sub_one!(m_four)
+  assert n.is_minus_one(m_four) == NO, "1 is -1 mod 4"
+  assert n.is_zero == NO, "1 is zero"
+  assert n.is_one == YES, "1 is not one"
+  assert n.is_odd == YES, "1 is not odd"
+  n.sub_one!(m_four)
+  assert n.is_minus_one(m_four) == NO, "0 is -1 mod 4"
+  assert n.is_zero == YES, "0 is not zero"
+  assert n.is_one == NO, "0 is one"
+  assert n.is_odd == NO, "0 is odd"
+  n.sub_one!(m_four)
+  assert n.is_minus_one(m_four) == YES, "-1 is not -1 mod 4"
+  assert n.is_zero == NO, "-1 is zero"
+  assert n.is_one == NO, "-1 is one"
+  assert n.is_odd == YES, "-1 mod 4 is not odd"
+
+  m_two_limbs = max_modulus(2)
+  n = new_nat()
+  n.set_bytes!([0x01], m_two_limbs).unwrap
+  assert n.is_one == 1, "1 is not one"
+}
+
+test "TrailingZeroBits" {
+  nb = big.Int.new
+  nb.set_bytes!([0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x7e])
+  nb.lsh!(nb, 128)
+  expected = 129
+  while expected >= 0 {
+    n = set_big(new_nat(), nb)
+    assert_eq n.trailing_zero_bits_var_time, expected
+    nb.rsh!(nb, 1)
+    expected -= 1
+  }
+}
+
+test "RightShift" {
+  g = new_gen(6)
+  nb = big.Int.new
+  nb.set_bytes!(g.bytes!(128))
+  for shift in [1, 32, 64, 128, 1024 - 128, 1024 - 64, 1024 - 32, 1024 - 1] {
+    for s in [shift - 1, shift, shift + 1] {
+      n = set_big(new_nat(), nb)
+      old_len = n.limbs.size
+      n.shift_right_var_time!(s)
+      assert_eq n.limbs.size, old_len
+      exp = big.Int.new
+      exp.rsh!(nb, s)
+      assert as_big(n).cmp(exp) == 0, "shift #{s}: #{as_big(n)} != #{exp}"
+    }
+  }
+}
+
+test "NewModulus" {
+  expected = "modulus must be > 1"
+  cases: [[Byte]] = [[], [0], [0.as_u8; 24], [1]]
+  for b in cases {
+    r = new_modulus(b)
+    assert r.err?
+    assert_eq r.err.unwrap.message, expected
+  }
+  one24 = [0.as_u8; 24]
+  one24[23] = 1
+  r = new_modulus(one24)
+  assert r.err?
+  assert_eq r.err.unwrap.message, expected
+}
+
+def make_test_value(nbits: Int) -> [U64] {
+  v: U64 = 0xffffffffffffffff
+  [v; nbits / 64]
+}
+
+# Go checks its sized assembly addMulVVW1024/1536/2048 against the generic
+# one; there is only the generic one here, checked against math/big.
+test "AddMulVVWSized" {
+  for n in [1024, 1536, 2048] {
+    x = make_test_value(n)
+    z = make_test_value(n)
+    zb = as_big(nat_of(z.clone))
+    xb = as_big(nat_of(x))
+    y: U64 = 0xffffffffffffffff
+    c = add_mul_vvw(z, x, y)
+    want = big.Int.new
+    yb = big.Int.new
+    yb.set_uint64!(y)
+    want.mul!(xb, yb)
+    want.add!(want, zb)
+    got = as_big(nat_of(z))
+    cb = big.Int.new
+    cb.set_uint64!(c)
+    cb.lsh!(cb, n)
+    got.add!(got, cb)
+    assert got.cmp(want) == 0, "add_mul_vvw #{n}"
+  }
+}
+
+# Checks one line of Go's testdata/mod_inv_tests.txt.
+def check_inverse(mod_inv: Str, a: Str, m: Str) {
+  # Go skips moduli <= 1.
+  if md = new_modulus(decode_hex(m)).ok {
+    x = new_nat()
+    av = x.set_bytes!(decode_hex(a), md).unwrap
+    inv = new_nat()
+    got = inv.inverse_var_time!(av, md)
+    assert got != none, "not invertible: #{a} mod #{m}"
+    e = new_nat()
+    exp = e.set_bytes!(decode_hex(mod_inv), md).unwrap
+    if g = got {
+      assert g.equal(exp) == 1, "#{nat_string(g)} != #{nat_string(exp)}"
+    }
+  }
+}
+
+def decode_hex(s0: Str) -> [Byte] {
+  s = s0.size % 2 != 0 ? "0" + s0 : s0
+  out = [0.as_u8; s.size / 2]
+  i = 0
+  while i < out.size {
+    out[i] = (hex_val(s[2 * i]) << 4) | hex_val(s[2 * i + 1])
+    i += 1
+  }
+  out
+}
+
+def hex_val(c: Byte) -> Byte {
+  return c - 48 if c >= 48 && c <= 57
+  return c - 87 if c >= 97 && c <= 102
+  c - 55
+}

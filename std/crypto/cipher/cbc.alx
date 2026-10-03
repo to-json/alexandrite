@@ -1,0 +1,104 @@
+#![overflow(wrap)]
+# Cipher block chaining (CBC) mode. CBC provides confidentiality by
+# xoring (chaining) each plaintext block with the previous ciphertext block
+# before applying the block cipher. See NIST SP 800-38A, pp 10-11.
+
+# A BlockMode that encrypts in cipher block chaining mode with b. The IV
+# must have b's block size.
+pub def new_cbc_encrypter[B](b: B, iv: [Byte]) -> CbcEncrypter[B] {
+  bs = b.block_size
+  panic("cipher.NewCBCEncrypter: IV length must equal block size") if iv.size != bs
+  CbcEncrypter.new(b: b, bs: bs, iv: iv + [])
+}
+
+# A BlockMode that decrypts in cipher block chaining mode with b. The IV
+# must have b's block size and match the one used to encrypt.
+pub def new_cbc_decrypter[B](b: B, iv: [Byte]) -> CbcDecrypter[B] {
+  bs = b.block_size
+  panic("cipher.NewCBCDecrypter: IV length must equal block size") if iv.size != bs
+  CbcDecrypter.new(b: b, bs: bs, iv: iv + [], tmp: [0.as_u8; bs])
+}
+
+# CBC encryption with a block cipher B (a BlockMode).
+pub struct CbcEncrypter[B] {
+  b: B
+  bs: Int
+  # The chaining value (shared storage: copies are the same mode).
+  iv: [Byte]
+
+  # The block size.
+  pub def block_size -> Int { bs }
+
+  # Encrypts src (whole blocks) into dst.
+  pub def crypt_blocks!(dst: [Byte], src: [Byte]) {
+    panic("crypto/cipher: input not full blocks") if src.size % bs != 0
+    panic("crypto/cipher: output smaller than input") if dst.size < src.size
+    n = src.size
+    prev = iv
+    off = 0
+    while off < n {
+      d = dst[off...off + bs]
+      # Write the xor to dst, then encrypt in place.
+      xor_n(d, src[off...off + bs], prev, bs)
+      b.encrypt(d, d)
+      # This block is the next iv.
+      prev = d
+      off += bs
+    }
+    copy(iv, prev)
+    nil
+  }
+
+  # Resets the IV (Go's SetIV, an unexported upgrade there).
+  pub def set_iv!(new_iv: [Byte]) {
+    panic("cipher: incorrect length IV") if new_iv.size != iv.size
+    copy(iv, new_iv)
+    nil
+  }
+}
+
+# CBC decryption with a block cipher B (a BlockMode).
+pub struct CbcDecrypter[B] {
+  b: B
+  bs: Int
+  iv: [Byte]
+  tmp: [Byte]
+
+  # The block size.
+  pub def block_size -> Int { bs }
+
+  # Decrypts src (whole blocks) into dst.
+  pub def crypt_blocks!(dst: [Byte], src: [Byte]) {
+    panic("crypto/cipher: input not full blocks") if src.size % bs != 0
+    panic("crypto/cipher: output smaller than input") if dst.size < src.size
+    return if src.size == 0
+    # Each block is xored with the previous ciphertext block (the iv); going
+    # BACKWARDS avoids copying when dst and src are the same.
+    end = src.size
+    start = end - bs
+    prev = start - bs
+    # The last block of ciphertext is the new iv.
+    copy(tmp, src[start...end])
+    while start > 0 {
+      d = dst[start...end]
+      b.decrypt(d, src[start...end])
+      xor_n(d, d, src[prev...start], bs)
+      end = start
+      start = prev
+      prev -= bs
+    }
+    # The first block uses the saved iv.
+    d = dst[start...end]
+    b.decrypt(d, src[start...end])
+    xor_n(d, d, iv, bs)
+    copy(iv, tmp)
+    nil
+  }
+
+  # Resets the IV (Go's SetIV, an unexported upgrade there).
+  pub def set_iv!(new_iv: [Byte]) {
+    panic("cipher: incorrect length IV") if new_iv.size != iv.size
+    copy(iv, new_iv)
+    nil
+  }
+}

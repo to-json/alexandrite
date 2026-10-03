@@ -1,0 +1,292 @@
+#![overflow(wrap)]
+# Package des: Go's crypto/des, the Data Encryption Standard (DES) and the
+# Triple Data Encryption Algorithm (TDEA) as defined in U.S. Federal
+# Information Processing Standards Publication 46-3. Pure alx, Go's code.
+#
+# DES is cryptographically broken and should not be used for secure
+# applications.
+#
+#   Go                                  alx
+#   des.BlockSize                       BLOCK_SIZE
+#   des.NewCipher(key) (cipher.Block, error)
+#                                       new_cipher(key) -> ~Cipher<KeySizeError>
+#   des.NewTripleDESCipher(key) (cipher.Block, error)
+#                                       new_triple_des_cipher(key) -> ~TripleCipher<KeySizeError>
+#   des.KeySizeError (int)              KeySizeError.KeySize(size)
+#   c.BlockSize / Encrypt / Decrypt     c.block_size / c.encrypt(dst, src) / c.decrypt(dst, src)
+#
+# Cipher and TripleCipher satisfy cipher.Block structurally.
+#
+# Timing: as in Go, the rounds index the 2 KiB of Feistel boxes with bits
+# of the key-mixed state, so the memory access pattern depends on the key
+# and the data (not constant-time; cache-timing attacks apply).
+#
+# Differences from Go:
+#   - The constructors return the concrete block types (Go: cipher.Block,
+#     with the types unexported); they convert to a cipher.Block wherever
+#     one is wanted.
+#   - KeySizeError is an error enum with one variant carrying the size (Go:
+#     a named int); the message is Go's ("crypto/des: invalid key size 7").
+#   - The Feistel boxes are a generated constant table (Go computes them at
+#     first use under a sync.Once; alx has no mutable package state). A
+#     test recomputes them as Go does.
+#   - Encrypt and Decrypt can't detect inexact overlap of dst and src (alx
+#     slices don't expose addresses), so they don't panic with "invalid
+#     buffer overlap"; dst == src works, as in Go.
+#   - No FIPS 140-only mode.
+
+# The DES block size in bytes.
+pub BLOCK_SIZE = 8
+
+# The error of the constructors: the key has the wrong size (8 bytes for
+# DES, 24 for triple DES).
+pub error KeySizeError {
+  KeySize(size: Int)
+
+  def message -> Str {
+    case self {
+      KeySize(size) => "crypto/des: invalid key size #{size}"
+    }
+  }
+}
+
+# A new DES cipher with the given 8-byte key.
+pub def new_cipher(key: [Byte]) -> ~Cipher<KeySizeError> {
+  fail KeySizeError.KeySize(size: key.size) if key.size != 8
+  Cipher.new(subkeys: generate_subkeys(key))
+}
+
+# A new triple DES (EDE) cipher with the given 24-byte key: three DES keys.
+pub def new_triple_des_cipher(key: [Byte]) -> ~TripleCipher<KeySizeError> {
+  fail KeySizeError.KeySize(size: key.size) if key.size != 24
+  TripleCipher.new(k1: generate_subkeys(key[0...8]), k2: generate_subkeys(key[8...16]), k3: generate_subkeys(key[16...24]))
+}
+
+# DES with one key (Go's desCipher).
+pub struct Cipher {
+  # The 16 round keys.
+  subkeys: [U64]
+
+  # The block size: 8.
+  pub def block_size -> Int { BLOCK_SIZE }
+
+  # Encrypts the first block of src into dst.
+  pub def encrypt(dst: [Byte], src: [Byte]) {
+    check_sizes(dst, src)
+    crypt_block(subkeys, dst, src, false)
+  }
+
+  # Decrypts the first block of src into dst.
+  pub def decrypt(dst: [Byte], src: [Byte]) {
+    check_sizes(dst, src)
+    crypt_block(subkeys, dst, src, true)
+  }
+}
+
+# Triple DES, encrypt-decrypt-encrypt with three keys (Go's
+# tripleDESCipher).
+pub struct TripleCipher {
+  k1: [U64]
+  k2: [U64]
+  k3: [U64]
+
+  # The block size: 8.
+  pub def block_size -> Int { BLOCK_SIZE }
+
+  # Encrypts the first block of src into dst.
+  pub def encrypt(dst: [Byte], src: [Byte]) {
+    check_sizes(dst, src)
+    b = permute_initial_block(be64(src))
+    left = (b >> 32).as_u32
+    right = b.as_u32
+    left = (left << 1) | (left >> 31)
+    right = (right << 1) | (right >> 31)
+    lr = (left.as_u64 << 32) | right.as_u64
+    lr = rounds(lr, k1, false)
+    lr = swap(rounds(swap(lr), k2, true))
+    lr = rounds(lr, k3, false)
+    finish(dst, (lr >> 32).as_u32, lr.as_u32)
+  }
+
+  # Decrypts the first block of src into dst.
+  pub def decrypt(dst: [Byte], src: [Byte]) {
+    check_sizes(dst, src)
+    b = permute_initial_block(be64(src))
+    left = (b >> 32).as_u32
+    right = b.as_u32
+    left = (left << 1) | (left >> 31)
+    right = (right << 1) | (right >> 31)
+    lr = (left.as_u64 << 32) | right.as_u64
+    lr = rounds(lr, k3, true)
+    lr = swap(rounds(swap(lr), k2, false))
+    lr = rounds(lr, k1, true)
+    finish(dst, (lr >> 32).as_u32, lr.as_u32)
+  }
+}
+
+def check_sizes(dst: [Byte], src: [Byte]) {
+  panic("crypto/des: input not full block") if src.size < BLOCK_SIZE
+  panic("crypto/des: output not full block") if dst.size < BLOCK_SIZE
+}
+
+def be64(b: [Byte]) -> U64 {
+  (b[0].as_u64 << 56) | (b[1].as_u64 << 48) | (b[2].as_u64 << 40) | (b[3].as_u64 << 32) | (b[4].as_u64 << 24) | (b[5].as_u64 << 16) | (b[6].as_u64 << 8) | b[7].as_u64
+}
+
+def put_be64(b: [Byte], v: U64) {
+  d = b
+  d[0] = (v >> 56).as_u8
+  d[1] = (v >> 48).as_u8
+  d[2] = (v >> 40).as_u8
+  d[3] = (v >> 32).as_u8
+  d[4] = (v >> 24).as_u8
+  d[5] = (v >> 16).as_u8
+  d[6] = (v >> 8).as_u8
+  d[7] = v.as_u8
+  nil
+}
+
+# One DES block (Go's cryptBlock).
+def crypt_block(subkeys: [U64], dst: [Byte], src: [Byte], decrypt: Bool) {
+  b = permute_initial_block(be64(src))
+  left = (b >> 32).as_u32
+  right = b.as_u32
+  left = (left << 1) | (left >> 31)
+  right = (right << 1) | (right >> 31)
+  lr = rounds((left.as_u64 << 32) | right.as_u64, subkeys, decrypt)
+  finish(dst, (lr >> 32).as_u32, lr.as_u32)
+}
+
+# The final rotation and permutation of a block's halves, into dst.
+def finish(dst: [Byte], l: U32, r: U32) {
+  left = (l << 31) | (l >> 1)
+  right = (r << 31) | (r >> 1)
+  pre_output = (right.as_u64 << 32) | left.as_u64
+  put_be64(dst, permute_final_block(pre_output))
+}
+
+# Swaps the 32-bit halves of x.
+def swap(x: U64) -> U64 { (x << 32) | (x >> 32) }
+
+# Sixteen Feistel rounds over the halves lr = left << 32 | right with the
+# round keys in order (or reversed, to decrypt); returns the new halves.
+# Triple DES's middle pass swaps the halves' roles around it (Go's
+# `right, left = feistel(right, left, ...)`).
+def rounds(lr: U64, k: [U64], reverse: Bool) -> U64 {
+  l = (lr >> 32).as_u32
+  r = lr.as_u32
+  i = 0
+  while i < 8 {
+    k0 = reverse ? k[15 - 2 * i] : k[2 * i]
+    k1 = reverse ? k[15 - (2 * i + 1)] : k[2 * i + 1]
+    # Go's feistel(l, r, k0, k1).
+    t = r ^ (k0 >> 32).as_u32
+    l ^= FEISTEL_BOX[448 + (t & 0x3f).to_i] ^ FEISTEL_BOX[320 + ((t >> 8) & 0x3f).to_i] ^ FEISTEL_BOX[192 + ((t >> 16) & 0x3f).to_i] ^ FEISTEL_BOX[64 + ((t >> 24) & 0x3f).to_i]
+    t = ((r << 28) | (r >> 4)) ^ k0.as_u32
+    l ^= FEISTEL_BOX[384 + (t & 0x3f).to_i] ^ FEISTEL_BOX[256 + ((t >> 8) & 0x3f).to_i] ^ FEISTEL_BOX[128 + ((t >> 16) & 0x3f).to_i] ^ FEISTEL_BOX[((t >> 24) & 0x3f).to_i]
+    t = l ^ (k1 >> 32).as_u32
+    r ^= FEISTEL_BOX[448 + (t & 0x3f).to_i] ^ FEISTEL_BOX[320 + ((t >> 8) & 0x3f).to_i] ^ FEISTEL_BOX[192 + ((t >> 16) & 0x3f).to_i] ^ FEISTEL_BOX[64 + ((t >> 24) & 0x3f).to_i]
+    t = ((l << 28) | (l >> 4)) ^ k1.as_u32
+    r ^= FEISTEL_BOX[384 + (t & 0x3f).to_i] ^ FEISTEL_BOX[256 + ((t >> 8) & 0x3f).to_i] ^ FEISTEL_BOX[128 + ((t >> 16) & 0x3f).to_i] ^ FEISTEL_BOX[((t >> 24) & 0x3f).to_i]
+    i += 1
+  }
+  (l.as_u64 << 32) | r.as_u64
+}
+
+# Moves the bits of src to the positions the permutation table names
+# (Go's permuteBlock).
+def permute_block(src: U64, permutation: [U8]) -> U64 {
+  block: U64 = 0
+  n = permutation.size
+  i = 0
+  while i < n {
+    bit = (src >> permutation[i].as_u64) & 1
+    block |= bit << (n - 1 - i).as_u64
+    i += 1
+  }
+  block
+}
+
+# The initial permutation, with swaps of bit groups (Go's
+# permuteInitialBlock; its comments show the 8x8 bit matrix steps).
+def permute_initial_block(block0: U64) -> U64 {
+  block = block0
+  # block = b7 b6 b5 b4 b3 b2 b1 b0 (8 bytes)
+  b1 = block >> 48
+  b2 = block << 48
+  block ^= b1 ^ b2 ^ (b1 << 48) ^ (b2 >> 48)
+  # block = b1 b0 b5 b4 b3 b2 b7 b6
+  b1 = (block >> 32) & 0xff00ff
+  b2 = block & 0xff00ff00
+  # exchange b0 b4 with b3 b7
+  block ^= (b1 << 32) ^ b2 ^ (b1 << 8) ^ (b2 << 24)
+  # Transpose the 4x4 blocks of nibbles, the 2x2 blocks of bit pairs, then
+  # the single bits.
+  b1 = block & 0x0f0f00000f0f0000
+  b2 = block & 0x0000f0f00000f0f0
+  block ^= b1 ^ b2 ^ (b1 >> 12) ^ (b2 << 12)
+  b1 = block & 0x3300330033003300
+  b2 = block & 0x00cc00cc00cc00cc
+  block ^= b1 ^ b2 ^ (b1 >> 6) ^ (b2 << 6)
+  b1 = block & 0xaaaaaaaa55555555
+  block ^= b1 ^ (b1 >> 33) ^ (b1 << 33)
+  block
+}
+
+# The inverse of permute_initial_block (Go's permuteFinalBlock).
+def permute_final_block(block0: U64) -> U64 {
+  block = block0
+  b1 = block & 0xaaaaaaaa55555555
+  block ^= b1 ^ (b1 >> 33) ^ (b1 << 33)
+  b1 = block & 0x3300330033003300
+  b2 = block & 0x00cc00cc00cc00cc
+  block ^= b1 ^ b2 ^ (b1 >> 6) ^ (b2 << 6)
+  b1 = block & 0x0f0f00000f0f0000
+  b2 = block & 0x0000f0f00000f0f0
+  block ^= b1 ^ b2 ^ (b1 >> 12) ^ (b2 << 12)
+  b1 = (block >> 32) & 0xff00ff
+  b2 = block & 0xff00ff00
+  block ^= (b1 << 32) ^ b2 ^ (b1 << 8) ^ (b2 << 24)
+  b1 = block >> 48
+  b2 = block << 48
+  block ^= b1 ^ b2 ^ (b1 << 48) ^ (b2 >> 48)
+  block
+}
+
+# The 16 rotations of a 28-bit key half (Go's ksRotate).
+def ks_rotate(input: U32) -> [U32] {
+  out = [0.as_u32; 16]
+  last = input
+  i = 0
+  while i < 16 {
+    rot = KS_ROTATIONS[i].as_u32
+    left = (last << (4 + rot)) >> 4
+    right = (last << 4) >> (32 - rot)
+    out[i] = left | right
+    last = out[i]
+    i += 1
+  }
+  out
+}
+
+# The 16 round keys of an 8-byte key (Go's generateSubkeys).
+def generate_subkeys(key_bytes: [Byte]) -> [U64] {
+  subkeys = [0.as_u64; 16]
+  key = be64(key_bytes)
+  permuted_key = permute_block(key, PERMUTED_CHOICE1)
+  left_rotations = ks_rotate((permuted_key >> 28).as_u32)
+  right_rotations = ks_rotate((permuted_key << 4).as_u32 >> 4)
+  i = 0
+  while i < 16 {
+    pc2_input = (left_rotations[i].as_u64 << 28) | right_rotations[i].as_u64
+    subkeys[i] = unpack(permute_block(pc2_input, PERMUTED_CHOICE2))
+    i += 1
+  }
+  subkeys
+}
+
+# Spreads the 8 six-bit groups of a round key over 8 bytes in the order the
+# Feistel function reads them.
+def unpack(x: U64) -> U64 {
+  (((x >> 6) & 0xff) << 0) | (((x >> 18) & 0xff) << 8) | (((x >> 30) & 0xff) << 16) | (((x >> 42) & 0xff) << 24) | ((x & 0xff) << 32) | (((x >> 12) & 0xff) << 40) | (((x >> 24) & 0xff) << 48) | (((x >> 36) & 0xff) << 56)
+}

@@ -1,0 +1,217 @@
+#![overflow(wrap)]
+# Galois/Counter Mode (GCM): an AEAD built from a 128-bit block cipher (NIST
+# SP 800-38D), Go's crypto/internal/fips140/aes/gcm generic code and
+# crypto/cipher's gcmFallback (they are the same algorithm).
+
+import "crypto/aes"
+import "crypto/rand"
+import "crypto/subtle"
+
+GCM_BLOCK_SIZE = 16
+GCM_STANDARD_NONCE_SIZE = 12
+GCM_TAG_SIZE = 16
+# NIST SP 800-38D recommends tags with 12 or more bytes.
+GCM_MINIMUM_TAG_SIZE = 12
+# Plaintexts longer than this (2^32 - 2 blocks) can't be sealed.
+GCM_MAX_PLAINTEXT: U64 = ((1 << 32) - 2) * 16
+
+# The block cipher b in Galois Counter Mode with the standard nonce length
+# (12 bytes) and a 16-byte tag. b's block size must be 16.
+#
+# In general, the GHASH operation performed by this implementation of GCM
+# is constant-time; the block cipher's timing is its own (see crypto/aes).
+pub def new_gcm[B](b: B) -> ~Gcm[B]<CipherError> {
+  ~make_gcm(b, GCM_STANDARD_NONCE_SIZE, GCM_TAG_SIZE)
+}
+
+# The block cipher b in Galois Counter Mode with nonces of the given
+# length, which may not be zero. Only use this to be compatible with an
+# existing cryptosystem that uses non-standard nonce lengths; otherwise use
+# new_gcm, which is faster and more resistant to misuse.
+pub def new_gcm_with_nonce_size[B](b: B, size: Int) -> ~Gcm[B]<CipherError> {
+  ~make_gcm(b, size, GCM_TAG_SIZE)
+}
+
+# The block cipher b in Galois Counter Mode with tags of the given length,
+# between 12 and 16 bytes. Only use this to be compatible with an existing
+# cryptosystem that uses non-standard tag lengths; otherwise use new_gcm,
+# which is more resistant to misuse.
+pub def new_gcm_with_tag_size[B](b: B, tag_size: Int) -> ~Gcm[B]<CipherError> {
+  ~make_gcm(b, GCM_STANDARD_NONCE_SIZE, tag_size)
+}
+
+def make_gcm[B](b: B, nonce_size: Int, tag_size: Int) -> ~Gcm[B]<CipherError> {
+  fail CipherError.IncorrectTagSize if tag_size < GCM_MINIMUM_TAG_SIZE || tag_size > GCM_BLOCK_SIZE
+  fail CipherError.ZeroNonceSize if nonce_size <= 0
+  fail CipherError.NeedsBlockSize16 if b.block_size != GCM_BLOCK_SIZE
+  Gcm.new(b: b, ns: nonce_size, ts: tag_size)
+}
+
+# A Galois Counter Mode AEAD over a block cipher B.
+pub struct Gcm[B] {
+  b: B
+  ns: Int
+  ts: Int
+
+  # The nonce size.
+  pub def nonce_size -> Int { ns }
+
+  # The tag size.
+  pub def overhead -> Int { ts }
+
+  # dst followed by the encryption of plaintext and the tag authenticating
+  # it and additional_data. Panics if the nonce has the wrong length.
+  pub def seal(dst: [Byte], nonce: [Byte], plaintext: [Byte], additional_data: [Byte]) -> [Byte] {
+    panic("crypto/cipher: incorrect nonce length given to GCM") if nonce.size != ns
+    panic("crypto/cipher: message too large for GCM") if plaintext.size.as_u64 > GCM_MAX_PLAINTEXT
+    ret = [0.as_u8; dst.size + plaintext.size + ts]
+    copy(ret, dst)
+    gcm_seal(b, ts, ret[dst.size...ret.size], nonce, plaintext, additional_data)
+    ret
+  }
+
+  # dst followed by the decryption of ciphertext, if its tag authenticates
+  # it and additional_data; CipherError.AuthFailed otherwise. Panics if the
+  # nonce has the wrong length.
+  pub def open(dst: [Byte], nonce: [Byte], ciphertext: [Byte], additional_data: [Byte]) -> ~[Byte]<CipherError> {
+    panic("crypto/cipher: incorrect nonce length given to GCM") if nonce.size != ns
+    # Sanity check that keeps authentication from always succeeding.
+    panic("crypto/cipher: incorrect GCM tag size") if ts < GCM_MINIMUM_TAG_SIZE
+    fail CipherError.AuthFailed if ciphertext.size < ts
+    fail CipherError.AuthFailed if ciphertext.size.as_u64 > GCM_MAX_PLAINTEXT + ts.as_u64
+    n = ciphertext.size - ts
+    out = [0.as_u8; n]
+    fail CipherError.AuthFailed if !gcm_open(b, ts, out, nonce, ciphertext, additional_data)
+    dst + out
+  }
+}
+
+# GCM sealing (Go's sealGeneric): out holds plaintext.size + ts bytes.
+def gcm_seal[B](b: B, ts: Int, out: [Byte], nonce: [Byte], plaintext: [Byte], additional_data: [Byte]) {
+  hk = [0.as_u8; GCM_BLOCK_SIZE]
+  b.encrypt(hk, hk)
+  counter = [0.as_u8; GCM_BLOCK_SIZE]
+  derive_counter(hk, counter, nonce)
+  tag_mask = [0.as_u8; GCM_BLOCK_SIZE]
+  gcm_counter_crypt(b, tag_mask, tag_mask, counter)
+  n = plaintext.size
+  gcm_counter_crypt(b, out, plaintext, counter)
+  tag = [0.as_u8; GCM_TAG_SIZE]
+  gcm_auth(tag, hk, tag_mask, out[0...n], additional_data)
+  copy(out[n...n + ts], tag)
+  nil
+}
+
+# GCM opening (Go's openGeneric): whether the tag is right; if so, out
+# holds the plaintext.
+def gcm_open[B](b: B, ts: Int, out: [Byte], nonce: [Byte], ciphertext: [Byte], additional_data: [Byte]) -> Bool {
+  hk = [0.as_u8; GCM_BLOCK_SIZE]
+  b.encrypt(hk, hk)
+  counter = [0.as_u8; GCM_BLOCK_SIZE]
+  derive_counter(hk, counter, nonce)
+  tag_mask = [0.as_u8; GCM_BLOCK_SIZE]
+  gcm_counter_crypt(b, tag_mask, tag_mask, counter)
+  n = ciphertext.size - ts
+  tag = ciphertext[n...ciphertext.size]
+  ct = ciphertext[0...n]
+  expected = [0.as_u8; GCM_TAG_SIZE]
+  gcm_auth(expected, hk, tag_mask, ct, additional_data)
+  return false if subtle.constant_time_compare(expected[0...ts], tag) != 1
+  gcm_counter_crypt(b, out, ct, counter)
+  true
+}
+
+# The initial counter block for nonce (NIST SP 800-38D section 7.1);
+# counter is zero on entry. A 12-byte nonce is used directly with a
+# 32-bit counter starting at 1; other lengths go through GHASH.
+def derive_counter(hk: [Byte], counter: [Byte], nonce: [Byte]) {
+  if nonce.size == GCM_STANDARD_NONCE_SIZE {
+    copy(counter, nonce)
+    counter[GCM_BLOCK_SIZE - 1] = 1
+  } else {
+    len_block = [0.as_u8; 16]
+    put_be64(len_block, 8, nonce.size.as_u64 * 8)
+    ghash(counter, hk, [nonce, len_block])
+  }
+  nil
+}
+
+# Encrypts src into out with b in counter mode with a 32-bit wrapping
+# counter (unlike CTR mode); counter is advanced past the blocks used.
+def gcm_counter_crypt[B](b: B, out: [Byte], src: [Byte], counter: [Byte]) {
+  mask = [0.as_u8; GCM_BLOCK_SIZE]
+  n = src.size
+  off = 0
+  while off + GCM_BLOCK_SIZE <= n {
+    b.encrypt(mask, counter)
+    gcm_inc32(counter)
+    xor_n(out[off...off + GCM_BLOCK_SIZE], src[off...off + GCM_BLOCK_SIZE], mask, GCM_BLOCK_SIZE)
+    off += GCM_BLOCK_SIZE
+  }
+  if off < n {
+    b.encrypt(mask, counter)
+    gcm_inc32(counter)
+    xor_n(out[off...n], src[off...n], mask, n - off)
+  }
+  nil
+}
+
+# Increments the last four bytes of the counter block as a big-endian
+# number.
+def gcm_inc32(counter: [Byte]) {
+  put_be32(counter, 12, be32(counter, 12) + 1)
+}
+
+# GHASH(additional_data, ciphertext) masked with tag_mask, into out.
+def gcm_auth(out: [Byte], hk: [Byte], tag_mask: [Byte], ciphertext: [Byte], additional_data: [Byte]) {
+  len_block = [0.as_u8; 16]
+  put_be64(len_block, 0, additional_data.size.as_u64 * 8)
+  put_be64(len_block, 8, ciphertext.size.as_u64 * 8)
+  s = [0.as_u8; GCM_BLOCK_SIZE]
+  ghash(s, hk, [additional_data, ciphertext, len_block])
+  xor_n(out, s, tag_mask, GCM_BLOCK_SIZE)
+}
+
+# AES-GCM with random nonces (Go's NewGCMWithRandomNonce): an AEAD whose
+# nonce_size is 0. seal makes a random 12-byte nonce and prepends it to the
+# ciphertext; open reads it back. The overhead is 28 bytes. A key can seal
+# up to 2^32 messages this way.
+pub def new_gcm_with_random_nonce(b: aes.Block) -> GcmWithRandomNonce {
+  GcmWithRandomNonce.new(g: Gcm.new(b: b, ns: GCM_STANDARD_NONCE_SIZE, ts: GCM_TAG_SIZE))
+}
+
+# AES-GCM with random nonces (an AEAD).
+pub struct GcmWithRandomNonce {
+  g: Gcm[aes.Block]
+
+  # 0: the nonce is chosen by seal.
+  pub def nonce_size -> Int { 0 }
+
+  # The nonce and the tag: 28 bytes.
+  pub def overhead -> Int { GCM_STANDARD_NONCE_SIZE + GCM_TAG_SIZE }
+
+  # dst followed by a random nonce, the encrypted plaintext and the tag.
+  # nonce must be empty.
+  pub def seal(dst: [Byte], nonce: [Byte], plaintext: [Byte], additional_data: [Byte]) -> [Byte] {
+    panic("crypto/cipher: non-empty nonce passed to GCMWithRandomNonce") if nonce.size != 0
+    panic("crypto/cipher: message too large for GCM") if plaintext.size.as_u64 > GCM_MAX_PLAINTEXT
+    ret = [0.as_u8; dst.size + GCM_STANDARD_NONCE_SIZE + plaintext.size + GCM_TAG_SIZE]
+    copy(ret, dst)
+    out = ret[dst.size...ret.size]
+    nn = out[0...GCM_STANDARD_NONCE_SIZE]
+    rand.read(nn)
+    gcm_seal(g.b, GCM_TAG_SIZE, out[GCM_STANDARD_NONCE_SIZE...out.size], nn, plaintext, additional_data)
+    ret
+  }
+
+  # dst followed by the decryption of a ciphertext made by seal (nonce,
+  # encrypted plaintext, tag), or CipherError.AuthFailed. nonce must be
+  # empty.
+  pub def open(dst: [Byte], nonce: [Byte], ciphertext: [Byte], additional_data: [Byte]) -> ~[Byte]<CipherError> {
+    panic("crypto/cipher: non-empty nonce passed to GCMWithRandomNonce") if nonce.size != 0
+    fail CipherError.AuthFailed if ciphertext.size < GCM_STANDARD_NONCE_SIZE + GCM_TAG_SIZE
+    nn = ciphertext[0...GCM_STANDARD_NONCE_SIZE]
+    ct = ciphertext[GCM_STANDARD_NONCE_SIZE...ciphertext.size]
+    ~g.open(dst, nn, ct, additional_data)
+  }
+}

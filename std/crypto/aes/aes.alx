@@ -1,0 +1,247 @@
+#![overflow(wrap)]
+# Package aes: Go's crypto/aes, AES encryption (formerly Rijndael), as
+# defined in U.S. Federal Information Processing Standards Publication 197.
+# Pure alx: the generic (non-assembly) code of Go's
+# crypto/internal/fips140/aes (aes_generic.go), which is what Go runs with
+# `-tags purego` or on architectures without AES instructions.
+#
+#   Go                                  alx
+#   aes.BlockSize                       BLOCK_SIZE
+#   aes.NewCipher(key) (cipher.Block, error)
+#                                       new_cipher(key) -> ~Block<KeySizeError>
+#   aes.KeySizeError (int)              KeySizeError.KeySize(size)
+#   b.BlockSize() / Encrypt / Decrypt   b.block_size / b.encrypt(dst, src) / b.decrypt(dst, src)
+#
+# A Block satisfies cipher.Block structurally; the modes in crypto/cipher
+# are generic over the block type, so an aes.Block runs them without
+# dynamic dispatch.
+#
+# Timing: as in Go's generic code, the rounds use four 1 KiB lookup tables
+# (TE0..TE3, TD0..TD3, "T-tables") indexed by state bytes, and the last
+# round and the key schedule index the 256-byte S-boxes. The memory access
+# pattern depends on the key and the data, so this implementation is NOT
+# constant-time: it is exposed to cache-timing attacks by code sharing the
+# CPU, exactly as Go's generic AES is. (Go's assembly on amd64/arm64/s390x/
+# ppc64 uses the AES instructions and is constant-time; alx has no
+# assembly.) GHASH in crypto/cipher is constant-time, as Go's is.
+#
+# Differences from Go:
+#   - NewCipher returns the concrete Block (Go: cipher.Block); it converts
+#     to a cipher.Block wherever one is wanted.
+#   - KeySizeError is an error enum with one variant carrying the size (Go:
+#     a named int); the message is Go's ("crypto/aes: invalid key size 7").
+#   - Encrypt and Decrypt can't detect inexact overlap of dst and src (alx
+#     slices don't expose addresses), so they don't panic with "invalid
+#     buffer overlap"; dst == src works, as in Go.
+#   - No FIPS 140 service indicator, no BoringCrypto, no assembly.
+
+# The AES block size in bytes.
+pub BLOCK_SIZE = 16
+
+AES128_KEY_SIZE = 16
+AES192_KEY_SIZE = 24
+AES256_KEY_SIZE = 32
+AES128_ROUNDS = 10
+AES192_ROUNDS = 12
+AES256_ROUNDS = 14
+
+# The error of new_cipher: the key isn't 16, 24 or 32 bytes.
+pub error KeySizeError {
+  KeySize(size: Int)
+
+  def message -> Str {
+    case self {
+      KeySize(size) => "crypto/aes: invalid key size #{size}"
+    }
+  }
+}
+
+# A new AES cipher with the given key: 16, 24 or 32 bytes select AES-128,
+# AES-192 or AES-256.
+pub def new_cipher(key: [Byte]) -> ~Block<KeySizeError> {
+  rounds = case key.size {
+    AES128_KEY_SIZE => AES128_ROUNDS
+    AES192_KEY_SIZE => AES192_ROUNDS
+    AES256_KEY_SIZE => AES256_ROUNDS
+    _ => 0
+  }
+  fail KeySizeError.KeySize(size: key.size) if rounds == 0
+  n = (rounds + 1) * 4
+  b = Block.new(rounds: rounds, enc: [0.as_u32; n], dec: [0.as_u32; n])
+  expand_key(b, key)
+  b
+}
+
+# An instance of AES using a particular key. It is safe for concurrent use:
+# the expanded key never changes.
+pub struct Block {
+  # 10, 12 or 14.
+  rounds: Int
+  # The encryption and decryption round keys, (rounds + 1) * 4 words each.
+  enc: [U32]
+  dec: [U32]
+
+  # The block size: 16.
+  pub def block_size -> Int { BLOCK_SIZE }
+
+  # Encrypts the first block of src into dst. dst and src may be the same
+  # slice.
+  pub def encrypt(dst: [Byte], src: [Byte]) {
+    panic("crypto/aes: input not full block") if src.size < BLOCK_SIZE
+    panic("crypto/aes: output not full block") if dst.size < BLOCK_SIZE
+    encrypt_block(self, dst, src)
+  }
+
+  # Decrypts the first block of src into dst. dst and src may be the same
+  # slice.
+  pub def decrypt(dst: [Byte], src: [Byte]) {
+    panic("crypto/aes: input not full block") if src.size < BLOCK_SIZE
+    panic("crypto/aes: output not full block") if dst.size < BLOCK_SIZE
+    decrypt_block(self, dst, src)
+  }
+}
+
+def be32(b: [Byte], i: Int) -> U32 {
+  (b[i].as_u32 << 24) | (b[i + 1].as_u32 << 16) | (b[i + 2].as_u32 << 8) | b[i + 3].as_u32
+}
+
+def put_be32(b: [Byte], i: Int, v: U32) {
+  d = b
+  d[i] = (v >> 24).as_u8
+  d[i + 1] = (v >> 16).as_u8
+  d[i + 2] = (v >> 8).as_u8
+  d[i + 3] = v.as_u8
+  nil
+}
+
+# Encrypts one block from src into dst with the expanded key (Go's
+# encryptBlockGeneric). src and dst hold at least 16 bytes.
+def encrypt_block(c: Block, dst: [Byte], src: [Byte]) {
+  xk = c.enc
+  s0 = be32(src, 0) ^ xk[0]
+  s1 = be32(src, 4) ^ xk[1]
+  s2 = be32(src, 8) ^ xk[2]
+  s3 = be32(src, 12) ^ xk[3]
+
+  # Middle rounds shuffle using tables.
+  k = 4
+  t0: U32 = 0
+  t1: U32 = 0
+  t2: U32 = 0
+  t3: U32 = 0
+  r = c.rounds - 1
+  while r > 0 {
+    t0 = xk[k] ^ TE0[(s0 >> 24).to_i] ^ TE1[((s1 >> 16) & 0xff).to_i] ^ TE2[((s2 >> 8) & 0xff).to_i] ^ TE3[(s3 & 0xff).to_i]
+    t1 = xk[k + 1] ^ TE0[(s1 >> 24).to_i] ^ TE1[((s2 >> 16) & 0xff).to_i] ^ TE2[((s3 >> 8) & 0xff).to_i] ^ TE3[(s0 & 0xff).to_i]
+    t2 = xk[k + 2] ^ TE0[(s2 >> 24).to_i] ^ TE1[((s3 >> 16) & 0xff).to_i] ^ TE2[((s0 >> 8) & 0xff).to_i] ^ TE3[(s1 & 0xff).to_i]
+    t3 = xk[k + 3] ^ TE0[(s3 >> 24).to_i] ^ TE1[((s0 >> 16) & 0xff).to_i] ^ TE2[((s1 >> 8) & 0xff).to_i] ^ TE3[(s2 & 0xff).to_i]
+    k += 4
+    s0 = t0
+    s1 = t1
+    s2 = t2
+    s3 = t3
+    r -= 1
+  }
+
+  # Last round uses s-box directly and XORs to produce output.
+  s0 = (SBOX0[(t0 >> 24).to_i].as_u32 << 24) | (SBOX0[((t1 >> 16) & 0xff).to_i].as_u32 << 16) | (SBOX0[((t2 >> 8) & 0xff).to_i].as_u32 << 8) | SBOX0[(t3 & 0xff).to_i].as_u32
+  s1 = (SBOX0[(t1 >> 24).to_i].as_u32 << 24) | (SBOX0[((t2 >> 16) & 0xff).to_i].as_u32 << 16) | (SBOX0[((t3 >> 8) & 0xff).to_i].as_u32 << 8) | SBOX0[(t0 & 0xff).to_i].as_u32
+  s2 = (SBOX0[(t2 >> 24).to_i].as_u32 << 24) | (SBOX0[((t3 >> 16) & 0xff).to_i].as_u32 << 16) | (SBOX0[((t0 >> 8) & 0xff).to_i].as_u32 << 8) | SBOX0[(t1 & 0xff).to_i].as_u32
+  s3 = (SBOX0[(t3 >> 24).to_i].as_u32 << 24) | (SBOX0[((t0 >> 16) & 0xff).to_i].as_u32 << 16) | (SBOX0[((t1 >> 8) & 0xff).to_i].as_u32 << 8) | SBOX0[(t2 & 0xff).to_i].as_u32
+
+  put_be32(dst, 0, s0 ^ xk[k])
+  put_be32(dst, 4, s1 ^ xk[k + 1])
+  put_be32(dst, 8, s2 ^ xk[k + 2])
+  put_be32(dst, 12, s3 ^ xk[k + 3])
+}
+
+# Decrypts one block from src into dst with the expanded key (Go's
+# decryptBlockGeneric). src and dst hold at least 16 bytes.
+def decrypt_block(c: Block, dst: [Byte], src: [Byte]) {
+  xk = c.dec
+  s0 = be32(src, 0) ^ xk[0]
+  s1 = be32(src, 4) ^ xk[1]
+  s2 = be32(src, 8) ^ xk[2]
+  s3 = be32(src, 12) ^ xk[3]
+
+  # Middle rounds shuffle using tables.
+  k = 4
+  t0: U32 = 0
+  t1: U32 = 0
+  t2: U32 = 0
+  t3: U32 = 0
+  r = c.rounds - 1
+  while r > 0 {
+    t0 = xk[k] ^ TD0[(s0 >> 24).to_i] ^ TD1[((s3 >> 16) & 0xff).to_i] ^ TD2[((s2 >> 8) & 0xff).to_i] ^ TD3[(s1 & 0xff).to_i]
+    t1 = xk[k + 1] ^ TD0[(s1 >> 24).to_i] ^ TD1[((s0 >> 16) & 0xff).to_i] ^ TD2[((s3 >> 8) & 0xff).to_i] ^ TD3[(s2 & 0xff).to_i]
+    t2 = xk[k + 2] ^ TD0[(s2 >> 24).to_i] ^ TD1[((s1 >> 16) & 0xff).to_i] ^ TD2[((s0 >> 8) & 0xff).to_i] ^ TD3[(s3 & 0xff).to_i]
+    t3 = xk[k + 3] ^ TD0[(s3 >> 24).to_i] ^ TD1[((s2 >> 16) & 0xff).to_i] ^ TD2[((s1 >> 8) & 0xff).to_i] ^ TD3[(s0 & 0xff).to_i]
+    k += 4
+    s0 = t0
+    s1 = t1
+    s2 = t2
+    s3 = t3
+    r -= 1
+  }
+
+  # Last round uses s-box directly and XORs to produce output.
+  s0 = (SBOX1[(t0 >> 24).to_i].as_u32 << 24) | (SBOX1[((t3 >> 16) & 0xff).to_i].as_u32 << 16) | (SBOX1[((t2 >> 8) & 0xff).to_i].as_u32 << 8) | SBOX1[(t1 & 0xff).to_i].as_u32
+  s1 = (SBOX1[(t1 >> 24).to_i].as_u32 << 24) | (SBOX1[((t0 >> 16) & 0xff).to_i].as_u32 << 16) | (SBOX1[((t3 >> 8) & 0xff).to_i].as_u32 << 8) | SBOX1[(t2 & 0xff).to_i].as_u32
+  s2 = (SBOX1[(t2 >> 24).to_i].as_u32 << 24) | (SBOX1[((t1 >> 16) & 0xff).to_i].as_u32 << 16) | (SBOX1[((t0 >> 8) & 0xff).to_i].as_u32 << 8) | SBOX1[(t3 & 0xff).to_i].as_u32
+  s3 = (SBOX1[(t3 >> 24).to_i].as_u32 << 24) | (SBOX1[((t2 >> 16) & 0xff).to_i].as_u32 << 16) | (SBOX1[((t1 >> 8) & 0xff).to_i].as_u32 << 8) | SBOX1[(t0 & 0xff).to_i].as_u32
+
+  put_be32(dst, 0, s0 ^ xk[k])
+  put_be32(dst, 4, s1 ^ xk[k + 1])
+  put_be32(dst, 8, s2 ^ xk[k + 2])
+  put_be32(dst, 12, s3 ^ xk[k + 3])
+}
+
+# Applies SBOX0 to each byte of w.
+def subw(w: U32) -> U32 {
+  (SBOX0[(w >> 24).to_i].as_u32 << 24) | (SBOX0[((w >> 16) & 0xff).to_i].as_u32 << 16) | (SBOX0[((w >> 8) & 0xff).to_i].as_u32 << 8) | SBOX0[(w & 0xff).to_i].as_u32
+}
+
+# Rotates w left by 8 bits.
+def rotw(w: U32) -> U32 { (w << 8) | (w >> 24) }
+
+# The key expansion of FIPS-197 Figure 11 (Go's expandKeyGeneric). Their
+# rcon[i] is POWX[i-1] << 24.
+def expand_key(c: Block, key: [Byte]) {
+  enc = c.enc
+  dec = c.dec
+  nk = key.size / 4
+  i = 0
+  while i < nk {
+    enc[i] = be32(key, 4 * i)
+    i += 1
+  }
+  n = enc.size
+  while i < n {
+    t = enc[i - 1]
+    if i % nk == 0 {
+      t = subw(rotw(t)) ^ (POWX[i / nk - 1].as_u32 << 24)
+    } else if nk > 6 && i % nk == 4 {
+      t = subw(t)
+    }
+    enc[i] = enc[i - nk] ^ t
+    i += 1
+  }
+
+  # Derive the decryption key from the encryption key: reverse the 4-word
+  # round key sets; all but the first and last get the MixColumn transform.
+  i = 0
+  while i < n {
+    ei = n - i - 4
+    j = 0
+    while j < 4 {
+      x = enc[ei + j]
+      if i > 0 && i + 4 < n {
+        x = TD0[SBOX0[(x >> 24).to_i].to_i] ^ TD1[SBOX0[((x >> 16) & 0xff).to_i].to_i] ^ TD2[SBOX0[((x >> 8) & 0xff).to_i].to_i] ^ TD3[SBOX0[(x & 0xff).to_i].to_i]
+      }
+      dec[i + j] = x
+      j += 1
+    }
+    i += 4
+  }
+  nil
+}

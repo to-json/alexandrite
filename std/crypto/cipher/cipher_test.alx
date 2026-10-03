@@ -1,0 +1,580 @@
+import "crypto/aes"
+import "crypto/des"
+import "encoding/hex"
+
+# Go's crypto/cipher tests, translated: cbc_test.go, cbc_aes_test.go,
+# ctr_test.go, ctr_aes_test.go, cfb_test.go, ofb_test.go, fuzz_test.go and
+# gcm_test.go (the tables are in tables_test.alx; cryptotest's TestStream,
+# TestBlockMode and TestAEAD are check_stream, check_block_mode and
+# check_aead). Go runs most tests once per implementation (assembly,
+# generic, and "Fallback": the block wrapped so it isn't an *aes.Block);
+# here the "generic" side is the same modes over a cipher.Block interface
+# value or a wrapper struct, which exercise the same code through another
+# block type.
+#
+# Not translated:
+#   - modes_test.go (TestCTRAble, TestCBCAble, TestGCM, TestNoExtraMethods),
+#     TestCBCExtraMethods, TestCTRExtraMethods, TestGCMExtraMethods: they
+#     test Go's run-time interface upgrades and reflect over method sets;
+#     alx has neither.
+#   - TestCTR_AES_multiblock_XORKeyStreamAt and the fips140 nonce tests
+#     (TestGCMNoncesFIPSV1/V126): they test internal FIPS-module APIs
+#     (XORKeyStreamAt, GCMWithCounterNonce, GCMForTLS12/13, GCMForSSH) that
+#     crypto/cipher doesn't export.
+#   - TestCTR_AES_blocks8FastPathMatchesGeneric compares the assembly
+#     8-block path with the generic one; it is kept as a comparison of CTR
+#     with a counter walked block by block.
+#   - The panicking parts of the conformance tests (an alx test can't catch
+#     a panic).
+
+def h(s: Str) -> [Byte] { hex.decode_string(s).unwrap }
+
+def hexs(b: [Byte]) -> Str { hex.encode_to_string(b) }
+
+struct ModeTest {
+  name: Str
+  key: [Byte]
+  iv: [Byte]
+  input: [Byte]
+  out: [Byte]
+}
+
+def mt(name: Str, key: Str, iv: Str, input: Str, out: Str) -> ModeTest {
+  ModeTest.new(name: name, key: h(key), iv: h(iv), input: h(input), out: h(out))
+}
+
+def aes_block(key: [Byte]) -> aes.Block { aes.new_cipher(key).unwrap }
+
+# Go's gcm_test.go wrapper: a Block that isn't an aes.Block.
+struct Wrapper {
+  b: aes.Block
+
+  def block_size -> Int { b.block_size }
+  def encrypt(dst: [Byte], src: [Byte]) { b.encrypt(dst, src) }
+  def decrypt(dst: [Byte], src: [Byte]) { b.decrypt(dst, src) }
+}
+
+# The same block as a cipher.Block interface value.
+def as_block(b: aes.Block) -> Block { b }
+
+# ---- CBC ----
+
+test "cbc block mode" {
+  for keylen in [128, 192, 256] {
+    b = aes_block(gen(keylen.as_u64, keylen / 8))
+    check_block_mode(b, ->(b: aes.Block, iv: [Byte]) -> CbcEncrypter[aes.Block] { new_cbc_encrypter(b, iv) }, ->(b: aes.Block, iv: [Byte]) -> CbcDecrypter[aes.Block] { new_cbc_decrypter(b, iv) })
+  }
+  d = des.new_cipher(gen(8, 8)).unwrap
+  check_block_mode(d, ->(b: des.Cipher, iv: [Byte]) -> CbcEncrypter[des.Cipher] { new_cbc_encrypter(b, iv) }, ->(b: des.Cipher, iv: [Byte]) -> CbcDecrypter[des.Cipher] { new_cbc_decrypter(b, iv) })
+}
+
+test "cbc encrypter aes" {
+  for t in cbc_aes_tests() {
+    e = new_cbc_encrypter(aes_block(t.key), t.iv)
+    data = t.input + []
+    e.crypt_blocks!(data, data)
+    assert_eq data, t.out
+  }
+}
+
+test "cbc decrypter aes" {
+  for t in cbc_aes_tests() {
+    d = new_cbc_decrypter(aes_block(t.key), t.iv)
+    data = t.out + []
+    d.crypt_blocks!(data, data)
+    assert_eq data, t.input
+  }
+}
+
+test "cbc set iv" {
+  t = cbc_aes_tests()[0]
+  e = new_cbc_encrypter(aes_block(t.key), gen(1, 16))
+  e.set_iv!(t.iv)
+  data = t.input + []
+  e.crypt_blocks!(data, data)
+  assert_eq data, t.out
+  d = new_cbc_decrypter(aes_block(t.key), gen(2, 16))
+  d.set_iv!(t.iv)
+  d.crypt_blocks!(data, data)
+  assert_eq data, t.input
+}
+
+# fuzz_test.go TestFuzz: CBC over aes.Block against CBC over the same block
+# as a cipher.Block value (Go: assembly against generic), on random data.
+test "fuzz" {
+  keys = [common_key128(), common_key192(), common_key256()]
+  for key in keys {
+    c = aes_block(key)
+    e1 = new_cbc_encrypter(c, common_iv())
+    e2 = new_cbc_encrypter(as_block(c), common_iv())
+    indata = [0.as_u8; 1024]
+    out1 = [0.as_u8; 1024]
+    out2 = [0.as_u8; 1024]
+    round: U64 = 0
+    while round < 20 {
+      copy(indata, gen(round + 50, 1024))
+      e1.crypt_blocks!(out1, indata)
+      e2.crypt_blocks!(out2, indata)
+      assert_eq out1, out2
+      round += 1
+    }
+    d1 = new_cbc_decrypter(c, common_iv())
+    d2 = new_cbc_decrypter(as_block(c), common_iv())
+    round = 0
+    while round < 20 {
+      copy(indata, gen(round + 90, 1024))
+      d1.crypt_blocks!(out1, indata)
+      d2.crypt_blocks!(out2, indata)
+      assert_eq out1, out2
+      round += 1
+    }
+  }
+}
+
+# ---- CTR ----
+
+# ctr_test.go's noopBlock: "encryption" copies, so the key stream is the
+# counter itself.
+struct NoopBlock {
+  size: Int
+
+  def block_size -> Int { size }
+  def encrypt(dst: [Byte], src: [Byte]) { copy(dst, src[0...size]) }
+  def decrypt(dst: [Byte], src: [Byte]) { panic("unreachable") }
+}
+
+def inc(b: [Byte]) {
+  i = b.size - 1
+  while i >= 0 {
+    b[i] = b[i] +% 1
+    break if b[i] != 0
+    i -= 1
+  }
+  nil
+}
+
+test "ctr" {
+  size = 64
+  while size <= 1024 {
+    iv = [0.as_u8; size]
+    ctr = new_ctr(NoopBlock.new(size: size), iv)
+    src = [0xff.as_u8; 1024]
+    want = src + []
+    counter = [0.as_u8; size]
+    i = 1
+    while i < want.size / size {
+      inc(counter)
+      j = 0
+      while j < size {
+        want[i * size + j] = want[i * size + j] ^ counter[j]
+        j += 1
+      }
+      i += 1
+    }
+    dst = [0.as_u8; 1024]
+    ctr.xor_key_stream!(dst, src)
+    assert_eq dst, want
+    size *= 2
+  }
+}
+
+test "ctr stream" {
+  for keylen in [128, 192, 256] {
+    b = aes_block(gen(keylen.as_u64 + 1, keylen / 8))
+    iv = gen(3, 16)
+    check_stream(->() -> Ctr[aes.Block] { new_ctr(b, iv) }, false)
+  }
+  d = des.new_cipher(gen(9, 8)).unwrap
+  div = gen(4, 8)
+  check_stream(->() -> Ctr[des.Cipher] { new_ctr(d, div) }, false)
+}
+
+test "ctr aes" {
+  for t in ctr_aes_tests() {
+    c = aes_block(t.key)
+    for j in [0, 5] {
+      input = t.input[0...t.input.size - j]
+      ctr = new_ctr(c, t.iv)
+      encrypted = [0.as_u8; input.size]
+      ctr.xor_key_stream!(encrypted, input)
+      assert_eq encrypted, t.out[0...input.size]
+    }
+    for j in [0, 7] {
+      input = t.out[0...t.out.size - j]
+      ctr = new_ctr(c, t.iv)
+      plain = [0.as_u8; input.size]
+      ctr.xor_key_stream!(plain, input)
+      assert_eq plain, t.input[0...input.size]
+    }
+  }
+}
+
+# The CTR key stream walked block by block: the reference the multiblock
+# tests compare with (Go's "generic counter walker").
+def reference_ctr(b: aes.Block, iv: [Byte], src: [Byte]) -> [Byte] {
+  counter = iv + []
+  out = [0.as_u8; src.size]
+  ks = [0.as_u8; 16]
+  off = 0
+  while off < src.size {
+    b.encrypt(ks, counter)
+    inc(counter)
+    j = 0
+    while j < 16 && off + j < src.size {
+      out[off + j] = src[off + j] ^ ks[j]
+      j += 1
+    }
+    off += 16
+  }
+  out
+}
+
+def be64_bytes(hi: U64, lo: U64) -> [Byte] {
+  out = [0.as_u8; 16]
+  i = 0
+  while i < 8 {
+    out[i] = (hi >> (56 - 8 * i).as_u64).as_u8
+    out[8 + i] = (lo >> (56 - 8 * i).as_u64).as_u8
+    i += 1
+  }
+  out
+}
+
+test "ctr aes blocks8 matches generic" {
+  block = aes_block([0.as_u8; 16])
+  keystream = [0.as_u8; 8 * 16]
+  max: U64 = 0xffffffffffffffff
+  ivs = [be64_bytes(0, 0), be64_bytes(1, max - 7), be64_bytes(2, max - 6), be64_bytes(0, max)]
+  for iv in ivs {
+    out = [0.as_u8; keystream.size]
+    ctr = new_ctr(block, iv)
+    ctr.xor_key_stream!(out, keystream)
+    assert_eq out, reference_ctr(block, iv, keystream)
+  }
+}
+
+test "ctr aes multiblock random iv" {
+  iv = gen(54321, 16)
+  size = 100
+  for key_size in [16, 24, 32] {
+    block = aes_block(gen(key_size.as_u64 + 54321, key_size))
+    plaintext = gen(key_size.as_u64 + 1000, size)
+    want = reference_ctr(block, iv, plaintext)
+    # Split the text in 3 parts in all possible ways.
+    part1 = 0
+    while part1 <= size {
+      part2 = 0
+      while part2 <= size - part1 {
+        ctr = new_ctr(block, iv)
+        got = [0.as_u8; size]
+        ctr.xor_key_stream!(got[0...part1], plaintext[0...part1])
+        ctr.xor_key_stream!(got[part1...part1 + part2], plaintext[part1...part1 + part2])
+        ctr.xor_key_stream!(got[part1 + part2...size], plaintext[part1 + part2...size])
+        assert_eq got, want
+        part2 += 1
+      }
+      part1 += 1
+    }
+  }
+}
+
+test "ctr aes multiblock overflow iv" {
+  size = 4096
+  plaintext = gen(987654, size)
+  ivs = [
+    h("0000000000000000ffffffffffffffff"),
+    h("ffffffffffffffffffffffffffffffff"),
+    h("ffffffffffffffff0000000000000000"),
+    h("fffffffffffffffffffffffffffffffe"),
+    h("0000000000000000fffffffffffffffe"),
+    h("ffffffffffffffffffffffffffffff00"),
+    h("0000000000000001ffffffffffffff00"),
+    h("0000000000000001ffffffffffffffff"),
+    h("0000000000000001fffffffffffffffe"),
+    h("0000000000000001ffffffffffffff00"),
+  ]
+  seed: U64 = 1
+  for key_size in [16, 24, 32] {
+    for iv in ivs {
+      seed += 1
+      block = aes_block(gen(seed, key_size))
+      want = reference_ctr(block, iv, plaintext)
+      for offset in [0, 1, 16, 1024] {
+        ctr = new_ctr(block, iv)
+        got = [0.as_u8; size]
+        ctr.xor_key_stream!(got, plaintext[0...offset])
+        ctr.xor_key_stream!(got[offset...size], plaintext[offset...size])
+        assert_eq got, want
+      }
+    }
+  }
+}
+
+# ---- CFB ----
+
+test "cfb vectors" {
+  for t in cfb_tests() {
+    block = aes_block(h(t[0]))
+    iv = h(t[1])
+    plaintext = h(t[2])
+    expected = h(t[3])
+    ciphertext = [0.as_u8; plaintext.size]
+    cfb = new_cfb_encrypter(block, iv)
+    cfb.xor_key_stream!(ciphertext, plaintext)
+    assert_eq ciphertext, expected
+    cfbdec = new_cfb_decrypter(block, iv)
+    plaintext_copy = [0.as_u8; ciphertext.size]
+    cfbdec.xor_key_stream!(plaintext_copy, ciphertext)
+    assert_eq plaintext_copy, plaintext
+  }
+}
+
+test "cfb inverse" {
+  block = aes_block(common_key128())
+  plaintext = "this is the plaintext. this is the plaintext.".bytes.to_a
+  iv = gen(77, block.block_size)
+  cfb = new_cfb_encrypter(block, iv)
+  ciphertext = plaintext + []
+  cfb.xor_key_stream!(ciphertext, ciphertext)
+  cfbdec = new_cfb_decrypter(block, iv)
+  plaintext_copy = ciphertext + []
+  cfbdec.xor_key_stream!(plaintext_copy, plaintext_copy)
+  assert_eq plaintext_copy, plaintext
+}
+
+test "cfb stream" {
+  for keylen in [128, 192, 256] {
+    b = aes_block(gen(keylen.as_u64 + 2, keylen / 8))
+    iv = gen(5, 16)
+    check_stream(->() -> Cfb[aes.Block] { new_cfb_encrypter(b, iv) }, true)
+    check_stream(->() -> Cfb[aes.Block] { new_cfb_decrypter(b, iv) }, true)
+  }
+  d = des.new_cipher(gen(10, 8)).unwrap
+  div = gen(6, 8)
+  check_stream(->() -> Cfb[des.Cipher] { new_cfb_encrypter(d, div) }, true)
+  check_stream(->() -> Cfb[des.Cipher] { new_cfb_decrypter(d, div) }, true)
+}
+
+# ---- OFB ----
+
+test "ofb" {
+  for t in ofb_tests() {
+    c = aes_block(t.key)
+    for j in [0, 5] {
+      plaintext = t.input[0...t.input.size - j]
+      ofb = new_ofb(c, t.iv)
+      ciphertext = [0.as_u8; plaintext.size]
+      ofb.xor_key_stream!(ciphertext, plaintext)
+      assert_eq ciphertext, t.out[0...plaintext.size]
+    }
+    for j in [0, 5] {
+      ciphertext = t.out[0...t.input.size - j]
+      ofb = new_ofb(c, t.iv)
+      plaintext = [0.as_u8; ciphertext.size]
+      ofb.xor_key_stream!(plaintext, ciphertext)
+      assert_eq plaintext, t.input[0...ciphertext.size]
+    }
+  }
+}
+
+test "ofb stream" {
+  for keylen in [128, 192, 256] {
+    b = aes_block(gen(keylen.as_u64 + 3, keylen / 8))
+    iv = gen(7, 16)
+    check_stream(->() -> Ofb[aes.Block] { new_ofb(b, iv) }, false)
+  }
+  d = des.new_cipher(gen(11, 8)).unwrap
+  div = gen(8, 8)
+  check_stream(->() -> Ofb[des.Cipher] { new_ofb(d, div) }, false)
+}
+
+# ---- GCM ----
+
+def check_aes_gcm_vectors[B](mk: ([Byte]) -> B) {
+  for t in aes_gcm_tests() {
+    blk = mk(h(t[0]))
+    nonce = h(t[1])
+    plaintext = h(t[2])
+    ad = h(t[3])
+    tag_size = (t[4].size - t[2].size) / 2
+    if nonce.size == 0 {
+      assert new_gcm_with_nonce_size(blk, 0).err?, "expected error for zero nonce size"
+      next
+    }
+    g = if tag_size != 16 {
+      new_gcm_with_tag_size(blk, tag_size).unwrap
+    } else if nonce.size != 12 {
+      new_gcm_with_nonce_size(blk, nonce.size).unwrap
+    } else {
+      new_gcm(blk).unwrap
+    }
+    ct = g.seal([], nonce, plaintext, ad)
+    assert_eq hexs(ct), t[4]
+    plaintext2 = g.open([], nonce, ct, ad).unwrap
+    assert_eq plaintext2, plaintext
+    if ad.size > 0 {
+      ad[0] = ad[0] ^ 0x80
+      assert g.open([], nonce, ct, ad).err?, "open succeeded after altering additional data"
+      ad[0] = ad[0] ^ 0x80
+    }
+    nonce[0] = nonce[0] ^ 0x80
+    assert g.open([], nonce, ct, ad).err?, "open succeeded after altering nonce"
+    nonce[0] = nonce[0] ^ 0x80
+    ct[0] = ct[0] ^ 0x80
+    assert g.open([], nonce, ct, ad).err?, "open succeeded after altering ciphertext"
+    ct[0] = ct[0] ^ 0x80
+  }
+}
+
+test "aes gcm" {
+  check_aes_gcm_vectors(->(key: [Byte]) -> aes.Block { aes_block(key) })
+  check_aes_gcm_vectors(->(key: [Byte]) -> Wrapper { Wrapper.new(b: aes_block(key)) })
+  check_aes_gcm_vectors(->(key: [Byte]) -> Block { as_block(aes_block(key)) })
+}
+
+test "gcm invalid tag size" {
+  b = aes_block(h("ab72c77b97cb5fe9a382d9fe81ffdbed"))
+  for tag_size in [0, 1, b.block_size + 1] {
+    r = new_gcm_with_tag_size(b, tag_size)
+    assert r.err?, "invalid tag size #{tag_size} accepted"
+    assert_eq r.err.unwrap.message, "cipher: incorrect tag size given to GCM"
+  }
+}
+
+test "gcm needs 128-bit block" {
+  d = des.new_cipher(gen(12, 8)).unwrap
+  assert_eq new_gcm(d).err.unwrap.message, "cipher: NewGCM requires 128-bit block cipher"
+  assert_eq new_gcm_with_nonce_size(aes_block(gen(13, 16)), 0).err.unwrap.message, "cipher: the nonce can't have zero length"
+}
+
+# Go's TestTagFailureOverwrite checks that a failed open zeroes dst's
+# spare capacity (the AESNI code decrypts before it authenticates). Here a
+# failed open writes nothing: dst keeps its bytes, and no plaintext comes
+# back.
+test "tag failure overwrite" {
+  key = h("ab72c77b97cb5fe9a382d9fe81ffdbed")
+  nonce = h("54cc7dc2c37ec006bcc6d1db")
+  ciphertext = h("0e1bde206a07a9c2c1b65300f8c649972b4401346697138c7a4891ee59867d0c")
+  g = new_gcm(aes_block(key)).unwrap
+  dst = [42.as_u8; ciphertext.size - 16]
+  r = g.open(dst[0...0], nonce, ciphertext, [])
+  assert r.err?, "bad open still succeeded"
+  assert_eq r.err.unwrap.message, "cipher: message authentication failed"
+  assert_eq dst, [42.as_u8; ciphertext.size - 16]
+}
+
+# The last 32 bits of the counter wrap.
+test "gcm counter wrap" {
+  tests = [
+    ["0fa72e25", "37e1948cdfff09fbde0c40ad99fee4a7"],
+    ["afe05cc1", "438f3aa9fee5e54903b1927bca26bbdf"],
+    ["9ffecbef", "7b88ca424df9703e9e8611071ec7e16e"],
+    ["ffc3e5b3", "38d49c86e0abe853ac250e66da54c01a"],
+    ["cfdd729d", "e08402eaac36a1a402e09b1bd56500e8"],
+    ["010ae3d486", "5405bb490b1f95d01e2ba735687154bc"],
+    ["01b1107a9d", "939a585f342e01e17844627492d44dbf"],
+  ]
+  key = aes_block([0.as_u8; 16])
+  plaintext = [0.as_u8; 16 * 17 + 1]
+  for t in tests {
+    nonce = h(t[0])
+    aead = new_gcm_with_nonce_size(key, nonce.size).unwrap
+    got = aead.seal([], nonce, plaintext, [])
+    assert_eq got[plaintext.size...got.size], h(t[1])
+    assert aead.open([], nonce, got, []).ok?, "authentication failed"
+  }
+}
+
+# Go's TestGCMAsm compares the assembly GCM with the generic one; here GCM
+# over aes.Block against GCM over the wrapped block, for every length,
+# alignment (offset into a larger buffer) and key size.
+test "gcm asm" {
+  lengths = [0, 156, 8192, 8193, 8208]
+  aligns = [0, 1, 2, 3]
+  seed: U64 = 4000
+  for ad_len in lengths {
+    for ad_align in aligns {
+      next if ad_align != 0 && ad_len == 0
+      for pt_len in [0, 156, 8193] {
+        for ks in [16, 24, 32] {
+          seed += 4
+          key = gen(seed, ks)
+          b = aes_block(key)
+          g1 = new_gcm(b).unwrap
+          g2 = new_gcm(Wrapper.new(b: b)).unwrap
+          ad_buf = gen(seed + 1, ad_align + ad_len)
+          ad = ad_buf[ad_align...ad_buf.size]
+          pt = gen(seed + 2, pt_len)
+          nonce = gen(seed + 3, 12)
+          want = g2.seal([], nonce, pt, ad)
+          got = g1.seal([], nonce, pt, ad)
+          assert_eq got, want
+          assert_eq g1.open([], nonce, want, ad).unwrap, pt
+        }
+      }
+    }
+  }
+}
+
+test "gcm aead" {
+  for key_size in [128, 192, 256] {
+    block = aes_block(gen(key_size.as_u64 + 5, key_size / 8))
+    check_aead(new_gcm(block).unwrap)
+    # Non-standard tag sizes.
+    check_aead(new_gcm_with_tag_size(block, 12).unwrap)
+    # Non-standard nonce sizes.
+    for nonce_size in [1, 16, 100] {
+      check_aead(new_gcm_with_nonce_size(block, nonce_size).unwrap)
+    }
+    check_aead(new_gcm_with_random_nonce(block))
+    # The fallback (a block that isn't an aes.Block).
+    check_aead(new_gcm(Wrapper.new(b: block)).unwrap)
+  }
+}
+
+test "gcm with random nonce" {
+  g = new_gcm_with_random_nonce(aes_block(gen(14, 32)))
+  assert_eq g.nonce_size, 0
+  assert_eq g.overhead, 28
+  pt = "hello, world".bytes.to_a
+  ad = "header".bytes.to_a
+  c1 = g.seal([], [], pt, ad)
+  c2 = g.seal([], [], pt, ad)
+  assert_eq c1.size, pt.size + 28
+  assert c1 != c2, "two seals used the same nonce"
+  assert_eq g.open([], [], c1, ad).unwrap, pt
+  assert_eq g.open([], [], c2, ad).unwrap, pt
+  assert g.open([], [], c1[0...27], ad).err?, "short ciphertext opened"
+  # The nonce is the first 12 bytes: a plain GCM opens the rest.
+  plain = new_gcm(aes_block(gen(14, 32))).unwrap
+  assert_eq plain.open([], c1[0...12], c1[12...c1.size], ad).unwrap, pt
+}
+
+# GHASH against Go's for a few inputs (ghash_sum is Go's gcm.GHASH).
+test "ghash" {
+  key = h("66e94bd4ef8a2c3b884cfa59ca342b2e")
+  assert_eq hexs(ghash_sum(key, [])), "00000000000000000000000000000000"
+  assert_eq hexs(ghash_sum(key, [h("0388dace60b6a392f328c2b971b2fe78"), h("00000000000000000000000000000080")])), "f38cbb1ad69223dcc3457ae5b6b0f885"
+}
+
+bench "aes-128 gcm seal 1350" {
+  g = new_gcm(aes_block(gen(1, 16))).unwrap
+  nonce = gen(2, 12)
+  buf = gen(3, 1350)
+  ad = gen(4, 13)
+  i = 0
+  while i < 100 {
+    g.seal([], nonce, buf, ad)
+    i += 1
+  }
+}
+
+bench "aes-128 ctr 1K" {
+  s = new_ctr(aes_block(gen(1, 16)), gen(2, 16))
+  buf = gen(3, 1024)
+  i = 0
+  while i < 100 {
+    s.xor_key_stream!(buf, buf)
+    i += 1
+  }
+}

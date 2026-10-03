@@ -1,0 +1,143 @@
+# Go's dump_test.go, translated. alx's client sends "User-Agent:
+# alx-http/1" and no "Accept-Encoding: gzip" (see the package header).
+import "bufio"
+import "bytes"
+import "io"
+import "strings"
+import "net/http"
+
+UA = "User-Agent: alx-http/1\r\n"
+
+def chunk(s: Str) -> Str { format("%x\r\n%s\r\n", s.size, s) }
+
+def hdr(pairs: [(Str, [Str])]) -> http.Header {
+  h = http.new_header
+  for p in pairs {
+    h.set_raw!(p[0], p[1])
+  }
+  h
+}
+
+def mkreq(method: Str, url: Str, proto: Str, h: http.Header, body: Str, cl: Int, te: [Str]) -> http.Request {
+  pv: Map[Str, Str] = {}
+  http.Request.new(method: method, url: url, path: "", raw_query: "", proto: proto, host: "", header: h, body: body.bytes.to_a, remote_addr: "", pathvals: pv, request_uri: "", content_length: cl, transfer_encoding: te, close: false, trailer: http.new_header)
+}
+
+def read_req(s: Str) -> http.Request {
+  http.read_request(bufio.new_reader(bytes.new_buffer_string(s)), "").unwrap.unwrap
+}
+
+def dump(r: http.Request, body: Bool) -> Str {
+  res = dump_request(r, body)
+  return "ERR " + res.err.unwrap.message if res.err?
+  Str.from_bytes(res.unwrap)
+}
+
+def dump_out(r: http.Request, body: Bool) -> Str {
+  res = dump_request_out(r, body)
+  return "ERR " + res.err.unwrap.message if res.err?
+  Str.from_bytes(res.unwrap)
+}
+
+test "dump request" {
+  # HTTP/1.1 => chunked coding; body; empty trailer
+  r = mkreq("GET", "http://www.google.com/search", "HTTP/1.1", http.new_header, "abcdef", 0, ["chunked"])
+  assert_eq dump(r, true), "GET /search HTTP/1.1\r\nHost: www.google.com\r\nTransfer-Encoding: chunked\r\n\r\n" + chunk("abcdef") + chunk("")
+  # the HTTP version is kept; no Host or User-Agent is added
+  r = mkreq("GET", "/foo", "HTTP/1.0", hdr([("X-Foo", ["X-Bar"])]), "", 0, [])
+  assert_eq dump(r, true), "GET /foo HTTP/1.0\r\nX-Foo: X-Bar\r\n\r\n"
+  r = http.new_request("GET", "http://example.com/foo", []).unwrap
+  assert_eq dump_out(r, true), "GET /foo HTTP/1.1\r\nHost: example.com\r\n" + UA + "\r\n"
+  # an https URL
+  r = mkreq("GET", "https://example.com/foo", "HTTP/1.1", http.new_header, "", 0, [])
+  r.host = "example.com"
+  assert_eq dump_out(r, true), "GET /foo HTTP/1.1\r\nHost: example.com\r\n" + UA + "\r\n"
+  # a body, dumped without it
+  r = mkreq("POST", "http://post.tld/", "HTTP/1.1", http.new_header, "abcdef", 6, [])
+  assert_eq dump_out(r, false), "POST / HTTP/1.1\r\nHost: post.tld\r\n" + UA + "Content-Length: 6\r\n\r\n"
+  # a body larger than a buffer
+  big = strings.repeat("a", 8193)
+  r = mkreq("POST", "http://post.tld/", "HTTP/1.1", hdr([("Content-Length", ["8193"])]), big, 8193, [])
+  assert_eq dump_out(r, true), "POST / HTTP/1.1\r\nHost: post.tld\r\n" + UA + "Content-Length: 8193\r\n\r\n" + big
+  assert_eq dump(r, true), "POST / HTTP/1.1\r\nHost: post.tld\r\nContent-Length: 8193\r\n\r\n" + big
+  # an absolute request URI: no Host line
+  r = read_req("GET http://foo.com/ HTTP/1.1\r\nUser-Agent: blah\r\n\r\n")
+  assert_eq dump(r, false), "GET http://foo.com/ HTTP/1.1\r\nUser-Agent: blah\r\n\r\n"
+  # Issue 7215: Content-Length as read
+  r = read_req("POST /v2/api/?login HTTP/1.1\r\nHost: passport.myhost.com\r\nContent-Length: 3\r\n\r\nkey1=name1&key2=name2")
+  assert_eq dump(r, true), "POST /v2/api/?login HTTP/1.1\r\nHost: passport.myhost.com\r\nContent-Length: 3\r\n\r\nkey"
+  r = read_req("POST /v2/api/?login HTTP/1.1\r\nHost: passport.myhost.com\r\nContent-Length: 0\r\n\r\nkey1=name1&key2=name2")
+  assert_eq dump(r, true), "POST /v2/api/?login HTTP/1.1\r\nHost: passport.myhost.com\r\nContent-Length: 0\r\n\r\n"
+  r = read_req("POST /v2/api/?login HTTP/1.1\r\nHost: passport.myhost.com\r\n\r\nkey1=name1&key2=name2")
+  assert_eq dump(r, true), "POST /v2/api/?login HTTP/1.1\r\nHost: passport.myhost.com\r\n\r\n"
+  # Issue 18506: an empty body is Content-Length: 0, not chunked
+  r = http.new_request("POST", "http://example.com/foo", []).unwrap
+  assert_eq dump_out(r, true), "POST /foo HTTP/1.1\r\nHost: example.com\r\n" + UA + "Content-Length: 0\r\n\r\n"
+  # Issue 54616: a Connection header isn't duplicated
+  r = read_req("GET / HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n")
+  assert_eq dump(r, false), "GET / HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n"
+  # an empty URL can't be sent
+  assert dump_out(mkreq("GET", "", "HTTP/1.1", http.new_header, "", 0, []), true).start_with?("ERR ")
+}
+
+def mkresp(status: Int, text: Str, h: http.Header, body: Str, cl: Int, te: [Str]) -> http.Response {
+  http.Response.new(status: status, status_text: text, proto: "HTTP/1.1", header: h, body: body.bytes.to_a, content_length: cl, transfer_encoding: te, close: false, trailer: http.new_header, request_method: "")
+}
+
+def dresp_trim(r: http.Response, body: Bool) -> Str {
+  s = Str.from_bytes(dump_response(r, body).unwrap)
+  strings.replace_all(strings.trim_space(s), "\r", "")
+}
+
+test "dump response" {
+  assert_eq dresp_trim(mkresp(200, "200 OK", hdr([("Foo", ["Bar"])]), "foo", 50, []), false), "HTTP/1.1 200 OK\nContent-Length: 50\nFoo: Bar"
+  assert_eq dresp_trim(mkresp(200, "200 OK", http.new_header, "foo", 3, []), true), "HTTP/1.1 200 OK\nContent-Length: 3\n\nfoo"
+  assert_eq dresp_trim(mkresp(200, "200 OK", http.new_header, "foo", -1, ["chunked"]), true), "HTTP/1.1 200 OK\nTransfer-Encoding: chunked\n\n3\nfoo\n0"
+  assert_eq dresp_trim(mkresp(200, "200 OK", hdr([("Foo1", ["Bar1"]), ("Foo2", ["Bar2"])]), "", 0, []), false), "HTTP/1.1 200 OK\nFoo1: Bar1\nFoo2: Bar2\nContent-Length: 0"
+}
+
+# ------------------------------------------------ helpers for vec_dump_test
+
+def pairs_header(ps: [(Str, Str)]) -> http.Header {
+  h = http.new_header
+  for p in ps {
+    h.add!(p[0], p[1])
+  }
+  h
+}
+
+def dreq(method: Str, url: Str, proto: Str, ps: [(Str, Str)], body: Str, cl: Int, te: [Str], host: Str, ruri: Str, with_body: Bool) -> Str {
+  r = mkreq(method, url, proto, pairs_header(ps), body, cl, te)
+  r.host = host
+  r.request_uri = ruri
+  res = dump_request(r, with_body)
+  return "ERR " + res.err.unwrap.message if res.err?
+  Str.from_bytes(res.unwrap)
+}
+
+def dresp(code: Int, text: Str, proto: Str, ps: [(Str, Str)], body: Str, cl: Int, te: [Str], close: Bool, method: Str, with_body: Bool) -> Str {
+  r = http.Response.new(status: code, status_text: text, proto: proto, header: pairs_header(ps), body: body.bytes.to_a, content_length: cl, transfer_encoding: te, close: close, trailer: http.new_header, request_method: method)
+  res = dump_response(r, with_body)
+  return "ERR " + res.err.unwrap.message if res.err?
+  Str.from_bytes(res.unwrap)
+}
+
+def chunks(writes: [Str]) -> Str {
+  b = bytes.new_buffer([])
+  w = new_chunked_writer(b)
+  for s in writes {
+    w.write_string!(s).unwrap
+  }
+  w.close!.unwrap
+  b.to_s
+}
+
+test "chunked reader and writer" {
+  b = bytes.new_buffer([])
+  w = new_chunked_writer(b)
+  w.write_string!("hello, ").unwrap
+  w.write_string!("world").unwrap
+  w.close!.unwrap
+  assert_eq b.to_s, "7\r\nhello, \r\n5\r\nworld\r\n0\r\n"
+  assert_eq Str.from_bytes(io.read_all(new_chunked_reader(b)).unwrap), "hello, world"
+}

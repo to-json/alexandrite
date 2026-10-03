@@ -45,6 +45,9 @@ struct Transfer {
   header: Header
   trailer: Header
   has_trailer: Bool
+  # Go read the body's first byte to see whether it was empty, so its
+  # chunked copy starts with a one-byte chunk.
+  probed: Bool
 
   def should_send_content_length -> Bool {
     return false if chunked_te?(te)
@@ -88,9 +91,14 @@ struct Transfer {
     ncopy = 0
     if !response_to_head && has_body {
       if chunked_te?(te) {
-        if body.size > 0 {
-          out.write!(strconv.format_int(body.size, 16) + "\r\n")
-          out.write!(Str.from_bytes(body))
+        rest = body
+        if probed && rest.size > 1 {
+          out.write!("1\r\n" + Str.from_bytes(rest[0...1]) + "\r\n")
+          rest = rest[1...rest.size]
+        }
+        if rest.size > 0 {
+          out.write!(strconv.format_int(rest.size, 16) + "\r\n")
+          out.write!(Str.from_bytes(rest))
           out.write!("\r\n")
         }
         out.write!("0\r\n")
@@ -157,7 +165,7 @@ def request_transfer(r: Request) -> ~Transfer {
   if cl < 0 && te.size == 0 && has_body && method != "CONNECT" {
     te = ["chunked"]
   }
-  t = Transfer.new(method: method, body: r.body, has_body: has_body, response_to_head: false, content_length: cl, close: r.close, te: te, header: r.header, trailer: r.trailer, has_trailer: r.trailer.size > 0)
+  t = Transfer.new(method: method, body: r.body, has_body: has_body, response_to_head: false, content_length: cl, close: r.close, te: te, header: r.header, trailer: r.trailer, has_trailer: r.trailer.size > 0, probed: r.content_length == 0 && has_body && r.transfer_encoding.size == 0 && lacks_body_method?(method))
   ~finish_transfer(t, true)
 }
 
@@ -191,7 +199,7 @@ def has_ctl_byte?(s: Str) -> Bool {
   false
 }
 
-def request_wire(r: Request, using_proxy: Bool) -> ~Str {
+def request_wire(r: Request, using_proxy: Bool, head_only: Bool) -> ~Str {
   pr = nurl.parse(r.url)
   fail "http: invalid Request URL: #{pr.err.unwrap.message}" if pr.err?
   u = pr.unwrap
@@ -222,6 +230,7 @@ def request_wire(r: Request, using_proxy: Bool) -> ~Str {
   ~t.write_header(b)
   b.write!(r.header.wire_subset(["Host", "User-Agent", "Content-Length", "Transfer-Encoding", "Trailer"]))
   b.write!("\r\n")
+  return b.to_s if head_only
   ~t.write_body(b)
   b.to_s
 }
@@ -232,7 +241,7 @@ def request_wire(r: Request, using_proxy: Bool) -> ~Str {
 # (Content-Length, or chunked coding when the length is unknown), the rest of
 # the header sorted, and the body. Nothing is written if it fails.
 pub def write_request(r: Request, w: io.Writer) -> ~Unit {
-  s = ~request_wire(r, false)
+  s = ~request_wire(r, false, false)
   out = w
   out.~write!(s.bytes.to_a)
   return
@@ -241,7 +250,7 @@ pub def write_request(r: Request, w: io.Writer) -> ~Unit {
 # Like write_request, in the form a proxy expects: an absolute URI in the
 # request line (Go's WriteProxy).
 pub def write_proxy_request(r: Request, w: io.Writer) -> ~Unit {
-  s = ~request_wire(r, true)
+  s = ~request_wire(r, true, false)
   out = w
   out.~write!(s.bytes.to_a)
   return
@@ -249,7 +258,7 @@ pub def write_proxy_request(r: Request, w: io.Writer) -> ~Unit {
 
 # The wire form of r (write_request into a string).
 pub def request_bytes(r: Request) -> ~Str {
-  ~request_wire(r, false)
+  ~request_wire(r, false, false)
 }
 
 # (major, minor) of "HTTP/M.N"; (0, 0) when it isn't one.
@@ -265,7 +274,7 @@ pub def parse_http_version(proto: Str) -> (Int, Int)? {
   (ma.unwrap, mi.unwrap)
 }
 
-def response_wire(r: Response) -> ~Str {
+def response_wire(r: Response, head_only: Bool, body_set: Bool) -> ~Str {
   major = 0
   minor = 0
   if v = parse_http_version(r.proto) {
@@ -280,24 +289,25 @@ def response_wire(r: Response) -> ~Str {
   }
   b = strings.new_builder
   b.write!(format("HTTP/%d.%d %03d %s\r\n", major, minor, r.status, text))
-  has_body = r.body.size > 0
+  has_body = body_set || r.body.size > 0
   cl = r.content_length
   # Go probes a body whose ContentLength is 0: it's empty, or of unknown length.
-  cl = -1 if cl == 0 && has_body
+  cl = -1 if cl == 0 && r.body.size > 0
   close = r.close
   at_least_11 = major > 1 || (major == 1 && minor >= 1)
   if cl == -1 && !close && at_least_11 && !chunked_te?(r.transfer_encoding) {
     close = true
   }
   method = r.request_method
-  t = Transfer.new(method: method, body: r.body, has_body: has_body, response_to_head: method == "HEAD", content_length: cl, close: close, te: r.transfer_encoding, header: r.header, trailer: r.trailer, has_trailer: r.trailer.size > 0)
+  t = Transfer.new(method: method, body: r.body, has_body: has_body, response_to_head: method == "HEAD", content_length: cl, close: close, te: r.transfer_encoding, header: r.header, trailer: r.trailer, has_trailer: r.trailer.size > 0, probed: r.content_length == 0 && r.body.size > 0)
   t = ~finish_transfer(t, at_least_11)
   ~t.write_header(b)
   b.write!(r.header.wire_subset(["Content-Length", "Transfer-Encoding", "Trailer"]))
-  if t.content_length == 0 && !chunked_te?(t.te) && !t.should_send_content_length && body_allowed_for_status?(r.status) {
+  if cl == 0 && !chunked_te?(r.transfer_encoding) && !t.should_send_content_length && body_allowed_for_status?(r.status) {
     b.write!("Content-Length: 0\r\n")
   }
   b.write!("\r\n")
+  return b.to_s if head_only
   ~t.write_body(b)
   b.to_s
 }
@@ -308,7 +318,7 @@ def response_wire(r: Response) -> ~Str {
 # and a chunked body's trailer. A response to HEAD (request_method) has no
 # body. Nothing is written if it fails.
 pub def write_response(r: Response, w: io.Writer) -> ~Unit {
-  s = ~response_wire(r)
+  s = ~response_wire(r, false, false)
   out = w
   out.~write!(s.bytes.to_a)
   return
@@ -316,5 +326,25 @@ pub def write_response(r: Response, w: io.Writer) -> ~Unit {
 
 # The wire form of r (write_response into a string).
 pub def response_bytes(r: Response) -> ~Str {
-  ~response_wire(r)
+  ~response_wire(r, false, false)
+}
+
+# What write_request writes up to and including the blank line after the
+# header (framing as for r's body, which isn't written or checked).
+pub def request_head(r: Request) -> ~Str {
+  ~request_wire(r, false, true)
+}
+
+# What write_response writes up to and including the blank line after the
+# header (framing as for r's body, which isn't written or checked).
+pub def response_head(r: Response) -> ~Str {
+  ~response_wire(r, true, false)
+}
+
+# Go's Response.Write output with Go's distinction between a nil and an
+# empty Body: `body_set` says the body is there even when it's empty (it
+# then frames as Go's non-nil empty body). `head_only` stops after the
+# header (httputil's dumps).
+pub def response_wire_form(r: Response, body_set: Bool, head_only: Bool) -> ~Str {
+  ~response_wire(r, head_only, body_set)
 }

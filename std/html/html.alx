@@ -1,0 +1,254 @@
+# Package html: Go's html — escaping and unescaping HTML text.
+#
+# API: EscapeString → escape_string, UnescapeString → unescape_string.
+#
+# The full HTML5 named character reference table (2229 entries, generated
+# from Go's html/entity.go) is in entity.alx, as a sorted fixed-width string
+# searched by bisection: no map is built at startup or on first use.
+#
+# Differences from Go: none in behaviour. Numeric references accumulate in a
+# 32-bit rune with wrapping arithmetic, as Go's do, so "&#4294967361;" is
+# "A" in both.
+
+import "unicode/utf8"
+
+LONGEST_ENTITY_WITHOUT_SEMICOLON = 6
+
+# Replacements for numeric references 0x80..0x9F, for compatibility with old
+# numeric entities that assumed Windows-1252.
+REPLACEMENT_TABLE: [Rune; 32] = [
+  0x20AC, 0x0081, 0x201A, 0x0192, 0x201E, 0x2026, 0x2020, 0x2021,
+  0x02C6, 0x2030, 0x0160, 0x2039, 0x0152, 0x008D, 0x017D, 0x008F,
+  0x0090, 0x2018, 0x2019, 0x201C, 0x201D, 0x2022, 0x2013, 0x2014,
+  0x02DC, 0x2122, 0x0161, 0x203A, 0x0153, 0x009D, 0x017E, 0x0178,
+]
+
+# Escapes the five characters <, >, &, ' and " ("&lt;", "&gt;", "&amp;",
+# "&#39;", "&#34;"). unescape_string(escape_string(s)) == s always.
+pub def escape_string(s: Str) -> Str {
+  i = 0
+  while i < s.size {
+    c = s[i]
+    break if c == 0x26 || c == 0x27 || c == 0x3C || c == 0x3E || c == 0x22
+    i += 1
+  }
+  return s if i == s.size
+  out: [Byte] = []
+  k = 0
+  while k < i {
+    out << s[k]
+    k += 1
+  }
+  while i < s.size {
+    c = s[i]
+    rep = case c {
+      0x26 => "&amp;"
+      0x27 => "&#39;"
+      0x3C => "&lt;"
+      0x3E => "&gt;"
+      0x22 => "&#34;"
+      _ => ""
+    }
+    if rep.size == 0 {
+      out << c
+    } else {
+      for b in rep.bytes {
+        out << b
+      }
+    }
+    i += 1
+  }
+  Str.from_bytes(out)
+}
+
+# Unescapes entities like "&lt;" to "<": every named reference of HTML5,
+# with or without its semicolon where HTML5 allows that, and numeric ones
+# ("&#225;", "&#xE1;"). unescape_string(escape_string(s)) == s always.
+pub def unescape_string(s: Str) -> Str {
+  i = index_amp(s, 0)
+  return s if i < 0
+  out: [Byte] = []
+  k = 0
+  while k < i {
+    out << s[k]
+    k += 1
+  }
+  src = i
+  while src < s.size {
+    if s[src] == 0x26 {
+      src, out = unescape_entity(s, src, out)
+    } else {
+      out << s[src]
+      src += 1
+    }
+  }
+  Str.from_bytes(out)
+}
+
+def index_amp(s: Str, from: Int) -> Int {
+  i = from
+  while i < s.size {
+    return i if s[i] == 0x26
+    i += 1
+  }
+  -1
+}
+
+# Appending in a callee doesn't grow the caller's slice (Go's append), so
+# these helpers return the extended slice.
+def put_rune(out: [Byte], r: Rune) -> [Byte] {
+  o = out
+  for b in utf8.encode_rune(r) {
+    o << b
+  }
+  o
+}
+
+def put_str(out: [Byte], s: Str, a: Int, b: Int) -> [Byte] {
+  o = out
+  i = a
+  while i < b {
+    o << s[i]
+    i += 1
+  }
+  o
+}
+
+def alnum?(c: Byte) -> Bool {
+  (0x61 <= c && c <= 0x7A) || (0x41 <= c && c <= 0x5A) || (0x30 <= c && c <= 0x39)
+}
+
+# Reads an entity like "&lt;" at s[src] (an '&'), appends what it stands for
+# to out and returns the offset after it and the extended out.
+def unescape_entity(s: Str, src: Int, out: [Byte]) -> (Int, [Byte]) {
+  o = out
+  n = s.size - src
+  i = 1
+  if n <= 1 {
+    o << s[src]
+    return (src + 1, o)
+  }
+  if s[src + 1] == 0x23 {
+    if n <= 3 {
+      o << s[src]
+      return (src + 1, o)
+    }
+    i += 1
+    c = s[src + i]
+    hex = false
+    if c == 0x78 || c == 0x58 {
+      hex = true
+      i += 1
+    }
+    x: Rune = 0
+    while i < n {
+      c = s[src + i]
+      i += 1
+      if hex {
+        if 0x30 <= c && c <= 0x39 {
+          x = (16 *% x) +% (c.as_i32 - 0x30)
+          next
+        } else if 0x61 <= c && c <= 0x66 {
+          x = (16 *% x) +% (c.as_i32 - 0x61 + 10)
+          next
+        } else if 0x41 <= c && c <= 0x46 {
+          x = (16 *% x) +% (c.as_i32 - 0x41 + 10)
+          next
+        }
+      } else if 0x30 <= c && c <= 0x39 {
+        x = (10 *% x) +% (c.as_i32 - 0x30)
+        next
+      }
+      i -= 1 if c != 0x3B
+      break
+    }
+    if i <= 3 {
+      o << s[src]
+      return (src + 1, o)
+    }
+    if 0x80 <= x && x <= 0x9F {
+      x = REPLACEMENT_TABLE[(x - 0x80).to_i]
+    } else if x == 0 || (0xD800 <= x && x <= 0xDFFF) || x > 0x10FFFF {
+      x = 0xFFFD
+    }
+    return (src + i, put_rune(o, x))
+  }
+  # Consume the longest run of name characters (and a following ';').
+  while i < n {
+    c = s[src + i]
+    i += 1
+    next if alnum?(c)
+    i -= 1 if c != 0x3B
+    break
+  }
+  name = s[src + 1...src + i]
+  if name.size > 0 {
+    e = lookup(name)
+    if e >= 0 {
+      return (src + i, put_entity(o, e))
+    }
+    max_len = name.size - 1
+    max_len = LONGEST_ENTITY_WITHOUT_SEMICOLON if max_len > LONGEST_ENTITY_WITHOUT_SEMICOLON
+    j = max_len
+    while j > 1 {
+      e = lookup(name[0...j])
+      if e >= 0 && entity_rune(e, 1) == 0 {
+        return (src + j + 1, put_entity(o, e))
+      }
+      j -= 1
+    }
+  }
+  (src + i, put_str(o, s, src, src + i))
+}
+
+# The index of entity `name` in ENTITIES, or -1.
+def lookup(name: Str) -> Int {
+  return -1 if name.size > ENTITY_NAME_WIDTH
+  lo = 0
+  hi = ENTITY_COUNT
+  while lo < hi {
+    m = (lo + hi) / 2
+    c = cmp_name(m, name)
+    return m if c == 0
+    if c < 0 {
+      lo = m + 1
+    } else {
+      hi = m
+    }
+  }
+  -1
+}
+
+# Compares entry e's (padded) name with name: <0, 0, >0.
+def cmp_name(e: Int, name: Str) -> Int {
+  base = e * ENTITY_WIDTH
+  i = 0
+  while i < ENTITY_NAME_WIDTH {
+    a = ENTITIES[base + i].to_i
+    b = i < name.size ? name[i].to_i : 0x20
+    return a - b if a != b
+    i += 1
+  }
+  0
+}
+
+# Code point k (0 or 1) of entry e; 0 when the entry has a single one.
+def entity_rune(e: Int, k: Int) -> Rune {
+  base = e * ENTITY_WIDTH + ENTITY_NAME_WIDTH + 6 * k
+  v = 0
+  i = 0
+  while i < 6 {
+    c = ENTITIES[base + i].to_i
+    d = c <= 0x39 ? c - 0x30 : c - 0x41 + 10
+    v = v * 16 + d
+    i += 1
+  }
+  v.to_i32
+}
+
+def put_entity(out: [Byte], e: Int) -> [Byte] {
+  o = put_rune(out, entity_rune(e, 0))
+  r2 = entity_rune(e, 1)
+  o = put_rune(o, r2) if r2 != 0
+  o
+}

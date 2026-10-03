@@ -1050,10 +1050,17 @@ fn sugar_shape_fits(te: &TypeExpr, t: &Ty) -> bool {
     }
 }
 
+/// Does the current package declare type `n` itself?
+fn in_current_pkg(n: &str, structs: &Structs) -> bool {
+    let p = current_pkg();
+    !p.is_empty() && structs.contains_key(&format!("{p}.{n}"))
+}
+
 pub fn type_from(t: &TypeExpr, structs: &Structs, consts: &Consts) -> R<Ty> {
     let type_from = |t| type_from(t, structs, consts);
     match t {
-        TypeExpr::Named(n, sp) if !matches!(n.as_str(), "Float" | "Bool" | "Str" | "Error" | "Unit" | "Ptr") && IntKind::from_name(n).is_none() && !structs.contains_key(n) => {
+        // A package's own type wins over a main-file type of the same name.
+        TypeExpr::Named(n, sp) if !matches!(n.as_str(), "Float" | "Bool" | "Str" | "Error" | "Unit" | "Ptr") && IntKind::from_name(n).is_none() && (!structs.contains_key(n) || in_current_pkg(n, structs)) => {
             let q = resolve_name(n, *sp, &|q| structs.contains_key(q) || generic(q).is_some())?;
             if generic(&q).is_some() && !structs.contains_key(&q) {
                 return Err(Diag::new(*sp, format!("`{n}` is generic: give its type arguments (`{n}[...]`)")));

@@ -68,7 +68,9 @@ fn zero(t: &LTy) -> String {
         LTy::F64 => "0.0".into(),
         LTy::Bool => "false".into(),
         LTy::Gen(_) | LTy::Task(_) | LTy::Chan(_) => "NULL".into(),
-        t => format!("({}){{0}}", cty(t)),
+        // `{}`, not `{0}`: the first member may be an empty aggregate (a
+        // struct with no fields, as a generic `T` can be).
+        t => format!("({}){{}}", cty(t)),
     }
 }
 

@@ -1,0 +1,481 @@
+import "bytes"
+import "strconv"
+import "strings"
+import "unicode/utf8"
+
+def raw(b: [Byte]) -> Str { Str.from_bytes(b) }
+
+# One of Go's readTests (the table is in reader_table_test.alx). In `input`,
+# § marks the start of a field, ¶ a record boundary and ∑ the position of an
+# error; make_positions removes them.
+struct ReadTest {
+  name: Str
+  input: Str
+  output: [[Str]]
+  errors: [Int] # per record: 0 none, 1 BareQuote, 2 Quote, 3 FieldCount, 4 InvalidDelim
+  comma: Rune
+  comment: Rune
+  use_fields_per_record: Bool # false means fields_per_record is -1
+  fields_per_record: Int
+  lazy_quotes: Bool
+  trim_leading_space: Bool
+  reuse_record: Bool
+}
+
+struct WriteTest {
+  input: [[Str]]
+  output: Str
+  error: Int
+  use_crlf: Bool
+  comma: Rune
+}
+
+# The expected field positions of each record, the error positions (record
+# number, line, column) and the text without the markers.
+def make_positions(text: Str) -> ([[(Int, Int)]], [(Int, Int, Int)], Str) {
+  buf: [Byte] = []
+  positions: [[(Int, Int)]] = []
+  err_positions: [(Int, Int, Int)] = []
+  line = 1
+  col = 1
+  rec_num = 0
+  i = 0
+  while i < text.size {
+    r, size = utf8.decode_rune_at(text, i)
+    if r == 0x0A {
+      line += 1
+      col = 1
+      buf << 0x0A
+    } else if r == 0xA7 {
+      # §
+      positions << [] if positions.size == 0
+      positions[positions.size - 1] << (line, col)
+    } else if r == 0xB6 {
+      # ¶
+      positions << []
+      rec_num += 1
+    } else if r == 0x2211 {
+      # ∑
+      err_positions << (rec_num, line, col)
+    } else {
+      k = 0
+      while k < size {
+        buf << text[i + k]
+        k += 1
+      }
+      col += size
+    }
+    i += size
+  }
+  (positions, err_positions, Str.from_bytes(buf))
+}
+
+def new_test_reader(tt: ReadTest, input: Str) -> Reader {
+  r = new_reader(bytes.new_buffer_string(input))
+  r.comma = tt.comma if tt.comma != 0
+  r.comment = tt.comment
+  r.fields_per_record = tt.use_fields_per_record ? tt.fields_per_record : -1
+  r.lazy_quotes = tt.lazy_quotes
+  r.trim_leading_space = tt.trim_leading_space
+  r.reuse_record = tt.reuse_record
+  r
+}
+
+# (kind, start_line, line, column) of a csv error; kind as in ReadTest.errors,
+# -1 for any other error.
+def err_info(e: Error) -> (Int, Int, Int, Int) {
+  case e {
+    BareQuote(s, l, c, _) => (1, s, l, c)
+    Quote(s, l, c, _) => (2, s, l, c)
+    FieldCount(s, l, c, _) => (3, s, l, c)
+    InvalidDelim => (4, 0, 0, 0)
+    _ => (-1, 0, 0, 0)
+  }
+}
+
+# The record carried by a csv parse error.
+def err_record(e: Error) -> [Str] {
+  case e {
+    BareQuote(_, _, _, rec) => rec
+    Quote(_, _, _, rec) => rec
+    FieldCount(_, _, _, rec) => rec
+    _ => []
+  }
+}
+
+# Go's errorWithPosition: the expected (kind, start_line, line, column) of
+# the error of record rec_num.
+def want_error(kind: Int, rec_num: Int, positions: [[(Int, Int)]], err_positions: [(Int, Int, Int)]) -> (Int, Int, Int, Int) {
+  return (4, 0, 0, 0) if kind == 4
+  panic("no positions found for error at record #{rec_num}") if rec_num >= positions.size
+  for ep in err_positions {
+    return (kind, positions[rec_num][0][0], ep[1], ep[2]) if ep[0] == rec_num
+  }
+  panic("no error position found for error at record #{rec_num}")
+}
+
+test "read" {
+  for tt in read_tests {
+    positions, err_positions, input = make_positions(tt.input)
+    r = new_test_reader(tt, input)
+    res = r.read_all!
+    first = -1
+    i = 0
+    while i < tt.errors.size {
+      if tt.errors[i] != 0 {
+        first = i
+        break
+      }
+      i += 1
+    }
+    if first >= 0 {
+      want = want_error(tt.errors[first], first, positions, err_positions)
+      assert res.err?, "#{tt.name}: ReadAll() should fail"
+      assert err_info(res.err.unwrap) == want, "#{tt.name}: ReadAll() error mismatch: got #{res.err.unwrap.message}"
+    } else {
+      assert !res.err?, "#{tt.name}: unexpected ReadAll() error"
+      assert res.unwrap == tt.output, "#{tt.name}: ReadAll() output"
+      # The input offset after ReadAll.
+      assert r.input_offset == input.size, "#{tt.name}: wrong input offset after ReadAll(): got #{r.input_offset}, want #{input.size}"
+    }
+
+    # Field and error positions.
+    r = new_test_reader(tt, input)
+    rec_num = 0
+    loop {
+      got = r.read!
+      want_kind = 0
+      want_kind = tt.errors[rec_num] if rec_num < tt.errors.size
+      rec: [Str] = []
+      if want_kind != 0 {
+        want = want_error(want_kind, rec_num, positions, err_positions)
+        assert got.err?, "#{tt.name}: Read() should fail at record #{rec_num}"
+        e = got.err.unwrap
+        assert err_info(e) == want, "#{tt.name}: Read() error at record #{rec_num}: got #{e.message}"
+        if want_kind != 3 {
+          assert rec_num >= tt.output.size, "#{tt.name}: need more records; got #{rec_num} want #{tt.output.size}"
+          break
+        }
+        rec = err_record(e)
+      } else {
+        assert !got.err?, "#{tt.name}: Read() unexpected error at record #{rec_num}"
+        if rec_num >= tt.output.size {
+          assert got.unwrap.none?, "#{tt.name}: Read() should be at EOF at record #{rec_num}"
+          break
+        }
+        rec = got.unwrap.unwrap
+      }
+      assert rec == tt.output[rec_num], "#{tt.name}: Read vs ReadAll mismatch at record #{rec_num}"
+      pos = positions[rec_num]
+      assert pos.size == rec.size, "#{tt.name}: mismatched position length at record #{rec_num}"
+      k = 0
+      while k < rec.size {
+        assert r.field_pos(k) == pos[k], "#{tt.name}: position mismatch at record #{rec_num}, field #{k}"
+        k += 1
+      }
+      rec_num += 1
+    }
+  }
+}
+
+test "read error messages" {
+  r = new_reader(bytes.new_buffer_string("a,\"b\nc\"d,e"))
+  assert_eq r.read!.err.unwrap.message, "record on line 1; parse error on line 2, column 2: extraneous or missing \" in quoted-field"
+  r = new_reader(bytes.new_buffer_string("a \"word\",\"b\""))
+  assert_eq r.read!.err.unwrap.message, "parse error on line 1, column 3: bare \" in non-quoted-field"
+  r = new_reader(bytes.new_buffer_string("a,b,c\nd,e"))
+  r.fields_per_record = 0
+  assert_eq r.read!.unwrap.unwrap, ["a", "b", "c"]
+  assert_eq r.fields_per_record, 3
+  assert_eq r.read!.err.unwrap.message, "record on line 2: wrong number of fields"
+  r = new_reader(bytes.new_buffer_string("a"))
+  r.comma = 0x22
+  assert_eq r.read!.err.unwrap.message, "csv: invalid field or comment delimiter"
+}
+
+test "field_pos" {
+  r = new_reader(bytes.new_buffer_string("a,b\n"))
+  r.read!.unwrap
+  assert_eq r.field_pos(1), (1, 3)
+}
+
+test "reuse_record shares the slice" {
+  r = new_reader(bytes.new_buffer_string("a,b\nc,d\n"))
+  r.reuse_record = true
+  first = r.read!.unwrap.unwrap
+  second = r.read!.unwrap.unwrap
+  assert_eq second, ["c", "d"]
+  assert_eq first, ["c", "d"]
+}
+
+test "a copy of a reader shares its stream and learned field count" {
+  r = new_reader(bytes.new_buffer_string("a,b\nc,d\ne\n"))
+  r.fields_per_record = 0
+  c = r
+  assert_eq c.read!.unwrap.unwrap, ["a", "b"]
+  assert_eq r.read!.unwrap.unwrap, ["c", "d"]
+  assert r.read!.err?, "the learned count applies to the original too"
+}
+
+test "write" {
+  n = 0
+  for tt in write_tests {
+    b = bytes.new_buffer_string("")
+    f = new_writer(b)
+    f.use_crlf = tt.use_crlf
+    f.comma = tt.comma if tt.comma != 0
+    res = f.write_all!(tt.input)
+    if tt.error == 4 {
+      assert res.err?, "##{n}: expected an error"
+      assert_eq err_info(res.err.unwrap)[0], 4
+    } else {
+      assert !res.err?, "##{n}: unexpected error"
+    }
+    assert b.string == tt.output, "##{n}: out=#{strconv.quote(b.string)} want #{strconv.quote(tt.output)}"
+    n += 1
+  }
+}
+
+struct ErrorWriter {
+  def write!(b: [Byte]) -> ~Int {
+    fail "Test"
+  }
+}
+
+test "error" {
+  b = bytes.new_buffer_string("")
+  f = new_writer(b)
+  f.write!(["abc"]).unwrap
+  f.flush!
+  assert f.err.none?, "unexpected error"
+
+  f = new_writer(ErrorWriter.new)
+  f.write!(["abc"]).unwrap
+  f.flush!
+  assert !f.err.none?, "error should not be none"
+}
+
+# Go's FuzzRoundtrip, over inputs from a fixed pseudo-random sequence: what
+# the reader accepts, the writer writes back to the same records.
+test "roundtrip" {
+  pieces = ["a", "b", ",", ";", "\t", "\"", "\"\"", "\n", "\r", "\r\n", " ", "#", "é", "\\."]
+  readers: [(Rune, Rune, Bool, Bool)] = [(0x2C, 0, false, false), (0x3B, 0, false, false), (0x09, 0, false, false), (0x2C, 0, true, false), (0x2C, 0, false, true), (0x2C, 0x23, false, false), (0x2C, 0x3B, false, false)]
+  seed = 12345
+  iter = 0
+  while iter < 300 {
+    sb: [Str] = []
+    seed = (seed * 1103515245 + 12345) % 2147483648
+    n = seed % 12
+    j = 0
+    while j < n {
+      seed = (seed * 1103515245 + 12345) % 2147483648
+      sb << pieces[(seed / 7) % pieces.size]
+      j += 1
+    }
+    input = strings.join(sb, "")
+    for tt in readers {
+      r = new_reader(bytes.new_buffer_string(input))
+      r.comma = tt[0]
+      r.comment = tt[1]
+      r.lazy_quotes = tt[2]
+      r.trim_leading_space = tt[3]
+      res = r.read_all!
+      next if res.err?
+      records = res.unwrap
+      buf = bytes.new_buffer_string("")
+      w = new_writer(buf)
+      w.comma = tt[0]
+      w.write_all!(records).unwrap
+      # The writer doesn't support comments: it can turn the quoted record
+      # "#" into a comment line.
+      next if tt[1] != 0
+      r2 = new_reader(bytes.new_buffer_string(buf.string))
+      r2.comma = tt[0]
+      r2.lazy_quotes = tt[2]
+      r2.trim_leading_space = tt[3]
+      result = r2.read_all!.unwrap
+      # The reader turns \r\n into \n, and skips the empty line the writer
+      # makes of a record holding one empty field.
+      want: [[Str]] = []
+      for rec in records {
+        next if rec.size == 1 && rec[0] == ""
+        fixed: [Str] = []
+        for s in rec {
+          fixed << strings.replace_all(s, "\r\n", "\n")
+        }
+        want << fixed
+      }
+      assert result == want, "roundtrip of #{strconv.quote(input)}"
+    }
+    iter += 1
+  }
+}
+
+# The Read/FieldPos/InputOffset trace the generated vectors compare with Go's.
+def trace(input: Str, comma: Rune, comment: Rune, fpr: Int, lazy: Bool, trim: Bool, reuse: Bool) -> Str {
+  out: [Str] = []
+  mk = ->(i: Str) -> Reader {
+    r = new_reader(bytes.new_buffer_string(i))
+    r.comma = comma
+    r.comment = comment
+    r.fields_per_record = fpr
+    r.lazy_quotes = lazy
+    r.trim_leading_space = trim
+    r.reuse_record = reuse
+    r
+  }
+  r = mk(input)
+  loop {
+    got = r.read!
+    rec: [Str] = []
+    stop = false
+    invalid = false
+    if got.err? {
+      e = got.err.unwrap
+      out << "err=#{e.message} "
+      rec = err_record(e)
+      kind = err_info(e)[0]
+      stop = kind != 3
+      invalid = kind == 4
+    } else if v = got.unwrap {
+      rec = v
+    } else {
+      out << "EOF"
+      break
+    }
+    qs: [Str] = []
+    for f in rec {
+      qs << strconv.quote(f)
+    }
+    out << "rec=[#{strings.join(qs, " ")}] pos="
+    if !invalid {
+      k = 0
+      while k < rec.size {
+        l, c = r.field_pos(k)
+        out << "#{l}:#{c},"
+        k += 1
+      }
+    }
+    out << " off=#{r.input_offset}; "
+    break if stop
+  }
+  r = mk(input)
+  all = r.read_all!
+  if all.err? {
+    out << "all err=#{all.err.unwrap.message}"
+  } else {
+    rs: [Str] = []
+    for rec in all.unwrap {
+      qs: [Str] = []
+      for f in rec {
+        qs << strconv.quote(f)
+      }
+      rs << "[#{strings.join(qs, " ")}]"
+    }
+    out << "all=[#{strings.join(rs, " ")}]"
+  }
+  strings.join(out, "")
+}
+
+def write_out(records: [[Str]], comma: Rune, crlf: Bool) -> Str {
+  b = bytes.new_buffer_string("")
+  w = new_writer(b)
+  w.comma = comma
+  w.use_crlf = crlf
+  res = w.write_all!(records)
+  return "err=#{res.err.unwrap.message}" if res.err?
+  b.string
+}
+
+def example_in -> Str {
+  "first_name,last_name,username\n\"Rob\",\"Pike\",rob\nKen,Thompson,ken\n\"Robert\",\"Griesemer\",\"gri\"\n"
+}
+
+def show(rec: [Str]) -> Str { "[#{strings.join(rec, " ")}]" }
+
+example "reader" {
+  r = new_reader(bytes.new_buffer_string(example_in))
+  loop {
+    rec = r.read!.unwrap
+    if v = rec {
+      puts show(v)
+    } else {
+      break
+    }
+  }
+} outputs "[first_name last_name username]\n[Rob Pike rob]\n[Ken Thompson ken]\n[Robert Griesemer gri]\n"
+
+example "reader options" {
+  input = "first_name;last_name;username\n\"Rob\";\"Pike\";rob\n# lines beginning with a # character are ignored\nKen;Thompson;ken\n\"Robert\";\"Griesemer\";\"gri\"\n"
+  r = new_reader(bytes.new_buffer_string(input))
+  r.comma = 0x3B
+  r.comment = 0x23
+  records = r.read_all!.unwrap
+  shown: [Str] = []
+  for rec in records {
+    shown << show(rec)
+  }
+  puts "[#{strings.join(shown, " ")}]"
+} outputs "[[first_name last_name username] [Rob Pike rob] [Ken Thompson ken] [Robert Griesemer gri]]\n"
+
+example "reader read_all" {
+  r = new_reader(bytes.new_buffer_string(example_in))
+  records = r.read_all!.unwrap
+  shown: [Str] = []
+  for rec in records {
+    shown << show(rec)
+  }
+  puts "[#{strings.join(shown, " ")}]"
+} outputs "[[first_name last_name username] [Rob Pike rob] [Ken Thompson ken] [Robert Griesemer gri]]\n"
+
+def example_records -> [[Str]] {
+  [["first_name", "last_name", "username"], ["Rob", "Pike", "rob"], ["Ken", "Thompson", "ken"], ["Robert", "Griesemer", "gri"]]
+}
+
+example "writer" {
+  b = bytes.new_buffer_string("")
+  w = new_writer(b)
+  for rec in example_records {
+    w.write!(rec).unwrap
+  }
+  w.flush!
+  assert w.err.none?, "flush failed"
+  print b.string
+} outputs "first_name,last_name,username\nRob,Pike,rob\nKen,Thompson,ken\nRobert,Griesemer,gri\n"
+
+example "writer write_all" {
+  b = bytes.new_buffer_string("")
+  w = new_writer(b)
+  w.write_all!(example_records).unwrap
+  print b.string
+} outputs "first_name,last_name,username\nRob,Pike,rob\nKen,Thompson,ken\nRobert,Griesemer,gri\n"
+
+def bench_data -> Str {
+  "x,y,z,w\nx,y,z,\nx,y,,\nx,,,\n,,,\n\"x\",\"y\",\"z\",\"w\"\n\"x\",\"y\",\"z\",\"\"\n\"x\",\"y\",\"\",\"\"\n\"x\",\"\",\"\",\"\"\n\"\",\"\",\"\",\"\"\n"
+}
+
+def bench_read(fpr: Int, reuse: Bool, data: Str) {
+  r = new_reader(bytes.new_buffer_string(strings.repeat(data, 10)))
+  r.fields_per_record = fpr
+  r.reuse_record = reuse
+  r.read_all!.unwrap
+}
+
+def large_fields -> Str {
+  strings.repeat("xxxxxxxxxxxxxxxx,yyyyyyyyyyyyyyyy,zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz,#{strings.repeat("w", 64)},#{strings.repeat("v", 128)}\n#{strings.repeat("x", 24)},#{strings.repeat("y", 32)},#{strings.repeat("z", 32)},#{strings.repeat("w", 64)},vvvv\n,,zzzz,#{strings.repeat("w", 64)},#{strings.repeat("v", 256)}\n#{strings.repeat("x", 32)},#{strings.repeat("y", 32)},#{strings.repeat("z", 32)},#{strings.repeat("w", 64)},#{strings.repeat("v", 64)}\n", 3)
+}
+
+bench "read" { bench_read(0, false, bench_data) }
+bench "read with fields per record" { bench_read(4, false, bench_data) }
+bench "read without fields per record" { bench_read(-1, false, bench_data) }
+bench "read large fields" { bench_read(0, false, large_fields) }
+bench "read reuse record" { bench_read(0, true, bench_data) }
+bench "read reuse record with fields per record" { bench_read(4, true, bench_data) }
+bench "read reuse record without fields per record" { bench_read(-1, true, bench_data) }
+bench "read reuse record large fields" { bench_read(0, true, large_fields) }
+
+bench "write" {
+  data = [["abc", "def", "12356", "1234567890987654311234432141542132"], ["abc", "def", "12356", "1234567890987654311234432141542132"], ["abc", "def", "12356", "1234567890987654311234432141542132"]]
+  w = new_writer(bytes.new_buffer_string(""))
+  w.write_all!(data).unwrap
+}

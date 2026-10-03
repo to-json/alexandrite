@@ -4096,14 +4096,16 @@ impl<'w, 'a> FnCx<'w, 'a> {
             return self.const_call_named(c, Some(t), *csp, name, name_span, args, block, sp);
         }
         // `Mutex.new(v)`, `Atomic.new(v)` (and `Mutex[T].new(v)` above).
+        // (A constant of the current package is keyed by its qualified name.)
+        let is_const = |cx: &Self, c: &str, csp: Span| resolve_name(c, csp, &|q| cx.w.consts.contains_key(q)).is_ok_and(|q| cx.w.consts.contains_key(&q));
         if let Some(Expr { kind: ExprKind::Const(c), span: csp, .. }) = recv {
-            if (c == "Mutex" || c == "Atomic") && name == "new" && !self.w.consts.contains_key(c) {
+            if (c == "Mutex" || c == "Atomic") && name == "new" && !is_const(self, c, *csp) {
                 return self.sync_new(c, None, *csp, args, sp);
             }
         }
         // Constant receivers: Int.sqrt, Array.new, File.read, Enumerator.new.
         if let Some(Expr { kind: ExprKind::Const(c), span: csp, .. }) = recv {
-            if !self.w.consts.contains_key(c) {
+            if !is_const(self, c, *csp) {
                 return self.const_call(c, *csp, name, name_span, args, block, sp);
             }
         }

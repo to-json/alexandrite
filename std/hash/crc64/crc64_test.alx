@@ -1,0 +1,215 @@
+import "hash"
+import "io"
+import "fmt"
+
+# Go's crc64_test.go, translated. The golden table is in golden_test.alx.
+
+test "crc64 hash" {
+  check_hash(->() -> hash.Hash { new(make_table(ISO)) })
+}
+
+# The Clone subtest of Go's testhash.TestHash.
+test "clone" {
+  h = new(make_table(ISO))
+  h3 = h.clone
+  prefix = b("tmp")
+  h.write!(prefix)
+  h2 = h.clone
+  prefix_sum = h.sum([])
+  assert_eq prefix_sum, h2.sum([])
+  suffix = b("tmp2")
+  h.write!(suffix)
+  h3.write!(prefix + suffix)
+  composite = h3.sum([])
+  assert_eq h.sum([]), composite
+  assert_eq h2.sum([]), prefix_sum
+  h2.write!(suffix)
+  assert_eq h.sum([]), composite
+  assert_eq h2.sum([]), composite
+}
+
+test "golden" {
+  tab_iso = make_table(ISO)
+  tab_ecma = make_table(ECMA)
+  for g in golden() {
+    c = new(tab_iso)
+    io.write_all(c, g.input).unwrap
+    assert_eq c.sum64, g.iso
+    c = new(tab_ecma)
+    io.write_all(c, g.input).unwrap
+    assert_eq c.sum64, g.ecma
+  }
+}
+
+def golden_marshal(tab: Table, ecma: Bool) {
+  for g in golden() {
+    h = new(tab)
+    h2 = new(tab)
+    half = g.input.size / 2
+    io.write_all(h, g.input[0...half]).unwrap
+    state = h.marshal_binary
+    prefix: [Byte] = [0, 0, 0, 0]
+    state_append = h.append_binary(prefix)
+    state_append = state_append[4...state_append.size]
+    want = ecma ? g.half_ecma : g.half_iso
+    assert_eq state, want
+    assert_eq state_append, want
+    h2.unmarshal_binary!(state).unwrap
+    io.write_all(h, g.input[half...g.input.size]).unwrap
+    io.write_all(h2, g.input[half...g.input.size]).unwrap
+    assert_eq h.sum64, h2.sum64
+  }
+}
+
+test "golden marshal" {
+  golden_marshal(make_table(ISO), false)
+  golden_marshal(make_table(ECMA), true)
+}
+
+test "marshal table mismatch" {
+  h1 = new(make_table(ISO))
+  h2 = new(make_table(ECMA))
+  state1 = h1.marshal_binary
+  r = h2.unmarshal_binary!(state1)
+  assert r.err.present?, "no error when one was expected"
+  assert_eq "#{r.err.unwrap}", "hash/crc64: tables do not match"
+}
+
+test "unmarshal errors" {
+  h = new(make_table(ISO))
+  r = h.unmarshal_binary!(b("crc\x01"))
+  assert_eq "#{r.err.unwrap}", "hash/crc64: invalid hash state identifier"
+  r2 = h.unmarshal_binary!(b("crc\x02abc"))
+  assert_eq "#{r2.err.unwrap}", "hash/crc64: invalid hash state size"
+}
+
+# The constant ISO / ECMA tables match the ones Go's code builds, and their
+# update paths match the table-driven one.
+test "constant tables" {
+  iso = slicing_make_table(make_simple_table(ISO))
+  ecma = slicing_make_table(make_simple_table(ECMA))
+  i = 0
+  while i < 2048 {
+    assert_eq ISO8[i], iso[i]
+    assert_eq ECMA8[i], ecma[i]
+    i += 1
+  }
+  lengths = [0, 1, 7, 8, 9, 63, 64, 65, 100, 1000, 2047, 2048, 4096, 5000]
+  for n in lengths {
+    p = gen(n.as_u64 + 300, n)
+    init = le64(gen(n.as_u64 + 400, 8), 0)
+    assert_eq update_iso(init, p), update_sliced(init, iso, p)
+    assert_eq update_ecma(init, p), update_sliced(init, ecma, p)
+  }
+}
+
+test "tables" {
+  assert_eq make_table(ISO).entries, make_simple_table(ISO)
+  assert_eq make_table(ECMA).entries, make_simple_table(ECMA)
+  assert_eq make_table(0x777).entries, make_simple_table(0x777)
+  assert_eq make_table(ECMA).poly, ECMA
+  assert_eq new(make_table(ISO)).size, SIZE
+  assert_eq new(make_table(ISO)).block_size, 1
+}
+
+example "checksum" {
+  puts fmt.sprintf("%016x", checksum(b("Hello world"), make_table(ECMA)))
+} outputs "f4a5f2b9d47756bf\n"
+
+# 1 MB of data, written in 64 kB pieces.
+def bench_data -> [Byte] {
+  [0x5a.as_u8; 1 << 20]
+}
+
+def bench_write(h0: hash.Hash, data: [Byte], piece: Int) {
+  h = h0
+  off = 0
+  while off < data.size {
+    hi = off + piece
+    hi = data.size if hi > data.size
+    h.write!(data[off...hi])
+    off = hi
+  }
+  h.sum([])
+}
+
+bench "crc64 ISO 1MB" {
+  bench_write(new(make_table(ISO)), bench_data(), 65536)
+}
+
+bench "crc64 ECMA 1MB" {
+  bench_write(new(make_table(ECMA)), bench_data(), 65536)
+}
+
+bench "crc64 random poly 1MB" {
+  bench_write(new(make_table(0x777)), bench_data(), 65536)
+}
+
+# Go's internal/testhash.TestHashWithoutClone, for a constructor of hashes.
+# (Clone is tested per type: hash.Hash has no clone.) Go's random bytes are
+# seeded generator bytes here.
+def check_hash(mk: () -> hash.Hash) {
+  # SumAppend: sum appends a digest of size bytes and leaves the prefix alone.
+  h = mk()
+  long_buff = gen(1, h.block_size + 1)
+  prefixes: [[Byte]] = [[], b("a"), long_buff]
+  for prefix in prefixes {
+    h.reset!
+    s = get_sum(h, prefix)
+    assert_eq s[0...prefix.size], prefix
+    assert_eq s[prefix.size...s.size], get_sum(h, [])
+    assert_eq s.size - prefix.size, h.size
+  }
+
+  # WriteWithoutError: write! reports every byte and leaves p alone.
+  h = mk()
+  slices: [[Byte]] = [[], b("a"), gen(2, h.block_size + 1)]
+  for p in slices {
+    write_to_hash(h, p)
+  }
+
+  # ResetState: a reset hash sums like a new one.
+  h = mk()
+  empty_sum = get_sum(h, [])
+  write_to_hash(h, gen(3, h.block_size))
+  h.reset!
+  assert_eq get_sum(h, []), empty_sum
+
+  # OutOfBoundsRead: write! reads only its slice.
+  h = mk()
+  bs = h.block_size
+  msg = gen(4, bs)
+  write_to_hash(h, msg)
+  expected = get_sum(h, [])
+  h.reset!
+  buff = gen(5, bs * 3)
+  copy(buff[bs...bs * 2], msg)
+  write_to_hash(h, buff[bs...bs * 2])
+  assert_eq get_sum(h, []), expected
+
+  # StatefulWrite: two writes equal one.
+  h = mk()
+  prefix = gen(6, h.block_size)
+  suffix = gen(7, h.block_size)
+  write_to_hash(h, prefix)
+  write_to_hash(h, suffix)
+  serial = get_sum(h, [])
+  h.reset!
+  write_to_hash(h, prefix + suffix)
+  assert_eq get_sum(h, []), serial
+}
+
+def write_to_hash(h0: hash.Hash, p: [Byte]) {
+  h = h0
+  before = p + []
+  n = h.write!(p).unwrap
+  assert_eq n, p.size
+  assert_eq p, before
+}
+
+def get_sum(h: hash.Hash, buff: [Byte]) -> [Byte] {
+  test_buff = buff + []
+  s = h.sum(buff)
+  assert_eq s, h.sum(test_buff)
+  s
+}

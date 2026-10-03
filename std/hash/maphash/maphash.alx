@@ -1,0 +1,390 @@
+#![overflow(wrap)]
+# Package maphash: Go's hash/maphash, seeded hashing of byte sequences for
+# hash tables and similar structures. Not cryptographically secure.
+#
+#   Go                                  alx
+#   maphash.Seed                        Seed
+#   maphash.MakeSeed() Seed             make_seed() -> Seed
+#   maphash.Bytes(seed, b) uint64       bytes(seed, b) -> U64
+#   maphash.String(seed, s) uint64      string(seed, s) -> U64
+#   maphash.Hash (zero value usable)    Hash: new() -> Hash, or Hash.new (see below)
+#   h.Write(b) / WriteString(s)         h.write!(b) -> Int / h.write_string!(s) -> Int
+#   h.WriteByte(b) error                h.write_byte!(b) (never fails)
+#   h.Seed() / SetSeed(seed)            h.seed / h.set_seed!(seed)
+#   h.Sum64() / Sum(b) / Reset()        h.sum64 / h.sum(b) / h.reset!
+#   h.Size() / BlockSize()              h.size / h.block_size
+#   h.Clone() (hash.Cloner, error)      h.clone -> Hash
+#
+# A Hash satisfies hash.Hash and hash.Hash64 structurally.
+#
+# The hash function is the one Go's runtime uses where it has no AES
+# instructions (internal/runtime/maps.memHashFallback, a wyhash variant), fed
+# 128-byte blocks the way maphash feeds the runtime. Go's values are random per
+# process, so only the properties carry over: for one seed, bytes, string and
+# any sequence of writes of the same bytes agree; different seeds give
+# unrelated hashes.
+#
+# Differences from Go:
+#   - The runtime's per-process random hash keys are fixed constants here;
+#     all the randomness comes from the Seed (make_seed reads getentropy(3)).
+#   - Go's zero Hash seeds itself on first use, in any method. alx structs are
+#     values whose zero value has no shared state (GO-VS-RUBY D36), and only a
+#     `!` method can create it: `Hash.new` seeds itself in its first `!` call
+#     (write!, write_string!, write_byte!, set_seed!, reset!), and `seed`,
+#     `sum64`, `sum` and `clone` panic on a Hash no `!` method has touched.
+#     `new()` returns a seeded Hash, usable everywhere.
+#   - A Hash keeps its state in shared storage, so copies are the same hash, as
+#     Go's pointer is; `clone` makes an independent one.
+#   - Not ported: Comparable, WriteComparable, Hasher and ComparableHasher. They
+#     hash any comparable value by its runtime type's hasher; alx has no
+#     runtime type information to hash an arbitrary T by (it would be a
+#     derive, like #[derive(Json)]).
+
+# A random value selecting a family of hash functions. The zero Seed is
+# invalid: bytes, string and set_seed! panic on it.
+pub struct Seed {
+  s: U64
+}
+
+extern def c_getentropy(buf: [Byte], n: Int) -> I32 = "getentropy"
+
+# A new random Seed.
+pub def make_seed -> Seed {
+  buf = [0.as_u8; 8]
+  while true {
+    rc = c_getentropy(buf, 8)
+    panic("maphash: getentropy failed") if rc != 0
+    s = r8(buf, 0)
+    return Seed.new(s: s) if s != 0
+  }
+  Seed.new(s: 1)
+}
+
+# The hash of b with the given seed: equal to writing b to a Hash with that
+# seed and calling sum64.
+pub def bytes(seed: Seed, b: [Byte]) -> U64 {
+  state = seed.s
+  panic("maphash: use of uninitialized Seed") if state == 0
+  off = 0
+  n = b.size
+  while n - off > BUF_SIZE {
+    state = mem_hash(b, off, BUF_SIZE, state)
+    off += BUF_SIZE
+  }
+  mem_hash(b, off, n - off, state)
+}
+
+# The hash of s with the given seed: equal to writing s to a Hash with that
+# seed and calling sum64.
+pub def string(seed: Seed, s: Str) -> U64 {
+  state = seed.s
+  panic("maphash: use of uninitialized Seed") if state == 0
+  off = 0
+  n = s.size
+  while n - off > BUF_SIZE {
+    state = mem_hash_str(s, off, BUF_SIZE, state)
+    off += BUF_SIZE
+  }
+  mem_hash_str(s, off, n - off, state)
+}
+
+# A new Hash with a random seed.
+pub def new -> Hash {
+  seed = make_seed()
+  Hash.new(st: [HashState.new(seed: seed.s, state: seed.s, buf: [0.as_u8; BUF_SIZE], n: 0)])
+}
+
+BUF_SIZE = 128
+
+# The runtime's hash keys (Go draws them at random per process).
+KEY0: U64 = 0xa0761d6478bd642f
+KEY1: U64 = 0xe7037ed1a0b428db
+KEY2: U64 = 0x8ebc6af09c88c6e3
+KEY3: U64 = 0x589965cc75374cc3
+M5: U64 = 0x1d8e4e27c47d124f
+
+# hi ^ lo of the 128-bit product of a and b.
+def mix(a: U64, b: U64) -> U64 {
+  mask: U64 = 0xffffffff
+  a0 = a & mask
+  a1 = a >> 32
+  b0 = b & mask
+  b1 = b >> 32
+  w0 = a0 * b0
+  t = a1 * b0 + (w0 >> 32)
+  w1 = (t & mask) + a0 * b1
+  hi = a1 * b1 + (t >> 32) + (w1 >> 32)
+  hi ^ (a * b)
+}
+
+def r4(p: [Byte], i: Int) -> U64 {
+  p[i].as_u64 | (p[i + 1].as_u64 << 8) | (p[i + 2].as_u64 << 16) | (p[i + 3].as_u64 << 24)
+}
+
+def r8(p: [Byte], i: Int) -> U64 {
+  r4(p, i) | (r4(p, i + 4) << 32)
+}
+
+def r4s(p: Str, i: Int) -> U64 {
+  p[i].as_u64 | (p[i + 1].as_u64 << 8) | (p[i + 2].as_u64 << 16) | (p[i + 3].as_u64 << 24)
+}
+
+def r8s(p: Str, i: Int) -> U64 {
+  r4s(p, i) | (r4s(p, i + 4) << 32)
+}
+
+# Go's memHashFallback of p[off...off + s] with `seed` (Go's rthash: an empty
+# input hashes to the seed itself).
+def mem_hash(p: [Byte], off: Int, s: Int, seed0: U64) -> U64 {
+  return seed0 if s == 0
+  seed = seed0 ^ KEY0
+  a: U64 = 0
+  b: U64 = 0
+  if s < 4 {
+    a = p[off].as_u64 | (p[off + (s >> 1)].as_u64 << 8) | (p[off + s - 1].as_u64 << 16)
+  } else if s == 4 {
+    a = r4(p, off)
+    b = a
+  } else if s < 8 {
+    a = r4(p, off)
+    b = r4(p, off + s - 4)
+  } else if s == 8 {
+    a = r8(p, off)
+    b = a
+  } else if s <= 16 {
+    a = r8(p, off)
+    b = r8(p, off + s - 8)
+  } else {
+    i = off
+    l = s
+    if l > 48 {
+      seed1 = seed
+      seed2 = seed
+      while l > 48 {
+        seed = mix(r8(p, i) ^ KEY1, r8(p, i + 8) ^ seed)
+        seed1 = mix(r8(p, i + 16) ^ KEY2, r8(p, i + 24) ^ seed1)
+        seed2 = mix(r8(p, i + 32) ^ KEY3, r8(p, i + 40) ^ seed2)
+        i += 48
+        l -= 48
+      }
+      seed = seed ^ seed1 ^ seed2
+    }
+    while l > 16 {
+      seed = mix(r8(p, i) ^ KEY1, r8(p, i + 8) ^ seed)
+      i += 16
+      l -= 16
+    }
+    a = r8(p, i + l - 16)
+    b = r8(p, i + l - 8)
+  }
+  mix(M5 ^ s.as_u64, mix(a ^ KEY1, b ^ seed))
+}
+
+# mem_hash over a Str.
+def mem_hash_str(p: Str, off: Int, s: Int, seed0: U64) -> U64 {
+  return seed0 if s == 0
+  seed = seed0 ^ KEY0
+  a: U64 = 0
+  b: U64 = 0
+  if s < 4 {
+    a = p[off].as_u64 | (p[off + (s >> 1)].as_u64 << 8) | (p[off + s - 1].as_u64 << 16)
+  } else if s == 4 {
+    a = r4s(p, off)
+    b = a
+  } else if s < 8 {
+    a = r4s(p, off)
+    b = r4s(p, off + s - 4)
+  } else if s == 8 {
+    a = r8s(p, off)
+    b = a
+  } else if s <= 16 {
+    a = r8s(p, off)
+    b = r8s(p, off + s - 8)
+  } else {
+    i = off
+    l = s
+    if l > 48 {
+      seed1 = seed
+      seed2 = seed
+      while l > 48 {
+        seed = mix(r8s(p, i) ^ KEY1, r8s(p, i + 8) ^ seed)
+        seed1 = mix(r8s(p, i + 16) ^ KEY2, r8s(p, i + 24) ^ seed1)
+        seed2 = mix(r8s(p, i + 32) ^ KEY3, r8s(p, i + 40) ^ seed2)
+        i += 48
+        l -= 48
+      }
+      seed = seed ^ seed1 ^ seed2
+    }
+    while l > 16 {
+      seed = mix(r8s(p, i) ^ KEY1, r8s(p, i + 8) ^ seed)
+      i += 16
+      l -= 16
+    }
+    a = r8s(p, i + l - 16)
+    b = r8s(p, i + l - 8)
+  }
+  mix(M5 ^ s.as_u64, mix(a ^ KEY1, b ^ seed))
+}
+
+struct HashState {
+  seed: U64   # the initial seed
+  state: U64  # the hash of all flushed bytes
+  buf: [Byte] # BUF_SIZE bytes, of which the first n are unflushed
+  n: Int
+}
+
+# A running seeded hash of a byte sequence. Hashes made with the same seed
+# and written the same bytes, in any pieces, have equal sums.
+pub struct Hash {
+  st: [HashState]
+
+  # Creates the state of a zero Hash with a random seed.
+  def init! {
+    if st.size == 0 {
+      seed = make_seed()
+      self.st = [HashState.new(seed: seed.s, state: seed.s, buf: [0.as_u8; BUF_SIZE], n: 0)]
+    }
+    nil
+  }
+
+  def check {
+    panic("maphash: Hash used before its first ! method; use maphash.new()") if st.size == 0
+    nil
+  }
+
+  # Hashes the full buffer.
+  def flush! {
+    self.st[0].state = mem_hash(st[0].buf, 0, BUF_SIZE, st[0].state)
+    self.st[0].n = 0
+    nil
+  }
+
+  # Adds b to the hashed sequence.
+  pub def write_byte!(b: Byte) {
+    init!
+    flush! if st[0].n == BUF_SIZE
+    self.st[0].buf[st[0].n] = b
+    self.st[0].n = st[0].n + 1
+    nil
+  }
+
+  # Adds b to the hashed sequence; returns b.size.
+  pub def write!(b: [Byte]) -> Int {
+    init!
+    size = b.size
+    off = 0
+    n = st[0].n
+    if n > 0 {
+      k = copy(st[0].buf[n...BUF_SIZE], b)
+      self.st[0].n = n + k
+      return size if n + k < BUF_SIZE
+      off = k
+      flush!
+    }
+    if size - off > BUF_SIZE {
+      state = st[0].state
+      while size - off > BUF_SIZE {
+        state = mem_hash(b, off, BUF_SIZE, state)
+        off += BUF_SIZE
+      }
+      self.st[0].state = state
+    }
+    copy(st[0].buf, b[off...size])
+    self.st[0].n = size - off
+    size
+  }
+
+  # Adds the bytes of s to the hashed sequence; returns s.size.
+  pub def write_string!(s: Str) -> Int {
+    init!
+    size = s.size
+    off = 0
+    n = st[0].n
+    if n > 0 {
+      k = BUF_SIZE - n
+      k = size if k > size
+      i = 0
+      while i < k {
+        self.st[0].buf[n + i] = s[i]
+        i += 1
+      }
+      self.st[0].n = n + k
+      return size if n + k < BUF_SIZE
+      off = k
+      flush!
+    }
+    if size - off > BUF_SIZE {
+      state = st[0].state
+      while size - off > BUF_SIZE {
+        state = mem_hash_str(s, off, BUF_SIZE, state)
+        off += BUF_SIZE
+      }
+      self.st[0].state = state
+    }
+    i = 0
+    while off + i < size {
+      self.st[0].buf[i] = s[off + i]
+      i += 1
+    }
+    self.st[0].n = size - off
+    size
+  }
+
+  # The seed: two hashes with the same seed and bytes have the same sum.
+  pub def seed -> Seed {
+    check
+    Seed.new(s: st[0].seed)
+  }
+
+  # Sets the seed and discards everything written.
+  pub def set_seed!(seed: Seed) {
+    panic("maphash: use of uninitialized Seed") if seed.s == 0
+    if st.size == 0 {
+      self.st = [HashState.new(seed: seed.s, state: seed.s, buf: [0.as_u8; BUF_SIZE], n: 0)]
+    } else {
+      self.st[0].seed = seed.s
+      self.st[0].state = seed.s
+      self.st[0].n = 0
+    }
+    nil
+  }
+
+  # Discards everything written; the seed stays.
+  pub def reset! {
+    init!
+    self.st[0].state = st[0].seed
+    self.st[0].n = 0
+    nil
+  }
+
+  # The hash of the bytes written. The state is unchanged.
+  pub def sum64 -> U64 {
+    check
+    mem_hash(st[0].buf, 0, st[0].n, st[0].state)
+  }
+
+  # b with sum64 appended, little-endian.
+  pub def sum(b: [Byte]) -> [Byte] {
+    x = sum64
+    out = b
+    s = 0
+    while s < 64 {
+      out << (x >> s).as_u8
+      s += 8
+    }
+    out
+  }
+
+  # The size of sum64 in bytes: 8.
+  pub def size -> Int { 8 }
+
+  # The buffer size: writes of whole blocks are hashed without copying.
+  pub def block_size -> Int { BUF_SIZE }
+
+  # An independent copy of the hash in its current state.
+  pub def clone -> Hash {
+    check
+    s = st[0]
+    Hash.new(st: [HashState.new(seed: s.seed, state: s.state, buf: s.buf + [], n: s.n)])
+  }
+}

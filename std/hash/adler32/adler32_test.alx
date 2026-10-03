@@ -1,0 +1,169 @@
+import "hash"
+import "io"
+import "fmt"
+
+# Go's adler32_test.go, translated. The golden table is in golden_test.alx.
+
+test "hash interface" {
+  check_hash(->() -> hash.Hash { new() })
+}
+
+# The Clone subtest of Go's testhash.TestHash.
+test "clone" {
+  h = new()
+  h3 = h.clone
+  prefix = b("tmp")
+  h.write!(prefix)
+  h2 = h.clone
+  prefix_sum = h.sum([])
+  assert_eq prefix_sum, h2.sum([])
+  suffix = b("tmp2")
+  h.write!(suffix)
+  h3.write!(prefix + suffix)
+  composite = h3.sum([])
+  assert_eq h.sum([]), composite
+  assert_eq h2.sum([]), prefix_sum
+  h2.write!(suffix)
+  assert_eq h.sum([]), composite
+  assert_eq h2.sum([]), composite
+}
+
+# Go's reference implementation: a modulo per byte.
+def simple_checksum(p: [Byte]) -> U32 {
+  s1: U32 = 1
+  s2: U32 = 0
+  for x in p {
+    s1 = (s1 + x.as_u32) % MOD
+    s2 = (s2 + s1) % MOD
+  }
+  (s2 << 16) | s1
+}
+
+test "golden" {
+  for g in golden() {
+    assert_eq simple_checksum(g.input), g.out
+    assert_eq checksum(g.input), g.out
+  }
+}
+
+test "golden marshal" {
+  for g in golden() {
+    h = new()
+    h2 = new()
+    half = g.input.size / 2
+    io.write_all(h, g.input[0...half]).unwrap
+    state = h.marshal_binary
+    prefix: [Byte] = [0, 0, 0, 0]
+    state_append = h.append_binary(prefix)
+    state_append = state_append[4...state_append.size]
+    assert_eq state, g.half_state
+    assert_eq state_append, g.half_state
+    h2.unmarshal_binary!(state).unwrap
+    io.write_all(h, g.input[half...g.input.size]).unwrap
+    io.write_all(h2, g.input[half...g.input.size]).unwrap
+    assert_eq h.sum32, h2.sum32
+  }
+}
+
+test "unmarshal errors" {
+  h = new()
+  r = h.unmarshal_binary!(b("adl\x02\x00\x00\x00\x01"))
+  assert_eq "#{r.err.unwrap}", "hash/adler32: invalid hash state identifier"
+  r2 = h.unmarshal_binary!(b("adl\x01\x00"))
+  assert_eq "#{r2.err.unwrap}", "hash/adler32: invalid hash state size"
+}
+
+test "sizes" {
+  assert_eq new().size, SIZE
+  assert_eq new().block_size, 4
+}
+
+example "checksum" {
+  puts fmt.sprintf("%08x", checksum(b("Hello world")))
+} outputs "18ab043d\n"
+
+# Go's BenchmarkAdler32KB, 1024 times over.
+bench "adler32 1MB in 1kB writes" {
+  data: [Byte] = []
+  i = 0
+  while i < 1024 {
+    data << i.as_u8
+    i += 1
+  }
+  h = new()
+  k = 0
+  while k < 1024 {
+    h.write!(data)
+    k += 1
+  }
+  h.sum([])
+}
+
+# Go's internal/testhash.TestHashWithoutClone, for a constructor of hashes.
+# (Clone is tested per type: hash.Hash has no clone.) Go's random bytes are
+# seeded generator bytes here.
+def check_hash(mk: () -> hash.Hash) {
+  # SumAppend: sum appends a digest of size bytes and leaves the prefix alone.
+  h = mk()
+  long_buff = gen(1, h.block_size + 1)
+  prefixes: [[Byte]] = [[], b("a"), long_buff]
+  for prefix in prefixes {
+    h.reset!
+    s = get_sum(h, prefix)
+    assert_eq s[0...prefix.size], prefix
+    assert_eq s[prefix.size...s.size], get_sum(h, [])
+    assert_eq s.size - prefix.size, h.size
+  }
+
+  # WriteWithoutError: write! reports every byte and leaves p alone.
+  h = mk()
+  slices: [[Byte]] = [[], b("a"), gen(2, h.block_size + 1)]
+  for p in slices {
+    write_to_hash(h, p)
+  }
+
+  # ResetState: a reset hash sums like a new one.
+  h = mk()
+  empty_sum = get_sum(h, [])
+  write_to_hash(h, gen(3, h.block_size))
+  h.reset!
+  assert_eq get_sum(h, []), empty_sum
+
+  # OutOfBoundsRead: write! reads only its slice.
+  h = mk()
+  bs = h.block_size
+  msg = gen(4, bs)
+  write_to_hash(h, msg)
+  expected = get_sum(h, [])
+  h.reset!
+  buff = gen(5, bs * 3)
+  copy(buff[bs...bs * 2], msg)
+  write_to_hash(h, buff[bs...bs * 2])
+  assert_eq get_sum(h, []), expected
+
+  # StatefulWrite: two writes equal one.
+  h = mk()
+  prefix = gen(6, h.block_size)
+  suffix = gen(7, h.block_size)
+  write_to_hash(h, prefix)
+  write_to_hash(h, suffix)
+  serial = get_sum(h, [])
+  h.reset!
+  write_to_hash(h, prefix + suffix)
+  assert_eq get_sum(h, []), serial
+}
+
+def write_to_hash(h0: hash.Hash, p: [Byte]) {
+  h = h0
+  before = p + []
+  n = h.write!(p).unwrap
+  assert_eq n, p.size
+  assert_eq p, before
+}
+
+def get_sum(h: hash.Hash, buff: [Byte]) -> [Byte] {
+  test_buff = buff + []
+  s = h.sum(buff)
+  assert_eq s, h.sum(test_buff)
+  s
+}

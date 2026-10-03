@@ -1,0 +1,304 @@
+import "hash"
+import "io"
+import "fmt"
+
+# Go's crc32_test.go and example_test.go, translated. The golden table is in
+# golden_test.alx; Go's random inputs are seeded generator bytes (gen, in
+# vec_crc32_test.alx).
+
+test "castagnoli race" {
+  ieee = new_ieee()
+  t = spawn { make_table(CASTAGNOLI) }
+  ieee.write!(b("hello"))
+  t.wait
+  assert_eq ieee.sum32, checksum_ieee(b("hello"))
+}
+
+test "hash interface" {
+  check_hash(->() -> hash.Hash { new_ieee() })
+}
+
+# The Clone subtest of Go's testhash.TestHash.
+test "clone" {
+  h = new_ieee()
+  h3 = h.clone
+  prefix = b("tmp")
+  h.write!(prefix)
+  h2 = h.clone
+  prefix_sum = h.sum([])
+  assert_eq prefix_sum, h2.sum([])
+  suffix = b("tmp2")
+  h.write!(suffix)
+  h3.write!(prefix + suffix)
+  composite = h3.sum([])
+  assert_eq h.sum([]), composite
+  assert_eq h2.sum([]), prefix_sum
+  h2.write!(suffix)
+  assert_eq h.sum([]), composite
+  assert_eq h2.sum([]), composite
+}
+
+def golden_ieee(f: ([Byte]) -> U32) {
+  for g in golden() {
+    assert_eq f(g.input), g.ieee
+  }
+}
+
+def golden_castagnoli(f: ([Byte]) -> U32) {
+  for g in golden() {
+    assert_eq f(g.input), g.castagnoli
+  }
+}
+
+CROSS_LENGTHS = [0, 1, 2, 3, 4, 5, 10, 16, 50, 63, 64, 65, 100,
+  127, 128, 129, 255, 256, 257, 300, 312, 384, 416, 448, 480,
+  500, 501, 502, 503, 504, 505, 512, 513, 1000, 1024, 2000,
+  4030, 4031, 4032, 4033, 4036, 4040, 4048, 4096, 5000, 10000]
+
+def cross_check(f1: (U32, [Byte]) -> U32, f2: (U32, [Byte]) -> U32) {
+  i = 0
+  while i < CROSS_LENGTHS.size {
+    n = CROSS_LENGTHS[i]
+    p = gen(n.as_u64 + 100, n)
+    init = gen(n.as_u64 + 200, 4)
+    crc_init = le32(init, 0)
+    assert_eq f1(crc_init, p), f2(crc_init, p)
+    i += 1
+  }
+}
+
+test "simple" {
+  tab = simple_make_table(IEEE)
+  golden_ieee(->(p: [Byte]) -> U32 { simple_update(0, tab, p) })
+  tab2 = simple_make_table(CASTAGNOLI)
+  golden_castagnoli(->(p: [Byte]) -> U32 { simple_update(0, tab2, p) })
+}
+
+def golden_marshal(tab: Table, castagnoli: Bool) {
+  for g in golden() {
+    h = new(tab)
+    h2 = new(tab)
+    half = g.input.size / 2
+    io.write_all(h, g.input[0...half]).unwrap
+    state = h.marshal_binary
+    prefix: [Byte] = [0, 0, 0, 0]
+    state_append = h.append_binary(prefix)
+    state_append = state_append[4...state_append.size]
+    want = castagnoli ? g.half_castagnoli : g.half_ieee
+    assert_eq state, want
+    assert_eq state_append, want
+    h2.unmarshal_binary!(state).unwrap
+    io.write_all(h, g.input[half...g.input.size]).unwrap
+    io.write_all(h2, g.input[half...g.input.size]).unwrap
+    assert_eq h.sum32, h2.sum32
+  }
+}
+
+test "golden marshal" {
+  golden_marshal(ieee_table(), false)
+  golden_marshal(make_table(CASTAGNOLI), true)
+}
+
+test "marshal table mismatch" {
+  h1 = new(ieee_table())
+  h2 = new(make_table(CASTAGNOLI))
+  state1 = h1.marshal_binary
+  r = h2.unmarshal_binary!(state1)
+  assert r.err.present?, "no error when one was expected"
+  assert_eq "#{r.err.unwrap}", "hash/crc32: tables do not match"
+}
+
+test "unmarshal errors" {
+  h = new_ieee()
+  r = h.unmarshal_binary!(b("crx\x01"))
+  assert_eq "#{r.err.unwrap}", "hash/crc32: invalid hash state identifier"
+  r2 = h.unmarshal_binary!(b("crc\x01abc"))
+  assert_eq "#{r2.err.unwrap}", "hash/crc32: invalid hash state size"
+}
+
+test "slicing" {
+  tab = slicing_make_table(IEEE)
+  golden_ieee(->(p: [Byte]) -> U32 { slicing_update(0, tab, p) })
+  tab2 = slicing_make_table(CASTAGNOLI)
+  golden_castagnoli(->(p: [Byte]) -> U32 { slicing_update(0, tab2, p) })
+
+  polys: [U32] = [IEEE, CASTAGNOLI, KOOPMAN, 0xd5828281]
+  for poly in polys {
+    t1 = simple_make_table(poly)
+    t2 = slicing_make_table(poly)
+    cross_check(
+      ->(crc: U32, p: [Byte]) -> U32 { simple_update(crc, t1, p) },
+      ->(crc: U32, p: [Byte]) -> U32 { slicing_update(crc, t2, p) })
+  }
+}
+
+# Go's TestArchIEEE / TestArchCastagnoli check the hardware paths against
+# slicing-by-8; here the constant-table paths stand in for them.
+test "constant tables" {
+  t = slicing_make_table(IEEE)
+  cross_check(
+    ->(crc: U32, p: [Byte]) -> U32 { update_ieee(crc, p) },
+    ->(crc: U32, p: [Byte]) -> U32 { slicing_update(crc, t, p) })
+  t2 = slicing_make_table(CASTAGNOLI)
+  cross_check(
+    ->(crc: U32, p: [Byte]) -> U32 { update_castagnoli(crc, p) },
+    ->(crc: U32, p: [Byte]) -> U32 { slicing_update(crc, t2, p) })
+  i = 0
+  while i < 2048 {
+    assert_eq IEEE8[i], t[i]
+    assert_eq CASTAGNOLI8[i], t2[i]
+    i += 1
+  }
+}
+
+test "golden" {
+  golden_ieee(->(p: [Byte]) -> U32 { checksum_ieee(p) })
+  delta = 1
+  while delta <= 7 {
+    d0 = delta
+    golden_ieee(->(p: [Byte]) -> U32 {
+      ieee = new_ieee()
+      d = d0
+      d = p.size if d >= p.size
+      ieee.write!(p[0...d])
+      ieee.write!(p[d...p.size])
+      ieee.sum32
+    })
+    delta += 1
+  }
+  tab = make_table(CASTAGNOLI)
+  golden_castagnoli(->(p: [Byte]) -> U32 {
+    c = new(tab)
+    c.write!(p)
+    c.sum32
+  })
+  delta = 1
+  while delta <= 7 {
+    d0 = delta
+    golden_castagnoli(->(p: [Byte]) -> U32 {
+      c = new(tab)
+      d = d0
+      d = p.size if d >= p.size
+      c.write!(p[0...d])
+      c.write!(p[d...p.size])
+      c.sum32
+    })
+    delta += 1
+  }
+}
+
+test "tables" {
+  assert_eq ieee_table().at(1), 0x77073096
+  assert_eq make_table(CASTAGNOLI).entries, simple_make_table(CASTAGNOLI)
+  assert_eq make_table(KOOPMAN).entries, simple_make_table(KOOPMAN)
+  assert_eq make_table(IEEE).poly, IEEE
+  assert_eq new_ieee().size, SIZE
+  assert_eq new_ieee().block_size, 1
+}
+
+example "make_table" {
+  crc32q = make_table(0xd5828281)
+  puts fmt.sprintf("%08x", checksum(b("Hello world"), crc32q))
+} outputs "2964d064\n"
+
+# 1 MB of data; the benchmarks write it in 4 kB or 40-byte pieces.
+def bench_data -> [Byte] {
+  [0x5a.as_u8; 1 << 20]
+}
+
+def bench_write(h0: hash.Hash, data: [Byte], piece: Int) {
+  h = h0
+  off = 0
+  while off < data.size {
+    hi = off + piece
+    hi = data.size if hi > data.size
+    h.write!(data[off...hi])
+    off = hi
+  }
+  h.sum([])
+}
+
+bench "crc32 IEEE 1MB in 4kB writes" {
+  bench_write(new_ieee(), bench_data(), 4096)
+}
+
+bench "crc32 Castagnoli 1MB in 4kB writes" {
+  bench_write(new(make_table(CASTAGNOLI)), bench_data(), 4096)
+}
+
+bench "crc32 Koopman 1MB in 4kB writes" {
+  bench_write(new(make_table(KOOPMAN)), bench_data(), 4096)
+}
+
+bench "crc32 IEEE 1MB in 40B writes" {
+  bench_write(new_ieee(), bench_data(), 40)
+}
+
+# Go's internal/testhash.TestHashWithoutClone, for a constructor of hashes.
+# (Clone is tested per type: hash.Hash has no clone.) Go's random bytes are
+# seeded generator bytes here.
+def check_hash(mk: () -> hash.Hash) {
+  # SumAppend: sum appends a digest of size bytes and leaves the prefix alone.
+  h = mk()
+  long_buff = gen(1, h.block_size + 1)
+  prefixes: [[Byte]] = [[], b("a"), long_buff]
+  for prefix in prefixes {
+    h.reset!
+    s = get_sum(h, prefix)
+    assert_eq s[0...prefix.size], prefix
+    assert_eq s[prefix.size...s.size], get_sum(h, [])
+    assert_eq s.size - prefix.size, h.size
+  }
+
+  # WriteWithoutError: write! reports every byte and leaves p alone.
+  h = mk()
+  slices: [[Byte]] = [[], b("a"), gen(2, h.block_size + 1)]
+  for p in slices {
+    write_to_hash(h, p)
+  }
+
+  # ResetState: a reset hash sums like a new one.
+  h = mk()
+  empty_sum = get_sum(h, [])
+  write_to_hash(h, gen(3, h.block_size))
+  h.reset!
+  assert_eq get_sum(h, []), empty_sum
+
+  # OutOfBoundsRead: write! reads only its slice.
+  h = mk()
+  bs = h.block_size
+  msg = gen(4, bs)
+  write_to_hash(h, msg)
+  expected = get_sum(h, [])
+  h.reset!
+  buff = gen(5, bs * 3)
+  copy(buff[bs...bs * 2], msg)
+  write_to_hash(h, buff[bs...bs * 2])
+  assert_eq get_sum(h, []), expected
+
+  # StatefulWrite: two writes equal one.
+  h = mk()
+  prefix = gen(6, h.block_size)
+  suffix = gen(7, h.block_size)
+  write_to_hash(h, prefix)
+  write_to_hash(h, suffix)
+  serial = get_sum(h, [])
+  h.reset!
+  write_to_hash(h, prefix + suffix)
+  assert_eq get_sum(h, []), serial
+}
+
+def write_to_hash(h0: hash.Hash, p: [Byte]) {
+  h = h0
+  before = p + []
+  n = h.write!(p).unwrap
+  assert_eq n, p.size
+  assert_eq p, before
+}
+
+def get_sum(h: hash.Hash, buff: [Byte]) -> [Byte] {
+  test_buff = buff + []
+  s = h.sum(buff)
+  assert_eq s, h.sum(test_buff)
+  s
+}

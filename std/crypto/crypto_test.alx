@@ -1,0 +1,105 @@
+import "io"
+import "hash"
+import "crypto/md5"
+import "crypto/sha1"
+import "crypto/sha256"
+import "crypto/sha512"
+import "crypto/sha3"
+
+# Package crypto's own tests. Go's crypto_test.go (TestSignMessage, over an
+# RSA key), issue21104_test.go (ciphers) and purego_test.go (build tags of
+# the assembly) need packages alx doesn't have yet, or have no counterpart;
+# these test the same API with stand-in signers.
+
+def b(s: Str) -> [Byte] { s.bytes.to_a }
+
+test "constants" {
+  assert_eq SHA256, Hash.SHA256
+  assert_eq SHA256.value, 5
+  assert_eq MD4.value, 1
+  assert_eq MLDSAMu.value, 20
+  assert Hash.from(0).none?, "Hash.from(0)"
+  assert Hash.from(21).none?, "Hash.from(21)"
+  assert_eq SHA512_256.to_s, "SHA-512/256"
+  assert_eq all_hashes().size, 20
+}
+
+test "new matches the packages" {
+  pairs: [(Hash, hash.Hash)] = [(MD5, md5.new()), (SHA1, sha1.new()), (SHA224, sha256.new224()),
+    (SHA256, sha256.new()), (SHA384, sha512.new384()), (SHA512, sha512.new()),
+    (SHA512_224, sha512.new512_224()), (SHA512_256, sha512.new512_256()), (SHA3_224, sha3.new224()),
+    (SHA3_256, sha3.new256()), (SHA3_384, sha3.new384()), (SHA3_512, sha3.new512())]
+  for p in pairs {
+    h = p[0].new
+    d = p[1]
+    h.write!(b("The quick brown fox jumps over the lazy dog")).unwrap
+    d.write!(b("The quick brown fox jumps over the lazy dog")).unwrap
+    assert_eq h.sum([]), d.sum([])
+    assert_eq h.size, p[0].size
+    assert_eq h.block_size, d.block_size
+  }
+}
+
+test "hash is signer opts" {
+  opts: SignerOpts = SHA384
+  assert_eq opts.hash_func.unwrap, SHA384
+}
+
+# A Signer that "signs" by returning the digest with a marker, and checks it
+# is handed the randomness source.
+struct TestKey {
+  id: Int
+
+  def equal?(o: TestKey) -> Bool { id == o.id }
+}
+
+struct EchoSigner {
+  key: TestKey
+
+  def public -> PublicKey { key }
+
+  def sign(rand: io.Reader, digest: [Byte], opts: SignerOpts) -> ~[Byte] {
+    r = rand
+    nonce = [0.as_u8; 2]
+    r.read!(nonce)
+    [0xee.as_u8] + nonce + digest
+  }
+}
+
+struct Ones {
+  def read!(p: [Byte]) -> Int {
+    i = 0
+    while i < p.size {
+      p[i] = 1
+      i += 1
+    }
+    p.size
+  }
+}
+
+# SignerOpts without a hash: the message is signed as it is.
+struct Raw {
+  def hash_func -> Hash? { none }
+}
+
+test "sign message" {
+  s = EchoSigner.new(key: TestKey.new(id: 7))
+  msg = b("message")
+  sig = sign_message(s, Ones.new, msg, SHA256).unwrap
+  assert_eq sig, MARK + sha256.sum256(msg).to_a
+  sig2 = sign_message(s, Ones.new, msg, Raw.new).unwrap
+  assert_eq sig2, MARK + msg
+  r = sign_message(s, Ones.new, msg, BLAKE2b_256)
+  assert_eq "#{r.err.unwrap}", "crypto: requested hash function unavailable: BLAKE2b-256"
+}
+
+def signer_public(s: Signer) -> PublicKey { s.public }
+
+test "signer interface" {
+  s = EchoSigner.new(key: TestKey.new(id: 9))
+  signer_public(s)
+  sig = s.sign(Ones.new, [5], SHA1).unwrap
+  assert_eq sig, MARK + [5.as_u8]
+}
+
+MARK: [Byte] = [0xee, 1, 1]

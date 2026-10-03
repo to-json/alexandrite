@@ -1,0 +1,264 @@
+#![overflow(wrap)]
+# Package sha256: Go's crypto/sha256, the SHA-224 and SHA-256 hash
+# algorithms of FIPS 180-4. Pure alx: the generic (non-assembly) code of Go's
+# crypto/internal/fips140/sha256.
+#
+#   Go                                  alx
+#   sha256.Size / Size224 / BlockSize   SIZE / SIZE224 / BLOCK_SIZE
+#   sha256.New() hash.Hash              new() -> Digest
+#   sha256.New224() hash.Hash           new224() -> Digest
+#   sha256.Sum256(data) [Size]byte      sum256(data) -> [Byte; 32]
+#   sha256.Sum224(data) [Size224]byte   sum224(data) -> [Byte; 28]
+#   d.Write(p) (int, error)             d.write!(p) -> Int (never fails)
+#   d.Sum(b) / Reset / Size / BlockSize d.sum(b) / d.reset! / d.size / d.block_size
+#   d.MarshalBinary / AppendBinary      d.marshal_binary / d.append_binary(b) (never fail)
+#   d.UnmarshalBinary(b) error          d.unmarshal_binary!(b) -> ~Unit<StateError>
+#   d.Clone() (hash.Cloner, error)      d.clone -> Digest
+#
+# A Digest satisfies hash.Hash structurally.
+#
+# Differences from Go:
+#   - New / New224 return the concrete Digest (Go: hash.Hash); it converts to
+#     a hash.Hash wherever one is wanted. crypto.SHA256.new gives a hash.Hash.
+#   - No registration with package crypto at init: package crypto knows the
+#     hashes it can make (alx has no init functions or global registries).
+#   - A Digest keeps its state in shared storage (GO-VS-RUBY D36): copies of
+#     a Digest are the same hash, as Go's pointer is; `clone` makes an
+#     independent one. Use new / new224: a zero `Digest.new` has no state.
+#   - Clone, MarshalBinary and AppendBinary can't fail, so they return plain
+#     values. No BoringCrypto or FIPS 140 module modes, no assembly.
+
+# The size of a SHA-256 checksum in bytes.
+pub SIZE = 32
+# The size of a SHA-224 checksum in bytes.
+pub SIZE224 = 28
+# The block size of SHA-256 and SHA-224 in bytes.
+pub BLOCK_SIZE = 64
+
+CHUNK = 64
+MAGIC224 = "sha\x02"
+MAGIC256 = "sha\x03"
+MARSHALED_SIZE = 4 + 8 * 4 + CHUNK + 8
+
+# Errors of Digest.unmarshal_binary!.
+pub error StateError {
+  InvalidIdentifier
+  InvalidSize
+
+  def message -> Str {
+    case self {
+      InvalidIdentifier => "crypto/sha256: invalid hash state identifier"
+      InvalidSize => "crypto/sha256: invalid hash state size"
+    }
+  }
+}
+
+INIT256: [U32; 8] = [0x6A09E667, 0xBB67AE85, 0x3C6EF372, 0xA54FF53A, 0x510E527F, 0x9B05688C, 0x1F83D9AB, 0x5BE0CD19]
+INIT224: [U32; 8] = [0xC1059ED8, 0x367CD507, 0x3070DD17, 0xF70E5939, 0xFFC00B31, 0x68581511, 0x64F98FA7, 0xBEFA4FA4]
+
+def append_be32(b: [Byte], v: U32) -> [Byte] {
+  out = b
+  out << (v >> 24).as_u8
+  out << (v >> 16).as_u8
+  out << (v >> 8).as_u8
+  out << v.as_u8
+  out
+}
+
+def append_be64(b: [Byte], v: U64) -> [Byte] {
+  out = append_be32(b, (v >> 32).as_u32)
+  append_be32(out, v.as_u32)
+}
+
+def be32(b: [Byte], i: Int) -> U32 {
+  (b[i].as_u32 << 24) | (b[i + 1].as_u32 << 16) | (b[i + 2].as_u32 << 8) | b[i + 3].as_u32
+}
+
+def be64(b: [Byte], i: Int) -> U64 {
+  (be32(b, i).as_u64 << 32) | be32(b, i + 4).as_u64
+}
+
+# Whether b starts with the bytes of s.
+def has_magic(b: [Byte], s: Str) -> Bool {
+  return false if b.size < s.size
+  i = 0
+  while i < s.size {
+    return false if b[i] != s[i]
+    i += 1
+  }
+  true
+}
+
+# A new SHA-256 hash.
+pub def new -> Digest {
+  d = Digest.new(h: [0.as_u32; 8], x: [0.as_u8; CHUNK], n: [0.as_u64; 2], is224: false)
+  d.reset!
+  d
+}
+
+# A new SHA-224 hash.
+pub def new224 -> Digest {
+  d = Digest.new(h: [0.as_u32; 8], x: [0.as_u8; CHUNK], n: [0.as_u64; 2], is224: true)
+  d.reset!
+  d
+}
+
+# The SHA-256 checksum of data.
+pub def sum256(data: [Byte]) -> [Byte; 32] {
+  d = new()
+  d.write!(data)
+  out: [Byte; 32] = [0; 32]
+  s = d.check_sum
+  i = 0
+  while i < 32 {
+    out[i] = s[i]
+    i += 1
+  }
+  out
+}
+
+# The SHA-224 checksum of data.
+pub def sum224(data: [Byte]) -> [Byte; 28] {
+  d = new224()
+  d.write!(data)
+  out: [Byte; 28] = [0; 28]
+  s = d.check_sum
+  i = 0
+  while i < 28 {
+    out[i] = s[i]
+    i += 1
+  }
+  out
+}
+
+# A running SHA-256 or SHA-224 hash.
+pub struct Digest {
+  # The chaining state.
+  h: [U32]
+  # The partial block.
+  x: [Byte]
+  # n[0]: bytes in x; n[1]: total bytes written.
+  n: [U64]
+  is224: Bool
+
+  # The checksum size in bytes: 32, or 28 for SHA-224.
+  pub def size -> Int { is224 ? SIZE224 : SIZE }
+
+  # The block size: 64.
+  pub def block_size -> Int { BLOCK_SIZE }
+
+  # Back to the initial state.
+  pub def reset! {
+    init = is224 ? INIT224 : INIT256
+    i = 0
+    while i < 8 {
+      self.h[i] = init[i]
+      i += 1
+    }
+    self.n[0] = 0
+    self.n[1] = 0
+    nil
+  }
+
+  # Adds p to the running hash; returns p.size.
+  pub def write!(p: [Byte]) -> Int {
+    nn = p.size
+    self.n[1] = n[1] + nn.as_u64
+    nx = n[0].to_i
+    off = 0
+    if nx > 0 {
+      k = CHUNK - nx
+      k = nn if k > nn
+      copy(x[nx...nx + k], p[0...k])
+      nx += k
+      if nx == CHUNK {
+        block(h, x, 0, CHUNK)
+        nx = 0
+      }
+      off = k
+    }
+    rest = nn - off
+    if rest >= CHUNK {
+      m = rest & ^(CHUNK - 1)
+      block(h, p, off, m)
+      off += m
+    }
+    if off < nn {
+      nx = nn - off
+      copy(x[0...nx], p[off...nn])
+    }
+    self.n[0] = nx.as_u64
+    nn
+  }
+
+  # The padded final digest of a copy of the state (Go's checkSum).
+  def check_sum -> [Byte] {
+    d = clone
+    len = d.n[1]
+    tmp = [0.as_u8; 72]
+    tmp[0] = 0x80
+    t = len % 64 < 56 ? 56 - len % 64 : 64 + 56 - len % 64
+    bits = len << 3
+    ti = t.to_i
+    j = 0
+    while j < 8 {
+      tmp[ti + j] = (bits >> (56 - 8 * j).as_u64).as_u8
+      j += 1
+    }
+    d.write!(tmp[0...ti + 8])
+    panic("d.nx != 0") if d.n[0] != 0
+    out: [Byte] = []
+    k = is224 ? 7 : 8
+    i = 0
+    while i < k {
+      out = append_be32(out, d.h[i])
+      i += 1
+    }
+    out
+  }
+
+  # b with the current hash appended. The state is unchanged.
+  pub def sum(b: [Byte]) -> [Byte] {
+    b + check_sum
+  }
+
+  # An independent copy of the hash in its current state.
+  pub def clone -> Digest {
+    Digest.new(h: h + [], x: x + [], n: n + [], is224: is224)
+  }
+
+  # b with the marshaled state appended (Go's AppendBinary).
+  pub def append_binary(b: [Byte]) -> [Byte] {
+    out = b + (is224 ? MAGIC224 : MAGIC256).bytes.to_a
+    i = 0
+    while i < 8 {
+      out = append_be32(out, h[i])
+      i += 1
+    }
+    nx = n[0].to_i
+    out = out + x[0...nx]
+    out = out + [0.as_u8; CHUNK - nx]
+    append_be64(out, n[1])
+  }
+
+  # The marshaled state (Go's MarshalBinary).
+  pub def marshal_binary -> [Byte] {
+    append_binary([])
+  }
+
+  # Restores a state from marshal_binary. A SHA-224 state can only be
+  # restored into a SHA-224 hash, and a SHA-256 state into a SHA-256 hash.
+  pub def unmarshal_binary!(b: [Byte]) -> ~Unit<StateError> {
+    fail StateError.InvalidIdentifier if !has_magic(b, is224 ? MAGIC224 : MAGIC256)
+    fail StateError.InvalidSize if b.size != MARSHALED_SIZE
+    i = 0
+    while i < 8 {
+      self.h[i] = be32(b, 4 + 4 * i)
+      i += 1
+    }
+    copy(x, b[36...36 + CHUNK])
+    len = be64(b, 36 + CHUNK)
+    self.n[1] = len
+    self.n[0] = len % CHUNK.as_u64
+  }
+}

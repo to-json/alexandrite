@@ -1,0 +1,158 @@
+import "hash"
+import "crypto/md5"
+import "crypto/sha1"
+import "crypto/sha256"
+import "crypto/sha512"
+import "crypto/sha3"
+import "encoding/hex"
+
+# Go's hmac_test.go, translated. The table is in table_test.alx; Go's
+# internal/testhash is testhash_test.alx.
+#
+# Not translated: TestNoClone (an HMAC over a hash without Clone: here
+# clone is a compile-time requirement, not a run-time error),
+# TestNonUniqueHash (needs object identity; see the header), TestExtraMethods
+# (reflection over the method set), hmac_wycheproof_test.go (downloads the
+# Wycheproof vectors as a Go module at test time; the generated vectors
+# cover random keys of every length instead). Go's justHash wrapper (a hash
+# with only the hash.Hash methods) is a constructor returning hash.Hash.
+
+# Go's TestHMAC for one case: the same MAC four times, with resets, over
+# the concrete hash and then over the bare hash.Hash interface.
+def check_case[H](mk: () -> H, t: HmacTest) {
+  h = new(mk, t.key)
+  assert_eq h.size, t.size
+  assert_eq h.block_size, t.blocksize
+  j = 0
+  while j < 2 {
+    assert_eq h.write!(t.input).unwrap, t.input.size
+    k = 0
+    while k < 2 {
+      assert_eq hex.encode_to_string(h.sum([])), t.out
+      k += 1
+    }
+    h.reset!
+    j += 1
+  }
+  h2 = new(->() -> hash.Hash { mk() }, t.key)
+  while j < 4 {
+    assert_eq h2.write!(t.input).unwrap, t.input.size
+    k = 0
+    while k < 2 {
+      assert_eq hex.encode_to_string(h2.sum([])), t.out
+      k += 1
+    }
+    h2.reset!
+    j += 1
+  }
+}
+
+test "hmac" {
+  for t in hmac_tests() {
+    case t.hash {
+      "md5.New" => check_case(->() -> md5.Digest { md5.new() }, t)
+      "sha1.New" => check_case(->() -> sha1.Digest { sha1.new() }, t)
+      "sha256.New" => check_case(->() -> sha256.Digest { sha256.new() }, t)
+      "sha256.New224" => check_case(->() -> sha256.Digest { sha256.new224() }, t)
+      "sha512.New" => check_case(->() -> sha512.Digest { sha512.new() }, t)
+      "sha512.New384" => check_case(->() -> sha512.Digest { sha512.new384() }, t)
+      _ => assert false, "unknown hash #{t.hash}"
+    }
+  }
+}
+
+# Go's TestSHA3Hash makes HMACs over SHA-3 wrapped as a bare hash.Hash.
+test "sha3 hash" {
+  h = new(->() -> hash.Hash { sha3.new256() }, b("key"))
+  h.write!(b("message")).unwrap
+  h2 = new(->() -> sha3.SHA3 { sha3.new256() }, b("key"))
+  h2.write!(b("message")).unwrap
+  assert_eq h.sum([]), h2.sum([])
+}
+
+test "equal" {
+  a = b("test")
+  b1 = b("test1")
+  c = b("test2")
+  assert equal?(b1, b1), "Equal failed with equal arguments"
+  assert !equal?(a, b1), "Equal accepted a prefix of the second argument"
+  assert !equal?(b1, a), "Equal accepted a prefix of the first argument"
+  assert !equal?(b1, c), "Equal accepted unequal slices"
+}
+
+def check_hmac_hash[H](mk: () -> H, key: [Byte]) {
+  check_hash(->() -> hash.Hash { new(mk, key) })
+  check_clone(new(mk, key))
+}
+
+test "hmac hash" {
+  for t in hmac_tests() {
+    case t.hash {
+      "md5.New" => check_hmac_hash(->() -> md5.Digest { md5.new() }, t.key)
+      "sha1.New" => check_hmac_hash(->() -> sha1.Digest { sha1.new() }, t.key)
+      "sha256.New" => check_hmac_hash(->() -> sha256.Digest { sha256.new() }, t.key)
+      "sha256.New224" => check_hmac_hash(->() -> sha256.Digest { sha256.new224() }, t.key)
+      "sha512.New" => check_hmac_hash(->() -> sha512.Digest { sha512.new() }, t.key)
+      "sha512.New384" => check_hmac_hash(->() -> sha512.Digest { sha512.new384() }, t.key)
+      _ => assert false, "unknown hash #{t.hash}"
+    }
+  }
+}
+
+# The Clone subtest of Go's testhash.TestHash.
+def check_clone[H](h: HMAC[H]) {
+  h3 = h.clone
+  prefix = b("tmp")
+  h.write!(prefix).unwrap
+  h2 = h.clone
+  prefix_sum = h.sum([])
+  assert_eq prefix_sum, h2.sum([])
+  suffix = b("tmp2")
+  h.write!(suffix).unwrap
+  h3.write!(prefix + suffix).unwrap
+  composite = h3.sum([])
+  assert_eq h.sum([]), composite
+  assert_eq h2.sum([]), prefix_sum
+  h2.write!(suffix).unwrap
+  assert_eq h.sum([]), composite
+  assert_eq h2.sum([]), composite
+}
+
+example "valid mac" {
+  key = b("secret")
+  mac = new(->() -> sha256.Digest { sha256.new() }, key)
+  mac.write!(b("message")).unwrap
+  expected = mac.sum([])
+  check = new(->() -> sha256.Digest { sha256.new() }, key)
+  check.write!(b("message")).unwrap
+  puts equal?(check.sum([]), expected)
+  puts hex.encode_to_string(expected)
+} outputs "true\n8b5f48702995c1598c573db1e21866a9b825d4a794d169d7060a03605796360b\n"
+
+bench "hmac sha256 1K" {
+  key = [0.as_u8; 32]
+  buf = [0.as_u8; 1024]
+  h = new(->() -> sha256.Digest { sha256.new() }, key)
+  i = 0
+  while i < 100 {
+    h.write!(buf).unwrap
+    mac = h.sum([])
+    h.reset!
+    buf[0] = mac[0]
+    i += 1
+  }
+}
+
+bench "hmac sha256 32" {
+  key = [0.as_u8; 32]
+  buf = [0.as_u8; 32]
+  h = new(->() -> sha256.Digest { sha256.new() }, key)
+  i = 0
+  while i < 100 {
+    h.write!(buf).unwrap
+    mac = h.sum([])
+    h.reset!
+    buf[0] = mac[0]
+    i += 1
+  }
+}

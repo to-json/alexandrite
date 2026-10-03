@@ -493,6 +493,7 @@ pub fn check_program(l: &Loaded, externs: Vec<DefInfo>) -> Result<TProgram, Diag
             f.overflow = if f.is_main { l.main.overflow } else { ov(f.span.file) };
         }
     }
+    crate::check::self_containing_closures(&funcs, &ifaces)?;
     for f in &funcs {
         prove::prove(f, &l.sm)?;
     }
@@ -569,6 +570,7 @@ pub fn check_library(l: &Loaded, idx: usize, prefix: &str) -> Result<(TProgram, 
     for (name, fid) in &exports {
         funcs[*fid].cname = format!("{prefix}_{}", crate::check::cname(name));
     }
+    crate::check::self_containing_closures(&funcs, &ifaces)?;
     for f in &funcs {
         prove::prove(f, &l.sm)?;
     }

@@ -6166,3 +6166,47 @@ fn expr_breaks_out(e: &TExpr) -> bool {
         }
     }
 }
+
+/// A closure value holds its captures, so a closure that captures a value
+/// holding the closure's own type would be infinitely large (and can't be
+/// laid out): `s.f = -> () { s.n }` where `s: S` has a field of that type.
+pub fn self_containing_closures(funcs: &[TFunc], ifaces: &HashMap<String, Vec<(Ty, Vec<FuncId>)>>) -> Result<(), Diag> {
+    let sites: Vec<(Ty, Vec<Ty>)> = funcs.iter().flat_map(|f| f.lambdas.iter().map(move |(_, t, caps)| (t.clone(), caps.iter().map(|c| f.locals[*c].ty.clone()).collect()))).collect();
+    fn holds(t: &Ty, want: &Ty, sites: &[(Ty, Vec<Ty>)], ifaces: &HashMap<String, Vec<(Ty, Vec<FuncId>)>>, seen: &mut Vec<Ty>) -> bool {
+        if t == want {
+            return true;
+        }
+        let go = |x: &Ty, seen: &mut Vec<Ty>| holds(x, want, sites, ifaces, seen);
+        match t {
+            Ty::Struct(_, fs) => fs.iter().any(|(_, f)| go(f, seen)),
+            Ty::Enum(_, vs) => vs.iter().any(|(_, fs)| fs.iter().any(|(_, f)| go(f, seen))),
+            Ty::Tuple(ts) => ts.iter().any(|x| go(x, seen)),
+            Ty::Opt(x) | Ty::Array(x) | Ty::Fixed(x, _) | Ty::Result(x) | Ty::Mutex(x) | Ty::Chan(x) => go(x, seen),
+            Ty::Map(k, v) => go(k, seen) || go(v, seen),
+            Ty::Fn(..) | Ty::Iface(_) => {
+                if seen.contains(t) {
+                    return false;
+                }
+                seen.push(t.clone());
+                match t {
+                    Ty::Iface(n) => ifaces.get(n).is_some_and(|v| v.iter().any(|(x, _)| go(x, seen))),
+                    _ => sites.iter().filter(|(ft, _)| ft == t).any(|(_, caps)| caps.iter().any(|c| go(c, seen))),
+                }
+            }
+            _ => false,
+        }
+    }
+    for f in funcs {
+        for (lo, t, caps) in &f.lambdas {
+            for c in caps {
+                let ct = &f.locals[*c].ty;
+                if holds(ct, t, &sites, ifaces, &mut vec![]) {
+                    let sp = Span { file: f.span.file, lo: *lo, hi: *lo + 1 };
+                    return Err(Diag::new(sp, format!("this closure captures `{}` ({}), which holds a closure of this same type ({}): a closure contains what it captures, so it would contain itself", f.locals[*c].name, ct.show(), t.show()))
+                        .note("pass the value as a parameter instead, or keep it in a Pool and capture its @handle"));
+                }
+            }
+        }
+    }
+    Ok(())
+}

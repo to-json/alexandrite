@@ -157,6 +157,7 @@ The logic: **fallibility is a prefix** ("approximately do this", "you'll probabl
 | D55 | From the sync/log/io port (S3) | a generic call's block may decide only the result type (`once_value { 42 }`); `x: pkg.T[K, V] = pkg.make` infers from the wanted type across packages; an interface value is shared storage only if an implementor is; `.dup` on a struct deep-copies (Mutexes stay shared); `x == none` tests presence only; runtime signal watching (self-pipe) and user lookup | S3 |
 | D56 | From the symmetric crypto port (S3) | C tuple type names carry their arity (nested tuples were conflated); release-mode bounds-check elision from value ranges (narrow types, masks, shifts, wrapping ops) and in-range `[T; N]` indexing | S3 |
 | D57 | From the public-key crypto port (S3) | `ALX_STD_DIR=<dir>` reads std from disk (no rebuild after std edits); storage-free tuple/struct/enum values don't make a def open a region; array literals take an earlier element's non-numeric type; a def's trailing literal and case/if arms take the wanted type; interfaces have a zero value | S3 |
+| D58 | From the net port (S3) | a static method on a type parameter (`T.from_json(s)`) resolves per instance; a fallible def fits a wanted `(A) -> ~R`; type parameters bind through Mutex/Atomic/Chan/Pool and other packages' generic types; `x: ~R = h.get` binds R, not ~R; `spawn { f(x) }` of a fallible non-Unit f is a checker error (it was miscompiled) | S3 |
 
 ## Memory model and the next push (user, 2026-10-01)
 

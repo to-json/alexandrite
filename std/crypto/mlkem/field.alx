@@ -1,0 +1,618 @@
+#![overflow(wrap)]
+# The arithmetic of ML-KEM: Go's crypto/internal/fips140/mlkem/field.go.
+#
+# A field element (Go's fieldElement, an integer modulo q, always reduced)
+# is a U16. A polynomial, either a ring element (Go's ringElement, R_q) or
+# its NTT representation (Go's nttElement, T_q), is a [U16] of N = 256
+# coefficients. Go passes these as [256]uint16 values; here they are slices
+# (shared storage), so the functions that Go writes as `f = op(f)` work in
+# place on their argument (ntt, inverse_ntt, poly_add_to, ...), and the
+# encoders write into a destination slice instead of appending.
+#
+# Timing: the same constant-time structure as Go: Barrett reduction instead
+# of division, conditional subtraction of q by masks, compress/decompress
+# with shifts. The only branches on data are in poly_byte_decode (the
+# public encapsulation key's modulus check) and sample_ntt (rejection
+# sampling of the public matrix A), as in Go. alx compiles to C (or JIT
+# code), and nothing guarantees that a C compiler keeps these forms
+# branch-free (see crypto/subtle's header).
+
+import "crypto/sha3"
+
+# ML-KEM's global constants.
+N = 256
+Q = 3329
+
+# encoding_size_X: the byte size of a polynomial encoded by ByteEncode_X
+# (FIPS 203, Algorithm 5).
+ENCODING_SIZE12 = 384
+ENCODING_SIZE11 = 352
+ENCODING_SIZE10 = 320
+ENCODING_SIZE5 = 160
+ENCODING_SIZE4 = 128
+ENCODING_SIZE1 = 32
+
+MESSAGE_SIZE = ENCODING_SIZE1
+
+# 2¹² * 2¹² / q, and log₂(2¹² * 2¹²).
+BARRETT_MULTIPLIER = 5039
+BARRETT_SHIFT = 24
+
+# a as a field element if it is < q (Go's fieldCheckReduced), else none.
+def field_check_reduced(a: U16) -> U16? {
+  return none if a >= Q
+  a
+}
+
+# Reduces a value a < 2q.
+def field_reduce_once(a: U16) -> U16 {
+  x = a - Q
+  # If x underflowed, then x >= 2¹⁶ - q > 2¹⁵, so the top bit is set.
+  x + (x >> 15) * Q
+}
+
+def field_add(a: U16, b: U16) -> U16 { field_reduce_once(a + b) }
+
+def field_sub(a: U16, b: U16) -> U16 { field_reduce_once(a - b + Q) }
+
+# Reduces a value a < 2q² using Barrett reduction, to avoid potentially
+# variable-time division.
+def field_reduce(a: U32) -> U16 {
+  quotient = ((a.as_u64 * BARRETT_MULTIPLIER) >> BARRETT_SHIFT).as_u32
+  field_reduce_once((a - quotient * Q).as_u16)
+}
+
+def field_mul(a: U16, b: U16) -> U16 { field_reduce(a.as_u32 * b.as_u32) }
+
+# a * (b - c). Fused to save a field_reduce_once after the subtraction.
+def field_mul_sub(a: U16, b: U16, c: U16) -> U16 {
+  field_reduce(a.as_u32 * (b - c + Q).as_u32)
+}
+
+# a * b + c * d. Fused to save a field_reduce_once and a field_reduce.
+def field_add_mul(a: U16, b: U16, c: U16, d: U16) -> U16 {
+  field_reduce(a.as_u32 * b.as_u32 + c.as_u32 * d.as_u32)
+}
+
+# Maps a field element uniformly to the range 0 to 2ᵈ-1, according to
+# FIPS 203, Definition 4.7.
+def compress(x: U16, d: Int) -> U16 {
+  # We want to compute (x * 2ᵈ) / q, rounded to nearest integer, with 1/2
+  # rounding up (see FIPS 203, Section 2.3).
+
+  # Barrett reduction produces a quotient and a remainder in the range
+  # [0, 2q), such that dividend = quotient * q + remainder.
+  dividend = x.as_u32 << d
+  quotient = ((dividend.as_u64 * BARRETT_MULTIPLIER) >> BARRETT_SHIFT).as_u32
+  remainder = dividend - quotient * Q
+
+  # Since the remainder is in the range [0, 2q), not [0, q), we need to
+  # portion it into three spans for rounding.
+  #
+  #     [ 0,       q/2     ) -> round to 0
+  #     [ q/2,     q + q/2 ) -> round to 1
+  #     [ q + q/2, 2q      ) -> round to 2
+  #
+  # We can convert that to the following logic: add 1 if remainder > q/2,
+  # then add 1 again if remainder > q + q/2.
+  #
+  # Note that if remainder > x, then ⌊x⌋ - remainder underflows, and the top
+  # bit of the difference will be set.
+  half: U32 = Q / 2
+  three_halves: U32 = Q + Q / 2
+  quotient += ((half - remainder) >> 31) & 1
+  quotient += ((three_halves - remainder) >> 31) & 1
+
+  # quotient might have overflowed at this point, so reduce it by masking.
+  one: U32 = 1
+  mask = (one << d) - 1
+  (quotient & mask).as_u16
+}
+
+# Maps a number y between 0 and 2ᵈ-1 uniformly to the full range of field
+# elements, according to FIPS 203, Definition 4.8.
+def decompress(y: U16, d: Int) -> U16 {
+  # We want to compute (y * q) / 2ᵈ, rounded to nearest integer, with 1/2
+  # rounding up (see FIPS 203, Section 2.3).
+  dividend = y.as_u32 * Q
+  quotient = dividend >> d # (y * q) / 2ᵈ
+
+  # The d'th least-significant bit of the dividend (the most significant
+  # bit of the remainder) is 1 for the top half of the values that divide
+  # to the same quotient, which are the ones that round up.
+  quotient += (dividend >> (d - 1)) & 1
+
+  # quotient is at most (2¹¹-1) * q / 2¹¹ + 1 = 3328, so it didn't overflow.
+  quotient.as_u16
+}
+
+# A zero polynomial.
+def new_poly -> [U16] { [0.as_u16; N] }
+
+# a + b, as a new polynomial (Go's polyAdd).
+def poly_add(a: [U16], b: [U16]) -> [U16] {
+  s = new_poly()
+  i = 0
+  while i < N {
+    s[i] = field_add(a[i], b[i])
+    i += 1
+  }
+  s
+}
+
+# a - b, as a new polynomial (Go's polySub).
+def poly_sub(a: [U16], b: [U16]) -> [U16] {
+  s = new_poly()
+  i = 0
+  while i < N {
+    s[i] = field_sub(a[i], b[i])
+    i += 1
+  }
+  s
+}
+
+# a += b, in place (Go's `a = polyAdd(a, b)`).
+def poly_add_to(a: [U16], b: [U16]) {
+  s = a
+  i = 0
+  while i < N {
+    s[i] = field_add(s[i], b[i])
+    i += 1
+  }
+  nil
+}
+
+# Writes the 384-byte encoding of f to dst[0...384].
+#
+# It implements ByteEncode₁₂, according to FIPS 203, Algorithm 5.
+def poly_byte_encode(dst: [Byte], f: [U16]) {
+  b = dst
+  i = 0
+  o = 0
+  while i < N {
+    x = f[i].as_u32 | (f[i + 1].as_u32 << 12)
+    b[o] = x.as_u8
+    b[o + 1] = (x >> 8).as_u8
+    b[o + 2] = (x >> 16).as_u8
+    o += 3
+    i += 2
+  }
+  nil
+}
+
+# Decodes the 384-byte encoding of a polynomial into f, checking that all
+# the coefficients are properly reduced (the "Modulus check" step of ML-KEM
+# Encapsulation). Returns false (leaving f partly written) if b has the
+# wrong length or a coefficient isn't reduced; Go returns the errors
+# "mlkem: invalid encoding length" and "mlkem: invalid polynomial encoding",
+# which the callers turn into the latter.
+#
+# It implements ByteDecode₁₂, according to FIPS 203, Algorithm 6.
+def poly_byte_decode(f: [U16], b: [Byte]) -> Bool {
+  return false if b.size != ENCODING_SIZE12
+  out = f
+  mask12: U32 = 0b1111_1111_1111
+  i = 0
+  o = 0
+  while i < N {
+    d = b[o].as_u32 | (b[o + 1].as_u32 << 8) | (b[o + 2].as_u32 << 16)
+    if x = field_check_reduced((d & mask12).as_u16) {
+      out[i] = x
+    } else {
+      return false
+    }
+    if x = field_check_reduced((d >> 12).as_u16) {
+      out[i + 1] = x
+    } else {
+      return false
+    }
+    o += 3
+    i += 2
+  }
+  true
+}
+
+# Writes a 32-byte encoding of a ring element to dst[0...32], compressing
+# one coefficient per bit.
+#
+# It implements Compress₁, according to FIPS 203, Definition 4.7, followed
+# by ByteEncode₁, according to FIPS 203, Algorithm 5.
+def ring_compress_and_encode1(dst: [Byte], f: [U16]) {
+  b = dst
+  i = 0
+  while i < ENCODING_SIZE1 {
+    b[i] = 0
+    i += 1
+  }
+  i = 0
+  while i < N {
+    b[i / 8] = b[i / 8] | (compress(f[i], 1) << (i % 8)).as_u8
+    i += 1
+  }
+  nil
+}
+
+# Decodes a 32-byte slice to a ring element where each bit is mapped to 0
+# or ⌈q/2⌋.
+#
+# It implements ByteDecode₁, according to FIPS 203, Algorithm 6, followed
+# by Decompress₁, according to FIPS 203, Definition 4.8.
+def ring_decode_and_decompress1(b: [Byte]) -> [U16] {
+  f = new_poly()
+  half_q: U16 = (Q + 1) / 2 # ⌈q/2⌋, rounded up per FIPS 203, Section 2.3
+  i = 0
+  while i < N {
+    b_i = ((b[i / 8] >> (i % 8)) & 1).as_u16
+    f[i] = b_i * half_q # 0 decompresses to 0, and 1 to ⌈q/2⌋
+    i += 1
+  }
+  f
+}
+
+# Writes a 128-byte encoding of a ring element to dst[0...128], compressing
+# two coefficients per byte.
+#
+# It implements Compress₄, according to FIPS 203, Definition 4.7, followed
+# by ByteEncode₄, according to FIPS 203, Algorithm 5.
+def ring_compress_and_encode4(dst: [Byte], f: [U16]) {
+  b = dst
+  i = 0
+  while i < N {
+    b[i / 2] = (compress(f[i], 4) | (compress(f[i + 1], 4) << 4)).as_u8
+    i += 2
+  }
+  nil
+}
+
+# Decodes a 128-byte encoding of a ring element where each four bits are
+# mapped to an equidistant distribution.
+#
+# It implements ByteDecode₄, according to FIPS 203, Algorithm 6, followed
+# by Decompress₄, according to FIPS 203, Definition 4.8.
+def ring_decode_and_decompress4(b: [Byte]) -> [U16] {
+  f = new_poly()
+  i = 0
+  while i < N {
+    f[i] = decompress((b[i / 2] & 0b1111).as_u16, 4)
+    f[i + 1] = decompress((b[i / 2] >> 4).as_u16, 4)
+    i += 2
+  }
+  f
+}
+
+# Writes a 320-byte encoding of a ring element to dst[0...320], compressing
+# four coefficients per five bytes.
+#
+# It implements Compress₁₀, according to FIPS 203, Definition 4.7, followed
+# by ByteEncode₁₀, according to FIPS 203, Algorithm 5.
+def ring_compress_and_encode10(dst: [Byte], f: [U16]) {
+  b = dst
+  o = 0
+  i = 0
+  while i < N {
+    x = compress(f[i], 10).as_u64
+    x = x | (compress(f[i + 1], 10).as_u64 << 10)
+    x = x | (compress(f[i + 2], 10).as_u64 << 20)
+    x = x | (compress(f[i + 3], 10).as_u64 << 30)
+    b[o] = x.as_u8
+    b[o + 1] = (x >> 8).as_u8
+    b[o + 2] = (x >> 16).as_u8
+    b[o + 3] = (x >> 24).as_u8
+    b[o + 4] = (x >> 32).as_u8
+    o += 5
+    i += 4
+  }
+  nil
+}
+
+# Decodes a 320-byte encoding of a ring element where each ten bits are
+# mapped to an equidistant distribution.
+#
+# It implements ByteDecode₁₀, according to FIPS 203, Algorithm 6, followed
+# by Decompress₁₀, according to FIPS 203, Definition 4.8.
+def ring_decode_and_decompress10(b: [Byte]) -> [U16] {
+  f = new_poly()
+  m10: U64 = 0b11_1111_1111
+  o = 0
+  i = 0
+  while i < N {
+    x = b[o].as_u64 | (b[o + 1].as_u64 << 8) | (b[o + 2].as_u64 << 16) | (b[o + 3].as_u64 << 24) |
+    (b[o + 4].as_u64 << 32)
+    o += 5
+    f[i] = decompress((x & m10).as_u16, 10)
+    f[i + 1] = decompress(((x >> 10) & m10).as_u16, 10)
+    f[i + 2] = decompress(((x >> 20) & m10).as_u16, 10)
+    f[i + 3] = decompress(((x >> 30) & m10).as_u16, 10)
+    i += 4
+  }
+  f
+}
+
+# Writes an encoding of a ring element to dst[0...32*d], compressing each
+# coefficient to d bits.
+#
+# It implements Compress, according to FIPS 203, Definition 4.7, followed
+# by ByteEncode, according to FIPS 203, Algorithm 5.
+def ring_compress_and_encode(dst: [Byte], f: [U16], d: Int) {
+  s = dst
+  o = 0
+  b: Byte = 0
+  b_idx = 0
+  i = 0
+  while i < N {
+    c = compress(f[i], d)
+    c_idx = 0
+    while c_idx < d {
+      b = b | ((c >> c_idx).as_u8 << b_idx)
+      bits = 8 - b_idx
+      bits = d - c_idx if d - c_idx < bits
+      b_idx += bits
+      c_idx += bits
+      if b_idx == 8 {
+        s[o] = b
+        o += 1
+        b = 0
+        b_idx = 0
+      }
+    }
+    i += 1
+  }
+  panic("mlkem: internal error: bitsFilled != 0") if b_idx != 0
+  nil
+}
+
+# Decodes an encoding of a ring element where each d bits are mapped to an
+# equidistant distribution. b must be 32*d bytes long.
+#
+# It implements ByteDecode, according to FIPS 203, Algorithm 6, followed by
+# Decompress, according to FIPS 203, Definition 4.8.
+def ring_decode_and_decompress(b: [Byte], d: Int) -> [U16] {
+  f = new_poly()
+  one: U16 = 1
+  mask = (one << d) - 1
+  o = 0
+  b_idx = 0
+  i = 0
+  while i < N {
+    c: U16 = 0
+    c_idx = 0
+    while c_idx < d {
+      c = c | ((b[o] >> b_idx).as_u16 << c_idx)
+      c = c & mask
+      bits = 8 - b_idx
+      bits = d - c_idx if d - c_idx < bits
+      b_idx += bits
+      c_idx += bits
+      if b_idx == 8 {
+        o += 1
+        b_idx = 0
+      }
+    }
+    f[i] = decompress(c, d)
+    i += 1
+  }
+  panic("mlkem: internal error: leftover bytes") if o != b.size
+  f
+}
+
+# Writes a 160-byte encoding of a ring element to dst, compressing eight
+# coefficients per five bytes (Compress₅ and ByteEncode₅).
+def ring_compress_and_encode5(dst: [Byte], f: [U16]) { ring_compress_and_encode(dst, f, 5) }
+
+# Decodes a 160-byte encoding (ByteDecode₅ and Decompress₅).
+def ring_decode_and_decompress5(b: [Byte]) -> [U16] { ring_decode_and_decompress(b, 5) }
+
+# Writes a 352-byte encoding of a ring element to dst, compressing eight
+# coefficients per eleven bytes (Compress₁₁ and ByteEncode₁₁).
+def ring_compress_and_encode11(dst: [Byte], f: [U16]) { ring_compress_and_encode(dst, f, 11) }
+
+# Decodes a 352-byte encoding (ByteDecode₁₁ and Decompress₁₁).
+def ring_decode_and_decompress11(b: [Byte]) -> [U16] { ring_decode_and_decompress(b, 11) }
+
+# Draws a ring element from the special Dη distribution given a stream of
+# random bytes generated by the PRF function, according to FIPS 203,
+# Algorithm 8 and Definition 4.3.
+def sample_poly_cbd(s: [Byte], b: Byte) -> [U16] {
+  prf = sha3.new_shake256()
+  prf.write!(s)
+  prf.write!([b])
+  bb = [0.as_u8; 64 * 2] # η = 2
+  prf.read!(bb)
+
+  # SamplePolyCBD simply draws four (2η) bits for each coefficient, and
+  # adds the first two and subtracts the last two.
+  f = new_poly()
+  i = 0
+  while i < N {
+    x = bb[i / 2]
+    b_7 = x >> 7
+    b_6 = (x >> 6) & 1
+    b_5 = (x >> 5) & 1
+    b_4 = (x >> 4) & 1
+    b_3 = (x >> 3) & 1
+    b_2 = (x >> 2) & 1
+    b_1 = (x >> 1) & 1
+    b_0 = x & 1
+    f[i] = field_sub((b_0 + b_1).as_u16, (b_2 + b_3).as_u16)
+    f[i + 1] = field_sub((b_4 + b_5).as_u16, (b_6 + b_7).as_u16)
+    i += 2
+  }
+  f
+}
+
+# The values ζ^2BitRev7(i)+1 mod q for each index i, according to FIPS 203,
+# Appendix A (with negative values reduced to positive).
+GAMMAS: [U16; 128] = [
+  17, 3312, 2761, 568, 583, 2746, 2649, 680, 1637, 1692, 723, 2606, 2288, 1041, 1100, 2229, 1409, 1920, 2662, 667,
+  3281, 48, 233, 3096, 756, 2573, 2156, 1173, 3015, 314, 3050, 279, 1703, 1626, 1651, 1678, 2789, 540, 1789, 1540,
+  1847, 1482, 952, 2377, 1461, 1868, 2687, 642, 939, 2390, 2308, 1021, 2437, 892, 2388, 941, 733, 2596, 2337, 992,
+  268, 3061, 641, 2688, 1584, 1745, 2298, 1031, 2037, 1292, 3220, 109, 375, 2954, 2549, 780, 2090, 1239, 1645, 1684,
+  1063, 2266, 319, 3010, 2773, 556, 757, 2572, 2099, 1230, 561, 2768, 2466, 863, 2594, 735, 2804, 525, 1092, 2237,
+  403, 2926, 1026, 2303, 1143, 2186, 2150, 1179, 2775, 554, 886, 2443, 1722, 1607, 1212, 2117, 1874, 1455, 1029,
+  2300, 2110, 1219, 2935, 394, 885, 2444, 2154, 1175
+]
+
+# acc += f ◦ g: multiplies two NTT elements and adds the product to acc, in
+# place (Go's `acc = polyAdd(acc, nttMul(f, g))`, fused to avoid a
+# temporary polynomial; the result is the same reduced value).
+#
+# It implements MultiplyNTTs, according to FIPS 203, Algorithm 11.
+def ntt_mul_add_to(acc: [U16], f: [U16], g: [U16]) {
+  h = acc
+  i = 0
+  while i < N {
+    a0 = f[i]
+    a1 = f[i + 1]
+    b0 = g[i]
+    b1 = g[i + 1]
+    h[i] = field_add(h[i], field_add_mul(a0, b0, field_mul(a1, b1), GAMMAS[i / 2]))
+    h[i + 1] = field_add(h[i + 1], field_add_mul(a0, b1, a1, b0))
+    i += 2
+  }
+  nil
+}
+
+# f ◦ g, as a new polynomial (Go's nttMul).
+def ntt_mul(f: [U16], g: [U16]) -> [U16] {
+  h = new_poly()
+  i = 0
+  while i < N {
+    a0 = f[i]
+    a1 = f[i + 1]
+    b0 = g[i]
+    b1 = g[i + 1]
+    h[i] = field_add_mul(a0, b0, field_mul(a1, b1), GAMMAS[i / 2])
+    h[i + 1] = field_add_mul(a0, b1, a1, b0)
+    i += 2
+  }
+  h
+}
+
+# The values ζ^BitRev7(k) mod q for each index k, according to FIPS 203,
+# Appendix A.
+ZETAS: [U16; 128] = [
+  1, 1729, 2580, 3289, 2642, 630, 1897, 848, 1062, 1919, 193, 797, 2786, 3260, 569, 1746, 296, 2447, 1339, 1476,
+  3046, 56, 2240, 1333, 1426, 2094, 535, 2882, 2393, 2879, 1974, 821, 289, 331, 3253, 1756, 1197, 2304, 2277, 2055,
+  650, 1977, 2513, 632, 2865, 33, 1320, 1915, 2319, 1435, 807, 452, 1438, 2868, 1534, 2402, 2647, 2617, 1481, 648,
+  2474, 3110, 1227, 910, 17, 2761, 583, 2649, 1637, 723, 2288, 1100, 1409, 2662, 3281, 233, 756, 2156, 3015, 3050,
+  1703, 1651, 2789, 1789, 1847, 952, 1461, 2687, 939, 2308, 2437, 2388, 733, 2337, 268, 641, 1584, 2298, 2037, 3220,
+  375, 2549, 2090, 1645, 1063, 319, 2773, 757, 2099, 561, 2466, 2594, 2804, 1092, 403, 1026, 1143, 2150, 2775, 886,
+  1722, 1212, 1874, 1029, 2110, 2935, 885, 2154
+]
+
+# Maps a ring element to its NTT representation, in place.
+#
+# It implements NTT, according to FIPS 203, Algorithm 9.
+def ntt(f: [U16]) {
+  a = f
+  k = 1
+  len = 128
+  while len >= 2 {
+    start = 0
+    while start < N {
+      zeta = ZETAS[k]
+      k += 1
+      j = start
+      while j < start + len {
+        t = field_mul(zeta, a[j + len])
+        a[j + len] = field_sub(a[j], t)
+        a[j] = field_add(a[j], t)
+        j += 1
+      }
+      start += 2 * len
+    }
+    len /= 2
+  }
+  nil
+}
+
+# Maps an NTT element back to the ring element it represents, in place.
+#
+# It implements NTT⁻¹, according to FIPS 203, Algorithm 10.
+def inverse_ntt(f: [U16]) {
+  a = f
+  k = 127
+  len = 2
+  while len <= 128 {
+    start = 0
+    while start < N {
+      zeta = ZETAS[k]
+      k -= 1
+      j = start
+      while j < start + len {
+        t = a[j]
+        a[j] = field_add(t, a[j + len])
+        a[j + len] = field_mul_sub(zeta, a[j + len], t)
+        j += 1
+      }
+      start += 2 * len
+    }
+    len *= 2
+  }
+  i = 0
+  while i < N {
+    a[i] = field_mul(a[i], 3303) # 3303 = 128⁻¹ mod q
+    i += 1
+  }
+  nil
+}
+
+# Draws a uniformly random NTT element into a[0...256] from a stream of
+# uniformly random bytes generated by the XOF function, according to FIPS
+# 203, Algorithm 7.
+def sample_ntt(a: [U16], rho: [Byte], ii: Byte, jj: Byte) {
+  xof = sha3.new_shake128()
+  xof.write!(rho)
+  xof.write!([ii, jj])
+
+  # SampleNTT essentially draws 12 bits at a time from r, interprets them
+  # in little-endian, and rejects values higher than q, until it drew 256
+  # values. (The rejection rate is approximately 19%.)
+  #
+  # To do this from a bytes stream, it draws three bytes at a time, and
+  # splits them into two uint16 appropriately masked.
+  #
+  #               r₀              r₁              r₂
+  #       |- - - - - - - -|- - - - - - - -|- - - - - - - -|
+  #
+  #               Uint16(r₀ || r₁)
+  #       |- - - - - - - - - - - - - - - -|
+  #       |- - - - - - - - - - - -|
+  #                   d₁
+  #
+  #                                Uint16(r₁ || r₂)
+  #                       |- - - - - - - - - - - - - - - -|
+  #                               |- - - - - - - - - - - -|
+  #                                           d₂
+  #
+  # Note that in little-endian, the rightmost bits are the most significant
+  # bits (dropped with a mask) and the leftmost bits are the least
+  # significant bits (dropped with a right shift).
+  #
+  # Go reads 24 bytes at a time; this reads a whole SHAKE128 block (168
+  # bytes, a multiple of 3), which consumes the same stream the same way.
+  out = a
+  buf = [0.as_u8; 168]
+  off = buf.size
+  j = 0
+  while true {
+    if off >= buf.size {
+      xof.read!(buf)
+      off = 0
+    }
+    d1 = (buf[off].as_u16 | (buf[off + 1].as_u16 << 8)) & 0b1111_1111_1111
+    d2 = (buf[off + 1].as_u16 | (buf[off + 2].as_u16 << 8)) >> 4
+    off += 3
+    if d1 < Q {
+      out[j] = d1
+      j += 1
+    }
+    break if j >= N
+    if d2 < Q {
+      out[j] = d2
+      j += 1
+    }
+    break if j >= N
+  }
+  nil
+}

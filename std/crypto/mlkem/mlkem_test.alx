@@ -1,0 +1,372 @@
+# Go's crypto/mlkem/mlkem_test.go and example_test.go.
+
+import "crypto"
+import "crypto/sha3"
+import "encoding/hex"
+
+# Go's testRoundTrip, for one parameter set.
+def check_round_trip(dk: crypto.Decapsulator, dk1: crypto.Decapsulator, dk2: crypto.Decapsulator, ek1: crypto.Encapsulator) -> ~Unit {
+  ek = dk.encapsulator
+  ke, c = ek.encapsulate
+  kd = ~dk.decapsulate(c)
+  assert_eq ke, kd
+
+  assert_eq ek.bytes, ek1.bytes
+  ke1, c1 = ek1.encapsulate
+  kd1 = ~dk1.decapsulate(c1)
+  assert_eq ke1, kd1
+
+  assert dk.encapsulator.bytes != dk2.encapsulator.bytes, "two generated keys are equal"
+
+  ke2, c2 = dk.encapsulator.encapsulate
+  assert c != c2, "two encapsulations gave the same ciphertext"
+  assert ke != ke2, "two encapsulations gave the same key"
+}
+
+test "RoundTrip/768" {
+  dk = generate_key768()
+  ek1 = ~new_encapsulation_key768(dk.encapsulation_key.bytes)
+  dk1 = ~new_decapsulation_key768(dk.bytes)
+  assert_eq dk.bytes, dk1.bytes
+  dk2 = generate_key768()
+  assert dk.bytes != dk2.bytes, "two generated seeds are equal"
+  ~check_round_trip(dk, dk1, dk2, ek1)
+}
+
+test "RoundTrip/1024" {
+  dk = generate_key1024()
+  ek1 = ~new_encapsulation_key1024(dk.encapsulation_key.bytes)
+  dk1 = ~new_decapsulation_key1024(dk.bytes)
+  assert_eq dk.bytes, dk1.bytes
+  dk2 = generate_key1024()
+  assert dk.bytes != dk2.bytes, "two generated seeds are equal"
+  ~check_round_trip(dk, dk1, dk2, ek1)
+}
+
+# Go's testBadLengths: every shorter length and up to 100 bytes longer fail.
+def check_bad_lengths(dk_bytes: [Byte], ek_bytes: [Byte], c: [Byte], new_dk: ([Byte]) -> Bool, new_ek: ([Byte]) -> Bool, decaps: ([Byte]) -> Bool) {
+  i = 0
+  while i < dk_bytes.size - 1 {
+    assert !new_dk(dk_bytes[0...i]), "expected error for dk length #{i}"
+    i += 1
+  }
+  dk_long = dk_bytes + []
+  i = 0
+  while i < 100 {
+    dk_long << 0
+    assert !new_dk(dk_long), "expected error for dk length #{dk_long.size}"
+    i += 1
+  }
+
+  i = 0
+  while i < ek_bytes.size - 1 {
+    assert !new_ek(ek_bytes[0...i]), "expected error for ek length #{i}"
+    i += 1
+  }
+  ek_long = ek_bytes + []
+  i = 0
+  while i < 100 {
+    ek_long << 0
+    assert !new_ek(ek_long), "expected error for ek length #{ek_long.size}"
+    i += 1
+  }
+
+  i = 0
+  while i < c.size - 1 {
+    assert !decaps(c[0...i]), "expected error for c length #{i}"
+    i += 1
+  }
+  c_long = c + []
+  i = 0
+  while i < 100 {
+    c_long << 0
+    assert !decaps(c_long), "expected error for c length #{c_long.size}"
+    i += 1
+  }
+  nil
+}
+
+test "BadLengths/768" {
+  dk = generate_key768()
+  ek = dk.encapsulation_key
+  _, c = ek.encapsulate
+  check_bad_lengths(dk.bytes, ek.bytes, c, ->(b: [Byte]) -> Bool { new_decapsulation_key768(b).ok? },
+    ->(b: [Byte]) -> Bool { new_encapsulation_key768(b).ok? }, ->(b: [Byte]) -> Bool { dk.decapsulate(b).ok? })
+  # The right lengths work.
+  assert new_decapsulation_key768(dk.bytes).ok?, "dk"
+  assert new_encapsulation_key768(ek.bytes).ok?, "ek"
+  assert dk.decapsulate(c).ok?, "c"
+}
+
+test "BadLengths/1024" {
+  dk = generate_key1024()
+  ek = dk.encapsulation_key
+  _, c = ek.encapsulate
+  check_bad_lengths(dk.bytes, ek.bytes, c, ->(b: [Byte]) -> Bool { new_decapsulation_key1024(b).ok? },
+    ->(b: [Byte]) -> Bool { new_encapsulation_key1024(b).ok? }, ->(b: [Byte]) -> Bool { dk.decapsulate(b).ok? })
+  assert new_decapsulation_key1024(dk.bytes).ok?, "dk"
+  assert new_encapsulation_key1024(ek.bytes).ok?, "ek"
+  assert dk.decapsulate(c).ok?, "c"
+}
+
+# Go's TestAccumulated: n random vectors (from a SHAKE128 stream) hashed
+# into one SHAKE128 output, to avoid checking in 150MB of test vectors.
+def accumulated(n: Int) -> ~Str {
+  s = sha3.new_shake128()
+  o = sha3.new_shake128()
+  seed = [0.as_u8; SEED_SIZE]
+  msg = [0.as_u8; 32]
+  ct1 = [0.as_u8; CIPHERTEXT_SIZE768]
+
+  i = 0
+  while i < n {
+    s.read!(seed)
+    dk = ~new_decapsulation_key768(seed)
+    ek = dk.encapsulation_key
+    ~o.write!(ek.bytes)
+
+    s.read!(msg)
+    k, ct = ~encapsulate768(ek, msg)
+    ~o.write!(ct)
+    ~o.write!(k)
+
+    kk = ~dk.decapsulate(ct)
+    assert_eq kk, k
+
+    s.read!(ct1)
+    k1 = ~dk.decapsulate(ct1)
+    ~o.write!(k1)
+    i += 1
+  }
+  out = [0.as_u8; 32]
+  o.read!(out)
+  hex.encode_to_string(out)
+}
+
+# Go's -short count.
+test "Accumulated/100" {
+  assert_eq ~accumulated(100), "1114b1b6699ed191734fa339376afa7e285c9e6acf6ff0177d346696ce564415"
+}
+
+# Go's default count.
+test "Accumulated/10000" {
+  assert_eq ~accumulated(10000), "8a518cc63da366322a8e7a818c7a0d63483cb3528d34a4cf42f35d5ad73f22fc"
+}
+
+test "ConstantSizes" {
+  assert_eq SHARED_KEY_SIZE, 32
+  assert_eq SEED_SIZE, 64
+  assert_eq CIPHERTEXT_SIZE768, K768 * ENCODING_SIZE10 + ENCODING_SIZE4
+  assert_eq ENCAPSULATION_KEY_SIZE768, K768 * ENCODING_SIZE12 + 32
+  assert_eq DECAPSULATION_KEY_SIZE768, K768 * ENCODING_SIZE12 + ENCAPSULATION_KEY_SIZE768 + 32 + 32
+  assert_eq CIPHERTEXT_SIZE1024, K1024 * ENCODING_SIZE11 + ENCODING_SIZE5
+  assert_eq ENCAPSULATION_KEY_SIZE1024, K1024 * ENCODING_SIZE12 + 32
+  assert_eq DECAPSULATION_KEY_SIZE1024, K1024 * ENCODING_SIZE12 + ENCAPSULATION_KEY_SIZE1024 + 32 + 32
+  dk = generate_key768()
+  assert_eq dk.bytes.size, SEED_SIZE
+  assert_eq dk.encapsulation_key.bytes.size, ENCAPSULATION_KEY_SIZE768
+  k, c = dk.encapsulation_key.encapsulate
+  assert_eq k.size, SHARED_KEY_SIZE
+  assert_eq c.size, CIPHERTEXT_SIZE768
+  assert_eq testing_only_expanded_bytes768(dk).size, DECAPSULATION_KEY_SIZE768
+  dk2 = generate_key1024()
+  assert_eq dk2.encapsulation_key.bytes.size, ENCAPSULATION_KEY_SIZE1024
+  k2, c2 = dk2.encapsulation_key.encapsulate
+  assert_eq k2.size, SHARED_KEY_SIZE
+  assert_eq c2.size, CIPHERTEXT_SIZE1024
+  assert_eq testing_only_expanded_bytes1024(dk2).size, DECAPSULATION_KEY_SIZE1024
+}
+
+test "errors" {
+  r = new_decapsulation_key768([1.as_u8, 2])
+  assert_eq r.err.unwrap.message, "mlkem: invalid seed length"
+  r2 = new_encapsulation_key1024([])
+  assert_eq r2.err.unwrap.message, "mlkem: invalid encapsulation key length"
+  bad = [0xff.as_u8; ENCAPSULATION_KEY_SIZE768]
+  assert_eq new_encapsulation_key768(bad).err.unwrap.message, "mlkem: invalid polynomial encoding"
+  dk = generate_key768()
+  assert_eq dk.decapsulate([]).err.unwrap.message, "mlkem: invalid ciphertext length"
+  r3 = encapsulate768(dk.encapsulation_key, [0.as_u8; 31])
+  assert_eq r3.err.unwrap.message, "mlkemtest: Encapsulate768: random must be 32 bytes"
+  dk2 = generate_key1024()
+  r4 = encapsulate1024(dk2.encapsulation_key, [0.as_u8; 33])
+  assert_eq r4.err.unwrap.message, "mlkemtest: Encapsulate1024: random must be 32 bytes"
+  assert_eq testing_only_new_decapsulation_key768([]).err.unwrap.message, "mlkem: invalid NIST decapsulation key length"
+  x = testing_only_expanded_bytes768(dk)
+  x[0] = 0xff
+  x[1] = 0xff
+  assert_eq testing_only_new_decapsulation_key768(x).err.unwrap.message, "mlkem: invalid secret key encoding"
+  y = testing_only_expanded_bytes1024(dk2)
+  y[DECAPSULATION_KEY_SIZE1024 - 33] = y[DECAPSULATION_KEY_SIZE1024 - 33] ^ 1
+  assert_eq testing_only_new_decapsulation_key1024(y).err.unwrap.message, "mlkem: inconsistent H(ek) in encoded bytes"
+}
+
+# The expanded key round-trips, and a key parsed from it works (its seed
+# doesn't come back: d is random).
+test "TestingOnlyNewDecapsulationKey" {
+  dk = generate_key768()
+  x = testing_only_expanded_bytes768(dk)
+  dk1 = ~testing_only_new_decapsulation_key768(x)
+  assert_eq testing_only_expanded_bytes768(dk1), x
+  assert_eq dk1.encapsulation_key.bytes, dk.encapsulation_key.bytes
+  k, c = dk.encapsulation_key.encapsulate
+  assert_eq ~dk1.decapsulate(c), k
+  assert dk1.bytes[0...32] != dk.bytes[0...32], "d was not replaced"
+  assert_eq dk1.bytes[32...64], dk.bytes[32...64]
+
+  dk2 = generate_key1024()
+  y = testing_only_expanded_bytes1024(dk2)
+  dk3 = ~testing_only_new_decapsulation_key1024(y)
+  assert_eq testing_only_expanded_bytes1024(dk3), y
+  k2, c2 = dk3.encapsulation_key.encapsulate
+  assert_eq ~dk2.decapsulate(c2), k2
+}
+
+# Derandomized key generation is the seed expansion.
+test "GenerateKeyInternal" {
+  seed = [0.as_u8; 64]
+  i = 0
+  while i < 64 {
+    seed[i] = (i * 7 + 3).as_u8
+    i += 1
+  }
+  a = generate_key_internal768(seed[0...32], seed[32...64])
+  b = ~new_decapsulation_key768(seed)
+  assert_eq a.bytes, seed
+  assert_eq a.encapsulation_key.bytes, b.encapsulation_key.bytes
+  c = generate_key_internal1024(seed[0...32], seed[32...64])
+  d = ~new_decapsulation_key1024(seed)
+  assert_eq c.encapsulation_key.bytes, d.encapsulation_key.bytes
+}
+
+# A tampered ciphertext decapsulates (implicit rejection) to a different
+# key: SHAKE256(z || c).
+test "implicit rejection" {
+  dk = generate_key768()
+  k, c = dk.encapsulation_key.encapsulate
+  c[5] = c[5] ^ 1
+  kr = ~dk.decapsulate(c)
+  assert kr != k, "tampered ciphertext gave the shared key"
+  assert_eq kr, sha3.sum_shake256(dk.bytes[32...64] + c, 32)
+}
+
+# The interfaces of package crypto.
+def use_decapsulator(d: crypto.Decapsulator) -> ~Bool {
+  k, c = d.encapsulator.encapsulate
+  ~d.decapsulate(c) == k
+}
+
+test "crypto.Decapsulator" {
+  assert ~use_decapsulator(generate_key768()), "768"
+  assert ~use_decapsulator(generate_key1024()), "1024"
+  e: crypto.Encapsulator = generate_key768().encapsulation_key
+  assert_eq e.bytes.size, ENCAPSULATION_KEY_SIZE768
+}
+
+# Go's Example: Alice and Bob share a secret.
+def bob(encapsulation_key: [Byte]) -> ~([Byte], [Byte]) {
+  # Bob encapsulates a shared secret using the encapsulation key.
+  ek = ~new_encapsulation_key768(encapsulation_key)
+  shared_secret, ciphertext = ek.encapsulate
+  # Bob sends the ciphertext to Alice.
+  (shared_secret, ciphertext)
+}
+
+example "mlkem" {
+  # Alice generates a new key pair and sends the encapsulation key to Bob.
+  dk = generate_key768()
+  encapsulation_key = dk.encapsulation_key.bytes
+
+  # Bob uses the encapsulation key to encapsulate a shared secret, and sends
+  # back the ciphertext to Alice.
+  bob_secret, ciphertext = bob(encapsulation_key).unwrap
+
+  # Alice decapsulates the shared secret from the ciphertext.
+  shared_secret = dk.decapsulate(ciphertext).unwrap
+
+  # Alice and Bob now share a secret.
+  puts shared_secret == bob_secret
+} outputs "true\n"
+
+# The cases of the generated vec_mlkem_test.alx: [SHA3-256(ek), K,
+# SHA3-256(c), K'] for the key from seed, encapsulation with randomness m
+# and decapsulation of SHAKE128(r) (implicit rejection).
+def vec768(seed: Str, m: Str, r: Str) -> ~[Str] {
+  dk = ~new_decapsulation_key768(hx(seed))
+  ek = ~new_encapsulation_key768(dk.encapsulation_key.bytes)
+  k, c = ~encapsulate768(ek, hx(m))
+  assert_eq ~dk.decapsulate(c), k
+  kr = ~dk.decapsulate(sha3.sum_shake128(hx(r), CIPHERTEXT_SIZE768))
+  [sha(ek.bytes), hex.encode_to_string(k), sha(c), hex.encode_to_string(kr)]
+}
+
+def vec1024(seed: Str, m: Str, r: Str) -> ~[Str] {
+  dk = ~new_decapsulation_key1024(hx(seed))
+  ek = ~new_encapsulation_key1024(dk.encapsulation_key.bytes)
+  k, c = ~encapsulate1024(ek, hx(m))
+  assert_eq ~dk.decapsulate(c), k
+  kr = ~dk.decapsulate(sha3.sum_shake128(hx(r), CIPHERTEXT_SIZE1024))
+  [sha(ek.bytes), hex.encode_to_string(k), sha(c), hex.encode_to_string(kr)]
+}
+
+# Go's benchmarks (BenchmarkKeyGen, BenchmarkEncaps, BenchmarkDecaps), for
+# both parameter sets. Each runs the operation 100 times after its setup:
+# divide by 100. KeyGen is the derandomized one (as Go's); Encaps parses
+# the encapsulation key each time (as Go's).
+BENCH_N = 100
+
+bench "KeyGen768 x100" {
+  i = 0
+  while i < BENCH_N {
+    generate_key_internal768([1.as_u8; 32], [2.as_u8; 32]).encapsulation_key.bytes
+    i += 1
+  }
+}
+
+bench "KeyGen1024 x100" {
+  i = 0
+  while i < BENCH_N {
+    generate_key_internal1024([1.as_u8; 32], [2.as_u8; 32]).encapsulation_key.bytes
+    i += 1
+  }
+}
+
+bench "Encaps768 x100" {
+  ek_bytes = generate_key_internal768([1.as_u8; 32], [2.as_u8; 32]).encapsulation_key.bytes
+  i = 0
+  while i < BENCH_N {
+    ek = new_encapsulation_key768(ek_bytes).unwrap
+    ek.encapsulate
+    i += 1
+  }
+}
+
+bench "Encaps1024 x100" {
+  ek_bytes = generate_key_internal1024([1.as_u8; 32], [2.as_u8; 32]).encapsulation_key.bytes
+  i = 0
+  while i < BENCH_N {
+    ek = new_encapsulation_key1024(ek_bytes).unwrap
+    ek.encapsulate
+    i += 1
+  }
+}
+
+bench "Decaps768 x100" {
+  dk = generate_key_internal768([1.as_u8; 32], [2.as_u8; 32])
+  _, c = dk.encapsulation_key.encapsulate
+  i = 0
+  while i < BENCH_N {
+    dk.decapsulate(c).unwrap
+    i += 1
+  }
+}
+
+bench "Decaps1024 x100" {
+  dk = generate_key_internal1024([1.as_u8; 32], [2.as_u8; 32])
+  _, c = dk.encapsulation_key.encapsulate
+  i = 0
+  while i < BENCH_N {
+    dk.decapsulate(c).unwrap
+    i += 1
+  }
+}

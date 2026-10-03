@@ -1,0 +1,676 @@
+#![overflow(wrap)]
+# Package mlkem: Go's crypto/mlkem, the quantum-resistant key encapsulation
+# method ML-KEM (formerly known as Kyber), as specified in NIST FIPS 203,
+# with Go's crypto/internal/fips140/mlkem merged in (field.alx is its
+# field.go) and the derandomized entry points of crypto/mlkem/mlkemtest as
+# public test hooks. Pure alx.
+#
+# Most applications should use the ML-KEM-768 parameter set, as implemented
+# by DecapsulationKey768 and EncapsulationKey768.
+#
+#   Go                                        alx
+#   mlkem.SharedKeySize / SeedSize            SHARED_KEY_SIZE / SEED_SIZE
+#   mlkem.CiphertextSize768 / 1024            CIPHERTEXT_SIZE768 / CIPHERTEXT_SIZE1024
+#   mlkem.EncapsulationKeySize768 / 1024      ENCAPSULATION_KEY_SIZE768 / ENCAPSULATION_KEY_SIZE1024
+#   GenerateKey768() (*DK768, error)          generate_key768() -> DecapsulationKey768 (never fails)
+#   NewDecapsulationKey768(seed) (*DK, error) new_decapsulation_key768(seed) -> ~DecapsulationKey768
+#   NewEncapsulationKey768(b) (*EK, error)    new_encapsulation_key768(b) -> ~EncapsulationKey768
+#   dk.Bytes() / dk.EncapsulationKey()        dk.bytes / dk.encapsulation_key
+#   dk.Encapsulator() crypto.Encapsulator     dk.encapsulator -> crypto.Encapsulator
+#   dk.Decapsulate(c) ([]byte, error)         dk.decapsulate(c) -> ~[Byte]
+#   ek.Bytes() / ek.Encapsulate() (K, c)      ek.bytes / ek.encapsulate -> ([Byte], [Byte])
+#   (the same with 1024)
+#   mlkemtest.Encapsulate768(ek, random)      encapsulate768(ek, random) -> ~([Byte], [Byte]) (test hook)
+#   mlkemtest.Encapsulate1024(ek, random)     encapsulate1024(ek, random) -> ~([Byte], [Byte]) (test hook)
+#   fips140/mlkem.GenerateKeyInternal768(d,z) generate_key_internal768(d, z) (test hook)
+#   fips140/mlkem.TestingOnlyExpandedBytes768 testing_only_expanded_bytes768(dk) (test hook)
+#   fips140/mlkem.TestingOnlyNewDecapsulationKey768(b)
+#                                             testing_only_new_decapsulation_key768(b) (test hook)
+#   (the same with 1024)
+#
+# DecapsulationKey768/1024 are crypto.Decapsulators and EncapsulationKey768/
+# 1024 are crypto.Encapsulators (the interfaces are structural; the shapes
+# match Go's: bytes, encapsulate -> (shared key, ciphertext), encapsulator,
+# decapsulate -> ~[Byte]).
+#
+# The test hooks are what Go's own tests (and ACVP testing) use; they must
+# only be used for known-answer tests. Go keeps them out of the public API
+# (an internal package and crypto/mlkem/mlkemtest); alx has no internal
+# packages, so they are public functions of this package.
+#
+# ML-KEM-1024: Go generates mlkem1024.go from mlkem768.go by renaming
+# identifiers (generate1024.go), so the two parameter sets have separate but
+# identical code with k = 3 or 4 and the ciphertext compression (du, dv) =
+# (10, 4) or (11, 5). Here one implementation (EncKey / DecKey and the kem_*
+# and pke_* functions) takes k from the key, and the public types for each
+# parameter set wrap it. The loops over k were never unrolled in Go either,
+# so the only cost is the choice of the du/dv encoders, once per polynomial.
+#
+# Timing: all operations on secret data are constant time in Go's sense
+# (see field.alx's header): implicit rejection in decapsulate selects the
+# key with crypto/subtle.constant_time_copy, with no branch on the
+# comparison. alx compiles to C or JIT code, which doesn't promise what Go's
+# compiler does (see crypto/subtle's header).
+#
+# Differences from Go:
+#   - generate_key768/1024 return the key, not (key, error): they can't
+#     fail (Go's error is always nil). They and encapsulate read
+#     crypto/rand directly (Go reads its DRBG; Go's API takes no rand).
+#   - Keys are structs whose polynomials live in slices (shared storage), so
+#     copies of a key share them, like Go's pointers; keys are never
+#     modified after they are made.
+#   - No FIPS 140 self-test (Go's CAST on first use, cast.go) and no
+#     pairwise consistency test after key generation (Go's fips140.PCT, run
+#     only in FIPS 140 mode): alx has no FIPS 140 module. cast.go's
+#     known-answer test is a test here (mlkem_test.alx), and the PCT is the
+#     round trip the tests do. No fips140only mode check in the mlkemtest
+#     hooks (alx has none).
+#   - mlkemtest's "failed to reconstruct key" error can't happen (it would
+#     need an EncapsulationKey whose bytes don't parse), so the hooks
+#     encapsulate with the key itself.
+#   - testing_only_new_decapsulation_key768/1024 make the unused seed d
+#     with crypto/rand, as Go does with its DRBG.
+#   - Errors are MlkemError values with Go's messages.
+
+import "crypto"
+import "crypto/rand"
+import "crypto/sha3"
+import "crypto/subtle"
+
+# The size of a shared key produced by ML-KEM.
+pub SHARED_KEY_SIZE = 32
+# The size of a seed used to generate a decapsulation key.
+pub SEED_SIZE = 64
+# The size of a ciphertext produced by ML-KEM-768.
+pub CIPHERTEXT_SIZE768 = 1088
+# The size of an ML-KEM-768 encapsulation key.
+pub ENCAPSULATION_KEY_SIZE768 = 1184
+# The size of an ML-KEM-1024 ciphertext.
+pub CIPHERTEXT_SIZE1024 = 1568
+# The size of an ML-KEM-1024 encapsulation key.
+pub ENCAPSULATION_KEY_SIZE1024 = 1568
+
+# The expanded NIST encoding of a decapsulation key (Go's
+# decapsulationKeySize768/1024): k*384 + (k*384 + 32) + 32 + 32.
+DECAPSULATION_KEY_SIZE768 = 2400
+DECAPSULATION_KEY_SIZE1024 = 3168
+
+# ML-KEM-768 and ML-KEM-1024's module dimensions.
+K768 = 3
+K1024 = 4
+
+# Errors of the constructors, decapsulate and the test hooks.
+pub error MlkemError {
+  InvalidSeedLength
+  InvalidEncapsulationKeyLength
+  InvalidPolynomialEncoding
+  InvalidCiphertextLength
+  # mlkemtest's Encapsulate768/1024 with random not 32 bytes long.
+  InvalidRandomLength(name: Str)
+  # testing_only_new_decapsulation_key768/1024's errors.
+  InvalidNistKeyLength
+  InvalidSecretKeyEncoding
+  InconsistentHash
+
+  def message -> Str {
+    case self {
+      InvalidSeedLength => "mlkem: invalid seed length"
+      InvalidEncapsulationKeyLength => "mlkem: invalid encapsulation key length"
+      InvalidPolynomialEncoding => "mlkem: invalid polynomial encoding"
+      InvalidCiphertextLength => "mlkem: invalid ciphertext length"
+      InvalidRandomLength(name) => "mlkemtest: #{name}: random must be 32 bytes"
+      InvalidNistKeyLength => "mlkem: invalid NIST decapsulation key length"
+      InvalidSecretKeyEncoding => "mlkem: invalid secret key encoding"
+      InconsistentHash => "mlkem: inconsistent H(ek) in encoded bytes"
+    }
+  }
+}
+
+# ---------------------------------------------------------------------------
+# ML-KEM-768
+
+# The public key used to produce ciphertexts to be decapsulated by the
+# corresponding DecapsulationKey768.
+pub struct EncapsulationKey768 {
+  key: EncKey
+
+  # The encapsulation key as a byte slice.
+  pub def bytes -> [Byte] { key.bytes }
+
+  # A shared key and an associated ciphertext from this encapsulation key,
+  # drawing random bytes from crypto/rand. The shared key must be kept
+  # secret.
+  #
+  # For testing, derandomized encapsulation is encapsulate768.
+  pub def encapsulate -> ([Byte], [Byte]) { key.encapsulate }
+}
+
+# The secret key used to decapsulate a shared key from a ciphertext. It
+# includes various precomputed values.
+pub struct DecapsulationKey768 {
+  key: DecKey
+
+  # The decapsulation key as a 64-byte seed in the "d || z" form. The
+  # decapsulation key must be kept secret.
+  pub def bytes -> [Byte] { key.bytes }
+
+  # The shared key from a ciphertext. If the ciphertext is not the correct
+  # length, it fails. A ciphertext that is the correct length but otherwise
+  # invalid gives a shared key that does not match the sender's, according
+  # to FIPS 203. The shared key must be kept secret.
+  pub def decapsulate(ciphertext: [Byte]) -> ~[Byte] { ~key.decapsulate(ciphertext) }
+
+  # The public encapsulation key necessary to produce ciphertexts.
+  pub def encapsulation_key -> EncapsulationKey768 { EncapsulationKey768.new(key: key.ek) }
+
+  # The encapsulation key, like encapsulation_key (crypto.Decapsulator).
+  pub def encapsulator -> crypto.Encapsulator { encapsulation_key }
+}
+
+# A new decapsulation key, drawing random bytes from crypto/rand. The
+# decapsulation key must be kept secret.
+pub def generate_key768 -> DecapsulationKey768 {
+  DecapsulationKey768.new(key: generate_key(K768))
+}
+
+# Expands a decapsulation key from a 64-byte seed in the "d || z" form. The
+# seed must be uniformly random.
+pub def new_decapsulation_key768(seed: [Byte]) -> ~DecapsulationKey768<MlkemError> {
+  DecapsulationKey768.new(key: ~new_key_from_seed(K768, seed))
+}
+
+# Parses an encapsulation key from its encoded form; fails if it is not
+# valid.
+pub def new_encapsulation_key768(encapsulation_key: [Byte]) -> ~EncapsulationKey768<MlkemError> {
+  EncapsulationKey768.new(key: ~parse_ek(K768, encapsulation_key))
+}
+
+# Test hook (Go's crypto/mlkem/mlkemtest.Encapsulate768): derandomized
+# ML-KEM-768 encapsulation (ML-KEM.Encaps_internal from FIPS 203) with ek
+# and 32 bytes of randomness. Returns (shared key, ciphertext). It must only
+# be used for known-answer tests.
+pub def encapsulate768(ek: EncapsulationKey768, random: [Byte]) -> ~([Byte], [Byte])<MlkemError> {
+  fail MlkemError.InvalidRandomLength(name: "Encapsulate768") if random.size != 32
+  kem_encaps(ek.key, random)
+}
+
+# Test hook (Go's fips140/mlkem.GenerateKeyInternal768): a derandomized
+# generate_key768, from the 32-byte seeds d and z.
+pub def generate_key_internal768(d: [Byte], z: [Byte]) -> DecapsulationKey768 {
+  DecapsulationKey768.new(key: kem_key_gen(K768, d, z))
+}
+
+# Test hook (Go's fips140/mlkem.TestingOnlyExpandedBytes768): the
+# decapsulation key in the full expanded NIST encoding. Only for ACVP
+# testing; otherwise use bytes, which returns the (much smaller) seed.
+pub def testing_only_expanded_bytes768(dk: DecapsulationKey768) -> [Byte] {
+  dk.key.expanded_bytes
+}
+
+# Test hook (Go's fips140/mlkem.TestingOnlyNewDecapsulationKey768): parses
+# a decapsulation key from its expanded NIST format. `bytes` must not be
+# called on the result: it doesn't give the original seed. Only for ACVP
+# testing; otherwise use new_decapsulation_key768.
+pub def testing_only_new_decapsulation_key768(b: [Byte]) -> ~DecapsulationKey768<MlkemError> {
+  DecapsulationKey768.new(key: ~parse_expanded_dk(K768, b))
+}
+
+# ---------------------------------------------------------------------------
+# ML-KEM-1024
+
+# The public key used to produce ciphertexts to be decapsulated by the
+# corresponding DecapsulationKey1024.
+pub struct EncapsulationKey1024 {
+  key: EncKey
+
+  # The encapsulation key as a byte slice.
+  pub def bytes -> [Byte] { key.bytes }
+
+  # A shared key and an associated ciphertext from this encapsulation key,
+  # drawing random bytes from crypto/rand. The shared key must be kept
+  # secret.
+  #
+  # For testing, derandomized encapsulation is encapsulate1024.
+  pub def encapsulate -> ([Byte], [Byte]) { key.encapsulate }
+}
+
+# The secret key used to decapsulate a shared key from a ciphertext. It
+# includes various precomputed values.
+pub struct DecapsulationKey1024 {
+  key: DecKey
+
+  # The decapsulation key as a 64-byte seed in the "d || z" form. The
+  # decapsulation key must be kept secret.
+  pub def bytes -> [Byte] { key.bytes }
+
+  # The shared key from a ciphertext. If the ciphertext is not the correct
+  # length, it fails. A ciphertext that is the correct length but otherwise
+  # invalid gives a shared key that does not match the sender's, according
+  # to FIPS 203. The shared key must be kept secret.
+  pub def decapsulate(ciphertext: [Byte]) -> ~[Byte] { ~key.decapsulate(ciphertext) }
+
+  # The public encapsulation key necessary to produce ciphertexts.
+  pub def encapsulation_key -> EncapsulationKey1024 { EncapsulationKey1024.new(key: key.ek) }
+
+  # The encapsulation key, like encapsulation_key (crypto.Decapsulator).
+  pub def encapsulator -> crypto.Encapsulator { encapsulation_key }
+}
+
+# A new decapsulation key, drawing random bytes from crypto/rand. The
+# decapsulation key must be kept secret.
+pub def generate_key1024 -> DecapsulationKey1024 {
+  DecapsulationKey1024.new(key: generate_key(K1024))
+}
+
+# Expands a decapsulation key from a 64-byte seed in the "d || z" form. The
+# seed must be uniformly random.
+pub def new_decapsulation_key1024(seed: [Byte]) -> ~DecapsulationKey1024<MlkemError> {
+  DecapsulationKey1024.new(key: ~new_key_from_seed(K1024, seed))
+}
+
+# Parses an encapsulation key from its encoded form; fails if it is not
+# valid.
+pub def new_encapsulation_key1024(encapsulation_key: [Byte]) -> ~EncapsulationKey1024<MlkemError> {
+  EncapsulationKey1024.new(key: ~parse_ek(K1024, encapsulation_key))
+}
+
+# Test hook (Go's crypto/mlkem/mlkemtest.Encapsulate1024): derandomized
+# ML-KEM-1024 encapsulation (ML-KEM.Encaps_internal from FIPS 203) with ek
+# and 32 bytes of randomness. Returns (shared key, ciphertext). It must only
+# be used for known-answer tests.
+pub def encapsulate1024(ek: EncapsulationKey1024, random: [Byte]) -> ~([Byte], [Byte])<MlkemError> {
+  fail MlkemError.InvalidRandomLength(name: "Encapsulate1024") if random.size != 32
+  kem_encaps(ek.key, random)
+}
+
+# Test hook (Go's fips140/mlkem.GenerateKeyInternal1024): a derandomized
+# generate_key1024, from the 32-byte seeds d and z.
+pub def generate_key_internal1024(d: [Byte], z: [Byte]) -> DecapsulationKey1024 {
+  DecapsulationKey1024.new(key: kem_key_gen(K1024, d, z))
+}
+
+# Test hook (Go's fips140/mlkem.TestingOnlyExpandedBytes1024): the
+# decapsulation key in the full expanded NIST encoding.
+pub def testing_only_expanded_bytes1024(dk: DecapsulationKey1024) -> [Byte] {
+  dk.key.expanded_bytes
+}
+
+# Test hook (Go's fips140/mlkem.TestingOnlyNewDecapsulationKey1024): parses
+# a decapsulation key from its expanded NIST format.
+pub def testing_only_new_decapsulation_key1024(b: [Byte]) -> ~DecapsulationKey1024<MlkemError> {
+  DecapsulationKey1024.new(key: ~parse_expanded_dk(K1024, b))
+}
+
+# ---------------------------------------------------------------------------
+# The implementation, for both parameter sets (Go's mlkem768.go; mlkem1024.go
+# is the same code with k = 4).
+
+# The encapsulation key size for module dimension k.
+def ek_size(k: Int) -> Int { k * ENCODING_SIZE12 + 32 }
+
+# The ciphertext size for module dimension k.
+def ct_size(k: Int) -> Int {
+  return CIPHERTEXT_SIZE768 if k == K768
+  CIPHERTEXT_SIZE1024
+}
+
+# The expanded decapsulation key size for module dimension k.
+def dk_size(k: Int) -> Int {
+  return DECAPSULATION_KEY_SIZE768 if k == K768
+  DECAPSULATION_KEY_SIZE1024
+}
+
+# The bits per coefficient of u (du) in a ciphertext.
+def du(k: Int) -> Int {
+  return 10 if k == K768
+  11
+}
+
+# u's encoded size per polynomial: 32 * du.
+def du_size(k: Int) -> Int {
+  return ENCODING_SIZE10 if k == K768
+  ENCODING_SIZE11
+}
+
+# The parsed and expanded encapsulation key (Go's EncapsulationKey768 of
+# the internal package, with its embedded encryptionKey).
+struct EncKey {
+  # The module dimension: 3 (ML-KEM-768) or 4 (ML-KEM-1024).
+  k: Int
+  # sampleNTT seed for A.
+  rho: [Byte]
+  # H(ek).
+  h: [Byte]
+  # ByteDecode₁₂(ek[:384k]): k NTT elements.
+  t: [[U16]]
+  # A[i*k+j] = sampleNTT(ρ, j, i): k*k NTT elements.
+  a: [[U16]]
+
+  # The encoded encapsulation key.
+  def bytes -> [Byte] {
+    b = [0.as_u8; ek_size(k)]
+    i = 0
+    while i < k {
+      poly_byte_encode(b[i * ENCODING_SIZE12...(i + 1) * ENCODING_SIZE12], t[i])
+      i += 1
+    }
+    copy(b[k * ENCODING_SIZE12...b.size], rho)
+    b
+  }
+
+  # A shared key and its ciphertext, with randomness from crypto/rand.
+  def encapsulate -> ([Byte], [Byte]) {
+    m = [0.as_u8; MESSAGE_SIZE]
+    rand.read(m)
+    # The modulus check (step 2 of the encapsulation key check from FIPS
+    # 203, Section 7.2) was done by poly_byte_decode in parse_ek.
+    kem_encaps(self, m)
+  }
+}
+
+# The decapsulation key (Go's DecapsulationKey768 of the internal package,
+# with its embedded encryptionKey and decryptionKey).
+struct DecKey {
+  # Decapsulation key seed.
+  d: [Byte]
+  # Implicit rejection sampling seed.
+  z: [Byte]
+  # The encapsulation key (ρ, H(ek), t, A).
+  ek: EncKey
+  # ByteDecode₁₂(dk[:decryptionKeySize]): k NTT elements.
+  s: [[U16]]
+
+  # The 64-byte "d || z" seed.
+  def bytes -> [Byte] { d + z }
+
+  # The full expanded NIST encoding.
+  def expanded_bytes -> [Byte] {
+    k = ek.k
+    b = [0.as_u8; k * ENCODING_SIZE12]
+    i = 0
+    while i < k {
+      # ByteEncode₁₂(s)
+      poly_byte_encode(b[i * ENCODING_SIZE12...(i + 1) * ENCODING_SIZE12], s[i])
+      i += 1
+    }
+    # ByteEncode₁₂(t) || ρ || H(ek) || z
+    b + ek.bytes + ek.h + z
+  }
+
+  def decapsulate(ciphertext: [Byte]) -> ~[Byte]<MlkemError> {
+    fail MlkemError.InvalidCiphertextLength if ciphertext.size != ct_size(ek.k)
+    # The hash check (step 3 of the decapsulation input check from FIPS
+    # 203, Section 7.3) is foregone as a DecKey is always validly generated
+    # by ML-KEM.KeyGen_internal.
+    kem_decaps(self, ciphertext)
+  }
+}
+
+# A new key from crypto/rand.
+def generate_key(k: Int) -> DecKey {
+  d = [0.as_u8; 32]
+  rand.read(d)
+  z = [0.as_u8; 32]
+  rand.read(z)
+  kem_key_gen(k, d, z)
+}
+
+# A key from a "d || z" seed.
+def new_key_from_seed(k: Int, seed: [Byte]) -> ~DecKey<MlkemError> {
+  fail MlkemError.InvalidSeedLength if seed.size != SEED_SIZE
+  kem_key_gen(k, seed[0...32], seed[32...64])
+}
+
+# Parses a decapsulation key from its expanded NIST format (Go's
+# TestingOnlyNewDecapsulationKey768).
+def parse_expanded_dk(k: Int, encoded: [Byte]) -> ~DecKey<MlkemError> {
+  fail MlkemError.InvalidNistKeyLength if encoded.size != dk_size(k)
+  b = encoded
+  s: [[U16]] = []
+  i = 0
+  while i < k {
+    p = new_poly()
+    fail MlkemError.InvalidSecretKeyEncoding if !poly_byte_decode(p, b[0...ENCODING_SIZE12])
+    s << p
+    b = b[ENCODING_SIZE12...b.size]
+    i += 1
+  }
+
+  ek_bytes = b[0...ek_size(k)]
+  ek = ~parse_ek(k, ek_bytes)
+  b = b[ek_size(k)...b.size]
+
+  fail MlkemError.InconsistentHash if subtle.constant_time_compare(ek.h, b[0...32]) != 1
+  b = b[32...b.size]
+
+  z = b + []
+
+  # A random d for bytes. This is a safety mechanism that avoids returning
+  # a broken key vs a random key if bytes is called in contravention of the
+  # testing_only_new_decapsulation_key768 comment advising against it.
+  d = [0.as_u8; 32]
+  rand.read(d)
+
+  DecKey.new(d: d, z: z, ek: ek, s: s)
+}
+
+# Generates a decapsulation key.
+#
+# It implements ML-KEM.KeyGen_internal according to FIPS 203, Algorithm 16,
+# and K-PKE.KeyGen according to FIPS 203, Algorithm 13. The two are merged
+# to save copies and allocations.
+def kem_key_gen(k: Int, d: [Byte], z: [Byte]) -> DecKey {
+  g = sha3.new512()
+  g.write!(d)
+  g.write!([k.as_u8]) # Module dimension as a domain separator.
+  gg = g.sum([])
+  rho = gg[0...32]
+  sigma = gg[32...64]
+
+  a = sample_matrix(k, rho)
+
+  n: Byte = 0
+  s: [[U16]] = []
+  i = 0
+  while i < k {
+    p = sample_poly_cbd(sigma, n)
+    ntt(p)
+    s << p
+    n += 1
+    i += 1
+  }
+  t: [[U16]] = []
+  i = 0
+  while i < k {
+    # t = A ◦ s + e
+    e = sample_poly_cbd(sigma, n)
+    ntt(e)
+    n += 1
+    j = 0
+    while j < k {
+      ntt_mul_add_to(e, a[i * k + j], s[j])
+      j += 1
+    }
+    t << e
+    i += 1
+  }
+
+  # H(ek): the encoding of t and ρ, hashed.
+  h = sha3.new256()
+  h.write!(EncKey.new(k: k, rho: rho, h: [], t: t, a: a).bytes)
+  ek = EncKey.new(k: k, rho: rho, h: h.sum([]), t: t, a: a)
+  DecKey.new(d: d + [], z: z + [], ek: ek, s: s)
+}
+
+# A[i*k+j] = sampleNTT(ρ, j, i), for i, j < k.
+def sample_matrix(k: Int, rho: [Byte]) -> [[U16]] {
+  a: [[U16]] = []
+  i = 0
+  while i < k {
+    j = 0
+    while j < k {
+      p = new_poly()
+      sample_ntt(p, rho, j.as_u8, i.as_u8)
+      a << p
+      j += 1
+    }
+    i += 1
+  }
+  a
+}
+
+# A shared key and an associated ciphertext.
+#
+# It implements ML-KEM.Encaps_internal according to FIPS 203, Algorithm 17.
+def kem_encaps(ek: EncKey, m: [Byte]) -> ([Byte], [Byte]) {
+  g = sha3.new512()
+  g.write!(m)
+  g.write!(ek.h)
+  gg = g.sum([])
+  kk = gg[0...SHARED_KEY_SIZE]
+  r = gg[SHARED_KEY_SIZE...gg.size]
+  c = pke_encrypt(ek, m, r)
+  (kk, c)
+}
+
+# Parses an encryption key from its encoded form.
+#
+# It implements the initial stages of K-PKE.Encrypt according to FIPS 203,
+# Algorithm 14.
+def parse_ek(k: Int, ek_pke: [Byte]) -> ~EncKey<MlkemError> {
+  fail MlkemError.InvalidEncapsulationKeyLength if ek_pke.size != ek_size(k)
+
+  h = sha3.new256()
+  h.write!(ek_pke)
+
+  t: [[U16]] = []
+  i = 0
+  while i < k {
+    p = new_poly()
+    fail MlkemError.InvalidPolynomialEncoding if !poly_byte_decode(p, ek_pke[i * ENCODING_SIZE12...(i + 1) * ENCODING_SIZE12])
+    t << p
+    i += 1
+  }
+  rho = ek_pke[k * ENCODING_SIZE12...ek_pke.size] + []
+
+  EncKey.new(k: k, rho: rho, h: h.sum([]), t: t, a: sample_matrix(k, rho))
+}
+
+# Encrypts a plaintext message.
+#
+# It implements K-PKE.Encrypt according to FIPS 203, Algorithm 14, although
+# the computation of t and AT is done in parse_ek.
+def pke_encrypt(ex: EncKey, m: [Byte], rnd: [Byte]) -> [Byte] {
+  k = ex.k
+  n: Byte = 0
+  r: [[U16]] = []
+  i = 0
+  while i < k {
+    p = sample_poly_cbd(rnd, n)
+    ntt(p)
+    r << p
+    n += 1
+    i += 1
+  }
+  e1: [[U16]] = []
+  i = 0
+  while i < k {
+    e1 << sample_poly_cbd(rnd, n)
+    n += 1
+    i += 1
+  }
+  e2 = sample_poly_cbd(rnd, n)
+
+  c = [0.as_u8; ct_size(k)]
+  sz = du_size(k)
+  i = 0
+  while i < k {
+    # u = NTT⁻¹(AT ◦ r) + e1
+    u_hat = new_poly()
+    j = 0
+    while j < k {
+      # Note that i and j are inverted, as we need the transposed of A.
+      ntt_mul_add_to(u_hat, ex.a[j * k + i], r[j])
+      j += 1
+    }
+    inverse_ntt(u_hat)
+    poly_add_to(u_hat, e1[i])
+    dst = c[i * sz...(i + 1) * sz]
+    if k == K768 {
+      ring_compress_and_encode10(dst, u_hat)
+    } else {
+      ring_compress_and_encode11(dst, u_hat)
+    }
+    i += 1
+  }
+
+  mu = ring_decode_and_decompress1(m)
+
+  # t⊺ ◦ r
+  v = new_poly()
+  i = 0
+  while i < k {
+    ntt_mul_add_to(v, ex.t[i], r[i])
+    i += 1
+  }
+  inverse_ntt(v)
+  poly_add_to(v, e2)
+  poly_add_to(v, mu)
+
+  dst = c[k * sz...c.size]
+  if k == K768 {
+    ring_compress_and_encode4(dst, v)
+  } else {
+    ring_compress_and_encode5(dst, v)
+  }
+  c
+}
+
+# A shared key from a ciphertext of the right size.
+#
+# It implements ML-KEM.Decaps_internal according to FIPS 203, Algorithm 18.
+def kem_decaps(dk: DecKey, c: [Byte]) -> [Byte] {
+  m = pke_decrypt(dk, c)
+  g = sha3.new512()
+  g.write!(m)
+  g.write!(dk.ek.h)
+  gg = g.sum([])
+  k_prime = gg[0...SHARED_KEY_SIZE]
+  r = gg[SHARED_KEY_SIZE...gg.size]
+  j = sha3.new_shake256()
+  j.write!(dk.z)
+  j.write!(c)
+  k_out = [0.as_u8; SHARED_KEY_SIZE]
+  j.read!(k_out)
+  c1 = pke_encrypt(dk.ek, m, r)
+
+  subtle.constant_time_copy(subtle.constant_time_compare(c, c1), k_out, k_prime)
+  k_out
+}
+
+# Decrypts a ciphertext.
+#
+# It implements K-PKE.Decrypt according to FIPS 203, Algorithm 15, although
+# s is retained from kem_key_gen.
+def pke_decrypt(dx: DecKey, c: [Byte]) -> [Byte] {
+  k = dx.ek.k
+  sz = du_size(k)
+  mask = new_poly() # s⊺ ◦ NTT(u)
+  i = 0
+  while i < k {
+    b = c[sz * i...sz * (i + 1)]
+    u = if k == K768 { ring_decode_and_decompress10(b) } else { ring_decode_and_decompress11(b) }
+    ntt(u)
+    ntt_mul_add_to(mask, dx.s[i], u)
+    i += 1
+  }
+
+  b = c[sz * k...c.size]
+  v = if k == K768 { ring_decode_and_decompress4(b) } else { ring_decode_and_decompress5(b) }
+  inverse_ntt(mask)
+  w = poly_sub(v, mask)
+
+  out = [0.as_u8; MESSAGE_SIZE]
+  ring_compress_and_encode1(out, w)
+  out
+}

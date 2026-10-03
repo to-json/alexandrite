@@ -28,6 +28,19 @@ pub struct Request {
   remote_addr: Str
   # Values of the `{name}` wildcards of the pattern that matched.
   pathvals: Map[Str, Str]
+  # Server side: the request target as the client sent it (Go's
+  # RequestURI); "" on client requests.
+  request_uri: Str
+  # Go's ContentLength: the body's length; -1 unknown (written chunked);
+  # 0 with a non-empty body is unknown too (as in Go). new_request and the
+  # server set it.
+  content_length: Int
+  # Go's TransferEncoding ("chunked"), outermost first.
+  transfer_encoding: [Str]
+  # Go's Close: close the connection after this request.
+  close: Bool
+  # Trailer fields to send after a chunked body (write_request).
+  trailer: Header
 
   # The decoded value of query parameter `key` (the first one), if present.
   pub def query(key: Str) -> Str? {
@@ -73,7 +86,8 @@ pub def new_request(method: Str, url: Str, body: [Byte]) -> ~Request {
   u = ~parse_url(url)
   h = new_header
   pv: Map[Str, Str] = {}
-  Request.new(method: method, url: url, path: u.path, raw_query: u.raw_query, proto: "HTTP/1.1", host: u.host_header, header: h, body: body, remote_addr: "", pathvals: pv)
+  te: [Str] = []
+  Request.new(method: method, url: url, path: u.path, raw_query: u.raw_query, proto: "HTTP/1.1", host: u.host_header, header: h, body: body, remote_addr: "", pathvals: pv, request_uri: "", content_length: body.size, transfer_encoding: te, close: false, trailer: new_header)
 }
 
 # ---------------------------------------------------------------- Response
@@ -85,6 +99,19 @@ pub struct Response {
   proto: Str
   header: Header
   body: [Byte]
+  # Go's ContentLength: -1 unknown; 0 with a non-empty body is unknown too
+  # (Go's Response.Write probes the body). read_response sets it from the
+  # headers.
+  content_length: Int
+  # Go's TransferEncoding ("chunked").
+  transfer_encoding: [Str]
+  # Go's Close: the connection closes after this response.
+  close: Bool
+  # Trailer fields (written after a chunked body).
+  trailer: Header
+  # The method of the request this answers (Go's Response.Request.Method;
+  # "HEAD" means no body is written).
+  request_method: Str
 
   pub def body_string -> Str {
     Str.from_bytes(body)
@@ -174,6 +201,14 @@ def read_chunked(br: bufio.Reader, limit: Int) -> ~[Byte] {
   }
 }
 
+# The Transfer-Encoding codings, lower case (Go's TransferEncoding: only
+# "chunked" is supported, so it is that or nothing).
+def transfer_encodings(h: Header) -> [Str] {
+  out: [Str] = []
+  out << "chunked" if strings.contains(lower(h.get("Transfer-Encoding")), "chunked")
+  out
+}
+
 # Reads the body described by the headers; `until_eof` is for responses with
 # neither a length nor chunking (read to the end of the stream).
 def read_body(br: bufio.Reader, h: Header, until_eof: Bool) -> ~[Byte] {
@@ -247,7 +282,11 @@ def read_request(br: bufio.Reader, remote: Str) -> ~Request? {
   path = ~unescape(rawpath, false)
   body = ~read_body(br, h, false)
   pv: Map[Str, Str] = {}
-  Request.new(method: method, url: target, path: path, raw_query: query, proto: proto, host: host, header: h, body: body, remote_addr: remote, pathvals: pv)
+  te = transfer_encodings(h)
+  cl = te.size > 0 ? -1 : body.size
+  rq = Request.new(method: method, url: target, path: path, raw_query: query, proto: proto, host: host, header: h, body: body, remote_addr: remote, pathvals: pv, request_uri: target, content_length: cl, transfer_encoding: te, close: false, trailer: new_header)
+  rq.close = rq.wants_close
+  rq
 }
 
 # Reads one response from br; `head` is true for a reply to HEAD.
@@ -268,5 +307,17 @@ pub def read_response(br: bufio.Reader, head: Bool) -> ~Response {
   if !head && code >= 200 && code != 204 && code != 304 {
     body = ~read_body(br, h, true)
   }
-  Response.new(status: code, status_text: text, proto: proto, header: h, body: body)
+  te = transfer_encodings(h)
+  cl = -1
+  if te.size == 0 {
+    cls = strings.trim_space(h.get("Content-Length"))
+    if cls.size > 0 {
+      cl = strconv.atoi(cls).unwrap_or(-1)
+    } else if code < 200 || code == 204 || code == 304 {
+      cl = 0
+    }
+  }
+  conn = lower(h.get("Connection"))
+  close = proto == "HTTP/1.0" ? !has_token?(conn, "keep-alive") : has_token?(conn, "close")
+  Response.new(status: code, status_text: text, proto: proto, header: h, body: body, content_length: cl, transfer_encoding: te, close: close, trailer: new_header, request_method: head ? "HEAD" : "")
 }

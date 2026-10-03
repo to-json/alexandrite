@@ -1,0 +1,196 @@
+# Go's net/http/internal/chunked_test.go, translated.
+import "bytes"
+import "io"
+import "strings"
+
+def bufb(s: Str) -> bytes.Buffer { bytes.new_buffer_string(s) }
+
+test "chunk" {
+  b = bytes.new_buffer([])
+  w = new_chunked_writer(b)
+  w.write!("hello, ".bytes.to_a).unwrap
+  w.write!("world! 0123456789abcdef".bytes.to_a).unwrap
+  w.close!.unwrap
+  assert_eq b.to_s, "7\r\nhello, \r\n17\r\nworld! 0123456789abcdef\r\n0\r\n"
+  r = new_chunked_reader(b)
+  assert_eq Str.from_bytes(io.read_all(r).unwrap), "hello, world! 0123456789abcdef"
+}
+
+test "chunk read multiple" {
+  b = bytes.new_buffer([])
+  w = new_chunked_writer(b)
+  w.write!("foo".bytes.to_a).unwrap
+  w.write!("bar".bytes.to_a).unwrap
+  w.close!.unwrap
+  r = new_chunked_reader(b)
+  buf: [Byte] = [0; 10]
+  n = r.read!(buf).unwrap
+  assert_eq n, 6
+  assert_eq Str.from_bytes(buf[0...n]), "foobar"
+  assert_eq r.read!(buf).unwrap, 0
+  # an EOF chunk is seen even though the buffer is already full
+  r2 = new_chunked_reader(bufb("3\r\nfoo\r\n0\r\n"))
+  buf3: [Byte] = [0; 3]
+  assert_eq r2.read!(buf3).unwrap, 3
+  assert_eq Str.from_bytes(buf3), "foo"
+  assert_eq r2.read!(buf3).unwrap, 0
+}
+
+test "chunk reader at a partial read reports unexpected EOF" {
+  b = bytes.new_buffer([])
+  w = new_chunked_writer(b)
+  w.write!("aaaaaa".bytes.to_a).unwrap
+  w.write!("bbbbbbbbbbbb".bytes.to_a).unwrap
+  w.write!("cccccccccccccccccccccccc".bytes.to_a).unwrap
+  w.close!.unwrap
+  # (TestChunkReaderAllocs without the allocation count: asking for one byte
+  # more than the data gives the data; Go's ReadFull adds ErrUnexpectedEOF)
+  r = new_chunked_reader(b)
+  read_buf: [Byte] = [0; 43]
+  assert_eq io.read_full(r, read_buf).unwrap, 42
+}
+
+def phu(s: Str) -> Str {
+  r = parse_hex_uint(s.bytes.to_a)
+  return r.err.unwrap.message if r.err?
+  "#{r.unwrap}"
+}
+
+test "parse hex uint" {
+  assert strings.contains(phu("x"), "invalid byte in chunk length")
+  assert_eq phu("0000000000000000"), "0"
+  assert_eq phu("0000000000000001"), "1"
+  assert_eq phu("ffffffffffffffff"), "18446744073709551615"
+  assert strings.contains(phu("000000000000bogus"), "invalid byte in chunk length")
+  assert strings.contains(phu("00000000000000000"), "http chunk length too large")
+  assert strings.contains(phu("10000000000000000"), "http chunk length too large")
+  assert strings.contains(phu("00000000000000001"), "http chunk length too large")
+  assert strings.contains(phu(""), "empty hex number for chunk length")
+  i = 0
+  while i <= 1234 {
+    assert_eq phu(format("%x", i)), "#{i}"
+    i += 1
+  }
+}
+
+test "chunk reading ignores extensions" {
+  inp = "7;ext=\"some quoted string\"\r\nhello, \r\n17;someext\r\nworld! 0123456789abcdef\r\n0;someextension=sometoken\r\n"
+  data = io.read_all(new_chunked_reader(bufb(inp))).unwrap
+  assert_eq Str.from_bytes(data), "hello, world! 0123456789abcdef"
+}
+
+test "chunk read partial, then malformed" {
+  cr = new_chunked_reader(bufb("7\r\n1234567xx"))
+  read_buf: [Byte] = [0; 7]
+  assert_eq cr.read!(read_buf).unwrap, 7
+  assert_eq Str.from_bytes(read_buf), "1234567"
+  assert strings.contains(cr.read!(read_buf).err.unwrap.message, "malformed")
+}
+
+def is_ueof(e: Error) -> Bool {
+  case e {
+    UnexpectedEof => true
+    _ => false
+  }
+}
+
+test "incomplete chunk" {
+  valid = "4\r\nabcd\r\n5\r\nabc\r\n\r\n0\r\n"
+  i = 0
+  while i < valid.size {
+    r = new_chunked_reader(bufb(valid[0...i]))
+    res = io.read_all(r)
+    assert res.err?, "want an error for #{i}"
+    assert is_ueof(res.err.unwrap), "want unexpected EOF for #{i}: #{res.err.unwrap.message}"
+    i += 1
+  }
+  assert io.read_all(new_chunked_reader(bufb(valid))).ok?
+}
+
+struct FailState {
+  data: [Byte]
+}
+
+# Reads its data, then fails (io.MultiReader(strings.NewReader(...),
+# iotest.ErrReader(err))).
+struct FailingReader {
+  st: [FailState]
+
+  pub def read!(p: [Byte]) -> ~Int {
+    if st[0].data.size == 0 {
+      fail "chunk end read error"
+    }
+    n = copy(p, st[0].data)
+    d = st[0].data
+    self.st[0].data = d[n...d.size]
+    n
+  }
+}
+
+test "chunk end read error" {
+  st: [FailState] = [FailState.new(data: "4\r\nabcd".bytes.to_a)]
+  r = new_chunked_reader(FailingReader.new(st: st))
+  res = io.read_all(r)
+  assert_eq res.err.unwrap.message, "chunk end read error"
+}
+
+struct GenState {
+  i: Int
+  b: [Byte]
+  chunk: [Byte]
+  limit: Int
+}
+
+# Go's funcReader: `chunk` `limit` times, then "0\r\n".
+struct GenReader {
+  st: [GenState]
+
+  pub def read!(p: [Byte]) -> Int {
+    if st[0].b.size == 0 {
+      return 0 if st[0].i > st[0].limit
+      self.st[0].b = st[0].i < st[0].limit ? st[0].chunk : "0\r\n".bytes.to_a
+      self.st[0].i = st[0].i + 1
+    }
+    n = copy(p, st[0].b)
+    b = st[0].b
+    self.st[0].b = b[n...b.size]
+    n
+  }
+}
+
+def gen(chunk: [Byte], limit: Int) -> GenReader {
+  e: [Byte] = []
+  st: [GenState] = [GenState.new(i: 0, b: e, chunk: chunk, limit: limit)]
+  GenReader.new(st: st)
+}
+
+test "chunk reader too much overhead" {
+  chunk = "1;".bytes.to_a
+  i = 0
+  while i < 100 {
+    chunk << 97
+    i += 1
+  }
+  chunk = chunk + "\r\nX\r\n".bytes.to_a
+  r = new_chunked_reader(gen(chunk, 1 << 20))
+  assert io.read_all(r).err?
+}
+
+test "chunk reader byte at a time" {
+  r = new_chunked_reader(gen("1\r\nX\r\n".bytes.to_a, 1 << 16))
+  got = io.read_all(r).unwrap
+  assert_eq got.size, 1 << 16
+}
+
+test "chunk invalid inputs" {
+  for b in ["1\na\r\n0\r\n", "1\r\r\na\r\n0\r\n", "1\r\na\n0\r\n", "1;\na\r\n0\r\n"] {
+    assert io.read_all(new_chunked_reader(bufb(b))).err?, "parsed invalid #{b}"
+  }
+}
+
+test "chunk line too long" {
+  long = "1;" + strings.repeat("a", 4093) + "\r\nx\r\n0\r\n"
+  assert_eq io.read_all(new_chunked_reader(bufb(long))).err.unwrap.message, "header line too long"
+  ok = "1;" + strings.repeat("a", 4092) + "\r\nx\r\n0\r\n"
+  assert_eq Str.from_bytes(io.read_all(new_chunked_reader(bufb(ok))).unwrap), "x"
+}

@@ -1142,7 +1142,9 @@ pub fn bind_tparams(te: &TypeExpr, t: &Ty, tps: &[TParam], out: &mut HashMap<Str
         }
         (TypeExpr::App(n, args, _), t) => {
             if let Some((base, targs)) = inst_args(t) {
-                if base == *n {
+                // `pkg.Name[T]` (or `Name[T]` inside its package) names the
+                // instance `path/to/pkg.Name`.
+                if base == *n || base.ends_with(&format!("/{n}")) || (!n.contains('.') && base.ends_with(&format!(".{n}"))) {
                     for (a, x) in args.iter().zip(&targs) {
                         bind_tparams(a, x, tps, out);
                     }

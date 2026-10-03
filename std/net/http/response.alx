@@ -2,6 +2,8 @@ import "net"
 import "strings"
 import "strconv"
 import "time"
+import gopath "path"
+import nurl "net/url"
 
 # A body that outgrows this many buffered bytes switches the response to
 # chunked transfer coding (headers go out, then each write is a chunk).
@@ -199,8 +201,14 @@ pub struct ResponseWriter {
 
   def send_head!(content_length: Int) -> ~Unit {
     s = st[0].status
-    if content_length >= 0 {
-      header.set!("Content-Length", strconv.itoa(content_length)) unless bodyless?
+    if bodyless? {
+      # (Go's suppressedHeaders: no length or coding without a body, and
+      # no Content-Type on a 304)
+      header.del!("Content-Length")
+      header.del!("Transfer-Encoding")
+      header.del!("Content-Type") if s == 304
+    } else if content_length >= 0 {
+      header.set!("Content-Length", strconv.itoa(content_length))
     } else {
       header.set!("Transfer-Encoding", "chunked")
       header.del!("Content-Length")
@@ -325,18 +333,57 @@ def html_escape(s: Str) -> Str {
   x = strings.replace_all(s, "&", "&amp;")
   x = strings.replace_all(x, "<", "&lt;")
   x = strings.replace_all(x, ">", "&gt;")
-  strings.replace_all(x, "\"", "&#34;")
+  x = strings.replace_all(x, "\"", "&#34;")
+  strings.replace_all(x, "'", "&#39;")
 }
 
-# Replies with a redirect to `url` (a path or a full URL) and status `code`
-# (301, 302, 303, 307 or 308).
-pub def redirect(w: ResponseWriter, r: Request, url: Str, code: Int) {
-  w.header.set!("Location", url)
-  if r.method == "GET" || r.method == "HEAD" {
+# Bytes >= 0x80 as "%xx" (lower-case hex, Go's hexEscapeNonASCII).
+def hex_escape_non_ascii(s: Str) -> Str {
+  b = strings.new_builder
+  for c in s.bytes {
+    if c >= 0x80 {
+      b.write!("%" + strconv.format_int(c.to_i, 16))
+    } else {
+      b.write_byte!(c)
+    }
+  }
+  b.to_s
+}
+
+# Replies with a redirect to `url` and status `code` (301, 302, 303, 307
+# or 308), as Go's Redirect: a path without scheme and host is made
+# absolute against the request's path and cleaned (keeping a trailing
+# slash and the query); non-ASCII bytes are %-escaped. The Content-Type and
+# the short HTML body are set for GET/HEAD unless the handler already set a
+# Content-Type.
+pub def redirect(w: ResponseWriter, r: Request, url0: Str, code: Int) {
+  url = url0
+  pu = nurl.parse(url)
+  if pu.ok? && pu.unwrap.scheme == "" && pu.unwrap.host == "" {
+    oldpath = r.escaped_path
+    oldpath = "/" if oldpath.size == 0
+    if url.size == 0 || url[0] != 47 {
+      olddir, _ = gopath.split(oldpath)
+      url = olddir + url
+    }
+    query = ""
+    i = strings.index(url, "?")
+    if i >= 0 {
+      query = url[i...url.size]
+      url = url[0...i]
+    }
+    trailing = strings.has_suffix(url, "/")
+    url = gopath.clean(url)
+    url += "/" if trailing && !strings.has_suffix(url, "/")
+    url += query
+  }
+  had_ct = w.header.raw("Content-Type").present?
+  w.header.set!("Location", hex_escape_non_ascii(url))
+  if !had_ct && (r.method == "GET" || r.method == "HEAD") {
     w.header.set!("Content-Type", "text/html; charset=utf-8")
   }
   w.write_header!(code)
-  if r.method == "GET" {
+  if !had_ct && r.method == "GET" {
     w.write_string!("<a href=\"" + html_escape(url) + "\">" + status_text(code) + "</a>.\n\n")
   }
 }

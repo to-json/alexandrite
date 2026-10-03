@@ -1,0 +1,328 @@
+import "io"
+import "hash"
+import "encoding/hex"
+import "strings"
+
+# Go's sha3_test.go, translated; Go's internal/testhash is testhash_test.alx.
+# Go's random bytes and math/rand choices are seeded generator values (gen,
+# in vec_sha3_test.alx).
+#
+# Not translated: the "SHA3-Zero" / "SHAKE-Zero" cases (Go's zero values are
+# usable hashes; alx's aren't, see the header), TestAllocations (allocation
+# counting), TestCSHAKELargeS (a 512 MiB customization string; Go skips it
+# in -short mode too).
+
+TEST_STRING = "brekeccakkeccak koax koax"
+
+def b(s: Str) -> [Byte] { s.bytes.to_a }
+
+def digests -> [() -> SHA3] {
+  [->() -> SHA3 { new224() }, ->() -> SHA3 { new256() }, ->() -> SHA3 { new384() },
+    ->() -> SHA3 { new512() }]
+}
+
+struct ShakeCase {
+  ctor: ([Byte], [Byte]) -> SHAKE
+  algo: Str
+  custom: Str
+}
+
+def shakes -> [ShakeCase] {
+  c128 = ->(n: [Byte], s: [Byte]) -> SHAKE { new_cshake128(n, s) }
+  c256 = ->(n: [Byte], s: [Byte]) -> SHAKE { new_cshake256(n, s) }
+  [ShakeCase.new(ctor: c128, algo: "", custom: ""), ShakeCase.new(ctor: c256, algo: "", custom: ""),
+    ShakeCase.new(ctor: c128, algo: "CSHAKE128", custom: "CustomString"),
+    ShakeCase.new(ctor: c256, algo: "CSHAKE256", custom: "CustomString")]
+}
+
+def make_shake(c: ShakeCase) -> SHAKE {
+  f = c.ctor
+  f(b(c.algo), b(c.custom))
+}
+
+test "sha3 hash" {
+  for f in digests() {
+    check_hash(->() -> hash.Hash { f() })
+    check_clone(f())
+  }
+}
+
+# The Clone subtest of Go's testhash.TestHash.
+def check_clone(h: SHA3) {
+  h3 = h.clone
+  prefix = b("tmp")
+  h.write!(prefix)
+  h2 = h.clone
+  prefix_sum = h.sum([])
+  assert_eq prefix_sum, h2.sum([])
+  suffix = b("tmp2")
+  h.write!(suffix)
+  h3.write!(prefix + suffix)
+  composite = h3.sum([])
+  assert_eq h.sum([]), composite
+  assert_eq h2.sum([]), prefix_sum
+  h2.write!(suffix)
+  assert_eq h.sum([]), composite
+  assert_eq h2.sum([]), composite
+}
+
+# 0x00, 0x01, ... (Go also offsets the slice at random to vary alignment).
+def sequential_bytes(size: Int) -> [Byte] {
+  off = 3
+  out = [0.as_u8; size + off]
+  r = out[off...out.size]
+  i = 0
+  while i < size {
+    r[i] = i.as_u8
+    i += 1
+  }
+  r
+}
+
+OFFSETS: [Int; 17] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 1]
+
+test "unaligned write" {
+  buf = sequential_bytes(0x10000)
+  for df in digests() {
+    d = df()
+    d.reset!
+    d.write!(buf)
+    want = d.sum([])
+    d.reset!
+    i = 0
+    while i < buf.size {
+      for j0 in OFFSETS {
+        j = j0
+        j = buf.size - i if buf.size - i < j
+        d.write!(buf[i...i + j])
+        i += j
+      }
+    }
+    assert_eq d.sum([]), want
+  }
+  for c in shakes() {
+    want = [0.as_u8; 16]
+    got = [0.as_u8; 16]
+    d = make_shake(c)
+    d.reset!
+    d.write!(buf).unwrap
+    d.read!(want)
+    d.reset!
+    i = 0
+    while i < buf.size {
+      for j0 in OFFSETS {
+        j = j0
+        j = buf.size - i if buf.size - i < j
+        d.write!(buf[i...i + j]).unwrap
+        i += j
+      }
+    }
+    d.read!(got)
+    assert_eq got, want
+  }
+}
+
+test "append" {
+  d = new224()
+  capacity = 2
+  while capacity <= 66 {
+    buf: [Byte] = [0, 0]
+    d.reset!
+    d.write!([0xcc])
+    buf = d.sum(buf)
+    assert_eq strings.to_upper(hex.encode_to_string(buf)), "0000DF70ADC49B2E76EEE3A6931B93FA41841C3AF2CDF5B32A18B5478C39"
+    capacity += 64
+  }
+}
+
+test "append no realloc" {
+  buf: [Byte] = [0]
+  d = new224()
+  d.write!([0xcc])
+  buf = d.sum(buf)
+  assert_eq strings.to_upper(hex.encode_to_string(buf)), "00DF70ADC49B2E76EEE3A6931B93FA41841C3AF2CDF5B32A18B5478C39"
+}
+
+test "squeezing" {
+  for c in shakes() {
+    d0 = make_shake(c)
+    d0.write!(b(TEST_STRING)).unwrap
+    ref = [0.as_u8; 32]
+    d0.read!(ref)
+    d1 = make_shake(c)
+    d1.write!(b(TEST_STRING)).unwrap
+    multiple: [Byte] = []
+    k = 0
+    while k < ref.size {
+      d1.read!([])
+      one = [0.as_u8; 1]
+      d1.read!(one)
+      multiple = multiple + one
+      k += 1
+    }
+    assert_eq multiple, ref
+  }
+}
+
+test "reset" {
+  out1 = [0.as_u8; 32]
+  out2 = [0.as_u8; 32]
+  for v in shakes() {
+    f = v.ctor
+    c = f([], [0x99, 0x98])
+    c.write!(sequential_bytes(0x100)).unwrap
+    c.read!(out1)
+    c.reset!
+    c.write!(sequential_bytes(0x100)).unwrap
+    c.read!(out2)
+    assert_eq out1, out2
+  }
+}
+
+def check_cshake_accumulated(mk: ([Byte], [Byte]) -> SHAKE, rate: Int, exp: Str) {
+  rnd = mk([], [])
+  acc = mk([], [])
+  n = 0
+  while n < 200 {
+    nn = [0.as_u8; n]
+    rnd.read!(nn)
+    s = 0
+    while s < 200 {
+      ss = [0.as_u8; s]
+      rnd.read!(ss)
+      c = mk(nn, ss)
+      io.copy_n(c, rnd, 100).unwrap
+      io.copy_n(acc, c, 200).unwrap
+      c.reset!
+      io.copy_n(c, rnd, rate).unwrap
+      io.copy_n(acc, c, 200).unwrap
+      c.reset!
+      io.copy_n(c, rnd, 200).unwrap
+      io.copy_n(acc, c, 200).unwrap
+      s += 1
+    }
+    n += 1
+  }
+  out = [0.as_u8; 32]
+  acc.read!(out)
+  assert_eq hex.encode_to_string(out), exp
+}
+
+test "cshake accumulated 128" {
+  check_cshake_accumulated(->(n: [Byte], s: [Byte]) -> SHAKE { new_cshake128(n, s) }, (1600 - 256) / 8,
+    "bb14f8657c6ec5403d0b0e2ef3d3393497e9d3b1a9a9e8e6c81dbaa5fd809252")
+}
+
+test "cshake accumulated 256" {
+  check_cshake_accumulated(->(n: [Byte], s: [Byte]) -> SHAKE { new_cshake256(n, s) }, (1600 - 512) / 8,
+    "0baaf9250c6e25f0c14ea5c7f9bfde54c8a922c8276437db28f3895bdf6eeeef")
+}
+
+def check_marshal_unmarshal(h: SHA3, seed: U64) {
+  buf = gen(seed, 200)
+  n = (seed * 37 % 200).to_i
+  h.write!(buf)
+  want = h.sum([])
+  h.reset!
+  h.write!(buf[0...n])
+  st = h.marshal_binary
+  h.write!([0.as_u8; 200])
+  h.unmarshal_binary!(st).unwrap
+  h.write!(buf[n...buf.size])
+  assert_eq h.sum([]), want
+}
+
+def check_marshal_unmarshal_shake(h: SHAKE, seed: U64) {
+  buf = gen(seed, 200)
+  n = (seed * 37 % 200).to_i
+  h.write!(buf).unwrap
+  want = [0.as_u8; 32]
+  h.read!(want)
+  h.reset!
+  h.write!(buf[0...n]).unwrap
+  st = h.marshal_binary
+  h.write!([0.as_u8; 200]).unwrap
+  h.unmarshal_binary!(st).unwrap
+  h.write!(buf[n...buf.size]).unwrap
+  got = [0.as_u8; 32]
+  h.read!(got)
+  assert_eq got, want
+}
+
+test "marshal unmarshal" {
+  check_marshal_unmarshal(new224(), 1)
+  check_marshal_unmarshal(new256(), 2)
+  check_marshal_unmarshal(new384(), 3)
+  check_marshal_unmarshal(new512(), 4)
+  check_marshal_unmarshal_shake(new_shake128(), 5)
+  check_marshal_unmarshal_shake(new_shake256(), 6)
+  check_marshal_unmarshal_shake(new_cshake128(b("N"), b("S")), 7)
+  check_marshal_unmarshal_shake(new_cshake256(b("N"), b("S")), 8)
+}
+
+test "write after read" {
+  h = new_shake128()
+  h.write!(b("abc")).unwrap
+  h.read!([0.as_u8; 4])
+  r = h.write!(b("d"))
+  assert_eq "#{r.err.unwrap}", "sha3: Write after Read"
+  h.reset!
+  assert_eq h.write!(b("d")).unwrap, 1
+}
+
+test "unmarshal errors" {
+  h = new256()
+  st = h.marshal_binary
+  r = h.unmarshal_binary!(st[0...10])
+  assert_eq "#{r.err.unwrap}", "sha3: invalid hash state"
+  h1 = new224()
+  r2 = h1.unmarshal_binary!(st)
+  assert_eq "#{r2.err.unwrap}", "sha3: invalid hash state function"
+  h2 = new_legacy_keccak256()
+  r3 = h2.unmarshal_binary!(st)
+  assert_eq "#{r3.err.unwrap}", "sha3: invalid hash state identifier"
+  bad = st + []
+  bad[205] = 200
+  h3 = new256()
+  r4 = h3.unmarshal_binary!(bad)
+  assert_eq "#{r4.err.unwrap}", "sha3: invalid hash state"
+  bad[205] = 0
+  bad[206] = 2
+  h4 = new256()
+  r5 = h4.unmarshal_binary!(bad)
+  assert_eq "#{r5.err.unwrap}", "sha3: invalid hash state"
+  h5 = new_shake128()
+  r6 = h5.unmarshal_binary!(st[0...5])
+  assert_eq "#{r6.err.unwrap}", "sha3: invalid hash state"
+}
+
+test "sizes" {
+  assert_eq new224().size, 28
+  assert_eq new256().size, 32
+  assert_eq new384().size, 48
+  assert_eq new512().size, 64
+  assert_eq new224().block_size, 144
+  assert_eq new256().block_size, 136
+  assert_eq new384().block_size, 104
+  assert_eq new512().block_size, 72
+  assert_eq new_shake128().block_size, 168
+  assert_eq new_shake256().block_size, 136
+}
+
+test "xof interface" {
+  x: hash.XOF = new_shake256()
+  x.write!(b("abc")).unwrap
+  out = [0.as_u8; 8]
+  x.read!(out).unwrap
+  assert_eq out, sum_shake256(b("abc"), 8)
+}
+
+bench "sha3-256 1MB" {
+  d = new256()
+  d.write!([0x5a.as_u8; 1 << 20])
+  d.sum([])
+}
+
+bench "shake256 1MB" {
+  sum_shake256([0x5a.as_u8; 1 << 20], 64)
+}

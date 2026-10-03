@@ -298,6 +298,7 @@ AlxStr alx_str_delete(AlxStr s, AlxStr chars);
 Arr_Str alx_str_split(AlxStr s, AlxStr sep);
 AlxStr alx_str_join(Arr_Str a, AlxStr sep);
 int64_t alx_str_to_i(AlxStr s);
+int64_t alx_str_index(AlxStr s, AlxStr sub, int64_t from);
 /* Byte length of the UTF-8 character starting at byte i. */
 int64_t alx_str_charlen(AlxStr s, int64_t i);
 /* Bytes [i, i+n) as a string (n == 0: the single byte at i as an Int). */
@@ -341,7 +342,8 @@ int64_t *alx_atomic_new(int64_t v);
  * `ok` is written only on the chosen recv case (the caller presets it). */
 typedef struct { AlxChan *ch; void *buf; int64_t is_send; int64_t ok; } AlxSelCase;
 /* Run `fn(copy of env, result)` as a task: a coroutine on one of N worker
- * threads (ALX_PROCS, default the CPU count), 256 KiB of stack (ALX_TASK_STACK).
+ * threads (ALX_PROCS, default the CPU count), 8 MiB of stack address space,
+ * committed as touched (ALX_TASK_STACK, e.g. `512k`, `64m`, `1g`).
  * Blocking channel/wait calls park it. A panic in the task is caught: see
  * alx_task_wait. */
 AlxTask *alx_spawn(AlxWorker fn, const void *env, size_t in_size, size_t out_size);

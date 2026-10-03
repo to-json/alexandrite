@@ -1,0 +1,880 @@
+#![overflow(wrap)]
+# Unsigned multi-precision integers (Go's nat.go, natmul.go): a nat is a
+# [U64] of little-endian words, normalized (no leading zero words; zero is
+# the empty slice).
+#
+# Unlike Go, these functions never reuse their receiver's storage: every
+# result is a fresh slice (or a subslice of one), and no function writes
+# into its arguments. That makes Int, Rat and Float plain values whose
+# copies can share mantissa storage safely (Go needs pointers and alias
+# checks for the same). Scratch storage inside an algorithm (division,
+# Karatsuba, Montgomery) is allocated per call.
+
+KARATSUBA_THRESHOLD = 40
+BASIC_SQR_THRESHOLD = 12
+KARATSUBA_SQR_THRESHOLD = 80
+
+def nat_zero -> [U64] {
+  z: [U64] = []
+  z
+}
+
+# A fresh nat of n zero words.
+def nat_make(n: I64) -> [U64] {
+  z: [U64] = [0; n]
+  z
+}
+
+def nat_one -> [U64] { nat_set_word(1) }
+
+def nat_two -> [U64] { nat_set_word(2) }
+
+# x without its leading zero words.
+def nat_norm(x: [U64]) -> [U64] {
+  i = x.size
+  while i > 0 && x[i - 1] == 0 {
+    i -= 1
+  }
+  x[0...i]
+}
+
+def nat_set_word(x: U64) -> [U64] {
+  return nat_zero if x == 0
+  z: [U64] = [x]
+  z
+}
+
+def nat_set_u64(x: U64) -> [U64] { nat_set_word(x) }
+
+# A copy of x.
+def nat_set(x: [U64]) -> [U64] {
+  z = nat_make(x.size)
+  copy(z, x)
+  z
+}
+
+def nat_add(x: [U64], y: [U64]) -> [U64] {
+  m = x.size
+  n = y.size
+  return nat_add(y, x) if m < n
+  return nat_zero if m == 0
+  return nat_set(x) if n == 0
+  z = nat_make(m + 1)
+  c = add_vv(z[0...n], x[0...n], y[0...n])
+  if m > n {
+    c = add_vw(z[n...m], x[n...m], c)
+  }
+  z[m] = c
+  nat_norm(z)
+}
+
+# x - y; panics ("underflow") if y > x.
+def nat_sub(x: [U64], y: [U64]) -> [U64] {
+  m = x.size
+  n = y.size
+  panic("underflow") if m < n
+  return nat_zero if m == 0
+  return nat_set(x) if n == 0
+  z = nat_make(m)
+  c = sub_vv(z[0...n], x[0...n], y[0...n])
+  if m > n {
+    c = sub_vw(z[n...m], x[n...m], c)
+  }
+  panic("underflow") if c != 0
+  nat_norm(z)
+}
+
+# -1, 0 or +1 as x < y, x == y or x > y (both normalized).
+def nat_cmp(x: [U64], y: [U64]) -> I64 {
+  m = x.size
+  n = y.size
+  if m != n || m == 0 {
+    return -1 if m < n
+    return 1 if m > n
+    return 0
+  }
+  i = m - 1
+  while i > 0 && x[i] == y[i] {
+    i -= 1
+  }
+  return -1 if x[i] < y[i]
+  return 1 if x[i] > y[i]
+  0
+}
+
+# z += x in place (z long enough), not normalizing: Go's addTo.
+def add_to(z: [U64], x: [U64]) -> Unit {
+  n = x.size
+  if n > 0 {
+    c = add_vv(z[0...n], z[0...n], x[0...n])
+    if c != 0 && n < z.size {
+      zz = z[n...z.size]
+      add_vw(zz, zz, c)
+    }
+  }
+}
+
+# x * y + r.
+def nat_mul_add_ww(x: [U64], y: U64, r: U64) -> [U64] {
+  m = x.size
+  return nat_set_word(r) if m == 0 || y == 0
+  z = nat_make(m + 1)
+  z[m] = mul_add_vww(z[0...m], x, y, r)
+  nat_norm(z)
+}
+
+# z = x * y (z of len(x) + len(y) words, overwritten).
+def basic_mul(z: [U64], x: [U64], y: [U64]) -> Unit {
+  n = x.size
+  for i in 0...n + y.size {
+    z[i] = 0
+  }
+  for i in 0...y.size {
+    d = y[i]
+    if d != 0 {
+      zz = z[i...i + n]
+      z[n + i] = add_mul_vvww(zz, zz, x, d, 0)
+    }
+  }
+}
+
+def nat_mul(x: [U64], y: [U64]) -> [U64] { nat_mul_t(x, y, KARATSUBA_THRESHOLD) }
+
+# nat_mul with the Karatsuba threshold as a parameter (Go's tests vary
+# the package variable karatsubaThreshold).
+#
+# Karatsuba is Go 1.20's in-place version (natmul.go before Go 1.24 moved
+# to a stack allocator): one scratch buffer of 6k words for the k-word
+# Karatsuba core, the rest of an unbalanced product added in k-word
+# pieces.
+def nat_mul_t(x0: [U64], y0: [U64], thr: I64) -> [U64] {
+  x = nat_norm(x0)
+  y = nat_norm(y0)
+  m = x.size
+  n = y.size
+  return nat_mul_t(y, x, thr) if m < n
+  return nat_zero if m == 0 || n == 0
+  return nat_mul_add_ww(x, y[0], 0) if n == 1
+  if n < thr {
+    z = nat_make(m + n)
+    basic_mul(z, x, y)
+    return nat_norm(z)
+  }
+  k = karatsuba_len(n, thr)
+  xk = x[0...k]
+  yk = y[0...k]
+  zbuf = nat_make(imax(6 * k, m + n))
+  karatsuba(zbuf, xk, yk, thr)
+  z = zbuf[0...m + n]
+  for i in 2 * k...z.size {
+    z[i] = 0
+  }
+  if k < n || m != n {
+    # add x0*y1*b^k, then the products of the remaining k-word pieces of x
+    # with y0 and y1
+    x0n = nat_norm(xk)
+    y1 = y[k...n]
+    t = nat_mul_t(x0n, y1, thr)
+    add_at(z, t, k)
+    y0n = nat_norm(yk)
+    i = k
+    while i < m {
+      xi = x[i...imin(i + k, m)]
+      xi = nat_norm(xi)
+      t = nat_mul_t(xi, y0n, thr)
+      add_at(z, t, i)
+      t = nat_mul_t(xi, y1, thr)
+      add_at(z, t, i + k)
+      i += k
+    }
+  }
+  nat_norm(z)
+}
+
+# The length Karatsuba uses for n words: n rounded down to (a number at
+# most thr) * 2^i.
+def karatsuba_len(n0: I64, thr: I64) -> I64 {
+  n = n0
+  i = 0
+  while n > thr {
+    n >>= 1
+    i += 1
+  }
+  n << i
+}
+
+# z[0...n+n/2] += x (len(x) == n, carry into the upper half).
+def karatsuba_add(z: [U64], x: [U64], n: I64) -> Unit {
+  c = add_vv(z[0...n], z[0...n], x[0...n])
+  if c != 0 {
+    zz = z[n...n + (n >> 1)]
+    add_vw(zz, zz, c)
+  }
+}
+
+def karatsuba_sub(z: [U64], x: [U64], n: I64) -> Unit {
+  c = sub_vv(z[0...n], z[0...n], x[0...n])
+  if c != 0 {
+    zz = z[n...n + (n >> 1)]
+    sub_vw(zz, zz, c)
+  }
+}
+
+# z += x << (64 i), z long enough.
+def add_at(z: [U64], x: [U64], i: I64) -> Unit {
+  n = x.size
+  if n > 0 {
+    zi = z[i...i + n]
+    c = add_vv(zi, zi, x)
+    if c != 0 {
+      j = i + n
+      if j < z.size {
+        zj = z[j...z.size]
+        add_vw(zj, zj, c)
+      }
+    }
+  }
+}
+
+# z[0...2n] = x * y for len(x) == len(y) == n, with len(z) >= 6n scratch
+# (Go 1.20's karatsuba; n is karatsuba_len-shaped).
+def karatsuba(z: [U64], x: [U64], y: [U64], thr: I64) -> Unit {
+  n = y.size
+  if n & 1 != 0 || n < thr || n < 2 {
+    basic_mul(z[0...2 * n], x, y)
+    return
+  }
+  n2 = n >> 1
+  x1 = x[n2...n]
+  x0 = x[0...n2]
+  y1 = y[n2...n]
+  y0 = y[0...n2]
+  # z0 = x0*y0, z2 = x1*y1
+  karatsuba(z, x0, y0, thr)
+  karatsuba(z[n...z.size], x1, y1, thr)
+  # xd = |x1 - x0|, yd = |y0 - y1|, s the sign of (x1-x0)*(y0-y1)
+  s = 1
+  xd = z[2 * n...2 * n + n2]
+  if sub_vv(xd, x1, x0) != 0 {
+    s = -s
+    _c = sub_vv(xd, x0, x1)
+  }
+  yd = z[2 * n + n2...3 * n]
+  if sub_vv(yd, y0, y1) != 0 {
+    s = -s
+    _c2 = sub_vv(yd, y1, y0)
+  }
+  # p = xd*yd
+  p = z[n * 3...z.size]
+  karatsuba(p, xd, yd, thr)
+  # save z0, z2 in r
+  r = z[n * 4...z.size]
+  copy(r, z[0...n * 2])
+  # z = z0 + (z0 + z2 + s*p) b^n2 + z2 b^n
+  zh = z[n2...z.size]
+  karatsuba_add(zh, r, n)
+  karatsuba_add(zh, r[n...r.size], n)
+  if s > 0 {
+    karatsuba_add(zh, p, n)
+  } else {
+    karatsuba_sub(zh, p, n)
+  }
+}
+
+def nat_sqr(x: [U64]) -> [U64] { nat_sqr_t(x, BASIC_SQR_THRESHOLD, KARATSUBA_SQR_THRESHOLD) }
+
+# nat_sqr with Go's basicSqrThreshold and karatsubaSqrThreshold as
+# parameters.
+def nat_sqr_t(x0: [U64], bthr: I64, kthr: I64) -> [U64] {
+  x = nat_norm(x0)
+  n = x.size
+  return nat_zero if n == 0
+  if n == 1 {
+    d = x[0]
+    z = nat_make(2)
+    z[1] = d.__mulhi(d)
+    z[0] = d * d
+    return nat_norm(z)
+  }
+  if n < bthr && n < kthr {
+    z = nat_make(2 * n)
+    basic_mul(z, x, x)
+    return nat_norm(z)
+  }
+  if n < kthr {
+    z = nat_make(2 * n)
+    basic_sqr(z, x, bthr)
+    return nat_norm(z)
+  }
+  # Go 1.20: Karatsuba on the low k words, the rest added in.
+  k = karatsuba_len(n, kthr)
+  xk = x[0...k]
+  zbuf = nat_make(imax(6 * k, 2 * n))
+  karatsuba_sqr(zbuf, xk, bthr, kthr)
+  z = zbuf[0...2 * n]
+  for i in 2 * k...z.size {
+    z[i] = 0
+  }
+  if k < n {
+    x0n = nat_norm(xk)
+    x1 = x[k...n]
+    t = nat_mul(x0n, x1)
+    add_at(z, t, k)
+    add_at(z, t, k)
+    t = nat_sqr_t(x1, bthr, kthr)
+    add_at(z, t, 2 * k)
+  }
+  nat_norm(z)
+}
+
+# z[0...2n] = x * x (len(z) == 2n), computing each cross product once.
+def basic_sqr(z: [U64], x: [U64], bthr: I64) -> Unit {
+  n = x.size
+  if n < bthr {
+    basic_mul(z, x, x)
+    return
+  }
+  t = nat_make(2 * n)
+  z[1] = x[0].__mulhi(x[0])
+  z[0] = x[0] * x[0]
+  for i in 1...n {
+    d = x[i]
+    z[2 * i + 1] = d.__mulhi(d)
+    z[2 * i] = d * d
+    ti = t[i...2 * i]
+    t[2 * i] = add_mul_vvww(ti, ti, x[0...i], d, 0)
+  }
+  tt = t[1...2 * n - 1]
+  t[2 * n - 1] = lsh_vu(tt, tt, 1)
+  _c = add_vv(z[0...2 * n], z[0...2 * n], t)
+}
+
+# z[0...2n] = x * x with Karatsuba, len(z) >= 6n scratch (Go 1.20's
+# karatsubaSqr).
+def karatsuba_sqr(z: [U64], x: [U64], bthr: I64, kthr: I64) -> Unit {
+  n = x.size
+  if n & 1 != 0 || n < kthr || n < 2 {
+    basic_sqr(z[0...2 * n], x, bthr)
+    return
+  }
+  n2 = n >> 1
+  x1 = x[n2...n]
+  x0 = x[0...n2]
+  karatsuba_sqr(z, x0, bthr, kthr)
+  karatsuba_sqr(z[n...z.size], x1, bthr, kthr)
+  # xd = |x1 - x0|
+  xd = z[2 * n...2 * n + n2]
+  if sub_vv(xd, x1, x0) != 0 {
+    _c = sub_vv(xd, x0, x1)
+  }
+  p = z[n * 3...z.size]
+  karatsuba_sqr(p, xd, bthr, kthr)
+  r = z[n * 4...z.size]
+  copy(r, z[0...n * 2])
+  zh = z[n2...z.size]
+  karatsuba_add(zh, r, n)
+  karatsuba_add(zh, r[n...r.size], n)
+  karatsuba_sub(zh, p, n)
+}
+
+# The product of all integers in [a, b] (1 for an empty range).
+def nat_mul_range(a: U64, b: U64) -> [U64] {
+  return nat_zero if a == 0
+  return nat_one if a > b
+  return nat_set_u64(a) if a == b
+  return nat_mul(nat_set_u64(a), nat_set_u64(b)) if a + 1 == b
+  m = a + (b - a) / 2
+  nat_mul(nat_mul_range(a, m), nat_mul_range(m + 1, b))
+}
+
+# The length of x in bits (x needn't be normalized).
+def nat_bit_len(x: [U64]) -> I64 {
+  i = x.size - 1
+  while i >= 0 {
+    return i * W + word_len(x[i]) if x[i] != 0
+    i -= 1
+  }
+  0
+}
+
+# The number of consecutive least significant zero bits of x.
+def nat_trailing_zero_bits(x: [U64]) -> I64 {
+  return 0 if x.size == 0
+  i = 0
+  while x[i] == 0 {
+    i += 1
+  }
+  i * W + ntz(x[i])
+}
+
+# n when x == 2^n, else none.
+def nat_is_pow2(x: [U64]) -> I64? {
+  i = 0
+  while x[i] == 0 {
+    i += 1
+  }
+  if i == x.size - 1 && x[i] & (x[i] - 1) == 0 {
+    return i * W + ntz(x[i])
+  }
+  none
+}
+
+# x << s.
+def nat_lsh(x: [U64], s: I64) -> [U64] {
+  m = x.size
+  return nat_zero if m == 0
+  n = m + s / W
+  z = nat_make(n + 1)
+  sm = s % W
+  if sm == 0 {
+    copy(z[n - m...n], x)
+    z[n] = 0
+  } else {
+    z[n] = lsh_vu(z[n - m...n], x, sm)
+  }
+  nat_norm(z)
+}
+
+# x >> s.
+def nat_rsh(x: [U64], s: I64) -> [U64] {
+  m = x.size
+  n = m - s / W
+  return nat_zero if n <= 0
+  z = nat_make(n)
+  sm = s % W
+  if sm == 0 {
+    copy(z, x[m - n...m])
+  } else {
+    rsh_vu(z, x[m - n...m], sm)
+  }
+  nat_norm(z)
+}
+
+# x with bit i set to b (0 or 1).
+def nat_set_bit(x: [U64], i: I64, b: U64) -> [U64] {
+  j = i / W
+  m: U64 = ONE << (i % W)
+  n = x.size
+  if b == 0 {
+    z = nat_set(x)
+    return z if j >= n
+    z[j] &= ^m
+    return nat_norm(z)
+  }
+  if b == 1 {
+    z = nat_make(imax(n, j + 1))
+    copy(z, x)
+    z[j] |= m
+    return z
+  }
+  panic("set bit is not 0 or 1")
+}
+
+# Bit i of x (0 or 1).
+def nat_bit(x: [U64], i: I64) -> U64 {
+  j = i / W
+  return 0 if j >= x.size
+  (x[j] >> (i % W)) & 1
+}
+
+# 1 if any of the i least significant bits of x is set.
+def nat_sticky(x: [U64], i: I64) -> U64 {
+  j = i / W
+  if j >= x.size {
+    return 0 if x.size == 0
+    return 1
+  }
+  for k in 0...j {
+    return 1 if x[k] != 0
+  }
+  return 1 if i % W != 0 && x[j] << (W - i % W) != 0
+  0
+}
+
+def nat_and(x: [U64], y: [U64]) -> [U64] {
+  m = imin(x.size, y.size)
+  z = nat_make(m)
+  for i in 0...m {
+    z[i] = x[i] & y[i]
+  }
+  nat_norm(z)
+}
+
+# x mod 2^n.
+def nat_trunc(x: [U64], n: I64) -> [U64] {
+  w = (n + W - 1) / W
+  return nat_set(x) if x.size < w
+  z = nat_make(w)
+  copy(z, x)
+  if n % W != 0 {
+    z[z.size - 1] &= (ONE << (n % W)) - 1
+  }
+  nat_norm(z)
+}
+
+def nat_and_not(x: [U64], y: [U64]) -> [U64] {
+  m = x.size
+  n = imin(y.size, m)
+  z = nat_make(m)
+  for i in 0...n {
+    z[i] = x[i] & ^y[i]
+  }
+  copy(z[n...m], x[n...m])
+  nat_norm(z)
+}
+
+def nat_or(x: [U64], y: [U64]) -> [U64] {
+  return nat_or(y, x) if x.size < y.size
+  m = x.size
+  n = y.size
+  z = nat_make(m)
+  for i in 0...n {
+    z[i] = x[i] | y[i]
+  }
+  copy(z[n...m], x[n...m])
+  nat_norm(z)
+}
+
+def nat_xor(x: [U64], y: [U64]) -> [U64] {
+  return nat_xor(y, x) if x.size < y.size
+  m = x.size
+  n = y.size
+  z = nat_make(m)
+  for i in 0...n {
+    z[i] = x[i] ^ y[i]
+  }
+  copy(z[n...m], x[n...m])
+  nat_norm(z)
+}
+
+# A random number in [0, limit), n the bit length of limit; rnd is any
+# value with a `uint32! -> U32` method that shares its state (D36).
+def nat_random[R](rnd: R, limit: [U64], n: I64) -> [U64] {
+  r = rnd
+  z = nat_make(limit.size)
+  bl = n % W
+  bl = W if bl == 0
+  mask: U64 = bl == 64 ? MASK : (ONE << bl) - 1
+  while true {
+    for i in 0...z.size {
+      lo = r.uint32!.to_u64
+      hi = r.uint32!.to_u64
+      z[i] = lo | (hi << 32)
+    }
+    z[limit.size - 1] &= mask
+    break if nat_cmp(nat_norm(z), limit) < 0
+  }
+  nat_norm(z)
+}
+
+# x**y mod m (x**y if m is zero).
+def nat_exp_nn(x: [U64], y: [U64], m: [U64], slow: Bool) -> [U64] {
+  return nat_zero if m.size == 1 && m[0] == 1
+  return nat_one if y.size == 0
+  return nat_zero if x.size == 0
+  return nat_one if x.size == 1 && x[0] == 1
+  return nat_set(x) if y.size == 1 && y[0] == 1 && m.size == 0
+  if y.size == 1 && y[0] == 1 {
+    _q, r = nat_div(x, m)
+    return r
+  }
+  if m.size != 0 && y.size > 1 && !slow {
+    return exp_nn_montgomery(x, y, m) if m[0] & 1 == 1
+    if log_m = nat_is_pow2(m) {
+      return exp_nn_windowed(x, y, log_m)
+    }
+    return exp_nn_montgomery_even(x, y, m)
+  }
+  z = nat_set(x)
+  v = y[y.size - 1]
+  shift = nlz(v) + 1
+  v <<= shift
+  msb: U64 = 1 << 63
+  w = W - shift
+  for _j in 0...w {
+    z = nat_sqr(z)
+    z = nat_mul(z, x) if v & msb != 0
+    if m.size != 0 {
+      _q, r = nat_div(z, m)
+      z = r
+    }
+    v <<= 1
+  }
+  i = y.size - 2
+  while i >= 0 {
+    v = y[i]
+    for _j in 0...W {
+      z = nat_sqr(z)
+      z = nat_mul(z, x) if v & msb != 0
+      if m.size != 0 {
+        _q, r = nat_div(z, m)
+        z = r
+      }
+      v <<= 1
+    }
+    i -= 1
+  }
+  nat_norm(z)
+}
+
+# x**y mod m for m = 2^n * odd: the two parts by recursion, combined with
+# the Chinese Remainder Theorem.
+def exp_nn_montgomery_even(x: [U64], y: [U64], m: [U64]) -> [U64] {
+  n = nat_trailing_zero_bits(m)
+  m1 = nat_lsh(nat_one, n)
+  m2 = nat_rsh(m, n)
+  z1 = nat_exp_nn(x, y, m1, false)
+  z2 = nat_exp_nn(x, y, m2, false)
+  z1 = nat_sub_mod2n(z1, z2, n)
+  m2inv = nat_mod_inverse(m2, m1)
+  p = nat_trunc(nat_mul(z1, m2inv), n)
+  nat_add(z2, nat_mul(p, m2))
+}
+
+# x**y mod 2^log_m, with a 4-bit window.
+def exp_nn_windowed(x: [U64], y: [U64], log_m: I64) -> [U64] {
+  panic("big: misuse of expNNWindowed") if y.size <= 1
+  return nat_zero if x[0] & 1 == 0
+  return nat_one if log_m == 1
+  n = 4
+  powers: [[U64]] = [nat_zero; 16]
+  powers[0] = nat_one
+  powers[1] = nat_trunc(x, log_m)
+  i = 2
+  while i < 16 {
+    powers[i] = nat_trunc(nat_sqr(powers[i / 2]), log_m)
+    powers[i + 1] = nat_trunc(nat_mul(powers[i], x), log_m)
+    i += 2
+  }
+  j = y.size - 1
+  mtop = (log_m - 2) / W
+  mmask = MASK
+  mbits = (log_m - 1) & (W - 1)
+  if mbits != 0 {
+    mmask = (ONE << mbits) - 1
+  }
+  j = mtop if j > mtop
+  advance = false
+  z = nat_one
+  while j >= 0 {
+    yi = y[j]
+    yi &= mmask if j == mtop
+    k = 0
+    while k < W {
+      if advance {
+        for _r in 0...4 {
+          z = nat_trunc(nat_sqr(z), log_m)
+        }
+      }
+      z = nat_trunc(nat_mul(z, powers[(yi >> (W - n)).to_i64]), log_m)
+      yi <<= n
+      advance = true
+      k += n
+    }
+    j -= 1
+  }
+  nat_norm(z)
+}
+
+# z = x * y * 2^(-64n) mod m into the 2n-word buffer z, given
+# k = -1/m mod 2^64; returns z[0...n], an "almost Montgomery" result
+# (< 2^(64n), not necessarily < m). x, y, m have n words each.
+def montgomery(z: [U64], x: [U64], y: [U64], m: [U64], k: U64, n: I64) -> [U64] {
+  if x.size != n || y.size != n || m.size != n {
+    panic("math/big: mismatched montgomery number lengths")
+  }
+  for i in 0...2 * n {
+    z[i] = 0
+  }
+  c: U64 = 0
+  for i in 0...n {
+    d = y[i]
+    zi = z[i...n + i]
+    c2 = add_mul_vvww(zi, zi, x, d, 0)
+    t = z[i] * k
+    c3 = add_mul_vvww(zi, zi, m, t, 0)
+    cx = c + c2
+    cy = cx + c3
+    z[n + i] = cy
+    c = cx < c2 || cy < c3 ? 1 : 0
+  }
+  if c != 0 {
+    sub_vv(z[0...n], z[n...2 * n], m)
+  } else {
+    copy(z[0...n], z[n...2 * n])
+  }
+  z[0...n]
+}
+
+# x**y mod m for odd m: Montgomery multiplication with a 4-bit window.
+def exp_nn_montgomery(x0: [U64], y: [U64], m: [U64]) -> [U64] {
+  num_words = m.size
+  x = x0
+  if x.size > num_words {
+    _q, r = nat_div(x, m)
+    x = r
+  }
+  if x.size < num_words {
+    rr = nat_make(num_words)
+    copy(rr, x)
+    x = rr
+  }
+  # k0 = -m**-1 mod 2**64 (Dumas, "On Newton-Raphson Iteration for
+  # Multiplicative Inverses Modulo Prime Powers")
+  k0 = 2 - m[0]
+  t = m[0] - 1
+  i = 1
+  while i < W {
+    t *= t
+    k0 *= t + 1
+    i <<= 1
+  }
+  k0 = 0 - k0
+  # RR = 2**(2*64*len(m)) mod m
+  _q, rr0 = nat_div(nat_lsh(nat_one, 2 * num_words * W), m)
+  rr = nat_make(num_words)
+  copy(rr, rr0)
+  one = nat_make(num_words)
+  one[0] = 1
+  n = 4
+  bufs: [[U64]] = []
+  for _b in 0...16 {
+    bufs << nat_make(2 * num_words)
+  }
+  powers: [[U64]] = [nat_zero; 16]
+  powers[0] = montgomery(bufs[0], one, rr, m, k0, num_words)
+  powers[1] = montgomery(bufs[1], x, rr, m, k0, num_words)
+  for p in 2...16 {
+    powers[p] = montgomery(bufs[p], powers[p - 1], powers[1], m, k0, num_words)
+  }
+  za = nat_make(2 * num_words)
+  zb = nat_make(2 * num_words)
+  z = za[0...num_words]
+  copy(z, powers[0])
+  # z lives in za; zb is the other buffer
+  j = y.size - 1
+  while j >= 0 {
+    yi = y[j]
+    k = 0
+    while k < W {
+      if j != y.size - 1 || k != 0 {
+        zz = montgomery(zb, z, z, m, k0, num_words)
+        z = montgomery(za, zz, zz, m, k0, num_words)
+        zz = montgomery(zb, z, z, m, k0, num_words)
+        z = montgomery(za, zz, zz, m, k0, num_words)
+      }
+      zz = montgomery(zb, z, powers[(yi >> (W - n)).to_i64], m, k0, num_words)
+      # swap the buffers: the result in zb becomes z
+      tmp = za
+      za = zb
+      zb = tmp
+      z = zz
+      yi <<= n
+      k += n
+    }
+    j -= 1
+  }
+  res = nat_set(montgomery(zb, z, one, m, k0, num_words))
+  if nat_cmp(nat_norm(res), m) >= 0 {
+    res = nat_sub(nat_norm(res), m)
+    if nat_cmp(res, m) >= 0 {
+      _q2, r2 = nat_div(res, m)
+      res = r2
+    }
+  }
+  nat_norm(res)
+}
+
+# The big-endian bytes of x, right-aligned in buf; returns the index of
+# the first nonzero byte. Panics if x doesn't fit.
+def nat_bytes(x: [U64], buf: [Byte]) -> I64 {
+  i = buf.size
+  for d0 in x {
+    d = d0
+    for _j in 0...S {
+      i -= 1
+      if i >= 0 {
+        buf[i] = d.as_u8
+      } elsif d.as_u8 != 0 {
+        panic("math/big: buffer too small to fit value")
+      }
+      d >>= 8
+    }
+  }
+  i = 0 if i < 0
+  while i < buf.size && buf[i] == 0 {
+    i += 1
+  }
+  i
+}
+
+# The nat of the big-endian bytes in buf.
+def nat_set_bytes(buf: [Byte]) -> [U64] {
+  z = nat_make((buf.size + S - 1) / S)
+  i = buf.size
+  k = 0
+  while i >= S {
+    d: U64 = 0
+    for j in i - S...i {
+      d = (d << 8) | buf[j].to_u64
+    }
+    z[k] = d
+    k += 1
+    i -= S
+  }
+  if i > 0 {
+    d: U64 = 0
+    s = 0
+    while i > 0 {
+      d |= buf[i - 1].to_u64 << s
+      i -= 1
+      s += 8
+    }
+    z[z.size - 1] = d
+  }
+  nat_norm(z)
+}
+
+# floor(sqrt(x)) (Brent and Zimmermann, Modern Computer Arithmetic,
+# Algorithm 1.13).
+def nat_sqrt(x: [U64]) -> [U64] {
+  return nat_set(x) if nat_cmp(x, nat_one) <= 0
+  z1 = nat_lsh(nat_one, (nat_bit_len(x) + 1) / 2)
+  while true {
+    z2, _r = nat_div(x, z1)
+    z2 = nat_rsh(nat_add(z2, z1), 1)
+    return z1 if nat_cmp(z2, z1) >= 0
+    z1 = z2
+  }
+  z1
+}
+
+# (x - y) mod 2^n.
+def nat_sub_mod2n(x0: [U64], y0: [U64], n: I64) -> [U64] {
+  x = x0
+  y = y0
+  x = nat_trunc(x, n) if nat_bit_len(x) > n
+  y = nat_trunc(y, n) if nat_bit_len(y) > n
+  return nat_sub(x, y) if nat_cmp(x, y) >= 0
+  # x - y < 0: 2^n - (y - x) = 1 + ^(y - x) mod 2^n
+  d = nat_sub(y, x)
+  words = imax(d.size, (n + W - 1) / W)
+  z = nat_make(words)
+  copy(z, d)
+  for i in 0...z.size {
+    z[i] = ^z[i]
+  }
+  nat_add(nat_trunc(z, n), nat_one)
+}
+
+# The inverse of g modulo n (both nats), or zero if there is none.
+def nat_mod_inverse(g: [U64], n: [U64]) -> [U64] {
+  z = Int.new
+  if r = z.mod_inverse!(Int.new(abs: g), Int.new(abs: n)) {
+    return r.abs
+  }
+  nat_zero
+}
+
+# A hexadecimal form for debugging: "0x...".
+def nat_string(x: [U64]) -> Str { "0x" + Str.from_bytes(nat_itoa(x, false, 16)) }

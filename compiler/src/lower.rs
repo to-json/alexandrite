@@ -882,6 +882,16 @@ impl<'a> Lw<'a> {
                 TK::IndexAssign(l, ..) | TK::PlaceAssign(l, ..) => Some(*l),
                 _ => None,
             };
+            // Storing a value without storage (a byte, a word) into an
+            // existing element, or copying such elements, allocates nothing:
+            // no region to look up (a hot loop's `s[i] = digit`).
+            let promote = self.promote();
+            let flat_store = match &e.kind {
+                TK::IndexAssign(_, _, x) | TK::PlaceAssign(_, _, _, x) => !crate::regions::has_storage(&x.ty) && !(promote && crate::regions::contains_int(&x.ty)),
+                TK::M(M::CopyInto, None, args, _) => args.first().is_some_and(|a| matches!(&a.ty, Ty::Array(t) | Ty::Fixed(t, _) if !crate::regions::has_storage(t) && !(promote && crate::regions::contains_int(t)))),
+                _ => false,
+            };
+            let root = if flat_store { None } else { root };
             if let Some(l) = root.filter(|l| matches!(self.lty(&self.f.locals[*l].ty), LTy::Arr(_) | LTy::Str)) {
                 let r = self.tmp(LTy::Region);
                 let v = self.var_of(l);
@@ -1482,6 +1492,18 @@ impl<'a> Lw<'a> {
     /// infallible method satisfying a fallible interface method always succeeds.
     fn iface_result(&mut self, e: &TExpr, fid: FuncId, call: LE) -> (Vec<LS>, LE) {
         let f = &self.p.funcs[fid];
+        // A covariant result (`def clone -> Hash` returning a Digest): wrap it.
+        if let (Ty::Iface(n), Ty::Struct(..) | Ty::Enum(..)) = (&e.ty, &f.ret) {
+            let impls = self.p.ifaces.get(n).cloned().unwrap_or_default();
+            let k = impls.iter().position(|(t, _)| *t == f.ret).expect("covariant result implements the interface");
+            let lt = self.lty(&e.ty);
+            let LTy::Tup(ts) = &lt else { unreachable!() };
+            let mut vals = vec![LE::I(k as i64)];
+            for (j, t) in ts[1..].iter().enumerate() {
+                vals.push(if j == k { call.clone() } else { zero_le(t) });
+            }
+            return (vec![], LE::Tup(lt, vals));
+        }
         let Ty::Result(t) = &e.ty else { return (vec![], call) };
         if f.fallible {
             return (vec![], call);
@@ -2183,6 +2205,22 @@ impl<'a> Lw<'a> {
     fn shift(&mut self, op: BinOp, k: IntKind, ck: IntKind, a: LE, c: LE, sp: Span) -> LE {
         let a = self.bind(a, LTy::I64);
         let c = self.bind(c, LTy::I64);
+        // A constant count (`x >> 7`, the common case in hash and crypto
+        // code) needs no checks or clamping: fold them here, so no backend
+        // sees a branch per shift (the JIT made a block per Cond, which made
+        // fully unrolled compression functions 40x slower than the C build).
+        if let LE::I(n) = c {
+            let w = k.bits() as i64;
+            if n >= 0 {
+                return match op {
+                    BinOp::Shl if n >= w => LE::I(0),
+                    BinOp::Shl => wrap_to(k, LE::Prim(Prim::Shl, vec![a, LE::I(n)])),
+                    _ if k == IntKind::U64 && n >= 64 => LE::I(0),
+                    _ if k == IntKind::U64 => LE::Prim(Prim::ShrU, vec![a, LE::I(n)]),
+                    _ => LE::Prim(Prim::ShrS, vec![a, LE::I(n.min(63))]),
+                };
+            }
+        }
         if ck.signed() {
             let neg = LE::Cmp(Op::Lt, Box::new(c.clone()), Box::new(LE::I(0)), LTy::I64);
             self.guard(neg, "negative shift amount", sp, "ArithError", 2);
@@ -2710,6 +2748,12 @@ impl<'a> Lw<'a> {
                     self.int_out(LE::Rt(Rt::StrToI, vec![v]))
                 }
             }
+            ByteIndex => {
+                let v = self.expr(recv.unwrap());
+                let a = self.expr(&args[0]);
+                let from = if args.len() > 1 { self.expr(&args[1]) } else { LE::I(0) };
+                LE::Rt(Rt::StrIndex, vec![v, a, from])
+            }
             Delete | Split => {
                 let v = self.expr(recv.unwrap());
                 let a = self.expr(&args[0]);
@@ -2847,6 +2891,7 @@ impl<'a> Lw<'a> {
                 LE::Rt(Rt::Math(f), v)
             }
             FloatBits => LE::Rt(Rt::FBits, vec![self.expr(recv.unwrap())]),
+            UMulHi => LE::Prim(Prim::UMulHi, vec![self.expr(recv.unwrap()), self.expr(&args[0])]),
             FloatFromBits => LE::Rt(Rt::FFromBits, vec![self.expr(recv.unwrap())]),
             StructNew => {
                 let t = self.lty(&e.ty);

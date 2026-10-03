@@ -1,0 +1,190 @@
+import "io"
+import "hash"
+import "encoding/hex"
+
+# Go's sha256_test.go and example_test.go, translated. The tables are in
+# golden_test.alx; Go's internal/testhash is testhash_test.alx.
+# cryptotest.TestAllImplementations runs each test once per implementation
+# (assembly, generic); alx has one.
+#
+# Not translated: TestAllocations (allocation counting), TestCgo (cgo
+# pointer checks), TestExtraMethods (reflection over the method set),
+# ExampleNew_file (opens a file.txt that isn't there; Go doesn't run it
+# either).
+
+def check_golden(gold: [Golden], mk: () -> Digest, one: ([Byte]) -> [Byte]) {
+  for g in gold {
+    assert_eq hexs(one(g.input)), g.out
+    c = mk()
+    j = 0
+    while j < 3 {
+      if j < 2 {
+        c.write!(g.input)
+      } else {
+        half = g.input.size / 2
+        c.write!(g.input[0...half])
+        c.sum([])
+        c.write!(g.input[half...g.input.size])
+      }
+      assert_eq hexs(c.sum([])), g.out
+      c.reset!
+      j += 1
+    }
+  }
+}
+
+test "golden" {
+  check_golden(golden(), ->() -> Digest { new() }, ->(p: [Byte]) -> [Byte] { sum256(p).to_a })
+  check_golden(golden224(), ->() -> Digest { new224() }, ->(p: [Byte]) -> [Byte] { sum224(p).to_a })
+}
+
+def check_golden_marshal(gold: [Golden], mk: () -> Digest) {
+  for g in gold {
+    h = mk()
+    h2 = mk()
+    half = g.input.size / 2
+    io.write_all(h, g.input[0...half]).unwrap
+    state = h.marshal_binary
+    state_append = h.append_binary([0, 0, 0, 0])
+    state_append = state_append[4...state_append.size]
+    assert_eq state, g.half_state
+    assert_eq state_append, g.half_state
+    h2.unmarshal_binary!(state).unwrap
+    io.write_all(h, g.input[half...g.input.size]).unwrap
+    io.write_all(h2, g.input[half...g.input.size]).unwrap
+    assert_eq h.sum([]), h2.sum([])
+  }
+}
+
+test "golden marshal" {
+  check_golden_marshal(golden224(), ->() -> Digest { new224() })
+  check_golden_marshal(golden(), ->() -> Digest { new() })
+}
+
+# Writes "0123456789" * (n / 10) in blocks of every power-of-ten size, at
+# four offsets.
+def check_large(n: Int, ok: Str) {
+  offsets = 4
+  blk = [0.as_u8; n + offsets]
+  c = new()
+  offset = 0
+  while offset < offsets {
+    i = 0
+    while i < n {
+      blk[offset + i] = 48 + (i % 10).as_u8
+      i += 1
+    }
+    block_size = 10
+    while block_size <= n {
+      blocks = n / block_size
+      p = blk[offset...offset + block_size]
+      c.reset!
+      i = 0
+      while i < blocks {
+        c.write!(p)
+        i += 1
+      }
+      assert_eq hexs(c.sum([])), ok
+      block_size *= 10
+    }
+    offset += 1
+  }
+}
+
+test "large" {
+  check_large(10000, "4c207598af7a20db0e3334dd044399a40e467cb81b37f7ba05a4f76dcbd8fd59")
+}
+
+test "extra large" {
+  check_large(100000, "aca9e593cc629cbaa94cd5a07dc029424aad93e5129e5d11f8dcd2f139c16cc0")
+}
+
+test "marshal type mismatch" {
+  h1 = new()
+  h2 = new224()
+  state1 = h1.marshal_binary
+  r = h2.unmarshal_binary!(state1)
+  assert r.err.present?, "no error when one was expected"
+  assert_eq "#{r.err.unwrap}", "crypto/sha256: invalid hash state identifier"
+}
+
+test "unmarshal errors" {
+  h = new()
+  r = h.unmarshal_binary!(b("sha\x03abc"))
+  assert_eq "#{r.err.unwrap}", "crypto/sha256: invalid hash state size"
+  r2 = h.unmarshal_binary!(b("sh"))
+  assert_eq "#{r2.err.unwrap}", "crypto/sha256: invalid hash state identifier"
+}
+
+test "size" {
+  assert_eq new().size, SIZE
+  assert_eq new224().size, SIZE224
+}
+
+test "block size" {
+  assert_eq new().block_size, BLOCK_SIZE
+  assert_eq new224().block_size, BLOCK_SIZE
+}
+
+test "large hashes" {
+  for t in large_unmarshal_tests() {
+    h = new()
+    h.unmarshal_binary!(t.state).unwrap
+    assert_eq hexs(h.sum([])), t.sum
+  }
+}
+
+test "hash" {
+  check_hash(->() -> hash.Hash { new224() })
+  check_clone(new224())
+  check_hash(->() -> hash.Hash { new() })
+  check_clone(new())
+}
+
+# The Clone subtest of Go's testhash.TestHash.
+def check_clone(h: Digest) {
+  h3 = h.clone
+  prefix = b("tmp")
+  h.write!(prefix)
+  h2 = h.clone
+  prefix_sum = h.sum([])
+  assert_eq prefix_sum, h2.sum([])
+  suffix = b("tmp2")
+  h.write!(suffix)
+  h3.write!(prefix + suffix)
+  composite = h3.sum([])
+  assert_eq h.sum([]), composite
+  assert_eq h2.sum([]), prefix_sum
+  h2.write!(suffix)
+  assert_eq h.sum([]), composite
+  assert_eq h2.sum([]), composite
+}
+
+example "sum256" {
+  s = sum256(b("hello world\n"))
+  puts hex.encode_to_string(s.to_a)
+} outputs "a948904f2f0f479b8f8197694b30184b0d2ed1c1cd2a1ec0fb85d299a192a447\n"
+
+example "new" {
+  h = new()
+  h.write!(b("hello world\n"))
+  puts hex.encode_to_string(h.sum([]))
+} outputs "a948904f2f0f479b8f8197694b30184b0d2ed1c1cd2a1ec0fb85d299a192a447\n"
+
+def bench_data(n: Int) -> [Byte] {
+  [0x5a.as_u8; n]
+}
+
+bench "sha256 1MB" {
+  d = new()
+  d.write!(bench_data(1 << 20))
+  d.sum([])
+}
+
+bench "sha256 8 bytes" {
+  sum256(b("12345678"))
+}
+
+bench "sha256 1K" {
+  sum256(bench_data(1024))
+}

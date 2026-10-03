@@ -1,0 +1,773 @@
+# Go's float_test.go, translated. Not translated (alx can't recover a
+# panic inside a test): the ErrNaN panic checks (TestFloatSetFloat64's
+# NaN case; the NaN results of TestFloatArithmeticSpecialValues, whose
+# other cases are kept); the "Int/Rat use the supplied *Int/*Rat" checks
+# of TestFloatInt and TestFloatRat (results are returned values here).
+
+import "math"
+import "strconv"
+
+# Go's (*Float).uint64 / int64 test helpers.
+def f_uint64(x: Float) -> U64 {
+  u, acc = x.uint64
+  panic("#{x.text("g", 10)} is not a uint64") if acc != Accuracy.Exact
+  u
+}
+
+def f_int64(x: Float) -> I64 {
+  i, acc = x.int64
+  panic("#{x.text("g", 10)} is not an int64") if acc != Accuracy.Exact
+  i
+}
+
+# Go's makeFloat: ParseFloat(s, 0, 1000, ToNearestEven).
+def make_float(s: Str) -> Float {
+  r = parse_float(s, 0, 1000, RoundingMode.ToNearestEven)
+  if e = r.err {
+    panic(e.message)
+  }
+  r.unwrap[0]
+}
+
+def alike(x: Float, y: Float) -> Bool { x.cmp(y) == 0 && x.signbit == y.signbit }
+
+def alike64(x: F64, y: F64) -> Bool { x == y && math.signbit(x) == math.signbit(y) }
+
+def fset_int64(x: I64) -> Float {
+  f = Float.new
+  f.set_int64!(x) if x != 0
+  f
+}
+
+test "FloatZeroValue" {
+  x = Float.new
+  assert_eq x.text("f", 1), "0.0"
+  assert_eq x.prec, 0
+  for t in t_test_float_zero_value_0 {
+    z = fset_int64(t.z)
+    x1 = fset_int64(t.x)
+    y1 = fset_int64(t.y)
+    op = t.opname
+    if op == 43 {
+      z.add!(x1, y1)
+    } elsif op == 45 {
+      z.sub!(x1, y1)
+    } elsif op == 42 {
+      z.mul!(x1, y1)
+    } else {
+      z.quo!(x1, y1)
+    }
+    got = 0
+    got = f_int64(z) if !z.inf?
+    assert_eq got, t.want
+  }
+}
+
+test "FloatSetPrec" {
+  for t in t_test_float_set_prec_0 {
+    x = make_float(t.x)
+    x.set_prec!(t.prec)
+    prec = t.prec
+    prec = MAX_PREC.to_i64 if prec.as_u64 > MAX_PREC
+    assert_eq x.prec, prec
+    assert x.to_s == t.want && x.acc == t.acc, "#{t.x}.SetPrec(#{t.prec}) = #{x} (#{x.acc}); want #{t.want} (#{t.acc})"
+  }
+}
+
+test "FloatMinPrec" {
+  tests = [("0", 0), ("-0", 0), ("+Inf", 0), ("-Inf", 0), ("1", 1), ("2", 1), ("3", 2), ("0x8001", 16), ("0x8001p-1000", 16), ("0x8001p+1000", 16), ("0.1", 100)]
+  for t in tests {
+    x = make_float(t[0])
+    x.set_prec!(100)
+    assert_eq x.min_prec, t[1]
+  }
+}
+
+test "FloatSign" {
+  for t in t_test_float_sign_0 {
+    assert_eq make_float(t.x).sign, t.s
+  }
+}
+
+test "FloatMantExp" {
+  for t in t_test_float_mant_exp_0 {
+    x = make_float(t.x)
+    mant = make_float(t.mant)
+    m, e = x.mant_exp
+    assert alike(m, mant) && e == t.exp, "#{t.x}.MantExp() = #{m.text("g", 10)}, #{e}; want #{t.mant}, #{t.exp}"
+  }
+}
+
+test "FloatMantExpAliasing" {
+  x = make_float("0.5p10")
+  m, e = x.mant_exp
+  x = m
+  assert_eq e, 10
+  assert alike(x, make_float("0.5")), "MantExp aliasing"
+}
+
+test "FloatSetMantExp" {
+  for t in t_test_float_set_mant_exp_0 {
+    frac = make_float(t.frac)
+    want = make_float(t.z)
+    z = Float.new
+    z.set_mant_exp!(frac, t.exp)
+    assert alike(z, want), "SetMantExp(#{t.frac}, #{t.exp}) = #{z.text("g", 10)}; want #{t.z}"
+    mant, e = want.mant_exp
+    z.set_mant_exp!(mant, e)
+    assert_eq z.cmp(want), 0
+  }
+}
+
+test "FloatPredicates" {
+  for t in t_test_float_predicates_0 {
+    x = make_float(t.x)
+    assert_eq x.signbit, t.signbit
+    assert_eq x.sign, t.sign
+    assert_eq x.inf?, t.inf
+  }
+}
+
+test "FloatIsInt" {
+  for t in ["0 int", "-0 int", "1 int", "-1 int", "0.5", "1.23", "1.23e1", "1.23e2 int", "0.000000001e+8", "0.000000001e+9 int", "1.2345e200 int", "Inf", "+Inf", "-Inf"] {
+    s = t
+    want = false
+    if t.end_with?(" int") {
+      s = t[0...t.size - 4]
+      want = true
+    }
+    assert_eq make_float(s).int?, want
+  }
+}
+
+def from_binary(s: Str) -> I64 { strconv.parse_int(s, 2, 64).unwrap }
+
+def check_float_round(x: I64, r: I64, prec: I64, mode: RoundingMode) -> Bool {
+  a = Accuracy.Exact
+  a = Accuracy.Below if r < x
+  a = Accuracy.Above if r > x
+  f = Float.new
+  f.set_mode!(mode)
+  f.set_int64!(x)
+  f.set_prec!(prec)
+  r1 = f_int64(f)
+  return false if r1 != r || f.prec != prec || f.acc != a
+  g = Float.new
+  g.set_mode!(mode)
+  g.set_prec!(prec)
+  g.set_int64!(x)
+  return false if !alike(g, f)
+  h = Float.new
+  h.set_mode!(mode)
+  h.set_prec!(prec)
+  h.set!(f)
+  alike(h, f)
+}
+
+test "FloatRound" {
+  for t in t_test_float_round_0 {
+    x = from_binary(t.x)
+    z = from_binary(t.zero)
+    e = from_binary(t.neven)
+    n = from_binary(t.naway)
+    a = from_binary(t.away)
+    p = t.prec
+    assert check_float_round(x, z, p, RoundingMode.ToZero), "#{t.x} ToZero #{p}"
+    assert check_float_round(x, e, p, RoundingMode.ToNearestEven), "#{t.x} ToNearestEven #{p}"
+    assert check_float_round(x, n, p, RoundingMode.ToNearestAway), "#{t.x} ToNearestAway #{p}"
+    assert check_float_round(x, a, p, RoundingMode.AwayFromZero), "#{t.x} AwayFromZero #{p}"
+    assert check_float_round(x, z, p, RoundingMode.ToNegativeInf), "#{t.x} ToNegativeInf #{p}"
+    assert check_float_round(x, a, p, RoundingMode.ToPositiveInf), "#{t.x} ToPositiveInf #{p}"
+    assert check_float_round(0 - x, 0 - a, p, RoundingMode.ToNegativeInf), "-#{t.x} ToNegativeInf #{p}"
+    assert check_float_round(0 - x, 0 - z, p, RoundingMode.ToPositiveInf), "-#{t.x} ToPositiveInf #{p}"
+  }
+}
+
+test "FloatRound24" {
+  x0 = (1 << 26) - 0x10
+  for d in 0..0x10 {
+    x = (x0 + d).to_f
+    f = Float.new
+    f.set_prec!(24)
+    f.set_float64!(x)
+    got, _a = f.float32
+    assert_eq got, float64_to_float32(x)
+  }
+}
+
+test "FloatSetUint64" {
+  ws: [U64] = [0, 1, 2, 10, 100, (ONE << 32) - 1, ONE << 32, M_]
+  for want in ws {
+    f = Float.new
+    f.set_uint64!(want)
+    assert_eq f_uint64(f), want
+  }
+  x: U64 = 0x8765432187654321
+  for prec in 1..64 {
+    f = Float.new
+    f.set_prec!(prec)
+    f.set_mode!(RoundingMode.ToZero)
+    f.set_uint64!(x)
+    assert_eq f_uint64(f), x & ^((ONE << (64 - prec)) - 1)
+  }
+}
+
+test "FloatSetInt64" {
+  for w in [0, 1, 2, 10, 100, (1 << 32) - 1, 1 << 32, 9223372036854775807] {
+    for i in 0...2 {
+      want = w
+      want = 0 - w if i & 1 != 0
+      f = Float.new
+      f.set_int64!(want)
+      assert_eq f_int64(f), want
+    }
+  }
+  x = 0x7654321076543210
+  for prec in 1..63 {
+    f = Float.new
+    f.set_prec!(prec)
+    f.set_mode!(RoundingMode.ToZero)
+    f.set_int64!(x)
+    assert_eq f_int64(f), x & ^((1 << (63 - prec)) - 1)
+  }
+}
+
+test "FloatSetFloat64" {
+  for w in [0.0, 1.0, 2.0, 12345.0, 1e10, 1e100, 3.14159265e10, 2.718281828e-123, 1.0 / 3.0, 3.40282346638528859811704183484516925440e+38, 1.79769313486231570814527423731704356798070e+308, 1.401298464324817e-45, 4.9406564584124654e-324, math.inf(-1), math.inf(0), math.inf(1)] {
+    for i in 0...2 {
+      want = w
+      want = -1.0 * w if i & 1 != 0
+      f = Float.new
+      f.set_float64!(want)
+      got, acc = f.float64
+      assert got == want && acc == Accuracy.Exact, "SetFloat64(#{want})"
+    }
+  }
+  x: U64 = 0x8765432143218
+  for prec in 1..52 {
+    f = Float.new
+    f.set_prec!(prec)
+    f.set_mode!(RoundingMode.ToZero)
+    f.set_float64!(x.to_i64.to_f)
+    got, _a = f.float64
+    assert_eq got, (x & ^((ONE << (52 - prec)) - 1)).to_i64.to_f
+  }
+}
+
+test "FloatSetInt" {
+  for want in ["0", "1", "-1", "1234567890", "123456789012345678901234567890", "123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890"] {
+    x = iv(want)
+    n = imax(x.bit_len, 64)
+    f = Float.new
+    f.set_int!(x)
+    assert_eq f.prec, n
+    assert_eq f.text("g", 100), want
+  }
+}
+
+test "FloatSetRat" {
+  for want in ["0", "1", "-1", "1234567890", "123456789012345678901234567890", "123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890", "1.2", "3.14159265"] {
+    x = rv(want)
+    n = imax(imax(x.num.bit_len, x.denom.bit_len), 64)
+    f1 = Float.new
+    f2 = Float.new
+    f2.set_prec!(1000)
+    f1.set_rat!(x)
+    f2.set_rat!(x)
+    assert_eq f1.prec, n
+    assert_eq f2.text("g", 100), want
+  }
+}
+
+test "FloatSetInf" {
+  f = Float.new
+  for t in t_test_float_set_inf_0 {
+    f.set_prec!(t.prec)
+    x = f.set_inf!(t.signbit)
+    assert x.to_s == t.want && x.prec == t.prec, "SetInf(#{t.signbit})"
+  }
+}
+
+test "FloatUint64" {
+  for t in t_test_float_uint64_0 {
+    out, acc = make_float(t.x).uint64
+    assert out == t.out && acc == t.acc, "#{t.x}: got #{out} (#{acc}); want #{t.out} (#{t.acc})"
+  }
+}
+
+test "FloatInt64" {
+  for t in t_test_float_int64_0 {
+    out, acc = make_float(t.x).int64
+    assert out == t.out && acc == t.acc, "#{t.x}: got #{out} (#{acc}); want #{t.out} (#{t.acc})"
+  }
+}
+
+def neg_acc(a: Accuracy) -> Accuracy { Accuracy.from_i(0 - a.to_i) }
+
+test "FloatFloat32" {
+  for t in t_test_float_float32_0 {
+    for i in 0...2 {
+      tx = t.x
+      tout = t.out
+      tacc = t.acc
+      if i != 0 {
+        tx = "-" + tx
+        tout = -1.0 * tout
+        tacc = neg_acc(tacc)
+      }
+      if pf = strconv.parse_float_bits(tx, 32).ok {
+        assert alike64(pf, tout), "#{tx}: incorrect test data"
+      }
+      out, acc = make_float(tx).float32
+      assert alike64(out, tout) && acc == tacc, "#{tx}: got #{out} (#{acc}); want #{tout} (#{tacc})"
+      x2 = Float.new
+      out2, acc2 = x2.set_float64!(out).float32
+      assert alike64(out2, out) && acc2 == Accuracy.Exact, "idempotency #{tx}"
+    }
+  }
+}
+
+test "FloatFloat64" {
+  for t in t_test_float_float64_0 {
+    for i in 0...2 {
+      tx = t.x
+      tout = t.out
+      tacc = t.acc
+      if i != 0 {
+        tx = "-" + tx
+        tout = -1.0 * tout
+        tacc = neg_acc(tacc)
+      }
+      if pf = strconv.parse_float_bits(tx, 64).ok {
+        assert alike64(pf, tout), "#{tx}: incorrect test data"
+      }
+      out, acc = make_float(tx).float64
+      assert alike64(out, tout) && acc == tacc, "#{tx}: got #{out} (#{acc}); want #{tout} (#{tacc})"
+      x2 = Float.new
+      out2, acc2 = x2.set_float64!(out).float64
+      assert alike64(out2, out) && acc2 == Accuracy.Exact, "idempotency #{tx}"
+    }
+  }
+}
+
+test "FloatInt" {
+  for t in t_test_float_int_0 {
+    res, acc = make_float(t.x).int
+    got = "nil"
+    if v = res {
+      got = v.to_s
+    }
+    assert got == t.want && acc == t.acc, "#{t.x}: got #{got} (#{acc}); want #{t.want} (#{t.acc})"
+  }
+}
+
+test "FloatRat" {
+  for t in t_test_float_rat_0 {
+    x = make_float(t.x)
+    x.set_prec!(64)
+    res, acc = x.rat
+    got = "nil"
+    if v = res {
+      got = v.to_s
+    }
+    assert_eq got, t.want
+    assert_eq acc, t.acc
+    if v = res {
+      g = Float.new
+      g.set_prec!(64)
+      g.set_rat!(v)
+      assert_eq g.cmp(x), 0
+    }
+  }
+}
+
+test "FloatAbs" {
+  for t in ["0", "1", "1234", "1.23e-2", "1e-1000", "1e1000", "Inf"] {
+    p = make_float(t)
+    a = Float.new
+    a.abs!(p)
+    assert alike(a, p), "#{t}"
+    n = make_float("-" + t)
+    a.abs!(n)
+    assert alike(a, p), "-#{t}"
+  }
+}
+
+test "FloatNeg" {
+  for t in ["0", "1", "1234", "1.23e-2", "1e-1000", "1e1000", "Inf"] {
+    p1 = make_float(t)
+    n1 = make_float("-" + t)
+    n2 = Float.new
+    n2.neg!(p1)
+    p2 = Float.new
+    p2.neg!(n2)
+    assert alike(n2, n1), "#{t}"
+    assert alike(p2, p1), "#{t}"
+  }
+}
+
+test "FloatInc" {
+  n = 10
+  for prec in t_prec_list {
+    next if (1 << prec) < n && prec < 63
+    x = Float.new
+    one = Float.new
+    x.set_prec!(prec)
+    one.set_int64!(1)
+    for _i in 0...n {
+      x.add!(x, one)
+    }
+    assert_eq x.cmp(fset_int64(n)), 0
+  }
+}
+
+def float_with(prec: I64, mode: RoundingMode) -> Float {
+  z = Float.new
+  z.set_prec!(prec)
+  z.set_mode!(mode)
+}
+
+test "FloatAdd" {
+  modes = [RoundingMode.ToZero, RoundingMode.ToNearestEven, RoundingMode.AwayFromZero]
+  for xbits in t_bits_list {
+    for ybits in t_bits_list {
+      x = bits_float(xbits)
+      y = bits_float(ybits)
+      zbits = bits_add(xbits, ybits)
+      z = bits_float(zbits)
+      for mode in modes {
+        for prec in t_prec_list {
+          got = float_with(prec, mode)
+          got.add!(x, y)
+          want = bits_round(zbits, prec, mode)
+          assert got.cmp(want) == 0, "prec = #{prec}, #{mode}: #{x} + #{y} = #{got}; want #{want}"
+          got.sub!(z, x)
+          want = bits_round(ybits, prec, mode)
+          assert got.cmp(want) == 0, "prec = #{prec}, #{mode}: #{z} - #{x} = #{got}; want #{want}"
+        }
+      }
+    }
+  }
+}
+
+test "FloatAddRoundZero" {
+  for mode in [RoundingMode.ToNearestEven, RoundingMode.ToNearestAway, RoundingMode.ToZero, RoundingMode.AwayFromZero, RoundingMode.ToPositiveInf, RoundingMode.ToNegativeInf] {
+    x = new_float(5.0)
+    y = Float.new
+    y.neg!(x)
+    want = new_float(0.0)
+    want.neg!(want) if mode == RoundingMode.ToNegativeInf
+    got = Float.new
+    got.set_mode!(mode)
+    got.add!(x, y)
+    assert got.cmp(want) == 0 && got.neg == (mode == RoundingMode.ToNegativeInf), "#{mode}: 5 + -5"
+    got.sub!(x, x)
+    assert got.cmp(want) == 0 && got.neg == (mode == RoundingMode.ToNegativeInf), "#{mode}: 5 - 5"
+  }
+}
+
+test "FloatAdd32" {
+  base = (1 << 26) - 0x10
+  for d in 0..0x10 {
+    for i in 0...2 {
+      x0 = base.to_f
+      y0 = d.to_f
+      if i & 1 != 0 {
+        t = x0
+        x0 = y0
+        y0 = t
+      }
+      x = new_float(x0)
+      y = new_float(y0)
+      z = Float.new
+      z.set_prec!(24)
+      z.add!(x, y)
+      got, acc = z.float32
+      want = float64_to_float32(float64_to_float32(y0) + float64_to_float32(x0))
+      assert got == want && acc == Accuracy.Exact, "#{x0} + #{y0}"
+      z.sub!(z, y)
+      got2, acc2 = z.float32
+      want2 = float64_to_float32(want - float64_to_float32(y0))
+      assert got2 == want2 && acc2 == Accuracy.Exact, "#{x0 + y0} - #{y0}"
+    }
+  }
+}
+
+test "FloatAdd64" {
+  base = (1 << 55) - 0x10
+  for d in 0..0x10 {
+    for i in 0...2 {
+      x0 = base.to_f
+      y0 = d.to_f
+      if i & 1 != 0 {
+        t = x0
+        x0 = y0
+        y0 = t
+      }
+      x = new_float(x0)
+      y = new_float(y0)
+      z = Float.new
+      z.set_prec!(53)
+      z.add!(x, y)
+      got, acc = z.float64
+      want = x0 + y0
+      assert got == want && acc == Accuracy.Exact, "#{x0} + #{y0}"
+      z.sub!(z, y)
+      got2, acc2 = z.float64
+      want -= y0
+      assert got2 == want && acc2 == Accuracy.Exact, "#{x0 + y0} - #{y0}"
+    }
+  }
+}
+
+test "Issue20490" {
+  for t in t_test_issue20490_0 {
+    a = new_float(t.a)
+    b = new_float(t.b)
+    diff = Float.new
+    diff.sub!(a, b)
+    b.sub!(a, b)
+    assert_eq b.cmp(diff), 0
+    b = new_float(t.b)
+    sum = Float.new
+    sum.add!(a, b)
+    b.add!(a, b)
+    assert_eq b.cmp(sum), 0
+  }
+}
+
+test "FloatMul" {
+  modes = [RoundingMode.ToZero, RoundingMode.ToNearestEven, RoundingMode.AwayFromZero]
+  for xbits in t_bits_list {
+    for ybits in t_bits_list {
+      x = bits_float(xbits)
+      y = bits_float(ybits)
+      zbits = bits_mul(xbits, ybits)
+      z = bits_float(zbits)
+      for mode in modes {
+        for prec in t_prec_list {
+          got = float_with(prec, mode)
+          got.mul!(x, y)
+          want = bits_round(zbits, prec, mode)
+          assert got.cmp(want) == 0, "prec = #{prec}, #{mode}: #{x} * #{y} = #{got}; want #{want}"
+          next if x.sign == 0
+          got.quo!(z, x)
+          want = bits_round(ybits, prec, mode)
+          assert got.cmp(want) == 0, "prec = #{prec}, #{mode}: #{z} / #{x} = #{got}; want #{want}"
+        }
+      }
+    }
+  }
+}
+
+test "FloatMul64" {
+  for t in t_test_float_mul64_0 {
+    for i in 0...8 {
+      x0 = t.x
+      y0 = t.y
+      x0 = -1.0 * x0 if i & 1 != 0
+      y0 = -1.0 * y0 if i & 2 != 0
+      if i & 4 != 0 {
+        tt = x0
+        x0 = y0
+        y0 = tt
+      }
+      x = new_float(x0)
+      y = new_float(y0)
+      z = Float.new
+      z.set_prec!(53)
+      z.mul!(x, y)
+      got, _a = z.float64
+      want = x0 * y0
+      assert got == want, "#{x0} * #{y0} = #{got}; want #{want}"
+      next if y0 == 0.0
+      z.quo!(z, y)
+      got2, _a2 = z.float64
+      want /= y0
+      assert got2 == want, "#{x0 * y0} / #{y0} = #{got2}; want #{want}"
+    }
+  }
+}
+
+test "Issue6866" {
+  for prec in t_prec_list {
+    two = float_with(prec, RoundingMode.ToNearestEven)
+    two.set_int64!(2)
+    one = float_with(prec, RoundingMode.ToNearestEven)
+    one.set_int64!(1)
+    three = float_with(prec, RoundingMode.ToNearestEven)
+    three.set_int64!(3)
+    msix = float_with(prec, RoundingMode.ToNearestEven)
+    msix.set_int64!(-6)
+    psix = float_with(prec, RoundingMode.ToNearestEven)
+    psix.set_int64!(6)
+    p = float_with(prec, RoundingMode.ToNearestEven)
+    z1 = float_with(prec, RoundingMode.ToNearestEven)
+    z2 = float_with(prec, RoundingMode.ToNearestEven)
+    p.quo!(one, three)
+    p.mul!(p, msix)
+    z1.add!(two, p)
+    p.quo!(one, three)
+    p.mul!(p, psix)
+    z2.sub!(two, p)
+    assert_eq z1.cmp(z2), 0
+    assert_eq z1.sign, 0
+    assert_eq z2.sign, 0
+  }
+}
+
+test "FloatQuo" {
+  preci = 200
+  precf = 20
+  for i in 0...8 {
+    bits: [I64] = [preci - 1]
+    bits << 0 if i & 3 != 0
+    bits << -1 if i & 2 != 0
+    bits << 0 - precf if i & 1 != 0
+    z = bits_float(bits)
+    y = new_float(3.14159265358979323e123)
+    x = float_with(z.prec + y.prec, RoundingMode.ToZero)
+    x.mul!(z, y)
+    assert_eq x.acc, Accuracy.Exact
+    for mode in [RoundingMode.ToZero, RoundingMode.ToNearestEven, RoundingMode.AwayFromZero] {
+      for d in -5...5 {
+        prec = preci + d
+        got = float_with(prec, mode)
+        got.quo!(x, y)
+        want = bits_round(bits, prec, mode)
+        assert got.cmp(want) == 0, "i = #{i}, prec = #{prec}, #{mode}: #{got}; want #{want}"
+      }
+    }
+  }
+}
+
+test "FloatQuoSmoke" {
+  n = 10
+  dprec = 3
+  prec = 10 + dprec
+  for x in -n..n {
+    for y in -n...n {
+      next if y == 0
+      a = x.to_f
+      b = y.to_f
+      c = a / b
+      for ad in -dprec..dprec {
+        for bd in -dprec..dprec {
+          aa = Float.new
+          aa.set_prec!(prec + ad)
+          aa.set_float64!(a)
+          bb = Float.new
+          bb.set_prec!(prec + bd)
+          bb.set_float64!(b)
+          cc = Float.new
+          cc.set_prec!(53)
+          cc.quo!(aa, bb)
+          got, acc = cc.float64
+          assert got == c, "#{a}/#{b} = #{cc.text("g", 5)}; want #{c}"
+          assert acc == Accuracy.Exact, "#{a}/#{b}: inexact"
+        }
+      }
+    }
+  }
+}
+
+def special_args -> [F64] { [math.inf(-1), -2.71828, -1.0, neg_zero, 0.0, 1.0, 2.71828, math.inf(1)] }
+
+test "FloatArithmeticSpecialValues" {
+  args = special_args
+  for i in 0...4 {
+    for x in args {
+      xx = Float.new
+      xx.set_float64!(x)
+      g0, a0 = xx.float64
+      assert g0 == x && a0 == Accuracy.Exact, "Float(#{x})"
+      for y in args {
+        yy = Float.new
+        yy.set_float64!(y)
+        z = 0.0
+        if i == 0 {
+          z = x + y
+        } elsif i == 1 {
+          z = x - y
+        } elsif i == 2 {
+          z = x * y
+        } else {
+          z = x / y
+        }
+        # Go checks that a NaN result panics with ErrNaN; alx can't
+        # recover the panic, so those cases are skipped.
+        next if math.is_nan(z)
+        got = Float.new
+        if i == 0 {
+          got.add!(xx, yy)
+        } elsif i == 1 {
+          got.sub!(xx, yy)
+        } elsif i == 2 {
+          got.mul!(xx, yy)
+        } else {
+          got.quo!(xx, yy)
+        }
+        want = Float.new
+        want.set_float64!(z)
+        assert alike(got, want), "#{x} op#{i} #{y} = #{got}; want #{want}"
+      }
+    }
+  }
+}
+
+test "FloatArithmeticOverflow" {
+  for t in t_test_float_arithmetic_overflow_0 {
+    x = make_float(t.x)
+    y = make_float(t.y)
+    z = float_with(t.prec, t.mode)
+    if t.op == 43 {
+      z.add!(x, y)
+    } elsif t.op == 45 {
+      z.sub!(x, y)
+    } elsif t.op == 42 {
+      z.mul!(x, y)
+    } else {
+      z.quo!(x, y)
+    }
+    assert z.text("p", 0) == t.want && z.acc == t.acc, "prec = #{t.prec} (#{t.mode}): #{x.text("p", 0)} op #{y.text("p", 0)} = #{z.text("p", 0)} (#{z.acc}); want #{t.want} (#{t.acc})"
+  }
+}
+
+test "FloatArithmeticRounding" {
+  for t in t_test_float_arithmetic_rounding_0 {
+    x = Float.new
+    y = Float.new
+    x.set_int64!(t.x)
+    y.set_int64!(t.y)
+    z = float_with(t.prec, t.mode)
+    if t.op == 43 {
+      z.add!(x, y)
+    } elsif t.op == 45 {
+      z.sub!(x, y)
+    } elsif t.op == 42 {
+      z.mul!(x, y)
+    } else {
+      z.quo!(x, y)
+    }
+    got, acc = z.int64
+    assert got == t.want && acc == Accuracy.Exact, "#{t.mode}, #{t.prec} bits: #{t.x} op #{t.y} = #{got}; want #{t.want}"
+  }
+}
+
+test "FloatCmpSpecialValues" {
+  args = special_args
+  for _i in 0...4 {
+    for x in args {
+      xx = Float.new
+      xx.set_float64!(x)
+      for y in args {
+        yy = Float.new
+        yy.set_float64!(y)
+        want = 0
+        want = -1 if x < y
+        want = 1 if x > y
+        assert_eq xx.cmp(yy), want
+      }
+    }
+  }
+}

@@ -192,6 +192,8 @@ pub struct Local {
 pub enum M {
     /// A Ruby string convenience (see strgen.rs; the code is its StrFn).
     StrHelper(u8),
+    /// `s.byteindex(sub, from)`: Ruby's String#byteindex (Rt::StrIndex).
+    ByteIndex,
     // stages
     Select,
     Reject,
@@ -234,6 +236,8 @@ pub enum M {
     Split,
     Even,
     Odd,
+    /// `u.__mulhi(v)` (U64): the high word of the 128-bit product (math/bits, math/big).
+    UMulHi,
     Digits,
     Step,
     Push,

@@ -1,0 +1,113 @@
+#![overflow(wrap)]
+# Package subtle: Go's crypto/subtle, functions that are often useful in
+# cryptographic code but require careful thought to use correctly.
+#
+#   Go                                  alx
+#   ConstantTimeCompare(x, y) int       constant_time_compare(x, y) -> Int
+#   ConstantTimeSelect(v, x, y) int     constant_time_select(v, x, y) -> Int
+#   ConstantTimeByteEq(x, y) int        constant_time_byte_eq(x, y) -> Int
+#   ConstantTimeEq(x, y int32) int      constant_time_eq(x: I32, y: I32) -> Int
+#   ConstantTimeCopy(v, x, y)           constant_time_copy(v, x, y)
+#   ConstantTimeLessOrEq(x, y) int      constant_time_less_or_eq(x, y) -> Int
+#   XORBytes(dst, x, y) int             xor_bytes(dst, x, y) -> Int
+#   WithDataIndependentTiming(f)        with_data_independent_timing { ... }
+#
+# The results are Ints (1 or 0), as in Go, so that callers can keep
+# combining them with arithmetic instead of branching on a Bool.
+#
+# Differences from Go:
+#   - Go's compiler turns its bool-to-int conversions into branch-free
+#     instructions (constanttime.boolToUint8 is an intrinsic). alx has no
+#     such intrinsic, so the comparisons are the arithmetic forms Go used
+#     before Go 1.25: masks built from subtraction and shifts, no branches
+#     on the inputs. (A C compiler could still turn them into branches; Go's
+#     guarantee rests on its own compiler in the same way.)
+#   - xor_bytes can't detect inexact overlap of dst with x or y (alx slices
+#     don't expose addresses), so it doesn't panic with "invalid overlap":
+#     the bytes are XORed from the first to the last.
+#   - with_data_independent_timing runs the block without setting the arm64
+#     PSTATE.DIT bit: there is no way to set it from alx (no inline
+#     assembly, and libc has no call for it). Go does the same on every
+#     architecture other than arm64.
+
+# 1 if the two slices have equal contents and 0 otherwise. The time taken
+# depends on the length of the slices and not on their contents. If the
+# lengths differ it returns 0 immediately.
+pub def constant_time_compare(x: [Byte], y: [Byte]) -> Int {
+  return 0 if x.size != y.size
+  v: Byte = 0
+  i = 0
+  while i < x.size {
+    v = v | (x[i] ^ y[i])
+    i += 1
+  }
+  constant_time_byte_eq(v, 0)
+}
+
+# x if v != 0 and y if v == 0 (Go documents only v == 1 and v == 0).
+pub def constant_time_select(v: Int, x: Int, y: Int) -> Int {
+  u = v.as_u64
+  # 1 if v != 0: the top bit of v | -v is set exactly then.
+  nz = ((u | (0 -% u)) >> 63).as_i64
+  (^(nz - 1) & x) | ((nz - 1) & y)
+}
+
+# 1 if x == y and 0 otherwise.
+pub def constant_time_byte_eq(x: Byte, y: Byte) -> Int {
+  z = (x ^ y).as_u32
+  ((z - 1) >> 31).as_i64
+}
+
+# 1 if x == y and 0 otherwise.
+pub def constant_time_eq(x: I32, y: I32) -> Int {
+  z = (x ^ y).as_u32.as_u64
+  ((z - 1) >> 63).as_i64
+}
+
+# Copies y into x (a slice of equal length) if v == 1; leaves x unchanged if
+# v == 0. Its behavior is undefined for any other v. Panics if the lengths
+# differ.
+pub def constant_time_copy(v: Int, x: [Byte], y: [Byte]) {
+  panic("subtle: slices have different lengths") if x.size != y.size
+  xmask = (v - 1).as_u8
+  ymask = (^(v - 1)).as_u8
+  dst = x
+  i = 0
+  while i < x.size {
+    dst[i] = (x[i] & xmask) | (y[i] & ymask)
+    i += 1
+  }
+  nil
+}
+
+# 1 if x <= y and 0 otherwise. Its behavior is undefined if x or y are
+# negative or greater than 2**31 - 1.
+pub def constant_time_less_or_eq(x: Int, y: Int) -> Int {
+  x32 = x.as_i32
+  y32 = y.as_i32
+  (((x32 - y32 - 1) >> 31) & 1).as_i64
+}
+
+# Sets dst[i] = x[i] ^ y[i] for all i < n = min(x.size, y.size) and returns
+# n. Panics without writing anything if dst is shorter than n. dst and x or
+# y may be the same slice.
+pub def xor_bytes(dst: [Byte], x: [Byte], y: [Byte]) -> Int {
+  n = x.size < y.size ? x.size : y.size
+  return 0 if n == 0
+  panic("subtle.XORBytes: dst too short") if n > dst.size
+  d = dst[0...n]
+  a = x[0...n]
+  b = y[0...n]
+  i = 0
+  while i < n {
+    d[i] = a[i] ^ b[i]
+    i += 1
+  }
+  n
+}
+
+# Runs f with the processor's data-independent-timing mode on, where there
+# is one. Here, it runs f (see the header).
+pub def with_data_independent_timing(f: () -> Unit) {
+  f()
+}

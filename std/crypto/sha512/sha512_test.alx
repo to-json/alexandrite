@@ -1,0 +1,163 @@
+import "io"
+import "hash"
+import "encoding/hex"
+
+# Go's sha512_test.go, translated. The tables are in golden_test.alx; Go's
+# internal/testhash is testhash_test.alx. cryptotest.TestAllImplementations
+# runs each test once per implementation (assembly, generic); alx has one.
+#
+# Not translated: TestAllocations (allocation counting), TestExtraMethods
+# (reflection over the method set).
+
+def check_golden(gold: [Golden], one: ([Byte]) -> [Byte], d0: Digest) {
+  digest = d0
+  for g in gold {
+    assert_eq hex.encode_to_string(one(g.input)), g.out
+    pass = 0
+    while pass < 3 {
+      if pass < 2 {
+        digest.write!(g.input)
+      } else {
+        half = g.input.size / 2
+        digest.write!(g.input[0...half])
+        digest.sum([])
+        digest.write!(g.input[half...g.input.size])
+      }
+      assert_eq hex.encode_to_string(digest.sum([])), g.out
+      digest.reset!
+      pass += 1
+    }
+  }
+}
+
+test "golden" {
+  check_golden(golden224(), ->(p: [Byte]) -> [Byte] { sum512_224(p).to_a }, new512_224())
+  check_golden(golden256(), ->(p: [Byte]) -> [Byte] { sum512_256(p).to_a }, new512_256())
+  check_golden(golden384(), ->(p: [Byte]) -> [Byte] { sum384(p).to_a }, new384())
+  check_golden(golden512(), ->(p: [Byte]) -> [Byte] { sum512(p).to_a }, new())
+}
+
+def check_golden_marshal(gold: [Golden], mk: () -> Digest) {
+  for g in gold {
+    h = mk()
+    h2 = mk()
+    half = g.input.size / 2
+    io.write_all(h, g.input[0...half]).unwrap
+    state = h.marshal_binary
+    state_append = h.append_binary([0, 0, 0, 0])
+    state_append = state_append[4...state_append.size]
+    assert_eq state, g.half_state
+    assert_eq state_append, g.half_state
+    h2.unmarshal_binary!(state).unwrap
+    io.write_all(h, g.input[half...g.input.size]).unwrap
+    io.write_all(h2, g.input[half...g.input.size]).unwrap
+    assert_eq h.sum([]), h2.sum([])
+  }
+}
+
+test "golden marshal" {
+  check_golden_marshal(golden224(), ->() -> Digest { new512_224() })
+  check_golden_marshal(golden256(), ->() -> Digest { new512_256() })
+  check_golden_marshal(golden384(), ->() -> Digest { new384() })
+  check_golden_marshal(golden512(), ->() -> Digest { new() })
+}
+
+def constructors -> [() -> Digest] {
+  [->() -> Digest { new() }, ->() -> Digest { new384() }, ->() -> Digest { new512_224() },
+    ->() -> Digest { new512_256() }]
+}
+
+test "marshal mismatch" {
+  hs = constructors()
+  i = 0
+  while i < hs.size {
+    j = 0
+    while j < hs.size {
+      if i != j {
+        f1 = hs[i]
+        h1 = f1()
+        f2 = hs[j]
+        h2 = f2()
+        state = h1.marshal_binary
+        r = h2.unmarshal_binary!(state)
+        assert r.err.present?, "i=#{i}, j=#{j}: got no error, expected one"
+      }
+      j += 1
+    }
+    i += 1
+  }
+}
+
+test "unmarshal errors" {
+  h = new()
+  r = h.unmarshal_binary!(b("sha\x07abc"))
+  assert_eq "#{r.err.unwrap}", "crypto/sha512: invalid hash state size"
+  r2 = h.unmarshal_binary!(b("sha"))
+  assert_eq "#{r2.err.unwrap}", "crypto/sha512: invalid hash state identifier"
+}
+
+test "size" {
+  assert_eq new().size, SIZE
+  assert_eq new384().size, SIZE384
+  assert_eq new512_224().size, SIZE224
+  assert_eq new512_256().size, SIZE256
+}
+
+test "block size" {
+  assert_eq new().block_size, BLOCK_SIZE
+}
+
+test "large hashes" {
+  for t in large_unmarshal_tests() {
+    h = new()
+    h.unmarshal_binary!(t.state).unwrap
+    assert_eq hex.encode_to_string(h.sum([])), t.sum
+  }
+}
+
+test "hash" {
+  check_hash(->() -> hash.Hash { new512_224() })
+  check_hash(->() -> hash.Hash { new512_256() })
+  check_hash(->() -> hash.Hash { new384() })
+  check_hash(->() -> hash.Hash { new() })
+  for mk in constructors() {
+    check_clone(mk())
+  }
+}
+
+# The Clone subtest of Go's testhash.TestHash.
+def check_clone(h: Digest) {
+  h3 = h.clone
+  prefix = b("tmp")
+  h.write!(prefix)
+  h2 = h.clone
+  prefix_sum = h.sum([])
+  assert_eq prefix_sum, h2.sum([])
+  suffix = b("tmp2")
+  h.write!(suffix)
+  h3.write!(prefix + suffix)
+  composite = h3.sum([])
+  assert_eq h.sum([]), composite
+  assert_eq h2.sum([]), prefix_sum
+  h2.write!(suffix)
+  assert_eq h.sum([]), composite
+  assert_eq h2.sum([]), composite
+}
+
+def bench_data(n: Int) -> [Byte] {
+  [0x5a.as_u8; n]
+}
+
+bench "sha512 1MB" {
+  d = new()
+  d.write!(bench_data(1 << 20))
+  d.sum([])
+}
+
+bench "sha512 8 bytes" {
+  sum512(b("12345678"))
+}
+
+bench "sha512 1K" {
+  sum512(bench_data(1024))
+}

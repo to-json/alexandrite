@@ -101,7 +101,7 @@ pub fn allocates(e: &TExpr, promote: bool) -> bool {
             // Scalars, reads, and terminals that produce an element or a number
             // (their blocks' allocations are sites of their own).
             M::TupleGet(_) | M::OptPresent | M::OptGet | M::Unwrap | M::EnumTag | M::Size | M::MapSize | M::MapHas | M::ChanLen | M::ResIsOk | M::ErrIs(_) | M::ErrAs(_)
-                | M::Even | M::Odd | M::IntSqrt | M::ToF | M::FloatToI | M::Conv(..) | M::FloatAbs | M::Sqrt | M::Math(_) | M::FloatBits | M::FloatFromBits | M::NowNs | M::PtrNull | M::CErrno
+                | M::Even | M::Odd | M::IntSqrt | M::ToF | M::FloatToI | M::Conv(..) | M::FloatAbs | M::Sqrt | M::Math(_) | M::FloatBits | M::FloatFromBits | M::UMulHi | M::NowNs | M::PtrNull | M::CErrno
                 | M::Sum | M::Max | M::Min | M::MaxBy | M::MinBy | M::Count | M::All | M::Any | M::Include | M::First | M::Last | M::Find | M::Each | M::Loop | M::Step
                 | M::ChanClose | M::CapBegin | M::Exit | M::Global(_)
         ) || (promote && e.ty == Ty::Int),
@@ -280,8 +280,16 @@ impl<'a> Graph<'a> {
                         let mut stored: Vec<Node> = if key_copied { per_arg.iter().skip(1).flatten().copied().collect() } else { avs.clone() };
                         stored.push(site(e));
                         self.flow(&stored, &rv);
-                        if *m == M::CopyInto && per_arg.len() >= 2 {
-                            // copy(dst, src): src's elements into dst.
+                        // copy(dst, src): src's elements into dst. Elements
+                        // without storage (a [U64], a [Byte]) are copied by
+                        // value: src needn't outlive dst (math/big copies
+                        // words between scratch and result buffers).
+                        let promote = self.f.overflow == crate::ast::Overflow::Promote;
+                        let flat = args.first().is_some_and(|a| match &a.ty {
+                            Ty::Array(t) | Ty::Fixed(t, _) => !has_storage(t) && !(promote && contains_int(t)),
+                            _ => false,
+                        });
+                        if *m == M::CopyInto && per_arg.len() >= 2 && !flat {
                             let (d, s) = (per_arg[0].clone(), per_arg[1].clone());
                             self.flow(&s, &d);
                         }

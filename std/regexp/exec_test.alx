@@ -1,0 +1,324 @@
+# Go's regexp exec_test.go: RE2's search and (sampled) exhaustive tests,
+# Fowler's POSIX tests, TestLongest and TestProgramTooLongForBacktrack.
+
+import "regexp/syntax"
+import "strconv"
+import "strings"
+import "unicode/utf8"
+
+# Whether every rune of s is ASCII.
+def single_bytes?(s: Str) -> Bool {
+  i = 0
+  while i < s.size {
+    return false if s[i] >= 0x80
+    i += 1
+  }
+  true
+}
+
+# Parses one RE2 result: "-" (no match) or space-separated pairs "lo-hi"
+# ("-" for an unmatched group). none means no match.
+def parse_result(res: Str) -> [Int]? {
+  return none if res == "-"
+  out: [Int] = []
+  for pair in strings.split(res, " ") {
+    if pair == "-" {
+      out << -1
+      out << -1
+    } else {
+      lo, hi = strings.cut(pair, "-").unwrap
+      out << strconv.atoi(lo).unwrap
+      out << strconv.atoi(hi).unwrap
+    }
+  }
+  out
+}
+
+# The submatch positions from each engine that applies: the NFA always,
+# the backtracker if the program is small enough, one-pass if compiled.
+def engine_results(re0: Regexp, text: Str) -> [(Str, [Int]?)] {
+  out: [(Str, [Int]?)] = []
+  # The NFA and backtracker use the prefix Go computes for programs that
+  # aren't one-pass.
+  dd = re0.d[0]
+  p, c = dd.prog.prefix
+  dd.prefix = p
+  dd.prefix_complete = c
+  dd.prefix_rune = p.size > 0 ? utf8.decode_rune_at(p, 0)[0].to_i : 0
+  dd.max_bit_state_len = max_bit_state_len(dd.inst_op.size)
+  dd.has_onepass = false
+  re = Regexp.new(d: [dd], longest: re0.longest)
+  v = new_nfa(re, re.d[0].num_cap)
+  out << ("nfa", nfa_match(v, re, text, 0) ? re.pad(v.tcap[0...re.d[0].num_cap].clone) : none)
+  # The NFA with no captures: just whether it matches.
+  v0 = new_nfa(re, 0)
+  m0 = nfa_match(v0, re, text, 0)
+  out << ("nfa0", m0 == out[0][1].present? ? out[0][1] : none)
+  if re.d[0].max_bit_state_len > 0 {
+    if b = backtrack(re, text, 0, re.d[0].num_cap) {
+      out << ("backtrack", re.pad(b))
+    } else {
+      out << ("backtrack", none)
+    }
+  }
+  if re0.d[0].has_onepass {
+    if o = do_one_pass(re0, text, 0, re0.d[0].num_cap) {
+      out << ("onepass", re.pad(o))
+    } else {
+      out << ("onepass", none)
+    }
+  }
+  out
+}
+
+def show(a: [Int]?) -> Str {
+  if x = a {
+    return "#{x}"
+  }
+  "nil"
+}
+
+# Go's testRE2 over a data file; returns the number of cases run. Every
+# failure is an assertion; stops after 20 failures.
+def run_re2(data: Str) -> Int {
+  strs: [Str] = []
+  input: [Str] = []
+  in_strings = false
+  have_re = false
+  re = must_compile("")
+  refull = must_compile("")
+  ncase = 0
+  nfail = 0
+  lineno = 0
+  for line in strings.split(data, "\n") {
+    lineno += 1
+    next if line == ""
+    c = line[0]
+    if c == 35 {
+      next
+    } else if c >= 65 && c <= 90 {
+      next # Test name.
+    } else if line == "strings" {
+      strs = []
+      in_strings = true
+    } else if line == "regexps" {
+      in_strings = false
+    } else if c == 34 {
+      q = strconv.unquote(line).unwrap
+      if in_strings {
+        strs << q
+        next
+      }
+      # Is a regexp.
+      assert input.size == 0, "line #{lineno}: out of sync: strings left before #{q}"
+      r = compile(q)
+      if x = r.ok {
+        re = x
+        have_re = true
+      } else {
+        have_re = false
+        # We don't and likely never will support \C; keep going.
+        assert_eq r.err.unwrap.message, "error parsing regexp: invalid escape sequence: `\\C`"
+        next
+      }
+      refull = must_compile("\\A(?:" + q + ")\\z")
+      input = strs
+    } else if c == 45 || (c >= 48 && c <= 57) {
+      # A sequence of match results.
+      ncase += 1
+      next if !have_re
+      assert input.size > 0, "line #{lineno}: out of sync: no input remaining"
+      text = input[0]
+      input = input[1...input.size]
+      # RE2's \B considers every byte position, so it sees 'not word
+      # boundary' in the middle of UTF-8 sequences. This package only
+      # considers the positions between runes, so it disagrees. Skip.
+      next if !single_bytes?(text) && strings.contains(re.to_s, "\\B")
+      res = strings.split(line, ";")
+      assert_eq res.size, 4
+      i = 0
+      while i < 4 {
+        r2 = i % 2 == 0 ? refull : re
+        r2.longest = i >= 2
+        have = r2.find_string_submatch_index(text)
+        want = parse_result(res[i])
+        if show(have) != show(want) {
+          nfail += 1
+          assert false, "line #{lineno}: #{r2.to_s} run #{i} find_string_submatch_index(#{strconv.quote(text)}) = #{show(have)}, want #{show(want)}"
+          return ncase if nfail >= 20
+        }
+        # Every engine on its own must agree (the public API picks one by
+        # size, so short inputs alone would never reach the NFA).
+        for e in engine_results(r2, text) {
+          if show(e[1]) != show(want) {
+            nfail += 1
+            assert false, "line #{lineno}: #{r2.to_s} run #{i} engine #{e[0]} on #{strconv.quote(text)} = #{show(e[1])}, want #{show(want)}"
+            return ncase if nfail >= 20
+          }
+        }
+        b = r2.match_string?(text)
+        if b != want.present? {
+          nfail += 1
+          assert false, "line #{lineno}: #{r2.to_s} run #{i} match_string?(#{strconv.quote(text)}) = #{b}"
+          return ncase if nfail >= 20
+        }
+        i += 1
+      }
+    } else {
+      assert false, "line #{lineno}: out of sync: #{line}"
+    }
+  }
+  assert input.size == 0, "out of sync: strings left at EOF"
+  ncase
+}
+
+test "re2 search" {
+  n = run_re2(re2_search_data)
+  assert_eq n, 1888
+}
+
+test "re2 exhaustive (sample)" {
+  n = run_re2(re2_exhaustive_data)
+  assert_eq n, 144536 # every 40th regexp of each stanza: see re2_exhaustive_data_test.alx
+}
+
+# ------------------------------------------------------------------ Fowler
+
+# Go's parseFowlerResult: (ok, compiled, matched, pos).
+def parse_fowler_result(s0: Str) -> (Bool, Bool, Bool, [Int]) {
+  s = s0
+  return (true, true, true, []) if s == ""                    # match with no position information
+  return (true, true, false, []) if s == "NOMATCH"            # match failure
+  return (true, false, false, []) if s[0] >= 65 && s[0] <= 90 # compile errors
+  x: [Int] = []
+  while s != "" {
+    end = 41 # )
+    if x.size % 2 == 0 {
+      return (false, true, false, []) if s[0] != 40
+      s = s[1...s.size]
+      end = 44 # ,
+    }
+    i = 0
+    while i < s.size && s[i].to_i != end { i += 1 }
+    return (false, true, false, []) if i == 0 || i == s.size
+    v = -1
+    if s[0...i] != "?" {
+      if n = strconv.atoi(s[0...i]).ok {
+        v = n
+      } else {
+        return (false, true, false, [])
+      }
+    }
+    x << v
+    s = s[i + 1...s.size]
+  }
+  return (false, true, false, []) if x.size % 2 != 0
+  (true, true, true, x)
+}
+
+# Go's testFowler over one .dat file; returns the number of tests run.
+def run_fowler(name: Str, data: Str) -> Int {
+  notab = must_compile_posix("[^\\t]+")
+  last_regexp = ""
+  lineno = 0
+  ntest = 0
+  for line in strings.split(data, "\n") {
+    lineno += 1
+    next if line == "" || line[0] == 35
+    field = notab.find_all_string(line, -1)
+    skip = false
+    i = 0
+    while i < field.size {
+      field[i] = "" if field[i] == "NULL"
+      skip = true if field[i] == "NIL"
+      i += 1
+    }
+    next if skip || field.size == 0
+    flag = field[0]
+    f0 = flag[0]
+    if f0 == 63 || f0 == 38 || f0 == 124 || f0 == 59 || f0 == 123 || f0 == 125 {
+      # Ignore all the control operators. Just run everything.
+      flag = flag[1...flag.size]
+      next if flag == ""
+    } else if f0 == 58 {
+      if cut = strings.cut(flag[1...flag.size], ":") {
+        flag = cut[1]
+      } else {
+        next
+      }
+    } else if f0 == 67 || f0 == 78 || f0 == 84 || (f0 >= 48 && f0 <= 57) {
+      next
+    }
+    assert field.size >= 4, "#{name}:#{lineno}: too few fields: #{line}"
+    next if field.size < 4
+    # Expand C escapes (a.k.a. Go escapes).
+    if strings.contains(flag, "$") {
+      field[1] = strconv.unquote("\"" + field[1] + "\"").unwrap
+      field[2] = strconv.unquote("\"" + field[2] + "\"").unwrap
+    }
+    # Field 2: the regular expression pattern; SAME uses the previous one.
+    field[1] = last_regexp if field[1] == "SAME"
+    last_regexp = field[1]
+    # Field 3: the string to match.
+    text = field[2]
+    # Field 4: the test outcome.
+    ok, should_compile, should_match, pos = parse_fowler_result(field[3])
+    assert ok, "#{name}:#{lineno}: cannot parse result #{field[3]}"
+    next if !ok
+    # Run test once for each specified capital letter mode that we support.
+    for c in flag.bytes {
+      pattern = field[1]
+      syn = syntax.POSIX | syntax.CLASS_NL
+      if c == 69 {
+        # E: extended regexp (what we support)
+      } else if c == 76 {
+        # L: literal
+        pattern = quote_meta(pattern)
+      } else {
+        next
+      }
+      syn |= syntax.FOLD_CASE if strings.contains(flag, "i")
+      r = compile_with(pattern, syn, true)
+      if re = r.ok {
+        ntest += 1
+        assert should_compile, "#{name}:#{lineno}: #{pattern} should not compile"
+        next if !should_compile
+        m = re.match_string?(text)
+        assert m == should_match, "#{name}:#{lineno}: #{pattern}.match(#{text}) = #{m}, want #{should_match}"
+        next if m != should_match
+        have = re.find_string_submatch_index(text) || []
+        assert (have.size > 0) == m, "#{name}:#{lineno}: match and find_string_submatch_index disagree"
+        have = have[0...pos.size] if have.size > pos.size
+        assert_eq have, pos
+      } else {
+        assert !should_compile, "#{name}:#{lineno}: #{pattern} did not compile"
+      }
+    }
+  }
+  ntest
+}
+
+test "fowler basic" {
+  assert_eq run_fowler("basic.dat", basic_dat), 205
+}
+
+test "fowler nullsubexpr" {
+  assert_eq run_fowler("nullsubexpr.dat", nullsubexpr_dat), 50
+}
+
+test "fowler repetition" {
+  assert_eq run_fowler("repetition.dat", repetition_dat), 91
+}
+
+test "longest" {
+  re = compile("a(|b)").unwrap
+  assert_eq re.find_string("ab"), "a"
+  re.longest!
+  assert_eq re.find_string("ab"), "ab"
+}
+
+test "program too long for backtrack" {
+  long_regex = must_compile("(one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|nineteen|twenty|twentyone|twentytwo|twentythree|twentyfour|twentyfive|twentysix|twentyseven|twentyeight|twentynine|thirty|thirtyone|thirtytwo|thirtythree|thirtyfour|thirtyfive|thirtysix|thirtyseven|thirtyeight|thirtynine|forty|fortyone|fortytwo|fortythree|fortyfour|fortyfive|fortysix|fortyseven|fortyeight|fortynine|fifty|fiftyone|fiftytwo|fiftythree|fiftyfour|fiftyfive|fiftysix|fiftyseven|fiftyeight|fiftynine|sixty|sixtyone|sixtytwo|sixtythree|sixtyfour|sixtyfive|sixtysix|sixtyseven|sixtyeight|sixtynine|seventy|seventyone|seventytwo|seventythree|seventyfour|seventyfive|seventysix|seventyseven|seventyeight|seventynine|eighty|eightyone|eightytwo|eightythree|eightyfour|eightyfive|eightysix|eightyseven|eightyeight|eightynine|ninety|ninetyone|ninetytwo|ninetythree|ninetyfour|ninetyfive|ninetysix|ninetyseven|ninetyeight|ninetynine|onehundred)")
+  assert long_regex.match_string?("two")
+  assert !long_regex.match_string?("xxx")
+}

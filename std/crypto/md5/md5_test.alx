@@ -1,0 +1,169 @@
+import "io"
+import "encoding/hex"
+import "hash"
+
+# Go's md5_test.go and example_test.go, translated. The tables are in
+# golden_test.alx; Go's internal/testhash is testhash_test.alx.
+#
+# Not translated: TestBlockGeneric (compares the assembly block function
+# with the generic one; alx has only the generic one), TestAllocations
+# (allocation counting), TestExtraMethods (reflection over the method set),
+# ExampleNew_file (opens a file.txt that isn't there; Go doesn't run it either).
+
+test "golden" {
+  for g in golden() {
+    assert_eq hexs(sum(g.input).to_a), g.out
+    c = new()
+    buf = [0.as_u8; g.input.size + 4]
+    j = 0
+    while j < 3 + 4 {
+      if j < 2 {
+        c.write!(g.input)
+      } else if j == 2 {
+        half = g.input.size / 2
+        c.write!(g.input[0...half])
+        c.sum([])
+        c.write!(g.input[half...g.input.size])
+      } else {
+        # an unaligned write
+        buf = buf[1...buf.size]
+        copy(buf, g.input)
+        c.write!(buf[0...g.input.size])
+      }
+      assert_eq hexs(c.sum([])), g.out
+      c.reset!
+      j += 1
+    }
+  }
+}
+
+test "golden marshal" {
+  for g in golden() {
+    h = new()
+    h2 = new()
+    half = g.input.size / 2
+    h.write!(g.input[0...half])
+    state = h.marshal_binary
+    state_append = h.append_binary([0, 0, 0, 0])
+    state_append = state_append[4...state_append.size]
+    assert_eq state, g.half_state
+    assert_eq state_append, g.half_state
+    h2.unmarshal_binary!(state).unwrap
+    h.write!(g.input[half...g.input.size])
+    h2.write!(g.input[half...g.input.size])
+    assert_eq h.sum([]), h2.sum([])
+  }
+}
+
+# Writes "0123456789" * (n / 10) in blocks of every power-of-ten size, at
+# four offsets.
+def check_large(n: Int, ok: Str) {
+  offsets = 4
+  blk = [0.as_u8; n + offsets]
+  c = new()
+  offset = 0
+  while offset < offsets {
+    i = 0
+    while i < n {
+      blk[offset + i] = 48 + (i % 10).as_u8
+      i += 1
+    }
+    block_size = 10
+    while block_size <= n {
+      blocks = n / block_size
+      p = blk[offset...offset + block_size]
+      c.reset!
+      i = 0
+      while i < blocks {
+        c.write!(p)
+        i += 1
+      }
+      assert_eq hexs(c.sum([])), ok
+      block_size *= 10
+    }
+    offset += 1
+  }
+}
+
+test "large" {
+  check_large(10000, "2bb571599a4180e1d542f76904adc3df")
+}
+
+test "extra large" {
+  check_large(100000, "13572e9e296cff52b79c52148313c3a5")
+}
+
+test "large hashes" {
+  for t in large_unmarshal_tests() {
+    h = new()
+    h.unmarshal_binary!(t.state).unwrap
+    assert_eq hexs(h.sum([])), t.sum
+  }
+}
+
+test "unmarshal errors" {
+  h = new()
+  r = h.unmarshal_binary!(b("md5\x02"))
+  assert_eq "#{r.err.unwrap}", "crypto/md5: invalid hash state identifier"
+  r2 = h.unmarshal_binary!(b("md5\x01abc"))
+  assert_eq "#{r2.err.unwrap}", "crypto/md5: invalid hash state size"
+  r3 = h.unmarshal_binary!(b("md"))
+  assert_eq "#{r3.err.unwrap}", "crypto/md5: invalid hash state identifier"
+}
+
+test "md5 hash" {
+  check_hash(->() -> hash.Hash { new() })
+  check_clone(new())
+}
+
+test "size" {
+  assert_eq new().size, SIZE
+  assert_eq new().block_size, BLOCK_SIZE
+}
+
+# The Clone subtest of Go's testhash.TestHash.
+def check_clone(h: Digest) {
+  h3 = h.clone
+  prefix = b("tmp")
+  h.write!(prefix)
+  h2 = h.clone
+  prefix_sum = h.sum([])
+  assert_eq prefix_sum, h2.sum([])
+  suffix = b("tmp2")
+  h.write!(suffix)
+  h3.write!(prefix + suffix)
+  composite = h3.sum([])
+  assert_eq h.sum([]), composite
+  assert_eq h2.sum([]), prefix_sum
+  h2.write!(suffix)
+  assert_eq h.sum([]), composite
+  assert_eq h2.sum([]), composite
+}
+
+example "new" {
+  h = new()
+  io.write_string(h, "The fog is getting thicker!").unwrap
+  io.write_string(h, "And Leon's getting laaarger!").unwrap
+  puts hex.encode_to_string(h.sum([]))
+} outputs "e2c569be17396eca2a2e3c11578123ed\n"
+
+example "sum" {
+  data = b("These pretzels are making me thirsty.")
+  puts hex.encode_to_string(sum(data).to_a)
+} outputs "b0804ec967f48520697662a204f5fe72\n"
+
+bench "md5 1MB" {
+  d = new()
+  d.write!(bench_data())
+  d.sum([])
+}
+
+bench "md5 8 bytes" {
+  d = new()
+  d.write!(b("12345678"))
+  d.sum([])
+}
+
+def bench_data -> [Byte] {
+  [0x5a.as_u8; 1 << 20]
+}

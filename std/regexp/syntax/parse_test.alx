@@ -1,0 +1,214 @@
+# Go's regexp/syntax parse_test.go: the test helpers and the tests that aren't
+# tables (the tables are in vec_parse_test.alx).
+
+import "strconv"
+import "unicode"
+import "unicode/utf8"
+
+TEST_FLAGS = 204 # MATCH_NL | PERL_X | UNICODE_GROUPS
+
+DUMP_NAMES = ["", "no", "emp", "lit", "cc", "dnl", "dot", "bol", "eol", "bot", "eot", "wb", "nwb", "cap", "star", "plus", "que", "rep", "cat", "alt"]
+
+def raw(b: [Byte]) -> Str { Str.from_bytes(b) }
+
+def hex(r: Rune) -> Str { "0x" + strconv.format_int(r.to_i, 16) }
+
+# A string representation of the tree showing the structure explicitly (Go's
+# dumpRegexp).
+def dump(re: Regexp) -> Str {
+  out = ""
+  op = re.op
+  if op >= DUMP_NAMES.size {
+    out += "op#{op}"
+  } else {
+    case op {
+      OP_STAR | OP_PLUS | OP_QUEST | OP_REPEAT => {
+        out += "n" if (re.flags & NON_GREEDY) != 0
+        out += DUMP_NAMES[op]
+      }
+      OP_LITERAL => {
+        out += re.rune.size > 1 ? "str" : "lit"
+        if (re.flags & FOLD_CASE) != 0 {
+          for r in re.rune {
+            if unicode.simple_fold(r) != r {
+              out += "fold"
+              break
+            }
+          }
+        }
+      }
+      _ => out += DUMP_NAMES[op]
+    }
+  }
+  out += "{"
+  case op {
+    OP_END_TEXT => {
+      out += "\\z" if (re.flags & WAS_DOLLAR) == 0
+    }
+    OP_LITERAL => {
+      b: [Byte] = []
+      for r in re.rune { b = utf8.append_rune(b, r) }
+      out += Str.from_bytes(b)
+    }
+    OP_CONCAT | OP_ALTERNATE => {
+      for s in re.sub { out += dump(s) }
+    }
+    OP_STAR | OP_PLUS | OP_QUEST => out += dump(re.sub[0])
+    OP_REPEAT => out += "#{re.min},#{re.max} " + dump(re.sub[0])
+    OP_CAPTURE => {
+      out += re.name + ":" if re.name != ""
+      out += dump(re.sub[0])
+    }
+    OP_CHAR_CLASS => {
+      sep = ""
+      rs = re.rune
+      i = 0
+      while i < rs.size {
+        out += sep
+        sep = " "
+        out += rs[i] == rs[i + 1] ? hex(rs[i]) : hex(rs[i]) + "-" + hex(rs[i + 1])
+        i += 2
+      }
+    }
+    _ => {}
+  }
+  out + "}"
+}
+
+def dump_of(s: Str, flags: Int) -> Str {
+  r = parse(s, flags)
+  if re = r.ok {
+    return dump(re)
+  }
+  "error: " + r.err.unwrap.message
+}
+
+# The error message for parsing s, or "" if it parses.
+def parse_error(s: Str, flags: Int) -> Str {
+  r = parse(s, flags)
+  return "" if r.ok?
+  r.err.unwrap.message
+}
+
+# The error code of a failed parse.
+def code_of(s: Str, flags: Int) -> Str {
+  e = parse(s, flags).err.unwrap
+  case e {
+    Syntax(c, _) => c
+    _ => ""
+  }
+}
+
+# Go's TestToStringEquivalentParse for one regexp: if String doesn't give back
+# the original, it must parse to the same tree and print the same again.
+def check_string_equivalent(s: Str) {
+  re = parse(s, TEST_FLAGS).unwrap
+  d = dump(re)
+  t = re.to_s
+  if t != s {
+    nre = parse(t, TEST_FLAGS).unwrap
+    assert_eq dump(nre), d
+    assert_eq nre.to_s, t
+  }
+}
+
+# Dump, String, Simplify and Compile of one pattern, against Go's.
+def check_all(s: Str, flags: Int, d: Str, str: Str, simple: Str, prog: Str) {
+  re = parse(s, flags).unwrap
+  assert_eq dump(re), d
+  assert_eq re.to_s, str
+  sre = re.simplify
+  assert_eq sre.to_s, simple
+  assert_eq compile(sre).to_s, prog
+  # Simplify must not change the original tree.
+  assert_eq dump(re), d
+}
+
+test "parse valid nesting" {
+  # Go's parseTests entries built with strings.Repeat: they parse.
+  assert parse("(" * 999 + ")" * 999, TEST_FLAGS).ok.present?
+  assert parse("(?:" * 999 + ")*" * 999, TEST_FLAGS).ok.present?
+  assert parse("(" + "|" * 12345 + ")", TEST_FLAGS).ok.present? # not nested at all
+}
+
+test "parse invalid long regexps" {
+  # Go's invalidRegexps entries built with strings.Repeat.
+  for f in [PERL, POSIX] {
+    assert_eq parse_error("(" * 1000 + ")" * 1000, f).size > 0, true
+    assert_eq code_of("(" * 1000 + ")" * 1000, f), ERR_NESTING_DEPTH
+    assert_eq code_of("(?:" * 1000 + ")*" * 1000, f), f == PERL ? ERR_NESTING_DEPTH : ERR_MISSING_REPEAT_ARGUMENT
+    assert_eq code_of("(" + "(xx?)" * 1000 + "){1000}", f), ERR_LARGE
+    assert_eq code_of("(xx?){1000}" * 1000, f), ERR_LARGE
+    assert_eq code_of("\\pL" * 27000, f), f == PERL ? ERR_LARGE : ERR_INVALID_ESCAPE
+  }
+}
+
+test "fold constants" {
+  last: Rune = -1
+  first: Rune = -1
+  i: Rune = 0
+  while i <= 0x10FFFF {
+    if unicode.simple_fold(i) != i {
+      first = i if first == -1
+      last = i
+    }
+    i += 1
+  }
+  assert_eq first, MIN_FOLD
+  assert_eq last, MAX_FOLD
+}
+
+test "append range collapse" {
+  # append_range should collapse each of the new ranges into the earlier
+  # ones (it looks back two ranges), so that the slice never grows very large.
+  r: [Rune] = []
+  i: Rune = 65
+  while i <= 90 {
+    r = append_range(r, i, i)
+    r = append_range(r, i + 32, i + 32)
+    i += 1
+  }
+  assert_eq r, [65, 90, 97, 122]
+}
+
+test "error type" {
+  e = ParseError.Syntax(code: ERR_MISSING_PAREN, expr: "a(")
+  assert_eq code_of("a(", PERL), ERR_MISSING_PAREN
+  assert_eq e.code, ERR_MISSING_PAREN
+  assert_eq e.expr, "a("
+  assert_eq parse_error("a(", PERL), e.message
+  assert_eq e.message, "error parsing regexp: missing closing ): `a(`"
+}
+
+test "regexp accessors" {
+  re = parse("(?P<x>a{2,3}?)b", PERL).unwrap
+  assert_eq op_string(re.op), "Concat"
+  subs = re.sub
+  assert_eq subs.size, 2
+  assert_eq subs[0].op, OP_CAPTURE
+  assert_eq subs[0].cap, 1
+  assert_eq subs[0].name, "x"
+  rep = subs[0].sub[0]
+  assert_eq rep.op, OP_REPEAT
+  assert_eq rep.min, 2
+  assert_eq rep.max, 3
+  assert (rep.flags & NON_GREEDY) != 0
+  assert_eq subs[1].rune, [98]
+  assert_eq re.max_cap, 1
+  assert_eq re.cap_names, ["", "x"]
+  assert re.equal?(parse("(?P<x>a{2,3}?)b", PERL).unwrap)
+  assert !re.equal?(parse("(?P<y>a{2,3}?)b", PERL).unwrap)
+  assert_eq op_string(128), "opPseudo"
+  assert_eq op_string(42), "Op(42)"
+}
+
+test "deep trees: print, simplify, compile" {
+  # x{1,1000} simplifies to 1000 nested quests: recursion 2000 deep.
+  re = parse("^x{1,1000}y{1,1000}$", PERL).unwrap
+  s = re.simplify
+  assert_eq parse_error(s.to_s, PERL).size > 0, true # too deep to parse again, as in Go
+  assert_eq compile(s).inst.size, 4002               # as Go
+  d = parse("(" * 999 + "a" + ")" * 999, PERL).unwrap
+  assert_eq d.max_cap, 999
+  assert_eq d.simplify.to_s, "(" * 999 + "a" + ")" * 999
+}

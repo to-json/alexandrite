@@ -1,0 +1,418 @@
+#![overflow(wrap)]
+# Package sha3: Go's crypto/sha3, the SHA-3 hash algorithms and the SHAKE
+# and cSHAKE extendable output functions of FIPS 202 and SP 800-185. Pure
+# alx: the generic (non-assembly) code of Go's crypto/internal/fips140/sha3.
+#
+#   Go                                  alx
+#   sha3.Sum224/256/384/512(data)       sum224 / sum256 / sum384 / sum512(data) -> [Byte; N]
+#   sha3.SumSHAKE128(data, length)      sum_shake128(data, length) -> [Byte]
+#   sha3.SumSHAKE256(data, length)      sum_shake256(data, length) -> [Byte]
+#   sha3.New224/256/384/512() *SHA3     new224 / new256 / new384 / new512 -> SHA3
+#   sha3.NewSHAKE128/256() *SHAKE       new_shake128 / new_shake256 -> SHAKE
+#   sha3.NewCSHAKE128/256(N, S) *SHAKE  new_cshake128 / new_cshake256(n, s) -> SHAKE
+#   s.Write(p) (int, error)             s.write!(p) -> Int (SHA3; never fails)
+#                                       s.write!(p) -> ~Int<Sha3Error> (SHAKE)
+#   s.Sum(b) / Reset / Size / BlockSize s.sum(b) / s.reset! / s.size / s.block_size
+#   s.Read(p) (int, error)              s.read!(p) -> Int (SHAKE; never fails)
+#   MarshalBinary / AppendBinary        marshal_binary / append_binary(b) (never fail)
+#   UnmarshalBinary(b) error            unmarshal_binary!(b) -> ~Unit<Sha3Error>
+#   (*SHA3).Clone() (hash.Cloner, error) s.clone -> SHA3
+#
+# SHA3 satisfies hash.Hash and SHAKE satisfies hash.XOF, structurally.
+#
+# Differences from Go:
+#   - The zero SHA3 / SHAKE of Go is a usable SHA3-256 / SHAKE256; alx's
+#     zero `SHA3.new` / `SHAKE.new` have no state: use the constructors.
+#   - Writing to a SHAKE after reading from it is an error
+#     (Sha3Error.WriteAfterRead, "sha3: Write after Read"), as hash.XOF
+#     describes, instead of Go's panic.
+#   - The state is in shared storage (GO-VS-RUBY D36): copies of a SHA3 or
+#     SHAKE are the same hash, as Go's pointers are; `clone` makes an
+#     independent one (SHAKE has clone too; Go's crypto/sha3.SHAKE doesn't).
+#   - The unexported legacy Keccak constructors Go reaches by linkname
+#     (golang.org/x/crypto's NewLegacyKeccak256/512) are public here:
+#     new_legacy_keccak256 / new_legacy_keccak512.
+#   - No registration with package crypto at init (alx has no init
+#     functions); package crypto knows the hashes it can make. No assembly,
+#     no FIPS 140 module mode.
+
+# Errors of write! (SHAKE) and unmarshal_binary!.
+pub error Sha3Error {
+  WriteAfterRead
+  InvalidState
+  InvalidIdentifier
+  InvalidFunction
+
+  def message -> Str {
+    case self {
+      WriteAfterRead => "sha3: Write after Read"
+      InvalidState => "sha3: invalid hash state"
+      InvalidIdentifier => "sha3: invalid hash state identifier"
+      InvalidFunction => "sha3: invalid hash state function"
+    }
+  }
+}
+
+DSBYTE_SHA3 = 0b00000110
+DSBYTE_KECCAK = 0b00000001
+DSBYTE_SHAKE = 0b00011111
+DSBYTE_CSHAKE = 0b00000100
+
+RATE_K256 = (1600 - 256) / 8
+RATE_K448 = (1600 - 448) / 8
+RATE_K512 = (1600 - 512) / 8
+RATE_K768 = (1600 - 768) / 8
+RATE_K1024 = (1600 - 1024) / 8
+
+MAGIC_SHA3 = "sha\x08"
+MAGIC_SHAKE = "sha\x09"
+MAGIC_CSHAKE = "sha\x0a"
+MAGIC_KECCAK = "sha\x0b"
+MARSHALED_SIZE = 4 + 1 + 200 + 1 + 1
+
+ABSORBING = 0
+SQUEEZING = 1
+
+# The sponge (Go's crypto/internal/fips140/sha3.Digest).
+struct Sponge {
+  # The 200-byte state.
+  a: [Byte]
+  # st[0]: the position in the state; st[1]: ABSORBING or SQUEEZING.
+  st: [Int]
+  rate: Int
+  dsbyte: Byte
+  # The default output size in bytes.
+  output_len: Int
+
+  def self.make(rate: Int, output_len: Int, dsbyte: Byte) -> Sponge {
+    Sponge.new(a: [0.as_u8; 200], st: [0, ABSORBING], rate: rate, dsbyte: dsbyte, output_len: output_len)
+  }
+
+  def reset! {
+    i = 0
+    while i < 200 {
+      self.a[i] = 0
+      i += 1
+    }
+    self.st[0] = 0
+    self.st[1] = ABSORBING
+    nil
+  }
+
+  def clone -> Sponge {
+    Sponge.new(a: a + [], st: st + [], rate: rate, dsbyte: dsbyte, output_len: output_len)
+  }
+
+  def permute! {
+    keccak_f1600(a)
+    self.st[0] = 0
+    nil
+  }
+
+  def pad_and_permute! {
+    self.a[st[0]] = a[st[0]] ^ dsbyte
+    self.a[rate - 1] = a[rate - 1] ^ 0x80
+    permute!
+    self.st[1] = SQUEEZING
+    nil
+  }
+
+  # Absorbs p; the caller checks that the sponge is absorbing.
+  def absorb!(p: [Byte]) {
+    i = 0
+    n = st[0]
+    while i < p.size {
+      k = rate - n
+      k = p.size - i if k > p.size - i
+      j = 0
+      while j < k {
+        self.a[n + j] = a[n + j] ^ p[i + j]
+        j += 1
+      }
+      n += k
+      i += k
+      if n == rate {
+        keccak_f1600(a)
+        n = 0
+      }
+    }
+    self.st[0] = n
+    nil
+  }
+
+  def read!(out: [Byte]) -> Int {
+    pad_and_permute! if st[1] == ABSORBING
+    o = out
+    i = 0
+    while i < o.size {
+      permute! if st[0] == rate
+      n = st[0]
+      k = rate - n
+      k = o.size - i if k > o.size - i
+      copy(o[i...i + k], a[n...n + k])
+      self.st[0] = n + k
+      i += k
+    }
+    o.size
+  }
+
+  def sum(b: [Byte]) -> [Byte] {
+    panic("sha3: Sum after Read") if st[1] != ABSORBING
+    dup = clone
+    out = [0.as_u8; output_len]
+    dup.read!(out)
+    b + out
+  }
+
+  def magic -> Str {
+    return MAGIC_SHA3 if dsbyte == DSBYTE_SHA3
+    return MAGIC_SHAKE if dsbyte == DSBYTE_SHAKE
+    return MAGIC_CSHAKE if dsbyte == DSBYTE_CSHAKE
+    panic("unknown dsbyte") if dsbyte != DSBYTE_KECCAK
+    MAGIC_KECCAK
+  }
+
+  def append_binary(b: [Byte]) -> [Byte] {
+    out = b + magic.bytes.to_a
+    out << rate.as_u8
+    out = out + a
+    out << st[0].as_u8
+    out << st[1].as_u8
+    out
+  }
+
+  def unmarshal_binary!(b: [Byte]) -> ~Unit<Sha3Error> {
+    fail Sha3Error.InvalidState if b.size != MARSHALED_SIZE
+    fail Sha3Error.InvalidIdentifier if Str.from_bytes(b[0...4]) != magic
+    fail Sha3Error.InvalidFunction if b[4].to_i != rate
+    n = b[205].to_i
+    state = b[206].to_i
+    fail Sha3Error.InvalidState if n > rate
+    fail Sha3Error.InvalidState if state != ABSORBING && state != SQUEEZING
+    copy(a, b[5...205])
+    self.st[0] = n
+    self.st[1] = state
+  }
+}
+
+# A new SHA3-224 hash.
+pub def new224 -> SHA3 { SHA3.new(s: Sponge.make(RATE_K448, 28, DSBYTE_SHA3)) }
+
+# A new SHA3-256 hash.
+pub def new256 -> SHA3 { SHA3.new(s: Sponge.make(RATE_K512, 32, DSBYTE_SHA3)) }
+
+# A new SHA3-384 hash.
+pub def new384 -> SHA3 { SHA3.new(s: Sponge.make(RATE_K768, 48, DSBYTE_SHA3)) }
+
+# A new SHA3-512 hash.
+pub def new512 -> SHA3 { SHA3.new(s: Sponge.make(RATE_K1024, 64, DSBYTE_SHA3)) }
+
+# A new legacy Keccak-256 hash (the pre-standard padding; Ethereum's hash).
+pub def new_legacy_keccak256 -> SHA3 { SHA3.new(s: Sponge.make(RATE_K512, 32, DSBYTE_KECCAK)) }
+
+# A new legacy Keccak-512 hash.
+pub def new_legacy_keccak512 -> SHA3 { SHA3.new(s: Sponge.make(RATE_K1024, 64, DSBYTE_KECCAK)) }
+
+def sum_with(h: SHA3, data: [Byte]) -> [Byte] {
+  h.write!(data)
+  h.sum([])
+}
+
+# The SHA3-224 hash of data.
+pub def sum224(data: [Byte]) -> [Byte; 28] {
+  out: [Byte; 28] = [0; 28]
+  copy(out[0...28], sum_with(new224(), data))
+  out
+}
+
+# The SHA3-256 hash of data.
+pub def sum256(data: [Byte]) -> [Byte; 32] {
+  out: [Byte; 32] = [0; 32]
+  copy(out[0...32], sum_with(new256(), data))
+  out
+}
+
+# The SHA3-384 hash of data.
+pub def sum384(data: [Byte]) -> [Byte; 48] {
+  out: [Byte; 48] = [0; 48]
+  copy(out[0...48], sum_with(new384(), data))
+  out
+}
+
+# The SHA3-512 hash of data.
+pub def sum512(data: [Byte]) -> [Byte; 64] {
+  out: [Byte; 64] = [0; 64]
+  copy(out[0...64], sum_with(new512(), data))
+  out
+}
+
+# length bytes of the SHAKE128 output of data.
+pub def sum_shake128(data: [Byte], length: Int) -> [Byte] {
+  h = new_shake128()
+  h.d.absorb!(data)
+  out = [0.as_u8; length]
+  h.read!(out)
+  out
+}
+
+# length bytes of the SHAKE256 output of data.
+pub def sum_shake256(data: [Byte], length: Int) -> [Byte] {
+  h = new_shake256()
+  h.d.absorb!(data)
+  out = [0.as_u8; length]
+  h.read!(out)
+  out
+}
+
+# An instance of a SHA-3 hash function (Go's *sha3.SHA3).
+pub struct SHA3 {
+  s: Sponge
+
+  # Absorbs p; returns p.size.
+  pub def write!(p: [Byte]) -> Int {
+    s.absorb!(p)
+    p.size
+  }
+
+  # b with the hash appended. The state is unchanged.
+  pub def sum(b: [Byte]) -> [Byte] { s.sum(b) }
+
+  # Back to the initial state.
+  pub def reset! {
+    s.reset!
+    nil
+  }
+
+  # The number of bytes sum appends.
+  pub def size -> Int { s.output_len }
+
+  # The rate of the sponge: writes that are a multiple of it may be faster.
+  pub def block_size -> Int { s.rate }
+
+  # An independent copy of the hash in its current state.
+  pub def clone -> SHA3 { SHA3.new(s: s.clone) }
+
+  # b with the marshaled state appended (Go's AppendBinary).
+  pub def append_binary(b: [Byte]) -> [Byte] { s.append_binary(b) }
+
+  # The marshaled state (Go's MarshalBinary).
+  pub def marshal_binary -> [Byte] { s.append_binary([]) }
+
+  # Restores a state from marshal_binary of the same function.
+  pub def unmarshal_binary!(b: [Byte]) -> ~Unit<Sha3Error> {
+    ~s.unmarshal_binary!(b)
+  }
+}
+
+# Go's leftEncode: x as a byte count followed by its big-endian bytes.
+def left_encode(x: U64) -> [Byte] {
+  n = 0
+  v = x
+  while v > 0 {
+    n += 1
+    v = v >> 8
+  }
+  n = 1 if n == 0
+  out: [Byte] = [n.as_u8]
+  i = n - 1
+  while i >= 0 {
+    out << (x >> (8 * i).as_u64).as_u8
+    i -= 1
+  }
+  out
+}
+
+# Go's bytepadWrite: absorbs left_encode(rate) || data, zero-padded to a
+# multiple of rate.
+def bytepad_write(c: Sponge, data: [Byte], rate: Int) {
+  d = c
+  rate_enc = left_encode(rate.as_u64)
+  d.absorb!(rate_enc)
+  d.absorb!(data)
+  padlen = rate - (rate_enc.size + data.size) % rate
+  d.absorb!([0.as_u8; padlen]) if padlen < rate
+  nil
+}
+
+def new_cshake(n: [Byte], s: [Byte], rate: Int, output_len: Int) -> SHAKE {
+  init: [Byte] = []
+  init = init + left_encode(n.size.as_u64 * 8)
+  init = init + n
+  init = init + left_encode(s.size.as_u64 * 8)
+  init = init + s
+  c = SHAKE.new(d: Sponge.make(rate, output_len, DSBYTE_CSHAKE), init_block: [init])
+  bytepad_write(c.d, init, rate)
+  c
+}
+
+# A new SHAKE128 XOF.
+pub def new_shake128 -> SHAKE {
+  SHAKE.new(d: Sponge.make(RATE_K256, 32, DSBYTE_SHAKE), init_block: [[]])
+}
+
+# A new SHAKE256 XOF.
+pub def new_shake256 -> SHAKE {
+  SHAKE.new(d: Sponge.make(RATE_K512, 64, DSBYTE_SHAKE), init_block: [[]])
+}
+
+# A new cSHAKE128 XOF with function name n and customization string s.
+# With both empty it is SHAKE128.
+pub def new_cshake128(n: [Byte], s: [Byte]) -> SHAKE {
+  return new_shake128() if n.size == 0 && s.size == 0
+  new_cshake(n, s, RATE_K256, 32)
+}
+
+# A new cSHAKE256 XOF with function name n and customization string s.
+# With both empty it is SHAKE256.
+pub def new_cshake256(n: [Byte], s: [Byte]) -> SHAKE {
+  return new_shake256() if n.size == 0 && s.size == 0
+  new_cshake(n, s, RATE_K512, 64)
+}
+
+# An instance of a SHAKE or cSHAKE extendable output function (Go's
+# *sha3.SHAKE).
+pub struct SHAKE {
+  d: Sponge
+  # [the cSHAKE prefix (function name and customization)]; empty for SHAKE.
+  init_block: [[Byte]]
+
+  # Absorbs more data. Fails after read! (until reset!).
+  pub def write!(p: [Byte]) -> ~Int<Sha3Error> {
+    fail Sha3Error.WriteAfterRead if d.st[1] != ABSORBING
+    d.absorb!(p)
+    p.size
+  }
+
+  # Squeezes p.size more bytes of output into p; returns p.size.
+  pub def read!(p: [Byte]) -> Int {
+    d.read!(p)
+  }
+
+  # Back to the initial state (with the cSHAKE prefix absorbed again).
+  pub def reset! {
+    d.reset!
+    bytepad_write(d, init_block[0], d.rate) if init_block[0].size != 0
+    nil
+  }
+
+  # The rate of the sponge.
+  pub def block_size -> Int { d.rate }
+
+  # An independent copy of the XOF in its current state.
+  pub def clone -> SHAKE { SHAKE.new(d: d.clone, init_block: [init_block[0]]) }
+
+  # b with the marshaled state appended (Go's AppendBinary).
+  pub def append_binary(b: [Byte]) -> [Byte] {
+    d.append_binary(b) + init_block[0]
+  }
+
+  # The marshaled state (Go's MarshalBinary).
+  pub def marshal_binary -> [Byte] { append_binary([]) }
+
+  # Restores a state from marshal_binary of the same function.
+  pub def unmarshal_binary!(b: [Byte]) -> ~Unit<Sha3Error> {
+    fail Sha3Error.InvalidState if b.size < MARSHALED_SIZE
+    ~d.unmarshal_binary!(b[0...MARSHALED_SIZE])
+    self.init_block[0] = b[MARSHALED_SIZE...b.size] + []
+  }
+}

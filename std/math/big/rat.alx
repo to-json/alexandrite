@@ -1,0 +1,713 @@
+#![overflow(wrap)]
+# Arbitrary-precision rationals (Go's rat.go, ratconv.go, ratmarsh.go).
+
+import "math"
+import "strconv"
+import "strings"
+import "encoding/json"
+
+# A quotient a/b of arbitrary precision, kept normalized (b > 0, gcd 1).
+# The zero value (`Rat.new`) is 0. Methods ending in `!` set the receiver
+# and return its new value.
+pub struct Rat {
+  # numerator (with the sign) and denominator (b.abs empty means 1)
+  a: Int
+  b: Int
+
+  # Sets z to exactly f; none if f is not finite (z unchanged).
+  pub def set_float64!(f: F64) -> Rat? {
+    bits = math.float64bits(f)
+    mantissa = bits & ((ONE << 52) - 1)
+    exp = ((bits >> 52) & 2047).to_i64
+    return none if exp == 2047
+    if exp == 0 {
+      exp -= 1022
+    } else {
+      mantissa |= ONE << 52
+      exp -= 1023
+    }
+    shift = 52 - exp
+    while mantissa & 1 == 0 && shift > 0 {
+      mantissa >>= 1
+      shift -= 1
+    }
+    na = Int.new
+    na.set_uint64!(mantissa)
+    na.neg = f < 0.0 && mantissa != 0
+    nb = new_int(1)
+    if shift > 0 {
+      nb.lsh!(nb, shift)
+    } else {
+      na.lsh!(na, 0 - shift)
+    }
+    self.a = na
+    self.b = nb
+    self.norm!
+  }
+
+  # The F64 nearest to x (as a float32 value: Go's Float32) and whether it
+  # is exact.
+  pub def float32 -> (F64, Bool) {
+    bb = b.abs
+    bb = nat_one if bb.size == 0
+    f, exact = quot_to_float32(a.abs, bb)
+    f = -1.0 * f if a.neg
+    (f, exact)
+  }
+
+  # The F64 nearest to x and whether it is exact.
+  pub def float64 -> (F64, Bool) {
+    bb = b.abs
+    bb = nat_one if bb.size == 0
+    f, exact = quot_to_float64(a.abs, bb)
+    f = -1.0 * f if a.neg
+    (f, exact)
+  }
+
+  # Sets z to a/b. Panics if b == 0.
+  pub def set_frac!(na: Int, nb: Int) -> Rat {
+    panic("division by zero") if nb.abs.size == 0
+    self.a = Int.new(abs: na.abs, neg: na.neg != nb.neg)
+    self.b = Int.new(abs: nb.abs)
+    self.norm!
+  }
+
+  # Sets z to a/b. Panics if b == 0.
+  pub def set_frac64!(na: I64, nb0: I64) -> Rat {
+    panic("division by zero") if nb0 == 0
+    x = new_int(na)
+    nb = nb0.as_u64
+    if nb0 < 0 {
+      nb = 0 - nb
+      x.neg = !x.neg
+    }
+    self.a = x
+    self.b = Int.new(abs: nat_set_u64(nb))
+    self.norm!
+  }
+
+  # Sets z to x (with denominator 1).
+  pub def set_int!(x: Int) -> Rat {
+    self.a = x
+    self.b = new_int(1)
+    self
+  }
+
+  # Sets z to x.
+  pub def set_int64!(x: I64) -> Rat {
+    self.a = new_int(x)
+    self.b = new_int(1)
+    self
+  }
+
+  # Sets z to x.
+  pub def set_uint64!(x: U64) -> Rat {
+    self.a = Int.new(abs: nat_set_u64(x))
+    self.b = new_int(1)
+    self
+  }
+
+  # Sets z to x.
+  pub def set!(x: Rat) -> Rat {
+    self.a = x.a
+    self.b = x.b
+    self.b = new_int(1) if b.abs.size == 0
+    self
+  }
+
+  # Sets z to |x|.
+  pub def abs!(x: Rat) -> Rat {
+    self.set!(x)
+    self.a = Int.new(abs: a.abs)
+    self
+  }
+
+  # Sets z to -x.
+  pub def neg!(x: Rat) -> Rat {
+    self.set!(x)
+    self.a = Int.new(abs: a.abs, neg: a.abs.size > 0 && !a.neg)
+    self
+  }
+
+  # Sets z to 1/x. Panics if x == 0.
+  pub def inv!(x: Rat) -> Rat {
+    panic("division by zero") if x.a.abs.size == 0
+    self.set!(x)
+    t = a.abs
+    self.a = Int.new(abs: b.abs, neg: a.neg)
+    self.b = Int.new(abs: t)
+    self
+  }
+
+  # -1, 0 or +1 as x < 0, x == 0 or x > 0.
+  pub def sign -> I64 { a.sign }
+
+  # Whether the denominator is 1 (Go's IsInt).
+  pub def int? -> Bool { b.abs.size == 0 || nat_cmp(b.abs, nat_one) == 0 }
+
+  # The numerator (a copy; Go returns a pointer into x). May be <= 0.
+  pub def num -> Int { a }
+
+  # The denominator (a copy), always > 0.
+  pub def denom -> Int {
+    return new_int(1) if b.abs.size == 0
+    b
+  }
+
+  # Reduces to lowest terms.
+  def norm! -> Rat {
+    if a.abs.size == 0 {
+      self.a = Int.new
+      self.b = new_int(1)
+      return self
+    }
+    if b.abs.size == 0 {
+      self.b = new_int(1)
+      return self
+    }
+    n = a.neg
+    aa = Int.new(abs: a.abs)
+    bb = Int.new(abs: b.abs)
+    f, _x, _y = lehmer_gcd(aa, bb, false)
+    if f.cmp(new_int(1)) != 0 {
+      q1, _r1 = nat_div(a.abs, f.abs)
+      q2, _r2 = nat_div(b.abs, f.abs)
+      self.a = Int.new(abs: q1, neg: n)
+      self.b = Int.new(abs: q2)
+    } else {
+      self.b = Int.new(abs: b.abs)
+    }
+    self
+  }
+
+  # -1, 0 or +1 as x < y, x == y or x > y.
+  pub def cmp(y: Rat) -> I64 {
+    sa = scale_denom(a, y.b.abs)
+    sb = scale_denom(y.a, b.abs)
+    sa.cmp(sb)
+  }
+
+  # Sets z to x + y.
+  pub def add!(x: Rat, y: Rat) -> Rat {
+    a1 = scale_denom(x.a, y.b.abs)
+    a2 = scale_denom(y.a, x.b.abs)
+    self.a = i_add(a1, a2)
+    self.b = Int.new(abs: mul_denom(x.b.abs, y.b.abs))
+    self.norm!
+  }
+
+  # Sets z to x - y.
+  pub def sub!(x: Rat, y: Rat) -> Rat {
+    a1 = scale_denom(x.a, y.b.abs)
+    a2 = scale_denom(y.a, x.b.abs)
+    self.a = i_sub(a1, a2)
+    self.b = Int.new(abs: mul_denom(x.b.abs, y.b.abs))
+    self.norm!
+  }
+
+  # Sets z to x * y.
+  pub def mul!(x: Rat, y: Rat) -> Rat {
+    self.a = i_mul(x.a, y.a)
+    self.b = Int.new(abs: mul_denom(x.b.abs, y.b.abs))
+    self.norm!
+  }
+
+  # Sets z to x / y. Panics if y == 0.
+  pub def quo!(x: Rat, y: Rat) -> Rat {
+    panic("division by zero") if y.a.abs.size == 0
+    na = scale_denom(x.a, y.b.abs)
+    nb = scale_denom(y.a, x.b.abs)
+    self.a = Int.new(abs: na.abs, neg: na.neg != nb.neg)
+    self.b = Int.new(abs: nb.abs)
+    self.norm!
+  }
+
+  # Sets z to the rational in s: "a/b", or a floating-point number with
+  # an optional exponent ("1.25", "-3e-2", "0x1p-3", "1_000"); none if s
+  # isn't one (z unchanged).
+  pub def set_string!(s: Str) -> Rat? {
+    if v = rat_from_string(s) {
+      self.set!(v)
+      return self
+    }
+    none
+  }
+
+  # Go's Rat.Scan: reads a rational token (the bytes +-/0123456789.eE)
+  # from r for the verbs e, f, g, E, F, G and v.
+  pub def scan!(r: ByteReader, verb: Str) -> ~Rat<BigError> {
+    rd = r
+    skip_space(rd)
+    tok: [Byte] = []
+    while true {
+      if ch = rd.read_byte! {
+        if "+-/0123456789.eE".include?(Str.from_bytes([ch])) {
+          tok << ch
+        } else {
+          rd.unread_byte!
+          break
+        }
+      } else {
+        break
+      }
+    }
+    fail BigError.InvalidVerb("Rat.Scan: invalid verb") if !"efgEFGv".include?(verb)
+    if v = rat_from_string(Str.from_bytes(tok)) {
+      return self.set!(v)
+    }
+    fail BigError.InvalidSyntax("Rat.Scan: invalid syntax")
+  }
+
+  # "a/b" (Go's String).
+  pub def to_s -> Str { Str.from_bytes(self.marshal([])) }
+
+  def marshal(buf: [Byte]) -> [Byte] {
+    out = a.append(buf, 10)
+    out << 47
+    if b.abs.size != 0 {
+      out = b.append(out, 10)
+    } else {
+      out << 49
+    }
+    out
+  }
+
+  # "a/b", or just "a" when the denominator is 1.
+  pub def rat_string -> Str {
+    return a.to_s if self.int?
+    self.to_s
+  }
+
+  # x in decimal with prec digits after the point, the last one rounded
+  # half away from zero.
+  pub def float_string(prec: I64) -> Str {
+    buf: [Byte] = []
+    if self.int? {
+      buf = a.append(buf, 10)
+      if prec > 0 {
+        buf << 46
+        for _i in 0...prec {
+          buf << 48
+        }
+      }
+      return Str.from_bytes(buf)
+    }
+    q, r0 = nat_div(a.abs, b.abs)
+    p = nat_one
+    if prec > 0 {
+      p = nat_exp_nn(nat_set_word(10), nat_set_u64(prec.as_u64), nat_zero, false)
+    }
+    r1 = nat_mul(r0, p)
+    r, r2 = nat_div(r1, b.abs)
+    r2 = nat_add(r2, r2)
+    if nat_cmp(b.abs, r2) <= 0 {
+      r = nat_add(r, nat_one)
+      if nat_cmp(r, p) >= 0 {
+        q = nat_add(q, nat_one)
+        r = nat_sub(r, p)
+      }
+    }
+    buf << 45 if a.neg
+    buf = buf + nat_utoa(q, 10)
+    if prec > 0 {
+      buf << 46
+      rs = nat_utoa(r, 10)
+      for _i in 0...prec - rs.size {
+        buf << 48
+      }
+      buf = buf + rs
+    }
+    Str.from_bytes(buf)
+  }
+
+  # The number of non-repeating digits after the decimal point of x's
+  # decimal representation, and whether that representation is finite.
+  pub def float_prec -> (I64, Bool) {
+    d = self.denom.abs
+    p2 = nat_trailing_zero_bits(d)
+    q = nat_rsh(d, p2)
+    fp = 13
+    tab: [[U64]] = []
+    f = nat_set_word(1220703125)
+    while true {
+      _t, r = nat_div(q, f)
+      break if r.size != 0
+      tab << f
+      f = nat_sqr(f)
+    }
+    p5 = 0
+    i = tab.size - 1
+    while i >= 0 {
+      t, r = nat_div(q, tab[i])
+      if r.size == 0 {
+        p5 += fp * (1 << i)
+        q = t
+      }
+      i -= 1
+    }
+    five = nat_set_word(5)
+    while true {
+      t, r = nat_div(q, five)
+      break if r.size != 0
+      p5 += 1
+      q = t
+    }
+    (imax(p2, p5), nat_cmp(q, nat_one) == 0)
+  }
+
+  # Go's GobEncode: version/sign byte, 4-byte numerator length, numerator
+  # and denominator big-endian.
+  pub def gob_encode -> ~[Byte]<BigError> {
+    buf: [Byte] = [0; 1 + 4 + (a.abs.size + b.abs.size) * S]
+    i = nat_bytes(b.abs, buf)
+    j = nat_bytes(a.abs, buf[0...i])
+    n = i - j
+    fail BigError.Msg("Rat.GobEncode: numerator too large") if n > 0xffffffff
+    buf[j - 4] = (n >> 24).as_u8
+    buf[j - 3] = (n >> 16).as_u8
+    buf[j - 2] = (n >> 8).as_u8
+    buf[j - 1] = n.as_u8
+    j -= 5
+    bb: Byte = RAT_GOB_VERSION << 1
+    bb |= 1 if a.neg
+    buf[j] = bb
+    buf[j...buf.size]
+  }
+
+  # Go's GobDecode (an empty buf is 0).
+  pub def gob_decode!(buf: [Byte]) -> ~Rat<BigError> {
+    if buf.size == 0 {
+      self.a = Int.new
+      self.b = Int.new
+      return self
+    }
+    fail BigError.Msg("Rat.GobDecode: buffer too small") if buf.size < 5
+    bb = buf[0]
+    if bb >> 1 != RAT_GOB_VERSION {
+      fail BigError.Msg("Rat.GobDecode: encoding version #{bb >> 1} not supported")
+    }
+    ln = (buf[1].to_u64 << 24) | (buf[2].to_u64 << 16) | (buf[3].to_u64 << 8) | buf[4].to_u64
+    fail BigError.Msg("Rat.GobDecode: invalid length") if ln > 0x7ffffffffffffffa
+    i = 5 + ln.to_i64
+    fail BigError.Msg("Rat.GobDecode: buffer too small") if buf.size < i
+    na = nat_set_bytes(buf[5...i])
+    self.a = Int.new(abs: na, neg: bb & 1 != 0)
+    self.b = Int.new(abs: nat_set_bytes(buf[i...buf.size]))
+    self
+  }
+
+  # b with x appended as text: "a" if x is an integer, else "a/b".
+  pub def append_text(buf: [Byte]) -> [Byte] {
+    return a.append_text(buf) if self.int?
+    self.marshal(buf)
+  }
+
+  # Go's MarshalText.
+  pub def marshal_text -> [Byte] { self.append_text([]) }
+
+  # encoding/json's protocol (a JSON string of the text form, as Go's
+  # json package does through MarshalText / UnmarshalText).
+  pub def json_str(e: json.Encoder) -> Str { e.q(Str.from_bytes(self.marshal_text)) }
+
+  pub def json_enc(e: json.Encoder) -> Unit {
+    ee = e
+    ee.str!(Str.from_bytes(self.marshal_text))
+  }
+
+  pub def self.json_zero -> Rat { Rat.new }
+
+  pub def self.json_dec(d: json.Decoder) -> Rat {
+    dd = d
+    if s = json_text_value(dd, "Rat") {
+      z = Rat.new
+      if v = z.set_string!(s) {
+        return v
+      }
+      dd.fail!(json.JsonError.Syntax(msg: "math/big: cannot unmarshal #{quote_str(s)} into a *big.Rat", offset: dd.pos))
+    }
+    Rat.new
+  }
+
+  # Sets z from text in any form set_string! accepts.
+  pub def unmarshal_text!(text: [Byte]) -> ~Rat<BigError> {
+    s = Str.from_bytes(text)
+    if v = self.set_string!(s) {
+      return v
+    }
+    fail BigError.Msg("math/big: cannot unmarshal #{quote_str(s)} into a *big.Rat")
+  }
+}
+
+# A new Rat a/b. Panics if b == 0.
+pub def new_rat(a: I64, b: I64) -> Rat {
+  z = Rat.new
+  z.set_frac64!(a, b)
+}
+
+# x * f (f a denominator nat; empty means 1).
+def scale_denom(x: Int, f: [U64]) -> Int {
+  return x if f.size == 0
+  Int.new(abs: nat_mul(x.abs, f), neg: x.neg)
+}
+
+# x * y for denominators (empty means 1).
+def mul_denom(x: [U64], y: [U64]) -> [U64] {
+  return nat_one if x.size == 0 && y.size == 0
+  return y if x.size == 0
+  return x if y.size == 0
+  nat_mul(x, y)
+}
+
+# The F64 nearest a/b (rounded to float32 precision when msize == 23):
+# Go's quotToFloat32/64.
+def quot_to_float(a: [U64], b: [U64], fsize: I64, msize: I64) -> (F64, Bool) {
+  msize1 = msize + 1
+  msize2 = msize1 + 1
+  esize = fsize - msize1
+  ebias = (1 << (esize - 1)) - 1
+  emin = 1 - ebias
+  alen = nat_bit_len(a)
+  return (0.0, true) if alen == 0
+  blen = nat_bit_len(b)
+  panic("division by zero") if blen == 0
+  exp = alen - blen
+  a2 = a
+  b2 = b
+  shift = msize2 - exp
+  if shift > 0 {
+    a2 = nat_lsh(a2, shift)
+  } elsif shift < 0 {
+    b2 = nat_lsh(b2, 0 - shift)
+  }
+  q, r = nat_div(a2, b2)
+  mantissa = low64(q)
+  have_rem = r.size > 0
+  if mantissa >> msize2 == 1 {
+    have_rem = true if mantissa & 1 == 1
+    mantissa >>= 1
+    exp += 1
+  }
+  panic("expected exactly #{msize2} bits of result") if mantissa >> msize1 != 1
+  if emin - msize <= exp && exp <= emin {
+    sh = emin - (exp - 1)
+    lostbits = mantissa & ((ONE << sh) - 1)
+    have_rem = have_rem || lostbits != 0
+    mantissa >>= sh
+    exp = 2 - ebias
+  }
+  exact = !have_rem
+  if mantissa & 1 != 0 {
+    exact = false
+    if have_rem || mantissa & 2 != 0 {
+      mantissa += 1
+      if mantissa >= ONE << msize2 {
+        mantissa >>= 1
+        exp += 1
+      }
+    }
+  }
+  mantissa >>= 1
+  f = math.ldexp(mantissa.to_i64.to_f, exp - msize1)
+  f = float64_to_float32(f) if fsize == 32
+  exact = false if math.is_inf(f, 0)
+  (f, exact)
+}
+
+def quot_to_float32(a: [U64], b: [U64]) -> (F64, Bool) { quot_to_float(a, b, 32, 23) }
+
+# The float32 nearest v (rounding to nearest even, Go's float32(v)), as an
+# F64.
+def float64_to_float32(v: F64) -> F64 {
+  return v if v == 0.0 || math.is_nan(v) || math.is_inf(v, 0)
+  bits = math.float64bits(v)
+  sign = bits >> 63
+  e = ((bits >> 52) & 2047).to_i64 - 1023
+  m = bits & ((ONE << 52) - 1)
+  m = m | (ONE << 52) if e > -1023
+  e = -1022 if e == -1023
+  # v = m * 2^(e - 52); keep 24 bits (fewer below float32's normal range)
+  keep = 24
+  keep = 24 - (-126 - e) if e < -126
+  r = 0.0
+  if keep <= 0 {
+    # below half the smallest denormal (or exactly half: ties to even, 0)
+    half = keep == 0 && m > (ONE << 52)
+    r = 0.0
+    r = 1.401298464324817e-45 if half
+  } else {
+    drop = 53 - keep
+    q = m >> drop
+    rem = m & ((ONE << drop) - 1)
+    halfway = ONE << (drop - 1)
+    q += 1 if rem > halfway || (rem == halfway && q & 1 == 1)
+    r = math.ldexp(q.to_i64.to_f, e - 52 + drop)
+    r = math.inf(1) if r > 3.40282346638528859811704183484516925440e+38
+  }
+  return -1.0 * r if sign == 1
+  r
+}
+
+def quot_to_float64(a: [U64], b: [U64]) -> (F64, Bool) { quot_to_float(a, b, 64, 52) }
+
+# Go's Rat.SetString; none on a syntax error.
+def rat_from_string(s: Str) -> Rat? {
+  return none if s.size == 0
+  sep = strings.index(s, "/")
+  if sep >= 0 {
+    num = Int.new
+    return none if num.set_string!(s[0...sep], 0).none?
+    r = new_byte_reader(s[sep + 1...s.size])
+    if v = nat_scan(r, 0, false).ok {
+      return none if r.len != 0
+      return none if v[0].size == 0
+      z = Rat.new
+      z.a = num
+      z.b = Int.new(abs: v[0])
+      return z.norm!
+    }
+    return none
+  }
+  r = new_byte_reader(s)
+  negr = scan_sign(r).ok
+  return none if negr.none?
+  neg = negr || false
+  m = nat_scan(r, 0, true).ok
+  return none if m.none?
+  mv = m || (nat_zero, 0, 0)
+  mant = mv[0]
+  base = mv[1]
+  fcount = mv[2]
+  e = scan_exponent(r, true, true).ok
+  return none if e.none?
+  ev = e || (0, 10)
+  exp = ev[0]
+  ebase = ev[1]
+  return none if r.len != 0
+  z = Rat.new
+  if mant.size == 0 {
+    return z.norm!
+  }
+  exp2 = 0
+  exp5 = 0
+  if fcount < 0 {
+    d = fcount
+    if base == 10 {
+      exp5 = d
+      exp2 = d
+    } elsif base == 2 {
+      exp2 = d
+    } elsif base == 8 {
+      exp2 = d * 3
+    } elsif base == 16 {
+      exp2 = d * 4
+    } else {
+      panic("unexpected mantissa base")
+    }
+  }
+  if ebase == 10 {
+    exp5 += exp
+    exp2 += exp
+  } elsif ebase == 2 {
+    exp2 += exp
+  } else {
+    panic("unexpected exponent base")
+  }
+  na = mant
+  nb = nat_one
+  if exp5 != 0 {
+    n = exp5
+    if n < 0 {
+      n = 0 - n
+      return none if n < 0
+    }
+    return none if n > 1000000
+    pow5 = nat_exp_nn(nat_set_word(5), nat_set_word(n.as_u64), nat_zero, false)
+    if exp5 > 0 {
+      na = nat_mul(na, pow5)
+    } else {
+      nb = pow5
+    }
+  }
+  return none if exp2 < -10000000 || exp2 > 10000000
+  if exp2 > 0 {
+    na = nat_lsh(na, exp2)
+  } elsif exp2 < 0 {
+    nb = nat_lsh(nb, 0 - exp2)
+  }
+  z.a = Int.new(abs: na, neg: neg && na.size > 0)
+  z.b = Int.new(abs: nb)
+  z.norm!
+}
+
+# Go's scanExponent: an optional exponent ('e'/'E' decimal, 'p'/'P' binary
+# if base2ok) with optional sign and (if sep_ok) '_' separators; returns
+# (exponent, base 10 or 2). No exponent is (0, 10).
+def scan_exponent(r: ByteReader, base2ok: Bool, sep_ok: Bool) -> ~(I64, I64)<BigError> {
+  exp, base, err = scan_exponent_raw(r, base2ok, sep_ok)
+  return (exp, base) if err == ""
+  fail BigError.NoDigits if err == "number has no digits"
+  fail BigError.InvalSep if err == "'_' must separate successive digits"
+  fail BigError.Num(err)
+}
+
+# scan_exponent with the error as text ("" for none), the exponent and
+# base still set as in Go's scanExponent.
+def scan_exponent_raw(r: ByteReader, base2ok: Bool, sep_ok: Bool) -> (I64, I64, Str) {
+  rd = r
+  base = 10
+  if ch = rd.read_byte! {
+    if ch == 101 || ch == 69 {
+      base = 10
+    } elsif (ch == 112 || ch == 80) && base2ok {
+      base = 2
+    } else {
+      rd.unread_byte!
+      return (0, 10, "")
+    }
+  } else {
+    return (0, 10, "")
+  }
+  digits: [Byte] = []
+  chq = rd.read_byte!
+  if c = chq {
+    if c == 43 || c == 45 {
+      digits << 45 if c == 45
+      chq = rd.read_byte!
+    }
+  }
+  prev: Byte = 46
+  inval_sep = false
+  has_digits = false
+  while true {
+    ch: Byte = 0
+    if c = chq {
+      ch = c
+    } else {
+      break
+    }
+    if 48 <= ch && ch <= 57 {
+      digits << ch
+      prev = 48
+      has_digits = true
+    } elsif ch == 95 && sep_ok {
+      inval_sep = true if prev != 48
+      prev = 95
+    } else {
+      rd.unread_byte!
+      break
+    }
+    chq = rd.read_byte!
+  }
+  return (0, base, "number has no digits") if !has_digits
+  ds = Str.from_bytes(digits)
+  pr = strconv.parse_int(ds, 10, 64)
+  if e = pr.err {
+    # Go's ParseInt returns the clamped value with a range error
+    exp = 9223372036854775807
+    exp = -9223372036854775808 if digits.size > 0 && digits[0] == 45
+    return (exp, base, e.message)
+  }
+  exp = pr.unwrap
+  return (exp, base, "'_' must separate successive digits") if inval_sep || prev == 95
+  (exp, base, "")
+}

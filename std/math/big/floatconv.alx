@@ -1,0 +1,560 @@
+#![overflow(wrap)]
+# Float from strings (Go's floatconv.go) and the decimal conversion used
+# by Float.text (Go's decimal.go, ftoa.go).
+
+import "strconv"
+
+POW5TAB: [U64; 28] = [
+  1, 5, 25, 125, 625, 3125, 15625, 78125, 390625, 1953125, 9765625,
+  48828125, 244140625, 1220703125, 6103515625, 30517578125, 152587890625,
+  762939453125, 3814697265625, 19073486328125, 95367431640625,
+  476837158203125, 2384185791015625, 11920928955078125, 59604644775390625,
+  298023223876953125, 1490116119384765625, 7450580596923828125,
+]
+
+# 5**n as a Float of precision prec (Go's pow5).
+def float_pow5(prec: U32, n0: U64) -> Float {
+  z = Float.new
+  z.prec_ = prec
+  m: U64 = 27
+  return z.set_uint64!(POW5TAB[n0.to_i64]) if n0 <= m
+  z.set_uint64!(POW5TAB[27])
+  n = n0 - m
+  f = Float.new
+  f.prec_ = prec + 64
+  f.set_uint64!(5)
+  while n > 0 {
+    z.mul!(z, f) if n & 1 != 0
+    f.mul!(f, f)
+    n >>= 1
+  }
+  z
+}
+
+# Go's Float.scan: a number in the given base (0, 2, 8, 10, 16) with an
+# optional sign, fraction and exponent, read from r; z gives the precision
+# (64 if 0) and mode. Returns (value, base found).
+def float_scan(z0: Float, r: ByteReader, base: I64) -> ~(Float, I64)<BigError> {
+  z = z0
+  prec = z.prec_
+  prec = 64 if prec == 0
+  z.form = FORM_ZERO
+  z.neg = ~scan_sign(r)
+  mant, b, fcount = ~nat_scan(r, base, true)
+  z.mant = mant
+  exp, ebase = ~scan_exponent(r, true, base == 0)
+  if z.mant.size == 0 {
+    z.prec_ = prec
+    z.acc_ = Accuracy.Exact
+    z.form = FORM_ZERO
+    return (z, b)
+  }
+  m = nat_set(z.mant)
+  s = fnorm(m)
+  z.mant = m
+  exp2 = m.size * W - s
+  exp5 = 0
+  if fcount < 0 {
+    d = fcount
+    if b == 10 {
+      exp5 = d
+      exp2 += d
+    } elsif b == 2 {
+      exp2 += d
+    } elsif b == 8 {
+      exp2 += d * 3
+    } elsif b == 16 {
+      exp2 += d * 4
+    } else {
+      panic("unexpected mantissa base")
+    }
+  }
+  if ebase == 10 {
+    exp5 += exp
+    exp2 += exp
+  } elsif ebase == 2 {
+    exp2 += exp
+  } else {
+    panic("unexpected exponent base")
+  }
+  # (exp2 can overflow I64 for absurd exponents only in theory)
+  if MIN_EXP <= exp2 && exp2 <= MAX_EXP {
+    z.prec_ = prec
+    z.form = FORM_FINITE
+    z.exp = exp2.as_i32
+  } else {
+    fail BigError.ExpOverflow
+  }
+  if exp5 == 0 {
+    z.round!(0)
+    return (z, b)
+  }
+  if exp5 < 0 {
+    p = float_pow5(z.prec_ + 64, (0 - exp5).as_u64)
+    z.quo!(z, p)
+  } else {
+    p = float_pow5(z.prec_ + 64, exp5.as_u64)
+    z.mul!(z, p)
+  }
+  (z, b)
+}
+
+# Go's Float.Parse on z (precision and mode taken from z).
+def float_parse(z0: Float, s: Str, base: I64) -> ~(Float, I64)<BigError> {
+  z = z0
+  if s.size == 3 && (s == "Inf" || s == "inf") {
+    z.set_inf!(false)
+    return (z, 0)
+  }
+  if s.size == 4 && (s[0] == 43 || s[0] == 45) && (s[1...4] == "Inf" || s[1...4] == "inf") {
+    z.set_inf!(s[0] == 45)
+    return (z, 0)
+  }
+  r = new_byte_reader(s)
+  f, b = ~float_scan(z, r, base)
+  rd = r
+  if ch = rd.read_byte! {
+    fail BigError.Trailing(ch)
+  }
+  (f, b)
+}
+
+# x parsed in the given base, with precision prec (64 if 0) and mode
+# (Go's ParseFloat): (value, base found).
+pub def parse_float(s: Str, base: I64, prec: I64, mode: RoundingMode) -> ~(Float, I64)<BigError> {
+  z = Float.new
+  z.set_prec!(prec)
+  z.set_mode!(mode)
+  ~float_parse(z, s, base)
+}
+
+# ---- decimal (Go's decimal.go) ----
+
+# A decimal mantissa (ASCII digits, no trailing zeros) and exponent: the
+# value is 0.mant × 10^exp.
+struct Decimal {
+  mant: [Byte]
+  exp: I64
+
+  def at(i: I64) -> Byte {
+    return mant[i] if 0 <= i && i < mant.size
+    48
+  }
+
+  def to_s -> Str {
+    return "0" if mant.size == 0
+    if exp <= 0 {
+      return "0." + ("0" * (0 - exp)) + Str.from_bytes(mant)
+    }
+    if exp < mant.size {
+      return Str.from_bytes(mant[0...exp]) + "." + Str.from_bytes(mant[exp...mant.size])
+    }
+    Str.from_bytes(mant) + ("0" * (exp - mant.size))
+  }
+}
+
+MAX_SHIFT = 60
+
+# The decimal of m × 2^shift (Go's decimal.init).
+def decimal_init(m0: [U64], shift0: I64) -> Decimal {
+  d = Decimal.new
+  return d if m0.size == 0
+  m = m0
+  shift = shift0
+  if shift < 0 {
+    ntz_ = nat_trailing_zero_bits(m)
+    s = 0 - shift
+    s = ntz_ if s >= ntz_
+    m = nat_rsh(m, s)
+    shift += s
+  }
+  if shift > 0 {
+    m = nat_lsh(m, shift)
+    shift = 0
+  }
+  ds = nat_utoa(m, 10)
+  n = ds.size
+  d.exp = n
+  while n > 0 && ds[n - 1] == 48 {
+    n -= 1
+  }
+  d.mant = ds[0...n]
+  if shift < 0 {
+    while shift < 0 - MAX_SHIFT {
+      d = decimal_rsh(d, MAX_SHIFT)
+      shift += MAX_SHIFT
+    }
+    d = decimal_rsh(d, 0 - shift)
+  }
+  d
+}
+
+# x >> s for s <= MAX_SHIFT (Go's rsh).
+def decimal_rsh(x0: Decimal, s: I64) -> Decimal {
+  x = x0
+  mant = x.mant
+  r = 0
+  n: U64 = 0
+  while n >> s == 0 && r < mant.size {
+    ch = mant[r].to_u64
+    r += 1
+    n = n * 10 + ch - 48
+  }
+  if n == 0 {
+    x.mant = []
+    return x
+  }
+  while n >> s == 0 {
+    r += 1
+    n *= 10
+  }
+  x.exp += 1 - r
+  out: [Byte] = []
+  mask = (ONE << s) - 1
+  while r < mant.size {
+    ch = mant[r].to_u64
+    r += 1
+    d = n >> s
+    n &= mask
+    out << (d + 48).as_u8
+    n = n * 10 + ch - 48
+  }
+  while n > 0 {
+    d = n >> s
+    n &= mask
+    out << (d + 48).as_u8
+    n *= 10
+  }
+  x.mant = out
+  decimal_trim(x)
+}
+
+def decimal_trim(x0: Decimal) -> Decimal {
+  x = x0
+  i = x.mant.size
+  while i > 0 && x.mant[i - 1] == 48 {
+    i -= 1
+  }
+  x.mant = x.mant[0...i]
+  x.exp = 0 if i == 0
+  x
+}
+
+def should_round_up(x: Decimal, n: I64) -> Bool {
+  if x.mant[n] == 53 && n + 1 == x.mant.size {
+    return n > 0 && (x.mant[n - 1] - 48) & 1 != 0
+  }
+  x.mant[n] >= 53
+}
+
+# x rounded to n digits, half to even.
+def decimal_round(x: Decimal, n: I64) -> Decimal {
+  return x if n < 0 || n >= x.mant.size
+  return decimal_round_up(x, n) if should_round_up(x, n)
+  decimal_round_down(x, n)
+}
+
+def decimal_round_up(x0: Decimal, n0: I64) -> Decimal {
+  x = x0
+  return x if n0 < 0 || n0 >= x.mant.size
+  n = n0
+  while n > 0 && x.mant[n - 1] >= 57 {
+    n -= 1
+  }
+  if n == 0 {
+    x.mant = [49]
+    x.exp += 1
+    return x
+  }
+  m: [Byte] = [0; n]
+  copy(m, x.mant[0...n])
+  m[n - 1] += 1
+  x.mant = m
+  x
+}
+
+def decimal_round_down(x0: Decimal, n: I64) -> Decimal {
+  x = x0
+  return x if n < 0 || n >= x.mant.size
+  x.mant = x.mant[0...n]
+  decimal_trim(x)
+}
+
+# ---- formatting (Go's ftoa.go) ----
+
+# Go's Float.Append for the formats e E f g G b p x (others: "%" + fmt).
+def float_append(x: Float, buf0: [Byte], fmt: Byte, prec0: I64) -> [Byte] {
+  buf = buf0
+  prec = prec0
+  buf << 45 if x.neg
+  if x.form == FORM_INF {
+    buf << 43 if !x.neg
+    return buf + "Inf".bytes
+  }
+  return fmt_b(x, buf) if fmt == 98
+  return fmt_p(x, buf) if fmt == 112
+  return fmt_x(x, buf, prec) if fmt == 120
+  d = Decimal.new
+  if x.form == FORM_FINITE {
+    d = decimal_init(x.mant, x.exp.to_i64 - nat_bit_len(x.mant))
+  }
+  shortest = false
+  if prec < 0 {
+    shortest = true
+    d = round_shortest(d, x)
+    if fmt == 101 || fmt == 69 {
+      prec = d.mant.size - 1
+    } elsif fmt == 102 {
+      prec = imax(d.mant.size - d.exp, 0)
+    } elsif fmt == 103 || fmt == 71 {
+      prec = d.mant.size
+    }
+  } else {
+    if fmt == 101 || fmt == 69 {
+      d = decimal_round(d, 1 + prec)
+    } elsif fmt == 102 {
+      d = decimal_round(d, d.exp + prec)
+    } elsif fmt == 103 || fmt == 71 {
+      prec = 1 if prec == 0
+      d = decimal_round(d, prec)
+    }
+  }
+  return fmt_e(buf, fmt, prec, d) if fmt == 101 || fmt == 69
+  return fmt_f(buf, prec, d) if fmt == 102
+  if fmt == 103 || fmt == 71 {
+    eprec = prec
+    eprec = d.mant.size if eprec > d.mant.size && d.mant.size >= d.exp
+    eprec = 6 if shortest
+    exp = d.exp - 1
+    if exp < -4 || exp >= eprec {
+      prec = d.mant.size if prec > d.mant.size
+      return fmt_e(buf, fmt + 101 - 103, prec - 1, d)
+    }
+    prec = d.mant.size if prec > d.exp
+    return fmt_f(buf, imax(prec - d.exp, 0), d)
+  }
+  out = buf
+  out = buf[0...buf.size - 1] if x.neg
+  out << 37
+  out << fmt
+  out
+}
+
+# The shortest decimal that rounds back to x (Go's roundShortest).
+def round_shortest(d: Decimal, x: Float) -> Decimal {
+  return d if d.mant.size == 0
+  mant = nat_set(x.mant)
+  exp = x.exp.to_i64 - nat_bit_len(mant)
+  s = nat_bit_len(mant) - (x.prec_.to_i64 + 1)
+  if s < 0 {
+    mant = nat_lsh(mant, 0 - s)
+  } elsif s > 0 {
+    mant = nat_rsh(mant, s)
+  }
+  exp += s
+  lower = decimal_init(nat_sub(mant, nat_one), exp)
+  upper = decimal_init(nat_add(mant, nat_one), exp)
+  inclusive = mant[0] & 2 == 0
+  for i in 0...d.mant.size {
+    m = d.mant[i]
+    l = lower.at(i)
+    u = upper.at(i)
+    okdown = l != m || (inclusive && i + 1 == lower.mant.size)
+    okup = m != u && (inclusive || m + 1 < u || i + 1 < upper.mant.size || (i >= upper.mant.size && m < 57))
+    return decimal_round(d, i + 1) if okdown && okup
+    return decimal_round_down(d, i + 1) if okdown
+    return decimal_round_up(d, i + 1) if okup
+  }
+  d
+}
+
+# %e: d.ddddde±dd
+def fmt_e(buf0: [Byte], fmt: Byte, prec: I64, d: Decimal) -> [Byte] {
+  buf = buf0
+  ch: Byte = 48
+  ch = d.mant[0] if d.mant.size > 0
+  buf << ch
+  if prec > 0 {
+    buf << 46
+    i = 1
+    m = imin(d.mant.size, prec + 1)
+    if i < m {
+      buf = buf + d.mant[i...m]
+      i = m
+    }
+    while i <= prec {
+      buf << 48
+      i += 1
+    }
+  }
+  buf << fmt
+  exp = 0
+  exp = d.exp - 1 if d.mant.size > 0
+  if exp < 0 {
+    buf << 45
+    exp = 0 - exp
+  } else {
+    buf << 43
+  }
+  buf << 48 if exp < 10
+  buf + strconv.itoa(exp).bytes
+}
+
+# %f: ddddddd.ddddd
+def fmt_f(buf0: [Byte], prec: I64, d: Decimal) -> [Byte] {
+  buf = buf0
+  if d.exp > 0 {
+    m = imin(d.mant.size, d.exp)
+    buf = buf + d.mant[0...m]
+    while m < d.exp {
+      buf << 48
+      m += 1
+    }
+  } else {
+    buf << 48
+  }
+  if prec > 0 {
+    buf << 46
+    for i in 0...prec {
+      buf << d.at(d.exp + i)
+    }
+  }
+  buf
+}
+
+# %b: mantissa as a decimal integer, then "p" and the binary exponent for
+# a mantissa of exactly x's precision.
+def fmt_b(x: Float, buf0: [Byte]) -> [Byte] {
+  buf = buf0
+  if x.form == FORM_ZERO {
+    buf << 48
+    return buf
+  }
+  m = x.mant
+  w = m.size * W
+  p = x.prec_.to_i64
+  if w < p {
+    m = nat_lsh(m, p - w)
+  } elsif w > p {
+    m = nat_rsh(m, w - p)
+  }
+  buf = buf + nat_utoa(m, 10)
+  buf << 112
+  e = x.exp.to_i64 - p
+  buf << 43 if e >= 0
+  buf + strconv.itoa(e).bytes
+}
+
+# %x: 0x1.hhhhp±dd with prec hex digits (as many as needed if prec < 0).
+def fmt_x(x0: Float, buf0: [Byte], prec: I64) -> [Byte] {
+  buf = buf0
+  if x0.form == FORM_ZERO {
+    buf = buf + "0x0".bytes
+    if prec > 0 {
+      buf << 46
+      for _i in 0...prec {
+        buf << 48
+      }
+    }
+    return buf + "p+00".bytes
+  }
+  n = 0
+  if prec < 0 {
+    n = 1 + (x0.min_prec - 1 + 3) / 4 * 4
+  } else {
+    n = 1 + 4 * prec
+  }
+  x = Float.new
+  x.set_prec!(n)
+  x.set_mode!(x0.mode_)
+  x.set!(x0)
+  m = x.mant
+  w = m.size * W
+  if w < n {
+    m = nat_lsh(m, n - w)
+  } elsif w > n {
+    m = nat_rsh(m, w - n)
+  }
+  exp64 = x.exp.to_i64 - 1
+  hm = nat_utoa(m, 16)
+  buf = buf + "0x1".bytes
+  if hm.size > 1 {
+    buf << 46
+    buf = buf + hm[1...hm.size]
+  }
+  buf << 112
+  if exp64 >= 0 {
+    buf << 43
+  } else {
+    exp64 = 0 - exp64
+    buf << 45
+  }
+  buf << 48 if exp64 < 10
+  buf + strconv.itoa(exp64).bytes
+}
+
+# %p: 0x.hhhhp±dd, the mantissa's hex digits without trailing zeros.
+def fmt_p(x: Float, buf0: [Byte]) -> [Byte] {
+  buf = buf0
+  if x.form == FORM_ZERO {
+    buf << 48
+    return buf
+  }
+  m = x.mant
+  i = 0
+  while i < m.size && m[i] == 0 {
+    i += 1
+  }
+  m = m[i...m.size]
+  buf = buf + "0x.".bytes
+  h = nat_utoa(m, 16)
+  k = h.size
+  while k > 0 && h[k - 1] == 48 {
+    k -= 1
+  }
+  buf = buf + h[0...k]
+  buf << 112
+  buf << 43 if x.exp >= 0
+  buf + strconv.itoa(x.exp.to_i64).bytes
+}
+
+# Go's Float.Format for a parsed verb.
+def float_format(x: Float, sp: FmtSpec) -> Str {
+  prec = sp.prec
+  has_prec = prec >= 0
+  prec = 6 if !has_prec
+  f = sp.verb
+  if f == 101 || f == 69 || f == 102 || f == 98 || f == 112 || f == 120 {
+    # as is
+  } elsif f == 70 {
+    f = 102
+  } elsif f == 118 || f == 103 || f == 71 {
+    f = 103 if f == 118
+    prec = -1 if !has_prec
+  } else {
+    return "%!" + Str.from_bytes([sp.verb]) + "(*big.Float=" + x.to_s + ")"
+  }
+  buf = float_append(x, [], f, prec)
+  buf = "?".bytes if buf.size == 0
+  sign = ""
+  if buf[0] == 45 {
+    sign = "-"
+    buf = buf[1...buf.size]
+  } elsif buf[0] == 43 {
+    sign = "+"
+    sign = " " if sp.space
+    buf = buf[1...buf.size]
+  } elsif sp.plus {
+    sign = "+"
+  } elsif sp.space {
+    sign = " "
+  }
+  padding = 0
+  if sp.width >= 0 && sp.width > sign.size + buf.size {
+    padding = sp.width - sign.size - buf.size
+  }
+  body = Str.from_bytes(buf)
+  return sign + rep("0", padding) + body if sp.zero && !x.inf?
+  return sign + body + rep(" ", padding) if sp.minus
+  rep(" ", padding) + sign + body
+}

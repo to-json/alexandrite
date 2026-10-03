@@ -1,0 +1,929 @@
+#![overflow(wrap)]
+# Matching engines, after Go's regexp/exec.go: the NFA (a Pike VM with
+# thread lists) and the one-pass matcher; backtrack.alx has the third.
+#
+# The input is always a Str (the [Byte] methods convert once). A rune and
+# its width travel packed in one Int: rune * 8 + width; end of text is
+# END_OF_TEXT * 8 + 0.
+
+import "regexp/syntax"
+import "unicode"
+import "unicode/utf8"
+
+END_OF_TEXT = -1
+
+# The rune at pos and its width, packed (rune << 3 | width).
+def step_at(s: Str, pos: Int) -> Int {
+  return -8 if pos >= s.size
+  c = s[pos]
+  return (c.to_i << 3) | 1 if c < 0x80
+  r, w = utf8.decode_rune_at(s, pos)
+  (r.to_i << 3) | w
+}
+
+# The rune before pos (END_OF_TEXT at 0), as Go's DecodeLastRuneInString(s[:pos]).
+def rune_before(s: Str, pos: Int) -> Int {
+  return END_OF_TEXT if pos <= 0 || pos > s.size
+  start = pos - 1
+  c = s[start]
+  return c.to_i if c < 0x80
+  lim = pos - 4
+  lim = 0 if lim < 0
+  start -= 1
+  while start >= lim {
+    break if (s[start] & 0xC0) != 0x80
+    start -= 1
+  }
+  start = 0 if start < 0
+  r, size = utf8.decode_rune_at(s, start)
+  return 0xFFFD if start + size != pos
+  r.to_i
+}
+
+# The rune at pos, or END_OF_TEXT.
+def rune_at(s: Str, pos: Int) -> Int {
+  return END_OF_TEXT if pos < 0 || pos >= s.size
+  step_at(s, pos) >> 3
+}
+
+# Whether the empty-width conditions op hold between runes r1 and r2 (Go's
+# lazyFlag.match).
+def empty_ok(op0: Int, r1: Int, r2: Int) -> Bool {
+  op = op0
+  return true if op == 0
+  if (op & syntax.EMPTY_BEGIN_LINE) != 0 {
+    return false if r1 != 10 && r1 >= 0
+    op &= ^syntax.EMPTY_BEGIN_LINE
+  }
+  if (op & syntax.EMPTY_BEGIN_TEXT) != 0 {
+    return false if r1 >= 0
+    op &= ^syntax.EMPTY_BEGIN_TEXT
+  }
+  return true if op == 0
+  if (op & syntax.EMPTY_END_LINE) != 0 {
+    return false if r2 != 10 && r2 >= 0
+    op &= ^syntax.EMPTY_END_LINE
+  }
+  if (op & syntax.EMPTY_END_TEXT) != 0 {
+    return false if r2 >= 0
+    op &= ^syntax.EMPTY_END_TEXT
+  }
+  return true if op == 0
+  if is_word(r1) != is_word(r2) {
+    op &= ^syntax.EMPTY_WORD_BOUNDARY
+  } else {
+    op &= ^syntax.EMPTY_NO_WORD_BOUNDARY
+  }
+  op == 0
+}
+
+# Whether r is an ASCII word character (Go's syntax.IsWordChar).
+def is_word(r: Int) -> Bool {
+  (r >= 97 && r <= 122) || (r >= 65 && r <= 90) || (r >= 48 && r <= 57) || r == 95
+}
+
+# Whether an INST_RUNE with runes rs and flags arg matches r (Go's
+# Inst.MatchRunePos != noMatch).
+def rune_matches(rs: [Rune], arg: Int, r: Int) -> Bool {
+  n = rs.size
+  if n == 2 {
+    return r >= rs[0].to_i && r <= rs[1].to_i
+  }
+  if n == 1 {
+    r0 = rs[0]
+    return true if r == r0.to_i
+    if (arg & syntax.FOLD_CASE) != 0 {
+      r1 = unicode.simple_fold(r0)
+      while r1 != r0 {
+        return true if r == r1.to_i
+        r1 = unicode.simple_fold(r1)
+      }
+    }
+    return false
+  }
+  if n <= 8 {
+    # Linear search for a few pairs. Should handle ASCII well.
+    j = 0
+    while j < n {
+      return false if r < rs[j].to_i
+      return true if r <= rs[j + 1].to_i
+      j += 2
+    }
+    return false
+  }
+  # Otherwise binary search.
+  lo = 0
+  hi = n / 2
+  while lo < hi {
+    m = (lo + hi) >> 1
+    if rs[2 * m].to_i <= r {
+      return true if r <= rs[2 * m + 1].to_i
+      lo = m + 1
+    } else {
+      hi = m
+    }
+  }
+  false
+}
+
+# The index of the matching rune pair of runes rs, or -1 (Go's MatchRunePos).
+def rune_match_pos(rs: [Rune], arg: Int, r: Int) -> Int {
+  n = rs.size
+  return -1 if n == 0
+  if n == 1 {
+    return rune_matches(rs, arg, r) ? 0 : -1
+  }
+  if n == 2 {
+    return r >= rs[0].to_i && r <= rs[1].to_i ? 0 : -1
+  }
+  if n <= 8 {
+    j = 0
+    while j < n {
+      return -1 if r < rs[j].to_i
+      return j / 2 if r <= rs[j + 1].to_i
+      j += 2
+    }
+    return -1
+  }
+  lo = 0
+  hi = n / 2
+  while lo < hi {
+    m = (lo + hi) >> 1
+    if rs[2 * m].to_i <= r {
+      return m if r <= rs[2 * m + 1].to_i
+      lo = m + 1
+    } else {
+      hi = m
+    }
+  }
+  -1
+}
+
+# -------------------------------------------------------------------- NFA
+
+# The Pike VM's state for one search (Go's machine). Queues: run queue and
+# next queue live in the halves [0, n) and [n, 2n) of sparse / dpc / dt.
+# Threads are capture vectors in tcap (ncap Ints each); thread 0 is the
+# match's capture vector (Go's matchcap). `st`: [qlen0, qlen1, nfree, matched].
+struct Nfa {
+  op: [Int]
+  out: [Int]
+  arg: [Int]
+  runes: [[Rune]]
+  rune0: [Int]
+  n: Int
+  ncap: Int
+  longest: Bool
+  sparse: [Int]
+  dpc: [Int]
+  dt: [Int]
+  tcap: [Int]
+  free: [Int]
+  stk: [Int]
+  st: [Int]
+}
+
+def new_nfa(re: Regexp, ncap: Int) -> Nfa {
+  n = re.d[0].inst_op.size
+  nthreads = 2 * n + 2
+  free: [Int] = []
+  t = nthreads - 1
+  while t >= 1 {
+    free << t
+    t -= 1
+  }
+  Nfa.new(op: re.d[0].inst_op, out: re.d[0].inst_out, arg: re.d[0].inst_arg, runes: re.d[0].inst_runes, rune0: re.d[0].inst_rune0, n: n, ncap: ncap, longest: re.longest, sparse: [0; 2 * n], dpc: [0; 2 * n], dt: [0; 2 * n], tcap: [0; ncap * nthreads], free: free, stk: [0; 3 * n + 4], st: [0, 0, free.size, 0])
+}
+
+# Follows empty arrows from pc and puts the threads they reach on queue q
+# (0 or 1), with captures from thread slot wslot at position pos; r1 and r2
+# are the runes around pos (for empty-width tests). treuse is a thread the
+# caller is done with (or -1); returns it if it wasn't used. Go's
+# machine.add, with an explicit stack instead of recursion.
+def nfa_add(v: Nfa, q: Int, pc0: Int, pos: Int, wslot: Int, treuse0: Int, r1: Int, r2: Int) -> Int {
+  treuse = treuse0
+  n = v.n
+  ncap = v.ncap
+  qb = q * n
+  ql = v.st[q]
+  sparse = v.sparse
+  dpc = v.dpc
+  dt = v.dt
+  ops = v.op
+  outs = v.out
+  args = v.arg
+  stk = v.stk
+  tcap = v.tcap
+  wb = wslot * ncap
+  sp = 1
+  stk[0] = pc0
+  cdepth = 0
+  while sp > 0 {
+    sp -= 1
+    x = stk[sp]
+    if x < 0 {
+      # Restore a capture slot after its subtree: (old value, -(slot + 1)).
+      sp -= 1
+      tcap[wb - x - 1] = stk[sp]
+      cdepth -= 1
+      next
+    }
+    pc = x
+    loop {
+      break if pc == 0
+      j = sparse[qb + pc]
+      break if j < ql && dpc[qb + j] == pc
+      j = ql
+      ql += 1
+      dpc[qb + j] = pc
+      dt[qb + j] = -1
+      sparse[qb + pc] = j
+      op = ops[pc]
+      if op == syntax.INST_ALT || op == syntax.INST_ALT_MATCH {
+        stk[sp] = args[pc]
+        sp += 1
+        pc = outs[pc]
+        next
+      }
+      if op == syntax.INST_NOP {
+        pc = outs[pc]
+        next
+      }
+      if op == syntax.INST_EMPTY_WIDTH {
+        break if !empty_ok(args[pc], r1, r2)
+        pc = outs[pc]
+        next
+      }
+      if op == syntax.INST_CAPTURE {
+        a = args[pc]
+        if a < ncap {
+          stk[sp] = tcap[wb + a]
+          stk[sp + 1] = -(a + 1)
+          sp += 2
+          cdepth += 1
+          tcap[wb + a] = pos
+        }
+        pc = outs[pc]
+        next
+      }
+      break if op == syntax.INST_FAIL
+      # INST_MATCH and the rune instructions: a thread.
+      t = 1
+      if ncap > 0 {
+        if treuse >= 0 && cdepth == 0 {
+          t = treuse
+          treuse = -1
+        } else {
+          nf = v.st[2] - 1
+          v.st[2] = nf
+          t = v.free[nf]
+        }
+        if t != wslot {
+          tb = t * ncap
+          k = 0
+          while k < ncap {
+            tcap[tb + k] = tcap[wb + k]
+            k += 1
+          }
+        }
+      }
+      dt[qb + j] = t
+      break
+    }
+  }
+  v.st[q] = ql
+  treuse
+}
+
+def nfa_free(v: Nfa, t: Int) {
+  if v.ncap > 0 {
+    nf = v.st[2]
+    v.free[nf] = t
+    v.st[2] = nf + 1
+  }
+}
+
+# Frees the threads left on queue q and empties it.
+def nfa_clear(v: Nfa, q: Int) {
+  qb = q * v.n
+  j = 0
+  while j < v.st[q] {
+    t = v.dt[qb + j]
+    nfa_free(v, t) if t >= 0
+    j += 1
+  }
+  v.st[q] = 0
+}
+
+# Runs the threads on queue rq over rune c at pos, adding the survivors to
+# queue nq for next_pos (Go's machine.step). nr1, nr2: the runes around
+# next_pos.
+def nfa_step(v: Nfa, rq: Int, nq: Int, pos: Int, next_pos: Int, c: Int, nr1: Int, nr2: Int) {
+  longest = v.longest
+  ncap = v.ncap
+  rb = rq * v.n
+  tcap = v.tcap
+  j = 0
+  while j < v.st[rq] {
+    t = v.dt[rb + j]
+    if t < 0 {
+      j += 1
+      next
+    }
+    if longest && v.st[3] != 0 && ncap > 0 && tcap[0] < tcap[t * ncap] {
+      nfa_free(v, t)
+      j += 1
+      next
+    }
+    pc = v.dpc[rb + j]
+    op = v.op[pc]
+    add = false
+    if op == syntax.INST_RUNE1 {
+      add = c == v.rune0[pc]
+    } else if op == syntax.INST_RUNE {
+      add = rune_matches(v.runes[pc], v.arg[pc], c)
+    } else if op == syntax.INST_RUNE_ANY_NOT_NL {
+      add = c != 10
+    } else if op == syntax.INST_RUNE_ANY {
+      add = true
+    } else if op == syntax.INST_MATCH {
+      if ncap > 0 && (!longest || v.st[3] == 0 || tcap[1] < pos) {
+        tb = t * ncap
+        tcap[tb + 1] = pos
+        k = 0
+        while k < ncap {
+          tcap[k] = tcap[tb + k]
+          k += 1
+        }
+      }
+      if !longest {
+        # First-match mode: cut off all lower-priority threads.
+        k = j + 1
+        while k < v.st[rq] {
+          d = v.dt[rb + k]
+          nfa_free(v, d) if d >= 0
+          k += 1
+        }
+        v.st[rq] = 0
+      }
+      v.st[3] = 1
+    } else {
+      panic("bad inst")
+    }
+    tl = t
+    tl = nfa_add(v, nq, v.out[pc], next_pos, t, t, nr1, nr2) if add
+    nfa_free(v, tl) if tl >= 0
+    j += 1
+  }
+  v.st[rq] = 0
+}
+
+# Runs the NFA on s from pos; the match's captures are in v.tcap[0...ncap]
+# (Go's machine.match, with machine.add and machine.step inlined: the hot
+# loop makes no calls but the rune tests).
+def nfa_match(v: Nfa, re: Regexp, s: Str, pos0: Int) -> Bool {
+  start_cond = re.d[0].cond
+  return false if start_cond == 255 # impossible
+  pos = pos0
+  ncap = v.ncap
+  n = v.n
+  longest = v.longest
+  ops = v.op
+  outs = v.out
+  args = v.arg
+  runes = v.runes
+  rune0 = v.rune0
+  sparse = v.sparse
+  dpc = v.dpc
+  dt = v.dt
+  tcap = v.tcap
+  free = v.free
+  stk = v.stk
+  nfree = v.st[2]
+  matched = false
+  k = 0
+  while k < ncap {
+    tcap[k] = -1
+    k += 1
+  }
+  # The run queue is [rb, rb + rlen) of dpc / dt, the next queue [nb, nb + nlen).
+  rb = 0
+  rlen = 0
+  nb = n
+  nlen = 0
+  x = step_at(s, pos)
+  r = x >> 3
+  width = x & 7
+  r1 = END_OF_TEXT
+  width1 = 0
+  if r != END_OF_TEXT {
+    x = step_at(s, pos + width)
+    r1 = x >> 3
+    width1 = x & 7
+  }
+  # The flag: runes around pos.
+  fa = pos == 0 ? END_OF_TEXT : rune_before(s, pos)
+  fb = r
+  has_prefix = re.d[0].prefix.size > 0
+  begin_text = (start_cond & syntax.EMPTY_BEGIN_TEXT) != 0
+  start = re.d[0].start
+  loop {
+    if rlen == 0 {
+      # Anchored match, past beginning of text.
+      break if begin_text && pos != 0
+      # Have match; finished exploring alternatives.
+      break if matched
+      if has_prefix && r1 != re.d[0].prefix_rune {
+        # Match requires literal prefix; fast search for it.
+        advance = s.byteindex(re.d[0].prefix, pos)
+        break if advance < 0
+        pos = advance
+        x = step_at(s, pos)
+        r = x >> 3
+        width = x & 7
+        x = step_at(s, pos + width)
+        r1 = x >> 3
+        width1 = x & 7
+      }
+    }
+    if !matched {
+      tcap[0] = pos if ncap > 0
+      # ---- add(runq, start, pos, matchcap (slot 0), no thread, fa, fb)
+      sp = 1
+      stk[0] = start
+      cdepth = 0
+      while sp > 0 {
+        sp -= 1
+        xx = stk[sp]
+        if xx < 0 {
+          sp -= 1
+          tcap[-xx - 1] = stk[sp]
+          cdepth -= 1
+          next
+        }
+        pc = xx
+        loop {
+          break if pc == 0
+          j = sparse[rb + pc]
+          break if j < rlen && dpc[rb + j] == pc
+          j = rlen
+          rlen += 1
+          dpc[rb + j] = pc
+          dt[rb + j] = -1
+          sparse[rb + pc] = j
+          op = ops[pc]
+          if op == syntax.INST_ALT || op == syntax.INST_ALT_MATCH {
+            stk[sp] = args[pc]
+            sp += 1
+            pc = outs[pc]
+            next
+          }
+          if op == syntax.INST_NOP {
+            pc = outs[pc]
+            next
+          }
+          if op == syntax.INST_EMPTY_WIDTH {
+            break if !empty_ok(args[pc], fa, fb)
+            pc = outs[pc]
+            next
+          }
+          if op == syntax.INST_CAPTURE {
+            a = args[pc]
+            if a < ncap {
+              stk[sp] = tcap[a]
+              stk[sp + 1] = -(a + 1)
+              sp += 2
+              cdepth += 1
+              tcap[a] = pos
+            }
+            pc = outs[pc]
+            next
+          }
+          break if op == syntax.INST_FAIL
+          # A thread, with a copy of the captures.
+          t = 1
+          if ncap > 0 {
+            nfree -= 1
+            t = free[nfree]
+            tb = t * ncap
+            k = 0
+            while k < ncap {
+              tcap[tb + k] = tcap[k]
+              k += 1
+            }
+          }
+          dt[rb + j] = t
+          break
+        }
+      }
+    }
+    fa = r
+    fb = r1
+    # ---- step(runq, nextq, pos, pos + width, r, fa, fb)
+    next_pos = pos + width
+    j0 = 0
+    while j0 < rlen {
+      t = dt[rb + j0]
+      if t < 0 {
+        j0 += 1
+        next
+      }
+      if longest && matched && ncap > 0 && tcap[0] < tcap[t * ncap] {
+        if ncap > 0 {
+          free[nfree] = t
+          nfree += 1
+        }
+        j0 += 1
+        next
+      }
+      ipc = dpc[rb + j0]
+      op = ops[ipc]
+      add = false
+      if op == syntax.INST_RUNE1 {
+        add = r == rune0[ipc]
+      } else if op == syntax.INST_RUNE {
+        rs = runes[ipc]
+        if rs.size <= 8 && rs.size != 1 {
+          # Small classes (and case-folded runes, expanded at compile time):
+          # a linear scan, inline.
+          q = 0
+          while q < rs.size {
+            break if r < rs[q].to_i
+            if r <= rs[q + 1].to_i {
+              add = true
+              break
+            }
+            q += 2
+          }
+        } else {
+          add = rune_matches(rs, args[ipc], r)
+        }
+      } else if op == syntax.INST_RUNE_ANY_NOT_NL {
+        add = r != 10
+      } else if op == syntax.INST_RUNE_ANY {
+        add = true
+      } else if op == syntax.INST_MATCH {
+        if ncap > 0 && (!longest || !matched || tcap[1] < pos) {
+          tb = t * ncap
+          tcap[tb + 1] = pos
+          k = 0
+          while k < ncap {
+            tcap[k] = tcap[tb + k]
+            k += 1
+          }
+        }
+        if !longest {
+          # First-match mode: cut off all lower-priority threads.
+          k = j0 + 1
+          while k < rlen {
+            d = dt[rb + k]
+            if d >= 0 && ncap > 0 {
+              free[nfree] = d
+              nfree += 1
+            }
+            k += 1
+          }
+          rlen = 0
+        }
+        matched = true
+      } else {
+        panic("bad inst")
+      }
+      if add {
+        # ---- add(nextq, out, next_pos, t's captures, reuse t, fa, fb)
+        treuse = t
+        wb = t * ncap
+        sp = 1
+        stk[0] = outs[ipc]
+        cdepth = 0
+        while sp > 0 {
+          sp -= 1
+          xx = stk[sp]
+          if xx < 0 {
+            sp -= 1
+            tcap[wb - xx - 1] = stk[sp]
+            cdepth -= 1
+            next
+          }
+          pc = xx
+          loop {
+            break if pc == 0
+            j = sparse[nb + pc]
+            break if j < nlen && dpc[nb + j] == pc
+            j = nlen
+            nlen += 1
+            dpc[nb + j] = pc
+            dt[nb + j] = -1
+            sparse[nb + pc] = j
+            op2 = ops[pc]
+            if op2 == syntax.INST_ALT || op2 == syntax.INST_ALT_MATCH {
+              stk[sp] = args[pc]
+              sp += 1
+              pc = outs[pc]
+              next
+            }
+            if op2 == syntax.INST_NOP {
+              pc = outs[pc]
+              next
+            }
+            if op2 == syntax.INST_EMPTY_WIDTH {
+              break if !empty_ok(args[pc], fa, fb)
+              pc = outs[pc]
+              next
+            }
+            if op2 == syntax.INST_CAPTURE {
+              a = args[pc]
+              if a < ncap {
+                stk[sp] = tcap[wb + a]
+                stk[sp + 1] = -(a + 1)
+                sp += 2
+                cdepth += 1
+                tcap[wb + a] = next_pos
+              }
+              pc = outs[pc]
+              next
+            }
+            break if op2 == syntax.INST_FAIL
+            # A thread: t itself if it's still free to use, else a copy.
+            nt = 1
+            if ncap > 0 {
+              if treuse >= 0 && cdepth == 0 {
+                nt = treuse
+                treuse = -1
+              } else {
+                nfree -= 1
+                nt = free[nfree]
+                tb = nt * ncap
+                k = 0
+                while k < ncap {
+                  tcap[tb + k] = tcap[wb + k]
+                  k += 1
+                }
+              }
+            }
+            dt[nb + j] = nt
+            break
+          }
+        }
+        t = treuse
+      }
+      if t >= 0 && ncap > 0 {
+        free[nfree] = t
+        nfree += 1
+      }
+      j0 += 1
+    }
+    rlen = 0
+    break if width == 0
+    break if ncap == 0 && matched
+    pos += width
+    r = r1
+    width = width1
+    if r != END_OF_TEXT {
+      x = step_at(s, pos + width)
+      r1 = x >> 3
+      width1 = x & 7
+    }
+    tq = rb
+    rb = nb
+    nb = tq
+    rlen = nlen
+    nlen = 0
+  }
+  # Free the threads left on the next queue (Go's m.clear(nextq)).
+  if ncap > 0 {
+    k = 0
+    while k < nlen {
+      d = dt[nb + k]
+      if d >= 0 {
+        free[nfree] = d
+        nfree += 1
+      }
+      k += 1
+    }
+  }
+  v.st[2] = nfree
+  v.st[3] = matched ? 1 : 0
+  matched
+}
+
+# --------------------------------------------------------------- one-pass
+
+# Go's doOnePass: the captures of the one-pass match from pos, or none.
+def do_one_pass(re: Regexp, s: Str, pos0: Int, ncap: Int) -> [Int]? {
+  start_cond = re.d[0].cond
+  return none if start_cond == 255 # impossible
+  pos = pos0
+  op = re.d[0].onepass
+  matchcap = [-1; ncap]
+  matched = false
+  x = step_at(s, pos)
+  r = x >> 3
+  width = x & 7
+  r1 = END_OF_TEXT
+  width1 = 0
+  if r != END_OF_TEXT {
+    x = step_at(s, pos + width)
+    r1 = x >> 3
+    width1 = x & 7
+  }
+  fa = pos == 0 ? END_OF_TEXT : rune_before(s, pos)
+  fb = r
+  pc = op.start
+  if pos == 0 && empty_ok(op.arg[pc], fa, fb) && re.d[0].prefix.size > 0 {
+    # Match requires literal prefix; fast search for it.
+    return none if !has_prefix_at(s, re.d[0].prefix, pos)
+    pos += re.d[0].prefix.size
+    x = step_at(s, pos)
+    r = x >> 3
+    width = x & 7
+    x = step_at(s, pos + width)
+    r1 = x >> 3
+    width1 = x & 7
+    fa = rune_before(s, pos)
+    fb = r
+    pc = re.d[0].prefix_end
+  }
+  ops = op.op
+  outs = op.out
+  args = op.arg
+  loop {
+    iop = ops[pc]
+    ipc = pc
+    pc = outs[pc]
+    if iop == syntax.INST_MATCH {
+      matched = true
+      if ncap > 0 {
+        matchcap[0] = 0
+        matchcap[1] = pos
+      }
+      break
+    } else if iop == syntax.INST_RUNE {
+      break if !rune_matches(op.runes[ipc], args[ipc], r)
+    } else if iop == syntax.INST_RUNE1 {
+      break if r != op.runes[ipc][0].to_i
+    } else if iop == syntax.INST_RUNE_ANY {
+      # Nothing
+    } else if iop == syntax.INST_RUNE_ANY_NOT_NL {
+      break if r == 10
+    } else if iop == syntax.INST_ALT || iop == syntax.INST_ALT_MATCH {
+      # peek at the input rune to see which branch to take
+      nx = rune_match_pos(op.runes[ipc], args[ipc], r)
+      if nx >= 0 {
+        pc = op.nexts[ipc][nx]
+      } else if iop == syntax.INST_ALT_MATCH {
+        pc = outs[ipc]
+      } else {
+        pc = 0
+      }
+      next
+    } else if iop == syntax.INST_FAIL {
+      break
+    } else if iop == syntax.INST_NOP {
+      next
+    } else if iop == syntax.INST_EMPTY_WIDTH {
+      break if !empty_ok(args[ipc], fa, fb)
+      next
+    } else if iop == syntax.INST_CAPTURE {
+      matchcap[args[ipc]] = pos if args[ipc] < ncap
+      next
+    } else {
+      panic("bad inst")
+    }
+    break if width == 0
+    fa = r
+    fb = r1
+    pos += width
+    r = r1
+    width = width1
+    if r != END_OF_TEXT {
+      x = step_at(s, pos + width)
+      r1 = x >> 3
+      width1 = x & 7
+    }
+  }
+  return none if !matched
+  matchcap
+}
+
+# --------------------------------------------------------------- dispatch
+
+# The match captures (ncap Ints) of the first match in s at or after pos, or
+# none (Go's find; an empty array for a match with ncap 0).
+def search(re: Regexp, s: Str, pos: Int, ncap: Int) -> [Int]? {
+  return none if s.size < re.d[0].min_input_len
+  return do_one_pass(re, s, pos, ncap) if re.d[0].has_onepass
+  return backtrack(re, s, pos, ncap) if s.size < re.d[0].max_bit_state_len
+  v = new_nfa(re, ncap)
+  return none if !nfa_match(v, re, s, pos)
+  v.tcap[0...ncap].clone
+}
+
+# search with a reusable NFA (for loops over one input).
+def search_with(re: Regexp, v: Nfa, s: Str, pos: Int) -> [Int]? {
+  ncap = v.ncap
+  return none if s.size < re.d[0].min_input_len
+  return do_one_pass(re, s, pos, ncap) if re.d[0].has_onepass
+  return backtrack(re, s, pos, ncap) if s.size < re.d[0].max_bit_state_len
+  return none if !nfa_match(v, re, s, pos)
+  v.tcap[0...ncap].clone
+}
+
+# --------------------------------------------------------- string search
+
+# Whether s[pos...] begins with p.
+def has_prefix_at(s: Str, p: Str, pos: Int) -> Bool {
+  return false if s.size - pos < p.size
+  i = 0
+  while i < p.size {
+    return false if s[pos + i] != p[i]
+    i += 1
+  }
+  true
+}
+
+# The first index >= from where p occurs in s, or -1 (memchr-based).
+def index_from(s: Str, p: Str, from: Int) -> Int { s.byteindex(p, from) }
+
+# ----------------------------------------------------------------- readers
+
+# The next rune from the reader in rd[0], packed, if pos is where the reader
+# is (st: [at end of text (0/1), reader position]); Go's inputReader.step.
+def reader_step(rd: [RuneReader], st: [Int], pos: Int) -> Int {
+  return -8 if st[0] == 0 && pos != st[1]
+  res = rd[0].read_rune!
+  if res.ok? {
+    if rw = res.unwrap {
+      st[1] = st[1] + rw[1]
+      return (rw[0].to_i << 3) | rw[1]
+    }
+  }
+  st[0] = 1
+  -8
+}
+
+# The NFA over a RuneReader from position 0 (Go's machine.match with an
+# inputReader: no prefix skipping, no context lookups).
+def nfa_match_reader(v: Nfa, re: Regexp, r: RuneReader) -> Bool {
+  start_cond = re.d[0].cond
+  return false if start_cond == 255 # impossible
+  rd: [RuneReader] = [r]
+  st = [0, 0]
+  pos = 0
+  ncap = v.ncap
+  v.st[3] = 0
+  k = 0
+  while k < ncap {
+    v.tcap[k] = -1
+    k += 1
+  }
+  rq = 0
+  nq = 1
+  x = reader_step(rd, st, pos)
+  rr = x >> 3
+  width = x & 7
+  r1 = END_OF_TEXT
+  width1 = 0
+  if rr != END_OF_TEXT {
+    x = reader_step(rd, st, pos + width)
+    r1 = x >> 3
+    width1 = x & 7
+  }
+  fa = END_OF_TEXT
+  fb = rr
+  loop {
+    if v.st[rq] == 0 {
+      break if (start_cond & syntax.EMPTY_BEGIN_TEXT) != 0 && pos != 0
+      break if v.st[3] != 0
+    }
+    if v.st[3] == 0 {
+      v.tcap[0] = pos if ncap > 0
+      nfa_add(v, rq, re.d[0].start, pos, 0, -1, fa, fb)
+    }
+    fa = rr
+    fb = r1
+    nfa_step(v, rq, nq, pos, pos + width, rr, fa, fb)
+    break if width == 0
+    break if ncap == 0 && v.st[3] != 0
+    pos += width
+    rr = r1
+    width = width1
+    if rr != END_OF_TEXT {
+      x = reader_step(rd, st, pos + width)
+      r1 = x >> 3
+      width1 = x & 7
+    }
+    t = rq
+    rq = nq
+    nq = t
+  }
+  nfa_clear(v, nq)
+  v.st[3] != 0
+}
+
+# Go's find over a reader.
+def find_reader(re: Regexp, r: RuneReader, ncap: Int) -> [Int]? {
+  v = new_nfa(re, ncap)
+  return none if !nfa_match_reader(v, re, r)
+  v.tcap[0...ncap].clone
+}

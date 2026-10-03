@@ -1,0 +1,229 @@
+# Go's os/user tests (user_test.go, lookup_unix_test.go,
+# listgroups_unix_test.go), translated. The parser tests run Go's pure-Go
+# /etc/passwd and /etc/group readers over Go's test files.
+import "os"
+import "slices"
+
+def large_group -> Str {
+  s = "largegroup:x:1000:user1"
+  i = 2
+  while i <= 7500 {
+    s += ",user#{i}"
+    i += 1
+  }
+  s
+}
+
+def test_group_file -> Str {
+  "# See the opendirectoryd(8) man page for additional\n" +
+    "# information about Open Directory.\n" +
+    "##\n" +
+    "nobody:*:-2:\n" +
+    "nogroup:*:-1:\n" +
+    "wheel:*:0:root\n" +
+    "emptyid:*::root\n" +
+    "invalidgid:*:notanumber:root\n" +
+    "+plussign:*:20:root\n" +
+    "-minussign:*:21:root\n" +
+    "# Next line is invalid (empty group name)\n" +
+    ":*:22:root\n" +
+    "\n" +
+    "daemon:*:1:root\n" +
+    "    indented:*:7:root\n" +
+    "# comment:*:4:found\n" +
+    "     # comment:*:4:found\n" +
+    "kmem:*:2:root\n" +
+    "manymembers:x:777:jill,jody,john,jack,jov,user777\n" +
+    large_group
+}
+
+def test_user_file -> Str {
+  "   # Example user file\n" +
+    "root:x:0:0:root:/root:/bin/bash\n" +
+    "daemon:x:1:1:daemon:/usr/sbin:/usr/sbin/nologin\n" +
+    "bin:x:2:3:bin:/bin:/usr/sbin/nologin\n" +
+    "     indented:x:3:3:indented:/dev:/usr/sbin/nologin\n" +
+    "sync:x:4:65534:sync:/bin:/bin/sync\n" +
+    "negative:x:-5:60:games:/usr/games:/usr/sbin/nologin\n" +
+    "man:x:6:12:man:/var/cache/man:/usr/sbin/nologin\n" +
+    "allfields:x:6:12:mansplit,man2,man3,man4:/home/allfields:/usr/sbin/nologin\n" +
+    "+plussign:x:8:10:man:/var/cache/man:/usr/sbin/nologin\n" +
+    "-minussign:x:9:10:man:/var/cache/man:/usr/sbin/nologin\n" +
+    "\n" +
+    "malformed:x:27:12 # more:colons:after:comment\n" +
+    "\n" +
+    "struid:x:notanumber:12 # more:colons:after:comment\n" +
+    "\n" +
+    "# commented:x:28:12:commented:/var/cache/man:/usr/sbin/nologin\n" +
+    "      # commentindented:x:29:12:commentindented:/var/cache/man:/usr/sbin/nologin\n" +
+    "\n" +
+    "struid2:x:30:badgid:struid2name:/home/struid:/usr/sbin/nologin\n"
+}
+
+test "find group name" {
+  tf = test_group_file
+  for text, name, gid in [
+    (tf, "nobody", "-2"), (tf, "kmem", "2"), (tf, "notinthefile", ""), (tf, "comment", ""),
+    (tf, "plussign", ""), (tf, "+plussign", ""), (tf, "-minussign", ""), (tf, "minussign", ""),
+    (tf, "emptyid", ""), (tf, "invalidgid", ""), (tf, "indented", "7"), (tf, "# comment", ""),
+    (tf, "largegroup", "1000"), (tf, "manymembers", "777"), ("", "emptyfile", ""),
+  ] {
+    r = find_group_name(name, text)
+    if gid == "" {
+      assert_eq r.err.unwrap.message, "group: unknown group #{name}"
+    } else {
+      g = ~r
+      assert_eq g.gid, gid
+      assert_eq g.name, name
+    }
+  }
+}
+
+test "find group id" {
+  tf = test_group_file
+  for text, gid, name in [
+    (tf, "-2", "nobody"), (tf, "2", "kmem"), (tf, "notinthefile", ""), (tf, "comment", ""),
+    (tf, "7", "indented"), (tf, "4", ""), (tf, "20", ""), (tf, "21", ""), ("", "emptyfile", ""),
+  ] {
+    r = find_group_id(gid, text)
+    if name == "" {
+      assert_eq r.err.unwrap.message, "group: unknown groupid #{gid}"
+    } else {
+      g = ~r
+      assert_eq g.gid, gid
+      assert_eq g.name, name
+    }
+  }
+}
+
+test "invalid user id" {
+  r = find_user_id("notanumber", "")
+  assert_eq r.err.unwrap.message, "user: invalid userid notanumber"
+}
+
+test "lookup user id" {
+  tf = test_user_file
+  for text, uid, name in [
+    (tf, "-5", "negative"), (tf, "2", "bin"), (tf, "100", ""), (tf, "8", ""), (tf, "9", ""),
+    (tf, "27", ""), (tf, "28", ""), (tf, "29", ""), (tf, "3", "indented"), (tf, "30", ""), ("", "1", ""),
+  ] {
+    r = find_user_id(uid, text)
+    if name == "" {
+      assert_eq r.err.unwrap.message, "user: unknown userid #{uid}"
+    } else {
+      u = ~r
+      assert_eq u.uid, uid
+      assert_eq u.username, name
+    }
+  }
+}
+
+test "lookup user populates all fields" {
+  u = ~find_username("allfields", test_user_file)
+  assert_eq u.username, "allfields"
+  assert_eq u.uid, "6"
+  assert_eq u.gid, "12"
+  assert_eq u.name, "mansplit"
+  assert_eq u.home_dir, "/home/allfields"
+}
+
+test "lookup user" {
+  tf = test_user_file
+  for text, name, uid in [
+    (tf, "negative", "-5"), (tf, "bin", "2"), (tf, "notinthefile", ""), (tf, "indented", "3"),
+    (tf, "plussign", ""), (tf, "+plussign", ""), (tf, "minussign", ""), (tf, "-minussign", ""),
+    (tf, "   indented", ""), (tf, "commented", ""), (tf, "commentindented", ""), (tf, "malformed", ""),
+    (tf, "# commented", ""), ("", "emptyfile", ""),
+  ] {
+    r = find_username(name, text)
+    if uid == "" {
+      assert_eq r.err.unwrap.message, "user: unknown user #{name}"
+    } else {
+      u = ~r
+      assert_eq u.uid, uid
+      assert_eq u.username, name
+    }
+  }
+}
+
+test "list groups" {
+  tf = test_group_file
+  for text, user, gid, want in [
+    (tf, "root", "0", ["0", "1", "2", "7"]),
+    (tf, "jill", "33", ["33", "777"]),
+    (tf, "jody", "34", ["34", "777"]),
+    (tf, "john", "35", ["35", "777"]),
+    (tf, "jov", "37", ["37", "777"]),
+    (tf, "user777", "7", ["7", "777", "1000"]),
+    (tf, "user1111", "1111", ["1111", "1000"]),
+    (tf, "user1000", "1000", ["1000"]),
+    (tf, "user7500", "7500", ["1000", "7500"]),
+    (tf, "no-such-user", "2345", ["2345"]),
+    ("", "no-such-user", "2345", ["2345"]),
+  ] {
+    got = ~list_groups_from(User.new(username: user, gid: gid), text)
+    slices.sort(got)
+    w = want.dup
+    slices.sort(w)
+    assert_eq got, w
+  }
+  assert list_groups_from(User.new(username: "", gid: "2345"), "").err?
+  assert list_groups_from(User.new(username: "joanna", gid: "bad"), "").err?
+}
+
+test "current" {
+  u = ~current
+  assert u.home_dir != "", "didn't get a HomeDir"
+  assert u.username != "", "didn't get a username"
+  assert_eq u.uid, os.getuid.to_s
+}
+
+test "lookup" {
+  want = ~current
+  got = ~lookup(want.username)
+  assert_eq got.uid, want.uid
+  assert_eq got.username, want.username
+  assert_eq got.name, want.name
+  assert_eq got.home_dir, want.home_dir
+  assert_eq got.gid, want.gid
+  assert_eq lookup("no-such-user-alx-xyz").err.unwrap.message, "user: unknown user no-such-user-alx-xyz"
+}
+
+test "lookup id" {
+  want = ~current
+  got = ~lookup_id(want.uid)
+  assert_eq got.uid, want.uid
+  assert_eq got.username, want.username
+  assert_eq got.name, want.name
+  assert_eq got.home_dir, want.home_dir
+  assert_eq got.gid, want.gid
+  assert_eq lookup_id("x").err.unwrap.message, "user: invalid userid x"
+  assert_eq lookup_id("3999999999").err.unwrap.message, "user: unknown userid 3999999999"
+}
+
+test "lookup group" {
+  u = ~current
+  r = lookup_group_id(u.gid)
+  # The group may have no name (Go's test allows it).
+  if g1 = r.ok {
+    assert_eq g1.gid, u.gid
+    g2 = ~lookup_group(g1.name)
+    assert_eq g2.gid, g1.gid
+    assert_eq g2.name, g1.name
+  }
+  assert_eq lookup_group("no-such-group-alx-xyz").err.unwrap.message, "group: unknown group no-such-group-alx-xyz"
+}
+
+test "group ids" {
+  u = ~current
+  gids = ~u.group_ids
+  assert gids.include?(u.gid), "group_ids does not contain the user's gid"
+  assert_eq gids[0], u.gid
+}
+
+test "root" {
+  r = ~lookup_id("0")
+  assert_eq r.uid, "0"
+  assert_eq r.username, "root"
+  assert_eq (~lookup("root")).uid, "0"
+}

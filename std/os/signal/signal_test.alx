@@ -1,0 +1,259 @@
+# Go's os/signal tests (signal_test.go, example_test.go), translated: the
+# ones that run in one process. Signals are sent to this process with
+# kill(getpid, sig); waiting is a channel receive with a 5-second guard
+# (only a failure waits that long). SIGHUP is never sent while nothing
+# catches it (it would end the test process).
+import "context"
+import "time"
+
+def send(s: Signal) {
+  kill(getpid, s).unwrap
+}
+
+# Go's waitSig: the next signal on c is want (fails after 5 s without one).
+def wait_sig(c: Chan[Signal], want: Signal) {
+  got = recv_or_timeout(c, 5000)
+  assert got != none, "timeout waiting for #{want.to_s}"
+  assert_eq got.unwrap.number, want.number
+}
+
+# Go's waitSigAll: signals on c until want (others, such as SIGURG, skipped).
+def wait_sig_all(c: Chan[Signal], want: Signal) {
+  loop {
+    got = recv_or_timeout(c, 5000)
+    assert got != none, "timeout waiting for #{want.to_s}"
+    break if got.unwrap.number == want.number
+  }
+}
+
+def recv_or_timeout(c: Chan[Signal], ms: Int) -> Signal? {
+  out: Signal? = none
+  select {
+    when v = c.recv => out = v
+    when _ = time.after(time.millisecond * ms).recv => out = none
+  }
+  out
+}
+
+# Go's quiesce: give a signal sent to this process time to arrive.
+def quiesce {
+  time.sleep(time.millisecond * 20)
+}
+
+def empty?(c: Chan[Signal]) -> Bool {
+  e = true
+  select {
+    when _ = c.recv => e = false
+    else => e = true
+  }
+  e
+}
+
+test "signal" {
+  c = Chan[Signal].new(1)
+  n = notify(c, [sighup])
+  send(sighup)
+  wait_sig(c, sighup)
+
+  # Everything we can get.
+  c1 = Chan[Signal].new(10)
+  n1 = notify(c1, [])
+  reset([sigurg])
+  send(sigwinch)
+  wait_sig_all(c1, sigwinch)
+  # Two more SIGHUPs reach c1, and c being full doesn't block anything.
+  send(sighup)
+  wait_sig_all(c1, sighup)
+  send(sighup)
+  wait_sig_all(c1, sighup)
+  # The first of them is waiting on c.
+  wait_sig(c, sighup)
+  n1.stop
+  n.stop
+}
+
+test "stop" {
+  for s in [sigwinch, sigusr1, sighup] {
+    c = Chan[Signal].new(1)
+    n = notify(c, [s])
+    send(s)
+    wait_sig(c, s)
+    n.stop
+    assert n.stopped?
+    n.stop
+    if s.number != sighup.number {
+      # sigwinch is ignored by default; sigusr1 must not reach c (it would
+      # end the process too, so it is ignored first).
+      ignore([s]) if s.number == sigusr1.number
+      send(s)
+      quiesce()
+      assert empty?(c), "unexpected signal #{s.to_s}"
+      reset([s])
+    }
+  }
+}
+
+def test_cancel(ign: Bool) {
+  c1 = Chan[Signal].new(1)
+  n1 = notify(c1, [sigwinch])
+  c2 = Chan[Signal].new(1)
+  n2 = notify(c2, [sighup])
+  send(sigwinch)
+  wait_sig(c1, sigwinch)
+  send(sighup)
+  wait_sig(c2, sighup)
+  # Either undoes both notifies.
+  if ign {
+    ignore([sigwinch, sighup])
+  } else {
+    reset([sigwinch, sighup])
+  }
+  send(sigwinch)
+  send(sighup) if ign
+  quiesce()
+  assert empty?(c1), "unexpected signal on c1"
+  assert empty?(c2), "unexpected signal on c2"
+  n1.stop
+  n2.stop
+  reset([sighup]) if ign
+}
+
+test "reset" {
+  test_cancel(false)
+}
+
+test "ignore" {
+  test_cancel(true)
+}
+
+test "ignored" {
+  c = Chan[Signal].new(1)
+  n = notify(c, [sigwinch])
+  assert !ignored?(sigwinch), "expected sigwinch to not be ignored"
+  n.stop
+  ignore([sigwinch])
+  assert ignored?(sigwinch), "expected sigwinch to be ignored when explicitly ignoring it"
+  reset([])
+  # As in Go, reset doesn't undo ignore (the signal stays ignored).
+  assert ignored?(sigwinch)
+}
+
+# Go's TestAtomicStop, in one process: stops racing with signals never
+# deliver after stop returns.
+test "atomic stop" {
+  (0...20).each { |i|
+    c = Chan[Signal].new(10)
+    n = notify(c, [sigusr2])
+    sender = spawn { send(sigusr2) }
+    sender.wait
+    # The default action of SIGUSR2 ends the process: let it arrive first.
+    wait_sig(c, sigusr2)
+    n.stop
+    # Drain what arrived before stop; nothing comes after.
+    while !empty?(c) {}
+    ignore([sigusr2])
+    send(sigusr2)
+    quiesce() if i == 0
+    assert empty?(c)
+    reset([sigusr2])
+  }
+}
+
+test "many notifiers" {
+  cs = (0...5).map { |_| Chan[Signal].new(1) }.to_a
+  ns = cs.map { |c| notify(c, [sigwinch]) }.to_a
+  send(sigwinch)
+  cs.each { |c| wait_sig(c, sigwinch) }
+  ns.each { |n| n.stop }
+}
+
+test "notify context notifications" {
+  for count in [1, 10] {
+    ctx, stop = notify_context(context.background, [sigint])
+    done = Chan[Bool].new(count)
+    (0...count).each { |_|
+      spawn {
+        send(sigint)
+        done << true
+      }
+    }
+    (0...count).each { |_| done.recv }
+    ctx.done.recv
+    assert ctx.err == context.ContextError.Canceled
+    # Not stopped yet: later SIGINTs are still caught, not fatal.
+    send(sigint)
+    quiesce()
+    stop.stop
+  }
+}
+
+test "notify context stop" {
+  ignore([sighup])
+  assert ignored?(sighup), "expected sighup to be ignored when explicitly ignoring it"
+  parent, cancel_parent = context.with_cancel(context.background)
+  c, stop = notify_context(parent, [sighup])
+  assert !ignored?(sighup), "expected sighup to not be ignored"
+  stop.stop
+  c.done.recv
+  assert c.err == context.ContextError.Canceled
+  cancel_parent()
+  reset([sighup])
+}
+
+test "notify context cancel parent" {
+  parent, cancel_parent = context.with_cancel(context.background)
+  c, stop = notify_context(parent, [sigint])
+  cancel_parent()
+  c.done.recv
+  assert c.err == context.ContextError.Canceled
+  stop.stop
+}
+
+test "notify context premature cancel parent" {
+  parent, cancel_parent = context.with_cancel(context.background)
+  cancel_parent()
+  c, stop = notify_context(parent, [sigint])
+  c.done.recv
+  assert c.err == context.ContextError.Canceled
+  stop.stop
+}
+
+test "notify context simultaneous stop" {
+  c, stop = notify_context(context.background, [sigint])
+  done = Chan[Bool].new(5)
+  (0...5).each { |_|
+    st = stop.dup
+    spawn {
+      st.stop
+      done << true
+    }
+  }
+  (0...5).each { |_| done.recv }
+  c.done.recv
+  assert c.err == context.ContextError.Canceled
+}
+
+test "signal names" {
+  assert_eq sighup.to_s, "hangup"
+  assert_eq sigint.to_s, "interrupt"
+  assert_eq sigterm.to_s, "terminated"
+  assert_eq sigusr1.to_s, "user defined signal 1"
+  assert_eq sigusr2.to_s, "user defined signal 2"
+  assert_eq sigkill.to_s, "killed"
+  assert_eq interrupt.number, sigint.number
+  assert_eq kill_signal.number, sigkill.number
+  assert_eq Signal.new(number: 77).to_s, "signal 77"
+}
+
+test "kill fails" {
+  assert kill(-999999, sigwinch).err?
+}
+
+example "notify" {
+  c = Chan[Signal].new(1)
+  n = notify(c, [sigwinch])
+  send(sigwinch)
+  s = c.recv.unwrap
+  puts "Got signal: #{s.to_s == sigwinch.to_s}"
+  n.stop
+} outputs "Got signal: true\n"

@@ -36,3 +36,15 @@ Open problems agents reported; each gets fixed in a compiler round between waves
 | 30 | math/big | no mutable package globals (caches like Go's divisor table) | open (design) |
 | 31 | math/big | `format` has no `%g` | open |
 | 32 | math/big | a main file can't declare its own `Int`/`Float` (only packages can) | open (by design for now) |
+| 33 | sync | a generic call's block that only decides the result type (`once_value { 42 }`) was refused; type parameters weren't bound through function or tuple types | fixed: an open result type is decided by the block's body; `bind_tparams` walks `Fn` and tuples |
+| 34 | sync | `x: pkg.T[K, V] = pkg.make` (wanted type from another package) didn't infer the type parameters | fixed: a qualified instance matches its unqualified declaration |
+| 35 | sync | a `case`/`if` arm ending in a statement (`ref[k] = v if c`) next to an arm with an optional value was silently dropped (lifting the arms popped the statement); a mismatched arm got the optional's type (C and JIT miscompiled) | fixed: only a trailing value is lifted; a value that doesn't become the optional keeps its type (the `if` is a statement or an error) |
+| 36 | sync | an interface value counted as shared storage for tasks even when no implementor has any (a Cond holding a Locker couldn't go to two tasks) | fixed: an interface shares iff an implementor does (fixpoint over the implementors) |
+| 37 | log | no way to copy a struct holding shared storage into a Mutex or task (`Mutex.new(LogState.new(out: w))` with a parameter `w`) | fixed: `s.dup` on a struct is a deep copy; Mutexes in it stay shared (deep copies, including a closure's `dup`, used to copy a captured Mutex) |
+| 38 | iotest | `x == none` / `assert_eq x, none` on an `Error?` compared the payloads (C: invalid operands; JIT: panic) | fixed: comparing with a literal `none` tests presence only |
+| 39 | log | a closure can't hold a closure of its own type, so Go's OnceFunc/OnceValue (a func wrapping a func) are structs with `call` | by design (closures are closed sums) |
+| 40 | log, os/signal | no mutable package globals: no settable standard logger (log.SetOutput/SetFlags/SetPrefix), no channel table for signal.Stop(c) | open (design; see #30) |
+| 41 | log | no caller location at run time: Lshortfile/Llongfile write `???:0` | open |
+| 42 | os/user | rgen: a fallible function returning `~T?` whose body ends in `loop { ... return ... }` emits an ill-typed trailing `(true, ())` (rustc rejects it); C and JIT accept | open (worked around with `while`) |
+| 43 | io/fs | an io/fs test can't import testing/fstest (it compiles a second io/fs whose types differ), so io/fs's MapFS tests live in testing/fstest | open |
+| 44 | sync | a method that returns early (`return if x`) and ends in a value-producing call (`done.recv`) reports "returns nil, but its last expression is T?"; `_ = e` as the last statement has e's type | open (small) |

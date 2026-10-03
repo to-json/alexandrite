@@ -827,6 +827,245 @@ mod rt {
         len as i64
     }
 
+    // Signals (std os/signal): the C runtime's self-pipe watchers (alx.c).
+    unsafe extern "C" {
+        fn signal(sig: i32, handler: usize) -> usize;
+        fn write(fd: i32, buf: *const u8, n: usize) -> isize;
+    }
+    const SIGW: usize = 64;
+    static SIG_MASK: [std::sync::atomic::AtomicU64; SIGW] = [const { std::sync::atomic::AtomicU64::new(0) }; SIGW];
+    static SIG_WFD: [std::sync::atomic::AtomicI32; SIGW] = [const { std::sync::atomic::AtomicI32::new(-1) }; SIGW];
+    // (read fds per slot, handled, ignored)
+    static SIG_STATE: std::sync::Mutex<([i32; SIGW], u64, u64)> = std::sync::Mutex::new(([-1; SIGW], 0, 0));
+    extern "C" fn sig_handler(sig: i32) {
+        use std::sync::atomic::Ordering::SeqCst;
+        let bit = 1u64 << sig;
+        for i in 0..SIGW {
+            if SIG_MASK[i].load(SeqCst) & bit != 0 {
+                let fd = SIG_WFD[i].load(SeqCst);
+                let b = sig as u8;
+                if fd >= 0 {
+                    unsafe { write(fd, &b, 1) };
+                }
+            }
+        }
+    }
+    fn sig_catchable(s: i64) -> bool {
+        s != sysc("SIGKILL") as i64 && s != sysc("SIGSTOP") as i64
+    }
+    pub unsafe fn shim_alx_sig_watch(mask: i64) -> i64 {
+        use std::sync::atomic::Ordering::SeqCst;
+        let mut p = [0i32; 2];
+        if unsafe { pipe(p.as_mut_ptr()) } != 0 {
+            return neg_errno(&std::io::Error::last_os_error());
+        }
+        for fd in p {
+            unsafe {
+                libc_fcntl(fd, sysc("F_SETFD"), sysc("FD_CLOEXEC"));
+                let fl = libc_fcntl(fd, sysc("F_GETFL"));
+                libc_fcntl(fd, sysc("F_SETFL"), fl | sysc("O_NONBLOCK"));
+            }
+        }
+        let mut st = SIG_STATE.lock().unwrap();
+        let Some(slot) = (0..SIGW).find(|&i| st.0[i] < 0) else {
+            unsafe {
+                close(p[0]);
+                close(p[1]);
+            }
+            return -(sysc("EMFILE") as i64);
+        };
+        st.0[slot] = p[0];
+        SIG_WFD[slot].store(p[1], SeqCst);
+        SIG_MASK[slot].store(mask as u64, SeqCst);
+        for s in 1..64 {
+            let bit = 1u64 << s;
+            if mask as u64 & bit != 0 && st.1 & bit == 0 && sig_catchable(s) {
+                unsafe { signal(s as i32, sig_handler as usize) };
+                st.1 |= bit;
+                st.2 &= !bit;
+            }
+        }
+        p[0] as i64
+    }
+    pub unsafe fn shim_alx_sig_unwatch(rfd: i64) -> i64 {
+        use std::sync::atomic::Ordering::SeqCst;
+        let mut st = SIG_STATE.lock().unwrap();
+        for i in 0..SIGW {
+            if st.0[i] == rfd as i32 {
+                SIG_MASK[i].store(0, SeqCst);
+                let w = SIG_WFD[i].swap(-1, SeqCst);
+                if w >= 0 {
+                    unsafe { close(w) };
+                }
+                st.0[i] = -1;
+            }
+        }
+        let live = SIG_MASK.iter().fold(0u64, |a, m| a | m.load(SeqCst));
+        for s in 1..64 {
+            let bit = 1u64 << s;
+            if st.1 & bit != 0 && live & bit == 0 {
+                unsafe { signal(s, 0) };
+                st.1 &= !bit;
+            }
+        }
+        0
+    }
+    pub unsafe fn shim_alx_sig_reset(mask: i64, how: i64) -> i64 {
+        use std::sync::atomic::Ordering::SeqCst;
+        let mut st = SIG_STATE.lock().unwrap();
+        for m in &SIG_MASK {
+            m.fetch_and(!(mask as u64), SeqCst);
+        }
+        for s in 1..64 {
+            let bit = 1u64 << s;
+            if mask as u64 & bit == 0 || !sig_catchable(s) {
+                continue;
+            }
+            if how != 0 {
+                unsafe { signal(s as i32, 1) };
+                st.2 |= bit;
+            } else {
+                if st.1 & bit != 0 {
+                    unsafe { signal(s as i32, 0) };
+                }
+                st.2 &= !bit;
+            }
+            st.1 &= !bit;
+        }
+        0
+    }
+    pub unsafe fn shim_alx_sig_ignored(sig: i64) -> i64 {
+        if !(1..64).contains(&sig) {
+            return 0;
+        }
+        let st = SIG_STATE.lock().unwrap();
+        if (st.2 >> sig) & 1 != 0 {
+            return 1;
+        }
+        if (st.1 >> sig) & 1 != 0 {
+            return 0;
+        }
+        // Ask without changing it: set SIG_IGN, look at the old one, put it back.
+        let old = unsafe { signal(sig as i32, 1) };
+        unsafe { signal(sig as i32, old) };
+        (old == 1) as i64
+    }
+
+    // Users and groups (std os/user): the C runtime's lookups, over the
+    // reentrant libc calls. struct passwd / group layouts per platform.
+    #[repr(C)]
+    #[cfg(target_os = "macos")]
+    struct Passwd {
+        name: *const std::ffi::c_char,
+        passwd: *const std::ffi::c_char,
+        uid: u32,
+        gid: u32,
+        change: i64,
+        class: *const std::ffi::c_char,
+        gecos: *const std::ffi::c_char,
+        dir: *const std::ffi::c_char,
+        shell: *const std::ffi::c_char,
+        expire: i64,
+    }
+    #[repr(C)]
+    #[cfg(not(target_os = "macos"))]
+    struct Passwd {
+        name: *const std::ffi::c_char,
+        passwd: *const std::ffi::c_char,
+        uid: u32,
+        gid: u32,
+        gecos: *const std::ffi::c_char,
+        dir: *const std::ffi::c_char,
+        shell: *const std::ffi::c_char,
+    }
+    #[repr(C)]
+    struct Group {
+        name: *const std::ffi::c_char,
+        passwd: *const std::ffi::c_char,
+        gid: u32,
+        mem: *const *const std::ffi::c_char,
+    }
+    unsafe extern "C" {
+        fn getpwuid_r(uid: u32, pw: *mut Passwd, buf: *mut u8, n: usize, res: *mut *mut Passwd) -> i32;
+        fn getpwnam_r(name: *const std::ffi::c_char, pw: *mut Passwd, buf: *mut u8, n: usize, res: *mut *mut Passwd) -> i32;
+        fn getgrgid_r(gid: u32, gr: *mut Group, buf: *mut u8, n: usize, res: *mut *mut Group) -> i32;
+        fn getgrnam_r(name: *const std::ffi::c_char, gr: *mut Group, buf: *mut u8, n: usize, res: *mut *mut Group) -> i32;
+        fn getgrouplist(name: *const std::ffi::c_char, gid: u32, groups: *mut u32, n: *mut i32) -> i32;
+    }
+    fn cstr_or_empty(p: *const std::ffi::c_char) -> Vec<u8> {
+        if p.is_null() { vec![] } else { unsafe { std::ffi::CStr::from_ptr(p) }.to_bytes().to_vec() }
+    }
+    unsafe fn put_fields(out: *mut u8, n: i64, fs: &[Vec<u8>]) -> i64 {
+        let need: usize = fs.iter().map(|f| f.len() + 1).sum();
+        if need as i64 > n {
+            return -(sysc("ERANGE") as i64);
+        }
+        let mut at = 0;
+        for f in fs {
+            unsafe {
+                std::ptr::copy_nonoverlapping(f.as_ptr(), out.add(at), f.len());
+                *out.add(at + f.len()) = 0;
+            }
+            at += f.len() + 1;
+        }
+        at as i64
+    }
+    pub unsafe fn shim_alx_user_lookup(kind: i64, key: *const std::ffi::c_char, out: *mut u8, n: i64) -> i64 {
+        let k = unsafe { std::ffi::CStr::from_ptr(key) };
+        let num: u32 = k.to_str().ok().and_then(|s| s.parse().ok()).unwrap_or(u32::MAX);
+        let mut bl = 16384usize;
+        loop {
+            let mut buf = vec![0u8; bl];
+            let (rc, r) = if kind <= 1 {
+                let mut pw: Passwd = unsafe { std::mem::zeroed() };
+                let mut res: *mut Passwd = std::ptr::null_mut();
+                let rc = unsafe { if kind == 0 { getpwuid_r(num, &mut pw, buf.as_mut_ptr(), bl, &mut res) } else { getpwnam_r(key, &mut pw, buf.as_mut_ptr(), bl, &mut res) } };
+                let mut r = 0;
+                if rc == 0 && !res.is_null() {
+                    let mut gecos = cstr_or_empty(pw.gecos);
+                    if let Some(i) = gecos.iter().position(|&c| c == b',') {
+                        gecos.truncate(i);
+                    }
+                    let fs = [pw.uid.to_string().into_bytes(), pw.gid.to_string().into_bytes(), cstr_or_empty(pw.name), gecos, cstr_or_empty(pw.dir)];
+                    r = unsafe { put_fields(out, n, &fs) };
+                }
+                (rc, r)
+            } else {
+                let mut gr: Group = unsafe { std::mem::zeroed() };
+                let mut res: *mut Group = std::ptr::null_mut();
+                let rc = unsafe { if kind == 2 { getgrgid_r(num, &mut gr, buf.as_mut_ptr(), bl, &mut res) } else { getgrnam_r(key, &mut gr, buf.as_mut_ptr(), bl, &mut res) } };
+                let mut r = 0;
+                if rc == 0 && !res.is_null() {
+                    let fs = [gr.gid.to_string().into_bytes(), cstr_or_empty(gr.name)];
+                    r = unsafe { put_fields(out, n, &fs) };
+                }
+                (rc, r)
+            };
+            if rc == sysc("ERANGE") && bl < (1 << 22) {
+                bl *= 4;
+                continue;
+            }
+            let quiet = [0, sysc("ENOENT"), sysc("ESRCH"), sysc("EBADF"), sysc("EPERM")];
+            return if quiet.contains(&rc) { r } else { -(rc as i64) };
+        }
+    }
+    pub unsafe fn shim_alx_user_groups(name: *const std::ffi::c_char, gid: i64, out: *mut u8, n: i64) -> i64 {
+        let mut cap = 64i32;
+        loop {
+            let mut gs = vec![0u32; cap as usize];
+            let mut cnt = cap;
+            let rc = unsafe { getgrouplist(name, gid as u32, gs.as_mut_ptr(), &mut cnt) };
+            if rc < 0 && cap < 65536 {
+                cap *= 4;
+                continue;
+            }
+            for i in 0..(cnt.min(n as i32)) as usize {
+                unsafe { std::ptr::copy_nonoverlapping((gs[i] as i64).to_ne_bytes().as_ptr(), out.add(8 * i), 8) };
+            }
+            return cnt as i64;
+        }
+    }
+
     pub fn now_ns() -> i64 {
         static T0: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
         T0.get_or_init(std::time::Instant::now).elapsed().as_nanos() as i64

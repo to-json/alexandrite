@@ -1,0 +1,282 @@
+# Package signal: Go's os/signal — incoming Unix signals delivered on
+# channels.
+#
+#   Go                                      alx
+#   os.Signal / syscall.Signal              Signal (number: to_s is Go's name, "interrupt")
+#   os.Interrupt, os.Kill                   interrupt, kill_signal
+#   syscall.SIGHUP, SIGINT, ...             sighup, sigint, ... (functions: the
+#                                             numbers are the platform's)
+#   Notify(c, sigs...)                      notify(c, sigs) -> Notifier   ([] = all)
+#   Stop(c)                                 n.stop  (on the Notifier notify returned)
+#   Reset(sigs...)                          reset(sigs)   ([] = all)
+#   Ignore(sigs...)                         ignore(sigs)  ([] = all)
+#   Ignored(sig)                            ignored?(sig)
+#   NotifyContext(ctx, sigs...)             notify_context(ctx, sigs) -> (Context, NotifyStop)
+#   syscall.Kill(pid, sig) (for tests)      kill(pid, sig) -> ~Unit
+#
+# How it works: the C runtime (alx_sig_watch) installs a handler for the
+# requested signals that writes each signal's number to a self-pipe, one
+# pipe per notify. notify starts a task that waits on the pipe through the
+# runtime's I/O poller (alx_fd_wait: the task parks, its worker runs other
+# tasks) and sends each signal on the channel without blocking: as in Go,
+# a signal is dropped if the channel isn't ready, so give it a buffer.
+# `stop` closes the pipe, waits for the task to end (no signal is sent on
+# the channel after stop returns, as Go guarantees) and puts back the
+# default action of signals nothing watches any more.
+#
+# Differences from Go:
+#  - Stop takes the Notifier, not the channel: channels have no identity to
+#    look up, and alexandrite has no package state to keep the table in.
+#    Each notify is its own registration: notifying the same channel twice
+#    makes two (each stopped separately); Go merges them.
+#  - Signals are `Signal` values with Go's names for this platform
+#    (`Signal.to_s`); the constants are lower-case functions
+#    (`signal.sigint`): a def name
+#    can't be upper case, and the numbers are the platform's (read from the
+#    runtime's constant table, alx_sys_const).
+#    `interrupt` / `kill_signal` are Go's os.Interrupt / os.Kill.
+#  - SIGKILL and SIGSTOP can't be caught (as in Go: notify ignores them).
+#    "All signals" (notify, reset or ignore with []) leaves out the ones
+#    the runtime itself uses: SIGSEGV and SIGBUS (stack overflow detection)
+#    and SIGPIPE (ignored, so a write to a closed socket fails instead of
+#    killing the program). Name them explicitly to change them.
+#  - `kill(pid, sig)` (syscall.Kill) is here so programs and tests can send
+#    signals; os has no Process.Signal yet.
+#  - Unix only (C runtime and the Rust oracle); the browser backend has no
+#    signals (FFI is refused there).
+
+import "context"
+
+extern def alx_sig_watch(mask: Int) -> Int
+extern def alx_sig_unwatch(rfd: Int) -> Int
+extern def alx_sig_reset(mask: Int, how: Int) -> Int
+extern def alx_sig_ignored(sig: Int) -> Int
+extern def alx_sys_const(name: Str) -> Int
+extern def alx_fd_wait(fd: Int, mode: Int) -> Int
+extern def c_read(fd: I32, buf: [Byte], n: Int) -> Int = "read"
+extern def c_close(fd: I32) -> I32 = "close"
+extern def c_kill(pid: I32, sig: I32) -> I32 = "kill"
+extern def c_getpid -> I32 = "getpid"
+
+# A Unix signal, by number (Go's syscall.Signal).
+pub struct Signal {
+  number: Int
+
+  # Go's name for it on this platform ("interrupt", "user defined signal 1").
+  pub def to_s -> Str { signal_name(number) }
+  pub def string -> Str { self.to_s }
+}
+
+def sig(name: Str) -> Signal { Signal.new(number: alx_sys_const(name)) }
+
+pub def sighup -> Signal { sig("SIGHUP") }
+pub def sigint -> Signal { sig("SIGINT") }
+pub def sigquit -> Signal { sig("SIGQUIT") }
+pub def sigill -> Signal { sig("SIGILL") }
+pub def sigtrap -> Signal { sig("SIGTRAP") }
+pub def sigabrt -> Signal { sig("SIGABRT") }
+pub def sigfpe -> Signal { sig("SIGFPE") }
+pub def sigkill -> Signal { sig("SIGKILL") }
+pub def sigusr1 -> Signal { sig("SIGUSR1") }
+pub def sigsegv -> Signal { sig("SIGSEGV") }
+pub def sigusr2 -> Signal { sig("SIGUSR2") }
+pub def sigpipe -> Signal { sig("SIGPIPE") }
+pub def sigalrm -> Signal { sig("SIGALRM") }
+pub def sigterm -> Signal { sig("SIGTERM") }
+pub def sigchld -> Signal { sig("SIGCHLD") }
+pub def sigcont -> Signal { sig("SIGCONT") }
+pub def sigstop -> Signal { sig("SIGSTOP") }
+pub def sigtstp -> Signal { sig("SIGTSTP") }
+pub def sigttin -> Signal { sig("SIGTTIN") }
+pub def sigttou -> Signal { sig("SIGTTOU") }
+pub def sigurg -> Signal { sig("SIGURG") }
+pub def sigxcpu -> Signal { sig("SIGXCPU") }
+pub def sigxfsz -> Signal { sig("SIGXFSZ") }
+pub def sigvtalrm -> Signal { sig("SIGVTALRM") }
+pub def sigprof -> Signal { sig("SIGPROF") }
+pub def sigwinch -> Signal { sig("SIGWINCH") }
+pub def sigio -> Signal { sig("SIGIO") }
+pub def sigsys -> Signal { sig("SIGSYS") }
+
+# Go's os.Interrupt and os.Kill.
+pub def interrupt -> Signal { sigint }
+pub def kill_signal -> Signal { sigkill }
+
+# Go's syscall signal names, by signal name (the numbers differ between
+# platforms; the names Go prints differ too, darwin first, then Linux).
+def signal_name(n: Int) -> Str {
+  linux = alx_sys_const("SIGUSR1") == 10
+  names = [
+    ("SIGHUP", "hangup", "hangup"),
+    ("SIGINT", "interrupt", "interrupt"),
+    ("SIGQUIT", "quit", "quit"),
+    ("SIGILL", "illegal instruction", "illegal instruction"),
+    ("SIGTRAP", "trace/BPT trap", "trace/breakpoint trap"),
+    ("SIGABRT", "abort trap", "aborted"),
+    ("SIGFPE", "floating point exception", "floating point exception"),
+    ("SIGKILL", "killed", "killed"),
+    ("SIGBUS", "bus error", "bus error"),
+    ("SIGSEGV", "segmentation fault", "segmentation fault"),
+    ("SIGSYS", "bad system call", "bad system call"),
+    ("SIGPIPE", "broken pipe", "broken pipe"),
+    ("SIGALRM", "alarm clock", "alarm clock"),
+    ("SIGTERM", "terminated", "terminated"),
+    ("SIGURG", "urgent I/O condition", "urgent I/O condition"),
+    ("SIGSTOP", "suspended (signal)", "stopped (signal)"),
+    ("SIGTSTP", "suspended", "stopped"),
+    ("SIGCONT", "continued", "continued"),
+    ("SIGCHLD", "child exited", "child exited"),
+    ("SIGTTIN", "stopped (tty input)", "stopped (tty input)"),
+    ("SIGTTOU", "stopped (tty output)", "stopped (tty output)"),
+    ("SIGIO", "I/O possible", "I/O possible"),
+    ("SIGXCPU", "cputime limit exceeded", "CPU time limit exceeded"),
+    ("SIGXFSZ", "filesize limit exceeded", "file size limit exceeded"),
+    ("SIGVTALRM", "virtual timer expired", "virtual timer expired"),
+    ("SIGPROF", "profiling timer expired", "profiling timer expired"),
+    ("SIGWINCH", "window size changes", "window changed"),
+    ("SIGUSR1", "user defined signal 1", "user defined signal 1"),
+    ("SIGUSR2", "user defined signal 2", "user defined signal 2"),
+  ]
+  for c, darwin, lx in names {
+    return linux ? lx : darwin if alx_sys_const(c) == n
+  }
+  "signal #{n}"
+}
+
+# The mask bit of each signal (all catchable signals for []).
+def mask_of(sigs: [Signal]) -> Int {
+  m = 0
+  if sigs.size == 0 {
+    n = 1
+    while n < 32 {
+      m |= 1 << n
+      n += 1
+    }
+    m &= ^((1 << sigkill.number) | (1 << sigstop.number))
+    # The runtime's own signals stay with the runtime: sigsegv and sigbus
+    # (stack overflow detection), sigpipe (ignored for sockets).
+    m &= ^((1 << alx_sys_const("SIGSEGV")) | (1 << alx_sys_const("SIGBUS")) | (1 << alx_sys_const("SIGPIPE")))
+    return m
+  }
+  for s in sigs {
+    m |= 1 << s.number if s.number > 0 && s.number < 64
+  }
+  m
+}
+
+# A registration made by notify; `stop` ends it (Go's Stop(c)).
+pub struct Notifier {
+  fd: Int
+  # Closed by the forwarding task when it has ended.
+  done: Chan[Bool]
+  stopped: Atomic[Bool]
+
+  # No more signals go to the channel once this returns.
+  pub def stop {
+    first = !stopped.swap(true)
+    alx_sig_unwatch(fd) if first
+    done.recv if first
+  }
+
+  pub def stopped? -> Bool { stopped.load }
+}
+
+# Go's Notify: the signals in sigs (every catchable signal for []) are sent
+# on c, without blocking: a signal is dropped if c isn't ready to take it.
+pub def notify(c: Chan[Signal], sigs: [Signal]) -> Notifier {
+  fd = alx_sig_watch(mask_of(sigs))
+  assert fd >= 0, "os/signal: can't watch signals (#{-fd})"
+  done = Chan[Bool].new
+  stopped = Atomic.new(false)
+  spawn {
+    buf: [Byte] = [0; 64]
+    loop {
+      n = c_read(fd.to_i32, buf, 64)
+      if n > 0 {
+        (0...n).each { |i|
+          if !stopped.load {
+            s = Signal.new(number: buf[i].to_i)
+            select {
+              when c.send(s) => {}
+              else => {}
+            }
+          }
+        }
+      } else if n == 0 {
+        break
+      } else {
+        w = alx_fd_wait(fd, 1)
+        break if w < 0
+      }
+    }
+    c_close(fd.to_i32)
+    done.close
+  }
+  Notifier.new(fd: fd, done: done, stopped: stopped)
+}
+
+# Go's Reset: the signals (all for []) go back to their default action,
+# and no channel gets them.
+pub def reset(sigs: [Signal]) {
+  alx_sig_reset(mask_of(sigs), 0)
+}
+
+# Go's Ignore: the signals (all for []) are ignored, and no channel gets
+# them.
+pub def ignore(sigs: [Signal]) {
+  alx_sig_reset(mask_of(sigs), 1)
+}
+
+# Go's Ignored: whether sig is currently ignored.
+pub def ignored?(s: Signal) -> Bool {
+  alx_sig_ignored(s.number) != 0
+}
+
+# Sends sig to process pid (Go's syscall.Kill).
+pub def kill(pid: Int, s: Signal) -> ~Unit {
+  r = c_kill(pid.to_i32, s.number.to_i32)
+  fail SignalError.Failed("kill: #{C.strerror(C.errno)}") if r != 0
+}
+
+# This process's ID (for kill).
+pub def getpid -> Int { c_getpid.to_i }
+
+pub error SignalError {
+  Failed(msg: Str)
+
+  def message -> Str {
+    case self {
+      Failed(msg) => msg
+    }
+  }
+}
+
+# What notify_context returns besides the context: `stop` stops the
+# notification and cancels the context (Go's stop func).
+pub struct NotifyStop {
+  n: Notifier
+  cancel: () -> Unit
+
+  pub def stop {
+    n.stop
+    f = cancel
+    f()
+  }
+}
+
+# Go's NotifyContext: a context cancelled when one of the signals arrives
+# (or when stop is called, or the parent is done).
+pub def notify_context(parent: context.Context, sigs: [Signal]) -> (context.Context, NotifyStop) {
+  ctx, cancel = context.with_cancel(parent)
+  ch = Chan[Signal].new(1)
+  n = notify(ch, sigs)
+  watch = cancel.dup
+  done = ctx.done
+  spawn {
+    select {
+      when _ = ch.recv => watch()
+      when _ = done.recv => {}
+    }
+  }
+  (ctx, NotifyStop.new(n: n, cancel: cancel))
+}

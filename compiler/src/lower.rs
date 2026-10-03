@@ -1571,6 +1571,9 @@ impl<'a> Lw<'a> {
     fn deep_copy(&mut self, v: LE, t: &LTy) -> LE {
         fn has_storage(t: &LTy) -> bool {
             match t {
+                // A Mutex (a one-element array of lock and value) is a handle:
+                // copies share it, like channels and atomics.
+                LTy::Arr(el) if matches!(&**el, LTy::Tup(ts) if ts.first() == Some(&LTy::Lock)) => false,
                 LTy::Str | LTy::Arr(_) | LTy::PInt => true,
                 LTy::Tup(ts) => ts.iter().any(has_storage),
                 _ => false,

@@ -1945,6 +1945,9 @@ static const SysConst sys_consts[] = {
     SC(O_NOFOLLOW) SC(EINPROGRESS) SC(ENOTSUP) SC(EOVERFLOW) SC(ETXTBSY) SC(EDQUOT) SC(ESTALE) SC(ENOBUFS)
     SC(ECONNABORTED) SC(ENOTCONN) SC(EHOSTUNREACH) SC(ENETUNREACH) SC(EADDRNOTAVAIL) SC(EAFNOSUPPORT)
     SC(S_ISUID) SC(S_ISGID) SC(S_ISVTX) SC(S_IRGRP) SC(S_IWGRP) SC(S_IXGRP) SC(S_IROTH) SC(S_IWOTH) SC(S_IXOTH)
+    SC(SIGHUP) SC(SIGINT) SC(SIGQUIT) SC(SIGILL) SC(SIGTRAP) SC(SIGABRT) SC(SIGFPE) SC(SIGKILL) SC(SIGUSR1)
+    SC(SIGSEGV) SC(SIGUSR2) SC(SIGALRM) SC(SIGTERM) SC(SIGCHLD) SC(SIGCONT) SC(SIGSTOP) SC(SIGTSTP) SC(SIGTTIN)
+    SC(SIGTTOU) SC(SIGURG) SC(SIGXCPU) SC(SIGXFSZ) SC(SIGVTALRM) SC(SIGPROF) SC(SIGWINCH) SC(SIGIO) SC(SIGSYS)
 };
 #undef SC
 
@@ -2123,6 +2126,229 @@ int64_t alx_sys_poll2(int64_t a, int64_t b) {
     while (poll(pf, 2, -1) < 0)
         if (errno != EINTR) return -errno;
     return 0;
+}
+
+/* ---------- signals (std os/signal) ----------
+ * A self-pipe per watcher: alx_sig_watch(mask) installs one handler for the
+ * signals in `mask` (bit n = signal n) and returns the read end of a fresh
+ * non-blocking pipe; the handler writes the signal's number (one byte) to the
+ * write end of every watcher whose mask has it (dropped when the pipe is
+ * full, like Go's non-blocking sends). The std package reads the pipe from a
+ * task that parks in alx_fd_wait and forwards to channels. alx_sig_unwatch
+ * closes the write end (the reader sees EOF) and restores the default action
+ * of signals nobody watches any more. The handler only reads atomics and
+ * calls write(2): async-signal-safe. */
+#define ALX_SIGW 64
+static struct { uint64_t mask; int wfd; int rfd; } g_sigw[ALX_SIGW];
+static pthread_mutex_t g_sig_mu = PTHREAD_MUTEX_INITIALIZER;
+static uint64_t g_sig_handled, g_sig_ignored;
+static bool g_sig_init;
+
+static void alx_sig_handler(int sig) {
+    int saved = errno;
+    uint64_t bit = (uint64_t)1 << sig;
+    for (int i = 0; i < ALX_SIGW; i++) {
+        if (__atomic_load_n(&g_sigw[i].mask, __ATOMIC_SEQ_CST) & bit) {
+            int fd = __atomic_load_n(&g_sigw[i].wfd, __ATOMIC_SEQ_CST);
+            unsigned char b = (unsigned char)sig;
+            if (fd >= 0) (void)!write(fd, &b, 1);
+        }
+    }
+    errno = saved;
+}
+
+static void sig_set(int sig, void (*h)(int)) {
+    struct sigaction sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_handler = h;
+    sa.sa_flags = SA_RESTART;
+    sigemptyset(&sa.sa_mask);
+    sigaction(sig, &sa, NULL);
+}
+
+/* Signals no watcher has any more go back to the default action. */
+static void sig_release_unwatched(void) {
+    uint64_t live = 0;
+    for (int i = 0; i < ALX_SIGW; i++) live |= __atomic_load_n(&g_sigw[i].mask, __ATOMIC_SEQ_CST);
+    for (int s = 1; s < 64; s++) {
+        uint64_t bit = (uint64_t)1 << s;
+        if ((g_sig_handled & bit) && !(live & bit)) {
+            sig_set(s, SIG_DFL);
+            g_sig_handled &= ~bit;
+        }
+    }
+}
+
+int64_t alx_sig_watch(int64_t mask) {
+    int p[2];
+    if (pipe(p) != 0) return -errno;
+    for (int k = 0; k < 2; k++) {
+        fcntl(p[k], F_SETFD, FD_CLOEXEC);
+        fcntl(p[k], F_SETFL, fcntl(p[k], F_GETFL) | O_NONBLOCK);
+    }
+    pthread_mutex_lock(&g_sig_mu);
+    if (!g_sig_init) {
+        for (int i = 0; i < ALX_SIGW; i++) { __atomic_store_n(&g_sigw[i].wfd, -1, __ATOMIC_SEQ_CST); g_sigw[i].rfd = -1; }
+        g_sig_init = true;
+    }
+    int slot = -1;
+    for (int i = 0; i < ALX_SIGW && slot < 0; i++)
+        if (g_sigw[i].rfd < 0) slot = i;
+    if (slot < 0) {
+        pthread_mutex_unlock(&g_sig_mu);
+        close(p[0]);
+        close(p[1]);
+        return -EMFILE;
+    }
+    g_sigw[slot].rfd = p[0];
+    __atomic_store_n(&g_sigw[slot].wfd, p[1], __ATOMIC_SEQ_CST);
+    __atomic_store_n(&g_sigw[slot].mask, (uint64_t)mask, __ATOMIC_SEQ_CST);
+    for (int s = 1; s < 64; s++) {
+        uint64_t bit = (uint64_t)1 << s;
+        if (((uint64_t)mask & bit) && !(g_sig_handled & bit) && s != SIGKILL && s != SIGSTOP) {
+            sig_set(s, alx_sig_handler);
+            g_sig_handled |= bit;
+            g_sig_ignored &= ~bit;
+        }
+    }
+    pthread_mutex_unlock(&g_sig_mu);
+    return p[0];
+}
+
+int64_t alx_sig_unwatch(int64_t rfd) {
+    pthread_mutex_lock(&g_sig_mu);
+    for (int i = 0; g_sig_init && i < ALX_SIGW; i++) {
+        if (g_sigw[i].rfd == rfd) {
+            __atomic_store_n(&g_sigw[i].mask, 0, __ATOMIC_SEQ_CST);
+            int w = __atomic_exchange_n(&g_sigw[i].wfd, -1, __ATOMIC_SEQ_CST);
+            if (w >= 0) close(w);
+            g_sigw[i].rfd = -1;
+        }
+    }
+    sig_release_unwatched();
+    pthread_mutex_unlock(&g_sig_mu);
+    return 0;
+}
+
+/* Go's Reset (how = 0: default action) and Ignore (how = 1): the signals in
+ * mask leave every watcher. */
+int64_t alx_sig_reset(int64_t mask, int64_t how) {
+    pthread_mutex_lock(&g_sig_mu);
+    for (int i = 0; g_sig_init && i < ALX_SIGW; i++)
+        __atomic_fetch_and(&g_sigw[i].mask, ~(uint64_t)mask, __ATOMIC_SEQ_CST);
+    for (int s = 1; s < 64; s++) {
+        uint64_t bit = (uint64_t)1 << s;
+        if (!((uint64_t)mask & bit) || s == SIGKILL || s == SIGSTOP) continue;
+        if (how) {
+            sig_set(s, SIG_IGN);
+            g_sig_ignored |= bit;
+        } else {
+            if (g_sig_handled & bit) sig_set(s, SIG_DFL);
+            g_sig_ignored &= ~bit;
+        }
+        g_sig_handled &= ~bit;
+    }
+    pthread_mutex_unlock(&g_sig_mu);
+    return 0;
+}
+
+/* Whether sig is ignored (by alx_sig_reset(.., 1) or inherited SIG_IGN). */
+int64_t alx_sig_ignored(int64_t sig) {
+    if (sig <= 0 || sig >= 64) return 0;
+    pthread_mutex_lock(&g_sig_mu);
+    bool ign = (g_sig_ignored >> sig) & 1;
+    bool handled = (g_sig_handled >> sig) & 1;
+    pthread_mutex_unlock(&g_sig_mu);
+    if (ign) return 1;
+    if (handled) return 0;
+    struct sigaction cur;
+    if (sigaction((int)sig, NULL, &cur) != 0) return 0;
+    return cur.sa_handler == SIG_IGN;
+}
+
+/* ---------- users and groups (std os/user) ----------
+ * kind 0: user by uid, 1: user by name, 2: group by gid, 3: group by name.
+ * Writes NUL-terminated fields to out: a user's uid, gid, login name, GECOS
+ * name (up to the first comma) and home directory; a group's gid and name.
+ * Returns the bytes written, 0 if there is no such user or group, -ERANGE if
+ * out is too small (ask again with more), or -errno. */
+#include <pwd.h>
+#include <grp.h>
+
+static int64_t put_fields(uint8_t *out, int64_t n, const char **fs, int k) {
+    int64_t need = 0;
+    for (int i = 0; i < k; i++) need += (int64_t)strlen(fs[i]) + 1;
+    if (need > n) return -ERANGE;
+    int64_t at = 0;
+    for (int i = 0; i < k; i++) {
+        size_t l = strlen(fs[i]);
+        memcpy(out + at, fs[i], l + 1);
+        at += (int64_t)l + 1;
+    }
+    return at;
+}
+
+int64_t alx_user_lookup(int64_t kind, const char *key, uint8_t *out, int64_t n) {
+    size_t bl = 16384;
+    for (;;) {
+        char *buf = malloc(bl);
+        if (!buf) return -ENOMEM;
+        int rc;
+        int64_t r = 0;
+        if (kind <= 1) {
+            struct passwd pw, *res = NULL;
+            rc = kind == 0 ? getpwuid_r((uid_t)strtoul(key, NULL, 10), &pw, buf, bl, &res) : getpwnam_r(key, &pw, buf, bl, &res);
+            if (rc == 0 && res) {
+                char uid[24], gid[24];
+                snprintf(uid, sizeof uid, "%lu", (unsigned long)pw.pw_uid);
+                snprintf(gid, sizeof gid, "%lu", (unsigned long)pw.pw_gid);
+                char *gecos = pw.pw_gecos ? pw.pw_gecos : "";
+                char *comma = strchr(gecos, ',');
+                if (comma) *comma = 0;
+                const char *fs[5] = { uid, gid, pw.pw_name ? pw.pw_name : "", gecos, pw.pw_dir ? pw.pw_dir : "" };
+                r = put_fields(out, n, fs, 5);
+            }
+        } else {
+            struct group gr, *res = NULL;
+            rc = kind == 2 ? getgrgid_r((gid_t)strtoul(key, NULL, 10), &gr, buf, bl, &res) : getgrnam_r(key, &gr, buf, bl, &res);
+            if (rc == 0 && res) {
+                char gid[24];
+                snprintf(gid, sizeof gid, "%lu", (unsigned long)gr.gr_gid);
+                const char *fs[2] = { gid, gr.gr_name ? gr.gr_name : "" };
+                r = put_fields(out, n, fs, 2);
+            }
+        }
+        free(buf);
+        if (rc == ERANGE && bl < (1 << 22)) { bl *= 4; continue; }
+        /* Not found is 0 (some systems report ENOENT/ESRCH for that). */
+        if (rc != 0 && rc != ENOENT && rc != ESRCH && rc != EBADF && rc != EPERM) return -rc;
+        return r;
+    }
+}
+
+/* The group IDs of user `name` (primary group gid included), into out (n
+ * slots). Returns the count; more than n means ask again with more room. */
+int64_t alx_user_groups(const char *name, int64_t gid, uint8_t *out, int64_t n) {
+    int cap = 64;
+    for (;;) {
+#ifdef __APPLE__
+        int *gs = malloc(sizeof(int) * (size_t)cap);
+        int cnt = cap;
+        int rc = getgrouplist(name, (int)gid, gs, &cnt);
+#else
+        gid_t *gs = malloc(sizeof(gid_t) * (size_t)cap);
+        int cnt = cap;
+        int rc = getgrouplist(name, (gid_t)gid, gs, &cnt);
+#endif
+        if (rc < 0 && cap < 65536) {
+            free(gs);
+            cap *= 4;
+            continue;
+        }
+        for (int i = 0; i < cnt && i < n; i++) { int64_t v = (int64_t)(unsigned)gs[i]; memcpy(out + 8 * i, &v, 8); }
+        free(gs);
+        return cnt;
+    }
 }
 
 /* ======================================================================

@@ -1,0 +1,157 @@
+# The CGI child side (a program run by a web server), after Go's child.go.
+import "io"
+import "net"
+import "net/http"
+import nurl "net/url"
+import "os"
+import "strconv"
+import "strings"
+
+# "KEY=value" entries as a map (later entries win; entries without "=" are
+# skipped).
+def env_map(env: [Str]) -> Map[Str, Str] {
+  m: Map[Str, Str] = {}
+  for kv in env {
+    if p = strings.cut(kv, "=") {
+      k, v = p
+      m[k] = v
+    }
+  }
+  m
+}
+
+# Go's http.ParseHTTPVersion: "HTTP/1.0" -> (1, 0); none if malformed.
+pub def parse_http_version(vers: Str) -> (Int, Int)? {
+  return (1, 1) if vers == "HTTP/1.1"
+  return (1, 0) if vers == "HTTP/1.0"
+  return none unless strings.has_prefix(vers, "HTTP/") && vers.size == 8 && vers[6] == 46
+  ma = vers[5]
+  mi = vers[7]
+  return none unless ma >= 48 && ma <= 57 && mi >= 48 && mi <= 57
+  ((ma - 48).to_i, (mi - 48).to_i)
+}
+
+# The protocol version a CGI request declares (SERVER_PROTOCOL; "INCLUDED"
+# is HTTP/1.0, RFC 3875 4.1.16). Go's Request.ProtoMajor / ProtoMinor.
+pub def proto_version(params: Map[Str, Str]) -> ~(Int, Int) {
+  p = params["SERVER_PROTOCOL"] || ""
+  return (1, 0) if p == "INCLUDED"
+  if v = parse_http_version(p) {
+    return v
+  }
+  fail CgiError.Msg("cgi: invalid SERVER_PROTOCOL version")
+}
+
+# The body length a CGI request declares (CONTENT_LENGTH; 0 if unset). Go's
+# Request.ContentLength.
+pub def content_length(params: Map[Str, Str]) -> ~Int {
+  s = params["CONTENT_LENGTH"] || ""
+  return 0 if s.size == 0
+  n = strconv.parse_int(s, 10, 64)
+  fail CgiError.Msg("cgi: bad CONTENT_LENGTH in environment: " + s) if n.err?
+  n.unwrap
+}
+
+# Whether the request came over TLS (HTTPS is "on", "ON" or "1"). Go's
+# Request.TLS != nil.
+pub def https?(params: Map[Str, Str]) -> Bool {
+  s = params["HTTPS"] || ""
+  s == "on" || s == "ON" || s == "1"
+}
+
+# The http.Request a CGI environment describes (Go's RequestFromMap). The
+# body is empty; see `request`.
+pub def request_from_map(params: Map[Str, Str]) -> ~http.Request {
+  method = params["REQUEST_METHOD"] || ""
+  fail CgiError.Msg("cgi: no REQUEST_METHOD in environment") if method.size == 0
+  proto = params["SERVER_PROTOCOL"] || ""
+  ~proto_version(params)
+  host = params["HTTP_HOST"] || ""
+  ~content_length(params)
+  h = http.new_header
+  ct = params["CONTENT_TYPE"] || ""
+  h.set!("Content-Type", ct) if ct.size > 0
+  for k, v in params {
+    next if k == "HTTP_HOST"
+    if strings.has_prefix(k, "HTTP_") {
+      h.add!(strings.replace_all(k[5...k.size], "_", "-"), v)
+    }
+  }
+  uri = params["REQUEST_URI"] || ""
+  if uri.size == 0 {
+    uri = (params["SCRIPT_NAME"] || "") + (params["PATH_INFO"] || "")
+    q = params["QUERY_STRING"] || ""
+    uri = uri + "?" + q if q.size > 0
+  }
+  u: nurl.Url? = none
+  if host.size > 0 {
+    raw = (https?(params) ? "https://" : "http://") + host + uri
+    r = nurl.parse(raw)
+    fail CgiError.Msg("cgi: failed to parse host and REQUEST_URI into a URL: " + raw) if r.err?
+    u = r.unwrap
+  } else {
+    r = nurl.parse(uri)
+    fail CgiError.Msg("cgi: failed to parse REQUEST_URI into a URL: " + uri) if r.err?
+    u = r.unwrap
+  }
+  url = u.unwrap
+  remote_port = strconv.atoi(params["REMOTE_PORT"] || "").unwrap_or(0)
+  remote = net.join_host_port(params["REMOTE_ADDR"] || "", strconv.itoa(remote_port))
+  pv: Map[Str, Str] = {}
+  b: [Byte] = []
+  http.Request.new(method: method, url: url.to_s, path: url.path, raw_query: url.raw_query, proto: proto, host: host, header: h, body: b, remote_addr: remote, pathvals: pv)
+}
+
+# The request of the CGI environment this program runs in, its body read
+# from stdin (CONTENT_LENGTH bytes). Go's Request.
+pub def request -> ~http.Request {
+  params = env_map(os.environ)
+  ~request_with_body(params, os.stdin)
+}
+
+def request_with_body[R: io.Reader](params: Map[Str, Str], body: R) -> ~http.Request {
+  r = ~request_from_map(params)
+  n = ~content_length(params)
+  if n > 0 {
+    buf: [Byte] = [0; n]
+    got = ~io.read_full(body, buf)
+    r.body = buf[0...got]
+  }
+  r
+}
+
+# Runs `handler` on the request of the CGI environment and writes its
+# response to stdout (Go's Serve).
+pub def serve(handler: (http.ResponseWriter, http.Request) -> Unit) -> ~Unit {
+  out = os.stdout
+  sink = ->(p: [Byte]) -> ~Unit {
+    out.~write!(p)
+    return
+  }
+  ~serve_params(env_map(os.environ), os.stdin, sink, handler)
+}
+
+# Like serve, routing through a ServeMux.
+pub def serve_mux(mux: http.ServeMux) -> ~Unit {
+  out = os.stdout
+  sink = ->(p: [Byte]) -> ~Unit {
+    out.~write!(p)
+    return
+  }
+  req = ~request_with_body(env_map(os.environ), os.stdin)
+  w = http.new_response_writer_to(http.MODE_CGI, false, sink)
+  # (find and dispatch in the scope that made w: see http.dispatch)
+  m = mux.find(req.method, req.path.size == 0 ? "/" : req.path)
+  http.dispatch(m, w, req)
+  w.~finish!
+  return
+}
+
+# serve over explicit parameters, body and output.
+def serve_params[R: io.Reader](params: Map[Str, Str], body: R, sink: ([Byte]) -> ~Unit, handler: (http.ResponseWriter, http.Request) -> Unit) -> ~Unit {
+  req = ~request_with_body(params, body)
+  w = http.new_response_writer_to(http.MODE_CGI, false, sink)
+  handler(w, req)
+  w.~finish!
+  return
+}

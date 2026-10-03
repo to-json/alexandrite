@@ -1,0 +1,393 @@
+# Package fcgi: Go's net/http/fcgi, the responder side of FastCGI: a
+# program a web server talks to over FastCGI records instead of starting it
+# per request (CGI).
+#
+#   ln = ~net.listen("tcp", "127.0.0.1:9000")
+#   fcgi.serve(ln, ->(w: http.ResponseWriter, r: http.Request) {
+#     w.write_string!("hello from FastCGI\n")
+#     return
+#   })
+#
+#   Go                                   alx
+#   Serve(l net.Listener, h) error       serve(l, f) -> ~Unit / serve_mux(l, mux)
+#   Serve(nil, h) (listener on stdin)    serve_stdin(f)
+#   ProcessEnv(r) map[string]string      process_env(r) -> Map[Str, Str]
+#   ErrRequestAborted, ErrConnClosed     FcgiError.RequestAborted, .ConnClosed
+#
+# Differences from Go:
+#  - alx requests hold their whole body, so a request is served once its
+#    stdin stream has ended (the empty stdin record); Go starts the handler
+#    at the first stdin record and streams the body through a pipe. A request
+#    aborted (FCGI_ABORT_REQUEST) or cut off by the connection's end before its
+#    stdin is complete is dropped without running the handler (Go runs it and
+#    its body read fails with ErrRequestAborted / ErrConnClosed; those errors
+#    exist here for completeness).
+#  - Each connection's requests are served one at a time, in the order their
+#    stdin completes (Go runs each in its own goroutine). Connections are
+#    served concurrently, one task each.
+#  - The handler is a function (serve_mux routes through a ServeMux; a
+#    function is registered at "/" of a mux of its own, which tasks can
+#    share; a request without a path is looked up as "/"). The
+#    response is an http.ResponseWriter in MODE_FCGI: "Status: 200 OK", the
+#    header (a Date if none, Content-Type sniffed when missing, no entity
+#    headers on a 304), a blank line, then the body, as FCGI_STDOUT records
+#    of at most 65535 bytes.
+#  - ProcessEnv's variables travel on the Request's path values under the
+#    prefix ENV_PREFIX (alx requests have no context); process_env reads them
+#    back. serve_mux keeps them alongside the pattern's wildcards.
+#  - The connection type is generic (`serve_conn[C]` over any
+#    io.ReadWriteCloser), used by the tests the way Go's use fake conns.
+#
+# Not translated: TestSlowRequest's timing (the request completes, the
+# connection closes: covered by "keep-alive off closes the connection"), and
+# the parts of TestChildServeCleansUp / TestChildServeReadsEnvVars /
+# TestResponseWriterSniffsContentType that depend on streaming the body:
+# their record streams get the terminating empty stdin record here.
+
+import "io"
+import "net"
+import "net/http"
+import "net/http/cgi"
+
+pub error FcgiError {
+  RequestAborted
+  ConnClosed
+  InvalidVersion
+  InvalidBeginRequest
+  InFlight
+
+  def message -> Str {
+    case self {
+      RequestAborted => "fcgi: request aborted by web server"
+      ConnClosed => "fcgi: connection to web server closed"
+      InvalidVersion => "fcgi: invalid header version"
+      InvalidBeginRequest => "fcgi: invalid begin request record"
+      InFlight => "fcgi: received ID that is already in-flight"
+    }
+  }
+}
+
+# Record types.
+pub TYPE_BEGIN_REQUEST = 1
+pub TYPE_ABORT_REQUEST = 2
+pub TYPE_END_REQUEST = 3
+pub TYPE_PARAMS = 4
+pub TYPE_STDIN = 5
+pub TYPE_STDOUT = 6
+pub TYPE_STDERR = 7
+pub TYPE_DATA = 8
+pub TYPE_GET_VALUES = 9
+pub TYPE_GET_VALUES_RESULT = 10
+pub TYPE_UNKNOWN_TYPE = 11
+
+# Keep the connection open after the request (FCGI_KEEP_CONN).
+pub FLAG_KEEP_CONN = 1
+
+# The largest record body, and the most padding.
+pub MAX_WRITE = 65535
+pub MAX_PAD = 255
+
+pub ROLE_RESPONDER = 1
+pub ROLE_AUTHORIZER = 2
+pub ROLE_FILTER = 3
+
+pub STATUS_REQUEST_COMPLETE = 0
+pub STATUS_CANT_MULTIPLEX = 1
+pub STATUS_OVERLOADED = 2
+pub STATUS_UNKNOWN_ROLE = 3
+
+# The path-value key prefix of the FastCGI variables (see process_env).
+pub ENV_PREFIX = "fcgi.env:"
+
+# One record as read: its type, request id and content (padding dropped).
+pub struct Record {
+  rec_type: Int
+  id: Int
+  content: [Byte]
+}
+
+# The bytes of a record of type t for request id with content b (at most
+# MAX_WRITE bytes), padded to a multiple of 8.
+pub def encode_record(t: Int, id: Int, b: [Byte]) -> [Byte] {
+  pad = (8 - (b.size & 7)) & 7
+  out: [Byte] = [1, t.as_u8, (id >> 8).as_u8, id.as_u8, (b.size >> 8).as_u8, b.size.as_u8, pad.as_u8, 0]
+  for c in b { out << c }
+  i = 0
+  while i < pad {
+    out << 0
+    i += 1
+  }
+  out
+}
+
+# Reads the next record from r; none at the end of input (a record cut off
+# in the middle is io.StreamError.UnexpectedEof).
+pub def read_record[R: io.Reader](r: R) -> ~Record? {
+  h: [Byte] = [0; 8]
+  n = ~io.read_full(r, h)
+  return none if n == 0
+  fail io.StreamError.UnexpectedEof if n < 8
+  fail FcgiError.InvalidVersion if h[0] != 1
+  clen = (h[4].to_i << 8) | h[5].to_i
+  body: [Byte] = [0; clen + h[6].to_i]
+  ~io.read_exact(r, body)
+  Record.new(rec_type: h[1].to_i, id: (h[2].to_i << 8) | h[3].to_i, content: body[0...clen])
+}
+
+# Writes a record for each MAX_WRITE bytes of b (none for an empty b).
+def write_stream[C: io.Writer](c: C, t: Int, id: Int, b: [Byte]) -> ~Unit {
+  off = 0
+  while off < b.size {
+    e = off + MAX_WRITE
+    e = b.size if e > b.size
+    ~io.write_all(c, encode_record(t, id, b[off...e]))
+    off = e
+  }
+}
+
+def write_record[C: io.Writer](c: C, t: Int, id: Int, b: [Byte]) -> ~Unit {
+  ~io.write_all(c, encode_record(t, id, b))
+}
+
+def write_end_request[C: io.Writer](c: C, id: Int, app_status: Int, protocol_status: Int) -> ~Unit {
+  b: [Byte] = [(app_status >> 24).as_u8, (app_status >> 16).as_u8, (app_status >> 8).as_u8, app_status.as_u8, protocol_status.as_u8, 0, 0, 0]
+  ~write_record(c, TYPE_END_REQUEST, id, b)
+}
+
+# The FastCGI encoding of a name or value length: one byte up to 127, else
+# four bytes with the top bit set.
+pub def encode_size(size: Int) -> [Byte] {
+  if size > 127 {
+    s = size | (1 << 31)
+    out: [Byte] = [(s >> 24).as_u8, (s >> 16).as_u8, (s >> 8).as_u8, s.as_u8]
+    return out
+  }
+  out: [Byte] = [size.as_u8]
+  out
+}
+
+# A length decoded from the start of s and the bytes it took; (0, 0) when s
+# is too short.
+pub def read_size(s: [Byte]) -> (Int, Int) {
+  return (0, 0) if s.size == 0
+  size = s[0].to_i
+  if size & 0x80 != 0 {
+    return (0, 0) if s.size < 4
+    size = ((s[0].to_i & 0x7F) << 24) | (s[1].to_i << 16) | (s[2].to_i << 8) | s[3].to_i
+    return (size, 4)
+  }
+  (size, 1)
+}
+
+# The name-value pairs encoding of pairs, in order.
+pub def encode_pairs(pairs: [(Str, Str)]) -> [Byte] {
+  out: [Byte] = []
+  for p in pairs {
+    k = p[0]
+    v = p[1]
+    out = out + encode_size(k.size) + encode_size(v.size) + k.bytes.to_a + v.bytes.to_a
+  }
+  out
+}
+
+# Decodes name-value pairs; stops at the first malformed one (Go's
+# parseParams).
+pub def parse_params(text0: [Byte]) -> Map[Str, Str] {
+  m: Map[Str, Str] = {}
+  text = text0
+  while text.size > 0 {
+    key_len, n = read_size(text)
+    return m if n == 0
+    text = text[n...text.size]
+    val_len, n2 = read_size(text)
+    return m if n2 == 0
+    text = text[n2...text.size]
+    return m if key_len + val_len > text.size
+    key = Str.from_bytes(text[0...key_len])
+    text = text[key_len...text.size]
+    val = Str.from_bytes(text[0...val_len])
+    text = text[val_len...text.size]
+    m[key] = val
+  }
+  m
+}
+
+# Writes pairs as a stream of records of type t (with its empty closing
+# record).
+def write_pairs[C: io.Writer](c: C, t: Int, id: Int, pairs: [(Str, Str)]) -> ~Unit {
+  ~write_stream(c, t, id, encode_pairs(pairs))
+  ~write_record(c, t, id, [])
+}
+
+# Whether a FastCGI variable is left for process_env (not one already
+# turned into the Request; Go's addFastCGIEnvToContext).
+def kept_env?(s: Str) -> Bool {
+  return false if s == "CONTENT_LENGTH" || s == "CONTENT_TYPE" || s == "HTTPS" || s == "PATH_INFO" || s == "QUERY_STRING" || s == "REMOTE_ADDR" || s == "REMOTE_HOST" || s == "REMOTE_PORT" || s == "REQUEST_METHOD" || s == "REQUEST_URI" || s == "SCRIPT_NAME" || s == "SERVER_PROTOCOL"
+  !s.start_with?("HTTP_")
+}
+
+# The FastCGI variables of the request's environment that aren't part of
+# the Request itself (REMOTE_USER, SCRIPT_FILENAME, server-specific ones);
+# empty for a request that didn't come over FastCGI. Go's ProcessEnv.
+pub def process_env(r: http.Request) -> Map[Str, Str] {
+  out: Map[Str, Str] = {}
+  for k, v in r.pathvals {
+    out[k[ENV_PREFIX.size...k.size]] = v if k.start_with?(ENV_PREFIX)
+  }
+  out
+}
+
+# ------------------------------------------------------------------ child
+
+# A request being received.
+struct FReq {
+  raw_params: [Byte]
+  params: Map[Str, Str]
+  keep_conn: Bool
+  stdin: [Byte]
+}
+
+# A handler function as a mux answering every path (as http's
+# new_server_func: the mux is a handle tasks can share).
+def func_responder(f: (http.ResponseWriter, http.Request) -> Unit) -> http.ServeMux {
+  mux = http.new_serve_mux
+  mux.handle_func("/", f)
+  mux
+}
+
+# Handles one record; false when the connection should close (Go's
+# handleRecord returning errCloseConn).
+def handle_record[C: io.ReadWriteCloser](c: C, reqs: Map[Int, FReq], h: http.ServeMux, rec: Record) -> ~Bool {
+  t = rec.rec_type
+  have = reqs.key?(rec.id)
+  return true if !have && t != TYPE_BEGIN_REQUEST && t != TYPE_GET_VALUES
+  if t == TYPE_BEGIN_REQUEST {
+    fail FcgiError.InFlight if have
+    b = rec.content
+    fail FcgiError.InvalidBeginRequest if b.size != 8
+    role = (b[0].to_i << 8) | b[1].to_i
+    if role != ROLE_RESPONDER {
+      write_end_request(c, rec.id, 0, STATUS_UNKNOWN_ROLE)
+      return true
+    }
+    e: [Byte] = []
+    pm: Map[Str, Str] = {}
+    reqs[rec.id] = FReq.new(raw_params: e, params: pm, keep_conn: (b[2] & FLAG_KEEP_CONN) != 0, stdin: e)
+    return true
+  }
+  if t == TYPE_PARAMS {
+    r = reqs[rec.id].unwrap
+    if rec.content.size > 0 {
+      r.raw_params = r.raw_params + rec.content
+    } else {
+      r.params = parse_params(r.raw_params)
+      r.raw_params = []
+    }
+    reqs[rec.id] = r
+    return true
+  }
+  if t == TYPE_STDIN {
+    r = reqs[rec.id].unwrap
+    if rec.content.size > 0 {
+      r.stdin = r.stdin + rec.content
+      reqs[rec.id] = r
+      return true
+    }
+    reqs.delete(rec.id)
+    return ~serve_request(c, rec.id, r, h)
+  }
+  if t == TYPE_GET_VALUES {
+    write_pairs(c, TYPE_GET_VALUES_RESULT, 0, [("FCGI_MPXS_CONNS", "1")])
+    return true
+  }
+  return true if t == TYPE_DATA
+  if t == TYPE_ABORT_REQUEST {
+    r = reqs[rec.id].unwrap
+    reqs.delete(rec.id)
+    write_end_request(c, rec.id, 0, STATUS_REQUEST_COMPLETE)
+    return r.keep_conn
+  }
+  b: [Byte] = [t.as_u8, 0, 0, 0, 0, 0, 0, 0]
+  write_record(c, TYPE_UNKNOWN_TYPE, 0, b)
+  true
+}
+
+# Runs the handler for a complete request and sends its response; whether
+# to keep the connection.
+def serve_request[C: io.ReadWriteCloser](c: C, id: Int, r: FReq, h: http.ServeMux) -> ~Bool {
+  conn = c
+  sink = ->(p: [Byte]) -> ~Unit {
+    ~write_stream(conn, TYPE_STDOUT, id, p)
+    return
+  }
+  w = http.new_response_writer_to(http.MODE_FCGI, false, sink)
+  hr = cgi.request_from_map(r.params)
+  if e = hr.err {
+    w.write_header!(500)
+    write_record(c, TYPE_STDERR, id, e.message.bytes.to_a)
+  } else {
+    req = hr.unwrap
+    req.body = r.stdin
+    for k, v in r.params {
+      req.pathvals[ENV_PREFIX + k] = v if kept_env?(k)
+    }
+    # (find and dispatch in the scope that made w: see http.dispatch)
+    m = h.find(req.method, req.path.size == 0 ? "/" : req.path)
+    for k, v in req.pathvals { m.pvals[k] = v }
+    http.dispatch(m, w, req)
+  }
+  w.finish!
+  write_record(c, TYPE_STDOUT, id, [])
+  ~write_end_request(c, id, 0, STATUS_REQUEST_COMPLETE)
+  r.keep_conn
+}
+
+# Serves the FastCGI records of one connection until it ends (or a request
+# without FCGI_KEEP_CONN is done), then closes it.
+def serve_conn_with[C: io.ReadWriteCloser](c: C, h: http.ServeMux) {
+  reqs: Map[Int, FReq] = {}
+  loop {
+    rec = read_record(c)
+    break if rec.err?
+    if r = rec.unwrap {
+      keep = handle_record(c, reqs, h, r)
+      break if keep.err? || !keep.unwrap
+    } else {
+      break
+    }
+  }
+  conn = c
+  conn.close!
+}
+
+# Serves one connection with handler f (any io.ReadWriteCloser; serve
+# accepts net.Conns and calls this for each).
+pub def serve_conn[C: io.ReadWriteCloser](c: C, f: (http.ResponseWriter, http.Request) -> Unit) {
+  serve_conn_with(c, func_responder(f))
+}
+
+# Accepts FastCGI connections on l and serves each in its own task with
+# handler f, until l fails (Go's Serve).
+pub def serve(l: net.Listener, f: (http.ResponseWriter, http.Request) -> Unit) -> ~Unit {
+  ~serve_responder(l, func_responder(f))
+}
+
+# Like serve, routing through mux.
+pub def serve_mux(l: net.Listener, mux: http.ServeMux) -> ~Unit {
+  ~serve_responder(l, mux)
+}
+
+def serve_responder(l: net.Listener, h: http.ServeMux) -> ~Unit {
+  loop {
+    c = l.~accept
+    mux = h
+    spawn { serve_conn_with(c, mux) }
+  }
+}
+
+# Serves on the listening socket the web server passed as stdin (Go's
+# Serve(nil, h)).
+pub def serve_stdin(f: (http.ResponseWriter, http.Request) -> Unit) -> ~Unit {
+  l = net.Listener.new(fdv: Atomic.new(0), addr: "")
+  ~serve(l, f)
+}

@@ -1,0 +1,291 @@
+# Go's net/http/fcgi tests (fcgi_test.go), translated, plus a loopback test
+# with a small FastCGI client.
+import "bytes"
+import "net"
+import "net/http"
+import "strings"
+
+# A connection reading `input` and collecting what is written (Go's
+# nopWriteCloser / writeOnlyConn / rwNopCloser).
+struct TConn {
+  input: bytes.Buffer
+  output: bytes.Buffer
+  closed: Atomic[Int]
+
+  def read!(p: [Byte]) -> Int { input.read!(p) }
+  def write!(p: [Byte]) -> Int { output.write!(p) }
+
+  def close! -> ~Unit {
+    closed.store(1)
+    return
+  }
+}
+
+def tconn(input: [Byte]) -> TConn {
+  TConn.new(input: bytes.new_buffer(input), output: bytes.new_buffer([]), closed: Atomic.new(0))
+}
+
+def bs(xs: [Byte]) -> [Byte] { xs }
+
+# Helpers for vec_fcgi_test.
+def end_request_bytes(id: Int, app_status: Int, protocol_status: Int) -> [Byte] {
+  out = bytes.new_buffer([])
+  write_end_request(out, id, app_status, protocol_status).unwrap
+  out.bytes
+}
+
+def pairs_bytes(id: Int, k: Str, v: Str) -> [Byte] {
+  out = bytes.new_buffer([])
+  write_pairs(out, TYPE_PARAMS, id, [(k, v)]).unwrap
+  out.bytes
+}
+
+test "size" {
+  tests = [(0, bs([0x00])), (127, bs([0x7F])), (128, bs([0x80, 0x00, 0x00, 0x80])), (1000, bs([0x80, 0x00, 0x03, 0xE8])), (33554431, bs([0x81, 0xFF, 0xFF, 0xFF]))]
+  for t in tests {
+    assert_eq encode_size(t[0]), t[1]
+    assert_eq read_size(t[1]), (t[0], t[1].size)
+  }
+  assert_eq read_size([]), (0, 0)
+  assert_eq read_size([0x80, 0]), (0, 0)
+}
+
+test "streams" {
+  zeros: [Byte] = [0; 65536]
+  z472: [Byte] = [0; 472]
+  c66: [Byte] = [0; 66000]
+  e: [Byte] = []
+  tests = [
+    ("single record", TYPE_STDOUT, 1, e, bs([1, 6, 0, 1, 0, 0, 0, 0])),
+    ("two records", TYPE_STDIN, 300, c66, bs([1, 5, 0x01, 0x2C, 0xFF, 0xFF, 1, 0]) + zeros + bs([1, 5, 0x01, 0x2C, 0x01, 0xD1, 7, 0]) + z472 + bs([1, 5, 0x01, 0x2C, 0, 0, 0, 0]))
+  ]
+  for t in tests {
+    buf = bytes.new_buffer(t[4])
+    content: [Byte] = []
+    last = Record.new(rec_type: 0, id: 0, content: e)
+    while buf.size > 0 {
+      r = read_record(buf).unwrap.unwrap
+      content = content + r.content
+      last = r
+    }
+    assert_eq last.rec_type, t[1]
+    assert_eq last.id, t[2]
+    assert content == t[3], "#{t[0]}: read wrong content"
+    out = bytes.new_buffer([])
+    write_stream(out, t[1], t[2], t[3]).unwrap
+    write_record(out, t[1], t[2], []).unwrap
+    assert out.bytes == t[4], "#{t[0]}: wrote wrong content"
+  }
+}
+
+test "read record errors" {
+  assert read_record(bytes.new_buffer([2, 1, 0, 1, 0, 0, 0, 0])).err?
+  assert read_record(bytes.new_buffer([1, 1, 0])).err?
+  assert read_record(bytes.new_buffer([1, 1, 0, 1, 0, 4, 0, 0, 1])).err?
+  assert_eq read_record(bytes.new_buffer([])).unwrap, none
+}
+
+def no_handler(w: http.ResponseWriter, r: http.Request) {}
+
+test "get values" {
+  c = tconn([])
+  reqs: Map[Int, FReq] = {}
+  rec = Record.new(rec_type: TYPE_GET_VALUES, id: 0, content: [])
+  assert handle_record(c, reqs, func_responder(no_handler), rec).unwrap
+  want = bs([1, 10, 0, 0, 0, 0x12, 6, 0, 0x0f, 1]) + "FCGI_MPXS_CONNS1".bytes.to_a + bs([0, 0, 0, 0, 0, 0, 1, 10, 0, 0, 0, 0, 0, 0])
+  assert c.output.bytes == want
+}
+
+def nvp11(name: Str, value: Str) -> [Byte] {
+  bs([name.size.as_u8, value.size.as_u8]) + name.bytes.to_a + value.bytes.to_a
+}
+
+def make_record(t: Int, id: Int, content: [Byte]) -> [Byte] {
+  bs([1, t.as_u8, (id >> 8).as_u8, id.as_u8, (content.size >> 8).as_u8, content.size.as_u8, 0, 0]) + content
+}
+
+def stream_begin_type_stdin -> [Byte] {
+  make_record(TYPE_BEGIN_REQUEST, 1, [0, ROLE_RESPONDER.as_u8, 0, 0, 0, 0, 0, 0]) + make_record(TYPE_PARAMS, 1, nvp11("REQUEST_METHOD", "GET")) + make_record(TYPE_PARAMS, 1, nvp11("SERVER_PROTOCOL", "HTTP/1.1")) + make_record(TYPE_PARAMS, 1, []) + make_record(TYPE_STDIN, 1, "0123456789abcdef".bytes.to_a)
+}
+
+# Go's streamFullRequestStdin, with the empty stdin record that ends the body
+# (alx serves a request once its body is complete).
+def stream_full_request_stdin -> [Byte] {
+  make_record(TYPE_BEGIN_REQUEST, 1, [0, ROLE_RESPONDER.as_u8, 0, 0, 0, 0, 0, 0]) + make_record(TYPE_PARAMS, 1, nvp11("REQUEST_METHOD", "GET")) + make_record(TYPE_PARAMS, 1, nvp11("SERVER_PROTOCOL", "HTTP/1.1")) + make_record(TYPE_PARAMS, 1, nvp11("REMOTE_USER", "jane.doe")) + make_record(TYPE_PARAMS, 1, nvp11("QUERY_STRING", "/foo/bar")) + make_record(TYPE_PARAMS, 1, []) + make_record(TYPE_STDIN, 1, "0123456789abcdef".bytes.to_a) + make_record(TYPE_STDIN, 1, []) + make_record(TYPE_END_REQUEST, 1, [])
+}
+
+# Go's TestChildServeCleansUp: an aborted request and a connection cut off
+# mid-body. Here neither runs the handler (see the package header); the
+# serve loop must still finish and close the connection, and the abort is
+# answered with an end-request record.
+test "child serve cleans up" {
+  ran = Atomic.new(0)
+  h = ->(w: http.ResponseWriter, r: http.Request) {
+    ran.add(1)
+    return
+  }
+  c = tconn(stream_begin_type_stdin() + make_record(TYPE_ABORT_REQUEST, 1, []))
+  serve_conn(c, h)
+  assert_eq c.closed.load, 1
+  assert c.output.bytes == encode_record(TYPE_END_REQUEST, 1, [0, 0, 0, 0, 0, 0, 0, 0])
+  c2 = tconn(stream_begin_type_stdin())
+  serve_conn(c2, h)
+  assert_eq c2.closed.load, 1
+  assert_eq ran.load, 0
+}
+
+test "malformed params" {
+  input = bs([1, 1, 0, 1, 0, 8, 0, 0, 0, 1, 1, 0, 0, 0, 0, 0, 1, 4, 0, 1, 0, 10, 0, 0, 50, 50, 3, 4, 5, 6, 7, 8, 9, 10, 1, 4, 0, 1, 0, 0, 0, 0])
+  c = tconn(input)
+  serve_conn(c, no_handler)
+  assert_eq c.closed.load, 1
+  assert_eq parse_params(bs([50, 50, 3, 4])).size, 0
+}
+
+test "child serve reads env vars" {
+  got = Chan[Map[Str, Str]].new(1)
+  h = ->(w: http.ResponseWriter, r: http.Request) {
+    got << process_env(r)
+    return
+  }
+  serve_conn(tconn(stream_full_request_stdin()), h)
+  env = got.recv.unwrap
+  assert_eq env["REMOTE_USER"] || "", "jane.doe"
+  assert !env.key?("QUERY_STRING")
+}
+
+test "response writer sniffs content type" {
+  tests = [
+    ("", "text/plain; charset=utf-8"),
+    ("<html><head><title>test page</title></head><body>This is a body</body></html>", "text/html; charset=utf-8"),
+    (strings.repeat("gopher", 86), "text/plain; charset=utf-8"),
+    (Str.from_bytes([0xFF, 0xD8, 0xFF]) + strings.repeat("B", 1024), "image/jpeg")
+  ]
+  for t in tests {
+    got = Chan[Str].new(1)
+    body = t[0]
+    h = ->(w: http.ResponseWriter, r: http.Request) {
+      w.write_string!(body).unwrap
+      got << w.header.get("Content-Type")
+      return
+    }
+    serve_conn(tconn(stream_full_request_stdin()), h)
+    assert_eq got.recv.unwrap, t[1]
+  }
+}
+
+# The stdout records of request `id` in raw, joined.
+def stdout_of(raw: [Byte], id: Int) -> (Str, Bool) {
+  b = bytes.new_buffer(raw)
+  out: [Byte] = []
+  ended = false
+  loop {
+    r = read_record(b).unwrap
+    if rec = r {
+      out = out + rec.content if rec.rec_type == TYPE_STDOUT && rec.id == id
+      ended = true if rec.rec_type == TYPE_END_REQUEST && rec.id == id
+    } else {
+      break
+    }
+  }
+  (Str.from_bytes(out), ended)
+}
+
+test "full request and response records" {
+  h = ->(w: http.ResponseWriter, r: http.Request) {
+    w.header.set!("Date", "Mon, 02 Jan 2006 15:04:05 GMT")
+    w.write_string!("method=#{r.method} body=#{r.body_string} q=#{r.raw_query}").unwrap
+    return
+  }
+  c = tconn(stream_full_request_stdin())
+  serve_conn(c, h)
+  text, ended = stdout_of(c.output.bytes, 1)
+  assert ended
+  assert_eq text, "Status: 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\nDate: Mon, 02 Jan 2006 15:04:05 GMT\r\n\r\nmethod=GET body=0123456789abcdef q=/foo/bar"
+  # the end-of-stream record, then FCGI_END_REQUEST, then the unknown type
+  # answer for the stray FCGI_END_REQUEST from the "server"
+  raw = c.output.bytes
+  tail = encode_record(TYPE_STDOUT, 1, []) + encode_record(TYPE_END_REQUEST, 1, [0, 0, 0, 0, 0, 0, 0, 0])
+  assert raw.size > tail.size
+}
+
+test "unknown role and unknown record type" {
+  c = tconn(make_record(TYPE_BEGIN_REQUEST, 7, [0, ROLE_FILTER.as_u8, 0, 0, 0, 0, 0, 0]))
+  serve_conn(c, no_handler)
+  assert c.output.bytes == encode_record(TYPE_END_REQUEST, 7, [0, 0, 0, 0, STATUS_UNKNOWN_ROLE.as_u8, 0, 0, 0])
+  c2 = tconn(make_record(TYPE_BEGIN_REQUEST, 1, [0, 1, 0, 0, 0, 0, 0, 0]) + make_record(42, 1, []))
+  serve_conn(c2, no_handler)
+  assert c2.output.bytes == encode_record(TYPE_UNKNOWN_TYPE, 0, [42, 0, 0, 0, 0, 0, 0, 0])
+}
+
+test "a bad environment is a 500 with the error on stderr" {
+  input = make_record(TYPE_BEGIN_REQUEST, 1, [0, 1, 0, 0, 0, 0, 0, 0]) + make_record(TYPE_PARAMS, 1, []) + make_record(TYPE_STDIN, 1, [])
+  c = tconn(input)
+  serve_conn(c, no_handler)
+  b = bytes.new_buffer(c.output.bytes)
+  first = read_record(b).unwrap.unwrap
+  assert_eq first.rec_type, TYPE_STDERR
+  assert_eq Str.from_bytes(first.content), "cgi: no REQUEST_METHOD in environment"
+  text, _ = stdout_of(c.output.bytes, 1)
+  assert text.start_with?("Status: 500 Internal Server Error\r\n")
+}
+
+test "large response is split into records" {
+  big = strings.repeat("x", 200000)
+  h = ->(w: http.ResponseWriter, r: http.Request) {
+    w.header.set!("Content-Type", "text/plain")
+    w.write_string!(big).unwrap
+    return
+  }
+  c = tconn(stream_full_request_stdin())
+  serve_conn(c, h)
+  b = bytes.new_buffer(c.output.bytes)
+  loop {
+    r = read_record(b).unwrap
+    if rec = r {
+      assert rec.content.size <= MAX_WRITE
+    } else {
+      break
+    }
+  }
+  text, _ = stdout_of(c.output.bytes, 1)
+  assert text.end_with?(big)
+}
+
+# A FastCGI client: one request with keep-conn, over a real connection.
+def fcgi_request(c: net.Conn, id: Int, params: [(Str, Str)], body: Str) -> (Str, Bool) {
+  out = make_record(TYPE_BEGIN_REQUEST, id, [0, 1, FLAG_KEEP_CONN.as_u8, 0, 0, 0, 0, 0])
+  out = out + encode_record(TYPE_PARAMS, id, encode_pairs(params)) + encode_record(TYPE_PARAMS, id, [])
+  out = out + encode_record(TYPE_STDIN, id, body.bytes.to_a) if body.size > 0
+  out = out + encode_record(TYPE_STDIN, id, [])
+  c.write!(out).unwrap
+  text: [Byte] = []
+  loop {
+    rec = read_record(c).unwrap.unwrap
+    text = text + rec.content if rec.rec_type == TYPE_STDOUT
+    break if rec.rec_type == TYPE_END_REQUEST
+  }
+  (Str.from_bytes(text), true)
+}
+
+test "serve over loopback with a mux" {
+  mux = http.new_serve_mux
+  mux.handle_func("POST /items/{id}") { |w, r|
+    w.header.set!("Date", "x")
+    w.write_string!("item #{r.path_value("id")} got #{r.body_string} user=#{process_env(r)["REMOTE_USER"] || "-"}").unwrap
+  }
+  ln = net.listen("tcp", "127.0.0.1:0").unwrap
+  port = ln.port
+  spawn { serve_mux(ln, mux) }
+  c = net.dial("tcp", "127.0.0.1:#{port}").unwrap
+  params = [("REQUEST_METHOD", "POST"), ("SERVER_PROTOCOL", "HTTP/1.1"), ("REQUEST_URI", "/items/7"), ("HTTP_HOST", "example.com"), ("CONTENT_LENGTH", "5"), ("REMOTE_USER", "ann")]
+  text, _ = fcgi_request(c, 1, params, "hello")
+  assert_eq text, "Status: 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\nDate: x\r\n\r\nitem 7 got hello user=ann"
+  # the connection is kept: a second request, an unknown path
+  params2 = [("REQUEST_METHOD", "GET"), ("SERVER_PROTOCOL", "HTTP/1.1"), ("REQUEST_URI", "/nope")]
+  text2, _ = fcgi_request(c, 2, params2, "")
+  assert text2.start_with?("Status: 404 Not Found\r\n")
+  assert text2.end_with?("404 page not found\n")
+  c.close!.unwrap
+  ln.close!.unwrap
+}

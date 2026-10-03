@@ -1,0 +1,301 @@
+# The CGI host side (a web server running a CGI program), after Go's
+# host.go.
+import "net"
+import "net/http"
+import nurl "net/url"
+import "net/textproto"
+import "os"
+import "os/exec"
+import "strconv"
+import "strings"
+
+# Environment variables a CGI program inherits by default (the dynamic
+# linker's search path).
+def os_default_inherit_env -> [Str] {
+  ["DYLD_LIBRARY_PATH", "LD_LIBRARY_PATH"]
+}
+
+# Runs a CGI program for each request (Go's cgi.Handler). Make one with
+# `new_handler(path)` and set the other fields as needed.
+pub struct Handler {
+  # Path to the CGI executable.
+  path: Str
+  # Root URI prefix of the handler ("" for "/").
+  root: Str
+  # Working directory of the program; "" means the directory of `path`.
+  dir: Str
+  # Extra environment variables, "KEY=value".
+  env: [Str]
+  # Environment variables to pass through from this process, by name.
+  inherit_env: [Str]
+  # Arguments for the program (after argv[0], which is `path`).
+  args: [Str]
+  # Gets the program's stderr output (Go: Stderr io.Writer; none: this
+  # process's stderr).
+  stderr: ((Str) -> Unit)?
+  # Gets error messages (Go: Logger; none: this process's stderr).
+  logger: ((Str) -> Unit)?
+  # Handles a local "Location: /path" reply of the program as an internal
+  # redirect (Go: PathLocationHandler); none: such replies go to the client.
+  path_location_handler: ((http.ResponseWriter, http.Request) -> Unit)?
+
+  def printf(msg: Str) {
+    if lg = logger {
+      lg(msg)
+    } else {
+      e = os.stderr
+      e.write_string!(msg + "\n")
+    }
+  }
+
+  def put_stderr(s: Str) {
+    return if s.size == 0
+    if f = stderr {
+      f(s)
+    } else {
+      e = os.stderr
+      e.write_string!(s)
+    }
+  }
+
+  # The program's environment for req.
+  def build_env(req: http.Request) -> [Str] {
+    root0 = strings.trim_right(root, "/")
+    path_info = strings.trim_prefix(req.path, root0)
+    port = "80"
+    hp = trailing_port(req.host)
+    port = hp if hp.size > 0
+    request_uri = req.url
+    if u = nurl.parse(req.url).ok {
+      request_uri = u.request_uri
+    }
+    env0 = ["SERVER_SOFTWARE=go", "SERVER_PROTOCOL=HTTP/1.1", "HTTP_HOST=" + req.host, "GATEWAY_INTERFACE=CGI/1.1", "REQUEST_METHOD=" + req.method, "QUERY_STRING=" + req.raw_query, "REQUEST_URI=" + request_uri, "PATH_INFO=" + path_info, "SCRIPT_NAME=" + root0, "SCRIPT_FILENAME=" + path, "SERVER_PORT=" + port]
+    rhp = net.split_host_port(req.remote_addr)
+    if rhp.ok? {
+      rip, rport = rhp.unwrap
+      env0 << "REMOTE_ADDR=" + rip
+      env0 << "REMOTE_HOST=" + rip
+      env0 << "REMOTE_PORT=" + rport
+    } else {
+      env0 << "REMOTE_ADDR=" + req.remote_addr
+      env0 << "REMOTE_HOST=" + req.remote_addr
+    }
+    hhp = net.split_host_port(req.host)
+    if hhp.ok? {
+      hd, _ = hhp.unwrap
+      env0 << "SERVER_NAME=" + hd
+    } else {
+      env0 << "SERVER_NAME=" + req.host
+    }
+    for k0 in req.header.keys {
+      k = env_key(k0)
+      next if k == "PROXY"
+      join = k == "COOKIE" ? "; " : ", "
+      env0 << "HTTP_" + k + "=" + strings.join(req.header.values(k0), join)
+    }
+    env0 << "CONTENT_LENGTH=#{req.body.size}" if req.body.size > 0
+    ctype = req.header.get("Content-Type")
+    env0 << "CONTENT_TYPE=" + ctype if ctype.size > 0
+    env_path = os.getenv("PATH") || ""
+    env_path = "/bin:/usr/bin:/usr/ucb:/usr/bsd:/usr/local/bin" if env_path.size == 0
+    env0 << "PATH=" + env_path
+    for e in inherit_env {
+      v = os.getenv(e) || ""
+      env0 << e + "=" + v if v.size > 0
+    }
+    for e in os_default_inherit_env() {
+      v = os.getenv(e) || ""
+      env0 << e + "=" + v if v.size > 0
+    }
+    for e in env { env0 << e }
+    remove_leading_duplicates(env0)
+  }
+
+  pub def serve_http(rw: http.ResponseWriter, req: http.Request) {
+    if strings.contains(http.lower(req.header.get("Transfer-Encoding")), "chunked") {
+      rw.write_header!(400)
+      rw.write_string!("Chunked request bodies are not supported by CGI.")
+      return
+    }
+    final_env = build_env(req)
+    cwd = dir
+    prog = path
+    if dir.size == 0 {
+      i = strings.last_index(path, "/")
+      cwd = i < 0 ? "" : path[0...i + 1]
+      prog = i < 0 ? path : path[i + 1...path.size]
+    }
+    cwd = "." if cwd.size == 0
+    # (a name without a slash would be looked up in $PATH)
+    prog = "./" + prog unless strings.contains(prog, "/")
+    cmd = exec.command(prog, args)
+    cmd.dir = cwd
+    cmd.env = final_env
+    cmd.stdin = Str.from_bytes(req.body) if req.body.size > 0
+    res = cmd.capture
+    if e = res.err {
+      rw.write_header!(500)
+      printf("CGI error: #{e.message}")
+      return
+    }
+    out = res.unwrap
+    put_stderr(out.stderr)
+    self.relay(rw, req, out.stdout)
+  }
+
+  # Translates the program's output into the response.
+  def relay(rw: http.ResponseWriter, req: http.Request, text: Str) {
+    headers = http.new_header
+    status_code = 0
+    header_lines = 0
+    saw_blank = false
+    pos = 0
+    while pos < text.size {
+      nl = text.byteindex("\n", pos)
+      raw_end = nl < 0 ? text.size : nl
+      line_end = raw_end
+      line_end -= 1 if line_end > pos && text[line_end - 1] == 13
+      if line_end - pos > 1024 {
+        rw.write_header!(500)
+        printf("cgi: long header line from subprocess.")
+        return
+      }
+      line = text[pos...line_end]
+      pos = nl < 0 ? text.size : nl + 1
+      if line.size == 0 {
+        saw_blank = true
+        break
+      }
+      header_lines += 1
+      if kv = strings.cut(line, ":") {
+        header, val0 = kv
+        if !http.valid_header_field_name?(header) {
+          printf("cgi: invalid header name: #{strconv.quote(header)}")
+          next
+        }
+        val = textproto.trim_string(val0)
+        if header == "Status" {
+          if val.size < 3 {
+            printf("cgi: bogus status (short): #{strconv.quote(val)}")
+            return
+          }
+          code = strconv.atoi(val[0...3])
+          if code.err? {
+            printf("cgi: bogus status: #{strconv.quote(val)}")
+            printf("cgi: line was #{strconv.quote(line)}")
+            return
+          }
+          status_code = code.unwrap
+        } else {
+          headers.add!(header, val)
+        }
+      } else {
+        printf("cgi: bogus header line: #{line}")
+      }
+    }
+    if header_lines == 0 || !saw_blank {
+      rw.write_header!(500)
+      printf("cgi: no headers")
+      return
+    }
+    loc = headers.get("Location")
+    if loc.size > 0 {
+      if strings.has_prefix(loc, "/") {
+        if f = path_location_handler {
+          handle_internal_redirect(rw, req, loc, f)
+          return
+        }
+      }
+      status_code = 302 if status_code == 0
+    }
+    if status_code == 0 && headers.get("Content-Type") == "" {
+      rw.write_header!(500)
+      printf("cgi: missing required Content-Type in headers")
+      return
+    }
+    status_code = 200 if status_code == 0
+    for k in headers.keys {
+      for v in headers.values(k) {
+        rw.header.add!(k, v)
+      }
+    }
+    rw.write_header!(status_code)
+    if pos < text.size {
+      r = rw.write!(text[pos...text.size].bytes.to_a)
+      printf("cgi: copy error: #{r.err.unwrap.message}") if r.err?
+    }
+  }
+
+  def handle_internal_redirect(rw: http.ResponseWriter, req: http.Request, p: Str, f: (http.ResponseWriter, http.Request) -> Unit) {
+    base = nurl.parse(req.url)
+    ref = nurl.parse(p)
+    if base.err? || ref.err? {
+      rw.write_header!(500)
+      printf("cgi: error resolving local URI path #{strconv.quote(p)}")
+      return
+    }
+    u = base.unwrap.resolve_reference(ref.unwrap)
+    pv: Map[Str, Str] = {}
+    b: [Byte] = []
+    nr = http.Request.new(method: "GET", url: u.to_s, path: u.path, raw_query: u.raw_query, proto: "HTTP/1.1", host: u.host, header: http.new_header, body: b, remote_addr: req.remote_addr, pathvals: pv)
+    f(rw, nr)
+  }
+}
+
+# A Handler for the program at `path`.
+pub def new_handler(path: Str) -> Handler {
+  e: [Str] = []
+  Handler.new(path: path, root: "", dir: "", env: e, inherit_env: e, args: e, stderr: none, logger: none, path_location_handler: none)
+}
+
+# The digits after a trailing ":" of host ("" if none; Go's trailingPort
+# regexp `:([0-9]+)$`).
+def trailing_port(host: Str) -> Str {
+  i = host.size
+  while i > 0 && host[i - 1] >= 48 && host[i - 1] <= 57 {
+    i -= 1
+  }
+  return "" if i == host.size || i == 0 || host[i - 1] != 58
+  host[i...host.size]
+}
+
+# A header name as a CGI variable: upper case, "-" and "=" as "_".
+def env_key(k: Str) -> Str {
+  b = k.bytes.to_a
+  i = 0
+  while i < b.size {
+    c = b[i]
+    if c >= 97 && c <= 122 {
+      b[i] = c - 32
+    } else if c == 45 || c == 61 {
+      b[i] = 95
+    }
+    i += 1
+  }
+  Str.from_bytes(b)
+}
+
+# env without the entries a later entry of the same key overrides.
+def remove_leading_duplicates(env: [Str]) -> [Str] {
+  out: [Str] = []
+  i = 0
+  while i < env.size {
+    e = env[i]
+    found = false
+    eq = strings.index_byte(e, 61)
+    if eq >= 0 {
+      keq = e[0...eq + 1]
+      j = i + 1
+      while j < env.size {
+        if strings.has_prefix(env[j], keq) {
+          found = true
+          break
+        }
+        j += 1
+      }
+    }
+    out << e unless found
+    i += 1
+  }
+  out
+}

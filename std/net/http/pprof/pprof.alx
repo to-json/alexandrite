@@ -1,0 +1,267 @@
+# Package pprof: Go's net/http/pprof handler surface, over what an alx
+# program can report about itself.
+#
+#   mux = http.new_serve_mux
+#   pprof.register(mux)          # Go: the package's init on DefaultServeMux
+#   # GET /debug/pprof/           index of the profiles
+#   # GET /debug/pprof/heap       region memory held now and at the peak
+#   # GET /debug/pprof/rusage     CPU time, peak RSS, faults, context switches
+#
+#   Go                                  alx
+#   Index, Cmdline, Profile,            index, cmdline, profile, symbol, trace
+#   Symbol, Trace (HandlerFuncs)        ((ResponseWriter, Request) -> Unit)
+#   Handler(name) http.Handler          handler(name) -> ProfileHandler (an http.Handler)
+#   init: http.HandleFunc(...)          register(mux)
+#
+# THE GAP: alx has no Go runtime and no sampling profiler. There are no
+# stack samples, no CPU profile, no execution trace, no goroutine, mutex,
+# block, allocs or threadcreate profiles, and no program-counter symbols.
+# What the runtime can report is served instead, as text:
+#  - "heap": the bytes the region allocator holds now and the most it has
+#    held (alx_mem_held / alx_mem_peak in the runtime). No per-allocation
+#    samples: memory lives in regions, not in individually traced objects
+#    (see `alx explain mem` for where allocations go).
+#  - "rusage": getrusage(2) of the process: user and system CPU time, peak
+#    resident set size, page faults, context switches.
+# Go's profile names that alx can't produce answer 501 Not Implemented with
+# an explanation (`profile`, `trace` and the runtime/pprof profiles); other
+# unknown names answer 404 "Unknown profile", as in Go.
+#
+# Other differences from Go:
+#  - Bodies are text in every mode. With debug=0 the headers are Go's
+#    (application/octet-stream, an attachment named after the profile) but
+#    the body is the same text as debug=1, not a pprof protocol buffer: `go
+#    tool pprof` can't read it.
+#  - `seconds=N` on heap and rusage serves the difference between two
+#    snapshots N seconds apart ("<name>-delta"), as Go's delta profiles do.
+#  - `symbol` answers "num_symbols: 0" (no symbol table to look PCs up in).
+#  - `gc=1` is accepted and does nothing (no garbage collector).
+#  - The index shows a count of 0 for every profile (there are no records
+#    to count).
+#
+# Not translated: TestDescriptions (runtime/pprof's profile list),
+# TestDeltaProfile / TestDeltaProfileEmptyBase (parse mutex profiles in
+# pprof's protobuf format). TestHandlers is translated with alx's answers.
+
+import "html"
+import "net/http"
+import "os"
+import "strconv"
+import "strings"
+
+extern def alx_mem_held -> Int
+extern def alx_mem_peak -> Int
+extern def alx_sleep_ns(ns: Int)
+extern def c_getrusage(who: I32, buf: [Byte]) -> I32 = "getrusage"
+extern def c_uname(buf: [Byte]) -> I32 = "uname"
+
+# The profiles alx serves, with their descriptions.
+def profiles -> [(Str, Str)] {
+  [
+    ("heap", "Bytes of memory the region allocator holds now and the most it has held. Memory lives in regions, so there are no per-allocation samples."),
+    ("rusage", "Resource usage of the process (getrusage): CPU time, peak resident set size, page faults and context switches.")
+  ]
+}
+
+# Go's profiles alx can't produce.
+def unsupported -> [Str] {
+  ["allocs", "block", "goroutine", "goroutineleak", "mutex", "threadcreate"]
+}
+
+def descriptions -> Map[Str, Str] {
+  d: Map[Str, Str] = {}
+  for p in profiles() { d[p[0]] = p[1] }
+  d["cmdline"] = "The command line invocation of the current program"
+  d["profile"] = "CPU profile: not available in alx (no sampling profiler); answers 501."
+  d["symbol"] = "Maps given program counters to function names: alx has no symbol table to look them up in, so it reports none."
+  d["trace"] = "A trace of execution of the current program: not available in alx (no execution tracer); answers 501."
+  d
+}
+
+def le64(b: [Byte], off: Int) -> Int {
+  v = 0
+  i = 7
+  while i >= 0 {
+    v = (v << 8) | b[off + i].to_i
+    i -= 1
+  }
+  v
+}
+
+def darwin? -> Bool {
+  buf: [Byte] = [0; 4096]
+  return false if c_uname(buf) != 0
+  n = 0
+  while n < buf.size && buf[n] != 0 {
+    n += 1
+  }
+  Str.from_bytes(buf[0...n]) == "Darwin"
+}
+
+# The named values of a profile, in order.
+def snapshot(name: Str) -> [(Str, Int)] {
+  if name == "heap" {
+    return [("HeldBytes", alx_mem_held), ("PeakHeldBytes", alx_mem_peak)]
+  }
+  # struct rusage: two timevals (16 bytes each on 64-bit systems), then
+  # longs: maxrss, ixrss, idrss, isrss, minflt, majflt, nswap, inblock,
+  # oublock, msgsnd, msgrcv, nsignals, nvcsw, nivcsw.
+  b: [Byte] = [0; 256]
+  c_getrusage(0.to_i32, b)
+  user = le64(b, 0) * 1000000000 + le64(b, 8) * 1000
+  sys = le64(b, 16) * 1000000000 + le64(b, 24) * 1000
+  rss = le64(b, 32)
+  rss = rss * 1024 unless darwin?()
+  [("UserNs", user), ("SysNs", sys), ("MaxRSSBytes", rss), ("MinorFaults", le64(b, 64)), ("MajorFaults", le64(b, 72)), ("VoluntaryCtxSwitches", le64(b, 128)), ("InvoluntaryCtxSwitches", le64(b, 136))]
+}
+
+def render(name: Str, vals: [(Str, Int)], delta: Bool) -> Str {
+  b = strings.new_builder
+  b.write!("alx #{name} profile#{delta ? " (delta)" : ""}\n")
+  for v in vals {
+    b.write!("# #{v[0]} = #{v[1]}\n")
+  }
+  b.to_s
+}
+
+def serve_error(w: http.ResponseWriter, status: Int, txt: Str) {
+  w.header.set!("Content-Type", "text/plain; charset=utf-8")
+  w.header.set!("X-Go-Pprof", "1")
+  w.header.del!("Content-Disposition")
+  w.write_header!(status)
+  w.write_string!(txt + "\n")
+  return
+}
+
+def form(r: http.Request, key: Str) -> Str {
+  r.form_value(key) || ""
+}
+
+# The command line, arguments separated by NUL bytes.
+pub def cmdline(w: http.ResponseWriter, r: http.Request) {
+  w.header.set!("X-Content-Type-Options", "nosniff")
+  w.header.set!("Content-Type", "text/plain; charset=utf-8")
+  w.write_string!(strings.join(os.args, "\u0000"))
+  return
+}
+
+# Go's CPU profile: not available (501).
+pub def profile(w: http.ResponseWriter, r: http.Request) {
+  w.header.set!("X-Content-Type-Options", "nosniff")
+  serve_error(w, 501, "Could not enable CPU profiling: alx has no CPU profiler")
+}
+
+# Go's execution trace: not available (501).
+pub def trace(w: http.ResponseWriter, r: http.Request) {
+  w.header.set!("X-Content-Type-Options", "nosniff")
+  serve_error(w, 501, "Could not enable tracing: alx has no execution tracer")
+}
+
+# Program-counter lookup: alx has no symbol table, so none resolve.
+pub def symbol(w: http.ResponseWriter, r: http.Request) {
+  w.header.set!("X-Content-Type-Options", "nosniff")
+  w.header.set!("Content-Type", "text/plain; charset=utf-8")
+  w.write_string!("num_symbols: 0\n")
+  return
+}
+
+# Serves the profile `name` (Go's Handler(name)).
+pub struct ProfileHandler {
+  name: Str
+
+  pub def serve_http(w: http.ResponseWriter, r: http.Request) {
+    serve_profile(name, w, r)
+  }
+}
+
+pub def handler(name: Str) -> ProfileHandler {
+  ProfileHandler.new(name: name)
+}
+
+def serve_profile(name: Str, w: http.ResponseWriter, r: http.Request) {
+  w.header.set!("X-Content-Type-Options", "nosniff")
+  known = false
+  for p in profiles() { known = true if p[0] == name }
+  if !known {
+    if unsupported().include?(name) {
+      serve_error(w, 501, "Profile #{name} is not available in alx (no Go runtime profiler)")
+    } else {
+      serve_error(w, 404, "Unknown profile")
+    }
+    return
+  }
+  debug = strconv.atoi(form(r, "debug")).unwrap_or(0)
+  sec_str = form(r, "seconds")
+  if sec_str.size > 0 {
+    sec = strconv.parse_int(sec_str, 10, 64).unwrap_or(0)
+    if sec <= 0 {
+      serve_error(w, 400, "invalid value for \"seconds\" - must be a positive integer")
+      return
+    }
+    if debug != 0 {
+      serve_error(w, 400, "seconds and debug params are incompatible")
+      return
+    }
+    p0 = snapshot(name)
+    alx_sleep_ns(sec * 1000000000)
+    p1 = snapshot(name)
+    d: [(Str, Int)] = []
+    i = 0
+    while i < p1.size {
+      d << (p1[i][0], p1[i][1] - p0[i][1])
+      i += 1
+    }
+    w.header.set!("Content-Type", "application/octet-stream")
+    w.header.set!("Content-Disposition", "attachment; filename=\"#{name}-delta\"")
+    w.write_string!(render(name, d, true))
+    return
+  }
+  if debug != 0 {
+    w.header.set!("Content-Type", "text/plain; charset=utf-8")
+  } else {
+    w.header.set!("Content-Type", "application/octet-stream")
+    w.header.set!("Content-Disposition", "attachment; filename=\"#{name}\"")
+  }
+  w.write_string!(render(name, snapshot(name), false))
+  return
+}
+
+# The index page, or the profile named after "/debug/pprof/" in the path.
+pub def index(w: http.ResponseWriter, r: http.Request) {
+  if r.path.start_with?("/debug/pprof/") {
+    name = r.path["/debug/pprof/".size...r.path.size]
+    if name.size > 0 {
+      serve_profile(name, w, r)
+      return
+    }
+  }
+  w.header.set!("X-Content-Type-Options", "nosniff")
+  w.header.set!("Content-Type", "text/html; charset=utf-8")
+  names: [Str] = []
+  for p in profiles() { names << p[0] }
+  for p in ["cmdline", "profile", "symbol", "trace"] { names << p }
+  names = names.sort
+  desc = descriptions()
+  b = strings.new_builder
+  b.write!("<html>\n<head>\n<title>/debug/pprof/</title>\n<style>\n.profile-name{\n\tdisplay:inline-block;\n\twidth:6rem;\n}\n</style>\n</head>\n<body>\n/debug/pprof/\n<br>\n<p>Set debug=1 as a query parameter to export in legacy text format</p>\n<br>\nTypes of profiles available:\n<table>\n<thead><td>Count</td><td>Profile</td></thead>\n")
+  for n in names {
+    b.write!("<tr><td>0</td><td><a href='#{n}?debug=1'>#{html.escape_string(n)}</a></td></tr>\n")
+  }
+  b.write!("</table>\n<br>\n<p>\nProfile Descriptions:\n<ul>\n")
+  for n in names {
+    b.write!("<li><div class=profile-name>#{html.escape_string(n)}: </div> #{html.escape_string(desc[n] || "")}</li>\n")
+  }
+  b.write!("</ul>\n</p>\n</body>\n</html>")
+  w.write_string!(b.to_s)
+  return
+}
+
+# Registers the handlers under "GET /debug/pprof/" (Go's init does this on
+# http.DefaultServeMux).
+pub def register(mux: http.ServeMux) {
+  mux.handle_func("GET /debug/pprof/", index)
+  mux.handle_func("GET /debug/pprof/cmdline", cmdline)
+  mux.handle_func("GET /debug/pprof/profile", profile)
+  mux.handle_func("GET /debug/pprof/symbol", symbol)
+  mux.handle_func("GET /debug/pprof/trace", trace)
+}

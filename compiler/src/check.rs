@@ -3071,6 +3071,15 @@ impl<'w, 'a> FnCx<'w, 'a> {
 
     /// Two T? are equal if both are absent or both hold equal values.
     fn opt_eq(&mut self, a: TExpr, b: TExpr, sp: Span) -> R<TExpr> {
+        // `x == none`: only presence matters (the value type needn't have ==).
+        if matches!(b.kind, TK::None) || matches!(a.kind, TK::None) {
+            let (x, _) = if matches!(b.kind, TK::None) { (a, b) } else { (b, a) };
+            let ot = x.ty.clone();
+            let (id, s1) = self.opt_tmp(x, sp);
+            let p = self.opt_present(id, &ot, sp);
+            let e = self.mk(TK::Not(Box::new(p)), Ty::Bool, sp);
+            return Ok(self.mk(TK::Seq(vec![s1, TStmt::Expr(e)]), Ty::Bool, sp));
+        }
         let ot = a.ty.clone();
         let (aid, s1) = self.opt_tmp(a, sp);
         let (bid, s2) = self.opt_tmp(b, sp);
@@ -4325,7 +4334,9 @@ impl<'w, 'a> FnCx<'w, 'a> {
                 let (bid, s2) = self.opt_tmp(b.clone(), sp);
                 let la = self.mk(TK::Local(aid), a.ty.clone(), sp);
                 let lb = self.mk(TK::Local(bid), b.ty.clone(), sp);
-                let eq = self.binary(BinOp::Eq, la.clone(), lb.clone(), sp)?;
+                // Against a literal `none`, only presence is compared.
+                let rhs = if matches!(b.kind, TK::None) { b.clone() } else { lb.clone() };
+                let eq = self.binary(BinOp::Eq, la.clone(), rhs, sp)?;
                 let mut vals = vec![];
                 for (v, x) in [(la, &args[0]), (lb, &args[1])] {
                     let v = self.show_value(v)?;

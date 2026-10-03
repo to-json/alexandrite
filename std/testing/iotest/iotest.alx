@@ -1,0 +1,331 @@
+# Package iotest: Go's testing/iotest — readers and writers for testing.
+#
+#   Go                                      alx
+#   OneByteReader(r)                        one_byte_reader(r) -> OneByteReader[R]
+#   HalfReader(r)                           half_reader(r) -> HalfReader[R]
+#   DataErrReader(r)                        data_err_reader(r) -> DataErrReader[R]
+#   TimeoutReader(r)                        timeout_reader(r) -> TimeoutReader[R]
+#   ErrReader(err)                          err_reader(err) -> ErrReader
+#   TruncateWriter(w, n)                    truncate_writer(w, n) -> TruncateWriter[W]
+#   NewReadLogger(prefix, r)                new_read_logger(prefix, r) -> ReadLogger[R, os.File]
+#   NewWriteLogger(prefix, w)               new_write_logger(prefix, w) -> WriteLogger[W, os.File]
+#   ErrTimeout                              IotestError.Timeout
+#   TestReader(r, content) error            test_reader(r, content) -> ~Unit,
+#                                           test_read_seeker(r, content) -> ~Unit
+#
+# Differences from Go:
+#  - The wrappers are generic over what they wrap (an alx interface value
+#    contains its implementors, so a type can't both hold an io.Reader and
+#    be one); they are io.Readers / io.Writers themselves and share their
+#    state across copies (D36): make them with the constructors.
+#  - End of input is `read!` returning 0 (io's shape), so there is no
+#    "data together with EOF" for DataErrReader to produce: it reads its
+#    source in 1024-byte chunks and hands them out, ending with a 0 read
+#    (Go's reader returns the last data with io.EOF).
+#  - The loggers log with `log.Printf` in Go, through the standard logger
+#    that tests redirect. alexandrite has no mutable standard logger, so
+#    `new_read_logger_to(prefix, r, logger)` / `new_write_logger_to` take the
+#    log.Logger to use; the plain constructors log to log.default (stderr).
+#  - TestReader asks the reader at run time whether it is also an
+#    io.Seeker or io.ReaderAt; there are no type assertions, so the seek
+#    checks are `test_read_seeker` and io.ReaderAt isn't checked.
+#    Failures are `IotestError.Failed(msg)` with Go's message text.
+
+import "bytes"
+import "encoding/hex"
+import "io"
+import "log"
+import "os"
+import "strconv"
+
+pub error IotestError {
+  # Go's ErrTimeout: the second read of a TimeoutReader.
+  Timeout
+  # A test_reader check failed.
+  Failed(msg: Str)
+
+  def message -> Str {
+    case self {
+      Timeout => "timeout"
+      Failed(msg) => msg
+    }
+  }
+}
+
+# Reads one byte per read! from R (Go's OneByteReader).
+pub struct OneByteReader[R] {
+  st: [R]
+
+  pub def read!(p: [Byte]) -> ~Int {
+    return 0 if p.size == 0
+    self.st[0].~read!(p[0...1])
+  }
+}
+
+pub def one_byte_reader[R](r: R) -> OneByteReader[R] {
+  OneByteReader[R].new(st: [r])
+}
+
+# Reads half as many bytes as asked for (rounded up) (Go's HalfReader).
+pub struct HalfReader[R] {
+  st: [R]
+
+  pub def read!(p: [Byte]) -> ~Int {
+    self.st[0].~read!(p[0...(p.size + 1) / 2])
+  }
+}
+
+pub def half_reader[R](r: R) -> HalfReader[R] {
+  HalfReader[R].new(st: [r])
+}
+
+struct DataErrState[R] {
+  r: R
+  unread: [Byte]
+  data: [Byte]
+}
+
+# Go's DataErrReader: reads its source in chunks (see the header).
+pub struct DataErrReader[R] {
+  st: [DataErrState[R]]
+
+  pub def read!(p: [Byte]) -> ~Int {
+    if st[0].unread.size == 0 {
+      n = self.st[0].r.~read!(self.st[0].data)
+      self.st[0].unread = st[0].data[0...n]
+    }
+    u = st[0].unread
+    n = u.size < p.size ? u.size : p.size
+    copy(p, u[0...n])
+    self.st[0].unread = u[n...u.size]
+    n
+  }
+}
+
+pub def data_err_reader[R](r: R) -> DataErrReader[R] {
+  e: [Byte] = []
+  d: [Byte] = [0; 1024]
+  DataErrReader[R].new(st: [DataErrState[R].new(r: r, unread: e, data: d)])
+}
+
+struct TimeoutState[R] {
+  r: R
+  count: Int
+}
+
+# Fails with IotestError.Timeout on the second read, with no data;
+# later reads succeed (Go's TimeoutReader).
+pub struct TimeoutReader[R] {
+  st: [TimeoutState[R]]
+
+  pub def read!(p: [Byte]) -> ~Int {
+    self.st[0].count += 1
+    fail IotestError.Timeout if st[0].count == 2
+    self.st[0].r.~read!(p)
+  }
+}
+
+pub def timeout_reader[R](r: R) -> TimeoutReader[R] {
+  TimeoutReader[R].new(st: [TimeoutState[R].new(r: r, count: 0)])
+}
+
+# Fails every read with err (Go's ErrReader).
+pub struct ErrReader {
+  err: Error
+
+  pub def read!(p: [Byte]) -> ~Int {
+    fail err
+  }
+}
+
+pub def err_reader(err: Error) -> ErrReader {
+  ErrReader.new(err: err)
+}
+
+struct TruncateState[W] {
+  w: W
+  n: Int
+}
+
+# Writes to W, but stops silently after n bytes (Go's TruncateWriter).
+pub struct TruncateWriter[W] {
+  st: [TruncateState[W]]
+
+  pub def write!(p: [Byte]) -> ~Int {
+    return p.size if st[0].n <= 0
+    n = p.size
+    n = st[0].n if n > st[0].n
+    m = self.st[0].w.~write!(p[0...n])
+    self.st[0].n -= m
+    p.size
+  }
+}
+
+pub def truncate_writer[W](w: W, n: Int) -> TruncateWriter[W] {
+  TruncateWriter[W].new(st: [TruncateState[W].new(w: w, n: n)])
+}
+
+struct LoggerState[T, W] {
+  prefix: Str
+  inner: T
+  log: log.Logger[W]
+}
+
+# Logs each read (`prefix hex` or `prefix hex: error`) and passes it on
+# (Go's NewReadLogger).
+pub struct ReadLogger[R, W] {
+  st: [LoggerState[R, W]]
+
+  def inner_read!(p: [Byte]) -> ~Int { self.st[0].inner.~read!(p) }
+
+  pub def read!(p: [Byte]) -> ~Int {
+    r = inner_read!(p)
+    l = st[0].log
+    if e = r.err {
+      l.printf("#{st[0].prefix} : #{e.message}")
+      fail e
+    }
+    n = r.unwrap
+    l.printf("#{st[0].prefix} #{hex.encode_to_string(p[0...n])}")
+    n
+  }
+}
+
+# Logs each write and passes it on (Go's NewWriteLogger).
+pub struct WriteLogger[W, LW] {
+  st: [LoggerState[W, LW]]
+
+  def inner_write!(p: [Byte]) -> ~Int { self.st[0].inner.~write!(p) }
+
+  pub def write!(p: [Byte]) -> ~Int {
+    r = inner_write!(p)
+    l = st[0].log
+    if e = r.err {
+      l.printf("#{st[0].prefix} : #{e.message}")
+      fail e
+    }
+    n = r.unwrap
+    l.printf("#{st[0].prefix} #{hex.encode_to_string(p[0...n])}")
+    n
+  }
+}
+
+pub def new_read_logger[R](prefix: Str, r: R) -> ReadLogger[R, os.File] {
+  new_read_logger_to(prefix, r, log.default)
+}
+
+pub def new_write_logger[W](prefix: Str, w: W) -> WriteLogger[W, os.File] {
+  new_write_logger_to(prefix, w, log.default)
+}
+
+# A ReadLogger logging to l (an addition: see the header).
+pub def new_read_logger_to[R, LW](prefix: Str, r: R, l: log.Logger[LW]) -> ReadLogger[R, LW] {
+  ReadLogger[R, LW].new(st: [LoggerState[R, LW].new(prefix: prefix, inner: r, log: l)])
+}
+
+pub def new_write_logger_to[W, LW](prefix: Str, w: W, l: log.Logger[LW]) -> WriteLogger[W, LW] {
+  WriteLogger[W, LW].new(st: [LoggerState[W, LW].new(prefix: prefix, inner: w, log: l)])
+}
+
+# ----------------------------------------------------------------- TestReader
+
+# Go's io.ReadAll(&smallByteReader{r}): reads 1, 2, 3, 1, 2, 3, ... bytes at
+# a time, naming the offset in errors.
+def read_small[R](r: R) -> ~[Byte] {
+  out: [Byte] = []
+  buf: [Byte] = [0; 3]
+  k = 0
+  off = 0
+  loop {
+    k = k % 3 + 1
+    res = rd(r, buf[0...k])
+    if e = res.err {
+      fail IotestError.Failed("Read(#{k} bytes at offset #{off}): #{e.message}")
+    }
+    n = res.unwrap
+    break if n == 0
+    out = out + buf[0...n]
+    off += n
+  }
+  out
+}
+
+# A read! or seek! through a copy (which shares the state), as a Result.
+def rd[R](r: R, p: [Byte]) -> ~Int {
+  x = r
+  x.~read!(p)
+}
+
+def sk[R](r: R, off: Int, whence: Int) -> ~Int {
+  x = r
+  x.~seek!(off, whence)
+}
+
+# io.read_all for any reader type (an io.Reader value can't hold a
+# SmallByteReader of an interface value).
+def read_all[R](r: R) -> ~[Byte] {
+  out: [Byte] = []
+  chunk: [Byte] = [0; 512]
+  loop {
+    n = ~rd(r, chunk)
+    break if n == 0
+    out = out + chunk[0...n]
+  }
+  out
+}
+
+def quote(b: [Byte]) -> Str {
+  strconv.quote(Str.from_bytes(b))
+}
+
+def check(ok: Bool, msg: Str) -> ~Unit {
+  fail IotestError.Failed(msg) if !ok
+}
+
+# Go's TestReader: reading r gives exactly content, in small pieces, then
+# 0 at the end; a read into an empty slice returns 0.
+pub def test_reader[R](r: R, content: [Byte]) -> ~Unit {
+  src = r
+  if content.size > 0 {
+    e: [Byte] = []
+    n0 = rd(src, e)
+    ~check(n0.ok == 0, "Read(0) = #{n0.ok || -1}, want 0, nil")
+  }
+  data = ~read_small(src)
+  ~check(data == content, "ReadAll(small amounts) = #{quote(data)}\n\twant #{quote(content)}")
+  buf: [Byte] = [0; 10]
+  n = rd(src, buf)
+  ~check(n.ok == 0, "Read(10) at EOF = #{n.ok || -1}, want 0, EOF")
+}
+
+# test_reader, then Go's io.Seeker checks (seek! with whence 0, 1, 2).
+pub def test_read_seeker[R](r: R, content: [Byte]) -> ~Unit {
+  ~test_reader(r, content)
+  src = r
+  size = content.size
+  off = sk(src, 0, 1)
+  ~check(off.ok == size, "Seek(0, 1) from EOF = #{off.ok || -1}, want #{size}, nil")
+  middle = size - size / 3
+  if middle > 0 {
+    o1 = sk(src, -1, 1)
+    ~check(o1.ok == size - 1, "Seek(-1, 1) from EOF = #{o1.ok || -1}, want #{size - 1}, nil")
+    o2 = sk(src, -size / 3, 1)
+    ~check(o2.ok == middle - 1, "Seek(#{-size / 3}, 1) from #{size - 1} = #{o2.ok || -1}, want #{middle - 1}, nil")
+    o3 = sk(src, 1, 1)
+    ~check(o3.ok == middle, "Seek(+1, 1) from #{middle - 1} = #{o3.ok || -1}, want #{middle}, nil")
+  }
+  o4 = sk(src, 0, 1)
+  ~check(o4.ok == middle, "Seek(0, 1) from #{middle} = #{o4.ok || -1}, want #{middle}, nil")
+  d1 = ~read_small(src)
+  ~check(d1 == content[middle...size], "ReadAll from offset #{middle} = #{quote(d1)}\n\twant #{quote(content[middle...size])}")
+  o5 = sk(src, middle / 2, 0)
+  ~check(o5.ok == middle / 2, "Seek(#{middle / 2}, 0) from EOF = #{o5.ok || -1}, want #{middle / 2}, nil")
+  o6 = sk(src, -size / 3, 2)
+  ~check(o6.ok == middle, "Seek(#{-size / 3}, 2) from #{middle / 2} = #{o6.ok || -1}, want #{middle}, nil")
+  d2 = ~read_small(src)
+  ~check(d2 == content[middle...size], "ReadAll from offset #{middle} = #{quote(d2)}\n\twant #{quote(content[middle...size])}")
+  o7 = sk(src, middle / 2, 0)
+  ~check(o7.ok == middle / 2, "Seek(#{middle / 2}, 0) from EOF = #{o7.ok || -1}, want #{middle / 2}, nil")
+  d3 = ~read_all(src)
+  ~check(d3 == content[middle / 2...size], "ReadAll from offset #{middle / 2} = #{quote(d3)}\n\twant #{quote(content[middle / 2...size])}")
+}

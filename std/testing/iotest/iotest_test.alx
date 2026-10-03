@@ -1,0 +1,227 @@
+# Go's testing/iotest tests (reader_test.go, writer_test.go,
+# logger_test.go, example_test.go), translated. Go's io.EOF is a 0 read.
+import "bytes"
+import "errors"
+import "io"
+import "log"
+import "strconv"
+
+def buf_of(s: Str) -> bytes.Buffer {
+  bytes.new_buffer_string(s)
+}
+
+# Reads r with p until a 0 read or an error; every read must return `each`
+# bytes (0: any). Returns what was read and the error, if any.
+def drain[R](r: R, p: [Byte], each: Int) -> (Str, Error?) {
+  src = r
+  got: [Byte] = []
+  loop {
+    n = src.read!(p)
+    if e = n.err {
+      return (Str.from_bytes(got), e)
+    }
+    k = n.unwrap
+    break if k == 0
+    assert k == each || each == 0, "read #{k} bytes, want #{each}"
+    got = got + p[0...k]
+  }
+  (Str.from_bytes(got), none)
+}
+
+test "one byte reader non-empty" {
+  obr = one_byte_reader(buf_of("Hello, World!"))
+  e: [Byte] = []
+  assert_eq ~obr.read!(e), 0
+  got, err = drain(obr, [0; 3], 1)
+  assert_eq err, none
+  assert_eq got, "Hello, World!"
+}
+
+test "one byte reader empty" {
+  obr = one_byte_reader(buf_of(""))
+  e: [Byte] = []
+  assert_eq ~obr.read!(e), 0
+  b: [Byte] = [0; 5]
+  assert_eq ~obr.read!(b), 0
+}
+
+test "half reader non-empty" {
+  hr = half_reader(buf_of("Hello, World!"))
+  e: [Byte] = []
+  assert_eq ~hr.read!(e), 0
+  got, err = drain(hr, [0; 2], 1)
+  assert_eq err, none
+  assert_eq got, "Hello, World!"
+}
+
+test "half reader empty" {
+  hr = half_reader(buf_of(""))
+  e: [Byte] = []
+  assert_eq ~hr.read!(e), 0
+  b: [Byte] = [0; 5]
+  assert_eq ~hr.read!(b), 0
+}
+
+def timed_out?(r: ~Int) -> Bool {
+  if e = r.err {
+    return e.message == "timeout"
+  }
+  false
+}
+
+test "timeout reader non-empty" {
+  buf = buf_of("Hello, World!")
+  tor = timeout_reader(buf)
+  e: [Byte] = []
+  assert_eq ~tor.read!(e), 0
+  assert timed_out?(tor.read!(e)), "second read should time out"
+  tor2 = timeout_reader(buf)
+  b: [Byte] = [0; 3]
+  assert ~tor2.read!(b) > 0
+  assert timed_out?(tor2.read!(b))
+  # Later reads go on.
+  assert_eq ~tor2.read!(b), 3
+}
+
+test "timeout reader empty" {
+  r = buf_of("")
+  tor = timeout_reader(r)
+  e: [Byte] = []
+  assert_eq ~tor.read!(e), 0
+  assert timed_out?(tor.read!(e))
+  tor2 = timeout_reader(r)
+  b: [Byte] = [0; 5]
+  assert_eq ~tor2.read!(b), 0
+  assert timed_out?(tor2.read!(b))
+}
+
+test "data err reader non-empty" {
+  der = data_err_reader(buf_of("Hello, World!"))
+  got, err = drain(der, [0; 3], 0)
+  assert_eq err, none
+  assert_eq got, "Hello, World!"
+}
+
+test "data err reader empty" {
+  der = data_err_reader(buf_of(""))
+  e: [Byte] = []
+  assert_eq ~der.read!(e), 0
+  b: [Byte] = [0; 5]
+  assert_eq ~der.read!(b), 0
+}
+
+test "err reader" {
+  for msg in ["io failure", "unexpected EOF"] {
+    r = err_reader(errors.new(msg))
+    e: [Byte] = []
+    n = r.read!(e)
+    assert_eq n.err.unwrap.message, msg
+  }
+}
+
+example "err reader" {
+  r = err_reader(errors.new("custom error"))
+  e: [Byte] = []
+  n = r.read!(e)
+  puts "n:   #{n.ok || 0}"
+  puts "err: #{strconv.quote(n.err.unwrap.message)}"
+} outputs "n:   0\nerr: \"custom error\"\n"
+
+# A seekable reader over a string (Go's strings.Reader, for TestStringsReader).
+struct SeekReader {
+  st: [(Str, Int)]
+
+  pub def read!(p: [Byte]) -> Int {
+    s, off = st[0]
+    n = s.size - off
+    n = p.size if p.size < n
+    copy(p, s.bytes.to_a[off...off + n])
+    self.st[0] = (s, off + n)
+    n
+  }
+
+  pub def seek!(offset: Int, whence: Int) -> ~Int {
+    s, off = st[0]
+    base = whence == 0 ? 0 : (whence == 1 ? off : s.size)
+    fail io.StreamError.InvalidArgument("negative position") if base + offset < 0
+    self.st[0] = (s, base + offset)
+    base + offset
+  }
+}
+
+test "strings reader" {
+  msg = "Now is the time for all good gophers."
+  ~test_reader(SeekReader.new(st: [(msg, 0)]), msg.bytes.to_a)
+  ~test_read_seeker(SeekReader.new(st: [(msg, 0)]), msg.bytes.to_a)
+  ~test_reader(buf_of(msg), msg.bytes.to_a)
+  ~test_reader(one_byte_reader(buf_of(msg)), msg.bytes.to_a)
+  # A reader that returns the wrong content fails.
+  r = test_reader(buf_of("abc"), "abd".bytes.to_a)
+  assert_eq r.err.unwrap.message, "ReadAll(small amounts) = \"abc\"\n\twant \"abd\""
+  r2 = test_reader(timeout_reader(buf_of("abcdef")), "abcdef".bytes.to_a)
+  assert_eq r2.err.unwrap.message, "Read(1 bytes at offset 0): timeout"
+}
+
+def truncate_writer_tests -> [(Str, Str, Int, Int)] {
+  [
+    ("hello", "", -1, 5),
+    ("world", "", 0, 5),
+    ("abcde", "abc", 3, 5),
+    ("edcba", "edcba", 7, 5),
+  ]
+}
+
+test "truncate writer" {
+  for input, want, trunc, n in truncate_writer_tests {
+    buf = bytes.new_buffer([])
+    tw = truncate_writer(buf, trunc)
+    assert_eq ~tw.write!(input.bytes.to_a), n
+    assert_eq buf.string, want
+  }
+}
+
+struct ErrWriter {
+  msg: Str
+
+  pub def write!(p: [Byte]) -> ~Int {
+    fail errors.new(msg)
+  }
+}
+
+def capture -> log.Logger[bytes.Buffer] {
+  log.new(bytes.new_buffer([]), "lw: ", 0)
+}
+
+test "write logger" {
+  out = capture
+  lw = bytes.new_buffer([])
+  wl = new_write_logger_to("write:", lw, out)
+  assert_eq ~wl.write!("Hello, World!".bytes.to_a), 13
+  assert_eq lw.string, "Hello, World!"
+  assert_eq out.writer.string, "lw: write: 48656c6c6f2c20576f726c6421\n"
+}
+
+test "write logger error on write" {
+  out = capture
+  wl = new_write_logger_to("write:", ErrWriter.new(msg: "Write Error!"), out)
+  assert wl.write!("Hello, World!".bytes.to_a).err?
+  assert_eq out.writer.string, "lw: write: : Write Error!\n"
+}
+
+test "read logger" {
+  out = capture
+  data = "Hello, World!"
+  rl = new_read_logger_to("read:", buf_of(data), out)
+  p: [Byte] = [0; 13]
+  assert_eq ~rl.read!(p), 13
+  assert_eq Str.from_bytes(p), data
+  assert_eq out.writer.string, "lw: read: 48656c6c6f2c20576f726c6421\n"
+}
+
+test "read logger error on read" {
+  out = capture
+  rl = new_read_logger_to("read:", err_reader(errors.new("io failure")), out)
+  p: [Byte] = [0; 13]
+  assert rl.read!(p).err?
+  assert_eq out.writer.string, "lw: read: : io failure\n"
+}

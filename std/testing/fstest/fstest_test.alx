@@ -1,0 +1,167 @@
+# Go's testing/fstest tests (mapfs_test.go, testfs_test.go), translated.
+import "io/fs"
+import "os"
+import "slices"
+import "strings"
+
+def m_of(pairs: [(Str, MapFile)]) -> MapFS {
+  files: Map[Str, MapFile] = {}
+  for k, v in pairs {
+    files[k] = v
+  }
+  map_fs(files)
+}
+
+def link(target: Str) -> MapFile {
+  MapFile.new(data: target.bytes.to_a, mode: fs.mode(fs.MODE_SYMLINK), mod_time: map_file([]).mod_time)
+}
+
+def with_mode(bits: U32) -> MapFile {
+  MapFile.new(data: [], mode: fs.mode(bits), mod_time: map_file([]).mod_time)
+}
+
+test "map fs" {
+  m = m_of([
+    ("hello", map_file_str("hello, world\n")),
+    ("fortune/k/ken.txt", map_file_str("If a program is too slow, it must have a loop.\n")),
+  ])
+  ~test_fs(m, ["hello", "fortune", "fortune/k", "fortune/k/ken.txt"])
+}
+
+test "map fs chmod dot" {
+  m = m_of([("a/b.txt", with_mode(0o666)), (".", with_mode(0o777 | fs.MODE_DIR))])
+  out = ""
+  ~fs.walk_dir(m, ".") { |p, d, err|
+    fi = ~d.unwrap.info
+    out += "#{p}: #{fi.mode.to_s}\n"
+  }
+  assert_eq out, ".: drwxrwxrwx\na: dr-xr-xr-x\na/b.txt: -rw-rw-rw-\n"
+}
+
+test "map fs file info name" {
+  m = m_of([("path/to/b.txt", map_file([]))])
+  info = ~m.stat("path/to/b.txt")
+  assert_eq info.name, "b.txt"
+}
+
+test "map fs symlink" {
+  content = "If a program is too slow, it must have a loop.\n"
+  m = m_of([
+    ("fortune/k/ken.txt", map_file_str(content)),
+    ("dirlink", link("fortune/k")),
+    ("linklink", link("dirlink")),
+    ("ken.txt", link("dirlink/ken.txt")),
+  ])
+  ~test_fs(m, ["fortune/k/ken.txt", "dirlink", "ken.txt", "linklink"])
+  assert_eq Str.from_bytes(~fs.read_file(m, "ken.txt")), content
+  assert_eq ~fs.read_link(m, "dirlink"), "fortune/k"
+  li = ~fs.lstat(m, "dirlink")
+  assert_eq li.name, "dirlink"
+  assert_eq li.mode, fs.mode(fs.MODE_SYMLINK)
+  si = ~fs.stat(m, "dirlink")
+  assert_eq si.name, "dirlink"
+  assert_eq si.mode, fs.mode(fs.MODE_DIR | 0o555)
+  li2 = ~fs.lstat(m, "linklink")
+  assert_eq li2.name, "linklink"
+  assert_eq li2.mode, fs.mode(fs.MODE_SYMLINK)
+  si2 = ~fs.stat(m, "linklink")
+  assert_eq si2.name, "linklink"
+  assert_eq si2.mode, fs.mode(fs.MODE_DIR | 0o555)
+  # Not a link.
+  r = fs.read_link(m, "fortune")
+  assert_eq r.err.unwrap.message, "readlink fortune: invalid argument"
+}
+
+test "symlink" {
+  tmp = ~os.mkdir_temp("", "fstest")
+  ~os.write_file(tmp + "/hello", "hello, world\n".bytes.to_a, 0o644)
+  ~os.symlink(tmp + "/hello", tmp + "/hello.link")
+  ~os.symlink("hello", tmp + "/hello_rel.link")
+  r = test_fs(fs.dir_fs(tmp), ["hello", "hello.link"])
+  ~os.remove_all(tmp)
+  ~r
+}
+
+test "dir fs tree" {
+  tmp = ~os.mkdir_temp("", "fstest")
+  ~os.mkdir_all(tmp + "/a/b", 0o755)
+  ~os.write_file(tmp + "/a/b/c.txt", "c".bytes.to_a, 0o644)
+  ~os.write_file(tmp + "/top", "".bytes.to_a, 0o600)
+  r = test_fs(fs.dir_fs(tmp), ["a", "a/b", "a/b/c.txt", "top"])
+  ~os.remove_all(tmp)
+  ~r
+}
+
+test "dash" {
+  m = m_of([("a-b/a", map_file_str("a-b/a"))])
+  ~test_fs(m, ["a-b/a"])
+}
+
+# Go's shuffledFS: directory reads in reverse order; TestFS doesn't care.
+# (Go wraps the File; a struct holding an fs.File value can't be one, so
+# this rebuilds the MapDir with its entries reversed.)
+struct ShuffledFS {
+  m: MapFS
+
+  pub def open(name: Str) -> ~fs.File {
+    f = m.~open(name)
+    info = f.~stat
+    return f if !info.is_dir
+    entries = f.~read_dir!(-1)
+    slices.sort_func(entries) { |a, b| strings.compare(b.name, a.name) }
+    MapDir.new(path: name, info: info, entries: entries, st: [0])
+  }
+}
+
+test "shuffled fs" {
+  m = m_of([("tmp/one", map_file_str("1")), ("tmp/two", map_file_str("2")), ("tmp/three", map_file_str("3"))])
+  ~test_fs(ShuffledFS.new(m: m), ["tmp/one", "tmp/two", "tmp/three"])
+}
+
+# Go's failPermFS: every open fails with ErrPermission.
+struct FailPermFS {
+  pub def open(name: Str) -> ~fs.File {
+    fail fs.path_error("open", name, "invalid argument") if !fs.valid_path?(name)
+    fail fs.path_error("open", name, "permission denied")
+  }
+}
+
+test "test fs wrapped errors" {
+  r = test_fs(FailPermFS.new, [])
+  e = r.err.unwrap
+  lines = e.message.lines
+  assert_eq lines[0], "TestFS found errors:"
+  assert lines.size > 1
+  for ln in lines[1...lines.size] {
+    assert ln.end_with?("permission denied"), ln
+  }
+}
+
+test "test fs finds problems" {
+  m = m_of([("a", map_file_str("x"))])
+  r = test_fs(m, ["a", "b"])
+  assert_eq r.err.unwrap.message, "TestFS found errors:\nexpected but not found: b"
+  r2 = test_fs(m, [])
+  assert_eq r2.err.unwrap.message, "TestFS found errors:\nexpected empty file system but found files:\na"
+  ~test_fs(m_of([]), [])
+}
+
+test "map file reads" {
+  m = m_of([("f", map_file_str("hello"))])
+  f = ~m.open("f")
+  buf: [Byte] = [0; 3]
+  assert_eq ~f.read!(buf), 3
+  assert_eq Str.from_bytes(buf), "hel"
+  assert_eq ~f.read!(buf), 2
+  assert_eq ~f.read!(buf), 0
+  d = ~m.open(".")
+  assert d.read!(buf).err?
+  assert_eq (~d.read_dir!(-1)).map { |e| e.name }.to_a, ["f"]
+  o = OpenMapFile.new(path: "f", info: ~m.stat("f"), data: "hello".bytes.to_a, st: [0])
+  assert_eq ~o.seek!(-2, 2), 3
+  assert_eq ~o.read_at(buf, 1), 3
+  assert_eq Str.from_bytes(buf), "ell"
+  assert o.seek!(9, 0).err?
+  assert_eq m.open("nope").err.unwrap.message, "open nope: file does not exist"
+  assert_eq m.open("../x").err.unwrap.message, "open ../x: file does not exist"
+}

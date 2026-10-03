@@ -1,0 +1,778 @@
+# Package fs: Go's io/fs — the interfaces to a file system, and functions
+# over any file system.
+#
+#   Go                                      alx
+#   FS (Open)                               interface FS: open(name) -> ~File, with default
+#                                             read_file, read_dir, stat, lstat, read_link, glob
+#   ReadFileFS / ReadDirFS / StatFS /       the same methods, defined by the implementation
+#     ReadLinkFS / GlobFS                     (they override FS's defaults)
+#   File, ReadDirFile                       interface File: stat, read!, close!,
+#                                             read_dir!(n) (default: fails "not implemented")
+#   FileInfo (interface)                    struct FileInfo: name, size, mode, mod_time, is_dir
+#   DirEntry (interface)                    struct DirEntry: name, is_dir, type, info
+#   FileMode (uint32) + ModeDir ...         struct FileMode (bits: U32): to_s, is_dir?,
+#                                             is_regular?, perm, type; MODE_DIR, ... (U32)
+#   ValidPath(name)                         valid_path?(name)
+#   ReadFile / ReadDir / Stat / Lstat /     read_file(fsys, name) / read_dir / stat / lstat /
+#     ReadLink / Glob / Sub / WalkDir         read_link / glob(fsys, pattern) / sub(fsys, dir) /
+#                                             walk_dir(fsys, root) { |path, d, err| ... }
+#   FileInfoToDirEntry / FormatFileInfo /   file_info_to_dir_entry(info) / format_file_info /
+#     FormatDirEntry                          format_dir_entry
+#   PathError{Op, Path, Err}                FsError.Path(at: PathFailure(op, path, err))
+#   ErrInvalid ErrPermission ErrExist       FsError.Invalid / Permission / Exist /
+#     ErrNotExist ErrClosed                   NotExist / Closed (+ is_not_exist(e), ...)
+#   SkipDir / SkipAll                       FsError.SkipDir / SkipAll
+#   os.DirFS(dir)                           dir_fs(dir) -> DirFS (here: see below)
+#
+# Differences from Go:
+#  - Go asks an FS for optional interfaces at run time (`fsys.(ReadFileFS)`).
+#    alexandrite has no type assertions: FS's optional methods are default
+#    methods of the FS interface instead. An implementation that defines
+#    `read_file` (or read_dir, stat, lstat, read_link, glob) is used, as Go
+#    uses ReadFileFS; one that doesn't gets the generic version over `open`.
+#    The package functions call the method, so `fs.read_file(fsys, n)` is
+#    `fsys.read_file(n)`.
+#  - The functions are generic over the file system type (`read_file[F]`),
+#    and `sub(fsys, dir)` returns a `SubFS[F]` (an alx interface value
+#    contains its implementors, so a type holding an FS value couldn't be
+#    one). Any FS works with them, including another SubFS.
+#  - FileInfo and DirEntry are structs, not interfaces (an implementation
+#    fills them in). `FileInfo.sys` doesn't exist. DirEntry carries the
+#    FileInfo it was made from (or none: then `info` fails with NotExist,
+#    the file having gone).
+#  - A Go error value with an identity becomes an FsError variant; a
+#    PathError's Err is its message text (`PathFailure.err`), compared by
+#    `is_not_exist(e)` etc. (Go's errors.Is). Messages are Go's
+#    ("open x: file does not exist").
+#  - `File.read!` returns 0 at the end (io's shape, GO-VS-RUBY F3), and
+#    `read_dir!(n)` with n > 0 returns an empty slice at the end of the
+#    directory instead of io.EOF.
+#  - Go's WalkDirFunc gets an error to report or filter; here the block gets
+#    `err: Error?` and returns `~Unit`: `fail FsError.SkipDir` skips a
+#    directory, `fail FsError.SkipAll` stops the walk, any other failure
+#    stops the walk and is returned.
+#  - os.DirFS lives here as `dir_fs` (os doesn't import io/fs), over the os
+#    package. Its FileInfo's mode is converted to Go's FileMode bits.
+
+import "io"
+import "os"
+import "path"
+import "slices"
+import "time"
+import "unicode/utf8"
+
+# ------------------------------------------------------------------- FileMode
+
+# The file type bits (Go's ModeDir ... ModeIrregular) and permissions.
+pub MODE_DIR: U32 = 1 << 31
+pub MODE_APPEND: U32 = 1 << 30
+pub MODE_EXCLUSIVE: U32 = 1 << 29
+pub MODE_TEMPORARY: U32 = 1 << 28
+pub MODE_SYMLINK: U32 = 1 << 27
+pub MODE_DEVICE: U32 = 1 << 26
+pub MODE_NAMED_PIPE: U32 = 1 << 25
+pub MODE_SOCKET: U32 = 1 << 24
+pub MODE_SETUID: U32 = 1 << 23
+pub MODE_SETGID: U32 = 1 << 22
+pub MODE_CHAR_DEVICE: U32 = 1 << 21
+pub MODE_STICKY: U32 = 1 << 20
+pub MODE_IRREGULAR: U32 = 1 << 19
+pub MODE_TYPE: U32 = 0x8f280000
+pub MODE_PERM: U32 = 0o777
+
+MODE_LETTERS = "dalTLDpSugct?"
+RWX = "rwxrwxrwx"
+
+# A file's mode and permission bits (Go's FileMode).
+pub struct FileMode {
+  bits: U32
+
+  # Go's String: type letters (`-` for none), then rwxrwxrwx.
+  pub def to_s -> Str {
+    out: [Byte] = []
+    i = 0
+    while i < MODE_LETTERS.size {
+      one: U32 = 1
+      out << MODE_LETTERS[i] if bits & (one << (31 - i).to_u32) != 0
+      i += 1
+    }
+    out << 45 if out.size == 0
+    i = 0
+    while i < 9 {
+      one: U32 = 1
+      out << (bits & (one << (8 - i).to_u32) != 0 ? RWX[i] : 45.to_u8)
+      i += 1
+    }
+    Str.from_bytes(out)
+  }
+  pub def string -> Str { self.to_s }
+
+  pub def is_dir? -> Bool { bits & MODE_DIR != 0 }
+  pub def is_regular? -> Bool { bits & MODE_TYPE == 0 }
+  pub def perm -> FileMode { FileMode.new(bits: bits & MODE_PERM) }
+  pub def type -> FileMode { FileMode.new(bits: bits & MODE_TYPE) }
+}
+
+# The FileMode with these bits.
+pub def mode(bits: U32) -> FileMode {
+  FileMode.new(bits: bits)
+}
+
+# ------------------------------------------------------------ FileInfo, entries
+
+# What a file system says about a file (Go's FileInfo).
+pub struct FileInfo {
+  name: Str
+  size: Int
+  mode: FileMode
+  mod_time: time.Time
+
+  pub def is_dir -> Bool { mode.is_dir? }
+  pub def to_s -> Str { format_file_info(self) }
+}
+
+# An entry read from a directory (Go's DirEntry): its name, its type bits
+# and the FileInfo it describes.
+pub struct DirEntry {
+  name: Str
+  typ: FileMode
+  fi: FileInfo?
+
+  pub def is_dir -> Bool { typ.is_dir? }
+  # The type bits of the entry's mode (Go's Type).
+  pub def type -> FileMode { typ }
+  # The entry's FileInfo; fails with NotExist if the file has gone.
+  pub def info -> ~FileInfo {
+    if i = fi {
+      return i
+    }
+    fail FsError.Path(PathFailure.new(op: "stat", path: name, err: ERR_NOT_EXIST))
+  }
+  pub def to_s -> Str { format_dir_entry(self) }
+}
+
+# A DirEntry for info (Go's FileInfoToDirEntry).
+pub def file_info_to_dir_entry(info: FileInfo) -> DirEntry {
+  DirEntry.new(name: info.name, typ: info.mode.type, fi: info)
+}
+
+# Go's FormatFileInfo: `-rw-r--r-- 100 1970-01-01 00:00:00 hello.go`.
+pub def format_file_info(info: FileInfo) -> Str {
+  out = info.mode.to_s + " " + info.size.to_s + " " + info.mod_time.format("2006-01-02 15:04:05") + " " + info.name
+  out += "/" if info.is_dir
+  out
+}
+
+# Go's FormatDirEntry: `d subdir/` or `- hello.go`.
+pub def format_dir_entry(d: DirEntry) -> Str {
+  m = d.type.to_s
+  out = m[0...m.size - 9] + " " + d.name
+  out += "/" if d.is_dir
+  out
+}
+
+# --------------------------------------------------------------------- errors
+
+ERR_INVALID = "invalid argument"
+ERR_PERMISSION = "permission denied"
+ERR_EXIST = "file already exists"
+ERR_NOT_EXIST = "file does not exist"
+ERR_CLOSED = "file already closed"
+
+# A failed operation on a path (Go's PathError): `err` is the underlying
+# error's message.
+pub struct PathFailure {
+  op: Str
+  path: Str
+  err: Str
+}
+
+pub error FsError {
+  # Go's *PathError: "op path: err".
+  Path(at: PathFailure)
+  # Go's ErrInvalid, ErrPermission, ErrExist, ErrNotExist, ErrClosed.
+  Invalid
+  Permission
+  Exist
+  NotExist
+  Closed
+  # Go's SkipDir / SkipAll, for walk_dir's block.
+  SkipDir
+  SkipAll
+
+  def message -> Str {
+    case self {
+      Path(at) => "#{at.op} #{at.path}: #{at.err}"
+      Invalid => ERR_INVALID
+      Permission => ERR_PERMISSION
+      Exist => ERR_EXIST
+      NotExist => ERR_NOT_EXIST
+      Closed => ERR_CLOSED
+      SkipDir => "skip this directory"
+      SkipAll => "skip everything and stop the walk"
+    }
+  }
+}
+
+# A PathError for op on name, with the message of err.
+pub def path_error(op: Str, name: Str, err: Str) -> FsError {
+  FsError.Path(PathFailure.new(op: op, path: name, err: err))
+}
+
+# The underlying message: a PathError's err, else the error's own.
+def cause_of(e: Error) -> Str {
+  return ERR_NOT_EXIST if os.is_not_exist(e)
+  return ERR_EXIST if os.is_exist(e)
+  return ERR_PERMISSION if os.is_permission(e)
+  case e {
+    FsError.Path(at) => at.err
+    _ => e.message
+  }
+}
+
+# Go's errors.Is(err, fs.ErrNotExist) and its siblings.
+pub def is_not_exist(e: Error) -> Bool { cause_of(e) == ERR_NOT_EXIST }
+pub def is_exist(e: Error) -> Bool { cause_of(e) == ERR_EXIST }
+pub def is_permission(e: Error) -> Bool { cause_of(e) == ERR_PERMISSION }
+pub def is_invalid(e: Error) -> Bool { cause_of(e) == ERR_INVALID }
+pub def is_closed(e: Error) -> Bool { cause_of(e) == ERR_CLOSED }
+
+# ------------------------------------------------------------------ the FS
+
+# An open file (Go's File, with ReadDirFile's read_dir!).
+pub interface File {
+  def stat -> ~FileInfo
+  def read!(p: [Byte]) -> ~Int
+  def close! -> ~Unit
+  # Up to n entries (all the rest for n <= 0), in directory order; with
+  # n > 0 an empty slice means the end. Not a directory: fails.
+  def read_dir!(n: Int) -> ~[DirEntry] {
+    fail path_error("readdir", "", "not implemented")
+  }
+}
+
+# A file system (Go's FS, with the optional interfaces as default methods).
+pub interface FS {
+  # Opens the named file; name must satisfy valid_path?.
+  def open(name: Str) -> ~File
+
+  # Go's ReadFileFS.ReadFile (default: open and read it all).
+  def read_file(name: Str) -> ~[Byte] {
+    ~read_file_by_open(self, name)
+  }
+
+  # Go's ReadDirFS.ReadDir (default: open and read_dir!(-1), sorted by name).
+  def read_dir(name: Str) -> ~[DirEntry] {
+    ~read_dir_by_open(self, name)
+  }
+
+  # Go's StatFS.Stat (default: open and stat).
+  def stat(name: Str) -> ~FileInfo {
+    ~stat_by_open(self, name)
+  }
+
+  # Go's ReadLinkFS.ReadLink (default: fails, ErrInvalid).
+  def read_link(name: Str) -> ~Str {
+    fail path_error("readlink", name, ERR_INVALID)
+  }
+
+  # Go's ReadLinkFS.Lstat (default: stat).
+  def lstat(name: Str) -> ~FileInfo {
+    ~stat_by_open(self, name)
+  }
+
+  # Go's GlobFS.Glob (default: matching over read_dir).
+  def glob(pattern: Str) -> ~[Str] {
+    ~glob_limit(self, pattern, 0)
+  }
+}
+
+# Whether name is a valid path for FS.open (Go's ValidPath): UTF-8,
+# slash-separated, unrooted, no empty, `.` or `..` elements (except "."
+# itself).
+pub def valid_path?(name: Str) -> Bool {
+  return false if !utf8.valid_string(name)
+  return true if name == "."
+  start = 0
+  loop {
+    i = start
+    while i < name.size && name[i] != 47 {
+      i += 1
+    }
+    elem = name[start...i]
+    return false if elem == "" || elem == "." || elem == ".."
+    return true if i == name.size
+    start = i + 1
+  }
+}
+
+def read_file_by_open[F](fsys: F, name: Str) -> ~[Byte] {
+  f = fsys.~open(name)
+  size = 512
+  if info = f.stat.ok {
+    size = info.size + 1 if info.size >= 0 && info.size < 1 << 30
+  }
+  out: [Byte] = []
+  size = 512 if size < 512
+  buf: [Byte] = [0; size]
+  loop {
+    n = f.read!(buf)
+    if e = n.err {
+      f.close!
+      fail e
+    }
+    k = n.unwrap
+    break if k == 0
+    out = out + buf[0...k]
+  }
+  f.close!
+  out
+}
+
+def by_entry_name(a: DirEntry, b: DirEntry) -> Int {
+  return -1 if a.name < b.name
+  return 1 if a.name > b.name
+  0
+}
+
+# A PathError's details, if e is one.
+def path_failure(e: Error) -> PathFailure? {
+  case e {
+    FsError.Path(at) => at
+    _ => none
+  }
+}
+
+def read_dir_by_open[F](fsys: F, name: Str) -> ~[DirEntry] {
+  f = fsys.~open(name)
+  r = f.read_dir!(-1)
+  f.close!
+  if e = r.err {
+    # Go's message names the directory.
+    if at = path_failure(e) {
+      fail path_error(at.op, at.path == "" ? name : at.path, at.err)
+    }
+    fail e
+  }
+  list = r.unwrap
+  slices.sort_func(list, by_entry_name)
+  list
+}
+
+def stat_by_open[F](fsys: F, name: Str) -> ~FileInfo {
+  f = fsys.~open(name)
+  r = f.stat
+  f.close!
+  ~r
+}
+
+# Go's ReadFile: the whole named file.
+pub def read_file[F](fsys: F, name: Str) -> ~[Byte] {
+  fsys.~read_file(name)
+}
+
+# Go's ReadDir: the named directory's entries, sorted by name.
+pub def read_dir[F](fsys: F, name: Str) -> ~[DirEntry] {
+  fsys.~read_dir(name)
+}
+
+# Go's Stat.
+pub def stat[F](fsys: F, name: Str) -> ~FileInfo {
+  fsys.~stat(name)
+}
+
+# Go's Lstat: a final symlink described, not followed (stat if the file
+# system has no links).
+pub def lstat[F](fsys: F, name: Str) -> ~FileInfo {
+  fsys.~lstat(name)
+}
+
+# Go's ReadLink.
+pub def read_link[F](fsys: F, name: Str) -> ~Str {
+  fsys.~read_link(name)
+}
+
+# Go's Glob: the names matching pattern (path.match syntax), in lexical
+# order within each directory; I/O errors are ignored, a bad pattern fails
+# with path.PathError.ErrBadPattern.
+pub def glob[F](fsys: F, pattern: Str) -> ~[Str] {
+  fsys.~glob(pattern)
+}
+
+def has_meta?(p: Str) -> Bool {
+  i = 0
+  while i < p.size {
+    c = p[i]
+    return true if c == 42 || c == 63 || c == 91 || c == 92
+    i += 1
+  }
+  false
+}
+
+def glob_limit[F](fsys: F, pattern: Str, depth: Int) -> ~[Str] {
+  fail path.PathError.ErrBadPattern if depth > 10000
+  _ = ~path.match(pattern, "")
+  out: [Str] = []
+  if !has_meta?(pattern) {
+    if fsys.stat(pattern).ok == none {
+      return out
+    }
+    return [pattern]
+  }
+  dir, file = path.split(pattern)
+  dir = dir == "" ? "." : dir[0...dir.size - 1]
+  if !has_meta?(dir) {
+    return ~glob_in(fsys, dir, file, out)
+  }
+  fail path.PathError.ErrBadPattern if dir == pattern
+  m = ~glob_limit(fsys, dir, depth + 1)
+  for d in m {
+    out = ~glob_in(fsys, d, file, out)
+  }
+  out
+}
+
+def glob_in[F](fsys: F, dir: Str, pattern: Str, matches: [Str]) -> ~[Str] {
+  m = matches
+  r = fsys.read_dir(dir)
+  if infos = r.ok {
+    for info in infos {
+      ok = ~path.match(pattern, info.name)
+      m << path.join([dir, info.name]) if ok
+    }
+  }
+  m
+}
+
+# ------------------------------------------------------------------------ Sub
+
+# The subtree of an FS rooted at dir (Go's Sub).
+pub struct SubFS[F] {
+  fsys: F
+  dir: Str
+
+  def full_name(op: Str, name: Str) -> ~Str {
+    fail path_error(op, name, ERR_INVALID) if !valid_path?(name)
+    path.join([dir, name])
+  }
+
+  # name inside the subtree, if it is there.
+  def shorten(name: Str) -> Str? {
+    return "." if name == dir
+    if name.size >= dir.size + 2 && name[dir.size] == 47 && name[0...dir.size] == dir {
+      return name[dir.size + 1...name.size]
+    }
+    none
+  }
+
+  # A PathError's path made relative to the subtree.
+  def fix_err(e: Error) -> Error {
+    case e {
+      FsError.Path(at) => {
+        if short = shorten(at.path) {
+          return path_error(at.op, short, at.err)
+        }
+        e
+      }
+      _ => e
+    }
+  }
+
+  pub def open(name: Str) -> ~File {
+    full = ~full_name("open", name)
+    r = fsys.open(full)
+    if e = r.err {
+      fail fix_err(e)
+    }
+    r.unwrap
+  }
+
+  pub def read_dir(name: Str) -> ~[DirEntry] {
+    full = ~full_name("read", name)
+    r = fsys.read_dir(full)
+    if e = r.err {
+      fail fix_err(e)
+    }
+    r.unwrap
+  }
+
+  pub def read_file(name: Str) -> ~[Byte] {
+    full = ~full_name("read", name)
+    r = fsys.read_file(full)
+    if e = r.err {
+      fail fix_err(e)
+    }
+    r.unwrap
+  }
+
+  pub def stat(name: Str) -> ~FileInfo {
+    full = ~full_name("stat", name)
+    r = fsys.stat(full)
+    if e = r.err {
+      fail fix_err(e)
+    }
+    r.unwrap
+  }
+
+  pub def read_link(name: Str) -> ~Str {
+    full = ~full_name("readlink", name)
+    r = fsys.read_link(full)
+    if e = r.err {
+      fail fix_err(e)
+    }
+    r.unwrap
+  }
+
+  pub def lstat(name: Str) -> ~FileInfo {
+    full = ~full_name("lstat", name)
+    r = fsys.lstat(full)
+    if e = r.err {
+      fail fix_err(e)
+    }
+    r.unwrap
+  }
+
+  pub def glob(pattern: Str) -> ~[Str] {
+    _ = ~path.match(pattern, "")
+    return ["."] if pattern == "."
+    r = fsys.glob(dir + "/" + pattern)
+    if e = r.err {
+      fail fix_err(e)
+    }
+    list = r.unwrap
+    out: [Str] = []
+    for name in list {
+      if s = shorten(name) {
+        out << s
+      } else {
+        fail path_error("glob", name, "invalid result from inner fsys Glob: #{name} not in #{dir}")
+      }
+    }
+    out
+  }
+
+  # The subtree at d inside this one (Go's subFS.Sub: no nesting).
+  pub def sub(d: Str) -> ~SubFS[F] {
+    return self if d == "."
+    full = ~full_name("sub", d)
+    SubFS[F].new(fsys: fsys, dir: full)
+  }
+}
+
+# Go's Sub: fsys seen from dir ("." is fsys itself, as a SubFS).
+pub def sub[F](fsys: F, dir: Str) -> ~SubFS[F] {
+  fail path_error("sub", dir, ERR_INVALID) if !valid_path?(dir)
+  SubFS[F].new(fsys: fsys, dir: dir)
+}
+
+# -------------------------------------------------------------------- WalkDir
+
+# Go's WalkDir: calls f(path, entry, err) for root and everything under it,
+# in lexical order, directories before their contents. See the header for
+# SkipDir / SkipAll. The entry is none only when root can't be stat'ed.
+pub def walk_dir[F](fsys: F, root: Str, f: (Str, DirEntry?, Error?) -> ~Unit) -> ~Unit {
+  r = fsys.stat(root)
+  res = if e = r.err {
+    f(root, none, e)
+  } else {
+    walk(fsys, root, file_info_to_dir_entry(r.unwrap), f)
+  }
+  if e = res.err {
+    stop = case e {
+      FsError.SkipDir => false
+      FsError.SkipAll => false
+      _ => true
+    }
+    fail e if stop
+  }
+}
+
+def skip_dir?(e: Error) -> Bool {
+  case e {
+    FsError.SkipDir => true
+    _ => false
+  }
+}
+
+def walk[F](fsys: F, name: Str, d: DirEntry, f: (Str, DirEntry?, Error?) -> ~Unit) -> ~Unit {
+  r = f(name, d, none)
+  if e = r.err {
+    return if skip_dir?(e) && d.is_dir
+    fail e
+  }
+  return if !d.is_dir
+  dirs: [DirEntry] = []
+  rd = fsys.read_dir(name)
+  if e = rd.err {
+    # Second call, to report the read_dir error.
+    r2 = f(name, d, e)
+    if e2 = r2.err {
+      return if skip_dir?(e2) && d.is_dir
+      fail e2
+    }
+  } else {
+    dirs = rd.unwrap
+  }
+  for d1 in dirs {
+    r3 = walk(fsys, path.join([name, d1.name]), d1, f)
+    if e = r3.err {
+      break if skip_dir?(e)
+      fail e
+    }
+  }
+}
+
+# ---------------------------------------------------------------------- DirFS
+
+# The real file system under dir (Go's os.DirFS), through package os.
+pub struct DirFS {
+  dir: Str
+
+  def join(op: Str, name: Str) -> ~Str {
+    fail path_error(op, name, ERR_INVALID) if !valid_path?(name)
+    name == "." ? dir : dir + "/" + name
+  }
+
+  pub def open(name: Str) -> ~File {
+    full = ~join("open", name)
+    r = os.open(full)
+    if e = r.err {
+      fail path_error("open", name, cause_of(e))
+    }
+    DirFile.new(f: r.unwrap, name: name, full: full, st: [0])
+  }
+
+  pub def read_file(name: Str) -> ~[Byte] {
+    full = ~join("readfile", name)
+    r = os.read_file(full)
+    if e = r.err {
+      fail path_error("open", name, cause_of(e))
+    }
+    r.unwrap
+  }
+
+  pub def read_dir(name: Str) -> ~[DirEntry] {
+    full = ~join("readdir", name)
+    r = os.read_dir(full)
+    if e = r.err {
+      fail path_error("open", name, cause_of(e))
+    }
+    r.unwrap.map { |en| os_entry(full, en) }.to_a
+  }
+
+  pub def stat(name: Str) -> ~FileInfo {
+    full = ~join("stat", name)
+    r = os.stat(full)
+    if e = r.err {
+      fail path_error("stat", name, cause_of(e))
+    }
+    from_os(r.unwrap)
+  }
+
+  pub def lstat(name: Str) -> ~FileInfo {
+    full = ~join("lstat", name)
+    r = os.lstat(full)
+    if e = r.err {
+      fail path_error("lstat", name, cause_of(e))
+    }
+    from_os(r.unwrap)
+  }
+
+  pub def read_link(name: Str) -> ~Str {
+    full = ~join("readlink", name)
+    r = os.readlink(full)
+    if e = r.err {
+      fail path_error("readlink", name, cause_of(e))
+    }
+    r.unwrap
+  }
+}
+
+# Go's os.DirFS(dir).
+pub def dir_fs(dir: Str) -> DirFS {
+  DirFS.new(dir: dir)
+}
+
+# An open file of a DirFS. `st[0]` is how many directory entries read_dir!
+# has returned.
+pub struct DirFile {
+  f: os.File
+  name: Str
+  full: Str
+  st: [Int]
+
+  pub def stat -> ~FileInfo {
+    r = f.stat
+    if e = r.err {
+      fail path_error("stat", name, cause_of(e))
+    }
+    info = from_os(r.unwrap)
+    info.name = path.base(name)
+    info
+  }
+
+  pub def read!(p: [Byte]) -> ~Int {
+    file = f
+    r = file.read!(p)
+    if e = r.err {
+      fail path_error("read", name, cause_of(e))
+    }
+    r.unwrap
+  }
+
+  pub def close! -> ~Unit {
+    file = f
+    r = file.close!
+    if e = r.err {
+      fail path_error("close", name, ERR_CLOSED)
+    }
+  }
+
+  pub def read_dir!(n: Int) -> ~[DirEntry] {
+    r = os.read_dir(full)
+    if e = r.err {
+      fail path_error("readdirent", name, cause_of(e))
+    }
+    all = r.unwrap
+    at = st[0]
+    end = n > 0 && at + n < all.size ? at + n : all.size
+    end = at if end < at
+    out = all[at...end].map { |en| os_entry(full, en) }.to_a
+    self.st[0] = end
+    out
+  }
+}
+
+# A Go FileMode from a stat(2) mode.
+def mode_of_unix(m: Int) -> FileMode {
+  bits = (m & 0o777).to_u32
+  t = m & 0o170000
+  bits |= MODE_DIR if t == 0o040000
+  bits |= MODE_SYMLINK if t == 0o120000
+  bits |= MODE_NAMED_PIPE if t == 0o010000
+  bits |= MODE_SOCKET if t == 0o140000
+  bits |= MODE_DEVICE if t == 0o060000
+  bits |= MODE_DEVICE | MODE_CHAR_DEVICE if t == 0o020000
+  bits |= MODE_SETUID if m & 0o4000 != 0
+  bits |= MODE_SETGID if m & 0o2000 != 0
+  bits |= MODE_STICKY if m & 0o1000 != 0
+  FileMode.new(bits: bits)
+}
+
+def from_os(i: os.FileInfo) -> FileInfo {
+  FileInfo.new(name: i.name, size: i.size, mode: mode_of_unix(i.mode), mod_time: time.unix(0, i.mod_time))
+}
+
+def os_entry(dir: Str, en: os.DirEntry) -> DirEntry {
+  fi: FileInfo? = none
+  if i = os.lstat(dir + "/" + en.name).ok {
+    fi = from_os(i)
+  }
+  typ = FileMode.new(bits: 0)
+  typ = FileMode.new(bits: MODE_DIR) if en.is_dir
+  typ = FileMode.new(bits: MODE_SYMLINK) if en.is_symlink
+  if i = fi {
+    typ = i.mode.type
+  }
+  DirEntry.new(name: en.name, typ: typ, fi: fi)
+}

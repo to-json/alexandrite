@@ -1,0 +1,1666 @@
+# The parser, after Go's regexp/syntax/parse.go. Positions are byte offsets
+# into the whole expression (Go slices the string as it goes).
+
+import "slices"
+import "unicode"
+import "unicode/utf8"
+
+# The maximum height of a parse tree (Go's maxHeight).
+MAX_HEIGHT = 1000
+# The maximum size of a compiled regexp in Insts (Go's maxSize: 128 MB / 40).
+MAX_SIZE = 3355443
+# The maximum number of runes in all the nodes (Go's maxRunes: 128 MB / 4).
+MAX_RUNES = 33554432
+
+MAX_RUNE: Rune = 0x10FFFF
+
+struct Parser {
+  flags: Int      # parse mode flags
+  stack: [Int]    # stack of parsed expressions (node ids)
+  free: [Int]     # nodes available for reuse
+  num_cap: Int    # number of capturing groups seen
+  s: Str          # the whole expression
+  num_regexp: Int # number of nodes allocated
+  num_runes: Int  # number of runes in char classes
+  repeats: Int    # product of all repetitions seen
+  height_on: Bool # tracking heights (Go: p.height != nil)
+  height: [Int]   # node height, -1 if unknown
+  size_on: Bool   # tracking sizes (Go: p.size != nil)
+  size: [Int]     # node compiled size, -1 if unknown
+  nodes: [Node]
+  fatal: Str # ERR_LARGE or ERR_NESTING_DEPTH once a limit is hit (Go panics)
+
+  def new_regexp!(op: Int) -> Int {
+    if free.size > 0 {
+      id = free[free.size - 1]
+      self.free = free[0...free.size - 1]
+      self.nodes[id] = Node.new(op: op)
+      return id
+    }
+    self.nodes << Node.new(op: op)
+    self.num_regexp += 1
+    nodes.size - 1
+  }
+
+  def reuse!(id: Int) {
+    self.height[id] = -1 if height_on && id < height.size
+    self.free << id
+  }
+
+  def check_limits!(id: Int) {
+    return if fatal != ""
+    if num_runes > MAX_RUNES {
+      self.fatal = ERR_LARGE
+      return
+    }
+    check_size!(id)
+    return if fatal != ""
+    check_height!(id)
+  }
+
+  def check_size!(id: Int) -> Unit {
+    if !size_on {
+      # Not tracking size yet: see cheaply whether we need to start. Keep the
+      # product of all the repeats seen; don't track while the number of
+      # nodes times that product is in budget.
+      self.repeats = 1 if repeats == 0
+      n0 = nodes[id]
+      if n0.op == OP_REPEAT {
+        n = n0.max
+        n = n0.min if n == -1
+        n = 1 if n <= 0
+        if n > MAX_SIZE / repeats {
+          self.repeats = MAX_SIZE
+        } else {
+          self.repeats = repeats * n
+        }
+      }
+      return if num_regexp < MAX_SIZE / repeats
+      # Start tracking, with everything constructed so far.
+      self.size_on = true
+      for s0 in stack { check_size!(s0) }
+    }
+    if calc_size!(id, true) > MAX_SIZE {
+      self.fatal = ERR_LARGE
+    }
+  }
+
+  def calc_size!(id: Int, force: Bool) -> Int {
+    if !force && id < size.size && size[id] >= 0 {
+      return size[id]
+    }
+    re = nodes[id]
+    sz = 0
+    case re.op {
+      OP_LITERAL => sz = re.rune.size
+      OP_CAPTURE | OP_STAR => sz = 2 + calc_size!(re.sub[0], false) # star can be 1+ or 2+; assume 2
+      OP_PLUS | OP_QUEST => sz = 1 + calc_size!(re.sub[0], false)
+      OP_CONCAT => {
+        for s0 in re.sub { sz += calc_size!(s0, false) }
+      }
+      OP_ALTERNATE => {
+        for s0 in re.sub { sz += calc_size!(s0, false) }
+        sz += re.sub.size - 1 if re.sub.size > 1
+      }
+      OP_REPEAT => {
+        sub = calc_size!(re.sub[0], false)
+        if re.max == -1 {
+          sz = re.min == 0 ? 2 + sub : 1 + re.min * sub
+        } else {
+          # x{2,5} = xx(x(x(x)?)?)?
+          sz = re.max * sub + (re.max - re.min)
+        }
+      }
+      _ => {}
+    }
+    sz = 1 if sz < 1
+    while size.size <= id { self.size << -1 }
+    self.size[id] = sz
+    sz
+  }
+
+  def check_height!(id: Int) -> Unit {
+    return if num_regexp < MAX_HEIGHT
+    if !height_on {
+      self.height_on = true
+      for s0 in stack { check_height!(s0) }
+    }
+    if calc_height!(id, true) > MAX_HEIGHT {
+      self.fatal = ERR_NESTING_DEPTH
+    }
+  }
+
+  def calc_height!(id: Int, force: Bool) -> Int {
+    if !force && id < height.size && height[id] >= 0 {
+      return height[id]
+    }
+    h = 1
+    for s0 in nodes[id].sub {
+      hs = calc_height!(s0, false)
+      h = 1 + hs if h < 1 + hs
+    }
+    while height.size <= id { self.height << -1 }
+    self.height[id] = h
+    h
+  }
+
+  # Pushes node id onto the stack; returns it, or -1 if it was merged into the
+  # literal on top.
+  def push!(id: Int) -> Int {
+    re = nodes[id]
+    self.num_runes += re.rune.size
+    rs = re.rune
+    if re.op == OP_CHAR_CLASS && rs.size == 2 && rs[0] == rs[1] {
+      # Single rune.
+      return -1 if maybe_concat!(rs[0], flags & ^FOLD_CASE)
+      self.nodes[id].op = OP_LITERAL
+      self.nodes[id].rune = [rs[0]]
+      self.nodes[id].flags = flags & ^FOLD_CASE
+    } else if (re.op == OP_CHAR_CLASS && rs.size == 4 && rs[0] == rs[1] && rs[2] == rs[3] && unicode.simple_fold(rs[0]) == rs[2] && unicode.simple_fold(rs[2]) == rs[0]) || (re.op == OP_CHAR_CLASS && rs.size == 2 && rs[0] + 1 == rs[1] && unicode.simple_fold(rs[0]) == rs[1] && unicode.simple_fold(rs[1]) == rs[0]) {
+      # Case-insensitive rune like [Aa] or [Δδ].
+      return -1 if maybe_concat!(rs[0], flags | FOLD_CASE)
+      # Rewrite as (case-insensitive) literal.
+      self.nodes[id].op = OP_LITERAL
+      self.nodes[id].rune = [rs[0]]
+      self.nodes[id].flags = flags | FOLD_CASE
+    } else {
+      # Incremental concatenation.
+      maybe_concat!(-1, 0)
+    }
+    self.stack << id
+    check_limits!(id)
+    id
+  }
+
+  # Incremental concatenation of literal runes into string nodes: merges the
+  # top two stack entries if both are literals with the same fold flag. If r
+  # >= 0 and a node is left over, uses it to push r with the given flags.
+  # Reports whether r was pushed.
+  def maybe_concat!(r: Rune, fl: Int) -> Bool {
+    n = stack.size
+    return false if n < 2
+    re1 = stack[n - 1]
+    re2 = stack[n - 2]
+    a = nodes[re1]
+    b = nodes[re2]
+    return false if a.op != OP_LITERAL || b.op != OP_LITERAL || (a.flags & FOLD_CASE) != (b.flags & FOLD_CASE)
+    # Push re1 into re2.
+    self.nodes[re2].rune = b.rune + a.rune
+    # Reuse re1 if possible.
+    if r >= 0 {
+      self.nodes[re1].rune = [r]
+      self.nodes[re1].flags = fl
+      return true
+    }
+    self.stack = stack[0...n - 1]
+    reuse!(re1)
+    false
+  }
+
+  # Pushes a literal for the rune r.
+  def literal!(r0: Rune) {
+    id = new_regexp!(OP_LITERAL)
+    self.nodes[id].flags = flags
+    r = r0
+    r = min_fold_rune(r) if (flags & FOLD_CASE) != 0
+    self.nodes[id].rune = [r]
+    push!(id)
+  }
+
+  # Pushes a node with the given op; returns it.
+  def op!(op: Int) -> Int {
+    id = new_regexp!(op)
+    self.nodes[id].flags = flags
+    push!(id)
+  }
+
+  # Replaces the top stack element with itself repeated according to op, min,
+  # max. `before` is where the repetition operator starts, `after` where it
+  # ends, `last_repeat` where the previous one started (-1 if none). Returns
+  # the updated `after`.
+  def repeat!(op: Int, min: Int, max: Int, before: Int, after0: Int, last_repeat: Int) -> ~Int<ParseError> {
+    after = after0
+    fl = flags
+    if (flags & PERL_X) != 0 {
+      if after < s.size && s[after] == 63 {
+        after += 1
+        fl ^= NON_GREEDY
+      }
+      if last_repeat >= 0 {
+        # In Perl it is not allowed to stack repetition operators: a** is a
+        # syntax error, not a doubled star, and a++ means something else
+        # entirely, which we don't support!
+        fail ParseError.Syntax(code: ERR_INVALID_REPEAT_OP, expr: s[last_repeat...after])
+      }
+    }
+    n = stack.size
+    fail ParseError.Syntax(code: ERR_MISSING_REPEAT_ARGUMENT, expr: s[before...after]) if n == 0
+    sub = stack[n - 1]
+    fail ParseError.Syntax(code: ERR_MISSING_REPEAT_ARGUMENT, expr: s[before...after]) if nodes[sub].op >= OP_PSEUDO
+    id = new_regexp!(op)
+    self.nodes[id].min = min
+    self.nodes[id].max = max
+    self.nodes[id].flags = fl
+    self.nodes[id].sub = [sub]
+    self.stack[n - 1] = id
+    check_limits!(id)
+    return after if fatal != ""
+    if op == OP_REPEAT && (min >= 2 || max >= 2) && !repeat_is_valid(nodes, id, 1000) {
+      fail ParseError.Syntax(code: ERR_INVALID_REPEAT_SIZE, expr: s[before...after])
+    }
+    after
+  }
+
+  # Replaces the top of the stack (above the topmost '|' or '(') with its
+  # concatenation.
+  def concat! -> Int {
+    maybe_concat!(-1, 0)
+    # Scan down to find pseudo-operator | or (.
+    i = stack.size
+    while i > 0 && nodes[stack[i - 1]].op < OP_PSEUDO { i -= 1 }
+    subs = stack[i...stack.size].clone
+    self.stack = stack[0...i]
+    # Empty concatenation is special case.
+    return push!(new_regexp!(OP_EMPTY_MATCH)) if subs.size == 0
+    push!(collapse!(subs, OP_CONCAT))
+  }
+
+  # Replaces the top of the stack (above the topmost '(') with its alternation.
+  def alternate! -> Int {
+    # Scan down to find pseudo-operator (. There are no | above (.
+    i = stack.size
+    while i > 0 && nodes[stack[i - 1]].op < OP_PSEUDO { i -= 1 }
+    subs = stack[i...stack.size].clone
+    self.stack = stack[0...i]
+    # Make sure top class is clean. All the others already are (see
+    # swap_vertical_bar).
+    clean_alt!(subs[subs.size - 1]) if subs.size > 0
+    # Empty alternate is special case (shouldn't happen but easy to handle).
+    return push!(new_regexp!(OP_NO_MATCH)) if subs.size == 0
+    push!(collapse!(subs, OP_ALTERNATE))
+  }
+
+  # Cleans node id for eventual inclusion in an alternation.
+  def clean_alt!(id: Int) {
+    if nodes[id].op == OP_CHAR_CLASS {
+      rs = clean_class(nodes[id].rune)
+      self.nodes[id].rune = rs
+      if rs.size == 2 && rs[0] == 0 && rs[1] == MAX_RUNE {
+        self.nodes[id].rune = []
+        self.nodes[id].op = OP_ANY_CHAR
+        return
+      }
+      if rs.size == 4 && rs[0] == 0 && rs[1] == 9 && rs[2] == 11 && rs[3] == MAX_RUNE {
+        self.nodes[id].rune = []
+        self.nodes[id].op = OP_ANY_CHAR_NOT_NL
+      }
+    }
+  }
+
+  # The result of applying op to subs. Subexpressions that are op nodes are
+  # hoisted up so there is never a concat of a concat or an alternate of an
+  # alternate.
+  def collapse!(subs: [Int], op: Int) -> Int {
+    return subs[0] if subs.size == 1
+    id = new_regexp!(op)
+    out: [Int] = []
+    for sub in subs {
+      if nodes[sub].op == op {
+        out = out + nodes[sub].sub
+        reuse!(sub)
+      } else {
+        out << sub
+      }
+    }
+    self.nodes[id].sub = out
+    if op == OP_ALTERNATE {
+      f = factor!(out)
+      self.nodes[id].sub = f
+      if f.size == 1 {
+        old = id
+        id = f[0]
+        reuse!(old)
+      }
+    }
+    id
+  }
+
+  # Factors common prefixes from the alternation list sub:
+  # ABC|ABD|AEF|BCX|BCY becomes A(B(C|D)|EF)|BC(X|Y) by literal prefix
+  # extraction, then A(B[CD]|EF)|BC[XY] by character class introduction.
+  def factor!(sub0: [Int]) -> [Int] {
+    return sub0 if sub0.size < 2
+    sub = sub0.clone
+
+    # Round 1: factor out common literal prefixes.
+    str: [Rune] = []
+    strflags = 0
+    start = 0
+    out: [Int] = []
+    i = 0
+    while i <= sub.size {
+      # Invariant: sub[start...i] all begin with str as modified by strflags.
+      istr: [Rune] = []
+      iflags = 0
+      if i < sub.size {
+        istr, iflags = leading_string(sub[i])
+        if iflags == strflags {
+          same = 0
+          while same < str.size && same < istr.size && str[same] == istr[same] { same += 1 }
+          if same > 0 {
+            # Matches at least one rune in current range. Keep going around.
+            str = str[0...same]
+            i += 1
+            next
+          }
+        }
+      }
+      # Found end of a run with common leading literal string: sub[start...i]
+      # all begin with str, but sub[i] does not even begin with str[0].
+      if i == start {
+        # Nothing to do - run of length 0.
+      } else if i == start + 1 {
+        # Just one: don't bother factoring.
+        out << sub[start]
+      } else {
+        # Construct factored form: prefix(suffix1|suffix2|...)
+        prefix = new_regexp!(OP_LITERAL)
+        self.nodes[prefix].flags = strflags
+        self.nodes[prefix].rune = str.clone
+        j = start
+        while j < i {
+          sub[j] = remove_leading_string!(sub[j], str.size)
+          check_limits!(sub[j])
+          j += 1
+        }
+        suffix = collapse!(sub[start...i].clone, OP_ALTERNATE) # recurse
+        re = new_regexp!(OP_CONCAT)
+        self.nodes[re].sub = [prefix, suffix]
+        out << re
+      }
+      # Prepare for next iteration.
+      start = i
+      str = istr
+      strflags = iflags
+      i += 1
+    }
+    sub = out
+
+    # Round 2: factor out common simple prefixes, just the first piece of
+    # each concatenation. Complex subexpressions (e.g. involving quantifiers)
+    # are not safe to factor because that collapses their distinct paths
+    # through the automaton, which affects correctness in some cases.
+    start = 0
+    out = []
+    first = -1
+    i = 0
+    while i <= sub.size {
+      # Invariant: sub[start...i] all begin with first.
+      ifirst = -1
+      if i < sub.size {
+        ifirst = leading_regexp(sub[i])
+        if first >= 0 && ifirst >= 0 && node_equal(nodes, first, nodes, ifirst) {
+          # first must be a character class OR a fixed repeat of a character class.
+          fr = nodes[first]
+          if is_char_class(nodes, first) || (fr.op == OP_REPEAT && fr.min == fr.max && is_char_class(nodes, fr.sub[0])) {
+            i += 1
+            next
+          }
+        }
+      }
+      # Found end of a run with common leading regexp: sub[start...i] all
+      # begin with first but sub[i] does not.
+      if i == start {
+        # Nothing to do - run of length 0.
+      } else if i == start + 1 {
+        out << sub[start]
+      } else {
+        # Construct factored form: prefix(suffix1|suffix2|...)
+        prefix = first
+        j = start
+        while j < i {
+          sub[j] = remove_leading_regexp!(sub[j], j != start) # prefix came from sub[start]
+          check_limits!(sub[j])
+          j += 1
+        }
+        suffix = collapse!(sub[start...i].clone, OP_ALTERNATE) # recurse
+        re = new_regexp!(OP_CONCAT)
+        self.nodes[re].sub = [prefix, suffix]
+        out << re
+      }
+      start = i
+      first = ifirst
+      i += 1
+    }
+    sub = out
+
+    # Round 3: collapse runs of single literals into character classes.
+    start = 0
+    out = []
+    i = 0
+    while i <= sub.size {
+      # Invariant: sub[start...i] are literal runes or character classes.
+      if i < sub.size && is_char_class(nodes, sub[i]) {
+        i += 1
+        next
+      }
+      # sub[i] is not a char or char class; emit char class for sub[start...i]...
+      if i == start {
+        # Nothing to do - run of length 0.
+      } else if i == start + 1 {
+        out << sub[start]
+      } else {
+        # Make new char class. Start with most complex regexp in sub[start].
+        mx = start
+        j = start + 1
+        while j < i {
+          a = nodes[sub[mx]]
+          b = nodes[sub[j]]
+          mx = j if a.op < b.op || (a.op == b.op && a.rune.size < b.rune.size)
+          j += 1
+        }
+        tmp = sub[start]
+        sub[start] = sub[mx]
+        sub[mx] = tmp
+        j = start + 1
+        while j < i {
+          merge_char_class!(sub[start], sub[j])
+          reuse!(sub[j])
+          j += 1
+        }
+        clean_alt!(sub[start])
+        out << sub[start]
+      }
+      # ... and then emit sub[i].
+      out << sub[i] if i < sub.size
+      start = i + 1
+      i += 1
+    }
+    sub = out
+
+    # Round 4: collapse runs of empty matches into a single empty match.
+    out = []
+    i = 0
+    while i < sub.size {
+      if !(i + 1 < sub.size && nodes[sub[i]].op == OP_EMPTY_MATCH && nodes[sub[i + 1]].op == OP_EMPTY_MATCH) {
+        out << sub[i]
+      }
+      i += 1
+    }
+    out
+  }
+
+  # The leading literal string that node id begins with, and its fold flag.
+  def leading_string(id0: Int) -> ([Rune], Int) {
+    id = id0
+    id = nodes[id].sub[0] if nodes[id].op == OP_CONCAT && nodes[id].sub.size > 0
+    re = nodes[id]
+    return ([], 0) if re.op != OP_LITERAL
+    (re.rune, re.flags & FOLD_CASE)
+  }
+
+  # Removes the first n leading runes from node id; returns its replacement.
+  def remove_leading_string!(id: Int, n: Int) -> Int {
+    re = nodes[id]
+    if re.op == OP_CONCAT && re.sub.size > 0 {
+      # Removing a leading string in a concatenation might simplify it.
+      sub = remove_leading_string!(re.sub[0], n)
+      subs = nodes[id].sub
+      subs[0] = sub
+      if nodes[sub].op == OP_EMPTY_MATCH {
+        reuse!(sub)
+        case subs.size {
+          0 | 1 => {
+            # Impossible but handle.
+            self.nodes[id].op = OP_EMPTY_MATCH
+            self.nodes[id].sub = []
+          }
+          2 => {
+            old = id
+            r = subs[1]
+            reuse!(old)
+            return r
+          }
+          _ => self.nodes[id].sub = subs[1...subs.size].clone
+        }
+      }
+      return id
+    }
+    if re.op == OP_LITERAL {
+      self.nodes[id].rune = re.rune[n...re.rune.size].clone
+      self.nodes[id].op = OP_EMPTY_MATCH if re.rune.size == n
+    }
+    id
+  }
+
+  # The leading regexp that node id begins with, or -1.
+  def leading_regexp(id: Int) -> Int {
+    re = nodes[id]
+    return -1 if re.op == OP_EMPTY_MATCH
+    if re.op == OP_CONCAT && re.sub.size > 0 {
+      sub = re.sub[0]
+      return -1 if nodes[sub].op == OP_EMPTY_MATCH
+      return sub
+    }
+    id
+  }
+
+  # Removes the leading regexp in node id; returns the replacement. If reuse
+  # is true, the removed regexp (if no longer needed) is reused.
+  def remove_leading_regexp!(id: Int, reuse: Bool) -> Int {
+    re = nodes[id]
+    if re.op == OP_CONCAT && re.sub.size > 0 {
+      reuse!(re.sub[0]) if reuse
+      subs = re.sub[1...re.sub.size].clone
+      self.nodes[id].sub = subs
+      case subs.size {
+        0 => {
+          self.nodes[id].op = OP_EMPTY_MATCH
+          self.nodes[id].sub = []
+        }
+        1 => {
+          r = subs[0]
+          reuse!(id)
+          return r
+        }
+        _ => {}
+      }
+      return id
+    }
+    reuse!(id) if reuse
+    new_regexp!(OP_EMPTY_MATCH)
+  }
+
+  # Makes dst = dst|src. The caller ensures dst.op >= src.op.
+  def merge_char_class!(dst: Int, src: Int) {
+    d = nodes[dst]
+    sr = nodes[src]
+    case d.op {
+      OP_ANY_CHAR => {
+        # src doesn't add anything.
+      }
+      OP_ANY_CHAR_NOT_NL => {
+        # src might add \n
+        self.nodes[dst].op = OP_ANY_CHAR if match_rune(nodes, src, 10)
+      }
+      OP_CHAR_CLASS => {
+        # src is simpler, so either literal or char class
+        if sr.op == OP_LITERAL {
+          self.nodes[dst].rune = append_literal(d.rune, sr.rune[0], sr.flags)
+        } else {
+          self.nodes[dst].rune = append_class(d.rune, sr.rune)
+        }
+      }
+      OP_LITERAL => {
+        # both literal
+        if !(sr.rune[0] == d.rune[0] && sr.flags == d.flags) {
+          self.nodes[dst].op = OP_CHAR_CLASS
+          rs = append_literal([], d.rune[0], d.flags)
+          self.nodes[dst].rune = append_literal(rs, sr.rune[0], sr.flags)
+        }
+      }
+      _ => {}
+    }
+  }
+
+  # Handles a | in the input.
+  def parse_vertical_bar! {
+    concat!
+    # The concatenation just parsed is on top of the stack. If it sits above
+    # an opVerticalBar, swap it below (things below an opVerticalBar become
+    # an alternation). Otherwise, push a new vertical bar.
+    op!(OP_VERTICAL_BAR) if !swap_vertical_bar!
+  }
+
+  # If the top of the stack is an element followed by an opVerticalBar, swaps
+  # the two and returns true; otherwise returns false.
+  def swap_vertical_bar! -> Bool {
+    # If above and below vertical bar are literal or char class, merge them
+    # into a single char class.
+    n = stack.size
+    if n >= 3 && nodes[stack[n - 2]].op == OP_VERTICAL_BAR && is_char_class(nodes, stack[n - 1]) && is_char_class(nodes, stack[n - 3]) {
+      re1 = stack[n - 1]
+      re3 = stack[n - 3]
+      # Make re3 the more complex of the two.
+      if nodes[re1].op > nodes[re3].op {
+        tmp = re1
+        re1 = re3
+        re3 = tmp
+        self.stack[n - 3] = re3
+      }
+      merge_char_class!(re3, re1)
+      reuse!(re1)
+      self.stack = stack[0...n - 1]
+      return true
+    }
+    if n >= 2 {
+      re1 = stack[n - 1]
+      re2 = stack[n - 2]
+      if nodes[re2].op == OP_VERTICAL_BAR {
+        # Now out of reach. Clean opportunistically.
+        clean_alt!(stack[n - 3]) if n >= 3
+        self.stack[n - 2] = re1
+        self.stack[n - 1] = re2
+        return true
+      }
+    }
+    false
+  }
+
+  # Handles a ) in the input.
+  def parse_right_paren! -> ~Int<ParseError> {
+    concat!
+    # pop vertical bar
+    self.stack = stack[0...stack.size - 1] if swap_vertical_bar!
+    alternate!
+    n = stack.size
+    fail ParseError.Syntax(code: ERR_UNEXPECTED_PAREN, expr: s) if n < 2
+    re1 = stack[n - 1]
+    re2 = stack[n - 2]
+    self.stack = stack[0...n - 2]
+    fail ParseError.Syntax(code: ERR_UNEXPECTED_PAREN, expr: s) if nodes[re2].op != OP_LEFT_PAREN
+    # Restore flags at time of paren.
+    self.flags = nodes[re2].flags
+    if nodes[re2].cap == 0 {
+      # Just for grouping.
+      push!(re1)
+    } else {
+      self.nodes[re2].op = OP_CAPTURE
+      self.nodes[re2].sub = [re1]
+      push!(re2)
+    }
+    0
+  }
+
+  # The rune at pos (an invalid encoding is an error).
+  def next_rune(pos: Int) -> ~(Rune, Int)<ParseError> {
+    c, n = utf8.decode_rune_at(s, pos)
+    fail ParseError.Syntax(code: ERR_INVALID_UTF8, expr: s[pos...s.size]) if c == utf8.RUNE_ERROR && n == 1
+    (c, pos + n)
+  }
+
+  # Checks that s[lo...hi] is valid UTF-8.
+  def check_utf8(lo: Int, hi: Int) -> ~Int<ParseError> {
+    i = lo
+    while i < hi {
+      c, n = utf8.decode_rune_at(s, i)
+      fail ParseError.Syntax(code: ERR_INVALID_UTF8, expr: s[i...hi]) if c == utf8.RUNE_ERROR && n == 1
+      i += n
+    }
+    0
+  }
+
+  # Parses {min} (max=min) or {min,} (max=-1) or {min,max} at pos. Returns
+  # (min, max, rest, ok); if the form is right but the values too big, min is
+  # -1 and ok is true.
+  def parse_repeat(pos: Int) -> (Int, Int, Int, Bool) {
+    return (0, 0, 0, false) if pos >= s.size || s[pos] != 123
+    p = pos + 1
+    min, p1, ok1 = parse_int(p)
+    return (0, 0, 0, false) if !ok1
+    p = p1
+    return (0, 0, 0, false) if p >= s.size
+    max = 0
+    if s[p] != 44 {
+      max = min
+    } else {
+      p += 1
+      return (0, 0, 0, false) if p >= s.size
+      if s[p] == 125 {
+        max = -1
+      } else {
+        mx, p2, ok2 = parse_int(p)
+        return (0, 0, 0, false) if !ok2
+        p = p2
+        max = mx
+        min = -1 if max < 0 # parse_int found too big a number
+      }
+    }
+    return (0, 0, 0, false) if p >= s.size || s[p] != 125
+    (min, max, p + 1, true)
+  }
+
+  # Parses a decimal integer at pos: (n, rest, ok). n is -1 if too big.
+  def parse_int(pos: Int) -> (Int, Int, Bool) {
+    return (0, pos, false) if pos >= s.size || s[pos] < 48 || s[pos] > 57
+    # Disallow leading zeros.
+    return (0, pos, false) if pos + 1 < s.size && s[pos] == 48 && s[pos + 1] >= 48 && s[pos + 1] <= 57
+    p = pos
+    while p < s.size && s[p] >= 48 && s[p] <= 57 { p += 1 }
+    n = 0
+    i = pos
+    while i < p {
+      # Avoid overflow.
+      if n >= 100_000_000 {
+        n = -1
+        break
+      }
+      n = n * 10 + s[i].to_i - 48
+      i += 1
+    }
+    (n, p, true)
+  }
+
+  # Parses a Perl flag setting or non-capturing group or both, like (?i) or
+  # (?: or (?i: at pos (which starts with "(?"); returns the rest.
+  def parse_perl_flags!(pos: Int) -> ~Int<ParseError> {
+    t = pos
+    # Named captures: (?P<name>expr) (Python), (?<name>expr) (.NET, Perl
+    # 5.10). Both are supported.
+    rem = s.size - t
+    starts_with_p = rem > 4 && s[t + 2] == 80 && s[t + 3] == 60
+    starts_with_name = rem > 3 && s[t + 2] == 60
+    if starts_with_p || starts_with_name {
+      # position of expr start
+      expr_start = starts_with_name ? 3 : 4
+      # Pull out name.
+      end = index_rune_from(s, t, 62)
+      if end < 0 {
+        _ = ~check_utf8(t, s.size)
+        fail ParseError.Syntax(code: ERR_INVALID_NAMED_CAPTURE, expr: s[pos...s.size])
+      }
+      capture = s[t...end + 1] # "(?P<name>" or "(?<name>"
+      name = s[t + expr_start...end]
+      ns0 = t + expr_start
+      _ = ~check_utf8(ns0, end)
+      fail ParseError.Syntax(code: ERR_INVALID_NAMED_CAPTURE, expr: capture) if !is_valid_capture_name(name)
+      # Like ordinary capture, but named.
+      self.num_cap += 1
+      re = op!(OP_LEFT_PAREN)
+      self.nodes[re].cap = num_cap
+      self.nodes[re].name = name
+      return end + 1
+    }
+
+    # Non-capturing group. Might also twiddle Perl flags.
+    t += 2 # skip (?
+    fl = flags
+    sign = 1
+    saw_flag = false
+    while t < s.size {
+      c, t2 = ~next_rune(t)
+      t = t2
+      case c {
+        105 => {
+          # i
+          fl |= FOLD_CASE
+          saw_flag = true
+        }
+        109 => {
+          # m
+          fl &= ^ONE_LINE
+          saw_flag = true
+        }
+        115 => {
+          # s
+          fl |= DOT_NL
+          saw_flag = true
+        }
+        85 => {
+          # U
+          fl |= NON_GREEDY
+          saw_flag = true
+        }
+        45 => {
+          # -: switch to negation
+          break if sign < 0
+          sign = -1
+          # Invert flags so that | above turn into &^ and vice versa. We'll
+          # invert flags again before using it below.
+          fl = ^fl
+          saw_flag = false
+        }
+        58 | 41 => {
+          # : or ): end of flags, starting group or not.
+          if sign < 0 {
+            break if !saw_flag
+            fl = ^fl
+          }
+          # Open new group
+          op!(OP_LEFT_PAREN) if c == 58
+          self.flags = fl
+          return t
+        }
+        _ => {break}
+      }
+    }
+    fail ParseError.Syntax(code: ERR_INVALID_PERL_OP, expr: s[pos...t])
+  }
+
+  # Parses an escape sequence at pos (a backslash); returns the rune and the rest.
+  def parse_escape(pos: Int) -> ~(Rune, Int)<ParseError> {
+    t = pos + 1
+    fail ParseError.Syntax(code: ERR_TRAILING_BACKSLASH, expr: "") if t >= s.size
+    c, t1 = ~next_rune(t)
+    t = t1
+    ok = false
+    r: Rune = 0
+    if c >= 49 && c <= 55 {
+      # Octal escapes. A single non-zero digit is a backreference; not supported.
+      if t < s.size && s[t] >= 48 && s[t] <= 55 {
+        ok = true
+      }
+    } else if c == 48 {
+      ok = true
+    }
+    if ok {
+      # Consume up to three octal digits; already have one.
+      r = c - 48
+      i = 1
+      while i < 3 {
+        break if t >= s.size || s[t] < 48 || s[t] > 55
+        r = r * 8 + s[t].to_i32 - 48
+        t += 1
+        i += 1
+      }
+      return (r, t)
+    }
+    case c {
+      120 => {
+        # x: hexadecimal escapes.
+        if t < s.size {
+          c2, t2 = ~next_rune(t)
+          t = t2
+          if c2 == 123 {
+            # Any number of digits in braces. Perl accepts any text at all; it
+            # ignores all text after the first non-hex digit. We require only
+            # hex digits, and at least one.
+            nhex = 0
+            r = 0
+            good = true
+            loop {
+              if t >= s.size {
+                good = false
+                break
+              }
+              c3, t3 = ~next_rune(t)
+              t = t3
+              break if c3 == 125
+              v = unhex(c3)
+              if v < 0 {
+                good = false
+                break
+              }
+              r = r * 16 + v
+              if r > MAX_RUNE {
+                good = false
+                break
+              }
+              nhex += 1
+            }
+            return (r, t) if good && nhex > 0
+          } else {
+            # Easy case: two hex digits.
+            x = unhex(c2)
+            c3, t3 = ~next_rune(t)
+            t = t3
+            y = unhex(c3)
+            return (x * 16 + y, t) if x >= 0 && y >= 0
+          }
+        }
+      }
+      # C escapes. There is no case 'b', to avoid misparsing the Perl
+      # word-boundary \b as the C backspace \b when in POSIX mode.
+      97 => {return (7, t)}
+      102 => {return (12, t)}
+      110 => {return (10, t)}
+      114 => {return (13, t)}
+      116 => {return (9, t)}
+      118 => {return (11, t)}
+      _ => {
+        # Escaped non-word characters are always themselves. PCRE is not
+        # quite so rigorous: it accepts things like \q, but we don't. We once
+        # rejected \_, but too many programs and people insist on using it, so
+        # allow \_.
+        return (c, t) if c < 0x80 && !is_alnum(c) && !(c >= 49 && c <= 55)
+      }
+    }
+    fail ParseError.Syntax(code: ERR_INVALID_ESCAPE, expr: s[pos...t])
+  }
+
+  # Parses a character class character at pos; class_start is where the
+  # class began (for the error).
+  def parse_class_char(pos: Int, class_start: Int) -> ~(Rune, Int)<ParseError> {
+    fail ParseError.Syntax(code: ERR_MISSING_BRACKET, expr: s[class_start...s.size]) if pos >= s.size
+    # Allow regular escape sequences even though many need not be escaped in
+    # this context.
+    return ~parse_escape(pos) if s[pos] == 92
+    ~next_rune(pos)
+  }
+
+  # Parses a Perl character class escape like \d at pos, appending to r.
+  # Returns (class, rest), rest -1 if there is none.
+  def parse_perl_class_escape(pos: Int, r: [Rune]) -> ([Rune], Int) {
+    return (r, -1) if (flags & PERL_X) == 0 || pos + 1 >= s.size || s[pos] != 92
+    if g = perl_group(s[pos + 1]) {
+      return (append_group(r, g), pos + 2)
+    }
+    (r, -1)
+  }
+
+  # Parses a POSIX named class like [:alnum:] at pos, appending to r.
+  # Returns (class, rest), rest -1 if there is none.
+  def parse_named_class(pos: Int, r: [Rune]) -> ~([Rune], Int)<ParseError> {
+    return (r, -1) if pos + 1 >= s.size || s[pos] != 91 || s[pos + 1] != 58
+    i = index_from(s, pos + 2, ":]")
+    return (r, -1) if i < 0
+    name = s[pos...i + 2]
+    if g = posix_group(name) {
+      return (append_group(r, g), i + 2)
+    }
+    fail ParseError.Syntax(code: ERR_INVALID_CHAR_RANGE, expr: name)
+  }
+
+  def append_group(r: [Rune], g: CharGroup) -> [Rune] {
+    if (flags & FOLD_CASE) == 0 {
+      return g.sign < 0 ? append_negated_class(r, g.class) : append_class(r, g.class)
+    }
+    tmp = clean_class(append_folded_class([], g.class))
+    g.sign < 0 ? append_negated_class(r, tmp) : append_class(r, tmp)
+  }
+
+  # Parses a Unicode class like \p{Han} at pos, appending to r. Returns
+  # (class, rest), rest -1 if there is none.
+  def parse_unicode_class(pos: Int, r0: [Rune]) -> ~([Rune], Int)<ParseError> {
+    r = r0
+    return (r, -1) if (flags & UNICODE_GROUPS) == 0 || pos + 1 >= s.size || s[pos] != 92 || (s[pos + 1] != 112 && s[pos + 1] != 80)
+    # Committed to parse or return error.
+    sign = s[pos + 1] == 80 ? -1 : 1
+    p2 = pos + 2
+    c, t = ~next_rune(p2)
+    name = ""
+    seq = ""
+    if c != 123 {
+      # Single-letter name.
+      seq = s[pos...t]
+      name = s[pos + 2...t]
+    } else {
+      # Name is in braces.
+      end = index_rune_from(s, pos, 125)
+      if end < 0 {
+        _ = ~check_utf8(pos, s.size)
+        fail ParseError.Syntax(code: ERR_INVALID_CHAR_RANGE, expr: s[pos...s.size])
+      }
+      seq = s[pos...end + 1]
+      t = end + 1
+      name = s[pos + 3...end]
+      p3 = pos + 3
+      _ = ~check_utf8(p3, end)
+    }
+    # Group can have leading negation too. \p{^Han} == \P{Han}, \P{^Han} == \p{Han}.
+    if name != "" && name[0] == 94 {
+      sign = -sign
+      name = name[1...name.size]
+    }
+    tab, fold, tsign = unicode_table(name)
+    fail ParseError.Syntax(code: ERR_INVALID_CHAR_RANGE, expr: seq) if tsign == 0
+    sign = -sign if tsign < 0
+    if (flags & FOLD_CASE) == 0 || fold.ranges.size == 0 {
+      r = sign > 0 ? append_table(r, tab) : append_negated_table(r, tab)
+    } else {
+      # Merge and clean tab and fold in a temporary buffer. This is necessary
+      # for the negative case and just tidy for the positive case.
+      tmp = clean_class(append_table(append_table([], tab), fold))
+      r = sign > 0 ? append_class(r, tmp) : append_negated_class(r, tmp)
+    }
+    (r, t)
+  }
+
+  # Parses a character class at pos ('[') and pushes it; returns the rest.
+  def parse_class!(pos: Int) -> ~Int<ParseError> {
+    t = pos + 1 # chop [
+    re = new_regexp!(OP_CHAR_CLASS)
+    self.nodes[re].flags = flags
+    class: [Rune] = []
+    sign = 1
+    if t < s.size && s[t] == 94 {
+      sign = -1
+      t += 1
+      # If character class does not match \n, add it here, so that negation
+      # later will do the right thing.
+      if (flags & CLASS_NL) == 0 {
+        class << 10
+        class << 10
+      }
+    }
+    first = true # ] and - are okay as first char in class
+    while t >= s.size || s[t] != 93 || first {
+      # POSIX: - is only okay unescaped as first or last in class.
+      # Perl: - is okay anywhere.
+      if t < s.size && s[t] == 45 && (flags & PERL_X) == 0 && !first && (t + 1 == s.size || s[t + 1] != 93) {
+        _, rsize = utf8.decode_rune_at(s, t + 1)
+        fail ParseError.Syntax(code: ERR_INVALID_CHAR_RANGE, expr: s[t...t + 1 + rsize])
+      }
+      first = false
+
+      # Look for POSIX [:alnum:] etc.
+      if t + 2 < s.size && s[t] == 91 && s[t + 1] == 58 {
+        nclass, nt = ~parse_named_class(t, class)
+        if nt >= 0 {
+          class = nclass
+          t = nt
+          next
+        }
+      }
+
+      # Look for Unicode character group like \p{Han}.
+      uclass, ut = ~parse_unicode_class(t, class)
+      if ut >= 0 {
+        class = uclass
+        t = ut
+        next
+      }
+
+      # Look for Perl character class symbols (extension).
+      pclass, pt = parse_perl_class_escape(t, class)
+      if pt >= 0 {
+        class = pclass
+        t = pt
+        next
+      }
+
+      # Single character or simple range.
+      rng = t
+      lo, t1 = ~parse_class_char(t, pos)
+      t = t1
+      hi = lo
+      # [a-] means (a|-) so check for final ].
+      if t + 1 < s.size && s[t] == 45 && s[t + 1] != 93 {
+        t += 1
+        h, t2 = ~parse_class_char(t, pos)
+        t = t2
+        hi = h
+        fail ParseError.Syntax(code: ERR_INVALID_CHAR_RANGE, expr: s[rng...t]) if hi < lo
+      }
+      if (flags & FOLD_CASE) == 0 {
+        class = append_range(class, lo, hi)
+      } else {
+        class = append_folded_range(class, lo, hi)
+      }
+    }
+    t += 1 # chop ]
+    class = clean_class(class)
+    class = negate_class(class) if sign < 0
+    self.nodes[re].rune = class
+    push!(re)
+    t
+  }
+
+  # Parses a backslash sequence at t; returns the rest.
+  def parse_backslash!(t0: Int) -> ~Int<ParseError> {
+    t = t0
+    if (flags & PERL_X) != 0 && t + 1 < s.size {
+      case s[t + 1] {
+        65 => {
+          # \A
+          op!(OP_BEGIN_TEXT)
+          return t + 2
+        }
+        98 => {
+          # \b
+          op!(OP_WORD_BOUNDARY)
+          return t + 2
+        }
+        66 => {
+          # \B
+          op!(OP_NO_WORD_BOUNDARY)
+          return t + 2
+        }
+        67 => {
+          # \C: any byte; not supported
+          fail ParseError.Syntax(code: ERR_INVALID_ESCAPE, expr: s[t...t + 2])
+        }
+        81 => {
+          # \Q ... \E: the ... is always literals
+          lit_end = index_from(s, t + 2, "\\E")
+          after = lit_end + 2
+          if lit_end < 0 {
+            lit_end = s.size
+            after = s.size
+          }
+          i = t + 2
+          while i < lit_end {
+            c, n = utf8.decode_rune_at(s, i)
+            fail ParseError.Syntax(code: ERR_INVALID_UTF8, expr: s[i...lit_end]) if c == utf8.RUNE_ERROR && n == 1
+            literal!(c)
+            i += n
+          }
+          return after
+        }
+        122 => {
+          # \z
+          op!(OP_END_TEXT)
+          return t + 2
+        }
+        _ => {}
+      }
+    }
+    re = new_regexp!(OP_CHAR_CLASS)
+    self.nodes[re].flags = flags
+    # Look for Unicode character group like \p{Han}.
+    if t + 1 < s.size && (s[t + 1] == 112 || s[t + 1] == 80) {
+      r, rest = ~parse_unicode_class(t, [])
+      if rest >= 0 {
+        self.nodes[re].rune = r
+        push!(re)
+        return rest
+      }
+    }
+    # Perl character class escape.
+    r, rest = parse_perl_class_escape(t, [])
+    if rest >= 0 {
+      self.nodes[re].rune = r
+      push!(re)
+      return rest
+    }
+    reuse!(re)
+    # Ordinary single-character escape.
+    c, rest2 = ~parse_escape(t)
+    literal!(c)
+    rest2
+  }
+}
+
+# Whether node id can be represented as a character class: single-rune
+# literal string, char class, ., and .|\n.
+def is_char_class(ns: [Node], id: Int) -> Bool {
+  re = ns[id]
+  (re.op == OP_LITERAL && re.rune.size == 1) || re.op == OP_CHAR_CLASS || re.op == OP_ANY_CHAR_NOT_NL || re.op == OP_ANY_CHAR
+}
+
+# Whether node id matches r.
+def match_rune(ns: [Node], id: Int, r: Rune) -> Bool {
+  re = ns[id]
+  case re.op {
+    OP_LITERAL => {return re.rune.size == 1 && re.rune[0] == r}
+    OP_CHAR_CLASS => {
+      i = 0
+      while i < re.rune.size {
+        return true if re.rune[i] <= r && r <= re.rune[i + 1]
+        i += 2
+      }
+      return false
+    }
+    OP_ANY_CHAR_NOT_NL => {return r != 10}
+    OP_ANY_CHAR => {return true}
+    _ => {return false}
+  }
+}
+
+# Whether the repetition re is valid: the combination of the top-level
+# repetition and any inner repetitions does not exceed n copies of the
+# innermost thing.
+def repeat_is_valid(ns: [Node], id: Int, n0: Int) -> Bool {
+  n = n0
+  re = ns[id]
+  if re.op == OP_REPEAT {
+    m = re.max
+    return true if m == 0
+    m = re.min if m < 0
+    return false if m > n
+    n /= m if m > 0
+  }
+  for s0 in re.sub {
+    return false if !repeat_is_valid(ns, s0, n)
+  }
+  true
+}
+
+# The minimum rune fold-equivalent to r.
+def min_fold_rune(r: Rune) -> Rune {
+  return r if r < MIN_FOLD || r > MAX_FOLD
+  m = r
+  f = unicode.simple_fold(r)
+  while f != r {
+    m = f if f < m
+    f = unicode.simple_fold(f)
+  }
+  m
+}
+
+# Whether name is a valid capture name: [A-Za-z0-9_]+.
+def is_valid_capture_name(name: Str) -> Bool {
+  return false if name == ""
+  i = 0
+  while i < name.size {
+    c, n = utf8.decode_rune_at(name, i)
+    return false if c != 95 && !is_alnum(c)
+    i += n
+  }
+  true
+}
+
+def is_alnum(c: Rune) -> Bool {
+  (c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122)
+}
+
+def unhex(c: Rune) -> Rune {
+  return c - 48 if c >= 48 && c <= 57
+  return c - 97 + 10 if c >= 97 && c <= 102
+  return c - 65 + 10 if c >= 65 && c <= 70
+  -1
+}
+
+# The first index >= from of byte c (an ASCII rune) in s, or -1.
+def index_rune_from(s: Str, from: Int, c: Int) -> Int {
+  i = from
+  while i < s.size {
+    return i if s[i].to_i == c
+    i += 1
+  }
+  -1
+}
+
+# The first index >= from of sub in s, or -1.
+def index_from(s: Str, from: Int, sub: Str) -> Int {
+  i = from
+  while i + sub.size <= s.size {
+    j = 0
+    while j < sub.size && s[i + j] == sub[j] { j += 1 }
+    return i if j == sub.size
+    i += 1
+  }
+  -1
+}
+
+# --------------------------------------------------------- character classes
+# A class is a [Rune] of (lo, hi) pairs.
+
+# Sorts the ranges (by lo increasing, hi decreasing), merges abutting and
+# overlapping ones, and eliminates duplicates.
+def clean_class(r: [Rune]) -> [Rune] {
+  n = r.size / 2
+  return r if n < 1
+  keys: [Int] = []
+  i = 0
+  while i < r.size {
+    keys << ((r[i].to_i << 22) | (0x3FFFFF - r[i + 1].to_i))
+    i += 2
+  }
+  slices.sort(keys)
+  out: [Rune] = []
+  for k in keys {
+    lo = (k >> 22).to_i32
+    hi = (0x3FFFFF - (k & 0x3FFFFF)).to_i32
+    w = out.size
+    if w > 0 && lo <= out[w - 1] + 1 {
+      # merge with previous range
+      out[w - 1] = hi if hi > out[w - 1]
+      next
+    }
+    # new disjoint range
+    out << lo
+    out << hi
+  }
+  out
+}
+
+# Whether r is in the (clean) class.
+def in_char_class(r: Rune, class: [Rune]) -> Bool {
+  lo = 0
+  hi = class.size / 2
+  while lo < hi {
+    m = (lo + hi) / 2
+    if r > class[2 * m + 1] {
+      lo = m + 1
+    } else if r < class[2 * m] {
+      hi = m
+    } else {
+      return true
+    }
+  }
+  false
+}
+
+# Appends the literal x to the class r.
+def append_literal(r: [Rune], x: Rune, flags: Int) -> [Rune] {
+  return append_folded_range(r, x, x) if (flags & FOLD_CASE) != 0
+  append_range(r, x, x)
+}
+
+# Appends the range lo-hi to the class r.
+def append_range(r: [Rune], lo: Rune, hi: Rune) -> [Rune] {
+  # Expand last range or next to last range if it overlaps or abuts.
+  # Checking two ranges helps when appending case-folded alphabets, so that
+  # one range can be expanding A-Z and the other expanding a-z.
+  n = r.size
+  i = 2
+  while i <= 4 {
+    if n >= i {
+      rlo = r[n - i]
+      rhi = r[n - i + 1]
+      if lo <= rhi + 1 && rlo <= hi + 1 {
+        r[n - i] = lo if lo < rlo
+        r[n - i + 1] = hi if hi > rhi
+        return r
+      }
+    }
+    i += 2
+  }
+  out = r
+  out << lo
+  out << hi
+  out
+}
+
+# Appends the range lo-hi and its case folding-equivalent runes to the class r.
+def append_folded_range(r0: [Rune], lo0: Rune, hi0: Rune) -> [Rune] {
+  r = r0
+  lo = lo0
+  hi = hi0
+  # Range is full: folding can't add more.
+  return append_range(r, lo, hi) if lo <= MIN_FOLD && hi >= MAX_FOLD
+  # Range is outside folding possibilities.
+  return append_range(r, lo, hi) if hi < MIN_FOLD || lo > MAX_FOLD
+  if lo < MIN_FOLD {
+    # [lo, MIN_FOLD-1] needs no folding.
+    r = append_range(r, lo, MIN_FOLD - 1)
+    lo = MIN_FOLD
+  }
+  if hi > MAX_FOLD {
+    # [MAX_FOLD+1, hi] needs no folding.
+    r = append_range(r, MAX_FOLD + 1, hi)
+    hi = MAX_FOLD
+  }
+  # Brute force. Depend on append_range to coalesce ranges on the fly.
+  c = lo
+  while c <= hi {
+    r = append_range(r, c, c)
+    f = unicode.simple_fold(c)
+    while f != c {
+      r = append_range(r, f, f)
+      f = unicode.simple_fold(f)
+    }
+    c += 1
+  }
+  r
+}
+
+# Appends the (clean) class x to the class r.
+def append_class(r0: [Rune], x: [Rune]) -> [Rune] {
+  r = r0
+  i = 0
+  while i < x.size {
+    r = append_range(r, x[i], x[i + 1])
+    i += 2
+  }
+  r
+}
+
+# Appends the case folding of the class x to the class r.
+def append_folded_class(r0: [Rune], x: [Rune]) -> [Rune] {
+  r = r0
+  i = 0
+  while i < x.size {
+    r = append_folded_range(r, x[i], x[i + 1])
+    i += 2
+  }
+  r
+}
+
+# Appends the negation of the (clean) class x to the class r.
+def append_negated_class(r0: [Rune], x: [Rune]) -> [Rune] {
+  r = r0
+  next_lo: Rune = 0
+  i = 0
+  while i < x.size {
+    lo = x[i]
+    hi = x[i + 1]
+    r = append_range(r, next_lo, lo - 1) if next_lo <= lo - 1
+    next_lo = hi + 1
+    i += 2
+  }
+  r = append_range(r, next_lo, MAX_RUNE) if next_lo <= MAX_RUNE
+  r
+}
+
+# Appends the table x to the class r.
+def append_table(r0: [Rune], x: unicode.RangeTable) -> [Rune] {
+  r = r0
+  for xr in x.ranges {
+    if xr.stride == 1 {
+      r = append_range(r, xr.lo, xr.hi)
+      next
+    }
+    c = xr.lo
+    while c <= xr.hi {
+      r = append_range(r, c, c)
+      c += xr.stride
+    }
+  }
+  r
+}
+
+# Appends the negation of the table x to the class r.
+def append_negated_table(r0: [Rune], x: unicode.RangeTable) -> [Rune] {
+  r = r0
+  next_lo: Rune = 0 # lo end of next class to add
+  for xr in x.ranges {
+    if xr.stride == 1 {
+      r = append_range(r, next_lo, xr.lo - 1) if next_lo <= xr.lo - 1
+      next_lo = xr.hi + 1
+      next
+    }
+    c = xr.lo
+    while c <= xr.hi {
+      r = append_range(r, next_lo, c - 1) if next_lo <= c - 1
+      next_lo = c + 1
+      c += xr.stride
+    }
+  }
+  r = append_range(r, next_lo, MAX_RUNE) if next_lo <= MAX_RUNE
+  r
+}
+
+# The negation of the (clean) class r.
+def negate_class(r: [Rune]) -> [Rune] {
+  out: [Rune] = []
+  next_lo: Rune = 0 # lo end of next class to add
+  i = 0
+  while i < r.size {
+    lo = r[i]
+    hi = r[i + 1]
+    if next_lo <= lo - 1 {
+      out << next_lo
+      out << lo - 1
+    }
+    next_lo = hi + 1
+    i += 2
+  }
+  if next_lo <= MAX_RUNE {
+    out << next_lo
+    out << MAX_RUNE
+  }
+  out
+}
+
+# ----------------------------------------------------------- unicode tables
+
+def range_table(lo: Rune, hi: Rune) -> unicode.RangeTable {
+  unicode.RangeTable.new(ranges: [unicode.Range.new(lo: lo, hi: hi, stride: 1)])
+}
+
+# The canonical lookup string for name: a leading upper case letter, then
+# lower case letters, omitting underscores, spaces and hyphens.
+def canonical_name(name: Str) -> Str {
+  out: [Byte] = []
+  first = true
+  i = 0
+  while i < name.size {
+    c = name[i]
+    if c == 95 || c == 45 || c == 32 {
+      i += 1
+      next
+    }
+    if first {
+      c -= 32 if c >= 97 && c <= 122
+      first = false
+    } else {
+      c += 32 if c >= 65 && c <= 90
+    }
+    out << c
+    i += 1
+  }
+  Str.from_bytes(out)
+}
+
+# The table named name, the table of its additional fold-equivalent code
+# points, and the sign (-1: invert the table; 0: no such table).
+def unicode_table(name0: Str) -> (unicode.RangeTable, unicode.RangeTable, Int) {
+  name = canonical_name(name0)
+  empty = unicode.RangeTable.new(ranges: [])
+  # Special cases: Any, Assigned, and ASCII. Also LC is the only
+  # non-canonical Categories key, so handle it here.
+  case name {
+    "Any" => {
+      t = range_table(0, MAX_RUNE)
+      return (t, t, 1)
+    }
+    "Assigned" => {
+      cn = unicode.category("Cn").unwrap
+      return (cn, cn, -1) # invert Cn (unassigned)
+    }
+    "Ascii" => {
+      fold = unicode.RangeTable.new(ranges: [unicode.Range.new(lo: 0, hi: 0x7F, stride: 1), unicode.Range.new(lo: 0x17F, hi: 0x17F, stride: 1), unicode.Range.new(lo: 0x212A, hi: 0x212A, stride: 1)])
+      return (range_table(0, 0x7F), fold, 1)
+    }
+    "Lc" => {return (unicode.category("LC").unwrap, unicode.fold_category("LC") || empty, 1)}
+    _ => {}
+  }
+  if t = unicode.category(name) {
+    return (t, unicode.fold_category(name) || empty, 1)
+  }
+  if t = unicode.script(name) {
+    return (t, unicode.fold_script(name) || empty, 1)
+  }
+  # CategoryAliases uses underscores in its names; match ignoring them.
+  for alias in unicode.category_alias_names {
+    if canonical_name(alias) == name {
+      actual = unicode.category_alias(alias).unwrap
+      return (unicode.category(actual).unwrap, unicode.fold_category(actual) || empty, 1)
+    }
+  }
+  for sn in unicode.script_names {
+    if canonical_name(sn) == name {
+      return (unicode.script(sn).unwrap, unicode.fold_script(sn) || empty, 1)
+    }
+  }
+  (empty, empty, 0)
+}
+
+# ----------------------------------------------------------------- parsing
+
+# A literal-flag parse: the string's runes.
+def literal_regexp(s: Str, flags: Int) -> Regexp {
+  ns: [Node] = [Node.new(op: OP_LITERAL, flags: flags, rune: s.runes)]
+  Regexp.new(ar: [Arena.new(nodes: ns)], id: 0)
+}
+
+# Parses a regular expression string s, controlled by flags, into a syntax
+# tree (Go's Parse).
+pub def parse(s: Str, flags: Int) -> ~Regexp<ParseError> {
+  p = Parser.new(flags: flags, s: s)
+  if (flags & LITERAL) != 0 {
+    # Trivial parser for literal string.
+    ~p.check_utf8(0, s.size)
+    return literal_regexp(s, flags)
+  }
+  # Otherwise, must do real work.
+  last_repeat = -1
+  t = 0
+  while t < s.size {
+    repeat = -1
+    c = s[t]
+    case c {
+      40 => {
+        # (
+        if (p.flags & PERL_X) != 0 && t + 1 < s.size && s[t + 1] == 63 {
+          # Flag changes and non-capturing groups.
+          t = p.~parse_perl_flags!(t)
+        } else {
+          p.num_cap += 1
+          id = p.op!(OP_LEFT_PAREN)
+          p.nodes[id].cap = p.num_cap
+          t += 1
+        }
+      }
+      124 => {
+        # |
+        p.parse_vertical_bar!
+        t += 1
+      }
+      41 => {
+        # )
+        p.~parse_right_paren!
+        t += 1
+      }
+      94 => {
+        # ^
+        p.op!((p.flags & ONE_LINE) != 0 ? OP_BEGIN_TEXT : OP_BEGIN_LINE)
+        t += 1
+      }
+      36 => {
+        # $
+        if (p.flags & ONE_LINE) != 0 {
+          id = p.op!(OP_END_TEXT)
+          p.nodes[id].flags = p.nodes[id].flags | WAS_DOLLAR
+        } else {
+          p.op!(OP_END_LINE)
+        }
+        t += 1
+      }
+      46 => {
+        # .
+        p.op!((p.flags & DOT_NL) != 0 ? OP_ANY_CHAR : OP_ANY_CHAR_NOT_NL)
+        t += 1
+      }
+      91 => {
+        # [
+        t = p.~parse_class!(t)
+      }
+      42 | 43 | 63 => {
+        # * + ?
+        op = c == 42 ? OP_STAR : (c == 43 ? OP_PLUS : OP_QUEST)
+        before = t
+        t1 = t + 1
+        t = p.~repeat!(op, 0, 0, before, t1, last_repeat)
+        repeat = before
+      }
+      123 => {
+        # {
+        before = t
+        min, max, after, ok = p.parse_repeat(t)
+        if !ok {
+          # If the repeat cannot be parsed, { is a literal.
+          p.literal!(123)
+          t += 1
+        } else {
+          if min < 0 || min > 1000 || max > 1000 || (max >= 0 && min > max) {
+            # Numbers were too big, or max is present and min > max.
+            fail ParseError.Syntax(code: ERR_INVALID_REPEAT_SIZE, expr: s[before...after])
+          }
+          t = p.~repeat!(OP_REPEAT, min, max, before, after, last_repeat)
+          repeat = before
+        }
+      }
+      92 => {
+        # \
+        t = p.~parse_backslash!(t)
+      }
+      _ => {
+        r, t2 = ~p.next_rune(t)
+        t = t2
+        p.literal!(r)
+      }
+    }
+    fail ParseError.Syntax(code: p.fatal, expr: s) if p.fatal != ""
+    last_repeat = repeat
+  }
+  p.concat!
+  # pop vertical bar
+  p.stack = p.stack[0...p.stack.size - 1] if p.swap_vertical_bar!
+  p.alternate!
+  fail ParseError.Syntax(code: p.fatal, expr: s) if p.fatal != ""
+  fail ParseError.Syntax(code: ERR_MISSING_PAREN, expr: s) if p.stack.size != 1
+  Regexp.new(ar: [Arena.new(nodes: p.nodes)], id: p.stack[0])
+}

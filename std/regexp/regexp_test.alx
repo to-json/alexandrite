@@ -1,0 +1,341 @@
+# Go's regexp all_test.go, find_test.go and onepass_test.go: the helpers the
+# generated tables (vec_tables_test.alx, vec_random_test.alx) call, and the
+# tests that aren't tables.
+
+import "regexp/syntax"
+import "strings"
+import "unicode/utf8"
+
+def raw(b: [Byte]) -> Str { Str.from_bytes(b) }
+
+def no_matches -> [[Int]] { [] }
+def no_strs -> [Str] { [] }
+
+# A RuneReader over a Str (Go's strings.Reader for the Reader methods).
+struct StrReader {
+  s: Str
+  st: [Int]
+
+  def read_rune! -> ~(Rune, Int)? {
+    p = st[0]
+    return none if p >= s.size
+    r, n = utf8.decode_rune_at(s, p)
+    c = st
+    c[0] = p + n
+    (r, n)
+  }
+}
+
+def reader(s: Str) -> StrReader { StrReader.new(s: s, st: [0]) }
+
+def bytes_of(s: Str) -> [Byte] { s.bytes }
+
+def str_of(b: [Byte]?) -> Str {
+  if x = b {
+    return Str.from_bytes(x)
+  }
+  "<nil>"
+}
+
+# Every Find variant on one pattern and text against the expected matches
+# (Go's TestFind ... TestFindAllStringSubmatchIndex, TestMatch,
+# TestMatchFunction and TestCopyMatch for one findTests entry).
+def check_find(pat: Str, text: Str, max: Int, matches: [[Int]]) {
+  re = must_compile(pat)
+  assert_eq re.to_s, pat
+  b = bytes_of(text)
+  found = matches.size > 0
+  if max != 0 {
+    # Match / MatchString / package MatchString / Copy.
+    assert_eq re.match_string?(text), found
+    assert_eq re.match?(b), found
+    assert_eq match_string(pat, text).unwrap, found
+    assert_eq re.copy.match_string?(text), found
+    assert_eq re.match_reader?(reader(text)), found
+    # Find / FindString.
+    if found {
+      want = text[matches[0][0]...matches[0][1]]
+      assert_eq str_of(re.find(b)), want
+      assert_eq re.find_string(text), want
+      assert_eq re.find_index(b).unwrap, matches[0][0...2]
+      assert_eq re.find_string_index(text).unwrap, matches[0][0...2]
+      assert_eq re.find_reader_index(reader(text)).unwrap, matches[0][0...2]
+      assert_eq re.find_submatch_index(b).unwrap, matches[0]
+      assert_eq re.find_string_submatch_index(text).unwrap, matches[0]
+      assert_eq re.find_reader_submatch_index(reader(text)).unwrap, matches[0]
+      check_submatch_strings(text, matches[0], re.find_string_submatch(text).unwrap)
+      check_submatch_bytes(text, matches[0], re.find_submatch(b).unwrap)
+    } else {
+      assert re.find(b).none?
+      assert_eq re.find_string(text), ""
+      assert re.find_index(b).none?
+      assert re.find_string_index(text).none?
+      assert re.find_reader_index(reader(text)).none?
+      assert re.find_submatch_index(b).none?
+      assert re.find_string_submatch_index(text).none?
+      assert re.find_reader_submatch_index(reader(text)).none?
+      assert re.find_string_submatch(text).none?
+      assert re.find_submatch(b).none?
+    }
+  }
+  # The All variants.
+  all = re.find_all_string(text, max)
+  assert_eq all.size, matches.size
+  allb = re.find_all(b, max)
+  assert_eq allb.size, matches.size
+  idx = re.find_all_string_index(text, max)
+  assert_eq idx.size, matches.size
+  assert_eq re.find_all_index(b, max).size, matches.size
+  sidx = re.find_all_string_submatch_index(text, max)
+  assert_eq sidx, matches
+  assert_eq re.find_all_submatch_index(b, max), matches
+  ssub = re.find_all_string_submatch(text, max)
+  bsub = re.find_all_submatch(b, max)
+  assert_eq ssub.size, matches.size
+  assert_eq bsub.size, matches.size
+  k = 0
+  while k < matches.size {
+    e = matches[k]
+    assert_eq all[k], text[e[0]...e[1]]
+    assert_eq Str.from_bytes(allb[k]), text[e[0]...e[1]]
+    assert_eq idx[k], e[0...2]
+    check_submatch_strings(text, e, ssub[k])
+    check_submatch_bytes(text, e, bsub[k])
+    k += 1
+  }
+}
+
+def check_submatch_strings(text: Str, submatches: [Int], result: [Str]) {
+  assert_eq submatches.size, result.size * 2
+  k = 0
+  while k < submatches.size {
+    if submatches[k] == -1 {
+      assert_eq result[k / 2], ""
+    } else {
+      assert_eq result[k / 2], text[submatches[k]...submatches[k + 1]]
+    }
+    k += 2
+  }
+}
+
+def check_submatch_bytes(text: Str, submatches: [Int], result: [[Byte]?]) {
+  assert_eq submatches.size, result.size * 2
+  k = 0
+  while k < submatches.size {
+    if submatches[k] == -1 {
+      assert result[k / 2].none?
+    } else {
+      assert_eq str_of(result[k / 2]), text[submatches[k]...submatches[k + 1]]
+    }
+    k += 2
+  }
+}
+
+def compile_error(expr: Str) -> Str {
+  r = compile(expr)
+  return "" if r.ok?
+  r.err.unwrap.message
+}
+
+def check_bad_compile(expr: Str, want: Str) {
+  e = compile_error(expr)
+  assert e != "", "compiling #{expr}: missing error"
+  assert strings.contains(e, want), "compiling #{expr}: wrong error #{e}; want #{want}"
+}
+
+# Go's TestReplaceAll (and TestReplaceAllLiteral for replacements without $).
+def check_replace(pattern: Str, repl: Str, input: Str, output: Str) {
+  re = compile(pattern).unwrap
+  assert_eq re.replace_all_string(input, repl), output
+  assert_eq Str.from_bytes(re.replace_all(bytes_of(input), bytes_of(repl))), output
+  if !strings.contains(repl, "$") {
+    check_replace_literal(pattern, repl, input, output)
+  }
+}
+
+def check_replace_literal(pattern: Str, repl: Str, input: Str, output: Str) {
+  re = compile(pattern).unwrap
+  assert_eq re.replace_all_literal_string(input, repl), output
+  assert_eq Str.from_bytes(re.replace_all_literal(bytes_of(input), bytes_of(repl))), output
+}
+
+# Go's TestQuoteMeta for one entry.
+def check_meta(pattern: Str, output: Str) {
+  quoted = quote_meta(pattern)
+  assert_eq quoted, output
+  if pattern != "" {
+    # The quoted string matches the original, unquoted string.
+    re = compile(quoted).unwrap
+    src = "abc" + pattern + "def"
+    assert_eq re.replace_all_string(src, "xyz"), "abcxyzdef"
+  }
+}
+
+def check_literal_prefix(pattern: Str, literal: Str, complete: Bool) {
+  s, c = must_compile(pattern).literal_prefix
+  assert_eq c, complete
+  assert_eq s, literal
+}
+
+def check_subexp(input: Str, num: Int, names: [Str], indices: [(Str, Int)]) {
+  re = must_compile(input)
+  n = re.d[0].num_subexp
+  assert_eq n, num
+  got = re.d[0].subexp_names
+  assert_eq got.size, 1 + n
+  if names.size > 0 {
+    assert_eq got, names
+  }
+  for si in indices {
+    assert_eq re.subexp_index(si[0]), si[1]
+  }
+}
+
+def check_split(s: Str, r: Str, n: Int, out: [Str]) {
+  re = compile(r).unwrap
+  sp = re.split(s, n)
+  assert_eq sp, out
+  if quote_meta(r) == r {
+    assert_eq sp, strings.split_n(s, r, n)
+  }
+}
+
+def check_min_input_len(expr: Str, min: Int) {
+  re = syntax.parse(expr, syntax.PERL).unwrap
+  assert_eq min_input_len(re), min
+}
+
+def check_one_pass(expr: Str, want: Bool) {
+  re = syntax.parse(expr, syntax.PERL).unwrap.simplify
+  p = syntax.compile(re)
+  assert compile_one_pass(p).present? == want, "compile_one_pass(#{expr})"
+}
+
+def check_random(pat: Str, text: Str, first: [[Int]], long: [[Int]], repl: Str, split: [Str]) {
+  re = must_compile(pat)
+  assert_eq re.find_all_string_submatch_index(text, -1), first
+  re2 = must_compile(pat)
+  re2.longest!
+  assert_eq re2.find_all_string_submatch_index(text, -1), long
+  assert_eq re.replace_all_string(text, "<$1>"), repl
+  assert_eq re.split(text, -1), split
+}
+
+def check_find_all_n(pat: Str, text: Str, n: Int, want: [[Int]]) {
+  assert_eq must_compile(pat).find_all_string_submatch_index(text, n), want
+}
+
+test "bad compile: expression too large" {
+  check_bad_compile("\\pL" * 27000, "expression too large")
+}
+
+test "replace all func" {
+  f = ->(s: Str) -> Str { "x" + s + "y" }
+  fb = ->(s: [Byte]) -> [Byte] { bytes_of("x" + Str.from_bytes(s) + "y") }
+  cases = [("[a-c]", "defabcdef", "defxayxbyxcydef"), ("[a-c]+", "defabcdef", "defxabcydef"), ("[a-c]*", "defabcdef", "xydxyexyfxabcydxyexyfxy")]
+  for c in cases {
+    re = compile(c[0]).unwrap
+    assert_eq re.replace_all_string_func(c[1], f), c[2]
+    assert_eq Str.from_bytes(re.replace_all_func(bytes_of(c[1]), fb)), c[2]
+  }
+}
+
+test "merge rune sets" {
+  # Go's runeMergeTests: left, right, merged, next, leftPC, rightPC.
+  m, n = merge_rune_sets([69, 69], [], 1, 2)
+  assert_eq m, [69, 69]
+  assert_eq n, [1]
+  m, n = merge_rune_sets([69, 69], [69, 69], 1, 1)
+  assert_eq m.size, 0
+  assert_eq n, [MERGE_FAILED]
+  m, n = merge_rune_sets([69, 69], [69, 69], 1, 2)
+  assert_eq m.size, 0
+  assert_eq n, [MERGE_FAILED]
+  m, n = merge_rune_sets([69, 69], [71, 71], 1, 2)
+  assert_eq m, [69, 69, 71, 71]
+  assert_eq n, [1, 2]
+  m, n = merge_rune_sets([71, 71], [69, 69], 1, 2)
+  assert_eq m, [69, 69, 71, 71]
+  assert_eq n, [2, 1]
+  m, n = merge_rune_sets([60, 60, 71, 71, 101, 101], [69, 69, 88, 88], 1, 2)
+  assert_eq m, [60, 60, 69, 69, 71, 71, 88, 88, 101, 101]
+  assert_eq n, [1, 2, 1, 2, 1]
+  fails: [([Rune], [Rune])] = [([69, 74], [71, 71]), ([69, 74], [68, 75]), ([69, 74], [74, 75]), ([69, 74], [65, 69]), ([69, 74], [71, 74]), ([69, 74], [65, 71]), ([69, 74, 60, 65], [66, 67])]
+  for f in fails {
+    m, n = merge_rune_sets(f[0], f[1], 1, 2)
+    assert_eq m.size, 0
+    assert_eq n, [MERGE_FAILED]
+  }
+}
+
+test "compile one pass: long literal" {
+  check_one_pass("^l" + "o" * 512 + "ng$", true)
+}
+
+test "run one pass" {
+  re = compile("^a(/b+(#c+)*)*$").unwrap
+  assert re.d[0].has_onepass
+  assert re.match_string?("a/b#c")
+}
+
+test "parse and compile" {
+  # The following sequence of match calls used to panic (Go issue 12980).
+  for c in [(syntax.PERL | syntax.ONE_LINE, false), (syntax.PERL & ^syntax.ONE_LINE, true)] {
+    parsed = syntax.parse("a$", c[0]).unwrap
+    re = compile(parsed.to_s).unwrap
+    assert_eq re.match_string?("a\nb"), c[1]
+  }
+}
+
+test "one pass cutoff" {
+  re = syntax.parse("^x{1,1000}y{1,1000}$", syntax.PERL).unwrap
+  p = syntax.compile(re.simplify)
+  assert compile_one_pass(p).none?
+}
+
+test "switch backtrack" {
+  # The same pattern with the standard matcher and then the backtracker
+  # (Go issue 10319).
+  re = must_compile("a|b")
+  long: [Byte] = [0; MAX_BACKTRACK_VECTOR + 1]
+  assert !re.match?(long)
+  assert !re.match?(long[0...1])
+}
+
+test "unmarshal text" {
+  good = ["", ".", "^.$", "a", "a*", "a+", "a?", "a|b", "a*|b*", "(a*|b)(c*|d)", "[a-z]", "[a-abc-c\\-\\]\\[]", "[a-z]+", "[abc]", "[^1234]", "[^\\n]", "\\!\\\\"]
+  unmarshaled = must_compile("")
+  for g in good {
+    re = compile(g).unwrap
+    marshaled = re.marshal_text
+    assert unmarshaled.unmarshal_text!(marshaled).ok?
+    assert_eq unmarshaled.to_s, g
+    buf: [Byte] = [0, 0, 0, 0]
+    app = re.append_text(buf)
+    assert unmarshaled.unmarshal_text!(app[4...app.size]).ok?
+    assert_eq unmarshaled.to_s, g
+  }
+  # invalid pattern
+  re = must_compile("")
+  assert re.unmarshal_text!(bytes_of("\\")).err?
+}
+
+test "expand" {
+  re = must_compile("(?P<key>\\w+):\\s+(?P<value>\\w+)")
+  src = "option1: value1"
+  m = re.find_string_submatch_index(src).unwrap
+  assert_eq Str.from_bytes(re.expand_string([], "$key=$value $$ ${1}x $9 ${bad", src, m)), "option1=value1 $ option1x  ${bad"
+  assert_eq Str.from_bytes(re.expand([], bytes_of("$2"), bytes_of(src), m)), "value1"
+}
+
+test "match package functions" {
+  assert match("a+b", bytes_of("xaab")).unwrap
+  assert !match_string("^b", "ab").unwrap
+  assert match_string("(", "x").err?
+  assert match_reader("b$", reader("aab")).unwrap
+}
+
+test "must compile panics message" {
+  assert_eq quote("a(b"), "`a(b`"
+  assert_eq quote("`"), "\"`\""
+}

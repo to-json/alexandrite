@@ -824,6 +824,7 @@ impl FnEmit<'_> {
                     Rt::StrSplit => s("alx_str_split"),
                     Rt::StrJoin => s("alx_str_join"),
                     Rt::StrToI => s("alx_str_to_i"),
+                    Rt::StrIndex => s("alx_str_index"),
                     Rt::StrChar => s("alx_str_charlen"),
                     Rt::StrByte => {
                         if a[2] == "INT64_C(0)" {

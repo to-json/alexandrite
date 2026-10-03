@@ -1,0 +1,453 @@
+# One-pass programs, after Go's regexp/onepass.go.
+#
+# A one-pass regexp is one in which every alternation can be decided by the
+# next input rune alone ("unambiguous"), and that is anchored at the start.
+# Such programs run without backtracking or thread lists (exec.alx).
+
+import "regexp/syntax"
+import "slices"
+import "unicode"
+import "unicode/utf8"
+
+MERGE_FAILED = 0xFFFFFFFF
+
+# A one-pass program: Go's onePassProg (an Inst list plus each Inst's Next).
+struct OnePass {
+  op: [Int]
+  out: [Int]
+  arg: [Int]
+  runes: [[Rune]]
+  nexts: [[Int]]
+  start: Int
+  num_cap: Int
+}
+
+# The literal prefix of a one-pass program (which begins with ^): (prefix,
+# complete, the pc of the last rune in the prefix).
+def one_pass_prefix(p: syntax.Prog) -> (Str, Bool, Int) {
+  i = p.inst[p.start]
+  if i.op != syntax.INST_EMPTY_WIDTH || (i.arg & syntax.EMPTY_BEGIN_TEXT) == 0 {
+    return ("", i.op == syntax.INST_MATCH, p.start)
+  }
+  pc = i.out
+  i = p.inst[pc]
+  while i.op == syntax.INST_NOP {
+    pc = i.out
+    i = p.inst[pc]
+  }
+  # Avoid allocation of buffer if prefix is empty.
+  if iop(i) != syntax.INST_RUNE || i.rune.size != 1 {
+    return ("", i.op == syntax.INST_MATCH, p.start)
+  }
+  # Have prefix; gather characters.
+  buf: [Byte] = []
+  while iop(i) == syntax.INST_RUNE && i.rune.size == 1 && (i.arg & syntax.FOLD_CASE) == 0 && i.rune[0] != utf8.RUNE_ERROR {
+    buf = utf8.append_rune(buf, i.rune[0])
+    pc = i.out
+    i = p.inst[i.out]
+  }
+  complete = i.op == syntax.INST_EMPTY_WIDTH && (i.arg & syntax.EMPTY_END_TEXT) != 0 && p.inst[i.out].op == syntax.INST_MATCH
+  (Str.from_bytes(buf), complete, pc)
+}
+
+# The op with the rune variants folded into INST_RUNE.
+def iop(i: syntax.Inst) -> Int {
+  op = i.op
+  return syntax.INST_RUNE if op == syntax.INST_RUNE1 || op == syntax.INST_RUNE_ANY || op == syntax.INST_RUNE_ANY_NOT_NL
+  op
+}
+
+# A sparse set of Ints (Go's queueOnePass); `st` holds size and next index.
+struct OpQueue {
+  sparse: [Int]
+  dense: [Int]
+  st: [Int]
+
+  def empty? -> Bool { st[1] >= st[0] }
+
+  def take -> Int {
+    c = st
+    n = dense[c[1]]
+    c[1] = c[1] + 1
+    n
+  }
+
+  def clear {
+    c = st
+    c[0] = 0
+    c[1] = 0
+    return
+  }
+
+  def contains?(u: Int) -> Bool {
+    return false if u >= sparse.size
+    sparse[u] < st[0] && dense[sparse[u]] == u
+  }
+
+  def insert(u: Int) {
+    insert_new(u) if !contains?(u)
+  }
+
+  def insert_new(u: Int) {
+    return if u >= sparse.size
+    c = st
+    sp = sparse
+    d = dense
+    sp[u] = c[0]
+    d[c[0]] = u
+    c[0] = c[0] + 1
+    return
+  }
+}
+
+def new_op_queue(size: Int) -> OpQueue {
+  OpQueue.new(sparse: [0; size], dense: [0; size], st: [0, 0])
+}
+
+# Merges two non-intersecting rune sets and returns the merged result and
+# the corresponding next-pc list; ([], [MERGE_FAILED]) if they intersect or
+# are out of order.
+def merge_rune_sets(left: [Rune], right: [Rune], left_pc: Int, right_pc: Int) -> ([Rune], [Int]) {
+  left_len = left.size
+  right_len = right.size
+  panic("mergeRuneSets odd length []rune") if (left_len & 1) != 0 || (right_len & 1) != 0
+  lx = 0
+  rx = 0
+  merged: [Rune] = []
+  nxt: [Int] = []
+  ix = -1
+  while lx < left_len || rx < right_len {
+    from_right = false
+    if rx >= right_len {
+      from_right = false
+    } else if lx >= left_len {
+      from_right = true
+    } else if right[rx] < left[lx] {
+      from_right = true
+    }
+    arr = from_right ? right : left
+    low = from_right ? rx : lx
+    # extend
+    return ([], [MERGE_FAILED]) if ix > 0 && arr[low] <= merged[ix]
+    merged << arr[low]
+    merged << arr[low + 1]
+    if from_right {
+      rx += 2
+      nxt << right_pc
+    } else {
+      lx += 2
+      nxt << left_pc
+    }
+    ix += 2
+  }
+  (merged, nxt)
+}
+
+# Restores the instructions that one-pass analysis rewrote but doesn't need
+# to keep (Go's cleanupOnePass).
+def cleanup_one_pass(p: OnePass, original: syntax.Prog) {
+  ix = 0
+  while ix < original.inst.size {
+    inst = original.inst[ix]
+    case inst.op {
+      syntax.INST_ALT | syntax.INST_ALT_MATCH | syntax.INST_RUNE => {}
+      syntax.INST_CAPTURE | syntax.INST_EMPTY_WIDTH | syntax.INST_NOP | syntax.INST_MATCH | syntax.INST_FAIL => {
+        p.nexts[ix] = []
+      }
+      syntax.INST_RUNE1 | syntax.INST_RUNE_ANY | syntax.INST_RUNE_ANY_NOT_NL => {
+        p.nexts[ix] = []
+        p.op[ix] = inst.op
+        p.out[ix] = inst.out
+        p.arg[ix] = inst.arg
+        p.runes[ix] = inst.rune
+      }
+      _ => {}
+    }
+    ix += 1
+  }
+}
+
+def is_alt(op: Int) -> Bool { op == syntax.INST_ALT || op == syntax.INST_ALT_MATCH }
+
+# A copy of the program with alternations of alternations rewritten, as Go's
+# onePassCopy.
+def one_pass_copy(prog: syntax.Prog) -> OnePass {
+  n = prog.inst.size
+  p = OnePass.new(op: [0; n], out: [0; n], arg: [0; n], runes: [], nexts: [], start: prog.start, num_cap: prog.num_cap)
+  i = 0
+  while i < n {
+    inst = prog.inst[i]
+    p.op[i] = inst.op
+    p.out[i] = inst.out
+    p.arg[i] = inst.arg
+    p.runes << inst.rune
+    p.nexts << []
+    i += 1
+  }
+  # rewrites one or more common Prog constructs that enable some otherwise
+  # non-onepass Progs to be onepass. A:BD (for example) means an InstAlt at
+  # pc A, an InstAlt with Out B and Arg D.
+  pc = 0
+  while pc < n {
+    if is_alt(p.op[pc]) {
+      # p_A_Other / p_A_Alt: which field of inst pc (true: out, false: arg).
+      a_other_out = true
+      a_alt = p.arg[pc]
+      if !is_alt(p.op[a_alt]) {
+        a_other_out = false
+        a_alt = p.out[pc]
+        if !is_alt(p.op[a_alt]) {
+          pc += 1
+          next
+        }
+      }
+      a_other = a_other_out ? p.out[pc] : p.arg[pc]
+      if is_alt(p.op[a_other]) {
+        # too complicated
+        pc += 1
+        next
+      }
+      # simple empty transition loop
+      # A:BC + B:DA => A:BC + B:DC
+      b_alt_out = true # p_B_Alt is &Inst[a_alt].Out
+      patch = false
+      if p.out[a_alt] == pc {
+        patch = true
+      } else if p.arg[a_alt] == pc {
+        patch = true
+        b_alt_out = false
+      }
+      if patch {
+        if b_alt_out {
+          p.out[a_alt] = a_other
+        } else {
+          p.arg[a_alt] = a_other
+        }
+      }
+      # empty transition to common target
+      # A:BC + B:DC => A:DC + B:DC
+      b_alt = b_alt_out ? p.out[a_alt] : p.arg[a_alt]
+      b_other = b_alt_out ? p.arg[a_alt] : p.out[a_alt]
+      if a_other == b_alt {
+        if a_other_out {
+          p.arg[pc] = b_other
+        } else {
+          p.out[pc] = b_other
+        }
+      }
+    }
+    pc += 1
+  }
+  p
+}
+
+ANY_RUNE_NOT_NL = [0, 9, 11, 0x10FFFF]
+ANY_RUNE = [0, 0x10FFFF]
+
+# State of make_one_pass's check.
+struct OpCheck {
+  p: OnePass
+  inst_queue: OpQueue
+  visit_queue: OpQueue
+  one_pass_runes: [[Rune]]
+  m: [Bool]
+}
+
+def runes_of(xs: [Int]) -> [Rune] {
+  out: [Rune] = []
+  for x in xs { out << x.to_i32 }
+  out
+}
+
+def fill_next(n: Int, out: Int) -> [Int] { [out; n] }
+
+# Go's makeOnePass check closure: whether the program from pc is one-pass.
+def op_check(c: OpCheck, pc: Int) -> Bool {
+  p = c.p
+  ok = true
+  return ok if c.visit_queue.contains?(pc)
+  c.visit_queue.insert(pc)
+  op = p.op[pc]
+  case op {
+    syntax.INST_ALT | syntax.INST_ALT_MATCH => {
+      ok = op_check(c, p.out[pc]) && op_check(c, p.arg[pc])
+      # check no-input paths to InstMatch
+      match_out = c.m[p.out[pc]]
+      match_arg = c.m[p.arg[pc]]
+      if match_out && match_arg {
+        return false
+      }
+      # Match on empty goes in inst.Out
+      if match_arg {
+        t = p.out[pc]
+        p.out[pc] = p.arg[pc]
+        p.arg[pc] = t
+        tb = match_out
+        match_out = match_arg
+        match_arg = tb
+      }
+      if match_out {
+        c.m[pc] = true
+        p.op[pc] = syntax.INST_ALT_MATCH
+      }
+      # build a dispatch operator from the two legs
+      merged, nx = merge_rune_sets(c.one_pass_runes[p.out[pc]], c.one_pass_runes[p.arg[pc]], p.out[pc], p.arg[pc])
+      c.one_pass_runes[pc] = merged
+      p.nexts[pc] = nx
+      if nx.size > 0 && nx[0] == MERGE_FAILED {
+        return false
+      }
+    }
+    syntax.INST_CAPTURE | syntax.INST_NOP | syntax.INST_EMPTY_WIDTH => {
+      ok = op_check(c, p.out[pc])
+      c.m[pc] = c.m[p.out[pc]]
+      # pass matching runes back through these no-ops.
+      c.one_pass_runes[pc] = c.one_pass_runes[p.out[pc]].clone
+      p.nexts[pc] = fill_next(c.one_pass_runes[pc].size / 2 + 1, p.out[pc])
+    }
+    syntax.INST_MATCH | syntax.INST_FAIL => {
+      c.m[pc] = op == syntax.INST_MATCH
+    }
+    syntax.INST_RUNE => {
+      c.m[pc] = false
+      return ok if p.nexts[pc].size > 0
+      c.inst_queue.insert(p.out[pc])
+      rs = p.runes[pc]
+      if rs.size == 0 {
+        c.one_pass_runes[pc] = []
+        p.nexts[pc] = [p.out[pc]]
+        return ok
+      }
+      runes: [Rune] = []
+      if rs.size == 1 && (p.arg[pc] & syntax.FOLD_CASE) != 0 {
+        r0 = rs[0]
+        runes << r0
+        runes << r0
+        r1 = unicode.simple_fold(r0)
+        while r1 != r0 {
+          runes << r1
+          runes << r1
+          r1 = unicode.simple_fold(r1)
+        }
+        runes = sort_runes(runes)
+      } else {
+        runes = rs.clone
+      }
+      c.one_pass_runes[pc] = runes
+      p.nexts[pc] = fill_next(runes.size / 2 + 1, p.out[pc])
+      p.op[pc] = syntax.INST_RUNE
+    }
+    syntax.INST_RUNE1 => {
+      c.m[pc] = false
+      return ok if p.nexts[pc].size > 0
+      c.inst_queue.insert(p.out[pc])
+      runes: [Rune] = []
+      # expand case-folded runes
+      r0 = p.runes[pc][0]
+      if (p.arg[pc] & syntax.FOLD_CASE) != 0 {
+        runes << r0
+        runes << r0
+        r1 = unicode.simple_fold(r0)
+        while r1 != r0 {
+          runes << r1
+          runes << r1
+          r1 = unicode.simple_fold(r1)
+        }
+        runes = sort_runes(runes)
+      } else {
+        runes << r0
+        runes << r0
+      }
+      c.one_pass_runes[pc] = runes
+      p.nexts[pc] = fill_next(runes.size / 2 + 1, p.out[pc])
+      p.op[pc] = syntax.INST_RUNE
+    }
+    syntax.INST_RUNE_ANY => {
+      c.m[pc] = false
+      return ok if p.nexts[pc].size > 0
+      c.inst_queue.insert(p.out[pc])
+      c.one_pass_runes[pc] = runes_of(ANY_RUNE)
+      p.nexts[pc] = [p.out[pc]]
+    }
+    syntax.INST_RUNE_ANY_NOT_NL => {
+      c.m[pc] = false
+      return ok if p.nexts[pc].size > 0
+      c.inst_queue.insert(p.out[pc])
+      c.one_pass_runes[pc] = runes_of(ANY_RUNE_NOT_NL)
+      p.nexts[pc] = fill_next(c.one_pass_runes[pc].size / 2 + 1, p.out[pc])
+    }
+    _ => {}
+  }
+  ok
+}
+
+def sort_runes(rs: [Rune]) -> [Rune] {
+  xs: [Int] = []
+  for r in rs { xs << r.to_i }
+  slices.sort(xs)
+  runes_of(xs)
+}
+
+# Builds the one-pass program (Go's makeOnePass); none if prog isn't one-pass.
+def make_one_pass(p: OnePass) -> OnePass? {
+  # If the machine is very long, it's not worth the time to check if we can
+  # use one pass.
+  n = p.op.size
+  return none if n >= 1000
+  c = OpCheck.new(p: p, inst_queue: new_op_queue(n), visit_queue: new_op_queue(n), one_pass_runes: [[]; n], m: [false; n])
+  c.inst_queue.clear
+  c.inst_queue.insert(p.start)
+  while !c.inst_queue.empty? {
+    c.visit_queue.clear
+    pc = c.inst_queue.take
+    return none if !op_check(c, pc)
+  }
+  i = 0
+  while i < n {
+    p.runes[i] = c.one_pass_runes[i]
+    i += 1
+  }
+  p
+}
+
+# The one-pass program for prog, or none if it isn't one-pass (Go's
+# compileOnePass).
+def compile_one_pass(prog: syntax.Prog) -> OnePass? {
+  return none if prog.start == 0
+  # onepass regexp is anchored
+  si = prog.inst[prog.start]
+  return none if si.op != syntax.INST_EMPTY_WIDTH || (si.arg & syntax.EMPTY_BEGIN_TEXT) != syntax.EMPTY_BEGIN_TEXT
+  has_alt = false
+  for inst in prog.inst {
+    if is_alt(inst.op) {
+      has_alt = true
+      break
+    }
+  }
+  # every instruction leading to InstMatch must be EmptyEndText
+  for inst in prog.inst {
+    op_out = prog.inst[inst.out].op
+    case inst.op {
+      syntax.INST_ALT | syntax.INST_ALT_MATCH => {
+        return none if op_out == syntax.INST_MATCH || prog.inst[inst.arg].op == syntax.INST_MATCH
+      }
+      syntax.INST_EMPTY_WIDTH => {
+        if op_out == syntax.INST_MATCH {
+          return none if (inst.arg & syntax.EMPTY_END_TEXT) != syntax.EMPTY_END_TEXT
+        }
+      }
+      _ => {
+        return none if op_out == syntax.INST_MATCH && has_alt
+      }
+    }
+  }
+  # Creates a slightly optimized copy of the original Prog that cleans up
+  # some Prog idioms that block valid onepass programs.
+  p = one_pass_copy(prog)
+  # checkAmbiguity on InstAlts, build onepass Prog if possible
+  if q = make_one_pass(p) {
+    cleanup_one_pass(q, prog)
+    return q
+  }
+  none
+}

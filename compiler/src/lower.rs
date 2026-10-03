@@ -2679,6 +2679,12 @@ impl<'a> Lw<'a> {
                     self.int_out(LE::Rt(Rt::StrToI, vec![v]))
                 }
             }
+            ByteIndex => {
+                let v = self.expr(recv.unwrap());
+                let a = self.expr(&args[0]);
+                let from = if args.len() > 1 { self.expr(&args[1]) } else { LE::I(0) };
+                LE::Rt(Rt::StrIndex, vec![v, a, from])
+            }
             Delete | Split => {
                 let v = self.expr(recv.unwrap());
                 let a = self.expr(&args[0]);

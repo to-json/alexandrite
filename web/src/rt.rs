@@ -442,6 +442,23 @@ pub extern "C" fn alxr_str_split(p: i64, n: i64, sp: i64, sn: i64) {
 }
 
 #[unsafe(no_mangle)]
+pub extern "C" fn alxr_str_index(p: i64, n: i64, q: i64, m: i64, from: i64) -> i64 {
+    let s = bytes(p, n);
+    let sub = bytes(q, m);
+    let from = from.max(0) as usize;
+    if from > s.len() {
+        return -1;
+    }
+    if sub.is_empty() {
+        return from as i64;
+    }
+    match s[from..].windows(sub.len()).position(|w| w == sub) {
+        Some(i) => (from + i) as i64,
+        None => -1,
+    }
+}
+
+#[unsafe(no_mangle)]
 pub extern "C" fn alxr_str_to_i(p: i64, n: i64) -> i64 {
     let s = bytes(p, n);
     let mut i = 0;

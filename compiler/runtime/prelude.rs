@@ -305,6 +305,20 @@ mod rt {
         let n = if c < 0x80 { 1 } else if c >= 0xF0 { 4 } else if c >= 0xE0 { 3 } else if c >= 0xC0 { 2 } else { 1 };
         if n > b.len() || b[1..n].iter().any(|x| x & 0xC0 != 0x80) { 1 } else { n }
     }
+    pub fn str_index(s: Str, sub: Str, from: i64) -> i64 {
+        let from = from.max(0) as usize;
+        if from > s.0.len() {
+            return -1;
+        }
+        if sub.0.is_empty() {
+            return from as i64;
+        }
+        match s.0[from..].windows(sub.0.len()).position(|w| w == &sub.0[..]) {
+            Some(i) => (from + i) as i64,
+            None => -1,
+        }
+    }
+
     pub fn str_to_i(s: Str) -> i64 {
         let t = String::from_utf8_lossy(&s.0);
         let t = t.trim_start();

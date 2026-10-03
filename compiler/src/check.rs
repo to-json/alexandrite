@@ -618,9 +618,19 @@ impl<'a> World<'a> {
                     bind_tparams(te, t, &d.tparams, &mut out);
                 }
             }
+            // Parameters the arguments don't decide come after them, in order
+            // (from the type the result is wanted as: `x: R[Int] = R.empty`).
+            let mut extra = args.iter().skip(d.params.len());
+            for tp in &d.tparams {
+                if !out.contains_key(&tp.name) {
+                    if let Some(t) = extra.next() {
+                        out.insert(tp.name.clone(), t.clone());
+                    }
+                }
+            }
             for tp in &d.tparams {
                 let Some(t) = out.get(&tp.name) else {
-                    return Err(Diag::new(tp.span, format!("can't infer `{}` from the arguments of `{}`", tp.name, d.name)));
+                    return Err(Diag::new(tp.span, format!("can't infer `{}` from the arguments of `{}`; declare the type the result is wanted as", tp.name, d.name)));
                 };
                 check_bound(tp, t, sp)?;
                 b.push((tp.name.clone(), t.clone()));
@@ -1205,6 +1215,8 @@ struct FnCx<'w, 'a> {
     /// The type the expression being checked is wanted as (for inferring
     /// a generic constructor's type arguments).
     want_hint: Option<Ty>,
+    /// `R[Str].empty`: the type arguments a static method's call gives (consumed by `call_def`).
+    owner_targs: Vec<Ty>,
     /// In a method: `Some(true)` for a `!` method (`self` is a one-element
     /// slice holding the receiver), `Some(false)` for one taking a copy.
     method: Option<bool>,
@@ -1265,6 +1277,7 @@ impl<'w, 'a> FnCx<'w, 'a> {
             pure_decl: def.is_some_and(|d| d.pure),
             fn_name: def.map_or("main".into(), |d| d.name.clone()),
             want_hint: None,
+            owner_targs: vec![],
             errs: Default::default(),
             decl_spans: vec![],
             usings: def.map_or_else(Vec::new, |d| d.using.iter().map(|u| (0, resolve_name(u, Span::default(), &|_| true).unwrap_or_else(|_| u.clone()))).collect()),
@@ -4387,6 +4400,7 @@ impl<'w, 'a> FnCx<'w, 'a> {
 
     /// Call def `def` with checked arguments (a method's include `self`).
     fn call_def(&mut self, def: usize, name: &str, name_span: Span, args: Vec<TExpr>, sp: Span) -> R<TExpr> {
+        let owner_targs = std::mem::take(&mut self.owner_targs);
         let d = self.w.defs[def].def.clone();
         let via_targ = d.name.rsplit_once('.').is_some_and(|(owner, _)| self.targ_types.iter().any(|t| t == owner));
         if !d.public && self.w.defs[def].pkg != current_pkg() && !via_targ {
@@ -4398,9 +4412,41 @@ impl<'w, 'a> FnCx<'w, 'a> {
             let own = usize::from(d.params.first().is_some_and(|p| p.name == "self"));
             return Err(Diag::new(name_span, format!("`{name}` takes {} argument(s), got {}", d.params.len() - own, args.len() - own)));
         }
-        let arg_tys: Vec<Ty> = args.iter().map(|a| self.resolve(&a.ty)).collect();
         // The callee's signature means what it means in its own package.
         let prev = enter_pkg(&self.w.defs[def].pkg);
+        let mut args = args;
+        if !owner_targs.is_empty() {
+            // `R[Byte].make(2, 7)`: the arguments adapt to the given types first.
+            let env: HashMap<String, Ty> = d.tparams.iter().map(|tp| tp.name.clone()).zip(owner_targs.iter().cloned()).collect();
+            for (a, p) in args.iter_mut().zip(&d.params) {
+                if let Some(want) = p.ty.as_ref().and_then(|te| subst_type(te, &env, &self.w.structs, &self.w.consts)) {
+                    match self.coerce(a.clone(), &want) {
+                        Ok(v) => *a = v,
+                        Err(e) => {
+                            leave_pkg(prev);
+                            return Err(e);
+                        }
+                    }
+                }
+            }
+        }
+        let mut arg_tys: Vec<Ty> = args.iter().map(|a| self.resolve(&a.ty)).collect();
+        if !owner_targs.is_empty() {
+            let mut out = HashMap::new();
+            for (p, t) in d.params.iter().zip(&arg_tys) {
+                if let Some(te) = &p.ty {
+                    bind_tparams(te, t, &d.tparams, &mut out);
+                }
+            }
+            for (tp, want) in d.tparams.iter().zip(&owner_targs) {
+                if let Some(got) = out.get(&tp.name).filter(|got| *got != want && !got.has_var()) {
+                    leave_pkg(prev);
+                    return Err(Diag::new(name_span, format!("`{name}`: `{}` is {}, but the arguments make it {}", tp.name, want.show(), got.show())));
+                }
+            }
+        }
+        let extra = self.result_targs(&d, &arg_tys, &owner_targs);
+        arg_tys.extend(extra.iter().cloned());
         let saved = match self.w.bind(def, &arg_tys, sp) {
             Ok(s) => s,
             Err(e) => {
@@ -4412,7 +4458,41 @@ impl<'w, 'a> FnCx<'w, 'a> {
         self.w.unbind(saved);
         leave_pkg(prev);
         let targs = r?;
-        self.call_def_inst(def, name, name_span, targs, sp, &d)
+        self.call_def_inst(def, name, name_span, targs, extra, sp, &d)
+    }
+
+    /// Type parameters of a generic def that its arguments don't decide,
+    /// taken from the type its result is wanted as (in tparam order).
+    /// A static method's own type's arguments (`R[Str].empty`) come first.
+    fn result_targs(&mut self, d: &Def, arg_tys: &[Ty], owner_targs: &[Ty]) -> Vec<Ty> {
+        if d.tparams.is_empty() {
+            return vec![];
+        }
+        let mut out = HashMap::new();
+        for (p, t) in d.params.iter().zip(arg_tys) {
+            if let Some(te) = &p.ty {
+                bind_tparams(te, t, &d.tparams, &mut out);
+            }
+        }
+        if d.tparams.iter().all(|tp| out.contains_key(&tp.name)) {
+            return vec![];
+        }
+        let mut from_ret: HashMap<String, Ty> = d.tparams.iter().map(|tp| tp.name.clone()).zip(owner_targs.iter().cloned()).collect();
+        if let (Some(want), Some(ret)) = (self.want_hint.clone(), d.ret.as_ref()) {
+            let want = self.resolve(&want);
+            bind_tparams(ret, &want, &d.tparams, &mut from_ret);
+        }
+        let mut extra = vec![];
+        for tp in &d.tparams {
+            if out.contains_key(&tp.name) {
+                continue;
+            }
+            match from_ret.get(&tp.name) {
+                Some(t) if !t.has_var() => extra.push(t.clone()),
+                _ => return vec![],
+            }
+        }
+        extra
     }
 
     fn call_def_args(&mut self, name_span: Span, d: &Def, ext: Option<Vec<Ty>>, args: Vec<TExpr>) -> R<Vec<TExpr>> {
@@ -4438,8 +4518,9 @@ impl<'w, 'a> FnCx<'w, 'a> {
         Ok(targs)
     }
 
-    fn call_def_inst(&mut self, def: usize, name: &str, name_span: Span, targs: Vec<TExpr>, sp: Span, d: &Def) -> R<TExpr> {
-        let arg_tys: Vec<Ty> = targs.iter().map(|a| self.resolve(&a.ty)).collect();
+    #[allow(clippy::too_many_arguments)]
+    fn call_def_inst(&mut self, def: usize, name: &str, name_span: Span, targs: Vec<TExpr>, extra: Vec<Ty>, sp: Span, d: &Def) -> R<TExpr> {
+        let mut arg_tys: Vec<Ty> = targs.iter().map(|a| self.resolve(&a.ty)).collect();
         if arg_tys.iter().any(Ty::has_var) {
             let t = self.unknown(sp, "this call's arguments")?;
             return Ok(self.mk(TK::Unit, t, sp));
@@ -4448,6 +4529,7 @@ impl<'w, 'a> FnCx<'w, 'a> {
         if self.pure_decl && !callee_pure {
             return Err(Diag::new(name_span, format!("`#[pure] def {}` calls `{name}`, which isn't pure", self.fn_name)));
         }
+        arg_tys.extend(extra);
         let fid = self.w.instance(def, arg_tys, sp)?;
         let (ret, fallible, io) = match &self.w.funcs[fid] {
             Some(f) => (f.ret.clone(), f.fallible, f.io),
@@ -4482,6 +4564,16 @@ impl<'w, 'a> FnCx<'w, 'a> {
     fn const_call(&mut self, c: &str, csp: Span, name: &str, name_span: Span, args: &[Expr], block: Option<&Block>, sp: Span) -> R<TExpr> {
         let resolved = resolve_name(c, csp, &|q| self.w.structs.contains_key(q) || generic(q).is_some())?;
         let c = resolved.as_str();
+        if let (Some(GenDef::S(_)), false, true) = (generic(c), self.w.structs.contains_key(c), name != "new") {
+            // `Ring.make(3, v)`: a static method of a generic type, generic over its parameters.
+            let q = method_name(c, name);
+            if let Some(&def) = self.w.by_name.get(&q) {
+                if self.w.defs[def].def.params.first().is_none_or(|p| p.name != "self") {
+                    // (`named` only marks `c` as a type here; the def infers its parameters.)
+                    return self.const_call_named(c, Some(Ty::Unit), csp, name, name_span, args, block, sp);
+                }
+            }
+        }
         if let (Some(g), false) = (generic(c), self.w.structs.contains_key(c)) {
             // `Stack.new(items: [1])`: infer the type arguments from the values
             // (or from the type the value is wanted as).
@@ -4561,6 +4653,11 @@ impl<'w, 'a> FnCx<'w, 'a> {
                             None => self.value(a)?,
                         };
                         targs.push(v);
+                    }
+                    if let Some((base, ts)) = named.as_ref().and_then(inst_args) {
+                        if base == c {
+                            self.owner_targs = ts;
+                        }
                     }
                     return self.call_def(def, &q, name_span, targs, sp);
                 }

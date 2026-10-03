@@ -9,10 +9,14 @@ use std::collections::HashSet;
 
 /// Methods of a generic type take `self` untyped: each instance is checked
 /// with the concrete type.
-fn generic_self(methods: &mut [Def]) {
+fn generic_self(methods: &mut [Def], tparams: &[TParam]) {
     for m in methods {
         if let Some(p) = m.params.first_mut().filter(|p| p.name == "self") {
             p.ty = None;
+        } else {
+            // A static method (`def self.make(v: T) -> R[T]`) is generic over the type's parameters.
+            let own = std::mem::take(&mut m.tparams);
+            m.tparams = tparams.iter().cloned().chain(own).collect();
         }
     }
 }
@@ -743,7 +747,7 @@ impl<'a> Parser<'a> {
             variants.push((vname, fields, vsp));
         }
         if !tparams.is_empty() {
-            generic_self(&mut methods[first_method..]);
+            generic_self(&mut methods[first_method..], &tparams);
         }
         let span = start.to(self.prev_span());
         if derives.iter().any(|d| d == "Json") {
@@ -809,7 +813,7 @@ impl<'a> Parser<'a> {
             fopts.push(std::mem::take(&mut pend));
         }
         if !tparams.is_empty() {
-            generic_self(&mut methods[first_method..]);
+            generic_self(&mut methods[first_method..], &tparams);
         }
         let span = start.to(self.prev_span());
         if derives.iter().any(|d| d == "Json") {

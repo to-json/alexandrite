@@ -1,0 +1,194 @@
+# MIMEHeader and header-key canonicalization, after Go's header.go and the
+# key functions of reader.go.
+import "strings"
+
+# A MIME-style header: canonical keys mapped to their values, in the order
+# the keys were first added. Copies share the map (Go's MIMEHeader is a map).
+pub struct MIMEHeader {
+  m: Map[Str, [Str]]
+
+  # Appends value to key's values.
+  pub def add!(key: Str, value: Str) {
+    self.add_raw!(canonical_mime_header_key(key), value)
+  }
+
+  # Appends value to the values of `key` as given (no canonicalization; Go's
+  # h[key] = append(h[key], value)).
+  pub def add_raw!(key: Str, value: Str) {
+    if vs = m[key] {
+      vs << value
+      self.m[key] = vs
+    } else {
+      self.m[key] = [value]
+    }
+  }
+
+  # Replaces key's values with value.
+  pub def set!(key: Str, value: Str) {
+    self.m[canonical_mime_header_key(key)] = [value]
+  }
+
+  # Sets key's values as given (no canonicalization; Go's h[key] = vs).
+  pub def set_raw!(key: Str, values: [Str]) {
+    self.m[key] = values
+  }
+
+  # The first value of key, "" if there is none.
+  pub def get(key: Str) -> Str {
+    if vs = m[canonical_mime_header_key(key)] {
+      return vs.size == 0 ? "" : vs[0]
+    }
+    ""
+  }
+
+  # Every value of key (empty when absent).
+  pub def values(key: Str) -> [Str] {
+    if vs = m[canonical_mime_header_key(key)] {
+      return vs
+    }
+    out: [Str] = []
+    out
+  }
+
+  # key's values without canonicalizing it (Go's h[key]); none if absent.
+  pub def raw(key: Str) -> [Str]? {
+    m[key]
+  }
+
+  pub def has?(key: Str) -> Bool {
+    m.key?(canonical_mime_header_key(key))
+  }
+
+  # Removes key.
+  pub def del!(key: Str) {
+    self.m.delete(canonical_mime_header_key(key))
+  }
+
+  # The number of keys.
+  pub def size -> Int { m.size }
+
+  # The keys, in insertion order.
+  pub def keys -> [Str] {
+    out: [Str] = []
+    for k, _ in m { out << k }
+    out
+  }
+
+  # The keys, sorted.
+  pub def sorted_keys -> [Str] {
+    keys.sort
+  }
+
+  # A copy that doesn't share storage.
+  pub def clone -> MIMEHeader {
+    out = new_mime_header
+    for k, vs in m {
+      c: [Str] = []
+      for v in vs { c << v }
+      out.m[k] = c
+    }
+    out
+  }
+
+  # Same keys with the same values (order of keys ignored, as Go's maps).
+  def ==(o: MIMEHeader) -> Bool {
+    return false if m.size != o.m.size
+    for k, vs in m {
+      if ws = o.m[k] {
+        return false unless vs == ws
+      } else {
+        return false
+      }
+    }
+    true
+  }
+
+  # Go's %v of the map: map[K1:[v1 v2] K2:[v]] with keys sorted.
+  def to_s -> Str {
+    b = strings.new_builder
+    b.write!("map[")
+    first = true
+    for k in keys.sort {
+      b.write!(" ") unless first
+      first = false
+      b.write!(k)
+      b.write!(":[")
+      b.write!(strings.join(m[k] || [], " "))
+      b.write!("]")
+    }
+    b.write!("]")
+    b.to_s
+  }
+}
+
+pub def new_mime_header -> MIMEHeader {
+  mm: Map[Str, [Str]] = {}
+  MIMEHeader.new(m: mm)
+}
+
+# Whether c may appear in a header field name (an RFC 7230 token byte).
+pub def valid_header_field_byte?(c: Byte) -> Bool {
+  return true if (c >= 97 && c <= 122) || (c >= 65 && c <= 90) || (c >= 48 && c <= 57)
+  c == 33 || c == 35 || c == 36 || c == 37 || c == 38 || c == 39 || c == 42 || c == 43 || c == 45 || c == 46 || c == 94 || c == 95 || c == 96 || c == 124 || c == 126
+}
+
+# Whether c may appear in a header field value: VCHAR, SP, HTAB, obs-text.
+pub def valid_header_value_byte?(c: Byte) -> Bool {
+  c >= 0x80 || (c >= 0x20 && c != 0x7F) || c == 9
+}
+
+# The canonical form of a MIME header key: the first letter and any letter
+# after a hyphen upper case, the rest lower case ("accept-encoding" ->
+# "Accept-Encoding"). A key with a space or a byte that isn't a token byte
+# is returned unchanged.
+pub def canonical_mime_header_key(s: Str) -> Str {
+  upper = true
+  i = 0
+  while i < s.size {
+    c = s[i]
+    return s unless valid_header_field_byte?(c)
+    if upper && c >= 97 && c <= 122 {
+      k, _ = canonical_key_ok(s)
+      return k
+    }
+    if !upper && c >= 65 && c <= 90 {
+      k, _ = canonical_key_ok(s)
+      return k
+    }
+    upper = c == 45
+    i += 1
+  }
+  s
+}
+
+# Go's canonicalMIMEHeaderKey: the canonical key and whether a is a valid
+# field name. A name with spaces (but otherwise valid) is kept as it is and is
+# valid.
+def canonical_key_ok(a: Str) -> (Str, Bool) {
+  return ("", false) if a.size == 0
+  no_canon = false
+  for c in a.bytes {
+    next if valid_header_field_byte?(c)
+    if c == 32 {
+      no_canon = true
+      next
+    }
+    return (a, false)
+  }
+  return (a, true) if no_canon
+  b = a.bytes.to_a
+  upper = true
+  i = 0
+  while i < b.size {
+    c = b[i]
+    if upper && c >= 97 && c <= 122 {
+      c = c - 32
+    } else if !upper && c >= 65 && c <= 90 {
+      c = c + 32
+    }
+    b[i] = c
+    upper = c == 45
+    i += 1
+  }
+  (Str.from_bytes(b), true)
+}

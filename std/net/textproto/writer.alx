@@ -1,0 +1,141 @@
+# Writer, after Go's writer.go.
+import "io"
+
+# Dot-writer states (Go's wstate*).
+WSTATE_BEGIN = 0
+WSTATE_BEGIN_LINE = 1
+WSTATE_CR = 2
+WSTATE_DATA = 3
+
+struct WriterState[W] {
+  wr: W
+  # Bytes not yet written to wr (Go's bufio.Writer buffer).
+  out: [Byte]
+  # The id of the open dot writer (0: none) and its state.
+  dot: Int
+  dot_state: Int
+  dot_ids: Int
+}
+
+# A writer of a text protocol's lines and dot-encoded blocks. Output is
+# buffered and written to W at the end of each line (print_line!) and when a
+# dot block is closed. Copies share state.
+pub struct Writer[W] {
+  st: [WriterState[W]]
+
+  def put!(b: [Byte]) {
+    for c in b { self.st[0].out << c }
+  }
+
+  def put_byte!(c: Byte) {
+    self.st[0].out << c
+  }
+
+  # Writes what is buffered to W.
+  pub def flush! -> ~Unit {
+    o = st[0].out
+    return if o.size == 0
+    self.st[0].out = []
+    off = 0
+    while off < o.size {
+      n = self.st[0].wr.~write!(o[off...o.size])
+      fail io.StreamError.ShortWrite if n <= 0
+      off += n
+    }
+  }
+
+  # Writes `line` followed by "\r\n" and flushes (Go's PrintfLine; format
+  # the line with `format(...)` first: alx has no variadics).
+  pub def print_line!(line: Str) -> ~Unit {
+    self.~close_dot!
+    self.put!(line.bytes.to_a)
+    self.put!([13, 10])
+    self.~flush!
+  }
+
+  # A writer of a dot-encoded block: "\n" becomes "\r\n", a "." starting a
+  # line is doubled, and close! ends the block with ".\r\n". Any other write
+  # through this Writer first closes it.
+  pub def dot_writer! -> ~DotWriter[W] {
+    self.~close_dot!
+    id = st[0].dot_ids + 1
+    self.st[0].dot_ids = id
+    self.st[0].dot = id
+    self.st[0].dot_state = WSTATE_BEGIN
+    DotWriter.new(wr: self, id: id)
+  }
+
+  def dot_write!(b: [Byte], id: Int) -> ~Int {
+    n = 0
+    while n < b.size {
+      c = b[n]
+      s = st[0].dot_state
+      if s == WSTATE_BEGIN || s == WSTATE_BEGIN_LINE {
+        self.st[0].dot_state = WSTATE_DATA
+        self.put_byte!(46) if c == 46
+        s = WSTATE_DATA
+      }
+      if s == WSTATE_DATA {
+        self.st[0].dot_state = WSTATE_CR if c == 13
+        if c == 10 {
+          self.put_byte!(13)
+          self.st[0].dot_state = WSTATE_BEGIN_LINE
+        }
+      } else if s == WSTATE_CR {
+        self.st[0].dot_state = WSTATE_DATA
+        self.st[0].dot_state = WSTATE_BEGIN_LINE if c == 10
+      }
+      self.put_byte!(c)
+      n += 1
+      self.~flush! if st[0].out.size >= 4096
+    }
+    n
+  }
+
+  def dot_close!(id: Int) -> ~Unit {
+    return if st[0].dot != id
+    self.st[0].dot = 0
+    s = st[0].dot_state
+    if s == WSTATE_BEGIN || s == WSTATE_DATA {
+      self.put!([13, 10])
+    } else if s == WSTATE_CR {
+      self.put_byte!(10)
+    }
+    self.put!([46, 13, 10])
+    self.~flush!
+  }
+
+  def close_dot! -> ~Unit {
+    d = st[0].dot
+    self.~dot_close!(d) if d != 0
+  }
+}
+
+# A Writer writing to w (Go: NewWriter(bufio.NewWriter(w))).
+pub def new_writer[W: io.Writer](w: W) -> Writer[W] {
+  st: [WriterState[W]] = [WriterState.new(wr: w, out: [], dot: 0, dot_state: 0, dot_ids: 0)]
+  Writer.new(st: st)
+}
+
+# A dot-encoded block being written (see Writer.dot_writer!). An io.Writer
+# when W holds no interface value.
+pub struct DotWriter[W] {
+  wr: Writer[W]
+  id: Int
+
+  # Writes b dot-encoded; b.size. Writing to a closed DotWriter writes
+  # nothing more to the block's end marker (the bytes go out raw, as Go's).
+  pub def write!(b: [Byte]) -> ~Int {
+    wr.~dot_write!(b, id)
+  }
+
+  pub def write_string!(s: Str) -> ~Int {
+    wr.~dot_write!(s.bytes.to_a, id)
+  }
+
+  # Ends the block (".\r\n", after a "\r\n" if the last line wasn't
+  # finished) and flushes.
+  pub def close! -> ~Unit {
+    wr.~dot_close!(id)
+  }
+}

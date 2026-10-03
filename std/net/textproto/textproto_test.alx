@@ -1,0 +1,463 @@
+# Go's net/textproto tests (reader_test.go, header_test.go, writer_test.go),
+# translated.
+import "bytes"
+import "io"
+import "net"
+import "strings"
+
+def reader(s: Str) -> Reader[bytes.Buffer] {
+  new_reader(bytes.new_buffer_string(s))
+}
+
+def hdr(pairs: [(Str, [Str])]) -> MIMEHeader {
+  h = new_mime_header
+  for p in pairs {
+    h.set_raw!(p[0], p[1])
+  }
+  h
+}
+
+def is_unexpected_eof(e: Error) -> Bool {
+  case e {
+    UnexpectedEof => true
+    _ => false
+  }
+}
+
+test "read line" {
+  r = reader("line1\nline2\n")
+  assert_eq r.read_line!.unwrap, "line1"
+  assert_eq r.read_line!.unwrap, "line2"
+  assert_eq r.read_line!.unwrap, none
+}
+
+test "read line long line" {
+  line = strings.repeat("12345", 10000)
+  r = reader(line + "\r\n")
+  assert_eq r.read_line!.unwrap, line
+}
+
+test "read continued line" {
+  r = reader("line1\nline\n 2\nline3\n")
+  assert_eq r.read_continued_line!.unwrap, "line1"
+  assert_eq r.read_continued_line!.unwrap, "line 2"
+  assert_eq r.read_continued_line!.unwrap, "line3"
+  assert_eq r.read_continued_line!.unwrap, none
+}
+
+test "read code line" {
+  r = reader("123 hi\n234 bye\n345 no way\n")
+  assert_eq r.read_code_line!(0).unwrap, (123, "hi")
+  assert_eq r.read_code_line!(23).unwrap, (234, "bye")
+  res = r.read_code_line!(346)
+  assert res.err?
+  case res.err.unwrap {
+    Code(code, msg) => {
+      assert_eq code, 345
+      assert_eq msg, "no way"
+    }
+    _ => assert false, "wrong error"
+  }
+  assert_eq res.err.unwrap.message, "345 \"no way\""
+  assert is_unexpected_eof(r.read_code_line!(1).err.unwrap)
+}
+
+test "read dot lines" {
+  r = reader("dotlines\r\n.foo\r\n..bar\n...baz\nquux\r\n\r\n.\r\nanother\n")
+  assert_eq r.read_dot_lines!.unwrap, ["dotlines", "foo", ".bar", "..baz", "quux", ""]
+  res = r.read_dot_lines!
+  assert is_unexpected_eof(res.err.unwrap)
+}
+
+test "read dot bytes" {
+  r = reader("dotlines\r\n.foo\r\n..bar\n...baz\nquux\r\n\r\n.\r\nanot.her\r\n")
+  assert_eq Str.from_bytes(r.read_dot_bytes!.unwrap), "dotlines\nfoo\n.bar\n..baz\nquux\n\n"
+  res = r.read_dot_bytes!
+  assert is_unexpected_eof(res.err.unwrap)
+}
+
+test "dot reader is an io.Reader and a read after it skips the block" {
+  r = reader("a\r\n..b\r\n.\r\nnext line\r\n")
+  d = r.dot_reader!.unwrap
+  assert_eq Str.from_bytes(io.read_all(d).unwrap), "a\n.b\n"
+  assert_eq r.read_line!.unwrap, "next line"
+  r2 = reader("skip\r\nme\r\n.\r\nafter\r\n")
+  d2 = r2.dot_reader!.unwrap
+  buf: [Byte] = [0; 2]
+  assert_eq d2.read!(buf).unwrap, 2
+  assert_eq r2.read_line!.unwrap, "after"
+  # the old dot reader is finished
+  assert_eq d2.read!(buf).unwrap, 0
+}
+
+test "read MIME header" {
+  r = reader("my-key: Value 1  \r\nLong-key: Even \n Longer Value\r\nmy-Key: Value 2\r\n\n")
+  m = r.read_mime_header!.unwrap
+  assert_eq m, hdr([("My-Key", ["Value 1", "Value 2"]), ("Long-Key", ["Even Longer Value"])])
+}
+
+test "read MIME header single" {
+  r = reader("Foo: bar\n\n")
+  assert_eq r.read_mime_header!.unwrap, hdr([("Foo", ["bar"])])
+}
+
+test "reader upcoming header keys" {
+  tests = [
+    ("", 0),
+    ("A: v", 1),
+    ("A: v\r\nB: v\r\n", 2),
+    ("A: v\nB: v\n", 2),
+    ("A: v\r\n  continued\r\n  still continued\r\nB: v\r\n\r\n", 2),
+    ("A: v\r\n\r\nB: v\r\nC: v\r\n", 1),
+    ("A: v" + strings.repeat("\n", 1000), 1)
+  ]
+  for t in tests {
+    r = reader(t[0])
+    assert_eq r.upcoming_header_keys!, t[1]
+  }
+}
+
+test "read MIME header no key" {
+  r = reader(": bar\ntest-1: 1\n\n")
+  assert r.read_mime_header!.err?
+}
+
+test "large read MIME header" {
+  sdata = strings.repeat("x", 16 * 1024)
+  r = reader("Cookie: " + sdata + "\r\n\n")
+  m = r.read_mime_header!.unwrap
+  assert_eq m.get("Cookie"), sdata
+}
+
+test "read MIME header non-compliant" {
+  r = reader("Foo: bar\r\nContent-Language: en\r\nSID : 0\r\nAudio Mode : None\r\nPrivilege : 127\r\n\r\n")
+  m = r.read_mime_header!.unwrap
+  want = hdr([("Foo", ["bar"]), ("Content-Language", ["en"]), ("SID ", ["0"]), ("Audio Mode ", ["None"]), ("Privilege ", ["127"])])
+  assert_eq m, want
+}
+
+test "read MIME header malformed" {
+  inputs = [
+    "No colon first line\r\nFoo: foo\r\n\r\n",
+    " No colon first line with leading space\r\nFoo: foo\r\n\r\n",
+    "\tNo colon first line with leading tab\r\nFoo: foo\r\n\r\n",
+    " First: line with leading space\r\nFoo: foo\r\n\r\n",
+    "\tFirst: line with leading tab\r\nFoo: foo\r\n\r\n",
+    "Foo: foo\r\nNo colon second line\r\n\r\n",
+    "Foo-\n\tBar: foo\r\n\r\n",
+    "Foo-\r\n\tBar: foo\r\n\r\n",
+    "Foo\r\n\t: foo\r\n\r\n",
+    "Foo-\n\tBar",
+    "Foo \tBar: foo\r\n\r\n",
+    ": empty key\r\n\r\n"
+  ]
+  for input in inputs {
+    r = reader(input)
+    res = r.read_mime_header!
+    assert res.err?, "want an error for #{input}"
+    assert !is_unexpected_eof(res.err.unwrap), "want a malformed error for #{input}"
+  }
+}
+
+test "read MIME header bytes" {
+  i = 0
+  while i <= 0xff {
+    s = Str.from_bytes("Foo".bytes.to_a + [i.as_u8] + "Bar: foo\r\n\r\n".bytes.to_a)
+    want_err = true
+    want_err = false if i >= 48 && i <= 57
+    want_err = false if i >= 97 && i <= 122
+    want_err = false if i >= 65 && i <= 90
+    want_err = false if i == 33 || i == 35 || i == 36 || i == 37 || i == 38 || i == 39 || i == 42 || i == 43 || i == 45 || i == 46 || i == 94 || i == 95 || i == 96 || i == 124 || i == 126
+    want_err = false if i == 58 || i == 32
+    r = reader(s)
+    assert_eq r.read_mime_header!.err?, want_err
+    i += 1
+  }
+  i = 0
+  while i <= 0xff {
+    # Go writes string(rune(i)): bytes >= 0x80 become two UTF-8 bytes.
+    rb = i < 0x80 ? [i.as_u8] : [(0xC0 | (i >> 6)).as_u8, (0x80 | (i & 0x3F)).as_u8]
+    s = Str.from_bytes("Foo: foo".bytes.to_a + rb + "bar\r\n\r\n".bytes.to_a)
+    want_err = true
+    want_err = false if i >= 0x21 && i <= 0x7e
+    want_err = false if i == 32 || i == 9
+    want_err = false if i >= 0x80
+    r = reader(s)
+    assert_eq r.read_mime_header!.err?, want_err
+    i += 1
+  }
+}
+
+test "read MIME header trim continued" {
+  r = reader("a:\n 0 \r\nb:1 \t\r\nc: 2\r\n 3\t\n  \t 4  \r\n\n")
+  m = r.read_mime_header!.unwrap
+  assert_eq m, hdr([("A", ["0"]), ("B", ["1"]), ("C", ["2 3 4"])])
+}
+
+test "read MIME header at EOF" {
+  r = reader("Foo: bar\r\n")
+  assert is_unexpected_eof(r.read_mime_header!.err.unwrap)
+  r2 = reader("Foo: bar\r\n")
+  h, eof = r2.read_mime_header_to_eof!.unwrap
+  assert eof
+  assert_eq h.get("foo"), "bar"
+  r3 = reader("")
+  h3, eof3 = r3.read_mime_header_to_eof!.unwrap
+  assert eof3
+  assert_eq h3.size, 0
+}
+
+test "read MIME header limits" {
+  r = reader("A: 1\r\nB: 2\r\nC: 3\r\n\r\n")
+  assert r.read_mime_header_limited!(1 << 20, 2).err?
+  r = reader("A: 1\r\nB: 2\r\n\r\n")
+  h, _ = r.read_mime_header_limited!(1 << 20, 2).unwrap
+  assert_eq h.size, 2
+  r = reader("A: " + strings.repeat("x", 1000) + "\r\n\r\n")
+  assert_eq r.read_mime_header_limited!(1000, 10).err.unwrap.message, "message too large"
+}
+
+test "RFC 959 lines" {
+  tests = [
+    ("230-Anonymous access granted, restrictions apply\nRead the file README.txt,\n230  please", 23, 230, "Anonymous access granted, restrictions apply\nRead the file README.txt,\n please"),
+    ("230 Anonymous access granted, restrictions apply\n", 23, 230, "Anonymous access granted, restrictions apply"),
+    ("400-A\n400-B\n400 C", 4, 400, "A\nB\nC"),
+    ("400-A\r\n400-B\r\n400 C\r\n", 4, 400, "A\nB\nC")
+  ]
+  for t in tests {
+    r = reader(t[0] + "\nFOLLOWING DATA")
+    code, msg = r.read_response!(t[1]).unwrap
+    assert_eq code, t[2]
+    assert_eq msg, t[3]
+  }
+}
+
+test "read multi-line error" {
+  r = reader("550-5.1.1 The email account that you tried to reach does not exist. Please try\n" + "550-5.1.1 double-checking the recipient's email address for typos or\n" + "550-5.1.1 unnecessary spaces. Learn more at\n" + "Unexpected but legal text!\n" + "550 5.1.1 https://support.google.com/mail/answer/6596 h20si25154304pfd.166 - gsmtp\n")
+  want_msg = "5.1.1 The email account that you tried to reach does not exist. Please try\n" + "5.1.1 double-checking the recipient's email address for typos or\n" + "5.1.1 unnecessary spaces. Learn more at\n" + "Unexpected but legal text!\n" + "5.1.1 https://support.google.com/mail/answer/6596 h20si25154304pfd.166 - gsmtp"
+  want_error = "550 \"5.1.1 The email account that you tried to reach does not exist. Please try\\n5.1.1 double-checking the recipient's email address for typos or\\n5.1.1 unnecessary spaces. Learn more at\\nUnexpected but legal text!\\n5.1.1 https://support.google.com/mail/answer/6596 h20si25154304pfd.166 - gsmtp\""
+  res = r.read_response!(250)
+  assert res.err?
+  case res.err.unwrap {
+    Code(code, msg) => {
+      assert_eq code, 550
+      assert_eq msg, want_msg
+    }
+    _ => assert false, "wrong error"
+  }
+  assert_eq res.err.unwrap.message, want_error
+}
+
+test "canonical MIME header key" {
+  tests = [
+    ("a-b-c", "A-B-C"),
+    ("a-1-c", "A-1-C"),
+    ("User-Agent", "User-Agent"),
+    ("uSER-aGENT", "User-Agent"),
+    ("user-agent", "User-Agent"),
+    ("USER-AGENT", "User-Agent"),
+    ("foo-bar_baz", "Foo-Bar_baz"),
+    ("foo-bar$baz", "Foo-Bar$baz"),
+    ("foo-bar~baz", "Foo-Bar~baz"),
+    ("foo-bar*baz", "Foo-Bar*baz"),
+    ("üser-agenT", "üser-agenT"),
+    ("a B", "a B"),
+    ("C Ontent-Transfer-Encoding", "C Ontent-Transfer-Encoding"),
+    ("foo bar", "foo bar")
+  ]
+  for t in tests {
+    assert_eq canonical_mime_header_key(t[0]), t[1]
+  }
+}
+
+test "MIME header multiple values" {
+  h = hdr([("Set-Cookie", ["cookie 1", "cookie 2"])])
+  assert_eq h.values("set-cookie").size, 2
+}
+
+test "MIME header methods" {
+  h = new_mime_header
+  h.add!("content-type", "a")
+  h.add!("Content-Type", "b")
+  h.set!("x-one", "1")
+  assert_eq h.get("CONTENT-TYPE"), "a"
+  assert_eq h.values("content-type"), ["a", "b"]
+  assert_eq h.keys, ["Content-Type", "X-One"]
+  h.del!("content-type")
+  assert_eq h.get("content-type"), ""
+  assert !h.has?("Content-Type")
+  assert_eq "#{h}", "map[X-One:[1]]"
+}
+
+def collect -> (bytes.Buffer, Writer[bytes.Buffer]) {
+  buf = bytes.new_buffer([])
+  (buf, new_writer(buf))
+}
+
+test "printf line" {
+  buf, w = collect()
+  w.print_line!(format("foo %d", 123)).unwrap
+  assert_eq buf.to_s, "foo 123\r\n"
+}
+
+test "dot writer" {
+  buf, w = collect()
+  d = w.dot_writer!.unwrap
+  assert_eq d.write!("abc\n.def\n..ghi\n.jkl\n.".bytes.to_a).unwrap, 21
+  d.close!.unwrap
+  assert_eq buf.to_s, "abc\r\n..def\r\n...ghi\r\n..jkl\r\n..\r\n.\r\n"
+}
+
+test "dot writer close empty write" {
+  buf, w = collect()
+  d = w.dot_writer!.unwrap
+  assert_eq d.write!([]).unwrap, 0
+  d.close!.unwrap
+  assert_eq buf.to_s, "\r\n.\r\n"
+}
+
+test "dot writer close no write" {
+  buf, w = collect()
+  d = w.dot_writer!.unwrap
+  d.close!.unwrap
+  assert_eq buf.to_s, "\r\n.\r\n"
+}
+
+test "dot writer is an io.Writer; a line write closes it" {
+  buf, w = collect()
+  d = w.dot_writer!.unwrap
+  io.write_string(d, "x\r\ny").unwrap
+  w.print_line!("QUIT").unwrap
+  assert_eq buf.to_s, "x\r\ny\r\n.\r\nQUIT\r\n"
+}
+
+test "trim string and bytes" {
+  assert_eq trim_string(" \t a b \r\n"), "a b"
+  assert_eq trim_string(""), ""
+  assert_eq Str.from_bytes(trim_bytes("\n x \n".bytes.to_a)), "x"
+}
+
+test "pipeline orders requests" {
+  p = new_pipeline
+  out = Chan[Int].new(10)
+  a = p.next
+  b = p.next
+  assert_eq (a, b), (0, 1)
+  t = spawn {
+    p.start_request(b)
+    out << b
+    p.end_request(b)
+  }
+  p.start_request(a)
+  out << a
+  p.end_request(a)
+  t.wait.unwrap
+  assert_eq out.recv, 0
+  assert_eq out.recv, 1
+}
+
+test "conn over loopback" {
+  l = net.listen("tcp", "127.0.0.1:0").unwrap
+  port = l.port
+  srv = spawn {
+    c = new_conn(l.~accept)
+    line = c.~read_line!
+    c.~print_line!("250-hello #{line || ""}")
+    c.~print_line!("250 ok")
+    data = c.~read_dot_lines!
+    c.~print_line!("250 got #{data.size}")
+    c.~close!
+  }
+  c = dial("tcp", "127.0.0.1:#{port}").unwrap
+  id = c.cmd!("HELO x").unwrap
+  c.start_response(id)
+  code, msg = c.read_response!(250).unwrap
+  c.end_response(id)
+  assert_eq code, 250
+  assert_eq msg, "hello HELO x\nok"
+  d = c.dot_writer!.unwrap
+  d.write_string!("one\ntwo\n").unwrap
+  d.close!.unwrap
+  assert_eq c.read_code_line!(2).unwrap, (250, "got 2")
+  srv.wait.unwrap
+  c.close!.unwrap
+}
+
+# ------------------------------------------- helpers for vec_textproto_test
+
+def render_header(h: MIMEHeader) -> Str {
+  parts: [Str] = []
+  for k in h.sorted_keys {
+    parts << k + "=[" + strings.join(h.raw(k) || [], "|") + "]"
+  }
+  strings.join(parts, ";")
+}
+
+def mh(s: Str) -> Str {
+  r = reader(s)
+  res = r.read_mime_header_to_eof!
+  return "ERR " + res.err.unwrap.message if res.err?
+  h, eof = res.unwrap
+  eof ? render_header(h) + " +EOF" : render_header(h)
+}
+
+def code_result(res: ~(Int, Str)) -> Str {
+  if e = res.err {
+    return "EOF" if is_unexpected_eof(e)
+    out = ""
+    case e {
+      Code(c, m) => out = "CODE #{c}|#{m}"
+      _ => out = "ERR " + e.message
+    }
+    return out
+  }
+  c, m = res.unwrap
+  "#{c}|#{m}"
+}
+
+def rr(s: Str, code: Int) -> Str {
+  r = reader(s)
+  code_result(r.read_response!(code))
+}
+
+def rcl(s: Str, code: Int) -> Str {
+  r = reader(s)
+  code_result(r.read_code_line!(code))
+}
+
+def cont(s: Str) -> Str {
+  r = reader(s)
+  out = ""
+  loop {
+    l = r.read_continued_line!
+    return "ERR " + l.err.unwrap.message if l.err?
+    if x = l.unwrap {
+      out = out + "<" + x + ">"
+    } else {
+      break
+    }
+  }
+  out
+}
+
+def dotb(s: Str) -> Str {
+  r = reader(s)
+  res = r.read_dot_bytes!
+  return "ERR " + res.err.unwrap.message if res.err?
+  Str.from_bytes(res.unwrap)
+}
+
+def dotl(s: Str) -> Str {
+  r = reader(s)
+  res = r.read_dot_lines!
+  return "ERR " + res.err.unwrap.message if res.err?
+  strings.join(res.unwrap, "|")
+}
+
+def dotw(s: Str) -> Str {
+  buf, w = collect()
+  d = w.dot_writer!.unwrap
+  d.write_string!(s).unwrap
+  d.close!.unwrap
+  buf.to_s
+}

@@ -36,3 +36,6 @@ Open problems agents reported; each gets fixed in a compiler round between waves
 | 30 | math/big | no mutable package globals (caches like Go's divisor table) | open (design) |
 | 31 | math/big | `format` has no `%g` | open |
 | 32 | math/big | a main file can't declare its own `Int`/`Float` (only packages can) | open (by design for now) |
+| 33 | math/cmplx | the C backend let clang contract `a*b - c` into an FMA on arm64 (`0.1*10.0 - 1.0` gave 5.55e-17 in `--release`, 0 on the JIT) | fixed: C is compiled with `-ffp-contract=off` (Go's amd64 results; no backend fuses) |
+| 34 | math/cmplx | std/math's exp/log/sin/hypot/... were libm (Apple's natively, Rust's `libm` in wasm): an ulp off Go's, which broke Go's own cmplx tests (asinh), and the backends disagreed | fixed: the elementary functions are Go's portable code in plain alx (std/math/elem.alx), bit-exact with Go (6280 generated vectors) |
+| 35 | math/cmplx | the committed web/test.mjs doesn't provide the `rt.ret` global the committed wasmgen imports (LinkError on every case); the main checkout has uncommitted fixes (run.js) | open (environment; a patched copy of the harness passes the complex cases) |

@@ -1294,6 +1294,7 @@ static size_t parse_size(const char *s, size_t dflt) {
     if (e == s || v <= 0) return dflt;
     if (*e == 'k' || *e == 'K') v *= 1024;
     else if (*e == 'm' || *e == 'M') v *= 1024 * 1024;
+    else if (*e == 'g' || *e == 'G') v *= 1024.0 * 1024 * 1024;
     return (size_t)v;
 }
 

@@ -342,7 +342,8 @@ int64_t *alx_atomic_new(int64_t v);
  * `ok` is written only on the chosen recv case (the caller presets it). */
 typedef struct { AlxChan *ch; void *buf; int64_t is_send; int64_t ok; } AlxSelCase;
 /* Run `fn(copy of env, result)` as a task: a coroutine on one of N worker
- * threads (ALX_PROCS, default the CPU count), 256 KiB of stack (ALX_TASK_STACK).
+ * threads (ALX_PROCS, default the CPU count), 8 MiB of stack address space,
+ * committed as touched (ALX_TASK_STACK, e.g. `512k`, `64m`, `1g`).
  * Blocking channel/wait calls park it. A panic in the task is caught: see
  * alx_task_wait. */
 AlxTask *alx_spawn(AlxWorker fn, const void *env, size_t in_size, size_t out_size);

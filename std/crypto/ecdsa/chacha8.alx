@@ -1,0 +1,257 @@
+#![overflow(wrap)]
+# Go's math/rand/v2 ChaCha8 (internal/chacha8rand, the generic block
+# function), as the io.Reader of the legacy signing path: signLegacy seeds
+# one with rand.NewChaCha8(seed) and reads its nonce candidates from it.
+# alx's std has no math/rand/v2 yet; this is the part ecdsa needs (Init,
+# Next, Refill, Uint64 and Read), with the same output as Go's.
+
+# Go's chacha8rand constants.
+CTR_INC: U32 = 4  # increment counter by 4 between block calls
+CTR_MAX: U32 = 16 # reseed when counter reaches 16
+CHUNK = 32        # each chunk produced by block is 32 uint64s
+RESEED = 4        # reseed with 4 words
+
+struct ChaCha8State {
+  buf: [U64]
+  seed: [U64]
+  i: Int
+  n: Int
+  c: U32
+  # The last read_len bytes of read_buf are still to be consumed by read!.
+  read_buf: [Byte]
+  read_len: Int
+}
+
+# A ChaCha8-based cryptographically strong random number generator (Go's
+# rand.ChaCha8). Copies share the state (D36).
+struct ChaCha8 {
+  st: [ChaCha8State]
+
+  # A uniformly distributed random U64 (Go's Uint64).
+  def uint64! -> U64 {
+    s = st[0]
+    if s.i >= s.n {
+      # Refill.
+      s.c += CTR_INC
+      if s.c == CTR_MAX {
+        # Reseed with generated uint64s for forward secrecy.
+        s.seed = [s.buf[CHUNK - RESEED], s.buf[CHUNK - RESEED + 1], s.buf[CHUNK - RESEED + 2], s.buf[CHUNK - RESEED + 3]]
+        s.c = 0
+      }
+      s.buf = chacha8_block(s.seed, s.c)
+      s.i = 0
+      s.n = CHUNK
+      s.n = CHUNK - RESEED if s.c == CTR_MAX - CTR_INC
+    }
+    x = s.buf[s.i]
+    s.i += 1
+    self.st[0] = s
+    x
+  }
+
+  # Reads exactly p.size bytes into p (Go's Read); returns p.size.
+  def read!(p: [Byte]) -> Int {
+    n = 0
+    s = st[0]
+    if s.read_len > 0 {
+      m = s.read_len
+      m = p.size if p.size < m
+      copy(p, s.read_buf[8 - s.read_len...8 - s.read_len + m])
+      s.read_len -= m
+      self.st[0] = s
+      n = m
+    }
+    while p.size - n >= 8 {
+      put_le64(p, n, self.uint64!)
+      n += 8
+    }
+    if p.size - n > 0 {
+      rb = [0.as_u8; 8]
+      put_le64(rb, 0, self.uint64!)
+      left = p.size - n
+      copy(p[n...p.size], rb[0...left])
+      s2 = st[0]
+      s2.read_buf = rb
+      s2.read_len = 8 - left
+      self.st[0] = s2
+      n = p.size
+    }
+    n
+  }
+}
+
+def put_le64(b: [Byte], off: Int, v: U64) {
+  i = 0
+  while i < 8 {
+    b[off + i] = (v >> (8 * i)).as_u8
+    i += 1
+  }
+}
+
+def le64(b: [Byte], off: Int) -> U64 {
+  v: U64 = 0
+  i = 7
+  while i >= 0 {
+    v = (v << 8) | b[off + i].to_u64
+    i -= 1
+  }
+  v
+}
+
+# Go's rand.NewChaCha8(seed): a ChaCha8 seeded with the 32-byte seed.
+def new_chacha8(seed: [Byte]) -> ChaCha8 {
+  sd = [le64(seed, 0), le64(seed, 8), le64(seed, 16), le64(seed, 24)]
+  s = ChaCha8State.new(buf: chacha8_block(sd, 0), seed: sd, i: 0, n: CHUNK, c: 0, read_buf: [0.as_u8; 8], read_len: 0)
+  ChaCha8.new(st: [s])
+}
+
+# Go's block_generic: four ChaCha8 blocks with counters counter..counter+3,
+# interlaced as Go's [16][4]uint32 layout and read as 32 uint64s.
+def chacha8_block(seed: [U64], counter: U32) -> [U64] {
+  # b[row * 4 + col]: row = word of the ChaCha state, col = block.
+  b = [0.as_u32; 64]
+  col = 0
+  while col < 4 {
+    b[0 * 4 + col] = 0x61707865
+    b[1 * 4 + col] = 0x3320646e
+    b[2 * 4 + col] = 0x79622d32
+    b[3 * 4 + col] = 0x6b206574
+    b[4 * 4 + col] = seed[0].as_u32
+    b[5 * 4 + col] = (seed[0] >> 32).as_u32
+    b[6 * 4 + col] = seed[1].as_u32
+    b[7 * 4 + col] = (seed[1] >> 32).as_u32
+    b[8 * 4 + col] = seed[2].as_u32
+    b[9 * 4 + col] = (seed[2] >> 32).as_u32
+    b[10 * 4 + col] = seed[3].as_u32
+    b[11 * 4 + col] = (seed[3] >> 32).as_u32
+    b[12 * 4 + col] = counter + col.as_u32
+    col += 1
+  }
+  i = 0
+  while i < 4 {
+    b0 = b[0 * 4 + i]
+    b1 = b[1 * 4 + i]
+    b2 = b[2 * 4 + i]
+    b3 = b[3 * 4 + i]
+    b4 = b[4 * 4 + i]
+    b5 = b[5 * 4 + i]
+    b6 = b[6 * 4 + i]
+    b7 = b[7 * 4 + i]
+    b8 = b[8 * 4 + i]
+    b9 = b[9 * 4 + i]
+    b10 = b[10 * 4 + i]
+    b11 = b[11 * 4 + i]
+    b12 = b[12 * 4 + i]
+    b13 = b[13 * 4 + i]
+    b14 = b[14 * 4 + i]
+    b15 = b[15 * 4 + i]
+
+    # 4 iterations of eight quarter-rounds each is 8 rounds
+    round = 0
+    while round < 4 {
+      b0 += b4
+      b12 = rotl32(b12 ^ b0, 16)
+      b8 += b12
+      b4 = rotl32(b4 ^ b8, 12)
+      b0 += b4
+      b12 = rotl32(b12 ^ b0, 8)
+      b8 += b12
+      b4 = rotl32(b4 ^ b8, 7)
+
+      b1 += b5
+      b13 = rotl32(b13 ^ b1, 16)
+      b9 += b13
+      b5 = rotl32(b5 ^ b9, 12)
+      b1 += b5
+      b13 = rotl32(b13 ^ b1, 8)
+      b9 += b13
+      b5 = rotl32(b5 ^ b9, 7)
+
+      b2 += b6
+      b14 = rotl32(b14 ^ b2, 16)
+      b10 += b14
+      b6 = rotl32(b6 ^ b10, 12)
+      b2 += b6
+      b14 = rotl32(b14 ^ b2, 8)
+      b10 += b14
+      b6 = rotl32(b6 ^ b10, 7)
+
+      b3 += b7
+      b15 = rotl32(b15 ^ b3, 16)
+      b11 += b15
+      b7 = rotl32(b7 ^ b11, 12)
+      b3 += b7
+      b15 = rotl32(b15 ^ b3, 8)
+      b11 += b15
+      b7 = rotl32(b7 ^ b11, 7)
+
+      b0 += b5
+      b15 = rotl32(b15 ^ b0, 16)
+      b10 += b15
+      b5 = rotl32(b5 ^ b10, 12)
+      b0 += b5
+      b15 = rotl32(b15 ^ b0, 8)
+      b10 += b15
+      b5 = rotl32(b5 ^ b10, 7)
+
+      b1 += b6
+      b12 = rotl32(b12 ^ b1, 16)
+      b11 += b12
+      b6 = rotl32(b6 ^ b11, 12)
+      b1 += b6
+      b12 = rotl32(b12 ^ b1, 8)
+      b11 += b12
+      b6 = rotl32(b6 ^ b11, 7)
+
+      b2 += b7
+      b13 = rotl32(b13 ^ b2, 16)
+      b8 += b13
+      b7 = rotl32(b7 ^ b8, 12)
+      b2 += b7
+      b13 = rotl32(b13 ^ b2, 8)
+      b8 += b13
+      b7 = rotl32(b7 ^ b8, 7)
+
+      b3 += b4
+      b14 = rotl32(b14 ^ b3, 16)
+      b9 += b14
+      b4 = rotl32(b4 ^ b9, 12)
+      b3 += b4
+      b14 = rotl32(b14 ^ b3, 8)
+      b9 += b14
+      b4 = rotl32(b4 ^ b9, 7)
+      round += 1
+    }
+
+    # Add b4..b11 back to the original key material, like in ChaCha20, to
+    # avoid trivial invertibility. There is no entropy in b0..b3 and
+    # b12..b15 so we can skip the additions.
+    b[0 * 4 + i] = b0
+    b[1 * 4 + i] = b1
+    b[2 * 4 + i] = b2
+    b[3 * 4 + i] = b3
+    b[4 * 4 + i] += b4
+    b[5 * 4 + i] += b5
+    b[6 * 4 + i] += b6
+    b[7 * 4 + i] += b7
+    b[8 * 4 + i] += b8
+    b[9 * 4 + i] += b9
+    b[10 * 4 + i] += b10
+    b[11 * 4 + i] += b11
+    b[12 * 4 + i] = b12
+    b[13 * 4 + i] = b13
+    b[14 * 4 + i] = b14
+    b[15 * 4 + i] = b15
+    i += 1
+  }
+  # Go reads the [16][4]uint32 array as [32]uint64 (little-endian).
+  out = [0.as_u64; 32]
+  k = 0
+  while k < 32 {
+    out[k] = b[2 * k].to_u64 | (b[2 * k + 1].to_u64 << 32)
+    k += 1
+  }
+  out
+}
+
+def rotl32(x: U32, n: Int) -> U32 { (x << n) | (x >> (32 - n)) }

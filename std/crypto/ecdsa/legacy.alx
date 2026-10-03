@@ -1,0 +1,128 @@
+# Go's crypto/ecdsa/ecdsa_legacy.go: a math/big implementation of ECDSA
+# that is only used for deprecated custom curves (an elliptic.CurveParams
+# rather than p224() ... p521()). Variable time.
+
+import "crypto/elliptic"
+import "io"
+import "math/big"
+
+def generate_legacy(c: elliptic.Curve, rand: io.Reader) -> ~PrivateKey {
+  k = ~rand_field_element(c, rand)
+  x, y = c.scalar_base_mult(k.bytes)
+  PrivateKey.new(public_key: PublicKey.new(curve: c, x: x, y: y), d: k)
+}
+
+# Go's hashToInt: a hash value as an integer. Per FIPS 186-4, Section 6.4,
+# we use the left-most bits of the hash to match the bit-length of the
+# order of the curve. This also performs Step 5 of SEC 1, Version 2.0,
+# Section 4.1.3.
+def hash_to_int(hash: [Byte], c: elliptic.Curve) -> big.Int {
+  order_bits = c.params.n.bit_len
+  order_bytes = (order_bits + 7) / 8
+  h = hash
+  h = h[0...order_bytes] if h.size > order_bytes
+
+  ret = big.Int.new
+  ret.set_bytes!(h)
+  excess = h.size * 8 - order_bits
+  ret.rsh!(ret, excess) if excess > 0
+  ret
+}
+
+def sign_legacy(priv: PrivateKey, csprng: io.Reader, hash: [Byte]) -> ~[Byte] {
+  c = priv.public_key.curve
+
+  # A cheap version of hedged signatures, for the deprecated path.
+  seed = [0.as_u8; 32]
+  ~io.read_exact(csprng, seed)
+  i = 0
+  for b in priv.d.bytes {
+    seed[i % 32] = seed[i % 32] ^ b
+    i += 1
+  }
+  i = 0
+  for b in hash {
+    seed[i % 32] = seed[i % 32] ^ b
+    i += 1
+  }
+  rng = new_chacha8(seed)
+
+  # SEC 1, Version 2.0, Section 4.1.3
+  n = c.params.n
+  fail EcdsaError.ZeroParam if n.sign == 0
+  r = big.Int.new
+  s = big.Int.new
+  while true {
+    k_inv = big.Int.new
+    while true {
+      k = ~rand_field_element(c, rng)
+      k_inv.mod_inverse!(k, n)
+
+      r, _ = c.scalar_base_mult(k.bytes)
+      r.mod!(r, n)
+      break if r.sign != 0
+    }
+
+    e = hash_to_int(hash, c)
+    s = big.Int.new
+    s.mul!(priv.d, r)
+    s.add!(s, e)
+    s.mul!(s, k_inv)
+    s.mod!(s, n) # n != 0
+    break if s.sign != 0
+  }
+
+  ~encode_signature(r.bytes, s.bytes)
+}
+
+def verify_legacy(pub: PublicKey, hash: [Byte], sig: [Byte]) -> Bool {
+  rs = parse_signature(sig)
+  return false if rs.err?
+  r_bytes, s_bytes = rs.unwrap
+  r = big.Int.new
+  r.set_bytes!(r_bytes)
+  s = big.Int.new
+  s.set_bytes!(s_bytes)
+
+  c = pub.curve
+  n = c.params.n
+
+  return false if r.sign <= 0 || s.sign <= 0
+  return false if r.cmp(n) >= 0 || s.cmp(n) >= 0
+
+  # SEC 1, Version 2.0, Section 4.1.4
+  e = hash_to_int(hash, c)
+  w = big.Int.new
+  w.mod_inverse!(s, n)
+
+  u1 = big.Int.new
+  u1.mul!(e, w)
+  u1.mod!(u1, n)
+  u2 = big.Int.new
+  u2.mul!(r, w)
+  u2.mod!(u2, n)
+
+  x1, y1 = c.scalar_base_mult(u1.bytes)
+  x2, y2 = c.scalar_mult(pub.x, pub.y, u2.bytes)
+  x, y = c.add(x1, y1, x2, y2)
+
+  return false if x.sign == 0 && y.sign == 0
+  x.mod!(x, n)
+  x.cmp(r) == 0
+}
+
+# Go's randFieldElement: a random element of the order of the curve using
+# the procedure of FIPS 186-4, Appendix B.5.2.
+def rand_field_element(c: elliptic.Curve, rand: io.Reader) -> ~big.Int {
+  while true {
+    n = c.params.n
+    b = [0.as_u8; (n.bit_len + 7) / 8]
+    ~io.read_exact(rand, b)
+    excess = b.size * 8 - n.bit_len
+    b[0] = b[0] >> excess if excess > 0
+    k = big.Int.new
+    k.set_bytes!(b)
+    return k if k.sign != 0 && k.cmp(n) < 0
+  }
+  panic("unreachable")
+}

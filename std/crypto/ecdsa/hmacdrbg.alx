@@ -1,0 +1,156 @@
+#![overflow(wrap)]
+# Go's crypto/internal/fips140/ecdsa/hmacdrbg.go: the SP 800-90A Rev. 1
+# HMAC_DRBG that makes ECDSA nonces. The hash is a hash.Hash constructor
+# (Go's is generic over the concrete hash type).
+
+import "crypto"
+import "crypto/hmac"
+import "crypto/sha512"
+import "hash"
+
+# Go's reseedInterval and maxRequestSize.
+RESEED_INTERVAL: U64 = 1 << 48
+MAX_REQUEST_SIZE = (1 << 19) / 8
+
+# The personalization string of new_drbg: Go's plainPersonalizationString
+# (written as it is) or blockAlignedPersonalizationString (each entry
+# written to the HMAC at a block boundary, as specified in
+# draft-irtf-cfrg-det-sigs-with-noise-04, Section 4).
+enum Personalization {
+  Plain(s: [Byte])
+  BlockAligned(s: [[Byte]])
+}
+
+struct DrbgState {
+  new_hash: () -> hash.Hash
+  hk: hmac.HMAC[hash.Hash]
+  v: [Byte]
+  reseed_counter: U64
+}
+
+# An SP 800-90A Rev. 1 HMAC_DRBG (Go's hmacDRBG).
+#
+# It is only intended to be used to generate ECDSA nonces. Since it will be
+# instantiated ex-novo for each signature, its generate! will only be
+# invoked once or twice (only for P-256, with probability 2⁻³²).
+#
+# Per Table 2, it has a reseed interval of 2^48 requests, and a maximum
+# request size of 2^19 bits (2^16 bytes, 64 KiB). Copies share the state
+# (D36).
+pub struct HmacDrbg {
+  st: [DrbgState]
+
+  # Produces at most MAX_REQUEST_SIZE bytes of random data in out
+  # (HMAC_DRBG_Generate_algorithm, per Section 10.1.2.5).
+  pub def generate!(out: [Byte]) {
+    panic("ecdsa: internal error: request size exceeds maximum") if out.size > MAX_REQUEST_SIZE
+    d = st[0]
+    panic("ecdsa: reseed interval exceeded") if d.reseed_counter > RESEED_INTERVAL
+
+    hk = d.hk
+    v = d.v
+    tlen = 0
+    while tlen < out.size {
+      # V = HMAC_K(V)
+      # T = T || V
+      hk.reset!
+      _ = hk.write!(v)
+      v = hk.sum([])
+      tlen += copy(out[tlen...out.size], v)
+    }
+
+    # Note that if this function shows up on ECDSA-level profiles, this can
+    # be optimized in the common case by deferring the rest to the next
+    # Generate call, which will never come in nearly all cases.
+
+    # HMAC_DRBG_Update, per Section 10.1.2.2, without provided_data.
+    # K = HMAC (K, V || 0x00)
+    hk.reset!
+    _ = hk.write!(v)
+    _ = hk.write!([0.as_u8])
+    k = hk.sum([])
+    # V = HMAC (K, V)
+    hk = hmac.new(d.new_hash, k)
+    _ = hk.write!(v)
+    v = hk.sum([])
+
+    self.st[0] = DrbgState.new(new_hash: d.new_hash, hk: hk, v: v, reseed_counter: d.reseed_counter + 1)
+    nil
+  }
+}
+
+# HMAC_DRBG_Instantiate_algorithm, per Section 10.1.2.3.
+def new_drbg(h: () -> hash.Hash, entropy: [Byte], nonce: [Byte], s: Personalization) -> HmacDrbg {
+  size = h().size
+
+  # K = 0x00 0x00 0x00 ... 0x00
+  k = [0.as_u8; size]
+
+  # V = 0x01 0x01 0x01 ... 0x01
+  v = [1.as_u8; size]
+
+  # HMAC_DRBG_Update, per Section 10.1.2.2.
+  # K = HMAC (K, V || 0x00 || provided_data)
+  hm = hmac.new(h, k)
+  drbg_update_write(hm, v, 0, entropy, nonce, s)
+  k = hm.sum([])
+  # V = HMAC (K, V)
+  hm = hmac.new(h, k)
+  _ = hm.write!(v)
+  v = hm.sum([])
+  # K = HMAC (K, V || 0x01 || provided_data).
+  hm.reset!
+  drbg_update_write(hm, v, 1, entropy, nonce, s)
+  k = hm.sum([])
+  # V = HMAC (K, V)
+  hm = hmac.new(h, k)
+  _ = hm.write!(v)
+  v = hm.sum([])
+
+  HmacDrbg.new(st: [DrbgState.new(new_hash: h, hk: hm, v: v, reseed_counter: 1)])
+}
+
+# Writes V || sep || entropy || nonce || personalization to hm.
+def drbg_update_write(hm: hmac.HMAC[hash.Hash], v: [Byte], sep: Byte, entropy: [Byte], nonce: [Byte], s: Personalization) {
+  h = hm
+  _ = h.write!(v)
+  _ = h.write!([sep])
+  _ = h.write!(entropy)
+  _ = h.write!(nonce)
+  case s {
+    Plain(p) => {
+      _ = h.write!(p)
+    }
+    BlockAligned(bs) => {
+      l = v.size + 1 + entropy.size + nonce.size
+      for b in bs {
+        pad000(h, l)
+        _ = h.write!(b)
+        l = b.size
+      }
+    }
+  }
+  nil
+}
+
+# Go's TestingOnlyNewDRBG: an HMAC_DRBG with a plain personalization
+# string. A test hook (Go uses it for ACVP and for the det-keygen vectors of
+# crypto/ecdsa's tests); not meant to be used directly.
+pub def testing_only_new_drbg(h: () -> hash.Hash, entropy: [Byte], nonce: [Byte], s: [Byte]) -> HmacDrbg {
+  new_drbg(h, entropy, nonce, Personalization.Plain(s))
+}
+
+# Pads the HMAC input with zeros to the next block boundary.
+def pad000(hm: hmac.HMAC[hash.Hash], written_so_far: Int) {
+  h = hm
+  block_size = h.block_size
+  rem = written_so_far % block_size
+  _ = h.write!([0.as_u8; block_size - rem]) if rem != 0
+  nil
+}
+
+# The constructor of SHA-512 as a hash.Hash (the hash of hedged signatures).
+def sha512_ctor -> () -> hash.Hash { ->() -> hash.Hash { sha512.new() } }
+
+# The constructor of h as a hash.Hash.
+def hash_ctor(h: crypto.Hash) -> () -> hash.Hash { ->() -> hash.Hash { h.new } }

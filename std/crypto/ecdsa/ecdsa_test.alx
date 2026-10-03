@@ -1,0 +1,550 @@
+import "crypto"
+import "crypto/elliptic"
+import "crypto/sha256"
+import "math/big"
+
+# Go's ecdsa_test.go, translated. testAllCurves runs each check on P-256,
+# P-224, P-384, P-521 and P-256's CurveParams (the generic path; see
+# all_curves). TestVectors (testdata/SigVer.rsp.bz2) is
+# vec_sigver_test.alx, TestKeyGenerationVectors (testdata/det-keygen.json)
+# is vec_detkeygen_test.alx, ecdsa_wycheproof_test.go is
+# vec_wycheproof_test.alx: 1582 of the 8678 tests of the 17 files Go
+# reads, all 484 of ecdsa_secp256r1_sha256 and, from each other file, the
+# first 4 tests of each (result, flags) kind. vec_det_test.alx and
+# vec_hedged_test.alx check keys and signatures byte for byte against Go's
+# (RFC 6979 and hedged with GODEBUG=cryptocustomrand=1, including the
+# legacy path).
+#
+# Differences in the translation:
+#   - TestEmptyHashRejection / TestSignHashLength: Go's nil opts (no hash
+#     check) and nil rand (deterministic) don't exist in alx; nil-rand
+#     cases call sign_deterministic, and "opts == nil skips the length
+#     check" is sign_asn1 (which has no opts). crypto.Hash(0) is ZeroHash
+#     below (hash_func none).
+#   - The "%T" of Go's messages and t.Parallel / TestAllImplementations
+#     (Go's assembly vs generic implementations; alx has one) are dropped.
+
+# Go's crypto.Hash(0) as SignerOpts: no hash.
+struct ZeroHash {
+  def hash_func -> crypto.Hash? { none }
+}
+
+test "KeyGeneration" {
+  for t in all_curves() {
+    c = t[1]
+    priv = generate_key(c, crand()).unwrap
+    assert c.on_curve?(priv.public_key.x, priv.public_key.y), "#{t[0]}: public key invalid"
+  }
+}
+
+test "SignAndVerify" {
+  for t in all_curves() {
+    priv = generate_key(t[1], crand()).unwrap
+    hashed = "testing".bytes
+    rs = sign(crand(), priv, hashed).unwrap
+    assert verify(priv.public_key, hashed, rs[0], rs[1]), "#{t[0]}: Verify failed"
+    hashed[0] = hashed[0] ^ 0xff
+    assert !verify(priv.public_key, hashed, rs[0], rs[1]), "#{t[0]}: Verify always works!"
+  }
+}
+
+test "SignAndVerifyASN1" {
+  for t in all_curves() {
+    priv = generate_key(t[1], crand()).unwrap
+    hashed = "testing".bytes
+    sig = sign_asn1(crand(), priv, hashed).unwrap
+    assert verify_asn1(priv.public_key, hashed, sig), "#{t[0]}: VerifyASN1 failed"
+    hashed[0] = hashed[0] ^ 0xff
+    assert !verify_asn1(priv.public_key, hashed, sig), "#{t[0]}: VerifyASN1 always works!"
+  }
+}
+
+test "EmptyHashRejection" {
+  for t in all_curves() {
+    priv = generate_key(t[1], crand()).unwrap
+    empty: [Byte] = []
+
+    # SignASN1
+    r = sign_asn1(crand(), priv, empty)
+    assert r.err?, "SignASN1 with empty hash should fail"
+    assert err_text(r).include?("cannot be empty"), "unexpected error: #{err_text(r)}"
+
+    # Sign
+    r = priv.sign(crand(), empty, crypto.SHA256)
+    assert r.err?, "Sign with empty hash should fail"
+
+    # SignDeterministic
+    r = priv.sign_deterministic(empty, crypto.SHA256)
+    assert r.err?, "deterministic Sign with empty hash should fail"
+
+    # VerifyASN1
+    hash = "test hash".bytes
+    sig = sign_asn1(crand(), priv, hash).unwrap
+    assert !verify_asn1(priv.public_key, empty, sig), "VerifyASN1 with empty hash should return false"
+  }
+}
+
+test "SignHashLength" {
+  for t in all_curves() {
+    priv = generate_key(t[1], crand()).unwrap
+    dg = sha256.sum256("message".bytes).to_a
+
+    # Go's opts == nil (no length check): sign_asn1.
+    assert sign_asn1(crand(), priv, dg).ok?, "Sign with nil opts"
+
+    # opts with matching hash length succeeds.
+    assert priv.sign(crand(), dg, crypto.SHA256).ok?, "Sign with matching hash"
+
+    # opts with mismatched hash length fails.
+    assert priv.sign(crand(), dg, crypto.SHA384).err?, "Sign with mismatched hash length should fail"
+    assert priv.sign(crand(), dg[0...dg.size - 1], crypto.SHA256).err?, "Sign with short digest should fail"
+    assert priv.sign(crand(), [], crypto.SHA256).err?, "Sign with empty digest should fail"
+
+    # opts.HashFunc() == 0 errors cleanly.
+    r = priv.sign(crand(), dg, ZeroHash.new)
+    assert_eq err_text(r), "ecdsa: Sign must be called with a hash, not with crypto.Hash(0)"
+  }
+}
+
+test "NonceSafety" {
+  for t in all_curves() {
+    priv = generate_key(t[1], crand()).unwrap
+    rs0 = sign(ZeroReader.new, priv, "testing".bytes).unwrap
+    rs1 = sign(ZeroReader.new, priv, "testing...".bytes).unwrap
+    # This should never happen.
+    assert rs0[1].cmp(rs1[1]) != 0, "#{t[0]}: the signatures on two different messages were the same"
+    assert rs0[0].cmp(rs1[0]) != 0, "#{t[0]}: the nonce used for two different messages was the same"
+  }
+}
+
+test "INDCCA" {
+  for t in all_curves() {
+    priv = generate_key(t[1], crand()).unwrap
+    rs0 = sign(crand(), priv, "testing".bytes).unwrap
+    rs1 = sign(crand(), priv, "testing".bytes).unwrap
+    assert rs0[1].cmp(rs1[1]) != 0, "#{t[0]}: two signatures of the same message produced the same result"
+    assert rs0[0].cmp(rs1[0]) != 0, "#{t[0]}: two signatures of the same message produced the same nonce"
+  }
+}
+
+test "NegativeInputs" {
+  for t in all_curves() {
+    key = generate_key(t[1], crand()).unwrap
+    hash = [0.as_u8; 32]
+    r = big.new_int(1)
+    r.lsh!(r, 550) # larger than any supported curve
+    r.neg!(r)
+    assert !verify(key.public_key, hash, r, r), "#{t[0]}: bogus signature accepted"
+  }
+}
+
+test "ZeroHashSignature" {
+  for t in all_curves() {
+    zero_hash = [0.as_u8; 64]
+    priv = generate_key(t[1], crand()).unwrap
+    # Sign a hash consisting of all zeros.
+    rs = sign(crand(), priv, zero_hash).unwrap
+    # Confirm that it can be verified.
+    assert verify(priv.public_key, zero_hash, rs[0], rs[1]), "#{t[0]}: zero hash signature verify failed"
+  }
+}
+
+test "ZeroSignature" {
+  for t in all_curves() {
+    priv = generate_key(t[1], crand()).unwrap
+    assert !verify(priv.public_key, [0.as_u8; 64], big.new_int(0), big.new_int(0)), "#{t[0]}: Verify with r,s=0 succeeded"
+  }
+}
+
+test "NegativeSignature" {
+  for t in all_curves() {
+    zero_hash = [0.as_u8; 64]
+    priv = generate_key(t[1], crand()).unwrap
+    rs = sign(crand(), priv, zero_hash).unwrap
+    r = rs[0]
+    r.neg!(r)
+    assert !verify(priv.public_key, zero_hash, r, rs[1]), "#{t[0]}: Verify with r=-r succeeded"
+  }
+}
+
+test "RPlusNSignature" {
+  for t in all_curves() {
+    zero_hash = [0.as_u8; 64]
+    priv = generate_key(t[1], crand()).unwrap
+    rs = sign(crand(), priv, zero_hash).unwrap
+    r = rs[0]
+    r.add!(r, t[1].params.n)
+    assert !verify(priv.public_key, zero_hash, r, rs[1]), "#{t[0]}: Verify with r=r+n succeeded"
+  }
+}
+
+test "RMinusNSignature" {
+  for t in all_curves() {
+    zero_hash = [0.as_u8; 64]
+    priv = generate_key(t[1], crand()).unwrap
+    rs = sign(crand(), priv, zero_hash).unwrap
+    r = rs[0]
+    r.sub!(r, t[1].params.n)
+    assert !verify(priv.public_key, zero_hash, r, rs[1]), "#{t[0]}: Verify with r=r-n succeeded"
+  }
+}
+
+def check_rfc6979(curve: elliptic.Curve, d: Str, x: Str, y: Str, msg: Str, r: Str, s: Str) {
+  priv = PrivateKey.new(d: from_hex(d), public_key: PublicKey.new(curve: curve, x: from_hex(x), y: from_hex(y)))
+  h = sha256.sum256(msg.bytes).to_a
+  sig = priv.sign_deterministic(h, crypto.SHA256).unwrap
+  expected = test_encode_signature(from_hex(r).bytes, from_hex(s).bytes)
+  assert_eq to_hex(sig), to_hex(expected)
+}
+
+# Go's test-local encodeSignature (cryptobyte).
+def test_encode_signature(r: [Byte], s: [Byte]) -> [Byte] {
+  body = test_asn1_int(r) + test_asn1_int(s)
+  return [0x30.as_u8, 0x81, body.size.as_u8] + body if body.size > 0x7f
+  [0x30.as_u8, body.size.as_u8] + body
+}
+
+def test_asn1_int(b: [Byte]) -> [Byte] {
+  i = 0
+  while b[i] == 0 {
+    i += 1
+  }
+  c = b[i...b.size]
+  c = [0.as_u8] + c if c[0] & 0x80 != 0
+  [0x02.as_u8, c.size.as_u8] + c
+}
+
+test "RFC6979 P-224" {
+  check_rfc6979(elliptic.p224(),
+    "F220266E1105BFE3083E03EC7A3A654651F45E37167E88600BF257C1",
+    "00CF08DA5AD719E42707FA431292DEA11244D64FC51610D94B130D6C",
+    "EEAB6F3DEBE455E3DBF85416F7030CBD94F34F2D6F232C69F3C1385A",
+    "sample",
+    "61AA3DA010E8E8406C656BC477A7A7189895E7E840CDFE8FF42307BA",
+    "BC814050DAB5D23770879494F9E0A680DC1AF7161991BDE692B10101")
+  check_rfc6979(elliptic.p224(),
+    "F220266E1105BFE3083E03EC7A3A654651F45E37167E88600BF257C1",
+    "00CF08DA5AD719E42707FA431292DEA11244D64FC51610D94B130D6C",
+    "EEAB6F3DEBE455E3DBF85416F7030CBD94F34F2D6F232C69F3C1385A",
+    "test",
+    "AD04DDE87B84747A243A631EA47A1BA6D1FAA059149AD2440DE6FBA6",
+    "178D49B1AE90E3D8B629BE3DB5683915F4E8C99FDF6E666CF37ADCFD")
+}
+
+test "RFC6979 P-256" {
+  # This vector was bruteforced to find a message that causes the
+  # generation of k to loop (see Go's test for its provenance).
+  check_rfc6979(elliptic.p256(),
+    "C9AFA9D845BA75166B5C215767B1D6934E50C3DB36E89B127B8A622B120F6721",
+    "60FED4BA255A9D31C961EB74C6356D68C049B8923B61FA6CE669622E60F29FB6",
+    "7903FE1008B8BC99A41AE9E95628BC64F2F1B20C2D7E9F5177A3C294D4462299",
+    "wv[vnX",
+    "EFD9073B652E76DA1B5A019C0E4A2E3FA529B035A6ABB91EF67F0ED7A1F21234",
+    "3DB4706C9D9F4A4FE13BB5E08EF0FAB53A57DBAB2061C83A35FA411C68D2BA33")
+
+  # The remaining vectors are from RFC 6979.
+  check_rfc6979(elliptic.p256(),
+    "C9AFA9D845BA75166B5C215767B1D6934E50C3DB36E89B127B8A622B120F6721",
+    "60FED4BA255A9D31C961EB74C6356D68C049B8923B61FA6CE669622E60F29FB6",
+    "7903FE1008B8BC99A41AE9E95628BC64F2F1B20C2D7E9F5177A3C294D4462299",
+    "sample",
+    "EFD48B2AACB6A8FD1140DD9CD45E81D69D2C877B56AAF991C34D0EA84EAF3716",
+    "F7CB1C942D657C41D436C7A1B6E29F65F3E900DBB9AFF4064DC4AB2F843ACDA8")
+  check_rfc6979(elliptic.p256(),
+    "C9AFA9D845BA75166B5C215767B1D6934E50C3DB36E89B127B8A622B120F6721",
+    "60FED4BA255A9D31C961EB74C6356D68C049B8923B61FA6CE669622E60F29FB6",
+    "7903FE1008B8BC99A41AE9E95628BC64F2F1B20C2D7E9F5177A3C294D4462299",
+    "test",
+    "F1ABB023518351CD71D881567B1EA663ED3EFCF6C5132B354F28D3B0B7D38367",
+    "019F4113742A2B14BD25926B49C649155F267E60D3814B4C0CC84250E46F0083")
+}
+
+test "RFC6979 P-384" {
+  check_rfc6979(elliptic.p384(),
+    "6B9D3DAD2E1B8C1C05B19875B6659F4DE23C3B667BF297BA9AA47740787137D896D5724E4C70A825F872C9EA60D2EDF5",
+    "EC3A4E415B4E19A4568618029F427FA5DA9A8BC4AE92E02E06AAE5286B300C64DEF8F0EA9055866064A254515480BC13",
+    "8015D9B72D7D57244EA8EF9AC0C621896708A59367F9DFB9F54CA84B3F1C9DB1288B231C3AE0D4FE7344FD2533264720",
+    "sample",
+    "21B13D1E013C7FA1392D03C5F99AF8B30C570C6F98D4EA8E354B63A21D3DAA33BDE1E888E63355D92FA2B3C36D8FB2CD",
+    "F3AA443FB107745BF4BD77CB3891674632068A10CA67E3D45DB2266FA7D1FEEBEFDC63ECCD1AC42EC0CB8668A4FA0AB0")
+  check_rfc6979(elliptic.p384(),
+    "6B9D3DAD2E1B8C1C05B19875B6659F4DE23C3B667BF297BA9AA47740787137D896D5724E4C70A825F872C9EA60D2EDF5",
+    "EC3A4E415B4E19A4568618029F427FA5DA9A8BC4AE92E02E06AAE5286B300C64DEF8F0EA9055866064A254515480BC13",
+    "8015D9B72D7D57244EA8EF9AC0C621896708A59367F9DFB9F54CA84B3F1C9DB1288B231C3AE0D4FE7344FD2533264720",
+    "test",
+    "6D6DEFAC9AB64DABAFE36C6BF510352A4CC27001263638E5B16D9BB51D451559F918EEDAF2293BE5B475CC8F0188636B",
+    "2D46F3BECBCC523D5F1A1256BF0C9B024D879BA9E838144C8BA6BAEB4B53B47D51AB373F9845C0514EEFB14024787265")
+}
+
+test "RFC6979 P-521" {
+  check_rfc6979(elliptic.p521(),
+    "0FAD06DAA62BA3B25D2FB40133DA757205DE67F5BB0018FEE8C86E1B68C7E75CAA896EB32F1F47C70855836A6D16FCC1466F6D8FBEC67DB89EC0C08B0E996B83538",
+    "1894550D0785932E00EAA23B694F213F8C3121F86DC97A04E5A7167DB4E5BCD371123D46E45DB6B5D5370A7F20FB633155D38FFA16D2BD761DCAC474B9A2F5023A4",
+    "0493101C962CD4D2FDDF782285E64584139C2F91B47F87FF82354D6630F746A28A0DB25741B5B34A828008B22ACC23F924FAAFBD4D33F81EA66956DFEAA2BFDFCF5",
+    "sample",
+    "1511BB4D675114FE266FC4372B87682BAECC01D3CC62CF2303C92B3526012659D16876E25C7C1E57648F23B73564D67F61C6F14D527D54972810421E7D87589E1A7",
+    "04A171143A83163D6DF460AAF61522695F207A58B95C0644D87E52AA1A347916E4F7A72930B1BC06DBE22CE3F58264AFD23704CBB63B29B931F7DE6C9D949A7ECFC")
+  check_rfc6979(elliptic.p521(),
+    "0FAD06DAA62BA3B25D2FB40133DA757205DE67F5BB0018FEE8C86E1B68C7E75CAA896EB32F1F47C70855836A6D16FCC1466F6D8FBEC67DB89EC0C08B0E996B83538",
+    "1894550D0785932E00EAA23B694F213F8C3121F86DC97A04E5A7167DB4E5BCD371123D46E45DB6B5D5370A7F20FB633155D38FFA16D2BD761DCAC474B9A2F5023A4",
+    "0493101C962CD4D2FDDF782285E64584139C2F91B47F87FF82354D6630F746A28A0DB25741B5B34A828008B22ACC23F924FAAFBD4D33F81EA66956DFEAA2BFDFCF5",
+    "test",
+    "00E871C4A14F993C6C7369501900C4BC1E9C7B0B4BA44E04868B30B41D8071042EB28C4C250411D0CE08CD197E4188EA4876F279F90B3D8D74A3C76E6F1E4656AA8",
+    "0CD52DBAA33B063C3A6CD8058A1FB0A46A4754B034FCC644766CA14DA8CA5CA9FDE00E88C1AD60CCBA759025299079D7A427EC3CC5B619BFBC828E7769BCD694E86")
+}
+
+test "ParseAndBytesRoundTrip" {
+  for t in all_curves() {
+    next if t[0].end_with?("/Generic") # these methods don't support generic curves
+    curve = t[1]
+    priv = generate_key(curve, crand()).unwrap
+
+    b = priv.public_key.bytes.unwrap
+    assert_eq b[0], 4.as_u8
+    p = parse_uncompressed_public_key(curve, b).unwrap
+    assert priv.public_key.equal?(p), "#{t[0]}: parsed private key's public key doesn't match original"
+
+    bk = priv.bytes.unwrap
+    k = parse_raw_private_key(curve, bk).unwrap
+    assert priv.equal?(k), "#{t[0]}: parsed private key doesn't match original"
+
+    if curve.nist_bits != 224 {
+      priv_ecdh = priv.ecdh.unwrap
+      pp = priv_ecdh.curve.new_public_key(b).unwrap
+      assert priv_ecdh.public_key.equal?(pp), "#{t[0]}: parsed ECDH public key doesn't match original"
+      assert pp.bytes == b, "#{t[0]}: encoded ECDH public key doesn't match Bytes"
+      kk = priv_ecdh.curve.new_private_key(bk).unwrap
+      assert priv_ecdh.equal?(kk), "#{t[0]}: parsed ECDH private key doesn't match original"
+      assert kk.bytes == bk, "#{t[0]}: encoded ECDH private key doesn't match Bytes"
+      assert priv.public_key.ecdh.unwrap.equal?(pp), "#{t[0]}: PublicKey.ECDH"
+    } else {
+      assert_eq err_text(priv.ecdh), "ecdsa: unsupported curve by crypto/ecdh"
+    }
+  }
+  # The generic curve: Bytes and the parsers reject it.
+  g: elliptic.Curve = elliptic.p256().params
+  gk = generate_key(g, crand()).unwrap
+  assert_eq err_text(gk.public_key.bytes), "ecdsa: curve not supported by PublicKey.Bytes"
+  assert_eq err_text(gk.bytes), "ecdsa: curve not supported by PrivateKey.Bytes"
+  assert_eq err_text(parse_raw_private_key(g, gk.d.fill_bytes([0.as_u8; 32]))), "ecdsa: curve not supported by ParseRawPrivateKey"
+}
+
+test "InvalidPublicKeys" {
+  for t in all_curves() {
+    curve = t[1]
+    size = 1 + 2 * ((curve.params.bit_size + 7) / 8)
+
+    # Infinity
+    k = PublicKey.new(curve: curve, x: big.new_int(0), y: big.new_int(0))
+    assert k.bytes.err?, "#{t[0]}: PublicKey.Bytes accepted infinity"
+    assert parse_uncompressed_public_key(curve, [0.as_u8]).err?, "#{t[0]}: ParseUncompressedPublicKey accepted infinity"
+    b = [0.as_u8; size]
+    b[0] = 4
+    assert parse_uncompressed_public_key(curve, b).err?, "#{t[0]}: ParseUncompressedPublicKey accepted infinity"
+
+    # NotOnCurve
+    kk = generate_key(curve, crand()).unwrap.public_key
+    kk.x.add!(kk.x, big.new_int(1))
+    assert kk.bytes.err?, "#{t[0]}: PublicKey.Bytes accepted not on curve"
+    b = [0.as_u8; size]
+    b[0] = 4
+    kk.x.fill_bytes(b[1...1 + b.size / 2])
+    kk.y.fill_bytes(b[1 + b.size / 2...b.size])
+    assert parse_uncompressed_public_key(curve, b).err?, "#{t[0]}: ParseUncompressedPublicKey accepted not on curve"
+
+    # Compressed
+    kc = generate_key(curve, crand()).unwrap.public_key
+    bc = elliptic.marshal_compressed(curve, kc.x, kc.y)
+    assert parse_uncompressed_public_key(curve, bc).err?, "#{t[0]}: ParseUncompressedPublicKey accepted compressed key"
+  }
+}
+
+test "InvalidPrivateKeys" {
+  for t in all_curves() {
+    curve = t[1]
+    size = (curve.params.bit_size + 7) / 8
+
+    # Zero
+    k = PrivateKey.new(public_key: PublicKey.new(curve: curve, x: big.new_int(0), y: big.new_int(0)), d: big.new_int(0))
+    assert k.bytes.err?, "#{t[0]}: PrivateKey.Bytes accepted zero key"
+    assert parse_raw_private_key(curve, [0.as_u8; size]).err?, "#{t[0]}: ParseRawPrivateKey accepted zero key"
+
+    # Overflow
+    d = big.Int.new
+    d.add!(curve.params.n, big.new_int(5))
+    xy = curve.scalar_base_mult(d.bytes)
+    ko = PrivateKey.new(public_key: PublicKey.new(curve: curve, x: xy[0], y: xy[1]), d: d)
+    assert ko.bytes.err?, "#{t[0]}: PrivateKey.Bytes accepted overflow key"
+    b = [0.as_u8; size]
+    ko.d.fill_bytes(b)
+    assert parse_raw_private_key(curve, b).err?, "#{t[0]}: ParseRawPrivateKey accepted overflow key"
+
+    # Length
+    assert parse_raw_private_key(curve, [1.as_u8, 2, 3]).err?, "#{t[0]}: ParseRawPrivateKey accepted short key"
+    assert parse_raw_private_key(curve, [0.as_u8; size] + [1.as_u8, 2, 3]).err?, "#{t[0]}: ParseRawPrivateKey accepted long key"
+  }
+}
+
+# ---- Go's equal_test.go ----
+
+def check_equal(c: elliptic.Curve) {
+  private = generate_key(c, crand()).unwrap
+  public = private.public_key
+
+  assert public.equal?(public), "public key is not equal to itself"
+  assert private.equal?(private), "private key is not equal to itself"
+  # Go: crypto.Signer(private).Public().(*ecdsa.PublicKey).
+  signer: crypto.Signer = private
+  _ = signer.public
+  assert public.equal?(private.public_key), "private.Public() is not Equal to public"
+
+  # Go round-trips through x509 PKCS#8 (not in alx yet): the raw encodings
+  # instead.
+  decoded = parse_raw_private_key(c, private.bytes.unwrap).unwrap
+  assert public.equal?(decoded.public_key), "public key is not equal to itself after decoding"
+  assert private.equal?(decoded), "private key is not equal to itself after decoding"
+
+  other = generate_key(c, crand()).unwrap
+  assert !public.equal?(other.public_key), "different public keys are Equal"
+  assert !private.equal?(other), "different private keys are Equal"
+
+  # Ensure that keys with the same coordinates but on different curves
+  # aren't considered Equal.
+  different_curve = public
+  if c.nist_bits == 256 {
+    different_curve.curve = elliptic.p224()
+  } else {
+    different_curve.curve = elliptic.p256()
+  }
+  assert !public.equal?(different_curve), "public keys with different curves are Equal"
+}
+
+test "Equal" {
+  check_equal(elliptic.p224())
+  check_equal(elliptic.p256())
+  check_equal(elliptic.p384())
+  check_equal(elliptic.p521())
+}
+
+# ---- Go's internal ecdsa_test.go and cast.go ----
+
+def check_random_point(c: Curve) {
+  # A sequence of all ones will generate 2^N-1, which should be rejected.
+  # (Unless, for example, we are masking too many bits.)
+  r = PrefixReader.new(st: [[0xff.as_u8; 100]])
+  kpl = random_point(c, Source.new(rand: r), false).unwrap
+  assert kpl[0].is_zero == 0, "k is zero"
+  assert_eq kpl[1][0], 4.as_u8
+  assert kpl[2] > 0, "#{c.curve}: overflow was not rejected"
+
+  # A sequence of all zeroes will generate zero, which should be rejected.
+  r = PrefixReader.new(st: [[0.as_u8; 100]])
+  kpl = random_point(c, Source.new(rand: r), false).unwrap
+  assert kpl[0].is_zero == 0, "k is zero"
+  assert_eq kpl[1][0], 4.as_u8
+  assert kpl[2] > 0, "#{c.curve}: zero was not rejected"
+
+  # P-256 has a 2⁻³² chance of randomly hitting a rejection. For P-224
+  # it's 2⁻¹¹², for P-384 it's 2⁻¹⁹⁴, and for P-521 it's 2⁻²⁶², so if we
+  # hit in tests, something is horribly wrong. (For example, we are
+  # masking the wrong bits.)
+  return nil if c.curve == P256_ID
+  kpl = random_point(c, Source.new(rand: crand()), false).unwrap
+  assert kpl[0].is_zero == 0, "k is zero"
+  assert_eq kpl[1][0], 4.as_u8
+  assert_eq kpl[2], 0
+}
+
+test "RandomPoint" {
+  check_random_point(fips_p224())
+  check_random_point(fips_p256())
+  check_random_point(fips_p384())
+  check_random_point(fips_p521())
+}
+
+test "HashToNat" {
+  for c in [fips_p224(), fips_p256(), fips_p384(), fips_p521()] {
+    l = 0
+    while l < 600 {
+      _ = hash_to_nat(c, [0xff.as_u8; l])
+      l += 1
+    }
+  }
+}
+
+# The key and hash of Go's cast.go (RFC 9500, Section 2.3).
+def cast_key -> FipsPrivateKey {
+  q = unhex("04" + "422548f88fb782ffb5eca3744452c72a1e558fbd6f73be5e48e93232cc45c5b1" +
+      "6c4cd10c4cb8d5b8a17139e94882c8992572993425f41419ab7e90a42a494272")
+  d = unhex("e6cb5bdd80aa45ae9c95e8c15476679ffec953c16851e711e743939589c64fc1")
+  FipsPrivateKey.new(pubk: FipsPublicKey.new(curve: P256_ID, q: q), d: d)
+}
+
+def cast_hash -> [Byte] {
+  unhex("171b1f5e9f8f8c5c42e806597b54c7b44905a1db3a3c31d3b756458cc2d68862" + "9ed67b9b2568d6c618941efee33378a6e1ce138881260252dfc20af267490a20")
+}
+
+test "CAST ECDSA P-256 SHA2-512 sign and verify" {
+  k = cast_key()
+  z = unhex("0102030405060708090a0b0c0d0e0f10")
+  pers = unhex("1112131415161718191a1b1c1d1e1f20")
+  hash = cast_hash()
+  drbg = new_drbg(sha512_ctor(), z, [], Personalization.Plain(pers))
+  got = sign_generic(fips_p256(), k, drbg, hash).unwrap
+  assert fips_verify(fips_p256(), k.pubk, hash, got).ok?, "verify"
+  assert_eq to_hex(got.r), "336496ff8afeaa0b2c4a1a9777cc84a57e881f162de029f762c23418109c698a"
+  assert_eq to_hex(got.s), "97532e136ed09b308adf4fe0548214835e93c7794b18a3f18a60ae5231e42e4e"
+}
+
+test "CAST DetECDSA P-256 SHA2-512 sign" {
+  k = cast_key()
+  hash = cast_hash()
+  got = fips_sign_deterministic(fips_p256(), sha512_ctor(), k, hash).unwrap
+  assert fips_verify(fips_p256(), k.pubk, hash, got).ok?, "verify"
+  assert_eq to_hex(got.r), "9fc383326ed94f8e24a019ef1d3ac355dd4b98ae78a7afd3fdf3221c8bd6117b"
+  assert_eq to_hex(got.s), "d652874171bd66d1af6c61ddd8a7bbd2f7d54770e9e4ac0ab9fa0fbd3b9bc2fe"
+}
+
+# ---- local: DER encoding, ChaCha8, errors ----
+
+test "signature DER encoding" {
+  assert_eq to_hex(encode_signature([0.as_u8, 0, 1], [0x80.as_u8]).unwrap), "3007020101020200" + "80"
+  assert_eq err_text(encode_signature([0.as_u8], [1.as_u8])), "invalid integer"
+  rs = parse_signature(unhex("3007020101020200" + "80")).unwrap
+  assert_eq to_hex(rs[0]), "01"
+  assert_eq to_hex(rs[1]), "80"
+  # Not minimal, negative, trailing data, BER length, wrong tag.
+  assert parse_signature(unhex("300802020001020200" + "80")).err?
+  assert parse_signature(unhex("30060201ff020101")).err?
+  assert parse_signature(unhex("300602010102010100")).err?
+  assert parse_signature(unhex("30810602010102010" + "1")).err?
+  assert parse_signature(unhex("310602010102010" + "1")).err?
+  big_rs = parse_signature_big(unhex("30060201ff020101")).unwrap
+  assert_eq big_rs[0].to_s, "-1"
+  # Long-form lengths.
+  long = [0x7f.as_u8; 200]
+  enc = encode_signature(long, long).unwrap
+  assert_eq to_hex(enc[0...4]), "30820196"
+  rs2 = parse_signature(enc).unwrap
+  assert rs2[0] == long && rs2[1] == long
+}
+
+test "ChaCha8 matches Go" {
+  # Go: rand.NewChaCha8([32]byte("chacha8 seed for the ecdsa test!")); the
+  # first 20 bytes, then 1000 more read in pieces of 7, then 2000 more.
+  rng = new_chacha8("chacha8 seed for the ecdsa test!".bytes)
+  a = [0.as_u8; 20]
+  rng.read!(a)
+  assert_eq to_hex(a), "78db992c6670a0ee7d2adf58930d0b42f0a97586"
+  all: [Byte] = []
+  i = 0
+  while i < 1000 {
+    p = [0.as_u8; 7]
+    rng.read!(p)
+    all = all + p
+    i += 7
+  }
+  b = [0.as_u8; 2000]
+  rng.read!(b)
+  assert_eq to_hex(sha256.sum256(all + b).to_a), "d352071a0a1f27e58aa9d648d35111e233c5f5fb9a628137e9d08fbb2eeb03ee"
+}

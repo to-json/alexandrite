@@ -1,0 +1,442 @@
+# Package ecdsa: Go's crypto/ecdsa, the Elliptic Curve Digital Signature
+# Algorithm of FIPS 186-5, with Go's crypto/internal/fips140/ecdsa merged
+# in (fips.alx, hmacdrbg.alx) and the legacy math/big path for custom
+# curves (legacy.alx).
+#
+# Signatures are not deterministic by default, but entropy is mixed with
+# the private key and the message (hedged signatures), achieving the same
+# level of security in case of randomness source failure. Operations
+# involving private keys are constant time as long as a Curve returned by
+# elliptic.p224(), p256(), p384() or p521() is used.
+#
+#   Go                                        alx
+#   PublicKey{Curve, X, Y *big.Int}           PublicKey{curve: elliptic.Curve, x: big.Int, y: big.Int}
+#   PrivateKey{PublicKey, D *big.Int}         PrivateKey{public_key: PublicKey, d: big.Int}
+#   GenerateKey(c, rand) (*PrivateKey, error) generate_key(c, rand) -> ~PrivateKey
+#   SignASN1(rand, priv, hash) ([]byte, err)  sign_asn1(rand, priv, hash) -> ~[Byte]
+#   VerifyASN1(pub, hash, sig) bool           verify_asn1(pub, hash, sig) -> Bool
+#   Sign(rand, priv, hash) (r, s, err)        sign(rand, priv, hash) -> ~(big.Int, big.Int)
+#   Verify(pub, hash, r, s) bool              verify(pub, hash, r, s) -> Bool
+#   priv.Sign(rand, digest, opts)             priv.sign(rand, digest, opts) -> ~[Byte]  (crypto.Signer)
+#   priv.Sign(nil, digest, opts)              priv.sign_deterministic(digest, opts) -> ~[Byte]
+#   priv.Public() crypto.PublicKey            priv.public -> crypto.PublicKey (priv.public_key is the field)
+#   pub.Equal(x) / priv.Equal(x)              pub.equal?(x: PublicKey) / priv.equal?(x: PrivateKey)
+#   pub.Bytes() / priv.Bytes()                pub.bytes / priv.bytes -> ~[Byte]
+#   ParseUncompressedPublicKey(c, data)       parse_uncompressed_public_key(c, data) -> ~PublicKey
+#   ParseRawPrivateKey(c, data)               parse_raw_private_key(c, data) -> ~PrivateKey
+#   pub.ECDH() / priv.ECDH()                  pub.ecdh -> ~ecdh.PublicKey / priv.ecdh -> ~ecdh.PrivateKey
+#
+# Test hooks (Go's internal API that Go's tests reach): testing_only_new_drbg
+# (fips140/ecdsa.TestingOnlyNewDRBG) and the HmacDrbg it returns
+# (generate!).
+#
+# Differences from Go:
+#   - Randomness: Go 1.26+ ignores the rand argument of GenerateKey,
+#     SignASN1, Sign and PrivateKey.Sign and always uses its secure source,
+#     unless GODEBUG=cryptocustomrand=1. alx has no GODEBUG: rand is always
+#     used (Go's cryptocustomrand=1 behaviour); pass crypto/rand's reader()
+#     for Go's default. With the same rand bytes, signatures and keys are
+#     byte-identical to Go's with cryptocustomrand=1 (the tests check it).
+#     randutil.MaybeReadByte (which makes Go's output depend on a coin
+#     flip) is not done.
+#   - Deterministic signatures: Go's PrivateKey.Sign with a nil rand makes
+#     an RFC 6979 signature; alx has no nil io.Reader, so that is
+#     sign_deterministic(digest, opts). Go's nil opts (no hash check) has
+#     no counterpart either: opts is required, and opts.hash_func none is
+#     Go's crypto.Hash(0) (an error). sign_asn1 signs without a hash check.
+#   - Named curves: Go recognises elliptic.P256() etc. by comparing the
+#     Curve with the singletons, so a copy of their CurveParams takes the
+#     generic math/big path. alx values have no identity: a curve is
+#     handled by fips.alx (nistec, constant time) when its nist_bits is not
+#     0, which is the case exactly for the Curves of elliptic.p224() ...
+#     p521(); any CurveParams (even p256().params) takes the legacy path,
+#     and Bytes/ParseRawPrivateKey/... reject it as Go rejects a copy. Go
+#     sends `elliptic.P256().Params()` itself (the singleton's params)
+#     through the FIPS path for signing; here it's the legacy path (both
+#     verify the same; hedged signatures from the same rand differ).
+#   - Equal compares curves by nist_bits for the named curves and by value
+#     (name, bit size and constants) for CurveParams; Go compares Curve
+#     interface values, so two copies of the same CurveParams are unequal
+#     there and equal here.
+#   - Keys are values: Go's *PublicKey and *PrivateKey are pointers with
+#     *big.Int fields; here the big.Ints are math/big's value Ints, and the
+#     results are fresh values. Go's PrivateKey embeds PublicKey (so
+#     priv.X is priv.PublicKey.X); here it is priv.public_key.x.
+#   - Go caches the internal private key per *PrivateKey
+#     (fips140cache); alx has no identity or mutable package state, so
+#     every signature converts and checks the key (decodes the public
+#     point) again. The internal curves (Go's sync.OnceValue P256() etc.)
+#     are rebuilt per call too.
+#   - The ASN.1 DER encoding and parsing of signatures (Go uses
+#     golang.org/x/crypto/cryptobyte) is implemented locally in asn1.alx,
+#     with cryptobyte's checks.
+#   - The legacy path needs math/rand/v2's ChaCha8, which alx's std lacks:
+#     chacha8.alx has the generator (the same output as Go's).
+#   - No BoringCrypto, no FIPS 140-only mode (its errors don't exist) and
+#     no FIPS self-tests (Go's CASTs run once per process in FIPS mode; the
+#     test vectors of cast.go are in the tests instead).
+#   - Errors are EcdsaError values with Go's messages, or the bigmod /
+#     nistec / io error that Go would return.
+#
+# Timing: see fips.alx. The legacy path (custom curves) is variable time,
+# as in Go. alx's backends make no formal constant-time promise (see
+# crypto/subtle).
+
+import "crypto"
+import "crypto/ecdh"
+import "crypto/elliptic"
+import "crypto/subtle"
+import "io"
+import "math/big"
+
+# Errors of this package, with Go's messages.
+pub error EcdsaError {
+  InvalidUncompressedPublicKey
+  UnsupportedEcdhCurve
+  # A curve that isn't one of the named curves, for an operation that
+  # needs one (what: "ParseUncompressedPublicKey", "PublicKey.Bytes",
+  # "ParseRawPrivateKey", "PrivateKey.Bytes", "deterministic signatures").
+  UnsupportedCurve(what: Str)
+  ZeroHashFunc
+  HashLengthMismatch
+  EmptyHash
+  HashUnavailable(name: Str)
+  InvalidInteger
+  InvalidAsn1
+  InvalidAsn1FromSign
+  NegativeCoordinate
+  OverflowingCoordinate
+  ScalarTooLarge
+  ScalarNotPositive
+  CurveTooLarge
+  PublicKeyInfinity
+  ZeroParam
+  # The internal API (crypto/internal/fips140/ecdsa).
+  KeyCurveMismatch(which: Str)
+  InvalidPublicKeyEncoding
+  InvalidPrivateKeyLength
+  PrivateKeyZero
+  RIsZero
+  SIsZero
+  SignatureRIsZero
+  SignatureSIsZero
+  DidNotVerify
+
+  def message -> Str {
+    case self {
+      InvalidUncompressedPublicKey => "ecdsa: invalid uncompressed public key"
+      UnsupportedEcdhCurve => "ecdsa: unsupported curve by crypto/ecdh"
+      UnsupportedCurve(what) => "ecdsa: curve not supported by #{what}"
+      ZeroHashFunc => "ecdsa: Sign must be called with a hash, not with crypto.Hash(0)"
+      HashLengthMismatch => "ecdsa: hash length does not match hash function"
+      EmptyHash => "ecdsa: hash cannot be empty"
+      HashUnavailable(name) => "ecdsa: requested hash function unavailable: #{name}"
+      InvalidInteger => "invalid integer"
+      InvalidAsn1 => "invalid ASN.1"
+      InvalidAsn1FromSign => "invalid ASN.1 from SignASN1"
+      NegativeCoordinate => "negative coordinate"
+      OverflowingCoordinate => "overflowing coordinate"
+      ScalarTooLarge => "ecdsa: private key scalar too large"
+      ScalarNotPositive => "ecdsa: private key scalar is zero or negative"
+      CurveTooLarge => "ecdsa: internal error: curve size too large"
+      PublicKeyInfinity => "ecdsa: public key point is the infinity"
+      ZeroParam => "zero parameter"
+      KeyCurveMismatch(which) => "ecdsa: #{which} key does not match curve"
+      InvalidPublicKeyEncoding => "ecdsa: invalid public key encoding"
+      InvalidPrivateKeyLength => "ecdsa: invalid private key length"
+      PrivateKeyZero => "ecdsa: private key is zero"
+      RIsZero => "ecdsa: internal error: r is zero"
+      SIsZero => "ecdsa: internal error: s is zero"
+      SignatureRIsZero => "ecdsa: invalid signature: r is zero"
+      SignatureSIsZero => "ecdsa: invalid signature: s is zero"
+      DidNotVerify => "ecdsa: signature did not verify"
+    }
+  }
+}
+
+# An ECDSA public key.
+pub struct PublicKey {
+  curve: elliptic.Curve
+  # The coordinates of the public key point. Deprecated in Go for direct
+  # use: use bytes and parse_uncompressed_public_key.
+  x: big.Int
+  y: big.Int
+
+  # Whether pub and x have the same value: the same coordinates and the
+  # same curve (see the header for how curves compare).
+  pub def equal?(x: PublicKey) -> Bool {
+    big_int_equal(self.x, x.x) && big_int_equal(self.y, x.y) && curve_equal(self.curve, x.curve)
+  }
+
+  # pub as an ecdh.PublicKey. Fails if the key is invalid according to
+  # ecdh's new_public_key, or if the curve isn't supported by crypto/ecdh
+  # (P-256, P-384 and P-521).
+  pub def ecdh -> ~ecdh.PublicKey { ~public_to_ecdh(self) }
+
+  # The public key as an uncompressed point according to SEC 1, Version
+  # 2.0, Section 2.3.3 (the X9.62 uncompressed format). Fails if the key
+  # is invalid or its curve isn't one of the named curves.
+  pub def bytes -> ~[Byte] {
+    bits = curve.nist_bits
+    fail EcdsaError.UnsupportedCurve(what: "PublicKey.Bytes") if bits == 0
+    k = ~public_key_to_fips(fips_curve(bits), self)
+    k.bytes
+  }
+}
+
+# An ECDSA private key; a crypto.Signer.
+pub struct PrivateKey {
+  public_key: PublicKey
+  # The private scalar. Deprecated in Go for direct use: use bytes and
+  # parse_raw_private_key.
+  d: big.Int
+
+  # priv as an ecdh.PrivateKey. Fails if the key is invalid according to
+  # ecdh's new_private_key, or if the curve isn't supported by crypto/ecdh
+  # (P-256, P-384 and P-521).
+  pub def ecdh -> ~ecdh.PrivateKey { ~private_to_ecdh(self) }
+
+  # The public key corresponding to priv (Go's Public).
+  pub def public -> crypto.PublicKey { public_key }
+
+  # Whether priv and x have the same value (see PublicKey.equal?).
+  pub def equal?(x: PrivateKey) -> Bool {
+    public_key.equal?(x.public_key) && big_int_equal(d, x.d)
+  }
+
+  # The private key as a fixed-length big-endian integer according to SEC
+  # 1, Version 2.0, Section 2.3.6 (the raw format). Fails if the key is
+  # invalid or its curve isn't one of the named curves.
+  pub def bytes -> ~[Byte] {
+    bits = public_key.curve.nist_bits
+    fail EcdsaError.UnsupportedCurve(what: "PrivateKey.Bytes") if bits == 0
+    k = ~private_key_to_fips(fips_curve(bits), self)
+    k.bytes
+  }
+
+  # Signs digest (the result of hashing a larger message with
+  # opts.hash_func) with priv, hedged with randomness from rand (crypto/
+  # rand's reader() for a secure source); returns the ASN.1 signature as
+  # sign_asn1. A digest longer than the order's bit length is truncated.
+  # Fails if opts.hash_func is none (Go's crypto.Hash(0)) or its size
+  # isn't digest.size.
+  pub def sign(rand: io.Reader, digest: [Byte], opts: crypto.SignerOpts) -> ~[Byte] {
+    ~check_sign_opts(digest, opts)
+    ~sign_asn1(rand, self, digest)
+  }
+
+  # Go's priv.Sign(nil, digest, opts): a deterministic signature according
+  # to RFC 6979, with opts.hash_func (which must be the hash that produced
+  # digest) in the HMAC_DRBG. The curve must be one of the named curves.
+  pub def sign_deterministic(digest: [Byte], opts: crypto.SignerOpts) -> ~[Byte] {
+    ~check_sign_opts(digest, opts)
+    ~sign_rfc6979(self, digest, opts)
+  }
+}
+
+# Go's curveToECDH: the crypto/ecdh curve of c, or none.
+def curve_to_ecdh(c: elliptic.Curve) -> ecdh.Curve? {
+  bits = c.nist_bits
+  return ecdh.p256() if bits == 256
+  return ecdh.p384() if bits == 384
+  return ecdh.p521() if bits == 521
+  none
+}
+
+def public_to_ecdh(pubk: PublicKey) -> ~ecdh.PublicKey {
+  if c = curve_to_ecdh(pubk.curve) {
+    k = ~pubk.bytes
+    return ~c.new_public_key(k)
+  }
+  fail EcdsaError.UnsupportedEcdhCurve
+}
+
+def private_to_ecdh(priv: PrivateKey) -> ~ecdh.PrivateKey {
+  if c = curve_to_ecdh(priv.public_key.curve) {
+    k = ~priv.bytes
+    return ~c.new_private_key(k)
+  }
+  fail EcdsaError.UnsupportedEcdhCurve
+}
+
+# Go's opts checks of PrivateKey.Sign.
+def check_sign_opts(digest: [Byte], opts: crypto.SignerOpts) -> ~Unit {
+  if h = opts.hash_func {
+    fail EcdsaError.HashLengthMismatch if h.size != digest.size
+  } else {
+    fail EcdsaError.ZeroHashFunc
+  }
+  nil
+}
+
+# Whether two curves are the same (see the header).
+def curve_equal(a: elliptic.Curve, b: elliptic.Curve) -> Bool {
+  return false if a.nist_bits != b.nist_bits
+  return true if a.nist_bits != 0
+  pa = a.params
+  pb = b.params
+  pa.name == pb.name && pa.bit_size == pb.bit_size && pa.p.cmp(pb.p) == 0 && pa.n.cmp(pb.n) == 0 &&
+    pa.b.cmp(pb.b) == 0 && pa.gx.cmp(pb.gx) == 0 && pa.gy.cmp(pb.gy) == 0
+}
+
+# Whether a and b are equal, leaking only their bit length through timing.
+def big_int_equal(a: big.Int, b: big.Int) -> Bool {
+  subtle.constant_time_compare(a.bytes, b.bytes) == 1
+}
+
+# A public key encoded as an uncompressed point according to SEC 1,
+# Version 2.0, Section 2.3.3 (the X9.62 uncompressed format). Fails if the
+# point is not in uncompressed form, is not on the curve, or is the point
+# at infinity, and if curve isn't one of p224() ... p521().
+pub def parse_uncompressed_public_key(curve: elliptic.Curve, data: [Byte]) -> ~PublicKey {
+  fail EcdsaError.InvalidUncompressedPublicKey if data.size < 1 || data[0] != 4
+  bits = curve.nist_bits
+  fail EcdsaError.UnsupportedCurve(what: "ParseUncompressedPublicKey") if bits == 0
+  k = ~new_fips_public_key(fips_curve(bits), data)
+  ~public_key_from_fips(curve, k)
+}
+
+# A private key encoded as a fixed-length big-endian integer, according to
+# SEC 1, Version 2.0, Section 2.3.6 (the raw format). Fails if the value is
+# not reduced modulo the curve's order, or if it's zero, and if curve isn't
+# one of p224() ... p521().
+pub def parse_raw_private_key(curve: elliptic.Curve, data: [Byte]) -> ~PrivateKey {
+  bits = curve.nist_bits
+  fail EcdsaError.UnsupportedCurve(what: "ParseRawPrivateKey") if bits == 0
+  c = fips_curve(bits)
+  q = ~base_mult(bits, data, false)
+  k = ~new_fips_private_key(c, data, q)
+  ~private_key_from_fips(curve, k)
+}
+
+# A new private key for curve c, from the random bytes of rand (crypto/
+# rand's reader() for a secure source).
+pub def generate_key(c: elliptic.Curve, rand: io.Reader) -> ~PrivateKey {
+  bits = c.nist_bits
+  return ~generate_legacy(c, rand) if bits == 0
+  k = ~fips_generate_key(fips_curve(bits), rand)
+  ~private_key_from_fips(c, k)
+}
+
+# Signs hash (the result of hashing a larger message) with priv: the ASN.1
+# DER signature. A hash longer than the bit length of the curve's order is
+# truncated to that length. The signature is hedged: randomness from rand
+# (crypto/rand's reader() for a secure source) is mixed with the key and
+# the hash.
+pub def sign_asn1(rand: io.Reader, priv: PrivateKey, hash: [Byte]) -> ~[Byte] {
+  fail EcdsaError.EmptyHash if hash.size == 0
+  bits = priv.public_key.curve.nist_bits
+  return ~sign_legacy(priv, rand, hash) if bits == 0
+  c = fips_curve(bits)
+  k = ~private_key_to_fips(c, priv)
+  # Always using SHA-512 instead of the hash that computed hash is
+  # technically a violation of draft-irtf-cfrg-det-sigs-with-noise-04 but
+  # in our API we don't get to know what it was, and this has no security
+  # impact.
+  sig = ~fips_sign(c, sha512_ctor(), k, rand, hash)
+  ~encode_signature(sig.r, sig.s)
+}
+
+def sign_rfc6979(priv: PrivateKey, hash: [Byte], opts: crypto.SignerOpts) -> ~[Byte] {
+  h = opts.hash_func || crypto.SHA256 # checked by check_sign_opts
+  bits = priv.public_key.curve.nist_bits
+  fail EcdsaError.UnsupportedCurve(what: "deterministic signatures") if bits == 0
+  c = fips_curve(bits)
+  k = ~private_key_to_fips(c, priv)
+  fail EcdsaError.HashUnavailable(name: h.to_s) if !h.available?
+  sig = ~fips_sign_deterministic(c, hash_ctor(h), k, hash)
+  ~encode_signature(sig.r, sig.s)
+}
+
+# Whether sig is a valid ASN.1 signature of hash by pub. The inputs are
+# not considered confidential, and may leak through timing side channels,
+# or if an attacker has control of part of the inputs.
+pub def verify_asn1(pub: PublicKey, hash: [Byte], sig: [Byte]) -> Bool {
+  return false if hash.size == 0
+  bits = pub.curve.nist_bits
+  return verify_legacy(pub, hash, sig) if bits == 0
+  c = fips_curve(bits)
+  rs = parse_signature(sig)
+  return false if rs.err?
+  r, s = rs.unwrap
+  k = public_key_to_fips(c, pub)
+  return false if k.err?
+  fips_verify(c, k.unwrap, hash, Signature.new(r: r, s: s)).ok?
+}
+
+# Signs hash with priv as sign_asn1 does, returning the signature as a pair
+# of integers. Most applications should use sign_asn1.
+pub def sign(rand: io.Reader, priv: PrivateKey, hash: [Byte]) -> ~(big.Int, big.Int) {
+  sig = ~sign_asn1(rand, priv, hash)
+  ~parse_signature_big(sig)
+}
+
+# Whether r, s is a valid signature of hash by pub. Most applications
+# should use verify_asn1.
+pub def verify(pub: PublicKey, hash: [Byte], r: big.Int, s: big.Int) -> Bool {
+  return false if r.sign <= 0 || s.sign <= 0
+  sig = encode_signature(r.bytes, s.bytes)
+  return false if sig.err?
+  verify_asn1(pub, hash, sig.unwrap)
+}
+
+def public_key_from_fips(curve: elliptic.Curve, pubk: FipsPublicKey) -> ~PublicKey {
+  x, y = ~point_to_affine(curve, pubk.bytes)
+  PublicKey.new(curve: curve, x: x, y: y)
+}
+
+def private_key_from_fips(curve: elliptic.Curve, priv: FipsPrivateKey) -> ~PrivateKey {
+  pubk = ~public_key_from_fips(curve, priv.public_key)
+  d = big.Int.new
+  d.set_bytes!(priv.bytes)
+  PrivateKey.new(public_key: pubk, d: d)
+}
+
+def public_key_to_fips(c: Curve, pubk: PublicKey) -> ~FipsPublicKey {
+  q = ~point_from_affine(pubk.curve, pubk.x, pubk.y)
+  ~new_fips_public_key(c, q)
+}
+
+def private_key_to_fips(c: Curve, priv: PrivateKey) -> ~FipsPrivateKey {
+  q = ~point_from_affine(priv.public_key.curve, priv.public_key.x, priv.public_key.y)
+
+  # Reject values that would not get correctly encoded.
+  n = priv.public_key.curve.params.n
+  fail EcdsaError.ScalarTooLarge if priv.d.bit_len > n.bit_len
+  fail EcdsaError.ScalarNotPositive if priv.d.sign <= 0
+
+  size = (n.bit_len + 7) / 8
+  # MAX_SCALAR_SIZE: enough for a P-521 private key.
+  fail EcdsaError.CurveTooLarge if size > 66
+  d = priv.d.fill_bytes([0.as_u8; size])
+  ~new_fips_private_key(c, d, q)
+}
+
+# The uncompressed point encoding of (x, y) (the input of nistec's
+# from_bytes); new_fips_public_key rejects invalid points.
+def point_from_affine(curve: elliptic.Curve, x: big.Int, y: big.Int) -> ~[Byte] {
+  bit_size = curve.params.bit_size
+  # Reject values that would not get correctly encoded.
+  fail EcdsaError.NegativeCoordinate if x.sign < 0 || y.sign < 0
+  fail EcdsaError.OverflowingCoordinate if x.bit_len > bit_size || y.bit_len > bit_size
+  # Encode the coordinates and let new_fips_public_key reject invalid
+  # points.
+  byte_len = (bit_size + 7) / 8
+  buf = [0.as_u8; 1 + 2 * byte_len]
+  buf[0] = 4 # uncompressed point
+  x.fill_bytes(buf[1...1 + byte_len])
+  y.fill_bytes(buf[1 + byte_len...1 + 2 * byte_len])
+  buf
+}
+
+# The coordinates of a nistec uncompressed encoding.
+def point_to_affine(curve: elliptic.Curve, p: [Byte]) -> ~(big.Int, big.Int) {
+  # [0] is the encoding of the point at infinity.
+  fail EcdsaError.PublicKeyInfinity if p.size == 1 && p[0] == 0
+  byte_len = (curve.params.bit_size + 7) / 8
+  x = big.Int.new
+  x.set_bytes!(p[1...1 + byte_len])
+  y = big.Int.new
+  y.set_bytes!(p[1 + byte_len...p.size])
+  (x, y)
+}

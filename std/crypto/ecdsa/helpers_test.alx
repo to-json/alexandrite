@@ -1,0 +1,173 @@
+# Helpers of the tests: readers (Go's zeroReader, bytes.NewReader +
+# io.MultiReader, a deterministic SHAKE256 stream) and the checks of the
+# generated vectors (vec_*_test.alx, made by a Go program with
+# GODEBUG=cryptocustomrand=1 and the same SHAKE256 streams as rand).
+
+import "crypto"
+import "crypto/elliptic"
+import "crypto/rand"
+import "crypto/sha256"
+import "crypto/sha3"
+import "encoding/hex"
+import "hash"
+import "math/big"
+
+# The SHAKE256 stream of seed, an io.Reader. One-byte reads read nothing
+# (they return 1 and leave the byte), like Go's keyGenTestReader: that
+# neutralizes randutil.MaybeReadByte on Go's side, and both sides then see
+# the same bytes.
+struct Stream {
+  s: sha3.SHAKE
+
+  pub def read!(p: [Byte]) -> Int {
+    return 1 if p.size == 1
+    sh = self.s
+    sh.read!(p)
+  }
+}
+
+def stream(seed: Str) -> Stream {
+  s = sha3.new_shake256()
+  s.write!(seed.bytes).unwrap
+  Stream.new(s: s)
+}
+
+# Reads zeros (Go's zeroReader).
+struct ZeroReader {
+  pub def read!(p: [Byte]) -> Int {
+    i = 0
+    while i < p.size {
+      p[i] = 0
+      i += 1
+    }
+    p.size
+  }
+}
+
+# The bytes of a slice, then crypto/rand (Go's io.MultiReader of a
+# bytes.Reader and rand.Reader).
+struct PrefixReader {
+  st: [[Byte]]
+
+  pub def read!(p: [Byte]) -> Int {
+    rest = st[0]
+    if rest.size == 0 {
+      return rand.read(p)
+    }
+    n = p.size
+    n = rest.size if rest.size < n
+    copy(p, rest[0...n])
+    self.st[0] = rest[n...rest.size]
+    n
+  }
+}
+
+# A reader of an HMAC_DRBG (Go's keyGenTestReader over
+# ecdsa.TestingOnlyNewDRBG): one-byte reads read nothing.
+struct DrbgReader {
+  d: HmacDrbg
+
+  pub def read!(p: [Byte]) -> Int {
+    return 1 if p.size == 1
+    dd = self.d
+    dd.generate!(p)
+    p.size
+  }
+}
+
+def crand -> rand.Reader { rand.reader() }
+
+def unhex(s: Str) -> [Byte] { hex.decode_string(s).unwrap }
+
+def to_hex(b: [Byte]) -> Str { hex.encode_to_string(b) }
+
+def from_hex(s: Str) -> big.Int {
+  r = big.Int.new
+  r.set_string!(s, 16).unwrap
+}
+
+def digest(h: crypto.Hash, msg: [Byte]) -> [Byte] {
+  d = h.new
+  _ = d.write!(msg)
+  d.sum([])
+}
+
+# The message of a failed result ("" if it succeeded).
+def err_text[T](r: ~T) -> Str {
+  if e = r.err {
+    return e.message
+  }
+  ""
+}
+
+# The curves of Go's testAllCurves: the named curves, and P-256's params
+# (Go's genericParamsForCurve), which take the generic math/big path.
+def all_curves -> [(Str, elliptic.Curve)] {
+  cs: [(Str, elliptic.Curve)] = []
+  cs << ("P256", elliptic.p256())
+  cs << ("P224", elliptic.p224())
+  cs << ("P384", elliptic.p384())
+  cs << ("P521", elliptic.p521())
+  g: elliptic.Curve = elliptic.p256().params
+  cs << ("P256/Generic", g)
+  cs
+}
+
+def sha256_ctor -> () -> hash.Hash { ->() -> hash.Hash { sha256.new() } }
+
+# ---- checks of the generated vectors ----
+
+# vec_det_test.alx: GenerateKey over stream(seed) gives the key d / pub.
+def check_keygen(c: elliptic.Curve, seed: Str, d: Str, pubk: Str) {
+  priv = generate_key(c, stream(seed)).unwrap
+  assert_eq to_hex(priv.bytes.unwrap), d
+  assert_eq to_hex(priv.public_key.bytes.unwrap), pubk
+}
+
+# vec_det_test.alx: the RFC 6979 signature of msg hashed with h.
+def check_det(c: elliptic.Curve, d: Str, h: crypto.Hash, msg: Str, want: Str) {
+  priv = parse_raw_private_key(c, unhex(d)).unwrap
+  dg = digest(h, msg.bytes)
+  sig = priv.sign_deterministic(dg, h).unwrap
+  assert_eq to_hex(sig), want
+  assert verify_asn1(priv.public_key, dg, sig), "verify"
+}
+
+# vec_hedged_test.alx: SignASN1 with stream(seed) as rand.
+def check_hedged(c: elliptic.Curve, d: Str, seed: Str, dg: Str, want: Str) {
+  priv = parse_raw_private_key(c, unhex(d)).unwrap
+  sig = sign_asn1(stream(seed), priv, unhex(dg)).unwrap
+  assert_eq to_hex(sig), want
+  assert verify_asn1(priv.public_key, unhex(dg), sig), "verify"
+}
+
+# vec_hedged_test.alx: legacy (CurveParams) GenerateKey and SignASN1.
+def check_legacy(c: elliptic.Curve, kseed: Str, d: Str, seed: Str, dg: Str, want: Str) {
+  priv = generate_key(c, stream(kseed)).unwrap
+  assert_eq priv.d.text(16), d
+  sig = sign_asn1(stream(seed), priv, unhex(dg)).unwrap
+  assert_eq to_hex(sig), want
+  assert verify_asn1(priv.public_key, unhex(dg), sig), "verify"
+}
+
+# vec_detkeygen_test.alx: c2sp.org/det-keygen (Go's
+# TestKeyGenerationVectors): GenerateKey over an HMAC_DRBG(SHA-256, seed,
+# personalization pers).
+def check_det_keygen(c: elliptic.Curve, seed: Str, pers: Str, d: Str, pubk: Str) {
+  drbg = testing_only_new_drbg(sha256_ctor(), unhex(seed), [], pers.bytes)
+  priv = generate_key(c, DrbgReader.new(d: drbg)).unwrap
+  assert_eq to_hex(priv.bytes.unwrap), d
+  assert_eq to_hex(priv.public_key.bytes.unwrap), pubk
+}
+
+# vec_sigver_test.alx: NIST SigVer (Go's TestVectors).
+def check_sigver(c: elliptic.Curve, h: crypto.Hash, msg: Str, qx: Str, qy: Str, r: Str, s: Str, want: Bool) {
+  pubk = PublicKey.new(curve: c, x: from_hex(qx), y: from_hex(qy))
+  assert_eq verify(pubk, digest(h, unhex(msg)), from_hex(r), from_hex(s)), want
+}
+
+# vec_wycheproof_test.alx: VerifyASN1 of a Wycheproof vector.
+def check_wycheproof(c: elliptic.Curve, h: crypto.Hash, pubk: Str, msg: Str, sig: Str, want: Bool) {
+  k = parse_uncompressed_public_key(c, unhex(pubk)).unwrap
+  assert_eq verify_asn1(k, digest(h, unhex(msg)), unhex(sig)), want
+}

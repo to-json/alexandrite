@@ -1,0 +1,434 @@
+# Package smtp: Go's net/smtp, the Simple Mail Transfer Protocol client
+# (RFC 5321) with the AUTH (RFC 4954), 8BITMIME (RFC 1652) and SMTPUTF8
+# (RFC 6531) extensions. Like Go's, the package is frozen: it is the minimal
+# client the standard library needs.
+#
+#   c = ~smtp.dial("mail.example.com:25")
+#   ~c.mail!("sender@example.org")
+#   ~c.rcpt!("recipient@example.net")
+#   wc = ~c.data!
+#   ~wc.write_string!("This is the email body")
+#   ~wc.close!
+#   ~c.quit!
+#
+#   Go                                      alx
+#   Dial(addr) (*Client, error)             dial(addr) -> ~Client[net.Conn]
+#   NewClient(conn, host) (*Client, error)  new_client(conn, host) -> ~Client[C]
+#   (*Client).Hello/Mail/Rcpt/Verify/...    hello!, mail!, rcpt!, verify!, reset!, noop!, quit!, close!
+#   (*Client).Data() (io.WriteCloser, err)  data! -> ~DataWriter[C]
+#   (*Client).Extension(ext) (bool, string) extension!(ext) -> Str? (the parameters)
+#   (*Client).Auth(a)                       auth!(a)
+#   (*Client).StartTLS(config)              start_tls! (fails: see below)
+#   Auth interface {Start; Next}            Auth {start(server) -> ~(Str, [Byte]); next(from, more) -> ~[Byte]?}
+#   ServerInfo{Name, TLS, Auth}             ServerInfo{name, tls, auth}
+#   PlainAuth / CRAMMD5Auth                 plain_auth / cram_md5_auth
+#   SendMail(addr, a, from, to, msg)        send_mail(addr, a: Auth?, from, to, msg)
+#   c.Text *textproto.Conn                  c.text (a textproto.Conn[C])
+#
+# Differences from Go:
+#  - There is no crypto/tls yet. start_tls! sends STARTTLS and, when the
+#    server agrees, fails with SmtpError.NoTls (Go switches the connection to
+#    TLS); send_mail fails the same way with a server offering STARTTLS. A
+#    Client is never "TLS", so plain_auth works only with a server named
+#    localhost / 127.0.0.1 / ::1. TLSConnectionState doesn't exist.
+#  - Client is generic over its connection (`Client[C]`, any
+#    io.ReadWriteCloser that shares its state across copies, as net.Conn
+#    does): see net/textproto.
+#  - Auth.next returns none where Go returns a nil slice ("no more
+#    responses"); an empty response is `[]`.
+#  - extension! returns the parameters (none: unsupported), Go's (bool,
+#    string). Errors are textproto's (a reply with an unexpected code is
+#    TextprotoError.Code: `535 "Invalid credentials"`) or SmtpError, with
+#    Go's messages.
+#
+# Not translated: TestNewClientWithTLS, TestTLSClient, TestTLSConnState and
+# the STARTTLS half of TestSendMail's server (they need crypto/tls); the
+# examples dial a real mail server (kept, as examples without output).
+
+import "crypto/hmac"
+import "crypto/md5"
+import "encoding/base64"
+import "encoding/hex"
+import "io"
+import "net"
+import "net/textproto"
+import "strings"
+
+pub error SmtpError {
+  # Go's errors.New texts ("smtp: A line must not contain CR or LF", ...).
+  Msg(text: Str)
+  # The server agreed to STARTTLS, but alx has no TLS yet.
+  NoTls
+
+  def message -> Str {
+    case self {
+      Msg(t) => t
+      NoTls => "smtp: STARTTLS is not supported (alx has no crypto/tls)"
+    }
+  }
+}
+
+# ---------------------------------------------------------------------- auth
+
+# What the client knows of the server when it authenticates.
+pub struct ServerInfo {
+  # The server name.
+  name: Str
+  # Whether the connection uses TLS (with a valid certificate for name).
+  tls: Bool
+  # The advertised authentication mechanisms.
+  auth: [Str]
+}
+
+# An SMTP authentication mechanism.
+pub interface Auth {
+  # Begins authenticating: the mechanism's name and the initial response
+  # (may be empty). A failure aborts the authentication.
+  def start(server: ServerInfo) -> ~(Str, [Byte])
+  # The next response to a server challenge (`more`: the server expects
+  # one); none when nothing more is to be sent.
+  def next(from_server: [Byte], more: Bool) -> ~[Byte]?
+}
+
+# PLAIN authentication (RFC 4616), as Go's PlainAuth: it refuses to send
+# the password unless the connection uses TLS or goes to localhost, and the
+# server's name must be `host`.
+pub struct PlainAuth {
+  identity: Str
+  username: Str
+  password: Str
+  host: Str
+
+  pub def start(server: ServerInfo) -> ~(Str, [Byte]) {
+    fail SmtpError.Msg("unencrypted connection") if !server.tls && !localhost?(server.name)
+    fail SmtpError.Msg("wrong host name") if server.name != host
+    ("PLAIN", (identity + "\x00" + username + "\x00" + password).bytes.to_a)
+  }
+
+  pub def next(from_server: [Byte], more: Bool) -> ~[Byte]? {
+    fail SmtpError.Msg("unexpected server challenge") if more
+    none
+  }
+}
+
+pub def plain_auth(identity: Str, username: Str, password: Str, host: Str) -> PlainAuth {
+  PlainAuth.new(identity: identity, username: username, password: password, host: host)
+}
+
+def localhost?(name: Str) -> Bool {
+  name == "localhost" || name == "127.0.0.1" || name == "::1"
+}
+
+# CRAM-MD5 authentication (RFC 2195).
+pub struct CramMD5Auth {
+  username: Str
+  secret: Str
+
+  pub def start(server: ServerInfo) -> ~(Str, [Byte]) {
+    e: [Byte] = []
+    ("CRAM-MD5", e)
+  }
+
+  pub def next(from_server: [Byte], more: Bool) -> ~[Byte]? {
+    return none unless more
+    d = hmac.new(->() -> md5.Digest { md5.new() }, secret.bytes.to_a)
+    d.write!(from_server)
+    (username + " " + hex.encode_to_string(d.sum([]))).bytes.to_a
+  }
+}
+
+pub def cram_md5_auth(username: Str, secret: Str) -> CramMD5Auth {
+  CramMD5Auth.new(username: username, secret: secret)
+}
+
+# -------------------------------------------------------------------- client
+
+struct ClientState {
+  tls: Bool
+  server_name: Str
+  # The extensions the server supports (none: it answered HELO, not EHLO).
+  ext: Map[Str, Str]?
+  # The AUTH mechanisms it advertised.
+  auth: [Str]
+  # The name sent in HELO / EHLO.
+  local_name: Str
+  did_hello: Bool
+  hello_error: Error?
+}
+
+# A client connection to an SMTP server. Copies share state.
+pub struct Client[C] {
+  # The textproto connection the client talks over.
+  text: textproto.Conn[C]
+  st: [ClientState]
+
+  # Closes the connection.
+  pub def close! -> ~Unit {
+    t = text
+    t.~close!
+  }
+
+  # Says EHLO (or HELO, if EHLO fails) once, before the first command.
+  def say_hello! -> ~Unit {
+    if !st[0].did_hello {
+      self.st[0].did_hello = true
+      e = self.ehlo!
+      if e.err? {
+        h = self.helo!
+        self.st[0].hello_error = h.err
+      }
+    }
+    if he = st[0].hello_error {
+      fail he
+    }
+  }
+
+  # Sends HELO / EHLO with `local_name` instead of "localhost"; only before
+  # any other command.
+  pub def hello!(local_name: Str) -> ~Unit {
+    ~validate_line(local_name)
+    fail SmtpError.Msg("smtp: Hello called after other methods") if st[0].did_hello
+    self.st[0].local_name = local_name
+    self.~say_hello!
+  }
+
+  # Sends `line` and reads the reply, expecting `expect_code` (see
+  # textproto's read_response!).
+  def cmd!(expect_code: Int, line: Str) -> ~(Int, Str) {
+    t = text
+    id = t.~cmd!(line)
+    t.start_response(id)
+    r = t.read_response!(expect_code)
+    t.end_response(id)
+    ~r
+  }
+
+  def helo! -> ~Unit {
+    self.st[0].ext = none
+    self.~cmd!(250, "HELO #{st[0].local_name}")
+    return
+  }
+
+  def ehlo! -> ~Unit {
+    _, msg = self.~cmd!(250, "EHLO #{st[0].local_name}")
+    ext: Map[Str, Str] = {}
+    ext_list = strings.split(msg, "\n")
+    if ext_list.size > 1 {
+      for line in ext_list[1...ext_list.size] {
+        k = line
+        v = ""
+        if kv = strings.cut(line, " ") {
+          k, v = kv
+        }
+        ext[k] = v
+      }
+    }
+    if mechs = ext["AUTH"] {
+      self.st[0].auth = strings.split(mechs, " ")
+    }
+    self.st[0].ext = ext
+  }
+
+  # Asks the server to switch to TLS. The server's refusal is returned as
+  # Go does; its consent fails with SmtpError.NoTls (no crypto/tls yet).
+  pub def start_tls! -> ~Unit {
+    self.~say_hello!
+    self.~cmd!(220, "STARTTLS")
+    fail SmtpError.NoTls
+  }
+
+  # Checks that the server knows the address (VRFY); many servers refuse.
+  pub def verify!(addr: Str) -> ~Unit {
+    ~validate_line(addr)
+    self.~say_hello!
+    self.~cmd!(250, "VRFY #{addr}")
+    return
+  }
+
+  # Authenticates with `a` (only on servers that support AUTH).
+  pub def auth!(a: Auth) -> ~Unit {
+    self.~say_hello!
+    enc = base64.std_encoding
+    started = a.start(ServerInfo.new(name: st[0].server_name, tls: st[0].tls, auth: st[0].auth))
+    if e = started.err {
+      self.quit!
+      fail e
+    }
+    mech, resp = started.unwrap
+    r = self.cmd!(0, strings.trim_space("AUTH #{mech} #{enc.encode_to_string(resp)}"))
+    loop {
+      ~r
+      code, msg64 = r.unwrap
+      step: ~[Byte]? = auth_step(a, code, msg64)
+      if e = step.err {
+        self.cmd!(501, "*")
+        self.quit!
+        fail e
+      }
+      if next_resp = step.unwrap {
+        r = self.cmd!(0, enc.encode_to_string(next_resp))
+      } else {
+        break
+      }
+    }
+  }
+
+  # Starts a mail transaction from `from` (MAIL FROM, with BODY=8BITMIME
+  # and SMTPUTF8 when the server supports them).
+  pub def mail!(from: Str) -> ~Unit {
+    ~validate_line(from)
+    self.~say_hello!
+    line = "MAIL FROM:<#{from}>"
+    if ext = st[0].ext {
+      line = line + " BODY=8BITMIME" if ext.key?("8BITMIME")
+      line = line + " SMTPUTF8" if ext.key?("SMTPUTF8")
+    }
+    self.~cmd!(250, line)
+    return
+  }
+
+  # Adds a recipient (RCPT TO).
+  pub def rcpt!(to: Str) -> ~Unit {
+    ~validate_line(to)
+    self.~cmd!(25, "RCPT TO:<#{to}>")
+    return
+  }
+
+  # Starts the message body (DATA): write it to the result (dot-encoded on
+  # the wire) and close! it to finish the message.
+  pub def data! -> ~DataWriter[C] {
+    self.~cmd!(354, "DATA")
+    t = text
+    w = t.~dot_writer!
+    DataWriter.new(c: self, w: w)
+  }
+
+  # The parameters of extension `ext` (case-insensitive) if the server
+  # supports it; none if not (or if EHLO failed).
+  pub def extension!(ext: Str) -> Str? {
+    return none if self.say_hello!.err?
+    if m = st[0].ext {
+      return m[strings.to_upper(ext)]
+    }
+    none
+  }
+
+  # Aborts the current mail transaction (RSET).
+  pub def reset! -> ~Unit {
+    self.~say_hello!
+    self.~cmd!(250, "RSET")
+    return
+  }
+
+  # Checks the connection (NOOP).
+  pub def noop! -> ~Unit {
+    self.~say_hello!
+    self.~cmd!(250, "NOOP")
+    return
+  }
+
+  # Sends QUIT and closes the connection.
+  pub def quit! -> ~Unit {
+    self.say_hello!
+    self.~cmd!(221, "QUIT")
+    self.~close!
+  }
+}
+
+# Go's Auth loop body: the next response for the reply (code, msg64), none
+# when done; fails on a reply that isn't 334 / 235 or a bad challenge.
+def auth_step(a: Auth, code: Int, msg64: Str) -> ~[Byte]? {
+  msg: [Byte] = []
+  if code == 334 {
+    msg = ~base64.std_encoding.decode_string(msg64)
+  } else if code == 235 {
+    msg = msg64.bytes.to_a
+  } else {
+    fail textproto.TextprotoError.Code(code: code, msg: msg64)
+  }
+  ~a.next(msg, code == 334)
+}
+
+# The writer data! returns: the message body, dot-encoded.
+pub struct DataWriter[C] {
+  c: Client[C]
+  w: textproto.DotWriter[C]
+
+  pub def write!(p: [Byte]) -> ~Int { w.~write!(p) }
+
+  pub def write_string!(s: Str) -> ~Int { w.~write!(s.bytes.to_a) }
+
+  # Ends the message and reads the server's verdict.
+  pub def close! -> ~Unit {
+    w.close!
+    t = c.text
+    t.~read_response!(250)
+    return
+  }
+}
+
+def validate_line(line: Str) -> ~Unit {
+  fail SmtpError.Msg("smtp: A line must not contain CR or LF") if strings.contains_any(line, "\n\r")
+}
+
+# A client over conn without reading the greeting.
+def client_over[C](conn: C, host: Str) -> Client[C] {
+  st: [ClientState] = [ClientState.new(tls: false, server_name: host, ext: none, auth: [], local_name: "localhost", did_hello: false, hello_error: none)]
+  Client.new(text: textproto.new_conn(conn), st: st)
+}
+
+# A client over an open connection to the server `host`: reads its 220
+# greeting.
+pub def new_client[C: io.ReadWriteCloser](conn: C, host: Str) -> ~Client[C] {
+  c = client_over(conn, host)
+  t = c.text
+  r = t.read_response!(220)
+  if e = r.err {
+    t.close!
+    fail e
+  }
+  c
+}
+
+# Connects to the server at addr ("host:port").
+pub def dial(addr: Str) -> ~Client[net.Conn] {
+  conn = ~net.dial("tcp", addr)
+  host, _ = net.split_host_port(addr).unwrap_or(("", ""))
+  ~new_client(conn, host)
+}
+
+# Connects to addr, authenticates with `a` if given (and the server supports
+# AUTH), and sends msg from `from` to every address in `to`. msg is the
+# whole message: headers, a blank line, the body, with CRLF line endings.
+pub def send_mail(addr: Str, a: Auth?, from: Str, to: [Str], msg: [Byte]) -> ~Unit {
+  ~validate_line(from)
+  for recp in to {
+    ~validate_line(recp)
+  }
+  c = ~dial(addr)
+  r = send_with(c, a, from, to, msg)
+  c.close!
+  ~r
+}
+
+def send_with(c0: Client[net.Conn], a: Auth?, from: Str, to: [Str], msg: [Byte]) -> ~Unit {
+  c = c0
+  c.~say_hello!
+  if c.extension!("STARTTLS").present? {
+    c.~start_tls!
+  }
+  if au = a {
+    if ext = c.st[0].ext {
+      fail SmtpError.Msg("smtp: server doesn't support AUTH") unless ext.key?("AUTH")
+      c.~auth!(au)
+    }
+  }
+  c.~mail!(from)
+  for addr in to {
+    c.~rcpt!(addr)
+  }
+  w = c.~data!
+  w.~write!(msg)
+  w.~close!
+  c.~quit!
+}

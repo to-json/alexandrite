@@ -3395,6 +3395,15 @@ impl<'w, 'a> FnCx<'w, 'a> {
             Some(TStmt::Expr(e)) => e.ty.clone(),
             _ => Ty::Unit,
         };
+        // A held `~T` as the task's value isn't lowered (the C backend
+        // mistyped it, the JIT lost it): the body's errors already make the
+        // task's result fallible, so ask for the `~`.
+        // (`spawn { srv.serve(ln) }`, a held ~Unit, is common and works.)
+        if let (Ty::Result(inner), Some(TStmt::Expr(e))) = (&bt, body.last()) {
+            if **inner != Ty::Unit {
+            return Err(Diag::new(e.span, "a `spawn` body can't end in a held `~T`: propagate it with `~` (`spawn { ~f(x) }`), so its error becomes the task's"));
+            }
+        }
         let tb = TBlock { params: vec![], destructure: false, body, pure: false, span: blk.span, own: (own_start, self.locals.len()) };
         let mut used = vec![];
         for s in &tb.body {

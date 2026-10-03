@@ -36,3 +36,6 @@ Open problems agents reported; each gets fixed in a compiler round between waves
 | 30 | math/big | no mutable package globals (caches like Go's divisor table) | open (design) |
 | 31 | math/big | `format` has no `%g` | open |
 | 32 | math/big | a main file can't declare its own `Int`/`Float` (only packages can) | open (by design for now) |
+| 33 | crypto/cipher | two struct layouts nesting the same fields differently (`Tup(Tup(A), B)`, `Tup(Tup(A, B))`) got one C type name: a generic struct field inside a plain struct failed to compile with --release | fixed: C tuple names carry their arity (acceptance case nested_layouts) |
+| 34 | crypto/aes | bounds checks on constant tables (`TE0[(s >> 24).to_i]`) in release: ~2x slower AES than Go generic | fixed: release proves `[T; N]` indexes in range from narrow integer types, `x & c`, `x >> c` and conversions |
+| 35 | crypto/cipher | a mode generic over its block (`Gcm[B]`) wrapping a `cipher.Block` *interface value* can't itself become an AEAD interface value (D12) | open (design; modes are used concretely) |

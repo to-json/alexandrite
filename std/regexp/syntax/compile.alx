@@ -1,0 +1,238 @@
+# The compiler from syntax trees to programs, after Go's
+# regexp/syntax/compile.go.
+#
+# A patch list is a list of instruction pointers that need to be filled in
+# (patched). Because the pointers haven't been filled in yet, we can reuse
+# their storage to hold the list. It's kind of sleazy, but works well in
+# practice. See https://swtch.com/~rsc/regexp/regexp1.html for inspiration.
+# These aren't really pointers: they're integers, so we can reinterpret them
+# this way without using package unsafe. A value l.head denotes
+# p.inst[l.head >> 1].out (l.head & 1 == 0) or .arg (l.head & 1 == 1).
+# head == 0 denotes the empty list, okay because we start every program with
+# a fail instruction, so we'll never want to point at its output link.
+
+# A fragment: its first instruction (0 for none), where to record its end
+# (the patch list head and tail), and whether it can match the empty string.
+struct Frag {
+  i: Int
+  head: Int
+  tail: Int
+  nullable: Bool
+}
+
+struct Compiler {
+  inst: [Inst]
+  num_cap: Int
+
+  def patch!(head0: Int, tail: Int, val: Int) {
+    head = head0
+    while head != 0 {
+      k = head >> 1
+      if (head & 1) == 0 {
+        head = inst[k].out
+        self.inst[k].out = val
+      } else {
+        head = inst[k].arg
+        self.inst[k].arg = val
+      }
+    }
+  }
+
+  # Appends patch list 2 to list 1: (head, tail).
+  def append_list!(h1: Int, t1: Int, h2: Int, t2: Int) -> (Int, Int) {
+    return (h2, t2) if h1 == 0
+    return (h1, t1) if h2 == 0
+    k = t1 >> 1
+    if (t1 & 1) == 0 {
+      self.inst[k].out = h2
+    } else {
+      self.inst[k].arg = h2
+    }
+    (h1, t2)
+  }
+
+  def new_inst!(op: Int) -> Frag {
+    f = Frag.new(i: inst.size, nullable: true)
+    self.inst << Inst.new(op: op)
+    f
+  }
+
+  def nop! -> Frag {
+    f = new_inst!(INST_NOP)
+    f.head = f.i << 1
+    f.tail = f.i << 1
+    f
+  }
+
+  def fail -> Frag { Frag.new() }
+
+  def cap!(arg: Int) -> Frag {
+    f = new_inst!(INST_CAPTURE)
+    f.head = f.i << 1
+    f.tail = f.i << 1
+    self.inst[f.i].arg = arg
+    self.num_cap = arg + 1 if num_cap < arg + 1
+    f
+  }
+
+  def cat!(f1: Frag, f2: Frag) -> Frag {
+    # concat of failure is failure
+    return Frag.new() if f1.i == 0 || f2.i == 0
+    # TODO: elide nop
+    patch!(f1.head, f1.tail, f2.i)
+    Frag.new(i: f1.i, head: f2.head, tail: f2.tail, nullable: f1.nullable && f2.nullable)
+  }
+
+  def alt!(f1: Frag, f2: Frag) -> Frag {
+    # alt of failure is other
+    return f2 if f1.i == 0
+    return f1 if f2.i == 0
+    f = new_inst!(INST_ALT)
+    self.inst[f.i].out = f1.i
+    self.inst[f.i].arg = f2.i
+    h, t = append_list!(f1.head, f1.tail, f2.head, f2.tail)
+    f.head = h
+    f.tail = t
+    f.nullable = f1.nullable || f2.nullable
+    f
+  }
+
+  def quest!(f1: Frag, nongreedy: Bool) -> Frag {
+    f = new_inst!(INST_ALT)
+    h = 0
+    if nongreedy {
+      self.inst[f.i].arg = f1.i
+      h = f.i << 1
+    } else {
+      self.inst[f.i].out = f1.i
+      h = (f.i << 1) | 1
+    }
+    h2, t2 = append_list!(h, h, f1.head, f1.tail)
+    f.head = h2
+    f.tail = t2
+    f
+  }
+
+  # loop returns the fragment for the main loop of a plus or star. For
+  # plus, it can be used after changing the entry to f1.i. For star, it can
+  # be used directly when f1 can't match an empty string. (When f1 can match
+  # an empty string, f1* must be implemented as (f1+)? to get the priority
+  # match order correct.)
+  def loop_frag!(f1: Frag, nongreedy: Bool) -> Frag {
+    f = new_inst!(INST_ALT)
+    if nongreedy {
+      self.inst[f.i].arg = f1.i
+      f.head = f.i << 1
+    } else {
+      self.inst[f.i].out = f1.i
+      f.head = (f.i << 1) | 1
+    }
+    f.tail = f.head
+    patch!(f1.head, f1.tail, f.i)
+    f
+  }
+
+  def star!(f1: Frag, nongreedy: Bool) -> Frag {
+    # Use (f1+)? to get priority match order correct. See golang.org/issue/46123.
+    return quest!(plus!(f1, nongreedy), nongreedy) if f1.nullable
+    loop_frag!(f1, nongreedy)
+  }
+
+  def plus!(f1: Frag, nongreedy: Bool) -> Frag {
+    l = loop_frag!(f1, nongreedy)
+    Frag.new(i: f1.i, head: l.head, tail: l.tail, nullable: f1.nullable)
+  }
+
+  def empty!(op: Int) -> Frag {
+    f = new_inst!(INST_EMPTY_WIDTH)
+    self.inst[f.i].arg = op
+    f.head = f.i << 1
+    f.tail = f.i << 1
+    f
+  }
+
+  def rune!(r: [Rune], flags0: Int) -> Frag {
+    f = new_inst!(INST_RUNE)
+    f.nullable = false
+    self.inst[f.i].rune = r
+    flags = flags0 & FOLD_CASE # only relevant flag is FOLD_CASE
+    # And only relevant if it's a single rune that folds.
+    flags &= ^FOLD_CASE if r.size != 1 || unicode.simple_fold(r[0]) == r[0]
+    self.inst[f.i].arg = flags
+    f.head = f.i << 1
+    f.tail = f.i << 1
+    # Special cases for exec machine.
+    if (flags & FOLD_CASE) == 0 && (r.size == 1 || (r.size == 2 && r[0] == r[1])) {
+      self.inst[f.i].op = INST_RUNE1
+    } else if r.size == 2 && r[0] == 0 && r[1] == 0x10FFFF {
+      self.inst[f.i].op = INST_RUNE_ANY
+    } else if r.size == 4 && r[0] == 0 && r[1] == 9 && r[2] == 11 && r[3] == 0x10FFFF {
+      self.inst[f.i].op = INST_RUNE_ANY_NOT_NL
+    }
+    f
+  }
+
+  def compile!(ns: [Node], id: Int) -> Frag {
+    re = ns[id]
+    case re.op {
+      OP_NO_MATCH => {return fail}
+      OP_EMPTY_MATCH => {return nop!}
+      OP_LITERAL => {
+        return nop! if re.rune.size == 0
+        f = Frag.new()
+        j = 0
+        while j < re.rune.size {
+          f1 = rune!(re.rune[j...j + 1], re.flags)
+          f = j == 0 ? f1 : cat!(f, f1)
+          j += 1
+        }
+        return f
+      }
+      OP_CHAR_CLASS => {return rune!(re.rune, re.flags)}
+      OP_ANY_CHAR_NOT_NL => {return rune!([0, 9, 11, 0x10FFFF], 0)}
+      OP_ANY_CHAR => {return rune!([0, 0x10FFFF], 0)}
+      OP_BEGIN_LINE => {return empty!(EMPTY_BEGIN_LINE)}
+      OP_END_LINE => {return empty!(EMPTY_END_LINE)}
+      OP_BEGIN_TEXT => {return empty!(EMPTY_BEGIN_TEXT)}
+      OP_END_TEXT => {return empty!(EMPTY_END_TEXT)}
+      OP_WORD_BOUNDARY => {return empty!(EMPTY_WORD_BOUNDARY)}
+      OP_NO_WORD_BOUNDARY => {return empty!(EMPTY_NO_WORD_BOUNDARY)}
+      OP_CAPTURE => {
+        bra = cap!(re.cap << 1)
+        sub = compile!(ns, re.sub[0])
+        ket = cap!((re.cap << 1) | 1)
+        return cat!(cat!(bra, sub), ket)
+      }
+      OP_STAR => {return star!(compile!(ns, re.sub[0]), (re.flags & NON_GREEDY) != 0)}
+      OP_PLUS => {return plus!(compile!(ns, re.sub[0]), (re.flags & NON_GREEDY) != 0)}
+      OP_QUEST => {return quest!(compile!(ns, re.sub[0]), (re.flags & NON_GREEDY) != 0)}
+      OP_CONCAT => {
+        return nop! if re.sub.size == 0
+        f = Frag.new()
+        i = 0
+        while i < re.sub.size {
+          f = i == 0 ? compile!(ns, re.sub[0]) : cat!(f, compile!(ns, re.sub[i]))
+          i += 1
+        }
+        return f
+      }
+      OP_ALTERNATE => {
+        f = Frag.new()
+        for sub in re.sub { f = alt!(f, compile!(ns, sub)) }
+        return f
+      }
+      _ => panic("regexp: unhandled case in compile")
+    }
+  }
+}
+
+# Compiles the regexp into a program to be executed (Go's Compile; it
+# cannot fail).
+pub def compile(re: Regexp) -> Prog {
+  c = Compiler.new(inst: [], num_cap: 2) # implicit ( and ) for whole match $0
+  c.new_inst!(INST_FAIL)
+  f = c.compile!(re.ar[0].nodes, re.id)
+  m = c.new_inst!(INST_MATCH)
+  c.patch!(f.head, f.tail, m.i)
+  Prog.new(inst: c.inst, start: f.i, num_cap: c.num_cap)
+}

@@ -1,0 +1,258 @@
+#![overflow(wrap)]
+# The bit-state backtracker, after Go's regexp/backtrack.go.
+#
+# A backtracking search that keeps a bit per (instruction, position) pair so
+# that no pair is explored twice: linear in len(prog) * len(input), and so
+# only used when that product is small (max_bit_state_len).
+#
+# Go's bitState, push and tryBacktrack are folded into one function over
+# local arrays (the job stack is triples pc, arg, pos in `jobs`), which keeps
+# the inner loop free of calls and allocation.
+
+import "regexp/syntax"
+
+VISITED_BITS = 32
+MAX_BACKTRACK_PROG = 500      # len(prog.inst) <= max
+MAX_BACKTRACK_VECTOR = 262144 # bit vector size <= max (bits)
+
+# The longest input the backtracker may be used on for prog (0: never).
+def max_bit_state_len(n: Int) -> Int {
+  return 0 if n > MAX_BACKTRACK_PROG
+  MAX_BACKTRACK_VECTOR / n
+}
+
+# A job stack twice as big, with the first n entries of jobs.
+def grow_jobs(jobs: [Int], n: Int) -> [Int] {
+  out = [0; jobs.size * 2]
+  copy(out, jobs[0...n])
+  out
+}
+
+# Runs a backtracking search for the first match of s from pos (Go's
+# Regexp.backtrack with tryBacktrack inlined).
+def backtrack(re: Regexp, s: Str, pos0: Int, ncap: Int) -> [Int]? {
+  start_cond = re.d[0].cond
+  return none if start_cond == 255 # impossible
+  return none if (start_cond & syntax.EMPTY_BEGIN_TEXT) != 0 && pos0 != 0
+  end = s.size
+  stride = end + 1
+  nprog = re.d[0].inst_op.size
+  visited = [0; (nprog * stride + VISITED_BITS - 1) / VISITED_BITS]
+  cap = [-1; ncap]
+  matchcap = [-1; ncap]
+  jobs = [0; 30]
+  ops = re.d[0].inst_op
+  outs = re.d[0].inst_out
+  args = re.d[0].inst_arg
+  rune0 = re.d[0].inst_rune0
+  longest = re.longest
+  anchored = (start_cond & syntax.EMPTY_BEGIN_TEXT) != 0
+  has_prefix = re.d[0].prefix.size > 0
+  pos = pos0
+  width = -1
+  # Unanchored search, starting from each possible text position. Notice
+  # that we have to try the empty string at the end of the text, so the loop
+  # condition is pos <= end, not pos < end. This looks wrong, but it is
+  # right: at the end, the width is 0. An anchored search tries pos only.
+  while pos <= end && width != 0 {
+    if !anchored && has_prefix {
+      # Match requires literal prefix; fast search for it.
+      advance = index_from(s, re.d[0].prefix, pos)
+      return none if advance < 0
+      pos = advance
+    }
+    cap[0] = pos if ncap > 0
+    # ---- tryBacktrack(start, pos)
+    matched = false
+    jn = 0
+    spc = re.d[0].start
+    if ops[spc] != syntax.INST_FAIL {
+      n = spc * stride + pos
+      w = n >> 5
+      bit = 1 << (n & 31)
+      if (visited[w] & bit) == 0 {
+        visited[w] = visited[w] | bit
+        jobs[0] = spc
+        jobs[1] = 0
+        jobs[2] = pos
+        jn = 3
+      }
+    }
+    while jn > 0 && !matched {
+      jn -= 3
+      pc = jobs[jn]
+      arg = jobs[jn + 1] != 0
+      p = jobs[jn + 2]
+      check = false
+      loop {
+        if check {
+          # CheckAndLoop: skip (pc, p) if already visited.
+          n = pc * stride + p
+          w = n >> 5
+          bit = 1 << (n & 31)
+          break if (visited[w] & bit) != 0
+          visited[w] = visited[w] | bit
+        }
+        check = true
+        op = ops[pc]
+        if op == syntax.INST_RUNE1 {
+          break if p >= end
+          c = s[p]
+          if c < 0x80 {
+            break if c.to_i != rune0[pc]
+            p += 1
+          } else {
+            x = step_at(s, p)
+            break if (x >> 3) != rune0[pc]
+            p += x & 7
+          }
+          pc = outs[pc]
+          next
+        }
+        if op == syntax.INST_RUNE {
+          break if p >= end
+          c = s[p]
+          if c < 0x80 {
+            break if !rune_matches(re.d[0].inst_runes[pc], args[pc], c.to_i)
+            p += 1
+          } else {
+            x = step_at(s, p)
+            break if !rune_matches(re.d[0].inst_runes[pc], args[pc], x >> 3)
+            p += x & 7
+          }
+          pc = outs[pc]
+          next
+        }
+        if op == syntax.INST_ALT {
+          # Cannot just push inst.Out and inst.Arg: if during the processing
+          # of inst.Out we encounter inst.Arg via another path, we want to
+          # process it then. Instead, re-push inst with arg==true as a
+          # reminder to push inst.Arg out later.
+          if arg {
+            # Finished inst.Out; try inst.Arg.
+            arg = false
+            pc = args[pc]
+            next
+          }
+          jobs = grow_jobs(jobs, jn) if jn + 3 > jobs.size
+          jobs[jn] = pc
+          jobs[jn + 1] = 1
+          jobs[jn + 2] = p
+          jn += 3
+          pc = outs[pc]
+          next
+        }
+        if op == syntax.INST_RUNE_ANY_NOT_NL {
+          break if p >= end
+          c = s[p]
+          if c < 0x80 {
+            break if c == 10
+            p += 1
+          } else {
+            p += step_at(s, p) & 7
+          }
+          pc = outs[pc]
+          next
+        }
+        if op == syntax.INST_RUNE_ANY {
+          break if p >= end
+          p += s[p] < 0x80 ? 1 : step_at(s, p) & 7
+          pc = outs[pc]
+          next
+        }
+        if op == syntax.INST_CAPTURE {
+          a = args[pc]
+          if arg {
+            # Finished inst.Out; restore the old value.
+            cap[a] = p
+            break
+          }
+          if a < ncap {
+            # Capture p to register, but save old value: come back when
+            # we're done (a push with arg true skips the visited check).
+            jobs = grow_jobs(jobs, jn) if jn + 3 > jobs.size
+            jobs[jn] = pc
+            jobs[jn + 1] = 1
+            jobs[jn + 2] = cap[a]
+            jn += 3
+            cap[a] = p
+          }
+          pc = outs[pc]
+          next
+        }
+        if op == syntax.INST_EMPTY_WIDTH {
+          break if !empty_ok(args[pc], rune_before(s, p), rune_at(s, p))
+          pc = outs[pc]
+          next
+        }
+        if op == syntax.INST_NOP {
+          pc = outs[pc]
+          next
+        }
+        if op == syntax.INST_ALT_MATCH {
+          # One opcode consumes runes; the other leads to match.
+          o = ops[outs[pc]]
+          tpc = 0
+          tpos = 0
+          if o == syntax.INST_RUNE || o == syntax.INST_RUNE1 || o == syntax.INST_RUNE_ANY || o == syntax.INST_RUNE_ANY_NOT_NL {
+            # inst.Arg is the match.
+            tpc = args[pc]
+            tpos = p
+            pc = args[pc]
+            p = end
+          } else {
+            # inst.Out is the match - non-greedy
+            tpc = outs[pc]
+            tpos = end
+            pc = outs[pc]
+          }
+          if ops[tpc] != syntax.INST_FAIL {
+            n = tpc * stride + tpos
+            w = n >> 5
+            bit = 1 << (n & 31)
+            if (visited[w] & bit) == 0 {
+              visited[w] = visited[w] | bit
+              jobs = grow_jobs(jobs, jn) if jn + 3 > jobs.size
+              jobs[jn] = tpc
+              jobs[jn + 1] = 0
+              jobs[jn + 2] = tpos
+              jn += 3
+            }
+          }
+          next
+        }
+        if op == syntax.INST_MATCH {
+          # We found a match. If the caller doesn't care where the match
+          # is, no point going further.
+          if ncap == 0 {
+            matched = true
+            break
+          }
+          # Record best match so far. Only need to check end point, because
+          # this entire call is only considering one start position.
+          cap[1] = p if ncap > 1
+          old = matchcap[1]
+          if old == -1 || (longest && p > 0 && p > old) {
+            k = 0
+            while k < ncap {
+              matchcap[k] = cap[k]
+              k += 1
+            }
+          }
+          # If going for first match, we're done; if we used the entire
+          # text, no longer match is possible.
+          matched = true if !longest || p == end
+          # Otherwise, continue on in hope of a longer match.
+          break
+        }
+        panic("unexpected InstFail")
+      }
+    }
+    matched = true if !matched && longest && ncap > 1 && matchcap[1] >= 0
+    return matchcap if matched
+    return none if anchored
+    width = pos < end ? (s[pos] < 0x80 ? 1 : step_at(s, pos) & 7) : 0
+    pos += width
+  }
+  none
+}

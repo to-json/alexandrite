@@ -298,6 +298,7 @@ AlxStr alx_str_delete(AlxStr s, AlxStr chars);
 Arr_Str alx_str_split(AlxStr s, AlxStr sep);
 AlxStr alx_str_join(Arr_Str a, AlxStr sep);
 int64_t alx_str_to_i(AlxStr s);
+int64_t alx_str_index(AlxStr s, AlxStr sub, int64_t from);
 /* Byte length of the UTF-8 character starting at byte i. */
 int64_t alx_str_charlen(AlxStr s, int64_t i);
 /* Bytes [i, i+n) as a string (n == 0: the single byte at i as an Int). */

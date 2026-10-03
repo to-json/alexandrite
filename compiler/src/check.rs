@@ -1255,7 +1255,7 @@ const INT_METHODS: &[&str] = &["to_s", "to_f", "to_i", "to_u8", "to_i32", "to_u3
 const FLOAT_METHODS: &[&str] = &["to_s", "to_f", "to_i", "abs", "sqrt"];
 /// `fmt` functions the compiler provides (std/fmt/fmt.alx documents them).
 const FMT_BUILTINS: &[&str] = &["sprintf", "printf", "sprint", "sprintln", "print", "println", "errorf"];
-const STR_METHODS: &[&str] = &["chars", "bytes", "runes", "size", "length", "reverse", "delete", "split", "to_i", "to_s", "strip", "lstrip", "rstrip", "lines", "start_with?", "end_with?", "include?"];
+const STR_METHODS: &[&str] = &["chars", "bytes", "runes", "size", "length", "reverse", "delete", "split", "to_i", "to_s", "strip", "lstrip", "rstrip", "lines", "start_with?", "end_with?", "include?", "byteindex"];
 
 fn lev(a: &str, b: &str) -> usize {
     let (a, b): (Vec<char>, Vec<char>) = (a.chars().collect(), b.chars().collect());
@@ -3465,12 +3465,31 @@ impl<'w, 'a> FnCx<'w, 'a> {
         let (id, steps, pty) = self.place(recv).map_err(|d| {
             if matches!(recv.kind, ExprKind::Name(_) | ExprKind::Index(..) | ExprKind::Call { .. }) { d } else { Diag::new(recv.span, format!("`{name}` changes its receiver; call it on a variable")) }
         })?;
-        let cur = self.place_read(id, &steps, &pty, recv.span);
-        let (tid, s1) = self.call_cell(cur, &pty, recv.span);
-        let mut targs = vec![self.mk(TK::Local(tid), Ty::arr(pty.clone()), recv.span)];
+        // Arguments are evaluated before the receiver is read: an argument
+        // that calls something (`p.push!(p.new_node!)`) may change the
+        // receiver, and the call must see that change.
+        let mut pre = vec![];
+        let mut vals = vec![];
         for a in args {
-            targs.push(self.value(a)?);
+            let v = self.value(a)?;
+            if has_call(&v) {
+                let (aid, st) = self.opt_tmp(v.clone(), v.span);
+                pre.push(st);
+                vals.push(self.mk(TK::Local(aid), v.ty.clone(), v.span));
+            } else {
+                vals.push(v);
+            }
         }
+        let cur = self.place_read(id, &steps, &pty, recv.span);
+        let (tid, s1) = self.call_cell(cur, &pty, recv.span, true);
+        let s1 = if pre.is_empty() {
+            s1
+        } else {
+            pre.push(s1);
+            TStmt::Expr(self.mk(TK::Seq(pre), Ty::Unit, sp))
+        };
+        let mut targs = vec![self.mk(TK::Local(tid), Ty::arr(pty.clone()), recv.span)];
+        targs.extend(vals);
         // The receiver is written back after the call, so a fallible call
         // is held (a `~T`) here; an enclosing `~` propagates it after.
         let saved = std::mem::replace(&mut self.under_try, false);
@@ -3500,7 +3519,13 @@ impl<'w, 'a> FnCx<'w, 'a> {
 
     /// The one-element slice a `!` call gets its receiver in: one per call
     /// site, made on first use and reused after (a loop allocates it once).
-    fn call_cell(&mut self, cur: TExpr, pty: &Ty, sp: Span) -> (LocalId, TStmt) {
+    ///
+    /// `share`: the call's arguments are evaluated before the cell is filled
+    /// (`mutating_call`), so no other `!` call on the same type can run while
+    /// the cell is in use, and call sites with the same receiver type share
+    /// one cell. That keeps frames small in recursive methods with many `!`
+    /// calls (std/regexp/syntax's printer and compiler).
+    fn call_cell(&mut self, cur: TExpr, pty: &Ty, sp: Span, share: bool) -> (LocalId, TStmt) {
         let n = self.locals.len();
         let at = Ty::arr(pty.clone());
         if self.cells.is_none() {
@@ -3508,12 +3533,18 @@ impl<'w, 'a> FnCx<'w, 'a> {
             let arr = self.mk(TK::Array(vec![cur]), at, sp);
             return self.opt_tmp(arr, sp);
         }
-        let cell = self.declare(&format!("__cell{n}"), at.clone());
+        let shared = if share { self.cells.as_ref().unwrap().iter().find(|(_, t)| *t == at).map(|(c, _)| *c) } else { None };
+        let cell = match shared {
+            Some(c) => c,
+            None => self.declare(&format!("__cell{n}"), at.clone()),
+        };
         let l = |ck: &mut Self| ck.mk(TK::Local(cell), at.clone(), sp);
         let size = { let c = l(self); self.mk(TK::M(M::Size, Some(Box::new(c)), vec![], None), Ty::Int, sp) };
         let zero = self.mk(TK::Int(0), Ty::Int, sp);
         let fresh = self.mk(TK::Bin(BinOp::Eq, Box::new(size), Box::new(zero)), Ty::Bool, sp);
-        self.cells.as_mut().unwrap().push((cell, at.clone()));
+        if shared.is_none() {
+            self.cells.as_mut().unwrap().push((cell, at.clone()));
+        }
         self.locals[cell].mutated = true;
         self.locals[cell].pushed = true;
         let c = l(self);
@@ -3528,7 +3559,7 @@ impl<'w, 'a> FnCx<'w, 'a> {
     fn mutating_iface_call(&mut self, recv: &Expr, iname: &str, k: usize, m: &IfaceMethod, args: &[Expr], sp: Span) -> R<TExpr> {
         let (id, steps, pty) = self.place(recv)?;
         let cur = self.place_read(id, &steps, &pty, recv.span);
-        let (tid, s1) = self.call_cell(cur, &pty, recv.span);
+        let (tid, s1) = self.call_cell(cur, &pty, recv.span, false);
         if args.len() != m.params.len() {
             return Err(Diag::new(sp, format!("`{iname}.{}` takes {} argument(s), got {}", m.name, m.params.len(), args.len())));
         }
@@ -5508,6 +5539,19 @@ impl<'w, 'a> FnCx<'w, 'a> {
                     };
                     return Ok(mk_m(self, M::StrHelper(code), recv, a, None, Ty::Bool));
                 }
+                "byteindex" => {
+                    // Ruby's String#byteindex(sub, offset = 0): a byte offset or -1
+                    // (nil in Ruby). std/regexp needed a fast substring search.
+                    let a = argv(self)?;
+                    if a.is_empty() || a.len() > 2 {
+                        return Err(Diag::new(sp, "`byteindex(sub, from = 0)` takes one or two arguments"));
+                    }
+                    self.expect(&a[0].ty, &Ty::Str, a[0].span, name)?;
+                    if a.len() == 2 {
+                        self.expect(&a[1].ty, &Ty::Int, a[1].span, name)?;
+                    }
+                    return Ok(mk_m(self, M::ByteIndex, recv, a, None, Ty::Int));
+                }
                 "chars" => return Ok(mk_m(self, M::Chars, recv, vec![], None, Ty::seq(Ty::Str, false))),
                 "bytes" => return Ok(mk_m(self, M::Bytes, recv, vec![], None, Ty::seq(Ty::IntK(IntKind::U8), false))),
                 "runes" => return Ok(mk_m(self, M::Runes, recv, vec![], None, Ty::seq(Ty::IntK(IntKind::I32), false))),
@@ -6048,6 +6092,16 @@ fn is_fallible_expr(e: &TExpr, cx: &FnCx) -> bool {
         TK::M(M::FileRead, ..) => true,
         _ => false,
     }
+}
+
+/// Whether evaluating `e` calls a function (and so may change state).
+fn has_call(e: &TExpr) -> bool {
+    if matches!(e.kind, TK::Call(..) | TK::Seq(..)) {
+        return true;
+    }
+    let mut found = false;
+    crate::prove::each_child(e, &mut |x| found = found || has_call(x));
+    found
 }
 
 /// An integer type, or one not known yet.

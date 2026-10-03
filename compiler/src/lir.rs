@@ -231,6 +231,8 @@ pub enum Rt {
     StrDelete,
     StrSplit,
     StrToI,
+    /// (s, sub, from): the first byte offset >= from where sub occurs, or -1.
+    StrIndex,
     StrChar,
     StrByte,
     StrLen,

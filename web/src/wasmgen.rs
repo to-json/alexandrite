@@ -52,6 +52,7 @@ const RT: &[(&str, &str)] = &[
     ("alxr_str_split", "jjjj>"),
     ("alxr_str_join", "jjjjj>"),
     ("alxr_str_to_i", "jj>j"),
+    ("alxr_str_index", "jjjjj>j"),
     ("alxr_str_charlen", "jjj>j"),
     ("alxr_str_sub", "jjjj>"),
     ("alxr_sort_i64", "jj>"),
@@ -2212,6 +2213,7 @@ impl<'c, 'p> Fx<'c, 'p> {
             Rt::StrSplit => call_ret(self, "alxr_str_split", 3),
             Rt::StrJoin => call_ret(self, "alxr_str_join", 2),
             Rt::StrToI => call(self, "alxr_str_to_i"),
+            Rt::StrIndex => call(self, "alxr_str_index"),
             Rt::StrChar => call(self, "alxr_str_charlen"),
             Rt::StrByte => {
                 if matches!(args[2], LE::I(0)) {

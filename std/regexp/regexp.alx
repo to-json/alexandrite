@@ -1,0 +1,750 @@
+# Package regexp: Go's regexp, with alx idioms (S2).
+#
+# Regular expression search with RE2 syntax (see package regexp/syntax),
+# guaranteed to run in time linear in the size of the input. Matching uses
+# Go's three engines with Go's rules for choosing between them: the one-pass
+# matcher for anchored unambiguous expressions, the bit-state backtracker
+# for small programs on short inputs, and the NFA (a Pike VM) otherwise.
+# Results, including submatch positions and leftmost-first/leftmost-longest
+# semantics, are Go's.
+#
+#   Go                                  alx
+#   Compile / CompilePOSIX              compile(expr) / compile_posix(expr) -> ~Regexp<syntax.ParseError>
+#   MustCompile / MustCompilePOSIX      must_compile(expr) / must_compile_posix(expr) (panic on error)
+#   Match / MatchString (package)       match(pattern, b) / match_string(pattern, s) -> ~Bool
+#   QuoteMeta                           quote_meta(s)
+#   re.Match / MatchString              re.match?(b) / re.match_string?(s)
+#   re.Find / FindString                re.find(b) -> [Byte]? / re.find_string(s) -> Str
+#   re.FindIndex / FindStringIndex      re.find_index(b) / re.find_string_index(s) -> [Int]?
+#   re.FindSubmatch                     re.find_submatch(b) -> [[Byte]?]?
+#   re.FindStringSubmatch               re.find_string_submatch(s) -> [Str]?
+#   re.Find(String)SubmatchIndex        re.find_submatch_index(b) / re.find_string_submatch_index(s) -> [Int]?
+#   re.FindAll(String)(Submatch)(Index) re.find_all(b, n) -> [[Byte]], find_all_string -> [Str],
+#                                       find_all_index / find_all_string_index -> [[Int]],
+#                                       find_all_submatch -> [[[Byte]?]], find_all_string_submatch -> [[Str]],
+#                                       find_all_submatch_index / find_all_string_submatch_index -> [[Int]]
+#   re.ReplaceAll(String)               re.replace_all(src, repl) / re.replace_all_string(src, repl)
+#   re.ReplaceAllLiteral(String)        re.replace_all_literal(src, repl) / re.replace_all_literal_string
+#   re.ReplaceAll(String)Func           re.replace_all_func(src) { |m| ... } / re.replace_all_string_func(src) { |m| ... }
+#   re.Expand / ExpandString            re.expand(dst, template, src, match) / re.expand_string(...)
+#   re.Split(s, n)                      re.split(s, n) -> [Str]
+#   re.LiteralPrefix                    re.literal_prefix -> (Str, Bool)
+#   re.NumSubexp / SubexpNames          re.d[0].num_subexp / re.d[0].subexp_names
+#   re.SubexpIndex(name)                re.subexp_index(name)
+#   re.Longest()                        re.longest! (on a variable)
+#   re.String / Copy                    re.to_s (re.string) / re.copy
+#   re.MatchReader, FindReaderIndex,    re.match_reader?(r), re.find_reader_index(r),
+#   FindReaderSubmatchIndex             re.find_reader_submatch_index(r), match_reader(pattern, r),
+#                                       over a RuneReader (anything with read_rune!, e.g. bufio.Reader)
+#   re.MarshalText / UnmarshalText /    re.marshal_text / re.unmarshal_text!(text) / re.append_text(b)
+#   AppendText
+#
+# Differences from Go:
+#   - "No match" is `none` where Go returns nil ([Byte]?, [Int]?, [Str]?,
+#     ...); FindAll variants return an empty list instead of nil. An
+#     unmatched group of find_submatch is `none` (Go: nil); in the Str
+#     variants it is "" as in Go.
+#   - A Regexp is a value; `longest!` changes the variable it is called on
+#     (Go changes the shared object). Copies share the compiled program.
+#   - The [Byte] methods copy the input into a Str once per call (Go reads
+#     the slice in place): an O(len) copy before matching.
+#   - A RuneReader is consumed as in Go (the match may read arbitrarily far);
+#     only the NFA is used for readers, as in Go apart from one-pass, which
+#     gives the same results.
+#   - The iterator methods Go 1.27 has unexported (All, AllString, ...) are
+#     not offered.
+
+import "regexp/syntax"
+import "slices"
+import "strconv"
+import "unicode"
+import "unicode/utf8"
+
+# The compiled form, shared by every copy of a Regexp (one cell, so a
+# Regexp is two words to pass around).
+struct RxData {
+  expr: Str         # as passed to compile
+  prog: syntax.Prog # compiled program
+  inst_op: [Int]    # the program, flattened: per instruction
+  inst_out: [Int]
+  inst_arg: [Int]
+  inst_runes: [[Rune]]
+  inst_rune0: [Int] # first rune (INST_RUNE1), else -2
+  start: Int
+  num_cap: Int
+  has_onepass: Bool
+  onepass: OnePass # one-pass program, if has_onepass
+  num_subexp: Int
+  max_bit_state_len: Int
+  subexp_names: [Str]
+  prefix: Str           # required prefix in unanchored matches
+  prefix_rune: Int      # first rune in prefix
+  prefix_end: Int       # pc for last rune in prefix
+  prefix_complete: Bool # prefix is the entire regexp
+  cond: Int             # empty-width conditions required at start of match
+  min_input_len: Int    # minimum length of the input in bytes
+}
+
+# A compiled regular expression (Go's *Regexp). Safe to share between tasks:
+# matching never changes it.
+pub struct Regexp {
+  d: [RxData]
+  longest: Bool # whether regexp prefers leftmost-longest match
+
+  # The source text used to compile the regular expression.
+  pub def to_s -> Str { d[0].expr }
+  pub def string -> Str { d[0].expr }
+
+  # A copy of the Regexp (Go's Copy): `longest!` on one copy does not
+  # affect the other.
+  pub def copy -> Regexp { self }
+
+  # Makes future searches prefer the leftmost-longest match.
+  pub def longest! {
+    self.longest = true
+  }
+
+  # The number of parenthesized subexpressions.
+  pub def num_subexp -> Int { d[0].num_subexp }
+
+  # The names of the parenthesized subexpressions; names[0] is always "" (the
+  # whole match), and unnamed groups have "".
+  pub def subexp_names -> [Str] { d[0].subexp_names }
+
+  # The index of the first subexpression with the given name, or -1.
+  pub def subexp_index(name: Str) -> Int {
+    if name != "" {
+      i = 0
+      while i < d[0].subexp_names.size {
+        return i if d[0].subexp_names[i] == name
+        i += 1
+      }
+    }
+    -1
+  }
+
+  # A literal string that must begin any match, and whether it is the whole
+  # regexp.
+  pub def literal_prefix -> (Str, Bool) { (d[0].prefix, d[0].prefix_complete) }
+
+  # ------------------------------------------------------------ matching
+
+  # Whether the string contains any match.
+  pub def match_string?(s: Str) -> Bool { search(self, s, 0, 0).present? }
+
+  # Whether the byte slice contains any match.
+  pub def match?(b: [Byte]) -> Bool { search(self, Str.from_bytes(b), 0, 0).present? }
+
+  # The text of the leftmost match in s ("" if none: use find_string_index
+  # to tell no match from an empty match).
+  pub def find_string(s: Str) -> Str {
+    if a = search(self, s, 0, 2) {
+      return s[a[0]...a[1]]
+    }
+    ""
+  }
+
+  # The leftmost match in b, or none.
+  pub def find(b: [Byte]) -> [Byte]? {
+    if a = search(self, Str.from_bytes(b), 0, 2) {
+      return b[a[0]...a[1]]
+    }
+    none
+  }
+
+  # The location [start, end] of the leftmost match in s, or none.
+  pub def find_string_index(s: Str) -> [Int]? {
+    if a = search(self, s, 0, 2) {
+      return a[0...2]
+    }
+    none
+  }
+
+  pub def find_index(b: [Byte]) -> [Int]? { find_string_index(Str.from_bytes(b)) }
+
+  # The leftmost match and its submatches, as positions: pairs of indexes
+  # (-1 for a group that didn't take part), or none.
+  pub def find_string_submatch_index(s: Str) -> [Int]? {
+    if a = search(self, s, 0, d[0].num_cap) {
+      return pad(a)
+    }
+    none
+  }
+
+  pub def find_submatch_index(b: [Byte]) -> [Int]? { find_string_submatch_index(Str.from_bytes(b)) }
+
+  # The text of the leftmost match and its submatches ("" for a group that
+  # didn't take part), or none.
+  pub def find_string_submatch(s: Str) -> [Str]? {
+    if a = search(self, s, 0, d[0].num_cap) {
+      out: [Str] = []
+      i = 0
+      while i <= d[0].num_subexp {
+        if 2 * i < a.size && a[2 * i] >= 0 {
+          out << s[a[2 * i]...a[2 * i + 1]]
+        } else {
+          out << ""
+        }
+        i += 1
+      }
+      return out
+    }
+    none
+  }
+
+  # The leftmost match in b and its submatches (none for a group that
+  # didn't take part), or none.
+  pub def find_submatch(b: [Byte]) -> [[Byte]?]? {
+    if a = search(self, Str.from_bytes(b), 0, d[0].num_cap) {
+      out: [[Byte]?] = []
+      i = 0
+      while i <= d[0].num_subexp {
+        if 2 * i < a.size && a[2 * i] >= 0 {
+          out << b[a[2 * i]...a[2 * i + 1]]
+        } else {
+          out << none
+        }
+        i += 1
+      }
+      return out
+    }
+    none
+  }
+
+  # Pads a match to (1 + num_subexp) * 2 entries with -1.
+  def pad(a: [Int]) -> [Int] {
+    out = a
+    n = (1 + d[0].num_subexp) * 2
+    while out.size < n { out << -1 }
+    out
+  }
+
+  # The successive non-overlapping matches (as padded capture vectors) of
+  # s, at most n if n >= 0 (Go's matches). Empty matches abutting a
+  # preceding match are ignored.
+  def all_matches(s: Str, n: Int, ncap: Int) -> [[Int]] {
+    out: [[Int]] = []
+    return out if n == 0
+    v = new_nfa(self, ncap)
+    end = s.size
+    pos = 0
+    prev_match_end = -1
+    max = n
+    while pos <= end {
+      m = search_with(self, v, s, pos)
+      if a = m {
+        accept = true
+        if a[1] == pos {
+          # We've found an empty match.
+          accept = false if a[0] == prev_match_end
+          # Move to next rune.
+          width = step_at(s, pos) & 7
+          if width > 0 {
+            pos += width
+          } else {
+            pos = end + 1
+          }
+        } else {
+          pos = a[1]
+        }
+        prev_match_end = a[1]
+        if accept {
+          out << pad(a)
+          if max > 0 {
+            max -= 1
+            break if max == 0
+          }
+        }
+      } else {
+        break
+      }
+    }
+    out
+  }
+
+  # All successive matches of the expression in s (at most n if n >= 0).
+  pub def find_all_string(s: Str, n: Int) -> [Str] {
+    out: [Str] = []
+    for m in all_matches(s, n, 2) { out << s[m[0]...m[1]] }
+    out
+  }
+
+  pub def find_all(b: [Byte], n: Int) -> [[Byte]] {
+    out: [[Byte]] = []
+    for m in all_matches(Str.from_bytes(b), n, 2) { out << b[m[0]...m[1]] }
+    out
+  }
+
+  pub def find_all_string_index(s: Str, n: Int) -> [[Int]] {
+    out: [[Int]] = []
+    for m in all_matches(s, n, 2) { out << [m[0], m[1]] }
+    out
+  }
+
+  pub def find_all_index(b: [Byte], n: Int) -> [[Int]] { find_all_string_index(Str.from_bytes(b), n) }
+
+  pub def find_all_string_submatch(s: Str, n: Int) -> [[Str]] {
+    out: [[Str]] = []
+    for m in all_matches(s, n, d[0].num_cap) {
+      sub: [Str] = []
+      i = 0
+      while i < m.size / 2 {
+        sub << (m[2 * i] >= 0 ? s[m[2 * i]...m[2 * i + 1]] : "")
+        i += 1
+      }
+      out << sub
+    }
+    out
+  }
+
+  pub def find_all_submatch(b: [Byte], n: Int) -> [[[Byte]?]] {
+    out: [[[Byte]?]] = []
+    for m in all_matches(Str.from_bytes(b), n, d[0].num_cap) {
+      sub: [[Byte]?] = []
+      i = 0
+      while i < m.size / 2 {
+        if m[2 * i] >= 0 {
+          sub << b[m[2 * i]...m[2 * i + 1]]
+        } else {
+          sub << none
+        }
+        i += 1
+      }
+      out << sub
+    }
+    out
+  }
+
+  pub def find_all_string_submatch_index(s: Str, n: Int) -> [[Int]] { all_matches(s, n, d[0].num_cap) }
+
+  pub def find_all_submatch_index(b: [Byte], n: Int) -> [[Int]] { all_matches(Str.from_bytes(b), n, d[0].num_cap) }
+
+  # ------------------------------------------------------------- readers
+
+  # Whether the text read from r contains any match.
+  pub def match_reader?(r: RuneReader) -> Bool { find_reader(self, r, 0).present? }
+
+  # The location of the leftmost match in the text read from r, or none.
+  pub def find_reader_index(r: RuneReader) -> [Int]? {
+    if a = find_reader(self, r, 2) {
+      return a[0...2]
+    }
+    none
+  }
+
+  # The leftmost match and submatches, as positions, in the text read from r.
+  pub def find_reader_submatch_index(r: RuneReader) -> [Int]? {
+    if a = find_reader(self, r, d[0].num_cap) {
+      return pad(a)
+    }
+    none
+  }
+
+  # --------------------------------------------------------- replacing
+
+  # Go's replaceAll: src with each match replaced by repl(buf, match).
+  def replace(src: Str, nmatch0: Int, repl: ([Byte], [Int]) -> [Byte]) -> [Byte] {
+    last_match_end = 0 # end position of the most recent match
+    search_pos = 0     # position where we next look for a match
+    buf: [Byte] = []
+    end_pos = src.size
+    nmatch = nmatch0
+    nmatch = d[0].num_cap if nmatch > d[0].num_cap
+    v = new_nfa(self, nmatch)
+    while search_pos <= end_pos {
+      m = search_with(self, v, src, search_pos)
+      if a = m {
+        # Copy the unmatched characters before this match.
+        buf = append_str(buf, src, last_match_end, a[0])
+        # Now insert a copy of the replacement string, but not for a match
+        # of the empty string immediately after another match. (Otherwise,
+        # we get double replacement for patterns that match both empty and
+        # nonempty strings.)
+        buf = repl(buf, a) if a[1] > last_match_end || a[0] == 0
+        last_match_end = a[1]
+        # Advance past this match; always advance at least one character.
+        width = step_at(src, search_pos) & 7
+        if search_pos + width > a[1] {
+          search_pos += width
+        } else if search_pos + 1 > a[1] {
+          # This clause is only needed at the end of the input string. In
+          # that case, step returns width = 0.
+          search_pos += 1
+        } else {
+          search_pos = a[1]
+        }
+      } else {
+        break
+      }
+    }
+    # Copy the unmatched characters after the last match.
+    append_str(buf, src, last_match_end, src.size)
+  }
+
+  # src with matches replaced by repl, in which $ signs are interpreted as
+  # in expand: $1 or ${1} is submatch 1, $name or ${name} a named one.
+  pub def replace_all_string(src: Str, repl: Str) -> Str {
+    n = 2
+    n = 2 * (d[0].num_subexp + 1) if index_byte(repl, 36) >= 0
+    me = self
+    b = replace(src, n, ->(dst: [Byte], m: [Int]) -> [Byte] { me.expand_into(dst, repl, src, m) })
+    Str.from_bytes(b)
+  }
+
+  # src with matches replaced by repl, substituted directly.
+  pub def replace_all_literal_string(src: Str, repl: Str) -> Str {
+    b = replace(src, 2, ->(dst: [Byte], m: [Int]) -> [Byte] { append_str(dst, repl, 0, repl.size) })
+    Str.from_bytes(b)
+  }
+
+  # src with each match replaced by f(match), substituted directly.
+  pub def replace_all_string_func(src: Str, f: (Str) -> Str) -> Str {
+    b = replace(src, 2, ->(dst: [Byte], m: [Int]) -> [Byte] {
+      r = f(src[m[0]...m[1]])
+      append_str(dst, r, 0, r.size)
+    })
+    Str.from_bytes(b)
+  }
+
+  pub def replace_all(src: [Byte], repl: [Byte]) -> [Byte] {
+    s = Str.from_bytes(src)
+    t = Str.from_bytes(repl)
+    n = 2
+    n = 2 * (d[0].num_subexp + 1) if index_byte(t, 36) >= 0
+    me = self
+    replace(s, n, ->(dst: [Byte], m: [Int]) -> [Byte] { me.expand_into(dst, t, s, m) })
+  }
+
+  pub def replace_all_literal(src: [Byte], repl: [Byte]) -> [Byte] {
+    replace(Str.from_bytes(src), 2, ->(dst: [Byte], m: [Int]) -> [Byte] { dst + repl })
+  }
+
+  pub def replace_all_func(src: [Byte], f: ([Byte]) -> [Byte]) -> [Byte] {
+    replace(Str.from_bytes(src), 2, ->(dst: [Byte], m: [Int]) -> [Byte] { dst + f(src[m[0]...m[1]]) })
+  }
+
+  # Appends template to dst with each $ variable replaced by the
+  # corresponding submatch of src at match (Go's Expand).
+  pub def expand(dst: [Byte], template: [Byte], src: [Byte], match: [Int]) -> [Byte] {
+    expand_into(dst, Str.from_bytes(template), Str.from_bytes(src), match)
+  }
+
+  pub def expand_string(dst: [Byte], template: Str, src: Str, match: [Int]) -> [Byte] {
+    expand_into(dst, template, src, match)
+  }
+
+  def expand_into(dst0: [Byte], template: Str, src: Str, match: [Int]) -> [Byte] {
+    dst = dst0
+    t = 0 # position in template
+    while t < template.size {
+      dp = index_byte_from(template, 36, t)
+      break if dp < 0
+      dst = append_str(dst, template, t, dp)
+      t = dp + 1
+      if t < template.size && template[t] == 36 {
+        # Treat $$ as $.
+        dst << 36
+        t += 1
+        next
+      }
+      name, num, rest, ok = extract(template, t)
+      if !ok {
+        # Malformed; treat $ as raw text.
+        dst << 36
+        next
+      }
+      t = rest
+      if num >= 0 {
+        if 2 * num + 1 < match.size && match[2 * num] >= 0 {
+          dst = append_str(dst, src, match[2 * num], match[2 * num + 1])
+        }
+      } else {
+        i = 0
+        while i < d[0].subexp_names.size {
+          if name == d[0].subexp_names[i] && 2 * i + 1 < match.size && match[2 * i] >= 0 {
+            dst = append_str(dst, src, match[2 * i], match[2 * i + 1])
+            break
+          }
+          i += 1
+        }
+      }
+    }
+    append_str(dst, template, t, template.size)
+  }
+
+  # Slices s into substrings separated by the expression; at most n
+  # substrings if n > 0 (the last is the unsplit remainder), all if n < 0,
+  # none if n == 0.
+  pub def split(s: Str, n: Int) -> [Str] {
+    out: [Str] = []
+    return out if n == 0
+    if d[0].expr.size > 0 && s.size == 0 {
+      out << ""
+      return out
+    }
+    matches = find_all_string_index(s, n)
+    beg = 0
+    end = 0
+    for m in matches {
+      break if n > 0 && out.size >= n - 1
+      end = m[0]
+      out << s[beg...end] if m[1] != 0
+      beg = m[1]
+    }
+    out << s[beg...s.size] if end != s.size
+    out
+  }
+
+  # ----------------------------------------------------------- encoding
+
+  # Appends the expression to b (Go's AppendText).
+  pub def append_text(b: [Byte]) -> [Byte] { append_str(b, d[0].expr, 0, d[0].expr.size) }
+
+  # The expression as bytes (Go's MarshalText).
+  pub def marshal_text -> [Byte] { append_str([], d[0].expr, 0, d[0].expr.size) }
+
+  # Replaces this Regexp with the compiled text (Go's UnmarshalText).
+  pub def unmarshal_text!(text: [Byte]) -> ~Bool<syntax.ParseError> {
+    re = ~compile(Str.from_bytes(text))
+    self.d = re.d
+    self.longest = re.longest
+    true
+  }
+}
+
+# Something runes can be read from (Go's io.RuneReader): returns the next
+# rune and its size in bytes, none at the end of the input.
+pub interface RuneReader {
+  def read_rune! -> ~(Rune, Int)?
+}
+
+# Parses a regular expression and returns a Regexp that matches
+# leftmost-first, as Perl does.
+pub def compile(expr: Str) -> ~Regexp<syntax.ParseError> { ~compile_with(expr, syntax.PERL, false) }
+
+# Like compile, but restricts the syntax to POSIX ERE (egrep) and matches
+# leftmost-longest.
+pub def compile_posix(expr: Str) -> ~Regexp<syntax.ParseError> { ~compile_with(expr, syntax.POSIX, true) }
+
+# Like compile, but panics if the expression cannot be parsed.
+pub def must_compile(s: Str) -> Regexp {
+  r = compile(s)
+  if re = r.ok {
+    return re
+  }
+  panic("regexp: Compile(#{quote(s)}): #{r.err.unwrap.message}")
+}
+
+# Like compile_posix, but panics if the expression cannot be parsed.
+pub def must_compile_posix(s: Str) -> Regexp {
+  r = compile_posix(s)
+  if re = r.ok {
+    return re
+  }
+  panic("regexp: CompilePOSIX(#{quote(s)}): #{r.err.unwrap.message}")
+}
+
+def quote(s: Str) -> Str {
+  return "`" + s + "`" if strconv.can_backquote(s)
+  strconv.quote(s)
+}
+
+def compile_with(expr: Str, mode: Int, longest: Bool) -> ~Regexp<syntax.ParseError> {
+  re0 = ~syntax.parse(expr, mode)
+  max_cap = re0.max_cap
+  cap_names = re0.cap_names
+  re = re0.simplify
+  prog = syntax.compile(re)
+  matchcap = prog.num_cap
+  matchcap = 2 if matchcap < 2
+  n = prog.inst.size
+  ops: [Int] = []
+  outs: [Int] = []
+  args: [Int] = []
+  runes: [[Rune]] = []
+  rune0: [Int] = []
+  for i in prog.inst {
+    ops << i.op
+    outs << i.out
+    args << i.arg
+    runes << engine_runes(i)
+    rune0 << (i.rune.size > 0 ? i.rune[0].to_i : -2)
+  }
+  r = RxData.new(expr: expr, prog: prog, inst_op: ops, inst_out: outs, inst_arg: args, inst_runes: runes, inst_rune0: rune0, start: prog.start, num_cap: prog.num_cap, num_subexp: max_cap, subexp_names: cap_names, cond: prog.start_cond, min_input_len: min_input_len(re))
+  if op = compile_one_pass(prog) {
+    r.has_onepass = true
+    r.onepass = op
+    p, c, e = one_pass_prefix(prog)
+    r.prefix = p
+    r.prefix_complete = c
+    r.prefix_end = e
+  } else {
+    p, c = prog.prefix
+    r.prefix = p
+    r.prefix_complete = c
+    r.max_bit_state_len = max_bit_state_len(n)
+  }
+  r.prefix_rune = utf8.decode_rune_at(r.prefix, 0)[0].to_i if r.prefix.size > 0
+  Regexp.new(d: [r], longest: longest)
+}
+
+# The runes the engines test an instruction against: a case-folded single
+# rune becomes the sorted class of its whole folding orbit (Go walks the
+# orbit with SimpleFold on every test), so matching needs no folding.
+def engine_runes(i: syntax.Inst) -> [Rune] {
+  return i.rune if i.rune.size != 1 || (i.arg & syntax.FOLD_CASE) == 0
+  r0 = i.rune[0]
+  rs: [Int] = [r0.to_i]
+  f = unicode.simple_fold(r0)
+  while f != r0 {
+    rs << f.to_i
+    f = unicode.simple_fold(f)
+  }
+  slices.sort(rs)
+  out: [Rune] = []
+  for r in rs {
+    out << r.to_i32
+    out << r.to_i32
+  }
+  out
+}
+
+# The minimum length in bytes of any matching input.
+def min_input_len(re: syntax.Regexp) -> Int {
+  case re.op {
+    syntax.OP_ANY_CHAR | syntax.OP_ANY_CHAR_NOT_NL | syntax.OP_CHAR_CLASS => 1
+    syntax.OP_LITERAL => {
+      l = 0
+      for r in re.rune {
+        l += r == utf8.RUNE_ERROR ? 1 : utf8.rune_len(r)
+      }
+      l
+    }
+    syntax.OP_CAPTURE | syntax.OP_PLUS => min_input_len(re.sub[0])
+    syntax.OP_REPEAT => re.min * min_input_len(re.sub[0])
+    syntax.OP_CONCAT => {
+      l = 0
+      for sub in re.sub { l += min_input_len(sub) }
+      l
+    }
+    syntax.OP_ALTERNATE => {
+      subs = re.sub
+      l = min_input_len(subs[0])
+      i = 1
+      while i < subs.size {
+        ln = min_input_len(subs[i])
+        l = ln if ln < l
+        i += 1
+      }
+      l
+    }
+    _ => 0
+  }
+}
+
+# Whether the string s contains any match of pattern.
+pub def match_string(pattern: Str, s: Str) -> ~Bool<syntax.ParseError> {
+  re = ~compile(pattern)
+  re.match_string?(s)
+}
+
+# Whether the byte slice b contains any match of pattern.
+pub def match(pattern: Str, b: [Byte]) -> ~Bool<syntax.ParseError> {
+  re = ~compile(pattern)
+  re.match?(b)
+}
+
+# Whether the text read from r contains any match of pattern.
+pub def match_reader(pattern: Str, r: RuneReader) -> ~Bool<syntax.ParseError> {
+  re = ~compile(pattern)
+  re.match_reader?(r)
+}
+
+# s with every regular expression metacharacter escaped: the result matches
+# the literal text s.
+pub def quote_meta(s: Str) -> Str {
+  i = 0
+  while i < s.size {
+    break if special(s[i])
+    i += 1
+  }
+  return s if i >= s.size
+  b = append_str([], s, 0, i)
+  while i < s.size {
+    b << 92 if special(s[i])
+    b << s[i]
+    i += 1
+  }
+  Str.from_bytes(b)
+}
+
+# Whether b is one of \.+*?()|[]{}^$.
+def special(b: Byte) -> Bool {
+  case b {
+    92 | 46 | 43 | 42 | 63 | 40 | 41 | 124 | 91 | 93 | 123 | 125 | 94 | 36 => true
+    _ => false
+  }
+}
+
+# Parses a $ variable name at template[t...]: (name, num, rest, ok); num is
+# -1 for a name that isn't a number.
+def extract(str: Str, t0: Int) -> (Str, Int, Int, Bool) {
+  t = t0
+  return ("", 0, 0, false) if t >= str.size
+  brace = false
+  if str[t] == 123 {
+    brace = true
+    t += 1
+  }
+  i = t
+  while i < str.size {
+    r, size = utf8.decode_rune_at(str, i)
+    break if !unicode.is_letter(r) && !unicode.is_digit(r) && r != 95
+    i += size
+  }
+  # empty name is not okay
+  return ("", 0, 0, false) if i == t
+  name = str[t...i]
+  if brace {
+    # missing closing brace
+    return ("", 0, 0, false) if i >= str.size || str[i] != 125
+    i += 1
+  }
+  # Parse number.
+  num = 0
+  k = 0
+  while k < name.size {
+    if name[k] < 48 || name[k] > 57 || num >= 100_000_000 {
+      num = -1
+      break
+    }
+    num = num * 10 + name[k].to_i - 48
+    k += 1
+  }
+  # Disallow leading zeros.
+  num = -1 if name[0] == 48 && name.size > 1
+  (name, num, i, true)
+}
+
+# ------------------------------------------------------------- helpers
+
+def append_str(b: [Byte], s: Str, lo: Int, hi: Int) -> [Byte] {
+  out = b
+  i = lo
+  while i < hi {
+    out << s[i]
+    i += 1
+  }
+  out
+}
+
+def index_byte(s: Str, c: Int) -> Int { index_byte_from(s, c, 0) }
+
+def index_byte_from(s: Str, c: Int, from: Int) -> Int {
+  i = from
+  while i < s.size {
+    return i if s[i].to_i == c
+    i += 1
+  }
+  -1
+}

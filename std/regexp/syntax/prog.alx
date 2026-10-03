@@ -1,0 +1,247 @@
+# Compiled programs, after Go's regexp/syntax/prog.go.
+
+import "strconv"
+import "unicode"
+import "unicode/utf8"
+
+# Inst ops (Go's InstOp).
+pub INST_ALT = 0
+pub INST_ALT_MATCH = 1
+pub INST_CAPTURE = 2
+pub INST_EMPTY_WIDTH = 3
+pub INST_MATCH = 4
+pub INST_FAIL = 5
+pub INST_NOP = 6
+pub INST_RUNE = 7
+pub INST_RUNE1 = 8
+pub INST_RUNE_ANY = 9
+pub INST_RUNE_ANY_NOT_NL = 10
+
+INST_OP_NAMES = ["InstAlt", "InstAltMatch", "InstCapture", "InstEmptyWidth", "InstMatch", "InstFail", "InstNop", "InstRune", "InstRune1", "InstRuneAny", "InstRuneAnyNotNL"]
+
+# The name of an inst op ("InstAlt", ...; "" if out of range), Go's InstOp.String.
+pub def inst_op_string(op: Int) -> Str {
+  return "" if op < 0 || op >= INST_OP_NAMES.size
+  INST_OP_NAMES[op]
+}
+
+# Empty-width conditions (Go's EmptyOp), a bit set.
+pub EMPTY_BEGIN_LINE = 1
+pub EMPTY_END_LINE = 2
+pub EMPTY_BEGIN_TEXT = 4
+pub EMPTY_END_TEXT = 8
+pub EMPTY_WORD_BOUNDARY = 16
+pub EMPTY_NO_WORD_BOUNDARY = 32
+
+# The zero-width assertions satisfied at the position between runes r1 and
+# r2 (-1 for the beginning or end of the text). Go's EmptyOpContext.
+pub def empty_op_context(r1: Rune, r2: Rune) -> Int {
+  op = EMPTY_NO_WORD_BOUNDARY
+  boundary = 0
+  if is_word_char(r1) {
+    boundary = 1
+  } else if r1 == 10 {
+    op |= EMPTY_BEGIN_LINE
+  } else if r1 < 0 {
+    op |= EMPTY_BEGIN_TEXT | EMPTY_BEGIN_LINE
+  }
+  if is_word_char(r2) {
+    boundary ^= 1
+  } else if r2 == 10 {
+    op |= EMPTY_END_LINE
+  } else if r2 < 0 {
+    op |= EMPTY_END_TEXT | EMPTY_END_LINE
+  }
+  op ^= EMPTY_WORD_BOUNDARY | EMPTY_NO_WORD_BOUNDARY if boundary != 0 # is_word_char(r1) != is_word_char(r2)
+  op
+}
+
+# Whether r is an ASCII word character [0-9A-Za-z_] (what \b looks at).
+pub def is_word_char(r: Rune) -> Bool {
+  (r >= 97 && r <= 122) || (r >= 65 && r <= 90) || (r >= 48 && r <= 57) || r == 95
+}
+
+NO_MATCH = -1
+
+# A single instruction (Go's Inst).
+pub struct Inst {
+  op: Int
+  out: Int # all but INST_MATCH, INST_FAIL
+  arg: Int # INST_ALT, INST_ALT_MATCH, INST_CAPTURE, INST_EMPTY_WIDTH
+  rune: [Rune]
+
+  # The op with the rune variants folded into INST_RUNE.
+  def op_kind -> Int {
+    return INST_RUNE if op == INST_RUNE1 || op == INST_RUNE_ANY || op == INST_RUNE_ANY_NOT_NL
+    op
+  }
+
+  # Whether the instruction matches (and consumes) r. Only for INST_RUNE.
+  pub def match_rune?(r: Rune) -> Bool { match_rune_pos(r) != NO_MATCH }
+
+  # The index of the matching rune pair, or -1. Only for INST_RUNE.
+  pub def match_rune_pos(r: Rune) -> Int {
+    rs = rune
+    case rs.size {
+      0 => {return NO_MATCH}
+      1 => {
+        # Special case: single-rune slice is from literal string, not char class.
+        r0 = rs[0]
+        return 0 if r == r0
+        if (arg & FOLD_CASE) != 0 {
+          r1 = unicode.simple_fold(r0)
+          while r1 != r0 {
+            return 0 if r == r1
+            r1 = unicode.simple_fold(r1)
+          }
+        }
+        return NO_MATCH
+      }
+      2 => {return r >= rs[0] && r <= rs[1] ? 0 : NO_MATCH}
+      4 | 6 | 8 => {
+        # Linear search for a few pairs. Should handle ASCII well.
+        j = 0
+        while j < rs.size {
+          return NO_MATCH if r < rs[j]
+          return j / 2 if r <= rs[j + 1]
+          j += 2
+        }
+        return NO_MATCH
+      }
+      _ => {}
+    }
+    # Otherwise binary search.
+    lo = 0
+    hi = rs.size / 2
+    while lo < hi {
+      m = (lo + hi) >> 1
+      c = rs[2 * m]
+      if c <= r {
+        return m if r <= rs[2 * m + 1]
+        lo = m + 1
+      } else {
+        hi = m
+      }
+    }
+    NO_MATCH
+  }
+
+  # Whether the instruction matches the empty string between runes before
+  # and after. Only for INST_EMPTY_WIDTH.
+  pub def match_empty_width?(before: Rune, after: Rune) -> Bool {
+    case arg {
+      EMPTY_BEGIN_LINE => {return before == 10 || before == -1}
+      EMPTY_END_LINE => {return after == 10 || after == -1}
+      EMPTY_BEGIN_TEXT => {return before == -1}
+      EMPTY_END_TEXT => {return after == -1}
+      EMPTY_WORD_BOUNDARY => {return is_word_char(before) != is_word_char(after)}
+      EMPTY_NO_WORD_BOUNDARY => {return is_word_char(before) == is_word_char(after)}
+      _ => panic("unknown empty width arg")
+    }
+  }
+
+  pub def to_s -> Str { dump_inst(self) }
+  pub def string -> Str { dump_inst(self) }
+}
+
+# A compiled regular expression program (Go's Prog).
+pub struct Prog {
+  inst: [Inst]
+  start: Int   # index of start instruction
+  num_cap: Int # number of INST_CAPTURE insts in re
+
+  # The first instruction at pc that isn't a nop or capture.
+  def skip_nop(pc0: Int) -> Inst {
+    i = inst[pc0]
+    while i.op == INST_NOP || i.op == INST_CAPTURE { i = inst[i.out] }
+    i
+  }
+
+  # A literal string that all matches must start with, and whether it is
+  # the entire match (Go's Prefix).
+  pub def prefix -> (Str, Bool) {
+    i = skip_nop(start)
+    # Avoid allocation of buffer if prefix is empty.
+    return ("", i.op == INST_MATCH) if i.op_kind != INST_RUNE || i.rune.size != 1
+    # Have prefix; gather characters.
+    buf: [Byte] = []
+    while i.op_kind == INST_RUNE && i.rune.size == 1 && (i.arg & FOLD_CASE) == 0 && i.rune[0] != utf8.RUNE_ERROR {
+      buf = utf8.append_rune(buf, i.rune[0])
+      i = skip_nop(i.out)
+    }
+    (Str.from_bytes(buf), i.op == INST_MATCH)
+  }
+
+  # The leading empty-width conditions that must be true in any match; ^0
+  # (all bits, -1 here) if no match is possible.
+  pub def start_cond -> Int {
+    flag = 0
+    pc = start
+    loop {
+      i = inst[pc]
+      case i.op {
+        INST_EMPTY_WIDTH => {flag |= i.arg}
+        INST_FAIL => {return 255} # Go's ^EmptyOp(0)
+        INST_CAPTURE | INST_NOP => {}
+        _ => {return flag}
+      }
+      pc = i.out
+    }
+    flag
+  }
+
+  pub def to_s -> Str { dump_prog(self) }
+  pub def string -> Str { dump_prog(self) }
+}
+
+def put(b: [Byte], s: Str) -> [Byte] {
+  out = b
+  i = 0
+  while i < s.size {
+    out << s[i]
+    i += 1
+  }
+  out
+}
+
+def dump_prog(p: Prog) -> Str {
+  b: [Byte] = []
+  j = 0
+  while j < p.inst.size {
+    pc = j.to_s
+    b = put(b, "   "[pc.size...3]) if pc.size < 3
+    pc += "*" if j == p.start
+    b = put(b, pc)
+    b = put(b, "\t")
+    b = put(b, dump_inst(p.inst[j]))
+    b = put(b, "\n")
+    j += 1
+  }
+  Str.from_bytes(b)
+}
+
+def runes_str(rs: [Rune]) -> Str {
+  b: [Byte] = []
+  for r in rs { b = utf8.append_rune(b, r) }
+  Str.from_bytes(b)
+}
+
+def dump_inst(i: Inst) -> Str {
+  case i.op {
+    INST_ALT => "alt -> #{i.out}, #{i.arg}"
+    INST_ALT_MATCH => "altmatch -> #{i.out}, #{i.arg}"
+    INST_CAPTURE => "cap #{i.arg} -> #{i.out}"
+    INST_EMPTY_WIDTH => "empty #{i.arg} -> #{i.out}"
+    INST_MATCH => "match"
+    INST_FAIL => "fail"
+    INST_NOP => "nop -> #{i.out}"
+    INST_RUNE => {
+      fold = (i.arg & FOLD_CASE) != 0 ? "/i" : ""
+      "rune #{strconv.quote_to_ascii(runes_str(i.rune))}#{fold} -> #{i.out}"
+    }
+    INST_RUNE1 => "rune1 #{strconv.quote_to_ascii(runes_str(i.rune))} -> #{i.out}"
+    INST_RUNE_ANY => "any -> #{i.out}"
+    INST_RUNE_ANY_NOT_NL => "anynotnl -> #{i.out}"
+    _ => ""
+  }
+}

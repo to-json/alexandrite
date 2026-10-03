@@ -650,6 +650,7 @@ impl FnEmit<'_> {
                     Rt::StrSplit => call("str_split"),
                     Rt::StrJoin => call("str_join"),
                     Rt::StrToI => call("str_to_i"),
+                    Rt::StrIndex => call("str_index"),
                     Rt::StrChar => format!("str_charlen(&{p0}, {})", a[1]),
                     Rt::StrByte => {
                         if a[2] == "(0i64)" {

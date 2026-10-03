@@ -32,7 +32,7 @@ mod rt {
         alx_init, alx_panic, alx_overflow, alx_pow, alx_isqrt, alx_sort_i64, alx_sort_str, alx_puts_i64,
         alxj_region_cur, alxj_region_mark, alxj_region_mark_larges, alxj_region_reset, alxj_region_enter, alxj_region_exit, alxj_region_use, alxj_region_set, alxj_region_program, alxj_region_of, alxj_region_new_child, alxj_region_free, alxj_region_bytes,
         alxj_alloc, alxj_zalloc, alxj_arr_alloc, alxj_arr_grow, alxj_arr_new, alxj_arr_copy,
-        alxj_int_to_s, alxj_str_rev, alxj_str_delete, alxj_str_split, alxj_str_join, alxj_str_to_i, alxj_str_charlen, alxj_str_sub,
+        alxj_int_to_s, alxj_str_rev, alxj_str_delete, alxj_str_split, alxj_str_join, alxj_str_to_i, alxj_str_index, alxj_str_charlen, alxj_str_sub,
         alxj_str_eq, alxj_str_cmp, alxj_str_is_pal, alxj_int_ndigits, alxj_digits,
         alxj_puts_str, alxj_print_str, alxj_puts_bool, alxj_puts_unit, alxj_pmap, alxj_pmap_try, alxj_finish,
         alxj_p_add, alxj_p_sub, alxj_p_mul, alxj_p_div, alxj_p_rem, alxj_p_pow, alxj_p_cmp, alxj_p_even, alxj_p_to_i64,
@@ -1805,6 +1805,7 @@ impl Fx<'_, '_, '_> {
             Rt::StrSplit => self.pint_call(rt::alxj_str_split, Some(&LTy::Arr(Box::new(LTy::Str))), &[&args[0], &args[1]], None),
             Rt::StrJoin => self.pint_call(rt::alxj_str_join, Some(&LTy::Str), &[&args[0], &args[1]], None),
             Rt::StrToI => self.pint_call(rt::alxj_str_to_i, None, &[&args[0]], None),
+            Rt::StrIndex => self.pint_call(rt::alxj_str_index, None, &[&args[0], &args[1], &args[2]], None),
             Rt::StrChar => {
                 let sv = self.e(&args[0]);
                 let p = self.spill(&s, &sv);

@@ -1,0 +1,117 @@
+# Simplification, after Go's regexp/syntax/simplify.go. New nodes are added
+# to the same arena; unchanged subtrees are shared (Go shares pointers), and
+# node identity (Go's pointer equality) is index equality.
+
+struct Simplifier {
+  nodes: [Node]
+
+  def add!(n: Node) -> Int {
+    self.nodes << n
+    nodes.size - 1
+  }
+
+  # Go's (*Regexp).Simplify.
+  def simplify!(id: Int) -> Int {
+    re = nodes[id]
+    case re.op {
+      OP_CAPTURE | OP_CONCAT | OP_ALTERNATE => {
+        # Simplify children, building a new node if a child changes.
+        changed = false
+        subs: [Int] = []
+        i = 0
+        while i < re.sub.size {
+          sub = re.sub[i]
+          nsub = simplify!(sub)
+          if !changed && nsub != sub {
+            changed = true
+            subs = re.sub[0...i].clone
+          }
+          subs << nsub if changed
+          i += 1
+        }
+        return id if !changed
+        n = re
+        n.rune = []
+        n.sub = subs
+        return add!(n)
+      }
+      OP_STAR | OP_PLUS | OP_QUEST => {
+        sub = simplify!(re.sub[0])
+        return simplify1!(re.op, re.flags, sub, id)
+      }
+      OP_REPEAT => {
+        # Special special case: x{0} matches the empty string and doesn't
+        # even need to consider x.
+        return add!(Node.new(op: OP_EMPTY_MATCH)) if re.min == 0 && re.max == 0
+        # The fun begins.
+        sub = simplify!(re.sub[0])
+        # x{n,} means at least n matches of x.
+        if re.max == -1 {
+          # Special case: x{0,} is x*.
+          return simplify1!(OP_STAR, re.flags, sub, -1) if re.min == 0
+          # Special case: x{1,} is x+.
+          return simplify1!(OP_PLUS, re.flags, sub, -1) if re.min == 1
+          # General case: x{4,} is xxxx+.
+          subs: [Int] = []
+          i = 0
+          while i < re.min - 1 {
+            subs << sub
+            i += 1
+          }
+          subs << simplify1!(OP_PLUS, re.flags, sub, -1)
+          return add!(Node.new(op: OP_CONCAT, sub: subs))
+        }
+        # Special case x{0} handled above.
+        # Special case: x{1} is just x.
+        return sub if re.min == 1 && re.max == 1
+        # General case: x{n,m} means n copies of x and m copies of x?.
+        # The machine will do less work if we nest the final m copies,
+        # so that x{2,5} = xx(x(x(x)?)?)?
+        # Build leading prefix: xx.
+        prefix: [Int] = []
+        has_prefix = false
+        if re.min > 0 {
+          has_prefix = true
+          i = 0
+          while i < re.min {
+            prefix << sub
+            i += 1
+          }
+        }
+        # Build and attach suffix: (x(x(x)?)?)?
+        if re.max > re.min {
+          suffix = simplify1!(OP_QUEST, re.flags, sub, -1)
+          i = re.min + 1
+          while i < re.max {
+            nre2 = add!(Node.new(op: OP_CONCAT, sub: [sub, suffix]))
+            suffix = simplify1!(OP_QUEST, re.flags, nre2, -1)
+            i += 1
+          }
+          return suffix if !has_prefix
+          prefix << suffix
+        }
+        return add!(Node.new(op: OP_CONCAT, sub: prefix)) if has_prefix
+        # Some degenerate case like min > max or min < max < 0.
+        # Handle as impossible match.
+        return add!(Node.new(op: OP_NO_MATCH))
+      }
+      _ => {return id}
+    }
+  }
+
+  # The simple regexp equivalent to Node{op, flags, sub: [sub]}, reusing re
+  # (-1 for none) if possible.
+  def simplify1!(op: Int, flags: Int, sub: Int, re: Int) -> Int {
+    s = nodes[sub]
+    # Special case: repeat the empty string as much as you want, but it's
+    # going to match only once.
+    return sub if s.op == OP_EMPTY_MATCH
+    # The operators are idempotent if the flags match.
+    return sub if op == s.op && (flags & NON_GREEDY) == (s.flags & NON_GREEDY)
+    if re >= 0 {
+      r = nodes[re]
+      return re if r.op == op && (r.flags & NON_GREEDY) == (flags & NON_GREEDY) && sub == r.sub[0]
+    }
+    add!(Node.new(op: op, flags: flags, sub: [sub]))
+  }
+}

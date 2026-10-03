@@ -1,0 +1,673 @@
+# Go's mime tests (type_test.go, type_unix_test.go, mediatype_test.go,
+# encodedword_test.go, example_test.go), translated.
+import "strings"
+
+# The bytes a hex string spells (for strings that aren't valid UTF-8).
+def hx(h: Str) -> Str {
+  out: [Byte] = []
+  i = 0
+  while i + 1 < h.size {
+    out << (from_hex(h[i]) * 16 + from_hex(h[i + 1])).as_u8
+    i += 2
+  }
+  Str.from_bytes(out)
+}
+
+def map_eq(a: Map[Str, Str], b: Map[Str, Str]) -> Bool {
+  return false if a.size != b.size
+  for k, v in a {
+    w = b[k]
+    return false if w.none? || (w || "") != v
+  }
+  true
+}
+
+# A Map from alternating keys and values.
+def m(kv: [Str]) -> Map[Str, Str] {
+  out: Map[Str, Str] = {}
+  i = 0
+  while i + 1 < kv.size {
+    out[kv[i]] = kv[i + 1]
+    i += 2
+  }
+  out
+}
+
+# parse_media_type's result as the vectors spell it: "type|k=v|k=v" (keys
+# sorted), "ERR message" or "ERR message|type".
+def pmt(s: Str) -> Str {
+  r = parse_media_type(s)
+  if r.err? {
+    e = r.err.unwrap
+    return case e {
+      InvalidMediaParameter(mt) => "ERR #{e.message}|#{mt}"
+      _ => "ERR #{e.message}"
+    }
+  }
+  mt, params = r.unwrap
+  keys: [Str] = []
+  for k, _ in params {
+    keys << k
+  }
+  out = mt
+  for k in keys.sort {
+    out = out + "|" + k + "=" + (params[k] || "")
+  }
+  out
+}
+
+# (decoded, error message) of WordDecoder.decode / decode_header.
+def wd(s: Str) -> (Str, Str) {
+  r = WordDecoder.new.decode(s)
+  r.err? ? ("", r.err.unwrap.message) : (r.unwrap, "")
+}
+
+def wdh(s: Str) -> (Str, Str) {
+  r = WordDecoder.new.decode_header(s)
+  r.err? ? ("", r.err.unwrap.message) : (r.unwrap, "")
+}
+
+# ------------------------------------------------------------- type_test.go
+
+# testdata/test.types and testdata/test.types.globs2.
+TEST_TYPES = "# Copyright 2010 The Go Authors. All rights reserved.\n# Use of this source code is governed by a BSD-style\n# license that can be found in the LICENSE file.\n\n\n # mime package test\napplication/test\tt1\t# Simple test\ntext/test\t\tt2\t# Text test\n"
+TEST_GLOBS = "# Copyright 2021 The Go Authors. All rights reserved.\n# Use of this source code is governed by a BSD-style\n# license that can be found in the LICENSE file.\n\n\n# mime package test for globs2\n50:document/test:*.t3\n50:example/test:*.t4\n50:text/plain:*,v\n50:application/x-trash:*~\n30:example/do-not-use:*.t4\n10:example/glob-question-mark:*.foo?ar\n10:example/glob-asterisk:*.foo*r\n10:example/glob-range:*.foo[1-3]\n"
+
+def set_type(t: Types, ext: Str, typ: Str) -> Types {
+  out = t
+  out.add_extension_type!(ext, typ).unwrap
+  out
+}
+
+test "type by extension" {
+  # initMimeForTests on Unix: no globs file, testdata/test.types.
+  t = builtin_types
+  t.load_mime_types!(TEST_TYPES)
+  tests = [(".T1", "application/test"), (".t2", "text/test; charset=utf-8"), (".png", "image/png")]
+  for tt in tests {
+    assert_eq t.type_by_extension(tt[0]), tt[1]
+  }
+}
+
+test "type by extension: package functions use the builtin table" {
+  assert_eq type_by_extension(".png"), "image/png"
+  assert_eq type_by_extension(".HTML"), "text/html; charset=utf-8"
+  assert_eq type_by_extension(".T1"), ""
+  assert_eq type_by_extension(".jpg"), "image/jpeg"
+  assert_eq type_by_extension(".JpG"), "image/jpeg"
+  assert_eq type_by_extension(".ÄÖ"), ""
+  assert_eq type_by_extension(""), ""
+  assert_eq extensions_by_type("text/html").unwrap, [".ehtml", ".htm", ".html", ".shtml"]
+  assert_eq extensions_by_type("x/unknown").unwrap.size, 0
+  assert extensions_by_type("bogus/<script>").err?
+}
+
+test "type by extension: local data" {
+  t = new_types
+  t = set_type(t, ".foo", "x/foo")
+  t = set_type(t, ".bar", "x/bar")
+  t = set_type(t, ".Bar", "x/bar; capital=1")
+  tests = [(".foo", "x/foo"), (".bar", "x/bar"), (".Bar", "x/bar; capital=1"), (".sdlkfjskdlfj", ""), (".t1", "")]
+  for tt in tests {
+    assert_eq t.type_by_extension(tt[0]), tt[1]
+  }
+}
+
+test "type by extension case" {
+  custom = "test/test; charset=iso-8859-1"
+  caps = "test/test; WAS=ALLCAPS"
+  t = new_types
+  t = set_type(t, ".TEST", caps)
+  t = set_type(t, ".tesT", custom)
+  # case-sensitive lookup
+  assert_eq t.type_by_extension(".tesT"), custom
+  assert_eq t.type_by_extension(".TEST"), caps
+  # case-insensitive
+  assert_eq t.type_by_extension(".TesT"), custom
+}
+
+test "add extension type: text MIME with params gets the default charset" {
+  t = new_types
+  ~t.add_extension_type!(".regtxt", "text/x-reg; myparam=myvalue")
+  got = t.type_by_extension(".regtxt")
+  assert got != ""
+  assert strings.contains(got, "charset=utf-8"), got
+  assert strings.has_prefix(got, "text/x-reg"), got
+  r = t.add_extension_type!("regtxt", "text/plain")
+  assert_eq r.err.unwrap.message, "mime: extension \"regtxt\" missing leading dot"
+}
+
+test "extensions by type" {
+  t = new_types
+  t = set_type(t, ".gif", "image/gif")
+  t = set_type(t, ".a", "foo/letter")
+  t = set_type(t, ".b", "foo/letter")
+  t = set_type(t, ".B", "foo/letter")
+  t = set_type(t, ".PNG", "image/png")
+  assert_eq t.extensions_by_type("image/gif").unwrap, [".gif"]
+  assert_eq t.extensions_by_type("image/png").unwrap, [".png"] # lowercase
+  assert_eq t.extensions_by_type("foo/letter").unwrap, [".a", ".b"]
+  assert_eq t.extensions_by_type("x/unknown").unwrap.size, 0
+}
+
+test "extensions by type 2" {
+  t = builtin_types
+  tests = [
+    ("application/postscript", [".ai", ".eps", ".ps"]),
+    ("application/vnd.android.package-archive", [".apk"]),
+    ("image/apng", [".apng"]),
+    ("image/avif", [".avif"]),
+    ("application/octet-stream", [".bin", ".com", ".exe"]),
+    ("image/bmp", [".bmp"]),
+    ("text/css; charset=utf-8", [".css"]),
+    ("text/csv; charset=utf-8", [".csv"]),
+    ("application/msword", [".doc"]),
+    ("application/vnd.openxmlformats-officedocument.wordprocessingml.document", [".docx"]),
+    ("text/html; charset=utf-8", [".ehtml", ".htm", ".html", ".shtml"]),
+    ("message/rfc822", [".eml"]),
+    ("audio/flac", [".flac"]),
+    ("image/gif", [".gif"]),
+    ("application/gzip", [".gz"]),
+    ("image/vnd.microsoft.icon", [".ico"]),
+    ("text/calendar; charset=utf-8", [".ics"]),
+    ("image/jpeg", [".jfif", ".jpeg", ".jpg", ".pjp", ".pjpeg"]),
+    ("text/javascript; charset=utf-8", [".js", ".mjs"]),
+    ("application/json", [".json"]),
+    ("audio/mp4", [".m4a"]),
+    ("audio/mpeg", [".mp3"]),
+    ("video/mp4", [".mp4"]),
+    ("audio/ogg", [".oga", ".ogg", ".opus"]),
+    ("video/ogg", [".ogv"]),
+    ("application/pdf", [".pdf"]),
+    ("image/png", [".png"]),
+    ("application/vnd.ms-powerpoint", [".ppt"]),
+    ("application/vnd.openxmlformats-officedocument.presentationml.presentation", [".pptx"]),
+    ("application/rdf+xml", [".rdf"]),
+    ("application/rtf", [".rtf"]),
+    ("image/svg+xml", [".svg"]),
+    ("text/plain; charset=utf-8", [".text", ".txt"]),
+    ("image/tiff", [".tif", ".tiff"]),
+    ("text/vtt; charset=utf-8", [".vtt"]),
+    ("application/wasm", [".wasm"]),
+    ("audio/wav", [".wav"]),
+    ("audio/webm", [".weba"]),
+    ("video/webm", [".webm"]),
+    ("image/webp", [".webp"]),
+    ("text/xml; charset=utf-8", [".xbl", ".xml", ".xsl"]),
+    ("image/x-xbitmap", [".xbm"]),
+    ("application/xhtml+xml", [".xht", ".xhtml"]),
+    ("application/vnd.ms-excel", [".xls"]),
+    ("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", [".xlsx"]),
+    ("application/zip", [".zip"]),
+  ]
+  for tt in tests {
+    assert_eq t.extensions_by_type(tt[0]).unwrap, tt[1]
+    # the package function answers from the same table
+    assert_eq extensions_by_type(tt[0]).unwrap, tt[1]
+  }
+}
+
+test "type by extension unix" {
+  # initMimeUnixTest: the builtin table, testdata/test.types.globs2, then
+  # testdata/test.types.
+  t = builtin_types
+  t.load_mime_globs!(TEST_GLOBS)
+  t.load_mime_types!(TEST_TYPES)
+  tests = [(".T1", "application/test"), (".t2", "text/test; charset=utf-8"), (".t3", "document/test"), (".t4", "example/test"), (".png", "image/png"), (",v", ""), ("~", ""), (".foo?ar", ""), (".foo*r", ""), (".foo[1-3]", "")]
+  for tt in tests {
+    assert_eq t.type_by_extension(tt[0]), tt[1]
+  }
+}
+
+test "system types" {
+  t = system_types
+  assert_eq t.type_by_extension(".png"), "image/png"
+}
+
+bench "type by extension" {
+  type_by_extension(".html")
+  type_by_extension(".HTML")
+  type_by_extension(".unused")
+}
+
+bench "extensions by type" {
+  extensions_by_type("text/html").unwrap
+  extensions_by_type("text/html; charset=utf-8").unwrap
+  extensions_by_type("application/octet-stream").unwrap
+}
+
+# -------------------------------------------------------- mediatype_test.go
+
+test "consume token" {
+  tests = [("foo bar", "foo", " bar"), ("bar", "bar", ""), ("", "", ""), (" foo", "", " foo")]
+  for t in tests {
+    token, rest = consume_token(t[0])
+    assert_eq token, t[1]
+    assert_eq rest, t[2]
+  }
+}
+
+test "consume value" {
+  tests = [
+    ("foo bar", "foo", " bar"),
+    ("bar", "bar", ""),
+    (" bar ", "", " bar "),
+    ("\"My value\"end", "My value", "end"),
+    ("\"My value\" end", "My value", " end"),
+    ("\"\\\\\" rest", "\\", " rest"),
+    ("\"My \\\" value\"end", "My \" value", "end"),
+    ("\"\\\" rest", "", "\"\\\" rest"),
+    ("\"C:\\dev\\go\\robots.txt\"", "C:\\dev\\go\\robots.txt", ""),
+    ("\"C:\\新建文件夹\\中文第二次测试.mp4\"", "C:\\新建文件夹\\中文第二次测试.mp4", ""),
+  ]
+  for t in tests {
+    value, rest = consume_value(t[0])
+    assert_eq value, t[1]
+    assert_eq rest, t[2]
+  }
+}
+
+test "consume media param" {
+  tests = [
+    (" ; foo=bar", "foo", "bar", ""),
+    ("; foo=bar", "foo", "bar", ""),
+    (";foo=bar", "foo", "bar", ""),
+    (";FOO=bar", "foo", "bar", ""),
+    (";foo=\"bar\"", "foo", "bar", ""),
+    (";foo=\"bar\"; ", "foo", "bar", "; "),
+    (";foo=\"bar\"; foo=baz", "foo", "bar", "; foo=baz"),
+    (" ; boundary=----CUT;", "boundary", "----CUT", ";"),
+    (" ; key=value;  blah=\"value\";name=\"foo\" ", "key", "value", ";  blah=\"value\";name=\"foo\" "),
+    (";  blah=\"value\";name=\"foo\" ", "blah", "value", ";name=\"foo\" "),
+    (";name=\"foo\" ", "name", "foo", " "),
+  ]
+  for t in tests {
+    param, value, rest = consume_media_param(t[0])
+    assert_eq param, t[1]
+    assert_eq value, t[2]
+    assert_eq rest, t[3]
+  }
+}
+
+# (in, type, params) of Go's parseMediaTypeTests.
+def parse_media_type_tests -> [(Str, Str, Map[Str, Str])] {
+  name_foo = m(["name", "foo"])
+  [
+    ("form-data; name=\"foo\"", "form-data", name_foo),
+    (" form-data ; name=foo", "form-data", name_foo),
+    ("FORM-DATA;name=\"foo\"", "form-data", name_foo),
+    (" FORM-DATA ; name=\"foo\"", "form-data", name_foo),
+    (" FORM-DATA ; name=\"foo\"", "form-data", name_foo),
+    ("form-data; key=value;  blah=\"value\";name=\"foo\" ", "form-data", m(["key", "value", "blah", "value", "name", "foo"])),
+    ("foo; key=val1; key=the-key-appears-again-which-is-bogus", "", m([])),
+    # From RFC 2231:
+    ("application/x-stuff; title*=us-ascii'en-us'This%20is%20%2A%2A%2Afun%2A%2A%2A", "application/x-stuff", m(["title", "This is ***fun***"])),
+    ("message/external-body; access-type=URL; " + "URL*0=\"ftp://\";" + "URL*1=\"cs.utk.edu/pub/moore/bulk-mailer/bulk-mailer.tar\"", "message/external-body", m(["access-type", "URL", "url", "ftp://cs.utk.edu/pub/moore/bulk-mailer/bulk-mailer.tar"])),
+    ("application/x-stuff; " + "title*0*=us-ascii'en'This%20is%20even%20more%20; " + "title*1*=%2A%2A%2Afun%2A%2A%2A%20; " + "title*2=\"isn't it!\"", "application/x-stuff", m(["title", "This is even more ***fun*** isn't it!"])),
+    # Tests from http://greenbytes.de/tech/tc2231/
+    # Note: Backslash escape handling is a bit loose, like MSIE.
+    ("attachment", "attachment", m([])), # #attonly
+    ("ATTACHMENT", "attachment", m([])), # #attonlyucase
+    ("attachment; filename=\"foo.html\"", "attachment", m(["filename", "foo.html"])),
+    ("attachment; filename=\"0000000000111111111122222\"", "attachment", m(["filename", "0000000000111111111122222"])),
+    ("attachment; filename=\"00000000001111111111222222222233333\"", "attachment", m(["filename", "00000000001111111111222222222233333"])),
+    ("attachment; filename=\"f\\oo.html\"", "attachment", m(["filename", "f\\oo.html"])),
+    ("attachment; filename=\"\\\"quoting\\\" tested.html\"", "attachment", m(["filename", "\"quoting\" tested.html"])),
+    ("attachment; filename=\"Here's a semicolon;.html\"", "attachment", m(["filename", "Here's a semicolon;.html"])),
+    ("attachment; foo=\"bar\"; filename=\"foo.html\"", "attachment", m(["foo", "bar", "filename", "foo.html"])),
+    ("attachment; foo=\"\\\"\\\\\";filename=\"foo.html\"", "attachment", m(["foo", "\"\\", "filename", "foo.html"])),
+    ("attachment; FILENAME=\"foo.html\"", "attachment", m(["filename", "foo.html"])),
+    ("attachment; filename=foo.html", "attachment", m(["filename", "foo.html"])),
+    ("attachment; filename=foo.html ;", "attachment", m(["filename", "foo.html"])),
+    ("attachment; filename='foo.html'", "attachment", m(["filename", "'foo.html'"])),
+    ("attachment; filename=\"foo-ä.html\"", "attachment", m(["filename", "foo-ä.html"])),
+    ("attachment; filename=\"foo-Ã¤.html\"", "attachment", m(["filename", "foo-Ã¤.html"])),
+    ("attachment; filename=\"foo-%41.html\"", "attachment", m(["filename", "foo-%41.html"])),
+    ("attachment; filename=\"50%.html\"", "attachment", m(["filename", "50%.html"])),
+    ("attachment; filename=\"foo-%\\41.html\"", "attachment", m(["filename", "foo-%\\41.html"])),
+    ("attachment; name=\"foo-%41.html\"", "attachment", m(["name", "foo-%41.html"])),
+    ("attachment; name=\"ä-%41.html\"", "attachment", m(["name", "ä-%41.html"])),
+    ("attachment; filename=\"foo-%c3%a4-%e2%82%ac.html\"", "attachment", m(["filename", "foo-%c3%a4-%e2%82%ac.html"])),
+    ("attachment; filename =\"foo.html\"", "attachment", m(["filename", "foo.html"])),
+    ("filename=foo.html", "", m([])),
+    ("x=y; filename=foo.html", "", m([])),
+    ("\"foo; filename=bar;baz\"; filename=qux", "", m([])),
+    ("filename=foo.html, filename=bar.html", "", m([])),
+    ("; filename=foo.html", "", m([])),
+    (": inline; attachment; filename=foo.html", "", m([])),
+    ("inline; attachment; filename=foo.html", "", m([])),
+    ("attachment; inline; filename=foo.html", "", m([])),
+    ("attachment; filename=\"foo.html\".txt", "", m([])),
+    ("attachment; filename=\"bar", "", m([])),
+    ("attachment; filename=foo\"bar;baz\"qux", "", m([])),
+    ("attachment; filename=foo.html, attachment; filename=bar.html", "", m([])),
+    ("attachment; foo=foo filename=bar", "", m([])),
+    ("attachment; filename=bar foo=foo", "", m([])),
+    ("attachment filename=bar", "", m([])),
+    ("filename=foo.html; attachment", "", m([])),
+    ("attachment; xfilename=foo.html", "attachment", m(["xfilename", "foo.html"])),
+    ("attachment; creation-date=\"Wed, 12 Feb 1997 16:29:51 -0500\"", "attachment", m(["creation-date", "Wed, 12 Feb 1997 16:29:51 -0500"])),
+    ("attachment; modification-date=\"Wed, 12 Feb 1997 16:29:51 -0500\"", "attachment", m(["modification-date", "Wed, 12 Feb 1997 16:29:51 -0500"])),
+    ("foobar", "foobar", m([])),
+    ("attachment; example=\"filename=example.txt\"", "attachment", m(["example", "filename=example.txt"])),
+    ("attachment; filename*=UTF-8''foo-%c3%a4-%e2%82%ac.html", "attachment", m(["filename", "foo-ä-€.html"])),
+    ("attachment; filename*=''foo-%c3%a4-%e2%82%ac.html", "attachment", m([])),
+    ("attachment; filename*=UTF-8''foo-a%cc%88.html", "attachment", m(["filename", "foo-a\u0308.html"])),
+    ("attachment; filename*= UTF-8''foo-%c3%a4.html", "attachment", m(["filename", "foo-ä.html"])),
+    ("attachment; filename* =UTF-8''foo-%c3%a4.html", "attachment", m(["filename", "foo-ä.html"])),
+    ("attachment; filename*=\"UTF-8''foo-%c3%a4.html\"", "attachment", m(["filename", "foo-ä.html"])),
+    ("attachment; filename*=\"foo%20bar.html\"", "attachment", m([])),
+    ("attachment; filename*=UTF-8'foo-%c3%a4.html", "attachment", m([])),
+    ("attachment; filename*=UTF-8''foo%", "attachment", m([])),
+    ("attachment; filename*=UTF-8''f%oo.html", "attachment", m([])),
+    ("attachment; filename*=UTF-8''A-%2541.html", "attachment", m(["filename", "A-%41.html"])),
+    ("attachment; filename*0=\"foo.\"; filename*1=\"html\"", "attachment", m(["filename", "foo.html"])),
+    ("attachment; filename*0*=UTF-8''foo-%c3%a4; filename*1=\".html\"", "attachment", m(["filename", "foo-ä.html"])),
+    ("attachment; filename*0=\"foo\"; filename*01=\"bar\"", "attachment", m(["filename", "foo"])),
+    ("attachment; filename*0=\"foo\"; filename*2=\"bar\"", "attachment", m(["filename", "foo"])),
+    ("attachment; filename*1=\"foo.\"; filename*2=\"html\"", "attachment", m([])),
+    ("attachment; filename*1=\"bar\"; filename*0=\"foo\"", "attachment", m(["filename", "foobar"])),
+    ("attachment; filename=\"foo-ae.html\"; filename*=UTF-8''foo-%c3%a4.html", "attachment", m(["filename", "foo-ä.html"])),
+    ("attachment; filename*=UTF-8''foo-%c3%a4.html; filename=\"foo-ae.html\"", "attachment", m(["filename", "foo-ä.html"])),
+    ("attachment; filename*0*=ISO-8859-15''euro-sign%3d%a4; filename*=ISO-8859-1''currency-sign%3d%a4", "attachment", m([])),
+    ("attachment; foobar=x; filename=\"foo.html\"", "attachment", m(["foobar", "x", "filename", "foo.html"])),
+    # Browsers also just send UTF-8 directly without RFC 2231.
+    ("form-data; firstname=\"Брэд\"; lastname=\"Фицпатрик\"", "form-data", m(["firstname", "Брэд", "lastname", "Фицпатрик"])),
+    # Empty string used to be mishandled.
+    ("foo; bar=\"\"", "foo", m(["bar", ""])),
+    # Microsoft browsers in intranet mode do not escape \ in file names.
+    ("form-data; name=\"file\"; filename=\"C:\\dev\\go\\robots.txt\"", "form-data", m(["name", "file", "filename", "C:\\dev\\go\\robots.txt"])),
+    ("form-data; name=\"file\"; filename=\"C:\\新建文件夹\\中文第二次测试.mp4\"", "form-data", m(["name", "file", "filename", "C:\\新建文件夹\\中文第二次测试.mp4"])),
+    # issue #46323: the example from RFC 2231 p.3, with a trailing semicolon
+    ("message/external-body; access-type=URL;\n\t\tURL*0=\"ftp://\";\n\t\tURL*1=\"cs.utk.edu/pub/moore/bulk-mailer/bulk-mailer.tar\";", "message/external-body", m(["access-type", "URL", "url", "ftp://cs.utk.edu/pub/moore/bulk-mailer/bulk-mailer.tar"])),
+    # Issue #48866: duplicate parameters containing equal values are allowed
+    ("text; charset=utf-8; charset=utf-8; format=fixed", "text", m(["charset", "utf-8", "format", "fixed"])),
+    ("text; charset=utf-8; format=flowed; charset=utf-8", "text", m(["charset", "utf-8", "format", "flowed"])),
+    # Issue #76236: '{' and '}' are token chars.
+    ("attachment; filename={file}.png", "attachment", m(["filename", "{file}.png"])),
+  ]
+}
+
+test "parse media type" {
+  for t in parse_media_type_tests {
+    r = parse_media_type(t[0])
+    if r.err? {
+      assert t[1] == "", "for input #{t[0]}, unexpected error: #{r.err.unwrap.message}"
+      next
+    }
+    mt, params = r.unwrap
+    assert_eq mt, t[1]
+    next if params.size == 0 && t[2].size == 0
+    assert map_eq(params, t[2]), "for input #{t[0]}, wrong params: #{params}"
+  }
+}
+
+bench "parse media type" {
+  for t in parse_media_type_tests {
+    _ = parse_media_type(t[0])
+  }
+}
+
+test "parse media type bogus" {
+  tests = [
+    ("bogus ;=========", "bogus", "mime: invalid media parameter"),
+    # From real email delivered by gmail (missing semicolon), Go issue 19498.
+    ("application/pdf; x-mac-type=\"3F3F3F3F\"; x-mac-creator=\"3F3F3F3F\" name=\"a.pdf\";", "application/pdf", "mime: invalid media parameter"),
+    ("bogus/<script>alert</script>", "", "mime: expected token after slash"),
+    ("bogus/bogus<script>alert</script>", "", "mime: unexpected content after media subtype"),
+    # Tests from http://greenbytes.de/tech/tc2231/
+    ("\"attachment\"", "attachment", "mime: no media type"),
+    ("attachment; filename=foo,bar.html", "attachment", "mime: invalid media parameter"),
+    ("attachment; ;filename=foo", "attachment", "mime: invalid media parameter"),
+    ("attachment; filename=foo bar.html", "attachment", "mime: invalid media parameter"),
+    ("attachment; filename=\"foo.html\"; filename=\"bar.html\"", "attachment", "mime: duplicate parameter name"),
+    ("attachment; filename=foo[1](2).html", "attachment", "mime: invalid media parameter"),
+    ("attachment; filename=foo-ä.html", "attachment", "mime: invalid media parameter"),
+    ("attachment; filename=foo-Ã¤.html", "attachment", "mime: invalid media parameter"),
+    ("attachment; filename *=UTF-8''foo-%c3%a4.html", "attachment", "mime: invalid media parameter"),
+  ]
+  for tt in tests {
+    r = parse_media_type(tt[0])
+    assert r.err?, "parse_media_type(#{tt[0]}) = no error; want parse error"
+    next unless r.err?
+    e = r.err.unwrap
+    assert_eq e.message, tt[2]
+    case e {
+      InvalidMediaParameter(mt) => assert_eq mt, tt[1]
+      _ => {}
+    }
+  }
+}
+
+test "format media type" {
+  # (type, params, want)
+  tests = [
+    ("noslash", m(["X", "Y"]), "noslash; x=Y"), # e.g. Content-Disposition values (RFC 2183); issue 11289
+    ("foo bar/baz", m([]), ""),
+    ("foo/bar baz", m([]), ""),
+    ("attachment", m(["filename", "ĄĄŽŽČČŠŠ"]), "attachment; filename*=utf-8''%C4%84%C4%84%C5%BD%C5%BD%C4%8C%C4%8C%C5%A0%C5%A0"),
+    ("attachment", m(["filename", "ÁÁÊÊÇÇÎÎ"]), "attachment; filename*=utf-8''%C3%81%C3%81%C3%8A%C3%8A%C3%87%C3%87%C3%8E%C3%8E"),
+    ("attachment", m(["filename", "数据统计.png"]), "attachment; filename*=utf-8''%E6%95%B0%E6%8D%AE%E7%BB%9F%E8%AE%A1.png"),
+    ("foo/BAR", m([]), "foo/bar"),
+    ("foo/BAR", m(["X", "Y"]), "foo/bar; x=Y"),
+    ("foo/BAR", m(["space", "With space"]), "foo/bar; space=\"With space\""),
+    ("foo/BAR", m(["quote", "With \"quote"]), "foo/bar; quote=\"With \\\"quote\""),
+    ("foo/BAR", m(["bslash", "With \\backslash"]), "foo/bar; bslash=\"With \\\\backslash\""),
+    ("foo/BAR", m(["both", "With \\backslash and \"quote"]), "foo/bar; both=\"With \\\\backslash and \\\"quote\""),
+    ("foo/BAR", m(["", "empty attribute"]), ""),
+    ("foo/BAR", m(["bad attribute", "baz"]), ""),
+    ("foo/BAR", m(["nonascii", "not an ascii character: ä"]), "foo/bar; nonascii*=utf-8''not%20an%20ascii%20character%3A%20%C3%A4"),
+    ("foo/BAR", m(["ctl", "newline: \n nil: \x00"]), "foo/bar; ctl*=utf-8''newline%3A%20%0A%20nil%3A%20%00"),
+    ("foo/bar", m(["a", "av", "b", "bv", "c", "cv"]), "foo/bar; a=av; b=bv; c=cv"),
+    ("foo/bar", m(["0", "'", "9", "'"]), "foo/bar; 0='; 9='"),
+    ("foo", m(["bar", ""]), "foo; bar=\"\""),
+  ]
+  for tt in tests {
+    got = format_media_type(tt[0], tt[1])
+    assert_eq got, tt[2]
+    next if got == ""
+    typ, params = ~parse_media_type(got)
+    assert_eq typ, strings.to_lower(tt[0])
+    for k, v in tt[1] {
+      assert_eq params[strings.to_lower(k)] || "", v
+    }
+  }
+}
+
+# ------------------------------------------------------ encodedword_test.go
+
+test "encode word" {
+  utf8 = "utf-8"
+  iso88591 = "iso-8859-1"
+  q = WordEncoder.QEncoding
+  b = WordEncoder.BEncoding
+  tests = [
+    (q, utf8, "François-Jérôme", "=?utf-8?q?Fran=C3=A7ois-J=C3=A9r=C3=B4me?="),
+    (b, utf8, "Café", "=?utf-8?b?Q2Fmw6k=?="),
+    (q, iso88591, "La Seleção", "=?iso-8859-1?q?La_Sele=C3=A7=C3=A3o?="),
+    (q, utf8, "", ""),
+    (q, utf8, "A", "A"),
+    (q, iso88591, "a", "a"),
+    (q, utf8, "123 456", "123 456"),
+    (q, utf8, "\t !\"\#$%&'()*+,-./ :;<>?@[\\]^_`{|}~", "\t !\"\#$%&'()*+,-./ :;<>?@[\\]^_`{|}~"),
+    (q, utf8, "é" * 10, "=?utf-8?q?" + "=C3=A9" * 10 + "?="),
+    (q, utf8, "é" * 11, "=?utf-8?q?" + "=C3=A9" * 10 + "?= =?utf-8?q?=C3=A9?="),
+    (q, iso88591, hx("e9") * 22, "=?iso-8859-1?q?" + "=E9" * 22 + "?="),
+    (q, utf8, hx("80") * 22, "=?utf-8?q?" + "=80" * 21 + "?= =?utf-8?q?=80?="),
+    (b, iso88591, hx("e9") * 45, "=?iso-8859-1?b?" + "6enp" * 15 + "?="),
+    (b, utf8, hx("80") * 48, "=?utf-8?b?" + "gICA" * 15 + "?= =?utf-8?b?gICA?="),
+  ]
+  for t in tests {
+    assert_eq t[0].encode(t[1], t[2]), t[3]
+  }
+}
+
+test "encoded word length" {
+  q = WordEncoder.QEncoding
+  b = WordEncoder.BEncoding
+  tests = [(q, "à" * 30), (q, "é" * 60), (b, "ï" * 25), (b, "ô" * 37), (b, hx("80") * 50), (q, "{$firstname} Bienvendio a Apostolica, aquà inicia el camino de tu")]
+  for t in tests {
+    s = t[0].encode("utf-8", t[1])
+    word_len = 0
+    for c in s.bytes {
+      if c == 32 {
+        word_len = 0
+        next
+      }
+      word_len += 1
+      assert word_len <= MAX_ENCODED_WORD_LEN, "encode(#{t[1]}) has more than #{MAX_ENCODED_WORD_LEN} characters: #{s}"
+    }
+  }
+}
+
+test "decode word" {
+  tests = [
+    ("=?UTF-8?Q?=C2=A1Hola,_se=C3=B1or!?=", "¡Hola, señor!", false),
+    ("=?UTF-8?Q?Fran=C3=A7ois-J=C3=A9r=C3=B4me?=", "François-Jérôme", false),
+    ("=?UTF-8?q?ascii?=", "ascii", false),
+    ("=?utf-8?B?QW5kcsOp?=", "André", false),
+    ("=?ISO-8859-1?Q?Rapha=EBl_Dupont?=", "Raphaël Dupont", false),
+    ("=?utf-8?b?IkFudG9uaW8gSm9zw6kiIDxqb3NlQGV4YW1wbGUub3JnPg==?=", "\"Antonio José\" <jose@example.org>", false),
+    ("=?UTF-8?A?Test?=", "", true),
+    ("=?UTF-8?Q?A=B?=", "", true),
+    ("=?UTF-8?Q?=A?=", "", true),
+    ("=?UTF-8?A?A?=", "", true),
+    ("=????=", "", true),
+    ("=?UTF-8???=", "", true),
+    ("=?UTF-8?Q??=", "", false),
+  ]
+  for t in tests {
+    dec = WordDecoder.new
+    r = dec.decode(t[0])
+    assert_eq r.err?, t[2]
+    if v = r.ok {
+      assert_eq v, t[1]
+    }
+  }
+}
+
+test "decode header" {
+  tests = [
+    ("=?UTF-8?Q?=C2=A1Hola,_se=C3=B1or!?=", "¡Hola, señor!"),
+    ("=?UTF-8?Q?Fran=C3=A7ois-J=C3=A9r=C3=B4me?=", "François-Jérôme"),
+    ("=?UTF-8?q?ascii?=", "ascii"),
+    ("=?utf-8?B?QW5kcsOp?=", "André"),
+    ("=?ISO-8859-1?Q?Rapha=EBl_Dupont?=", "Raphaël Dupont"),
+    ("Jean", "Jean"),
+    ("=?utf-8?b?IkFudG9uaW8gSm9zw6kiIDxqb3NlQGV4YW1wbGUub3JnPg==?=", "\"Antonio José\" <jose@example.org>"),
+    ("=?UTF-8?A?Test?=", "=?UTF-8?A?Test?="),
+    ("=?UTF-8?Q?A=B?=", "=?UTF-8?Q?A=B?="),
+    ("=?UTF-8?Q?=A?=", "=?UTF-8?Q?=A?="),
+    ("=?UTF-8?A?A?=", "=?UTF-8?A?A?="),
+    # Incomplete words
+    ("=?", "=?"),
+    ("=?UTF-8?", "=?UTF-8?"),
+    ("=?UTF-8?=", "=?UTF-8?="),
+    ("=?UTF-8?Q", "=?UTF-8?Q"),
+    ("=?UTF-8?Q?", "=?UTF-8?Q?"),
+    ("=?UTF-8?Q?=", "=?UTF-8?Q?="),
+    ("=?UTF-8?Q?A", "=?UTF-8?Q?A"),
+    ("=?UTF-8?Q?A?", "=?UTF-8?Q?A?"),
+    # Tests from RFC 2047
+    ("=?ISO-8859-1?Q?a?=", "a"),
+    ("=?ISO-8859-1?Q?a?= b", "a b"),
+    ("=?ISO-8859-1?Q?a?= =?ISO-8859-1?Q?b?=", "ab"),
+    ("=?ISO-8859-1?Q?a?=  =?ISO-8859-1?Q?b?=", "ab"),
+    ("=?ISO-8859-1?Q?a?= \r\n\t =?ISO-8859-1?Q?b?=", "ab"),
+    ("=?ISO-8859-1?Q?a_b?=", "a b"),
+    # Undecodable words
+    ("=?UTF-8?b?garbage?= =?UTF-8?b?QW5kcsOp?= =?UTF-8?b?garbage?=", "=?UTF-8?b?garbage?= André =?UTF-8?b?garbage?="),
+    ("=?UTF-8?b?QW5kcsOp", "=?UTF-8?b?QW5kcsOp"),
+    ("=?UTF-8?x?y?=?UTF-8?x?y=?", "=?UTF-8?x?y?=?UTF-8?x?y=?"),
+  ]
+  for t in tests {
+    dec = WordDecoder.new
+    assert_eq dec.decode_header(t[0]).unwrap, t[1]
+  }
+}
+
+test "charset decoder" {
+  tests = [
+    ("=?utf-8?b?Q2Fmw6k=?=", "Café", [], []),
+    ("=?ISO-8859-1?Q?caf=E9?=", "café", [], []),
+    ("=?US-ASCII?Q?foo_bar?=", "foo bar", [], []),
+    ("=?utf-8?Q?=?=", "=?utf-8?Q?=?=", [], []),
+    ("=?utf-8?Q?=A?=", "=?utf-8?Q?=A?=", [], []),
+    ("=?ISO-8859-15?Q?f=F5=F6?=  =?windows-1252?Q?b=E0r?=", hx("66f5f662e072"), ["iso-8859-15", "windows-1252"], [hx("66f5f6"), hx("62e072")]),
+  ]
+  for t in tests {
+    i = 0
+    charsets = t[2]
+    contents = t[3]
+    dec = WordDecoder.new(charset_reader: ->(charset: Str, content: [Byte]) -> ~[Byte] {
+      assert_eq charset, charsets[i]
+      assert_eq Str.from_bytes(content), contents[i]
+      i += 1
+      content
+    })
+    assert_eq dec.decode_header(t[0]).unwrap, t[1]
+  }
+}
+
+test "charset decoder error" {
+  dec = WordDecoder.new(charset_reader: ->(charset: Str, content: [Byte]) -> ~[Byte] {
+    fail "Test error" if content.size >= 0
+    content
+  })
+  assert dec.decode_header("=?charset?Q?foo?=").err?
+  # without a reader the charset is unhandled
+  assert_eq WordDecoder.new.decode_header("=?charset?Q?foo?=").err.unwrap.message, "mime: unhandled charset \"charset\""
+}
+
+bench "q encode word" {
+  WordEncoder.QEncoding.encode("UTF-8", "¡Hola, señor!")
+}
+
+bench "q decode word" {
+  WordDecoder.new.decode("=?utf-8?q?=C2=A1Hola,_se=C3=B1or!?=").unwrap
+}
+
+bench "q decode header" {
+  WordDecoder.new.decode_header("=?utf-8?q?=C2=A1Hola,_se=C3=B1or!?=").unwrap
+}
+
+# ---------------------------------------------------------- example_test.go
+
+example "word encoder encode" {
+  puts WordEncoder.QEncoding.encode("utf-8", "¡Hola, señor!")
+  puts WordEncoder.QEncoding.encode("utf-8", "Hello!")
+  puts WordEncoder.BEncoding.encode("UTF-8", "¡Hola, señor!")
+  puts WordEncoder.QEncoding.encode("ISO-8859-1", "Caf" + hx("e9"))
+} outputs "=?utf-8?q?=C2=A1Hola,_se=C3=B1or!?=\nHello!\n=?UTF-8?b?wqFIb2xhLCBzZcOxb3Ih?=\n=?ISO-8859-1?q?Caf=E9?=\n"
+
+def x_case(charset: Str, content: [Byte]) -> ~[Byte] {
+  # Fake character set for the example.
+  fail "unhandled charset #{charset}" if charset != "x-case"
+  strings.to_upper(Str.from_bytes(content)).bytes.to_a
+}
+
+example "word decoder decode" {
+  dec = WordDecoder.new
+  puts dec.decode("=?utf-8?q?=C2=A1Hola,_se=C3=B1or!?=").unwrap
+  dec.charset_reader = ->(charset: Str, content: [Byte]) -> ~[Byte] { ~x_case(charset, content) }
+  puts dec.decode("=?x-case?q?hello!?=").unwrap
+} outputs "¡Hola, señor!\nHELLO!\n"
+
+example "word decoder decode header" {
+  dec = WordDecoder.new
+  puts dec.decode_header("=?utf-8?q?=C3=89ric?= <eric@example.org>, =?utf-8?q?Ana=C3=AFs?= <anais@example.org>").unwrap
+  puts dec.decode_header("=?utf-8?q?=C2=A1Hola,?= =?utf-8?q?_se=C3=B1or!?=").unwrap
+  dec.charset_reader = ->(charset: Str, content: [Byte]) -> ~[Byte] { ~x_case(charset, content) }
+  puts dec.decode_header("=?x-case?q?hello_?= =?x-case?q?world!?=").unwrap
+} outputs "Éric <eric@example.org>, Anaïs <anais@example.org>\n¡Hola, señor!\nHELLO WORLD!\n"
+
+example "format media type" {
+  params: Map[Str, Str] = {"charset" => "utf-8"}
+  puts "result: " + format_media_type("text/html", params)
+} outputs "result: text/html; charset=utf-8\n"
+
+example "parse media type" {
+  mediatype, params = parse_media_type("text/html; charset=utf-8").unwrap
+  puts "type: " + mediatype
+  puts "charset: " + (params["charset"] || "")
+} outputs "type: text/html\ncharset: utf-8\n"

@@ -1,0 +1,999 @@
+# Package netip: Go's net/netip — IP addresses (Addr), address:port pairs
+# (AddrPort) and CIDR prefixes (Prefix) as small comparable values.
+#
+#   Go                                  alx
+#   ParseAddr(s) (Addr, error)          parse_addr(s) -> ~Addr<NetipError>
+#   MustParseAddr / ...AddrPort / ...Prefix   must_parse_addr / must_parse_addr_port / must_parse_prefix
+#   AddrFrom4([4]byte) / AddrFrom16     addr_from4(a: [Byte; 4]) / addr_from16(a: [Byte; 16])
+#   AddrFromSlice(b) (Addr, bool)       addr_from_slice(b) -> Addr?
+#   IPv4Unspecified() ...               ipv4_unspecified, ipv6_unspecified, ipv6_loopback,
+#                                       ipv6_link_local_all_nodes, ipv6_link_local_all_routers
+#   ip.IsValid() / Is4 / Is6 / Is4In6   ip.valid? / is4? / is6? / is4in6?
+#   ip.IsLoopback() and friends         ip.loopback?, multicast?, private?, unspecified?,
+#                                       global_unicast?, link_local_unicast?,
+#                                       link_local_multicast?, interface_local_multicast?
+#   ip.Compare / Less                   ip.compare(other) -> Int / ip.less?(other); also <=>
+#   ip.Prefix(bits) (Prefix, error)     ip.prefix(bits) -> ~Prefix<NetipError>
+#   ip.As4 / As16 / AsSlice             ip.as4 -> [Byte; 4] / as16 -> [Byte; 16] / as_slice -> [Byte]
+#   ip.Next() / Prev()                  ip.next_addr / prev_addr (`next` is a keyword)
+#   ip.Zone() / WithZone(z) / Unmap()   ip.zone / with_zone(z) / unmap
+#   ip.BitLen()                         ip.bit_len
+#   ip.String / StringExpanded          ip.to_s (also `string`) / string_expanded
+#   AppendTo / AppendText / MarshalText ip.append_to(b) / append_text(b) / marshal_text -> [Byte]
+#   (*Addr).UnmarshalText(b) error      unmarshal_addr_text(b) -> ~Addr (a constructor; see below)
+#   MarshalBinary / AppendBinary        ip.marshal_binary / append_binary(b)
+#   (*Addr).UnmarshalBinary(b) error    unmarshal_addr_binary(b) -> ~Addr
+#   AddrPortFrom(ip, port)              addr_port_from(ip, port: U16)
+#   ParseAddrPort(s)                    parse_addr_port(s) -> ~AddrPort<NetipError>
+#   p.Addr() / p.Port()                 p.addr / p.port (U16)
+#   PrefixFrom(ip, bits)                prefix_from(ip, bits)
+#   ParsePrefix(s)                      parse_prefix(s) -> ~Prefix<NetipError>
+#   p.Bits / Masked / Contains / Overlaps / IsSingleIP    p.bits / masked / contains?(ip) / overlaps?(o) / single_ip?
+#
+# Differences from Go:
+#  - Go's Unmarshal* methods write through a pointer receiver; alx's are
+#    constructors (`unmarshal_addr_text`, `unmarshal_addr_port_binary`, ...)
+#    returning the value, as an empty input gives the zero value.
+#  - The errors are NetipError variants with Go's messages:
+#    ParseAddr(input, msg, at) is Go's parseAddrError, ParsePrefix(input,
+#    msg) its parsePrefixError, Invalid(msg) the errors.New ones.
+#  - Methods returning (T, error) where the error can't happen (AppendText,
+#    MarshalText, ...) return T.
+#  - Addr keeps its zone in a Str field (Go interns it with unique.Make); the
+#    fields hi, lo, z and zn are visible but meant to be private.
+#  - No JSON or encoding.TextMarshaler protocol (there is no reflection-based
+#    encoding/json; use marshal_text / unmarshal_addr_text).
+#  - AddrPort and Prefix order with `compare`; all three types define `<=>`.
+
+import "strconv"
+
+pub error NetipError {
+  # Go's parseAddrError: the input, what's wrong, and where (may be "").
+  ParseAddr(input: Str, msg: Str, at: Str)
+  # Go's parsePrefixError.
+  ParsePrefix(input: Str, msg: Str)
+  # The errors Go makes with errors.New.
+  Invalid(msg: Str)
+
+  def message -> Str {
+    case self {
+      ParseAddr(i, m, at) => at == "" ? "ParseAddr(#{strconv.quote(i)}): #{m}" : "ParseAddr(#{strconv.quote(i)}): #{m} (at #{strconv.quote(at)})"
+      ParsePrefix(i, m) => "netip.ParsePrefix(#{strconv.quote(i)}): #{m}"
+      Invalid(m) => m
+    }
+  }
+}
+
+MAX64: U64 = 18446744073709551615
+
+# ------------------------------------------------------------------ uint128
+
+# A 128-bit unsigned number: an IPv6 address, or an IPv4 one in its 4in6 form.
+struct Uint128 {
+  hi: U64
+  lo: U64
+
+  def zero? -> Bool { (hi | lo) == 0 }
+  def and(m: Uint128) -> Uint128 { Uint128.new(hi: hi & m.hi, lo: lo & m.lo) }
+  def xor(m: Uint128) -> Uint128 { Uint128.new(hi: hi ^ m.hi, lo: lo ^ m.lo) }
+  def or(m: Uint128) -> Uint128 { Uint128.new(hi: hi | m.hi, lo: lo | m.lo) }
+  def not -> Uint128 { Uint128.new(hi: ^hi, lo: ^lo) }
+
+  def sub_one -> Uint128 {
+    borrow: U64 = 0
+    borrow = 1 if lo == 0
+    Uint128.new(hi: hi -% borrow, lo: lo -% 1)
+  }
+
+  def add_one -> Uint128 {
+    carry: U64 = 0
+    carry = 1 if lo == MAX64
+    Uint128.new(hi: hi +% carry, lo: lo +% 1)
+  }
+
+  def bits_set_from(bit: Int) -> Uint128 { self.or(mask6(bit).not) }
+  def bits_cleared_from(bit: Int) -> Uint128 { self.and(mask6(bit)) }
+}
+
+def u128(hi: U64, lo: U64) -> Uint128 { Uint128.new(hi: hi, lo: lo) }
+
+# The 128-bit mask with the n leading bits set.
+def mask6(n: Int) -> Uint128 {
+  Uint128.new(hi: ^(MAX64 >> n), lo: MAX64 << (128 - n))
+}
+
+# --------------------------------------------------------------------- Addr
+
+# Addr.z: no address (the zero value), IPv4, IPv6.
+Z0 = 0
+Z4 = 4
+Z6 = 6
+
+# An IPv4 or IPv6 address (with an optional IPv6 zone), a comparable value.
+# The zero Addr is not a valid address.
+pub struct Addr {
+  hi: U64
+  lo: U64
+  z: Int
+  zn: Str
+
+  def u -> Uint128 { Uint128.new(hi: hi, lo: lo) }
+
+  def with_u(v: Uint128) -> Addr { Addr.new(hi: v.hi, lo: v.lo, z: z, zn: zn) }
+
+  def v4(i: Int) -> Byte { (lo >> ((3 - i) * 8)).as_u8 }
+
+  def v6(i: Int) -> Byte {
+    half = (i / 8) % 2 == 0 ? hi : lo
+    (half >> ((7 - i % 8) * 8)).as_u8
+  }
+
+  def v6u16(i: Int) -> U16 {
+    half = (i / 4) % 2 == 0 ? hi : lo
+    (half >> ((3 - i % 4) * 16)).as_u16
+  }
+
+  def zero? -> Bool { z == Z0 }
+
+  # Whether the address was initialized (the zero Addr is not valid).
+  pub def valid? -> Bool { z != Z0 }
+
+  # 0 for the zero Addr, 32 for IPv4, 128 for IPv6 (4in6 included).
+  pub def bit_len -> Int {
+    return 0 if z == Z0
+    return 32 if z == Z4
+    128
+  }
+
+  # The IPv6 zone ("" for IPv4 and unzoned addresses).
+  pub def zone -> Str { zn }
+
+  # -1, 0 or 1: by bit length, then address, then zone. Go's Compare.
+  pub def compare(ip2: Addr) -> Int {
+    f1 = bit_len
+    f2 = ip2.bit_len
+    return -1 if f1 < f2
+    return 1 if f1 > f2
+    return -1 if hi < ip2.hi
+    return 1 if hi > ip2.hi
+    return -1 if lo < ip2.lo
+    return 1 if lo > ip2.lo
+    if is6? {
+      return -1 if zn < ip2.zn
+      return 1 if zn > ip2.zn
+    }
+    0
+  }
+
+  def <=>(ip2: Addr) -> Int { compare(ip2) }
+
+  # Whether ip sorts before ip2.
+  pub def less?(ip2: Addr) -> Bool { compare(ip2) == -1 }
+
+  pub def is4? -> Bool { z == Z4 }
+
+  # Whether ip is an IPv4-mapped IPv6 address (::ffff:a.b.c.d).
+  pub def is4in6? -> Bool { is6? && hi == 0 && lo >> 32 == 0xffff }
+
+  # Whether ip is IPv6, 4in6 included.
+  pub def is6? -> Bool { z == Z6 }
+
+  # ip with any IPv4-mapped prefix removed (a 4in6 address becomes IPv4).
+  pub def unmap -> Addr {
+    return Addr.new(hi: hi, lo: lo, z: Z4, zn: "") if is4in6?
+    self
+  }
+
+  # ip with the zone set (for IPv6; IPv4 is returned unchanged). "" removes it.
+  pub def with_zone(name: Str) -> Addr {
+    return self unless is6?
+    Addr.new(hi: hi, lo: lo, z: Z6, zn: name)
+  }
+
+  def without_zone -> Addr {
+    return self unless is6?
+    Addr.new(hi: hi, lo: lo, z: Z6, zn: "")
+  }
+
+  def has_zone? -> Bool { z == Z6 && zn != "" }
+
+  pub def link_local_unicast? -> Bool {
+    ip = is4in6? ? unmap : self
+    return ip.v4(0) == 169 && ip.v4(1) == 254 if ip.is4?
+    return ip.v6u16(0) & 0xffc0 == 0xfe80 if ip.is6?
+    false
+  }
+
+  pub def loopback? -> Bool {
+    ip = is4in6? ? unmap : self
+    return ip.v4(0) == 127 if ip.is4?
+    return ip.hi == 0 && ip.lo == 1 if ip.is6?
+    false
+  }
+
+  pub def multicast? -> Bool {
+    ip = is4in6? ? unmap : self
+    return ip.v4(0) & 0xf0 == 0xe0 if ip.is4?
+    return ip.hi >> 56 == 0xff if ip.is6?
+    false
+  }
+
+  pub def interface_local_multicast? -> Bool {
+    return v6u16(0) & 0xff0f == 0xff01 if is6? && !is4in6?
+    false
+  }
+
+  pub def link_local_multicast? -> Bool {
+    ip = is4in6? ? unmap : self
+    return ip.v4(0) == 224 && ip.v4(1) == 0 && ip.v4(2) == 0 if ip.is4?
+    return ip.v6u16(0) & 0xff0f == 0xff02 if ip.is6?
+    false
+  }
+
+  # Whether ip is a global unicast address: not unspecified, the IPv4
+  # broadcast address, loopback, multicast or link-local unicast. (Private
+  # addresses count, as in Go.)
+  pub def global_unicast? -> Bool {
+    return false if z == Z0
+    ip = is4in6? ? unmap : self
+    return false if ip.is4? && (ip == ipv4_unspecified || ip == addr_from4([255, 255, 255, 255]))
+    ip != ipv6_unspecified && !ip.loopback? && !ip.multicast? && !ip.link_local_unicast?
+  }
+
+  # Whether ip is private per RFC 1918 (IPv4) or RFC 4193 (IPv6).
+  pub def private? -> Bool {
+    ip = is4in6? ? unmap : self
+    if ip.is4? {
+      return ip.v4(0) == 10 || (ip.v4(0) == 172 && ip.v4(1) & 0xf0 == 16) || (ip.v4(0) == 192 && ip.v4(1) == 168)
+    }
+    return ip.v6(0) & 0xfe == 0xfc if ip.is6?
+    false
+  }
+
+  # Whether ip is 0.0.0.0 or :: (zoneless).
+  pub def unspecified? -> Bool { self == ipv4_unspecified || self == ipv6_unspecified }
+
+  # The prefix of ip with its first b bits (the rest masked off). The zero
+  # Addr gives the zero Prefix.
+  pub def prefix(b: Int) -> ~Prefix<NetipError> {
+    fail NetipError.Invalid("negative Prefix bits") if b < 0
+    effective_bits = b
+    return Prefix.new if z == Z0
+    if z == Z4 {
+      fail NetipError.Invalid("prefix length #{b} too large for IPv4") if b > 32
+      effective_bits += 96
+    } else {
+      fail NetipError.Invalid("prefix length #{b} too large for IPv6") if b > 128
+    }
+    prefix_from(with_u(u.and(mask6(effective_bits))), b)
+  }
+
+  # The 16-byte form (IPv4 as ::ffff:a.b.c.d); the zone is dropped.
+  pub def as16 -> [Byte; 16] {
+    out: [Byte; 16] = [0; 16]
+    for i in 0...8 {
+      out[i] = (hi >> ((7 - i) * 8)).as_u8
+      out[i + 8] = (lo >> ((7 - i) * 8)).as_u8
+    }
+    out
+  }
+
+  # The 4-byte form of an IPv4 or 4in6 address; panics on other addresses.
+  pub def as4 -> [Byte; 4] {
+    if z == Z4 || is4in6? {
+      out: [Byte; 4] = [v4(0), v4(1), v4(2), v4(3)]
+      return out
+    }
+    panic("As4 called on IP zero value") if z == Z0
+    panic("As4 called on IPv6 address")
+  }
+
+  # 4 bytes for IPv4, 16 for IPv6, none for the zero Addr.
+  pub def as_slice -> [Byte] {
+    return [] if z == Z0
+    return [v4(0), v4(1), v4(2), v4(3)] if z == Z4
+    out: [Byte] = []
+    for b in as16 {
+      out << b
+    }
+    out
+  }
+
+  # The address after ip; the zero Addr when ip is the last one.
+  pub def next_addr -> Addr {
+    a = with_u(u.add_one)
+    if is4? {
+      return Addr.new if a.lo.as_u32 == 0
+    } else if a.u.zero? {
+      return Addr.new
+    }
+    a
+  }
+
+  # The address before ip; the zero Addr when ip is the first one.
+  pub def prev_addr -> Addr {
+    if is4? {
+      return Addr.new if lo.as_u32 == 0
+    } else if u.zero? {
+      return Addr.new
+    }
+    with_u(u.sub_one)
+  }
+
+  # Dotted decimal for IPv4, RFC 5952 for IPv6 (4in6 as ::ffff:a.b.c.d),
+  # with "%zone"; "invalid IP" for the zero Addr.
+  pub def to_s -> Str {
+    return "invalid IP" unless valid?
+    Str.from_bytes(append_to([]))
+  }
+
+  pub def string -> Str { to_s }
+
+  # b with ip's text form appended (nothing for the zero Addr).
+  pub def append_to(b: [Byte]) -> [Byte] {
+    return b if z == Z0
+    return append_to4(b) if z == Z4
+    return append_to4in6(b) if is4in6?
+    append_to6(b)
+  }
+
+  def append_to4(b: [Byte]) -> [Byte] {
+    out = append_decimal(b, v4(0))
+    out << 46
+    out = append_decimal(out, v4(1))
+    out << 46
+    out = append_decimal(out, v4(2))
+    out << 46
+    append_decimal(out, v4(3))
+  }
+
+  def append_to4in6(b: [Byte]) -> [Byte] {
+    out = append_str(b, "::ffff:")
+    out = unmap.append_to4(out)
+    if zn != "" {
+      out << 37
+      out = append_str(out, zn)
+    }
+    out
+  }
+
+  def append_to6(b: [Byte]) -> [Byte] {
+    zero_start = 255
+    zero_end = 255
+    for i in 0...8 {
+      j = i
+      while j < 8 && v6u16(j) == 0 {
+        j += 1
+      }
+      l = j - i
+      if l >= 2 && (zero_start == 255 || l > zero_end - zero_start) {
+        zero_start = i
+        zero_end = j
+      }
+    }
+    out = b
+    i = 0
+    while i < 8 {
+      if i == zero_start {
+        out << 58
+        out << 58
+        i = zero_end
+        break if i >= 8
+      } else if i > 0 {
+        out << 58
+      }
+      out = append_hex(out, v6u16(i))
+      i += 1
+    }
+    if zn != "" {
+      out << 37
+      out = append_str(out, zn)
+    }
+    out
+  }
+
+  # Like to_s, but IPv6 addresses are written in full (every group four
+  # digits, no "::").
+  pub def string_expanded -> Str {
+    return to_s if z == Z0 || z == Z4
+    out: [Byte] = []
+    for i in 0...8 {
+      out << 58 if i > 0
+      out = append_hex_pad(out, v6u16(i))
+    }
+    if zn != "" {
+      out << 37
+      out = append_str(out, zn)
+    }
+    Str.from_bytes(out)
+  }
+
+  # Go's AppendText: append_to (it can't fail).
+  pub def append_text(b: [Byte]) -> [Byte] { append_to(b) }
+
+  # Go's MarshalText: the text form; empty for the zero Addr.
+  pub def marshal_text -> [Byte] { append_to([]) }
+
+  # Go's AppendBinary: 4 bytes for IPv4, 16 plus the zone for IPv6, nothing
+  # for the zero Addr.
+  pub def append_binary(b: [Byte]) -> [Byte] {
+    return b if z == Z0
+    out = b
+    if z == Z4 {
+      out << v4(0)
+      out << v4(1)
+      out << v4(2)
+      out << v4(3)
+      return out
+    }
+    for c in as16 {
+      out << c
+    }
+    append_str(out, zn)
+  }
+
+  pub def marshal_binary -> [Byte] { append_binary([]) }
+
+  def marshal_binary_size -> Int {
+    return 0 if z == Z0
+    return 4 if z == Z4
+    16 + zn.size
+  }
+}
+
+DIGITS = "0123456789abcdef"
+
+def append_str(b: [Byte], s: Str) -> [Byte] {
+  out = b
+  for c in s.bytes {
+    out << c
+  }
+  out
+}
+
+def append_decimal(b: [Byte], x: Byte) -> [Byte] {
+  out = b
+  out << DIGITS[x / 100] if x >= 100
+  out << DIGITS[x / 10 % 10] if x >= 10
+  out << DIGITS[x % 10]
+  out
+}
+
+def append_hex(b: [Byte], x: U16) -> [Byte] {
+  out = b
+  out << DIGITS[x >> 12] if x >= 0x1000
+  out << DIGITS[(x >> 8) & 0xf] if x >= 0x100
+  out << DIGITS[(x >> 4) & 0xf] if x >= 0x10
+  out << DIGITS[x & 0xf]
+  out
+}
+
+def append_hex_pad(b: [Byte], x: U16) -> [Byte] {
+  out = b
+  out << DIGITS[x >> 12]
+  out << DIGITS[(x >> 8) & 0xf]
+  out << DIGITS[(x >> 4) & 0xf]
+  out << DIGITS[x & 0xf]
+  out
+}
+
+# ff02::1
+pub def ipv6_link_local_all_nodes -> Addr { Addr.new(hi: 0xff02000000000000, lo: 1, z: Z6, zn: "") }
+
+# ff02::2
+pub def ipv6_link_local_all_routers -> Addr { Addr.new(hi: 0xff02000000000000, lo: 2, z: Z6, zn: "") }
+
+# ::1
+pub def ipv6_loopback -> Addr { Addr.new(hi: 0, lo: 1, z: Z6, zn: "") }
+
+# ::
+pub def ipv6_unspecified -> Addr { Addr.new(hi: 0, lo: 0, z: Z6, zn: "") }
+
+# 0.0.0.0
+pub def ipv4_unspecified -> Addr { addr_from4([0, 0, 0, 0]) }
+
+# The IPv4 address of the four bytes.
+pub def addr_from4(a: [Byte; 4]) -> Addr {
+  v: U64 = 0xffff00000000 | (a[0].to_u64 << 24) | (a[1].to_u64 << 16) | (a[2].to_u64 << 8) | a[3].to_u64
+  Addr.new(hi: 0, lo: v, z: Z4, zn: "")
+}
+
+# The IPv6 address of the 16 bytes (an IPv4-mapped one stays IPv6; see unmap).
+pub def addr_from16(a: [Byte; 16]) -> Addr {
+  h: U64 = 0
+  l: U64 = 0
+  for i in 0...8 {
+    h = (h << 8) | a[i].to_u64
+    l = (l << 8) | a[i + 8].to_u64
+  }
+  Addr.new(hi: h, lo: l, z: Z6, zn: "")
+}
+
+# The address of a 4- or 16-byte slice; none for any other length.
+pub def addr_from_slice(slice: [Byte]) -> Addr? {
+  if slice.size == 4 {
+    a: [Byte; 4] = [slice[0], slice[1], slice[2], slice[3]]
+    return addr_from4(a)
+  }
+  if slice.size == 16 {
+    a16: [Byte; 16] = [0; 16]
+    for i in 0...16 {
+      a16[i] = slice[i]
+    }
+    return addr_from16(a16)
+  }
+  none
+}
+
+# Parses an IPv4 address ("192.0.2.1"), an IPv6 address ("2001:db8::68")
+# or an IPv6 address with a zone ("fe80::1cc0:3e8c:119f:c2e1%ens18").
+# IPv4 fields with leading zeros are rejected; so are dotted forms with
+# fewer than four fields.
+pub def parse_addr(s: Str) -> ~Addr<NetipError> {
+  for i in 0...s.size {
+    c = s[i]
+    return ~parse_ipv4(s) if c == 46
+    return ~parse_ipv6(s) if c == 58
+    fail NetipError.ParseAddr(s, "missing IPv6 address", "") if c == 37
+  }
+  fail NetipError.ParseAddr(s, "unable to parse IP", "")
+}
+
+# parse_addr, panicking on an error (for constants and tests).
+pub def must_parse_addr(s: Str) -> Addr {
+  r = parse_addr(s)
+  panic(r.err.unwrap.message) if r.err?
+  r.unwrap
+}
+
+# Parses the IPv4 fields of in[off...end] into fields (4 bytes).
+def parse_ipv4_fields(input: Str, off: Int, end: Int, fields: [Byte]) -> ~Unit<NetipError> {
+  val = 0
+  pos = 0
+  dig_len = 0
+  s = input[off...end]
+  for i in 0...s.size {
+    c = s[i]
+    if c >= 48 && c <= 57 {
+      fail NetipError.ParseAddr(input, "IPv4 field has octet with leading zero", "") if dig_len == 1 && val == 0
+      val = val * 10 + c.to_i - 48
+      dig_len += 1
+      fail NetipError.ParseAddr(input, "IPv4 field has value >255", "") if val > 255
+    } else if c == 46 {
+      # .1.2.3, 1.2.3. and 1..2.3 are invalid.
+      if i == 0 || i == s.size - 1 || s[i - 1] == 46 {
+        fail NetipError.ParseAddr(input, "IPv4 field must have at least one digit", s[i...s.size])
+      }
+      # 1.2.3.4.5 is invalid.
+      fail NetipError.ParseAddr(input, "IPv4 address too long", "") if pos == 3
+      fields[pos] = val.as_u8
+      pos += 1
+      val = 0
+      dig_len = 0
+    } else {
+      fail NetipError.ParseAddr(input, "unexpected character", s[i...s.size])
+    }
+  }
+  fail NetipError.ParseAddr(input, "IPv4 address too short", "") if pos < 3
+  fields[3] = val.as_u8
+}
+
+def parse_ipv4(s: Str) -> ~Addr<NetipError> {
+  fields: [Byte] = [0, 0, 0, 0]
+  ~parse_ipv4_fields(s, 0, s.size, fields)
+  addr_from4([fields[0], fields[1], fields[2], fields[3]])
+}
+
+def parse_ipv6(input: Str) -> ~Addr<NetipError> {
+  s = input
+  # Split off the zone right from the start.
+  zone = ""
+  zi = -1
+  for k in 0...s.size {
+    if s[k] == 37 {
+      zi = k
+      break
+    }
+  }
+  if zi != -1 {
+    zone = s[zi + 1...s.size]
+    s = s[0...zi]
+    fail NetipError.ParseAddr(input, "zone must be a non-empty string", "") if zone == ""
+  }
+  ip: [Byte] = [0; 16]
+  ellipsis = -1 # position of ellipsis in ip
+  # Might have leading ellipsis
+  if s.size >= 2 && s[0] == 58 && s[1] == 58 {
+    ellipsis = 0
+    s = s[2...s.size]
+    # Might be only ellipsis
+    return ipv6_unspecified.with_zone(zone) if s.size == 0
+  }
+  # Loop, parsing hex numbers followed by colon.
+  i = 0
+  while i < 16 {
+    # Hex number. Similar to parseIPv4, inlining the hex number parsing
+    # yields a significant performance increase.
+    off = 0
+    acc = 0
+    while off < s.size {
+      c = s[off]
+      if c >= 48 && c <= 57 {
+        acc = (acc << 4) + c.to_i - 48
+      } else if c >= 97 && c <= 102 {
+        acc = (acc << 4) + c.to_i - 97 + 10
+      } else if c >= 65 && c <= 70 {
+        acc = (acc << 4) + c.to_i - 65 + 10
+      } else {
+        break
+      }
+      fail NetipError.ParseAddr(input, "each group must have 4 or less digits", s) if off > 3
+      fail NetipError.ParseAddr(input, "IPv6 field has value >=2^16", s) if acc > 0xffff
+      off += 1
+    }
+    fail NetipError.ParseAddr(input, "each colon-separated field must have at least one digit", s) if off == 0
+    # If followed by dot, might be in trailing IPv4.
+    if off < s.size && s[off] == 46 {
+      if ellipsis < 0 && i != 12 {
+        # Not the right place.
+        fail NetipError.ParseAddr(input, "embedded IPv4 address must replace the final 2 fields of the address", s)
+      }
+      if i + 4 > 16 {
+        # Not enough room.
+        fail NetipError.ParseAddr(input, "too many hex fields to fit an embedded IPv4 at the end of the address", s)
+      }
+      end = input.size
+      end -= zone.size + 1 if zone.size > 0
+      # (the arguments are computed first: under `~` their arithmetic
+      # would be fallible too)
+      start = end - s.size
+      field = ip[i...i + 4]
+      ~parse_ipv4_fields(input, start, end, field)
+      s = ""
+      i += 4
+      break
+    }
+    # Save this 16-bit chunk.
+    ip[i] = (acc >> 8).as_u8
+    ip[i + 1] = acc.as_u8
+    i += 2
+    # Stop at end of string.
+    s = s[off...s.size]
+    break if s.size == 0
+    # Otherwise must be followed by colon and more.
+    fail NetipError.ParseAddr(input, "unexpected character, want colon", s) if s[0] != 58
+    fail NetipError.ParseAddr(input, "colon must be followed by more characters", s) if s.size == 1
+    s = s[1...s.size]
+    # Look for ellipsis.
+    if s[0] == 58 {
+      # already have one
+      fail NetipError.ParseAddr(input, "multiple :: in address", s) if ellipsis >= 0
+      ellipsis = i
+      s = s[1...s.size]
+      # can be at end
+      break if s.size == 0
+    }
+  }
+  # Must have used entire string.
+  fail NetipError.ParseAddr(input, "trailing garbage after address", s) if s.size != 0
+  # If didn't parse enough, expand ellipsis.
+  if i < 16 {
+    fail NetipError.ParseAddr(input, "address string too short", "") if ellipsis < 0
+    n = 16 - i
+    j = i - 1
+    while j >= ellipsis {
+      ip[j + n] = ip[j]
+      j -= 1
+    }
+    for k in ellipsis...ellipsis + n {
+      ip[k] = 0
+    }
+  } else if ellipsis >= 0 {
+    # Ellipsis must represent at least one 0 group.
+    fail NetipError.ParseAddr(input, "the :: must expand to at least one field of zeros", "")
+  }
+  a: [Byte; 16] = [0; 16]
+  for k in 0...16 {
+    a[k] = ip[k]
+  }
+  addr_from16(a).with_zone(zone)
+}
+
+# Go's (*Addr).UnmarshalText: "" is the zero Addr, anything else parse_addr.
+pub def unmarshal_addr_text(text: [Byte]) -> ~Addr<NetipError> {
+  return Addr.new if text.size == 0
+  ~parse_addr(Str.from_bytes(text))
+}
+
+# Go's (*Addr).UnmarshalBinary: 0, 4, 16 or 16+zone bytes.
+pub def unmarshal_addr_binary(b: [Byte]) -> ~Addr<NetipError> {
+  n = b.size
+  return Addr.new if n == 0
+  return addr_from_slice(b) || Addr.new if n == 4 || n == 16
+  if n > 16 {
+    a = addr_from_slice(b[0...16]) || Addr.new
+    return a.with_zone(Str.from_bytes(b[16...n]))
+  }
+  fail NetipError.Invalid("unexpected slice size")
+}
+
+# ----------------------------------------------------------------- AddrPort
+
+# An IP address and a port number.
+pub struct AddrPort {
+  ip: Addr
+  pt: U16
+
+  pub def addr -> Addr { ip }
+  pub def port -> U16 { pt }
+
+  # Whether the address is valid (any port is).
+  pub def valid? -> Bool { ip.valid? }
+
+  # By address, then port.
+  pub def compare(p2: AddrPort) -> Int {
+    c = ip.compare(p2.ip)
+    return c if c != 0
+    return -1 if pt < p2.pt
+    return 1 if pt > p2.pt
+    0
+  }
+
+  def <=>(p2: AddrPort) -> Int { compare(p2) }
+
+  # "1.2.3.4:80", "[::1]:80"; "invalid AddrPort" when the address isn't valid.
+  pub def to_s -> Str {
+    return "invalid AddrPort" if ip.z == Z0
+    Str.from_bytes(append_to([]))
+  }
+
+  pub def string -> Str { to_s }
+
+  pub def append_to(b: [Byte]) -> [Byte] {
+    return b if ip.z == Z0
+    out = b
+    if ip.z == Z4 {
+      out = ip.append_to4(out)
+    } else {
+      out << 91
+      out = ip.is4in6? ? ip.append_to4in6(out) : ip.append_to6(out)
+      out << 93
+    }
+    out << 58
+    append_str(out, pt.to_s)
+  }
+
+  pub def append_text(b: [Byte]) -> [Byte] { append_to(b) }
+
+  pub def marshal_text -> [Byte] { append_to([]) }
+
+  # The address's binary form, then the port (little-endian, as Go).
+  pub def append_binary(b: [Byte]) -> [Byte] {
+    out = ip.append_binary(b)
+    out << pt.as_u8
+    out << (pt >> 8).as_u8
+    out
+  }
+
+  pub def marshal_binary -> [Byte] { append_binary([]) }
+}
+
+pub def addr_port_from(ip: Addr, port: U16) -> AddrPort { AddrPort.new(ip: ip, pt: port) }
+
+# Splits "ip:port" (or "[ip]:port"); the Bool says the brackets were there.
+def split_addr_port(s: Str) -> ~(Str, Str, Bool)<NetipError> {
+  i = s.size - 1
+  while i >= 0 && s[i] != 58 {
+    i -= 1
+  }
+  fail NetipError.Invalid("not an ip:port") if i == -1
+  ip = s[0...i]
+  port = s[i + 1...s.size]
+  fail NetipError.Invalid("no IP") if ip.size == 0
+  fail NetipError.Invalid("no port") if port.size == 0
+  v6 = false
+  if ip[0] == 91 {
+    fail NetipError.Invalid("missing ]") if ip.size < 2 || ip[ip.size - 1] != 93
+    ip = ip[1...ip.size - 1]
+    v6 = true
+  }
+  (ip, port, v6)
+}
+
+# Parses "1.2.3.4:80" or "[::1]:80". IPv6 addresses need the brackets and
+# IPv4 ones may not have them.
+pub def parse_addr_port(s: Str) -> ~AddrPort<NetipError> {
+  ip_s, port, v6 = ~split_addr_port(s)
+  pr = strconv.parse_uint(port, 10, 16)
+  fail NetipError.Invalid("invalid port #{strconv.quote(port)} parsing #{strconv.quote(s)}") if pr.err?
+  ip = ~parse_addr(ip_s)
+  if v6 && ip.is4? {
+    fail NetipError.Invalid("invalid ip:port #{strconv.quote(s)}, square brackets can only be used with IPv6 addresses")
+  } else if !v6 && ip.is6? {
+    fail NetipError.Invalid("invalid ip:port #{strconv.quote(s)}, IPv6 addresses must be surrounded by square brackets")
+  }
+  AddrPort.new(ip: ip, pt: pr.unwrap.as_u16)
+}
+
+pub def must_parse_addr_port(s: Str) -> AddrPort {
+  r = parse_addr_port(s)
+  panic(r.err.unwrap.message) if r.err?
+  r.unwrap
+}
+
+# Go's (*AddrPort).UnmarshalText.
+pub def unmarshal_addr_port_text(text: [Byte]) -> ~AddrPort<NetipError> {
+  return AddrPort.new if text.size == 0
+  ~parse_addr_port(Str.from_bytes(text))
+}
+
+# Go's (*AddrPort).UnmarshalBinary.
+pub def unmarshal_addr_port_binary(b: [Byte]) -> ~AddrPort<NetipError> {
+  fail NetipError.Invalid("unexpected slice size") if b.size < 2
+  head = b[0...b.size - 2]
+  a = ~unmarshal_addr_binary(head)
+  port = b[b.size - 2].to_u16 | (b[b.size - 1].to_u16 << 8)
+  addr_port_from(a, port)
+}
+
+# ------------------------------------------------------------------- Prefix
+
+# An IP prefix (CIDR block): an address and a number of leading bits. The
+# address keeps its host bits (see masked); the zone is always dropped.
+pub struct Prefix {
+  ip: Addr
+  # bits + 1, so that the zero Prefix (0) is invalid.
+  bits1: Int
+
+  pub def addr -> Addr { ip }
+
+  # The prefix length; -1 when invalid.
+  pub def bits -> Int { bits1 - 1 }
+
+  pub def valid? -> Bool { bits1 > 0 }
+
+  def zero? -> Bool { self == Prefix.new }
+
+  # Whether the prefix holds exactly one address (/32 or /128).
+  pub def single_ip? -> Bool { valid? && bits == ip.bit_len }
+
+  # By masked address, then length, then the unmasked address.
+  pub def compare(p2: Prefix) -> Int {
+    c = masked.ip.compare(p2.masked.ip)
+    return c if c != 0
+    return -1 if bits < p2.bits
+    return 1 if bits > p2.bits
+    ip.compare(p2.ip)
+  }
+
+  def <=>(p2: Prefix) -> Int { compare(p2) }
+
+  # The prefix with its host bits cleared; the zero Prefix when invalid.
+  pub def masked -> Prefix {
+    ip.prefix(bits).unwrap_or(Prefix.new)
+  }
+
+  # Whether the network includes ip. An IPv4 prefix never contains an IPv6
+  # address or the reverse (4in6 included), and zoned addresses are never
+  # contained.
+  pub def contains?(a: Addr) -> Bool {
+    return false if !valid? || a.has_zone?
+    f1 = ip.bit_len
+    f2 = a.bit_len
+    return false if f1 == 0 || f2 == 0 || f1 != f2
+    if a.is4? {
+      # xor the IP addresses together; mismatched bits are now ones.
+      # Shift away the number of bits we don't care about.
+      return ((a.lo ^ ip.lo) >> ((32 - bits) & 63)).as_u32 == 0
+    }
+    a.u.xor(ip.u).and(mask6(bits)).zero?
+  }
+
+  # Whether p and o share an address.
+  pub def overlaps?(o: Prefix) -> Bool {
+    return false if !valid? || !o.valid?
+    return true if self == o
+    return false if ip.is4? != o.ip.is4?
+    min_bits = bits < o.bits ? bits : o.bits
+    return true if min_bits == 0
+    # One of these Prefix calls might fail on a bad bit count, in which
+    # case they don't overlap.
+    pr = ip.prefix(min_bits)
+    or_ = o.ip.prefix(min_bits)
+    return false if pr.err? || or_.err?
+    pr.unwrap.ip == or_.unwrap.ip
+  }
+
+  # "1.2.3.0/24"; "invalid Prefix" when invalid.
+  pub def to_s -> Str {
+    return "invalid Prefix" unless valid?
+    Str.from_bytes(append_to([]))
+  }
+
+  pub def string -> Str { to_s }
+
+  # Appends the text form; nothing for the zero Prefix.
+  pub def append_to(b: [Byte]) -> [Byte] {
+    return b if zero?
+    return append_str(b, "invalid Prefix") unless valid?
+    out = b
+    if ip.z == Z4 {
+      out = ip.append_to4(out)
+    } else if ip.is4in6? {
+      out = append_str(out, "::ffff:")
+      out = ip.unmap.append_to4(out)
+    } else {
+      out = ip.append_to6(out)
+    }
+    out << 47
+    append_decimal(out, bits.as_u8)
+  }
+
+  pub def append_text(b: [Byte]) -> [Byte] { append_to(b) }
+
+  pub def marshal_text -> [Byte] { append_to([]) }
+
+  # The address (zone dropped) in binary, then the length byte.
+  pub def append_binary(b: [Byte]) -> [Byte] {
+    out = ip.without_zone.append_binary(b)
+    out << bits.as_u8
+    out
+  }
+
+  pub def marshal_binary -> [Byte] { append_binary([]) }
+}
+
+# The prefix of ip with `bits` leading bits; the host bits are kept (see
+# Prefix.masked) and the zone dropped. Out-of-range bits give an invalid
+# Prefix.
+pub def prefix_from(ip: Addr, bits: Int) -> Prefix {
+  b1 = 0
+  b1 = bits + 1 if !ip.zero? && bits >= 0 && bits <= ip.bit_len
+  Prefix.new(ip: ip.without_zone, bits1: b1)
+}
+
+# Parses "192.168.1.0/24" or "2001:db8::/32". The address keeps its host
+# bits; zones and leading zeros in the length are rejected.
+pub def parse_prefix(s: Str) -> ~Prefix<NetipError> {
+  i = s.size - 1
+  while i >= 0 && s[i] != 47 {
+    i -= 1
+  }
+  fail NetipError.ParsePrefix(s, "no '/'") if i < 0
+  ar = parse_addr(s[0...i])
+  fail NetipError.ParsePrefix(s, ar.err.unwrap.message) if ar.err?
+  ip = ar.unwrap
+  # IPv6 zones are not allowed: https://go.dev/issue/51899
+  fail NetipError.ParsePrefix(s, "IPv6 zones cannot be present in a prefix") if ip.is6? && ip.zn != ""
+  bits_str = s[i + 1...s.size]
+  # strconv.Atoi accepts a leading sign and leading zeros, but we don't want that.
+  if bits_str.size > 1 && (bits_str[0] < 49 || bits_str[0] > 57) {
+    fail NetipError.ParsePrefix(s, "bad bits after slash: #{strconv.quote(bits_str)}")
+  }
+  br = strconv.atoi(bits_str)
+  fail NetipError.ParsePrefix(s, "bad bits after slash: #{strconv.quote(bits_str)}") if br.err?
+  bits = br.unwrap
+  max_bits = ip.is6? ? 128 : 32
+  fail NetipError.ParsePrefix(s, "prefix length out of range") if bits < 0 || bits > max_bits
+  prefix_from(ip, bits)
+}
+
+pub def must_parse_prefix(s: Str) -> Prefix {
+  r = parse_prefix(s)
+  panic(r.err.unwrap.message) if r.err?
+  r.unwrap
+}
+
+# Go's (*Prefix).UnmarshalText.
+pub def unmarshal_prefix_text(text: [Byte]) -> ~Prefix<NetipError> {
+  return Prefix.new if text.size == 0
+  ~parse_prefix(Str.from_bytes(text))
+}
+
+# Go's (*Prefix).UnmarshalBinary.
+pub def unmarshal_prefix_binary(b: [Byte]) -> ~Prefix<NetipError> {
+  fail NetipError.Invalid("unexpected slice size") if b.size < 1
+  head = b[0...b.size - 1]
+  a = ~unmarshal_addr_binary(head)
+  prefix_from(a, b[b.size - 1].to_i)
+}

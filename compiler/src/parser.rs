@@ -457,6 +457,8 @@ impl<'a> Parser<'a> {
         let name_span = self.span();
         let name = match self.bump().tok {
             Tok::Ident(n) => n,
+            // A keyword names a method (Ruby's `def next`): `e.next` can't be read as one.
+            Tok::Kw(k) if owner.is_some() => kw_name(k),
             // Operators, inside a struct: `def +(o)`, `def ==(o)`, `def <=>(o)`, `def [](i)`.
             Tok::Op(op @ ("+" | "-" | "*" | "/" | "%" | "==" | "<=>")) if owner.is_some() => op.to_string(),
             Tok::Op("[") if owner.is_some() && self.eat_op("]") => "[]".to_string(),
@@ -829,7 +831,17 @@ impl<'a> Parser<'a> {
                 }
                 t => return Err(Diag::new(sp, format!("expected a type after `@`, found {}", describe(&t)))),
             };
-            let base = TypeExpr::Handle(std::mem::take(&mut name), sp.to(self.prev_span()));
+            // `@Node[T]`: a handle to a generic type's instance.
+            let mut args = vec![];
+            if self.is_op("[") && !self.space_before() {
+                self.bump();
+                args.push(self.type_expr()?);
+                while self.eat_op(",") {
+                    args.push(self.type_expr()?);
+                }
+                self.expect_op("]")?;
+            }
+            let base = TypeExpr::Handle(std::mem::take(&mut name), args, sp.to(self.prev_span()));
             if self.is_op("?") && !self.space_before() {
                 self.bump();
                 return Ok(TypeExpr::Opt(Box::new(base), sp.to(self.prev_span())));
@@ -1515,6 +1527,7 @@ impl<'a> Parser<'a> {
         let name_span = self.span();
         let name = match self.bump().tok {
             Tok::Ident(n) => n,
+            Tok::Kw(k) => kw_name(k),
             t => return Err(Diag::new(name_span, format!("expected a method name after `.~`, found {}", describe(&t)))),
         };
         let (args, block_sym) = if self.is_op("(") && !self.space_before() { self.call_args()? } else { (vec![], None) };
@@ -1532,6 +1545,7 @@ impl<'a> Parser<'a> {
         let name_span = self.span();
         let name = match self.bump().tok {
             Tok::Ident(n) | Tok::Const(n) => n,
+            Tok::Kw(k) => kw_name(k),
             t => return Err(Diag::new(name_span, format!("expected a method name after `.`, found {}", describe(&t)))),
         };
         let (args, block_sym) = if self.is_op("(") && !self.space_before() { self.call_args()? } else { (vec![], None) };
@@ -1558,6 +1572,7 @@ impl<'a> Parser<'a> {
                 let name_span = self.span();
                 let name = match self.bump().tok {
                     Tok::Ident(n) => n,
+                    Tok::Kw(k) => kw_name(k),
                     t => return Err(Diag::new(name_span, format!("expected a method name after `?.`, found {}", describe(&t)))),
                 };
                 let (args, block_sym) = if self.is_op("(") && !self.space_before() { self.call_args()? } else { (vec![], None) };
@@ -1574,6 +1589,7 @@ impl<'a> Parser<'a> {
                 let name = match self.bump().tok {
                     Tok::Ident(n) => n,
                     Tok::Const(n) => n,
+                    Tok::Kw(k) => kw_name(k),
                     t => return Err(Diag::new(name_span, format!("expected a method name after `.`, found {}", describe(&t)))),
                 };
                 // `geom.Stack[Int].new`: a package's generic type applied.
@@ -2058,6 +2074,11 @@ pub fn is_place(e: &Expr) -> bool {
         ExprKind::Call { recv: Some(r), args, block: None, block_sym: None, .. } if args.is_empty() => is_place(r),
         _ => false,
     }
+}
+
+/// A keyword's spelling, for keywords used as method names (`e.next`).
+fn kw_name(k: Kw) -> String {
+    format!("{k:?}").to_lowercase()
 }
 
 pub fn describe(t: &Tok) -> String {

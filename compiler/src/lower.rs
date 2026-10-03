@@ -2863,7 +2863,12 @@ impl<'a> Lw<'a> {
                 }
                 let (mut body, v) = w.sub_val(|w| w.inline_block(b, &pvs, &[], None));
                 let ret = w.lty(rt);
-                if ok_t.is_some() {
+                // A body whose last expression never finishes (`panic(..)`
+                // after early returns) has no value to return: like a def's,
+                // it ends without a return.
+                let never = matches!(v, LE::Unit) && !matches!(ok_t, Some(LTy::Unit)) && ret != LTy::Unit && !matches!(&**rt, Ty::Result(t) if **t == Ty::Unit);
+                if never {
+                } else if ok_t.is_some() {
                     let v = if ok_t == Some(LTy::Unit) {
                         if !matches!(v, LE::Unit | LE::Var(_) | LE::I(_) | LE::B(_)) {
                             body.push(LS::Eval(v));
@@ -2999,7 +3004,7 @@ impl<'a> Lw<'a> {
                 let LTy::Arr(slot) = &hs[0] else { unreachable!() };
                 LE::ArrLit((**h).clone(), vec![LE::Tup((**h).clone(), vec![LE::ArrWithCap((**slot).clone(), Box::new(LE::I(0))), LE::I(0), LE::RegionProgram, LE::I(0), LE::ArrWithCap(LTy::I64, Box::new(LE::I(0))), LE::I(0)])])
             }
-            PoolAdd | PoolGet | PoolSet | PoolRemove | PoolSize => {
+            PoolAdd | PoolGet | PoolLookup | PoolSet | PoolRemove | PoolSize => {
                 let r = recv.unwrap();
                 let lt = self.lty(&r.ty);
                 let pv = self.expr(r);
@@ -3015,6 +3020,26 @@ impl<'a> Lw<'a> {
                 let loc = self.loc(sp);
                 match m {
                     PoolSize => self.int_out(hdr(1)),
+                    PoolLookup => {
+                        // No panics: a handle past the end or of a removed
+                        // slot gives none.
+                        let h = self.expr(&args[0]);
+                        let hv = self.bind(h, LTy::I64);
+                        let idx = self.bind(handle_index(hv.clone()), LTy::I64);
+                        let rt = self.lty(&e.ty);
+                        let res = self.tmp(rt.clone());
+                        self.emit(LS::Set(res, zero_le(&rt)));
+                        let inb = LE::Cmp(Op::Lt, Box::new(idx.clone()), Box::new(LE::Len(Box::new(hdr(0)))), LTy::I64);
+                        let body = self.sub(|lw| {
+                            let slot = lw.tmp((**slot_t).clone());
+                            lw.emit(LS::Set(slot, LE::Index { arr: Box::new(hdr(0)), idx: Box::new(idx.clone()), check: None }));
+                            let live = LE::Cmp(Op::Eq, Box::new(LE::Field(Box::new(LE::Var(slot)), 0)), Box::new(handle_gen(hv.clone())), LTy::I64);
+                            let live = lw.bind(live, LTy::Bool);
+                            lw.emit(LS::If(live.clone(), vec![LS::Set(res, LE::Tup(rt.clone(), vec![live, LE::Field(Box::new(LE::Var(slot)), 1)]))], vec![]));
+                        });
+                        self.emit(LS::If(inb, body, vec![]));
+                        LE::Var(res)
+                    }
                     PoolAdd => {
                         // The value first: making it may add to this pool too.
                         let v = self.arg(&args[0]);

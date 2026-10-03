@@ -1,0 +1,380 @@
+# Package list: Go's container/list, a doubly linked list (S2).
+#
+#   Go                                  alx
+#   list.New() *List                    List[T].new
+#   var l list.List                     List[T].new (the zero value is ready)
+#   l.Init() *List                      l.init!  (clears the list)
+#   l.Len() int                         l.len
+#   l.Front() / l.Back() *Element       l.front / l.back -> Element[T]?
+#   l.PushFront(v) / PushBack(v)        l.push_front!(v) / l.push_back!(v) -> Element[T]
+#   l.InsertBefore(v, mark)             l.insert_before!(v, mark) -> Element[T]?
+#   l.InsertAfter(v, mark)              l.insert_after!(v, mark) -> Element[T]?
+#   l.Remove(e) any                     l.remove!(e) -> T?
+#   l.MoveToFront(e) / MoveToBack(e)    l.move_to_front!(e) / l.move_to_back!(e)
+#   l.MoveBefore(e, mark)               l.move_before!(e, mark)
+#   l.MoveAfter(e, mark)                l.move_after!(e, mark)
+#   l.PushBackList(other)               l.push_back_list!(other)
+#   l.PushFrontList(other)              l.push_front_list!(other)
+#   e.Next() / e.Prev() *Element        e.next / e.prev -> Element[T]?
+#   e.Value                             e.value (read), e.set_value!(v) (write)
+#
+# Representation: there are no pointers in alx, so the elements live in a
+# `Pool[Node[T]]` and link to each other with `@Node[T]` handles (R3). Like
+# Go's, the list is a ring through a sentinel node (made on first use). An
+# `Element[T]` is a (list, handle) pair: a small value that can be copied
+# and compared. A `List` value's pool is shared by its copies (pools are
+# references), so every copy of a list is the same list, as a Go *List is.
+# Removing an element frees its pool slot for reuse; the pool's generation
+# check means a stale Element never reaches the slot's new occupant.
+#
+# Differences from Go:
+#   - Elements hold values of one type T (`List[Int]`), not `any`.
+#   - `remove!` returns `T?`: the removed value, or none when e is not an
+#     element of l (Go returns e.Value either way). A removed element's
+#     value is gone: its slot is freed, so `e.value` on it panics, while
+#     `e.next` / `e.prev` give none (as in Go).
+#   - `e.value = x` is `e.set_value!(x)`; it panics on a removed element.
+#   - Element equality (`==`) is identity: the same node of the same list.
+#   - Copy a `List` before its first insertion and the copies share the
+#     pool but not the sentinel's handle; it is found again on first use,
+#     so they still behave as one list.
+
+# A list node: the sentinel holds the length in `n`; other nodes the value.
+struct Node[T] {
+  value: T
+  nxt: @Node[T]?
+  prv: @Node[T]?
+  n: Int
+}
+
+# An element of a linked list.
+pub struct Element[T] {
+  # The list the element belongs to (or did), and its node there. A zero
+  # Element (`Element[T].new`) is in no list.
+  list: List[T]
+  h: @Node[T]?
+
+  # The next list element, or none.
+  pub def next -> Element[T]? {
+    if n = list.live_node(h) {
+      p = n.nxt.unwrap
+      return none if p == list.root_handle.unwrap
+      return Element[T].new(list: list, h: p)
+    }
+    none
+  }
+
+  # The previous list element, or none.
+  pub def prev -> Element[T]? {
+    if n = list.live_node(h) {
+      p = n.prv.unwrap
+      return none if p == list.root_handle.unwrap
+      return Element[T].new(list: list, h: p)
+    }
+    none
+  }
+
+  # The value stored with this element. Panics if the element was removed.
+  pub def value -> T {
+    if n = list.live_node(h) {
+      return n.value
+    }
+    panic("list: value of an element that is not in a list")
+  }
+
+  # Replaces the value stored with this element (Go's `e.Value = v`).
+  # Panics if the element was removed.
+  pub def set_value!(v: T) {
+    if hh = h {
+      if n = list.nodes.get(hh) {
+        ps = list.nodes
+        ps[hh] = Node[T].new(value: v, nxt: n.nxt, prv: n.prv, n: n.n)
+        return
+      }
+    }
+    panic("list: set_value! on an element that is not in a list")
+  }
+
+  # Identity: the same node of the same list.
+  pub def ==(o: Element[T]) -> Bool {
+    if a = h {
+      if b = o.h {
+        return a == b && list.same?(o.list)
+      }
+      return false
+    }
+    o.h.none?
+  }
+}
+
+# A doubly linked list. The zero value (`List[T].new`) is an empty list
+# ready to use.
+pub struct List[T] {
+  nodes: Pool[Node[T]]
+  # The sentinel's handle, once made (also findable as the pool's first
+  # node: it is added first and never removed).
+  root: @Node[T]?
+
+  # The sentinel, if the list has been used.
+  def root_handle -> @Node[T]? {
+    return root if root.present?
+    for h, _ in nodes {
+      return h
+    }
+    none
+  }
+
+  # Makes the sentinel if there is none yet.
+  def lazy_init! -> @Node[T] {
+    if r = root_handle {
+      self.root = r
+      return r
+    }
+    r = nodes.add(Node[T].new)
+    ps = nodes
+    rn = ps[r]
+    ps[r] = Node[T].new(value: rn.value, nxt: r, prv: r, n: 0)
+    self.root = r
+    r
+  }
+
+  # The node behind h, if h is a live element of this pool (not the sentinel).
+  def live_node(h: @Node[T]?) -> Node[T]? {
+    if hh = h {
+      if r = root_handle {
+        return none if hh == r
+      }
+      return nodes.get(hh)
+    }
+    none
+  }
+
+  # Whether o is this very list (they share one pool). Pools have no
+  # identity to compare, so this changes our sentinel's count for a moment
+  # and looks for the change through o.
+  def same?(o: List[T]) -> Bool {
+    r = root_handle
+    s = o.root_handle
+    if a = r {
+      if b = s {
+        return false if a != b
+        ps = nodes
+        mine = ps[a]
+        return false if o.nodes[b].n != mine.n
+        ps[a] = Node[T].new(value: mine.value, nxt: mine.nxt, prv: mine.prv, n: mine.n + 1)
+        seen = o.nodes[b].n == mine.n + 1
+        ps[a] = mine
+        return seen
+      }
+    }
+    false
+  }
+
+  # Whether e is an element of this list (Go's `e.list == l`).
+  def owns?(e: Element[T]) -> Bool {
+    live_node(e.h).present? && same?(e.list)
+  }
+
+  def nxt_of(h: @Node[T]) -> @Node[T] { nodes[h].nxt.unwrap }
+
+  def prv_of(h: @Node[T]) -> @Node[T] { nodes[h].prv.unwrap }
+
+  def set_nxt(h: @Node[T], to: @Node[T]) {
+    ps = nodes
+    n = ps[h]
+    ps[h] = Node[T].new(value: n.value, nxt: to, prv: n.prv, n: n.n)
+  }
+
+  def set_prv(h: @Node[T], to: @Node[T]) {
+    ps = nodes
+    n = ps[h]
+    ps[h] = Node[T].new(value: n.value, nxt: n.nxt, prv: to, n: n.n)
+  }
+
+  def add_len(r: @Node[T], d: Int) {
+    ps = nodes
+    n = ps[r]
+    ps[r] = Node[T].new(value: n.value, nxt: n.nxt, prv: n.prv, n: n.n + d)
+  }
+
+  def element(h: @Node[T]) -> Element[T] {
+    Element[T].new(list: self, h: h)
+  }
+
+  # Inserts a new node holding v after `at`; returns its handle.
+  def insert_value!(v: T, at: @Node[T]) -> @Node[T] {
+    r = lazy_init!
+    nx = nxt_of(at)
+    e = nodes.add(Node[T].new(value: v, nxt: nx, prv: at))
+    set_nxt(at, e)
+    set_prv(nx, e)
+    add_len(r, 1)
+    e
+  }
+
+  # Unlinks e and frees its slot; returns its value.
+  def unlink!(e: @Node[T]) -> T {
+    r = lazy_init!
+    n = nodes[e]
+    set_nxt(n.prv.unwrap, n.nxt.unwrap)
+    set_prv(n.nxt.unwrap, n.prv.unwrap)
+    add_len(r, -1)
+    nodes.remove(e)
+    n.value
+  }
+
+  # Moves e to after `at`.
+  def move!(e: @Node[T], at: @Node[T]) {
+    return if e == at
+    n = nodes[e]
+    set_nxt(n.prv.unwrap, n.nxt.unwrap)
+    set_prv(n.nxt.unwrap, n.prv.unwrap)
+    nx = nxt_of(at)
+    set_prv(e, at)
+    set_nxt(e, nx)
+    set_nxt(at, e)
+    set_prv(nx, e)
+  }
+
+  # Initializes or clears the list. Every element is removed (and its
+  # Element values go stale).
+  pub def init! {
+    r = lazy_init!
+    h = nxt_of(r)
+    while h != r {
+      nx = nxt_of(h)
+      nodes.remove(h)
+      h = nx
+    }
+    ps = nodes
+    rn = ps[r]
+    ps[r] = Node[T].new(value: rn.value, nxt: r, prv: r, n: 0)
+  }
+
+  # The number of elements of the list. O(1).
+  pub def len -> Int {
+    if r = root_handle {
+      return nodes[r].n
+    }
+    0
+  }
+
+  # The first element of the list, or none if the list is empty.
+  pub def front -> Element[T]? {
+    return none if len == 0
+    element(nxt_of(root_handle.unwrap))
+  }
+
+  # The last element of the list, or none if the list is empty.
+  pub def back -> Element[T]? {
+    return none if len == 0
+    element(prv_of(root_handle.unwrap))
+  }
+
+  # Removes e from l if e is an element of l, and returns its value; none
+  # (and l unchanged) if it isn't.
+  pub def remove!(e: Element[T]) -> T? {
+    return none if !owns?(e)
+    unlink!(e.h.unwrap)
+  }
+
+  # Inserts a new element with value v at the front of the list and returns it.
+  pub def push_front!(v: T) -> Element[T] {
+    r = lazy_init!
+    element(insert_value!(v, r))
+  }
+
+  # Inserts a new element with value v at the back of the list and returns it.
+  pub def push_back!(v: T) -> Element[T] {
+    r = lazy_init!
+    element(insert_value!(v, prv_of(r)))
+  }
+
+  # Inserts a new element with value v immediately before mark and returns
+  # it; none (and l unchanged) if mark is not an element of l.
+  pub def insert_before!(v: T, mark: Element[T]) -> Element[T]? {
+    return none if !owns?(mark)
+    element(insert_value!(v, prv_of(mark.h.unwrap)))
+  }
+
+  # Inserts a new element with value v immediately after mark and returns
+  # it; none (and l unchanged) if mark is not an element of l.
+  pub def insert_after!(v: T, mark: Element[T]) -> Element[T]? {
+    return none if !owns?(mark)
+    element(insert_value!(v, mark.h.unwrap))
+  }
+
+  # Moves e to the front of the list. If e is not an element of l, the list
+  # is not modified.
+  pub def move_to_front!(e: Element[T]) {
+    return if !owns?(e)
+    r = lazy_init!
+    h = e.h.unwrap
+    return if nxt_of(r) == h
+    move!(h, r)
+  }
+
+  # Moves e to the back of the list. If e is not an element of l, the list
+  # is not modified.
+  pub def move_to_back!(e: Element[T]) {
+    return if !owns?(e)
+    r = lazy_init!
+    h = e.h.unwrap
+    return if prv_of(r) == h
+    move!(h, prv_of(r))
+  }
+
+  # Moves e to its new position before mark. If e or mark is not an element
+  # of l, or e == mark, the list is not modified.
+  pub def move_before!(e: Element[T], mark: Element[T]) {
+    return if !owns?(e) || !owns?(mark) || e.h.unwrap == mark.h.unwrap
+    move!(e.h.unwrap, prv_of(mark.h.unwrap))
+  }
+
+  # Moves e to its new position after mark. If e or mark is not an element
+  # of l, or e == mark, the list is not modified.
+  pub def move_after!(e: Element[T], mark: Element[T]) {
+    return if !owns?(e) || !owns?(mark) || e.h.unwrap == mark.h.unwrap
+    move!(e.h.unwrap, mark.h.unwrap)
+  }
+
+  # Inserts a copy of another list at the back of l. l and other may be
+  # the same list.
+  pub def push_back_list!(other: List[T]) {
+    r = lazy_init!
+    i = other.len
+    e = other.front
+    while i > 0 {
+      x = e.unwrap
+      insert_value!(x.value, prv_of(r))
+      e = x.next
+      i -= 1
+    }
+  }
+
+  # Inserts a copy of another list at the front of l. l and other may be
+  # the same list.
+  pub def push_front_list!(other: List[T]) {
+    r = lazy_init!
+    i = other.len
+    e = other.back
+    while i > 0 {
+      x = e.unwrap
+      insert_value!(x.value, r)
+      e = x.prev
+      i -= 1
+    }
+  }
+
+  # The values from front to back.
+  pub def values -> [T] {
+    out: [T] = []
+    e = front
+    while e.present? {
+      x = e.unwrap
+      out << x.value
+      e = x.next
+    }
+    out
+  }
+}

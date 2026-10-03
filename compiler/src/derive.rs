@@ -166,7 +166,8 @@ pub fn type_src(t: &TypeExpr) -> String {
         TypeExpr::Fixed(e, _, _) => format!("[{}; _]", type_src(e)),
         TypeExpr::App(n, args, _) => format!("{n}[{}]", args.iter().map(type_src).collect::<Vec<_>>().join(", ")),
         TypeExpr::Result(e, _, _) => format!("~{}", type_src(e)),
-        TypeExpr::Handle(n, _) => format!("@{n}"),
+        TypeExpr::Handle(n, args, _) if args.is_empty() => format!("@{n}"),
+        TypeExpr::Handle(n, args, _) => format!("@{n}[{}]", args.iter().map(type_src).collect::<Vec<_>>().join(", ")),
         TypeExpr::Fn(ps, r, _) => format!("({}) -> {}", ps.iter().map(type_src).collect::<Vec<_>>().join(", "), type_src(r)),
         TypeExpr::Tuple(ts, _) => format!("({})", ts.iter().map(type_src).collect::<Vec<_>>().join(", ")),
     }

@@ -1,0 +1,415 @@
+#![overflow(wrap)]
+# Package bits: Go's math/bits, bit counting and manipulation for the
+# unsigned integer types (S2).
+#
+#   Go                                  alx
+#   bits.UintSize                       UINT_SIZE (64)
+#   LeadingZeros{,8,16,32,64}(x) int    leading_zeros{,8,16,32,64}(x) -> Int
+#   TrailingZeros{,8,16,32,64}(x) int   trailing_zeros{,8,16,32,64}(x) -> Int
+#   OnesCount{,8,16,32,64}(x) int       ones_count{,8,16,32,64}(x) -> Int
+#   RotateLeft{,8,16,32,64}(x, k)       rotate_left{,8,16,32,64}(x, k: Int)
+#   Reverse{,8,16,32,64}(x)             reverse{,8,16,32,64}(x)
+#   ReverseBytes{,16,32,64}(x)          reverse_bytes{,16,32,64}(x)
+#   Len{,8,16,32,64}(x) int             len{,8,16,32,64}(x) -> Int
+#   Add{,32,64}(x, y, carry)            add{,32,64}(x, y, carry) -> (sum, carry_out)
+#   Sub{,32,64}(x, y, borrow)           sub{,32,64}(x, y, borrow) -> (diff, borrow_out)
+#   Mul{,32,64}(x, y)                   mul{,32,64}(x, y) -> (hi, lo)
+#   Div{,32,64}(hi, lo, y)              div{,32,64}(hi, lo, y) -> (quo, rem)
+#   Rem{,32,64}(hi, lo, y)              rem{,32,64}(hi, lo, y)
+#
+# Go's `uint` is 64 bits wide here, so the unsuffixed functions take and
+# return U64 (and are the 64-bit ones). The 8/16/32/64 variants take U8, U16,
+# U32 and U64. Go's results that are pairs are tuples (`hi, lo = mul64(x, y)`).
+#
+# Differences from Go: none in behaviour. `div*` panics with Go's messages
+# ("runtime error: integer divide by zero" when y == 0, "runtime error:
+# integer overflow" when y <= hi), and so does `rem*` for y == 0. The
+# functions are plain alx (Go's portable code), not intrinsics.
+
+# The size of Go's uint in bits: 64.
+pub UINT_SIZE = 64
+
+DIVIDE_ERROR = "runtime error: integer divide by zero"
+OVERFLOW_ERROR = "runtime error: integer overflow"
+
+# ---- leading zeros ----
+
+# The number of leading zero bits in x; 64 for x == 0.
+pub def leading_zeros(x: U64) -> Int { 64 - len64(x) }
+
+# The number of leading zero bits in x; 8 for x == 0.
+pub def leading_zeros8(x: U8) -> Int { 8 - len8(x) }
+
+# The number of leading zero bits in x; 16 for x == 0.
+pub def leading_zeros16(x: U16) -> Int { 16 - len16(x) }
+
+# The number of leading zero bits in x; 32 for x == 0.
+pub def leading_zeros32(x: U32) -> Int { 32 - len32(x) }
+
+# The number of leading zero bits in x; 64 for x == 0.
+pub def leading_zeros64(x: U64) -> Int { 64 - len64(x) }
+
+# ---- trailing zeros ----
+
+# See http://supertech.csail.mit.edu/papers/debruijn.pdf
+DE_BRUIJN32: U32 = 0x077CB531
+
+DE_BRUIJN32_TAB: [U8; 32] = [
+  0, 1, 28, 2, 29, 14, 24, 3, 30, 22, 20, 15, 25, 17, 4, 8,
+  31, 27, 13, 23, 21, 19, 16, 7, 26, 12, 18, 6, 11, 5, 10, 9,
+]
+
+DE_BRUIJN64: U64 = 0x03f79d71b4ca8b09
+
+DE_BRUIJN64_TAB: [U8; 64] = [
+  0, 1, 56, 2, 57, 49, 28, 3, 61, 58, 42, 50, 38, 29, 17, 4,
+  62, 47, 59, 36, 45, 43, 51, 22, 53, 39, 33, 30, 24, 18, 12, 5,
+  63, 55, 48, 27, 60, 41, 37, 16, 46, 35, 44, 21, 52, 32, 23, 11,
+  54, 26, 40, 15, 34, 20, 31, 10, 25, 14, 19, 9, 13, 8, 7, 6,
+]
+
+# The number of trailing zero bits in x; 64 for x == 0.
+pub def trailing_zeros(x: U64) -> Int { trailing_zeros64(x) }
+
+# The number of trailing zero bits in x; 8 for x == 0.
+pub def trailing_zeros8(x: U8) -> Int { NTZ8TAB[x.to_i64].to_i64 }
+
+# The number of trailing zero bits in x; 16 for x == 0.
+pub def trailing_zeros16(x: U16) -> Int {
+  return 16 if x == 0
+  # isolate the lowest set bit and look it up (x & -x)
+  v = x.to_u32
+  DE_BRUIJN32_TAB[(((v & (0 - v)) * DE_BRUIJN32) >> (32 - 5)).to_i64].to_i64
+}
+
+# The number of trailing zero bits in x; 32 for x == 0.
+pub def trailing_zeros32(x: U32) -> Int {
+  return 32 if x == 0
+  DE_BRUIJN32_TAB[(((x & (0 - x)) * DE_BRUIJN32) >> (32 - 5)).to_i64].to_i64
+}
+
+# The number of trailing zero bits in x; 64 for x == 0.
+pub def trailing_zeros64(x: U64) -> Int {
+  return 64 if x == 0
+  DE_BRUIJN64_TAB[(((x & (0 - x)) * DE_BRUIJN64) >> (64 - 6)).to_i64].to_i64
+}
+
+# ---- ones count ----
+
+M0: U64 = 0x5555555555555555 # 01010101 ...
+M1: U64 = 0x3333333333333333 # 00110011 ...
+M2: U64 = 0x0f0f0f0f0f0f0f0f # 00001111 ...
+M3: U64 = 0x00ff00ff00ff00ff # etc.
+M4: U64 = 0x0000ffff0000ffff
+
+# The number of one bits ("population count") in x.
+pub def ones_count(x: U64) -> Int { ones_count64(x) }
+
+# The number of one bits in x.
+pub def ones_count8(x: U8) -> Int { POP8TAB[x.to_i64].to_i64 }
+
+# The number of one bits in x.
+pub def ones_count16(x: U16) -> Int {
+  POP8TAB[(x >> 8).to_i64].to_i64 + POP8TAB[(x & 0xff).to_i64].to_i64
+}
+
+# The number of one bits in x.
+pub def ones_count32(x: U32) -> Int {
+  POP8TAB[(x >> 24).to_i64].to_i64 + POP8TAB[((x >> 16) & 0xff).to_i64].to_i64 + POP8TAB[((x >> 8) & 0xff).to_i64].to_i64 + POP8TAB[(x & 0xff).to_i64].to_i64
+}
+
+# The number of one bits in x.
+pub def ones_count64(x0: U64) -> Int {
+  # Implementation: Parallel summing of adjacent bits.
+  # See "Hacker's Delight", Chap. 5: Counting Bits.
+  x = ((x0 >> 1) & M0) + (x0 & M0)
+  x = ((x >> 2) & M1) + (x & M1)
+  x = ((x >> 4) + x) & M2
+  x += x >> 8
+  x += x >> 16
+  x += x >> 32
+  (x & 127).to_i64
+}
+
+# ---- rotate ----
+
+# x rotated left by (k mod 64) bits; rotates right for negative k.
+pub def rotate_left(x: U64, k: Int) -> U64 { rotate_left64(x, k) }
+
+# x rotated left by (k mod 8) bits; rotates right for negative k.
+pub def rotate_left8(x: U8, k: Int) -> U8 {
+  s = k & 7
+  (x << s) | (x >> (8 - s))
+}
+
+# x rotated left by (k mod 16) bits; rotates right for negative k.
+pub def rotate_left16(x: U16, k: Int) -> U16 {
+  s = k & 15
+  (x << s) | (x >> (16 - s))
+}
+
+# x rotated left by (k mod 32) bits; rotates right for negative k.
+pub def rotate_left32(x: U32, k: Int) -> U32 {
+  s = k & 31
+  (x << s) | (x >> (32 - s))
+}
+
+# x rotated left by (k mod 64) bits; rotates right for negative k.
+pub def rotate_left64(x: U64, k: Int) -> U64 {
+  s = k & 63
+  (x << s) | (x >> (64 - s))
+}
+
+# ---- reverse ----
+
+# x with its bits in reversed order.
+pub def reverse(x: U64) -> U64 { reverse64(x) }
+
+# x with its bits in reversed order.
+pub def reverse8(x: U8) -> U8 { REV8TAB[x.to_i64] }
+
+# x with its bits in reversed order.
+pub def reverse16(x: U16) -> U16 {
+  REV8TAB[(x >> 8).to_i64].to_u16 | (REV8TAB[(x & 0xff).to_i64].to_u16 << 8)
+}
+
+# x with its bits in reversed order.
+pub def reverse32(x0: U32) -> U32 {
+  m0 = M0.as_u32
+  m1 = M1.as_u32
+  m2 = M2.as_u32
+  x = ((x0 >> 1) & m0) | ((x0 & m0) << 1)
+  x = ((x >> 2) & m1) | ((x & m1) << 2)
+  x = ((x >> 4) & m2) | ((x & m2) << 4)
+  reverse_bytes32(x)
+}
+
+# x with its bits in reversed order.
+pub def reverse64(x0: U64) -> U64 {
+  x = ((x0 >> 1) & M0) | ((x0 & M0) << 1)
+  x = ((x >> 2) & M1) | ((x & M1) << 2)
+  x = ((x >> 4) & M2) | ((x & M2) << 4)
+  reverse_bytes64(x)
+}
+
+# ---- reverse bytes ----
+
+# x with its bytes in reversed order.
+pub def reverse_bytes(x: U64) -> U64 { reverse_bytes64(x) }
+
+# x with its bytes in reversed order.
+pub def reverse_bytes16(x: U16) -> U16 { (x >> 8) | (x << 8) }
+
+# x with its bytes in reversed order.
+pub def reverse_bytes32(x0: U32) -> U32 {
+  m3 = M3.as_u32
+  x = ((x0 >> 8) & m3) | ((x0 & m3) << 8)
+  (x >> 16) | (x << 16)
+}
+
+# x with its bytes in reversed order.
+pub def reverse_bytes64(x0: U64) -> U64 {
+  x = ((x0 >> 8) & M3) | ((x0 & M3) << 8)
+  x = ((x >> 16) & M4) | ((x & M4) << 16)
+  (x >> 32) | (x << 32)
+}
+
+# ---- len ----
+
+# The minimum number of bits to represent x; 0 for x == 0.
+pub def len(x: U64) -> Int { len64(x) }
+
+# The minimum number of bits to represent x; 0 for x == 0.
+pub def len8(x: U8) -> Int { LEN8TAB[x.to_i64].to_i64 }
+
+# The minimum number of bits to represent x; 0 for x == 0.
+pub def len16(x0: U16) -> Int {
+  x = x0
+  n = 0
+  if x >= 1 << 8 {
+    x >>= 8
+    n = 8
+  }
+  n + LEN8TAB[x.to_i64].to_i64
+}
+
+# The minimum number of bits to represent x; 0 for x == 0.
+pub def len32(x0: U32) -> Int {
+  x = x0
+  n = 0
+  if x >= 1 << 16 {
+    x >>= 16
+    n = 16
+  }
+  if x >= 1 << 8 {
+    x >>= 8
+    n += 8
+  }
+  n + LEN8TAB[x.to_i64].to_i64
+}
+
+# The minimum number of bits to represent x; 0 for x == 0.
+pub def len64(x0: U64) -> Int {
+  x = x0
+  n = 0
+  if x >= 1 << 32 {
+    x >>= 32
+    n = 32
+  }
+  if x >= 1 << 16 {
+    x >>= 16
+    n += 16
+  }
+  if x >= 1 << 8 {
+    x >>= 8
+    n += 8
+  }
+  n + LEN8TAB[x.to_i64].to_i64
+}
+
+# ---- add with carry ----
+
+# The sum with carry of x, y and carry: (sum, carry_out). carry must be 0 or
+# 1 (otherwise the result is undefined); carry_out is 0 or 1.
+pub def add(x: U64, y: U64, carry: U64) -> (U64, U64) { add64(x, y, carry) }
+
+# The sum with carry of x, y and carry: (sum, carry_out).
+pub def add32(x: U32, y: U32, carry: U32) -> (U32, U32) {
+  sum64 = x.to_u64 + y.to_u64 + carry.to_u64
+  (sum64.as_u32, (sum64 >> 32).as_u32)
+}
+
+# The sum with carry of x, y and carry: (sum, carry_out).
+pub def add64(x: U64, y: U64, carry: U64) -> (U64, U64) {
+  sum = x + y + carry
+  # The sum will overflow if both top bits are set (x & y) or if one of them
+  # is (x | y), and a carry from the lower place happened. If such a carry
+  # happens, the top bit will be 1 + 0 + 1 = 0 (&^ sum).
+  (sum, ((x & y) | ((x | y) &^ sum)) >> 63)
+}
+
+# ---- subtract with borrow ----
+
+# The difference of x, y and borrow: (diff, borrow_out). borrow must be 0 or
+# 1 (otherwise the result is undefined); borrow_out is 0 or 1.
+pub def sub(x: U64, y: U64, borrow: U64) -> (U64, U64) { sub64(x, y, borrow) }
+
+# The difference of x, y and borrow: (diff, borrow_out).
+pub def sub32(x: U32, y: U32, borrow: U32) -> (U32, U32) {
+  diff = x - y - borrow
+  # The difference will underflow if the top bit of x is not set and the top
+  # bit of y is set (^x & y) or if they are the same (^(x ^ y)) and a borrow
+  # from the lower place happens. If that borrow happens, the result will be
+  # 1 - 1 - 1 = 0 - 0 - 1 = 1 (& diff).
+  (diff, ((^x & y) | (^(x ^ y) & diff)) >> 31)
+}
+
+# The difference of x, y and borrow: (diff, borrow_out).
+pub def sub64(x: U64, y: U64, borrow: U64) -> (U64, U64) {
+  diff = x - y - borrow
+  (diff, ((^x & y) | (^(x ^ y) & diff)) >> 63)
+}
+
+# ---- full-width multiply ----
+
+# The 128-bit product of x and y: (hi, lo), with x * y = hi * 2^64 + lo.
+pub def mul(x: U64, y: U64) -> (U64, U64) { mul64(x, y) }
+
+# The 64-bit product of x and y: (hi, lo), with x * y = hi * 2^32 + lo.
+pub def mul32(x: U32, y: U32) -> (U32, U32) {
+  tmp = x.to_u64 * y.to_u64
+  ((tmp >> 32).as_u32, tmp.as_u32)
+}
+
+# The 128-bit product of x and y: (hi, lo), with x * y = hi * 2^64 + lo.
+pub def mul64(x: U64, y: U64) -> (U64, U64) {
+  mask32: U64 = (1 << 32) - 1
+  x0 = x & mask32
+  x1 = x >> 32
+  y0 = y & mask32
+  y1 = y >> 32
+  w0 = x0 * y0
+  t = x1 * y0 + (w0 >> 32)
+  w1 = t & mask32
+  w2 = t >> 32
+  w1 += x0 * y1
+  hi = x1 * y1 + w2 + (w1 >> 32)
+  (hi, x * y)
+}
+
+# ---- full-width divide ----
+
+# The quotient and remainder of (hi, lo) divided by y: (quo, rem), with
+# quo = (hi, lo) / y and rem = (hi, lo) % y, the dividend bits' upper half in
+# hi and lower half in lo. Panics for y == 0 (division by zero) or y <= hi
+# (quotient overflow).
+pub def div(hi: U64, lo: U64, y: U64) -> (U64, U64) { div64(hi, lo, y) }
+
+# Like div, for 32-bit halves: (quo, rem) of (hi, lo) / y.
+pub def div32(hi: U32, lo: U32, y: U32) -> (U32, U32) {
+  panic(DIVIDE_ERROR) if y == 0
+  panic(OVERFLOW_ERROR) if y <= hi
+  z = (hi.to_u64 << 32) | lo.to_u64
+  ((z / y.to_u64).as_u32, (z % y.to_u64).as_u32)
+}
+
+# Like div: (quo, rem) of (hi, lo) / y, for 64-bit halves.
+pub def div64(hi: U64, lo: U64, y0: U64) -> (U64, U64) {
+  panic(DIVIDE_ERROR) if y0 == 0
+  panic(OVERFLOW_ERROR) if y0 <= hi
+  # If high part is zero, we can directly return the results.
+  return (lo / y0, lo % y0) if hi == 0
+  s = leading_zeros64(y0)
+  y = y0 << s
+
+  two32: U64 = 1 << 32
+  mask32: U64 = two32 - 1
+  yn1 = y >> 32
+  yn0 = y & mask32
+  un32 = (hi << s) | (lo >> (64 - s))
+  un10 = lo << s
+  un1 = un10 >> 32
+  un0 = un10 & mask32
+  q1 = un32 / yn1
+  rhat = un32 - q1 * yn1
+
+  while q1 >= two32 || q1 * yn0 > two32 * rhat + un1 {
+    q1 -= 1
+    rhat += yn1
+    break if rhat >= two32
+  }
+
+  un21 = un32 * two32 + un1 - q1 * y
+  q0 = un21 / yn1
+  rhat = un21 - q0 * yn1
+
+  while q0 >= two32 || q0 * yn0 > two32 * rhat + un0 {
+    q0 -= 1
+    rhat += yn1
+    break if rhat >= two32
+  }
+
+  (q1 * two32 + q0, (un21 * two32 + un0 - q0 * y) >> s)
+}
+
+# The remainder of (hi, lo) divided by y. Unlike div, it doesn't panic on a
+# quotient overflow (only for y == 0).
+pub def rem(hi: U64, lo: U64, y: U64) -> U64 { rem64(hi, lo, y) }
+
+# The remainder of (hi, lo) divided by y, for 32-bit halves.
+pub def rem32(hi: U32, lo: U32, y: U32) -> U32 {
+  panic(DIVIDE_ERROR) if y == 0
+  (((hi.to_u64 << 32) | lo.to_u64) % y.to_u64).as_u32
+}
+
+# The remainder of (hi, lo) divided by y, for 64-bit halves.
+pub def rem64(hi: U64, lo: U64, y: U64) -> U64 {
+  panic(DIVIDE_ERROR) if y == 0
+  # We scale down hi so that hi < y, then use div64 to compute the rem with
+  # the guarantee that it won't panic on quotient overflow. Given that
+  #   hi ≡ hi%y    (mod y)
+  # we have
+  #   hi<<64 + lo ≡ (hi%y)<<64 + lo    (mod y)
+  _, r = div64(hi % y, lo, y)
+  r
+}

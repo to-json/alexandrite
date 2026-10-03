@@ -1,0 +1,273 @@
+# Package ring: Go's container/ring, circular lists (S2).
+#
+#   Go                              alx
+#   ring.New(n) *Ring               ring.new(n, v) -> Ring[T]?  (n elements holding v)
+#   var r ring.Ring                 Ring[T].new  (a one-element ring)
+#   r.Next() / r.Prev() *Ring       r.next / r.prev -> Ring[T]
+#   r.Move(n) *Ring                 r.move(n) -> Ring[T]
+#   r.Len() int                     r.len
+#   r.Link(s) *Ring                 r.link!(s) -> Ring[T]   (s: Ring[T]?)
+#   r.Unlink(n) *Ring               r.unlink!(n) -> Ring[T]?
+#   r.Do(f)                         r.do { |v| ... }
+#   r.Value                         r.value (read), r.set_value!(v) (write)
+#
+# Representation: the elements live in a `Pool[Node[T]]` and point at each
+# other with `@Node[T]` handles (R3). A `Ring[T]` is a (pool, handle) pair,
+# so it can be copied, compared and passed around like Go's *Ring; the
+# copies share the pool (pools are references). A nil *Ring is `none`.
+#
+# Differences from Go:
+#   - Values have one type T, not `any`; `ring.new(n, v)` takes the value
+#     every element starts with (Go's start as nil), which also names T.
+#   - Rings made separately live in different pools. `r.link!(s)` with s from
+#     another pool moves s's whole ring into r's pool (O(len s)); Ring values
+#     that pointed into s's old ring then refer to removed slots, and using
+#     them panics. To keep such values valid, make the rings in one pool:
+#     `r.new_ring(n, v)` makes a ring in r's pool.
+#   - `Ring[T].new` is Go's zero Ring: a one-element ring holding T's zero
+#     value. Its node is made by the first `!` method (set_value!, link!,
+#     unlink!), which needs a variable; copies taken before that are separate
+#     one-element rings. (Go's Next/Prev/Move/Len initialize too; here they
+#     treat the zero ring as the one-element ring it is.)
+#   - Ring equality (`==`) is identity: the same element of the same ring.
+#     Two zero rings compare equal.
+#   - Unlinked elements are not freed (Go's GC frees them once unreachable):
+#     they stay in the pool as the returned ring. Remove them with
+#     `r.unlink!(n)` and drop the result; the slots are reused only when the
+#     whole pool goes away.
+
+# A ring element. `tag` lets two rings check whether they share a pool.
+struct Node[T] {
+  value: T
+  nxt: @Node[T]?
+  prv: @Node[T]?
+  tag: Int
+}
+
+# An element of a circular list, or ring. Rings have no beginning or end; a
+# Ring value refers to one element and can be used to reach the whole ring.
+pub struct Ring[T] {
+  pool: Pool[Node[T]]
+  # none: Go's zero Ring, a one-element ring whose node isn't made yet.
+  h: @Node[T]?
+
+  def at(h: @Node[T]) -> Ring[T] {
+    Ring[T].new(pool: pool, h: h)
+  }
+
+  # The node, making it if this is a zero ring.
+  def init! -> @Node[T] {
+    if hh = h {
+      return hh
+    }
+    hh = pool.add(Node[T].new)
+    link_nodes(hh, hh)
+    self.h = hh
+    hh
+  }
+
+  def nxt_of(h: @Node[T]) -> @Node[T] { pool[h].nxt.unwrap }
+
+  def prv_of(h: @Node[T]) -> @Node[T] { pool[h].prv.unwrap }
+
+  # a.next = b and b.prev = a.
+  def link_nodes(a: @Node[T], b: @Node[T]) {
+    ps = pool
+    na = ps[a]
+    ps[a] = Node[T].new(value: na.value, nxt: b, prv: na.prv, tag: na.tag)
+    nb = ps[b]
+    ps[b] = Node[T].new(value: nb.value, nxt: nb.nxt, prv: a, tag: nb.tag)
+  }
+
+  # Whether o's element lives in this ring's pool. Pools have no identity to
+  # compare, so this changes our node's tag for a moment and looks for the
+  # change through o.
+  def same_pool?(o: Ring[T]) -> Bool {
+    return false if h.none?
+    if b = o.h {
+      if theirs = o.pool.get(b) {
+        if mine = pool.get(b) {
+          return false if theirs.tag != mine.tag
+          ps = pool
+          ps[b] = Node[T].new(value: mine.value, nxt: mine.nxt, prv: mine.prv, tag: mine.tag + 1)
+          seen = o.pool[b].tag == mine.tag + 1
+          ps[b] = mine
+          return seen
+        }
+      }
+    }
+    false
+  }
+
+  # The next ring element.
+  pub def next -> Ring[T] {
+    if hh = h {
+      return at(nxt_of(hh))
+    }
+    self
+  }
+
+  # The previous ring element.
+  pub def prev -> Ring[T] {
+    if hh = h {
+      return at(prv_of(hh))
+    }
+    self
+  }
+
+  # Moves n % r.len elements backward (n < 0) or forward (n >= 0) in the
+  # ring and returns that ring element.
+  pub def move(n: Int) -> Ring[T] {
+    hh = h
+    return self if hh.none?
+    p = hh.unwrap
+    k = n
+    while k < 0 {
+      p = prv_of(p)
+      k += 1
+    }
+    while k > 0 {
+      p = nxt_of(p)
+      k -= 1
+    }
+    at(p)
+  }
+
+  # The number of elements in the ring. O(n).
+  pub def len -> Int {
+    hh = h
+    return 1 if hh.none?
+    start = hh.unwrap
+    n = 1
+    p = nxt_of(start)
+    while p != start {
+      n += 1
+      p = nxt_of(p)
+    }
+    n
+  }
+
+  # The value of this element.
+  pub def value -> T {
+    if hh = h {
+      return pool[hh].value
+    }
+    Node[T].new.value
+  }
+
+  # Sets the value of this element (Go's `r.Value = v`).
+  pub def set_value!(v: T) {
+    hh = init!
+    ps = pool
+    n = ps[hh]
+    ps[hh] = Node[T].new(value: v, nxt: n.nxt, prv: n.prv, tag: n.tag)
+  }
+
+  # Moves s's ring into this ring's pool (s comes from another pool or is a
+  # zero ring); returns the handle of s's element there.
+  def adopt!(s: Ring[T]) -> @Node[T] {
+    vals: [T] = []
+    if sh = s.h {
+      p = sh
+      loop {
+        n = s.pool[p]
+        vals << n.value
+        nx = n.nxt.unwrap
+        s.pool.remove(p)
+        p = nx
+        break if p == sh
+      }
+    } else {
+      vals << s.value
+    }
+    first = pool.add(Node[T].new(value: vals[0]))
+    last = first
+    for i in 1...vals.size {
+      nh = pool.add(Node[T].new(value: vals[i]))
+      link_nodes(last, nh)
+      last = nh
+    }
+    link_nodes(last, first)
+    first
+  }
+
+  # Connects ring r with ring s such that r.next becomes s, and returns the
+  # original value of r.next. r must not be empty (none).
+  #
+  # If r and s point to the same ring, linking them removes the elements
+  # between r and s from the ring. The removed elements form a subring and
+  # the result is a reference to that subring (if no elements were removed,
+  # the result is still the original value for r.next, and not none).
+  #
+  # If r and s point to different rings, linking them creates a single ring
+  # with the elements of s inserted after r. The result points to the
+  # element following the last element of s after insertion.
+  pub def link!(s: Ring[T]?) -> Ring[T] {
+    rh = init!
+    n = nxt_of(rh)
+    if sr = s {
+      sh = if sr.h.present? && same_pool?(sr) { sr.h.unwrap } else { adopt!(sr) }
+      p = prv_of(sh)
+      link_nodes(rh, sh)
+      link_nodes(p, n)
+    }
+    at(n)
+  }
+
+  # Removes n % r.len elements from the ring, starting at r.next. If
+  # n % r.len == 0, r remains unchanged. The result is the removed subring;
+  # none for n <= 0.
+  pub def unlink!(n: Int) -> Ring[T]? {
+    return none if n <= 0
+    init!
+    link!(move(n + 1))
+  }
+
+  # Calls f on each element of the ring, in forward order. The behavior of
+  # do is undefined if f changes the ring.
+  pub def do(f: (T) -> Unit) {
+    hh = h
+    if hh.none? {
+      f(value)
+      return
+    }
+    start = hh.unwrap
+    f(pool[start].value)
+    p = nxt_of(start)
+    while p != start {
+      f(pool[p].value)
+      p = nxt_of(p)
+    }
+  }
+
+  # A new ring of n elements holding v, in this ring's pool, so it can be
+  # linked to this one without moving; none for n <= 0.
+  pub def new_ring(n: Int, v: T) -> Ring[T]? {
+    return none if n <= 0
+    first = pool.add(Node[T].new(value: v))
+    last = first
+    for _ in 1...n {
+      nh = pool.add(Node[T].new(value: v))
+      link_nodes(last, nh)
+      last = nh
+    }
+    link_nodes(last, first)
+    at(first)
+  }
+
+  # Identity: the same element of the same ring.
+  pub def ==(o: Ring[T]) -> Bool {
+    if a = h {
+      if b = o.h {
+        return a == b && same_pool?(o)
+      }
+      return false
+    }
+    o.h.none?
+  }
+}
+
+# A ring of n elements, each holding v; none for n <= 0.
+pub def new[T](n: Int, v: T) -> Ring[T]? {
+  Ring[T].new.new_ring(n, v)
+}

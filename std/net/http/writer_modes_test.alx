@@ -1,0 +1,117 @@
+# ResponseWriter output modes, Header.write and content sniffing.
+import "bytes"
+import "net"
+
+test "header write: sorted, cleaned, invalid names skipped" {
+  h = new_header
+  h.add!("Content-Type", "text/html; charset=UTF-8")
+  h.add!("Content-Length", "0")
+  h.add!("Blank", "")
+  h.add!("Content-Encoding", "gzip")
+  h.add!("Content-Encoding", "x-y")
+  h.add!("Nl", "a\nb\r\nc")
+  h.set_raw!("Bad Key", ["x"])
+  h.add!("Ws", "  trimmed\t")
+  assert_eq h.wire_subset([]), "Blank: \r\nContent-Encoding: gzip\r\nContent-Encoding: x-y\r\nContent-Length: 0\r\nContent-Type: text/html; charset=UTF-8\r\nNl: a b  c\r\nWs: trimmed\r\n"
+  assert_eq h.wire_subset(["Content-Length", "Content-Encoding"]), "Blank: \r\nContent-Type: text/html; charset=UTF-8\r\nNl: a b  c\r\nWs: trimmed\r\n"
+  buf = bytes.new_buffer([])
+  h.write(buf).unwrap
+  assert_eq buf.to_s, h.wire_subset([])
+}
+
+test "recording writer" {
+  w = new_recording_writer
+  w.header.set!("X-A", "1")
+  w.write_string!("<html><body>hi").unwrap
+  w.header.set!("X-B", "late")
+  assert_eq w.status, 200
+  assert_eq Str.from_bytes(w.recorded_body), "<html><body>hi"
+  snap = w.recorded_header
+  assert_eq snap.get("Content-Type"), "text/html; charset=utf-8"
+  assert_eq snap.get("X-A"), "1"
+  assert_eq snap.get("X-B"), ""
+  assert_eq w.header.get("X-B"), "late"
+  assert !w.flushed?
+  w.flush!.unwrap
+  assert w.flushed?
+  w2 = new_recording_writer
+  w2.write_header!(404)
+  w2.write_string!("x").unwrap
+  assert_eq w2.status, 404
+  # Go's recorder sniffs only when the first write sets the status.
+  assert_eq w2.recorded_header.get("Content-Type"), ""
+}
+
+def capture(mode: Int) -> (ResponseWriter, bytes.Buffer) {
+  out = bytes.new_buffer([])
+  o = out
+  sink = ->(p: [Byte]) -> ~Unit {
+    o.write!(p)
+    return
+  }
+  (new_response_writer_to(mode, false, sink), out)
+}
+
+test "CGI mode" {
+  w, out = capture(MODE_CGI)
+  w.header.set!("X-Thing", "a")
+  w.write_string!("hello").unwrap
+  w.write_string!(" world").unwrap
+  w.finish!.unwrap
+  assert_eq out.to_s, "Status: 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\nX-Thing: a\r\n\r\nhello world"
+  w2, out2 = capture(MODE_CGI)
+  w2.write_header!(302)
+  w2.header.set!("Location", "/x")
+  w2.finish!.unwrap
+  assert_eq out2.to_s, "Status: 302 Found\r\nContent-Type: text/plain; charset=utf-8\r\nLocation: /x\r\n\r\n"
+}
+
+test "FCGI mode adds Date and drops entity headers on 304" {
+  w, out = capture(MODE_FCGI)
+  w.header.set!("Content-Type", "text/plain")
+  w.header.set!("Date", "Mon, 02 Jan 2006 15:04:05 GMT")
+  w.write_header!(304)
+  w.finish!.unwrap
+  assert_eq out.to_s, "Status: 304 Not Modified\r\nDate: Mon, 02 Jan 2006 15:04:05 GMT\r\n\r\n"
+  w2, out2 = capture(MODE_FCGI)
+  w2.write_string!("x").unwrap
+  w2.finish!.unwrap
+  assert out2.to_s.start_with?("Status: 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\nDate: ")
+}
+
+test "HTTP mode to a sink" {
+  w, out = capture(MODE_HTTP)
+  w.write_string!("{}").unwrap
+  assert w.finish!.unwrap
+  assert_eq out.to_s, "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n{}"
+}
+
+# Go's TestServerContentTypeSniff, over a few of sniff_test.go's cases.
+test "server content type sniff" {
+  cases = [
+    ("", ""),
+    ("<HtMl><bOdY>blah blah blah</body></html>", "text/html; charset=utf-8"),
+    ("   <!DOCTYPE HTML>...", "text/html; charset=utf-8"),
+    ("This is not HTML. It has ☃ though.", "text/plain; charset=utf-8"),
+    ("\n<?xml!", "text/xml; charset=utf-8"),
+    ("GIF89a...", "image/gif"),
+    ("%PDF-1.4", "application/pdf")
+  ]
+  mux = new_serve_mux
+  mux.handle_func("/") { |w, r|
+    i = (r.query("i") || "0").to_i
+    w.write_string!(cases[i][0]).unwrap
+  }
+  srv = new_server(mux)
+  ln = net.listen("tcp", "127.0.0.1:0").unwrap
+  port = ln.port
+  spawn { srv.serve(ln) }
+  i = 0
+  while i < cases.size {
+    r = get("http://127.0.0.1:#{port}/?i=#{i}").unwrap
+    assert_eq r.header.get("Content-Type"), cases[i][1]
+    assert_eq r.body_string, cases[i][0]
+    i += 1
+  }
+  srv.shutdown
+}

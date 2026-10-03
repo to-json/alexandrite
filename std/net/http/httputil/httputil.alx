@@ -1,0 +1,129 @@
+# Package httputil: Go's net/http/httputil, HTTP utility functions
+# complementing net/http: request and response dumps, the chunked coding,
+# and a reverse proxy.
+#
+#   Go                                       alx
+#   DumpRequest(req, body) ([]byte, error)   dump_request(req, body) -> ~[Byte]
+#   DumpRequestOut(req, body)                dump_request_out(req, body) -> ~[Byte]
+#   DumpResponse(resp, body)                 dump_response(resp, body) -> ~[Byte]
+#   NewChunkedReader(r) / NewChunkedWriter   new_chunked_reader(r) / new_chunked_writer(w)
+#   ReverseProxy{Director|Rewrite, ...}      ReverseProxy (see reverseproxy.alx)
+#   NewSingleHostReverseProxy(target)        new_single_host_reverse_proxy(target: nurl.Url)
+#   ProxyRequest{In, Out}.SetURL / SetXForwarded   ProxyRequest{incoming, out}.set_url! / set_xforwarded!
+#   ErrLineTooLong                           http.ChunkedError.LineTooLong
+#
+# Differences from Go:
+#  - alx's Request and Response hold the whole body as bytes, so dumping
+#    never consumes or replaces a body (Go's drainBody), and a "nil Body" is
+#    an empty one.
+#  - dump_request_out is what http.write_request produces, the form alx's
+#    client framing follows: "User-Agent: alx-http/1" (Go:
+#    Go-http-client/1.1) and no "Accept-Encoding: gzip" (Go's Transport
+#    asks for gzip; alx's client doesn't decompress). Without the body the
+#    dump stops after the header, as Go's.
+#  - ClientConn / ServerConn / NewClientConn / NewProxyClientConn /
+#    NewServerConn (persist.go: deprecated since Go 1, "do not use") are not
+#    ported; ErrPersistEOF, ErrClosed and ErrPipeline with them.
+#  - BufferPool is not ported (alx copies from a byte slice).
+#
+# Not translated (dump_test.go): the eofReader case (a non-nil empty body
+# sent chunked), the goroutine-leak and Issue 38352 deadlock checks (context
+# cancellation of an in-memory transport).
+
+import "io"
+import "strings"
+import "net/http"
+import nurl "net/url"
+
+# A reader of the chunked coding (Go's NewChunkedReader; see
+# http.ChunkedReader).
+pub def new_chunked_reader[R: io.Reader](r: R) -> http.ChunkedReader[R] {
+  http.new_chunked_reader(r)
+}
+
+# A writer of the chunked coding (Go's NewChunkedWriter; see
+# http.ChunkedWriter). Closing it writes the last chunk "0\r\n", not the
+# trailer's final "\r\n".
+pub def new_chunked_writer[W: io.Writer](w: W) -> http.ChunkedWriter[W] {
+  http.new_chunked_writer(w)
+}
+
+def chunked?(te: [Str]) -> Bool {
+  te.size > 0 && te[0] == "chunked"
+}
+
+# req as it was received by a server, in HTTP/1.x wire form (Go's
+# DumpRequest): the request line with req.request_uri (or the URL's request
+# URI) and req's protocol version, Host (unless the request URI is
+# absolute), Transfer-Encoding, the header (sorted, without Host,
+# Transfer-Encoding and Trailer) and, if `body`, the body (re-encoded as
+# chunks when chunked).
+pub def dump_request(req: http.Request, body: Bool) -> ~[Byte] {
+  b = strings.new_builder
+  req_uri = req.request_uri
+  pu = nurl.parse(req.url)
+  if req_uri == "" {
+    fail "http: invalid Request URL: #{pu.err.unwrap.message}" if pu.err?
+    req_uri = pu.unwrap.request_uri
+  }
+  major = 0
+  minor = 0
+  if v = http.parse_http_version(req.proto) {
+    major, minor = v
+  }
+  method = req.method == "" ? "GET" : req.method
+  b.write!("#{method} #{req_uri} HTTP/#{major}.#{minor}\r\n")
+  abs = strings.has_prefix(req.request_uri, "http://") || strings.has_prefix(req.request_uri, "https://")
+  if !abs {
+    host = req.host
+    host = pu.unwrap.host if host == "" && pu.ok?
+    b.write!("Host: #{host}\r\n") if host != ""
+  }
+  chunked = chunked?(req.transfer_encoding)
+  b.write!("Transfer-Encoding: " + strings.join(req.transfer_encoding, ",") + "\r\n") if req.transfer_encoding.size > 0
+  b.write!(req.header.wire_subset(["Host", "Transfer-Encoding", "Trailer"]))
+  b.write!("\r\n")
+  if body && req.body.size > 0 {
+    if chunked {
+      b.write!(format("%x\r\n", req.body.size))
+      b.write!(Str.from_bytes(req.body))
+      b.write!("\r\n0\r\n\r\n")
+    } else {
+      b.write!(Str.from_bytes(req.body))
+    }
+  }
+  b.to_s.bytes.to_a
+}
+
+# req as alx's client would send it (Go's DumpRequestOut): http's
+# write_request form, including the User-Agent and framing headers. Without
+# `body`, only the header. Fails like the client for a URL without a host.
+pub def dump_request_out(req: http.Request, body: Bool) -> ~[Byte] {
+  pu = nurl.parse(req.url)
+  fail "http: invalid Request URL: #{pu.err.unwrap.message}" if pu.err?
+  fail "http: no Host in request URL" if pu.unwrap.host == ""
+  r = req
+  if pu.unwrap.scheme == "https" {
+    u = pu.unwrap
+    u.scheme = "http"
+    r.url = u.to_s
+  }
+  s = body ? ~http.request_bytes(r) : ~http.request_head(r)
+  s.bytes.to_a
+}
+
+# resp in HTTP/1.x wire form (Go's DumpResponse: http.write_response). With
+# `body` false the header is written as if the body were there (its
+# Content-Length or chunking) and the dump stops after it.
+pub def dump_response(resp: http.Response, body: Bool) -> ~[Byte] {
+  # (Go always gives Response.Write a non-nil body here: the real one, an
+  # empty one, or one that can't be read, whose error ends the dump after
+  # the header)
+  return ~http.response_wire_form(resp, true, false).bytes.to_a if body
+  r = resp
+  if r.content_length == 0 {
+    r.body = []
+    return ~http.response_wire_form(r, true, false).bytes.to_a
+  }
+  ~http.response_wire_form(r, true, true).bytes.to_a
+}

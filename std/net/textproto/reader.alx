@@ -1,0 +1,638 @@
+# Reader, after Go's reader.go. The buffering of Go's *bufio.Reader is built
+# in (see the package header for why).
+import "io"
+import "strconv"
+import "strings"
+
+DEFAULT_BUF = 4096
+
+# Dot-reader states (Go's dotReader).
+DOT_BEGIN_LINE = 0
+DOT_DOT = 1
+DOT_DOT_CR = 2
+DOT_CR = 3
+DOT_DATA = 4
+DOT_EOF = 5
+
+struct ReaderState[R] {
+  rd: R
+  buf: [Byte]
+  # Unread bytes are buf[r...w].
+  r: Int
+  w: Int
+  # rd reported its end.
+  eof: Bool
+  # The last byte read (for unread_byte!), -1 when it can't be undone.
+  last: Int
+  # The id of the active dot reader (0: none) and its state.
+  dot: Int
+  dot_state: Int
+  # The last dot reader id handed out.
+  dot_ids: Int
+}
+
+# A reader of a text protocol's requests or responses: lines, continued
+# lines, numeric status lines, dot-encoded blocks and MIME headers. It
+# buffers what it reads from R, so it is also the buffered reader of the
+# stream (read!, read_byte!, peek!, ...; Go's r.R). Copies share state.
+pub struct Reader[R] {
+  st: [ReaderState[R]]
+
+  # ------------------------------------------------------ buffered reading
+
+  # Reads more from rd into the buffer (growing it when full); the count, 0
+  # at the end of input.
+  def fill! -> ~Int {
+    return 0 if st[0].eof
+    r = st[0].r
+    w = st[0].w
+    if r > 0 {
+      buf = st[0].buf
+      copy(buf, buf[r...w])
+      self.st[0].w = w - r
+      self.st[0].r = 0
+      w = w - r
+    }
+    if w == st[0].buf.size {
+      nb: [Byte] = [0; st[0].buf.size * 2]
+      copy(nb, st[0].buf)
+      self.st[0].buf = nb
+    }
+    buf = st[0].buf
+    n = self.st[0].rd.~read!(buf[w...buf.size])
+    if n == 0 {
+      self.st[0].eof = true
+      return 0
+    }
+    self.st[0].w = w + n
+    n
+  }
+
+  # Unread bytes in the buffer.
+  pub def buffered -> Int { st[0].w - st[0].r }
+
+  # Reads up to p.size bytes of the raw stream; 0 at the end of input.
+  pub def read!(p: [Byte]) -> ~Int {
+    return 0 if p.size == 0
+    if st[0].r == st[0].w {
+      # Large reads bypass the buffer.
+      if p.size >= st[0].buf.size && !st[0].eof {
+        n = self.st[0].rd.~read!(p)
+        self.st[0].eof = true if n == 0
+        self.st[0].last = n > 0 ? p[n - 1].to_i : -1
+        return n
+      }
+      got = self.~fill!
+      return 0 if got == 0
+    }
+    r = st[0].r
+    k = st[0].w - r
+    k = p.size if k > p.size
+    copy(p, st[0].buf[r...r + k])
+    self.st[0].r = r + k
+    self.st[0].last = st[0].buf[r + k - 1].to_i
+    k
+  }
+
+  # The next byte, none at the end of input.
+  pub def read_byte! -> ~Byte? {
+    while st[0].r == st[0].w {
+      n = self.~fill!
+      return none if n == 0
+    }
+    r = st[0].r
+    c = st[0].buf[r]
+    self.st[0].r = r + 1
+    self.st[0].last = c.to_i
+    c
+  }
+
+  # Undoes the last read_byte! (or the last byte of a read!).
+  pub def unread_byte! -> ~Unit {
+    last = st[0].last
+    fail io.StreamError.InvalidArgument("unread_byte without a byte to unread") if last < 0
+    r = st[0].r
+    if r > 0 {
+      self.st[0].r = r - 1
+      self.st[0].buf[r - 1] = last.as_u8
+    } else {
+      # Shift the buffer right by one.
+      w = st[0].w
+      if w == st[0].buf.size {
+        nb: [Byte] = [0; st[0].buf.size * 2]
+        copy(nb, st[0].buf)
+        self.st[0].buf = nb
+      }
+      buf = st[0].buf
+      copy(buf[1...w + 1], buf[0...w])
+      self.st[0].buf[0] = last.as_u8
+      self.st[0].w = w + 1
+    }
+    self.st[0].last = -1
+  }
+
+  # The next n bytes without consuming them (fewer at the end of input).
+  pub def peek!(n: Int) -> ~[Byte] {
+    while st[0].w - st[0].r < n {
+      got = self.~fill!
+      break if got == 0
+    }
+    r = st[0].r
+    e = r + n
+    e = st[0].w if e > st[0].w
+    st[0].buf[r...e]
+  }
+
+  # Skips n bytes; returns how many were skipped.
+  pub def discard!(n: Int) -> ~Int {
+    left = n
+    while left > 0 {
+      if st[0].r == st[0].w {
+        got = self.~fill!
+        break if got == 0
+      }
+      k = st[0].w - st[0].r
+      k = left if k > left
+      self.st[0].r = st[0].r + k
+      left -= k
+    }
+    self.st[0].last = -1
+    n - left
+  }
+
+  # The next line without "\n" / "\r\n" (bufio.ReadLine); none at the end of
+  # input. lim >= 0: fail with MessageTooLarge when the line is longer.
+  def raw_line!(lim: Int) -> ~[Byte]? {
+    from = st[0].r
+    loop {
+      r = st[0].r
+      w = st[0].w
+      buf = st[0].buf
+      i = from
+      while i < w && buf[i] != 10 {
+        i += 1
+      }
+      if i < w {
+        e = i
+        e = i - 1 if e > r && buf[e - 1] == 13
+        fail TextprotoError.MessageTooLarge if lim >= 0 && e - r > lim
+        out = buf[r...e]
+        self.st[0].r = i + 1
+        self.st[0].last = 10
+        return out
+      }
+      fail TextprotoError.MessageTooLarge if lim >= 0 && w - r > lim + 1
+      from = w - r
+      got = self.~fill!
+      from = from + st[0].r
+      if got == 0 {
+        r = st[0].r
+        w = st[0].w
+        return none if r == w
+        e = w
+        fail TextprotoError.MessageTooLarge if lim >= 0 && e - r > lim
+        out = st[0].buf[r...e]
+        self.st[0].r = w
+        self.st[0].last = st[0].buf[w - 1].to_i
+        return out
+      }
+    }
+  }
+
+  # ------------------------------------------------------------- lines
+
+  # A single line, without its final "\n" or "\r\n"; none at the end of
+  # input.
+  pub def read_line! -> ~Str? {
+    self.~close_dot!
+    if l = ~raw_line!(-1) {
+      return Str.from_bytes(l)
+    }
+    none
+  }
+
+  # Like read_line!, as bytes.
+  pub def read_line_bytes! -> ~[Byte]? {
+    self.~close_dot!
+    if l = ~raw_line!(-1) {
+      out: [Byte] = [0; l.size]
+      copy(out, l)
+      return out
+    }
+    none
+  }
+
+  def line_slice!(lim: Int) -> ~[Byte]? {
+    self.~close_dot!
+    l = ~raw_line!(lim)
+    if x = l {
+      # copy: the buffer moves on later reads
+      out: [Byte] = [0; x.size]
+      copy(out, x)
+      return out
+    }
+    none
+  }
+
+  # A possibly continued line: lines starting with a space or tab continue
+  # the previous one (RFC 5322 folding). Each line is trimmed of surrounding
+  # spaces and tabs and the pieces are joined with one space. none at the
+  # end of input. "Line 1\n  continued\n" reads "Line 1 continued".
+  pub def read_continued_line! -> ~Str? {
+    if l = ~continued_line!(-1, false) {
+      return Str.from_bytes(l)
+    }
+    none
+  }
+
+  # Like read_continued_line!, as bytes.
+  pub def read_continued_line_bytes! -> ~[Byte]? {
+    ~continued_line!(-1, false)
+  }
+
+  # Go's readContinuedLineSlice; `need_colon` validates the first line.
+  def continued_line!(lim0: Int, need_colon: Bool) -> ~[Byte]? {
+    first = ~line_slice!(lim0)
+    return none unless first.present?
+    line = first.unwrap
+    return line if line.size == 0
+    if need_colon && index_of(line, 58) < 0 {
+      fail TextprotoError.Protocol("malformed MIME header: missing colon: #{strconv.quote(Str.from_bytes(line))}")
+    }
+    buf = trim(line)
+    lim = lim0 < 0 ? 9223372036854775807 : lim0
+    lim -= buf.size
+    while ~skip_space! > 0 {
+      buf << 32
+      fail TextprotoError.MessageTooLarge if buf.size >= lim
+      more = line_slice!(lim - buf.size)
+      break if more.err?
+      if m = more.unwrap {
+        for c in trim(m) { buf << c }
+      } else {
+        break
+      }
+    }
+    buf
+  }
+
+  def skip_space! -> ~Int {
+    n = 0
+    loop {
+      b = ~read_byte!
+      if c = b {
+        if c != 32 && c != 9 {
+          ~unread_byte!
+          break
+        }
+        n += 1
+      } else {
+        break
+      }
+    }
+    n
+  }
+
+  # ---------------------------------------------------------- code lines
+
+  # Reads a response code line "ddd message" (Go's ReadCodeLine). If
+  # expect_code is 1..9, 10..99 or 100..999, the code must start with it
+  # (a TextprotoError.Code otherwise, which carries the code and message).
+  # A multi-line response ("ddd-...") is a Protocol error. The input ending
+  # is io.StreamError.UnexpectedEof (Go: io.EOF).
+  pub def read_code_line!(expect_code: Int) -> ~(Int, Str) {
+    l = ~read_line!
+    fail io.StreamError.UnexpectedEof unless l.present?
+    code, continued, message, bad = ~parse_code_line(l.unwrap, expect_code)
+    fail TextprotoError.Code(code: code, msg: message) if bad
+    fail TextprotoError.Protocol("unexpected multi-line response: #{strconv.quote(message)}") if continued
+    (code, message)
+  }
+
+  # Reads a possibly multi-line response (RFC 959): "ddd-first\nddd-second\n
+  # ddd last" gives the code and "first\nsecond\nlast". Lines of a
+  # multi-line response that don't start with the code are kept whole. Fails
+  # like read_code_line!, except that a multi-line response is fine; a code
+  # mismatch is reported with the whole message.
+  pub def read_response!(expect_code: Int) -> ~(Int, Str) {
+    l = ~read_line!
+    fail io.StreamError.UnexpectedEof unless l.present?
+    line0 = l.unwrap
+    p0 = parse_code_line(line0, expect_code)
+    if p0.err? && line0.size >= 4 && line0[3] == 45 {
+      # Go goes on reading the "continued" response: no later line can
+      # match the code, so it reads to the end of input.
+      loop {
+        x = ~read_line!
+        fail io.StreamError.UnexpectedEof unless x.present?
+      }
+    }
+    code, continued, first, bad = ~p0
+    b = strings.new_builder
+    b.write!(first)
+    while continued {
+      nl = ~read_line!
+      fail io.StreamError.UnexpectedEof unless nl.present?
+      line = nl.unwrap
+      parsed = parse_code_line(line, 0)
+      if parsed.err? {
+        b.write!("\n")
+        b.write!(strings.trim_right(line, "\r\n"))
+        continued = true
+        next
+      }
+      code2, cont2, more, _ = parsed.unwrap
+      if code2 != code {
+        b.write!("\n")
+        b.write!(strings.trim_right(line, "\r\n"))
+        continued = true
+        next
+      }
+      continued = cont2
+      b.write!("\n")
+      b.write!(more)
+    }
+    message = b.to_s
+    fail TextprotoError.Code(code: code, msg: message) if bad
+    (code, message)
+  }
+
+  # ---------------------------------------------------------- dot encoding
+
+  # A reader of a dot-encoded block (RFC 5321 "data"): lines end in "\r\n"
+  # (read as "\n"), a leading "." is removed, and a line "." alone ends the
+  # block. Reading past the block's end gives 0; the input ending first is
+  # io.StreamError.UnexpectedEof. Any other read from this Reader first
+  # skips the rest of the block.
+  pub def dot_reader! -> ~DotReader[R] {
+    self.~close_dot!
+    id = st[0].dot_ids + 1
+    self.st[0].dot_ids = id
+    self.st[0].dot = id
+    self.st[0].dot_state = DOT_BEGIN_LINE
+    DotReader.new(rd: self, id: id)
+  }
+
+  # Reads one byte of the active dot block into p[n] (Go's dotReader.Read
+  # loop body); the new n.
+  def dot_read!(p: [Byte], id: Int) -> ~Int {
+    n = 0
+    return 0 if st[0].dot != id
+    while n < p.size && st[0].dot_state != DOT_EOF {
+      cb = read_byte!
+      if cb.err? {
+        self.st[0].dot = 0
+        fail cb.err.unwrap
+      }
+      if cc = cb.unwrap {
+        c = cc
+        s = st[0].dot_state
+        if s == DOT_BEGIN_LINE {
+          if c == 46 {
+            self.st[0].dot_state = DOT_DOT
+            next
+          }
+          if c == 13 {
+            self.st[0].dot_state = DOT_CR
+            next
+          }
+          self.st[0].dot_state = DOT_DATA
+        } else if s == DOT_DOT {
+          if c == 13 {
+            self.st[0].dot_state = DOT_DOT_CR
+            next
+          }
+          if c == 10 {
+            self.st[0].dot_state = DOT_EOF
+            next
+          }
+          self.st[0].dot_state = DOT_DATA
+        } else if s == DOT_DOT_CR {
+          if c == 10 {
+            self.st[0].dot_state = DOT_EOF
+            next
+          }
+          ~unread_byte!
+          c = 13
+          self.st[0].dot_state = DOT_DATA
+        } else if s == DOT_CR {
+          if c == 10 {
+            self.st[0].dot_state = DOT_BEGIN_LINE
+          } else {
+            ~unread_byte!
+            c = 13
+            self.st[0].dot_state = DOT_DATA
+          }
+        } else {
+          if c == 13 {
+            self.st[0].dot_state = DOT_CR
+            next
+          }
+          if c == 10 {
+            self.st[0].dot_state = DOT_BEGIN_LINE
+          }
+        }
+        p[n] = c
+        n += 1
+      } else {
+        # (the next read fails: the input stays at its end)
+        return n if n > 0
+        self.st[0].dot = 0
+        fail io.StreamError.UnexpectedEof
+      }
+    }
+    self.st[0].dot = 0 if st[0].dot_state == DOT_EOF
+    n
+  }
+
+  # Skips the rest of an active dot block.
+  def close_dot! -> ~Unit {
+    return if st[0].dot == 0
+    buf: [Byte] = [0; 128]
+    while st[0].dot != 0 {
+      r = dot_read!(buf, st[0].dot)
+      break if r.err?
+      break if r.unwrap == 0
+    }
+    self.st[0].dot = 0
+  }
+
+  # The decoded dot block (see dot_reader!).
+  pub def read_dot_bytes! -> ~[Byte] {
+    d = ~dot_reader!
+    out: [Byte] = []
+    buf: [Byte] = [0; 4096]
+    loop {
+      n = d.~read!(buf)
+      break if n == 0
+      i = 0
+      while i < n {
+        out << buf[i]
+        i += 1
+      }
+    }
+    out
+  }
+
+  # The lines of a dot block, without their endings and with the leading "."
+  # removed. The input ending first is io.StreamError.UnexpectedEof.
+  pub def read_dot_lines! -> ~[Str] {
+    v: [Str] = []
+    loop {
+      l = ~read_line!
+      fail io.StreamError.UnexpectedEof unless l.present?
+      line = l.unwrap
+      if line.size > 0 && line[0] == 46 {
+        break if line.size == 1
+        line = line[1...line.size]
+      }
+      v << line
+    }
+    v
+  }
+
+  # ------------------------------------------------------------ MIME headers
+
+  # Reads a MIME header up to its blank line. "My-Key: Value 1\r\nLong-Key:
+  # Even\r\n Longer Value\r\nMy-Key: Value 2\r\n\r\n" gives {"My-Key":
+  # ["Value 1", "Value 2"], "Long-Key": ["Even Longer Value"]}. Keys are
+  # canonicalized, values trimmed of leading spaces. Fails with
+  # TextprotoError.Protocol on a malformed line, and with
+  # io.StreamError.UnexpectedEof if the input ends before the blank line (Go
+  # returns the header read so far with io.EOF; read_mime_header_to_eof!
+  # does that).
+  pub def read_mime_header! -> ~MIMEHeader {
+    h, eof = ~read_mime_header_limited!(9223372036854775807, 9223372036854775807)
+    fail io.StreamError.UnexpectedEof if eof
+    h
+  }
+
+  # Like read_mime_header!, but the input may end instead of the blank line:
+  # the header and whether it did (Go's (hdr, io.EOF)).
+  pub def read_mime_header_to_eof! -> ~(MIMEHeader, Bool) {
+    ~read_mime_header_limited!(9223372036854775807, 9223372036854775807)
+  }
+
+  # Go's readMIMEHeader with its limits on memory (bytes, as Go counts them)
+  # and on the number of header lines; going over either fails with
+  # MessageTooLarge. The Bool: the input ended before the blank line.
+  pub def read_mime_header_limited!(max_memory0: Int, max_headers0: Int) -> ~(MIMEHeader, Bool) {
+    m = new_mime_header
+    max_memory = max_memory0 - 400
+    max_headers = max_headers0
+    pk = ~peek!(1)
+    if pk.size > 0 && (pk[0] == 32 || pk[0] == 9) {
+      l = ~line_slice!(80)
+      line = l || []
+      fail TextprotoError.Protocol("malformed MIME header initial line: #{strconv.quote(Str.from_bytes(line))}")
+    }
+    loop {
+      kvo = ~continued_line!(max_memory, true)
+      return (m, true) unless kvo.present?
+      kv = kvo.unwrap
+      return (m, false) if kv.size == 0
+      i = index_of(kv, 58)
+      fail TextprotoError.Protocol("malformed MIME header line: #{strconv.quote(Str.from_bytes(kv))}") if i < 0
+      key, ok = canonical_key_ok(Str.from_bytes(kv[0...i]))
+      fail TextprotoError.Protocol("malformed MIME header line: #{strconv.quote(Str.from_bytes(kv))}") unless ok
+      v = kv[i + 1...kv.size]
+      for c in v {
+        # (Go canonicalizes the key in place, so the message shows it)
+        fail TextprotoError.Protocol("malformed MIME header line: #{strconv.quote(key + Str.from_bytes(kv[i...kv.size]))}") unless valid_header_value_byte?(c)
+      }
+      max_headers -= 1
+      fail TextprotoError.MessageTooLarge if max_headers < 0
+      j = 0
+      while j < v.size && (v[j] == 32 || v[j] == 9) {
+        j += 1
+      }
+      value = Str.from_bytes(v[j...v.size])
+      if !m.m.key?(key) {
+        max_memory -= key.size
+        max_memory -= 200
+      }
+      max_memory -= value.size
+      fail TextprotoError.MessageTooLarge if max_memory < 0
+      m.add_raw!(key, value)
+    }
+  }
+
+  # How many header keys the buffered input seems to hold (Go's
+  # upcomingHeaderKeys; a size hint, exposed for its test).
+  def upcoming_header_keys! -> Int {
+    self.peek!(1)
+    s = buffered
+    return 0 if s == 0
+    peek = st[0].buf[st[0].r...st[0].w]
+    n = 0
+    start = 0
+    while start < peek.size && n < 1000 {
+      e = start
+      while e < peek.size && peek[e] != 10 {
+        e += 1
+      }
+      line = peek[start...e]
+      start = e + 1
+      break if line.size == 0 || (line.size == 1 && line[0] == 13)
+      next if line[0] == 32 || line[0] == 9
+      n += 1
+    }
+    n
+  }
+}
+
+# A Reader over r (Go: NewReader(bufio.NewReader(r))).
+pub def new_reader[R: io.Reader](r: R) -> Reader[R] {
+  buf: [Byte] = [0; DEFAULT_BUF]
+  st: [ReaderState[R]] = [ReaderState.new(rd: r, buf: buf, r: 0, w: 0, eof: false, last: -1, dot: 0, dot_state: 0, dot_ids: 0)]
+  Reader[R].new(st: st)
+}
+
+# A dot-encoded block being read (see Reader.dot_reader!). An io.Reader when
+# R holds no interface value.
+pub struct DotReader[R] {
+  rd: Reader[R]
+  id: Int
+
+  pub def read!(p: [Byte]) -> ~Int {
+    rd.~dot_read!(p, id)
+  }
+}
+
+def index_of(b: [Byte], c: Byte) -> Int {
+  i = 0
+  while i < b.size {
+    return i if b[i] == c
+    i += 1
+  }
+  -1
+}
+
+# b without leading and trailing spaces and tabs (a copy).
+def trim(s: [Byte]) -> [Byte] {
+  i = 0
+  while i < s.size && (s[i] == 32 || s[i] == 9) {
+    i += 1
+  }
+  n = s.size
+  while n > i && (s[n - 1] == 32 || s[n - 1] == 9) {
+    n -= 1
+  }
+  out: [Byte] = [0; n - i]
+  copy(out, s[i...n])
+  out
+}
+
+# Go's parseCodeLine: code, continued, message and whether the code didn't
+# match expect_code. Fails with Protocol on a malformed line.
+def parse_code_line(line: Str, expect_code: Int) -> ~(Int, Bool, Str, Bool) {
+  if line.size < 4 || (line[3] != 32 && line[3] != 45) {
+    fail TextprotoError.Protocol("short response: #{strconv.quote(line)}")
+  }
+  continued = line[3] == 45
+  code = strconv.atoi(line[0...3]).unwrap_or(-1)
+  fail TextprotoError.Protocol("invalid response code: #{strconv.quote(line)}") if code < 100
+  message = line[4...line.size]
+  bad = (1 <= expect_code && expect_code < 10 && code / 100 != expect_code) || (10 <= expect_code && expect_code < 100 && code / 10 != expect_code) || (100 <= expect_code && expect_code < 1000 && code != expect_code)
+  (code, continued, message, bad)
+}

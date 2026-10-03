@@ -1,0 +1,170 @@
+# Go's requestwrite_test.go (TestRequestWrite's table) and
+# responsewrite_test.go, translated. alx's default User-Agent is
+# DEFAULT_USER_AGENT where Go's is "Go-http-client/1.1".
+#
+# Not translated: requestwrite cases 6, 12, 13 (a non-nil empty body, and
+# bodies whose reader fails: alx bodies are bytes), 17 (an opaque URL with a
+# different host: Request.url is a string), the WriteProxy expectations of
+# cases built from those; TestRequestWriteTransport, TestRequestWriteClosesBody
+# and TestRequestWriteError (Transport, body closing and writer errors).
+import "bytes"
+
+UA = "User-Agent: alx-http/1\r\n"
+
+def hdr(pairs: [(Str, [Str])]) -> Header {
+  h = new_header
+  for p in pairs {
+    h.set_raw!(p[0], p[1])
+  }
+  h
+}
+
+def mkreq(method: Str, url: Str, host: Str, h: Header, body: Str, cl: Int, te: [Str], close: Bool, trailer: Header) -> Request {
+  pv: Map[Str, Str] = {}
+  Request.new(method: method, url: url, path: "", raw_query: "", proto: "HTTP/1.1", host: host, header: h, body: body.bytes.to_a, remote_addr: "", pathvals: pv, request_uri: "", content_length: cl, transfer_encoding: te, close: close, trailer: trailer)
+}
+
+def simple(method: Str, url: Str, host: Str) -> Request {
+  mkreq(method, url, host, new_header, "", 0, [], false, new_header)
+}
+
+def wr(r: Request) -> Str {
+  res = request_bytes(r)
+  return "ERR " + res.err.unwrap.message if res.err?
+  res.unwrap
+}
+
+def wp(r: Request) -> Str {
+  b = bytes.new_buffer([])
+  res = write_proxy_request(r, b)
+  return "ERR " + res.err.unwrap.message if res.err?
+  b.to_s
+}
+
+def chunk(s: Str) -> Str {
+  format("%x\r\n%s\r\n", s.size, s)
+}
+
+test "request write" {
+  # 0: HTTP/1.1, no body
+  h0 = hdr([("Accept", ["text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"]), ("Accept-Charset", ["ISO-8859-1,utf-8;q=0.7,*;q=0.7"]), ("Accept-Encoding", ["gzip,deflate"]), ("Accept-Language", ["en-us,en;q=0.5"]), ("Keep-Alive", ["300"]), ("Proxy-Connection", ["keep-alive"]), ("User-Agent", ["Fake"])])
+  r0 = mkreq("GET", "http://www.techcrunch.com/", "www.techcrunch.com", h0, "", 0, [], false, new_header)
+  rest0 = "User-Agent: Fake\r\nAccept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8\r\nAccept-Charset: ISO-8859-1,utf-8;q=0.7,*;q=0.7\r\nAccept-Encoding: gzip,deflate\r\nAccept-Language: en-us,en;q=0.5\r\nKeep-Alive: 300\r\nProxy-Connection: keep-alive\r\n\r\n"
+  assert_eq wr(r0), "GET / HTTP/1.1\r\nHost: www.techcrunch.com\r\n" + rest0
+  assert_eq wp(r0), "GET http://www.techcrunch.com/ HTTP/1.1\r\nHost: www.techcrunch.com\r\n" + rest0
+  # 1: chunked body
+  r1 = mkreq("GET", "http://www.google.com/search", "", new_header, "abcdef", 0, ["chunked"], false, new_header)
+  assert_eq wr(r1), "GET /search HTTP/1.1\r\nHost: www.google.com\r\n" + UA + "Transfer-Encoding: chunked\r\n\r\n" + chunk("abcdef") + chunk("")
+  assert_eq wp(r1), "GET http://www.google.com/search HTTP/1.1\r\nHost: www.google.com\r\n" + UA + "Transfer-Encoding: chunked\r\n\r\n" + chunk("abcdef") + chunk("")
+  # 2: POST chunked, close
+  r2 = mkreq("POST", "http://www.google.com/search", "", new_header, "abcdef", 0, ["chunked"], true, new_header)
+  assert_eq wr(r2), "POST /search HTTP/1.1\r\nHost: www.google.com\r\n" + UA + "Connection: close\r\nTransfer-Encoding: chunked\r\n\r\n" + chunk("abcdef") + chunk("")
+  # 3: POST with Content-Length
+  r3 = mkreq("POST", "http://www.google.com/search", "", new_header, "abcdef", 6, [], true, new_header)
+  assert_eq wr(r3), "POST /search HTTP/1.1\r\nHost: www.google.com\r\n" + UA + "Connection: close\r\nContent-Length: 6\r\n\r\nabcdef"
+  assert_eq wp(r3), "POST http://www.google.com/search HTTP/1.1\r\nHost: www.google.com\r\n" + UA + "Connection: close\r\nContent-Length: 6\r\n\r\nabcdef"
+  # 4: Content-Length in the header is ignored
+  r4 = mkreq("POST", "http://example.com/", "example.com", hdr([("Content-Length", ["10"])]), "abcdef", 6, [], false, new_header)
+  assert_eq wr(r4), "POST / HTTP/1.1\r\nHost: example.com\r\n" + UA + "Content-Length: 6\r\n\r\nabcdef"
+  assert_eq wp(r4), "POST http://example.com/ HTTP/1.1\r\nHost: example.com\r\n" + UA + "Content-Length: 6\r\n\r\nabcdef"
+  # 5: default to HTTP/1.1
+  assert_eq wr(simple("GET", "/search", "www.google.com")), "GET /search HTTP/1.1\r\nHost: www.google.com\r\n" + UA + "\r\n"
+  # 7: 0 ContentLength, nil body
+  r7 = simple("POST", "/", "example.com")
+  assert_eq wr(r7), "POST / HTTP/1.1\r\nHost: example.com\r\n" + UA + "Content-Length: 0\r\n\r\n"
+  assert_eq wp(r7), "POST / HTTP/1.1\r\nHost: example.com\r\n" + UA + "Content-Length: 0\r\n\r\n"
+  # 8: 0 ContentLength, 1-byte body
+  r8 = mkreq("POST", "/", "example.com", new_header, "x", 0, [], false, new_header)
+  assert_eq wr(r8), "POST / HTTP/1.1\r\nHost: example.com\r\n" + UA + "Transfer-Encoding: chunked\r\n\r\n" + chunk("x") + chunk("")
+  # 9, 10, 11: length mismatches
+  assert_eq wr(mkreq("POST", "/", "example.com", new_header, "12345", 10, [], false, new_header)), "ERR http: ContentLength=10 with Body length 5"
+  assert_eq wr(mkreq("POST", "/", "example.com", new_header, "12345678", 4, [], false, new_header)), "ERR http: ContentLength=4 with Body length 8"
+  assert_eq wr(mkreq("POST", "/", "example.com", new_header, "", 5, [], false, new_header)), "ERR http: Request.ContentLength=5 with nil Body"
+  # 14: no Host
+  r14 = mkreq("GET", "/foo", "", hdr([("X-Foo", ["X-Bar"])]), "", 0, [], false, new_header)
+  assert_eq wr(r14), "GET /foo HTTP/1.1\r\nHost: \r\n" + UA + "X-Foo: X-Bar\r\n\r\n"
+  # 15: Header["Host"] isn't used
+  r15 = mkreq("GET", "http:///search", "", hdr([("Host", ["bad.example.com"])]), "", 0, [], false, new_header)
+  assert_eq wr(r15), "GET /search HTTP/1.1\r\nHost: \r\n" + UA + "\r\n"
+  # 16: opaque
+  assert_eq wr(simple("GET", "http:/%2F/%2F/", "www.google.com")), "GET /%2F/%2F/ HTTP/1.1\r\nHost: www.google.com\r\n" + UA + "\r\n"
+  # 18: custom case in header keys
+  r18 = mkreq("GET", "http://www.google.com/", "", hdr([("ALL-CAPS", ["x"])]), "", 0, [], false, new_header)
+  assert_eq wr(r18), "GET / HTTP/1.1\r\nHost: www.google.com\r\n" + UA + "ALL-CAPS: x\r\n\r\n"
+  # 19, 20: IPv6 zones are removed
+  assert_eq wr(simple("GET", "", "[fe80::1%en0]")), "GET / HTTP/1.1\r\nHost: [fe80::1]\r\n" + UA + "\r\n"
+  assert_eq wr(simple("GET", "//www.example.com", "[fe80::1%en0]:8080")), "GET / HTTP/1.1\r\nHost: [fe80::1]:8080\r\n" + UA + "\r\n"
+  # 21, 22: CONNECT
+  assert_eq wr(simple("CONNECT", "https://proxy.com", "")), "CONNECT proxy.com HTTP/1.1\r\nHost: proxy.com\r\n" + UA + "\r\n"
+  assert_eq wr(simple("CONNECT", "https:backend:443", "proxy.com")), "CONNECT backend:443 HTTP/1.1\r\nHost: proxy.com\r\n" + UA + "\r\n"
+  # 23, 24: a key without values isn't written
+  r23 = mkreq("GET", "/foo", "", hdr([("X-Foo", ["X-Bar"]), ("X-Idempotency-Key", [])]), "", 0, [], false, new_header)
+  assert_eq wr(r23), "GET /foo HTTP/1.1\r\nHost: \r\n" + UA + "X-Foo: X-Bar\r\n\r\n"
+  # 25: control characters in the URL (alx's URL parser refuses them first)
+  assert wr(simple("GET", "//www.example.com/?new\nline", "")).start_with?("ERR ")
+  # 26: PATCH with nil body
+  assert_eq wr(simple("PATCH", "/", "example.com")), "PATCH / HTTP/1.1\r\nHost: example.com\r\n" + UA + "Content-Length: 0\r\n\r\n"
+  # 27: a valid trailer
+  r27 = mkreq("POST", "http://example.com/", "", new_header, "abcdef", 0, ["chunked"], false, hdr([("X-Trailer", ["ok"])]))
+  assert_eq wr(r27), "POST / HTTP/1.1\r\nHost: example.com\r\n" + UA + "Transfer-Encoding: chunked\r\nTrailer: X-Trailer\r\n\r\n" + chunk("abcdef") + "0\r\nX-Trailer: ok\r\n\r\n"
+  # 28-31: invalid trailers
+  bad_keys = [(hdr([("X-Trailer\r\nInjected: 1", ["ok"])]), "ERR net/http: invalid trailer field name \"X-Trailer\\r\\nInjected: 1\""), (hdr([("X-Trailer", ["evil\r\nInjected: 1"])]), "ERR net/http: invalid trailer field value for \"X-Trailer\""), (hdr([("", ["ok"])]), "ERR net/http: invalid trailer field name \"\"")]
+  for bk in bad_keys {
+    r = mkreq("POST", "http://example.com/", "", new_header, "abcdef", 0, ["chunked"], false, bk[0])
+    assert_eq wr(r), bk[1]
+  }
+}
+
+def mkresp(status: Int, text: Str, proto: Str, method: Str, h: Header, body: Str, cl: Int, te: [Str], close: Bool) -> Response {
+  Response.new(status: status, status_text: text, proto: proto, header: h, body: body.bytes.to_a, content_length: cl, transfer_encoding: te, close: close, trailer: new_header, request_method: method)
+}
+
+def wresp(r: Response) -> Str {
+  res = response_bytes(r)
+  return "ERR " + res.err.unwrap.message if res.err?
+  res.unwrap
+}
+
+test "response write" {
+  e = new_header
+  assert_eq wresp(mkresp(503, "", "HTTP/1.0", "GET", e, "abcdef", 6, [], false)), "HTTP/1.0 503 Service Unavailable\r\nContent-Length: 6\r\n\r\nabcdef"
+  assert_eq wresp(mkresp(200, "", "HTTP/1.0", "GET", e, "abcdef", -1, [], false)), "HTTP/1.0 200 OK\r\n\r\nabcdef"
+  assert_eq wresp(mkresp(200, "", "HTTP/1.1", "GET", e, "abcdef", -1, [], true)), "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\nabcdef"
+  assert_eq wresp(mkresp(200, "", "HTTP/1.1", "GET", e, "abcdef", -1, [], false)), "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\nabcdef"
+  assert_eq wresp(mkresp(200, "", "HTTP/1.1", "GET", e, "abcdef", -1, ["chunked"], false)), "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n6\r\nabcdef\r\n0\r\n\r\n"
+  assert_eq wresp(mkresp(200, "", "HTTP/1.1", "GET", e, "", 0, [], false)), "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"
+  assert_eq wresp(mkresp(200, "", "HTTP/1.1", "GET", e, "foo", 0, [], false)), "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\nfoo"
+  assert_eq wresp(mkresp(200, "", "HTTP/1.1", "GET", e, "abcdef", 6, ["chunked"], true)), "HTTP/1.1 200 OK\r\nConnection: close\r\nTransfer-Encoding: chunked\r\n\r\n6\r\nabcdef\r\n0\r\n\r\n"
+  assert_eq wresp(mkresp(204, "", "HTTP/1.1", "GET", hdr([("Foo", [" Bar\nBaz "])]), "", 0, ["chunked"], true)), "HTTP/1.1 204 No Content\r\nConnection: close\r\nFoo: Bar Baz\r\n\r\n"
+  assert_eq wresp(mkresp(200, "", "HTTP/1.1", "POST", new_header, "", 0, [], false)), "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"
+  assert_eq wresp(mkresp(200, "", "HTTP/1.1", "POST", new_header, "abcdef", -1, [], false)), "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\nabcdef"
+  assert_eq wresp(mkresp(7, "license to violate specs", "HTTP/1.0", "GET", new_header, "", 0, [], false)), "HTTP/1.0 007 license to violate specs\r\nContent-Length: 0\r\n\r\n"
+  assert_eq wresp(mkresp(123, "123 Sesame Street", "HTTP/1.0", "GET", new_header, "", 0, [], false)), "HTTP/1.0 123 Sesame Street\r\n\r\n"
+  assert_eq wresp(mkresp(204, "No Content", "HTTP/1.0", "GET", new_header, "", 0, [], false)), "HTTP/1.0 204 No Content\r\n\r\n"
+}
+
+test "response write invalid trailer" {
+  for t in [(hdr([("X-Trailer\r\nInjected: 1", ["ok"])]), "ERR net/http: invalid trailer field name \"X-Trailer\\r\\nInjected: 1\""), (hdr([("X-Trailer", ["evil\r\nInjected: 1"])]), "ERR net/http: invalid trailer field value for \"X-Trailer\"")] {
+    r = mkresp(200, "", "HTTP/1.1", "GET", new_header, "abcdef", -1, ["chunked"], false)
+    r.trailer = t[0]
+    assert_eq wresp(r), t[1]
+  }
+}
+
+test "response to HEAD has no body" {
+  r = mkresp(200, "", "HTTP/1.1", "HEAD", new_header, "abcdef", 6, [], false)
+  assert_eq wresp(r), "HTTP/1.1 200 OK\r\nContent-Length: 6\r\n\r\n"
+}
+
+test "written request reads back" {
+  r = mkreq("POST", "http://example.com/a?b=c", "", hdr([("X-A", ["1"])]), "hello", 5, [], false, new_header)
+  b = bytes.new_buffer([])
+  write_request(r, b).unwrap
+  back = read_request(bufio.new_reader(b)).unwrap.unwrap
+  assert_eq back.method, "POST"
+  assert_eq back.request_uri, "/a?b=c"
+  assert_eq back.host, "example.com"
+  assert_eq back.body_string, "hello"
+  assert_eq back.header.get("X-A"), "1"
+  assert_eq back.content_length, 5
+}

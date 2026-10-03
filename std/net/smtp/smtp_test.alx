@@ -1,0 +1,389 @@
+# Go's net/smtp tests (smtp_test.go, example_test.go), translated. The
+# fake connections are a struct reading a server script from one buffer and
+# recording the client's commands in another, as Go's faker does.
+import "bytes"
+import "net"
+import "net/textproto"
+import "strings"
+
+struct Fake {
+  rd: bytes.Buffer
+  wr: bytes.Buffer
+
+  pub def read!(p: [Byte]) -> ~Int {
+    r = rd
+    r.read!(p)
+  }
+
+  pub def write!(p: [Byte]) -> ~Int {
+    w = wr
+    w.write!(p)
+  }
+
+  pub def close! -> ~Unit {
+    return
+  }
+}
+
+def crlf(s: Str) -> Str {
+  strings.join(strings.split(s, "\n"), "\r\n")
+}
+
+def fake(server: Str) -> (Fake, bytes.Buffer) {
+  out = bytes.new_buffer([])
+  (Fake.new(rd: bytes.new_buffer_string(server), wr: out), out)
+}
+
+# Go's `&Client{Text: textproto.NewConn(fake), localName: "localhost"}`.
+def fake_client(server: Str) -> (Client[Fake], bytes.Buffer) {
+  f, out = fake(crlf(server))
+  (client_over(f, ""), out)
+}
+
+def set_tls(c: Client[Fake], name: Str) {
+  cc = c
+  cc.st[0].tls = true
+  cc.st[0].server_name = name
+}
+
+def set_did_hello(c: Client[Fake]) {
+  cc = c
+  cc.st[0].did_hello = true
+}
+
+def bstr(b: [Byte]?) -> Str {
+  if x = b {
+    return Str.from_bytes(x)
+  }
+  "<nil>"
+}
+
+test "auth" {
+  info = ServerInfo.new(name: "testserver", tls: true, auth: [])
+  a1 = plain_auth("", "user", "pass", "testserver")
+  name, resp = a1.start(info).unwrap
+  assert_eq name, "PLAIN"
+  assert_eq Str.from_bytes(resp), "\x00user\x00pass"
+  a2 = plain_auth("foo", "bar", "baz", "testserver")
+  name, resp = a2.start(info).unwrap
+  assert_eq name, "PLAIN"
+  assert_eq Str.from_bytes(resp), "foo\x00bar\x00baz"
+  a3 = cram_md5_auth("user", "pass")
+  name, resp = a3.start(info).unwrap
+  assert_eq name, "CRAM-MD5"
+  assert_eq resp.size, 0
+  assert_eq bstr(a3.next("<123456.1322876914@testserver>".bytes.to_a, true).unwrap), "user 287eb355114cf5c471c26a875f1ca4ae"
+  assert_eq bstr(a3.next([], false).unwrap), "<nil>"
+  assert_eq a1.next([], true).err.unwrap.message, "unexpected server challenge"
+}
+
+test "auth plain" {
+  tests = [
+    ("servername", ServerInfo.new(name: "servername", tls: true, auth: []), ""),
+    ("localhost", ServerInfo.new(name: "localhost", tls: false, auth: []), ""),
+    ("servername", ServerInfo.new(name: "servername", tls: false, auth: ["PLAIN"]), "unencrypted connection"),
+    ("servername", ServerInfo.new(name: "servername", tls: false, auth: ["CRAM-MD5"]), "unencrypted connection"),
+    ("servername", ServerInfo.new(name: "attacker", tls: true, auth: []), "wrong host name")
+  ]
+  for t in tests {
+    a = plain_auth("foo", "bar", "baz", t[0])
+    r = a.start(t[1])
+    got = r.err? ? r.err.unwrap.message : ""
+    assert_eq got, t[2]
+  }
+}
+
+# Go's toServerEmptyAuth: no initial response, and Next must not be called.
+struct EmptyAuth {
+  pub def start(server: ServerInfo) -> ~(Str, [Byte]) {
+    e: [Byte] = []
+    ("FOOAUTH", e)
+  }
+
+  pub def next(from_server: [Byte], more: Bool) -> ~[Byte]? {
+    assert false, "unexpected call"
+    none
+  }
+}
+
+test "client auth trim space" {
+  f, wrote = fake("220 hello world\r\n200 some more")
+  c = new_client(f, "fake.host").unwrap
+  set_tls(c, "fake.host")
+  set_did_hello(c)
+  c.auth!(EmptyAuth.new)
+  c.close!
+  assert_eq wrote.to_s, "AUTH FOOAUTH\r\n*\r\nQUIT\r\n"
+}
+
+BASIC_SERVER = "250 mx.google.com at your service\n502 Unrecognized command.\n250-mx.google.com at your service\n250-SIZE 35651584\n250-AUTH LOGIN PLAIN\n250 8BITMIME\n530 Authentication required\n252 Send some mail, I'll try my best\n250 User is valid\n235 Accepted\n250 Sender OK\n250 Receiver OK\n354 Go ahead\n250 Data OK\n221 OK\n"
+
+BASIC_CLIENT = "HELO localhost\nEHLO localhost\nEHLO localhost\nMAIL FROM:<user@gmail.com> BODY=8BITMIME\nVRFY user1@gmail.com\nVRFY user2@gmail.com\nAUTH PLAIN AHVzZXIAcGFzcw==\nMAIL FROM:<user@gmail.com> BODY=8BITMIME\nRCPT TO:<golang-nuts@googlegroups.com>\nDATA\nFrom: user@gmail.com\nTo: golang-nuts@googlegroups.com\nSubject: Hooray for Go\n\nLine 1\n..Leading dot line .\nGoodbye.\n.\nQUIT\n"
+
+test "basic" {
+  c, out = fake_client(BASIC_SERVER)
+  c.helo!.unwrap
+  assert c.ehlo!.err?, "expected first EHLO to fail"
+  c.ehlo!.unwrap
+  set_did_hello(c)
+  assert_eq c.extension!("aUtH"), "LOGIN PLAIN"
+  assert_eq c.extension!("DSN"), none
+  assert c.mail!("user@gmail.com").err?, "MAIL should require authentication"
+  assert c.verify!("user1@gmail.com").err?, "first VRFY: expected no verification"
+  assert c.verify!("user2@gmail.com>\r\nDATA\r\nAnother injected message body\r\n.\r\nQUIT\r\n").err?, "VRFY injection"
+  c.verify!("user2@gmail.com").unwrap
+  # fake TLS so authentication won't complain
+  set_tls(c, "smtp.google.com")
+  c.auth!(plain_auth("", "user", "pass", "smtp.google.com")).unwrap
+  assert c.rcpt!("golang-nuts@googlegroups.com>\r\nDATA\r\nInjected message body\r\n.\r\nQUIT\r\n").err?, "RCPT injection"
+  assert c.mail!("user@gmail.com>\r\nDATA\r\nAnother injected message body\r\n.\r\nQUIT\r\n").err?, "MAIL injection"
+  c.mail!("user@gmail.com").unwrap
+  c.rcpt!("golang-nuts@googlegroups.com").unwrap
+  msg = "From: user@gmail.com\nTo: golang-nuts@googlegroups.com\nSubject: Hooray for Go\n\nLine 1\n.Leading dot line .\nGoodbye."
+  w = c.data!.unwrap
+  w.write_string!(msg).unwrap
+  w.close!.unwrap
+  c.quit!.unwrap
+  assert_eq out.to_s, crlf(BASIC_CLIENT)
+}
+
+test "HELO failed" {
+  c, out = fake_client("502 EH?\n502 EH?\n221 OK\n")
+  assert c.hello!("localhost").err?, "expected EHLO to fail"
+  c.quit!.unwrap
+  assert_eq out.to_s, crlf("EHLO localhost\nHELO localhost\nQUIT\n")
+}
+
+test "extensions: helo" {
+  c, out = fake_client("250 mx.google.com at your service\n250 Sender OK\n221 Goodbye\n")
+  c.helo!.unwrap
+  set_did_hello(c)
+  c.mail!("user@gmail.com").unwrap
+  c.quit!.unwrap
+  assert_eq out.to_s, crlf("HELO localhost\nMAIL FROM:<user@gmail.com>\nQUIT\n")
+}
+
+test "extensions: ehlo" {
+  c, out = fake_client("250-mx.google.com at your service\n250 SIZE 35651584\n250 Sender OK\n221 Goodbye\n")
+  c.hello!("localhost").unwrap
+  assert !c.extension!("8BITMIME").present?
+  assert !c.extension!("SMTPUTF8").present?
+  c.mail!("user@gmail.com").unwrap
+  c.quit!.unwrap
+  assert_eq out.to_s, crlf("EHLO localhost\nMAIL FROM:<user@gmail.com>\nQUIT\n")
+}
+
+test "extensions: ehlo 8bitmime" {
+  c, out = fake_client("250-mx.google.com at your service\n250-SIZE 35651584\n250 8BITMIME\n250 Sender OK\n221 Goodbye\n")
+  c.hello!("localhost").unwrap
+  assert c.extension!("8BITMIME").present?
+  assert !c.extension!("SMTPUTF8").present?
+  c.mail!("user@gmail.com").unwrap
+  c.quit!.unwrap
+  assert_eq out.to_s, crlf("EHLO localhost\nMAIL FROM:<user@gmail.com> BODY=8BITMIME\nQUIT\n")
+}
+
+test "extensions: ehlo smtputf8" {
+  c, out = fake_client("250-mx.google.com at your service\n250-SIZE 35651584\n250 SMTPUTF8\n250 Sender OK\n221 Goodbye\n")
+  c.hello!("localhost").unwrap
+  assert !c.extension!("8BITMIME").present?
+  assert c.extension!("SMTPUTF8").present?
+  c.mail!("user+📧@gmail.com").unwrap
+  c.quit!.unwrap
+  assert_eq out.to_s, crlf("EHLO localhost\nMAIL FROM:<user+📧@gmail.com> SMTPUTF8\nQUIT\n")
+}
+
+test "extensions: ehlo 8bitmime smtputf8" {
+  c, out = fake_client("250-mx.google.com at your service\n250-SIZE 35651584\n250-8BITMIME\n250 SMTPUTF8\n250 Sender OK\n221 Goodbye\n\t")
+  c.hello!("localhost").unwrap
+  set_did_hello(c)
+  assert c.extension!("8BITMIME").present?
+  assert c.extension!("SMTPUTF8").present?
+  c.mail!("user+📧@gmail.com").unwrap
+  c.quit!.unwrap
+  assert_eq out.to_s, crlf("EHLO localhost\nMAIL FROM:<user+📧@gmail.com> BODY=8BITMIME SMTPUTF8\nQUIT\n")
+}
+
+test "new client" {
+  f, out = fake(crlf("220 hello world\n250-mx.google.com at your service\n250-SIZE 35651584\n250-AUTH LOGIN PLAIN\n250 8BITMIME\n221 OK\n"))
+  c = new_client(f, "fake.host").unwrap
+  assert_eq c.extension!("aUtH"), "LOGIN PLAIN"
+  assert_eq c.extension!("DSN"), none
+  c.quit!.unwrap
+  assert_eq out.to_s, crlf("EHLO localhost\nQUIT\n")
+  c.close!
+}
+
+test "new client 2" {
+  f, out = fake(crlf("220 hello world\n502 EH?\n250-mx.google.com at your service\n250-SIZE 35651584\n250-AUTH LOGIN PLAIN\n250 8BITMIME\n221 OK\n"))
+  c = new_client(f, "fake.host").unwrap
+  assert_eq c.extension!("DSN"), none
+  c.quit!.unwrap
+  assert_eq out.to_s, crlf("EHLO localhost\nHELO localhost\nQUIT\n")
+}
+
+test "new client fails on a bad greeting" {
+  f, _ = fake("554 go away\r\n")
+  assert_eq new_client(f, "x").err.unwrap.message, "554 \"go away\""
+}
+
+test "hello" {
+  base_server = "220 hello world\n502 EH?\n250-mx.google.com at your service\n250 FEATURE\n"
+  hello_server = ["", "502 Not implemented\n", "250 User is valid\n", "235 Accepted\n", "250 Sender ok\n", "", "250 Reset ok\n", "221 Goodbye\n", "250 Sender ok\n", "250 ok\n"]
+  base_client = "EHLO customhost\nHELO customhost\n"
+  hello_client = ["", "STARTTLS\n", "VRFY test@example.com\n", "AUTH PLAIN AHVzZXIAcGFzcw==\n", "MAIL FROM:<test@example.com>\n", "", "RSET\n", "QUIT\n", "VRFY test@example.com\n", "NOOP\n"]
+  i = 0
+  while i < hello_server.size {
+    f, out = fake(crlf(base_server + hello_server[i]))
+    c = new_client(f, "fake.host").unwrap
+    c.st[0].local_name = "customhost"
+    err: Error? = none
+    if i == 0 {
+      assert c.hello!("hostinjection>\n\rDATA\r\nInjected message body\r\n.\r\nQUIT\r\n").err?, "hello injection"
+      err = c.hello!("customhost").err
+    } else if i == 1 {
+      e = c.start_tls!.err.unwrap
+      err = e.message == "502 \"Not implemented\"" ? none : e
+    } else if i == 2 {
+      err = c.verify!("test@example.com").err
+    } else if i == 3 {
+      set_tls(c, "smtp.google.com")
+      err = c.auth!(plain_auth("", "user", "pass", "smtp.google.com")).err
+    } else if i == 4 {
+      err = c.mail!("test@example.com").err
+    } else if i == 5 {
+      assert !c.extension!("feature").present?, "expected FEATURE not to be supported"
+    } else if i == 6 {
+      err = c.reset!.err
+    } else if i == 7 {
+      err = c.quit!.err
+    } else if i == 8 {
+      err = c.verify!("test@example.com").err
+      if err.present? {
+        err = c.hello!("customhost").err
+      }
+    } else {
+      err = c.noop!.err
+    }
+    assert !err.present?, "command #{i} failed"
+    assert_eq out.to_s, crlf(base_client + hello_client[i])
+    c.close!
+    i += 1
+  }
+}
+
+test "start tls after the server agrees" {
+  f, out = fake(crlf("220 hi\n250-x\n250 STARTTLS\n220 go ahead\n"))
+  c = new_client(f, "h").unwrap
+  assert c.extension!("starttls").present?
+  assert_eq c.start_tls!.err.unwrap.message, "smtp: STARTTLS is not supported (alx has no crypto/tls)"
+  assert_eq out.to_s, crlf("EHLO localhost\nSTARTTLS\n")
+}
+
+SEND_MAIL_SERVER = "220 hello world\n502 EH?\n250 mx.google.com at your service\n250 Sender ok\n250 Receiver ok\n354 Go ahead\n250 Data ok\n221 Goodbye\n"
+
+SEND_MAIL_CLIENT = "EHLO localhost\nHELO localhost\nMAIL FROM:<test@example.com>\nRCPT TO:<other@example.com>\nDATA\nFrom: test@example.com\nTo: other@example.com\nSubject: SendMail test\n\nSendMail is working for me.\n.\nQUIT\n"
+
+# Go's scripted server: sends each reply (continued ones together), then
+# records the client's line (lines, up to ".", after "354 Go ahead").
+def script_server(l: net.Listener, data: [Str]) -> ~Str {
+  conn = l.~accept
+  tc = textproto.new_conn(conn)
+  rec = strings.new_builder
+  i = 0
+  while i < data.size && data[i] != "" {
+    tc.~print_line!(data[i])
+    while data[i].size >= 4 && data[i][3] == 45 {
+      i += 1
+      tc.~print_line!(data[i])
+    }
+    break if data[i] == "221 Goodbye"
+    read = false
+    while !read || data[i] == "354 Go ahead" {
+      msg = tc.~read_line! || ""
+      rec.write!(msg + "\r\n")
+      read = true
+      break if data[i] == "354 Go ahead" && msg == "."
+    }
+    i += 1
+  }
+  conn.close!
+  rec.to_s
+}
+
+test "send mail" {
+  l = net.listen("tcp", "127.0.0.1:0").unwrap
+  addr = "127.0.0.1:#{l.port}"
+  data = strings.split(crlf(SEND_MAIL_SERVER), "\r\n")
+  srv = spawn { ~script_server(l, data) }
+  msg = crlf("From: test@example.com\nTo: other@example.com\nSubject: SendMail test\n\nSendMail is working for me.\n").bytes.to_a
+  no_auth: Auth? = none
+  assert send_mail(addr, no_auth, "test@example.com", ["other@example.com>\n\rDATA\r\nInjected message body\r\n.\r\nQUIT\r\n"], msg).err?, "injection"
+  send_mail(addr, no_auth, "test@example.com", ["other@example.com"], msg).unwrap
+  assert_eq srv.wait.unwrap, crlf(SEND_MAIL_CLIENT)
+  l.close!.unwrap
+}
+
+test "send mail with auth" {
+  l = net.listen("tcp", "127.0.0.1:0").unwrap
+  addr = "127.0.0.1:#{l.port}"
+  srv = spawn {
+    conn = l.~accept
+    tc = textproto.new_conn(conn)
+    tc.~print_line!("220 hello world")
+    msg = tc.~read_line! || ""
+    fail "unexpected response #{msg}" if msg != "EHLO localhost"
+    tc.~print_line!("250 mx.google.com at your service")
+    conn.close!
+  }
+  a: Auth? = plain_auth("", "user", "pass", "smtp.google.com")
+  r = send_mail(addr, a, "test@example.com", ["other@example.com"], "x".bytes.to_a)
+  assert_eq r.err.unwrap.message, "smtp: server doesn't support AUTH"
+  srv.wait.unwrap
+  l.close!.unwrap
+}
+
+test "auth failed" {
+  f, out = fake(crlf("220 hello world\n250-mx.google.com at your service\n250 AUTH LOGIN PLAIN\n535-Invalid credentials\n535 please see www.example.com\n221 Goodbye\n"))
+  c = new_client(f, "fake.host").unwrap
+  set_tls(c, "smtp.google.com")
+  r = c.auth!(plain_auth("", "user", "pass", "smtp.google.com"))
+  assert_eq r.err.unwrap.message, "535 \"Invalid credentials\\nplease see www.example.com\""
+  assert_eq out.to_s, crlf("EHLO localhost\nAUTH PLAIN AHVzZXIAcGFzcw==\n*\nQUIT\n")
+}
+
+test "auth with a CRAM-MD5 challenge" {
+  # 334 + base64("<123456.1322876914@testserver>")
+  f, out = fake(crlf("220 hi\n250-x\n250 AUTH CRAM-MD5\n334 PDEyMzQ1Ni4xMzIyODc2OTE0QHRlc3RzZXJ2ZXI+\n235 ok\n"))
+  c = new_client(f, "h").unwrap
+  c.auth!(cram_md5_auth("user", "pass")).unwrap
+  assert_eq out.to_s, crlf("EHLO localhost\nAUTH CRAM-MD5\ndXNlciAyODdlYjM1NTExNGNmNWM0NzFjMjZhODc1ZjFjYTRhZQ==\n")
+}
+
+# Go's examples talk to mail.example.com; they are compiled, not run.
+def example_client -> ~Unit {
+  c = ~dial("mail.example.com:25")
+  c.~mail!("sender@example.org")
+  c.~rcpt!("recipient@example.net")
+  wc = c.~data!
+  wc.~write_string!("This is the email body")
+  wc.~close!
+  c.~quit!
+}
+
+def example_plain_auth -> ~Unit {
+  hostname = "mail.example.com"
+  auth: Auth? = plain_auth("", "user@example.com", "password", hostname)
+  ~send_mail(hostname + ":25", auth, "gopher@example.net", ["foo@example.com"], "dummy message".bytes.to_a)
+}
+
+def example_send_mail -> ~Unit {
+  auth: Auth? = plain_auth("", "user@example.com", "password", "mail.example.com")
+  msg = "To: recipient@example.net\r\nSubject: discount Gophers!\r\n\r\nThis is the email body.\r\n".bytes.to_a
+  ~send_mail("mail.example.com:25", auth, "sender@example.org", ["recipient@example.net"], msg)
+}
+
+test "examples compile" {
+  f = [example_client, example_plain_auth, example_send_mail]
+  assert_eq f.size, 3
+}

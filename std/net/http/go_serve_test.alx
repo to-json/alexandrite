@@ -1,0 +1,356 @@
+# Go's serve_test.go: the tests the current API supports, translated
+# (handlers on in-process loopback servers bound to 127.0.0.1:0).
+import "bufio"
+import "bytes"
+import "net"
+import "strings"
+
+def serve_func(f: (ResponseWriter, Request) -> Unit) -> (Server, Int) {
+  srv = new_server_func(f)
+  ln = net.listen("tcp", "127.0.0.1:0").unwrap
+  port = ln.port
+  spawn { srv.serve(ln) }
+  (srv, port)
+}
+
+# Writes raw to a new connection, half-closes it, and returns everything
+# the server answered.
+def raw_exchange(port: Int, raw: Str) -> Str {
+  c = net.dial("tcp", "127.0.0.1:#{port}").unwrap
+  c.write_string!(raw).unwrap
+  c.close_write!.unwrap
+  out: [Byte] = []
+  buf: [Byte] = [0; 4096]
+  loop {
+    n = c.read!(buf).unwrap_or(0)
+    break if n == 0
+    out = out + buf[0...n]
+  }
+  c.close!.unwrap
+  Str.from_bytes(out)
+}
+
+def first_response(port: Int, raw: Str, head: Bool) -> Response {
+  s = raw_exchange(port, raw)
+  read_response(bufio.new_reader(bytes.new_buffer_string(s)), head).unwrap
+}
+
+# Go's TestRedirect.
+test "redirect" {
+  req = new_request("GET", "http://example.com/qux/", []).unwrap
+  tests = [
+    ("http://foobar.com/baz", "http://foobar.com/baz"),
+    ("https://foobar.com/baz", "https://foobar.com/baz"),
+    ("test://foobar.com/baz", "test://foobar.com/baz"),
+    ("//foobar.com/baz", "//foobar.com/baz"),
+    ("/foobar.com/baz", "/foobar.com/baz"),
+    ("foobar.com/baz", "/qux/foobar.com/baz"),
+    ("../quux/foobar.com/baz", "/quux/foobar.com/baz"),
+    ("///foobar.com/baz", "/foobar.com/baz"),
+    ("/foo?next=http://bar.com/", "/foo?next=http://bar.com/"),
+    ("http://localhost:8080/_ah/login?continue=http://localhost:8080/", "http://localhost:8080/_ah/login?continue=http://localhost:8080/"),
+    ("/фубар", "/%d1%84%d1%83%d0%b1%d0%b0%d1%80"),
+    ("http://foo.com/фубар", "http://foo.com/%d1%84%d1%83%d0%b1%d0%b0%d1%80")
+  ]
+  for t in tests {
+    rec = new_recording_writer
+    redirect(rec, req, t[0], 302)
+    assert_eq rec.status, 302
+    assert_eq rec.header.get("Location"), t[1]
+  }
+}
+
+# Go's TestRedirectContentTypeAndBody (a set but empty Content-Type is
+# written as an empty value list).
+test "redirect content type and body" {
+  tests = [
+    ("GET", 0, "text/html; charset=utf-8", "<a href=\"/foo\">Found</a>.\n\n"),
+    ("HEAD", 0, "text/html; charset=utf-8", ""),
+    ("POST", 0, "", ""),
+    ("DELETE", 0, "", ""),
+    ("foo", 0, "", ""),
+    ("GET", 1, "application/test", ""),
+    ("GET", 2, "", "")
+  ]
+  for t in tests {
+    req = new_request(t[0], "http://example.com/qux/", []).unwrap
+    rec = new_recording_writer
+    rec.header.set_raw!("Content-Type", ["application/test"]) if t[1] == 1
+    rec.header.set_raw!("Content-Type", []) if t[1] == 2
+    redirect(rec, req, "/foo", 302)
+    assert_eq rec.status, 302
+    assert_eq rec.header.get("Content-Type"), t[2]
+    assert_eq Str.from_bytes(rec.recorded_body), t[3]
+  }
+}
+
+# Go's TestMuxRedirectLeadingSlashes (through a server: the mux runs in
+# the server's scope).
+test "mux redirect leading slashes" {
+  mux = new_serve_mux
+  srv = new_server(mux)
+  ln = net.listen("tcp", "127.0.0.1:0").unwrap
+  port = ln.port
+  spawn { srv.serve(ln) }
+  for p in ["//foo.txt", "///foo.txt", "/../../foo.txt"] {
+    r = first_response(port, "GET #{p} HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\n", false)
+    assert_eq r.status, 307
+    assert_eq r.header.get("Location"), "/foo.txt"
+  }
+  srv.shutdown
+}
+
+# Go's TestMuxNoSlashRedirectWithTrailingSlash and
+# TestMuxNoSlash405WithTrailingSlash.
+test "mux no slash redirect with trailing slash" {
+  for pat in ["/{x}/", "GET /{x}/"] {
+    mux = new_serve_mux
+    mux.handle_func(pat) { |w, r| w.write_string!("ok\n") }
+    _, code = mux.lookup("GET", "/")
+    assert_eq code, 404
+  }
+}
+
+# Go's TestServeMuxHandlerTrailingSlash.
+test "serve mux handler trailing slash" {
+  mux = new_serve_mux
+  mux.handle_func("/{x}/") { |w, r| not_found(w, r) }
+  m = mux.find("POST", "/foo")
+  assert_eq m.code, 307
+}
+
+# Go's TestServeWithSlashRedirectKeepsQueryString.
+test "serve with slash redirect keeps query string" {
+  mux = new_serve_mux
+  mux.handle_func("/testOne") { |w, r| w.write_string!(r.raw_query) }
+  mux.handle_func("/testTwo/") { |w, r| w.write_string!(r.raw_query) }
+  mux.handle_func("/testThree") { |w, r| w.write_string!(r.raw_query) }
+  mux.handle_func("/testThree/") { |w, r| w.write_string!("#{r.raw_query}:bar") }
+  srv = new_server(mux)
+  ln = net.listen("tcp", "127.0.0.1:0").unwrap
+  port = ln.port
+  spawn { srv.serve(ln) }
+  tests = [
+    ("/testOne?this=that", "GET", "this=that", true),
+    ("/testTwo?foo=bar", "GET", "foo=bar", true),
+    ("/testTwo?a=1&b=2&a=3", "GET", "a=1&b=2&a=3", true),
+    ("/testTwo?", "GET", "", true),
+    ("/testThree?foo", "GET", "foo", true),
+    ("/testThree/?foo", "GET", "foo:bar", true),
+    ("/testThree?foo", "CONNECT", "foo", true),
+    ("/testThree/?foo", "CONNECT", "foo:bar", true),
+    ("/testOne/foo/..?foo", "GET", "foo", true),
+    ("/testOne/foo/..?foo", "CONNECT", "404 page not found\n", false)
+  ]
+  c = new_client
+  for t in tests {
+    req = new_request(t[1], "http://127.0.0.1:#{port}#{t[0]}", []).unwrap
+    res = c.do(req).unwrap
+    assert_eq res.status, 404 unless t[3]
+    assert_eq res.body_string, t[2]
+  }
+  srv.shutdown
+}
+
+# Go's TestServeHTTP10Close, TestClientCanClose,
+# TestHandlersCanSetConnectionClose11/10 (testTCPConnectionCloses).
+test "tcp connection closes" {
+  srv, port = serve_func(->(w: ResponseWriter, r: Request) {
+    w.header.set!("Connection", "close") if r.path == "/close"
+    w.write_string!("x") if r.path == "/file"
+  })
+  for raw in ["GET /file HTTP/1.0\r\n\r\n", "GET / HTTP/1.1\r\nHost: foo\r\nConnection: close\r\n\r\n", "GET /close HTTP/1.1\r\nHost: foo\r\n\r\n\r\n", "GET /close HTTP/1.0\r\nConnection: keep-alive\r\n\r\n"] {
+    c = net.dial("tcp", "127.0.0.1:#{port}").unwrap
+    c.write_string!(raw).unwrap
+    br = bufio.new_reader(c)
+    r = read_response(br, false).unwrap
+    assert r.close, raw
+    # the server closed its side
+    buf: [Byte] = [0; 16]
+    assert_eq br.read!(buf).unwrap_or(0), 0
+    c.close!.unwrap
+  }
+  srv.shutdown
+}
+
+# Go's TestHTTP10KeepAlive204Response, TestHTTP11KeepAlive204Response,
+# TestHTTP10KeepAlive304Response (testTCPConnectionStaysOpen).
+test "tcp connection stays open" {
+  srv, port = serve_func(->(w: ResponseWriter, r: Request) {
+    w.write_header!(r.path == "/304" ? 304 : 204)
+  })
+  for raw in ["GET / HTTP/1.0\r\nConnection: keep-alive\r\n\r\n", "GET / HTTP/1.1\r\nHost: foo\r\n\r\n", "GET /304 HTTP/1.0\r\nConnection: keep-alive\r\nIf-Modified-Since: Mon, 02 Jan 2006 15:04:05 GMT\r\n\r\n"] {
+    c = net.dial("tcp", "127.0.0.1:#{port}").unwrap
+    br = bufio.new_reader(c)
+    i = 0
+    while i < 2 {
+      c.write_string!(raw).unwrap
+      r = read_response(br, false).unwrap
+      assert r.status == 204 || r.status == 304
+      i += 1
+    }
+    c.close!.unwrap
+  }
+  srv.shutdown
+}
+
+# Go's TestHeadResponses.
+test "head responses" {
+  srv, port = serve_func(->(w: ResponseWriter, r: Request) {
+    w.write_string!("<html>").unwrap
+    w.write_string!("789a").unwrap
+  })
+  res = head("http://127.0.0.1:#{port}/").unwrap
+  assert_eq res.transfer_encoding.size, 0
+  assert_eq res.header.get("Content-Type"), "text/html; charset=utf-8"
+  assert_eq res.content_length, 10
+  assert_eq res.body.size, 0
+  srv.shutdown
+}
+
+# Go's TestCaseSensitiveMethod.
+test "case sensitive method" {
+  srv, port = serve_func(->(w: ResponseWriter, r: Request) {
+    w.write_string!(r.method)
+  })
+  req = new_request("get", "http://127.0.0.1:#{port}/", []).unwrap
+  assert_eq new_client.do(req).unwrap.body_string, "get"
+  srv.shutdown
+}
+
+# Go's TestContentLengthZero.
+test "content length zero" {
+  srv, port = serve_func(->(w: ResponseWriter, r: Request) {})
+  for version in ["HTTP/1.0", "HTTP/1.1"] {
+    c = net.dial("tcp", "127.0.0.1:#{port}").unwrap
+    c.write_string!("GET / #{version}\r\nConnection: keep-alive\r\nHost: foo\r\n\r\n").unwrap
+    r = read_response(bufio.new_reader(c), false).unwrap
+    assert_eq r.transfer_encoding.size, 0
+    assert_eq r.content_length, 0
+    c.close!.unwrap
+  }
+  srv.shutdown
+}
+
+# Go's TestOptions.
+test "options" {
+  uris = Chan[Str].new(4)
+  mux = new_serve_mux
+  mux.handle_func("/") { |w, r| uris << r.request_uri }
+  srv = new_server(mux)
+  ln = net.listen("tcp", "127.0.0.1:0").unwrap
+  port = ln.port
+  spawn { srv.serve(ln) }
+  c = net.dial("tcp", "127.0.0.1:#{port}").unwrap
+  br = bufio.new_reader(c)
+  c.write_string!("OPTIONS * HTTP/1.1\r\nHost: foo.com\r\n\r\n").unwrap
+  assert_eq read_response(br, false).unwrap.status, 200
+  c.write_string!("GET * HTTP/1.1\r\nHost: foo.com\r\n\r\n").unwrap
+  assert_eq read_response(br, false).unwrap.status, 400
+  c.close!.unwrap
+  get("http://127.0.0.1:#{port}/second").unwrap
+  assert_eq uris.recv.unwrap, "/second"
+  srv.shutdown
+}
+
+# Go's TestCodesPreventingContentTypeAndBody.
+test "codes preventing content type and body" {
+  for code in [304, 204] {
+    srv, port = serve_func(->(w: ResponseWriter, r: Request) {
+      w.header.set!("Content-Length", "123") if r.path == "/header"
+      c = r.query("c") || "204"
+      w.write_header!(c.to_i)
+      w.write_string!("stuff") if r.path == "/more"
+    })
+    for req in ["GET /?c=#{code} HTTP/1.0", "GET /header?c=#{code} HTTP/1.0", "GET /more?c=#{code} HTTP/1.0", "GET /?c=#{code} HTTP/1.1\r\nHost: foo", "GET /header?c=#{code} HTTP/1.1\r\nHost: foo", "GET /more?c=#{code} HTTP/1.1\r\nHost: foo"] {
+      got = raw_exchange(port, req + "\r\nConnection: close\r\n\r\n")
+      assert strings.contains(got, "#{code} #{status_text(code)}"), got
+      assert !strings.contains(got, "Content-Length"), got
+      assert !strings.contains(got, "stuff"), got
+    }
+    srv.shutdown
+  }
+}
+
+# Go's TestContentTypeOkayOn204.
+test "content type okay on 204" {
+  srv, port = serve_func(->(w: ResponseWriter, r: Request) {
+    w.header.set!("Content-Length", "123")
+    w.header.set!("Content-Type", "foo/bar")
+    w.write_header!(204)
+  })
+  got = raw_exchange(port, "GET / HTTP/1.1\r\nHost: foo\r\nConnection: close\r\n\r\n")
+  assert strings.contains(got, "Content-Type: foo/bar"), got
+  assert !strings.contains(got, "Content-Length: 123"), got
+  srv.shutdown
+}
+
+# Go's TestTolerateCRLFBeforeRequestLine.
+test "tolerate CRLF before request line" {
+  count = Atomic.new(0)
+  srv, port = serve_func(->(w: ResponseWriter, r: Request) {
+    count.add(1)
+    return
+  })
+  raw_exchange(port, "POST / HTTP/1.1\r\nHost: golang.org\r\nContent-Length: 3\r\n\r\nABC\r\n\r\nGET / HTTP/1.1\r\nHost: golang.org\r\n\r\n")
+  assert_eq count.load, 2
+  srv.shutdown
+}
+
+# Go's TestServerValidatesHeaders.
+test "server validates headers" {
+  srv, port = serve_func(->(w: ResponseWriter, r: Request) {})
+  xff = Str.from_bytes([0xFF])
+  tests = [
+    ("", 200),
+    ("Foo: bar\r\n", 200),
+    ("X-Foo: bar\r\n", 200),
+    ("Foo: a space\r\n", 200),
+    ("A space: foo\r\n", 400),
+    ("foo" + xff + "bar: foo\r\n", 400),
+    ("foo\x00bar: foo\r\n", 400),
+    ("Foo: " + strings.repeat("x", 1 << 21) + "\r\n", 431),
+    ("Foo : bar\r\n", 400),
+    ("Foo\t: bar\r\n", 400),
+    (": empty key\r\n", 400),
+    ("Content-Length: notdigits\r\n", 400),
+    ("Content-Length: notdigits\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n", 400),
+    ("foo: foo foo\r\n", 200),
+    ("foo: foo\tfoo\r\n", 200),
+    ("foo: foo\x00foo\r\n", 400),
+    ("foo: foo\x7ffoo\r\n", 400),
+    ("foo: foo" + xff + "foo\r\n", 200)
+  ]
+  for t in tests {
+    r = first_response(port, "GET / HTTP/1.1\r\nHost: foo\r\n" + t[0] + "\r\n", false)
+    assert r.status == t[1], "#{strings.repeat("", 0)}#{t[0].size > 100 ? "huge" : t[0]}: got #{r.status}"
+  }
+  srv.shutdown
+}
+
+# Go's TestServerValidatesMethod.
+test "server validates method" {
+  srv, port = serve_func(->(w: ResponseWriter, r: Request) {})
+  assert_eq first_response(port, "GET / HTTP/1.1\r\nHost: foo.example\r\n\r\n", false).status, 200
+  assert_eq first_response(port, "GE(T / HTTP/1.1\r\nHost: foo.example\r\n\r\n", false).status, 400
+  srv.shutdown
+}
+
+# Go's TestQuerySemicolon (the allow=false half; AllowQuerySemicolons is
+# missing).
+test "query semicolon" {
+  srv, port = serve_func(->(w: ResponseWriter, r: Request) {
+    x = r.parsed_url.query.get("x")
+    rr = r
+    e = rr.parse_form!
+    ok = e.err? && strings.contains(e.err.unwrap.message, "semicolon")
+    w.write_string!("#{x}|#{ok}|#{rr.form_value("x") || ""}")
+  })
+  tests = [("?a=1;x=bad&x=good", "good", true), ("?a=1;b=bad&x=good", "good", true), ("?a=1%3Bx=bad&x=good%3B", "good;", false), ("?a=1;x=good;x=bad", "", true)]
+  for t in tests {
+    res = get("http://127.0.0.1:#{port}/#{t[0]}").unwrap
+    assert_eq res.status, 200
+    assert_eq res.body_string, "#{t[1]}|#{t[2]}|#{t[1]}"
+  }
+  srv.shutdown
+}

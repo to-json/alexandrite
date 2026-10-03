@@ -1,0 +1,522 @@
+# Reading requests and responses off the wire, after Go's request.go
+# (readRequest), response.go (ReadResponse), transfer.go (readTransfer) and
+# internal/chunked.go. Bodies are read whole (alx has no streaming bodies).
+import "bufio"
+import "io"
+import "strconv"
+import "strings"
+import "net/textproto"
+import "encoding/base64"
+import nurl "net/url"
+
+# Go's ParseHTTPVersion: "HTTP/1.0" -> (1, 0); none if malformed.
+pub def parse_http_version(vers: Str) -> (Int, Int)? {
+  return (1, 1) if vers == "HTTP/1.1"
+  return (1, 0) if vers == "HTTP/1.0"
+  return none unless strings.has_prefix(vers, "HTTP/")
+  return none if vers.size != 8
+  return none if vers[6] != 46
+  return none unless vers[5] >= 48 && vers[5] <= 57 && vers[7] >= 48 && vers[7] <= 57
+  ((vers[5] - 48).to_i, (vers[7] - 48).to_i)
+}
+
+# The user name and password of a "Basic <base64(user:pass)>" credential
+# (the prefix is case-insensitive), none if malformed (Go's parseBasicAuth).
+pub def parse_basic_auth(auth: Str) -> (Str, Str)? {
+  return none if auth.size < 6 || !ascii_equal_fold?(auth[0...6], "Basic ")
+  c = base64.std_encoding.decode_string(auth[6...auth.size])
+  return none if c.err?
+  strings.cut(Str.from_bytes(c.unwrap), ":")
+}
+
+# Go's badStringError: `what "val"`.
+def bad_string(what: Str, val: Str) -> HttpError {
+  HttpError.Protocol("#{what} #{strconv.quote(val)}")
+}
+
+# Whether the comma-separated values hold `token` (ASCII
+# case-insensitively, Go's httpguts.HeaderValuesContainsToken).
+pub def header_values_contain_token?(values: [Str], token: Str) -> Bool {
+  for v in values {
+    for part in strings.split(v, ",") {
+      return true if ascii_equal_fold?(strings.trim(part, " \t"), token)
+    }
+  }
+  false
+}
+
+# a == b, ASCII case-insensitively; a non-ASCII byte never matches (Go's
+# tokenEqual / ascii.EqualFold).
+def ascii_equal_fold?(a: Str, b: Str) -> Bool {
+  return false if a.size != b.size
+  i = 0
+  while i < a.size {
+    x = a[i]
+    y = b[i]
+    return false if x >= 0x80 || y >= 0x80
+    x = x + 32 if x >= 65 && x <= 90
+    y = y + 32 if y >= 65 && y <= 90
+    return false if x != y
+    i += 1
+  }
+  true
+}
+
+# Go's shouldClose: whether a message with this version and header ends
+# its connection. With `remove`, a "Connection: close" header is deleted.
+def should_close(major: Int, minor: Int, h: Header, remove: Bool) -> Bool {
+  return true if major < 1
+  conv = h.raw("Connection") || []
+  has_close = header_values_contain_token?(conv, "close")
+  if major == 1 && minor == 0 {
+    return has_close || !header_values_contain_token?(conv, "keep-alive")
+  }
+  h.del!("Connection") if has_close && remove
+  has_close
+}
+
+def fix_pragma_cache_control(h: Header) {
+  hp = h.raw("Pragma") || []
+  if hp.size > 0 && hp[0] == "no-cache" && !h.raw("Cache-Control").present? {
+    h.set_raw!("Cache-Control", ["no-cache"])
+  }
+}
+
+# Whether a response with this status may have a body.
+pub def body_allowed_for_status?(status: Int) -> Bool {
+  !((status >= 100 && status <= 199) || status == 204 || status == 304)
+}
+
+# Go's parseContentLength over the Content-Length values (-1 if none).
+def parse_content_length(cl_headers: [Str]) -> ~Int {
+  return -1 if cl_headers.size == 0
+  cl = textproto.trim_string(cl_headers[0])
+  fail bad_string("invalid empty Content-Length", cl) if cl.size == 0
+  n = strconv.parse_uint(cl, 10, 63)
+  fail bad_string("bad Content-Length", cl) if n.err?
+  n.unwrap.to_i
+}
+
+# What readTransfer found out about a message's body.
+struct Transfer {
+  chunked: Bool
+  # The body length to read: -1 to the end of the stream (or none).
+  real_length: Int
+  # The value of the ContentLength field.
+  content_length: Int
+  close: Bool
+  trailer: Header
+}
+
+# Go's readTransfer, minus the body itself.
+def read_transfer(h: Header, is_response: Bool, status: Int, request_method: Str, major0: Int, minor0: Int, close0: Bool) -> ~Transfer {
+  major = major0
+  minor = minor0
+  if major == 0 && minor == 0 {
+    major = 1
+    minor = 1
+  }
+  close = close0
+  close = should_close(major0, minor0, h, true) if is_response
+  # parseTransferEncoding
+  chunked = false
+  if raw = h.raw("Transfer-Encoding") {
+    h.del_raw!("Transfer-Encoding")
+    if major > 1 || (major == 1 && minor >= 1) {
+      if raw.size != 1 {
+        fail HttpError.UnsupportedTE("too many transfer encodings: [#{strings.join(raw.map { |x| strconv.quote(x) }.to_a, " ")}]")
+      }
+      fail HttpError.UnsupportedTE("unsupported transfer encoding: #{strconv.quote(raw[0])}") unless ascii_equal_fold?(raw[0], "chunked")
+      chunked = true
+    }
+  }
+  # fixLength
+  real = 0
+  cls = h.raw("Content-Length") || []
+  if cls.size > 1 {
+    first = textproto.trim_string(cls[0])
+    for ct in cls[1...cls.size] {
+      if first != textproto.trim_string(ct) {
+        fail HttpError.Protocol("http: message cannot contain multiple Content-Length headers; got [#{strings.join(cls.map { |x| strconv.quote(x) }.to_a, " ")}]")
+      }
+    }
+    h.del!("Content-Length")
+    h.add!("Content-Length", first)
+    cls = h.raw("Content-Length") || []
+  }
+  n = 0
+  n = ~parse_content_length(cls) if cls.size > 0
+  decided = false
+  if is_response && request_method == "HEAD" {
+    real = 0
+    decided = true
+  } else if status / 100 == 1 || status == 204 || status == 304 {
+    real = 0
+    decided = true
+  } else if chunked {
+    h.del!("Content-Length")
+    real = -1
+    decided = true
+  } else if cls.size > 0 {
+    real = n
+    decided = true
+  }
+  if !decided {
+    h.del!("Content-Length")
+    real = is_response ? -1 : 0
+  }
+  content_length = real
+  if is_response && request_method == "HEAD" {
+    content_length = ~parse_content_length(h.raw("Content-Length") || [])
+  }
+  # fixTrailer
+  trailer = new_header
+  if vv = h.raw("Trailer") {
+    if chunked {
+      h.del!("Trailer")
+      for v in vv {
+        for f in strings.split(textproto.trim_string(v), ",") {
+          key = textproto.trim_string(f)
+          next if key.size == 0
+          key = canonical_key(key)
+          if key == "Transfer-Encoding" || key == "Trailer" || key == "Content-Length" {
+            fail bad_string("bad trailer key", key)
+          }
+          trailer.set_raw!(key, [])
+        }
+      }
+    }
+  }
+  if is_response && real == -1 && !chunked && body_allowed_for_status?(status) {
+    close = true
+  }
+  Transfer.new(chunked: chunked, real_length: real, content_length: content_length, close: close, trailer: trailer)
+}
+
+# ------------------------------------------------------------- headers
+
+# The header block up to its blank line (Go's textproto readMIMEHeader over
+# the bufio.Reader): continued lines, Go's validation and error messages.
+# `budget` counts the bytes of the message head read so far against
+# MAX_HEADER_BYTES; more than MAX_HEADERS values is HeadersTooLarge.
+def read_header_block(br: bufio.Reader, budget0: Int) -> ~Header {
+  budget = budget0
+  m = new_header
+  count = 0
+  pk = br.~peek!(1)
+  if pk.size > 0 && (pk[0] == 32 || pk[0] == 9) {
+    l = br.~read_line!
+    fail HttpError.Protocol("malformed MIME header initial line: #{strconv.quote(l || "")}")
+  }
+  loop {
+    lo = br.~read_line!
+    fail io.StreamError.UnexpectedEof unless lo.present?
+    line = lo.unwrap
+    budget += line.size + 2
+    fail HttpError.HeadersTooLarge if budget > MAX_HEADER_BYTES + 4096
+    return m if line.size == 0
+    i = strings.index_byte(line, 58)
+    fail HttpError.Protocol("malformed MIME header: missing colon: #{strconv.quote(line)}") if i < 0
+    kv = trim_sp(line)
+    # continuation lines
+    loop {
+      p = br.~peek!(1)
+      break unless p.size > 0 && (p[0] == 32 || p[0] == 9)
+      loop {
+        b = br.~read_byte!
+        if c = b {
+          if c != 32 && c != 9 {
+            br.~unread_byte!
+            break
+          }
+        } else {
+          break
+        }
+      }
+      kv = kv + " "
+      more = br.~read_line!
+      if x = more {
+        budget += x.size + 2
+        fail HttpError.HeadersTooLarge if budget > MAX_HEADER_BYTES + 4096
+        kv = kv + trim_sp(x)
+      } else {
+        break
+      }
+    }
+    j = strings.index_byte(kv, 58)
+    fail HttpError.Protocol("malformed MIME header line: #{strconv.quote(kv)}") if j < 0
+    key = header_key_ok(kv[0...j])
+    fail HttpError.Protocol("malformed MIME header line: #{strconv.quote(kv)}") unless key.present?
+    k = key.unwrap
+    v = kv[j + 1...kv.size]
+    for c in v.bytes {
+      fail HttpError.Protocol("malformed MIME header line: #{strconv.quote(k + kv[j...kv.size])}") unless textproto.valid_header_value_byte?(c)
+    }
+    count += 1
+    fail HttpError.HeadersTooLarge if count > MAX_HEADERS
+    vs = 0
+    while vs < v.size && (v[vs] == 32 || v[vs] == 9) {
+      vs += 1
+    }
+    value = v[vs...v.size]
+    if old = m.raw(k) {
+      old << value
+      m.set_raw!(k, old)
+    } else {
+      m.set_raw!(k, [value])
+    }
+  }
+}
+
+def trim_sp(s: Str) -> Str {
+  strings.trim(s, " \t")
+}
+
+# textproto's canonicalMIMEHeaderKey: the canonical key, or none if the
+# name is invalid (a name with spaces is kept as it is).
+def header_key_ok(a: Str) -> Str? {
+  return none if a.size == 0
+  spaces = false
+  for c in a.bytes {
+    next if textproto.valid_header_field_byte?(c)
+    if c == 32 {
+      spaces = true
+      next
+    }
+    return none
+  }
+  return a if spaces
+  textproto.canonical_mime_header_key(a)
+}
+
+# ---------------------------------------------------------------- bodies
+
+def read_raw_line(br: bufio.Reader) -> ~Str {
+  s = br.~read_string!(10)
+  fail io.StreamError.UnexpectedEof unless s.present?
+  line = s.unwrap
+  fail io.StreamError.UnexpectedEof if line[line.size - 1] != 10
+  line
+}
+
+# A chunked body (Go's chunkedReader) and its trailer, read whole; trailer
+# values go into `trailer`.
+def read_chunked_body(br: bufio.Reader, limit: Int, trailer: Header) -> ~[Byte] {
+  out: [Byte] = []
+  excess = 0
+  loop {
+    p = ~read_raw_line(br)
+    idx = strings.index_byte(p, 13)
+    fail HttpError.Protocol("chunked line ends with bare LF") if idx < 0
+    fail HttpError.Protocol("invalid CR in chunked line") if idx != p.size - 2
+    line = p[0...p.size - 2]
+    fail HttpError.Protocol("header line too long") if line.size >= 4096
+    excess += line.size + 2
+    line = strings.trim_right(line, " \t")
+    if c = strings.cut(line, ";") {
+      line, _ = c
+    }
+    fail HttpError.Protocol("empty hex number for chunk length") if line.size == 0
+    n = 0
+    i = 0
+    while i < line.size {
+      b = line[i]
+      d = -1
+      d = (b - 48).to_i if b >= 48 && b <= 57
+      d = (b - 87).to_i if b >= 97 && b <= 102
+      d = (b - 55).to_i if b >= 65 && b <= 70
+      fail HttpError.Protocol("invalid byte in chunk length") if d < 0
+      fail HttpError.Protocol("http chunk length too large") if i == 16
+      fail HttpError.TooLarge("body") if n > (MAX_BODY_BYTES >> 4)
+      n = (n << 4) | d
+      i += 1
+    }
+    excess -= 16 + 2 * n
+    excess = 0 if excess < 0
+    fail HttpError.Protocol("chunked encoding contains too much non-data") if excess > 16 * 1024
+    break if n == 0
+    fail HttpError.TooLarge("body") if out.size + n > limit
+    data = ~read_exact_n(br, n)
+    out = out + data
+    crlf = br.~peek!(2)
+    fail io.StreamError.UnexpectedEof if crlf.size < 2
+    fail HttpError.Protocol("malformed chunked encoding") if crlf[0] != 13 || crlf[1] != 10
+    br.~discard!(2)
+  }
+  # the trailer (Go's body.readTrailer)
+  pk = br.~peek!(2)
+  if pk.size == 2 && pk[0] == 13 && pk[1] == 10 {
+    br.~discard!(2)
+    return out
+  }
+  fail HttpError.Protocol("http: unexpected EOF reading trailer") if pk.size < 2
+  th = read_header_block(br, 0)
+  if e = th.err {
+    eof = false
+    case e {
+      UnexpectedEof => eof = true
+      _ => eof = false
+    }
+    fail HttpError.Protocol("http: unexpected EOF reading trailer") if eof
+    fail e
+  }
+  t = th.unwrap
+  for k in t.keys {
+    trailer.set_raw!(k, t.raw(k) || [])
+  }
+  out
+}
+
+# Reads n bytes; fails with io's UnexpectedEof if the stream ends first.
+def read_exact_n(br: bufio.Reader, n: Int) -> ~[Byte] {
+  buf = zeros(n)
+  got = 0
+  while got < n {
+    k = br.~read!(buf[got...n])
+    fail io.StreamError.UnexpectedEof if k == 0
+    got += k
+  }
+  buf
+}
+
+def read_to_eof(br: bufio.Reader) -> ~[Byte] {
+  out: [Byte] = []
+  buf = zeros(4096)
+  loop {
+    k = br.~read!(buf)
+    break if k == 0
+    fail HttpError.TooLarge("body") if out.size + k > MAX_BODY_BYTES
+    out = out + buf[0...k]
+  }
+  out
+}
+
+# ---------------------------------------------------------------- requests
+
+# Reads one request from br, Go's http.ReadRequest: the request line, the
+# header and the whole body. none if the stream ended before the request
+# started (Go's io.EOF); a stream ending inside it is io's UnexpectedEof.
+# Errors carry Go's messages. The Host header is removed from `header`
+# (it is in `host`), as Go's ReadRequest does.
+pub def read_request(br: bufio.Reader) -> ~Request? {
+  ro = ~read_request_head(br, false)
+  if r = ro {
+    req = r
+    req.body = ~read_request_body(br, r)
+    req.header.del_raw!("Host")
+    return req
+  }
+  none
+}
+
+# The request line and header (Go's readRequest); `skip_crlf` drops empty
+# lines before it (Go's server does after a POST).
+def read_request_head(br: bufio.Reader, skip_crlf: Bool) -> ~Request? {
+  lo = br.~read_line!
+  return none unless lo.present?
+  s = lo.unwrap
+  while skip_crlf && s.size == 0 {
+    lo = br.~read_line!
+    return none unless lo.present?
+    s = lo.unwrap
+  }
+  fail HttpError.HeadersTooLarge if s.size > MAX_HEADER_BYTES + 4096
+  # parseRequestLine
+  c1 = strings.cut(s, " ")
+  fail bad_string("malformed HTTP request", s) unless c1.present?
+  method, rest = c1.unwrap
+  c2 = strings.cut(rest, " ")
+  fail bad_string("malformed HTTP request", s) unless c2.present?
+  request_uri, proto = c2.unwrap
+  fail bad_string("invalid method", method) unless token?(method)
+  vers = parse_http_version(proto)
+  fail bad_string("malformed HTTP version", proto) unless vers.present?
+  major, minor = vers.unwrap
+  rawurl = request_uri
+  just_authority = method == "CONNECT" && !strings.has_prefix(rawurl, "/")
+  rawurl = "http://" + rawurl if just_authority
+  pu = nurl.parse_request_uri(rawurl)
+  fail pu.err.unwrap if pu.err?
+  u = pu.unwrap
+  u.scheme = "" if just_authority
+  h = ~read_header_block(br, s.size + 2)
+  hosts = h.raw("Host") || []
+  fail HttpError.Protocol("too many Host headers") if hosts.size > 1
+  host = u.host
+  host = hosts[0] if host.size == 0 && hosts.size > 0
+  fix_pragma_cache_control(h)
+  close = should_close(major, minor, h, false)
+  t = ~read_transfer(h, false, 200, method, major, minor, close)
+  te: [Str] = []
+  te << "chunked" if t.chunked
+  cl = t.content_length
+  close2 = t.close
+  # Go's isH2Upgrade: the HTTP/2 client preface
+  if method == "PRI" && h.size == 0 && u.path == "*" && proto == "HTTP/2.0" {
+    cl = -1
+    close2 = true
+  }
+  pv: Map[Str, Str] = {}
+  Request.new(method: method, url: request_uri, path: u.path, raw_query: u.raw_query, proto: proto, host: host, header: h, body: [], remote_addr: "", pathvals: pv, request_uri: request_uri, parsed_url: u, proto_major: major, proto_minor: minor, content_length: cl, transfer_encoding: te, close: close2, trailer: t.trailer, form: nurl.new_values, post_form: nurl.new_values)
+}
+
+# Reads the body of a request whose head read_request_head returned.
+def read_request_body(br: bufio.Reader, req: Request) -> ~[Byte] {
+  if req.transfer_encoding.size > 0 {
+    tr = req.trailer
+    return ~read_chunked_body(br, MAX_BODY_BYTES, tr)
+  }
+  if req.content_length > 0 {
+    fail HttpError.TooLarge("body") if req.content_length > MAX_BODY_BYTES
+    return ~read_exact_n(br, req.content_length)
+  }
+  out: [Byte] = []
+  out
+}
+
+# --------------------------------------------------------------- responses
+
+# Reads one response from br (Go's http.ReadResponse; `head`: it answers a
+# HEAD request). The body is read whole: by Content-Length, chunked, or to
+# the end of the stream when the response has neither.
+pub def read_response(br: bufio.Reader, head: Bool) -> ~Response {
+  lo = br.~read_line!
+  fail io.StreamError.UnexpectedEof unless lo.present?
+  line = lo.unwrap
+  c1 = strings.cut(line, " ")
+  fail bad_string("malformed HTTP response", line) unless c1.present?
+  proto, status0 = c1.unwrap
+  status = strings.trim_left(status0, " ")
+  code_s = status
+  if c2 = strings.cut(status, " ") {
+    code_s, _ = c2
+  }
+  fail bad_string("malformed HTTP status code", code_s) if code_s.size != 3
+  code = strconv.atoi(code_s).unwrap_or(-1)
+  fail bad_string("malformed HTTP status code", code_s) if code < 0
+  vers = parse_http_version(proto)
+  fail bad_string("malformed HTTP version", proto) unless vers.present?
+  major, minor = vers.unwrap
+  h = ~read_header_block(br, 0)
+  fix_pragma_cache_control(h)
+  t = ~read_transfer(h, true, code, head ? "HEAD" : "GET", major, minor, false)
+  body: [Byte] = []
+  te: [Str] = []
+  te << "chunked" if t.chunked
+  tr = t.trailer
+  if t.chunked {
+    if !head && body_allowed_for_status?(code) {
+      body = ~read_chunked_body(br, MAX_BODY_BYTES, tr)
+    }
+  } else if t.real_length > 0 {
+    fail HttpError.TooLarge("body") if t.real_length > MAX_BODY_BYTES
+    body = ~read_exact_n(br, t.real_length)
+  } else if t.real_length < 0 && t.close {
+    body = ~read_to_eof(br)
+  }
+  text = ""
+  if c3 = strings.cut(status, " ") {
+    _, text = c3
+  }
+  Response.new(status: code, status_text: text, proto: proto, header: h, body: body, status_str: status, proto_major: major, proto_minor: minor, content_length: t.content_length, transfer_encoding: te, close: t.close, trailer: tr)
+}

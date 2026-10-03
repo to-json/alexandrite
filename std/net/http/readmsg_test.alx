@@ -1,0 +1,242 @@
+# Go's readrequest_test.go and response_test.go (TestReadRequest,
+# TestReadRequest_Bad, TestReadResponse): their tables are part of the
+# generated vec_readmsg_test.alx, through the helpers below. Hand-written
+# cases for the rest of response_test.go and request_test.go follow.
+import "bytes"
+import "strings"
+
+def render_hdr(h: Header) -> Str {
+  parts: [Str] = []
+  for k in h.keys.sort {
+    parts << k + "=[" + strings.join(h.raw(k) || [], "|") + "]"
+  }
+  "{" + strings.join(parts, ";") + "}"
+}
+
+def err_str(e: Error) -> Str {
+  "ERR " + e.message
+}
+
+def rreq(raw: Str) -> Str {
+  br = bufio.new_reader(bytes.new_buffer_string(raw))
+  res = read_request(br)
+  return err_str(res.err.unwrap) if res.err?
+  o = res.unwrap
+  return "EOF" unless o.present?
+  r = o.unwrap
+  u = r.parsed_url
+  "#{r.method}|#{r.request_uri}|#{u.scheme},#{u.host},#{u.path},#{u.raw_query}|#{r.proto} #{r.proto_major}.#{r.proto_minor}|host=#{r.host}|#{render_hdr(r.header)}|cl=#{r.content_length}|te=#{strings.join(r.transfer_encoding, ",")}|close=#{r.close}|tr=#{render_hdr(r.trailer)}|#{r.body_string}"
+}
+
+def rresp(raw: Str, head: Bool) -> Str {
+  br = bufio.new_reader(bytes.new_buffer_string(raw))
+  res = read_response(br, head)
+  return err_str(res.err.unwrap) if res.err?
+  r = res.unwrap
+  "#{r.status}|#{r.status_str}|#{r.proto} #{r.proto_major}.#{r.proto_minor}|#{render_hdr(r.header)}|cl=#{r.content_length}|te=#{strings.join(r.transfer_encoding, ",")}|close=#{r.close}|tr=#{render_hdr(r.trailer)}|#{r.body_string}"
+}
+
+test "parse HTTP version" {
+  # Go's TestParseHTTPVersion
+  tests = [
+    ("HTTP/0.0", 0, 0, true),
+    ("HTTP/0.9", 0, 9, true),
+    ("HTTP/1.0", 1, 0, true),
+    ("HTTP/1.1", 1, 1, true),
+    ("HTTP", 0, 0, false),
+    ("HTTP/one.one", 0, 0, false),
+    ("HTTP/1.1/", 0, 0, false),
+    ("HTTP/-1,0", 0, 0, false),
+    ("HTTP/0,-1", 0, 0, false),
+    ("HTTP/", 0, 0, false),
+    ("HTTP/1,1", 0, 0, false),
+    ("HTTP/+1.1", 0, 0, false),
+    ("HTTP/1.+1", 0, 0, false),
+    ("HTTP/0000000001.1", 0, 0, false),
+    ("HTTP/1.0000000001", 0, 0, false),
+    ("HTTP/3.14", 0, 0, false),
+    ("HTTP/12.3", 0, 0, false)
+  ]
+  for t in tests {
+    v = parse_http_version(t[0])
+    assert_eq v.present?, t[3]
+    if x = v {
+      assert_eq x, (t[1], t[2])
+    }
+  }
+}
+
+def resp_status_case(s: Str) -> Str { "HTTP/1.1 " + s + "\r\nFoo: bar\r\n\r\n" }
+
+def resp_version_case(s: Str) -> Str { s + " 200 OK\r\n\r\n" }
+
+# Go's TestReadResponseErrors: "" = no error, else a substring of the
+# message.
+test "read response errors" {
+  multi = "message cannot contain multiple Content-Length headers"
+  empty = "invalid empty Content-Length"
+  bad_status = "malformed HTTP status code"
+  bad_vers = "malformed HTTP version"
+  tests = [
+    ("", "unexpected EOF"),
+    ("HTTP/1.1 301 Moved Permanently\r\nFoo: bar", "unexpected EOF"),
+    ("HTTP/1.1", "malformed HTTP response"),
+    ("HTTP/2.0", "malformed HTTP response"),
+    (resp_status_case("20X Unknown"), bad_status),
+    (resp_status_case("abcd Unknown"), bad_status),
+    (resp_status_case("二百/两百 OK"), bad_status),
+    (resp_status_case(" Unknown"), bad_status),
+    (resp_status_case("c8 OK"), bad_status),
+    (resp_status_case("0x12d Moved Permanently"), bad_status),
+    (resp_status_case("200 OK"), ""),
+    (resp_status_case("000 OK"), ""),
+    (resp_status_case("001 OK"), ""),
+    (resp_status_case("404 NOTFOUND"), ""),
+    (resp_status_case("20 OK"), bad_status),
+    (resp_status_case("00 OK"), bad_status),
+    (resp_status_case("-10 OK"), bad_status),
+    (resp_status_case("1000 OK"), bad_status),
+    (resp_status_case("999 Done"), ""),
+    (resp_status_case("-1 OK"), bad_status),
+    (resp_status_case("-200 OK"), bad_status),
+    (resp_version_case("HTTP/1.2"), ""),
+    (resp_version_case("HTTP/2.0"), ""),
+    (resp_version_case("HTTP/1.100000000002"), bad_vers),
+    (resp_version_case("HTTP/1.-1"), bad_vers),
+    (resp_version_case("HTTP/A.B"), bad_vers),
+    (resp_version_case("HTTP/1"), bad_vers),
+    (resp_version_case("http/1.1"), bad_vers),
+    ("HTTP/1.1 200 OK\r\nContent-Length: 10\r\nContent-Length: 7\r\n\r\nGopher hey\r\n", multi),
+    ("HTTP/1.1 200 OK\r\nContent-Length: 7\r\nContent-Length: 7\r\n\r\nGophers\r\n", ""),
+    ("HTTP/1.1 201 OK\r\nContent-Length: 0\r\nContent-Length: 7\r\n\r\nGophers\r\n", multi),
+    ("HTTP/1.1 300 OK\r\nContent-Length: 0\r\nContent-Length: 0 \r\n\r\nGophers\r\n", ""),
+    ("HTTP/1.1 200 OK\r\nContent-Length:\r\nContent-Length:\r\n\r\nGophers\r\n", empty),
+    ("HTTP/1.1 206 OK\r\nContent-Length:\r\nContent-Length: 0 \r\nConnection: close\r\n\r\nGophers\r\n", multi),
+    ("HTTP/1.1 204 OK\r\nContent-Length: 7\r\nContent-Length: 8\r\n\r\n", multi),
+    ("HTTP/1.1 204 OK\r\nContent-Length: 3\r\nContent-Length: 3\r\n\r\n", ""),
+    ("HTTP/1.1 304 OK\r\nContent-Length: 880\r\nContent-Length: 1\r\n\r\n", multi),
+    ("HTTP/1.1 304 OK\r\nContent-Length: 961\r\nContent-Length: 961\r\n\r\n", ""),
+    ("HTTP/1.1 200 OK\r\n Content-type: text/html\r\nFoo: bar\r\n\r\n", "malformed MIME"),
+    ("HTTP/1.1 200 OK\r\n\tContent-type: text/html\r\nFoo: bar\r\n\r\n", "malformed MIME")
+  ]
+  for t in tests {
+    br = bufio.new_reader(bytes.new_buffer_string(t[0]))
+    res = read_response(br, false)
+    if t[1].size == 0 {
+      assert res.ok?, t[0]
+    } else {
+      assert res.err?, t[0]
+      assert strings.contains(res.err.unwrap.message, t[1]), t[0]
+    }
+  }
+}
+
+# Go's TestResponseStatusStutter.
+test "response status stutter" {
+  r = rresp("HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n", false)
+  assert r.start_with?("200|200 OK|")
+}
+
+# Go's TestResponseContentLengthShortBody.
+test "response content length short body" {
+  br = bufio.new_reader(bytes.new_buffer_string("HTTP/1.1 200 OK\r\nContent-Length: 123\r\n\r\nSome bytes"))
+  res = read_response(br, false)
+  assert_eq res.err.unwrap.message, "unexpected EOF"
+}
+
+# Go's TestReadRequest_Bad, by name.
+test "read request bad" {
+  bads = [
+    "CONNECT []%20%48%54%54%50%2f%31%2e%31%0a%4d%79%48%65%61%64%65%72%3a%20%31%32%33%0a%0a HTTP/1.0\r\n\r\n",
+    "POST / HTTP/1.1\r\nContent-Length: 3\r\nContent-Length: 4\r\n\r\nabc\r\n\r\n",
+    "HEAD / HTTP/1.1\r\nHost: foo\r\nContent-Length: 4\r\nContent-Length: 5\r\n\r\n1234\r\n\r\n",
+    "GET / HTTP/1.1\r\n Host: foo\r\n\r\n",
+    "GET / HTTP/1.1\r\n\tHost: foo\r\n\r\n"
+  ]
+  for b in bads {
+    br = bufio.new_reader(bytes.new_buffer_string(b))
+    assert read_request(br).err?, b
+  }
+}
+
+# Go's TestReadRequestErrors (readRequestErrorTests): the error substring
+# ("" none, "EOF" the clean end of input) and, without an error, the header.
+test "read request errors" {
+  tests = [
+    ("GET / HTTP/1.1\r\nheader:foo\r\n\r\n", "", "{Header=[foo]}"),
+    ("GET / HTTP/1.1\r\nheader:foo\r\n", "unexpected EOF", ""),
+    ("", "EOF", ""),
+    ("HEAD / HTTP/1.1\r\n\r\n", "", "{}"),
+    ("POST / HTTP/1.1\r\nContent-Length: 10\r\nContent-Length: 0\r\n\r\nGopher hey\r\n", "cannot contain multiple Content-Length headers", ""),
+    ("POST / HTTP/1.1\r\nContent-Length: 10\r\nContent-Length: 6\r\n\r\nGopher\r\n", "cannot contain multiple Content-Length headers", ""),
+    ("PUT / HTTP/1.1\r\nContent-Length: 6 \r\nContent-Length: 6\r\nContent-Length:6\r\n\r\nGopher\r\n", "", "{Content-Length=[6]}"),
+    ("PUT / HTTP/1.1\r\nContent-Length: 1\r\nContent-Length: 6 \r\n\r\n", "cannot contain multiple Content-Length headers", ""),
+    ("POST / HTTP/1.1\r\nContent-Length:\r\nContent-Length: 3\r\n\r\n", "cannot contain multiple Content-Length headers", ""),
+    ("HEAD / HTTP/1.1\r\nContent-Length:0\r\nContent-Length: 0\r\n\r\n", "", "{Content-Length=[0]}"),
+    ("HEAD / HTTP/1.1\r\nHost: foo\r\nHost: bar\r\n\r\n\r\n\r\n", "too many Host headers", "")
+  ]
+  for t in tests {
+    br = bufio.new_reader(bytes.new_buffer_string(t[0]))
+    res = read_request(br)
+    if t[1] == "EOF" {
+      assert !res.unwrap.present?
+    } else if t[1].size > 0 {
+      assert strings.contains(res.err.unwrap.message, t[1]), t[0]
+    } else {
+      assert_eq render_hdr(res.unwrap.unwrap.header), t[2]
+    }
+  }
+}
+
+test "chunked request trailer" {
+  r = rreq("POST / HTTP/1.1\r\nHost: x\r\nTrailer: X-T\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n0\r\nX-T: v\r\n\r\n")
+  assert_eq r, "POST|/|,,/,|HTTP/1.1 1.1|host=x|{}|cl=-1|te=chunked|close=false|tr={X-T=[v]}|abc"
+}
+
+# Go's TestParseTransferEncoding (transfer_test.go).
+test "parse transfer encoding" {
+  tests = [
+    (["fugazi"], "unsupported transfer encoding: \"fugazi\""),
+    (["chunked, chunked", "identity", "chunked"], "too many transfer encodings: [\"chunked, chunked\" \"identity\" \"chunked\"]"),
+    ([""], "unsupported transfer encoding: \"\""),
+    (["chunked, identity"], "unsupported transfer encoding: \"chunked, identity\""),
+    (["chunked", "identity"], "too many transfer encodings: [\"chunked\" \"identity\"]"),
+    (["\vchunked"], "unsupported transfer encoding: \"\\vchunked\""),
+    (["chunked"], "")
+  ]
+  for t in tests {
+    h = new_header
+    h.set_raw!("Transfer-Encoding", t[0])
+    res = read_transfer(h, false, 200, "GET", 1, 1, false)
+    if t[1].size == 0 {
+      assert res.ok?
+    } else {
+      assert_eq res.err.unwrap.message, t[1]
+    }
+  }
+}
+
+# Go's TestParseContentLength (transfer_test.go).
+test "parse content length" {
+  tests = [("", "invalid empty Content-Length \"\""), ("3", ""), ("+3", "bad Content-Length \"+3\""), ("-3", "bad Content-Length \"-3\""), ("9223372036854775807", ""), ("9223372036854775808", "bad Content-Length \"9223372036854775808\"")]
+  for t in tests {
+    res = parse_content_length([t[0]])
+    if t[1].size == 0 {
+      assert res.ok?
+    } else {
+      assert_eq res.err.unwrap.message, t[1]
+    }
+  }
+}
+
+# Go's TestFinalChunkedBodyReadEOF (transfer_test.go), whole-body form.
+test "final chunked body read EOF" {
+  r = rresp("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n" + "0a\r\nBody here\n\r\n" + "09\r\ncontinued\r\n" + "0\r\n\r\n", false)
+  assert r.end_with?("|Body here\ncontinued")
+}
+
+# Go's TestBodyReadBadTrailer (transfer_test.go).
+test "body read bad trailer" {
+  r = rresp("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n" + "3\r\nfoo\r\n0\r\nabc\r\n\r\n", false)
+  assert r.start_with?("ERR "), r
+}

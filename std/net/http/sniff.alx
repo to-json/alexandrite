@@ -1,0 +1,159 @@
+# Content-type sniffing, after Go's net/http/internal/sniff.go (the
+# algorithm of https://mimesniff.spec.whatwg.org/).
+
+# How many bytes detect_content_type looks at.
+pub SNIFF_LEN = 512
+
+# Signature kinds.
+SIG_HTML = 0
+SIG_MASKED = 1
+SIG_EXACT = 2
+SIG_MP4 = 3
+SIG_TEXT = 4
+
+struct Sig {
+  kind: Int
+  pat: [Byte]
+  mask: [Byte]
+  skip_ws: Bool
+  ct: Str
+}
+
+def b(s: Str) -> [Byte] { s.bytes.to_a }
+
+def bs(xs: [Byte]) -> [Byte] { xs }
+
+def html_sig(s: Str) -> Sig {
+  Sig.new(kind: SIG_HTML, pat: b(s), mask: [], skip_ws: true, ct: "text/html; charset=utf-8")
+}
+
+def exact(p: [Byte], ct: Str) -> Sig {
+  Sig.new(kind: SIG_EXACT, pat: p, mask: [], skip_ws: false, ct: ct)
+}
+
+def masked(m: [Byte], p: [Byte], skip: Bool, ct: Str) -> Sig {
+  Sig.new(kind: SIG_MASKED, pat: p, mask: m, skip_ws: skip, ct: ct)
+}
+
+def ff(n: Int) -> [Byte] {
+  out: [Byte] = [0xFF; n]
+  out
+}
+
+def signatures -> [Sig] {
+  s: [Sig] = []
+  for h in ["<!DOCTYPE HTML", "<HTML", "<HEAD", "<SCRIPT", "<IFRAME", "<H1", "<DIV", "<FONT", "<TABLE", "<A", "<STYLE", "<TITLE", "<B", "<BODY", "<BR", "<P", "<!--"] {
+    s << html_sig(h)
+  }
+  s << masked(ff(5), b("<?xml"), true, "text/xml; charset=utf-8")
+  s << exact(b("%PDF-"), "application/pdf")
+  s << exact(b("%!PS-Adobe-"), "application/postscript")
+  s << masked([0xFF, 0xFF, 0, 0], [0xFE, 0xFF, 0, 0], false, "text/plain; charset=utf-16be")
+  s << masked([0xFF, 0xFF, 0, 0], [0xFF, 0xFE, 0, 0], false, "text/plain; charset=utf-16le")
+  s << masked([0xFF, 0xFF, 0xFF, 0], [0xEF, 0xBB, 0xBF, 0], false, "text/plain; charset=utf-8")
+  s << exact([0, 0, 1, 0], "image/x-icon")
+  s << exact([0, 0, 2, 0], "image/x-icon")
+  s << exact(b("BM"), "image/bmp")
+  s << exact(b("GIF87a"), "image/gif")
+  s << exact(b("GIF89a"), "image/gif")
+  s << masked([0xFF, 0xFF, 0xFF, 0xFF, 0, 0, 0, 0, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF], b("RIFF") + bs([0, 0, 0, 0]) + b("WEBPVP"), false, "image/webp")
+  s << exact([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A], "image/png")
+  s << exact([0xFF, 0xD8, 0xFF], "image/jpeg")
+  s << masked([0xFF, 0xFF, 0xFF, 0xFF, 0, 0, 0, 0, 0xFF, 0xFF, 0xFF, 0xFF], b("FORM") + bs([0, 0, 0, 0]) + b("AIFF"), false, "audio/aiff")
+  s << masked(ff(3), b("ID3"), false, "audio/mpeg")
+  s << masked(ff(5), b("OggS") + bs([0]), false, "application/ogg")
+  s << masked(ff(8), b("MThd") + bs([0, 0, 0, 6]), false, "audio/midi")
+  s << masked([0xFF, 0xFF, 0xFF, 0xFF, 0, 0, 0, 0, 0xFF, 0xFF, 0xFF, 0xFF], b("RIFF") + bs([0, 0, 0, 0]) + b("AVI "), false, "video/avi")
+  s << masked([0xFF, 0xFF, 0xFF, 0xFF, 0, 0, 0, 0, 0xFF, 0xFF, 0xFF, 0xFF], b("RIFF") + bs([0, 0, 0, 0]) + b("WAVE"), false, "audio/wave")
+  s << Sig.new(kind: SIG_MP4, pat: [], mask: [], skip_ws: false, ct: "video/mp4")
+  s << exact([0x1A, 0x45, 0xDF, 0xA3], "video/webm")
+  z34: [Byte] = [0; 34]
+  s << masked(z34 + bs([0xFF, 0xFF]), z34 + b("LP"), false, "application/vnd.ms-fontobject")
+  s << exact([0, 1, 0, 0], "font/ttf")
+  s << exact(b("OTTO"), "font/otf")
+  s << exact(b("ttcf"), "font/collection")
+  s << exact(b("wOFF"), "font/woff")
+  s << exact(b("wOF2"), "font/woff2")
+  s << exact([0x1F, 0x8B, 0x08], "application/x-gzip")
+  s << exact(b("PK") + bs([3, 4]), "application/zip")
+  s << exact(b("Rar!") + bs([0x1A, 7, 0]), "application/x-rar-compressed")
+  s << exact(b("Rar!") + bs([0x1A, 7, 1, 0]), "application/x-rar-compressed")
+  s << exact([0, 0x61, 0x73, 0x6D], "application/wasm")
+  s << Sig.new(kind: SIG_TEXT, pat: [], mask: [], skip_ws: false, ct: "text/plain; charset=utf-8")
+  s
+}
+
+def sniff_ws?(c: Byte) -> Bool {
+  c == 9 || c == 10 || c == 12 || c == 13 || c == 32
+}
+
+def sig_match(sig: Sig, data0: [Byte], first_non_ws: Int) -> Bool {
+  data = data0
+  k = sig.kind
+  if k == SIG_EXACT {
+    return false if data.size < sig.pat.size
+    return data[0...sig.pat.size] == sig.pat
+  }
+  if k == SIG_MASKED {
+    data = data[first_non_ws...data.size] if sig.skip_ws
+    return false if data.size < sig.pat.size
+    i = 0
+    while i < sig.pat.size {
+      return false if (data[i] & sig.mask[i]) != sig.pat[i]
+      i += 1
+    }
+    return true
+  }
+  if k == SIG_HTML {
+    data = data[first_non_ws...data.size]
+    h = sig.pat
+    return false if data.size < h.size + 1
+    i = 0
+    while i < h.size {
+      db = data[i]
+      db = db & 0xDF if h[i] >= 65 && h[i] <= 90
+      return false if h[i] != db
+      i += 1
+    }
+    t = data[h.size]
+    return t == 32 || t == 62
+  }
+  if k == SIG_MP4 {
+    return false if data.size < 12
+    box = (data[0].to_i << 24) | (data[1].to_i << 16) | (data[2].to_i << 8) | data[3].to_i
+    return false if data.size < box || box % 4 != 0
+    return false unless data[4] == 102 && data[5] == 116 && data[6] == 121 && data[7] == 112
+    st = 8
+    while st < box {
+      if st != 12 && data[st] == 109 && data[st + 1] == 112 && data[st + 2] == 52 {
+        return true
+      }
+      st += 4
+    }
+    return false
+  }
+  # text
+  i = first_non_ws
+  while i < data.size {
+    c = data[i]
+    return false if c <= 8 || c == 11 || (c >= 14 && c <= 26) || (c >= 28 && c <= 31)
+    i += 1
+  }
+  true
+}
+
+# The Content-Type of data, from at most its first 512 bytes; always a valid
+# MIME type, "application/octet-stream" when nothing more specific matches
+# (Go's DetectContentType).
+pub def detect_content_type(data0: [Byte]) -> Str {
+  data = data0
+  data = data[0...SNIFF_LEN] if data.size > SNIFF_LEN
+  first = 0
+  while first < data.size && sniff_ws?(data[first]) {
+    first += 1
+  }
+  for sig in signatures {
+    return sig.ct if sig_match(sig, data, first)
+  }
+  "application/octet-stream"
+}

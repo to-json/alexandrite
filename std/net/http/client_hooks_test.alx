@@ -1,0 +1,139 @@
+# The client's trace hooks (httptrace) and cookie jar hook, against
+# loopback servers.
+import "net"
+import "strings"
+import "net/http/httptrace"
+import nurl "net/url"
+
+def hook_server -> (Server, Int) {
+  mux = new_serve_mux
+  mux.handle_func("/hi") { |w, r|
+    w.write_string!("hi").unwrap
+  }
+  mux.handle_func("/hop") { |w, r|
+    redirect(w, r, "/hi", 302)
+  }
+  mux.handle_func("/set") { |w, r|
+    set_cookie(w, Cookie.new(name: "a", value: "1"))
+    set_cookie(w, Cookie.new(name: "b", value: "2", path: "/"))
+    redirect(w, r, "/echo", 302)
+  }
+  mux.handle_func("/echo") { |w, r|
+    w.write_string!(r.header.values("Cookie").join("|")).unwrap
+  }
+  srv = new_server(mux)
+  ln = net.listen("tcp", "127.0.0.1:0").unwrap
+  port = ln.port
+  spawn { srv.serve(ln) }
+  (srv, port)
+}
+
+# A trace that logs each hook's name (and some arguments) into `log`.
+def logging_trace(log: strings.Builder) -> httptrace.ClientTrace {
+  l = log
+  httptrace.ClientTrace.new(get_conn: [->(hp: Str) {
+    l.write!("get_conn,")
+    return
+    }], dns_start: [->(i: httptrace.DNSStartInfo) {
+      l.write!("dns_start #{i.host},")
+      return
+    }], dns_done: [->(i: httptrace.DNSDoneInfo) {
+      l.write!("dns_done #{i.err.present?},")
+      return
+    }], connect_start: [->(n: Str, a: Str) {
+      l.write!("connect_start #{n},")
+      return
+    }], connect_done: [->(n: Str, a: Str, e: Error?) {
+      l.write!("connect_done #{e.present?},")
+      return
+    }], got_conn: [->(i: httptrace.GotConnInfo) {
+      l.write!("got_conn #{i.reused},")
+      return
+    }], wrote_header_field: [->(k: Str, vs: [Str]) {
+      l.write!("field #{k},")
+      return
+    }], wrote_headers: [->() {
+      l.write!("wrote_headers,")
+      return
+    }], wrote_request: [->(i: httptrace.WroteRequestInfo) {
+      l.write!("wrote_request #{i.err.present?},")
+      return
+    }], got_first_response_byte: [->() {
+      l.write!("first_byte,")
+      return
+  }])
+}
+
+test "trace hooks fire in Go's order" {
+  srv, port = hook_server()
+  log = strings.new_builder
+  req = with_client_trace(new_request("GET", "http://127.0.0.1:#{port}/hi", []).unwrap, logging_trace(log))
+  assert client_trace(req).present?
+  r = new_client.do(req).unwrap
+  assert_eq r.body_string, "hi"
+  assert_eq log.to_s, "get_conn,connect_start tcp,connect_done false,got_conn false,field Host,field Connection,field User-Agent,wrote_headers,wrote_request false,first_byte,"
+  srv.shutdown
+}
+
+test "trace hooks: dns for a host name, every hop, composed traces" {
+  srv, port = hook_server()
+  log = strings.new_builder
+  second = strings.new_builder
+  s2 = second
+  extra = httptrace.ClientTrace.new(get_conn: [->(hp: Str) {
+    s2.write!("x")
+    return
+  }])
+  req = new_request("GET", "http://localhost:#{port}/hop", []).unwrap
+  req = with_client_trace(req, logging_trace(log))
+  req = with_client_trace(req, extra)
+  r = new_client.do(req).unwrap
+  assert_eq r.body_string, "hi"
+  one = "get_conn,dns_start localhost,dns_done false,connect_start tcp,connect_done false,got_conn false,field Host,field Connection,field User-Agent,wrote_headers,wrote_request false,first_byte,"
+  assert_eq log.to_s, one + one
+  assert_eq second.to_s, "xx"
+  srv.shutdown
+}
+
+test "trace connect_done reports a refused connection" {
+  l = net.listen("tcp", "127.0.0.1:0").unwrap
+  port = l.port
+  l.close!.unwrap
+  log = strings.new_builder
+  req = with_client_trace(new_request("GET", "http://127.0.0.1:#{port}/", []).unwrap, logging_trace(log))
+  assert new_client.do(req).err?
+  assert_eq log.to_s, "get_conn,connect_start tcp,connect_done true,"
+}
+
+# A jar keeping every cookie for every URL (for the hook; the real one is
+# net/http/cookiejar).
+struct AllJar {
+  st: Mutex[[Cookie]]
+
+  def set_cookies(u: nurl.Url, cookies: [Cookie]) {
+    st.lock { |cs|
+      for c in cookies {
+        cs << c
+      }
+    }
+  }
+
+  def cookies(u: nurl.Url) -> [Cookie] {
+    st.lock { |cs| cs.map { Cookie.new(name: it.name, value: it.value) }.to_a }
+  }
+}
+
+test "client jar: cookies stored from a redirect are sent on the next hop" {
+  srv, port = hook_server()
+  empty: [Cookie] = []
+  jar = AllJar.new(st: Mutex.new(empty))
+  c = Client.new(max_redirects: 10, jar: jar)
+  req = new_request("GET", "http://127.0.0.1:#{port}/set", []).unwrap
+  req.header.set!("Cookie", "manual=x")
+  r = c.do(req).unwrap
+  assert_eq r.body_string, "manual=x; a=1; b=2"
+  assert_eq jar.cookies(nurl.parse("http://x/").unwrap).size, 2
+  # the caller's request isn't changed
+  assert_eq req.header.get("Cookie"), "manual=x"
+  srv.shutdown
+}

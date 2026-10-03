@@ -1,29 +1,29 @@
+import "io"
 import "strings"
+import "net/textproto"
+import "time"
 
-# A case-insensitive multi-map of header fields. Keys are stored canonically
-# ("content-type" -> "Content-Type"); every method canonicalizes its key.
-# Copies share the same fields (the map is shared storage), like Go's
-# `http.Header` map; the mutating methods need a variable or field receiver.
+# The key-value pairs of an HTTP header (Go's Header, a
+# textproto.MIMEHeader): canonical keys ("content-type" -> "Content-Type")
+# mapped to their values, in the order keys were first added. Every method
+# canonicalizes its key. Copies share the same fields (the map is shared
+# storage), like Go's `http.Header` map; the mutating methods need a variable
+# or field receiver.
 pub struct Header {
-  # Each key's values joined with "\n" (values never contain a newline: set
-  # and add turn CR and LF into spaces, which also stops response splitting).
-  m: Map[Str, Str]
+  m: Map[Str, [Str]]
 
   # The first value of `key`, "" if there is none.
   pub def get(key: Str) -> Str {
-    vs = m[canonical_key(key)]
-    if v = vs {
-      i = strings.index_byte(v, 10)
-      return i < 0 ? v : v[0...i]
+    if vs = m[canonical_key(key)] {
+      return vs.size == 0 ? "" : vs[0]
     }
     ""
   }
 
   # Every value of `key` (empty when absent).
   pub def values(key: Str) -> [Str] {
-    vs = m[canonical_key(key)]
-    if v = vs {
-      return strings.split(v, "\n")
+    if vs = m[canonical_key(key)] {
+      return vs
     }
     out: [Str] = []
     out
@@ -35,23 +35,39 @@ pub struct Header {
 
   # Replaces every value of `key` with `value`.
   pub def set!(key: Str, value: Str) {
-    self.m[canonical_key(key)] = one_line(value)
+    self.m[canonical_key(key)] = [value]
   }
 
   # Appends a value for `key`.
   pub def add!(key: Str, value: Str) {
     k = canonical_key(key)
-    old = m[k]
-    if o = old {
-      self.m[k] = o + "\n" + one_line(value)
+    if vs = m[k] {
+      vs << value
+      self.m[k] = vs
     } else {
-      self.m[k] = one_line(value)
+      self.m[k] = [value]
     }
   }
 
   # Removes `key`.
   pub def del!(key: Str) {
     self.m.delete(canonical_key(key))
+  }
+
+  # The values stored under `key` exactly as written, without
+  # canonicalizing it (Go's h[key]); none if absent.
+  pub def raw(key: Str) -> [Str]? {
+    m[key]
+  }
+
+  # Sets the values under `key` exactly as written (Go's h[key] = vs).
+  pub def set_raw!(key: Str, values: [Str]) {
+    self.m[key] = values
+  }
+
+  # Removes `key` exactly as written (Go's delete(h, key)).
+  pub def del_raw!(key: Str) {
+    self.m.delete(key)
   }
 
   # Number of distinct keys.
@@ -67,45 +83,151 @@ pub struct Header {
   # A copy that doesn't share storage.
   pub def clone -> Header {
     out = new_header
-    for k, v in m { out.m[k] = v }
+    for k, vs in m {
+      c: [Str] = []
+      for v in vs { c << v }
+      out.m[k] = c
+    }
     out
   }
-}
 
-def one_line(v: Str) -> Str {
-  return v unless strings.contains(v, "\n") || strings.contains(v, "\r")
-  strings.replace_all(strings.replace_all(v, "\r", " "), "\n", " ")
+  # Writes the header in wire format: keys sorted, one "Key: value\r\n"
+  # line per value, CR and LF in values turned into spaces and surrounding
+  # white space trimmed; keys that aren't valid field names are skipped.
+  pub def write(w: io.Writer) -> ~Unit {
+    out = w
+    s = wire_subset([])
+    out.~write!(s.bytes.to_a) if s.size > 0
+  }
+
+  # Like write, leaving out the keys in `exclude` (canonical keys, as Go's
+  # exclude map).
+  pub def write_subset(w: io.Writer, exclude: [Str]) -> ~Unit {
+    out = w
+    s = wire_subset(exclude)
+    out.~write!(s.bytes.to_a) if s.size > 0
+  }
+
+  # The wire format of write_subset, as text.
+  pub def wire_subset(exclude: [Str]) -> Str {
+    b = strings.new_builder
+    for k in keys.sort {
+      next if exclude.include?(k)
+      next unless valid_header_field_name?(k)
+      for v in m[k] || [] {
+        b.write!(k)
+        b.write!(": ")
+        b.write!(textproto.trim_string(clean(v)))
+        b.write!("\r\n")
+      }
+    }
+    b.to_s
+  }
+
+  # Same keys with the same values (key order ignored).
+  pub def ==(o: Header) -> Bool {
+    return false if m.size != o.m.size
+    for k, vs in m {
+      if ws = o.m[k] {
+        return false unless vs == ws
+      } else {
+        return false
+      }
+    }
+    true
+  }
+
+  # Go's %v of the map: map[K1:[v1 v2] K2:[v]] with keys sorted.
+  pub def to_s -> Str {
+    parts: [Str] = []
+    for k in keys.sort {
+      parts << k + ":[" + strings.join(m[k] || [], " ") + "]"
+    }
+    "map[" + strings.join(parts, " ") + "]"
+  }
 }
 
 pub def new_header -> Header {
-  mm: Map[Str, Str] = {}
+  mm: Map[Str, [Str]] = {}
   Header.new(m: mm)
 }
 
-# "content-type" -> "Content-Type". A key with a byte that isn't a token
-# character is returned unchanged (as in Go).
+# "content-type" -> "Content-Type" (textproto's canonical_mime_header_key:
+# a key with a space or a non-token byte is returned unchanged).
 pub def canonical_key(k: Str) -> Str {
-  b = k.bytes.to_a
-  upper = true
-  changed = false
-  i = 0
-  while i < b.size {
-    c = b[i]
-    if upper && c >= 97 && c <= 122 {
-      b[i] = c - 32
-      changed = true
-    } else if !upper && c >= 65 && c <= 90 {
-      b[i] = c + 32
-      changed = true
-    }
-    upper = c == 45
-    i += 1
+  textproto.canonical_mime_header_key(k)
+}
+
+# Go's CanonicalHeaderKey.
+pub def canonical_header_key(k: Str) -> Str {
+  textproto.canonical_mime_header_key(k)
+}
+
+# Whether s is a valid header field name (a non-empty token).
+pub def valid_header_field_name?(s: Str) -> Bool {
+  return false if s.size == 0
+  for c in s.bytes {
+    return false unless textproto.valid_header_field_byte?(c)
   }
-  return k unless changed
-  Str.from_bytes(b)
+  true
+}
+
+# Whether v is a valid header field value (no control bytes but tab).
+pub def valid_header_field_value?(v: Str) -> Bool {
+  for c in v.bytes {
+    return false unless textproto.valid_header_value_byte?(c)
+  }
+  true
 }
 
 # ASCII lower case.
 pub def lower(s: Str) -> Str {
   strings.to_lower(s)
+}
+
+# Whether the comma/space-separated list v holds `token`, compared ASCII
+# case-insensitively (Go's hasToken).
+pub def has_token?(v: Str, token: Str) -> Bool {
+  return false if token.size > v.size || token.size == 0
+  return true if v == token
+  sp = 0
+  while sp <= v.size - token.size {
+    b = v[sp]
+    if b != token[0] && (b | 0x20) != token[0] {
+      sp += 1
+      next
+    }
+    if sp > 0 && !token_boundary?(v[sp - 1]) {
+      sp += 1
+      next
+    }
+    end_pos = sp + token.size
+    if end_pos != v.size && !token_boundary?(v[end_pos]) {
+      sp += 1
+      next
+    }
+    return true if strings.equal_fold(v[sp...end_pos], token)
+    sp += 1
+  }
+  false
+}
+
+def token_boundary?(b: Byte) -> Bool {
+  b == 32 || b == 44 || b == 9
+}
+
+# The time format of HTTP dates: "Mon, 02 Jan 2006 15:04:05 GMT" (UTC).
+pub TIME_FORMAT = "Mon, 02 Jan 2006 15:04:05 GMT"
+
+# Parses an HTTP date in any of the three formats HTTP/1.1 allows:
+# TIME_FORMAT, RFC 850 and ANSI C asctime.
+pub def parse_time(text: Str) -> ~time.Time {
+  layouts = [TIME_FORMAT, "Monday, 02-Jan-06 15:04:05 MST", "Mon Jan _2 15:04:05 2006"]
+  last = time.parse(layouts[0], text)
+  for l in layouts {
+    r = time.parse(l, text)
+    return r.unwrap if r.ok?
+    last = r
+  }
+  ~last
 }

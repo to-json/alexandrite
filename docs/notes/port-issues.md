@@ -62,3 +62,17 @@ Open problems agents reported; each gets fixed in a compiler round between waves
 | 56 | crypto/cipher | two struct layouts nesting the same fields differently (`Tup(Tup(A), B)`, `Tup(Tup(A, B))`) got one C type name: a generic struct field inside a plain struct failed to compile with --release | fixed: C tuple names carry their arity (acceptance case nested_layouts) |
 | 57 | crypto/aes | bounds checks on constant tables (`TE0[(s >> 24).to_i]`) in release: ~2x slower AES than Go generic | fixed: release proves `[T; N]` indexes in range from narrow integer types, `x & c`, `x >> c` and conversions |
 | 58 | crypto/cipher | a mode generic over its block (`Gcm[B]`) wrapping a `cipher.Block` *interface value* can't itself become an AEAD interface value (D12) | open (design; modes are used concretely) |
+| 59 | net/rpc | `T.from_json(s)` inside a generic def (a static method on a type parameter) | fixed: resolved per instance (checker) |
+| 60 | net/rpc | passing a fallible def `-> ~R` where `(A) -> ~R` is wanted: "lambda result: expected R, got ~R" | fixed (checker) |
+| 61 | net/rpc, mail, multipart, httputil | type parameters didn't bind through `Mutex[S[T]]`/`Atomic`/`Chan`/`Pool` or another package's generic type (`textproto.Reader[R]`, and `Reader.new` inside its package when instantiated from outside) | fixed: `bind_tparams` (checker) |
+| 62 | net/rpc | `x: ~Reply = h.get` bound R to `~Reply` | fixed |
+| 63 | net/smtp | `spawn { f(x) }` with `f -> ~T` (T not Unit): bad C, lost value on the JIT | fixed: a checker error asking for `spawn { ~f(x) }` |
+| 64 | net/http/pprof | the JIT didn't resolve `alx_mem_held` / `alx_mem_peak` | fixed |
+| 65 | net/http audit | a `Mutex` captured by a lambda that moves into another task (`f.dup`, a handler in its request task) is copied: updates under `lock` there are lost (JIT and C); `Atomic` and `Chan` share | open (serious) |
+| 66 | httputil | `def f { spawn { 1 } }; t = spawn { f() }` crashes the compiler: "a task handle has no zero value" (`lower.rs` `zero_le`) | open (workaround: explicit `return`) |
+| 67 | cookiejar | `mu.lock { \|s\| if c { s.m.delete(k) } else { s.m[k] = 1 } }`: C emits `v = 0;` for the store arm (typed `Int?`) | open (workaround: end the block with `nil`) |
+| 68 | net/mail | C mistypes a statement `case` whose arms assign locals of different types (as in json-derive.md) | open |
+| 69 | net/http/cgi | spawning with a struct holding a lambda: the error suggests `h.dup`, which doesn't exist | open |
+| 70 | net/rpc | `r: Reply = client.call(..).unwrap` can't infer R through `.unwrap` | open |
+| 71 | httptest, httptrace, fcgi | a closure can't capture a value holding a closure of its own type (handler capturing its server, a director wrapping the old one, composed trace hooks) | open (design; see #2) |
+| 72 | sniff | `b("RIFF") + [0, 0, 0, 0]`: a literal after `+` on a `[Byte]` stays `[Int]` | open (workaround: a `[Byte]` parameter) |

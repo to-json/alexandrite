@@ -1,0 +1,432 @@
+# Go's net/http/cgi tests (child_test.go, host_test.go, integration_test.go),
+# translated. The host tests run a /bin/sh CGI program (Go's run the test
+# binary, formerly a Perl script); the integration tests ("hosting
+# ourselves") connect the host's environment and output parsing to the
+# child's serve in-process.
+import "bytes"
+import "net/http"
+import nurl "net/url"
+import "os"
+import "os/exec"
+import "strings"
+
+def env_of(pairs: [(Str, Str)]) -> Map[Str, Str] {
+  m: Map[Str, Str] = {}
+  for p in pairs { m[p[0]] = p[1] }
+  m
+}
+
+test "request" {
+  env = env_of([("SERVER_PROTOCOL", "HTTP/1.1"), ("REQUEST_METHOD", "GET"), ("HTTP_HOST", "example.com"), ("HTTP_REFERER", "elsewhere"), ("HTTP_USER_AGENT", "goclient"), ("HTTP_FOO_BAR", "baz"), ("REQUEST_URI", "/path?a=b"), ("CONTENT_LENGTH", "123"), ("CONTENT_TYPE", "text/xml"), ("REMOTE_ADDR", "5.6.7.8"), ("REMOTE_PORT", "54321")])
+  req = request_from_map(env).unwrap
+  assert_eq req.user_agent, "goclient"
+  assert_eq req.method, "GET"
+  assert_eq req.header.get("Content-Type"), "text/xml"
+  assert_eq content_length(env).unwrap, 123
+  assert_eq req.header.get("Referer"), "elsewhere"
+  assert_eq req.header.get("Foo-Bar"), "baz"
+  assert_eq req.url, "http://example.com/path?a=b"
+  assert_eq req.form_value("a"), "b"
+  assert !https?(env)
+  assert_eq req.remote_addr, "5.6.7.8:54321"
+  assert_eq req.path, "/path"
+  assert_eq req.host, "example.com"
+}
+
+test "request with TLS" {
+  env = env_of([("SERVER_PROTOCOL", "HTTP/1.1"), ("REQUEST_METHOD", "GET"), ("HTTP_HOST", "example.com"), ("HTTP_REFERER", "elsewhere"), ("REQUEST_URI", "/path?a=b"), ("CONTENT_TYPE", "text/xml"), ("HTTPS", "1"), ("REMOTE_ADDR", "5.6.7.8")])
+  req = request_from_map(env).unwrap
+  assert_eq req.url, "https://example.com/path?a=b"
+  assert https?(env)
+}
+
+test "request without host" {
+  env = env_of([("SERVER_PROTOCOL", "HTTP/1.1"), ("HTTP_HOST", ""), ("REQUEST_METHOD", "GET"), ("REQUEST_URI", "/path?a=b"), ("CONTENT_LENGTH", "123")])
+  req = request_from_map(env).unwrap
+  assert_eq req.url, "/path?a=b"
+}
+
+test "request without request URI" {
+  env = env_of([("SERVER_PROTOCOL", "HTTP/1.1"), ("HTTP_HOST", "example.com"), ("REQUEST_METHOD", "GET"), ("SCRIPT_NAME", "/dir/scriptname"), ("PATH_INFO", "/p1/p2"), ("QUERY_STRING", "a=1&b=2"), ("CONTENT_LENGTH", "123")])
+  req = request_from_map(env).unwrap
+  assert_eq req.url, "http://example.com/dir/scriptname/p1/p2?a=1&b=2"
+}
+
+test "request without remote port" {
+  env = env_of([("SERVER_PROTOCOL", "HTTP/1.1"), ("HTTP_HOST", "example.com"), ("REQUEST_METHOD", "GET"), ("REQUEST_URI", "/path?a=b"), ("CONTENT_LENGTH", "123"), ("REMOTE_ADDR", "5.6.7.8")])
+  req = request_from_map(env).unwrap
+  assert_eq req.remote_addr, "5.6.7.8:0"
+}
+
+test "included server protocol" {
+  env = env_of([("REQUEST_METHOD", "GET"), ("SERVER_PROTOCOL", "INCLUDED")])
+  req = request_from_map(env).unwrap
+  assert_eq req.proto, "INCLUDED"
+  assert_eq proto_version(env).unwrap, (1, 0)
+}
+
+test "request errors" {
+  assert_eq request_from_map(env_of([("SERVER_PROTOCOL", "HTTP/1.1")])).err.unwrap.message, "cgi: no REQUEST_METHOD in environment"
+  assert_eq request_from_map(env_of([("REQUEST_METHOD", "GET"), ("SERVER_PROTOCOL", "HTTP/x")])).err.unwrap.message, "cgi: invalid SERVER_PROTOCOL version"
+  assert_eq request_from_map(env_of([("REQUEST_METHOD", "GET"), ("SERVER_PROTOCOL", "HTTP/1.1"), ("CONTENT_LENGTH", "x1")])).err.unwrap.message, "cgi: bad CONTENT_LENGTH in environment: x1"
+  assert_eq parse_http_version("HTTP/2.0"), (2, 0)
+  assert_eq parse_http_version("HTTP/1.10"), none
+}
+
+# Go's TestResponse: the child's writer, over its four bodies.
+test "response" {
+  tests = [
+    ("no body", "", "text/plain; charset=utf-8"),
+    ("html", "<html><head><title>test page</title></head><body>This is a body</body></html>", "text/html; charset=utf-8"),
+    ("text", strings.repeat("gopher", 86), "text/plain; charset=utf-8"),
+    ("jpg", Str.from_bytes([0xFF, 0xD8, 0xFF]) + strings.repeat("B", 1024), "image/jpeg")
+  ]
+  for t in tests {
+    buf = bytes.new_buffer([])
+    o = buf
+    sink = ->(p: [Byte]) -> ~Unit {
+      o.write!(p)
+      return
+    }
+    w = http.new_response_writer_to(http.MODE_CGI, false, sink)
+    assert_eq w.write_string!(t[1]).unwrap, t[1].size
+    w.finish!.unwrap
+    assert_eq w.header.get("Content-Type"), t[2]
+    assert buf.to_s.end_with?(t[1]), "body was not correctly written"
+    assert buf.to_s.start_with?("Status: 200 OK\r\nContent-Type: #{t[2]}\r\n\r\n")
+  }
+}
+
+# ------------------------------------------------------------------- host
+
+SCRIPT = "#!/bin/sh\nbody=\"\"\nif [ -n \"$CONTENT_LENGTH\" ]; then body=$(/usr/bin/head -c \"$CONTENT_LENGTH\"); fi\ncase \"&$QUERY_STRING\" in\n  *\"&loc=\"*) loc=${QUERY_STRING#*loc=}; loc=${loc%%&*}; printf 'Location: %s\\r\\n\\r\\n' \"$loc\"; exit 0;;\nesac\nprintf 'Content-Type: text/html\\r\\nX-CGI-Pid: %s\\r\\nX-Test-Header: X-Test-Value\\r\\n\\r\\n' \"$$\"\ncase \"&$QUERY_STRING\" in *\"&writestderr=\"*) echo 'Hello, stderr!' >&2;; esac\nprintf 'test=Hello CGI\\r\\n'\nIFS='&'\nfor kv in $QUERY_STRING $body; do\n  [ -n \"$kv\" ] && printf 'param-%s\\r\\n' \"$kv\"\ndone\nunset IFS\n/usr/bin/env | while IFS= read -r l; do printf 'env-%s\\r\\n' \"$l\"; done\nprintf 'cwd=%s\\r\\n' \"$(pwd -P)\"\n"
+
+# A temporary directory holding the CGI program test.cgi; its path.
+def script_path -> Str {
+  dir = os.mkdir_temp("", "cgitest*").unwrap
+  p = dir + "/test.cgi"
+  os.write_file(p, SCRIPT.bytes.to_a, 0o755).unwrap
+  p
+}
+
+def handler(root: Str) -> Handler {
+  h = new_handler(script_path())
+  h.root = root
+  h
+}
+
+# A server-side request from its text (Go's http.ReadRequest), from
+# 1.2.3.4:1234.
+def new_request(text: Str) -> http.Request {
+  head = text
+  body = ""
+  if hb = strings.cut(text, "\n\n") {
+    head, body = hb
+  }
+  lines = strings.split(head, "\n")
+  parts = strings.split(lines[0], " ")
+  target = parts[1]
+  h = http.new_header
+  host = ""
+  for l in lines[1...lines.size] {
+    if kv = strings.cut(l, ":") {
+      k, v = kv
+      if http.canonical_key(k) == "Host" {
+        host = strings.trim_space(v)
+      } else {
+        h.add!(k, strings.trim_space(v))
+      }
+    }
+  }
+  path = target
+  q = ""
+  if pq = strings.cut(target, "?") {
+    path, q = pq
+  }
+  pv: Map[Str, Str] = {}
+  http.Request.new(method: parts[0], url: target, path: nurl.path_unescape(path).unwrap, raw_query: q, proto: parts[2], host: host, header: h, body: body.bytes.to_a, remote_addr: "1.2.3.4:1234", pathvals: pv)
+}
+
+# The CGI output's "k=v" lines as a map, plus "_body".
+def response_map(w: http.ResponseWriter) -> Map[Str, Str] {
+  m: Map[Str, Str] = {}
+  body = Str.from_bytes(w.recorded_body)
+  m["_body"] = body
+  lines = strings.split(body, "\n")
+  # (an unterminated last line is not read, as with Go's ReadString)
+  for line in lines[0...lines.size - 1] {
+    l = strings.trim_right(line, "\r\n")
+    if kv = strings.cut(l, "=") {
+      k, v = kv
+      m[k] = v
+    } else {
+      assert false, "unexpected line #{l}"
+    }
+  }
+  m
+}
+
+def run_cgi_test(h: Handler, text: Str, expected: [(Str, Str)]) -> (http.ResponseWriter, Map[Str, Str]) {
+  rw = http.new_recording_writer
+  req = new_request(text)
+  h.serve_http(rw, req)
+  m = response_map(rw)
+  for e in expected {
+    assert_eq m[e[0]] || "", e[1]
+  }
+  (rw, m)
+}
+
+test "CGI basic get" {
+  h = handler("/test.cgi")
+  rw, _ = run_cgi_test(h, "GET /test.cgi?foo=bar&a=b HTTP/1.0\nHost: example.com:80\n\n", [("test", "Hello CGI"), ("param-a", "b"), ("param-foo", "bar"), ("env-GATEWAY_INTERFACE", "CGI/1.1"), ("env-HTTP_HOST", "example.com:80"), ("env-PATH_INFO", ""), ("env-QUERY_STRING", "foo=bar&a=b"), ("env-REMOTE_ADDR", "1.2.3.4"), ("env-REMOTE_HOST", "1.2.3.4"), ("env-REMOTE_PORT", "1234"), ("env-REQUEST_METHOD", "GET"), ("env-REQUEST_URI", "/test.cgi?foo=bar&a=b"), ("env-SCRIPT_FILENAME", h.path), ("env-SCRIPT_NAME", "/test.cgi"), ("env-SERVER_NAME", "example.com"), ("env-SERVER_PORT", "80"), ("env-SERVER_SOFTWARE", "go")])
+  assert_eq rw.header.get("Content-Type"), "text/html"
+  assert_eq rw.header.get("X-Test-Header"), "X-Test-Value"
+  assert rw.header.get("X-CGI-Pid").size > 0
+}
+
+test "CGI env IPv6" {
+  h = handler("/test.cgi")
+  rw = http.new_recording_writer
+  req = new_request("GET /test.cgi?foo=bar&a=b HTTP/1.0\nHost: example.com\n\n")
+  req.remote_addr = "[2000::3000]:12345"
+  h.serve_http(rw, req)
+  m = response_map(rw)
+  for e in [("test", "Hello CGI"), ("env-HTTP_HOST", "example.com"), ("env-REMOTE_ADDR", "2000::3000"), ("env-REMOTE_HOST", "2000::3000"), ("env-REMOTE_PORT", "12345"), ("env-SERVER_NAME", "example.com"), ("env-SERVER_PORT", "80")] {
+    assert_eq m[e[0]] || "", e[1]
+  }
+}
+
+test "path info" {
+  h = handler("/test.cgi")
+  run_cgi_test(h, "GET /test.cgi/extrapath?a=b HTTP/1.0\nHost: example.com\n\n", [("param-a", "b"), ("env-PATH_INFO", "/extrapath"), ("env-QUERY_STRING", "a=b"), ("env-REQUEST_URI", "/test.cgi/extrapath?a=b"), ("env-SCRIPT_FILENAME", h.path), ("env-SCRIPT_NAME", "/test.cgi")])
+}
+
+test "path info dir root" {
+  h = handler("/myscript//")
+  run_cgi_test(h, "GET /myscript/bar?a=b HTTP/1.0\nHost: example.com\n\n", [("env-PATH_INFO", "/bar"), ("env-QUERY_STRING", "a=b"), ("env-REQUEST_URI", "/myscript/bar?a=b"), ("env-SCRIPT_FILENAME", h.path), ("env-SCRIPT_NAME", "/myscript")])
+}
+
+test "dup headers" {
+  h = handler("")
+  run_cgi_test(h, "GET /myscript/bar?a=b HTTP/1.0\nCookie: nom=NOM\nCookie: yum=YUM\nX-Foo: val1\nX-Foo: val2\nHost: example.com\n\n", [("env-REQUEST_URI", "/myscript/bar?a=b"), ("env-SCRIPT_FILENAME", h.path), ("env-HTTP_COOKIE", "nom=NOM; yum=YUM"), ("env-HTTP_X_FOO", "val1, val2")])
+}
+
+test "drop proxy header" {
+  h = handler("")
+  _, m = run_cgi_test(h, "GET /myscript/bar?a=b HTTP/1.0\nX-Foo: a\nProxy: should_be_stripped\nHost: example.com\n\n", [("env-REQUEST_URI", "/myscript/bar?a=b"), ("env-SCRIPT_FILENAME", h.path), ("env-HTTP_X_FOO", "a")])
+  assert !m.key?("env-HTTP_PROXY")
+}
+
+test "path info no root" {
+  h = handler("")
+  run_cgi_test(h, "GET /bar?a=b HTTP/1.0\nHost: example.com\n\n", [("env-PATH_INFO", "/bar"), ("env-QUERY_STRING", "a=b"), ("env-REQUEST_URI", "/bar?a=b"), ("env-SCRIPT_FILENAME", h.path), ("env-SCRIPT_NAME", "")])
+}
+
+test "CGI basic post" {
+  h = handler("/test.cgi")
+  run_cgi_test(h, "POST /test.cgi?a=b HTTP/1.0\nHost: example.com\nContent-Type: application/x-www-form-urlencoded\nContent-Length: 15\n\npostfoo=postbar", [("test", "Hello CGI"), ("param-postfoo", "postbar"), ("env-REQUEST_METHOD", "POST"), ("env-CONTENT_LENGTH", "15"), ("env-REQUEST_URI", "/test.cgi?a=b")])
+}
+
+test "CGI post chunked" {
+  h = handler("/test.cgi")
+  rw, _ = run_cgi_test(h, "POST /test.cgi?a=b HTTP/1.1\nHost: example.com\nContent-Type: application/x-www-form-urlencoded\nTransfer-Encoding: chunked\n\npostfoo=postbar", [])
+  assert_eq rw.status, 400
+}
+
+test "redirect" {
+  h = handler("/test.cgi")
+  rw, _ = run_cgi_test(h, "GET /test.cgi?loc=http://foo.com/ HTTP/1.0\nHost: example.com\n\n", [])
+  assert_eq rw.status, 302
+  assert_eq rw.header.get("Location"), "http://foo.com/"
+}
+
+test "internal redirect" {
+  h = handler("/test.cgi")
+  h.path_location_handler = ->(w: http.ResponseWriter, r: http.Request) {
+    w.write_string!("basepath=#{r.path}\n")
+    w.write_string!("remoteaddr=#{r.remote_addr}\n")
+    return
+  }
+  run_cgi_test(h, "GET /test.cgi?loc=/foo HTTP/1.0\nHost: example.com\n\n", [("basepath", "/foo"), ("remoteaddr", "1.2.3.4:1234")])
+}
+
+def physical(dir: Str) -> Str {
+  c = exec.command("sh", ["-c", "pwd -P"])
+  c.dir = dir
+  strings.trim_space(c.output.unwrap)
+}
+
+test "dir" {
+  h = handler("/test.cgi")
+  cwd = os.getwd.unwrap
+  h.dir = cwd
+  # (Dir set: the path is used as it is)
+  run_cgi_test(h, "GET /test.cgi HTTP/1.0\nHost: example.com\n\n", [("cwd", physical(cwd))])
+  h2 = handler("/test.cgi")
+  sdir = h2.path[0...strings.last_index(h2.path, "/")]
+  run_cgi_test(h2, "GET /test.cgi HTTP/1.0\nHost: example.com\n\n", [("cwd", physical(sdir))])
+}
+
+test "env override" {
+  h = handler("/test.cgi")
+  cwd = os.getwd.unwrap
+  h.dir = cwd
+  h.env = ["SCRIPT_FILENAME=/x/testdata/test.cgi", "REQUEST_URI=/foo/bar", "PATH=/wibble"]
+  run_cgi_test(h, "GET /test.cgi HTTP/1.0\nHost: example.com\n\n", [("cwd", physical(cwd)), ("env-SCRIPT_FILENAME", "/x/testdata/test.cgi"), ("env-REQUEST_URI", "/foo/bar"), ("env-PATH", "/wibble")])
+}
+
+test "handler stderr" {
+  h = handler("/test.cgi")
+  got = bytes.new_buffer([])
+  g = got
+  h.stderr = ->(s: Str) {
+    g.write_string!(s)
+    return
+  }
+  rw = http.new_recording_writer
+  h.serve_http(rw, new_request("GET /test.cgi?writestderr=1 HTTP/1.0\nHost: example.com\n\n"))
+  assert_eq got.to_s, "Hello, stderr!\n"
+}
+
+test "missing program is a 500" {
+  h = new_handler("/nonexistent/dir/prog.cgi")
+  logs = bytes.new_buffer([])
+  lg = logs
+  h.logger = ->(s: Str) {
+    lg.write_string!(s)
+    return
+  }
+  rw = http.new_recording_writer
+  h.serve_http(rw, new_request("GET / HTTP/1.0\nHost: x\n\n"))
+  assert_eq rw.status, 500
+  assert logs.to_s.start_with?("CGI error: ")
+}
+
+test "remove leading duplicates" {
+  assert_eq remove_leading_duplicates(["a=b", "b=c", "a=b2"]), ["b=c", "a=b2"]
+  assert_eq remove_leading_duplicates(["a=b", "b=c", "d", "e=f"]), ["a=b", "b=c", "d", "e=f"]
+}
+
+test "trailing port and env key" {
+  assert_eq trailing_port("example.com:8080"), "8080"
+  assert_eq trailing_port("example.com"), ""
+  assert_eq trailing_port("[::1]:443"), "443"
+  assert_eq trailing_port("x:"), ""
+  assert_eq env_key("X-Foo=bar"), "X_FOO_BAR"
+}
+
+# ------------------------------------------------- hosting ourselves
+
+# Go's childCGIProcess handler.
+def child_handler(rw: http.ResponseWriter, req: http.Request) -> Unit {
+  if req.form_value("nil-request-body") == "1" {
+    rw.write_string!("nil-request-body=false\n").unwrap
+    return
+  }
+  rw.header.set!("X-Test-Header", "X-Test-Value")
+  return if req.form_value("no-body") == "1"
+  if eb = req.query("exact-body") {
+    rw.write_string!(eb).unwrap
+    return
+  }
+  rw.write_string!("test=Hello CGI-in-CGI\n").unwrap
+  for kv in http.query_pairs(req.raw_query) {
+    rw.write_string!("param-#{kv[0]}=#{kv[1]}\n").unwrap
+  }
+  if req.body.size > 0 {
+    for kv in http.query_pairs(req.body_string) {
+      rw.write_string!("param-#{kv[0]}=#{kv[1]}\n").unwrap
+    }
+  }
+}
+
+# The host's environment for `text` given to the child's serve, and the
+# child's output relayed by the host (Go's TestHostingOurselves setup, with
+# the process boundary replaced by a call).
+def host_ourselves(text: Str) -> (http.ResponseWriter, Map[Str, Str]) {
+  h = new_handler("/usr/local/bin/test.go")
+  h.root = "/test.go"
+  req = new_request(text)
+  env = h.build_env(req)
+  params = env_map(env)
+  out = bytes.new_buffer([])
+  o = out
+  sink = ->(p: [Byte]) -> ~Unit {
+    o.write!(p)
+    return
+  }
+  serve_params(params, bytes.new_buffer(req.body), sink, child_handler).unwrap
+  rw = http.new_recording_writer
+  h.relay(rw, req, out.to_s)
+  (rw, response_map(rw))
+}
+
+test "hosting ourselves" {
+  rw, m = host_ourselves("GET /test.go?foo=bar&a=b HTTP/1.0\nHost: example.com\n\n")
+  assert_eq m["test"] || "", "Hello CGI-in-CGI"
+  assert_eq m["param-a"] || "", "b"
+  assert_eq m["param-foo"] || "", "bar"
+  assert_eq rw.status, 200
+  assert_eq rw.header.get("Content-Type"), "text/plain; charset=utf-8"
+  assert_eq rw.header.get("X-Test-Header"), "X-Test-Value"
+}
+
+test "hosting ourselves: post body" {
+  _, m = host_ourselves("POST /test.go?a=b HTTP/1.0\nHost: example.com\nContent-Type: application/x-www-form-urlencoded\nContent-Length: 15\n\npostfoo=postbar")
+  assert_eq m["param-postfoo"] || "", "postbar"
+  assert_eq m["param-a"] || "", "b"
+}
+
+test "child only headers" {
+  rw, m = host_ourselves("GET /test.go?no-body=1 HTTP/1.0\nHost: example.com\n\n")
+  assert_eq m["_body"] || "", ""
+  assert_eq rw.header.get("X-Test-Header"), "X-Test-Value"
+}
+
+test "nil request body" {
+  _, m = host_ourselves("POST /test.go?nil-request-body=1 HTTP/1.0\nHost: example.com\n\n")
+  assert_eq m["nil-request-body"] || "", "false"
+  _, m2 = host_ourselves("POST /test.go?nil-request-body=1 HTTP/1.0\nHost: example.com\nContent-Length: 0\n\n")
+  assert_eq m2["nil-request-body"] || "", "false"
+}
+
+test "child content type" {
+  tests = [
+    ("", "text/plain; charset=utf-8"),
+    ("<html><head><title>test page</title></head><body>This is a body</body></html>", "text/html; charset=utf-8"),
+    (strings.repeat("gopher", 86), "text/plain; charset=utf-8"),
+    (Str.from_bytes([0xFF, 0xD8, 0xFF]) + strings.repeat("B", 1024), "image/jpeg")
+  ]
+  for t in tests {
+    rw = http.new_recording_writer
+    h = new_handler("/usr/local/bin/test.go")
+    h.root = "/test.go"
+    req = new_request("GET /test.go?exact-body=#{nurl.query_escape(t[0])} HTTP/1.0\nHost: example.com\n\n")
+    out = bytes.new_buffer([])
+    o = out
+    sink = ->(p: [Byte]) -> ~Unit {
+      o.write!(p)
+      return
+    }
+    serve_params(env_map(h.build_env(req)), bytes.new_buffer([]), sink, child_handler).unwrap
+    h.relay(rw, req, out.to_s)
+    assert_eq Str.from_bytes(rw.recorded_body), t[0]
+    assert_eq rw.header.get("Content-Type"), t[1]
+  }
+}
+
+def want500(text: Str) {
+  h = new_handler("/usr/local/bin/test.go")
+  h.logger = ->(s: Str) { return }
+  rw = http.new_recording_writer
+  h.relay(rw, new_request("GET /x HTTP/1.0\nHost: example.com\n\n"), text)
+  assert_eq rw.status, 500
+  assert_eq rw.recorded_body.size, 0
+}
+
+test "500 with no headers, no content type, empty headers" {
+  want500("")
+  want500("Content-Length: 6\n\nHello\n")
+  want500("\nHello")
+}

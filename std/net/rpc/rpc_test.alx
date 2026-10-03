@@ -1,0 +1,416 @@
+# Go's net/rpc tests (server_test.go, client_test.go), translated.
+import "encoding/json"
+import "net"
+import "net/textproto"
+import "strconv"
+import "strings"
+import "time"
+
+#[derive(Json)]
+struct Args {
+  #[json("A")] a: Int
+  #[json("B")] b: Int
+}
+
+#[derive(Json)]
+struct Reply {
+  #[json("C")] c: Int
+}
+
+#[derive(Json)]
+struct Text {
+  s: Str
+}
+
+def add(args: Args) -> ~Reply {
+  Reply.new(c: args.a + args.b)
+}
+
+def mul(args: Args) -> ~Reply {
+  Reply.new(c: args.a * args.b)
+}
+
+def div(args: Args) -> ~Reply {
+  fail "divide by zero" if args.b == 0
+  Reply.new(c: args.a / args.b)
+}
+
+def arith_string(args: Args) -> ~json.Value {
+  ~json.parse(strconv.quote("#{args.a}+#{args.b}=#{args.a + args.b}"))
+}
+
+def scan(args: Text) -> ~Reply {
+  Reply.new(c: ~strconv.atoi(strings.trim_space(args.s)))
+}
+
+def sleep_milli(args: Args) -> ~Reply {
+  time.sleep(time.Duration.new(ns: args.a * 1000000))
+  Reply.new(c: 0)
+}
+
+def arith(name: Str) -> Service {
+  s = new_service(name)
+  s.method!("Add", add)
+  s.method!("Mul", mul)
+  s.method!("Div", div)
+  s.method!("String", arith_string)
+  s.method!("Scan", scan)
+  s.method!("SleepMilli", sleep_milli)
+  s
+}
+
+# A server like Go's startServer / startNewServer, listening on a free port.
+def start(extra: Bool) -> (Server, Int) {
+  s = new_server
+  s.register(arith("Arith")).unwrap
+  emb = new_service("Embed")
+  emb.method!("Exported", add)
+  s.register(emb).unwrap
+  s.register_name("net.rpc.Arith", arith("Arith")).unwrap
+  s.register_name("newServer.Arith", arith("Arith")).unwrap if extra
+  ln = net.listen("tcp", "127.0.0.1:0").unwrap
+  port = ln.port
+  spawn { s.accept(ln) }
+  (s, port)
+}
+
+def test_rpc(port: Int) -> ~Unit {
+  client = dial("tcp", "127.0.0.1:#{port}").unwrap
+  # Synchronous calls
+  r: Reply = client.~call("Arith.Add", Args.new(a: 7, b: 8))
+  assert_eq r.c, 15
+  # Methods exported from (Go: unexported) embedded structs
+  r: Reply = client.~call("Embed.Exported", Args.new(a: 7, b: 0))
+  assert_eq r.c, 7
+  # Nonexistent method
+  bad: ~Reply = client.call("Arith.BadOperation", Args.new(a: 7, b: 0))
+  assert bad.err?
+  assert bad.err.unwrap.message.start_with?("rpc: can't find method "), bad.err.unwrap.message
+  # Unknown service
+  bad: ~Reply = client.call("Arith.Unknown", Args.new(a: 7, b: 8))
+  assert strings.contains(bad.err.unwrap.message, "method")
+  # Out of order.
+  mul_done = client.go("Arith.Mul", Args.new(a: 7, b: 8), none)
+  add_done = client.go("Arith.Add", Args.new(a: 7, b: 8), none)
+  add_call = add_done.recv.unwrap
+  assert add_call.error == none
+  ar: Reply = add_call.~result
+  assert_eq ar.c, 15
+  mul_call = mul_done.recv.unwrap
+  mr: Reply = mul_call.~result
+  assert_eq mr.c, 56
+  assert_eq mul_call.service_method, "Arith.Mul"
+  # Error test
+  bad: ~Reply = client.call("Arith.Div", Args.new(a: 7, b: 0))
+  assert_eq bad.err.unwrap.message, "divide by zero"
+  case bad.err.unwrap {
+    ServerError(m) => assert_eq m, "divide by zero"
+    _ => assert false, "want a ServerError"
+  }
+  # Non-struct argument (Go: a string; here a struct holding one)
+  r: Reply = client.~call("Arith.Scan", Text.new(s: "12345"))
+  assert_eq r.c, 12345
+  # Non-struct reply (Go: *string; here a json.Value)
+  sv: json.Value = client.~call("Arith.String", Args.new(a: 27, b: 35))
+  assert_eq sv.as_str, "27+35=62"
+  r: Reply = client.~call("Arith.Mul", Args.new(a: 7, b: 8))
+  assert_eq r.c, 56
+  # ServiceName contain "." character
+  r: Reply = client.~call("net.rpc.Arith.Add", Args.new(a: 7, b: 8))
+  assert_eq r.c, 15
+  client.close!.unwrap
+}
+
+test "RPC" {
+  _, port = start(false)
+  test_rpc(port).unwrap
+  _, port2 = start(true)
+  test_rpc(port2).unwrap
+  # testNewServerRPC
+  client = dial("tcp", "127.0.0.1:#{port2}").unwrap
+  r: Reply = client.~call("newServer.Arith.Add", Args.new(a: 7, b: 8))
+  assert_eq r.c, 15
+  client.close!.unwrap
+}
+
+test "registration errors" {
+  s = new_server
+  s.register(arith("Arith")).unwrap
+  assert_eq s.register(arith("Arith")).err.unwrap.message, "rpc: service already defined: Arith"
+  assert_eq s.register(new_service("Empty")).err.unwrap.message, "rpc.Register: type Empty has no exported methods of suitable type"
+  assert_eq s.register_name("", arith("X")).err.unwrap.message, "rpc.Register: no service name for type X"
+  s.register_func("Calc.Add", add).unwrap
+  s.register_func("Calc.Mul", mul).unwrap
+  assert_eq s.register_func("nodot", add).err.unwrap.message, "rpc: service/method request ill-formed: nodot"
+}
+
+test "num calls" {
+  s, port = start(false)
+  client = dial("tcp", "127.0.0.1:#{port}").unwrap
+  i = 0
+  while i < 3 {
+    r: Reply = client.~call("Arith.Add", Args.new(a: i, b: 1))
+    assert_eq r.c, i + 1
+    i += 1
+  }
+  assert_eq s.num_calls("Arith.Add"), 3
+  assert_eq s.num_calls("Arith.Mul"), 0
+  assert_eq s.num_calls("Nope.Add"), 0
+  client.close!.unwrap
+}
+
+# CodecEmulator / ServeRequest: a codec answering in memory.
+struct EmuState {
+  service_method: Str
+  args: Str
+  reply: Str
+  error: Str
+  served: Bool
+}
+
+struct CodecEmulator {
+  st: Mutex[EmuState]
+
+  pub def read_request_header! -> ~Request? {
+    sm = st.lock { |s|
+      s.served = true
+      s.service_method
+    }
+    Request.new(service_method: sm, seq: 0)
+  }
+
+  pub def read_request_body!(want: Bool) -> ~Str {
+    st.lock { |s| s.args }
+  }
+
+  pub def write_response!(r: Response, body: Str) -> ~Unit {
+    st.lock { |s|
+      s.reply = body
+      s.error = r.error
+    }
+  }
+
+  pub def close! -> ~Unit {
+    return
+  }
+}
+
+def emu_call(server: Server, method: Str, args: Args) -> ~Reply {
+  a = ~args.to_json
+  em = CodecEmulator.new(st: Mutex.new(EmuState.new(service_method: method, args: a, reply: "", error: "", served: false)))
+  served = server.serve_request(em)
+  e = em.st.lock { |s| s.error }
+  fail RpcError.ServerError(e) if e != ""
+  ~served
+  body = em.st.lock { |s| s.reply }
+  ~Reply.from_json(body)
+}
+
+test "serve request" {
+  s = new_server
+  s.register(arith("Arith")).unwrap
+  r = emu_call(s, "Arith.Add", Args.new(a: 7, b: 8)).unwrap
+  assert_eq r.c, 15
+  r = emu_call(s, "Arith.Mul", Args.new(a: 7, b: 8)).unwrap
+  assert_eq r.c, 56
+  bad = emu_call(s, "Arith.Div", Args.new(a: 7, b: 0))
+  assert_eq bad.err.unwrap.message, "divide by zero"
+  bad = emu_call(s, "Arith.Nope", Args.new(a: 7, b: 0))
+  assert bad.err?
+}
+
+test "concurrent calls" {
+  _, port = start(false)
+  client = dial("tcp", "127.0.0.1:#{port}").unwrap
+  ts = (1..20).map { |i|
+    c = client
+    spawn {
+      ok = 0
+      j = 0
+      while j < 10 {
+        r: Reply = c.~call("Arith.Mul", Args.new(a: i, b: j))
+        ok += 1 if r.c == i * j
+        j += 1
+      }
+      ok
+    }
+  }.to_a
+  assert_eq ts.sum { it.wait.unwrap }, 200
+  client.close!.unwrap
+}
+
+# client_test.go: TestCloseCodec, TestBadCall-style uses of a closed client.
+test "close client" {
+  _, port = start(false)
+  client = dial("tcp", "127.0.0.1:#{port}").unwrap
+  r: Reply = client.~call("Arith.Add", Args.new(a: 1, b: 2))
+  assert_eq r.c, 3
+  client.close!.unwrap
+  # A second close fails with ErrShutdown.
+  e = client.close!
+  assert_eq e.err.unwrap.message, "connection is shut down"
+  bad: ~Reply = client.call("Arith.Add", Args.new(a: 1, b: 2))
+  assert_eq bad.err.unwrap.message, "connection is shut down"
+}
+
+test "server closing the connection fails pending calls" {
+  # a server that reads one request and hangs up
+  ln = net.listen("tcp", "127.0.0.1:0").unwrap
+  port = ln.port
+  spawn {
+    c = ln.~accept
+    buf: [Byte] = [0; 64]
+    c.~read!(buf)
+    c.~close!
+  }
+  client = dial("tcp", "127.0.0.1:#{port}").unwrap
+  bad: ~Reply = client.call("Arith.SleepMilli", Args.new(a: 1, b: 0))
+  assert_eq bad.err.unwrap.message, "unexpected EOF"
+  client.close!.unwrap
+}
+
+test "wire format" {
+  ln = net.listen("tcp", "127.0.0.1:0").unwrap
+  port = ln.port
+  s = new_server
+  s.register(arith("Arith")).unwrap
+  spawn { s.accept(ln) }
+  c = net.dial("tcp", "127.0.0.1:#{port}").unwrap
+  tp = textproto.new_reader(c)
+  c.write_string!("{\"ServiceMethod\":\"Arith.Add\",\"Seq\":5}\r\n{\"A\":1,\"B\":2}\r\n").unwrap
+  assert_eq tp.read_line!.unwrap, "{\"ServiceMethod\":\"Arith.Add\",\"Seq\":5,\"Error\":\"\"}"
+  assert_eq tp.read_line!.unwrap, "{\"C\":3}"
+  c.write_string!("{\"ServiceMethod\":\"Arith.Div\",\"Seq\":6}\n{\"A\":1,\"B\":0}\n").unwrap
+  assert_eq tp.read_line!.unwrap, "{\"ServiceMethod\":\"Arith.Div\",\"Seq\":6,\"Error\":\"divide by zero\"}"
+  assert_eq tp.read_line!.unwrap, "{}"
+  c.close!.unwrap
+}
+
+# client_test.go: TestCloseCodec.
+struct ShutdownCodec {
+  responded: Chan[Int]
+  closed: Atomic[Int]
+
+  pub def write_request!(r: Request, body: Str) -> ~Unit {
+    return
+  }
+
+  pub def read_response_header! -> ~Response? {
+    responded << 1
+    fail RpcError.Failure("shutdownCodec ReadResponseHeader")
+  }
+
+  pub def read_response_body! -> ~Str { "" }
+
+  pub def close! -> ~Unit {
+    closed.store(1)
+  }
+}
+
+test "close codec" {
+  codec = ShutdownCodec.new(responded: Chan[Int].new, closed: Atomic.new(0))
+  client = new_client_with_codec(codec)
+  codec.responded.recv
+  client.close!.unwrap
+  assert codec.closed.load == 1, "client.close! did not close the codec"
+}
+
+# server_test.go: TestSendDeadlock (a codec whose writes fail and whose reads
+# never return).
+struct WriteFailCodec {
+  never: Chan[Int]
+
+  pub def write_request!(r: Request, body: Str) -> ~Unit {
+    fail RpcError.Failure("fail")
+  }
+
+  pub def read_response_header! -> ~Response? {
+    never.recv
+    none
+  }
+
+  pub def read_response_body! -> ~Str { "" }
+
+  pub def close! -> ~Unit {
+    return
+  }
+}
+
+test "send deadlock" {
+  client = new_client_with_codec(WriteFailCodec.new(never: Chan[Int].new))
+  i = 0
+  while i < 2 {
+    bad: ~Reply = client.call("Arith.Add", Args.new(a: 7, b: 8))
+    assert_eq bad.err.unwrap.message, "fail"
+    i += 1
+  }
+}
+
+# server_test.go: TestClientWriteError.
+struct WriteCrasher {
+  done: Chan[Bool]
+
+  pub def read!(p: [Byte]) -> ~Int {
+    done.recv
+    0
+  }
+
+  pub def write!(p: [Byte]) -> ~Int {
+    fail RpcError.Failure("fake write failure")
+  }
+
+  pub def close! -> ~Unit {
+    return
+  }
+}
+
+test "client write error" {
+  w = WriteCrasher.new(done: Chan[Bool].new(1))
+  c = new_client(w)
+  bad: ~Reply = c.call("foo", Args.new(a: 1, b: 0))
+  assert_eq bad.err.unwrap.message, "fake write failure"
+  w.done << true
+  c.close!.unwrap
+}
+
+# server_test.go: TestTCPClose (over TCP; Go's goes through HTTP).
+test "TCP close" {
+  _, port = start(false)
+  client = dial("tcp", "127.0.0.1:#{port}").unwrap
+  r: Reply = client.call("Arith.Mul", Args.new(a: 17, b: 8)).unwrap_or(Reply.new(c: -1))
+  assert_eq r.c, 136
+  client.close!.unwrap
+}
+
+# server_test.go: TestAcceptExitAfterListenerClose.
+test "accept exits after listener close" {
+  s = new_server
+  s.register(arith("Arith")).unwrap
+  l = net.listen("tcp", "127.0.0.1:0").unwrap
+  l.close!.unwrap
+  s.accept(l)
+}
+
+# server_test.go: TestShutdown.
+test "shutdown" {
+  l = net.listen("tcp", "127.0.0.1:0").unwrap
+  port = l.port
+  ch = Chan[net.Conn].new(1)
+  spawn {
+    c1 = l.~accept
+    ch << c1
+    l.~close!
+  }
+  c = net.dial("tcp", "127.0.0.1:#{port}").unwrap
+  c1 = ch.recv.unwrap
+  s = new_server
+  s.register(arith("Arith")).unwrap
+  spawn { s.serve_conn(c1) }
+  client = new_client(c)
+  r: Reply = client.call("Arith.Add", Args.new(a: 7, b: 8)).unwrap_or(Reply.new(c: -1))
+  assert_eq r.c, 15
+  done = client.go("Arith.SleepMilli", Args.new(a: 10, b: 8), Chan[Call].new(1))
+  c.close_write!.unwrap
+  call = done.recv.unwrap
+  assert call.error == none, "the call in flight still gets its reply"
+}

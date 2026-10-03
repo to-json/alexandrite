@@ -1,0 +1,542 @@
+# Package multipart: Go's mime/multipart, MIME multipart parsing and writing
+# (RFC 2046), sufficient for HTTP (RFC 7578) and the bodies browsers send.
+#
+#   mr = multipart.new_reader(body, boundary)
+#   while p = ~mr.next_part! {
+#     puts p.form_name, Str.from_bytes(~io.read_all(p))
+#   }
+#
+#   mw = multipart.new_writer(buf)
+#   ~mw.write_field!("key", "val")
+#   fw = ~mw.create_form_file!("file", "a.txt")
+#   ~fw.write!(data)
+#   ~mw.close!
+#   content_type = mw.form_data_content_type
+#
+#   Go                                    alx
+#   NewReader(r, boundary) *Reader        new_reader(r, boundary) -> Reader[R]
+#   (*Reader).NextPart() (*Part, error)   next_part! -> ~Part[R]? (none at the end)
+#   (*Reader).NextRawPart()               next_raw_part! -> ~Part[R]?
+#   (*Reader).ReadForm(maxMemory)         read_form!(max_memory) -> ~Form
+#   Part.Header, FormName, FileName       Part.header, form_name, file_name
+#   (*Part).Read / Close                  Part.read! / close!
+#   Form{Value, File}, RemoveAll          Form{value, file}, remove_all
+#   FileHeader{Filename, Header, Size}    FileHeader{filename, header, size}
+#   (*FileHeader).Open() (File, error)    FileHeader.open -> ~File
+#   File (Reader+ReaderAt+Seeker+Closer)  File (read!, read_at, seek!, close!)
+#   NewWriter(w) *Writer                  new_writer(w) -> Writer[W]
+#   Boundary, SetBoundary                 boundary, set_boundary!
+#   CreatePart(h) (io.Writer, error)      create_part!(h) -> ~PartWriter[W]
+#   CreateFormFile / CreateFormField      create_form_file! / create_form_field!
+#   WriteField, FormDataContentType       write_field!, form_data_content_type
+#   FileContentDisposition                file_content_disposition
+#   ErrMessageTooLarge                    MultipartError.MessageTooLarge
+#
+# Differences from Go:
+#  - Reader, Part, Writer and PartWriter are generic over the stream they
+#    read or write (`Reader[R]`, `Writer[W]`): an interface value can't hold
+#    a reader that itself holds an io.Reader (GO-VS-RUBY D12), and a Part
+#    should be an io.Reader (nested multiparts read a Part). The Reader is
+#    built on net/textproto's Reader[R], which does the buffering Go's
+#    bufio.Reader does.
+#  - End of input is not an error (io's convention): next_part! returns none
+#    where Go returns io.EOF, and Part.read! returns 0 at the end of a part. A
+#    part cut short by the end of input fails with
+#    io.StreamError.UnexpectedEof, as in Go.
+#  - Go's Read returns bytes together with an error; here read! returns the
+#    bytes first and fails on the next call.
+#  - The GODEBUG settings multipartmaxparts, multipartmaxheaders and
+#    multipartfiles=distinct are Reader fields set with
+#    set_max_parts!, set_max_headers! and set_distinct_files!; the temporary
+#    directory (Go's unexported tempDir, used by its tests) is set with
+#    set_temp_dir!.
+#  - Go's NextPart closes the previous part by reading it to the end through
+#    its (possibly quoted-printable) decoder; here the raw bytes are skipped,
+#    so a decoding error in an unread part doesn't stop the next one.
+#  - A Part read after the next one was requested reads nothing (0); Go's
+#    reads from wherever the shared buffer is.
+#  - FileHeader.open returns this package's File for every case (Go returns
+#    an *os.File for a file spilled to its own temporary file).
+#  - Go's Reader reads boundary lines with a 4096-byte bufio buffer; a longer
+#    line before a part's header fails with "multipart: NextPart: bufio:
+#    buffer full" here too.
+#
+# Not translated: TestWriterBoundaryGoroutines (a data race check),
+# BenchmarkReadForm, and TestReadForm_MetadataTooLarge's "many parts" case
+# runs with 1,100 parts instead of 110,000 (the limit is 1,000).
+
+import "crypto/rand"
+import "io"
+import "mime"
+import "mime/quotedprintable"
+import "net/textproto"
+import "os"
+import "path/filepath"
+import "strconv"
+import "strings"
+
+pub error MultipartError {
+  # A form or part header is over the limits (Go's ErrMessageTooLarge).
+  MessageTooLarge
+  # new_reader was given "" as the boundary.
+  EmptyBoundary
+  # Reading the next boundary line failed (`why`: "EOF", "bufio: buffer
+  # full" or the reader's error).
+  NextPart(why: Str)
+  # A line other than a boundary after a part's blank line.
+  ExpectingNewPart(line: Str)
+  # A line other than a boundary between parts.
+  UnexpectedLine(line: Str)
+  # A write to a part after the next one was created.
+  FinishedPart
+  # set_boundary! after the first part.
+  BoundaryAfterWrite
+  InvalidBoundaryLength
+  InvalidBoundaryChar
+
+  def message -> Str {
+    case self {
+      MessageTooLarge => "multipart: message too large"
+      EmptyBoundary => "multipart: boundary is empty"
+      NextPart(w) => "multipart: NextPart: #{w}"
+      ExpectingNewPart(l) => "multipart: expecting a new Part; got line #{strconv.quote(l)}"
+      UnexpectedLine(l) => "multipart: unexpected line in Next(): #{strconv.quote(l)}"
+      FinishedPart => "multipart: can't write to finished part"
+      BoundaryAfterWrite => "mime: SetBoundary called after write"
+      InvalidBoundaryLength => "mime: invalid boundary length"
+      InvalidBoundaryChar => "mime: invalid boundary character"
+    }
+  }
+}
+
+# Go's peekBufferSize: the longest line next_part! accepts before a part.
+PEEK_BUFFER_SIZE = 4096
+# Go's maxMIMEHeaderSize.
+MAX_MIME_HEADER_SIZE = 10485760
+MAX_INT = 9223372036854775807
+
+# What a part's scan found (Go's p.err).
+SCAN_NONE = 0
+SCAN_EOF = 1
+SCAN_ERR = 2
+
+struct ReaderState {
+  # The id of the part being read (0: none) and the last id handed out.
+  current: Int
+  ids: Int
+  parts_read: Int
+  nl: [Byte]
+  nl_dash_boundary: [Byte]
+  dash_boundary_dash: [Byte]
+  dash_boundary: [Byte]
+  # The current part's reading state (Go's Part.n, total, err, readErr).
+  n: Int
+  total: Int
+  kind: Int
+  err: Error?
+  read_err: Error?
+  # Settings (Go's GODEBUG and tempDir).
+  temp_dir: Str
+  max_parts: Int
+  max_headers: Int
+  distinct: Bool
+}
+
+# An iterator over the parts of a MIME multipart body. Copies share state.
+pub struct Reader[R] {
+  tp: textproto.Reader[R]
+  st: [ReaderState]
+
+  # Go's GODEBUG=multipartmaxparts (default 1000): the most parts read_form!
+  # accepts.
+  pub def set_max_parts!(n: Int) { self.st[0].max_parts = n }
+
+  # Go's GODEBUG=multipartmaxheaders (default 10000): the most header lines
+  # in a part, and in all of read_form!'s file headers together.
+  pub def set_max_headers!(n: Int) { self.st[0].max_headers = n }
+
+  # Go's GODEBUG=multipartfiles=distinct: read_form! spills each large file
+  # to its own temporary file instead of one shared file.
+  pub def set_distinct_files!(on: Bool) { self.st[0].distinct = on }
+
+  # Where read_form! creates temporary files ("" is os's temp_dir).
+  pub def set_temp_dir!(dir: Str) { self.st[0].temp_dir = dir }
+
+  # The next part, none after the last one. A Content-Transfer-Encoding of
+  # "quoted-printable" is decoded transparently (and removed from the
+  # part's header). The previous part is skipped.
+  pub def next_part! -> ~Part[R]? {
+    ~next_part_limited!(false, MAX_MIME_HEADER_SIZE, st[0].max_headers)
+  }
+
+  # Like next_part!, without the quoted-printable decoding.
+  pub def next_raw_part! -> ~Part[R]? {
+    ~next_part_limited!(true, MAX_MIME_HEADER_SIZE, st[0].max_headers)
+  }
+
+  # Parses a whole multipart/form-data body. File parts are held in memory
+  # up to max_memory bytes in all (plus 10 MiB for the rest of the form);
+  # larger files go to a temporary file (one shared file unless
+  # set_distinct_files!). Form.remove_all deletes it. Fails with
+  # MessageTooLarge when the form doesn't fit the limits.
+  pub def read_form!(max_memory: Int) -> ~Form {
+    vm: Map[Str, [Str]] = {}
+    fm: Map[Str, [FileHeader]] = {}
+    form = Form.new(value: vm, file: fm)
+    none_file: os.File? = none
+    fb: [FormBuild] = [FormBuild.new(file: none_file, file_off: 0, disk_files: 0)]
+    res = build_form(self, max_memory, fb, form)
+    close_err: Error? = none
+    if f = fb[0].file {
+      g = f
+      c = g.close!
+      close_err = c.err if c.err?
+    }
+    if !st[0].distinct && fb[0].disk_files > 1 {
+      for k, fhs in form.file {
+        out: [FileHeader] = []
+        for fh in fhs {
+          x = fh
+          x.tmpshared = true
+          out << x
+        }
+        form.file[k] = out
+      }
+    }
+    if e = res.err {
+      form.remove_all
+      if f = fb[0].file {
+        os.remove(f.name)
+      }
+      fail e
+    }
+    if e = close_err {
+      form.remove_all
+      fail e
+    }
+    form
+  }
+
+  def next_part_limited!(raw: Bool, max_size: Int, max_headers: Int) -> ~Part[R]? {
+    self.~skip_current!
+    fail MultipartError.EmptyBoundary if st[0].dash_boundary.size == 2
+    expect_new_part = false
+    loop {
+      line, eof = ~read_slice!
+      return none if eof && final_boundary?(line)
+      if eof {
+        fail MultipartError.NextPart("EOF")
+      }
+      if self.boundary_delimiter_line!(line) {
+        self.st[0].parts_read = st[0].parts_read + 1
+        return ~new_part!(raw, max_size, max_headers)
+      }
+      return none if final_boundary?(line)
+      fail MultipartError.ExpectingNewPart(Str.from_bytes(line)) if expect_new_part
+      next if st[0].parts_read == 0
+      if line == st[0].nl {
+        expect_new_part = true
+        next
+      }
+      fail MultipartError.UnexpectedLine(Str.from_bytes(line))
+    }
+  }
+
+  # Go's bufio ReadSlice('\n') with a 4096-byte buffer: the line with its
+  # "\n", and whether the input ended (then the line is what was left).
+  def read_slice! -> ~([Byte], Bool) {
+    n = tp.buffered
+    n = 1 if n < 1
+    n = PEEK_BUFFER_SIZE if n > PEEK_BUFFER_SIZE
+    loop {
+      pk = tp.~peek!(n)
+      i = 0
+      while i < pk.size && pk[i] != 10 {
+        i += 1
+      }
+      if i < pk.size {
+        line = copy_of(pk[0...i + 1])
+        tp.~discard!(i + 1)
+        return (line, false)
+      }
+      if pk.size < n {
+        line = copy_of(pk)
+        tp.~discard!(pk.size)
+        return (line, true)
+      }
+      fail MultipartError.NextPart("bufio: buffer full") if n >= PEEK_BUFFER_SIZE
+      n = n * 2
+      n = PEEK_BUFFER_SIZE if n > PEEK_BUFFER_SIZE
+    }
+  }
+
+  def final_boundary?(line: [Byte]) -> Bool {
+    dbd = st[0].dash_boundary_dash
+    return false unless has_prefix?(line, dbd)
+    rest = skip_lwsp(line[dbd.size...line.size])
+    rest.size == 0 || rest == st[0].nl
+  }
+
+  def boundary_delimiter_line!(line: [Byte]) -> Bool {
+    db = st[0].dash_boundary
+    return false unless has_prefix?(line, db)
+    rest = skip_lwsp(line[db.size...line.size])
+    if st[0].parts_read == 0 && rest.size == 1 && rest[0] == 10 {
+      nl = st[0].nl
+      self.st[0].nl = nl[1...nl.size]
+      ndb = st[0].nl_dash_boundary
+      self.st[0].nl_dash_boundary = ndb[1...ndb.size]
+    }
+    rest == st[0].nl
+  }
+
+  def new_part!(raw: Bool, max_size: Int, max_headers: Int) -> ~Part[R]? {
+    res = tp.read_mime_header_limited!(max_size, max_headers)
+    if e = res.err {
+      fail MultipartError.MessageTooLarge if e.message == "message too large"
+      fail e
+    }
+    h, eof = res.unwrap
+    # (Go: the header ended by the input's end is io.EOF from NextPart)
+    return none if eof
+    id = st[0].ids + 1
+    self.st[0].ids = id
+    self.st[0].current = id
+    self.st[0].n = 0
+    self.st[0].total = 0
+    self.st[0].kind = SCAN_NONE
+    self.st[0].err = none
+    self.st[0].read_err = none
+    rp = RawPart[R].new(rd: self, id: id)
+    qp = false
+    if !raw && strings.equal_fold(h.get("Content-Transfer-Encoding"), "quoted-printable") {
+      h.del!("Content-Transfer-Encoding")
+      qp = true
+    }
+    params: Map[Str, Str] = {}
+    cell: [Disposition] = [Disposition.new(parsed: false, disposition: "", params: params)]
+    Part[R].new(header: h, raw: rp, qp: qp, qpr: quotedprintable.new_reader(rp), disp: cell)
+  }
+
+  # Skips the rest of the current part.
+  def skip_current! -> ~Unit {
+    id = st[0].current
+    return if id == 0
+    buf: [Byte] = [0; 4096]
+    loop {
+      r = part_read!(buf, id)
+      break if r.err?
+      break if r.unwrap == 0
+    }
+    self.st[0].current = 0
+  }
+
+  # Go's partReader.Read for the part `id`.
+  def part_read!(d: [Byte], id: Int) -> ~Int {
+    return 0 if st[0].current != id || d.size == 0
+    while st[0].n == 0 && st[0].kind == SCAN_NONE {
+      pk = tp.~peek!(tp.buffered)
+      n, kind = scan_until_boundary(pk, st[0].dash_boundary, st[0].nl_dash_boundary, st[0].total, st[0].read_err.present?)
+      self.st[0].n = n
+      self.st[0].kind = kind
+      self.st[0].err = st[0].read_err if kind == SCAN_ERR
+      if n == 0 && kind == SCAN_NONE {
+        more = tp.peek!(pk.size + 1)
+        if e = more.err {
+          self.st[0].read_err = e
+        } else if more.unwrap.size < pk.size + 1 {
+          self.st[0].read_err = io.StreamError.UnexpectedEof
+        }
+      }
+    }
+    if st[0].n == 0 {
+      return 0 if st[0].kind == SCAN_EOF
+      if e = st[0].err {
+        fail e
+      }
+      return 0
+    }
+    n = d.size
+    n = st[0].n if n > st[0].n
+    got = tp.~read!(d[0...n])
+    self.st[0].total = st[0].total + got
+    self.st[0].n = st[0].n - got
+    got
+  }
+}
+
+# A Reader of the multipart body r with the given boundary (the boundary
+# parameter of the body's Content-Type).
+pub def new_reader[R: io.Reader](r: R, boundary: Str) -> Reader[R] {
+  b = ("\r\n--" + boundary + "--").bytes.to_a
+  e: Error? = none
+  s = ReaderState.new(current: 0, ids: 0, parts_read: 0, nl: b[0...2], nl_dash_boundary: b[0...b.size - 2], dash_boundary_dash: b[2...b.size], dash_boundary: b[2...b.size - 2], n: 0, total: 0, kind: SCAN_NONE, err: e, read_err: e, temp_dir: "", max_parts: 1000, max_headers: 10000, distinct: false)
+  st: [ReaderState] = [s]
+  Reader[R].new(tp: textproto.new_reader(r), st: st)
+}
+
+# The raw bytes of a part (Go's partReader).
+pub struct RawPart[R] {
+  rd: Reader[R]
+  id: Int
+
+  pub def read!(d: [Byte]) -> ~Int {
+    r = rd
+    r.~part_read!(d, id)
+  }
+}
+
+struct Disposition {
+  parsed: Bool
+  disposition: Str
+  params: Map[Str, Str]
+}
+
+# A single part of a multipart body: its header and an io.Reader of its
+# body. Copies share state.
+pub struct Part[R] {
+  # The part's header (the Content-Transfer-Encoding is removed when the
+  # body is quoted-printable decoded).
+  header: textproto.MIMEHeader
+  raw: RawPart[R]
+  qp: Bool
+  qpr: quotedprintable.Reader[RawPart[R]]
+  disp: [Disposition]
+
+  # Reads the part's body (decoded); 0 at its end.
+  pub def read!(d: [Byte]) -> ~Int {
+    if qp {
+      q = qpr
+      return q.~read!(d)
+    }
+    r = raw
+    r.~read!(d)
+  }
+
+  # Skips the rest of the part.
+  pub def close! -> ~Unit {
+    buf: [Byte] = [0; 4096]
+    loop {
+      n = self.~read!(buf)
+      break if n == 0
+    }
+  }
+
+  def parse_disposition! {
+    return if disp[0].parsed
+    self.disp[0].parsed = true
+    r = mime.parse_media_type(header.get("Content-Disposition"))
+    if r.ok? {
+      d, ps = r.unwrap
+      self.disp[0].disposition = d
+      self.disp[0].params = ps
+    }
+  }
+
+  # The name parameter of a "form-data" Content-Disposition, "" otherwise.
+  pub def form_name -> Str {
+    me = self
+    me.parse_disposition!
+    return "" if disp[0].disposition != "form-data"
+    disp[0].params["name"] || ""
+  }
+
+  # The filename parameter of the Content-Disposition, as a base name ("" if
+  # there is none).
+  pub def file_name -> Str {
+    me = self
+    me.parse_disposition!
+    f = disp[0].params["filename"] || ""
+    return "" if f.size == 0
+    filepath.base(f)
+  }
+}
+
+# Go's scanUntilBoundary: how many bytes of buf belong to the part, and
+# whether the part ends there (SCAN_EOF) or the read error applies (SCAN_ERR).
+def scan_until_boundary(buf: [Byte], dash_boundary: [Byte], nl_dash_boundary: [Byte], total: Int, read_err: Bool) -> (Int, Int) {
+  rerr = read_err ? SCAN_ERR : SCAN_NONE
+  if total == 0 {
+    if has_prefix?(buf, dash_boundary) {
+      m = match_after_prefix(buf, dash_boundary, read_err)
+      return (dash_boundary.size, SCAN_NONE) if m == -1
+      return (0, SCAN_NONE) if m == 0
+      return (0, SCAN_EOF)
+    }
+    return (0, rerr) if has_prefix?(dash_boundary, buf)
+  }
+  i = index_bytes(buf, nl_dash_boundary)
+  if i >= 0 {
+    m = match_after_prefix(buf[i...buf.size], nl_dash_boundary, read_err)
+    return (i + nl_dash_boundary.size, SCAN_NONE) if m == -1
+    return (i, SCAN_NONE) if m == 0
+    return (i, SCAN_EOF)
+  }
+  return (0, rerr) if has_prefix?(nl_dash_boundary, buf)
+  j = buf.size - 1
+  while j >= 0 && buf[j] != nl_dash_boundary[0] {
+    j -= 1
+  }
+  return (j, SCAN_NONE) if j >= 0 && has_prefix?(nl_dash_boundary, buf[j...buf.size])
+  (buf.size, rerr)
+}
+
+# Go's matchAfterPrefix: -1 no boundary, +1 a boundary, 0 need more input.
+def match_after_prefix(buf: [Byte], prefix: [Byte], read_err: Bool) -> Int {
+  if buf.size == prefix.size {
+    return read_err ? 1 : 0
+  }
+  c = buf[prefix.size]
+  return 1 if c == 32 || c == 9 || c == 13 || c == 10
+  if c == 45 {
+    if buf.size == prefix.size + 1 {
+      return read_err ? -1 : 0
+    }
+    return 1 if buf[prefix.size + 1] == 45
+  }
+  -1
+}
+
+def has_prefix?(b: [Byte], p: [Byte]) -> Bool {
+  b.size >= p.size && b[0...p.size] == p
+}
+
+def index_bytes(b: [Byte], sep: [Byte]) -> Int {
+  return 0 if sep.size == 0
+  i = 0
+  last = b.size - sep.size
+  while i <= last {
+    if b[i] == sep[0] && b[i...i + sep.size] == sep {
+      return i
+    }
+    i += 1
+  }
+  -1
+}
+
+def skip_lwsp(b: [Byte]) -> [Byte] {
+  i = 0
+  while i < b.size && (b[i] == 32 || b[i] == 9) {
+    i += 1
+  }
+  b[i...b.size]
+}
+
+def copy_of(b: [Byte]) -> [Byte] {
+  out: [Byte] = [0; b.size]
+  copy(out, b)
+  out
+}
+
+# 30 random bytes in hex (Go's randomBoundary).
+def random_boundary -> Str {
+  buf: [Byte] = [0; 30]
+  rand.read(buf)
+  hx = "0123456789abcdef"
+  out: [Byte] = []
+  for c in buf {
+    out << hx[c >> 4]
+    out << hx[c & 15]
+  }
+  Str.from_bytes(out)
+}

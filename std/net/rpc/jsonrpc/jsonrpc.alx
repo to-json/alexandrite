@@ -1,0 +1,294 @@
+# Package jsonrpc: Go's net/rpc/jsonrpc, a JSON-RPC 1.0 codec for net/rpc.
+#
+#   client = ~jsonrpc.dial("tcp", addr)
+#   r: Reply = client.~call("Arith.Add", Args.new(a: 7, b: 8))
+#
+#   server = rpc.new_server
+#   ...
+#   jsonrpc.serve_conn(server, conn)
+#
+# Wire format (Go's, byte for byte): a request is
+#   {"method":"Arith.Add","params":[{"A":7,"B":8}],"id":0}
+# and a response
+#   {"id":0,"result":{"C":15},"error":null}
+#   {"id":0,"result":null,"error":"divide by zero"}
+# each followed by "\n". Messages are read as a stream of JSON values (no
+# framing needed); a request's "id" may be any JSON value and is echoed back
+# as it was sent (re-encoded compactly).
+#
+#   Go                                     alx
+#   NewClientCodec(conn) rpc.ClientCodec   new_client_codec(conn) -> ClientCodec[C]
+#   NewServerCodec(conn) rpc.ServerCodec   new_server_codec(conn) -> ServerCodec[C]
+#   NewClient(conn) *rpc.Client            new_client(conn) -> rpc.Client[ClientCodec[C]]
+#   Dial(network, address)                 dial(network, addr)
+#   ServeConn(conn)                        serve_conn(server, conn)
+#
+# Differences from Go:
+#  - serve_conn takes the rpc.Server (Go serves rpc.DefaultServer; alx has no
+#    package-level mutable state, see net/rpc).
+#  - Codecs are generic over the connection and keep their state in Mutexes
+#    (net/rpc's requirement for codecs; see its header).
+#  - An "error" that isn't a string is reported as "invalid error " + its
+#    JSON text (Go formats the decoded value with %v: map[...], <nil> for
+#    null; null is "<nil>" here too).
+#
+# Not translated (all_test.go): TestBuiltinTypes (map/slice/array replies of
+# builtin types; see net/rpc), TestUnexpectedError (an io.Pipe closed with an
+# error; TestMalformedInput covers the same loop exit). net.Pipe is replaced
+# by loopback TCP connections.
+
+import "encoding/json"
+import "io"
+import "net"
+import "net/rpc"
+import "net/textproto"
+
+def ws?(c: Byte) -> Bool {
+  c == 32 || c == 9 || c == 10 || c == 13
+}
+
+def delim?(c: Byte) -> Bool {
+  ws?(c) || c == 44 || c == 93 || c == 125 || c == 58
+}
+
+# The text of the next JSON value in the stream (not validated); none at the
+# end of input.
+def next_value[C](r: textproto.Reader[C]) -> ~Str? {
+  rd = r
+  out: [Byte] = []
+  first: Byte = 0
+  loop {
+    b = ~rd.read_byte!
+    return none unless b.present?
+    first = b.unwrap
+    break unless ws?(first)
+  }
+  out << first
+  if first == 123 || first == 91 {
+    depth = 1
+    in_str = false
+    esc = false
+    while depth > 0 {
+      b = ~rd.read_byte!
+      fail io.StreamError.UnexpectedEof unless b.present?
+      c = b.unwrap
+      out << c
+      if in_str {
+        if esc {
+          esc = false
+        } else if c == 92 {
+          esc = true
+        } else if c == 34 {
+          in_str = false
+        }
+      } else if c == 34 {
+        in_str = true
+      } else if c == 123 || c == 91 {
+        depth += 1
+      } else if c == 125 || c == 93 {
+        depth -= 1
+      }
+    }
+  } else if first == 34 {
+    esc = false
+    loop {
+      b = ~rd.read_byte!
+      fail io.StreamError.UnexpectedEof unless b.present?
+      c = b.unwrap
+      out << c
+      if esc {
+        esc = false
+      } else if c == 92 {
+        esc = true
+      } else if c == 34 {
+        break
+      }
+    }
+  } else {
+    loop {
+      p = ~rd.peek!(1)
+      break if p.size == 0 || delim?(p[0])
+      b = ~rd.read_byte!
+      out << b.unwrap
+    }
+  }
+  Str.from_bytes(out)
+}
+
+# The next JSON value of the stream, parsed; none at the end of input.
+def read_value[C](rd: Mutex[textproto.Reader[C]]) -> ~json.Value? {
+  t = rd.lock { |r| next_value(r) }
+  text = ~t
+  return none unless text.present?
+  ~json.parse(text.unwrap)
+}
+
+def write_text[C](conn: Mutex[C], s: Str) -> ~Unit {
+  r = conn.lock { |c| io.write_all(c, s.bytes.to_a) }
+  ~r
+}
+
+def raw(v: json.Value?) -> Str? {
+  if x = v {
+    return none if x.null?
+    return x.to_json.unwrap_or("null")
+  }
+  none
+}
+
+# --------------------------------------------------------------------- server
+
+struct ServerState {
+  seq: Int
+  # The request ids still to be answered, as JSON text, by sequence number.
+  pending: Map[Int, Str]
+  # The current request's params (JSON text), none if it had none.
+  params: Str?
+}
+
+# The server side of the JSON-RPC codec over a connection C.
+pub struct ServerCodec[C] {
+  rd: Mutex[textproto.Reader[C]]
+  conn: Mutex[C]
+  st: Mutex[ServerState]
+
+  pub def read_request_header! -> ~rpc.Request? {
+    vo = ~read_value(rd)
+    return none unless vo.present?
+    v = vo.unwrap
+    m = ""
+    if mv = v.get("method") {
+      m = mv.as_str || ""
+    }
+    id = raw(v.get("id")) || "null"
+    params = raw(v.get("params"))
+    seq = st.lock { |s|
+      s.seq = s.seq + 1
+      s.pending[s.seq] = id
+      s.params = params
+      s.seq
+    }
+    rpc.Request.new(service_method: m, seq: seq)
+  }
+
+  pub def read_request_body!(want: Bool) -> ~Str {
+    return "" unless want
+    po = st.lock { |s| s.params }
+    fail rpc.RpcError.Failure("jsonrpc: request body missing params") unless po.present?
+    p = ~json.parse(po.unwrap)
+    fail rpc.RpcError.Failure("json: cannot unmarshal #{kind_name(p)} into Go value of type [1]interface {}") unless p.array?
+    # (Go unmarshals into a [1]any: a missing element leaves the zero value)
+    if x = p.at(0) {
+      return ~x.to_json
+    }
+    "null"
+  }
+
+  pub def write_response!(r: rpc.Response, body: Str) -> ~Unit {
+    seq = r.seq
+    b: Str? = st.lock { |s| s.pending.delete(seq) }
+    fail rpc.RpcError.Failure("invalid sequence number in response") unless b.present?
+    id = b.unwrap
+    line = r.error == "" ? "{\"id\":#{id},\"result\":#{body},\"error\":null}\n" : "{\"id\":#{id},\"result\":null,\"error\":#{json.quote(r.error)}}\n"
+    ~write_text(conn, line)
+  }
+
+  pub def close! -> ~Unit {
+    r = conn.lock { |c| c.close! }
+    ~r
+  }
+}
+
+def kind_name(v: json.Value) -> Str {
+  return "object" if v.object?
+  return "string" if v.string?
+  return "number" if v.number?
+  return "bool" if v.bool?
+  "null"
+}
+
+# A JSON-RPC server codec over conn.
+pub def new_server_codec[C: io.ReadWriteCloser](conn: C) -> ServerCodec[C] {
+  pm: Map[Int, Str] = {}
+  ServerCodec.new(rd: Mutex.new(textproto.new_reader(conn)), conn: Mutex.new(conn), st: Mutex.new(ServerState.new(seq: 0, pending: pm, params: none)))
+}
+
+# Serves conn with server, speaking JSON-RPC, until the client hangs up.
+pub def serve_conn[C: io.ReadWriteCloser](server: rpc.Server, conn: C) {
+  server.serve_codec(new_server_codec(conn))
+}
+
+# --------------------------------------------------------------------- client
+
+struct ClientState {
+  # The method of each request in flight, by id.
+  pending: Map[Int, Str]
+  # The result of the response just read (JSON text).
+  result: Str
+}
+
+# The client side of the JSON-RPC codec over a connection C.
+pub struct ClientCodec[C] {
+  rd: Mutex[textproto.Reader[C]]
+  conn: Mutex[C]
+  st: Mutex[ClientState]
+
+  pub def write_request!(r: rpc.Request, body: Str) -> ~Unit {
+    st.lock { |s| s.pending[r.seq] = r.service_method }
+    ~write_text(conn, "{\"method\":#{json.quote(r.service_method)},\"params\":[#{body}],\"id\":#{r.seq}}\n")
+  }
+
+  pub def read_response_header! -> ~rpc.Response? {
+    vo = ~read_value(rd)
+    return none unless vo.present?
+    v = vo.unwrap
+    id = 0
+    if iv = v.get("id") {
+      id = iv.as_int || 0
+    }
+    result = raw(v.get("result"))
+    m = st.lock { |s|
+      s.result = result || "null"
+      s.pending.delete(id) || ""
+    }
+    err = ""
+    ev = v.get("error")
+    has_err = ev.present? && !ev.unwrap.null?
+    if has_err || !result.present? {
+      if !has_err {
+        fail rpc.RpcError.Failure("invalid error <nil>")
+      }
+      e = ev.unwrap
+      fail rpc.RpcError.Failure("invalid error " + (raw(ev) || "")) unless e.string?
+      err = e.as_str || ""
+      err = "unspecified error" if err == ""
+    }
+    rpc.Response.new(service_method: m, seq: id, error: err)
+  }
+
+  pub def read_response_body! -> ~Str {
+    st.lock { |s| s.result }
+  }
+
+  pub def close! -> ~Unit {
+    r = conn.lock { |c| c.close! }
+    ~r
+  }
+}
+
+# A JSON-RPC client codec over conn.
+pub def new_client_codec[C: io.ReadWriteCloser](conn: C) -> ClientCodec[C] {
+  pm: Map[Int, Str] = {}
+  ClientCodec.new(rd: Mutex.new(textproto.new_reader(conn)), conn: Mutex.new(conn), st: Mutex.new(ClientState.new(pending: pm, result: "")))
+}
+
+# An rpc.Client speaking JSON-RPC over conn.
+pub def new_client[C: io.ReadWriteCloser](conn: C) -> rpc.Client[ClientCodec[C]] {
+  rpc.new_client_with_codec(new_client_codec(conn))
+}
+
+# Connects to addr and makes a JSON-RPC client.
+pub def dial(network: Str, addr: Str) -> ~rpc.Client[ClientCodec[net.Conn]] {
+  c = ~net.dial(network, addr)
+  new_client(c)
+}

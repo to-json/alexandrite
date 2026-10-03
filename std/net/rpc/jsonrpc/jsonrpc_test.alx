@@ -1,0 +1,204 @@
+# Go's net/rpc/jsonrpc tests (all_test.go), translated; net.Pipe is a
+# loopback TCP connection here.
+import "bytes"
+import "encoding/json"
+import "net"
+import "net/rpc"
+import "net/textproto"
+import "strings"
+
+#[derive(Json)]
+struct Args {
+  #[json("A")] a: Int
+  #[json("B")] b: Int
+}
+
+#[derive(Json)]
+struct Reply {
+  #[json("C")] c: Int
+}
+
+def add(args: Args) -> ~Reply {
+  Reply.new(c: args.a + args.b)
+}
+
+def mul(args: Args) -> ~Reply {
+  Reply.new(c: args.a * args.b)
+}
+
+def div(args: Args) -> ~Reply {
+  fail "divide by zero" if args.b == 0
+  Reply.new(c: args.a / args.b)
+}
+
+def arith_server -> rpc.Server {
+  s = rpc.new_server
+  a = rpc.new_service("Arith")
+  a.method!("Add", add)
+  a.method!("Mul", mul)
+  a.method!("Div", div)
+  s.register(a).unwrap
+  s
+}
+
+# A JSON-RPC server on a free port; its port.
+def start_server -> Int {
+  s = arith_server
+  ln = net.listen("tcp", "127.0.0.1:0").unwrap
+  port = ln.port
+  spawn {
+    loop {
+      c = ln.accept
+      break if c.err?
+      conn = c.unwrap
+      spawn { serve_conn(s, conn) }
+    }
+  }
+  port
+}
+
+# Sends one raw request on a new connection; the response line, with its
+# "\n".
+def exchange(port: Int, req: Str) -> Str {
+  c = net.dial("tcp", "127.0.0.1:#{port}").unwrap
+  c.write_string!(req).unwrap
+  tp = textproto.new_reader(c)
+  line = tp.read_line!.unwrap || "<EOF>"
+  c.close!.unwrap
+  line + "\n"
+}
+
+test "server no params" {
+  port = start_server()
+  resp = json.parse(exchange(port, "{\"method\": \"Arith.Add\", \"id\": \"123\"}")).unwrap
+  assert !resp.get("error").unwrap.null?, "expected an error"
+}
+
+test "server empty message" {
+  port = start_server()
+  resp = json.parse(exchange(port, "{}")).unwrap
+  assert !resp.get("error").unwrap.null?, "expected an error"
+}
+
+test "server" {
+  port = start_server()
+  c = net.dial("tcp", "127.0.0.1:#{port}").unwrap
+  tp = textproto.new_reader(c)
+  i = 0
+  while i < 10 {
+    hex = strings.repeat("0", 4 - "#{i}".size) + "#{i}"
+    c.write_string!("{\"method\": \"Arith.Add\", \"id\": \"\\u#{hex}\", \"params\": [{\"A\": #{i}, \"B\": #{i + 1}}]}").unwrap
+    resp = json.parse(tp.read_line!.unwrap.unwrap).unwrap
+    assert resp.get("error").unwrap.null?
+    assert_eq resp.get("id").unwrap.as_str.unwrap, Str.from_bytes([i.as_u8])
+    assert_eq resp.get("result").unwrap.get("C").unwrap.as_int.unwrap, 2 * i + 1
+    i += 1
+  }
+  c.close!.unwrap
+}
+
+test "client" {
+  port = start_server()
+  client = dial("tcp", "127.0.0.1:#{port}").unwrap
+  # Synchronous calls
+  r: ~Reply = client.call("Arith.Add", Args.new(a: 7, b: 8))
+  assert_eq r.unwrap.c, 15
+  r: ~Reply = client.call("Arith.Mul", Args.new(a: 7, b: 8))
+  assert_eq r.unwrap.c, 56
+  # Out of order.
+  mul_done = client.go("Arith.Mul", Args.new(a: 7, b: 8), none)
+  add_done = client.go("Arith.Add", Args.new(a: 7, b: 8), none)
+  add_call = add_done.recv.unwrap
+  assert add_call.error == none
+  ar: ~Reply = add_call.result
+  assert_eq ar.unwrap.c, 15
+  mul_call = mul_done.recv.unwrap
+  mr: ~Reply = mul_call.result
+  assert_eq mr.unwrap.c, 56
+  # Error test
+  r: ~Reply = client.call("Arith.Div", Args.new(a: 7, b: 0))
+  assert_eq r.err.unwrap.message, "divide by zero"
+  client.close!.unwrap
+}
+
+test "malformed input" {
+  # ServeConn must return, not loop.
+  l = net.listen("tcp", "127.0.0.1:0").unwrap
+  port = l.port
+  spawn {
+    c = net.~dial("tcp", "127.0.0.1:#{port}")
+    c.~write_string!("{id:1}")
+  }
+  srv = l.accept.unwrap
+  serve_conn(arith_server, srv)
+  l.close!.unwrap
+}
+
+test "malformed output" {
+  l = net.listen("tcp", "127.0.0.1:0").unwrap
+  port = l.port
+  spawn {
+    s = l.~accept
+    s.~write_string!("{\"id\":0,\"result\":null,\"error\":null}")
+    buf: [Byte] = [0; 256]
+    while s.~read!(buf) > 0 {
+    }
+  }
+  client = dial("tcp", "127.0.0.1:#{port}").unwrap
+  r: ~Reply = client.call("Arith.Add", Args.new(a: 7, b: 8))
+  assert r.err?, "expected error"
+  client.close!.unwrap
+}
+
+# An in-memory connection: reads from `input`, writes to `out`.
+struct MemConn {
+  input: Mutex[bytes.Buffer]
+  out: Mutex[bytes.Buffer]
+
+  pub def read!(p: [Byte]) -> ~Int {
+    input.lock { |b| b.read!(p) }
+  }
+
+  pub def write!(p: [Byte]) -> ~Int {
+    out.lock { |b| b.write!(p) }
+  }
+
+  pub def close! -> ~Unit {
+    return
+  }
+
+  def text -> Str {
+    out.lock { |b| b.to_s }
+  }
+}
+
+def mem(input: Str) -> MemConn {
+  MemConn.new(input: Mutex.new(bytes.new_buffer_string(input)), out: Mutex.new(bytes.new_buffer([])))
+}
+
+test "server error has null result" {
+  m = mem("{\"method\": \"Arith.Add\", \"id\": \"123\", \"params\": []}")
+  sc = new_server_codec(m)
+  r = sc.read_request_header!.unwrap.unwrap
+  value_text = "the value we don't want to see"
+  error_text = "some error"
+  sc.write_response!(rpc.Response.new(service_method: "Method", seq: r.seq, error: error_text), json.quote(value_text)).unwrap
+  assert strings.contains(m.text, error_text), m.text
+  assert !strings.contains(m.text, value_text), m.text
+  assert_eq m.text, "{\"id\":\"123\",\"result\":null,\"error\":\"some error\"}\n"
+}
+
+test "client wire format" {
+  m = mem("{\"id\":0,\"result\":{\"C\":15},\"error\":null}\n{\"id\":1,\"result\":null,\"error\":\"\"}{\"id\":2,\"error\":{\"x\":1}}")
+  cc = new_client_codec(m)
+  cc.write_request!(rpc.Request.new(service_method: "Arith.Add", seq: 0), "{\"A\":7,\"B\":8}").unwrap
+  assert_eq m.text, "{\"method\":\"Arith.Add\",\"params\":[{\"A\":7,\"B\":8}],\"id\":0}\n"
+  cc.write_request!(rpc.Request.new(service_method: "Arith.Div", seq: 1), "{}").unwrap
+  h = cc.read_response_header!.unwrap.unwrap
+  assert_eq (h.service_method, h.seq, h.error), ("Arith.Add", 0, "")
+  assert_eq cc.read_response_body!.unwrap, "{\"C\":15}"
+  h = cc.read_response_header!.unwrap.unwrap
+  assert_eq (h.service_method, h.seq, h.error), ("Arith.Div", 1, "unspecified error")
+  assert_eq cc.read_response_header!.err.unwrap.message, "invalid error {\"x\":1}"
+  assert_eq cc.read_response_header!.unwrap, none
+}

@@ -1,0 +1,222 @@
+# Package textproto: Go's net/textproto, generic support for text-based
+# request/response protocols in the style of HTTP, NNTP and SMTP.
+#
+#   tp = textproto.new_reader(conn)          # any io.Reader
+#   h = ~tp.read_mime_header!                # MIMEHeader
+#   code, msg = ~tp.read_response!(2)        # "220-...\r\n220 ok\r\n"
+#
+#   Go                                     alx
+#   NewReader(bufio.NewReader(r)) *Reader  new_reader(r) -> Reader[R]
+#   (*Reader).ReadLine() (string, error)   read_line! -> ~Str? (none at EOF)
+#   ReadLineBytes / ReadContinuedLine[Bytes]  read_line_bytes!, read_continued_line![_bytes]
+#   ReadCodeLine(n) (int, string, error)   read_code_line!(n) -> ~(Int, Str)
+#   ReadResponse(n) (int, string, error)   read_response!(n) -> ~(Int, Str)
+#   DotReader() io.Reader                  dot_reader! -> ~DotReader[R]
+#   ReadDotBytes / ReadDotLines            read_dot_bytes!, read_dot_lines!
+#   ReadMIMEHeader() (MIMEHeader, error)   read_mime_header! -> ~MIMEHeader
+#   NewWriter(bufio.NewWriter(w)) *Writer  new_writer(w) -> Writer[W]
+#   PrintfLine(format, args...)            print_line!(format(...))
+#   DotWriter() io.WriteCloser             dot_writer! -> ~DotWriter[W]
+#   Pipeline, NewConn, Dial, (*Conn).Cmd   Pipeline, new_conn, dial, Conn.cmd!(line)
+#   MIMEHeader (map[string][]string)       MIMEHeader (add!, set!, get, values, del!, keys)
+#   CanonicalMIMEHeaderKey                 canonical_mime_header_key
+#   TrimString / TrimBytes                 trim_string / trim_bytes
+#   *Error{Code, Msg}, ProtocolError       TextprotoError.Code(code, msg), .Protocol(msg)
+#
+# Differences from Go:
+#  - Reader and Writer are generic over the stream (`Reader[R]`, `Writer[W]`)
+#    and do their own buffering, instead of taking a *bufio.Reader /
+#    *bufio.Writer: an interface value can't hold a reader that itself holds
+#    an io.Reader (GO-VS-RUBY D12), and the dot reader / writer (and readers
+#    built on this one, like mime/multipart's parts) should be usable as
+#    io.Readers / io.Writers. A Reader is also the stream's buffered reader:
+#    read!, read_byte!, unread_byte!, peek!, discard! and buffered are Go's
+#    r.R methods. Passing a bufio.Reader works too, but then the DotReader
+#    holds an interface value and can't itself be passed as an io.Reader.
+#  - End of input is not an error (io's convention): read_line! and friends
+#    return none. Where Go returns io.EOF from a call that needs more input
+#    (read_code_line!, read_response!, read_dot_lines!, a dot reader, a MIME
+#    header without its blank line) alx fails with
+#    io.StreamError.UnexpectedEof. read_mime_header_to_eof! keeps Go's
+#    "header plus io.EOF" result as (header, true).
+#  - Go's Read*Line functions return a value together with an error (a code
+#    mismatch gives the code, the message and an *Error). A `~T` holds one or
+#    the other: the TextprotoError.Code variant carries the code and message.
+#  - print_line! takes the finished line (no variadics); Conn.cmd! likewise.
+#  - Conn doesn't embed Reader / Writer / Pipeline (alx has no embedding):
+#    they are the fields `reader`, `writer`, `pipeline`, and Conn forwards the
+#    common calls.
+#  - MIMEHeader is a struct around Map[Str, [Str]] (insertion-ordered; Go's
+#    map is unordered); `==` compares as Go's reflect.DeepEqual would.
+#  - The commonHeader interning table isn't needed (strings aren't
+#    allocated per key the way Go's are) and isn't ported.
+#
+# Not translated: TestReadMIMEHeaderAllocations, TestCommonHeaders'
+# allocation count and the benchmarks' alloc reports (Go runtime memory
+# statistics), TestIssue46363 (a data race on the interning table).
+
+import "io"
+import "net"
+
+pub error TextprotoError {
+  # A numeric reply with the wrong code (Go's *Error): "550 \"msg\"".
+  Code(code: Int, msg: Str)
+  # A malformed reply or header line (Go's ProtocolError).
+  Protocol(msg: Str)
+  # A line or header over the limit (Go's errMessageTooLarge).
+  MessageTooLarge
+
+  def message -> Str {
+    case self {
+      Code(c, m) => format("%03d %q", c, m)
+      Protocol(m) => m
+      MessageTooLarge => "message too large"
+    }
+  }
+}
+
+def ascii_space?(b: Byte) -> Bool {
+  b == 32 || b == 9 || b == 10 || b == 13
+}
+
+# s without leading and trailing ASCII white space (" \t\r\n").
+pub def trim_string(s: Str) -> Str {
+  i = 0
+  while i < s.size && ascii_space?(s[i]) {
+    i += 1
+  }
+  n = s.size
+  while n > i && ascii_space?(s[n - 1]) {
+    n -= 1
+  }
+  s[i...n]
+}
+
+# b without leading and trailing ASCII white space (shares b's storage).
+pub def trim_bytes(b: [Byte]) -> [Byte] {
+  i = 0
+  while i < b.size && ascii_space?(b[i]) {
+    i += 1
+  }
+  n = b.size
+  while n > i && ascii_space?(b[n - 1]) {
+    n -= 1
+  }
+  b[i...n]
+}
+
+# ------------------------------------------------------------------ Pipeline
+
+struct Sequencer {
+  id: Int
+  wait: Map[Int, Chan[Bool]]
+}
+
+def seq_start(s: Mutex[Sequencer], id: Int) {
+  c: Chan[Bool]? = s.lock { |q|
+    if q.id == id {
+      none
+    } else {
+      ch = Chan[Bool].new
+      q.wait[id] = ch
+      ch
+    }
+  }
+  if ch = c {
+    ch.recv
+  }
+}
+
+def seq_end(s: Mutex[Sequencer], id: Int) {
+  c: Chan[Bool]? = s.lock { |q|
+    assert q.id == id, "out of sync"
+    q.id = id + 1
+    q.wait.delete(id + 1)
+  }
+  if ch = c {
+    ch.close
+  }
+}
+
+def new_sequencer -> Mutex[Sequencer] {
+  w: Map[Int, Chan[Bool]] = {}
+  Mutex.new(Sequencer.new(id: 0, wait: w))
+}
+
+# Puts pipelined requests and responses in order (Go's Pipeline): a client
+# takes an id with `next`, then brackets sending its request with
+# start_request / end_request and reading the response with start_response
+# / end_response; each start waits until every lower id has ended. A handle:
+# copies share state.
+pub struct Pipeline {
+  ids: Atomic[Int]
+  request: Mutex[Sequencer]
+  response: Mutex[Sequencer]
+
+  # The next request/response id.
+  pub def next -> Int { ids.add(1) - 1 }
+
+  pub def start_request(id: Int) { seq_start(request, id) }
+  pub def end_request(id: Int) { seq_end(request, id) }
+  pub def start_response(id: Int) { seq_start(response, id) }
+  pub def end_response(id: Int) { seq_end(response, id) }
+}
+
+pub def new_pipeline -> Pipeline {
+  Pipeline.new(ids: Atomic.new(0), request: new_sequencer, response: new_sequencer)
+}
+
+# ---------------------------------------------------------------------- Conn
+
+# A text protocol connection: a Reader, a Writer and a Pipeline over one
+# stream C (Go's Conn embeds them; here they are fields, with the common
+# calls forwarded). C must share its state across copies (net.Conn does).
+pub struct Conn[C] {
+  reader: Reader[C]
+  writer: Writer[C]
+  pipeline: Pipeline
+  conn: C
+
+  pub def close! -> ~Unit {
+    c = conn
+    c.~close!
+  }
+
+  # Sends `line` as the next request in the pipeline; its id (Go's Cmd:
+  # format the line with `format(...)` first).
+  pub def cmd!(line: Str) -> ~Int {
+    id = pipeline.next
+    pipeline.start_request(id)
+    r = writer.print_line!(line)
+    pipeline.end_request(id)
+    ~r
+    id
+  }
+
+  pub def print_line!(line: Str) -> ~Unit { writer.~print_line!(line) }
+  pub def dot_writer! -> ~DotWriter[C] { writer.~dot_writer! }
+  pub def read_line! -> ~Str? { reader.~read_line! }
+  pub def read_continued_line! -> ~Str? { reader.~read_continued_line! }
+  pub def read_code_line!(expect_code: Int) -> ~(Int, Str) { reader.~read_code_line!(expect_code) }
+  pub def read_response!(expect_code: Int) -> ~(Int, Str) { reader.~read_response!(expect_code) }
+  pub def dot_reader! -> ~DotReader[C] { reader.~dot_reader! }
+  pub def read_dot_bytes! -> ~[Byte] { reader.~read_dot_bytes! }
+  pub def read_dot_lines! -> ~[Str] { reader.~read_dot_lines! }
+  pub def read_mime_header! -> ~MIMEHeader { reader.~read_mime_header! }
+  pub def next -> Int { pipeline.next }
+  pub def start_request(id: Int) { pipeline.start_request(id) }
+  pub def end_request(id: Int) { pipeline.end_request(id) }
+  pub def start_response(id: Int) { pipeline.start_response(id) }
+  pub def end_response(id: Int) { pipeline.end_response(id) }
+}
+
+# A Conn over c.
+pub def new_conn[C: io.ReadWriteCloser](c: C) -> Conn[C] {
+  Conn.new(reader: new_reader(c), writer: new_writer(c), pipeline: new_pipeline, conn: c)
+}
+
+# Connects to addr over network ("tcp") and wraps the connection.
+pub def dial(network: Str, addr: Str) -> ~Conn[net.Conn] {
+  c = ~net.dial(network, addr)
+  new_conn(c)
+}

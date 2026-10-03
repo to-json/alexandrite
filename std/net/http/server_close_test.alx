@@ -1,0 +1,47 @@
+# Shutdown with connections that never sent a request, and
+# close_client_connections (from Go's httptest server tests).
+import "bufio"
+import "net"
+
+test "shutdown doesn't wait for a connection that sent nothing" {
+  mux = new_serve_mux
+  mux.handle_func("/") { |w, r|
+    w.write_string!("hello").unwrap
+  }
+  srv = new_server(mux)
+  ln = net.listen("tcp", "127.0.0.1:0").unwrap
+  port = ln.port
+  spawn { srv.serve(ln) }
+  cnew = net.dial("tcp", "127.0.0.1:#{port}").unwrap
+  cidle = net.dial("tcp", "127.0.0.1:#{port}").unwrap
+  cidle.write_string!("HEAD / HTTP/1.1\r\nHost: foo\r\n\r\n").unwrap
+  assert_eq read_response(bufio.new_reader(cidle), true).unwrap.status, 200
+  # (Go's testServerCloseBlocking: this hung before)
+  srv.shutdown
+  cnew.close!
+  cidle.close!
+}
+
+test "close client connections" {
+  mux = new_serve_mux
+  # (a handler can't capture its own server: another task closes the
+  # connections when the handler asks, then lets it return)
+  ask = Chan[Bool].new(1)
+  done = Chan[Bool].new(1)
+  mux.handle_func("/") { |w, r|
+    ask << true
+    done.recv
+  }
+  srv = new_server(mux)
+  ln = net.listen("tcp", "127.0.0.1:0").unwrap
+  port = ln.port
+  spawn { srv.serve(ln) }
+  closer = spawn {
+    ask.recv
+    srv.close_client_connections
+    done << true
+  }
+  assert get("http://127.0.0.1:#{port}/").err?
+  closer.wait.unwrap
+  srv.shutdown
+}

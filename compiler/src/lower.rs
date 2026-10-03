@@ -387,6 +387,9 @@ struct Lw<'a> {
     /// R1 placement for this function's allocation sites, its frame region
     /// and the caller's (`dest`), and the class whose region is current.
     place: Option<&'a crate::regions::FnPlacement>,
+    /// In a lambda's body: the placement of the function the lambda is
+    /// written in (its sites are placed there; the body has no frame).
+    lambda_place: Option<&'a crate::regions::FnPlacement>,
     frame: Option<(V, V)>,
     /// A light frame: a mark in the caller's region instead of a region
     /// of its own (see `light_frame`).
@@ -432,6 +435,7 @@ impl<'a> Lw<'a> {
             prog,
             res: None,
             place: None,
+            lambda_place: None,
             frame: None,
             light: None,
             ambient: crate::regions::Place::Frame,
@@ -953,6 +957,20 @@ impl<'a> Lw<'a> {
         // A call whose result holds no storage: where it's made doesn't matter
         // (the callee places its own allocations).
         if matches!(e.kind, TK::Call(..)) && !crate::regions::has_storage(&e.ty) && !(self.promote() && crate::regions::contains_int(&e.ty)) {
+            return None;
+        }
+        // In a lambda's body, what the analysis sends to the program region
+        // (stored into a captured variable that outlives the call, say) must
+        // go there: the region current when the lambda runs may be the
+        // frame of whoever called it, freed when that returns.
+        if let (Some(pl), None) = (self.lambda_place, self.frame) {
+            use crate::regions::Place;
+            if crate::regions::allocates(e, self.promote()) {
+                let class = pl.sites.get(&(e as *const TExpr as usize)).copied().unwrap_or(Place::Global);
+                if matches!(class, Place::Global | Place::Into(_)) && self.ambient != Place::Global {
+                    return Some((LE::RegionProgram, Place::Global));
+                }
+            }
             return None;
         }
         if let (Some(pl), Some((frame, dest))) = (self.place, self.frame) {
@@ -2842,6 +2860,7 @@ impl<'a> Lw<'a> {
                 // The body becomes its own function: captures first, then params.
                 let Ty::Fn(pts, rt) = &e.ty else { unreachable!() };
                 let mut w = Lw::new(self.p, self.sm, self.opts, self.f, self.mode, ErrPath::Return(vec![]), self.prog);
+                w.lambda_place = self.place.or(self.lambda_place);
                 // `(..) -> ~T`: a fallible body, like a fallible def's.
                 let ok_t = match &**rt {
                     Ty::Result(t) => Some(w.lty(t)),

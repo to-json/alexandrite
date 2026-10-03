@@ -1,0 +1,628 @@
+import "bytes"
+import "io"
+import "strconv"
+import "strings"
+import "unicode"
+import "unicode/utf8"
+
+def raw(b: [Byte]) -> Str { Str.from_bytes(b) }
+
+def f100 -> Str { strings.repeat("f", 100) }
+
+def src(s: Str) -> bytes.Buffer { bytes.new_buffer_string(s) }
+
+# Delivers its data one segment per read (Go's StringReader). An empty
+# segment is skipped: a 0-byte read is the end of input in alx, where Go's
+# reader returns 0 bytes and no error and the scanner reads again.
+struct StringReader {
+  st: [Int] # the next segment
+  data: [Str]
+
+  def read!(p: [Byte]) -> Int {
+    while st[0] < data.size && data[st[0]].size == 0 {
+      self.st[0] = st[0] + 1
+    }
+    return 0 if st[0] >= data.size
+    s = data[st[0]]
+    n = s.size
+    n = p.size if n > p.size
+    i = 0
+    while i < n {
+      p[i] = s[i]
+      i += 1
+    }
+    self.st[0] = st[0] + 1
+    n
+  }
+}
+
+test "next" {
+  for segments in segment_list {
+    want = strings.join(segments, "")
+    s = new_scanner(StringReader.new(st: [0], data: segments))
+    got: [Byte] = []
+    loop {
+      ch = s.next!
+      break if ch == EOF
+      for b in utf8.encode_rune(ch) {
+        got << b
+      }
+    }
+    assert Str.from_bytes(got) == want, "segments=#{segments} got=#{Str.from_bytes(got)} want=#{want}"
+  }
+}
+
+def make_source(pattern_pre: Str, pattern_post: Str) -> bytes.Buffer {
+  parts: [Str] = []
+  for k in token_list {
+    parts << pattern_pre + k[1] + pattern_post
+  }
+  src(strings.join(parts, ""))
+}
+
+def check_tok(s: Scanner, line: Int, got: Rune, want: Rune, text: Str) {
+  assert got == want, "tok = #{token_string(got)}, want #{token_string(want)} for #{strconv.quote(text)}"
+  assert s.position.line == line, "line = #{s.position.line}, want #{line} for #{strconv.quote(text)}"
+  stext = s.token_text
+  assert stext == text, "text = #{strconv.quote(stext)}, want #{strconv.quote(text)}"
+  # TokenText is idempotent.
+  assert s.token_text == text, "text = #{strconv.quote(s.token_text)}, want #{strconv.quote(text)} (idempotency check)"
+}
+
+def check_tok_err(s: Scanner, line: Int, want: Rune, text: Str) {
+  sc = s
+  prev = sc.error_count
+  check_tok(sc, line, sc.scan!, want, text)
+  assert sc.error_count == prev + 1, "want error for #{strconv.quote(text)}"
+}
+
+def count_newlines(s: Str) -> Int {
+  n = 0
+  for c in s.bytes {
+    n += 1 if c == 0x0A
+  }
+  n
+}
+
+def test_scan(mode: Int) {
+  s = new_scanner(make_source(" \t", "\n"))
+  s.mode = mode
+  tok = s.scan!
+  line = 1
+  for k in token_list {
+    if (mode & SKIP_COMMENTS) == 0 || k[0] != COMMENT {
+      check_tok(s, line, tok, k[0], k[1])
+      tok = s.scan!
+    }
+    line += count_newlines(k[1]) + 1 # each token is on a new line
+  }
+  check_tok(s, line, tok, EOF, "")
+}
+
+test "scan" {
+  test_scan(GO_TOKENS)
+  test_scan(GO_TOKENS - SKIP_COMMENTS)
+}
+
+test "invalid exponent" {
+  s = new_scanner(src("1.5e 1.5E 1e+ 1e- 1.5z"))
+  bad: [Str] = []
+  s.set_error!(->(e: ScanError) {
+    bad << "#{e.token_text}: #{e.msg}" if e.msg != "exponent has no digits"
+  })
+  check_tok_err(s, 1, FLOAT, "1.5e")
+  check_tok_err(s, 1, FLOAT, "1.5E")
+  check_tok_err(s, 1, FLOAT, "1e+")
+  check_tok_err(s, 1, FLOAT, "1e-")
+  check_tok(s, 1, s.scan!, FLOAT, "1.5")
+  check_tok(s, 1, s.scan!, IDENT, "z")
+  check_tok(s, 1, s.scan!, EOF, "")
+  assert_eq s.error_count, 4
+  assert_eq bad.size, 0
+}
+
+test "position" {
+  s = new_scanner(make_source("\t\t\t\t", "\n"))
+  s.mode = GO_TOKENS - SKIP_COMMENTS
+  s.scan!
+  offset = 4
+  line = 1
+  for k in token_list {
+    p = s.position
+    assert p.offset == offset, "offset = #{p.offset}, want #{offset} for #{strconv.quote(k[1])}"
+    assert p.line == line, "line = #{p.line}, want #{line} for #{strconv.quote(k[1])}"
+    assert p.column == 5, "column = #{p.column}, want 5 for #{strconv.quote(k[1])}"
+    offset += 4 + k[1].size + 1 # 4 tabs + token bytes + newline
+    line += count_newlines(k[1]) + 1
+    s.scan!
+  }
+  # No token-internal errors.
+  assert_eq s.error_count, 0
+}
+
+test "scan zero mode" {
+  b = make_source("", "\n")
+  str = b.string
+  s = new_scanner(b)
+  s.mode = 0       # no token classes
+  s.whitespace = 0 # no white space
+  tok = s.scan!
+  i = 0
+  for ch in str.runes {
+    assert tok == ch, "#{i}. tok = #{token_string(tok)}, want #{token_string(ch)}"
+    tok = s.scan!
+    i += 1
+  }
+  assert tok == EOF, "tok = #{token_string(tok)}, want EOF"
+  assert_eq s.error_count, 0
+}
+
+def test_scan_selected_mode(mode: Int, class: Rune) {
+  s = new_scanner(make_source("", "\n"))
+  s.mode = mode
+  tok = s.scan!
+  while tok != EOF {
+    assert !(tok < 0 && tok != class), "tok = #{token_string(tok)}, want #{token_string(class)}"
+    tok = s.scan!
+  }
+  assert_eq s.error_count, 0
+}
+
+test "scan selected mask" {
+  test_scan_selected_mode(0, 0)
+  test_scan_selected_mode(SCAN_IDENTS, IDENT)
+  # Not SCAN_INTS and SCAN_FLOATS: parts of the floats in the source look
+  # like (invalid) octal ints, and floats may scan as Int or Float.
+  test_scan_selected_mode(SCAN_CHARS, CHAR)
+  test_scan_selected_mode(SCAN_STRINGS, STRING)
+  test_scan_selected_mode(SKIP_COMMENTS, 0)
+  test_scan_selected_mode(SCAN_COMMENTS, COMMENT)
+}
+
+test "scan custom ident" {
+  s = new_scanner(src("faab12345 a12b123 a12 3b"))
+  # ident = ( 'a' | 'b' ) { digit } . digit = '0' .. '3' . At most 4 long.
+  s.set_is_ident_rune!(->(ch: Rune, i: Int) -> Bool { (i == 0 && (ch == 0x61 || ch == 0x62)) || (0 < i && i < 4 && 0x30 <= ch && ch <= 0x33) })
+  check_tok(s, 1, s.scan!, 0x66, "f")
+  check_tok(s, 1, s.scan!, IDENT, "a")
+  check_tok(s, 1, s.scan!, IDENT, "a")
+  check_tok(s, 1, s.scan!, IDENT, "b123")
+  check_tok(s, 1, s.scan!, INT, "45")
+  check_tok(s, 1, s.scan!, IDENT, "a12")
+  check_tok(s, 1, s.scan!, IDENT, "b123")
+  check_tok(s, 1, s.scan!, IDENT, "a12")
+  check_tok(s, 1, s.scan!, INT, "3")
+  check_tok(s, 1, s.scan!, IDENT, "b")
+  check_tok(s, 1, s.scan!, EOF, "")
+}
+
+test "scan next" {
+  bom = "\ufeff"
+  s = new_scanner(src(bom + "if a == bcd /* com" + bom + "ment */ {\n\ta += c\n}" + bom + "// line comment ending in eof"))
+  check_tok(s, 1, s.scan!, IDENT, "if") # the first BOM is ignored
+  check_tok(s, 1, s.scan!, IDENT, "a")
+  check_tok(s, 1, s.scan!, 0x3D, "=")
+  check_tok(s, 0, s.next!, 0x3D, "")
+  check_tok(s, 0, s.next!, 0x20, "")
+  check_tok(s, 0, s.next!, 0x62, "")
+  check_tok(s, 1, s.scan!, IDENT, "cd")
+  check_tok(s, 1, s.scan!, 0x7B, "{")
+  check_tok(s, 2, s.scan!, IDENT, "a")
+  check_tok(s, 2, s.scan!, 0x2B, "+")
+  check_tok(s, 0, s.next!, 0x3D, "")
+  check_tok(s, 2, s.scan!, IDENT, "c")
+  check_tok(s, 3, s.scan!, 0x7D, "}")
+  check_tok(s, 3, s.scan!, 0xFEFF, bom)
+  check_tok(s, 3, s.scan!, -1, "")
+  assert_eq s.error_count, 0
+}
+
+test "scan whitespace" {
+  b: [Byte] = []
+  ws: U64 = 0
+  # From 1: NUL is not allowed.
+  ch = 1
+  while ch < 0x20 {
+    b << ch.as_u8
+    ws |= 1.as_u64 << ch.as_u64
+    ch += 1
+  }
+  b << 0x78
+  s = new_scanner(bytes.new_buffer(b))
+  s.mode = 0
+  s.whitespace = ws
+  tok = s.scan!
+  assert tok == 0x78, "tok = #{token_string(tok)}, want #{token_string(0x78)}"
+}
+
+def test_error(source: Str, pos: Str, msg: Str, tok: Rune) {
+  s = new_scanner(src(source))
+  first: [ScanError] = []
+  s.set_error!(->(e: ScanError) {
+    first << e if first.size == 0 # only the first error
+  })
+  tk = s.scan!
+  assert tk == tok, "tok = #{token_string(tk)}, want #{token_string(tok)} for #{strconv.quote(source)}"
+  assert first.size == 1, "error handler not called for #{strconv.quote(source)}"
+  assert first[0].pos.to_s == pos, "pos = #{strconv.quote(first[0].pos.to_s)}, want #{strconv.quote(pos)} for #{strconv.quote(source)}"
+  assert first[0].msg == msg, "msg = #{strconv.quote(first[0].msg)}, want #{strconv.quote(msg)} for #{strconv.quote(source)}"
+  assert s.error_count > 0, "count = #{s.error_count}, want > 0 for #{strconv.quote(source)}"
+}
+
+test "error" {
+  test_error("\0", "<input>:1:1", "invalid character NUL", 0)
+  test_error(raw([0x80]), "<input>:1:1", "invalid UTF-8 encoding", utf8.RUNE_ERROR)
+  test_error(raw([0xFF]), "<input>:1:1", "invalid UTF-8 encoding", utf8.RUNE_ERROR)
+
+  test_error("a\0", "<input>:1:2", "invalid character NUL", IDENT)
+  test_error("ab" + raw([0x80]), "<input>:1:3", "invalid UTF-8 encoding", IDENT)
+  test_error("abc" + raw([0xFF]), "<input>:1:4", "invalid UTF-8 encoding", IDENT)
+
+  test_error("\"a\0", "<input>:1:3", "invalid character NUL", STRING)
+  test_error("\"ab" + raw([0x80]), "<input>:1:4", "invalid UTF-8 encoding", STRING)
+  test_error("\"abc" + raw([0xFF]), "<input>:1:5", "invalid UTF-8 encoding", STRING)
+
+  test_error("`a\0", "<input>:1:3", "invalid character NUL", RAW_STRING)
+  test_error("`ab" + raw([0x80]), "<input>:1:4", "invalid UTF-8 encoding", RAW_STRING)
+  test_error("`abc" + raw([0xFF]), "<input>:1:5", "invalid UTF-8 encoding", RAW_STRING)
+
+  test_error("'\\\"'", "<input>:1:3", "invalid char escape", CHAR)
+  test_error("\"\\'\"", "<input>:1:3", "invalid char escape", STRING)
+
+  test_error("01238", "<input>:1:6", "invalid digit '8' in octal literal", INT)
+  test_error("01238123", "<input>:1:9", "invalid digit '8' in octal literal", INT)
+  test_error("0x", "<input>:1:3", "hexadecimal literal has no digits", INT)
+  test_error("0xg", "<input>:1:3", "hexadecimal literal has no digits", INT)
+  test_error("'aa'", "<input>:1:4", "invalid char literal", CHAR)
+  test_error("1.5e", "<input>:1:5", "exponent has no digits", FLOAT)
+  test_error("1.5E", "<input>:1:5", "exponent has no digits", FLOAT)
+  test_error("1.5e+", "<input>:1:6", "exponent has no digits", FLOAT)
+  test_error("1.5e-", "<input>:1:6", "exponent has no digits", FLOAT)
+
+  test_error("'", "<input>:1:2", "literal not terminated", CHAR)
+  test_error("'\n", "<input>:1:2", "literal not terminated", CHAR)
+  test_error("\"abc", "<input>:1:5", "literal not terminated", STRING)
+  test_error("\"abc\n", "<input>:1:5", "literal not terminated", STRING)
+  test_error("`abc\n", "<input>:2:1", "literal not terminated", RAW_STRING)
+  test_error("/*/", "<input>:1:4", "comment not terminated", EOF)
+}
+
+# Fails every read with an error that is not the end of input.
+struct ErrReader {
+  def read!(b: [Byte]) -> ~Int {
+    fail io.StreamError.NoProgress
+  }
+}
+
+test "io error" {
+  s = new_scanner(ErrReader.new)
+  msgs: [Str] = []
+  s.set_error!(->(e: ScanError) {
+    msgs << e.msg
+  })
+  tok = s.scan!
+  assert tok == EOF, "tok = #{token_string(tok)}, want EOF"
+  assert msgs.size > 0, "error handler not called"
+  assert_eq msgs[0], "multiple Read calls return no data or error"
+}
+
+def check_pos(got: Position, offset: Int, line: Int, column: Int) {
+  assert got.offset == offset && got.line == line && got.column == column, "got offset, line, column = #{got.offset}, #{got.line}, #{got.column}; want #{offset}, #{line}, #{column}"
+}
+
+def check_next_pos(s: Scanner, offset: Int, line: Int, column: Int, char: Rune) {
+  sc = s
+  ch = sc.next!
+  assert ch == char, "ch = #{token_string(ch)}, want #{token_string(char)}"
+  check_pos(sc.pos, offset, line, column)
+}
+
+def check_scan_pos(s: Scanner, offset: Int, line: Int, column: Int, char: Rune) {
+  sc = s
+  check_pos(sc.pos, offset, line, column)
+  ch = sc.scan!
+  if ch != char {
+    assert false, "ch = #{token_string(ch)}, want #{token_string(char)}"
+    assert rune_str(ch) == sc.token_text, "tok = #{strconv.quote(sc.token_text)}, want #{strconv.quote(rune_str(ch))}"
+  }
+  check_pos(sc.position, offset, line, column)
+}
+
+test "pos" {
+  # Corner case: empty source.
+  s = new_scanner(src(""))
+  check_pos(s.pos, 0, 1, 1)
+  s.peek! # peek doesn't affect the position
+  check_pos(s.pos, 0, 1, 1)
+
+  # Corner case: a source of only a newline.
+  s = new_scanner(src("\n"))
+  check_pos(s.pos, 0, 1, 1)
+  check_next_pos(s, 1, 2, 1, 0x0A)
+  # After EOF the position doesn't change.
+  i = 10
+  while i > 0 {
+    check_scan_pos(s, 1, 2, 1, EOF)
+    i -= 1
+  }
+  assert_eq s.error_count, 0
+
+  # Corner case: a source of a single character.
+  s = new_scanner(src("本"))
+  check_pos(s.pos, 0, 1, 1)
+  check_next_pos(s, 3, 1, 2, 0x672C)
+  i = 10
+  while i > 0 {
+    check_scan_pos(s, 3, 1, 2, EOF)
+    i -= 1
+  }
+  assert_eq s.error_count, 0
+
+  # Positions after next!.
+  s = new_scanner(src("  foo६४  \n\n本語\n"))
+  check_next_pos(s, 1, 1, 2, 0x20)
+  s.peek!
+  check_next_pos(s, 2, 1, 3, 0x20)
+  check_next_pos(s, 3, 1, 4, 0x66)
+  check_next_pos(s, 4, 1, 5, 0x6F)
+  check_next_pos(s, 5, 1, 6, 0x6F)
+  check_next_pos(s, 8, 1, 7, 0x96C)
+  check_next_pos(s, 11, 1, 8, 0x96A)
+  check_next_pos(s, 12, 1, 9, 0x20)
+  check_next_pos(s, 13, 1, 10, 0x20)
+  check_next_pos(s, 14, 2, 1, 0x0A)
+  check_next_pos(s, 15, 3, 1, 0x0A)
+  check_next_pos(s, 18, 3, 2, 0x672C)
+  check_next_pos(s, 21, 3, 3, 0x8A9E)
+  check_next_pos(s, 22, 4, 1, 0x0A)
+  i = 10
+  while i > 0 {
+    check_scan_pos(s, 22, 4, 1, EOF)
+    i -= 1
+  }
+  assert_eq s.error_count, 0
+
+  # Positions after scan!.
+  s = new_scanner(src("abc\n本語\n\nx"))
+  s.mode = 0
+  s.whitespace = 0
+  check_scan_pos(s, 0, 1, 1, 0x61)
+  s.peek!
+  check_scan_pos(s, 1, 1, 2, 0x62)
+  check_scan_pos(s, 2, 1, 3, 0x63)
+  check_scan_pos(s, 3, 1, 4, 0x0A)
+  check_scan_pos(s, 4, 2, 1, 0x672C)
+  check_scan_pos(s, 7, 2, 2, 0x8A9E)
+  check_scan_pos(s, 10, 2, 3, 0x0A)
+  check_scan_pos(s, 11, 3, 1, 0x0A)
+  check_scan_pos(s, 12, 4, 1, 0x78)
+  i = 10
+  while i > 0 {
+    check_scan_pos(s, 13, 4, 2, EOF)
+    i -= 1
+  }
+  assert_eq s.error_count, 0
+}
+
+# Counts its reads; always at the end of input.
+struct CountReader {
+  st: [Int]
+
+  def read!(p: [Byte]) -> Int {
+    self.st[0] = st[0] + 1
+    0
+  }
+}
+
+test "next EOF handling" {
+  r = CountReader.new(st: [0])
+  s = new_scanner(r)
+  assert s.next! == EOF, "1) EOF not reported"
+  assert s.peek! == EOF, "2) EOF not reported"
+  assert r.st[0] == 1, "scanner called Read #{r.st[0]} times, not once"
+}
+
+test "scan EOF handling" {
+  r = CountReader.new(st: [0])
+  s = new_scanner(r)
+  assert s.scan! == EOF, "1) EOF not reported"
+  assert s.peek! == EOF, "2) EOF not reported"
+  assert r.st[0] == 1, "scanner called Read #{r.st[0]} times, not once"
+}
+
+test "issue 29723" {
+  s = new_scanner(src("x \""))
+  texts: [Str] = []
+  s.set_error!(->(e: ScanError) {
+    texts << e.token_text # this shouldn't panic
+  })
+  r = s.scan!
+  while r != EOF {
+    r = s.scan!
+  }
+  assert texts.size > 0, "no error"
+  for t in texts {
+    assert_eq t, "\""
+  }
+}
+
+test "numbers" {
+  for test in number_tests {
+    s = new_scanner(src(test[1]))
+    errs: [Str] = []
+    s.set_error!(->(e: ScanError) {
+      errs << e.msg
+    })
+    i = 0
+    for want in strings.split(test[2], " ") {
+      start = errs.size
+      tok = s.scan!
+      lit = s.token_text
+      if i == 0 {
+        assert tok == test[0], "#{strconv.quote(test[1])}: got token #{token_string(tok)}; want #{token_string(test[0])}"
+        err = errs.size > start ? errs[start] : ""
+        assert err == test[3], "#{strconv.quote(test[1])}: got error #{strconv.quote(err)}; want #{strconv.quote(test[3])}"
+      }
+      assert lit == want, "#{strconv.quote(test[1])}: got literal #{strconv.quote(lit)} (#{token_string(tok)}); want #{want}"
+      i += 1
+    }
+    # All read.
+    tok = s.scan!
+    assert tok == EOF, "#{strconv.quote(test[1])}: got #{token_string(tok)}; want EOF"
+  }
+}
+
+def extract_ints(t: Str, mode: Int) -> Str {
+  s = new_scanner(src(t))
+  s.mode = mode
+  res: [Str] = []
+  loop {
+    tok = s.scan!
+    if tok == INT || tok == FLOAT {
+      res << s.token_text
+    } else if tok == EOF {
+      break
+    }
+  }
+  strings.join(res, " ")
+}
+
+test "issue 30320" {
+  cases: [(Str, Str, Int)] = [
+    ("foo01.bar31.xx-0-1-1-0", "01 31 0 1 1 0", SCAN_INTS),
+    ("foo0/12/0/5.67", "0 12 0 5 67", SCAN_INTS),
+    ("xxx1e0yyy", "1 0", SCAN_INTS),
+    ("1_2", "1_2", SCAN_INTS),
+    ("xxx1.0yyy2e3ee", "1 0 2 3", SCAN_INTS),
+    ("xxx1.0yyy2e3ee", "1.0 2e3", SCAN_FLOATS),
+  ]
+  for c in cases {
+    got = extract_ints(c[0], c[2])
+    assert got == c[1], "#{strconv.quote(c[0])}: got #{strconv.quote(got)}; want #{strconv.quote(c[1])}"
+  }
+}
+
+test "issue 50909" {
+  s = new_scanner(src("hello \n\nworld\n!\n"))
+  s.set_is_ident_rune!(->(ch: Rune, i: Int) -> Bool { ch != 0x0A })
+  r: [Str] = []
+  n = 0
+  while s.scan! != EOF && n < 10 {
+    r << s.token_text
+    n += 1
+  }
+  assert_eq strings.join(r, ""), "hello world!"
+  assert_eq n, 3
+}
+
+test "position to_s" {
+  assert_eq Position.new.to_s, "<input>"
+  assert_eq Position.new(line: 3, column: 4).to_s, "<input>:3:4"
+  assert_eq Position.new(filename: "a.go", line: 3, column: 4).to_s, "a.go:3:4"
+  assert !Position.new.valid?
+  assert_eq token_string(EOF), "EOF"
+  assert_eq token_string(0x61), "\"a\""
+  assert_eq token_string(-100), "\"\ufffd\""
+}
+
+# The trace the generated vectors compare with Go's.
+def trace(source: Str, mode: Int, ws: U64) -> Str {
+  out: [Str] = []
+  s = new_scanner(src(source))
+  s.mode = mode
+  s.whitespace = ws
+  s.set_error!(->(e: ScanError) {
+    out << "E(#{e.msg} @#{e.pos} #{e.pos.offset} text=#{strconv.quote(e.token_text)}) "
+  })
+  i = 0
+  while i < 200 {
+    tok = s.scan!
+    p = s.position
+    q = s.pos
+    out << "#{token_string(tok)} #{strconv.quote(s.token_text)} #{p.offset}:#{p.line}:#{p.column}|#{q.offset}:#{q.line}:#{q.column}; "
+    break if tok == EOF
+    i += 1
+  }
+  out << "errors=#{s.error_count}"
+  strings.join(out, "")
+}
+
+example "scanner" {
+  s = Scanner.new(st: [])
+  s.init!(src("\n// This is scanned code.\nif a > 10 {\n\tsomeParsable = text\n}"))
+  s.filename = "example"
+  tok = s.scan!
+  while tok != EOF {
+    puts "#{s.position}: #{s.token_text}"
+    tok = s.scan!
+  }
+} outputs "example:3:1: if\nexample:3:4: a\nexample:3:6: >\nexample:3:8: 10\nexample:3:11: {\nexample:4:2: someParsable\nexample:4:15: =\nexample:4:17: text\nexample:5:1: }\n"
+
+example "is ident rune" {
+  input = "%var1 var2%"
+  s = Scanner.new(st: [])
+  s.init!(src(input))
+  s.filename = "default"
+  tok = s.scan!
+  while tok != EOF {
+    puts "#{s.position}: #{s.token_text}"
+    tok = s.scan!
+  }
+  puts ""
+  s.init!(src(input))
+  s.filename = "percent"
+  # Treat a leading '%' as part of an identifier.
+  s.set_is_ident_rune!(->(ch: Rune, i: Int) -> Bool { (ch == 0x25 && i == 0) || unicode.is_letter(ch) || (unicode.is_digit(ch) && i > 0) })
+  tok = s.scan!
+  while tok != EOF {
+    puts "#{s.position}: #{s.token_text}"
+    tok = s.scan!
+  }
+} outputs "default:1:1: %\ndefault:1:2: var1\ndefault:1:7: var2\ndefault:1:11: %\n\npercent:1:1: %var1\npercent:1:7: var2\npercent:1:11: %\n"
+
+example "mode" {
+  input = "\n    // Comment begins at column 5.\n\nThis line should not be included in the output.\n\n/*\nThis multiline comment\nshould be extracted in\nits entirety.\n*/\n"
+  s = Scanner.new(st: [])
+  s.init!(src(input))
+  s.filename = "comments"
+  s.mode = s.mode ^ SKIP_COMMENTS # don't skip comments
+  tok = s.scan!
+  while tok != EOF {
+    txt = s.token_text
+    puts "#{s.position}: #{txt}" if strings.has_prefix(txt, "//") || strings.has_prefix(txt, "/*")
+    tok = s.scan!
+  }
+} outputs "comments:2:5: // Comment begins at column 5.\ncomments:6:1: /*\nThis multiline comment\nshould be extracted in\nits entirety.\n*/\n"
+
+example "whitespace" {
+  # Tab-separated values.
+  s = Scanner.new(st: [])
+  s.init!(src("aa\tab\tac\tad\nba\tbb\tbc\tbd\nca\tcb\tcc\tcd\nda\tdb\tdc\tdd"))
+  s.whitespace = s.whitespace ^ ((1.as_u64 << 9) | (1.as_u64 << 10)) # don't skip tabs and new lines
+  tsv: [[Str]] = [["", "", "", ""], ["", "", "", ""], ["", "", "", ""], ["", "", "", ""]]
+  row = 0
+  col = 0
+  tok = s.scan!
+  while tok != EOF {
+    if tok == 0x0A {
+      row += 1
+      col = 0
+    } else if tok == 0x09 {
+      col += 1
+    } else {
+      tsv[row][col] = s.token_text
+    }
+    tok = s.scan!
+  }
+  shown: [Str] = []
+  for r in tsv {
+    shown << "[#{strings.join(r, " ")}]"
+  }
+  print "[#{strings.join(shown, " ")}]\n"
+} outputs "[[aa ab ac ad] [ba bb bc bd] [ca cb cc cd] [da db dc dd]]\n"
+
+bench "scan" {
+  s = new_scanner(make_source(" \t", "\n"))
+  while s.scan! != EOF {
+  }
+}

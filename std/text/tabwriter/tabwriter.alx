@@ -1,0 +1,386 @@
+# Package tabwriter: Go's text/tabwriter — a write filter that turns tabbed
+# columns into aligned text (the Elastic Tabstops algorithm).
+#
+# The Writer treats incoming bytes as UTF-8 text made of cells terminated by
+# horizontal ('\t') or vertical ('\v') tabs and by newline ('\n') or
+# formfeed ('\f') characters; both newline and formfeed end a line.
+# Tab-terminated cells in contiguous lines form a column; the Writer pads
+# the cells of a column to the same width. Cells are tab-terminated, not
+# tab-separated: trailing text after the last tab of a line is a cell but
+# not part of a column. All code points count as one column wide; tabs
+# count `tabwidth`.
+#
+# With DISCARD_EMPTY_COLUMNS, empty columns terminated entirely by vertical
+# ("soft") tabs are dropped. With FILTER_HTML, HTML tags pass through with
+# width 0 and entities with width 1. Text between two ESCAPE bytes (0xFF)
+# passes through unchanged, tabs and line breaks included; STRIP_ESCAPE
+# removes the ESCAPE bytes, otherwise they are written and don't count
+# towards the width. A formfeed flushes: the columns after it are
+# independent of those before (with DEBUG, "---\n" is written there).
+#
+# API (Go → alx):
+#   NewWriter(out, minwidth, tabwidth, padding, padchar, flags)
+#                         new_writer(out, minwidth, tabwidth, padding,
+#                                    padchar, flags)
+#   w.Init(...)           w.init!(...)  (also on a zero-value Writer)
+#   w.Write(p)            w.write!(p) -> ~Int  (a Writer is an io.Writer)
+#   (io.WriteString(w,s)) w.write_string!(s) -> ~Int
+#   w.Flush()             w.flush! -> ~Unit
+#   FilterHTML, StripEscape, AlignRight, DiscardEmptyColumns, TabIndent,
+#   Debug                 FILTER_HTML, STRIP_ESCAPE, ALIGN_RIGHT,
+#                         DISCARD_EMPTY_COLUMNS, TAB_INDENT, DEBUG (Int bits)
+#   Escape                ESCAPE (the byte 0xFF)
+#
+# Differences from Go:
+#  - Go turns a failing write of the underlying writer into a panic that
+#    Write/Flush recover and return as their error (and re-panics with
+#    "tabwriter: panic during Write (...)" when the writer itself panics).
+#    Here the writer's error simply propagates out of write! / flush!; as in
+#    Go, a failed flush! still resets the Writer, and a write! that fails
+#    keeps what was buffered.
+#  - Writer[T] is generic over its output (like Rust's BufWriter<W>): a
+#    struct holding an io.Writer value can't itself be one, and a tabwriter
+#    is used as an io.Writer (to stack filters, or with io.write_string).
+#    new_writer infers T; a zero-value Writer names it
+#    (`Writer[bytes.Buffer].new(st: [])`).
+#  - A Writer is a handle on shared state (GO-VS-RUBY D36): copies (an
+#    io.Writer value holding it, say) write to the same buffer.
+#  - Init panics, as Go's does, for a negative minwidth, tabwidth or padding.
+#  - The `flags` are an Int (Go: uint).
+
+import "io"
+import "unicode/utf8"
+
+pub FILTER_HTML = 1           # skip HTML tags; entities count as one column
+pub STRIP_ESCAPE = 2          # drop the ESCAPE bytes around escaped text
+pub ALIGN_RIGHT = 4           # right-align cell contents
+pub DISCARD_EMPTY_COLUMNS = 8 # drop empty columns of soft tabs
+pub TAB_INDENT = 16           # pad leading empty cells with tabs
+pub DEBUG = 32                # print '|' between columns
+
+# Brackets escaped text (Go's Escape, '\xff').
+pub ESCAPE: Byte = 0xFF
+
+# A segment of text terminated by a tab or line break: its size in bytes,
+# width in runes, and whether a '\t' ended it.
+struct Cell {
+  size: Int
+  width: Int
+  htab: Bool
+}
+
+struct WriterState[T] {
+  output: T
+  minwidth: Int
+  tabwidth: Int
+  padding: Int
+  padchar: Byte
+  flags: Int
+  buf: [Byte]     # text collected, without tabs and line breaks
+  pos: Int        # buf position up to which the current cell's width is known
+  cell: Cell      # the current, incomplete cell
+  end_char: Byte  # the end of the escaped section (ESCAPE, '>', ';'), or 0
+  lines: [[Cell]] # each line a list of cells
+  widths: [Int]   # column widths during formatting
+}
+
+pub struct Writer[T] {
+  st: [WriterState[T]]
+
+  # (Re)initializes the Writer to write to output: cells at least minwidth
+  # wide (padding included); tabwidth is the width of a tab in columns (for
+  # padchar '\t'); padding is added to each cell's width; padchar fills
+  # (with '\t', the writer assumes tabs of tabwidth and cells are
+  # left-aligned whatever the flags).
+  pub def init!(output: T, minwidth: Int, tabwidth: Int, padding: Int, padchar: Byte, flags: Int) {
+    panic("negative minwidth, tabwidth, or padding") if minwidth < 0 || tabwidth < 0 || padding < 0
+    f = flags
+    f -= f & ALIGN_RIGHT if padchar == 0x09
+    s = WriterState[T].new(output: output, minwidth: minwidth, tabwidth: tabwidth, padding: padding, padchar: padchar, flags: f, buf: [], pos: 0, cell: Cell.new, end_char: 0, lines: [], widths: [])
+    if st.size == 0 {
+      self.st = [s]
+    } else {
+      self.st[0] = s
+    }
+    self.reset!
+  }
+
+  def flag?(f: Int) -> Bool { (st[0].flags & f) != 0 }
+
+  # Starts a new line.
+  def add_line! {
+    self.st[0].lines << []
+  }
+
+  # Drops everything collected.
+  def reset! {
+    self.st[0].buf = []
+    self.st[0].pos = 0
+    self.st[0].cell = Cell.new
+    self.st[0].end_char = 0
+    self.st[0].lines = []
+    self.st[0].widths = []
+    self.add_line!
+  }
+
+  def write0!(b: [Byte]) -> ~Unit {
+    out = st[0].output
+    n = out.~write!(b)
+    fail io.StreamError.ShortWrite if n != b.size
+  }
+
+  # n copies of the byte c.
+  def write_n!(c: Byte, n: Int) -> ~Unit {
+    return if n <= 0
+    b: [Byte] = [c; n]
+    self.~write0!(b)
+  }
+
+  def write_padding!(textw: Int, cellw: Int, use_tabs: Bool) -> ~Unit {
+    s = st[0]
+    if s.padchar == 0x09 || use_tabs {
+      # Padding with tabs.
+      return if s.tabwidth == 0 # tabs have no width: no padding possible
+      # Make cellw the smallest multiple of tabwidth.
+      w = (cellw + s.tabwidth - 1) / s.tabwidth * s.tabwidth
+      n = w - textw
+      panic("internal error") if n < 0
+      self.~write_n!(0x09, (n + s.tabwidth - 1) / s.tabwidth)
+      return
+    }
+    self.~write_n!(s.padchar, cellw - textw)
+  }
+
+  # Writes lines line0...line1 (the buffered text starting at pos0); returns
+  # the position after them.
+  def write_lines!(pos0: Int, line0: Int, line1: Int) -> ~Int {
+    pos = pos0
+    i = line0
+    while i < line1 {
+      line = st[0].lines[i]
+      # Tabs for the indentation (leading empty cells) with TAB_INDENT.
+      use_tabs = flag?(TAB_INDENT)
+      j = 0
+      while j < line.size {
+        c = line[j]
+        self.~write0!([0x7C]) if j > 0 && flag?(DEBUG)
+        nw = st[0].widths.size
+        if c.size == 0 {
+          # An empty cell.
+          self.~write_padding!(c.width, st[0].widths[j], use_tabs) if j < nw
+        } else {
+          # A non-empty cell.
+          use_tabs = false
+          if !flag?(ALIGN_RIGHT) {
+            self.~write0!(st[0].buf[pos...pos + c.size])
+            pos += c.size
+            self.~write_padding!(c.width, st[0].widths[j], false) if j < nw
+          } else {
+            self.~write_padding!(c.width, st[0].widths[j], false) if j < nw
+            self.~write0!(st[0].buf[pos...pos + c.size])
+            pos += c.size
+          }
+        }
+        j += 1
+      }
+      if i + 1 == st[0].lines.size {
+        # The last buffered line has no line break; it may hold text of an
+        # unterminated cell.
+        k = st[0].cell.size
+        self.~write0!(st[0].buf[pos...pos + k])
+        pos += k
+      } else {
+        self.~write0!([0x0A])
+      }
+      i += 1
+    }
+    pos
+  }
+
+  # Formats and writes lines line0...line1 (whose text starts at pos0);
+  # returns the position after them.
+  #
+  # Go's format recurses once per column; this is the same algorithm with
+  # an explicit stack, so a line of many cells doesn't need a deep call
+  # stack. Each block is (first, this, end): its lines first...end, scanned
+  # up to `this`, for column `widths.size`. A block finding a column cell at
+  # `this` writes the lines before it, measures the column over the lines
+  # that have it (this...stop), pushes that width and a block for them, and
+  # resumes at stop when that block is done (its width popped).
+  def format!(pos0: Int, line0: Int, line1: Int) -> ~Int {
+    pos = pos0
+    lines = st[0].lines
+    minwidth = st[0].minwidth
+    padding = st[0].padding
+    discard = flag?(DISCARD_EMPTY_COLUMNS)
+    base = st[0].widths.size
+    blocks: [(Int, Int, Int)] = [(line0, line0, line1)]
+    loop {
+      top = blocks.size - 1
+      first, this, stop = blocks[top]
+      column = base + top
+      while this < stop && column >= lines[this].size - 1 {
+        this += 1
+      }
+      if this < stop {
+        # A cell in this column: the column starts here. Write the lines
+        # before it, then find the column's width and extent.
+        pos = self.~write_lines!(pos, first, this)
+        start = this
+        width = minwidth
+        discardable = true # all cells empty and "soft"
+        while this < stop && column < lines[this].size - 1 {
+          c = lines[this][column]
+          w = c.width + padding
+          width = w if w > width
+          discardable = false if c.width > 0 || c.htab
+          this += 1
+        }
+        width = 0 if discardable && discard
+        # Format the block to the right of this column, then go on here.
+        self.st[0].widths << width
+        blocks[top] = (this, this, stop)
+        blocks << (start, start, this)
+        next
+      }
+      pos = self.~write_lines!(pos, first, stop)
+      blocks = blocks[0...top]
+      break if top == 0
+      self.st[0].widths = st[0].widths[0...st[0].widths.size - 1]
+    }
+    pos
+  }
+
+  # Appends text to the current cell.
+  def append!(text: [Byte]) {
+    for c in text {
+      self.st[0].buf << c
+    }
+    self.st[0].cell.size = st[0].cell.size + text.size
+  }
+
+  # Adds the width of the text after pos to the current cell.
+  def update_width! {
+    b = st[0].buf
+    self.st[0].cell.width = st[0].cell.width + utf8.rune_count(b[st[0].pos...b.size])
+    self.st[0].pos = b.size
+  }
+
+  def start_escape!(ch: Byte) {
+    if ch == ESCAPE {
+      self.st[0].end_char = ESCAPE
+    } else if ch == 0x3C {
+      self.st[0].end_char = 0x3E
+    } else if ch == 0x26 {
+      self.st[0].end_char = 0x3B
+    }
+  }
+
+  # Ends an escaped section: escaped text counts its runes (without the
+  # ESCAPE bytes), a tag nothing, an entity one.
+  def end_escape! {
+    e = st[0].end_char
+    if e == ESCAPE {
+      self.update_width!
+      self.st[0].cell.width = st[0].cell.width - 2 if !flag?(STRIP_ESCAPE)
+    } else if e == 0x3B {
+      self.st[0].cell.width = st[0].cell.width + 1
+    }
+    self.st[0].pos = st[0].buf.size
+    self.st[0].end_char = 0
+  }
+
+  # Ends the current cell; returns the number of cells in the line.
+  def terminate_cell!(htab: Bool) -> Int {
+    self.st[0].cell.htab = htab
+    n = st[0].lines.size
+    self.st[0].lines[n - 1] << st[0].cell
+    self.st[0].cell = Cell.new
+    st[0].lines[n - 1].size
+  }
+
+  # Writes out everything buffered: the last cell (if not empty) is ended
+  # first. Any incomplete escape sequence counts as complete. Call it once
+  # all data is written.
+  pub def flush! -> ~Unit {
+    r = self.flush_no_defers!
+    self.reset! if r.err?
+    ~r
+  }
+
+  def flush_no_defers! -> ~Unit {
+    if st[0].cell.size > 0 {
+      self.end_escape! if st[0].end_char != 0
+      self.terminate_cell!(false)
+    }
+    self.~format!(0, 0, st[0].lines.size)
+    self.reset!
+  }
+
+  # Writes buf to the Writer, returning buf.size. A failure of the
+  # underlying writer propagates.
+  pub def write!(buf: [Byte]) -> ~Int {
+    n = 0 # the start of the text not yet appended
+    i = 0
+    while i < buf.size {
+      ch = buf[i]
+      if st[0].end_char == 0 {
+        # Outside an escape.
+        if ch == 0x09 || ch == 0x0B || ch == 0x0A || ch == 0x0C {
+          # The end of a cell.
+          self.append!(buf[n...i])
+          self.update_width!
+          n = i + 1
+          ncells = self.terminate_cell!(ch == 0x09)
+          if ch == 0x0A || ch == 0x0C {
+            # The end of a line.
+            self.add_line!
+            if ch == 0x0C || ncells == 1 {
+              # A formfeed, or a line of one cell (which can't be part of
+              # a column, so it ends any column block): flush. A formfeed
+              # also ends the columns.
+              self.~flush_no_defers!
+              self.~write0!("---\n".bytes.to_a) if ch == 0x0C && flag?(DEBUG)
+            }
+          }
+        } else if ch == ESCAPE {
+          # The start of an escape.
+          self.append!(buf[n...i])
+          self.update_width!
+          n = i
+          n += 1 if flag?(STRIP_ESCAPE)
+          self.start_escape!(ESCAPE)
+        } else if (ch == 0x3C || ch == 0x26) && flag?(FILTER_HTML) {
+          # A possible HTML tag or entity.
+          self.append!(buf[n...i])
+          self.update_width!
+          n = i
+          self.start_escape!(ch)
+        }
+      } else if ch == st[0].end_char {
+        # Inside an escape: its end.
+        j = i + 1
+        j = i if ch == ESCAPE && flag?(STRIP_ESCAPE)
+        self.append!(buf[n...j])
+        n = i + 1
+        self.end_escape!
+      }
+      i += 1
+    }
+    # The rest of the text.
+    self.append!(buf[n...buf.size])
+    buf.size
+  }
+
+  # Writes the bytes of s.
+  pub def write_string!(s: Str) -> ~Int {
+    self.~write!(s.bytes.to_a)
+  }
+}
+
+# A Writer writing to output (see init!).
+pub def new_writer[T](output: T, minwidth: Int, tabwidth: Int, padding: Int, padchar: Byte, flags: Int) -> Writer[T] {
+  w = Writer[T].new(st: [])
+  w.init!(output, minwidth, tabwidth, padding, padchar, flags)
+  w
+}

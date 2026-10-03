@@ -1,0 +1,507 @@
+# Package csv: Go's encoding/csv — reading and writing comma-separated values
+# (RFC 4180, except that Writer ends lines with LF unless use_crlf is set).
+#
+# API (Go → alx):
+#   NewReader(r)            new_reader(r)
+#   Reader.Comma, .Comment, .FieldsPerRecord, .LazyQuotes,
+#   .TrimLeadingSpace, .ReuseRecord
+#                           r.comma, r.comment, r.fields_per_record,
+#                           r.lazy_quotes, r.trim_leading_space,
+#                           r.reuse_record (plain fields: set them before the
+#                           first read)
+#   Reader.Read()           r.read! -> ~[Str]?  (none at the end of input)
+#   Reader.ReadAll()        r.read_all! -> ~[[Str]]
+#   Reader.FieldPos(i)      r.field_pos(i) -> (line, column)
+#   Reader.InputOffset()    r.input_offset
+#   NewWriter(w)            new_writer(w)
+#   Writer.Comma, .UseCRLF  w.comma, w.use_crlf
+#   Writer.Write(rec)       w.write!(rec) -> ~Unit
+#   Writer.WriteAll(recs)   w.write_all!(recs) -> ~Unit (flushes)
+#   Writer.Flush()          w.flush!
+#   Writer.Error()          w.err -> Error?
+#   *ParseError, ErrBareQuote, ErrQuote, ErrFieldCount
+#                           CsvError.BareQuote / Quote / FieldCount, each with
+#                           start_line, line, column (Go's ParseError fields)
+#                           and the record read so far; `message` is Go's
+#                           ParseError.Error() text exactly.
+#   errInvalidDelim         CsvError.InvalidDelim ("csv: invalid field or
+#                           comment delimiter")
+#
+# Differences from Go:
+#  - End of input is not an error: read! returns none (Go: nil, io.EOF).
+#  - Go returns a partial record together with a parse error, and the whole
+#    record together with ErrFieldCount (which is not fatal: reading may go
+#    on). A `~T` holds a value or an error, so the record travels in the
+#    error: `case e { FieldCount(_, _, _, rec) => ... }`.
+#  - A Reader / Writer is a handle on shared state (GO-VS-RUBY D36): copies
+#    read from / write to the same stream. The option fields are plain
+#    values, copied with the handle. read! updates `fields_per_record` (from
+#    0 to the first record's count) on the variable it is called on, and also
+#    in the shared state, so a copy that reads later still checks the count.
+#  - Writer.Flush returns nothing in Go and the error is kept for Error();
+#    flush! does the same (`err` is Go's Error()). write! and write_all!
+#    fail at once when the underlying writer fails.
+#  - With reuse_record, the record slice of the previous read! is reused when
+#    the new record has the same number of fields (Go reuses any slice with
+#    enough capacity).
+#  - Not ported: Reader.TrailingComma and ErrTrailingComma (deprecated and
+#    unused in Go).
+
+import "bufio"
+import "io"
+import "unicode"
+import "unicode/utf8"
+
+pub error CsvError {
+  # A quote in an unquoted field (Go's ErrBareQuote in a ParseError).
+  BareQuote(start_line: Int, line: Int, column: Int, record: [Str])
+  # An extraneous or missing quote in a quoted field (Go's ErrQuote).
+  Quote(start_line: Int, line: Int, column: Int, record: [Str])
+  # A record with the wrong number of fields (Go's ErrFieldCount); the record
+  # is complete and reading may go on.
+  FieldCount(start_line: Int, line: Int, column: Int, record: [Str])
+  # Comma or Comment is not a valid delimiter.
+  InvalidDelim
+
+  def message -> Str {
+    case self {
+      BareQuote(s, l, c, _) => parse_message(s, l, c, "bare \" in non-quoted-field")
+      Quote(s, l, c, _) => parse_message(s, l, c, "extraneous or missing \" in quoted-field")
+      FieldCount(_, l, _, _) => "record on line #{l}: wrong number of fields"
+      InvalidDelim => "csv: invalid field or comment delimiter"
+    }
+  }
+}
+
+def parse_message(start_line: Int, line: Int, column: Int, what: Str) -> Str {
+  if start_line != line {
+    return "record on line #{start_line}; parse error on line #{line}, column #{column}: #{what}"
+  }
+  "parse error on line #{line}, column #{column}: #{what}"
+}
+
+def valid_delim?(r: Rune) -> Bool {
+  r != 0 && r != 0x22 && r != 0x0D && r != 0x0A && utf8.valid_rune(r) && r != utf8.RUNE_ERROR
+}
+
+# ---------------------------------------------------------------------- Reader
+
+# The mutable part of a Reader, kept in a one-element slice (D36).
+struct ReaderState {
+  br: bufio.Reader
+  num_line: Int
+  offset: Int
+  rec_buf: [Byte]
+  field_indexes: [Int]
+  field_positions: [(Int, Int)]
+  last_record: [Str]
+  learned: Int # the count fields_per_record = 0 learned; -1 before that
+}
+
+pub struct Reader {
+  # The field delimiter (',' from new_reader). Must be a valid rune other
+  # than '"', '\r', '\n' and U+FFFD.
+  comma: Rune
+  # If not 0, lines beginning with it (without preceding white space) are
+  # ignored. Same rules as comma, and must differ from it.
+  comment: Rune
+  # > 0: every record must have this many fields; 0: set from the first
+  # record; < 0: no check.
+  fields_per_record: Int
+  # A quote may appear in an unquoted field, and a non-doubled quote in a
+  # quoted field.
+  lazy_quotes: Bool
+  # Leading white space in a field is ignored (even if comma is a space).
+  trim_leading_space: Bool
+  # read! may reuse the previous record's slice.
+  reuse_record: Bool
+  st: [ReaderState]
+
+  # Reads one record. none at the end of input. A parse error fails with the
+  # record read so far; a wrong field count fails with the whole record and
+  # reading may continue.
+  pub def read! -> ~[Str]? {
+    self.~read_record!(reuse_record)
+  }
+
+  # All remaining records.
+  pub def read_all! -> ~[[Str]] {
+    out: [[Str]] = []
+    loop {
+      rec = self.~read_record!(false)
+      if r = rec {
+        out << r
+      } else {
+        break
+      }
+    }
+    out
+  }
+
+  # The line and column (1-based; columns count bytes) where field `field` of
+  # the record most recently read starts. Panics for an index out of range.
+  pub def field_pos(field: Int) -> (Int, Int) {
+    ps = st[0].field_positions
+    panic("out of range index passed to FieldPos") if field < 0 || field >= ps.size
+    ps[field]
+  }
+
+  # The input byte offset of the reader: the end of the most recently read
+  # record, the start of the next.
+  pub def input_offset -> Int { st[0].offset }
+
+  # The next line with its "\n" ("\r\n" becomes "\n"; a "\r" before the end of
+  # input is dropped), and whether the input had ended (no bytes at all).
+  def read_line! -> ~([Byte], Bool) {
+    got = self.st[0].br.~read_bytes!(10)
+    line: [Byte] = []
+    eof = true
+    if l = got {
+      line = l
+      eof = false
+    }
+    n = line.size
+    if n > 0 && line[n - 1] != 10 && line[n - 1] == 13 {
+      line = line[0...n - 1]
+    }
+    self.st[0].num_line = st[0].num_line + 1
+    self.st[0].offset = st[0].offset + n
+    n = line.size
+    if n >= 2 && line[n - 2] == 13 && line[n - 1] == 10 {
+      line[n - 2] = 10
+      line = line[0...n - 1]
+    }
+    (line, eof)
+  }
+
+  def read_record!(reuse: Bool) -> ~[Str]? {
+    if comma == comment || !valid_delim?(comma) || (comment != 0 && !valid_delim?(comment)) {
+      fail CsvError.InvalidDelim
+    }
+    # Read a line, skipping empty lines and comments.
+    line: [Byte] = []
+    eof = false
+    loop {
+      line, eof = self.~read_line!
+      if comment != 0 && next_rune(line) == comment {
+        break if eof
+        next
+      }
+      if !eof && line.size == length_nl(line) {
+        next
+      }
+      break
+    }
+    return none if eof
+
+    comma_len = utf8.rune_len(comma)
+    rec_line = st[0].num_line
+    buf: [Byte] = []
+    idx: [Int] = []
+    poss: [(Int, Int)] = []
+    pos_line = st[0].num_line
+    pos_col = 1
+    # Which error stopped the parse: 0 none, 1 bare quote, 2 quote.
+    err_kind = 0
+    err_line = 0
+    err_col = 0
+    loop {
+      if trim_leading_space {
+        i = 0
+        while i < line.size {
+          r, size = decode(line, i)
+          break if !unicode.is_space(r)
+          i += size
+        }
+        pos_col -= length_nl(line) if i == line.size
+        line = line[i...line.size]
+        pos_col += i
+      }
+      if line.size == 0 || line[0] != 0x22 {
+        # An unquoted field.
+        i = index_rune(line, comma)
+        field = i >= 0 ? line[0...i] : line[0...line.size - length_nl(line)]
+        if !lazy_quotes {
+          j = index_byte(field, 0x22)
+          if j >= 0 {
+            err_kind = 1
+            err_line = st[0].num_line
+            err_col = pos_col + j
+            break
+          }
+        }
+        for c in field {
+          buf << c
+        }
+        idx << buf.size
+        poss << (pos_line, pos_col)
+        if i >= 0 {
+          line = line[i + comma_len...line.size]
+          pos_col += i + comma_len
+          next
+        }
+        break
+      }
+      # A quoted field.
+      field_pos = (pos_line, pos_col)
+      line = line[1...line.size]
+      pos_col += 1
+      more = false # another field follows on this line
+      loop {
+        i = index_byte(line, 0x22)
+        if i >= 0 {
+          k = 0
+          while k < i {
+            buf << line[k]
+            k += 1
+          }
+          line = line[i + 1...line.size]
+          pos_col += i + 1
+          rn = next_rune(line)
+          if rn == 0x22 {
+            # `""`: a quote.
+            buf << 0x22
+            line = line[1...line.size]
+            pos_col += 1
+          } else if rn == comma {
+            # `",`: the end of the field.
+            line = line[comma_len...line.size]
+            pos_col += comma_len
+            idx << buf.size
+            poss << field_pos
+            more = true
+            break
+          } else if length_nl(line) == line.size {
+            # `"\n`: the end of the line.
+            idx << buf.size
+            poss << field_pos
+            break
+          } else if lazy_quotes {
+            # A bare quote.
+            buf << 0x22
+          } else {
+            # `"*`: an invalid unescaped quote.
+            err_kind = 2
+            err_line = st[0].num_line
+            err_col = pos_col - 1
+            break
+          }
+        } else if line.size > 0 {
+          # The end of the line: keep going on the next.
+          for c in line {
+            buf << c
+          }
+          pos_col += line.size
+          line, eof = self.~read_line!
+          if line.size > 0 {
+            pos_line += 1
+            pos_col = 1
+          }
+        } else {
+          # The end of the input inside the quotes.
+          if !lazy_quotes {
+            err_kind = 2
+            err_line = pos_line
+            err_col = pos_col
+            break
+          }
+          idx << buf.size
+          poss << field_pos
+          break
+        }
+      }
+      break if !more
+    }
+
+    # Cut the record out of the buffer.
+    s = Str.from_bytes(buf)
+    dst: [Str] = []
+    if reuse && st[0].last_record.size == idx.size {
+      dst = st[0].last_record
+    } else {
+      dst = [""; idx.size]
+    }
+    pre = 0
+    i = 0
+    while i < idx.size {
+      dst[i] = s[pre...idx[i]]
+      pre = idx[i]
+      i += 1
+    }
+    self.st[0].last_record = dst if reuse
+    self.st[0].field_positions = poss
+
+    # Check or learn the expected field count.
+    want = fields_per_record
+    want = st[0].learned if want == 0 && st[0].learned >= 0
+    count_bad = false
+    if want > 0 {
+      count_bad = dst.size != want && err_kind == 0
+    } else if want == 0 {
+      self.fields_per_record = dst.size
+      self.st[0].learned = dst.size
+    }
+    fail CsvError.BareQuote(start_line: rec_line, line: err_line, column: err_col, record: dst) if err_kind == 1
+    fail CsvError.Quote(start_line: rec_line, line: err_line, column: err_col, record: dst) if err_kind == 2
+    fail CsvError.FieldCount(start_line: rec_line, line: rec_line, column: 1, record: dst) if count_bad
+    dst
+  }
+}
+
+# A Reader over r, with comma ','.
+pub def new_reader(r: io.Reader) -> Reader {
+  st: [ReaderState] = [ReaderState.new(br: bufio.new_reader(r), learned: -1)]
+  Reader.new(comma: 0x2C, st: st)
+}
+
+# 1 if b ends in "\n", else 0.
+def length_nl(b: [Byte]) -> Int {
+  b.size > 0 && b[b.size - 1] == 10 ? 1 : 0
+}
+
+# The rune at b[i] and its size; (U+FFFD, 1) for an invalid encoding,
+# (U+FFFD, 0) at the end.
+def decode(b: [Byte], i: Int) -> (Rune, Int) {
+  return (utf8.RUNE_ERROR, 0) if i >= b.size
+  c = b[i]
+  return (c.as_i32, 1) if c < 0x80
+  e = i + 4
+  e = b.size if e > b.size
+  utf8.decode_rune(b[i...e])
+}
+
+# The first rune of b, or U+FFFD.
+def next_rune(b: [Byte]) -> Rune {
+  r, _ = decode(b, 0)
+  r
+}
+
+def index_byte(b: [Byte], c: Byte) -> Int {
+  i = 0
+  while i < b.size {
+    return i if b[i] == c
+    i += 1
+  }
+  -1
+}
+
+# The index of the UTF-8 encoding of r (a valid rune) in b, or -1.
+def index_rune(b: [Byte], r: Rune) -> Int {
+  return index_byte(b, r.as_u8) if r < 0x80
+  enc = utf8.encode_rune(r)
+  i = 0
+  while i + enc.size <= b.size {
+    if b[i] == enc[0] {
+      k = 1
+      while k < enc.size && b[i + k] == enc[k] {
+        k += 1
+      }
+      return i if k == enc.size
+    }
+    i += 1
+  }
+  -1
+}
+
+# ---------------------------------------------------------------------- Writer
+
+# The mutable part of a Writer (D36).
+struct WriterState {
+  bw: bufio.Writer
+  error: Error?
+}
+
+pub struct Writer {
+  # The field delimiter (',' from new_writer).
+  comma: Rune
+  # End lines with "\r\n" instead of "\n".
+  use_crlf: Bool
+  st: [WriterState]
+
+  # Writes one record, quoting fields as needed. Buffered: call flush!.
+  pub def write!(record: [Str]) -> ~Unit {
+    fail CsvError.InvalidDelim if !valid_delim?(comma)
+    bw = st[0].bw
+    n = 0
+    for field in record {
+      bw.~write_rune!(comma) if n > 0
+      n += 1
+      if !field_needs_quotes?(field) {
+        bw.~write_string!(field)
+        next
+      }
+      bw.~write_byte!(0x22)
+      a = 0
+      i = 0
+      while i < field.size {
+        c = field[i]
+        if c == 0x22 || c == 0x0D || c == 0x0A {
+          bw.~write_string!(field[a...i]) if i > a
+          if c == 0x22 {
+            bw.~write_string!("\"\"")
+          } else if c == 0x0D {
+            bw.~write_byte!(0x0D) if !use_crlf
+          } else if use_crlf {
+            bw.~write_string!("\r\n")
+          } else {
+            bw.~write_byte!(0x0A)
+          }
+          a = i + 1
+        }
+        i += 1
+      }
+      bw.~write_string!(field[a...field.size]) if field.size > a
+      bw.~write_byte!(0x22)
+    }
+    bw.~write_string!(use_crlf ? "\r\n" : "\n")
+  }
+
+  # Writes any buffered data to the underlying writer; an error is kept for
+  # `err`.
+  pub def flush! {
+    bw = st[0].bw
+    r = bw.flush!
+    if r.err? {
+      self.st[0].error = r.err.unwrap
+    }
+  }
+
+  # The error of an earlier flush!, if any (Go's Writer.Error).
+  pub def err -> Error? { st[0].error }
+
+  # Writes every record, then flushes.
+  pub def write_all!(records: [[Str]]) -> ~Unit {
+    for rec in records {
+      self.~write!(rec)
+    }
+    bw = st[0].bw
+    bw.~flush!
+  }
+
+  # Whether field must be quoted: it holds the comma, a quote, "\r" or "\n",
+  # starts with a space, or is `\.` (Postgres's end-of-data marker). The
+  # empty field is not quoted.
+  def field_needs_quotes?(field: Str) -> Bool {
+    return false if field.size == 0
+    return true if field == "\\."
+    if comma < 0x80 {
+      c0 = comma.as_u8
+      for c in field.bytes {
+        return true if c == 0x0A || c == 0x0D || c == 0x22 || c == c0
+      }
+    } else {
+      return true if index_rune(field.bytes.to_a, comma) >= 0
+      for c in field.bytes {
+        return true if c == 0x0A || c == 0x0D || c == 0x22
+      }
+    }
+    r1, _ = utf8.decode_rune_in_string(field)
+    unicode.is_space(r1)
+  }
+}
+
+# A Writer to w, with comma ','.
+pub def new_writer(w: io.Writer) -> Writer {
+  st: [WriterState] = [WriterState.new(bw: bufio.new_writer(w), error: none)]
+  Writer.new(comma: 0x2C, st: st)
+}

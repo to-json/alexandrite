@@ -1,0 +1,701 @@
+# Package scanner: Go's text/scanner — a scanner and tokenizer for UTF-8
+# text read from an io.Reader.
+#
+# By default a Scanner skips white space and Go comments and recognizes all
+# literals of the Go language. It can be set to recognize only some of them
+# (`mode`), other white space (`whitespace`) and other identifiers
+# (`set_is_ident_rune!`). The NUL character is not allowed; a byte order mark
+# at the start of the input is dropped.
+#
+# API (Go → alx):
+#   new(Scanner).Init(src)   s = Scanner.new; s.init!(src)  (or new_scanner(src))
+#   s.Scan()                 s.scan! -> Rune  (a token or a character)
+#   s.Next()                 s.next! -> Rune  (the next character)
+#   s.Peek()                 s.peek! -> Rune
+#   s.Pos()                  s.pos -> Position  (after the last token/char)
+#   s.Position (embedded)    s.position -> Position  (start of the last token)
+#   s.Line / Offset / Column s.position.line / .offset / .column
+#   s.Filename               s.filename (a field)
+#   s.TokenText()            s.token_text
+#   s.ErrorCount             s.error_count
+#   s.Mode, s.Whitespace     s.mode (Int), s.whitespace (U64): fields
+#   s.Error = f              s.set_error!(f), f: (ScanError) -> Unit
+#   s.IsIdentRune = f        s.set_is_ident_rune!(f), f: (Rune, Int) -> Bool
+#   TokenString(tok)         token_string(tok)
+#   Position.IsValid/String  Position.valid? / to_s
+#   EOF, Ident, Int, Float, Char, String, RawString, Comment
+#                            EOF, IDENT, INT, FLOAT, CHAR, STRING, RAW_STRING,
+#                            COMMENT
+#   ScanIdents ... GoTokens  SCAN_IDENTS, SCAN_INTS, SCAN_FLOATS, SCAN_CHARS,
+#                            SCAN_STRINGS, SCAN_RAW_STRINGS, SCAN_COMMENTS,
+#                            SKIP_COMMENTS, GO_TOKENS
+#   GoWhitespace             GO_WHITESPACE
+#
+# Differences from Go:
+#  - The error callback gets a ScanError (the message, Pos(), the Position
+#    field and TokenText() at the time of the error) instead of the
+#    *Scanner: a Scanner can't hold a function taking a Scanner (a value
+#    can't contain itself), nor a closure that captures the Scanner it is
+#    stored in. Everything Go's tests read from the scanner inside the
+#    callback is in the ScanError.
+#    Without a callback the error is printed to stderr as "pos: msg", as in
+#    Go.
+#  - A Scanner is a handle on shared state (GO-VS-RUBY D36); `mode`,
+#    `whitespace`, `filename` and the callbacks are plain fields of the
+#    handle, so they belong to the variable they are set on.
+#  - A reader error is reported through the error callback with its message,
+#    as in Go. A 0-byte read is the end of the input (alx readers have no
+#    io.EOF); Go reads again after (0, nil).
+#  - init! keeps the identifier predicate and the filename, as Go's Init
+#    does, and clears the error callback.
+
+import "io"
+import "os"
+import "strconv"
+import "unicode"
+import "unicode/utf8"
+
+# The tokens scan! returns, besides Unicode characters.
+pub EOF: Rune = -1
+pub IDENT: Rune = -2
+pub INT: Rune = -3
+pub FLOAT: Rune = -4
+pub CHAR: Rune = -5
+pub STRING: Rune = -6
+pub RAW_STRING: Rune = -7
+pub COMMENT: Rune = -8
+SKIP_COMMENT: Rune = -9
+
+# Mode bits: which tokens are recognized (bit 1 << -token).
+pub SCAN_IDENTS = 4
+pub SCAN_INTS = 8
+pub SCAN_FLOATS = 16 # includes Ints and hexadecimal floats
+pub SCAN_CHARS = 32
+pub SCAN_STRINGS = 64
+pub SCAN_RAW_STRINGS = 128
+pub SCAN_COMMENTS = 256
+pub SKIP_COMMENTS = 512 # with SCAN_COMMENTS, comments become white space
+pub GO_TOKENS = 1012    # all of the above but SCAN_INTS (SCAN_FLOATS has it)
+
+# The default white space: '\t', '\n', '\r' and ' ' (bit 1 << ch).
+pub GO_WHITESPACE: U64 = 4294977024
+
+BUF_LEN = 1024 # at least utf8.UTF_MAX
+
+# A source position. Valid if line > 0.
+pub struct Position {
+  filename: Str # the file name, if any
+  offset: Int   # the byte offset, from 0
+  line: Int     # the line number, from 1
+  column: Int   # the column (characters on the line), from 1
+
+  pub def valid? -> Bool { line > 0 }
+
+  # "file:line:column", "<input>" for no file name, without the line and
+  # column when invalid.
+  pub def to_s -> Str {
+    s = filename
+    s = "<input>" if s == ""
+    s = "#{s}:#{line}:#{column}" if valid?
+    s
+  }
+}
+
+# What the error callback gets.
+pub struct ScanError {
+  msg: Str           # the error
+  pos: Position      # Go's s.Pos() at the error
+  position: Position # Go's s.Position: the token's start; invalid outside a token
+  token_text: Str    # Go's s.TokenText() at the error
+}
+
+# A printable form of a token or character.
+pub def token_string(tok: Rune) -> Str {
+  return "EOF" if tok == EOF
+  return "Ident" if tok == IDENT
+  return "Int" if tok == INT
+  return "Float" if tok == FLOAT
+  return "Char" if tok == CHAR
+  return "String" if tok == STRING
+  return "RawString" if tok == RAW_STRING
+  return "Comment" if tok == COMMENT
+  strconv.quote(rune_str(tok))
+}
+
+# Go's string(r): the UTF-8 encoding of r, U+FFFD's if r is invalid.
+def rune_str(r: Rune) -> Str {
+  Str.from_bytes(utf8.encode_rune(r))
+}
+
+struct ScannerState {
+  src: io.Reader
+  src_buf: [Byte]     # BUF_LEN + 1 bytes: one for the sentinel
+  src_pos: Int        # the reading position (src_buf index)
+  src_end: Int        # the end of the data in src_buf
+  src_buf_offset: Int # the byte offset of src_buf[0] in the source
+  line: Int
+  column: Int
+  last_line_len: Int # the length of the last line, in characters
+  last_char_len: Int # the length of the last character, in bytes
+  tok_buf: [Byte]    # the token text's head no longer in src_buf
+  tok_pos: Int       # the token text's tail start (src_buf index); valid if >= 0
+  tok_end: Int       # the token text's tail end
+  ch: Rune           # the character before src_pos
+  error_count: Int
+  offset: Int # the last token's position (Go's s.Position)
+  tok_line: Int
+  tok_column: Int
+}
+
+pub struct Scanner {
+  # Which tokens are recognized (SCAN_* bits); may change at any time.
+  mode: Int
+  # Which characters ch <= ' ' are white space (bit 1 << ch); may change.
+  whitespace: U64
+  # Reported in positions; never changed by the scanner.
+  filename: Str
+  st: [ScannerState]
+  on_error: [(ScanError) -> Unit]
+  ident_rune: [(Rune, Int) -> Bool]
+
+  # Starts scanning src: error count 0, mode GO_TOKENS, whitespace
+  # GO_WHITESPACE, no error callback.
+  pub def init!(src: io.Reader) {
+    buf: [Byte] = [0; BUF_LEN + 1]
+    buf[0] = 0x80 # sentinel
+    s = ScannerState.new(src: src, src_buf: buf, line: 1, tok_buf: [], tok_pos: -1, ch: -2)
+    if st.size == 0 {
+      self.st = [s]
+    } else {
+      self.st[0] = s
+    }
+    self.on_error = []
+    self.mode = GO_TOKENS
+    self.whitespace = GO_WHITESPACE
+  }
+
+  # Calls f for each error (instead of printing it).
+  pub def set_error!(f: (ScanError) -> Unit) {
+    self.on_error = [f]
+  }
+
+  # Sets the predicate for the i'th rune of an identifier (Go's
+  # IsIdentRune). Its runes must not be white space.
+  pub def set_is_ident_rune!(f: (Rune, Int) -> Bool) {
+    self.ident_rune = [f]
+  }
+
+  # The number of errors so far.
+  pub def error_count -> Int { st[0].error_count }
+
+  # The start of the most recently scanned token (invalid after next! or
+  # init!).
+  pub def position -> Position {
+    s = st[0]
+    Position.new(filename: filename, offset: s.offset, line: s.tok_line, column: s.tok_column)
+  }
+
+  # Reads the next character.
+  def next_ch! -> Rune {
+    ch = st[0].src_buf[st[0].src_pos].as_i32
+    width = 1
+    if ch >= 0x80 {
+      # Not ASCII, or the end of the buffer.
+      while st[0].src_pos + utf8.UTF_MAX > st[0].src_end && !utf8.full_rune(st[0].src_buf[st[0].src_pos...st[0].src_end]) {
+        # Not enough bytes: read more, saving the token text first.
+        if st[0].tok_pos >= 0 {
+          k = st[0].tok_pos
+          while k < st[0].src_pos {
+            self.st[0].tok_buf << st[0].src_buf[k]
+            k += 1
+          }
+          self.st[0].tok_pos = 0
+        }
+        # Move the unread bytes to the front.
+        i = st[0].src_end - st[0].src_pos
+        buf = st[0].src_buf
+        copy(buf[0...i], buf[st[0].src_pos...st[0].src_end])
+        self.st[0].src_buf_offset = st[0].src_buf_offset + st[0].src_pos
+        got = self.st[0].src.read!(buf[i...BUF_LEN])
+        n = got.err? ? 0 : got.unwrap
+        self.st[0].src_pos = 0
+        self.st[0].src_end = i + n
+        self.st[0].src_buf[st[0].src_end] = 0x80 # sentinel
+        if n == 0 || got.err? {
+          # The end of the input (or a reader error, reported).
+          self.error!(got.err.unwrap.message) if got.err?
+          if st[0].src_end == 0 {
+            # A character before: count the EOF's column.
+            self.st[0].column = st[0].column + 1 if st[0].last_char_len > 0
+            self.st[0].last_char_len = 0
+            return EOF
+          }
+          break
+        }
+      }
+      # At least one byte.
+      ch = st[0].src_buf[st[0].src_pos].as_i32
+      if ch >= 0x80 {
+        r, w = utf8.decode_rune(st[0].src_buf[st[0].src_pos...st[0].src_end])
+        ch = r
+        width = w
+        if ch == utf8.RUNE_ERROR && width == 1 {
+          # Advance for the error position.
+          self.st[0].src_pos = st[0].src_pos + 1
+          self.st[0].last_char_len = 1
+          self.st[0].column = st[0].column + 1
+          self.error!("invalid UTF-8 encoding")
+          return ch
+        }
+      }
+    }
+    self.st[0].src_pos = st[0].src_pos + width
+    self.st[0].last_char_len = width
+    self.st[0].column = st[0].column + 1
+    if ch == 0 {
+      self.error!("invalid character NUL")
+    } else if ch == 0x0A {
+      self.st[0].line = st[0].line + 1
+      self.st[0].last_line_len = st[0].column
+      self.st[0].column = 0
+    }
+    ch
+  }
+
+  # Reads and returns the next character (EOF at the end). Invalidates the
+  # token position; pos gives the current one.
+  pub def next! -> Rune {
+    self.st[0].tok_pos = -1 # no token text
+    self.st[0].tok_line = 0
+    ch = self.peek!
+    self.st[0].ch = self.next_ch! if ch != EOF
+    ch
+  }
+
+  # The next character, without advancing (EOF at the end).
+  pub def peek! -> Rune {
+    if st[0].ch == -2 {
+      # Only for the very first character.
+      self.st[0].ch = self.next_ch!
+      self.st[0].ch = self.next_ch! if st[0].ch == 0xFEFF # skip a BOM
+    }
+    st[0].ch
+  }
+
+  def error!(msg: Str) {
+    self.st[0].tok_end = st[0].src_pos - st[0].last_char_len # terminate the token text
+    self.st[0].error_count = st[0].error_count + 1
+    if on_error.size > 0 {
+      e = ScanError.new(msg: msg, pos: pos, position: position, token_text: token_text)
+      for f in on_error {
+        f(e)
+      }
+      return
+    }
+    p = position
+    p = pos if !p.valid?
+    out = os.stderr
+    r = out.write_string!("#{p}: #{msg}\n")
+    # As in Go, a failed write is ignored.
+    return if r.err?
+  }
+
+  def is_ident_rune(ch: Rune, i: Int) -> Bool {
+    if ident_rune.size > 0 {
+      f = ident_rune[0]
+      return ch != EOF && f(ch, i)
+    }
+    ch == 0x5F || unicode.is_letter(ch) || (unicode.is_digit(ch) && i > 0)
+  }
+
+  def scan_identifier! -> Rune {
+    # The 0th rune is known to be fine.
+    ch = self.next_ch!
+    i = 1
+    while is_ident_rune(ch, i) {
+      ch = self.next_ch!
+      i += 1
+    }
+    ch
+  }
+
+  # Accepts { digit | '_' } from ch0. For base <= 10 any decimal digit is
+  # accepted and the first one >= base recorded in `invalid` (if 0 so far).
+  # Returns the first rune after, the bit set (1: digits, 2: '_') and
+  # `invalid`.
+  def digits!(ch0: Rune, base: Int, invalid0: Rune) -> (Rune, Int, Rune) {
+    ch = ch0
+    invalid = invalid0
+    digsep = 0
+    if base <= 10 {
+      max = (0x30 + base).as_i32
+      while decimal?(ch) || ch == 0x5F {
+        ds = 1
+        if ch == 0x5F {
+          ds = 2
+        } else if ch >= max && invalid == 0 {
+          invalid = ch
+        }
+        digsep |= ds
+        ch = self.next_ch!
+      }
+    } else {
+      while hex?(ch) || ch == 0x5F {
+        digsep |= ch == 0x5F ? 2 : 1
+        ch = self.next_ch!
+      }
+    }
+    (ch, digsep, invalid)
+  }
+
+  def scan_number!(ch0: Rune, seen_dot0: Bool) -> (Rune, Rune) {
+    ch = ch0
+    seen_dot = seen_dot0
+    base = 10
+    prefix: Rune = 0 # 0 (decimal), '0' (0-octal), 'x', 'o' or 'b'
+    digsep = 0
+    invalid: Rune = 0
+    tok: Rune = 0
+    ds = 0
+    # The integer part.
+    if !seen_dot {
+      tok = INT
+      if ch == 0x30 {
+        ch = self.next_ch!
+        l = lower(ch)
+        if l == 0x78 {
+          ch = self.next_ch!
+          base = 16
+          prefix = 0x78
+        } else if l == 0x6F {
+          ch = self.next_ch!
+          base = 8
+          prefix = 0x6F
+        } else if l == 0x62 {
+          ch = self.next_ch!
+          base = 2
+          prefix = 0x62
+        } else {
+          base = 8
+          prefix = 0x30
+          digsep = 1 # the leading 0
+        }
+      }
+      ch, ds, invalid = self.digits!(ch, base, invalid)
+      digsep |= ds
+      if ch == 0x2E && (mode & SCAN_FLOATS) != 0 {
+        ch = self.next_ch!
+        seen_dot = true
+      }
+    }
+    # The fractional part.
+    if seen_dot {
+      tok = FLOAT
+      self.error!("invalid radix point in " + litname(prefix)) if prefix == 0x6F || prefix == 0x62
+      ch, ds, invalid = self.digits!(ch, base, invalid)
+      digsep |= ds
+    }
+    self.error!(litname(prefix) + " has no digits") if (digsep & 1) == 0
+    # The exponent.
+    e = lower(ch)
+    if (e == 0x65 || e == 0x70) && (mode & SCAN_FLOATS) != 0 {
+      if e == 0x65 && prefix != 0 && prefix != 0x30 {
+        self.error!("#{strconv.quote_rune(ch)} exponent requires decimal mantissa")
+      } else if e == 0x70 && prefix != 0x78 {
+        self.error!("#{strconv.quote_rune(ch)} exponent requires hexadecimal mantissa")
+      }
+      ch = self.next_ch!
+      tok = FLOAT
+      ch = self.next_ch! if ch == 0x2B || ch == 0x2D
+      ch, ds, _ = self.digits!(ch, 10, 1)
+      digsep |= ds
+      self.error!("exponent has no digits") if (ds & 1) == 0
+    } else if prefix == 0x78 && tok == FLOAT {
+      self.error!("hexadecimal mantissa requires a 'p' exponent")
+    }
+    if tok == INT && invalid != 0 {
+      self.error!("invalid digit #{strconv.quote_rune(invalid)} in #{litname(prefix)}")
+    }
+    if (digsep & 2) != 0 {
+      self.st[0].tok_end = st[0].src_pos - st[0].last_char_len # terminate the token text
+      self.error!("'_' must separate successive digits") if invalid_sep(token_text) >= 0
+    }
+    (tok, ch)
+  }
+
+  # Accepts up to n digits of base; an error if there are fewer.
+  def scan_digits!(ch0: Rune, base: Int, n0: Int) -> Rune {
+    ch = ch0
+    n = n0
+    while n > 0 && digit_val(ch) < base {
+      ch = self.next_ch!
+      n -= 1
+    }
+    self.error!("invalid char escape") if n > 0
+    ch
+  }
+
+  def scan_escape!(quote: Rune) -> Rune {
+    ch = self.next_ch! # the character after '\'
+    if ch == 0x61 || ch == 0x62 || ch == 0x66 || ch == 0x6E || ch == 0x72 || ch == 0x74 || ch == 0x76 || ch == 0x5C || ch == quote {
+      ch = self.next_ch!
+    } else if ch >= 0x30 && ch <= 0x37 {
+      ch = self.scan_digits!(ch, 8, 3)
+    } else if ch == 0x78 {
+      ch = self.scan_digits!(self.next_ch!, 16, 2)
+    } else if ch == 0x75 {
+      ch = self.scan_digits!(self.next_ch!, 16, 4)
+    } else if ch == 0x55 {
+      ch = self.scan_digits!(self.next_ch!, 16, 8)
+    } else {
+      self.error!("invalid char escape")
+    }
+    ch
+  }
+
+  # Scans a quoted literal; returns its number of characters.
+  def scan_string!(quote: Rune) -> Int {
+    n = 0
+    ch = self.next_ch! # the character after the quote
+    while ch != quote {
+      if ch == 0x0A || ch < 0 {
+        self.error!("literal not terminated")
+        return n
+      }
+      if ch == 0x5C {
+        ch = self.scan_escape!(quote)
+      } else {
+        ch = self.next_ch!
+      }
+      n += 1
+    }
+    n
+  }
+
+  def scan_raw_string! {
+    ch = self.next_ch! # the character after '`'
+    while ch != 0x60 {
+      if ch < 0 {
+        self.error!("literal not terminated")
+        return
+      }
+      ch = self.next_ch!
+    }
+  }
+
+  def scan_char! {
+    self.error!("invalid char literal") if self.scan_string!(0x27) != 1
+  }
+
+  # Scans a comment after its '/' (ch is '/' or '*'); returns the character
+  # after it.
+  def scan_comment!(ch0: Rune) -> Rune {
+    ch = ch0
+    if ch == 0x2F {
+      # A line comment.
+      ch = self.next_ch!
+      while ch != 0x0A && ch >= 0 {
+        ch = self.next_ch!
+      }
+      return ch
+    }
+    # A general comment.
+    ch = self.next_ch!
+    loop {
+      if ch < 0 {
+        self.error!("comment not terminated")
+        break
+      }
+      c0 = ch
+      ch = self.next_ch!
+      if c0 == 0x2A && ch == 0x2F {
+        ch = self.next_ch!
+        break
+      }
+    }
+    ch
+  }
+
+  def white?(ch: Rune) -> Bool {
+    ch >= 0 && ch < 64 && (whitespace & (1.as_u64 << ch.as_u64)) != 0
+  }
+
+  # Reads the next token or character and returns it: a token only if its
+  # mode bit is set; EOF at the end. Errors go to the error callback.
+  pub def scan! -> Rune {
+    ch = self.peek!
+    # Reset the token text position.
+    self.st[0].tok_pos = -1
+    self.st[0].tok_line = 0
+    loop {
+      # Skip white space.
+      while white?(ch) {
+        ch = self.next_ch!
+      }
+      # Start collecting the token text.
+      self.st[0].tok_buf = []
+      self.st[0].tok_pos = st[0].src_pos - st[0].last_char_len
+      # The token's position.
+      self.st[0].offset = st[0].src_buf_offset + st[0].tok_pos
+      if st[0].column > 0 {
+        # The last character was not a '\n'.
+        self.st[0].tok_line = st[0].line
+        self.st[0].tok_column = st[0].column
+      } else {
+        # It was ('\n' can't be the very start: next_ch! ran once).
+        self.st[0].tok_line = st[0].line - 1
+        self.st[0].tok_column = st[0].last_line_len
+      }
+      # The token.
+      tok = ch
+      redo = false
+      if is_ident_rune(ch, 0) {
+        if (mode & SCAN_IDENTS) != 0 {
+          tok = IDENT
+          ch = self.scan_identifier!
+        } else {
+          ch = self.next_ch!
+        }
+      } else if decimal?(ch) {
+        if (mode & (SCAN_INTS | SCAN_FLOATS)) != 0 {
+          tok, ch = self.scan_number!(ch, false)
+        } else {
+          ch = self.next_ch!
+        }
+      } else if ch == EOF {
+        # Nothing to read.
+      } else if ch == 0x22 {
+        if (mode & SCAN_STRINGS) != 0 {
+          self.scan_string!(0x22)
+          tok = STRING
+        }
+        ch = self.next_ch!
+      } else if ch == 0x27 {
+        if (mode & SCAN_CHARS) != 0 {
+          self.scan_char!
+          tok = CHAR
+        }
+        ch = self.next_ch!
+      } else if ch == 0x2E {
+        ch = self.next_ch!
+        if decimal?(ch) && (mode & SCAN_FLOATS) != 0 {
+          tok, ch = self.scan_number!(ch, true)
+        }
+      } else if ch == 0x2F {
+        ch = self.next_ch!
+        if (ch == 0x2F || ch == 0x2A) && (mode & SCAN_COMMENTS) != 0 {
+          if (mode & SKIP_COMMENTS) != 0 {
+            self.st[0].tok_pos = -1 # no token text
+            ch = self.scan_comment!(ch)
+            redo = true
+          } else {
+            ch = self.scan_comment!(ch)
+            tok = COMMENT
+          }
+        }
+      } else if ch == 0x60 {
+        if (mode & SCAN_RAW_STRINGS) != 0 {
+          self.scan_raw_string!
+          tok = RAW_STRING
+        }
+        ch = self.next_ch!
+      } else {
+        ch = self.next_ch!
+      }
+      next if redo
+      # The end of the token text.
+      self.st[0].tok_end = st[0].src_pos - st[0].last_char_len
+      self.st[0].ch = ch
+      return tok
+    }
+    EOF
+  }
+
+  # The position right after the last character or token read by next! or
+  # scan! (position has the start of the last token).
+  pub def pos -> Position {
+    s = st[0]
+    off = s.src_buf_offset + s.src_pos - s.last_char_len
+    if s.column > 0 {
+      # The last character was not a '\n'.
+      return Position.new(filename: filename, offset: off, line: s.line, column: s.column)
+    }
+    if s.last_line_len > 0 {
+      # It was.
+      return Position.new(filename: filename, offset: off, line: s.line - 1, column: s.last_line_len)
+    }
+    # The start of the source.
+    Position.new(filename: filename, offset: off, line: 1, column: 1)
+  }
+
+  # The text of the most recently scanned token ("" after next!). Also valid
+  # in the error callback (ScanError.token_text).
+  pub def token_text -> Str {
+    s = st[0]
+    return "" if s.tok_pos < 0
+    e = s.tok_end
+    e = s.tok_pos if e < s.tok_pos # at EOF tok_end can be -1
+    return Str.from_bytes(s.src_buf[s.tok_pos...e]) if s.tok_buf.size == 0
+    Str.from_bytes(s.tok_buf + s.src_buf[s.tok_pos...e])
+  }
+}
+
+# A Scanner over src (Go: new(Scanner).Init(src)).
+pub def new_scanner(src: io.Reader) -> Scanner {
+  s = Scanner.new(st: [])
+  s.init!(src)
+  s
+}
+
+# ch in lower case if it is an ASCII letter.
+def lower(ch: Rune) -> Rune { 0x20 | ch }
+
+def decimal?(ch: Rune) -> Bool { 0x30 <= ch && ch <= 0x39 }
+
+def hex?(ch: Rune) -> Bool {
+  (0x30 <= ch && ch <= 0x39) || (0x61 <= lower(ch) && lower(ch) <= 0x66)
+}
+
+def digit_val(ch: Rune) -> Int {
+  return (ch - 0x30).to_i if 0x30 <= ch && ch <= 0x39
+  return (lower(ch) - 0x61 + 10).to_i if 0x61 <= lower(ch) && lower(ch) <= 0x66
+  16 # larger than any digit
+}
+
+def litname(prefix: Rune) -> Str {
+  return "hexadecimal literal" if prefix == 0x78
+  return "octal literal" if prefix == 0x6F || prefix == 0x30
+  return "binary literal" if prefix == 0x62
+  "decimal literal"
+}
+
+# The index of the first invalid '_' separator in x, or -1.
+def invalid_sep(x: Str) -> Int {
+  x1: Rune = 0x20 # the prefix character; only 'x' matters
+  d: Rune = 0x2E  # '_', '0' (a digit) or '.' (anything else)
+  i = 0
+  # A prefix counts as a digit.
+  if x.size >= 2 && x[0] == 0x30 {
+    x1 = lower(x[1].as_i32)
+    if x1 == 0x78 || x1 == 0x6F || x1 == 0x62 {
+      d = 0x30
+      i = 2
+    }
+  }
+  # The mantissa and exponent.
+  while i < x.size {
+    p = d # the previous digit
+    d = x[i].as_i32
+    if d == 0x5F {
+      return i if p != 0x30
+    } else if decimal?(d) || (x1 == 0x78 && hex?(d)) {
+      d = 0x30
+    } else {
+      return i - 1 if p == 0x5F
+      d = 0x2E
+    }
+    i += 1
+  }
+  return x.size - 1 if d == 0x5F
+  -1
+}

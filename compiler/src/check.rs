@@ -3828,6 +3828,9 @@ impl<'w, 'a> FnCx<'w, 'a> {
                 let r = self.coerce(r, &inner)?;
                 let rt = self.resolve(&r.ty);
                 let (value, ty) = if matches!(rt, Ty::Opt(_)) {
+                    if !self.unify(&r.ty, &lt) {
+                        return Err(Diag::new(r.span, format!("`||` default is {}, but the value is {}", rt.show(), self.resolve(&lt).show())));
+                    }
                     (self.mk(TK::Local(tmp), lt.clone(), sp), lt.clone())
                 } else {
                     if !self.unify(&r.ty, &inner) {

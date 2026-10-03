@@ -98,7 +98,9 @@ fn step(toks: &[Token], i: usize, pi: usize, pk: Kind, pv: bool, st: &mut State)
         return (false, Kind::Prefix, false);
     }
     if pop.is_some_and(|o| matches!(o, "." | "?." | ".." | "...")) {
-        return (false, nrm.0, nrm.1);
+        // A keyword after `.` names a method or field (`self.next`): a value.
+        let member = matches!(c, Tok::Kw(_)) && pop != Some("..") && pop != Some("...");
+        return (false, nrm.0, nrm.1 || member);
     }
     if cop == Some("|") && st.params {
         st.params = false;

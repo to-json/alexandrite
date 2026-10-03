@@ -796,6 +796,8 @@ impl<'a> Parser<'a> {
             let fsp = self.span();
             let fname = match self.bump().tok {
                 Tok::Ident(n) => n,
+                // A keyword names a field too (Go's `next`): read it as `self.next`.
+                Tok::Kw(k) if matches!(self.peek(), Tok::Op(":")) => kw_name(k),
                 t => return Err(Diag::new(fsp, format!("expected a field name, found {}", describe(&t)))),
             };
             self.expect_op(":")?;
@@ -1703,8 +1705,12 @@ impl<'a> Parser<'a> {
                     other => return Err(Diag::new(t.span, format!("expected a method name after `&:`, found {}", describe(&other)))),
                 };
                 sym = Some((name, sp.to(t.span)));
-            } else if let (Tok::Ident(name), Tok::Op(":")) = (self.peek().clone(), self.peek_at(1).clone()) {
-                // `name: value`
+            } else if let (Some(name), Tok::Op(":")) = (match self.peek().clone() {
+                Tok::Ident(n) => Some(n),
+                Tok::Kw(k) => Some(kw_name(k)),
+                _ => None,
+            }, self.peek_at(1).clone()) {
+                // `name: value` (a keyword may name a field: `next: n`)
                 let nsp = self.bump().span;
                 self.bump();
                 self.skip_newlines();

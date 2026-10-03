@@ -37,6 +37,16 @@ The rules every std port follows (user decisions 2026-10-03, GO-VS-RUBY S1–S4,
 - A `test` block is fallible: use `.unwrap` or `~` inside.
 - A file's `#![...]` directive must be its first line.
 - `reduce(init) { }` accumulates in init's type.
+- `~f(a - 1, xs[i...j])` makes the argument arithmetic and slicing fallible too (ArithError/IndexError join your declared error set): compute arguments before the `~` call.
+- `r.err` on a `~T<E>` is an open `Error`, not `E`; match it with `case e { Variant(..) => }` (qualified `E.Variant(..)` / `pkg.E.Variant(..)` works too).
+- Inside a struct, calling a package function with the same name as one of the struct's methods calls the method: give the helper another name.
+- Locals are function-scoped: the same name with different types in two branches is an error.
+- A type that holds an `io.Reader`/`io.Writer` *interface value* can't itself be passed as one (interface values are closed sums, D12): make wrappers generic over the inner type (`Reader[R]`, like Rust's BufReader<R>), as encoding/hex, mime/quotedprintable and text/tabwriter do.
+- No variadics: take a slice (`cmp.or([a, b, c])`).
+- `[0; n]` and `c ? 1 : 0` adapt to a wanted Byte/U64 only in simple positions; use a typed local when in doubt.
+- Big generated vector files: keep test blocks to ~100 asserts each and files to a few thousand asserts (release builds of huge files are slow).
+- `"\x80"`-`"\xff"` escapes aren't allowed in string literals (Str is UTF-8 text): build such bytes with `Str.from_bytes([...])`.
+- Known open compiler issues: docs/notes/port-issues.md.
 - If you hit a compiler bug or a missing language feature, see "Language gaps" below.
 
 ## Language gaps

@@ -1,0 +1,271 @@
+# Go's crypto/elliptic/params.go: the generic, variable-time math/big
+# implementation of a short-form Weierstrass curve with a = -3.
+import "math/big"
+
+# The parameters of an elliptic curve and also a generic, non-constant time
+# implementation of Curve. The generic implementation is deprecated in Go:
+# custom curves are insecure, and the named curves have specific,
+# constant-time implementations (p224() etc.).
+pub struct CurveParams {
+  # The order of the underlying field.
+  p: big.Int
+  # The order of the base point.
+  n: big.Int
+  # The constant of the curve equation.
+  b: big.Int
+  # The x coordinate of the base point.
+  gx: big.Int
+  # The y coordinate of the base point.
+  gy: big.Int
+  # The size of the underlying field.
+  bit_size: Int
+  # The canonical name of the curve.
+  name: Str
+
+  # The parameters themselves.
+  pub def params -> CurveParams { self }
+
+  # x³ - 3x + b (mod p).
+  def polynomial(x: big.Int) -> big.Int {
+    x3 = big.Int.new
+    x3.mul!(x, x)
+    x3.mul!(x3, x)
+
+    three_x = big.Int.new
+    three_x.lsh!(x, 1)
+    three_x.add!(three_x, x)
+
+    x3.sub!(x3, three_x)
+    x3.add!(x3, self.b)
+    x3.mod!(x3, self.p)
+    x3
+  }
+
+  # Whether (x, y) is on the curve (the generic implementation).
+  pub def on_curve?(x: big.Int, y: big.Int) -> Bool {
+    return false if x.sign < 0 || x.cmp(self.p) >= 0 || y.sign < 0 || y.cmp(self.p) >= 0
+    # y² = x³ - 3x + b
+    y2 = big.Int.new
+    y2.mul!(y, y)
+    y2.mod!(y2, self.p)
+    polynomial(x).cmp(y2) == 0
+  }
+
+  # The affine form of the Jacobian point (x, y, z). See
+  # https://hyperelliptic.org/EFD/g1p/auto-shortw-jacobian-3.html#addition-add-2007-bl
+  def affine_from_jacobian(x: big.Int, y: big.Int, z: big.Int) -> (big.Int, big.Int) {
+    return (big.Int.new, big.Int.new) if z.sign == 0
+    zinv = big.Int.new
+    zinv.mod_inverse!(z, self.p)
+    zinvsq = big.Int.new
+    zinvsq.mul!(zinv, zinv)
+
+    x_out = big.Int.new
+    x_out.mul!(x, zinvsq)
+    x_out.mod!(x_out, self.p)
+    zinvsq.mul!(zinvsq, zinv)
+    y_out = big.Int.new
+    y_out.mul!(y, zinvsq)
+    y_out.mod!(y_out, self.p)
+    (x_out, y_out)
+  }
+
+  # (x1, y1) + (x2, y2) (the generic implementation).
+  pub def add(x1: big.Int, y1: big.Int, x2: big.Int, y2: big.Int) -> (big.Int, big.Int) {
+    panic_if_not_on_curve(self, x1, y1)
+    panic_if_not_on_curve(self, x2, y2)
+    z1 = z_for_affine(x1, y1)
+    z2 = z_for_affine(x2, y2)
+    j = add_jacobian(x1, y1, z1, x2, y2, z2)
+    affine_from_jacobian(j[0], j[1], j[2])
+  }
+
+  # The sum of (x1, y1, z1) and (x2, y2, z2), in Jacobian form.
+  def add_jacobian(x1: big.Int, y1: big.Int, z1: big.Int, x2: big.Int, y2: big.Int, z2: big.Int) -> (big.Int, big.Int, big.Int) {
+    # See https://hyperelliptic.org/EFD/g1p/auto-shortw-jacobian-3.html#addition-add-2007-bl
+    x3 = big.Int.new
+    y3 = big.Int.new
+    z3 = big.Int.new
+    if z1.sign == 0 {
+      x3.set!(x2)
+      y3.set!(y2)
+      z3.set!(z2)
+      return (x3, y3, z3)
+    }
+    if z2.sign == 0 {
+      x3.set!(x1)
+      y3.set!(y1)
+      z3.set!(z1)
+      return (x3, y3, z3)
+    }
+
+    z1z1 = big.Int.new
+    z1z1.mul!(z1, z1)
+    z1z1.mod!(z1z1, self.p)
+    z2z2 = big.Int.new
+    z2z2.mul!(z2, z2)
+    z2z2.mod!(z2z2, self.p)
+
+    u1 = big.Int.new
+    u1.mul!(x1, z2z2)
+    u1.mod!(u1, self.p)
+    u2 = big.Int.new
+    u2.mul!(x2, z1z1)
+    u2.mod!(u2, self.p)
+    h = big.Int.new
+    h.sub!(u2, u1)
+    x_equal = h.sign == 0
+    h.add!(h, self.p) if h.sign == -1
+    i = big.Int.new
+    i.lsh!(h, 1)
+    i.mul!(i, i)
+    j = big.Int.new
+    j.mul!(h, i)
+
+    s1 = big.Int.new
+    s1.mul!(y1, z2)
+    s1.mul!(s1, z2z2)
+    s1.mod!(s1, self.p)
+    s2 = big.Int.new
+    s2.mul!(y2, z1)
+    s2.mul!(s2, z1z1)
+    s2.mod!(s2, self.p)
+    r = big.Int.new
+    r.sub!(s2, s1)
+    r.add!(r, self.p) if r.sign == -1
+    y_equal = r.sign == 0
+    return double_jacobian(x1, y1, z1) if x_equal && y_equal
+    r.lsh!(r, 1)
+    v = big.Int.new
+    v.mul!(u1, i)
+
+    x3.set!(r)
+    x3.mul!(x3, x3)
+    x3.sub!(x3, j)
+    x3.sub!(x3, v)
+    x3.sub!(x3, v)
+    x3.mod!(x3, self.p)
+
+    y3.set!(r)
+    v.sub!(v, x3)
+    y3.mul!(y3, v)
+    s1.mul!(s1, j)
+    s1.lsh!(s1, 1)
+    y3.sub!(y3, s1)
+    y3.mod!(y3, self.p)
+
+    z3.add!(z1, z2)
+    z3.mul!(z3, z3)
+    z3.sub!(z3, z1z1)
+    z3.sub!(z3, z2z2)
+    z3.mul!(z3, h)
+    z3.mod!(z3, self.p)
+
+    (x3, y3, z3)
+  }
+
+  # 2 * (x1, y1) (the generic implementation).
+  pub def double(x1: big.Int, y1: big.Int) -> (big.Int, big.Int) {
+    panic_if_not_on_curve(self, x1, y1)
+    z1 = z_for_affine(x1, y1)
+    j = double_jacobian(x1, y1, z1)
+    affine_from_jacobian(j[0], j[1], j[2])
+  }
+
+  # 2 * (x, y, z), in Jacobian form.
+  def double_jacobian(x: big.Int, y: big.Int, z: big.Int) -> (big.Int, big.Int, big.Int) {
+    # See https://hyperelliptic.org/EFD/g1p/auto-shortw-jacobian-3.html#doubling-dbl-2001-b
+    delta = big.Int.new
+    delta.mul!(z, z)
+    delta.mod!(delta, self.p)
+    gamma = big.Int.new
+    gamma.mul!(y, y)
+    gamma.mod!(gamma, self.p)
+    alpha = big.Int.new
+    alpha.sub!(x, delta)
+    alpha.add!(alpha, self.p) if alpha.sign == -1
+    alpha2 = big.Int.new
+    alpha2.add!(x, delta)
+    alpha.mul!(alpha, alpha2)
+    alpha2.set!(alpha)
+    alpha.lsh!(alpha, 1)
+    alpha.add!(alpha, alpha2)
+
+    beta = alpha2
+    beta.mul!(x, gamma)
+
+    x3 = big.Int.new
+    x3.mul!(alpha, alpha)
+    beta8 = big.Int.new
+    beta8.lsh!(beta, 3)
+    beta8.mod!(beta8, self.p)
+    x3.sub!(x3, beta8)
+    x3.add!(x3, self.p) if x3.sign == -1
+    x3.mod!(x3, self.p)
+
+    z3 = big.Int.new
+    z3.add!(y, z)
+    z3.mul!(z3, z3)
+    z3.sub!(z3, gamma)
+    z3.add!(z3, self.p) if z3.sign == -1
+    z3.sub!(z3, delta)
+    z3.add!(z3, self.p) if z3.sign == -1
+    z3.mod!(z3, self.p)
+
+    beta.lsh!(beta, 2)
+    beta.sub!(beta, x3)
+    beta.add!(beta, self.p) if beta.sign == -1
+    y3 = alpha
+    y3.mul!(alpha, beta)
+
+    gamma.mul!(gamma, gamma)
+    gamma.lsh!(gamma, 3)
+    gamma.mod!(gamma, self.p)
+
+    y3.sub!(y3, gamma)
+    y3.add!(y3, self.p) if y3.sign == -1
+    y3.mod!(y3, self.p)
+
+    (x3, y3, z3)
+  }
+
+  # k * (bx, by) (the generic implementation: double-and-add, not constant
+  # time).
+  pub def scalar_mult(bx: big.Int, by: big.Int, k: [Byte]) -> (big.Int, big.Int) {
+    panic_if_not_on_curve(self, bx, by)
+    bz = new_big(1)
+    x = big.Int.new
+    y = big.Int.new
+    z = big.Int.new
+    for b0 in k {
+      byte = b0
+      for _ in 0...8 {
+        d = double_jacobian(x, y, z)
+        x = d[0]
+        y = d[1]
+        z = d[2]
+        if byte & 0x80 == 0x80 {
+          a = add_jacobian(bx, by, bz, x, y, z)
+          x = a[0]
+          y = a[1]
+          z = a[2]
+        }
+        byte = byte << 1
+      }
+    }
+    affine_from_jacobian(x, y, z)
+  }
+
+  # k * G (the generic implementation).
+  pub def scalar_base_mult(k: [Byte]) -> (big.Int, big.Int) { scalar_mult(gx, gy, k) }
+}
+
+# The Jacobian Z coordinate for an affine point: 0 for (0, 0) (infinity by
+# convention), 1 otherwise. See Issue 37294.
+def z_for_affine(x: big.Int, y: big.Int) -> big.Int {
+  z = big.Int.new
+  z.set_int64!(1) if x.sign != 0 || y.sign != 0
+  z
+}
+
+def new_big(v: Int) -> big.Int { big.new_int(v) }

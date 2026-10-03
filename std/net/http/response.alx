@@ -1,15 +1,31 @@
 import "net"
 import "strings"
 import "strconv"
+import "time"
 
 # A body that outgrows this many buffered bytes switches the response to
 # chunked transfer coding (headers go out, then each write is a chunk).
 pub FLUSH_THRESHOLD = 32768
 
+# Where a ResponseWriter's output goes and in which form:
+#  - MODE_HTTP: an HTTP/1.x response on a connection ("HTTP/1.1 200 OK",
+#    Content-Length or chunked framing; the server's writers).
+#  - MODE_CGI: a CGI response ("Status: 200 OK" header line, then the
+#    header and the raw body as it is written; net/http/cgi).
+#  - MODE_FCGI: like MODE_CGI, plus a Date header and no entity headers on a
+#    304 (net/http/fcgi).
+#  - MODE_RECORD: nothing is sent; the status, a snapshot of the header and
+#    the body are recorded (net/http/httptest's ResponseRecorder).
+pub MODE_HTTP = 0
+pub MODE_CGI = 1
+pub MODE_FCGI = 2
+pub MODE_RECORD = 3
+
 struct RWState {
   # 0 until write_header! (or the first write).
   status: Int
-  # Body bytes held back so Content-Length can be sent.
+  # Body bytes held back (MODE_HTTP: so Content-Length can be sent; MODE_RECORD:
+  # the whole body).
   body: [Byte]
   head_sent: Bool
   chunked: Bool
@@ -18,40 +34,92 @@ struct RWState {
   # The request used HTTP/1.1, so chunked coding is available.
   can_chunk: Bool
   head_request: Bool
-  # Bytes not yet written to the connection.
+  # Bytes not yet handed to the sink.
   out: [Byte]
+  mode: Int
+  # MODE_RECORD: flush! was called; the header when the status was set.
+  flushed: Bool
+  snap: Header
+  # Sink failures, kept until finish!.
+  failed: Bool
 }
 
 # What a handler writes its response to. Copies share state (D36), so it can
 # be passed around freely.
 #
-# Framing: the response is held in memory while the handler writes. If it
-# finishes with less than FLUSH_THRESHOLD bytes (and never called `flush!`),
-# it goes out with a `Content-Length`; otherwise the headers go out first with
-# `Transfer-Encoding: chunked` and each write is a chunk. HTTP/1.0 clients
-# always get a buffered, length-framed response. `Date` and `Server` headers
-# are not sent.
+# Framing (MODE_HTTP): the response is held in memory while the handler
+# writes. If it finishes with less than FLUSH_THRESHOLD bytes (and never
+# called `flush!`), it goes out with a `Content-Length`; otherwise the headers
+# go out first with `Transfer-Encoding: chunked` and each write is a chunk.
+# HTTP/1.0 clients always get a buffered, length-framed response. Without a
+# Content-Type, one is sniffed from the body (detect_content_type). `Date`
+# and `Server` headers are not sent. See the MODE_ constants for the other
+# kinds of output.
 pub struct ResponseWriter {
   st: [RWState]
-  conn: net.Conn
+  # Takes the finished bytes (the connection, a CGI's stdout, ...).
+  sink: ([Byte]) -> ~Unit
   # The response headers: set them before the first write.
   header: Header
 
-  # Sets the status line. Only the first call counts; headers set after it
-  # (and a write) are not sent unless the response is still being buffered.
+  # Sets the status. Only the first call counts; headers set after it (and
+  # after a write) are not sent unless the response is still being buffered.
   pub def write_header!(code: Int) {
     return if st[0].status != 0
     c = code
     c = 500 if c < 100 || c > 999
     self.st[0].status = c
+    m = st[0].mode
+    if m == MODE_RECORD {
+      self.st[0].snap = header.clone
+    } else if m == MODE_FCGI {
+      if c == 304 {
+        header.del!("Content-Type")
+        header.del!("Content-Length")
+        header.del!("Transfer-Encoding")
+      }
+      header.set!("Date", now_http_date()) if header.get("Date") == ""
+    }
     return
   }
 
+  # The status set so far (0: none yet).
   pub def status -> Int { st[0].status }
+
+  # Whether write_header! (or a write) has set the status.
+  pub def wrote_header? -> Bool { st[0].status != 0 }
+
+  # MODE_RECORD: the body written so far.
+  pub def recorded_body -> [Byte] { st[0].body }
+
+  # MODE_RECORD: the header as it was when the status was set (the live
+  # header before that).
+  pub def recorded_header -> Header {
+    st[0].status == 0 ? header : st[0].snap
+  }
+
+  # MODE_RECORD: whether flush! was called.
+  pub def flushed? -> Bool { st[0].flushed }
 
   # Appends p to the body (status 200 if none was set); p.size.
   pub def write!(p: [Byte]) -> ~Int {
-    self.write_header!(200)
+    m = st[0].mode
+    if st[0].status == 0 {
+      if m == MODE_RECORD && !header.has?("Content-Type") && !header.has?("Transfer-Encoding") {
+        header.set!("Content-Type", detect_content_type(p))
+      }
+      self.write_header!(200)
+    }
+    if m == MODE_RECORD {
+      for c in p { self.st[0].body << c }
+      return p.size
+    }
+    if m == MODE_CGI || m == MODE_FCGI {
+      self.~send_cgi_head!(p) unless st[0].head_sent
+      self.~put!(p)
+      self.~flush_out! if st[0].out.size > 65536
+      return p.size
+    }
     return p.size if st[0].head_request && st[0].head_sent
     if st[0].head_sent {
       self.~send_chunk!(p)
@@ -71,6 +139,17 @@ pub struct ResponseWriter {
   # Sends what's buffered now (switching to chunked coding), so the client
   # sees it before the handler is done. On HTTP/1.0 it does nothing.
   pub def flush! -> ~Unit {
+    m = st[0].mode
+    if m == MODE_RECORD {
+      self.write_header!(200) if st[0].status == 0
+      self.st[0].flushed = true
+      return
+    }
+    if m == MODE_CGI || m == MODE_FCGI {
+      self.write_header!(200)
+      self.~flush_out!
+      return
+    }
     return if !st[0].can_chunk
     self.write_header!(200)
     self.~start_stream! unless st[0].head_sent
@@ -91,13 +170,31 @@ pub struct ResponseWriter {
     return if st[0].out.size == 0
     o = st[0].out
     self.st[0].out = []
-    conn.~write!(o)
+    s = sink
+    r = s(o)
+    if r.err? {
+      self.st[0].failed = true
+      ~r
+    }
     return
   }
 
   def bodyless? -> Bool {
     s = st[0].status
     s < 200 || s == 204 || s == 304
+  }
+
+  # The CGI header block, before the first body bytes p.
+  def send_cgi_head!(p: [Byte]) -> ~Unit {
+    s = st[0].status
+    self.~put_string!("Status: #{s} #{status_text(s)}\r\n")
+    if !header.has?("Content-Type") && !(st[0].mode == MODE_FCGI && s == 304) {
+      header.set!("Content-Type", detect_content_type(p))
+    }
+    self.~put_string!(header.wire_subset([]))
+    self.~put_string!("\r\n")
+    self.st[0].head_sent = true
+    self.~flush_out!
   }
 
   def send_head!(content_length: Int) -> ~Unit {
@@ -109,9 +206,7 @@ pub struct ResponseWriter {
       header.del!("Content-Length")
     }
     if !header.has?("Content-Type") && st[0].body.size > 0 && !bodyless? {
-      b = st[0].body
-      ctype = b[0] == 60 ? "text/html; charset=utf-8" : "text/plain; charset=utf-8"
-      header.set!("Content-Type", ctype)
+      header.set!("Content-Type", detect_content_type(st[0].body))
     }
     if lower(header.get("Connection")) == "close" {
       self.st[0].close_after = true
@@ -143,9 +238,18 @@ pub struct ResponseWriter {
     self.~flush_out! if st[0].out.size > 65536
   }
 
-  # Called by the server when the handler returns: completes the response and
-  # flushes it. true if the connection stays usable.
-  def finish! -> ~Bool {
+  # Completes the response after the handler returned and flushes it to the
+  # sink; true if the connection stays usable. (The server calls it; so do
+  # the cgi and fcgi packages. A recorder needs no finish.)
+  pub def finish! -> ~Bool {
+    m = st[0].mode
+    return true if m == MODE_RECORD
+    if m == MODE_CGI || m == MODE_FCGI {
+      self.write_header!(200)
+      self.~send_cgi_head!([]) unless st[0].head_sent
+      self.~flush_out!
+      return true
+    }
     self.write_header!(200)
     if !st[0].head_sent {
       n = st[0].body.size
@@ -157,7 +261,7 @@ pub struct ResponseWriter {
       self.~put_string!("0\r\n\r\n")
     }
     self.~flush_out!
-    !st[0].close_after
+    !st[0].close_after && !st[0].failed
   }
 }
 
@@ -167,11 +271,40 @@ def clean(v: Str) -> Str {
   strings.replace_all(strings.replace_all(v, "\r", " "), "\n", " ")
 }
 
-def new_response_writer(conn: net.Conn, head_request: Bool, can_chunk: Bool, close_after: Bool) -> ResponseWriter {
+def now_http_date -> Str {
+  time.now.utc.format(TIME_FORMAT)
+}
+
+def new_rw_state(mode: Int, head_request: Bool, can_chunk: Bool, close_after: Bool) -> [RWState] {
   b: [Byte] = []
   ob: [Byte] = []
-  s: [RWState] = [RWState.new(status: 0, body: b, head_sent: false, chunked: false, close_after: close_after, can_chunk: can_chunk, head_request: head_request, out: ob)]
-  ResponseWriter.new(st: s, conn: conn, header: new_header)
+  s: [RWState] = [RWState.new(status: 0, body: b, head_sent: false, chunked: false, close_after: close_after, can_chunk: can_chunk, head_request: head_request, out: ob, mode: mode, flushed: false, snap: new_header, failed: false)]
+  s
+}
+
+def new_response_writer(conn: net.Conn, head_request: Bool, can_chunk: Bool, close_after: Bool) -> ResponseWriter {
+  c = conn
+  sink = ->(p: [Byte]) -> ~Unit {
+    c.~write!(p)
+    return
+  }
+  ResponseWriter.new(st: new_rw_state(MODE_HTTP, head_request, can_chunk, close_after), sink: sink, header: new_header)
+}
+
+# A ResponseWriter whose output (in the form `mode` says) goes to `sink`.
+# For MODE_HTTP, `head_request` drops the body and the response is
+# length-framed unless it streams (chunked); call `finish!` when the handler
+# is done.
+pub def new_response_writer_to(mode: Int, head_request: Bool, sink: ([Byte]) -> ~Unit) -> ResponseWriter {
+  ResponseWriter.new(st: new_rw_state(mode, head_request, true, false), sink: sink, header: new_header)
+}
+
+# A ResponseWriter that records what a handler does (MODE_RECORD).
+pub def new_recording_writer -> ResponseWriter {
+  sink = ->(p: [Byte]) -> ~Unit {
+    return
+  }
+  ResponseWriter.new(st: new_rw_state(MODE_RECORD, false, true, false), sink: sink, header: new_header)
 }
 
 # Replies with the status `code` and `msg` as a text/plain body.

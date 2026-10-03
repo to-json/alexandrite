@@ -14,7 +14,7 @@ target/release/alx fmt --check f.alx                 # formatter (gofmt-like, no
 target/release/alx run acceptance/run.alx -k <filter>  # acceptance groups whose name contains <filter>
 ```
 
-- **Rebuild after editing `std/`:** std is embedded in the compiler at build time.
+- **Rebuild after editing `std/`:** std is embedded in the compiler at build time. To skip that while iterating, `ALX_STD_DIR=$PWD/std target/release/alx test std/<pkg>` reads std from disk.
 - **In a worktree:** use *its* `target/release/alx`, not the main repo's.
 - **Full acceptance** (`alx run acceptance/run.alx`, no `-k`) takes 30+ minutes and starts servers on fixed ports. The person merging your branch runs it. You run your packages' tests and the relevant `-k` groups, unless your task says otherwise.
 - **One acceptance run per checkout at a time:** each run clears `acceptance/cases/.alx-cache` when it starts, so a second run (even `-k`) breaks the first.

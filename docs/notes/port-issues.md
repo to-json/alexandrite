@@ -28,11 +28,11 @@ Open problems agents reported; each gets fixed in a compiler round between waves
 | 22 | crypto | `hs[i]()` (calling an indexed function value) doesn't parse | open |
 | 23 | crypto | `case` arms aren't converted to a wanted interface type | open |
 | 24 | crypto | `"#{e}"` can't interpolate a plain enum value | open |
-| 25 | crypto | `[0xee.as_u8, 1, 1]`: later elements don't take U8 from the first | open |
+| 25 | crypto | `[0xee.as_u8, 1, 1]`: later elements don't take U8 from the first | fixed (D57: array literals take an earlier element's type) |
 | 26 | crypto | a `[T; N]` local is heap-allocated, not a stack array | open (perf) |
 | 27 | crypto | HMAC can't ask a generic `H` whether it's marshalable, so no saved keyed state: PBKDF2 3.8x Go | open (perf) |
 | 28 | math/big | no add-with-carry: big Mul/String ~2x Go | open (perf) |
-| 29 | math/big | tuple-returning functions get region mark/reset even when they don't allocate (`bits.add64` slow in loops) | open (perf) |
+| 29 | math/big | tuple-returning functions get region mark/reset even when they don't allocate (`bits.add64` slow in loops) | partly fixed (D57: storage-free values) |
 | 30 | math/big | no mutable package globals (caches like Go's divisor table) | open (design) |
 | 31 | math/big | `format` has no `%g` | fixed: `%g` (shortest, as Go); `%.Ng` and `%G` not yet |
 | 32 | math/big | a main file can't declare its own `Int`/`Float` (only packages can) | open (by design for now) |

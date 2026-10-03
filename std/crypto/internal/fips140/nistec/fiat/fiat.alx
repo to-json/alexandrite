@@ -1,0 +1,104 @@
+#![overflow(wrap)]
+# Package fiat: Go's crypto/internal/fips140/nistec/fiat, field arithmetic
+# modulo the primes of the NIST P-224, P-256, P-384 and P-521 curves, from
+# fiat-crypto (formally verified, generated code).
+#
+#   Go                                  alx
+#   new(P256Element) (zero)             P256Element.new
+#   e.One()                             P256Element.one
+#   e.Set(t)                            e = t (elements are values)
+#   e.Equal(t) int / e.IsZero() int     e.equal(t) -> Int / e.is_zero -> Int
+#   e.Bytes() []byte                    e.bytes -> [Byte]
+#   e.SetBytes(v) (*E, error)           P256Element.from_bytes(v) -> ~P256Element<FiatError>
+#   e.Add(t1, t2) / Sub / Mul           t1.add(t2) / t1.sub(t2) / t1.mul(t2)
+#   e.Square(t)                         t.square
+#   v.Select(a, b, cond)                P256Element.select(a, b, cond)
+#   e.Invert(x)                         x.invert
+#
+# The same for P224Element, P384Element and P521Element.
+#
+# The p*_fiat64.alx and p*_invert.alx files are translated mechanically from
+# Go's p*_fiat64.go (fiat-crypto's word_by_word_montgomery output) and
+# p*_invert.go (addchain output), and p*.alx from Go's generate.go template,
+# by a translator script; regenerate rather than edit them.
+#
+# Timing: the generated code is straight-line and branch-free: bits.Add64,
+# Sub64 and Mul64 become their portable formulas (carries and borrows from
+# masks and shifts, the high word from `__mulhi`), and selects are masks, as
+# in fiat's --cmovznz-by-mul output. Go's guarantee rests on its compiler;
+# alx's C and Cranelift backends could in principle introduce branches (as
+# crypto/subtle's header says), though none are expected for this code.
+#
+# Differences from Go:
+#   - Elements are plain values (structs of U64 limbs, so they live in
+#     registers / on the stack): operations return new elements instead of
+#     setting a receiver and returning it. Go's Set is assignment.
+#   - SetBytes is the static from_bytes and returns a new element; the error
+#     is FiatError.InvalidEncoding with Go's message.
+#   - Select is static: P256Element.select(a, b, cond).
+
+# Errors of from_bytes.
+pub error FiatError {
+  # An encoding of the wrong length, or of a value not below the prime
+  # (Go: "invalid P256Element encoding").
+  InvalidEncoding(element: Str)
+
+  def message -> Str {
+    case self {
+      InvalidEncoding(element) => "invalid #{element} encoding"
+    }
+  }
+}
+
+# Reverses v in place.
+def invert_endianness(v: [Byte]) {
+  w = v
+  n = v.size
+  i = 0
+  while i < n / 2 {
+    t = w[i]
+    w[i] = w[n - 1 - i]
+    w[n - 1 - i] = t
+    i += 1
+  }
+  nil
+}
+
+# The big-endian U64 at b[i...i + 8].
+def be_u64(b: [Byte], i: Int) -> U64 {
+  v: U64 = 0
+  k = 0
+  while k < 8 {
+    v = (v << 8) | b[i + k].as_u64
+    k += 1
+  }
+  v
+}
+
+# 1 if x <= y as big-endian numbers of the same length, 0 otherwise (and 0
+# for different lengths); constant time in the contents (Go's
+# crypto/internal/fips140/subtle.ConstantTimeLessOrEqBytes).
+def constant_time_less_or_eq_bytes(x: [Byte], y: [Byte]) -> Int {
+  return 0 if x.size != y.size
+  # A constant time subtraction chain y - x: no final borrow means x <= y.
+  b: U64 = 0
+  n = x.size
+  while n > 8 {
+    x0 = be_u64(x, n - 8)
+    y0 = be_u64(y, n - 8)
+    d = y0 - x0 - b
+    b = ((^y0 & x0) | (^(y0 ^ x0) & d)) >> 63
+    n -= 8
+  }
+  if n > 0 {
+    xb = [0.as_u8; 8]
+    yb = [0.as_u8; 8]
+    copy(xb[8 - n...8], x[0...n])
+    copy(yb[8 - n...8], y[0...n])
+    x0 = be_u64(xb, 0)
+    y0 = be_u64(yb, 0)
+    d = y0 - x0 - b
+    b = ((^y0 & x0) | (^(y0 ^ x0) & d)) >> 63
+  }
+  (b ^ 1).as_i64
+}

@@ -502,6 +502,23 @@ AlxStr alx_str_join(Arr_Str a, AlxStr sep) {
     return r;
 }
 
+/* s.byteindex(sub, from): the first offset >= from (clamped to 0) where sub
+ * occurs, or -1. memchr finds candidates for the first byte. */
+int64_t alx_str_index(AlxStr s, AlxStr sub, int64_t from) {
+    if (from < 0) from = 0;
+    if (from > s.len) return -1;
+    if (sub.len == 0) return from;
+    char c0 = sub.ptr[0];
+    for (int64_t i = from; i + sub.len <= s.len;) {
+        const char *hit = memchr(s.ptr + i, c0, (size_t)(s.len - sub.len + 1 - i));
+        if (!hit) return -1;
+        i = hit - s.ptr;
+        if (sub.len == 1 || memcmp(s.ptr + i + 1, sub.ptr + 1, (size_t)sub.len - 1) == 0) return i;
+        i++;
+    }
+    return -1;
+}
+
 int64_t alx_str_to_i(AlxStr s) {
     /* Ruby: leading whitespace, optional sign, digits; garbage stops it. */
     int64_t i = 0, v = 0;
@@ -979,7 +996,8 @@ void alx_pmap_try(const void *in, int64_t n, size_t in_size, void *out, size_t v
  * worker goes on to run another one.
  *
  * Stacks: every worker owns one mmap'd run stack (guard page below, size
- * ALX_TASK_STACK, default 256 KiB) that all its tasks run on. When a task
+ * ALX_TASK_STACK, default 8 MiB of address space, committed only as it is
+ * touched) that all its tasks run on. When a task
  * parks, its live part [sp, top) is copied to the heap; it is copied back to
  * the same addresses on resume. A parked task costs its used bytes (about a
  * kilobyte) instead of a page-rounded private stack, so 100000 tasks fit.
@@ -1276,6 +1294,7 @@ static size_t parse_size(const char *s, size_t dflt) {
     if (e == s || v <= 0) return dflt;
     if (*e == 'k' || *e == 'K') v *= 1024;
     else if (*e == 'm' || *e == 'M') v *= 1024 * 1024;
+    else if (*e == 'g' || *e == 'G') v *= 1024.0 * 1024 * 1024;
     return (size_t)v;
 }
 
@@ -1457,7 +1476,7 @@ static bool workers_start(void) {
 #if defined(ALX_ASAN) || defined(ALX_TSAN)
     size_t dflt = 1 << 20;       /* instrumented frames are big */
 #else
-    size_t dflt = 256 << 10;
+    size_t dflt = 8 << 20;       /* reserved, committed as touched: deep recursion (regexp trees nest 2000 deep) */
 #endif
     const char *e = getenv("ALX_TASK_STACK");
     g_stk_size = e ? parse_size(e, dflt) : dflt;

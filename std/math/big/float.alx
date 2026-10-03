@@ -1,0 +1,966 @@
+#![overflow(wrap)]
+# Multi-precision binary floating-point numbers (Go's float.go, sqrt.go).
+
+import "math"
+import "encoding/json"
+
+# The largest and smallest exponents a Float can have, and the largest
+# precision.
+pub MAX_EXP = 2147483647
+pub MIN_EXP = -2147483648
+pub MAX_PREC: U64 = 4294967295
+
+# forms
+FORM_ZERO = 0
+FORM_FINITE = 1
+FORM_INF = 2
+
+MSB: U64 = 0x8000000000000000
+
+# A multi-precision binary floating-point number: sign × mantissa ×
+# 2^exponent with 0.5 <= mantissa < 1.0, prec mantissa bits, a rounding
+# mode, and the accuracy of the last operation. The zero value is +0 with
+# precision 0 (the first operation that sets it picks a precision, as in
+# Go). Methods ending in `!` set the receiver and return its new value.
+# NaNs are not values: operations that would make one panic with Go's
+# ErrNaN message.
+pub struct Float {
+  prec_: U32
+  mode_: RoundingMode
+  acc_: Accuracy
+  form: I64
+  neg: Bool
+  mant: [U64]
+  exp: I32
+
+  # Sets z's precision to prec bits (rounding z if needed; 0 maps finite
+  # values to ±0). Precisions above MAX_PREC are MAX_PREC.
+  pub def set_prec!(prec0: I64) -> Float {
+    self.acc_ = Accuracy.Exact
+    if prec0 == 0 {
+      self.prec_ = 0
+      if form == FORM_FINITE {
+        self.acc_ = make_acc(neg)
+        self.form = FORM_ZERO
+      }
+      return self
+    }
+    p = prec0.as_u64
+    p = MAX_PREC if p > MAX_PREC
+    old = prec_
+    self.prec_ = p.as_u32
+    self.round!(0) if prec_ < old
+    self
+  }
+
+  # Sets z's rounding mode (and its accuracy to Exact).
+  pub def set_mode!(mode: RoundingMode) -> Float {
+    self.mode_ = mode
+    self.acc_ = Accuracy.Exact
+    self
+  }
+
+  # The mantissa precision in bits (0 for an unset zero value).
+  pub def prec -> I64 { prec_.to_i64 }
+
+  # The minimum precision that represents x exactly (0 for ±0 and ±Inf).
+  pub def min_prec -> I64 {
+    return 0 if form != FORM_FINITE
+    mant.size * W - nat_trailing_zero_bits(mant)
+  }
+
+  # The rounding mode.
+  pub def mode -> RoundingMode { mode_ }
+
+  # The accuracy of the most recent operation (unless said otherwise).
+  pub def acc -> Accuracy { acc_ }
+
+  # -1, 0 or +1 as x < 0, x is ±0, or x > 0.
+  pub def sign -> I64 {
+    return 0 if form == FORM_ZERO
+    return -1 if neg
+    1
+  }
+
+  # (mant, exp) with x = mant × 2^exp and 0.5 <= |mant| < 1.0 (Go's
+  # MantExp(mant)); ±0 and ±Inf give (x, 0).
+  pub def mant_exp -> (Float, I64) {
+    e = 0
+    e = exp.to_i64 if form == FORM_FINITE
+    m = self
+    m.exp = 0 if m.form == FORM_FINITE
+    (m, e)
+  }
+
+  def set_exp_and_round!(e: I64, sbit: U64) -> Unit {
+    if e < MIN_EXP {
+      self.acc_ = make_acc(neg)
+      self.form = FORM_ZERO
+      return
+    }
+    if e > MAX_EXP {
+      self.acc_ = make_acc(!neg)
+      self.form = FORM_INF
+      return
+    }
+    self.form = FORM_FINITE
+    self.exp = e.as_i32
+    self.round!(sbit)
+  }
+
+  # Sets z to mant × 2^exp (Go's SetMantExp), rounded to z's precision.
+  pub def set_mant_exp!(m: Float, e: I64) -> Float {
+    self.copy!(m)
+    self.set_exp_and_round!(exp.to_i64 + e, 0) if form == FORM_FINITE
+    self
+  }
+
+  # Whether x is negative or negative zero.
+  pub def signbit -> Bool { neg }
+
+  # Whether x is +Inf or -Inf (Go's IsInf).
+  pub def inf? -> Bool { form == FORM_INF }
+
+  # Whether x is an integer (±Inf isn't).
+  pub def int? -> Bool {
+    return form == FORM_ZERO if form != FORM_FINITE
+    return false if exp <= 0
+    prec_ <= exp.as_u32 || self.min_prec <= exp.to_i64
+  }
+
+  # Rounds z to its precision and mode; sbit is a sticky bit for bits
+  # already shifted out. Sets the accuracy.
+  def round!(sbit0: U64) -> Unit {
+    self.acc_ = Accuracy.Exact
+    return if form != FORM_FINITE
+    m = mant.size
+    bits = m * W
+    return if bits <= prec_.to_i64
+    r = bits - prec_.to_i64 - 1
+    rbit = nat_bit(mant, r) & 1
+    sbit = sbit0
+    if sbit == 0 && (rbit == 0 || mode_ == RoundingMode.ToNearestEven) {
+      sbit = nat_sticky(mant, r)
+    }
+    sbit &= 1
+    n = (prec_.to_i64 + (W - 1)) / W
+    mt = nat_make(n)
+    copy(mt, mant[m - n...m])
+    ntz = n * W - prec_.to_i64
+    lsb = ONE << ntz
+    if rbit | sbit != 0 {
+      inc = false
+      case mode_ {
+        ToNegativeInf => inc = neg
+        ToZero => inc = false
+        ToNearestEven => inc = rbit != 0 && (sbit != 0 || mt[0] & lsb != 0)
+        ToNearestAway => inc = rbit != 0
+        AwayFromZero => inc = true
+        ToPositiveInf => inc = !neg
+      }
+      self.acc_ = make_acc(inc != neg)
+      if inc {
+        if add_vw(mt, mt, lsb) != 0 {
+          if exp.to_i64 >= MAX_EXP {
+            self.form = FORM_INF
+            self.mant = mt
+            return
+          }
+          self.exp = exp + 1
+          rsh_vu(mt, mt, 1)
+          mt[n - 1] |= MSB
+        }
+      }
+    }
+    mt[0] &= ^(lsb - 1)
+    self.mant = mt
+  }
+
+  def set_bits64!(n: Bool, x: U64) -> Float {
+    self.prec_ = 64 if prec_ == 0
+    self.acc_ = Accuracy.Exact
+    self.neg = n
+    if x == 0 {
+      self.form = FORM_ZERO
+      return self
+    }
+    self.form = FORM_FINITE
+    s = nlz(x)
+    self.mant = nat_set_u64(x << s)
+    self.exp = (64 - s).as_i32
+    self.round!(0) if prec_ < 64
+    self
+  }
+
+  # Sets z to x (with precision 64 if z's is 0), rounded.
+  pub def set_uint64!(x: U64) -> Float { self.set_bits64!(false, x) }
+
+  # Sets z to x (with precision 64 if z's is 0), rounded.
+  pub def set_int64!(x: I64) -> Float {
+    u = x.as_u64
+    u = 0 - u if x < 0
+    self.set_bits64!(x < 0, u)
+  }
+
+  # Sets z to x (with precision 53 if z's is 0), rounded. Panics for NaN.
+  pub def set_float64!(x: F64) -> Float {
+    self.prec_ = 53 if prec_ == 0
+    panic("Float.SetFloat64(NaN)") if math.is_nan(x)
+    self.acc_ = Accuracy.Exact
+    self.neg = math.signbit(x)
+    if x == 0.0 {
+      self.form = FORM_ZERO
+      return self
+    }
+    if math.is_inf(x, 0) {
+      self.form = FORM_INF
+      return self
+    }
+    self.form = FORM_FINITE
+    fmant, e = math.frexp(x)
+    self.mant = nat_set_u64(MSB | (math.float64bits(fmant) << 11))
+    self.exp = e.as_i32
+    self.round!(0) if prec_ < 53
+    self
+  }
+
+  # Sets z to x (with precision max(bit length, 64) if z's is 0), rounded.
+  pub def set_int!(x: Int) -> Float {
+    bits = nat_bit_len(x.abs)
+    if prec_ == 0 {
+      self.prec_ = imax(bits, 64).as_u32
+    }
+    self.acc_ = Accuracy.Exact
+    self.neg = x.neg
+    if x.abs.size == 0 {
+      self.form = FORM_ZERO
+      return self
+    }
+    m = nat_set(x.abs)
+    fnorm(m)
+    self.mant = m
+    self.set_exp_and_round!(bits, 0)
+    self
+  }
+
+  # Sets z to the nearest value to x (precision: the larger of a's and
+  # b's if z's is 0).
+  pub def set_rat!(x: Rat) -> Float {
+    return self.set_int!(x.num) if x.int?
+    fa = Float.new
+    fa.set_int!(x.num)
+    fb = Float.new
+    fb.set_int!(x.denom)
+    if prec_ == 0 {
+      self.prec_ = fa.prec_.to_i64.as_u32 if fa.prec_ >= fb.prec_
+      self.prec_ = fb.prec_.to_i64.as_u32 if fb.prec_ > fa.prec_
+    }
+    self.quo!(fa, fb)
+  }
+
+  # Sets z to +Inf (signbit false) or -Inf.
+  pub def set_inf!(signbit: Bool) -> Float {
+    self.acc_ = Accuracy.Exact
+    self.form = FORM_INF
+    self.neg = signbit
+    self
+  }
+
+  # Sets z to x rounded to z's precision (x's if z's is 0).
+  pub def set!(x: Float) -> Float {
+    self.acc_ = Accuracy.Exact
+    self.form = x.form
+    self.neg = x.neg
+    if x.form == FORM_FINITE {
+      self.exp = x.exp
+      self.mant = x.mant
+    }
+    if prec_ == 0 {
+      self.prec_ = x.prec_
+    } elsif prec_ < x.prec_ {
+      self.round!(0)
+    }
+    self
+  }
+
+  # Sets z to x exactly, with x's precision, mode and accuracy.
+  pub def copy!(x: Float) -> Float {
+    self.prec_ = x.prec_
+    self.mode_ = x.mode_
+    self.acc_ = x.acc_
+    self.form = x.form
+    self.neg = x.neg
+    if form == FORM_FINITE {
+      self.mant = x.mant
+      self.exp = x.exp
+    }
+    self
+  }
+
+  # x as a U64 truncated toward zero, and the accuracy (0 for negative x,
+  # the largest U64 for too-large x).
+  pub def uint64 -> (U64, Accuracy) {
+    if form == FORM_FINITE {
+      return (0, Accuracy.Above) if neg
+      return (0, Accuracy.Below) if exp <= 0
+      if exp <= 64 {
+        u = msb64(mant) >> (64 - exp.to_i64)
+        return (u, Accuracy.Exact) if self.min_prec <= 64
+        return (u, Accuracy.Below)
+      }
+      return (MASK, Accuracy.Below)
+    }
+    return (0, Accuracy.Exact) if form == FORM_ZERO
+    return (0, Accuracy.Above) if neg
+    (MASK, Accuracy.Below)
+  }
+
+  # x as an I64 truncated toward zero, and the accuracy (the I64 limits for
+  # out-of-range x).
+  pub def int64 -> (I64, Accuracy) {
+    if form == FORM_FINITE {
+      acc0 = make_acc(neg)
+      return (0, acc0) if exp <= 0
+      if exp <= 63 {
+        i = (msb64(mant) >> (64 - exp.to_i64)).as_i64
+        i = 0 - i if neg
+        return (i, Accuracy.Exact) if self.min_prec <= exp.to_i64
+        return (i, acc0)
+      }
+      if neg {
+        acc1 = acc0
+        acc1 = Accuracy.Exact if exp == 64 && self.min_prec == 1
+        return (-9223372036854775808, acc1)
+      }
+      return (9223372036854775807, Accuracy.Below)
+    }
+    return (0, Accuracy.Exact) if form == FORM_ZERO
+    return (-9223372036854775808, Accuracy.Above) if neg
+    (9223372036854775807, Accuracy.Below)
+  }
+
+  # The float32 nearest to x (as an F64; Go's Float32) and its accuracy.
+  pub def float32 -> (F64, Accuracy) { self.to_ieee(32, 23) }
+
+  # The F64 nearest to x and its accuracy.
+  pub def float64 -> (F64, Accuracy) { self.to_ieee(64, 52) }
+
+  # Go's Float32/Float64 for fbits 32 or 64 (mbits mantissa bits).
+  def to_ieee(fbits: I64, mbits: I64) -> (F64, Accuracy) {
+    ebits = fbits - mbits - 1
+    bias = (1 << (ebits - 1)) - 1
+    emin = 1 - bias
+    emax = bias
+    smallest = 4.9406564584124654e-324
+    smallest = 1.401298464324817e-45 if fbits == 32
+    if form == FORM_FINITE {
+      e = exp.to_i64 - 1
+      p = mbits + 1
+      if e < emin {
+        p = mbits + 1 - emin + e
+        if p < 0 || (p == 0 && nat_sticky(mant, mant.size * W - 1) == 0) {
+          return (neg_zero, Accuracy.Above) if neg
+          return (0.0, Accuracy.Below)
+        }
+        if p == 0 {
+          return (0.0 - smallest, Accuracy.Below) if neg
+          return (smallest, Accuracy.Above)
+        }
+      }
+      r = Float.new
+      r.prec_ = p.as_u32
+      r.set!(self)
+      e = r.exp.to_i64 - 1
+      if r.form == FORM_INF || e > emax {
+        return (math.inf(-1), Accuracy.Below) if neg
+        return (math.inf(1), Accuracy.Above)
+      }
+      sign: U64 = 0
+      bexp: U64 = 0
+      m: U64 = 0
+      sign = ONE << (fbits - 1) if neg
+      top = msb64(r.mant)
+      if fbits == 32 {
+        top = top >> 32
+      }
+      if e < emin {
+        p = mbits + 1 - emin + e
+        m = top >> (fbits - p)
+      } else {
+        bexp = (e + bias).as_u64 << mbits
+        m = (top >> ebits) & ((ONE << mbits) - 1)
+      }
+      bits = sign | bexp | m
+      if fbits == 32 {
+        return (float32_from_bits(bits), r.acc_)
+      }
+      return (math.float64frombits(bits), r.acc_)
+    }
+    if form == FORM_ZERO {
+      return (neg_zero, Accuracy.Exact) if neg
+      return (0.0, Accuracy.Exact)
+    }
+    return (math.inf(-1), Accuracy.Exact) if neg
+    (math.inf(1), Accuracy.Exact)
+  }
+
+  # x truncated toward zero as an Int, and the accuracy; none for ±Inf.
+  pub def int -> (Int?, Accuracy) {
+    if form == FORM_FINITE {
+      acc0 = make_acc(neg)
+      return (Int.new, acc0) if exp <= 0
+      all_bits = mant.size * W
+      e = exp.to_i64
+      acc0 = Accuracy.Exact if self.min_prec <= e
+      z = Int.new
+      z.neg = neg
+      if e > all_bits {
+        z.abs = nat_lsh(mant, e - all_bits)
+      } elsif e < all_bits {
+        z.abs = nat_rsh(mant, all_bits - e)
+      } else {
+        z.abs = nat_set(mant)
+      }
+      return (z, acc0)
+    }
+    return (Int.new, Accuracy.Exact) if form == FORM_ZERO
+    (none, make_acc(neg))
+  }
+
+  # x as an exact Rat; none for ±Inf.
+  pub def rat -> (Rat?, Accuracy) {
+    if form == FORM_FINITE {
+      all_bits = mant.size * W
+      e = exp.to_i64
+      z = Rat.new
+      if e > all_bits {
+        z.a = Int.new(abs: nat_lsh(mant, e - all_bits), neg: neg)
+        z.b = Int.new
+      } elsif e < all_bits {
+        z.a = Int.new(abs: nat_set(mant), neg: neg)
+        z.b = Int.new(abs: nat_lsh(nat_one, all_bits - e))
+        z.norm!
+      } else {
+        z.a = Int.new(abs: nat_set(mant), neg: neg)
+        z.b = Int.new
+      }
+      return (z, Accuracy.Exact)
+    }
+    if form == FORM_ZERO {
+      z = Rat.new
+      return (z.set_int64!(0), Accuracy.Exact)
+    }
+    (none, make_acc(neg))
+  }
+
+  # Sets z to |x| (rounded to z's precision).
+  pub def abs!(x: Float) -> Float {
+    self.set!(x)
+    self.neg = false
+    self
+  }
+
+  # Sets z to -x (rounded to z's precision).
+  pub def neg!(x: Float) -> Float {
+    self.set!(x)
+    self.neg = !neg
+    self
+  }
+
+  # z = |x| + |y| (both finite), rounded.
+  def uadd!(x: Float, y: Float) -> Unit {
+    ex = x.exp.to_i64 - x.mant.size * W
+    ey = y.exp.to_i64 - y.mant.size * W
+    if ex < ey {
+      t = nat_lsh(y.mant, ey - ex)
+      self.mant = nat_add(x.mant, t)
+    } elsif ex > ey {
+      t = nat_lsh(x.mant, ex - ey)
+      self.mant = nat_add(t, y.mant)
+      ex = ey
+    } else {
+      self.mant = nat_add(x.mant, y.mant)
+    }
+    s = fnorm(mant)
+    self.set_exp_and_round!(ex + mant.size * W - s, 0)
+  }
+
+  # z = |x| - |y| (both finite, |x| > |y|), rounded.
+  def usub!(x: Float, y: Float) -> Unit {
+    ex = x.exp.to_i64 - x.mant.size * W
+    ey = y.exp.to_i64 - y.mant.size * W
+    if ex < ey {
+      t = nat_lsh(y.mant, ey - ex)
+      self.mant = nat_sub(x.mant, t)
+    } elsif ex > ey {
+      t = nat_lsh(x.mant, ex - ey)
+      self.mant = nat_sub(t, y.mant)
+      ex = ey
+    } else {
+      self.mant = nat_sub(x.mant, y.mant)
+    }
+    if mant.size == 0 {
+      self.acc_ = Accuracy.Exact
+      self.form = FORM_ZERO
+      self.neg = false
+      return
+    }
+    s = fnorm(mant)
+    self.set_exp_and_round!(ex + mant.size * W - s, 0)
+  }
+
+  # z = |x| * |y| (both finite), rounded.
+  def umul!(x: Float, y: Float) -> Unit {
+    e = x.exp.to_i64 + y.exp.to_i64
+    self.mant = nat_mul(x.mant, y.mant)
+    s = fnorm(mant)
+    self.set_exp_and_round!(e - s, 0)
+  }
+
+  # z = |x| / |y| (both finite), rounded.
+  def uquo!(x: Float, y: Float) -> Unit {
+    n = prec_.to_i64 / W + 1
+    xadj = x.mant
+    d0 = n - x.mant.size + y.mant.size
+    if d0 > 0 {
+      xadj = nat_make(x.mant.size + d0)
+      copy(xadj[d0...xadj.size], x.mant)
+    }
+    d = xadj.size - y.mant.size
+    q, r = nat_div(xadj, y.mant)
+    self.mant = q
+    e = x.exp.to_i64 - y.exp.to_i64 - (d - q.size) * W
+    sbit: U64 = 0
+    sbit = 1 if r.size > 0
+    s = fnorm(mant)
+    self.set_exp_and_round!(e - s, sbit)
+  }
+
+  # Compares |x| and |y| (both finite).
+  def ucmp(y: Float) -> I64 {
+    return -1 if exp < y.exp
+    return 1 if exp > y.exp
+    i = mant.size
+    j = y.mant.size
+    while i > 0 || j > 0 {
+      xm: U64 = 0
+      ym: U64 = 0
+      if i > 0 {
+        i -= 1
+        xm = mant[i]
+      }
+      if j > 0 {
+        j -= 1
+        ym = y.mant[j]
+      }
+      return -1 if xm < ym
+      return 1 if xm > ym
+    }
+    0
+  }
+
+  # Sets z to x + y rounded (precision: the larger of x's and y's if z's
+  # is 0). Panics for +Inf + -Inf.
+  pub def add!(x: Float, y: Float) -> Float {
+    self.prec_ = max_u32(x.prec_, y.prec_) if prec_ == 0
+    if x.form == FORM_FINITE && y.form == FORM_FINITE {
+      yneg = y.neg
+      self.neg = x.neg
+      if x.neg == yneg {
+        self.uadd!(x, y)
+      } elsif x.ucmp(y) > 0 {
+        self.usub!(x, y)
+      } else {
+        self.neg = !neg
+        self.usub!(y, x)
+      }
+      self.neg = true if form == FORM_ZERO && mode_ == RoundingMode.ToNegativeInf && acc_ == Accuracy.Exact
+      return self
+    }
+    if x.form == FORM_INF && y.form == FORM_INF && x.neg != y.neg {
+      self.acc_ = Accuracy.Exact
+      self.form = FORM_ZERO
+      self.neg = false
+      panic("addition of infinities with opposite signs")
+    }
+    if x.form == FORM_ZERO && y.form == FORM_ZERO {
+      self.acc_ = Accuracy.Exact
+      self.form = FORM_ZERO
+      self.neg = x.neg && y.neg
+      return self
+    }
+    return self.set!(x) if x.form == FORM_INF || y.form == FORM_ZERO
+    self.set!(y)
+  }
+
+  # Sets z to x - y rounded. Panics for Inf - Inf of the same sign.
+  pub def sub!(x: Float, y: Float) -> Float {
+    self.prec_ = max_u32(x.prec_, y.prec_) if prec_ == 0
+    if x.form == FORM_FINITE && y.form == FORM_FINITE {
+      yneg = y.neg
+      self.neg = x.neg
+      if x.neg != yneg {
+        self.uadd!(x, y)
+      } elsif x.ucmp(y) > 0 {
+        self.usub!(x, y)
+      } else {
+        self.neg = !neg
+        self.usub!(y, x)
+      }
+      self.neg = true if form == FORM_ZERO && mode_ == RoundingMode.ToNegativeInf && acc_ == Accuracy.Exact
+      return self
+    }
+    if x.form == FORM_INF && y.form == FORM_INF && x.neg == y.neg {
+      self.acc_ = Accuracy.Exact
+      self.form = FORM_ZERO
+      self.neg = false
+      panic("subtraction of infinities with equal signs")
+    }
+    if x.form == FORM_ZERO && y.form == FORM_ZERO {
+      self.acc_ = Accuracy.Exact
+      self.form = FORM_ZERO
+      self.neg = x.neg && !y.neg
+      return self
+    }
+    return self.set!(x) if x.form == FORM_INF || y.form == FORM_ZERO
+    self.neg!(y)
+  }
+
+  # Sets z to x * y rounded. Panics for 0 * Inf.
+  pub def mul!(x: Float, y: Float) -> Float {
+    self.prec_ = max_u32(x.prec_, y.prec_) if prec_ == 0
+    self.neg = x.neg != y.neg
+    if x.form == FORM_FINITE && y.form == FORM_FINITE {
+      self.umul!(x, y)
+      return self
+    }
+    self.acc_ = Accuracy.Exact
+    if (x.form == FORM_ZERO && y.form == FORM_INF) || (x.form == FORM_INF && y.form == FORM_ZERO) {
+      self.form = FORM_ZERO
+      self.neg = false
+      panic("multiplication of zero with infinity")
+    }
+    if x.form == FORM_INF || y.form == FORM_INF {
+      self.form = FORM_INF
+      return self
+    }
+    self.form = FORM_ZERO
+    self
+  }
+
+  # Sets z to x / y rounded. Panics for 0/0 and Inf/Inf.
+  pub def quo!(x: Float, y: Float) -> Float {
+    self.prec_ = max_u32(x.prec_, y.prec_) if prec_ == 0
+    self.neg = x.neg != y.neg
+    if x.form == FORM_FINITE && y.form == FORM_FINITE {
+      self.uquo!(x, y)
+      return self
+    }
+    self.acc_ = Accuracy.Exact
+    if (x.form == FORM_ZERO && y.form == FORM_ZERO) || (x.form == FORM_INF && y.form == FORM_INF) {
+      self.form = FORM_ZERO
+      self.neg = false
+      panic("division of zero by zero or infinity by infinity")
+    }
+    if x.form == FORM_ZERO || y.form == FORM_INF {
+      self.form = FORM_ZERO
+      return self
+    }
+    self.form = FORM_INF
+    self
+  }
+
+  # -1, 0 or +1 as x < y, x == y (also -0 == +0, Inf == Inf) or x > y.
+  pub def cmp(y: Float) -> I64 {
+    mx = self.ord
+    my = y.ord
+    return -1 if mx < my
+    return 1 if mx > my
+    return y.ucmp(self) if mx == -1
+    return self.ucmp(y) if mx == 1
+    0
+  }
+
+  # -2, -1, 0, +1, +2 for -Inf, negative, zero, positive, +Inf.
+  def ord -> I64 {
+    m = 0
+    if form == FORM_FINITE {
+      m = 1
+    } elsif form == FORM_ZERO {
+      return 0
+    } else {
+      m = 2
+    }
+    return 0 - m if neg
+    m
+  }
+
+  # Sets z to the number in s (any form parse! accepts, base 0); none if
+  # s isn't one (z unchanged).
+  pub def set_string!(s: Str) -> Float? {
+    if v = float_parse(self, s, 0).ok {
+      self.copy!(v[0])
+      return self
+    }
+    none
+  }
+
+  # Go's Parse: sets z to the number in s, rounded to z's precision (64 if
+  # 0) and mode: an optional sign, a mantissa in base (0: prefixes 0b, 0o,
+  # 0x and `_` separators; 2, 8, 10 or 16) with an optional '.', an
+  # optional exponent ('e'/'E' decimal, 'p'/'P' binary), or "Inf"/"inf".
+  # Returns (z, the base found).
+  pub def parse!(s: Str, base: I64) -> ~(Float, I64)<BigError> {
+    f, b = ~float_parse(self, s, base)
+    self.copy!(f)
+    (self, b)
+  }
+
+  # Go's Float.Scan: skips white space, then reads a number (base 0) from r.
+  pub def scan!(r: ByteReader, verb: Str) -> ~Float<BigError> {
+    _v = verb
+    skip_space(r)
+    f, _b = ~float_scan(self, r, 0)
+    self.copy!(f)
+  }
+
+  # x formatted per format ("e", "E", "f", "g", "G", "b", "p", "x") with
+  # prec digits (Go's Text; prec < 0: the fewest digits that read back
+  # exactly at x's precision).
+  pub def text(format: Str, prec: I64) -> Str { Str.from_bytes(float_append(self, [], format[0], prec)) }
+
+  # buf with x.text(format, prec) appended.
+  pub def append(buf: [Byte], format: Str, prec: I64) -> [Byte] { float_append(self, buf, format[0], prec) }
+
+  # x.text("g", 10) (Go's String).
+  pub def to_s -> Str { self.text("g", 10) }
+
+  # x formatted by the first verb of f (Go's fmt.Sprintf(f, x) through
+  # Float.Format): %e %E %f %F %g %G %v %b %p %x with flags + - 0 and
+  # space, a width and a precision; text around the verb is kept.
+  pub def format(f: Str) -> Str {
+    if p = parse_fmt(f) {
+      return p[0] + float_format(self, p[1]) + p[2]
+    }
+    f
+  }
+
+  # Go's GobEncode.
+  pub def gob_encode -> [Byte] {
+    sz = 1 + 1 + 4
+    n = 0
+    if form == FORM_FINITE {
+      n = (prec_.to_i64 + (W - 1)) / W
+      n = mant.size if mant.size < n
+      sz += 4 + n * S
+    }
+    buf: [Byte] = [0; sz]
+    buf[0] = FLOAT_GOB_VERSION
+    b = ((mode_.to_i & 7) << 5) | (((acc_.to_i + 1) & 3) << 3) | ((form & 3) << 1)
+    b |= 1 if neg
+    buf[1] = b.as_u8
+    put_be32(buf, 2, prec_.to_u64)
+    if form == FORM_FINITE {
+      put_be32(buf, 6, exp.as_u32.to_u64)
+      nat_bytes(mant[mant.size - n...mant.size], buf[10...buf.size])
+    }
+    buf
+  }
+
+  # Go's GobDecode: an empty buf is +0; a set precision is kept.
+  pub def gob_decode!(buf: [Byte]) -> ~Float<BigError> {
+    if buf.size == 0 {
+      self.prec_ = 0
+      self.mode_ = RoundingMode.ToNearestEven
+      self.acc_ = Accuracy.Exact
+      self.form = FORM_ZERO
+      self.neg = false
+      self.mant = nat_zero
+      self.exp = 0
+      return self
+    }
+    fail BigError.Msg("Float.GobDecode: buffer too small") if buf.size < 6
+    if buf[0] != FLOAT_GOB_VERSION {
+      fail BigError.Msg("Float.GobDecode: encoding version #{buf[0]} not supported")
+    }
+    old_prec = prec_
+    old_mode = mode_
+    b = buf[1]
+    self.mode_ = RoundingMode.from_i(((b >> 5) & 7).to_i64)
+    self.acc_ = Accuracy.from_i(((b >> 3) & 3).to_i64 - 1)
+    self.form = ((b >> 1) & 3).to_i64
+    self.neg = b & 1 != 0
+    self.prec_ = get_be32(buf, 2).as_u32
+    if form == FORM_FINITE {
+      fail BigError.Msg("Float.GobDecode: buffer too small for finite form float") if buf.size < 10
+      self.exp = get_be32(buf, 6).as_u32.as_i32
+      self.mant = nat_set_bytes(buf[10...buf.size])
+    }
+    if old_prec != 0 {
+      self.mode_ = old_mode
+      self.set_prec!(old_prec.to_i64)
+    }
+    msg = self.validate0
+    fail BigError.Msg("Float.GobDecode: " + msg) if msg != ""
+    self
+  }
+
+  # "" if x is well-formed, else what's wrong.
+  def validate0 -> Str {
+    return "" if form != FORM_FINITE
+    m = mant.size
+    return "nonzero finite number with empty mantissa" if m == 0
+    if mant[m - 1] & MSB == 0 {
+      return "msb not set in last word " + format_hex(mant[m - 1]) + " of " + self.text("p", 0)
+    }
+    return "zero precision finite number" if prec_ == 0
+    ""
+  }
+
+  # b with x.text("g", -1) appended (Go's AppendText).
+  pub def append_text(b: [Byte]) -> [Byte] { float_append(self, b, 103, -1) }
+
+  # x.text("g", -1) as bytes (Go's MarshalText).
+  pub def marshal_text -> [Byte] { self.append_text([]) }
+
+  # encoding/json's protocol (a JSON string of the text form, as Go's
+  # json package does through MarshalText / UnmarshalText).
+  pub def json_str(e: json.Encoder) -> Str { e.q(Str.from_bytes(self.marshal_text)) }
+
+  pub def json_enc(e: json.Encoder) -> Unit {
+    ee = e
+    ee.str!(Str.from_bytes(self.marshal_text))
+  }
+
+  pub def self.json_zero -> Float { Float.new }
+
+  pub def self.json_dec(d: json.Decoder) -> Float {
+    dd = d
+    if s = json_text_value(dd, "Float") {
+      z = Float.new
+      r = z.unmarshal_text!(s.bytes)
+      if e = r.err {
+        dd.fail!(json.JsonError.Syntax(msg: e.message, offset: dd.pos))
+      } else {
+        return r.unwrap
+      }
+    }
+    Float.new
+  }
+
+  # Sets z from text as parse!(text, 0) does.
+  pub def unmarshal_text!(text: [Byte]) -> ~Float<BigError> {
+    s = Str.from_bytes(text)
+    r = float_parse(self, s, 0)
+    if e = r.err {
+      fail BigError.Msg("math/big: cannot unmarshal #{quote_str(s)} into a *big.Float (#{e.message})")
+    }
+    self.copy!(r.unwrap[0])
+  }
+
+  # Sets z to the square root of x, rounded (precision: x's if z's is 0).
+  # Panics for x < 0.
+  pub def sqrt!(x: Float) -> Float {
+    self.prec_ = x.prec_ if prec_ == 0
+    panic("square root of negative operand") if x.sign == -1
+    if x.form != FORM_FINITE {
+      self.acc_ = Accuracy.Exact
+      self.form = x.form
+      self.neg = x.neg
+      return self
+    }
+    p = prec_
+    m, b = x.mant_exp
+    z = m
+    z.prec_ = p
+    bm = b % 2
+    if bm == 1 {
+      z.exp = z.exp + 1
+    } elsif bm == -1 {
+      z.exp = z.exp - 1
+    }
+    z = sqrt_inverse(z)
+    r = Float.new
+    r.copy!(z)
+    r.set_mant_exp!(z, b / 2)
+    self.copy!(r)
+  }
+}
+
+# A new Float set to x with precision 53. Panics for NaN.
+pub def new_float(x: F64) -> Float {
+  panic("NewFloat(NaN)") if math.is_nan(x)
+  z = Float.new
+  z.set_float64!(x)
+}
+
+def max_u32(a: U32, b: U32) -> U32 {
+  return a if a > b
+  b
+}
+
+# -0.0
+def neg_zero -> F64 { math.copysign(0.0, -1.0) }
+
+# The float32 with the given bits, as an F64.
+def float32_from_bits(b: U64) -> F64 {
+  sign = (b >> 31) & 1
+  e = ((b >> 23) & 255).to_i64
+  m = b & 0x7fffff
+  v = 0.0
+  if e == 255 {
+    v = math.inf(1)
+  } elsif e == 0 {
+    v = math.ldexp(m.to_i64.to_f, -149)
+  } else {
+    v = math.ldexp((m | 0x800000).to_i64.to_f, e - 150)
+  }
+  return 0.0 - v if sign == 1 && v != 0.0
+  return neg_zero if sign == 1
+  v
+}
+
+# Shifts m left so its top bit is set (in place); returns the shift.
+def fnorm(m: [U64]) -> I64 {
+  s = nlz(m[m.size - 1])
+  if s > 0 {
+    c = lsh_vu(m, m, s)
+    panic("nlz or lshVU incorrect") if c != 0
+  }
+  s
+}
+
+# The top 64 bits of the normalized x.
+def msb64(x: [U64]) -> U64 {
+  return 0 if x.size == 0
+  x[x.size - 1]
+}
+
+# x * (1/sqrt(x)) by Newton's iteration on the inverse square root.
+def sqrt_inverse(x: Float) -> Float {
+  p = x.prec_
+  three = new_float(3.0)
+  xf, _a = x.float64
+  sqi = Float.new
+  # (Go's newFloat leaves the precision 0: the seed has float64 precision)
+  sqi.set_float64!(1.0 / math.sqrt(xf))
+  target = p.to_i64 + 32
+  while sqi.prec_.to_i64 < target {
+    sqi.prec_ = sqi.prec_ * 2
+    # t = t(3 - x t^2) / 2
+    u = Float.new
+    u.prec_ = sqi.prec_
+    v = Float.new
+    v.prec_ = sqi.prec_
+    u.mul!(sqi, sqi)
+    u.mul!(x, u)
+    v.sub!(three, u)
+    u.mul!(sqi, v)
+    u.exp = u.exp - 1
+    sqi.set!(u)
+  }
+  z = Float.new
+  z.prec_ = p
+  z.mode_ = x.mode_
+  z.mul!(x, sqi)
+}

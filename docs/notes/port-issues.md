@@ -22,3 +22,17 @@ Open problems agents reported; each gets fixed in a compiler round between waves
 | 16 | hash | maphash's `getentropy` FFI on wasm | by design: the browser provides only the time/sleep externs and refuses programs calling other FFI with an error |
 | 17 | (main) | an array literal `[128, 65]` doesn't adapt to a `[Byte]` parameter (`Str.from_bytes([128, 65])`); a typed local works | fixed: array literals coerce element-wise; C declares array types used only by literals |
 | 18 | (main) | a keyword (`next`) can't name a struct field or a named argument | fixed: keywords name fields (`next: T`, `N.new(next: x)`, `self.next`); fmt treats `.kw` as a value |
+| 19 | regexp | `p.push!(p.new_regexp!(op))` lost the argument's effect on the receiver (index out of bounds) | fixed: `!` call arguments are evaluated before the receiver is read |
+| 20 | regexp | `.err` on a `~T<ParseError>` is an open `Error`: fields only via `case e { Syntax(code, expr) => }` | open (design) |
+| 21 | regexp | `syntax.OP_ANY_CHAR` in a case arm parsed as a qualified variant (after #3) | fixed: a prefix without a type part is a value |
+| 22 | crypto | `hs[i]()` (calling an indexed function value) doesn't parse | open |
+| 23 | crypto | `case` arms aren't converted to a wanted interface type | open |
+| 24 | crypto | `"#{e}"` can't interpolate a plain enum value | open |
+| 25 | crypto | `[0xee.as_u8, 1, 1]`: later elements don't take U8 from the first | open |
+| 26 | crypto | a `[T; N]` local is heap-allocated, not a stack array | open (perf) |
+| 27 | crypto | HMAC can't ask a generic `H` whether it's marshalable, so no saved keyed state: PBKDF2 3.8x Go | open (perf) |
+| 28 | math/big | no add-with-carry: big Mul/String ~2x Go | open (perf) |
+| 29 | math/big | tuple-returning functions get region mark/reset even when they don't allocate (`bits.add64` slow in loops) | open (perf) |
+| 30 | math/big | no mutable package globals (caches like Go's divisor table) | open (design) |
+| 31 | math/big | `format` has no `%g` | open |
+| 32 | math/big | a main file can't declare its own `Int`/`Float` (only packages can) | open (by design for now) |

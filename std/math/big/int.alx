@@ -1,0 +1,1085 @@
+#![overflow(wrap)]
+import "encoding/json"
+
+# Signed multi-precision integers (Go's int.go). See big.alx for the API
+# overview and the differences from Go.
+
+# An arbitrary-precision signed integer. The zero value (`Int.new`) is 0.
+# Methods ending in `!` set the receiver (Go's `z.Op(x, y)`) and return
+# its new value.
+pub struct Int {
+  neg: Bool
+  abs: [U64]
+
+  # -1, 0 or +1 as x < 0, x == 0 or x > 0.
+  pub def sign -> I64 {
+    return 0 if abs.size == 0
+    return -1 if neg
+    1
+  }
+
+  # Sets z to x.
+  pub def set_int64!(x: I64) -> Int {
+    u = x.as_u64
+    u = 0 - u if x < 0
+    self.abs = nat_set_u64(u)
+    self.neg = x < 0
+    self
+  }
+
+  # Sets z to x.
+  pub def set_uint64!(x: U64) -> Int {
+    self.abs = nat_set_u64(x)
+    self.neg = false
+    self
+  }
+
+  # Sets z to x.
+  pub def set!(x: Int) -> Int {
+    self.abs = x.abs
+    self.neg = x.neg
+    self
+  }
+
+  # The absolute value as little-endian words (a copy; Go shares it).
+  pub def bits -> [U64] { nat_set(abs) }
+
+  # Sets z to the value of the little-endian words in abs (copied).
+  pub def set_bits!(a: [U64]) -> Int {
+    self.abs = nat_norm(nat_set(a))
+    self.neg = false
+    self
+  }
+
+  # Sets z to |x|.
+  pub def abs!(x: Int) -> Int {
+    self.abs = x.abs
+    self.neg = false
+    self
+  }
+
+  # Sets z to -x.
+  pub def neg!(x: Int) -> Int {
+    self.abs = x.abs
+    self.neg = x.abs.size > 0 && !x.neg
+    self
+  }
+
+  # Sets z to x + y.
+  pub def add!(x: Int, y: Int) -> Int {
+    n = x.neg
+    if x.neg == y.neg {
+      self.abs = nat_add(x.abs, y.abs)
+    } elsif nat_cmp(x.abs, y.abs) >= 0 {
+      self.abs = nat_sub(x.abs, y.abs)
+    } else {
+      n = !n
+      self.abs = nat_sub(y.abs, x.abs)
+    }
+    self.neg = abs.size > 0 && n
+    self
+  }
+
+  # Sets z to x - y.
+  pub def sub!(x: Int, y: Int) -> Int {
+    n = x.neg
+    if x.neg != y.neg {
+      self.abs = nat_add(x.abs, y.abs)
+    } elsif nat_cmp(x.abs, y.abs) >= 0 {
+      self.abs = nat_sub(x.abs, y.abs)
+    } else {
+      n = !n
+      self.abs = nat_sub(y.abs, x.abs)
+    }
+    self.neg = abs.size > 0 && n
+    self
+  }
+
+  # Sets z to x * y.
+  pub def mul!(x: Int, y: Int) -> Int {
+    self.abs = nat_mul(x.abs, y.abs)
+    self.neg = abs.size > 0 && x.neg != y.neg
+    self
+  }
+
+  # Sets z to x * x (Go's Mul with x == y uses squaring).
+  pub def sqr!(x: Int) -> Int {
+    self.abs = nat_sqr(x.abs)
+    self.neg = false
+    self
+  }
+
+  # Sets z to the product of all integers in [a, b] (1 if a > b).
+  pub def mul_range!(a0: I64, b0: I64) -> Int {
+    return self.set_int64!(1) if a0 > b0
+    return self.set_int64!(0) if a0 <= 0 && b0 >= 0
+    a = a0
+    b = b0
+    n = false
+    if a < 0 {
+      n = (b - a) & 1 == 0
+      t = a
+      a = 0 - b
+      b = 0 - t
+    }
+    self.abs = nat_mul_range(a.as_u64, b.as_u64)
+    self.neg = n
+    self
+  }
+
+  # Sets z to the binomial coefficient C(n, k).
+  pub def binomial!(n: I64, k0: I64) -> Int {
+    return self.set_int64!(0) if k0 > n || k0 < 0
+    k = k0
+    k = n - k if k > n - k
+    nn = new_int(n)
+    kk = new_int(k)
+    i = Int.new
+    t = Int.new
+    one = new_int(1)
+    z = new_int(1)
+    while i.cmp(kk) < 0 {
+      t.sub!(nn, i)
+      z.mul!(z, t)
+      i.add!(i, one)
+      z.quo!(z, i)
+    }
+    self.set!(z)
+  }
+
+  # Sets z to x / y truncated toward zero (Go's /). Panics for y == 0.
+  pub def quo!(x: Int, y: Int) -> Int {
+    q, _r = nat_div(x.abs, y.abs)
+    self.abs = q
+    self.neg = q.size > 0 && x.neg != y.neg
+    self
+  }
+
+  # Sets z to x % y with the sign of x (Go's %). Panics for y == 0.
+  pub def rem!(x: Int, y: Int) -> Int {
+    _q, r = nat_div(x.abs, y.abs)
+    self.abs = r
+    self.neg = r.size > 0 && x.neg
+    self
+  }
+
+  # Sets z to x / y (truncated) and returns (z, the remainder x - y*z).
+  # Go's QuoRem(x, y, r) writes the remainder into r.
+  pub def quo_rem!(x: Int, y: Int) -> (Int, Int) {
+    q, r = nat_div(x.abs, y.abs)
+    self.abs = q
+    self.neg = q.size > 0 && x.neg != y.neg
+    (self, Int.new(abs: r, neg: r.size > 0 && x.neg))
+  }
+
+  # Sets z to the Euclidean quotient x div y. Panics for y == 0.
+  pub def div!(x: Int, y: Int) -> Int {
+    yneg = y.neg
+    q, r = Int.new.quo_rem_(x, y)
+    if r.neg {
+      if yneg {
+        q.add!(q, new_int(1))
+      } else {
+        q.sub!(q, new_int(1))
+      }
+    }
+    self.set!(q)
+  }
+
+  # Sets z to the Euclidean modulus x mod y (0 <= z < |y|).
+  pub def mod!(x: Int, y: Int) -> Int {
+    _q, r = Int.new.quo_rem_(x, y)
+    if r.neg {
+      if y.neg {
+        r.sub!(r, y)
+      } else {
+        r.add!(r, y)
+      }
+    }
+    self.set!(r)
+  }
+
+  # Sets z to the Euclidean quotient x div y and returns (z, x mod y).
+  # Go's DivMod(x, y, m) writes the modulus into m.
+  pub def div_mod!(x: Int, y: Int) -> (Int, Int) {
+    q, m = Int.new.quo_rem_(x, y)
+    if m.neg {
+      if y.neg {
+        q.add!(q, new_int(1))
+        m.sub!(m, y)
+      } else {
+        q.sub!(q, new_int(1))
+        m.add!(m, y)
+      }
+    }
+    self.set!(q)
+    (self, m)
+  }
+
+  # The quotient and remainder of x / y (a helper for the division
+  # variants; the receiver is ignored).
+  def quo_rem_(x: Int, y: Int) -> (Int, Int) {
+    q, r = nat_div(x.abs, y.abs)
+    (Int.new(abs: q, neg: q.size > 0 && x.neg != y.neg), Int.new(abs: r, neg: r.size > 0 && x.neg))
+  }
+
+  # Sets z to x / y rounded as `mode` says (TRUNC, FLOOR, ROUND (to
+  # nearest even) or CEIL; Go's Divide) and returns (z, x - y*z).
+  pub def divide!(x: Int, y: Int, mode: RoundingMode) -> (Int, Int) {
+    n = x.neg != y.neg
+    q, r = nat_div(x.abs, y.abs)
+    rneg = false
+    if r.size > 0 {
+      case mode {
+        ToZero => rneg = x.neg
+        ToNegativeInf => {
+          rneg = y.neg
+          if n {
+            q = nat_add(q, nat_one)
+            r = nat_sub(y.abs, r)
+          }
+        }
+        ToPositiveInf => {
+          rneg = !y.neg
+          if !n {
+            q = nat_add(q, nat_one)
+            r = nat_sub(y.abs, r)
+          }
+        }
+        ToNearestEven => {
+          c = nat_cmp(nat_mul(r, nat_two), y.abs)
+          even = q.size == 0 || q[0] & 1 == 0
+          if c < 0 || (c == 0 && even) {
+            rneg = x.neg
+          } else {
+            rneg = !x.neg
+            q = nat_add(q, nat_one)
+            r = nat_sub(y.abs, r)
+          }
+        }
+        _ => panic("unsupported rounding mode")
+      }
+    }
+    self.abs = q
+    self.neg = n && q.size > 0
+    (self, Int.new(abs: r, neg: rneg))
+  }
+
+  # -1, 0 or +1 as x < y, x == y or x > y.
+  pub def cmp(y: Int) -> I64 {
+    if neg == y.neg {
+      r = nat_cmp(abs, y.abs)
+      return 0 - r if neg
+      return r
+    }
+    return -1 if neg
+    1
+  }
+
+  # Compares |x| and |y|.
+  pub def cmp_abs(y: Int) -> I64 { nat_cmp(abs, y.abs) }
+
+  # The low 64 bits of x as an I64 (undefined, as in Go, when x doesn't fit).
+  pub def int64 -> I64 {
+    v = low64(abs).as_i64
+    return 0 - v if neg
+    v
+  }
+
+  # The low 64 bits of |x| (undefined when x doesn't fit).
+  pub def uint64 -> U64 { low64(abs) }
+
+  # Whether x fits in an I64 (Go's IsInt64).
+  pub def int64? -> Bool {
+    if abs.size <= 1 {
+      w = low64(abs).as_i64
+      return w >= 0 || (neg && w == 0 - w)
+    }
+    false
+  }
+
+  # Whether x fits in a U64 (Go's IsUint64).
+  pub def uint64? -> Bool { !neg && abs.size <= 1 }
+
+  # The F64 nearest x, and whether that rounded it (Go's Float64).
+  pub def float64 -> (F64, Accuracy) {
+    n = nat_bit_len(abs)
+    return (0.0, Accuracy.Exact) if n == 0
+    if n <= 53 || (n < 64 && n - nat_trailing_zero_bits(abs) <= 53) {
+      f = u64_to_f(low64(abs))
+      f = 0.0 - f if neg
+      return (f, Accuracy.Exact)
+    }
+    fz = Float.new
+    fz.set_int!(self)
+    fz.float64
+  }
+
+  # Sets z to the number in s in the given base (0: Go's prefixes 0b, 0o,
+  # 0x, 0 and `_` separators; 2..62), optionally signed; none if s isn't
+  # entirely a number (z is then unchanged).
+  pub def set_string!(s: Str, base: I64) -> Int? {
+    r = new_byte_reader(s)
+    if v = int_from_reader(r, base).ok {
+      if r.len == 0 {
+        self.set!(v[0])
+        return self
+      }
+    }
+    none
+  }
+
+  # Sets z to the big-endian unsigned number in buf.
+  pub def set_bytes!(buf: [Byte]) -> Int {
+    self.abs = nat_set_bytes(buf)
+    self.neg = false
+    self
+  }
+
+  # |x| as big-endian bytes.
+  pub def bytes -> [Byte] {
+    buf: [Byte] = [0; abs.size * S]
+    i = nat_bytes(abs, buf)
+    buf[i...buf.size]
+  }
+
+  # Writes |x| into buf as a zero-extended big-endian number and returns
+  # buf. Panics if |x| doesn't fit.
+  pub def fill_bytes(buf: [Byte]) -> [Byte] {
+    for i in 0...buf.size {
+      buf[i] = 0
+    }
+    nat_bytes(abs, buf)
+    buf
+  }
+
+  # The length of |x| in bits (0 for 0).
+  pub def bit_len -> I64 { nat_bit_len(abs) }
+
+  # The number of consecutive least significant zero bits of |x|.
+  pub def trailing_zero_bits -> I64 { nat_trailing_zero_bits(abs) }
+
+  # Sets z to x**y mod |m| (x**y if m is 0; 1 for y <= 0 then). For y < 0
+  # and m != 0, x**y is the modular inverse of x raised to -y; none if
+  # that inverse doesn't exist.
+  pub def exp!(x: Int, y: Int, m: Int) -> Int? { self.exp_!(x, y, m, false) }
+
+  def exp_!(x: Int, y: Int, m: Int, slow: Bool) -> Int? {
+    xw = x.abs
+    if y.neg {
+      return self.set_int64!(1) if m.abs.size == 0
+      inv = Int.new
+      if iv = inv.mod_inverse!(x, m) {
+        xw = iv.abs
+      } else {
+        return none
+      }
+    }
+    yw = y.abs
+    mw = m.abs
+    self.abs = nat_exp_nn(xw, yw, mw, slow)
+    self.neg = abs.size > 0 && x.neg && yw.size > 0 && yw[0] & 1 == 1
+    if neg && mw.size > 0 {
+      self.abs = nat_sub(mw, abs)
+      self.neg = false
+    }
+    self
+  }
+
+  # Sets z to the greatest common divisor of a and b (Go's GCD(nil, nil,
+  # a, b)): 0 if both are 0, |a| if b is 0, |b| if a is 0.
+  pub def gcd!(a: Int, b: Int) -> Int {
+    d, _x, _y = int_gcd(a, b, false)
+    self.set!(d)
+  }
+
+  # Sets z to gcd(a, b) and returns (z, x, y) with z = a*x + b*y (Go's
+  # GCD(x, y, a, b)); for a, b both nonzero, z is positive.
+  pub def gcd_xy!(a: Int, b: Int) -> (Int, Int, Int) {
+    d, x, y = int_gcd(a, b, true)
+    self.set!(d)
+    (self, x, y)
+  }
+
+  # Sets z to a pseudo-random number in [0, n) (0 for n <= 0), reading
+  # 32-bit words from rnd: any value with a `uint32! -> U32` method that
+  # shares its state across copies (Go's *rand.Rand).
+  pub def rand![R](rnd: R, n: Int) -> Int {
+    self.neg = false
+    if n.neg || n.abs.size == 0 {
+      self.abs = nat_zero
+      return self
+    }
+    self.abs = nat_random(rnd, n.abs, nat_bit_len(n.abs))
+    self
+  }
+
+  # Sets z to the multiplicative inverse of g modulo n; none if there is
+  # none (z is then unchanged). n == 0 has none; a negative n means |n|.
+  pub def mod_inverse!(g0: Int, n0: Int) -> Int? {
+    n = n0
+    n = i_neg(n0) if n0.neg
+    g = g0
+    if g0.neg {
+      t = Int.new
+      g = t.mod!(g0, n)
+    }
+    d, x, _y = int_gcd(g, n, true)
+    return none if d.cmp(new_int(1)) != 0
+    if x.neg {
+      self.add!(x, n)
+    } else {
+      self.set!(x)
+    }
+    self
+  }
+
+  # Sets z to a square root of x mod p (p an odd prime); none if x isn't a
+  # square mod p. Results for composite p are undefined.
+  pub def mod_sqrt!(x0: Int, p: Int) -> Int? {
+    j = jacobi(x0, p)
+    return none if j == -1
+    return self.set_int64!(0) if j == 0
+    x = x0
+    if x0.neg || x0.cmp(p) >= 0 {
+      x = i_mod(x0, p)
+    }
+    if p.abs[0] % 4 == 3 {
+      return self.set!(mod_sqrt3_mod4_prime(x, p))
+    }
+    if p.abs[0] % 8 == 5 {
+      return self.set!(mod_sqrt5_mod8_prime(x, p))
+    }
+    self.set!(mod_sqrt_tonelli_shanks(x, p))
+  }
+
+  # Sets z to x << n.
+  pub def lsh!(x: Int, n: I64) -> Int {
+    panic("negative shift amount") if n < 0
+    self.abs = nat_lsh(x.abs, n)
+    self.neg = x.neg
+    self
+  }
+
+  # Sets z to x >> n (an arithmetic shift: rounds toward -infinity).
+  pub def rsh!(x: Int, n: I64) -> Int {
+    panic("negative shift amount") if n < 0
+    if x.neg {
+      t = nat_sub(x.abs, nat_one)
+      t = nat_rsh(t, n)
+      self.abs = nat_add(t, nat_one)
+      self.neg = true
+      return self
+    }
+    self.abs = nat_rsh(x.abs, n)
+    self.neg = false
+    self
+  }
+
+  # Bit i of x in two's complement (0 or 1). Panics for i < 0.
+  pub def bit(i: I64) -> I64 {
+    if i == 0 {
+      return (abs[0] & 1).to_i64 if abs.size > 0
+      return 0
+    }
+    panic("negative bit index") if i < 0
+    if neg {
+      t = nat_sub(abs, nat_one)
+      return (nat_bit(t, i) ^ 1).to_i64
+    }
+    nat_bit(abs, i).to_i64
+  }
+
+  # Sets z to x with bit i (two's complement) set to b (0 or 1).
+  pub def set_bit!(x: Int, i: I64, b: I64) -> Int {
+    panic("negative bit index") if i < 0
+    if x.neg {
+      t = nat_sub(x.abs, nat_one)
+      t = nat_set_bit(t, i, (b ^ 1).as_u64)
+      self.abs = nat_add(t, nat_one)
+      self.neg = abs.size > 0
+      return self
+    }
+    self.abs = nat_set_bit(x.abs, i, b.as_u64)
+    self.neg = false
+    self
+  }
+
+  # Sets z to x & y (two's complement).
+  pub def and!(x0: Int, y0: Int) -> Int {
+    x = x0
+    y = y0
+    if x.neg == y.neg {
+      if x.neg {
+        x1 = nat_sub(x.abs, nat_one)
+        y1 = nat_sub(y.abs, nat_one)
+        self.abs = nat_add(nat_or(x1, y1), nat_one)
+        self.neg = true
+        return self
+      }
+      self.abs = nat_and(x.abs, y.abs)
+      self.neg = false
+      return self
+    }
+    if x.neg {
+      x = y0
+      y = x0
+    }
+    y1 = nat_sub(y.abs, nat_one)
+    self.abs = nat_and_not(x.abs, y1)
+    self.neg = false
+    self
+  }
+
+  # Sets z to x &^ y (two's complement).
+  pub def and_not!(x: Int, y: Int) -> Int {
+    if x.neg == y.neg {
+      if x.neg {
+        x1 = nat_sub(x.abs, nat_one)
+        y1 = nat_sub(y.abs, nat_one)
+        self.abs = nat_and_not(y1, x1)
+        self.neg = false
+        return self
+      }
+      self.abs = nat_and_not(x.abs, y.abs)
+      self.neg = false
+      return self
+    }
+    if x.neg {
+      x1 = nat_sub(x.abs, nat_one)
+      self.abs = nat_add(nat_or(x1, y.abs), nat_one)
+      self.neg = true
+      return self
+    }
+    y1 = nat_sub(y.abs, nat_one)
+    self.abs = nat_and(x.abs, y1)
+    self.neg = false
+    self
+  }
+
+  # Sets z to x | y (two's complement).
+  pub def or!(x0: Int, y0: Int) -> Int {
+    x = x0
+    y = y0
+    if x.neg == y.neg {
+      if x.neg {
+        x1 = nat_sub(x.abs, nat_one)
+        y1 = nat_sub(y.abs, nat_one)
+        self.abs = nat_add(nat_and(x1, y1), nat_one)
+        self.neg = true
+        return self
+      }
+      self.abs = nat_or(x.abs, y.abs)
+      self.neg = false
+      return self
+    }
+    if x.neg {
+      x = y0
+      y = x0
+    }
+    y1 = nat_sub(y.abs, nat_one)
+    self.abs = nat_add(nat_and_not(y1, x.abs), nat_one)
+    self.neg = true
+    self
+  }
+
+  # Sets z to x ^ y (two's complement).
+  pub def xor!(x0: Int, y0: Int) -> Int {
+    x = x0
+    y = y0
+    if x.neg == y.neg {
+      if x.neg {
+        x1 = nat_sub(x.abs, nat_one)
+        y1 = nat_sub(y.abs, nat_one)
+        self.abs = nat_xor(x1, y1)
+        self.neg = false
+        return self
+      }
+      self.abs = nat_xor(x.abs, y.abs)
+      self.neg = false
+      return self
+    }
+    if x.neg {
+      x = y0
+      y = x0
+    }
+    y1 = nat_sub(y.abs, nat_one)
+    self.abs = nat_add(nat_xor(x.abs, y1), nat_one)
+    self.neg = true
+    self
+  }
+
+  # Sets z to ^x (two's complement: -x - 1).
+  pub def not!(x: Int) -> Int {
+    if x.neg {
+      self.abs = nat_sub(x.abs, nat_one)
+      self.neg = false
+      return self
+    }
+    self.abs = nat_add(x.abs, nat_one)
+    self.neg = true
+    self
+  }
+
+  # Sets z to floor(sqrt(x)). Panics for x < 0.
+  pub def sqrt!(x: Int) -> Int {
+    panic("square root of negative number") if x.neg
+    self.neg = false
+    self.abs = nat_sqrt(x.abs)
+    self
+  }
+
+  # x in base `base` (2..62; digits 0-9, a-z, then A-Z above base 36).
+  pub def text(base: I64) -> Str { int_text(self, base) }
+
+  # buf with x in base `base` appended.
+  pub def append(buf: [Byte], base: I64) -> [Byte] { buf + nat_itoa(abs, neg, base) }
+
+  # x in base 10 (Go's String).
+  pub def to_s -> Str { int_text(self, 10) }
+
+  # x formatted by the first verb of f (Go's fmt.Sprintf(f, x) through
+  # Int.Format): %b %o %O %d %s %v %x %X with the flags + - # 0 and space,
+  # a width and a precision (minimum digits); text around the verb is kept.
+  pub def format(f: Str) -> Str {
+    if p = parse_fmt(f) {
+      return p[0] + int_format(self, p[1]) + p[2]
+    }
+    f
+  }
+
+  # Go's Int.Scan: reads an integer from r for the verb ("b", "o", "d",
+  # "x", "X", or "s"/"v" for any base prefix), after leading white space.
+  pub def scan!(r: ByteReader, verb: Str) -> ~Int<BigError> {
+    vb: Byte = 0
+    vb = verb[0] if verb.size > 0
+    v = ~int_scan_verb(r, vb)
+    self.set!(v)
+  }
+
+  # Go's GobEncode: a version/sign byte, then |x| big-endian.
+  pub def gob_encode -> [Byte] {
+    buf: [Byte] = [0; 1 + abs.size * S]
+    i = nat_bytes(abs, buf) - 1
+    b: Byte = INT_GOB_VERSION << 1
+    b |= 1 if neg
+    buf[i] = b
+    buf[i...buf.size]
+  }
+
+  # Go's GobDecode (an empty buf is 0).
+  pub def gob_decode!(buf: [Byte]) -> ~Int<BigError> {
+    if buf.size == 0 {
+      self.abs = nat_zero
+      self.neg = false
+      return self
+    }
+    b = buf[0]
+    if b >> 1 != INT_GOB_VERSION {
+      fail BigError.Msg("Int.GobDecode: encoding version #{b >> 1} not supported")
+    }
+    self.neg = b & 1 != 0
+    self.abs = nat_set_bytes(buf[1...buf.size])
+    self
+  }
+
+  # b with x in base 10 appended (Go's AppendText).
+  pub def append_text(b: [Byte]) -> [Byte] { self.append(b, 10) }
+
+  # x in base 10 (Go's MarshalText).
+  pub def marshal_text -> [Byte] { nat_itoa(abs, neg, 10) }
+
+  # Sets z from text in any base Go's SetString(s, 0) accepts.
+  pub def unmarshal_text!(text: [Byte]) -> ~Int<BigError> {
+    s = Str.from_bytes(text)
+    if v = self.set_string!(s, 0) {
+      return v
+    }
+    fail BigError.Msg("math/big: cannot unmarshal #{quote_str(s)} into a *big.Int")
+  }
+
+  # x as a JSON number.
+  pub def marshal_json -> [Byte] { nat_itoa(abs, neg, 10) }
+
+  # Sets z from a JSON number (null leaves z unchanged).
+  pub def unmarshal_json!(text: [Byte]) -> ~Int<BigError> {
+    return self if Str.from_bytes(text) == "null"
+    self.~unmarshal_text!(text)
+  }
+
+  # encoding/json's protocol, so an Int can be a field of a type that
+  # derives Json: a JSON number (Go's MarshalJSON / UnmarshalJSON).
+  pub def json_str(_e: json.Encoder) -> Str { int_text(self, 10) }
+
+  pub def json_enc(e: json.Encoder) -> Unit {
+    ee = e
+    ee.raw!(int_text(self, 10))
+  }
+
+  pub def self.json_zero -> Int { Int.new }
+
+  pub def self.json_dec(d: json.Decoder) -> Int {
+    dd = d
+    v = json.Value.json_dec(dd)
+    return Int.new if dd.failed || v.null?
+    s = v.to_s
+    if v.number? {
+      z = Int.new
+      if r = z.set_string!(s, 0) {
+        return r
+      }
+    }
+    dd.fail!(json.JsonError.Syntax(msg: "math/big: cannot unmarshal #{quote_str(s)} into a *big.Int", offset: dd.pos))
+    Int.new
+  }
+
+  # Whether x is probably prime: n Miller-Rabin rounds with pseudorandom
+  # bases plus a Baillie-PSW test (100% accurate below 2^64). Panics for
+  # n < 0.
+  pub def probably_prime?(n: I64) -> Bool { probably_prime(self, n) }
+}
+
+# A new Int set to x.
+pub def new_int(x: I64) -> Int {
+  z = Int.new
+  z.set_int64!(x)
+}
+
+# An Int from nat words (normalizing).
+def int_of(abs: [U64], neg: Bool) -> Int {
+  a = nat_norm(abs)
+  Int.new(abs: a, neg: neg && a.size > 0)
+}
+
+def low64(x: [U64]) -> U64 {
+  return 0 if x.size == 0
+  x[0]
+}
+
+# A U64 as F64, rounding to nearest even.
+def u64_to_f(x: U64) -> F64 {
+  return x.to_i64.to_f if x >> 63 == 0
+  # halve with the low bit folded in (sticky), convert, double
+  h = (x >> 1) | (x & 1)
+  h.to_i64.to_f * 2.0
+}
+
+# (gcd(a, b), x, y) with gcd = a*x + b*y; x and y only if `ext`.
+def int_gcd(a: Int, b: Int, ext: Bool) -> (Int, Int, Int) {
+  if a.abs.size == 0 || b.abs.size == 0 {
+    z = Int.new
+    if a.abs.size == 0 {
+      z.set!(b)
+    } else {
+      z.set!(a)
+    }
+    z.neg = false
+    x = Int.new
+    if a.abs.size != 0 {
+      x.set_uint64!(1)
+      x.neg = a.neg
+    }
+    y = Int.new
+    if b.abs.size != 0 {
+      y.set_uint64!(1)
+      y.neg = b.neg
+    }
+    return (z, x, y)
+  }
+  lehmer_gcd(a, b, ext)
+}
+
+# Lehmer's single-digit simulation of the Euclidean steps on the top
+# words of A and B: (u0, u1, v0, v1, even).
+def lehmer_simulate(a_: Int, b_: Int) -> (U64, U64, U64, U64, Bool) {
+  m = b_.abs.size
+  n = a_.abs.size
+  h = nlz(a_.abs[n - 1])
+  a1 = (a_.abs[n - 1] << h) | (a_.abs[n - 2] >> (W - h))
+  a2: U64 = 0
+  if n == m {
+    a2 = (b_.abs[n - 1] << h) | (b_.abs[n - 2] >> (W - h))
+  } elsif n == m + 1 {
+    a2 = b_.abs[n - 2] >> (W - h)
+  }
+  even = false
+  u0: U64 = 0
+  u1: U64 = 1
+  u2: U64 = 0
+  v0: U64 = 0
+  v1: U64 = 0
+  v2: U64 = 1
+  while a2 >= v2 && a1 - a2 >= v1 + v2 {
+    q = a1 / a2
+    r = a1 % a2
+    a1 = a2
+    a2 = r
+    t = u1 + q * u2
+    u0 = u1
+    u1 = u2
+    u2 = t
+    t2 = v1 + q * v2
+    v0 = v1
+    v1 = v2
+    v2 = t2
+    even = !even
+  }
+  (u0, u1, v0, v1, even)
+}
+
+# x * w with sign x.neg != neg.
+def mul_w(x: Int, neg: Bool, w: U64) -> Int { Int.new(abs: nat_mul_add_ww(x.abs, w, 0), neg: x.neg != neg) }
+
+# The Lehmer update of (A, B): A = u0*A + v0*B, B = u1*A + v1*B with the
+# cosequence signs.
+def lehmer_update(a_: Int, b_: Int, u0: U64, u1: U64, v0: U64, v1: U64, even: Bool) -> (Int, Int) {
+  q = mul_w(b_, even, v0)
+  r = mul_w(a_, even, u1)
+  a2 = mul_w(a_, !even, u0)
+  b2 = mul_w(b_, !even, v1)
+  na = Int.new
+  na.add!(a2, q)
+  nb = Int.new
+  nb.add!(b2, r)
+  (na, nb)
+}
+
+# Lehmer's GCD (Jebelean's improved condition, Go's lehmerGCD); with ext,
+# also the cofactors x and y.
+def lehmer_gcd(a: Int, b: Int, ext: Bool) -> (Int, Int, Int) {
+  aa = i_abs(a)
+  bb = i_abs(b)
+  ua = new_int(1)
+  ub = Int.new
+  if nat_cmp(aa.abs, bb.abs) < 0 {
+    t = aa
+    aa = bb
+    bb = t
+    t2 = ua
+    ua = ub
+    ub = t2
+  }
+  while bb.abs.size > 1 {
+    u0, u1, v0, v1, even = lehmer_simulate(aa, bb)
+    if v0 != 0 {
+      na, nb = lehmer_update(aa, bb, u0, u1, v0, v1, even)
+      aa = na
+      bb = nb
+      if ext {
+        nua, nub = lehmer_update(ua, ub, u0, u1, v0, v1, even)
+        ua = nua
+        ub = nub
+      }
+    } else {
+      q, r = Int.new.quo_rem_(aa, bb)
+      aa = bb
+      bb = r
+      if ext {
+        q.mul!(q, ub)
+        t = ub
+        ub = i_sub(ua, q)
+        ua = t
+      }
+    }
+  }
+  if bb.abs.size > 0 {
+    if aa.abs.size > 1 {
+      q, r = Int.new.quo_rem_(aa, bb)
+      aa = bb
+      bb = r
+      if ext {
+        q.mul!(q, ub)
+        t = ub
+        ub = i_sub(ua, q)
+        ua = t
+      }
+    }
+    if bb.abs.size > 0 {
+      aw = aa.abs[0]
+      bw = bb.abs[0]
+      if ext {
+        uaw: U64 = 1
+        ubw: U64 = 0
+        vaw: U64 = 0
+        vbw: U64 = 1
+        even = true
+        while bw != 0 {
+          qw = aw / bw
+          rw = aw % bw
+          aw = bw
+          bw = rw
+          tw = uaw + qw * ubw
+          uaw = ubw
+          ubw = tw
+          tw2 = vaw + qw * vbw
+          vaw = vbw
+          vbw = tw2
+          even = !even
+        }
+        x1 = mul_w(ua, !even, uaw)
+        x2 = mul_w(ub, even, vaw)
+        ua = i_add(x1, x2)
+      } else {
+        while bw != 0 {
+          tw = aw % bw
+          aw = bw
+          bw = tw
+        }
+      }
+      aa = Int.new(abs: [aw], neg: aa.neg)
+    }
+  }
+  x = Int.new
+  y = Int.new
+  if ext {
+    y.mul!(a, ua)
+    y.neg = !y.neg if a.neg
+    y.sub!(aa, y)
+    y.div!(y, b)
+    x.set!(ua)
+    x.neg = !x.neg if a.neg
+  }
+  (aa, x, y)
+}
+
+# The Jacobi symbol (x/y): -1, 0 or +1. Panics if y is even.
+pub def jacobi(x: Int, y: Int) -> I64 {
+  if y.abs.size == 0 || y.abs[0] & 1 == 0 {
+    panic("big: invalid 2nd argument to Int.Jacobi: need odd integer but got #{y}")
+  }
+  a = x
+  b = y
+  c = Int.new
+  j = 1
+  if b.neg {
+    j = -1 if a.neg
+    b.neg = false
+  }
+  one = new_int(1)
+  while true {
+    return j if b.cmp(one) == 0
+    return 0 if a.abs.size == 0
+    a.mod!(a, b)
+    return 0 if a.abs.size == 0
+    s = nat_trailing_zero_bits(a.abs)
+    if s & 1 != 0 {
+      bmod8 = b.abs[0] & 7
+      j = 0 - j if bmod8 == 3 || bmod8 == 5
+    }
+    c.rsh!(a, s)
+    j = 0 - j if b.abs[0] & 3 == 3 && c.abs[0] & 3 == 3
+    a = b
+    b = c
+  }
+  j
+}
+
+# x^((p+1)/4) mod p for p = 3 mod 4.
+def mod_sqrt3_mod4_prime(x: Int, p: Int) -> Int {
+  e = i_add(p, new_int(1))
+  e.rsh!(e, 2)
+  z = Int.new
+  z.exp!(x, e, p)
+  z
+}
+
+# Atkin's algorithm for p = 5 mod 8.
+def mod_sqrt5_mod8_prime(x: Int, p: Int) -> Int {
+  e = i_rsh(p, 3)
+  tx = i_lsh(x, 1)
+  alpha = Int.new
+  alpha.exp!(tx, e, p)
+  beta = i_mul(alpha, alpha)
+  beta.mod!(beta, p)
+  beta.mul!(beta, tx)
+  beta.mod!(beta, p)
+  beta.sub!(beta, new_int(1))
+  beta.mul!(beta, x)
+  beta.mod!(beta, p)
+  beta.mul!(beta, alpha)
+  z = Int.new
+  z.mod!(beta, p)
+}
+
+# The Tonelli-Shanks square root modulo the prime p.
+def mod_sqrt_tonelli_shanks(x: Int, p: Int) -> Int {
+  one = new_int(1)
+  s = i_sub(p, one)
+  e = nat_trailing_zero_bits(s.abs)
+  s.rsh!(s, e)
+  n = new_int(2)
+  while jacobi(n, p) != -1 {
+    n.add!(n, one)
+  }
+  y = i_add(s, one)
+  y.rsh!(y, 1)
+  y.exp!(x, y, p)
+  b = Int.new
+  b.exp!(x, s, p)
+  g = Int.new
+  g.exp!(n, s, p)
+  r = e
+  t = Int.new
+  while true {
+    m = 0
+    t.set!(b)
+    while t.cmp(one) != 0 {
+      t.mul!(t, t)
+      t.mod!(t, p)
+      m += 1
+    }
+    return y if m == 0
+    t.set_int64!(0)
+    t.set_bit!(t, r - m - 1, 1)
+    t.exp!(g, t, p)
+    g.mul!(t, t)
+    g.mod!(g, p)
+    y.mul!(y, t)
+    y.mod!(y, p)
+    b.mul!(b, g)
+    b.mod!(b, p)
+    r = m
+  }
+  y
+}
+
+# Value-returning forms of the Int operations, for expressions.
+def i_add(x: Int, y: Int) -> Int {
+  z = Int.new
+  z.add!(x, y)
+}
+
+def i_sub(x: Int, y: Int) -> Int {
+  z = Int.new
+  z.sub!(x, y)
+}
+
+def i_mul(x: Int, y: Int) -> Int {
+  z = Int.new
+  z.mul!(x, y)
+}
+
+def i_mod(x: Int, y: Int) -> Int {
+  z = Int.new
+  z.mod!(x, y)
+}
+
+def i_abs(x: Int) -> Int {
+  z = Int.new
+  z.abs!(x)
+}
+
+def i_neg(x: Int) -> Int {
+  z = Int.new
+  z.neg!(x)
+}
+
+def i_lsh(x: Int, n: I64) -> Int {
+  z = Int.new
+  z.lsh!(x, n)
+}
+
+def i_rsh(x: Int, n: I64) -> Int {
+  z = Int.new
+  z.rsh!(x, n)
+}

@@ -1,0 +1,165 @@
+import "io"
+import "encoding/hex"
+import "hash"
+
+# Go's sha1_test.go and example_test.go, translated. The tables are in
+# golden_test.alx; Go's internal/testhash is testhash_test.alx.
+#
+# Not translated: TestAllocations
+# (allocation counting), TestExtraMethods (reflection over the method set),
+# ExampleNew_file (opens a file.txt that isn't there; Go doesn't run it either).
+
+test "golden" {
+  for g in golden() {
+    assert_eq hexs(sum(g.input).to_a), g.out
+    c = new()
+    half = g.input.size / 2
+    j = 0
+    while j < 4 {
+      s: [Byte] = []
+      if j < 2 {
+        c.write!(g.input)
+        s = c.sum([])
+      } else if j == 2 {
+        c.write!(g.input[0...half])
+        c.sum([])
+        c.write!(g.input[half...g.input.size])
+        s = c.sum([])
+      } else {
+        c.write!(g.input[0...half])
+        c.constant_time_sum([])
+        c.write!(g.input[half...g.input.size])
+        s = c.constant_time_sum([])
+      }
+      assert_eq hexs(s), g.out
+      c.reset!
+      j += 1
+    }
+  }
+}
+
+# constant_time_sum against sum at every length around the padding
+# boundaries (one block or two).
+test "constant time sum" {
+  n = 0
+  while n < 200 {
+    c = new()
+    c.write!(gen(n.as_u64 + 1000, n))
+    assert_eq c.constant_time_sum(b("x")), c.sum(b("x"))
+    n += 1
+  }
+}
+
+# Go's TestOutOfBoundsRead sums slices that end at guard pages; here, the
+# prefixes and suffixes of a buffer.
+test "out of bounds read" {
+  buf = gen(77, 1000)
+  i = 0
+  while i <= 1000 {
+    assert_eq sum(buf[0...i]), sum(buf[0...i] + [])
+    assert_eq sum(buf[1000 - i...1000]), sum(buf[1000 - i...1000] + [])
+    i += 37
+  }
+}
+
+test "golden marshal" {
+  for g in golden() {
+    h = new()
+    h2 = new()
+    half = g.input.size / 2
+    h.write!(g.input[0...half])
+    state = h.marshal_binary
+    state_append = h.append_binary([0, 0, 0, 0])
+    state_append = state_append[4...state_append.size]
+    assert_eq state, g.half_state
+    assert_eq state_append, g.half_state
+    h2.unmarshal_binary!(state).unwrap
+    h.write!(g.input[half...g.input.size])
+    h2.write!(g.input[half...g.input.size])
+    assert_eq h.sum([]), h2.sum([])
+  }
+}
+
+test "large hashes" {
+  for t in large_unmarshal_tests() {
+    h = new()
+    h.unmarshal_binary!(t.state).unwrap
+    assert_eq hexs(h.sum([])), t.sum
+  }
+}
+
+test "unmarshal errors" {
+  h = new()
+  r = h.unmarshal_binary!(b("sha\x02"))
+  assert_eq "#{r.err.unwrap}", "crypto/sha1: invalid hash state identifier"
+  r2 = h.unmarshal_binary!(b("sha\x01abc"))
+  assert_eq "#{r2.err.unwrap}", "crypto/sha1: invalid hash state size"
+  r3 = h.unmarshal_binary!(b("sh"))
+  assert_eq "#{r3.err.unwrap}", "crypto/sha1: invalid hash state identifier"
+}
+
+test "sha1 hash" {
+  check_hash(->() -> hash.Hash { new() })
+  check_clone(new())
+}
+
+test "size" {
+  assert_eq new().size, SIZE
+  assert_eq new().block_size, BLOCK_SIZE
+}
+
+# The Clone subtest of Go's testhash.TestHash.
+def check_clone(h: Digest) {
+  h3 = h.clone
+  prefix = b("tmp")
+  h.write!(prefix)
+  h2 = h.clone
+  prefix_sum = h.sum([])
+  assert_eq prefix_sum, h2.sum([])
+  suffix = b("tmp2")
+  h.write!(suffix)
+  h3.write!(prefix + suffix)
+  composite = h3.sum([])
+  assert_eq h.sum([]), composite
+  assert_eq h2.sum([]), prefix_sum
+  h2.write!(suffix)
+  assert_eq h.sum([]), composite
+  assert_eq h2.sum([]), composite
+}
+
+# fmt's "% x": hex bytes separated by spaces.
+def spaced_hex(p: [Byte]) -> Str {
+  parts: [Str] = []
+  for x in p {
+    parts << hex.encode_to_string([x])
+  }
+  parts.join(" ")
+}
+
+example "new" {
+  h = new()
+  io.write_string(h, "His money is twice tainted:").unwrap
+  io.write_string(h, " 'taint yours and 'taint mine.").unwrap
+  puts spaced_hex(h.sum([]))
+} outputs "59 7f 6a 54 00 10 f9 4c 15 d7 18 06 a9 9a 2c 87 10 e7 47 bd\n"
+
+example "sum" {
+  data = b("This page intentionally left blank.")
+  puts spaced_hex(sum(data).to_a)
+} outputs "af 06 49 23 bb f2 30 15 96 aa c4 c2 73 ba 32 17 8e bc 4a 96\n"
+
+bench "sha1 1MB" {
+  d = new()
+  d.write!(bench_data())
+  d.sum([])
+}
+
+bench "sha1 8 bytes" {
+  d = new()
+  d.write!(b("12345678"))
+  d.sum([])
+}
+
+def bench_data -> [Byte] {
+  [0x5a.as_u8; 1 << 20]
+}

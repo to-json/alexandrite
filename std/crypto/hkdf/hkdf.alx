@@ -1,0 +1,78 @@
+# Package hkdf: Go's crypto/hkdf, the HMAC-based Extract-and-Expand Key
+# Derivation Function of RFC 5869. HKDF combines a master secret with a
+# salt and context info into one or more cryptographically strong keys.
+#
+#   Go                                              alx
+#   hkdf.Extract(h, secret, salt) ([]byte, error)   extract(h, secret, salt) -> [Byte]
+#   hkdf.Expand(h, prk, info, keyLength)            expand(h, prk, info, key_length) -> ~[Byte]<HkdfError>
+#   hkdf.Key(h, secret, salt, info, keyLength)      key(h, secret, salt, info, key_length) -> ~[Byte]<HkdfError>
+#
+# h is a constructor of the hash, as in Go (`->() -> sha256.Digest {
+# sha256.new() }`); the functions are generic over its type.
+#
+# Differences from Go:
+#   - extract can't fail (Go's Extract fails only in FIPS 140-only mode,
+#     which alx doesn't have), so it returns plain bytes.
+#   - Go's nil salt means "hash-size zeros"; an empty alx salt does the same
+#     (the HMAC key is zero-padded, so the two give the same result anyway).
+
+import "crypto/hmac"
+
+# Errors of expand and key.
+pub error HkdfError {
+  KeyLengthTooLarge
+
+  def message -> Str {
+    case self {
+      KeyLengthTooLarge => "hkdf: requested key length too large"
+    }
+  }
+}
+
+# The pseudorandom key of RFC 5869's Extract step for secret and salt.
+pub def extract[H](h: () -> H, secret: [Byte], salt: [Byte]) -> [Byte] {
+  s = salt
+  if s.size == 0 {
+    s = [0.as_u8; h().size]
+  }
+  extractor = hmac.new(h, s)
+  extractor.write!(secret)
+  extractor.sum([])
+}
+
+# key_length bytes of RFC 5869's Expand step for the pseudorandom key prk
+# and context info. key_length may be at most 255 times the hash's size.
+pub def expand[H](h: () -> H, prk: [Byte], info: Str, key_length: Int) -> ~[Byte]<HkdfError> {
+  fail HkdfError.KeyLengthTooLarge if key_length > h().size * 255
+  expand_unchecked(h, prk, info, key_length)
+}
+
+# Go's crypto/internal/fips140/hkdf.Expand.
+def expand_unchecked[H](h: () -> H, prk: [Byte], info: Str, key_len: Int) -> [Byte] {
+  out: [Byte] = []
+  expander = hmac.new(h, prk)
+  counter = 0
+  buf: [Byte] = []
+  info_bytes = info.bytes.to_a
+  while out.size < key_len {
+    counter += 1
+    panic("hkdf: counter overflow") if counter > 255
+    expander.reset! if counter > 1
+    expander.write!(buf)
+    expander.write!(info_bytes)
+    expander.write!([counter.as_u8])
+    buf = expander.sum([])
+    remain = key_len - out.size
+    remain = buf.size if remain > buf.size
+    out = out + buf[0...remain]
+  }
+  out
+}
+
+# key_length bytes derived from secret, salt and info: extract, then
+# expand. key_length may be at most 255 times the hash's size.
+pub def key[H](h: () -> H, secret: [Byte], salt: [Byte], info: Str, key_length: Int) -> ~[Byte]<HkdfError> {
+  fail HkdfError.KeyLengthTooLarge if key_length > h().size * 255
+  prk = extract(h, secret, salt)
+  expand_unchecked(h, prk, info, key_length)
+}

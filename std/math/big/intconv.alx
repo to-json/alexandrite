@@ -1,0 +1,208 @@
+#![overflow(wrap)]
+# Int to and from strings (Go's intconv.go), and the format-spec parser
+# shared with Float (Go's fmt.State).
+
+import "strings"
+
+# x in base `base` (2..62; digits 0-9, a-z, then A-Z for bases above 36).
+def int_text(x: Int, base: I64) -> Str { Str.from_bytes(nat_itoa(x.abs, x.neg, base)) }
+
+# A parsed fmt verb: flags, width, precision (-1 when absent) and the verb.
+struct FmtSpec {
+  plus: Bool
+  minus: Bool
+  sharp: Bool
+  space: Bool
+  zero: Bool
+  width: I64
+  prec: I64
+  verb: Byte
+}
+
+# Splits a format string into (text before, spec, text after) at its first
+# verb ("%%" is a literal '%'). none if there is no verb.
+def parse_fmt(f: Str) -> (Str, FmtSpec, Str)? {
+  b = f.bytes
+  pre: [Byte] = []
+  i = 0
+  while i < b.size {
+    if b[i] != 37 {
+      pre << b[i]
+      i += 1
+      next
+    }
+    if i + 1 < b.size && b[i + 1] == 37 {
+      pre << 37
+      i += 2
+      next
+    }
+    sp = FmtSpec.new(width: -1, prec: -1)
+    i += 1
+    while i < b.size {
+      c = b[i]
+      if c == 43 {
+        sp.plus = true
+      } elsif c == 45 {
+        sp.minus = true
+      } elsif c == 35 {
+        sp.sharp = true
+      } elsif c == 32 {
+        sp.space = true
+      } elsif c == 48 {
+        sp.zero = true
+      } else {
+        break
+      }
+      i += 1
+    }
+    while i < b.size && b[i] >= 48 && b[i] <= 57 {
+      sp.width = 0 if sp.width < 0
+      sp.width = sp.width * 10 + (b[i] - 48).to_i64
+      i += 1
+    }
+    if i < b.size && b[i] == 46 {
+      i += 1
+      sp.prec = 0
+      while i < b.size && b[i] >= 48 && b[i] <= 57 {
+        sp.prec = sp.prec * 10 + (b[i] - 48).to_i64
+        i += 1
+      }
+    }
+    return none if i >= b.size
+    sp.verb = b[i]
+    post = Str.from_bytes(b[i + 1...b.size])
+    # a later "%%" in the rest is a literal '%'
+    return (Str.from_bytes(pre), sp, strings.replace_all(post, "%%", "%"))
+  }
+  none
+}
+
+# s repeated n times (nothing for n <= 0).
+def rep(s: Str, n: I64) -> Str {
+  return "" if n <= 0
+  s * n
+}
+
+# Go's Int.Format: the verbs b, o, O, d, s, v, x, X with the flags
+# + (sign), space, # (base prefix), - (left-justify), 0 (zero padding),
+# a width and a precision (minimum digits).
+def int_format(x: Int, sp: FmtSpec) -> Str {
+  ch = sp.verb
+  base = 0
+  if ch == 98 {
+    base = 2
+  } elsif ch == 111 || ch == 79 {
+    base = 8
+  } elsif ch == 100 || ch == 115 || ch == 118 {
+    base = 10
+  } elsif ch == 120 || ch == 88 {
+    base = 16
+  } else {
+    return "%!" + Str.from_bytes([ch]) + "(big.Int=" + int_text(x, 10) + ")"
+  }
+  sign = ""
+  if x.neg {
+    sign = "-"
+  } elsif sp.plus {
+    sign = "+"
+  } elsif sp.space {
+    sign = " "
+  }
+  prefix = ""
+  if sp.sharp {
+    if ch == 98 {
+      prefix = "0b"
+    } elsif ch == 111 {
+      prefix = "0"
+    } elsif ch == 120 {
+      prefix = "0x"
+    } elsif ch == 88 {
+      prefix = "0X"
+    }
+  }
+  prefix = "0o" if ch == 79
+  digits = nat_utoa(x.abs, base)
+  if ch == 88 {
+    for i in 0...digits.size {
+      d = digits[i]
+      digits[i] = d - 97 + 65 if 97 <= d && d <= 122
+    }
+  }
+  left = 0
+  zeros = 0
+  right = 0
+  if sp.prec >= 0 {
+    if digits.size < sp.prec {
+      zeros = sp.prec - digits.size
+    } elsif digits.size == 1 && digits[0] == 48 && sp.prec == 0 {
+      return ""
+    }
+  }
+  length = sign.size + prefix.size + zeros + digits.size
+  if sp.width >= 0 && length < sp.width {
+    d = sp.width - length
+    if sp.minus {
+      right = d
+    } elsif sp.zero && sp.prec < 0 {
+      zeros = d
+    } else {
+      left = d
+    }
+  }
+  rep(" ", left) + sign + prefix + rep("0", zeros) + Str.from_bytes(digits) + rep(" ", right)
+}
+
+# Reads an optional sign: (negative?, ok); not ok at the end of input.
+def scan_sign(r: ByteReader) -> ~Bool<BigError> {
+  rd = r
+  if ch = rd.read_byte! {
+    return true if ch == 45
+    return false if ch == 43
+    rd.unread_byte!
+    return false
+  }
+  fail BigError.Eof
+}
+
+# Go's Int.scan: an optionally signed integer from r; (value, base).
+def int_from_reader(r: ByteReader, base: I64) -> ~(Int, I64)<BigError> {
+  neg = ~scan_sign(r)
+  abs, b, _count = ~nat_scan(r, base, false)
+  (Int.new(abs: abs, neg: abs.size > 0 && neg), b)
+}
+
+# Go's Int.Scan for a verb: skips leading white space, then reads an
+# integer in the verb's base (b, o, d, x, X; s and v: any base prefix).
+def int_scan_verb(r: ByteReader, verb: Byte) -> ~Int<BigError> {
+  rd = r
+  skip_space(rd)
+  base = 0
+  if verb == 98 {
+    base = 2
+  } elsif verb == 111 {
+    base = 8
+  } elsif verb == 100 {
+    base = 10
+  } elsif verb == 120 || verb == 88 {
+    base = 16
+  } elsif verb != 115 && verb != 118 {
+    fail BigError.InvalidVerb("Int.Scan: invalid verb")
+  }
+  v, _b = ~int_from_reader(rd, base)
+  v
+}
+
+# Skips white space (Go's ScanState.SkipSpace).
+def skip_space(r: ByteReader) -> Unit {
+  rd = r
+  while true {
+    if ch = rd.read_byte! {
+      if !(ch == 32 || ch == 9 || ch == 10 || ch == 13) {
+        rd.unread_byte!
+        return
+      }
+    } else {
+      return
+    }
+  }
+}

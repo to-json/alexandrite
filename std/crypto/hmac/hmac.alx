@@ -1,0 +1,114 @@
+# Package hmac: Go's crypto/hmac, the Keyed-Hash Message Authentication Code
+# (HMAC) of FIPS 198. An HMAC is a cryptographic hash that uses a key to sign
+# a message; the receiver verifies it by recomputing it with the same key.
+# Compare MACs with `equal` to avoid timing side channels:
+#
+#   def valid_mac?(message: [Byte], message_mac: [Byte], key: [Byte]) -> Bool {
+#     mac = hmac.new(->() -> sha256.Digest { sha256.new() }, key)
+#     mac.write!(message)
+#     hmac.equal?(message_mac, mac.sum([]))
+#   }
+#
+#   Go                                  alx
+#   hmac.New(h func() hash.Hash, key)   new(h: () -> H, key) -> HMAC[H]
+#   hmac.Equal(mac1, mac2) bool         equal?(mac1, mac2) -> Bool
+#   m.Write / Sum / Reset               m.write!(p) -> Int / m.sum(b) / m.reset!
+#   m.Size / BlockSize                  m.size / m.block_size
+#   (*HMAC).Clone() (hash.Cloner, err)  m.clone -> HMAC[H] (needs H.clone)
+#
+# HMAC[H] satisfies hash.Hash structurally when H does.
+#
+# Differences from Go:
+#   - New is generic over the hash type (Go's internal fips140/hmac.New is
+#     too): `hmac.new(->() -> sha256.Digest { sha256.new() }, key)` gives an
+#     HMAC[sha256.Digest], itself a hash.Hash. A constructor returning
+#     hash.Hash (crypto.SHA256.new) works too; the resulting HMAC[hash.Hash]
+#     can't itself be passed as a hash.Hash (an interface value can't hold
+#     a struct holding interface values, D12), but has all the methods.
+#   - write! returns the inner hash's result, so it can fail only if H's
+#     write! can.
+#   - Go checks that h returns distinct objects ("hash generation function
+#     does not produce unique values") by comparing the pointers; alx values
+#     have no identity, so a constructor that hands out one shared hash
+#     gives wrong MACs instead of a panic.
+#   - Go saves the keyed inner and outer states with MarshalBinary on the
+#     first reset when the hash supports it, and restores them after; here
+#     reset! and sum always rehash the padded key (the same results, one
+#     more block per reset and sum), since a generic H can't be asked at run
+#     time whether it is marshalable.
+#   - No BoringCrypto or FIPS 140-only mode.
+
+import "crypto/subtle"
+
+# A new HMAC using the hash made by h and the given key.
+pub def new[H](h: () -> H, key: [Byte]) -> HMAC[H] {
+  outer = h()
+  inner = h()
+  blocksize = inner.block_size
+  ipad = [0.as_u8; blocksize]
+  opad = [0.as_u8; blocksize]
+  k = key
+  if k.size > blocksize {
+    outer.write!(k)
+    k = outer.sum([])
+  }
+  copy(ipad, k)
+  copy(opad, k)
+  i = 0
+  while i < blocksize {
+    ipad[i] = ipad[i] ^ 0x36
+    opad[i] = opad[i] ^ 0x5c
+    i += 1
+  }
+  inner.write!(ipad)
+  HMAC.new(opad: opad, ipad: ipad, outer: outer, inner: inner)
+}
+
+# Whether two MACs are equal, compared in time that depends only on their
+# lengths.
+pub def equal?(mac1: [Byte], mac2: [Byte]) -> Bool {
+  subtle.constant_time_compare(mac1, mac2) == 1
+}
+
+# A running HMAC (Go's crypto/internal/fips140/hmac.HMAC).
+pub struct HMAC[H] {
+  opad: [Byte]
+  ipad: [Byte]
+  outer: H
+  inner: H
+
+  # Adds p to the message.
+  pub def write!(p: [Byte]) -> ~Int {
+    ~inner.write!(p)
+  }
+
+  # b with the MAC of the message so far appended. The state is unchanged.
+  pub def sum(b: [Byte]) -> [Byte] {
+    orig = b.size
+    full = inner.sum(b)
+    # The outer hash's state is shared storage: this reuses it.
+    o = outer
+    o.reset!
+    o.write!(opad)
+    o.write!(full[orig...full.size])
+    o.sum(b)
+  }
+
+  # The MAC size in bytes: the hash's size.
+  pub def size -> Int { outer.size }
+
+  # The hash's block size.
+  pub def block_size -> Int { inner.block_size }
+
+  # Back to the keyed initial state.
+  pub def reset! {
+    inner.reset!
+    inner.write!(ipad)
+    nil
+  }
+
+  # An independent copy of the HMAC in its current state.
+  pub def clone -> HMAC[H] {
+    HMAC.new(opad: opad, ipad: ipad, outer: outer.clone, inner: inner.clone)
+  }
+}

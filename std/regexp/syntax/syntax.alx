@@ -1,0 +1,550 @@
+# Package syntax: Go's regexp/syntax, with alx idioms (S2).
+#
+# Parses regular expressions into syntax trees, simplifies them and compiles
+# them into programs for package regexp. The syntax is RE2's, exactly as Go
+# accepts it (see Go's regexp/syntax documentation); parse trees, error codes
+# and messages, simplified trees and compiled programs are the same as Go's.
+#
+#   Go                                  alx
+#   syntax.Parse(s, flags)              parse(s, flags) -> ~Regexp<ParseError>
+#   *syntax.Regexp (a tree node)        Regexp (a handle: a node in a shared arena)
+#   re.Op / Flags / Sub / Rune          re.op / re.flags / re.sub / re.rune
+#   re.Min / Max / Cap / Name           re.min / re.max / re.cap / re.name
+#   re.Equal(x) / String / Simplify     re.equal?(x) / re.to_s / re.simplify
+#   re.MaxCap / CapNames                re.max_cap / re.cap_names
+#   syntax.Op, OpLiteral, ...           Int constants OP_LITERAL, ...; op_string(op)
+#   syntax.Flags, FoldCase, Perl, ...   Int constants FOLD_CASE, PERL, POSIX, ...
+#   *syntax.Error{Code, Expr}           ParseError.Syntax(code, expr); err.message
+#   syntax.ErrorCode, ErrMissingParen   Str constants ERR_MISSING_PAREN, ...
+#   syntax.Compile(re) (*Prog, error)   compile(re) -> Prog (it cannot fail)
+#   *syntax.Prog, Inst, InstOp, EmptyOp Prog, Inst; Int constants INST_ALT, EMPTY_BEGIN_LINE, ...
+#   prog.Prefix() (string, bool)        prog.prefix -> (Str, Bool)
+#   prog.StartCond / String             prog.start_cond / prog.to_s
+#   inst.MatchRune / MatchRunePos       inst.match_rune?(r) / inst.match_rune_pos(r)
+#   inst.MatchEmptyWidth / String       inst.match_empty_width?(before, after) / inst.to_s
+#   EmptyOpContext, IsWordChar          empty_op_context(r1, r2), is_word_char(r)
+#
+# Differences from Go:
+#   - A Regexp is a handle (an arena and a node index), not a pointer: recursive
+#     value types don't exist yet ("recursive types come with the memory
+#     model"). Copies of a handle are the same node; `sub` returns handles.
+#     Building trees by hand (Go's &Regexp{...} literals) isn't offered.
+#     `simplify` adds nodes to the same arena, sharing unchanged subtrees, as
+#     Go's shares pointers.
+#   - Ops, flags, inst ops and empty ops are Int constants (Go's are distinct
+#     integer types); the String methods are op_string / inst_op_string.
+#   - The error type is ParseError (`Error` is the language's own name) with
+#     one variant, Syntax(code, expr); codes are Str constants, the message
+#     is Go's ("error parsing regexp: <code>: `<expr>`"). From a `.err` (a
+#     plain Error) read the fields with `case e { Syntax(code, expr) => }`.
+#   - Prog.start_cond's "no match possible" value is 255 (Go's ^EmptyOp(0)).
+#   - Inst.to_s can't tell a nil rune list from an empty one, so Go's
+#     "rune <nil>" never appears.
+#   - Go's parser recovers from panics for ErrLarge / ErrNestingDepth; here
+#     the parser records the condition and unwinds, with the same result.
+
+import "strconv"
+import "unicode"
+import "unicode/utf8"
+
+# ------------------------------------------------------------------ errors
+
+# The ways parsing fails: Go's *syntax.Error. `code` is one of the ERR_*
+# strings, `expr` the offending part of the expression.
+pub error ParseError {
+  Syntax(code: Str, expr: Str)
+
+  def message -> Str {
+    case self {
+      Syntax(c, e) => "error parsing regexp: #{c}: `#{e}`"
+    }
+  }
+
+  # The error code (one of the ERR_* constants).
+  pub def code -> Str {
+    case self {
+      Syntax(c, _) => c
+    }
+  }
+
+  # The offending expression.
+  pub def expr -> Str {
+    case self {
+      Syntax(_, e) => e
+    }
+  }
+}
+
+pub ERR_INTERNAL_ERROR = "regexp/syntax: internal error"
+pub ERR_INVALID_CHAR_CLASS = "invalid character class"
+pub ERR_INVALID_CHAR_RANGE = "invalid character class range"
+pub ERR_INVALID_ESCAPE = "invalid escape sequence"
+pub ERR_INVALID_NAMED_CAPTURE = "invalid named capture"
+pub ERR_INVALID_PERL_OP = "invalid or unsupported Perl syntax"
+pub ERR_INVALID_REPEAT_OP = "invalid nested repetition operator"
+pub ERR_INVALID_REPEAT_SIZE = "invalid repeat count"
+pub ERR_INVALID_UTF8 = "invalid UTF-8"
+pub ERR_MISSING_BRACKET = "missing closing ]"
+pub ERR_MISSING_PAREN = "missing closing )"
+pub ERR_MISSING_REPEAT_ARGUMENT = "missing argument to repetition operator"
+pub ERR_TRAILING_BACKSLASH = "trailing backslash at end of expression"
+pub ERR_UNEXPECTED_PAREN = "unexpected )"
+pub ERR_NESTING_DEPTH = "expression nests too deeply"
+pub ERR_LARGE = "expression too large"
+
+# ------------------------------------------------------------------- flags
+
+pub FOLD_CASE = 1        # case-insensitive match
+pub LITERAL = 2          # treat pattern as literal string
+pub CLASS_NL = 4         # allow character classes like [^a-z] and [[:space:]] to match newline
+pub DOT_NL = 8           # allow . to match newline
+pub ONE_LINE = 16        # treat ^ and $ as only matching at beginning and end of text
+pub NON_GREEDY = 32      # make repetition operators default to non-greedy
+pub PERL_X = 64          # allow Perl extensions
+pub UNICODE_GROUPS = 128 # allow \p{Han}, \P{Han} for Unicode group and negation
+pub WAS_DOLLAR = 256     # regexp OP_END_TEXT was $, not \z
+pub SIMPLE = 512         # regexp contains no counted repetition
+pub MATCH_NL = 12        # CLASS_NL | DOT_NL
+pub PERL = 212           # CLASS_NL | ONE_LINE | PERL_X | UNICODE_GROUPS: as close to Perl as possible
+pub POSIX = 0            # POSIX syntax
+
+# --------------------------------------------------------------------- ops
+
+pub OP_NO_MATCH = 1          # matches no strings
+pub OP_EMPTY_MATCH = 2       # matches empty string
+pub OP_LITERAL = 3           # matches Runes sequence
+pub OP_CHAR_CLASS = 4        # matches Runes interpreted as range pair list
+pub OP_ANY_CHAR_NOT_NL = 5   # matches any character except newline
+pub OP_ANY_CHAR = 6          # matches any character
+pub OP_BEGIN_LINE = 7        # matches empty string at beginning of line
+pub OP_END_LINE = 8          # matches empty string at end of line
+pub OP_BEGIN_TEXT = 9        # matches empty string at beginning of text
+pub OP_END_TEXT = 10         # matches empty string at end of text
+pub OP_WORD_BOUNDARY = 11    # matches word boundary `\b`
+pub OP_NO_WORD_BOUNDARY = 12 # matches word non-boundary `\B`
+pub OP_CAPTURE = 13          # capturing subexpression with index cap, optional name
+pub OP_STAR = 14             # matches sub[0] zero or more times
+pub OP_PLUS = 15             # matches sub[0] one or more times
+pub OP_QUEST = 16            # matches sub[0] zero or one times
+pub OP_REPEAT = 17           # matches sub[0] at least min times, at most max (max == -1 is no limit)
+pub OP_CONCAT = 18           # matches concatenation of subs
+pub OP_ALTERNATE = 19        # matches alternation of subs
+
+OP_PSEUDO = 128 # where pseudo-ops start
+OP_LEFT_PAREN = 128
+OP_VERTICAL_BAR = 129
+
+OP_NAMES = ["NoMatch", "EmptyMatch", "Literal", "CharClass", "AnyCharNotNL", "AnyChar", "BeginLine", "EndLine", "BeginText", "EndText", "WordBoundary", "NoWordBoundary", "Capture", "Star", "Plus", "Quest", "Repeat", "Concat", "Alternate"]
+
+# The name of an op, as Go's Op.String ("Literal", "opPseudo", "Op(42)").
+pub def op_string(op: Int) -> Str {
+  return OP_NAMES[op - 1] if op >= 1 && op <= 19
+  return "opPseudo" if op == 128
+  "Op(#{op})"
+}
+
+# ------------------------------------------------------------------- trees
+
+# One node of a syntax tree (Go's Regexp struct). Children are node indices.
+struct Node {
+  op: Int
+  flags: Int
+  sub: [Int]
+  rune: [Rune]
+  min: Int
+  max: Int
+  cap: Int
+  name: Str
+}
+
+# The nodes of one or more trees: shared by every Regexp handle into them.
+struct Arena {
+  nodes: [Node]
+}
+
+# A node in a regular expression syntax tree (Go's *syntax.Regexp).
+pub struct Regexp {
+  ar: [Arena]
+  id: Int
+
+  def node -> Node { ar[0].nodes[id] }
+  def at(i: Int) -> Regexp { Regexp.new(ar: ar, id: i) }
+
+  # The operator (an OP_* constant).
+  pub def op -> Int { ar[0].nodes[id].op }
+  pub def flags -> Int { ar[0].nodes[id].flags }
+  # The subexpressions, if any.
+  pub def sub -> [Regexp] {
+    out: [Regexp] = []
+    for i in ar[0].nodes[id].sub { out << at(i) }
+    out
+  }
+  # Matched runes, for OP_LITERAL and OP_CHAR_CLASS (range pairs).
+  pub def rune -> [Rune] { ar[0].nodes[id].rune }
+  # min, max for OP_REPEAT.
+  pub def min -> Int { ar[0].nodes[id].min }
+  pub def max -> Int { ar[0].nodes[id].max }
+  # Capturing index, for OP_CAPTURE.
+  pub def cap -> Int { ar[0].nodes[id].cap }
+  # Capturing name, for OP_CAPTURE.
+  pub def name -> Str { ar[0].nodes[id].name }
+
+  # Whether two trees have identical structure (Go's Equal).
+  pub def equal?(y: Regexp) -> Bool { node_equal(ar[0].nodes, id, y.ar[0].nodes, y.id) }
+
+  # The Perl syntax for the regular expression (Go's String).
+  pub def to_s -> Str { regexp_string(ar[0].nodes, id) }
+  pub def string -> Str { regexp_string(ar[0].nodes, id) }
+
+  # The maximum capture index in the tree.
+  pub def max_cap -> Int { node_max_cap(ar[0].nodes, id) }
+
+  # The names of the capturing groups, indexed by capture number ("" for an
+  # unnamed group; names[0] is the whole match).
+  pub def cap_names -> [Str] {
+    names = [""; node_max_cap(ar[0].nodes, id) + 1]
+    node_cap_names(ar[0].nodes, id, names)
+    names
+  }
+
+  # An equivalent tree with counted repetitions expanded and other simple
+  # rewrites applied (Go's Simplify); shares unchanged subtrees with this one.
+  pub def simplify -> Regexp {
+    sm = Simplifier.new(nodes: ar[0].nodes)
+    nid = sm.simplify!(id)
+    cell = ar
+    cell[0].nodes = sm.nodes
+    at(nid)
+  }
+}
+
+# Whether x and y have identical structure.
+def node_equal(xs: [Node], x: Int, ys: [Node], y: Int) -> Bool {
+  a = xs[x]
+  b = ys[y]
+  return false if a.op != b.op
+  case a.op {
+    OP_END_TEXT => {
+      # The parse flags remember whether this is \z or \Z.
+      return false if (a.flags & WAS_DOLLAR) != (b.flags & WAS_DOLLAR)
+    }
+    OP_LITERAL | OP_CHAR_CLASS => {
+      return (a.flags & FOLD_CASE) == (b.flags & FOLD_CASE) && a.rune == b.rune
+    }
+    OP_ALTERNATE | OP_CONCAT => {
+      return false if a.sub.size != b.sub.size
+      i = 0
+      while i < a.sub.size {
+        return false if !node_equal(xs, a.sub[i], ys, b.sub[i])
+        i += 1
+      }
+      return true
+    }
+    OP_STAR | OP_PLUS | OP_QUEST => {
+      return false if (a.flags & NON_GREEDY) != (b.flags & NON_GREEDY) || !node_equal(xs, a.sub[0], ys, b.sub[0])
+    }
+    OP_REPEAT => {
+      return false if (a.flags & NON_GREEDY) != (b.flags & NON_GREEDY) || a.min != b.min || a.max != b.max || !node_equal(xs, a.sub[0], ys, b.sub[0])
+    }
+    OP_CAPTURE => {
+      return false if a.cap != b.cap || a.name != b.name || !node_equal(xs, a.sub[0], ys, b.sub[0])
+    }
+    _ => {}
+  }
+  true
+}
+
+def node_max_cap(ns: [Node], id: Int) -> Int {
+  n = ns[id]
+  m = n.op == OP_CAPTURE ? n.cap : 0
+  for s in n.sub {
+    k = node_max_cap(ns, s)
+    m = k if m < k
+  }
+  m
+}
+
+def node_cap_names(ns: [Node], id: Int, names: [Str]) -> Unit {
+  n = ns[id]
+  names[n.cap] = n.name if n.op == OP_CAPTURE
+  for s in n.sub { node_cap_names(ns, s, names) }
+}
+
+# ---------------------------------------------------------------- printing
+
+FLAG_I = 1       # (?i:
+FLAG_M = 2       # (?m:
+FLAG_S = 4       # (?s:
+FLAG_OFF = 8     # )
+FLAG_PREC = 16   # (?: )
+NEG_SHIFT = 5    # FLAG_I << NEG_SHIFT is (?-i:
+FLAG_NEG_M = 64  # FLAG_M << NEG_SHIFT: (?-m:
+FLAG_NEG_S = 128 # FLAG_S << NEG_SHIFT: (?-s:
+FLAG_NEG_MS = 192
+
+MIN_FOLD: Rune = 0x0041  # the smallest rune involved in case folding
+MAX_FOLD: Rune = 0x1E943 # the largest
+
+# State of String(): the flags to print around each node, and the output.
+struct Printer {
+  ns: [Node]
+  flags: [Int]
+  out: [[Byte]] # one cell: the output
+
+  def add_span(start: Int, last: Int, f: Int) {
+    fl = flags
+    fl[start] = f
+    fl[last] = fl[last] | FLAG_OFF # maybe start == last
+  }
+
+  # The flags that must be active or can't be active around node id: (must, cant).
+  def calc_flags(id: Int) -> (Int, Int) {
+    re = ns[id]
+    case re.op {
+      OP_LITERAL => {
+        # Fold-sensitive literal: must or can't have (?i) as the node says.
+        for r in re.rune {
+          if r >= MIN_FOLD && r <= MAX_FOLD && unicode.simple_fold(r) != r {
+            return (re.flags & FOLD_CASE) != 0 ? (FLAG_I, 0) : (0, FLAG_I)
+          }
+        }
+        return (0, 0)
+      }
+      OP_CHAR_CLASS => {
+        # Fold-sensitive class: (?i) has been compiled out.
+        i = 0
+        while i < re.rune.size {
+          lo = re.rune[i] < MIN_FOLD ? MIN_FOLD : re.rune[i]
+          hi = re.rune[i + 1] > MAX_FOLD ? MAX_FOLD : re.rune[i + 1]
+          r = lo
+          while r <= hi {
+            f = unicode.simple_fold(r)
+            while f != r {
+              return (0, FLAG_I) if !(lo <= f && f <= hi) && !in_char_class(f, re.rune)
+              f = unicode.simple_fold(f)
+            }
+            r += 1
+          }
+          i += 2
+        }
+        return (0, 0)
+      }
+      OP_ANY_CHAR_NOT_NL => {return (0, FLAG_S)}
+      OP_ANY_CHAR => {return (FLAG_S, 0)}
+      OP_BEGIN_LINE | OP_END_LINE => {return (FLAG_M, 0)}
+      OP_END_TEXT => {
+        return (0, FLAG_M) if (re.flags & WAS_DOLLAR) != 0
+        return (0, 0)
+      }
+      OP_CAPTURE | OP_STAR | OP_PLUS | OP_QUEST | OP_REPEAT => {return calc_flags(re.sub[0])}
+      OP_CONCAT | OP_ALTERNATE => {
+        # Gather must and cant for each sub; on a conflict, put the flags
+        # around the span found so far and start over.
+        must = 0
+        cant = 0
+        all_cant = 0
+        start = 0
+        last = 0
+        did = false
+        i = 0
+        while i < re.sub.size {
+          sm, sc = calc_flags(re.sub[i])
+          if (must & sc) != 0 || (sm & cant) != 0 {
+            add_span(re.sub[start], re.sub[last], must) if must != 0
+            must = 0
+            cant = 0
+            start = i
+            did = true
+          }
+          must |= sm
+          cant |= sc
+          all_cant |= sc
+          last = i if sm != 0
+          start += 1 if must == 0 && start == i
+          i += 1
+        }
+        return (must, cant) if !did
+        add_span(re.sub[start], re.sub[last], must) if must != 0
+        return (0, all_cant)
+      }
+      _ => {return (0, 0)}
+    }
+  }
+
+  def put_s(s: Str) {
+    o = out
+    i = 0
+    while i < s.size {
+      o[0] << s[i]
+      i += 1
+    }
+  }
+
+  def escape(r: Rune, force: Bool) {
+    if unicode.is_print(r) {
+      o = out
+      o[0] << 92 if force || is_meta(r)
+      o[0] = utf8.append_rune(o[0], r)
+      return
+    }
+    case r {
+      7 => put_s("\\a")
+      12 => put_s("\\f")
+      10 => put_s("\\n")
+      13 => put_s("\\r")
+      9 => put_s("\\t")
+      11 => put_s("\\v")
+      _ => {
+        if r < 0x100 {
+          put_s("\\x")
+          s = strconv.format_int(r.to_i, 16)
+          put_s("0") if s.size == 1
+          put_s(s)
+        } else {
+          put_s("\\x{")
+          put_s(strconv.format_int(r.to_i, 16))
+          put_s("}")
+        }
+      }
+    }
+  }
+
+  def write_class(rs: [Rune]) {
+    if rs.size % 2 != 0 {
+      put_s("[invalid char class]")
+      return
+    }
+    put_s("[")
+    if rs.size == 0 {
+      put_s("^\\x00-\\x{10FFFF}")
+    } else if rs[0] == 0 && rs[rs.size - 1] == 0x10FFFF && rs.size > 2 {
+      # Contains 0 and MaxRune. Probably a negated class: print the gaps.
+      put_s("^")
+      i = 1
+      while i < rs.size - 1 {
+        lo = rs[i] + 1
+        hi = rs[i + 1] - 1
+        escape(lo, lo == 45)
+        if lo != hi {
+          put_s("-") if hi != lo + 1
+          escape(hi, hi == 45)
+        }
+        i += 2
+      }
+    } else {
+      i = 0
+      while i < rs.size {
+        lo = rs[i]
+        hi = rs[i + 1]
+        escape(lo, lo == 45)
+        if lo != hi {
+          put_s("-") if hi != lo + 1
+          escape(hi, hi == 45)
+        }
+        i += 2
+      }
+    }
+    put_s("]")
+  }
+
+  def write_regexp(id: Int, f0: Int) -> Unit {
+    re = ns[id]
+    f = f0 | flags[id]
+    if (f & FLAG_PREC) != 0 && (f & ^(FLAG_OFF | FLAG_PREC)) != 0 && (f & FLAG_OFF) != 0 {
+      # FLAG_PREC is redundant with other flags being added and terminated.
+      f &= ^FLAG_PREC
+    }
+    if (f & ^(FLAG_OFF | FLAG_PREC)) != 0 {
+      put_s("(?")
+      put_s("i") if (f & FLAG_I) != 0
+      put_s("m") if (f & FLAG_M) != 0
+      put_s("s") if (f & FLAG_S) != 0
+      if (f & FLAG_NEG_MS) != 0 {
+        put_s("-")
+        put_s("m") if (f & FLAG_NEG_M) != 0
+        put_s("s") if (f & FLAG_NEG_S) != 0
+      }
+      put_s(":")
+    }
+    put_s("(?:") if (f & FLAG_PREC) != 0
+    case re.op {
+      OP_NO_MATCH => put_s("[^\\x00-\\x{10FFFF}]")
+      OP_EMPTY_MATCH => put_s("(?:)")
+      OP_LITERAL => {
+        for r in re.rune { escape(r, false) }
+      }
+      OP_CHAR_CLASS => write_class(re.rune)
+      OP_ANY_CHAR_NOT_NL | OP_ANY_CHAR => put_s(".")
+      OP_BEGIN_LINE => put_s("^")
+      OP_END_LINE => put_s("$")
+      OP_BEGIN_TEXT => put_s("\\A")
+      OP_END_TEXT => put_s((re.flags & WAS_DOLLAR) != 0 ? "$" : "\\z")
+      OP_WORD_BOUNDARY => put_s("\\b")
+      OP_NO_WORD_BOUNDARY => put_s("\\B")
+      OP_CAPTURE => {
+        if re.name != "" {
+          put_s("(?P<")
+          put_s(re.name)
+          put_s(">")
+        } else {
+          put_s("(")
+        }
+        write_regexp(re.sub[0], flags[re.sub[0]]) if ns[re.sub[0]].op != OP_EMPTY_MATCH
+        put_s(")")
+      }
+      OP_STAR | OP_PLUS | OP_QUEST | OP_REPEAT => {
+        sub = ns[re.sub[0]]
+        p = sub.op > OP_CAPTURE || (sub.op == OP_LITERAL && sub.rune.size > 1) ? FLAG_PREC : 0
+        write_regexp(re.sub[0], p)
+        case re.op {
+          OP_STAR => put_s("*")
+          OP_PLUS => put_s("+")
+          OP_QUEST => put_s("?")
+          _ => {
+            put_s("{")
+            put_s(re.min.to_s)
+            if re.max != re.min {
+              put_s(",")
+              put_s(re.max.to_s) if re.max >= 0
+            }
+            put_s("}")
+          }
+        }
+        put_s("?") if (re.flags & NON_GREEDY) != 0
+      }
+      OP_CONCAT => {
+        for s in re.sub {
+          write_regexp(s, ns[s].op == OP_ALTERNATE ? FLAG_PREC : 0)
+        }
+      }
+      OP_ALTERNATE => {
+        i = 0
+        while i < re.sub.size {
+          put_s("|") if i > 0
+          write_regexp(re.sub[i], 0)
+          i += 1
+        }
+      }
+      _ => put_s("<invalid op#{re.op}>")
+    }
+    put_s(")") if (f & FLAG_PREC) != 0
+    put_s(")") if (f & FLAG_OFF) != 0
+  }
+}
+
+def regexp_string(ns: [Node], id: Int) -> Str {
+  pr = Printer.new(ns: ns, flags: [0; ns.size], out: [[]])
+  must, cant = pr.calc_flags(id)
+  must |= (cant & ^FLAG_I) << NEG_SHIFT
+  must |= FLAG_OFF if must != 0
+  pr.write_regexp(id, must)
+  Str.from_bytes(pr.out[0])
+}
+
+# Whether r is one of \.+*?()|[]{}^$.
+def is_meta(r: Rune) -> Bool {
+  case r {
+    92 | 46 | 43 | 42 | 63 | 40 | 41 | 124 | 91 | 93 | 123 | 125 | 94 | 36 => true
+    _ => false
+  }
+}

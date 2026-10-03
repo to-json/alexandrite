@@ -1,0 +1,362 @@
+#![overflow(wrap)]
+# Package crc32: Go's hash/crc32, the 32-bit cyclic redundancy check.
+#
+#   Go                                  alx
+#   crc32.Size                          SIZE
+#   crc32.IEEE / Castagnoli / Koopman   IEEE / CASTAGNOLI / KOOPMAN
+#   crc32.Table ([256]uint32)           Table (t.entries gives the 256 entries)
+#   crc32.IEEETable                     ieee_table()
+#   crc32.MakeTable(poly) *Table        make_table(poly) -> Table
+#   crc32.New(tab) hash.Hash32          new(tab) -> Digest
+#   crc32.NewIEEE() hash.Hash32         new_ieee() -> Digest
+#   crc32.Update(crc, tab, p)           update(crc, tab, p) -> U32
+#   crc32.Checksum(data, tab)           checksum(data, tab) -> U32
+#   crc32.ChecksumIEEE(data)            checksum_ieee(data) -> U32
+#   d.Write(p) (int, error)             d.write!(p) -> Int (never fails)
+#   d.Sum(b) / Sum32 / Reset            d.sum(b) / d.sum32 / d.reset!
+#   d.Size / BlockSize                  d.size / d.block_size
+#   d.MarshalBinary / AppendBinary      d.marshal_binary / d.append_binary(b) (never fail)
+#   d.UnmarshalBinary(b) error          d.unmarshal_binary!(b) -> ~Unit<StateError>
+#   d.Clone() (hash.Cloner, error)      d.clone -> Digest
+#
+# A Digest satisfies hash.Hash and hash.Hash32 structurally.
+#
+# Differences from Go:
+#   - A Table is a value, not a pointer to an array: the IEEE and Castagnoli
+#     tables are recognized by their polynomial (Go compares pointers), and
+#     their slicing-by-8 tables are constants generated from Go (tables.alx)
+#     instead of being built on first use. Every other polynomial's Table holds
+#     its own slicing-by-8 tables (Go uses the byte-at-a-time loop for them; the
+#     sums are the same). There are no architecture-specific (SSE4.2 / ARMv8 CRC)
+#     paths.
+#   - A Digest keeps its crc in shared storage (GO-VS-RUBY D36), so copies of a
+#     Digest are the same hash, as Go's pointer is; `clone` makes an independent
+#     one. Use new / new_ieee: a zero `Digest.new` has no state.
+#   - Clone, MarshalBinary and AppendBinary can't fail, so they return plain values.
+
+# The size of a CRC-32 checksum in bytes.
+pub SIZE = 4
+
+# Reversed polynomials.
+pub IEEE = 0xedb88320       # by far the most common; Ethernet, gzip, zip, PNG ...
+pub CASTAGNOLI = 0x82f63b78 # iSCSI; better error detection, hardware support
+pub KOOPMAN = 0xeb31d82e    # also better than IEEE
+
+# Errors of Digest.unmarshal_binary!.
+pub error StateError {
+  InvalidIdentifier
+  InvalidSize
+  TableMismatch
+
+  def message -> Str {
+    case self {
+      InvalidIdentifier => "hash/crc32: invalid hash state identifier"
+      InvalidSize => "hash/crc32: invalid hash state size"
+      TableMismatch => "hash/crc32: tables do not match"
+    }
+  }
+}
+
+# A 256-entry table for a polynomial, for efficient processing.
+pub struct Table {
+  poly: U32
+  # Slicing-by-8 tables (entry [k * 256 + i]), empty for IEEE and Castagnoli,
+  # whose tables are the constants IEEE8 / CASTAGNOLI8.
+  t8: [U32]
+
+  # The polynomial this table was made from.
+  pub def poly -> U32 { poly }
+
+  # Entry i of Go's [256]uint32 table.
+  pub def at(i: Int) -> U32 {
+    if t8.size > 0 { return t8[i] }
+    if poly == CASTAGNOLI { return CASTAGNOLI8[i] }
+    IEEE8[i]
+  }
+
+  # The 256 entries of Go's table.
+  pub def entries -> [U32] {
+    out: [U32] = []
+    i = 0
+    while i < 256 {
+      out << at(i)
+      i += 1
+    }
+    out
+  }
+}
+
+# The table for the IEEE polynomial (Go's IEEETable).
+pub def ieee_table -> Table {
+  Table.new(poly: IEEE, t8: [])
+}
+
+# The Table for the polynomial `poly`. Its contents must not be modified.
+pub def make_table(poly: U32) -> Table {
+  return Table.new(poly: poly, t8: []) if poly == IEEE || poly == CASTAGNOLI
+  Table.new(poly: poly, t8: slicing_make_table(poly))
+}
+
+# Go's simpleMakeTable: the 256-entry table for poly.
+def simple_make_table(poly: U32) -> [U32] {
+  t: [U32] = []
+  i = 0
+  while i < 256 {
+    crc = i.as_u32
+    j = 0
+    while j < 8 {
+      if crc & 1 == 1 {
+        crc = (crc >> 1) ^ poly
+      } else {
+        crc = crc >> 1
+      }
+      j += 1
+    }
+    t << crc
+    i += 1
+  }
+  t
+}
+
+# Go's slicingMakeTable, flattened: entry [k * 256 + i] is table k.
+def slicing_make_table(poly: U32) -> [U32] {
+  t = simple_make_table(poly)
+  t8 = [0.as_u32; 2048]
+  i = 0
+  while i < 256 {
+    t8[i] = t[i]
+    i += 1
+  }
+  i = 0
+  while i < 256 {
+    crc = t[i]
+    j = 1
+    while j < 8 {
+      crc = t[(crc & 0xff).to_i] ^ (crc >> 8)
+      t8[j * 256 + i] = crc
+      j += 1
+    }
+    i += 1
+  }
+  t8
+}
+
+# Go's simpleUpdate: byte at a time with the first 256 entries of `tab`.
+def simple_update(crc0: U32, tab: [U32], p: [Byte]) -> U32 {
+  crc = ^crc0
+  for v in p {
+    crc = tab[((crc ^ v.as_u32) & 0xff).to_i] ^ (crc >> 8)
+  }
+  ^crc
+}
+
+# The little-endian U32 at p[i...i + 4].
+def le32(p: [Byte], i: Int) -> U32 {
+  p[i].as_u32 | (p[i + 1].as_u32 << 8) | (p[i + 2].as_u32 << 16) | (p[i + 3].as_u32 << 24)
+}
+
+# Inputs shorter than this go byte at a time.
+SLICING8_CUTOFF = 16
+
+# Go's slicingUpdate with a flattened slicing-by-8 table.
+def slicing_update(crc0: U32, t: [U32], p: [Byte]) -> U32 {
+  crc = crc0
+  n = p.size
+  i = 0
+  if n >= SLICING8_CUTOFF {
+    crc = ^crc
+    while n - i > 8 {
+      crc = crc ^ le32(p, i)
+      crc = t[p[i + 7].to_i] ^ t[256 + p[i + 6].to_i] ^ t[512 + p[i + 5].to_i] ^ t[768 + p[i + 4].to_i] ^
+      t[1024 + (crc >> 24).to_i] ^ t[1280 + ((crc >> 16) & 0xff).to_i] ^
+      t[1536 + ((crc >> 8) & 0xff).to_i] ^ t[1792 + (crc & 0xff).to_i]
+      i += 8
+    }
+    crc = ^crc
+  }
+  return crc if i == n
+  crc = ^crc
+  while i < n {
+    crc = t[((crc ^ p[i].as_u32) & 0xff).to_i] ^ (crc >> 8)
+    i += 1
+  }
+  ^crc
+}
+
+# slicing_update over the constant IEEE tables.
+def update_ieee(crc0: U32, p: [Byte]) -> U32 {
+  crc = crc0
+  n = p.size
+  i = 0
+  if n >= SLICING8_CUTOFF {
+    crc = ^crc
+    while n - i > 8 {
+      crc = crc ^ le32(p, i)
+      crc = IEEE8[p[i + 7].to_i] ^ IEEE8[256 + p[i + 6].to_i] ^ IEEE8[512 + p[i + 5].to_i] ^ IEEE8[768 + p[i + 4].to_i] ^
+      IEEE8[1024 + (crc >> 24).to_i] ^ IEEE8[1280 + ((crc >> 16) & 0xff).to_i] ^
+      IEEE8[1536 + ((crc >> 8) & 0xff).to_i] ^ IEEE8[1792 + (crc & 0xff).to_i]
+      i += 8
+    }
+    crc = ^crc
+  }
+  return crc if i == n
+  crc = ^crc
+  while i < n {
+    crc = IEEE8[((crc ^ p[i].as_u32) & 0xff).to_i] ^ (crc >> 8)
+    i += 1
+  }
+  ^crc
+}
+
+# slicing_update over the constant Castagnoli tables.
+def update_castagnoli(crc0: U32, p: [Byte]) -> U32 {
+  crc = crc0
+  n = p.size
+  i = 0
+  if n >= SLICING8_CUTOFF {
+    crc = ^crc
+    while n - i > 8 {
+      crc = crc ^ le32(p, i)
+      crc = CASTAGNOLI8[p[i + 7].to_i] ^ CASTAGNOLI8[256 + p[i + 6].to_i] ^ CASTAGNOLI8[512 + p[i + 5].to_i] ^
+      CASTAGNOLI8[768 + p[i + 4].to_i] ^ CASTAGNOLI8[1024 + (crc >> 24).to_i] ^
+      CASTAGNOLI8[1280 + ((crc >> 16) & 0xff).to_i] ^ CASTAGNOLI8[1536 + ((crc >> 8) & 0xff).to_i] ^
+      CASTAGNOLI8[1792 + (crc & 0xff).to_i]
+      i += 8
+    }
+    crc = ^crc
+  }
+  return crc if i == n
+  crc = ^crc
+  while i < n {
+    crc = CASTAGNOLI8[((crc ^ p[i].as_u32) & 0xff).to_i] ^ (crc >> 8)
+    i += 1
+  }
+  ^crc
+}
+
+# The result of adding the bytes in p to crc.
+pub def update(crc: U32, tab: Table, p: [Byte]) -> U32 {
+  return slicing_update(crc, tab.t8, p) if tab.t8.size > 0
+  return update_castagnoli(crc, p) if tab.poly == CASTAGNOLI
+  return update_ieee(crc, p) if tab.poly == IEEE
+  # A zero Table: an all-zero table.
+  slicing_update(crc, [0.as_u32; 2048], p)
+}
+
+# The CRC-32 checksum of data using the polynomial of tab.
+pub def checksum(data: [Byte], tab: Table) -> U32 {
+  update(0, tab, data)
+}
+
+# The CRC-32 checksum of data using the IEEE polynomial.
+pub def checksum_ieee(data: [Byte]) -> U32 {
+  update_ieee(0, data)
+}
+
+# A new running CRC-32 using the polynomial of tab.
+pub def new(tab: Table) -> Digest {
+  Digest.new(st: [0.as_u32], tab: tab)
+}
+
+# A new running CRC-32 using the IEEE polynomial.
+pub def new_ieee -> Digest {
+  new(ieee_table())
+}
+
+MAGIC = "crc\x01"
+MARSHALED_SIZE = 12
+
+# The IEEE checksum of the table's big-endian entries: identifies a table in
+# a marshaled state.
+def table_sum(t: Table) -> U32 {
+  b: [Byte] = []
+  for x in t.entries {
+    b = put_be32(b, x)
+  }
+  checksum_ieee(b)
+}
+
+def put_be32(b: [Byte], v: U32) -> [Byte] {
+  out = b
+  out << (v >> 24).as_u8
+  out << (v >> 16).as_u8
+  out << (v >> 8).as_u8
+  out << v.as_u8
+  out
+}
+
+# Whether b starts with the bytes of s.
+def has_magic(b: [Byte], s: Str) -> Bool {
+  return false if b.size < s.size
+  i = 0
+  while i < s.size {
+    return false if b[i] != s[i]
+    i += 1
+  }
+  true
+}
+
+def be32(b: [Byte], i: Int) -> U32 {
+  (b[i].as_u32 << 24) | (b[i + 1].as_u32 << 16) | (b[i + 2].as_u32 << 8) | b[i + 3].as_u32
+}
+
+# A running CRC-32 (Go's hash.Hash32 returned by New).
+pub struct Digest {
+  st: [U32]
+  tab: Table
+
+  # The checksum size in bytes.
+  pub def size -> Int { SIZE }
+
+  # The block size: 1.
+  pub def block_size -> Int { 1 }
+
+  # Back to the initial state.
+  pub def reset! {
+    self.st[0] = 0
+    nil
+  }
+
+  # Adds p to the running checksum; returns p.size.
+  pub def write!(p: [Byte]) -> Int {
+    self.st[0] = update(st[0], tab, p)
+    p.size
+  }
+
+  # The current checksum.
+  pub def sum32 -> U32 { st[0] }
+
+  # b with the current checksum appended, big-endian. The state is unchanged.
+  pub def sum(b: [Byte]) -> [Byte] {
+    put_be32(b, st[0])
+  }
+
+  # An independent copy of the hash in its current state.
+  pub def clone -> Digest {
+    Digest.new(st: [st[0]], tab: tab)
+  }
+
+  # b with the marshaled state appended (Go's AppendBinary).
+  pub def append_binary(b: [Byte]) -> [Byte] {
+    out = b
+    for c in MAGIC.bytes {
+      out << c
+    }
+    out = put_be32(out, table_sum(tab))
+    put_be32(out, st[0])
+  }
+
+  # The marshaled state (Go's MarshalBinary).
+  pub def marshal_binary -> [Byte] {
+    append_binary([])
+  }
+
+  # Restores a state from marshal_binary. The table must be the one the state
+  # was made with.
+  pub def unmarshal_binary!(b: [Byte]) -> ~Unit<StateError> {
+    fail StateError.InvalidIdentifier if !has_magic(b, MAGIC)
+    fail StateError.InvalidSize if b.size != MARSHALED_SIZE
+    fail StateError.TableMismatch if table_sum(tab) != be32(b, 4)
+    self.st[0] = be32(b, 8)
+  }
+}

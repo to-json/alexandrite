@@ -1,0 +1,328 @@
+#![overflow(wrap)]
+# Package crc64: Go's hash/crc64, the 64-bit cyclic redundancy check.
+#
+#   Go                                  alx
+#   crc64.Size                          SIZE
+#   crc64.ISO / ECMA                    ISO / ECMA
+#   crc64.Table ([256]uint64)           Table (t.entries gives the 256 entries)
+#   crc64.MakeTable(poly) *Table        make_table(poly) -> Table
+#   crc64.New(tab) hash.Hash64          new(tab) -> Digest
+#   crc64.Update(crc, tab, p)           update(crc, tab, p) -> U64
+#   crc64.Checksum(data, tab)           checksum(data, tab) -> U64
+#   d.Write(p) (int, error)             d.write!(p) -> Int (never fails)
+#   d.Sum(b) / Sum64 / Reset            d.sum(b) / d.sum64 / d.reset!
+#   d.Size / BlockSize                  d.size / d.block_size
+#   d.MarshalBinary / AppendBinary      d.marshal_binary / d.append_binary(b) (never fail)
+#   d.UnmarshalBinary(b) error          d.unmarshal_binary!(b) -> ~Unit<StateError>
+#   d.Clone() (hash.Cloner, error)      d.clone -> Digest
+#
+# A Digest satisfies hash.Hash and hash.Hash64 structurally.
+#
+# Differences from Go:
+#   - A Table is a value, not a pointer to an array. The ISO and ECMA
+#     slicing-by-8 tables are constants generated from Go (tables.alx) instead
+#     of being built on first use; every other polynomial's Table holds its own
+#     slicing-by-8 tables, built by make_table (Go builds them per update call
+#     for inputs of 2 kB and more, and goes byte at a time below that). The sums
+#     are the same.
+#   - A Digest keeps its crc in shared storage (GO-VS-RUBY D36), so copies of a
+#     Digest are the same hash, as Go's pointer is; `clone` makes an independent
+#     one. Use new: a zero `Digest.new` has no state.
+#   - Clone, MarshalBinary and AppendBinary can't fail, so they return plain values.
+
+# The size of a CRC-64 checksum in bytes.
+pub SIZE = 8
+
+# Reversed polynomials.
+pub ISO: U64 = 0xd800000000000000  # ISO 3309, used in HDLC
+pub ECMA: U64 = 0xc96c5795d7870f42 # ECMA 182
+
+# Errors of Digest.unmarshal_binary!.
+pub error StateError {
+  InvalidIdentifier
+  InvalidSize
+  TableMismatch
+
+  def message -> Str {
+    case self {
+      InvalidIdentifier => "hash/crc64: invalid hash state identifier"
+      InvalidSize => "hash/crc64: invalid hash state size"
+      TableMismatch => "hash/crc64: tables do not match"
+    }
+  }
+}
+
+# A 256-entry table for a polynomial, for efficient processing.
+pub struct Table {
+  poly: U64
+  # Slicing-by-8 tables (entry [k * 256 + i]), empty for ISO and ECMA, whose
+  # tables are the constants ISO8 / ECMA8.
+  t8: [U64]
+
+  # The polynomial this table was made from.
+  pub def poly -> U64 { poly }
+
+  # Entry i of Go's [256]uint64 table.
+  pub def at(i: Int) -> U64 {
+    if t8.size > 0 { return t8[i] }
+    if poly == ECMA { return ECMA8[i] }
+    ISO8[i]
+  }
+
+  # The 256 entries of Go's table.
+  pub def entries -> [U64] {
+    out: [U64] = []
+    i = 0
+    while i < 256 {
+      out << at(i)
+      i += 1
+    }
+    out
+  }
+}
+
+# The Table for the polynomial `poly`. Its contents must not be modified.
+pub def make_table(poly: U64) -> Table {
+  return Table.new(poly: poly, t8: []) if poly == ISO || poly == ECMA
+  Table.new(poly: poly, t8: slicing_make_table(make_simple_table(poly)))
+}
+
+# Go's makeTable: the 256-entry table for poly.
+def make_simple_table(poly: U64) -> [U64] {
+  t: [U64] = []
+  i = 0
+  while i < 256 {
+    crc = i.as_u64
+    j = 0
+    while j < 8 {
+      if crc & 1 == 1 {
+        crc = (crc >> 1) ^ poly
+      } else {
+        crc = crc >> 1
+      }
+      j += 1
+    }
+    t << crc
+    i += 1
+  }
+  t
+}
+
+# Go's makeSlicingBy8Table, flattened: entry [k * 256 + i] is table k.
+def slicing_make_table(t: [U64]) -> [U64] {
+  t8 = [0.as_u64; 2048]
+  i = 0
+  while i < 256 {
+    t8[i] = t[i]
+    i += 1
+  }
+  i = 0
+  while i < 256 {
+    crc = t[i]
+    j = 1
+    while j < 8 {
+      crc = t[(crc & 0xff).to_i] ^ (crc >> 8)
+      t8[j * 256 + i] = crc
+      j += 1
+    }
+    i += 1
+  }
+  t8
+}
+
+# The little-endian U64 at p[i...i + 8].
+def le64(p: [Byte], i: Int) -> U64 {
+  p[i].as_u64 | (p[i + 1].as_u64 << 8) | (p[i + 2].as_u64 << 16) | (p[i + 3].as_u64 << 24) |
+  (p[i + 4].as_u64 << 32) | (p[i + 5].as_u64 << 40) | (p[i + 6].as_u64 << 48) | (p[i + 7].as_u64 << 56)
+}
+
+# Go's update with a flattened slicing-by-8 table (its first 256 entries are
+# the byte-at-a-time table).
+def update_sliced(crc0: U64, t: [U64], p: [Byte]) -> U64 {
+  crc = ^crc0
+  n = p.size
+  i = 0
+  if n >= 64 {
+    while n - i > 8 {
+      crc = crc ^ le64(p, i)
+      crc = t[1792 + (crc & 0xff).to_i] ^ t[1536 + ((crc >> 8) & 0xff).to_i] ^
+      t[1280 + ((crc >> 16) & 0xff).to_i] ^ t[1024 + ((crc >> 24) & 0xff).to_i] ^
+      t[768 + ((crc >> 32) & 0xff).to_i] ^ t[512 + ((crc >> 40) & 0xff).to_i] ^
+      t[256 + ((crc >> 48) & 0xff).to_i] ^ t[(crc >> 56).to_i]
+      i += 8
+    }
+  }
+  while i < n {
+    crc = t[((crc ^ p[i].as_u64) & 0xff).to_i] ^ (crc >> 8)
+    i += 1
+  }
+  ^crc
+}
+
+# update_sliced over the constant ISO tables.
+def update_iso(crc0: U64, p: [Byte]) -> U64 {
+  crc = ^crc0
+  n = p.size
+  i = 0
+  if n >= 64 {
+    while n - i > 8 {
+      crc = crc ^ le64(p, i)
+      crc = ISO8[1792 + (crc & 0xff).to_i] ^ ISO8[1536 + ((crc >> 8) & 0xff).to_i] ^
+      ISO8[1280 + ((crc >> 16) & 0xff).to_i] ^ ISO8[1024 + ((crc >> 24) & 0xff).to_i] ^
+      ISO8[768 + ((crc >> 32) & 0xff).to_i] ^ ISO8[512 + ((crc >> 40) & 0xff).to_i] ^
+      ISO8[256 + ((crc >> 48) & 0xff).to_i] ^ ISO8[(crc >> 56).to_i]
+      i += 8
+    }
+  }
+  while i < n {
+    crc = ISO8[((crc ^ p[i].as_u64) & 0xff).to_i] ^ (crc >> 8)
+    i += 1
+  }
+  ^crc
+}
+
+# update_sliced over the constant ECMA tables.
+def update_ecma(crc0: U64, p: [Byte]) -> U64 {
+  crc = ^crc0
+  n = p.size
+  i = 0
+  if n >= 64 {
+    while n - i > 8 {
+      crc = crc ^ le64(p, i)
+      crc = ECMA8[1792 + (crc & 0xff).to_i] ^ ECMA8[1536 + ((crc >> 8) & 0xff).to_i] ^
+      ECMA8[1280 + ((crc >> 16) & 0xff).to_i] ^ ECMA8[1024 + ((crc >> 24) & 0xff).to_i] ^
+      ECMA8[768 + ((crc >> 32) & 0xff).to_i] ^ ECMA8[512 + ((crc >> 40) & 0xff).to_i] ^
+      ECMA8[256 + ((crc >> 48) & 0xff).to_i] ^ ECMA8[(crc >> 56).to_i]
+      i += 8
+    }
+  }
+  while i < n {
+    crc = ECMA8[((crc ^ p[i].as_u64) & 0xff).to_i] ^ (crc >> 8)
+    i += 1
+  }
+  ^crc
+}
+
+# The result of adding the bytes in p to crc.
+pub def update(crc: U64, tab: Table, p: [Byte]) -> U64 {
+  return update_sliced(crc, tab.t8, p) if tab.t8.size > 0
+  return update_ecma(crc, p) if tab.poly == ECMA
+  return update_iso(crc, p) if tab.poly == ISO
+  # A zero Table: an all-zero table.
+  update_sliced(crc, [0.as_u64; 2048], p)
+}
+
+# The CRC-64 checksum of data using the polynomial of tab.
+pub def checksum(data: [Byte], tab: Table) -> U64 {
+  update(0, tab, data)
+}
+
+# A new running CRC-64 using the polynomial of tab.
+pub def new(tab: Table) -> Digest {
+  Digest.new(st: [0.as_u64], tab: tab)
+}
+
+MAGIC = "crc\x02"
+MARSHALED_SIZE = 20
+
+# The ISO checksum of the table's big-endian entries: identifies a table in a
+# marshaled state.
+def table_sum(t: Table) -> U64 {
+  b: [Byte] = []
+  for x in t.entries {
+    b = put_be64(b, x)
+  }
+  update_iso(0, b)
+}
+
+def put_be64(b: [Byte], v: U64) -> [Byte] {
+  out = b
+  s = 56
+  while s >= 0 {
+    out << (v >> s).as_u8
+    s -= 8
+  }
+  out
+}
+
+def be64(b: [Byte], i: Int) -> U64 {
+  v: U64 = 0
+  k = 0
+  while k < 8 {
+    v = (v << 8) | b[i + k].as_u64
+    k += 1
+  }
+  v
+}
+
+# Whether b starts with the bytes of s.
+def has_magic(b: [Byte], s: Str) -> Bool {
+  return false if b.size < s.size
+  i = 0
+  while i < s.size {
+    return false if b[i] != s[i]
+    i += 1
+  }
+  true
+}
+
+# A running CRC-64 (Go's hash.Hash64 returned by New).
+pub struct Digest {
+  st: [U64]
+  tab: Table
+
+  # The checksum size in bytes.
+  pub def size -> Int { SIZE }
+
+  # The block size: 1.
+  pub def block_size -> Int { 1 }
+
+  # Back to the initial state.
+  pub def reset! {
+    self.st[0] = 0
+    nil
+  }
+
+  # Adds p to the running checksum; returns p.size.
+  pub def write!(p: [Byte]) -> Int {
+    self.st[0] = update(st[0], tab, p)
+    p.size
+  }
+
+  # The current checksum.
+  pub def sum64 -> U64 { st[0] }
+
+  # b with the current checksum appended, big-endian. The state is unchanged.
+  pub def sum(b: [Byte]) -> [Byte] {
+    put_be64(b, st[0])
+  }
+
+  # An independent copy of the hash in its current state.
+  pub def clone -> Digest {
+    Digest.new(st: [st[0]], tab: tab)
+  }
+
+  # b with the marshaled state appended (Go's AppendBinary).
+  pub def append_binary(b: [Byte]) -> [Byte] {
+    out = b
+    for c in MAGIC.bytes {
+      out << c
+    }
+    out = put_be64(out, table_sum(tab))
+    put_be64(out, st[0])
+  }
+
+  # The marshaled state (Go's MarshalBinary).
+  pub def marshal_binary -> [Byte] {
+    append_binary([])
+  }
+
+  # Restores a state from marshal_binary. The table must be the one the state
+  # was made with.
+  pub def unmarshal_binary!(b: [Byte]) -> ~Unit<StateError> {
+    fail StateError.InvalidIdentifier if !has_magic(b, MAGIC)
+    fail StateError.InvalidSize if b.size != MARSHALED_SIZE
+    fail StateError.TableMismatch if table_sum(tab) != be64(b, 4)
+    self.st[0] = be64(b, 12)
+  }
+}

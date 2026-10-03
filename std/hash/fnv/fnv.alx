@@ -1,0 +1,340 @@
+#![overflow(wrap)]
+# Package fnv: Go's hash/fnv, the non-cryptographic FNV-1 and FNV-1a hashes
+# by Glenn Fowler, Landon Curt Noll and Phong Vo
+# (https://en.wikipedia.org/wiki/Fowler-Noll-Vo_hash_function).
+#
+#   Go                                  alx
+#   fnv.New32() / New32a()              new32() -> Fnv32 / new32a() -> Fnv32a
+#   fnv.New64() / New64a()              new64() -> Fnv64 / new64a() -> Fnv64a
+#   fnv.New128() / New128a()            new128() -> Fnv128 / new128a() -> Fnv128a
+#   h.Write(p) (int, error)             h.write!(p) -> Int (never fails)
+#   h.Sum(b) / Sum32 / Sum64 / Reset    h.sum(b) / h.sum32 / h.sum64 / h.reset!
+#   h.Size / BlockSize                  h.size / h.block_size
+#   h.MarshalBinary / AppendBinary      h.marshal_binary / h.append_binary(b) (never fail)
+#   h.UnmarshalBinary(b) error          h.unmarshal_binary!(b) -> ~Unit<StateError>
+#   h.Clone() (hash.Cloner, error)      h.clone -> the same type
+#
+# The 32-bit types satisfy hash.Hash32, the 64-bit ones hash.Hash64, and all
+# of them hash.Hash, structurally.
+#
+# Differences from Go:
+#   - The constructors return the concrete types (Go returns the interfaces
+#     over unexported types); the types are exported so they can be named.
+#   - A hash keeps its state in shared storage (GO-VS-RUBY D36), so copies are
+#     the same hash, as Go's pointer is; `clone` makes an independent one. Use
+#     the constructors: a zero `Fnv32.new` has no state.
+#   - Clone, MarshalBinary and AppendBinary can't fail, so they return plain values.
+
+OFFSET32: U32 = 2166136261
+OFFSET64: U64 = 14695981039346656037
+OFFSET128_LOWER: U64 = 0x62b821756295c58d
+OFFSET128_HIGHER: U64 = 0x6c62272e07bb0142
+PRIME32: U32 = 16777619
+PRIME64: U64 = 1099511628211
+PRIME128_LOWER: U64 = 0x13b
+PRIME128_SHIFT = 24
+
+# Errors of unmarshal_binary!.
+pub error StateError {
+  InvalidIdentifier
+  InvalidSize
+
+  def message -> Str {
+    case self {
+      InvalidIdentifier => "hash/fnv: invalid hash state identifier"
+      InvalidSize => "hash/fnv: invalid hash state size"
+    }
+  }
+}
+
+# A new 32-bit FNV-1 hash.
+pub def new32 -> Fnv32 { Fnv32.new(st: [OFFSET32]) }
+
+# A new 32-bit FNV-1a hash.
+pub def new32a -> Fnv32a { Fnv32a.new(st: [OFFSET32]) }
+
+# A new 64-bit FNV-1 hash.
+pub def new64 -> Fnv64 { Fnv64.new(st: [OFFSET64]) }
+
+# A new 64-bit FNV-1a hash.
+pub def new64a -> Fnv64a { Fnv64a.new(st: [OFFSET64]) }
+
+# A new 128-bit FNV-1 hash.
+pub def new128 -> Fnv128 { Fnv128.new(st: [OFFSET128_HIGHER, OFFSET128_LOWER]) }
+
+# A new 128-bit FNV-1a hash.
+pub def new128a -> Fnv128a { Fnv128a.new(st: [OFFSET128_HIGHER, OFFSET128_LOWER]) }
+
+# The 128-bit product of x and y as (high, low): Go's bits.Mul64.
+def mul64(x: U64, y: U64) -> (U64, U64) {
+  mask: U64 = 0xffffffff
+  x0 = x & mask
+  x1 = x >> 32
+  y0 = y & mask
+  y1 = y >> 32
+  w0 = x0 * y0
+  t = x1 * y0 + (w0 >> 32)
+  w1 = t & mask
+  w2 = t >> 32
+  w1 = w1 + x0 * y1
+  (x1 * y1 + w2 + (w1 >> 32), x * y)
+}
+
+def put_be32(b: [Byte], v: U32) -> [Byte] {
+  out = b
+  out << (v >> 24).as_u8
+  out << (v >> 16).as_u8
+  out << (v >> 8).as_u8
+  out << v.as_u8
+  out
+}
+
+def put_be64(b: [Byte], v: U64) -> [Byte] {
+  out = b
+  s = 56
+  while s >= 0 {
+    out << (v >> s).as_u8
+    s -= 8
+  }
+  out
+}
+
+def be32(b: [Byte], i: Int) -> U32 {
+  (b[i].as_u32 << 24) | (b[i + 1].as_u32 << 16) | (b[i + 2].as_u32 << 8) | b[i + 3].as_u32
+}
+
+def be64(b: [Byte], i: Int) -> U64 {
+  (be32(b, i).as_u64 << 32) | be32(b, i + 4).as_u64
+}
+
+def append_magic(b: [Byte], kind: Byte) -> [Byte] {
+  out = b
+  out << 0x66 # f
+  out << 0x6e # n
+  out << 0x76 # v
+  out << kind
+  out
+}
+
+# Checks a marshaled state's identifier (fnv\x0<kind>) and size.
+def check_state(b: [Byte], kind: Byte, size: Int) -> ~Unit<StateError> {
+  if b.size < 4 || b[0] != 0x66 || b[1] != 0x6e || b[2] != 0x76 || b[3] != kind {
+    fail StateError.InvalidIdentifier
+  }
+  fail StateError.InvalidSize if b.size != size
+}
+
+# The 32-bit FNV-1 hash.
+pub struct Fnv32 {
+  st: [U32]
+
+  pub def size -> Int { 4 }
+  pub def block_size -> Int { 1 }
+
+  pub def reset! {
+    self.st[0] = OFFSET32
+    nil
+  }
+
+  pub def write!(data: [Byte]) -> Int {
+    h = st[0]
+    for c in data {
+      h = h * PRIME32
+      h = h ^ c.as_u32
+    }
+    self.st[0] = h
+    data.size
+  }
+
+  pub def sum32 -> U32 { st[0] }
+  pub def sum(b: [Byte]) -> [Byte] { put_be32(b, st[0]) }
+  pub def clone -> Fnv32 { Fnv32.new(st: [st[0]]) }
+  pub def append_binary(b: [Byte]) -> [Byte] { put_be32(append_magic(b, 1), st[0]) }
+  pub def marshal_binary -> [Byte] { append_binary([]) }
+
+  pub def unmarshal_binary!(b: [Byte]) -> ~Unit<StateError> {
+    ~check_state(b, 1, 8)
+    self.st[0] = be32(b, 4)
+  }
+}
+
+# The 32-bit FNV-1a hash.
+pub struct Fnv32a {
+  st: [U32]
+
+  pub def size -> Int { 4 }
+  pub def block_size -> Int { 1 }
+
+  pub def reset! {
+    self.st[0] = OFFSET32
+    nil
+  }
+
+  pub def write!(data: [Byte]) -> Int {
+    h = st[0]
+    for c in data {
+      h = h ^ c.as_u32
+      h = h * PRIME32
+    }
+    self.st[0] = h
+    data.size
+  }
+
+  pub def sum32 -> U32 { st[0] }
+  pub def sum(b: [Byte]) -> [Byte] { put_be32(b, st[0]) }
+  pub def clone -> Fnv32a { Fnv32a.new(st: [st[0]]) }
+  pub def append_binary(b: [Byte]) -> [Byte] { put_be32(append_magic(b, 2), st[0]) }
+  pub def marshal_binary -> [Byte] { append_binary([]) }
+
+  pub def unmarshal_binary!(b: [Byte]) -> ~Unit<StateError> {
+    ~check_state(b, 2, 8)
+    self.st[0] = be32(b, 4)
+  }
+}
+
+# The 64-bit FNV-1 hash.
+pub struct Fnv64 {
+  st: [U64]
+
+  pub def size -> Int { 8 }
+  pub def block_size -> Int { 1 }
+
+  pub def reset! {
+    self.st[0] = OFFSET64
+    nil
+  }
+
+  pub def write!(data: [Byte]) -> Int {
+    h = st[0]
+    for c in data {
+      h = h * PRIME64
+      h = h ^ c.as_u64
+    }
+    self.st[0] = h
+    data.size
+  }
+
+  pub def sum64 -> U64 { st[0] }
+  pub def sum(b: [Byte]) -> [Byte] { put_be64(b, st[0]) }
+  pub def clone -> Fnv64 { Fnv64.new(st: [st[0]]) }
+  pub def append_binary(b: [Byte]) -> [Byte] { put_be64(append_magic(b, 3), st[0]) }
+  pub def marshal_binary -> [Byte] { append_binary([]) }
+
+  pub def unmarshal_binary!(b: [Byte]) -> ~Unit<StateError> {
+    ~check_state(b, 3, 12)
+    self.st[0] = be64(b, 4)
+  }
+}
+
+# The 64-bit FNV-1a hash.
+pub struct Fnv64a {
+  st: [U64]
+
+  pub def size -> Int { 8 }
+  pub def block_size -> Int { 1 }
+
+  pub def reset! {
+    self.st[0] = OFFSET64
+    nil
+  }
+
+  pub def write!(data: [Byte]) -> Int {
+    h = st[0]
+    for c in data {
+      h = h ^ c.as_u64
+      h = h * PRIME64
+    }
+    self.st[0] = h
+    data.size
+  }
+
+  pub def sum64 -> U64 { st[0] }
+  pub def sum(b: [Byte]) -> [Byte] { put_be64(b, st[0]) }
+  pub def clone -> Fnv64a { Fnv64a.new(st: [st[0]]) }
+  pub def append_binary(b: [Byte]) -> [Byte] { put_be64(append_magic(b, 4), st[0]) }
+  pub def marshal_binary -> [Byte] { append_binary([]) }
+
+  pub def unmarshal_binary!(b: [Byte]) -> ~Unit<StateError> {
+    ~check_state(b, 4, 12)
+    self.st[0] = be64(b, 4)
+  }
+}
+
+# The 128-bit FNV-1 hash. st is [high, low].
+pub struct Fnv128 {
+  st: [U64]
+
+  pub def size -> Int { 16 }
+  pub def block_size -> Int { 1 }
+
+  pub def reset! {
+    self.st[0] = OFFSET128_HIGHER
+    self.st[1] = OFFSET128_LOWER
+    nil
+  }
+
+  pub def write!(data: [Byte]) -> Int {
+    s0 = st[0]
+    s1 = st[1]
+    for c in data {
+      hi, lo = mul64(PRIME128_LOWER, s1)
+      hi = hi + (s1 << PRIME128_SHIFT) + PRIME128_LOWER * s0
+      s1 = lo ^ c.as_u64
+      s0 = hi
+    }
+    self.st[0] = s0
+    self.st[1] = s1
+    data.size
+  }
+
+  pub def sum(b: [Byte]) -> [Byte] { put_be64(put_be64(b, st[0]), st[1]) }
+  pub def clone -> Fnv128 { Fnv128.new(st: [st[0], st[1]]) }
+  pub def append_binary(b: [Byte]) -> [Byte] { put_be64(put_be64(append_magic(b, 5), st[0]), st[1]) }
+  pub def marshal_binary -> [Byte] { append_binary([]) }
+
+  pub def unmarshal_binary!(b: [Byte]) -> ~Unit<StateError> {
+    ~check_state(b, 5, 20)
+    self.st[0] = be64(b, 4)
+    self.st[1] = be64(b, 12)
+  }
+}
+
+# The 128-bit FNV-1a hash. st is [high, low].
+pub struct Fnv128a {
+  st: [U64]
+
+  pub def size -> Int { 16 }
+  pub def block_size -> Int { 1 }
+
+  pub def reset! {
+    self.st[0] = OFFSET128_HIGHER
+    self.st[1] = OFFSET128_LOWER
+    nil
+  }
+
+  pub def write!(data: [Byte]) -> Int {
+    s0 = st[0]
+    s1 = st[1]
+    for c in data {
+      s1 = s1 ^ c.as_u64
+      hi, lo = mul64(PRIME128_LOWER, s1)
+      hi = hi + (s1 << PRIME128_SHIFT) + PRIME128_LOWER * s0
+      s1 = lo
+      s0 = hi
+    }
+    self.st[0] = s0
+    self.st[1] = s1
+    data.size
+  }
+
+  pub def sum(b: [Byte]) -> [Byte] { put_be64(put_be64(b, st[0]), st[1]) }
+  pub def clone -> Fnv128a { Fnv128a.new(st: [st[0], st[1]]) }
+  pub def append_binary(b: [Byte]) -> [Byte] { put_be64(put_be64(append_magic(b, 6), st[0]), st[1]) }
+  pub def marshal_binary -> [Byte] { append_binary([]) }
+
+  pub def unmarshal_binary!(b: [Byte]) -> ~Unit<StateError> {
+    ~check_state(b, 6, 20)
+    self.st[0] = be64(b, 4)
+    self.st[1] = be64(b, 12)
+  }
+}

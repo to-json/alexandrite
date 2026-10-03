@@ -1053,7 +1053,9 @@ fn sugar_shape_fits(te: &TypeExpr, t: &Ty) -> bool {
 pub fn type_from(t: &TypeExpr, structs: &Structs, consts: &Consts) -> R<Ty> {
     let type_from = |t| type_from(t, structs, consts);
     match t {
-        TypeExpr::Named(n, sp) if !matches!(n.as_str(), "Float" | "Bool" | "Str" | "Error" | "Unit" | "Ptr") && IntKind::from_name(n).is_none() && !structs.contains_key(n) => {
+        // (Resolved even when the main package has a type of the same name: a
+        // package's own `Hash` wins over the main package's inside it.)
+        TypeExpr::Named(n, sp) if !matches!(n.as_str(), "Float" | "Bool" | "Str" | "Error" | "Unit" | "Ptr") && IntKind::from_name(n).is_none() => {
             let q = resolve_name(n, *sp, &|q| structs.contains_key(q) || generic(q).is_some())?;
             if generic(&q).is_some() && !structs.contains_key(&q) {
                 return Err(Diag::new(*sp, format!("`{n}` is generic: give its type arguments (`{n}[...]`)")));
@@ -4007,14 +4009,16 @@ impl<'w, 'a> FnCx<'w, 'a> {
             return self.const_call_named(c, Some(t), *csp, name, name_span, args, block, sp);
         }
         // `Mutex.new(v)`, `Atomic.new(v)` (and `Mutex[T].new(v)` above).
+        // (A constant of the current package is keyed by its qualified name.)
+        let is_const = |cx: &Self, c: &str, csp: Span| resolve_name(c, csp, &|q| cx.w.consts.contains_key(q)).is_ok_and(|q| cx.w.consts.contains_key(&q));
         if let Some(Expr { kind: ExprKind::Const(c), span: csp, .. }) = recv {
-            if (c == "Mutex" || c == "Atomic") && name == "new" && !self.w.consts.contains_key(c) {
+            if (c == "Mutex" || c == "Atomic") && name == "new" && !is_const(self, c, *csp) {
                 return self.sync_new(c, None, *csp, args, sp);
             }
         }
         // Constant receivers: Int.sqrt, Array.new, File.read, Enumerator.new.
         if let Some(Expr { kind: ExprKind::Const(c), span: csp, .. }) = recv {
-            if !self.w.consts.contains_key(c) {
+            if !is_const(self, c, *csp) {
                 return self.const_call(c, *csp, name, name_span, args, block, sp);
             }
         }

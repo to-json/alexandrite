@@ -42,7 +42,7 @@ pub fn ffi_sig(d: &Def) -> R<ExternSig> {
                 TypeExpr::Named(n, _) if IntKind::from_name(n) == Some(IntKind::U8) => Ok(Ty::arr(Ty::IntK(IntKind::U8))),
                 _ => Err(Diag::new(*sp, "an `extern def` takes only a [Byte] array (a pointer to its first element)")),
             },
-            TypeExpr::Named(_, sp) | TypeExpr::Array(_, sp) | TypeExpr::Opt(_, sp) | TypeExpr::Fixed(_, _, sp) | TypeExpr::App(_, _, sp) | TypeExpr::Result(_, _, sp) | TypeExpr::Handle(_, sp) | TypeExpr::Fn(_, _, sp) | TypeExpr::Tuple(_, sp) => Err(bad(*sp)),
+            TypeExpr::Named(_, sp) | TypeExpr::Array(_, sp) | TypeExpr::Opt(_, sp) | TypeExpr::Fixed(_, _, sp) | TypeExpr::App(_, _, sp) | TypeExpr::Result(_, _, sp) | TypeExpr::Handle(_, _, sp) | TypeExpr::Fn(_, _, sp) | TypeExpr::Tuple(_, sp) => Err(bad(*sp)),
         }
     }
     let mut params = vec![];
@@ -980,11 +980,15 @@ pub fn instantiate(n: &str, g: &GenDef, targs: Vec<Ty>, sp: Span, structs: &Stru
         env.insert(tp.name.clone(), t.clone());
     }
     DEPTH.with(|d| d.set(d.get() + 1));
+    // The field types are the generic's package's names (`list.List[Int]`
+    // made in another package still finds list's private `Node`).
+    let prev = enter_pkg(&pkg_of(n));
     let fields = |fs: &[(String, TypeExpr, Span)]| fs.iter().map(|(f, te, _)| Ok((f.clone(), type_from(te, &env, consts)?))).collect::<R<Vec<_>>>();
     let r = match g {
         GenDef::S(d) => fields(&d.fields).map(|fs| Ty::Struct(name.clone(), fs)),
         GenDef::E(d) => d.variants.iter().map(|(v, fs, _)| Ok((v.clone(), fields(fs)?))).collect::<R<Vec<_>>>().map(|vs| Ty::Enum(name.clone(), vs)),
     };
+    leave_pkg(prev);
     DEPTH.with(|d| d.set(d.get() - 1));
     let t = r?;
     INSTS.with(|m| m.borrow_mut().insert(name, (n.to_string(), targs)));
@@ -1020,6 +1024,15 @@ pub fn bind_tparams(te: &TypeExpr, t: &Ty, tps: &[TParam], out: &mut HashMap<Str
         (TypeExpr::App(n, args, _), Ty::Map(k, v)) if n == "Map" && args.len() == 2 => {
             bind_tparams(&args[0], k, tps, out);
             bind_tparams(&args[1], v, tps, out);
+        }
+        (TypeExpr::Handle(n, args, _), Ty::Handle(h)) if !args.is_empty() => {
+            if let Some((base, targs)) = INSTS.with(|m| m.borrow().get(h).cloned()) {
+                if base == *n || base.ends_with(&format!(".{n}")) {
+                    for (a, x) in args.iter().zip(&targs) {
+                        bind_tparams(a, x, tps, out);
+                    }
+                }
+            }
         }
         (TypeExpr::App(n, args, _), t) => {
             if let Some((base, targs)) = inst_args(t) {
@@ -1081,7 +1094,21 @@ pub fn type_from(t: &TypeExpr, structs: &Structs, consts: &Consts) -> R<Ty> {
         },
         TypeExpr::Array(t, _) => Ok(Ty::arr(type_from(t)?)),
         TypeExpr::Result(t, _, _) => Ok(Ty::Result(Box::new(type_from(t)?))),
-        TypeExpr::Handle(n, sp) => {
+        TypeExpr::Handle(n, args, sp) if !args.is_empty() => {
+            // `@Node[T]`: named like the instance (`Node[Int]`), which isn't
+            // made here: a handle only names its type (the instance may be
+            // the struct being made, `struct Node[T] { next: @Node[T]? }`).
+            let g = resolve_name(n, *sp, &|q| generic(q).is_some())?;
+            let Some(gd) = generic(&g) else {
+                return Err(Diag::new(*sp, format!("`{n}` isn't a generic type")));
+            };
+            if gd.tparams().len() != args.len() {
+                return Err(Diag::new(*sp, format!("`{n}` takes {} type argument(s), got {}", gd.tparams().len(), args.len())));
+            }
+            let targs = args.iter().map(type_from).collect::<R<Vec<_>>>()?;
+            Ok(Ty::Handle(format!("{g}[{}]", targs.iter().map(Ty::show).collect::<Vec<_>>().join(", "))))
+        }
+        TypeExpr::Handle(n, _, sp) => {
             let q = resolve_name(n, *sp, &|q| structs.contains_key(q) || generic(q).is_some() || DECLARED.with(|d| d.borrow().contains(q)))?;
             if !(structs.contains_key(&q) || DECLARED.with(|d| d.borrow().contains(&q))) {
                 return Err(Diag::new(*sp, format!("unknown type `{n}`")));
@@ -1181,6 +1208,11 @@ struct FnCx<'w, 'a> {
     /// In a method: `Some(true)` for a `!` method (`self` is a one-element
     /// slice holding the receiver), `Some(false)` for one taking a copy.
     method: Option<bool>,
+    /// The types this generic def's type parameters are bound to (by name):
+    /// their methods are callable here even when not `pub`, since the caller
+    /// handed the type over for exactly that (`heap.push(h, x)` calls the
+    /// caller's `h.push!`).
+    targ_types: Vec<String>,
     /// The next block checked has its value discarded (`each`, `step`).
     block_unused: bool,
 }
@@ -1219,6 +1251,7 @@ fn lev(a: &str, b: &str) -> usize {
 
 impl<'w, 'a> FnCx<'w, 'a> {
     fn new(w: &'w mut World<'a>, def: Option<&Def>, _overflow: Overflow, hints: &'w HashMap<(NodeId, u32), Ty>, strict: bool) -> Self {
+        let targ_types = def.map_or_else(Vec::new, |d| d.tparams.iter().filter_map(|tp| w.structs.get(&tp.name).and_then(|t| t.type_name().map(str::to_string))).collect());
         FnCx {
             w,
             locals: vec![],
@@ -1242,6 +1275,7 @@ impl<'w, 'a> FnCx<'w, 'a> {
             lambda_info: vec![],
             method: def.filter(|d| d.params.first().is_some_and(|p| p.name == "self")).map(|d| d.name.ends_with('!')),
             block_unused: false,
+            targ_types,
             is_main: def.is_none(),
             ret: Ty::Unit,
             impure: false,
@@ -3076,6 +3110,19 @@ impl<'w, 'a> FnCx<'w, 'a> {
                 bind_tparams(te, &at, &d.tparams, &mut env);
             }
         }
+        // A generic type's method (`r.do { |v| }` on a `Ring[Int]`): its
+        // type's parameters come from the receiver.
+        if let (Some((owner, _)), Some(a0)) = (d.name.rsplit_once('.'), before.first()) {
+            if let Some(g) = generic(owner).filter(|_| d.params.first().is_some_and(|p| p.name == "self")) {
+                let st = self.resolve(&a0.ty);
+                let st = st.arr_elem().filter(|_| d.name.ends_with('!')).unwrap_or(st);
+                if let Some((_, targs)) = inst_args(&st) {
+                    for (tp, t) in g.tparams().iter().zip(targs) {
+                        env.entry(tp.name.clone()).or_insert(t);
+                    }
+                }
+            }
+        }
         let prev = enter_pkg(&self.w.defs[def].pkg);
         let want = match d.params.last().and_then(|p| p.ty.as_ref()) {
             Some(te) => subst_type(te, &env, &self.w.structs, &self.w.consts),
@@ -4277,7 +4324,8 @@ impl<'w, 'a> FnCx<'w, 'a> {
     /// Call def `def` with checked arguments (a method's include `self`).
     fn call_def(&mut self, def: usize, name: &str, name_span: Span, args: Vec<TExpr>, sp: Span) -> R<TExpr> {
         let d = self.w.defs[def].def.clone();
-        if !d.public && self.w.defs[def].pkg != current_pkg() {
+        let via_targ = d.name.rsplit_once('.').is_some_and(|(owner, _)| self.targ_types.iter().any(|t| t == owner));
+        if !d.public && self.w.defs[def].pkg != current_pkg() && !via_targ {
             let shown = d.name.rsplit('/').next().unwrap_or(&d.name);
             return Err(Diag::new(name_span, format!("`{shown}` isn't public; its package must declare it `pub def`")));
         }
@@ -5111,8 +5159,13 @@ impl<'w, 'a> FnCx<'w, 'a> {
                     return Ok(mk_m(self, M::PoolRemove, recv, vec![h], None, Ty::Opt(Box::new(t))));
                 }
                 ("size" | "length", 0) => return Ok(mk_m(self, M::PoolSize, recv, vec![], None, Ty::Int)),
+                ("get", 1) => {
+                    let h = self.value(&args[0])?;
+                    self.expect(&h.ty, &ht, h.span, "pool handle")?;
+                    return Ok(mk_m(self, M::PoolLookup, recv, vec![h], None, Ty::Opt(Box::new(t))));
+                }
                 _ if SEQ_METHODS.contains(&name) => {}
-                _ => return Err(Diag::new(name_span, format!("no method `{name}` on {}; it has add, remove, size, [h], and the Enumerable methods over (handle, value)", rt.show()))),
+                _ => return Err(Diag::new(name_span, format!("no method `{name}` on {}; it has add, remove, size, get, [h], and the Enumerable methods over (handle, value)", rt.show()))),
             }
         }
         if let (Ty::Task(t), "wait", 0) = (&rt, name, args.len()) {

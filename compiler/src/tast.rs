@@ -301,6 +301,8 @@ pub enum M {
     PoolNew,
     PoolAdd,
     PoolGet,
+    /// `p.get(h)`: the value, or none for a removed (or foreign, out of range) handle.
+    PoolLookup,
     PoolSet,
     PoolRemove,
     PoolSize,

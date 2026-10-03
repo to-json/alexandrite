@@ -83,6 +83,11 @@ struct Gen<'a> {
     p: &'a LProgram,
 }
 
+thread_local! {
+    /// Types of tuple literals, declared after the bodies are emitted.
+    static LITERAL_TYPES: std::cell::RefCell<Vec<LTy>> = const { std::cell::RefCell::new(vec![]) };
+}
+
 pub fn emit(p: &LProgram) -> String {
     let mut g = Gen { out: String::new(), types_done: HashSet::new(), typedefs: String::new(), p };
     // Collect every type used.
@@ -129,6 +134,9 @@ pub fn emit(p: &LProgram) -> String {
         if !f.external {
             g.func(f);
         }
+    }
+    for t in LITERAL_TYPES.with(|l| std::mem::take(&mut *l.borrow_mut())) {
+        g.need_type(&t);
     }
     let main = p.funcs.iter().find(|f| f.is_main).map(|f| f.name.clone()).unwrap_or_default();
     let mut s = String::new();
@@ -697,7 +705,11 @@ impl FnEmit<'_> {
             LE::S(s) => format!("alx_str_lit({}, {})", c_str(s), s.len()),
             LE::Loc(s) => c_str(s),
             LE::Unit => "0".into(),
-            LE::Tup(t, vs) => format!("(({}){{{}}})", cty(t), vs.iter().map(|x| self.e(x)).collect::<Vec<_>>().join(", ")),
+            LE::Tup(t, vs) => {
+                // A literal's type may be held by no variable (`Zero[T].new.v`).
+                LITERAL_TYPES.with(|l| l.borrow_mut().push(t.clone()));
+                format!("(({}){{{}}})", cty(t), vs.iter().map(|x| self.e(x)).collect::<Vec<_>>().join(", "))
+            }
             LE::Field(x, i) => format!("({}).f{i}", self.e(x)),
             LE::Arith(op, a, b, ovf) => {
                 let (a, b) = (self.e(a), self.e(b));

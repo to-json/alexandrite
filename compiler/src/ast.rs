@@ -232,7 +232,7 @@ pub fn texpr_word(t: &TypeExpr) -> String {
         TypeExpr::Fixed(e, _, _) => format!("Fixed{}", texpr_word(e)),
         TypeExpr::App(n, args, _) => format!("{n}{}", args.iter().map(texpr_word).collect::<String>()),
         TypeExpr::Result(e, _, _) => format!("Res{}", texpr_word(e)),
-        TypeExpr::Handle(n, _) => format!("H{}", n.replace(['.', '/'], "_")),
+        TypeExpr::Handle(n, args, _) => format!("H{}{}", n.replace(['.', '/'], "_"), args.iter().map(texpr_word).collect::<String>()),
         TypeExpr::Fn(ps, r, _) => format!("Fn{}To{}", ps.iter().map(texpr_word).collect::<String>(), texpr_word(r)),
         TypeExpr::Tuple(ts, _) => format!("Tup{}End", ts.iter().map(texpr_word).collect::<String>()),
     }
@@ -284,8 +284,8 @@ pub enum TypeExpr {
     /// `~T`, `~T<E | F>`: a fallible T (a Result value when held).
     Result(Box<TypeExpr>, Option<Vec<String>>, Span),
     /// `@Node`: a handle into a `Pool[Node]` (refers to the type by name, so
-    /// `struct Node { kids: [@Node] }` is fine).
-    Handle(String, Span),
+    /// `struct Node { kids: [@Node] }` is fine); `@Node[T]` for a generic one.
+    Handle(String, Vec<TypeExpr>, Span),
     /// `(A, B) -> R`: a function value (a lambda).
     Fn(Vec<TypeExpr>, Box<TypeExpr>, Span),
     /// `(A, B)`: a tuple (Go's multiple results, held as one value).

@@ -1,0 +1,203 @@
+#![overflow(wrap)]
+import "crypto/internal/fips140/edwards25519/field"
+import "encoding/hex"
+
+# Go's edwards25519_test.go, translated, and the helpers the other test
+# files share.
+#
+# testing/quick draws random Scalars with Scalar.Generate; here a seeded
+# splitmix64 generator (Rng) draws them with the same distribution, so the
+# property checks are reproducible.
+#
+# Not translated: TestComparable (Go checks that Point is not comparable
+# with ==; alx structs always are, see the header).
+
+# A splitmix64 stream: the deterministic stand-in for math/rand.
+struct Rng {
+  st: [U64]
+
+  def next! -> U64 {
+    self.st[0] = st[0] + 0x9e3779b97f4a7c15
+    z = st[0]
+    z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9
+    z = (z ^ (z >> 27)) * 0x94d049bb133111eb
+    z ^ (z >> 31)
+  }
+
+  def intn!(n: Int) -> Int { (self.next! % n.as_u64).as_i64 }
+
+  # Fills b[lo...hi] with random bytes.
+  def read!(b: [Byte], lo: Int, hi: Int) {
+    i = lo
+    while i < hi {
+      b[i] = self.next!.as_u8
+      i += 1
+    }
+  }
+}
+
+def new_rng(seed: U64) -> Rng { Rng.new(st: [seed]) }
+
+def b_point -> Point { new_generator_point() }
+
+def i_point -> Point { new_identity_point() }
+
+def decode_hex(s: Str) -> [Byte] { hex.decode_string(s).unwrap }
+
+# Whether p's coordinates specify a point on the curve, with T consistent.
+def on_curve?(p: Point) -> Bool {
+  xx = p.x.square
+  yy = p.y.square
+  zz = p.z.square
+  zzzz = zz.square
+  # -x^2 + y^2 = 1 + dx^2y^2
+  # -(X/Z)^2 + (Y/Z)^2 = 1 + d(X/Z)^2(Y/Z)^2
+  # (-X^2 + Y^2)/Z^2 = 1 + (dX^2Y^2)/Z^4
+  # (-X^2 + Y^2)*Z^2 = Z^4 + dX^2Y^2
+  lhs = yy.subtract(xx).multiply(zz)
+  rhs = d.multiply(xx).multiply(yy).add(zzzz)
+  return false if lhs.equal(rhs) != 1
+  # xy = T/Z
+  p.x.multiply(p.y).equal(p.z.multiply(p.t)) == 1
+}
+
+test "generator" {
+  # The coordinates of B from RFC 8032, Section 5.1, converted to little
+  # endian hex.
+  x = "1ad5258f602d56c9b2a7259560c72c695cdcd6fd31e2a4c0fe536ecdd3366921"
+  y = "5866666666666666666666666666666666666666666666666666666666666666"
+  b = b_point
+  assert_eq hex.encode_to_string(b.x.bytes), x
+  assert_eq hex.encode_to_string(b.y.bytes), y
+  assert_eq b.z.equal(field.one()), 1
+  # Check that t is correct.
+  assert on_curve?(b), "on curve"
+  # The constants match their decoded encodings (Go decodes them at init).
+  enc = decode_hex("5866666666666666666666666666666666666666666666666666666666666666")
+  assert Point.set_bytes(enc).unwrap == b, "generator limbs"
+  assert_eq Point.set_bytes(b.bytes).unwrap.equal(b), 1
+  i = Point.set_bytes(decode_hex("0100000000000000000000000000000000000000000000000000000000000000")).unwrap
+  assert_eq i.equal(i_point), 1
+}
+
+test "d constants" {
+  d_bytes: [Byte] = [0xa3, 0x78, 0x59, 0x13, 0xca, 0x4d, 0xeb, 0x75, 0xab, 0xd8, 0x41, 0x41, 0x4d, 0x0a, 0x70, 0x00, 0x98,
+    0xe8, 0x79, 0x77, 0x79, 0x40, 0xc7, 0x8c, 0x73, 0xfe, 0x6f, 0x2b, 0xee, 0x6c, 0x03, 0x52]
+  dd = field.set_bytes(d_bytes).unwrap
+  assert dd == d, "d"
+  assert dd.add(dd) == d2, "d2"
+}
+
+test "add sub neg on base point" {
+  b = b_point
+  check_lhs = b.add(b)
+  check_rhs = p3_from_p1xp1(p1xp1_double(p2_from_p3(b)))
+  assert_eq check_lhs.equal(check_rhs), 1
+  assert on_curve?(check_lhs) && on_curve?(check_rhs), "on curve"
+
+  check_lhs = b.subtract(b)
+  bneg = b.negate
+  check_rhs = b.add(bneg)
+  assert_eq check_lhs.equal(check_rhs), 1
+  assert_eq i_point.equal(check_lhs), 1
+  assert_eq i_point.equal(check_rhs), 1
+  assert on_curve?(check_lhs) && on_curve?(check_rhs) && on_curve?(bneg), "on curve"
+}
+
+test "invalid encodings" {
+  # An invalid point, that also happens to have y > p.
+  invalid = "efffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f"
+  r = Point.set_bytes(decode_hex(invalid))
+  assert r.err?, "expected error for invalid point"
+  assert_eq r.err.unwrap.message, "edwards25519: invalid point encoding"
+  r = Point.set_bytes(decode_hex("0100"))
+  assert_eq r.err.unwrap.message, "edwards25519: invalid point encoding length"
+}
+
+test "non canonical points" {
+  tests: [(Str, Str, Str)] = [
+    # Points with x = 0 and the sign bit set. With x = 0 the curve equation
+    # gives y^2 = 1, so y = +-1. 1 has two valid encodings.
+    ("y=1,sign-", "0100000000000000000000000000000000000000000000000000000000000080",
+      "0100000000000000000000000000000000000000000000000000000000000000"),
+    ("y=p+1,sign-", "eeffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+      "0100000000000000000000000000000000000000000000000000000000000000"),
+    ("y=p-1,sign-", "ecffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+      "ecffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f"),
+    # Non-canonical y encodings with values 2^255-19 (p) to 2^255-1 (p+18).
+    ("y=p,sign+", "edffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
+      "0000000000000000000000000000000000000000000000000000000000000000"),
+    ("y=p,sign-", "edffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+      "0000000000000000000000000000000000000000000000000000000000000080"),
+    ("y=p+1,sign+", "eeffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
+      "0100000000000000000000000000000000000000000000000000000000000000"),
+    # "y=p+1,sign-" is already tested above.
+    # p+2 is not a valid y-coordinate.
+    ("y=p+3,sign+", "f0ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
+      "0300000000000000000000000000000000000000000000000000000000000000"),
+    ("y=p+3,sign-", "f0ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+      "0300000000000000000000000000000000000000000000000000000000000080"),
+    ("y=p+4,sign+", "f1ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
+      "0400000000000000000000000000000000000000000000000000000000000000"),
+    ("y=p+4,sign-", "f1ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+      "0400000000000000000000000000000000000000000000000000000000000080"),
+    ("y=p+5,sign+", "f2ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
+      "0500000000000000000000000000000000000000000000000000000000000000"),
+    ("y=p+5,sign-", "f2ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+      "0500000000000000000000000000000000000000000000000000000000000080"),
+    ("y=p+6,sign+", "f3ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
+      "0600000000000000000000000000000000000000000000000000000000000000"),
+    ("y=p+6,sign-", "f3ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+      "0600000000000000000000000000000000000000000000000000000000000080"),
+    # p+7 is not a valid y-coordinate.
+    # p+8 is not a valid y-coordinate.
+    ("y=p+9,sign+", "f6ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
+      "0900000000000000000000000000000000000000000000000000000000000000"),
+    ("y=p+9,sign-", "f6ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+      "0900000000000000000000000000000000000000000000000000000000000080"),
+    ("y=p+10,sign+", "f7ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
+      "0a00000000000000000000000000000000000000000000000000000000000000"),
+    ("y=p+10,sign-", "f7ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+      "0a00000000000000000000000000000000000000000000000000000000000080"),
+    # p+11 is not a valid y-coordinate.
+    # p+12 is not a valid y-coordinate.
+    # p+13 is not a valid y-coordinate.
+    ("y=p+14,sign+", "fbffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
+      "0e00000000000000000000000000000000000000000000000000000000000000"),
+    ("y=p+14,sign-", "fbffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+      "0e00000000000000000000000000000000000000000000000000000000000080"),
+    ("y=p+15,sign+", "fcffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
+      "0f00000000000000000000000000000000000000000000000000000000000000"),
+    ("y=p+15,sign-", "fcffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+      "0f00000000000000000000000000000000000000000000000000000000000080"),
+    ("y=p+16,sign+", "fdffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
+      "1000000000000000000000000000000000000000000000000000000000000000"),
+    ("y=p+16,sign-", "fdffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+      "1000000000000000000000000000000000000000000000000000000000000080"),
+    # p+17 is not a valid y-coordinate.
+    ("y=p+18,sign+", "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
+      "1200000000000000000000000000000000000000000000000000000000000000"),
+    ("y=p+18,sign-", "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+      "1200000000000000000000000000000000000000000000000000000000000080")
+  ]
+  for tt in tests {
+    p1 = Point.set_bytes(decode_hex(tt[1])).unwrap
+    p2 = Point.set_bytes(decode_hex(tt[2])).unwrap
+    assert p1.equal(p2) == 1, "#{tt[0]}: equivalent points are not equal"
+    assert_eq hex.encode_to_string(p1.bytes), tt[2]
+    assert on_curve?(p1) && on_curve?(p2), "#{tt[0]}: on curve"
+  }
+}
+
+test "uninitialized point panics" {
+  t = spawn { Point.new.bytes }
+  r = t.wait
+  assert r.err?, "uninitialized point"
+}
+
+bench "encoding decoding" {
+  p = dalek_scalar_basepoint
+  buf = p.bytes
+  p = Point.set_bytes(buf).unwrap
+  assert p.z.equal(field.one()) == 1, "bench"
+}

@@ -1,0 +1,148 @@
+#![overflow(wrap)]
+# Scalar multiplication (Go's scalarmult.go).
+
+# x * B, where B is the canonical generator, in constant time.
+pub def scalar_base_mult(x: Scalar) -> Point {
+  # Write x = sum(x_i * 16^i) so  x*B = sum( B*x_i*16^i )
+  # as described in the Ed25519 paper
+  #
+  # Group even and odd coefficients
+  # x*B     = x_0*16^0*B + x_2*16^2*B + ... + x_62*16^62*B
+  #         + x_1*16^1*B + x_3*16^3*B + ... + x_63*16^63*B
+  # x*B     = x_0*16^0*B + x_2*16^2*B + ... + x_62*16^62*B
+  #    + 16*( x_1*16^0*B + x_3*16^2*B + ... + x_63*16^62*B)
+  #
+  # We use a lookup table for each i to get x_i*16^(2*i)*B
+  # and do four doublings to multiply by 16.
+  digits = x.signed_radix16
+
+  # Accumulate the odd components first
+  v = new_identity_point()
+  i = 1
+  while i < 64 {
+    multiple = basepoint_select(i / 2, digits[i])
+    v = p3_from_p1xp1(p1xp1_add_affine(v, multiple))
+    i += 2
+  }
+
+  # Multiply by 16
+  tmp2 = p2_from_p3(v)       # tmp2 =    v in P2 coords
+  tmp1 = p1xp1_double(tmp2)  # tmp1 =  2*v in P1xP1 coords
+  tmp2 = p2_from_p1xp1(tmp1) # tmp2 =  2*v in P2 coords
+  tmp1 = p1xp1_double(tmp2)  # tmp1 =  4*v in P1xP1 coords
+  tmp2 = p2_from_p1xp1(tmp1) # tmp2 =  4*v in P2 coords
+  tmp1 = p1xp1_double(tmp2)  # tmp1 =  8*v in P1xP1 coords
+  tmp2 = p2_from_p1xp1(tmp1) # tmp2 =  8*v in P2 coords
+  tmp1 = p1xp1_double(tmp2)  # tmp1 = 16*v in P1xP1 coords
+  v = p3_from_p1xp1(tmp1)    # now v = 16*(odd components)
+
+  # Accumulate the even components
+  i = 0
+  while i < 64 {
+    multiple = basepoint_select(i / 2, digits[i])
+    v = p3_from_p1xp1(p1xp1_add_affine(v, multiple))
+    i += 2
+  }
+  v
+}
+
+# x * q, in constant time.
+pub def scalar_mult(x: Scalar, q: Point) -> Point {
+  check_initialized(q)
+
+  table = proj_table_from_p3(q)
+
+  # Write x = sum(x_i * 16^i)
+  # so  x*Q = sum( Q*x_i*16^i )
+  #         = Q*x_0 + 16*(Q*x_1 + 16*( ... + Q*x_63) ... )
+  #           <------compute inside out---------
+  #
+  # We use the lookup table to get the x_i*Q values
+  # and do four doublings to compute 16*Q
+  digits = x.signed_radix16
+
+  # Unwrap first loop iteration to save computing 16*identity
+  multiple = table.select_into(digits[63])
+
+  v = new_identity_point()
+  tmp1 = p1xp1_add(v, multiple) # tmp1 = x_63*Q in P1xP1 coords
+  i = 62
+  while i >= 0 {
+    tmp2 = p2_from_p1xp1(tmp1) # tmp2 =    (prev) in P2 coords
+    tmp1 = p1xp1_double(tmp2)  # tmp1 =  2*(prev) in P1xP1 coords
+    tmp2 = p2_from_p1xp1(tmp1) # tmp2 =  2*(prev) in P2 coords
+    tmp1 = p1xp1_double(tmp2)  # tmp1 =  4*(prev) in P1xP1 coords
+    tmp2 = p2_from_p1xp1(tmp1) # tmp2 =  4*(prev) in P2 coords
+    tmp1 = p1xp1_double(tmp2)  # tmp1 =  8*(prev) in P1xP1 coords
+    tmp2 = p2_from_p1xp1(tmp1) # tmp2 =  8*(prev) in P2 coords
+    tmp1 = p1xp1_double(tmp2)  # tmp1 = 16*(prev) in P1xP1 coords
+    v = p3_from_p1xp1(tmp1)    #    v = 16*(prev) in P3 coords
+    multiple = table.select_into(digits[i])
+    tmp1 = p1xp1_add(v, multiple) # tmp1 = x_i*Q + 16*(prev) in P1xP1 coords
+    i -= 1
+  }
+  p3_from_p1xp1(tmp1)
+}
+
+# a * aa + b * B, where B is the canonical generator. Execution time
+# depends on the inputs.
+pub def var_time_double_scalar_base_mult(a: Scalar, aa: Point, b: Scalar) -> Point {
+  check_initialized(aa)
+
+  # Similarly to the single variable-base approach, we compute digits and
+  # use them with a lookup table. However, because we are allowed to do
+  # variable-time operations, we don't need constant-time lookups or
+  # constant-time digit computations.
+  #
+  # So we use a non-adjacent form of some width w instead of radix 16.
+  # This is like a binary representation (one digit for each binary place)
+  # but we allow the digits to grow in magnitude up to 2^{w-1} so that the
+  # nonzero digits are as sparse as possible. Intuitively, this "condenses"
+  # the "mass" of the scalar onto sparse coefficients (meaning fewer
+  # additions).
+
+  a_table = naf_table5_from_p3(aa)
+  # Because the basepoint is fixed, we can use a wider NAF corresponding to
+  # a bigger table.
+  a_naf = a.non_adjacent_form(5)
+  b_naf = b.non_adjacent_form(8)
+
+  # Find the first nonzero coefficient.
+  i = 255
+  while i >= 0 {
+    break if a_naf[i] != 0 || b_naf[i] != 0
+    i -= 1
+  }
+
+  v = new_identity_point()
+  tmp2 = p2_zero()
+
+  # Move from high to low bits, doubling the accumulator at each iteration
+  # and checking whether there is a nonzero coefficient to look up a
+  # multiple of.
+  while i >= 0 {
+    tmp1 = p1xp1_double(tmp2)
+
+    # Only update v if we have a nonzero coeff to add in.
+    if a_naf[i] > 0 {
+      v = p3_from_p1xp1(tmp1)
+      tmp1 = p1xp1_add(v, a_table.select_into(a_naf[i]))
+    } elsif a_naf[i] < 0 {
+      v = p3_from_p1xp1(tmp1)
+      tmp1 = p1xp1_sub(v, a_table.select_into(-a_naf[i]))
+    }
+
+    if b_naf[i] > 0 {
+      v = p3_from_p1xp1(tmp1)
+      tmp1 = p1xp1_add_affine(v, basepoint_naf_select(b_naf[i]))
+    } elsif b_naf[i] < 0 {
+      v = p3_from_p1xp1(tmp1)
+      tmp1 = p1xp1_sub_affine(v, basepoint_naf_select(-b_naf[i]))
+    }
+
+    tmp2 = p2_from_p1xp1(tmp1)
+    i -= 1
+  }
+
+  p3_from_p2(tmp2)
+}

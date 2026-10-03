@@ -1,0 +1,166 @@
+#![overflow(wrap)]
+import "crypto/internal/fips140/edwards25519/field"
+
+# Lookup tables for scalar multiplication (Go's tables.go). The fixed-base
+# tables are constants (basepoint_table.alx); the others are built at run
+# time.
+
+# A dynamic lookup table for variable-base, constant-time scalar muls:
+# points[i] = (i+1)*Q.
+struct ProjLookupTable {
+  points: [ProjCached]
+
+  # x*Q, where -8 <= x <= 8, in constant time.
+  def select_into(x: I8) -> ProjCached {
+    # Compute xabs = |x|
+    xmask = x >> 7
+    xabs = ((x + xmask) ^ xmask).as_u8
+
+    dest = cached_zero()
+    j = 1
+    while j <= 8 {
+      # Set dest = j*Q if |x| = j
+      cond = byte_eq(xabs, j.as_u8)
+      dest = cached_select(points[j - 1], dest, cond)
+      j += 1
+    }
+    # Now dest = |x|*Q, conditionally negate to get x*Q
+    cached_cond_neg(dest, (xmask & 1).as_i64)
+  }
+}
+
+# A lookup table for fixed-base, constant-time scalar muls:
+# points[i] = (i+1)*Q. (The basepoint's are constants; this type builds
+# one for any point, for the tests.)
+struct AffineLookupTable {
+  points: [AffineCached]
+
+  # x*Q, where -8 <= x <= 8, in constant time.
+  def select_into(x: I8) -> AffineCached {
+    xmask = x >> 7
+    xabs = ((x + xmask) ^ xmask).as_u8
+
+    dest = affine_zero()
+    j = 1
+    while j <= 8 {
+      cond = byte_eq(xabs, j.as_u8)
+      dest = affine_select(points[j - 1], dest, cond)
+      j += 1
+    }
+    affine_cond_neg(dest, (xmask & 1).as_i64)
+  }
+}
+
+# A dynamic lookup table for variable-base, variable-time scalar muls:
+# points[i] = (2*i+1)*Q.
+struct NafLookupTable5 {
+  points: [ProjCached]
+
+  # x*Q for odd x with 0 < x < 2^4 (in variable time).
+  def select_into(x: I8) -> ProjCached { points[(x / 2).as_i64] }
+}
+
+# A lookup table for fixed-base, variable-time scalar muls:
+# points[i] = (2*i+1)*Q. (The basepoint's is a constant; tests only.)
+struct NafLookupTable8 {
+  points: [AffineCached]
+
+  # x*Q for odd x with 0 < x < 2^7 (in variable time).
+  def select_into(x: I8) -> AffineCached { points[(x / 2).as_i64] }
+}
+
+# 1 if x == y, and 0 otherwise (Go's constanttime.ByteEq).
+def byte_eq(x: Byte, y: Byte) -> Int {
+  z = (x ^ y).as_u32
+  ((z - 1) >> 31).as_i64
+}
+
+# Builds a lookup table at run time. Fast.
+def proj_table_from_p3(q: Point) -> ProjLookupTable {
+  # Goal: points[i] = (i+1)*Q, i.e., Q, 2Q, ..., 8Q
+  # This allows lookup of -8Q, ..., -Q, 0, Q, ..., 8Q
+  points = [cached_from_p3(q)]
+  i = 0
+  while i < 7 {
+    # Compute (i+1)*Q as Q + i*Q and convert to a ProjCached
+    points << cached_from_p3(p3_from_p1xp1(p1xp1_add(q, points[i])))
+    i += 1
+  }
+  ProjLookupTable.new(points)
+}
+
+# Not optimised for speed; fixed-base tables are precomputed.
+def affine_table_from_p3(q: Point) -> AffineLookupTable {
+  points = [affine_from_p3(q)]
+  i = 0
+  while i < 7 {
+    # Compute (i+1)*Q as Q + i*Q and convert to AffineCached
+    points << affine_from_p3(p3_from_p1xp1(p1xp1_add_affine(q, points[i])))
+    i += 1
+  }
+  AffineLookupTable.new(points)
+}
+
+# Builds a lookup table at run time. Fast.
+def naf_table5_from_p3(q: Point) -> NafLookupTable5 {
+  # Goal: points[i] = (2*i+1)*Q, i.e., Q, 3Q, 5Q, ..., 15Q
+  # This allows lookup of -15Q, ..., -3Q, -Q, 0, Q, 3Q, ..., 15Q
+  points = [cached_from_p3(q)]
+  q2 = q.add(q)
+  i = 0
+  while i < 7 {
+    points << cached_from_p3(p3_from_p1xp1(p1xp1_add(q2, points[i])))
+    i += 1
+  }
+  NafLookupTable5.new(points)
+}
+
+# Not optimised for speed; fixed-base tables are precomputed.
+def naf_table8_from_p3(q: Point) -> NafLookupTable8 {
+  points = [affine_from_p3(q)]
+  q2 = q.add(q)
+  i = 0
+  while i < 63 {
+    points << affine_from_p3(p3_from_p1xp1(p1xp1_add_affine(q2, points[i])))
+    i += 1
+  }
+  NafLookupTable8.new(points)
+}
+
+# Entry k (15 limbs from base) of a constant table, as an AffineCached.
+def basepoint_affine_at(base: Int) -> AffineCached {
+  AffineCached.new(field.from_limbs(BASEPOINT_TABLE[base], BASEPOINT_TABLE[base + 1], BASEPOINT_TABLE[base + 2],
+    BASEPOINT_TABLE[base + 3], BASEPOINT_TABLE[base + 4]),
+    field.from_limbs(BASEPOINT_TABLE[base + 5], BASEPOINT_TABLE[base + 6], BASEPOINT_TABLE[base + 7],
+      BASEPOINT_TABLE[base + 8], BASEPOINT_TABLE[base + 9]),
+    field.from_limbs(BASEPOINT_TABLE[base + 10], BASEPOINT_TABLE[base + 11], BASEPOINT_TABLE[base + 12],
+      BASEPOINT_TABLE[base + 13], BASEPOINT_TABLE[base + 14]))
+}
+
+# x * 256^i * B, where -8 <= x <= 8, in constant time: Go's
+# basepointTable()[i].SelectInto(dest, x). Every entry of table i is read.
+def basepoint_select(i: Int, x: I8) -> AffineCached {
+  xmask = x >> 7
+  xabs = ((x + xmask) ^ xmask).as_u8
+
+  dest = affine_zero()
+  j = 1
+  while j <= 8 {
+    cond = byte_eq(xabs, j.as_u8)
+    dest = affine_select(basepoint_affine_at((i * 8 + j - 1) * 15), dest, cond)
+    j += 1
+  }
+  affine_cond_neg(dest, (xmask & 1).as_i64)
+}
+
+# x * B for odd x with 0 < x < 2^7 (in variable time): Go's
+# basepointNafTable().SelectInto(dest, x).
+def basepoint_naf_select(x: I8) -> AffineCached {
+  base = (x / 2).as_i64 * 15
+  AffineCached.new(field.from_limbs(BASEPOINT_NAF_TABLE[base], BASEPOINT_NAF_TABLE[base + 1],
+    BASEPOINT_NAF_TABLE[base + 2], BASEPOINT_NAF_TABLE[base + 3], BASEPOINT_NAF_TABLE[base + 4]),
+    field.from_limbs(BASEPOINT_NAF_TABLE[base + 5], BASEPOINT_NAF_TABLE[base + 6], BASEPOINT_NAF_TABLE[base + 7],
+      BASEPOINT_NAF_TABLE[base + 8], BASEPOINT_NAF_TABLE[base + 9]),
+    field.from_limbs(BASEPOINT_NAF_TABLE[base + 10], BASEPOINT_NAF_TABLE[base + 11], BASEPOINT_NAF_TABLE[base + 12],
+      BASEPOINT_NAF_TABLE[base + 13], BASEPOINT_NAF_TABLE[base + 14]))
+}

@@ -1,0 +1,195 @@
+#![overflow(wrap)]
+import "encoding/hex"
+import "math/big"
+
+# Go's scalar_test.go, translated. Scalar.Generate becomes gen_scalar over
+# the seeded Rng (edwards25519_test.alx); Go's non-short iteration counts
+# (100 * 1024) are scaled down to a few thousand.
+
+def sc_one_bytes -> [Byte] {
+  b = [0.as_u8; 32]
+  b[0] = 1
+  b
+}
+
+def sc_one -> Scalar { Scalar.set_canonical_bytes(sc_one_bytes).unwrap }
+
+def sc_minus_one -> Scalar { Scalar.new.subtract(sc_one) }
+
+# A valid (reduced modulo l) Scalar with a distribution weighted towards
+# high, low, and edge values (Go's Scalar.Generate).
+def gen_scalar(r: Rng) -> Scalar {
+  rr = r
+  s = [0.as_u8; 32]
+  dice_roll = rr.intn!(100)
+  if dice_roll == 0 {
+  } elsif dice_roll == 1 {
+    s = sc_one_bytes
+  } elsif dice_roll == 2 {
+    s = sc_minus_one.bytes
+  } elsif dice_roll < 5 {
+    # A low scalar in [0, 2^125).
+    rr.read!(s, 0, 16)
+    s[15] = s[15] & ((1 << 5) - 1)
+  } elsif dice_roll < 10 {
+    # A high scalar in [2^252, 2^252 + 2^124).
+    s[31] = 1 << 4
+    rr.read!(s, 0, 16)
+    s[15] = s[15] & ((1 << 4) - 1)
+  } else {
+    # A valid scalar in [0, l) by returning [0, 2^252) which has a
+    # negligibly different distribution (the former has a 2^-127.6 chance
+    # of being out of the latter range).
+    rr.read!(s, 0, 32)
+    s[31] = s[31] & ((1 << 4) - 1)
+  }
+  fiat_scalar_to_montgomery(fiat_scalar_from_bytes(s))
+}
+
+test "scalar generate" {
+  r = new_rng(10)
+  i = 0
+  while i < 5000 {
+    assert reduced?(gen_scalar(r).bytes), "generated unreduced scalar"
+    i += 1
+  }
+}
+
+test "scalar set canonical bytes" {
+  r = new_rng(11)
+  i = 0
+  while i < 3000 {
+    input = [0.as_u8; 32]
+    r.read!(input, 0, 32)
+    # Mask out top 4 bits to guarantee value falls in [0, l).
+    input[31] = input[31] & ((1 << 4) - 1)
+    sc = Scalar.set_canonical_bytes(input).unwrap
+    repr = sc.bytes
+    assert input == repr && reduced?(repr), "bytes->scalar->bytes"
+    i += 1
+  }
+  i = 0
+  while i < 3000 {
+    sc1 = gen_scalar(r)
+    sc2 = Scalar.set_canonical_bytes(sc1.bytes).unwrap
+    assert sc1 == sc2, "scalar->bytes->scalar"
+    i += 1
+  }
+
+  b = sc_minus_one.bytes
+  b[0] = b[0] + 1
+  assert Scalar.set_canonical_bytes(b).err?, "non-canonical 1"
+  b = sc_minus_one.bytes
+  b[31] = b[31] + 1
+  assert Scalar.set_canonical_bytes(b).err?, "non-canonical 2"
+  b = sc_minus_one.bytes
+  b[31] = b[31] | 0b1000_0000
+  assert_eq Scalar.set_canonical_bytes(b).err.unwrap.message, "invalid scalar encoding"
+  assert_eq Scalar.set_canonical_bytes([1, 2]).err.unwrap.message, "invalid scalar length"
+}
+
+def big_from_le(b: [Byte]) -> big.Int {
+  n = big.Int.new
+  n.set_bytes!(b.reverse)
+}
+
+test "scalar set uniform bytes" {
+  m = big.Int.new
+  m.set_string!("27742317777372353535851937790883648493", 10)
+  one = big.new_int(1)
+  p252 = big.Int.new
+  p252.lsh!(one, 252)
+  m.add!(m, p252)
+  r = new_rng(12)
+  i = 0
+  while i < 2000 {
+    input = [0.as_u8; 64]
+    r.read!(input, 0, 64)
+    sc = Scalar.set_uniform_bytes(input).unwrap
+    repr = sc.bytes
+    assert reduced?(repr), "reduced"
+    sc_big = big_from_le(repr)
+    in_big = big_from_le(input)
+    in_big.mod!(in_big, m)
+    assert_eq in_big.cmp(sc_big), 0
+    i += 1
+  }
+  assert_eq Scalar.set_uniform_bytes([0.as_u8; 63]).err.unwrap.message, "edwards25519: invalid SetUniformBytes input length"
+}
+
+test "scalar set bytes with clamping" {
+  # Generated with libsodium.js 1.0.18 crypto_scalarmult_ed25519_base.
+  random = "633d368491364dc9cd4c1bf891b1d59460face1644813240a313e61f2c88216e"
+  s = Scalar.set_bytes_with_clamping(decode_hex(random)).unwrap
+  p = scalar_base_mult(s)
+  assert_eq hex.encode_to_string(p.bytes), "1d87a9026fd0126a5736fe1628c95dd419172b5b618457e041c9c861b2494a94"
+
+  zero = "0000000000000000000000000000000000000000000000000000000000000000"
+  s = Scalar.set_bytes_with_clamping(decode_hex(zero)).unwrap
+  p = scalar_base_mult(s)
+  assert_eq hex.encode_to_string(p.bytes), "693e47972caf527c7883ad1b39822f026f47db2ab0e1919955b8993aa04411d1"
+
+  one = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+  s = Scalar.set_bytes_with_clamping(decode_hex(one)).unwrap
+  p = scalar_base_mult(s)
+  assert_eq hex.encode_to_string(p.bytes), "12e9a68b73fd5aacdbcaf3e88c46fea6ebedb1aa84eed1842f07f8edab65e3a7"
+
+  assert_eq Scalar.set_bytes_with_clamping([0.as_u8; 31]).err.unwrap.message, "edwards25519: invalid SetBytesWithClamping input length"
+}
+
+test "scalar multiply distributes over add" {
+  r = new_rng(13)
+  i = 0
+  while i < 3000 {
+    x = gen_scalar(r)
+    y = gen_scalar(r)
+    z = gen_scalar(r)
+    # t1 = (x+y)*z
+    t1 = x.add(y).multiply(z)
+    # t2 = x*z + y*z
+    t2 = x.multiply(z).add(y.multiply(z))
+    assert t1 == t2 && reduced?(t1.bytes) && reduced?(t2.bytes), "distributes"
+    i += 1
+  }
+}
+
+test "scalar add like sub neg" {
+  r = new_rng(14)
+  i = 0
+  while i < 3000 {
+    x = gen_scalar(r)
+    y = gen_scalar(r)
+    # t1 = x - y
+    t1 = x.subtract(y)
+    # t2 = -y + x
+    t2 = y.negate.add(x)
+    assert t1 == t2 && reduced?(t1.bytes), "add like sub neg"
+    i += 1
+  }
+}
+
+test "scalar non adjacent form" {
+  s = Scalar.set_canonical_bytes([0x1a, 0x0e, 0x97, 0x8a, 0x90, 0xf6, 0x62, 0x2d, 0x37, 0x47, 0x02, 0x3f, 0x8a, 0xd8, 0x26,
+    0x4d, 0xa7, 0x58, 0xaa, 0x1b, 0x88, 0xe0, 0x40, 0xd1, 0x58, 0x9e, 0x7b, 0x7f, 0x23, 0x76, 0xef, 0x09]).unwrap
+  expected_naf: [I8] = [
+    0, 13, 0, 0, 0, 0, 0, 0, 0, 7, 0, 0, 0, 0, 0, 0, -9, 0, 0, 0, 0, -11, 0, 0, 0, 0, 3, 0, 0, 0, 0, 1,
+    0, 0, 0, 0, 9, 0, 0, 0, 0, -5, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 11, 0, 0, 0, 0, 11, 0, 0, 0, 0, 0,
+    -9, 0, 0, 0, 0, 0, -3, 0, 0, 0, 0, 9, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, -1, 0, 0, 0, 0, 0, 9, 0,
+    0, 0, 0, -15, 0, 0, 0, 0, -7, 0, 0, 0, 0, -9, 0, 0, 0, 0, 0, 5, 0, 0, 0, 0, 13, 0, 0, 0, 0, 0, -3, 0,
+    0, 0, 0, -11, 0, 0, 0, 0, -7, 0, 0, 0, 0, -13, 0, 0, 0, 0, 11, 0, 0, 0, 0, -9, 0, 0, 0, 0, 0, 1, 0, 0,
+    0, 0, 0, -15, 0, 0, 0, 0, 1, 0, 0, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0, 0, 5, 0, 0, 0, 0, 0, 13, 0, 0, 0,
+    0, 0, 0, 11, 0, 0, 0, 0, 0, 15, 0, 0, 0, 0, 0, -9, 0, 0, 0, 0, 0, 0, 0, -1, 0, 0, 0, 0, 0, 0, 0, 7,
+    0, 0, 0, 0, 0, -15, 0, 0, 0, 0, 0, 15, 0, 0, 0, 0, 15, 0, 0, 0, 0, 15, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0
+  ]
+  s_naf = s.non_adjacent_form(5)
+  i = 0
+  while i < 256 {
+    assert expected_naf[i] == s_naf[i], "wrong digit at position #{i}"
+    i += 1
+  }
+}
+
+test "scalar equal" {
+  assert_eq sc_one.equal(sc_minus_one), 0
+  assert_eq sc_minus_one.equal(sc_minus_one), 1
+}

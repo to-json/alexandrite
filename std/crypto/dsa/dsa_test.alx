@@ -1,0 +1,201 @@
+# Go's dsa_test.go and dsa_wycheproof_test.go (vectors in
+# vec_wycheproof_test.alx), plus deterministic vectors of Go's crypto/dsa
+# (vec_det_test.alx). TestParameterGeneration (skipped by Go in short
+# mode) runs L1024N160 only: the bigger sizes take minutes.
+
+import "crypto"
+import "crypto/rand"
+import "crypto/sha3"
+import "encoding/hex"
+import "math/big"
+
+def big_hex(s: Str) -> big.Int {
+  z = big.Int.new
+  z.set_string!(s, 16).unwrap
+}
+
+def sign_and_verify(i: Int, priv: PrivateKey) {
+  hashed = "testing".bytes
+  r = sign(rand.reader(), priv, hashed)
+  assert r.ok?, "#{i}: error signing"
+  rs, ss = r.unwrap
+  assert verify(priv.public_key, hashed, rs, ss), "#{i}: Verify failed"
+}
+
+def parameter_generation(sizes: ParameterSizes, l: Int, n: Int) {
+  params = generate_parameters(rand.reader(), sizes).unwrap
+  assert_eq params.p.bit_len, l
+  assert_eq params.q.bit_len, n
+  one = big.new_int(1)
+  pm1 = big.Int.new
+  pm1.sub!(params.p, one)
+  z = big.Int.new
+  quo, rem = z.div_mod!(pm1, params.q)
+  assert rem.sign == 0, "p-1 mod q != 0"
+  x = big.Int.new
+  x.exp!(params.g, quo, params.p)
+  assert x.cmp(one) != 0, "invalid generator"
+  priv = PrivateKey.new(public_key: PublicKey.new(parameters: params, y: big.Int.new), x: big.Int.new)
+  priv = generate_key(priv, rand.reader()).unwrap
+  sign_and_verify(0, priv)
+}
+
+test "ParameterGeneration" {
+  parameter_generation(L1024N160, 1024, 160)
+}
+
+def test_p -> Str {
+  "A9B5B793FB4785793D246BAE77E8FF63CA52F442DA763C440259919FE1BC1D6065A9350637A04F75A2F039401D49F08E066C4D275A5A65DA5684BC563C14289D7AB8A67163BFBF79D85972619AD2CFF55AB0EE77A9002B0EF96293BDD0F42685EBB2C66C327079F6C98000FBCB79AACDE1BC6F9D5C7B1A97E3D9D54ED7951FEF"
+}
+
+def test_g -> Str {
+  "634364FC25248933D01D1993ECABD0657CC0CB2CEED7ED2E3E8AECDFCDC4A25C3B15E9E3B163ACA2984B5539181F3EFF1A5E8903D71D5B95DA4F27202B77D2C44B430BB53741A8D59A8F86887525C9F2A6A5980A195EAA7F2FF910064301DEF89D3AA213E1FAC7768D89365318E370AF54A112EFBA9246D9158386BA1B4EEFDA"
+}
+
+def test_y -> Str {
+  "32969E5780CFE1C849A1C276D7AEB4F38A23B591739AA2FE197349AEEBD31366AEE5EB7E6C6DDB7C57D02432B30DB5AA66D9884299FAA72568944E4EEDC92EA3FBC6F39F53412FBCC563208F7C15B737AC8910DBC2D9C9B8C001E72FDC40EB694AB1F06A5A2DBD18D9E36C66F31F566742F11EC0A52E9F7B89355C02FB5D32D2"
+}
+
+test "SignAndVerify" {
+  params = Parameters.new(p: big_hex(test_p()), q: big_hex("E1D3391245933D68A0714ED34BBCB7A1F422B9C1"), g: big_hex(test_g()))
+  priv = PrivateKey.new(public_key: PublicKey.new(parameters: params, y: big_hex(test_y())), x: big_hex("5078D4D29795CBE76D3AACFE48C9AF0BCDBEE91A"))
+  sign_and_verify(0, priv)
+}
+
+test "SignAndVerifyWithBadPublicKey" {
+  params = Parameters.new(p: big_hex(test_p()), q: big_hex("FA"), g: big_hex(test_g()))
+  pubk = PublicKey.new(parameters: params, y: big_hex(test_y()))
+  assert !verify(pubk, "testing".bytes, big_hex("2"), big_hex("4")), "Verify unexpected success with non-existent mod inverse of Q"
+}
+
+test "SigningWithDegenerateKeys" {
+  # Signing with degenerate keys must not loop forever.
+  bad_keys: [(Str, Str, Str, Str, Str)] = [("00", "01", "00", "00", "00"), ("01", "ff", "00", "00", "00")]
+  i = 0
+  for t in bad_keys {
+    params = Parameters.new(p: big_hex(t[0]), q: big_hex(t[1]), g: big_hex(t[2]))
+    priv = PrivateKey.new(public_key: PublicKey.new(parameters: params, y: big_hex(t[3])), x: big_hex(t[4]))
+    assert sign(rand.reader(), priv, "testing".bytes).err?, "##{i}: unexpected success"
+    i += 1
+  }
+}
+
+test "GenerateKeyWithoutParameters" {
+  priv = PrivateKey.new(public_key: PublicKey.new(parameters: Parameters.new, y: big.Int.new), x: big.Int.new)
+  r = generate_key(priv, rand.reader())
+  assert r.err?
+}
+
+# ---- Wycheproof (dsa_wycheproof_test.go) ----
+
+def make_pub(p: Str, q: Str, g: Str, y: Str) -> PublicKey {
+  PublicKey.new(parameters: Parameters.new(p: big_hex(p), q: big_hex(q), g: big_hex(g)), y: big_hex(y))
+}
+
+def check_wp(k: PublicKey, h: crypto.Hash, msg: Str, sig: Str, want: Bool) {
+  d = h.new
+  _ = d.write!(hex.decode_string(msg).unwrap)
+  # Truncated to the byte length of Q.
+  hashed = d.sum([])[0...k.parameters.q.bit_len / 8]
+  assert_eq verify_asn1(k, hashed, hex.decode_string(sig).unwrap), want
+}
+
+# Go's test helper: a DER SEQUENCE of two INTEGERs, read as strictly as
+# golang.org/x/crypto/cryptobyte does (minimal lengths and integers).
+def verify_asn1(k: PublicKey, hash: [Byte], sig: [Byte]) -> Bool {
+  seq = read_asn1(sig, 0, 0x30)
+  return false if seq == none
+  inner, end = seq.unwrap
+  return false if end != sig.size
+  r1 = read_asn1(inner, 0, 0x02)
+  return false if r1 == none
+  rb, off = r1.unwrap
+  s1 = read_asn1(inner, off, 0x02)
+  return false if s1 == none
+  sb, off2 = s1.unwrap
+  return false if off2 != inner.size
+  r = asn1_integer(rb)
+  s = asn1_integer(sb)
+  return false if r == none || s == none
+  verify(k, hash, r.unwrap, s.unwrap)
+}
+
+# The contents of the element with tag at b[off], and the offset after it.
+def read_asn1(b: [Byte], off: Int, tag: Byte) -> ([Byte], Int)? {
+  return none if b.size - off < 2 || b[off] != tag
+  l = b[off + 1].to_i
+  i = off + 2
+  if l & 0x80 != 0 {
+    n = l & 0x7f
+    # Indefinite or over-long length forms are rejected.
+    return none if n == 0 || n > 4 || b.size - i < n
+    l = 0
+    j = 0
+    while j < n {
+      l = (l << 8) | b[i + j].to_i
+      j += 1
+    }
+    # Minimal: long form only for >= 128, no leading zero byte.
+    return none if l < 128 || b[i] == 0
+    i += n
+  }
+  return none if b.size - i < l
+  (b[i...i + l], i + l)
+}
+
+# A minimal two's complement INTEGER as a big.Int.
+def asn1_integer(b: [Byte]) -> big.Int? {
+  return none if b.size == 0
+  return none if b.size > 1 && ((b[0] == 0 && b[1] & 0x80 == 0) || (b[0] == 0xff && b[1] & 0x80 == 0x80))
+  z = big.Int.new
+  z.set_bytes!(b)
+  if b[0] & 0x80 != 0 {
+    # Negative: subtract 2^(8 * size).
+    m = big.new_int(1)
+    m.lsh!(m, 8 * b.size)
+    z.sub!(z, m)
+  }
+  z
+}
+
+# ---- deterministic vectors (vec_det_test.alx) ----
+
+# The SHAKE256 stream of seed; one-byte reads read nothing (both sides
+# neutralize Go's randutil.MaybeReadByte the same way).
+struct Stream {
+  s: sha3.SHAKE
+
+  pub def read!(p: [Byte]) -> Int {
+    return 1 if p.size == 1
+    sh = self.s
+    sh.read!(p)
+  }
+}
+
+def stream(seed: Str) -> Stream {
+  s = sha3.new_shake256()
+  s.write!(seed.bytes).unwrap
+  Stream.new(s: s)
+}
+
+def check_generate_parameters(seed: Str, p: Str, q: Str, g: Str) {
+  params = generate_parameters(stream(seed), L1024N160).unwrap
+  assert_eq params.p.text(16), p
+  assert_eq params.q.text(16), q
+  assert_eq params.g.text(16), g
+}
+
+def check_generate_key(params: Parameters, seed: Str, x: Str, y: Str) -> PrivateKey {
+  priv = PrivateKey.new(public_key: PublicKey.new(parameters: params, y: big.Int.new), x: big.Int.new)
+  k = generate_key(priv, stream(seed)).unwrap
+  assert_eq k.x.text(16), x
+  assert_eq k.public_key.y.text(16), y
+  k
+}
+
+def check_sign(k: PrivateKey, seed: Str, msg: Str, r: Str, s: Str) {
+  rs, ss = sign(stream(seed), k, msg.bytes).unwrap
+  assert_eq rs.text(16), r
+  assert_eq ss.text(16), s
+  assert verify(k.public_key, msg.bytes, rs, ss)
+}

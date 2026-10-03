@@ -1044,6 +1044,18 @@ pub fn bind_tparams(te: &TypeExpr, t: &Ty, tps: &[TParam], out: &mut HashMap<Str
             bind_tparams(&args[0], k, tps, out);
             bind_tparams(&args[1], v, tps, out);
         }
+        // Through function and tuple types (`f: () -> T` given a block).
+        (TypeExpr::Fn(ps, r, _), Ty::Fn(xs, y)) if ps.len() == xs.len() => {
+            for (p, x) in ps.iter().zip(xs) {
+                bind_tparams(p, x, tps, out);
+            }
+            bind_tparams(r, y, tps, out);
+        }
+        (TypeExpr::Tuple(es, _), Ty::Tuple(xs)) if es.len() == xs.len() => {
+            for (e, x) in es.iter().zip(xs) {
+                bind_tparams(e, x, tps, out);
+            }
+        }
         (TypeExpr::Handle(n, args, _), Ty::Handle(h)) if !args.is_empty() => {
             if let Some((base, targs)) = INSTS.with(|m| m.borrow().get(h).cloned()) {
                 if base == *n || base.ends_with(&format!(".{n}")) {
@@ -1055,7 +1067,8 @@ pub fn bind_tparams(te: &TypeExpr, t: &Ty, tps: &[TParam], out: &mut HashMap<Str
         }
         (TypeExpr::App(n, args, _), t) => {
             if let Some((base, targs)) = inst_args(t) {
-                if base == *n {
+                // From another package the instance's base is qualified.
+                if base == *n || base.ends_with(&format!(".{n}")) {
                     for (a, x) in args.iter().zip(&targs) {
                         bind_tparams(a, x, tps, out);
                     }
@@ -2919,12 +2932,23 @@ impl<'w, 'a> FnCx<'w, 'a> {
     fn coerce_branch(&mut self, e: TExpr, want: &Ty) -> R<TExpr> {
         match e.kind {
             TK::Seq(mut ss) => {
-                if let Some(TStmt::Expr(last)) = ss.pop() {
+                let mut ty = want.clone();
+                if let Some(TStmt::Expr(_)) = ss.last() {
+                    let Some(TStmt::Expr(last)) = ss.pop() else { unreachable!() };
                     let v = self.coerce(last, want)?;
+                    // A value that doesn't become a `want` keeps its type
+                    // (the arms then disagree: a statement `if`).
+                    if !self.unify(&v.ty, want) {
+                        ty = v.ty.clone();
+                    }
                     ss.push(TStmt::Expr(v));
+                } else {
+                    // Ends in a statement (`x = 1 if c`): no value to lift,
+                    // and the statement stays.
+                    ty = e.ty.clone();
                 }
                 let sp = e.span;
-                Ok(self.mk(TK::Seq(ss), want.clone(), sp))
+                Ok(self.mk(TK::Seq(ss), ty, sp))
             }
             _ => self.coerce(e, want),
         }
@@ -3084,6 +3108,8 @@ impl<'w, 'a> FnCx<'w, 'a> {
         // A lambda of type `(..) -> ~T` is fallible like a def: `~` and `fail`
         // inside return the error, and its body produces a T.
         let fallible = matches!(self.resolve(&rvar), Ty::Result(_));
+        // A wanted function type whose result is still open: the body decides.
+        let open_ret = ret.is_none() && matches!(self.resolve(&rvar), Ty::Var(_));
         let body_ret = match self.resolve(&rvar) {
             Ty::Result(t) => *t,
             _ => rvar.clone(),
@@ -3122,7 +3148,7 @@ impl<'w, 'a> FnCx<'w, 'a> {
         self.lock_floor = saved_lock;
         self.cells = saved_cells;
         let (mut tb, bt) = r?;
-        if ret.is_none() && hint.is_none() && !matches!(self.resolve(&bt), Ty::Never) && !self.unify(&rvar, &bt) {
+        if ret.is_none() && (hint.is_none() || open_ret) && !matches!(self.resolve(&bt), Ty::Never) && !self.unify(&rvar, &bt) {
             return Err(Diag::new(sp, format!("this lambda returns {} and {}", self.resolve(&rvar).show(), self.resolve(&bt).show())));
         }
         let rt = self.resolve(&rvar);
@@ -3182,7 +3208,15 @@ impl<'w, 'a> FnCx<'w, 'a> {
         }
         let prev = enter_pkg(&self.w.defs[def].pkg);
         let want = match d.params.last().and_then(|p| p.ty.as_ref()) {
-            Some(te) => subst_type(te, &env, &self.w.structs, &self.w.consts),
+            Some(te) => subst_type(te, &env, &self.w.structs, &self.w.consts).or_else(|| match te {
+                // Only the result is open (`once_value[T](f: () -> T)`): the
+                // block's body decides it.
+                TypeExpr::Fn(ps, _, _) => {
+                    let ps = ps.iter().map(|p| subst_type(p, &env, &self.w.structs, &self.w.consts)).collect::<Option<Vec<_>>>()?;
+                    Some(Ty::Fn(ps, Box::new(self.fresh())))
+                }
+                _ => None,
+            }),
             None => None,
         };
         leave_pkg(prev);
@@ -5213,6 +5247,12 @@ impl<'w, 'a> FnCx<'w, 'a> {
                     targs.push(f);
                 }
                 return self.call_def(def, name, name_span, targs, sp);
+            }
+            // A struct's `dup` (unless it defines one): a deep copy, sharing
+            // no storage with the original (so it can go to a task or a
+            // Mutex, like a slice's or a function's dup).
+            if matches!(name, "dup" | "clone") && args.is_empty() && block.is_none() {
+                return Ok(mk_m(self, M::Dup, recv, vec![], None, rt.clone()));
             }
             return Err(self.no_field(sn, fs, name, name_span));
         }

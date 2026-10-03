@@ -336,7 +336,7 @@ impl<'a> Graph<'a> {
                     && match &e.ty {
                         Ty::Array(t) => !has_storage(t),
                         Ty::Map(k, t) => !has_storage(k) && !has_storage(t),
-                        Ty::Fn(..) => true,
+                        Ty::Fn(..) | Ty::Struct(..) => true,
                         _ => false,
                     };
                 if !matches!(m, M::Spawn | M::Lock) && !flat_copy {

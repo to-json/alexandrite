@@ -1,0 +1,243 @@
+# Package atomic: Go's sync/atomic, over the language's `Atomic[T]` (R6).
+#
+#   Go                                  alx
+#   atomic.Int32 / Int64 / Uint32 /     new_int32(v) / new_int64(v) / new_uint32(v) /
+#     Uint64 (zero value usable)          new_uint64(v) -> Int32 / Int64 / Uint32 / Uint64
+#     Load / Store / Swap /               load / store(v) / swap(v) /
+#     CompareAndSwap / Add / And / Or     compare_and_swap(old, new) / add(d) / and(m) / or(m)
+#   atomic.Bool                         new_bool(v) -> Boolean: load, store, swap, compare_and_swap
+#   atomic.Value                        new_value[T] -> Value[T]: load (T?), store, swap (T?),
+#                                         compare_and_swap(old, new)
+#   atomic.Pointer[T]                   Value[T] (alexandrite has no pointers)
+#   AddInt32(&x, d), LoadInt64(&x), ... the methods above (no pointers to plain ints)
+#
+# Every operation is sequentially consistent, as in Go. The values share
+# their state across copies (they are handles), so a copy captured by a task
+# is the same atomic.
+#
+# How they map onto the language: `Atomic[T]` holds an Int or a Bool. Int64
+# is one directly; Uint64 keeps its bits in it (Atomic.add wraps like a
+# 64-bit two's-complement adder, which is also unsigned addition); Int32 and
+# Uint32 keep their value in an Atomic[Int] and add, and, or with a
+# compare-and-swap loop that wraps to 32 bits. Value[T] is a `Mutex[T?]`.
+#
+# Differences from Go:
+#  - Make each with its constructor (`new_int32(0)`); Go's zero values hold
+#    the state inline, alx's are handles.
+#  - `atomic.Bool` is `Boolean` (the name Bool is the language's type).
+#  - No functions on addresses (AddInt32(&x, d), SwapPointer, ...) and no
+#    Uintptr or Pointer[T]: there are no pointers. Value[T] takes Pointer's
+#    place.
+#  - Value is generic, so Go's panics for storing nil or values of different
+#    types can't happen; `load` returns none before the first store.
+#    `compare_and_swap(old, new)` compares with `==` (Go panics on
+#    incomparable types; alx refuses them at compile time).
+
+# ---------------------------------------------------------------------- Int64
+
+# An atomic Int (Go's atomic.Int64).
+pub struct Int64 {
+  v: Atomic[Int]
+
+  pub def load -> Int { v.load }
+  pub def store(x: Int) { v.store(x) }
+  # Stores x; returns the old value.
+  pub def swap(x: Int) -> Int { v.swap(x) }
+  # Stores new if the value is old; reports whether it did.
+  pub def compare_and_swap(old: Int, new: Int) -> Bool { v.compare_and_swap(old, new) }
+  # Adds delta (wrapping); returns the new value.
+  pub def add(delta: Int) -> Int { v.add(delta) }
+
+  # Bitwise and with mask; returns the old value.
+  pub def and(mask: Int) -> Int {
+    loop {
+      old = v.load
+      return old if v.compare_and_swap(old, old & mask)
+    }
+  }
+
+  # Bitwise or with mask; returns the old value.
+  pub def or(mask: Int) -> Int {
+    loop {
+      old = v.load
+      return old if v.compare_and_swap(old, old | mask)
+    }
+  }
+}
+
+pub def new_int64(x: Int) -> Int64 {
+  Int64.new(v: Atomic.new(x))
+}
+
+# --------------------------------------------------------------------- Uint64
+
+# An atomic U64 (Go's atomic.Uint64): its bits in an Atomic[Int].
+pub struct Uint64 {
+  v: Atomic[Int]
+
+  pub def load -> U64 { v.load.as_u64 }
+  pub def store(x: U64) { v.store(x.as_i64) }
+  pub def swap(x: U64) -> U64 { v.swap(x.as_i64).as_u64 }
+  pub def compare_and_swap(old: U64, new: U64) -> Bool { v.compare_and_swap(old.as_i64, new.as_i64) }
+  # Adds delta (wrapping); returns the new value. To subtract c, add
+  # `^(c - 1)` as in Go (or `0 -% c`).
+  pub def add(delta: U64) -> U64 { v.add(delta.as_i64).as_u64 }
+
+  pub def and(mask: U64) -> U64 {
+    m = mask.as_i64
+    loop {
+      old = v.load
+      return old.as_u64 if v.compare_and_swap(old, old & m)
+    }
+  }
+
+  pub def or(mask: U64) -> U64 {
+    m = mask.as_i64
+    loop {
+      old = v.load
+      return old.as_u64 if v.compare_and_swap(old, old | m)
+    }
+  }
+}
+
+pub def new_uint64(x: U64) -> Uint64 {
+  Uint64.new(v: Atomic.new(x.as_i64))
+}
+
+# ---------------------------------------------------------------------- Int32
+
+# An atomic I32 (Go's atomic.Int32), kept sign-extended in an Atomic[Int].
+pub struct Int32 {
+  v: Atomic[Int]
+
+  pub def load -> I32 { v.load.as_i32 }
+  pub def store(x: I32) { v.store(x.to_i) }
+  pub def swap(x: I32) -> I32 { v.swap(x.to_i).as_i32 }
+  pub def compare_and_swap(old: I32, new: I32) -> Bool { v.compare_and_swap(old.to_i, new.to_i) }
+
+  # Adds delta (wrapping at 32 bits); returns the new value.
+  pub def add(delta: I32) -> I32 {
+    loop {
+      old = v.load
+      new = old.as_i32 +% delta
+      return new if v.compare_and_swap(old, new.to_i)
+    }
+  }
+
+  pub def and(mask: I32) -> I32 {
+    loop {
+      old = v.load
+      return old.as_i32 if v.compare_and_swap(old, (old.as_i32 & mask).to_i)
+    }
+  }
+
+  pub def or(mask: I32) -> I32 {
+    loop {
+      old = v.load
+      return old.as_i32 if v.compare_and_swap(old, (old.as_i32 | mask).to_i)
+    }
+  }
+}
+
+pub def new_int32(x: I32) -> Int32 {
+  Int32.new(v: Atomic.new(x.to_i))
+}
+
+# --------------------------------------------------------------------- Uint32
+
+# An atomic U32 (Go's atomic.Uint32), kept zero-extended in an Atomic[Int].
+pub struct Uint32 {
+  v: Atomic[Int]
+
+  pub def load -> U32 { v.load.as_u32 }
+  pub def store(x: U32) { v.store(x.to_i) }
+  pub def swap(x: U32) -> U32 { v.swap(x.to_i).as_u32 }
+  pub def compare_and_swap(old: U32, new: U32) -> Bool { v.compare_and_swap(old.to_i, new.to_i) }
+
+  # Adds delta (wrapping at 32 bits); returns the new value.
+  pub def add(delta: U32) -> U32 {
+    loop {
+      old = v.load
+      new = old.as_u32 +% delta
+      return new if v.compare_and_swap(old, new.to_i)
+    }
+  }
+
+  pub def and(mask: U32) -> U32 {
+    loop {
+      old = v.load
+      return old.as_u32 if v.compare_and_swap(old, (old.as_u32 & mask).to_i)
+    }
+  }
+
+  pub def or(mask: U32) -> U32 {
+    loop {
+      old = v.load
+      return old.as_u32 if v.compare_and_swap(old, (old.as_u32 | mask).to_i)
+    }
+  }
+}
+
+pub def new_uint32(x: U32) -> Uint32 {
+  Uint32.new(v: Atomic.new(x.to_i))
+}
+
+# -------------------------------------------------------------------- Boolean
+
+# An atomic Bool (Go's atomic.Bool).
+pub struct Boolean {
+  v: Atomic[Bool]
+
+  pub def load -> Bool { v.load }
+  pub def store(x: Bool) { v.store(x) }
+  pub def swap(x: Bool) -> Bool { v.swap(x) }
+  pub def compare_and_swap(old: Bool, new: Bool) -> Bool { v.compare_and_swap(old, new) }
+}
+
+pub def new_bool(x: Bool) -> Boolean {
+  Boolean.new(v: Atomic.new(x))
+}
+
+# ---------------------------------------------------------------------- Value
+
+# An atomically loaded and stored value of any type (Go's atomic.Value and
+# atomic.Pointer[T]).
+pub struct Value[T] {
+  st: Mutex[T?]
+
+  # The last value stored, or none before the first store.
+  pub def load -> T? {
+    st.lock { |v| v }
+  }
+
+  pub def store(x: T) {
+    st.lock { |v| v = x }
+  }
+
+  # Stores x; returns the previous value (none before the first store).
+  pub def swap(x: T) -> T? {
+    st.lock { |v|
+      old = v
+      v = x
+      old
+    }
+  }
+
+  # Stores new if the current value is old (`==`); reports whether it did.
+  # Before the first store nothing matches.
+  pub def compare_and_swap(old: T, new: T) -> Bool {
+    st.lock { |v|
+      ok = false
+      if cur = v {
+        ok = cur == old
+      }
+      v = new if ok
+      ok
+    }
+  }
+}
+
+pub def new_value[T] -> Value[T] {
+  v: T? = none
+  Value[T].new(st: Mutex.new(v))
+}

@@ -2763,7 +2763,7 @@ impl<'a> Lw<'a> {
                 let v = self.expr(&args[0]);
                 LE::Rt(Rt::StrFromBytes, vec![v])
             }
-            Dup if matches!(recv.unwrap().ty, Ty::Fn(..)) => {
+            Dup if matches!(recv.unwrap().ty, Ty::Fn(..) | Ty::Struct(..)) => {
                 let r = recv.unwrap();
                 let v = self.expr(r);
                 let t = self.lty(&r.ty);

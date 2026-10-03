@@ -13,10 +13,44 @@ use crate::diag::{Diag, SourceMap, Span};
 use crate::tast::*;
 use std::collections::HashMap;
 
+thread_local! {
+    /// Per interface: whether any implementor carries shared storage. An
+    /// interface not listed (before `check` runs) is assumed to.
+    static IFACE_SHARES: std::cell::RefCell<HashMap<String, bool>> = std::cell::RefCell::new(HashMap::new());
+}
+
+/// Which interfaces' values carry shared storage: those with an implementor
+/// that does (a fixpoint, since implementors may hold interface values).
+fn learn_ifaces(p: &TProgram) {
+    IFACE_SHARES.with(|m| {
+        let mut m = m.borrow_mut();
+        m.clear();
+        for k in p.ifaces.keys() {
+            m.insert(k.clone(), false);
+        }
+    });
+    loop {
+        let mut changed = false;
+        for (k, imps) in &p.ifaces {
+            if IFACE_SHARES.with(|m| m.borrow()[k]) {
+                continue;
+            }
+            if imps.iter().any(|(t, _)| shares(t)) {
+                IFACE_SHARES.with(|m| m.borrow_mut().insert(k.clone(), true));
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+}
+
 /// Does a value of this type carry storage another task could mutate?
 pub fn shares(t: &Ty) -> bool {
     match t {
-        Ty::Array(_) | Ty::Map(..) | Ty::Pool(_) | Ty::Fn(..) | Ty::Iface(_) => true,
+        Ty::Iface(n) => IFACE_SHARES.with(|m| m.borrow().get(n).copied().unwrap_or(true)),
+        Ty::Array(_) | Ty::Map(..) | Ty::Pool(_) | Ty::Fn(..) => true,
         Ty::Fixed(t, _) | Ty::Opt(t) | Ty::Result(t) => shares(t),
         Ty::Tuple(ts) => ts.iter().any(shares),
         Ty::Struct(_, fs) => fs.iter().any(|(_, t)| shares(t)),
@@ -26,6 +60,7 @@ pub fn shares(t: &Ty) -> bool {
 }
 
 pub fn check(p: &TProgram, sm: &SourceMap) -> Result<(), Diag> {
+    learn_ifaces(p);
     let al = crate::regions::aliases(p);
     for (f, al) in p.funcs.iter().zip(&al) {
         if f.external {

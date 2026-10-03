@@ -1,0 +1,456 @@
+# Go's rand_test.go, auto_test.go and race_test.go.
+
+import "math"
+
+NUM_TEST_SAMPLES = 10000
+
+struct StatsResults {
+  mean: Float
+  stddev: Float
+  close_enough: Float
+  max_error: Float
+
+  def check_similar_distribution(expected: StatsResults) -> Str? {
+    if !near_equal(mean, expected.mean, expected.close_enough, expected.max_error) {
+      return "mean #{mean} != #{expected.mean} (allowed error #{expected.close_enough}, #{expected.max_error})"
+    }
+    if !near_equal(stddev, expected.stddev, expected.close_enough, expected.max_error) {
+      return "stddev #{stddev} != #{expected.stddev} (allowed error #{expected.close_enough}, #{expected.max_error})"
+    }
+    none
+  }
+}
+
+def near_equal(a: Float, b: Float, close_enough: Float, max_error: Float) -> Bool {
+  abs_diff = math.abs(a - b)
+  return true if abs_diff < close_enough
+  abs_diff / math.max(math.abs(a), math.abs(b)) < max_error
+}
+
+def test_seeds -> [U64] { [1, 1754801282, 1698661970, 1550503961] }
+
+def get_stats_results(samples: [Float]) -> StatsResults {
+  sum = 0.0
+  squaresum = 0.0
+  for s in samples {
+    sum += s
+    squaresum += s * s
+  }
+  mean = sum / samples.size.to_f
+  StatsResults.new(mean: mean, stddev: math.sqrt(squaresum / samples.size.to_f - mean * mean))
+}
+
+# Every failure found, as messages.
+def check_sample_distribution(samples: [Float], expected: StatsResults) -> [Str] {
+  if e = get_stats_results(samples).check_similar_distribution(expected) {
+    return [e]
+  }
+  []
+}
+
+def check_sample_slice_distributions(samples: [Float], nslices: Int, expected: StatsResults) -> [Str] {
+  errs: [Str] = []
+  chunk = samples.size / nslices
+  for i in 0...nslices {
+    low = i * chunk
+    high = i == nslices - 1 ? samples.size - 1 : (i + 1) * chunk
+    errs = errs + check_sample_distribution(samples[low...high], expected)
+  }
+  errs
+}
+
+def generate_normal_samples(nsamples: Int, mean: Float, stddev: Float, seed: U64) -> [Float] {
+  r = new(new_pcg(seed, seed))
+  samples: [Float] = [0.0; nsamples]
+  for i in 0...nsamples { samples[i] = r.norm_float64! * stddev + mean }
+  samples
+}
+
+def normal_distribution_errors(nsamples: Int, mean: Float, stddev: Float, seed: U64) -> [Str] {
+  samples = generate_normal_samples(nsamples, mean, stddev, seed)
+  error_scale = math.max(1.0, stddev)
+  expected = StatsResults.new(mean: mean, stddev: stddev, close_enough: 0.10 * error_scale, max_error: 0.08 * error_scale)
+  check_sample_distribution(samples, expected) + check_sample_slice_distributions(samples, 2, expected) + check_sample_slice_distributions(samples, 7, expected)
+}
+
+test "standard normal values" {
+  for seed in test_seeds() {
+    assert_eq normal_distribution_errors(NUM_TEST_SAMPLES, 0.0, 1.0, seed), []
+  }
+}
+
+test "non-standard normal values" {
+  sd = 0.5
+  while sd < 1000.0 {
+    m = 0.5
+    while m < 1000.0 {
+      for seed in test_seeds() {
+        assert_eq normal_distribution_errors(NUM_TEST_SAMPLES, m, sd, seed), []
+      }
+      m *= 2.0
+    }
+    sd *= 2.0
+  }
+}
+
+def generate_exponential_samples(nsamples: Int, rate: Float, seed: U64) -> [Float] {
+  r = new(new_pcg(seed, seed))
+  samples: [Float] = [0.0; nsamples]
+  for i in 0...nsamples { samples[i] = r.exp_float64! / rate }
+  samples
+}
+
+def exponential_distribution_errors(nsamples: Int, rate: Float, seed: U64) -> [Str] {
+  mean = 1.0 / rate
+  stddev = mean
+  samples = generate_exponential_samples(nsamples, rate, seed)
+  error_scale = math.max(1.0, 1.0 / rate)
+  expected = StatsResults.new(mean: mean, stddev: stddev, close_enough: 0.10 * error_scale, max_error: 0.20 * error_scale)
+  check_sample_distribution(samples, expected) + check_sample_slice_distributions(samples, 2, expected) + check_sample_slice_distributions(samples, 7, expected)
+}
+
+test "standard exponential values" {
+  for seed in test_seeds() {
+    assert_eq exponential_distribution_errors(NUM_TEST_SAMPLES, 1.0, seed), []
+  }
+}
+
+test "non-standard exponential values" {
+  rate = 0.05
+  while rate < 10.0 {
+    for seed in test_seeds() {
+      assert_eq exponential_distribution_errors(NUM_TEST_SAMPLES, rate, seed), []
+    }
+    rate *= 2.0
+  }
+}
+
+# initNorm: the tables recomputed (kn exactly, wn and fn to 1e-7).
+def init_norm -> ([U32], [Float], [Float]) {
+  m1 = 2147483648.0
+  dn = RN
+  tn = dn
+  vn = 9.91256303526217e-3
+  kn: [U32] = [0; 128]
+  wn: [Float] = [0.0; 128]
+  fnn: [Float] = [0.0; 128]
+  q = vn / math.exp(-0.5 * dn * dn)
+  kn[0] = ((dn / q) * m1).to_u32
+  kn[1] = 0
+  wn[0] = f32(q / m1)
+  wn[127] = f32(dn / m1)
+  fnn[0] = 1.0
+  fnn[127] = f32(math.exp(-0.5 * dn * dn))
+  i = 126
+  while i >= 1 {
+    dn = math.sqrt(-2.0 * math.log(vn / dn + math.exp(-0.5 * dn * dn)))
+    kn[i + 1] = ((dn / tn) * m1).to_u32
+    tn = dn
+    fnn[i] = f32(math.exp(-0.5 * dn * dn))
+    wn[i] = f32(dn / m1)
+    i -= 1
+  }
+  (kn, wn, fnn)
+}
+
+# initExp: the tables recomputed (ke exactly, we and fe to 1e-7).
+def init_exp -> ([U32], [Float], [Float]) {
+  m2 = 4294967296.0
+  de = RE
+  te = de
+  ve = 3.9496598225815571993e-3
+  ke: [U32] = [0; 256]
+  we: [Float] = [0.0; 256]
+  fe: [Float] = [0.0; 256]
+  q = ve / math.exp(-de)
+  ke[0] = ((de / q) * m2).to_u32
+  ke[1] = 0
+  we[0] = f32(q / m2)
+  we[255] = f32(de / m2)
+  fe[0] = 1.0
+  fe[255] = f32(math.exp(-de))
+  i = 254
+  while i >= 1 {
+    de = -math.log(ve / de + math.exp(-de))
+    ke[i + 1] = ((de / te) * m2).to_u32
+    te = de
+    fe[i] = f32(math.exp(-de))
+    we[i] = f32(de / m2)
+    i -= 1
+  }
+  (ke, we, fe)
+}
+
+def compare_float_slices(s1: [Float], s2: [Float]) -> Int {
+  return (s1.size < s2.size ? s1.size : s2.size) + 1 if s1.size != s2.size
+  for i in 0...s1.size {
+    return i if !near_equal(s1[i], s2[i], 0.0, 1e-7)
+  }
+  -1
+}
+
+test "norm tables" {
+  kn, wn, fnn = init_norm()
+  assert_eq KN.to_a, kn
+  assert_eq compare_float_slices(WN.to_a, wn), -1
+  assert_eq compare_float_slices(FN.to_a, fnn), -1
+}
+
+test "exp tables" {
+  ke, we, fe = init_exp()
+  assert_eq KE.to_a, ke
+  assert_eq compare_float_slices(WE.to_a, we), -1
+  assert_eq compare_float_slices(FE.to_a, fe), -1
+}
+
+def test_rand -> Rand { new(new_pcg(1, 2)) }
+
+test "Float32" {
+  r = test_rand()
+  for ct in 0...1000000 {
+    f = r.float32!
+    assert f < 1.0, "Float32() should be in range [0,1). ct: #{ct} f: #{f}"
+  }
+}
+
+test "shuffle small" {
+  r = test_rand()
+  for n in 0..1 {
+    r.shuffle!(n) { |i, j| panic("swap called, n=#{n} i=#{i} j=#{j}") }
+  }
+}
+
+# A permutation's rank among all permutations of its size.
+def encode_perm(s: [Int]) -> Int {
+  for i in 0...s.size {
+    x = s[i]
+    for j in i + 1...s.size {
+      s[j] -= 1 if s[j] > x
+    }
+  }
+  m = 0
+  fact = 1
+  i = s.size - 1
+  while i >= 0 {
+    m += s[i] * fact
+    fact *= s.size - i
+    i -= 1
+  }
+  m
+}
+
+# The chi-squared statistics of `fn` (values in [0, nfact)), as samples.
+def chi2_errors(r: Rand, n: Int, which: Str) -> [Str] {
+  q = r
+  nfact = 1
+  for i in 2..n { nfact *= i }
+  p: [Int] = [0; n]
+  nsamples = 10 * nfact < 1000 ? 1000 : 10 * nfact
+  samples: [Float] = [0.0; nsamples]
+  for k in 0...nsamples {
+    iters = 1000
+    counts: [Int] = [0; nfact]
+    for _ in 0...iters {
+      v = 0
+      if which == "Int32N" {
+        v = q.int32_n!(nfact.as_i32).to_i
+      } else if which == "Perm" {
+        v = encode_perm(q.perm!(n))
+      } else {
+        for i in 0...n { p[i] = i }
+        q.shuffle!(n) { |i, j| p[i], p[j] = p[j], p[i] }
+        v = encode_perm(p.dup)
+      }
+      counts[v] += 1
+    }
+    want = iters.to_f / nfact.to_f
+    chi2 = 0.0
+    for have in counts {
+      err = have.to_f - want
+      chi2 += err * err
+    }
+    samples[k] = chi2 / want
+  }
+  dof = (nfact - 1).to_f
+  expected = StatsResults.new(mean: dof, stddev: math.sqrt(2.0 * dof))
+  error_scale = math.max(1.0, expected.stddev)
+  expected.close_enough = 0.10 * error_scale
+  expected.max_error = 0.08
+  check_sample_distribution(samples, expected).map { |e| "n=#{n} #{which}: #{e}" }.to_a
+}
+
+# Go's TestUniformFactorial in its -short form (n = 3); Go's full run goes
+# to n = 6 (about 6 million Perm calls per method).
+test "uniform factorial" {
+  r = new(new_pcg(1, 2))
+  for n in 3..3 {
+    for which in ["Int32N", "Perm", "Shuffle"] {
+      assert_eq chi2_errors(r, n, which), []
+    }
+  }
+}
+
+test "N" {
+  for _ in 0...1000 {
+    v = n(10)
+    assert v >= 0 && v < 10, "N(10) returned #{v}"
+  }
+  b: U8 = 7
+  for _ in 0...1000 {
+    v = n(b)
+    assert v < 7, "N(U8 7) returned #{v}"
+  }
+}
+
+test "N panics on zero" {
+  r = test_rand()
+  t = spawn { r.n!(0) }
+  assert t.wait.err?, "N(0) panics"
+}
+
+test "IntN panics on zero" {
+  r = test_rand()
+  t = spawn { r.int_n!(0) }
+  assert t.wait.err?, "IntN(0) panics"
+}
+
+test "auto" {
+  # The unseeded top-level functions don't produce Seed(1)'s output.
+  out: [I64] = []
+  for _ in 0...10 { out << int64() }
+  r = new(new_pcg(1, 0))
+  found = 0
+  for _ in 0...1000 {
+    x = r.int64!
+    if x == out[found] {
+      found += 1
+      assert found < out.size, "found unseeded output in Seed(1) output"
+    }
+  }
+}
+
+test "top-level functions" {
+  for _ in 0...100 {
+    assert int64() >= 0
+    assert int32() >= 0
+    assert int() >= 0
+    assert int_n(5) < 5
+    assert int32_n(5) < 5
+    assert int64_n(5) < 5
+    assert uint64_n(5) < 5
+    assert uint32_n(5) < 5
+    assert uint_n(5) < 5
+    f = float64()
+    assert f >= 0.0 && f < 1.0
+    g = float32()
+    assert g >= 0.0 && g < 1.0
+    assert exp_float64() > 0.0
+    x = norm_float64()
+    assert x == x
+    uint32()
+    uint64()
+    uint()
+  }
+  p = perm(10)
+  q = p.sort
+  assert_eq q, (0...10).to_a
+  xs = (0...20).to_a
+  shuffle(20) { |i, j| xs[i], xs[j] = xs[j], xs[i] }
+  xs = xs.sort
+  assert_eq xs, (0...20).to_a
+}
+
+# Go's race_test.go TestConcurrent: the top-level functions from many tasks.
+test "concurrent" {
+  ts = (0...10).map { |_|
+    spawn {
+      seed = 0
+      for _ in 0...10 {
+        seed += exp_float64().to_i
+        seed += float32().to_i
+        seed += float64().to_i
+        seed += int_n(int()) % 2
+        seed += int32_n(int32()).to_i % 2
+        seed += int64_n(int64()) % 2
+        seed += norm_float64().to_i
+        seed += uint32().to_i
+        seed += (uint64() >> 32).to_i
+        for p in perm(10) { seed += p }
+      }
+      seed
+    }
+  }.to_a
+  for t in ts { assert t.wait.unwrap > 0 }
+}
+
+test "Rand copies share the source" {
+  r = test_rand()
+  r2 = r
+  a = r.uint64!
+  b = r2.uint64!
+  assert_eq a, 0xc4f5a58656eef510
+  assert_eq b, 0x9dcec3ad077dec6c
+}
+
+test "f32" {
+  assert_eq f32(0.1).__bits, 0x3fb99999a0000000
+  assert_eq f32(1.0), 1.0
+  assert_eq f32(-0.1).__bits, 0xbfb99999a0000000
+  # Ties to even, at the 24-bit boundary.
+  assert_eq f32(1.0 + 1.0 / 16777216.0), 1.0
+  assert_eq f32(1.0 + 3.0 / 16777216.0), 1.0 + 4.0 / 16777216.0
+  # Subnormals and overflow.
+  assert_eq f32(1e-45).__bits, 0x36a0000000000000
+  assert_eq f32(3e-45).__bits, 0x36b0000000000000
+  assert_eq f32(1e-50), 0.0
+  assert_eq f32(4e38), math.inf(1)
+  assert_eq f32(3.4028235e38).__bits, 0x47efffffe0000000
+}
+
+bench "Int64" {
+  r = test_rand()
+  t: I64 = 0
+  for _ in 0...1000000 { t = t +% r.int64! }
+  assert t != 0
+}
+
+bench "IntN 1000" {
+  r = test_rand()
+  t = 0
+  for _ in 0...1000000 { t += r.int_n!(1000) }
+  assert t != 0
+}
+
+bench "Float64" {
+  r = test_rand()
+  t = 0.0
+  for _ in 0...1000000 { t += r.float64! }
+  assert t > 0.0
+}
+
+bench "NormFloat64" {
+  r = test_rand()
+  t = 0.0
+  for _ in 0...1000000 { t += r.norm_float64! }
+  assert t == t
+}
+
+bench "ExpFloat64" {
+  r = test_rand()
+  t = 0.0
+  for _ in 0...1000000 { t += r.exp_float64! }
+  assert t > 0.0
+}
+
+bench "Perm30" {
+  r = test_rand()
+  t = 0
+  for _ in 0...100000 { t += r.perm!(30)[0] }
+  assert t > 0
+}
+
+bench "global Int64" {
+  t: I64 = 0
+  for _ in 0...100000 { t = t +% int64() }
+  assert t != 0
+}

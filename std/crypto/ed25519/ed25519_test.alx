@@ -1,0 +1,249 @@
+import "crypto"
+import "crypto/rand"
+import "crypto/sha512"
+import "encoding/hex"
+
+# Go's ed25519_test.go, translated (TestGolden's testdata/sign.input.gz is
+# vec_golden_test.alx; ed25519vectors_test.go and the Wycheproof test are
+# vec_ed25519vectors_test.alx and vec_wycheproof_test.alx, see there).
+#
+# Not translated: TestAllocations (Go counts heap allocations with
+# testing.AllocsPerRun; alx has no allocation counter, and its arena
+# allocation doesn't have Go's escape-analysis question).
+
+# Reads zeros (Go's zeroReader).
+struct ZeroReader {
+  def read!(p: [Byte]) -> ~Int {
+    i = 0
+    while i < p.size {
+      p[i] = 0
+      i += 1
+    }
+    p.size
+  }
+}
+
+# Reads the bytes of a slice, then EOF (Go's bytes.NewReader).
+struct SliceReader {
+  st: [[Byte]]
+
+  def read!(p: [Byte]) -> ~Int {
+    rest = st[0]
+    n = p.size
+    n = rest.size if rest.size < n
+    copy(p, rest[0...n])
+    self.st[0] = rest[n...rest.size]
+    n
+  }
+}
+
+def dh(s: Str) -> [Byte] { hex.decode_string(s).unwrap }
+
+test "example ed25519ctx" {
+  kp = generate_key(rand.reader()).unwrap
+  pub_key = kp[0]
+  priv = kp[1]
+  msg = "The quick brown fox jumps over the lazy dog".bytes
+  sig = priv.sign_options(rand.reader(), msg, Options.new(context: "Example_ed25519ctx")).unwrap
+  assert !verify_with_options(pub_key, msg, sig, Options.new(context: "Example_ed25519ctx")).err?, "invalid signature"
+}
+
+test "generate key" {
+  kp = generate_key(rand.reader()).unwrap
+  public = kp[0]
+  private = kp[1]
+  assert_eq public.bytes.size, PUBLIC_KEY_SIZE
+  assert_eq private.bytes.size, PRIVATE_KEY_SIZE
+  assert private.public_key.bytes == public.bytes, "public key doesn't match private key"
+  from_seed = new_key_from_seed(private.seed)
+  assert private.bytes == from_seed.bytes, "recreating key pair from seed gave different private key"
+
+  k2 = generate_key(rand.reader()).unwrap[1]
+  assert private.bytes != k2.bytes, "GenerateKey returned the same private key twice"
+
+  # generate_key is documented to be the same as new_key_from_seed.
+  seed = [0.as_u8; SEED_SIZE]
+  rand.read(seed)
+  k4 = generate_key(SliceReader.new(st: [seed + []])).unwrap[1]
+  k4n = new_key_from_seed(seed)
+  assert k4.bytes == k4n.bytes, "GenerateKey with seed gave different private key"
+
+  # A short reader fails.
+  assert generate_key(SliceReader.new(st: [[1, 2, 3]])).err?, "short seed"
+}
+
+test "sign verify" {
+  kp = generate_key(ZeroReader.new).unwrap
+  public = kp[0]
+  private = kp[1]
+  message = "test message".bytes
+  sig = sign(private, message)
+  assert verify(public, message, sig), "valid signature rejected"
+  assert !verify(public, "wrong message".bytes, sig), "signature of different message accepted"
+}
+
+test "sign verify hashed" {
+  # From RFC 8032, Section 7.3
+  key = dh("833fe62409237b9d62ec77587520911e9a759cec1d19755b7da901b96dca3d42ec172b93ad5e563bf4932c70e1245034c35467ef2efd4d64ebf819683467e2bf")
+  expected_sig = dh("98a70222f0b8121aa9d30f813d683f809e462b469c7ff87639499bb94e6dae4131f85042463c2a355a2003d062adf5aaa10b8c61e636062aaad11c2a26083406")
+  message = dh("616263")
+
+  private = PrivateKey.new(key)
+  public = private.public_key
+  hash = sha512.sum512(message)[0...64]
+  sig = private.sign(rand.reader(), hash, crypto.SHA512).unwrap
+  assert_eq sig, expected_sig
+  sig = private.sign_options(rand.reader(), hash, Options.new(hash: crypto.SHA512)).unwrap
+  assert_eq sig, expected_sig
+  assert !verify_with_options(public, hash, sig, Options.new(hash: crypto.SHA512)).err?, "valid signature rejected"
+
+  assert verify_with_options(public, hash, sig, Options.new(hash: crypto.SHA256)).err?, "expected error for wrong hash"
+
+  wrong_hash = sha512.sum512("wrong message".bytes)[0...64]
+  assert verify_with_options(public, wrong_hash, sig, Options.new(hash: crypto.SHA512)).err?, "signature of different message accepted"
+
+  sig[0] = sig[0] ^ 0xff
+  assert verify_with_options(public, hash, sig, Options.new(hash: crypto.SHA512)).err?, "invalid signature accepted"
+  sig[0] = sig[0] ^ 0xff
+  sig[SIGNATURE_SIZE - 1] = sig[SIGNATURE_SIZE - 1] ^ 0xff
+  assert verify_with_options(public, hash, sig, Options.new(hash: crypto.SHA512)).err?, "invalid signature accepted"
+
+  # The RFC provides no test vectors for Ed25519ph with context, so just
+  # sign and verify something.
+  sig = private.sign_options(rand.reader(), hash, Options.new(hash: crypto.SHA512, context: "123")).unwrap
+  assert !verify_with_options(public, hash, sig, Options.new(hash: crypto.SHA512, context: "123")).err?, "valid signature rejected"
+  assert verify_with_options(public, hash, sig, Options.new(hash: crypto.SHA512, context: "321")).err?, "expected error for wrong context"
+  assert verify_with_options(public, hash, sig, Options.new(hash: crypto.SHA256, context: "123")).err?, "expected error for wrong hash"
+}
+
+test "sign verify context" {
+  # From RFC 8032, Section 7.2
+  key = dh("0305334e381af78f141cb666f6199f57bc3495335a256a95bd2a55bf546663f6dfc9425e4f968f7f0c29f0259cf5f9aed6851c2bb4ad8bfb860cfee0ab248292")
+  expected_sig = dh("55a4cc2f70a54e04288c5f4cd1e45a7bb520b36292911876cada7323198dd87a8b36950b95130022907a7fb7c4e9b2d5f6cca685a587b4b21f4b888e4e7edb0d")
+  message = dh("f726936d19c800494e3fdaff20b276a8")
+  context = "foo"
+
+  private = PrivateKey.new(key)
+  public = private.public_key
+  sig = private.sign_options(rand.reader(), message, Options.new(context: context)).unwrap
+  assert_eq sig, expected_sig
+  assert !verify_with_options(public, message, sig, Options.new(context: context)).err?, "valid signature rejected"
+
+  assert verify_with_options(public, "bar".bytes, sig, Options.new(context: context)).err?, "signature of different message accepted"
+  assert verify_with_options(public, message, sig, Options.new(context: "bar")).err?, "signature with different context accepted"
+
+  sig[0] = sig[0] ^ 0xff
+  assert verify_with_options(public, message, sig, Options.new(context: context)).err?, "invalid signature accepted"
+  sig[0] = sig[0] ^ 0xff
+  sig[SIGNATURE_SIZE - 1] = sig[SIGNATURE_SIZE - 1] ^ 0xff
+  assert verify_with_options(public, message, sig, Options.new(context: context)).err?, "invalid signature accepted"
+}
+
+def signer_sign(signer: crypto.Signer, message: [Byte], opts: crypto.SignerOpts) -> ~[Byte] {
+  ~signer.sign(ZeroReader.new, message, opts)
+}
+
+test "crypto signer" {
+  kp = generate_key(ZeroReader.new).unwrap
+  public = kp[0]
+  private = kp[1]
+
+  signer: crypto.Signer = private
+  # Go type-asserts signer.Public() to PublicKey; alx can't, so the
+  # concrete public_key is compared.
+  assert public.equal?(private.public_key), "public keys do not match"
+
+  message = "message".bytes
+  signature = signer_sign(signer, message, Options.new).unwrap
+  signature2 = signer_sign(signer, message, Options.new(hash: none)).unwrap
+  assert signature == signature2, "signatures do not match"
+  assert verify(public, message, signature), "Verify failed on signature from Sign()"
+  # A hash other than SHA-512 is rejected.
+  r = signer_sign(signer, message, crypto.SHA256)
+  assert_eq r.err.unwrap.message, "ed25519: expected opts.HashFunc() zero (unhashed message, for standard Ed25519) or SHA-512 (for Ed25519ph)"
+}
+
+test "equal" {
+  kp = generate_key(rand.reader()).unwrap
+  public = kp[0]
+  private = kp[1]
+  assert public.equal?(public), "public key is not equal to itself"
+  assert public.equal?(private.public_key), "private.Public() is not Equal to public"
+  assert private.equal?(private), "private key is not equal to itself"
+
+  kp2 = generate_key(rand.reader()).unwrap
+  assert !public.equal?(kp2[0]), "different public keys are Equal"
+  assert !private.equal?(kp2[1]), "different private keys are Equal"
+}
+
+test "malleability" {
+  # https://tools.ietf.org/html/rfc8032#section-5.1.7 adds an additional
+  # test that s be in [0, order). This prevents someone from adding a
+  # multiple of order to s and obtaining a second valid signature for the
+  # same message.
+  msg: [Byte] = [0x54, 0x65, 0x73, 0x74]
+  sig: [Byte] = [0x7c, 0x38, 0xe0, 0x26, 0xf2, 0x9e, 0x14, 0xaa, 0xbd, 0x05, 0x9a, 0x0f, 0x2d, 0xb8, 0xb0, 0xcd, 0x78, 0x30,
+    0x40, 0x60, 0x9a, 0x8b, 0xe6, 0x84, 0xdb, 0x12, 0xf8, 0x2a, 0x27, 0x77, 0x4a, 0xb0, 0x67, 0x65, 0x4b, 0xce, 0x38, 0x32,
+    0xc2, 0xd7, 0x6f, 0x8f, 0x6f, 0x5d, 0xaf, 0xc0, 0x8d, 0x93, 0x39, 0xd4, 0xee, 0xf6, 0x76, 0x57, 0x33, 0x36, 0xa5, 0xc5,
+    0x1e, 0xb6, 0xf9, 0x46, 0xb3, 0x1d]
+  public_key: [Byte] = [0x7d, 0x4d, 0x0e, 0x7f, 0x61, 0x53, 0xa6, 0x9b, 0x62, 0x42, 0xb5, 0x22, 0xab, 0xbe, 0xe6, 0x85, 0xfd,
+    0xa4, 0x42, 0x0f, 0x88, 0x34, 0xb1, 0x08, 0xc3, 0xbd, 0xae, 0x36, 0x9e, 0xf5, 0x49, 0xfa]
+  assert !verify(PublicKey.new(public_key), msg, sig), "non-canonical signature accepted"
+}
+
+# Go's FIPS 140 self-test (cast.go), which Go runs before the first use.
+test "fips140 cast" {
+  assert fips140_cast(), "CAST"
+}
+
+# Errors and panics with Go's messages.
+test "errors" {
+  pk = new_key_from_seed([0.as_u8; 32])
+  pub_key = pk.public_key
+  msg = "m".bytes
+  sig = sign(pk, msg)
+  assert_eq verify_with_options(pub_key, msg, sig[0...63], Options.new).err.unwrap.message, "ed25519: bad signature length: 63"
+  assert_eq verify_with_options(pub_key, msg, sig, Options.new(hash: crypto.SHA512)).err.unwrap.message, "ed25519: bad Ed25519ph message hash length: 1"
+  assert_eq verify_with_options(pub_key, msg, sig, Options.new(context: "x" * 256)).err.unwrap.message, "ed25519: bad Ed25519ctx context length: 256"
+  assert_eq verify_with_options(pub_key, msg, sig, Options.new(hash: crypto.SHA256)).err.unwrap.message, "ed25519: expected opts.Hash zero (unhashed message, for standard Ed25519) or SHA-512 (for Ed25519ph)"
+  bad = sig + []
+  bad[63] = bad[63] | 0x80
+  assert_eq verify_with_options(pub_key, msg, bad, Options.new).err.unwrap.message, "ed25519: invalid signature"
+  # A public key that isn't a point.
+  not_point = PublicKey.new(dh("efffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f"))
+  assert_eq verify_with_options(not_point, msg, sig, Options.new).err.unwrap.message, "ed25519: bad public key"
+  assert_eq pk.sign_options(rand.reader(), msg, Options.new(context: "x" * 256)).err.unwrap.message, "ed25519: bad Ed25519ctx context length: 256"
+
+  t1 = spawn { new_key_from_seed([1, 2, 3]) }
+  assert "#{t1.wait.err.unwrap}".end_with?("ed25519: bad seed length: 3"), "ed25519: bad seed length: 3"
+  t2 = spawn { sign(PrivateKey.new([1, 2]), "m".bytes) }
+  assert "#{t2.wait.err.unwrap}".end_with?("ed25519: bad private key: ed25519: bad private key length: 2"), "ed25519: bad private key: ed25519: bad private key length: 2"
+  t3 = spawn { verify(PublicKey.new([1]), "m".bytes, [0.as_u8; 64]) }
+  assert "#{t3.wait.err.unwrap}".end_with?("ed25519: bad public key length: 1"), "ed25519: bad public key length: 1"
+}
+
+def bench_key -> PrivateKey { generate_key(ZeroReader.new).unwrap[1] }
+
+bench "key generation" {
+  kp = generate_key(ZeroReader.new).unwrap
+  assert kp[0].bytes.size == 32, "bench"
+}
+
+bench "new key from seed" {
+  k = new_key_from_seed([0.as_u8; SEED_SIZE])
+  assert k.bytes.size == 64, "bench"
+}
+
+bench "signing" {
+  priv = bench_key
+  sig = sign(priv, "Hello, world!".bytes)
+  assert sig.size == 64, "bench"
+}
+
+bench "verification" {
+  priv = bench_key
+  pub_key = priv.public_key
+  message = "Hello, world!".bytes
+  signature = sign(priv, message)
+  assert verify(pub_key, message, signature), "bench"
+}

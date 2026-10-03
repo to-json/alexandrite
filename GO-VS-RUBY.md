@@ -149,6 +149,7 @@ The logic: **fallibility is a prefix** ("approximately do this", "you'll probabl
 | D47 | Language additions from std wave 1 (S1, docs/milestones/S1.md) | qualified variant patterns `pkg.Type.Variant(..)`; `(T)` groups a type; invalid UTF-8 decodes to U+FFFD per byte (Go); array literals coerce element-wise; `==` on optionals (`T? == T?`, `T? == T`); `%.Nd` integer precision; keywords name struct fields and named arguments (`next: T`) | S1 |
 | D48 | Generic statics and result-type inference (S1) | a static method of a generic type is generic over the type's parameters (`R.make(v)`, `R[Byte].make(7)`); type parameters the arguments don't decide come from the wanted type (`x: R[Int] = R.empty`); no explicit `f[T](..)` on plain calls yet | S1 |
 | D49 | Covariant interface results (S1) | an implementor's method may return a struct/enum that implements the interface's declared interface result (`def clone -> Hash` satisfied by `-> Digest`); the dispatch wraps it. Fallible covariant results not yet | S1 |
+| D50 | From the regexp port (S2) | `Str#byteindex(sub, from = 0)` (Ruby's; a byte offset or -1; memchr-based on every backend); `!` calls evaluate their arguments before reading the receiver; call sites with one receiver type share a `!` cell; the task stack reserves 8 MiB (committed as touched; was 256 KiB) so Go-depth recursion (`x{1,1000}`) fits | S2 |
 
 ## Memory model and the next push (user, 2026-10-01)
 

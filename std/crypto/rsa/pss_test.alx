@@ -1,0 +1,87 @@
+# Go's pss_test.go. TestPSSGolden's pss-vect.txt.bz2 is
+# vec_pss_golden_test.alx (check_pss_golden below). The FIPS-mode
+# expectations of TestPSSSigning (fipsGood) don't apply (no FIPS mode).
+
+import "crypto"
+import "crypto/sha256"
+import "crypto/sha512"
+
+def check_pss_golden(key: PublicKey, msg: Str, sig: Str) {
+  h = crypto.SHA1.new
+  _ = h.write!(unhex(msg))
+  hashed = h.sum([])
+  opts = PSSOptions.new(salt_length: PSS_SALT_LENGTH_EQUALS_HASH, hash: none)
+  r = verify_pss_g(key, crypto.SHA1, hashed, unhex(sig), opts, false)
+  assert r.ok?, err_text(r)
+}
+
+# OpenSSL uses the maximal salt length by default.
+test "PSSOpenSSL" {
+  hashed = digest(crypto.SHA256, "testing")
+  # `echo -n testing | openssl dgst -sign key.pem -sigopt rsa_padding_mode:pss -sha256 > sig`
+  sig = unhex("95596fd310a2e7a2929d4a072e2b27cc06c2872c52f04acc0594f2c32e20d73e6662b5952ba3939a666425e074668c3e92ebc6e6c044f3b4b42e8c660a379c69")
+  r = verify_pss_g(test512_key().public_key, crypto.SHA256, hashed, sig, none, false)
+  assert r.ok?, err_text(r)
+}
+
+test "PSSNilOpts" {
+  hashed = digest(crypto.SHA256, "testing")
+  _ = sign_pss(crand(), test1024_key(), crypto.SHA256, hashed, none)
+}
+
+test "PSSSigning" {
+  # (sign salt length, verify salt length, good)
+  combos: [(Int, Int, Bool)] = [
+    (PSS_SALT_LENGTH_AUTO, PSS_SALT_LENGTH_AUTO, true),
+    (PSS_SALT_LENGTH_EQUALS_HASH, PSS_SALT_LENGTH_AUTO, true),
+    (PSS_SALT_LENGTH_EQUALS_HASH, PSS_SALT_LENGTH_EQUALS_HASH, true),
+    (PSS_SALT_LENGTH_EQUALS_HASH, 8, false),
+    (8, 8, true),
+    (8, PSS_SALT_LENGTH_AUTO, true),
+    (42, PSS_SALT_LENGTH_AUTO, true),
+    (PSS_SALT_LENGTH_AUTO, PSS_SALT_LENGTH_EQUALS_HASH, false),
+    (PSS_SALT_LENGTH_AUTO, 106, true),
+    (PSS_SALT_LENGTH_AUTO, 20, false),
+    (PSS_SALT_LENGTH_AUTO, -2, false),
+  ]
+  hashed = digest(crypto.SHA1, "testing")
+  k = test1024_key()
+  i = 0
+  for t in combos {
+    sig = sign_pss(crand(), k, crypto.SHA1, hashed, PSSOptions.new(salt_length: t[0], hash: none))
+    assert sig.ok?, "##{i}: error while signing: #{err_text(sig)}"
+    r = verify_pss(k.public_key, crypto.SHA1, hashed, sig.unwrap, PSSOptions.new(salt_length: t[1], hash: none))
+    assert r.ok? == t[2], "##{i}: bad result, wanted: #{t[2]}, got: #{err_text(r)}"
+    i += 1
+  }
+}
+
+# Issue 42741: EM is one byte shorter than k when modBits - 1 is a
+# multiple of 8.
+test "PSS513" {
+  key = generate_key_g(crand(), 513, false).unwrap
+  d = sha256.sum256("message".bytes).to_a
+  sig = key.sign_g(crand(), d, PSSOptions.new(salt_length: PSS_SALT_LENGTH_AUTO, hash: crypto.SHA256), false).unwrap
+  r = verify_pss_g(key.public_key, crypto.SHA256, d, sig, none, false)
+  assert r.ok?, err_text(r)
+}
+
+test "InvalidPSSSaltLength" {
+  key = generate_key_g(crand(), 245, false).unwrap
+  d = sha256.sum256("message".bytes).to_a
+  r = sign_pss_g(crand(), key, crypto.SHA256, d, PSSOptions.new(salt_length: -2, hash: crypto.SHA256), false)
+  assert_eq err_text(r), "crypto/rsa: invalid PSS salt length"
+  v = verify_pss_g(key.public_key, crypto.SHA256, [1, 2, 3], [0.as_u8; 31], PSSOptions.new(salt_length: -2, hash: none), false)
+  assert v.err?, "VerifyPSS unexpected success"
+}
+
+test "HashOverride" {
+  d = sha512.sum512("message".bytes).to_a
+  k = test2048_key()
+  # opts.hash overrides the hash argument of sign_pss.
+  sig = sign_pss(crand(), k, crypto.SHA256, d, PSSOptions.new(salt_length: 0, hash: crypto.SHA512))
+  assert sig.ok?, "SignPSS unexpected error: #{err_text(sig)}"
+  # verify_pss ignores opts.hash.
+  r = verify_pss(k.public_key, crypto.SHA512, d, sig.unwrap, PSSOptions.new(salt_length: 0, hash: crypto.SHA256))
+  assert r.ok?, "VerifyPSS unexpected error: #{err_text(r)}"
+}

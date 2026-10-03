@@ -1,0 +1,246 @@
+#![overflow(wrap)]
+# Go's crypto/internal/fips140/rsa/keygen.go: key generation per
+# c2sp.org/det-keygen (FIPS 186-5 A.1.3 random probable primes, Miller-
+# Rabin of B.3.1, d = e^-1 mod lambda(N)), plus Go's crypto/rand.Prime
+# for multi-prime keys. Not constant time (as in Go).
+
+import "io"
+import "crypto/internal/fips140/bigmod"
+import "crypto/rand"
+import "math/big"
+
+# Go's fips140/rsa.GenerateKey. The prime candidates come from random;
+# the Miller-Rabin bases from crypto/rand (Go: its DRBG), so the key
+# depends only on random.
+def fips_generate_key(random: io.Reader, bits: Int) -> ~FipsPrivateKey {
+  fail fips_err("rsa: key too small") if bits < 32
+  loop {
+    p = ~random_prime(random, (bits + 1) / 2)
+    q = ~random_prime(random, bits / 2)
+    pm = ~bigmod.new_modulus(p)
+    qm = ~bigmod.new_modulus(q)
+    qe = qm.nat
+    qe.expand_for!(pm)
+    fail fips_err("rsa: generated p == q, random source is broken") if qe.equal(pm.nat) == 1
+    nm = ~bigmod.new_modulus_product(p, q)
+    fail fips_err("rsa: internal error: modulus size incorrect") if nm.bit_len != bits
+
+    # d = e^-1 mod lambda(N), lambda(N) = lcm(p-1, q-1), as FIPS 186-5
+    # A.1.1(3) requires (rather than mod phi(N)).
+    lr = totient(pm, qm)
+    if lr.err? {
+      # The divisor is too large: try again with other primes.
+      next if is_divisor_too_large(lr)
+      ~lr
+    }
+    lambda = lr.unwrap
+    e = bigmod.new_nat()
+    e.set_uint!(65537)
+    dn = bigmod.new_nat()
+    dopt = dn.inverse_var_time!(e, lambda)
+    # GCD(e, lambda(N)) != 1: retry (probability ~2^-15).
+    next if dopt == none
+    d = dopt.unwrap
+    e.expand_for!(lambda)
+    fail fips_err("rsa: internal error: e*d != 1 mod λ(N)") if e.mul!(d, lambda).is_one == 0
+    # FIPS 186-5 A.1.1(3)'s d > 2^(nlen/2) is checked by
+    # check_private_key (it fails with probability < 2^-126).
+    k = ~fips_new_private_key_m(nm, 65537, d, pm, qm)
+    # Go runs a sign/verify pairwise consistency test here in FIPS mode.
+    return k
+  }
+}
+
+def is_divisor_too_large(r: ~bigmod.Modulus) -> Bool {
+  case r.err.unwrap {
+    RsaError.DivisorTooLarge => true
+    _ => false
+  }
+}
+
+# Go's totient: lambda(N) = lcm(p-1, q-1) for primes p, q = 7 mod 8 (so
+# p-1, q-1 are even and not divisible by 4). Fails with DivisorTooLarge
+# if gcd(p-1, q-1) >= 2^32.
+def totient(p: bigmod.Modulus, q: bigmod.Modulus) -> ~bigmod.Modulus {
+  a = p.nat
+  a.sub_one!(p)
+  b = q.nat
+  b.sub_one!(q)
+  fail fips_err("rsa: internal error: p and q must be 7 mod 8") if a.is_odd == 1 || b.is_odd == 1
+  # lcm(a, b) = a * (b / gcd(a, b)). The GCD needs an odd operand: b/2 is
+  # odd, and lcm(2x, 2y) = lcm(2x, y) for odd x, y.
+  b.shift_right_by_one!
+  fail fips_err("rsa: internal error: p and q must be 7 mod 8") if b.is_odd == 0
+  g = bigmod.new_nat()
+  gcd = ~g.gcd_var_time!(a, b)
+  fail fips_err("rsa: internal error: gcd(a, b) is even") if gcd.is_odd == 0
+  # Single-word divisors only (Go rejects >= 2^32 on every platform).
+  fail RsaError.DivisorTooLarge if gcd.bit_len_var_time + 1 > 32
+  fail fips_err("rsa: internal error: gcd(a, b) is zero") if gcd.is_zero == 1 || gcd.bits[0] == 0
+  rem = b.div_short_var_time!(gcd.bits[0])
+  fail fips_err("rsa: internal error: b is not divisible by gcd(a, b)") if rem != 0
+  ~bigmod.new_modulus_product(a.bytes(p), b.bytes(q))
+}
+
+# A random prime of the given size, FIPS 186-5 A.1.3.
+def random_prime(random: io.Reader, bits: Int) -> ~[Byte] {
+  fail fips_err("rsa: prime size must be at least 16 bits") if bits < 16
+  b = [0.as_u8; (bits + 7) / 8]
+  loop {
+    ~io.read_exact(random, b)
+    # Clear the excess top bits (a mask, so test candidates can be plain
+    # big-endian integers).
+    excess = b.size * 8 - bits
+    b[0] &= (0xff >> excess).as_u8
+    # Set the top two bits, so the product of two such primes has the
+    # full length.
+    if excess < 7 {
+      b[0] |= (0xc0 >> excess).as_u8
+    } else {
+      b[0] |= 0x01
+      b[1] |= 0x80
+    }
+    # 7 mod 8: odd, and (p - 1) / 2 odd (Miller-Rabin, totient).
+    b[b.size - 1] |= 0x07
+    # p > 3/2 * 2^(bits-1) > sqrt(2) * 2^(bits-1) by the top bits; the
+    # |p - q| check is deferred to check_private_key.
+    return b if is_prime(b)
+  }
+}
+
+# Odd primes whose products of three fit in 32 bits (trial division
+# before Miller-Rabin).
+PRIMES: [U64; 255] = [
+  3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43, 47, 53,
+  59, 61, 67, 71, 73, 79, 83, 89, 97, 101, 103, 107, 109, 113, 127,
+  131, 137, 139, 149, 151, 157, 163, 167, 173, 179, 181, 191, 193, 197, 199,
+  211, 223, 227, 229, 233, 239, 241, 251, 257, 263, 269, 271, 277, 281, 283,
+  293, 307, 311, 313, 317, 331, 337, 347, 349, 353, 359, 367, 373, 379, 383,
+  389, 397, 401, 409, 419, 421, 431, 433, 439, 443, 449, 457, 461, 463, 467,
+  479, 487, 491, 499, 503, 509, 521, 523, 541, 547, 557, 563, 569, 571, 577,
+  587, 593, 599, 601, 607, 613, 617, 619, 631, 641, 643, 647, 653, 659, 661,
+  673, 677, 683, 691, 701, 709, 719, 727, 733, 739, 743, 751, 757, 761, 769,
+  773, 787, 797, 809, 811, 821, 823, 827, 829, 839, 853, 857, 859, 863, 877,
+  881, 883, 887, 907, 911, 919, 929, 937, 941, 947, 953, 967, 971, 977, 983,
+  991, 997, 1009, 1013, 1019, 1021, 1031, 1033, 1039, 1049, 1051, 1061, 1063, 1069,
+  1087, 1091, 1093, 1097, 1103, 1109, 1117, 1123, 1129, 1151, 1153, 1163, 1171, 1181,
+  1187, 1193, 1201, 1213, 1217, 1223, 1229, 1231, 1237, 1249, 1259, 1277, 1279, 1283,
+  1289, 1291, 1297, 1301, 1303, 1307, 1319, 1321, 1327, 1361, 1367, 1373, 1381, 1399,
+  1409, 1423, 1427, 1429, 1433, 1439, 1447, 1451, 1453, 1459, 1471, 1481, 1483, 1487,
+  1489, 1493, 1499, 1511, 1523, 1531, 1543, 1549, 1553, 1559, 1567, 1571, 1579, 1583,
+  1597, 1601, 1607, 1609, 1613, 1619,
+]
+
+# Go's isPrime: Miller-Rabin (FIPS 186-5 B.3.1) for a random w = 3 mod 4,
+# after trial division. Not constant time; may accept adversarial
+# composites.
+def is_prime(w: [Byte]) -> Bool {
+  mrr = miller_rabin_setup(w)
+  # w is zero, one, or even.
+  return false if mrr.err?
+  mr = mrr.unwrap
+  i = 0
+  while i < PRIMES.size {
+    p1 = PRIMES[i]
+    p2 = PRIMES[i + 1]
+    p3 = PRIMES[i + 2]
+    wn = mr.w.nat
+    r = wn.div_short_var_time!(p1 * p2 * p3)
+    return false if r % p1 == 0 || r % p2 == 0 || r % p3 == 0
+    i += 3
+  }
+  # The number of rounds for random candidates, by size (BoringSSL's
+  # table).
+  bits = mr.w.bit_len
+  iterations = 34
+  if bits >= 3747 {
+    iterations = 3
+  } else if bits >= 1345 {
+    iterations = 4
+  } else if bits >= 476 {
+    iterations = 5
+  } else if bits >= 400 {
+    iterations = 6
+  } else if bits >= 347 {
+    iterations = 7
+  } else if bits >= 308 {
+    iterations = 8
+  } else if bits >= 55 {
+    iterations = 27
+  }
+  b = [0.as_u8; (bits + 7) / 8]
+  loop {
+    rand.read(b)
+    excess = b.size * 8 - bits
+    b[0] &= (0xff >> excess).as_u8
+    result = miller_rabin_iteration(mr, b)
+    # b was rejected.
+    next if result.err?
+    return false if !result.unwrap
+    iterations -= 1
+    return true if iterations == 0
+  }
+}
+
+# The state reused across Miller-Rabin rounds: w and m = (w - 1) / 2
+# (big-endian, without leading zeros).
+struct MillerRabin {
+  w: bigmod.Modulus
+  m: [Byte]
+}
+
+# w must be 3 mod 4 (big-endian).
+def miller_rabin_setup(w: [Byte]) -> ~MillerRabin {
+  fail fips_err("candidate is not 3 mod 4") if w.size == 0 || w[w.size - 1] & 0b11 != 0b11
+  wm = ~bigmod.new_modulus(w)
+  # m = (w-1)/2^a with m odd; a = 1 since w = 3 mod 4.
+  m = wm.nat
+  m.sub_one!(wm)
+  m.shift_right_by_one!
+  mb = m.bytes(wm)
+  i = 0
+  while mb[i] == 0 {
+    i += 1
+  }
+  MillerRabin.new(w: wm, m: mb[i...mb.size])
+}
+
+# One round with base bb: true is "possibly prime", false "composite";
+# fails for a base out of range.
+def miller_rabin_iteration(mr: MillerRabin, bb: [Byte]) -> ~Bool {
+  # Reject b <= 1 and b >= w - 1.
+  fail fips_err("incorrect length") if bb.size != (mr.w.bit_len + 7) / 8
+  b = bigmod.new_nat()
+  ~b.set_bytes!(bb, mr.w)
+  fail fips_err("out-of-range candidate") if b.is_zero == 1 || b.is_one == 1 || b.is_minus_one(mr.w) == 1
+  # With a = 1, b is a possible prime iff b^m = +-1 mod w.
+  z = bigmod.new_nat()
+  z.exp!(b, mr.m, mr.w)
+  z.is_one == 1 || z.is_minus_one(mr.w) == 1
+}
+
+# Go's crypto/rand.Prime: a number of the given bit length that is prime
+# with high probability, from random (used by GenerateMultiPrimeKey; alx's
+# crypto/rand has no Prime).
+def rand_prime(random: io.Reader, bits: Int) -> ~big.Int {
+  fail fips_err("crypto/rand: prime size must be at least 2-bit") if bits < 2
+  b = bits % 8
+  b = 8 if b == 0
+  bytes = [0.as_u8; (bits + 7) / 8]
+  p = big.Int.new
+  loop {
+    ~io.read_exact(random, bytes)
+    # At most bits long, with the top two bits set.
+    bytes[0] &= ((1 << b) - 1).as_u8
+    if b >= 2 {
+      bytes[0] |= (3 << (b - 2)).as_u8
+    } else {
+      bytes[0] |= 1
+      bytes[1] |= 0x80 if bytes.size > 1
+    }
+    # Odd.
+    bytes[bytes.size - 1] |= 1
+    p.set_bytes!(bytes)
+    return p if p.probably_prime?(20)
+  }
+}

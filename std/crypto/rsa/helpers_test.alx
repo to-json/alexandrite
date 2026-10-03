@@ -1,0 +1,196 @@
+# Helpers of the tests: keys from hex components (Go's tests parse PEM
+# keys; keys_test.alx has their components), a deterministic SHAKE256
+# random stream (vec_det_test.alx's vectors were made by Go with the same
+# stream under GODEBUG=cryptocustomrand=1), and the checks of the
+# generated vectors.
+
+import "crypto"
+import "crypto/rand"
+import "crypto/sha3"
+import "encoding/hex"
+import "io"
+import "math/big"
+
+def big_hex(s: Str) -> big.Int {
+  z = big.Int.new
+  z.set_string!(s, 16).unwrap
+}
+
+# A key as x509.ParsePKCS1PrivateKey / ParsePKCS8PrivateKey return it:
+# precomputed.
+def make_key(n: Str, e: Int, d: Str, primes: [Str]) -> PrivateKey {
+  ps: [big.Int] = []
+  for p in primes {
+    ps << big_hex(p)
+  }
+  k = PrivateKey.new(public_key: PublicKey.new(n: big_hex(n), e: e), d: big_hex(d), primes: ps, precomputed: PrecomputedValues.new)
+  k.precompute!
+  k
+}
+
+def make_pub(n: Str, e: Int) -> PublicKey { PublicKey.new(n: big_hex(n), e: e) }
+
+# The SHAKE256 stream of seed, an io.Reader. One-byte reads read nothing
+# (they return 1 and leave the byte), like Go's keyGenTestReader: that
+# neutralizes randutil.MaybeReadByte on Go's side, and both sides then
+# see the same bytes.
+struct Stream {
+  s: sha3.SHAKE
+
+  pub def read!(p: [Byte]) -> Int {
+    return 1 if p.size == 1
+    sh = self.s
+    sh.read!(p)
+  }
+}
+
+def stream(seed: Str) -> Stream {
+  s = sha3.new_shake256()
+  s.write!(seed.bytes).unwrap
+  Stream.new(s: s)
+}
+
+def unhex(s: Str) -> [Byte] { hex.decode_string(s).unwrap }
+
+def to_hex(b: [Byte]) -> Str { hex.encode_to_string(b) }
+
+def digest(h: crypto.Hash, msg: Str) -> [Byte] {
+  d = h.new
+  _ = d.write!(msg.bytes)
+  d.sum([])
+}
+
+# The message of a failed result ("" if it succeeded).
+def err_text[T](r: ~T) -> Str {
+  if e = r.err {
+    return e.message
+  }
+  ""
+}
+
+def crand -> rand.Reader { rand.reader() }
+
+# A reader that is always at the end of its input (Go's nil reader for
+# the "legacy and ignored" parameters).
+struct NilReader {
+  pub def read!(p: [Byte]) -> Int { 0 }
+}
+
+def nil_reader -> NilReader { NilReader.new }
+
+# ---- checks of the Wycheproof vectors (vec_wycheproof_*_test.alx) ----
+
+def check_wp_oaep(k: PrivateKey, h: crypto.Hash, mgf: crypto.Hash, ct: Str, label: Str, msg: Str, want: Bool) {
+  r = k.decrypt(nil_reader(), unhex(ct), OAEPOptions.new(hash: h, mgf_hash: mgf, label: unhex(label)))
+  if want {
+    assert r.ok?, "expected success: #{err_text(r)}"
+    assert_eq to_hex(r.unwrap), msg
+  } else {
+    assert r.err?, "expected failure"
+  }
+}
+
+def check_wp_pkcs1_decrypt(k: PrivateKey, ct: Str, msg: Str, want: Bool) {
+  r = decrypt_pkcs1v15(nil_reader(), k, unhex(ct))
+  if want {
+    assert r.ok?, "DecryptPKCS1v15: #{err_text(r)}"
+    assert_eq to_hex(r.unwrap), msg
+  } else {
+    assert r.err?, "DecryptPKCS1v15 unexpectedly succeeded"
+  }
+}
+
+def check_wp_sig(p: PublicKey, h: crypto.Hash, msg: Str, sig: Str, want: Bool) {
+  r = verify_pkcs1v15(p, h, digest_bytes(h, unhex(msg)), unhex(sig))
+  assert_eq r.ok?, want
+}
+
+def check_wp_pss(p: PublicKey, h: crypto.Hash, sl: Int, msg: Str, sig: Str, want: Bool) {
+  r = verify_pss(p, h, digest_bytes(h, unhex(msg)), unhex(sig), PSSOptions.new(salt_length: sl, hash: h))
+  assert_eq r.ok?, want
+}
+
+def digest_bytes(h: crypto.Hash, msg: [Byte]) -> [Byte] {
+  d = h.new
+  _ = d.write!(msg)
+  d.sum([])
+}
+
+# ---- checks of vec_det_test.alx ----
+
+def check_sign_pkcs1v15(k: PrivateKey, h: crypto.Hash, msg: Str, want: Str) {
+  d = digest(h, msg)
+  sig = sign_pkcs1v15_g(nil_reader(), k, h, d, false).unwrap
+  assert_eq to_hex(sig), want
+  assert verify_pkcs1v15_g(k.public_key, h, d, sig, false).ok?, "verify #{h.to_s}"
+}
+
+def check_sign_pkcs1v15_fails(k: PrivateKey, h: crypto.Hash, msg: Str, want: Str) {
+  assert_eq err_text(sign_pkcs1v15_g(nil_reader(), k, h, digest(h, msg), false)), want
+}
+
+def check_sign_pkcs1v15_raw(k: PrivateKey, msg: Str, want: Str) {
+  sig = sign_pkcs1v15_g(nil_reader(), k, none, msg.bytes, false).unwrap
+  assert_eq to_hex(sig), want
+  assert verify_pkcs1v15_g(k.public_key, none, msg.bytes, sig, false).ok?
+}
+
+def pss_opts(sl: Int) -> PSSOptions? {
+  return none if sl == 0
+  PSSOptions.new(salt_length: sl, hash: none)
+}
+
+def check_sign_pss(k: PrivateKey, h: crypto.Hash, sl: Int, seed: Str, want: Str) {
+  d = digest(h, "message to be signed")
+  sig = sign_pss_g(stream(seed), k, h, d, pss_opts(sl), false).unwrap
+  assert_eq to_hex(sig), want
+  assert verify_pss_g(k.public_key, h, d, sig, pss_opts(sl), false).ok?, "verify PSS #{h.to_s} #{sl}"
+}
+
+def check_sign_pss_fails(k: PrivateKey, h: crypto.Hash, sl: Int, seed: Str, want: Str) {
+  d = digest(h, "message to be signed")
+  assert_eq err_text(sign_pss_g(stream(seed), k, h, d, pss_opts(sl), false)), want
+}
+
+def check_encrypt_oaep(k: PrivateKey, h: crypto.Hash, seed: Str, msg: Str, label: Str, want: Str) {
+  ct = encrypt_oaep_g(h.new, h.new, stream(seed), k.public_key, msg.bytes, label.bytes, false).unwrap
+  assert_eq to_hex(ct), want
+  pt = decrypt_oaep_g(h.new, h.new, k, ct, label.bytes, false).unwrap
+  assert_eq Str.from_bytes(pt), msg
+}
+
+def check_encrypt_oaep_fails(k: PrivateKey, h: crypto.Hash, seed: Str, msg: Str, label: Str, want: Str) {
+  assert_eq err_text(encrypt_oaep_g(h.new, h.new, stream(seed), k.public_key, msg.bytes, label.bytes, false)), want
+}
+
+def check_encrypt_pkcs1v15(k: PrivateKey, seed: Str, msg: Str, want: Str) {
+  ct = encrypt_pkcs1v15_g(stream(seed), k.public_key, msg.bytes, false).unwrap
+  assert_eq to_hex(ct), want
+  pt = decrypt_pkcs1v15_g(nil_reader(), k, ct, false).unwrap
+  assert_eq Str.from_bytes(pt), msg
+}
+
+def check_encrypt_pkcs1v15_fails(k: PrivateKey, seed: Str, msg: Str, want: Str) {
+  assert_eq err_text(encrypt_pkcs1v15_g(stream(seed), k.public_key, msg.bytes, false)), want
+}
+
+def check_generate_key(seed: Str, bits: Int, n: Str, d: Str, p: Str, q: Str) {
+  k = generate_key_g(stream(seed), bits, false).unwrap
+  assert_eq k.n.text(16), n
+  assert_eq k.d.text(16), d
+  assert_eq k.primes[0].text(16), p
+  assert_eq k.primes[1].text(16), q
+  assert k.validate.ok?, "validate #{bits}"
+}
+
+def check_generate_multi_prime_key(seed: Str, nprimes: Int, bits: Int, n: Str, d: Str, primes: [Str]) {
+  k = generate_multi_prime_key_g(stream(seed), nprimes, bits, false).unwrap
+  assert_eq k.n.text(16), n
+  assert_eq k.d.text(16), d
+  assert_eq k.primes.size, primes.size
+  i = 0
+  while i < primes.size {
+    assert_eq k.primes[i].text(16), primes[i]
+    i += 1
+  }
+}

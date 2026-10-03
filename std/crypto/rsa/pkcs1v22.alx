@@ -1,0 +1,234 @@
+#![overflow(wrap)]
+# Go's crypto/internal/fips140/rsa/pkcs1v22.go: RSASSA-PSS and RSAES-OAEP
+# (RFC 8017, PKCS #1 v2.2) on the internal keys.
+
+import "hash"
+import "io"
+import "crypto/subtle"
+
+# Increments a four-byte big-endian counter.
+def inc_counter(c: [Byte]) {
+  i = 3
+  while i >= 0 {
+    c[i] += 1
+    return nil if c[i] != 0
+    i -= 1
+  }
+}
+
+# XORs out with the MGF1 mask of seed (PKCS #1 v2.1).
+def mgf1_xor(out: [Byte], h: hash.Hash, seed: [Byte]) {
+  hh = h
+  counter = [0.as_u8; 4]
+  done = 0
+  while done < out.size {
+    hh.reset!
+    _ = hh.write!(seed)
+    _ = hh.write!(counter)
+    digest = hh.sum([])
+    i = 0
+    while i < digest.size && done < out.size {
+      out[done] ^= digest[i]
+      done += 1
+      i += 1
+    }
+    inc_counter(counter)
+  }
+}
+
+# EMSA-PSS-ENCODE (RFC 8017, 9.1.1):
+#   EM = MGF1 xor DB || H( 8*0x00 || mHash || salt ) || 0xbc, DB = PS || 0x01 || salt
+def emsa_pss_encode(m_hash: [Byte], em_bits: Int, salt: [Byte], h: hash.Hash) -> ~[Byte] {
+  hh = h
+  h_len = hh.size
+  s_len = salt.size
+  em_len = (em_bits + 7) / 8
+  # 2. mHash = Hash(M), hLen octets.
+  fail fips_err("crypto/rsa: input must be hashed with given hash") if m_hash.size != h_len
+  # 3. emLen >= hLen + sLen + 2.
+  fail RsaError.MessageTooLong if em_len < h_len + s_len + 2
+  em = [0.as_u8; em_len]
+  ps_len = em_len - s_len - h_len - 2
+  db = em[0...ps_len + 1 + s_len]
+  # 5-6. H = Hash(0x00 * 8 || mHash || salt)
+  hh.reset!
+  _ = hh.write!([0.as_u8; 8])
+  _ = hh.write!(m_hash)
+  _ = hh.write!(salt)
+  hv = hh.sum([])
+  copy(em[ps_len + 1 + s_len...em_len - 1], hv)
+  # 7-8. DB = PS || 0x01 || salt
+  db[ps_len] = 0x01
+  copy(db[ps_len + 1...db.size], salt)
+  # 9-10. maskedDB = DB xor MGF(H, emLen - hLen - 1)
+  mgf1_xor(db, hh, hv)
+  # 11. Clear the leftmost 8 * emLen - emBits bits.
+  db[0] &= (0xff >> (8 * em_len - em_bits)).as_u8
+  # 12. EM = maskedDB || H || 0xbc
+  em[em_len - 1] = 0xbc
+  em
+}
+
+# Go's pssSaltLengthAutodetect.
+PSS_SALT_LENGTH_AUTODETECT = -1
+
+# EMSA-PSS-VERIFY (RFC 8017, 9.1.2); s_len -1 detects the salt length.
+def emsa_pss_verify(m_hash: [Byte], em: [Byte], em_bits: Int, s_len0: Int, h: hash.Hash) -> ~Unit {
+  hh = h
+  s_len = s_len0
+  h_len = hh.size
+  em_len = (em_bits + 7) / 8
+  fail fips_err("rsa: internal error: inconsistent length") if em_len != em.size
+  fail RsaError.Verification if h_len != m_hash.size
+  # 3. emLen >= hLen + sLen + 2.
+  fail RsaError.Verification if em_len < h_len + s_len + 2
+  # 4. The rightmost octet is 0xbc.
+  fail RsaError.Verification if em[em_len - 1] != 0xbc
+  # 5. maskedDB, then H.
+  db = em[0...em_len - h_len - 1]
+  hv = em[em_len - h_len - 1...em_len - 1]
+  # 6. The leftmost 8 * emLen - emBits bits are zero.
+  bit_mask = (0xff >> (8 * em_len - em_bits)).as_u8
+  fail RsaError.Verification if em[0] & ^bit_mask != 0
+  # 7-8. DB = maskedDB xor MGF(H, emLen - hLen - 1)
+  mgf1_xor(db, hh, hv)
+  # 9. Clear the leftmost bits.
+  db[0] &= bit_mask
+  # Unknown salt length: find the 0x01 delimiter.
+  if s_len == PSS_SALT_LENGTH_AUTODETECT {
+    ps_len = -1
+    i = 0
+    while i < db.size {
+      if db[i] == 0x01 {
+        ps_len = i
+        break
+      }
+      i += 1
+    }
+    fail RsaError.Verification if ps_len < 0
+    s_len = db.size - ps_len - 1
+  }
+  # 10. PS is zero, followed by 0x01.
+  ps_len = em_len - h_len - s_len - 2
+  i = 0
+  while i < ps_len {
+    fail RsaError.Verification if db[i] != 0x00
+    i += 1
+  }
+  fail RsaError.Verification if db[ps_len] != 0x01
+  # 11. The salt is the last sLen octets of DB.
+  salt = db[db.size - s_len...db.size]
+  # 12-13. H' = Hash(0x00 * 8 || mHash || salt)
+  hh.reset!
+  _ = hh.write!([0.as_u8; 8])
+  _ = hh.write!(m_hash)
+  _ = hh.write!(salt)
+  h0 = hh.sum([])
+  # 14.
+  fail RsaError.Verification if h0 != hv
+  nil
+}
+
+# Go's fips140/rsa.PSSMaxSaltLength (outside FIPS 140 mode).
+def pss_max_salt_length(pubk: FipsPublicKey, h: hash.Hash) -> ~Int {
+  salt_length = (pubk.n.bit_len - 1 + 7) / 8 - 2 - h.size
+  fail RsaError.MessageTooLong if salt_length < 0
+  salt_length
+}
+
+# Go's fips140/rsa.SignPSS: the salt is read from random.
+def fips_sign_pss(random: io.Reader, priv: FipsPrivateKey, h: hash.Hash, hashed: [Byte], salt_length: Int) -> ~[Byte] {
+  fail fips_err("crypto/rsa: salt length cannot be negative") if salt_length < 0
+  salt = [0.as_u8; salt_length]
+  ~io.read_exact(random, salt)
+  em_bits = priv.pubk.n.bit_len - 1
+  em = ~emsa_pss_encode(hashed, em_bits, salt, h)
+  # RFC 8017: EM is one octet shorter than k when modBits - 1 is a
+  # multiple of 8; pad it to k.
+  k = priv.pubk.size
+  if em.size < k {
+    em_new = [0.as_u8; k]
+    copy(em_new[k - em.size...k], em)
+    em = em_new
+  }
+  ~fips_decrypt(priv, em, true)
+}
+
+# Go's fips140/rsa.VerifyPSS / VerifyPSSWithSaltLength (salt_length -1:
+# detect).
+def fips_verify_pss(pubk: FipsPublicKey, h: hash.Hash, digest: [Byte], sig: [Byte], salt_length: Int) -> ~Unit {
+  ~check_public_key(pubk)
+  fail RsaError.Verification if sig.size != pubk.size
+  em_bits = pubk.n.bit_len - 1
+  em_len = (em_bits + 7) / 8
+  emr = fips_encrypt_raw(pubk, sig)
+  fail RsaError.Verification if emr.err?
+  em = emr.unwrap
+  # Encode to the modulus size, then strip leading zeros down to emLen.
+  while em.size > em_len && em.size > 0 {
+    fail RsaError.Verification if em[0] != 0
+    em = em[1...em.size]
+  }
+  ~emsa_pss_verify(digest, em, em_bits, salt_length, h)
+}
+
+# Go's fips140/rsa.EncryptOAEP: the seed is read from random.
+def fips_encrypt_oaep(h: hash.Hash, mgf_hash: hash.Hash, random: io.Reader, pubk: FipsPublicKey, msg: [Byte], label: [Byte]) -> ~[Byte] {
+  hh = h
+  ~check_public_key(pubk)
+  k = pubk.size
+  hs = hh.size
+  fail RsaError.MessageTooLong if msg.size > k - 2 * hs - 2
+  hh.reset!
+  _ = hh.write!(label)
+  l_hash = hh.sum([])
+  em = [0.as_u8; k]
+  seed = em[1...1 + hs]
+  db = em[1 + hs...k]
+  copy(db[0...hs], l_hash)
+  db[db.size - msg.size - 1] = 1
+  copy(db[db.size - msg.size...db.size], msg)
+  ~io.read_exact(random, seed)
+  mgf1_xor(db, mgf_hash, seed)
+  mgf1_xor(seed, mgf_hash, db)
+  ~fips_encrypt_raw(pubk, em)
+}
+
+# Go's fips140/rsa.DecryptOAEP: the padding is checked in constant time
+# (Manger's attack).
+def fips_decrypt_oaep(h: hash.Hash, mgf_hash: hash.Hash, priv: FipsPrivateKey, ciphertext: [Byte], label: [Byte]) -> ~[Byte] {
+  hh = h
+  k = priv.pubk.size
+  hs = hh.size
+  fail RsaError.Decryption if ciphertext.size > k || k < hs * 2 + 2
+  em = ~fips_decrypt(priv, ciphertext, false)
+  hh.reset!
+  _ = hh.write!(label)
+  l_hash = hh.sum([])
+  first_byte_is_zero = subtle.constant_time_byte_eq(em[0], 0)
+  seed = em[1...hs + 1]
+  db = em[hs + 1...em.size]
+  mgf1_xor(seed, mgf_hash, db)
+  mgf1_xor(db, mgf_hash, seed)
+  l_hash2 = db[0...hs]
+  l_hash2_good = subtle.constant_time_compare(l_hash, l_hash2)
+  # The rest is zero or more 0x00, then 0x01, then the message:
+  #   looking_for_index: 1 while still looking for the 0x01
+  #   index: the offset of the first 0x01
+  #   invalid: 1 if a non-zero byte came before the 0x01
+  looking_for_index = 1
+  index = 0
+  invalid = 0
+  rest = db[hs...db.size]
+  i = 0
+  while i < rest.size {
+    equals0 = subtle.constant_time_byte_eq(rest[i], 0)
+    equals1 = subtle.constant_time_byte_eq(rest[i], 1)
+    index = subtle.constant_time_select(looking_for_index & equals1, i, index)
+    looking_for_index = subtle.constant_time_select(equals1, 0, looking_for_index)
+    invalid = subtle.constant_time_select(looking_for_index & ^equals0, 1, invalid)
+    i += 1
+  }
+  fail RsaError.Decryption if first_byte_is_zero & l_hash2_good & ^invalid & ^looking_for_index != 1
+  rest[index + 1...rest.size]
+}

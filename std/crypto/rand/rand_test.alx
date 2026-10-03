@@ -1,0 +1,143 @@
+import "io"
+
+# Go's rand_test.go and text_test.go, translated. Each Read test runs on
+# read and on reader().read!, as Go's testReadAndReader does.
+#
+# Not translated: TestReadUsesReader and TestReadError (they replace the
+# package's Reader variable, which alx doesn't have; see the header),
+# TestAllocations (allocation counting), TestSynctest (Go's synctest
+# bubbles), TestDefaultReader (reflection over the Reader type), util_test.go
+# (Int and Prime need math/big). TestRead checks that the bytes don't
+# compress with compress/flate, which alx doesn't have yet; here the byte
+# values' spread stands in for it.
+
+def both(f: (([Byte]) -> Int) -> Unit) {
+  f(->(b: [Byte]) -> Int { read(b) })
+  f(->(b: [Byte]) -> Int {
+    r = reader()
+    r.read!(b)
+  })
+}
+
+test "read" {
+  both(->(rd: ([Byte]) -> Int) {
+    n = 100000
+    b = [0.as_u8; n]
+    assert_eq rd(b), n
+    # Incompressible bytes: every value about n / 256 times (the chance of
+    # a count outside 250..550 for random bytes is below 1e-15).
+    counts = [0; 256]
+    for x in b {
+      counts[x.to_i] = counts[x.to_i] + 1
+    }
+    for c in counts {
+      assert c > 250 && c < 550, "byte value count #{c} out of range"
+    }
+  })
+}
+
+test "read byte values" {
+  both(->(rd: ([Byte]) -> Int) {
+    b = [0.as_u8; 1]
+    seen = [false; 256]
+    count = 0
+    while count < 256 {
+      assert_eq rd(b), 1
+      if !seen[b[0].to_i] {
+        seen[b[0].to_i] = true
+        count += 1
+      }
+    }
+  })
+}
+
+test "large read" {
+  both(->(rd: ([Byte]) -> Int) {
+    b = [0.as_u8; 40 << 20]
+    assert_eq rd(b), b.size
+    # The last bytes were written too (40 MiB of zeros is impossible).
+    zeros = 0
+    for x in b[b.size - 64...b.size] {
+      zeros += 1 if x == 0
+    }
+    assert zeros < 16, "tail of a large read looks unwritten"
+  })
+}
+
+test "read empty" {
+  both(->(rd: ([Byte]) -> Int) {
+    assert_eq rd([]), 0
+    e: [Byte] = []
+    assert_eq rd(e), 0
+  })
+}
+
+test "concurrent read" {
+  tasks = (0...100).map { |k|
+    spawn {
+      ok = true
+      i = 0
+      while i < 1000 {
+        b = [0.as_u8; 32]
+        ok = false if read(b) != 32
+        i += 1
+      }
+      ok
+    }
+  }
+  for t in tasks {
+    assert t.wait.unwrap, "Read failed in a task"
+  }
+}
+
+test "reader is an io.Reader" {
+  b = [0.as_u8; 64]
+  io.read_full(reader(), b).unwrap
+  assert_eq io.copy_n(io.Discard.new, reader(), 100).unwrap, 100
+}
+
+test "text" {
+  set: Map[Str, Bool] = {}
+  index_set = (0...26).map { |_| [0; 32] }
+  rounds = 1000
+  done = false
+  k = 0
+  while k < rounds && !done {
+    s = text()
+    assert_eq s.size, 26
+    i = 0
+    while i < s.size {
+      r = s[i]
+      assert (r >= 65 && r <= 90) || (r >= 50 && r <= 55), "Text()[#{i}] = #{r}, outside of base32 alphabet"
+      i += 1
+    }
+    assert !set.key?(s), "Text() = #{s}, duplicate of previously produced string"
+    set[s] = true
+    done = true
+    i = 0
+    while i < s.size {
+      r = s[i]
+      slot = r >= 65 ? (r - 65).to_i : (r - 50 + 26).to_i
+      row = index_set[i]
+      row[slot] = row[slot] + 1
+      for c in row {
+        done = false if c == 0
+      }
+      i += 1
+    }
+    k += 1
+  }
+  assert done, "failed to produce every char at every index after #{rounds} rounds"
+}
+
+bench "read 4" {
+  read([0.as_u8; 4])
+}
+
+bench "read 32" {
+  read([0.as_u8; 32])
+}
+
+bench "read 4K" {
+  read([0.as_u8; 4 << 10])
+}

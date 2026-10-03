@@ -174,6 +174,10 @@ pub struct World<'a> {
     /// Array constants read in place (`MONTHS[i]`): name and value, by
     /// `M::Global` index. Set once, before the program runs; never written.
     pub globals: Vec<(String, TExpr)>,
+    /// Constants whose values are enum variants (`pub SHA256 = Hash.SHA256`),
+    /// or refer to such constants: evaluated once the types are known
+    /// (`add_enum_consts`).
+    pending_consts: Vec<ConstDef>,
 }
 
 #[derive(Clone, Debug)]
@@ -193,6 +197,9 @@ pub enum CVal {
     /// An array literal of constants (a slice or a fixed array: the
     /// constant's type says which, and is always known for these).
     Arr(Vec<CVal>),
+    /// A variant without fields of an enum (`pub SHA256 = Hash.SHA256`):
+    /// the enum's qualified name and the variant's index.
+    Enum(String, usize),
 }
 
 /// The type of a constant's value: `want` if given (checking that the value
@@ -232,6 +239,7 @@ fn const_type(v: &CVal, want: Option<&Ty>, sp: Span) -> R<Ty> {
             }
             Ok(Ty::arr(el))
         }
+        (CVal::Enum(..), _) => Err(Diag::new(sp, "an array constant can't hold enum values")),
         (_, Some(t)) => Err(Diag::new(sp, format!("this constant isn't {}", t.show()))),
     }
 }
@@ -251,6 +259,7 @@ pub fn const_lit(v: &CVal, ty: &Ty, sp: Span) -> TExpr {
             let el = t.arr_elem().unwrap();
             TK::Array(vs.iter().map(|v| const_lit(v, &el, sp)).collect())
         }
+        (CVal::Enum(..), _) => unreachable!("enum constants aren't array elements"),
     };
     TExpr { kind, ty: ty.clone(), span: sp }
 }
@@ -276,7 +285,7 @@ impl<'a> World<'a> {
         }
         GENERICS.with(|g| g.borrow_mut().clear());
         INSTS.with(|g| g.borrow_mut().clear());
-        Ok(World { sm, defs, by_name, instances: HashMap::new(), funcs: vec![], sigs: HashMap::new(), fatal: None, structs: HashMap::new(), consts: HashMap::new(), ifaces: HashMap::new(), impls: HashMap::new(), stringers: HashMap::new(), errors: vec![], refines: HashMap::new(), warnings: vec![], globals: vec![] })
+        Ok(World { sm, defs, by_name, instances: HashMap::new(), funcs: vec![], sigs: HashMap::new(), fatal: None, structs: HashMap::new(), consts: HashMap::new(), ifaces: HashMap::new(), impls: HashMap::new(), stringers: HashMap::new(), errors: vec![], refines: HashMap::new(), warnings: vec![], globals: vec![], pending_consts: vec![] })
     }
 
     /// Evaluate top-level constants, in order (each may use earlier ones).
@@ -284,6 +293,21 @@ impl<'a> World<'a> {
         for d in defs {
             if self.consts.contains_key(&d.name) || self.structs.contains_key(&d.name) {
                 return Err(Diag::new(d.span, format!("`{}` is already defined", d.name)));
+            }
+            // `Enum.Variant`, or a constant naming one: after the types.
+            let deferred = match &d.value.kind {
+                ExprKind::Call { recv: Some(r), args, block: None, .. } => args.is_empty() && matches!(r.kind, ExprKind::Const(_)),
+                ExprKind::Const(c) => {
+                    let prev = enter_pkg(&pkg_of(&d.name));
+                    let q = resolve_name(c, d.value.span, &|q| self.pending_consts.iter().any(|p| p.name == q));
+                    leave_pkg(prev);
+                    q.is_ok_and(|q| self.pending_consts.iter().any(|p| p.name == q))
+                }
+                _ => false,
+            };
+            if deferred {
+                self.pending_consts.push(d.clone());
+                continue;
             }
             let prev = enter_pkg(&pkg_of(&d.name));
             let v = self.eval_const(&d.value);
@@ -326,6 +350,55 @@ impl<'a> World<'a> {
 
     fn eval_const(&self, e: &Expr) -> R<CVal> {
         eval_const(&self.consts, e)
+    }
+
+    /// The constants `add_consts` deferred: enum variants, once the types
+    /// are known.
+    pub fn add_enum_consts(&mut self) -> R<()> {
+        let pending = std::mem::take(&mut self.pending_consts);
+        for d in &pending {
+            let prev = enter_pkg(&pkg_of(&d.name));
+            let ev = self.enum_const(&d.value);
+            let want = d.ty.as_ref().map(|te| type_from(te, &self.structs, &self.consts));
+            leave_pkg(prev);
+            let (v, t) = match ev {
+                Some(r) => r?,
+                None => return Err(Diag::new(d.value.span, "a constant must be computable at compile time: literals, arrays of them, other constants, operators and enum variants without fields")),
+            };
+            if let Some(want) = want {
+                let want = want?;
+                if want != t {
+                    return Err(Diag::new(d.value.span, format!("`{}` is declared {} but its value isn't", d.name, want.show())));
+                }
+            }
+            self.consts.insert(d.name.clone(), (v, Some(t)));
+        }
+        Ok(())
+    }
+
+    /// `Enum.Variant` (a variant without fields) or another enum constant
+    /// as a constant's value: its value and type. None: not one of those.
+    fn enum_const(&self, e: &Expr) -> Option<R<(CVal, Ty)>> {
+        match &e.kind {
+            ExprKind::Call { recv: Some(r), name, args, block: None, .. } if args.is_empty() => {
+                let ExprKind::Const(c) = &r.kind else { return None };
+                let q = resolve_name(c, r.span, &|q| self.structs.contains_key(q)).ok()?;
+                let t @ Ty::Enum(_, vs) = self.structs.get(&q)? else { return None };
+                Some(match vs.iter().position(|(v, _)| v == name) {
+                    Some(k) if vs[k].1.is_empty() => Ok((CVal::Enum(q.clone(), k), t.clone())),
+                    Some(_) => Err(Diag::new(e.span, format!("`{c}.{name}` has fields: only a variant without fields can be a constant"))),
+                    None => Err(Diag::new(e.span, format!("{c} has no variant `{name}`"))),
+                })
+            }
+            ExprKind::Const(c) => {
+                let q = resolve_name(c, e.span, &|q| self.consts.contains_key(q)).ok()?;
+                match self.consts.get(&q)? {
+                    (v @ CVal::Enum(..), Some(t)) => Some(Ok((v.clone(), t.clone()))),
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
     }
 
     /// The global holding array constant `name` (made on first use).
@@ -1021,6 +1094,20 @@ pub fn bind_tparams(te: &TypeExpr, t: &Ty, tps: &[TParam], out: &mut HashMap<Str
             out.entry(n.clone()).or_insert_with(|| t.clone());
         }
         (TypeExpr::Array(e, _), Ty::Array(x)) | (TypeExpr::Opt(e, _), Ty::Opt(x)) | (TypeExpr::Fixed(e, _, _), Ty::Fixed(x, _)) => bind_tparams(e, x, tps, out),
+        // A function argument binds through its parameter and result types:
+        // `def new[H](h: () -> H)` takes H from `->() -> sha256.Digest { .. }`.
+        (TypeExpr::Fn(ps, r, _), Ty::Fn(xs, y)) if ps.len() == xs.len() => {
+            for (p, x) in ps.iter().zip(xs) {
+                bind_tparams(p, x, tps, out);
+            }
+            bind_tparams(r, y, tps, out);
+        }
+        (TypeExpr::Result(e, _, _), Ty::Result(x)) => bind_tparams(e, x, tps, out),
+        (TypeExpr::Tuple(es, _), Ty::Tuple(xs)) if es.len() == xs.len() => {
+            for (e, x) in es.iter().zip(xs) {
+                bind_tparams(e, x, tps, out);
+            }
+        }
         (TypeExpr::App(n, args, _), Ty::Map(k, v)) if n == "Map" && args.len() == 2 => {
             bind_tparams(&args[0], k, tps, out);
             bind_tparams(&args[1], v, tps, out);
@@ -2824,8 +2911,17 @@ impl<'w, 'a> FnCx<'w, 'a> {
             }
         }
         // Arms that disagree: an error if the value is wanted, else a statement (no value).
+        // The case's type is the first arm's that has a value: an arm that
+        // panics or returns (a Never) fits any type, and mustn't make the
+        // whole case a Never.
+        let mut case_ty = None;
         if let Some(d) = default.as_ref().filter(|_| has_default) {
-            let ty = d.ty.clone();
+            let arm_tys: Vec<Ty> = conds.iter().map(|(_, b)| b.ty.clone()).chain(std::iter::once(d.ty.clone())).collect();
+            let ty = arm_tys.iter().find(|t| !matches!(self.resolve(t), Ty::Never)).cloned().unwrap_or_else(|| d.ty.clone());
+            if !self.unify(&d.ty, &ty) && used {
+                return Err(Diag::new(d.span, format!("this arm is {}, but the others are {}", self.resolve(&d.ty).show(), self.resolve(&ty).show())));
+            }
+            case_ty = Some(ty.clone());
             for (_, b) in &conds {
                 if !self.unify(&b.ty, &ty) {
                     if used {
@@ -2841,7 +2937,10 @@ impl<'w, 'a> FnCx<'w, 'a> {
             Some(d) => unitize(self, d),
             None => self.mk(TK::Unit, Ty::Unit, sp),
         };
-        let ty = acc.ty.clone();
+        let ty = match case_ty {
+            Some(t) if has_default => t,
+            _ => acc.ty.clone(),
+        };
         for (c, b) in conds.into_iter().rev() {
             let b = if has_default { b } else { unitize(self, b) };
             let s = c.span.to(b.span);
@@ -3778,6 +3877,17 @@ impl<'w, 'a> FnCx<'w, 'a> {
             // A fresh array per use: changing it never changes the constant.
             (v @ CVal::Arr(_), Some(t)) => const_lit(&v, &t, sp),
             (CVal::Arr(_), None) => unreachable!("array constants are typed"),
+            (CVal::Enum(_, k), Some(et @ Ty::Enum(..))) => {
+                let Ty::Enum(_, vs) = &et else { unreachable!() };
+                let mut slots = vec![];
+                for (_, fs) in vs {
+                    for (_, ft) in fs {
+                        slots.push(self.zero_of(ft, sp).ok_or_else(|| Diag::new(sp, format!("{} has no zero value", ft.show())))?);
+                    }
+                }
+                self.mk(TK::M(M::VariantNew(k), None, slots, None), et.clone(), sp)
+            }
+            (CVal::Enum(..), _) => unreachable!("enum constants are typed"),
             (CVal::Str(s), _) => self.mk(TK::Str(s), Ty::Str, sp),
             (CVal::Bool(b), _) => self.mk(TK::Bool(b), Ty::Bool, sp),
             (CVal::Num(n), None) => {

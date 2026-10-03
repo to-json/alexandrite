@@ -1,0 +1,100 @@
+import "crypto/sha1"
+import "crypto/sha256"
+import "crypto/md5"
+import "crypto/sha512"
+import "hash"
+
+# Go's hkdf_test.go and example_test.go, translated. The table is in
+# table_test.alx.
+#
+# Not translated: TestFIPSServiceIndicator (FIPS 140 module mode),
+# hkdf_wycheproof_test.go (downloads the Wycheproof vectors as a Go module
+# at test time; the generated vectors cover random secrets, salts, infos and
+# lengths instead).
+
+def check_case[H](h: () -> H, tt: HkdfTest) {
+  info = Str.from_bytes(tt.info)
+  prk = extract(h, tt.master, tt.salt)
+  assert_eq prk, tt.prk
+  k = key(h, tt.master, tt.salt, info, tt.out.size).unwrap
+  assert_eq k, tt.out
+  expanded = expand(h, prk, info, tt.out.size).unwrap
+  assert_eq expanded, tt.out
+}
+
+test "hkdf" {
+  for tt in hkdf_tests() {
+    if tt.hash == "sha1.New" {
+      check_case(->() -> sha1.Digest { sha1.new() }, tt)
+    } else {
+      assert_eq tt.hash, "sha256.New"
+      check_case(->() -> sha256.Digest { sha256.new() }, tt)
+    }
+  }
+}
+
+test "hkdf limit" {
+  h = ->() -> sha1.Digest { sha1.new() }
+  master: [Byte] = [0x00, 0x01, 0x02, 0x03]
+  info = ""
+  limit = h().size * 255
+  out = key(h, master, [], info, limit)
+  assert out.ok?, "key derivation failed"
+  assert_eq out.unwrap.size, limit
+  r = key(h, master, [], info, limit + 1)
+  assert r.err.present?, "expected key derivation to fail, but it succeeded"
+  assert_eq "#{r.err.unwrap}", "hkdf: requested key length too large"
+  r2 = expand(h, master, info, limit + 1)
+  assert_eq "#{r2.err.unwrap}", "hkdf: requested key length too large"
+}
+
+test "hash interface" {
+  # A constructor returning the hash.Hash interface works like a concrete one.
+  a = key(->() -> hash.Hash { sha256.new() }, b("secret"), b("salt"), "info", 42).unwrap
+  c = key(->() -> sha256.Digest { sha256.new() }, b("secret"), b("salt"), "info", 42).unwrap
+  assert_eq a, c
+}
+
+example "usage" {
+  h = ->() -> sha256.Digest { sha256.new() }
+  key_len = h().size / 2
+  secret: [Byte] = [0x00, 0x01, 0x02, 0x03]
+  # Go reads a random salt; any salt shows the shape.
+  salt = [7.as_u8; h().size]
+  info = "hkdf example"
+  keys: [[Byte]] = []
+  i = 0
+  while i < 3 {
+    keys << key(h, secret, salt, info + "#{i}", key_len).unwrap
+    i += 1
+  }
+  i = 0
+  while i < keys.size {
+    puts "Key ##{i + 1}: #{keys[i] != [0.as_u8; 16]}"
+    i += 1
+  }
+} outputs "Key #1: true\nKey #2: true\nKey #3: true\n"
+
+def bench_hkdf[H](h: () -> H) {
+  master: [Byte] = [0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07]
+  salt: [Byte] = [0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17]
+  info = Str.from_bytes([0x20, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27])
+  key(h, master, salt, info, h().size).unwrap
+  nil
+}
+
+bench "16 byte md5 single" {
+  bench_hkdf(->() -> md5.Digest { md5.new() })
+}
+
+bench "20 byte sha1 single" {
+  bench_hkdf(->() -> sha1.Digest { sha1.new() })
+}
+
+bench "32 byte sha256 single" {
+  bench_hkdf(->() -> sha256.Digest { sha256.new() })
+}
+
+bench "64 byte sha512 single" {
+  bench_hkdf(->() -> sha512.Digest { sha512.new() })
+}

@@ -460,6 +460,7 @@ pub fn check_program(l: &Loaded, externs: Vec<DefInfo>) -> Result<TProgram, Diag
     w.add_iface_names(&ifaces)?;
     w.add_builtin_errors();
     w.add_structs(&structs, &enums)?;
+    w.add_enum_consts()?;
     w.add_iface_sigs(&ifaces)?;
     let refines: Vec<_> = all().flat_map(|m| m.refines.iter()).cloned().collect();
     w.add_refines(&refines)?;
@@ -556,6 +557,7 @@ pub fn check_library(l: &Loaded, idx: usize, prefix: &str) -> Result<(TProgram, 
     w.add_iface_names(&m.ifaces)?;
     w.add_builtin_errors();
     w.add_structs(&m.structs, &m.enums)?;
+    w.add_enum_consts()?;
     w.add_iface_sigs(&m.ifaces)?;
     let exports = w.check_exports()?;
     let messages = w.message_instances()?;

@@ -2183,6 +2183,22 @@ impl<'a> Lw<'a> {
     fn shift(&mut self, op: BinOp, k: IntKind, ck: IntKind, a: LE, c: LE, sp: Span) -> LE {
         let a = self.bind(a, LTy::I64);
         let c = self.bind(c, LTy::I64);
+        // A constant count (`x >> 7`, the common case in hash and crypto
+        // code) needs no checks or clamping: fold them here, so no backend
+        // sees a branch per shift (the JIT made a block per Cond, which made
+        // fully unrolled compression functions 40x slower than the C build).
+        if let LE::I(n) = c {
+            let w = k.bits() as i64;
+            if n >= 0 {
+                return match op {
+                    BinOp::Shl if n >= w => LE::I(0),
+                    BinOp::Shl => wrap_to(k, LE::Prim(Prim::Shl, vec![a, LE::I(n)])),
+                    _ if k == IntKind::U64 && n >= 64 => LE::I(0),
+                    _ if k == IntKind::U64 => LE::Prim(Prim::ShrU, vec![a, LE::I(n)]),
+                    _ => LE::Prim(Prim::ShrS, vec![a, LE::I(n.min(63))]),
+                };
+            }
+        }
         if ck.signed() {
             let neg = LE::Cmp(Op::Lt, Box::new(c.clone()), Box::new(LE::I(0)), LTy::I64);
             self.guard(neg, "negative shift amount", sp, "ArithError", 2);

@@ -1,0 +1,511 @@
+# Package cmplx: Go's math/cmplx, functions of complex numbers (S3), over
+# the builtin `Complex` (Go's complex128, GO-VS-RUBY D53).
+#
+#   Go                                  alx
+#   complex(r, i), real(x), imag(x)     Complex.new(r, i), x.real, x.imag
+#   Abs(x) float64                      abs(x) -> Float
+#   Phase(x) float64                    phase(x) -> Float
+#   Polar(x) (r, θ float64)             polar(x) -> (Float, Float)
+#   Rect(r, θ) complex128               rect(r, theta) -> Complex
+#   Conj, Sqrt, Exp, Log, Log10         conj, sqrt, exp, log, log10
+#   Pow(x, y)                           pow(x, y)
+#   Sin, Cos, Tan, Cot                  sin, cos, tan, cot
+#   Sinh, Cosh, Tanh                    sinh, cosh, tanh
+#   Asin, Acos, Atan                    asin, acos, atan
+#   Asinh, Acosh, Atanh                 asinh, acosh, atanh
+#   Inf(), NaN()                        inf, nan
+#   IsInf(x), IsNaN(x) bool             is_inf(x), is_nan(x) -> Bool (as
+#                                       std/math's is_inf / is_nan)
+#
+# The algorithms are Go's, line for line, so special values (NaN, ±Inf,
+# signed zeros) come out exactly as in Go. Differences from Go:
+#   - Finite results can differ from Go's in the last bit or so: they rest
+#     on std/math, whose exp, log, sin, cos, hypot, atan2, pow, sinh ... are
+#     the platform's libm (and Rust's libm in the browser), not Go's own
+#     Cephes/FreeBSD ports. Go's tests allow the same (they compare with
+#     relative tolerances of 4e-16 to 1e-14, which the translated tests and
+#     the generated vectors keep; see vec_cmplx_test.alx).
+#   - No complex64 (alx has no float32).
+
+import "math"
+import "math/bits"
+
+# ---- basics ----
+
+# The absolute value (modulus) of x.
+pub def abs(x: Complex) -> Float { math.hypot(x.real, x.imag) }
+
+# The complex conjugate of x.
+pub def conj(x: Complex) -> Complex { Complex.new(x.real, -x.imag) }
+
+# The argument of x, in [-PI, PI].
+pub def phase(x: Complex) -> Float { math.atan2(x.imag, x.real) }
+
+# The absolute value and phase of x.
+pub def polar(x: Complex) -> (Float, Float) { (abs(x), phase(x)) }
+
+# The complex number with polar coordinates r, theta.
+pub def rect(r: Float, theta: Float) -> Complex {
+  s, c = math.sincos(theta)
+  Complex.new(r * c, r * s)
+}
+
+# Whether either part of x is an infinity.
+pub def is_inf(x: Complex) -> Bool { math.is_inf(x.real, 0) || math.is_inf(x.imag, 0) }
+
+# Complex infinity: (+Inf+Infi).
+pub def inf -> Complex {
+  i = math.inf(1)
+  Complex.new(i, i)
+}
+
+# Whether either part of x is NaN and neither is an infinity.
+pub def is_nan(x: Complex) -> Bool {
+  return false if math.is_inf(x.real, 0) || math.is_inf(x.imag, 0)
+  math.is_nan(x.real) || math.is_nan(x.imag)
+}
+
+# Complex NaN: (NaN+NaNi).
+pub def nan -> Complex {
+  n = math.nan
+  Complex.new(n, n)
+}
+
+# ---- sqrt, exp, log, pow ----
+
+# The square root of x, with the real part >= 0 (the principal value).
+pub def sqrt(x: Complex) -> Complex {
+  if x.imag == 0.0 {
+    # imag(result) keeps the sign of imag(x) for a signed zero.
+    return Complex.new(0.0, x.imag) if x.real == 0.0
+    return Complex.new(0.0, math.copysign(math.sqrt(-x.real), x.imag)) if x.real < 0.0
+    return Complex.new(math.sqrt(x.real), x.imag)
+  } else if math.is_inf(x.imag, 0) {
+    return Complex.new(math.inf(1), x.imag)
+  }
+  if x.real == 0.0 {
+    if x.imag < 0.0 {
+      r = math.sqrt(-0.5 * x.imag)
+      return Complex.new(r, -r)
+    }
+    r = math.sqrt(0.5 * x.imag)
+    return Complex.new(r, r)
+  }
+  a = x.real
+  b = x.imag
+  scale = 0.0
+  # Rescale to avoid internal overflow or underflow.
+  if math.abs(a) > 4.0 || math.abs(b) > 4.0 {
+    a *= 0.25
+    b *= 0.25
+    scale = 2.0
+  } else {
+    a *= 1.8014398509481984e16 # 2**54
+    b *= 1.8014398509481984e16
+    scale = 7.450580596923828125e-9 # 2**-27
+  }
+  r = math.hypot(a, b)
+  t = 0.0
+  if a > 0.0 {
+    t = math.sqrt(0.5 * r + 0.5 * a)
+    r = scale * math.abs((0.5 * b) / t)
+    t *= scale
+  } else {
+    r = math.sqrt(0.5 * r - 0.5 * a)
+    t = scale * math.abs((0.5 * b) / r)
+    r *= scale
+  }
+  return Complex.new(t, -r) if b < 0.0
+  Complex.new(t, r)
+}
+
+# e**x.
+pub def exp(x: Complex) -> Complex {
+  re = x.real
+  im = x.imag
+  if math.is_inf(re, 0) {
+    if re > 0.0 && im == 0.0 {
+      return x
+    } else if math.is_inf(im, 0) || math.is_nan(im) {
+      return Complex.new(0.0, math.copysign(0.0, im)) if re < 0.0
+      return Complex.new(math.inf(1), math.nan)
+    }
+  } else if math.is_nan(re) {
+    return Complex.new(math.nan, im) if im == 0.0
+  }
+  r = math.exp(x.real)
+  s, c = math.sincos(x.imag)
+  Complex.new(r * c, r * s)
+}
+
+# The natural logarithm of x (the principal value: imag in [-PI, PI]).
+pub def log(x: Complex) -> Complex { Complex.new(math.log(abs(x)), phase(x)) }
+
+# The decimal logarithm of x.
+pub def log10(x: Complex) -> Complex {
+  z = log(x)
+  Complex.new(math.LOG10E * z.real, math.LOG10E * z.imag)
+}
+
+# x**y, the principal value. pow(0, y): 1 for y.real == 0 (Go: also for
+# imag != 0), +Inf (real y) or inf() for y.real < 0, 0 for y.real > 0, and
+# nan() when y is NaN.
+pub def pow(x: Complex, y: Complex) -> Complex {
+  if x == 0 { # also true for -0
+    return nan if is_nan(y)
+    r = y.real
+    i = y.imag
+    if r == 0.0 {
+      return 1
+    } else if r < 0.0 {
+      return Complex.new(math.inf(1), 0) if i == 0.0
+      return inf
+    } else if r > 0.0 {
+      return 0
+    }
+    panic("not reached")
+  }
+  modulus = abs(x)
+  return Complex.new(0, 0) if modulus == 0.0
+  r = math.pow(modulus, y.real)
+  arg = phase(x)
+  theta = y.real * arg
+  if y.imag != 0.0 {
+    r *= math.exp(-y.imag * arg)
+    theta += y.imag * math.log(modulus)
+  }
+  s, c = math.sincos(theta)
+  Complex.new(r * c, r * s)
+}
+
+# ---- trigonometric and hyperbolic ----
+
+# The sine of x.
+pub def sin(x: Complex) -> Complex {
+  re = x.real
+  im = x.imag
+  if im == 0.0 && (math.is_inf(re, 0) || math.is_nan(re)) {
+    return Complex.new(math.nan, im)
+  } else if math.is_inf(im, 0) {
+    if re == 0.0 {
+      return x
+    } else if math.is_inf(re, 0) || math.is_nan(re) {
+      return Complex.new(math.nan, im)
+    }
+  } else if re == 0.0 && math.is_nan(im) {
+    return x
+  }
+  s, c = math.sincos(x.real)
+  sh, ch = sinhcosh(x.imag)
+  Complex.new(s * ch, c * sh)
+}
+
+# The hyperbolic sine of x.
+pub def sinh(x: Complex) -> Complex {
+  re = x.real
+  im = x.imag
+  if re == 0.0 && (math.is_inf(im, 0) || math.is_nan(im)) {
+    return Complex.new(re, math.nan)
+  } else if math.is_inf(re, 0) {
+    if im == 0.0 {
+      return Complex.new(re, im)
+    } else if math.is_inf(im, 0) || math.is_nan(im) {
+      return Complex.new(re, math.nan)
+    }
+  } else if im == 0.0 && math.is_nan(re) {
+    return Complex.new(math.nan, im)
+  }
+  s, c = math.sincos(x.imag)
+  sh, ch = sinhcosh(x.real)
+  Complex.new(c * sh, s * ch)
+}
+
+# The cosine of x.
+pub def cos(x: Complex) -> Complex {
+  re = x.real
+  im = x.imag
+  if im == 0.0 && (math.is_inf(re, 0) || math.is_nan(re)) {
+    return Complex.new(math.nan, -im * math.copysign(0.0, re))
+  } else if math.is_inf(im, 0) {
+    if re == 0.0 {
+      return Complex.new(math.inf(1), -re * math.copysign(0.0, im))
+    } else if math.is_inf(re, 0) || math.is_nan(re) {
+      return Complex.new(math.inf(1), math.nan)
+    }
+  } else if re == 0.0 && math.is_nan(im) {
+    return Complex.new(math.nan, 0)
+  }
+  s, c = math.sincos(x.real)
+  sh, ch = sinhcosh(x.imag)
+  Complex.new(c * ch, -s * sh)
+}
+
+# The hyperbolic cosine of x.
+pub def cosh(x: Complex) -> Complex {
+  re = x.real
+  im = x.imag
+  if re == 0.0 && (math.is_inf(im, 0) || math.is_nan(im)) {
+    return Complex.new(math.nan, re * math.copysign(0.0, im))
+  } else if math.is_inf(re, 0) {
+    if im == 0.0 {
+      return Complex.new(math.inf(1), im * math.copysign(0.0, re))
+    } else if math.is_inf(im, 0) || math.is_nan(im) {
+      return Complex.new(math.inf(1), math.nan)
+    }
+  } else if im == 0.0 && math.is_nan(re) {
+    return Complex.new(math.nan, im)
+  }
+  s, c = math.sincos(x.imag)
+  sh, ch = sinhcosh(x.real)
+  Complex.new(c * ch, s * sh)
+}
+
+# sinh(x) and cosh(x), from one exp when |x| > 0.5.
+def sinhcosh(x: Float) -> (Float, Float) {
+  return (math.sinh(x), math.cosh(x)) if math.abs(x) <= 0.5
+  e = math.exp(x)
+  ei = 0.5 / e
+  e *= 0.5
+  (e - ei, e + ei)
+}
+
+# The tangent of x.
+pub def tan(x: Complex) -> Complex {
+  re = x.real
+  im = x.imag
+  if math.is_inf(im, 0) {
+    return Complex.new(math.copysign(0.0, re), math.copysign(1.0, im)) if math.is_inf(re, 0) || math.is_nan(re)
+    return Complex.new(math.copysign(0.0, math.sin(2.0 * re)), math.copysign(1.0, im))
+  } else if re == 0.0 && math.is_nan(im) {
+    return x
+  }
+  d = math.cos(2.0 * x.real) + math.cosh(2.0 * x.imag)
+  d = tan_series(x) if math.abs(d) < 0.25
+  return inf if d == 0.0
+  Complex.new(math.sin(2.0 * x.real) / d, math.sinh(2.0 * x.imag) / d)
+}
+
+# The hyperbolic tangent of x.
+pub def tanh(x: Complex) -> Complex {
+  re = x.real
+  im = x.imag
+  if math.is_inf(re, 0) {
+    return Complex.new(math.copysign(1.0, re), math.copysign(0.0, im)) if math.is_inf(im, 0) || math.is_nan(im)
+    return Complex.new(math.copysign(1.0, re), math.copysign(0.0, math.sin(2.0 * im)))
+  } else if im == 0.0 && math.is_nan(re) {
+    return x
+  }
+  d = math.cosh(2.0 * x.real) + math.cos(2.0 * x.imag)
+  return inf if d == 0.0
+  Complex.new(math.sinh(2.0 * x.real) / d, math.sin(2.0 * x.imag) / d)
+}
+
+# The cotangent of x.
+pub def cot(x: Complex) -> Complex {
+  d = math.cosh(2.0 * x.imag) - math.cos(2.0 * x.real)
+  d = tan_series(x) if math.abs(d) < 0.25
+  return inf if d == 0.0
+  Complex.new(math.sin(2.0 * x.real) / d, -math.sinh(2.0 * x.imag) / d)
+}
+
+# x reduced to (-PI/2, PI/2] modulo PI (Payne-Hanek for |x| >= 2**30).
+def reduce_pi(x: Float) -> Float {
+  if math.abs(x) < 1073741824.0 { # 1 << 30
+    pi1 = 3.141592502593994       # 0x400921fb40000000
+    pi2 = 1.5099578831723193e-07  # 0x3e84442d00000000
+    pi3 = 1.0780605716316238e-14  # 0x3d08469898cc5170
+    t = x / math.PI
+    t += 0.5
+    t = t.to_i.to_f # the multiple
+    return ((x - t * pi1) - t * pi2) - t * pi3
+  }
+  shift = 52 # 64 - 11 - 1
+  bias = 1023
+  frac_mask: U64 = (1 << 52) - 1
+  ix = math.float64bits(x)
+  ex = ((ix >> shift) & 0x7FF).to_i - bias - shift
+  ix &= frac_mask
+  one: U64 = 1
+  ix |= one << shift
+  # 4/PI's bits, as in math's trig_reduce.
+  m_pi: [U64] = [
+    0x0000000000000000,
+    0x517cc1b727220a94,
+    0xfe13abe8fa9a6ee0,
+    0x6db14acc9e21c820,
+    0xff28b1d5ef5de2b0,
+    0xdb92371d2126e970,
+    0x0324977504e8c90e,
+    0x7f0ef58e5894d39f,
+    0x74411afa975da242,
+    0x74ce38135a2fbf20,
+    0x9cc8eb1cc1a99cfa,
+    0x4e422fc5defc941d,
+    0x8ffc4bffef02cc07,
+    0xf79788c5ad05368f,
+    0xb69b3f6793e584db,
+    0xa7a31fb34f2ff516,
+    0xba93dd63f5f2f8bd,
+    0x9e839cfbc5294975,
+    0x35fdafd88fc6ae84,
+    0x2b0198237e3db5d5,
+  ]
+  digit = (ex + 64) / 64
+  bitshift = (ex + 64) % 64
+  z0 = (m_pi[digit] << bitshift) | (m_pi[digit + 1] >> (64 - bitshift))
+  z1 = (m_pi[digit + 1] << bitshift) | (m_pi[digit + 2] >> (64 - bitshift))
+  z2 = (m_pi[digit + 2] << bitshift) | (m_pi[digit + 3] >> (64 - bitshift))
+  z2hi, _z2lo = bits.mul64(z2, ix)
+  z1hi, z1lo = bits.mul64(z1, ix)
+  z0lo = z0 *% ix
+  lo, c = bits.add64(z1lo, z2hi, 0)
+  hi, _c = bits.add64(z0lo, z1hi, c)
+  lz = bits.leading_zeros64(hi)
+  e = (bias - (lz + 1)).as_u64
+  hi = (hi << (lz + 1)) | (lo >> (64 - (lz + 1)))
+  hi >>= 64 - shift
+  hi |= e << shift
+  r = math.float64frombits(hi)
+  r -= 1.0 if r > 0.5
+  math.PI * r
+}
+
+# Taylor series for cosh(2y) - cos(2x), used where the direct formula
+# loses precision.
+def tan_series(z: Complex) -> Float {
+  machep = 1.0 / 9007199254740992.0 # 1 / (1 << 53)
+  x = math.abs(2.0 * z.real)
+  y = math.abs(2.0 * z.imag)
+  x = reduce_pi(x)
+  x = x * x
+  y = y * y
+  x2 = 1.0
+  y2 = 1.0
+  f = 1.0
+  rn = 0.0
+  d = 0.0
+  loop {
+    rn += 1.0
+    f *= rn
+    rn += 1.0
+    f *= rn
+    x2 *= x
+    y2 *= y
+    t = y2 + x2
+    t /= f
+    d += t
+
+    rn += 1.0
+    f *= rn
+    rn += 1.0
+    f *= rn
+    x2 *= x
+    y2 *= y
+    t = y2 - x2
+    t /= f
+    d += t
+    break if !(math.abs(t / d) > machep)
+  }
+  d
+}
+
+# ---- inverse functions ----
+
+# The inverse sine of x.
+pub def asin(x: Complex) -> Complex {
+  re = x.real
+  im = x.imag
+  if im == 0.0 && math.abs(re) <= 1.0 {
+    return Complex.new(math.asin(re), im)
+  } else if re == 0.0 && math.abs(im) <= 1.0 {
+    return Complex.new(re, math.asinh(im))
+  } else if math.is_nan(im) {
+    return Complex.new(re, math.nan) if re == 0.0
+    return Complex.new(math.nan, re) if math.is_inf(re, 0)
+    return nan
+  } else if math.is_inf(im, 0) {
+    return x if math.is_nan(re)
+    return Complex.new(math.copysign(math.PI / 4, re), im) if math.is_inf(re, 0)
+    return Complex.new(math.copysign(0.0, re), im)
+  } else if math.is_inf(re, 0) {
+    return Complex.new(math.copysign(math.PI / 2, re), math.copysign(re, im))
+  }
+  ct = Complex.new(-x.imag, x.real) # i * x
+  xx = x * x
+  x1 = Complex.new(1.0 - xx.real, -xx.imag) # 1 - x*x
+  x2 = sqrt(x1)                             # sqrt(1 - x*x)
+  w = log(ct + x2)
+  Complex.new(w.imag, -w.real) # -i * w
+}
+
+# The inverse hyperbolic sine of x.
+pub def asinh(x: Complex) -> Complex {
+  re = x.real
+  im = x.imag
+  if im == 0.0 && math.abs(re) <= 1.0 {
+    return Complex.new(math.asinh(re), im)
+  } else if re == 0.0 && math.abs(im) <= 1.0 {
+    return Complex.new(re, math.asin(im))
+  } else if math.is_inf(re, 0) {
+    return Complex.new(re, math.copysign(math.PI / 4, im)) if math.is_inf(im, 0)
+    return x if math.is_nan(im)
+    return Complex.new(re, math.copysign(0.0, im))
+  } else if math.is_nan(re) {
+    return x if im == 0.0
+    return Complex.new(im, re) if math.is_inf(im, 0)
+    return nan
+  } else if math.is_inf(im, 0) {
+    return Complex.new(math.copysign(im, re), math.copysign(math.PI / 2, im))
+  }
+  xx = x * x
+  x1 = Complex.new(1.0 + xx.real, xx.imag) # 1 + x*x
+  log(x + sqrt(x1))                        # log(x + sqrt(1 + x*x))
+}
+
+# The inverse cosine of x.
+pub def acos(x: Complex) -> Complex {
+  w = asin(x)
+  Complex.new(math.PI / 2 - w.real, -w.imag)
+}
+
+# The inverse hyperbolic cosine of x.
+pub def acosh(x: Complex) -> Complex {
+  return Complex.new(0.0, math.copysign(math.PI / 2, x.imag)) if x == 0
+  w = acos(x)
+  return Complex.new(-w.imag, w.real) if w.imag <= 0.0 # i * w
+  Complex.new(w.imag, -w.real)                         # -i * w
+}
+
+# The inverse tangent of x.
+pub def atan(x: Complex) -> Complex {
+  re = x.real
+  im = x.imag
+  if im == 0.0 {
+    return Complex.new(math.atan(re), im)
+  } else if re == 0.0 && math.abs(im) <= 1.0 {
+    return Complex.new(re, math.atanh(im))
+  } else if math.is_inf(im, 0) || math.is_inf(re, 0) {
+    return Complex.new(math.nan, math.copysign(0.0, im)) if math.is_nan(re)
+    return Complex.new(math.copysign(math.PI / 2, re), math.copysign(0.0, im))
+  } else if math.is_nan(re) || math.is_nan(im) {
+    return nan
+  }
+  x2 = x.real * x.real
+  a = 1.0 - x2 - x.imag * x.imag
+  return nan if a == 0.0
+  t = 0.5 * math.atan2(2.0 * x.real, a)
+  w = reduce_pi(t)
+  t = x.imag - 1.0
+  b = x2 + t * t
+  return nan if b == 0.0
+  t = x.imag + 1.0
+  c = (x2 + t * t) / b
+  Complex.new(w, 0.25 * math.log(c))
+}
+
+# The inverse hyperbolic tangent of x.
+pub def atanh(x: Complex) -> Complex {
+  z = Complex.new(-x.imag, x.real) # i * x
+  z = atan(z)
+  Complex.new(z.imag, -z.real) # -i * z
+}

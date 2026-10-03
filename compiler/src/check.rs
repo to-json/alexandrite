@@ -3592,7 +3592,7 @@ impl<'w, 'a> FnCx<'w, 'a> {
 
     /// `recv.m!(args)`: call a mutating method on a place, through a
     /// one-element slice, and write the receiver back.
-    fn mutating_call(&mut self, recv: &Expr, def: usize, name: &str, name_span: Span, args: &[Expr], sp: Span) -> R<TExpr> {
+    fn mutating_call(&mut self, recv: &Expr, def: usize, name: &str, name_span: Span, args: &[Expr], block: Option<&Block>, sp: Span) -> R<TExpr> {
         let (id, steps, pty) = self.place(recv).map_err(|d| {
             if matches!(recv.kind, ExprKind::Name(_) | ExprKind::Index(..) | ExprKind::Call { .. }) { d } else { Diag::new(recv.span, format!("`{name}` changes its receiver; call it on a variable")) }
         })?;
@@ -3621,6 +3621,15 @@ impl<'w, 'a> FnCx<'w, 'a> {
         };
         let mut targs = vec![self.mk(TK::Local(tid), Ty::arr(pty.clone()), recv.span)];
         targs.extend(vals);
+        // A block for a last parameter of function type (`r.shuffle!(n) { |i, j| }`).
+        if let Some(b) = block {
+            let d = &self.w.defs[def].def;
+            if d.params.len() != targs.len() + 1 || !matches!(d.params.last().and_then(|p| p.ty.as_ref()), Some(TypeExpr::Fn(..))) {
+                return Err(Diag::new(sp, format!("`{name}` doesn't take a block")));
+            }
+            let f = self.block_as_lambda(def, &targs, b)?;
+            targs.push(f);
+        }
         // The receiver is written back after the call, so a fallible call
         // is held (a `~T`) here; an enclosing `~` propagates it after.
         let saved = std::mem::replace(&mut self.under_try, false);
@@ -4399,10 +4408,7 @@ impl<'w, 'a> FnCx<'w, 'a> {
             }
             if let Some(sn) = st.as_ref().and_then(|t| t.type_name()) {
                 if let Some(&def) = self.w.by_name.get(&method_name(sn, name)) {
-                    if block.is_some() {
-                        return Err(Diag::new(sp, format!("`{name}` doesn't take a block")));
-                    }
-                    return self.mutating_call(recv, def, name, name_span, args, sp);
+                    return self.mutating_call(recv, def, name, name_span, args, block, sp);
                 }
             }
         }
@@ -5998,10 +6004,13 @@ impl<'w, 'a> FnCx<'w, 'a> {
         let Some(Expr { kind: ExprKind::Str(fmt), span: fsp, .. }) = args.first() else {
             return Err(Diag::new(sp, format!("`{name}` takes a format string literal first")));
         };
-        let vals = args[1..].iter().map(|a| self.value(a)).collect::<R<Vec<_>>>()?;
+        let mut vals = args[1..].iter().map(|a| self.value(a)).collect::<R<Vec<_>>>()?;
         let mut pieces = vec![];
         let mut lit = String::new();
         let mut k = 0;
+        // Complex arguments of `%f`/`%e` (D53): held in temporaries, their parts shown as extra arguments.
+        let mut pre: Vec<TStmt> = vec![];
+        let mut extra: Vec<TExpr> = vec![];
         let mut it = fmt.chars().peekable();
         while let Some(c) = it.next() {
             if c != '%' {
@@ -6050,6 +6059,26 @@ impl<'w, 'a> FnCx<'w, 'a> {
                 rest = &r[n..];
             }
             let verb = rest;
+            // Go's fmtComplex: `(` real, imag with a sign, `i)`, each part formatted by the verb.
+            if is_complex(&t) && matches!(verb, "f" | "F" | "e" | "E") {
+                let z = self.mk(TK::Int(0), Ty::Int, sp);
+                let v = std::mem::replace(&mut vals[k], z);
+                let ty = v.ty.clone();
+                let (lid, st) = self.opt_tmp(v, sp);
+                pre.push(st);
+                pieces.push(FmtPiece::Lit("(".into()));
+                for (part, plus) in [(0, plus), (1, true)] {
+                    let l = self.mk(TK::Local(lid), ty.clone(), sp);
+                    let e = self.mk(TK::M(M::TupleGet(part), Some(Box::new(l)), vec![], None), Ty::Float, sp);
+                    let j = args.len() - 1 + extra.len();
+                    extra.push(e);
+                    let inner = if matches!(verb, "f" | "F") { FmtPiece::Fixed(j, prec.unwrap_or(6)) } else { FmtPiece::Exp(j, prec.unwrap_or(6), verb == "E") };
+                    pieces.push(if width > 0 || plus || space { FmtPiece::Padded { inner: Box::new(inner), width, left, zero: zero && !left, plus, space: space && !plus } } else { inner });
+                }
+                pieces.push(FmtPiece::Lit("i)".into()));
+                k += 1;
+                continue;
+            }
             let bad = |what: &str| Diag::new(v.span, format!("`%{spec}` needs {what}, got {}", t.show()));
             let numeric = t.int_kind().is_some() || t == Ty::Float;
             let piece = match verb {
@@ -6144,12 +6173,18 @@ impl<'w, 'a> FnCx<'w, 'a> {
         if k != vals.len() {
             return Err(Diag::new(sp, format!("`{name}`: {} directive(s) but {} argument(s)", k, vals.len())));
         }
+        vals.extend(extra);
         let vals = vals
             .into_iter()
             .enumerate()
             .map(|(i, v)| if pieces.iter().any(|p| p.wants_float() && p.arg() == Some(i)) { self.coerce(v, &Ty::Float) } else { Ok(v) })
             .collect::<R<Vec<_>>>()?;
-        Ok(self.mk(TK::Format(pieces, vals), Ty::Str, sp))
+        let f = self.mk(TK::Format(pieces, vals), Ty::Str, sp);
+        if pre.is_empty() {
+            return Ok(f);
+        }
+        pre.push(TStmt::Expr(f));
+        Ok(self.mk(TK::Seq(pre), Ty::Str, sp))
     }
 
     /// `fmt.sprintf` and friends (std/fmt): builtins over `format`.

@@ -1,0 +1,428 @@
+#![overflow(wrap)]
+import "encoding/hex"
+import "math/big"
+import "crypto/rand"
+
+# Go's fe_test.go, fe_alias_test.go and fe_bench_test.go, translated.
+#
+# testing/quick draws random Elements with Element.Generate (half "weird"
+# edge-case limbs, half random 52-bit limbs); here a seeded splitmix64
+# generator (Rng) draws them the same way, so the property checks keep
+# their inputs but are reproducible. Iteration counts are Go's default
+# quick.Check count (100) scaled down from Go's non-short scale where Go
+# runs 100 * 1024 cases.
+#
+# Not translated:
+#   - TestFeMul (feMul against feMulGeneric): there is no assembly feMul,
+#     only the generic code.
+#   - TestSetBytesRoundTripEdgeCases is empty in Go.
+#   - TestAliasing checks that Go's pointer receiver may alias the
+#     arguments (v.Add(v, v)). alx Elements are values and operations
+#     return new values, so receivers can't alias; "aliasing" below checks
+#     the value equivalent: f(x, x) equals f(x, copy-of-x), and the inputs
+#     are unchanged afterwards.
+
+# A splitmix64 stream: the deterministic stand-in for math/rand.
+struct Rng {
+  st: [U64]
+
+  def next! -> U64 {
+    self.st[0] = st[0] + 0x9e3779b97f4a7c15
+    z = st[0]
+    z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9
+    z = (z ^ (z >> 27)) * 0x94d049bb133111eb
+    z ^ (z >> 31)
+  }
+
+  def intn!(n: Int) -> Int { (self.next! % n.as_u64).as_i64 }
+}
+
+def new_rng(seed: U64) -> Rng { Rng.new(st: [seed]) }
+
+MASK_LOW_52_BITS: U64 = (1 << 52) - 1
+
+def generate_field_element(r: Rng) -> Element {
+  rr = r
+  Element.new(rr.next! & MASK_LOW_52_BITS, rr.next! & MASK_LOW_52_BITS, rr.next! & MASK_LOW_52_BITS,
+    rr.next! & MASK_LOW_52_BITS, rr.next! & MASK_LOW_52_BITS)
+}
+
+# weirdLimbs can be combined to generate a range of edge-case field
+# elements. 0 and -1 are intentionally more weighted, as they combine well.
+WEIRD_LIMBS_51: [U64; 15] = [0, 0, 0, 0, 1, 19 - 1, 19, 0x2aaaaaaaaaaaa, 0x5555555555555, (1 << 51) - 20,
+  (1 << 51) - 19, (1 << 51) - 1, (1 << 51) - 1, (1 << 51) - 1, (1 << 51) - 1]
+WEIRD_LIMBS_52: [U64; 23] = [0, 0, 0, 0, 0, 0, 1, 19 - 1, 19, 0x2aaaaaaaaaaaa, 0x5555555555555, (1 << 51) - 20,
+  (1 << 51) - 19, (1 << 51) - 1, (1 << 51) - 1, (1 << 51) - 1, (1 << 51) - 1, (1 << 51) - 1, (1 << 51) - 1,
+  1 << 51, (1 << 51) + 1, (1 << 52) - 19, (1 << 52) - 1]
+
+def generate_weird_field_element(r: Rng) -> Element {
+  rr = r
+  Element.new(WEIRD_LIMBS_52[rr.intn!(23)], WEIRD_LIMBS_51[rr.intn!(15)], WEIRD_LIMBS_51[rr.intn!(15)],
+    WEIRD_LIMBS_51[rr.intn!(15)], WEIRD_LIMBS_51[rr.intn!(15)])
+}
+
+# Element.Generate.
+def gen(r: Rng) -> Element {
+  rr = r
+  return generate_weird_field_element(rr) if rr.intn!(2) == 0
+  generate_field_element(rr)
+}
+
+def gen_bytes(r: Rng, n: Int) -> [Byte] {
+  rr = r
+  out = [0.as_u8; n]
+  i = 0
+  while i < n {
+    out[i] = rr.next!.as_u8
+    i += 1
+  }
+  out
+}
+
+def bit_len(x: U64) -> Int {
+  n = 0
+  v = x
+  while v != 0 {
+    n += 1
+    v = v >> 1
+  }
+  n
+}
+
+# Whether the element is within the expected bit size bounds after a light
+# reduction.
+def in_bounds?(x: Element) -> Bool {
+  bit_len(x.l0) <= 52 && bit_len(x.l1) <= 52 && bit_len(x.l2) <= 52 && bit_len(x.l3) <= 52 &&
+    bit_len(x.l4) <= 52
+}
+
+def decode_hex(s: Str) -> [Byte] { hex.decode_string(s).unwrap }
+
+def fe(b: [Byte]) -> Element { set_bytes(b).unwrap }
+
+test "multiply distributes over add" {
+  r = new_rng(1)
+  i = 0
+  while i < 5000 {
+    x = gen(r)
+    y = gen(r)
+    z = gen(r)
+    # t1 = (x+y)*z
+    t1 = x.add(y).multiply(z)
+    # t2 = x*z + y*z
+    t2 = x.multiply(z).add(y.multiply(z))
+    assert t1.equal(t2) == 1 && in_bounds?(t1) && in_bounds?(t2), "distributes"
+    i += 1
+  }
+}
+
+# Go's mul and addMul helpers (inlined in multiply and square_n here):
+# the 128-bit product and accumulation they compute.
+def mul128(a: U64, b: U64) -> (U64, U64) { (a *% b, a.__mulhi(b)) }
+
+def add_mul128(v: (U64, U64), a: U64, b: U64) -> (U64, U64) {
+  p = a *% b
+  lo = v[0] + p
+  c = lo < p ? ONE : ZERO
+  (lo, v[1] + a.__mulhi(b) + c)
+}
+
+test "mul 64 to 128" {
+  r = mul128(5, 5)
+  assert_eq r[0], 0x19
+  assert_eq r[1], 0
+  r = mul128(18014398509481983, 18014398509481983) # 2^54 - 1
+  assert_eq r[0], 0xff80000000000001
+  assert_eq r[1], 0xfffffffffff
+  a: U64 = 1125899906842661
+  b: U64 = 2097155
+  r = mul128(a, b)
+  r = add_mul128(r, a, b)
+  r = add_mul128(r, a, b)
+  r = add_mul128(r, a, b)
+  r = add_mul128(r, a, b)
+  assert_eq r[0], 16888498990613035
+  assert_eq r[1], 640
+}
+
+test "set bytes round trip" {
+  r = new_rng(2)
+  i = 0
+  while i < 1000 {
+    input = gen_bytes(r, 32)
+    f = fe(input)
+    # Mask the most significant bit as it's ignored by set_bytes.
+    input[31] = input[31] & 0x7f
+    assert input == f.bytes && in_bounds?(f), "bytes->FE->bytes"
+    i += 1
+  }
+  i = 0
+  while i < 1000 {
+    f = gen(r)
+    g = fe(f.bytes)
+    # Not using equal, so as not to go through bytes again; reduce because
+    # both gen and set_bytes can produce non-canonical representations.
+    assert f.reduce == g.reduce, "FE->bytes->FE"
+    i += 1
+  }
+  # Fixed vectors from dalek.
+  tests: [(Element, [Byte])] = [
+    (Element.new(358744748052810, 1691584618240980, 977650209285361, 1429865912637724, 560044844278676),
+      [74, 209, 69, 197, 70, 70, 161, 222, 56, 226, 229, 19, 112, 60, 25, 92, 187, 74, 222, 56, 50, 153, 51, 233, 40, 74,
+        57, 6, 160, 185, 213, 31]),
+    (Element.new(84926274344903, 473620666599931, 365590438845504, 1028470286882429, 2146499180330972),
+      [199, 23, 106, 112, 61, 77, 216, 79, 186, 60, 11, 118, 13, 16, 103, 15, 42, 32, 83, 250, 44, 57, 204, 198, 78, 199,
+        253, 119, 146, 172, 3, 122])
+  ]
+  for tt in tests {
+    assert_eq tt[0].bytes, tt[1]
+    assert_eq fe(tt[1]).equal(tt[0]), 1
+  }
+  assert set_bytes([1, 2, 3]).err?, "short input"
+  assert_eq set_bytes([0.as_u8; 33]).err.unwrap.message, "edwards25519: invalid field element input size"
+}
+
+def reverse(b: [Byte]) -> [Byte] {
+  out = b.reverse
+  out
+}
+
+# v = n; the bit length of n must not exceed 256.
+def from_big(n: big.Int) -> Element {
+  panic("edwards25519: invalid field element input size") if n.bit_len > 256
+  buf = [0.as_u8; 32]
+  n.fill_bytes(buf)
+  fe(reverse(buf))
+}
+
+def from_decimal(s: Str) -> Element {
+  n = big.Int.new
+  n.set_string!(s, 10) || panic("not a valid decimal: " + s)
+  from_big(n)
+}
+
+def to_big(v: Element) -> big.Int {
+  n = big.Int.new
+  n.set_bytes!(reverse(v.bytes))
+}
+
+test "bytes big equivalence" {
+  r = new_rng(3)
+  i = 0
+  while i < 500 {
+    input = gen_bytes(r, 32)
+    f = fe(input)
+    input[31] = input[31] & 0x7f # mask the most significant bit
+    b = big.Int.new
+    b.set_bytes!(reverse(input))
+    f1 = from_big(b)
+    assert f == f1, "set_bytes vs big"
+    buf = [0.as_u8; 32]
+    to_big(f1).fill_bytes(buf)
+    assert f.bytes == reverse(buf) && in_bounds?(f) && in_bounds?(f1), "bytes vs big"
+    i += 1
+  }
+}
+
+test "decimal constants" {
+  sqrt_m1_string = "19681161376707505956807079304988542015446066515923890162744021073123829784752"
+  assert_eq sqrt_m1.equal(from_decimal(sqrt_m1_string)), 1
+  # d is in the parent package (tested there).
+}
+
+# Self-consistency between multiply and square.
+test "consistency" {
+  x = Element.new(1, 1, 1, 1, 1)
+  assert x.multiply(x) == x.square, "all ones"
+  b = [0.as_u8; 32]
+  rand.read(b)
+  x = fe(b)
+  assert x.multiply(x) == x.square, "random"
+}
+
+test "equal" {
+  x = Element.new(1, 1, 1, 1, 1)
+  y = Element.new(5, 4, 3, 2, 1)
+  assert_eq x.equal(x), 1
+  assert_eq x.equal(y), 0
+}
+
+test "invert" {
+  x = Element.new(1, 1, 1, 1, 1)
+  assert one() == x.multiply(x.invert).reduce, "inversion identity"
+  b = [0.as_u8; 32]
+  rand.read(b)
+  x = fe(b)
+  assert one() == x.multiply(x.invert).reduce, "random inversion identity"
+  assert_eq zero().invert.equal(zero()), 1
+}
+
+test "select swap" {
+  a = Element.new(358744748052810, 1691584618240980, 977650209285361, 1429865912637724, 560044844278676)
+  b = Element.new(84926274344903, 473620666599931, 365590438845504, 1028470286882429, 2146499180330972)
+  c = select(a, b, 1)
+  d = select(a, b, 0)
+  assert c.equal(a) == 1 && d.equal(b) == 1, "select"
+  c, d = swap(c, d, 0)
+  assert c.equal(a) == 1 && d.equal(b) == 1, "swap 0"
+  c, d = swap(c, d, 1)
+  assert c.equal(b) == 1 && d.equal(a) == 1, "swap 1"
+}
+
+test "mult 32" {
+  r = new_rng(4)
+  i = 0
+  while i < 1000 {
+    x = gen(r)
+    y = r.next!.as_u32
+    t1 = Element.new
+    j = 0
+    while j < 100 {
+      t1 = x.mult_32(y)
+      j += 1
+    }
+    ty = Element.new(l0: y.as_u64)
+    t2 = Element.new
+    j = 0
+    while j < 100 {
+      t2 = x.multiply(ty)
+      j += 1
+    }
+    assert t1.equal(t2) == 1 && in_bounds?(t1) && in_bounds?(t2), "mult_32"
+    i += 1
+  }
+}
+
+test "sqrt ratio" {
+  # From draft-irtf-cfrg-ristretto255-decaf448-00, Appendix A.4.
+  z = "0000000000000000000000000000000000000000000000000000000000000000"
+  o = "0100000000000000000000000000000000000000000000000000000000000000"
+  tests: [(Str, Str, Int, Str)] = [
+    # If u is 0, the function is defined to return (0, TRUE), even if v is
+    # zero.
+    (z, z, 1, z),
+    # 0/1 == 0^2
+    (z, o, 1, z),
+    # If u is non-zero and v is zero, defined to return (0, FALSE).
+    (o, z, 0, z),
+    # 2/1 is not square in this field.
+    ("0200000000000000000000000000000000000000000000000000000000000000", o, 0,
+      "3c5ff1b5d8e4113b871bd052f9e7bcd0582804c266ffb2d4f4203eb07fdb7c54"),
+    # 4/1 == 2^2
+    ("0400000000000000000000000000000000000000000000000000000000000000", o, 1,
+      "0200000000000000000000000000000000000000000000000000000000000000"),
+    # 1/4 == (2^-1)^2 == (2^(p-2))^2 per Euler's theorem
+    (o, "0400000000000000000000000000000000000000000000000000000000000000", 1,
+      "f6ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff3f")
+  ]
+  for tt in tests {
+    u = fe(decode_hex(tt[0]))
+    v = fe(decode_hex(tt[1]))
+    want = fe(decode_hex(tt[3]))
+    got = sqrt_ratio(u, v)
+    assert got[0].equal(want) == 1 && got[1] == tt[2], "sqrt_ratio #{tt[0]} #{tt[1]}"
+  }
+}
+
+test "square n" {
+  r = new_rng(5)
+  ns = [1, 2, 5, 10, 15, 50, 120]
+  i = 0
+  while i < 300 {
+    x = gen(r)
+    for n in ns {
+      got = x.square_n(n)
+      want = x
+      j = 0
+      while j < n {
+        want = want.square
+        j += 1
+      }
+      assert got.equal(want) == 1, "square_n(#{n}) mismatch"
+      assert in_bounds?(got), "square_n(#{n}) out of bounds"
+    }
+    i += 1
+  }
+}
+
+# Go's TestAliasing, for values: f(x, x) agrees with f(x, x') for a copy x'
+# of x, and the arguments are unchanged afterwards.
+test "aliasing" {
+  r = new_rng(6)
+  i = 0
+  while i < 256 {
+    x = gen(r)
+    y = gen(r)
+    x1 = x
+    y1 = y
+    assert x.absolute == x1.absolute, "absolute"
+    assert x.invert == x1.invert, "invert"
+    assert x.negate == x1.negate, "negate"
+    assert x.square == x1.square, "square"
+    assert x.square_n(10) == x1.square_n(10), "square_n"
+    assert x.pow22523 == x1.pow22523, "pow22523"
+    assert x.mult_32(0xffffffff) == x1.mult_32(0xffffffff), "mult_32"
+    assert x.multiply(x) == x.multiply(x1) && x.multiply(y) == x1.multiply(y1), "multiply"
+    assert x.add(x) == x.add(x1) && x.add(y) == x1.add(y1), "add"
+    assert x.subtract(x) == x.subtract(x1) && x.subtract(y) == x1.subtract(y1), "subtract"
+    assert sqrt_ratio(x, x)[0] == sqrt_ratio(x, x1)[0], "sqrt_ratio"
+    assert select(x, y, 0) == y1 && select(x, y, 1) == x1, "select"
+    assert in_bounds?(x.multiply(y)) && in_bounds?(x.add(y)) && in_bounds?(x.subtract(y)), "bounds"
+    assert x == x1 && y == y1, "arguments modified"
+    i += 1
+  }
+}
+
+bench "add" {
+  x = one()
+  y = x.add(x)
+  i = 0
+  while i < 1000 {
+    x = x.add(y)
+    i += 1
+  }
+  assert in_bounds?(x), "bench"
+}
+
+bench "multiply" {
+  x = one()
+  y = x.add(x)
+  i = 0
+  while i < 1000 {
+    x = x.multiply(y)
+    i += 1
+  }
+  assert in_bounds?(x), "bench"
+}
+
+bench "square" {
+  x = one().add(one())
+  i = 0
+  while i < 1000 {
+    x = x.square
+    i += 1
+  }
+  assert in_bounds?(x), "bench"
+}
+
+bench "invert" {
+  x = one().add(one())
+  x = x.invert
+  assert in_bounds?(x), "bench"
+}
+
+bench "mult 32" {
+  x = one()
+  i = 0
+  while i < 1000 {
+    x = x.mult_32(0xaa42aa42)
+    i += 1
+  }
+  assert in_bounds?(x), "bench"
+}
+
+bench "bytes" {
+  x = one()
+  b = x.bytes
+  assert b.size == 32, "bench"
+}

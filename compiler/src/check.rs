@@ -5804,6 +5804,15 @@ impl<'w, 'a> FnCx<'w, 'a> {
                 }
                 _ => return Err(Diag::new(*fsp, format!("unsupported directive `%{spec}`")).note("supported so far (Go's fmt verbs): %v, %d, %s, %q, %t, %f, %e, %E, %x, %X, %o, %b, %c, %T, %%, with flags `-+0 `, a width and a precision")),
             };
+            // Integer precision: minimum digits; Go ignores the 0 flag then.
+            let int_verb = matches!(verb, "d" | "i" | "x" | "X" | "o" | "b");
+            let piece = match prec {
+                Some(n) if int_verb => {
+                    zero = false;
+                    FmtPiece::Digits { inner: Box::new(piece), n }
+                }
+                _ => piece,
+            };
             let piece = if width > 0 || plus || space {
                 FmtPiece::Padded { inner: Box::new(piece), width, left, zero: zero && !left && numeric, plus: plus && numeric, space: space && numeric && !plus }
             } else {

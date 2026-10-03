@@ -2396,6 +2396,19 @@ impl<'a> Lw<'a> {
                 let v = self.int_in_t(vals[*k].clone(), &args[*k].ty, args[*k].span);
                 LE::Rt(Rt::RuneToS, vec![v])
             }
+            FmtPiece::Digits { inner, n } => {
+                let s = self.fmt_piece(inner, vals, args);
+                let s = self.bind(s, LTy::Str);
+                let first = LE::Rt(Rt::StrByte, vec![s.clone(), LE::I(0), LE::I(0)]);
+                let neg = LE::Cmp(Op::Eq, Box::new(first), Box::new(LE::I(b'-' as i64)), LTy::I64);
+                let w = LE::Cond(Box::new(neg), Box::new(LE::I(*n as i64 + 1)), Box::new(LE::I(*n as i64)));
+                let padded = LE::Rt(Rt::StrPad, vec![s.clone(), w, LE::I(2)]);
+                if *n > 0 {
+                    return padded;
+                }
+                let zero = LE::Cmp(Op::Eq, Box::new(s), Box::new(LE::S("0".into())), LTy::Str);
+                LE::Cond(Box::new(zero), Box::new(LE::S(String::new())), Box::new(padded))
+            }
             FmtPiece::Padded { inner, width, left, zero, plus, space } => {
                 let s = self.fmt_piece(inner, vals, args);
                 let mut s = self.bind(s, LTy::Str);

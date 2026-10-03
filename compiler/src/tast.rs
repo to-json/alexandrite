@@ -472,6 +472,8 @@ pub enum FmtPiece {
     Exp(usize, u32, bool),
     /// A piece with flags and a width: `%-8s`, `%05d`, `%+d`, `% d`.
     Padded { inner: Box<FmtPiece>, width: u32, left: bool, zero: bool, plus: bool, space: bool },
+    /// An integer's precision, `%.3d`: at least n digits (zero-padded after the sign); `%.0d` of 0 is empty.
+    Digits { inner: Box<FmtPiece>, n: u32 },
 }
 impl FmtPiece {
     /// The argument this piece shows.
@@ -479,14 +481,14 @@ impl FmtPiece {
         match self {
             FmtPiece::Lit(_) => None,
             FmtPiece::Int(k) | FmtPiece::Str(k) | FmtPiece::Fixed(k, _) | FmtPiece::Base(k, ..) | FmtPiece::Char(k) | FmtPiece::Quote(k) | FmtPiece::Exp(k, ..) => Some(*k),
-            FmtPiece::Padded { inner, .. } => inner.arg(),
+            FmtPiece::Padded { inner, .. } | FmtPiece::Digits { inner, .. } => inner.arg(),
         }
     }
     /// Whether it shows its argument as a Float.
     pub fn wants_float(&self) -> bool {
         match self {
             FmtPiece::Fixed(..) | FmtPiece::Exp(..) => true,
-            FmtPiece::Padded { inner, .. } => inner.wants_float(),
+            FmtPiece::Padded { inner, .. } | FmtPiece::Digits { inner, .. } => inner.wants_float(),
             _ => false,
         }
     }

@@ -1630,6 +1630,16 @@ impl<'w, 'a> FnCx<'w, 'a> {
                 }
             }
         }
+        // A def whose failures all come from calls covered by its declared set
+        // (recursion through defs still being checked) fails with that set: its
+        // callers see the declaration, not an empty set.
+        if self.errs.is_empty() {
+            if let Some(Some(declared)) = def.map(|d| d.errs.clone()) {
+                for n in &declared {
+                    self.errs.insert(resolve_name(n, Span::default(), &|q| self.w.structs.contains_key(q)).unwrap_or_else(|_| n.clone()));
+                }
+            }
+        }
         let errs = self.errs.iter().cloned().collect();
         // Locals assigned but never read (Go's "declared and not used").
         let mut read = std::collections::HashSet::new();
@@ -2409,7 +2419,7 @@ impl<'w, 'a> FnCx<'w, 'a> {
                 let held = if let Ty::Result(t) = self.resolve(&inner.ty) {
                     match (&inner.kind, self.mut_errs.take()) {
                         (TK::Seq(..), Some(es)) if !es.is_empty() => {
-                            errs.extend(es);
+                            errs.extend(es.into_iter().filter(|e| !e.is_empty()));
                             mut_call = true;
                         }
                         _ => {
@@ -3743,7 +3753,13 @@ impl<'w, 'a> FnCx<'w, 'a> {
         self.under_try = saved;
         let call = call?;
         if let TK::Call(f, _) = &call.kind {
-            self.mut_errs = self.w.funcs[*f].as_ref().map(|f| f.errs.clone());
+            // (A `!` method still being checked, in a def with a declared set: its
+            // failures are covered by the declaration, as for plain calls.)
+            self.mut_errs = match self.w.funcs[*f].as_ref() {
+                Some(f) => Some(f.errs.clone()),
+                None if self.declared_errs => Some(vec![String::new()]),
+                None => None,
+            };
         }
         let rty = call.ty.clone();
         if matches!(self.resolve(&rty), Ty::Unit) {

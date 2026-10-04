@@ -1308,7 +1308,9 @@ impl<'a> Lw<'a> {
                     LE::Slice(at, Box::new(av), Box::new(lo_v), Box::new(LE::Var(len)))
                 }
             }
-            TK::Index(a, i) if self.try_mode => {
+            // The element reads of a slice `==` (check.rs arr_eq) are always in
+            // range: no IndexError under `~`.
+            TK::Index(a, i) if self.try_mode && !matches!(&i.kind, TK::Local(l) if self.f.locals[*l].name.starts_with("_eqi")) => {
                 let av = self.expr(a);
                 let av = self.bind_arr(av, self.lty(&a.ty));
                 let iv = self.expr(i);

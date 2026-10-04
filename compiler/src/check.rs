@@ -2444,7 +2444,8 @@ impl<'w, 'a> FnCx<'w, 'a> {
                 let fallible_op = held.is_some() || is_fallible_expr(&inner, self);
                 if !mut_call {
                     let selfl = if self.method == Some(true) { self.lookup("self") } else { None };
-                    try_faults(&inner, &mut errs, selfl);
+                    let eqi: std::collections::HashSet<LocalId> = self.locals.iter().enumerate().filter(|(_, l)| l.name.starts_with("_eqi")).map(|(k, _)| k).collect();
+                    try_faults(&inner, &mut errs, selfl, &eqi);
                 }
                 if self.wrap && fallible_op {
                     errs.remove("ArithError");
@@ -6463,14 +6464,19 @@ fn int_like(t: &Ty) -> bool {
 /// panicking: arithmetic (ArithError) and the panicking builtins of
 /// `prove::fault`. A nested `~` and blocks that become functions of
 /// their own aren't covered by this one.
-fn try_faults(e: &TExpr, out: &mut std::collections::BTreeSet<String>, selfl: Option<LocalId>) {
+fn try_faults(e: &TExpr, out: &mut std::collections::BTreeSet<String>, selfl: Option<LocalId>, eqi: &std::collections::HashSet<LocalId>) {
     match &e.kind {
         // Reading `self` in a `!` method: its one-element slice, always there.
         TK::Index(a, i) if matches!((&a.kind, &i.kind), (TK::Local(l), TK::Int(0)) if Some(*l) == selfl) => return,
+        // The element reads of a slice `==` (arr_eq): always in range.
+        TK::Index(a, i) if matches!(&i.kind, TK::Local(l) if eqi.contains(l)) => {
+            try_faults(a, out, selfl, eqi);
+            return;
+        }
         TK::Try(_) => return,
         _ if crate::prove::own_function_block(e) => {
             if let TK::M(_, r, args, _) = &e.kind {
-                r.iter().map(|r| &**r).chain(args).for_each(|x| try_faults(x, out, selfl));
+                r.iter().map(|r| &**r).chain(args).for_each(|x| try_faults(x, out, selfl, eqi));
             }
             return;
         }
@@ -6489,7 +6495,7 @@ fn try_faults(e: &TExpr, out: &mut std::collections::BTreeSet<String>, selfl: Op
     if let Some(f) = crate::prove::fault(e) {
         out.insert(f.err.to_string());
     }
-    crate::prove::each_child(e, &mut |x| try_faults(x, out, selfl));
+    crate::prove::each_child(e, &mut |x| try_faults(x, out, selfl, eqi));
 }
 
 // ---- math block: intrinsics behind std/math ----

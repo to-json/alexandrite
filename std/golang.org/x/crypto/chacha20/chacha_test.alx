@@ -1,0 +1,139 @@
+# golang.org/x/crypto/chacha20's tests (chacha_test.go); the vectors of
+# vectors_test.go are in vec_chacha_test.alx, checked by check_vector
+# (TestNoOverlap, TestOverlap, TestUnaligned and TestStep for each).
+#
+# Not translated: the panic checks of TestSetCounter and TestLastBlock
+# (setting the counter backwards and crypting past the last block panic as
+# in Go, but alx has no recover to observe it); the non-panicking halves
+# are here. TestUnaligned's buffer offsets are kept although alx has no
+# alignment concerns.
+
+import "crypto/cipher"
+import "encoding/hex"
+import "math/rand"
+
+def hex_decode(s: Str) -> [Byte] { hex.decode_string(s).unwrap }
+
+def new_c(key: [Byte], nonce: [Byte]) -> Cipher { new_unauthenticated_cipher(key, nonce).unwrap }
+
+# TestNoOverlap, TestOverlap, TestUnaligned and TestStep for one vector.
+def check_vector(key: Str, nonce: Str, input: Str, output: Str) {
+  data = hex_decode(input)
+  # No overlap.
+  s = new_c(hex_decode(key), hex_decode(nonce))
+  out = [0.as_u8; data.size]
+  s.xor_key_stream!(out, data)
+  assert_eq hex.encode_to_string(out), output
+  # Overlap.
+  s = new_c(hex_decode(key), hex_decode(nonce))
+  d2 = data + []
+  s.xor_key_stream!(d2, d2)
+  assert_eq hex.encode_to_string(d2), output
+  # Unaligned: various source and destination offsets.
+  max = 8
+  inp = [0.as_u8; data.size + max]
+  outp = [0.as_u8; data.size + max]
+  for i in [0, 1, 3, 7] {
+    for j in [0, 2, 5, 7] {
+      s = new_c(hex_decode(key), hex_decode(nonce))
+      in_ = inp[i...i + data.size]
+      o = outp[j...j + data.size]
+      copy(in_, data)
+      s.xor_key_stream!(o, in_)
+      assert_eq hex.encode_to_string(o), output
+    }
+  }
+  # Step: several calls of various sizes.
+  steps = [1, 3, 4, 7, 8, 17, 24, 30, 64, 256]
+  rnd = rand.new(rand.new_source(data.size))
+  s = new_c(hex_decode(key), hex_decode(nonce))
+  o3 = [0.as_u8; data.size]
+  i = 0
+  step = steps[rnd.intn!(steps.size)]
+  while i + step < data.size {
+    s.xor_key_stream!(o3[i...i + step], data[i...i + step])
+    assert o3[i + step] == 0, "output overwritten"
+    i += step
+    step = steps[rnd.intn!(steps.size)]
+  }
+  # finish the encryption
+  s.xor_key_stream!(o3[i...o3.size], data[i...data.size])
+  # ensure we tolerate a call with an empty input
+  s.xor_key_stream!(o3[o3.size...o3.size], data[data.size...data.size])
+  assert_eq hex.encode_to_string(o3), output
+  nil
+}
+
+def zero_cipher -> Cipher { new_c([0.as_u8; KEY_SIZE], [0.as_u8; NONCE_SIZE]) }
+
+test "SetCounter" {
+  s = zero_cipher()
+  src = ("test" * 32).bytes
+  # two 64-byte blocks
+  dst1 = [0.as_u8; src.size]
+  s.xor_key_stream!(dst1, src)
+  # advance counter to 1 and xor second block
+  s = zero_cipher()
+  s.set_counter!(1)
+  dst2 = [0.as_u8; src.size]
+  s.xor_key_stream!(dst2[64...dst2.size], src[64...src.size])
+  assert_eq dst1[64...dst1.size], dst2[64...dst2.size]
+  # test again with unaligned blocks; set_counter! should reset the buffer
+  s = zero_cipher()
+  s.xor_key_stream!(dst1[0...70], src[0...70])
+  s = zero_cipher()
+  z = [0.as_u8]
+  s.xor_key_stream!(z, z)
+  s.set_counter!(1)
+  s.xor_key_stream!(dst2[64...70], src[64...70])
+  assert_eq dst1[64...70], dst2[64...70]
+}
+
+test "LastBlock" {
+  last_block = "ace4cd09e294d1912d4ad205d06f95d9c2f2bfcf453e8753f128765b62215f4d" + "92c74f2f626c6a640c0b1284d839ec81f1696281dafc3e684593937023b58b1d"
+  # setting the counter to 0xffffffff - 1 and crypting two blocks should
+  # not trigger a panic
+  s = zero_cipher()
+  s.set_counter!(0xfffffffe)
+  blocks = [0.as_u8; 64 * 2]
+  s.xor_key_stream!(blocks, blocks)
+  assert_eq hex.encode_to_string(blocks[64...128]), last_block
+  # if we crypt less than a full block, we should be able to crypt the rest
+  # in a subsequent call without panicking
+  s = zero_cipher()
+  s.set_counter!(0xffffffff)
+  block = [0.as_u8; 64]
+  s.xor_key_stream!(block[0...7], block[0...7])
+  s.xor_key_stream!(block[7...64], block[7...64])
+  assert_eq hex.encode_to_string(block), last_block
+}
+
+test "HChaCha20" {
+  # See draft-irtf-cfrg-xchacha-00, Section 2.2.1.
+  key = hex_decode("000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f")
+  nonce = hex_decode("000000090000004a0000000031415927")
+  expected = hex_decode("82413b4227b27bfed30e42508a877d73a0f9e4d58a74a853c12ec41326d3ecdc")
+  assert_eq hchacha20(key, nonce).unwrap, expected
+}
+
+test "errors" {
+  assert_eq new_unauthenticated_cipher([0.as_u8; 31], [0.as_u8; 12]).err?.message || "", "chacha20: wrong key size"
+  assert_eq new_unauthenticated_cipher([0.as_u8; 32], [0.as_u8; 13]).err?.message || "", "chacha20: wrong nonce size"
+  assert_eq hchacha20([0.as_u8; 32], [0.as_u8; 15]).err?.message || "", "chacha20: wrong HChaCha20 nonce size"
+}
+
+test "Cipher is a cipher.Stream" {
+  s: cipher.Stream = zero_cipher()
+  a = [0.as_u8; 10]
+  s.xor_key_stream!(a, a)
+  b = [0.as_u8; 10]
+  z = zero_cipher()
+  z.xor_key_stream!(b, b)
+  assert_eq a, b
+}
+
+bench "ChaCha20 65536" {
+  src = [0.as_u8; 65536]
+  c = zero_cipher()
+  c.xor_key_stream!(src, src)
+}

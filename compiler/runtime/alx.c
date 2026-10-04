@@ -2143,9 +2143,12 @@ static struct { uint64_t mask; int wfd; int rfd; } g_sigw[ALX_SIGW];
 static pthread_mutex_t g_sig_mu = PTHREAD_MUTEX_INITIALIZER;
 static uint64_t g_sig_handled, g_sig_ignored;
 static bool g_sig_init;
+/* Handlers running right now: alx_sig_unwatch waits for none before it closes a pipe. */
+static int g_sig_busy;
 
 static void alx_sig_handler(int sig) {
     int saved = errno;
+    __atomic_add_fetch(&g_sig_busy, 1, __ATOMIC_SEQ_CST);
     uint64_t bit = (uint64_t)1 << sig;
     for (int i = 0; i < ALX_SIGW; i++) {
         if (__atomic_load_n(&g_sigw[i].mask, __ATOMIC_SEQ_CST) & bit) {
@@ -2154,6 +2157,7 @@ static void alx_sig_handler(int sig) {
             if (fd >= 0) (void)!write(fd, &b, 1);
         }
     }
+    __atomic_sub_fetch(&g_sig_busy, 1, __ATOMIC_SEQ_CST);
     errno = saved;
 }
 
@@ -2221,7 +2225,11 @@ int64_t alx_sig_unwatch(int64_t rfd) {
         if (g_sigw[i].rfd == rfd) {
             __atomic_store_n(&g_sigw[i].mask, 0, __ATOMIC_SEQ_CST);
             int w = __atomic_exchange_n(&g_sigw[i].wfd, -1, __ATOMIC_SEQ_CST);
-            if (w >= 0) close(w);
+            if (w >= 0) {
+                /* A handler that read the old descriptor is still counted in. */
+                while (__atomic_load_n(&g_sig_busy, __ATOMIC_SEQ_CST) != 0) {}
+                close(w);
+            }
             g_sigw[i].rfd = -1;
         }
     }

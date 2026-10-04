@@ -1,0 +1,548 @@
+# Package cryptobyte: golang.org/x/crypto/cryptobyte (the copy Go's std
+# vendors), parsing and building length-prefixed and ASN.1 DER encoded
+# binary messages, as crypto/x509 and crypto/tls use it.
+#
+#   Go                                        alx
+#   type String []byte                        String { s: [Byte] }; string(b) makes one
+#   s.ReadUint8(&v) bool                      s.read_u8! -> U8?     (none: nothing is consumed)
+#   ReadUint16 / 24 / 32 / 48 / 64            read_u16! -> U16?, read_u24! / read_u32! -> U32?,
+#                                             read_u48! / read_u64! -> U64?
+#   ReadUint{8,16,24}LengthPrefixed(&c)       read_u8_length_prefixed! ... -> String?
+#   ReadBytes(&b, n) / CopyBytes(b) / Skip(n) read_bytes!(n) -> [Byte]? / copy_bytes!(b) / skip!(n) -> Bool
+#   s.Empty() / len(s)                        s.empty? / s.size; s.bytes is the rest
+#   ReadASN1(&c, tag) / ReadASN1Element       read_asn1!(tag) / read_asn1_element!(tag) -> String?
+#   ReadAnyASN1(&c, &tag) / ...Element        read_any_asn1! / read_any_asn1_element! -> (String, Byte)?
+#   ReadASN1Bytes(&b, tag)                    read_asn1_bytes!(tag) -> [Byte]?
+#   PeekASN1Tag(tag) / SkipASN1(tag)          peek_asn1_tag?(tag) / skip_asn1!(tag) -> Bool
+#   ReadOptionalASN1(&c, &present, tag)       read_optional_asn1!(tag) -> (String, Bool)?
+#   SkipOptionalASN1(tag)                     skip_optional_asn1!(tag) -> Bool
+#   ReadASN1Integer(&i) (by out type)         read_asn1_int64! -> Int?, read_asn1_uint64! -> U64?,
+#                                             read_asn1_big_int! -> big.Int?, read_asn1_int_bytes! -> [Byte]?
+#                                             (and read_asn1_integer_in!(lo, hi) for Go's narrower ints)
+#   ReadOptionalASN1Integer(&i, tag, def)     read_optional_asn1_int64!(tag, def) -> Int?,
+#                                             read_optional_asn1_big_int!(tag, def) -> big.Int?
+#   ReadASN1Int64WithTag / ReadASN1Enum       read_asn1_int64_with_tag!(tag) / read_asn1_enum! -> Int?
+#   ReadASN1Boolean / ReadOptionalASN1Boolean read_asn1_boolean! / read_optional_asn1_boolean!(tag, def) -> Bool?
+#   ReadASN1ObjectIdentifier                  read_asn1_object_identifier! -> asn1.ObjectIdentifier?
+#   ReadASN1GeneralizedTime / UTCTime         read_asn1_generalized_time! / read_asn1_utc_time! -> time.Time?
+#   ReadASN1BitString / ...AsBytes            read_asn1_bit_string! -> asn1.BitString? / read_asn1_bit_string_as_bytes! -> [Byte]?
+#   ReadOptionalASN1OctetString(&b, &p, tag)  read_optional_asn1_octet_string!(tag) -> ([Byte], Bool)?
+#   Builder, NewBuilder, NewFixedBuilder      Builder, new_builder(buf), new_fixed_builder(buf, capacity)
+#   b.AddUint8(v) ... AddBytes(v)             b.add_u8!(v) ... add_bytes!(v)
+#   b.AddUint8LengthPrefixed(func(c) {...})   b.add_u8_length_prefixed! { |c| ... } (u16, u24, u32)
+#   b.AddASN1(tag, func(c) {...})             b.add_asn1!(tag) { |c| ... }
+#   AddASN1Int64 / Uint64 / BigInt / Enum ... add_asn1_int64! / add_asn1_uint64! / add_asn1_big_int! /
+#                                             add_asn1_enum! / add_asn1_int64_with_tag! /
+#                                             add_asn1_octet_string! / add_asn1_bit_string! /
+#                                             add_asn1_object_identifier! / add_asn1_boolean! /
+#                                             add_asn1_null! / add_asn1_generalized_time! /
+#                                             add_asn1_utc_time!
+#   b.MarshalASN1(v)                          b.marshal_asn1!(v) (v derives Asn1)
+#   b.AddValue(v MarshalingValue)             b.add_value!(v) (v: MarshalingValue, `marshal(b) -> ~Unit`)
+#   b.Bytes() ([]byte, error)                 b.bytes -> ~[Byte]
+#   b.BytesOrPanic() / SetError / Unwrite(n)  b.bytes_or_panic / set_error!(e) / unwrite!(n)
+#
+# Differences from Go:
+#   - Go's out-pointer readers (`ReadX(&out) bool`) return an optional:
+#     none is Go's false. As in Go, a failed read may have consumed input.
+#   - Go's ReadASN1Integer and ReadOptionalASN1Integer pick the integer
+#     type from the out pointer with reflection; here there is one method
+#     per type (int64, uint64, big.Int, []byte), plus
+#     read_asn1_integer_in!(lo, hi) for Go's narrower int types.
+#   - A continuation can't abort the builder with panic(BuildError{err})
+#     (alx has no recover): call c.set_error!(err) on the child instead.
+#     Go also panics when a parent is written while a child is pending;
+#     here the child is a separate Builder that is flushed into the
+#     parent when its block returns, so that misuse can't happen.
+#   - Builder shares its state across copies (D36): make it with
+#     new_builder / new_fixed_builder.
+#   - A fixed builder's capacity is the size of the buffer given (Go: its
+#     cap); the bytes in the buffer are kept as the start of the result,
+#     as in Go.
+
+import "encoding/asn1"
+import "math/big"
+import "time"
+import cbasn1 "golang.org/x/crypto/cryptobyte/asn1"
+
+# A byte string with methods for parsing: Go's cryptobyte.String. Every
+# read! consumes from the front.
+pub struct String {
+  s: [Byte]
+
+  # The bytes not yet read.
+  pub def bytes -> [Byte] { s }
+  pub def size -> Int { s.size }
+  # Whether the string has no more bytes.
+  pub def empty? -> Bool { s.size == 0 }
+
+  # Reads n bytes, advancing the string; none if there aren't enough.
+  def read!(n: Int) -> [Byte]? {
+    return none if s.size < n || n < 0
+    v = s[0...n]
+    self.s = s[n...s.size]
+    v
+  }
+
+  # Advances the string by n bytes; false if there aren't enough.
+  pub def skip!(n: Int) -> Bool { self.read!(n).some? }
+
+  pub def read_u8! -> U8? {
+    if v = self.read!(1) {
+      return v[0]
+    }
+    none
+  }
+
+  pub def read_u16! -> U16? {
+    if v = self.read!(2) {
+      return (v[0].to_u16 << 8) | v[1].to_u16
+    }
+    none
+  }
+
+  pub def read_u24! -> U32? {
+    if v = self.read!(3) {
+      return (v[0].to_u32 << 16) | (v[1].to_u32 << 8) | v[2].to_u32
+    }
+    none
+  }
+
+  pub def read_u32! -> U32? {
+    if v = self.read!(4) {
+      return (v[0].to_u32 << 24) | (v[1].to_u32 << 16) | (v[2].to_u32 << 8) | v[3].to_u32
+    }
+    none
+  }
+
+  pub def read_u48! -> U64? {
+    if v = self.read!(6) {
+      r: U64 = 0
+      for b in v {
+        r = (r << 8) | b.to_u64
+      }
+      return r
+    }
+    none
+  }
+
+  pub def read_u64! -> U64? {
+    if v = self.read!(8) {
+      r: U64 = 0
+      for b in v {
+        r = (r << 8) | b.to_u64
+      }
+      return r
+    }
+    none
+  }
+
+  def read_length_prefixed!(len_len: Int) -> String? {
+    if len_bytes = self.read!(len_len) {
+      length = 0
+      for b in len_bytes {
+        length = (length << 8) | b.to_i
+      }
+      if v = self.read!(length) {
+        return String.new(s: v)
+      }
+    }
+    none
+  }
+
+  # A child string prefixed by its length in one byte.
+  pub def read_u8_length_prefixed! -> String? { self.read_length_prefixed!(1) }
+  pub def read_u16_length_prefixed! -> String? { self.read_length_prefixed!(2) }
+  pub def read_u24_length_prefixed! -> String? { self.read_length_prefixed!(3) }
+
+  # The next n bytes (sharing storage with the string).
+  pub def read_bytes!(n: Int) -> [Byte]? { self.read!(n) }
+
+  # Copies the next out.size bytes into out; false if there aren't enough.
+  pub def copy_bytes!(out: [Byte]) -> Bool {
+    if v = self.read!(out.size) {
+      return copy(out, v) == out.size
+    }
+    false
+  }
+
+  # ---------------------------------------------------------------- ASN.1
+
+  # Go's readASN1: the next element (DER lengths only, low tag numbers
+  # only), with or without its header, and its tag.
+  def read_asn1_any!(skip_header: Bool) -> (String, Byte)? {
+    return none if s.size < 2
+    tag = s[0]
+    len_byte = s[1]
+    return none if tag & 0x1f == 0x1f
+    length = 0
+    header_len = 0
+    if len_byte & 0x80 == 0 {
+      # Short-form length (section 8.1.3.4), encoded in bits 1-7.
+      length = len_byte.to_i + 2
+      header_len = 2
+    } else {
+      # Long-form length (section 8.1.3.5). Bits 1-7 encode the number of
+      # octets used to encode the length.
+      len_len = (len_byte & 0x7f).to_i
+      return none if len_len == 0 || len_len > 4 || s.size < 2 + len_len
+      len32 = 0
+      i = 0
+      while i < len_len {
+        len32 = (len32 << 8) | s[2 + i].to_i
+        i += 1
+      }
+      # ITU-T X.690 section 10.1 (DER length forms) requires encoding the
+      # length with the minimum number of octets.
+      return none if len32 < 128
+      # Long length form may not be used for lengths that fit in short form.
+      return none if (len32 >> ((len_len - 1) * 8)) == 0
+      header_len = 2 + len_len
+      length = header_len + len32
+    }
+    if v = self.read!(length) {
+      return (String.new(s: skip_header ? v[header_len...v.size] : v), tag)
+    }
+    none
+  }
+
+  # The contents of the next element and its tag.
+  pub def read_any_asn1! -> (String, Byte)? { self.read_asn1_any!(true) }
+
+  # The next element (with its header) and its tag.
+  pub def read_any_asn1_element! -> (String, Byte)? { self.read_asn1_any!(false) }
+
+  # The contents of the next element, which must have the given tag.
+  pub def read_asn1!(tag: Byte) -> String? {
+    if r = self.read_any_asn1! {
+      return r[0] if r[1] == tag
+    }
+    none
+  }
+
+  # The next element (with its header), which must have the given tag.
+  pub def read_asn1_element!(tag: Byte) -> String? {
+    if r = self.read_any_asn1_element! {
+      return r[0] if r[1] == tag
+    }
+    none
+  }
+
+  # The contents of the next element with the given tag, as bytes.
+  pub def read_asn1_bytes!(tag: Byte) -> [Byte]? {
+    if c = self.read_asn1!(tag) {
+      return c.s
+    }
+    none
+  }
+
+  # Whether the next element has the given tag.
+  pub def peek_asn1_tag?(tag: Byte) -> Bool { s.size > 0 && s[0] == tag }
+
+  # Skips the next element, which must have the given tag.
+  pub def skip_asn1!(tag: Byte) -> Bool { self.read_asn1!(tag).some? }
+
+  # The contents of the next element if it has the given tag, and whether it
+  # was present; none if it is present but malformed.
+  pub def read_optional_asn1!(tag: Byte) -> (String, Bool)? {
+    present = self.peek_asn1_tag?(tag)
+    if present {
+      if c = self.read_asn1!(tag) {
+        return (c, true)
+      }
+      return none
+    }
+    (String.new, false)
+  }
+
+  # Skips the next element if it has the given tag.
+  pub def skip_optional_asn1!(tag: Byte) -> Bool {
+    return true if !self.peek_asn1_tag?(tag)
+    self.read_asn1!(tag).some?
+  }
+
+  pub def read_asn1_boolean! -> Bool? {
+    if b = self.read_asn1!(cbasn1.BOOLEAN) {
+      return none if b.s.size != 1
+      return false if b.s[0] == 0
+      return true if b.s[0] == 0xff
+    }
+    none
+  }
+
+  # Go's ReadASN1Integer into an int64.
+  pub def read_asn1_int64! -> Int? { self.read_asn1_int64_with_tag!(cbasn1.INTEGER) }
+
+  # Go's ReadASN1Integer into a narrower signed integer type: none unless
+  # the value is in lo..hi.
+  pub def read_asn1_integer_in!(lo: Int, hi: Int) -> Int? {
+    if v = self.read_asn1_int64! {
+      return v if v >= lo && v <= hi
+    }
+    none
+  }
+
+  # Go's ReadASN1Integer into a uint64 (or a narrower unsigned type).
+  pub def read_asn1_uint64! -> U64? {
+    if b = self.read_asn1!(cbasn1.INTEGER) {
+      return none if !check_asn1_integer?(b.s)
+      return asn1_unsigned(b.s)
+    }
+    none
+  }
+
+  # Go's ReadASN1Integer into a *big.Int.
+  pub def read_asn1_big_int! -> big.Int? {
+    if b = self.read_asn1!(cbasn1.INTEGER) {
+      bytes = b.s
+      return none if !check_asn1_integer?(bytes)
+      out = big.Int.new
+      if bytes[0] & 0x80 == 0x80 {
+        # Negative number.
+        neg = [0.as_u8; bytes.size]
+        i = 0
+        while i < bytes.size {
+          neg[i] = ^bytes[i]
+          i += 1
+        }
+        out.set_bytes!(neg)
+        out.add!(out, big.new_int(1))
+        out.neg!(out)
+      } else {
+        out.set_bytes!(bytes)
+      }
+      return out
+    }
+    none
+  }
+
+  # Go's ReadASN1Integer into a *[]byte: a non-negative integer as
+  # big-endian bytes without leading zeros (at least one byte).
+  pub def read_asn1_int_bytes! -> [Byte]? {
+    if b = self.read_asn1!(cbasn1.INTEGER) {
+      bytes = b.s
+      return none if !check_asn1_integer?(bytes)
+      return none if bytes[0] & 0x80 == 0x80
+      i = 0
+      while bytes.size - i > 1 && bytes[i] == 0 {
+        i += 1
+      }
+      return bytes[i...bytes.size]
+    }
+    none
+  }
+
+  # An INTEGER with a non-INTEGER tag, as an int64.
+  pub def read_asn1_int64_with_tag!(tag: Byte) -> Int? {
+    if b = self.read_asn1!(tag) {
+      return none if !check_asn1_integer?(b.s)
+      return asn1_signed(b.s)
+    }
+    none
+  }
+
+  pub def read_asn1_enum! -> Int? { self.read_asn1_int64_with_tag!(cbasn1.ENUM) }
+
+  # Go's readBase128Int.
+  def read_base128_int! -> Int? {
+    ret = 0
+    i = 0
+    while s.size > 0 {
+      return none if i == 5
+      # Avoid overflowing int on a 32-bit platform.
+      return none if ret >= 1 << (31 - 7)
+      ret = ret << 7
+      b = s[0]
+      self.s = s[1...s.size]
+      # ITU-T X.690, section 8.19.2:
+      # The subidentifier shall be encoded in the fewest possible octets,
+      # that is, the leading octet of the subidentifier shall not have the
+      # value 0x80.
+      return none if i == 0 && b == 0x80
+      ret = ret | (b & 0x7f).to_i
+      return ret if b & 0x80 == 0
+      i += 1
+    }
+    # truncated
+    none
+  }
+
+  pub def read_asn1_object_identifier! -> asn1.ObjectIdentifier? {
+    if b0 = self.read_asn1!(cbasn1.OBJECT_IDENTIFIER) {
+      b = b0
+      return none if b.s.size == 0
+      components: [Int] = []
+      if v = b.read_base128_int! {
+        # In the worst case, we get two elements from the first byte (which
+        # is encoded differently) and then every varint is a single byte
+        # long.
+        if v < 80 {
+          components << v / 40
+          components << v % 40
+        } else {
+          components << 2
+          components << v - 80
+        }
+      } else {
+        return none
+      }
+      while b.s.size > 0 {
+        if w = b.read_base128_int! {
+          components << w
+        } else {
+          return none
+        }
+      }
+      return asn1.oid(components)
+    }
+    none
+  }
+
+  pub def read_asn1_generalized_time! -> time.Time? {
+    if b = self.read_asn1!(cbasn1.GENERALIZED_TIME) {
+      t = Str.from_bytes(b.s)
+      if res = time.parse(GENERALIZED_TIME_FORMAT_STR, t).ok {
+        return res if res.format(GENERALIZED_TIME_FORMAT_STR) == t
+      }
+    }
+    none
+  }
+
+  pub def read_asn1_utc_time! -> time.Time? {
+    if b = self.read_asn1!(cbasn1.UTC_TIME) {
+      t = Str.from_bytes(b.s)
+      format_str = DEFAULT_UTC_TIME_FORMAT_STR
+      r = time.parse(format_str, t)
+      if !r.ok? {
+        format_str = "0601021504Z0700"
+        r = time.parse(format_str, t)
+      }
+      if res0 = r.ok {
+        res = res0
+        return none if res.format(format_str) != t
+        if res.year >= 2050 {
+          # UTCTime interprets the low order digits 50-99 as 1950-99.
+          # This only makes sense when the year is between 1950 and 2049.
+          res = res.add_date(-100, 0, 0)
+        }
+        return res
+      }
+    }
+    none
+  }
+
+  pub def read_asn1_bit_string! -> asn1.BitString? {
+    if b = self.read_asn1!(cbasn1.BIT_STRING) {
+      bytes = b.s
+      return none if bytes.size == 0
+      padding_bits = bytes[0].to_i
+      bytes = bytes[1...bytes.size]
+      if padding_bits > 7 || (bytes.size == 0 && padding_bits != 0) || (bytes.size > 0 && bytes[bytes.size - 1].to_i & ((1 << padding_bits) - 1) != 0) {
+        return none
+      }
+      return asn1.BitString.new(bytes: bytes, bit_length: bytes.size * 8 - padding_bits)
+    }
+    none
+  }
+
+  # A BIT STRING that is a whole number of bytes.
+  pub def read_asn1_bit_string_as_bytes! -> [Byte]? {
+    if b = self.read_asn1!(cbasn1.BIT_STRING) {
+      return none if b.s.size == 0
+      return none if b.s[0] != 0
+      return b.s[1...b.s.size]
+    }
+    none
+  }
+
+  # Go's ReadOptionalASN1Integer into an int64: the integer inside an
+  # optional element with the given tag, or def when absent.
+  pub def read_optional_asn1_int64!(tag: Byte, default_value: Int) -> Int? {
+    if r = self.read_optional_asn1!(tag) {
+      i, present = r
+      return default_value if !present
+      if v = i.read_asn1_int64! {
+        return v if i.empty?
+      }
+    }
+    none
+  }
+
+  # Go's ReadOptionalASN1Integer into a *big.Int.
+  pub def read_optional_asn1_big_int!(tag: Byte, default_value: big.Int) -> big.Int? {
+    if r = self.read_optional_asn1!(tag) {
+      i, present = r
+      return default_value if !present
+      if v = i.read_asn1_big_int! {
+        return v if i.empty?
+      }
+    }
+    none
+  }
+
+  # The contents of an OCTET STRING inside an optional element with the
+  # given tag, and whether it was present.
+  pub def read_optional_asn1_octet_string!(tag: Byte) -> ([Byte], Bool)? {
+    if r = self.read_optional_asn1!(tag) {
+      child, present = r
+      return ([], false) if !present
+      if oct = child.read_asn1!(cbasn1.OCTET_STRING) {
+        return (oct.s, true) if child.empty?
+      }
+    }
+    none
+  }
+
+  # A BOOLEAN inside an optional element with the given tag, or def.
+  pub def read_optional_asn1_boolean!(tag: Byte, default_value: Bool) -> Bool? {
+    if r = self.read_optional_asn1!(tag) {
+      child, present = r
+      return default_value if !present
+      return child.read_asn1_boolean!
+    }
+    none
+  }
+}
+
+# A String reading from b (Go's cryptobyte.String(b)).
+pub def string(b: [Byte]) -> String { String.new(s: b) }
+
+GENERALIZED_TIME_FORMAT_STR = "20060102150405Z0700"
+DEFAULT_UTC_TIME_FORMAT_STR = "060102150405Z0700"
+
+def check_asn1_integer?(bytes: [Byte]) -> Bool {
+  # An INTEGER is encoded with at least one octet.
+  return false if bytes.size == 0
+  # Value is a single octet.
+  return true if bytes.size == 1
+  if (bytes[0] == 0 && bytes[1] & 0x80 == 0) || (bytes[0] == 0xff && bytes[1] & 0x80 == 0x80) {
+    # Value is not minimally encoded.
+    return false
+  }
+  true
+}
+
+def asn1_signed(n: [Byte]) -> Int? {
+  length = n.size
+  return none if length > 8
+  out: U64 = 0
+  for b in n {
+    out = (out << 8) | b.to_u64
+  }
+  # Shift up and down in order to sign extend the result.
+  sh = 64 - length * 8
+  return 0 if sh == 64
+  ((out << sh).as_i64) >> sh
+}
+
+def asn1_unsigned(n: [Byte]) -> U64? {
+  length = n.size
+  return none if length > 9 || (length == 9 && n[0] != 0)
+  # Negative number
+  return none if n[0] & 0x80 != 0
+  out: U64 = 0
+  for b in n {
+    out = (out << 8) | b.to_u64
+  }
+  out
+}

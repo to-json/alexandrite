@@ -277,6 +277,9 @@ fn pkg_dir(path: &str, imp: &Import, mods: &Mods, list: &dyn Fn(&Path) -> std::i
             }
             Ok(dir.join(path[m.len()..].trim_start_matches('/')))
         }
+        // The packages Go's std vendors (golang.org/x/crypto/cryptobyte, ...)
+        // are part of alx's std under their own paths.
+        None if path.split('/').next().is_some_and(|s| s.contains('.')) && is_std(path) => Ok(Path::new(STD_DIR).join(path)),
         None if path.split('/').next().is_some_and(|s| s.contains('.')) => Err(Diag::new(imp.span, format!("no required module provides package `{path}`; add `require <module> <version>` to alx.mod"))),
         // The module's own directory wins; otherwise the standard library.
         None if is_std(path) && !list(&mods.root.join(path)).is_ok_and(|fs| fs.iter().any(|f| f.extension().is_some_and(|e| e == "alx"))) => Ok(Path::new(STD_DIR).join(path)),

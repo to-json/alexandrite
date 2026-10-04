@@ -94,7 +94,11 @@ pub fn current_pkg() -> String {
 
 /// The package part of a qualified name (`geom.Point` → `geom`).
 pub fn pkg_of(name: &str) -> String {
-    match name.split_once('.') {
+    // The path may itself contain dots (`golang.org/x/crypto/cryptobyte.String`):
+    // the package part ends at the first dot after its last slash.
+    let base = name.split('[').next().unwrap_or(name);
+    let from = base.rfind('/').map_or(0, |k| k + 1);
+    match name[from..].find('.').map(|k| (&name[..from + k], &name[from + k + 1..])) {
         Some((p, _)) if !p.chars().next().is_some_and(|c| c.is_uppercase()) => p.to_string(),
         _ => String::new(),
     }

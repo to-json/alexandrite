@@ -1576,7 +1576,7 @@ impl<'a> Lw<'a> {
                 let et = self.lty(&Ty::Error);
                 let saved = self.tmp(LTy::Region);
                 self.emit(LS::RegionUse { region: LE::Var(dest), saved });
-                let c = self.deep_copy(err, &et);
+                let c = self.error_copy(err);
                 let c = self.bind(c, et);
                 self.emit(LS::RegionRestore(saved));
                 c
@@ -1862,6 +1862,29 @@ impl<'a> Lw<'a> {
             }
             body.push(LS::Return(Some(LE::Rt(Rt::StrCat, vec![LE::Field(Box::new(err_body(LE::Var(pe))), 2), LE::Var(s)]))));
             let func = LFunc { name: name.clone(), params: vec![pe], vars: std::mem::take(&mut w.vars), ret: LTy::Str, body, external: false, is_main: false, labels: w.labels };
+            let mut prog = self.prog.borrow_mut();
+            let slot = prog.funcs.iter().position(|f| f.name == name).unwrap();
+            prog.funcs[slot] = func;
+        }
+        LE::Call(name, vec![e])
+    }
+
+    /// A deep copy of an Error value into the current region: one shared
+    /// function (`__error_copy`), not inlined at every `fail`. The Error
+    /// type spans every error type in the program, so an inline copy grew
+    /// each fail site by kilobytes (and the Rust oracle past rustc's patience).
+    fn error_copy(&mut self, e: LE) -> LE {
+        let name = "__error_copy".to_string();
+        let exists = self.prog.borrow().funcs.iter().any(|f| f.name == name);
+        if !exists {
+            let et = self.lty(&Ty::Error);
+            self.prog.borrow_mut().funcs.push(LFunc { name: name.clone(), params: vec![], vars: vec![], ret: et.clone(), body: vec![], external: false, is_main: false, labels: 0 });
+            let mut w = Lw::new(self.p, self.sm, self.opts, self.f, self.mode, ErrPath::Die(vec![]), self.prog);
+            let pe = w.new_var("e", et.clone());
+            let c = w.deep_copy(LE::Var(pe), &et);
+            let mut body = w.out.pop().unwrap_or_default();
+            body.push(LS::Return(Some(c)));
+            let func = LFunc { name: name.clone(), params: vec![pe], vars: std::mem::take(&mut w.vars), ret: et, body, external: false, is_main: false, labels: w.labels };
             let mut prog = self.prog.borrow_mut();
             let slot = prog.funcs.iter().position(|f| f.name == name).unwrap();
             prog.funcs[slot] = func;

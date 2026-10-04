@@ -76,3 +76,4 @@ Open problems agents reported; each gets fixed in a compiler round between waves
 | 70 | net/rpc | `r: Reply = client.call(..).unwrap` can't infer R through `.unwrap` | open |
 | 71 | httptest, httptrace, fcgi | a closure can't capture a value holding a closure of its own type (handler capturing its server, a director wrapping the old one, composed trace hooks) | open (design; see #2) |
 | 72 | sniff | `b("RIFF") + [0, 0, 0, 0]`: a literal after `+` on a `[Byte]` stays `[Int]` | open (workaround: a `[Byte]` parameter) |
+| 73 | (main, net merge) | the Rust oracle of httpdemo grew to 7.4 MB and rustc ran for hours: every `fail` inlined a deep copy of the program-wide Error type (all error types' variants) | fixed: one shared `__error_copy` function (2.4 MB, rustc 64 s) |

@@ -68,7 +68,7 @@ Open problems agents reported; each gets fixed in a compiler round between waves
 | 62 | net/rpc | `x: ~Reply = h.get` bound R to `~Reply` | fixed |
 | 63 | net/smtp | `spawn { f(x) }` with `f -> ~T` (T not Unit): bad C, lost value on the JIT | fixed: a checker error asking for `spawn { ~f(x) }` |
 | 64 | net/http/pprof | the JIT didn't resolve `alx_mem_held` / `alx_mem_peak` | fixed |
-| 65 | net/http audit | a `Mutex` captured by a lambda that moves into another task (`f.dup`, a handler in its request task) is copied: updates under `lock` there are lost (JIT and C); `Atomic` and `Chan` share | open (serious) |
+| 65 | net/http audit | a `Mutex` captured by a lambda that moves into another task (`f.dup`, a handler in its request task) is copied: updates under `lock` there are lost (JIT and C); `Atomic` and `Chan` share | fixed by the sync port (D55: copies of closures and structs keep a captured Mutex shared); acceptance case mutexcapture |
 | 66 | httputil | `def f { spawn { 1 } }; t = spawn { f() }` crashes the compiler: "a task handle has no zero value" (`lower.rs` `zero_le`) | open (workaround: explicit `return`) |
 | 67 | cookiejar | `mu.lock { \|s\| if c { s.m.delete(k) } else { s.m[k] = 1 } }`: C emits `v = 0;` for the store arm (typed `Int?`) | open (workaround: end the block with `nil`) |
 | 68 | net/mail | C mistypes a statement `case` whose arms assign locals of different types (as in json-derive.md) | open |

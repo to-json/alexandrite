@@ -33,6 +33,16 @@ pub struct Opts {
     pub rename: Option<String>,
     pub skip: bool,
     pub omit_empty: bool,
+    /// `#[asn1(...)]` options (derive_asn1.rs).
+    pub asn1: crate::derive_asn1::A1,
+}
+
+/// A field or variant attribute: `#[json(...)]` or `#[asn1(...)]`.
+pub fn apply_field_attr(text: &str, sp: Span, o: &mut Opts) -> Result<(), Diag> {
+    if text.trim_start().starts_with("asn1") {
+        return crate::derive_asn1::apply_asn1_attr(text, sp, &mut o.asn1);
+    }
+    apply_json_attr(text, sp, o)
 }
 
 /// Parse the text of one `#[json(...)]` attribute into `o`.
@@ -114,8 +124,8 @@ pub fn derive_names(text: &str, sp: Span) -> Result<Option<Vec<String>>, Diag> {
     let names: Vec<String> = inner.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
     for n in &names {
         // Eq and Show are structural already (D13, D14): accepted, nothing to generate.
-        if !matches!(n.as_str(), "Json" | "Eq" | "Show") {
-            return Err(Diag::new(sp, format!("can't derive `{n}`")).note("derivable: Json (generates to_json / from_json); Eq and Show are accepted and need nothing: structs, tuples and enums already compare and print field by field"));
+        if !matches!(n.as_str(), "Json" | "Asn1" | "Eq" | "Show") {
+            return Err(Diag::new(sp, format!("can't derive `{n}`")).note("derivable: Json (generates to_json / from_json), Asn1 (to_asn1 / from_asn1); Eq and Show are accepted and need nothing: structs, tuples and enums already compare and print field by field"));
         }
     }
     Ok(Some(names))
@@ -144,6 +154,10 @@ pub enum DShape {
 
 #[derive(Clone, Debug)]
 pub struct DeriveJob {
+    /// "Json" or "Asn1".
+    pub which: &'static str,
+    /// Type-level `#[asn1(...)]` options.
+    pub type_opts: crate::derive_asn1::A1,
     pub name: String,
     pub tparams: Vec<String>,
     pub public: bool,

@@ -1,0 +1,429 @@
+# Field parameters and the per-field parsing that Go's parseField does with
+# reflection: the derive's generated code (and the typed unmarshal_*
+# functions) call `head` for the element of a field, then the typed
+# decoder for its contents.
+
+import "math/big"
+import "strconv"
+import "time"
+
+# Go's fieldParameters: the options of one field (its `asn1:"..."` tag).
+pub struct Params {
+  # OPTIONAL: may be absent.
+  optional: Bool
+  # An EXPLICIT tag is in use.
+  explicit: Bool
+  # An APPLICATION tag is in use.
+  application: Bool
+  # A PRIVATE tag is in use.
+  private: Bool
+  # A default value for INTEGER typed fields.
+  default_value: Int?
+  # The EXPLICIT or IMPLICIT tag.
+  tag: Int?
+  # The string tag to use when marshaling (0: chosen from the value).
+  string_type: Int
+  # The time tag to use when marshaling (0: chosen from the value).
+  time_type: Int
+  # Encode as a SET (OF).
+  set: Bool
+  # Omit an empty slice when marshaling.
+  omit_empty: Bool
+
+  # Go's %+v of a fieldParameters (pointers as their values).
+  pub def to_s -> Str {
+    dv = "<nil>"
+    if d = default_value {
+      dv = d.to_s
+    }
+    tg = "<nil>"
+    if t = tag {
+      tg = t.to_s
+    }
+    "{optional:#{optional} explicit:#{explicit} application:#{application} private:#{private} defaultValue:#{dv} tag:#{tg} stringType:#{string_type} timeType:#{time_type} set:#{set} omitEmpty:#{omit_empty}}"
+  }
+}
+
+# Go's parseFieldParameters: the options of a tag string such as
+# "optional,explicit,tag:0". Unknown options are ignored, as in Go.
+pub def parse_field_parameters(s: Str) -> Params {
+  ret = Params.new
+  for part in s.split(",") {
+    if part == "optional" {
+      ret.optional = true
+    } else if part == "explicit" {
+      ret.explicit = true
+      ret.tag = 0 if ret.tag.none?
+    } else if part == "generalized" {
+      ret.time_type = TAG_GENERALIZED_TIME
+    } else if part == "utc" {
+      ret.time_type = TAG_UTC_TIME
+    } else if part == "ia5" {
+      ret.string_type = TAG_IA5_STRING
+    } else if part == "printable" {
+      ret.string_type = TAG_PRINTABLE_STRING
+    } else if part == "numeric" {
+      ret.string_type = TAG_NUMERIC_STRING
+    } else if part == "utf8" {
+      ret.string_type = TAG_UTF8_STRING
+    } else if part.start_with?("default:") {
+      if i = strconv.parse_int(part[8...part.size], 10, 64).ok {
+        ret.default_value = i
+      }
+    } else if part.start_with?("tag:") {
+      if i = strconv.atoi(part[4...part.size]).ok {
+        ret.tag = i
+      }
+    } else if part == "set" {
+      ret.set = true
+    } else if part == "application" {
+      ret.application = true
+      ret.tag = 0 if ret.tag.none?
+    } else if part == "private" {
+      ret.private = true
+      ret.tag = 0 if ret.tag.none?
+    } else if part == "omitempty" {
+      ret.omit_empty = true
+    }
+  }
+  ret
+}
+
+# ---------------------------------------------------------------- kinds
+
+# What a decoder expects (Go's getUniversalType, by Go type).
+pub K_RAW = 0
+pub K_BOOL = 1
+pub K_INT = 2
+pub K_BIT_STRING = 3
+pub K_BYTES = 4
+pub K_OID = 6
+pub K_ENUM = 10
+pub K_SEQUENCE = 16
+pub K_SET = 17
+pub K_STR = 19
+pub K_TIME = 23
+pub K_FLAG = 100
+pub K_ANY = 101
+
+# (match_any, universal tag, compound) of a kind.
+def universal(kind: Int) -> (Bool, Int, Bool) {
+  return (true, -1, false) if kind == K_RAW
+  return (false, TAG_BOOLEAN, false) if kind == K_FLAG
+  return (false, kind, true) if kind == K_SEQUENCE || kind == K_SET
+  (false, kind, false)
+}
+
+# The element of one field, after the explicit tag (if any) is removed.
+pub struct Head {
+  # false: the field is absent (optional); the other fields are unset
+  # except `next`, which is the offset the field started at.
+  present: Bool
+  class: Int
+  tag: Int
+  is_compound: Bool
+  # The universal tag, adjusted for strings and times as in Go.
+  utag: Int
+  # The offsets in the input of the whole element (with the explicit
+  # tag, if any), its contents, and the end of the contents.
+  start: Int
+  body: Int
+  end: Int
+  # The offset after the field.
+  next: Int
+  # The nesting depth of the field (children are parsed below it).
+  depth: Int
+  # An explicit tag of length 0 holding a Flag.
+  empty_explicit: Bool
+}
+
+def absent(off: Int, depth: Int) -> Head { Head.new(present: false, next: off, depth: depth) }
+
+# Go's parseField up to the switch on the Go type: the element for a field
+# of the given kind at bytes[init_offset], applying params. Fails as Go
+# does; an absent optional field gives `present` false. `name` is the
+# type's name for the "tags don't match" error.
+pub def head(bytes: [Byte], init_offset: Int, params: Params, kind: Int, name: Str, depth0: Int) -> ~Head<Asn1Error> {
+  depth = depth0 + 1
+  fail Asn1Error.Structural("nesting depth exceeded") if depth > MAX_DECODE_DEPTH
+  offset = init_offset
+  # If we have run out of data, it may be that there are optional elements at the end.
+  if offset == bytes.size {
+    return absent(init_offset, depth) if params.optional
+    fail Asn1Error.Syntax("sequence truncated")
+  }
+  t, o1 = ~parse_tag_and_length(bytes, offset)
+  offset = o1
+  if params.explicit {
+    expected_class = CLASS_CONTEXT_SPECIFIC
+    expected_class = CLASS_APPLICATION if params.application
+    fail Asn1Error.Structural("explicit tag has no child") if offset == bytes.size
+    if t.class == expected_class && t.tag == (params.tag || 0) && (t.length == 0 || t.is_compound) {
+      if kind == K_RAW {
+        # The inner element should not be parsed for RawValues.
+        nil
+      } else if t.length > 0 {
+        t2, o2 = ~parse_tag_and_length(bytes, offset)
+        t = t2
+        offset = o2
+      } else {
+        fail Asn1Error.Structural("zero length explicit tag was not an asn1.Flag") if kind != K_FLAG
+        return Head.new(present: true, empty_explicit: true, start: init_offset, body: offset, end: offset, next: offset, depth: depth)
+      }
+    } else {
+      # The tags didn't match, it might be an optional element.
+      return absent(init_offset, depth) if params.optional
+      fail Asn1Error.Structural("explicitly tagged member didn't match")
+    }
+  }
+  if kind == K_ANY {
+    # Go's ANY: any element, decoded if it is a known universal type.
+    fail Asn1Error.Syntax("data truncated") if invalid_length?(offset, t.length, bytes.size)
+    return Head.new(present: true, class: t.class, tag: t.tag, is_compound: t.is_compound, utag: t.tag, start: init_offset, body: offset, end: offset + t.length, next: offset + t.length, depth: depth)
+  }
+  match_any, universal_tag, compound_type = universal(kind)
+  # Special case for strings: all the ASN.1 string types map to Str.
+  # universal() returns the tag for PrintableString when it sees a Str,
+  # so if we see a different string type on the wire, we change the
+  # universal type to match.
+  if universal_tag == TAG_PRINTABLE_STRING {
+    if t.class == CLASS_UNIVERSAL {
+      if t.tag == TAG_IA5_STRING || t.tag == TAG_GENERAL_STRING || t.tag == TAG_T61_STRING || t.tag == TAG_UTF8_STRING || t.tag == TAG_NUMERIC_STRING || t.tag == TAG_BMP_STRING {
+        universal_tag = t.tag
+      }
+    } else if params.string_type != 0 {
+      universal_tag = params.string_type
+    }
+  }
+  # Special case for time: UTCTime and GeneralizedTime both map to
+  # time.Time.
+  if universal_tag == TAG_UTC_TIME {
+    if t.class == CLASS_UNIVERSAL {
+      universal_tag = t.tag if t.tag == TAG_GENERALIZED_TIME
+    } else if params.time_type != 0 {
+      universal_tag = params.time_type
+    }
+  }
+  universal_tag = TAG_SET if params.set
+  match_any_class_and_tag = match_any
+  expected_class = CLASS_UNIVERSAL
+  expected_tag = universal_tag
+  if !params.explicit {
+    if tg = params.tag {
+      match_any_class_and_tag = false
+      expected_tag = tg
+      if params.application {
+        expected_class = CLASS_APPLICATION
+      } else if params.private {
+        expected_class = CLASS_PRIVATE
+      } else {
+        expected_class = CLASS_CONTEXT_SPECIFIC
+      }
+    }
+  }
+  # We have unwrapped any explicit tagging at this point.
+  if (!match_any_class_and_tag && (t.class != expected_class || t.tag != expected_tag)) || (!match_any && t.is_compound != compound_type) {
+    # Tags don't match. Again, it could be an optional element.
+    return absent(init_offset, depth) if params.optional
+    fail Asn1Error.Structural("tags don't match (#{expected_tag} vs {class:#{t.class} tag:#{t.tag} length:#{t.length} isCompound:#{t.is_compound}}) #{params.to_s} #{name} @#{offset}")
+  }
+  fail Asn1Error.Syntax("data truncated") if invalid_length?(offset, t.length, bytes.size)
+  Head.new(present: true, class: t.class, tag: t.tag, is_compound: t.is_compound, utag: universal_tag, start: init_offset, body: offset, end: offset + t.length, next: offset + t.length, depth: depth)
+}
+
+# Go's parseSequenceOf's first pass: every element of a SEQUENCE OF / SET
+# OF has the element type's tag. `kind` is the element's kind, or for a
+# derived struct K_SEQUENCE / K_SET (its asn1_utag).
+pub def check_seq_of(bytes: [Byte], kind: Int) -> ~Unit<Asn1Error> {
+  match_any, expected_tag, compound_type = universal(kind)
+  offset = 0
+  while offset < bytes.size {
+    t, o = ~parse_tag_and_length(bytes, offset)
+    offset = o
+    tag = t.tag
+    if tag == TAG_IA5_STRING || tag == TAG_GENERAL_STRING || tag == TAG_T61_STRING || tag == TAG_UTF8_STRING || tag == TAG_NUMERIC_STRING || tag == TAG_BMP_STRING {
+      tag = TAG_PRINTABLE_STRING
+    } else if tag == TAG_GENERALIZED_TIME || tag == TAG_UTC_TIME {
+      tag = TAG_UTC_TIME
+    }
+    if !match_any && (t.class != CLASS_UNIVERSAL || t.is_compound != compound_type || tag != expected_tag) {
+      fail Asn1Error.Structural("sequence tag mismatch")
+    }
+    fail Asn1Error.Syntax("truncated sequence") if invalid_length?(offset, t.length, bytes.size)
+    offset += t.length
+  }
+}
+
+# ---------------------------------------------------------------- typed decoders
+# Each reads one field at b[off] with params p, and returns the value and
+# the offset after the field. An absent optional field gives the zero
+# value (or the default, for integers) and `off`.
+
+pub def dec_bool(b: [Byte], off: Int, p: Params, depth: Int) -> ~(Bool, Int)<Asn1Error> {
+  h = ~head(b, off, p, K_BOOL, "bool", depth)
+  return (false, h.next) if !h.present
+  inner = b[h.body...h.end]
+  (~parse_bool(inner), h.next)
+}
+
+# A Flag (Go's asn1.Flag): true when present.
+pub def dec_flag(b: [Byte], off: Int, p: Params, depth: Int) -> ~(Bool, Int)<Asn1Error> {
+  h = ~head(b, off, p, K_FLAG, "Flag", depth)
+  (h.present, h.next)
+}
+
+pub def dec_int(b: [Byte], off: Int, p: Params, depth: Int) -> ~(Int, Int)<Asn1Error> {
+  h = ~head(b, off, p, K_INT, "int", depth)
+  return (p.default_value || 0, h.next) if !h.present
+  inner = b[h.body...h.end]
+  (~parse_int64(inner), h.next)
+}
+
+# An int32 field (Go's parseInt32 for 4-byte ints).
+pub def dec_int32(b: [Byte], off: Int, p: Params, depth: Int) -> ~(Int, Int)<Asn1Error> {
+  h = ~head(b, off, p, K_INT, "int32", depth)
+  return (p.default_value || 0, h.next) if !h.present
+  inner = b[h.body...h.end]
+  (~parse_int32(inner), h.next)
+}
+
+# An integer field with a range (I8, I16).
+pub def dec_int_range(b: [Byte], off: Int, p: Params, depth: Int, lo: Int, hi: Int) -> ~(Int, Int)<Asn1Error> {
+  v, o = ~dec_int(b, off, p, depth)
+  fail Asn1Error.Structural("integer too large") if v < lo || v > hi
+  (v, o)
+}
+
+# An ENUMERATED field (Go's asn1.Enumerated).
+pub def dec_enumerated(b: [Byte], off: Int, p: Params, depth: Int) -> ~(Int, Int)<Asn1Error> {
+  h = ~head(b, off, p, K_ENUM, "Enumerated", depth)
+  return (p.default_value || 0, h.next) if !h.present
+  inner = b[h.body...h.end]
+  (~parse_int32(inner), h.next)
+}
+
+pub def dec_big(b: [Byte], off: Int, p: Params, depth: Int) -> ~(big.Int, Int)<Asn1Error> {
+  h = ~head(b, off, p, K_INT, "", depth)
+  return (big.Int.new, h.next) if !h.present
+  inner = b[h.body...h.end]
+  (~parse_big_int(inner), h.next)
+}
+
+pub def dec_bytes(b: [Byte], off: Int, p: Params, depth: Int) -> ~([Byte], Int)<Asn1Error> {
+  h = ~head(b, off, p, K_BYTES, "", depth)
+  return ([], h.next) if !h.present
+  (b[h.body...h.end] + [], h.next)
+}
+
+pub def dec_bit_string(b: [Byte], off: Int, p: Params, depth: Int) -> ~(BitString, Int)<Asn1Error> {
+  h = ~head(b, off, p, K_BIT_STRING, "BitString", depth)
+  return (BitString.new, h.next) if !h.present
+  inner = b[h.body...h.end]
+  (~parse_bit_string(inner), h.next)
+}
+
+pub def dec_oid(b: [Byte], off: Int, p: Params, depth: Int) -> ~(ObjectIdentifier, Int)<Asn1Error> {
+  h = ~head(b, off, p, K_OID, "ObjectIdentifier", depth)
+  return (ObjectIdentifier.new, h.next) if !h.present
+  inner = b[h.body...h.end]
+  (~parse_object_identifier(inner), h.next)
+}
+
+pub def dec_time(b: [Byte], off: Int, p: Params, depth: Int) -> ~(time.Time, Int)<Asn1Error> {
+  h = ~head(b, off, p, K_TIME, "Time", depth)
+  return (time.Time.new, h.next) if !h.present
+  if h.utag == TAG_UTC_TIME {
+    inner = b[h.body...h.end]
+    return (~parse_utc_time(inner), h.next)
+  }
+  inner = b[h.body...h.end]
+  (~parse_generalized_time(inner), h.next)
+}
+
+pub def dec_str(b: [Byte], off: Int, p: Params, depth: Int) -> ~(Str, Int)<Asn1Error> {
+  h = ~head(b, off, p, K_STR, "string", depth)
+  return ("", h.next) if !h.present
+  inner = b[h.body...h.end]
+  ut = h.utag
+  v = ""
+  if ut == TAG_PRINTABLE_STRING {
+    v = ~parse_printable_string(inner)
+  } else if ut == TAG_NUMERIC_STRING {
+    v = ~parse_numeric_string(inner)
+  } else if ut == TAG_IA5_STRING {
+    v = ~parse_ia5_string(inner)
+  } else if ut == TAG_T61_STRING {
+    v = parse_t61_string(inner)
+  } else if ut == TAG_UTF8_STRING {
+    v = ~parse_utf8_string(inner)
+  } else if ut == TAG_GENERAL_STRING {
+    # GeneralString is specified in ISO-2022/ECMA-35, A brief review
+    # suggests that it includes structures that allow the encoding to
+    # change midstring and such. We give up and pass it as an 8-bit string.
+    v = parse_t61_string(inner)
+  } else if ut == TAG_BMP_STRING {
+    v = ~parse_bmp_string(inner)
+  } else {
+    fail Asn1Error.Syntax("internal error: unknown string type #{ut}")
+  }
+  (v, h.next)
+}
+
+pub def dec_raw(b: [Byte], off: Int, p: Params, depth: Int) -> ~(RawValue, Int)<Asn1Error> {
+  h = ~head(b, off, p, K_RAW, "RawValue", depth)
+  return (RawValue.new, h.next) if !h.present
+  (RawValue.new(class: h.class, tag: h.tag, is_compound: h.is_compound, bytes: b[h.body...h.end] + [], full_bytes: b[h.start...h.end] + []), h.next)
+}
+
+# Go's ANY (an interface{} field): the value of a known universal
+# primitive, else Any.Nil.
+pub def dec_any(b: [Byte], off: Int, p: Params, depth: Int) -> ~(Any, Int)<Asn1Error> {
+  h = ~head(b, off, p, K_ANY, "", depth)
+  return (Any.Nil, h.next) if !h.present
+  return (Any.Nil, h.next) if h.is_compound || h.class != CLASS_UNIVERSAL
+  inner = b[h.body...h.end]
+  t = h.tag
+  r = Any.Nil
+  if t == TAG_BOOLEAN {
+    r = Any.Bool(~parse_bool(inner))
+  } else if t == TAG_PRINTABLE_STRING {
+    r = Any.Str(~parse_printable_string(inner))
+  } else if t == TAG_NUMERIC_STRING {
+    r = Any.Str(~parse_numeric_string(inner))
+  } else if t == TAG_IA5_STRING {
+    r = Any.Str(~parse_ia5_string(inner))
+  } else if t == TAG_T61_STRING {
+    r = Any.Str(parse_t61_string(inner))
+  } else if t == TAG_UTF8_STRING {
+    r = Any.Str(~parse_utf8_string(inner))
+  } else if t == TAG_INTEGER {
+    r = Any.Int(~parse_int64(inner))
+  } else if t == TAG_BIT_STRING {
+    r = Any.BitString(~parse_bit_string(inner))
+  } else if t == TAG_OID {
+    r = Any.Oid(~parse_object_identifier(inner))
+  } else if t == TAG_UTC_TIME {
+    r = Any.Time(~parse_utc_time(inner))
+  } else if t == TAG_GENERALIZED_TIME {
+    r = Any.Time(~parse_generalized_time(inner))
+  } else if t == TAG_OCTET_STRING {
+    r = Any.Bytes(inner + [])
+  } else if t == TAG_BMP_STRING {
+    r = Any.Str(~parse_bmp_string(inner))
+  }
+  (r, h.next)
+}
+
+# ---------------------------------------------------------------- zero values
+# Go omits an optional field holding its zero value (the derived code asks).
+
+pub def zero_bit_string?(b: BitString) -> Bool { b.bytes.size == 0 && b.bit_length == 0 }
+
+pub def zero_raw?(r: RawValue) -> Bool { r.class == 0 && r.tag == 0 && !r.is_compound && r.bytes.size == 0 && r.full_bytes.size == 0 }
+
+pub def zero_any?(a: Any) -> Bool {
+  case a {
+    Nil => true
+    _ => false
+  }
+}

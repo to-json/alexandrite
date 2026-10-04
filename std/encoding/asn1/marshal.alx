@@ -1,0 +1,448 @@
+# Marshalling (Go's marshal.go). Go builds a tree of encoders and writes it
+# once; here every element is built as bytes directly: body, then `wrap`
+# (Go's makeField after makeBody) prepends the tag and length and applies
+# the field's implicit / explicit tagging.
+
+import "bytes"
+import "math/big"
+import "slices"
+import "time"
+import "unicode/utf8"
+
+# ---------------------------------------------------------------- bodies
+
+# Go's int64Encoder: the minimal two's-complement big-endian bytes of i.
+def int64_bytes(i: Int) -> [Byte] {
+  n = 1
+  j = i
+  while j > 127 {
+    n += 1
+    j = j >> 8
+  }
+  while j < -128 {
+    n += 1
+    j = j >> 8
+  }
+  out = [0.as_u8; n]
+  k = 0
+  while k < n {
+    out[k] = (i >> ((n - 1 - k) * 8)).as_u8
+    k += 1
+  }
+  out
+}
+
+def base128_int_length(n: Int) -> Int {
+  return 1 if n == 0
+  l = 0
+  i = n
+  while i > 0 {
+    l += 1
+    i = i >> 7
+  }
+  l
+}
+
+def append_base128_int(dst: [Byte], n: Int) -> [Byte] {
+  out = dst
+  l = base128_int_length(n)
+  i = l - 1
+  while i >= 0 {
+    o = (n >> (i * 7)).as_u8 & 0x7f
+    o = o | 0x80 if i != 0
+    out << o
+    i -= 1
+  }
+  out
+}
+
+# Go's makeBigInt: the minimal two's-complement big-endian bytes of n.
+def big_int_bytes(n: big.Int) -> [Byte] {
+  if n.sign < 0 {
+    # A negative number has to be converted to two's-complement form. So
+    # we'll invert and subtract 1. If the most-significant-bit isn't set
+    # then we'll need to pad the beginning with 0xff in order to keep the
+    # number negative.
+    n_minus1 = big.Int.new
+    n_minus1.neg!(n)
+    n_minus1.sub!(n_minus1, big.new_int(1))
+    bs = n_minus1.bytes
+    i = 0
+    while i < bs.size {
+      bs[i] = bs[i] ^ 0xff
+      i += 1
+    }
+    return [0xff.as_u8] + bs if bs.size == 0 || bs[0] & 0x80 == 0
+    return bs
+  }
+  return [0.as_u8] if n.sign == 0
+  bs = n.bytes
+  return [0.as_u8] + bs if bs.size > 0 && bs[0] & 0x80 != 0
+  bs
+}
+
+def append_length(dst: [Byte], i: Int) -> [Byte] {
+  out = dst
+  n = length_length(i)
+  while n > 0 {
+    out << (i >> ((n - 1) * 8)).as_u8
+    n -= 1
+  }
+  out
+}
+
+def length_length(i: Int) -> Int {
+  num_bytes = 1
+  j = i
+  while j > 255 {
+    num_bytes += 1
+    j = j >> 8
+  }
+  num_bytes
+}
+
+# Go's appendTagAndLength.
+pub def append_tag_and_length(dst: [Byte], t: TagAndLength) -> [Byte] {
+  out = dst
+  b = (t.class << 6).as_u8
+  b = b | 0x20 if t.is_compound
+  if t.tag >= 31 {
+    out << (b | 0x1f)
+    out = append_base128_int(out, t.tag)
+  } else {
+    out << (b | t.tag.as_u8)
+  }
+  if t.length >= 128 {
+    l = length_length(t.length)
+    out << (0x80 | l.as_u8)
+    out = append_length(out, t.length)
+  } else {
+    out << t.length.as_u8
+  }
+  out
+}
+
+def header(class: Int, tag: Int, length: Int, compound: Bool) -> [Byte] {
+  append_tag_and_length([], TagAndLength.new(class: class, tag: tag, length: length, is_compound: compound))
+}
+
+def oid_body(oid: [Int]) -> ~[Byte]<Asn1Error> {
+  if oid.size < 2 || oid[0] > 2 || (oid[0] < 2 && oid[1] >= 40) {
+    fail Asn1Error.Structural("invalid object identifier")
+  }
+  out = append_base128_int([], oid[0] * 40 + oid[1])
+  i = 2
+  while i < oid.size {
+    out = append_base128_int(out, oid[i])
+    i += 1
+  }
+  out
+}
+
+def printable_body(s: Str) -> ~[Byte]<Asn1Error> {
+  i = 0
+  while i < s.size {
+    # The asterisk is often used in PrintableString, even though it is
+    # invalid. If a PrintableString was specifically requested then the
+    # asterisk is permitted by this code. Ampersand is allowed in parsing
+    # due a handful of CA certificates, however when making new
+    # certificates it is rejected.
+    fail Asn1Error.Structural("PrintableString contains invalid character") if !printable?(s[i], true, false)
+    i += 1
+  }
+  s.bytes
+}
+
+def ia5_body(s: Str) -> ~[Byte]<Asn1Error> {
+  i = 0
+  while i < s.size {
+    fail Asn1Error.Structural("IA5String contains invalid character") if s[i] > 127
+    i += 1
+  }
+  s.bytes
+}
+
+def numeric_body(s: Str) -> ~[Byte]<Asn1Error> {
+  i = 0
+  while i < s.size {
+    fail Asn1Error.Structural("NumericString contains invalid character") if !numeric?(s[i])
+    i += 1
+  }
+  s.bytes
+}
+
+def two_digits(dst: [Byte], v: Int) -> [Byte] {
+  out = dst
+  out << (48 + (v / 10) % 10).as_u8
+  out << (48 + v % 10).as_u8
+  out
+}
+
+def four_digits(dst: [Byte], v: Int) -> [Byte] {
+  out = dst
+  out << (48 + (v / 1000) % 10).as_u8
+  out << (48 + (v / 100) % 10).as_u8
+  out << (48 + (v / 10) % 10).as_u8
+  out << (48 + v % 10).as_u8
+  out
+}
+
+def outside_utc_range?(t: time.Time) -> Bool {
+  year = t.year
+  year < 1950 || year >= 2050
+}
+
+def utc_time_body(t: time.Time) -> ~[Byte]<Asn1Error> {
+  year = t.year
+  dst: [Byte] = []
+  if year >= 1950 && year < 2000 {
+    dst = two_digits(dst, year - 1900)
+  } else if year >= 2000 && year < 2050 {
+    dst = two_digits(dst, year - 2000)
+  } else {
+    fail Asn1Error.Structural("cannot represent time as UTCTime")
+  }
+  time_common(dst, t)
+}
+
+def generalized_time_body(t: time.Time) -> ~[Byte]<Asn1Error> {
+  year = t.year
+  fail Asn1Error.Structural("cannot represent time as GeneralizedTime") if year < 0 || year > 9999
+  time_common(four_digits([], year), t)
+}
+
+def time_common(dst: [Byte], t: time.Time) -> [Byte] {
+  out = two_digits(dst, t.month)
+  out = two_digits(out, t.day)
+  out = two_digits(out, t.hour)
+  out = two_digits(out, t.minute)
+  out = two_digits(out, t.second)
+  _, offset = t.zone_info
+  if offset / 60 == 0 {
+    out << 90
+    return out
+  }
+  if offset > 0 {
+    out << 43
+  } else {
+    out << 45
+  }
+  offset_minutes = offset / 60
+  offset_minutes = -offset_minutes if offset_minutes < 0
+  out = two_digits(out, offset_minutes / 60)
+  two_digits(out, offset_minutes % 60)
+}
+
+def bit_string_body(b: BitString) -> [Byte] {
+  [((8 - b.bit_length % 8) % 8).as_u8] + b.bytes
+}
+
+# Go's stripTagAndLength.
+def strip_tag_and_length(input: [Byte]) -> [Byte] {
+  r = parse_tag_and_length(input, 0)
+  if v = r.ok {
+    return input[v[1]...input.size]
+  }
+  input
+}
+
+# ---------------------------------------------------------------- wrap
+
+# Go's makeField after the body is made: the element with universal tag
+# `tag`, applying the params' SET, implicit and explicit tagging.
+pub def wrap(body: [Byte], tag0: Int, is_compound: Bool, params: Params) -> ~[Byte]<Asn1Error> {
+  tag = tag0
+  if params.set {
+    fail Asn1Error.Structural("non sequence tagged as set") if tag != TAG_SEQUENCE
+    tag = TAG_SET
+  }
+  class = CLASS_UNIVERSAL
+  if t = params.tag {
+    if params.application {
+      class = CLASS_APPLICATION
+    } else if params.private {
+      class = CLASS_PRIVATE
+    } else {
+      class = CLASS_CONTEXT_SPECIFIC
+    }
+    if params.explicit {
+      inner = header(CLASS_UNIVERSAL, tag, body.size, is_compound) + body
+      return header(class, t, inner.size, true) + inner
+    }
+    # implicit tag.
+    tag = t
+  }
+  header(class, tag, body.size, is_compound) + body
+}
+
+# Go's makeField checks for a non-time / non-string value given a time or
+# string type.
+def no_time_type(p: Params) -> ~Unit<Asn1Error> {
+  fail Asn1Error.Structural("explicit time type given to non-time member") if p.time_type != 0
+}
+
+def no_string_type(p: Params) -> ~Unit<Asn1Error> {
+  fail Asn1Error.Structural("explicit string type given to non-string member") if p.string_type != 0
+}
+
+def plain(p: Params) -> ~Unit<Asn1Error> {
+  ~no_time_type(p)
+  ~no_string_type(p)
+}
+
+# ---------------------------------------------------------------- typed encoders
+# Each makes the element of one value with params p (Go's makeField on a
+# value of that type). Omission of optional zero values is the caller's
+# (the derived code checks the field).
+
+pub def enc_bool(v: Bool, p: Params) -> ~[Byte]<Asn1Error> {
+  ~plain(p)
+  ~wrap([v ? 0xff.as_u8 : 0.as_u8], TAG_BOOLEAN, false, p)
+}
+
+# A Flag: an empty BOOLEAN element (normally implicitly tagged).
+pub def enc_flag(_v: Bool, p: Params) -> ~[Byte]<Asn1Error> {
+  ~plain(p)
+  ~wrap([], TAG_BOOLEAN, false, p)
+}
+
+pub def enc_int(v: Int, p: Params) -> ~[Byte]<Asn1Error> {
+  ~plain(p)
+  ~wrap(int64_bytes(v), TAG_INTEGER, false, p)
+}
+
+pub def enc_enumerated(v: Int, p: Params) -> ~[Byte]<Asn1Error> {
+  ~plain(p)
+  ~wrap(int64_bytes(v), TAG_ENUM, false, p)
+}
+
+pub def enc_big(v: big.Int, p: Params) -> ~[Byte]<Asn1Error> {
+  ~plain(p)
+  ~wrap(big_int_bytes(v), TAG_INTEGER, false, p)
+}
+
+pub def enc_bytes(v: [Byte], p: Params) -> ~[Byte]<Asn1Error> {
+  ~plain(p)
+  ~wrap(v, TAG_OCTET_STRING, false, p)
+}
+
+pub def enc_bit_string(v: BitString, p: Params) -> ~[Byte]<Asn1Error> {
+  ~plain(p)
+  ~wrap(bit_string_body(v), TAG_BIT_STRING, false, p)
+}
+
+pub def enc_oid(v: ObjectIdentifier, p: Params) -> ~[Byte]<Asn1Error> {
+  ~plain(p)
+  ~wrap(~oid_body(v.arcs), TAG_OID, false, p)
+}
+
+pub def enc_time(v: time.Time, p: Params) -> ~[Byte]<Asn1Error> {
+  ~no_string_type(p)
+  if p.time_type == TAG_GENERALIZED_TIME || outside_utc_range?(v) {
+    return ~wrap(~generalized_time_body(v), TAG_GENERALIZED_TIME, false, p)
+  }
+  ~wrap(~utc_time_body(v), TAG_UTC_TIME, false, p)
+}
+
+# A Str: a PrintableString if it can be one, else a UTF8String, unless
+# the params ask for a string type.
+pub def enc_str(v: Str, p: Params) -> ~[Byte]<Asn1Error> {
+  ~no_time_type(p)
+  tag = TAG_PRINTABLE_STRING
+  if p.string_type == 0 {
+    # This is a string without an explicit string type. We'll use a
+    # PrintableString if the character set in the string is sufficiently
+    # limited, otherwise we'll use a UTF8String.
+    i = 0
+    while i < v.size {
+      if v[i] >= 0x80 || !printable?(v[i], false, false) {
+        fail Asn1Error.Structural("invalid UTF-8") if !utf8.valid_string(v)
+        tag = TAG_UTF8_STRING
+        break
+      }
+      i += 1
+    }
+  } else {
+    tag = p.string_type
+  }
+  body: [Byte] = []
+  if p.string_type == TAG_IA5_STRING {
+    body = ~ia5_body(v)
+  } else if p.string_type == TAG_PRINTABLE_STRING {
+    body = ~printable_body(v)
+  } else if p.string_type == TAG_NUMERIC_STRING {
+    body = ~numeric_body(v)
+  } else {
+    body = v.bytes
+  }
+  ~wrap(body, tag, false, p)
+}
+
+# Go's makeField for a RawValue: its FullBytes if set, else its own
+# class, tag and Bytes (the params' tagging doesn't apply).
+pub def enc_raw(v: RawValue, _p: Params) -> ~[Byte]<Asn1Error> {
+  return v.full_bytes if v.full_bytes.size != 0
+  header(v.class, v.tag, v.bytes.size, v.is_compound) + v.bytes
+}
+
+# An Any (Go's interface{} holding one of the decoded types).
+pub def enc_any(v: Any, p: Params) -> ~[Byte]<Asn1Error> {
+  r: [Byte] = []
+  case v {
+    Nil => {
+      fail Asn1Error.Structural("empty value")
+    }
+    Bool(b) => {
+      r = ~enc_bool(b, p)
+    }
+    Int(i) => {
+      r = ~enc_int(i, p)
+    }
+    Str(s) => {
+      r = ~enc_str(s, p)
+    }
+    BitString(b) => {
+      r = ~enc_bit_string(b, p)
+    }
+    Oid(o) => {
+      r = ~enc_oid(o, p)
+    }
+    Time(t) => {
+      r = ~enc_time(t, p)
+    }
+    Bytes(b) => {
+      r = ~enc_bytes(b, p)
+    }
+  }
+  r
+}
+
+# The SEQUENCE OF / SET OF holding the encoded elements: Go's makeBody for
+# a slice (a SET OF is sorted, as DER requires), then makeField's tagging.
+# `set` is a SET OF type (Go's slice type named ...SET).
+pub def enc_list(elems: [[Byte]], set: Bool, p: Params) -> ~[Byte]<Asn1Error> {
+  ~plain(p)
+  is_set = set || p.set
+  parts = elems
+  if is_set && parts.size > 1 {
+    parts = elems + []
+    slices.sort_func(parts) { |a, b| bytes.compare(a, b) }
+  }
+  body: [Byte] = []
+  for e in parts {
+    body = body + e
+  }
+  q = p
+  q.set = false
+  ~wrap(body, is_set ? TAG_SET : TAG_SEQUENCE, true, q)
+}
+
+# The element of a struct whose fields encode as `body` (derived code).
+pub def enc_struct(body: [Byte], p: Params) -> ~[Byte]<Asn1Error> {
+  ~plain(p)
+  ~wrap(body, TAG_SEQUENCE, true, p)
+}
+
+# The body of a struct whose raw_content field is set: those bytes without
+# their tag and length (Go's makeBody with a RawContent).
+pub def raw_content_body(raw: [Byte]) -> [Byte] { strip_tag_and_length(raw) }

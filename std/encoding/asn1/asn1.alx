@@ -1,0 +1,540 @@
+# Package asn1: Go's encoding/asn1, the parsing and serialisation of
+# DER-encoded ASN.1 data structures (ITU-T X.690) as used by X.509.
+#
+# Go's Marshal and Unmarshal walk a value with reflection and read the
+# field tags (`asn1:"optional,explicit,tag:0"`). alx has no reflection
+# (GO-VS-RUBY S3): a struct says `#[derive(Asn1)]` and its fields carry
+# the same options as attributes; the compiler writes the encoder and the
+# decoder (compiler/src/derive.rs, D59). Values that aren't derived
+# structs (an Int, a Str, a [Byte], ...) have typed functions.
+#
+#   Go                                        alx
+#   type T struct { A int `asn1:"tag:1"` }    #[derive(Asn1)] struct T { #[asn1(tag: 1)] a: Int }
+#   Marshal(v)                                v.to_asn1 / marshal(v) -> ~[Byte]   (derived T)
+#   MarshalWithParams(v, "set")               v.to_asn1_with_params("set") / marshal_with_params(v, "set")
+#   Unmarshal(b, &v) (rest, err)              T.from_asn1(b) / unmarshal[T](b) -> ~(T, [Byte])  (value, rest)
+#   UnmarshalWithParams(b, &v, params)        T.from_asn1_with_params(b, params) / unmarshal_with_params[T]
+#   Marshal(int64 / string / []byte / ...)    marshal_int / marshal_str / marshal_bytes / marshal_bool /
+#                                             marshal_big / marshal_oid / marshal_bit_string /
+#                                             marshal_time / marshal_raw / marshal_any / marshal_enumerated /
+#                                             marshal_strs / marshal_ints (all also *_with_params)
+#   Unmarshal(b, &int / &string / ...)        unmarshal_int / unmarshal_str / ... -> ~(T, [Byte])
+#   BitString{Bytes, BitLength}               BitString{bytes, bit_length}; at(i), right_align
+#   ObjectIdentifier ([]int)                  ObjectIdentifier{arcs: [Int]}; equal?(o), to_s / string
+#   Enumerated (int) / Flag (bool)            Int / Bool fields with #[asn1(enumerated)] / #[asn1(flag)]
+#   RawValue{Class, Tag, IsCompound, Bytes,   RawValue{class, tag, is_compound, bytes, full_bytes}
+#     FullBytes}
+#   RawContent ([]byte, first field)          a [Byte] first field with #[asn1(raw_content)]
+#   NullRawValue / NullBytes                  null_raw_value() / null_bytes()
+#   interface{} (ANY)                         Any (an enum: Nil, Bool, Int, Str, BitString, Oid,
+#                                             Time, Bytes)
+#   *big.Int                                  big.Int (big.Int? for an optional one)
+#   time.Time                                 time.Time
+#   StructuralError{Msg} / SyntaxError{Msg}   Asn1Error.Structural(msg) / Syntax(msg) (Go's messages);
+#                                             errors.New / fmt.Errorf ones are Asn1Error.Other(msg)
+#   TagBoolean ... TagBMPString               TAG_BOOLEAN ... TAG_BMP_STRING
+#   ClassUniversal ... ClassPrivate           CLASS_UNIVERSAL ... CLASS_PRIVATE
+#
+# The derive. `#[derive(Asn1)]` on a struct writes
+#
+#   def asn1_enc(p: asn1.Params) -> ~[Byte]       the element (Go's makeField)
+#   def self.asn1_dec(b, off, p, depth) -> ~(T, Int)  one element at b[off] (Go's parseField)
+#   def self.asn1_utag -> Int                     TAG_SEQUENCE (TAG_SET for #[asn1(set)] types)
+#   def to_asn1 / to_asn1_with_params(s)          Marshal / MarshalWithParams
+#   def self.from_asn1(b) / from_asn1_with_params(b, s)   Unmarshal / UnmarshalWithParams
+#
+# Field attributes are Go's tag options, comma separated: optional,
+# explicit, application, private, tag: N (or tag:N), default: N, set,
+# omit_empty (or omitempty), utf8, ia5, printable, numeric, utc,
+# generalized; plus enumerated and flag on Int / Bool fields (Go's types
+# Enumerated and Flag), raw_content on a first [Byte] field (Go's
+# RawContent) and skip (the field isn't encoded; Go would refuse an
+# unexported field). Field types: Bool, Int, I8..I64, Str, [Byte],
+# big.Int, time.Time, asn1.BitString, asn1.ObjectIdentifier,
+# asn1.RawValue, asn1.Any, other derived structs, [T] of any of these
+# (SEQUENCE OF, or SET OF with `set`), and T? (absent = none).
+#
+# A type-level `#[asn1(set)]` or `#[asn1(transparent)]` next to the derive
+# makes a one-field struct stand for that field's slice: Go's named slice
+# types (`type RDNSequence []RelativeDistinguishedNameSET`, where a name
+# ending in SET makes a SET OF). See crypto/x509/pkix.
+#
+# Differences from Go:
+#   - Values that have no reflection are handled at compile time: a
+#     struct that doesn't derive Asn1 can't be marshalled, and Go's
+#     run-time errors for unsupported Go types ("unknown Go type",
+#     "struct contains unexported fields", Unmarshal's non-pointer
+#     recipient) are compile errors or can't happen.
+#   - Recursive types can't exist in alx (a value can't contain itself),
+#     so Go's nesting-limit tests have no counterpart; the depth limit
+#     (10,000) is still checked.
+#   - An optional field is omitted when it holds its zero value, as in
+#     Go; for slices, an empty slice counts as zero (alx has no nil
+#     slices; Go would encode an empty non-nil slice). A big.Int has no
+#     nil: use big.Int? for a field that can be absent (a plain big.Int
+#     is never omitted; Go's nil *big.Int fails with "empty integer").
+#   - T? fields: none is omitted when marshalling; absent decodes as none.
+#   - Unsigned integer fields aren't supported (as in Go). I8 and I16
+#     fields decode with Go's int64 rules and a range check (Go refuses
+#     them as unsupported).
+#   - Error text: "tags don't match" prints the params' pointers as
+#     their values (Go prints addresses), and the type name is the alx
+#     name of the field's type.
+#   - Time parsing errors carry time.ParseError's message (Go's differs
+#     slightly for some inputs).
+
+import "math/big"
+import "strconv"
+import "time"
+import "unicode/utf8"
+import "unicode/utf16"
+
+# ---------------------------------------------------------------- constants
+
+# ASN.1 tags represent the type of the following object.
+pub TAG_BOOLEAN = 1
+pub TAG_INTEGER = 2
+pub TAG_BIT_STRING = 3
+pub TAG_OCTET_STRING = 4
+pub TAG_NULL = 5
+pub TAG_OID = 6
+pub TAG_ENUM = 10
+pub TAG_UTF8_STRING = 12
+pub TAG_SEQUENCE = 16
+pub TAG_SET = 17
+pub TAG_NUMERIC_STRING = 18
+pub TAG_PRINTABLE_STRING = 19
+pub TAG_T61_STRING = 20
+pub TAG_IA5_STRING = 22
+pub TAG_UTC_TIME = 23
+pub TAG_GENERALIZED_TIME = 24
+pub TAG_GENERAL_STRING = 27
+pub TAG_BMP_STRING = 30
+
+# ASN.1 class types represent the namespace of the tag.
+pub CLASS_UNIVERSAL = 0
+pub CLASS_APPLICATION = 1
+pub CLASS_CONTEXT_SPECIFIC = 2
+pub CLASS_PRIVATE = 3
+
+MAX_DECODE_DEPTH = 10000
+
+# ---------------------------------------------------------------- errors
+
+pub error Asn1Error {
+  # The data is valid ASN.1 but doesn't fit the value (Go's StructuralError).
+  Structural(msg: Str)
+  # The data isn't valid ASN.1 (Go's SyntaxError).
+  Syntax(msg: Str)
+  # Go's errors.New / fmt.Errorf errors, with their full text.
+  Other(msg: Str)
+
+  def message -> Str {
+    case self {
+      Structural(m) => "asn1: structure error: " + m
+      Syntax(m) => "asn1: syntax error: " + m
+      Other(m) => m
+    }
+  }
+}
+
+# ---------------------------------------------------------------- BOOLEAN
+
+def parse_bool(bytes: [Byte]) -> ~Bool<Asn1Error> {
+  fail Asn1Error.Syntax("invalid boolean") if bytes.size != 1
+  return false if bytes[0] == 0
+  return true if bytes[0] == 0xff
+  fail Asn1Error.Syntax("invalid boolean")
+}
+
+# ---------------------------------------------------------------- INTEGER
+
+# Go's checkInteger: an INTEGER's contents are at least one octet and
+# minimally encoded.
+def check_integer(bytes: [Byte]) -> ~Unit<Asn1Error> {
+  fail Asn1Error.Structural("empty integer") if bytes.size == 0
+  return if bytes.size == 1
+  if (bytes[0] == 0 && bytes[1] & 0x80 == 0) || (bytes[0] == 0xff && bytes[1] & 0x80 == 0x80) {
+    fail Asn1Error.Structural("integer not minimally-encoded")
+  }
+}
+
+# Go's parseInt64: a two's-complement big-endian integer of at most 8 bytes.
+def parse_int64(bytes: [Byte]) -> ~Int<Asn1Error> {
+  ~check_integer(bytes)
+  fail Asn1Error.Structural("integer too large") if bytes.size > 8
+  ret: U64 = 0
+  for b in bytes {
+    ret = (ret << 8) | b.to_u64
+  }
+  # Shift up and down in order to sign extend the result.
+  sh = 64 - bytes.size * 8
+  ((ret << sh).as_i64) >> sh
+}
+
+# Go's parseInt32: like parse_int64, but the result must fit 32 bits.
+def parse_int32(bytes: [Byte]) -> ~Int<Asn1Error> {
+  ~check_integer(bytes)
+  v = ~parse_int64(bytes)
+  fail Asn1Error.Structural("integer too large") if v < -2147483648 || v > 2147483647
+  v
+}
+
+# Go's parseBigInt: a two's-complement big-endian integer of any size.
+def parse_big_int(bytes: [Byte]) -> ~big.Int<Asn1Error> {
+  ~check_integer(bytes)
+  ret = big.Int.new
+  if bytes.size > 0 && bytes[0] & 0x80 == 0x80 {
+    # This is a negative number.
+    not_bytes = [0.as_u8; bytes.size]
+    i = 0
+    while i < bytes.size {
+      not_bytes[i] = ^bytes[i]
+      i += 1
+    }
+    ret.set_bytes!(not_bytes)
+    ret.add!(ret, big.new_int(1))
+    ret.neg!(ret)
+    return ret
+  }
+  ret.set_bytes!(bytes)
+  ret
+}
+
+# ---------------------------------------------------------------- BIT STRING
+
+# BitString is the structure to use when you want an ASN.1 BIT STRING
+# type. A bit string is padded up to the nearest byte in memory and the
+# number of valid bits is recorded. Padding bits will be zero.
+pub struct BitString {
+  # The bits packed into bytes.
+  bytes: [Byte]
+  # The length in bits.
+  bit_length: Int
+
+  # The bit at the given index. If the index is out of range it returns 0.
+  pub def at(i: Int) -> Int {
+    return 0 if i < 0 || i >= bit_length
+    x = i / 8
+    y = 7 - i % 8
+    (self.bytes[x] >> y).to_i & 1
+  }
+
+  # The slice where the padding bits are at the beginning. The slice may
+  # share memory with the BitString.
+  pub def right_align -> [Byte] {
+    shift = 8 - bit_length % 8
+    return self.bytes if shift == 8 || self.bytes.size == 0
+    a = [0.as_u8; self.bytes.size]
+    a[0] = self.bytes[0] >> shift
+    i = 1
+    while i < self.bytes.size {
+      a[i] = (self.bytes[i - 1] << (8 - shift)) | (self.bytes[i] >> shift)
+      i += 1
+    }
+    a
+  }
+}
+
+# Go's parseBitString.
+def parse_bit_string(bytes: [Byte]) -> ~BitString<Asn1Error> {
+  fail Asn1Error.Syntax("zero length BIT STRING") if bytes.size == 0
+  padding_bits = bytes[0].to_i
+  if padding_bits > 7 || (bytes.size == 1 && padding_bits > 0) || bytes[bytes.size - 1].to_i & ((1 << padding_bits) - 1) != 0 {
+    fail Asn1Error.Syntax("invalid padding bits in BIT STRING")
+  }
+  BitString.new(bytes: bytes[1...bytes.size], bit_length: (bytes.size - 1) * 8 - padding_bits)
+}
+
+# ---------------------------------------------------------------- NULL
+
+# The RawValue of a NULL (Go's NullRawValue).
+pub def null_raw_value -> RawValue { RawValue.new(tag: TAG_NULL) }
+
+# The DER encoding of a NULL (Go's NullBytes).
+pub def null_bytes -> [Byte] { [TAG_NULL.as_u8, 0] }
+
+# ---------------------------------------------------------------- OBJECT IDENTIFIER
+
+# An ASN.1 OBJECT IDENTIFIER: Go's ObjectIdentifier ([]int).
+pub struct ObjectIdentifier {
+  arcs: [Int]
+
+  # Whether two OIDs are the same.
+  pub def equal?(other: ObjectIdentifier) -> Bool { arcs == other.arcs }
+
+  # The dotted form ("1.2.840.113549").
+  pub def to_s -> Str { arcs.map { it.to_s }.to_a.join(".") }
+  pub def string -> Str { self.to_s }
+  pub def size -> Int { arcs.size }
+}
+
+# An ObjectIdentifier from its arcs.
+pub def oid(arcs: [Int]) -> ObjectIdentifier { ObjectIdentifier.new(arcs: arcs) }
+
+# Go's parseObjectIdentifier: an OBJECT IDENTIFIER's contents.
+def parse_object_identifier(bytes: [Byte]) -> ~ObjectIdentifier<Asn1Error> {
+  fail Asn1Error.Syntax("zero length OBJECT IDENTIFIER") if bytes.size == 0
+  s: [Int] = []
+  # The first varint is 40*value1 + value2: according to this packing,
+  # value1 can take the values 0, 1 and 2 only. When value1 = 0 or
+  # value1 = 1, then value2 is <= 39. When value1 = 2, then there are no
+  # restrictions on value2.
+  v, offset = ~parse_base128_int(bytes, 0)
+  if v < 80 {
+    s << v / 40
+    s << v % 40
+  } else {
+    s << 2
+    s << v - 80
+  }
+  while offset < bytes.size {
+    w, o2 = ~parse_base128_int(bytes, offset)
+    s << w
+    offset = o2
+  }
+  ObjectIdentifier.new(arcs: s)
+}
+
+# Go's parseBase128Int: a base-128 encoded int at bytes[off], and the
+# offset after it. The value must fit 31 bits.
+def parse_base128_int(bytes: [Byte], init_offset: Int) -> ~(Int, Int)<Asn1Error> {
+  offset = init_offset
+  ret64 = 0
+  shifted = 0
+  while offset < bytes.size {
+    fail Asn1Error.Structural("base 128 integer too large") if shifted == 5
+    ret64 = ret64 << 7
+    b = bytes[offset]
+    # integers should be minimally encoded, so the leading octet should
+    # never be 0x80
+    fail Asn1Error.Syntax("integer is not minimally encoded") if shifted == 0 && b == 0x80
+    ret64 = ret64 | (b & 0x7f).to_i
+    offset += 1
+    if b & 0x80 == 0 {
+      fail Asn1Error.Structural("base 128 integer too large") if ret64 > 2147483647
+      return (ret64, offset)
+    }
+    shifted += 1
+  }
+  fail Asn1Error.Syntax("truncated base 128 integer")
+}
+
+# ---------------------------------------------------------------- times
+
+# Go's parseUTCTime.
+def parse_utc_time(bytes: [Byte]) -> ~time.Time<Asn1Error> {
+  s = Str.from_bytes(bytes)
+  format_str = "0601021504Z0700"
+  r = time.parse(format_str, s)
+  if !r.ok? {
+    format_str = "060102150405Z0700"
+    r = time.parse(format_str, s)
+  }
+  if e = r.err {
+    fail Asn1Error.Other(e.message)
+  }
+  ret = r.unwrap
+  serialized = ret.format(format_str)
+  if serialized != s {
+    fail Asn1Error.Other("asn1: time did not serialize back to the original value and may be invalid: given #{strconv.quote(s)}, but serialized as #{strconv.quote(serialized)}")
+  }
+  if ret.year >= 2050 {
+    # UTCTime only encodes times prior to 2050. See
+    # https://tools.ietf.org/html/rfc5280#section-4.1.2.5.1
+    ret = ret.add_date(-100, 0, 0)
+  }
+  ret
+}
+
+# Go's parseGeneralizedTime.
+def parse_generalized_time(bytes: [Byte]) -> ~time.Time<Asn1Error> {
+  format_str = "20060102150405.999999999Z0700"
+  s = Str.from_bytes(bytes)
+  r = time.parse(format_str, s)
+  if e = r.err {
+    fail Asn1Error.Other(e.message)
+  }
+  ret = r.unwrap
+  serialized = ret.format(format_str)
+  if serialized != s {
+    fail Asn1Error.Other("asn1: time did not serialize back to the original value and may be invalid: given #{strconv.quote(s)}, but serialized as #{strconv.quote(serialized)}")
+  }
+  ret
+}
+
+# ---------------------------------------------------------------- strings
+
+# Go's parseNumericString: digits and spaces.
+def parse_numeric_string(bytes: [Byte]) -> ~Str<Asn1Error> {
+  for b in bytes {
+    fail Asn1Error.Syntax("NumericString contains invalid character") if !numeric?(b)
+  }
+  Str.from_bytes(bytes)
+}
+
+def numeric?(b: Byte) -> Bool { (b >= 48 && b <= 57) || b == 32 }
+
+# Go's parsePrintableString (the asterisk and ampersand are accepted
+# because they are common in certificates).
+def parse_printable_string(bytes: [Byte]) -> ~Str<Asn1Error> {
+  for b in bytes {
+    fail Asn1Error.Syntax("PrintableString contains invalid character") if !printable?(b, true, true)
+  }
+  Str.from_bytes(bytes)
+}
+
+# Go's isPrintable: whether b is in the ASN.1 PrintableString set. If
+# asterisk is true then '*' is also allowed, reflecting existing practice.
+# If ampersand is true then '&' is allowed as well.
+def printable?(b: Byte, asterisk: Bool, ampersand: Bool) -> Bool {
+  # a-z A-Z 0-9 ' ( ) + , - . / space : = ? (and * &)
+  (b >= 97 && b <= 122) || (b >= 65 && b <= 90) || (b >= 48 && b <= 57) || (b >= 39 && b <= 41) || (b >= 43 && b <= 47) || b == 32 || b == 58 || b == 61 || b == 63 || (asterisk && b == 42) || (ampersand && b == 38)
+}
+
+# Go's parseIA5String: ASCII.
+def parse_ia5_string(bytes: [Byte]) -> ~Str<Asn1Error> {
+  for b in bytes {
+    fail Asn1Error.Syntax("IA5String contains invalid character") if b >= 0x80
+  }
+  Str.from_bytes(bytes)
+}
+
+# Go's parseT61String: each byte is a code point (Latin-1, as Go does).
+def parse_t61_string(bytes: [Byte]) -> Str {
+  buf: [Byte] = []
+  for v in bytes {
+    buf = utf8.append_rune(buf, v.to_i.as_i32)
+  }
+  Str.from_bytes(buf)
+}
+
+# Go's parseUTF8String.
+def parse_utf8_string(bytes: [Byte]) -> ~Str<Asn1Error> {
+  fail Asn1Error.Other("asn1: invalid UTF-8 string") if !utf8.valid(bytes)
+  Str.from_bytes(bytes)
+}
+
+# Go's parseBMPString: UCS-2 (big-endian UTF-16 without surrogates), with
+# an optional terminating NUL.
+def parse_bmp_string(bmp: [Byte]) -> ~Str<Asn1Error> {
+  # BMPString uses the defunct UCS-2 16-bit character encoding, which
+  # covers the Basic Multilingual Plane. Go's utf16 package handles UTF-16;
+  # UCS-2 is UTF-16 without surrogates, which we check for.
+  fail Asn1Error.Other("invalid BMPString") if bmp.size % 2 != 0
+  b = bmp
+  # Strip terminator if present.
+  l = b.size
+  b = b[0...l - 2] if l >= 2 && b[l - 1] == 0 && b[l - 2] == 0
+  s: [U16] = []
+  i = 0
+  while i < b.size {
+    point = (b[i].to_u16 << 8) + b[i + 1].to_u16
+    if point == 0xfffe || point == 0xffff || (point >= 0xfdd0 && point <= 0xfdef) || (point >= 0xd800 && point <= 0xdfff) {
+      fail Asn1Error.Other("invalid BMPString")
+    }
+    s << point
+    i += 2
+  }
+  buf: [Byte] = []
+  for r in utf16.decode(s) {
+    buf = utf8.append_rune(buf, r)
+  }
+  Str.from_bytes(buf)
+}
+
+# ---------------------------------------------------------------- RawValue
+
+# An undecoded ASN.1 object.
+pub struct RawValue {
+  class: Int
+  tag: Int
+  is_compound: Bool
+  bytes: [Byte]
+  # Includes the tag and length.
+  full_bytes: [Byte]
+}
+
+# A decoded ASN.1 ANY: Go's interface{} field or Unmarshal target. Nil is
+# an element of a type Go doesn't decode (Go leaves the interface nil).
+pub enum Any {
+  Nil
+  Bool(Bool)
+  Int(Int)
+  Str(Str)
+  BitString(BitString)
+  Oid(ObjectIdentifier)
+  Time(time.Time)
+  Bytes([Byte])
+
+  # The string, if this is one.
+  pub def str -> Str? {
+    case self {
+      Str(s) => s
+      _ => none
+    }
+  }
+}
+
+# ---------------------------------------------------------------- tag and length
+
+# The header of a DER element.
+pub struct TagAndLength {
+  class: Int
+  tag: Int
+  length: Int
+  is_compound: Bool
+}
+
+# Go's parseTagAndLength: the header at bytes[init_offset] and the offset
+# of its contents.
+def parse_tag_and_length(bytes: [Byte], init_offset: Int) -> ~(TagAndLength, Int)<Asn1Error> {
+  offset = init_offset
+  # parse_tag_and_length should not be called without at least a single
+  # byte to read. Thus this check is for robustness:
+  fail Asn1Error.Other("asn1: internal error in parseTagAndLength") if offset >= bytes.size
+  b = bytes[offset]
+  offset += 1
+  ret = TagAndLength.new(class: (b >> 6).to_i, is_compound: b & 0x20 == 0x20, tag: (b & 0x1f).to_i)
+  # If the bottom five bits are set, then the tag number is actually
+  # base 128 encoded afterwards
+  if ret.tag == 0x1f {
+    t, o2 = ~parse_base128_int(bytes, offset)
+    ret.tag = t
+    offset = o2
+    # Tags should be encoded in minimal form.
+    fail Asn1Error.Syntax("non-minimal tag") if ret.tag < 0x1f
+  }
+  fail Asn1Error.Syntax("truncated tag or length") if offset >= bytes.size
+  b = bytes[offset]
+  offset += 1
+  if b & 0x80 == 0 {
+    # The length is encoded in the bottom 7 bits.
+    ret.length = (b & 0x7f).to_i
+  } else {
+    # Bottom 7 bits give the number of length bytes to follow.
+    num_bytes = (b & 0x7f).to_i
+    fail Asn1Error.Syntax("indefinite length found (not DER)") if num_bytes == 0
+    ret.length = 0
+    i = 0
+    while i < num_bytes {
+      fail Asn1Error.Syntax("truncated tag or length") if offset >= bytes.size
+      b = bytes[offset]
+      offset += 1
+      # We can't shift ret.length up without overflowing (Go's int on
+      # 32-bit platforms).
+      fail Asn1Error.Structural("length too large") if ret.length >= 1 << 23
+      ret.length = (ret.length << 8) | b.to_i
+      # DER requires that lengths be minimal.
+      fail Asn1Error.Structural("superfluous leading zeros in length") if ret.length == 0
+      i += 1
+    }
+    # Short lengths must be encoded in short form.
+    fail Asn1Error.Structural("non-minimal length") if ret.length < 0x80
+  }
+  (ret, offset)
+}
+
+def invalid_length?(offset: Int, length: Int, slice_length: Int) -> Bool {
+  offset + length < offset || offset + length > slice_length
+}

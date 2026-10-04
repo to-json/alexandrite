@@ -1,0 +1,536 @@
+import "bytes"
+import "encoding/base64"
+import "io"
+import "io/fs"
+import "os"
+import "testing/fstest"
+import "time"
+
+# Go's reader_test.go.
+
+struct ZipTestFile {
+  name: Str
+  mode: U32
+  non_utf8: Bool
+  mod_time: time.Time
+  modified: time.Time
+  # The expected error reading the content: "" none, else its message.
+  content_err: Str
+  # none: Go's nil Content (then file or size).
+  content: [Byte]?
+  file: Str
+  size: U64
+}
+
+struct ZipTest {
+  name: Str
+  # A generated archive instead of testdata/<name>: "r", "crc", "notstreamed", "big".
+  source: Str
+  comment: Str
+  # none: Go's nil File (don't check files).
+  file: [ZipTestFile]?
+  obscured: Bool
+  # The expected error opening: "" none.
+  error: Str
+}
+
+def tz(hours: Int) -> time.Location {
+  time_zone(time.Duration.new(hours * 3600 * 1000000000))
+}
+
+def at(y: Int, mo: Int, d: Int, h: Int, mi: Int, s: Int, ns: Int, loc: time.Location) -> time.Time {
+  time.date(y, mo, d, h, mi, s, ns, loc)
+}
+
+def b(s: Str) -> [Byte] { s.bytes.to_a }
+
+def empty -> [Byte] {
+  e: [Byte] = []
+  e
+}
+
+def zf(name: Str, content: [Byte]?, modified: time.Time, mode: U32) -> ZipTestFile {
+  ZipTestFile.new(name: name, mode: mode, modified: modified, content: content)
+}
+
+def test_zip_files -> [ZipTestFile] {
+  [
+    zf("test.txt", b("This is a test text file.\n"), at(2010, 9, 5, 12, 12, 1, 0, tz(10)), 0o644),
+    ZipTestFile.new(name: "gophercolor16x16.png", file: "gophercolor16x16.png", modified: at(2010, 9, 5, 15, 52, 58, 0, tz(10)), mode: 0o644),
+  ]
+}
+
+def win_files(loc: time.Location) -> [ZipTestFile] {
+  [
+    zf("hello", b("world \r\n"), at(2011, 12, 8, 10, 4, 24, 0, loc), 0o666),
+    zf("dir/bar", b("foo \r\n"), at(2011, 12, 8, 10, 4, 50, 0, loc), 0o666),
+    zf("dir/empty/", empty, at(2011, 12, 8, 10, 8, 6, 0, loc), fs.MODE_DIR | 0o777),
+    zf("readonly", b("important \r\n"), at(2011, 12, 8, 10, 6, 8, 0, loc), 0o444),
+  ]
+}
+
+def foo_bar(loc: time.Location, mode: U32, foo_err: Str, t1: time.Time, t2: time.Time) -> [ZipTestFile] {
+  foo = zf("foo.txt", b("foo\n"), t1, mode)
+  foo.content_err = foo_err
+  [foo, zf("bar.txt", b("bar\n"), t2, mode)]
+}
+
+def time_file(modified: time.Time, mode: U32) -> [ZipTestFile] {
+  f = zf("test.txt", empty, modified, mode)
+  f.size = 0xffffffff
+  [f]
+}
+
+def utf8_file(mode: U32, non_utf8: Bool, modified: time.Time) -> [ZipTestFile] {
+  f = zf("世界", empty, modified, mode)
+  f.non_utf8 = non_utf8
+  [f]
+}
+
+def zip_tests -> [ZipTest] {
+  t1979 = at(1979, 11, 30, 0, 0, 0, 0, time.utc)
+  out = [
+    ZipTest.new(name: "test.zip", comment: "This is a zipfile comment.", file: test_zip_files),
+    ZipTest.new(name: "test-trailing-junk.zip", comment: "This is a zipfile comment.", file: test_zip_files),
+    ZipTest.new(name: "test-prefix.zip", comment: "This is a zipfile comment.", file: test_zip_files),
+    ZipTest.new(name: "test-baddirsz.zip", comment: "This is a zipfile comment.", file: test_zip_files),
+    ZipTest.new(name: "test-badbase.zip", comment: "This is a zipfile comment.", file: test_zip_files),
+    ZipTest.new(name: "r.zip", source: "r", file: [zf("r/r.zip", r_zip_bytes, at(2010, 3, 4, 0, 24, 16, 0, time.utc), 0o666)]),
+    ZipTest.new(name: "symlink.zip", file: [zf("symlink", b("../target"), at(2012, 2, 3, 19, 56, 48, 0, tz(-2)), 0o777 | fs.MODE_SYMLINK)]),
+    ZipTest.new(name: "readme.zip"),
+    ZipTest.new(name: "readme.notzip", error: "zip: not a valid zip file"),
+    ZipTest.new(name: "dd.zip", file: [zf("filename", b("This is a test textfile.\n"), at(2011, 2, 2, 13, 6, 20, 0, time.utc), 0o666)]),
+    ZipTest.new(name: "winxp.zip", file: win_files(time.utc)),
+    ZipTest.new(name: "unix.zip", file: win_files(tz(0))),
+    ZipTest.new(name: "go-no-datadesc-sig.zip.base64", obscured: true, file: foo_bar(tz(-8), 0o644, "", at(2012, 3, 8, 16, 59, 10, 0, tz(-8)), at(2012, 3, 8, 16, 59, 12, 0, tz(-8)))),
+    ZipTest.new(name: "go-with-datadesc-sig.zip", file: foo_bar(time.utc, 0o666, "", t1979, t1979)),
+    ZipTest.new(name: "Bad-CRC32-in-data-descriptor", source: "crc", file: foo_bar(time.utc, 0o666, "zip: checksum error", t1979, t1979)),
+    ZipTest.new(name: "crc32-not-streamed.zip", file: foo_bar(tz(-8), 0o644, "", at(2012, 3, 8, 16, 59, 10, 0, tz(-8)), at(2012, 3, 8, 16, 59, 12, 0, tz(-8)))),
+    ZipTest.new(name: "crc32-not-streamed.zip", source: "notstreamed", file: foo_bar(tz(-8), 0o644, "zip: checksum error", at(2012, 3, 8, 16, 59, 10, 0, tz(-8)), at(2012, 3, 8, 16, 59, 12, 0, tz(-8)))),
+    ZipTest.new(name: "zip64.zip", file: [zf("README", b("This small file is in ZIP64 format.\n"), at(2012, 8, 10, 14, 33, 32, 0, time.utc), 0o644)]),
+    ZipTest.new(name: "zip64-2.zip", file: [zf("README", b("This small file is in ZIP64 format.\n"), at(2012, 8, 10, 14, 33, 32, 0, tz(-4)), 0o644)]),
+  ]
+  big = zf("big.file", none, t1979, 0o666)
+  big.size = 0xffffffff
+  out << ZipTest.new(name: "big.zip", source: "big", file: [big])
+  out << ZipTest.new(name: "utf8-7zip.zip", file: utf8_file(0o666, false, at(2017, 11, 6, 13, 9, 27, 867862500, tz(-8))))
+  out << ZipTest.new(name: "utf8-infozip.zip", file: utf8_file(0o644, true, at(2017, 11, 6, 13, 9, 27, 0, tz(-8))))
+  out << ZipTest.new(name: "utf8-osx.zip", file: utf8_file(0o644, true, at(2017, 11, 6, 13, 9, 27, 0, tz(-8))))
+  out << ZipTest.new(name: "utf8-winrar.zip", file: utf8_file(0o666, false, at(2017, 11, 6, 13, 9, 27, 867862500, tz(-8))))
+  out << ZipTest.new(name: "utf8-winzip.zip", file: utf8_file(0o666, false, at(2017, 11, 6, 13, 9, 27, 867000000, tz(-8))))
+  out << ZipTest.new(name: "time-7zip.zip", file: time_file(at(2017, 10, 31, 21, 11, 57, 244817900, tz(-7)), 0o666))
+  out << ZipTest.new(name: "time-infozip.zip", file: time_file(at(2017, 10, 31, 21, 11, 57, 0, tz(-7)), 0o644))
+  out << ZipTest.new(name: "time-osx.zip", file: time_file(at(2017, 10, 31, 21, 11, 57, 0, tz(-7)), 0o644))
+  out << ZipTest.new(name: "time-win7.zip", file: time_file(at(2017, 10, 31, 21, 11, 58, 0, time.utc), 0o666))
+  out << ZipTest.new(name: "time-winrar.zip", file: time_file(at(2017, 10, 31, 21, 11, 57, 244817900, tz(-7)), 0o666))
+  out << ZipTest.new(name: "time-winzip.zip", file: time_file(at(2017, 10, 31, 21, 11, 57, 244000000, tz(-7)), 0o666))
+  out << ZipTest.new(name: "time-go.zip", file: time_file(at(2017, 10, 31, 21, 11, 57, 0, tz(-7)), 0o666))
+  f22738 = zf("file", empty, at(1999, 12, 31, 19, 0, 0, 0, tz(-5)), 0o666)
+  f22738.mod_time = at(1999, 12, 31, 19, 0, 0, 0, time.utc)
+  out << ZipTest.new(name: "time-22738.zip", file: [f22738])
+  t2021 = at(2021, 12, 29, 0, 0, 0, 0, tz(0))
+  out << ZipTest.new(name: "dupdir.zip", file: [zf("a/", empty, t2021, fs.MODE_DIR | 0o666), zf("a/b", empty, t2021, 0o666), zf("a/b/", empty, t2021, fs.MODE_DIR | 0o666), zf("a/b/c", empty, t2021, 0o666)])
+  out << ZipTest.new(name: "comment-truncated.zip", error: "zip: not a valid zip file")
+  out
+}
+
+def mess_with(name: Str, corrupt: ([Byte]) -> Unit) -> [Byte] {
+  data = os.read_file("testdata/" + name).unwrap
+  corrupt.call(data)
+  data
+}
+
+def source_bytes(src: Str) -> [Byte] {
+  case src {
+    "r" => r_zip_bytes
+    "crc" => mess_with("go-with-datadesc-sig.zip", ->(d: [Byte]) { d[0x2d] = d[0x2d] + 1 })
+    "notstreamed" => mess_with("crc32-not-streamed.zip", ->(d: [Byte]) {
+      d[0x11] = d[0x11] + 1
+      d[0x9d] = d[0x9d] + 1
+    })
+    _ => big_zip_bytes()
+  }
+}
+
+# Go's returnBigZipBytes: biggest.zip holds bigger.zip holds big.zip.
+def big_zip_bytes -> [Byte] {
+  data = biggest_zip_bytes
+  for _i in 0...2 {
+    r = new_reader(bytes.new_reader(data), data.size).unwrap
+    f = r.file[0].open.unwrap
+    data = io.read_all(f).unwrap
+  }
+  data
+}
+
+def equal_time_and_zone(t1: time.Time, t2: time.Time) -> Bool {
+  n1, o1 = t1.zone_info
+  n2, o2 = t2.zone_info
+  t1.equal(t2) && n1 == n2 && o1 == o2
+}
+
+def read_test_file[R](zt: ZipTest, ft: ZipTestFile, f: File[R], raw: [Byte]) -> ~Unit {
+  h = f.header
+  assert_eq h.name, ft.name
+  if !ft.modified.is_zero {
+    assert equal_time_and_zone(h.modified, ft.modified), "#{h.name}: Modified=#{h.modified}, want #{ft.modified}"
+  }
+  if !ft.mod_time.is_zero {
+    assert equal_time_and_zone(h.mod_time, ft.mod_time), "#{h.name}: ModTime=#{h.mod_time}, want #{ft.mod_time}"
+  }
+  assert ft.mode != 0, "#{h.name} mode: got #{f.mode}, want none"
+  assert_eq f.mode.bits, ft.mode
+  size = h.uncompressed_size.as_u64
+  if size == 0xffffffff {
+    size = h.uncompressed_size64
+  } else {
+    assert_eq size, h.uncompressed_size64
+  }
+
+  # open_raw returns the right bytes.
+  rw = f.~open_raw
+  start = f.~data_offset
+  got = io.~read_all(rw)
+  stop = start + h.compressed_size64.to_i
+  assert got == raw[start...stop], "#{h.name}: open_raw returned unexpected bytes"
+
+  r = f.~open
+  if ft.content.none? && ft.file == "" && ft.size > 0 {
+    assert_eq size, ft.size
+    return
+  }
+  out = bytes.new_buffer([])
+  res = io.copy(out, r)
+  if e = res.err {
+    assert_eq e.message, ft.content_err
+    return
+  }
+  assert_eq ft.content_err, ""
+  assert_eq out.len.as_u64, size
+  c = ft.content || os.~read_file("testdata/" + ft.file)
+  assert out.bytes == c, "#{h.name}: content differs"
+}
+
+def read_test_zip(zt: ZipTest) -> ~Unit {
+  raw: [Byte] = []
+  if zt.source != "" {
+    raw = source_bytes(zt.source)
+    zr = new_reader(bytes.new_reader(raw), raw.size)
+    ~check_zip(zt, zr, raw)
+  } else if zt.obscured {
+    enc = os.~read_file("testdata/" + zt.name)
+    raw = base64.std_encoding.~decode_string(Str.from_bytes(enc))
+    zo = new_reader(bytes.new_reader(raw), raw.size)
+    ~check_zip(zt, zo, raw)
+  } else {
+    raw = os.~read_file("testdata/" + zt.name)
+    zf = open_reader("testdata/" + zt.name)
+    ~check_zip(zt, zf, raw)
+    if zf.ok? {
+      z = zf.unwrap
+      z.~close!
+    }
+  }
+}
+
+def check_zip[R](zt: ZipTest, zr: ~Reader[R], raw: [Byte]) -> ~Unit {
+  if e = zr.err {
+    assert_eq e.message, zt.error
+    return
+  }
+  assert_eq "", zt.error
+  z = zr.unwrap
+  files = zt.file || []
+  return if zt.file.none?
+  assert_eq z.comment, zt.comment
+  assert_eq z.file.size, files.size
+  for i in 0...files.size {
+    ~read_test_file(zt, files[i], z.file[i], raw)
+  }
+}
+
+test "reader" {
+  for zt in zip_tests {
+    r = read_test_zip(zt)
+    if e = r.err {
+      assert false, "#{zt.name}: #{e.message}"
+    }
+  }
+}
+
+# Go's simultaneous reads (readTestZip): five tasks read every file.
+test "simultaneous reads" {
+  data = ~os.read_file("testdata/test.zip")
+  z = ~new_reader(bytes.new_reader(data), data.size)
+  tasks = (0...5).map { |_i|
+    zc = z.dup
+    spawn {
+      total = 0
+      for f in zc.file {
+        rc = f.~open
+        total += io.~read_all(rc).size
+      }
+      total
+    }
+  }.to_a
+  for t in tasks {
+    assert_eq t.~wait, 26 + 785
+  }
+}
+
+test "invalid files" {
+  size = 1024 * 70
+  bz: [Byte] = [0; size]
+  r = new_reader(bytes.new_reader(bz), size)
+  assert_eq r.err.unwrap.message, "zip: not a valid zip file"
+  # Repeated directory end signatures.
+  i = 0
+  while i < size - 4 {
+    put32(bz, i, DIRECTORY_END_SIGNATURE)
+    i += 4
+  }
+  r = new_reader(bytes.new_reader(bz), size)
+  assert_eq r.err.unwrap.message, "zip: not a valid zip file"
+  r = new_reader(bytes.new_reader(b("foobar")), -1)
+  assert !r.ok?, "expected error when negative size is passed"
+}
+
+test "issue 8186" {
+  dummy: Map[U16, (SectionReader) -> ([Byte]) -> ~Int] = {}
+  for s in issue8186_entries {
+    rd = bytes.new_reader(s)
+    f = File[bytes.Reader].new(header: FileHeader.new(), zipr: rd, header_offset: 0, decompressors: dummy)
+    res = read_directory_header(f, dir_cursor(rd, 0, s.size))
+    assert res.ok?, "error reading entry"
+  }
+}
+
+test "issue 10957" {
+  data = issue10957_data
+  z = ~new_reader(bytes.new_reader(data), data.size)
+  for i in 0...z.file.size {
+    f = z.file[i]
+    r = f.open
+    next if !r.ok?
+    rc = r.unwrap
+    if f.header.uncompressed_size64 < 1000000 {
+      out = io.copy(io.Discard.new(), rc)
+      if i == 3 {
+        assert_eq out.err.unwrap.message, "unexpected EOF"
+      }
+      if n = out.ok? ? out.unwrap : none {
+        assert_eq n.as_u64, f.header.uncompressed_size64
+      }
+    }
+  }
+}
+
+test "issue 10956" {
+  data = issue10956_data
+  assert !new_reader(bytes.new_reader(data), data.size).ok?, "got nil error, want ErrFormat"
+}
+
+test "issue 11146" {
+  data = issue11146_data
+  z = ~new_reader(bytes.new_reader(data), data.size)
+  r = z.file[0].~open
+  res = io.read_all(r)
+  assert_eq res.err.unwrap.message, "unexpected EOF"
+}
+
+test "issue 12449" {
+  data = issue12449_data
+  r = new_reader(bytes.new_reader(data), data.size)
+  assert r.ok?, "error reading the archive"
+}
+
+test "fs" {
+  for t in [("testdata/unix.zip", ["hello", "dir/bar", "readonly"]), ("testdata/subdir.zip", ["a/b/c"])] {
+    z = ~open_reader(t[0])
+    r = fstest.test_fs(z, t[1])
+    if e = r.err {
+      assert false, e.message
+    }
+    z.~close!
+  }
+}
+
+test "fs walk" {
+  tests = [("testdata/unix.zip", [".", "dir", "dir/bar", "dir/empty", "hello", "readonly"], false), ("testdata/subdir.zip", [".", "a", "a/b", "a/b/c"], false), ("testdata/dupdir.zip", [], true)]
+  for t in tests {
+    z = ~open_reader(t[0])
+    files: [Str] = []
+    saw_err = [false]
+    r = fs.walk_dir(z, ".") { |p, d, err|
+      if e = err {
+        assert t[2], "#{p}: #{e.message}"
+        saw_err[0] = true
+        return
+      }
+      files << p
+    }
+    assert r.ok?, "walk_dir error"
+    assert_eq saw_err[0], t[2]
+    assert_eq files, t[1] if !t[2]
+    z.~close!
+  }
+}
+
+test "fs walk bad file" {
+  buf = bytes.new_buffer([])
+  zw = new_writer(buf)
+  hdr = FileHeader.new(name: ".")
+  hdr.set_mode!(fs.mode(fs.MODE_DIR | 0o755))
+  w = zw.~create_header!(hdr)
+  w.~write!(b("some data"))
+  zw.~close!
+  data = buf.bytes
+  zr = ~new_reader(bytes.new_reader(data), data.size)
+  count = [0]
+  r = fs.walk_dir(zr, ".") { |p, d, err|
+    count[0] += 1
+    fail ZipError.Format if count[0] > 2
+    if e = err {
+      fail e
+    }
+  }
+  assert !r.ok?, "expected error from invalid file name"
+  assert r.err.unwrap.message != "zip: not a valid zip file", "repeated call to path"
+}
+
+test "fs mod time" {
+  z = ~open_reader("testdata/subdir.zip")
+  for t in [("a", at(2021, 4, 19, 12, 29, 56, 0, tz(-7)).utc), ("a/b/c", at(2021, 4, 19, 12, 29, 59, 0, tz(-7)).utc)] {
+    fi = fs.~stat(z, t[0])
+    assert fi.mod_time.equal(t[1]), "#{t[0]}: got modtime #{fi.mod_time}, want #{t[1]}"
+  }
+  z.~close!
+}
+
+test "cve 2021 27919" {
+  data = cve202127919_data
+  r = ~new_reader(bytes.new_reader(data), data.size)
+  assert_eq r.check_paths.err.unwrap.message, "zip: insecure file path"
+  assert r.open("test.txt").ok?, "error reading file"
+  assert_eq r.file.size, 1
+  assert_eq r.file[0].header.name, "../test.txt"
+  assert r.file[0].open.ok?, "error opening file"
+}
+
+test "open reader insecure path" {
+  data = cve202127919_data
+  name = ~os.mkdir_temp("", "zip") + "/test.zip"
+  ~os.write_file(name, data, 0o644)
+  r = ~open_reader(name)
+  assert_eq r.check_paths.err.unwrap.message, "zip: insecure file path"
+  assert r.open("test.txt").ok?, "error reading file"
+  assert_eq r.file.size, 1
+  assert_eq r.file[0].header.name, "../test.txt"
+  assert r.file[0].open.ok?, "error opening file"
+  r.~close!
+}
+
+test "cve 2021 33196" {
+  data = cve202133196_data
+  assert_eq new_reader(bytes.new_reader(data), data.size).err.unwrap.message, "zip: not a valid zip file"
+  # A handful of empty files is fine.
+  buf = bytes.new_buffer([])
+  w = new_writer(buf)
+  for _i in 0...5 {
+    w.~create!("")
+  }
+  w.~close!
+  d = buf.bytes
+  r = ~new_reader(bytes.new_reader(d), d.size)
+  assert_eq r.file.size, 5
+}
+
+test "cve 2021 39293" {
+  data = cve202139293_data
+  assert_eq new_reader(bytes.new_reader(data), data.size).err.unwrap.message, "zip: not a valid zip file"
+}
+
+test "cve 2021 41772" {
+  data = cve202141772_data
+  r = ~new_reader(bytes.new_reader(data), data.size)
+  assert_eq r.check_paths.err.unwrap.message, "zip: insecure file path"
+  names: [Str] = []
+  for f in r.file {
+    names << f.header.name
+    assert f.open.ok?, "error opening #{f.header.name}"
+    assert !r.open(f.header.name).ok?, "opening #{f.header.name} with fs.FS API succeeded"
+  }
+  assert_eq names, ["/", "//", "\\", "/test.txt"]
+  assert !r.open("").ok?, "opening \"\" succeeded"
+  assert r.open("test.txt").ok?, "error opening test.txt"
+  entries = fs.~read_dir(r, ".")
+  assert_eq entries.size, 1
+  assert_eq entries[0].name, "test.txt"
+  info = entries[0].~info
+  assert_eq info.name, "test.txt"
+}
+
+test "under size" {
+  z = ~open_reader("testdata/readme.zip")
+  for i in 0...z.file.size {
+    z.file[i].header.uncompressed_size64 = 1
+  }
+  for f in z.file {
+    rd = f.~open
+    res = io.copy(io.Discard.new(), rd)
+    assert_eq res.err.unwrap.message, "zip: not a valid zip file"
+  }
+  z.~close!
+}
+
+test "issue 54801" {
+  for input in ["testdata/readme.zip", "testdata/dd.zip"] {
+    z = ~open_reader(input)
+    for f in z.file {
+      g = f
+      g.header.name += "/"
+      rd = g.~open
+      res = io.copy(io.Discard.new(), rd)
+      assert_eq res.err.unwrap.message, "zip: not a valid zip file"
+    }
+    z.~close!
+  }
+}
+
+test "insecure paths" {
+  for p in ["../foo", "/foo", "a/b/../../../c", "a\\b"] {
+    buf = bytes.new_buffer([])
+    zw = new_writer(buf)
+    zw.~create!(p)
+    zw.~close!
+    d = buf.bytes
+    zr = ~new_reader(bytes.new_reader(d), d.size)
+    assert_eq zr.check_paths.err.unwrap.message, "zip: insecure file path"
+    assert_eq zr.file.map { it.header.name }.to_a, [p]
+  }
+}
+
+test "disable insecure path check" {
+  buf = bytes.new_buffer([])
+  zw = new_writer(buf)
+  zw.~create!("/foo")
+  zw.~close!
+  d = buf.bytes
+  zr = ~new_reader(bytes.new_reader(d), d.size)
+  assert_eq zr.file.map { it.header.name }.to_a, ["/foo"]
+}
+
+test "compressed directory" {
+  data = compressed_directory_data
+  r = ~new_reader(bytes.new_reader(data), data.size)
+  for f in r.file {
+    rc = f.~open
+    io.~copy(io.Discard.new(), rc)
+  }
+}
+
+test "base offset plus overflow" {
+  data = base_offset_plus_overflow_data
+  # Must not panic.
+  new_reader(bytes.new_reader(data), data.size + 1875)
+}

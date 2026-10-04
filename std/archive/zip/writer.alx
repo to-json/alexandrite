@@ -1,0 +1,530 @@
+# Writing ZIP archives (Go's writer.go and register.go).
+
+import "bytes"
+import "compress/flate"
+import "hash/crc32"
+import "io"
+import "io/fs"
+import "strings"
+
+BUF_SIZE = 4096
+
+def crc32_update(crc: U32, p: [Byte]) -> U32 {
+  crc32.update(crc, crc32.ieee_table(), p)
+}
+
+def store_compressor(b: bytes.Buffer) -> ~io.WriteCloser {
+  NopCloser.new(b: b)
+}
+
+def flate_compressor(b: bytes.Buffer) -> ~io.WriteCloser {
+  # Go's level 5 (its pooled flate writers).
+  ~flate.new_writer(b, 5)
+}
+
+# The Store "compressor": what is written goes to the buffer as is.
+struct NopCloser {
+  b: bytes.Buffer
+  pub def write!(p: [Byte]) -> ~Int { self.b.write!(p) }
+  pub def close! -> ~Unit {}
+}
+
+# A header in the central directory: the FileHeader, where its local
+# header is, and whether it was written raw.
+struct Hdr {
+  fh: FileHeader
+  offset: U64
+  raw: Bool
+}
+
+struct WriterState[W] {
+  w: W
+  # Go's bufio.Writer over w: buf[0...n] is pending.
+  buf: [Byte]
+  n: Int
+  # Bytes written (from set_offset!'s start).
+  count: Int
+  dir: [Hdr]
+  # The open file: its id, or -1; whether it was closed.
+  last: Int
+  last_closed: Bool
+  next_id: Int
+  closed: Bool
+  comment: Str
+  compressors: Map[U16, (bytes.Buffer) -> ~io.WriteCloser]
+  # The open file's compressor (none for the built-in Store) and the
+  # buffer it writes into.
+  comp: [io.WriteCloser]
+  sink: bytes.Buffer
+  digest: U32
+  raw_count: Int
+  comp_count: Int
+  # Tests: skip the CRC-32 (Go's tests swap in a fake hash) and see the
+  # central directory's size and offset at close.
+  fake_crc: Bool
+  close_hook: [(U64, U64) -> Unit]
+}
+
+# Writes a ZIP archive to W (Go's Writer). Copies share the archive.
+pub struct Writer[W] {
+  st: [WriterState[W]]
+
+  # Buffered output, as Go's bufio.Writer.
+  def out!(p: [Byte]) -> ~Unit {
+    q = p
+    loop {
+      n = st[0].n
+      break if q.size <= BUF_SIZE - n
+      if n == 0 {
+        self.st[0].w.~write!(q)
+        self.st[0].count += q.size
+        return
+      }
+      k = BUF_SIZE - n
+      copy(st[0].buf[n...BUF_SIZE], q[0...k])
+      self.st[0].n = BUF_SIZE
+      self.st[0].count += k
+      ~flush!
+      q = q[k...q.size]
+    }
+    n = st[0].n
+    copy(st[0].buf[n...n + q.size], q)
+    self.st[0].n = n + q.size
+    self.st[0].count += q.size
+  }
+
+  # Sets the offset of the archive's start in the output, for an archive
+  # appended to other data (Go's SetOffset). Before any data is written.
+  pub def set_offset!(n: Int) {
+    assert st[0].count == 0, "zip: SetOffset called after data was written"
+    self.st[0].count = n
+  }
+
+  # Writes buffered data to the underlying writer (close! does too).
+  pub def flush! -> ~Unit {
+    n = st[0].n
+    return if n == 0
+    self.st[0].n = 0
+    self.st[0].w.~write!(st[0].buf[0...n])
+  }
+
+  # Sets the end-of-central-directory comment; before close!.
+  pub def set_comment!(comment: Str) -> ~Unit {
+    fail ZipError.LongComment if comment.size > UINT16MAX
+    self.st[0].comment = comment
+  }
+
+  # Registers or overrides the compressor for method in this Writer (Go's
+  # Writer.RegisterCompressor).
+  pub def register_compressor!(method: U16, comp: (bytes.Buffer) -> ~io.WriteCloser) {
+    self.st[0].compressors[method] = comp
+  }
+
+  # The header of the file last added, as the Writer completed it (Go's
+  # CreateHeader mutates the caller's FileHeader).
+  pub def last_header -> FileHeader? {
+    return none if st[0].dir.size == 0
+    st[0].dir[st[0].dir.size - 1].fh
+  }
+
+  # Moves the open file's compressed output into the archive.
+  def drain! -> ~Unit {
+    b = st[0].sink.bytes
+    return if b.size == 0
+    ~out!(b)
+    self.st[0].comp_count += b.size
+    self.st[0].sink.reset!
+  }
+
+  # Writes to the open file (FileWriter.write!).
+  def file_write!(id: Int, p: [Byte]) -> ~Int {
+    fail ZipError.WriteToClosedFile if st[0].last != id || st[0].last_closed
+    hi = st[0].dir.size - 1
+    if st[0].dir[hi].raw {
+      ~out!(p)
+      return p.size
+    }
+    self.st[0].digest = crc32_update(st[0].digest, p) if !st[0].fake_crc
+    self.st[0].raw_count += p.size
+    if st[0].comp.size == 0 {
+      ~out!(p)
+      self.st[0].comp_count += p.size
+    } else {
+      self.st[0].comp[0].~write!(p)
+      ~drain!
+    }
+    p.size
+  }
+
+  # Closes the open file (Go's fileWriter.close).
+  def close_file! -> ~Unit {
+    fail ZipError.FileClosedTwice if st[0].last_closed
+    self.st[0].last_closed = true
+    hi = st[0].dir.size - 1
+    if !st[0].dir[hi].raw {
+      if st[0].comp.size > 0 {
+        self.st[0].comp[0].~close!
+        ~drain!
+      }
+      fh = st[0].dir[hi].fh
+      fh.crc32 = st[0].digest
+      fh.compressed_size64 = st[0].comp_count.as_u64
+      fh.uncompressed_size64 = st[0].raw_count.as_u64
+      if fh.compressed_size64 > U64_32MAX || fh.uncompressed_size64 > U64_32MAX {
+        fh.compressed_size = U32MAX
+        fh.uncompressed_size = U32MAX
+        fh.reader_version = ZIP_VERSION45
+      } else {
+        fh.compressed_size = fh.compressed_size64.as_u32
+        fh.uncompressed_size = fh.uncompressed_size64.as_u32
+      }
+      self.st[0].dir[hi].fh = fh
+    }
+    ~write_data_descriptor!(st[0].dir[hi].fh)
+  }
+
+  def write_data_descriptor!(fh: FileHeader) -> ~Unit {
+    return if !fh.has_data_descriptor?
+    big = fh.compressed_size64 > U64_32MAX || fh.uncompressed_size64 > U64_32MAX
+    dlen = big ? DATA_DESCRIPTOR64_LEN : DATA_DESCRIPTOR_LEN
+    buf: [Byte] = [0; dlen]
+    put32(buf, 0, DATA_DESCRIPTOR_SIGNATURE)
+    put32(buf, 4, fh.crc32)
+    if big {
+      put64(buf, 8, fh.compressed_size64)
+      put64(buf, 16, fh.uncompressed_size64)
+    } else {
+      put32(buf, 8, fh.compressed_size)
+      put32(buf, 12, fh.uncompressed_size)
+    }
+    ~out!(buf)
+  }
+
+  def prepare! -> ~Unit {
+    ~close_file! if st[0].last >= 0 && !st[0].last_closed
+  }
+
+  # Finishes the archive: the central directory and end records. Doesn't
+  # close the underlying writer.
+  pub def close! -> ~Unit {
+    if st[0].last >= 0 && !st[0].last_closed {
+      ~close_file!
+      self.st[0].last = -1
+    }
+    fail ZipError.WriterClosedTwice if st[0].closed
+    self.st[0].closed = true
+
+    start = st[0].count
+    used_zip64 = false
+    for i in 0...st[0].dir.size {
+      h = st[0].dir[i]
+      fh = h.fh
+      # Zip64 extra when a size or the offset reaches 0xffffffff (with
+      # just the fields that do).
+      reader_version = fh.reader_version
+      if fh.compressed_size64 >= U64_32MAX || fh.uncompressed_size64 >= U64_32MAX || h.offset >= U64_32MAX {
+        used_zip64 = true
+        reader_version = ZIP_VERSION45 if reader_version < ZIP_VERSION45
+        eb: [Byte] = [0; 28]
+        put16(eb, 0, ZIP64_EXTRA_ID)
+        size = 0
+        if fh.uncompressed_size64 >= U64_32MAX {
+          put64(eb, 4 + size, fh.uncompressed_size64)
+          size += 8
+        }
+        if fh.compressed_size64 >= U64_32MAX {
+          put64(eb, 4 + size, fh.compressed_size64)
+          size += 8
+        }
+        if h.offset >= U64_32MAX {
+          put64(eb, 4 + size, h.offset)
+          size += 8
+        }
+        put16(eb, 2, size.as_u16)
+        fh.extra = fh.extra + eb[0...4 + size]
+        self.st[0].dir[i].fh = fh
+      }
+      buf: [Byte] = [0; DIRECTORY_HEADER_LEN]
+      put32(buf, 0, DIRECTORY_HEADER_SIGNATURE)
+      put16(buf, 4, fh.creator_version)
+      put16(buf, 6, reader_version)
+      put16(buf, 8, fh.flags)
+      put16(buf, 10, fh.method)
+      put16(buf, 12, fh.modified_time)
+      put16(buf, 14, fh.modified_date)
+      put32(buf, 16, fh.crc32)
+      put32(buf, 20, min_u64(fh.compressed_size64, U64_32MAX).as_u32)
+      put32(buf, 24, min_u64(fh.uncompressed_size64, U64_32MAX).as_u32)
+      put16(buf, 28, fh.name.size.as_u16)
+      put16(buf, 30, fh.extra.size.as_u16)
+      put16(buf, 32, fh.comment.size.as_u16)
+      put32(buf, 38, fh.external_attrs)
+      put32(buf, 42, min_u64(h.offset, U64_32MAX).as_u32)
+      ~out!(buf)
+      ~out!(fh.name.bytes.to_a)
+      ~out!(fh.extra)
+      ~out!(fh.comment.bytes.to_a)
+    }
+    end = st[0].count
+    records = st[0].dir.size.as_u64
+    size = (end - start).as_u64
+    offset = start.as_u64
+    if st[0].close_hook.size > 0 {
+      st[0].close_hook[0].call(size, offset)
+    }
+
+    if used_zip64 || records >= 0xffff || size >= U64_32MAX || offset >= U64_32MAX {
+      buf: [Byte] = [0; DIRECTORY64_END_LEN + DIRECTORY64_LOC_LEN]
+      put32(buf, 0, DIRECTORY64_END_SIGNATURE)
+      put64(buf, 4, (DIRECTORY64_END_LEN - 12).as_u64)
+      put16(buf, 12, ZIP_VERSION45)
+      put16(buf, 14, ZIP_VERSION45)
+      put64(buf, 24, records)
+      put64(buf, 32, records)
+      put64(buf, 40, size)
+      put64(buf, 48, offset)
+      put32(buf, 56, DIRECTORY64_LOC_SIGNATURE)
+      put64(buf, 64, end.as_u64)
+      put32(buf, 72, 1)
+      ~out!(buf)
+    }
+
+    buf: [Byte] = [0; DIRECTORY_END_LEN]
+    put32(buf, 0, DIRECTORY_END_SIGNATURE)
+    put16(buf, 8, min_u64(records, 0xffff).as_u16)
+    put16(buf, 10, min_u64(records, 0xffff).as_u16)
+    put32(buf, 12, min_u64(size, U64_32MAX).as_u32)
+    put32(buf, 16, min_u64(offset, U64_32MAX).as_u32)
+    put16(buf, 20, st[0].comment.size.as_u16)
+    ~out!(buf)
+    ~out!(st[0].comment.bytes.to_a)
+    ~flush!
+  }
+
+  # Adds a file compressed with Deflate (Go's Create); write its content to
+  # the result before the next create!/create_header!/create_raw!/close!.
+  # A trailing slash makes a directory.
+  pub def create!(name: Str) -> ~FileWriter[W] {
+    self.~create_header!(FileHeader.new(name: name, method: DEFLATE))
+  }
+
+  # Adds a file described by fh (Go's CreateHeader): sets the UTF-8 flag,
+  # versions, MS-DOS time and extended timestamp from fh.modified, and the
+  # data descriptor flag.
+  pub def create_header!(header: FileHeader) -> ~FileWriter[W] {
+    ~prepare!
+    fh = header
+    valid1, require1 = detect_utf8(fh.name)
+    valid2, require2 = detect_utf8(fh.comment)
+    if fh.non_utf8 {
+      fh.flags = fh.flags & 0xf7ff
+    } else if (require1 || require2) && valid1 && valid2 {
+      fh.flags = fh.flags | 0x800
+    }
+    fh.creator_version = (fh.creator_version & 0xff00) | ZIP_VERSION20
+    fh.reader_version = ZIP_VERSION20
+    if !fh.modified.is_zero {
+      # In the zone of modified (not converted to UTC, as Go).
+      d, tm = time_to_ms_dos_time(fh.modified)
+      fh.modified_date = d
+      fh.modified_time = tm
+      mbuf: [Byte] = [0; 9]
+      put16(mbuf, 0, EXT_TIME_EXTRA_ID)
+      put16(mbuf, 2, 5)
+      mbuf[4] = 1
+      put32(mbuf, 5, fh.modified.unix.as_u32)
+      fh.extra = fh.extra + mbuf
+    }
+    is_dir = fh.name.end_with?("/")
+    comps: [io.WriteCloser] = []
+    if is_dir {
+      fh.method = STORE
+      fh.flags = fh.flags & 0xfff7
+      fh.compressed_size = 0
+      fh.compressed_size64 = 0
+      fh.uncompressed_size = 0
+      fh.uncompressed_size64 = 0
+    } else {
+      fh.flags = fh.flags | 0x8
+      self.st[0].sink.reset!
+      if c = st[0].compressors[fh.method] {
+        comps << ~c.call(st[0].sink)
+      } else if fh.method == DEFLATE {
+        comps << ~flate_compressor(st[0].sink)
+      } else if fh.method != STORE {
+        fail ZipError.Algorithm
+      }
+    }
+    h = Hdr.new(fh: fh, offset: st[0].count.as_u64, raw: false)
+    self.st[0].dir << h
+    ~write_header!(h)
+    if is_dir {
+      return FileWriter[W].new(st: st, id: -1, dir: true)
+    }
+    id = st[0].next_id
+    self.st[0].next_id = id + 1
+    self.st[0].last = id
+    self.st[0].last_closed = false
+    self.st[0].comp = comps
+    self.st[0].digest = 0
+    self.st[0].raw_count = 0
+    self.st[0].comp_count = 0
+    FileWriter[W].new(st: st, id: id, dir: false)
+  }
+
+  def write_header!(h: Hdr) -> ~Unit {
+    fh = h.fh
+    fail ZipError.LongName if fh.name.size > UINT16MAX
+    fail ZipError.LongExtra if fh.extra.size > UINT16MAX
+    # Sizes are known only for a raw file without a data descriptor; a
+    # streamed file writes zeros (the central directory is authoritative).
+    zip64_extra: [Byte] = []
+    reader_version = fh.reader_version
+    no_dd = h.raw && !fh.has_data_descriptor?
+    if no_dd && (fh.compressed_size64 > U64_32MAX || fh.uncompressed_size64 > U64_32MAX) {
+      reader_version = ZIP_VERSION45 if reader_version < ZIP_VERSION45
+      z: [Byte] = [0; 20]
+      zip64_extra = z
+      put16(zip64_extra, 0, ZIP64_EXTRA_ID)
+      put16(zip64_extra, 2, 16)
+      put64(zip64_extra, 4, fh.uncompressed_size64)
+      put64(zip64_extra, 12, fh.compressed_size64)
+    }
+    buf: [Byte] = [0; FILE_HEADER_LEN]
+    put32(buf, 0, FILE_HEADER_SIGNATURE)
+    put16(buf, 4, reader_version)
+    put16(buf, 6, fh.flags)
+    put16(buf, 8, fh.method)
+    put16(buf, 10, fh.modified_time)
+    put16(buf, 12, fh.modified_date)
+    if no_dd {
+      put32(buf, 14, fh.crc32)
+      if zip64_extra.size > 0 {
+        put32(buf, 18, U32MAX)
+        put32(buf, 22, U32MAX)
+      } else {
+        put32(buf, 18, fh.compressed_size64.as_u32)
+        put32(buf, 22, fh.uncompressed_size64.as_u32)
+      }
+    }
+    put16(buf, 26, fh.name.size.as_u16)
+    put16(buf, 28, (fh.extra.size + zip64_extra.size).as_u16)
+    ~out!(buf)
+    ~out!(fh.name.bytes.to_a)
+    ~out!(fh.extra)
+    ~out!(zip64_extra)
+  }
+
+  # Adds a file whose data is written as is, already compressed (Go's
+  # CreateRaw): fh's CRC-32 and sizes must be right.
+  pub def create_raw!(header: FileHeader) -> ~FileWriter[W] {
+    ~prepare!
+    fh = header
+    fh.compressed_size = min_u64(fh.compressed_size64, U64_32MAX).as_u32
+    fh.uncompressed_size = min_u64(fh.uncompressed_size64, U64_32MAX).as_u32
+    h = Hdr.new(fh: fh, offset: st[0].count.as_u64, raw: true)
+    self.st[0].dir << h
+    ~write_header!(h)
+    if fh.name.end_with?("/") {
+      self.st[0].last = -1
+      return FileWriter[W].new(st: st, id: -1, dir: true)
+    }
+    id = st[0].next_id
+    self.st[0].next_id = id + 1
+    self.st[0].last = id
+    self.st[0].last_closed = false
+    empty: [io.WriteCloser] = []
+    self.st[0].comp = empty
+    FileWriter[W].new(st: st, id: id, dir: false)
+  }
+
+  # Copies f (from a Reader) into the archive raw: no decompression,
+  # compression or checks (Go's Copy).
+  pub def copy![R](f: File[R]) -> ~Unit {
+    r = f.~open_raw
+    fw = self.~create_raw!(f.header)
+    buf: [Byte] = [0; 32 * 1024]
+    loop {
+      n = r.~read!(buf)
+      break if n == 0
+      fw.~write!(buf[0...n])
+    }
+  }
+
+  # Adds the files of fsys, walking from its root, compressed with Deflate
+  # (Go's AddFS). Only regular files and directories.
+  pub def add_fs![F](fsys: F) -> ~Unit {
+    zw = self
+    ~fs.walk_dir(fsys, ".") { |name, d, err|
+      if e = err {
+        fail e
+      }
+      return if name == "."
+      de = d.unwrap
+      info = de.~info
+      fail ZipError.NonRegularFile if !de.is_dir && !info.mode.is_regular?
+      h = file_info_header(info)
+      h.name = name
+      h.name += "/" if de.is_dir
+      h.method = DEFLATE
+      fw = zw.~create_header!(h)
+      return if de.is_dir
+      f = fsys.~open(name)
+      ~copy_close(fw, f)
+    }
+  }
+}
+
+def copy_file[W, F](fw: FileWriter[W], f: F) -> ~Int {
+  dst = fw
+  src = f
+  total = 0
+  buf: [Byte] = [0; 32 * 1024]
+  loop {
+    n = src.~read!(buf)
+    break if n == 0
+    dst.~write!(buf[0...n])
+    total += n
+  }
+  total
+}
+
+# Copies f into fw and closes f (Go's io.Copy, deferred Close).
+def copy_close[W, F](fw: FileWriter[W], f: F) -> ~Unit {
+  src = f
+  r = copy_file(fw, src)
+  src.close!
+  if e = r.err {
+    fail e
+  }
+}
+
+def min_u64(a: U64, b: U64) -> U64 { a < b ? a : b }
+
+# A Writer writing a ZIP archive to w (Go's NewWriter).
+pub def new_writer[W](w: W) -> Writer[W] {
+  comps: Map[U16, (bytes.Buffer) -> ~io.WriteCloser] = {}
+  e: [io.WriteCloser] = []
+  hooks: [(U64, U64) -> Unit] = []
+  bf: [Byte] = [0; BUF_SIZE]
+  hs: [Hdr] = []
+  Writer[W].new(st: [WriterState[W].new(w: w, buf: bf, n: 0, count: 0, dir: hs, last: -1, last_closed: true, next_id: 0, closed: false, comment: "", compressors: comps, comp: e, sink: bytes.new_buffer([]), digest: 0, raw_count: 0, comp_count: 0, fake_crc: false, close_hook: hooks)])
+}
+
+# What create!/create_header!/create_raw! return: writes the file's
+# content (Go's io.Writer from Create). A directory's accepts only empty
+# writes.
+pub struct FileWriter[W] {
+  st: [WriterState[W]]
+  id: Int
+  dir: Bool
+
+  pub def write!(p: [Byte]) -> ~Int {
+    if dir {
+      return 0 if p.size == 0
+      fail ZipError.WriteToDirectory
+    }
+    zw = Writer[W].new(st: st)
+    zw.~file_write!(id, p)
+  }
+}

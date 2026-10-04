@@ -1,0 +1,306 @@
+import "bytes"
+import "compress/flate"
+import "hash/crc32"
+import "io"
+import "io/fs"
+import "os"
+import "strings"
+import "testing/fstest"
+import "time"
+
+# Go's writer_test.go.
+
+struct WriteTest {
+  name: Str
+  data: [Byte]
+  method: U16
+  mode: U32
+}
+
+# Deterministic stand-in for Go's rand.Read.
+def random_bytes(n: Int) -> [Byte] {
+  out: [Byte] = [0; n]
+  x: U64 = 0x9e3779b97f4a7c15
+  for i in 0...n {
+    x = x ^ (x << 13)
+    x = x ^ (x >> 7)
+    x = x ^ (x << 17)
+    out[i] = (x >> 24).as_u8
+  }
+  out
+}
+
+def write_tests -> [WriteTest] {
+  [
+    WriteTest.new(name: "foo", data: b("Rabbits, guinea pigs, gophers, marsupial rats, and quolls."), method: STORE, mode: 0o666),
+    WriteTest.new(name: "bar", data: random_bytes(1 << 17), method: DEFLATE, mode: 0o644),
+    WriteTest.new(name: "setuid", data: b("setuid file"), method: DEFLATE, mode: 0o755 | fs.MODE_SETUID),
+    WriteTest.new(name: "setgid", data: b("setgid file"), method: DEFLATE, mode: 0o755 | fs.MODE_SETGID),
+    WriteTest.new(name: "symlink", data: b("../link/target"), method: DEFLATE, mode: 0o755 | fs.MODE_SYMLINK),
+    WriteTest.new(name: "device", data: b("device file"), method: DEFLATE, mode: 0o755 | fs.MODE_DEVICE),
+    WriteTest.new(name: "chardevice", data: b("char device file"), method: DEFLATE, mode: 0o755 | fs.MODE_DEVICE | fs.MODE_CHAR_DEVICE),
+  ]
+}
+
+def test_create[W](w: Writer[W], wt: WriteTest) -> ~Unit {
+  header = FileHeader.new(name: wt.name, method: wt.method)
+  header.set_mode!(fs.mode(wt.mode)) if wt.mode != 0
+  zw = w
+  f = zw.~create_header!(header)
+  f.~write!(wt.data)
+}
+
+def test_read_file[R](f: File[R], wt: WriteTest) -> ~Unit {
+  assert_eq f.header.name, wt.name
+  assert_eq f.mode.bits, wt.mode
+  rc = f.~open
+  got = io.~read_all(rc)
+  rc.~close!
+  assert got == wt.data, "file contents of #{wt.name} differ"
+}
+
+def reader_of(buf: bytes.Buffer) -> ~Reader[bytes.Reader] {
+  d = buf.bytes
+  ~new_reader(bytes.new_reader(d), d.size)
+}
+
+test "writer" {
+  buf = bytes.new_buffer([])
+  w = new_writer(buf)
+  tests = write_tests
+  for wt in tests {
+    ~test_create(w, wt)
+  }
+  w.~close!
+  r = ~reader_of(buf)
+  for i in 0...tests.size {
+    ~test_read_file(r.file[i], tests[i])
+  }
+}
+
+test "writer comment" {
+  for t in [("hi, hello", true), ("hi, こんにちわ", true), ("a" * UINT16MAX, true), ("a" * (UINT16MAX + 1), false)] {
+    buf = bytes.new_buffer([])
+    w = new_writer(buf)
+    res = w.set_comment!(t[0])
+    if !res.ok? {
+      assert !t[1], "SetComment: unexpected error"
+      next
+    }
+    assert t[1], "SetComment: unexpected success, want error"
+    assert w.close!.ok?, "close"
+    assert_eq w.st[0].closed, t[1]
+    r = ~reader_of(buf)
+    assert_eq r.comment, t[0]
+  }
+}
+
+struct Utf8Test {
+  name: Str
+  comment: Str
+  non_utf8: Bool
+  flags: U16
+}
+
+test "writer utf8" {
+  sjis: [Byte] = [0x93, 0xfa, 0x96, 0x7b, 0x8c, 0xea, 0x2e, 0x74, 0x78, 0x74]
+  tests = [
+    Utf8Test.new(name: "hi, hello", comment: "in the world", flags: 0x8),
+    Utf8Test.new(name: "hi, こんにちわ", comment: "in the world", flags: 0x808),
+    Utf8Test.new(name: "hi, こんにちわ", comment: "in the world", non_utf8: true, flags: 0x8),
+    Utf8Test.new(name: "hi, hello", comment: "in the 世界", flags: 0x808),
+    Utf8Test.new(name: "hi, こんにちわ", comment: "in the 世界", flags: 0x808),
+    Utf8Test.new(name: "the replacement rune is �", comment: "the replacement rune is �", flags: 0x808),
+    Utf8Test.new(name: Str.from_bytes(sjis), comment: "in the 世界", flags: 0x008),
+  ]
+  buf = bytes.new_buffer([])
+  w = new_writer(buf)
+  for t in tests {
+    h = FileHeader.new(name: t.name, comment: t.comment, non_utf8: t.non_utf8, method: DEFLATE)
+    fw = w.~create_header!(h)
+    fw.~write!([])
+  }
+  w.~close!
+  r = ~reader_of(buf)
+  for i in 0...tests.size {
+    assert_eq r.file[i].header.flags, tests[i].flags
+  }
+}
+
+test "writer time" {
+  buf = bytes.new_buffer([])
+  h = FileHeader.new(name: "test.txt", modified: time.date(2017, 10, 31, 21, 11, 57, 0, tz(-7)))
+  w = new_writer(buf)
+  w.~create_header!(h)
+  w.~close!
+  want = os.~read_file("testdata/time-go.zip")
+  assert buf.bytes == want, "contents of time-go.zip differ"
+}
+
+test "writer offset" {
+  buf = bytes.new_buffer([])
+  existing: [Byte] = [1, 2, 3, 1, 2, 3, 1, 2, 3]
+  n = buf.write!(existing)
+  w = new_writer(buf)
+  w.set_offset!(n)
+  tests = write_tests
+  for wt in tests {
+    ~test_create(w, wt)
+  }
+  w.~close!
+  r = ~reader_of(buf)
+  for i in 0...tests.size {
+    ~test_read_file(r.file[i], tests[i])
+  }
+}
+
+test "writer flush" {
+  buf = bytes.new_buffer([])
+  w = new_writer(buf)
+  w.~create!("foo")
+  assert_eq buf.len, 0
+  w.~flush!
+  assert buf.len > 0, "no bytes written after flush"
+}
+
+test "writer dir" {
+  w = new_writer(io.Discard.new())
+  dw = w.~create!("dir/")
+  e: [Byte] = []
+  assert dw.write!(e).ok?, "Write(nil) to directory"
+  assert !dw.write!(b("hello")).ok?, "Write(hello) to directory: want error"
+}
+
+test "writer dir attributes" {
+  buf = bytes.new_buffer([])
+  w = new_writer(buf)
+  w.~create_header!(FileHeader.new(name: "dir/", method: DEFLATE, compressed_size64: 1234, uncompressed_size64: 5678))
+  w.~close!
+  bs = buf.bytes
+  sig: [Byte] = [0; 4]
+  put32(sig, 0, FILE_HEADER_SIGNATURE)
+  idx = bytes.index(bs, sig)
+  assert idx >= 0, "file header not found"
+  bs = bs[idx...bs.size]
+  zeros4: [Byte] = [0, 0, 0, 0]
+  assert bs[6...10] == zeros4, "unexpected method and flags"
+  zeros12: [Byte] = [0; 12]
+  assert bs[14...26] == zeros12, "crc and sizes should be 0"
+  put32(sig, 0, DATA_DESCRIPTOR_SIGNATURE)
+  assert !bytes.contains(bs, sig), "there should be no data descriptor"
+}
+
+test "writer copy" {
+  buf = bytes.new_buffer([])
+  w = new_writer(buf)
+  tests = write_tests
+  for wt in tests {
+    ~test_create(w, wt)
+  }
+  w.~close!
+  src = ~reader_of(buf)
+  for i in 0...tests.size {
+    ~test_read_file(src.file[i], tests[i])
+  }
+  buf2 = bytes.new_buffer([])
+  dst = new_writer(buf2)
+  for f in src.file {
+    dst.~copy!(f)
+  }
+  dst.~close!
+  r = ~reader_of(buf2)
+  for i in 0...tests.size {
+    ~test_read_file(r.file[i], tests[i])
+  }
+}
+
+test "writer create raw" {
+  files = [("small store w desc", b("gophers"), STORE, 0x8.as_u16), ("small deflate wo desc", bytes.repeat(b("abcdefg"), 2048), DEFLATE, 0.as_u16)]
+  archive = bytes.new_buffer([])
+  w = new_writer(archive)
+  crcs: [U32] = []
+  csizes: [U64] = []
+  for f in files {
+    content = f[1]
+    crc = crc32.checksum_ieee(content)
+    size = content.size.as_u64
+    csize = size
+    compressed = content
+    if f[2] == DEFLATE {
+      cb = bytes.new_buffer([])
+      fw = ~flate.new_writer(cb, flate.BEST_SPEED)
+      fw.~write!(content)
+      fw.~close!
+      compressed = cb.bytes
+      csize = compressed.size.as_u64
+    }
+    crcs << crc
+    csizes << csize
+    h = FileHeader.new(name: f[0], method: f[2], flags: f[3], crc32: crc, compressed_size64: csize, uncompressed_size64: size)
+    zw = w.~create_raw!(h)
+    zw.~write!(compressed)
+  }
+  w.~close!
+  r = ~reader_of(archive)
+  for i in 0...files.size {
+    got = r.file[i].header
+    assert_eq got.name, files[i][0]
+    assert_eq got.method, files[i][2]
+    assert_eq got.flags, files[i][3]
+    assert_eq got.crc32, crcs[i]
+    assert_eq got.compressed_size64, csizes[i]
+    assert_eq got.uncompressed_size64, files[i][1].size.as_u64
+    rc = r.file[i].~open
+    assert io.~read_all(rc) == files[i][1], "#{got.name}: read_all returned unexpected bytes"
+  }
+}
+
+def write_tests_to_fs(tests: [WriteTest]) -> fstest.MapFS {
+  files: Map[Str, fstest.MapFile] = {}
+  for wt in tests {
+    files[wt.name] = fstest.MapFile.new(data: wt.data, mode: fs.mode(wt.mode), mod_time: time.Time.new)
+  }
+  fstest.map_fs(files)
+}
+
+test "writer add fs" {
+  buf = bytes.new_buffer([])
+  w = new_writer(buf)
+  e: [Byte] = []
+  tests = [
+    WriteTest.new(name: "emptyfolder", data: e, mode: 0o755 | fs.MODE_DIR),
+    WriteTest.new(name: "file.go", data: b("hello"), mode: 0o644),
+    WriteTest.new(name: "subfolder/another.go", data: b("world"), mode: 0o644),
+  ]
+  w.~add_fs!(write_tests_to_fs(tests))
+  w.~close!
+  want = [tests[0], tests[1], WriteTest.new(name: "subfolder", data: e, mode: 0o555 | fs.MODE_DIR), tests[2]]
+  r = ~reader_of(buf)
+  for i in 0...want.size {
+    wt = want[i]
+    wt.name += "/" if wt.mode & fs.MODE_DIR != 0
+    ~test_read_file(r.file[i], wt)
+  }
+}
+
+test "issue 61875" {
+  buf = bytes.new_buffer([])
+  w = new_writer(buf)
+  tests = [
+    WriteTest.new(name: "symlink", data: b("../link/target"), method: DEFLATE, mode: 0o755 | fs.MODE_SYMLINK),
+    WriteTest.new(name: "device", data: b(""), method: DEFLATE, mode: 0o755 | fs.MODE_DEVICE),
+  ]
+  assert !w.add_fs!(write_tests_to_fs(tests)).ok?, "expected error, got nil"
+}
+
+test "writer errors" {
+  buf = bytes.new_buffer([])
+  w = new_writer(buf)
+  f = w.~create!("a")
+  w.~create!("b")
+  assert_eq f.write!(b("x")).err.unwrap.message, "zip: write to closed file"
+  w.~close!
+  assert_eq w.close!.err.unwrap.message, "zip: writer closed twice"
+  assert_eq w.create_header!(FileHeader.new(name: "c", method: 99)).err.unwrap.message, "zip: unsupported compression algorithm"
+  assert strings.contains(ZipError.Duplicate(name: "x").message, "duplicate")
+}

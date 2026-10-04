@@ -168,64 +168,51 @@ pub struct String {
 
   # ---------------------------------------------------------------- ASN.1
 
-  # Go's readASN1: the next element (DER lengths only, low tag numbers
-  # only), with or without its header, and its tag.
-  def read_asn1_any!(skip_header: Bool) -> (String, Byte)? {
+  # The contents of the next element and its tag.
+  pub def read_any_asn1! -> (String, Byte)? {
     return none if s.size < 2
-    tag = s[0]
-    len_byte = s[1]
-    return none if tag & 0x1f == 0x1f
-    length = 0
-    header_len = 0
-    if len_byte & 0x80 == 0 {
-      # Short-form length (section 8.1.3.4), encoded in bits 1-7.
-      length = len_byte.to_i + 2
-      header_len = 2
-    } else {
-      # Long-form length (section 8.1.3.5). Bits 1-7 encode the number of
-      # octets used to encode the length.
-      len_len = (len_byte & 0x7f).to_i
-      return none if len_len == 0 || len_len > 4 || s.size < 2 + len_len
-      len32 = 0
-      i = 0
-      while i < len_len {
-        len32 = (len32 << 8) | s[2 + i].to_i
-        i += 1
-      }
-      # ITU-T X.690 section 10.1 (DER length forms) requires encoding the
-      # length with the minimum number of octets.
-      return none if len32 < 128
-      # Long length form may not be used for lengths that fit in short form.
-      return none if (len32 >> ((len_len - 1) * 8)) == 0
-      header_len = 2 + len_len
-      length = header_len + len32
-    }
-    if v = self.read!(length) {
-      return (String.new(s: skip_header ? v[header_len...v.size] : v), tag)
-    }
-    none
+    v = s
+    # (Inlined: a `!` call on self copies the receiver through a cell.)
+    h = asn1_header(v)
+    return none if h[0] < 0
+    self.s = v[h[1]...v.size]
+    (String.new(s: v[h[0]...h[1]]), v[0])
   }
 
-  # The contents of the next element and its tag.
-  pub def read_any_asn1! -> (String, Byte)? { self.read_asn1_any!(true) }
-
   # The next element (with its header) and its tag.
-  pub def read_any_asn1_element! -> (String, Byte)? { self.read_asn1_any!(false) }
+  pub def read_any_asn1_element! -> (String, Byte)? {
+    return none if s.size < 2
+    v = s
+    # (Inlined: a `!` call on self copies the receiver through a cell.)
+    h = asn1_header(v)
+    return none if h[0] < 0
+    self.s = v[h[1]...v.size]
+    (String.new(s: v[0...h[1]]), v[0])
+  }
 
-  # The contents of the next element, which must have the given tag.
+  # The contents of the next element, which must have the given tag (a
+  # valid element with another tag is consumed, as in Go).
   pub def read_asn1!(tag: Byte) -> String? {
-    if r = self.read_any_asn1! {
-      return r[0] if r[1] == tag
-    }
-    none
+    return none if s.size < 2
+    v = s
+    # (Inlined: a `!` call on self copies the receiver through a cell.)
+    h = asn1_header(v)
+    return none if h[0] < 0
+    self.s = v[h[1]...v.size]
+    return none if v[0] != tag
+    String.new(s: v[h[0]...h[1]])
   }
 
   # The next element (with its header), which must have the given tag.
   pub def read_asn1_element!(tag: Byte) -> String? {
-    if r = self.read_any_asn1_element! {
-      return r[0] if r[1] == tag
-    }
-    none
+    return none if s.size < 2
+    v = s
+    # (Inlined: a `!` call on self copies the receiver through a cell.)
+    h = asn1_header(v)
+    return none if h[0] < 0
+    self.s = v[h[1]...v.size]
+    return none if v[0] != tag
+    String.new(s: v[0...h[1]])
   }
 
   # The contents of the next element with the given tag, as bytes.
@@ -545,4 +532,39 @@ def asn1_unsigned(n: [Byte]) -> U64? {
     out = (out << 8) | b.to_u64
   }
   out
+}
+
+# Go's readASN1 length rules for the element at the start of s: the offset
+# of its contents and its whole length, or (-1, 0).
+def asn1_header(s: [Byte]) -> (Int, Int) {
+  return (-1, 0) if s.size < 2
+  tag = s[0]
+  len_byte = s[1]
+  # High-tag-number form isn't supported.
+  return (-1, 0) if tag & 0x1f == 0x1f
+  if len_byte & 0x80 == 0 {
+    # Short-form length (section 8.1.3.4), encoded in bits 1-7.
+    length = len_byte.to_i + 2
+    return (-1, 0) if s.size < length
+    return (2, length)
+  }
+  # Long-form length (section 8.1.3.5). Bits 1-7 encode the number of
+  # octets used to encode the length.
+  len_len = (len_byte & 0x7f).to_i
+  return (-1, 0) if len_len == 0 || len_len > 4 || s.size < 2 + len_len
+  len32 = 0
+  i = 0
+  while i < len_len {
+    len32 = (len32 << 8) | s[2 + i].to_i
+    i += 1
+  }
+  # ITU-T X.690 section 10.1 (DER length forms) requires encoding the
+  # length with the minimum number of octets.
+  return (-1, 0) if len32 < 128
+  # Long length form may not be used for lengths that fit in short form.
+  return (-1, 0) if (len32 >> ((len_len - 1) * 8)) == 0
+  header_len = 2 + len_len
+  length = header_len + len32
+  return (-1, 0) if s.size < length
+  (header_len, length)
 }

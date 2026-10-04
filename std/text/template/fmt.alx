@@ -1,0 +1,992 @@
+# Go's fmt (print.go and format.go) over template Values: what `print`,
+# `printf`, `println` and `{{.}}` produce. An INVALID Value is Go's nil
+# interface argument ("<nil>").
+
+import "strconv"
+import "unicode/utf8"
+
+LDIGITS = "0123456789abcdefx"
+UDIGITS = "0123456789ABCDEFX"
+
+struct Printer {
+  buf: [Str]
+  # flags
+  wid_present: Bool
+  prec_present: Bool
+  minus: Bool
+  plus: Bool
+  sharp: Bool
+  space: Bool
+  zero: Bool
+  plus_v: Bool
+  sharp_v: Bool
+  wid: Int
+  prec: Int
+  # printf state
+  erroring: Bool
+  reordered: Bool
+  good_arg_num: Bool
+
+  def clearflags! -> Unit {
+    self.wid_present = false
+    self.prec_present = false
+    self.minus = false
+    self.plus = false
+    self.sharp = false
+    self.space = false
+    self.zero = false
+    self.plus_v = false
+    self.sharp_v = false
+    self.wid = 0
+    self.prec = 0
+  }
+
+  def w!(s: Str) { self.buf << s }
+
+  def text -> Str { buf.join("") }
+
+  # Generates n bytes of padding.
+  def write_padding!(n: Int) -> Unit {
+    return nil if n <= 0
+    # Zero padding is allowed only to the left.
+    c = (zero && !minus) ? "0" : " "
+    w!(c * n)
+  }
+
+  # Appends s, padded on the left (!minus) or right (minus).
+  def pad!(s: Str) -> Unit {
+    if !wid_present || wid == 0 {
+      w!(s)
+      return nil
+    }
+    width = wid - utf8.rune_count_in_string(s)
+    if !minus {
+      write_padding!(width)
+      w!(s)
+    } else {
+      w!(s)
+      write_padding!(width)
+    }
+  }
+
+  def fmt_boolean!(v: Bool) { pad!(v ? "true" : "false") }
+
+  # Formats a uint64 as "U+0078" or with sharp set as "U+0078 'x'".
+  def fmt_unicode!(u0: U64) -> Unit {
+    u = u0
+    p = 4
+    if prec_present && prec > 4 {
+      p = prec
+    }
+    hex = strings_upper_hex(u)
+    while hex.size < p { hex = "0" + hex }
+    s = "U+" + hex
+    if sharp && u <= 0x10FFFF.as_u64 && strconv.is_print(u.to_i.to_i32) {
+      s = s + " '" + Str.from_bytes(utf8.encode_rune(u.to_i.to_i32)) + "'"
+    }
+    old_zero = zero
+    self.zero = false
+    pad!(s)
+    self.zero = old_zero
+  }
+
+  # Formats signed and unsigned integers.
+  def fmt_integer!(u0: U64, base: Int, is_signed: Bool, verb: Int, digits: Str) -> Unit {
+    u = u0
+    negative = is_signed && u.as_i64 < 0
+    if negative {
+      u = 0.as_u64 -% u
+    }
+    # Two ways to ask for extra leading zero digits: %.3d or %03d. If both
+    # are specified the zero flag is ignored and padding with spaces is
+    # used instead.
+    p = 0
+    if prec_present {
+      p = prec
+      # Precision of 0 and value of 0 means "print nothing" but padding.
+      if p == 0 && u == 0.as_u64 {
+        old_zero = zero
+        self.zero = false
+        write_padding!(wid)
+        self.zero = old_zero
+        return nil
+      }
+    } else if zero && !minus && wid_present {
+      # Zero padding is allowed only to the left.
+      p = wid
+      if negative || plus || space {
+        # leave room for sign
+        p -= 1
+      }
+    }
+    b = base.as_u64
+    ds: [Byte] = []
+    while u >= b {
+      ds << digits[(u % b).to_i]
+      u = u / b
+    }
+    ds << digits[u.to_i]
+    while ds.size < p { ds << 48 }
+    # Various prefixes: 0x, -, etc.
+    if sharp {
+      if base == 2 {
+        ds << 98
+        ds << 48
+      } else if base == 8 {
+        ds << 48 if ds[ds.size - 1] != 48
+      } else if base == 16 {
+        ds << digits[16]
+        ds << 48
+      }
+    }
+    if verb == 79 { # 'O'
+      ds << 111
+      ds << 48
+    }
+    if negative {
+      ds << 45
+    } else if plus {
+      ds << 43
+    } else if space {
+      ds << 32
+    }
+    # Left padding with zeros has already been handled like precision
+    # earlier or the zero flag is ignored due to an explicitly set
+    # precision.
+    old_zero = zero
+    self.zero = false
+    pad!(Str.from_bytes(ds.reverse))
+    self.zero = old_zero
+  }
+
+  # Truncates s to the specified precision, if present.
+  def truncate_string(s: Str) -> Str {
+    if prec_present {
+      n = prec
+      i = 0
+      while i < s.size {
+        n -= 1
+        return s[0...i] if n < 0
+        _, w = utf8.decode_rune_at(s, i)
+        i += w
+      }
+    }
+    s
+  }
+
+  def fmt_s!(s: Str) { pad!(truncate_string(s)) }
+
+  # Formats a string as a hexadecimal encoding of its bytes.
+  def fmt_sx!(s: Str, digits: Str) -> Unit {
+    length = s.size
+    # Set length to not process more bytes than the precision demands.
+    length = prec if prec_present && prec < length
+    # Compute width of the encoding taking into account the sharp and space
+    # flag.
+    width = 2 * length
+    if width > 0 {
+      if space {
+        # Each element encoded by two hexadecimals will get a leading 0x or 0X.
+        width *= 2 if sharp
+        # Elements will be separated by a space.
+        width += length - 1
+      } else if sharp {
+        # Only a leading 0x or 0X will be added for the whole string.
+        width += 2
+      }
+    } else {
+      # The byte slice or string that should be encoded is empty.
+      write_padding!(wid) if wid_present
+      return nil
+    }
+    # Handle padding to the left.
+    if wid_present && wid > width && !minus {
+      write_padding!(wid - width)
+    }
+    o: [Byte] = []
+    if sharp {
+      o << 48
+      o << digits[16]
+    }
+    i = 0
+    while i < length {
+      if space && i > 0 {
+        o << 32
+        if sharp {
+          o << 48
+          o << digits[16]
+        }
+      }
+      c = s[i]
+      o << digits[(c >> 4).to_i]
+      o << digits[(c & 15).to_i]
+      i += 1
+    }
+    w!(Str.from_bytes(o))
+    # Handle padding to the right.
+    if wid_present && wid > width && minus {
+      write_padding!(wid - width)
+    }
+  }
+
+  # Formats a string as a double-quoted, escaped Go string constant. If
+  # sharp is set a raw (backquoted) string may be returned instead if the
+  # string does not contain any control characters other than tab.
+  def fmt_q!(s0: Str) -> Unit {
+    s = truncate_string(s0)
+    if sharp && strconv.can_backquote(s) {
+      pad!("`" + s + "`")
+      return nil
+    }
+    pad!(plus ? strconv.quote_to_ascii(s) : strconv.quote(s))
+  }
+
+  # Formats an integer as a Unicode character.
+  def fmt_c!(c: U64) -> Unit {
+    r = c > 0x10FFFF.as_u64 ? utf8.RUNE_ERROR : c.to_i.to_i32
+    r = utf8.RUNE_ERROR if !utf8.valid_rune(r)
+    pad!(Str.from_bytes(utf8.encode_rune(r)))
+  }
+
+  # Formats an integer as a single-quoted, escaped Go character constant.
+  def fmt_qc!(c: U64) -> Unit {
+    r = c > 0x10FFFF.as_u64 ? utf8.RUNE_ERROR : c.to_i.to_i32
+    pad!(plus ? strconv.quote_rune_to_ascii(r) : strconv.quote_rune(r))
+  }
+
+  # Formats a float64.
+  def fmt_float!(v: Float, size: Int, verb: Int, prec0: Int) -> Unit {
+    # Explicit precision in format specifier overrules default precision.
+    p = prec_present ? prec : prec0
+    # Format number, reserving space for leading + sign if needed.
+    vs = Str.from_bytes([verb.as_u8])
+    s = strconv.format_float(v, vs, p, size)
+    num = (s[0] == 45 || s[0] == 43) ? s : "+" + s
+    # space means to add a leading space instead of a "+" sign unless the
+    # sign is explicitly asked for by plus.
+    if space && num[0] == 43 && !plus {
+      num = " " + num[1...num.size]
+    }
+    # Special handling for infinities and NaN, which don't look like a
+    # number so shouldn't be padded with zeros.
+    if num[1] == 73 || num[1] == 78 {
+      old_zero = zero
+      self.zero = false
+      # Remove sign before NaN if not asked for.
+      if num[1] == 78 && !space && !plus {
+        num = num[1...num.size]
+      }
+      pad!(num)
+      self.zero = old_zero
+      return nil
+    }
+    # The sharp flag forces printing a decimal point for non-binary formats
+    # and retains trailing zeros, which we may need to restore.
+    if sharp && verb != 98 {
+      digits = 0
+      if verb == 118 || verb == 103 || verb == 71 || verb == 120 {
+        digits = p
+        # If no precision is set explicitly use a precision of 6.
+        digits = 6 if digits == -1
+      }
+      tail = ""
+      has_point = false
+      saw_nonzero = false
+      i = 1
+      cut = num.size
+      while i < num.size {
+        c = num[i]
+        if c == 46 {
+          has_point = true
+        } else if c == 112 || c == 80 {
+          tail = num[i...num.size]
+          cut = i
+          break
+        } else if (c == 101 || c == 69) && verb != 120 && verb != 88 {
+          tail = num[i...num.size]
+          cut = i
+          break
+        } else {
+          saw_nonzero = true if c != 48
+          # Count significant digits after the first non-zero digit.
+          digits -= 1 if saw_nonzero
+        }
+        i += 1
+      }
+      num = num[0...cut]
+      if !has_point {
+        # Leading digit 0 should contribute once to digits.
+        digits -= 1 if num.size == 2 && num[1] == 48
+        num = num + "."
+      }
+      while digits > 0 {
+        num = num + "0"
+        digits -= 1
+      }
+      num = num + tail
+    }
+    # We want a sign if asked for and if the sign is not positive.
+    if plus || num[0] != 43 {
+      # If we're zero padding to the left we want the sign before the
+      # leading zeros. Achieve this by writing the sign out and then padding
+      # the unsigned number.
+      if zero && !minus && wid_present && wid > num.size {
+        w!(num[0...1])
+        write_padding!(wid - num.size)
+        w!(num[1...num.size])
+        return nil
+      }
+      pad!(num)
+      return nil
+    }
+    # No sign to show and the number is positive; just print the unsigned
+    # number.
+    pad!(num[1...num.size])
+  }
+
+  # --- print.go ---
+
+  def bad_verb!(v: Value, verb: Int) -> Unit {
+    self.erroring = true
+    w!("%!")
+    w!(rune_str(verb))
+    w!("(")
+    if v.k != KIND_INVALID {
+      w!(v.type_name)
+      w!("=")
+      print_arg!(v, 118)
+    } else {
+      w!("<nil>")
+    }
+    w!(")")
+    self.erroring = false
+  }
+
+  def fmt_bool!(v: Value, b: Bool, verb: Int) -> Unit {
+    if verb == 116 || verb == 118 {
+      fmt_boolean!(b)
+    } else {
+      bad_verb!(v, verb)
+    }
+  }
+
+  # Formats a uint64 in hexadecimal and prefixes it with 0x or not, as
+  # requested, by temporarily setting the sharp flag.
+  def fmt_0x64!(u: U64, leading0x: Bool) -> Unit {
+    s = sharp
+    self.sharp = leading0x
+    fmt_integer!(u, 16, false, 118, LDIGITS)
+    self.sharp = s
+  }
+
+  def fmt_int!(v: Value, u: U64, is_signed: Bool, verb: Int) -> Unit {
+    case verb {
+      118 => {
+        if sharp_v && !is_signed {
+          fmt_0x64!(u, true)
+        } else {
+          fmt_integer!(u, 10, is_signed, verb, LDIGITS)
+        }
+      }
+      100 => fmt_integer!(u, 10, is_signed, verb, LDIGITS)
+      98 => fmt_integer!(u, 2, is_signed, verb, LDIGITS)
+      111 | 79 => fmt_integer!(u, 8, is_signed, verb, LDIGITS)
+      120 => fmt_integer!(u, 16, is_signed, verb, LDIGITS)
+      88 => fmt_integer!(u, 16, is_signed, verb, UDIGITS)
+      99 => fmt_c!(u)
+      113 => fmt_qc!(u)
+      85 => fmt_unicode!(u)
+      _ => bad_verb!(v, verb)
+    }
+  }
+
+  def fmt_flt!(v: Value, x: Float, size: Int, verb: Int) -> Unit {
+    case verb {
+      118 => fmt_float!(x, size, 103, -1)
+      98 | 103 | 71 | 120 | 88 => fmt_float!(x, size, verb, -1)
+      102 | 101 | 69 => fmt_float!(x, size, verb, 6)
+      70 => fmt_float!(x, size, 102, 6)
+      _ => bad_verb!(v, verb)
+    }
+  }
+
+  def fmt_complex!(v: Value, re: Float, im: Float, size: Int, verb: Int) -> Unit {
+    case verb {
+      118 | 98 | 103 | 71 | 120 | 88 | 102 | 70 | 101 | 69 => {
+        old_plus = plus
+        w!("(")
+        fmt_flt!(v, re, size / 2, verb)
+        # Imaginary part always has a sign.
+        self.plus = true
+        fmt_flt!(v, im, size / 2, verb)
+        w!("i)")
+        self.plus = old_plus
+        nil
+      }
+      _ => bad_verb!(v, verb)
+    }
+  }
+
+  def fmt_string!(v: Value, s: Str, verb: Int) -> Unit {
+    case verb {
+      118 => {
+        if sharp_v {
+          fmt_q!(s)
+        } else {
+          fmt_s!(s)
+        }
+      }
+      115 => fmt_s!(s)
+      120 => fmt_sx!(s, LDIGITS)
+      88 => fmt_sx!(s, UDIGITS)
+      113 => fmt_q!(s)
+      _ => bad_verb!(v, verb)
+    }
+  }
+
+  # Go's handleMethods: a value with a String() or Error() method prints
+  # that for %v %s %x %X %q.
+  def handle_methods!(v: Value, verb: Int) -> Bool {
+    return false if erroring
+    return false if sharp_v
+    if verb == 118 || verb == 115 || verb == 120 || verb == 88 || verb == 113 {
+      if o = v.obj {
+        if s = o.tmpl_string {
+          fmt_string!(v, s, verb)
+          return true
+        }
+      }
+    }
+    false
+  }
+
+  def print_arg!(v0: Value, verb: Int) -> Unit {
+    # A nil interface is Go's nil argument.
+    v = nil_iface?(v0) ? Value.invalid : v0
+    if v.k == KIND_INVALID {
+      if verb == 84 || verb == 118 {
+        pad!("<nil>")
+      } else {
+        bad_verb!(v, verb)
+      }
+      return nil
+    }
+    # Special processing considerations.
+    if verb == 84 { # %T
+      fmt_s!(v.type_name)
+      return nil
+    }
+    if verb == 112 { # %p
+      fmt_pointer!(v, 112)
+      return nil
+    }
+    return nil if handle_methods!(v, verb)
+    print_value!(v, verb, 0)
+  }
+
+  # Go's fmtPointer: alx values have no addresses; a non-nil pointer
+  # prints as 0x1.
+  def fmt_pointer!(v: Value, verb: Int) -> Unit {
+    u = 0.as_u64
+    case v.k {
+      # alx values have no addresses: a non-nil pointer prints as this one.
+      KIND_PTR => u = v.nil? ? 0.as_u64 : 0xc000010000.as_u64
+      KIND_LIST | KIND_MAP | KIND_FUNC => u = v.nil? ? 0.as_u64 : 1.as_u64
+      _ => {
+        bad_verb!(v, verb)
+        return nil
+      }
+    }
+    case verb {
+      118 => {
+        if sharp_v {
+          w!("(")
+          w!(v.type_name)
+          w!(")(")
+          if u == 0.as_u64 {
+            w!("nil")
+          } else {
+            fmt_0x64!(u, true)
+          }
+          w!(")")
+        } else if u == 0.as_u64 {
+          pad!("<nil>")
+        } else {
+          fmt_0x64!(u, !sharp)
+        }
+      }
+      112 => fmt_0x64!(u, !sharp)
+      98 | 111 | 100 | 120 | 88 => fmt_int!(v, u, false, verb)
+      _ => bad_verb!(v, verb)
+    }
+  }
+
+  def print_value!(v: Value, verb: Int, depth: Int) -> Unit {
+    # Handle values with special methods if not already handled by
+    # print_arg (depth == 0).
+    if depth > 0 && v.k != KIND_INVALID {
+      return nil if handle_methods!(v, verb)
+    }
+    case v.k {
+      KIND_INVALID => {
+        # (no value inside a container is a nil interface element)
+        if depth == 0 {
+          w!("<invalid reflect.Value>")
+        } else if sharp_v {
+          w!("interface {}(nil)")
+        } else {
+          w!("<nil>")
+        }
+      }
+      KIND_BOOL => fmt_bool!(v, v.n != 0, verb)
+      KIND_INT => fmt_int!(v, v.n.as_u64, true, verb)
+      KIND_UINT => fmt_int!(v, v.u, false, verb)
+      KIND_FLOAT => fmt_flt!(v, v.f, v.type_name == "float32" ? 32 : 64, verb)
+      KIND_COMPLEX => fmt_complex!(v, v.f, v.g, v.type_name == "complex64" ? 64 : 128, verb)
+      KIND_STRING => fmt_string!(v, v.s, verb)
+      KIND_MAP => {
+        if sharp_v {
+          w!(v.type_name)
+          if v.nil? {
+            w!("(nil)")
+            return nil
+          }
+          w!("{")
+        } else {
+          w!("map[")
+        }
+        i = 0
+        for e in v.sorted_entries {
+          if i > 0 {
+            w!(sharp_v ? ", " : " ")
+          }
+          print_value!(e[0], verb, depth + 1)
+          w!(":")
+          print_value!(e[1], verb, depth + 1)
+          i += 1
+        }
+        w!(sharp_v ? "}" : "]")
+      }
+      KIND_STRUCT => {
+        w!(v.type_name) if sharp_v
+        w!("{")
+        i = 0
+        for e in v.entries {
+          if i > 0 {
+            w!(sharp_v ? ", " : " ")
+          }
+          if plus_v || sharp_v {
+            w!(e[0].s)
+            w!(":")
+          }
+          print_value!(e[1], verb, depth + 1)
+          i += 1
+        }
+        w!("}")
+      }
+      KIND_LIST => {
+        tn = v.type_name
+        if verb == 115 || verb == 113 || verb == 120 || verb == 88 {
+          # Handle byte and uint8 slices and arrays special for the above
+          # verbs.
+          if elem_type(tn) == "uint8" || elem_type(tn) == "byte" {
+            bs: [Byte] = v.elems.map { it.u.to_i.as_u8 }
+            fmt_bytes!(Str.from_bytes(bs), verb)
+            return nil
+          }
+        }
+        if sharp_v {
+          w!(tn)
+          if v.nil? && strings_has_prefix(tn, "[]") {
+            w!("(nil)")
+            return nil
+          }
+          w!("{")
+          i = 0
+          for e in v.elems {
+            w!(", ") if i > 0
+            print_value!(e, verb, depth + 1)
+            i += 1
+          }
+          w!("}")
+        } else {
+          w!("[")
+          i = 0
+          for e in v.elems {
+            w!(" ") if i > 0
+            print_value!(e, verb, depth + 1)
+            i += 1
+          }
+          w!("]")
+        }
+      }
+      KIND_PTR => {
+        # A nil interface element (Go's Interface case).
+        if nil_iface?(v) {
+          if sharp_v {
+            w!(v.type_name)
+            w!("(nil)")
+          } else {
+            w!("<nil>")
+          }
+          return nil
+        }
+        # pointer to array or slice or struct? ok at top level but not
+        # embedded (avoid loops)
+        if depth == 0 && !v.nil? {
+          a = v.elem
+          if a.k == KIND_LIST || a.k == KIND_STRUCT || a.k == KIND_MAP {
+            w!("&")
+            print_value!(a, verb, depth + 1)
+            return nil
+          }
+        }
+        fmt_pointer!(v, verb)
+      }
+      _ => fmt_pointer!(v, verb)
+    }
+  }
+
+  def fmt_bytes!(s: Str, verb: Int) -> Unit {
+    case verb {
+      115 => pad!(truncate_string(s))
+      120 => fmt_sx!(s, LDIGITS)
+      88 => fmt_sx!(s, UDIGITS)
+      _ => fmt_q!(s)
+    }
+  }
+
+  def bad_arg_num!(verb: Int) -> Unit {
+    w!("%!")
+    w!(rune_str(verb))
+    w!("(BADINDEX)")
+  }
+
+  def missing_arg!(verb: Int) -> Unit {
+    w!("%!")
+    w!(rune_str(verb))
+    w!("(MISSING)")
+  }
+
+  # Go's argNumber: an explicit argument index [n] at format[i].
+  def arg_number!(arg_num: Int, format: Str, i: Int, num_args: Int) -> (Int, Int, Bool) {
+    if format.size <= i || format[i] != 91 {
+      return (arg_num, i, false)
+    }
+    self.reordered = true
+    index, w, ok = parse_arg_number(format[i...format.size])
+    if ok && 0 <= index && index < num_args {
+      return (index, i + w, true)
+    }
+    self.good_arg_num = false
+    (arg_num, i + w, ok)
+  }
+
+  def do_printf!(format: Str, a: [Value]) -> Unit {
+    end = format.size
+    arg_num = 0
+    after_index = false
+    self.reordered = false
+    i = 0
+    while i < end {
+      self.good_arg_num = true
+      lasti = i
+      while i < end && format[i] != 37 { i += 1 }
+      w!(format[lasti...i]) if i > lasti
+      break if i >= end
+      # Process one verb
+      i += 1
+      # Do we have flags?
+      clearflags!
+      simple = false
+      while i < end {
+        c = format[i]
+        if c == 35 {
+          self.sharp = true
+        } else if c == 48 {
+          self.zero = true
+        } else if c == 43 {
+          self.plus = true
+        } else if c == 45 {
+          self.minus = true
+        } else if c == 32 {
+          self.space = true
+        } else {
+          # Fast path for common case of ascii lower case simple verbs
+          # without precision or width or argument indices.
+          if 97 <= c && c <= 122 && arg_num < a.size {
+            if c == 118 {
+              # Go syntax
+              self.sharp_v = sharp
+              self.sharp = false
+              # Struct-field syntax
+              self.plus_v = plus
+              self.plus = false
+            }
+            print_arg!(a[arg_num], c.to_i)
+            arg_num += 1
+            i += 1
+            simple = true
+          }
+          break
+        }
+        i += 1
+      }
+      next if simple
+      # Do we have an explicit argument index?
+      arg_num, i, after_index = arg_number!(arg_num, format, i, a.size)
+      # Do we have width?
+      if i < end && format[i] == 42 {
+        i += 1
+        t0, t1, t2 = int_from_arg(a, arg_num)
+        self.wid = t0
+        self.wid_present = t1
+        arg_num = t2
+        w!("%!(BADWIDTH)") if !wid_present
+        # We have a negative width, so take its value and ensure that the
+        # minus flag is set
+        if wid < 0 {
+          self.wid = -wid
+          self.minus = true
+          # Do not pad with zeros to the right.
+          self.zero = false
+        }
+        after_index = false
+      } else {
+        t0, t1, t2 = parsenum(format, i, end)
+        self.wid = t0
+        self.wid_present = t1
+        i = t2
+        if after_index && wid_present {
+          # "%[3]2d"
+          self.good_arg_num = false
+        }
+      }
+      # Do we have precision?
+      if i + 1 < end && format[i] == 46 {
+        i += 1
+        if after_index {
+          # "%[3].2d"
+          self.good_arg_num = false
+        }
+        arg_num, i, after_index = arg_number!(arg_num, format, i, a.size)
+        if i < end && format[i] == 42 {
+          i += 1
+          t0, t1, t2 = int_from_arg(a, arg_num)
+          self.prec = t0
+          self.prec_present = t1
+          arg_num = t2
+          # Negative precision arguments don't make sense
+          if prec < 0 {
+            self.prec = 0
+            self.prec_present = false
+          }
+          w!("%!(BADPREC)") if !prec_present
+          after_index = false
+        } else {
+          t0, t1, t2 = parsenum(format, i, end)
+          self.prec = t0
+          self.prec_present = t1
+          i = t2
+          if !prec_present {
+            self.prec = 0
+            self.prec_present = true
+          }
+        }
+      }
+      if !after_index {
+        arg_num, i, after_index = arg_number!(arg_num, format, i, a.size)
+      }
+      if i >= end {
+        w!("%!(NOVERB)")
+        break
+      }
+      verb, size = utf8.decode_rune_at(format, i)
+      vb = verb.to_i
+      i += size
+      if vb == 37 {
+        # Percent does not absorb operands and ignores width and precision.
+        w!("%")
+      } else if !good_arg_num {
+        bad_arg_num!(vb)
+      } else if arg_num >= a.size {
+        # No argument left over to print for the current verb.
+        missing_arg!(vb)
+      } else {
+        if vb == 118 {
+          self.sharp_v = sharp
+          self.sharp = false
+          self.plus_v = plus
+          self.plus = false
+        }
+        print_arg!(a[arg_num], vb)
+        arg_num += 1
+      }
+    }
+    # Check for extra arguments unless the call accessed the arguments out
+    # of order, in which case it's too expensive to detect if they've all
+    # been used and arguably OK if they're not.
+    if !reordered && arg_num < a.size {
+      clearflags!
+      w!("%!(EXTRA ")
+      j = arg_num
+      while j < a.size {
+        w!(", ") if j > arg_num
+        arg = a[j]
+        if arg.k == KIND_INVALID || nil_iface?(arg) {
+          w!("<nil>")
+        } else {
+          w!(arg.type_name)
+          w!("=")
+          print_arg!(arg, 118)
+        }
+        j += 1
+      }
+      w!(")")
+    }
+  }
+
+  def do_print!(a: [Value]) -> Unit {
+    prev_string = false
+    i = 0
+    for arg in a {
+      is_string = arg.k == KIND_STRING
+      # Add a space between two non-string arguments.
+      w!(" ") if i > 0 && !is_string && !prev_string
+      print_arg!(arg, 118)
+      prev_string = is_string
+      i += 1
+    }
+  }
+
+  def do_println!(a: [Value]) -> Unit {
+    i = 0
+    for arg in a {
+      w!(" ") if i > 0
+      print_arg!(arg, 118)
+      i += 1
+    }
+    w!("\n")
+  }
+}
+
+# Whether v is the nil of an interface type.
+def nil_iface?(v: Value) -> Bool {
+  v.k == KIND_PTR && v.nil? && !strings_has_prefix(v.type_name, "*")
+}
+
+def new_printer -> Printer {
+  Printer.new(buf: [])
+}
+
+# Go's fmt.Sprint over Values.
+pub def go_sprint(a: [Value]) -> Str {
+  p = new_printer()
+  p.do_print!(a)
+  p.text
+}
+
+# Go's fmt.Sprintln over Values.
+pub def go_sprintln(a: [Value]) -> Str {
+  p = new_printer()
+  p.do_println!(a)
+  p.text
+}
+
+# Go's fmt.Sprintf over Values.
+pub def go_sprintf(format: Str, a: [Value]) -> Str {
+  p = new_printer()
+  p.do_printf!(format, a)
+  p.text
+}
+
+def rune_str(r: Int) -> Str {
+  Str.from_bytes(utf8.encode_rune(r.to_i32))
+}
+
+def strings_upper_hex(u: U64) -> Str {
+  ds = "0123456789ABCDEF"
+  return "0" if u == 0.as_u64
+  out: [Byte] = []
+  x = u
+  while x > 0.as_u64 {
+    out << ds[(x & 15.as_u64).to_i]
+    x = x >> 4
+  }
+  Str.from_bytes(out.reverse)
+}
+
+def strings_has_prefix(s: Str, p: Str) -> Bool {
+  s.size >= p.size && s[0...p.size] == p
+}
+
+# The element type of a slice or array type name ("[]uint8" -> "uint8").
+def elem_type(t: Str) -> Str {
+  return "" if t.size == 0 || t[0] != 91
+  i = 1
+  while i < t.size && t[i] != 93 { i += 1 }
+  t[i + 1...t.size]
+}
+
+def too_large(x: Int) -> Bool {
+  x > 1000000 || x < -1000000
+}
+
+# Converts ASCII digits to a number: (num, isnum, newi).
+def parsenum(s: Str, start: Int, end: Int) -> (Int, Bool, Int) {
+  return (0, false, end) if start >= end
+  num = 0
+  isnum = false
+  i = start
+  while i < end && 48 <= s[i] && s[i] <= 57 {
+    # Overflow; crazy long number most likely.
+    return (0, false, end) if too_large(num)
+    num = num * 10 + (s[i] - 48).to_i
+    isnum = true
+    i += 1
+  }
+  (num, isnum, i)
+}
+
+# Go's intFromArg: (num, isInt, newArgNum).
+def int_from_arg(a: [Value], arg_num: Int) -> (Int, Bool, Int) {
+  new_arg_num = arg_num
+  num = 0
+  is_int = false
+  if arg_num < a.size {
+    v = a[arg_num]
+    if v.k == KIND_INT {
+      num = v.n
+      is_int = true
+    } else if v.k == KIND_UINT {
+      if v.u.as_i64 >= 0 {
+        num = v.u.as_i64
+        is_int = true
+      }
+    }
+    new_arg_num = arg_num + 1
+    if too_large(num) {
+      num = 0
+      is_int = false
+    }
+  }
+  (num, is_int, new_arg_num)
+}
+
+# Go's parseArgNumber: (index, width, ok) for "[n]..." at the start of s.
+def parse_arg_number(s: Str) -> (Int, Int, Bool) {
+  # There must be at least 3 bytes: [n].
+  return (0, 1, false) if s.size < 3
+  # Find closing bracket.
+  i = 1
+  while i < s.size {
+    if s[i] == 93 {
+      width, ok, newi = parsenum(s, 1, i)
+      return (0, i + 1, false) if !ok || newi != i
+      # arg numbers are one-indexed and skip paren.
+      return (width - 1, i + 1, true)
+    }
+    i += 1
+  }
+  (0, 1, false)
+}

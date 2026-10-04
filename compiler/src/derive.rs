@@ -33,6 +33,9 @@ pub struct Opts {
     pub rename: Option<String>,
     pub skip: bool,
     pub omit_empty: bool,
+    /// `#[template("Name")]` / `#[template(skip)]` (derive(Template)).
+    pub trename: Option<String>,
+    pub tskip: bool,
 }
 
 /// Parse the text of one `#[json(...)]` attribute into `o`.
@@ -114,8 +117,8 @@ pub fn derive_names(text: &str, sp: Span) -> Result<Option<Vec<String>>, Diag> {
     let names: Vec<String> = inner.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
     for n in &names {
         // Eq and Show are structural already (D13, D14): accepted, nothing to generate.
-        if !matches!(n.as_str(), "Json" | "Eq" | "Show") {
-            return Err(Diag::new(sp, format!("can't derive `{n}`")).note("derivable: Json (generates to_json / from_json); Eq and Show are accepted and need nothing: structs, tuples and enums already compare and print field by field"));
+        if !matches!(n.as_str(), "Json" | "Template" | "Eq" | "Show") {
+            return Err(Diag::new(sp, format!("can't derive `{n}`")).note("derivable: Json (generates to_json / from_json), Template (text/template data: to_tmpl); Eq and Show are accepted and need nothing: structs, tuples and enums already compare and print field by field"));
         }
     }
     Ok(Some(names))

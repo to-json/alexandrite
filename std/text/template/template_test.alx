@@ -1,0 +1,591 @@
+# Go's exec_test.go and multi_test.go tests whose data needs no derived
+# types (those are in derives/, which can import this package).
+
+import "bytes"
+import "strings"
+import "text/template/parse"
+
+def sv(s: Str) -> Value { Value.str(s) }
+
+def iv(i: Int) -> Value { Value.int(i) }
+
+# One generated vector (vec_exec_test.alx): the output of `input` on data,
+# then Go's error after "|ERR|", or "PARSE:" and the parse error.
+def vec(data: Value, input: Str, want: Str) {
+  r = new("v").parse(input)
+  if e = r.err {
+    assert_eq "PARSE:#{e.message}", want
+    return nil
+  }
+  b = bytes.new_buffer([])
+  x = r.unwrap.execute(b, data)
+  got = b.string
+  if e = x.err {
+    got = got + "|ERR|" + e.message
+  }
+  assert_eq got, want
+  nil
+}
+
+def exec_buf(t: Template, data: Value) -> (Str, Error?) {
+  b = bytes.new_buffer([])
+  r = t.execute(b, data)
+  (b.string, r.err)
+}
+
+test "delims" {
+  hello = "Hello, world"
+  value = Value.struct_of("struct { Str string }", ["Str"], [sv(hello)])
+  pairs = [("", ""), ("{{", "}}"), ("<<", ">>"), ("|", "|"), ("(日)", "(本)")]
+  for pr in pairs {
+    left = pr[0]
+    right = pr[1]
+    true_left = left == "" ? "{{" : left
+    true_right = right == "" ? "}}" : right
+    action = true_left + ".Str" + true_right
+    # A comment, which is not preserved in the parse tree.
+    comment = true_left + "/*comment*/" + true_right
+    # An action containing a string that looks like the left delimiter.
+    str_action = true_left + "\"" + true_left + "\"" + true_right
+    text = action + comment + str_action
+    tmpl = new("delims").delims(left, right).~parse(text)
+    # The parse tree's String form should roundtrip back to the input,
+    # using the custom delimiters, modulo the dropped comment.
+    assert_eq tmpl.root.unwrap.to_s, action + str_action
+    assert_eq tmpl.~execute_str(value), hello + true_left
+  }
+}
+
+EXEC_ERROR_TEXT = "line 1\nline 2\nline 3\n{{template \"one\" .}}\n{{define \"one\"}}{{template \"two\" .}}{{end}}\n{{define \"two\"}}{{template \"three\" .}}{{end}}\n{{define \"three\"}}{{index \"hi\" $}}{{end}}"
+
+# Check that an error from a nested template contains all the relevant
+# information.
+test "exec error" {
+  tmpl = new("top").~parse(EXEC_ERROR_TEXT)
+  # 5 is out of range indexing "hi"
+  r = tmpl.execute_str(iv(5))
+  assert_eq r.err?.message || "", "template: top:7:20: executing \"three\" at <index \"hi\" $>: error calling index: index out of range: 5"
+}
+
+error CustomError {
+  Heyo
+
+  def message -> Str { "heyo !" }
+}
+
+# Check that a custom error can be returned.
+test "exec error custom error" {
+  failing = Func.of("func() (string, error)", ->(a: [Value]) -> ~Value {
+    fail CustomError.Heyo
+    Value.invalid
+  })
+  tmpl = must(new("top").funcs({"err" => failing}).parse("{{ err }}"))
+  r = tmpl.execute_str(Value.invalid)
+  assert r.err?, "expected custom error"
+  found = false
+  if e = r.err {
+    case e {
+      Heyo => found = true
+      _ => found = false
+    }
+  }
+  assert found, "expected custom error; got #{r.err?.message || ""}"
+}
+
+test "js escaping" {
+  cases = [
+    ("a", "a"),
+    ("'foo", "\\'foo"),
+    ("Go \"jump\" \\", "Go \\\"jump\\\" \\\\"),
+    ("Yukihiro says \"今日は世界\"", "Yukihiro says \\\"今日は世界\\\""),
+    ("unprintable ￾", "unprintable \\uFFFE"),
+    ("<html>", "\\u003Chtml\\u003E"),
+    ("no = in attributes", "no \\u003D in attributes"),
+    ("&#x27; does not become HTML entity", "\\u0026#x27; does not become HTML entity"),
+  ]
+  for c in cases {
+    assert_eq js_escape_string(c[0]), c[1]
+  }
+}
+
+# A nice example: walk a binary tree (Go's Tree data, built as values: alx
+# structs can't contain themselves).
+def tree_node(val: Int, left: Value?, right: Value?) -> Value {
+  l = left || Value.nil_of("*template.Tree")
+  r = right || Value.nil_of("*template.Tree")
+  Value.struct_of("template.Tree", ["Val", "Left", "Right"], [iv(val), l, r]).ptr
+}
+
+# Use different delimiters to test Set.Delims. Also test the trimming of
+# leading and trailing spaces.
+TREE_TEMPLATE = "\n\t(- define \"tree\" -)\n\t[\n\t\t(- .Val -)\n\t\t(- with .Left -)\n\t\t\t(template \"tree\" . -)\n\t\t(- end -)\n\t\t(- with .Right -)\n\t\t\t(- template \"tree\" . -)\n\t\t(- end -)\n\t]\n\t(- end -)\n"
+
+test "tree" {
+  tree = tree_node(1,
+    tree_node(2, tree_node(3, tree_node(4, none, none), none), tree_node(5, tree_node(6, none, none), none)),
+    tree_node(7, tree_node(8, tree_node(9, none, none), none), tree_node(10, tree_node(11, none, none), none)))
+  tmpl = new("root").delims("(", ")").~parse(TREE_TEMPLATE)
+  expect = "[1[2[3[4]][5[6]]][7[8[9]][10[11]]]]"
+  # First by looking up the template.
+  assert_eq tmpl.lookup("tree").unwrap.~execute_str(tree), expect
+  # Then direct to execution.
+  b = bytes.new_buffer([])
+  tmpl.~execute_template(b, "tree", tree)
+  assert_eq b.string, expect
+}
+
+test "execute on new template" {
+  # This is issue 3872.
+  assert_eq new("Name").templates.size, 0
+  # This is issue 11379. The zero Template: no templates; Parse, Execute
+  # and ExecuteTemplate return errors (alx: parsing the zero Template is an
+  # error, Go's initializes it in place).
+  z = Template.new
+  assert_eq z.templates.size, 0
+  assert z.parse("").err?
+  assert z.new("abc").parse("").err? if false
+  assert z.execute_str(Value.invalid).err?
+  assert z.execute_template_str("XXX", Value.invalid).err?
+}
+
+TEST_TEMPLATES = "{{define \"one\"}}one{{end}}{{define \"two\"}}two{{end}}"
+
+test "message for execute empty" {
+  # Test a truly empty template.
+  tmpl = new("empty")
+  want = "template: empty: \"empty\" is an incomplete or empty template"
+  assert_eq tmpl.execute_str(iv(0)).err?.message || "", want
+  # Add a non-empty template to check that the error is helpful.
+  tests = new("").~parse(TEST_TEMPLATES)
+  tmpl.~add_parse_tree("secondary", tests.tree.unwrap)
+  assert_eq tmpl.execute_str(iv(0)).err?.message || "", want
+  # Make sure we can execute the secondary.
+  _u1 = tmpl.~execute_template_str("secondary", iv(0))
+}
+
+test "final for printf" {
+  tmpl = new("").~parse("{{\"x\" | printf}}")
+  assert_eq tmpl.~execute_str(iv(0)), "x"
+}
+
+test "missing map key" {
+  data = Value.map_of([sv("x")], [iv(99)], "map[string]int")
+  tmpl = new("t1").~parse("{{.x}} {{.y}}")
+  # By default, just get "<no value>"
+  assert_eq tmpl.~execute_str(data), "99 <no value>"
+  # Same if we set the option explicitly to the default.
+  tmpl.option(["missingkey=default"])
+  assert_eq tmpl.~execute_str(data), "99 <no value>"
+  # Next we ask for a zero value
+  tmpl.option(["missingkey=zero"])
+  assert_eq tmpl.~execute_str(data), "99 0"
+  # Now we ask for an error.
+  tmpl.option(["missingkey=error"])
+  assert tmpl.execute_str(data).err?, "expected error; got none"
+  # same Option, but now a nil interface: ask for an error
+  assert tmpl.execute_str(Value.invalid).err?, "expected error for nil-interface; got none"
+}
+
+# Test that the error message for multiline unterminated string refers to
+# the line number of the opening quote.
+test "unterminated string error" {
+  r = new("X").parse("hello\n\n{{`unterminated\n\n\n\n}}\n some more\n\n")
+  assert r.err?, "expected error"
+  assert strings.contains(r.err?.message || "", "X:3: unterminated raw quoted string"), r.err?.message || ""
+}
+
+struct ErrorWriter {
+  pub def write!(p: [Byte]) -> ~Int {
+    fail Failure.Msg("always be failing")
+  }
+}
+
+test "execute gives exec error" {
+  # First, a non-execution error shouldn't be an ExecError.
+  tmpl = new("X").~parse("hello")
+  w = ErrorWriter.new
+  r = tmpl.execute(w, iv(0))
+  assert_eq r.err?.message || "", "always be failing"
+  is_exec = false
+  if e = r.err {
+    case e {
+      Exec(_, _) => is_exec = true
+      _ => is_exec = false
+    }
+  }
+  assert !is_exec, "a write error is not an ExecError"
+  # This one should be an ExecError.
+  tmpl2 = new("X").~parse("hello, {{.X.Y}}")
+  r2 = tmpl2.execute_str(iv(0))
+  is_exec = false
+  if e = r2.err {
+    case e {
+      Exec(_, _) => is_exec = true
+      _ => is_exec = false
+    }
+  }
+  assert is_exec, "expected ExecError"
+  assert strings.contains(r2.err?.message || "", "field X in type int"), r2.err?.message || ""
+}
+
+def func_name_test_func -> Func { Func.of("func() int", ->(a: [Value]) -> ~Value { iv(0) }) }
+
+test "good func names" {
+  for name in ["_", "a", "a1", "a1", "Ӵ"] {
+    tmpl = new("X").funcs({name => func_name_test_func()})
+    assert_eq tmpl.name, "X"
+  }
+}
+
+test "bad func names" {
+  for name in ["", "2", "a-b"] {
+    # Funcs panics, as Go's does.
+    t = spawn { new("X").funcs({name => func_name_test_func()}) }
+    assert t.wait.err?, "#{name} succeeded incorrectly as function name"
+  }
+}
+
+test "is true" {
+  cases = [
+    (iv(1), true),
+    (iv(0), false),
+    (Value.uint_of(1.as_u64, "uint8"), true),
+    (Value.uint_of(0.as_u64, "uint8"), false),
+    (Value.float(1.0), true),
+    (Value.float(0.0), false),
+    (Value.complex_of(Complex.new(1.0, 0.0), "complex64"), true),
+    (Value.complex_of(Complex.new(0.0, 0.0), "complex64"), false),
+    (Value.bool(true), true),
+    (Value.bool(false), false),
+    (Value.list_of([iv(1), iv(2)], "[2]int"), true),
+    (Value.list_of([], "[0]int"), false),
+    (Value.list_of([Value.uint_of(97.as_u64, "uint8")], "[]uint8"), true),
+    (Value.list_of([], "[]uint8"), false),
+    (Value.map_of([sv("a"), sv("b")], [iv(1), iv(2)], "map[string]int"), true),
+    (Value.map_of([], [], "map[string]int"), false),
+    (iv(0).ptr, true),
+    (Value.nil_of("*int"), false),
+  ]
+  for c in cases {
+    t, _ = is_true(c[0])
+    assert t == c[1], "is_true(#{c[0]})"
+  }
+}
+
+test "block" {
+  input = "a({{block \"inner\" .}}bar({{.}})baz{{end}})b"
+  want = "a(bar(hello)baz)b"
+  overlay = "{{define \"inner\"}}foo({{.}})bar{{end}}"
+  want2 = "a(foo(goodbye)bar)b"
+  tmpl = new("outer").~parse(input)
+  cl = tmpl.clone
+  tmpl2 = must(cl).~parse(overlay)
+  assert_eq tmpl.~execute_str(sv("hello")), want
+  assert_eq tmpl2.~execute_str(sv("goodbye")), want2
+}
+
+test "eval field errors" {
+  t_ = Value.struct_of("template.T", ["X"], [sv("")])
+  # Go's MissingFieldOnNil wants "can't evaluate field MissingField in type
+  # *template.T": alx's nil pointer doesn't know its element's fields, so
+  # it says "nil pointer evaluating *template.T.MissingField".
+  cases = [
+    ("{{.MissingField}}", t_.ptr, "can't evaluate field MissingField in type *template.T"),
+    ("{{.X}}", Value.nil_of("*template.T"), "nil pointer evaluating *template.T.X"),
+    ("{{.MissingKey}}", Value.nil_of("*map[string]string"), "nil pointer evaluating *map[string]string.MissingKey"),
+    ("{{.MissingKey}}", Value.map_of([], [], "map[string]string").ptr, "<nil>"),
+  ]
+  for c in cases {
+    tmpl = must(new("tmpl").parse(c[0]))
+    r = tmpl.execute_str(c[1])
+    got = r.err?.message || "<nil>"
+    assert strings.has_suffix(got, c[2]), "got error #{got}, want #{c[2]}"
+  }
+}
+
+test "max exec depth" {
+  tmpl = must(new("tmpl").parse("{{template \"tmpl\" .}}"))
+  r = tmpl.execute_str(Value.invalid)
+  assert strings.contains(r.err?.message || "<nil>", "exceeded maximum template depth"), r.err?.message || "<nil>"
+}
+
+test "interface values" {
+  cases = [
+    ("{{index .Nil 1}}", "ERROR: index of untyped nil"),
+    ("{{index .Slice 2}}", "2"),
+    ("{{index .Slice .Two}}", "2"),
+    ("{{call .Nil 1}}", "ERROR: call of nil"),
+    ("{{call .PlusOne 1}}", "2"),
+    ("{{call .PlusOne .One}}", "2"),
+    ("{{and (index .Slice 0) true}}", "0"),
+    ("{{and .Zero true}}", "0"),
+    ("{{and (index .Slice 1) false}}", "false"),
+    ("{{and .One false}}", "false"),
+    ("{{or (index .Slice 0) false}}", "false"),
+    ("{{or .Zero false}}", "false"),
+    ("{{or (index .Slice 1) true}}", "1"),
+    ("{{or .One true}}", "1"),
+    ("{{not (index .Slice 0)}}", "true"),
+    ("{{not .Zero}}", "true"),
+    ("{{not (index .Slice 1)}}", "false"),
+    ("{{not .One}}", "false"),
+    ("{{eq (index .Slice 0) .Zero}}", "true"),
+    ("{{eq (index .Slice 1) .One}}", "true"),
+    ("{{ne (index .Slice 0) .Zero}}", "false"),
+    ("{{ne (index .Slice 1) .One}}", "false"),
+    ("{{ge (index .Slice 0) .One}}", "false"),
+    ("{{ge (index .Slice 1) .Zero}}", "true"),
+    ("{{gt (index .Slice 0) .One}}", "false"),
+    ("{{gt (index .Slice 1) .Zero}}", "true"),
+    ("{{le (index .Slice 0) .One}}", "true"),
+    ("{{le (index .Slice 1) .Zero}}", "false"),
+    ("{{lt (index .Slice 0) .One}}", "true"),
+    ("{{lt (index .Slice 1) .Zero}}", "false"),
+  ]
+  plus_one = Func.of("func(int) int", ->(a: [Value]) -> ~Value { iv(a[0].int_val + 1) })
+  data = Value.map({
+    "PlusOne" => Value.func(plus_one),
+    "Slice" => Value.list_of([iv(0), iv(1), iv(2), iv(3)], "[]int"),
+    "One" => iv(1),
+    "Two" => iv(2),
+    "Nil" => Value.invalid,
+    "Zero" => iv(0),
+  })
+  for c in cases {
+    tmpl = must(new("tmpl").parse(c[0]))
+    r = tmpl.execute_str(data)
+    if strings.has_prefix(c[1], "ERROR:") {
+      e = strings.trim_space(strings.trim_prefix(c[1], "ERROR:"))
+      assert strings.contains(r.err?.message || "", e), "#{c[0]}: Execute: #{r.err?.message || ""}, want error #{e}"
+      next
+    }
+    assert r.ok?, "#{c[0]}: Execute: #{r.err?.message || ""}"
+    assert_eq r.unwrap, c[1]
+  }
+}
+
+# Panics during calls are errors in Go (recovered); alx functions fail
+# instead. The method calls on nil receivers (GetU on a nil *T) can't
+# exist in alx.
+test "execute panic during call" {
+  do_panic = Func.of("func() string", ->(a: [Value]) -> ~Value {
+    fail Failure.Msg("custom panic string")
+    Value.invalid
+  })
+  cases = [
+    ("direct func call panics", "{{doPanic}}", Value.nil_of("*template.T"), "template: t:1:2: executing \"t\" at <doPanic>: error calling doPanic: custom panic string"),
+    ("indirect func call panics", "{{call doPanic}}", Value.nil_of("*template.T"), "template: t:1:7: executing \"t\" at <doPanic>: error calling doPanic: custom panic string"),
+    ("method call on nil interface", "{{.NonEmptyInterfaceNil.Method0}}", Value.struct_of("template.T", ["NonEmptyInterfaceNil"], [Value.nil_of("template.I")]).ptr, "template: t:1:23: executing \"t\" at <.NonEmptyInterfaceNil.Method0>: nil pointer evaluating template.I.Method0"),
+  ]
+  for c in cases {
+    tmpl = new("t").funcs({"doPanic" => do_panic}).~parse(c[1])
+    r = tmpl.execute_str(c[2])
+    assert r.err?, "#{c[0]}: expected error; got none"
+    assert strings.contains(r.err?.message || "", c[3]), "#{c[0]}: got #{r.err?.message || ""}"
+  }
+}
+
+# Issue 31810. Check that a parenthesized first argument behaves properly.
+test "issue 31810" {
+  # A simple value with no arguments is fine.
+  tmpl = new("").~parse("{{ (.)  }}")
+  assert_eq tmpl.~execute_str(sv("result")), "result"
+  # Even a plain function fails - need to use call.
+  f = Value.func(Func.of("func() string", ->(a: [Value]) -> ~Value { sv("result") }))
+  assert tmpl.execute_str(f).err?, "expected error with no call, got none"
+  # Works if the function is explicitly called.
+  tmpl2 = new("").~parse("{{ (call .)  }}")
+  assert_eq tmpl2.~execute_str(f), "result"
+}
+
+# multi_test.go
+
+test "multi parse" {
+  cases = [
+    ("empty", "", true, [], []),
+    ("one", "{{define \"foo\"}} FOO {{end}}", true, ["foo"], [" FOO "]),
+    ("two", "{{define \"foo\"}} FOO {{end}}{{define \"bar\"}} BAR {{end}}", true, ["foo", "bar"], [" FOO ", " BAR "]),
+    # errors
+    ("missing end", "{{define \"foo\"}} FOO ", false, [], []),
+    ("malformed name", "{{define \"foo}} FOO ", false, [], []),
+  ]
+  for c in cases {
+    r = new("root").parse(c[1])
+    if !c[2] {
+      assert r.err?, "#{c[0]}: expected error; got none"
+      next
+    }
+    assert r.ok?, "#{c[0]}: unexpected error"
+    tmpl = r.unwrap
+    # +1 for root
+    assert_eq tmpl.c[0].names.size, c[3].size + 1
+    i = 0
+    for name in c[3] {
+      t = tmpl.lookup(name)
+      assert t != none, "#{c[0]}: can't find template #{name}"
+      assert_eq t.unwrap.root.unwrap.to_s, c[4][i]
+      i += 1
+    }
+  }
+}
+
+test "parse files errors" {
+  assert parse_files(["DOES NOT EXIST"]).err?, "expected error for non-existent file; got none"
+  assert parse_glob("DOES NOT EXIST").err?, "expected error for non-existent file; got none"
+  assert new("error").parse_glob("[x").err?, "expected error for bad pattern; got none"
+}
+
+test "parse files with data" {
+  for which in [0, 1] {
+    t = new("root")
+    tmpl = which == 0 ? t.~parse_files(["testdata/tmpl1.tmpl", "testdata/tmpl2.tmpl"]) : t.~parse_glob("testdata/tmpl*.tmpl")
+    tt = tmpl.new("test").~parse("{{template \"tmpl1.tmpl\"}}{{template \"tmpl2.tmpl\"}}")
+    assert_eq tt.~execute_str(iv(0)), "template1\n\ny\ntemplate2\n\nx\n"
+  }
+}
+
+CLONE_TEXT1 = "{{define \"a\"}}{{template \"b\"}}{{template \"c\"}}{{end}}"
+CLONE_TEXT2 = "{{define \"b\"}}b{{end}}"
+CLONE_TEXT3 = "{{define \"c\"}}root{{end}}"
+CLONE_TEXT4 = "{{define \"c\"}}clone{{end}}"
+CLONE_TEXT5 = "{{define \"e\"}}{{.Foo}}{{end}}"
+
+test "clone" {
+  # Create some templates and clone the root.
+  root = new("root").~parse(CLONE_TEXT1)
+  _u2 = root.~parse(CLONE_TEXT2)
+  _u3 = root.parse(CLONE_TEXT5)
+  root.option(["missingkey=error"])
+  clone = must(root.clone)
+  # Add variants to both.
+  _u4 = root.~parse(CLONE_TEXT3)
+  _u5 = clone.~parse(CLONE_TEXT4)
+  # Verify that the clone is self-consistent.
+  for t in clone.templates {
+    assert t.lookup(t.name).unwrap.same?(t), "clone does not contain self for #{t.name}"
+  }
+  assert clone.lookup("root").unwrap.same?(clone), "clone does not contain root"
+  # Execute root.
+  assert_eq root.~execute_template_str("a", iv(0)), "broot"
+  # Execute copy.
+  assert_eq clone.~execute_template_str("a", iv(0)), "bclone"
+  root_err = root.execute_template_str("e", Value.map({}))
+  clone_err = clone.execute_template_str("e", Value.map({}))
+  assert clone_err.err?, "expected error from missing key in cloned template"
+  assert_eq clone_err.err?.message || "", root_err.err?.message || ""
+}
+
+test "add parse tree" {
+  # Create some templates.
+  root = new("root").~parse(CLONE_TEXT1)
+  _u6 = root.~parse(CLONE_TEXT2)
+  # Add a new parse tree.
+  tree = ~parse.parse("cloneText3", CLONE_TEXT3, "", "", [builtin_names()])
+  added = root.~add_parse_tree("c", tree["c"].unwrap)
+  # Execute.
+  assert_eq added.~execute_template_str("a", iv(0)), "broot"
+}
+
+# Issue 7032
+test "add parse tree to unparsed template" {
+  master = "{{define \"master\"}}{{end}}"
+  tmpl = new("master")
+  tree = ~parse.parse("master", master, "", "", [])
+  # used to panic
+  _u7 = tmpl.~add_parse_tree("master", tree["master"].unwrap)
+}
+
+test "redefinition" {
+  tmpl = new("tmpl1").~parse("{{define \"test\"}}foo{{end}}")
+  _u8 = tmpl.~parse("{{define \"test\"}}bar{{end}}")
+  _u9 = tmpl.new("tmpl2").~parse("{{define \"test\"}}bar{{end}}")
+}
+
+# Issue 10879
+test "empty template clone crash" {
+  t1 = new("base")
+  # used to panic
+  _u10 = t1.~clone
+}
+
+# Issue 10910, 10926
+test "template look up" {
+  t1 = new("foo")
+  assert t1.lookup("foo") == none, "Lookup returned non-nil value for undefined template foo"
+  t1.new("bar")
+  assert t1.lookup("bar") == none, "Lookup returned non-nil value for undefined template bar"
+  _u11 = t1.parse("{{define \"foo\"}}test{{end}}")
+  assert t1.lookup("foo") != none, "Lookup returned nil value for defined template"
+}
+
+test "new" {
+  # template with same name already exists
+  t1 = new("test").~parse("{{define \"test\"}}foo{{end}}")
+  t2 = t1.new("test")
+  assert t1.tree != none, "defined template got nil Tree"
+  assert t2.tree == none, "undefined template got non-nil Tree"
+  contains_t1 = false
+  for tmpl in t1.templates {
+    assert !tmpl.same?(t2), "Templates included undefined template"
+    contains_t1 = true if tmpl.same?(t1)
+  }
+  assert contains_t1, "Templates didn't include defined template"
+}
+
+test "parse" {
+  # In multiple calls to Parse with the same receiver template, only one
+  # call can contain text other than space, comments, and template
+  # definitions
+  t1 = new("test")
+  _u12 = t1.~parse("{{define \"test\"}}{{end}}")
+  _u13 = t1.~parse("{{define \"test\"}}{{/* this is a comment */}}{{end}}")
+  _u14 = t1.~parse("{{define \"test\"}}foo{{end}}")
+}
+
+test "empty template" {
+  cases = [
+    (["x", "y"], "", "y"),
+    ([""], "once", ""),
+    (["", ""], "twice", ""),
+    (["{{.}}", "{{.}}"], "twice", "twice"),
+    (["{{/* a comment */}}", "{{/* a comment */}}"], "comment", ""),
+    (["{{.}}", ""], "twice", ""),
+  ]
+  for c in cases {
+    root = new("root")
+    m = root
+    for d in c[0] {
+      m = root.new(c[1]).~parse(d)
+    }
+    assert_eq m.~execute_str(sv(c[1])), c[2]
+  }
+}
+
+# Issue 19249 was a regression in 1.8 caused by the handling of empty
+# templates added in that release, which got different answers depending
+# on the order templates appeared in the internal map.
+test "issue 19294" {
+  inlined: Map[Str, Str] = {
+    "stylesheet" => "{{define \"stylesheet\"}}stylesheet{{end}}",
+    "xhtml" => "{{block \"stylesheet\" .}}{{end}}",
+  }
+  all = ["stylesheet", "xhtml"]
+  i = 0
+  while i < 100 {
+    res = new("title.xhtml").~parse("{{template \"xhtml\" .}}")
+    for name in all {
+      _u15 = res.new(name).~parse(inlined[name].unwrap)
+    }
+    assert_eq res.~execute_str(iv(0)), "stylesheet"
+    i += 1
+  }
+}
+
+# Issue 48436 (the zero Template can't be changed in place in alx: adding a
+# tree to it gives a new template set holding the tree).
+test "add to zero template" {
+  tree = ~parse.parse("c", CLONE_TEXT3, "", "", [builtin_names()])
+  tmpl = Template.new
+  t = tmpl.~add_parse_tree("x", tree["c"].unwrap)
+  assert_eq t.~execute_str(iv(0)), "root"
+}

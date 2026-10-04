@@ -1,0 +1,550 @@
+# Package template: Go's text/template, data-driven templates for
+# generating textual output. The template language is Go's, unchanged:
+# actions, pipelines, variables, if/with/range/else, break/continue,
+# define/template/block, comments, {{- -}} trimming, the predefined
+# functions (and, or, not, len, index, slice, call, print, printf,
+# println, html, js, urlquery, eq, ne, lt, le, gt, ge) with Go's
+# semantics, results and error messages.
+#
+# Data. Go evaluates .Field, .Method args, index and range by reflection;
+# alx has none (GO-VS-RUBY S3), so a template executes on a `Value`, Go's
+# reflect.Value as a dynamic value (value.alx):
+#   - scalars carry Go's kind and type name (int, uint16, float64, string,
+#     template.HTML ...), so eq/lt, printf "%T", argument checks and error
+#     messages follow Go's rules;
+#   - slices, arrays, maps, structs, pointers and functions are nodes of a
+#     Doc arena (a Value can't contain Values);
+#   - `#[derive(Template)]` on a struct or enum writes `to_tmpl` (its value
+#     as a Value; fields keep their alx names, `#[template("Name")]`
+#     renames, `#[template(skip)]` leaves out) and, when the type has
+#     public methods, the `Data` protocol that lets templates call them
+#     (`.method args`, renamed the same way; `to_s` is fmt's String()).
+#     `#[template("pkg.T")]` before the type gives its Go type name.
+#   - Value's constructors build data by hand: Value.int(3),
+#     Value.str_of(s, "template.HTML"), Value.list([...]),
+#     Value.map({"k" => v}), Value.struct_of(type, names, values),
+#     Value.struct_with(type, names, values, obj) (fields of any type plus
+#     a derived type's methods), Value.from_json(json.parse(s)),
+#     Value.nil_of("*T"), v.ptr.
+#   - Functions: a `Func` is a Go signature (`Sig`) and a closure over
+#     [Value]: Func.of("func(string, ...int) (string, error)", ->(a) {..}).
+#     The executor checks and converts arguments to the signature's types
+#     first, as Go's does. func0..func3 and funcn are adapters for
+#     functions of any-typed arguments; a derived type's `tmpl_funcs` is
+#     its public methods as a FuncMap (typed by the derive).
+#
+#   Go                                  alx
+#   template.New(name)                  template.new(name)
+#   template.Must(t, err)               template.must(r)  (r: ~Template)
+#   t.Parse(text)                       t.parse(text) -> ~Template
+#   t.Execute(w, data)                  t.execute(w, data) -> ~Unit  (w: any write!([Byte]))
+#   t.ExecuteTemplate(w, name, data)    t.execute_template(w, name, data)
+#   (strings.Builder + Execute)         t.execute_str(data) -> ~Str, t.execute_template_str
+#   t.Funcs(FuncMap{...})               t.funcs({"name" => Func.of(..)}) (Map[Str, Func])
+#   t.Delims / Option / Lookup / New    t.delims / t.option([..]) / t.lookup (Template?) / t.new
+#   t.Clone / AddParseTree / Templates  t.clone / t.add_parse_tree / t.templates
+#   t.Name / DefinedTemplates / Tree    t.name / t.defined_templates / t.tree (parse.Tree?)
+#   ParseFiles / ParseGlob / ParseFS    parse_files([..]) / parse_glob / parse_fs(fsys, [..])
+#   (and the methods of the same names)
+#   HTMLEscapeString / JSEscapeString   html_escape_string / js_escape_string
+#   HTMLEscaper / JSEscaper / URLQueryEscaper   html_escaper / js_escaper / url_query_escaper ([Value])
+#   IsTrue(v)                           is_true(v: Value) -> (Bool, Bool)
+#   ExecError                           ExecError.Exec(name, msg)
+#   fmt.Sprint/Sprintf/Sprintln         go_sprint / go_sprintf / go_sprintln over [Value]
+#
+# Differences from Go:
+#   - Data is a Value (above). A derived type can't hold a Value field
+#     when it has public methods (the type would contain itself): build
+#     such data with Value.struct_with.
+#   - Pointers are values: a pointer's identity can't be compared, so eq on
+#     two non-nil pointers compares what they point to; `%p` and `%v` of a
+#     non-nil pointer to a scalar print 0xc000010000.
+#   - No methods on nil receivers (a method of a nil *T is "nil pointer
+#     evaluating"), no channels, iter.Seq funcs or unsafe.Pointer as data,
+#     and a nil pointer doesn't know its element's fields (Go says "can't
+#     evaluate field X" for a missing field through a nil *T).
+#   - A function or method that panics in Go returns an error in alx (no
+#     recover); Funcs panics on a bad name or signature, as Go's does.
+#   - A called function's error is returned wrapped with the template's
+#     context (its message is Go's, "template: t:1:2: executing ... error
+#     calling f: ..."), not as an ExecError; other execution errors are
+#     ExecErrors.
+#   - Execute writes the output when execution ends (the partial output of
+#     a failed execution is written too, as in Go, but not progressively).
+#   - Template is a handle: copies share the template and its set, and its
+#     methods (which change that shared state) chain without `!`. The zero
+#     Template (Template.new) can't be parsed; add_parse_tree on it returns
+#     a new set holding the tree.
+#   - The nesting limit of template invocations is 100 (Go: 100000).
+#   - DefinedTemplates lists templates in definition order (Go: map order).
+
+import "io/fs"
+import "os"
+import "path"
+import "path/filepath"
+import "strconv"
+import "strings"
+import "text/template/parse"
+import "unicode"
+
+# Options (Go's missingKeyAction).
+# Return an invalid value.
+MAP_INVALID = 0
+# Return the zero value for the map element.
+MAP_ZERO_VALUE = 1
+# Error out.
+MAP_ERROR = 2
+
+# One template's own state: its tree and delimiters.
+struct TState {
+  name: Str
+  tree: parse.Tree?
+  left_delim: Str
+  right_delim: Str
+}
+
+# The information shared by related templates.
+struct Common {
+  # Defined templates: name -> index of its state.
+  names: Map[Str, Int]
+  states: [TState]
+  missing_key: Int
+  # The functions added with Funcs, for parsing and for execution.
+  parse_funcs: Map[Str, Bool]
+  exec_funcs: Map[Str, Func]
+}
+
+def new_common -> [Common] {
+  [Common.new(names: {}, states: [], parse_funcs: {}, exec_funcs: {})]
+}
+
+# The representation of a parsed template. A Template is a handle: copies
+# share the template and the set it belongs to, as Go's *Template does, so
+# its methods (which change that shared state) chain like Go's.
+pub struct Template {
+  c: [Common]
+  i: Int
+
+  def st -> TState { c[0].states[i] }
+
+  # The name of the template.
+  pub def name -> Str { c.size == 0 ? "" : st().name }
+
+  # The parse tree (Go's embedded *parse.Tree), if parsed.
+  pub def tree -> parse.Tree? {
+    return none if c.size == 0
+    st().tree
+  }
+
+  # The root of the parse tree (Go's t.Root).
+  pub def root -> parse.Node? {
+    if tr = tree() {
+      return tr.root
+    }
+    none
+  }
+
+  def set_tree(t: parse.Tree?) {
+    cc = c
+    cc[0].states[i].tree = t
+  }
+
+  # Whether two handles are the same template.
+  pub def same?(o: Template) -> Bool {
+    return false if c.size == 0 || o.c.size == 0 || i != o.i || c[0].states.size != o.c[0].states.size
+    # The same set: add a state to one and look at the other.
+    cc = c
+    n = cc[0].states.size
+    ss = cc[0].states
+    ss << TState.new(name: "")
+    cc[0].states = ss
+    r = o.c[0].states.size == n + 1
+    cc[0].states = ss[0...n]
+    r
+  }
+
+  # A new, undefined template associated with this one and with the same
+  # delimiters. The association, which is transitive, allows one template
+  # to invoke another with a {{template}} action.
+  pub def new(name: Str) -> Template {
+    cc = c
+    ss = cc[0].states
+    ss << TState.new(name: name, left_delim: st().left_delim, right_delim: st().right_delim)
+    cc[0].states = ss
+    Template.new(c: cc, i: ss.size - 1)
+  }
+
+  # A duplicate of the template, including all associated templates. The
+  # actual representation is not copied, but the name space of associated
+  # templates is, so further calls to parse in the copy will add templates
+  # to the copy but not to the original.
+  pub def clone -> ~Template {
+    nc = new_common()
+    nt = Template.new(c: nc, i: 0)
+    ss: [TState] = [st()]
+    nc[0].states = ss
+    nc[0].missing_key = c[0].missing_key
+    for k, idx in c[0].names {
+      if k == name {
+        nc[0].names[k] = 0
+        next
+      }
+      ss << c[0].states[idx]
+      nc[0].states = ss
+      nc[0].names[k] = ss.size - 1
+    }
+    for k, v in c[0].parse_funcs { nc[0].parse_funcs[k] = v }
+    for k, v in c[0].exec_funcs { nc[0].exec_funcs[k] = v }
+    nt
+  }
+
+  # Associates the argument parse tree with the template t, giving it the
+  # specified name. If the template has not been defined, this tree becomes
+  # its definition. If it has been defined and already has that name, the
+  # existing definition is replaced; otherwise a new template is created,
+  # defined, and returned.
+  pub def add_parse_tree(name: Str, tree: parse.Tree) -> ~Template {
+    if c.size == 0 {
+      # The zero Template: alx can't initialize it in place as Go does; the
+      # tree goes into a new set.
+      return fresh_template(name).~add_parse_tree(name, tree)
+    }
+    nt = self
+    nt = new(name) if name != self.name
+    # Even if nt == t, we need to install it in the common map.
+    if associate(nt, tree) || nt.tree == none {
+      nt.set_tree(tree)
+    }
+    nt
+  }
+
+  # The defined templates associated with t.
+  pub def templates -> [Template] {
+    out: [Template] = []
+    return out if c.size == 0
+    for _, idx in c[0].names {
+      out << Template.new(c: c, i: idx)
+    }
+    out
+  }
+
+  # Sets the action delimiters, to be used in subsequent calls to parse.
+  # An empty delimiter stands for the corresponding default: {{ or }}.
+  pub def delims(left: Str, right: Str) -> Template {
+    cc = c
+    cc[0].states[i].left_delim = left
+    cc[0].states[i].right_delim = right
+    self
+  }
+
+  # Adds the functions of the map to the template's function map. Any
+  # function used in the template must be added before the template is
+  # parsed. It may be called again, including after parsing, to replace a
+  # function of the same name. Panics, as Go's does, if a name can't be used
+  # syntactically as a function in a template or a function's signature is
+  # bad.
+  pub def funcs(m: Map[Str, Func]) -> Template {
+    cc = c
+    for name, f in m {
+      if !good_name?(name) {
+        panic("function name #{quote(name)} is not a valid identifier")
+      }
+      if e = f.sig.check(name) {
+        panic(e)
+      }
+      cc[0].exec_funcs[name] = f
+      cc[0].parse_funcs[name] = true
+    }
+    self
+  }
+
+  # The template with the given name that is associated with t, or none if
+  # there is no such template.
+  pub def lookup(name: Str) -> Template? {
+    return none if c.size == 0
+    if idx = c[0].names[name] {
+      return Template.new(c: c, i: idx)
+    }
+    none
+  }
+
+  # Parses text as a template body for t. Named template definitions
+  # ({{define ...}} or {{block ...}} statements) in text define additional
+  # templates associated with t and are removed from the definition of t
+  # itself. A definition with a body containing only white space and
+  # comments is considered empty and will not replace an existing
+  # template's body.
+  pub def parse(text: Str) -> ~Template {
+    fail Failure.Msg("template: the zero Template can't be parsed; use template.new") if c.size == 0
+    fs: [Map[Str, Bool]] = [c[0].parse_funcs, builtin_names()]
+    trees = ~parse.parse(name, text, st().left_delim, st().right_delim, fs)
+    # Add the newly parsed trees, including the one for t, into our common
+    # structure.
+    for n, tr in trees {
+      _ = self.~add_parse_tree(n, tr)
+    }
+    self
+  }
+
+  # Installs the new template into the group of templates associated with
+  # t. Reports whether to store this tree as the template's tree.
+  def associate(nt: Template, tree: parse.Tree) -> Bool {
+    if old = c[0].names[nt.name] {
+      old_t = Template.new(c: c, i: old)
+      if parse.is_empty_tree(tree.root) && old_t.tree != none {
+        # If a template by that name exists, don't replace it with an
+        # empty template.
+        return false
+      }
+    }
+    cc = c
+    cc[0].names[nt.name] = nt.i
+    true
+  }
+
+  # Sets options for the template: "missingkey=default" or
+  # "missingkey=invalid" (the default: missing keys give no value),
+  # "missingkey=zero" (the zero value of the map's element type),
+  # "missingkey=error" (execution stops with an error). Panics on an
+  # unknown option, as Go's does.
+  pub def option(opts: [Str]) -> Template {
+    for o in opts { set_option(o) }
+    self
+  }
+
+  def set_option(opt: Str) {
+    panic("empty option string") if opt == ""
+    # key=value
+    if kv = strings.cut(opt, "=") {
+      if kv[0] == "missingkey" {
+        cc = c
+        case kv[1] {
+          "invalid" | "default" => {
+            cc[0].missing_key = MAP_INVALID
+            return nil
+          }
+          "zero" => {
+            cc[0].missing_key = MAP_ZERO_VALUE
+            return nil
+          }
+          "error" => {
+            cc[0].missing_key = MAP_ERROR
+            return nil
+          }
+          _ => {}
+        }
+      }
+    }
+    panic("unrecognized option: #{opt}")
+  }
+
+  # A string listing the defined templates, prefixed by the string
+  # "; defined templates are: ". If there are none, it returns the empty
+  # string. For generating an error message here and in html/template.
+  pub def defined_templates -> Str {
+    return "" if c.size == 0
+    b = ""
+    for n, idx in c[0].names {
+      t = c[0].states[idx]
+      tr = t.tree
+      next if tr == none || tr.unwrap.root == none
+      if b == "" {
+        b = "; defined templates are: "
+      } else {
+        b = b + ", "
+      }
+      b = b + quote(n)
+    }
+    b
+  }
+
+  # Parses the named files and associates the resulting templates with t.
+  # If an error occurs, parsing stops and the error is returned. Since the
+  # templates created by parse_files are named by the base names of the
+  # argument files, t should usually have the name of one of the (base)
+  # names of the files.
+  pub def parse_files(filenames: [Str]) -> ~Template {
+    ~parse_files_into(self, filenames)
+  }
+
+  # Parses the template definitions in the files identified by the pattern
+  # (filepath.Match syntax) and associates them with t.
+  pub def parse_glob(pattern: Str) -> ~Template {
+    ~parse_glob_into(self, pattern)
+  }
+
+  # Like parse_files or parse_glob but reads from the file system fsys
+  # (an io/fs FS) instead of the host operating system's file system. It
+  # accepts a list of glob patterns (see path.Match).
+  pub def parse_fs[F](fsys: F, patterns: [Str]) -> ~Template {
+    ~parse_fs_into(self, fsys, patterns)
+  }
+
+  # Applies the template to the data and writes the output to w. If an
+  # error occurs executing the template or writing its output, execution
+  # stops, but partial results may already have been written to the output
+  # writer.
+  pub def execute[W, D](w: W, data: D) -> ~Unit {
+    out, err = run_template(self, data.to_tmpl)
+    _ = w.~write!(out.bytes) if out.size > 0
+    if e = err {
+      fail e
+    }
+    nil
+  }
+
+  # Applies the template associated with t that has the given name to the
+  # data and writes the output to w.
+  pub def execute_template[W, D](w: W, name: Str, data: D) -> ~Unit {
+    if t = lookup(name) {
+      return t.~execute(w, data)
+    }
+    fail Failure.Msg("template: no template #{quote(name)} associated with template #{quote(self.name)}")
+  }
+
+  # Executes the template and returns its output (alx's convenience: the
+  # partial output of a failed execution is lost).
+  pub def execute_str[D](data: D) -> ~Str {
+    out, err = run_template(self, data.to_tmpl)
+    if e = err {
+      fail e
+    }
+    out
+  }
+
+  # execute_template to a Str.
+  pub def execute_template_str[D](name: Str, data: D) -> ~Str {
+    if t = lookup(name) {
+      return t.~execute_str(data)
+    }
+    fail Failure.Msg("template: no template #{quote(name)} associated with template #{quote(self.name)}")
+  }
+}
+
+def fresh_template(name: Str) -> Template { new(name) }
+
+# A new, undefined template with the given name.
+pub def new(name: Str) -> Template {
+  c = new_common()
+  c[0].states = [TState.new(name: name)]
+  Template.new(c: c, i: 0)
+}
+
+# A helper that panics if the error is non-nil (Go's Must). It is intended
+# for use in variable initializations such as
+#   t = template.must(template.new("name").parse("text"))
+pub def must(r: ~Template) -> Template {
+  if e = r.err {
+    panic(e.message)
+  }
+  r.unwrap
+}
+
+# Creates a new Template and parses the template definitions from the named
+# files. The returned template's name will have the base name and parsed
+# contents of the first file. There must be at least one file.
+pub def parse_files(filenames: [Str]) -> ~Template {
+  ~parse_files_into_new(filenames)
+}
+
+def parse_files_into_new(filenames: [Str]) -> ~Template {
+  fail Failure.Msg("template: no files named in call to ParseFiles") if filenames.size == 0
+  first = filepath.base(filenames[0])
+  t = new(first)
+  ~parse_files_into(t, filenames)
+}
+
+# Go's parseFiles: the helper for the function and the method. It uses the
+# first file's base name as the template's name when t is nameless.
+def parse_files_into(t0: Template, filenames: [Str]) -> ~Template {
+  fail Failure.Msg("template: no files named in call to ParseFiles") if filenames.size == 0
+  t = t0
+  for filename in filenames {
+    b = ~os.read_file(filename)
+    s = Str.from_bytes(b)
+    name = filepath.base(filename)
+    # First template becomes return value if not already defined, and we
+    # use that one for subsequent New calls to associate all the templates
+    # together. Also, if this file has the same name as t, this file
+    # becomes the contents of t, so
+    #   t = template.new("x").parse_files(["x"])
+    # works. Otherwise we create a new template associated with t.
+    tmpl = name == t.name ? t : t.new(name)
+    _ = tmpl.~parse(s)
+  }
+  t
+}
+
+# Creates a new Template and parses the template definitions from the files
+# identified by the pattern. The files are matched according to the
+# semantics of filepath.Match, and the pattern must match at least one
+# file.
+pub def parse_glob(pattern: Str) -> ~Template {
+  filenames = ~filepath.glob(pattern)
+  fail Failure.Msg("template: pattern matches no files: #{bquote(pattern)}") if filenames.size == 0
+  ~parse_files_into_new(filenames)
+}
+
+def parse_glob_into(t: Template, pattern: Str) -> ~Template {
+  filenames = ~filepath.glob(pattern)
+  fail Failure.Msg("template: pattern matches no files: #{bquote(pattern)}") if filenames.size == 0
+  ~parse_files_into(t, filenames)
+}
+
+# Like parse_files or parse_glob but reads from the file system fsys.
+pub def parse_fs[F](fsys: F, patterns: [Str]) -> ~Template {
+  filenames = ~fs_glob_all(fsys, patterns)
+  fail Failure.Msg("template: no files named in call to ParseFiles") if filenames.size == 0
+  t = new(path.base(filenames[0]))
+  ~parse_fs_files(t, fsys, filenames)
+}
+
+def parse_fs_into[F](t: Template, fsys: F, patterns: [Str]) -> ~Template {
+  filenames = ~fs_glob_all(fsys, patterns)
+  ~parse_fs_files(t, fsys, filenames)
+}
+
+def fs_glob_all[F](fsys: F, patterns: [Str]) -> ~[Str] {
+  filenames: [Str] = []
+  for pattern in patterns {
+    list = ~fs.glob(fsys, pattern)
+    fail Failure.Msg("template: pattern matches no files: #{bquote(pattern)}") if list.size == 0
+    for f in list { filenames << f }
+  }
+  filenames
+}
+
+def parse_fs_files[F](t: Template, fsys: F, filenames: [Str]) -> ~Template {
+  fail Failure.Msg("template: no files named in call to ParseFiles") if filenames.size == 0
+  for filename in filenames {
+    b = ~fs.read_file(fsys, filename)
+    name = path.base(filename)
+    tmpl = name == t.name ? t : t.new(name)
+    _ = tmpl.~parse(Str.from_bytes(b))
+  }
+  t
+}
+
+# Go's %#q: backquoted when possible.
+def bquote(s: Str) -> Str {
+  return "`" + s + "`" if strconv.can_backquote(s)
+  strconv.quote(s)
+}
+
+def quote(s: Str) -> Str { strconv.quote(s) }
+
+# Whether the function name is a valid identifier.
+def good_name?(name: Str) -> Bool {
+  return false if name == ""
+  i = 0
+  for r in name.runes {
+    if r == 95 {
+    } else if i == 0 && !unicode.is_letter(r) {
+      return false
+    } else if !unicode.is_letter(r) && !unicode.is_digit(r) {
+      return false
+    }
+    i += 1
+  }
+  true
+}

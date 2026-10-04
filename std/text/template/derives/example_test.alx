@@ -1,0 +1,225 @@
+# Go's example_test.go, examplefunc_test.go and examplefiles_test.go.
+
+import "os"
+import "path/filepath"
+import "strings"
+import "text/template"
+
+#[derive(Template)]
+struct Recipient {
+  #[template("Name")] name: Str
+  #[template("Gift")] gift: Str
+  #[template("Attended")] attended: Bool
+}
+
+LETTER = "\nDear {{.Name}},\n{{if .Attended}}\nIt was a pleasure to see you at the wedding.\n{{- else}}\nIt is a shame you couldn't make it to the wedding.\n{{- end}}\n{{with .Gift -}}\nThank you for the lovely {{.}}.\n{{end}}\nBest wishes,\nJosie\n"
+
+example "template" {
+  # Prepare some data to insert into the template.
+  recipients = [
+    Recipient.new(name: "Aunt Mildred", gift: "bone china tea set", attended: true),
+    Recipient.new(name: "Uncle John", gift: "moleskin pants", attended: false),
+    Recipient.new(name: "Cousin Rodney", gift: "", attended: false),
+  ]
+  # Create a new template and parse the letter into it.
+  t = template.must(template.new("letter").parse(LETTER))
+  # Execute the template for each recipient.
+  for r in recipients {
+    out = t.execute_str(r)
+    if e = out.err {
+      puts "executing template: #{e.message}"
+    } else {
+      print out.unwrap
+    }
+  }
+} outputs "\nDear Aunt Mildred,\n\nIt was a pleasure to see you at the wedding.\nThank you for the lovely bone china tea set.\n\nBest wishes,\nJosie\n\nDear Uncle John,\n\nIt is a shame you couldn't make it to the wedding.\nThank you for the lovely moleskin pants.\n\nBest wishes,\nJosie\n\nDear Cousin Rodney,\n\nIt is a shame you couldn't make it to the wedding.\n\nBest wishes,\nJosie\n"
+
+def strs(xs: [Str]) -> template.Value { template.Value.list_of(xs.map { template.Value.str(it) }, "[]string") }
+
+example "template block" {
+  master = "Names:{{block \"list\" .}}{{\"\\n\"}}{{range .}}{{println \"-\" .}}{{end}}{{end}}"
+  overlay = "{{define \"list\"}} {{join . \", \"}}{{end}} "
+  funcs: Map[Str, template.Func] = {
+    "join" => template.Func.of("func([]string, string) string", ->(a: [template.Value]) -> ~template.Value {
+      template.Value.str(strings.join(a[0].elems.map { it.str_val }, a[1].str_val))
+    }),
+  }
+  guardians = strs(["Gamora", "Groot", "Nebula", "Rocket", "Star-Lord"])
+  master_tmpl = template.new("master").funcs(funcs).parse(master).unwrap
+  cl = master_tmpl.clone
+  overlay_tmpl = template.must(cl).parse(overlay).unwrap
+  print master_tmpl.execute_str(guardians).unwrap
+  print overlay_tmpl.execute_str(guardians).unwrap
+} outputs "Names:\n- Gamora\n- Groot\n- Nebula\n- Rocket\n- Star-Lord\nNames: Gamora, Groot, Nebula, Rocket, Star-Lord"
+
+# strings.Title (ASCII): letters that begin words are upper-cased; a word
+# boundary is anything but a letter, digit or underscore.
+def title(s: Str) -> Str {
+  out: [Byte] = []
+  sep = true
+  for b in s.bytes {
+    c = b.to_i
+    alnum = (c >= 97 && c <= 122) || (c >= 65 && c <= 90) || (c >= 48 && c <= 57) || c == 95
+    if sep && c >= 97 && c <= 122 {
+      c -= 32
+    }
+    out << c.as_u8
+    sep = !alnum
+  }
+  Str.from_bytes(out)
+}
+
+example "template func" {
+  # First we create a FuncMap with which to register the function.
+  func_map: Map[Str, template.Func] = {
+    # The name "title" is what the function will be called in the template
+    # text.
+    "title" => template.Func.of("func(string) string", ->(a: [template.Value]) -> ~template.Value { template.Value.str(title(a[0].str_val)) }),
+  }
+  # A simple template definition to test our function. We print the input
+  # text several ways:
+  # - the original
+  # - title-cased
+  # - title-cased and then printed with %q
+  # - printed with %q and then title-cased.
+  template_text = "\nInput: {{printf \"%q\" .}}\nOutput 0: {{title .}}\nOutput 1: {{title . | printf \"%q\"}}\nOutput 2: {{printf \"%q\" . | title}}\n"
+  # Create a template, add the function map, and parse the text.
+  tmpl = template.new("titleTest").funcs(func_map).parse(template_text).unwrap
+  # Run the template to verify the output.
+  print tmpl.execute_str(template.Value.str("the go programming language")).unwrap
+} outputs "\nInput: \"the go programming language\"\nOutput 0: The Go Programming Language\nOutput 1: \"The Go Programming Language\"\nOutput 2: \"The Go Programming Language\"\n"
+
+# This example demonstrates registering two custom template functions and
+# how to overwrite one of the functions after the template has been parsed.
+# Overwriting can be used, for example, to alter the operation of cloned
+# templates.
+example "template funcs" {
+  # Define a simple template to test the functions.
+  tmpl = "{{ . | lower | repeat }}"
+  # Define the template funcMap with two functions.
+  func_map: Map[Str, template.Func] = {
+    "lower" => template.Func.of("func(string) string", ->(a: [template.Value]) -> ~template.Value { template.Value.str(strings.to_lower(a[0].str_val)) }),
+    "repeat" => template.Func.of("func(string) string", ->(a: [template.Value]) -> ~template.Value { template.Value.str(a[0].str_val * 2) }),
+  }
+  # Define a New template, add the funcMap using Funcs and then Parse the
+  # template.
+  parsed_tmpl = template.new("t").funcs(func_map).parse(tmpl).unwrap
+  print parsed_tmpl.execute_str(template.Value.str("ABC\n")).unwrap
+  # Funcs must be called before a template is parsed to add functions to
+  # the template. Funcs can also be used after a template is parsed to
+  # overwrite template functions.
+  #
+  # Here the function identified by "repeat" is overwritten.
+  parsed_tmpl.funcs({"repeat" => template.Func.of("func(string) string", ->(a: [template.Value]) -> ~template.Value { template.Value.str(a[0].str_val * 3) })})
+  print parsed_tmpl.execute_str(template.Value.str("DEF\n")).unwrap
+} outputs "abc\nabc\ndef\ndef\ndef\n"
+
+#[derive(Template)]
+struct Book {
+  #[template("Stars")] stars: Float
+  #[template("Name")] name: Str
+}
+
+# This example demonstrates how to use "if".
+example "template if" {
+  tpl = template.new("book").parse("{{ if (gt .Stars 4.0) }}\"{{.Name }}\" is a great book.{{ else }}\"{{.Name}}\" is not a great book.{{ end }}").unwrap
+  b = Book.new(stars: 4.9, name: "Good Night, Gopher")
+  print tpl.execute_str(b).unwrap
+} outputs "\"Good Night, Gopher\" is a great book."
+
+# examplefiles_test.go: templates in files.
+
+struct TemplateFile {
+  name: Str
+  contents: Str
+}
+
+def create_test_dir(files: [TemplateFile]) -> Str {
+  dir = os.mkdir_temp("", "template").unwrap
+  for file in files {
+    f = os.create(filepath.join([dir, file.name])).unwrap
+    f.write_string!(file.contents).unwrap
+    f.close!.unwrap
+  }
+  dir
+}
+
+# Here we demonstrate loading a set of templates from a directory.
+example "template glob" {
+  # Here we create a temporary directory and populate it with our sample
+  # template definition files; usually the template files would already
+  # exist in some location known to the program.
+  dir = create_test_dir([
+    # T0.tmpl is a plain template file that just invokes T1.
+    TemplateFile.new(name: "T0.tmpl", contents: "T0 invokes T1: ({{template \"T1\"}})\n"),
+    # T1.tmpl defines a template, T1 that invokes T2.
+    TemplateFile.new(name: "T1.tmpl", contents: "{{define \"T1\"}}T1 invokes T2: ({{template \"T2\"}}){{end}}"),
+    # T2.tmpl defines a template T2.
+    TemplateFile.new(name: "T2.tmpl", contents: "{{define \"T2\"}}This is T2{{end}}"),
+  ])
+  # pattern is the glob pattern used to find all the template files.
+  pattern = filepath.join([dir, "*.tmpl"])
+  # Here starts the example proper.
+  # T0.tmpl is the first name matched, so it becomes the starting template,
+  # the value returned by ParseGlob.
+  tmpl = template.must(template.parse_glob(pattern))
+  print tmpl.execute_str(template.Value.invalid).unwrap
+  os.remove_all(dir).unwrap
+} outputs "T0 invokes T1: (T1 invokes T2: (This is T2))\n"
+
+# This example demonstrates one way to share some templates and use them in
+# different contexts. In this variant we add multiple driver templates by
+# hand to an existing bundle of templates.
+example "template helpers" {
+  dir = create_test_dir([
+    # T1.tmpl defines a template, T1 that invokes T2.
+    TemplateFile.new(name: "T1.tmpl", contents: "{{define \"T1\"}}T1 invokes T2: ({{template \"T2\"}}){{end}}"),
+    # T2.tmpl defines a template T2.
+    TemplateFile.new(name: "T2.tmpl", contents: "{{define \"T2\"}}This is T2{{end}}"),
+  ])
+  pattern = filepath.join([dir, "*.tmpl"])
+  # Load the helpers.
+  templates = template.must(template.parse_glob(pattern))
+  # Add one driver template to the bunch; we do this with an explicit
+  # template definition.
+  _a = templates.parse("{{define \"driver1\"}}Driver 1 calls T1: ({{template \"T1\"}})\n{{end}}").unwrap
+  # Add another driver template.
+  _b = templates.parse("{{define \"driver2\"}}Driver 2 calls T2: ({{template \"T2\"}})\n{{end}}").unwrap
+  # We load all the templates before execution. This package does not
+  # require that behavior but html/template's escaping does, so it's a good
+  # habit.
+  print templates.execute_template_str("driver1", template.Value.invalid).unwrap
+  print templates.execute_template_str("driver2", template.Value.invalid).unwrap
+  os.remove_all(dir).unwrap
+} outputs "Driver 1 calls T1: (T1 invokes T2: (This is T2))\nDriver 2 calls T2: (This is T2)\n"
+
+# This example demonstrates how to use one group of driver templates with
+# distinct sets of helper templates.
+example "template share" {
+  dir = create_test_dir([
+    # T0.tmpl is a plain template file that just invokes T1.
+    TemplateFile.new(name: "T0.tmpl", contents: "T0 ({{.}} version) invokes T1: ({{template `T1`}})\n"),
+    # T1.tmpl defines a template, T1 that invokes T2. Note T2 is not defined
+    TemplateFile.new(name: "T1.tmpl", contents: "{{define \"T1\"}}T1 invokes T2: ({{template \"T2\"}}){{end}}"),
+  ])
+  pattern = filepath.join([dir, "*.tmpl"])
+  # Load the drivers.
+  drivers = template.must(template.parse_glob(pattern))
+  # We must define an implementation of the T2 template. First we clone the
+  # drivers, then add a definition of T2 to the template name space.
+  # 1. Clone the helper set to create a new name space from which to run
+  # them.
+  first = drivers.clone.unwrap
+  # 2. Define T2, version A, and parse it.
+  _a = first.parse("{{define \"T2\"}}T2, version A{{end}}").unwrap
+  # Now repeat the whole thing, using a different version of T2.
+  # 1. Clone the drivers.
+  second = drivers.clone.unwrap
+  # 2. Define T2, version B, and parse it.
+  _b = second.parse("{{define \"T2\"}}T2, version B{{end}}").unwrap
+  # Execute the templates in the reverse order to verify the first is
+  # unaffected by the second.
+  print second.execute_template_str("T0.tmpl", template.Value.str("second")).unwrap
+  print first.execute_template_str("T0.tmpl", template.Value.str("first")).unwrap
+  os.remove_all(dir).unwrap
+} outputs "T0 (second version) invokes T1: (T1 invokes T2: (T2, version B))\nT0 (first version) invokes T1: (T1 invokes T2: (T2, version A))\n"

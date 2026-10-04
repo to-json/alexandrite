@@ -1,0 +1,578 @@
+# The predefined functions: Go's text/template/funcs.go.
+
+import "net/url"
+import "strings"
+import "unicode"
+import "unicode/utf8"
+
+# The predefined functions' names, for the parser.
+def builtin_names -> Map[Str, Bool] {
+  m: Map[Str, Bool] = {}
+  for n in ["and", "call", "html", "index", "slice", "js", "len", "not", "or", "print", "printf", "println", "urlquery", "eq", "ge", "gt", "le", "lt", "ne"] {
+    m[n] = true
+  }
+  m
+}
+
+RV = "reflect.Value"
+ANY = "interface {}"
+
+# The signatures of the predefined functions (Go's reflect types of them).
+def builtin_sig(name: Str) -> Sig? {
+  case name {
+    "and" | "or" => Sig.new(params: [RV, RV], variadic: true, results: [RV])
+    "call" => Sig.new(params: [RV, RV], variadic: true, results: [RV, "error"])
+    "html" | "js" | "print" | "println" | "urlquery" => Sig.new(params: [ANY], variadic: true, results: ["string"])
+    "index" | "slice" => Sig.new(params: [RV, RV], variadic: true, results: [RV, "error"])
+    "len" => Sig.new(params: [RV], results: ["int", "error"])
+    "not" => Sig.new(params: [RV], results: ["bool"])
+    "printf" => Sig.new(params: ["string", ANY], variadic: true, results: ["string"])
+    "eq" => Sig.new(params: [RV, RV], variadic: true, results: ["bool", "error"])
+    "ge" | "gt" | "le" | "lt" | "ne" => Sig.new(params: [RV, RV], results: ["bool", "error"])
+    _ => none
+  }
+}
+
+# Calls a predefined function (and/or and call are handled by the
+# executor).
+def call_builtin(name: Str, args: [Value]) -> ~Value {
+  case name {
+    "html" => Value.str(html_escape_string(eval_args(args)))
+    "js" => Value.str(js_escape_string(eval_args(args)))
+    "urlquery" => Value.str(url.query_escape(eval_args(args)))
+    "print" => Value.str(go_sprint(args))
+    "println" => Value.str(go_sprintln(args))
+    "printf" => Value.str(go_sprintf(args[0].s, args[1...args.size]))
+    "index" => ~index(args[0], args[1...args.size])
+    "slice" => ~slice(args[0], args[1...args.size])
+    "len" => Value.int(~length(args[0]))
+    "not" => Value.bool(!truth(args[0]))
+    "eq" => Value.bool(~eq(args[0], args[1...args.size]))
+    "ne" => Value.bool(!~eq(args[0], [args[1]]))
+    "lt" => Value.bool(~lt(args[0], args[1]))
+    "le" => Value.bool(~le(args[0], args[1]))
+    "gt" => Value.bool(!~le(args[0], args[1]))
+    "ge" => Value.bool(!~lt(args[0], args[1]))
+    _ => Value.invalid
+  }
+}
+
+def ferr(msg: Str) -> Error { Failure.Msg(msg) }
+
+# Whether a kind is an integer kind.
+def int_like(k: Int) -> Bool { k == KIND_INT || k == KIND_UINT }
+
+# Checks if value can be used as an argument of type arg_type, and
+# converts an invalid value to appropriate zero if possible.
+def prepare_arg(value: Value, arg_type: Str) -> ~Value {
+  if value.k == KIND_INVALID {
+    if !can_be_nil(arg_type) {
+      fail ferr("value is nil; should be of type #{arg_type}")
+    }
+    return zero_of(arg_type)
+  }
+  return value if assignable(value, arg_type)
+  ak = kind_of_type(arg_type)
+  if int_like(value.k) && int_like(ak) {
+    if ak == KIND_INT {
+      x = value.k == KIND_INT ? value.n : value.u.as_i64
+      return Value.int_of(wrap_int(x, arg_type), arg_type)
+    }
+    ux = value.k == KIND_UINT ? value.u : value.n.as_u64
+    return Value.uint_of(wrap_uint(ux, arg_type), arg_type)
+  }
+  fail ferr("value has type #{value.type_name}; should be #{arg_type}")
+}
+
+# Checks if a Value can be used as an index, and converts it to int if
+# possible.
+def index_arg(index: Value, cap: Int) -> ~Int {
+  x = 0
+  case index.k {
+    KIND_INT => x = index.n
+    KIND_UINT => x = index.u.as_i64
+    KIND_INVALID => {
+      fail ferr("cannot index slice/array with nil")
+    }
+    _ => {
+      fail ferr("cannot index slice/array with type #{index.type_name}")
+    }
+  }
+  if x < 0 || x > cap {
+    fail ferr("index out of range: #{x}")
+  }
+  x
+}
+
+# The result of indexing its first argument by the following arguments.
+# Thus "index x 1 2 3" is, in Go syntax, x[1][2][3]. Each indexed item must
+# be a map, slice, or array.
+def index(item0: Value, indexes: [Value]) -> ~Value {
+  item = indirect_interface(item0)
+  if item.k == KIND_INVALID {
+    fail ferr("index of untyped nil")
+  }
+  for ix0 in indexes {
+    ix = indirect_interface(ix0)
+    item2, is_nil = indirect(item)
+    item = item2
+    if is_nil {
+      fail ferr("index of nil pointer")
+    }
+    case item.k {
+      KIND_LIST | KIND_STRING => {
+        n = item.len
+        x = ~index_arg(ix, n)
+        if x >= n {
+          # reflect's own panic, which Go's safeCall turns into the error
+          fail ferr(item.k == KIND_STRING ? "reflect: string index out of range" : "reflect: slice index out of range")
+        }
+        if item.k == KIND_STRING {
+          item = Value.uint_of(item.s[x].to_u64, "uint8")
+        } else {
+          item = item.at(x)
+        }
+      }
+      KIND_MAP => {
+        kt = map_key_type(item.type_name)
+        key = ~prepare_arg(ix, kt)
+        if v = item.map_get(key) {
+          item = v
+        } else {
+          item = zero_of(map_elem_type(item.type_name))
+        }
+      }
+      _ => {
+        fail ferr("can't index item of type #{item.type_name}")
+      }
+    }
+  }
+  item
+}
+
+# The result of slicing its first argument by the remaining arguments.
+# Thus "slice x 1 2" is, in Go syntax, x[1:2], while "slice x" is x[:],
+# "slice x 1" is x[1:], and "slice x 1 2 3" is x[1:2:3]. The first argument
+# must be a string, slice, or array.
+def slice(item00: Value, indexes: [Value]) -> ~Value {
+  item0 = indirect_interface(item00)
+  if item0.k == KIND_INVALID {
+    fail ferr("slice of untyped nil")
+  }
+  item, is_nil = indirect(item0)
+  if is_nil {
+    fail ferr("slice of nil pointer")
+  }
+  if indexes.size > 3 {
+    fail ferr("too many slice indexes: #{indexes.size}")
+  }
+  cap = 0
+  case item.k {
+    KIND_STRING => {
+      if indexes.size == 3 {
+        fail ferr("cannot 3-index slice a string")
+      }
+      cap = item.len
+    }
+    KIND_LIST => cap = item.cap
+    _ => {
+      fail ferr("can't slice item of type #{item.type_name}")
+    }
+  }
+  # set default values for cases item[:], item[i:].
+  idx = [0, item.len, 0]
+  i = 0
+  for ix in indexes {
+    idx[i] = ~index_arg(ix, cap)
+    i += 1
+  }
+  # given item[i:j], make sure i <= j.
+  if idx[0] > idx[1] {
+    fail ferr("invalid slice index: #{idx[0]} > #{idx[1]}")
+  }
+  if item.k == KIND_STRING {
+    return Value.str_of(item.s[idx[0]...idx[1]], item.t)
+  }
+  st = slice_type(item.type_name)
+  if indexes.size < 3 {
+    return typed_value(item.slice(idx[0], idx[1], cap), st)
+  }
+  # given item[i:j:k], make sure i <= j <= k.
+  if idx[1] > idx[2] {
+    fail ferr("invalid slice index: #{idx[1]} > #{idx[2]}")
+  }
+  typed_value(item.slice(idx[0], idx[1], idx[2]), st)
+}
+
+# The type of a slice of a slice or array type: "[3]int" -> "[]int".
+def slice_type(t: Str) -> Str {
+  return t if strings.has_prefix(t, "[]") || !strings.has_prefix(t, "[")
+  e = bracket_end(t, 0)
+  "[]" + t[e + 1...t.size]
+}
+
+# The length of the item, with an error if it has no defined length.
+def length(item0: Value) -> ~Int {
+  item, is_nil = indirect(item0)
+  if is_nil {
+    fail ferr("len of nil pointer")
+  }
+  case item.k {
+    KIND_LIST | KIND_MAP | KIND_STRING => item.len
+    KIND_INVALID => {
+      # (Go panics in reflect, and the call reports the panic)
+      fail ferr("reflect: call of reflect.Value.Type on zero Value")
+    }
+    _ => {
+      fail ferr("len of type #{item.type_name}")
+    }
+  }
+}
+
+# The result of evaluating the first argument as a function. The function
+# must return 1 result, or 2 results, the second of which is an error.
+def call_value(name: Str, fnv0: Value, args: [Value]) -> ~Value {
+  fnv = indirect_interface(fnv0)
+  if fnv.k == KIND_INVALID {
+    fail ferr("call of nil")
+  }
+  if fnv.k != KIND_FUNC {
+    fail ferr("non-function #{name} of type #{fnv.type_name}")
+  }
+  c = fnv.callable
+  if c == none {
+    fail ferr("reflect: call of nil function")
+  }
+  sg = c.unwrap.sig
+  if e = sg.check(name) {
+    fail ferr(e)
+  }
+  num_in = sg.params.size
+  ddd = ""
+  if sg.variadic {
+    if args.size < num_in - 1 {
+      fail ferr("wrong number of args for #{name}: got #{args.size} want at least #{num_in - 1}")
+    }
+    ddd = sg.params[num_in - 1]
+  } else if args.size != num_in {
+    fail ferr("wrong number of args for #{name}: got #{args.size} want #{num_in}")
+  }
+  argv: [Value] = []
+  i = 0
+  for arg in args {
+    # Compute the expected type. Clumsy because of variadics.
+    arg_type = ddd
+    arg_type = sg.params[i] if !sg.variadic || i < num_in - 1
+    r = prepare_arg(indirect_interface(arg), arg_type)
+    if e = r.err {
+      fail e.wrap("arg #{i}")
+    }
+    argv << r.unwrap
+    i += 1
+  }
+  ~c.unwrap.call(argv)
+}
+
+# Comparison.
+
+BK_INVALID = 0
+BK_BOOL = 1
+BK_COMPLEX = 2
+BK_INT = 3
+BK_FLOAT = 4
+BK_STRING = 5
+BK_UINT = 6
+
+def basic_kind_of(v: Value) -> Int {
+  case v.k {
+    KIND_BOOL => BK_BOOL
+    KIND_INT => BK_INT
+    KIND_UINT => BK_UINT
+    KIND_FLOAT => BK_FLOAT
+    KIND_COMPLEX => BK_COMPLEX
+    KIND_STRING => BK_STRING
+    _ => BK_INVALID
+  }
+}
+
+# Whether v is the zero Value, or nil of its type.
+def is_nil_value(v: Value) -> Bool {
+  return true if v.k == KIND_INVALID
+  v.nil?
+}
+
+# Whether v1 and v2 are both the same kind, or one is nil. Called only when
+# dealing with nillable types, or there's about to be an error.
+def can_compare(v1: Value, v2: Value) -> Bool {
+  v1.k == v2.k || v1.k == KIND_INVALID || v2.k == KIND_INVALID
+}
+
+# Whether values of this kind are comparable with == in Go.
+def comparable?(v: Value) -> Bool {
+  case v.k {
+    KIND_LIST => !strings.has_prefix(v.type_name, "[]") && v.elems.all? { comparable?(it) }
+    KIND_MAP | KIND_FUNC => false
+    KIND_STRUCT => v.entries.all? { comparable?(it[1]) }
+    _ => true
+  }
+}
+
+# Go's == on two comparable values of the same type.
+def values_equal(a: Value, b: Value) -> Bool {
+  return false if a.k != b.k || a.type_name != b.type_name
+  case a.k {
+    KIND_BOOL | KIND_INT => a.n == b.n
+    KIND_UINT => a.u == b.u
+    KIND_FLOAT => a.f == b.f
+    KIND_COMPLEX => a.f == b.f && a.g == b.g
+    KIND_STRING => a.s == b.s
+    KIND_INVALID => true
+    KIND_PTR => {
+      return a.nil? == b.nil? if a.nil? || b.nil?
+      values_equal(a.elem, b.elem)
+    }
+    KIND_LIST => {
+      xs = a.elems
+      ys = b.elems
+      return false if xs.size != ys.size
+      i = 0
+      while i < xs.size {
+        return false if !values_equal(xs[i], ys[i])
+        i += 1
+      }
+      true
+    }
+    KIND_STRUCT => {
+      xs = a.entries
+      ys = b.entries
+      return false if xs.size != ys.size
+      i = 0
+      while i < xs.size {
+        return false if !values_equal(xs[i][1], ys[i][1])
+        i += 1
+      }
+      true
+    }
+    _ => false
+  }
+}
+
+# Evaluates the comparison a == b || a == c || ...
+def eq(arg10: Value, arg2: [Value]) -> ~Bool {
+  arg1 = indirect_interface(arg10)
+  if arg2.size == 0 {
+    fail ferr("missing argument for comparison")
+  }
+  k1 = basic_kind_of(arg1)
+  for arg0 in arg2 {
+    arg = indirect_interface(arg0)
+    k2 = basic_kind_of(arg)
+    t = false
+    if k1 != k2 {
+      # Special case: Can compare integer values regardless of type's sign.
+      if k1 == BK_INT && k2 == BK_UINT {
+        t = arg1.n >= 0 && arg1.n.as_u64 == arg.u
+      } else if k1 == BK_UINT && k2 == BK_INT {
+        t = arg.n >= 0 && arg1.u == arg.n.as_u64
+      } else if arg1.k != KIND_INVALID && arg.k != KIND_INVALID {
+        fail ferr("incompatible types for comparison: #{arg1.type_name} and #{arg.type_name}")
+      }
+    } else {
+      case k1 {
+        BK_BOOL | BK_INT => t = arg1.n == arg.n
+        BK_COMPLEX => t = arg1.f == arg.f && arg1.g == arg.g
+        BK_FLOAT => t = arg1.f == arg.f
+        BK_STRING => t = arg1.s == arg.s
+        BK_UINT => t = arg1.u == arg.u
+        _ => {
+          if !can_compare(arg1, arg) {
+            fail ferr("non-comparable types #{go_sprintf("%s", [arg1])}: #{arg1.type_name}, #{arg.type_name}: #{go_sprint([arg])}")
+          }
+          if is_nil_value(arg1) || is_nil_value(arg) {
+            t = is_nil_value(arg) == is_nil_value(arg1)
+          } else {
+            if !comparable?(arg) {
+              fail ferr("non-comparable type #{go_sprintf("%s", [arg])}: #{arg.type_name}")
+            }
+            t = values_equal(arg1, arg)
+          }
+        }
+      }
+    }
+    return true if t
+  }
+  false
+}
+
+# Evaluates the comparison a < b.
+def lt(arg10: Value, arg20: Value) -> ~Bool {
+  arg1 = indirect_interface(arg10)
+  arg2 = indirect_interface(arg20)
+  k1 = basic_kind_of(arg1)
+  if k1 == BK_INVALID {
+    fail ferr("invalid type for comparison")
+  }
+  k2 = basic_kind_of(arg2)
+  if k2 == BK_INVALID {
+    fail ferr("invalid type for comparison")
+  }
+  if k1 != k2 {
+    # Special case: Can compare integer values regardless of type's sign.
+    if k1 == BK_INT && k2 == BK_UINT {
+      return arg1.n < 0 || arg1.n.as_u64 < arg2.u
+    }
+    if k1 == BK_UINT && k2 == BK_INT {
+      return arg2.n >= 0 && arg1.u < arg2.n.as_u64
+    }
+    fail ferr("incompatible types for comparison: #{arg1.type_name} and #{arg2.type_name}")
+  }
+  case k1 {
+    BK_BOOL | BK_COMPLEX => {
+      fail ferr("invalid type for comparison")
+    }
+    BK_FLOAT => arg1.f < arg2.f
+    BK_INT => arg1.n < arg2.n
+    BK_STRING => arg1.s < arg2.s
+    _ => arg1.u < arg2.u
+  }
+}
+
+# Evaluates the comparison a <= b.
+def le(arg1: Value, arg2: Value) -> ~Bool {
+  # <= is < or ==.
+  if ~lt(arg1, arg2) {
+    return true
+  }
+  ~eq(arg1, [arg2])
+}
+
+# HTML escaping.
+
+# The escaped HTML equivalent of the plain text data s.
+pub def html_escape_string(s: Str) -> Str {
+  # Avoid allocation if we can.
+  return s if !strings.contains_any(s, "'\"&<>\x00")
+  out: [Str] = []
+  last = 0
+  i = 0
+  while i < s.size {
+    c = s[i]
+    rep = case c {
+      0 => "\uFFFD"
+      34 => "&#34;"
+      39 => "&#39;"
+      38 => "&amp;"
+      60 => "&lt;"
+      62 => "&gt;"
+      _ => ""
+    }
+    if rep != "" {
+      out << s[last...i]
+      out << rep
+      last = i + 1
+    }
+    i += 1
+  }
+  out << s[last...s.size]
+  out.join("")
+}
+
+# The escaped HTML equivalent of the textual representation of its
+# arguments.
+pub def html_escaper(args: [Value]) -> Str { html_escape_string(eval_args(args)) }
+
+# JavaScript escaping.
+
+def js_is_special(r: Rune) -> Bool {
+  case r {
+    92 | 39 | 34 | 60 | 62 | 38 | 61 => true
+    _ => r < 32 || 0x80 <= r
+  }
+}
+
+# The escaped JavaScript equivalent of the plain text data s.
+pub def js_escape_string(s: Str) -> Str {
+  # Avoid allocation if we can.
+  if strings.index_func(s, ->(r: Rune) -> Bool { js_is_special(r) }) < 0 {
+    return s
+  }
+  hex = "0123456789ABCDEF"
+  out: [Str] = []
+  last = 0
+  i = 0
+  while i < s.size {
+    c = s[i]
+    if !js_is_special(c.to_i.to_i32) {
+      i += 1
+      next
+    }
+    out << s[last...i]
+    if c < 0x80 {
+      # Quotes, slashes and angle brackets get quoted. Control characters
+      # get written as \u00XX.
+      case c {
+        92 => out << "\\\\"
+        39 => out << "\\'"
+        34 => out << "\\\""
+        60 => out << "\\u003C"
+        62 => out << "\\u003E"
+        38 => out << "\\u0026"
+        61 => out << "\\u003D"
+        _ => {
+          out << "\\u00"
+          out << hex[(c >> 4).to_i...(c >> 4).to_i + 1]
+          out << hex[(c & 15).to_i...(c & 15).to_i + 1]
+        }
+      }
+      i += 1
+    } else {
+      # Unicode rune.
+      r, size = utf8.decode_rune_at(s, i)
+      if unicode.is_print(r) {
+        out << s[i...i + size]
+      } else {
+        h = strings_upper_hex(r.to_i.as_u64)
+        while h.size < 4 { h = "0" + h }
+        out << "\\u#{h}"
+      }
+      i += size
+    }
+    last = i
+  }
+  out << s[last...s.size]
+  out.join("")
+}
+
+# The escaped JavaScript equivalent of the textual representation of its
+# arguments.
+pub def js_escaper(args: [Value]) -> Str { js_escape_string(eval_args(args)) }
+
+# The escaped value of the textual representation of its arguments in a
+# form suitable for embedding in a URL query.
+pub def url_query_escaper(args: [Value]) -> Str { url.query_escape(eval_args(args)) }
+
+# Go's printableValue for evalArgs: pointers are followed, no value is
+# "<no value>".
+def printable(v0: Value) -> Value {
+  v = v0
+  if v.k == KIND_PTR {
+    v, _ = indirect(v)
+  }
+  # (a nil interface argument is Go's reflect.ValueOf(nil): no value)
+  v = indirect_interface(v)
+  return Value.str("<no value>") if v.k == KIND_INVALID
+  v
+}
+
+# Formats the list of arguments into a string. It is therefore equivalent
+# to fmt.Sprint(args...) except that each argument is indirected (if a
+# pointer), as required, using the same rules as the default string
+# evaluation during template execution: an untyped nil is "<no value>".
+pub def eval_args(args: [Value]) -> Str {
+  # Fast path for simple common case.
+  if args.size == 1 && args[0].k == KIND_STRING && args[0].t == "" {
+    return args[0].s
+  }
+  xs = args.map { printable(it) }
+  go_sprint(xs)
+}

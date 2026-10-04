@@ -3258,7 +3258,7 @@ impl<'w, 'a> FnCx<'w, 'a> {
         let body = self.binary(BinOp::Eq, ea, eb, sp)?;
         let zero = self.mk(TK::Int(0), Ty::Int, sp);
         let range = self.mk(TK::Range(Box::new(zero), Box::new(na), true), Ty::Range, sp);
-        let blk = TBlock { params: vec![i], destructure: false, body: vec![TStmt::Expr(body)], pure: false, span: sp, own: (i, i + 1) };
+        let blk = TBlock { params: vec![i], destructure: false, body: vec![TStmt::Expr(body)], pure: false, span: sp, own: (i, i + 1), id: 0 };
         let all = self.mk(TK::M(M::All, Some(Box::new(range)), vec![], Some(Box::new(blk))), Ty::Bool, sp);
         let both = self.mk(TK::Bin(BinOp::And, Box::new(same_size), Box::new(all)), Ty::Bool, sp);
         Ok(self.mk(TK::Seq(vec![s1, s2, TStmt::Expr(both)]), Ty::Bool, sp))
@@ -3337,7 +3337,7 @@ impl<'w, 'a> FnCx<'w, 'a> {
                     Some(TStmt::Expr(e)) => e.ty.clone(),
                     _ => Ty::Unit,
                 };
-                (TBlock { params: vec![], destructure: false, body, pure: false, span: blk.span, own: (own_start, self.locals.len()) }, ty)
+                (TBlock { params: vec![], destructure: false, body, pure: false, span: blk.span, own: (own_start, self.locals.len()), id: 0 }, ty)
             })
         } else {
             self.block_n(blk, &ptys, false)
@@ -3375,7 +3375,10 @@ impl<'w, 'a> FnCx<'w, 'a> {
         used.dedup();
         let caps: Vec<LocalId> = used.into_iter().filter(|l| *l < tb.own.0 || *l >= tb.own.1).filter(|l| !tb.params.contains(l)).collect();
         let ty = Ty::Fn(ptys, Box::new(rt));
-        let lo = blk.span.lo;
+        // A lambda is known by its AST block's id (derived code gives every
+        // token the declaration's span, so spans aren't unique).
+        tb.id = blk.id;
+        let lo = blk.id;
         self.lambdas.retain(|(l, _, _)| *l != lo);
         self.lambdas.push((lo, ty.clone(), caps.clone()));
         self.lambda_info.retain(|(l, _, _)| *l != lo);
@@ -3525,7 +3528,7 @@ impl<'w, 'a> FnCx<'w, 'a> {
             return Err(Diag::new(e.span, "a `spawn` body can't end in a held `~T`: propagate it with `~` (`spawn { ~f(x) }`), so its error becomes the task's"));
             }
         }
-        let tb = TBlock { params: vec![], destructure: false, body, pure: false, span: blk.span, own: (own_start, self.locals.len()) };
+        let tb = TBlock { params: vec![], destructure: false, body, pure: false, span: blk.span, own: (own_start, self.locals.len()), id: 0 };
         let mut used = vec![];
         for s in &tb.body {
             crate::lower::collect_locals_stmt(s, &mut used);
@@ -4652,7 +4655,7 @@ impl<'w, 'a> FnCx<'w, 'a> {
                 self.loops.pop();
                 // A loop nothing breaks out of never finishes (it returns, fails or panics).
                 let ty = if breaks_out(&body) { Ty::Unit } else { Ty::Never };
-                let blk = TBlock { params: vec![], destructure: false, body, pure: true, span: b.span , own: (0, 0) };
+                let blk = TBlock { params: vec![], destructure: false, body, pure: true, span: b.span , own: (0, 0), id: 0 };
                 return Ok(self.mk(TK::M(M::Loop, None, vec![], Some(Box::new(blk))), ty, sp));
             }
             "it" => return Err(Diag::new(sp, "`it` can only be used inside a block")),
@@ -5240,7 +5243,7 @@ impl<'w, 'a> FnCx<'w, 'a> {
                 self.impure = saved || self.impure;
                 self.loops.pop();
                 self.pop_scope();
-                let blk = TBlock { params: vec![y], destructure: false, body, pure, span: b.span, own: (own_start, self.locals.len()) };
+                let blk = TBlock { params: vec![y], destructure: false, body, pure, span: b.span, own: (own_start, self.locals.len()), id: 0 };
                 Ok(self.mk(TK::M(M::EnumNew, None, vec![], Some(Box::new(blk))), Ty::Gen(Box::new(el)), sp))
             }
             _ => {
@@ -5312,9 +5315,9 @@ impl<'w, 'a> FnCx<'w, 'a> {
         // The block's value: materialize unless it feeds flat_map (caller decides).
         if let Some(TStmt::Expr(e)) = body.last_mut() {
             let ty = e.ty.clone();
-            return Ok((TBlock { params: ids, destructure, body, pure, span: b.span, own }, ty));
+            return Ok((TBlock { params: ids, destructure, body, pure, span: b.span, own, id: b.id }, ty));
         }
-        Ok((TBlock { params: ids, destructure, body, pure, span: b.span, own }, if matches!(ty, Ty::Never) { Ty::Never } else { Ty::Unit }))
+        Ok((TBlock { params: ids, destructure, body, pure, span: b.span, own, id: b.id }, if matches!(ty, Ty::Never) { Ty::Never } else { Ty::Unit }))
     }
 
     /// `&:name` as a block: `{ |x| x.name }`.
@@ -5326,7 +5329,7 @@ impl<'w, 'a> FnCx<'w, 'a> {
         self.pop_scope();
         let body = body?;
         let ty = body.ty.clone();
-        Ok((TBlock { params: vec![p], destructure: false, body: vec![TStmt::Expr(body)], pure: true, span: sym.1 , own: (0, 0) }, ty))
+        Ok((TBlock { params: vec![p], destructure: false, body: vec![TStmt::Expr(body)], pure: true, span: sym.1 , own: (0, 0), id: 0 }, ty))
     }
 
     /// Block given as `{ ... }` or `&:sym`.
@@ -6106,7 +6109,7 @@ impl<'w, 'a> FnCx<'w, 'a> {
                             let la = self.mk(TK::Local(a), el.clone(), sp);
                             let lx = self.mk(TK::Local(x), el.clone(), sp);
                             let body = self.binary(bop, la, lx, sp)?;
-                            TBlock { params: vec![a, x], destructure: false, body: vec![TStmt::Expr(body)], pure: true, span: ssp , own: (0, 0) }
+                            TBlock { params: vec![a, x], destructure: false, body: vec![TStmt::Expr(body)], pure: true, span: ssp , own: (0, 0), id: 0 }
                         }
                         None => {
                             let (b, t) = self.block_n(block.unwrap(), &[acc_ty.clone(), el.clone()], false)?;

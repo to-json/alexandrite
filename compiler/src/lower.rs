@@ -2979,7 +2979,7 @@ impl<'a> Lw<'a> {
             }
             Lambda => {
                 let b = blk.unwrap();
-                let lo = b.span.lo;
+                let lo = b.id;
                 let g = LAMBDAS.with(|l| l.borrow().iter().position(|s| s.0 == self.f.cname && s.1 == lo)).expect("lambda registered");
                 let sites = lambda_sites(&e.ty);
                 let tag = sites.iter().position(|(x, _)| *x == g).unwrap();

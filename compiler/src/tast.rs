@@ -512,6 +512,9 @@ pub struct TBlock {
     pub span: Span,
     /// Locals declared inside this block: ids in [own.0, own.1).
     pub own: (usize, usize),
+    /// The AST block's id (0 for blocks the checker makes): a lambda's
+    /// identity, which a span isn't (derived code shares one span).
+    pub id: u32,
 }
 
 #[derive(Clone, Debug)]

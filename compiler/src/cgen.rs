@@ -687,6 +687,7 @@ impl FnEmit<'_> {
             LE::ChanNew(t, cap) => format!("alx_chan_new({}, sizeof({}))", self.e(cap), cty_mem(t)),
             LE::ChanLen(c) => format!("alx_chan_len({})", self.e(c)),
             LE::LockNew => "alx_lock_new()".into(),
+            LE::NullTask(_) => "NULL".into(),
             LE::AtomicNew(v) => format!("alx_atomic_new({})", self.e(v)),
             LE::AtomicLoad(a) => format!("__atomic_load_n({}, __ATOMIC_SEQ_CST)", self.e(a)),
             LE::AtomicRmw(AtomicOp::Add, a, v) => format!("(__atomic_add_fetch({}, {}, __ATOMIC_SEQ_CST))", self.e(a), self.e(v)),

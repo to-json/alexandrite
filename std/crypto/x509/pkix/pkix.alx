@@ -1,0 +1,297 @@
+# Package pkix: Go's crypto/x509/pkix, the shared, low level structures
+# used for ASN.1 parsing and serialization of X.509 certificates, CRL and
+# OCSP. The structures derive Asn1 (encoding/asn1, D59).
+#
+#   Go                                        alx
+#   AlgorithmIdentifier{Algorithm, Parameters} AlgorithmIdentifier{algorithm, parameters}
+#   RDNSequence ([]RelativeDistinguishedNameSET)  RDNSequence{rdns: [RelativeDistinguishedNameSET]}
+#   RelativeDistinguishedNameSET ([]ATV)       RelativeDistinguishedNameSET{atvs: [AttributeTypeAndValue]}
+#   AttributeTypeAndValue{Type, Value any}     AttributeTypeAndValue{type, value: asn1.Any}
+#   AttributeTypeAndValueSET{Type, Value}      AttributeTypeAndValueSET{type, value: [[AttributeTypeAndValue]]}
+#   Extension{Id, Critical, Value}             Extension{id, critical, value}
+#   Name{Country, ..., Names, ExtraNames}      Name{country, organization, organizational_unit,
+#                                                locality, province, street_address, postal_code,
+#                                                serial_number, common_name, names, extra_names}
+#   n.FillFromRDNSequence(&rdns)               n.fill_from_rdn_sequence!(rdns)
+#   n.ToRDNSequence() / n.String()             n.to_rdn_sequence / n.to_s (n.string)
+#   r.String() (RDNSequence)                   r.to_s
+#   CertificateList / TBSCertificateList /     CertificateList / TBSCertificateList /
+#     RevokedCertificate                         RevokedCertificate
+#   certList.HasExpired(now)                   cert_list.has_expired?(now)
+#
+# Differences from Go:
+#   - Go's named slice types RDNSequence and RelativeDistinguishedNameSET
+#     are one-field structs (#[asn1(transparent)] / #[asn1(set)]); their
+#     elements are in `rdns` / `atvs`.
+#   - AttributeTypeAndValue.Value is an asn1.Any (Go's `any`): a string is
+#     asn1.Any.Str(s). Go's fmt.Sprint of the value is Any's to_s here
+#     (strings as they are, numbers in decimal, ...).
+#   - Go distinguishes a nil ExtraNames from an empty one in String (nil:
+#     the Names that aren't standard attributes are printed too); alx has
+#     no nil slices, so an empty extra_names counts as nil.
+#   - A RevokedCertificate's serial number is a big.Int (no nil).
+
+import "encoding/asn1"
+import "encoding/hex"
+import "math/big"
+import "time"
+import "unicode/utf8"
+
+#[derive(Asn1)]
+pub struct AlgorithmIdentifier {
+  algorithm: asn1.ObjectIdentifier
+  #[asn1(optional)] parameters: asn1.RawValue
+}
+
+# An X.501 distinguished name: the RDNs in order (Go's RDNSequence).
+#[derive(Asn1)]
+#[asn1(transparent)]
+pub struct RDNSequence {
+  rdns: [RelativeDistinguishedNameSET]
+
+  # The string form of the sequence, roughly following the RFC 2253
+  # Distinguished Names syntax.
+  pub def to_s -> Str {
+    buf = ""
+    i = 0
+    while i < rdns.size {
+      rdn = rdns[rdns.size - 1 - i]
+      buf = buf + "," if i > 0
+      j = 0
+      for tv in rdn.atvs {
+        buf = buf + "+" if j > 0
+        j += 1
+        oid_string = tv.type.to_s
+        type_name = attribute_type_name(oid_string)
+        if type_name == "" {
+          if tv.value.str.none? {
+            r = asn1.marshal_any(tv.value)
+            if der = r.ok {
+              buf = buf + oid_string + "=#" + hex.encode_to_string(der)
+              # No value escaping necessary.
+              next
+            }
+          }
+          type_name = oid_string
+        }
+        value_string = any_string(tv.value)
+        escaped: [Byte] = []
+        n = value_string.size
+        pos = 0
+        while pos < n {
+          c, size = utf8.decode_rune_at(value_string, pos)
+          esc = false
+          if c == 44 || c == 43 || c == 34 || c == 92 || c == 60 || c == 62 || c == 59 {
+            esc = true
+          } else if c == 32 {
+            # Go compares the byte offset of the rune.
+            esc = pos == 0 || pos == n - 1
+          } else if c == 35 {
+            esc = pos == 0
+          }
+          escaped << 92 if esc
+          escaped = utf8.append_rune(escaped, c)
+          pos += size
+        }
+        buf = buf + type_name + "=" + Str.from_bytes(escaped)
+      }
+      i += 1
+    }
+    buf
+  }
+  pub def string -> Str { self.to_s }
+}
+
+def attribute_type_name(oid: Str) -> Str {
+  case oid {
+    "2.5.4.6" => "C"
+    "2.5.4.10" => "O"
+    "2.5.4.11" => "OU"
+    "2.5.4.3" => "CN"
+    "2.5.4.5" => "SERIALNUMBER"
+    "2.5.4.7" => "L"
+    "2.5.4.8" => "ST"
+    "2.5.4.9" => "STREET"
+    "2.5.4.17" => "POSTALCODE"
+    _ => ""
+  }
+}
+
+# Go's fmt.Sprint of the decoded value.
+pub def any_string(v: asn1.Any) -> Str {
+  case v {
+    Nil => "<nil>"
+    Bool(b) => b ? "true" : "false"
+    Int(i) => i.to_s
+    Str(s) => s
+    BitString(b) => "{#{b.bytes} #{b.bit_length}}"
+    Oid(o) => o.to_s
+    Time(t) => t.to_s
+    Bytes(b) => "#{b}"
+    Raw(r) => "{#{r.class} #{r.tag} #{r.is_compound} #{r.bytes} #{r.full_bytes}}"
+  }
+}
+
+#[derive(Asn1)]
+#[asn1(set)]
+pub struct RelativeDistinguishedNameSET {
+  atvs: [AttributeTypeAndValue]
+}
+
+# A single attribute of a name: its type and value.
+#[derive(Asn1)]
+pub struct AttributeTypeAndValue {
+  type: asn1.ObjectIdentifier
+  value: asn1.Any
+}
+
+# Go's AttributeTypeAndValueSET: a type and a SET OF names (RFC 2986).
+#[derive(Asn1)]
+pub struct AttributeTypeAndValueSET {
+  type: asn1.ObjectIdentifier
+  #[asn1(set)] value: [[AttributeTypeAndValue]]
+}
+
+# A certificate extension (RFC 5280 section 4.2).
+#[derive(Asn1)]
+pub struct Extension {
+  id: asn1.ObjectIdentifier
+  #[asn1(optional)] critical: Bool
+  value: [Byte]
+}
+
+# An X.509 distinguished name. The common elements of a DN have fields;
+# names holds all of the parsed attributes (in order); extra_names are
+# added to marshalled names and override the fields with the same OIDs.
+pub struct Name {
+  country: [Str]
+  organization: [Str]
+  organizational_unit: [Str]
+  locality: [Str]
+  province: [Str]
+  street_address: [Str]
+  postal_code: [Str]
+  serial_number: Str
+  common_name: Str
+  names: [AttributeTypeAndValue]
+  extra_names: [AttributeTypeAndValue]
+
+  # Fills the fields from an RDNSequence; multi-entry RDNs are flattened,
+  # and the attributes are appended to names.
+  pub def fill_from_rdn_sequence!(rdns: RDNSequence) {
+    for rdn in rdns.rdns {
+      next if rdn.atvs.size == 0
+      for atv in rdn.atvs {
+        self.names << atv
+        if value = atv.value.str {
+          t = atv.type.arcs
+          if t.size == 4 && t[0] == 2 && t[1] == 5 && t[2] == 4 {
+            case t[3] {
+              3 => self.common_name = value
+              5 => self.serial_number = value
+              6 => self.country << value
+              7 => self.locality << value
+              8 => self.province << value
+              9 => self.street_address << value
+              10 => self.organization << value
+              11 => self.organizational_unit << value
+              17 => self.postal_code << value
+              _ => nil
+            }
+          }
+        }
+      }
+    }
+  }
+
+  def append_rdns(input: RDNSequence, values: [Str], oid: asn1.ObjectIdentifier) -> RDNSequence {
+    return input if values.size == 0 || oid_in_attribute_type_and_value?(oid, extra_names)
+    s: [AttributeTypeAndValue] = []
+    for value in values {
+      s << AttributeTypeAndValue.new(type: oid, value: asn1.Any.Str(value))
+    }
+    RDNSequence.new(rdns: input.rdns + [RelativeDistinguishedNameSET.new(atvs: s)])
+  }
+
+  # The name as an RDNSequence (extra_names are appended, and replace the
+  # fields with the same OIDs).
+  pub def to_rdn_sequence -> RDNSequence {
+    ret = RDNSequence.new
+    ret = self.append_rdns(ret, country, asn1.oid([2, 5, 4, 6]))
+    ret = self.append_rdns(ret, province, asn1.oid([2, 5, 4, 8]))
+    ret = self.append_rdns(ret, locality, asn1.oid([2, 5, 4, 7]))
+    ret = self.append_rdns(ret, street_address, asn1.oid([2, 5, 4, 9]))
+    ret = self.append_rdns(ret, postal_code, asn1.oid([2, 5, 4, 17]))
+    ret = self.append_rdns(ret, organization, asn1.oid([2, 5, 4, 10]))
+    ret = self.append_rdns(ret, organizational_unit, asn1.oid([2, 5, 4, 11]))
+    ret = self.append_rdns(ret, [common_name], asn1.oid([2, 5, 4, 3])) if common_name.size > 0
+    ret = self.append_rdns(ret, [serial_number], asn1.oid([2, 5, 4, 5])) if serial_number.size > 0
+    for atv in extra_names {
+      ret.rdns << RelativeDistinguishedNameSET.new(atvs: [atv])
+    }
+    ret
+  }
+
+  # The string form of the name, roughly following RFC 2253.
+  pub def to_s -> Str {
+    rdns = RDNSequence.new
+    # If there are no ExtraNames, surface the parsed value (all entries in
+    # Names) instead.
+    if extra_names.size == 0 {
+      for atv in names {
+        t = atv.type.arcs
+        if t.size == 4 && t[0] == 2 && t[1] == 5 && t[2] == 4 {
+          v = t[3]
+          # These attributes were already parsed into named fields.
+          next if v == 3 || v == 5 || v == 6 || v == 7 || v == 8 || v == 9 || v == 10 || v == 11 || v == 17
+        }
+        # Place non-standard parsed values at the beginning of the sequence
+        # so they will be at the end of the string. See Issue 39924.
+        rdns.rdns << RelativeDistinguishedNameSET.new(atvs: [atv])
+      }
+    }
+    rdns.rdns = rdns.rdns + self.to_rdn_sequence.rdns
+    rdns.to_s
+  }
+  pub def string -> Str { self.to_s }
+}
+
+def oid_in_attribute_type_and_value?(oid: asn1.ObjectIdentifier, atv: [AttributeTypeAndValue]) -> Bool {
+  for a in atv {
+    return true if a.type.equal?(oid)
+  }
+  false
+}
+
+# The ASN.1 structure of the same name from RFC 5280, section 5.1. Use
+# Certificate.CheckCRLSignature to verify the signature.
+#[derive(Asn1)]
+pub struct CertificateList {
+  tbs_cert_list: TBSCertificateList
+  signature_algorithm: AlgorithmIdentifier
+  signature_value: asn1.BitString
+
+  # Whether now is past the expiry time of the list.
+  pub def has_expired?(now: time.Time) -> Bool { !now.before(tbs_cert_list.next_update) }
+}
+
+# The ASN.1 structure of the same name from RFC 5280, section 5.1.
+#[derive(Asn1)]
+pub struct TBSCertificateList {
+  #[asn1(raw_content)] raw: [Byte]
+  #[asn1(optional, default: 0)] version: Int
+  signature: AlgorithmIdentifier
+  issuer: RDNSequence
+  this_update: time.Time
+  #[asn1(optional)] next_update: time.Time
+  #[asn1(optional)] revoked_certificates: [RevokedCertificate]
+  #[asn1(tag: 0, optional, explicit)] extensions: [Extension]
+}
+
+# The ASN.1 structure of the same name from RFC 5280, section 5.1.
+#[derive(Asn1)]
+pub struct RevokedCertificate {
+  serial_number: big.Int
+  revocation_time: time.Time
+  #[asn1(optional)] extensions: [Extension]
+}

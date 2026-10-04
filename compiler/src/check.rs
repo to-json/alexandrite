@@ -1341,8 +1341,8 @@ struct FnCx<'w, 'a> {
     /// functions of their own).
     cells: Option<Vec<(LocalId, Ty)>>,
     /// Lambda literals checked so far: (block span start, fn type, captures).
-    lambdas: Vec<(u32, Ty, Vec<LocalId>)>,
-    lambda_info: Vec<(u32, Vec<LocalId>, (usize, usize))>,
+    lambdas: Vec<(u64, Ty, Vec<LocalId>)>,
+    lambda_info: Vec<(u64, Vec<LocalId>, (usize, usize))>,
     /// The type the expression being checked is wanted as (for inferring
     /// a generic constructor's type arguments).
     want_hint: Option<Ty>,
@@ -3375,10 +3375,11 @@ impl<'w, 'a> FnCx<'w, 'a> {
         used.dedup();
         let caps: Vec<LocalId> = used.into_iter().filter(|l| *l < tb.own.0 || *l >= tb.own.1).filter(|l| !tb.params.contains(l)).collect();
         let ty = Ty::Fn(ptys, Box::new(rt));
-        // A lambda is known by its AST block's id (derived code gives every
-        // token the declaration's span, so spans aren't unique).
+        // A lambda is known by its AST block's id and its span (derived code
+        // gives every token the declaration's span, so spans aren't unique).
         tb.id = blk.id;
-        let lo = blk.id;
+        // (with its span: synthesized lambdas share an id, u32::MAX)
+        let lo = ((blk.id as u64) << 32) | blk.span.lo as u64;
         self.lambdas.retain(|(l, _, _)| *l != lo);
         self.lambdas.push((lo, ty.clone(), caps.clone()));
         self.lambda_info.retain(|(l, _, _)| *l != lo);
@@ -6622,7 +6623,8 @@ pub fn self_containing_closures(funcs: &[TFunc], ifaces: &HashMap<String, Vec<(T
             for c in caps {
                 let ct = &f.locals[*c].ty;
                 if holds(ct, t, &sites, ifaces, &mut vec![]) {
-                    let sp = Span { file: f.span.file, lo: *lo, hi: *lo + 1 };
+                    let l = (*lo & 0xffff_ffff) as u32;
+                    let sp = Span { file: f.span.file, lo: l, hi: l + 1 };
                     return Err(Diag::new(sp, format!("this closure captures `{}` ({}), which holds a closure of this same type ({}): a closure contains what it captures, so it would contain itself", f.locals[*c].name, ct.show(), t.show()))
                         .note("pass the value as a parameter instead, or keep it in a Pool and capture its @handle"));
                 }

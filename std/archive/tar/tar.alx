@@ -1,0 +1,1023 @@
+# Package tar: Go's archive/tar, reading and writing tar archives (USTAR,
+# PAX and GNU, including GNU and PAX sparse files and long names).
+#
+#   Go                                      alx
+#   Header{Typeflag, Name, Linkname, Size,  Header (typeflag: Byte, name, linkname, size, mode,
+#     Mode, Uid, Gid, Uname, Gname,           uid, gid, uname, gname, mod_time, access_time,
+#     ModTime, AccessTime, ChangeTime,        change_time, devmajor, devminor,
+#     Devmajor, Devminor, Xattrs,             xattrs: Map[Str, Str], pax_records: Map[Str, Str],
+#     PAXRecords, Format}                     format: Int)
+#   TypeReg ... TypeGNULongLink             TYPE_REG ... TYPE_GNU_LONG_LINK (Bytes)
+#   Format, FormatUnknown / USTAR / PAX /   Int bit sets: FORMAT_UNKNOWN / FORMAT_USTAR /
+#     GNU, f.String()                         FORMAT_PAX / FORMAT_GNU; format_string(f)
+#   h.FileInfo() fs.FileInfo                h.file_info -> fs.FileInfo
+#   FileInfoHeader(fi, link)                file_info_header(fi, link) -> ~Header
+#     (fi.Sys() is a *Header)                 file_info_header_sys(fi, link, sys)
+#   NewReader(r) / tr.Next / tr.Read        new_reader(r) -> Reader[R] / tr.next! -> ~Header? /
+#                                             tr.read!(p) -> ~Int
+#   NewWriter(w) / tw.WriteHeader / Write / new_writer(w) -> Writer[W] / tw.write_header!(h) /
+#     Flush / Close / AddFS(fsys)             write! / flush! / close! / add_fs!(fsys)
+#   ErrHeader, ErrWriteTooLong,             TarError.Header, WriteTooLong, FieldTooLong,
+#     ErrFieldTooLong, ErrWriteAfterClose,    WriteAfterClose, InsecurePath(name)
+#     ErrInsecurePath
+#   (headerError, unexported)               TarError.CannotEncode(reasons)
+#
+# Error messages are Go's.
+#
+# Differences from Go:
+#  - The end of the archive is not an error (alx's io shape): next! returns
+#    none at the end (Go: io.EOF), and read! returns 0 at the end of an
+#    entry. An archive or entry that ends early fails with
+#    io.StreamError.UnexpectedEof.
+#  - Where Go's Read returns data together with an error (a sparse entry
+#    whose data runs out), read! returns the data and fails on the next
+#    call; the error is sticky, as in Go.
+#  - write! writes what fits in the entry and then fails with WriteTooLong
+#    (Go returns the short count with the error); io.Writer has no short
+#    counts.
+#  - Reader and Writer are generic over what they wrap (Reader[R],
+#    Writer[W]), like compress/gzip's (D12). They share their state across
+#    copies (D36).
+#  - Go skips entry data with Seek when the input is an io.Seeker, and its
+#    sparse WriteTo / ReadFrom seek over holes when the other side is an
+#    io.WriteSeeker / io.ReadSeeker. alx can't ask a value for an optional
+#    interface: data is skipped by reading, and holes are written as zeros.
+#    The results are the same.
+#  - fs.FileInfo is a struct without Sys: FileInfoHeader's use of a *Header
+#    in fi.Sys() is file_info_header_sys(fi, link, sys), and the unix
+#    sysStat (uid, gid, user and group names, device numbers from
+#    syscall.Stat_t) and the FileInfoNames interface don't exist; set those
+#    fields on the result instead.
+#  - Go's GODEBUG tarinsecurepath=0 (next fails with ErrInsecurePath for
+#    non-local names) is tr.insecure_path_check!(true); the error carries
+#    the name and the entry is skipped (Go returns the header with the
+#    error). Off by default, as in Go.
+#  - Xattrs and PAXRecords are never nil: an empty Map is Go's nil map.
+#  - Header.format is an Int bit set (FORMAT_*), not a named type;
+#    format_string(f) is Go's Format.String.
+#  - Sparse files are read (GNU old format, PAX 0.0, 0.1 and 1.0), as in
+#    Go; writing them isn't public in Go either (its sparse writer is
+#    internal, kept here too, and tested as Go tests it).
+
+import "io/fs"
+import "path"
+import "strconv"
+import "strings"
+import "time"
+
+# ------------------------------------------------------------------ errors
+
+pub error TarError {
+  # Go's ErrHeader.
+  Header
+  # Go's ErrWriteTooLong: more data than the header's size.
+  WriteTooLong
+  # Go's ErrFieldTooLong.
+  FieldTooLong
+  # Go's ErrWriteAfterClose.
+  WriteAfterClose
+  # Go's ErrInsecurePath (see insecure_path_check!).
+  InsecurePath(name: Str)
+  # A sparse file referencing data that isn't there (Go's errMissData).
+  MissData
+  # A sparse file with data it doesn't reference (Go's errUnrefData).
+  UnrefData
+  # A non-NUL byte written to a sparse hole (Go's errWriteHole).
+  WriteHole
+  # Go's errSparseTooLong.
+  SparseTooLong
+  # A header that no format can encode (Go's headerError).
+  CannotEncode(reasons: [Str])
+  # flush! before an entry's data is all written.
+  MissedWriting(n: Int)
+  # file_info_header of a socket.
+  Socket
+  # file_info_header of a mode it doesn't know.
+  UnknownMode(mode: Str)
+  # add_fs! of a file that is neither regular, a directory nor a symlink.
+  NonRegular
+
+  def message -> Str {
+    case self {
+      Header => "archive/tar: invalid tar header"
+      WriteTooLong => "archive/tar: write too long"
+      FieldTooLong => "archive/tar: header field too long"
+      WriteAfterClose => "archive/tar: write after close"
+      InsecurePath(_name) => "archive/tar: insecure file path"
+      MissData => "archive/tar: sparse file references non-existent data"
+      UnrefData => "archive/tar: sparse file contains unreferenced data"
+      WriteHole => "archive/tar: write non-NUL byte in sparse hole"
+      SparseTooLong => "archive/tar: sparse map too long"
+      CannotEncode(reasons) => header_error_message(reasons)
+      MissedWriting(n) => "archive/tar: missed writing #{n} bytes"
+      Socket => "archive/tar: sockets not supported"
+      UnknownMode(m) => "archive/tar: unknown file mode #{m}"
+      NonRegular => "tar: cannot add non-regular file"
+    }
+  }
+}
+
+def header_error_message(reasons: [Str]) -> Str {
+  prefix = "archive/tar: cannot encode header"
+  ss: [Str] = []
+  for s in reasons {
+    ss << s if s != ""
+  }
+  return prefix if ss.size == 0
+  prefix + ": " + strings.join(ss, "; and ")
+}
+
+# ------------------------------------------------------------- type flags
+
+# A regular file.
+pub TYPE_REG: Byte = 48
+# Go's deprecated TypeRegA: a regular file (or a directory, if the name
+# ends in a slash), read and written as TYPE_REG.
+pub TYPE_REG_A: Byte = 0
+pub TYPE_LINK: Byte = 49
+pub TYPE_SYMLINK: Byte = 50
+pub TYPE_CHAR: Byte = 51
+pub TYPE_BLOCK: Byte = 52
+pub TYPE_DIR: Byte = 53
+pub TYPE_FIFO: Byte = 54
+# Reserved (contiguous file).
+pub TYPE_CONT: Byte = 55
+# A PAX extended header, for the next file.
+pub TYPE_X_HEADER: Byte = 120
+# A PAX global header: its records apply to the rest of the archive.
+pub TYPE_X_GLOBAL_HEADER: Byte = 103
+# A GNU sparse file.
+pub TYPE_GNU_SPARSE: Byte = 83
+# GNU meta files holding the next file's long name or link name.
+pub TYPE_GNU_LONG_NAME: Byte = 76
+pub TYPE_GNU_LONG_LINK: Byte = 75
+
+# --------------------------------------------------------------- PAX keys
+
+PAX_NONE = ""
+PAX_PATH = "path"
+PAX_LINKPATH = "linkpath"
+PAX_SIZE = "size"
+PAX_UID = "uid"
+PAX_GID = "gid"
+PAX_UNAME = "uname"
+PAX_GNAME = "gname"
+PAX_MTIME = "mtime"
+PAX_ATIME = "atime"
+PAX_CTIME = "ctime"
+PAX_CHARSET = "charset"
+PAX_COMMENT = "comment"
+PAX_SCHILY_XATTR = "SCHILY.xattr."
+PAX_GNU_SPARSE = "GNU.sparse."
+PAX_GNU_SPARSE_NUM_BLOCKS = "GNU.sparse.numblocks"
+PAX_GNU_SPARSE_OFFSET = "GNU.sparse.offset"
+PAX_GNU_SPARSE_NUM_BYTES = "GNU.sparse.numbytes"
+PAX_GNU_SPARSE_MAP = "GNU.sparse.map"
+PAX_GNU_SPARSE_NAME = "GNU.sparse.name"
+PAX_GNU_SPARSE_MAJOR = "GNU.sparse.major"
+PAX_GNU_SPARSE_MINOR = "GNU.sparse.minor"
+PAX_GNU_SPARSE_SIZE = "GNU.sparse.size"
+PAX_GNU_SPARSE_REAL_SIZE = "GNU.sparse.realsize"
+
+def basic_key?(k: Str) -> Bool {
+  k == PAX_PATH || k == PAX_LINKPATH || k == PAX_SIZE || k == PAX_UID || k == PAX_GID || k == PAX_UNAME || k == PAX_GNAME || k == PAX_MTIME || k == PAX_ATIME || k == PAX_CTIME
+}
+
+# ----------------------------------------------------------------- formats
+
+# Format bits (Go's Format): a header's format, or a set of them.
+pub FORMAT_UNKNOWN = 0
+FORMAT_V7 = 1
+# USTAR (POSIX.1-1988): 8 GiB files, 256-byte names, no sub-second times.
+pub FORMAT_USTAR = 2
+# PAX (POSIX.1-2001): USTAR plus records; anything goes.
+pub FORMAT_PAX = 4
+# GNU tar's format: base-256 numbers, long names, sparse files.
+pub FORMAT_GNU = 8
+FORMAT_STAR = 16
+FORMAT_MAX = 32
+
+def format_name(f: Int) -> Str {
+  case f {
+    1 => "V7"
+    2 => "USTAR"
+    4 => "PAX"
+    8 => "GNU"
+    16 => "STAR"
+    _ => ""
+  }
+}
+
+# Go's Format.String: "USTAR", "(USTAR | PAX)", "<unknown>".
+pub def format_string(f: Int) -> Str {
+  ss: [Str] = []
+  f2 = 1
+  while f2 < FORMAT_MAX {
+    ss << format_name(f2) if f & f2 != 0
+    f2 = f2 << 1
+  }
+  return "<unknown>" if ss.size == 0
+  return ss[0] if ss.size == 1
+  "(" + strings.join(ss, " | ") + ")"
+}
+
+# ------------------------------------------------------------------ Header
+
+# A header in a tar archive (Go's Header). Fields a format can't hold make
+# the Writer pick another format (or fail).
+pub struct Header {
+  # The entry's type (TYPE_*). Writing promotes TYPE_REG_A to TYPE_REG or
+  # TYPE_DIR.
+  typeflag: Byte
+  name: Str
+  # The link target (TYPE_LINK, TYPE_SYMLINK).
+  linkname: Str
+  # The logical size in bytes.
+  size: Int
+  # Permission and mode bits (the c_IS* bits of Unix).
+  mode: Int
+  uid: Int
+  gid: Int
+  uname: Str
+  gname: Str
+  # The zero Time: none recorded (written as the epoch).
+  mod_time: time.Time
+  # PAX or GNU only.
+  access_time: time.Time
+  change_time: time.Time
+  devmajor: Int
+  devminor: Int
+  # Go's deprecated Xattrs (PAX "SCHILY.xattr." records).
+  xattrs: Map[Str, Str]
+  # PAX records: read, every record of the entry; written, the ones that
+  # aren't already fields (and all of them for a global header).
+  pax_records: Map[Str, Str]
+  # The format read; for writing, the format wanted (FORMAT_UNKNOWN: any).
+  format: Int
+
+  # The header as an fs.FileInfo (Go's FileInfo).
+  pub def file_info -> fs.FileInfo {
+    m = file_mode
+    nm = m.is_dir? ? path.base(path.clean(name)) : path.base(name)
+    fs.FileInfo.new(name: nm, size: size, mode: m, mod_time: mod_time)
+  }
+
+  def file_mode -> fs.FileMode {
+    bits = (mode & 0o777).as_u32
+    bits = bits | fs.MODE_SETUID if mode & C_ISUID != 0
+    bits = bits | fs.MODE_SETGID if mode & C_ISGID != 0
+    bits = bits | fs.MODE_STICKY if mode & C_ISVTX != 0
+    m = mode & (-1 ^ 0o7777)
+    if m == C_ISDIR {
+      bits = bits | fs.MODE_DIR
+    } else if m == C_ISFIFO {
+      bits = bits | fs.MODE_NAMED_PIPE
+    } else if m == C_ISLNK {
+      bits = bits | fs.MODE_SYMLINK
+    } else if m == C_ISBLK {
+      bits = bits | fs.MODE_DEVICE
+    } else if m == C_ISCHR {
+      bits = bits | fs.MODE_DEVICE | fs.MODE_CHAR_DEVICE
+    } else if m == C_ISSOCK {
+      bits = bits | fs.MODE_SOCKET
+    }
+    if typeflag == TYPE_SYMLINK {
+      bits = bits | fs.MODE_SYMLINK
+    } else if typeflag == TYPE_CHAR {
+      bits = bits | fs.MODE_DEVICE | fs.MODE_CHAR_DEVICE
+    } else if typeflag == TYPE_BLOCK {
+      bits = bits | fs.MODE_DEVICE
+    } else if typeflag == TYPE_DIR {
+      bits = bits | fs.MODE_DIR
+    } else if typeflag == TYPE_FIFO {
+      bits = bits | fs.MODE_NAMED_PIPE
+    }
+    fs.mode(bits)
+  }
+
+  # The formats that can encode the header, the PAX records it would need,
+  # and why none can (when none can). Go's allowedFormats.
+  def allowed_formats -> (Int, Map[Str, Str], TarError?) {
+    a = Allowed.new(format: FORMAT_USTAR | FORMAT_PAX | FORMAT_GNU, pax: {}, recs: pax_records)
+    a.verify_string!(name, 100, "Name", PAX_PATH)
+    a.verify_string!(linkname, 100, "Linkname", PAX_LINKPATH)
+    a.verify_string!(uname, 32, "Uname", PAX_UNAME)
+    a.verify_string!(gname, 32, "Gname", PAX_GNAME)
+    a.verify_numeric!(mode, 8, "Mode", PAX_NONE)
+    a.verify_numeric!(uid, 8, "Uid", PAX_UID)
+    a.verify_numeric!(gid, 8, "Gid", PAX_GID)
+    a.verify_numeric!(size, 12, "Size", PAX_SIZE)
+    a.verify_numeric!(devmajor, 8, "Devmajor", PAX_NONE)
+    a.verify_numeric!(devminor, 8, "Devminor", PAX_NONE)
+    a.verify_time!(mod_time, 12, "ModTime", PAX_MTIME)
+    a.verify_time!(access_time, 12, "AccessTime", PAX_ATIME)
+    a.verify_time!(change_time, 12, "ChangeTime", PAX_CTIME)
+
+    why_only_pax = ""
+    why_only_gnu = ""
+    t = typeflag
+    if t == TYPE_REG || t == TYPE_CHAR || t == TYPE_BLOCK || t == TYPE_FIFO || t == TYPE_GNU_SPARSE {
+      if strings.has_suffix(name, "/") {
+        return (FORMAT_UNKNOWN, {}, TarError.CannotEncode(["filename may not have trailing slash"]))
+      }
+    } else if t == TYPE_X_HEADER || t == TYPE_GNU_LONG_NAME || t == TYPE_GNU_LONG_LINK {
+      return (FORMAT_UNKNOWN, {}, TarError.CannotEncode(["cannot manually encode TypeXHeader, TypeGNULongName, or TypeGNULongLink headers"]))
+    } else if t == TYPE_X_GLOBAL_HEADER {
+      if !only_global_fields? {
+        return (FORMAT_UNKNOWN, {}, TarError.CannotEncode(["only PAXRecords should be set for TypeXGlobalHeader"]))
+      }
+      why_only_pax = "only PAX supports TypeXGlobalHeader"
+      a.format = a.format & FORMAT_PAX
+    }
+    if !header_only_type?(t) && size < 0 {
+      return (FORMAT_UNKNOWN, {}, TarError.CannotEncode(["negative size on header-only type"]))
+    }
+
+    if xattrs.size > 0 {
+      xattrs.each { |k, v| a.pax[PAX_SCHILY_XATTR + k] = v }
+      why_only_pax = "only PAX supports Xattrs"
+      a.format = a.format & FORMAT_PAX
+    }
+    if pax_records.size > 0 {
+      pax_records.each { |k, v|
+        if a.pax.has_key?(k) {
+          # Don't overwrite existing records.
+        } else if t == TYPE_X_GLOBAL_HEADER {
+          a.pax[k] = v
+        } else if !basic_key?(k) && !strings.has_prefix(k, PAX_GNU_SPARSE) {
+          a.pax[k] = v
+        }
+      }
+      why_only_pax = "only PAX supports PAXRecords"
+      a.format = a.format & FORMAT_PAX
+    }
+    for k in a.pax.keys.sort {
+      v = a.pax[k] || ""
+      if !valid_pax_record?(k, v) {
+        return (FORMAT_UNKNOWN, {}, TarError.CannotEncode(["invalid PAX record: " + strconv.quote(k + " = " + v)]))
+      }
+    }
+
+    want = format
+    if want != FORMAT_UNKNOWN {
+      if want & FORMAT_PAX != 0 && !a.prefer_pax {
+        want = want | FORMAT_USTAR
+      }
+      a.format = a.format & want
+    }
+    err: TarError? = none
+    if a.format == FORMAT_UNKNOWN {
+      if format == FORMAT_USTAR {
+        err = TarError.CannotEncode(["Format specifies USTAR", a.why_no_ustar, why_only_pax, why_only_gnu])
+      } else if format == FORMAT_PAX {
+        err = TarError.CannotEncode(["Format specifies PAX", a.why_no_pax, why_only_gnu])
+      } else if format == FORMAT_GNU {
+        err = TarError.CannotEncode(["Format specifies GNU", a.why_no_gnu, why_only_pax])
+      } else {
+        err = TarError.CannotEncode([a.why_no_ustar, a.why_no_pax, a.why_no_gnu, why_only_pax, why_only_gnu])
+      }
+    }
+    (a.format, a.pax, err)
+  }
+
+  # Whether only name, typeflag, xattrs, pax_records and format are set.
+  def only_global_fields? -> Bool {
+    linkname == "" && size == 0 && mode == 0 && uid == 0 && gid == 0 && uname == "" && gname == "" && mod_time.is_zero && access_time.is_zero && change_time.is_zero && devmajor == 0 && devminor == 0
+  }
+}
+
+# The state of allowed_formats (Go's closures over format, paxHdrs and the
+# why* strings).
+struct Allowed {
+  format: Int
+  pax: Map[Str, Str]
+  recs: Map[Str, Str]
+  why_no_ustar: Str
+  why_no_pax: Str
+  why_no_gnu: Str
+  prefer_pax: Bool
+
+  def verify_string!(s: Str, size: Int, name: Str, pax_key: Str) {
+    too_long = s.size > size
+    allow_long_gnu = pax_key == PAX_PATH || pax_key == PAX_LINKPATH
+    if has_nul?(s) || (too_long && !allow_long_gnu) {
+      self.why_no_gnu = "GNU cannot encode #{name}=#{strconv.quote(s)}"
+      self.format = format & (-1 ^ FORMAT_GNU)
+    }
+    if !ascii?(s) || too_long {
+      can_split = pax_key == PAX_PATH
+      if !can_split || split_ustar_path(s).none? {
+        self.why_no_ustar = "USTAR cannot encode #{name}=#{strconv.quote(s)}"
+        self.format = format & (-1 ^ FORMAT_USTAR)
+      }
+      if pax_key == PAX_NONE {
+        self.why_no_pax = "PAX cannot encode #{name}=#{strconv.quote(s)}"
+        self.format = format & (-1 ^ FORMAT_PAX)
+      } else {
+        self.pax[pax_key] = s
+      }
+    }
+    if v = recs[pax_key] {
+      self.pax[pax_key] = v if v == s
+    }
+  }
+
+  def verify_numeric!(n: Int, size: Int, name: Str, pax_key: Str) {
+    if !fits_in_base256?(size, n) {
+      self.why_no_gnu = "GNU cannot encode #{name}=#{n}"
+      self.format = format & (-1 ^ FORMAT_GNU)
+    }
+    if !fits_in_octal?(size, n) {
+      self.why_no_ustar = "USTAR cannot encode #{name}=#{n}"
+      self.format = format & (-1 ^ FORMAT_USTAR)
+      if pax_key == PAX_NONE {
+        self.why_no_pax = "PAX cannot encode #{name}=#{n}"
+        self.format = format & (-1 ^ FORMAT_PAX)
+      } else {
+        self.pax[pax_key] = n.to_s
+      }
+    }
+    if v = recs[pax_key] {
+      self.pax[pax_key] = v if v == n.to_s
+    }
+  }
+
+  def verify_time!(ts: time.Time, size: Int, name: Str, pax_key: Str) {
+    return if ts.is_zero
+    if !fits_in_base256?(size, ts.unix) {
+      self.why_no_gnu = "GNU cannot encode #{name}=#{ts}"
+      self.format = format & (-1 ^ FORMAT_GNU)
+    }
+    is_mtime = pax_key == PAX_MTIME
+    fits_octal = fits_in_octal?(size, ts.unix)
+    if (is_mtime && !fits_octal) || !is_mtime {
+      self.why_no_ustar = "USTAR cannot encode #{name}=#{ts}"
+      self.format = format & (-1 ^ FORMAT_USTAR)
+    }
+    needs_nano = ts.nanosecond != 0
+    if !is_mtime || !fits_octal || needs_nano {
+      self.prefer_pax = true
+      if pax_key == PAX_NONE {
+        self.why_no_pax = "PAX cannot encode #{name}=#{ts}"
+        self.format = format & (-1 ^ FORMAT_PAX)
+      } else {
+        self.pax[pax_key] = format_pax_time(ts)
+      }
+    }
+    if v = recs[pax_key] {
+      self.pax[pax_key] = v if v == format_pax_time(ts)
+    }
+  }
+}
+
+# Unix mode bits (Go's c_IS* constants).
+C_ISUID = 0o4000
+C_ISGID = 0o2000
+C_ISVTX = 0o1000
+C_ISDIR = 0o40000
+C_ISFIFO = 0o10000
+C_ISREG = 0o100000
+C_ISLNK = 0o120000
+C_ISBLK = 0o60000
+C_ISCHR = 0o20000
+C_ISSOCK = 0o140000
+
+# A Header describing fi (Go's FileInfoHeader): name, mode, size, mod_time
+# and type. For a symlink, link is its target. The name is fi's base name
+# (a directory's ends in "/"); set the full path on the result.
+pub def file_info_header(fi: fs.FileInfo, link: Str) -> ~Header<TarError> {
+  fm = fi.mode
+  h = Header.new(name: fi.name, mod_time: fi.mod_time, mode: fm.perm.bits.to_i)
+  if fm.is_regular? {
+    h.typeflag = TYPE_REG
+    h.size = fi.size
+  } else if fi.is_dir {
+    h.typeflag = TYPE_DIR
+    h.name += "/"
+  } else if fm.bits & fs.MODE_SYMLINK != 0 {
+    h.typeflag = TYPE_SYMLINK
+    h.linkname = link
+  } else if fm.bits & fs.MODE_DEVICE != 0 {
+    h.typeflag = fm.bits & fs.MODE_CHAR_DEVICE != 0 ? TYPE_CHAR : TYPE_BLOCK
+  } else if fm.bits & fs.MODE_NAMED_PIPE != 0 {
+    h.typeflag = TYPE_FIFO
+  } else if fm.bits & fs.MODE_SOCKET != 0 {
+    fail TarError.Socket
+  } else {
+    fail TarError.UnknownMode(fm.to_s)
+  }
+  h.mode = h.mode | C_ISUID if fm.bits & fs.MODE_SETUID != 0
+  h.mode = h.mode | C_ISGID if fm.bits & fs.MODE_SETGID != 0
+  h.mode = h.mode | C_ISVTX if fm.bits & fs.MODE_STICKY != 0
+  h
+}
+
+# file_info_header, with the rest taken from sys (Go's FileInfoHeader when
+# fi.Sys() is a *Header, as h.file_info's is): ids, names, access and change
+# times, xattrs and PAX records, and a hard link's type and target.
+pub def file_info_header_sys(fi: fs.FileInfo, link: Str, sys: Header) -> ~Header<TarError> {
+  h = ~file_info_header(fi, link)
+  h.uid = sys.uid
+  h.gid = sys.gid
+  h.uname = sys.uname
+  h.gname = sys.gname
+  h.access_time = sys.access_time
+  h.change_time = sys.change_time
+  h.xattrs = sys.xattrs.clone
+  if sys.typeflag == TYPE_LINK {
+    h.typeflag = TYPE_LINK
+    h.size = 0
+    h.linkname = sys.linkname
+  }
+  h.pax_records = sys.pax_records.clone
+  h
+}
+
+def header_only_type?(flag: Byte) -> Bool {
+  flag == TYPE_LINK || flag == TYPE_SYMLINK || flag == TYPE_CHAR || flag == TYPE_BLOCK || flag == TYPE_DIR || flag == TYPE_FIFO
+}
+
+# ------------------------------------------------------------ sparse maps
+
+# A fragment of a sparse file: data (Go's sparseDatas) or a hole
+# (sparseHoles), by context.
+struct SparseEntry {
+  offset: Int
+  length: Int
+
+  def end_offset -> Int { offset + length }
+}
+
+def sp(offset: Int, length: Int) -> SparseEntry {
+  SparseEntry.new(offset: offset, length: length)
+}
+
+# Whether sp is a valid sparse map of a file of `size` bytes: in order, not
+# overlapping, within the file.
+def validate_sparse_entries(entries: [SparseEntry], size: Int) -> Bool {
+  return false if size < 0
+  pre = sp(0, 0)
+  for cur in entries {
+    return false if cur.offset < 0 || cur.length < 0
+    return false if cur.offset > 0x7fffffffffffffff - cur.length
+    return false if cur.end_offset > size
+    return false if pre.end_offset > cur.offset
+    pre = cur
+  }
+  true
+}
+
+def block_padding(offset: Int) -> Int {
+  (0 - offset) & (BLOCK_SIZE - 1)
+}
+
+# The fragments shrunk to whole blocks (except at the end of the file);
+# empty ones dropped.
+def align_sparse_entries(src: [SparseEntry], size: Int) -> [SparseEntry] {
+  dst: [SparseEntry] = []
+  for s in src {
+    pos = s.offset
+    e = s.end_offset
+    pos += block_padding(pos)
+    e -= block_padding(0 - e) if e != size
+    dst << sp(pos, e - pos) if pos < e
+  }
+  dst
+}
+
+# The complement of a valid sparse map: data fragments to holes or back.
+# The result always ends with a fragment ending at size (maybe empty).
+def invert_sparse_entries(src: [SparseEntry], size: Int) -> [SparseEntry] {
+  dst: [SparseEntry] = []
+  pre = sp(0, 0)
+  for cur in src {
+    next if cur.length == 0
+    pre.length = cur.offset - pre.offset
+    dst << pre if pre.length > 0
+    pre.offset = cur.end_offset
+  }
+  pre.length = size - pre.offset
+  dst << pre
+  dst
+}
+
+# --------------------------------------------------------------- strconv
+
+def has_nul?(s: Str) -> Bool {
+  strings.index_byte(s, 0) >= 0
+}
+
+def ascii?(s: Str) -> Bool {
+  for c in s.runes {
+    return false if c >= 0x80 || c == 0
+  }
+  true
+}
+
+# s without its non-ASCII characters and NULs.
+def to_ascii(s: Str) -> Str {
+  return s if ascii?(s)
+  b: [Byte] = []
+  for c in s.runes {
+    b << c.as_u8 if c < 0x80 && c != 0
+  }
+  Str.from_bytes(b)
+}
+
+# A NUL-terminated string field.
+def parse_string(b: [Byte]) -> Str {
+  i = 0
+  while i < b.size && b[i] != 0 {
+    i += 1
+  }
+  Str.from_bytes(b[0...i])
+}
+
+# Whether x fits an n-byte base-256 field.
+def fits_in_base256?(n: Int, x: Int) -> Bool {
+  return true if n >= 9
+  bin_bits = (n - 1) * 8
+  x >= 0 - (1 << bin_bits) && x < 1 << bin_bits
+}
+
+# Whether x fits an n-byte octal field (with its NUL).
+def fits_in_octal?(n: Int, x: Int) -> Bool {
+  return false if x < 0
+  return true if n >= 22
+  x < 1 << ((n - 1) * 3)
+}
+
+# Field parsing with a sticky error flag (Go's parser).
+struct Parser {
+  err: Bool
+
+  def parse_numeric!(b: [Byte]) -> Int {
+    if b.size > 0 && b[0] & 0x80 != 0 {
+      # Base-256 (binary) two's complement.
+      inv: Byte = b[0] & 0x40 != 0 ? 0xff : 0
+      x: U64 = 0
+      i = 0
+      while i < b.size {
+        c = b[i] ^ inv
+        c = c & 0x7f if i == 0
+        if x >> 56 > 0 {
+          self.err = true
+          return 0
+        }
+        x = (x << 8) | c.as_u64
+        i += 1
+      }
+      if x >> 63 > 0 {
+        self.err = true
+        return 0
+      }
+      return inv == 0xff ? -1 - x.as_i64 : x.as_i64
+    }
+    self.parse_octal!(b)
+  }
+
+  def parse_octal!(b0: [Byte]) -> Int {
+    # Leading and trailing spaces and NULs are allowed.
+    lo = 0
+    hi = b0.size
+    while lo < hi && (b0[lo] == 32 || b0[lo] == 0) {
+      lo += 1
+    }
+    while hi > lo && (b0[hi - 1] == 32 || b0[hi - 1] == 0) {
+      hi -= 1
+    }
+    return 0 if lo == hi
+    r = strconv.parse_uint(parse_string(b0[lo...hi]), 8, 64)
+    if r.err.some? {
+      self.err = true
+      return 0
+    }
+    r.unwrap.as_i64
+  }
+}
+
+# Field formatting with a sticky error flag (Go's formatter).
+struct Formatter {
+  err: Bool
+
+  def format_string!(b: [Byte], s: Str) {
+    self.err = true if s.size > b.size
+    sb = s.bytes.to_a
+    copy(b, sb)
+    b[s.size] = 0 if s.size < b.size
+    # GNU and BSD tar end a truncated name ending in a slash with NUL.
+    if s.size > b.size && b[b.size - 1] == 47 {
+      n = strings.trim_right(s[0...b.size - 1], "/").size
+      b[n] = 0
+    }
+  }
+
+  def format_ascii!(b: [Byte], s: Str) {
+    self.format_string!(b, to_ascii(s))
+  }
+
+  def format_numeric!(b: [Byte], x0: Int) {
+    if fits_in_octal?(b.size, x0) {
+      self.format_octal!(b, x0)
+      return
+    }
+    if fits_in_base256?(b.size, x0) {
+      x = x0
+      i = b.size - 1
+      while i >= 0 {
+        b[i] = x.as_u8
+        x = x >> 8
+        i -= 1
+      }
+      b[0] = b[0] | 0x80
+      return
+    }
+    self.format_octal!(b, 0)
+    self.err = true
+    nil
+  }
+
+  def format_octal!(b: [Byte], x0: Int) {
+    x = x0
+    if !fits_in_octal?(b.size, x) {
+      x = 0
+      self.err = true
+    }
+    s = strconv.format_int(x, 8)
+    n = b.size - s.size - 1
+    s = strings.repeat("0", n) + s if n > 0
+    self.format_string!(b, s)
+  }
+}
+
+def digit?(c: Byte) -> Bool { c >= 48 && c <= 57 }
+
+# A PAX time ("1350244992.023960108"); TarError.Header if malformed.
+def parse_pax_time(s: Str) -> ~time.Time<TarError> {
+  ss = s
+  sn = ""
+  if parts = strings.cut(s, ".") {
+    ss = parts[0]
+    sn = parts[1]
+  }
+  r = strconv.parse_int(ss, 10, 64)
+  fail TarError.Header if r.err.some?
+  secs = r.unwrap
+  return time.unix(secs, 0) if sn.size == 0
+  digits: [Byte] = [48; 9]
+  i = 0
+  while i < sn.size {
+    c = sn[i]
+    fail TarError.Header if !digit?(c)
+    digits[i] = c if i < 9
+    i += 1
+  }
+  nsecs = strconv.parse_int(Str.from_bytes(digits), 10, 64).unwrap
+  return time.unix(secs, 0 - nsecs) if ss.size > 0 && ss[0] == 45
+  time.unix(secs, nsecs)
+}
+
+# The PAX form of ts: seconds, and a fraction without trailing zeros.
+def format_pax_time(ts: time.Time) -> Str {
+  secs = ts.unix
+  nsecs = ts.nanosecond
+  return secs.to_s if nsecs == 0
+  sign = ""
+  if secs < 0 {
+    sign = "-"
+    secs = 0 - (secs + 1)
+    nsecs = 0 - (nsecs - 1000000000)
+  }
+  frac = nsecs.to_s
+  frac = strings.repeat("0", 9 - frac.size) + frac
+  strings.trim_right("#{sign}#{secs}.#{frac}", "0")
+}
+
+# The first record of s ("%d %s=%s\n"): key, value and the rest.
+def parse_pax_record(s: Str) -> ~(Str, Str, Str)<TarError> {
+  cut = strings.cut(s, " ")
+  fail TarError.Header if cut.none?
+  n_str, rest = cut.unwrap
+  r = strconv.parse_int(n_str, 10, 0)
+  fail TarError.Header if r.err.some?
+  n = r.unwrap
+  fail TarError.Header if n < 5 || n > s.size
+  n -= n_str.size + 1
+  fail TarError.Header if n <= 0
+  rec = rest[0...n - 1]
+  nl = rest[n - 1...n]
+  rem = rest[n...rest.size]
+  fail TarError.Header if nl != "\n"
+  kv = strings.cut(rec, "=")
+  fail TarError.Header if kv.none?
+  k, v = kv.unwrap
+  fail TarError.Header if !valid_pax_record?(k, v)
+  (k, v, rem)
+}
+
+# One record: "%d %s=%s\n", the length counting itself.
+def format_pax_record(k: Str, v: Str) -> ~Str<TarError> {
+  fail TarError.Header if !valid_pax_record?(k, v)
+  size = k.size + v.size + 3
+  size += size.to_s.size
+  record = "#{size} #{k}=#{v}\n"
+  if record.size != size {
+    size = record.size
+    record = "#{size} #{k}=#{v}\n"
+  }
+  record
+}
+
+def valid_pax_record?(k: Str, v: Str) -> Bool {
+  return false if k == "" || strings.contains(k, "=")
+  if k == PAX_PATH || k == PAX_LINKPATH || k == PAX_UNAME || k == PAX_GNAME {
+    return !has_nul?(v)
+  }
+  !has_nul?(k)
+}
+
+# ------------------------------------------------------------------ blocks
+
+BLOCK_SIZE = 512
+NAME_SIZE = 100
+PREFIX_SIZE = 155
+# The largest special (meta) file read: PAX records, long names.
+MAX_SPECIAL_FILE_SIZE = 1 << 20
+MAX_SPARSE_FILE_ENTRIES = 1 << 20
+
+# Field offsets and sizes of a header block (V7, USTAR, GNU and STAR).
+def f_name(b: [Byte]) -> [Byte] { b[0...100] }
+def f_mode(b: [Byte]) -> [Byte] { b[100...108] }
+def f_uid(b: [Byte]) -> [Byte] { b[108...116] }
+def f_gid(b: [Byte]) -> [Byte] { b[116...124] }
+def f_size(b: [Byte]) -> [Byte] { b[124...136] }
+def f_mod_time(b: [Byte]) -> [Byte] { b[136...148] }
+def f_chksum(b: [Byte]) -> [Byte] { b[148...156] }
+def f_link_name(b: [Byte]) -> [Byte] { b[157...257] }
+def f_magic(b: [Byte]) -> [Byte] { b[257...263] }
+def f_version(b: [Byte]) -> [Byte] { b[263...265] }
+def f_user_name(b: [Byte]) -> [Byte] { b[265...297] }
+def f_group_name(b: [Byte]) -> [Byte] { b[297...329] }
+def f_dev_major(b: [Byte]) -> [Byte] { b[329...337] }
+def f_dev_minor(b: [Byte]) -> [Byte] { b[337...345] }
+def f_ustar_prefix(b: [Byte]) -> [Byte] { b[345...500] }
+def f_gnu_access_time(b: [Byte]) -> [Byte] { b[345...357] }
+def f_gnu_change_time(b: [Byte]) -> [Byte] { b[357...369] }
+def f_gnu_sparse(b: [Byte]) -> [Byte] { b[386...483] }
+def f_gnu_real_size(b: [Byte]) -> [Byte] { b[483...495] }
+def f_star_prefix(b: [Byte]) -> [Byte] { b[345...476] }
+def f_star_access_time(b: [Byte]) -> [Byte] { b[476...488] }
+def f_star_change_time(b: [Byte]) -> [Byte] { b[488...500] }
+def f_star_trailer(b: [Byte]) -> [Byte] { b[508...512] }
+
+# A sparse array (GNU): 24-byte entries, then the "is extended" byte.
+def sa_max_entries(s: [Byte]) -> Int { s.size / 24 }
+def sa_offset(s: [Byte], i: Int) -> [Byte] { s[i * 24...i * 24 + 12] }
+def sa_length(s: [Byte], i: Int) -> [Byte] { s[i * 24 + 12...i * 24 + 24] }
+def sa_is_extended(s: [Byte]) -> [Byte] {
+  n = 24 * sa_max_entries(s)
+  s[n...n + 1]
+}
+
+def new_block -> [Byte] {
+  b: [Byte] = [0; 512]
+  b
+}
+
+def zero_block?(b: [Byte]) -> Bool {
+  for c in b {
+    return false if c != 0
+  }
+  true
+}
+
+def bytes_eq?(b: [Byte], s: Str) -> Bool {
+  return false if b.size != s.size
+  i = 0
+  while i < b.size {
+    return false if b[i] != s[i]
+    i += 1
+  }
+  true
+}
+
+def put_str(b: [Byte], s: Str) {
+  i = 0
+  while i < s.size && i < b.size {
+    b[i] = s[i]
+    i += 1
+  }
+}
+
+def put_bytes(b: [Byte], s: [Byte]) {
+  copy(b, s)
+}
+
+# The checksums of a block: unsigned and signed sums of its bytes, the
+# checksum field counted as spaces.
+def compute_checksum(b: [Byte]) -> (Int, Int) {
+  unsigned = 0
+  signed = 0
+  i = 0
+  while i < b.size {
+    c = i >= 148 && i < 156 ? 32 : b[i].to_i
+    unsigned += c
+    signed += c >= 128 ? c - 256 : c
+    i += 1
+  }
+  (unsigned, signed)
+}
+
+MAGIC_GNU = "ustar "
+MAGIC_USTAR = "ustar"
+TRAILER_STAR = "tar"
+
+def magic_ustar?(b: [Byte]) -> Bool {
+  m = f_magic(b)
+  bytes_eq?(m[0...5], MAGIC_USTAR) && m[5] == 0
+}
+
+def version_gnu?(b: [Byte]) -> Bool {
+  v = f_version(b)
+  v[0] == 32 && v[1] == 0
+}
+
+def trailer_star?(b: [Byte]) -> Bool {
+  t = f_star_trailer(b)
+  bytes_eq?(t[0...3], TRAILER_STAR) && t[3] == 0
+}
+
+# The block's possible formats; FORMAT_UNKNOWN when the checksum is wrong.
+def get_format(b: [Byte]) -> Int {
+  p = Parser.new()
+  value = p.parse_octal!(f_chksum(b))
+  c1, c2 = compute_checksum(b)
+  return FORMAT_UNKNOWN if p.err || (value != c1 && value != c2)
+  if magic_ustar?(b) && trailer_star?(b) {
+    return FORMAT_STAR
+  }
+  return FORMAT_USTAR | FORMAT_PAX if magic_ustar?(b)
+  return FORMAT_GNU if bytes_eq?(f_magic(b), MAGIC_GNU) && version_gnu?(b)
+  FORMAT_V7
+}
+
+# Writes the magic and version of `format` and the checksum.
+def set_format(b: [Byte], format: Int) {
+  if format & FORMAT_V7 != 0 {
+    # No magic.
+  } else if format & FORMAT_GNU != 0 {
+    put_str(f_magic(b), MAGIC_GNU)
+    v = f_version(b)
+    v[0] = 32
+    v[1] = 0
+  } else if format & FORMAT_STAR != 0 {
+    put_str(f_magic(b), MAGIC_USTAR)
+    b[262] = 0
+    put_str(f_version(b), "00")
+    put_str(f_star_trailer(b), TRAILER_STAR)
+    b[511] = 0
+  } else if format & (FORMAT_USTAR | FORMAT_PAX) != 0 {
+    put_str(f_magic(b), MAGIC_USTAR)
+    b[262] = 0
+    put_str(f_version(b), "00")
+  } else {
+    assert false, "invalid format"
+  }
+  f = Formatter.new()
+  field = f_chksum(b)
+  c1, _c2 = compute_checksum(b)
+  f.format_octal!(field[0...7], c1)
+  field[7] = 32
+}
+
+# Splits a long name into a USTAR prefix and suffix; none if it can't.
+def split_ustar_path(name: Str) -> (Str, Str)? {
+  length = name.size
+  return none if length <= NAME_SIZE || !ascii?(name)
+  if length > PREFIX_SIZE + 1 {
+    length = PREFIX_SIZE + 1
+  } else if name[length - 1] == 47 {
+    length -= 1
+  }
+  i = strings.last_index(name[0...length], "/")
+  nlen = name.size - i - 1
+  plen = i
+  return none if i <= 0 || nlen > NAME_SIZE || nlen == 0 || plen > PREFIX_SIZE
+  (name[0...i], name[i + 1...name.size])
+}
+
+# Whether name is local (Go's filepath.IsLocal on Unix): relative, not
+# empty, and not escaping with "..".
+def local_path?(name: Str) -> Bool {
+  return false if name == "" || path.is_abs(name)
+  p = name
+  has_dots = false
+  for part in strings.split(name, "/") {
+    if part == "." || part == ".." {
+      has_dots = true
+      break
+    }
+  }
+  p = path.clean(name) if has_dots
+  !(p == ".." || strings.has_prefix(p, "../"))
+}

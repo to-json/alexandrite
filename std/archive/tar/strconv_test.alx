@@ -1,0 +1,336 @@
+# Go's archive/tar strconv_test.go.
+
+import "strings"
+import "time"
+
+MAX_I64 = 0x7fffffffffffffff
+MIN_I64 = -0x7fffffffffffffff - 1
+
+test "fits in base256" {
+  vectors = [
+    (1, 8, true),
+    (0, 8, true),
+    (-1, 8, true),
+    (1 << 56, 8, false),
+    ((1 << 56) - 1, 8, true),
+    (-1 << 56, 8, true),
+    ((-1 << 56) - 1, 8, false),
+    (121654, 8, true),
+    (-9849849, 8, true),
+    (MAX_I64, 9, true),
+    (0, 9, true),
+    (MIN_I64, 9, true),
+    (MAX_I64, 12, true),
+    (0, 12, true),
+    (MIN_I64, 12, true),
+  ]
+  for v in vectors {
+    assert_eq fits_in_base256?(v[1], v[0]), v[2]
+  }
+}
+
+test "parse numeric" {
+  vectors = [
+    ("", 0, true),
+    (Str.from_bytes([128]), 0, true),
+    (Str.from_bytes([128, 0]), 0, true),
+    (Str.from_bytes([128, 0, 0]), 0, true),
+    (Str.from_bytes([191]), (1 << 6) - 1, true),
+    (Str.from_bytes([191, 255]), (1 << 14) - 1, true),
+    (Str.from_bytes([191, 255, 255]), (1 << 22) - 1, true),
+    (Str.from_bytes([255]), -1, true),
+    (Str.from_bytes([255, 255]), -1, true),
+    (Str.from_bytes([255, 255, 255]), -1, true),
+    (Str.from_bytes([192]), -1 * (1 << 6), true),
+    (Str.from_bytes([192, 0]), -1 * (1 << 14), true),
+    (Str.from_bytes([192, 0, 0]), -1 * (1 << 22), true),
+    (Str.from_bytes([135, 118, 162, 34, 235, 138, 114, 97]), 537795476381659745, true),
+    (Str.from_bytes([128, 0, 0, 0, 7, 118, 162, 34, 235, 138, 114, 97]), 537795476381659745, true),
+    (Str.from_bytes([247, 118, 162, 34, 235, 138, 114, 97]), -615126028225187231, true),
+    (Str.from_bytes([255, 255, 255, 255, 247, 118, 162, 34, 235, 138, 114, 97]), -615126028225187231, true),
+    (Str.from_bytes([128, 127, 255, 255, 255, 255, 255, 255, 255]), MAX_I64, true),
+    (Str.from_bytes([128, 128, 0, 0, 0, 0, 0, 0, 0]), 0, false),
+    (Str.from_bytes([255, 128, 0, 0, 0, 0, 0, 0, 0]), MIN_I64, true),
+    (Str.from_bytes([255, 127, 255, 255, 255, 255, 255, 255, 255]), 0, false),
+    (Str.from_bytes([245, 236, 209, 199, 126, 95, 38, 72, 129, 159, 143, 155]), 0, false),
+    ("0000000\x00", 0, true),
+    (" \x0000000\x00", 0, true),
+    (" \x0000003\x00", 3, true),
+    ("00000000227\x00", 0o227, true),
+    ("032033\x00 ", 0o32033, true),
+    ("320330\x00 ", 0o320330, true),
+    ("0000660\x00 ", 0o660, true),
+    ("\x00 0000660\x00 ", 0o660, true),
+    ("0123456789abcdef", 0, false),
+    ("0123456789\x00abcdef", 0, false),
+    ("01234567\x0089abcdef", 342391, true),
+    ("0123~_&4123", 0, false),
+  ]
+  for v in vectors {
+    p = Parser.new()
+    got = p.parse_numeric!(v[0].bytes.to_a)
+    ok = !p.err
+    assert ok == v[2], "parse_numeric(#{v[0].bytes.to_a}): ok #{ok}"
+    assert_eq got, v[1] if ok
+  }
+}
+
+test "format numeric" {
+  vectors = [
+    (0, "0\x00", true),
+    (7, "7\x00", true),
+    (8, Str.from_bytes([128, 8]), true),
+    (0o77, "77\x00", true),
+    (0o100, Str.from_bytes([128, 0, 64]), true),
+    (0, "0000000\x00", true),
+    (0o123, "0000123\x00", true),
+    (0o7654321, "7654321\x00", true),
+    (0o7777777, "7777777\x00", true),
+    (0o10000000, Str.from_bytes([128, 0, 0, 0, 0, 32, 0, 0]), true),
+    (0, "00000000000\x00", true),
+    (0o00001234567, "00001234567\x00", true),
+    (0o76543210321, "76543210321\x00", true),
+    (0o12345670123, "12345670123\x00", true),
+    (0o77777777777, "77777777777\x00", true),
+    (0o100000000000, Str.from_bytes([128, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0]), true),
+    (MAX_I64, "777777777777777777777\x00", true),
+    (-1, Str.from_bytes([255]), true),
+    (-1, Str.from_bytes([255, 255]), true),
+    (-1, Str.from_bytes([255, 255, 255]), true),
+    ((1 << 0), "0", false),
+    ((1 << 8) - 1, Str.from_bytes([128, 255]), true),
+    ((1 << 8), "0\x00", false),
+    ((1 << 16) - 1, Str.from_bytes([128, 255, 255]), true),
+    ((1 << 16), "00\x00", false),
+    (-1 * (1 << 0), Str.from_bytes([255]), true),
+    (-1*(1<<0) - 1, "0", false),
+    (-1 * (1 << 8), Str.from_bytes([255, 0]), true),
+    (-1*(1<<8) - 1, "0\x00", false),
+    (-1 * (1 << 16), Str.from_bytes([255, 0, 0]), true),
+    (-1*(1<<16) - 1, "00\x00", false),
+    (537795476381659745, "0000000\x00", false),
+    (537795476381659745, Str.from_bytes([128, 0, 0, 0, 7, 118, 162, 34, 235, 138, 114, 97]), true),
+    (-615126028225187231, "0000000\x00", false),
+    (-615126028225187231, Str.from_bytes([255, 255, 255, 255, 247, 118, 162, 34, 235, 138, 114, 97]), true),
+    (MAX_I64, "0000000\x00", false),
+    (MAX_I64, Str.from_bytes([128, 0, 0, 0, 127, 255, 255, 255, 255, 255, 255, 255]), true),
+    (MIN_I64, "0000000\x00", false),
+    (MIN_I64, Str.from_bytes([255, 255, 255, 255, 128, 0, 0, 0, 0, 0, 0, 0]), true),
+    (MAX_I64, Str.from_bytes([128, 127, 255, 255, 255, 255, 255, 255, 255]), true),
+    (MIN_I64, Str.from_bytes([255, 128, 0, 0, 0, 0, 0, 0, 0]), true),
+  ]
+  for v in vectors {
+    f = Formatter.new()
+    got: [Byte] = [0; v[1].size]
+    f.format_numeric!(got, v[0])
+    ok = !f.err
+    assert ok == v[2], "format_numeric(#{v[0]}): ok #{ok}"
+    assert_eq got, v[1].bytes.to_a
+  }
+}
+
+test "fits in octal" {
+  vectors = [
+    (-1, 1, false),
+    (-1, 2, false),
+    (-1, 3, false),
+    (0, 1, true),
+    (0 + 1, 1, false),
+    (0, 2, true),
+    (0o7, 2, true),
+    (0o7 + 1, 2, false),
+    (0, 4, true),
+    (0o777, 4, true),
+    (0o777 + 1, 4, false),
+    (0, 8, true),
+    (0o7777777, 8, true),
+    (0o7777777 + 1, 8, false),
+    (0, 12, true),
+    (0o77777777777, 12, true),
+    (0o77777777777 + 1, 12, false),
+    (MAX_I64, 22, true),
+    (0o12345670123, 12, true),
+    (0o1564164, 12, true),
+    (-0o12345670123, 12, false),
+    (-0o1564164, 12, false),
+    (-1564164, 30, false),
+  ]
+  for v in vectors {
+    assert_eq fits_in_octal?(v[1], v[0]), v[2]
+  }
+}
+
+test "parse pax time" {
+  vectors = [
+    ("1350244992.023960108", time.unix(1350244992, 23960108), true),
+    ("1350244992.02396010", time.unix(1350244992, 23960100), true),
+    ("1350244992.0239601089", time.unix(1350244992, 23960108), true),
+    ("1350244992.3", time.unix(1350244992, 300000000), true),
+    ("1350244992", time.unix(1350244992, 0), true),
+    ("-1.000000001", time.unix(-1, -1+0), true),
+    ("-1.000001", time.unix(-1, -1000+0), true),
+    ("-1.001000", time.unix(-1, -1000000+0), true),
+    ("-1", time.unix(-1, -0+0), true),
+    ("-1.999000", time.unix(-1, -1000000000+1000000), true),
+    ("-1.999999", time.unix(-1, -1000000000+1000), true),
+    ("-1.999999999", time.unix(-1, -1000000000+1), true),
+    ("0.000000001", time.unix(0, 1+0), true),
+    ("0.000001", time.unix(0, 1000+0), true),
+    ("0.001000", time.unix(0, 1000000+0), true),
+    ("0", time.unix(0, 0), true),
+    ("0.999000", time.unix(0, 1000000000-1000000), true),
+    ("0.999999", time.unix(0, 1000000000-1000), true),
+    ("0.999999999", time.unix(0, 1000000000-1), true),
+    ("1.000000001", time.unix(1, 1-0), true),
+    ("1.000001", time.unix(1, 1000-0), true),
+    ("1.001000", time.unix(1, 1000000-0), true),
+    ("1", time.unix(1, 0-0), true),
+    ("1.999000", time.unix(1, 1000000000-1000000), true),
+    ("1.999999", time.unix(1, 1000000000-1000), true),
+    ("1.999999999", time.unix(1, 1000000000-1), true),
+    ("-1350244992.023960108", time.unix(-1350244992, -23960108), true),
+    ("-1350244992.02396010", time.unix(-1350244992, -23960100), true),
+    ("-1350244992.0239601089", time.unix(-1350244992, -23960108), true),
+    ("-1350244992.3", time.unix(-1350244992, -300000000), true),
+    ("-1350244992", time.unix(-1350244992, 0), true),
+    ("", time.Time.new(), false),
+    ("0", time.unix(0, 0), true),
+    ("1.", time.unix(1, 0), true),
+    ("0.0", time.unix(0, 0), true),
+    (".5", time.Time.new(), false),
+    ("-1.3", time.unix(-1, -300000000), true),
+    ("-1.0", time.unix(-1, -0), true),
+    ("-0.0", time.unix(-0, -0), true),
+    ("-0.1", time.unix(-0, -100000000), true),
+    ("-0.01", time.unix(-0, -10000000), true),
+    ("-0.99", time.unix(-0, -990000000), true),
+    ("-0.98", time.unix(-0, -980000000), true),
+    ("-1.1", time.unix(-1, -100000000), true),
+    ("-1.01", time.unix(-1, -10000000), true),
+    ("-2.99", time.unix(-2, -990000000), true),
+    ("-5.98", time.unix(-5, -980000000), true),
+    ("-", time.Time.new(), false),
+    ("+", time.Time.new(), false),
+    ("-1.-1", time.Time.new(), false),
+    ("99999999999999999999999999999999999999999999999", time.Time.new(), false),
+    ("0.123456789abcdef", time.Time.new(), false),
+    ("foo", time.Time.new(), false),
+    ("\x00", time.Time.new(), false),
+    ("𝟵𝟴𝟳𝟲𝟱.𝟰𝟯𝟮𝟭𝟬", time.Time.new(), false),
+    ("98765﹒43210", time.Time.new(), false),
+  ]
+  for v in vectors {
+    r = parse_pax_time(v[0])
+    assert r.ok? == v[2], "parse_pax_time(#{v[0]})"
+    if t = r.ok {
+      assert t == v[1], "parse_pax_time(#{v[0]}): got #{t.unix}s #{t.nanosecond}ns, want #{v[1].unix}s #{v[1].nanosecond}ns"
+    }
+  }
+}
+
+test "format pax time" {
+  vectors = [
+    (1350244992, 0, "1350244992"),
+    (1350244992, 300000000, "1350244992.3"),
+    (1350244992, 23960100, "1350244992.0239601"),
+    (1350244992, 23960108, "1350244992.023960108"),
+    (1, 1000000000 - 1, "1.999999999"),
+    (1, 1000000000 - 1000, "1.999999"),
+    (1, 1000000000 - 1000000, "1.999"),
+    (1, 0 - 0, "1"),
+    (1, 1000000 - 0, "1.001"),
+    (1, 1000 - 0, "1.000001"),
+    (1, 1 - 0, "1.000000001"),
+    (0, 1000000000 - 1, "0.999999999"),
+    (0, 1000000000 - 1000, "0.999999"),
+    (0, 1000000000 - 1000000, "0.999"),
+    (0, 0, "0"),
+    (0, 1000000 + 0, "0.001"),
+    (0, 1000 + 0, "0.000001"),
+    (0, 1 + 0, "0.000000001"),
+    (-1, -1000000000 + 1, "-1.999999999"),
+    (-1, -1000000000 + 1000, "-1.999999"),
+    (-1, -1000000000 + 1000000, "-1.999"),
+    (-1, -0 + 0, "-1"),
+    (-1, -1000000 + 0, "-1.001"),
+    (-1, -1000 + 0, "-1.000001"),
+    (-1, -1 + 0, "-1.000000001"),
+    (-1350244992, 0, "-1350244992"),
+    (-1350244992, -300000000, "-1350244992.3"),
+    (-1350244992, -23960100, "-1350244992.0239601"),
+    (-1350244992, -23960108, "-1350244992.023960108"),
+  ]
+  for v in vectors {
+    assert_eq format_pax_time(time.unix(v[0], v[1])), v[2]
+  }
+}
+
+test "parse pax record" {
+  med_name = strings.repeat("CD", 50)
+  long_name = strings.repeat("AB", 100)
+  vectors = [
+    ("6 k=v\n\n", "\n", "k", "v", true),
+    ("19 path=/etc/hosts\n", "", "path", "/etc/hosts", true),
+    ("210 path=" + long_name + "\nabc", "abc", "path", long_name, true),
+    ("110 path=" + med_name + "\n", "", "path", med_name, true),
+    ("9 foo=ba\n", "", "foo", "ba", true),
+    ("11 foo=bar\n\x00", "\x00", "foo", "bar", true),
+    ("18 foo=b=\nar=\n==\x00\n", "", "foo", "b=\nar=\n==\x00", true),
+    ("27 foo=hello9 foo=ba\nworld\n", "", "foo", "hello9 foo=ba\nworld", true),
+    ("27 ☺☻☹=日a本b語ç\nmeow mix", "meow mix", "☺☻☹", "日a本b語ç", true),
+    ("17 \x00hello=\x00world\n", "17 \x00hello=\x00world\n", "", "", false),
+    ("1 k=1\n", "1 k=1\n", "", "", false),
+    ("6 k~1\n", "6 k~1\n", "", "", false),
+    ("6_k=1\n", "6_k=1\n", "", "", false),
+    ("6 k=1 ", "6 k=1 ", "", "", false),
+    ("632 k=1\n", "632 k=1\n", "", "", false),
+    ("16 longkeyname=hahaha\n", "16 longkeyname=hahaha\n", "", "", false),
+    ("3 somelongkey=\n", "3 somelongkey=\n", "", "", false),
+    ("50 tooshort=\n", "50 tooshort=\n", "", "", false),
+    ("0000000000000000000000000000000030 mtime=1432668921.098285006\n30 ctime=2147483649.15163319", "0000000000000000000000000000000030 mtime=1432668921.098285006\n30 ctime=2147483649.15163319", "mtime", "1432668921.098285006", false),
+    ("06 k=v\n", "06 k=v\n", "", "", false),
+    ("00006 k=v\n", "00006 k=v\n", "", "", false),
+    ("000006 k=v\n", "000006 k=v\n", "", "", false),
+    ("000000 k=v\n", "000000 k=v\n", "", "", false),
+    ("0 k=v\n", "0 k=v\n", "", "", false),
+    ("+0000005 x=\n", "+0000005 x=\n", "", "", false),
+  ]
+  for v in vectors {
+    r = parse_pax_record(v[0])
+    assert r.ok? == v[4], "parse_pax_record(#{v[0]})"
+    if x = r.ok {
+      k, val, res = x
+      assert_eq k, v[2]
+      assert_eq val, v[3]
+      assert_eq res, v[1]
+    } else {
+      # Go returns the input as the residual on failure.
+      assert_eq v[1], v[0]
+    }
+  }
+}
+
+test "format pax record" {
+  med_name = strings.repeat("CD", 50)
+  long_name = strings.repeat("AB", 100)
+  vectors = [
+    ("k", "v", "6 k=v\n", true),
+    ("path", "/etc/hosts", "19 path=/etc/hosts\n", true),
+    ("path", long_name, "210 path=" + long_name + "\n", true),
+    ("path", med_name, "110 path=" + med_name + "\n", true),
+    ("foo", "ba", "9 foo=ba\n", true),
+    ("foo", "bar", "11 foo=bar\n", true),
+    ("foo", "b=\nar=\n==\x00", "18 foo=b=\nar=\n==\x00\n", true),
+    ("foo", "hello9 foo=ba\nworld", "27 foo=hello9 foo=ba\nworld\n", true),
+    ("☺☻☹", "日a本b語ç", "27 ☺☻☹=日a本b語ç\n", true),
+    ("xhello", "\x00world", "17 xhello=\x00world\n", true),
+    ("path", "null\x00", "", false),
+    ("null\x00", "value", "", false),
+    (PAX_SCHILY_XATTR + "key", "null\x00", "26 SCHILY.xattr.key=null\x00\n", true),
+  ]
+  for v in vectors {
+    r = format_pax_record(v[0], v[1])
+    assert r.ok? == v[3], "format_pax_record(#{v[0]}, #{v[1]})"
+    assert_eq r.ok || "", v[2]
+  }
+}

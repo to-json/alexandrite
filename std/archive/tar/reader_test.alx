@@ -1,0 +1,505 @@
+# Go's archive/tar reader_test.go. Go's TestReader table is
+# vec_reader_test.alx (generated from Go's reader over the same files).
+
+import "bytes"
+import "io"
+import "strconv"
+import "strings"
+import "time"
+
+def b(s: Str) -> [Byte] { s.bytes.to_a }
+
+def zeros(n: Int) -> [Byte] {
+  z: [Byte] = [0; n]
+  z
+}
+
+def err_msg[T](r: ~T) -> Str {
+  if e = r.err {
+    return e.message
+  }
+  ""
+}
+
+test "partial read" {
+  vectors = [
+    ("gnu.tar", [(4, "Kilt"), (6, "Google")]),
+    ("sparse-formats.tar", [(2, "\x00G"), (4, "\x00G\x00o"), (6, "\x00G\x00o\x00G"), (8, "\x00G\x00o\x00G\x00o"), (4, "end\n")]),
+  ]
+  for v in vectors {
+    tr = new_reader(bytes.new_reader(~testdata_bytes(v[0])))
+    for tc in v[1] {
+      h = tr.~next!
+      assert h.some?, "#{v[0]}: next!"
+      buf: [Byte] = [0; tc[0]]
+      io.~read_exact(tr, buf)
+      assert Str.from_bytes(buf) == tc[1], "#{v[0]}: got #{strconv.quote(Str.from_bytes(buf))}, want #{strconv.quote(tc[1])}"
+    }
+    assert tr.~next!.none?, "#{v[0]}: want the end"
+  }
+}
+
+test "uninitialized read" {
+  tr = new_reader(bytes.new_reader(~testdata_bytes("gnu.tar")))
+  e: [Byte] = []
+  assert_eq tr.~read!(e), 0
+}
+
+# Go's TestReadTruncation. Go runs each input through a plain reader, a
+# seeker and a failing seeker, with and without draining each entry; alx
+# never seeks, so the plain reader is all of them.
+test "read truncation" {
+  data1 = ~testdata_bytes("gnu.tar")
+  data2 = ~testdata_bytes("ustar-file-reg.tar") + zeros(10 * 512)
+  pax = ~testdata_bytes("pax-path-hdr.tar")
+  sparse = ~testdata_bytes("sparse-formats.tar")
+  trash = b(strings.repeat("garbage ", 64))
+  eof = ""
+  ueof = "unexpected EOF"
+  hdr_err = "archive/tar: invalid tar header"
+  vectors: [([Byte], Int, Str)] = [
+    (zeros(0), 0, eof),
+    (data1[0...511], 0, ueof),
+    (data1[0...512], 1, ueof),
+    (data1[0...1024], 1, eof),
+    (data1[0...1536], 2, ueof),
+    (data1[0...2048], 2, eof),
+    (data1, 2, eof),
+    (data1[0...2048] + data2[0...1536], 3, eof),
+    (data2[0...511], 0, ueof),
+    (data2[0...512], 1, ueof),
+    (data2[0...1195], 1, ueof),
+    (data2[0...1196], 1, eof),
+    (data2[0...1200], 1, eof),
+    (data2[0...1535], 1, eof),
+    (data2[0...1536], 1, eof),
+    (data2[0...1536] + trash[0...1], 1, ueof),
+    (data2[0...1536] + trash[0...511], 1, ueof),
+    (data2[0...1536] + trash, 1, hdr_err),
+    (data2[0...2048], 1, eof),
+    (data2[0...2048] + trash[0...1], 1, ueof),
+    (data2[0...2048] + trash[0...511], 1, ueof),
+    (data2[0...2048] + trash, 1, hdr_err),
+    (data2[0...2560], 1, eof),
+    (data2[0...2560] + trash[0...1], 1, eof),
+    (data2[0...2560] + trash[0...511], 1, eof),
+    (data2[0...2560] + trash, 1, eof),
+    (data2[0...3072], 1, eof),
+    (pax, 0, eof),
+    (pax + trash[0...1], 0, ueof),
+    (pax + trash[0...511], 0, ueof),
+    (sparse[0...511], 0, ueof),
+    (sparse[0...512], 0, ueof),
+    (sparse[0...3584], 1, eof),
+    (sparse[0...9200], 1, eof),
+    (sparse[0...9216], 1, eof),
+    (sparse[0...9728], 2, ueof),
+    (sparse[0...10240], 2, eof),
+    (sparse[0...11264], 2, ueof),
+    (sparse, 5, eof),
+    (sparse + trash, 5, eof),
+  ]
+  i = 0
+  for v in vectors {
+    for manual in [false, true] {
+      tr = new_reader(bytes.new_reader(v[0]))
+      cnt = 0
+      err = ""
+      loop {
+        r = tr.next!
+        if e = r.err {
+          err = e.message
+          break
+        }
+        break if r.unwrap.none?
+        cnt += 1
+        if manual {
+          w = tr.write_to!(io.Discard.new())
+          if e = w.err {
+            err = e.message
+            break
+          }
+        }
+      }
+      assert err == v[2], "test #{i} (manual #{manual}): got #{err}, want #{v[2]}"
+      assert cnt == v[1], "test #{i} (manual #{manual}): got #{cnt} headers, want #{v[1]}"
+    }
+    i += 1
+  }
+}
+
+test "read header only" {
+  tr = new_reader(bytes.new_reader(~testdata_bytes("hdr-only.tar")))
+  hdrs: [Header] = []
+  loop {
+    h = tr.~next!
+    break if h.none?
+    hdr = h.unwrap
+    hdrs << hdr
+    # A special type reads nothing.
+    buf: [Byte] = [0]
+    cnt = io.~read_full(tr, buf)
+    assert !(cnt > 0 && hdr.typeflag != TYPE_REG), "read #{cnt} bytes of #{hdr.name}"
+  }
+  # 16 entries: the later 8 are the first 8 with a size.
+  assert_eq hdrs.size, 16
+  for i in 0...8 {
+    h1 = hdrs[i]
+    h2 = hdrs[i + 8]
+    h1.size = 0
+    h2.size = 0
+    assert_eq header_diff(h1, h2), ""
+  }
+}
+
+test "merge pax" {
+  vectors = [
+    ({"path" => "a/b/c", "uid" => "1000", "mtime" => "1350244992.023960108"}, Header.new(name: "a/b/c", uid: 1000, mod_time: time.unix(1350244992, 23960108), pax_records: {"path" => "a/b/c", "uid" => "1000", "mtime" => "1350244992.023960108"}), true),
+    ({"gid" => "gtgergergersagersgers"}, Header.new(), false),
+    ({"missing" => "missing", "SCHILY.xattr.key" => "value"}, Header.new(xattrs: {"key" => "value"}, pax_records: {"missing" => "missing", "SCHILY.xattr.key" => "value"}), true),
+  ]
+  i = 0
+  for v in vectors {
+    hd = [Header.new()]
+    r = merge_pax(hd, v[0])
+    assert_eq header_diff(hd[0], v[1]), "" if v[2]
+    assert r.ok? == v[2], "test #{i}, merge_pax: got #{r.ok?}, want #{v[2]}"
+    i += 1
+  }
+}
+
+test "parse pax" {
+  vectors: [(Str, Map[Str, Str], Bool)] = [
+    ("", {}, true),
+    ("6 k=1\n", {"k" => "1"}, true),
+    ("10 a=name\n", {"a" => "name"}, true),
+    ("9 a=name\n", {"a" => "name"}, true),
+    ("30 mtime=1350244992.023960108\n", {"mtime" => "1350244992.023960108"}, true),
+    ("3 somelongkey=\n", {}, false),
+    ("50 tooshort=\n", {}, false),
+    ("13 key1=haha\n13 key2=nana\n13 key3=kaka\n", {"key1" => "haha", "key2" => "nana", "key3" => "kaka"}, true),
+    ("13 key1=val1\n13 key2=val2\n8 key1=\n", {"key1" => "", "key2" => "val2"}, true),
+    ("22 GNU.sparse.size=10\n26 GNU.sparse.numblocks=2\n23 GNU.sparse.offset=1\n25 GNU.sparse.numbytes=2\n23 GNU.sparse.offset=3\n25 GNU.sparse.numbytes=4\n", {PAX_GNU_SPARSE_SIZE => "10", PAX_GNU_SPARSE_NUM_BLOCKS => "2", PAX_GNU_SPARSE_MAP => "1,2,3,4"}, true),
+    ("22 GNU.sparse.size=10\n26 GNU.sparse.numblocks=1\n25 GNU.sparse.numbytes=2\n23 GNU.sparse.offset=1\n", {}, false),
+    ("22 GNU.sparse.size=10\n26 GNU.sparse.numblocks=1\n25 GNU.sparse.offset=1,2\n25 GNU.sparse.numbytes=2\n", {}, false),
+  ]
+  i = 0
+  for v in vectors {
+    r = parse_pax(bytes.new_reader(b(v[0])))
+    got = r.ok || empty_map
+    assert map_eq?(got, v[1]), "test #{i}, parse_pax: got #{map_str(got)}, want #{map_str(v[1])}"
+    assert r.ok? == v[2], "test #{i}, parse_pax: ok #{r.ok?}"
+    i += 1
+  }
+}
+
+
+
+
+# Fills the sparse array's entries from sps; returns the rest (and marks
+# the array extended if there is a rest).
+def populate_sparse_map(sa: [Byte], sps: [[Byte]]) -> [[Byte]] {
+  i = 0
+  k = 0
+  while k < sps.size && i < sa_max_entries(sa) {
+    copy(sa[i * 24...i * 24 + 24], sps[k])
+    k += 1
+    i += 1
+  }
+  rest = sps[k...sps.size]
+  ext = sa_is_extended(sa)
+  ext[0] = 0x80 if rest.size > 0
+  rest
+}
+
+def make_input(format: Int, size: Str, sps0: [[Byte]]) -> [Byte] {
+  blk = new_block
+  copy(f_gnu_real_size(blk), b(size))
+  sps = populate_sparse_map(f_gnu_sparse(blk), sps0)
+  set_format(blk, format) if format != FORMAT_UNKNOWN
+  out = blk
+  while sps.size > 0 {
+    ext = new_block
+    sps = populate_sparse_map(ext, sps)
+    out = out + ext
+  }
+  out
+}
+
+def make_sparse_strings(spd: [SparseEntry]) -> [[Byte]] {
+  out: [[Byte]] = []
+  f = Formatter.new()
+  for s in spd {
+    e: [Byte] = [0; 24]
+    f.format_numeric!(e[0...12], s.offset)
+    f.format_numeric!(e[12...24], s.length)
+    out << e
+  }
+  out
+}
+
+test "read old gnu sparse map" {
+  many: [SparseEntry] = []
+  # Go uses 1 << 20 entries; 1 << 16 already passes the 1 MiB limit.
+  for i in 0...(1 << 16) {
+    many << sp(i * 2, i * 2 + 1)
+  }
+  hdr_err = "archive/tar: invalid tar header"
+  six = make_sparse_strings([sp(0, 1), sp(2, 1), sp(4, 1), sp(6, 1), sp(8, 1), sp(10, 1)])
+  vectors: [([Byte], [SparseEntry]?, Int, Str)] = [
+    (make_input(FORMAT_UNKNOWN, "", []), none, 0, hdr_err),
+    (make_input(FORMAT_GNU, "1234", [b("fewa")]), none, 0o1234, hdr_err),
+    (make_input(FORMAT_GNU, "0031", []), no_sp, 0o31, ""),
+    (make_input(FORMAT_GNU, "80", []), none, 0, hdr_err),
+    (make_input(FORMAT_GNU, "1234", make_sparse_strings([sp(0, 0), sp(1, 1)])), [sp(0, 0), sp(1, 1)], 0o1234, ""),
+    (make_input(FORMAT_GNU, "1234", make_sparse_strings([sp(0, 0), sp(1, 1)]) + [b(""), b("blah")]), [sp(0, 0), sp(1, 1)], 0o1234, ""),
+    (make_input(FORMAT_GNU, "3333", make_sparse_strings([sp(0, 1), sp(2, 1), sp(4, 1), sp(6, 1)])), [sp(0, 1), sp(2, 1), sp(4, 1), sp(6, 1)], 0o3333, ""),
+    (make_input(FORMAT_GNU, "", make_sparse_strings([sp(0, 1), sp(2, 1)]) + [b(""), b("")] + make_sparse_strings([sp(4, 1), sp(6, 1)])), [sp(0, 1), sp(2, 1), sp(4, 1), sp(6, 1)], 0, ""),
+    (make_input(FORMAT_GNU, "", six)[0...BLOCK_SIZE], none, 0, "unexpected EOF"),
+    (make_input(FORMAT_GNU, "", six)[0...3 * BLOCK_SIZE / 2], none, 0, "unexpected EOF"),
+    (make_input(FORMAT_GNU, "", six), [sp(0, 1), sp(2, 1), sp(4, 1), sp(6, 1), sp(8, 1), sp(10, 1)], 0, ""),
+    (make_input(FORMAT_GNU, "", make_sparse_strings([sp(10 << 30, 512), sp(20 << 30, 512)])), [sp(10 << 30, 512), sp(20 << 30, 512)], 0, ""),
+    (make_input(FORMAT_GNU, "", make_sparse_strings(many)), none, 0, "archive/tar: sparse map too long"),
+  ]
+  i = 0
+  for v in vectors {
+    blk = new_block
+    n = copy(blk, v[0])
+    tr = new_reader(bytes.new_reader(v[0][n...v[0].size]))
+    hd = [Header.new()]
+    r = tr.read_old_gnu_sparse_map!(hd, blk)
+    got = r.ok
+    if want = v[1] {
+      assert got.some?, "test #{i}: want a map"
+      assert_eq sp_str(got.unwrap), sp_str(want)
+    } else {
+      assert got.none?, "test #{i}: want no map"
+    }
+    assert_eq err_msg(r), v[3]
+    assert_eq hd[0].size, v[2]
+    i += 1
+  }
+}
+
+def pad_input(s: Str) -> Str {
+  s + Str.from_bytes(zeros(block_padding(s.size)))
+}
+
+test "read gnu sparse pax headers" {
+  hundred_in = "100\n"
+  hundred: [SparseEntry] = []
+  for i in 0...100 {
+    hundred_in += "#{i << 30}\n512\n"
+    hundred << sp(i << 30, 512)
+  }
+  vectors: [(Str, Map[Str, Str], [SparseEntry]?, Int, Str, Str)] = [
+    ("", empty_map, none, 0, "", ""),
+    ("", {PAX_GNU_SPARSE_NUM_BLOCKS => MAX_I64.to_s, PAX_GNU_SPARSE_MAP => "0,1,2,3"}, none, 0, "", "archive/tar: invalid tar header"),
+    ("", {PAX_GNU_SPARSE_NUM_BLOCKS => "4\x00", PAX_GNU_SPARSE_MAP => "0,1,2,3"}, none, 0, "", "archive/tar: invalid tar header"),
+    ("", {PAX_GNU_SPARSE_NUM_BLOCKS => "4", PAX_GNU_SPARSE_MAP => "0,1,2,3"}, none, 0, "", "archive/tar: invalid tar header"),
+    ("", {PAX_GNU_SPARSE_NUM_BLOCKS => "2", PAX_GNU_SPARSE_MAP => "0,1,2,3"}, [sp(0, 1), sp(2, 3)], 0, "", ""),
+    ("", {PAX_GNU_SPARSE_NUM_BLOCKS => "2", PAX_GNU_SPARSE_MAP => "0, 1,2,3"}, none, 0, "", "archive/tar: invalid tar header"),
+    ("", {PAX_GNU_SPARSE_NUM_BLOCKS => "2", PAX_GNU_SPARSE_MAP => "0,1,02,3", PAX_GNU_SPARSE_REAL_SIZE => "4321"}, [sp(0, 1), sp(2, 3)], 4321, "", ""),
+    ("", {PAX_GNU_SPARSE_NUM_BLOCKS => "2", PAX_GNU_SPARSE_MAP => "0,one1,2,3"}, none, 0, "", "archive/tar: invalid tar header"),
+    ("", {PAX_GNU_SPARSE_MAJOR => "0", PAX_GNU_SPARSE_MINOR => "0", PAX_GNU_SPARSE_NUM_BLOCKS => "2", PAX_GNU_SPARSE_MAP => "0,1,2,3", PAX_GNU_SPARSE_SIZE => "1234", PAX_GNU_SPARSE_REAL_SIZE => "4321", PAX_GNU_SPARSE_NAME => "realname"}, [sp(0, 1), sp(2, 3)], 1234, "realname", ""),
+    ("", {PAX_GNU_SPARSE_MAJOR => "0", PAX_GNU_SPARSE_MINOR => "0", PAX_GNU_SPARSE_NUM_BLOCKS => "1", PAX_GNU_SPARSE_MAP => "10737418240,512", PAX_GNU_SPARSE_SIZE => "10737418240", PAX_GNU_SPARSE_NAME => "realname"}, [sp(10737418240, 512)], 10737418240, "realname", ""),
+    ("", {PAX_GNU_SPARSE_MAJOR => "0", PAX_GNU_SPARSE_MINOR => "0", PAX_GNU_SPARSE_NUM_BLOCKS => "0", PAX_GNU_SPARSE_MAP => ""}, no_sp, 0, "", ""),
+    ("", {PAX_GNU_SPARSE_MAJOR => "0", PAX_GNU_SPARSE_MINOR => "1", PAX_GNU_SPARSE_NUM_BLOCKS => "4", PAX_GNU_SPARSE_MAP => "0,5,10,5,20,5,30,5"}, [sp(0, 5), sp(10, 5), sp(20, 5), sp(30, 5)], 0, "", ""),
+    ("", {PAX_GNU_SPARSE_MAJOR => "1", PAX_GNU_SPARSE_MINOR => "0", PAX_GNU_SPARSE_NUM_BLOCKS => "4", PAX_GNU_SPARSE_MAP => "0,5,10,5,20,5,30,5"}, none, 0, "", "unexpected EOF"),
+    (pad_input("0\n"), {PAX_GNU_SPARSE_MAJOR => "1", PAX_GNU_SPARSE_MINOR => "0"}, no_sp, 0, "", ""),
+    (pad_input("0\n")[0...BLOCK_SIZE - 1] + "#", {PAX_GNU_SPARSE_MAJOR => "1", PAX_GNU_SPARSE_MINOR => "0"}, no_sp, 0, "", ""),
+    (pad_input("0"), {PAX_GNU_SPARSE_MAJOR => "1", PAX_GNU_SPARSE_MINOR => "0"}, none, 0, "", "unexpected EOF"),
+    (pad_input("ab\n"), {PAX_GNU_SPARSE_MAJOR => "1", PAX_GNU_SPARSE_MINOR => "0"}, none, 0, "", "archive/tar: invalid tar header"),
+    (pad_input("1\n2\n3\n"), {PAX_GNU_SPARSE_MAJOR => "1", PAX_GNU_SPARSE_MINOR => "0"}, [sp(2, 3)], 0, "", ""),
+    (pad_input("1\n2\n"), {PAX_GNU_SPARSE_MAJOR => "1", PAX_GNU_SPARSE_MINOR => "0"}, none, 0, "", "unexpected EOF"),
+    (pad_input("1\n2\n\n"), {PAX_GNU_SPARSE_MAJOR => "1", PAX_GNU_SPARSE_MINOR => "0"}, none, 0, "", "archive/tar: invalid tar header"),
+    (Str.from_bytes(zeros(512)) + pad_input("0\n"), {PAX_GNU_SPARSE_MAJOR => "1", PAX_GNU_SPARSE_MINOR => "0"}, none, 0, "", "archive/tar: invalid tar header"),
+    (strings.repeat("0", BLOCK_SIZE) + pad_input("1\n5\n1\n"), {PAX_GNU_SPARSE_MAJOR => "1", PAX_GNU_SPARSE_MINOR => "0"}, [sp(5, 1)], 0, "", ""),
+    (pad_input("#{MAX_I64}\n"), {PAX_GNU_SPARSE_MAJOR => "1", PAX_GNU_SPARSE_MINOR => "0"}, none, 0, "", "archive/tar: invalid tar header"),
+    (pad_input(strings.repeat("0", 300) + "1\n" + strings.repeat("0", 1000) + "5\n" + strings.repeat("0", 800) + "2\n"), {PAX_GNU_SPARSE_MAJOR => "1", PAX_GNU_SPARSE_MINOR => "0"}, [sp(5, 2)], 0, "", ""),
+    (pad_input("2\n10737418240\n512\n21474836480\n512\n"), {PAX_GNU_SPARSE_MAJOR => "1", PAX_GNU_SPARSE_MINOR => "0"}, [sp(10737418240, 512), sp(21474836480, 512)], 0, "", ""),
+    (pad_input(hundred_in), {PAX_GNU_SPARSE_MAJOR => "1", PAX_GNU_SPARSE_MINOR => "0"}, hundred, 0, "", ""),
+  ]
+  i = 0
+  for v in vectors {
+    hd = [Header.new(pax_records: v[1])]
+    r = bytes.new_reader(b(v[0] + "#"))
+    tr = new_reader(r)
+    tr.set_reg!(r.len)
+    res = tr.read_gnu_sparse_pax_headers!(hd)
+    got: [SparseEntry]? = none
+    if x = res.ok {
+      got = x
+    }
+    if want = v[2] {
+      assert got.some?, "test #{i}: want a map"
+      assert_eq sp_str(got.unwrap), sp_str(want)
+    } else {
+      assert got.none?, "test #{i}: want no map"
+    }
+    assert_eq err_msg(res), v[5]
+    assert_eq hd[0].size, v[3]
+    assert_eq hd[0].name, v[4]
+    assert !(v[5] == "" && r.len == 0), "test #{i}: canary byte unexpectedly consumed"
+    i += 1
+  }
+}
+
+# Go's TestFileReader, over the Reader's current entry: makeReg (data,
+# size) and makeSparse (a plain entry, data fragments, logical size).
+# Ops: (0, n, want, err) reads n bytes; (1, 0, want, err) writes the rest
+# to a buffer (Go's WriteTo; holes become zeros where Go seeks over them);
+# (2, logical, "", "") / (3, physical, "", "") check what remains.
+struct FileReaderCase {
+  data: Str
+  size: Int
+  sparse: Bool
+  spd: [SparseEntry]
+  lsize: Int
+  ops: [(Int, Int, Str, Str)]
+}
+
+def reg_case(data: Str, size: Int, ops: [(Int, Int, Str, Str)]) -> FileReaderCase {
+  FileReaderCase.new(data: data, size: size, sparse: false, spd: [], lsize: 0, ops: ops)
+}
+
+def sparse_case(data: Str, size: Int, spd: [SparseEntry], lsize: Int, ops: [(Int, Int, Str, Str)]) -> FileReaderCase {
+  FileReaderCase.new(data: data, size: size, sparse: true, spd: spd, lsize: lsize, ops: ops)
+}
+
+def rd(n: Int, want: Str, err: Str) -> (Int, Int, Str, Str) { (0, n, want, err) }
+def wt(want: Str, err: Str) -> (Int, Int, Str, Str) { (1, 0, want, err) }
+def rem(l: Int, p: Int) -> [(Int, Int, Str, Str)] { [(2, l, "", ""), (3, p, "", "")] }
+
+# A reader that fails an empty read (Go's testNonEmptyReader).
+struct NonEmptyReader {
+  r: bytes.Reader
+
+  pub def read!(p: [Byte]) -> ~Int {
+    fail io.StreamError.InvalidArgument("unexpected empty Read call") if p.size == 0
+    rr = r
+    rr.read!(p)
+  }
+}
+
+test "file reader" {
+  ueof = "unexpected EOF"
+  miss = "archive/tar: sparse file references non-existent data"
+  unref = "archive/tar: sparse file contains unreferenced data"
+  abcde = [sp(0, 2), sp(5, 3)]
+  vectors = [
+    reg_case("", 0, rem(0, 0) + [rd(0, "", ""), rd(1, "", ""), wt("", "")] + rem(0, 0)),
+    reg_case("", 1, rem(1, 1) + [rd(5, "", ueof), wt("", ueof)] + rem(1, 1)),
+    reg_case("hello", 5, rem(5, 5) + [rd(5, "hello", "")] + rem(0, 0)),
+    reg_case("hello, world", 50, rem(50, 50) + [rd(7, "hello, ", "")] + rem(43, 43) + [rd(5, "world", "")] + rem(38, 38) + [wt("", ueof), rd(1, "", ueof)] + rem(38, 38)),
+    reg_case("hello, world", 5, rem(5, 5) + [rd(0, "", ""), rd(4, "hell", "")] + rem(1, 1) + [wt("o", "")] + rem(0, 0) + [wt("", ""), rd(0, "", "")]),
+    sparse_case("abcde", 5, abcde, 8, rem(8, 5) + [rd(3, "ab\x00", ""), rd(10, "\x00\x00cde", "")] + rem(0, 0)),
+    sparse_case("abcde", 5, abcde, 8, rem(8, 5) + [wt("ab\x00\x00\x00cde", "")] + rem(0, 0)),
+    sparse_case("abcde", 5, abcde, 10, rem(10, 5) + [rd(100, "ab\x00\x00\x00cde\x00\x00", "")] + rem(0, 0)),
+    sparse_case("abc", 5, abcde, 10, rem(10, 5) + [rd(100, "ab\x00\x00\x00c", ueof)] + rem(4, 2)),
+    sparse_case("abcde", 5, [sp(1, 3), sp(6, 2)], 8, rem(8, 5) + [rd(8, "\x00abc\x00\x00de", "")] + rem(0, 0)),
+    sparse_case("abcde", 5, [sp(1, 3), sp(6, 0), sp(6, 0), sp(6, 2)], 8, rem(8, 5) + [rd(8, "\x00abc\x00\x00de", "")] + rem(0, 0)),
+    sparse_case("abcde", 5, [sp(1, 3), sp(6, 0), sp(6, 0), sp(6, 2)], 8, rem(8, 5) + [wt("\x00abc\x00\x00de", "")] + rem(0, 0)),
+    sparse_case("abcde", 5, [sp(1, 3), sp(6, 2)], 10, [rd(100, "\x00abc\x00\x00de\x00\x00", "")]),
+    sparse_case("abcde", 5, [sp(1, 3), sp(6, 2)], 10, [wt("\x00abc\x00\x00de\x00\x00", "")]),
+    sparse_case("abcde", 5, [sp(1, 3), sp(6, 2), sp(8, 0), sp(8, 0), sp(8, 0), sp(8, 0)], 10, [rd(100, "\x00abc\x00\x00de\x00\x00", "")]),
+    sparse_case("", 0, [], 2, [rd(100, "\x00\x00", "")]),
+    sparse_case("", 8, [sp(1, 3), sp(6, 5)], 15, [rd(100, "\x00", ueof)]),
+    sparse_case("ab", 2, [sp(1, 3), sp(6, 5)], 15, [rd(100, "\x00ab", miss)]),
+    sparse_case("ab", 8, [sp(1, 3), sp(6, 5)], 15, [rd(100, "\x00ab", ueof)]),
+    sparse_case("abc", 3, [sp(1, 3), sp(6, 5)], 15, [rd(100, "\x00abc\x00\x00", miss)]),
+    sparse_case("abc", 8, [sp(1, 3), sp(6, 5)], 15, [rd(100, "\x00abc\x00\x00", ueof)]),
+    sparse_case("abcde", 5, [sp(1, 3), sp(6, 5)], 15, [rd(100, "\x00abc\x00\x00de", miss)]),
+    sparse_case("abcde", 5, [sp(1, 3), sp(6, 5)], 15, [wt("\x00abc\x00\x00de", miss)]),
+    sparse_case("abcde", 8, [sp(1, 3), sp(6, 5)], 15, [rd(100, "\x00abc\x00\x00de", ueof)]),
+    sparse_case("abcdefghEXTRA", 13, [sp(1, 3), sp(6, 5)], 15, rem(15, 13) + [rd(100, "\x00abc\x00\x00defgh\x00\x00\x00\x00", unref), wt("", unref)] + rem(0, 5)),
+    sparse_case("abcdefghEXTRA", 13, [sp(1, 3), sp(6, 5)], 15, rem(15, 13) + [wt("\x00abc\x00\x00defgh\x00\x00\x00\x00", unref), rd(100, "", unref)] + rem(0, 5)),
+  ]
+  i = 0
+  for v in vectors {
+    tr = new_reader(NonEmptyReader.new(r: bytes.new_reader(b(v.data))))
+    tr.set_reg!(v.size)
+    if v.sparse {
+      assert validate_sparse_entries(v.spd, v.lsize), "invalid sparse map"
+      tr.set_sparse!(invert_sparse_entries(v.spd, v.lsize))
+    }
+    j = 0
+    for op in v.ops {
+      if op[0] == 0 {
+        buf: [Byte] = [0; op[1]]
+        n, err = tr.cur_read!(buf)
+        got = Str.from_bytes(buf[0...n])
+        msg = ""
+        if e = err {
+          msg = e.message
+        }
+        assert got == op[2] && msg == op[3], "test #{i}.#{j}, read(#{op[1]}): got (#{strconv.quote(got)}, #{msg}), want (#{strconv.quote(op[2])}, #{op[3]})"
+      } else if op[0] == 1 {
+        out = bytes.new_buffer([])
+        cnt, err = file_write_to(tr, out)
+        msg = ""
+        if e = err {
+          msg = e.message
+        }
+        assert out.to_s == op[2] && msg == op[3] && cnt == op[2].size, "test #{i}.#{j}, write_to: got (#{strconv.quote(out.to_s)}, #{msg}), want (#{strconv.quote(op[2])}, #{op[3]})"
+      } else if op[0] == 2 {
+        assert_eq tr.logical_remaining, op[1]
+      } else {
+        assert_eq tr.physical_remaining, op[1]
+      }
+      j += 1
+    }
+    i += 1
+  }
+}
+
+# Go's fileReader.WriteTo without a seeker: io.Copy of the entry.
+def file_write_to[R](tr: Reader[R], w: bytes.Buffer) -> (Int, Error?) {
+  buf: [Byte] = [0; 32 * 1024]
+  total = 0
+  loop {
+    n, err = tr.cur_read!(buf)
+    if n > 0 {
+      ww = w
+      ww.write!(buf[0...n])
+      total += n
+    }
+    return (total, err) if err.some?
+    return (total, none) if n == 0
+  }
+}
+
+test "insecure paths" {
+  for p in ["../foo", "/foo", "a/b/../../../c"] {
+    buf = bytes.new_buffer([])
+    tw = new_writer(buf)
+    tw.write_header!(Header.new(name: p))
+    tw.write_header!(Header.new(name: "secure"))
+    tw.close!
+    tr = new_reader(buf)
+    tr.insecure_path_check!(true)
+    r = tr.next!
+    if e = r.err {
+      assert_eq e.message, "archive/tar: insecure file path"
+      case e {
+        TarError.InsecurePath(name) => assert_eq name, p
+        _ => assert false, "want InsecurePath"
+      }
+    } else {
+      assert false, "next! for #{p}: want InsecurePath"
+    }
+    # Not sticky.
+    h = tr.~next!
+    assert_eq h.unwrap.name, "secure"
+  }
+}
+
+test "disable insecure path check" {
+  buf = bytes.new_buffer([])
+  tw = new_writer(buf)
+  tw.~write_header!(Header.new(name: "/foo"))
+  tw.~close!
+  tr = new_reader(buf)
+  h = tr.~next!
+  assert_eq h.unwrap.name, "/foo"
+}

@@ -1,0 +1,189 @@
+# Helpers for the tar tests (the generated vectors use them too).
+
+import "bytes"
+import "compress/bzip2"
+import "crypto/sha256"
+import "encoding/base64"
+import "encoding/hex"
+import "hash/crc32"
+import "os"
+import "strings"
+
+# The bytes of testdata/name; a .base64 file is decoded (Go's
+# obscuretestdata).
+def testdata_bytes(name: Str) -> ~[Byte] {
+  data = os.~read_file("testdata/" + name)
+  if strings.has_suffix(name, ".base64") {
+    s = strings.replace_all(Str.from_bytes(data), "\n", "")
+    return base64.std_encoding.~decode_string(s)
+  }
+  data
+}
+
+def hex32(v: U32) -> Str {
+  digits = "0123456789abcdef"
+  out: [Byte] = []
+  i = 7
+  while i >= 0 {
+    out << digits[((v >> (i * 4).as_u32) & 15).to_i]
+    i -= 1
+  }
+  Str.from_bytes(out)
+}
+
+def sha256_hex(b: [Byte]) -> Str {
+  s = sha256.sum256(b)
+  out: [Byte] = []
+  for c in s {
+    out << c
+  }
+  hex.encode_to_string(out)
+}
+
+def map_str(m: Map[Str, Str]) -> Str {
+  parts: [Str] = []
+  for k in m.keys.sort {
+    parts << "#{k}=#{m[k] || ""}"
+  }
+  "{" + strings.join(parts, ", ") + "}"
+}
+
+def map_eq?(a: Map[Str, Str], b: Map[Str, Str]) -> Bool {
+  return false if a.size != b.size
+  for k in a.keys {
+    v = b[k]
+    return false if v.none?
+    return false if v.unwrap != (a[k] || "")
+  }
+  true
+}
+
+# The first field where got and want differ, or "".
+def header_diff(got: Header, want: Header) -> Str {
+  return "typeflag: got #{got.typeflag}, want #{want.typeflag}" if got.typeflag != want.typeflag
+  return "name: got #{got.name}, want #{want.name}" if got.name != want.name
+  return "linkname: got #{got.linkname}, want #{want.linkname}" if got.linkname != want.linkname
+  return "size: got #{got.size}, want #{want.size}" if got.size != want.size
+  return "mode: got #{got.mode}, want #{want.mode}" if got.mode != want.mode
+  return "uid: got #{got.uid}, want #{want.uid}" if got.uid != want.uid
+  return "gid: got #{got.gid}, want #{want.gid}" if got.gid != want.gid
+  return "uname: got #{got.uname}, want #{want.uname}" if got.uname != want.uname
+  return "gname: got #{got.gname}, want #{want.gname}" if got.gname != want.gname
+  return "mod_time: got #{got.mod_time}, want #{want.mod_time}" if got.mod_time != want.mod_time
+  return "access_time: got #{got.access_time}, want #{want.access_time}" if got.access_time != want.access_time
+  return "change_time: got #{got.change_time}, want #{want.change_time}" if got.change_time != want.change_time
+  return "devmajor: got #{got.devmajor}, want #{want.devmajor}" if got.devmajor != want.devmajor
+  return "devminor: got #{got.devminor}, want #{want.devminor}" if got.devminor != want.devminor
+  return "xattrs: got #{map_str(got.xattrs)}, want #{map_str(want.xattrs)}" if !map_eq?(got.xattrs, want.xattrs)
+  return "pax_records: got #{map_str(got.pax_records)}, want #{map_str(want.pax_records)}" if !map_eq?(got.pax_records, want.pax_records)
+  return "format: got #{got.format}, want #{want.format}" if got.format != want.format
+  ""
+}
+
+# Reads testdata/file to the end, as Go's TestReader: the headers, the
+# CRC-32 of each entry's data (read 8 bytes at a time) if with_sums, and the
+# error that ended it ("" for none).
+def check_reader(file: Str, want: [Header], sums: [Str], with_sums: Bool, want_err: Str) -> ~Unit {
+  data = ~testdata_bytes(file)
+  if strings.contains(file, ".bz2") {
+    ~check_reader_on(file, bzip2.new_reader(bytes.new_reader(data)), want, sums, with_sums, want_err)
+  } else {
+    ~check_reader_on(file, bytes.new_reader(data), want, sums, with_sums, want_err)
+  }
+}
+
+def check_reader_on[R](file: Str, r: R, want: [Header], sums: [Str], with_sums: Bool, want_err: Str) -> ~Unit {
+  tr = new_reader(r)
+  got: [Header] = []
+  got_sums: [Str] = []
+  err = ""
+  loop {
+    n = tr.next!
+    if e = n.err {
+      err = e.message
+      break
+    }
+    h = n.unwrap
+    break if h.none?
+    got << h.unwrap
+    next if !with_sums
+    crc: U32 = 0
+    # 8 bytes at a time, as Go's test (big sparse files in big reads).
+    bn = h.unwrap.size > (1 << 20) ? 1 << 16 : 8
+    buf: [Byte] = [0; bn]
+    failed = false
+    loop {
+      rr = tr.read!(buf)
+      if e = rr.err {
+        err = e.message
+        failed = true
+        break
+      }
+      k = rr.unwrap
+      break if k == 0
+      crc = crc32.update(crc, crc32.ieee_table(), buf[0...k])
+    }
+    break if failed
+    got_sums << hex32(crc)
+  }
+  i = 0
+  while i < got.size && i < want.size {
+    d = header_diff(got[i], want[i])
+    assert d == "", "#{file} entry #{i}: #{d}"
+    i += 1
+  }
+  assert_eq got.size, want.size
+  assert_eq got_sums, sums
+  assert_eq err, want_err
+}
+
+# An entry for check_writer: a header and the data written after it.
+struct WEntry {
+  h: Header
+  data: Str
+}
+
+def msg_of(e: Error?) -> Str {
+  if x = e {
+    return x.message
+  }
+  ""
+}
+
+# Writes the entries as Go's writer vectors did: each step's error message
+# ("" for none), then the output's size and SHA-256.
+def check_writer(es: [WEntry], errs: [Str], close: Bool, close_err: Str, sum: Str, size: Int) -> ~Unit {
+  b = bytes.new_buffer([])
+  tw = new_writer(b)
+  got: [Str] = []
+  for e in es {
+    r = tw.write_header!(e.h)
+    got << msg_of(r.err)
+    if r.ok? && e.data != "" {
+      got << msg_of(tw.write!(e.data.bytes.to_a).err)
+    } else {
+      got << ""
+    }
+  }
+  if close {
+    assert_eq msg_of(tw.close!.err), close_err
+  }
+  assert_eq got, errs
+  out = b.bytes
+  assert_eq out.size, size
+  assert_eq sha256_hex(out), sum
+}
+
+def no_sp -> [SparseEntry] {
+  e: [SparseEntry] = []
+  e
+}
+
+def empty_map -> Map[Str, Str] {
+  m: Map[Str, Str] = {}
+  m
+}
+
+def sp_str(s: [SparseEntry]) -> Str {
+  "[" + strings.join(s.map { "{#{it.offset} #{it.length}}" }.to_a, " ") + "]"
+}

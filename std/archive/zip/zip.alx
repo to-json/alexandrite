@@ -1,0 +1,478 @@
+# Package zip: Go's archive/zip, reading and writing ZIP archives
+# (including ZIP64; no disk spanning).
+#
+#   Go                                      alx
+#   Store, Deflate (uint16)                 STORE, DEFLATE (U16)
+#   ErrFormat / ErrAlgorithm / ErrChecksum  ZipError.Format / Algorithm / Checksum /
+#     / ErrInsecurePath                       InsecurePath (others: see ZipError)
+#   FileHeader{Name, Comment, NonUTF8,      FileHeader (name, comment, non_utf8,
+#     CreatorVersion, ReaderVersion, Flags,   creator_version, reader_version, flags,
+#     Method, Modified, ModifiedTime,         method, modified, modified_time,
+#     ModifiedDate, CRC32, CompressedSize,    modified_date, crc32, compressed_size,
+#     UncompressedSize, CompressedSize64,     uncompressed_size, compressed_size64,
+#     UncompressedSize64, Extra,              uncompressed_size64, extra,
+#     ExternalAttrs}                          external_attrs), Go's integer types
+#   fh.FileInfo / Mode / SetMode /          fh.file_info / mode / set_mode! /
+#     ModTime / SetModTime                    mod_time / set_mod_time!
+#   FileInfoHeader(fi) (*FileHeader, error) file_info_header(fi) -> FileHeader
+#   NewReader(r io.ReaderAt, size)          new_reader(r, size) -> ~Reader[R]
+#   OpenReader(name) (*ReadCloser, error)   open_reader(name) -> ~Reader[os.File]
+#                                             (ReadCloser: Reader[os.File], with close!)
+#   r.File / r.Comment                      r.file ([File[R]]) / r.comment
+#   r.RegisterDecompressor(m, d)            r.register_decompressor!(m, d)
+#   r.Open(name) (fs.File, error)           r.open(name) -> ~fs.File (Reader is an fs.FS)
+#   f.FileHeader (embedded)                 f.header
+#   f.Open / OpenRaw / DataOffset           f.open -> ~FileReader (an fs.File) /
+#                                             open_raw -> ~SectionReader / data_offset
+#   NewWriter(w) *Writer                    new_writer(w) -> Writer[W]
+#   w.SetOffset / Flush / SetComment        w.set_offset! / flush! / set_comment!
+#   w.Close                                 w.close!
+#   w.Create / CreateHeader / CreateRaw     w.create!(name) / create_header!(fh) /
+#     (io.Writer, error)                      create_raw!(fh) -> ~FileWriter[W]
+#   w.Copy(f) / AddFS(fsys)                 w.copy!(f) / add_fs!(fsys)
+#   w.RegisterCompressor(m, c)              w.register_compressor!(m, c)
+#   Compressor func(io.Writer)              (bytes.Buffer) -> ~io.WriteCloser
+#     (io.WriteCloser, error)
+#   Decompressor func(io.Reader)            (SectionReader) -> ([Byte]) -> ~Int
+#     io.ReadCloser
+#   RegisterCompressor / RegisterDecompressor  not ported: per-Writer / per-Reader only
+#     (package-level)
+#
+# Differences from Go:
+#  - No package-level registry: alexandrite has no mutable package globals
+#    (port-issues #30), so RegisterCompressor and RegisterDecompressor exist
+#    only as the per-Writer / per-Reader methods. Store and Deflate are
+#    built in, as in Go.
+#  - A Compressor writes its output to a bytes.Buffer (the Writer drains it
+#    into the archive after each write and at close); it returns any
+#    io.WriteCloser. A Decompressor gets the compressed data as a
+#    SectionReader (an io.Reader) and returns a read function
+#    (`([Byte]) -> ~Int`, 0 at the end) rather than an io.ReadCloser: an alx
+#    interface value contains its implementors (GO-VS-RUBY D12), and the
+#    FileReader that holds the decompressor is itself an io.Reader, so the
+#    decompressor's state can't be an io.Reader value (nor capture one).
+#  - Reader, File and Writer are generic over what they read or write. R is
+#    anything with `read_at(p: [Byte], off: Int) -> ~Int` (a short count, 0
+#    at or past the end): os.File, bytes.Reader. W is any io.Writer.
+#    FileReader and SectionReader aren't generic (they read R through a
+#    closure).
+#  - FileReader.read! returns the data and reports a checksum, size or
+#    data descriptor problem at the end (the call that would return 0).
+#    Go's tests replace the CRC-32 hash to write and read multi-GiB files
+#    fast; here a private flag does (Writer and FileReader `fake_crc` /
+#    `fake_hash`), as does a hook for the central directory's size and
+#    offset (Go's testHookCloseSizeOffset).
+#  - The end of input is not an error (io's shape): reads return 0 at the
+#    end. Where Go's ReadAt reports io.EOF for a short read inside the
+#    archive, this port fails with io.StreamError.UnexpectedEof.
+#  - Go's GODEBUG zipinsecurepath=0 (new_reader returning the Reader with
+#    ErrInsecurePath) has no equivalent: call `r.check_paths` after
+#    new_reader, which fails with ZipError.InsecurePath for a non-local
+#    name or one with a backslash.
+#  - Writer.create_header! copies the FileHeader (Go takes ownership of the
+#    pointer and mutates it): the final header is in the archive and in
+#    `w.last_header`. Go's "invalid duplicate FileHeader" check (the same
+#    pointer twice) has no equivalent.
+#  - The writer's output is buffered as Go's (a 4096-byte bufio.Writer):
+#    flush! or close! writes it out.
+#  - SetOffset after data was written panics in Go; here too (an assert).
+#  - FileHeader.file_info is an fs.FileInfo struct (alx's io/fs): no Sys.
+#    file_info_header uses only name, size, mode and mod_time.
+#  - Reader.open builds its file list when the Reader is made (Go builds it
+#    on the first Open); later changes to r.file aren't seen by open.
+#  - Directory reads (read_dir!) end with an empty slice (io/fs's shape).
+
+import "io"
+import "io/fs"
+import "path"
+import "strings"
+import "time"
+import "unicode/utf8"
+
+# Compression methods.
+pub STORE: U16 = 0
+pub DEFLATE: U16 = 8
+
+FILE_HEADER_SIGNATURE: U32 = 0x04034b50
+DIRECTORY_HEADER_SIGNATURE: U32 = 0x02014b50
+DIRECTORY_END_SIGNATURE: U32 = 0x06054b50
+DIRECTORY64_LOC_SIGNATURE: U32 = 0x07064b50
+DIRECTORY64_END_SIGNATURE: U32 = 0x06064b50
+DATA_DESCRIPTOR_SIGNATURE: U32 = 0x08074b50
+FILE_HEADER_LEN = 30
+DIRECTORY_HEADER_LEN = 46
+DIRECTORY_END_LEN = 22
+DATA_DESCRIPTOR_LEN = 16
+DATA_DESCRIPTOR64_LEN = 24
+DIRECTORY64_LOC_LEN = 20
+DIRECTORY64_END_LEN = 56
+
+CREATOR_FAT: U16 = 0
+CREATOR_UNIX: U16 = 3
+CREATOR_NTFS: U16 = 11
+CREATOR_VFAT: U16 = 14
+CREATOR_MACOSX: U16 = 19
+
+ZIP_VERSION20: U16 = 20
+ZIP_VERSION45: U16 = 45
+
+UINT16MAX = 0xffff
+UINT32MAX = 0xffffffff
+U32MAX: U32 = 0xffffffff
+U64_32MAX: U64 = 0xffffffff
+
+ZIP64_EXTRA_ID: U16 = 0x0001
+NTFS_EXTRA_ID: U16 = 0x000a
+UNIX_EXTRA_ID: U16 = 0x000d
+EXT_TIME_EXTRA_ID: U16 = 0x5455
+INFO_ZIP_UNIX_EXTRA_ID: U16 = 0x5855
+
+# Errors of this package; messages are Go's.
+pub error ZipError {
+  # Go's ErrFormat.
+  Format
+  # Go's ErrAlgorithm.
+  Algorithm
+  # Go's ErrChecksum.
+  Checksum
+  # Go's ErrInsecurePath (from check_paths).
+  InsecurePath
+  NegativeSize
+  InvalidCommentLength
+  LongName
+  LongExtra
+  LongComment
+  WriterClosedTwice
+  WriteToDirectory
+  WriteToClosedFile
+  FileClosedTwice
+  NonRegularFile
+  # Two entries for one fs.FS name.
+  Duplicate(name: Str)
+  # A name read_dir! can't return.
+  InvalidFileName(name: Str)
+
+  def message -> Str {
+    case self {
+      Format => "zip: not a valid zip file"
+      Algorithm => "zip: unsupported compression algorithm"
+      Checksum => "zip: checksum error"
+      InsecurePath => "zip: insecure file path"
+      NegativeSize => "zip: size cannot be negative"
+      InvalidCommentLength => "zip: invalid comment length"
+      LongName => "zip: FileHeader.Name too long"
+      LongExtra => "zip: FileHeader.Extra too long"
+      LongComment => "zip: Writer.Comment too long"
+      WriterClosedTwice => "zip: writer closed twice"
+      WriteToDirectory => "zip: write to directory"
+      WriteToClosedFile => "zip: write to closed file"
+      FileClosedTwice => "zip: file closed twice"
+      NonRegularFile => "zip: cannot add non-regular file"
+      Duplicate(name) => "#{name}: duplicate entries in zip file"
+      InvalidFileName(name) => "invalid file name: #{name}"
+    }
+  }
+}
+
+# ------------------------------------------------------------ little endian
+
+def le16(b: [Byte], i: Int) -> U16 { b[i].as_u16 | (b[i + 1].as_u16 << 8) }
+
+def le32(b: [Byte], i: Int) -> U32 {
+  b[i].as_u32 | (b[i + 1].as_u32 << 8) | (b[i + 2].as_u32 << 16) | (b[i + 3].as_u32 << 24)
+}
+
+def le64(b: [Byte], i: Int) -> U64 { le32(b, i).as_u64 | (le32(b, i + 4).as_u64 << 32) }
+
+def put16(b: [Byte], i: Int, v: U16) {
+  b[i] = v.as_u8
+  b[i + 1] = (v >> 8).as_u8
+}
+
+def put32(b: [Byte], i: Int, v: U32) {
+  b[i] = v.as_u8
+  b[i + 1] = (v >> 8).as_u8
+  b[i + 2] = (v >> 16).as_u8
+  b[i + 3] = (v >> 24).as_u8
+}
+
+def put64(b: [Byte], i: Int, v: U64) {
+  put32(b, i, v.as_u32)
+  put32(b, i + 4, (v >> 32).as_u32)
+}
+
+# A cursor over a byte slice (Go's readBuf).
+struct ReadBuf {
+  b: [Byte]
+  i: Int
+
+  def len -> Int { b.size - i }
+  def u8! -> Byte {
+    v = b[i]
+    self.i += 1
+    v
+  }
+  def u16! -> U16 {
+    v = le16(b, i)
+    self.i += 2
+    v
+  }
+  def u32! -> U32 {
+    v = le32(b, i)
+    self.i += 4
+    v
+  }
+  def u64! -> U64 {
+    v = le64(b, i)
+    self.i += 8
+    v
+  }
+  def skip!(n: Int) {
+    self.i += n
+  }
+  def sub!(n: Int) -> ReadBuf {
+    s = ReadBuf.new(b: b[i...i + n], i: 0)
+    self.i += n
+    s
+  }
+}
+
+def read_buf(b: [Byte]) -> ReadBuf { ReadBuf.new(b: b, i: 0) }
+
+# ---------------------------------------------------------------- FileHeader
+
+# A file within a ZIP archive (Go's FileHeader). The 64-bit sizes are
+# always right; the 32-bit ones are 0xffffffff for ZIP64 files.
+pub struct FileHeader {
+  # A relative, slash-separated path; a trailing slash makes a directory.
+  name: Str
+  comment: Str
+  # Name and comment aren't UTF-8 (the writer otherwise sets the UTF-8 flag
+  # for valid UTF-8 that needs it).
+  non_utf8: Bool
+  creator_version: U16
+  reader_version: U16
+  flags: U16
+  # STORE (0) or DEFLATE, or a registered method.
+  method: U16
+  # The modification time (the zero Time: none; MS-DOS fields only).
+  modified: time.Time
+  # MS-DOS time and date (deprecated in Go: use modified).
+  modified_time: U16
+  modified_date: U16
+  crc32: U32
+  compressed_size: U32
+  uncompressed_size: U32
+  compressed_size64: U64
+  uncompressed_size64: U64
+  extra: [Byte]
+  external_attrs: U32
+
+  # The fs.FileInfo of the header (Go's FileInfo; no Sys).
+  pub def file_info -> fs.FileInfo {
+    size = uncompressed_size64 > 0 ? uncompressed_size64.to_i : uncompressed_size.to_i
+    mt = modified.is_zero ? self.mod_time : modified.utc
+    fs.FileInfo.new(name: path.base(name), size: size, mode: self.mode, mod_time: mt)
+  }
+
+  # The MS-DOS modification time, in UTC (Go's deprecated ModTime).
+  pub def mod_time -> time.Time {
+    ms_dos_time_to_time(modified_date, modified_time)
+  }
+
+  # Sets modified (in UTC) and the MS-DOS fields (Go's SetModTime).
+  pub def set_mod_time!(t: time.Time) {
+    u = t.utc
+    self.modified = u
+    d, tm = time_to_ms_dos_time(u)
+    self.modified_date = d
+    self.modified_time = tm
+  }
+
+  # The permission and mode bits (Go's Mode).
+  pub def mode -> fs.FileMode {
+    m = fs.mode(0)
+    c = creator_version >> 8
+    if c == CREATOR_UNIX || c == CREATOR_MACOSX {
+      m = unix_mode_to_file_mode(external_attrs >> 16)
+    } else if c == CREATOR_NTFS || c == CREATOR_VFAT || c == CREATOR_FAT {
+      m = msdos_mode_to_file_mode(external_attrs)
+    }
+    if name.size > 0 && name[name.size - 1] == 47 {
+      m = fs.mode(m.bits | fs.MODE_DIR)
+    }
+    m
+  }
+
+  # Sets the permission and mode bits (Go's SetMode).
+  pub def set_mode!(mode: fs.FileMode) {
+    self.creator_version = (creator_version & 0xff) | (CREATOR_UNIX << 8)
+    self.external_attrs = file_mode_to_unix_mode(mode) << 16
+    if mode.bits & fs.MODE_DIR != 0 {
+      self.external_attrs |= MSDOS_DIR
+    }
+    if mode.bits & 0o200 == 0 {
+      self.external_attrs |= MSDOS_READ_ONLY
+    }
+  }
+
+  def has_data_descriptor? -> Bool { flags & 0x8 != 0 }
+}
+
+# A partly filled FileHeader for fi (Go's FileInfoHeader): name (the base
+# name only), sizes, modification time and mode. Set method for
+# compression.
+pub def file_info_header(fi: fs.FileInfo) -> FileHeader {
+  fh = FileHeader.new(name: fi.name, uncompressed_size64: fi.size.as_u64)
+  fh.set_mod_time!(fi.mod_time)
+  fh.set_mode!(fi.mode)
+  if fh.uncompressed_size64 > U64_32MAX {
+    fh.uncompressed_size = U32MAX
+  } else {
+    fh.uncompressed_size = fh.uncompressed_size64.as_u32
+  }
+  fh
+}
+
+# A fixed zone for an offset, rounded to 15 minutes; 0 if implausible
+# (Go's timeZone).
+def time_zone(offset: time.Duration) -> time.Location {
+  o = offset.round(time.minute * 15)
+  ns = o.nanoseconds
+  ns = 0 if ns < -12 * 3600 * 1000000000 || ns > 14 * 3600 * 1000000000
+  time.fixed_zone("", ns / 1000000000)
+}
+
+# An MS-DOS date and time as a UTC Time (2s resolution).
+def ms_dos_time_to_time(dos_date: U16, dos_time: U16) -> time.Time {
+  time.date((dos_date >> 9).to_i + 1980, ((dos_date >> 5) & 0xf).to_i, (dos_date & 0x1f).to_i, (dos_time >> 11).to_i, ((dos_time >> 5) & 0x3f).to_i, (dos_time & 0x1f).to_i * 2, 0, time.utc)
+}
+
+# A Time as an MS-DOS (date, time), in t's zone.
+def time_to_ms_dos_time(t: time.Time) -> (U16, U16) {
+  d = (t.day + (t.month << 5) + ((t.year - 1980) << 9)).as_u16
+  tm = (t.second / 2 + (t.minute << 5) + (t.hour << 11)).as_u16
+  (d, tm)
+}
+
+S_IFMT: U32 = 0xf000
+S_IFSOCK: U32 = 0xc000
+S_IFLNK: U32 = 0xa000
+S_IFREG: U32 = 0x8000
+S_IFBLK: U32 = 0x6000
+S_IFDIR: U32 = 0x4000
+S_IFCHR: U32 = 0x2000
+S_IFIFO: U32 = 0x1000
+S_ISUID: U32 = 0x800
+S_ISGID: U32 = 0x400
+S_ISVTX: U32 = 0x200
+MSDOS_DIR: U32 = 0x10
+MSDOS_READ_ONLY: U32 = 0x01
+
+def msdos_mode_to_file_mode(m: U32) -> fs.FileMode {
+  bits: U32 = 0o666
+  if m & MSDOS_DIR != 0 {
+    bits = fs.MODE_DIR | 0o777
+  }
+  if m & MSDOS_READ_ONLY != 0 {
+    bits = bits & 0xffffff6d
+  }
+  fs.mode(bits)
+}
+
+def file_mode_to_unix_mode(mode: fs.FileMode) -> U32 {
+  t = mode.bits & fs.MODE_TYPE
+  m = S_IFREG
+  if t == fs.MODE_DIR {
+    m = S_IFDIR
+  } else if t == fs.MODE_SYMLINK {
+    m = S_IFLNK
+  } else if t == fs.MODE_NAMED_PIPE {
+    m = S_IFIFO
+  } else if t == fs.MODE_SOCKET {
+    m = S_IFSOCK
+  } else if t == fs.MODE_DEVICE {
+    m = S_IFBLK
+  } else if t == fs.MODE_DEVICE | fs.MODE_CHAR_DEVICE {
+    m = S_IFCHR
+  }
+  m |= S_ISUID if mode.bits & fs.MODE_SETUID != 0
+  m |= S_ISGID if mode.bits & fs.MODE_SETGID != 0
+  m |= S_ISVTX if mode.bits & fs.MODE_STICKY != 0
+  m | (mode.bits & 0o777)
+}
+
+def unix_mode_to_file_mode(m: U32) -> fs.FileMode {
+  bits = m & 0o777
+  t = m & S_IFMT
+  if t == S_IFBLK {
+    bits |= fs.MODE_DEVICE
+  } else if t == S_IFCHR {
+    bits |= fs.MODE_DEVICE | fs.MODE_CHAR_DEVICE
+  } else if t == S_IFDIR {
+    bits |= fs.MODE_DIR
+  } else if t == S_IFIFO {
+    bits |= fs.MODE_NAMED_PIPE
+  } else if t == S_IFLNK {
+    bits |= fs.MODE_SYMLINK
+  } else if t == S_IFSOCK {
+    bits |= fs.MODE_SOCKET
+  }
+  bits |= fs.MODE_SETGID if m & S_ISGID != 0
+  bits |= fs.MODE_SETUID if m & S_ISUID != 0
+  bits |= fs.MODE_STICKY if m & S_ISVTX != 0
+  fs.mode(bits)
+}
+
+# Whether s is valid UTF-8, and whether it must be taken as UTF-8 (not
+# compatible with CP-437 / ASCII) (Go's detectUTF8).
+def detect_utf8(s: Str) -> (Bool, Bool) {
+  needed = false
+  i = 0
+  while i < s.size {
+    r, size = utf8.decode_rune_at(s, i)
+    i += size
+    if r < 0x20 || r > 0x7d || r == 0x5c {
+      if !utf8.valid_rune(r) || (r == 0xfffd && size == 1) {
+        return (false, false)
+      }
+      needed = true
+    }
+  }
+  (true, needed)
+}
+
+# Go's filepath.IsLocal (Unix).
+def is_local(p: Str) -> Bool {
+  return false if p == "" || p[0] == 47
+  has_dots = false
+  for part in strings.split(p, "/") {
+    if part == "." || part == ".." {
+      has_dots = true
+      break
+    }
+  }
+  q = has_dots ? path.clean(p) : p
+  !(q == ".." || q.start_with?("../"))
+}
+
+# Reads exactly p.size bytes at off from r, or fails (UnexpectedEof).
+def read_full_at[R](r: R, p: [Byte], off: Int) -> ~Unit {
+  done = 0
+  while done < p.size {
+    n = r.~read_at(p[done...p.size], off + done)
+    fail io.StreamError.UnexpectedEof if n <= 0
+    done += n
+  }
+}
+
+# Reads up to p.size bytes at off; returns the count (short at the end).
+def read_at_most[R](r: R, p: [Byte], off: Int) -> ~Int {
+  done = 0
+  while done < p.size {
+    n = r.~read_at(p[done...p.size], off + done)
+    break if n <= 0
+    done += n
+  }
+  done
+}

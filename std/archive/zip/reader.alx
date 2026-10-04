@@ -1,0 +1,728 @@
+# Reading ZIP archives (Go's reader.go).
+
+import "compress/flate"
+import "io"
+import "io/fs"
+import "os"
+import "path"
+import "slices"
+import "strings"
+import "time"
+
+# ------------------------------------------------------------ SectionReader
+
+# Reads a section of the archive (Go's io.SectionReader over the
+# archive's io.ReaderAt, as File.open_raw returns it, and what a
+# decompressor reads); copies share the position.
+pub struct SectionReader {
+  ra: ([Byte], Int) -> ~Int
+  base: Int
+  limit: Int
+  st: [Int]
+
+  pub def read!(p: [Byte]) -> ~Int {
+    off = st[0]
+    return 0 if off >= limit || p.size == 0
+    n = p.size
+    n = limit - off if n > limit - off
+    m = ra.~call(p[0...n], off)
+    return 0 if m <= 0
+    self.st[0] = off + m
+    m
+  }
+
+  # The size of the section.
+  pub def size -> Int { limit - base }
+}
+
+def section[R](r: R, off: Int, n: Int) -> SectionReader {
+  ra = ->(p: [Byte], at: Int) -> ~Int { r.~read_at(p, at) }
+  SectionReader.new(ra: ra, base: off, limit: off + n, st: [off])
+}
+
+# ------------------------------------------------------------ decompressors
+
+def store_decompressor(r: SectionReader) -> ([Byte]) -> ~Int {
+  src = r
+  ->(p: [Byte]) -> ~Int { src.~read!(p) }
+}
+
+def flate_decompressor(r: SectionReader) -> ([Byte]) -> ~Int {
+  fr = flate.new_reader(r)
+  ->(p: [Byte]) -> ~Int { fr.~read!(p) }
+}
+
+def builtin_decompressor(method: U16) -> ((SectionReader) -> ([Byte]) -> ~Int)? {
+  return store_decompressor if method == STORE
+  return flate_decompressor if method == DEFLATE
+  none
+}
+
+# ---------------------------------------------------------------------- File
+
+# A file in a ZIP archive: its header and where its data is.
+pub struct File[R] {
+  header: FileHeader
+  zipr: R
+  # Includes the archive's base offset.
+  header_offset: Int
+  # The Reader's registered decompressors (shared with it).
+  decompressors: Map[U16, (SectionReader) -> ([Byte]) -> ~Int]
+
+  # The offset of the file's (possibly compressed) data from the start of
+  # the archive (Go's DataOffset).
+  pub def data_offset -> ~Int {
+    header_offset + ~find_body_offset
+  }
+
+  # A reader of the file's content, decompressed and checked (Go's Open).
+  pub def open -> ~FileReader {
+    body = ~find_body_offset
+    if header.name.end_with?("/") {
+      # A directory has no data; tolerate a compressed size with no
+      # uncompressed size (Java's jar tool).
+      err: Error? = none
+      err = ZipError.Format if header.uncompressed_size64 != 0
+      return FileReader.new(src: empty_src, f: header, desr: none, dir: true, st: [FileReaderState.new(nread: 0, digest: 0, err: err, done: err.none?, fake_hash: false)])
+    }
+    size = header.compressed_size64.to_i
+    r = section(zipr, header_offset + body, size)
+    dcomp = decompressors[header.method] || builtin_decompressor(header.method)
+    fail ZipError.Algorithm if dcomp.none?
+    src = dcomp.unwrap.call(r)
+    desr: SectionReader? = none
+    if header.has_data_descriptor? {
+      desr = section(zipr, header_offset + body + size, DATA_DESCRIPTOR_LEN)
+    }
+    FileReader.new(src: src, f: header, desr: desr, dir: false, st: [FileReaderState.new(nread: 0, digest: 0, err: none, done: false, fake_hash: false)])
+  }
+
+  # A reader of the file's raw (compressed) data (Go's OpenRaw).
+  pub def open_raw -> ~SectionReader {
+    body = ~find_body_offset
+    section(zipr, header_offset + body, header.compressed_size64.to_i)
+  }
+
+  def find_body_offset -> ~Int {
+    buf: [Byte] = [0; FILE_HEADER_LEN]
+    ~read_full_at(zipr, buf, header_offset)
+    fail ZipError.Format if le32(buf, 0) != FILE_HEADER_SIGNATURE
+    filename_len = le16(buf, 26).to_i
+    extra_len = le16(buf, 28).to_i
+    FILE_HEADER_LEN + filename_len + extra_len
+  }
+
+  # The file's mode (its header's).
+  pub def mode -> fs.FileMode { header.mode }
+}
+
+def empty_src -> ([Byte]) -> ~Int {
+  ->(p: [Byte]) -> ~Int { 0 }
+}
+
+struct FileReaderState {
+  nread: U64
+  digest: U32
+  # Sticky error; done: the end was reached and checked.
+  err: Error?
+  done: Bool
+  # Tests: skip the CRC-32 (Go's tests swap in a fake hash).
+  fake_hash: Bool
+}
+
+# The content of a File (Go's checksumReader / dirReader, returned by
+# File.open and Reader.open): read! decompresses and, at the end, checks
+# the size and CRC-32 (ZipError.Checksum, ZipError.Format, or
+# io.StreamError.UnexpectedEof for a short file). An fs.File.
+pub struct FileReader {
+  src: ([Byte]) -> ~Int
+  f: FileHeader
+  desr: SectionReader?
+  dir: Bool
+  st: [FileReaderState]
+
+  pub def stat -> ~fs.FileInfo { f.file_info }
+
+  pub def read!(p: [Byte]) -> ~Int {
+    if e = st[0].err {
+      fail e
+    }
+    return 0 if st[0].done || p.size == 0
+    n = src.~call(p)
+    if n > 0 {
+      self.st[0].digest = crc32_update(st[0].digest, p[0...n]) if !st[0].fake_hash
+      self.st[0].nread += n.as_u64
+      fail ZipError.Format if st[0].nread > f.uncompressed_size64
+      return n
+    }
+    # The end: check what was read.
+    err: Error? = none
+    if st[0].nread != f.uncompressed_size64 {
+      err = io.StreamError.UnexpectedEof
+    } else if d = desr {
+      r = read_data_descriptor(d, f)
+      if e = r.err {
+        err = e
+      } else if !st[0].fake_hash && st[0].digest != f.crc32 {
+        err = ZipError.Checksum
+      }
+    } else if !st[0].fake_hash && f.crc32 != 0 && st[0].digest != f.crc32 {
+      err = ZipError.Checksum
+    }
+    self.st[0].done = true
+    if e = err {
+      self.st[0].err = e
+      fail e
+    }
+    0
+  }
+
+  pub def close! -> ~Unit {}
+
+  # fs.File's read_dir! (a file isn't a directory).
+  pub def read_dir!(n: Int) -> ~[fs.DirEntry] {
+    fail fs.path_error("readdir", f.name, "not implemented")
+  }
+}
+
+def read_data_descriptor(r: SectionReader, f: FileHeader) -> ~Unit {
+  buf: [Byte] = [0; DATA_DESCRIPTOR_LEN]
+  rd = r
+  fail io.StreamError.UnexpectedEof if ~io.read_full(rd, buf[0...4]) < 4
+  off = 0
+  # The signature is optional: without it these 4 bytes are the CRC.
+  off = 4 if le32(buf, 0) != DATA_DESCRIPTOR_SIGNATURE
+  fail io.StreamError.UnexpectedEof if ~io.read_full(rd, buf[off...12]) < 12 - off
+  fail ZipError.Checksum if le32(buf, 0) != f.crc32
+  # The sizes that follow (32 or 64 bits) are ignored: the central
+  # directory has them.
+}
+
+# ---------------------------------------------------------------------- Reader
+
+# An entry of the fs.FS view: a file (idx into Reader.file) or a directory
+# (synthesised when idx < 0).
+struct FileListEntry {
+  name: Str
+  fh: FileHeader?
+  idx: Int
+  is_dir: Bool
+  is_dup: Bool
+
+  def stat -> ~fs.FileInfo {
+    fail ZipError.Duplicate(name: name) if is_dup
+    if !is_dir {
+      return fh.unwrap.file_info
+    }
+    _d, elem, _x = split(name)
+    mt = time.Time.new
+    if h = fh {
+      mt = h.modified.utc
+    }
+    fs.FileInfo.new(name: elem, size: 0, mode: fs.mode(fs.MODE_DIR | 0o555), mod_time: mt)
+  }
+}
+
+# An archive opened for reading (Go's Reader); also an fs.FS (open).
+pub struct Reader[R] {
+  r: R
+  # The files, in central directory order.
+  file: [File[R]]
+  comment: Str
+  decompressors: Map[U16, (SectionReader) -> ([Byte]) -> ~Int]
+  # Where the archive starts in r (JAR files with a script prefix).
+  base_offset: Int
+  file_list: [FileListEntry]
+
+  # Registers or overrides the decompressor for method in this Reader and
+  # its Files (Go's Reader.RegisterDecompressor).
+  pub def register_decompressor!(method: U16, dcomp: (SectionReader) -> ([Byte]) -> ~Int) {
+    self.decompressors[method] = dcomp
+  }
+
+  # Fails with ZipError.InsecurePath if a name isn't local (filepath's
+  # IsLocal) or has a backslash: Go's check under GODEBUG
+  # zipinsecurepath=0.
+  pub def check_paths -> ~Unit {
+    for f in file {
+      n = f.header.name
+      next if n == ""
+      fail ZipError.InsecurePath if !is_local(n) || strings.contains(n, "\\")
+    }
+  }
+
+  # Closes r (open_reader's os.File).
+  pub def close! -> ~Unit {
+    self.r.~close!
+  }
+
+  # Opens the named file or directory (fs.FS semantics: slash-separated,
+  # no leading / or ../).
+  pub def open(name: Str) -> ~fs.File {
+    fail fs.path_error("open", name, "invalid argument") if !fs.valid_path?(name)
+    e = open_lookup(name)
+    if en = e {
+      if en.is_dir {
+        return OpenDir.new(e: en, files: open_read_dir(name), st: [0])
+      }
+      return file[en.idx].~open
+    }
+    fail fs.path_error("open", name, "file does not exist")
+  }
+
+  def open_lookup(name: Str) -> FileListEntry? {
+    if name == "." {
+      return FileListEntry.new(name: "./", fh: none, idx: -1, is_dir: true, is_dup: false)
+    }
+    dir, elem, _x = split(name)
+    files = file_list
+    i, _f = slices.binary_search_func(files, dir) { |a, d|
+      idir, ielem, _y = split(a.name)
+      d != idir ? strings.compare(idir, d) : strings.compare(ielem, elem)
+    }
+    if i < files.size {
+      fname = files[i].name
+      if fname == name || (fname.size == name.size + 1 && fname[name.size] == 47 && fname[0...name.size] == name) {
+        return files[i]
+      }
+    }
+    none
+  }
+
+  def open_read_dir(dir: Str) -> [FileListEntry] {
+    files = file_list
+    i, _f = slices.binary_search_func(files, dir) { |a, d|
+      idir, _e, _y = split(a.name)
+      d != idir ? strings.compare(idir, d) : 1
+    }
+    j, _g = slices.binary_search_func(files, dir) { |a, d|
+      jdir, _e, _y = split(a.name)
+      d != jdir ? strings.compare(jdir, d) : -1
+    }
+    files[i...j]
+  }
+}
+
+# The open fs.File of a directory (Go's openDir); st[0] is the offset.
+pub struct OpenDir {
+  e: FileListEntry
+  files: [FileListEntry]
+  st: [Int]
+
+  pub def close! -> ~Unit {}
+  pub def stat -> ~fs.FileInfo { ~e.stat }
+  pub def read!(p: [Byte]) -> ~Int {
+    fail fs.path_error("read", e.name, "is a directory")
+  }
+
+  pub def read_dir!(count: Int) -> ~[fs.DirEntry] {
+    off = st[0]
+    n = files.size - off
+    n = count if count > 0 && n > count
+    out: [fs.DirEntry] = []
+    return out if n == 0
+    for i in 0...n {
+      s = files[off + i].~stat
+      if s.name == "." || !fs.valid_path?(s.name) {
+        fail fs.path_error("readdir", e.name, ZipError.InvalidFileName(name: files[off + i].name).message)
+      }
+      out << fs.file_info_to_dir_entry(s)
+    }
+    self.st[0] = off + n
+    out
+  }
+}
+
+def split(name: Str) -> (Str, Str, Bool) {
+  is_dir = name.end_with?("/")
+  n = is_dir ? name[0...name.size - 1] : name
+  i = strings.last_index_byte(n, 47)
+  return (".", n, is_dir) if i < 0
+  (n[0...i], n[i + 1...n.size], is_dir)
+}
+
+def file_entry_compare(x: Str, y: Str) -> Int {
+  xdir, xelem, _a = split(x)
+  ydir, yelem, _b = split(y)
+  return strings.compare(xdir, ydir) if xdir != ydir
+  strings.compare(xelem, yelem)
+}
+
+# Coerces name into a valid fs.FS name (Go's toValidName).
+def to_valid_name(name: Str) -> Str {
+  p = path.clean(strings.replace_all(name, "\\", "/"))
+  p = p[1...p.size] if p.start_with?("/")
+  while p.start_with?("../") {
+    p = p[3...p.size]
+  }
+  p
+}
+
+def build_file_list[R](files: [File[R]]) -> [FileListEntry] {
+  list: [FileListEntry] = []
+  by_file: Map[Str, Int] = {}
+  known_dirs: Map[Str, Int] = {}
+  dirs: Map[Str, Bool] = {}
+  dir_list: [Str] = []
+  idx = 0
+  for f in files {
+    fi = idx
+    idx += 1
+    fname = f.header.name
+    is_dir = fname.size > 0 && fname[fname.size - 1] == 47
+    name = to_valid_name(fname)
+    next if name == ""
+    if k = by_file[name] {
+      list[k].is_dup = true
+      next
+    }
+    if k = known_dirs[name] {
+      list[k].is_dup = true
+      next
+    }
+    dir = name
+    loop {
+      j = strings.last_index(dir, "/")
+      break if j < 0
+      dir = dir[0...j]
+      break if dirs.key?(dir)
+      dirs[dir] = true
+      dir_list << dir
+    }
+    at = list.size
+    list << FileListEntry.new(name: name, fh: f.header, idx: fi, is_dir: is_dir, is_dup: false)
+    if is_dir {
+      known_dirs[name] = at
+    } else {
+      by_file[name] = at
+    }
+  }
+  for dir in dir_list {
+    if !known_dirs.key?(dir) {
+      if k = by_file[dir] {
+        list[k].is_dup = true
+      } else {
+        list << FileListEntry.new(name: dir, fh: none, idx: -1, is_dir: true, is_dup: false)
+      }
+    }
+  }
+  slices.sort_func(list) { |a, b| file_entry_compare(a.name, b.name) }
+  list
+}
+
+# A Reader of the archive in r, which holds size bytes (Go's NewReader).
+pub def new_reader[R](r: R, size: Int) -> ~Reader[R] {
+  fail ZipError.NegativeSize if size < 0
+  end, base_offset = ~read_directory_end(r, size)
+  decomp: Map[U16, (SectionReader) -> ([Byte]) -> ~Int] = {}
+  files: [File[R]] = []
+  # Directory headers are read until a bad one; the count only has to
+  # match modulo 65536 (it is truncated to 16 bits).
+  off = base_offset + end.directory_offset.to_i
+  last_err: Error? = none
+  # Read the directory in chunks through a small buffered cursor.
+  cur = dir_cursor(r, off, size)
+  loop {
+    f = File[R].new(header: FileHeader.new(), zipr: r, header_offset: 0, decompressors: decomp)
+    res = read_directory_header(f, cur)
+    if e = res.err {
+      if is_format_or_eof(e) {
+        last_err = e
+        break
+      }
+      fail e
+    }
+    f2 = res.unwrap
+    f2.header_offset += base_offset
+    files << f2
+  }
+  if files.size.as_u16 != end.directory_records.as_u16 {
+    fail last_err.unwrap
+  }
+  z = Reader[R].new(r: r, file: files, comment: end.comment, decompressors: decomp, base_offset: base_offset, file_list: [])
+  z.file_list = build_file_list(files)
+  z
+}
+
+def is_format_or_eof(e: Error) -> Bool {
+  case e {
+    ZipError.Format => true
+    io.StreamError.UnexpectedEof => true
+    _ => false
+  }
+}
+
+# Opens the named archive file (Go's OpenReader); close! the Reader when
+# done.
+pub def open_reader(name: Str) -> ~Reader[os.File] {
+  f = ~os.open(name)
+  st = f.stat
+  if e = st.err {
+    fc = f
+    fc.close!
+    fail e
+  }
+  r = new_reader(f, st.unwrap.size)
+  if e = r.err {
+    fc = f
+    fc.close!
+    fail e
+  }
+  r.unwrap
+}
+
+# A buffered sequential reader of r from off (Go's bufio over a
+# SectionReader).
+struct CursorState {
+  off: Int
+  buf: [Byte]
+  at: Int
+}
+
+struct DirCursor[R] {
+  r: R
+  limit: Int
+  st: [CursorState]
+
+  # Reads exactly p.size bytes, or fails with UnexpectedEof.
+  def read_full!(p: [Byte]) -> ~Unit {
+    done = 0
+    while done < p.size {
+      if st[0].at >= st[0].buf.size {
+        off = st[0].off
+        n = limit - off
+        n = 4096 if n > 4096
+        fail io.StreamError.UnexpectedEof if n <= 0
+        b: [Byte] = [0; n]
+        m = ~read_at_most(r, b, off)
+        fail io.StreamError.UnexpectedEof if m == 0
+        self.st[0].buf = b[0...m]
+        self.st[0].at = 0
+        self.st[0].off = off + m
+      }
+      at = st[0].at
+      bf = st[0].buf
+      k = p.size - done
+      k = bf.size - at if k > bf.size - at
+      copy(p[done...done + k], bf[at...at + k])
+      self.st[0].at = at + k
+      done += k
+    }
+  }
+}
+
+def dir_cursor[R](r: R, off: Int, limit: Int) -> DirCursor[R] {
+  e: [Byte] = []
+  DirCursor[R].new(r: r, limit: limit, st: [CursorState.new(off: off, buf: e, at: 0)])
+}
+
+# Reads a central directory header into f (Go's readDirectoryHeader):
+# UnexpectedEof if it is incomplete, Format without a valid signature.
+def read_directory_header[R](f: File[R], cur: DirCursor[R]) -> ~File[R] {
+  buf: [Byte] = [0; DIRECTORY_HEADER_LEN]
+  c = cur
+  c.~read_full!(buf)
+  b = read_buf(buf)
+  fail ZipError.Format if b.u32! != DIRECTORY_HEADER_SIGNATURE
+  h = f.header
+  h.creator_version = b.u16!
+  h.reader_version = b.u16!
+  h.flags = b.u16!
+  h.method = b.u16!
+  h.modified_time = b.u16!
+  h.modified_date = b.u16!
+  h.crc32 = b.u32!
+  h.compressed_size = b.u32!
+  h.uncompressed_size = b.u32!
+  h.compressed_size64 = h.compressed_size.as_u64
+  h.uncompressed_size64 = h.uncompressed_size.as_u64
+  filename_len = b.u16!.to_i
+  extra_len = b.u16!.to_i
+  comment_len = b.u16!.to_i
+  b.skip!(4)
+  h.external_attrs = b.u32!
+  header_offset = b.u32!.to_i
+  d: [Byte] = [0; filename_len + extra_len + comment_len]
+  c.~read_full!(d)
+  h.name = Str.from_bytes(d[0...filename_len])
+  h.extra = d[filename_len...filename_len + extra_len]
+  h.comment = Str.from_bytes(d[filename_len + extra_len...d.size])
+
+  valid1, require1 = detect_utf8(h.name)
+  valid2, require2 = detect_utf8(h.comment)
+  if !valid1 || !valid2 {
+    h.non_utf8 = true
+  } else if !require1 && !require2 {
+    h.non_utf8 = false
+  } else {
+    h.non_utf8 = h.flags & 0x800 == 0
+  }
+
+  modified = time.Time.new
+  extra = read_buf(h.extra)
+  while extra.len >= 4 {
+    tag = extra.u16!
+    size = extra.u16!.to_i
+    break if extra.len < size
+    fb = extra.sub!(size)
+    if tag == ZIP64_EXTRA_ID {
+      # Consulted only for the fields that are maxed out.
+      if h.uncompressed_size == U32MAX {
+        fail ZipError.Format if fb.len < 8
+        h.uncompressed_size64 = fb.u64!
+      }
+      if h.compressed_size == U32MAX {
+        fail ZipError.Format if fb.len < 8
+        h.compressed_size64 = fb.u64!
+      }
+      if header_offset == UINT32MAX {
+        fail ZipError.Format if fb.len < 8
+        header_offset = fb.u64!.as_i64
+      }
+    } else if tag == NTFS_EXTRA_ID {
+      next if fb.len < 4
+      fb.skip!(4)
+      while fb.len >= 4 {
+        attr_tag = fb.u16!
+        attr_size = fb.u16!.to_i
+        break if fb.len < attr_size
+        ab = fb.sub!(attr_size)
+        next if attr_tag != 1 || attr_size != 24
+        ts = ab.u64!.as_i64
+        secs = ts / 10000000
+        nsecs = 100 * (ts % 10000000)
+        epoch = time.date(1601, 1, 1, 0, 0, 0, 0, time.utc)
+        modified = time.unix(epoch.unix + secs, nsecs)
+      }
+    } else if tag == UNIX_EXTRA_ID || tag == INFO_ZIP_UNIX_EXTRA_ID {
+      next if fb.len < 8
+      fb.skip!(4)
+      modified = time.unix(fb.u32!.to_i, 0)
+    } else if tag == EXT_TIME_EXTRA_ID {
+      next if fb.len < 5 || fb.u8! & 1 == 0
+      modified = time.unix(fb.u32!.to_i, 0)
+    }
+  }
+
+  msdos_modified = ms_dos_time_to_time(h.modified_date, h.modified_time)
+  h.modified = msdos_modified
+  if !modified.is_zero {
+    h.modified = modified.utc
+    # The offset between the MS-DOS and extended times is the zone (always
+    # a non-UTC zone, even at offset 0).
+    if h.modified_time != 0 || h.modified_date != 0 {
+      h.modified = modified.in_zone(time_zone(msdos_modified.sub(modified)))
+    }
+  }
+  out = f
+  out.header = h
+  out.header_offset = header_offset
+  out
+}
+
+# The end of central directory record.
+struct DirectoryEnd {
+  directory_records: U64
+  directory_size: U64
+  directory_offset: U64
+  comment: Str
+}
+
+def read_directory_end[R](r: R, size: Int) -> ~(DirectoryEnd, Int) {
+  buf: [Byte] = []
+  directory_end_offset = 0
+  found = false
+  for i in 0...2 {
+    blen = i == 0 ? 1024 : 65 * 1024
+    blen = size if blen > size
+    bb: [Byte] = [0; blen]
+    buf = bb
+    ~read_at_most(r, buf, size - blen)
+    p = find_signature_in_block(buf)
+    if p >= 0 {
+      buf = buf[p...buf.size]
+      directory_end_offset = size - blen + p
+      found = true
+      break
+    }
+    fail ZipError.Format if i == 1 || blen == size
+  }
+  fail ZipError.Format if !found
+  b = read_buf(buf[4...buf.size])
+  b.skip!(6)
+  d = DirectoryEnd.new()
+  d.directory_records = b.u16!.as_u64
+  d.directory_size = b.u32!.as_u64
+  d.directory_offset = b.u32!.as_u64
+  l = b.u16!.to_i
+  fail ZipError.InvalidCommentLength if l > b.len
+  d.comment = Str.from_bytes(b.b[b.i...b.i + l])
+
+  # ZIP64 when the values are maxed out.
+  if d.directory_records == 0xffff || d.directory_size == 0xffffffff || d.directory_offset == 0xffffffff {
+    p = ~find_directory64_end(r, directory_end_offset)
+    if p >= 0 {
+      directory_end_offset = p
+      d = ~read_directory64_end(r, p, d)
+    }
+  }
+  max_int64: U64 = 0x7fffffffffffffff
+  fail ZipError.Format if d.directory_size > max_int64 || d.directory_offset > max_int64
+  dsize = d.directory_size.to_i
+  doff = d.directory_offset.to_i
+  base_offset = directory_end_offset - dsize - doff
+  o = base_offset + doff
+  fail ZipError.Format if o < 0 || o >= size
+
+  # A non-zero base offset that would find a valid directory header at
+  # base 0 means the end record is wrong: use 0.
+  if base_offset > 0 {
+    cur = dir_cursor(r, doff, size)
+    dummy: Map[U16, (SectionReader) -> ([Byte]) -> ~Int] = {}
+    f = File[R].new(header: FileHeader.new(), zipr: r, header_offset: 0, decompressors: dummy)
+    base_offset = 0 if read_directory_header(f, cur).ok?
+  }
+  (d, base_offset)
+}
+
+# The offset of the ZIP64 end record from its locator before the end
+# record; -1 if there is none.
+def find_directory64_end[R](r: R, directory_end_offset: Int) -> ~Int {
+  loc_offset = directory_end_offset - DIRECTORY64_LOC_LEN
+  return -1 if loc_offset < 0
+  buf: [Byte] = [0; DIRECTORY64_LOC_LEN]
+  ~read_full_at(r, buf, loc_offset)
+  b = read_buf(buf)
+  return -1 if b.u32! != DIRECTORY64_LOC_SIGNATURE
+  return -1 if b.u32! != 0
+  p = b.u64!
+  return -1 if b.u32! != 1
+  p.as_i64
+}
+
+def read_directory64_end[R](r: R, offset: Int, d: DirectoryEnd) -> ~DirectoryEnd {
+  buf: [Byte] = [0; DIRECTORY64_END_LEN]
+  ~read_full_at(r, buf, offset)
+  b = read_buf(buf)
+  fail ZipError.Format if b.u32! != DIRECTORY64_END_SIGNATURE
+  b.skip!(12 + 8 + 8)
+  out = d
+  out.directory_records = b.u64!
+  out.directory_size = b.u64!
+  out.directory_offset = b.u64!
+  out
+}
+
+def find_signature_in_block(b: [Byte]) -> Int {
+  i = b.size - DIRECTORY_END_LEN
+  while i >= 0 {
+    if b[i] == 80 && b[i + 1] == 75 && b[i + 2] == 5 && b[i + 3] == 6 {
+      n = b[i + DIRECTORY_END_LEN - 2].to_i | (b[i + DIRECTORY_END_LEN - 1].to_i << 8)
+      # A truncated comment: reject (as Info-ZIP ignores it).
+      return -1 if n + DIRECTORY_END_LEN + i > b.size
+      return i
+    }
+    i -= 1
+  }
+  -1
+}

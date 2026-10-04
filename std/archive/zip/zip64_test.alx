@@ -1,0 +1,363 @@
+import "bytes"
+import "compress/gzip"
+import "io"
+import "os"
+import "strings"
+
+# Go's zip64_test.go and zip64_sparse_test.go: the testdata/zip64 goldens
+# (archives of 4-5 GiB from Info-ZIP, libarchive and Go 1.26, stored as
+# gzipped sparse files).
+
+struct SparseSpan {
+  offset: Int
+  data: [Byte]
+}
+
+# An archive as non-zero spans plus a size (Go's sparseFile); a ReaderAt.
+struct SparseFile {
+  size: Int
+  spans: [SparseSpan]
+
+  def read_at(p: [Byte], off: Int) -> ~Int {
+    fail "sparseFile: negative offset" if off < 0
+    return 0 if off >= size
+    stop = off + p.size
+    stop = size if stop > size
+    n = stop - off
+    for i in 0...n {
+      p[i] = 0
+    }
+    for s in spans {
+      s_end = s.offset + s.data.size
+      next if s_end <= off || s.offset >= stop
+      from = s.offset > off ? s.offset : off
+      to = s_end < stop ? s_end : stop
+      copy(p[from - off...to - off], s.data[from - s.offset...to - s.offset])
+    }
+    n
+  }
+
+  # The last keep bytes and where they start.
+  def materialize_tail(keep: Int) -> ([Byte], Int) {
+    k = keep > size ? size : keep
+    base = size - k
+    buf: [Byte] = [0; k]
+    self.read_at(buf, base)
+    (buf, base)
+  }
+}
+
+def read_sparse(data: [Byte]) -> ~SparseFile {
+  size = le64(data, 0).as_i64
+  n = le32(data, 8).to_i
+  fail "sparseFile: implausible span count #{n}" if n > 1 << 20
+  spans: [SparseSpan] = []
+  at = 12
+  for _i in 0...n {
+    off = le64(data, at).as_i64
+    sz = le32(data, at + 8).to_i
+    at += 12
+    spans << SparseSpan.new(offset: off, data: data[at...at + sz])
+    at += sz
+  }
+  SparseFile.new(size: size, spans: spans)
+}
+
+def read_sparse_file(p: Str) -> ~SparseFile {
+  f = ~os.open(p)
+  zr = ~gzip.new_reader(f)
+  z = zr.unwrap
+  data = io.~read_all(z)
+  f.~close!
+  ~read_sparse(data)
+}
+
+# Go's sparseBuffer: keeps the non-zero 4096-byte chunks written to it.
+struct SparseBuffer {
+  st: [SparseFile]
+
+  def write!(p: [Byte]) -> Int {
+    q = p
+    while q.size > 0 {
+      k = q.size < 4096 ? q.size : 4096
+      chunk = q[0...k]
+      if !all_zero?(chunk) {
+        f = st[0]
+        last = f.spans.size - 1
+        if last >= 0 && f.spans[last].offset + f.spans[last].data.size == f.size {
+          self.st[0].spans[last].data = f.spans[last].data + chunk
+        } else {
+          self.st[0].spans << SparseSpan.new(offset: f.size, data: bytes.clone(chunk))
+        }
+      }
+      self.st[0].size += k
+      q = q[k...q.size]
+    }
+    p.size
+  }
+}
+
+def all_zero?(b: [Byte]) -> Bool {
+  for c in b {
+    return false if c != 0
+  }
+  true
+}
+
+struct CdEntry {
+  name: Str
+  method: U16
+  reader_version: U16
+  raw_csize: U32
+  raw_usize: U32
+  raw_offset: U32
+  csize64: U64
+  usize64: U64
+  offset64: U64
+  # "usize", "csize", "offset" in the order of the Zip64 extra.
+  z64_extra_fields: [Str]
+}
+
+struct CdSnapshot {
+  entries: [CdEntry]
+  eocd_records: U16
+  eocd_size: U32
+  eocd_offset: U32
+  has_eocd64: Bool
+  eocd64_records: U64
+  eocd64_size: U64
+  eocd64_offset: U64
+}
+
+def find_eocd(data: [Byte]) -> ~Int {
+  fail "zip: too short for EOCD" if data.size < DIRECTORY_END_LEN
+  hi = data.size - DIRECTORY_END_LEN
+  lo = hi > UINT16MAX ? hi - UINT16MAX : 0
+  i = hi
+  while i >= lo {
+    if le32(data, i) == DIRECTORY_END_SIGNATURE {
+      cl = le16(data, i + 20).to_i
+      return i if i + DIRECTORY_END_LEN + cl == data.size
+    }
+    i -= 1
+  }
+  fail "zip: EOCD not found"
+}
+
+# Go's parseCD: the central directory and end records of the tail data,
+# which starts at base in the archive.
+def parse_cd(data: [Byte], base: Int) -> ~CdSnapshot {
+  sig_off = ~find_eocd(data)
+  snap = CdSnapshot.new()
+  snap.eocd_records = le16(data, sig_off + 10)
+  snap.eocd_size = le32(data, sig_off + 12)
+  snap.eocd_offset = le32(data, sig_off + 16)
+  dir_offset = snap.eocd_offset.to_i
+  n_records = snap.eocd_records.to_i
+  if sig_off >= DIRECTORY64_LOC_LEN {
+    loc_off = sig_off - DIRECTORY64_LOC_LEN
+    if le32(data, loc_off) == DIRECTORY64_LOC_SIGNATURE {
+      e64 = le64(data, loc_off + 8).as_i64
+      fail "zip: EOCD64 before captured tail" if e64 < base
+      d = e64 - base
+      fail "zip: EOCD64 offset out of range" if d + DIRECTORY64_END_LEN > data.size
+      fail "zip: EOCD64 signature mismatch" if le32(data, d) != DIRECTORY64_END_SIGNATURE
+      snap.has_eocd64 = true
+      snap.eocd64_records = le64(data, d + 32)
+      snap.eocd64_size = le64(data, d + 40)
+      snap.eocd64_offset = le64(data, d + 48)
+      dir_offset = snap.eocd64_offset.as_i64
+      n_records = snap.eocd64_records.as_i64
+    }
+  }
+  fail "zip: CD before captured tail" if dir_offset < base
+  off = dir_offset - base
+  for i in 0...n_records {
+    fail "zip: CD entry #{i} out of range" if off + DIRECTORY_HEADER_LEN > data.size
+    fail "zip: bad CD signature at offset #{off}" if le32(data, off) != DIRECTORY_HEADER_SIGNATURE
+    e = CdEntry.new()
+    e.reader_version = le16(data, off + 6)
+    e.method = le16(data, off + 10)
+    e.raw_csize = le32(data, off + 20)
+    e.raw_usize = le32(data, off + 24)
+    name_len = le16(data, off + 28).to_i
+    extra_len = le16(data, off + 30).to_i
+    comm_len = le16(data, off + 32).to_i
+    e.raw_offset = le32(data, off + 42)
+    rec_len = DIRECTORY_HEADER_LEN + name_len + extra_len + comm_len
+    fail "zip: CD entry #{i} truncated" if off + rec_len > data.size
+    name_off = off + DIRECTORY_HEADER_LEN
+    extra_off = name_off + name_len
+    e.name = Str.from_bytes(data[name_off...extra_off])
+    extra = data[extra_off...extra_off + extra_len]
+    e.csize64 = e.raw_csize.as_u64
+    e.usize64 = e.raw_usize.as_u64
+    e.offset64 = e.raw_offset.as_u64
+    while extra.size >= 4 {
+      tag = le16(extra, 0)
+      size = le16(extra, 2).to_i
+      break if 4 + size > extra.size
+      field = extra[4...4 + size]
+      extra = extra[4 + size...extra.size]
+      next if tag != ZIP64_EXTRA_ID
+      if e.raw_usize == U32MAX && field.size >= 8 {
+        e.usize64 = le64(field, 0)
+        e.z64_extra_fields << "usize"
+        field = field[8...field.size]
+      }
+      if e.raw_csize == U32MAX && field.size >= 8 {
+        e.csize64 = le64(field, 0)
+        e.z64_extra_fields << "csize"
+        field = field[8...field.size]
+      }
+      if e.raw_offset == U32MAX && field.size >= 8 {
+        e.offset64 = le64(field, 0)
+        e.z64_extra_fields << "offset"
+        field = field[8...field.size]
+      }
+    }
+    snap.entries << e
+    off += rec_len
+  }
+  snap
+}
+
+# Go's compareCDSnapshots: the mismatches (empty: equivalent).
+def compare_cd_snapshots(want: CdSnapshot, got: CdSnapshot) -> [Str] {
+  out: [Str] = []
+  if got.entries.size != want.entries.size {
+    out << "entry count = #{got.entries.size}, want #{want.entries.size}"
+    return out
+  }
+  for i in 0...want.entries.size {
+    we = want.entries[i]
+    ge = got.entries[i]
+    out << "entry #{i} #{we.name}: RawCSize = #{ge.raw_csize}, want #{we.raw_csize}" if we.raw_csize != ge.raw_csize
+    out << "entry #{i} #{we.name}: RawUSize = #{ge.raw_usize}, want #{we.raw_usize}" if we.raw_usize != ge.raw_usize
+    out << "entry #{i} #{we.name}: CSize64 = #{ge.csize64}, want #{we.csize64}" if we.csize64 != ge.csize64
+    out << "entry #{i} #{we.name}: USize64 = #{ge.usize64}, want #{we.usize64}" if we.usize64 != ge.usize64
+    out << "entry #{i} #{we.name}: RawOffset placeholder" if (we.raw_offset == U32MAX) != (ge.raw_offset == U32MAX)
+    out << "entry #{i} #{we.name}: Zip64 sub-field order = #{ge.z64_extra_fields}, want #{we.z64_extra_fields}" if we.z64_extra_fields != ge.z64_extra_fields
+    out << "entry #{i} #{we.name}: ReaderVersion = #{ge.reader_version}" if we.z64_extra_fields.size > 0 && ge.reader_version < ZIP_VERSION45
+  }
+  out << "EOCD records placeholder" if (want.eocd_records == 0xffff) != (got.eocd_records == 0xffff)
+  out << "EOCD size placeholder" if (want.eocd_size == U32MAX) != (got.eocd_size == U32MAX)
+  out << "EOCD offset placeholder" if (want.eocd_offset == U32MAX) != (got.eocd_offset == U32MAX)
+  out << "EOCD64 present = #{got.has_eocd64}, want #{want.has_eocd64}" if got.has_eocd64 != want.has_eocd64
+  if want.has_eocd64 && got.has_eocd64 && got.eocd64_records != want.eocd64_records {
+    out << "EOCD64 records = #{got.eocd64_records}, want #{want.eocd64_records}"
+  }
+  out
+}
+
+def check_reader_matches_snapshot(label: Str, f: SparseFile, snap: CdSnapshot) -> ~Unit {
+  zr = ~new_reader(f, f.size)
+  assert_eq zr.file.size, snap.entries.size
+  for i in 0...zr.file.size {
+    h = zr.file[i].header
+    want = snap.entries[i]
+    assert_eq h.name, want.name
+    assert_eq h.uncompressed_size64, want.usize64
+    assert_eq h.compressed_size64, want.csize64
+  }
+}
+
+# Go's reproduceCD: the golden's entries written by this Writer (multi-GiB
+# streams of zeros; Deflate entries raw with declared sizes).
+def reproduce_cd(golden: CdSnapshot) -> ~SparseFile {
+  e: [SparseSpan] = []
+  sb = SparseBuffer.new(st: [SparseFile.new(size: 0, spans: e)])
+  w = new_writer(sb)
+  for en in golden.entries {
+    if en.csize64 == en.usize64 {
+      fw = w.~create_header!(FileHeader.new(name: en.name, method: en.method))
+      w.st[0].fake_crc = true
+      ~write_zeros(fw, en.usize64.to_i)
+      next
+    }
+    fw = w.~create_raw!(FileHeader.new(name: en.name, method: en.method, compressed_size64: en.csize64, uncompressed_size64: en.usize64))
+    ~write_zeros(fw, en.csize64.to_i)
+  }
+  w.~close!
+  sb.st[0]
+}
+
+def expected_diff -> Map[Str, Bool] {
+  {
+    "infozip-store-4g-minus-1" => true,
+    "infozip-offset-eq-4g" => true,
+    "libarchive-deflate-zeros-5g" => true,
+    "libarchive-store-just-under-4g" => true,
+    "go126-store-5g" => true,
+    "go126-deflate-zeros-5g" => true,
+    "go126-store-4g-minus-1" => true,
+    "go126-store-4g-minus-2" => true,
+    "go126-store-exact-4g" => true,
+    "go126-offset-past-4g" => true,
+    "go126-offset-eq-4g" => true,
+    "go126-store-just-under-4g" => false,
+  }
+}
+
+def golden_names -> ~[Str] {
+  names: [Str] = []
+  for en in os.~read_dir("testdata/zip64") {
+    names << strings.trim_suffix(en.name, ".zsparse") if en.name.end_with?(".zsparse")
+  }
+  names
+}
+
+# The reader half of Go's TestZip64WriterCDGoldens: each golden parses and
+# new_reader agrees with it.
+test "zip64 goldens read" {
+  names = ~golden_names
+  assert_eq names.size, 24
+  for name in names {
+    sf = ~read_sparse_file("testdata/zip64/#{name}.zsparse")
+    data, base = sf.materialize_tail(1 << 20)
+    golden = ~parse_cd(data, base)
+    ~check_reader_matches_snapshot("golden", sf, golden)
+  }
+}
+
+# The writer half: replays each golden (multi-GiB writes; slow).
+test "zip64 writer cd goldens" {
+  return if !slow_tests?
+  diffs = expected_diff
+  for name in ~golden_names {
+    sf = ~read_sparse_file("testdata/zip64/#{name}.zsparse")
+    data, base = sf.materialize_tail(1 << 20)
+    golden = ~parse_cd(data, base)
+    ours = ~reproduce_cd(golden)
+    od, ob = ours.materialize_tail(1 << 20)
+    got = ~parse_cd(od, ob)
+    ~check_reader_matches_snapshot("reproduced", ours, got)
+    mism = compare_cd_snapshots(golden, got)
+    if diffs[name] || false {
+      assert mism.size > 0, "#{name}: expected this golden to fail equivalence, but it passed"
+    } else {
+      assert mism.size == 0, "#{name}: #{strings.join(mism, "; ")}"
+    }
+  }
+}
+
+test "zip64 lfh both placeholders" {
+  buf = bytes.new_buffer([])
+  w = new_writer(buf)
+  fh = FileHeader.new(name: "x", method: DEFLATE, compressed_size64: 1024, uncompressed_size64: 5 << 30)
+  fw = w.~create_raw!(fh)
+  ~write_zeros(fw, 1024)
+  w.~close!
+  bs = buf.bytes
+  assert_eq le32(bs, 14), fh.crc32
+  assert_eq le32(bs, 18), U32MAX
+  assert_eq le32(bs, 22), U32MAX
+  name_len = le16(bs, 26).to_i
+  extra_len = le16(bs, 28).to_i
+  assert_eq extra_len, 20
+  extra = bs[30 + name_len...30 + name_len + extra_len]
+  assert_eq le16(extra, 0), ZIP64_EXTRA_ID
+  assert_eq le16(extra, 2), 16
+  assert_eq le64(extra, 4), fh.uncompressed_size64
+  assert_eq le64(extra, 12), fh.compressed_size64
+}

@@ -1,0 +1,109 @@
+import "bytes"
+import "compress/flate"
+import "encoding/base64"
+import "io"
+import "os"
+import "strings"
+
+# Go's example_test.go and fuzz_test.go.
+
+example "Writer" {
+  buf = bytes.new_buffer([])
+  w = new_writer(buf)
+  files = [
+    ("readme.txt", "This archive contains some text files."),
+    ("gopher.txt", "Gopher names:\nGeorge\nGeoffrey\nGonzo"),
+    ("todo.txt", "Get animal handling licence.\nWrite more examples."),
+  ]
+  for file in files {
+    f = w.~create!(file[0])
+    f.~write!(b(file[1]))
+  }
+  w.~close!
+} outputs ""
+
+example "Reader" {
+  r = ~open_reader("testdata/readme.zip")
+  for f in r.file {
+    print "Contents of #{f.header.name}:\n"
+    rc = f.~open
+    buf = bytes.new_buffer([])
+    io.~copy_n(buf, rc, 68)
+    print buf.to_s
+    rc.~close!
+    print "\n"
+  }
+  r.~close!
+} outputs "Contents of README:\nThis is the source code repository for the Go programming language.\n"
+
+example "Writer_RegisterCompressor" {
+  buf = bytes.new_buffer([])
+  w = new_writer(buf)
+  # A custom Deflate compressor, at a higher level.
+  w.register_compressor!(DEFLATE, ->(out: bytes.Buffer) -> ~io.WriteCloser { ~flate.new_writer(out, flate.BEST_COMPRESSION) })
+  f = w.~create!("x.txt")
+  f.~write!(b("hello hello hello hello"))
+  w.~close!
+  r = ~reader_of(buf)
+  rc = r.file[0].~open
+  print Str.from_bytes(io.~read_all(rc))
+} outputs "hello hello hello hello"
+
+test "register decompressor" {
+  # A Reader-level decompressor overriding Store: upper-cases the data.
+  buf = bytes.new_buffer([])
+  w = new_writer(buf)
+  f = w.~create_header!(FileHeader.new(name: "a.txt", method: STORE))
+  f.~write!(b("abc"))
+  w.~close!
+  r = ~reader_of(buf)
+  r.register_decompressor!(STORE, ->(src: SectionReader) -> ([Byte]) -> ~Int {
+    s = src
+    ->(p: [Byte]) -> ~Int {
+      n = s.~read!(p)
+      for i in 0...n {
+        p[i] = p[i] - 32
+      }
+      n
+    }
+  })
+  rc = r.file[0].~open
+  # The CRC no longer matches the data.
+  res = io.read_all(rc)
+  assert_eq res.err.unwrap.message, "zip: checksum error"
+  # A method no one registered.
+  r.file[0].header.method = 77
+  assert_eq r.file[0].open.err.unwrap.message, "zip: unsupported compression algorithm"
+}
+
+# FuzzReader's property on its seed inputs (alx has no fuzzing): what
+# reads without error is written back.
+test "FuzzReader" {
+  for de in ~os.read_dir("testdata") {
+    next if de.is_dir
+    data = ~os.read_file("testdata/" + de.name)
+    if strings.has_suffix(de.name, ".base64") {
+      data = base64.std_encoding.~decode_string(strings.replace_all(Str.from_bytes(data), "\n", ""))
+    }
+    rr = new_reader(bytes.new_reader(data), data.size)
+    next if !rr.ok?
+    r = rr.unwrap
+    files: [(FileHeader, [Byte])] = []
+    for f in r.file {
+      fr = f.open
+      next if !fr.ok?
+      c = fr.unwrap
+      content = io.read_all(c)
+      next if !content.ok?
+      files << (f.header, content.unwrap)
+      r.open(f.header.name)
+    }
+    next if files.size == 0
+    w = new_writer(io.Discard.new())
+    for f in files {
+      ww = w.~create_header!(f[0])
+      ww.~write!(f[1])
+    }
+    w.~close!
+  }
+}

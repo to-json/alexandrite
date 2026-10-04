@@ -501,6 +501,7 @@ impl FnEmit<'_> {
             LE::ChanNew(t, cap) => format!("Chan::<{}>::new({})", rty(t), self.e(cap)),
             LE::ChanLen(c) => format!("({}).len()", self.e(c)),
             LE::LockNew => "AlxLock::default()".into(),
+            LE::NullTask(_) => "Default::default()".into(),
             LE::AtomicNew(v) => format!("AlxAtomic::new({})", self.e(v)),
             LE::AtomicLoad(a) => format!("({}).load()", self.e(a)),
             LE::AtomicRmw(AtomicOp::Add, a, v) => format!("({}).add({})", self.e(a), self.e(v)),

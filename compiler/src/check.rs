@@ -2302,6 +2302,11 @@ impl<'w, 'a> FnCx<'w, 'a> {
                 if !self.unify(&bin.ty, &pty) {
                     return Err(Diag::new(sp, format!("`{}=` on a {} place gives {}", op.text(), self.resolve(&pty).show(), self.resolve(&bin.ty).show())));
                 }
+                // Str and array `+=` concatenate: assign the whole sum (its
+                // storage is then placed like any assigned value's).
+                if *op == crate::ast::BinOp::Add && matches!(self.resolve(&pty), Ty::Str | Ty::Array(_)) {
+                    return Ok(self.mk(TK::PlaceAssign(id, steps, None, Box::new(bin)), pty, sp));
+                }
                 let TK::Bin(_, _, rhs) = bin.kind else { unreachable!() };
                 self.mk(TK::PlaceAssign(id, steps, Some(*op), rhs), pty, sp)
             }

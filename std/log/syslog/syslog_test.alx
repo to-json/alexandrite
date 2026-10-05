@@ -1,0 +1,369 @@
+# Go's syslog_test.go, translated: the writers talk to in-process servers
+# (unix, unixgram, udp, tcp) like Go's startServer.
+#
+# Differences from Go's tests:
+#  - The packet server sends each datagram to `done` as it arrives (Go's
+#    reads until a 100 ms read deadline expires and then sends everything it
+#    got as one string): net has no read deadlines yet. One message per
+#    datagram makes the checks the same; TestConcurrentWrite's channel holds
+#    all ten messages so the server never blocks.
+#  - The stream server's 5 s read deadline is left out (same reason); its
+#    connections end when the writers close them.
+#  - TestNew / TestNewLogger / TestDial use the system's syslog socket as
+#    Go's do, and skip (pass with a note) when there is none ("Unix syslog
+#    delivery error"); like Go's, TestNew and TestNewLogger send nothing.
+#  - check() matches with a regexp instead of fmt.Sscanf.
+#  - Go's ExampleDial has no output and dials localhost:1234 (it is compiled,
+#    not run); "example dial" does the same against a local server.
+
+import "bufio"
+import "log"
+import "net"
+import "os"
+import "regexp"
+import "sync"
+
+# A test server: its address, how to close it, and its tasks.
+struct TestServer {
+  addr: Str
+  pc: net.PacketConn?
+  l: net.Listener?
+  wg: sync.WaitGroup
+  dir: Str
+
+  # Go's sock.Close().
+  def close {
+    if p = pc {
+      pp = p
+      _ = pp.close!
+    }
+    if x = l {
+      ll = x
+      _ = ll.close!
+    }
+  }
+
+  # Go's srvWG.Wait().
+  def wait {
+    wg.wait
+  }
+
+  def cleanup {
+    _ = os.remove_all(dir) if dir != ""
+  }
+}
+
+# Go's runPktSyslog: each datagram to done, until the socket is closed.
+def run_pkt_syslog(c: net.PacketConn, done: Chan[Str]) {
+  pc = c
+  buf: [Byte] = [0; 4096]
+  loop {
+    r = pc.read_from!(buf)
+    break if r.err?
+    n, _ = r.unwrap
+    done << Str.from_bytes(buf[0...n])
+  }
+}
+
+# Go's runStreamSyslog: a task per connection sending each line to done
+# (with crashy, closing the connection after every 7 lines).
+def run_stream_syslog(l: net.Listener, done: Chan[Str], wg: sync.WaitGroup, crashy: Bool) {
+  loop {
+    r = l.accept
+    break if r.err?
+    c = r.unwrap
+    wg.add(1)
+    spawn {
+      cc = c
+      b = bufio.new_reader(cc)
+      ct = 1
+      while !crashy || ct & 7 != 0 {
+        s = b.read_string!(10)
+        break unless s.ok?
+        if line = s.unwrap {
+          done << line
+        } else {
+          break
+        }
+        ct += 1
+      }
+      _ = cc.close!
+      wg.done
+    }
+  }
+}
+
+# Go's startServer: a server on network n at la (a fresh temp socket path
+# for unix and unixgram if la is "", 127.0.0.1:0 for udp and tcp).
+def start_server(n: Str, la0: Str, done: Chan[Str], crashy: Bool) -> TestServer {
+  la = la0
+  dir = ""
+  if n == "udp" || n == "tcp" {
+    la = "127.0.0.1:0"
+  } else if la == "" {
+    # Short: sun_path holds ~104 bytes.
+    dir = os.mkdir_temp("", "").unwrap
+    la = dir + "/sock"
+  }
+  wg = sync.new_wait_group
+  if n == "udp" || n == "unixgram" {
+    pc = net.listen_packet(n, la).unwrap
+    wg.add(1)
+    spawn {
+      run_pkt_syslog(pc, done)
+      wg.done
+    }
+    return TestServer.new(addr: pc.local_addr, pc: pc, wg: wg, dir: dir)
+  }
+  l = net.listen(n, la).unwrap
+  wg.add(1)
+  spawn {
+    run_stream_syslog(l, done, wg, crashy)
+    wg.done
+  }
+  TestServer.new(addr: l.addr, l: l, wg: wg, dir: dir)
+}
+
+# Go's check: out is a well-formed message carrying `in`.
+def check(input: Str, out: Str, transport: Str) {
+  hostname = os.hostname.unwrap
+  q = regexp.quote_meta(input)
+  if transport == "unixgram" || transport == "unix" {
+    re = regexp.must_compile("^<#{LOG_USER + LOG_INFO}>\\S+ +\\S+ +\\S+ syslog_test\\[\\d+\\]: #{q}\\n$")
+    assert re.match_string?(out), "got #{out}, does not match #{re}"
+    return
+  }
+  re = regexp.must_compile("^<#{LOG_USER + LOG_INFO}>(\\S+) (\\S+) syslog_test\\[\\d+\\]: #{q}\\n$")
+  m = re.find_string_submatch(out) || []
+  assert m.size == 3, "got #{out}, does not match #{re}"
+  assert_eq m[2], hostname
+}
+
+test "with simulated" {
+  msg = "Test 123"
+  for tr in ["unix", "unixgram", "udp", "tcp"] {
+    done = Chan[Str].new(0)
+    srv = start_server(tr, "", done, false)
+    s = dial(tr, srv.addr, LOG_INFO | LOG_USER, "syslog_test").unwrap
+    s.info(msg).unwrap
+    check(msg, done.recv.unwrap, tr)
+    s.close.unwrap
+    srv.close
+    srv.wait
+    srv.cleanup
+  }
+}
+
+test "flap" {
+  network = "unix"
+  done = Chan[Str].new(0)
+  srv = start_server(network, "", done, false)
+  addr = srv.addr
+
+  s = dial(network, addr, LOG_INFO | LOG_USER, "syslog_test").unwrap
+  msg = "Moo 2"
+  s.info(msg).unwrap
+  check(msg, done.recv.unwrap, network)
+
+  # restart the server (closing the listener removed its socket file, as
+  # Go's does; Go also removes it by hand)
+  srv.close
+  _ = os.remove(addr)
+  srv2 = start_server(network, addr, done, false)
+
+  # and try retransmitting
+  msg = "Moo 3"
+  s.info(msg).unwrap
+  check(msg, done.recv.unwrap, network)
+
+  s.close.unwrap
+  srv2.close
+  srv.wait
+  srv2.wait
+  srv.cleanup
+}
+
+test "new" {
+  assert_eq LOG_LOCAL7, 23 << 3
+  r = new(LOG_INFO | LOG_USER, "the_tag")
+  if e = r.err {
+    if e.message == "Unix syslog delivery error" {
+      puts "skipping: syslogd not running"
+      return
+    }
+    assert false, "New() failed: #{e.message}"
+  }
+  # Don't send any messages.
+  r.unwrap.close.unwrap
+}
+
+test "new logger" {
+  r = new_logger(LOG_USER | LOG_INFO, 0)
+  if e = r.err {
+    if e.message == "Unix syslog delivery error" {
+      puts "skipping: syslogd not running"
+      return
+    }
+    assert false, e.message
+  }
+}
+
+test "dial" {
+  f = dial("", "", (LOG_LOCAL7 | LOG_DEBUG) + 1, "syslog_test")
+  assert f.err?, "Should have trapped bad priority"
+  assert_eq f.err.unwrap.message, "log/syslog: invalid priority"
+  f = dial("", "", -1, "syslog_test")
+  assert f.err?, "Should have trapped bad priority"
+  l = dial("", "", LOG_USER | LOG_ERR, "syslog_test")
+  if e = l.err {
+    if e.message == "Unix syslog delivery error" {
+      puts "skipping: syslogd not running"
+      return
+    }
+    assert false, "Dial() failed: #{e.message}"
+  }
+  l.unwrap.close.unwrap
+}
+
+test "write" {
+  hostname = os.hostname.unwrap
+  tests = [
+    (LOG_USER | LOG_ERR, "syslog_test", "", ""),
+    (LOG_USER | LOG_ERR, "syslog_test", "write test", "write test"),
+    # Write should not add \n if there already is one
+    (LOG_USER | LOG_ERR, "syslog_test", "write test 2\n", "write test 2"),
+  ]
+  for t in tests {
+    done = Chan[Str].new(0)
+    srv = start_server("udp", "", done, false)
+    l = dial("udp", srv.addr, t[0], t[1]).unwrap
+    n = l.write_string!(t[2]).unwrap
+    assert_eq n, t[2].size
+    rcvd = done.recv.unwrap
+    re = regexp.must_compile("^<#{t[0]}>(\\S+) (\\S+) syslog_test\\[(\\d+)\\]: #{regexp.quote_meta(t[3])}\\n$")
+    m = re.find_string_submatch(rcvd) || []
+    assert m.size == 4, "s.Info() = #{rcvd}, didn't match #{re}"
+    assert_eq m[2], hostname
+    assert_eq m[3], os.getpid.to_s
+    l.close.unwrap
+    srv.close
+    srv.wait
+  }
+}
+
+test "concurrent write" {
+  done = Chan[Str].new(16)
+  srv = start_server("udp", "", done, false)
+  w = dial("udp", srv.addr, LOG_USER | LOG_ERR, "how's it going?").unwrap
+  ts = (0...10).map {
+    spawn {
+      w.info("test").unwrap
+    }
+  }.to_a
+  for t in ts {
+    t.wait.unwrap
+  }
+  w.close.unwrap
+  srv.close
+  srv.wait
+}
+
+test "concurrent reconnect" {
+  n_tasks = 10
+  m_msgs = 100
+  network = "unix"
+  done = Chan[Str].new(n_tasks * m_msgs)
+  srv = start_server(network, "", done, true)
+  addr = srv.addr
+
+  # count all the messages arriving
+  count = spawn {
+    ct = 0
+    loop {
+      break if done.recv == none
+      ct += 1
+      # we are looking for 500 out of 1000 events here because lots of log
+      # messages are lost in buffers (kernel and/or bufio)
+      break if ct > n_tasks * m_msgs / 2
+    }
+    ct
+  }
+
+  wg = sync.new_wait_group
+  wg.add(n_tasks)
+  for _ in 0...n_tasks {
+    spawn {
+      w = dial(network, addr, LOG_USER | LOG_ERR, "tag").unwrap
+      for _ in 0...m_msgs {
+        w.info("test").unwrap
+      }
+      w.close.unwrap
+      wg.done
+    }
+  }
+  wg.wait
+  srv.close
+  srv.wait
+  done.close
+  ct = count.wait.unwrap
+  assert ct > 0, "no messages arrived"
+  srv.cleanup
+}
+
+# ---- beyond Go's tests
+
+test "new logger writes through the writer" {
+  done = Chan[Str].new(4)
+  srv = start_server("unixgram", "", done, false)
+  w = dial("unixgram", srv.addr, LOG_WARNING | LOG_DAEMON, "syslog_test").unwrap
+  lg = log.new(w, "pfx: ", 0)
+  lg.print("hello")
+  got = done.recv.unwrap
+  re = regexp.must_compile("^<#{LOG_WARNING | LOG_DAEMON}>\\S+ +\\S+ +\\S+ syslog_test\\[\\d+\\]: pfx: hello\\n$")
+  assert re.match_string?(got), got
+  w.close.unwrap
+  srv.close
+  srv.wait
+  srv.cleanup
+}
+
+test "severity methods keep the facility" {
+  done = Chan[Str].new(8)
+  srv = start_server("udp", "", done, false)
+  w = dial("udp", srv.addr, LOG_LOCAL3 | LOG_INFO, "syslog_test").unwrap
+  w.emerg("m").unwrap
+  w.alert("m").unwrap
+  w.crit("m").unwrap
+  w.err("m").unwrap
+  w.warning("m").unwrap
+  w.notice("m").unwrap
+  w.info("m").unwrap
+  w.debug("m").unwrap
+  for sev in 0...8 {
+    got = done.recv.unwrap
+    assert got.start_with?("<#{LOG_LOCAL3 | sev}>"), got
+  }
+  w.close.unwrap
+  srv.close
+  srv.wait
+}
+
+test "dial errors" {
+  e = dial("tcp", "127.0.0.1:1", LOG_INFO, "t").err.unwrap
+  assert_eq e.message, "dial tcp 127.0.0.1:1: connect: connection refused"
+  e2 = dial("bogus", "x", LOG_INFO, "t").err.unwrap
+  assert_eq e2.message, "dial bogus x: unknown network bogus"
+}
+
+test "example dial" {
+  done = Chan[Str].new(4)
+  srv = start_server("tcp", "", done, false)
+  sys_log = dial("tcp", srv.addr, LOG_WARNING | LOG_DAEMON, "demotag").unwrap
+  sys_log.write_string!("This is a daemon warning with demotag.").unwrap
+  sys_log.emerg("And this is a daemon emergency with demotag.").unwrap
+  assert done.recv.unwrap.start_with?("<28>"), "warning|daemon"
+  assert done.recv.unwrap.start_with?("<24>"), "emerg|daemon"
+  sys_log.close.unwrap
+  srv.close
+  srv.wait
+}

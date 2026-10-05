@@ -2499,6 +2499,7 @@ int64_t alx_user_groups(const char *name, int64_t gid, uint8_t *out, int64_t n) 
 #include <netinet/tcp.h>
 #include <arpa/inet.h>
 #include <netdb.h>
+#include <sys/un.h>
 #if defined(__linux__)
 #  include <sys/epoll.h>
 #  define ALX_EPOLL 1
@@ -2676,9 +2677,14 @@ static void sock_init(void) {
     pthread_once(&once, sigpipe_ignore);
 }
 
-/* "ip:port" or "[ip6]:port", NUL-terminated, into out (>= 64 bytes). Length. */
+/* "ip:port" or "[ip6]:port", NUL-terminated, into out (>= 64 bytes). Length.
+ * A Unix socket's address is its path (truncated to 63 bytes; "" if unbound). */
 static int64_t sock_fmt(const struct sockaddr_storage *ss, uint8_t *out) {
     char h[INET6_ADDRSTRLEN] = "";
+    if (ss->ss_family == AF_UNIX) {
+        const struct sockaddr_un *u = (const void *)ss;
+        return snprintf((char *)out, 64, "%s", u->sun_path);
+    }
     if (ss->ss_family == AF_INET6) {
         const struct sockaddr_in6 *a = (const void *)ss;
         inet_ntop(AF_INET6, &a->sin6_addr, h, sizeof h);
@@ -2810,4 +2816,62 @@ int64_t alx_sock_lookup(const char *host, uint8_t *out, int64_t n) {
     }
     freeaddrinfo(res);
     return len;
+}
+
+/* A UDP or Unix-domain socket. kind: 1 "udp", 2 "unix" (stream), 3
+ * "unixgram"; for kinds 2 and 3 `host` is the path and port is ignored.
+ * listen 0 connects (UDP and unixgram at once; a unix stream connect may be
+ * in progress: wait writable and read alx_sock_error, as for TCP), 1 binds
+ * (and listens, for "unix", with `backlog`). The fd (non-blocking,
+ * close-on-exec), or -errno / -ALX_ENOHOST. Resolution blocks the worker. */
+int64_t alx_sock_open(int64_t kind, const char *host, int64_t port, int64_t listen_, int64_t backlog) {
+    sock_init();
+    if (kind == 2 || kind == 3) {
+        struct sockaddr_un u;
+        memset(&u, 0, sizeof u);
+        u.sun_family = AF_UNIX;
+        size_t n = strlen(host);
+        if (n >= sizeof u.sun_path) return -EINVAL;
+        memcpy(u.sun_path, host, n);
+        int fd = socket(AF_UNIX, kind == 2 ? SOCK_STREAM : SOCK_DGRAM, 0);
+        if (fd < 0) return -errno;
+        sock_prep(fd);
+        int rc = listen_ ? bind(fd, (struct sockaddr *)&u, sizeof u) : connect(fd, (struct sockaddr *)&u, sizeof u);
+        if (rc == 0 && listen_ && kind == 2) rc = listen(fd, (int)backlog);
+        if (rc < 0 && !(errno == EINPROGRESS && !listen_)) { int e = errno; close(fd); return -e; }
+        return fd;
+    }
+    struct addrinfo hints, *res = NULL;
+    memset(&hints, 0, sizeof hints);
+    hints.ai_socktype = SOCK_DGRAM;
+    if (listen_) hints.ai_flags = AI_PASSIVE;
+    char ps[16];
+    snprintf(ps, sizeof ps, "%d", (int)port);
+    const char *h = host[0] ? host : (listen_ ? "0.0.0.0" : "127.0.0.1");
+    if (getaddrinfo(h, ps, &hints, &res) != 0) return -ALX_ENOHOST;
+    struct addrinfo *pick = res;
+    for (struct addrinfo *a = res; a; a = a->ai_next)
+        if (a->ai_family == AF_INET) { pick = a; break; }
+    int fd = socket(pick->ai_family, pick->ai_socktype, pick->ai_protocol);
+    if (fd < 0) { int e = errno; freeaddrinfo(res); return -e; }
+    sock_prep(fd);
+    int rc = listen_ ? bind(fd, pick->ai_addr, pick->ai_addrlen) : connect(fd, pick->ai_addr, pick->ai_addrlen);
+    int e = errno;
+    freeaddrinfo(res);
+    if (rc < 0) { close(fd); return -e; }
+    return fd;
+}
+
+/* Non-blocking recvfrom: the datagram's length (truncated to n) with the
+ * sender's address in out (>= 64 bytes; "" if it has none), or -errno
+ * (-EAGAIN: wait readable, retry). */
+int64_t alx_sock_recvfrom(int64_t fd, uint8_t *buf, int64_t n, uint8_t *out) {
+    struct sockaddr_storage ss;
+    socklen_t len = sizeof ss;
+    memset(&ss, 0, sizeof ss);
+    ssize_t r = recvfrom((int)fd, buf, (size_t)n, 0, (struct sockaddr *)&ss, &len);
+    if (r < 0) return -errno;
+    if (len == 0) ss.ss_family = AF_UNIX; /* an unbound unixgram sender */
+    sock_fmt(&ss, out);
+    return (int64_t)r;
 }

@@ -383,7 +383,7 @@ fn load_pkg(
         let mut m = parse_file(sm, shown, text, next_id)?;
         crate::embed::resolve(&mut m, &embed_dir(f))?;
         if let Some(s) = m.main.first() {
-            return Err(Diag::new(s.span, format!("a package (`{path}`) holds only declarations; move statements into a def")));
+            return Err(Diag::new(s.span, format!("a package (`{path}`) holds only declarations; move statements into a def")).note("package-level values are constants (`NAME = 42`), or, for state that changes, `NAME = Atomic.new(v)` / `NAME = Mutex.new(v)` (R11)"));
         }
         if let Some(t) = m.tests.first() {
             return Err(not_a_test_file(t));
@@ -526,6 +526,22 @@ pub fn check_program(l: &Loaded, externs: Vec<DefInfo>) -> Result<TProgram, Diag
     let refines: Vec<_> = all().flat_map(|m| m.refines.iter()).cloned().collect();
     w.add_refines(&refines)?;
     let main = w.check_main(&l.main.main, l.main.overflow, Span { file: l.main.file, lo: 0, hi: 0 })?;
+    // R11: package-level Atomics / Mutexes are set first thing in main.
+    let inits = w.var_inits()?;
+    let vars: Vec<usize> = inits.iter().map(|(g, _)| *g).collect();
+    if let Some(Some(mf)) = w.funcs.get_mut(main) {
+        let sp = mf.span;
+        let pre: Vec<crate::tast::TStmt> = inits
+            .iter()
+            .map(|&(g, fid)| {
+                let t = w.funcs[fid].as_ref().unwrap().ret.clone();
+                let call = crate::tast::TExpr { kind: crate::tast::TK::Call(fid, vec![]), ty: t, span: sp };
+                crate::tast::TStmt::Expr(crate::tast::TExpr { kind: crate::tast::TK::M(crate::tast::M::SetGlobal(g), None, vec![call], None), ty: Ty::Unit, span: sp })
+            })
+            .collect();
+        let mf = w.funcs[main].as_mut().unwrap();
+        mf.body.splice(0..0, pre);
+    }
     let messages = w.message_instances()?;
     let ifaces = std::mem::take(&mut w.impls);
     let stringers = std::mem::take(&mut w.stringers);
@@ -559,7 +575,7 @@ pub fn check_program(l: &Loaded, externs: Vec<DefInfo>) -> Result<TProgram, Diag
     for f in &funcs {
         prove::prove(f, &l.sm)?;
     }
-    let mut p = TProgram { funcs, main, ifaces, stringers, errors, messages, warnings, globals };
+    let mut p = TProgram { funcs, main, ifaces, stringers, errors, messages, warnings, globals, vars };
     // R5: lambdas see the variables they capture, not copies.
     crate::capture::convert(&mut p);
     // R6: what goes to another task isn't used here afterwards.
@@ -593,8 +609,9 @@ pub fn separable(p: &Package) -> bool {
         // The header spells types with `parse_ty`: sized ints and structs can't cross it.
         && m.defs.iter().filter(|d| d.public).all(|d| d.params.iter().all(|p| p.ty.as_ref().is_some_and(header_type)) && d.ret.as_ref().is_none_or(header_type))
         && m.defs.iter().any(|d| d.public)
-        // Array constants live in globals the program's main sets up.
-        && !m.consts.iter().any(|c| matches!(c.value.kind, crate::ast::ExprKind::Array(_) | crate::ast::ExprKind::ArrayRepeat(..)))
+        // Array constants and package-level Atomics / Mutexes (R11) live
+        // in globals the program's main sets up.
+        && !m.consts.iter().any(|c| c.var || matches!(c.value.kind, crate::ast::ExprKind::Array(_) | crate::ast::ExprKind::ArrayRepeat(..)))
         // The builtin Complex is declared with the program.
         && !uses_complex(&p.source)
         // Formats with flags reach the fmt engine, declared with the program (builtin.alx).
@@ -649,7 +666,7 @@ pub fn check_library(l: &Loaded, idx: usize, prefix: &str) -> Result<(TProgram, 
     for f in &funcs {
         prove::prove(f, &l.sm)?;
     }
-    Ok((TProgram { funcs, main: usize::MAX, ifaces, stringers, errors, messages, warnings: vec![], globals: vec![] }, exports))
+    Ok((TProgram { funcs, main: usize::MAX, ifaces, stringers, errors, messages, warnings: vec![], globals: vec![], vars: vec![] }, exports))
 }
 
 /// The generated header: one line per export.

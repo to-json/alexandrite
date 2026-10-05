@@ -181,7 +181,33 @@ pub struct World<'a> {
     /// or refer to such constants: evaluated once the types are known
     /// (`add_enum_consts`).
     pending_consts: Vec<ConstDef>,
+    /// R11: package-level `Atomic[T]` / `Mutex[T]` values, in declaration
+    /// order (each package after its imports, the main file last).
+    pub vars: Vec<VarInfo>,
 }
+
+/// A package-level `Atomic[T]` / `Mutex[T]` (R11): the global holding it
+/// and, once checked, its type and the instance of its initializer.
+#[derive(Clone, Debug)]
+pub struct VarInfo {
+    pub name: String,
+    pub span: Span,
+    pub global: usize,
+    pub ty: Option<Ty>,
+    pub init: Option<FuncId>,
+    checking: bool,
+}
+
+/// A top-level `NAME = value` whose value isn't a constant (R11).
+fn not_constant(name: &str, e: Diag) -> Diag {
+    let short = name.rsplit('.').next().unwrap_or(name);
+    let mut d = Diag::new(e.span, format!("`{short}` isn't a constant: a top-level value is computed at compile time, or is an `Atomic[T]` or a `Mutex[T]`"));
+    d.notes.push(e.msg.replacen("a constant must", "a constant's value must", 1));
+    d.notes.push(R11_NOTE.to_string());
+    d
+}
+
+const R11_NOTE: &str = "package-level state that changes lives in an `Atomic[T]` (`NAME = Atomic.new(v)`), or a `Mutex[T]` for state changed in place (R11)";
 
 #[derive(Clone, Debug)]
 pub struct IfaceMethod {
@@ -203,7 +229,7 @@ pub enum CVal {
     /// A variant without fields of an enum (`pub SHA256 = Hash.SHA256`):
     /// the enum's qualified name and the variant's index.
     Enum(String, usize),
-    /// The files of an `#[embed]` constant (D62), its type Str, [Byte] or
+    /// The files of an `#[embed]` constant (D65), its type Str, [Byte] or
     /// embed.FS: (slash-separated name, contents); directories end in `/`.
     Embed(std::rc::Rc<Vec<(String, Vec<u8>)>>),
 }
@@ -293,14 +319,21 @@ impl<'a> World<'a> {
         }
         GENERICS.with(|g| g.borrow_mut().clear());
         INSTS.with(|g| g.borrow_mut().clear());
-        Ok(World { sm, defs, by_name, instances: HashMap::new(), funcs: vec![], sigs: HashMap::new(), fatal: None, structs: HashMap::new(), consts: HashMap::new(), ifaces: HashMap::new(), impls: HashMap::new(), stringers: HashMap::new(), errors: vec![], refines: HashMap::new(), warnings: vec![], globals: vec![], pending_consts: vec![] })
+        Ok(World { sm, defs, by_name, instances: HashMap::new(), funcs: vec![], sigs: HashMap::new(), fatal: None, structs: HashMap::new(), consts: HashMap::new(), ifaces: HashMap::new(), impls: HashMap::new(), stringers: HashMap::new(), errors: vec![], refines: HashMap::new(), warnings: vec![], globals: vec![], pending_consts: vec![], vars: vec![] })
     }
 
     /// Evaluate top-level constants, in order (each may use earlier ones).
     pub fn add_consts(&mut self, defs: &[ConstDef]) -> R<()> {
         for d in defs {
-            if self.consts.contains_key(&d.name) || self.structs.contains_key(&d.name) {
+            if self.consts.contains_key(&d.name) || self.structs.contains_key(&d.name) || self.vars.iter().any(|v| v.name == d.name) {
                 return Err(Diag::new(d.span, format!("`{}` is already defined", d.name)));
+            }
+            if d.var {
+                // Checked on first use (or at the end), run at program start.
+                let global = self.globals.len();
+                self.globals.push((d.name.clone(), TExpr { kind: TK::Unit, ty: Ty::Unit, span: d.span }));
+                self.vars.push(VarInfo { name: d.name.clone(), span: d.span, global, ty: None, init: None, checking: false });
+                continue;
             }
             // `Enum.Variant`, or a constant naming one, or embedded files: after the types.
             let deferred = d.embed.is_some() || match &d.value.kind {
@@ -320,7 +353,7 @@ impl<'a> World<'a> {
             let prev = enter_pkg(&pkg_of(&d.name));
             let v = self.eval_const(&d.value);
             leave_pkg(prev);
-            let v = v?;
+            let v = v.map_err(|e| if e.msg.starts_with("a constant must be computable") { not_constant(&d.name, e) } else { e })?;
             let prev = enter_pkg(&pkg_of(&d.name));
             let ty = match &d.ty {
                 Some(te) if matches!(v, CVal::Arr(_)) => {
@@ -394,7 +427,7 @@ impl<'a> World<'a> {
             leave_pkg(prev);
             let (v, t) = match ev {
                 Some(r) => r?,
-                None => return Err(Diag::new(d.value.span, "a constant must be computable at compile time: literals, arrays of them, other constants, operators and enum variants without fields")),
+                None => return Err(not_constant(&d.name, Diag::new(d.value.span, "a constant must be computable at compile time: literals, arrays of them, other constants, operators and enum variants without fields"))),
             };
             if let Some(want) = want {
                 let want = want?;
@@ -430,6 +463,110 @@ impl<'a> World<'a> {
             }
             _ => None,
         }
+    }
+
+    /// The package-level value (R11) named `q` (qualified), if there is one.
+    /// (The main file's, unqualified, are seen only from the main file.)
+    pub fn var_index(&self, q: &str) -> Option<usize> {
+        if !q.contains('.') && !current_pkg().is_empty() {
+            return None;
+        }
+        self.vars.iter().position(|v| v.name == q)
+    }
+
+    /// Package-level value `k` (R11): its global and type, checking its
+    /// initializer first if nothing has yet.
+    pub fn var_global(&mut self, k: usize, sp: Span) -> R<(usize, Ty)> {
+        if let Some(t) = &self.vars[k].ty {
+            return Ok((self.vars[k].global, t.clone()));
+        }
+        let name = self.vars[k].name.clone();
+        let short = name.rsplit('.').next().unwrap_or(&name).to_string();
+        if self.vars[k].checking {
+            return Err(Diag::new(sp, format!("`{short}`'s initial value depends on `{short}` itself")));
+        }
+        let Some(&def) = self.by_name.get(&crate::ast::var_init_name(&name)) else {
+            return Err(Diag::new(sp, format!("`{short}` has no initializer")));
+        };
+        self.vars[k].checking = true;
+        let r = self.instance(def, vec![], self.vars[k].span);
+        self.vars[k].checking = false;
+        let fid = r?;
+        let vsp = self.vars[k].span;
+        let Some(f) = &self.funcs[fid] else {
+            return Err(Diag::new(vsp, format!("`{short}`'s initial value depends on `{short}` itself")));
+        };
+        if f.fallible {
+            return Err(Diag::new(vsp, format!("`{short}`'s initial value can fail; a package-level value is computed at program start, where nothing can handle the error")).note("handle it in the initializer (`|| default`, `.rescue { }`)"));
+        }
+        let t = f.ret.clone();
+        if !matches!(t, Ty::Atomic(_) | Ty::Mutex(_)) {
+            return Err(Diag::new(vsp, format!("`{short}` is {}: a package-level value is a constant, an `Atomic[T]` or a `Mutex[T]`", t.show())).note(R11_NOTE));
+        }
+        self.vars[k].ty = Some(t.clone());
+        self.vars[k].init = Some(fid);
+        Ok((self.vars[k].global, t))
+    }
+
+    /// Check every package-level value's initializer and order them (R11):
+    /// a value is initialized after every value its initializer reads,
+    /// through any chain of calls; otherwise in declaration order (Go's
+    /// rule). A cycle is an error. Returns (global, initializer) pairs.
+    pub fn var_inits(&mut self) -> R<Vec<(usize, FuncId)>> {
+        for k in 0..self.vars.len() {
+            let sp = self.vars[k].span;
+            let prev = enter_pkg(&pkg_of(&self.vars[k].name));
+            let r = self.var_global(k, sp);
+            leave_pkg(prev);
+            r?;
+        }
+        let by_global: HashMap<usize, usize> = self.vars.iter().enumerate().map(|(k, v)| (v.global, k)).collect();
+        // Each function's direct callees and the values it reads.
+        let mut deps: Vec<Vec<usize>> = vec![];
+        for k in 0..self.vars.len() {
+            let mut seen = std::collections::HashSet::new();
+            let mut stack = vec![self.vars[k].init.unwrap()];
+            let mut reads = vec![];
+            while let Some(fid) = stack.pop() {
+                if !seen.insert(fid) {
+                    continue;
+                }
+                let Some(f) = &self.funcs[fid] else { continue };
+                let mut visit = |e: &TExpr| {
+                    fn go(e: &TExpr, stack: &mut Vec<FuncId>, reads: &mut Vec<usize>, by_global: &HashMap<usize, usize>) {
+                        match &e.kind {
+                            TK::Call(fid, _) => stack.push(*fid),
+                            TK::M(M::Global(g), ..) => {
+                                if let Some(v) = by_global.get(g) {
+                                    reads.push(*v);
+                                }
+                            }
+                            _ => {}
+                        }
+                        crate::prove::each_child(e, &mut |c| go(c, stack, reads, by_global));
+                    }
+                    go(e, &mut stack, &mut reads, &by_global);
+                };
+                for s in &f.body {
+                    crate::prove::stmt_exprs(s, &mut visit);
+                }
+            }
+            deps.push(reads);
+        }
+        let n = self.vars.len();
+        let mut done = vec![false; n];
+        let mut order = vec![];
+        while order.len() < n {
+            let Some(k) = (0..n).find(|&k| !done[k] && deps[k].iter().all(|&d| done[d] && d != k)) else {
+                let k = (0..n).find(|&k| !done[k]).unwrap();
+                let short = |k: usize| self.vars[k].name.rsplit('.').next().unwrap_or("").to_string();
+                let on: Vec<String> = deps[k].iter().filter(|&&d| !done[d]).map(|&d| format!("`{}`", short(d))).collect();
+                return Err(Diag::new(self.vars[k].span, format!("initialization cycle: `{}`'s initial value reads {}, which can't be initialized first", short(k), on.join(", "))));
+            };
+            done[k] = true;
+            order.push((self.vars[k].global, self.vars[k].init.unwrap()));
+        }
+        Ok(order)
     }
 
     /// The global holding array constant `name` (made on first use).
@@ -1305,10 +1442,7 @@ pub fn type_from(t: &TypeExpr, structs: &Structs, consts: &Consts) -> R<Ty> {
             ("Chan", [t]) => Ok(Ty::Chan(Box::new(type_from(t)?))),
             ("Pool", [t]) => Ok(Ty::Pool(Box::new(type_from(t)?))),
             ("Mutex", [t]) => Ok(Ty::Mutex(Box::new(type_from(t)?))),
-            ("Atomic", [t]) => match type_from(t)? {
-                t @ (Ty::Int | Ty::Bool) => Ok(Ty::Atomic(Box::new(t))),
-                t => Err(Diag::new(*sp, format!("`Atomic` holds an Int or a Bool, not {}; guard other values with a `Mutex`", t.show()))),
-            },
+            ("Atomic", [t]) => Ok(Ty::Atomic(Box::new(type_from(t)?))),
             ("Task", [t]) => Ok(Ty::Task(Box::new(type_from(t)?))),
             (g, _) if generic(&resolve_name(g, *sp, &|q| generic(q).is_some())?).is_some() => {
                 let g = resolve_name(g, *sp, &|q| generic(q).is_some())?;
@@ -2185,10 +2319,19 @@ impl<'w, 'a> FnCx<'w, 'a> {
                     return self.call(None, n, sp, &[], None, None, sp);
                 }
             },
-            ExprKind::Const(c) => match self.w.consts.get(&resolve_name(c, sp, &|q| self.w.consts.contains_key(q))?).cloned() {
-                Some((v, ty)) => return self.const_value(v, ty, sp),
-                None => return Err(Diag::new(sp, format!("`{c}` is not a value; call a method on it (`{c}.new`, ...)"))),
-            },
+            ExprKind::Const(c) => {
+                let q = resolve_name(c, sp, &|q| self.w.consts.contains_key(q) || self.w.var_index(q).is_some())?;
+                if let Some((v, ty)) = self.w.consts.get(&q).cloned() {
+                    return self.const_value(v, ty, sp);
+                }
+                if let Some(k) = self.w.var_index(&q) {
+                    // R11: a package-level Atomic / Mutex, read in place.
+                    let (g, t) = self.w.var_global(k, sp)?;
+                    self.impure = true;
+                    return Ok(self.mk(TK::M(M::Global(g), None, vec![], None), t, sp));
+                }
+                return Err(Diag::new(sp, format!("`{c}` is not a value; call a method on it (`{c}.new`, ...)")));
+            }
             ExprKind::Call { recv: Some(r), name, args, block: None, block_sym: None, .. } if matches!(name.as_str(), "size" | "length") && args.is_empty() && self.const_array(r).is_some() => {
                 let Some((_, CVal::Arr(vs), _)) = self.const_array(r) else { unreachable!() };
                 self.mk(TK::Int(vs.len() as i64), Ty::Int, sp)
@@ -3494,6 +3637,71 @@ impl<'w, 'a> FnCx<'w, 'a> {
         }
     }
 
+    /// A method on an `Atomic[T]` whose T isn't an Int or a Bool (R11):
+    /// the value sits behind a lock (a Mutex's layout), and each method is
+    /// one short `lock` block. The arguments are evaluated first, outside
+    /// the lock; `load` and `swap` return copies (`lock` copies out).
+    fn atomic_method(&mut self, recv: TExpr, t: &Ty, name: &str, name_span: Span, args: &[Expr], sp: Span) -> R<TExpr> {
+        let mut pre = vec![];
+        let mut tmps = vec![];
+        let n_args = match name {
+            "load" => 0,
+            "store" | "swap" => 1,
+            "compare_and_swap" => 2,
+            _ => usize::MAX,
+        };
+        if n_args == usize::MAX {
+            let add = if name == "add" { " (`add` is for an Atomic[Int])" } else { "" };
+            return Err(Diag::new(name_span, format!("no method `{name}` on Atomic[{}]{add}; it has load, store(v), swap(v) and compare_and_swap(old, new)", t.show())));
+        }
+        if n_args != args.len() {
+            return Err(Diag::new(name_span, format!("`{name}` takes {n_args} argument{}", if n_args == 1 { "" } else { "s" })));
+        }
+        for a in args {
+            let v = self.value_as(a, t)?;
+            self.expect(&v.ty, t, v.span, "atomic value")?;
+            let id = self.declare(&format!("_atomic{}_{}", sp.lo, self.locals.len()), t.clone());
+            pre.push(TStmt::Expr(self.mk(TK::Assign(id, Box::new(v)), t.clone(), sp)));
+            tmps.push(id);
+        }
+        let p = self.declare(&format!("_atomicv{}_{}", sp.lo, self.locals.len()), t.clone());
+        let own0 = self.locals.len();
+        let local = |cx: &Self, id: LocalId| cx.mk(TK::Local(id), t.clone(), sp);
+        let set_p = |cx: &mut Self, from: LocalId| {
+            cx.locals[p].reassigned += 1;
+            let v = local(cx, from);
+            TStmt::Expr(cx.mk(TK::Assign(p, Box::new(v)), t.clone(), sp))
+        };
+        let (body, bt) = match name {
+            "load" => (vec![TStmt::Expr(local(self, p))], t.clone()),
+            "store" => (vec![set_p(self, tmps[0])], Ty::Unit),
+            "swap" => {
+                let old = self.declare(&format!("_atomicold{}_{}", sp.lo, self.locals.len()), t.clone());
+                let pv = local(self, p);
+                let save = TStmt::Expr(self.mk(TK::Assign(old, Box::new(pv)), t.clone(), sp));
+                (vec![save, set_p(self, tmps[0]), TStmt::Expr(local(self, old))], t.clone())
+            }
+            _ => {
+                let (a, b) = (local(self, p), local(self, tmps[0]));
+                let eq = self.binary(BinOp::Eq, a, b, sp)?;
+                let ok = self.declare(&format!("_atomicok{}_{}", sp.lo, self.locals.len()), Ty::Bool);
+                let save = TStmt::Expr(self.mk(TK::Assign(ok, Box::new(eq)), Ty::Bool, sp));
+                let cond = self.mk(TK::Local(ok), Ty::Bool, sp);
+                let set = set_p(self, tmps[1]);
+                let res = TStmt::Expr(self.mk(TK::Local(ok), Ty::Bool, sp));
+                (vec![save, TStmt::If(cond, vec![set], vec![]), res], Ty::Bool)
+            }
+        };
+        let blk = TBlock { params: vec![p], destructure: false, body, pure: false, span: sp, own: (own0, self.locals.len()), id: 0 };
+        self.impure = true;
+        let lock = self.mk(TK::M(M::Lock, Some(Box::new(recv)), vec![], Some(Box::new(blk))), bt.clone(), sp);
+        if pre.is_empty() {
+            return Ok(lock);
+        }
+        pre.push(TStmt::Expr(lock));
+        Ok(self.mk(TK::Seq(pre), bt, sp))
+    }
+
     /// `Mutex.new(v)` / `Atomic.new(v)`, with the value type given or not.
     fn sync_new(&mut self, c: &str, t: Option<Ty>, csp: Span, args: &[Expr], sp: Span) -> R<TExpr> {
         let [a] = args else {
@@ -3512,8 +3720,13 @@ impl<'w, 'a> FnCx<'w, 'a> {
         if c == "Mutex" {
             return Ok(self.mk(TK::M(M::MutexNew, None, vec![v], None), Ty::Mutex(Box::new(vt)), sp));
         }
-        if !matches!(vt, Ty::Int | Ty::Bool) {
-            return Err(Diag::new(csp, format!("`Atomic` holds an Int or a Bool, not {}; guard other values with a `Mutex`", vt.show())));
+        if vt.has_var() {
+            return Err(Diag::new(csp, "the type of this atomic's value isn't known yet; write `Atomic[T].new(v)`"));
+        }
+        if vt.atomic_boxed() {
+            // R11: any other value sits behind the atomic's lock, in the
+            // layout a Mutex has (see `atomic_method`).
+            return Ok(self.mk(TK::M(M::MutexNew, None, vec![v], None), Ty::Atomic(Box::new(vt)), sp));
         }
         Ok(self.mk(TK::M(M::AtomicNew, None, vec![v], None), Ty::Atomic(Box::new(vt)), sp))
     }
@@ -4524,6 +4737,14 @@ impl<'w, 'a> FnCx<'w, 'a> {
                         let (v, ty) = self.w.consts[&q].clone();
                         return self.const_value(v, ty, sp);
                     }
+                    if let (Some(k), true) = (self.w.var_index(&q), args.is_empty()) {
+                        if !is_public(&q) {
+                            return Err(Diag::new(name_span, format!("`{name}` isn't public; its package must declare it `pub`")));
+                        }
+                        let (g, t) = self.w.var_global(k, sp)?;
+                        self.impure = true;
+                        return Ok(self.mk(TK::M(M::Global(g), None, vec![], None), t, sp));
+                    }
                     return Err(Diag::new(name_span, format!("`{name}` is a type (or isn't in that package); call a method on it")));
                 }
                 if path == "fmt" && crate::front::is_std("fmt") && FMT_BUILTINS.contains(&name) {
@@ -4537,7 +4758,7 @@ impl<'w, 'a> FnCx<'w, 'a> {
             if let ExprKind::Call { recv: Some(r2), name: tn, args: a2, block: None, name_span: tsp, .. } = &r.kind {
                 if a2.is_empty() && tn.chars().next().is_some_and(|c| c.is_uppercase()) {
                     // (`geom.ORIGIN.size` is a method of the constant's value.)
-                    if let Some(path) = self.pkg_alias(r2).filter(|p| !self.w.consts.contains_key(&format!("{p}.{tn}"))) {
+                    if let Some(path) = self.pkg_alias(r2).filter(|p| !self.w.consts.contains_key(&format!("{p}.{tn}")) && self.w.var_index(&format!("{p}.{tn}")).is_none()) {
                         let alias_q = format!("{}.{tn}", match &r2.kind { ExprKind::Name(a) => a.clone(), ExprKind::Call { name, .. } => name.clone(), _ => unreachable!() });
                         let _ = path;
                         return self.const_call(&alias_q, *tsp, name, name_span, args, block, sp);
@@ -4583,7 +4804,8 @@ impl<'w, 'a> FnCx<'w, 'a> {
         }
         // `Mutex.new(v)`, `Atomic.new(v)` (and `Mutex[T].new(v)` above).
         // (A constant of the current package is keyed by its qualified name.)
-        let is_const = |cx: &Self, c: &str, csp: Span| resolve_name(c, csp, &|q| cx.w.consts.contains_key(q)).is_ok_and(|q| cx.w.consts.contains_key(&q));
+        // (So is a package-level Atomic / Mutex, R11: `REGISTRY.lock { }`.)
+        let is_const = |cx: &Self, c: &str, csp: Span| resolve_name(c, csp, &|q| cx.w.consts.contains_key(q) || cx.w.var_index(q).is_some()).is_ok_and(|q| cx.w.consts.contains_key(&q) || cx.w.var_index(&q).is_some());
         if let Some(Expr { kind: ExprKind::Const(c), span: csp, .. }) = recv {
             if (c == "Mutex" || c == "Atomic") && name == "new" && !is_const(self, c, *csp) {
                 return self.sync_new(c, None, *csp, args, sp);
@@ -5803,6 +6025,9 @@ impl<'w, 'a> FnCx<'w, 'a> {
                 ck.expect(&v.ty, &t, v.span, "atomic value")?;
                 Ok(v)
             };
+            if t.atomic_boxed() {
+                return self.atomic_method(recv, &t, name, name_span, args, sp);
+            }
             return match (name, args.len()) {
                 ("load", 0) => Ok(mk_m(self, M::AtomicLoad, recv, vec![], None, t)),
                 ("store", 1) => {

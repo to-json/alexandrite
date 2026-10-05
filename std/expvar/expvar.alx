@@ -1,0 +1,643 @@
+# Package expvar: Go's expvar — public variables (counters, gauges, maps of
+# them) and their JSON at /debug/vars.
+#
+#   reg = expvar.new_registry                 # Go: the package's global vars
+#   reqs = reg.new_int("requests")
+#   reqs.add(1)
+#   hits = reg.new_map("hits")
+#   hits.add("/index", 1)
+#   mux = http.new_serve_mux
+#   reg.register(mux)                         # GET /debug/vars
+#
+#   Go                                      alx
+#   Var (interface { String() string })     Var (interface { to_s -> Str })
+#   Int / Float / String (zero usable)      make_int / make_float / make_string -> Int / Float / String
+#     Value / String / Add / AddFloat / Set   value / to_s / add(d) / set(v)
+#   Map                                     reg.make_map -> Map (see "Maps" below)
+#     Get / Set / Add / AddFloat /            get(k) -> Var? / set(k, v: Var?) / add(k, d) / add_float(k, d) /
+#     Delete / Do / Init / String             delete(k) / do { |kv| } / init -> Map / to_s
+#   KeyValue{Key, Value}                    KeyValue (key, value: Var?)
+#   Func (func() any)                       Func[T] (`expvar.func { v }`): value -> T, to_s
+#   Publish(name, v) / Get(name) / Do(f)    reg.publish(name, v) / reg.get(name) -> Var? / reg.do { |kv| }
+#   NewInt / NewFloat / NewMap / NewString  reg.new_int / new_float / new_map / new_string (name)
+#   Handler()                               reg.handler -> (ResponseWriter, Request) -> Unit
+#   init: HandleFunc("GET /debug/vars")     reg.register(mux)
+#   init: Publish("cmdline"), ("memstats")  done by new_registry
+#   v.(*Int), v.(*Map), ...                 v.as_int, as_float, as_string, as_map (-> T?)
+#
+# The JSON is Go's byte for byte: Int in decimal, Float as strconv's 'g' with
+# the shortest digits (so NaN and +Inf come out as Go writes them, which is
+# not valid JSON either), String quoted as Go's appendJSONQuote (<, >, & and
+# U+2028/9 as \u escapes, invalid UTF-8 as U+FFFD), a Map as
+# `{"k": v, "k2": v2}` with sorted keys and ": " / ", " separators, Func as
+# json.marshal of its value (empty if that fails, as Go), and the handler's
+# document as `{\n"k": v,\n"k2": v2\n}\n`.
+#
+# The registry (Go's package globals). alexandrite has no mutable package
+# state (docs/notes/port-issues.md #30, #51), so Go's global `vars` and its
+# init-time registrations become an explicit value: `new_registry` makes one
+# and publishes "cmdline" and "memstats" in it, as Go's init does; `register`
+# installs its handler on a ServeMux you pass (there is no DefaultServeMux).
+# A Registry is a handle: copies (in tasks, in handlers) share it. A
+# program that wants Go's one-per-process registry makes one in main and
+# passes it to whoever publishes.
+#
+# This is an interim design. GO-VS-RUBY R11 (decided, not yet implemented)
+# allows package-level state behind an Atomic[T] or Mutex[T]. Once that
+# lands, the package keeps one process-wide Registry in such a global, and a
+# private `def registry -> Registry` reads it (made on first use with
+# cmdline and memstats published, as Go's init does). Go's package-level
+# functions then become one-line wrappers over it: publish, get, do,
+# new_int / new_float / new_string / new_map, handler. Every operation is
+# already a Registry method, so the switch only adds the global, the
+# accessor and the wrappers. The explicit Registry stays for tests and for
+# programs that want more than one.
+#
+# Maps. An expvar Map holds Vars and is itself a Var, so a Map can hold a
+# Map. Recursive types don't exist yet (a value can't contain itself, and a
+# closure can't hold a closure of its own type), so a registry keeps all of
+# its maps' contents in one store (a Pool under a Mutex) and a Map is a
+# handle into it. Hence:
+#  - Maps are made by a registry: `reg.make_map` (Go's new(Map).Init()) or
+#    `reg.new_map(name)` (Go's NewMap). A Map can be put into a Map (or
+#    published) only in the registry that made it; another registry's Map
+#    panics ("expvar: Map from another Registry").
+#  - A Map deleted or replaced in its parent keeps its contents in the store
+#    (its handle may still be in use): making maps in a loop grows the
+#    registry.
+#  - Int, Float, String and Func are independent of registries: their state
+#    is an Atomic or Mutex of their own.
+#
+# Other differences from Go:
+#  - Int, Float and String have no usable zero value (an Atomic or Mutex is
+#    a handle that must be made): use make_int / make_float / make_string
+#    (Go's new(Int)) or reg.new_int(name) and friends.
+#  - `get` returns a Var interface value; Go's type assertions
+#    `v.(*expvar.Int)` are `v.as_int` (and as_float, as_string, as_map),
+#    optionals. A Var of a type of your own is stored as its `to_s` (a
+#    closure over a copy of the value), so it comes back from `get` as an
+#    Other whose to_s calls yours: give it shared state (D36) if it changes.
+#    A Func comes back the same way (as_* are none).
+#  - Func is generic: `func { v }` makes a Func[T] whose to_s is
+#    json.marshal of the block's value, so T must be something json.marshal
+#    takes (a `#[derive(Json)]` type, json.Value, or a type with json_enc).
+#    `value` returns T (Go: any).
+#  - `do` and the JSON output take a snapshot of a map's keys and entries
+#    under the registry's lock, then call the block (or the Vars' to_s)
+#    without it, so a block or a Var may use the registry. Go holds the
+#    map's read lock during the iteration. Values are read live either way.
+#  - "memstats" can't be Go's runtime.MemStats (no GC, no Go runtime): it is
+#    the runtime's own counters, `{"HeldBytes": n, "PeakHeldBytes": n}`
+#    (bytes held in regions now, and the most ever; see net/http/pprof).
+#    "cmdline" is os.args as Go's.
+#  - publish of a name already published writes Go's message to stderr and
+#    panics (log.panicln, as Go).
+#  - The handler isn't restricted to GET by itself (as Go's Handler() isn't);
+#    `register` installs it as "GET /debug/vars", Go 1.22's pattern.
+#    GODEBUG=httpmuxgo121 doesn't exist.
+
+import "encoding/json"
+import "log"
+import "net/http"
+import "os"
+import "strconv"
+import "math"
+import "unicode/utf8"
+
+extern def c_getentropy(buf: [Byte], n: Int) -> I32 = "getentropy"
+extern def alx_mem_held -> I64
+extern def alx_mem_peak -> I64
+
+HEX = "0123456789abcdef"
+
+# ------------------------------------------------------------------- Var
+
+# A public variable: to_s returns its JSON.
+pub interface Var {
+  def to_s -> Str
+
+  # How a Map stores the Var (types of your own: as their to_s).
+  def var_entry -> Entry { Entry.new(other: Other.new(f: -> {to_s})) }
+
+  # Go's v.(*Int) and friends: the Var as that type, if it is one.
+  def as_int -> Int? { none }
+  def as_float -> Float? { none }
+  def as_string -> String? { none }
+  def as_map -> Map? { none }
+}
+
+# One entry of a Map, as `do` passes it. `value` is none for a key set to
+# none (Go's nil Var).
+pub struct KeyValue {
+  key: Str
+  value: Var?
+}
+
+# ------------------------------------------------------------------- Int
+
+# A 64-bit integer variable. Copies share it.
+pub struct Int {
+  v: Atomic[I64]
+
+  pub def value -> I64 { v.load }
+  pub def to_s -> Str { v.load.to_s }
+  pub def add(delta: I64) { v.add(delta) }
+  pub def set(value: I64) { v.store(value) }
+
+  def var_entry -> Entry { Entry.new(int: self) }
+  pub def as_int -> Int? { self }
+}
+
+# A new Int, 0 (Go's new(expvar.Int)).
+pub def make_int -> Int { Int.new(v: Atomic.new(0)) }
+
+# ----------------------------------------------------------------- Float
+
+# A 64-bit float variable (its bits in an Atomic). Copies share it.
+pub struct Float {
+  bits: Atomic[I64]
+
+  pub def value -> F64 { math.float64frombits(bits.load.as_u64) }
+
+  # strconv's 'g' format with the fewest digits that read back exactly.
+  pub def to_s -> Str { strconv.format_float(value, "g", -1, 64) }
+
+  # Adds delta (a compare-and-swap loop, as Go).
+  pub def add(delta: F64) {
+    loop {
+      cur = bits.load
+      nxt = math.float64bits(math.float64frombits(cur.as_u64) + delta).as_i64
+      return if bits.compare_and_swap(cur, nxt)
+    }
+  }
+
+  pub def set(value: F64) { bits.store(math.float64bits(value).as_i64) }
+
+  def var_entry -> Entry { Entry.new(float: self) }
+  pub def as_float -> Float? { self }
+}
+
+# A new Float, 0 (Go's new(expvar.Float)).
+pub def make_float -> Float { Float.new(bits: Atomic.new(0)) }
+
+# ---------------------------------------------------------------- String
+
+# A string variable. Copies share it. to_s is the JSON string; value the
+# string itself.
+pub struct String {
+  s: Mutex[Str]
+
+  pub def value -> Str { s.lock { |v| v } }
+  pub def to_s -> Str { json_quote(value) }
+  pub def set(value: Str) { s.lock { |v| v = value } }
+
+  def var_entry -> Entry { Entry.new(string: self) }
+  pub def as_string -> String? { self }
+}
+
+# A new String, "" (Go's new(expvar.String)).
+pub def make_string -> String { String.new(s: Mutex.new("")) }
+
+# ------------------------------------------------------------------ Func
+
+# A Var whose value comes from calling f; its JSON is json.marshal of that
+# value ("" if marshaling fails, as Go).
+pub struct Func[T] {
+  f: () -> T
+
+  pub def value -> T { f.call }
+  pub def to_s -> Str { json.marshal(f.call).unwrap_or("") }
+}
+
+# Go's expvar.Func(f).
+pub def func[T](f: () -> T) -> Func[T] { Func[T].new(f: f) }
+
+# ----------------------------------------------------------------- Other
+
+# A Var of another type, as a Map holds it: its to_s.
+pub struct Other {
+  f: () -> Str
+
+  pub def to_s -> Str { f.call }
+  def var_entry -> Entry { Entry.new(other: self) }
+}
+
+# ------------------------------------------------------------------- Map
+
+# What a Map holds under a key: one of the fields (all none: Go's nil Var).
+struct Entry {
+  int: Int?
+  float: Float?
+  string: String?
+  map: @MapState?
+  map_sid: I64
+  other: Other?
+}
+
+# A Map's keys (sorted) and entries.
+struct MapState {
+  keys: [Str]
+  m: Map[Str, Entry]
+}
+
+# A registry's maps.
+struct Store {
+  sid: I64
+  maps: Pool[MapState]
+}
+
+# A string-to-Var map variable, itself a Var. A handle into its registry's
+# store (see the header); copies share it.
+pub struct Map {
+  st: Mutex[Store]
+  id: @MapState
+  sid: I64
+
+  # The Var under key, or none (absent, or set to none).
+  pub def get(key: Str) -> Var? {
+    e = st.lock { |s| s.maps[id].m[key] }
+    if x = e {
+      return to_var(x)
+    }
+    none
+  }
+
+  # Sets key to v (none: Go's nil Var, written as null).
+  pub def set(key: Str, v: Var?) {
+    e = Entry.new
+    if x = v {
+      e = x.var_entry
+    }
+    check_store(e)
+    st.lock { |s|
+      ms = s.maps[id]
+      ms.keys = insert_key(ms.keys, key) unless ms.m.has_key?(key)
+      ms.m[key] = e
+      s.maps[id] = ms
+      nil
+    }
+  }
+
+  # Adds delta to the Int under key, making it if key is absent; does
+  # nothing if key holds another kind of Var.
+  pub def add(key: Str, delta: I64) {
+    e = st.lock { |s|
+      ms = s.maps[id]
+      if !ms.m.has_key?(key) {
+        ms.keys = insert_key(ms.keys, key)
+        ms.m[key] = Entry.new(int: make_int)
+        s.maps[id] = ms
+      }
+      ms.m[key].unwrap
+    }
+    if i = e.int {
+      i.add(delta)
+    }
+  }
+
+  # Adds delta to the Float under key, making it if key is absent; does
+  # nothing if key holds another kind of Var.
+  pub def add_float(key: Str, delta: F64) {
+    e = st.lock { |s|
+      ms = s.maps[id]
+      if !ms.m.has_key?(key) {
+        ms.keys = insert_key(ms.keys, key)
+        ms.m[key] = Entry.new(float: make_float)
+        s.maps[id] = ms
+      }
+      ms.m[key].unwrap
+    }
+    if f = e.float {
+      f.add(delta)
+    }
+  }
+
+  # Removes key (nothing if it is absent).
+  pub def delete(key: Str) {
+    st.lock { |s|
+      ms = s.maps[id]
+      i = find_key(ms.keys, key)
+      if i < ms.keys.size && ms.keys[i] == key {
+        rest = ms.keys[i + 1...ms.keys.size]
+        keys = ms.keys[0...i]
+        keys += rest
+        ms.keys = keys
+        ms.m.delete(key)
+        s.maps[id] = ms
+      }
+      nil
+    }
+  }
+
+  # Calls f for each entry, in key order (on a snapshot: see the header).
+  pub def do(f: (KeyValue) -> Unit) {
+    kvs = st.lock { |s|
+      ms = s.maps[id]
+      out: [(Str, Entry)] = []
+      for k in ms.keys {
+        out << (k, ms.m[k].unwrap)
+      }
+      out
+    }
+    for kv in kvs {
+      f.call(KeyValue.new(key: kv[0], value: to_var(kv[1])))
+    }
+  }
+
+  # Removes every key; returns the map.
+  pub def init -> Map {
+    st.lock { |s|
+      s.maps[id] = MapState.new
+      nil
+    }
+    self
+  }
+
+  # `{"k": v, "k2": v2}`, keys sorted.
+  pub def to_s -> Str { json_of(false) }
+
+  pub def as_map -> Map? { self }
+
+  def var_entry -> Entry { Entry.new(map: id, map_sid: sid) }
+
+  # The JSON: pieces of text and leaf Vars taken under the lock, the leaves'
+  # to_s called after.
+  def json_of(expand: Bool) -> Str {
+    pieces = st.lock { |s|
+      out: [(Str, Entry?)] = []
+      snapshot(s, id, expand, out)
+    }
+    b: [Byte] = []
+    for p in pieces {
+      b += p[0].bytes.to_a
+      if e = p[1] {
+        b += leaf_json(e).bytes.to_a
+      }
+    }
+    Str.from_bytes(b)
+  }
+
+  # The Var an entry holds.
+  def to_var(e: Entry) -> Var? {
+    if i = e.int {
+      return i
+    }
+    if f = e.float {
+      return f
+    }
+    if s = e.string {
+      return s
+    }
+    if h = e.map {
+      return Map.new(st: st, id: h, sid: sid)
+    }
+    if o = e.other {
+      return o
+    }
+    none
+  }
+
+  # Panics if e is a Map from another registry.
+  def check_store(e: Entry) {
+    if e.map != none && e.map_sid != sid {
+      assert false, "expvar: Map from another Registry"
+    }
+  }
+}
+
+# The index of key in sorted keys, or where it would go.
+def find_key(keys: [Str], key: Str) -> I64 {
+  lo = 0
+  hi = keys.size
+  while lo < hi {
+    mid = (lo + hi) / 2
+    if keys[mid] < key {
+      lo = mid + 1
+    } else {
+      hi = mid
+    }
+  }
+  lo
+}
+
+# keys with key added in order.
+def insert_key(keys0: [Str], key: Str) -> [Str] {
+  keys = keys0
+  i = find_key(keys, key)
+  return keys if i < keys.size && keys[i] == key
+  keys << key
+  j = keys.size - 1
+  while j > i {
+    keys[j] = keys[j - 1]
+    j -= 1
+  }
+  keys[i] = key
+  keys
+}
+
+# Go's appendJSONMayExpand: the map's text with its leaves left as entries.
+def snapshot(s: Store, id: @MapState, expand: Bool, into: [(Str, Entry?)]) -> [(Str, Entry?)] {
+  out = into
+  ms = s.maps[id]
+  sep = expand ? ",\n" : ", "
+  nl = expand ? "\n" : ""
+  text = "{" + nl
+  first = true
+  for k in ms.keys {
+    text += sep unless first
+    first = false
+    text += json_quote(k) + ": "
+    e = ms.m[k].unwrap
+    if h = e.map {
+      out << (text, none)
+      text = ""
+      out = snapshot(s, h, false, out)
+    } else if e.int == none && e.float == none && e.string == none && e.other == none {
+      text += "null"
+    } else {
+      out << (text, e)
+      text = ""
+    }
+  }
+  out << (text + nl + "}" + nl, none)
+  out
+}
+
+# The JSON of a leaf entry (not a map).
+def leaf_json(e: Entry) -> Str {
+  if i = e.int {
+    return i.to_s
+  }
+  if f = e.float {
+    return f.to_s
+  }
+  if s = e.string {
+    return s.to_s
+  }
+  if o = e.other {
+    return o.to_s
+  }
+  "null"
+}
+
+# -------------------------------------------------------------- Registry
+
+# Go's package-level registry of published Vars (see the header): a Map
+# whose keys are the published names.
+pub struct Registry {
+  vars: Map
+
+  # Publishes v under name; panics if name is taken (Go's log.Panicln).
+  pub def publish(name: Str, v: Var) {
+    taken = vars.st.lock { |s| s.maps[vars.id].m.has_key?(name) }
+    if taken {
+      log.panicln("Reuse of exported var name: #{name}")
+    }
+    vars.set(name, v)
+  }
+
+  # The Var published under name, or none.
+  pub def get(name: Str) -> Var? { vars.get(name) }
+
+  # Calls f for each published Var, in name order.
+  pub def do(f: (KeyValue) -> Unit) { vars.do(f) }
+
+  # A new Int, published under name.
+  pub def new_int(name: Str) -> Int {
+    v = make_int
+    publish(name, v)
+    v
+  }
+
+  pub def new_float(name: Str) -> Float {
+    v = make_float
+    publish(name, v)
+    v
+  }
+
+  pub def new_string(name: Str) -> String {
+    v = make_string
+    publish(name, v)
+    v
+  }
+
+  # A new empty Map, published under name.
+  pub def new_map(name: Str) -> Map {
+    v = make_map
+    publish(name, v)
+    v
+  }
+
+  # A new empty Map in this registry, not published (Go's new(Map).Init()).
+  pub def make_map -> Map {
+    h = vars.st.lock { |s| s.maps.add(MapState.new) }
+    Map.new(st: vars.st, id: h, sid: vars.sid)
+  }
+
+  # Every published Var as Go's handler writes it: `{\n"name": v,\n...\n}\n`.
+  pub def json -> Str { vars.json_of(true) }
+
+  # The /debug/vars handler (Go's Handler()).
+  pub def handler -> (http.ResponseWriter, http.Request) -> Unit {
+    r = self
+    ->(w: http.ResponseWriter, _req: http.Request) {
+      w.header.set!("Content-Type", "application/json; charset=utf-8")
+      _ = w.write!(r.json.bytes.to_a)
+      nil
+    }
+  }
+
+  # Installs the handler on mux as "GET /debug/vars" (Go's init does it on
+  # http.DefaultServeMux).
+  pub def register(mux: http.ServeMux) {
+    mux.handle_func("GET /debug/vars", handler)
+  }
+
+  # Removes every published Var (Go's test-only RemoveAll).
+  def remove_all {
+    vars.init
+  }
+}
+
+# A registry without any Vars.
+pub def new_empty_registry -> Registry {
+  b: [Byte] = [0; 8]
+  c_getentropy(b, 8)
+  sid = 0
+  for x in b {
+    sid = (sid << 8) | x.to_i
+  }
+  st = Mutex.new(Store.new(sid: sid, maps: Pool[MapState].new))
+  h = st.lock { |s| s.maps.add(MapState.new) }
+  Registry.new(vars: Map.new(st: st, id: h, sid: sid))
+}
+
+# A registry with "cmdline" and "memstats" published, as Go's init does.
+pub def new_registry -> Registry {
+  r = new_empty_registry
+  r.publish("cmdline", func { StrList.new(v: os.args) })
+  r.publish("memstats", func { mem_stats })
+  r
+}
+
+# os.args as JSON (Go's cmdline Func).
+struct StrList {
+  v: [Str]
+
+  def json_enc(e: json.Encoder) {
+    e.raw!("[")
+    for i in 0...v.size {
+      e.raw!(",") if i > 0
+      e.str!(v[i])
+    }
+    e.raw!("]")
+  }
+}
+
+# The runtime's memory counters (Go's memstats Func; see the header).
+#[derive(Json)]
+pub struct MemStats {
+  #[json("HeldBytes")] held_bytes: I64
+  #[json("PeakHeldBytes")] peak_held_bytes: I64
+}
+
+# The runtime's memory counters now.
+pub def mem_stats -> MemStats {
+  MemStats.new(held_bytes: alx_mem_held, peak_held_bytes: alx_mem_peak)
+}
+
+# Go's appendJSONQuote: s as a JSON string, with <, >, & and U+2028/9 as
+# \u escapes and invalid UTF-8 as U+FFFD.
+def json_quote(s: Str) -> Str {
+  b: [Byte] = [34]
+  for r in s.runes {
+    if r < 32 || r == 92 || r == 34 || r == 60 || r == 62 || r == 38 || r == 0x2028 || r == 0x2029 {
+      if r == 92 || r == 34 {
+        b << 92
+        b << r.as_u8
+      } else if r == 10 {
+        b << 92
+        b << 110
+      } else if r == 13 {
+        b << 92
+        b << 114
+      } else if r == 9 {
+        b << 92
+        b << 116
+      } else {
+        b << 92
+        b << 117
+        b << HEX[(r >> 12) & 15]
+        b << HEX[(r >> 8) & 15]
+        b << HEX[(r >> 4) & 15]
+        b << HEX[r & 15]
+      }
+    } else if r < 128 {
+      b << r.as_u8
+    } else {
+      b = utf8.append_rune(b, r)
+    }
+  }
+  b << 34
+  Str.from_bytes(b)
+}

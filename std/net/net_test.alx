@@ -1,4 +1,5 @@
 import "io"
+import "os"
 
 def b(s: Str) -> [Byte] { s.bytes.to_a }
 
@@ -161,11 +162,89 @@ test "dial timeout succeeds when the peer answers" {
 }
 
 test "bad network and bad address" {
-  assert_eq dial("udp", "127.0.0.1:1").err.unwrap.message, "dial tcp 127.0.0.1:1: unknown network udp"
+  assert_eq dial("sctp", "127.0.0.1:1").err.unwrap.message, "dial sctp 127.0.0.1:1: unknown network sctp"
   assert dial("tcp", "nope").err?
 }
 
 test "lookup_host" {
   addrs = lookup_host("127.0.0.1").unwrap
   assert_eq addrs[0], "127.0.0.1"
+}
+
+# A short socket path in a fresh temp directory (sun_path holds ~104 bytes).
+def sock_path -> Str {
+  os.mkdir_temp("", "").unwrap + "/sock"
+}
+
+test "udp: dial sends datagrams to listen_packet" {
+  pc = listen_packet("udp", "127.0.0.1:0").unwrap
+  assert pc.local_addr.start_with?("127.0.0.1:"), pc.local_addr
+  c = dial("udp", pc.local_addr).unwrap
+  c.write!(b("one")).unwrap
+  c.write!(b("two!")).unwrap
+  buf: [Byte] = [0; 64]
+  n, from = pc.read_from!(buf).unwrap
+  assert_eq Str.from_bytes(buf[0...n]), "one"
+  assert_eq from, c.local_addr
+  n2, _ = pc.read_from!(buf).unwrap
+  assert_eq Str.from_bytes(buf[0...n2]), "two!"
+  c.close!.unwrap
+  pc.close!.unwrap
+}
+
+test "unixgram: dial sends datagrams to listen_packet" {
+  path = sock_path
+  pc = listen_packet("unixgram", path).unwrap
+  assert_eq pc.local_addr, path
+  c = dial("unixgram", path).unwrap
+  c.write!(b("hello")).unwrap
+  buf: [Byte] = [0; 64]
+  n, from = pc.read_from!(buf).unwrap
+  assert_eq Str.from_bytes(buf[0...n]), "hello"
+  assert_eq from, ""
+  c.close!.unwrap
+  pc.close!.unwrap
+  os.remove(path).unwrap
+}
+
+test "closing a packet conn wakes read_from" {
+  pc = listen_packet("udp", "127.0.0.1:0").unwrap
+  t = spawn {
+    buf: [Byte] = [0; 8]
+    pc.read_from!(buf).err?
+  }
+  os_sleep(20000000)
+  pc.close!.unwrap
+  assert t.wait.unwrap, "read_from didn't fail after close"
+}
+
+def os_sleep(ns: Int) { alx_sleep_ns(ns) }
+
+test "unix: stream echo, and close removes the socket file" {
+  path = sock_path
+  l = listen("unix", path).unwrap
+  t = spawn {
+    c = l.accept.unwrap
+    echo(c)
+  }
+  c = dial("unix", path).unwrap
+  c.write!(b("ping")).unwrap
+  c.close_write!.unwrap
+  got = io.read_all(c).unwrap
+  assert_eq Str.from_bytes(got), "ping"
+  assert_eq t.wait.unwrap, 4
+  c.close!.unwrap
+  assert os.stat(path).ok?, "socket file missing while listening"
+  l.close!.unwrap
+  assert !os.stat(path).ok?, "close didn't remove the socket file"
+}
+
+test "unix and unixgram errors" {
+  path = sock_path
+  e = dial("unix", path).err.unwrap
+  assert e.message.start_with?("dial unix #{path}: connect: "), e.message
+  e2 = dial("unixgram", path).err.unwrap
+  assert e2.message.start_with?("dial unixgram #{path}: connect: "), e2.message
+  e3 = listen_packet("tcp", "127.0.0.1:0").err.unwrap
+  assert_eq e3.message, "listen tcp 127.0.0.1:0: unknown network tcp"
 }

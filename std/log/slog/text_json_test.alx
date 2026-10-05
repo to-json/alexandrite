@@ -1,0 +1,187 @@
+# Go's text_handler_test.go and json_handler_test.go.
+
+import "encoding/json"
+import "errors"
+import "math"
+import "strconv"
+import "strings"
+import "time"
+
+# Go's test type `name`: a struct whose %+v Go prints through its String
+# method.
+struct NameS {
+  first: Str
+  last: Str
+
+  def log_text -> ~Str { last + ", " + first }
+  def log_json -> ~Str { "{\"First\":" + json.quote(first) + ",\"Last\":" + json.quote(last) + "}" }
+}
+
+# Go's TextAppender test type.
+struct TextAppend {
+  s: Str
+
+  def log_text -> ~Str {
+    fail errors.new("textAppend: empty string") if s == ""
+    "textAppend{\"" + s + "\"}"
+  }
+  def log_json -> ~Str { json.quote(s) }
+}
+
+# A struct printed by %+v (Go's `&struct{ A, b int }{A: 1, b: 2}`).
+struct AB {
+  a: Int
+  b: Int
+
+  def log_text -> ~Str { "&{A:#{a} b:#{b}}" }
+  def log_json -> ~Str { "{\"A\":#{a}}" }
+}
+
+def marshaler_ascii -> Str {
+  bs: [Byte] = []
+  i = 0
+  while i < 128 {
+    bs << i.as_u8
+    i += 1
+  }
+  Str.from_bytes(bs)
+}
+
+# Go's %q of a string.
+def go_q(s: Str) -> Str { strconv.quote(s) }
+
+test "text handler" {
+  ascii = marshaler_ascii
+  cases: [(Attr, Str, Str)] = [
+    (int("a", 1), "a", "1"),
+    (string("x = y", "qu\"o"), "\"x = y\"", "\"qu\\\"o\""),
+    (any("name", any_value(NameS.new(first: "Ren", last: "Hoek"))), "name", "\"Hoek, Ren\""),
+    (any("x", any_value(AB.new(a: 1, b: 2))), "x", "\"&{A:1 b:2}\""),
+    (any("t", any_value(TextM.new(s: "abc"))), "t", "\"text{\\\"abc\\\"}\""),
+    (any("t", any_value(TextM.new(s: ascii))), "t", strconv.quote("text{" + go_q(ascii) + "}")),
+    (any("t", any_value(TextM.new(s: ""))), "t", "\"!ERROR:text: empty string\""),
+    (any("t", any_value(TextAppend.new(s: "abc"))), "t", "\"textAppend{\\\"abc\\\"}\""),
+    (any("t", any_value(TextAppend.new(s: ""))), "t", "\"!ERROR:textAppend: empty string\""),
+    (any("a", nil_value), "a", "<nil>"),
+  ]
+  for c in cases {
+    for upper_keys in [false, true] {
+      buf = new_buf
+      opts = upper_keys ? HandlerOptions.new(replace_attr: ->(gs: [Str], a: Attr) -> Attr { upper_case_key(gs, a) }) : HandlerOptions.new
+      h = new_text_handler(buf, opts)
+      r = new_record(test_time, level_info, "a message", 0)
+      r.add_attrs!([c[0]])
+      h.handle(r).unwrap
+      got = buf.string
+      got = got[0...got.size - 1]
+      prefix = upper_keys ? "TIME=2000-01-02T03:04:05.000Z LEVEL=INFO MSG=\"a message\"" : "time=2000-01-02T03:04:05.000Z level=INFO msg=\"a message\""
+      key = upper_keys ? strings.to_upper(c[1]) : c[1]
+      assert_eq got, prefix + " " + key + "=" + c[2]
+    }
+  }
+}
+
+test "text handler preformatted" {
+  buf = new_buf
+  h = new_text_handler(buf, HandlerOptions.new).with_attrs([duration("dur", time.minute), bool("b", true)])
+  r = new_record(time.Time.new, Level.new(n: 0), "m", 0)
+  r.add_attrs!([int("a", 1)])
+  h.handle(r).unwrap
+  assert_eq strings.trim_suffix(buf.string, "\n"), "level=INFO msg=m dur=1m0s b=true a=1"
+}
+
+test "needs quoting" {
+  cases: [(Str, Bool)] = [("", true), ("ab", false), ("a=b", true), ("\"ab\"", true), ("\x07\x08", true), ("a\tb", true), ("µåπ", false), ("a b", true), ("badutf8" + Str.from_bytes([0xF6]), true)]
+  for c in cases {
+    assert_eq needs_quoting(c[0]), c[1]
+  }
+}
+
+# A map[string]int printed by encoding/json, as Go's TestJSONHandler logs.
+struct MapBI {
+  b: Int
+
+  def log_text -> ~Str { "map[b:#{b}]" }
+  def log_json -> ~Str { "{\"b\":#{b}}" }
+}
+
+test "json handler" {
+  for upper_keys in [false, true] {
+    buf = new_buf
+    opts = upper_keys ? HandlerOptions.new(replace_attr: ->(gs: [Str], a: Attr) -> Attr { upper_case_key(gs, a) }) : HandlerOptions.new
+    h = new_json_handler(buf, opts)
+    r = new_record(test_time, level_info, "m", 0)
+    r.add_attrs!([int("a", 1), any("m", any_value(MapBI.new(b: 2)))])
+    h.handle(r).unwrap
+    want = upper_keys ? "{\"TIME\":\"2000-01-02T03:04:05Z\",\"LEVEL\":\"INFO\",\"MSG\":\"m\",\"A\":1,\"M\":{\"b\":2}}" : "{\"time\":\"2000-01-02T03:04:05Z\",\"level\":\"INFO\",\"msg\":\"m\",\"a\":1,\"m\":{\"b\":2}}"
+    assert_eq strings.trim_suffix(buf.string, "\n"), want
+  }
+}
+
+test "json handler marshaler escaping" {
+  ascii = marshaler_ascii
+  buf = new_buf
+  h = new_json_handler(buf, HandlerOptions.new)
+  r = new_record(test_time, level_info, "m", 0)
+  r.add_attrs!([any("m", any_value(JsonM.new(s: ascii)))])
+  h.handle(r).unwrap
+  got = strings.trim_suffix(buf.string, "\n")
+  assert json.valid(got), "output is not valid JSON: #{got}"
+  for esc in ["\\\"", "\\\\", "\\t", "\\n", "\\u0000"] {
+    assert strings.contains(got, esc), "output does not contain #{esc}"
+  }
+  i = 0
+  while i < 32 {
+    assert strings.index_byte(got, i.as_u8) < 0, "unescaped control character #{i}"
+    i += 1
+  }
+  v = json.parse(got).unwrap
+  m = v.get("m").unwrap
+  assert_eq m.size, 1
+  assert_eq m.at(0).unwrap.as_str.unwrap, ascii
+}
+
+# Go's jsonValueString.
+def json_value_string(v: Value) -> Str {
+  st = new_state(Fmt.new(json: true), "", "")
+  if e = st.append_json_value!(v) {
+    st.append_error!(e)
+  }
+  st.buf
+}
+
+# Go's TestAppendJSONValue: the values and what Go's json.Encoder (without
+# HTML escaping) writes for them.
+test "append json value" {
+  cases: [(Value, Str)] = [
+    (string_value("hello\r\n\t\x07"), "\"hello\\r\\n\\t\\u0007\""),
+    (string_value("\"[{escape}]\""), "\"\\\"[{escape}]\\\"\""),
+    (string_value("<escapeHTML&>"), "\"<escapeHTML&>\""),
+    (string_value("θ  ￿" + Str.from_bytes([0xF6])), "\"θ\\u2028\\u2029￿�\""),
+    (string_value("-123"), "\"-123\""),
+    (int64_value(-9200123456789123456), "-9200123456789123456"),
+    (uint64_value(9200123456789123456), "9200123456789123456"),
+    (float64_value(-12.75), "-12.75"),
+    (float64_value(1.23e-9), "1.23e-9"),
+    (bool_value(false), "false"),
+    (duration_value(time.minute), "60000000000"),
+    (time_value(test_time), "\"2000-01-02T03:04:05Z\""),
+    (any_value(JsonM.new(s: "xyz")), "[\"xyz\"]"),
+    (level_value(level_warn), "\"WARN\""),
+  ]
+  for c in cases {
+    assert_eq json_value_string(c[0]), c[1]
+  }
+}
+
+test "json append attr value special" {
+  assert_eq json_value_string(float64_value(math.nan)), "\"!ERROR:json: unsupported value: NaN\""
+  assert_eq json_value_string(float64_value(math.inf(1))), "\"!ERROR:json: unsupported value: +Inf\""
+  assert_eq json_value_string(float64_value(math.inf(-1))), "\"!ERROR:json: unsupported value: -Inf\""
+  assert_eq json_value_string(error_value("EOF")), "\"EOF\""
+}
+
+bench "json handler" {
+  l = new(new_json_handler(new_buf, HandlerOptions.new)).with([string("program", "my-test-program"), string("package", "log/slog"), string("traceID", "2039232309232309"), string("URL", "https://pkg.go.dev/golang.org/x/log/slog")])
+  l.log_attrs(level_info, "this is a typical log message", [string("module", "github.com/google/go-cmp"), string("version", "v1.23.4"), int("count", 23), int("number", 123456)])
+}

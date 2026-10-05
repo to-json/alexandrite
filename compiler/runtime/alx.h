@@ -520,6 +520,8 @@ int64_t alx_sock_peer_addr(int64_t fd, uint8_t *out);
 int64_t alx_sock_set_nodelay(int64_t fd, int64_t on);
 int64_t alx_sock_shutdown(int64_t fd, int64_t how);
 int64_t alx_sock_lookup(const char *host, uint8_t *out, int64_t n);
+int64_t alx_sock_open(int64_t kind, const char *host, int64_t port, int64_t listen_, int64_t backlog);
+int64_t alx_sock_recvfrom(int64_t fd, uint8_t *buf, int64_t n, uint8_t *out);
 
 
 

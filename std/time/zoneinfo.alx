@@ -1,0 +1,924 @@
+# Time zones: Go's zoneinfo.go, zoneinfo_read.go and zoneinfo_unix.go.
+# A Location loaded from the IANA database (load_location, load_location_from_tzdata)
+# keeps the zones, the transitions and the TZ-string rule that extends them, as Go's
+# does; lookup is Go's (binary search, then the rule past the last transition), without
+# Go's one-zone cache (a Location is an immutable value here; the cache only saves the
+# binary search). The differences are listed in time.alx's header.
+
+extern def alx_sys_open(p: Str, flags: I32, mode: I32) -> I32
+extern def tz_read(fd: I32, buf: [Byte], n: Int) -> Int = "read"
+extern def tz_pread(fd: I32, buf: [Byte], n: Int, off: Int) -> Int = "pread"
+extern def tz_lseek(fd: I32, off: Int, whence: I32) -> Int = "lseek"
+extern def tz_close(fd: I32) -> I32 = "close"
+extern def tz_getenv(name: Str) -> Ptr = "getenv"
+
+# The beginning and end of time for zone transitions (Go's alpha and omega).
+ALPHA = -9223372036854775808
+OMEGA = 9223372036854775807
+
+SECONDS_PER_HOUR = 3600
+SECONDS_PER_MINUTE = 60
+
+# errnos the loader tells apart (the same on every Unix alx runs on)
+ENOENT = 2
+EINTR = 4
+
+# Go's maxFileSize: a zoneinfo file larger than this is refused.
+MAX_FILE_SIZE = 10485760
+
+# Where the system's zoneinfo files are (Go's platformZoneSources, zoneinfo_unix.go).
+def platform_zone_sources -> [Str] {
+  ["/usr/share/zoneinfo/", "/usr/share/lib/zoneinfo/", "/usr/lib/locale/TZ/", "/etc/zoneinfo"]
+}
+
+# A zone such as CET: its abbreviation, offset (seconds east of UTC) and whether
+# it is daylight saving time.
+struct Zone {
+  name: Str
+  offset: Int
+  is_dst: Bool
+}
+
+# A transition: from `when` (Unix seconds) on, zone[index] is in effect.
+struct ZoneTrans {
+  when: Int
+  index: Int
+  isstd: Bool
+  isutc: Bool
+}
+
+# Why a location didn't load (Go's messages).
+pub error LocationError {
+  Unknown(name: Str)
+  BadName
+  BadData
+  Errno(code: Int)
+  TooLarge(name: Str)
+  BadZip(msg: Str)
+
+  def message -> Str {
+    case self {
+      Unknown(n) => "unknown time zone #{n}"
+      BadName => "time: invalid location name"
+      BadData => "malformed time zone information"
+      Errno(c) => errno_text(c)
+      TooLarge(n) => "time: file #{n} is too large"
+      BadZip(m) => m
+    }
+  }
+}
+
+# Go's text for the errnos that opening and reading a zoneinfo file can give
+# (Linux and macOS numbers). A table rather than C's strerror, so that the
+# message doesn't need the C library (the browser backend has none).
+def errno_text(code: Int) -> Str {
+  case code {
+    1 => "operation not permitted"
+    2 => "no such file or directory"
+    4 => "interrupted system call"
+    5 => "input/output error"
+    9 => "bad file descriptor"
+    12 => "cannot allocate memory"
+    13 => "permission denied"
+    20 => "not a directory"
+    21 => "is a directory"
+    23 => "too many open files in system"
+    24 => "too many open files"
+    36 => "file name too long"
+    40 => "too many levels of symbolic links"
+    62 => "too many levels of symbolic links"
+    63 => "file name too long"
+    _ => "errno #{code}"
+  }
+}
+
+def enoent?(e: LocationError) -> Bool {
+  case e {
+    Errno(c) => c == ENOENT
+    _ => false
+  }
+}
+
+# A Location maps instants to the zone in use: UTC, the process's local zone
+# (asked of the C library), a fixed offset, or zones and transitions from the
+# tz database (kind 3) with `extend`, the TZ-string rule for instants after the
+# last transition ("PST8PDT,M3.2.0,M11.1.0").
+pub struct Location {
+  name: Str
+  offset: Int # seconds east of UTC (fixed zones)
+  kind: Int   # 0 UTC, 1 Local, 2 fixed, 3 tz database
+  zone: [Zone]
+  tx: [ZoneTrans]
+  extend: Str
+
+  pub def to_s -> Str { name }
+  pub def string -> Str { name }
+
+  # Go's lookup: the zone's abbreviation, offset, the start and end (Unix seconds)
+  # of the span around `sec` during which it is in effect, and whether it is DST.
+  # The local zone is the C library's offset and abbreviation only (no span, no
+  # DST flag): what conversions need, without reading files (the browser has none).
+  def lookup(sec: Int) -> (Str, Int, Int, Int, Bool) {
+    if kind == 0 {
+      return "UTC", 0, ALPHA, OMEGA, false
+    }
+    if kind == 1 {
+      return Str.from_cstr(alx_local_zone(sec)), alx_local_offset(sec), ALPHA, OMEGA, false
+    }
+    if kind == 2 {
+      return name, offset, ALPHA, OMEGA, false
+    }
+    if zone.size == 0 {
+      return "UTC", 0, ALPHA, OMEGA, false
+    }
+    if tx.size == 0 || sec < tx[0].when {
+      z = zone[self.lookup_first_zone]
+      e = tx.size > 0 ? tx[0].when : OMEGA
+      return z.name, z.offset, ALPHA, e, z.is_dst
+    }
+    # binary search for the entry with the largest time <= sec
+    e = OMEGA
+    lo = 0
+    hi = tx.size
+    while hi - lo > 1 {
+      m = (lo + hi) / 2
+      lim = tx[m].when
+      if sec < lim {
+        e = lim
+        hi = m
+      } else {
+        lo = m
+      }
+    }
+    z = zone[tx[lo].index]
+    start = tx[lo].when
+    # past the known transitions: the extend rule
+    if lo == tx.size - 1 && extend != "" {
+      if r = tzset(extend, start, sec) { return r }
+    }
+    return z.name, z.offset, start, e, z.is_dst
+  }
+
+  # The zone for times before the first transition (Go's lookupFirstZone, after
+  # tzcode's localtime.c): the first zone if no transition uses it; else, when
+  # the first transition is to DST, the closest standard zone before that one;
+  # else the first standard zone; else the first zone.
+  def lookup_first_zone -> Int {
+    return 0 if !self.first_zone_used?
+    if tx.size > 0 && zone[tx[0].index].is_dst {
+      zi = tx[0].index - 1
+      while zi >= 0 {
+        return zi if !zone[zi].is_dst
+        zi -= 1
+      }
+    }
+    for zi in 0...zone.size {
+      return zi if !zone[zi].is_dst
+    }
+    0
+  }
+
+  def first_zone_used? -> Bool {
+    for t in tx {
+      return true if t.index == 0
+    }
+    false
+  }
+
+  # Go's lookupName: the offset of the zone abbreviated `zname` (such as "EST")
+  # at the pseudo-Unix time `unix` (the wall clock read as UTC).
+  def lookup_name(zname: Str, unix: Int) -> Int? {
+    return local_lookup_name(zname, unix) if kind == 1
+    zs = self.zones
+    # first a zone with that name actually in effect at that time (in Sydney
+    # both standard and daylight time were "EST": the offset picks one)
+    for z in zs {
+      if z.name == zname {
+        nam, off, _, _, _ = self.lookup(unix - z.offset)
+        return off if nam == z.name
+      }
+    }
+    # then any zone with that name
+    for z in zs {
+      return z.offset if z.name == zname
+    }
+    none
+  }
+
+  # The zones (a fixed zone is one; UTC has none).
+  def zones -> [Zone] {
+    return [Zone.new(name: name, offset: offset, is_dst: false)] if kind == 2
+    zone
+  }
+
+  # lookup, with the span and DST flag of the local zone too: those come from the
+  # tz database's local zone (local_tz), when it agrees with the C library.
+  def lookup_full(sec: Int) -> (Str, Int, Int, Int, Bool) {
+    return local_lookup(sec) if kind == 1
+    self.lookup(sec)
+  }
+}
+
+# Go's lookupName for the local zone, whose zones the C library doesn't list: the
+# zones in effect around then (the instant, and half a year either side).
+def local_lookup_name(zname: Str, unix: Int) -> Int? {
+  cands: [Zone] = []
+  for probe in [unix, unix - 182 * SEC_PER_DAY, unix + 182 * SEC_PER_DAY] {
+    cands << Zone.new(name: Str.from_cstr(alx_local_zone(probe)), offset: alx_local_offset(probe))
+  }
+  for z in cands {
+    if z.name == zname {
+      return z.offset if Str.from_cstr(alx_local_zone(unix - z.offset)) == zname
+    }
+  }
+  for z in cands {
+    return z.offset if z.name == zname
+  }
+  none
+}
+
+# The local zone (the C library's offset and abbreviation), with the bounds and
+# DST flag of the tz database's local zone when it agrees.
+def local_lookup(sec: Int) -> (Str, Int, Int, Int, Bool) {
+  off = alx_local_offset(sec)
+  nm = Str.from_cstr(alx_local_zone(sec))
+  if l = local_tz() {
+    if l.kind == 3 {
+      n2, o2, s, e, d = l.lookup(sec)
+      if n2 == nm && o2 == off {
+        return nm, off, s, e, d
+      }
+    }
+  }
+  return nm, off, ALPHA, OMEGA, false
+}
+
+def getenv(name: Str) -> Str? {
+  p = tz_getenv(name)
+  return none if p.null?
+  Str.from_cstr(p)
+}
+
+# The tz database's local zone as Go's initLocal finds it: $TZ unset is
+# /etc/localtime ("Local"); TZ="" is UTC; TZ=":path" or "/path" is that file
+# (named by the path, or "Local" for /etc/localtime); TZ="Area/City" is that zone
+# from the system database. Anything that doesn't load is UTC.
+def local_tz -> Location? {
+  if tz0 = getenv("TZ") {
+    tz = tz0
+    tz = tz[1...tz.size] if tz != "" && tz[0].to_i == 58
+    if tz != "" && tz[0].to_i == 47 {
+      r = load_location_from(tz, [""])
+      if z = r.ok {
+        return rename(z, tz == "/etc/localtime" ? "Local" : tz)
+      }
+    } else if tz != "" && tz != "UTC" {
+      r = load_location_from(tz, platform_zone_sources())
+      if z = r.ok { return z }
+    }
+  } else {
+    r = load_location_from("localtime", ["/etc"])
+    if z = r.ok { return rename(z, "Local") }
+  }
+  Location.new(name: "UTC", kind: 0)
+}
+
+def rename(l: Location, name: Str) -> Location {
+  Location.new(name: name, offset: l.offset, kind: l.kind, zone: l.zone, tx: l.tx, extend: l.extend)
+}
+
+# Go's tzset: the zone at `sec` from a TZ-string rule (`s`, such as
+# "PST8PDT,M3.2.0,M11.1.0"), given the time of the last transition. Returns
+# lookup's values, or none if the string doesn't parse.
+def tzset(s0: Str, last_tx_sec: Int, sec: Int) -> (Str, Int, Int, Int, Bool)? {
+  s = s0
+  std_name = ""
+  dst_name = ""
+  std_offset = 0
+  dst_offset = 0
+  if nm1 = tzset_name(s) {
+    std_name = nm1[0]
+    s = nm1[1]
+  } else {
+    return none
+  }
+  if of1 = tzset_offset(s) {
+    std_offset = of1[0]
+    s = of1[1]
+  } else {
+    return none
+  }
+  # The numbers in the tzset string are added to local time to get UTC, but our
+  # offsets are added to UTC to get local time.
+  std_offset = 0 - std_offset
+
+  if s.size == 0 || s[0].to_i == 44 {
+    # no daylight saving time
+    return std_name, std_offset, last_tx_sec, OMEGA, false
+  }
+
+  if nm2 = tzset_name(s) {
+    dst_name = nm2[0]
+    s = nm2[1]
+  } else {
+    return none
+  }
+  if s.size == 0 || s[0].to_i == 44 {
+    dst_offset = std_offset + SECONDS_PER_HOUR
+  } else {
+    if of2 = tzset_offset(s) {
+      dst_offset = 0 - of2[0]
+      s = of2[1]
+    } else {
+      return none
+    }
+  }
+
+  # default DST rules per tzcode
+  s = ",M3.2.0,M11.1.0" if s.size == 0
+  # The TZ definition does not mention ';' here but tzcode accepts it.
+  return none if s[0].to_i != 44 && s[0].to_i != 59
+  s = s[1...s.size]
+
+  start_rule = TzRule.new()
+  end_rule = TzRule.new()
+  if ru1 = tzset_rule(s) {
+    start_rule = ru1[0]
+    s = ru1[1]
+  } else {
+    return none
+  }
+  return none if s.size == 0 || s[0].to_i != 44
+  s = s[1...s.size]
+  if ru2 = tzset_rule(s) {
+    end_rule = ru2[0]
+    s = ru2[1]
+  } else {
+    return none
+  }
+  return none if s.size > 0
+
+  # the start of sec's year (UTC) and the seconds since then
+  days = fdiv(sec, SEC_PER_DAY)
+  year, _, _ = civil_from_days(days)
+  yday = days - days_from_civil(year, 1, 1) + 1
+  ysec = (yday - 1) * SEC_PER_DAY + sec % SEC_PER_DAY
+  ystart = sec - ysec
+
+  start_sec = tzrule_time(year, start_rule, std_offset)
+  end_sec = tzrule_time(year, end_rule, dst_offset)
+  dst_is_dst = true
+  std_is_dst = false
+  # Southern hemispheres: the rules flip, and so do the labels.
+  if end_sec < start_sec {
+    t = start_sec
+    start_sec = end_sec
+    end_sec = t
+    n = std_name
+    std_name = dst_name
+    dst_name = n
+    o = std_offset
+    std_offset = dst_offset
+    dst_offset = o
+    b = std_is_dst
+    std_is_dst = dst_is_dst
+    dst_is_dst = b
+  }
+
+  # The start and end are accurate close to a transition, but otherwise just
+  # the start and end of the year: enough for date().
+  if ysec < start_sec {
+    return std_name, std_offset, ystart, start_sec + ystart, std_is_dst
+  } else if ysec >= end_sec {
+    return std_name, std_offset, end_sec + ystart, ystart + 365 * SEC_PER_DAY, std_is_dst
+  }
+  return dst_name, dst_offset, start_sec + ystart, end_sec + ystart, dst_is_dst
+}
+
+# The zone name at the start of a TZ string and the rest (Go's tzsetName).
+def tzset_name(s: Str) -> (Str, Str)? {
+  return none if s.size == 0
+  if s[0].to_i != 60 {
+    for i in 0...s.size {
+      c = s[i].to_i
+      if (c >= 48 && c <= 57) || c == 44 || c == 45 || c == 43 {
+        return none if i < 3
+        return s[0...i], s[i...s.size]
+      }
+    }
+    return none if s.size < 3
+    return s, ""
+  }
+  for i in 0...s.size {
+    if s[i].to_i == 62 {
+      return s[1...i], s[i + 1...s.size]
+    }
+  }
+  none
+}
+
+# The offset in seconds at the start of a TZ string and the rest (Go's tzsetOffset).
+def tzset_offset(s0: Str) -> (Int, Str)? {
+  s = s0
+  return none if s.size == 0
+  neg = false
+  if s[0].to_i == 43 {
+    s = s[1...s.size]
+  } else if s[0].to_i == 45 {
+    s = s[1...s.size]
+    neg = true
+  }
+  # The tzdata code permits values up to 24 * 7 here, although POSIX does not.
+  hours = 0
+  if r = tzset_num(s, 0, 24 * 7) {
+    hours = r[0]
+    s = r[1]
+  } else {
+    return none
+  }
+  off = hours * SECONDS_PER_HOUR
+  if s.size == 0 || s[0].to_i != 58 {
+    off = 0 - off if neg
+    return off, s
+  }
+  if r = tzset_num(s[1...s.size], 0, 59) {
+    off += r[0] * SECONDS_PER_MINUTE
+    s = r[1]
+  } else {
+    return none
+  }
+  if s.size == 0 || s[0].to_i != 58 {
+    off = 0 - off if neg
+    return off, s
+  }
+  if r = tzset_num(s[1...s.size], 0, 59) {
+    off += r[0]
+    s = r[1]
+  } else {
+    return none
+  }
+  off = 0 - off if neg
+  return off, s
+}
+
+RULE_JULIAN = 0
+RULE_DOY = 1
+RULE_MONTH_WEEK_DAY = 2
+
+# A rule of a TZ string: Jn (Julian day, no leap day), n (zero-based day of
+# year) or Mm.w.d (day d of week w of month m), at `time` seconds local time.
+struct TzRule {
+  kind: Int
+  day: Int
+  week: Int
+  mon: Int
+  time: Int
+}
+
+# Go's tzsetRule.
+def tzset_rule(s0: Str) -> (TzRule, Str)? {
+  s = s0
+  return none if s.size == 0
+  r = TzRule.new()
+  if s[0].to_i == 74 {
+    if n = tzset_num(s[1...s.size], 1, 365) {
+      r = TzRule.new(kind: RULE_JULIAN, day: n[0])
+      s = n[1]
+    } else {
+      return none
+    }
+  } else if s[0].to_i == 77 {
+    mon = 0
+    week = 0
+    day = 0
+    if n = tzset_num(s[1...s.size], 1, 12) {
+      mon = n[0]
+      s = n[1]
+    } else {
+      return none
+    }
+    return none if s.size == 0 || s[0].to_i != 46
+    if n = tzset_num(s[1...s.size], 1, 5) {
+      week = n[0]
+      s = n[1]
+    } else {
+      return none
+    }
+    return none if s.size == 0 || s[0].to_i != 46
+    if n = tzset_num(s[1...s.size], 0, 6) {
+      day = n[0]
+      s = n[1]
+    } else {
+      return none
+    }
+    r = TzRule.new(kind: RULE_MONTH_WEEK_DAY, day: day, week: week, mon: mon)
+  } else {
+    if n = tzset_num(s, 0, 365) {
+      r = TzRule.new(kind: RULE_DOY, day: n[0])
+      s = n[1]
+    } else {
+      return none
+    }
+  }
+  if s.size == 0 || s[0].to_i != 47 {
+    r.time = 2 * SECONDS_PER_HOUR # 2am is the default
+    return r, s
+  }
+  if o = tzset_offset(s[1...s.size]) {
+    r.time = o[0]
+    return r, o[1]
+  }
+  none
+}
+
+# A number in [min, max] at the start of s and the rest (Go's tzsetNum).
+def tzset_num(s: Str, min: Int, max: Int) -> (Int, Str)? {
+  return none if s.size == 0
+  num = 0
+  for i in 0...s.size {
+    c = s[i].to_i
+    if c < 48 || c > 57 {
+      return none if i == 0 || num < min
+      return num, s[i...s.size]
+    }
+    num = num * 10 + c - 48
+    return none if num > max
+  }
+  return none if num < min
+  return num, ""
+}
+
+# Days before the start of month m (1..12) in a common year.
+def days_before(m: Int) -> Int {
+  case m {
+    1 => 0
+    2 => 31
+    3 => 59
+    4 => 90
+    5 => 120
+    6 => 151
+    7 => 181
+    8 => 212
+    9 => 243
+    10 => 273
+    11 => 304
+    12 => 334
+    _ => 365
+  }
+}
+
+# Seconds since the start of `year` at which rule r takes effect, in a zone
+# `off` seconds east of UTC (Go's tzruleTime).
+def tzrule_time(year: Int, r: TzRule, off: Int) -> Int {
+  s = 0
+  if r.kind == RULE_JULIAN {
+    s = (r.day - 1) * SEC_PER_DAY
+    s += SEC_PER_DAY if is_leap(year) && r.day >= 60
+  } else if r.kind == RULE_DOY {
+    s = r.day * SEC_PER_DAY
+  } else if r.kind == RULE_MONTH_WEEK_DAY {
+    # Zeller's Congruence
+    m1 = (r.mon + 9) % 12 + 1
+    yy0 = year
+    yy0 -= 1 if r.mon <= 2
+    yy1 = yy0 / 100
+    yy2 = yy0 % 100
+    dow = ((26 * m1 - 2) / 10 + 1 + yy2 + yy2 / 4 + yy1 / 4 - 2 * yy1) % 7
+    dow += 7 if dow < 0
+    # dow is the weekday of the month's first day; the first `r.day` day:
+    d = r.day - dow
+    d += 7 if d < 0
+    i = 1
+    while i < r.week {
+      break if d + 7 >= days_in_month(year, r.mon)
+      d += 7
+      i += 1
+    }
+    d += days_before(r.mon)
+    d += 1 if is_leap(year) && r.mon > 2
+    s = d * SEC_PER_DAY
+  }
+  s + r.time - off
+}
+
+# --------------------------------------------------------------- loading
+
+# Go's LoadLocation. "" and "UTC" are UTC, "Local" the local zone; any other name
+# is a file of the IANA database ("America/New_York"), looked for in the directory
+# or uncompressed zip named by $ZONEINFO, then the system's (/usr/share/zoneinfo,
+# /usr/share/lib/zoneinfo, /usr/lib/locale/TZ, /etc/zoneinfo). Go would then try
+# $GOROOT/lib/time/zoneinfo.zip and an imported time/tzdata: here
+# `tzdata.load_location(name)` is this function plus the embedded database.
+pub def load_location(name: Str) -> ~Location<LocationError> {
+  return utc() if name == "" || name == "UTC"
+  return local() if name == "Local"
+  # No valid IANA name contains "..", or starts with a slash.
+  fail LocationError.BadName if contains_dot_dot?(name) || name[0].to_i == 47 || name[0].to_i == 92
+  first_err: LocationError? = none
+  zi = getenv("ZONEINFO") || ""
+  if zi != "" {
+    r = load_tzinfo_from_dir_or_zip(zi, name)
+    if data = r.ok {
+      z = load_location_from_tzdata(name, data)
+      return z.unwrap if z.ok?
+      first_err = as_loc_err(z.err)
+    } else if e = as_loc_err(r.err) {
+      first_err = e if !enoent?(e)
+    }
+  }
+  lr = load_location_from(name, platform_zone_sources())
+  return lr.unwrap if lr.ok?
+  if e = first_err { fail e }
+  if e2 = as_loc_err(lr.err) { fail e2 }
+  fail LocationError.Unknown(name)
+}
+
+def as_loc_err(e: Error?) -> LocationError? {
+  if x = e {
+    return case x {
+      LocationError.Unknown(n) => LocationError.Unknown(n)
+      LocationError.BadName => LocationError.BadName
+      LocationError.BadData => LocationError.BadData
+      LocationError.Errno(c) => LocationError.Errno(c)
+      LocationError.TooLarge(n) => LocationError.TooLarge(n)
+      LocationError.BadZip(m) => LocationError.BadZip(m)
+      _ => LocationError.BadZip(x.message)
+    }
+  }
+  none
+}
+
+def contains_dot_dot?(s: Str) -> Bool {
+  i = 0
+  while i + 1 < s.size {
+    return true if s[i].to_i == 46 && s[i + 1].to_i == 46
+    i += 1
+  }
+  false
+}
+
+# Go's loadLocation: the first of `sources` that has the zone; the first error
+# other than "no such file", or "unknown time zone".
+def load_location_from(name: Str, sources: [Str]) -> ~Location<LocationError> {
+  first_err: LocationError? = none
+  for source in sources {
+    r = load_tzinfo_from_dir_or_zip(source, name)
+    err: LocationError? = none
+    if data = r.ok {
+      z = load_location_from_tzdata(name, data)
+      return z.unwrap if z.ok?
+      err = as_loc_err(z.err)
+    } else {
+      err = as_loc_err(r.err)
+    }
+    if e = err {
+      first_err = e if first_err == none && !enoent?(e)
+    }
+  }
+  if e = first_err { fail e }
+  fail LocationError.Unknown(name)
+}
+
+# The zoneinfo file `name` from a directory, or from an uncompressed zip archive
+# if `dir` ends in ".zip".
+def load_tzinfo_from_dir_or_zip(dir: Str, name: Str) -> ~[Byte]<LocationError> {
+  return ~load_tzinfo_from_zip(dir, name) if dir.size > 4 && dir[dir.size - 4...dir.size] == ".zip"
+  path = dir != "" ? dir + "/" + name : name
+  ~read_file(path)
+}
+
+# The whole file (Go's readFile: an errno on failure, at most MAX_FILE_SIZE bytes).
+def read_file(name: Str) -> ~[Byte]<LocationError> {
+  fd = ~open_ro(name)
+  defer tz_close(fd)
+  buf: [Byte] = [0; 4096]
+  len = 0
+  loop {
+    if len == buf.size {
+      bigger: [Byte] = [0; buf.size * 2]
+      copy(bigger[0...len], buf[0...len])
+      buf = bigger
+    }
+    n = tz_read(fd, buf[len...buf.size], buf.size - len)
+    while n < 0 {
+      code = C.errno
+      fail LocationError.Errno(code) if code != EINTR
+      n = tz_read(fd, buf[len...buf.size], buf.size - len)
+    }
+    break if n == 0
+    len += n
+    fail LocationError.TooLarge(name) if len > MAX_FILE_SIZE
+  }
+  buf[0...len]
+}
+
+def open_ro(name: Str) -> ~I32<LocationError> {
+  fd = alx_sys_open(name, 0.to_i32, 0.to_i32) # O_RDONLY
+  while fd < 0 {
+    code = C.errno
+    fail LocationError.Errno(code) if code != EINTR
+    fd = alx_sys_open(name, 0.to_i32, 0.to_i32)
+  }
+  fd
+}
+
+# Reads len(buf) bytes at `off` (from the end if negative); false on a short read.
+def preadn(fd: I32, buf: [Byte], off0: Int) -> Bool {
+  off = off0
+  if off < 0 {
+    size = tz_lseek(fd, 0, 2.to_i32)
+    return false if size < 0
+    off += size
+    return false if off < 0
+  }
+  got = 0
+  while got < buf.size {
+    m = tz_pread(fd, buf[got...buf.size], buf.size - got, off + got)
+    if m < 0 && C.errno == EINTR {
+      m = 0
+    } else if m <= 0 {
+      return false
+    }
+    got += m
+  }
+  true
+}
+
+def get4(b: [Byte], i: Int) -> Int {
+  return 0 if b.size < i + 4
+  b[i].to_i | (b[i + 1].to_i << 8) | (b[i + 2].to_i << 16) | (b[i + 3].to_i << 24)
+}
+
+def get2(b: [Byte], i: Int) -> Int {
+  return 0 if b.size < i + 2
+  b[i].to_i | (b[i + 1].to_i << 8)
+}
+
+ZECHEADER = 0x06054b50
+ZCHEADER = 0x02014b50
+ZTAILSIZE = 22
+ZHEADERSIZE = 30
+ZHEADER = 0x04034b50
+
+# The file `name` in an uncompressed zip archive (Go's loadTzinfoFromZip: it reads
+# just the central directory and that entry).
+def load_tzinfo_from_zip(zipfile: Str, name: Str) -> ~[Byte]<LocationError> {
+  fd = ~open_ro(zipfile)
+  defer tz_close(fd)
+  corrupt = LocationError.BadZip("corrupt zip file " + zipfile)
+  buf: [Byte] = [0; ZTAILSIZE]
+  fail corrupt if !preadn(fd, buf, 0 - ZTAILSIZE) || get4(buf, 0) != ZECHEADER
+  n = get2(buf, 10)
+  size = get4(buf, 12)
+  off = get4(buf, 16)
+
+  dir: [Byte] = [0; size]
+  fail corrupt if !preadn(fd, dir, off)
+  p = 0
+  for _i in 0...n {
+    break if get4(dir, p) != ZCHEADER
+    meth = get2(dir, p + 10)
+    fsize = get4(dir, p + 24)
+    namelen = get2(dir, p + 28)
+    xlen = get2(dir, p + 30)
+    fclen = get2(dir, p + 32)
+    foff = get4(dir, p + 42)
+    zname = p + 46 + namelen <= dir.size ? Str.from_bytes(dir[p + 46...p + 46 + namelen]) : ""
+    p += 46 + namelen + xlen + fclen
+    next if zname != name
+    fail LocationError.BadZip("unsupported compression for " + name + " in " + zipfile) if meth != 0
+
+    h: [Byte] = [0; ZHEADERSIZE + namelen]
+    ok = preadn(fd, h, foff)
+    fail corrupt if !ok || get4(h, 0) != ZHEADER || get2(h, 8) != meth || get2(h, 26) != namelen || Str.from_bytes(h[30...30 + namelen]) != name
+    xlen = get2(h, 28)
+
+    data: [Byte] = [0; fsize]
+    fail corrupt if !preadn(fd, data, foff + 30 + namelen + xlen)
+    return data
+  }
+  fail LocationError.Errno(ENOENT)
+}
+
+# ------------------------------------------------------------ TZif reading
+
+# Reads TZif data from position `pos` (Go's dataIO, without its sticky error:
+# a short read is malformed data straight away).
+def big4(d: [Byte], pos: Int) -> ~Int<LocationError> {
+  fail LocationError.BadData if pos + 4 > d.size
+  (d[pos].to_i << 24) | (d[pos + 1].to_i << 16) | (d[pos + 2].to_i << 8) | d[pos + 3].to_i
+}
+
+# A big-endian 32-bit number at d[pos] (in bounds).
+def be4(d: [Byte], pos: Int) -> Int {
+  (d[pos].to_i << 24) | (d[pos + 1].to_i << 16) | (d[pos + 2].to_i << 8) | d[pos + 3].to_i
+}
+
+def take(d: [Byte], pos: Int, n: Int) -> ~[Byte]<LocationError> {
+  fail LocationError.BadData if n < 0 || pos + n > d.size
+  d[pos...pos + n]
+}
+
+# The bytes up to the first NUL, as a string (Go's byteString).
+def byte_string(p: [Byte]) -> Str {
+  i = 0
+  while i < p.size && p[i] != 0 { i += 1 }
+  Str.from_bytes(p[0...i])
+}
+
+# Go's LoadLocationFromTZData: a Location named `name` from the content of an
+# IANA zoneinfo file (TZif, versions 1 to 3).
+pub def load_location_from_tzdata(name: Str, data: [Byte]) -> ~Location<LocationError> {
+  magic = ~take(data, 0, 4)
+  fail LocationError.BadData if Str.from_bytes(magic) != "TZif"
+  p = ~take(data, 4, 16)
+  version = 0
+  v0 = p[0].to_i
+  if v0 == 0 {
+    version = 1
+  } else if v0 == 50 {
+    version = 2
+  } else if v0 == 51 {
+    version = 3
+  } else {
+    fail LocationError.BadData
+  }
+  pos = 20
+  # counts: isutc, isstd, leap, time, zone, char
+  n: [Int] = [0; 6]
+  for i in 0...6 {
+    n[i] = ~big4(data, pos)
+    pos += 4
+  }
+  # Version 2 and later repeat the data with 64-bit times: skip the 32-bit part.
+  is64 = false
+  if version > 1 {
+    skip = n[3] * 4 + n[3] + n[4] * 6 + n[5] + n[2] * 8 + n[1] + n[0]
+    skip += 4 + 16
+    fail LocationError.BadData if pos + skip > data.size
+    pos += skip
+    is64 = true
+    for i in 0...6 {
+      n[i] = ~big4(data, pos)
+      pos += 4
+    }
+  }
+  size = is64 ? 8 : 4
+  ntx = n[3]
+  ntimes = ntx * size
+  nzonedata = n[4] * 6
+  nchar = n[5]
+  nleap = n[2] * (size + 4)
+  nstd = n[1]
+  nutc = n[0]
+  txtimes = ~take(data, pos, ntimes)
+  pos += ntimes
+  txzones = ~take(data, pos, ntx)
+  pos += ntx
+  zonedata = ~take(data, pos, nzonedata)
+  pos += nzonedata
+  abbrev = ~take(data, pos, nchar)
+  pos += nchar
+  _leap = ~take(data, pos, nleap)
+  pos += nleap
+  isstd = ~take(data, pos, nstd)
+  pos += nstd
+  isutc = ~take(data, pos, nutc)
+  pos += nutc
+
+  # the TZ string after the data, between newlines
+  extend = ""
+  rest = data[pos...data.size]
+  if rest.size > 2 && rest[0] == 10 && rest[rest.size - 1] == 10 {
+    extend = Str.from_bytes(rest[1...rest.size - 1])
+  }
+
+  nzone = n[4]
+  fail LocationError.BadData if nzone == 0
+  zones: [Zone] = []
+  for i in 0...nzone {
+    off = be4(zonedata, i * 6).as_i32.to_i
+    dst = zonedata[i * 6 + 4] != 0
+    b = zonedata[i * 6 + 5].to_i
+    fail LocationError.BadData if b >= abbrev.size
+    zones << Zone.new(name: byte_string(abbrev[b...abbrev.size]), offset: off, is_dst: dst)
+  }
+
+  tx: [ZoneTrans] = []
+  for i in 0...n[3] {
+    w = 0
+    if is64 {
+      w = (be4(txtimes, i * 8) << 32) | be4(txtimes, i * 8 + 4)
+    } else {
+      w = be4(txtimes, i * 4).as_i32.to_i
+    }
+    idx = txzones[i].to_i
+    fail LocationError.BadData if idx >= zones.size
+    tx << ZoneTrans.new(when: w, index: idx, isstd: i < isstd.size && isstd[i] != 0, isutc: i < isutc.size && isutc[i] != 0)
+  }
+  # Build fake transition to cover all time. This happens in fixed locations
+  # like "Etc/GMT0".
+  tx << ZoneTrans.new(when: ALPHA, index: 0) if tx.size == 0
+
+  Location.new(name: name, kind: 3, zone: zones, tx: tx, extend: extend)
+}

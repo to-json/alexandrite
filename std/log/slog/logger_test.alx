@@ -1,0 +1,221 @@
+# Go's logger_test.go and multi_handler_test.go.
+
+import "errors"
+import "log"
+import "time"
+
+test "log text handler" {
+  buf = new_buf
+  l = new(new_text_handler(buf, HandlerOptions.new))
+  check = ->(want: Str) -> Bool {
+    w = want == "" ? "" : "time=" + TEXT_TIME_RE + " " + want
+    ok = check_log(buf.string, w)
+    buf.reset
+    ok
+  }
+  l.info("msg", [int("a", 1), int("b", 2)])
+  assert check.call("level=INFO msg=msg a=1 b=2")
+  l.debug("bg", [int("a", 1), int("b", 2)])
+  assert check.call("")
+  l.warn("w", [duration("dur", time.second * 3)])
+  assert check.call("level=WARN msg=w dur=3s")
+  l.error("bad", [int("a", 1)])
+  assert check.call("level=ERROR msg=bad a=1")
+  l.log(level_warn + 1, "w", [int("a", 1), string("b", "two")])
+  assert check.call("level=WARN\\+1 msg=w a=1 b=two")
+  l.log_attrs(level_info + 1, "a b c", [int("a", 1), string("b", "two")])
+  assert check.call("level=INFO\\+1 msg=\"a b c\" a=1 b=two")
+  l.info("info", [group("a", [int("i", 1)])])
+  assert check.call("level=INFO msg=info a.i=1")
+  l.info("info", [any("a", group_value([int("i", 1)]))])
+  assert check.call("level=INFO msg=info a.i=1")
+}
+
+# Go's TestConnections, for the direction alexandrite has: the default
+# handler writes through a log.Logger (here one with LSHORTFILE, which
+# writes ???:0 without caller locations).
+test "connections" {
+  logbuf = new_buf
+  l = new(new_default_handler(log.new(logbuf, "", log.LSHORTFILE)))
+  l.info("msg", [int("a", 1)])
+  assert check_log(logbuf.string, "\\?\\?\\?:0: INFO msg a=1")
+  logbuf.reset
+  l.info("msg", [any("p", nil_value)])
+  assert check_log(logbuf.string, "\\?\\?\\?:0: INFO msg p=<nil>")
+  logbuf.reset
+  l.warn("msg", [int("b", 2)])
+  assert check_log(logbuf.string, "\\?\\?\\?:0: WARN msg b=2")
+  logbuf.reset
+  l.error("msg", [err("err", errors.new("EOF")), int("c", 3)])
+  assert check_log(logbuf.string, "\\?\\?\\?:0: ERROR msg err=EOF c=3")
+  logbuf.reset
+  l.debug("msg", [int("c", 3)])
+  assert check_log(logbuf.string, "")
+  # wrap default handler
+  w = new(WrappingHandler[DefaultHandler[SharedBuf]].new(h: new_default_handler(log.new(logbuf, "", log.LSHORTFILE))))
+  w.info("msg", [int("d", 4)])
+  assert check_log(logbuf.string, "\\?\\?\\?:0: INFO msg d=4")
+}
+
+# Go's wrappingHandler, generic over what it wraps (a handler can't hold a
+# Handler value and be one: see the header).
+struct WrappingHandler[H] {
+  h: H
+
+  def enabled?(level: Level) -> Bool { h.enabled?(level) }
+  def with_group(name: Str) -> WrappingHandler[H] { WrappingHandler[H].new(h: h.with_group(name)) }
+  def with_attrs(as: [Attr]) -> WrappingHandler[H] { WrappingHandler[H].new(h: h.with_attrs(as)) }
+  def handle(r: Record) -> ~Unit { ~h.handle(r) }
+}
+
+# Go's captureHandler: records what it was given (copies share the state).
+struct Capture {
+  r: Record
+  attrs: [Attr]
+  groups: [Str]
+}
+
+struct CaptureHandler {
+  st: Mutex[Capture]
+
+  def enabled?(level: Level) -> Bool { true }
+  def handle(r: Record) -> ~Unit {
+    st.lock { |c| c.r = r }
+    nil
+  }
+  def with_attrs(as: [Attr]) -> CaptureHandler {
+    c = st.lock { |c| c }
+    CaptureHandler.new(st: Mutex.new(Capture.new(r: c.r, groups: c.groups, attrs: (c.attrs + as).dup)))
+  }
+  def with_group(name: Str) -> CaptureHandler {
+    c = st.lock { |c| c }
+    CaptureHandler.new(st: Mutex.new(Capture.new(r: c.r, attrs: c.attrs, groups: c.groups + [name])))
+  }
+}
+
+def new_capture -> CaptureHandler { CaptureHandler.new(st: Mutex.new(Capture.new)) }
+
+test "attrs" {
+  h1 = new_capture.with_attrs([int("a", 1)])
+  h = h1.with_attrs([int("b", 2)])
+  new(h).info("m", [int("c", 3)])
+  c = h.st.lock { |c| c }
+  assert attrs_equal(c.attrs, [int("a", 1), int("b", 2)])
+  assert attrs_equal(attrs_of(c.r), [int("c", 3)])
+}
+
+test "logger error" {
+  buf = new_buf
+  l = new(new_text_handler(buf, HandlerOptions.new(replace_attr: remove_keys([TIME_KEY]))))
+  l.error("msg", [err("err", errors.new("EOF")), int("a", 1)])
+  assert check_log(buf.string, "level=ERROR msg=msg err=EOF a=1")
+}
+
+test "new log logger" {
+  buf = new_buf
+  h = new_text_handler(buf, HandlerOptions.new)
+  ll = new_log_logger(h, level_warn)
+  ll.print("hello")
+  assert check_log(buf.string, "time=" + TEXT_TIME_RE + " level=WARN msg=hello")
+  # The writer's level: below the handler's minimum, nothing is written.
+  buf.reset
+  new_log_logger(new_text_handler(buf, HandlerOptions.new(level: level_error)), level_warn).print("no")
+  assert_eq buf.string, ""
+}
+
+test "logger no ops" {
+  # Go checks identity (l.With() == l); a Logger is a value here: the
+  # result writes the same.
+  buf = new_buf
+  l = new(new_text_handler(buf, HandlerOptions.new(replace_attr: remove_keys([TIME_KEY]))))
+  l.with([]).info("a", [])
+  l.with_group("").info("b", [int("x", 1)])
+  assert_eq buf.string, "level=INFO msg=a\nlevel=INFO msg=b x=1\n"
+}
+
+test "default logger" {
+  # Writes to stderr through std/log; only check that it is enabled at INFO.
+  assert default.enabled?(level_info)
+  assert !default.enabled?(level_debug)
+  d = new_default_handler(log.new(new_buf, "", 0))
+  d.level_var.set(level_debug)
+  assert d.enabled?(level_debug)
+}
+
+# --------------------------------------------------------- MultiHandler
+
+# Go's mockFailingHandler: handles, then fails.
+struct FailingHandler[H] {
+  h: H
+  msg: Str
+
+  def enabled?(level: Level) -> Bool { h.enabled?(level) }
+  def handle(r: Record) -> ~Unit {
+    _ = h.handle(r)
+    fail errors.new(msg)
+  }
+  def with_attrs(as: [Attr]) -> FailingHandler[H] { FailingHandler[H].new(h: h.with_attrs(as), msg: msg) }
+  def with_group(name: Str) -> FailingHandler[H] { FailingHandler[H].new(h: h.with_group(name), msg: msg) }
+}
+
+test "multi handler" {
+  # Handle sends log to all handlers
+  b1 = new_buf
+  b2 = new_buf
+  logger = new(new_multi_handler([new_text_handler(b1, HandlerOptions.new), new_json_handler(b2, HandlerOptions.new)]))
+  logger.info("hello world", [string("user", "test")])
+  assert check_log(b1.string, "time=" + TEXT_TIME_RE + " level=INFO msg=\"hello world\" user=test")
+  assert check_log(b2.string, "\\{\"time\":\"" + JSON_TIME_RE + "\",\"level\":\"INFO\",\"msg\":\"hello world\",\"user\":\"test\"\\}")
+
+  # Enabled returns true if any handler is enabled
+  m = new_multi_handler([new_text_handler(new_buf, HandlerOptions.new(level: level_error)), new_text_handler(new_buf, HandlerOptions.new(level: level_info))])
+  assert m.enabled?(level_info)
+  assert m.enabled?(level_error)
+  # ... and false if none is
+  assert !m.enabled?(level_debug)
+
+  # WithAttrs propagates attributes to all handlers
+  b1 = new_buf
+  b2 = new_buf
+  m = new_multi_handler([new_text_handler(b1, HandlerOptions.new), new_json_handler(b2, HandlerOptions.new)]).with_attrs([string("request_id", "123")])
+  new(m).info("request processed", [])
+  assert check_log(b1.string, "time=" + TEXT_TIME_RE + " level=INFO msg=\"request processed\" request_id=123")
+  assert check_log(b2.string, "\\{\"time\":\"" + JSON_TIME_RE + "\",\"level\":\"INFO\",\"msg\":\"request processed\",\"request_id\":\"123\"\\}")
+
+  # WithGroup propagates group to all handlers
+  b1 = new_buf
+  b2 = new_buf
+  m = new_multi_handler([new_text_handler(b1, HandlerOptions.new), new_json_handler(b2, HandlerOptions.new)]).with_group("req")
+  new(m).info("user login", [int("user_id", 42)])
+  assert check_log(b1.string, "time=" + TEXT_TIME_RE + " level=INFO msg=\"user login\" req.user_id=42")
+  assert check_log(b2.string, "\\{\"time\":\"" + JSON_TIME_RE + "\",\"level\":\"INFO\",\"msg\":\"user login\",\"req\":\\{\"user_id\":42\\}\\}")
+
+  # Handle propagates errors from handlers
+  b1 = new_buf
+  b2 = new_buf
+  f = FailingHandler[JSONHandler[SharedBuf]].new(h: new_json_handler(b2, HandlerOptions.new), msg: "mock failing")
+  m = new_multi_handler([f, new_text_handler(b1, HandlerOptions.new)])
+  e = m.handle(new_record(time.now, level_info, "test message", 0)).err
+  assert_eq e.unwrap.message, "mock failing"
+  assert check_log(b1.string, "time=" + TEXT_TIME_RE + " level=INFO msg=\"test message\"")
+  assert check_log(b2.string, "\\{\"time\":\"" + JSON_TIME_RE + "\",\"level\":\"INFO\",\"msg\":\"test message\"\\}")
+
+  # Handle with no handlers
+  m = new_multi_handler([])
+  new(m).info("nothing", [])
+  assert m.handle(new_record(time.now, level_info, "test", 0)).ok?
+}
+
+test "new multi handler copy" {
+  b1 = new_buf
+  hs: [LeafHandler] = [new_text_handler(b1, HandlerOptions.new)]
+  m = new_multi_handler(hs)
+  hs[0] = discard_handler
+  assert m.handle(new_record(time.now, level_info, "test message", 0)).ok?
+  assert check_log(b1.string, "time=" + TEXT_TIME_RE + " level=INFO msg=\"test message\"")
+}
+
+bench "nop log attrs" {
+  l = new(new_capture)
+  l.log_attrs(level_info, "msg", [int("a", 1), string("b", "two"), bool("c", true)])
+}

@@ -41,22 +41,26 @@
 #     norm_float64! and exp_float64! do Go's float32 arithmetic by rounding
 #     each operation to float32 (exact: a double holds every float32 sum
 #     and product before rounding).
-#   - The top-level functions draw from the operating system's CSPRNG
-#     (getentropy(3)) through a small buffer per call, where Go uses its
-#     runtime's per-thread ChaCha8 seeded by the OS; both are unpredictable
-#     and unseedable, so the only difference is speed (a system call per
-#     top-level call). In the browser the wasm backend refuses programs
-#     that call getentropy (only the time/sleep FFI is provided), so use a
+#   - The top-level functions share one global Rand (Go's
+#     globalRandGenerator), a package-level Mutex (R11) chosen on the first
+#     top-level call. By default it draws from the operating system's
+#     CSPRNG (getentropy(3), 256 bytes at a time), where Go uses its
+#     runtime's per-thread ChaCha8 seeded by the OS: both are unpredictable
+#     and unseedable. In the browser the wasm backend refuses programs that
+#     call getentropy (only the time/sleep FFI is provided), so use a
 #     seeded Rand there.
-#   - seed(seed) is always a no-op (Go 1.24's default). Go's GODEBUG
-#     opt-outs randseednop=0 / randautoseed=0, which make the global source
-#     a seeded rngSource, aren't supported: alx has no mutable package
-#     state to hold it (docs/notes/port-issues.md #30). Use new(new_source(s)).
-#   - Read is only r.read! and read(p); Go's lockedSource and the Rand's
-#     interplay with it (seedPos) have no counterpart since nothing here is
-#     global.
+#   - seed(seed) is a no-op (Go 1.24's default). As in Go, GODEBUG
+#     randseednop=0 makes it seed the global Rand: it switches to Go's
+#     lockedSource (an rngSource) and every later top-level call follows
+#     that seed's sequence; GODEBUG randautoseed=0 starts the global Rand as
+#     an rngSource seeded with 1. GODEBUG is read from the environment (the
+#     last setting of a name wins); go.mod's godebug lines don't exist here.
+#   - Read is only r.read! and read(p); Go's lockedSource's interplay with
+#     a Rand's read position (seedPos) has no counterpart: a top-level call
+#     holds the global Rand's lock throughout.
 
 import "math"
+import "os"
 
 extern def c_getentropy(buf: [Byte], n: Int) -> I32 = "getentropy"
 
@@ -354,7 +358,7 @@ pub def new_zipf(r: Rand, s: Float, v: Float, imax: U64) -> Zipf? {
 
 # ---- top-level functions: the operating system's random bytes ----
 
-OS_BUF = 64
+OS_BUF = 256
 
 struct OsState {
   buf: [Byte]
@@ -385,102 +389,200 @@ struct OsSource {
   }
 }
 
-# A Rand over the operating system's randomness, for one top-level call.
-def global -> Rand {
-  new(OsSource.new(st: [OsState.new(buf: [0.as_u8; OS_BUF], off: OS_BUF)]))
+# The top-level functions' Rand (Go's globalRandGenerator), chosen on the
+# first top-level call (`start!`).
+struct GlobalRand {
+  started: Bool
+  # r is Go's lockedSource (a seeded rngSource), not the OS's randomness.
+  locked: Bool
+  r: Rand?
+
+  def start! {
+    return if started
+    self.started = true
+    if godebug("randautoseed") == "0" {
+      self.r = new(new_rng_source(1))
+      self.locked = true
+    } else {
+      self.r = new(OsSource.new(st: [OsState.new(buf: [0.as_u8; OS_BUF], off: OS_BUF)]))
+    }
+  }
+
+  # The global Rand (copies share its state).
+  def cur! -> Rand {
+    start!()
+    r.unwrap
+  }
 }
 
-# Deprecated (Go): a no-op, as Go's Seed is by default since Go 1.24.
-# Use new(new_source(seed)) for a deterministic sequence.
+# R11: the global Rand, behind its lock.
+GLOBAL = Mutex.new(GlobalRand.new(started: false, locked: false, r: none))
+
+# The value of setting `name` in the GODEBUG environment variable
+# (`name=value,...`; the last one wins), or "".
+def godebug(name: Str) -> Str {
+  v = ""
+  if env = os.getenv("GODEBUG") {
+    for kv in env.split(",") {
+      parts = kv.split("=")
+      v = kv[name.size + 1...kv.size] if parts.size >= 2 && parts[0] == name
+    }
+  }
+  v
+}
+
+# Deprecated (Go): a no-op, as Go's Seed is by default since Go 1.24. With
+# GODEBUG randseednop=0, seeds the global Rand: later top-level calls give
+# the sequence of new(new_source(seed)). Use new(new_source(seed)) for a
+# deterministic sequence of your own.
 pub def seed(seed: Int) {
+  return if godebug("randseednop") != "0"
+  GLOBAL.lock { |g|
+    g.started = true
+    if g.locked {
+      r = g.r.unwrap
+      r.seed!(seed)
+    } else {
+      g.r = new(new_rng_source(seed))
+      g.locked = true
+    }
+    nil
+  }
 }
 
 # A non-negative random 63-bit integer from the default source.
 pub def int63 -> Int {
-  r = global()
-  r.int63!()
+  GLOBAL.lock { |g|
+    r = g.cur!()
+    r.int63!()
+  }
 }
 
 # A random 32-bit value from the default source.
 pub def uint32 -> U32 {
-  r = global()
-  r.uint32!()
+  GLOBAL.lock { |g|
+    r = g.cur!()
+    r.uint32!()
+  }
 }
 
 # A random 64-bit value from the default source.
 pub def uint64 -> U64 {
-  r = global()
-  r.uint64!()
+  GLOBAL.lock { |g|
+    r = g.cur!()
+    r.uint64!()
+  }
 }
 
 # A non-negative random 31-bit integer from the default source.
 pub def int31 -> I32 {
-  r = global()
-  r.int31!()
+  GLOBAL.lock { |g|
+    r = g.cur!()
+    r.int31!()
+  }
 }
 
 # A non-negative random Int from the default source.
 pub def int -> Int {
-  r = global()
-  r.int!()
+  GLOBAL.lock { |g|
+    r = g.cur!()
+    r.int!()
+  }
 }
 
 # A non-negative random number in [0, n) from the default source. Panics if n <= 0.
 pub def int63n(n: Int) -> Int {
-  r = global()
-  r.int63n!(n)
+  panic("invalid argument to Int63n") if n <= 0
+  GLOBAL.lock { |g|
+    r = g.cur!()
+    r.int63n!(n)
+  }
 }
 
 # A non-negative random number in [0, n) from the default source. Panics if n <= 0.
 pub def int31n(n: I32) -> I32 {
-  r = global()
-  r.int31n!(n)
+  panic("invalid argument to Int31n") if n <= 0
+  GLOBAL.lock { |g|
+    r = g.cur!()
+    r.int31n!(n)
+  }
 }
 
 # A non-negative random number in [0, n) from the default source. Panics if n <= 0.
 pub def intn(n: Int) -> Int {
-  r = global()
-  r.intn!(n)
+  panic("invalid argument to Intn") if n <= 0
+  GLOBAL.lock { |g|
+    r = g.cur!()
+    r.intn!(n)
+  }
 }
 
 # A random number in [0.0, 1.0) from the default source.
 pub def float64 -> Float {
-  r = global()
-  r.float64!()
+  GLOBAL.lock { |g|
+    r = g.cur!()
+    r.float64!()
+  }
 }
 
 # A random float32 in [0.0, 1.0) (as a Float) from the default source.
 pub def float32 -> Float {
-  r = global()
-  r.float32!()
+  GLOBAL.lock { |g|
+    r = g.cur!()
+    r.float32!()
+  }
 }
 
 # A random permutation of the integers [0, n) from the default source.
 pub def perm(n: Int) -> [Int] {
-  r = global()
-  r.perm!(n)
+  GLOBAL.lock { |g|
+    r = g.cur!()
+    r.perm!(n)
+  }
 }
 
-# Randomizes the order of n elements with the default source.
+# Randomizes the order of n elements with the default source. (Each draw
+# takes the global lock on its own, so swap may use the top-level
+# functions.)
 pub def shuffle(n: Int, swap: (Int, Int) -> Unit) {
-  r = global()
-  r.shuffle!(n, swap)
+  panic("invalid argument to Shuffle") if n < 0
+  i = n - 1
+  while i > INT31_MAX - 1 {
+    j = int63n(i + 1)
+    swap(i, j)
+    i -= 1
+  }
+  while i > 0 {
+    k = i
+    j = GLOBAL.lock { |g|
+      r = g.cur!()
+      r.lemire_int31n!((k + 1).as_i32).to_i
+    }
+    swap(i, j)
+    i -= 1
+  }
 }
 
 # Fills p with random bytes from the default source; returns p.size.
 pub def read(p: [Byte]) -> Int {
-  r = global()
-  r.read!(p)
+  GLOBAL.lock { |g|
+    r = g.cur!()
+    r.read!(p)
+  }
 }
 
 # A normally distributed Float (mean 0, standard deviation 1) from the default source.
 pub def norm_float64 -> Float {
-  r = global()
-  r.norm_float64!()
+  GLOBAL.lock { |g|
+    r = g.cur!()
+    r.norm_float64!()
+  }
 }
 
 # An exponentially distributed Float (rate 1) from the default source.
 pub def exp_float64 -> Float {
-  r = global()
-  r.exp_float64!()
+  GLOBAL.lock { |g|
+    r = g.cur!()
+    r.exp_float64!()
+  }
 }

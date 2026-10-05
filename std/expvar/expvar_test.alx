@@ -1,0 +1,333 @@
+# Go's expvar_test.go, translated. Each test makes its own registry (Go's
+# RemoveAll between tests). Benchmarks become `bench` blocks.
+
+import "encoding/json"
+import "net/http"
+import "net/http/httptest"
+import "os"
+import "strconv"
+
+test "nil" {
+  reg = new_empty_registry
+  assert reg.get("missing") == none, "got a Var for a missing name"
+}
+
+test "int" {
+  reg = new_empty_registry
+  reqs = reg.new_int("requests")
+  assert_eq reqs.value, 0
+  got = reg.get("requests").unwrap.as_int.unwrap
+  got.add(10)
+  assert_eq reqs.value, 10
+  reqs.set(0)
+
+  reqs.add(1)
+  reqs.add(3)
+  assert_eq reqs.value, 4
+  assert_eq reqs.to_s, "4"
+
+  reqs.set(-2)
+  assert_eq reqs.value, -2
+}
+
+test "float" {
+  reg = new_empty_registry
+  reqs = reg.new_float("requests-float")
+  assert_eq reqs.value, 0.0
+  got = reg.get("requests-float").unwrap.as_float.unwrap
+  got.add(1.5)
+  assert_eq reqs.value, 1.5
+
+  reqs.add(1.25)
+  assert_eq reqs.value, 2.75
+  assert_eq reqs.to_s, "2.75"
+
+  reqs.add(-2.0)
+  assert_eq reqs.value, 0.75
+}
+
+test "string" {
+  reg = new_empty_registry
+  name = reg.new_string("my-name")
+  assert_eq name.value, ""
+
+  name.set("Mike")
+  assert_eq name.to_s, "\"Mike\""
+  assert_eq name.value, "Mike"
+
+  # Make sure we produce safe JSON output.
+  name.set("<")
+  assert_eq name.to_s, "\"\\u003c\""
+}
+
+test "map init" {
+  reg = new_empty_registry
+  colors = reg.new_map("bike-shed-colors")
+  colors.add("red", 1)
+  colors.add("blue", 1)
+  colors.add("chartreuse", 1)
+
+  n = Atomic.new(0)
+  colors.do { |_kv| n.add(1) }
+  assert_eq n.load, 3
+
+  colors.init
+
+  n.store(0)
+  colors.do { |_kv| n.add(1) }
+  assert_eq n.load, 0
+}
+
+def count(m: Map) -> I64 {
+  n = Atomic.new(0)
+  m.do { |_kv| n.add(1) }
+  n.load
+}
+
+test "map delete" {
+  reg = new_empty_registry
+  colors = reg.new_map("bike-shed-colors")
+
+  colors.add("red", 1)
+  colors.add("red", 2)
+  colors.add("blue", 4)
+  assert_eq count(colors), 2
+
+  colors.delete("red")
+  assert colors.get("red") == none, "removed red, Get should return nil"
+  assert_eq count(colors), 1
+
+  colors.delete("notfound")
+  assert_eq count(colors), 1
+
+  colors.delete("blue")
+  colors.delete("blue")
+  assert colors.get("blue") == none, "removed blue, Get should return nil"
+  assert_eq count(colors), 0
+}
+
+test "map counter" {
+  reg = new_empty_registry
+  colors = reg.new_map("bike-shed-colors")
+
+  colors.add("red", 1)
+  colors.add("red", 2)
+  colors.add("blue", 4)
+  colors.add_float("green \"midori\"", 4.125)
+  assert_eq colors.get("red").unwrap.as_int.unwrap.value, 3
+  assert_eq colors.get("blue").unwrap.as_int.unwrap.value, 4
+  assert_eq colors.get("green \"midori\"").unwrap.as_float.unwrap.value, 4.125
+
+  s = colors.to_s
+  j = json.parse(s).unwrap
+  assert j.object?, "colors.String() didn't produce a map"
+  red = j.get("red").unwrap
+  assert red.number?, "red is not a number"
+  assert_eq red.as_float.unwrap, 3.0
+}
+
+test "map nil" {
+  reg = new_empty_registry
+  key = "key"
+  m = reg.new_map("issue527719")
+  m.set(key, none)
+  s = m.to_s
+  j = json.parse(s).unwrap
+  assert j.object?, "m.String() didn't produce a map"
+  v = j.get(key)
+  assert v != none, "missing key"
+  assert v.unwrap.null?, "m[key] isn't nil"
+}
+
+test "func" {
+  x = ["a", "b"]
+  f = func { json.parse(json_strs(x)).unwrap }
+  assert_eq f.to_s, "[\"a\",\"b\"]"
+  assert_eq f.value.size, 2
+
+  # Go changes the captured variable; a block captures by value, so the
+  # changing value lives in shared state.
+  n = Atomic.new(17)
+  g = func { json.parse(n.load.to_s).unwrap }
+  assert_eq g.to_s, "17"
+  n.store(18)
+  assert_eq g.to_s, "18"
+}
+
+def json_strs(xs: [Str]) -> Str {
+  "[" + xs.map { json_quote(it) }.to_a.join(",") + "]"
+}
+
+test "handler" {
+  reg = new_empty_registry
+  m = reg.new_map("map1")
+  m.add("a", 1)
+  m.add("z", 2)
+  m2 = reg.new_map("map2")
+  for i in 0...9 {
+    m2.add(strconv.itoa(i), i)
+  }
+  rr = httptest.new_recorder
+  rr.serve(reg.handler, httptest.new_request("GET", "/debug/vars", []))
+  want = "{\n\"map1\": {\"a\": 1, \"z\": 2},\n\"map2\": {\"0\": 0, \"1\": 1, \"2\": 2, \"3\": 3, \"4\": 4, \"5\": 5, \"6\": 6, \"7\": 7, \"8\": 8}\n}\n"
+  assert_eq rr.body_string, want
+  assert_eq rr.header_map.get("Content-Type"), "application/json; charset=utf-8"
+}
+
+test "append json quote" {
+  b: [Byte] = []
+  for i in 0...128 {
+    b << i.as_u8
+  }
+  b += "\u2028\u2029".bytes.to_a
+  got = json_quote(Str.from_bytes(b))
+  want = "\"" +
+    "\\u0000\\u0001\\u0002\\u0003\\u0004\\u0005\\u0006\\u0007\\u0008\\t\\n\\u000b\\u000c\\r\\u000e\\u000f" +
+    "\\u0010\\u0011\\u0012\\u0013\\u0014\\u0015\\u0016\\u0017\\u0018\\u0019\\u001a\\u001b\\u001c\\u001d\\u001e\\u001f" +
+    " !\\\"#$%\\u0026'()*+,-./0123456789:;\\u003c=\\u003e?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\\\]^_" +
+    "`abcdefghijklmnopqrstuvwxyz{|}~\u007f\\u2028\\u2029\""
+  assert_eq got, want
+}
+
+# ---- beyond Go's tests: the registry's own registrations, a real server,
+# nested maps, Vars of other types, many tasks.
+
+test "new registry publishes cmdline and memstats" {
+  reg = new_registry
+  cmd = reg.get("cmdline").unwrap.to_s
+  j = json.parse(cmd).unwrap
+  assert j.array?, "cmdline isn't an array"
+  args = os.args
+  assert_eq j.size, args.size
+  for i in 0...args.size {
+    assert_eq j.at(i).unwrap.as_str.unwrap, args[i]
+  }
+  ms = json.parse(reg.get("memstats").unwrap.to_s).unwrap
+  assert ms.get("HeldBytes").unwrap.number?, "memstats.HeldBytes"
+  assert ms.get("PeakHeldBytes").unwrap.as_int.unwrap >= ms.get("HeldBytes").unwrap.as_int.unwrap, "peak < held"
+  doc = json.parse(reg.json).unwrap
+  assert_eq doc.keys, ["cmdline", "memstats"]
+}
+
+test "register serves GET /debug/vars" {
+  reg = new_empty_registry
+  reg.new_int("hits").add(3)
+  mux = http.new_serve_mux
+  reg.register(mux)
+  ts = httptest.new_server(mux)
+
+  r = http.get(ts.url + "/debug/vars").unwrap
+  assert_eq r.status, 200
+  assert_eq r.header.get("Content-Type"), "application/json; charset=utf-8"
+  assert_eq r.body_string, "{\n\"hits\": 3\n}\n"
+  p = http.post(ts.url + "/debug/vars", "text/plain", "").unwrap
+  assert_eq p.status, 405
+  ts.close
+}
+
+test "nested maps" {
+  reg = new_empty_registry
+  m = reg.make_map
+  m1 = reg.make_map
+  m.set("map1", m1)
+  m1.add("a", 1)
+  m1.add("z", 2)
+  m2 = reg.make_map
+  m.set("map2", m2)
+  for i in 0...9 {
+    m2.add(strconv.itoa(i), i)
+  }
+  s1 = make_string
+  m.set("str1", s1)
+  s1.set("hello, world!")
+  s2 = make_string
+  m.set("str2", s2)
+  s2.set("fizz buzz")
+  want = "{\"map1\": {\"a\": 1, \"z\": 2}, \"map2\": {\"0\": 0, \"1\": 1, \"2\": 2, \"3\": 3, \"4\": 4, \"5\": 5, \"6\": 6, \"7\": 7, \"8\": 8}, \"str1\": \"hello, world!\", \"str2\": \"fizz buzz\"}"
+  assert_eq m.to_s, want
+  back = m.get("map1").unwrap.as_map.unwrap
+  back.add("b", 5)
+  assert_eq m1.to_s, "{\"a\": 1, \"b\": 5, \"z\": 2}"
+  assert m.get("str1").unwrap.as_int == none, "a String isn't an Int"
+  assert_eq m.get("str1").unwrap.as_string.unwrap.value, "hello, world!"
+  m.delete("map1")
+  assert_eq count(m), 3
+  assert_eq m1.to_s, "{\"a\": 1, \"b\": 5, \"z\": 2}"
+}
+
+struct Temp {
+  deg: Atomic[I64]
+  def to_s -> Str { "{\"celsius\": " + deg.load.to_s + "}" }
+}
+
+test "a Var of another type" {
+  reg = new_empty_registry
+  t = Temp.new(deg: Atomic.new(21))
+  reg.publish("temp", t)
+  m = reg.new_map("rooms")
+  m.set("kitchen", t)
+  m.add("kitchen", 5)
+  t.deg.store(23)
+  assert_eq reg.get("temp").unwrap.to_s, "{\"celsius\": 23}"
+  assert reg.get("temp").unwrap.as_int == none, "a Temp isn't an Int"
+  assert_eq reg.json, "{\n\"rooms\": {\"kitchen\": {\"celsius\": 23}},\n\"temp\": {\"celsius\": 23}\n}\n"
+}
+
+test "concurrent adds" {
+  reg = new_empty_registry
+  n = reg.new_int("n")
+  f = reg.new_float("f")
+  m = reg.new_map("m")
+  ts = (0...8).map { |k|
+    spawn {
+      for i in 0...1000 {
+        n.add(1)
+        f.add(0.5)
+        m.add("k" + ((i + k) % 4).to_s, 1)
+        m.add_float("f", 1.0)
+      }
+    }
+  }.to_a
+  for t in ts {
+    t.wait
+  }
+  assert_eq n.value, 8000
+  assert_eq f.value, 4000.0
+  assert_eq m.to_s, "{\"f\": 8000, \"k0\": 2000, \"k1\": 2000, \"k2\": 2000, \"k3\": 2000}"
+}
+
+bench "int add" {
+  v = make_int
+  v.add(1)
+}
+
+bench "float add" {
+  v = make_float
+  v.add(1.0)
+}
+
+bench "string set" {
+  s = make_string
+  s.set("red")
+}
+
+bench "map add same" {
+  m = new_empty_registry.make_map
+  m.add("red", 1)
+  m.add("red", 1)
+  m.add("red", 1)
+  m.add("red", 1)
+}
+
+bench "map string" {
+  reg = new_empty_registry
+  m = reg.make_map
+  m1 = reg.make_map
+  m.set("map1", m1)
+  m1.add("a", 1)
+  m1.add("z", 2)
+  s1 = make_string
+  m.set("str1", s1)
+  s1.set("hello, world!")
+  _ = m.to_s
+}

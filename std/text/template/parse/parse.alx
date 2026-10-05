@@ -1,0 +1,954 @@
+# Package parse: Go's text/template/parse. It builds parse trees for
+# templates as defined by text/template and html/template; clients should
+# use those packages rather than this one.
+#
+#   Go                                    alx
+#   parse.Parse(name, text, l, r, funcs)  parse(name, text, l, r, funcs) -> ~Map[Str, Tree]
+#   parse.New(name)                       new_tree(name)
+#   t.Parse(text, l, r, treeSet, funcs)   t.parse(text, l, r, tree_set, funcs) -> ~Tree
+#   t.Name / t.ParseName / t.Root / t.Mode  t.name / t.parse_name / t.root (Node?) / t.mode,
+#                                         set with t.set_name, t.set_root, t.set_mode
+#   t.Copy()                              t.copy
+#   t.ErrorContext(n)                     t.error_context(n) -> (Str, Str)
+#   parse.IsEmptyTree(n)                  is_empty_tree(n)  (n: Node?)
+#   parse.NewIdentifier(name)             new_identifier(name)
+#   ParseComments, SkipFuncCheck          PARSE_COMMENTS, SKIP_FUNC_CHECK
+#   NodeText ... NodeContinue             NODE_TEXT ... NODE_CONTINUE
+#   Node (interface) and *XxxNode         Node (one handle type; see node.alx)
+#   n.Type() / n.Position() / n.String()  n.typ / n.pos / n.to_s
+#   n.Copy()                              n.copy
+#
+# Differences from Go:
+#   - The nodes of one parse live in an arena and `Node` is a handle on one
+#     (alx has no pointers, and a value can't contain itself). All of Go's
+#     node structs are the one `Node`; its fields are methods (`nodes`,
+#     `pipe`, `cmds`, `args`, `ident`, ...) and html/template's rewriting
+#     uses the `set_*!` methods. A copy is made in the same arena.
+#   - The funcs argument is a list of name sets (`[Map[Str, Bool]]`): the
+#     parser only checks that a function is defined.
+#   - Errors are `ParseError`s with Go's text ("template: name:1: ...").
+#   - Go's tests change two package variables: `textFormat` (text nodes as
+#     %q) is `n.string_quoted`, and `maxStackDepth` is a field of the tree
+#     (`t.set_max_stack_depth`); alx has no mutable package variables.
+#   - A Tree is a handle: copies of a Tree value share its state, as Go's
+#     *Tree does. Its methods change that shared state, never the handle,
+#     so they are called without `!` (Go's `New(name).Parse(...)` chains).
+
+import "strconv"
+import "strings"
+
+# Parse mode flags.
+# parse comments and add them to AST
+pub PARSE_COMMENTS = 1
+# do not check that functions are defined
+pub SKIP_FUNC_CHECK = 2
+
+# The maximum depth permitted for nested parenthesized expressions.
+MAX_STACK_DEPTH = 10000
+
+# A parse error, with Go's text.
+pub error ParseError {
+  Msg(text: Str)
+
+  def message -> Str {
+    case self {
+      Msg(t) => t
+    }
+  }
+}
+
+struct TreeS {
+  # name of the template represented by the tree.
+  name: Str
+  # name of the top-level template during parsing, for error messages.
+  parse_name: Str
+  # top-level root of the tree.
+  root: Node?
+  # parsing mode.
+  mode: Int
+  # text parsed to create the template (or its parent)
+  text: Str
+  left_delim: Str
+  right_delim: Str
+  max_stack_depth: Int
+}
+
+# The representation of a single parsed template.
+pub struct Tree {
+  st: [TreeS]
+
+  pub def name -> Str { st[0].name }
+  pub def parse_name -> Str { st[0].parse_name }
+  pub def root -> Node? { st[0].root }
+  pub def mode -> Int { st[0].mode }
+  pub def text -> Str { st[0].text }
+  pub def left_delim -> Str { st[0].left_delim }
+  pub def right_delim -> Str { st[0].right_delim }
+  pub def set_name(n: Str) {
+    s = st
+    s[0].name = n
+  }
+  pub def set_parse_name(n: Str) {
+    s = st
+    s[0].parse_name = n
+  }
+  pub def set_root(r: Node?) {
+    s = st
+    s[0].root = r
+  }
+  pub def set_mode(m: Int) {
+    s = st
+    s[0].mode = m
+  }
+  pub def set_max_stack_depth(d: Int) {
+    s = st
+    s[0].max_stack_depth = d
+  }
+
+  # Whether two handles are the same tree.
+  pub def same?(o: Tree) -> Bool {
+    # Trees are compared by their state's identity: change one and look.
+    return false if st[0].name != o.st[0].name
+    s = st
+    m = s[0].max_stack_depth
+    s[0].max_stack_depth = m + 1
+    r = o.st[0].max_stack_depth == m + 1
+    s[0].max_stack_depth = m
+    r
+  }
+
+  # A copy of the Tree. Any parsing state is discarded.
+  pub def copy -> Tree {
+    t = new_tree(name)
+    t.st[0].parse_name = parse_name
+    if r = root {
+      t.st[0].root = r.copy
+    }
+    t.st[0].text = text
+    t.st[0].left_delim = left_delim
+    t.st[0].right_delim = right_delim
+    t.st[0].mode = mode
+    t
+  }
+
+  # A textual representation of the location of the node in the input
+  # text: ("name:line:col", the node's text).
+  pub def error_context(n: Node) -> (Str, Str) {
+    pos = n.pos
+    full = n.tree_text
+    pname = n.parse_name
+    if full == "" && pname == "" {
+      full = text
+      pname = parse_name
+    }
+    pos = full.size if pos > full.size
+    txt = full[0...pos]
+    byte_num = strings.last_index(txt, "\n")
+    if byte_num == -1 {
+      # On first line.
+      byte_num = pos
+    } else {
+      # After the newline.
+      byte_num += 1
+      byte_num = pos - byte_num
+    }
+    line_num = 1 + strings.count(txt, "\n")
+    ("#{pname}:#{line_num}:#{byte_num}", n.to_s)
+  }
+
+  # Parses the template definition string to construct a representation of
+  # the template for execution. If either action delimiter string is empty,
+  # the default ("{{" or "}}") is used. Embedded template definitions are
+  # added to the tree_set map.
+  pub def parse(text: Str, left_delim: Str, right_delim: Str, tree_set: Map[Str, Tree], funcs: [Map[Str, Bool]]) -> ~Tree {
+    s = st
+    s[0].parse_name = name
+    l = left_delim == "" ? DEFAULT_LEFT_DELIM : left_delim
+    r = right_delim == "" ? DEFAULT_RIGHT_DELIM : right_delim
+    s[0].left_delim = l
+    s[0].right_delim = r
+    s[0].text = text
+    p = Parser.new(lex: lex(name, text, l, r), funcs: funcs, tree_set: tree_set, ar: new_arena(text, name, l, r), tree: self, vars: ["$"], token: [Item.new(), Item.new(), Item.new()], max_depth: st[0].max_stack_depth)
+    p.start_parse!
+    r2 = p.parse_top!
+    if e = r2.err {
+      s[0].root = none
+      fail e
+    }
+    self
+  }
+}
+
+# A new parse tree with the given name.
+pub def new_tree(name: Str) -> Tree {
+  Tree.new(st: [TreeS.new(name: name, max_stack_depth: MAX_STACK_DEPTH)])
+}
+
+# A map from template name to Tree, created by parsing the templates
+# described in the argument string. The top-level template will be given
+# the specified name. If an error is encountered, parsing stops and the
+# error is returned.
+pub def parse(name: Str, text: Str, left_delim: Str, right_delim: Str, funcs: [Map[Str, Bool]]) -> ~Map[Str, Tree] {
+  tree_set: Map[Str, Tree] = {}
+  t = new_tree(name)
+  t.st[0].text = text
+  _ = t.~parse(text, left_delim, right_delim, tree_set, funcs)
+  tree_set
+}
+
+# The parser's state: Go's Tree fields that exist only while parsing.
+struct Parser {
+  lex: Lexer
+  funcs: [Map[Str, Bool]]
+  tree_set: Map[Str, Tree]
+  ar: [ArenaS]
+  # the tree being parsed
+  tree: Tree
+  # three-token lookahead for parser.
+  token: [Item]
+  peek_count: Int
+  # variables defined at the moment.
+  vars: [Str]
+  # line of left delim starting action
+  action_line: Int
+  range_depth: Int
+  # depth of nested parenthesized expressions
+  stack_depth: Int
+  max_depth: Int
+
+  def node(i: Int) -> Node { Node.new(ar: ar, id: i) }
+  def nd(i: Int) -> N { ar[0].nodes[i] }
+  def add(n: N) -> Int { arena_add(ar, n) }
+
+  # Returns the next token.
+  def next! -> Item {
+    if peek_count > 0 {
+      self.peek_count -= 1
+    } else {
+      self.token[0] = self.lex.next_item!
+    }
+    token[peek_count]
+  }
+
+  # Backs the input stream up one token.
+  def backup! { self.peek_count += 1 }
+
+  # Backs the input stream up two tokens. The zeroth token is already there.
+  def backup2!(t1: Item) {
+    self.token[1] = t1
+    self.peek_count = 2
+  }
+
+  # Backs the input stream up three tokens. The zeroth token is already
+  # there.
+  def backup3!(t2: Item, t1: Item) {
+    # Reverse order: we're pushing back.
+    self.token[1] = t1
+    self.token[2] = t2
+    self.peek_count = 3
+  }
+
+  # Returns but does not consume the next token.
+  def peek! -> Item {
+    if peek_count > 0 {
+      return token[peek_count - 1]
+    }
+    self.peek_count = 1
+    self.token[0] = self.lex.next_item!
+    token[0]
+  }
+
+  # Returns the next non-space token.
+  def next_non_space! -> Item {
+    loop {
+      t = next!
+      return t if t.typ != ITEM_SPACE
+    }
+    Item.new()
+  }
+
+  # Returns but does not consume the next non-space token.
+  def peek_non_space! -> Item {
+    t = next_non_space!
+    backup!
+    t
+  }
+
+  # Formats the error and terminates processing.
+  def errorf(msg: Str) -> ParseError {
+    ParseError.Msg(text: "template: #{tree.parse_name}:#{token[0].line}: #{msg}")
+  }
+
+  # Consumes the next token and guarantees it has the required type.
+  def expect!(expected: Int, context: Str) -> ~Item<ParseError> {
+    t = next_non_space!
+    fail unexpected(t, context) if t.typ != expected
+    t
+  }
+
+  # Consumes the next token and guarantees it has one of the required types.
+  def expect_one_of!(e1: Int, e2: Int, context: Str) -> ~Item<ParseError> {
+    t = next_non_space!
+    fail unexpected(t, context) if t.typ != e1 && t.typ != e2
+    t
+  }
+
+  # Complains about the token.
+  def unexpected(t: Item, context: Str) -> ParseError {
+    if t.typ == ITEM_ERROR {
+      extra = ""
+      if action_line != 0 && action_line != t.line {
+        extra = " in action started at #{tree.parse_name}:#{action_line}"
+        if strings.has_suffix(t.val, " action") {
+          # avoid "action in action"
+          extra = extra[" in action".size...extra.size]
+        }
+      }
+      return errorf("#{t.to_s}#{extra}")
+    }
+    errorf("unexpected #{t.to_s} in #{context}")
+  }
+
+  # Initializes the parser, using the lexer.
+  def start_parse! {
+    m = tree.mode
+    self.lex.emit_comment = (m & PARSE_COMMENTS) != 0
+    self.lex.break_ok = !has_function("break")
+    self.lex.continue_ok = !has_function("continue")
+  }
+
+  # Adds tree to the tree set.
+  def add_tree!(t: Tree) -> ~Unit<ParseError> {
+    if old = tree_set[t.name] {
+      if !is_empty_tree(old.root) {
+        if !is_empty_tree(t.root) {
+          fail errorf("template: multiple definition of template #{strconv.quote(t.name)}")
+        }
+        return nil
+      }
+    }
+    self.tree_set[t.name] = t
+    nil
+  }
+
+  # The top-level parser for a template, essentially the same as item_list
+  # except it also parses {{define}} actions. It runs to EOF.
+  def parse_top! -> ~Unit<ParseError> {
+    root = add(blank(NODE_LIST, peek!.pos))
+    tree.set_root(node(root))
+    while peek!.typ != ITEM_EOF {
+      if peek!.typ == ITEM_LEFT_DELIM {
+        delim = next!
+        if next_non_space!.typ == ITEM_DEFINE {
+          # name will be updated once we know it.
+          self.~parse_definition!
+          next
+        }
+        backup2!(delim)
+      }
+      n = self.~text_or_action!
+      t = nd(n).typ
+      if t == NODE_END || t == NODE_ELSE {
+        fail errorf("unexpected #{node(n).to_s}")
+      }
+      root_kids = nd(root).kids
+      root_kids << n
+      self.ar[0].nodes[root].kids = root_kids
+    }
+    self.~add_tree!(tree)
+    nil
+  }
+
+  # Switches to parsing a new tree (a definition or a block) that shares
+  # the lexer; returns the saved state of the current one.
+  def enter!(name: Str) -> (Tree, [Str], Int, Int) {
+    saved = (tree, vars, range_depth, stack_depth)
+    t = new_tree(name)
+    t.st[0].text = tree.text
+    t.st[0].mode = tree.mode
+    t.st[0].left_delim = tree.left_delim
+    t.st[0].right_delim = tree.right_delim
+    t.st[0].parse_name = tree.parse_name
+    t.st[0].max_stack_depth = tree.st[0].max_stack_depth
+    self.tree = t
+    self.vars = ["$"]
+    self.stack_depth = 0
+    saved
+  }
+
+  def leave!(saved: (Tree, [Str], Int, Int)) {
+    self.tree = saved[0]
+    self.vars = saved[1]
+    self.range_depth = saved[2]
+    self.stack_depth = saved[3]
+  }
+
+  # Parses a {{define}} ... {{end}} template definition and installs the
+  # definition in the tree set. The "define" keyword has already been
+  # scanned.
+  def parse_definition! -> ~Unit<ParseError> {
+    saved = enter!("definition")
+    self.~parse_definition_body!
+    leave!(saved)
+    nil
+  }
+
+  def parse_definition_body! -> ~Unit<ParseError> {
+    context = "define clause"
+    name = self.~expect_one_of!(ITEM_STRING, ITEM_RAW_STRING, context)
+    u = strconv.unquote(name.val)
+    if e = u.err {
+      fail errorf(e.message)
+    }
+    tree.set_name(u.unwrap)
+    _ = self.~expect!(ITEM_RIGHT_DELIM, context)
+    list, end = self.~item_list!
+    tree.set_root(node(list))
+    if nd(end).typ != NODE_END {
+      fail errorf("unexpected #{node(end).to_s} in #{context}")
+    }
+    self.~add_tree!(tree)
+    nil
+  }
+
+  # itemList:
+  #   textOrAction*
+  # Terminates at {{end}} or {{else}}, returned separately.
+  def item_list! -> ~(Int, Int)<ParseError> {
+    list = add(blank(NODE_LIST, peek_non_space!.pos))
+    while peek_non_space!.typ != ITEM_EOF {
+      n = self.~text_or_action!
+      t = nd(n).typ
+      if t == NODE_END || t == NODE_ELSE {
+        return (list, n)
+      }
+      ks = nd(list).kids
+      ks << n
+      self.ar[0].nodes[list].kids = ks
+    }
+    fail errorf("unexpected EOF")
+  }
+
+  # textOrAction:
+  #   text | comment | action
+  def text_or_action! -> ~Int<ParseError> {
+    t = next_non_space!
+    case t.typ {
+      ITEM_TEXT => {
+        n = blank(NODE_TEXT, t.pos)
+        n.text = t.val
+        return add(n)
+      }
+      ITEM_LEFT_DELIM => {
+        self.action_line = t.line
+        r = self.~action!
+        self.action_line = 0
+        return r
+      }
+      ITEM_COMMENT => {
+        n = blank(NODE_COMMENT, t.pos)
+        n.text = t.val
+        return add(n)
+      }
+      _ => {}
+    }
+    fail unexpected(t, "input")
+  }
+
+  # Action:
+  #   control
+  #   command ("|" command)*
+  # Left delim is past. Now get actions. First word could be a keyword
+  # such as range.
+  def action! -> ~Int<ParseError> {
+    t = next_non_space!
+    case t.typ {
+      ITEM_BLOCK => {
+        return self.~block_control!
+      }
+      ITEM_BREAK => {
+        return self.~break_control!(t.pos, t.line)
+      }
+      ITEM_CONTINUE => {
+        return self.~continue_control!(t.pos, t.line)
+      }
+      ITEM_ELSE => {
+        return self.~else_control!
+      }
+      ITEM_END => {
+        return self.~end_control!
+      }
+      ITEM_IF => {
+        return self.~if_control!
+      }
+      ITEM_RANGE => {
+        return self.~range_control!
+      }
+      ITEM_TEMPLATE => {
+        return self.~template_control!
+      }
+      ITEM_WITH => {
+        return self.~with_control!
+      }
+      _ => {}
+    }
+    backup!
+    tok = peek!
+    # Do not pop variables; they persist until "end".
+    pipe = self.~pipeline!("command", ITEM_RIGHT_DELIM)
+    n = blank(NODE_ACTION, tok.pos)
+    n.line = tok.line
+    n.pipe = pipe
+    add(n)
+  }
+
+  # Break:
+  #   {{break}}
+  # Break keyword is past.
+  def break_control!(pos: Int, line: Int) -> ~Int<ParseError> {
+    t = next_non_space!
+    fail unexpected(t, "{{break}}") if t.typ != ITEM_RIGHT_DELIM
+    fail errorf("{{break}} outside {{range}}") if range_depth == 0
+    n = blank(NODE_BREAK, pos)
+    n.line = line
+    add(n)
+  }
+
+  # Continue:
+  #   {{continue}}
+  # Continue keyword is past.
+  def continue_control!(pos: Int, line: Int) -> ~Int<ParseError> {
+    t = next_non_space!
+    fail unexpected(t, "{{continue}}") if t.typ != ITEM_RIGHT_DELIM
+    fail errorf("{{continue}} outside {{range}}") if range_depth == 0
+    n = blank(NODE_CONTINUE, pos)
+    n.line = line
+    add(n)
+  }
+
+  # Pipeline:
+  #   declarations? command ('|' command)*
+  def pipeline!(context: Str, end: Int) -> ~Int<ParseError> {
+    tok = peek_non_space!
+    pn = blank(NODE_PIPE, tok.pos)
+    pn.line = tok.line
+    pipe = add(pn)
+    # Are there declarations or assignments?
+    decls = true
+    while decls {
+      decls = false
+      v = peek_non_space!
+      if v.typ == ITEM_VARIABLE {
+        next!
+        # Since space is a token, we need 3-token look-ahead here in the
+        # worst case: in "$x foo" we need to read "foo" (as opposed to ":=")
+        # to know that $x is an argument variable rather than a
+        # declaration. So remember the token adjacent to the variable so we
+        # can push it back if necessary.
+        token_after_variable = peek!
+        nx = peek_non_space!
+        if nx.typ == ITEM_ASSIGN || nx.typ == ITEM_DECLARE {
+          self.ar[0].nodes[pipe].is_assign = nx.typ == ITEM_ASSIGN
+          next_non_space!
+          push_decl!(pipe, v)
+        } else if nx.typ == ITEM_CHAR && nx.val == "," {
+          next_non_space!
+          push_decl!(pipe, v)
+          if context == "range" && nd(pipe).decl.size < 2 {
+            pk = peek_non_space!.typ
+            if pk == ITEM_VARIABLE || pk == ITEM_RIGHT_DELIM || pk == ITEM_RIGHT_PAREN {
+              # second initialized variable in a range pipeline
+              decls = true
+              next
+            }
+            fail errorf("range can only initialize variables")
+          }
+          fail errorf("too many declarations in #{context}")
+        } else if token_after_variable.typ == ITEM_SPACE {
+          backup3!(v, token_after_variable)
+        } else {
+          backup2!(v)
+        }
+      }
+    }
+    loop {
+      t = next_non_space!
+      if t.typ == end {
+        # At this point, the pipeline is complete
+        self.~check_pipeline(pipe, context)
+        return pipe
+      }
+      case t.typ {
+        ITEM_BOOL | ITEM_CHAR_CONSTANT | ITEM_COMPLEX | ITEM_DOT | ITEM_FIELD | ITEM_IDENTIFIER | ITEM_NUMBER | ITEM_NIL | ITEM_RAW_STRING | ITEM_STRING | ITEM_VARIABLE | ITEM_LEFT_PAREN => {
+          backup!
+          c = self.~command!
+          ks = nd(pipe).kids
+          ks << c
+          self.ar[0].nodes[pipe].kids = ks
+        }
+        _ => {
+          fail unexpected(t, context)
+        }
+      }
+    }
+    pipe
+  }
+
+  def push_decl!(pipe: Int, v: Item) {
+    vn = blank(NODE_VARIABLE, v.pos)
+    vn.ident = strings.split(v.val, ".")
+    vi = add(vn)
+    ds = nd(pipe).decl
+    ds << vi
+    self.ar[0].nodes[pipe].decl = ds
+    self.vars << v.val
+  }
+
+  def check_pipeline(pipe: Int, context: Str) -> ~Unit<ParseError> {
+    cmds = nd(pipe).kids
+    # Reject empty pipelines
+    fail errorf("missing value for #{context}") if cmds.size == 0
+    # Only the first command of a pipeline can start with a non executable
+    # operand
+    i = 1
+    while i < cmds.size {
+      t = nd(nd(cmds[i]).kids[0]).typ
+      if t == NODE_BOOL || t == NODE_DOT || t == NODE_NIL || t == NODE_NUMBER || t == NODE_STRING {
+        # With A|B|C, pipeline stage 2 is B
+        fail errorf("non executable command in pipeline stage #{i + 1}")
+      }
+      i += 1
+    }
+    nil
+  }
+
+  def parse_control!(context: Str) -> ~(Int, Int, Int, Int, Int, Int)<ParseError> {
+    mark = vars.size
+    r = self.~parse_control_body!(context)
+    self.vars = vars[0...mark]
+    r
+  }
+
+  def parse_control_body!(context: Str) -> ~(Int, Int, Int, Int, Int, Int)<ParseError> {
+    pipe = self.~pipeline!(context, ITEM_RIGHT_DELIM)
+    self.range_depth += 1 if context == "range"
+    list, nx = self.~item_list!
+    self.range_depth -= 1 if context == "range"
+    else_list = -1
+    t = nd(nx).typ
+    if t == NODE_ELSE {
+      # Special case for "else if" and "else with".
+      # If the "else" is followed immediately by an "if" or "with", the
+      # else_control! will have left the "if" or "with" token pending.
+      # Treat
+      #   {{if a}}_{{else if b}}_{{end}}
+      #   {{with a}}_{{else with b}}_{{end}}
+      # as
+      #   {{if a}}_{{else}}{{if b}}_{{end}}{{end}}
+      #   {{with a}}_{{else}}{{with b}}_{{end}}{{end}}.
+      # To do this, parse the "if" or "with" as usual and stop at it
+      # {{end}}; the subsequent{{end}} is assumed. This technique works
+      # even for long if-else-if chains.
+      if context == "if" && peek!.typ == ITEM_IF {
+        # Consume the "if" token.
+        next!
+        else_list = add(blank(NODE_LIST, nd(nx).pos))
+        n = self.~if_control!
+        self.ar[0].nodes[else_list].kids = [n]
+      } else if context == "with" && peek!.typ == ITEM_WITH {
+        next!
+        else_list = add(blank(NODE_LIST, nd(nx).pos))
+        n = self.~with_control!
+        self.ar[0].nodes[else_list].kids = [n]
+      } else {
+        el, nx2 = self.~item_list!
+        else_list = el
+        if nd(nx2).typ != NODE_END {
+          fail errorf("expected end; found #{node(nx2).to_s}")
+        }
+      }
+    }
+    (nd(pipe).pos, nd(pipe).line, pipe, list, else_list, 0)
+  }
+
+  def branch!(typ: Int, context: Str) -> ~Int<ParseError> {
+    pos, line, pipe, list, else_list, _ = self.~parse_control!(context)
+    n = blank(typ, pos)
+    n.line = line
+    n.pipe = pipe
+    n.list = list
+    n.else_list = else_list
+    add(n)
+  }
+
+  # If:
+  #   {{if pipeline}} itemList {{end}}
+  #   {{if pipeline}} itemList {{else}} itemList {{end}}
+  # If keyword is past.
+  def if_control! -> ~Int<ParseError> { self.~branch!(NODE_IF, "if") }
+
+  # Range:
+  #   {{range pipeline}} itemList {{end}}
+  #   {{range pipeline}} itemList {{else}} itemList {{end}}
+  # Range keyword is past.
+  def range_control! -> ~Int<ParseError> { self.~branch!(NODE_RANGE, "range") }
+
+  # With:
+  #   {{with pipeline}} itemList {{end}}
+  #   {{with pipeline}} itemList {{else}} itemList {{end}}
+  # If keyword is past.
+  def with_control! -> ~Int<ParseError> { self.~branch!(NODE_WITH, "with") }
+
+  # End:
+  #   {{end}}
+  # End keyword is past.
+  def end_control! -> ~Int<ParseError> {
+    t = self.~expect!(ITEM_RIGHT_DELIM, "end")
+    add(blank(NODE_END, t.pos))
+  }
+
+  # Else:
+  #   {{else}}
+  # Else keyword is past.
+  def else_control! -> ~Int<ParseError> {
+    pk = peek_non_space!
+    # The "{{else if ... " and "{{else with ..." will be treated as
+    # "{{else}}{{if ..." and "{{else}}{{with ...". So return the else node
+    # here.
+    if pk.typ == ITEM_IF || pk.typ == ITEM_WITH {
+      n = blank(NODE_ELSE, pk.pos)
+      n.line = pk.line
+      return add(n)
+    }
+    t = self.~expect!(ITEM_RIGHT_DELIM, "else")
+    n = blank(NODE_ELSE, t.pos)
+    n.line = t.line
+    add(n)
+  }
+
+  # Block:
+  #   {{block stringValue pipeline}}
+  # Block keyword is past. The name must be something that can evaluate to
+  # a string. The pipeline is mandatory.
+  def block_control! -> ~Int<ParseError> {
+    context = "block clause"
+    tok = next_non_space!
+    name = self.~parse_template_name(tok, context)
+    pipe = self.~pipeline!(context, ITEM_RIGHT_DELIM)
+    saved = enter!(name)
+    self.~block_body!(context)
+    leave!(saved)
+    n = blank(NODE_TEMPLATE, tok.pos)
+    n.line = tok.line
+    n.text = name
+    n.pipe = pipe
+    add(n)
+  }
+
+  def block_body!(context: Str) -> ~Unit<ParseError> {
+    list, end = self.~item_list!
+    tree.set_root(node(list))
+    if nd(end).typ != NODE_END {
+      fail errorf("unexpected #{node(end).to_s} in #{context}")
+    }
+    self.~add_tree!(tree)
+    nil
+  }
+
+  # Template:
+  #   {{template stringValue pipeline}}
+  # Template keyword is past. The name must be something that can evaluate
+  # to a string.
+  def template_control! -> ~Int<ParseError> {
+    context = "template clause"
+    tok = next_non_space!
+    name = self.~parse_template_name(tok, context)
+    pipe = -1
+    if next_non_space!.typ != ITEM_RIGHT_DELIM {
+      backup!
+      # Do not pop variables; they persist until "end".
+      pipe = self.~pipeline!(context, ITEM_RIGHT_DELIM)
+    }
+    n = blank(NODE_TEMPLATE, tok.pos)
+    n.line = tok.line
+    n.text = name
+    n.pipe = pipe
+    add(n)
+  }
+
+  def parse_template_name(tok: Item, context: Str) -> ~Str<ParseError> {
+    if tok.typ == ITEM_STRING || tok.typ == ITEM_RAW_STRING {
+      u = strconv.unquote(tok.val)
+      if e = u.err {
+        fail errorf(e.message)
+      }
+      return u.unwrap
+    }
+    fail unexpected(tok, context)
+  }
+
+  # command:
+  #   operand (space operand)*
+  # space-separated arguments up to a pipeline character or right
+  # delimiter. we consume the pipe character but leave the right delim to
+  # terminate the action.
+  def command! -> ~Int<ParseError> {
+    cmd = add(blank(NODE_COMMAND, peek_non_space!.pos))
+    loop {
+      # skip leading spaces.
+      peek_non_space!
+      operand = self.~operand!
+      if operand >= 0 {
+        ks = nd(cmd).kids
+        ks << operand
+        self.ar[0].nodes[cmd].kids = ks
+      }
+      t = next!
+      if t.typ == ITEM_SPACE {
+        next
+      }
+      if t.typ == ITEM_RIGHT_DELIM || t.typ == ITEM_RIGHT_PAREN {
+        backup!
+      } else if t.typ != ITEM_PIPE {
+        fail unexpected(t, "operand")
+      }
+      break
+    }
+    fail errorf("empty command") if nd(cmd).kids.size == 0
+    cmd
+  }
+
+  # operand:
+  #   term .Field*
+  # An operand is a space-separated component of a command, a term possibly
+  # followed by field accesses. -1 means the next item is not an operand.
+  def operand! -> ~Int<ParseError> {
+    n = self.~term!
+    return -1 if n < 0
+    if peek!.typ == ITEM_FIELD {
+      cn = blank(NODE_CHAIN, peek!.pos)
+      cn.pipe = n
+      chain = add(cn)
+      while peek!.typ == ITEM_FIELD {
+        f = next!.val
+        fs = nd(chain).ident
+        fs << f[1...f.size]
+        self.ar[0].nodes[chain].ident = fs
+      }
+      # Compatibility with original API: If the term is of type NODE_FIELD
+      # or NODE_VARIABLE, just put more fields on the original. Otherwise,
+      # keep the Chain node. Obvious parsing errors involving literal
+      # values are detected here. More complex error cases will have to be
+      # handled at execution time.
+      t = nd(n).typ
+      case t {
+        NODE_FIELD => {
+          fnode = blank(NODE_FIELD, nd(chain).pos)
+          fnode.ident = strings.split(node(chain).to_s[1...node(chain).to_s.size], ".")
+          return add(fnode)
+        }
+        NODE_VARIABLE => {
+          vnode = blank(NODE_VARIABLE, nd(chain).pos)
+          vnode.ident = strings.split(node(chain).to_s, ".")
+          return add(vnode)
+        }
+        NODE_BOOL | NODE_STRING | NODE_NUMBER | NODE_NIL | NODE_DOT => {
+          fail errorf("unexpected . after term #{strconv.quote(node(n).to_s)}")
+        }
+        _ => {
+          return chain
+        }
+      }
+    }
+    n
+  }
+
+  # term:
+  #   literal (number, string, nil, boolean)
+  #   function (identifier)
+  #   .
+  #   .Field
+  #   $
+  #   '(' pipeline ')'
+  # A term is a simple "expression". -1 means the next item is not a term.
+  def term! -> ~Int<ParseError> {
+    t = next_non_space!
+    case t.typ {
+      ITEM_IDENTIFIER => {
+        check_func = (tree.mode & SKIP_FUNC_CHECK) == 0
+        if check_func && !has_function(t.val) {
+          fail errorf("function #{strconv.quote(t.val)} not defined")
+        }
+        n = blank(NODE_IDENTIFIER, t.pos)
+        n.text = t.val
+        return add(n)
+      }
+      ITEM_DOT => {
+        return add(blank(NODE_DOT, t.pos))
+      }
+      ITEM_NIL => {
+        return add(blank(NODE_NIL, t.pos))
+      }
+      ITEM_VARIABLE => {
+        return self.~use_var(t.pos, t.val)
+      }
+      ITEM_FIELD => {
+        n = blank(NODE_FIELD, t.pos)
+        # [1...] to drop leading period
+        n.ident = strings.split(t.val[1...t.val.size], ".")
+        return add(n)
+      }
+      ITEM_BOOL => {
+        n = blank(NODE_BOOL, t.pos)
+        n.truth = t.val == "true"
+        return add(n)
+      }
+      ITEM_CHAR_CONSTANT | ITEM_COMPLEX | ITEM_NUMBER => {
+        nn = new_number(t.pos, t.val, t.typ)
+        if e = nn.err {
+          fail errorf(e.message)
+        }
+        return add(nn.unwrap)
+      }
+      ITEM_LEFT_PAREN => {
+        fail errorf("max expression depth exceeded") if stack_depth >= max_depth
+        self.stack_depth += 1
+        r = self.~pipeline!("parenthesized pipeline", ITEM_RIGHT_PAREN)
+        self.stack_depth -= 1
+        return r
+      }
+      ITEM_STRING | ITEM_RAW_STRING => {
+        u = strconv.unquote(t.val)
+        if e = u.err {
+          fail errorf(e.message)
+        }
+        n = blank(NODE_STRING, t.pos)
+        n.quoted = t.val
+        n.text = u.unwrap
+        return add(n)
+      }
+      _ => {}
+    }
+    backup!
+    -1
+  }
+
+  # Whether a function name exists in the parser's maps.
+  def has_function(name: Str) -> Bool {
+    for m in funcs {
+      return true if m[name] || false
+    }
+    false
+  }
+
+  # A node for a variable reference. It errors if the variable is not
+  # defined.
+  def use_var(pos: Int, name: Str) -> ~Int<ParseError> {
+    n = blank(NODE_VARIABLE, pos)
+    n.ident = strings.split(name, ".")
+    for v in vars {
+      return add(n) if v == n.ident[0]
+    }
+    fail errorf("undefined variable #{strconv.quote(n.ident[0])}")
+  }
+}

@@ -1,0 +1,425 @@
+# Go's parse_test.go. The tables (numberTests, parseTests, errorTests,
+# isEmptyTests) were translated by a generator; the other tests by hand.
+# Go's tests set maxStackDepth to 3 (an init function): the helpers here set
+# it on each tree.
+
+import "strconv"
+import "strings"
+
+def builtins -> [Map[Str, Bool]] {
+  [{"printf" => true, "contains" => true}]
+}
+
+def new_test_tree(name: Str) -> Tree {
+  t = new_tree(name)
+  t.set_max_stack_depth(3)
+  t
+}
+
+def fmt_g(f: Float) -> Str { strconv.format_float(f, "g", -1, 64) }
+
+# TestNumberParse: one case.
+def check_number(text: Str, typ: Int, is_int: Bool, is_uint: Bool, is_float: Bool, is_complex: Bool, i: Int, u: Str, f: Str, cr: Str, ci: Str) {
+  r = new_number(0, text, typ)
+  assert r.ok?, "unexpected error for #{text}"
+  n = r.unwrap
+  assert n.is_complex == is_complex, "complex incorrect for #{text}"
+  assert n.is_int == is_int, "integer incorrect for #{text}"
+  assert_eq n.int64, i if is_int
+  assert n.is_uint == is_uint, "unsigned integer incorrect for #{text}"
+  assert_eq strconv.format_uint(n.uint64, 10), u if is_uint
+  assert n.is_float == is_float, "float incorrect for #{text}"
+  assert_eq fmt_g(n.float64), f if is_float
+  if is_complex {
+    assert_eq fmt_g(n.complex128.real), cr
+    assert_eq fmt_g(n.complex128.imag), ci
+  }
+}
+
+# testParse: one case, without and with a copy of the root.
+def check_parse(name: Str, input: Str, ok: Bool, result: Str) {
+  tree_set: Map[Str, Tree] = {}
+  r = new_test_tree(name).parse(input, "", "", tree_set, builtins())
+  if !ok {
+    # (Go doesn't compare the message of an expected error here.)
+    assert r.err?, "#{name}: expected error; got none"
+    return nil
+  }
+  assert r.ok?, "#{name}: unexpected error: #{r.err?.message || ""}"
+  root = r.unwrap.root.unwrap
+  assert_eq root.string_quoted, result
+  assert_eq root.copy.string_quoted, result
+  nil
+}
+
+# TestErrors: one case.
+def check_error(name: Str, input: Str, result: Str) {
+  tree_set: Map[Str, Tree] = {}
+  r = new_test_tree(name).parse(input, "", "", tree_set, [])
+  msg = r.err?.message || ""
+  assert r.err?, "#{name}: expected error #{result}, got nil"
+  assert strings.contains(msg, result), "#{name}: error #{msg} does not contain #{result}"
+}
+
+# TestIsEmpty: one case.
+def check_empty(name: Str, input: Str, empty: Bool) {
+  tree_set: Map[Str, Tree] = {}
+  r = new_test_tree("root").parse(input, "", "", tree_set, [])
+  assert r.ok?, "#{name}: unexpected error"
+  assert is_empty_tree(r.unwrap.root) == empty, "#{name}: expected #{empty}"
+}
+
+# One generated vector (vec_parse_test.alx): parse `input` in `mode` and
+# compare every tree's String() (sorted by name), or the error, with Go's.
+def vec(input: Str, mode: Int, want: Str) {
+  tr = new_tree("v")
+  tr.set_mode(mode)
+  set: Map[Str, Tree] = {}
+  funcs: [Map[Str, Bool]] = [{"printf" => true, "print" => true, "println" => true, "len" => true, "index" => true, "eq" => true, "ne" => true, "lt" => true, "and" => true, "or" => true, "not" => true, "html" => true, "js" => true, "call" => true, "slice" => true, "contains" => true, "urlquery" => true}]
+  r = tr.parse(input, "", "", set, funcs)
+  if e = r.err {
+    assert_eq "ERR:#{e.message}", want
+    return nil
+  }
+  names: [Str] = set.keys
+  names = names.sort
+  got: [Str] = []
+  copied: [Str] = []
+  for k in names {
+    root = set[k].unwrap.root.unwrap
+    got << "#{k}=#{root.to_s}"
+    copied << "#{k}=#{root.copy.to_s}"
+  }
+  assert_eq strings.join(got, "\n"), want
+  assert_eq strings.join(copied, "\n"), want
+  nil
+}
+
+test "is empty nil" {
+  assert is_empty_tree(none), "nil tree is not empty"
+}
+
+test "parse with comments" {
+  cases = [
+    ("comment", "{{/*\n\n\n*/}}", "{{/*\n\n\n*/}}"),
+    ("comment trim left", "x \r\n\t{{- /* hi */}}", "\"x\"{{/* hi */}}"),
+    ("comment trim right", "{{/* hi */ -}}\n\n\ty", "{{/* hi */}}\"y\""),
+    ("comment trim left and right", "x \r\n\t{{- /* */ -}}\n\n\ty", "\"x\"{{/* */}}\"y\""),
+  ]
+  for c in cases {
+    tr = new_tree(c[0])
+    tr.set_mode(PARSE_COMMENTS)
+    tree_set: Map[Str, Tree] = {}
+    t = tr.~parse(c[1], "", "", tree_set, [])
+    assert_eq t.root.unwrap.string_quoted, c[2]
+  }
+}
+
+test "delims string roundtrip" {
+  inputs = [
+    "[[.X]]",
+    "[[/* a comment */]]",
+    "[[if .X]]y[[else]]z[[end]]",
+    "[[range .X]][[break]][[continue]][[end]]",
+    "[[with .X]]y[[end]]",
+    "[[template \"name\" .]]",
+  ]
+  for input in inputs {
+    tr = new_tree("test")
+    tr.set_mode(PARSE_COMMENTS)
+    tree_set: Map[Str, Tree] = {}
+    t = tr.~parse(input, "[[", "]]", tree_set, [])
+    assert_eq t.root.unwrap.to_s, input
+  }
+}
+
+test "keywords and funcs" {
+  inp = "{{range .X}}{{break 20}}{{end}}"
+  # 'break' is a defined function, don't treat it as a keyword: it should
+  # accept an argument successfully.
+  ts1: Map[Str, Tree] = {}
+  r1 = new_tree("").parse(inp, "", "", ts1, [{"break" => true}])
+  assert r1.ok?, "with break func: unexpected error"
+  # No function called 'break'; treat it as a keyword. Results in a parse
+  # error.
+  ts2: Map[Str, Tree] = {}
+  r2 = new_tree("").parse(inp, "", "", ts2, [])
+  assert r2.err?, "without break func: expected error; got none"
+}
+
+test "skip func check" {
+  tr = new_tree("skip func check")
+  tr.set_mode(SKIP_FUNC_CHECK)
+  tree_set: Map[Str, Tree] = {}
+  t = tr.~parse("{{fn 1 2}}", "", "", tree_set, [])
+  assert_eq t.root.unwrap.string_quoted, "{{fn 1 2}}"
+}
+
+test "error context with tree copy" {
+  tree_set: Map[Str, Tree] = {}
+  tree = new_tree("root").~parse("{{if true}}{{end}}", "", "", tree_set, [])
+  tree_copy = tree.copy
+  want_location, want_context = tree.error_context(tree.root.unwrap.nodes[0])
+  got_location, got_context = tree_copy.error_context(tree_copy.root.unwrap.nodes[0])
+  assert_eq got_location, want_location
+  assert_eq got_context, want_context
+}
+
+test "block" {
+  input = "a{{block \"inner\" .}}bar{{.}}baz{{end}}b"
+  outer = "a{{template \"inner\" .}}b"
+  inner = "bar{{.}}baz"
+  tree_set: Map[Str, Tree] = {}
+  tmpl = new_tree("outer").~parse(input, "", "", tree_set, [])
+  assert_eq tmpl.root.unwrap.to_s, outer
+  in_tmpl = tree_set["inner"]
+  assert in_tmpl != none, "block did not define template"
+  assert_eq in_tmpl.unwrap.root.unwrap.to_s, inner
+}
+
+test "line num" {
+  count = 3
+  text = "{{printf 1234}}\n" * count
+  tree_set: Map[Str, Tree] = {}
+  tree = new_tree("bench").~parse(text, "", "", tree_set, builtins())
+  # Check the line numbers. Each line is an action containing a template,
+  # followed by text. That's two nodes per line.
+  nodes = tree.root.unwrap.nodes
+  i = 0
+  while i < nodes.size {
+    line = 1 + i / 2
+    # Action first.
+    action = nodes[i]
+    assert_eq action.typ, NODE_ACTION
+    assert_eq action.line, line
+    assert_eq action.pipe.unwrap.line, line
+    i += 2
+  }
+}
+
+test "parse function" {
+  # parse.Parse: the map of trees, including definitions.
+  trees = ~parse("top", "a{{define \"x\"}}X{{end}}{{template \"x\"}}", "", "", [])
+  assert_eq trees.keys, ["x", "top"]
+  assert_eq trees["top"].unwrap.root.unwrap.to_s, "a{{template \"x\"}}"
+  assert_eq trees["x"].unwrap.root.unwrap.to_s, "X"
+  assert_eq trees["x"].unwrap.parse_name, "top"
+}
+
+test "number parse" {
+  check_number("0", 13, true, true, true, false, 0, "0", "0", "0", "0")
+  check_number("-0", 13, true, true, true, false, 0, "0", "0", "0", "0")
+  check_number("73", 13, true, true, true, false, 73, "73", "73", "0", "0")
+  check_number("7_3", 13, true, true, true, false, 73, "73", "73", "0", "0")
+  check_number("0b10_010_01", 13, true, true, true, false, 73, "73", "73", "0", "0")
+  check_number("0B10_010_01", 13, true, true, true, false, 73, "73", "73", "0", "0")
+  check_number("073", 13, true, true, true, false, 59, "59", "59", "0", "0")
+  check_number("0o73", 13, true, true, true, false, 59, "59", "59", "0", "0")
+  check_number("0O73", 13, true, true, true, false, 59, "59", "59", "0", "0")
+  check_number("0x73", 13, true, true, true, false, 115, "115", "115", "0", "0")
+  check_number("0X73", 13, true, true, true, false, 115, "115", "115", "0", "0")
+  check_number("0x7_3", 13, true, true, true, false, 115, "115", "115", "0", "0")
+  check_number("-73", 13, true, false, true, false, -73, "0", "-73", "0", "0")
+  check_number("+73", 13, true, false, true, false, 73, "0", "73", "0", "0")
+  check_number("100", 13, true, true, true, false, 100, "100", "100", "0", "0")
+  check_number("1e9", 13, true, true, true, false, 1000000000, "1000000000", "1e+09", "0", "0")
+  check_number("-1e9", 13, true, false, true, false, -1000000000, "0", "-1e+09", "0", "0")
+  check_number("-1.2", 13, false, false, true, false, 0, "0", "-1.2", "0", "0")
+  check_number("1e19", 13, false, true, true, false, 0, "10000000000000000000", "1e+19", "0", "0")
+  check_number("1e1_9", 13, false, true, true, false, 0, "10000000000000000000", "1e+19", "0", "0")
+  check_number("1E19", 13, false, true, true, false, 0, "10000000000000000000", "1e+19", "0", "0")
+  check_number("-1e19", 13, false, false, true, false, 0, "0", "-1e+19", "0", "0")
+  check_number("0x_1p4", 13, true, true, true, false, 16, "16", "16", "0", "0")
+  check_number("0X_1P4", 13, true, true, true, false, 16, "16", "16", "0", "0")
+  check_number("0x_1p-4", 13, false, false, true, false, 0, "0", "0.0625", "0", "0")
+  check_number("4i", 13, false, false, false, true, 0, "0", "0", "0", "4")
+  check_number("-1.2+4.2i", 5, false, false, false, true, 0, "0", "0", "-1.2", "4.2")
+  check_number("073i", 13, false, false, false, true, 0, "0", "0", "0", "73")
+  check_number("0i", 13, true, true, true, true, 0, "0", "0", "0", "0")
+  check_number("-1.2+0i", 5, false, false, true, true, 0, "0", "-1.2", "-1.2", "0")
+  check_number("-12+0i", 5, true, false, true, true, -12, "0", "-12", "-12", "0")
+  check_number("13+0i", 5, true, true, true, true, 13, "13", "13", "13", "0")
+  check_number("0123", 13, true, true, true, false, 83, "83", "83", "0", "0")
+  check_number("-0x0", 13, true, true, true, false, 0, "0", "0", "0", "0")
+  check_number("0xdeadbeef", 13, true, true, true, false, 3735928559, "3735928559", "3.735928559e+09", "0", "0")
+  check_number("'a'", 3, true, true, true, false, 97, "97", "97", "0", "0")
+  check_number("'\\n'", 3, true, true, true, false, 10, "10", "10", "0", "0")
+  check_number("'\\\\'", 3, true, true, true, false, 92, "92", "92", "0", "0")
+  check_number("'\\''", 3, true, true, true, false, 39, "39", "39", "0", "0")
+  check_number("'\\xFF'", 3, true, true, true, false, 255, "255", "255", "0", "0")
+  check_number("'パ'", 3, true, true, true, false, 12497, "12497", "12497", "0", "0")
+  check_number("'\\u30d1'", 3, true, true, true, false, 12497, "12497", "12497", "0", "0")
+  check_number("'\\U000030d1'", 3, true, true, true, false, 12497, "12497", "12497", "0", "0")
+  assert new_number(0, "+-2", 13).err?, "+-2"
+  assert new_number(0, "0x123.", 13).err?, "0x123."
+  assert new_number(0, "1e.", 13).err?, "1e."
+  assert new_number(0, "0xi.", 13).err?, "0xi."
+  assert new_number(0, "1+2.", 13).err?, "1+2."
+  assert new_number(0, "'x", 3).err?, "'x"
+  assert new_number(0, "'xx'", 3).err?, "'xx'"
+  assert new_number(0, "'433937734937734969526500969526500'", 3).err?, "'433937734937734969526500969526500'"
+  check_number("0xef", 13, true, true, true, false, 239, "239", "239", "0", "0")
+}
+
+test "parse 0" {
+  check_parse("empty", "", true, "")
+  check_parse("comment", "{{/*\n\n\n*/}}", true, "")
+  check_parse("spaces", " \t\n", true, "\" \\t\\n\"")
+  check_parse("text", "some text", true, "\"some text\"")
+  check_parse("emptyAction", "{{}}", false, "{{}}")
+  check_parse("field", "{{.X}}", true, "{{.X}}")
+  check_parse("simple command", "{{printf}}", true, "{{printf}}")
+  check_parse("$ invocation", "{{$}}", true, "{{$}}")
+  check_parse("variable invocation", "{{with $x := 3}}{{$x 23}}{{end}}", true, "{{with $x := 3}}{{$x 23}}{{end}}")
+  check_parse("variable with fields", "{{$.I}}", true, "{{$.I}}")
+  check_parse("multi-word command", "{{printf `%d` 23}}", true, "{{printf `%d` 23}}")
+  check_parse("pipeline", "{{.X|.Y}}", true, "{{.X | .Y}}")
+  check_parse("pipeline with decl", "{{$x := .X|.Y}}", true, "{{$x := .X | .Y}}")
+  check_parse("nested pipeline", "{{.X (.Y .Z) (.A | .B .C) (.E)}}", true, "{{.X (.Y .Z) (.A | .B .C) (.E)}}")
+  check_parse("field applied to parentheses", "{{(.Y .Z).Field}}", true, "{{(.Y .Z).Field}}")
+  check_parse("simple if", "{{if .X}}hello{{end}}", true, "{{if .X}}\"hello\"{{end}}")
+  check_parse("if with else", "{{if .X}}true{{else}}false{{end}}", true, "{{if .X}}\"true\"{{else}}\"false\"{{end}}")
+  check_parse("if with else if", "{{if .X}}true{{else if .Y}}false{{end}}", true, "{{if .X}}\"true\"{{else}}{{if .Y}}\"false\"{{end}}{{end}}")
+  check_parse("if else chain", "+{{if .X}}X{{else if .Y}}Y{{else if .Z}}Z{{end}}+", true, "\"+\"{{if .X}}\"X\"{{else}}{{if .Y}}\"Y\"{{else}}{{if .Z}}\"Z\"{{end}}{{end}}{{end}}\"+\"")
+  check_parse("simple range", "{{range .X}}hello{{end}}", true, "{{range .X}}\"hello\"{{end}}")
+  check_parse("chained field range", "{{range .X.Y.Z}}hello{{end}}", true, "{{range .X.Y.Z}}\"hello\"{{end}}")
+  check_parse("nested range", "{{range .X}}hello{{range .Y}}goodbye{{end}}{{end}}", true, "{{range .X}}\"hello\"{{range .Y}}\"goodbye\"{{end}}{{end}}")
+  check_parse("range with else", "{{range .X}}true{{else}}false{{end}}", true, "{{range .X}}\"true\"{{else}}\"false\"{{end}}")
+  check_parse("range over pipeline", "{{range .X|.M}}true{{else}}false{{end}}", true, "{{range .X | .M}}\"true\"{{else}}\"false\"{{end}}")
+  check_parse("range []int", "{{range .SI}}{{.}}{{end}}", true, "{{range .SI}}{{.}}{{end}}")
+  check_parse("range 1 var", "{{range $x := .SI}}{{.}}{{end}}", true, "{{range $x := .SI}}{{.}}{{end}}")
+  check_parse("range 2 vars", "{{range $x, $y := .SI}}{{.}}{{end}}", true, "{{range $x, $y := .SI}}{{.}}{{end}}")
+  check_parse("range with break", "{{range .SI}}{{.}}{{break}}{{end}}", true, "{{range .SI}}{{.}}{{break}}{{end}}")
+  check_parse("range with continue", "{{range .SI}}{{.}}{{continue}}{{end}}", true, "{{range .SI}}{{.}}{{continue}}{{end}}")
+  check_parse("constants", "{{range .SI 1 -3.2i true false 'a' nil}}{{end}}", true, "{{range .SI 1 -3.2i true false 'a' nil}}{{end}}")
+  check_parse("template", "{{template `x`}}", true, "{{template \"x\"}}")
+  check_parse("template with arg", "{{template `x` .Y}}", true, "{{template \"x\" .Y}}")
+  check_parse("with", "{{with .X}}hello{{end}}", true, "{{with .X}}\"hello\"{{end}}")
+  check_parse("with with else", "{{with .X}}hello{{else}}goodbye{{end}}", true, "{{with .X}}\"hello\"{{else}}\"goodbye\"{{end}}")
+  check_parse("with with else with", "{{with .X}}hello{{else with .Y}}goodbye{{end}}", true, "{{with .X}}\"hello\"{{else}}{{with .Y}}\"goodbye\"{{end}}{{end}}")
+  check_parse("with else chain", "{{with .X}}X{{else with .Y}}Y{{else with .Z}}Z{{end}}", true, "{{with .X}}\"X\"{{else}}{{with .Y}}\"Y\"{{else}}{{with .Z}}\"Z\"{{end}}{{end}}{{end}}")
+  check_parse("trim left", "x \r\n\t{{- 3}}", true, "\"x\"{{3}}")
+  check_parse("trim right", "{{3 -}}\n\n\ty", true, "{{3}}\"y\"")
+  check_parse("trim left and right", "x \r\n\t{{- 3 -}}\n\n\ty", true, "\"x\"{{3}}\"y\"")
+  check_parse("trim with extra spaces", "x\n{{-  3   -}}\ny", true, "\"x\"{{3}}\"y\"")
+}
+
+test "parse 1" {
+  check_parse("comment trim left", "x \r\n\t{{- /* hi */}}", true, "\"x\"")
+  check_parse("comment trim right", "{{/* hi */ -}}\n\n\ty", true, "\"y\"")
+  check_parse("comment trim left and right", "x \r\n\t{{- /* */ -}}\n\n\ty", true, "\"x\"\"y\"")
+  check_parse("block definition", "{{block \"foo\" .}}hello{{end}}", true, "{{template \"foo\" .}}")
+  check_parse("newline in assignment", "{{ $x \n := \n 1 \n }}", true, "{{$x := 1}}")
+  check_parse("newline in empty action", "{{\n}}", false, "{{\n}}")
+  check_parse("newline in pipeline", "{{\n\"x\"\n|\nprintf\n}}", true, "{{\"x\" | printf}}")
+  check_parse("newline in comment", "{{/*\nhello\n*/}}", true, "")
+  check_parse("newline in comment", "{{-\n/*\nhello\n*/\n-}}", true, "")
+  check_parse("spaces around continue", "{{range .SI}}{{.}}{{ continue }}{{end}}", true, "{{range .SI}}{{.}}{{continue}}{{end}}")
+  check_parse("spaces around break", "{{range .SI}}{{.}}{{ break }}{{end}}", true, "{{range .SI}}{{.}}{{break}}{{end}}")
+  check_parse("unclosed action", "hello{{range", false, "")
+  check_parse("unmatched end", "{{end}}", false, "")
+  check_parse("unmatched else", "{{else}}", false, "")
+  check_parse("unmatched else after if", "{{if .X}}hello{{end}}{{else}}", false, "")
+  check_parse("multiple else", "{{if .X}}1{{else}}2{{else}}3{{end}}", false, "")
+  check_parse("missing end", "hello{{range .x}}", false, "")
+  check_parse("missing end after else", "hello{{range .x}}{{else}}", false, "")
+  check_parse("undefined function", "hello{{undefined}}", false, "")
+  check_parse("undefined variable", "{{$x}}", false, "")
+  check_parse("variable undefined after end", "{{with $x := 4}}{{end}}{{$x}}", false, "")
+  check_parse("variable undefined in template", "{{template $v}}", false, "")
+  check_parse("declare with field", "{{with $x.Y := 4}}{{end}}", false, "")
+  check_parse("template with field ref", "{{template .X}}", false, "")
+  check_parse("template with var", "{{template $v}}", false, "")
+  check_parse("invalid punctuation", "{{printf 3, 4}}", false, "")
+  check_parse("multidecl outside range", "{{with $v, $u := 3}}{{end}}", false, "")
+  check_parse("too many decls in range", "{{range $u, $v, $w := 3}}{{end}}", false, "")
+  check_parse("dot applied to parentheses", "{{printf (printf .).}}", false, "")
+  check_parse("adjacent args", "{{printf 3`x`}}", false, "")
+  check_parse("adjacent args with .", "{{printf `x`.}}", false, "")
+  check_parse("extra end after if", "{{if .X}}a{{else if .Y}}b{{end}}{{end}}", false, "")
+  check_parse("break outside range", "{{range .}}{{end}} {{break}}", false, "")
+  check_parse("continue outside range", "{{range .}}{{end}} {{continue}}", false, "")
+  check_parse("break in range else", "{{range .}}{{else}}{{break}}{{end}}", false, "")
+  check_parse("continue in range else", "{{range .}}{{else}}{{continue}}{{end}}", false, "")
+  check_parse("bug0a", "{{$x := 0}}{{$x}}", true, "{{$x := 0}}{{$x}}")
+  check_parse("bug0b", "{{$x += 1}}{{$x}}", false, "")
+  check_parse("bug0c", "{{$x ! 2}}{{$x}}", false, "")
+  check_parse("bug0d", "{{$x % 3}}{{$x}}", false, "")
+}
+
+test "parse 2" {
+  check_parse("bug0e", "{{range $x := $y := 3}}{{end}}", false, "")
+  check_parse("bug1a", "{{$x:=.}}{{$x!2}}", false, "")
+  check_parse("bug1b", "{{$x:=.}}{{$x+2}}", false, "")
+  check_parse("bug1c", "{{$x:=.}}{{$x +2}}", true, "{{$x := .}}{{$x +2}}")
+  check_parse("bug2a", "{{range $x := 0}}{{$x}}{{end}}", true, "{{range $x := 0}}{{$x}}{{end}}")
+  check_parse("bug2b", "{{range $x = 0}}{{$x}}{{end}}", true, "{{range $x = 0}}{{$x}}{{end}}")
+  check_parse("dot after integer", "{{1.E}}", false, "")
+  check_parse("dot after float", "{{0.1.E}}", false, "")
+  check_parse("dot after boolean", "{{true.E}}", false, "")
+  check_parse("dot after char", "{{'a'.any}}", false, "")
+  check_parse("dot after string", "{{\"hello\".guys}}", false, "")
+  check_parse("dot after dot", "{{..E}}", false, "")
+  check_parse("dot after nil", "{{nil.E}}", false, "")
+  check_parse("wrong pipeline dot", "{{12|.}}", false, "")
+  check_parse("wrong pipeline number", "{{.|12|printf}}", false, "")
+  check_parse("wrong pipeline string", "{{.|printf|\"error\"}}", false, "")
+  check_parse("wrong pipeline char", "{{12|printf|'e'}}", false, "")
+  check_parse("wrong pipeline boolean", "{{.|true}}", false, "")
+  check_parse("wrong pipeline nil", "{{'c'|nil}}", false, "")
+  check_parse("empty pipeline", "{{printf \"%d\" ( ) }}", false, "")
+  check_parse("block definition", "{{block \"foo\"}}hello{{end}}", false, "")
+  check_parse("paren nesting normal", "{{ (( 1 )) }}", true, "{{((1))}}")
+  check_parse("paren nesting at limit", "{{ ((( 1 ))) }}", true, "{{(((1)))}}")
+  check_parse("paren nesting exceeds limit", "{{ (((( 1 )))) }}", false, "template: test:1: max expression depth exceeded")
+  check_parse("paren nesting in pipeline", "{{ ((( 1 ))) | printf }}", true, "{{(((1))) | printf}}")
+  check_parse("paren nesting in pipeline exceeds limit", "{{ (((( 1 )))) | printf }}", false, "template: test:1: max expression depth exceeded")
+  check_parse("paren nesting with other constructs", "{{ if ((( true ))) }}YES{{ end }}", true, "{{if (((true)))}}\"YES\"{{end}}")
+  check_parse("paren nesting with other constructs exceeds limit", "{{ if (((( true )))) }}YES{{ end }}", false, "template: test:1: max expression depth exceeded")
+}
+
+test "errors" {
+  check_error("unclosed1", "line1\n{{", "unclosed1:2: unclosed action")
+  check_error("unclosed2", "line1\n{{define `x`}}line2\n{{", "unclosed2:3: unclosed action")
+  check_error("unclosed3", "line1\n{{\"x\"\n\"y\"\n", "unclosed3:4: unclosed action started at unclosed3:2")
+  check_error("unclosed4", "{{\n\n\n\n\n", "unclosed4:6: unclosed action started at unclosed4:1")
+  check_error("var1", "line1\n{{\nx\n}}", "var1:3: function \"x\" not defined")
+  check_error("function", "{{foo}}", "function \"foo\" not defined")
+  check_error("comment1", "{{/*}}", "comment1:1: unclosed comment")
+  check_error("comment2", "{{/*\nhello\n}}", "comment2:1: unclosed comment")
+  check_error("lparen", "{{.X (1 2 3}}", "unclosed left paren")
+  check_error("rparen", "{{.X 1 2 3 ) }}", "unexpected right paren")
+  check_error("rparen2", "{{(.X 1 2 3", "unclosed action")
+  check_error("space", "{{`x`3}}", "in operand")
+  check_error("idchar", "{{a\#}}", "'\#'")
+  check_error("charconst", "{{'a}}", "unterminated character constant")
+  check_error("stringconst", "{{\"a}}", "unterminated quoted string")
+  check_error("rawstringconst", "{{`a}}", "unterminated raw quoted string")
+  check_error("number", "{{0xi}}", "number syntax")
+  check_error("multidefine", "{{define `a`}}a{{end}}{{define `a`}}b{{end}}", "multiple definition of template")
+  check_error("eof", "{{range .X}}", "unexpected EOF")
+  check_error("variable", "{{$x := 23}}{{with $x.y := 3}}{{$x 23}}{{end}}", "unexpected \":=\"")
+  check_error("multidecl", "{{$a,$b,$c := 23}}", "too many declarations")
+  check_error("undefvar", "{{$a}}", "undefined variable")
+  check_error("wrongdot", "{{true.any}}", "unexpected . after term")
+  check_error("wrongpipeline", "{{12|false}}", "non executable command in pipeline")
+  check_error("emptypipeline", "{{ ( ) }}", "missing value for parenthesized pipeline")
+  check_error("multilinerawstring", "{{ $v := `\n` }} {{", "multilinerawstring:2: unclosed action")
+  check_error("rangeundefvar", "{{range $k}}{{end}}", "undefined variable")
+  check_error("rangeundefvars", "{{range $k, $v}}{{end}}", "undefined variable")
+  check_error("rangemissingvalue1", "{{range $k,}}{{end}}", "missing value for range")
+  check_error("rangemissingvalue2", "{{range $k, $v := }}{{end}}", "missing value for range")
+  check_error("rangenotvariable1", "{{range $k, .}}{{end}}", "range can only initialize variables")
+  check_error("rangenotvariable2", "{{range $k, 123 := .}}{{end}}", "range can only initialize variables")
+}
+
+test "is empty" {
+  check_empty("empty", "", true)
+  check_empty("nonempty", "hello", false)
+  check_empty("spaces only", " \t\n \t\n", true)
+  check_empty("comment only", "{{/* comment */}}", true)
+  check_empty("definition", "{{define \"x\"}}something{{end}}", true)
+  check_empty("definitions and space", "{{define `x`}}something{{end}}\n\n{{define `y`}}something{{end}}\n\n", true)
+  check_empty("definitions and text", "{{define `x`}}something{{end}}\nx\n{{define `y`}}something{{end}}\ny\n", false)
+  check_empty("definition and action", "{{define `x`}}something{{end}}{{if 3}}foo{{end}}", false)
+}

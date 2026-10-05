@@ -521,6 +521,9 @@ pub struct TBlock {
     pub span: Span,
     /// Locals declared inside this block: ids in [own.0, own.1).
     pub own: (usize, usize),
+    /// The AST block's id (0 for blocks the checker makes): a lambda's
+    /// identity, which a span isn't (derived code shares one span).
+    pub id: u32,
 }
 
 #[derive(Clone, Debug)]
@@ -559,10 +562,10 @@ pub struct TFunc {
     pub ffi: Option<String>,
     pub is_main: bool,
     /// Lambda literals in this function: (block span start, fn type, captured locals).
-    pub lambdas: Vec<(u32, Ty, Vec<LocalId>)>,
+    pub lambdas: Vec<(u64, Ty, Vec<LocalId>)>,
     /// Per lambda (by block span start): its parameters and the range of
     /// locals its body declares (parameters included).
-    pub lambda_info: Vec<(u32, Vec<LocalId>, (usize, usize))>,
+    pub lambda_info: Vec<(u64, Vec<LocalId>, (usize, usize))>,
     /// The error types it can fail with ("Error" = any).
     pub errs: Vec<String>,
 }

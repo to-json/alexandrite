@@ -1,0 +1,173 @@
+# The rest of Go's escape_test.go and content_test.go.
+
+import "dyn"
+import "bytes"
+import "strings"
+import ttmpl "text/template"
+
+test "escape map" {
+  data = dyn.Value.map_of([sv("html"), sv("urlquery")], [sv("<h1>Hi!</h1>"), sv("http://www.foo.com/index.html?title=main")], "map[string]string")
+  # covering issue 20323
+  cases = [
+    ("field with predefined escaper name 1", "{{.html | print}}", "&lt;h1&gt;Hi!&lt;/h1&gt;"),
+    ("field with predefined escaper name 2", "{{.urlquery | print}}", "http://www.foo.com/index.html?title=main"),
+  ]
+  for c in cases {
+    tmpl = must(new("").parse(c[1]))
+    assert_eq tmpl.~execute_str(data), c[2]
+  }
+}
+
+test "escape errors not ignorable" {
+  tmpl = new("dangerous").~parse("<a")
+  b = bytes.new_buffer([])
+  r = tmpl.execute(b, dyn.Value.invalid)
+  assert r.err?, "Expected error"
+  assert_eq b.string, ""
+}
+
+test "escape set errors not ignorable" {
+  tmpl = new("root").~parse("{{define \"t\"}}<a{{end}}")
+  b = bytes.new_buffer([])
+  r = tmpl.execute_template(b, "t", dyn.Value.invalid)
+  assert r.err?, "Expected error"
+  assert_eq b.string, ""
+}
+
+test "redundant funcs" {
+  inputs = [
+    sv(lower7_input() + "﷬�￿&amp;%22\\"),
+    css("a[href =~ \"//example.com\"]#foo"),
+    html("Hello, <b>World</b> &amp;tc!"),
+    html_attr(" dir=\"ltr\""),
+    js("c && alert(\"Hello, World!\");"),
+    js_str("Hello, World & O'Reilly\\x21"),
+    url("greeting=H%69&addressee=(World)"),
+  ]
+  pairs = [
+    ("_html_template_commentescaper", "_html_template_attrescaper"),
+    ("_html_template_commentescaper", "_html_template_htmlescaper"),
+    ("_html_template_cssescaper", "_html_template_attrescaper"),
+    ("_html_template_jsregexpescaper", "_html_template_attrescaper"),
+    ("_html_template_jsstrescaper", "_html_template_attrescaper"),
+    ("_html_template_jstmpllitescaper", "_html_template_attrescaper"),
+    ("_html_template_urlescaper", "_html_template_urlnormalizer"),
+  ]
+  fm = escaper_funcs()
+  for p in pairs {
+    f0 = fm[p[0]].unwrap
+    f1 = fm[p[1]].unwrap
+    for input in inputs {
+      want = f0.~call([input])
+      assert redundant_funcs(p[0], p[1]), p[0]
+      assert_eq f1.~call([want]).str_val, want.str_val
+    }
+  }
+}
+
+test "indirect print" {
+  tmpl = must(new("t").parse("{{.}}"))
+  assert_eq tmpl.~execute_str(dyn.Value.int(3).ptr), "3"
+  assert_eq tmpl.~execute_str(sv("hello").ptr.ptr), "hello"
+}
+
+# This is a test for issue 3272.
+test "empty template html" {
+  page = must(new("page").parse_files(["/dev/null"]))
+  assert page.execute_template_str("page", sv("nothing")).err?, "expected error"
+}
+
+# Go's Issue7379: an int type with a method.
+#[derive(Data)]
+#[data("template.Issue7379")]
+struct Issue7379 {
+  #[data("SomeMethod")]
+  pub def some_method(x: Int) -> Str { "<#{x}>" }
+}
+
+# This is a test for issue 7379: type assertion error caused panic, and then
+# the code to handle the panic breaks escaping.
+test "pipe to method is escaped" {
+  tmpl = must(new("x").parse("<html>{{0 | .SomeMethod}}</html>\n"))
+  i = 0
+  while i < 3 {
+    assert_eq tmpl.~execute_str(Issue7379.new), "<html>&lt;0&gt;</html>\n"
+    i += 1
+  }
+}
+
+# Unlike text/template, html/template crashed if given an incomplete
+# template, that is, a template that had been named but not given any
+# content. This is issue #10204.
+test "error on undefined" {
+  tmpl = new("undefined")
+  r = tmpl.execute_str(dyn.Value.invalid)
+  assert strings.contains(r.err?.message || "", "incomplete"), r.err?.message || ""
+}
+
+# This covers issue #20842.
+test "idempotent execute" {
+  tmpl = must(new("").parse("{{define \"main\"}}<body>{{template \"hello\"}}</body>{{end}}"))
+  _a = must(tmpl.parse("{{define \"hello\"}}Hello, {{\"Ladies & Gentlemen!\"}}{{end}}"))
+  # Ensure that "hello" produces the same output when executed twice.
+  i = 0
+  while i < 2 {
+    assert_eq tmpl.~execute_template_str("hello", dyn.Value.invalid), "Hello, Ladies &amp; Gentlemen!"
+    i += 1
+  }
+  # Ensure that the implicit re-execution of "hello" during the execution of
+  # "main" does not cause the output of "hello" to change.
+  assert_eq tmpl.~execute_template_str("main", dyn.Value.invalid), "<body>Hello, Ladies &amp; Gentlemen!</body>"
+}
+
+# Covers issue 22780.
+test "orphaned template" {
+  t1 = must(new("foo").parse("<a href=\"{{.}}\">link1</a>"))
+  t2 = must(t1.new("foo").parse("bar"))
+  r = t1.execute_str(sv("javascript:alert(1)"))
+  assert_eq r.err?.message || "", "template: \"foo\" is an incomplete or empty template"
+  assert_eq t2.~execute_str(dyn.Value.invalid), "bar"
+}
+
+# Covers issue 21844.
+test "aliased parse tree does not overescape" {
+  tpl = must(new("foo").parse("{{.}}"))
+  _a = tpl.~add_parse_tree("bar", tpl.tree.unwrap)
+  got1 = tpl.~execute_template_str("foo", sv("<baz>"))
+  got2 = tpl.~execute_template_str("bar", sv("<baz>"))
+  assert_eq got1, "&lt;baz&gt;"
+  assert_eq got2, got1
+}
+
+# Go's myStringer and errorer: String() and Error() on pointers.
+#[derive(Data)]
+#[data("template.myStringer")]
+struct MyStringer {
+  v: Int
+
+  pub def to_s -> Str { "string=#{v}" }
+}
+
+#[derive(Data)]
+#[data("template.errorer")]
+struct Errorer {
+  v: Int
+
+  pub def to_s -> Str { "error=#{v}" }
+}
+
+# Test that we print using the String method. Was issue 3073.
+test "stringer" {
+  tmpl = must(new("x").parse("{{.}}"))
+  assert_eq tmpl.~execute_str(MyStringer.new(v: 3).to_data.ptr), "string=3"
+  assert_eq tmpl.~execute_str(Errorer.new(v: 7).to_data.ptr), "error=7"
+}
+
+# https://golang.org/issue/5982
+test "escaping nil nonempty interfaces" {
+  tmpl = must(new("x").parse("{{.E}}"))
+  got = tmpl.~execute_str(dyn.Value.struct_of("struct { E error }", ["E"], [dyn.Value.nil_of("error")]))
+  # A non-empty interface should print like an empty interface.
+  want = tmpl.~execute_str(dyn.Value.struct_of("struct { E interface {} }", ["E"], [dyn.Value.nil_of("interface {}")]))
+  assert_eq got, want
+}

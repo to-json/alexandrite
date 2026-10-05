@@ -1,0 +1,498 @@
+# Parse nodes: Go's text/template/parse/node.go.
+#
+# Go's nodes are pointers to typed structs behind the Node interface. alx
+# has no pointers and a value can't contain itself, so the nodes of one
+# parse live in an arena (a shared `[ArenaS]`) and a `Node` is a handle:
+# the arena and an index. Every Go node type is the same `Node` here; its
+# `typ` is Go's NodeType and the accessors read the fields that type has.
+# A type switch `switch n := node.(type) { case *ActionNode: ... }`
+# becomes `case n.typ { NODE_ACTION => ... }`.
+
+import "strconv"
+import "strings"
+
+# Node types (Go's NodeType constants, same values).
+# Plain text.
+pub NODE_TEXT = 0
+# A non-control action such as a field evaluation.
+pub NODE_ACTION = 1
+# A boolean constant.
+pub NODE_BOOL = 2
+# A sequence of field accesses.
+pub NODE_CHAIN = 3
+# An element of a pipeline.
+pub NODE_COMMAND = 4
+# The cursor, dot.
+pub NODE_DOT = 5
+# An else action. Not added to tree.
+NODE_ELSE = 6
+# An end action. Not added to tree.
+NODE_END = 7
+# A field or method name.
+pub NODE_FIELD = 8
+# An identifier; always a function name.
+pub NODE_IDENTIFIER = 9
+# An if action.
+pub NODE_IF = 10
+# A list of Nodes.
+pub NODE_LIST = 11
+# An untyped nil constant.
+pub NODE_NIL = 12
+# A numerical constant.
+pub NODE_NUMBER = 13
+# A pipeline of commands.
+pub NODE_PIPE = 14
+# A range action.
+pub NODE_RANGE = 15
+# A string constant.
+pub NODE_STRING = 16
+# A template invocation action.
+pub NODE_TEMPLATE = 17
+# A $ variable.
+pub NODE_VARIABLE = 18
+# A with action.
+pub NODE_WITH = 19
+# A comment.
+pub NODE_COMMENT = 20
+# A break action.
+pub NODE_BREAK = 21
+# A continue action.
+pub NODE_CONTINUE = 22
+
+# One node's data. Which fields mean something depends on `typ`.
+struct N {
+  typ: Int
+  pos: Int
+  # Action, Pipe, Branch, Template, Break, Continue, Else: the line number.
+  line: Int
+  # Text and Comment: the text. Identifier: the name. String: the unquoted
+  # text. Number: the original text. Template: the template's name.
+  text: Str
+  # String: the original text, with quotes.
+  quoted: Str
+  # Field, Variable: the identifiers. Chain: the fields.
+  ident: [Str]
+  # List: the nodes. Command: the arguments. Pipe: the commands.
+  kids: [Int]
+  # Pipe: the declared variables.
+  decl: [Int]
+  # Pipe: the variables are assigned, not declared.
+  is_assign: Bool
+  # Action, Branch, Template: the pipeline. Chain: the term. -1: none.
+  pipe: Int
+  # Branch: what to execute if the value is non-empty, and if not (-1: none).
+  list: Int
+  else_list: Int
+  # Number: the value, under every type that can represent it.
+  is_int: Bool
+  is_uint: Bool
+  is_float: Bool
+  is_complex: Bool
+  int64: Int
+  uint64: U64
+  float64: Float
+  complex128: Complex
+  # Bool: the value.
+  truth: Bool
+}
+
+# The nodes of one parse, and what their String() and ErrorContext need:
+# the text that was parsed, the top-level template's name and the delimiters.
+struct ArenaS {
+  nodes: [N]
+  text: Str
+  parse_name: Str
+  left_delim: Str
+  right_delim: Str
+}
+
+def new_arena(text: Str, parse_name: Str, left: Str, right: Str) -> [ArenaS] {
+  [ArenaS.new(nodes: [], text: text, parse_name: parse_name, left_delim: left, right_delim: right)]
+}
+
+def arena_add(ar: [ArenaS], n: N) -> Int {
+  ns = ar[0].nodes
+  ns << n
+  ar[0].nodes = ns
+  ns.size - 1
+}
+
+def blank(typ: Int, pos: Int) -> N {
+  N.new(typ: typ, pos: pos, pipe: -1, list: -1, else_list: -1)
+}
+
+# An element in the parse tree: a handle on a node in its parse's arena.
+# Copies of a Node are the same node.
+pub struct Node {
+  ar: [ArenaS]
+  id: Int
+
+  def n -> N { ar[0].nodes[id] }
+  def at(i: Int) -> Node { Node.new(ar: ar, id: i) }
+  def opt(i: Int) -> Node? {
+    return none if i < 0
+    at(i)
+  }
+  def ats(is: [Int]) -> [Node] { is.map { at(it) } }
+
+  # The node type (Go's Type()).
+  pub def typ -> Int { n().typ }
+  # The byte position of the start of the node in the full original input
+  # string (Go's Position()).
+  pub def pos -> Int { n().pos }
+  pub def position -> Int { n().pos }
+  # The line number (Action, Pipe, If, Range, With, Template, Break, Continue).
+  pub def line -> Int { n().line }
+
+  # ListNode.Nodes: the element nodes in lexical order.
+  pub def nodes -> [Node] { ats(n().kids) }
+  # TextNode.Text, CommentNode.Text, StringNode.Text (unquoted).
+  pub def text -> Str { n().text }
+  # StringNode.Quoted: the original text, with quotes.
+  pub def quoted -> Str { n().quoted }
+  # IdentifierNode.Ident: the function name.
+  pub def ident_name -> Str { n().text }
+  # TemplateNode.Name: the name of the template (unquoted).
+  pub def name -> Str { n().text }
+  # FieldNode.Ident / VariableNode.Ident: the identifiers in lexical order
+  # (a variable's first one is its name, with the $).
+  pub def ident -> [Str] { n().ident }
+  # ChainNode.Field: the fields, in lexical order.
+  pub def field -> [Str] { n().ident }
+  # ChainNode.Node: the term the fields apply to.
+  pub def node -> Node { at(n().pipe) }
+  # PipeNode.IsAssign: the variables are being assigned, not declared.
+  pub def is_assign -> Bool { n().is_assign }
+  # PipeNode.Decl: the variables in lexical order.
+  pub def decl -> [Node] { ats(n().decl) }
+  # PipeNode.Cmds: the commands in lexical order.
+  pub def cmds -> [Node] { ats(n().kids) }
+  # CommandNode.Args: the arguments in lexical order.
+  pub def args -> [Node] { ats(n().kids) }
+  # ActionNode.Pipe, BranchNode.Pipe, TemplateNode.Pipe (none: no pipeline).
+  pub def pipe -> Node? { opt(n().pipe) }
+  # BranchNode.List and ElseList.
+  pub def list -> Node? { opt(n().list) }
+  pub def else_list -> Node? { opt(n().else_list) }
+  # BoolNode.True.
+  pub def truth -> Bool { n().truth }
+  # NumberNode fields.
+  pub def is_int -> Bool { n().is_int }
+  pub def is_uint -> Bool { n().is_uint }
+  pub def is_float -> Bool { n().is_float }
+  pub def is_complex -> Bool { n().is_complex }
+  pub def int64 -> Int { n().int64 }
+  pub def uint64 -> U64 { n().uint64 }
+  pub def float64 -> Float { n().float64 }
+  pub def complex128 -> Complex { n().complex128 }
+
+  # The delimiters and the text of the parse this node belongs to.
+  pub def left_delim -> Str { ar[0].left_delim }
+  pub def right_delim -> Str { ar[0].right_delim }
+  pub def parse_name -> Str { ar[0].parse_name }
+  pub def tree_text -> Str { ar[0].text }
+
+  # Whether two handles name the same node.
+  pub def same?(o: Node) -> Bool {
+    id == o.id && ar[0].nodes.size == o.ar[0].nodes.size && ar[0].text == o.ar[0].text && ar[0].parse_name == o.ar[0].parse_name
+  }
+
+  # Setters, for html/template's rewriting of the tree.
+  # (A Node is a handle: these change the shared arena, not the handle.)
+  pub def set_text(t: Str) {
+    a = ar
+    a[0].nodes[id].text = t
+  }
+  pub def set_kids(ks: [Node]) {
+    a = ar
+    a[0].nodes[id].kids = ks.map { it.id }
+  }
+  pub def set_nodes(ks: [Node]) { set_kids(ks) }
+  pub def set_args(ks: [Node]) { set_kids(ks) }
+  pub def set_cmds(ks: [Node]) { set_kids(ks) }
+  pub def set_decl(ks: [Node]) {
+    a = ar
+    a[0].nodes[id].decl = ks.map { it.id }
+  }
+  pub def set_pipe(p: Node?) {
+    i = -1
+    if q = p { i = q.id }
+    a = ar
+    a[0].nodes[id].pipe = i
+  }
+  pub def set_list(l: Node?) {
+    i = -1
+    if q = l { i = q.id }
+    a = ar
+    a[0].nodes[id].list = i
+  }
+  pub def set_else_list(l: Node?) {
+    i = -1
+    if q = l { i = q.id }
+    a = ar
+    a[0].nodes[id].else_list = i
+  }
+  pub def set_ident(xs: [Str]) {
+    a = ar
+    a[0].nodes[id].ident = xs
+  }
+  pub def set_name(t: Str) { set_text(t) }
+  pub def set_pos(p: Int) {
+    a = ar
+    a[0].nodes[id].pos = p
+  }
+
+  # ListNode.append / CommandNode.append / PipeNode.append.
+  pub def append(k: Node) {
+    a = ar
+    ks = a[0].nodes[id].kids
+    ks << k.id
+    a[0].nodes[id].kids = ks
+  }
+
+  # New nodes in this node's arena (for html/template).
+  pub def new_identifier(name: Str, pos: Int) -> Node {
+    nn = blank(NODE_IDENTIFIER, pos)
+    nn.text = name
+    at(arena_add(ar, nn))
+  }
+  pub def new_command(pos: Int, args: [Node]) -> Node {
+    nn = blank(NODE_COMMAND, pos)
+    nn.kids = args.map { it.id }
+    at(arena_add(ar, nn))
+  }
+  pub def new_pipe(pos: Int, line: Int, decl: [Node], cmds: [Node]) -> Node {
+    nn = blank(NODE_PIPE, pos)
+    nn.line = line
+    nn.decl = decl.map { it.id }
+    nn.kids = cmds.map { it.id }
+    at(arena_add(ar, nn))
+  }
+  pub def new_text(pos: Int, text: Str) -> Node {
+    nn = blank(NODE_TEXT, pos)
+    nn.text = text
+    at(arena_add(ar, nn))
+  }
+  pub def new_list(pos: Int) -> Node { at(arena_add(ar, blank(NODE_LIST, pos))) }
+  pub def new_string(pos: Int, quoted: Str, text: Str) -> Node {
+    nn = blank(NODE_STRING, pos)
+    nn.quoted = quoted
+    nn.text = text
+    at(arena_add(ar, nn))
+  }
+
+  # The node as template text (Go's String()).
+  pub def to_s -> Str { write(id, [], false).join("") }
+  pub def string -> Str { to_s() }
+  # String() with text nodes written as Go's %q (Go's tests set the package
+  # variable textFormat to "%q"; alx has no mutable package variables).
+  pub def string_quoted -> Str { write(id, [], true).join("") }
+
+  def write(i: Int, acc: [Str], q: Bool) -> [Str] {
+    o = acc
+    x = ar[0].nodes[i]
+    l = ar[0].left_delim
+    r = ar[0].right_delim
+    case x.typ {
+      NODE_LIST => {
+        for k in x.kids { o = write(k, o, q) }
+      }
+      NODE_TEXT => {
+        o << (q ? strconv.quote(x.text) : x.text)
+      }
+      NODE_COMMENT => {
+        o << l
+        o << x.text
+        o << r
+      }
+      NODE_PIPE => {
+        if x.decl.size > 0 {
+          j = 0
+          for v in x.decl {
+            o << ", " if j > 0
+            o = write(v, o, q)
+            j += 1
+          }
+          o << (x.is_assign ? " = " : " := ")
+        }
+        j = 0
+        for c in x.kids {
+          o << " | " if j > 0
+          o = write(c, o, q)
+          j += 1
+        }
+      }
+      NODE_ACTION => {
+        o << l
+        o = write(x.pipe, o, q)
+        o << r
+      }
+      NODE_COMMAND => {
+        j = 0
+        for a in x.kids {
+          o << " " if j > 0
+          j += 1
+          if ar[0].nodes[a].typ == NODE_PIPE {
+            o << "("
+            o = write(a, o, q)
+            o << ")"
+            next
+          }
+          o = write(a, o, q)
+        }
+      }
+      NODE_IDENTIFIER => {
+        o << x.text
+      }
+      NODE_VARIABLE => {
+        o << x.ident.join(".")
+      }
+      NODE_DOT => {
+        o << "."
+      }
+      NODE_NIL => {
+        o << "nil"
+      }
+      NODE_FIELD => {
+        for f in x.ident {
+          o << "."
+          o << f
+        }
+      }
+      NODE_CHAIN => {
+        if ar[0].nodes[x.pipe].typ == NODE_PIPE {
+          o << "("
+          o = write(x.pipe, o, q)
+          o << ")"
+        } else {
+          o = write(x.pipe, o, q)
+        }
+        for f in x.ident {
+          o << "."
+          o << f
+        }
+      }
+      NODE_BOOL => {
+        o << (x.truth ? "true" : "false")
+      }
+      NODE_NUMBER => {
+        o << x.text
+      }
+      NODE_STRING => {
+        o << x.quoted
+      }
+      NODE_END => {
+        o << "#{l}end#{r}"
+      }
+      NODE_ELSE => {
+        o << "#{l}else#{r}"
+      }
+      NODE_BREAK => {
+        o << "#{l}break#{r}"
+      }
+      NODE_CONTINUE => {
+        o << "#{l}continue#{r}"
+      }
+      NODE_TEMPLATE => {
+        o << l
+        o << "template "
+        o << strconv.quote(x.text)
+        if x.pipe >= 0 {
+          o << " "
+          o = write(x.pipe, o, q)
+        }
+        o << r
+      }
+      _ => {
+        # NODE_IF, NODE_RANGE, NODE_WITH
+        name = case x.typ {
+          NODE_IF => "if"
+          NODE_RANGE => "range"
+          _ => "with"
+        }
+        o << l
+        o << name
+        o << " "
+        o = write(x.pipe, o, q)
+        o << r
+        o = write(x.list, o, q)
+        if x.else_list >= 0 {
+          o << "#{l}else#{r}"
+          o = write(x.else_list, o, q)
+        }
+        o << "#{l}end#{r}"
+      }
+    }
+    o
+  }
+
+  # A deep copy of the node and all its components (Go's Copy()), in the
+  # same arena. A ChainNode's term is shared, as in Go.
+  pub def copy -> Node { at(copy_of(id)) }
+  # Go's CopyList / CopyPipe: none stays none.
+  pub def copy_opt(o: Node?) -> Node? {
+    if x = o {
+      return x.copy
+    }
+    none
+  }
+
+  def copy_of(i: Int) -> Int {
+    return -1 if i < 0
+    x = ar[0].nodes[i]
+    case x.typ {
+      NODE_LIST | NODE_COMMAND => {
+        x.kids = x.kids.map { copy_of(it) }
+      }
+      NODE_PIPE => {
+        x.decl = x.decl.map { copy_of(it) }
+        x.kids = x.kids.map { copy_of(it) }
+      }
+      NODE_ACTION | NODE_TEMPLATE => {
+        x.pipe = copy_of(x.pipe)
+      }
+      NODE_IF | NODE_RANGE | NODE_WITH => {
+        x.pipe = copy_of(x.pipe)
+        x.list = copy_of(x.list)
+        x.else_list = copy_of(x.else_list)
+      }
+      _ => {
+        x.ident = x.ident.map { it }
+      }
+    }
+    arena_add(ar, x)
+  }
+}
+
+# Go's NewIdentifier: an identifier node in an arena of its own (SetTree
+# and SetPos are the arena's and `set_pos`).
+pub def new_identifier(ident: Str) -> Node {
+  ar = new_arena("", "", DEFAULT_LEFT_DELIM, DEFAULT_RIGHT_DELIM)
+  nn = blank(NODE_IDENTIFIER, 0)
+  nn.text = ident
+  Node.new(ar: ar, id: arena_add(ar, nn))
+}
+
+# Whether this tree (node) is empty of everything but space or comments.
+pub def is_empty_tree(o: Node?) -> Bool {
+  if n = o {
+    case n.typ {
+      NODE_COMMENT => {
+        return true
+      }
+      NODE_LIST => {
+        for k in n.nodes {
+          return false if !is_empty_tree(k)
+        }
+        return true
+      }
+      NODE_TEXT => {
+        return strings.trim_space(n.text).size == 0
+      }
+      _ => {
+        return false
+      }
+    }
+  }
+  true
+}

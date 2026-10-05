@@ -1,0 +1,565 @@
+# JavaScript escaping: Go's html/template/js.go, and the part of Go's
+# encoding/json.Marshal that jsValEscaper uses, over Values.
+
+import "dyn"
+import "encoding/base64"
+import "encoding/json"
+import "slices"
+import "strconv"
+import "strings"
+import ttmpl "text/template"
+import "unicode/utf8"
+
+JS_WHITESPACE = "\x0c\n\r\t\x0b                  　﻿"
+
+def trim_right_js_space(s: Str) -> Str {
+  set = JS_WHITESPACE.runes
+  e = s.size
+  while e > 0 {
+    r, w = utf8.decode_last_rune_in_string(s[0...e])
+    break if !set.any? { it == r }
+    e -= w
+  }
+  s[0...e]
+}
+
+# The context that determines whether a slash after the given run of tokens
+# starts a regular expression instead of a division operator: / or /=.
+#
+# This assumes that the token run does not include any string tokens,
+# comment tokens, regular expression literal tokens, or division
+# operators.
+#
+# This fails on some valid but nonsensical JavaScript programs like
+# "x = ++/foo/i" which is quite different than "x++/foo/i", but is not
+# known to fail on any known useful programs. It is based on the draft
+# JavaScript 2.0 lexical grammar and requires one token of lookbehind:
+# https://www.mozilla.org/js/language/js20-2000-07/rationale/syntax.html
+def next_js_ctx(s0: Str, preceding: Int) -> Int {
+  # Trim all JS whitespace characters
+  s = trim_right_js_space(s0)
+  return preceding if s.size == 0
+  n = s.size
+  c = s[n - 1].to_i
+  case c {
+    43 | 45 => {
+      # ++ and -- are not regexp preceders, but + and - are whether they
+      # are used as infix or prefix operators.
+      start = n - 1
+      # Count the number of adjacent dashes or pluses.
+      while start > 0 && s[start - 1].to_i == c { start -= 1 }
+      if ((n - start) & 1) == 1 {
+        # Reached for trailing minus signs since "---" is the same as
+        # "-- -".
+        return JS_CTX_REGEXP
+      }
+      JS_CTX_DIV_OP
+    }
+    46 => {
+      # Handle "42."
+      if n != 1 && 48 <= s[n - 2] && s[n - 2] <= 57 {
+        return JS_CTX_DIV_OP
+      }
+      JS_CTX_REGEXP
+    }
+    # Suffixes for all punctuators from section 7.7 of the language spec
+    # that only end binary operators not handled above.
+    44 | 60 | 62 | 61 | 42 | 37 | 38 | 124 | 94 | 63 => JS_CTX_REGEXP
+    # Suffixes for all punctuators from section 7.7 of the language spec
+    # that are prefix operators not handled above.
+    33 | 126 => JS_CTX_REGEXP
+    # Matches all the punctuators from section 7.7 of the language spec
+    # that are open brackets not handled above.
+    40 | 91 => JS_CTX_REGEXP
+    # Matches all the punctuators from section 7.7 of the language spec
+    # that precede expression starts.
+    58 | 59 | 123 => JS_CTX_REGEXP
+    # CAVEAT: the close punctuators ('}', ']', ')') precede div ops and are
+    # handled in the default except for '}' which can precede a division
+    # op as in
+    #    ({ valueOf: function () { return 42 } } / 2
+    # which is valid, but, in practice, developers don't divide object
+    # literals, so our heuristic works well for code like
+    #    function () { ... }  /foo/.test(x) && sideEffect();
+    # The ')' punctuator can precede a regular expression as in
+    #     if (b) /foo/.test(x) && ...
+    # but this is much less likely than
+    #     (a + b) / c
+    125 => JS_CTX_REGEXP
+    _ => {
+      # Look for an IdentifierName and see if it is a keyword that can
+      # precede a regular expression.
+      j = n
+      while j > 0 && is_js_ident_part(s[j - 1].to_i.to_i32) { j -= 1 }
+      if regexp_preceder_keyword?(s[j...n]) {
+        return JS_CTX_REGEXP
+      }
+      # Otherwise is a punctuator not listed above, or a string which
+      # precedes a div op, or an identifier which precedes a div op.
+      JS_CTX_DIV_OP
+    }
+  }
+}
+
+def regexp_preceder_keyword?(w: Str) -> Bool {
+  case w {
+    "break" | "case" | "continue" | "delete" | "do" | "else" | "finally" | "in" | "instanceof" | "return" | "throw" | "try" | "typeof" | "void" => true
+    _ => false
+  }
+}
+
+# Whether v has a MarshalJSON method (Go's json.Marshaler).
+def marshaler?(v: dyn.Value) -> Bool {
+  if o = v.obj {
+    return o.data_sig("MarshalJSON") != none
+  }
+  false
+}
+
+# Go's indirectToJSONMarshaler: follows pointers until a Marshaler or a
+# non-pointer.
+def indirect_to_json_marshaler(v0: dyn.Value) -> dyn.Value {
+  v = v0
+  while v.kind == dyn.KIND_PTR && !v.nil? && !marshaler?(v) {
+    v = v.elem
+  }
+  v
+}
+
+# Escapes its inputs to a JS Expression (section 11.14) that has neither
+# side-effects nor free variables outside (NaN, Infinity).
+def js_val_escaper(args: [dyn.Value]) -> Str {
+  a = dyn.Value.invalid
+  if args.size == 1 {
+    a = indirect_to_json_marshaler(args[0])
+    if a.kind == dyn.KIND_STRING && a.type_name == "template.JS" {
+      return a.str_val
+    }
+    if a.kind == dyn.KIND_STRING && a.type_name == "template.JSStr" {
+      # TODO: normalize quotes.
+      return "\"" + a.str_val + "\""
+    }
+    if !marshaler?(a) && stringer?(a) {
+      # Do not treat as a Stringer.
+      a = dyn.Value.str(a.obj.unwrap.data_string.unwrap)
+    }
+    # TODO: detect cycles before calling Marshal which loops infinitely on
+    # cyclic data. This may be an unacceptable DoS risk.
+  } else {
+    xs = args.map { indirect_to_json_marshaler(it) }
+    a = dyn.Value.str(dyn.fmt_print(xs))
+  }
+  r = json_marshal(a)
+  if e = r.err {
+    err_str = script_tag_escape(e.message)
+    err_str = strings.replace_all(err_str, "*/", "* /")
+    err_str = strings.replace_all(err_str, "<!--", "\\x3C!--")
+    # TODO: maybe post-process output to prevent it from containing
+    # "<!--", "-->", "<![CDATA[", "]]>", or "</script"
+    # in case custom marshalers produce output containing those.
+    # Note: Do not use \x escaping to save bytes because it is not JSON
+    # compatible and this escaper supports ld+json content-type.
+    return " /* #{err_str} */null "
+  }
+  b = r.unwrap
+  # TODO: maybe post-process output to prevent it from containing
+  # "<!--", "-->", "<![CDATA[", "]]>", or "</script"
+  # in case custom marshalers produce output containing those.
+  # Note: Do not use \x escaping to save bytes because it is not JSON
+  # compatible and this escaper supports ld+json content-type.
+  if b.size == 0 {
+    # In, `x=y/{{.}}*z` a json.Marshaler that produces "" should not cause
+    # the output `x=y/*z`.
+    return " null "
+  }
+  first, _ = utf8.decode_rune_at(b, 0)
+  last, _ = utf8.decode_last_rune_in_string(b)
+  pad = is_js_ident_part(first) || is_js_ident_part(last)
+  out: [Str] = []
+  out << " " if pad
+  written = 0
+  i = 0
+  # Make sure that json.Marshal escapes codepoints U+2028 & U+2029 so it
+  # falls within the subset of JSON which is valid JS.
+  while i < b.size {
+    rn, n = utf8.decode_rune_at(b, i)
+    repl = ""
+    if rn == 0x2028 {
+      repl = "\\u2028"
+    } else if rn == 0x2029 {
+      repl = "\\u2029"
+    }
+    if repl != "" {
+      out << b[written...i]
+      out << repl
+      written = i + n
+    }
+    i += n
+  }
+  if out.size != 0 {
+    out << b[written...b.size]
+    out << " " if pad
+    return out.join("")
+  }
+  b
+}
+
+# Go's scriptTagRe replacement: (?i)<(/?)script -> \x3C$1script.
+def script_tag_escape(s: Str) -> Str {
+  out: [Str] = []
+  written = 0
+  i = 0
+  while i < s.size {
+    if s[i] == 60 {
+      j = i + 1
+      slash = j < s.size && s[j] == 47
+      j += 1 if slash
+      if j + 6 <= s.size && equal_fold_ascii(s[j...j + 6], "script") {
+        out << s[written...i]
+        out << "\\x3C" + (slash ? "/" : "") + "script"
+        written = j + 6
+        i = j + 6
+        next
+      }
+    }
+    i += 1
+  }
+  return s if written == 0
+  out << s[written...s.size]
+  out.join("")
+}
+
+# Escapes its inputs to a sequence of characters that can be embedded
+# between quotes in a JS string literal.
+def js_str_escaper(args: [dyn.Value]) -> Str {
+  s, t = stringify(args)
+  if t == CONTENT_JS_STR {
+    return js_replace(s, 2)
+  }
+  js_replace(s, 0)
+}
+
+def js_tmpl_lit_escaper(args: [dyn.Value]) -> Str {
+  s, _ = stringify(args)
+  js_replace(s, 1)
+}
+
+# Escapes its inputs to a sequence of characters that can be embedded
+# between slashes in a JS regular expression literal.
+def js_regexp_escaper(args: [dyn.Value]) -> Str {
+  s, _ = stringify(args)
+  s = js_replace(s, 3)
+  if s == "" {
+    # /{{.X}}/ should not produce a line comment when .X == "".
+    return "(?:)"
+  }
+  s
+}
+
+# The replacement tables: 0 jsStrReplacementTable, 1 jsBqStrReplacementTable,
+# 2 jsStrNormReplacementTable, 3 jsRegexpReplacementTable.
+def js_table(table: Int, r: Rune) -> Str {
+  # (the control characters, the same in every table)
+  case r {
+    0 => {
+      return "\\u0000"
+    }
+    9 => {
+      return "\\t"
+    }
+    10 => {
+      return "\\n"
+    }
+    11 => {
+      return "\\u000b"
+    }
+    12 => {
+      return "\\f"
+    }
+    13 => {
+      return "\\r"
+    }
+    _ => {}
+  }
+  case table {
+    0 => case r {
+      34 => "\\u0022"
+      96 => "\\u0060"
+      38 => "\\u0026"
+      39 => "\\u0027"
+      43 => "\\u002b"
+      47 => "\\/"
+      60 => "\\u003c"
+      62 => "\\u003e"
+      92 => "\\\\"
+      _ => ""
+    }
+    1 => case r {
+      34 => "\\u0022"
+      96 => "\\u0060"
+      38 => "\\u0026"
+      39 => "\\u0027"
+      43 => "\\u002b"
+      47 => "\\/"
+      60 => "\\u003c"
+      62 => "\\u003e"
+      92 => "\\\\"
+      36 => "\\u0024"
+      123 => "\\u007b"
+      125 => "\\u007d"
+      _ => ""
+    }
+    2 => case r {
+      34 => "\\u0022"
+      38 => "\\u0026"
+      39 => "\\u0027"
+      96 => "\\u0060"
+      43 => "\\u002b"
+      47 => "\\/"
+      60 => "\\u003c"
+      62 => "\\u003e"
+      _ => ""
+    }
+    _ => case r {
+      34 => "\\u0022"
+      36 => "\\$"
+      38 => "\\u0026"
+      39 => "\\u0027"
+      40 => "\\("
+      41 => "\\)"
+      42 => "\\*"
+      43 => "\\u002b"
+      45 => "\\-"
+      46 => "\\."
+      47 => "\\/"
+      60 => "\\u003c"
+      62 => "\\u003e"
+      63 => "\\?"
+      91 => "\\["
+      92 => "\\\\"
+      93 => "\\]"
+      94 => "\\^"
+      123 => "\\{"
+      124 => "\\|"
+      125 => "\\}"
+      _ => ""
+    }
+  }
+}
+
+# The low code points: the control characters as \u00XX (Go's
+# lowUnicodeReplacementTable), with \t \n \f \r.
+def low_unicode(r: Rune) -> Str {
+  case r {
+    9 => "\\t"
+    10 => "\\n"
+    12 => "\\f"
+    13 => "\\r"
+    _ => {
+      h = strconv.format_int(r.to_i, 16)
+      h = "0" + h if h.size < 2
+      "\\u00" + h
+    }
+  }
+}
+
+# Replaces each rune r of s with the table's entry for r; runes with no
+# entry pass, except the control characters and U+2028/U+2029.
+def js_replace(s: Str, table: Int) -> Str {
+  out: [Str] = []
+  written = 0
+  i = 0
+  while i < s.size {
+    r, w = utf8.decode_rune_at(s, i)
+    repl = ""
+    if r < 0x20 {
+      repl = low_unicode(r)
+    } else if r < 128 {
+      repl = js_table(table, r)
+    } else if r == 0x2028 {
+      repl = "\\u2028"
+    } else if r == 0x2029 {
+      repl = "\\u2029"
+    }
+    if repl == "" {
+      i += w
+      next
+    }
+    out << s[written...i]
+    out << repl
+    written = i + w
+    i += w
+  }
+  return s if written == 0
+  out << s[written...s.size]
+  out.join("")
+}
+
+# Whether the given rune is a JS identifier part. It does not handle all the
+# non-Latin letters, joiners, and combining marks, but it does handle every
+# codepoint that can occur in a numeric literal or a keyword.
+def is_js_ident_part(r: Rune) -> Bool {
+  r == 36 || (48 <= r && r <= 57) || (65 <= r && r <= 90) || r == 95 || (97 <= r && r <= 122)
+}
+
+# Whether the given MIME type is a JavaScript MIME type (as in
+# https://mimesniff.spec.whatwg.org/#javascript-mime-type plus JSON and
+# modules, which are JS).
+def is_js_type(mime: Str) -> Bool {
+  # per
+  #   https://www.w3.org/TR/html5/scripting-1.html#attr-script-type
+  #   https://tools.ietf.org/html/rfc7231#section-3.1.1
+  #   https://tools.ietf.org/html/rfc4329#section-3
+  #   https://www.ietf.org/rfc/rfc4627.txt
+  # discard parameters
+  m = mime
+  if pr = strings.cut(m, ";") {
+    m = pr[0]
+  }
+  m = strings.trim_space(strings.to_lower(m))
+  case m {
+    "" | "application/ecmascript" | "application/javascript" | "application/json" | "application/ld+json" | "application/x-ecmascript" | "application/x-javascript" | "module" | "text/ecmascript" | "text/javascript" | "text/javascript1.0" | "text/javascript1.1" | "text/javascript1.2" | "text/javascript1.3" | "text/javascript1.4" | "text/javascript1.5" | "text/jscript" | "text/livescript" | "text/x-ecmascript" | "text/x-javascript" => true
+    _ => false
+  }
+}
+
+# Go's json.Marshal over a Value.
+def json_marshal(v: dyn.Value) -> ~Str {
+  out: [Str] = []
+  parts = ~json_enc(v, out)
+  parts.join("")
+}
+
+def json_enc(v: dyn.Value, acc: [Str]) -> ~[Str] {
+  out = acc
+  if v.kind == dyn.KIND_INVALID {
+    out << "null"
+    return out
+  }
+  if marshaler?(v) {
+    o = v.obj.unwrap
+    r = o.data_call("MarshalJSON", [])
+    if e = r.err {
+      fail Failure.Msg("json: error calling MarshalJSON for type #{v.type_name}: #{e.message}")
+    }
+    rv = r.unwrap
+    b = rv.kind == dyn.KIND_STRING ? rv.str_val : Str.from_bytes(rv.elems.map { it.uint_val.to_i.as_u8 })
+    c = json.check(b)
+    if e = c.err {
+      fail Failure.Msg("json: error calling MarshalJSON for type #{v.type_name}: #{e.message}")
+    }
+    out << json.html_escape(json.compact(b).unwrap)
+    return out
+  }
+  case v.kind {
+    dyn.KIND_BOOL => out << (v.bool_val ? "true" : "false")
+    dyn.KIND_INT => out << "#{v.int_val}"
+    dyn.KIND_UINT => out << strconv.format_uint(v.uint_val, 10)
+    dyn.KIND_FLOAT => {
+      bits = v.type_name == "float32" ? 32 : 64
+      f = v.float_val
+      if f != f || f > 1.7976931348623157e308 || f < -1.7976931348623157e308 {
+        fail Failure.Msg("json: unsupported value: " + strconv.format_float(f, "g", -1, bits))
+      }
+      out << json_float(f, bits)
+    }
+    dyn.KIND_STRING => out << json.quote(v.str_val)
+    dyn.KIND_LIST => {
+      t = v.type_name
+      if t.start_with?("[]") && v.nil? {
+        out << "null"
+        return out
+      }
+      if t == "[]uint8" || t == "[]byte" {
+        bs: [Byte] = v.elems.map { it.uint_val.to_i.as_u8 }
+        out << "\"" + base64.std_encoding.encode_to_string(bs) + "\""
+        return out
+      }
+      out << "["
+      i = 0
+      for e in v.elems {
+        out << "," if i > 0
+        out = ~json_enc(e, out)
+        i += 1
+      }
+      out << "]"
+    }
+    dyn.KIND_MAP => {
+      if v.nil? {
+        out << "null"
+        return out
+      }
+      kvs: [(Str, dyn.Value)] = []
+      for e in v.entries {
+        k = e[0]
+        ks = case k.kind {
+          dyn.KIND_STRING => k.str_val
+          dyn.KIND_INT => "#{k.int_val}"
+          dyn.KIND_UINT => strconv.format_uint(k.uint_val, 10)
+          _ => {
+            fail Failure.Msg("json: unsupported type: #{v.type_name}")
+            ""
+          }
+        }
+        kvs << (ks, e[1])
+      }
+      slices.sort_func(kvs, ->(a: (Str, dyn.Value), b: (Str, dyn.Value)) -> Int { a[0] < b[0] ? -1 : (a[0] > b[0] ? 1 : 0) })
+      out << "{"
+      i = 0
+      for kv in kvs {
+        out << "," if i > 0
+        out << json.quote(kv[0])
+        out << ":"
+        out = ~json_enc(kv[1], out)
+        i += 1
+      }
+      out << "}"
+    }
+    dyn.KIND_STRUCT => {
+      out << "{"
+      i = 0
+      for e in v.entries {
+        name = e[0].str_val
+        # (unexported fields aren't encoded)
+        next if e[0].int_val == 1
+        out << "," if i > 0
+        out << json.quote(name)
+        out << ":"
+        out = ~json_enc(e[1], out)
+        i += 1
+      }
+      out << "}"
+    }
+    dyn.KIND_PTR => {
+      if v.nil? {
+        out << "null"
+        return out
+      }
+      out = ~json_enc(v.elem, out)
+    }
+    _ => {
+      fail Failure.Msg("json: unsupported type: #{v.type_name}")
+    }
+  }
+  out
+}
+
+# Go's encoding/json float encoding.
+def json_float(f: Float, bits: Int) -> Str {
+  a = f.abs
+  fmt = "f"
+  if a != 0.0 {
+    if (bits == 64 && (a < 1e-6 || a >= 1e21)) || (bits == 32 && (a < 1e-6 || a >= 1e21)) {
+      fmt = "e"
+    }
+  }
+  b = strconv.format_float(f, fmt, -1, bits)
+  if fmt == "e" {
+    # clean up e-09 to e-9
+    n = b.size
+    if n >= 4 && b[n - 4] == 101 && b[n - 3] == 45 && b[n - 2] == 48 {
+      b = b[0...n - 2] + b[n - 1...n]
+    }
+  }
+  b
+}

@@ -23,7 +23,7 @@ thread_local! {
     /// Every error type (enums), in tag order.
     static ERRORS: RefCell<Vec<Ty>> = const { RefCell::new(Vec::new()) };
     /// Every lambda literal: (enclosing function, block start, fn type, capture types).
-    static LAMBDAS: RefCell<Vec<(String, u32, Ty, Vec<Ty>)>> = const { RefCell::new(Vec::new()) };
+    static LAMBDAS: RefCell<Vec<(String, u64, Ty, Vec<Ty>)>> = const { RefCell::new(Vec::new()) };
     /// The LIR global of each array constant read in place, by (`M::Global`
     /// index, type): an Int is a bignum in promote mode, so one constant
     /// can need two.
@@ -2990,7 +2990,7 @@ impl<'a> Lw<'a> {
             }
             Lambda => {
                 let b = blk.unwrap();
-                let lo = b.span.lo;
+                let lo = ((b.id as u64) << 32) | b.span.lo as u64;
                 let g = LAMBDAS.with(|l| l.borrow().iter().position(|s| s.0 == self.f.cname && s.1 == lo)).expect("lambda registered");
                 let sites = lambda_sites(&e.ty);
                 let tag = sites.iter().position(|(x, _)| *x == g).unwrap();

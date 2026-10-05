@@ -55,6 +55,8 @@ pub struct Parser<'a> {
     cur_data_name: Option<String>,
     /// derive(Data) jobs (see derive_data.rs).
     djobs: Vec<crate::derive_data::DataJob>,
+    /// derive(Xml) jobs (see derive_xml.rs).
+    xjobs: Vec<crate::derive_xml::XmlJob>,
 }
 
 type PResult<T> = Result<T, Diag>;
@@ -63,7 +65,7 @@ type PResult<T> = Result<T, Diag>;
 const CMD_PKG: &str = "alxexec";
 
 pub fn parse(file: u32, toks: &[Token], next_id: &mut NodeId) -> PResult<Module> {
-    let mut p = Parser { toks, pos: 0, next_id, scopes: vec![HashSet::new()], in_cond: false, usings: vec![], extern_mode: false, cur_derives: vec![], jobs: vec![], cur_data_name: None, djobs: vec![] };
+    let mut p = Parser { toks, pos: 0, next_id, scopes: vec![HashSet::new()], in_cond: false, usings: vec![], extern_mode: false, cur_derives: vec![], jobs: vec![], cur_data_name: None, djobs: vec![], xjobs: vec![] };
     let mut m = p.module(file)?;
     // Command literals call into os/exec (also from inside `#{...}`).
     let has_cmd = toks.iter().any(|t| match &t.tok {
@@ -149,7 +151,7 @@ impl<'a> Parser<'a> {
     /// The expression in an embedded piece of source (`#{...}`).
     fn code_expr(&mut self, src: &str, base: u32, sp: Span, what: &str) -> PResult<Expr> {
         let toks = crate::lexer::lex_at(sp.file, src, base)?;
-        let mut sub = Parser { toks: &toks, pos: 0, next_id: self.next_id, scopes: self.scopes.clone(), in_cond: false, usings: vec![], extern_mode: false, cur_derives: vec![], jobs: vec![], cur_data_name: None, djobs: vec![] };
+        let mut sub = Parser { toks: &toks, pos: 0, next_id: self.next_id, scopes: self.scopes.clone(), in_cond: false, usings: vec![], extern_mode: false, cur_derives: vec![], jobs: vec![], cur_data_name: None, djobs: vec![], xjobs: vec![] };
         sub.skip_newlines();
         let e = sub.expr()?;
         sub.skip_newlines();
@@ -372,6 +374,7 @@ impl<'a> Parser<'a> {
     /// Write the code of every recorded derive and parse it in as methods.
     fn expand_derives(&mut self, m: &mut Module) -> PResult<()> {
         self.expand_data_derives(m)?;
+        self.expand_xml_derives(m)?;
         if self.jobs.is_empty() {
             return Ok(());
         }
@@ -401,10 +404,47 @@ impl<'a> Parser<'a> {
             for t in &mut toks {
                 t.span = job.span;
             }
-            let mut sub = Parser { toks: &toks, pos: 0, next_id: self.next_id, scopes: vec![HashSet::new()], in_cond: false, usings: vec![], extern_mode: false, cur_derives: vec![], jobs: vec![], cur_data_name: None, djobs: vec![] };
+            let mut sub = Parser { toks: &toks, pos: 0, next_id: self.next_id, scopes: vec![HashSet::new()], in_cond: false, usings: vec![], extern_mode: false, cur_derives: vec![], jobs: vec![], cur_data_name: None, djobs: vec![], xjobs: vec![] };
             sub.skip_newlines();
             let mut defs = vec![];
             sub.struct_def(&mut defs).map_err(|d| Diag::new(job.span, format!("derive(Json) on `{}` made code that doesn't parse: {}\n{text}", job.name, d.msg)))?;
+            for d in &mut defs {
+                d.span = job.span;
+            }
+            m.defs.extend(defs);
+        }
+        Ok(())
+    }
+
+    /// Write the code of every derive(Xml) and parse it in as methods.
+    fn expand_xml_derives(&mut self, m: &mut Module) -> PResult<()> {
+        if self.xjobs.is_empty() {
+            return Ok(());
+        }
+        let xjobs = std::mem::take(&mut self.xjobs);
+        // The local name of the `encoding/xml` import (added if the file has none).
+        let alias = match m.imports.iter().find(|i| i.path == "encoding/xml") {
+            Some(i) => import_name(i),
+            None => {
+                m.imports.push(Import { alias: Some("alxxml".into()), path: "encoding/xml".into(), span: xjobs[0].job.span });
+                "alxxml".to_string()
+            }
+        };
+        let by_name: std::collections::HashMap<String, &crate::derive_xml::XmlJob> = xjobs.iter().map(|j| (j.job.name.clone(), j)).collect();
+        for xj in &xjobs {
+            let job = &xj.job;
+            let text = crate::derive_xml::xml_source(xj, &alias, &by_name)?;
+            if std::env::var("ALX_DERIVE_DEBUG").is_ok() {
+                eprintln!("{text}");
+            }
+            let mut toks = crate::lexer::lex(job.span.file, &text).map_err(|d| Diag::new(job.span, format!("derive(Xml) on `{}` made code that doesn't lex: {}\n{text}", job.name, d.msg)))?;
+            for t in &mut toks {
+                t.span = job.span;
+            }
+            let mut sub = Parser { toks: &toks, pos: 0, next_id: self.next_id, scopes: vec![HashSet::new()], in_cond: false, usings: vec![], extern_mode: false, cur_derives: vec![], jobs: vec![], cur_data_name: None, djobs: vec![], xjobs: vec![] };
+            sub.skip_newlines();
+            let mut defs = vec![];
+            sub.struct_def(&mut defs).map_err(|d| Diag::new(job.span, format!("derive(Xml) on `{}` made code that doesn't parse: {}\n{text}", job.name, d.msg)))?;
             for d in &mut defs {
                 d.span = job.span;
             }
@@ -466,7 +506,7 @@ impl<'a> Parser<'a> {
             for t in &mut toks {
                 t.span = job.span;
             }
-            let mut sub = Parser { toks: &toks, pos: 0, next_id: self.next_id, scopes: vec![HashSet::new()], in_cond: false, usings: vec![], extern_mode: false, cur_derives: vec![], jobs: vec![], cur_data_name: None, djobs: vec![] };
+            let mut sub = Parser { toks: &toks, pos: 0, next_id: self.next_id, scopes: vec![HashSet::new()], in_cond: false, usings: vec![], extern_mode: false, cur_derives: vec![], jobs: vec![], cur_data_name: None, djobs: vec![], xjobs: vec![] };
             sub.skip_newlines();
             let mut defs = vec![];
             sub.struct_def(&mut defs).map_err(|d| Diag::new(job.span, format!("derive(Data) on `{}` made code that doesn't parse: {}\n{text}", job.name, d.msg)))?;
@@ -912,6 +952,12 @@ impl<'a> Parser<'a> {
             let job = crate::derive::DeriveJob { name: name.clone(), tparams: tparams.iter().map(|t| t.name.clone()).collect(), public: false, span, shape: crate::derive::DShape::Struct(dfields) };
             let ms = data_methods(methods, &mopts);
             self.djobs.push(crate::derive_data::DataJob { job, go_name: data_name, methods: ms });
+        }
+        if derives.iter().any(|d| d == "Xml") {
+            let dfields = fields.iter().zip(fopts.iter()).map(|((n, t, s), o)| crate::derive::DField { name: n.clone(), ty: t.clone(), opts: o.clone(), span: *s }).collect();
+            let job = crate::derive::DeriveJob { name: name.clone(), tparams: tparams.iter().map(|t| t.name.clone()).collect(), public: false, span, shape: crate::derive::DShape::Struct(dfields) };
+            let ms = methods[first_method..].iter().map(|d| d.name.rsplit('.').next().unwrap_or(&d.name).to_string()).collect();
+            self.xjobs.push(crate::derive_xml::XmlJob { job, methods: ms });
         }
         if derives.iter().any(|d| d == "Json") {
             let dfields = fields.iter().zip(fopts).map(|((n, t, s), o)| crate::derive::DField { name: n.clone(), ty: t.clone(), opts: o, span: *s }).collect();

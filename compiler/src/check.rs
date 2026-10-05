@@ -3345,6 +3345,9 @@ impl<'w, 'a> FnCx<'w, 'a> {
         let saved_main = std::mem::replace(&mut self.is_main, false);
         let saved = self.want_hint.take();
         let saved_loops = std::mem::take(&mut self.loops);
+        // A `~` around the call the lambda is passed to doesn't reach into
+        // the lambda's body (`~f(->() { g() })`: g's result is held there).
+        let saved_try = std::mem::replace(&mut self.under_try, false);
         let r = if ptys.is_empty() {
             let own_start = self.locals.len();
             self.scopes.push(HashMap::new());
@@ -3360,6 +3363,7 @@ impl<'w, 'a> FnCx<'w, 'a> {
         } else {
             self.block_n(blk, &ptys, false)
         };
+        self.under_try = saved_try;
         self.loops = saved_loops;
         self.want_hint = saved;
         self.ret = saved_ret;

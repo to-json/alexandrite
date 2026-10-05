@@ -2578,9 +2578,8 @@ impl<'a> Parser<'a> {
                 self.expect_op("]")?;
                 self.mk(ExprKind::Array(items), sp.to(self.prev_span()))
             }
-            Tok::Ident(name) if name == "fail" && !self.is_local("fail") && !matches!(self.peek(), Tok::Op("(") | Tok::Op("=")) => {
-                return Err(jump_here(sp, "fail"));
-            }
+            // (A `fail` here may be a def of that name: the checker explains
+            // an undefined one.)
             Tok::Kw(k @ (Kw::Return | Kw::Break | Kw::Next)) => return Err(jump_here(sp, &kw_name(k))),
             Tok::Ident(name) => {
                 if self.is_local(&name) {

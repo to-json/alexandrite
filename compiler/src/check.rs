@@ -5199,6 +5199,9 @@ impl<'w, 'a> FnCx<'w, 'a> {
             if let Some(best) = cands.iter().filter(|c| c.as_str() != name && lev(c, name) <= 2).min_by_key(|c| lev(c, name)) {
                 msg.push_str(&format!("; did you mean `{best}`?"));
             }
+            if name == "fail" {
+                return Err(Diag::new(name_span, "`fail` is a statement, not a function: `fail e`, without parentheses").note("inside an expression it can only follow `||` (`v = opt || fail e`) or be a whole `case` arm (`X => fail e`) (S8)"));
+            }
             return Err(Diag::new(name_span, msg));
         };
         let d = self.w.defs[def].def.clone();

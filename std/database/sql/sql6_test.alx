@@ -1,0 +1,262 @@
+# Go's sql_test.go, part 6: TestStmtCloseDeps .. TestConnExpiresFreshOutOfPool.
+#
+# Not translated: TestTxCannotCommitAfterRollback (it needs sql.go's
+# package-level test hooks hookTxGrabConn / rollbackHook /
+# bypassRowsAwaitDone, which have no place until package state lands, R11).
+
+import "context"
+import "sync"
+import "time"
+
+def get_rows_cursor(rows: Rows) -> RowsCursor { rows.rowsi.as(RowsCursor).unwrap }
+
+test "StmtCloseDeps" {
+  test_database([], ->(db: DB) -> ~Unit {
+    errs = no_close_errors(db)
+    populate(db, "magicquery")
+    drv = drv_of(db)
+    open_delta0 = drv.open_count - drv.close_count
+    stmt = db.~prepare("SELECT|magicquery|op|op=?,millis=?")
+    nquery = 50
+    for _batch in 0...2 {
+      wg = sync.new_wait_group
+      for _i in 0...nquery {
+        wg.add(1)
+        s = stmt.dup
+        _ = spawn {
+          r: ~Str = s.query_row(("sleep", 5)).scan
+          if e = r.err {
+            panic e.message if !no_rows?(e)
+          }
+          wg.done
+        }
+      }
+      wg.wait
+    }
+    assert_eq num_free_conns(db), 2
+    n = num_deps(db)
+    assert n <= 4, "number of dependencies = #{n}; expected <= 4"
+    open_delta = (drv.open_count - drv.close_count) - open_delta0
+    assert open_delta <= 2, "db connections opened = #{open_delta}; want <= 2"
+    css = stmt.core.st.lock { |s| s.css.size }
+    assert css <= nquery, "len(stmt.css) = #{css}; want <= #{nquery}"
+    ~stmt.close
+    assert_eq num_free_conns(db), 2
+    n = num_deps(db)
+    assert n <= 2, "number of dependencies = #{n}; expected <= 2"
+    clear_all_conns(db)
+    check_no_close_errors(db, errs)
+    nil
+  }).unwrap
+}
+
+test "CloseConnBeforeStmts" {
+  db = new_test_db("people")
+  errs = no_close_errors(db)
+  stmt = db.~prepare("SELECT|people|name|")
+  free = db.st.lock { |s| s.free_conn }
+  assert free.size == 1, "expected 1 freeConn; got #{free.size}"
+  dc = free[0]
+  assert !dc.st.lock { |d| d.closed }, "conn shouldn't be closed"
+  assert_eq dc.st.lock { |d| d.open_stmt.size }, 1
+  r = db.close
+  assert !r.err?, "db Close = #{r.err}"
+  assert dc.st.lock { |d| d.closed }, "after db.Close, driverConn should be closed"
+  assert_eq dc.st.lock { |d| d.open_stmt.size }, 0
+  r2 = stmt.close
+  assert !r2.err?, "Stmt close = #{r2.err}"
+  assert dc.st.lock { |d| d.final_closed }, "after Stmt Close, the driver's Conn should be closed"
+  check_no_close_errors(db, errs)
+}
+
+def strict_close(db: DB, on: Bool) {
+  drv_of(db).hooks.st.lock { |h|
+    h.strict_close = on
+    nil
+  }
+}
+
+def strict_close_errors(db: DB) -> [Str] { drv_of(db).hooks.st.lock { |h| h.strict_close_errors } }
+
+test "RowsCloseOrder" {
+  test_database([], ->(db: DB) -> ~Unit {
+    populate(db, "people")
+    db.set_max_idle_conns(0)
+    strict_close(db, true)
+    rows = db.~query("SELECT|people|age,name|", nil)
+    ~rows.close
+    strict_close(db, false)
+    e = strict_close_errors(db)
+    assert e.size == 0, "#{e}"
+    nil
+  }).unwrap
+}
+
+test "RowsImplicitClose" {
+  test_database([], ->(db: DB) -> ~Unit {
+    populate(db, "people")
+    rows = db.~query("SELECT|people|age,name|", nil)
+    r = get_rows_cursor(rows)
+    r.st.lock { |s|
+      s.err_pos = 2
+      s.err = Failure.Msg("fail")
+      nil
+    }
+    got = 0
+    while rows.next {
+      got += 1
+    }
+    assert_eq got, 2
+    assert_eq rows.err?.message || "", "fail"
+    assert r.st.lock { |s| s.closed }, "r.closed is false, want true"
+    nil
+  }).unwrap
+}
+
+test "RowsCloseError" {
+  test_database([], ->(db: DB) -> ~Unit {
+    populate(db, "people")
+    rows = db.~query("SELECT|people|age,name|", nil)
+    rc = get_rows_cursor(rows)
+    rc.st.lock { |s|
+      s.close_err = Failure.Msg("rowsCursor: failed to close")
+      nil
+    }
+    while rows.next {
+      _r: (Int, Str) = rows.~scan
+    }
+    assert_eq rows.err?.message || "", "rowsCursor: failed to close"
+    nil
+  }).unwrap
+}
+
+test "StmtCloseOrder" {
+  test_database([], ->(db: DB) -> ~Unit {
+    populate(db, "people")
+    db.set_max_idle_conns(0)
+    strict_close(db, true)
+    assert db.query("SELECT|non_existent|name|", nil).err?, "Querying non-existent table should fail"
+    strict_close(db, false)
+    e = strict_close_errors(db)
+    assert e.size == 0, "#{e}"
+    nil
+  }).unwrap
+}
+
+# Go's manyErrBadConnSetup: every pooled connection goes bad.
+def many_err_bad_conn_setup(db: DB) -> DB {
+  nconn = MAX_BAD_CONN_RETRIES + 1
+  db.set_max_idle_conns(nconn)
+  db.set_max_open_conns(nconn)
+  rs: [Rows] = []
+  for _i in 0...nconn {
+    rs << db.query("SELECT|people|age,name|", nil).unwrap
+  }
+  for r in rs {
+    r.close.unwrap
+  }
+  s = db.st.lock { |s| (s.num_open, s.free_conn) }
+  assert s[0] == nconn, "unexpected numOpen #{s[0]} (was expecting #{nconn})"
+  assert s[1].size == nconn, "unexpected len(db.freeConn) #{s[1].size} (was expecting #{nconn})"
+  for c in s[1] {
+    c.lock.lock
+    get_fake_conn(c.ci).set_sticky_bad(true)
+    c.lock.unlock
+  }
+  db
+}
+
+test "ManyErrBadConn" {
+  db = many_err_bad_conn_setup(new_test_db("people"))
+  rows = db.~query("SELECT|people|age,name|", nil)
+  ~rows.close
+  close_db(db)
+
+  db = many_err_bad_conn_setup(new_test_db("people"))
+  db.~exec("INSERT|people|name=Julia,age=19", nil)
+  close_db(db)
+
+  db = many_err_bad_conn_setup(new_test_db("people"))
+  tx = db.~begin
+  ~tx.rollback
+  close_db(db)
+
+  db = many_err_bad_conn_setup(new_test_db("people"))
+  stmt = db.~prepare("SELECT|people|age,name|")
+  ~stmt.close
+  close_db(db)
+
+  db = new_test_db("people")
+  stmt = db.~prepare("INSERT|people|name=Julia,age=19")
+  db = many_err_bad_conn_setup(db)
+  stmt.~exec(nil)
+  ~stmt.close
+  close_db(db)
+
+  db = new_test_db("people")
+  stmt = db.~prepare("SELECT|people|age,name|")
+  db = many_err_bad_conn_setup(db)
+  rows = stmt.~query(nil)
+  ~rows.close
+  ~stmt.close
+  close_db(db)
+
+  db = many_err_bad_conn_setup(new_test_db("people"))
+  ctx = context.background
+  conn = db.~conn_context(ctx)
+  get_fake_conn(conn.dc.ci).set_skip_dirty_session
+  ~conn.close
+  close_db(db)
+
+  db = many_err_bad_conn_setup(new_test_db("people"))
+  ~db.ping_context(ctx)
+  close_db(db)
+}
+
+test "TxStmtDeadlock" {
+  test_database([], ->(db: DB) -> ~Unit {
+    populate(db, "people")
+    ctx, cancel = context.with_cancel(context.background)
+    defer cancel()
+    tx = db.~begin_tx(ctx, none)
+    stmt = tx.~prepare("SELECT|people|name,age|age=?")
+    cancel()
+    for _i in 0...1000 {
+      r = stmt.query(1)
+      break if r.err?
+    }
+    _ = tx.rollback
+    nil
+  }).unwrap
+}
+
+test "ConnExpiresFreshOutOfPool" {
+  for ec in [(false, false), (true, false), (false, true)] {
+    ctx = context.background
+    db = new_test_db("magicquery")
+    db.set_max_open_conns(1)
+    clear_all_conns(db)
+    db.set_max_idle_conns(1)
+    db.set_conn_max_lifetime(time.second * 10)
+    conn = db.~conn(ctx, ALWAYS_NEW_CONN)
+    after_put_conn = Chan[Str].new(1)
+    d = db.dup
+    _ = spawn {
+      r = d.conn(ctx, ALWAYS_NEW_CONN)
+      if c = r.ok {
+        d.put_conn(c, none, false)
+        after_put_conn << ""
+      } else {
+        after_put_conn << "db.conn: #{r.err?.message || ""}"
+      }
+    }
+    # (Go's synctest.Wait: the task is now waiting for the one connection.)
+    wait_until(->(_i: Int) -> Bool { db.st.lock { |s| s.conn_requests.size } == 1 })
+    db.clock_skew.add(11000000000)
+    get_fake_conn(conn.ci).set_sticky_bad(ec[1])
+    db.put_conn(conn, none, true)
+    got = after_put_conn.recv || "closed"
+    assert got == "", got
+    close_db(db)
+  }
+}

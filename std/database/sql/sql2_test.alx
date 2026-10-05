@@ -1,0 +1,266 @@
+# Go's sql_test.go, part 2: TestMultiResultSetQuery .. TestBogusPreboundParameters.
+
+import "context"
+import "database/sql/driver"
+import "strings"
+import "sync"
+import "time"
+
+test "MultiResultSetQuery" {
+  test_database([], ->(db: DB) -> ~Unit {
+    populate(db, "people")
+    prepares0 = num_prepares(db)
+    rows = db.~query("SELECT|people|age,name|;SELECT|people|name|", nil)
+    got1: [(Int, Str)] = []
+    while rows.next {
+      r: (Int, Str) = rows.~scan
+      got1 << r
+    }
+    ~rows.err_result
+    assert got1 == [(1, "Alice"), (2, "Bob"), (3, "Chris")], "mismatch: #{got1}"
+    assert rows.next_result_set, "expected another result set"
+    got2: [Str] = []
+    while rows.next {
+      r: Str = rows.~scan
+      got2 << r
+    }
+    ~rows.err_result
+    assert got2 == ["Alice", "Bob", "Chris"], "mismatch: #{got2}"
+    assert !rows.next_result_set, "expected no more result sets"
+    wait_for_free(db, 1)
+    assert_eq num_prepares(db) - prepares0, 1
+    nil
+  }).unwrap
+}
+
+test "QueryNamedArg" {
+  test_database(["NamedValue"], ->(db: DB) -> ~Unit {
+    populate(db, "people")
+    prepares0 = num_prepares(db)
+    rows = db.~query("SELECT|people|age,name|name=?name,age=?age", (named("age", 2), named("name", "Bob")))
+    got: [(Int, Str)] = []
+    while rows.next {
+      r: (Int, Str) = rows.~scan
+      got << r
+    }
+    ~rows.err_result
+    assert got == [(2, "Bob")], "mismatch: #{got}"
+    assert_eq num_free_conns(db), 1
+    assert_eq num_prepares(db) - prepares0, 1
+    nil
+  }).unwrap
+}
+
+test "PoolExhaustOnCancel" {
+  max = 3
+  saturate = sync.new_wait_group
+  saturate_done = sync.new_wait_group
+  saturate.add(max)
+  saturate_done.add(max)
+  done_ping = Chan[Bool].new
+  state = Atomic.new(0)
+  fc = new_fake_connector(new_fake_driver, FAKE_DB_NAME)
+  fc2 = FakeConnector.new(name: fc.name, drv: fc.drv, waiter: ->(ctx: context.Context) {
+    if state.load == 1 {
+      saturate.done
+      select {
+        when ctx.done.recv => {}
+        when done_ping.recv => {}
+      }
+    }
+    nil
+  }, closed: fc.closed)
+  db = new_test_db_connector(fc2, "people")
+  db.set_max_open_conns(max)
+  state.store(1)
+  for _i in 0...max {
+    d = db.dup
+    _ = spawn {
+      r = d.query("SELECT|people|name,photo|", nil)
+      if rows = r.ok {
+        _ = rows.close
+      }
+      saturate_done.done
+    }
+  }
+  saturate.wait
+  state.store(2)
+  ctx, cancel = context.with_timeout(context.background, time.second * 2)
+  defer cancel()
+  for _i in 0...max {
+    ctx_req, cancel_req = context.with_cancel(ctx)
+    _ = spawn {
+      time.sleep(time.millisecond * 20)
+      cancel_req()
+    }
+    r = db.ping_context(ctx_req)
+    assert canceled?(r.err), "PingContext (Exhaust): #{r.err}"
+  }
+  done_ping.close
+  saturate_done.wait
+  ~db.ping_context(ctx)
+  close_db(db)
+}
+
+test "RowsColumns" {
+  test_database([], ->(db: DB) -> ~Unit {
+    populate(db, "people")
+    rows = db.~query("SELECT|people|age,name|", nil)
+    cols = rows.~columns
+    assert cols == ["age", "name"], "got #{cols}"
+    ~rows.close
+    nil
+  }).unwrap
+}
+
+test "RowsColumnTypes" {
+  test_database([], ->(db: DB) -> ~Unit {
+    populate(db, "people")
+    rows = db.~query("SELECT|people|age,name|", nil)
+    tt = rows.~column_types
+    # (Go builds destinations from ScanType by reflection; here the names.)
+    types = tt.map { |c| c.scan_type }
+    assert types == ["I32", "Str"] || types == ["any", "any"], "scan types #{types}"
+    ct = 0
+    while rows.next {
+      v: (I32, Str) = rows.~scan
+      if ct == 1 {
+        assert_eq v[0], 2.as_i32
+        assert_eq v[1], "Bob"
+      }
+      ct += 1
+    }
+    assert_eq ct, 3
+    ~rows.close
+    nil
+  }).unwrap
+}
+
+test "QueryRow" {
+  test_database([], ->(db: DB) -> ~Unit {
+    populate(db, "people")
+    r1: ~Int = db.query_row("SELECT|people|age,name|age=?", 3).scan
+    assert (r1.err?.message || "").include?("expected 2 destination arguments"), "expected error from wrong number of arguments; actually got: #{r1.err}"
+    birthday: time.Time = db.query_row("SELECT|people|bdate|age=?", 3).~scan
+    assert birthday == chris_birthday, "chris birthday = #{birthday}"
+    ar: (Int, Str) = db.query_row("SELECT|people|age,name|age=?", 2).~scan
+    assert_eq ar[1], "Bob"
+    assert_eq ar[0], 2
+    ar2: (Int, Str) = db.query_row("SELECT|people|age,name|name=?", "Alice").~scan
+    assert_eq ar2[1], "Alice"
+    assert_eq ar2[0], 1
+    photo: [Byte] = db.query_row("SELECT|people|photo|name=?", "Alice").~scan
+    assert photo == "APHOTO".bytes, "photo = #{photo}"
+    nil
+  }).unwrap
+}
+
+test "RowErr" {
+  test_database([], ->(db: DB) -> ~Unit {
+    populate(db, "people")
+    row = db.query_row_context(context.background, "SELECT|people|bdate|age=?", 3)
+    assert row.err == none, "Unexpected err = #{row.err}"
+    _x: ~driver.Value = row.scan
+    ctx, cancel = context.with_cancel(context.background)
+    cancel()
+    e = db.query_row_context(ctx, "SELECT|people|bdate|age=?", 3).err
+    assert (e?.message || "").include?("context canceled"), "Expected err = context canceled; got #{e}"
+    nil
+  }).unwrap
+}
+
+test "TxRollbackCommitErr" {
+  test_database([], ->(db: DB) -> ~Unit {
+    populate(db, "people")
+    tx = db.~begin
+    ~tx.rollback
+    assert is_tx_done?(tx.commit.err.unwrap), "expected ErrTxDone from Commit"
+    tx2 = db.~begin
+    ~tx2.commit
+    assert is_tx_done?(tx2.rollback.err.unwrap), "expected ErrTxDone from Rollback"
+    nil
+  }).unwrap
+}
+
+test "StatementErrorAfterClose" {
+  test_database([], ->(db: DB) -> ~Unit {
+    populate(db, "people")
+    stmt = db.~prepare("SELECT|people|age|name=?")
+    ~stmt.close
+    r: ~Str = stmt.query_row("foo").scan
+    assert r.err?, "expected error from QueryRow.Scan after Stmt.Close"
+    nil
+  }).unwrap
+}
+
+test "StatementQueryRow" {
+  test_database([], ->(db: DB) -> ~Unit {
+    populate(db, "people")
+    stmt = db.~prepare("SELECT|people|age|name=?")
+    defer stmt.close
+    for tt in [("Alice", 1), ("Bob", 2), ("Chris", 3)] {
+      age: Int = stmt.query_row(tt[0]).~scan
+      assert age == tt[1], "#{tt[0]}: age=#{age}, want #{tt[1]}"
+    }
+    nil
+  }).unwrap
+}
+
+# Go's stubDriverStmt.
+struct StubDriverStmt {
+  err: Str
+  def close -> ~Unit { fail err }
+  def num_input -> Int { -1 }
+  def exec(args: [driver.Value]) -> ~driver.Result { driver.RowsAffected.new(n: 0) }
+  def query(args: [driver.Value]) -> ~driver.Rows { fail "stub" }
+}
+
+test "StatementClose" {
+  db = new_test_db("")
+  want = "STMT ERROR"
+  s1 = sticky_stmt(db, Failure.Msg(want))
+  assert_eq s1.close.err?.message || "", want
+  tx = db.~begin
+  ds = new_driver_stmt(1, StubDriverStmt.new(err: want), sync.new_lock)
+  s2 = Stmt.new(db: db, query: "", sticky_err: none, closemu: new_closing_mutex, cg: Grabber.new(tx: tx, c: none), parent: none, core: new_stmt_core(2, [], 0, ds))
+  assert_eq s2.close.err?.message || "", want
+  ~tx.rollback
+  close_db(db)
+}
+
+test "StatementQueryRowConcurrent" {
+  test_database([], ->(db: DB) -> ~Unit {
+    populate(db, "people")
+    stmt = db.~prepare("SELECT|people|age|name=?")
+    defer stmt.close
+    n = 10
+    ch = Chan[Str].new(n)
+    for _i in 0...n {
+      s = stmt.dup
+      _ = spawn {
+        r: ~Int = s.query_row("Alice").scan
+        msg = ""
+        if e = r.err {
+          msg = e.message
+        } else if r.unwrap != 1 {
+          msg = "unexpected age #{r.unwrap}"
+        }
+        ch << msg
+      }
+    }
+    for _i in 0...n {
+      m = ch.recv || "closed"
+      assert m == "", m
+    }
+    nil
+  }).unwrap
+}
+
+test "BogusPreboundParameters" {
+  test_database([], ->(db: DB) -> ~Unit {
+    exec_t(db, "CREATE|t1|name=string,age=int32,dead=bool", nil)
+    r = db.prepare("INSERT|t1|name=?,age=bogusconversion")
+    assert_eq r.err?.message || "", "fakedb: invalid conversion to int32 from \"bogusconversion\""
+    nil
+  }).unwrap
+}

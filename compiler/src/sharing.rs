@@ -398,6 +398,12 @@ fn locals_read(e: &TExpr, out: &mut Vec<LocalId>) {
         out.push(l);
         return;
     }
+    // `x.dup` is a deep copy: it shares nothing with `x`.
+    if let TK::M(M::Dup, Some(_), args, None) = &e.kind {
+        if args.is_empty() {
+            return;
+        }
+    }
     crate::prove::each_child(e, &mut |c| locals_read(c, out));
 }
 

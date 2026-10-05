@@ -73,5 +73,5 @@ A new derive reads its key from `Opts.tags` and parses Go's tag syntax for it; n
 - `std/dyn/value_test.alx`: constructors, type names, fmt, from_json, the conversions, functions.
 - `std/dyn/derives/derive_test.alx`: every field kind both ways, enums, options, errors, methods through `Data`.
 - `std/encoding/json/derives/derives_test.alx` "field tags": `#[field(json: ...)]`, foreign keys ignored.
-- Acceptance case `tmpl_fixes` (all backends and the Rust oracle): a derived type with methods and function fields in a template; to_data / from_data round trip; one `#[field(...)]` read by Json and Data.
+- Acceptance case `tmplfixes` (all backends and the Rust oracle): a derived type with methods and function fields in a template; to_data / from_data round trip; one `#[field(...)]` read by Json and Data.
 - text/template and html/template run on it (their derives tests, generated vectors and Go's test tables).

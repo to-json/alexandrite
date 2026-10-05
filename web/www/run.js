@@ -15,6 +15,10 @@ export function programImports(mod, wasm, api) {
   return { env: { memory: wasm.memory }, rt };
 }
 
+// How a thrown run ended, for api.run_failed: alx:abort, alx:exit1, a
+// crash, or alx:exit0 (os.exit(0): the run ends normally).
+const ended = (m) => (m.includes('alx:abort') ? 1 : m.includes('alx:exit1') ? 2 : m.includes('alx:exit0') ? 4 : 3);
+
 // Run tasks on this thread until the run is over.
 export async function runTasks(exports, api) {
   for (;;) {
@@ -31,7 +35,7 @@ export async function runTasks(exports, api) {
       } catch (e) {
         const m = String(e);
         if (m.includes('alx:pmap')) api.pmap_failed();
-        else api.run_failed(3, m);
+        else api.run_failed(ended(m), m);
       }
       continue;
     }
@@ -41,17 +45,21 @@ export async function runTasks(exports, api) {
       const m = String(e);
       // A panic in a spawned task ends only that task.
       if (m.includes('alx:task')) api.task_failed();
-      else api.run_failed(m.includes('alx:abort') ? 1 : m.includes('alx:exit1') ? 2 : 3, m);
+      else api.run_failed(ended(m), m);
     }
   }
 }
 
 // Run a program to the end. `started` is called once the run's tasks can
 // be taken (helper threads join then). Throws what the program threw
-// (alx:abort, alx:exit1, a crash).
+// (alx:abort, alx:exit1, a crash); returns after os.exit(0).
 export async function runProgram(exports, api, started = () => {}) {
   if (!exports.run_task) {
-    exports.main();
+    try {
+      exports.main();
+    } catch (e) {
+      if (!String(e).includes('alx:exit0')) throw e;
+    }
     return;
   }
   api.sched_start();

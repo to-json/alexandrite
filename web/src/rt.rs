@@ -61,6 +61,10 @@ pub struct Shared {
     pub consts: Vec<Box<[u8]>>,
     /// Where `Test.begin_capture` started capturing stdout.
     pub cap: Option<usize>,
+    /// The environment (`os.getenv`, `os.setenv`): empty at the start of a run.
+    pub env: Vec<(Vec<u8>, Vec<u8>)>,
+    /// The program's name (`os.args[0]`): the file name last compiled.
+    pub prog: String,
 }
 
 static SHARED: LazyLock<Mutex<Shared>> = LazyLock::new(|| Mutex::new(Shared::default()));
@@ -88,6 +92,7 @@ pub fn reset() {
     s.out.clear();
     s.err.clear();
     s.cap = None;
+    s.env.clear();
     drop(s);
     crate::sched::reset();
 }
@@ -97,6 +102,8 @@ pub fn reset() {
 pub enum Stop {
     Abort,
     Exit1,
+    /// `exit 0` (os.exit(0)): the run ends normally.
+    Exit0,
     /// A spawned task panicked: the scheduler records it and runs the rest.
     Task,
     /// A `pmap` element panicked on a helper thread: the caller re-raises it.
@@ -109,6 +116,7 @@ pub(crate) fn stop(how: Stop) -> ! {
     wasm_bindgen::throw_str(match how {
         Stop::Abort => "alx:abort",
         Stop::Exit1 => "alx:exit1",
+        Stop::Exit0 => "alx:exit0",
         Stop::Task => "alx:task",
         Stop::Pmap => "alx:pmap",
     })
@@ -814,11 +822,14 @@ pub extern "C" fn alxr_strerror(n: i64) {
         17 => "File exists",
         20 => "Not a directory",
         21 => "Is a directory",
+        25 => "Inappropriate ioctl for device",
+        29 => "Illegal seek",
         22 => "Invalid argument",
         24 => "Too many open files",
         28 => "No space left on device",
         32 => "Broken pipe",
         38 | 78 => "Function not implemented",
+        39 | 66 => "Directory not empty",
         _ => return ret_str(format!("Unknown error: {n}").as_bytes()),
     };
     ret_str(m.as_bytes())

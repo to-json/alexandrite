@@ -2050,6 +2050,14 @@ impl<'w, 'a> FnCx<'w, 'a> {
                     let w = tail_want.clone().unwrap();
                     TStmt::Expr(self.value_as(e, &w)?)
                 }
+                // `def f[T] -> ~T { ~g(raw) }`: the declared result decides what
+                // the arguments don't (as `v: T = ~g(raw)` does; #137).
+                StmtKind::Expr(e @ Expr { kind: ExprKind::Try(_) | ExprKind::Call { .. }, .. }) if used && tail_want.is_some() => {
+                    let saved = self.want_hint.replace(tail_want.clone().unwrap());
+                    let r = self.expr(e);
+                    self.want_hint = saved;
+                    TStmt::Expr(r?)
+                }
                 StmtKind::Expr(Expr { kind: ExprKind::Case(subject, arms), span, .. }) if used && tail_want.is_some() => {
                     let saved = self.want_hint.replace(tail_want.clone().unwrap());
                     let r = self.case(subject.as_deref(), arms, *span, used);

@@ -1,0 +1,74 @@
+# R11: package-level state behind Atomic[T] (any T) and Mutex[T].
+import "pkgs/settings"
+
+struct Conf {
+  name: Str
+  tags: [Str]
+  limits: Map[Str, Int]
+}
+
+# Initialized in dependency order: TAGS and settings' values before BANNER.
+BANNER = Atomic.new(banner())
+TAGS = Atomic.new(["a", "b"])
+CONF = Atomic.new(Conf.new(name: "base", tags: ["x"], limits: {"rps" => 10}))
+WORDS = Atomic.new("hello")
+COUNTS = Mutex[Map[Str, Int]].new({})
+
+def banner -> Str { "#{settings.GREETING.load} / #{TAGS.load.size} tags" }
+
+def count(k: Str) {
+  COUNTS.lock { |m| m[k] = (m[k] || 0) + 1 }
+}
+
+puts BANNER.load
+
+# load returns a copy: changing it leaves the stored value alone.
+c = CONF.load
+c.tags << "local"
+c.limits["rps"] = 99
+puts "#{CONF.load.tags.size} #{CONF.load.limits["rps"] || 0}"
+
+# swap and compare_and_swap replace the value as a whole.
+old = CONF.swap(Conf.new(name: "next", tags: [], limits: {}))
+puts "#{old.name} -> #{CONF.load.name}"
+puts WORDS.compare_and_swap("hello", "world")
+puts WORDS.compare_and_swap("hello", "again")
+puts WORDS.load
+xs = Atomic[[Int]].new([1, 2, 3])
+puts xs.compare_and_swap([1, 2, 3], [4])
+puts xs.load.size
+
+# Concurrent readers and one writer: a reader never sees a torn value.
+writer = spawn {
+  for i in 0...200 {
+    settings.set_level(i % 2 == 0 ? "debug" : "info", i % 2 == 0 ? 2 : 1)
+  }
+  0
+}
+readers = (0...4).map { |_r|
+  spawn {
+    bad = 0
+    for _i in 0...200 {
+      l = settings.LEVEL.load
+      bad += 1 if (l.name == "debug") != (l.n == 2)
+    }
+    bad
+  }
+}
+writer.~wait
+torn = readers.map { |t| t.~wait }.sum
+puts "torn reads: #{torn}"
+
+# A Mutex-held registry updated from many tasks, in this file and in a package.
+ts = (0...10).map { |i|
+  spawn {
+    for j in 0...20 {
+      count("k#{(i + j) % 4}")
+      settings.note("t#{i}")
+    }
+    0
+  }
+}
+ts.each { |t| t.~wait }
+COUNTS.lock { |m| m.keys.sort.each { |k| puts "#{k}=#{m[k] || 0}" } }
+puts "#{settings.HITS.load} #{settings.seen.size}"

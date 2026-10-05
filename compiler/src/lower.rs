@@ -156,7 +156,8 @@ pub fn lower(p: &TProgram, sm: &SourceMap, opts: &Opts) -> LProgram {
     // program region (current at that point), and only read afterwards.
     let globals = GLOBALS.with(|g| g.take());
     if let Some(main) = prog.funcs.iter_mut().find(|f| f.is_main) {
-        let init = globals.iter().enumerate().map(|(id, (k, t))| LS::SetGlobal(id, lit_le(&p.globals[*k], t)));
+        // Package-level values (R11) are set by main's first statements.
+        let init = globals.iter().enumerate().filter(|(_, (k, _))| !p.vars.contains(k)).map(|(id, (k, t))| LS::SetGlobal(id, lit_le(&p.globals[*k], t)));
         main.body.splice(0..0, init);
     }
     prog.globals = globals.into_iter().map(|(_, t)| t).collect();
@@ -336,7 +337,9 @@ pub fn lty(t: &Ty, mode: Overflow) -> LTy {
         // (present?, value) and the live count. A handle is a slot index.
         Ty::Pool(t) => LTy::Arr(Box::new(pool_header(lty(t, mode)))),
         // A one-element array (shared, like a map) of (lock, value).
+        // So is an atomic of anything but an Int or a Bool (R11).
         Ty::Mutex(t) => LTy::Arr(Box::new(LTy::Tup(vec![LTy::Lock, lty(t, mode)]))),
+        Ty::Atomic(t) if t.atomic_boxed() => LTy::Arr(Box::new(LTy::Tup(vec![LTy::Lock, lty(t, mode)]))),
         Ty::Atomic(_) => LTy::Atomic,
         Ty::Handle(_) | Ty::Ptr => LTy::I64,
         Ty::Chan(t) => LTy::Chan(Box::new(lty(t, mode))),
@@ -2741,6 +2744,12 @@ impl<'a> Lw<'a> {
                 self.pipeline(m, e, recv.unwrap(), args, blk)
             }
             Global(k) => LE::Global(global_of(k, self.lty(&e.ty))),
+            SetGlobal(k) => {
+                let lt = self.lty(&args[0].ty);
+                let v = self.expr(&args[0]);
+                self.emit(LS::SetGlobal(global_of(k, lt), v));
+                LE::Unit
+            }
             Pmap => self.pmap(e, recv.unwrap(), blk.unwrap()),
             Size => {
                 let r = recv.unwrap();

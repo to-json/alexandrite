@@ -1,0 +1,1119 @@
+# Package dyn: dynamic values, alx's stand-in for Go's reflect.Value
+# (GO-VS-RUBY S5; docs/notes/data-derive.md).
+#
+# Go code that inspects arbitrary values at run time (text/template and
+# html/template, slog's Any, expvar, testing/quick, fmt's %v of user types)
+# does it by reflection. alx has none (S3), so such values travel as a
+# `Value` tree, a superset of encoding/json's Value:
+#
+#   - scalars carry their Go kind and type name (int, uint16, float64,
+#     string, template.HTML, ...), so comparisons, `%T`, argument checks and
+#     error messages can follow Go's rules;
+#   - lists (slices and arrays), maps, structs and pointers are nodes in a
+#     `Doc` arena (alx values can't contain themselves, so a tree of values
+#     is stored flat, as json.Value is);
+#   - a struct may carry a `Data` object: the original alx value, whose
+#     exposed methods a consumer calls by name (a template's `.Method args`);
+#   - functions are `Func`s: a Go-style signature (`Sig`) and a closure over
+#     `[Value]`.
+#
+# `#[derive(Data)]` writes `to_data` / `from_data` for a struct or enum
+# (and the Data methods when it has public methods); Value's static
+# constructors build values by hand, `Value.from_json` from a JSON
+# document, and fmt.alx prints them as Go's fmt does (`fmt_print`,
+# `fmt_printf`, `fmt_println`).
+
+import "encoding/json"
+import "strconv"
+import "strings"
+
+# Kinds (Go's reflect.Kind, folded: every int width is INT, and so on).
+# No value (Go's invalid reflect.Value: an untyped nil, a missing map key).
+pub KIND_INVALID = 0
+pub KIND_BOOL = 1
+# int, int8, int16, int32, int64
+pub KIND_INT = 2
+# uint, uint8, uint16, uint32, uint64, uintptr
+pub KIND_UINT = 3
+# float64, float32
+pub KIND_FLOAT = 4
+# complex128, complex64
+pub KIND_COMPLEX = 5
+pub KIND_STRING = 6
+# a slice or an array (the type name says which)
+pub KIND_LIST = 7
+pub KIND_MAP = 8
+pub KIND_STRUCT = 9
+pub KIND_FUNC = 10
+# a pointer (to its element), or a nil pointer, or the nil of a
+# non-empty interface type
+pub KIND_PTR = 11
+# The marker for "no final argument" in the executor (Go's missingVal).
+pub KIND_MISSING = 12
+
+# The interface a derived type implements when it exposes methods: the
+# executor asks it for a method's signature and calls it by name.
+pub interface Data {
+  # The signature of the exposed method `name`, or none.
+  def data_sig(name: Str) -> Sig?
+  # Calls the exposed method `name`; the arguments already match its Sig.
+  def data_call(name: Str, args: [Value]) -> ~Value
+  # The text fmt prints for the value (Go's String() or Error()), if any.
+  def data_string -> Str?
+}
+
+# A function value's interface (Func is the implementation; the interface
+# lets a Doc hold functions over Values).
+pub interface Callable {
+  def sig -> Sig
+  def call(args: [Value]) -> ~Value
+}
+
+# A function's signature, with Go's type names: what the executor checks
+# and converts the arguments to (Go's reflect.Type of the func).
+pub struct Sig {
+  # The parameter types; with `variadic` the last one is the element type
+  # of the ...T parameter.
+  params: [Str]
+  variadic: Bool
+  # The result types: one, or two whose second is "error". Others are
+  # rejected when the function is called (Go's goodFunc).
+  results: [Str]
+
+  # The Go text of the signature: func(string, ...int) (string, error).
+  pub def to_s -> Str {
+    ps: [Str] = []
+    i = 0
+    while i < params.size {
+      p = params[i]
+      ps << ((variadic && i == params.size - 1) ? "...#{p}" : p)
+      i += 1
+    }
+    r = case results.size {
+      0 => ""
+      1 => " #{results[0]}"
+      _ => " (#{strings.join(results, ", ")})"
+    }
+    "func(#{strings.join(ps, ", ")})#{r}"
+  }
+
+  # Go's goodFunc: one result, or two whose second is an error.
+  pub def check(name: Str) -> Str? {
+    return none if results.size == 1
+    if results.size == 2 {
+      return none if results[1] == "error"
+      return "invalid function signature for #{name}: second return value should be error; is #{results[1]}"
+    }
+    "function #{name} has #{results.size} return values; should be 1 or 2"
+  }
+
+  # Parses Go's signature syntax: "func(string, ...int) (string, error)".
+  # Parameter names are allowed ("func(a, b string) int").
+  pub def self.parse(s: Str) -> Sig {
+    t = strings.trim_space(s)
+    t = t[4...t.size] if strings.has_prefix(t, "func")
+    t = strings.trim_space(t)
+    close = matching(t, 0)
+    inner = t[1...close]
+    rest = strings.trim_space(t[close + 1...t.size])
+    params: [Str] = []
+    variadic = false
+    pending = 0
+    for part in split_top(inner) {
+      p = strings.trim_space(part)
+      next if p == ""
+      # "name type" or "type"
+      sp = top_space(p)
+      if sp >= 0 {
+        p = strings.trim_space(p[sp + 1...p.size])
+        while pending > 0 {
+          params << strip_dots(p)
+          pending -= 1
+        }
+      } else if !(is_type_start(p)) {
+        # a bare name: its type comes later ("a, b string")
+        pending += 1
+        next
+      }
+      if strings.has_prefix(p, "...") {
+        variadic = true
+        p = p[3...p.size]
+      }
+      params << p
+    }
+    results: [Str] = []
+    if rest != "" {
+      if rest[0] == 40 {
+        for r in split_top(rest[1...matching(rest, 0)]) {
+          q = strings.trim_space(r)
+          sp = top_space(q)
+          q = strings.trim_space(q[sp + 1...q.size]) if sp >= 0
+          results << q if q != ""
+        }
+      } else {
+        results << rest
+      }
+    }
+    Sig.new(params: params, variadic: variadic, results: results)
+  }
+}
+
+def strip_dots(p: Str) -> Str { strings.has_prefix(p, "...") ? p[3...p.size] : p }
+
+# Whether a parameter word is a type rather than a bare parameter name.
+def is_type_start(p: Str) -> Bool {
+  return true if p.size == 0
+  c = p[0]
+  return true if c == 91 || c == 42 || c == 46 || c == 40
+  return true if strings.has_prefix(p, "map[") || strings.has_prefix(p, "func(") || strings.has_prefix(p, "chan ") || strings.has_prefix(p, "interface") || strings.has_prefix(p, "struct")
+  return true if strings.contains(p, ".")
+  basic_kind(p) != KIND_INVALID || p == "any" || p == "error"
+}
+
+# The index of the bracket closing the one at `at`.
+def matching(s: Str, at: Int) -> Int {
+  depth = 0
+  i = at
+  while i < s.size {
+    c = s[i]
+    depth += 1 if c == 40 || c == 91 || c == 123
+    if c == 41 || c == 93 || c == 125 {
+      depth -= 1
+      return i if depth == 0
+    }
+    i += 1
+  }
+  s.size - 1
+}
+
+# Splits on commas outside brackets.
+def split_top(s: Str) -> [Str] {
+  out: [Str] = []
+  depth = 0
+  st = 0
+  i = 0
+  while i < s.size {
+    c = s[i]
+    depth += 1 if c == 40 || c == 91 || c == 123
+    depth -= 1 if c == 41 || c == 93 || c == 125
+    if c == 44 && depth == 0 {
+      out << s[st...i]
+      st = i + 1
+    }
+    i += 1
+  }
+  out << s[st...s.size]
+  out
+}
+
+# The first space outside brackets (between a name and its type), or -1.
+def top_space(s: Str) -> Int {
+  depth = 0
+  i = 0
+  while i < s.size {
+    c = s[i]
+    depth += 1 if c == 40 || c == 91 || c == 123
+    depth -= 1 if c == 41 || c == 93 || c == 125
+    if c == 32 && depth == 0 {
+      w = strip_dots(s[0...i])
+      return -1 if strings.has_prefix(s, "map[") || w == "chan" || w == "func" || strings.has_prefix(w, "interface") || strings.has_prefix(w, "struct")
+      return i
+    }
+    i += 1
+  }
+  -1
+}
+
+# A function a template can call: a signature and a closure over Values.
+# The executor checks and converts the arguments to the signature's types
+# before calling, as Go's does by reflection.
+pub struct Func {
+  sg: Sig
+  f: ([Value]) -> ~Value
+
+  pub def sig -> Sig { sg }
+  pub def call(args: [Value]) -> ~Value { ~f.call(args) }
+
+  # A function with the Go signature `sig` ("func(string, int) string").
+  pub def self.of(sig: Str, f: ([Value]) -> ~Value) -> Func {
+    Func.new(sg: Sig.parse(sig), f: f)
+  }
+
+  # A function with the signature `sig`.
+  pub def self.make(sig: Sig, f: ([Value]) -> ~Value) -> Func {
+    Func.new(sg: sig, f: f)
+  }
+}
+
+# Adapters for common arities: arguments of any type (Go's interface{} /
+# reflect.Value parameters), one result of any type.
+pub def func0(f: () -> ~Value) -> Func {
+  Func.new(sg: Sig.new(params: [], results: ["interface {}"]), f: ->(a: [Value]) -> ~Value { ~f.call() })
+}
+
+pub def func1(f: (Value) -> ~Value) -> Func {
+  Func.new(sg: Sig.new(params: ["interface {}"], results: ["interface {}"]), f: ->(a: [Value]) -> ~Value { ~f.call(a[0]) })
+}
+
+pub def func2(f: (Value, Value) -> ~Value) -> Func {
+  Func.new(sg: Sig.new(params: ["interface {}", "interface {}"], results: ["interface {}"]), f: ->(a: [Value]) -> ~Value { ~f.call(a[0], a[1]) })
+}
+
+pub def func3(f: (Value, Value, Value) -> ~Value) -> Func {
+  Func.new(sg: Sig.new(params: ["interface {}", "interface {}", "interface {}"], results: ["interface {}"]), f: ->(a: [Value]) -> ~Value { ~f.call(a[0], a[1], a[2]) })
+}
+
+# A variadic function: func(...interface{}) interface{}.
+pub def funcn(f: ([Value]) -> ~Value) -> Func {
+  Func.new(sg: Sig.new(params: ["interface {}"], variadic: true, results: ["interface {}"]), f: f)
+}
+
+# A stored value. Scalars hold their value; containers their children:
+# LIST elements are kids[start...start+cnt]; MAP and STRUCT entries are
+# (key, value) pairs there (a STRUCT's keys are its field names, `n` = 1 on
+# a key marks an unexported field).
+struct Node {
+  k: Int
+  t: Str
+  n: Int
+  u: U64
+  f: Float
+  g: Float
+  s: Str
+  start: Int
+  cnt: Int
+  # LIST: Go's cap.
+  cap: Int
+  # STRUCT: index of its Data object (-1: none). FUNC: index of the Callable.
+  obj: Int
+  # LIST, MAP, FUNC: a nil slice, map or func.
+  nilv: Bool
+}
+
+struct DocS {
+  nodes: [Node]
+  kids: [Int]
+  objs: [Data]
+  fns: [Callable]
+}
+
+# An arena of values. The derive builds a whole value in one Doc; Value's
+# constructors copy their parts into a new one.
+pub struct Doc {
+  st: [DocS]
+
+  pub def self.make -> Doc { Doc.new(st: [DocS.new(nodes: [], kids: [], objs: [], fns: [])]) }
+
+  def push(n: Node) -> Int {
+    s = st
+    ns = s[0].nodes
+    ns << n
+    s[0].nodes = ns
+    ns.size - 1
+  }
+
+  def push_kids(ks: [Int]) -> Int {
+    s = st
+    k = s[0].kids
+    start = k.size
+    for x in ks { k << x }
+    s[0].kids = k
+    start
+  }
+
+  # The value at node `id` of this doc.
+  pub def value(id: Int) -> Value {
+    n = st[0].nodes[id]
+    if n.k == KIND_LIST || n.k == KIND_MAP || n.k == KIND_STRUCT || n.k == KIND_FUNC || (n.k == KIND_PTR && n.cnt > 0) {
+      return Value.new(k: n.k, t: n.t, d: st, id: id)
+    }
+    Value.new(k: n.k, t: n.t, n: n.n, u: n.u, f: n.f, g: n.g, s: n.s, id: -1)
+  }
+
+  # Adds v (copying it, if it lives in another doc); returns its node.
+  pub def add(v: Value) -> Int {
+    if v.d.size == 0 {
+      return push(Node.new(k: v.k, t: v.t, n: v.n, u: v.u, f: v.f, g: v.g, s: v.s, obj: -1))
+    }
+    copy_node(v.d, v.id)
+  }
+
+  def copy_node(src: [DocS], id: Int) -> Int {
+    n = src[0].nodes[id]
+    case n.k {
+      KIND_LIST | KIND_MAP | KIND_STRUCT | KIND_PTR => {
+        ks: [Int] = []
+        i = 0
+        # (a slice's elements up to its capacity)
+        m = n.k == KIND_LIST && n.cap > n.cnt ? n.cap : n.cnt
+        while i < m {
+          ks << copy_node(src, src[0].kids[n.start + i])
+          i += 1
+        }
+        n.start = push_kids(ks)
+        if n.obj >= 0 {
+          s = st
+          os = s[0].objs
+          os << src[0].objs[n.obj]
+          s[0].objs = os
+          n.obj = os.size - 1
+        }
+        push(n)
+      }
+      KIND_FUNC => {
+        if n.obj >= 0 {
+          s = st
+          fs = s[0].fns
+          fs << src[0].fns[n.obj]
+          s[0].fns = fs
+          n.obj = fs.size - 1
+        }
+        push(n)
+      }
+      _ => push(n)
+    }
+  }
+
+  # Node constructors (used by derived code).
+  pub def bool(b: Bool) -> Int { push(Node.new(k: KIND_BOOL, t: "", n: b ? 1 : 0, obj: -1)) }
+  pub def int(x: Int, t: Str) -> Int { push(Node.new(k: KIND_INT, t: t == "int" ? "" : t, n: x, obj: -1)) }
+  pub def uint(x: U64, t: Str) -> Int { push(Node.new(k: KIND_UINT, t: t == "uint" ? "" : t, u: x, obj: -1)) }
+  pub def float(x: Float, t: Str) -> Int { push(Node.new(k: KIND_FLOAT, t: t == "float64" ? "" : t, f: x, obj: -1)) }
+  pub def complex(c: Complex) -> Int { push(Node.new(k: KIND_COMPLEX, f: c.real, g: c.imag, obj: -1)) }
+  pub def str(x: Str, t: Str) -> Int { push(Node.new(k: KIND_STRING, t: t == "string" ? "" : t, s: x, obj: -1)) }
+  pub def nil_of(t: Str) -> Int { add(Value.nil_of(t)) }
+  pub def invalid -> Int { push(Node.new(k: KIND_INVALID, obj: -1)) }
+
+  # A slice (or array, `[N]T`) of the nodes `ids`.
+  pub def list(t: Str, ids: [Int]) -> Int {
+    start = push_kids(ids)
+    push(Node.new(k: KIND_LIST, t: t, start: start, cnt: ids.size, cap: ids.size, obj: -1))
+  }
+
+  # A map; keys[i] maps to vals[i].
+  pub def map(t: Str, keys: [Int], vals: [Int]) -> Int {
+    ks: [Int] = []
+    i = 0
+    while i < keys.size {
+      ks << keys[i]
+      ks << vals[i]
+      i += 1
+    }
+    start = push_kids(ks)
+    push(Node.new(k: KIND_MAP, t: t, start: start, cnt: ks.size, obj: -1))
+  }
+
+  # A struct of type `t` with these fields (exported) and no methods.
+  pub def strct(t: Str, names: [Str], vals: [Int]) -> Int {
+    ks: [Int] = []
+    i = 0
+    while i < names.size {
+      ks << str(names[i], "")
+      ks << vals[i]
+      i += 1
+    }
+    start = push_kids(ks)
+    push(Node.new(k: KIND_STRUCT, t: t, start: start, cnt: ks.size, obj: -1))
+  }
+
+  # A struct whose methods `obj` exposes.
+  pub def strct_obj(t: Str, names: [Str], vals: [Int], obj: Data) -> Int {
+    id = strct(t, names, vals)
+    s = st
+    os = s[0].objs
+    os << obj
+    s[0].objs = os
+    s[0].nodes[id].obj = os.size - 1
+    id
+  }
+
+  # Gives node `id` the type name `t`; returns id.
+  pub def retype(id: Int, t: Str) -> Int {
+    s = st
+    s[0].nodes[id].t = t
+    id
+  }
+
+  # A pointer of type `t` ("*T") to node `id`.
+  pub def ptr(id: Int, t: Str) -> Int {
+    start = push_kids([id])
+    push(Node.new(k: KIND_PTR, t: t, start: start, cnt: 1, obj: -1))
+  }
+
+  # A function value.
+  pub def func(f: Func, t: Str) -> Int {
+    s = st
+    fs = s[0].fns
+    fs << f
+    s[0].fns = fs
+    push(Node.new(k: KIND_FUNC, t: t == "" ? f.sig.to_s : t, obj: fs.size - 1))
+  }
+}
+
+# A template value: Go's reflect.Value for template data. Scalars are held
+# inline; lists, maps, structs and functions are nodes in a Doc. Values are
+# immutable and cheap to copy.
+pub struct Value {
+  k: Int
+  # Go type name; "" means the kind's default (int, string, ...).
+  t: Str
+  n: Int
+  u: U64
+  f: Float
+  g: Float
+  s: Str
+  d: [DocS]
+  id: Int
+  # The interface type the value was read through (Go's reflect.Value of
+  # Kind Interface: a range element or map entry of type interface {}),
+  # or "". Only error messages ("in type interface {}") see it.
+  it: Str
+
+  def node -> Node { d[0].nodes[id] }
+  def doc -> Doc { Doc.new(st: d) }
+
+  # The value itself (so generic code can call `x.to_data` on a Value).
+  pub def to_data -> Value { self }
+
+  # Constructors.
+  # No value: Go's invalid reflect.Value (an untyped nil).
+  pub def self.invalid -> Value { Value.new(k: KIND_INVALID, id: -1) }
+  pub def self.bool(b: Bool) -> Value { Value.new(k: KIND_BOOL, n: b ? 1 : 0, id: -1) }
+  pub def self.int(x: Int) -> Value { Value.new(k: KIND_INT, n: x, id: -1) }
+  # An integer of a sized type: "int8", "int16", "int32", "int64" (or a
+  # named one, "time.Duration").
+  pub def self.int_of(x: Int, t: Str) -> Value { Value.new(k: KIND_INT, t: t == "int" ? "" : t, n: x, id: -1) }
+  pub def self.uint(x: U64) -> Value { Value.new(k: KIND_UINT, u: x, id: -1) }
+  pub def self.uint_of(x: U64, t: Str) -> Value { Value.new(k: KIND_UINT, t: t == "uint" ? "" : t, u: x, id: -1) }
+  pub def self.float(x: Float) -> Value { Value.new(k: KIND_FLOAT, f: x, id: -1) }
+  pub def self.float_of(x: Float, t: Str) -> Value { Value.new(k: KIND_FLOAT, t: t == "float64" ? "" : t, f: x, id: -1) }
+  pub def self.complex(c: Complex) -> Value { Value.new(k: KIND_COMPLEX, f: c.real, g: c.imag, id: -1) }
+  pub def self.complex_of(c: Complex, t: Str) -> Value { Value.new(k: KIND_COMPLEX, t: t == "complex128" ? "" : t, f: c.real, g: c.imag, id: -1) }
+  pub def self.str(x: Str) -> Value { Value.new(k: KIND_STRING, s: x, id: -1) }
+  # A string of a named string type ("template.HTML").
+  pub def self.str_of(x: Str, t: Str) -> Value { Value.new(k: KIND_STRING, t: t == "string" ? "" : t, s: x, id: -1) }
+
+  # A typed nil: "*T" (a nil pointer), "[]T" (a nil slice), "map[K]V" (a
+  # nil map), "func(...)" (a nil func), or an interface type's nil.
+  pub def self.nil_of(t: Str) -> Value {
+    if strings.has_prefix(t, "[]") {
+      dd = Doc.make
+      id = dd.list(t, [])
+      dd.st[0].nodes[id].nilv = true
+      return dd.value(id)
+    }
+    if strings.has_prefix(t, "map[") {
+      dd = Doc.make
+      id = dd.map(t, [], [])
+      dd.st[0].nodes[id].nilv = true
+      return dd.value(id)
+    }
+    if strings.has_prefix(t, "func(") {
+      dd = Doc.make
+      id = dd.push(Node.new(k: KIND_FUNC, t: t, obj: -1, nilv: true))
+      return dd.value(id)
+    }
+    Value.new(k: KIND_PTR, t: t, id: -1)
+  }
+
+  # A slice of these values ([]interface{} unless `t` says otherwise).
+  pub def self.list(xs: [Value]) -> Value { Value.list_of(xs, "[]interface {}") }
+  pub def self.list_of(xs: [Value], t: Str) -> Value {
+    dd = Doc.make
+    ids = xs.map { dd.add(it) }
+    dd.value(dd.list(t, ids))
+  }
+  # A slice whose capacity (Go's cap) is `cap`; the extra elements are zero
+  # values of `zero`.
+  pub def self.list_cap(xs: [Value], cap: Int, zero: Value, t: Str) -> Value {
+    dd = Doc.make
+    ids: [Int] = xs.map { dd.add(it) }
+    n = ids.size
+    while ids.size < cap { ids << dd.add(zero) }
+    id = dd.list(t, ids)
+    dd.st[0].nodes[id].cnt = n
+    dd.st[0].nodes[id].cap = cap
+    dd.value(id)
+  }
+
+  # A map[string]interface{} of these entries (insertion order kept;
+  # printing and range sort the keys, as Go's do).
+  pub def self.map(m: Map[Str, Value]) -> Value {
+    ks: [Value] = []
+    vs: [Value] = []
+    for k, v in m {
+      ks << Value.str(k)
+      vs << v
+    }
+    Value.map_of(ks, vs, "map[string]interface {}")
+  }
+  pub def self.map_of(keys: [Value], vals: [Value], t: Str) -> Value {
+    dd = Doc.make
+    kids: [Int] = []
+    vids: [Int] = []
+    i = 0
+    while i < keys.size {
+      kids << dd.add(keys[i])
+      vids << dd.add(vals[i])
+      i += 1
+    }
+    dd.value(dd.map(t, kids, vids))
+  }
+
+  # A struct of type `t` ("main.T", "struct { a int; b string }") with
+  # these fields. A field whose name starts with a lower-case letter is
+  # unexported, as in Go (it prints, but `.name` is an error).
+  pub def self.struct_of(t: Str, names: [Str], vals: [Value]) -> Value {
+    dd = Doc.make
+    ks: [Int] = []
+    i = 0
+    while i < names.size {
+      kid = dd.str(names[i], "")
+      if !exported?(names[i]) {
+        dd.st[0].nodes[kid].n = 1
+      }
+      ks << kid
+      ks << dd.add(vals[i])
+      i += 1
+    }
+    start = dd.push_kids(ks)
+    dd.value(dd.push(Node.new(k: KIND_STRUCT, t: t, start: start, cnt: ks.size, obj: -1)))
+  }
+
+  # A struct like struct_of whose methods (and String()) are `obj`'s: how a
+  # type with methods and fields of any type (Go's interface{} fields,
+  # which a derived type can't hold) becomes template data.
+  pub def self.struct_with(t: Str, names: [Str], vals: [Value], obj: Data) -> Value {
+    v = Value.struct_of(t, names, vals)
+    dd = v.doc()
+    s = dd.st
+    os = s[0].objs
+    os << obj
+    s[0].objs = os
+    s[0].nodes[v.id].obj = os.size - 1
+    v
+  }
+
+  # A function value of Go type `t` ("" : its signature's text).
+  pub def self.func(f: Func) -> Value {
+    dd = Doc.make
+    dd.value(dd.func(f, ""))
+  }
+
+  # A JSON document as template data, as Go's json.Unmarshal into an
+  # interface{} makes it: objects are map[string]interface {}, arrays
+  # []interface {}, numbers float64, strings, bools, and null no value.
+  pub def self.from_json(j: json.Value) -> Value {
+    if j.null? {
+      return Value.invalid
+    }
+    if b = j.as_bool {
+      return Value.bool(b)
+    }
+    if j.number? {
+      return Value.float(j.as_float || 0.0)
+    }
+    if s = j.as_str {
+      return Value.str(s)
+    }
+    if j.array? {
+      return Value.list(j.values.map { json_elem(it) })
+    }
+    ks: [Value] = []
+    vs: [Value] = []
+    keys = j.keys
+    vals = j.values
+    i = 0
+    while i < keys.size {
+      # A repeated key: the last one wins, as in Go.
+      found = -1
+      x = 0
+      while x < ks.size {
+        found = x if ks[x].s == keys[i]
+        x += 1
+      }
+      if found >= 0 {
+        vs[found] = json_elem(vals[i])
+      } else {
+        ks << Value.str(keys[i])
+        vs << json_elem(vals[i])
+      }
+      i += 1
+    }
+    Value.map_of(ks, vs, "map[string]interface {}")
+  }
+
+  # Any value that converts itself (a derived type, or a Value).
+  pub def self.from[T](x: T) -> Value { x.to_data }
+
+  # A pointer to the value (Go's &x), of type "*T".
+  pub def ptr -> Value {
+    dd = Doc.make
+    dd.value(dd.ptr(dd.add(self), "*" + type_name))
+  }
+
+  # PTR: the value pointed to (a nil pointer has none: INVALID).
+  pub def elem -> Value {
+    return Value.invalid if k != KIND_PTR || d.size == 0
+    nd = node()
+    return Value.invalid if nd.cnt == 0
+    doc().value(d[0].kids[nd.start])
+  }
+
+  # Accessors.
+  pub def kind -> Int { k }
+  pub def valid? -> Bool { k != KIND_INVALID }
+
+  # The Go type name (reflect.Type.String()).
+  pub def type_name -> Str {
+    return t if t != ""
+    case k {
+      KIND_BOOL => "bool"
+      KIND_INT => "int"
+      KIND_UINT => "uint"
+      KIND_FLOAT => "float64"
+      KIND_COMPLEX => "complex128"
+      KIND_STRING => "string"
+      KIND_LIST => "[]interface {}"
+      KIND_MAP => "map[string]interface {}"
+      KIND_STRUCT => "struct {}"
+      KIND_FUNC => "func()"
+      _ => "<nil>"
+    }
+  }
+
+  # Whether the value is a nil pointer, slice, map or func (Go's IsNil).
+  pub def nil? -> Bool {
+    return d.size == 0 if k == KIND_PTR
+    if k == KIND_LIST || k == KIND_MAP || k == KIND_FUNC {
+      return node().nilv
+    }
+    false
+  }
+
+  pub def bool_val -> Bool { n != 0 }
+  pub def int_val -> Int { n }
+  pub def uint_val -> U64 { u }
+  pub def float_val -> Float { f }
+  pub def complex_val -> Complex { Complex.new(f, g) }
+  pub def str_val -> Str { s }
+
+  # LIST, MAP, STRUCT, STRING: Go's Len.
+  pub def len -> Int {
+    return s.size if k == KIND_STRING
+    return 0 if d.size == 0
+    nd = node()
+    return nd.cnt / 2 if k == KIND_MAP || k == KIND_STRUCT
+    nd.cnt
+  }
+  # LIST: Go's Cap.
+  pub def cap -> Int {
+    return 0 if d.size == 0
+    node().cap
+  }
+
+  # LIST: element i (0 <= i < cap).
+  pub def at(i: Int) -> Value {
+    nd = node()
+    doc().value(d[0].kids[nd.start + i])
+  }
+
+  # LIST: the elements.
+  pub def elems -> [Value] {
+    out: [Value] = []
+    return out if k != KIND_LIST
+    i = 0
+    nd = node()
+    while i < nd.cnt {
+      out << doc().value(d[0].kids[nd.start + i])
+      i += 1
+    }
+    out
+  }
+
+  # MAP: the entries in insertion order. STRUCT: the fields in order.
+  pub def entries -> [(Value, Value)] {
+    out: [(Value, Value)] = []
+    return out if k != KIND_MAP && k != KIND_STRUCT
+    nd = node()
+    i = 0
+    while i < nd.cnt {
+      out << (doc().value(d[0].kids[nd.start + i]), doc().value(d[0].kids[nd.start + i + 1]))
+      i += 2
+    }
+    out
+  }
+
+  # MAP: the entries sorted by key (Go's internal/fmtsort order).
+  pub def sorted_entries -> [(Value, Value)] {
+    es = entries()
+    sort_entries(es)
+  }
+
+  # MAP: the value for a key equal to `key`, or none.
+  pub def map_get(key: Value) -> Value? {
+    for e in entries() {
+      return e[1] if key_eq(e[0], key)
+    }
+    none
+  }
+
+  # STRUCT: field `name`: (the value, exported?), or none.
+  pub def field(name: Str) -> (Value, Bool)? {
+    return none if k != KIND_STRUCT
+    nd = node()
+    i = 0
+    while i < nd.cnt {
+      kn = d[0].nodes[d[0].kids[nd.start + i]]
+      if kn.s == name {
+        return (doc().value(d[0].kids[nd.start + i + 1]), kn.n == 0)
+      }
+      i += 2
+    }
+    none
+  }
+
+  # STRUCT: field names in order.
+  pub def field_names -> [Str] {
+    out: [Str] = []
+    return out if k != KIND_STRUCT
+    nd = node()
+    i = 0
+    while i < nd.cnt {
+      out << d[0].nodes[d[0].kids[nd.start + i]].s
+      i += 2
+    }
+    out
+  }
+
+  # STRUCT: its Data object, if it has methods.
+  pub def obj -> Data? {
+    if k == KIND_PTR {
+      return none if d.size == 0
+      return elem().obj
+    }
+    return none if k != KIND_STRUCT || d.size == 0
+    nd = node()
+    return none if nd.obj < 0
+    d[0].objs[nd.obj]
+  }
+
+  # FUNC: the function (none for a nil func).
+  pub def callable -> Callable? {
+    return none if k != KIND_FUNC
+    nd = node()
+    return none if nd.obj < 0
+    d[0].fns[nd.obj]
+  }
+
+  # A LIST's elements i...j (Go's s[i:j]; j may reach the capacity).
+  pub def slice(i: Int, j: Int, cap: Int) -> Value {
+    nd = node()
+    dd = Doc.make
+    ids: [Int] = []
+    x = i
+    while x < cap {
+      ids << dd.add(doc().value(d[0].kids[nd.start + x]))
+      x += 1
+    }
+    nid = dd.list(t, ids)
+    dd.st[0].nodes[nid].cnt = j - i
+    dd.st[0].nodes[nid].cap = cap - i
+    dd.value(nid)
+  }
+
+  # The value as Go's fmt prints it with %v.
+  pub def to_s -> Str { fmt_print([self]) }
+}
+
+# A JSON value inside an array or object: null is a nil interface{}.
+def json_elem(j: json.Value) -> Value {
+  return Value.nil_of("interface {}") if j.null?
+  Value.from_json(j)
+}
+
+# Whether a struct field name is exported (starts with an upper-case
+# letter or a non-ASCII letter; alx names are always lower-case, so the
+# derive marks its fields exported itself).
+def exported?(name: Str) -> Bool {
+  return false if name.size == 0
+  c = name[0]
+  !(c >= 97 && c <= 122) && c != 95
+}
+
+# Map key equality (Go's ==, for the key kinds a template can use).
+def key_eq(a: Value, b: Value) -> Bool {
+  return false if a.k != b.k
+  case a.k {
+    KIND_BOOL | KIND_INT => a.n == b.n
+    KIND_UINT => a.u == b.u
+    KIND_FLOAT => a.f == b.f
+    KIND_COMPLEX => a.f == b.f && a.g == b.g
+    KIND_STRING => a.s == b.s && a.type_name == b.type_name
+    KIND_INVALID | KIND_PTR => true
+    _ => false
+  }
+}
+
+# Go's internal/fmtsort comparison of two keys: -1, 0, 1.
+def key_cmp(a: Value, b: Value) -> Int {
+  if a.k != b.k {
+    return a.k < b.k ? -1 : 1
+  }
+  case a.k {
+    KIND_BOOL | KIND_INT => {
+      return -1 if a.n < b.n
+      return 1 if a.n > b.n
+      0
+    }
+    KIND_UINT => {
+      return -1 if a.u < b.u
+      return 1 if a.u > b.u
+      0
+    }
+    KIND_FLOAT => float_cmp(a.f, b.f)
+    KIND_COMPLEX => {
+      c = float_cmp(a.f, b.f)
+      return c if c != 0
+      float_cmp(a.g, b.g)
+    }
+    KIND_STRING => {
+      return -1 if a.s < b.s
+      return 1 if a.s > b.s
+      0
+    }
+    _ => 0
+  }
+}
+
+# fmtsort's float order: NaN first, then numeric.
+def float_cmp(a: Float, b: Float) -> Int {
+  if a < b {
+    return -1
+  }
+  if a > b {
+    return 1
+  }
+  if a == b {
+    return 0
+  }
+  return -1 if a != a && b == b
+  return 1 if a == a && b != b
+  0
+}
+
+def sort_entries(es: [(Value, Value)]) -> [(Value, Value)] {
+  # insertion sort: stable, and template maps are small
+  out = es
+  i = 1
+  while i < out.size {
+    x = out[i]
+    j = i - 1
+    while j >= 0 && key_cmp(out[j][0], x[0]) > 0 {
+      out[j + 1] = out[j]
+      j -= 1
+    }
+    out[j + 1] = x
+    i += 1
+  }
+  out
+}
+
+# The kind of a Go basic type name (KIND_INVALID if it isn't one).
+pub def basic_kind(t: Str) -> Int {
+  case t {
+    "bool" => KIND_BOOL
+    "int" | "int8" | "int16" | "int32" | "int64" | "rune" => KIND_INT
+    "uint" | "uint8" | "uint16" | "uint32" | "uint64" | "uintptr" | "byte" => KIND_UINT
+    "float32" | "float64" => KIND_FLOAT
+    "complex64" | "complex128" => KIND_COMPLEX
+    "string" => KIND_STRING
+    _ => KIND_INVALID
+  }
+}
+
+# The kind a Go type name denotes: basic kinds, composites by their syntax,
+# KIND_STRUCT for other names (and interfaces, which the caller checks).
+pub def kind_of_type(t: Str) -> Int {
+  b = basic_kind(t)
+  return b if b != KIND_INVALID
+  return KIND_LIST if strings.has_prefix(t, "[")
+  return KIND_MAP if strings.has_prefix(t, "map[")
+  return KIND_FUNC if strings.has_prefix(t, "func(")
+  return KIND_PTR if strings.has_prefix(t, "*")
+  KIND_STRUCT
+}
+
+# Whether a Go type name is an interface type the executor knows: the
+# empty interface, error, fmt.Stringer, reflect.Value (which receives any
+# value, including an invalid one).
+pub def iface_type?(t: Str) -> Bool {
+  t == "interface {}" || t == "any" || t == "error" || t == "fmt.Stringer" || t == "reflect.Value" || strings.has_prefix(t, "interface")
+}
+
+# v as read from a container whose element type is t: an interface type
+# is remembered (Value.it).
+pub def through(v: Value, t: Str) -> Value {
+  return v if !(t == "any" || t == "error" || strings.has_prefix(t, "interface"))
+  r = v
+  r.it = t
+  r
+}
+
+# Whether t is an empty interface or reflect.Value: anything is assignable.
+pub def any_type?(t: Str) -> Bool {
+  t == "interface {}" || t == "any" || t == "reflect.Value" || t == "interface{}"
+}
+
+# Reading values back (what `from_data` of #[derive(Data)] calls). Each
+# fails with a "dyn: ..." message when the value doesn't fit; numbers
+# convert between kinds when the value is exact (JSON's numbers are
+# float64: 3.0 is an Int, 3.5 isn't).
+
+def mismatch(v: Value, want: Str) -> Error {
+  Failure.Msg("dyn: cannot use #{v.valid? ? v.type_name : "nil"} value as #{want}")
+}
+
+# The value behind any pointers (a nil pointer: INVALID).
+pub def deref(v: Value) -> Value {
+  x = v
+  while x.k == KIND_PTR {
+    x = x.elem
+  }
+  x
+}
+
+# Whether v is no value: INVALID, a nil pointer or nil interface.
+pub def absent?(v: Value) -> Bool { v.k == KIND_INVALID || v.k == KIND_PTR && v.nil? }
+
+pub def to_int(v0: Value) -> ~Int {
+  v = deref(v0)
+  case v.k {
+    KIND_INT => {return v.n}
+    KIND_UINT => {
+      return v.u.as_i64 if v.u <= 9223372036854775807.as_u64
+    }
+    KIND_FLOAT => {
+      if v.f >= -9223372036854775808.0 && v.f < 9223372036854775808.0 && v.f.to_i.to_f == v.f {
+        return v.f.to_i
+      }
+    }
+    _ => {}
+  }
+  fail mismatch(v, "int")
+}
+
+pub def to_uint(v0: Value) -> ~U64 {
+  v = deref(v0)
+  case v.k {
+    KIND_UINT => {return v.u}
+    KIND_INT => {
+      return v.n.as_u64 if v.n >= 0
+    }
+    KIND_FLOAT => {
+      if v.f >= 0.0 && v.f < 18446744073709551616.0 && v.f.to_u64.to_f == v.f {
+        return v.f.to_u64
+      }
+    }
+    _ => {}
+  }
+  fail mismatch(v, "uint")
+}
+
+pub def to_float(v0: Value) -> ~Float {
+  v = deref(v0)
+  case v.k {
+    KIND_FLOAT => {return v.f}
+    KIND_INT => {return v.n.to_f}
+    KIND_UINT => {return v.u.to_f}
+    _ => {}
+  }
+  fail mismatch(v, "float64")
+}
+
+pub def to_complex(v0: Value) -> ~Complex {
+  v = deref(v0)
+  return v.complex_val if v.k == KIND_COMPLEX
+  Complex.new(~to_float(v), 0.0)
+}
+
+pub def to_bool(v0: Value) -> ~Bool {
+  v = deref(v0)
+  fail mismatch(v, "bool") if v.k != KIND_BOOL
+  v.bool_val
+}
+
+pub def to_str(v0: Value) -> ~Str {
+  v = deref(v0)
+  fail mismatch(v, "string") if v.k != KIND_STRING
+  v.str_val
+}
+
+# A LIST (of n elements, if n >= 0); a nil slice is an empty one.
+pub def want_list(v0: Value, n: Int) -> ~Value {
+  v = deref(v0)
+  return Value.list([]) if v.k == KIND_INVALID && n < 0
+  fail mismatch(v, n < 0 ? "a slice" : "[#{n}] array") if v.k != KIND_LIST
+  fail Failure.Msg("dyn: an array of #{v.len} elements for [#{n}]") if n >= 0 && v.len != n
+  v
+}
+
+# A MAP; a nil map is an empty one.
+pub def want_map(v0: Value) -> ~Value {
+  v = deref(v0)
+  return Value.map_of([], [], "map[string]interface {}") if v.k == KIND_INVALID
+  fail mismatch(v, "a map") if v.k != KIND_MAP
+  v
+}
+
+# A STRUCT (or a map[string]..., as JSON objects are) for the type named t.
+pub def want_struct(v: Value, t: Str) -> ~Value {
+  fail mismatch(v, t) if v.k != KIND_STRUCT && v.k != KIND_MAP
+  v
+}
+
+# A FUNC's function.
+pub def want_func(v0: Value) -> ~Callable {
+  v = deref(v0)
+  if v.k == KIND_FUNC {
+    if c = v.callable {
+      return c
+    }
+  }
+  fail mismatch(v, "a func")
+}
+
+# Field `name` of a struct, or the entry for key `name` of a map.
+pub def get_field(v: Value, name: Str) -> ~Value {
+  if x = lookup_field(v, name) {
+    return x
+  }
+  fail Failure.Msg("dyn: #{v.type_name} has no field #{name}")
+}
+
+# Like get_field, but a missing field is INVALID (for optional fields).
+pub def field_or_nil(v: Value, name: Str) -> Value { lookup_field(v, name) || Value.invalid }
+
+def lookup_field(v: Value, name: Str) -> Value? {
+  if v.k == KIND_MAP {
+    return v.map_get(Value.str(name))
+  }
+  if f = v.field(name) {
+    return f[0]
+  }
+  none
+}
+
+# An enum's variant: a string (a payload-free variant of a type without
+# methods) or the "variant" field of a struct.
+pub def variant_name(v: Value, t: Str) -> ~Str {
+  return v.str_val if v.k == KIND_STRING
+  if v.k == KIND_STRUCT || v.k == KIND_MAP {
+    return ~to_str(~get_field(v, "variant"))
+  }
+  fail mismatch(v, t)
+}
+
+pub def no_variant(t: Str, name: Str) -> Error { Failure.Msg("dyn: #{t} has no variant #{strconv.quote(name)}") }
+
+pub def no_method(t: Str, name: Str) -> Error { Failure.Msg("dyn: #{t} has no method #{name}") }

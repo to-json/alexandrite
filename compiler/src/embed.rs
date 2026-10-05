@@ -1,4 +1,4 @@
-//! `#[embed("pattern", ...)]` (Go's `//go:embed`, D59): find the files a
+//! `#[embed("pattern", ...)]` (Go's `//go:embed`, D62): find the files a
 //! constant embeds, by Go's rules (cmd/go's resolveEmbed), and read them.
 //! The checker turns them into the constant's value (`CVal::Embed`).
 

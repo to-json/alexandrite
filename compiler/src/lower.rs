@@ -23,7 +23,7 @@ thread_local! {
     /// Every error type (enums), in tag order.
     static ERRORS: RefCell<Vec<Ty>> = const { RefCell::new(Vec::new()) };
     /// Every lambda literal: (enclosing function, block start, fn type, capture types).
-    static LAMBDAS: RefCell<Vec<(String, u32, Ty, Vec<Ty>)>> = const { RefCell::new(Vec::new()) };
+    static LAMBDAS: RefCell<Vec<(String, u64, Ty, Vec<Ty>)>> = const { RefCell::new(Vec::new()) };
     /// The LIR global of each array constant read in place, by (`M::Global`
     /// index, type): an Int is a bignum in promote mode, so one constant
     /// can need two.
@@ -2990,7 +2990,7 @@ impl<'a> Lw<'a> {
             }
             Lambda => {
                 let b = blk.unwrap();
-                let lo = b.span.lo;
+                let lo = ((b.id as u64) << 32) | b.span.lo as u64;
                 let g = LAMBDAS.with(|l| l.borrow().iter().position(|s| s.0 == self.f.cname && s.1 == lo)).expect("lambda registered");
                 let sites = lambda_sites(&e.ty);
                 let tag = sites.iter().position(|(x, _)| *x == g).unwrap();
@@ -3108,7 +3108,7 @@ impl<'a> Lw<'a> {
                 let (stmts, v) = w.sub_val(|w| w.scoped_value(&b.body, &ok_ty));
                 body.extend(stmts);
                 // Nothing to return: the last expression still runs.
-                let v = if ok_ty == Ty::Unit {
+                let v = if matches!(ok_ty, Ty::Unit | Ty::Never) {
                     if !matches!(v, LE::Unit | LE::Var(_) | LE::I(_) | LE::B(_)) {
                         body.push(LS::Eval(v));
                     }
@@ -3117,7 +3117,7 @@ impl<'a> Lw<'a> {
                     v
                 };
                 let out_t = if fallible { result_lty(w.lty(&ok_ty), self.mode) } else { ok_lty(w.lty(&ok_ty)) };
-                let v = if fallible { w.ok_result(if ok_ty == Ty::Unit { LE::B(false) } else { v }) } else if ok_ty == Ty::Unit { LE::B(false) } else { v };
+                let v = if fallible { w.ok_result(if matches!(ok_ty, Ty::Unit | Ty::Never) { LE::B(false) } else { v }) } else if matches!(ok_ty, Ty::Unit | Ty::Never) { LE::B(false) } else { v };
                 body.push(LS::Return(Some(v)));
                 let mut prog = self.prog.borrow_mut();
                 let id = prog.workers.len();
@@ -3334,7 +3334,7 @@ impl<'a> Lw<'a> {
                 let pv = self.expr(r);
                 let p = self.tmp_of(pv, lt);
                 let cell = || LE::Index { arr: Box::new(LE::Var(p)), idx: Box::new(LE::I(0)), check: None };
-                self.emit(LS::Lock(LE::Field(Box::new(cell()), 0)));
+                self.emit(LS::Lock(LE::Field(Box::new(cell()), 0), self.loc(sp)));
                 let b = blk.unwrap();
                 let res = self.inline_block(b, &[LE::Field(Box::new(cell()), 1)], &[], None);
                 let rt = self.lty(&e.ty);
@@ -3418,6 +3418,21 @@ impl<'a> Lw<'a> {
             ChanLen => {
                 let c = self.expr(recv.unwrap());
                 self.int_out(LE::ChanLen(Box::new(c)))
+            }
+            MutexPoisoned | MutexClearPoison => {
+                let r = recv.unwrap();
+                let lt = self.lty(&r.ty);
+                let pv = self.expr(r);
+                let p = self.tmp_of(pv, lt);
+                let cell = LE::Index { arr: Box::new(LE::Var(p)), idx: Box::new(LE::I(0)), check: None };
+                let l = LE::Field(Box::new(cell), 0);
+                if m == MutexClearPoison {
+                    self.emit(LS::LockClearPoison(l));
+                    LE::Unit
+                } else {
+                    let b = LE::LockPoisoned(Box::new(l));
+                    self.bind(b, LTy::Bool)
+                }
             }
             ToIface(k) => {
                 let lt = self.lty(&e.ty);
@@ -4690,7 +4705,7 @@ fn le_allocates(e: &LE, rets: &(std::collections::HashSet<String>, std::collecti
     match e {
         LE::Var(_) | LE::I(_) | LE::F(_) | LE::B(_) | LE::S(_) | LE::SB(_) | LE::Loc(_) | LE::Unit | LE::RegionProgram | LE::Global(_) => false,
         LE::Tup(_, xs) | LE::Prim(_, xs) => any(xs),
-        LE::Field(x, _) | LE::Neg(x, _) | LE::FNeg(x) | LE::Not(x) | LE::Len(x) | LE::RangeField(x, _) | LE::ChanLen(x) | LE::AtomicLoad(x) | LE::RegionOf(x) | LE::RegionBytes(x) => one(x),
+        LE::Field(x, _) | LE::Neg(x, _) | LE::FNeg(x) | LE::Not(x) | LE::Len(x) | LE::RangeField(x, _) | LE::ChanLen(x) | LE::LockPoisoned(x) | LE::AtomicLoad(x) | LE::RegionOf(x) | LE::RegionBytes(x) => one(x),
         LE::Arith(_, a, b, _) | LE::Cmp(_, a, b, _) | LE::FArith(_, a, b) | LE::Range(a, b, _) => one(a) || one(b),
         LE::Cond(a, b, c) => one(a) || one(b) || one(c),
         LE::Index { arr, idx, .. } => one(arr) || one(idx),
@@ -4725,7 +4740,7 @@ fn frame_allocates(body: &[LS], frame: V, rets: &(std::collections::HashSet<Stri
                     *cur = saved.get(sv).copied().unwrap_or(true);
                     false
                 }
-                LS::Set(_, e) | LS::Eval(e) | LS::Puts(e, _) | LS::Print(e) | LS::PanicStr(e) | LS::Exit(e) | LS::Die(e) | LS::Lock(e) | LS::Unlock(e) => *cur && alloc(e),
+                LS::Set(_, e) | LS::Eval(e) | LS::Puts(e, _) | LS::Print(e) | LS::PanicStr(e) | LS::Exit(e) | LS::Die(e) | LS::Lock(e, _) | LS::Unlock(e) | LS::LockClearPoison(e) => *cur && alloc(e),
                 LS::Return(e) => *cur && e.as_ref().is_some_and(alloc),
                 LS::SetIndex { idx, val, .. } => *cur && (alloc(idx) || alloc(val)),
                 LS::AtomicStore(a, b) => *cur && (alloc(a) || alloc(b)),
@@ -4801,7 +4816,7 @@ fn drop_frame(body: &mut Vec<LS>, frame: V, dest: V) {
 fn stmts_allocate(ss: &[LS], rets: &(std::collections::HashSet<String>, std::collections::HashSet<String>)) -> bool {
     let alloc = |e: &LE| le_allocates(e, rets);
     ss.iter().any(|s| match s {
-        LS::Set(_, e) | LS::Eval(e) | LS::Puts(e, _) | LS::Print(e) | LS::Lock(e) | LS::Unlock(e) => alloc(e),
+        LS::Set(_, e) | LS::Eval(e) | LS::Puts(e, _) | LS::Print(e) | LS::Lock(e, _) | LS::Unlock(e) | LS::LockClearPoison(e) => alloc(e),
         LS::SetIndex { idx, val, .. } => alloc(idx) || alloc(val),
         LS::If(c, a, b) => alloc(c) || stmts_allocate(a, rets) || stmts_allocate(b, rets),
         LS::Loop(_, b) => stmts_allocate(b, rets),
@@ -4943,7 +4958,7 @@ fn visit_le(e: &LE, f: &mut dyn FnMut(&LE)) {
     f(e);
     match e {
         LE::Tup(_, xs) | LE::Prim(_, xs) | LE::Call(_, xs) | LE::Ffi(_, xs) | LE::Rt(_, xs) | LE::ArrLit(_, xs) | LE::GenNew(_, xs) => xs.iter().for_each(|x| visit_le(x, f)),
-        LE::Field(x, _) | LE::Neg(x, _) | LE::FNeg(x) | LE::Not(x) | LE::Len(x) | LE::RangeField(x, _) | LE::ChanLen(x) | LE::AtomicLoad(x) | LE::RegionOf(x) | LE::RegionBytes(x) | LE::RegionNew(x) | LE::ToP(x) | LE::AtomicNew(x) | LE::ArrWithCap(_, x) | LE::ChanNew(_, x) => visit_le(x, f),
+        LE::Field(x, _) | LE::Neg(x, _) | LE::FNeg(x) | LE::Not(x) | LE::Len(x) | LE::RangeField(x, _) | LE::ChanLen(x) | LE::LockPoisoned(x) | LE::AtomicLoad(x) | LE::RegionOf(x) | LE::RegionBytes(x) | LE::RegionNew(x) | LE::ToP(x) | LE::AtomicNew(x) | LE::ArrWithCap(_, x) | LE::ChanNew(_, x) => visit_le(x, f),
         LE::Arith(_, a, b, _) | LE::Cmp(_, a, b, _) | LE::FArith(_, a, b) | LE::PArith(_, a, b) | LE::Range(a, b, _) | LE::AtomicRmw(_, a, b) | LE::ArrNew(_, a, b, _) => {
             visit_le(a, f);
             visit_le(b, f);

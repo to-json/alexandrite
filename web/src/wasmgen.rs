@@ -117,7 +117,9 @@ const RT: &[(&str, &str)] = &[
     ("alxr_chan_close", "jjj>"),
     ("alxr_select", "jji>j"),
     ("alxr_lock_new", ">j"),
-    ("alxr_lock", "j>i"),
+    ("alxr_lock", "jjj>i"),
+    ("alxr_lock_poisoned", "j>i"),
+    ("alxr_lock_clear_poison", "j>"),
     ("alxr_unlock", "j>"),
     ("alxr_sleep", "j>i"),
     // pmap on threads (sched.rs)
@@ -1139,8 +1141,9 @@ impl<'c, 'p> Fx<'c, 'p> {
                 }
                 self.set_var(*dst);
             }
-            LS::Lock(l) => {
+            LS::Lock(l, loc) => {
                 self.e(l);
+                self.str_const(loc);
                 self.rt("alxr_lock");
                 let st = self.pop(&[I])[0];
                 self.suspend_if(st, false, k);
@@ -1242,6 +1245,10 @@ impl<'c, 'p> Fx<'c, 'p> {
                 self.e(l);
                 self.rt("alxr_unlock");
             }
+            LS::LockClearPoison(l) => {
+                self.e(l);
+                self.rt("alxr_lock_clear_poison");
+            }
             LS::AtomicStore(a, v) => {
                 let a = self.eval_locals(a)[0];
                 let v = self.eval_locals(v)[0];
@@ -1255,7 +1262,7 @@ impl<'c, 'p> Fx<'c, 'p> {
             }
             // Blocking outside a suspending function: only in code that
             // can't run (an unreachable generator).
-            LS::Wait { .. } | LS::ChanSend { .. } | LS::ChanRecv { .. } | LS::Select { .. } | LS::Lock(_) => {
+            LS::Wait { .. } | LS::ChanSend { .. } | LS::ChanRecv { .. } | LS::Select { .. } | LS::Lock(..) => {
                 self.ins().unreachable();
             }
             LS::Set(v, e) => {
@@ -1754,6 +1761,10 @@ impl<'c, 'p> Fx<'c, 'p> {
             LE::ChanLen(ch) => {
                 self.e(ch);
                 self.rt("alxr_chan_len");
+            }
+            LE::LockPoisoned(l) => {
+                self.e(l);
+                self.rt("alxr_lock_poisoned");
             }
             LE::LockNew => self.rt("alxr_lock_new"),
             LE::NullTask(_) => self.i64c(0),
@@ -2381,6 +2392,7 @@ pub(crate) fn ty_of(tys: &Tys, vars: &[LVar], e: &LE) -> LTy {
         LE::RegionProgram => LTy::Region,
         LE::ChanNew(t, _) => LTy::Chan(Box::new(t.clone())),
         LE::ChanLen(_) => LTy::I64,
+        LE::LockPoisoned(_) => LTy::Bool,
         LE::Var(v) => vars[*v].ty.clone(),
         LE::I(_) | LE::Arith(..) | LE::Neg(..) | LE::Len(_) => LTy::I64,
         LE::F(_) | LE::FArith(..) | LE::FNeg(_) | LE::Prim(Prim::UToF, _) => LTy::F64,

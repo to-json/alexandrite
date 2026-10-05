@@ -456,9 +456,13 @@ impl FnEmit<'_> {
                 let c = self.e(ch);
                 self.line(&format!("alx_chan_close({c}, {});", c_str(loc)));
             }
-            LS::Lock(l) => {
+            LS::Lock(l, loc) => {
                 let l = self.e(l);
-                self.line(&format!("alx_lock({l});"));
+                self.line(&format!("alx_lock({l}, {});", c_str(loc)));
+            }
+            LS::LockClearPoison(l) => {
+                let l = self.e(l);
+                self.line(&format!("alx_lock_clear_poison({l});"));
             }
             LS::Unlock(l) => {
                 let l = self.e(l);
@@ -690,6 +694,7 @@ impl FnEmit<'_> {
             LE::RegionProgram => "alx_region_program()".into(),
             LE::ChanNew(t, cap) => format!("alx_chan_new({}, sizeof({}))", self.e(cap), cty_mem(t)),
             LE::ChanLen(c) => format!("alx_chan_len({})", self.e(c)),
+            LE::LockPoisoned(l) => format!("alx_lock_poisoned({})", self.e(l)),
             LE::LockNew => "alx_lock_new()".into(),
             LE::NullTask(_) => "NULL".into(),
             LE::AtomicNew(v) => format!("alx_atomic_new({})", self.e(v)),

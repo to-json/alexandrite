@@ -1,0 +1,227 @@
+# NumberNode construction: Go's (*Tree).newNumber, with the part of
+# fmt.Sscan that reads a complex number.
+
+import "math"
+import "strconv"
+import "strings"
+
+TWO63 = 9223372036854775808.0
+TWO64 = 18446744073709551616.0
+
+# float64(int64(f)) == f, without relying on what an out-of-range
+# conversion gives.
+def float_is_int(f: Float) -> Bool {
+  f >= -TWO63 && f < TWO63 && f.to_i.to_f == f
+}
+
+# float64(uint64(f)) == f, likewise.
+def float_is_uint(f: Float) -> Bool {
+  return false if !(f >= 0.0 && f < TWO64)
+  float_to_uint(f).to_f == f
+}
+
+pub def float_to_uint(f: Float) -> U64 {
+  if f >= TWO63 {
+    top: U64 = 9223372036854775808
+    return (f - TWO63).to_i.as_u64 +% top
+  }
+  f.to_i.as_u64
+}
+
+# A number node for the literal `text` of item type `typ`. The value is
+# parsed and stored under all the types that can represent the value.
+# This simulates in a small amount of code the behavior of Go's ideal
+# constants.
+def new_number(pos: Int, text: Str, typ: Int) -> ~N<ParseError> {
+  n = blank(NODE_NUMBER, pos)
+  n.text = text
+  if typ == ITEM_CHAR_CONSTANT {
+    rr = strconv.unquote_char(text[1...text.size], text[0])
+    if rr.err? {
+      fail ParseError.Msg(text: "invalid syntax")
+    }
+    r, _, tail = rr.unwrap
+    if tail != "'" {
+      fail ParseError.Msg(text: "malformed character constant: #{text}")
+    }
+    n.int64 = r.to_i
+    n.is_int = true
+    n.uint64 = r.to_i.as_u64
+    n.is_uint = true
+    # odd but those are the rules.
+    n.float64 = r.to_i.to_f
+    n.is_float = true
+    return n
+  }
+  if typ == ITEM_COMPLEX {
+    c = ~sscan_complex(text)
+    n.is_complex = true
+    n.complex128 = c
+    return simplify_complex(n)
+  }
+  # Imaginary constants can only be complex unless they are zero.
+  if text.size > 0 && text[text.size - 1] == 105 {
+    fr = strconv.parse_float(text[0...text.size - 1])
+    if f = fr.ok {
+      n.is_complex = true
+      n.complex128 = Complex.new(0.0, f)
+      return simplify_complex(n)
+    }
+  }
+  # Do integer test first so we get 0x123 etc.
+  # will fail for -0; fixed below.
+  ur = strconv.parse_uint(text, 0, 64)
+  u = 0.as_u64
+  if v = ur.ok {
+    n.is_uint = true
+    n.uint64 = v
+    u = v
+  }
+  ir = strconv.parse_int(text, 0, 64)
+  if i = ir.ok {
+    n.is_int = true
+    n.int64 = i
+    if i == 0 {
+      # in case of -0.
+      n.is_uint = true
+      n.uint64 = u
+    }
+  }
+  # If an integer extraction succeeded, promote the float.
+  if n.is_int {
+    n.is_float = true
+    n.float64 = n.int64.to_f
+  } else if n.is_uint {
+    n.is_float = true
+    n.float64 = n.uint64.to_f
+  } else {
+    fr = strconv.parse_float(text)
+    if f = fr.ok {
+      # If we parsed it as a float but it looks like an integer, it's a
+      # huge number too large to fit in an int. Reject it.
+      if !strings.contains_any(text, ".eEpP") {
+        fail ParseError.Msg(text: "integer overflow: #{strconv.quote(text)}")
+      }
+      n.is_float = true
+      n.float64 = f
+      # If a floating-point extraction succeeded, extract the int if needed.
+      if !n.is_int && float_is_int(f) {
+        n.is_int = true
+        n.int64 = f.to_i
+      }
+      if !n.is_uint && float_is_uint(f) {
+        n.is_uint = true
+        n.uint64 = float_to_uint(f)
+      }
+    }
+  }
+  if !n.is_int && !n.is_uint && !n.is_float {
+    fail ParseError.Msg(text: "illegal number syntax: #{strconv.quote(text)}")
+  }
+  n
+}
+
+# Pulls out any other types that are represented by the complex number.
+# These all require that the imaginary part be zero.
+def simplify_complex(n0: N) -> N {
+  n = n0
+  n.is_float = n.complex128.imag == 0.0
+  if n.is_float {
+    n.float64 = n.complex128.real
+    n.is_int = float_is_int(n.float64)
+    n.int64 = n.float64.to_i if n.is_int
+    n.is_uint = float_is_uint(n.float64)
+    n.uint64 = float_to_uint(n.float64) if n.is_uint
+  }
+  n
+}
+
+# fmt.Sscan(text, &complex128): "(re+imi)" or "re+imi".
+pub def sscan_complex(text: Str) -> ~Complex<ParseError> {
+  sc = Scan.new(s: text)
+  # skip leading space
+  while sc.p < text.size && (text[sc.p] == 32 || text[sc.p] == 9 || text[sc.p] == 10 || text[sc.p] == 13) {
+    sc.p += 1
+  }
+  bad = ParseError.Msg(text: "syntax error scanning complex number")
+  fail ParseError.Msg(text: "unexpected EOF") if sc.p >= text.size
+  parens = sc.accept!("(")
+  re = sc.float_token!
+  # Must now have a sign.
+  fail bad if !sc.accept!("+-")
+  sign = text[sc.p - 1...sc.p]
+  im = sc.float_token!
+  fail bad if !sc.accept!("i")
+  fail bad if parens && !sc.accept!(")")
+  r = ~convert_float(re)
+  i = ~convert_float(sign + im)
+  Complex.new(r, i)
+}
+
+def convert_float(s: Str) -> ~Float<ParseError> {
+  p = s.byteindex("p")
+  if p >= 0 && !(strings.contains(s, "x") || strings.contains(s, "X")) {
+    fr = strconv.parse_float(s[0...p])
+    if e = fr.err {
+      fail ParseError.Msg(text: e.message)
+    }
+    mr = strconv.atoi(s[p + 1...s.size])
+    if e = mr.err {
+      fail ParseError.Msg(text: e.message)
+    }
+    return math.ldexp(fr.unwrap, mr.unwrap)
+  }
+  fr = strconv.parse_float(s)
+  if e = fr.err {
+    fail ParseError.Msg(text: e.message)
+  }
+  fr.unwrap
+}
+
+struct Scan {
+  s: Str
+  p: Int
+
+  def accept!(set: Str) -> Bool {
+    if p < s.size && set.byteindex(s[p...p + 1]) >= 0 {
+      self.p += 1
+      return true
+    }
+    false
+  }
+
+  def float_token! -> Str {
+    st = p
+    # NaN?
+    if accept!("nN") && accept!("aA") && accept!("nN") {
+      return s[st...p]
+    }
+    # leading sign?
+    accept!("+-")
+    # Inf?
+    if accept!("iI") && accept!("nN") && accept!("fF") {
+      return s[st...p]
+    }
+    digits = "0123456789_"
+    exp = "eEpP"
+    if accept!("0") && accept!("xX") {
+      digits = "0123456789aAbBcCdDeEfF_"
+      exp = "pP"
+    }
+    # digits?
+    while accept!(digits) {}
+    # decimal point?
+    if accept!(".") {
+      # fraction?
+      while accept!(digits) {}
+    }
+    # exponent?
+    if accept!(exp) {
+      # leading sign?
+      accept!("+-")
+      # digits?
+      while accept!("0123456789_") {}
+    }
+    s[st...p]
+  }
+}

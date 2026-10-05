@@ -99,11 +99,13 @@ struct Task {
     /// Ok(pointer to the value) or Err(panic message).
     result: Option<Result<i64, String>>,
     waiters: Vec<Waiter>,
+    /// The locks it holds, oldest first (lock blocks nest).
+    held: Vec<usize>,
 }
 
 impl Task {
     fn new(worker: i64, env: i64) -> Task {
-        Task { worker, env, frames: vec![], state: State::Runnable, epoch: 0, fired: None, result: None, waiters: vec![] }
+        Task { worker, env, frames: vec![], state: State::Runnable, epoch: 0, fired: None, result: None, waiters: vec![], held: vec![] }
     }
 }
 
@@ -124,6 +126,8 @@ struct Chan {
 
 struct Lock {
     held: bool,
+    /// A holder panicked (until `clear_poison!`).
+    poisoned: bool,
     q: VecDeque<Waiter>,
 }
 
@@ -186,6 +190,8 @@ thread_local! {
     static PANIC: RefCell<Option<String>> = const { RefCell::new(None) };
     /// The `pmap` job this helper thread is working on (-1: none).
     static HELPING: Cell<i64> = const { Cell::new(-1) };
+    /// The locks this helper thread holds in a pmap element (oldest first).
+    static HELPER_HELD: RefCell<Vec<usize>> = const { RefCell::new(Vec::new()) };
 }
 
 fn s() -> MutexGuard<'static, Sched> {
@@ -535,7 +541,11 @@ pub fn run_failed(how: i32, msg: String) {
 #[wasm_bindgen]
 pub fn task_failed() {
     let msg = PANIC.with(|p| p.borrow_mut().take()).unwrap_or_else(|| "alexandrite: task failed".into());
-    s().finish(cur(), Err(msg));
+    let mut s = s();
+    let t = cur();
+    let held = std::mem::take(&mut s.tasks[t].held);
+    s.poison(held);
+    s.finish(t, Err(msg));
 }
 
 /// A `pmap` element panicked while this helper ran it (JS caught `alx:pmap`).
@@ -545,6 +555,8 @@ pub fn pmap_failed() {
     let msg = PANIC.with(|p| p.borrow_mut().take()).unwrap_or_else(|| "alexandrite: pmap failed".into());
     if j >= 0 {
         let mut s = s();
+        let held = HELPER_HELD.with(|h| std::mem::take(&mut *h.borrow_mut()));
+        s.poison(held);
         let job = &mut s.jobs[j as usize];
         job.panic.get_or_insert(msg);
         job.done += 1;
@@ -890,40 +902,106 @@ pub extern "C" fn alxr_select(cs: i64, n: i64, default: i32) -> i64 {
 
 // ---------- locks ----------
 
+// Each holder keeps the locks it holds (`Task::held`; a pmap helper thread,
+// `HELPER_HELD`). A panic releases them and marks them poisoned; taking a
+// poisoned lock panics until `clear_poison!`.
+
 #[unsafe(no_mangle)]
 pub extern "C" fn alxr_lock_new() -> i64 {
     let mut s = s();
-    s.locks.push(Lock { held: false, q: VecDeque::new() });
+    s.locks.push(Lock { held: false, poisoned: false, q: VecDeque::new() });
     (s.locks.len() - 1) as i64
 }
 
+const POISONED: &str = "Mutex poisoned: a task panicked while holding it";
+
 /// 0: taken; -1: suspend (the unlocker hands it over).
 #[unsafe(no_mangle)]
-pub extern "C" fn alxr_lock(l: i64) -> i32 {
-    let mut s = s();
-    if let Some(Fired::Woke) = s.take_fired() {
-        return 0;
-    }
-    let lk = &mut s.locks[l as usize];
-    if !lk.held {
-        lk.held = true;
-        return 0;
-    }
-    let me = s.me();
-    s.locks[l as usize].q.push_back(me);
-    s.park()
+pub extern "C" fn alxr_lock(l: i64, lp: i64, ln: i64) -> i32 {
+    let l = l as usize;
+    raise((|| {
+        let mut s = s();
+        if let Some(Fired::Woke) = s.take_fired() {
+            // Handed over.
+            if s.locks[l].poisoned {
+                s.release(l);
+                return Err((POISONED, loc_str(lp, ln)));
+            }
+            s.hold(l);
+            return Ok(0);
+        }
+        let lk = &mut s.locks[l];
+        if !lk.held {
+            if lk.poisoned {
+                return Err((POISONED, loc_str(lp, ln)));
+            }
+            lk.held = true;
+            s.hold(l);
+            return Ok(0);
+        }
+        let me = s.me();
+        s.locks[l].q.push_back(me);
+        Ok(s.park())
+    })())
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn alxr_unlock(l: i64) {
+    let l = l as usize;
     let mut s = s();
-    while let Some(w) = s.locks[l as usize].q.pop_front() {
-        // Handed over: it stays held.
-        if s.fire(w, Fired::Woke) {
-            return;
+    let drop_held = |h: &mut Vec<usize>| {
+        if let Some(i) = h.iter().rposition(|&x| x == l) {
+            h.remove(i);
+        }
+    };
+    if HELPING.with(|h| h.get()) >= 0 {
+        HELPER_HELD.with(|h| drop_held(&mut h.borrow_mut()));
+    } else {
+        let t = cur();
+        drop_held(&mut s.tasks[t].held);
+    }
+    s.release(l);
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn alxr_lock_poisoned(l: i64) -> i32 {
+    s().locks[l as usize].poisoned as i32
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn alxr_lock_clear_poison(l: i64) {
+    s().locks[l as usize].poisoned = false;
+}
+
+impl Sched {
+    /// The current holder took lock `l`.
+    fn hold(&mut self, l: usize) {
+        if HELPING.with(|h| h.get()) >= 0 {
+            HELPER_HELD.with(|h| h.borrow_mut().push(l));
+        } else {
+            let t = cur();
+            self.tasks[t].held.push(l);
         }
     }
-    s.locks[l as usize].held = false;
+
+    /// Hand lock `l` to a waiter, or free it.
+    fn release(&mut self, l: usize) {
+        while let Some(w) = self.locks[l].q.pop_front() {
+            // Handed over: it stays held.
+            if self.fire(w, Fired::Woke) {
+                return;
+            }
+        }
+        self.locks[l].held = false;
+    }
+
+    /// After a panic: release the locks in `held` (newest last) and poison them.
+    fn poison(&mut self, held: Vec<usize>) {
+        for l in held.into_iter().rev() {
+            self.locks[l].poisoned = true;
+            self.release(l);
+        }
+    }
 }
 
 // ---------- time ----------

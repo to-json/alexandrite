@@ -143,6 +143,8 @@ pub enum LE {
     ChanNew(LTy, Box<LE>),
     /// The number of values buffered in a channel right now (I64).
     ChanLen(Box<LE>),
+    /// Whether a holder of the lock panicked (Bool) since `LockClearPoison`.
+    LockPoisoned(Box<LE>),
     /// A new, unheld lock.
     LockNew,
     /// A task handle that names no task (an LTy::Task's zero value; never waited on).
@@ -417,10 +419,15 @@ pub enum LS {
     /// Close `ch`; receivers drain what's buffered, then see `ok` = false.
     /// Closing twice panics at `loc`.
     ChanClose { ch: LE, loc: String },
-    /// Take the lock, blocking (the task) while another holder has it.
-    Lock(LE),
+    /// Take the lock, blocking (the task) while another holder has it. The
+    /// runtime remembers it as held by this task: if the task panics, the
+    /// lock is released and poisoned, and taking a poisoned lock panics at
+    /// `loc` (the String).
+    Lock(LE, String),
     /// Release the lock (held by this task) and wake a waiter.
     Unlock(LE),
+    /// Clear the lock's poisoned mark.
+    LockClearPoison(LE),
     /// Store into an atomic cell.
     AtomicStore(LE, LE),
     /// Run one ready case, chosen fairly (random among the ready ones);

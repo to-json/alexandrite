@@ -268,6 +268,22 @@ impl Ck<'_> {
                 }
                 self.use_of(*l, e.span);
             }
+            TK::M(M::TaskWait, Some(r), _, _) if matches!(&r.kind, TK::M(M::Spawn, ..)) => {
+                // `(spawn { ... }).wait` (what `assert_panics` makes): the
+                // task is over before anything else runs, so its captures
+                // are only used, not handed over.
+                let TK::M(_, _, caps, blk) = &r.kind else { unreachable!() };
+                for c in caps {
+                    self.expr(c);
+                }
+                if let Some(b) = blk {
+                    let saved = std::mem::take(&mut self.moved);
+                    let saved_loops = std::mem::take(&mut self.loops);
+                    self.stmts(&b.body);
+                    self.loops = saved_loops;
+                    self.moved = saved;
+                }
+            }
             TK::M(M::Spawn, _, caps, blk) => {
                 // Capturing is a use; then the captures belong to the task.
                 for c in caps {

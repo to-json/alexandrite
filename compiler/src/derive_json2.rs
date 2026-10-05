@@ -196,7 +196,11 @@ impl<'a> G<'a> {
             K::Str => format!("{x}.size == 0"),
             K::Complex => format!("({x}.real == 0.0 && {x}.imag == 0.0)"),
             K::Bytes | K::Arr(_) | K::Map(..) => format!("{x}.size == 0"),
-            K::FixedBytes(_) | K::Fixed(..) => format!("{x} == {}", self.zero(t)?),
+            K::FixedBytes(_) => format!("{x}.all? {{ |_w| _w == 0 }}"),
+            K::Fixed(e, _) => {
+                let w = format!("_w{}", x.len());
+                format!("{x}.all? {{ |{w}| {} }}", self.is_zero(e, &w)?)
+            }
             K::Opt(_) => format!("{x}.none?"),
             K::Tuple(ts) => {
                 if ts.is_empty() {
@@ -293,7 +297,8 @@ impl<'a> G<'a> {
                 };
                 let fk = self.enc_lambda(kt, ind)?;
                 let fv = self.enc_lambda(vt, ind)?;
-                self.w(ind, format!("~{j}.marshal_map({e}, {x}, {o}, {gt}, {uniq}, {fk}, {fv})"));
+                let tk = lit(&self.go(kt)?);
+                self.w(ind, format!("~{j}.marshal_map({e}, {x}, {o}, {gt}, {tk}, {uniq}, {fk}, {fv})"));
             }
             K::Tuple(ts) => {
                 let names: Vec<String> = ts.iter().map(|_| self.fresh("t")).collect();
@@ -435,10 +440,20 @@ pub fn json2_source(job: &DeriveJob, go_name: &str, c: &Ctx) -> Result<String, D
     }
     let mut g = G { c, tparams: &job.tparams, out: String::new(), n: 0 };
     let (j, jt, name) = (c.j, c.t, job.name.as_str());
-    let gt = lit(go_name);
+    // A transparent struct is its field, also in Go's type names.
+    let tfield = match (&job.shape, job.transparent) {
+        (DShape::Struct(fields), true) => Some(crate::derive::transparent_field(fields).map_err(fail)?),
+        _ => None,
+    };
+    let go_name = match (tfield, &job.go_name) {
+        (Some(f), None) => g.go(&f.ty).map_err(fail)?,
+        _ => go_name.to_string(),
+    };
+    let gt = lit(&go_name);
     g.w(0, format!("struct {name} {{"));
     g.w(1, format!("pub def json_v2_type -> Str {{ {gt} }}"));
     match &job.shape {
+        DShape::Struct(_) if tfield.is_some() => transparent_methods(&mut g, job, tfield.unwrap()).map_err(fail)?,
         DShape::Struct(fields) => struct_methods(&mut g, job, fields, &gt).map_err(fail)?,
         DShape::Enum(vs) => enum_methods(&mut g, job, vs, &gt).map_err(fail)?,
     }
@@ -473,6 +488,26 @@ fn unhook_prelude(g: &mut G, name: &str) {
     g.w(2, "}");
 }
 
+fn transparent_methods<'a>(g: &mut G<'a>, job: &'a DeriveJob, f: &'a DField) -> GR<()> {
+    let jt = g.c.t.to_string();
+    let name = job.name.as_str();
+    let z = g.is_zero(&f.ty, &format!("self.{}", f.name))?;
+    g.w(1, format!("pub def json_v2_is_zero -> Bool {{ {z} }}"));
+    g.w(1, format!("pub def json_v2_enc(_e: {jt}.Encoder, _o: {jt}.Options) -> ~Unit<Error> {{"));
+    hook_prelude(g, name);
+    g.enc(&f.ty, &format!("self.{}", f.name), "_e", "_o", 2)?;
+    g.w(2, "nil");
+    g.w(1, "}");
+    g.w(1, format!("pub def json_v2_dec(_d: {jt}.Decoder, _o: {jt}.Options) -> ~{name}<Error> {{"));
+    unhook_prelude(g, name);
+    g.dec(&f.ty, &format!("self.{}", f.name), "_d", "_o", "_v", 2)?;
+    g.w(2, "_r = self");
+    g.w(2, format!("_r.{} = _v", f.name));
+    g.w(2, "_r");
+    g.w(1, "}");
+    Ok(())
+}
+
 fn struct_methods<'a>(g: &mut G<'a>, job: &'a DeriveJob, fields: &'a [DField], gt: &str) -> GR<()> {
     let (j, jt) = (g.c.j.to_string(), g.c.t.to_string());
     let name = job.name.as_str();
@@ -504,17 +539,22 @@ fn struct_methods<'a>(g: &mut G<'a>, job: &'a DeriveJob, fields: &'a [DField], g
     // ---- encoding
     g.w(1, format!("pub def json_v2_enc(_e: {jt}.Encoder, _o: {jt}.Options) -> ~Unit<Error> {{"));
     hook_prelude(g, name);
+    let fmt_field = live.iter().find(|f| f.opts.format.is_some()).map(|f| f.opts.drename.clone().unwrap_or_else(|| f.name.clone()));
+    if let Some(ff) = &fmt_field {
+        g.w(2, format!("fail {j}.unsupported_format_enc(_e, {gt}, {}) if !_o.get({jt}.F_FORMAT_TAG_SUPPORTED)", lit(ff)));
+    }
     g.w(2, format!("_fo = ~{j}.begin_struct(_e, _o, {gt})"));
-    g.w(2, "_p0 = self.~json_v2_fields_enc(_e, _fo, \"\")");
+    g.w(2, format!("_w = self.~json_v2_fields_enc(_e, _fo, {j}.no_names)"));
     if let Some(f) = fallback {
-        let known: Vec<String> = direct.iter().map(|f| lit(&json_name(f))).collect();
-        let known = format!("[{}]", known.join(", "));
-        let known = if known == "[]" { format!("{{ _k: [Str] = []; _k }}") } else { known };
+        let names: Vec<String> = direct.iter().map(|f| lit(&json_name(f))).collect();
+        let casings: Vec<String> = direct.iter().map(|f| f.opts.casing.to_string()).collect();
+        let (names, casings) = if names.is_empty() { (format!("{j}.no_names"), format!("{j}.no_casings")) } else { (format!("[{}]", names.join(", ")), format!("[{}]", casings.join(", "))) };
+        g.w(2, format!("_fb = {j}.Fallback.new(seen: _w, names: {names}, casings: {casings})"));
         match g.kind(&f.ty)? {
-            K::Raw => g.w(2, format!("~{j}.marshal_fallback_raw(_e, _fo, self.{}, {known})", f.name)),
+            K::Raw => g.w(2, format!("~{j}.marshal_fallback_raw(_e, _fo, self.{}, _fb)", f.name)),
             K::Map(_, vt) => {
                 let fv = g.enc_lambda(vt, 2)?;
-                g.w(2, format!("~{j}.marshal_fallback_map(_e, _fo, self.{}, {known}, {fv})", f.name));
+                g.w(2, format!("~{j}.marshal_fallback_map(_e, _fo, self.{}, _fb, {fv})", f.name));
             }
             _ => unreachable!(),
         }
@@ -522,13 +562,15 @@ fn struct_methods<'a>(g: &mut G<'a>, job: &'a DeriveJob, fields: &'a [DField], g
     g.w(2, format!("~{j}.end_struct(_e)"));
     g.w(1, "}");
     // ---- the members (also what an embedding struct writes)
-    g.w(1, format!("pub def json_v2_fields_enc(_e: {jt}.Encoder, _fo: {jt}.Options, _prev0: Str) -> ~Str<Error> {{"));
-    g.w(2, "_prev = _prev0");
+    // `_w`: the names written so far (the last one is what an omitempty
+    // member that is taken back out restores).
+    g.w(1, format!("pub def json_v2_fields_enc(_e: {jt}.Encoder, _fo: {jt}.Options, _w0: [Str]) -> ~[Str]<Error> {{"));
+    g.w(2, "_w = _w0");
     g.w(2, format!("_oz = _fo.get({jt}.F_OMIT_ZERO_STRUCT_FIELDS)"));
     for f in &members {
         let x = format!("self.{}", f.name);
         if f.opts.embed {
-            g.w(2, format!("_prev = {x}.~json_v2_fields_enc(_e, _fo, _prev)"));
+            g.w(2, format!("_w = {x}.~json_v2_fields_enc(_e, _fo, _w)"));
             continue;
         }
         let zero = g.is_zero(&f.ty, &x)?;
@@ -545,13 +587,13 @@ fn struct_methods<'a>(g: &mut G<'a>, job: &'a DeriveJob, fields: &'a [DField], g
         g.w(3, format!("{ov} = {fo}"));
         g.enc(&f.ty, &x, "_e", &ov, 3)?;
         if f.opts.omit_empty && fast.is_none() {
-            g.w(3, format!("_prev = {} if !{j}.unwrite_if_empty(_e, _prev)", lit(&jn)));
+            g.w(3, format!("_w << {} if !{j}.unwrite_if_empty(_e, {j}.last_name(_w))", lit(&jn)));
         } else {
-            g.w(3, format!("_prev = {}", lit(&jn)));
+            g.w(3, format!("_w << {}", lit(&jn)));
         }
         g.w(2, "}");
     }
-    g.w(2, "_prev");
+    g.w(2, "_w");
     g.w(1, "}");
     // ---- name lookup: (canonical name, ambiguous?)
     g.w(1, format!("pub def self.json_v2_lookup(_name: Str, _o: {jt}.Options) -> (Str, Bool) {{"));
@@ -623,6 +665,9 @@ fn struct_methods<'a>(g: &mut G<'a>, job: &'a DeriveJob, fields: &'a [DField], g
     g.w(1, format!("pub def json_v2_dec(_d: {jt}.Decoder, _o: {jt}.Options) -> ~{name}<Error> {{"));
     unhook_prelude(g, name);
     g.w(2, format!("return {name}.json_zero if !~{j}.begin_struct_dec(_d, _o, {gt})"));
+    if let Some(ff) = &fmt_field {
+        g.w(2, format!("fail {j}.unsupported_format_dec(_d, {gt}, {}) if !_o.get({jt}.F_FORMAT_TAG_SUPPORTED)", lit(ff)));
+    }
     g.w(2, format!("_fo = {j}.inner_opts(_o)"));
     g.w(2, "_r = self");
     g.w(2, "_seen: Map[Str, Bool] = {}");

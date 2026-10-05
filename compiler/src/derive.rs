@@ -254,6 +254,18 @@ fn unescape(s: &str) -> String {
     out
 }
 
+/// Is this attribute `#[json(transparent)]` (before a type)? Other `json(...)`
+/// attributes there are an error.
+pub fn is_transparent_attr(text: &str, sp: Span) -> Result<bool, Diag> {
+    let t = text.trim();
+    let Some(r) = t.strip_prefix("json") else { return Ok(false) };
+    let inner = r.trim_start().strip_prefix('(').and_then(|r| r.trim_end().strip_suffix(')')).map(str::trim);
+    match inner {
+        Some("transparent") => Ok(true),
+        _ => Err(Diag::new(sp, format!("unknown attribute `#[{text}]` on a type")).note("before a type: #[json(transparent)] (a one-field struct encoded as its field); #[json(...)] options go on fields")),
+    }
+}
+
 /// The names in `#[derive(A, B)]`.
 pub fn derive_names(text: &str, sp: Span) -> Result<Option<Vec<String>>, Diag> {
     let Some(rest) = text.trim().strip_prefix("derive") else { return Ok(None) };
@@ -294,6 +306,8 @@ pub struct DeriveJob {
     pub name: String,
     /// `#[data("pkg.T")]`: the Go type name consumers see (json/v2 errors).
     pub go_name: Option<String>,
+    /// `#[json(transparent)]`: a struct with one field is encoded as that field.
+    pub transparent: bool,
     pub tparams: Vec<String>,
     pub public: bool,
     pub span: Span,
@@ -413,6 +427,10 @@ enum Ty<'a> {
 
 struct Gen<'a> {
     alias: &'a str,
+    /// In a file that uses encoding/json/v2, a field type v1 has no encoding
+    /// for (fixed arrays, non-Str map keys, Complex) fails at run time in v1
+    /// instead of failing the derive.
+    lenient: bool,
     tparams: &'a [String],
     types: &'a ModuleTypes,
     owner: &'a str,
@@ -482,6 +500,9 @@ impl<'a> Gen<'a> {
     /// becomes one interpolated string, so a record costs one allocation and one
     /// push into the encoder, however many fields it has.
     fn enc(&mut self, t: &'a TypeExpr, x: &str, ind: usize) -> GResult<Vec<Frag>> {
+        if self.lenient && self.classify(t).is_err() && self.zero(t).is_some() {
+            return Ok(vec![Frag::Ex(format!("_e.unsupported!({})", lit(&type_src(t))))]);
+        }
         Ok(match self.classify(t)? {
             Ty::Int(_) | Ty::Bool => vec![Frag::Ex(x.to_string())],
             Ty::Float => vec![Frag::Ex(format!("_e.f!({x})"))],
@@ -592,6 +613,14 @@ impl<'a> Gen<'a> {
 
     /// Statements that read a value of type `t` from `d` into a new local `dest`.
     fn dec(&mut self, t: &'a TypeExpr, dest: &str, ind: usize) -> GResult<()> {
+        if self.lenient && self.classify(t).is_err() {
+            if let Some(z) = self.zero(t) {
+                self.w(ind, format!("{dest}: {} = {z}", type_src(t)));
+                self.w(ind, "_d.skip!");
+                self.w(ind, format!("_d.fail!({}.JsonError.Unsupported({}))", self.alias, lit(&format!("type {}", type_src(t)))));
+                return Ok(());
+            }
+        }
         match self.classify(t)? {
             Ty::Int(k) => match k {
                 IntKind::I64 => self.w(ind, format!("{dest} = _d.int!")),
@@ -649,6 +678,15 @@ impl<'a> Gen<'a> {
 
 }
 
+/// The one field of a `#[json(transparent)]` struct.
+pub fn transparent_field(fields: &[DField]) -> Result<&DField, String> {
+    let live: Vec<&DField> = fields.iter().filter(|f| !f.opts.skip).collect();
+    match live.as_slice() {
+        [f] => Ok(f),
+        _ => Err("#[json(transparent)] needs exactly one (non-skipped) field".to_string()),
+    }
+}
+
 fn check_keys<'a>(fields: impl Iterator<Item = &'a DField>, what: &str) -> Result<(), String> {
     let mut seen: HashSet<String> = HashSet::new();
     for f in fields {
@@ -664,9 +702,9 @@ fn check_keys<'a>(fields: impl Iterator<Item = &'a DField>, what: &str) -> Resul
 }
 
 /// The source text of `struct Name[T] { defs }` holding the derived methods.
-pub fn json_source(job: &DeriveJob, alias: &str, types: &ModuleTypes) -> Result<String, Diag> {
+pub fn json_source(job: &DeriveJob, alias: &str, types: &ModuleTypes, lenient: bool) -> Result<String, Diag> {
     let fail = |m: String| Diag::new(job.span, format!("derive(Json) on `{}`: {m}", job.name));
-    let mut g = Gen { alias, tparams: &job.tparams, types, owner: &job.name, out: String::new(), n: 0 };
+    let mut g = Gen { alias, lenient, tparams: &job.tparams, types, owner: &job.name, out: String::new(), n: 0 };
     if !job.tparams.is_empty() {
         return Err(fail("generic types can't derive Json yet; derive it on a concrete wrapper, or write json_enc / json_dec by hand".to_string()));
     }
@@ -677,6 +715,11 @@ pub fn json_source(job: &DeriveJob, alias: &str, types: &ModuleTypes) -> Result<
     // ---- encoding
     g.w(1, format!("{pubk}def json_str(_e: {a}.Encoder) -> Str {{"));
     match &job.shape {
+        DShape::Struct(fields) if job.transparent => {
+            let f = transparent_field(fields).map_err(&fail)?;
+            let fr = g.enc(&f.ty, &format!("self.{}", f.name), 2).map_err(&fail)?;
+            g.w(2, frags_expr(&fr));
+        }
         DShape::Struct(fields) => {
             check_keys(fields.iter(), "").map_err(&fail)?;
             let vals: Vec<String> = fields.iter().map(|f| format!("self.{}", f.name)).collect();
@@ -759,6 +802,11 @@ pub fn json_source(job: &DeriveJob, alias: &str, types: &ModuleTypes) -> Result<
     let mut helpers = String::new();
     g.w(1, format!("{pubk}def self.json_dec(_d: {a}.Decoder) -> {name} {{"));
     match &job.shape {
+        DShape::Struct(fields) if job.transparent => {
+            let f = transparent_field(fields).map_err(&fail)?;
+            g.dec(&f.ty, "_v", 2).map_err(&fail)?;
+            g.w(2, format!("{name}.new({}: _v)", f.name));
+        }
         DShape::Struct(fields) => {
             g.w(2, format!("_r = {name}.new"));
             g.w(2, "if _d.open_obj! {");
@@ -927,6 +975,11 @@ impl<'a> Gen<'a> {
             TypeExpr::Named(n, _) if n == "Str" => "\"\"".into(),
             TypeExpr::Named(n, _) if !self.tparams.contains(n) => format!("{n}.json_zero"),
             TypeExpr::Array(..) => "[]".into(),
+            TypeExpr::Fixed(e, n, _) => match &n.kind {
+                ExprKind::Int(v) => format!("[{}; {v}]", self.zero(e)?),
+                _ => return None,
+            },
+            TypeExpr::Named(n, _) if n == "Complex" => "Complex.new(0.0, 0.0)".into(),
             TypeExpr::App(n, ..) if n == "Map" => "{}".into(),
             TypeExpr::Opt(..) => "none".into(),
             TypeExpr::Tuple(ts, _) => format!("({})", ts.iter().map(|t| self.zero(t)).collect::<Option<Vec<_>>>()?.join(", ")),

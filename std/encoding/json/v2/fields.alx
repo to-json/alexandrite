@@ -95,6 +95,16 @@ pub def unwrite_if_empty(e: jsontext.Encoder, prev: Str) -> Bool {
   e.unwrite_empty_object_member!(prev == "" ? none : prev)
 }
 
+# Go's error for a struct with a `format:` tag option when format tags
+# aren't enabled (they are experimental in Go 1.27: experimental_support_format_tag).
+pub def unsupported_format_enc(e: jsontext.Encoder, t: Str, field: Str) -> JsonError {
+  marshal_error_before(e, t, ErrCause.Msg(text: "Go struct field " + field + " has unsupported `format` tag option"))
+}
+
+pub def unsupported_format_dec(d: jsontext.Decoder, t: Str, field: Str) -> JsonError {
+  unmarshal_error_after(d, t, ErrCause.Msg(text: "Go struct field " + field + " has unsupported `format` tag option"))
+}
+
 # ------------------------------------------------------------------ structs: unmarshal
 
 # Starts reading a struct: the token was read; true for an object (then
@@ -150,8 +160,55 @@ pub def duplicate_field_error(d: jsontext.Decoder, raw_len: Int) -> jsontext.Jso
 
 # ------------------------------------------------------------------ embedded fallbacks
 
+# An empty list of names (for generated code).
+pub def no_names -> [Str] {
+  n: [Str] = []
+  n
+}
+
+pub def no_casings -> [Int] {
+  n: [Int] = []
+  n
+}
+
+# The last name written ("" if none).
+pub def last_name(w: [Str]) -> Str { w.size > 0 ? w[w.size - 1] : "" }
+
+# What an embedded fallback's members are checked against (Go's
+# insertUnquotedName): the struct's fields (a member named like one, exactly
+# or by its folded name, is a duplicate only if that field was written) and
+# the object's other names.
+pub struct Fallback {
+  seen: [Str]
+  names: [Str]
+  casings: [Int]
+
+  # Whether name may be written; records it.
+  def insert!(e: jsontext.Encoder, name: Str, o: jsontext.Options) -> Bool {
+    hit = ""
+    if names.include?(name) {
+      hit = name
+    } else {
+      folded = fold_name(name)
+      for i in 0...names.size {
+        if fold_name(names[i]) == folded && match_folded(name, names[i], casings[i], o) {
+          hit = names[i]
+          break
+        }
+      }
+    }
+    if hit != "" {
+      return false if seen.include?(hit)
+      self.seen << hit
+      return true
+    }
+    e.insert_namespace_name!(name)
+  }
+}
+
 # Writes the members of a jsontext.Value field tagged `embed` (an object).
-pub def marshal_fallback_raw(e: jsontext.Encoder, o: jsontext.Options, v: jsontext.Value, known: [Str]) -> ~Unit<Error> {
+pub def marshal_fallback_raw(e: jsontext.Encoder, o: jsontext.Options, v: jsontext.Value, fb0: Fallback) -> ~Unit<Error> {
+  fb = fb0
   return nil if v.raw.size == 0
   t = "jsontext.Value"
   d = jsontext.new_bytes_decoder(v.raw, [jsontext.allow_duplicate_names(true), jsontext.allow_invalid_utf8(true)])
@@ -172,7 +229,7 @@ pub def marshal_fallback_raw(e: jsontext.Encoder, o: jsontext.Options, v: jsonte
     name_raw = nv || []
     if check {
       name = Str.from_bytes(jsontext.unquote_may_copy(name_raw, verbatim))
-      if known.include?(name) || !e.insert_namespace_name!(name) {
+      if !fb.insert!(e, name, o) {
         fail duplicate_name_error(e.stack_pointer.parent, name, e.output_offset)
       }
     }
@@ -214,7 +271,8 @@ pub def unmarshal_fallback_raw(d: jsontext.Decoder, cur: jsontext.Value, quoted:
 }
 
 # Writes the entries of a Map[Str, V] field tagged `embed`.
-pub def marshal_fallback_map[V](e: jsontext.Encoder, o: jsontext.Options, m: Map[Str, V], known: [Str], fv: (jsontext.Encoder, V, jsontext.Options) -> ~Unit<Error>) -> ~Unit<Error> {
+pub def marshal_fallback_map[V](e: jsontext.Encoder, o: jsontext.Options, m: Map[Str, V], fb0: Fallback, fv: (jsontext.Encoder, V, jsontext.Options) -> ~Unit<Error>) -> ~Unit<Error> {
+  fb = fb0
   return nil if m.size == 0
   check = !o.get(jsontext.F_ALLOW_DUPLICATE_NAMES)
   names: [Str] = []
@@ -223,8 +281,14 @@ pub def marshal_fallback_map[V](e: jsontext.Encoder, o: jsontext.Options, m: Map
     names = names.sort
   }
   for k in names {
-    if check && (known.include?(k) || !e.insert_namespace_name!(k)) {
-      fail duplicate_name_error(e.stack_pointer.parent, k, e.output_offset)
+    if check {
+      # The name as written (invalid UTF-8 mangled, when allowed).
+      q, _err = jsontext.append_quote_opts([], k.bytes, o)
+      u, _err2 = jsontext.unquote_into([], q)
+      name = Str.from_bytes(u)
+      if !fb.insert!(e, name, o) {
+        fail duplicate_name_error(e.stack_pointer.parent, name, e.output_offset)
+      }
     }
     e.~write_token!(jsontext.string(k))
     if v = m[k] { ~fv(e, v, o) }
@@ -234,7 +298,8 @@ pub def marshal_fallback_map[V](e: jsontext.Encoder, o: jsontext.Options, m: Map
 
 # Decodes an unknown member into a Map[Str, V] fallback.
 pub def unmarshal_fallback_map[V](d: jsontext.Decoder, o: jsontext.Options, cur: Map[Str, V], name: Str, zv: V, fv: (jsontext.Decoder, V, jsontext.Options) -> ~V<Error>) -> ~Map[Str, V]<Error> {
-  m = cur
+  m: Map[Str, V] = {}
+  for ck, cv in cur { m[ck] = cv }
   v = m[name] || zv
   m[name] = ~fv(d, v, o)
   m

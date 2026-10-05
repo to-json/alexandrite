@@ -53,6 +53,8 @@ pub struct Parser<'a> {
     jobs: Vec<crate::derive::DeriveJob>,
     /// `#[data("pkg.Name")]` read before the declaration being parsed.
     cur_data_name: Option<String>,
+    /// `#[json(transparent)]` read before the declaration being parsed.
+    cur_transparent: bool,
     /// derive(Data) jobs (see derive_data.rs).
     djobs: Vec<crate::derive_data::DataJob>,
 }
@@ -63,7 +65,7 @@ type PResult<T> = Result<T, Diag>;
 const CMD_PKG: &str = "alxexec";
 
 pub fn parse(file: u32, toks: &[Token], next_id: &mut NodeId) -> PResult<Module> {
-    let mut p = Parser { toks, pos: 0, next_id, scopes: vec![HashSet::new()], in_cond: false, usings: vec![], extern_mode: false, cur_derives: vec![], jobs: vec![], cur_data_name: None, djobs: vec![] };
+    let mut p = Parser { toks, pos: 0, next_id, scopes: vec![HashSet::new()], in_cond: false, usings: vec![], extern_mode: false, cur_derives: vec![], jobs: vec![], cur_data_name: None, djobs: vec![], cur_transparent: false };
     let mut m = p.module(file)?;
     // Command literals call into os/exec (also from inside `#{...}`).
     let has_cmd = toks.iter().any(|t| match &t.tok {
@@ -149,7 +151,7 @@ impl<'a> Parser<'a> {
     /// The expression in an embedded piece of source (`#{...}`).
     fn code_expr(&mut self, src: &str, base: u32, sp: Span, what: &str) -> PResult<Expr> {
         let toks = crate::lexer::lex_at(sp.file, src, base)?;
-        let mut sub = Parser { toks: &toks, pos: 0, next_id: self.next_id, scopes: self.scopes.clone(), in_cond: false, usings: vec![], extern_mode: false, cur_derives: vec![], jobs: vec![], cur_data_name: None, djobs: vec![] };
+        let mut sub = Parser { toks: &toks, pos: 0, next_id: self.next_id, scopes: self.scopes.clone(), in_cond: false, usings: vec![], extern_mode: false, cur_derives: vec![], jobs: vec![], cur_data_name: None, djobs: vec![], cur_transparent: false };
         sub.skip_newlines();
         let e = sub.expr()?;
         sub.skip_newlines();
@@ -359,6 +361,11 @@ impl<'a> Parser<'a> {
     fn type_attrs(&mut self) -> PResult<()> {
         while let Tok::Attr(a) = self.peek().clone() {
             let sp = self.bump().span;
+            if crate::derive::is_transparent_attr(&a, sp)? {
+                self.cur_transparent = true;
+                self.skip_newlines();
+                continue;
+            }
             if a.trim_start().starts_with("data") {
                 let (rename, _) = crate::derive::parse_data_attr(&a, sp)?;
                 self.cur_data_name = rename;
@@ -424,7 +431,7 @@ impl<'a> Parser<'a> {
             }
         }
         for (k, job) in jobs.iter().enumerate() {
-            let text = crate::derive::json_source(job, &alias, &types)?;
+            let text = crate::derive::json_source(job, &alias, &types, wants_v2)?;
             // One struct body: v1's methods, then v2's (both texts are `struct Name { ... }`).
             let text = if wants_v2 {
                 let v1 = &text[..text.rfind('}').unwrap()];
@@ -440,7 +447,7 @@ impl<'a> Parser<'a> {
             for t in &mut toks {
                 t.span = job.span;
             }
-            let mut sub = Parser { toks: &toks, pos: 0, next_id: self.next_id, scopes: vec![HashSet::new()], in_cond: false, usings: vec![], extern_mode: false, cur_derives: vec![], jobs: vec![], cur_data_name: None, djobs: vec![] };
+            let mut sub = Parser { toks: &toks, pos: 0, next_id: self.next_id, scopes: vec![HashSet::new()], in_cond: false, usings: vec![], extern_mode: false, cur_derives: vec![], jobs: vec![], cur_data_name: None, djobs: vec![], cur_transparent: false };
             sub.skip_newlines();
             let mut defs = vec![];
             sub.struct_def(&mut defs).map_err(|d| Diag::new(job.span, format!("derive(Json) on `{}` made code that doesn't parse: {}\n{text}", job.name, d.msg)))?;
@@ -505,7 +512,7 @@ impl<'a> Parser<'a> {
             for t in &mut toks {
                 t.span = job.span;
             }
-            let mut sub = Parser { toks: &toks, pos: 0, next_id: self.next_id, scopes: vec![HashSet::new()], in_cond: false, usings: vec![], extern_mode: false, cur_derives: vec![], jobs: vec![], cur_data_name: None, djobs: vec![] };
+            let mut sub = Parser { toks: &toks, pos: 0, next_id: self.next_id, scopes: vec![HashSet::new()], in_cond: false, usings: vec![], extern_mode: false, cur_derives: vec![], jobs: vec![], cur_data_name: None, djobs: vec![], cur_transparent: false };
             sub.skip_newlines();
             let mut defs = vec![];
             sub.struct_def(&mut defs).map_err(|d| Diag::new(job.span, format!("derive(Data) on `{}` made code that doesn't parse: {}\n{text}", job.name, d.msg)))?;
@@ -793,6 +800,7 @@ impl<'a> Parser<'a> {
         let first_method = methods.len();
         let derives = std::mem::take(&mut self.cur_derives);
         let data_name = self.cur_data_name.take();
+        let transparent = std::mem::take(&mut self.cur_transparent);
         self.expect_op("{")?;
         let mut variants: Vec<(String, Vec<(String, TypeExpr, Span)>, Span)> = vec![];
         let mut dvariants: Vec<crate::derive::DVariant> = vec![];
@@ -871,12 +879,12 @@ impl<'a> Parser<'a> {
         }
         let span = start.to(self.prev_span());
         if derives.iter().any(|d| d == "Data") {
-            let job = crate::derive::DeriveJob { name: name.clone(), go_name: data_name.clone(), tparams: tparams.iter().map(|t| t.name.clone()).collect(), public: false, span, shape: crate::derive::DShape::Enum(dvariants.clone()) };
+            let job = crate::derive::DeriveJob { name: name.clone(), go_name: data_name.clone(), transparent, tparams: tparams.iter().map(|t| t.name.clone()).collect(), public: false, span, shape: crate::derive::DShape::Enum(dvariants.clone()) };
             let ms = data_methods(methods, &mopts);
             self.djobs.push(crate::derive_data::DataJob { job, go_name: data_name.clone(), methods: ms });
         }
         if derives.iter().any(|d| d == "Json") {
-            self.jobs.push(crate::derive::DeriveJob { name: name.clone(), go_name: data_name.clone(), tparams: tparams.iter().map(|t| t.name.clone()).collect(), public: false, span, shape: crate::derive::DShape::Enum(dvariants) });
+            self.jobs.push(crate::derive::DeriveJob { name: name.clone(), go_name: data_name.clone(), transparent, tparams: tparams.iter().map(|t| t.name.clone()).collect(), public: false, span, shape: crate::derive::DShape::Enum(dvariants) });
         }
         Ok(EnumDef { name, span, error: false, tparams, variants })
     }
@@ -892,6 +900,7 @@ impl<'a> Parser<'a> {
         let first_method = methods.len();
         let derives = std::mem::take(&mut self.cur_derives);
         let data_name = self.cur_data_name.take();
+        let transparent = std::mem::take(&mut self.cur_transparent);
         self.expect_op("{")?;
         let mut fields: Vec<(String, TypeExpr, Span)> = vec![];
         let mut fopts: Vec<crate::derive::Opts> = vec![];
@@ -948,13 +957,13 @@ impl<'a> Parser<'a> {
         let span = start.to(self.prev_span());
         if derives.iter().any(|d| d == "Data") {
             let dfields = fields.iter().zip(fopts.iter()).map(|((n, t, s), o)| crate::derive::DField { name: n.clone(), ty: t.clone(), opts: o.clone(), span: *s }).collect();
-            let job = crate::derive::DeriveJob { name: name.clone(), go_name: data_name.clone(), tparams: tparams.iter().map(|t| t.name.clone()).collect(), public: false, span, shape: crate::derive::DShape::Struct(dfields) };
+            let job = crate::derive::DeriveJob { name: name.clone(), go_name: data_name.clone(), transparent, tparams: tparams.iter().map(|t| t.name.clone()).collect(), public: false, span, shape: crate::derive::DShape::Struct(dfields) };
             let ms = data_methods(methods, &mopts);
             self.djobs.push(crate::derive_data::DataJob { job, go_name: data_name.clone(), methods: ms });
         }
         if derives.iter().any(|d| d == "Json") {
             let dfields = fields.iter().zip(fopts).map(|((n, t, s), o)| crate::derive::DField { name: n.clone(), ty: t.clone(), opts: o, span: *s }).collect();
-            self.jobs.push(crate::derive::DeriveJob { name: name.clone(), go_name: data_name.clone(), tparams: tparams.iter().map(|t| t.name.clone()).collect(), public: false, span, shape: crate::derive::DShape::Struct(dfields) });
+            self.jobs.push(crate::derive::DeriveJob { name: name.clone(), go_name: data_name.clone(), transparent, tparams: tparams.iter().map(|t| t.name.clone()).collect(), public: false, span, shape: crate::derive::DShape::Struct(dfields) });
         }
         Ok(StructDef { name, span, tparams, fields })
     }

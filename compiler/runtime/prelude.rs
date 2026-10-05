@@ -1598,6 +1598,12 @@ mod rt {
         }
     }
     /// The zero value: a closed, unbuffered channel (send panics, recv gives ok = false).
+    // A channel's identity (`==`): the same channel, as in Go.
+    impl<T> PartialEq for Chan<T> {
+        fn eq(&self, o: &Self) -> bool {
+            Arc::ptr_eq(&self.0, &o.0)
+        }
+    }
     impl<T> Default for Chan<T> {
         fn default() -> Self {
             let c = Chan::new(0);

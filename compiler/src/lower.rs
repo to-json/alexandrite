@@ -121,11 +121,12 @@ pub fn lower(p: &TProgram, sm: &SourceMap, opts: &Opts) -> LProgram {
                     // Allocations of the frame go in the region current at the
                     // call, above a mark; the way out rolls it back.
                     let (mark, larges, dest) = (lw.new_var("mark", LTy::Region), lw.new_var("larges", LTy::Region), lw.new_var("dest", LTy::Region));
-                    // (The region itself is only named from inside loops that
-                    // have iteration regions of their own.)
-                    if !pl.loops.is_empty() {
-                        prologue.push(LS::Set(dest, LE::Rt(Rt::RegionCur, vec![])));
-                    }
+                    // The region itself is named from inside loops that have
+                    // iteration regions of their own, and from an argument
+                    // made in another region (`f(g([]))` with g's result in
+                    // the program region and `[]` in the frame), so it is
+                    // always set.
+                    prologue.push(LS::Set(dest, LE::Rt(Rt::RegionCur, vec![])));
                     prologue.push(LS::Set(mark, LE::Rt(Rt::RegionMark, vec![])));
                     prologue.push(LS::Set(larges, LE::Rt(Rt::RegionMarkLarges, vec![])));
                     lw.light = Some((mark, larges));

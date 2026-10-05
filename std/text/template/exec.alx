@@ -1,0 +1,1016 @@
+# Execution: Go's text/template/exec.go over Values.
+#
+# Go's executor panics to stop (errors, {{break}}, {{continue}}) and
+# recovers at the top; here errors propagate with `~` and walking returns a
+# control code (CTL_NEXT, CTL_BREAK, CTL_CONTINUE).
+
+import "dyn"
+import "strconv"
+import "strings"
+import "text/template/parse"
+
+# The maximum stack depth of templates within templates. Go's is 100000
+# (1000 on wasm). alx's is 100: a nested template call costs about 32 KB of
+# native stack in a release build (the C backend gives every local of a
+# function its own stack slot, docs/notes/port-issues.md), and stacks are
+# 8 MiB.
+MAX_EXEC_DEPTH = 100
+
+CTL_NEXT = 0
+CTL_BREAK = 1
+CTL_CONTINUE = 2
+
+# The error Execute returns when evaluating the template fails (Go's
+# ExecError). A write error is returned as itself. An error from a called
+# function or method is that error, wrapped with the template's context
+# ("template: t:1:2: executing \"t\" at <f>: error calling f: ...").
+pub error ExecError {
+  Exec(name: Str, msg: Str)
+
+  def message -> Str {
+    case self {
+      Exec(_, m) => m
+    }
+  }
+}
+
+# The dynamic value of a variable such as $, $x etc.
+struct Var {
+  name: Str
+  value: dyn.Value
+}
+
+# The marker for "no final argument" (Go's missingVal).
+def missing_val -> dyn.Value { dyn.Value.new(k: dyn.KIND_MISSING, id: -1) }
+
+def is_missing(v: dyn.Value) -> Bool { v.k == dyn.KIND_MISSING }
+
+# What to call: a builtin, a function, or a method of a Data object.
+struct Callee {
+  name: Str
+  sg: dyn.Sig
+  builtin: Bool
+  f: dyn.Callable?
+  obj: dyn.Data?
+}
+
+# The state of an execution. It's not part of the template so that
+# multiple executions of the same template can execute in parallel.
+struct State {
+  tmpl: Template
+  out: [Str]
+  # current node, for errors
+  node: parse.Node?
+  # push-down stack of variable values.
+  vars: [Var]
+  # the height of the stack of executing templates.
+  depth: Int
+
+  # Pushes a new variable on the stack.
+  def push!(name: Str, value: dyn.Value) { self.vars << Var.new(name: name, value: value) }
+
+  # The length of the variable stack.
+  def mark -> Int { vars.size }
+
+  # Pops the variable stack up to the mark.
+  def pop!(m: Int) { self.vars = vars[0...m] }
+
+  # Overwrites the last declared variable with the given name. Used by
+  # variable assignments.
+  def set_var!(name: Str, value: dyn.Value) -> ~Unit {
+    i = vars.size - 1
+    while i >= 0 {
+      if vars[i].name == name {
+        self.vars[i].value = value
+        return nil
+      }
+      i -= 1
+    }
+    fail errorf("undefined variable: #{name}")
+  }
+
+  # Overwrites the top-nth variable on the stack. Used by range iterations.
+  def set_top_var!(n: Int, value: dyn.Value) { self.vars[vars.size - n].value = value }
+
+  # The value of the named variable.
+  def var_value(name: Str) -> ~dyn.Value {
+    i = vars.size - 1
+    while i >= 0 {
+      return vars[i].value if vars[i].name == name
+      i -= 1
+    }
+    fail errorf("undefined variable: #{name}")
+  }
+
+  # Marks the state to be on node n, for error reporting.
+  def at!(n: parse.Node) { self.node = n }
+
+  # The error for a failure at the current node.
+  def errorf(msg: Str) -> ExecError {
+    name = tmpl.name
+    if n = node {
+      location, context = error_context(tmpl, n)
+      return ExecError.Exec(name: name, msg: "template: #{location}: executing #{strconv.quote(name)} at <#{context}>: #{msg}")
+    }
+    ExecError.Exec(name: name, msg: "template: #{name}: #{msg}")
+  }
+
+  # The context prefix of a function's own error ("error calling f").
+  def wrap_prefix(msg: Str) -> Str {
+    e = errorf(msg)
+    e.message
+  }
+
+  def write!(s: Str) { self.out << s }
+
+  # Walk functions step through the major pieces of the template structure,
+  # generating output as they go.
+  def walk!(dot: dyn.Value, n: parse.Node) -> ~Int {
+    at!(n)
+    case n.typ {
+      parse.NODE_ACTION => {
+        # Do not pop variables so they persist until next end. Also, if the
+        # action declares variables, don't print the result.
+        p = n.pipe.unwrap
+        val = self.~eval_pipeline!(dot, p)
+        if p.decl.size == 0 {
+          self.~print_value!(n, val)
+        }
+      }
+      parse.NODE_BREAK => {
+        return CTL_BREAK
+      }
+      parse.NODE_COMMENT => {}
+      parse.NODE_CONTINUE => {
+        return CTL_CONTINUE
+      }
+      parse.NODE_IF => {
+        return self.~walk_if_or_with!(parse.NODE_IF, dot, n.pipe.unwrap, n.list.unwrap, n.else_list)
+      }
+      parse.NODE_LIST => {
+        for k in n.nodes {
+          r = self.~walk!(dot, k)
+          return r if r != CTL_NEXT
+        }
+      }
+      parse.NODE_RANGE => {
+        self.~walk_range!(dot, n)
+      }
+      parse.NODE_TEMPLATE => {
+        self.~walk_template!(dot, n)
+      }
+      parse.NODE_TEXT => {
+        write!(n.text)
+      }
+      parse.NODE_WITH => {
+        return self.~walk_if_or_with!(parse.NODE_WITH, dot, n.pipe.unwrap, n.list.unwrap, n.else_list)
+      }
+      _ => {
+        fail errorf("unknown node: #{n.to_s}")
+      }
+    }
+    CTL_NEXT
+  }
+
+  # Walks an 'if' or 'with' node. The two control structures are identical
+  # in behavior except that 'with' sets dot.
+  def walk_if_or_with!(typ: Int, dot: dyn.Value, pipe: parse.Node, list: parse.Node, else_list: parse.Node?) -> ~Int {
+    m = mark()
+    val = self.~eval_pipeline!(dot, pipe)
+    truth, ok = is_true(indirect_interface(val))
+    if !ok {
+      fail errorf("if/with can't use #{dyn.fmt_print([val])}")
+    }
+    r = CTL_NEXT
+    if truth {
+      if typ == parse.NODE_WITH {
+        r = self.~walk!(val, list)
+      } else {
+        r = self.~walk!(dot, list)
+      }
+    } else if el = else_list {
+      r = self.~walk!(dot, el)
+    }
+    pop!(m)
+    r
+  }
+
+  # One iteration of a range: sets the variables and walks the body.
+  # Returns CTL_BREAK to stop.
+  def one_iteration!(r: parse.Node, m: Int, index: dyn.Value, elem: dyn.Value) -> ~Int {
+    p = r.pipe.unwrap
+    decl = p.decl
+    if decl.size > 0 {
+      if p.is_assign {
+        # With two variables, index comes first. With one, we use the
+        # element.
+        if decl.size > 1 {
+          self.~set_var!(decl[0].ident[0], index)
+        } else {
+          self.~set_var!(decl[0].ident[0], elem)
+        }
+      } else {
+        # Set top var (lexically the second if there are two) to the
+        # element.
+        set_top_var!(1, elem)
+      }
+    }
+    if decl.size > 1 {
+      if p.is_assign {
+        self.~set_var!(decl[1].ident[0], elem)
+      } else {
+        # Set next var (lexically the first if there are two) to the index.
+        set_top_var!(2, index)
+      }
+    }
+    c = self.~walk!(elem, r.list.unwrap)
+    pop!(m)
+    c == CTL_BREAK ? CTL_BREAK : CTL_NEXT
+  }
+
+  def walk_range!(dot: dyn.Value, r: parse.Node) -> ~Unit {
+    at!(r)
+    m0 = mark()
+    p = r.pipe.unwrap
+    val, _ = indirect(self.~eval_pipeline!(dot, p))
+    # mark top of stack before any variables in the body are pushed.
+    m = mark()
+    ran = false
+    case val.k {
+      dyn.KIND_INT | dyn.KIND_UINT => {
+        if p.decl.size > 1 {
+          fail errorf("can't use #{dyn.fmt_print([val])} to iterate over more than one variable")
+        }
+        n = val.k == dyn.KIND_INT ? val.n : (val.u.as_i64 < 0 ? -1 : val.u.as_i64)
+        i = 0
+        while i < n {
+          ran = true
+          # Pass element as second value, as we do for channels.
+          ev = val
+          ev.n = i
+          ev.u = i.as_u64
+          c = self.~one_iteration!(r, m, dyn.Value.invalid, ev)
+          break if c == CTL_BREAK
+          i += 1
+        }
+      }
+      dyn.KIND_LIST => {
+        n = val.len
+        i = 0
+        while i < n {
+          ran = true
+          c = self.~one_iteration!(r, m, dyn.Value.int(i), dyn.through(val.at(i), dyn.elem_type(val.type_name)))
+          break if c == CTL_BREAK
+          i += 1
+        }
+      }
+      dyn.KIND_MAP => {
+        for e in val.sorted_entries {
+          ran = true
+          c = self.~one_iteration!(r, m, e[0], dyn.through(e[1], map_elem_type(val.type_name)))
+          break if c == CTL_BREAK
+        }
+      }
+      dyn.KIND_INVALID => {
+        # An invalid value is likely a nil map, etc. and acts like an
+        # empty map.
+      }
+      _ => {
+        fail errorf("range can't iterate over #{dyn.fmt_print([val])}")
+      }
+    }
+    if !ran {
+      if el = r.else_list {
+        _ = self.~walk!(dot, el)
+      }
+    }
+    pop!(m0)
+    nil
+  }
+
+  def walk_template!(dot: dyn.Value, t: parse.Node) -> ~Unit {
+    at!(t)
+    tm = tmpl.lookup(t.name)
+    if tm == none {
+      fail errorf("template #{strconv.quote(t.name)} not defined")
+    }
+    if depth == MAX_EXEC_DEPTH {
+      fail errorf("exceeded maximum template depth (#{MAX_EXEC_DEPTH})")
+    }
+    # Variables declared by the pipeline persist.
+    d = dot
+    if p = t.pipe {
+      d = self.~eval_pipeline!(dot, p)
+    } else {
+      d = dyn.Value.invalid
+    }
+    # No dynamic scoping: template invocations inherit no variables.
+    saved_tmpl = tmpl
+    saved_vars = vars
+    saved_node = node
+    self.depth += 1
+    self.tmpl = tm.unwrap
+    self.vars = [Var.new(name: "$", value: d)]
+    if root = tm.unwrap.root {
+      _ = self.~walk!(d, root)
+    }
+    self.depth -= 1
+    self.tmpl = saved_tmpl
+    self.vars = saved_vars
+    self.node = saved_node
+    nil
+  }
+
+  # Eval functions evaluate pipelines, commands, and their elements and
+  # extract values from the data structure by examining fields, calling
+  # methods, and so on. The printing of those values happens only through
+  # walk functions.
+
+  # The value acquired by evaluating a pipeline. If the pipeline has a
+  # variable declaration, the variable will be pushed on the stack. Callers
+  # should therefore pop the stack after they are finished executing
+  # commands depending on the pipeline value.
+  def eval_pipeline!(dot: dyn.Value, pipe: parse.Node) -> ~dyn.Value {
+    at!(pipe)
+    value = missing_val()
+    for cmd in pipe.cmds {
+      # previous value is this one's final arg.
+      value = self.~eval_command!(dot, cmd, value)
+      # If the object has type interface{}, dig down one level to the thing
+      # inside: a nil interface{} is no value.
+      if value.k == dyn.KIND_PTR && value.nil? && dyn.any_type?(value.type_name) {
+        value = dyn.Value.invalid
+      }
+      value.it = "" if dyn.any_type?(value.it)
+    }
+    for v in pipe.decl {
+      if pipe.is_assign {
+        self.~set_var!(v.ident[0], value)
+      } else {
+        push!(v.ident[0], value)
+      }
+    }
+    value
+  }
+
+  def not_a_function(args: [parse.Node], final: dyn.Value) -> ~Unit {
+    if args.size > 1 || !is_missing(final) {
+      fail errorf("can't give argument to non-function #{args[0].to_s}")
+    }
+    nil
+  }
+
+  def eval_command!(dot: dyn.Value, cmd: parse.Node, final: dyn.Value) -> ~dyn.Value {
+    args = cmd.args
+    first = args[0]
+    case first.typ {
+      parse.NODE_FIELD => {
+        return self.~eval_field_node!(dot, first, args, final)
+      }
+      parse.NODE_CHAIN => {
+        return self.~eval_chain_node!(dot, first, args, final)
+      }
+      parse.NODE_IDENTIFIER => {
+        # Must be a function.
+        return self.~eval_function!(dot, first, cmd, args, final)
+      }
+      parse.NODE_PIPE => {
+        # Parenthesized pipeline. The arguments are all inside the
+        # pipeline; final must be absent.
+        self.~not_a_function(args, final)
+        return self.~eval_pipeline!(dot, first)
+      }
+      parse.NODE_VARIABLE => {
+        return self.~eval_variable_node!(dot, first, args, final)
+      }
+      _ => {}
+    }
+    at!(first)
+    self.~not_a_function(args, final)
+    case first.typ {
+      parse.NODE_BOOL => {
+        return dyn.Value.bool(first.truth)
+      }
+      parse.NODE_DOT => {
+        return dot
+      }
+      parse.NODE_NIL => {
+        fail errorf("nil is not a command")
+      }
+      parse.NODE_NUMBER => {
+        return self.~ideal_constant!(first)
+      }
+      parse.NODE_STRING => {
+        return dyn.Value.str(first.text)
+      }
+      _ => {}
+    }
+    fail errorf("can't evaluate command #{strconv.quote(first.to_s)}")
+  }
+
+  # The value of a number in a context where we don't know the type. In
+  # that case, the syntax of the number tells us its type, and we use Go
+  # rules to resolve. Note there is no such thing as a uint ideal constant
+  # in this situation - the value must be of int type.
+  def ideal_constant!(c: parse.Node) -> ~dyn.Value {
+    at!(c)
+    text = c.text
+    if c.is_complex {
+      # incontrovertible.
+      return dyn.Value.complex(c.complex128)
+    }
+    if c.is_float && !is_hex_int(text) && !is_rune_int(text) && strings.contains_any(text, ".eEpP") {
+      return dyn.Value.float(c.float64)
+    }
+    if c.is_int {
+      return dyn.Value.int(c.int64)
+    }
+    if c.is_uint {
+      fail errorf("#{text} overflows int")
+    }
+    dyn.Value.invalid
+  }
+
+  def eval_field_node!(dot: dyn.Value, field: parse.Node, args: [parse.Node], final: dyn.Value) -> ~dyn.Value {
+    at!(field)
+    self.~eval_field_chain!(dot, dot, field, field.ident, args, final)
+  }
+
+  def eval_chain_node!(dot: dyn.Value, chain: parse.Node, args: [parse.Node], final: dyn.Value) -> ~dyn.Value {
+    at!(chain)
+    if chain.field.size == 0 {
+      fail errorf("internal error: no fields in evalChainNode")
+    }
+    if chain.node.typ == parse.NODE_NIL {
+      fail errorf("indirection through explicit nil in #{chain.to_s}")
+    }
+    # (pipe).Field1.Field2 has pipe as .Node, fields as .Field. Eval the
+    # pipeline, then the fields.
+    pipe = self.~eval_arg!(dot, "", chain.node)
+    self.~eval_field_chain!(dot, pipe, chain, chain.field, args, final)
+  }
+
+  def eval_variable_node!(dot: dyn.Value, variable: parse.Node, args: [parse.Node], final: dyn.Value) -> ~dyn.Value {
+    # $x.Field has $x as the first ident, Field as the second. Eval the var,
+    # then the fields.
+    at!(variable)
+    ids = variable.ident
+    value = self.~var_value(ids[0])
+    if ids.size == 1 {
+      self.~not_a_function(args, final)
+      return value
+    }
+    self.~eval_field_chain!(dot, value, variable, ids[1...ids.size], args, final)
+  }
+
+  # Evaluates .X.Y.Z possibly followed by arguments. dot is the environment
+  # in which to evaluate arguments, while receiver is the value being
+  # walked along the chain.
+  def eval_field_chain!(dot: dyn.Value, receiver0: dyn.Value, n: parse.Node, ident: [Str], args: [parse.Node], final: dyn.Value) -> ~dyn.Value {
+    receiver = receiver0
+    k = ident.size
+    i = 0
+    while i < k - 1 {
+      receiver = self.~eval_field!(dot, ident[i], n, [], missing_val(), receiver)
+      i += 1
+    }
+    # Now if it's a method, it gets the arguments.
+    self.~eval_field!(dot, ident[k - 1], n, args, final, receiver)
+  }
+
+  def eval_function!(dot: dyn.Value, n: parse.Node, cmd: parse.Node, args: [parse.Node], final: dyn.Value) -> ~dyn.Value {
+    at!(n)
+    name = n.ident_name
+    if f = find_function(name, tmpl) {
+      return self.~eval_call!(dot, f, cmd, name, args, final)
+    }
+    fail errorf("#{strconv.quote(name)} is not a defined function")
+  }
+
+  # Evaluates an expression like (.Field) or (.Field arg1 arg2). The
+  # 'final' argument represents the return value from the preceding value
+  # of the pipeline, if any.
+  def eval_field!(dot: dyn.Value, field_name: Str, n: parse.Node, args: [parse.Node], final: dyn.Value, receiver0: dyn.Value) -> ~dyn.Value {
+    receiver = receiver0
+    if receiver.k == dyn.KIND_INVALID {
+      if tmpl.c[0].missing_key == MAP_ERROR {
+        # Treat invalid value as missing map key.
+        fail errorf("nil data; no entry for key #{strconv.quote(field_name)}")
+      }
+      return dyn.Value.invalid
+    }
+    typ = receiver.it != "" ? receiver.it : receiver.type_name
+    rv, is_nil = indirect(receiver)
+    receiver = rv
+    if is_nil {
+      # Calling a method or reading a field through nil can't work (alx
+      # values have no methods with nil receivers).
+      fail errorf("nil pointer evaluating #{typ}.#{field_name}")
+    }
+    if o = receiver.obj {
+      if sg = o.data_sig(field_name) {
+        c = Callee.new(name: field_name, sg: sg, obj: o)
+        return self.~eval_call!(dot, c, n, field_name, args, final)
+      }
+    }
+    has_args = args.size > 1 || !is_missing(final)
+    # It's not a method; must be a field of a struct or an element of a map.
+    case receiver.k {
+      dyn.KIND_STRUCT => {
+        if fe = receiver.field(field_name) {
+          if !fe[1] {
+            fail errorf("#{field_name} is an unexported field of struct type #{typ}")
+          }
+          # If it's a function, we must call it.
+          if has_args {
+            fail errorf("#{field_name} has arguments but cannot be invoked as function")
+          }
+          return fe[0]
+        }
+      }
+      dyn.KIND_MAP => {
+        # If it's a map, attempt to use the field name as a key.
+        kt = map_key_type(receiver.type_name)
+        if kt == "string" || dyn.any_type?(kt) {
+          if has_args {
+            fail errorf("#{field_name} is not a method but has arguments")
+          }
+          if r = receiver.map_get(dyn.Value.str(field_name)) {
+            return dyn.through(r, map_elem_type(receiver.type_name))
+          }
+          case tmpl.c[0].missing_key {
+            MAP_ZERO_VALUE => {
+              return zero_of(map_elem_type(receiver.type_name))
+            }
+            MAP_ERROR => {
+              fail errorf("map has no entry for key #{strconv.quote(field_name)}")
+            }
+            _ => {
+              return dyn.Value.invalid
+            }
+          }
+        }
+      }
+      _ => {}
+    }
+    fail errorf("can't evaluate field #{field_name} in type #{typ}")
+  }
+
+  # Executes a function or method call. The arg list, if non-empty,
+  # includes (in the manner of the shell) arg[0] as the function itself.
+  def eval_call!(dot: dyn.Value, fun: Callee, n: parse.Node, name: Str, args0: [parse.Node], final: dyn.Value) -> ~dyn.Value {
+    args = args0.size > 0 ? args0[1...args0.size] : args0
+    sg = fun.sg
+    params = sg.params
+    num_in = args.size
+    num_in += 1 if !is_missing(final)
+    num_fixed = args.size
+    if sg.variadic {
+      # last arg is the variadic one.
+      num_fixed = params.size - 1
+      if num_in < num_fixed {
+        fail errorf("wrong number of args for #{name}: want at least #{params.size - 1} got #{args.size}")
+      }
+    } else if num_in != params.size {
+      fail errorf("wrong number of args for #{name}: want #{params.size} got #{num_in}")
+    }
+    if e = sg.check(name) {
+      fail errorf(e)
+    }
+    # Special case for builtin and/or, which short-circuit.
+    if fun.builtin && (name == "and" || name == "or") {
+      arg_type = params[0]
+      v = dyn.Value.invalid
+      for arg in args {
+        v = self.~eval_arg!(dot, arg_type, arg)
+        if truth(v) == (name == "or") {
+          return v
+        }
+      }
+      if !is_missing(final) {
+        # The last argument to and/or is coming from the pipeline. We
+        # didn't short circuit on an earlier argument, so we are going to
+        # return this one. We don't have to evaluate final, but we do have
+        # to check its type.
+        v = self.~validate_type(final, arg_type)
+      }
+      return v
+    }
+    # Build the arg list. Args must be evaluated. Fixed args first.
+    argv: [dyn.Value] = []
+    i = 0
+    while i < num_fixed && i < args.size {
+      argv << self.~eval_arg!(dot, params[i], args[i])
+      i += 1
+    }
+    # Now the ... args.
+    if sg.variadic {
+      # Argument is a slice.
+      arg_type = params[params.size - 1]
+      while i < args.size {
+        argv << self.~eval_arg!(dot, arg_type, args[i])
+        i += 1
+      }
+    }
+    # Add final value if necessary.
+    if !is_missing(final) {
+      t = params[params.size - 1]
+      if sg.variadic && num_in - 1 < num_fixed {
+        # The added final argument corresponds to a fixed parameter of the
+        # function. Validate against the type of the actual parameter.
+        t = params[num_in - 1]
+      }
+      argv << self.~validate_type(final, t)
+    }
+    # Special case for the "call" builtin. Insert the name of the callee
+    # function as the first argument.
+    if fun.builtin && name == "call" {
+      callee_name = args.size == 0 ? final.s : args[0].to_s
+      r = call_value(callee_name, argv[0], argv[1...argv.size])
+      if e = r.err {
+        at!(n)
+        fail wrap_call_error(e, wrap_prefix("error calling #{name}"))
+      }
+      return r.unwrap
+    }
+    r = invoke(fun, argv)
+    if e = r.err {
+      # If we have an error that is not nil, stop execution and return that
+      # error to the caller.
+      at!(n)
+      fail wrap_call_error(e, wrap_prefix("error calling #{name}"))
+    }
+    r.unwrap
+  }
+
+  # Guarantees that the value is valid and assignable to the type ("": no
+  # type, Go's nil reflect.Type).
+  def validate_type(value: dyn.Value, typ: Str) -> ~dyn.Value {
+    if value.k == dyn.KIND_INVALID {
+      if typ == "" {
+        # An untyped nil interface{}. Accept as a proper nil value.
+        return value
+      }
+      if can_be_nil(typ) {
+        # Like above, but use the zero value of the non-nil type.
+        return zero_of(typ)
+      }
+      fail errorf("invalid value; expected #{typ}")
+    }
+    return value if typ == "" || assignable(value, typ)
+    vt = value.type_name
+    # Does one dereference or indirection work? We could do more, as we do
+    # with method receivers, but that gets messy and method receivers are
+    # much more constrained, so it makes more sense there than here.
+    # Besides, one is almost always all you need.
+    if value.k == dyn.KIND_PTR && strings.has_prefix(vt, "*") && vt[1...vt.size] == typ {
+      if value.nil? {
+        fail errorf("dereference of nil pointer of type #{typ}")
+      }
+      return value.elem
+    }
+    if "*#{vt}" == typ {
+      return value.ptr
+    }
+    fail errorf("wrong type for value; expected #{typ}; got #{vt}")
+  }
+
+  def eval_arg!(dot: dyn.Value, typ: Str, n: parse.Node) -> ~dyn.Value {
+    at!(n)
+    case n.typ {
+      parse.NODE_DOT => {
+        return self.~validate_type(dot, typ)
+      }
+      parse.NODE_NIL => {
+        if can_be_nil(typ) {
+          return zero_of(typ)
+        }
+        fail errorf("cannot assign nil to #{typ}")
+      }
+      parse.NODE_FIELD => {
+        v = self.~eval_field_node!(dot, n, [n], missing_val())
+        return self.~validate_type(v, typ)
+      }
+      parse.NODE_VARIABLE => {
+        v = self.~eval_variable_node!(dot, n, [], missing_val())
+        return self.~validate_type(v, typ)
+      }
+      parse.NODE_PIPE => {
+        v = self.~eval_pipeline!(dot, n)
+        return self.~validate_type(v, typ)
+      }
+      parse.NODE_IDENTIFIER => {
+        v = self.~eval_function!(dot, n, n, [], missing_val())
+        return self.~validate_type(v, typ)
+      }
+      parse.NODE_CHAIN => {
+        v = self.~eval_chain_node!(dot, n, [], missing_val())
+        return self.~validate_type(v, typ)
+      }
+      _ => {}
+    }
+    if dyn.any_type?(typ) {
+      return self.~eval_empty_interface!(dot, n)
+    }
+    k = dyn.kind_of_type(typ)
+    case k {
+      dyn.KIND_BOOL => {
+        if n.typ == parse.NODE_BOOL {
+          return typed_value(dyn.Value.bool(n.truth), typ)
+        }
+        fail errorf("expected bool; found #{n.to_s}")
+      }
+      dyn.KIND_COMPLEX => {
+        if n.typ == parse.NODE_NUMBER && n.is_complex {
+          return dyn.Value.complex_of(n.complex128, typ)
+        }
+        fail errorf("expected complex; found #{n.to_s}")
+      }
+      dyn.KIND_FLOAT => {
+        if n.typ == parse.NODE_NUMBER && n.is_float {
+          return dyn.Value.float_of(n.float64, typ)
+        }
+        fail errorf("expected float; found #{n.to_s}")
+      }
+      dyn.KIND_INT => {
+        if n.typ == parse.NODE_NUMBER && n.is_int {
+          return dyn.Value.int_of(wrap_int(n.int64, typ), typ)
+        }
+        fail errorf("expected integer; found #{n.to_s}")
+      }
+      dyn.KIND_STRING => {
+        if n.typ == parse.NODE_STRING {
+          return dyn.Value.str_of(n.text, typ)
+        }
+        fail errorf("expected string; found #{n.to_s}")
+      }
+      dyn.KIND_UINT => {
+        if n.typ == parse.NODE_NUMBER && n.is_uint {
+          return dyn.Value.uint_of(wrap_uint(n.uint64, typ), typ)
+        }
+        fail errorf("expected unsigned integer; found #{n.to_s}")
+      }
+      _ => {}
+    }
+    fail errorf("can't handle #{n.to_s} for arg of type #{typ}")
+  }
+
+  def eval_empty_interface!(dot: dyn.Value, n: parse.Node) -> ~dyn.Value {
+    at!(n)
+    case n.typ {
+      parse.NODE_BOOL => {
+        return dyn.Value.bool(n.truth)
+      }
+      parse.NODE_DOT => {
+        return dot
+      }
+      parse.NODE_FIELD => {
+        return self.~eval_field_node!(dot, n, [], missing_val())
+      }
+      parse.NODE_IDENTIFIER => {
+        return self.~eval_function!(dot, n, n, [], missing_val())
+      }
+      parse.NODE_NIL => {
+        # NilNode is handled in eval_arg, the only place that calls here.
+        fail errorf("evalEmptyInterface: nil (can't happen)")
+      }
+      parse.NODE_NUMBER => {
+        return self.~ideal_constant!(n)
+      }
+      parse.NODE_STRING => {
+        return dyn.Value.str(n.text)
+      }
+      parse.NODE_VARIABLE => {
+        return self.~eval_variable_node!(dot, n, [], missing_val())
+      }
+      parse.NODE_PIPE => {
+        return self.~eval_pipeline!(dot, n)
+      }
+      _ => {}
+    }
+    fail errorf("can't handle assignment of #{n.to_s} to empty interface argument")
+  }
+
+  # Writes the textual representation of the value to the output of the
+  # template.
+  def print_value!(n: parse.Node, v0: dyn.Value) -> ~Unit {
+    at!(n)
+    v = v0
+    if v.k == dyn.KIND_PTR {
+      # fmt.Fprint handles nil.
+      v, _ = indirect(v)
+    }
+    if v.k == dyn.KIND_INVALID {
+      write!("<no value>")
+      return nil
+    }
+    if v.k == dyn.KIND_FUNC && v.obj == none {
+      fail errorf("can't print #{n.to_s} of type #{v.type_name}")
+    }
+    write!(dyn.fmt_print([v]))
+    nil
+  }
+}
+
+# The item at the end of indirection, and whether it's a nil pointer.
+pub def indirect(v0: dyn.Value) -> (dyn.Value, Bool) {
+  v = v0
+  while v.k == dyn.KIND_PTR {
+    return (v, true) if v.nil?
+    v = v.elem
+  }
+  (v, false)
+}
+
+# The concrete value in an interface value: the nil of an interface type is
+# no value (Go's indirectInterface).
+pub def indirect_interface(v: dyn.Value) -> dyn.Value {
+  if v.k == dyn.KIND_PTR && v.nil? && !strings.has_prefix(v.type_name, "*") {
+    return dyn.Value.invalid
+  }
+  v
+}
+
+# A value typed `t` (the same value, another type name).
+def typed_value(v: dyn.Value, t: Str) -> dyn.Value {
+  w = v
+  w.t = t
+  w
+}
+
+def is_rune_int(s: Str) -> Bool { s.size > 0 && s[0] == 39 }
+
+def is_hex_int(s: Str) -> Bool {
+  s.size > 2 && s[0] == 48 && (s[1] == 120 || s[1] == 88) && !strings.contains_any(s, "pP")
+}
+
+# Go's reflect SetInt truncation for sized types.
+def wrap_int(x: Int, t: Str) -> Int {
+  case t {
+    "int8" => x.as_i8.to_i
+    "int16" => x.as_i16.to_i
+    "int32" | "rune" => x.as_i32.to_i
+    _ => x
+  }
+}
+
+def wrap_uint(x: U64, t: Str) -> U64 {
+  case t {
+    "uint8" | "byte" => x.as_u8.to_u64
+    "uint16" => x.as_u16.to_u64
+    "uint32" => x.as_u32.to_u64
+    _ => x
+  }
+}
+
+# Calls a resolved function.
+def invoke(c: Callee, args: [dyn.Value]) -> ~dyn.Value {
+  if c.builtin {
+    return ~call_builtin(c.name, args)
+  }
+  if o = c.obj {
+    return ~o.data_call(c.name, args)
+  }
+  ~c.f.unwrap.call(args)
+}
+
+# A called function's error with the template's context, keeping the
+# error itself (so errors.As-style matching still finds it).
+def wrap_call_error(e: Error, prefix: Str) -> Error {
+  e.wrap(prefix)
+}
+
+# Looks for a function in the template, and the builtins.
+def find_function(name: Str, tmpl: Template) -> Callee? {
+  if tmpl.c.size > 0 {
+    if f = tmpl.c[0].exec_funcs[name] {
+      return Callee.new(name: name, sg: f.sig, f: f)
+    }
+  }
+  if sg = builtin_sig(name) {
+    return Callee.new(name: name, sg: sg, builtin: true)
+  }
+  none
+}
+
+# Whether an untyped nil can be assigned to the type (Go's canBeNil).
+def can_be_nil(typ: Str) -> Bool {
+  return true if strings.has_prefix(typ, "[]") || strings.has_prefix(typ, "map[") || strings.has_prefix(typ, "func(") || strings.has_prefix(typ, "*") || strings.has_prefix(typ, "chan ")
+  dyn.iface_type?(typ)
+}
+
+# Whether a value of v's type can be assigned to a variable of type typ.
+def assignable(v: dyn.Value, typ: Str) -> Bool {
+  vt = v.type_name
+  return true if vt == typ
+  return true if dyn.any_type?(typ)
+  if typ == "fmt.Stringer" || typ == "error" {
+    if o = v.obj {
+      return o.data_string != none
+    }
+    return false
+  }
+  false
+}
+
+# The zero value of a Go type.
+def zero_of(typ: Str) -> dyn.Value {
+  case dyn.kind_of_type(typ) {
+    dyn.KIND_BOOL => typed_value(dyn.Value.bool(false), typ)
+    dyn.KIND_INT => dyn.Value.int_of(0, typ)
+    dyn.KIND_UINT => dyn.Value.uint_of(0.as_u64, typ)
+    dyn.KIND_FLOAT => dyn.Value.float_of(0.0, typ)
+    dyn.KIND_COMPLEX => dyn.Value.complex_of(Complex.new(0.0, 0.0), typ)
+    dyn.KIND_STRING => dyn.Value.str_of("", typ)
+    dyn.KIND_LIST => {
+      if strings.has_prefix(typ, "[]") {
+        return dyn.Value.nil_of(typ)
+      }
+      dyn.Value.list_of([], typ)
+    }
+    dyn.KIND_MAP | dyn.KIND_FUNC | dyn.KIND_PTR => dyn.Value.nil_of(typ)
+    _ => {
+      if dyn.iface_type?(typ) {
+        return dyn.Value.invalid
+      }
+      dyn.Value.struct_of(typ, [], [])
+    }
+  }
+}
+
+# The key type of a map type name: "map[string]int" -> "string".
+def map_key_type(t: Str) -> Str {
+  return "" if !strings.has_prefix(t, "map[")
+  e = bracket_end(t, 3)
+  t[4...e]
+}
+
+# The element type of a map type name: "map[string]int" -> "int".
+def map_elem_type(t: Str) -> Str {
+  return "" if !strings.has_prefix(t, "map[")
+  e = bracket_end(t, 3)
+  t[e + 1...t.size]
+}
+
+# The index of the ']' closing the '[' at `at`.
+def bracket_end(t: Str, at: Int) -> Int {
+  depth = 0
+  i = at
+  while i < t.size {
+    depth += 1 if t[i] == 91
+    if t[i] == 93 {
+      depth -= 1
+      return i if depth == 0
+    }
+    i += 1
+  }
+  t.size - 1
+}
+
+# Whether the value is 'true', in the sense of not the zero of its type,
+# and whether the value has a meaningful truth value. This is the
+# definition of truth used by if and other such actions.
+pub def is_true(val: dyn.Value) -> (Bool, Bool) {
+  case val.k {
+    dyn.KIND_INVALID => (false, true)
+    dyn.KIND_LIST | dyn.KIND_MAP | dyn.KIND_STRING => (val.len > 0, true)
+    dyn.KIND_BOOL => (val.n != 0, true)
+    dyn.KIND_COMPLEX => (val.f != 0.0 || val.g != 0.0, true)
+    dyn.KIND_FUNC | dyn.KIND_PTR => (!val.nil?, true)
+    dyn.KIND_INT => (val.n != 0, true)
+    dyn.KIND_FLOAT => (val.f != 0.0, true)
+    dyn.KIND_UINT => (val.u != 0.as_u64, true)
+    # Struct values are always true.
+    dyn.KIND_STRUCT => (true, true)
+    _ => (false, false)
+  }
+}
+
+def truth(v: dyn.Value) -> Bool {
+  t, _ = is_true(indirect_interface(v))
+  t
+}
+
+# The location and context of a node for an error message (Go's
+# t.ErrorContext).
+def error_context(t: Template, n: parse.Node) -> (Str, Str) {
+  if tr = t.tree {
+    return tr.error_context(n)
+  }
+  parse.new_tree(t.name).error_context(n)
+}
+
+# Executes t on data: the output, and the error that stopped it.
+def run_template(t: Template, data: dyn.Value) -> (Str, Error?) {
+  s = State.new(tmpl: t, out: [], vars: [Var.new(name: "$", value: data)])
+  if t.c.size == 0 || t.root == none {
+    e = s.errorf("#{strconv.quote(t.name)} is an incomplete or empty template")
+    return ("", e)
+  }
+  r = s.walk!(data, t.root.unwrap)
+  out = s.out.join("")
+  if e = r.err {
+    return (out, e)
+  }
+  (out, none)
+}

@@ -1,0 +1,779 @@
+# Context transitions over template text: Go's html/template/transition.go.
+# A transition function takes a context and template text input, and
+# returns the updated context and the number of bytes consumed from the
+# front of the input.
+
+import "strconv"
+import "unicode/utf8"
+
+COMMENT_START = "<!--"
+COMMENT_END = "-->"
+
+# The transition function for state c.state (Go's transitionFunc table).
+def transition(c: Context, s: Str) -> (Context, Int) { transition_for(c.state, c, s) }
+
+# The transition function of state st, applied to c.
+def transition_for(st: Int, c: Context, s: Str) -> (Context, Int) {
+  case st {
+    STATE_TEXT => t_text(c, s)
+    STATE_TAG => t_tag(c, s)
+    STATE_ATTR_NAME => t_attr_name(c, s)
+    STATE_AFTER_NAME => t_after_name(c, s)
+    STATE_BEFORE_VALUE => t_before_value(c, s)
+    STATE_HTML_CMT => t_html_cmt(c, s)
+    STATE_RCDATA => t_special_tag_end(c, s)
+    STATE_ATTR => t_attr(c, s)
+    STATE_URL => t_url(c, s)
+    STATE_META_CONTENT => t_meta_content(c, s)
+    STATE_META_CONTENT_URL => t_meta_content_url(c, s)
+    STATE_SRCSET => t_url(c, s)
+    STATE_JS => t_js(c, s)
+    STATE_JS_DQ_STR | STATE_JS_SQ_STR | STATE_JS_REGEXP => t_js_delimited(c, s)
+    STATE_JS_TMPL_LIT => t_js_tmpl(c, s)
+    STATE_JS_BLOCK_CMT => t_block_cmt(c, s)
+    STATE_JS_LINE_CMT | STATE_JS_HTML_OPEN_CMT | STATE_JS_HTML_CLOSE_CMT => t_line_cmt(c, s)
+    STATE_CSS => t_css(c, s)
+    STATE_CSS_DQ_STR | STATE_CSS_SQ_STR | STATE_CSS_DQ_URL | STATE_CSS_SQ_URL | STATE_CSS_URL => t_css_str(c, s)
+    STATE_CSS_BLOCK_CMT => t_block_cmt(c, s)
+    STATE_CSS_LINE_CMT => t_line_cmt(c, s)
+    _ => t_error(c, s)
+  }
+}
+
+# Byte helpers (Go's bytes package over Str views).
+def index_byte(s: Str, b: Int) -> Int {
+  i = 0
+  while i < s.size {
+    return i if s[i].to_i == b
+    i += 1
+  }
+  -1
+}
+
+def index_any(s: Str, chars: Str) -> Int {
+  i = 0
+  while i < s.size {
+    c = s[i]
+    j = 0
+    while j < chars.size {
+      return i if chars[j] == c
+      j += 1
+    }
+    i += 1
+  }
+  -1
+}
+
+# Go's bytes.IndexAny for a set with non-ASCII runes: the byte index of the
+# first rune in `chars`.
+def index_any_runes(s: Str, chars: Str) -> Int {
+  i = 0
+  set = chars.runes
+  while i < s.size {
+    r, w = decode_rune(s, i)
+    return i if set.any? { it == r }
+    i += w
+  }
+  -1
+}
+
+def decode_rune(s: Str, i: Int) -> (Rune, Int) { utf8.decode_rune_at(s, i) }
+
+def has_prefix(s: Str, p: Str) -> Bool { s.size >= p.size && s[0...p.size] == p }
+
+def equal_fold_ascii(a: Str, b: Str) -> Bool {
+  return false if a.size != b.size
+  i = 0
+  while i < a.size {
+    x = lower_byte(a[i].to_i)
+    y = lower_byte(b[i].to_i)
+    return false if x != y
+    i += 1
+  }
+  true
+}
+
+def lower_byte(c: Int) -> Int { (c >= 65 && c <= 90) ? c + 32 : c }
+
+def to_lower_ascii(s: Str) -> Str {
+  bs: [Byte] = s.bytes.map { lower_byte(it.to_i).as_u8 }
+  Str.from_bytes(bs)
+}
+
+# The context transition function for the text state.
+def t_text(c: Context, s: Str) -> (Context, Int) {
+  k = 0
+  loop {
+    x = index_byte(s[k...s.size], 60)
+    if x < 0 || k + x + 1 == s.size {
+      return (c, s.size)
+    }
+    i = k + x
+    if i + 4 <= s.size && s[i...i + 4] == COMMENT_START {
+      return (ctx(STATE_HTML_CMT), i + 4)
+    }
+    i += 1
+    is_end = false
+    if s[i] == 47 {
+      if i + 1 == s.size {
+        return (c, s.size)
+      }
+      is_end = true
+      i += 1
+    }
+    j, e = eat_tag_name(s, i)
+    if j != i {
+      e = ELEMENT_NONE if is_end
+      # We've found an HTML tag.
+      r = ctx(STATE_TAG)
+      r.element = e
+      return (r, j)
+    }
+    k = j
+  }
+  (c, s.size)
+}
+
+def element_content_type(e: Int) -> Int {
+  case e {
+    ELEMENT_SCRIPT => STATE_JS
+    ELEMENT_STYLE => STATE_CSS
+    ELEMENT_TEXTAREA | ELEMENT_TITLE => STATE_RCDATA
+    _ => STATE_TEXT
+  }
+}
+
+# The context transition function for the tag state.
+def t_tag(c: Context, s: Str) -> (Context, Int) {
+  # Find the attribute name.
+  i = eat_white_space(s, 0)
+  if i == s.size {
+    return (c, s.size)
+  }
+  if s[i] == 62 {
+    # Treat <meta> specially, because it doesn't have an end tag, and we
+    # want to transition into the correct state/element for it.
+    if c.element == ELEMENT_META {
+      return (ctx(STATE_TEXT), i + 1)
+    }
+    r = ctx(element_content_type(c.element))
+    r.element = c.element
+    return (r, i + 1)
+  }
+  j, err = eat_attr_name(s, i)
+  if e = err {
+    return (err_ctx(e), s.size)
+  }
+  attr = ATTR_NONE
+  if i == j {
+    return (err_ctx(errorf(ERR_BAD_HTML, none, 0, "expected space, attr name, or end of tag, but got #{gq(s[i...s.size])}")), s.size)
+  }
+  name = to_lower_ascii(s[i...j])
+  if c.element == ELEMENT_SCRIPT && name == "type" {
+    attr = ATTR_SCRIPT_TYPE
+  } else if c.element == ELEMENT_META && name == "content" {
+    attr = ATTR_META_CONTENT
+  } else {
+    case attr_type(name) {
+      CONTENT_URL => attr = ATTR_URL
+      CONTENT_CSS => attr = ATTR_STYLE
+      CONTENT_JS => attr = ATTR_SCRIPT
+      CONTENT_SRCSET => attr = ATTR_SRCSET
+      _ => {}
+    }
+  }
+  r = ctx(j == s.size ? STATE_ATTR_NAME : STATE_AFTER_NAME)
+  r.element = c.element
+  r.attr = attr
+  (r, j)
+}
+
+# The context transition function for STATE_ATTR_NAME.
+def t_attr_name(c: Context, s: Str) -> (Context, Int) {
+  i, err = eat_attr_name(s, 0)
+  if e = err {
+    return (err_ctx(e), s.size)
+  }
+  r = c
+  r.state = STATE_AFTER_NAME if i != s.size
+  (r, i)
+}
+
+# The context transition function for STATE_AFTER_NAME.
+def t_after_name(c: Context, s: Str) -> (Context, Int) {
+  # Look for the start of the value.
+  i = eat_white_space(s, 0)
+  if i == s.size {
+    return (c, s.size)
+  }
+  r = c
+  if s[i] != 61 {
+    # Occurs due to tag ending '>', and valueless attribute.
+    r.state = STATE_TAG
+    return (r, i)
+  }
+  r.state = STATE_BEFORE_VALUE
+  # Consume the "=".
+  (r, i + 1)
+}
+
+def attr_start_state(a: Int) -> Int {
+  case a {
+    ATTR_SCRIPT => STATE_JS
+    ATTR_STYLE => STATE_CSS
+    ATTR_URL => STATE_URL
+    ATTR_SRCSET => STATE_SRCSET
+    ATTR_META_CONTENT => STATE_META_CONTENT
+    _ => STATE_ATTR
+  }
+}
+
+# The context transition function for STATE_BEFORE_VALUE.
+def t_before_value(c: Context, s: Str) -> (Context, Int) {
+  i = eat_white_space(s, 0)
+  if i == s.size {
+    return (c, s.size)
+  }
+  # Find the attribute delimiter.
+  delim = DELIM_SPACE_OR_TAG_END
+  if s[i] == 39 {
+    delim = DELIM_SINGLE_QUOTE
+    i += 1
+  } else if s[i] == 34 {
+    delim = DELIM_DOUBLE_QUOTE
+    i += 1
+  }
+  r = c
+  r.state = attr_start_state(c.attr)
+  r.delim = delim
+  (r, i)
+}
+
+# The context transition function for STATE_HTML_CMT.
+def t_html_cmt(c: Context, s: Str) -> (Context, Int) {
+  i = s.byteindex(COMMENT_END)
+  if i != -1 {
+    return (ctx(STATE_TEXT), i + 3)
+  }
+  (c, s.size)
+}
+
+def special_tag_end_marker(e: Int) -> Str {
+  case e {
+    ELEMENT_SCRIPT => "script"
+    ELEMENT_STYLE => "style"
+    ELEMENT_TEXTAREA => "textarea"
+    ELEMENT_TITLE => "title"
+    _ => ""
+  }
+}
+
+# The context transition function for raw text and RCDATA element states.
+def t_special_tag_end(c: Context, s: Str) -> (Context, Int) {
+  if c.element != ELEMENT_NONE {
+    # script end tags ("</script") within script literals are ignored, so
+    # that we can properly escape them.
+    if c.element == ELEMENT_SCRIPT && (is_in_script_literal(c.state) || is_comment(c.state)) {
+      return (c, s.size)
+    }
+    i = index_tag_end(s, special_tag_end_marker(c.element))
+    if i != -1 {
+      return (ctx(STATE_TEXT), i)
+    }
+  }
+  (c, s.size)
+}
+
+TAG_END_SEPARATORS = "> \t\n\x0c/"
+
+# The index of a special tag end in a case insensitive way, or -1.
+def index_tag_end(s0: Str, tag: Str) -> Int {
+  s = s0
+  res = 0
+  plen = 2
+  while s.size > 0 {
+    # Try to find the tag end prefix first
+    i = s.byteindex("</")
+    return i if i == -1
+    s = s[i + plen...s.size]
+    # Try to match the actual tag if there is still space for it
+    if tag.size <= s.size && equal_fold_ascii(tag, s[0...tag.size]) {
+      s = s[tag.size...s.size]
+      # Check the tag is followed by a proper separator
+      if s.size > 0 && index_byte(TAG_END_SEPARATORS, s[0].to_i) != -1 {
+        return res + i
+      }
+      res += tag.size
+    }
+    res += i + plen
+  }
+  -1
+}
+
+# The context transition function for the attribute state.
+def t_attr(c: Context, s: Str) -> (Context, Int) { (c, s.size) }
+
+# The context transition function for the URL state.
+def t_url(c: Context, s: Str) -> (Context, Int) {
+  r = c
+  if index_any(s, "#?") >= 0 {
+    r.url_part = URL_PART_QUERY_OR_FRAG
+  } else if s.size != eat_white_space(s, 0) && c.url_part == URL_PART_NONE {
+    # HTML5 uses "Valid URL potentially surrounded by spaces" for attrs:
+    # https://www.w3.org/TR/html5/index.html#attributes-1
+    r.url_part = URL_PART_PRE_QUERY
+  }
+  (r, s.size)
+}
+
+# The context transition function for the JS state.
+def t_js(c: Context, s: Str) -> (Context, Int) {
+  r = c
+  i = index_any(s, "\"`'/{}<-#")
+  if i == -1 {
+    # Entire input is non string, comment, regexp tokens.
+    r.js_ctx = next_js_ctx(s, c.js_ctx)
+    return (r, s.size)
+  }
+  r.js_ctx = next_js_ctx(s[0...i], c.js_ctx)
+  case s[i] {
+    34 => {
+      r.state = STATE_JS_DQ_STR
+      r.js_ctx = JS_CTX_REGEXP
+    }
+    39 => {
+      r.state = STATE_JS_SQ_STR
+      r.js_ctx = JS_CTX_REGEXP
+    }
+    96 => {
+      r.state = STATE_JS_TMPL_LIT
+      r.js_ctx = JS_CTX_REGEXP
+    }
+    47 => {
+      if i + 1 < s.size && s[i + 1] == 47 {
+        r.state = STATE_JS_LINE_CMT
+        i += 1
+      } else if i + 1 < s.size && s[i + 1] == 42 {
+        r.state = STATE_JS_BLOCK_CMT
+        i += 1
+      } else if r.js_ctx == JS_CTX_REGEXP {
+        r.state = STATE_JS_REGEXP
+      } else if r.js_ctx == JS_CTX_DIV_OP {
+        r.js_ctx = JS_CTX_REGEXP
+      } else {
+        return (err_ctx(errorf(ERR_SLASH_AMBIG, none, 0, "'/' could start a division or regexp: #{gq_prec(s[i...s.size], 32)}")), s.size)
+      }
+    }
+    # ECMAScript supports HTML style comments for legacy reasons, see
+    # Appendix B.1.1 "HTML-like Comments". The handling of these comments
+    # is somewhat confusing. Multi-line comments are not supported, i.e.
+    # anything on lines between the opening and closing tokens is not
+    # considered a comment, but anything following the opening or closing
+    # token, on the same line, is ignored. As such we simply treat any line
+    # prefixed with "<!--" or "-->" as if it were actually prefixed with
+    # "//" and move on.
+    60 => {
+      if i + 3 < s.size && s[i...i + 4] == COMMENT_START {
+        r.state = STATE_JS_HTML_OPEN_CMT
+        i += 3
+      }
+    }
+    45 => {
+      if i + 2 < s.size && s[i...i + 3] == COMMENT_END {
+        r.state = STATE_JS_HTML_CLOSE_CMT
+        i += 2
+      }
+    }
+    # ECMAScript also supports "hashbang" comment lines, see Section 12.5.
+    35 => {
+      if i + 1 < s.size && s[i + 1] == 33 {
+        r.state = STATE_JS_LINE_CMT
+        i += 1
+      }
+    }
+    123 => {
+      # We only care about tracking brace depth if we are inside of a
+      # template literal.
+      if r.js_brace_depth.size == 0 {
+        r.js_ctx = next_js_ctx(s[i...i + 1], r.js_ctx)
+        return (r, i + 1)
+      }
+      d = r.js_brace_depth.map { it }
+      d[d.size - 1] = d[d.size - 1] + 1
+      r.js_brace_depth = d
+      r.js_ctx = next_js_ctx(s[i...i + 1], r.js_ctx)
+    }
+    125 => {
+      if r.js_brace_depth.size == 0 {
+        r.js_ctx = next_js_ctx(s[i...i + 1], r.js_ctx)
+        return (r, i + 1)
+      }
+      # There are no cases where a brace can be escaped in the JS context
+      # that are not syntax errors, it seems. Because of this we can just
+      # count "\}" as "}" and move on, the script is already broken as fully
+      # fledged parsers will just fail anyway.
+      d = r.js_brace_depth.map { it }
+      d[d.size - 1] = d[d.size - 1] - 1
+      r.js_brace_depth = d
+      if d[d.size - 1] >= 0 {
+        r.js_ctx = next_js_ctx(s[i...i + 1], r.js_ctx)
+        return (r, i + 1)
+      }
+      r.js_brace_depth = d[0...d.size - 1]
+      r.state = STATE_JS_TMPL_LIT
+    }
+    _ => {}
+  }
+  (r, i + 1)
+}
+
+def t_js_tmpl(c: Context, s: Str) -> (Context, Int) {
+  r = c
+  k = 0
+  loop {
+    x = index_any(s[k...s.size], "`\\$")
+    break if x < 0
+    i = k + x
+    case s[i] {
+      92 => {
+        i += 1
+        if i == s.size {
+          return (err_ctx(errorf(ERR_PARTIAL_ESCAPE, none, 0, "unfinished escape sequence in JS string: #{gq(s)}")), s.size)
+        }
+      }
+      36 => {
+        if s.size >= i + 2 && s[i + 1] == 123 {
+          d = r.js_brace_depth.map { it }
+          d << 0
+          r.js_brace_depth = d
+          r.jsbd_set = true
+          r.state = STATE_JS
+          return (r, i + 2)
+        }
+      }
+      _ => {
+        # end
+        r.state = STATE_JS
+        return (r, i + 1)
+      }
+    }
+    k = i + 1
+  }
+  (r, s.size)
+}
+
+# The context transition function for the JS string and regexp states.
+def t_js_delimited(c: Context, s: Str) -> (Context, Int) {
+  specials = "\\\""
+  if c.state == STATE_JS_SQ_STR {
+    specials = "\\'"
+  } else if c.state == STATE_JS_REGEXP {
+    specials = "\\/[]"
+  }
+  r = c
+  k = 0
+  in_charset = false
+  loop {
+    x = index_any(s[k...s.size], specials)
+    break if x < 0
+    i = k + x
+    case s[i] {
+      92 => {
+        i += 1
+        if i == s.size {
+          return (err_ctx(errorf(ERR_PARTIAL_ESCAPE, none, 0, "unfinished escape sequence in JS string: #{gq(s)}")), s.size)
+        }
+      }
+      91 => in_charset = true
+      93 => in_charset = false
+      47 => {
+        # If "</script" appears in a regex literal, the '/' should not close
+        # the regex literal, and it will later be escaped to "\x3C/script"
+        # in escapeText.
+        if i > 0 && i + 7 <= s.size && equal_fold_ascii(s[i - 1...i + 7], "</script") {
+          i += 1
+        } else if !in_charset {
+          r.state = STATE_JS
+          r.js_ctx = JS_CTX_DIV_OP
+          return (r, i + 1)
+        }
+      }
+      _ => {
+        # end delimiter
+        if !in_charset {
+          r.state = STATE_JS
+          r.js_ctx = JS_CTX_DIV_OP
+          return (r, i + 1)
+        }
+      }
+    }
+    k = i + 1
+  }
+  if in_charset {
+    # This can be fixed by making context richer if interpolation into
+    # charsets is desired.
+    return (err_ctx(errorf(ERR_PARTIAL_CHARSET, none, 0, "unfinished JS regexp charset: #{gq(s)}")), s.size)
+  }
+  (r, s.size)
+}
+
+# The context transition function for /*comment*/ states.
+def t_block_cmt(c: Context, s: Str) -> (Context, Int) {
+  i = s.byteindex("*/")
+  if i == -1 {
+    return (c, s.size)
+  }
+  r = c
+  if c.state == STATE_JS_BLOCK_CMT {
+    r.state = STATE_JS
+  } else {
+    r.state = STATE_CSS
+  }
+  (r, i + 2)
+}
+
+# The context transition function for //comment states, and the JS
+# HTML-like comment state.
+def t_line_cmt(c: Context, s: Str) -> (Context, Int) {
+  i = -1
+  end_state = STATE_JS
+  if c.state == STATE_CSS_LINE_CMT {
+    i = index_any(s, "\n\x0c\r")
+    end_state = STATE_CSS
+  } else {
+    i = index_any_runes(s, "\n\r  ")
+  }
+  if i == -1 {
+    return (c, s.size)
+  }
+  r = c
+  r.state = end_state
+  # Per section 7.4 of EcmaScript 5 : https://es5.github.io/#x7.4
+  # "However, the LineTerminator at the end of the line is not considered
+  # to be part of the single-line comment; it is recognized separately by
+  # the lexical grammar and becomes part of the stream of input elements
+  # for the syntactic grammar."
+  (r, i)
+}
+
+def trim_right_css_space(s: Str) -> Str {
+  e = s.size
+  while e > 0 && is_css_space(s[e - 1]) { e -= 1 }
+  s[0...e]
+}
+
+# The context transition function for the CSS state.
+def t_css(c: Context, s: Str) -> (Context, Int) {
+  # CSS quoted strings are almost never used except for URLs, multiword
+  # font-names, list separators in content values and attribute value
+  # selectors. We conservatively treat all strings as URLs, but make some
+  # allowances to avoid confusion.
+  r = c
+  k = 0
+  loop {
+    x = index_any(s[k...s.size], "(\"'/")
+    if x < 0 {
+      return (c, s.size)
+    }
+    i = k + x
+    case s[i] {
+      40 => {
+        # Look for url to the left.
+        p = trim_right_css_space(s[0...i])
+        if ends_with_css_keyword(p, "url") {
+          j = i + 1
+          while j < s.size && is_css_space(s[j]) { j += 1 }
+          if j != s.size && s[j] == 34 {
+            r.state = STATE_CSS_DQ_URL
+            j += 1
+          } else if j != s.size && s[j] == 39 {
+            r.state = STATE_CSS_SQ_URL
+            j += 1
+          } else {
+            r.state = STATE_CSS_URL
+          }
+          return (r, j)
+        }
+      }
+      47 => {
+        if i + 1 < s.size {
+          if s[i + 1] == 47 {
+            r.state = STATE_CSS_LINE_CMT
+            return (r, i + 2)
+          }
+          if s[i + 1] == 42 {
+            r.state = STATE_CSS_BLOCK_CMT
+            return (r, i + 2)
+          }
+        }
+      }
+      34 => {
+        r.state = STATE_CSS_DQ_STR
+        return (r, i + 1)
+      }
+      39 => {
+        r.state = STATE_CSS_SQ_STR
+        return (r, i + 1)
+      }
+      _ => {}
+    }
+    k = i + 1
+  }
+  (r, s.size)
+}
+
+# The context transition function for the CSS string and URL states.
+def t_css_str(c: Context, s: Str) -> (Context, Int) {
+  end_and_esc = ""
+  case c.state {
+    STATE_CSS_DQ_STR | STATE_CSS_DQ_URL => end_and_esc = "\\\""
+    STATE_CSS_SQ_STR | STATE_CSS_SQ_URL => end_and_esc = "\\'"
+    # Unquoted URLs end with a newline or close parenthesis. The below
+    # includes the wc (whitespace character) and nl.
+    _ => end_and_esc = "\\\t\n\x0c\r )"
+  }
+  r = c
+  k = 0
+  loop {
+    x = index_any(s[k...s.size], end_and_esc)
+    if x < 0 {
+      r2, nread = t_url(r, decode_css(s[k...s.size]))
+      return (r2, k + nread)
+    }
+    i = k + x
+    if s[i] == 92 {
+      i += 1
+      if i == s.size {
+        return (err_ctx(errorf(ERR_PARTIAL_ESCAPE, none, 0, "unfinished escape sequence in CSS string: #{gq(s)}")), s.size)
+      }
+    } else {
+      r.state = STATE_CSS
+      return (r, i + 1)
+    }
+    r, _ = t_url(r, decode_css(s[0...i + 1]))
+    k = i + 1
+  }
+  (r, s.size)
+}
+
+# The context transition function for the error state.
+def t_error(c: Context, s: Str) -> (Context, Int) { (c, s.size) }
+
+# The context transition function for the meta content attribute state.
+def t_meta_content(c: Context, s: Str) -> (Context, Int) {
+  i = 0
+  while i < s.size {
+    if i + 3 <= s.size - 1 && equal_fold_ascii(s[i...i + 3], "url") {
+      j = eat_white_space(s, i + 3)
+      if j < s.size && s[j] == 61 {
+        r = c
+        r.state = STATE_META_CONTENT_URL
+        return (r, j + 1)
+      }
+    }
+    i += 1
+  }
+  (c, s.size)
+}
+
+# The context transition function for the "url=" part of a meta content
+# attribute state.
+def t_meta_content_url(c: Context, s: Str) -> (Context, Int) {
+  i = 0
+  while i < s.size {
+    if s[i] == 59 {
+      r = c
+      r.state = STATE_META_CONTENT
+      return (r, i + 1)
+    }
+    i += 1
+  }
+  (c, s.size)
+}
+
+# The largest j such that s[i...j] is an attribute name. It is an error if
+# s[i...] does not look like it begins with an attribute name, such as
+# encountering a quote mark without a preceding equals sign.
+def eat_attr_name(s: Str, i: Int) -> (Int, ErrInfo?) {
+  j = i
+  while j < s.size {
+    case s[j] {
+      32 | 9 | 10 | 12 | 13 | 61 | 62 => {
+        return (j, none)
+      }
+      39 | 34 | 60 => {
+        # These result in a parse warning in HTML5 and are indicative of
+        # serious problems if seen in an attr name in a template.
+        return (-1, errorf(ERR_BAD_HTML, none, 0, "#{gq(s[j...j + 1])} in attribute name: #{gq_prec(s, 32)}"))
+      }
+      _ => {}
+    }
+    j += 1
+  }
+  (s.size, none)
+}
+
+def element_of_name(n: Str) -> Int {
+  case n {
+    "script" => ELEMENT_SCRIPT
+    "style" => ELEMENT_STYLE
+    "textarea" => ELEMENT_TEXTAREA
+    "title" => ELEMENT_TITLE
+    "meta" => ELEMENT_META
+    _ => ELEMENT_NONE
+  }
+}
+
+# Whether c is an ASCII letter.
+def ascii_alpha(c: Int) -> Bool { (65 <= c && c <= 90) || (97 <= c && c <= 122) }
+
+# Whether c is an ASCII letter or digit.
+def ascii_alpha_num(c: Int) -> Bool { ascii_alpha(c) || (48 <= c && c <= 57) }
+
+# The largest j such that s[i...j] is a tag name, and the tag type.
+def eat_tag_name(s: Str, i: Int) -> (Int, Int) {
+  if i == s.size || !ascii_alpha(s[i].to_i) {
+    return (i, ELEMENT_NONE)
+  }
+  j = i + 1
+  while j < s.size {
+    x = s[j].to_i
+    if ascii_alpha_num(x) {
+      j += 1
+      next
+    }
+    # Allow "x-y" or "x:y" but not "x-", "-y", or "x--y".
+    if (x == 58 || x == 45) && j + 1 < s.size && ascii_alpha_num(s[j + 1].to_i) {
+      j += 2
+      next
+    }
+    break
+  }
+  (j, element_of_name(to_lower_ascii(s[i...j])))
+}
+
+# The largest j such that s[i...j] is white space.
+def eat_white_space(s: Str, i: Int) -> Int {
+  j = i
+  while j < s.size {
+    c = s[j]
+    return j if !(c == 32 || c == 9 || c == 10 || c == 12 || c == 13)
+    j += 1
+  }
+  s.size
+}
+
+# Go's %q of a byte string.
+def gq(s: Str) -> Str { strconv.quote(s) }
+
+# Go's %.Nq: the first n runes, quoted.
+def gq_prec(s: Str, n: Int) -> Str {
+  i = 0
+  k = 0
+  while i < s.size && k < n {
+    _, w = decode_rune(s, i)
+    i += w
+    k += 1
+  }
+  strconv.quote(s[0...i])
+}

@@ -1,0 +1,648 @@
+# Prepared statements (Go's *Stmt), result sets (*Rows, *Row) and column
+# types.
+
+import "context"
+import "database/sql/driver"
+import "sync"
+
+# ------------------------------------------------------------------- Stmt
+
+# What a Stmt is prepared on: the pool (each connection gets its own driver
+# statement, re-prepared as needed), a Tx or a Conn (Go's stmtConnGrabber).
+struct Grabber {
+  tx: Tx?
+  c: Conn?
+
+  def some? -> Bool { tx != none || c != none }
+}
+
+def no_grabber -> Grabber { Grabber.new(tx: none, c: none) }
+
+def grab(g: Grabber, ctx: context.Context) -> ~(DriverConn, Release) {
+  if tx = g.tx {
+    d = tx.~grab_conn(ctx)
+    return (d, tx.rel_tx)
+  }
+  if c = g.c {
+    d = c.~grab_conn(ctx)
+    return (d, c.rel)
+  }
+  fail "sql: no connection grabber"
+}
+
+def grabber_tx_ctx(g: Grabber) -> context.Context? {
+  if tx = g.tx {
+    return tx.ctx
+  }
+  none
+}
+
+struct ConnStmt {
+  dc: DriverConn
+  ds: DriverStmt
+}
+
+# A Stmt's mutable part, shared by its copies (and by Tx statements made
+# from it, which depend on it).
+struct StmtCore {
+  id: Int
+  st: Mutex[StmtState]
+}
+
+struct StmtState {
+  closed: Bool
+  # The driver statements by connection (Go's css).
+  css: [ConnStmt]
+  last_num_closed: Int
+  # The driver statement of a Tx or Conn statement (Go's cgds).
+  cgds: DriverStmt?
+}
+
+def new_stmt_core(id: Int, css: [ConnStmt], last_num_closed: Int, cgds: DriverStmt?) -> StmtCore {
+  st = StmtState.new(closed: false, css: css, last_num_closed: last_num_closed, cgds: cgds)
+  StmtCore.new(id: id, st: Mutex.new(st.dup))
+}
+
+# What closing a Stmt needs (a Tx keeps these for the statements prepared
+# in it; a Stmt itself can't be kept there: it holds its Tx).
+struct StmtCloser {
+  db: DB
+  core: StmtCore
+  parent: StmtCore?
+  closemu: ClosingMutex
+  sticky_err: Error?
+  has_cg: Bool
+
+  def close -> ~Unit {
+    closemu.lock
+    defer closemu.unlock
+    if e = sticky_err {
+      fail e
+    }
+    got = core.st.lock { |s|
+      r: (Bool, DriverStmt?) = (true, none)
+      if !s.closed {
+        s.closed = true
+        r = (false, s.cgds)
+        s.cgds = none
+      }
+      r
+    }
+    return nil if got[0]
+    txds = got[1]
+    if !has_cg {
+      if db.remove_dep(core.id, core.id) {
+        stmt_final_close(db, core)
+      }
+      return nil
+    }
+    if p = parent {
+      if db.remove_dep(p.id, core.id) {
+        stmt_final_close(db, p)
+      }
+      return nil
+    }
+    if ds = txds {
+      return ds.~close
+    }
+    nil
+  }
+}
+
+# Go's Stmt.finalClose: the statement's driver statements close as their
+# connections come back.
+def stmt_final_close(db: DB, core: StmtCore) {
+  css = core.st.lock { |s|
+    v = s.css
+    s.css = []
+    v
+  }
+  for v in css {
+    db.note_unused_driver_statement(v.dc, v.ds)
+    v.dc.st.lock { |d|
+      d.open_stmt.delete(v.ds.id)
+      nil
+    }
+  }
+}
+
+# A prepared statement (Go's *Stmt). Safe for concurrent use; on the pool
+# it is prepared again on each connection it runs on.
+pub struct Stmt {
+  db: DB
+  text: Str
+  sticky_err: Error?
+  closemu: ClosingMutex
+  cg: Grabber
+  parent: StmtCore?
+  core: StmtCore
+
+  def closer -> StmtCloser {
+    has_cg = cg.some?
+    StmtCloser.new(db: db, core: core, parent: parent, closemu: closemu, sticky_err: sticky_err, has_cg: has_cg)
+  }
+
+  # Go's removeClosedStmtLocked: forgets driver statements of closed
+  # connections, now and then.
+  def remove_closed_stmt {
+    db_closed = db.num_closed.load
+    core.st.lock { |s|
+      t = s.css.size / 2 + 1
+      t = 10 if t > 10
+      if db_closed - s.last_num_closed >= t {
+        keep: [ConnStmt] = []
+        for v in s.css {
+          gone = v.dc.st.lock { |d| d.dbmu_closed }
+          keep << v if !gone
+        }
+        s.css = keep
+        s.last_num_closed = db_closed
+      }
+      nil
+    }
+  }
+
+  # Go's connStmt: a connection and this statement prepared on it.
+  def conn_stmt(ctx: context.Context, strategy: Int) -> ~(DriverConn, Release, DriverStmt) {
+    if e = sticky_err {
+      fail e
+    }
+    closed = core.st.lock { |s| s.closed }
+    fail SqlError.StmtClosed if closed
+    if cg.some? {
+      g = ~grab(cg, ctx)
+      ds = core.st.lock { |s| s.cgds }
+      return (g[0], g[1], ds.unwrap)
+    }
+    remove_closed_stmt
+    dc = db.~conn(ctx, strategy)
+    found = core.st.lock { |s| s.css.find { |v| v.dc.id == dc.id } }
+    if v = found {
+      return (dc, db_release(db, dc), v.ds)
+    }
+    dc.lock.lock
+    r = prepare_on_conn_locked(ctx, dc)
+    dc.lock.unlock
+    if e = r.err {
+      db.put_conn(dc, e, true)
+      fail e
+    }
+    (dc, db_release(db, dc), r.unwrap)
+  }
+
+  # Go's prepareOnConnLocked (dc's lock held).
+  def prepare_on_conn_locked(ctx: context.Context, dc: DriverConn) -> ~DriverStmt {
+    has_cg = cg.some?
+    ds = ~prepare_locked(db, ctx, dc, has_cg, text)
+    core.st.lock { |s|
+      s.css << ConnStmt.new(dc: dc, ds: ds)
+      nil
+    }
+    ds
+  }
+
+  pub def exec[A](args: A) -> ~Result { ~exec_context(context.background, args) }
+
+  # Executes the statement with `args` (see the header for argument lists).
+  pub def exec_context[A](ctx: context.Context, args: A) -> ~Result {
+    nv = driver.~to_named_values(args)
+    closemu.rlock
+    defer closemu.runlock
+    r = exec_once(ctx, nv, CACHED_OR_NEW_CONN)
+    r = exec_once(ctx, nv, CACHED_OR_NEW_CONN) if retry?(r.err)
+    r = exec_once(ctx, nv, ALWAYS_NEW_CONN) if retry?(r.err)
+    ~r
+  }
+
+  def exec_once(ctx: context.Context, nv: [driver.NamedValue], strategy: Int) -> ~Result {
+    c = ~conn_stmt(ctx, strategy)
+    r = result_from_statement(ctx, c[0].ci, c[2], nv)
+    release(c[1], r.err)
+    ~r
+  }
+
+  pub def query[A](args: A) -> ~Rows { ~query_context(context.background, args) }
+
+  pub def query_context[A](ctx: context.Context, args: A) -> ~Rows {
+    nv = driver.~to_named_values(args)
+    closemu.rlock
+    defer closemu.runlock
+    r = query_once(ctx, nv, CACHED_OR_NEW_CONN)
+    r = query_once(ctx, nv, CACHED_OR_NEW_CONN) if retry?(r.err)
+    r = query_once(ctx, nv, ALWAYS_NEW_CONN) if retry?(r.err)
+    ~r
+  }
+
+  def query_once(ctx: context.Context, nv: [driver.NamedValue], strategy: Int) -> ~Rows {
+    c = ~conn_stmt(ctx, strategy)
+    r = rowsi_from_statement(ctx, c[0].ci, c[2], nv)
+    if e = r.err {
+      release(c[1], e)
+      fail e
+    }
+    rows_id = db.next_id
+    db.add_dep(core.id, rows_id)
+    rows = new_rows(db, c[0], c[1], (core, rows_id), r.unwrap, none)
+    rows.init_context_close(ctx, grabber_tx_ctx(cg))
+    rows
+  }
+
+  pub def query_row[A](args: A) -> Row { query_row_context(context.background, args) }
+
+  pub def query_row_context[A](ctx: context.Context, args: A) -> Row {
+    r = query_context(ctx, args)
+    if e = r.err {
+      return Row.new(e0: e, rows: none)
+    }
+    Row.new(e0: none, rows: r.unwrap)
+  }
+
+  # Closes the statement (its driver statements close as their connections
+  # come back).
+  pub def close -> ~Unit { closer.~close }
+}
+
+# ------------------------------------------------------------------- Rows
+
+struct RowsState {
+  lasterr: Error?
+  closed: Bool
+  hit_eof: Bool
+  next_called: Bool
+  lastcols: [driver.Value]
+  num_cols: Int
+  cancel: (() -> Unit)?
+  context_done: Error?
+}
+
+# The result of a query (Go's *Rows): `while rows.next { x = rows.~scan }`,
+# then `rows.err`. Closing early is fine; it closes itself at the end.
+pub struct Rows {
+  db: DB
+  dc: DriverConn
+  rel: Release
+  # A Stmt's query depends on the Stmt until the Rows close.
+  stmt_dep: (StmtCore, Int)?
+  rowsi: driver.Rows
+  close_stmt: DriverStmt?
+  closemu: ClosingMutex
+  st: Mutex[RowsState]
+
+  def init_context_close(ctx: context.Context, txctx: context.Context?) {
+    tx_can = txctx?.cancelable? || false
+    return if !ctx.cancelable? && !tx_can
+    closectx, cancel = context.with_cancel(ctx)
+    st.lock { |s|
+      s.cancel = cancel
+      nil
+    }
+    rows = self.dup
+    if t = txctx {
+      _ = spawn {
+        select {
+          when ctx.done.recv => rows.note_context_done(ctx_error(ctx))
+          when t.done.recv => rows.note_context_done(ctx_error(t))
+          when closectx.done.recv => {}
+        }
+        _ = rows.close_with(ctx_err(ctx))
+      }
+    } else {
+      _ = spawn {
+        select {
+          when ctx.done.recv => rows.note_context_done(ctx_error(ctx))
+          when closectx.done.recv => {}
+        }
+        _ = rows.close_with(ctx_err(ctx))
+      }
+    }
+    nil
+  }
+
+  def note_context_done(e: Error) {
+    st.lock { |s|
+      s.context_done = e
+      nil
+    }
+  }
+
+  def lasterr_or_err_locked(s: RowsState, err: Error?) -> Error? {
+    if e = s.lasterr {
+      return e
+    }
+    err
+  }
+
+  # Moves to the next row; false at the end or on an error (see err).
+  pub def next -> Bool {
+    cd = st.lock { |s| s.context_done }
+    return false if cd != none
+    closemu.rlock
+    r = next_locked
+    closemu.runlock
+    do_close = r[0]
+    ok = r[1]
+    _ = close if do_close
+    if do_close && !ok {
+      st.lock { |s|
+        s.hit_eof = true
+        nil
+      }
+    }
+    ok
+  }
+
+  def next_locked -> (Bool, Bool) {
+    closed = st.lock { |s| s.closed }
+    return (false, false) if closed
+    dc.lock.lock
+    defer dc.lock.unlock
+    dest = st.lock { |s|
+      if !s.next_called {
+        s.num_cols = rowsi.columns.size
+        s.next_called = true
+      }
+      if s.lastcols.size != s.num_cols {
+        s.lastcols = [driver.Value.Null; s.num_cols]
+      }
+      s.lastcols
+    }
+    r = rowsi.next(dest)
+    if e = r.err {
+      st.lock { |s|
+        s.lasterr = e
+        nil
+      }
+      return (true, false)
+    }
+    if !r.unwrap {
+      return (true, false) if !rowsi.has_next_result_set?
+      return (false, false)
+    }
+    st.lock { |s|
+      s.lastcols = dest
+      nil
+    }
+    (false, true)
+  }
+
+  # Moves to the next result set (Go's NextResultSet); false when there is
+  # none or on an error.
+  pub def next_result_set -> Bool {
+    closemu.rlock
+    closed = st.lock { |s| s.closed }
+    if closed {
+      closemu.runlock
+      return false
+    }
+    st.lock { |s|
+      s.next_called = false
+      s.lastcols = []
+      nil
+    }
+    if !rowsi.has_next_result_set? {
+      closemu.runlock
+      _ = close
+      return false
+    }
+    dc.lock.lock
+    r = rowsi.next_result_set
+    dc.lock.unlock
+    if e = r.err {
+      st.lock { |s|
+        s.lasterr = e
+        nil
+      }
+      closemu.runlock
+      _ = close
+      return false
+    }
+    closemu.runlock
+    true
+  }
+
+  # The error that ended iteration, if any (Go's Err).
+  pub def err -> Error? {
+    cd = st.lock { |s| s.hit_eof ? none : s.context_done }
+    if e = cd {
+      return e
+    }
+    closemu.rlock
+    defer closemu.runlock
+    st.lock { |s| lasterr_or_err_locked(s, none) }
+  }
+
+  # err as a Result: `~rows.err_result` after the loop.
+  pub def err_result -> ~Unit {
+    if e = err {
+      fail e
+    }
+    nil
+  }
+
+  pub def columns -> ~[Str] {
+    closemu.rlock
+    defer closemu.runlock
+    closed = st.lock { |s| s.closed }
+    if closed {
+      e = st.lock { |s| lasterr_or_err_locked(s, SqlError.RowsClosed) }
+      fail e.unwrap
+    }
+    dc.lock.lock
+    defer dc.lock.unlock
+    rowsi.columns
+  }
+
+  pub def column_types -> ~[ColumnType] {
+    closemu.rlock
+    defer closemu.runlock
+    closed = st.lock { |s| s.closed }
+    if closed {
+      e = st.lock { |s| lasterr_or_err_locked(s, SqlError.RowsClosed) }
+      fail e.unwrap
+    }
+    dc.lock.lock
+    defer dc.lock.unlock
+    names = rowsi.columns
+    out: [ColumnType] = []
+    for i in 0...names.size {
+      ln = rowsi.column_type_length(i)
+      nl = rowsi.column_type_nullable(i)
+      ps = rowsi.column_type_precision_scale(i)
+      out << ColumnType.new(name: names[i], has_nullable: nl != none, has_length: ln != none, has_precision_scale: ps != none, nullable_: nl || false, length_: ln || 0, database_type: rowsi.column_type_database_type_name(i), precision: (ps || (0, 0))[0], scale: (ps || (0, 0))[1], scan_type_: rowsi.column_type_scan_type(i))
+    }
+    out
+  }
+
+  # The current row as it came from the driver, after the checks Go's Scan
+  # makes.
+  def current -> ~RawRow {
+    closemu.rlock
+    defer closemu.runlock
+    s = st.lock { |s| (s.lasterr, s.closed, s.next_called, s.lastcols, s.num_cols) }
+    if e = s[0] {
+      fail e
+    }
+    if s[1] {
+      fail SqlError.RowsClosed
+    }
+    fail "sql: Scan called without calling Next" if !s[2]
+    dc.lock.lock
+    cols = rowsi.columns
+    dc.lock.unlock
+    vals: [driver.Value] = []
+    for v in s[3] {
+      vals << clone_value(v)
+    }
+    RawRow.new(columns: cols, values: vals)
+  }
+
+  # The current row as a T: a tuple, a #[derive(Row)] struct, or one value
+  # (Go's Scan; see the header).
+  pub def scan[T] -> ~T {
+    raw = ~current
+    v: T = ~scan_row(raw)
+    v
+  }
+
+  # Column i of the current row as a T.
+  pub def get[T](i: Int) -> ~T {
+    raw = ~current
+    fail "sql: column index #{i} out of range [0, #{raw.values.size})" if i < 0 || i >= raw.values.size
+    v: T = ~convert_column(raw, i)
+    v
+  }
+
+  # The current row's driver Values (Go's Scan into `*any`).
+  pub def values -> ~[driver.Value] {
+    raw = ~current
+    raw.values
+  }
+
+  # Every remaining row as a T, then closes (an addition).
+  pub def scan_all[T] -> ~[T] {
+    out: [T] = []
+    while self.next {
+      r: ~T = scan_row_of(self)
+      if e = r.err {
+        _ = close
+        fail e
+      }
+      out << r.unwrap
+    }
+    ~err_result
+    out
+  }
+
+  pub def close -> ~Unit { ~close_with(none) }
+
+  # Go's Rows.close(err).
+  def close_with(err0: Error?) -> ~Unit {
+    closemu.lock
+    defer closemu.unlock
+    already = st.lock { |s|
+      was = s.closed
+      s.closed = true
+      s.lasterr = err0 if !was && s.lasterr == none
+      was
+    }
+    return nil if already
+    dc.lock.lock
+    r = rowsi.close
+    dc.lock.unlock
+    cancel = st.lock { |s| s.cancel }
+    if c = cancel {
+      c()
+    }
+    if cs = close_stmt {
+      _ = cs.close
+    }
+    release(rel, r.err)
+    if d = stmt_dep {
+      if db.remove_dep(d[0].id, d[1]) {
+        stmt_final_close(db, d[0])
+      }
+    }
+    st.lock { |s|
+      s.lasterr = lasterr_or_err_locked(s, r.err)
+      nil
+    }
+    ~r
+  }
+}
+
+def scan_row_of[T](rows: Rows) -> ~T {
+  v: T = rows.~scan
+  v
+}
+
+def clone_value(v: driver.Value) -> driver.Value {
+  case v {
+    Bytes(b) => driver.Value.Bytes(b.dup)
+    _ => v
+  }
+}
+
+def new_rows(db: DB, dc: DriverConn, rel: Release, stmt_dep: (StmtCore, Int)?, rowsi: driver.Rows, close_stmt: DriverStmt?) -> Rows {
+  st = RowsState.new(lasterr: none, closed: false, hit_eof: false, next_called: false, lastcols: [], num_cols: 0, cancel: none, context_done: none)
+  Rows.new(db: db, dc: dc, rel: rel, stmt_dep: stmt_dep, rowsi: rowsi, close_stmt: close_stmt, closemu: new_closing_mutex, st: Mutex.new(st))
+}
+
+# ------------------------------------------------------------------- Row
+
+# The result of query_row (Go's *Row): `scan` reads the first row and
+# closes; no row is ERR_NO_ROWS.
+pub struct Row {
+  e0: Error?
+  rows: Rows?
+
+  pub def scan[T] -> ~T {
+    if e = e0 {
+      fail e
+    }
+    rs = rows.unwrap
+    if !rs.next {
+      _ = rs.close
+      if e = rs.err {
+        fail e
+      }
+      fail SqlError.NoRows
+    }
+    r: ~T = scan_row_of(rs)
+    if e = r.err {
+      _ = rs.close
+      fail e
+    }
+    ~rs.close
+    r.unwrap
+  }
+
+  # The error of the query, if it failed (Go's Row.Err).
+  pub def err -> Error? { e0 }
+}
+
+# ------------------------------------------------------------ ColumnType
+
+# What the driver says about a result column (Go's *ColumnType).
+pub struct ColumnType {
+  name: Str
+  has_nullable: Bool
+  has_length: Bool
+  has_precision_scale: Bool
+  nullable_: Bool
+  length_: Int
+  database_type: Str
+  precision: Int
+  scale: Int
+  scan_type_: Str
+
+  # The length of variable-length types (text, blobs), if the driver knows.
+  pub def length -> Int? { has_length ? length_ : none }
+  # (precision, scale) of decimal types, if the driver knows.
+  pub def decimal_size -> (Int, Int)? { has_precision_scale ? (precision, scale) : none }
+  # The alx type to scan into, by name ("Int", "Str", ...; "any" if unknown).
+  pub def scan_type -> Str { scan_type_ }
+  # Whether the column may be NULL, if the driver knows.
+  pub def nullable -> Bool? { has_nullable ? nullable_ : none }
+  # The database's name for the type ("VARCHAR", "INTEGER", ...), or "".
+  pub def database_type_name -> Str { database_type }
+}

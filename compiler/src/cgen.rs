@@ -247,8 +247,12 @@ fn vname(f: &LFunc, v: V) -> String {
 }
 
 fn c_str(s: &str) -> String {
+    c_bytes(s.as_bytes())
+}
+
+fn c_bytes(s: &[u8]) -> String {
     let mut o = String::from("\"");
-    for b in s.bytes() {
+    for &b in s {
         match b {
             b'"' => o.push_str("\\\""),
             b'\\' => o.push_str("\\\\"),
@@ -774,6 +778,7 @@ impl FnEmit<'_> {
             }
             LE::B(b) => if *b { "true" } else { "false" }.into(),
             LE::S(s) => format!("alx_str_lit({}, {})", c_str(s), s.len()),
+            LE::SB(b) => format!("alx_str_lit({}, {})", c_bytes(b), b.len()),
             LE::Loc(s) => c_str(s),
             LE::Unit => "0".into(),
             LE::Tup(t, vs) => {

@@ -1,0 +1,177 @@
+# Go's embed/internal/embedtest tests (embed_test.go, embedx_test.go).
+
+import "io/fs"
+import "os"
+import "testing/fstest"
+
+#[embed("testdata/h*.txt")]
+#[embed("c*.txt", "testdata/g*.txt")]
+GLOBAL: FS
+
+#[embed("c*txt")]
+CONCURRENCY: Str
+
+#[embed("testdata/g*.txt")]
+GLASS: [Byte]
+
+#[embed("testdata")]
+TEST_DIR_ALL: FS
+
+#[embed("testdata")]
+TEST_HIDDEN_DIR: FS
+
+#[embed("testdata/*")]
+TEST_HIDDEN_STAR: FS
+
+#[embed("all:testdata")]
+TEST_ALL_PREFIX: FS
+
+#[embed("testdata/*.txt")]
+XGLOBAL: FS
+
+#[embed("testdata/ascii.txt")]
+SBIG: Str
+
+#[embed("testdata/ascii.txt")]
+BBIG: [Byte]
+
+# Not UTF-8: 00 80 ff 41 0a.
+#[embed("binary.dat")]
+BINARY: Str
+
+#[embed("binary.dat")]
+BINARY_BYTES: [Byte]
+
+def check_file(f: FS, name: Str, data: Str) -> ~Unit {
+  d = f.~read_file(name)
+  assert_eq Str.from_bytes(d), data
+}
+
+def check_dir(f: FS, name: Str, expect: [Str]) -> ~Unit {
+  dirs = f.~read_dir(name)
+  names: [Str] = []
+  for d in dirs {
+    n = d.name
+    n += "/" if d.is_dir
+    names << n
+  }
+  assert_eq names, expect
+}
+
+test "Global" {
+  ~check_file(GLOBAL, "concurrency.txt", "Concurrency is not parallelism.\n")
+  ~check_file(GLOBAL, "testdata/hello.txt", "hello, world\n")
+  ~check_file(GLOBAL, "testdata/glass.txt", "I can eat glass and it doesn't hurt me.\n")
+  ~fstest.test_fs(GLOBAL, ["concurrency.txt", "testdata/hello.txt"])
+  assert_eq CONCURRENCY, "Concurrency is not parallelism.\n"
+  assert_eq Str.from_bytes(GLASS), "I can eat glass and it doesn't hurt me.\n"
+}
+
+test "Dir" {
+  all = TEST_DIR_ALL
+  ~check_file(all, "testdata/hello.txt", "hello, world\n")
+  ~check_file(all, "testdata/i/i18n.txt", "internationalization\n")
+  ~check_file(all, "testdata/i/j/k/k8s.txt", "kubernetes\n")
+  ~check_file(all, "testdata/ken.txt", "If a program is too slow, it must have a loop.\n")
+  ~check_dir(all, ".", ["testdata/"])
+  ~check_dir(all, "testdata/i", ["i18n.txt", "j/"])
+  ~check_dir(all, "testdata/i/j", ["k/"])
+  ~check_dir(all, "testdata/i/j/k", ["k8s.txt"])
+}
+
+test "Hidden" {
+  ~check_dir(TEST_HIDDEN_DIR, "testdata", ["-not-hidden/", "ascii.txt", "glass.txt", "hello.txt", "i/", "ken.txt"])
+  ~check_dir(TEST_HIDDEN_STAR, "testdata", ["-not-hidden/", ".hidden/", "_hidden/", "ascii.txt", "glass.txt", "hello.txt", "i/", "ken.txt"])
+  # but not .more or _more
+  ~check_dir(TEST_HIDDEN_STAR, "testdata/.hidden", ["fortune.txt", "more/"])
+  # `all:` keeps them.
+  ~check_dir(TEST_ALL_PREFIX, "testdata/.hidden", [".more/", "_more/", "fortune.txt", "more/"])
+}
+
+test "Uninitialized" {
+  uninitialized = FS.new
+  ~check_dir(uninitialized, ".", [])
+  f = uninitialized.~open(".")
+  fi = f.~stat
+  assert fi.is_dir, "in uninitialized embed.FS, . is not a directory"
+  f.~close!
+}
+
+test "Aliases" {
+  want = TEST_DIR_ALL.~read_file("testdata/hello.txt")
+  assert_eq Str.from_bytes(want), "hello, world\n"
+}
+
+test "Offset" {
+  file = TEST_DIR_ALL.~open_file("testdata/hello.txt")
+  want = "hello, world\n"
+  # Read the entire file.
+  got: [Byte] = [0; want.size]
+  n = file.~read!(got)
+  assert_eq n, want.size
+  assert_eq Str.from_bytes(got), want
+  # Try to read one byte; confirm we're at the end.
+  buf: [Byte] = [0; 1]
+  n = file.~read!(buf)
+  assert_eq n, 0
+  # Use seek to get the offset at the end.
+  off = file.~seek!(0, 1)
+  assert_eq off, want.size
+  # read_at reads the entire file, ignoring the offset.
+  got2: [Byte] = [0; want.size]
+  n = file.~read_at(got2, 0)
+  assert_eq n, want.size
+  assert_eq Str.from_bytes(got2), want
+  # read_at with a non-zero offset.
+  rest = want[7...want.size]
+  got3: [Byte] = [0; rest.size]
+  n = file.~read_at(got3, 7)
+  assert_eq n, rest.size
+  assert_eq Str.from_bytes(got3), rest
+}
+
+test "XGlobal" {
+  ~check_file(XGLOBAL, "testdata/hello.txt", "hello, world\n")
+  big = os.~read_file("testdata/ascii.txt")
+  assert_eq SBIG, Str.from_bytes(big)
+  assert_eq Str.from_bytes(BBIG), Str.from_bytes(big)
+  # Each use of a [Byte] constant is a fresh copy: changing one never
+  # changes the embedded data (Go's variables share instead).
+  g = GLASS
+  g[0] = g[0] + 1
+  assert GLASS[0] != g[0]
+}
+
+test "not UTF-8" {
+  assert_eq BINARY.size, 5
+  assert_eq BINARY.bytes.to_a, [0.as_u8, 0x80, 0xff, 0x41, 0x0a]
+  assert_eq BINARY_BYTES, [0.as_u8, 0x80, 0xff, 0x41, 0x0a]
+}
+
+test "errors" {
+  r = TEST_DIR_ALL.read_file("testdata/nope.txt")
+  assert_eq "#{r.err.unwrap}", "open testdata/nope.txt: file does not exist"
+  assert fs.is_not_exist(r.err.unwrap)
+  r2 = TEST_DIR_ALL.read_file("testdata/i")
+  assert_eq "#{r2.err.unwrap}", "read testdata/i: is a directory"
+  r3 = TEST_DIR_ALL.read_dir("testdata/hello.txt")
+  assert_eq "#{r3.err.unwrap}", "read testdata/hello.txt: not a directory"
+  r4 = TEST_DIR_ALL.open("../x")
+  assert r4.err?
+}
+
+test "fs functions" {
+  info = ~fs.stat(TEST_DIR_ALL, "testdata/i/j")
+  assert info.is_dir
+  assert_eq info.name, "j"
+  assert_eq info.mode.to_s, "dr-xr-xr-x"
+  info = ~fs.stat(TEST_DIR_ALL, "testdata/hello.txt")
+  assert_eq info.mode.to_s, "-r--r--r--"
+  assert_eq info.size, 13
+  matches = ~fs.glob(TEST_DIR_ALL, "testdata/*.txt")
+  assert_eq matches, ["testdata/ascii.txt", "testdata/glass.txt", "testdata/hello.txt", "testdata/ken.txt"]
+  sub = ~fs.sub(TEST_DIR_ALL, "testdata/i")
+  d = ~fs.read_file(sub, "j/k/k8s.txt")
+  assert_eq Str.from_bytes(d), "kubernetes\n"
+  ~fstest.test_fs(TEST_DIR_ALL, ["testdata/hello.txt", "testdata/i/j/k/k8s.txt"])
+}

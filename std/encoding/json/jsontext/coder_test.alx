@@ -1,0 +1,621 @@
+# Go's coder_test.go, decode_test.go and encode_test.go: the logic of
+# TestCoderInterleaved, TestCoderStackPointer, TestCoderMaxDepth, TestDecoder,
+# TestFaultyDecoder, TestDecoderErrors, TestResumableDecoder,
+# TestPeekableDecoder, TestDecoderReset, TestEncoder, TestFaultyEncoder,
+# TestEncoderErrors, TestEncoderReset. The tables are generated from Go's
+# (vec_coder_test.alx, vec_decerr_test.alx, vec_encerr_test.alx).
+
+import "bytes"
+import "strings"
+import "encoding/hex"
+
+# The bytes of a hex string as a Str (for invalid UTF-8 in test data).
+def hs(h: Str) -> Str { Str.from_bytes(hex.decode_string(h).unwrap) }
+
+struct CoderCase {
+  name: Str
+  input: Str
+  compacted: Str
+  escaped: Str
+  indented: Str
+  canonicalized: Str
+  tokens: [Token]
+  pointers: [Str]
+  has_pointers: Bool
+}
+
+struct DecCall {
+  kind: Kind
+  token: Bool
+  out: Str
+  err: Str
+  ptr: Str
+}
+
+struct DecErrCase {
+  name: Str
+  opts: [Options]
+  input: Str
+  calls: [DecCall]
+  offset: Int
+}
+
+struct EncCall {
+  token: Bool
+  tok: Token
+  val: Str
+  err: Str
+  ptr: Str
+}
+
+struct EncErrCase {
+  name: Str
+  opts: [Options]
+  calls: [EncCall]
+  out: Str
+}
+
+# A deterministic pseudo-random source (splitmix64).
+struct Rng {
+  st: [U64]
+  def n!(k: Int) -> Int {
+    self.st[0] = st[0] +% 0x9e3779b97f4a7c15
+    z = st[0]
+    z = (z ^ (z >> 30)) *% 0xbf58476d1ce4e5b9
+    z = (z ^ (z >> 27)) *% 0x94d049bb133111eb
+    z = z ^ (z >> 31)
+    (z % k.to_u64).as_i64
+  }
+}
+
+pub error FaultError {
+  NoProgress
+  ShortWrite
+  def message -> Str {
+    case self {
+      NoProgress => "multiple Read calls return no data or error"
+      ShortWrite => "short write"
+    }
+  }
+}
+
+# Go's FaultyBuffer as a Reader: at most max bytes per read (1 or more:
+# reading 0 is the end of input in alx), and sometimes an error instead.
+struct FaultyReader {
+  st: [FState]
+  pub def read!(p: [Byte]) -> ~Int {
+    return 0 if st[0].b.size == 0 || p.size == 0
+    if st[0].may_error && st[0].rng.n!(2) == 0 {
+      fail FaultError.NoProgress
+    }
+    n = st[0].max
+    n = p.size if n > p.size
+    n = st[0].b.size if n > st[0].b.size
+    for i in 0...n { p[i] = st[0].b[i] }
+    self.st[0].b = st[0].b[n...st[0].b.size]
+    n
+  }
+}
+
+# Go's FaultyBuffer as a Writer: sometimes fails without writing (alx
+# writers write all or fail).
+struct FaultyWriter {
+  st: [FState]
+  pub def write!(p: [Byte]) -> ~Int {
+    if st[0].may_error && st[0].rng.n!(2) == 0 {
+      fail FaultError.ShortWrite
+    }
+    for c in p { self.st[0].b << c }
+    p.size
+  }
+}
+
+struct FState {
+  b: [Byte]
+  max: Int
+  may_error: Bool
+  rng: Rng
+}
+
+def faulty_state(s: Str, may_error: Bool) -> [FState] {
+  [FState.new(b: s.bytes, max: 1, may_error: may_error, rng: Rng.new(st: [0]))]
+}
+
+def err_text(r: Error?) -> Str {
+  if e = r { return e.message }
+  ""
+}
+
+test "coder interleaved" {
+  for td in coder_cases {
+    for mode in ["TokenFirst", "ValueFirst", "TokenDelims"] {
+      dst = bytes.new_buffer([])
+      dec = new_str_decoder(td.input, [])
+      enc = new_encoder(dst, [])
+      tick = mode == "TokenFirst"
+      loop {
+        if mode == "TokenDelims" {
+          k = dec.peek_kind!
+          tick = k == Kind.BeginObject || k == Kind.EndObject || k == Kind.BeginArray || k == Kind.EndArray
+        }
+        if tick {
+          r = dec.read_token!
+          assert r.ok?, "#{td.name}/#{mode}: read_token: #{err_text(r.err)}"
+          t = r.unwrap
+          break if t.none?
+          enc.~write_token!(t.unwrap)
+        } else {
+          q = dec.read_value!
+          if !q.ok? {
+            k = dec.peek_kind!
+            if k == Kind.EndObject || k == Kind.EndArray {
+              assert syntactic(q.err.unwrap).present?, "#{td.name}: want a SyntacticError"
+              tick = !tick
+              next
+            }
+            assert false, "#{td.name}/#{mode}: read_value: #{err_text(q.err)}"
+          }
+          v = q.unwrap
+          break if v.none?
+          enc.~write_value!(v.unwrap)
+        }
+        tick = !tick
+      }
+      check_eq(dst.string, td.compacted + "\n", "#{td.name}/#{mode}")
+    }
+  }
+}
+
+test "coder stack pointer" {
+  tests: [(Token, Str)] = [
+    (Token.null, ""),
+    (Token.begin_array, ""), (Token.end_array, ""),
+    (Token.begin_array, ""), (bool(true), "/0"), (Token.end_array, ""),
+    (Token.begin_array, ""), (string("hello"), "/0"), (string("goodbye"), "/1"), (Token.end_array, ""),
+    (Token.begin_object, ""), (Token.end_object, ""),
+    (Token.begin_object, ""), (string("hello"), "/hello"), (string("goodbye"), "/hello"), (Token.end_object, ""),
+    (Token.begin_object, ""),
+    (string(""), "/"), (Token.null, "/"),
+    (string("0"), "/0"), (Token.null, "/0"),
+    (string("~"), "/~0"), (Token.null, "/~0"),
+    (string("/"), "/~1"), (Token.null, "/~1"),
+    (string("a//b~/c/~d~~e"), "/a~1~1b~0~1c~1~0d~0~0e"), (Token.null, "/a~1~1b~0~1c~1~0d~0~0e"),
+    (string(" \r\n\t"), "/ \r\n\t"), (Token.null, "/ \r\n\t"),
+    (Token.end_object, ""),
+    (Token.begin_array, ""), (Token.begin_object, "/0"), (string(""), "/0/"), (Token.begin_array, "/0/"),
+    (Token.begin_object, "/0//0"), (string("\#"), "/0//0/\#"), (Token.null, "/0//0/\#"), (Token.end_object, "/0//0"),
+    (Token.end_array, "/0/"), (Token.end_object, "/0"), (Token.end_array, ""),
+  ]
+  for dupes in [false, true] {
+    bb = bytes.new_buffer([])
+    enc = new_encoder(bb, [allow_duplicate_names(dupes)])
+    for i in 0...tests.size {
+      enc.~write_token!(tests[i][0])
+      check_eq(enc.stack_pointer.s, tests[i][1], "encoder #{i}")
+    }
+    dec = new_decoder(bb, [allow_duplicate_names(dupes)])
+    for i in 0...tests.size {
+      dec.~read_token!
+      check_eq(dec.stack_pointer.s, tests[i][1], "decoder #{i}")
+    }
+  }
+}
+
+def check_read_token(dec: Decoder, want: Kind, want_err: Str, what: Str) {
+  r = dec.read_token!
+  if r.ok? {
+    k = r.unwrap?.kind || Kind.Invalid
+    assert k == want && want_err == "", "#{what}: read_token = #{k}, want #{want} #{want_err}"
+  } else {
+    check_eq(err_text(r.err), want_err, what)
+  }
+}
+
+def check_read_value(dec: Decoder, want_len: Int, want_err: Str, what: Str) {
+  q = dec.read_value!
+  if q.ok? {
+    n = q.unwrap?.raw?.size || 0
+    assert n == want_len && want_err == "", "#{what}: read_value len #{n}, want #{want_len} #{want_err}"
+  } else {
+    check_eq(err_text(q.err), want_err, what)
+  }
+}
+
+def check_write_token(enc: Encoder, t: Token, want_err: Str, what: Str) {
+  check_eq(err_text(enc.write_token!(t).err), want_err, what)
+}
+
+def check_write_value(enc: Encoder, v: Str, want_err: Str, what: Str) {
+  check_eq(err_text(enc.write_value!(Value.of(v)).err), want_err, what)
+}
+
+def trim_array(s: Str) -> Str { s[1...s.size - 1] }
+def trim_object(s: Str) -> Str { s[4...s.size - 1] }
+
+test "coder max depth" {
+  d = MAX_NESTING_DEPTH
+  max_arrays = "[" * (d + 1) + "]" * (d + 1)
+  max_objects = "{\"\":" * (d + 1) + "\"\"" + "}" * (d + 1)
+  arr_err = SyntacticError.new(byte_offset: d, json_pointer: Pointer.new(s: "/0" * d), err: Cause.MaxDepth).message
+  obj_err = SyntacticError.new(byte_offset: d * 4, json_pointer: Pointer.new(s: "/" * d), err: Cause.MaxDepth).message
+
+  dec = new_str_decoder(trim_array(max_arrays), [])
+  check_read_value(dec, d * 2, "", "ArraysValid/SingleValue")
+  dec = new_str_decoder(trim_array(max_arrays), [])
+  check_read_token(dec, Kind.BeginArray, "", "ArraysValid/TokenThenValue")
+  check_read_value(dec, (d - 1) * 2, "", "ArraysValid/TokenThenValue")
+  check_read_token(dec, Kind.EndArray, "", "ArraysValid/TokenThenValue")
+  dec = new_str_decoder(trim_array(max_arrays), [])
+  for _i in 0...d { check_read_token(dec, Kind.BeginArray, "", "ArraysValid/AllTokens") }
+  for _i in 0...d { check_read_token(dec, Kind.EndArray, "", "ArraysValid/AllTokens") }
+
+  dec = new_str_decoder(max_arrays, [])
+  check_read_value(dec, 0, arr_err, "ArraysInvalid/SingleValue")
+  dec = new_str_decoder(max_arrays, [])
+  check_read_token(dec, Kind.BeginArray, "", "ArraysInvalid/TokenThenValue")
+  check_read_value(dec, 0, arr_err, "ArraysInvalid/TokenThenValue")
+  dec = new_str_decoder(max_arrays, [])
+  for _i in 0...d { check_read_token(dec, Kind.BeginArray, "", "ArraysInvalid/AllTokens") }
+  check_read_value(dec, 0, arr_err, "ArraysInvalid/AllTokens")
+
+  dec = new_str_decoder(trim_object(max_objects), [])
+  check_read_value(dec, d * 5 + 2, "", "ObjectsValid/SingleValue")
+  dec = new_str_decoder(trim_object(max_objects), [])
+  check_read_token(dec, Kind.BeginObject, "", "ObjectsValid/TokenThenValue")
+  check_read_token(dec, Kind.String, "", "ObjectsValid/TokenThenValue")
+  check_read_value(dec, (d - 1) * 5 + 2, "", "ObjectsValid/TokenThenValue")
+  check_read_token(dec, Kind.EndObject, "", "ObjectsValid/TokenThenValue")
+  dec = new_str_decoder(trim_object(max_objects), [])
+  for _i in 0...d {
+    check_read_token(dec, Kind.BeginObject, "", "ObjectsValid/AllTokens")
+    check_read_token(dec, Kind.String, "", "ObjectsValid/AllTokens")
+  }
+  check_read_token(dec, Kind.String, "", "ObjectsValid/AllTokens")
+  for _i in 0...d { check_read_token(dec, Kind.EndObject, "", "ObjectsValid/AllTokens") }
+
+  dec = new_str_decoder(max_objects, [])
+  check_read_value(dec, 0, obj_err, "ObjectsInvalid/SingleValue")
+  dec = new_str_decoder(max_objects, [])
+  check_read_token(dec, Kind.BeginObject, "", "ObjectsInvalid/TokenThenValue")
+  check_read_token(dec, Kind.String, "", "ObjectsInvalid/TokenThenValue")
+  check_read_value(dec, 0, obj_err, "ObjectsInvalid/TokenThenValue")
+  dec = new_str_decoder(max_objects, [])
+  for _i in 0...d {
+    check_read_token(dec, Kind.BeginObject, "", "ObjectsInvalid/AllTokens")
+    check_read_token(dec, Kind.String, "", "ObjectsInvalid/AllTokens")
+  }
+  check_read_token(dec, Kind.Invalid, obj_err, "ObjectsInvalid/AllTokens")
+
+  enc = new_buffered_encoder([])
+  check_write_value(enc, max_arrays, arr_err, "Arrays/SingleValue")
+  check_write_value(enc, trim_array(max_arrays), "", "Arrays/SingleValue")
+  enc = new_buffered_encoder([])
+  check_write_token(enc, Token.begin_array, "", "Arrays/TokenThenValue")
+  check_write_value(enc, trim_array(max_arrays), arr_err, "Arrays/TokenThenValue")
+  check_write_value(enc, trim_array(trim_array(max_arrays)), "", "Arrays/TokenThenValue")
+  check_write_token(enc, Token.end_array, "", "Arrays/TokenThenValue")
+  enc = new_buffered_encoder([])
+  for _i in 0...d { check_write_token(enc, Token.begin_array, "", "Arrays/AllTokens") }
+  check_write_token(enc, Token.begin_array, arr_err, "Arrays/AllTokens")
+  for _i in 0...d { check_write_token(enc, Token.end_array, "", "Arrays/AllTokens") }
+
+  enc = new_buffered_encoder([])
+  check_write_value(enc, max_objects, obj_err, "Objects/SingleValue")
+  check_write_value(enc, trim_object(max_objects), "", "Objects/SingleValue")
+  enc = new_buffered_encoder([])
+  check_write_token(enc, Token.begin_object, "", "Objects/TokenThenValue")
+  check_write_token(enc, string(""), "", "Objects/TokenThenValue")
+  check_write_value(enc, trim_object(max_objects), obj_err, "Objects/TokenThenValue")
+  check_write_value(enc, trim_object(trim_object(max_objects)), "", "Objects/TokenThenValue")
+  check_write_token(enc, Token.end_object, "", "Objects/TokenThenValue")
+  enc = new_buffered_encoder([])
+  for _i in 0...d - 1 {
+    check_write_token(enc, Token.begin_object, "", "Objects/AllTokens")
+    check_write_token(enc, string(""), "", "Objects/AllTokens")
+  }
+  check_write_token(enc, Token.begin_object, "", "Objects/AllTokens")
+  check_write_token(enc, string(""), "", "Objects/AllTokens")
+  check_write_token(enc, Token.begin_object, obj_err, "Objects/AllTokens")
+  check_write_token(enc, string(""), "", "Objects/AllTokens")
+  for _i in 0...d { check_write_token(enc, Token.end_object, "", "Objects/AllTokens") }
+}
+
+test "decoder" {
+  for td in coder_cases {
+    # Token
+    dec = new_decoder(bytes.new_buffer_string(td.input), [])
+    toks: [Str] = []
+    ptrs: [Str] = []
+    while t = dec.~read_token! {
+      toks << t.clone.to_s
+      ptrs << dec.stack_pointer.s if td.has_pointers
+    }
+    check_eq(toks, td.tokens.map { it.to_s }, "#{td.name}/Token")
+    check_eq(ptrs, td.pointers, "#{td.name}/Token pointers")
+    # Value
+    dec = new_decoder(bytes.new_buffer_string(td.input), [])
+    v = dec.~read_value!
+    check_eq(v.unwrap.to_s, strings.trim_space(td.input), "#{td.name}/Value")
+    # TokenDelims
+    dec = new_decoder(bytes.new_buffer_string(td.input), [])
+    toks = []
+    loop {
+      k = dec.peek_kind!
+      if k == Kind.BeginObject || k == Kind.EndObject || k == Kind.BeginArray || k == Kind.EndArray {
+        t = dec.~read_token!
+        break if t.none?
+        toks << t.unwrap.to_s
+      } else {
+        vv = dec.~read_value!
+        break if vv.none?
+        toks << Token.raw_token(vv.unwrap.to_s).to_s
+      }
+    }
+    check_eq(toks, td.tokens.map { it.to_s }, "#{td.name}/TokenDelims")
+  }
+}
+
+test "faulty decoder" {
+  for td in coder_cases {
+    dec = new_decoder(FaultyReader.new(st: faulty_state(td.input, true)), [])
+    toks: [Str] = []
+    loop {
+      r = dec.read_token!
+      if !r.ok? {
+        assert err_text(r.err).include?("multiple Read calls return no data or error"), "#{td.name}/Token: #{err_text(r.err)}"
+        next
+      }
+      t = r.unwrap
+      break if t.none?
+      toks << t.unwrap.to_s
+    }
+    check_eq(toks, td.tokens.map { it.to_s }, "#{td.name}/Token")
+    dec = new_decoder(FaultyReader.new(st: faulty_state(td.input, true)), [])
+    loop {
+      q = dec.read_value!
+      if !q.ok? {
+        assert err_text(q.err).include?("multiple Read calls return no data or error"), "#{td.name}/Value: #{err_text(q.err)}"
+        next
+      }
+      v = q.unwrap
+      break if v.none?
+      check_eq(v.unwrap.to_s, strings.trim_space(td.input), "#{td.name}/Value")
+    }
+  }
+}
+
+test "decoder errors" {
+  for td in decoder_error_cases {
+    dec = new_decoder(bytes.new_buffer_string(td.input), td.opts)
+    for i in 0...td.calls.size {
+      call = td.calls[i]
+      k = dec.peek_kind!
+      assert k == call.kind, "#{td.name}: #{i}: peek_kind = #{k}, want #{call.kind}"
+      got_err = ""
+      if call.token {
+        r = dec.read_token!
+        if r.ok? {
+          if t = r.unwrap {
+            check_eq(t.to_s, call.out, "#{td.name}: #{i}: read_token")
+          } else {
+            got_err = "<EOF>"
+          }
+        } else {
+          got_err = err_text(r.err)
+        }
+      } else {
+        q = dec.read_value!
+        if q.ok? {
+          if v = q.unwrap {
+            check_eq(v.to_s, call.out, "#{td.name}: #{i}: read_value")
+          } else {
+            got_err = "<EOF>"
+          }
+        } else {
+          got_err = err_text(q.err)
+        }
+      }
+      check_eq(got_err, call.err, "#{td.name}: #{i}: error")
+      if call.ptr != "" {
+        check_eq(dec.stack_pointer.s, call.ptr, "#{td.name}: #{i}: stack_pointer")
+      }
+    }
+    check_eq(dec.input_offset, td.offset, "#{td.name}: input_offset")
+    unread = Str.from_bytes(dec.unread_buffer)
+    want_unread = td.input[td.offset...td.input.size]
+    assert want_unread.start_with?(unread), "#{td.name}: unread #{unread}"
+  }
+}
+
+test "resumable decoder" {
+  cases = ["0", "123456789", "0.0", "0.123456789", "0e0", "0e+0", "0e123456789", "0e+123456789",
+    "123456789.123456789e+123456789", "-0", "-123456789", "-0.0", "-0.123456789", "-0e0", "-0e-0",
+    "-0e123456789", "-0e-123456789", "-123456789.123456789e-123456789",
+    "\"\"", "\"a\"", "\"ab\"", "\"abc\"", "\"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz\"",
+    "\"\\\"\\\\\\/\\b\\f\\n\\r\\t\"", "\"\\u0022\\u005c\\u002f\\u0008\\u000c\\u000a\\u000d\\u0009\"",
+    "\"\\ud800\\udead\"", "\"\u0080ö€힙דּ�\U0001f602\"",
+    "\"\\u0080\\u00f6\\u20ac\\ud799\\ue000\\ufb33\\ufffd\\ud83d\\ude02\""]
+  for want in cases {
+    dec = new_decoder(FaultyReader.new(st: faulty_state(want, false)), [])
+    got = dec.~read_value!
+    assert_eq got.unwrap.to_s, want
+  }
+}
+
+test "peekable decoder" {
+  bb = bytes.new_buffer([])
+  d = new_decoder(bb, [])
+  pk = ->(want: Kind, i: Int) { assert d.peek_kind! == want, "#{i}: peek_kind" }
+  rt = ->(want: Kind, err: Str, i: Int) {
+    r = d.read_token!
+    if r.ok? {
+      k = r.unwrap?.kind || Kind.Invalid
+      e = r.unwrap.none? ? "<EOF>" : ""
+      assert k == want && e == err, "#{i}: read_token = #{k} #{e}, want #{want} #{err}"
+    } else {
+      assert want == Kind.Invalid && err_text(r.err) == err, "#{i}: read_token error #{err_text(r.err)}, want #{err}"
+    }
+  }
+  rv = ->(want: Kind, err: Str, i: Int) {
+    r = d.read_value!
+    if r.ok? {
+      k = r.unwrap?.kind || Kind.Invalid
+      e = r.unwrap.none? ? "<EOF>" : ""
+      assert k == want && e == err, "#{i}: read_value = #{k} #{e}, want #{want} #{err}"
+    } else {
+      assert want == Kind.Invalid && err_text(r.err) == err, "#{i}: read_value error #{err_text(r.err)}, want #{err}"
+    }
+  }
+  eof_at = ->(prefix: Str, ptr: Str) -> Str {
+    SyntacticError.new(byte_offset: prefix.size, json_pointer: Pointer.new(s: ptr), err: Cause.UnexpectedEof).message
+  }
+  pk(Kind.Invalid, 0)
+  bb.write_string!("[ ")
+  rt(Kind.Invalid, "<EOF>", 2)
+  rt(Kind.BeginArray, "", 3)
+  pk(Kind.Invalid, 4)
+  bb.write_string!("] ")
+  rv(Kind.Invalid, eof_at("[ ", ""), 6)
+  rv(Kind.Invalid, SyntacticError.new(byte_offset: 2, json_pointer: Pointer.new(s: "/0"), err: invalid_char("]".bytes, "at start of value")).message, 7)
+  rt(Kind.EndArray, "", 8)
+  bb.write_string!("[ ")
+  rt(Kind.BeginArray, "", 10)
+  bb.write_string!(" null ")
+  pk(Kind.Null, 12)
+  pk(Kind.Null, 13)
+  rt(Kind.Null, "", 14)
+  bb.write_string!(", ")
+  pk(Kind.Invalid, 16)
+  bb.write_string!("fal")
+  pk(Kind.False, 18)
+  rv(Kind.Invalid, eof_at("[ ] [  null , fal", "/1"), 19)
+  bb.write_string!("se ")
+  rv(Kind.False, "", 21)
+  pk(Kind.Invalid, 22)
+  bb.write_string!(" , ")
+  pk(Kind.Invalid, 24)
+  bb.write_string!(" \"\" ")
+  rv(Kind.Invalid, eof_at("[ ] [  null , false  , ", ""), 26)
+  rv(Kind.String, "", 27)
+  bb.write_string!(" , 0")
+  pk(Kind.Number, 29)
+  rt(Kind.Number, "", 30)
+  bb.write_string!(" , {} , []")
+  pk(Kind.BeginObject, 32)
+  rv(Kind.BeginObject, "", 33)
+  rv(Kind.BeginArray, "", 34)
+  bb.write_string!("]")
+  rt(Kind.EndArray, "", 36)
+}
+
+test "decoder reset" {
+  large = "{\"key1\":\"value1\",\"key2\":\"value2\",\"key3\":\"value3\",\"key4\":\"value4\",\"key5\":\"value5\"}"
+  dec = new_decoder(bytes.new_buffer_string(large), [])
+  assert_eq dec.~read_value!.unwrap.to_s, large
+  dec.reset!(bytes.new_buffer_string(large), [])
+  assert_eq dec.~read_value!.unwrap.to_s, large
+  dec.reset!(bytes.new_buffer_string(large), [])
+  assert_eq dec.~read_value!.unwrap.to_s, large
+}
+
+test "encoder" {
+  for td in coder_cases {
+    for fmt_name in ["Compact", "Indented"] {
+      for type_name in ["Token", "Value", "TokenDelims"] {
+        opts = [flag_option(F_OMIT_TOP_LEVEL_NEWLINE, true)]
+        want = td.compacted
+        if fmt_name == "Indented" {
+          opts = opts + [multiline(true), with_indent_prefix("\t"), with_indent("    ")]
+          want = td.indented if td.indented != ""
+        }
+        dst = bytes.new_buffer([])
+        enc = new_encoder(dst, opts)
+        what = "#{td.name}/#{type_name}/#{fmt_name}"
+        if type_name == "Token" {
+          ptrs: [Str] = []
+          for t in td.tokens {
+            enc.~write_token!(t)
+            ptrs << enc.stack_pointer.s if td.has_pointers
+          }
+          check_eq(ptrs, td.pointers, what)
+        } else if type_name == "Value" {
+          enc.~write_value!(Value.of(td.input))
+        } else {
+          for t in td.tokens {
+            k = t.kind
+            if k == Kind.BeginObject || k == Kind.EndObject || k == Kind.BeginArray || k == Kind.EndArray {
+              enc.~write_token!(t)
+            } else {
+              v = Value.of(t.to_s)
+              if k == Kind.String {
+                b, _e = append_quote_opts([], t.to_s.bytes, Options.new)
+                v = Value.new(raw: b)
+              }
+              enc.~write_value!(v)
+            }
+          }
+        }
+        check_eq(dst.string, want, what)
+      }
+    }
+  }
+}
+
+test "faulty encoder" {
+  for td in coder_cases {
+    for type_name in ["Token", "Value"] {
+      st = faulty_state("", true)
+      enc = new_encoder(FaultyWriter.new(st: st), [])
+      if type_name == "Token" {
+        for t in td.tokens {
+          r = enc.write_token!(t)
+          assert r.ok? || err_text(r.err).include?("short write"), "#{td.name}: #{err_text(r.err)}"
+        }
+      } else {
+        r = enc.write_value!(Value.of(td.input))
+        assert r.ok? || err_text(r.err).include?("short write"), "#{td.name}: #{err_text(r.err)}"
+      }
+      got = Str.from_bytes(st[0].b) + Str.from_bytes(enc.bytes)
+      check_eq(got, td.compacted + "\n", "#{td.name}/#{type_name}")
+    }
+  }
+}
+
+test "encoder errors" {
+  for td in encoder_error_cases {
+    dst = bytes.new_buffer([])
+    enc = new_encoder(dst, td.opts)
+    for i in 0...td.calls.size {
+      call = td.calls[i]
+      got = ""
+      if call.token {
+        got = err_text(enc.write_token!(call.tok).err)
+      } else {
+        got = err_text(enc.write_value!(Value.of(call.val)).err)
+      }
+      check_eq(got, call.err, "#{td.name}: #{i}")
+      if call.ptr != "" {
+        check_eq(enc.stack_pointer.s, call.ptr, "#{td.name}: #{i}: stack_pointer")
+      }
+    }
+    got_out = dst.string + Str.from_bytes(enc.bytes)
+    check_eq(got_out, td.out, "#{td.name}: output")
+    check_eq(enc.output_offset, td.out.size, "#{td.name}: output_offset")
+  }
+}
+
+test "encoder reset" {
+  large = "{\"key1\":\"value1\",\"key2\":\"value2\",\"key3\":\"value3\",\"key4\":\"value4\",\"key5\":\"value5\"}\n"
+  bb = bytes.new_buffer([])
+  enc = new_encoder(bb, [])
+  enc.~write_value!(Value.of(large))
+  assert_eq bb.string, large
+  bb.reset!
+  enc.reset!(bb, [])
+  enc.~write_value!(Value.of(large))
+  assert_eq bb.string, large
+}
+
+def check_eq[T](got: T, want: T, what: Str) {
+  assert got == want, "#{what}:\n  got  #{got}\n  want #{want}"
+}

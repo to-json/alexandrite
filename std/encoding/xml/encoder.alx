@@ -1,0 +1,406 @@
+# The XML writer (Go's marshal.go: Encoder and its printer).
+
+import "io"
+import "strconv"
+import "strings"
+
+# The size of the output buffer (Go's bufio default).
+BUF_SIZE = 4096
+
+# The mutable part of an Encoder, kept in a one-element slice (D36).
+struct EncState {
+  # The output; none: everything stays in `pieces` (marshal, to_xml).
+  wr: io.Writer?
+  pieces: [Str]
+  nbuf: Int
+  seq: Int
+  indent: Str
+  prefix: Str
+  depth: Int
+  indented_in: Bool
+  put_newline: Bool
+  attr_ns: Map[Str, Str]
+  attr_prefix: Map[Str, Str]
+  prefixes: [Str]
+  tags: [Name]
+  closed: Bool
+  err: Error?
+}
+
+# Writes XML to an output stream (Go's Encoder). A handle: copies write to
+# the same stream.
+pub struct Encoder {
+  st: [EncState]
+
+  # ------------------------------------------------------------ Go's API
+
+  # Each element begins on a new line starting with prefix and one indent
+  # per level of nesting (Go's Indent).
+  pub def indent!(prefix: Str, indent: Str) {
+    self.st[0].prefix = prefix
+    self.st[0].indent = indent
+  }
+
+  # Writes one token (Go's EncodeToken). Start and end elements must match;
+  # a ProcInst with target "xml" is only allowed as the first token. Does
+  # not flush.
+  pub def encode_token!(t: Token) -> ~Unit {
+    case t {
+      StartElement(s) => self.~write_start!(s)
+      EndElement(e) => self.~write_end!(e.name)
+      CharData(b) => self.put!(escape_str(Str.from_bytes(b), false))
+      Comment(b) => {
+        fail other("xml: EncodeToken of Comment containing --> marker") if bytes_contain?(b, "-->")
+        self.put!("<!--")
+        self.put!(Str.from_bytes(b))
+        self.put!("-->")
+        return self.~cached_error
+      }
+      ProcInst(p) => {
+        fail other("xml: EncodeToken of ProcInst xml target only valid for xml declaration, first token encoded") if p.target == "xml" && st[0].nbuf != 0
+        fail other("xml: EncodeToken of ProcInst with invalid Target") if !name_str?(p.target)
+        fail other("xml: EncodeToken of ProcInst containing ?> marker") if bytes_contain?(p.inst, "?>")
+        self.put!("<?")
+        self.put!(p.target)
+        if p.inst.size > 0 {
+          self.put!(" ")
+          self.put!(Str.from_bytes(p.inst))
+        }
+        self.put!("?>")
+      }
+      Directive(b) => {
+        fail other("xml: EncodeToken of Directive containing wrong < or > markers") if !valid_directive?(b)
+        self.put!("<!")
+        self.put!(Str.from_bytes(b))
+        self.put!(">")
+      }
+    }
+    self.~cached_error
+  }
+
+  # Writes the string s as the element start (Go's EncodeElement(s, start)
+  # with a string s) and flushes.
+  pub def encode_text!(s: Str, start: StartElement) -> ~Unit {
+    fail other("xml: EncodeElement of StartElement with missing name") if start.name.local == ""
+    self.~write_start!(start)
+    self.escape_string!(s)
+    self.~write_end!(start.name)
+    self.~flush!
+  }
+
+  # Writes the buffered XML to the underlying writer (Go's Flush).
+  pub def flush! -> ~Unit {
+    self.flush_buf!
+    if e = st[0].err {
+      fail e
+    }
+    nil
+  }
+
+  # Flushes and marks the Encoder closed; fails if an element is still open
+  # (Go's Close). Writing after close fails.
+  pub def close! -> ~Unit {
+    return nil if st[0].closed
+    self.st[0].closed = true
+    self.flush_buf!
+    if e = st[0].err {
+      fail e
+    }
+    n = st[0].tags.size
+    fail other("unclosed tag <#{st[0].tags[n - 1].local}>") if n > 0
+    nil
+  }
+
+  # Everything written so far, for an Encoder made by new_buffer_encoder.
+  pub def output -> Str {
+    st[0].pieces.join("")
+  }
+
+  # ------------------------------------------------------------ for marshaling
+
+  # Writes a start element (Go's writeStart): records it for the matching
+  # end, defines name space prefixes for attributes as needed.
+  pub def write_start!(start: StartElement) -> ~Unit {
+    fail other("xml: start tag with no name") if start.name.local == ""
+    self.st[0].tags << start.name
+    self.st[0].prefixes << ""
+    self.write_indent!(1)
+    out: [Str] = ["<", start.name.local]
+    if start.name.space != "" {
+      out << " xmlns=\""
+      out << escape_str(start.name.space, true)
+      out << "\""
+    }
+    for a in start.attr {
+      next if a.name.local == ""
+      out << " "
+      if a.name.space != "" {
+        pd = self.create_attr_prefix!(a.name.space)
+        out << pd[1]
+        out << pd[0]
+        out << ":"
+      }
+      out << a.name.local
+      out << "=\""
+      out << escape_str(a.value, true)
+      out << "\""
+    }
+    out << ">"
+    self.put!(out.join(""))
+    nil
+  }
+
+  # Writes an end element (Go's writeEnd); it must match the open element.
+  pub def write_end!(name: Name) -> ~Unit {
+    fail other("xml: end tag with no name") if name.local == ""
+    n = st[0].tags.size
+    fail other("xml: end tag </#{name.local}> without start tag") if n == 0 || st[0].tags[n - 1].local == ""
+    top = st[0].tags[n - 1]
+    if top != name {
+      fail other("xml: end tag </#{name.local}> does not match start tag <#{top.local}>") if top.local != name.local
+      fail other("xml: end tag </#{name.local}> in namespace #{name.space} does not match start tag <#{top.local}> in namespace #{top.space}")
+    }
+    self.st[0].tags = st[0].tags[0...n - 1]
+    self.write_indent!(-1)
+    self.put!("</#{name.local}>")
+    self.pop_prefix!
+    nil
+  }
+
+  # Text, escaped (Go's EscapeString on the printer: newlines too).
+  pub def escape_string!(s: Str) {
+    self.put!(escape_str(s, true))
+  }
+
+  # Bytes of text, escaped (Go's EscapeText on the printer).
+  pub def escape_bytes!(b: [Byte]) {
+    self.put!(escape_str(Str.from_bytes(b), true))
+  }
+
+  # Text in CDATA sections (Go's emitCDATA).
+  pub def write_cdata!(s: Str) {
+    self.put!(cdata_str(s))
+  }
+
+  # Text as it is (an innerxml field).
+  pub def write_raw!(s: Str) {
+    self.put!(s)
+  }
+
+  # A comment field's text as <!--s--> (nothing when s is empty).
+  pub def write_comment!(s: Str) -> ~Unit {
+    return nil if s.size == 0
+    self.write_indent!(0)
+    self.put!("<!--")
+    dash_dash = strings.contains(s, "--")
+    self.put!(s) if !dash_dash
+    fail other("xml: comments must not contain \"--\"") if dash_dash
+    self.put!(" ") if s[s.size - 1] == 0x2D
+    self.put!("-->")
+    nil
+  }
+
+  # The name space of the innermost open element ("" if none).
+  pub def top_space -> Str {
+    n = st[0].tags.size
+    n == 0 ? "" : st[0].tags[n - 1].space
+  }
+
+  # Write errors so far (Go's cachedWriteError).
+  pub def cached_error -> ~Unit {
+    if e = st[0].err {
+      fail e
+    }
+    nil
+  }
+
+  # Writes the XML encoding of v and flushes (Go's Encode).
+  pub def encode![T](v: T) -> ~Unit {
+    v.~xml_enc(self, none, Name.new)
+    self.~flush!
+  }
+
+  # Writes v with start as its outermost element and flushes (Go's
+  # EncodeElement).
+  pub def encode_element![T](v: T, start: StartElement) -> ~Unit {
+    fail other("xml: EncodeElement of StartElement with missing name") if start.name.local == ""
+    v.~xml_enc(self, start, Name.new)
+    self.~flush!
+  }
+
+  # Starts a Marshaler's output: it may not close elements it didn't open.
+  pub def begin_marshaler! -> Int {
+    self.st[0].tags << Name.new
+    st[0].tags.size
+  }
+
+  # Ends a Marshaler's output: it must close the elements it opened (Go's
+  # marshalInterface).
+  pub def end_marshaler!(n: Int, type_name: Str) -> ~Unit {
+    m = st[0].tags.size
+    fail other("xml: #{type_name}.MarshalXML wrote invalid XML: <#{st[0].tags[m - 1].local}> not closed") if m > n
+    self.st[0].tags = st[0].tags[0...n - 1]
+    nil
+  }
+
+  # The parent elements of a field ("a>b>c"): closes the open parents that
+  # aren't shared with `parents` and returns the shared ones (Go's
+  # parentStack.trim).
+  pub def trim_parents!(stack: [Str], parents: [Str]) -> ~[Str] {
+    split = 0
+    while split < parents.size && split < stack.size {
+      break if parents[split] != stack[split]
+      split += 1
+    }
+    i = stack.size - 1
+    while i >= split {
+      self.~write_end!(Name.new(local: stack[i]))
+      i -= 1
+    }
+    stack[0...split]
+  }
+
+  # Opens the parents not yet open (Go's parentStack.push).
+  pub def push_parents!(stack: [Str], parents: [Str]) -> ~[Str] {
+    out = stack.dup
+    i = stack.size
+    while i < parents.size {
+      self.~write_start!(StartElement.new(name: Name.new(local: parents[i])))
+      out << parents[i]
+      i += 1
+    }
+    out
+  }
+
+  # ------------------------------------------------------------ the printer
+
+  def put!(s: Str) {
+    if st[0].closed && st[0].err.none? {
+      self.st[0].err = other("use of closed Encoder")
+    }
+    return if !st[0].err.none?
+    return if s.size == 0
+    self.st[0].pieces << s
+    self.st[0].nbuf += s.size
+    if st[0].nbuf >= BUF_SIZE && !st[0].wr.none? {
+      self.flush_buf!
+    }
+  }
+
+  # Writes the buffer to the writer; a write error sticks (Go's bufio).
+  def flush_buf! {
+    return if !st[0].err.none?
+    if w0 = st[0].wr {
+      return if st[0].nbuf == 0
+      w = w0
+      data = st[0].pieces.join("").bytes
+      r = w.write!(data)
+      self.st[0].wr = w
+      self.st[0].pieces = []
+      self.st[0].nbuf = 0
+      if e = r.err {
+        self.st[0].err = e
+        return
+      }
+      n = r.unwrap
+      if n < data.size {
+        self.st[0].err = io.StreamError.ShortWrite
+      }
+    }
+  }
+
+  def write_indent!(delta: Int) {
+    return if st[0].prefix.size == 0 && st[0].indent.size == 0
+    if delta < 0 {
+      self.st[0].depth -= 1
+      if st[0].indented_in {
+        self.st[0].indented_in = false
+        return
+      }
+      self.st[0].indented_in = false
+    }
+    if st[0].put_newline {
+      self.put!("\n")
+    } else {
+      self.st[0].put_newline = true
+    }
+    self.put!(st[0].prefix) if st[0].prefix.size > 0
+    if st[0].indent.size > 0 {
+      i = 0
+      while i < st[0].depth {
+        self.put!(st[0].indent)
+        i += 1
+      }
+    }
+    if delta > 0 {
+      self.st[0].depth += 1
+      self.st[0].indented_in = true
+    }
+  }
+
+  # The prefix for the name space url, and the declaration to write before
+  # it when the prefix is new (Go's createAttrPrefix).
+  def create_attr_prefix!(url: Str) -> (Str, Str) {
+    if p = st[0].attr_prefix[url] {
+      return (p, "") if p != ""
+    }
+    return (XML_PREFIX, "") if url == XML_URL
+    prefix = strings.trim_right(url, "/")
+    i = strings.last_index(prefix, "/")
+    prefix = prefix[i + 1...prefix.size] if i >= 0
+    if prefix == "" || !name_str?(prefix) || strings.contains(prefix, ":") {
+      prefix = "_"
+    }
+    if prefix.size >= 3 && strings.equal_fold(prefix[0...3], "xml") {
+      prefix = "_" + prefix
+    }
+    if taken = st[0].attr_ns[prefix] {
+      if taken != "" {
+        loop {
+          self.st[0].seq += 1
+          id = "#{prefix}_#{st[0].seq}"
+          if (st[0].attr_ns[id] || "") == "" {
+            prefix = id
+            break
+          }
+        }
+      }
+    }
+    self.st[0].attr_prefix[url] = prefix
+    self.st[0].attr_ns[prefix] = url
+    self.st[0].prefixes << prefix
+    (prefix, "xmlns:#{prefix}=\"#{escape_str(url, true)}\" ")
+  }
+
+  def pop_prefix! {
+    loop {
+      n = st[0].prefixes.size
+      break if n == 0
+      prefix = st[0].prefixes[n - 1]
+      self.st[0].prefixes = st[0].prefixes[0...n - 1]
+      break if prefix == ""
+      url = st[0].attr_ns[prefix] || ""
+      self.st[0].attr_prefix.delete(url)
+      self.st[0].attr_ns.delete(prefix)
+    }
+  }
+}
+
+def bytes_contain?(b: [Byte], s: Str) -> Bool {
+  strings.contains(Str.from_bytes(b), s)
+}
+
+def new_enc_state(w: io.Writer?) -> EncState {
+  EncState.new(wr: w, pieces: [], attr_ns: {}, attr_prefix: {}, prefixes: [], tags: [])
+}
+
+# An Encoder writing to w (Go's NewEncoder).
+pub def new_encoder(w: io.Writer) -> Encoder {
+  Encoder.new(st: [new_enc_state(w)])
+}
+
+# An Encoder that keeps its output (read it with `output`); marshal and
+# to_xml use one.
+pub def new_buffer_encoder -> Encoder {
+  Encoder.new(st: [new_enc_state(none)])
+}

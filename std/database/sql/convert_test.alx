@@ -1,0 +1,145 @@
+# Go's convert_test.go: convertAssign's table (TestConversions), as scans of
+# one driver.Value into a destination type (scan_value[T], what rows.scan
+# does per column), plus TestNullString, TestValueConverters, TestDriverArgs.
+#
+# Not translated: the RawBytes rows and TestRawBytesAllocs (no RawBytes),
+# the uuid rows (no uuid package), float32 destinations (no float32),
+# user-defined named types (userDefined, userDefinedString,
+# userDefinedSlice: alx has no defined scalar types; a user type is a
+# struct with `sql_scan`), complex128 sources (not a driver.Value),
+# TestDecimal (no decimal Value), TestUserDefinedBytes (the copy is the only
+# behaviour: [Byte] destinations always copy), TestConvertAssignNoContext
+# (no ScanContext).
+
+import "database/sql/driver"
+import "strings"
+import "sync"
+import "time"
+
+def vi(i: Int) -> driver.Value { driver.Value.Int(i) }
+def vs(s: Str) -> driver.Value { driver.Value.Str(s) }
+def vb(s: Str) -> driver.Value { driver.Value.Bytes(s.bytes) }
+def vf(f: Float) -> driver.Value { driver.Value.Float(f) }
+def vt(t: time.Time) -> driver.Value { driver.Value.Time(t) }
+
+# One convertAssign row: scanning `src` into a T gives `want` or `want_err`.
+def conv[T](n: Int, src: driver.Value, want: T, want_err: Str) {
+  r: ~T = scan_value(src)
+  got_err = r.err?.message || ""
+  assert got_err == want_err, "convertAssign ##{n}: for #{src} (#{src.go_type}): got error #{got_err}, want error #{want_err}"
+  if x = r.ok {
+    assert x == want, "convertAssign ##{n}: for #{src} (#{src.go_type}): got #{x}, want #{want}"
+  }
+}
+
+def some_time -> time.Time { time.unix(123, 0) }
+
+test "Conversions" {
+  conv(0, vs("foo"), "foo", "")
+  conv(1, vi(123), 123, "")
+  conv(2, vt(some_time), some_time, "")
+  conv(3, vs("string"), "string", "")
+  conv(4, vb("byteslice"), "byteslice", "")
+  conv(5, vi(123), "123", "")
+  conv(6, ~driver.to_value(123.as_i8), "123", "")
+  conv(7, ~driver.to_value(123.as_u64), "123", "")
+  conv(8, vf(1.5), "1.5", "")
+  conv(9, vt(time.unix(1, 0).utc), "1970-01-01T00:00:01Z", "")
+  conv(10, vt(time.unix(1453874597, 0).in_zone(time.fixed_zone("here", -3600 * 8))), "2016-01-26T22:03:17-08:00", "")
+  conv(11, vt(time.unix(1, 2).utc), "1970-01-01T00:00:01.000000002Z", "")
+  conv(12, vt(time.Time.new), "0001-01-01T00:00:00Z", "")
+  conv(13, vt(time.unix(1, 2).utc), "1970-01-01T00:00:01.000000002Z".bytes, "")
+  conv(14, vt(time.unix(1, 2).utc), vt(time.unix(1, 2).utc), "")
+  e: [Byte] = []
+  conv(15, driver.Value.Null, e, "")
+  conv(16, vs("string"), "string".bytes, "")
+  conv(17, vb("byteslice"), "byteslice".bytes, "")
+  conv(18, vi(123), "123".bytes, "")
+  conv(19, vf(1.5), "1.5".bytes, "")
+  conv(20, vs("255"), 255.as_u8, "")
+  conv(21, vs("256"), 0.as_u8, "converting driver.Value type string (\"256\") to a uint8: value out of range")
+  conv(22, vs("256"), 256.as_u16, "")
+  conv(23, vs("-1"), -1, "")
+  conv(24, vs("foo"), 0, "converting driver.Value type string (\"foo\") to a int: invalid syntax")
+  conv(25, vi(5), 5.as_u8, "")
+  conv(26, vi(256), 0.as_u8, "converting driver.Value type int64 (\"256\") to a uint8: value out of range")
+  conv(27, vi(256), 256.as_u16, "")
+  conv(28, vi(65536), 0.as_u16, "converting driver.Value type int64 (\"65536\") to a uint16: value out of range")
+  conv(29, driver.Value.Bool(true), true, "")
+  conv(30, vs("True"), true, "")
+  conv(31, vs("TRUE"), true, "")
+  conv(32, vs("1"), true, "")
+  conv(33, vi(1), true, "")
+  conv(34, driver.Value.Bool(false), false, "")
+  conv(35, vs("false"), false, "")
+  conv(36, vs("FALSE"), false, "")
+  conv(37, vs("0"), false, "")
+  conv(38, vi(0), false, "")
+  conv(39, vs("yup"), false, "sql/driver: couldn't convert \"yup\" into type bool")
+  conv(40, vi(2), false, "sql/driver: couldn't convert 2 into type bool")
+  conv(41, vf(1.5), 1.5, "")
+  conv(42, vi(1), 1.0, "")
+  conv(43, vs("1.5"), 1.5, "")
+  # Pointers: Go's **int64 is alx's Int?.
+  n: Int? = none
+  conv(44, driver.Value.Null, n, "")
+  answer: Int? = 42
+  conv(45, vi(42), answer, "")
+  # Interfaces: Go's *any is driver.Value.
+  conv(46, vf(1.5), vf(1.5), "")
+  conv(47, vi(1), vi(1), "")
+  conv(48, vs("str"), vs("str"), "")
+  conv(49, vb("byteslice"), vb("byteslice"), "")
+  conv(50, driver.Value.Bool(true), driver.Value.Bool(true), "")
+  conv(51, driver.Value.Null, driver.Value.Null, "")
+  # A NULL into a non-optional, and a time into an Int.
+  conv(52, driver.Value.Null, 0, "converting NULL to int is unsupported")
+  conv(53, vi(1), some_time, "unsupported Scan, storing driver.Value type int64 into type *time.Time")
+}
+
+test "Conversions: bytes copy" {
+  src: [Byte] = "byteslice".bytes
+  got: driver.Value = ~scan_value(driver.Value.Bytes(src))
+  case got {
+    Bytes(b) => {
+      b[0] = 0
+      assert src[0] == 98, "copy into driver.Value didn't copy []byte data"
+    }
+    _ => assert false, "not bytes"
+  }
+}
+
+test "NullString" {
+  ns: NullString = ~scan_value(vb("foo"))
+  assert ns.valid, "expecting not null"
+  assert_eq ns.string, "foo"
+  ns2: NullString = ~scan_value(driver.Value.Null)
+  assert !ns2.valid, "expecting null on nil"
+  assert_eq ns2.string, ""
+}
+
+test "ValueConverters" {
+  assert_eq ~driver.to_value(NullString.new(string: "hi", valid: true)), vs("hi")
+  assert_eq ~driver.to_value(NullString.new(string: "", valid: false)), driver.Value.Null
+}
+
+# Go's Valuer_V (a value receiver); Valuer_P (pointer receiver, nil
+# handled) has no counterpart without pointers: an optional Valuer that is
+# none is Null.
+struct ValuerV {
+  s: Str
+  def sql_value -> ~driver.Value { vs(strings.to_upper(s)) }
+}
+
+test "DriverArgs" {
+  check = ->(got: [driver.NamedValue], want: driver.Value) {
+    assert got.size == 1 && got[0].ordinal == 1 && got[0].value == want, "got #{got[0].value}, want #{want}"
+  }
+  ds = new_driver_stmt(1, StubDriverStmt.new(err: ""), sync.new_lock)
+  check(~driver_args_conn_locked(UnknownInputsConn.new, ds, ~driver.to_named_values(ValuerV.new(s: "foo"))), vs("FOO"))
+  none_v: ValuerV? = none
+  check(~driver_args_conn_locked(UnknownInputsConn.new, ds, ~driver.to_named_values(none_v)), driver.Value.Null)
+  check(~driver_args_conn_locked(UnknownInputsConn.new, ds, ~driver.to_named_values("plain-str")), vs("plain-str"))
+  none_s: Str? = none
+  check(~driver_args_conn_locked(UnknownInputsConn.new, ds, ~driver.to_named_values(none_s)), driver.Value.Null)
+}

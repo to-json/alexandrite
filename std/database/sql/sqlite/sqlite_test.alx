@@ -1,0 +1,272 @@
+# The SQLite driver against a real on-disk database in a temp directory.
+
+import "context"
+import "database/sql"
+import "database/sql/driver"
+import "os"
+import "sync"
+import "time"
+
+def temp_db(name: Str, params: Str) -> sql.DB {
+  dir = os.mkdir_temp("", "alx-sqlite-*").unwrap
+  sql.open_driver(Driver.new, "#{dir}/#{name}.db#{params}").unwrap
+}
+
+#[derive(Row)]
+struct Person {
+  id: Int
+  name: Str
+  #[field(db: "years")]
+  age: Int?
+  email: Str?
+  #[field(db: "-")]
+  cache: Int
+}
+
+def setup(db: sql.DB) -> ~Unit {
+  db.~exec("create table people(id integer primary key, name text not null unique, years int, email text, photo blob, score real, active boolean, born datetime)", nil)
+  nil
+}
+
+test "version" {
+  assert version.start_with?("3."), version
+}
+
+test "CRUD" {
+  db = temp_db("crud", "")
+  ~setup(db)
+  r = db.~exec("insert into people(name, years, email) values(?, ?, ?)", ("ann", 30, "ann@example.com"))
+  assert_eq ~r.last_insert_id, 1
+  assert_eq ~r.rows_affected, 1
+  r2 = db.~exec("insert into people(name, years) values(?, ?)", ("bob", 25))
+  assert_eq ~r2.last_insert_id, 2
+  n: Int = db.query_row("select count(*) from people", nil).~scan
+  assert_eq n, 2
+  # A tuple, NULL as none.
+  t: (Int, Str, Int?, Str?) = db.query_row("select id, name, years, email from people where name = ?", "bob").~scan
+  want: (Int, Str, Int?, Str?) = (2, "bob", 25, none)
+  assert t == want, "#{t}"
+  # A #[derive(Row)] struct, columns by name.
+  p: Person = db.query_row("select id, name, years, email from people where id = ?", 1).~scan
+  assert_eq p.name, "ann"
+  assert p.age == 30, "#{p.age}"
+  assert p.email == "ann@example.com", "#{p.email}"
+  # Update and delete.
+  u = db.~exec("update people set years = years + 1", nil)
+  assert_eq ~u.rows_affected, 2
+  rows = db.~query("select id, name, years, email from people order by id", nil)
+  all: [Person] = rows.~scan_all
+  assert_eq all.size, 2
+  assert all[1].age == 26, "#{all[1].age}"
+  d = db.~exec("delete from people where name = ?", "ann")
+  assert_eq ~d.rows_affected, 1
+  none_row: ~Str = db.query_row("select name from people where name = ?", "ann").scan
+  assert sql.no_rows?(none_row.err.unwrap), "#{none_row.err}"
+  ~db.close
+}
+
+test "derive Row errors" {
+  db = temp_db("derive", "")
+  ~setup(db)
+  db.~exec("insert into people(name) values('x')", nil)
+  r: ~Person = db.query_row("select id, name, photo from people", nil).scan
+  assert_eq r.err?.message || "", "sql: missing destination name photo in Person"
+  # Column names match case-insensitively; missing columns stay zero.
+  p: Person = db.query_row("select NAME from people", nil).~scan
+  assert_eq p.name, "x"
+  assert p.age == none, "zero"
+  ~db.close
+}
+
+test "types: NULLs, BLOBs, reals, bools, times" {
+  db = temp_db("types", "")
+  ~setup(db)
+  blob: [Byte] = [0, 1, 2, 255, 0]
+  born = time.date(2001, 2, 3, 4, 5, 6, 7000, time.utc)
+  db.~exec("insert into people(name, photo, score, active, born) values(?, ?, ?, ?, ?)", ("a", blob, 2.5, true, born))
+  empty: [Byte] = []
+  db.~exec("insert into people(name, photo, score, active) values(?, ?, ?, ?)", ("b", empty, -0.125, false))
+  nb: [Byte]? = none
+  db.~exec("insert into people(name, photo) values(?, ?)", ("c", nb))
+  rows = db.~query("select name, photo, score, active, born from people order by name", nil)
+  got: [(Str, [Byte]?, Float?, Bool?, time.Time?)] = rows.~scan_all
+  assert got[0][1] == blob, "blob #{got[0][1]}"
+  assert got[0][2] == 2.5, "real"
+  assert got[0][3] == true, "bool"
+  assert got[0][4] == born, "time #{got[0][4]} want #{born}"
+  assert got[1][1] == empty, "empty blob #{got[1][1]}"
+  assert got[1][3] == false, "false"
+  assert got[1][4] == none, "null time"
+  assert got[2][1] == none, "null blob"
+  assert got[2][2] == none, "null real"
+  # Raw values and per-column getters.
+  rows2 = db.~query("select name, photo, score from people where name = 'a'", nil)
+  assert rows2.next, "row"
+  vals = rows2.~values
+  assert vals[0] == driver.Value.Str("a"), "#{vals[0]}"
+  assert vals[1] == driver.Value.Bytes(blob), "#{vals[1]}"
+  s: Float = rows2.~get(2)
+  assert_eq s, 2.5
+  ~rows2.close
+  # Text scans into numbers and back (database/sql's conversions).
+  num: Int = db.query_row("select '42'", nil).~scan
+  assert_eq num, 42
+  txt: Str = db.query_row("select 7", nil).~scan
+  assert_eq txt, "7"
+  ~db.close
+}
+
+test "transactions: commit and rollback" {
+  db = temp_db("tx", "")
+  ~setup(db)
+  tx = db.~begin
+  tx.~exec("insert into people(name) values(?)", "in-tx")
+  inside: Int = tx.query_row("select count(*) from people", nil).~scan
+  assert_eq inside, 1
+  ~tx.rollback
+  after: Int = db.query_row("select count(*) from people", nil).~scan
+  assert_eq after, 0
+  tx2 = db.~begin
+  stmt = tx2.~prepare("insert into people(name, years) values(?, ?)")
+  for i in 0...10 {
+    stmt.~exec(("p#{i}", i))
+  }
+  ~tx2.commit
+  assert stmt.exec(("late", 1)).err?, "a Tx statement after commit fails"
+  committed: Int = db.query_row("select count(*) from people", nil).~scan
+  assert_eq committed, 10
+  assert_eq tx2.commit.err?.message || "", "sql: transaction has already been committed or rolled back"
+  # Isolation levels SQLite has no use for.
+  r = db.begin_tx(context.background, sql.TxOptions.new(isolation: sql.LEVEL_READ_COMMITTED, read_only: false))
+  assert_eq r.err?.message || "", "sqlite: isolation level Read Committed is not supported"
+  ro = db.~begin_tx(context.background, sql.TxOptions.new(isolation: 0, read_only: true))
+  w = ro.exec("insert into people(name) values('no')", nil)
+  assert (w.err?.message || "").include?("readonly"), "#{w.err}"
+  ~ro.rollback
+  ~db.close
+}
+
+test "errors: constraints with SQLite's messages" {
+  db = temp_db("errors", "?_foreign_keys=1")
+  ~setup(db)
+  db.~exec("insert into people(name) values('ann')", nil)
+  r = db.exec("insert into people(name) values('ann')", nil)
+  e = r.err.unwrap
+  assert_eq e.message, "UNIQUE constraint failed: people.name"
+  case e {
+    SqliteError.Error(code, ext, _) => {
+      assert_eq code, ERR_CONSTRAINT
+      assert_eq ext, ERR_CONSTRAINT_UNIQUE
+    }
+    _ => assert false, "not a SqliteError: #{e}"
+  }
+  n: Str? = none
+  r2 = db.exec("insert into people(name) values(?)", n)
+  assert_eq r2.err?.message || "", "NOT NULL constraint failed: people.name"
+  db.~exec("create table pets(id integer primary key, owner int references people(id))", nil)
+  r3 = db.exec("insert into pets(owner) values(99)", nil)
+  assert_eq r3.err?.message || "", "FOREIGN KEY constraint failed"
+  r4 = db.query("select nope from people", nil)
+  assert_eq r4.err?.message || "", "no such column: nope"
+  r5 = db.exec("bogus", nil)
+  assert_eq r5.err?.message || "", "near \"bogus\": syntax error"
+  r6: ~Int = db.query_row("select name from people", nil).scan
+  assert_eq r6.err?.message || "", "sql: Scan error on column index 0, name \"name\": converting driver.Value type string (\"ann\") to a int: invalid syntax"
+  ~db.close
+}
+
+test "multi-statement exec and named parameters" {
+  db = temp_db("multi", "")
+  db.~exec("create table t(a int, b text); insert into t values(?, ?); insert into t values(?, ?)", (1, "x", 2, "y"))
+  n: Int = db.query_row("select sum(a) from t", nil).~scan
+  assert_eq n, 3
+  b: Str = db.query_row("select b from t where a = :a", sql.named("a", 2)).~scan
+  assert_eq b, "y"
+  b2: Str = db.query_row("select b from t where a = @k and b = $v", (sql.named("k", 1), sql.named("v", "x"))).~scan
+  assert_eq b2, "x"
+  ~db.close
+}
+
+test "concurrency through the pool" {
+  db = temp_db("pool", "?_journal_mode=WAL&_busy_timeout=10000")
+  ~setup(db)
+  db.set_max_open_conns(4)
+  workers = 8
+  per = 25
+  wg = sync.new_wait_group
+  failures = Mutex.new([""; 0])
+  for w in 0...workers {
+    wg.add(1)
+    d = db.dup
+    _ = spawn {
+      for i in 0...per {
+        r = d.exec("insert into people(name, years) values(?, ?)", ("w#{w}-#{i}", i))
+        if e = r.err {
+          failures.lock { |v|
+            v << e.message
+            nil
+          }
+        }
+        c: ~Int = d.query_row("select count(*) from people", nil).scan
+        if e = c.err {
+          failures.lock { |v|
+            v << e.message
+            nil
+          }
+        }
+      }
+      wg.done
+    }
+  }
+  wg.wait
+  f = failures.lock { |v| v }
+  assert f.size == 0, "#{f}"
+  total: Int = db.query_row("select count(*) from people", nil).~scan
+  assert_eq total, workers * per
+  s = db.stats
+  assert s.open_connections <= 4, "#{s.open_connections} open"
+  ~db.close
+}
+
+test "context cancellation interrupts" {
+  db = temp_db("cancel", "")
+  ctx, cancel = context.with_timeout(context.background, time.millisecond * 50)
+  defer cancel()
+  # A query that runs until interrupted.
+  r: ~Int = db.query_row_context(ctx, "with recursive c(x) as (select 1 union all select x + 1 from c) select count(*) from c", nil).scan
+  assert r.err?, "expected an interrupt"
+  ~db.ping
+  ~db.close
+}
+
+test "register and open by name" {
+  register
+  register
+  assert sql.drivers.include?("sqlite3"), "registered"
+  dir = os.mkdir_temp("", "alx-sqlite-*").unwrap
+  db = sql.~open("sqlite3", "#{dir}/named.db")
+  one: Int = db.query_row("select 1", nil).~scan
+  assert_eq one, 1
+  ~db.close
+}
+
+test "in-memory, one connection" {
+  db = ~sql.open_driver(Driver.new, ":memory:")
+  db.set_max_open_conns(1)
+  db.~exec("create table kv(k text primary key, v text)", nil)
+  stmt = db.~prepare("insert into kv values(?, ?)")
+  for i in 0...100 {
+    stmt.~exec(("k#{i}", "v#{i}"))
+  }
+  ~stmt.close
+  rows = db.~query("select k, v from kv where k like 'k1%' order by k", nil)
+  got: [(Str, Str)] = rows.~scan_all
+  assert_eq got.size, 11
+  assert got[0] == ("k1", "v1"), "#{got[0]}"
+  cols = db.~query("select k, v from kv", nil)
+  ct = cols.~column_types
+  assert_eq ct[0].database_type_name, "TEXT"
+  assert_eq ct[0].scan_type, "Str"
+  ~cols.close
+  ~db.close
+}

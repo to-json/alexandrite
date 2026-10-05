@@ -1,0 +1,210 @@
+# Go's sql_test.go, part 5: TestMaxIdleConns .. TestConnMaxLifetime.
+# Go's synctest.Sleep (a fake clock) is the DB's clock_skew here.
+
+import "context"
+import "sync"
+import "time"
+
+def no_close_errors(db: DB) -> Mutex[[Str]] {
+  errs = Mutex.new([""; 0])
+  drv_of(db).hooks.set_post_close_conn(->(err: Error?) {
+    if e = err {
+      errs.lock { |v|
+        v << "Error closing fakeConn: #{e.message}"
+        nil
+      }
+    }
+  })
+  errs
+}
+
+def check_no_close_errors(db: DB, errs: Mutex[[Str]]) {
+  drv_of(db).hooks.set_post_close_conn(none)
+  got = errs.lock { |v| v }
+  assert got.size == 0, "#{got}"
+}
+
+test "MaxIdleConns" {
+  test_database([], ->(db: DB) -> ~Unit {
+    populate(db, "people")
+    tx = db.~begin
+    _ = tx.commit
+    assert_eq num_free_conns(db), 1
+    db.set_max_idle_conns(0)
+    assert_eq num_free_conns(db), 0
+    tx2 = db.~begin
+    _ = tx2.commit
+    assert_eq num_free_conns(db), 0
+    nil
+  }).unwrap
+}
+
+test "MaxOpenConns" {
+  test_database([], ->(db: DB) -> ~Unit {
+    errs = no_close_errors(db)
+    populate(db, "magicquery")
+    drv = drv_of(db)
+    clear_all_conns(db)
+    opens0 = drv.open_count
+    db.set_max_idle_conns(10)
+    db.set_max_open_conns(10)
+    stmt = db.~prepare("SELECT|magicquery|op|op=?,millis=?")
+    nquery = 50
+    sleep_millis = 5
+    failures = Mutex.new([""; 0])
+    for _batch in 0...2 {
+      wg = sync.new_wait_group
+      for _i in 0...nquery {
+        wg.add(1)
+        s = stmt.dup
+        _ = spawn {
+          r: ~Str = s.query_row(("sleep", sleep_millis)).scan
+          if e = r.err {
+            if !no_rows?(e) {
+              failures.lock { |v|
+                v << e.message
+                nil
+              }
+            }
+          }
+          wg.done
+        }
+      }
+      wg.wait
+    }
+    f = failures.lock { |v| v }
+    assert f.size == 0, "#{f}"
+    assert_eq num_free_conns(db), 10
+    n = num_deps(db)
+    assert n <= 20, "number of dependencies = #{n}; expected <= 20"
+    opens = drv.open_count - opens0
+    assert opens <= 10, "db connections opened = #{opens}; want <= 10"
+    ~stmt.close
+    assert_eq num_free_conns(db), 10
+    n = num_deps(db)
+    assert n <= 10, "number of dependencies = #{n}; expected <= 10"
+    db.set_max_open_conns(5)
+    assert_eq num_free_conns(db), 5
+    assert num_deps(db) <= 5, "deps"
+    db.set_max_open_conns(0)
+    assert_eq num_free_conns(db), 5
+    assert num_deps(db) <= 5, "deps"
+    clear_all_conns(db)
+    check_no_close_errors(db, errs)
+    nil
+  }).unwrap
+}
+
+test "MaxOpenConnsOnBusy" {
+  test_database([], ->(db: DB) -> ~Unit {
+    errs = no_close_errors(db)
+    populate(db, "magicquery")
+    db.set_max_open_conns(3)
+    ctx = context.background
+    conn0 = db.~conn(ctx, CACHED_OR_NEW_CONN)
+    conn1 = db.~conn(ctx, CACHED_OR_NEW_CONN)
+    conn2 = db.~conn(ctx, CACHED_OR_NEW_CONN)
+    num_open = ->(_i: Int) -> Int { db.st.lock { |s| s.num_open } }
+    assert_eq num_open(0), 3
+    db.set_max_open_conns(2)
+    assert_eq num_open(0), 3
+    db.put_conn(conn0, none, true)
+    db.put_conn(conn1, none, true)
+    assert_eq num_open(0), 2
+    db.put_conn(conn2, none, true)
+    assert_eq num_open(0), 2
+    check_no_close_errors(db, errs)
+    nil
+  }).unwrap
+}
+
+test "PendingConnsAfterErr" {
+  max_open = 2
+  try_open = max_open * 2 + 2
+  drv = new_fake_driver
+  db = ~open_driver(drv, FAKE_DB_NAME)
+  db.set_max_open_conns(max_open)
+  db.set_max_idle_conns(0)
+  errs = Chan[Str].new(try_open)
+  opening = sync.new_wait_group
+  opening.add(try_open)
+  drv.hooks.set_open_err(->() -> Error? {
+    opening.wait
+    Failure.Msg("db offline")
+  })
+  for _i in 0...try_open {
+    d = db.dup
+    _ = spawn {
+      opening.done
+      r = d.exec("will never run", nil)
+      errs << (r.err?.message || "")
+    }
+  }
+  opening.wait
+  timeout = time.after(time.second * 5)
+  for _i in 0...try_open {
+    select {
+      when e = errs.recv => assert e == "db offline", "unexpected err: got #{e}, want db offline"
+      when timeout.recv => panic "orphaned connection request(s), still waiting after 5s"
+    }
+  }
+  ok = wait_until(->(_i: Int) -> Bool { db.st.lock { |s| s.num_open } == 0 })
+  assert ok, "num_open stays nonzero"
+  drv.hooks.set_open_err(none)
+  close_db(db)
+}
+
+test "SingleOpenConn" {
+  test_database([], ->(db: DB) -> ~Unit {
+    populate(db, "people")
+    db.set_max_open_conns(1)
+    rows = db.~query("SELECT|people|name|", nil)
+    ~rows.close
+    rows2 = db.~query("SELECT|people|name|", nil)
+    ~rows2.close
+    nil
+  }).unwrap
+}
+
+test "Stats" {
+  db = new_test_db("people")
+  assert_eq db.stats.open_connections, 1
+  tx = db.~begin
+  _ = tx.commit
+  close_db(db)
+  assert_eq db.stats.open_connections, 0
+}
+
+test "ConnMaxLifetime" {
+  test_database([], ->(db: DB) -> ~Unit {
+    populate(db, "magicquery")
+    drv = drv_of(db)
+    clear_all_conns(db)
+    opens0 = drv.open_count
+    closes0 = drv.close_count
+    db.set_max_idle_conns(10)
+    db.set_max_open_conns(10)
+    tx = db.~begin
+    db.clock_skew.add(1000000000)
+    tx2 = db.~begin
+    _ = tx.commit
+    _ = tx2.commit
+    assert_eq drv.open_count - opens0, 2
+    assert_eq drv.close_count - closes0, 0
+    assert_eq num_free_conns(db), 2
+    # (Go sleeps 10s on a fake clock; real time also passes here, so 9.5s:
+    # the first connection is past the 10s lifetime, the second is not.)
+    db.clock_skew.add(9500000000)
+    db.set_conn_max_lifetime(time.second * 10)
+    tx3 = db.~begin
+    tx4 = db.~begin
+    _ = tx3.commit
+    _ = tx4.commit
+    wait_until(->(_i: Int) -> Bool { drv.close_count - closes0 == 1 })
+    assert_eq drv.open_count - opens0, 3
+    assert_eq drv.close_count - closes0, 1
+    s = db.stats
+    assert s.max_lifetime_closed == 1, "MaxLifetimeClosed = #{s.max_lifetime_closed}; want 1"
+    nil
+  }).unwrap
+}

@@ -1,0 +1,254 @@
+# Go's sql_test.go, part 4: TestInvalidNilValues .. TestSimultaneousQueries.
+#
+# Not translated: TestCursorFake, TestCursorDoubleRowsPointer,
+# TestCursorNull, TestCursorCancel (a driver.Rows as a column value: not
+# ported), TestQueryRowNilScanDest (no nil pointers), TestNullUUIDParam (no
+# uuid package).
+
+import "context"
+import "database/sql/driver"
+import "time"
+
+test "InvalidNilValues" {
+  for tt in [("time.Time", "sql: Scan error on column index 0, name \"bdate\": unsupported Scan, storing driver.Value type <nil> into type *time.Time"), ("int", "sql: Scan error on column index 0, name \"bdate\": converting NULL to int is unsupported")] {
+    db = new_test_db("people")
+    ctx = context.background
+    conn = conn_or_panic(db, ctx)
+    get_fake_conn(conn.dc.ci).set_skip_dirty_session
+    row = conn.query_row_context(ctx, "SELECT|people|bdate|age=?", 1)
+    msg = ""
+    if tt[0] == "int" {
+      r: ~Int = row.scan
+      msg = r.err?.message || ""
+    } else {
+      r2: ~time.Time = row.scan
+      msg = r2.err?.message || ""
+    }
+    assert msg == tt[1], "Expected error: #{tt[1]}\nReceived: #{msg}"
+    ~conn.ping_context(ctx)
+    ~conn.close
+    close_db(db)
+  }
+}
+
+def conn_or_panic(db: DB, ctx: context.Context) -> Conn { db.conn_context(ctx).unwrap }
+
+test "ConnTx" {
+  test_database([], ->(db: DB) -> ~Unit {
+    populate(db, "people")
+    ctx = context.background
+    conn = db.~conn_context(ctx)
+    get_fake_conn(conn.dc.ci).set_skip_dirty_session
+    defer conn.close
+    tx = conn.~begin_tx(ctx, none)
+    tx.~exec_context(ctx, "INSERT|people|name=?,age=?,photo=APHOTO", ("Nancy", 33))
+    ~tx.commit
+    name: Str = conn.query_row_context(ctx, "SELECT|people|name|age=?", 33).~scan
+    assert_eq name, "Nancy"
+    nil
+  }).unwrap
+}
+
+test "ConnIsValid" {
+  test_database(["Validator"], ->(db: DB) -> ~Unit {
+    populate(db, "people")
+    db.set_max_open_conns(1)
+    c = db.~conn_context(context.background)
+    c.~raw(->(raw: driver.Conn) -> ~Unit {
+      get_fake_conn(raw).set_sticky_bad(true)
+      nil
+    })
+    _ = c.close
+    free = db.st.lock { |s| s.free_conn }
+    if free.size > 0 {
+      bad = get_fake_conn(free[0].ci).st.lock { |s| s.sticky_bad }
+      assert !bad, "bad connection returned to pool; expected bad connection to be discarded"
+    }
+    nil
+  }).unwrap
+}
+
+test "Issue2542Deadlock" {
+  db = new_test_db("people")
+  close_db(db)
+  for _i in 0...2 {
+    assert db.query("SELECT|people|age,name|", nil).err?, "expected error"
+  }
+}
+
+test "CloseStmtBeforeRows" {
+  test_database([], ->(db: DB) -> ~Unit {
+    populate(db, "people")
+    s = db.~prepare("SELECT|people|name|")
+    r = s.~query(nil)
+    ~s.close
+    _ = r.close
+    nil
+  }).unwrap
+}
+
+test "NullByteSlice" {
+  test_database([], ->(db: DB) -> ~Unit {
+    exec_t(db, "CREATE|t|id=int32,name=nullstring", nil)
+    n: Str? = none
+    exec_t(db, "INSERT|t|id=10,name=?", n)
+    name: [Byte] = db.query_row("SELECT|t|name|id=?", 10).~scan
+    assert name.size == 0, "name []byte should be empty for null column value, got: #{name}"
+    exec_t(db, "INSERT|t|id=11,name=?", "bob")
+    name2: [Byte] = db.query_row("SELECT|t|name|id=?", 11).~scan
+    assert_eq Str.from_bytes(name2), "bob"
+    nil
+  }).unwrap
+}
+
+# Go's TestPointerParamsAndScans: *string is alx's Str?.
+test "PointerParamsAndScans" {
+  test_database([], ->(db: DB) -> ~Unit {
+    exec_t(db, "CREATE|t|id=int32,name=nullstring", nil)
+    name: Str? = "bob"
+    exec_t(db, "INSERT|t|id=10,name=?", name)
+    name = none
+    exec_t(db, "INSERT|t|id=20,name=?", name)
+    got: Str? = db.query_row("SELECT|t|name|id=?", 10).~scan
+    assert got == "bob", "id 10's name = #{got}; want bob"
+    got2: Str? = db.query_row("SELECT|t|name|id=?", 20).~scan
+    assert got2 == none, "id 20 = #{got2}; want nil"
+    nil
+  }).unwrap
+}
+
+test "QueryRowClosingStmt" {
+  test_database([], ->(db: DB) -> ~Unit {
+    populate(db, "people")
+    _r: (Int, Str) = db.query_row("SELECT|people|age,name|age=?", 3).~scan
+    free = db.st.lock { |s| s.free_conn }
+    assert free.size == 1, "expected 1 free conn"
+    st = get_fake_conn(free[0].ci).stmts
+    assert st[0] == st[1], "statement close mismatch: made #{st[0]}, closed #{st[1]}"
+    nil
+  }).unwrap
+}
+
+test "Issue6651" {
+  test_database([], ->(db: DB) -> ~Unit {
+    populate(db, "people")
+    hooks = drv_of(db).hooks
+    want = "error in rows.Next"
+    hooks.set_rows_cursor_next(->(dest: [driver.Value]) -> Error? { Failure.Msg("error in rows.Next") })
+    r: ~Str = db.query_row("SELECT|people|name|", nil).scan
+    assert_eq r.err?.message || "", want
+    hooks.set_rows_cursor_next(none)
+    want2 = "error in rows.Close"
+    hooks.st.lock { |h|
+      h.rows_close_err = Failure.Msg(want2)
+      nil
+    }
+    r2: ~Str = db.query_row("SELECT|people|name|", nil).scan
+    hooks.st.lock { |h|
+      h.rows_close_err = none
+      nil
+    }
+    assert_eq r2.err?.message || "", want2
+    nil
+  }).unwrap
+}
+
+# Go's nullTestRun. Go passes the row parameters as `any`; here they are
+# converted to driver Values first (to_value: the same conversion, Valuer
+# included), so one function serves every type.
+def null_test_run[S](null_type: Str, not_null_type: Str, null_params: [driver.Value], not_null_params: [driver.Value], scan_null_vals: [S]) -> ~Unit {
+  ~test_database([], ->(db: DB) -> ~Unit {
+    exec_t(db, "CREATE|t|id=int32,name=string,nullf=#{null_type},notnullf=#{not_null_type}", nil)
+    exec_t(db, "INSERT|t|id=?,name=?,nullf=?,notnullf=?", (1, "alice", null_params[0], not_null_params[0]))
+    exec_t(db, "INSERT|t|id=?,name=?,nullf=?,notnullf=?", (2, "bob", null_params[1], not_null_params[1]))
+    stmt = db.~prepare("INSERT|t|id=?,name=?,nullf=?,notnullf=?")
+    defer stmt.close
+    stmt.~exec((3, "chris", null_params[2], not_null_params[2]))
+    stmt.~exec((4, "dave", null_params[3], not_null_params[3]))
+    stmt.~exec((5, "eleanor", null_params[4], not_null_params[4]))
+    r6: ~Result = stmt.exec((6, "bob", null_params[5], not_null_params[5]))
+    assert r6.err?, "expected error inserting nil val with prepared statement Exec"
+    n: Str? = none
+    _ = db.exec("INSERT|t|id=?,name=?,nullf=?", (999, n, n))
+    for i in 0...5 {
+      got: S = db.query_row("SELECT|t|nullf|id=?", i + 1).~scan
+      assert got == scan_null_vals[i], "id=#{i + 1} got #{got}, want #{scan_null_vals[i]}"
+    }
+    nil
+  })
+}
+
+def v[T](x: T) -> driver.Value { driver.to_value(x).unwrap }
+
+test "NullStringParam" {
+  null_test_run("nullstring", "string", [v(NullString.new(string: "aqua", valid: true)), v(NullString.new(string: "brown", valid: false)), v("chartreuse"), v(NullString.new(string: "darkred", valid: true)), v(NullString.new(string: "eel", valid: false)), v("foo")], [v(""), v(""), v(""), v(""), v(""), v(NullString.new(string: "black", valid: false))], [NullString.new(string: "aqua", valid: true), NullString.new(string: "", valid: false), NullString.new(string: "chartreuse", valid: true), NullString.new(string: "darkred", valid: true), NullString.new(string: "", valid: false)]).unwrap
+}
+
+test "GenericNullStringParam" {
+  null_test_run("nullstring", "string", [v(Null[Str].new(v: "aqua", valid: true)), v(Null[Str].new(v: "brown", valid: false)), v("chartreuse"), v(Null[Str].new(v: "darkred", valid: true)), v(Null[Str].new(v: "eel", valid: false)), v("foo")], [v(""), v(""), v(""), v(""), v(""), v(Null[Str].new(v: "black", valid: false))], [Null[Str].new(v: "aqua", valid: true), Null[Str].new(v: "", valid: false), Null[Str].new(v: "chartreuse", valid: true), Null[Str].new(v: "darkred", valid: true), Null[Str].new(v: "", valid: false)]).unwrap
+}
+
+test "NullInt64Param" {
+  null_test_run("nullint64", "int64", [v(NullInt64.new(int64: 31, valid: true)), v(NullInt64.new(int64: -22, valid: false)), v(22), v(NullInt64.new(int64: 33, valid: true)), v(NullInt64.new(int64: 222, valid: false)), v(0)], [v(1), v(1), v(1), v(1), v(1), v(NullInt64.new(int64: 31, valid: false))], [NullInt64.new(int64: 31, valid: true), NullInt64.new(int64: 0, valid: false), NullInt64.new(int64: 22, valid: true), NullInt64.new(int64: 33, valid: true), NullInt64.new(int64: 0, valid: false)]).unwrap
+}
+
+test "NullInt32Param" {
+  i = ->(n: Int, ok: Bool) -> NullInt32 { NullInt32.new(int32: n.as_i32, valid: ok) }
+  null_test_run("nullint32", "int32", [v(i(31, true)), v(i(-22, false)), v(22), v(i(33, true)), v(i(222, false)), v(0)], [v(1), v(1), v(1), v(1), v(1), v(i(31, false))], [i(31, true), i(0, false), i(22, true), i(33, true), i(0, false)]).unwrap
+}
+
+test "NullInt16Param" {
+  i = ->(n: Int, ok: Bool) -> NullInt16 { NullInt16.new(int16: n.as_i16, valid: ok) }
+  null_test_run("nullint16", "int16", [v(i(31, true)), v(i(-22, false)), v(22), v(i(33, true)), v(i(222, false)), v(0)], [v(1), v(1), v(1), v(1), v(1), v(i(31, false))], [i(31, true), i(0, false), i(22, true), i(33, true), i(0, false)]).unwrap
+}
+
+test "NullByteParam" {
+  i = ->(n: Int, ok: Bool) -> NullByte { NullByte.new(byte: n.as_u8, valid: ok) }
+  null_test_run("nullbyte", "byte", [v(i(31, true)), v(i(0, false)), v(22), v(i(33, true)), v(i(222, false)), v(0)], [v(1), v(1), v(1), v(1), v(1), v(i(31, false))], [i(31, true), i(0, false), i(22, true), i(33, true), i(0, false)]).unwrap
+}
+
+test "NullFloat64Param" {
+  f = ->(n: Float, ok: Bool) -> NullFloat64 { NullFloat64.new(float64: n, valid: ok) }
+  null_test_run("nullfloat64", "float64", [v(f(31.2, true)), v(f(13.1, false)), v(-22.9), v(f(33.81, true)), v(f(222.0, false)), v(10)], [v(1), v(1), v(1), v(1), v(1), v(f(31.2, false))], [f(31.2, true), f(0.0, false), f(-22.9, true), f(33.81, true), f(0.0, false)]).unwrap
+}
+
+test "NullBoolParam" {
+  b = ->(x: Bool, ok: Bool) -> NullBool { NullBool.new(bool: x, valid: ok) }
+  null_test_run("nullbool", "bool", [v(b(false, true)), v(b(true, false)), v(true), v(b(true, true)), v(b(true, false)), v(true)], [v(true), v(false), v(true), v(false), v(true), v(b(true, false))], [b(false, true), b(false, false), b(true, true), b(true, true), b(false, false)]).unwrap
+}
+
+test "NullTimeParam" {
+  t0 = time.Time.new
+  t1 = time.date(2000, 1, 1, 8, 9, 10, 11, time.utc)
+  t2 = time.date(2010, 1, 1, 8, 9, 10, 11, time.utc)
+  n = ->(x: time.Time, ok: Bool) -> NullTime { NullTime.new(time: x, valid: ok) }
+  null_test_run("nulldatetime", "datetime", [v(n(t1, true)), v(n(t1, false)), v(t1), v(n(t1, true)), v(n(t1, false)), v(t2)], [v(t2), v(t2), v(t2), v(t2), v(t2), v(n(t1, false))], [n(t1, true), n(t0, false), n(t1, true), n(t1, true), n(t0, false)]).unwrap
+}
+
+test "Issue4902" {
+  test_database([], ->(db: DB) -> ~Unit {
+    populate(db, "people")
+    drv = drv_of(db)
+    opens0 = drv.open_count
+    for _i in 0...10 {
+      stmt = db.~prepare("SELECT|people|name|")
+      ~stmt.close
+    }
+    opens = drv.open_count - opens0
+    assert opens <= 1, "opens = #{opens}; want <= 1"
+    nil
+  }).unwrap
+}
+
+test "SimultaneousQueries" {
+  test_database([], ->(db: DB) -> ~Unit {
+    populate(db, "people")
+    tx = db.~begin
+    defer tx.rollback
+    r1 = tx.~query("SELECT|people|name|", nil)
+    defer r1.close
+    r2 = tx.~query("SELECT|people|name|", nil)
+    defer r2.close
+    nil
+  }).unwrap
+}

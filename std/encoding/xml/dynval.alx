@@ -1,0 +1,219 @@
+# Dynamic values (dyn.Value, alx's stand-in for Go's interface{} and
+# reflect.Value): a `dyn.Value` field of a derived type is Go's `any`
+# field, and marshal_value writes any Value as Go's Marshal would write the
+# Go value it describes (structs by their exported field names, no tags).
+
+import "dyn"
+import "strconv"
+
+# Whether v is a nil interface or pointer (Go's IsNil on an interface field).
+pub def dyn_nil?(v: dyn.Value) -> Bool {
+  v.kind == dyn.KIND_INVALID || v.kind == dyn.KIND_PTR && v.nil?
+}
+
+# An `any` field is empty (Go's isEmptyValue on an interface) when nil.
+pub def dyn_empty?(v: dyn.Value) -> Bool { dyn_nil?(v) }
+
+# Go's isEmptyValue on a value of v's kind.
+def dyn_empty_val?(v: dyn.Value) -> Bool {
+  k = v.kind
+  return v.len == 0 if k == dyn.KIND_STRING || k == dyn.KIND_LIST || k == dyn.KIND_MAP
+  return !v.bool_val if k == dyn.KIND_BOOL
+  return v.int_val == 0 if k == dyn.KIND_INT
+  return v.uint_val == 0 if k == dyn.KIND_UINT
+  return v.float_val == 0.0 if k == dyn.KIND_FLOAT
+  return v.nil? if k == dyn.KIND_PTR
+  k == dyn.KIND_INVALID
+}
+
+# Go's indirect: through pointers, stopping at a nil one.
+def dyn_indirect(v0: dyn.Value) -> dyn.Value {
+  v = v0
+  while v.kind == dyn.KIND_PTR && !v.nil? {
+    v = v.elem
+  }
+  v
+}
+
+def dyn_bytes?(v: dyn.Value) -> Bool {
+  t = v.type_name
+  v.kind == dyn.KIND_LIST && (t == "[]uint8" || t == "[]byte" || t.size > 2 && t[0] == 0x5B && (t.end_with?("]uint8") || t.end_with?("]byte")))
+}
+
+def dyn_byte_slice(v: dyn.Value) -> [Byte] {
+  out: [Byte] = []
+  for x in v.elems {
+    out << (x.kind == dyn.KIND_UINT ? x.uint_val.as_u8 : x.int_val.as_u8)
+  }
+  out
+}
+
+# Go's marshalSimple: the text of a scalar, or none for other kinds.
+def dyn_simple(v: dyn.Value) -> Str? {
+  k = v.kind
+  return strconv.itoa(v.int_val) if k == dyn.KIND_INT
+  return strconv.format_uint(v.uint_val, 10) if k == dyn.KIND_UINT
+  return strconv.format_float(v.float_val, "g", -1, v.type_name == "float32" ? 32 : 64) if k == dyn.KIND_FLOAT
+  return v.str_val if k == dyn.KIND_STRING
+  return (v.bool_val ? "true" : "false") if k == dyn.KIND_BOOL
+  return Str.from_bytes(dyn_byte_slice(v)) if dyn_bytes?(v)
+  none
+}
+
+# The unqualified type name Go's marshal uses for an element (typ.Name()).
+def dyn_type_local(v: dyn.Value) -> Str {
+  t = v.type_name
+  return "" if t.size == 0 || t[0] == 0x5B || t[0] == 0x2A || t.start_with?("map[") || t.start_with?("func(") || t.start_with?("struct ")
+  i = t.size - 1
+  while i >= 0 && t[i] != 0x2E {
+    i -= 1
+  }
+  name = t[i + 1...t.size]
+  j = 0
+  while j < name.size && name[j] != 0x5B {
+    j += 1
+  }
+  name[0...j]
+}
+
+# The value of a struct's XMLName field when it is a Name (a struct with a
+# string Local and Space), else the empty name.
+def dyn_xml_name(v: dyn.Value) -> Name {
+  out = Name.new
+  if xf = v.field("XMLName") {
+    xv = dyn_indirect(xf[0])
+    if xv.kind == dyn.KIND_STRUCT {
+      if l = xv.field("Local") {
+        out.local = l[0].str_val if l[0].kind == dyn.KIND_STRING
+      }
+      if s = xv.field("Space") {
+        out.space = s[0].str_val if s[0].kind == dyn.KIND_STRING
+      }
+    }
+  }
+  out
+}
+
+# Go's marshalValue for a dynamic value. `iface`: v is the content of an
+# interface (its omitempty test is a nil test).
+pub def marshal_dyn(e: Encoder, v0: dyn.Value, tmpl: StartElement?, fname: Name, omit: Bool) -> ~Unit {
+  ~marshal_dyn_at(e, v0, tmpl, fname, omit, true)
+}
+
+def marshal_dyn_at(e: Encoder, v0: dyn.Value, tmpl: StartElement?, fname: Name, omit: Bool, iface: Bool) -> ~Unit {
+  if t = tmpl {
+    fail other("xml: EncodeElement of StartElement with missing name") if t.name.local == ""
+  }
+  return nil if v0.kind == dyn.KIND_INVALID
+  if omit {
+    return nil if iface && dyn_nil?(v0)
+    return nil if !iface && dyn_empty_val?(v0)
+  }
+  v = v0
+  while v.kind == dyn.KIND_PTR {
+    return nil if v.nil?
+    v = v.elem
+  }
+  return nil if v.kind == dyn.KIND_INVALID
+  if v.kind == dyn.KIND_LIST && !dyn_bytes?(v) {
+    for x in v.elems {
+      ~marshal_dyn_at(e, x, tmpl, fname, omit, false)
+    }
+    return nil
+  }
+  start = StartElement.new(name: Name.new)
+  if t = tmpl {
+    start = t.copy
+  } else if v.kind == dyn.KIND_STRUCT {
+    start.name = dyn_xml_name(v)
+  }
+  start.name = fname if start.name.local == ""
+  if start.name.local == "" {
+    n = dyn_type_local(v)
+    fail XmlError.UnsupportedType(v.type_name) if n == ""
+    start.name = Name.new(local: n)
+  }
+  if v.kind == dyn.KIND_STRUCT {
+    e.~write_start!(start)
+    for fnm in v.field_names {
+      f = v.field(fnm) || (dyn.Value.invalid, false)
+      next if !f[1] || fnm == "XMLName"
+      ~marshal_dyn_at(e, f[0], none, Name.new(local: fnm), false, true)
+    }
+    e.~write_end!(start.name)
+    return e.~cached_error
+  }
+  s = dyn_simple(v)
+  if x = s {
+    e.~write_start!(start)
+    e.escape_string!(x)
+    e.~write_end!(start.name)
+    return e.~cached_error
+  }
+  fail XmlError.UnsupportedType(v.type_name)
+}
+
+# Go's marshalAttr for a dynamic value: the attributes it makes.
+pub def dyn_attrs(v0: dyn.Value, name: Name) -> ~[Attr] {
+  out: [Attr] = []
+  v = v0
+  if v.kind == dyn.KIND_PTR {
+    return out if v.nil?
+    v = v.elem
+  }
+  return out if v.kind == dyn.KIND_INVALID
+  if v.kind == dyn.KIND_LIST && !dyn_bytes?(v) {
+    for x in v.elems {
+      out = out + ~dyn_attrs(x, name)
+    }
+    return out
+  }
+  if s = dyn_simple(v) {
+    out << Attr.new(name: name, value: s)
+    return out
+  }
+  fail XmlError.UnsupportedType(v.type_name)
+}
+
+# The character data of a dynamic chardata / cdata field.
+pub def dyn_text(v0: dyn.Value) -> ~Str? {
+  v = dyn_indirect(v0)
+  return none if v.kind == dyn.KIND_LIST && !dyn_bytes?(v)
+  dyn_simple(v)
+}
+
+# A dynamic comment field.
+pub def dyn_comment(e: Encoder, v0: dyn.Value, type_name: Str) -> ~Unit {
+  v = dyn_indirect(v0)
+  if v.kind == dyn.KIND_STRING {
+    return e.~write_comment!(v.str_val)
+  }
+  if dyn_bytes?(v) {
+    return e.~write_comment!(Str.from_bytes(dyn_byte_slice(v)))
+  }
+  fail bad_comment(type_name)
+}
+
+# A dynamic innerxml field: a string or []byte is written as it is, any
+# other value as an element.
+pub def dyn_inner(e: Encoder, v0: dyn.Value, fname: Name) -> ~Unit {
+  v = dyn_indirect(v0)
+  if v.kind == dyn.KIND_STRING {
+    e.write_raw!(v.str_val)
+    return nil
+  }
+  if dyn_bytes?(v) {
+    e.write_raw!(Str.from_bytes(dyn_byte_slice(v)))
+    return nil
+  }
+  ~marshal_dyn_at(e, v, none, fname, false, true)
+}
+
+# The XML encoding of a dynamic value (Go's Marshal of an interface{}).
+pub def marshal_value(v: dyn.Value) -> ~[Byte] {
+  e = new_buffer_encoder()
+  ~marshal_dyn(e, v, none, Name.new, false)
+  e.~flush!
+  e.~close!
+  e.output.bytes
+}

@@ -1,0 +1,204 @@
+#![overflow(wrap)]
+# Errors of encoding/json/v2 (Go's errors.go).
+
+import "strconv"
+import "strings"
+import "encoding/json/jsontext"
+
+# What a SemanticError wraps (Go's SemanticError.Err).
+pub enum ErrCause {
+  # No underlying error.
+  Nothing
+  # An error by its message (strconv's "invalid syntax", "value out of range",
+  # "invalid use of `string` tag option", ...).
+  Msg(text: Str)
+  # Go's ErrUnknownName.
+  UnknownName
+  # Go's errAmbiguousName.
+  AmbiguousName
+  # A syntax error found while handling the value.
+  Syntax(e: jsontext.SyntacticError)
+
+  pub def message -> Str {
+    case self {
+      Nothing => ""
+      Msg(t) => t
+      UnknownName => "unknown object member name"
+      AmbiguousName => "ambiguous object member name"
+      Syntax(e) => e.message
+    }
+  }
+}
+
+# Go's *SemanticError: a JSON value that can't be represented in the Go (alx)
+# type, or the reverse. `go_type` is Go's spelling of the type ("int",
+# "[]string", "map[string]int", "*T", "pkg.T"; see the package header).
+pub struct SemanticError {
+  action: Str
+  byte_offset: Int
+  json_pointer: jsontext.Pointer
+  json_kind: jsontext.Kind
+  json_value: Str
+  go_type: Str
+  err: ErrCause
+
+  pub def message -> Str {
+    b = ERROR_PREFIX + "cannot"
+    prep = ""
+    if action == "marshal" {
+      b = b + " marshal"
+      prep = " from"
+    } else if action == "unmarshal" {
+      b = b + " unmarshal"
+      prep = " into"
+    } else {
+      b = b + " handle"
+      prep = " with"
+    }
+    case json_kind {
+      Null => {b = b + " JSON null"}
+      False => {b = b + " JSON boolean"}
+      True => {b = b + " JSON boolean"}
+      String => {b = b + " JSON string"}
+      Number => {b = b + " JSON number"}
+      BeginObject => {b = b + " JSON object"}
+      EndObject => {b = b + " JSON object"}
+      BeginArray => {b = b + " JSON array"}
+      EndArray => {b = b + " JSON array"}
+      Invalid => {
+        prep = "" if action == ""
+      }
+    }
+    if json_value.size > 0 && json_value.size < 100 {
+      b = b + " " + json_value
+    }
+    if go_type != "" {
+      ts = go_type
+      if ts.size > 100 {
+        ts = go_type.start_with?("struct") ? "struct" : (go_type.start_with?("map[") ? "map" : (go_type.start_with?("[]") ? "slice" : "array"))
+      }
+      b = b + prep + " Go " + ts
+    }
+    if err == ErrCause.UnknownName || err == ErrCause.AmbiguousName {
+      b = b + ": " + err.message + " " + strconv.quote(json_pointer.last_token)
+      parent = json_pointer.parent
+      if parent.s != "" {
+        b = b + " within " + strconv.quote(jsontext.truncate_pointer(parent.s, 100))
+      }
+      return b
+    }
+    serr: jsontext.SyntacticError? = none
+    case err {
+      Syntax(s) => {serr = s}
+      _ => {}
+    }
+    if json_pointer.s != "" {
+      inside = false
+      if s = serr { inside = json_pointer.contains?(s.json_pointer) }
+      if !inside {
+        b = b + " within " + strconv.quote(jsontext.truncate_pointer(json_pointer.s, 100))
+      }
+    } else if byte_offset > 0 {
+      before = false
+      if s = serr { before = byte_offset <= s.byte_offset }
+      if !before {
+        b = b + " after offset " + byte_offset.to_s
+      }
+    }
+    if err != ErrCause.Nothing {
+      t = err.message
+      t = strings.trim_prefix(t, "jsontext: ") if serr.present?
+      b = b + ": " + t
+    }
+    b
+  }
+}
+
+ERROR_PREFIX = "json: "
+
+# Everything this package fails with besides the jsontext errors it passes
+# on (syntax errors from the Decoder and Encoder, I/O errors).
+pub error JsonError {
+  # Go's *SemanticError.
+  Semantic(e: SemanticError)
+  # The input ended at the top level (Go's io.EOF inside the package, turned
+  # into an "unexpected EOF" SyntacticError or none at the boundaries).
+  Eof
+  # From a marshal or unmarshal function: not for this value, try the next
+  # one or the default (Go's errors.ErrUnsupported).
+  Unsupported
+  # Anything else, by its message.
+  Other(msg: Str)
+
+  def message -> Str {
+    case self {
+      Semantic(e) => e.message
+      Eof => "EOF"
+      Unsupported => "unsupported operation"
+      Other(m) => m
+    }
+  }
+}
+
+# The SemanticError inside e, if it is one.
+pub def semantic(e: Error) -> SemanticError? {
+  case e {
+    JsonError.Semantic(s) => s
+    _ => none
+  }
+}
+
+def sem(action: Str, off: Int, ptr: jsontext.Pointer, kind: jsontext.Kind, value: Str, t: Str, c: ErrCause) -> JsonError {
+  JsonError.Semantic(e: SemanticError.new(action: action, byte_offset: off, json_pointer: ptr, json_kind: kind, json_value: value, go_type: t, err: c))
+}
+
+# Go's newMarshalErrorBefore: a problem with the value about to be written.
+pub def marshal_error_before(e: jsontext.Encoder, t: Str, c: ErrCause) -> JsonError {
+  sem("marshal", e.output_offset + e.count_next_delim_whitespace, e.pointer_at(1), jsontext.Kind.Invalid, "", t, c)
+}
+
+# Go's newUnmarshalErrorBefore: a problem before reading the next value.
+pub def unmarshal_error_before(d: jsontext.Decoder, t: Str, c: ErrCause) -> JsonError {
+  off = d.input_offset + d.count_next_delim_whitespace!
+  sem("unmarshal", off, d.pointer_at(1), jsontext.Kind.Invalid, "", t, c)
+}
+
+# Go's newUnmarshalErrorAfter: a problem with the token or value just read.
+pub def unmarshal_error_after(d: jsontext.Decoder, t: Str, c: ErrCause) -> JsonError {
+  prev = d.previous_token_or_value
+  k = jsontext.Value.new(raw: prev).kind
+  sem("unmarshal", d.input_offset - prev.size, d.pointer_at(-1), k, "", t, c)
+}
+
+# Go's newUnmarshalErrorAfterWithValue: also quotes a string or number read.
+pub def unmarshal_error_after_value(d: jsontext.Decoder, t: Str, c: ErrCause) -> JsonError {
+  prev = d.previous_token_or_value
+  k = jsontext.Value.new(raw: prev).kind
+  v = (k == jsontext.Kind.String || k == jsontext.Kind.Number) ? Str.from_bytes(prev) : ""
+  sem("unmarshal", d.input_offset - prev.size, d.pointer_at(-1), k, v, t, c)
+}
+
+# Go's error for a format tag option the type doesn't support.
+pub def invalid_format_enc(e: jsontext.Encoder, o: jsontext.Options, t: Str) -> JsonError {
+  marshal_error_before(e, t, ErrCause.Msg(text: "invalid format flag " + strconv.quote(o.format)))
+}
+
+pub def invalid_format_dec(d: jsontext.Decoder, o: jsontext.Options, t: Str) -> JsonError {
+  unmarshal_error_before(d, t, ErrCause.Msg(text: "invalid format flag " + strconv.quote(o.format)))
+}
+
+ERR_INVALID_STRING_TAG = "invalid use of `string` tag option"
+
+# Go's newDuplicateNameError: a SyntacticError for a repeated member name.
+pub def duplicate_name_error(ptr: jsontext.Pointer, name: Str?, offset: Int) -> jsontext.JsonTextError {
+  p = ptr
+  if n = name { p = ptr.append_token(n) }
+  jsontext.JsonTextError.Syntactic(e: jsontext.SyntacticError.new(byte_offset: offset, json_pointer: p, err: jsontext.Cause.DuplicateName))
+}
+
+# A SemanticError's cause for a jsontext error (its SyntacticError, or its
+# message).
+pub def cause_of(e: Error) -> ErrCause {
+  if s = jsontext.syntactic(e) { return ErrCause.Syntax(e: s) }
+  ErrCause.Msg(text: e.message)
+}

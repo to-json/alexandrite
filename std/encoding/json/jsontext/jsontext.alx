@@ -1,0 +1,591 @@
+#![overflow(wrap)]
+# Package jsontext: Go's encoding/json/jsontext, the syntactic layer of JSON v2
+# (RFC 4627, 7159, 7493, 8259, 8785): a streaming Encoder and Decoder of JSON
+# tokens and values with a state machine that checks the grammar, the Token
+# and Value types, and Value formatting (compact, indent, canonicalize).
+# Package encoding/json/v2 marshals typed values on top of it.
+#
+#   Go                                   alx
+#   NewEncoder(w, opts...)               new_encoder(w, [opts...])
+#   (*Encoder).WriteToken(t) error       e.~write_token!(t)
+#   (*Encoder).WriteValue(v) error       e.~write_value!(v)
+#   (*Encoder).OutputOffset/StackDepth/StackIndex/StackPointer/Options/Reset
+#                                        output_offset, stack_depth, stack_index(i),
+#                                        stack_pointer, options, reset!(w, opts)
+#   NewDecoder(r, opts...)               new_decoder(r, [opts...])
+#   (*Decoder).ReadToken() (Token, err)  d.~read_token! -> Token?  (none: Go's io.EOF)
+#   (*Decoder).ReadValue() (Value, err)  d.~read_value! -> Value?  (none: Go's io.EOF)
+#   (*Decoder).PeekKind / SkipValue      peek_kind -> Kind, ~skip_value!
+#   (*Decoder).InputOffset/UnreadBuffer/StackDepth/StackIndex/StackPointer
+#                                        input_offset, unread_buffer, stack_depth, ...
+#   Token: Null, True, BeginObject, ...  Token.null, Token.false_, Token.true_,
+#                                        Token.begin_object, end_object, begin_array, end_array
+#   Bool(b) String(s) Int(n) Uint(n) Float(f)
+#                                        jsontext.bool(b), string(s), int(n),
+#                                        uint(n), float(f) (package functions)
+#   t.Kind() t.String() t.Bool()         t.kind, t.to_s (Go's String), t.bool
+#   t.Int() t.Uint() t.Float() t.Clone() t.~int, t.~uint, t.~float, t.clone; Go's
+#                                        clamped value with the error: int_clamped,
+#                                        uint_clamped, float_clamped
+#   Kind ('n', 'f', '"', '0', '{', ...)  enum Kind { Invalid, Null, False, True, String,
+#                                        Number, BeginObject, EndObject, BeginArray,
+#                                        EndArray }; k.byte is Go's byte, k.to_s Go's String
+#   Value ([]byte)                       struct Value { raw: [Byte] }: Value.of(str),
+#                                        v.to_s, v.kind, v.valid?(opts), v.~compact!(opts),
+#                                        v.~indent!(opts), v.~canonicalize!(opts),
+#                                        v.~format!(opts), v.clone
+#   AppendFormat(dst, src, opts...)      append_format(dst, src, opts) -> ~[Byte]
+#   AppendQuote / AppendUnquote          append_quote(dst, s) / append_unquote(dst, s)
+#                                        -> ([Byte], JsonTextError?) (Go returns both)
+#   AppendFloat(dst, f, bits)            append_float_bits(dst, f, 64)
+#   Pointer (string)                     struct Pointer { s: Str }: valid?, contains?,
+#                                        parent, last_token, append_token, tokens
+#   options: AllowDuplicateNames(b),     allow_duplicate_names(b), allow_invalid_utf8(b),
+#     AllowInvalidUTF8, EscapeForHTML,   escape_for_html(b), escape_for_js(b),
+#     EscapeForJS, PreserveRawStrings,   preserve_raw_strings(b), canonicalize_raw_ints(b),
+#     CanonicalizeRawInts/Floats,        canonicalize_raw_floats(b), reorder_raw_objects(b),
+#     ReorderRawObjects, SpaceAfterColon space_after_colon(b), space_after_comma(b),
+#     SpaceAfterComma, Multiline,        multiline(b), with_indent(s),
+#     WithIndent, WithIndentPrefix       with_indent_prefix(s)
+#   json.GetOption(opts, setter)         get_option(opts, setter) -> Bool? (bool options),
+#                                        get_str_option(opts, setter) -> Str? (indents)
+#   *SyntacticError {ByteOffset,         JsonTextError.Syntactic(SyntacticError):
+#     JSONPointer, Err}                    byte_offset, json_pointer, err (a Cause)
+#   ErrDuplicateName, ErrNonStringName   Cause.DuplicateName, Cause.NonStringName
+#   io.ErrUnexpectedEOF inside an error  Cause.UnexpectedEof (message "unexpected EOF")
+#
+# Differences from Go, and why:
+#   - The end of the input (Go's io.EOF from ReadToken/ReadValue) is `none`: in
+#     alx the end of a stream isn't an error (GO-VS-RUBY F3).
+#   - Options is one struct (Go: an interface implemented by flag values and
+#     *jsonopts.Struct); the constructors return an Options with one setting, a
+#     list of them is joined in order as Go joins its variadic options. The same
+#     struct carries encoding/json/v2's options, which jsontext ignores, as Go's.
+#   - Tokens own their bytes: Go's Token read from a Decoder aliases the
+#     decoder's buffer and panics when used after the next read; here it stays
+#     valid, so Clone is a plain copy.
+#   - There is no float32: Float32 tokens and AppendFloat(.., 32) round to the
+#     nearest float32 through bit arithmetic (append_float(dst, f, 32) works,
+#     Token.float32 isn't provided).
+#   - Kind is an enum, so Go's "<invalid jsontext.Kind: 'x'>" can't happen.
+#   - Encoder and Decoder hold an io.Writer / io.Reader interface value (or
+#     none: an encoder into its own buffer, a decoder over given bytes); Go's
+#     bytes.Buffer fast paths are not reproduced (same output).
+#   - Errors carry their messages, not the wrapped Go error values: an I/O
+#     error is Io(action, message); `errors.Is(err, ErrDuplicateName)` is
+#     `case e { JsonTextError.Syntactic(s) => s.err == Cause.DuplicateName }`.
+#   - WithByteLimit / WithDepthLimit are commented out in Go too; the
+#     internal Encoder/Decoder hooks for json/v2 (export.go) are ordinary
+#     package-visible methods.
+#   - The decoder discards consumed input when it reads more from its Reader,
+#     as Go's does, but without Go's buffer growth heuristics (the read sizes
+#     differ; offsets and results don't).
+
+import "strconv"
+import "strings"
+import "io"
+import "unicode/utf16"
+
+# ------------------------------------------------------------------ Kind
+
+# The kind of a token or value. Go's Kind is a byte ('n', 'f', 't', '"',
+# '0', '{', '}', '[', ']'); `byte` gives it.
+pub enum Kind {
+  Invalid
+  Null
+  False
+  True
+  String
+  Number
+  BeginObject
+  EndObject
+  BeginArray
+  EndArray
+
+  pub def byte -> Byte {
+    case self {
+      Invalid => 0
+      Null => 110
+      False => 102
+      True => 116
+      String => 34
+      Number => 48
+      BeginObject => 123
+      EndObject => 125
+      BeginArray => 91
+      EndArray => 93
+    }
+  }
+
+  pub def to_s -> Str {
+    case self {
+      Invalid => "invalid"
+      Null => "null"
+      False => "false"
+      True => "true"
+      String => "string"
+      Number => "number"
+      BeginObject => "{"
+      EndObject => "}"
+      BeginArray => "["
+      EndArray => "]"
+    }
+  }
+
+  # The kind of a JSON value or token starting with byte c (Go's normalize).
+  pub def self.of(c: Byte) -> Kind {
+    case c {
+      110 => Kind.Null
+      102 => Kind.False
+      116 => Kind.True
+      34 => Kind.String
+      123 => Kind.BeginObject
+      125 => Kind.EndObject
+      91 => Kind.BeginArray
+      93 => Kind.EndArray
+      45 => Kind.Number
+      48..57 => Kind.Number
+      _ => Kind.Invalid
+    }
+  }
+}
+
+# ------------------------------------------------------------------ errors
+
+# The cause inside a SyntacticError (Go's SyntacticError.Err).
+pub enum Cause {
+  DuplicateName
+  NonStringName
+  MissingValue
+  MismatchDelim
+  MaxDepth
+  InvalidNamespace
+  UnexpectedEof
+  InvalidUtf8
+  InvalidToken
+  # Go's jsonwire.InvalidTextError: "invalid <label> <what> <where>".
+  InvalidText(label: Str, what: Str, where_: Str)
+  # An I/O error from the Reader or Writer ("read" or "write").
+  Io(action: Str, msg: Str)
+  # Anything else, by its message.
+  Other(msg: Str)
+
+  pub def message -> Str {
+    case self {
+      DuplicateName => "duplicate object member name"
+      NonStringName => "object member name must be a string"
+      MissingValue => "missing value after object name"
+      MismatchDelim => "mismatching structural token for object or array"
+      MaxDepth => "exceeded max depth"
+      InvalidNamespace => "object namespace is in an invalid state"
+      UnexpectedEof => "unexpected EOF"
+      InvalidUtf8 => "invalid UTF-8"
+      InvalidToken => "invalid jsontext.Token"
+      InvalidText(l, w, wh) => invalid_text_message(l, w, wh)
+      Io(a, m) => ERROR_PREFIX + a + " error: " + m
+      Other(m) => m
+    }
+  }
+}
+
+pub ERROR_PREFIX = "jsontext: "
+
+# Go's *SyntacticError: a syntax problem (or a structural one, such as a
+# duplicate name) at a byte offset, with the JSON Pointer to where it is.
+pub struct SyntacticError {
+  byte_offset: Int
+  json_pointer: Pointer
+  err: Cause
+
+  pub def message -> Str {
+    ptr = json_pointer
+    off = byte_offset
+    b = ERROR_PREFIX + err.message
+    if err == Cause.DuplicateName {
+      b = b + " " + strconv.quote(ptr.last_token)
+      ptr = ptr.parent
+      off = 0
+    }
+    if ptr.s != "" {
+      b = b + " within " + strconv.quote(truncate_pointer(ptr.s, 100))
+    }
+    if off > 0 {
+      b = b + " after offset " + strconv.itoa(off)
+    }
+    b
+  }
+}
+
+# Everything this package fails with.
+pub error JsonTextError {
+  # Go's *SyntacticError.
+  Syntactic(e: SyntacticError)
+  # An I/O error of the underlying Reader or Writer (Go's *ioError).
+  Io(action: Str, msg: Str)
+  # Go's *numError: a number token that doesn't fit the requested type.
+  Num(accessor: Str, value: Str, range: Bool)
+  # Using a Token or an Encoder in a way Go reports with an error value.
+  Invalid(msg: Str)
+
+  def message -> Str {
+    case self {
+      Syntactic(e) => e.message
+      Io(a, m) => ERROR_PREFIX + a + " error: " + m
+      Num(acc, v, r) => "jsontext.Token(" + v + ")." + acc + " error: " + (r ? "value out of range" : "invalid syntax")
+      Invalid(m) => m
+    }
+  }
+}
+
+# The SyntacticError inside e, if it is one.
+pub def syntactic(e: Error) -> SyntacticError? {
+  case e {
+    JsonTextError.Syntactic(s) => s
+    _ => none
+  }
+}
+
+# ------------------------------------------------------------------ Pointer
+
+# A JSON Pointer (RFC 6901): "" is the top-level value, "/a/0" the first
+# element of member "a". `~` is escaped as `~0` and `/` as `~1`.
+pub struct Pointer {
+  s: Str
+
+  pub def to_s -> Str { s }
+
+  # Whether p is a syntactically valid pointer.
+  pub def valid? -> Bool {
+    i = 0
+    n = s.size
+    while i < n {
+      c = s[i]
+      if c == 126 {
+        return false if i + 1 == n || (s[i + 1] != 48 && s[i + 1] != 49)
+      }
+      if c >= 0x80 {
+        r, sz = decode_rune_s(s, i)
+        return false if r == 0xFFFD && sz == 1
+        i += sz
+        next
+      }
+      i += 1
+    }
+    n == 0 || s[0] == 47
+  }
+
+  # Whether pc is p itself or a pointer into it.
+  pub def contains?(pc: Pointer) -> Bool {
+    return false if !pc.s.start_with?(s)
+    suffix = pc.s[s.size...pc.s.size]
+    suffix == "" || suffix[0] == 47
+  }
+
+  # The pointer without its last token ("" stays "").
+  pub def parent -> Pointer {
+    i = strings.last_index_byte(s, 47)
+    i = 0 if i < 0
+    Pointer.new(s: s[0...i])
+  }
+
+  # The last reference token, unescaped.
+  pub def last_token -> Str {
+    i = strings.last_index_byte(s, 47)
+    i = 0 if i < 0
+    last = s[i...s.size]
+    last = last[1...last.size] if last.size > 0 && last[0] == 47
+    unescape_pointer_token(last)
+  }
+
+  # p with tok appended as one more reference token.
+  pub def append_token(tok: Str) -> Pointer {
+    b = app_s([], s)
+    b << 47
+    Pointer.new(s: Str.from_bytes(append_escape_pointer_name(b, tok)))
+  }
+
+  # The reference tokens, unescaped.
+  pub def tokens -> [Str] {
+    out: [Str] = []
+    p = s
+    while p.size > 0 {
+      p = p[1...p.size] if p[0] == 47
+      i = strings.index_byte(p, 47)
+      i = p.size if i < 0
+      out << unescape_pointer_token(p[0...i])
+      p = p[i...p.size]
+    }
+    out
+  }
+}
+
+def unescape_pointer_token(t: Str) -> Str {
+  return t if !t.include?("~")
+  strings.replace_all(strings.replace_all(t, "~1", "/"), "~0", "~")
+}
+
+def append_escape_pointer_name(b0: [Byte], name: Str) -> [Byte] {
+  b = b0
+  for i in 0...name.size {
+    c = name[i]
+    if c == 126 {
+      b << 126
+      b << 48
+    } else if c == 47 {
+      b << 126
+      b << 49
+    } else {
+      b << c
+    }
+  }
+  b
+}
+
+# ------------------------------------------------------------------ options
+
+# The bits of the boolean options (Go's jsonflags). Coder flags, then
+# encoding/json/v2's, then its v1 compatibility flags; the same positions as Go.
+pub F_ALLOW_DUPLICATE_NAMES: U64 = 1 << 1
+pub F_ALLOW_INVALID_UTF8: U64 = 1 << 2
+pub F_WITHIN_ARSHAL_CALL: U64 = 1 << 3
+pub F_OMIT_TOP_LEVEL_NEWLINE: U64 = 1 << 4
+pub F_PRESERVE_RAW_STRINGS: U64 = 1 << 5
+pub F_CANONICALIZE_RAW_INTS: U64 = 1 << 6
+pub F_CANONICALIZE_RAW_FLOATS: U64 = 1 << 7
+pub F_REORDER_RAW_OBJECTS: U64 = 1 << 8
+pub F_ESCAPE_FOR_HTML: U64 = 1 << 9
+pub F_ESCAPE_FOR_JS: U64 = 1 << 10
+pub F_MULTILINE: U64 = 1 << 11
+pub F_SPACE_AFTER_COLON: U64 = 1 << 12
+pub F_SPACE_AFTER_COMMA: U64 = 1 << 13
+pub F_INDENT: U64 = 1 << 14
+pub F_INDENT_PREFIX: U64 = 1 << 15
+pub F_BYTE_LIMIT: U64 = 1 << 16
+pub F_DEPTH_LIMIT: U64 = 1 << 17
+# encoding/json/v2
+pub F_STRINGIFY_NUMBERS: U64 = 1 << 18
+pub F_DETERMINISTIC: U64 = 1 << 19
+pub F_FORMAT_NIL_MAP_AS_NULL: U64 = 1 << 20
+pub F_FORMAT_NIL_SLICE_AS_NULL: U64 = 1 << 21
+pub F_OMIT_ZERO_STRUCT_FIELDS: U64 = 1 << 22
+pub F_MATCH_CASE_INSENSITIVE_NAMES: U64 = 1 << 23
+pub F_REJECT_UNKNOWN_MEMBERS: U64 = 1 << 24
+pub F_MARSHALERS: U64 = 1 << 25
+pub F_UNMARSHALERS: U64 = 1 << 26
+pub F_STRING_TAG: U64 = 1 << 27
+pub F_FORMAT_TAG: U64 = 1 << 28
+pub F_FORMAT_TAG_SUPPORTED: U64 = 1 << 29
+# encoding/json (v1) semantics expressed as v2 options
+pub F_CALL_METHODS_WITH_LEGACY_SEMANTICS: U64 = 1 << 30
+pub F_FORMAT_BYTE_ARRAY_AS_ARRAY: U64 = 1 << 31
+pub F_FORMAT_BYTES_WITH_LEGACY_SEMANTICS: U64 = 1 << 32
+pub F_FORMAT_DURATION_AS_NANO: U64 = 1 << 33
+pub F_MATCH_CASE_SENSITIVE_DELIMITER: U64 = 1 << 34
+pub F_MERGE_WITH_LEGACY_SEMANTICS: U64 = 1 << 35
+pub F_OMIT_EMPTY_WITH_LEGACY_SEMANTICS: U64 = 1 << 36
+pub F_PARSE_BYTES_WITH_LOOSE_RFC4648: U64 = 1 << 37
+pub F_PARSE_TIME_WITH_LOOSE_RFC3339: U64 = 1 << 38
+pub F_REPORT_ERRORS_WITH_LEGACY_SEMANTICS: U64 = 1 << 39
+pub F_STRINGIFY_WITH_LEGACY_SEMANTICS: U64 = 1 << 40
+pub F_UNMARSHAL_ANY_WITH_RAW_NUMBER: U64 = 1 << 41
+pub F_UNMARSHAL_ARRAY_FROM_ANY_LENGTH: U64 = 1 << 42
+
+F_ANY_WHITESPACE: U64 = (1 << 11) | (1 << 12) | (1 << 13)
+F_ANY_ESCAPE: U64 = (1 << 9) | (1 << 10)
+F_CANONICALIZE_NUMBERS: U64 = (1 << 6) | (1 << 7)
+pub F_TAG_FLAGS: U64 = (1 << 27) | (1 << 28)
+F_NON_BOOLEAN: U64 = (1 << 14) | (1 << 15) | (1 << 16) | (1 << 17) | (1 << 25) | (1 << 26) | (1 << 28)
+
+# The v1 defaults (Go's jsonflags.DefaultV1Flags): v2 options that are
+# explicitly false by default, and true under encoding/json's v1 semantics.
+pub F_DEFAULT_V1: U64 = (1 << 1) | (1 << 2) | (1 << 9) | (1 << 10) | (1 << 5) | (1 << 19) | (1 << 20) | (1 << 21) | (1 << 23) | (1 << 30) | (1 << 31) | (1 << 32) | (1 << 33) | (1 << 34) | (1 << 35) | (1 << 36) | (1 << 37) | (1 << 38) | (1 << 39) | (1 << 40) | (1 << 42)
+
+# Options for the Encoder, the Decoder, and encoding/json/v2's Marshal and
+# Unmarshal. `presence` says which flags were set, `values` their values
+# (Go's jsonflags.Flags); the other fields hold the non-boolean options.
+# Build one with the option functions; a list is joined in order.
+pub struct Options {
+  presence: U64
+  values: U64
+  indent: Str
+  indent_prefix: Str
+  byte_limit: Int
+  depth_limit: Int
+  # encoding/json/v2: the `format:` of the current field (Go's jsonopts.Format).
+  format: Str
+  # encoding/json/v2: WithMarshalers / WithUnmarshalers (see that package).
+  marshalers: [MarshalHook]
+  unmarshalers: [UnmarshalHook]
+
+  # The value of a boolean flag (false when unset).
+  pub def get(f: U64) -> Bool { values & f != 0 }
+  # Whether any of the flags in f was set.
+  pub def has(f: U64) -> Bool { presence & f != 0 }
+
+  # Sets flag f to v (Go's Flags.Set).
+  pub def set!(f: U64, v: Bool) {
+    self.presence = presence | f
+    self.values = values & ^f
+    self.values = values | f if v
+  }
+
+  # Clears flags f (neither set nor present).
+  pub def clear!(f: U64) {
+    self.presence = presence & ^f
+    self.values = values & ^f
+  }
+
+  # Joins src into this (later options win), as Go's jsonopts.Struct.Join.
+  pub def join!(src: Options) {
+    self.presence = presence | src.presence
+    self.values = (values & ^src.presence) | src.values
+    if src.presence & F_NON_BOOLEAN != 0 {
+      self.indent = src.indent if src.presence & F_INDENT != 0
+      self.indent_prefix = src.indent_prefix if src.presence & F_INDENT_PREFIX != 0
+      self.byte_limit = src.byte_limit if src.presence & F_BYTE_LIMIT != 0
+      self.depth_limit = src.depth_limit if src.presence & F_DEPTH_LIMIT != 0
+      self.marshalers = src.marshalers if src.presence & F_MARSHALERS != 0
+      self.unmarshalers = src.unmarshalers if src.presence & F_UNMARSHALERS != 0
+      self.format = src.format if src.presence & F_FORMAT_TAG != 0
+    }
+  }
+
+  # Joins a list.
+  pub def join_all!(srcs: [Options]) {
+    for o in srcs { self.join!(o) }
+  }
+
+  # Multiline's defaults: a space after colons, none after commas, "\t".
+  pub def initialize_multiline! {
+    self.set!(F_SPACE_AFTER_COLON, true) if !has(F_SPACE_AFTER_COLON)
+    self.set!(F_SPACE_AFTER_COMMA, false) if !has(F_SPACE_AFTER_COMMA)
+    if !has(F_INDENT) {
+      self.set!(F_INDENT, true)
+      self.indent = "\t"
+    }
+  }
+}
+
+# ------------------------------------------------------------------ hooks
+
+# A value encoding/json/v2's WithMarshalers / WithUnmarshalers functions can
+# be called with: every type that derives Json is one (json_v2_type is Go's
+# name of the type), and a hook takes its own type back out with a `case`
+# over the interface value (D71).
+pub interface Marshalee {
+  def json_v2_type -> Str
+}
+
+# A value handed to a hook: a builtin by kind (with Go's name of its type), or
+# a derived value.
+pub enum Arg {
+  B(v: Bool)
+  S(v: Str)
+  I(v: Int, t: Str)
+  U(v: U64, t: Str)
+  F(v: Float, t: Str)
+  O(v: Marshalee)
+}
+
+# The Encoder or Decoder a hook is called with, as an interface value: the
+# hooks live in the Options an Encoder holds, so their types can't name
+# Encoder itself (a type can't contain itself); a hook gets its Encoder back
+# with `case h { jsontext.Encoder(e) => ... }`.
+pub interface HookEncoder {
+  def output_offset -> Int
+}
+
+pub interface HookDecoder {
+  def input_offset -> Int
+}
+
+# One of WithMarshalers' functions, type-erased: true if it wrote the value,
+# false if it doesn't apply to it (or skipped it, Go's errors.ErrUnsupported).
+pub struct MarshalHook {
+  f: (HookEncoder, Arg) -> ~Bool
+}
+
+# One of WithUnmarshalers' functions: the decoded value (given the current
+# one), or none if it doesn't apply.
+pub struct UnmarshalHook {
+  f: (HookDecoder, Arg) -> ~Arg?
+}
+
+# The joined options of a list.
+pub def join_options(opts: [Options]) -> Options {
+  o = Options.new
+  o.join_all!(opts)
+  o
+}
+
+# An Options with one boolean flag set.
+pub def flag_option(f: U64, v: Bool) -> Options {
+  o = Options.new
+  o.set!(f, v)
+  o
+}
+
+# Whether duplicate object member names are allowed (default: rejected).
+pub def allow_duplicate_names(v: Bool) -> Options { flag_option(F_ALLOW_DUPLICATE_NAMES, v) }
+# Whether invalid UTF-8 in strings is allowed (default: rejected); when
+# encoding it becomes U+FFFD.
+pub def allow_invalid_utf8(v: Bool) -> Options { flag_option(F_ALLOW_INVALID_UTF8, v) }
+# Escape <, > and & in strings as <, >, &.
+pub def escape_for_html(v: Bool) -> Options { flag_option(F_ESCAPE_FOR_HTML, v) }
+# Escape U+2028 and U+2029 as   and  .
+pub def escape_for_js(v: Bool) -> Options { flag_option(F_ESCAPE_FOR_JS, v) }
+# Copy raw strings verbatim instead of reformatting their escapes.
+pub def preserve_raw_strings(v: Bool) -> Options { flag_option(F_PRESERVE_RAW_STRINGS, v) }
+# Reformat raw integers beyond ±2^53 as float64 would print them.
+pub def canonicalize_raw_ints(v: Bool) -> Options { flag_option(F_CANONICALIZE_RAW_INTS, v) }
+# Reformat raw numbers with a fraction or exponent as float64 would print them.
+pub def canonicalize_raw_floats(v: Bool) -> Options { flag_option(F_CANONICALIZE_RAW_FLOATS, v) }
+# Sort the members of raw objects (RFC 8785).
+pub def reorder_raw_objects(v: Bool) -> Options { flag_option(F_REORDER_RAW_OBJECTS, v) }
+# A space after each colon.
+pub def space_after_colon(v: Bool) -> Options { flag_option(F_SPACE_AFTER_COLON, v) }
+# A space after each comma.
+pub def space_after_comma(v: Bool) -> Options { flag_option(F_SPACE_AFTER_COMMA, v) }
+# One element or member per line, indented.
+pub def multiline(v: Bool) -> Options { flag_option(F_MULTILINE, v) }
+
+# The indentation per level of multiline output (implies multiline(true)).
+# Panics if it isn't spaces and tabs, as Go's does.
+pub def with_indent(indent: Str) -> Options {
+  t = strings.trim(indent, " \t")
+  panic("json: invalid character " + quote_rune_b(t.bytes) + " in indent") if t.size > 0
+  o = Options.new
+  o.set!(F_MULTILINE | F_INDENT, true)
+  o.indent = indent
+  o
+}
+
+# The prefix of every line after the first of multiline output (implies
+# multiline(true)). Panics if it isn't spaces and tabs.
+pub def with_indent_prefix(prefix: Str) -> Options {
+  t = strings.trim(prefix, " \t")
+  panic("json: invalid character " + quote_rune_b(t.bytes) + " in indent prefix") if t.size > 0
+  o = Options.new
+  o.set!(F_MULTILINE | F_INDENT_PREFIX, true)
+  o.indent_prefix = prefix
+  o
+}
+
+# Go's GetOption for a boolean option: its value in opts, or none if opts
+# doesn't set it. `setter` is the option's function (`allow_duplicate_names`).
+pub def get_option(opts: Options, setter: (Bool) -> Options) -> Bool? {
+  f = setter(true).presence
+  if opts.presence & f == 0 {
+    # A `string` field tag counts as StringifyNumbers.
+    return true if f == F_STRINGIFY_NUMBERS && opts.get(F_STRING_TAG)
+    return none
+  }
+  opts.values & f != 0
+}
+
+# Go's GetOption for with_indent / with_indent_prefix.
+pub def get_str_option(opts: Options, setter: (Str) -> Options) -> Str? {
+  f = setter("").presence & (F_INDENT | F_INDENT_PREFIX)
+  return none if opts.presence & f == 0
+  f == F_INDENT ? opts.indent : opts.indent_prefix
+}

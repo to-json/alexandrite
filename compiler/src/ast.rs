@@ -180,6 +180,22 @@ pub struct ConstDef {
     /// not a compile-time constant. Its value is computed once, at program
     /// start, by the def `var_init_name(name)` the parser adds.
     pub var: bool,
+    /// `#[embed("pattern", ...)] NAME: Type` (Go's `//go:embed`): the
+    /// patterns, then the files the front end found for them.
+    pub embed: Option<Embed>,
+}
+
+/// The files of an `#[embed(...)]` constant (D65).
+#[derive(Debug, Clone, Default)]
+pub struct Embed {
+    pub patterns: Vec<String>,
+    pub span: Span,
+    /// Slash-separated names relative to the declaring file's directory,
+    /// with their contents, in Go's embed.FS order (by directory, then
+    /// name). Directories are listed too, named with a trailing `/` and
+    /// no data.
+    pub files: std::rc::Rc<Vec<(String, Vec<u8>)>>,
+
 }
 
 /// The def computing package-level value `name` (`pkg.NAME` → `pkg.__init_NAME`).
@@ -259,6 +275,9 @@ pub struct IfaceDef {
 #[derive(Debug, Clone)]
 pub struct RefineDef {
     pub name: String,
+    /// `refine OptScan[T] for T? { }`: a generic refinement; its methods
+    /// are generic over these (first), bound by matching the target.
+    pub tparams: Vec<TParam>,
     pub target: TypeExpr,
     pub methods: Vec<String>,
     pub span: Span,
@@ -276,6 +295,20 @@ pub fn texpr_word(t: &TypeExpr) -> String {
         TypeExpr::Handle(n, args, _) => format!("H{}{}", n.replace(['.', '/'], "_"), args.iter().map(texpr_word).collect::<String>()),
         TypeExpr::Fn(ps, r, _) => format!("Fn{}To{}", ps.iter().map(texpr_word).collect::<String>(), texpr_word(r)),
         TypeExpr::Tuple(ts, _) => format!("Tup{}End", ts.iter().map(texpr_word).collect::<String>()),
+    }
+}
+
+/// An `extern def`'s link name with the library `#[link("lib")]` names
+/// (`Def::ffi` holds both; `ffi_split` takes them apart).
+pub fn ffi_with_lib(lib: &str, sym: &str) -> String {
+    format!("{lib}\0{sym}")
+}
+
+/// (library, symbol) of a `Def::ffi`.
+pub fn ffi_split(ffi: &str) -> (Option<&str>, &str) {
+    match ffi.split_once('\0') {
+        Some((l, s)) => (Some(l), s),
+        None => (None, ffi),
     }
 }
 

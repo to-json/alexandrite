@@ -228,6 +228,7 @@ fn collect_enters(ss: &[LS], out: &mut Vec<(V, V)>) {
 /// An `extern def` as a function: its body is one C call, with Ints
 /// converted to machine words (and back) in a `#![overflow(promote)]` file.
 fn ffi_wrapper(p: &TProgram, sm: &SourceMap, opts: &Opts, f: &TFunc, sym: &str, prog: &RefCell<LProgram>) -> LFunc {
+    let (lib, sym) = crate::ast::ffi_split(sym);
     let mut lw = Lw::new(p, sm, opts, f, f.overflow, ErrPath::Return(vec![]), prog);
     let params: Vec<V> = f.params.iter().map(|l| lw.var_of(*l)).collect();
     let ffi_ty = |t: &Ty| match t {
@@ -248,7 +249,7 @@ fn ffi_wrapper(p: &TProgram, sm: &SourceMap, opts: &Opts, f: &TFunc, sym: &str, 
         let a = LE::Var(*v);
         args.push(if promote && *t == Ty::Int { LE::Rt(Rt::PToI64, vec![a, LE::Loc(sym.to_string())]) } else { a });
     }
-    let sig = FfiSig { sym: sym.to_string(), params: tys, ret: ffi_ty(&f.ret) };
+    let sig = FfiSig { sym: sym.to_string(), lib: lib.map(str::to_string), params: tys, ret: ffi_ty(&f.ret) };
     let idx = {
         let mut pr = prog.borrow_mut();
         match pr.externs.iter().position(|x| *x == sig) {
@@ -813,7 +814,7 @@ impl<'a> Lw<'a> {
         match s {
             TStmt::Expr(e) => {
                 let v = self.expr(e);
-                if !matches!(v, LE::Var(_) | LE::I(_) | LE::B(_) | LE::S(_) | LE::Unit | LE::Field(..) | LE::Cmp(..)) {
+                if !matches!(v, LE::Var(_) | LE::I(_) | LE::B(_) | LE::S(_) | LE::SB(_) | LE::Unit | LE::Field(..) | LE::Cmp(..)) {
                     self.emit(LS::Eval(v));
                 }
             }
@@ -1139,6 +1140,7 @@ impl<'a> Lw<'a> {
                 LE::Unit
             }
             TK::Str(s) => LE::S(s.clone()),
+            TK::Bytes(b) => LE::SB(b.clone()),
             TK::Bool(b) => LE::B(*b),
             TK::Unit => LE::Unit,
             TK::Local(l) => LE::Var(self.var_of(*l)),
@@ -2009,8 +2011,18 @@ impl<'a> Lw<'a> {
         match ty {
             Ty::Fixed(el, n) => {
                 let lt = self.lty(ty);
-                let c = self.tmp(lt);
-                self.emit(LS::Set(c, LE::Rt(Rt::ArrCopy, vec![v])));
+                let c = self.tmp(lt.clone());
+                // The copy goes into the region of the array it copies: the
+                // region analysis placed that one where the value must live
+                // (`v = ys; xs[i] = v` stores v somewhere longer-lived than
+                // the current region, which a loop iteration frees; port-issues #88).
+                let src = self.bind(v, lt.clone());
+                let saved = (*n > 0).then(|| {
+                    let saved = self.tmp(LTy::Region);
+                    self.emit(LS::RegionUse { region: LE::RegionOf(Box::new(src.clone())), saved });
+                    saved
+                });
+                self.emit(LS::Set(c, LE::Rt(Rt::ArrCopy, vec![src])));
                 if el.is_value_array() {
                     let i = self.tmp(LTy::I64);
                     self.emit(LS::Set(i, LE::I(0)));
@@ -2024,6 +2036,9 @@ impl<'a> Lw<'a> {
                         lw.emit(LS::Set(i, LE::Arith(Op::Add, Box::new(LE::Var(i)), Box::new(LE::I(1)), Ovf::Unchecked)));
                     });
                     self.emit(LS::Loop(l, body));
+                }
+                if let Some(saved) = saved {
+                    self.emit(LS::RegionRestore(saved));
                 }
                 LE::Var(c)
             }
@@ -2977,6 +2992,16 @@ impl<'a> Lw<'a> {
             FloatBits => LE::Rt(Rt::FBits, vec![self.expr(recv.unwrap())]),
             UMulHi => LE::Prim(Prim::UMulHi, vec![self.expr(recv.unwrap()), self.expr(&args[0])]),
             FloatFromBits => LE::Rt(Rt::FFromBits, vec![self.expr(recv.unwrap())]),
+            FloatFmtF => {
+                let x = self.expr(recv.unwrap());
+                let n = self.expr(&args[0]);
+                LE::Rt(Rt::FFmt, vec![x, n])
+            }
+            FloatFmtE => {
+                let x = self.expr(recv.unwrap());
+                let n = self.expr(&args[0]);
+                LE::Rt(Rt::FFmtE, vec![x, n, LE::B(false)])
+            }
             StructNew => {
                 let t = self.lty(&e.ty);
                 let vs = args.iter().map(|a| self.arg(a)).collect();
@@ -3499,6 +3524,19 @@ impl<'a> Lw<'a> {
                     None => LE::Unit,
                 }
             }
+            IfaceOpt(k) => {
+                let r = recv.unwrap();
+                let rv = self.expr(r);
+                let rv = self.bind(rv, self.lty(&r.ty));
+                let t = self.lty(&e.ty);
+                let LTy::Tup(ts) = &t else { unreachable!() };
+                let out = self.tmp(t.clone());
+                self.emit(LS::Set(out, LE::Tup(t.clone(), vec![LE::B(false), zero_le(&ts[1])])));
+                let tag = LE::Field(Box::new(rv.clone()), 0);
+                let got = LS::Set(out, LE::Tup(t.clone(), vec![LE::B(true), LE::Field(Box::new(rv), k + 1)]));
+                self.emit(LS::If(LE::Cmp(Op::Eq, Box::new(tag), Box::new(LE::I(k as i64)), LTy::I64), vec![got], vec![]));
+                LE::Var(out)
+            }
             IfaceCall(mi) => {
                 let r = recv.unwrap();
                 let Ty::Iface(iname) = &r.ty else { unreachable!() };
@@ -3653,6 +3691,15 @@ impl<'a> Lw<'a> {
             ErrAs(k) => {
                 let v = self.expr(recv.unwrap());
                 LE::Field(Box::new(err_body(v)), 3 + k)
+            }
+            // An interface value is (tag, implementor 0, implementor 1, ...).
+            IfaceIs(k) => {
+                let v = self.expr(recv.unwrap());
+                LE::Cmp(Op::Eq, Box::new(LE::Field(Box::new(v), 0)), Box::new(LE::I(k as i64)), LTy::I64)
+            }
+            IfaceAs(k) => {
+                let v = self.expr(recv.unwrap());
+                LE::Field(Box::new(v), 1 + k)
             }
             ResOk | ResErr | ResIsOk | ResUnwrap | ResUnwrapOr | ResRescue => {
                 let r = recv.unwrap();
@@ -4708,7 +4755,7 @@ fn le_allocates(e: &LE, rets: &(std::collections::HashSet<String>, std::collecti
     let any = |xs: &[LE]| xs.iter().any(|x| le_allocates(x, rets));
     let one = |x: &LE| le_allocates(x, rets);
     match e {
-        LE::Var(_) | LE::I(_) | LE::F(_) | LE::B(_) | LE::S(_) | LE::Loc(_) | LE::Unit | LE::RegionProgram | LE::Global(_) => false,
+        LE::Var(_) | LE::I(_) | LE::F(_) | LE::B(_) | LE::S(_) | LE::SB(_) | LE::Loc(_) | LE::Unit | LE::RegionProgram | LE::Global(_) => false,
         LE::Tup(_, xs) | LE::Prim(_, xs) => any(xs),
         LE::Field(x, _) | LE::Neg(x, _) | LE::FNeg(x) | LE::Not(x) | LE::Len(x) | LE::RangeField(x, _) | LE::ChanLen(x) | LE::LockPoisoned(x) | LE::AtomicLoad(x) | LE::RegionOf(x) | LE::RegionBytes(x) => one(x),
         LE::Arith(_, a, b, _) | LE::Cmp(_, a, b, _) | LE::FArith(_, a, b) | LE::Range(a, b, _) => one(a) || one(b),

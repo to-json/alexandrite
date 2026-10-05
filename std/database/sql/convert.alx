@@ -1,0 +1,626 @@
+# Scanning: Go's convertAssign as compile-time protocol (see the header of
+# sql.alx), and the driver arguments' checks (driverArgsConnLocked lives in
+# exec.alx).
+#
+# Each destination type T has a static `T.sql_scan(src: driver.Value) -> ~T`
+# (Go's per-destination cases of convertAssign; a Scanner of yours defines
+# its own) and `T.from_sql_row(r: RawRow) -> ~T` (a whole row: tuples
+# element by element, one value from a one-column row, #[derive(Row)]
+# structs by column name). The builtins get both from the refinements below.
+#
+# Conversions (Go's): into Str from Str, [Byte], Time (RFC 3339 with
+# nanoseconds) and numbers/bools (formatted); into [Byte] likewise, NULL
+# gives []; into integers from integers (range-checked) and from text
+# (parsed, base 10), NULL refused; into Float from numbers and text; into
+# Bool by driver.bool's rules; into time.Time only from Time; into
+# driver.Value anything; into T? NULL gives none, anything else T's rules.
+
+import "database/sql/driver"
+import "strconv"
+import "time"
+
+using SInt
+using SI8
+using SI16
+using SI32
+using SU8
+using SU16
+using SU32
+using SU64
+using SFloat
+using SBool
+using SStr
+using SBytes
+using STime
+using SValue
+using SOpt
+using STup2
+using STup3
+using STup4
+using STup5
+using STup6
+using STup7
+using STup8
+
+# A row as the driver gave it: column names and values.
+pub struct RawRow {
+  columns: [Str]
+  values: [driver.Value]
+}
+
+# A Value as a T (T.sql_scan).
+pub def scan_value[T](src: driver.Value) -> ~T {
+  v: T = ~T.sql_scan(src)
+  v
+}
+
+# The row as a T (what rows.scan returns).
+def scan_row[T](raw: RawRow) -> ~T {
+  v: T = ~T.from_sql_row(raw)
+  v
+}
+
+# Column i of the row as a T, with Go's error context.
+pub def convert_column[T](raw: RawRow, i: Int) -> ~T {
+  r = T.sql_scan(raw.values[i])
+  if e = r.err {
+    fail e.wrap("sql: Scan error on column index #{i}, name #{strconv.quote(raw.columns[i])}")
+  }
+  r.unwrap
+}
+
+# A one-column row as a T.
+pub def one_column[T](raw: RawRow) -> ~T {
+  fail "sql: expected #{raw.values.size} destination arguments in Scan, not 1" if raw.values.size != 1
+  v: T = ~convert_column(raw, 0)
+  v
+}
+
+# Go's asString: a Value as text.
+def as_string(v: driver.Value) -> Str {
+  case v {
+    Str(s) => s
+    Bytes(b) => Str.from_bytes(b)
+    Int(i) => "#{i}"
+    Float(f) => strconv.format_float(f, "g", -1, 64)
+    Bool(b) => b ? "true" : "false"
+    Time(t) => t.to_s
+    Null => "<nil>"
+  }
+}
+
+# Go's strconvErr: the reason without strconv's prefix.
+def num_reason(e: Error) -> Str {
+  case e {
+    strconv.NumError.ErrRange(_, _) => "value out of range"
+    _ => "invalid syntax"
+  }
+}
+
+def null_unsupported(kind: Str) -> Error { Failure.Msg("converting NULL to #{kind} is unsupported") }
+
+def bad_number(src: driver.Value, s: Str, kind: Str, e: Error) -> Error {
+  Failure.Msg("converting driver.Value type #{src.go_type} (#{strconv.quote(s)}) to a #{kind}: #{num_reason(e)}")
+}
+
+def parse_int_value(src: driver.Value, kind: Str, bits: Int) -> ~Int {
+  case src {
+    Null => {fail null_unsupported(kind)}
+    Int(i) => {
+      if bits == 64 {
+        return i
+      }
+      _ = 0
+    }
+    _ => {}
+  }
+  s = as_string(src)
+  r = strconv.parse_int(s, 10, bits)
+  if e = r.err {
+    fail bad_number(src, s, kind, e)
+  }
+  r.unwrap
+}
+
+def parse_uint_value(src: driver.Value, kind: Str, bits: Int) -> ~U64 {
+  fail null_unsupported(kind) if src.null?
+  s = as_string(src)
+  r = strconv.parse_uint(s, 10, bits)
+  if e = r.err {
+    fail bad_number(src, s, kind, e)
+  }
+  r.unwrap
+}
+
+def unsupported_scan(src: driver.Value, dest: Str) -> Error {
+  Failure.Msg("unsupported Scan, storing driver.Value type #{src.go_type} into type #{dest}")
+}
+
+refine SInt for Int {
+  def self.sql_scan(src: driver.Value) -> ~Int {
+    v = ~parse_int_value(src, "int", 64)
+    v
+  }
+  def self.from_sql_row(raw: RawRow) -> ~Int {
+    v: Int = ~one_column(raw)
+    v
+  }
+}
+
+refine SI8 for I8 {
+  def self.sql_scan(src: driver.Value) -> ~I8 {
+    v = ~parse_int_value(src, "int8", 8)
+    v.as_i8
+  }
+  def self.from_sql_row(raw: RawRow) -> ~I8 {
+    v: I8 = ~one_column(raw)
+    v
+  }
+}
+
+refine SI16 for I16 {
+  def self.sql_scan(src: driver.Value) -> ~I16 {
+    v = ~parse_int_value(src, "int16", 16)
+    v.as_i16
+  }
+  def self.from_sql_row(raw: RawRow) -> ~I16 {
+    v: I16 = ~one_column(raw)
+    v
+  }
+}
+
+refine SI32 for I32 {
+  def self.sql_scan(src: driver.Value) -> ~I32 {
+    v = ~parse_int_value(src, "int32", 32)
+    v.as_i32
+  }
+  def self.from_sql_row(raw: RawRow) -> ~I32 {
+    v: I32 = ~one_column(raw)
+    v
+  }
+}
+
+refine SU8 for U8 {
+  def self.sql_scan(src: driver.Value) -> ~U8 {
+    v = ~parse_uint_value(src, "uint8", 8)
+    v.as_u8
+  }
+  def self.from_sql_row(raw: RawRow) -> ~U8 {
+    v: U8 = ~one_column(raw)
+    v
+  }
+}
+
+refine SU16 for U16 {
+  def self.sql_scan(src: driver.Value) -> ~U16 {
+    v = ~parse_uint_value(src, "uint16", 16)
+    v.as_u16
+  }
+  def self.from_sql_row(raw: RawRow) -> ~U16 {
+    v: U16 = ~one_column(raw)
+    v
+  }
+}
+
+refine SU32 for U32 {
+  def self.sql_scan(src: driver.Value) -> ~U32 {
+    v = ~parse_uint_value(src, "uint32", 32)
+    v.as_u32
+  }
+  def self.from_sql_row(raw: RawRow) -> ~U32 {
+    v: U32 = ~one_column(raw)
+    v
+  }
+}
+
+refine SU64 for U64 {
+  def self.sql_scan(src: driver.Value) -> ~U64 {
+    v = ~parse_uint_value(src, "uint64", 64)
+    v
+  }
+  def self.from_sql_row(raw: RawRow) -> ~U64 {
+    v: U64 = ~one_column(raw)
+    v
+  }
+}
+
+refine SFloat for Float {
+  def self.sql_scan(src: driver.Value) -> ~Float {
+    case src {
+      Float(f) => f
+      Null => {fail null_unsupported("float64")}
+      _ => {
+        s = as_string(src)
+        r = strconv.parse_float(s)
+        if e = r.err {
+          fail bad_number(src, s, "float64", e)
+        }
+        r.unwrap
+      }
+    }
+  }
+  def self.from_sql_row(raw: RawRow) -> ~Float {
+    v: Float = ~one_column(raw)
+    v
+  }
+}
+
+refine SBool for Bool {
+  def self.sql_scan(src: driver.Value) -> ~Bool {
+    v = driver.bool.~convert_value(src)
+    case v {
+      Bool(b) => b
+      _ => false
+    }
+  }
+  def self.from_sql_row(raw: RawRow) -> ~Bool {
+    v: Bool = ~one_column(raw)
+    v
+  }
+}
+
+refine SStr for Str {
+  def self.sql_scan(src: driver.Value) -> ~Str {
+    case src {
+      Str(s) => s
+      Bytes(b) => Str.from_bytes(b)
+      Time(t) => t.format(time.RFC3339_NANO)
+      Null => {fail null_unsupported("string")}
+      _ => as_string(src)
+    }
+  }
+  def self.from_sql_row(raw: RawRow) -> ~Str {
+    v: Str = ~one_column(raw)
+    v
+  }
+}
+
+refine SBytes for [Byte] {
+  def self.sql_scan(src: driver.Value) -> ~[Byte] {
+    case src {
+      Str(s) => s.bytes
+      Bytes(b) => b.dup
+      Time(t) => t.format(time.RFC3339_NANO).bytes
+      Null => []
+      _ => as_string(src).bytes
+    }
+  }
+  def self.from_sql_row(raw: RawRow) -> ~[Byte] {
+    v: [Byte] = ~one_column(raw)
+    v
+  }
+}
+
+refine STime for time.Time {
+  def self.sql_scan(src: driver.Value) -> ~time.Time {
+    case src {
+      Time(t) => t
+      _ => {fail unsupported_scan(src, "*time.Time")}
+    }
+  }
+  def self.from_sql_row(raw: RawRow) -> ~time.Time {
+    v: time.Time = ~one_column(raw)
+    v
+  }
+}
+
+refine SValue for driver.Value {
+  def self.sql_scan(src: driver.Value) -> ~driver.Value {
+    case src {
+      Bytes(b) => driver.Value.Bytes(b.dup)
+      _ => src
+    }
+  }
+  def self.from_sql_row(raw: RawRow) -> ~driver.Value {
+    v: driver.Value = ~one_column(raw)
+    v
+  }
+}
+
+refine SOpt[T] for T? {
+  def self.sql_scan(src: driver.Value) -> ~T? {
+    return none if src.null?
+    v = ~T.sql_scan(src)
+    v
+  }
+  def self.from_sql_row(raw: RawRow) -> ~T? {
+    v: T? = ~one_column(raw)
+    v
+  }
+}
+
+refine STup2[A, B] for (A, B) {
+  def self.from_sql_row(raw: RawRow) -> ~(A, B) {
+    fail "sql: expected #{raw.values.size} destination arguments in Scan, not 2" if raw.values.size != 2
+    v0: A = ~convert_column(raw, 0)
+    v1: B = ~convert_column(raw, 1)
+    (v0, v1)
+  }
+}
+
+refine STup3[A, B, C] for (A, B, C) {
+  def self.from_sql_row(raw: RawRow) -> ~(A, B, C) {
+    fail "sql: expected #{raw.values.size} destination arguments in Scan, not 3" if raw.values.size != 3
+    v0: A = ~convert_column(raw, 0)
+    v1: B = ~convert_column(raw, 1)
+    v2: C = ~convert_column(raw, 2)
+    (v0, v1, v2)
+  }
+}
+
+refine STup4[A, B, C, D] for (A, B, C, D) {
+  def self.from_sql_row(raw: RawRow) -> ~(A, B, C, D) {
+    fail "sql: expected #{raw.values.size} destination arguments in Scan, not 4" if raw.values.size != 4
+    v0: A = ~convert_column(raw, 0)
+    v1: B = ~convert_column(raw, 1)
+    v2: C = ~convert_column(raw, 2)
+    v3: D = ~convert_column(raw, 3)
+    (v0, v1, v2, v3)
+  }
+}
+
+refine STup5[A, B, C, D, E] for (A, B, C, D, E) {
+  def self.from_sql_row(raw: RawRow) -> ~(A, B, C, D, E) {
+    fail "sql: expected #{raw.values.size} destination arguments in Scan, not 5" if raw.values.size != 5
+    v0: A = ~convert_column(raw, 0)
+    v1: B = ~convert_column(raw, 1)
+    v2: C = ~convert_column(raw, 2)
+    v3: D = ~convert_column(raw, 3)
+    v4: E = ~convert_column(raw, 4)
+    (v0, v1, v2, v3, v4)
+  }
+}
+
+refine STup6[A, B, C, D, E, F] for (A, B, C, D, E, F) {
+  def self.from_sql_row(raw: RawRow) -> ~(A, B, C, D, E, F) {
+    fail "sql: expected #{raw.values.size} destination arguments in Scan, not 6" if raw.values.size != 6
+    v0: A = ~convert_column(raw, 0)
+    v1: B = ~convert_column(raw, 1)
+    v2: C = ~convert_column(raw, 2)
+    v3: D = ~convert_column(raw, 3)
+    v4: E = ~convert_column(raw, 4)
+    v5: F = ~convert_column(raw, 5)
+    (v0, v1, v2, v3, v4, v5)
+  }
+}
+
+refine STup7[A, B, C, D, E, F, G] for (A, B, C, D, E, F, G) {
+  def self.from_sql_row(raw: RawRow) -> ~(A, B, C, D, E, F, G) {
+    fail "sql: expected #{raw.values.size} destination arguments in Scan, not 7" if raw.values.size != 7
+    v0: A = ~convert_column(raw, 0)
+    v1: B = ~convert_column(raw, 1)
+    v2: C = ~convert_column(raw, 2)
+    v3: D = ~convert_column(raw, 3)
+    v4: E = ~convert_column(raw, 4)
+    v5: F = ~convert_column(raw, 5)
+    v6: G = ~convert_column(raw, 6)
+    (v0, v1, v2, v3, v4, v5, v6)
+  }
+}
+
+refine STup8[A, B, C, D, E, F, G, H] for (A, B, C, D, E, F, G, H) {
+  def self.from_sql_row(raw: RawRow) -> ~(A, B, C, D, E, F, G, H) {
+    fail "sql: expected #{raw.values.size} destination arguments in Scan, not 8" if raw.values.size != 8
+    v0: A = ~convert_column(raw, 0)
+    v1: B = ~convert_column(raw, 1)
+    v2: C = ~convert_column(raw, 2)
+    v3: D = ~convert_column(raw, 3)
+    v4: E = ~convert_column(raw, 4)
+    v5: F = ~convert_column(raw, 5)
+    v6: G = ~convert_column(raw, 6)
+    v7: H = ~convert_column(raw, 7)
+    (v0, v1, v2, v3, v4, v5, v6, v7)
+  }
+}
+
+# ------------------------------------------------------------ Null types
+
+# A T that may be NULL (Go's Null[T]): `v` is meaningful when `valid`.
+# (alx's own `T?` does the same; these exist for Go's API.)
+pub struct Null[T] {
+  v: T
+  valid: Bool
+
+  pub def self.sql_scan(src: driver.Value) -> ~Null[T] {
+    return Null[T].new(valid: false) if src.null?
+    x: T = ~scan_value(src)
+    Null[T].new(v: x, valid: true)
+  }
+  pub def self.from_sql_row(raw: RawRow) -> ~Null[T] {
+    v: Null[T] = ~one_column(raw)
+    v
+  }
+  pub def sql_value -> ~driver.Value {
+    return driver.Value.Null if !valid
+    driver.~to_value(v)
+  }
+  pub def sql_arg(ordinal: Int) -> ~driver.NamedValue { driver.NamedValue.new(name: "", ordinal: ordinal, value: self.~sql_value) }
+  pub def sql_args -> ~[driver.NamedValue] { [self.~sql_arg(1)] }
+}
+
+# Go's NullString.
+pub struct NullString {
+  string: Str
+  valid: Bool
+
+  pub def self.sql_scan(src: driver.Value) -> ~NullString {
+    return NullString.new(valid: false) if src.null?
+    x: Str = ~scan_value(src)
+    NullString.new(string: x, valid: true)
+  }
+  pub def self.from_sql_row(raw: RawRow) -> ~NullString {
+    v: NullString = ~one_column(raw)
+    v
+  }
+  pub def sql_value -> ~driver.Value {
+    return driver.Value.Null if !valid
+    driver.~to_value(self.string)
+  }
+  pub def sql_arg(ordinal: Int) -> ~driver.NamedValue { driver.NamedValue.new(name: "", ordinal: ordinal, value: self.~sql_value) }
+  pub def sql_args -> ~[driver.NamedValue] { [self.~sql_arg(1)] }
+}
+
+# Go's NullInt64.
+pub struct NullInt64 {
+  int64: Int
+  valid: Bool
+
+  pub def self.sql_scan(src: driver.Value) -> ~NullInt64 {
+    return NullInt64.new(valid: false) if src.null?
+    x: Int = ~scan_value(src)
+    NullInt64.new(int64: x, valid: true)
+  }
+  pub def self.from_sql_row(raw: RawRow) -> ~NullInt64 {
+    v: NullInt64 = ~one_column(raw)
+    v
+  }
+  pub def sql_value -> ~driver.Value {
+    return driver.Value.Null if !valid
+    driver.~to_value(self.int64)
+  }
+  pub def sql_arg(ordinal: Int) -> ~driver.NamedValue { driver.NamedValue.new(name: "", ordinal: ordinal, value: self.~sql_value) }
+  pub def sql_args -> ~[driver.NamedValue] { [self.~sql_arg(1)] }
+}
+
+# Go's NullInt32.
+pub struct NullInt32 {
+  int32: I32
+  valid: Bool
+
+  pub def self.sql_scan(src: driver.Value) -> ~NullInt32 {
+    return NullInt32.new(valid: false) if src.null?
+    x: I32 = ~scan_value(src)
+    NullInt32.new(int32: x, valid: true)
+  }
+  pub def self.from_sql_row(raw: RawRow) -> ~NullInt32 {
+    v: NullInt32 = ~one_column(raw)
+    v
+  }
+  pub def sql_value -> ~driver.Value {
+    return driver.Value.Null if !valid
+    driver.~to_value(self.int32)
+  }
+  pub def sql_arg(ordinal: Int) -> ~driver.NamedValue { driver.NamedValue.new(name: "", ordinal: ordinal, value: self.~sql_value) }
+  pub def sql_args -> ~[driver.NamedValue] { [self.~sql_arg(1)] }
+}
+
+# Go's NullInt16.
+pub struct NullInt16 {
+  int16: I16
+  valid: Bool
+
+  pub def self.sql_scan(src: driver.Value) -> ~NullInt16 {
+    return NullInt16.new(valid: false) if src.null?
+    x: I16 = ~scan_value(src)
+    NullInt16.new(int16: x, valid: true)
+  }
+  pub def self.from_sql_row(raw: RawRow) -> ~NullInt16 {
+    v: NullInt16 = ~one_column(raw)
+    v
+  }
+  pub def sql_value -> ~driver.Value {
+    return driver.Value.Null if !valid
+    driver.~to_value(self.int16)
+  }
+  pub def sql_arg(ordinal: Int) -> ~driver.NamedValue { driver.NamedValue.new(name: "", ordinal: ordinal, value: self.~sql_value) }
+  pub def sql_args -> ~[driver.NamedValue] { [self.~sql_arg(1)] }
+}
+
+# Go's NullByte.
+pub struct NullByte {
+  byte: Byte
+  valid: Bool
+
+  pub def self.sql_scan(src: driver.Value) -> ~NullByte {
+    return NullByte.new(valid: false) if src.null?
+    x: Byte = ~scan_value(src)
+    NullByte.new(byte: x, valid: true)
+  }
+  pub def self.from_sql_row(raw: RawRow) -> ~NullByte {
+    v: NullByte = ~one_column(raw)
+    v
+  }
+  pub def sql_value -> ~driver.Value {
+    return driver.Value.Null if !valid
+    driver.~to_value(self.byte)
+  }
+  pub def sql_arg(ordinal: Int) -> ~driver.NamedValue { driver.NamedValue.new(name: "", ordinal: ordinal, value: self.~sql_value) }
+  pub def sql_args -> ~[driver.NamedValue] { [self.~sql_arg(1)] }
+}
+
+# Go's NullFloat64.
+pub struct NullFloat64 {
+  float64: Float
+  valid: Bool
+
+  pub def self.sql_scan(src: driver.Value) -> ~NullFloat64 {
+    return NullFloat64.new(valid: false) if src.null?
+    x: Float = ~scan_value(src)
+    NullFloat64.new(float64: x, valid: true)
+  }
+  pub def self.from_sql_row(raw: RawRow) -> ~NullFloat64 {
+    v: NullFloat64 = ~one_column(raw)
+    v
+  }
+  pub def sql_value -> ~driver.Value {
+    return driver.Value.Null if !valid
+    driver.~to_value(self.float64)
+  }
+  pub def sql_arg(ordinal: Int) -> ~driver.NamedValue { driver.NamedValue.new(name: "", ordinal: ordinal, value: self.~sql_value) }
+  pub def sql_args -> ~[driver.NamedValue] { [self.~sql_arg(1)] }
+}
+
+# Go's NullBool.
+pub struct NullBool {
+  bool: Bool
+  valid: Bool
+
+  pub def self.sql_scan(src: driver.Value) -> ~NullBool {
+    return NullBool.new(valid: false) if src.null?
+    x: Bool = ~scan_value(src)
+    NullBool.new(bool: x, valid: true)
+  }
+  pub def self.from_sql_row(raw: RawRow) -> ~NullBool {
+    v: NullBool = ~one_column(raw)
+    v
+  }
+  pub def sql_value -> ~driver.Value {
+    return driver.Value.Null if !valid
+    driver.~to_value(self.bool)
+  }
+  pub def sql_arg(ordinal: Int) -> ~driver.NamedValue { driver.NamedValue.new(name: "", ordinal: ordinal, value: self.~sql_value) }
+  pub def sql_args -> ~[driver.NamedValue] { [self.~sql_arg(1)] }
+}
+
+# Go's NullTime.
+pub struct NullTime {
+  time: time.Time
+  valid: Bool
+
+  pub def self.sql_scan(src: driver.Value) -> ~NullTime {
+    return NullTime.new(valid: false) if src.null?
+    x: time.Time = ~scan_value(src)
+    NullTime.new(time: x, valid: true)
+  }
+  pub def self.from_sql_row(raw: RawRow) -> ~NullTime {
+    v: NullTime = ~one_column(raw)
+    v
+  }
+  pub def sql_value -> ~driver.Value {
+    return driver.Value.Null if !valid
+    driver.~to_value(self.time)
+  }
+  pub def sql_arg(ordinal: Int) -> ~driver.NamedValue { driver.NamedValue.new(name: "", ordinal: ordinal, value: self.~sql_value) }
+  pub def sql_args -> ~[driver.NamedValue] { [self.~sql_arg(1)] }
+}
+
+# ASCII lowercase (#[derive(Row)] matches column names case-insensitively).
+pub def lower_ascii(s: Str) -> Str {
+  b = s.bytes
+  i = 0
+  while i < b.size {
+    b[i] = b[i] + 32 if b[i] >= 65 && b[i] <= 90
+    i += 1
+  }
+  Str.from_bytes(b)
+}

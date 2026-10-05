@@ -1,0 +1,382 @@
+# Go's sql_test.go, part 1: the helpers (testDatabase, newTestDB, populate,
+# closeDB, ...) and the tests up to TestTxStmt.
+#
+# Go runs the testDatabase tests under testing/synctest (a fake clock); here
+# they run on the real clock with short waits, and "synctest.Wait" becomes
+# polling until the condition holds (wait_until). Each test makes its own
+# fake driver (Go's tests share one), so hooks don't leak between tests.
+
+import "context"
+import "database/sql/driver"
+import "time"
+
+FAKE_DB_NAME = "foo"
+
+def chris_birthday -> time.Time { time.unix(123456789, 0) }
+
+# Go's basicConnector / basicConn / basicStmt: a driver that implements only
+# the required interfaces (every optional method is the default).
+struct BasicConnector {
+  fc: FakeConnector
+  def connect(ctx: context.Context) -> ~driver.Conn {
+    c = fc.drv.~open_fake(fc.name)
+    c.set_skip_dirty_session
+    BasicConn.new(fc: c)
+  }
+}
+
+struct BasicConn {
+  fc: FakeConn
+  def prepare(query: Str) -> ~driver.Stmt {
+    s = fc.~prepare_fake(context.background, query)
+    BasicStmt.new(fc: fc, s: s)
+  }
+  def begin -> ~driver.Tx { fc.~begin }
+  def close -> ~Unit { fc.~close }
+}
+
+struct BasicStmt {
+  fc: FakeConn
+  s: FakeStmt
+
+  def values_to_named_values(args: [driver.Value]) -> ~[driver.NamedValue] {
+    out: [driver.NamedValue] = []
+    i = 0
+    for arg in args {
+      cc = s.column_converter(i)
+      v = arg
+      if c = cc {
+        r = c.convert_value(arg)
+        if e = r.err {
+          fail e.wrap("sql: converting argument $#{i + 1} type")
+        }
+        v = r.unwrap
+      }
+      out << driver.NamedValue.new(name: "", ordinal: i + 1, value: v)
+      i += 1
+    }
+    out
+  }
+  def close -> ~Unit { s.~close }
+  def num_input -> Int { s.num_input }
+  def exec(args: [driver.Value]) -> ~driver.Result {
+    nvs = ~values_to_named_values(args)
+    s.~exec_context(context.background, nvs)
+  }
+  def query(args: [driver.Value]) -> ~driver.Rows {
+    nvs = ~values_to_named_values(args)
+    s.~query_context(context.background, nvs)
+  }
+}
+
+# The fake connection behind a pool connection.
+def get_fake_conn(ci: driver.Conn) -> FakeConn {
+  if f = ci.as(FakeConn) {
+    return f
+  }
+  if b = ci.as(BasicConn) {
+    return b.fc
+  }
+  panic "not a fake conn"
+}
+
+# The fake driver behind a DB made by new_test_db / test_database.
+def drv_of(db: DB) -> FakeDriver {
+  case db.src {
+    Conn(c) => {
+      if f = c.as(FakeConnector) {
+        return f.drv
+      }
+      if b = c.as(BasicConnector) {
+        return b.fc.drv
+      }
+      panic "not a fake connector"
+    }
+    Dsn(d, _) => {
+      if f = d.as(FakeDriver) {
+        return f
+      }
+      panic "not a fake driver"
+    }
+  }
+}
+
+# Polls `f` until it holds (Go's synctest.Wait before a check); false after 5s.
+def wait_until(f: (Int) -> Bool) -> Bool {
+  deadline = time.now.unix_nano + 5000000000
+  loop {
+    return true if f(0)
+    return false if time.now.unix_nano > deadline
+    time.sleep(time.duration(200000))
+  }
+}
+
+# Go's testDatabase: runs f against the "basic" driver and the "default"
+# one (Go's third, "scancols", is RowsColumnScanner: not ported).
+# `features` lists what f needs ("ConnBeginTx", "NamedValue", "Validator"):
+# the basic driver has none of them.
+def test_database(features: [Str], f: (DB) -> ~Unit) -> ~Unit {
+  drv = new_fake_driver
+  if features.size == 0 {
+    db = open_db(BasicConnector.new(fc: new_fake_connector(drv, FAKE_DB_NAME)))
+    db.~exec("WIPE", nil)
+    r = f(db)
+    close_db(db)
+    if e = r.err {
+      fail e.wrap("basic")
+    }
+  }
+  drv2 = new_fake_driver
+  db2 = open_db(new_fake_connector(drv2, FAKE_DB_NAME))
+  db2.~exec("WIPE", nil)
+  r2 = f(db2)
+  close_db(db2)
+  if e = r2.err {
+    fail e.wrap("default")
+  }
+  nil
+}
+
+def new_test_db(name: Str) -> DB { new_test_db_connector(new_fake_connector(new_fake_driver, FAKE_DB_NAME), name) }
+
+def new_test_db_connector(fc: FakeConnector, name: Str) -> DB {
+  db = open_db(fc)
+  db.exec("WIPE", nil).unwrap
+  populate(db, name) if name != ""
+  db
+}
+
+def populate(db: DB, name: Str) {
+  case name {
+    "people" => {
+      exec_t(db, "CREATE|people|name=string,age=int32,photo=blob,dead=bool,bdate=datetime", nil)
+      exec_t(db, "INSERT|people|name=Alice,age=?,photo=APHOTO", 1)
+      exec_t(db, "INSERT|people|name=Bob,age=?,photo=BPHOTO", 2)
+      exec_t(db, "INSERT|people|name=Chris,age=?,photo=CPHOTO,bdate=?", (3, chris_birthday))
+    }
+    "magicquery" => {
+      exec_t(db, "CREATE|magicquery|op=string,millis=int32", nil)
+      exec_t(db, "INSERT|magicquery|op=sleep,millis=10", nil)
+    }
+    "tx_status" => {
+      exec_t(db, "CREATE|tx_status|tx_status=string", nil)
+      exec_t(db, "INSERT|tx_status|tx_status=invalid", nil)
+    }
+    _ => panic "unknown database name #{name}"
+  }
+}
+
+def exec_t[A](db: DB, query: Str, args: A) {
+  r = db.exec(query, args)
+  if e = r.err {
+    panic "Exec of #{query}: #{e.message}"
+  }
+}
+
+# Go's closeDB: no open statements on idle connections, the DB closes
+# cleanly, every fake connection closes without error.
+def close_db(db: DB) {
+  drv = drv_of(db)
+  errs = Mutex.new([""; 0])
+  drv.hooks.set_post_close_conn(->(err: Error?) {
+    if e = err {
+      errs.lock { |v|
+        v << "Error closing fakeConn: #{e.message}"
+        nil
+      }
+    }
+  })
+  free = db.st.lock { |s| s.free_conn }
+  i = 0
+  for dc in free {
+    n = dc.st.lock { |d| d.open_stmt.size }
+    assert n == 0, "while closing db, freeConn #{i}/#{free.size} had #{n} open stmts; want 0"
+    i += 1
+  }
+  r = db.close
+  if e = r.err {
+    panic "error closing DB: #{e.message}"
+  }
+  ok = wait_until(->(_i: Int) -> Bool { db.st.lock { |s| s.num_open } == 0 })
+  n = db.st.lock { |s| s.num_open }
+  assert ok, "#{n} connections still open after closing DB"
+  drv.hooks.set_post_close_conn(none)
+  got = errs.lock { |v| v }
+  assert got.size == 0, "#{got}"
+}
+
+def num_prepares(db: DB) -> Int {
+  free = db.st.lock { |s| s.free_conn }
+  assert free.size == 1, "free conns = #{free.size}; want 1"
+  get_fake_conn(free[0].ci).num_prepare
+}
+
+def num_deps(db: DB) -> Int { db.st.lock { |s| s.dep.size } }
+
+def num_free_conns(db: DB) -> Int { db.st.lock { |s| s.free_conn.size } }
+
+def clear_all_conns(db: DB) {
+  db.set_max_idle_conns(0)
+  assert_eq num_free_conns(db), 0
+  assert_eq num_deps(db), 0
+}
+
+def wait_for_free(db: DB, want: Int) {
+  wait_until(->(_i: Int) -> Bool { num_free_conns(db) == want })
+  n = num_free_conns(db)
+  assert n == want, "free conns after hitting EOF = #{n}; want #{want}"
+}
+
+def wait_for_rows_close(rows: Rows) {
+  ok = wait_until(->(_i: Int) -> Bool { rows.st.lock { |s| s.closed } })
+  assert ok, "failed to close rows"
+}
+
+# Whether `e` is context.Canceled.
+def canceled?(e: Error?) -> Bool {
+  if x = e {
+    return case x {
+      context.ContextError.Canceled => true
+      _ => false
+    }
+  }
+  false
+}
+
+def deadline_exceeded?(e: Error?) -> Bool {
+  if x = e {
+    return case x {
+      context.ContextError.DeadlineExceeded => true
+      _ => false
+    }
+  }
+  false
+}
+
+# ------------------------------------------------------------------ tests
+
+test "OpenDB" {
+  drv = new_fake_driver
+  db = ~open_driver(drv, FAKE_DB_NAME)
+  defer db.close
+  assert db.driver?.as(FakeDriver) != none, "OpenDB should return the driver of the Connector"
+}
+
+test "Drivers (registry)" {
+  unregister_all_drivers
+  register("test", new_fake_driver)
+  register("invalid", new_fake_driver)
+  all = drivers
+  assert all.include?("test") && all.include?("invalid") && all == all.sort, "Drivers = #{all}"
+  r = open("nope", "x")
+  assert_eq r.err?.message || "", "sql: unknown driver \"nope\" (forgotten import?)"
+  db = ~open("test", FAKE_DB_NAME)
+  db.~exec("WIPE", nil)
+  ~db.close
+}
+
+test "Query" {
+  test_database([], ->(db: DB) -> ~Unit {
+    populate(db, "people")
+    prepares0 = num_prepares(db)
+    rows = db.~query("SELECT|people|age,name|", nil)
+    defer rows.close
+    got: [(Int, Str)] = []
+    while rows.next {
+      r: (Int, Str) = rows.~scan
+      got << r
+    }
+    ~rows.err_result
+    assert got == [(1, "Alice"), (2, "Bob"), (3, "Chris")], "mismatch: #{got}"
+    assert_eq num_free_conns(db), 1
+    assert_eq num_prepares(db) - prepares0, 1
+    nil
+  }).unwrap
+}
+
+test "QueryContext" {
+  test_database([], ->(db: DB) -> ~Unit {
+    populate(db, "people")
+    prepares0 = num_prepares(db)
+    ctx, cancel = context.with_cancel(context.background)
+    defer cancel()
+    rows = db.~query_context(ctx, "SELECT|people|age,name|", nil)
+    got: [(Int, Str)] = []
+    index = 0
+    while rows.next {
+      if index == 2 {
+        cancel()
+        wait_for_rows_close(rows)
+      }
+      r: ~(Int, Str) = rows.scan
+      if e = r.err {
+        break if index == 2
+        fail e
+      }
+      assert index != 2, "Scan: want context.Canceled"
+      got << r.unwrap
+      index += 1
+    }
+    assert ctx.done?, "context err = nil; want context.Canceled"
+    assert canceled?(ctx_err(ctx)), "context err not Canceled"
+    assert got == [(1, "Alice"), (2, "Bob")], "mismatch: #{got}"
+    wait_for_rows_close(rows)
+    wait_for_free(db, 1)
+    assert_eq num_prepares(db) - prepares0, 1
+    nil
+  }).unwrap
+}
+
+test "QueryContextWait" {
+  test_database([], ->(db: DB) -> ~Unit {
+    populate(db, "people")
+    prepares0 = num_prepares(db)
+    ctx, cancel = context.with_cancel(context.background)
+    defer cancel()
+    c = db.~conn_context(ctx)
+    get_fake_conn(c.dc.ci).set_waiter(->(x: context.Context) {
+      cancel()
+      _ = ctx.done.recv
+      nil
+    })
+    r = c.query_context(ctx, "SELECT|people|age,name|", nil)
+    _ = c.close
+    assert canceled?(r.err), "expected QueryContext to error with context canceled but returned #{r.err}"
+    wait_for_free(db, 1)
+    assert_eq num_prepares(db) - prepares0, 1
+    nil
+  }).unwrap
+}
+
+def test_context_wait(keep_conn_on_rollback: Bool, db: DB) -> ~Unit {
+  populate(db, "people")
+  ctx, cancel = context.with_cancel(context.background)
+  tx = db.~begin_tx(ctx, none)
+  tx.keep_conn_on_rollback.store(keep_conn_on_rollback)
+  get_fake_conn(tx.dc.ci).set_waiter(->(x: context.Context) {
+    cancel()
+    _ = ctx.done.recv
+    nil
+  })
+  r = tx.query_context(ctx, "SELECT|people|age,name|", nil)
+  assert canceled?(r.err), "expected QueryContext to error with context canceled but returned #{r.err}"
+  wait_for_free(db, keep_conn_on_rollback ? 1 : 0)
+  nil
+}
+
+test "TxContextWait" {
+  test_database([], ->(db: DB) -> ~Unit { ~test_context_wait(false, db) })
+}
+
+test "TxContextWaitNoDiscard" {
+  test_database([], ->(db: DB) -> ~Unit { ~test_context_wait(true, db) })
+}
+
+test "UnsupportedOptions" {
+  test_database([], ->(db: DB) -> ~Unit {
+    populate(db, "people")
+    r = db.begin_tx(context.background, TxOptions.new(isolation: LEVEL_SERIALIZABLE, read_only: true))
+    assert r.err?, "expected error when using unsupported options, got nil"
+    nil
+  }).unwrap
+}

@@ -1,0 +1,86 @@
+# Go's closingMutex (closemu.go): an RWMutex for synchronizing close.
+# Unlike sync.RWMutex, a waiting writer doesn't block new readers: a reader
+# may take the lock again while a writer waits (the same task re-entering
+# for read never deadlocks), and the writer gets it once no reader holds it.
+#
+# State lives in a Mutex; waiters park on a channel that every release
+# closes (and replaces), the way std/sync's WaitGroup and Cond wake.
+
+struct CmState {
+  readers: Int
+  writer: Bool
+  wake: Chan[Bool]
+}
+
+struct ClosingMutex {
+  st: Mutex[CmState]
+
+  def rlock {
+    loop {
+      w: Chan[Bool]? = st.lock { |s|
+        r: Chan[Bool]? = none
+        if s.writer {
+          r = s.wake
+        } else {
+          s.readers += 1
+        }
+        r
+      }
+      if ch = w {
+        _ = ch.recv
+      } else {
+        break
+      }
+    }
+  }
+
+  def runlock {
+    st.lock { |s|
+      panic "invalid closingMutex state" if s.readers <= 0 || s.writer
+      s.readers -= 1
+      if s.readers == 0 {
+        s.wake.close
+        s.wake = Chan[Bool].new
+      }
+      nil
+    }
+  }
+
+  def lock {
+    loop {
+      w: Chan[Bool]? = st.lock { |s|
+        r: Chan[Bool]? = none
+        if s.writer || s.readers > 0 {
+          r = s.wake
+        } else {
+          s.writer = true
+        }
+        r
+      }
+      if ch = w {
+        _ = ch.recv
+      } else {
+        break
+      }
+    }
+  }
+
+  def unlock {
+    st.lock { |s|
+      panic "invalid closingMutex state" if !s.writer
+      s.writer = false
+      s.wake.close
+      s.wake = Chan[Bool].new
+      nil
+    }
+  }
+
+  # Whether a reader or the writer holds it (tests).
+  def held? -> Bool {
+    st.lock { |s| s.writer || s.readers > 0 }
+  }
+}
+
+def new_closing_mutex -> ClosingMutex {
+  ClosingMutex.new(st: Mutex.new(CmState.new(readers: 0, writer: false, wake: Chan[Bool].new)))
+}

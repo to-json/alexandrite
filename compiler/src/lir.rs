@@ -94,6 +94,8 @@ pub enum LE {
     F(f64),
     B(bool),
     S(String),
+    /// A Str literal of arbitrary bytes (not UTF-8: `#[embed]`).
+    SB(Vec<u8>),
     /// A source location string (C: `const char *`).
     Loc(String),
     Unit,
@@ -213,6 +215,8 @@ impl FfiTy {
 pub struct FfiSig {
     /// The link name (without the platform's leading underscore).
     pub sym: String,
+    /// The library `#[link("lib")]` names (`-llib`; the JIT dlopens it).
+    pub lib: Option<String>,
     pub params: Vec<FfiTy>,
     pub ret: FfiTy,
 }

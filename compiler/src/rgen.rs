@@ -54,8 +54,12 @@ fn is_copy(t: &LTy) -> bool {
 }
 
 fn lit(s: &str) -> String {
+    lit_bytes(s.as_bytes())
+}
+
+fn lit_bytes(s: &[u8]) -> String {
     let mut o = String::from("b\"");
-    for b in s.bytes() {
+    for &b in s {
         match b {
             b'"' => o.push_str("\\\""),
             b'\\' => o.push_str("\\\\"),
@@ -223,7 +227,8 @@ fn ffi_fns(p: &LProgram) -> String {
                 let _ = writeln!(o, "unsafe fn ffi_c_{i}({}){cret} {{ {f}({}) }}", cparams.join(", "), names.join(", "));
             }
             None => {
-                let _ = writeln!(o, "unsafe extern \"C\" {{\n    #[link_name = {:?}]\n    fn ffi_c_{i}({}){cret};\n}}", x.sym, cparams.join(", "));
+                let link = x.lib.as_ref().map(|l| format!("#[link(name = {l:?})]\n")).unwrap_or_default();
+                let _ = writeln!(o, "{link}unsafe extern \"C\" {{\n    #[link_name = {:?}]\n    fn ffi_c_{i}({}){cret};\n}}", x.sym, cparams.join(", "));
             }
         }
         let rparams: Vec<String> = x.params.iter().enumerate().map(|(k, t)| format!("a{k}: {}", rty(&t.lty()))).collect();
@@ -584,6 +589,7 @@ impl FnEmit<'_> {
             }
             LE::B(b) => b.to_string(),
             LE::S(s) => format!("Str::lit({})", lit(s)),
+            LE::SB(b) => format!("Str::lit({})", lit_bytes(b)),
             LE::Loc(s) => loc(s),
             LE::Unit => "()".into(),
             LE::Tup(_, vs) if vs.is_empty() => "()".into(),

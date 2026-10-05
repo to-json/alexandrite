@@ -244,6 +244,17 @@ fn std_list(dir: &Path) -> Option<Vec<PathBuf>> {
     Some(fs)
 }
 
+/// The directory `#[embed]` patterns of file `f` are relative to: its own,
+/// or for a std package, its directory under `ALX_STD_DIR` (the embedded
+/// standard library has no files beside it).
+fn embed_dir(f: &Path) -> PathBuf {
+    let d = f.parent().unwrap_or(Path::new(".")).to_path_buf();
+    match (d.strip_prefix(STD_DIR), std::env::var_os("ALX_STD_DIR")) {
+        (Ok(rel), Some(root)) => PathBuf::from(root).join(rel),
+        _ => d,
+    }
+}
+
 fn std_read(f: &Path) -> Option<String> {
     let rel = f.strip_prefix(STD_DIR).ok()?.to_string_lossy().replace('\\', "/");
     std_files().iter().find(|(p, _)| *p == rel).map(|(_, t)| t.to_string())
@@ -300,10 +311,13 @@ pub fn load_with(path: &Path, display: &str, read: &dyn Fn(&Path) -> std::io::Re
             return Err((sm, d));
         }
     };
-    let main = match parse_file(&mut sm, display.to_string(), text, &mut next_id) {
+    let mut main = match parse_file(&mut sm, display.to_string(), text, &mut next_id) {
         Ok(m) => m,
         Err(d) => return Err((sm, d)),
     };
+    if let Err(d) = crate::embed::resolve(&mut main, path.parent().unwrap_or(Path::new("."))) {
+        return Err((sm, d));
+    }
     if let Some(t) = main.tests.first() {
         return Err((sm, not_a_test_file(t)));
     }
@@ -369,8 +383,9 @@ fn load_pkg(
             Ok(rel) => format!("std/{}", rel.display()),
             Err(_) => shown_root.join(f.strip_prefix(&mods.root).unwrap_or(f)).display().to_string(),
         };
-        let m = parse_file(sm, shown, text, next_id)?;
-        if let Some(s) = m.main.first() {
+        let mut m = parse_file(sm, shown, text, next_id)?;
+        crate::embed::resolve(&mut m, &embed_dir(f))?;
+        if let Some(s) = m.main.iter().find(|s| !matches!(s.kind, crate::ast::StmtKind::Using(_))) {
             return Err(Diag::new(s.span, format!("a package (`{path}`) holds only declarations; move statements into a def")).note("package-level values are constants (`NAME = 42`), or, for state that changes, `NAME = Atomic.new(v)` / `NAME = Mutex.new(v)` (R11)"));
         }
         if let Some(t) = m.tests.first() {
@@ -422,6 +437,8 @@ pub struct TestItem {
     /// The def holding the body.
     pub func: String,
     pub outputs: Option<String>,
+    /// The body takes a `testing.T` (a test) or `testing.B` (a benchmark).
+    pub param: bool,
 }
 
 /// What `alx test` was asked for.
@@ -431,6 +448,8 @@ pub struct TestOpts {
     /// Benchmarks run only when set: `.` for all, else a substring of the name.
     pub bench: Option<String>,
     pub bench_ns: i64,
+    /// `-short`: testing.short? is true.
+    pub short: bool,
 }
 
 /// Prefix every name a package declares with its path (`geom.area`).
@@ -542,6 +561,11 @@ pub fn check_program(l: &Loaded, externs: Vec<DefInfo>) -> Result<TProgram, Diag
             // Only reached code records uses (generic and untested defs
             // aren't checked), so a reference in the file's text counts too.
             let in_text = l.sm.files.get(i.span.file as usize).is_some_and(|f| mentions(&f.text, &alias));
+            // An import a derive added for its own code (`alxjson`, `alxdyn`, ...):
+            // the derived methods the program doesn't call aren't checked.
+            if i.alias.as_deref().is_some_and(|a| matches!(a, "alxjson" | "alxjson2" | "alxjsontext" | "alxdyn")) {
+                continue;
+            }
             if !crate::check::import_used(&pkg, &alias) && !in_text && !ext.contains(i.path.trim_end_matches('/')) {
                 warnings.push(Diag::new(i.span, format!("`{}` is imported but not used", i.path)));
             }
@@ -598,6 +622,12 @@ pub fn separable(p: &Package) -> bool {
         && !m.consts.iter().any(|c| c.var || matches!(c.value.kind, crate::ast::ExprKind::Array(_) | crate::ast::ExprKind::ArrayRepeat(..)))
         // The builtin Complex is declared with the program.
         && !uses_complex(&p.source)
+        // Formats with flags reach the fmt engine, declared with the program (builtin.alx).
+        && !["format(", "printf(", "sprintf(", "errorf("].iter().any(|f| p.source.contains(f))
+        // So is `==` on maps (`__map_eq`).
+        && !(p.source.contains("Map[") && (p.source.contains("==") || p.source.contains("!=")))
+        // Embedded files aren't part of the source the cache is keyed by.
+        && !m.consts.iter().any(|c| c.embed.is_some())
 }
 
 fn uses_complex(src: &str) -> bool {
@@ -815,15 +845,23 @@ def __alx_pass(name: Str, ns: I64) -> I64 {
 "#;
 
 /// The runner: a program (in alx) that runs each item as its own task.
-fn runner_source(items: &[TestItem], dir: &str, o: &TestOpts) -> String {
+/// `tp` qualifies the package testing's names (`testing.`, or nothing in
+/// testing's own tests); `main` is the test file's `test_main`, if any.
+fn runner_source(items: &[TestItem], dir: &str, o: &TestOpts, tp: &str, main: Option<&str>) -> String {
     let mut s = String::from(RUNNER_HELPERS);
-    s.push_str("\n__fails = 0\n__start = Time.now_ns\n");
+    s.push_str("\ndef __alx_run_all -> Int {\n__fails = 0\n__start = Time.now_ns\n");
     let order = [TestKind::Test, TestKind::Bench, TestKind::Example];
     for kind in order {
         for it in items.iter().filter(|i| i.kind == kind) {
             let name = alx_quote(&it.name);
             let f = &it.func;
             match kind {
+                TestKind::Test if it.param => {
+                    s.push_str(&format!("__fails += {tp}run_test({name}, ->(t: {tp}T) -> ~Unit {{ ~{f}(t); nil }})\n"));
+                }
+                TestKind::Bench if it.param => {
+                    s.push_str(&format!("__fails += {tp}run_bench({name}, {}, ->(b: {tp}B) -> ~Unit {{ ~{f}(b); nil }})\n", o.bench_ns));
+                }
                 TestKind::Test | TestKind::Example => {
                     let ex = kind == TestKind::Example;
                     s.push_str(&format!("puts \"=== RUN   \" + {name}\n__t0 = Time.now_ns\n"));
@@ -856,8 +894,13 @@ fn runner_source(items: &[TestItem], dir: &str, o: &TestOpts) -> String {
     }
     let dir = alx_quote(dir);
     s.push_str(&format!(
-        "__total = Time.now_ns - __start\nif __fails > 0 {{\n  puts \"FAIL\"\n  puts \"FAIL   \" + {dir} + \" #{{__alx_secs3(__total)}}s\"\n  Test.exit(1)\n}}\nputs \"PASS\"\nputs \"ok     \" + {dir} + \" #{{__alx_secs3(__total)}}s\"\n"
+        "__total = Time.now_ns - __start\nif __fails > 0 {{\n  puts \"FAIL\"\n  puts \"FAIL   \" + {dir} + \" #{{__alx_secs3(__total)}}s\"\n  return 1\n}}\nputs \"PASS\"\nputs \"ok     \" + {dir} + \" #{{__alx_secs3(__total)}}s\"\n0\n}}\n"
     ));
+    match main {
+        // Go's TestMain: it runs the tests through m.run; its code is the exit status.
+        Some(m) => s.push_str(&format!("__m = {tp}new_m(->() -> Int {{ __alx_run_all() }})\n{m}(__m)\nTest.exit(__m.code)\n")),
+        None => s.push_str("__code = __alx_run_all()\nTest.exit(__code) if __code != 0\n"),
+    }
     s
 }
 
@@ -906,7 +949,10 @@ pub fn load_tests(dir: &Path, dir_shown: &str, only: Option<&Path>, o: &TestOpts
             Ok(m) => m,
             Err(d) => return Err((sm, d)),
         };
-        if let Some(s) = m.main.first() {
+        if let Err(d) = crate::embed::resolve(&mut m, &embed_dir(f)) {
+            return Err((sm, d));
+        }
+        if let Some(s) = m.main.iter().find(|s| !matches!(s.kind, crate::ast::StmtKind::Using(_))) {
             let why = if test_file { "a test file holds only declarations and test blocks; move statements into a `test`" } else { "a package holds only declarations; move statements into a def" };
             return Err((sm, Diag::new(s.span, why)));
         }
@@ -925,17 +971,30 @@ pub fn load_tests(dir: &Path, dir_shown: &str, only: Option<&Path>, o: &TestOpts
     let shadow = acc.structs.iter().map(|s| &s.name).chain(acc.enums.iter().map(|e| &e.name)).any(|n| crate::check::SHADOWABLE.contains(&n.as_str()));
     let own_path = {
         let d = dir_shown.trim_end_matches('/');
-        match d.strip_prefix("std/") {
+        // `std/x` or `/abs/path/std/x` (a std package tested by its full path).
+        match d.strip_prefix("std/").or_else(|| d.rfind("/std/").map(|i| &d[i + 5..])).filter(|p| is_std(p)) {
             Some(p) => p.to_string(),
             None => format!("_test/{}", d.rsplit('/').next().unwrap_or(d)),
         }
     };
+    // A body taking `|t|` / `|b|` gets the package testing's T / B, and the
+    // runner imports testing (unless these are testing's own tests).
+    let own_testing = own_path == "testing";
+    let tp = if own_testing { "" } else { "testing." };
+    let main_fn = acc.defs.iter().any(|d| d.name == "test_main" && d.params.len() == 1);
+    let mut needs_testing = main_fn;
     // Every body becomes a def; pick what to run.
     let mut items = vec![];
     let total = decls.len();
     for (k, mut t) in decls.into_iter().enumerate() {
         let mut func = format!("__alx_t{k}");
         t.def.name = func.clone();
+        let param = !t.def.params.is_empty();
+        if let Some(p) = t.def.params.first_mut() {
+            let ty = if t.kind == TestKind::Bench { "B" } else { "T" };
+            p.ty = Some(crate::ast::TypeExpr::Named(format!("{tp}{ty}"), p.span));
+            needs_testing = true;
+        }
         if shadow {
             t.def.public = true;
             func = format!("__alx_pkg.{func}");
@@ -945,14 +1004,20 @@ pub fn load_tests(dir: &Path, dir_shown: &str, only: Option<&Path>, o: &TestOpts
             // `a|b` matches names containing a or b (the alternation of Go's
             // regexp filters; the parts are plain substrings).
             TestKind::Bench => o.bench.as_ref().is_some_and(|b| b == "." || b.split('|').any(|p| t.name.contains(p))),
-            _ => o.run.as_ref().is_none_or(|r| r.split('|').any(|p| t.name.contains(p))),
+            // `-run A/B`: A picks the tests, B their subtests (package testing).
+            _ => o.run.as_ref().is_none_or(|r| r.split('/').next().unwrap_or("").split('|').any(|p| t.name.contains(p))),
         };
         if wanted {
-            items.push(TestItem { kind: t.kind, name: t.name, func, outputs: t.outputs });
+            items.push(TestItem { kind: t.kind, name: t.name, func, outputs: t.outputs, param });
         }
     }
     let (n, total) = (items.len(), total);
-    let mut runner = match parse_file(&mut sm, "<alx test>".into(), runner_source(&items, dir_shown, o), &mut next_id) {
+    let main_name = main_fn.then(|| if shadow { "__alx_pkg.test_main".to_string() } else { "test_main".to_string() });
+    let testing_import = Import { alias: None, path: "testing".into(), span: Span::default() };
+    if needs_testing && !own_testing && !acc.imports.iter().any(|i| i.path == "testing") {
+        acc.imports.push(testing_import.clone());
+    }
+    let mut runner = match parse_file(&mut sm, "<alx test>".into(), runner_source(&items, dir_shown, o, tp, main_name.as_deref()), &mut next_id) {
         Ok(m) => m,
         Err(d) => return Err((sm, d)),
     };
@@ -966,6 +1031,9 @@ pub fn load_tests(dir: &Path, dir_shown: &str, only: Option<&Path>, o: &TestOpts
     let own = if shadow {
         qualify(&mut acc, &own_path);
         runner.imports.push(Import { alias: Some("__alx_pkg".into()), path: own_path.clone(), span: Span::default() });
+        if needs_testing {
+            runner.imports.push(testing_import);
+        }
         Some(acc)
     } else {
         merge_decls(&mut runner, acc);

@@ -138,6 +138,8 @@ enum Outcome {
     Running,
     Abort,
     Exit1,
+    /// `exit 0`: every thread stops, and the run ends normally.
+    Exit0,
     Crash(String),
 }
 
@@ -511,6 +513,7 @@ pub fn run_outcome() -> i32 {
         Outcome::Abort => 1,
         Outcome::Exit1 => 2,
         Outcome::Crash(_) => 3,
+        Outcome::Exit0 => 4,
     }
 }
 
@@ -522,8 +525,8 @@ pub fn run_crash_message() -> String {
     }
 }
 
-/// This thread's task ended the run (`alx:abort` = 1, `alx:exit1` = 2, or
-/// a crash = 3 with its message): every thread stops.
+/// This thread's task ended the run (`alx:abort` = 1, `alx:exit1` = 2,
+/// a crash = 3 with its message, `alx:exit0` = 4): every thread stops.
 #[wasm_bindgen]
 pub fn run_failed(how: i32, msg: String) {
     let mut s = s();
@@ -531,6 +534,7 @@ pub fn run_failed(how: i32, msg: String) {
         s.outcome = match how {
             1 => Outcome::Abort,
             2 => Outcome::Exit1,
+            4 => Outcome::Exit0,
             _ => Outcome::Crash(msg),
         };
     }

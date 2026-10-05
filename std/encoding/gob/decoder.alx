@@ -16,12 +16,10 @@ pub struct Wire {
 }
 
 MAX_IGNORE_DEPTH = 10000
+READ_CHUNK = 1 << 20
 
 struct DecState {
   read: ([Byte]) -> ~Int
-  # read-ahead from the reader
-  rbuf: [Byte]
-  rpos: Int
   # the current message
   buf: [Byte]
   pos: Int
@@ -34,6 +32,8 @@ struct DecState {
   # decoding the top-level value itself (Go names the local type *T then:
   # Decode was given a pointer)
   at_top: Bool
+  # Go's maxIgnoreNestingDepth
+  max_depth: Int
 }
 
 BUILTIN_NAMES = ["", "bool", "int", "uint", "float", "bytes", "string", "complex", "interface"]
@@ -45,38 +45,39 @@ pub struct Dec {
   pub def types -> Types { self.st[0].types }
   pub def registry -> Registry { self.st[0].reg }
 
+  # How deep skipped values may nest (Go's maxIgnoreNestingDepth, 10000).
+  pub def set_max_depth!(n: Int) { self.st[0].max_depth = n }
+
   # ---- reading the stream
 
   # One byte from the reader, or none at its end.
   def read_byte! -> ~Byte? {
-    if self.st[0].rpos >= self.st[0].rbuf.size {
-      chunk: [Byte] = [0; 4096]
-      n = self.st[0].read.~call(chunk)
-      return none if n == 0
-      self.st[0].rbuf = chunk[0...n]
-      self.st[0].rpos = 0
-    }
-    b = self.st[0].rbuf[self.st[0].rpos]
-    self.st[0].rpos += 1
-    b
+    one: [Byte] = [0]
+    n = self.st[0].read.~call(one)
+    return none if n == 0
+    one[0]
   }
 
-  # Exactly n bytes from the reader (fewer at its end).
+  # Exactly n bytes from the reader (fewer at its end). The decoder never
+  # reads past the message it wants, so several Decoders can take turns on
+  # one reader (Go gets that from io.ByteReader; wrap a slow reader in a
+  # bufio.Reader, as Go's NewDecoder does).
   def read_n!(n: Int) -> ~[Byte] {
+    # in pieces of at most 1 MiB, so a corrupt length can't make it
+    # allocate gigabytes up front (Go's saferio.ReadData)
     out: [Byte] = []
     while out.size < n {
-      if self.st[0].rpos >= self.st[0].rbuf.size {
-        chunk: [Byte] = [0; 4096]
-        k = self.st[0].read.~call(chunk)
+      want = n - out.size
+      want = READ_CHUNK if want > READ_CHUNK
+      piece: [Byte] = [0; want]
+      got = 0
+      while got < want {
+        k = self.st[0].read.~call(piece[got...want])
         break if k == 0
-        self.st[0].rbuf = chunk[0...k]
-        self.st[0].rpos = 0
+        got += k
       }
-      take = n - out.size
-      avail = self.st[0].rbuf.size - self.st[0].rpos
-      take = avail if avail < take
-      out += self.st[0].rbuf[self.st[0].rpos...self.st[0].rpos + take]
-      self.st[0].rpos += take
+      out += piece[0...got]
+      break if got < want
     }
     out
   }
@@ -382,7 +383,9 @@ pub struct Dec {
 
   # The wire struct for a local struct type (compileDec's checks).
   pub def wire_struct(w: Int, local: Str) -> ~Wire {
-    fail gerr("gob: type mismatch in decoder: want struct type #{local}; got non-struct") if w < FIRST_USER_ID
+    if w > 0 && w < FIRST_USER_ID {
+      fail gerr("gob: type mismatch in decoder: want struct type #{local}; got non-struct")
+    }
     t = self.~wire_or(w, gerr("gob: unknown type id or corrupted data"))
     fail gerr("gob: type mismatch in decoder: want struct type #{local}; got non-struct") if t.kind != K_STRUCT
     t
@@ -483,7 +486,7 @@ pub struct Dec {
   }
 
   def skip_in!(w: Int) -> ~Unit {
-    fail gerr("gob: invalid nesting depth") if self.st[0].depth > MAX_IGNORE_DEPTH
+    fail gerr("invalid nesting depth") if self.st[0].depth > self.st[0].max_depth
     if w == T_BOOL || w == T_INT || w == T_UINT || w == T_FLOAT {
       self.~uint!
       return
@@ -554,7 +557,7 @@ pub struct Dec {
 def ovfl(name: Str) -> GobError { gerr("value for \"#{name}\" out of range") }
 
 pub def new_dec(read: ([Byte]) -> ~Int, reg: Registry) -> Dec {
-  Dec.new(st: [DecState.new(read: read, rbuf: [], rpos: 0, buf: [], pos: 0, wire: {}, plans: {}, types: new_types(), reg: reg, depth: 0, at_top: false)])
+  Dec.new(st: [DecState.new(read: read, buf: [], pos: 0, wire: {}, plans: {}, types: new_types(), reg: reg, depth: 0, at_top: false, max_depth: MAX_IGNORE_DEPTH)])
 }
 
 # Go's Decoder: values from a stream of messages on a reader.

@@ -1,0 +1,102 @@
+# S4: a task that panics inside `lock` releases the lock and poisons it.
+# Taking a poisoned lock panics (in a task: that task's `wait` error);
+# `poisoned?` tells, `clear_poison!` accepts the value as it is.
+
+def boom(xs: [Int], i: Int) -> Int { xs[i] }
+
+# 1. A panic mid-block: the lock is released (no deadlock) and poisoned.
+mu = Mutex.new(0)
+t = spawn {
+  mu.lock { |v|
+    v += 1
+    boom([1], 3)
+  }
+}
+r = t.wait
+puts r.ok?
+puts mu.poisoned?
+t2 = spawn { mu.lock { |v| v } }
+if e = t2.wait.err { puts e.message }
+puts mu.poisoned?
+
+# 2. Recovery: clear the mark, then the lock works again. Assigning `v`
+# takes effect only when the block finishes, so the value is the one from
+# before the panicking block.
+mu.clear_poison!
+puts mu.poisoned?
+puts mu.lock { |v| v }
+mu.lock { |v| v += 10 }
+puts mu.lock { |v| v }
+
+# 3. ...but changes made in place through shared storage (slice elements)
+# have already happened.
+ms = Mutex.new([1, 2, 3])
+t3 = spawn {
+  ms.lock { |v|
+    v[0] = 100
+    v = [7]
+    boom(v, 5)
+  }
+}
+puts t3.wait.ok?
+ms.clear_poison!
+puts ms.lock { |v| "#{v}" }
+
+# 4. Several locks: the ones held at the panic are poisoned, nested ones
+# included; one locked and released before the panic is not, nor one the
+# task never touched.
+a = Mutex.new(1)
+b = Mutex.new(2)
+c = Mutex.new(3)
+d = Mutex.new(4)
+t4 = spawn {
+  d.lock { |v| v += 1 }
+  a.lock { |x|
+    b.lock { |y|
+      x += y
+      boom([], 0)
+    }
+  }
+}
+puts t4.wait.ok?
+puts [a.poisoned?, b.poisoned?, c.poisoned?, d.poisoned?]
+puts d.lock { |v| v }
+
+# 5. A nested lock released normally before the outer block panics stays clean.
+e1 = Mutex.new(0)
+e2 = Mutex.new(0)
+t5 = spawn {
+  e1.lock { |x|
+    e2.lock { |y| y += 5 }
+    x += 1
+    boom([], x)
+  }
+}
+puts t5.wait.ok?
+puts [e1.poisoned?, e2.poisoned?]
+puts e2.lock { |v| v }
+
+# 6. A task waiting for the lock when its holder panics gets the poison panic.
+f = Mutex.new(0)
+held = Chan[Int].new(1)
+go = Chan[Int].new(1)
+holder = spawn {
+  f.lock { |v|
+    held << 1
+    go.recv
+    boom([], v)
+  }
+}
+held.recv
+waiter = spawn { f.lock { |v| v + 1 } }
+go << 1
+puts holder.wait.ok?
+w = waiter.wait
+puts w.ok?
+if e = w.err { puts e.message.include?("Mutex poisoned") }
+
+# 7. Many tasks, each panicking holding its own lock, none deadlocks.
+locks = (0...8).to_a.map { Mutex.new(it) }
+tasks = locks.map { |l| spawn { l.lock { |v| boom([], v) } } }
+puts tasks.count { !it.wait.ok? }
+puts locks.count { it.poisoned? }

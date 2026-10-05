@@ -343,6 +343,9 @@ pub struct Param {
     pub name: String,
     pub ty: Option<TypeExpr>,
     pub span: Span,
+    /// `attrs: [Attr] = []` (S8): evaluated per call, at the call site,
+    /// in the callee's package, when the call leaves the parameter out.
+    pub default: Option<Box<Expr>>,
 }
 
 #[derive(Debug, Clone)]
@@ -543,6 +546,21 @@ pub enum ExprKind {
     SliceRange(Option<Box<Expr>>, Option<Box<Expr>>, bool),
     /// `x?.m(...)`: the inner Call's receiver is the optional value.
     OptCall(Box<Expr>),
+    /// A parameter's default value standing in for an argument the call
+    /// left out (made by the checker, never parsed; S8).
+    DefaultArg(Box<DefaultArg>),
+}
+
+#[derive(Debug, Clone)]
+pub struct DefaultArg {
+    /// The callee's package: the default's names resolve there.
+    pub pkg: String,
+    /// The parameter's declared type (in the callee's package).
+    pub ty: Option<TypeExpr>,
+    pub expr: Expr,
+    /// Distinguishes this use's inference sites from other uses of the
+    /// same default expression.
+    pub salt: u32,
 }
 
 #[derive(Debug, Clone)]

@@ -1543,6 +1543,9 @@ struct FnCx<'w, 'a> {
     tail_want: Option<Ty>,
     /// `R[Str].empty`: the type arguments a static method's call gives (consumed by `call_def`).
     owner_targs: Vec<Ty>,
+    /// Mixed into inference sites while a parameter's default is checked
+    /// (one default expression serves every call that leaves it out).
+    site_salt: u32,
     /// In a method: `Some(true)` for a `!` method (`self` is a one-element
     /// slice holding the receiver), `Some(false)` for one taking a copy.
     method: Option<bool>,
@@ -1608,6 +1611,7 @@ impl<'w, 'a> FnCx<'w, 'a> {
             want_hint: None,
             tail_want: None,
             owner_targs: vec![],
+            site_salt: 0,
             errs: Default::default(),
             decl_spans: vec![],
             usings: def.map_or_else(Vec::new, |d| d.using.iter().map(|u| (0, resolve_name(u, Span::default(), &|_| true).unwrap_or_else(|_| u.clone()))).collect()),
@@ -1643,6 +1647,7 @@ impl<'w, 'a> FnCx<'w, 'a> {
     /// A type variable tied to a binding site: starts from what earlier
     /// passes learned there.
     fn site(&mut self, node: NodeId, slot: u32) -> Ty {
+        let slot = slot ^ self.site_salt;
         if let Some(t) = self.hints.get(&(node, slot)) {
             return t.clone();
         }
@@ -2311,12 +2316,13 @@ impl<'w, 'a> FnCx<'w, 'a> {
                 None => {
                     // A function passed as a value where one is wanted:
                     // `sort_func(xs, by_len)` is `sort_func(xs, ->(a, b) { by_len(a, b) })`.
-                    // (A bare name of a function with parameters can't be a call.)
+                    // (A bare name of a function with parameters can't be a call,
+                    // unless they all have defaults (S8): then it is one, as in Ruby.)
                     let q = resolve_name(n, sp, &|q| self.w.by_name.contains_key(q)).unwrap_or_else(|_| n.clone());
                     let def = self.w.by_name.get(&q).map(|&d| self.w.defs[d].def.clone());
                     // A field of the receiver shadows a function of the same name.
                     let def = def.filter(|_| self.self_field(e).is_none());
-                    if let Some(d) = def.filter(|d| !d.params.is_empty() && d.tparams.is_empty() && d.params.iter().all(|p| p.ty.is_some())) {
+                    if let Some(d) = def.filter(|d| !d.params.is_empty() && d.tparams.is_empty() && d.params.iter().all(|p| p.ty.is_some()) && !d.params.iter().all(|p| p.default.is_some())) {
                         {
                             let id = NodeId::MAX;
                             let names: Vec<String> = (0..d.params.len()).map(|i| format!("__arg{i}")).collect();
@@ -2335,7 +2341,7 @@ impl<'w, 'a> FnCx<'w, 'a> {
                                 d.ret.clone()
                             };
                             let body = Block { id, params: names.iter().map(|a| (a.clone(), sp)).collect(), body: vec![Stmt { kind: StmtKind::Expr(call), span: sp }], span: sp };
-                            let params = names.into_iter().zip(&d.params).map(|(name, p)| Param { name, ty: p.ty.clone(), span: sp }).collect();
+                            let params = names.into_iter().zip(&d.params).map(|(name, p)| Param { name, ty: p.ty.clone(), span: sp, default: None }).collect();
                             let lam = Expr { id, kind: ExprKind::Lambda(params, ret, Box::new(body)), span: sp };
                             return self.expr(&lam);
                         }
@@ -2705,6 +2711,24 @@ impl<'w, 'a> FnCx<'w, 'a> {
                 let t = self.fresh();
                 self.mk(TK::None, Ty::Opt(Box::new(t)), sp)
             }
+            ExprKind::DefaultArg(d) => {
+                // S8: in the callee's package, seeing none of the caller's locals.
+                let prev = enter_pkg(&d.pkg);
+                let scopes = std::mem::replace(&mut self.scopes, vec![HashMap::new()]);
+                let method = self.method.take();
+                let salt = self.site_salt;
+                self.site_salt ^= d.salt;
+                let want = d.ty.as_ref().and_then(|t| type_from(t, &self.w.structs, &self.w.consts).ok());
+                let r = match want {
+                    Some(w) => self.value_as(&d.expr, &w),
+                    None => self.value(&d.expr),
+                };
+                self.site_salt = salt;
+                self.method = method;
+                self.scopes = scopes;
+                leave_pkg(prev);
+                r?
+            }
             ExprKind::OptCall(call) => {
                 let ExprKind::Call { recv: Some(recv), name, name_span, args, block, block_sym } = &call.kind else { unreachable!() };
                 let o = self.value(recv)?;
@@ -2729,7 +2753,7 @@ impl<'w, 'a> FnCx<'w, 'a> {
                 self.mk(TK::Seq(vec![pre, TStmt::Expr(t)]), ty, sp)
             }
             ExprKind::If(c, a, b) => return self.if_value(c, a, b, sp, true),
-            ExprKind::KwArg(n, nsp, _) => return Err(Diag::new(*nsp, format!("keyword argument `{n}:` outside `Struct.new`")).note("keyword arguments name struct fields: `Body.new(x: 1.0, mass: m)`")),
+            ExprKind::KwArg(n, nsp, _) => return Err(Diag::new(*nsp, format!("keyword argument `{n}:` where nothing takes it")).note("keyword arguments name struct fields (`Body.new(x: 1.0, mass: m)`) or a def's parameters (`info(\"msg\", level: 2)`)")),
             ExprKind::Array(items) => {
                 let el = self.site(e.id, 0);
                 let mut out = vec![];
@@ -3675,7 +3699,7 @@ impl<'w, 'a> FnCx<'w, 'a> {
         if blk.params.is_empty() && ps.len() == 1 {
             blk.params = vec![("it".into(), b.span)];
         }
-        let params = blk.params.iter().map(|(n, s)| Param { name: n.clone(), ty: None, span: *s }).collect();
+        let params = blk.params.iter().map(|(n, s)| Param { name: n.clone(), ty: None, span: *s, default: None }).collect();
         let lam = Expr { id: NodeId::MAX, kind: ExprKind::Lambda(params, None, Box::new(blk)), span: b.span };
         let saved = self.want_hint.replace(want.unwrap());
         let r = self.expr(&lam);
@@ -4047,6 +4071,7 @@ impl<'w, 'a> FnCx<'w, 'a> {
         // receiver, and the call must see that change.
         let mut pre = vec![];
         let mut vals = vec![];
+        let args = &*self.fill_args(def, args, 1, block.is_some(), sp)?;
         for a in args {
             let v = self.value(a)?;
             if has_call(&v) {
@@ -5177,6 +5202,7 @@ impl<'w, 'a> FnCx<'w, 'a> {
             return Err(Diag::new(name_span, msg));
         };
         let d = self.w.defs[def].def.clone();
+        let args = &*self.fill_args(def, args, 0, block.is_some(), sp)?;
         // A block for a last parameter of function type: `index_func(xs) { |x| ... }`.
         if let Some(b) = block {
             if d.params.len() != args.len() + 1 || !matches!(d.params.last().and_then(|p| p.ty.as_ref()), Some(TypeExpr::Fn(..))) {
@@ -5211,6 +5237,58 @@ impl<'w, 'a> FnCx<'w, 'a> {
             targs.push(v);
         }
         self.call_def(def, name, name_span, targs, sp)
+    }
+
+    /// S8: a call's arguments matched to def `def`'s parameters: keyword
+    /// arguments (`name: v`, after the positional ones) by name, and the
+    /// ones left out by their defaults. `nself`: parameters passed apart
+    /// (the receiver); `block`: a block fills the last parameter. Borrowed
+    /// as given when there is nothing to match (counts are checked later).
+    fn fill_args<'e>(&self, def: usize, args: &'e [Expr], nself: usize, block: bool, sp: Span) -> R<std::borrow::Cow<'e, [Expr]>> {
+        use std::borrow::Cow;
+        let info = &self.w.defs[def];
+        let d = &info.def;
+        let end = d.params.len() - usize::from(block && d.params.len() > nself);
+        let params = &d.params[nself.min(end)..end];
+        let kw = args.iter().any(|a| matches!(a.kind, ExprKind::KwArg(..)));
+        if !kw && (args.len() >= params.len() || params.iter().all(|p| p.default.is_none())) {
+            return Ok(Cow::Borrowed(args));
+        }
+        let shown = d.name.rsplit('/').next().unwrap_or(&d.name);
+        let shown = shown.rsplit_once('.').filter(|_| nself == 1).map_or(shown, |(_, m)| m);
+        let mut slots: Vec<Option<Expr>> = vec![None; params.len()];
+        let mut seen_kw = false;
+        for (i, a) in args.iter().enumerate() {
+            match &a.kind {
+                ExprKind::KwArg(n, nsp, v) => {
+                    seen_kw = true;
+                    let Some(k) = params.iter().position(|p| &p.name == n) else {
+                        let names: Vec<String> = params.iter().map(|p| format!("`{}`", p.name)).collect();
+                        return Err(Diag::new(*nsp, format!("`{shown}` has no parameter `{n}`")).note(if names.is_empty() { "it takes no arguments".to_string() } else { format!("its parameters: {}", names.join(", ")) }));
+                    };
+                    if slots[k].is_some() {
+                        return Err(Diag::new(*nsp, format!("argument `{n}` given twice")));
+                    }
+                    slots[k] = Some((**v).clone());
+                }
+                _ if seen_kw => return Err(Diag::new(a.span, "a positional argument can't follow a keyword argument")),
+                _ if i >= params.len() => return Err(Diag::new(a.span, format!("`{shown}` takes {} argument(s), got {}", params.len(), args.len()))),
+                _ => slots[i] = Some(a.clone()),
+            }
+        }
+        let mut out = vec![];
+        for (k, (s, p)) in slots.into_iter().zip(params).enumerate() {
+            out.push(match (s, &p.default) {
+                (Some(a), _) => a,
+                (None, Some(e)) => {
+                    let salt = (sp.file.wrapping_mul(0x9E37_79B1) ^ sp.lo.wrapping_mul(0x85EB_CA6B) ^ (k as u32).wrapping_mul(0xC2B2_AE35)) | 0x8000_0000;
+                    let da = DefaultArg { pkg: info.pkg.clone(), ty: p.ty.clone(), expr: (**e).clone(), salt };
+                    Expr { id: NodeId::MAX, kind: ExprKind::DefaultArg(Box::new(da)), span: sp }
+                }
+                (None, None) => return Err(Diag::new(sp, format!("`{shown}` needs argument `{}`", p.name))),
+            });
+        }
+        Ok(Cow::Owned(out))
     }
 
     /// Call def `def` with checked arguments (a method's include `self`).
@@ -5467,6 +5545,7 @@ impl<'w, 'a> FnCx<'w, 'a> {
                     if block.is_some() {
                         return Err(Diag::new(sp, format!("`{c}.{name}` doesn't take a block")));
                     }
+                    let args = &*self.fill_args(def, args, 0, false, sp)?;
                     if args.len() != d.params.len() {
                         return Err(Diag::new(name_span, format!("`{c}.{name}` takes {} argument(s), got {}", d.params.len(), args.len())));
                     }
@@ -5504,6 +5583,7 @@ impl<'w, 'a> FnCx<'w, 'a> {
                         return Err(Diag::new(sp, format!("`{c}.{name}` doesn't take a block")));
                     }
                     let d = self.w.defs[def].def.clone();
+                    let args = &*self.fill_args(def, args, 0, false, sp)?;
                     if args.len() != d.params.len() {
                         return Err(Diag::new(name_span, format!("`{c}.{name}` takes {} argument(s), got {}", d.params.len(), args.len())));
                     }
@@ -5875,6 +5955,7 @@ impl<'w, 'a> FnCx<'w, 'a> {
             Err(d) if d.msg.starts_with(&format!("no method `{name}`")) && bsym.is_none() => {
                 let rt = self.resolve(&recv.ty);
                 let Some(def) = self.std_sugar(&rt, name)? else { return Err(d) };
+                let args = &*self.fill_args(def, args, 1, block.is_some(), sp)?;
                 let mut targs = vec![recv];
                 for a in args {
                     targs.push(self.value(a)?);
@@ -5935,6 +6016,7 @@ impl<'w, 'a> FnCx<'w, 'a> {
             if block.is_some() {
                 return Err(Diag::new(sp, format!("`{name}` doesn't take a block")));
             }
+            let args = &*self.fill_args(def, args, 1, false, sp)?;
             let mut targs = vec![recv];
             for a in args {
                 targs.push(self.value(a)?);
@@ -6063,6 +6145,7 @@ impl<'w, 'a> FnCx<'w, 'a> {
                 if name.ends_with('!') {
                     return Err(Diag::new(recv.span, format!("`{name}` changes its receiver; call it on a variable")));
                 }
+                let args = &*self.fill_args(def, args, 1, block.is_some(), sp)?;
                 let mut targs = vec![recv];
                 for a in args {
                     targs.push(self.value(a)?);
@@ -6276,6 +6359,7 @@ impl<'w, 'a> FnCx<'w, 'a> {
                 if name.ends_with('!') {
                     return Err(Diag::new(recv.span, format!("`{name}` changes its receiver; call it on a variable")));
                 }
+                let args = &*self.fill_args(def, args, 1, false, sp)?;
                 let mut targs = vec![recv];
                 for a in args {
                     targs.push(self.value(a)?);

@@ -245,7 +245,7 @@ impl<'a> Parser<'a> {
                         let Tok::Ident(p) = self.bump().tok else { unreachable!() };
                         self.bump();
                         self.declare(&p);
-                        param = Some(Param { name: p, ty: None, span: psp });
+                        param = Some(Param { name: p, ty: None, span: psp, default: None });
                         self.stmts_to_brace()
                     } else {
                         self.braced_stmts()
@@ -803,7 +803,7 @@ impl<'a> Parser<'a> {
             let t = TypeExpr::Named(o.to_string(), name_span);
             let ty = if name.ends_with('!') { TypeExpr::Array(Box::new(t), name_span) } else { t };
             self.declare("self");
-            params.push(Param { name: "self".into(), ty: if in_iface { None } else { Some(ty) }, span: name_span });
+            params.push(Param { name: "self".into(), ty: if in_iface { None } else { Some(ty) }, span: name_span, default: None });
         }
         let name = match owner {
             Some(o) => method_name(o, &name),
@@ -811,6 +811,7 @@ impl<'a> Parser<'a> {
         };
         if self.is_op("(") && !self.space_before() {
             self.bump();
+            let mut defaults_at = vec![];
             while !self.is_op(")") {
                 let sp = self.span();
                 let pname = match self.bump().tok {
@@ -818,13 +819,33 @@ impl<'a> Parser<'a> {
                     t => return Err(Diag::new(sp, format!("expected a parameter name, found {}", describe(&t)))),
                 };
                 let ty = if self.eat_op(":") { Some(self.type_expr()?) } else { None };
+                // S8: `name: T = default`.
+                let default = if self.is_op("=") {
+                    let esp = self.bump().span;
+                    if ty.is_none() {
+                        return Err(Diag::new(esp, format!("a parameter with a default needs a type: `{pname}: Type = value`")));
+                    }
+                    if self.extern_mode {
+                        return Err(Diag::new(esp, "an `extern def` can't have default values"));
+                    }
+                    if in_iface {
+                        return Err(Diag::new(esp, "an interface method can't have default values").note("an implementor's own method may; calls through the interface pass every argument"));
+                    }
+                    let from = self.pos;
+                    let e = self.ternary()?;
+                    defaults_at.push((params.len(), from, self.pos));
+                    Some(Box::new(e))
+                } else {
+                    None
+                };
                 self.declare(&pname);
-                params.push(Param { name: pname, ty, span: sp });
+                params.push(Param { name: pname, ty, span: sp, default });
                 if !self.eat_op(",") {
                     break;
                 }
             }
             self.expect_op(")")?;
+            self.check_defaults(&params, &defaults_at)?;
         }
         let (mut ret, mut fallible, mut errs) = (None, false, None);
         if self.eat_op("->") {
@@ -864,6 +885,33 @@ impl<'a> Parser<'a> {
         };
         self.scopes.pop();
         Ok(DefSig { name, span: start.to(self.prev_span()), tparams, name_span, params, ret, fallible, errs, pure, ffi, body })
+    }
+
+    /// S8: defaults use no parameters (they are evaluated at the call site,
+    /// without the call's other arguments), and a required parameter can't
+    /// follow one with a default (except a last function parameter, which
+    /// a block fills). `at`: each default's parameter and token range.
+    fn check_defaults(&self, params: &[Param], at: &[(usize, usize, usize)]) -> PResult<()> {
+        for &(k, from, to) in at {
+            for i in from..to {
+                let Tok::Ident(n) = &self.toks[i].tok else { continue };
+                let after_dot = i > from && matches!(self.toks[i - 1].tok, Tok::Op(".") | Tok::Op("&."));
+                let kw = matches!(self.toks.get(i + 1).map(|t| &t.tok), Some(Tok::Op(":"))) && !matches!(self.toks.get(i + 2).map(|t| &t.tok), Some(Tok::Op(":")));
+                if !after_dot && !kw && params.iter().any(|p| &p.name == n) {
+                    return Err(Diag::new(self.toks[i].span, format!("the default of `{}` uses parameter `{n}`", params[k].name)).note("defaults are evaluated at the call site, without the call's other arguments (S8)"));
+                }
+            }
+        }
+        if let Some(first) = params.iter().position(|p| p.default.is_some()) {
+            let last = params.len() - 1;
+            for (i, p) in params.iter().enumerate().skip(first) {
+                let block = i == last && matches!(p.ty, Some(TypeExpr::Fn(..)));
+                if p.default.is_none() && !block {
+                    return Err(Diag::new(p.span, format!("parameter `{}` needs a default: it follows `{}`, which has one", p.name, params[first].name)).note("parameters with defaults come last (a last function parameter, filled by a block, may follow them)"));
+                }
+            }
+        }
+        Ok(())
     }
 
     /// `[T, U: Shape, N: like Int]` after a type or def name (no space before `[`).
@@ -2455,7 +2503,7 @@ impl<'a> Parser<'a> {
                         };
                         let ty = if self.eat_op(":") { Some(self.type_expr()?) } else { None };
                         self.declare(&pname);
-                        params.push(Param { name: pname, ty, span: psp });
+                        params.push(Param { name: pname, ty, span: psp, default: None });
                         if !self.eat_op(",") {
                             break;
                         }

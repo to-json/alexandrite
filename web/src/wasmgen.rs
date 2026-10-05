@@ -88,6 +88,7 @@ const RT: &[(&str, &str)] = &[
     ("alxr_umulhi", "jj>j"),
     ("alxr_puts_u64", "j>"),
     ("alxr_u64_to_s", "j>"),
+    ("alxr_strerror", "j>"),
     ("alxr_int_fmt", "jjii>"),
     ("alxr_f_to_u64", "fjj>j"),
     ("alxr_rune_to_s", "j>"),
@@ -2318,7 +2319,8 @@ impl<'c, 'p> Fx<'c, 'p> {
             Rt::U64ToS => call_ret(self, "alxr_u64_to_s", 2),
             Rt::IntFmt => call_ret(self, "alxr_int_fmt", 2),
             // Unreachable: `suspend::prepare` refuses programs that use these.
-            Rt::Errno | Rt::Strerror | Rt::StrFromPtr => {
+            Rt::Strerror => call_ret(self, "alxr_strerror", 2),
+            Rt::Errno | Rt::StrFromPtr => {
                 self.ins().unreachable();
             }
             Rt::StrFromCstr => call_ret(self, "alxr_str_from_cstr", 2),

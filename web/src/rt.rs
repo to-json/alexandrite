@@ -795,6 +795,35 @@ pub extern "C" fn alxr_puts_u64(v: i64) {
     s.out.push('\n');
 }
 
+/// C's `strerror` for the browser: the usual POSIX messages (the browser
+/// makes no system calls, so these only appear in error values a program
+/// builds itself; any program importing `os` can name them).
+#[unsafe(no_mangle)]
+pub extern "C" fn alxr_strerror(n: i64) {
+    let m = match n {
+        0 => "Undefined error: 0",
+        1 => "Operation not permitted",
+        2 => "No such file or directory",
+        3 => "No such process",
+        4 => "Interrupted system call",
+        5 => "Input/output error",
+        9 => "Bad file descriptor",
+        11 | 35 => "Resource temporarily unavailable",
+        12 => "Cannot allocate memory",
+        13 => "Permission denied",
+        17 => "File exists",
+        20 => "Not a directory",
+        21 => "Is a directory",
+        22 => "Invalid argument",
+        24 => "Too many open files",
+        28 => "No space left on device",
+        32 => "Broken pipe",
+        38 | 78 => "Function not implemented",
+        _ => return ret_str(format!("Unknown error: {n}").as_bytes()),
+    };
+    ret_str(m.as_bytes())
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn alxr_u64_to_s(v: i64) {
     ret_str((v as u64).to_string().as_bytes());

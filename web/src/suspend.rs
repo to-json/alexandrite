@@ -154,7 +154,7 @@ fn uses(body: &mut [LS], externs: &[FfiSig], sleep: Option<usize>) -> Uses {
                         u.c_only = true;
                     }
                 }
-                LE::Rt(Rt::Errno | Rt::Strerror | Rt::StrFromPtr, _) => u.c_only = true,
+                LE::Rt(Rt::Errno | Rt::StrFromPtr, _) => u.c_only = true,
                 _ => {}
             });
         }

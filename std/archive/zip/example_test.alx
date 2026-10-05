@@ -76,6 +76,50 @@ test "register decompressor" {
   assert_eq r.file[0].open.err.unwrap.message, "zip: unsupported compression algorithm"
 }
 
+# The package-level registries (Go's RegisterCompressor /
+# RegisterDecompressor): method 200 stores its data upper-cased.
+test "register compressor and decompressor" {
+  register_compressor(200, ->(out: bytes.Buffer) -> ~io.WriteCloser { UpperWriter.new(out: out) })
+  register_decompressor(200, ->(src: SectionReader) -> ([Byte]) -> ~Int {
+    s = src
+    ->(p: [Byte]) -> ~Int { s.~read!(p) }
+  })
+  buf = bytes.new_buffer([])
+  w = new_writer(buf)
+  f = w.~create_header!(FileHeader.new(name: "a.txt", method: 200))
+  f.~write!(b("abc"))
+  w.~close!
+  r = ~reader_of(buf)
+  # The stored data is upper-cased, so its CRC (of "abc") doesn't match.
+  rc = r.file[0].~open
+  res = io.read_all(rc)
+  assert_eq res.err.unwrap.message, "zip: checksum error"
+  # A Reader's own decompressor comes first.
+  r.register_decompressor!(200, ->(src: SectionReader) -> ([Byte]) -> ~Int {
+    s = src
+    ->(p: [Byte]) -> ~Int {
+      n = s.~read!(p)
+      for i in 0...n {
+        p[i] = p[i] + 32
+      }
+      n
+    }
+  })
+  rc2 = r.file[0].~open
+  assert_eq Str.from_bytes(io.~read_all(rc2)), "abc"
+}
+
+# Upper-cases ASCII letters on the way to out.
+struct UpperWriter {
+  out: bytes.Buffer
+  def write!(p: [Byte]) -> ~Int {
+    q = p.map { |c| c >= 97 && c <= 122 ? c - 32 : c }.to_a
+    self.out.write!(q)
+    p.size
+  }
+  def close! -> ~Unit {}
+}
+
 # FuzzReader's property on its seed inputs (alx has no fuzzing): what
 # reads without error is written back.
 test "FuzzReader" {

@@ -63,14 +63,16 @@ if (filter.endsWith('.alx') && filter.includes('/')) {
 }
 let fail = 0;
 // What needs the C library must be refused at compile time.
-const browserless = ['ffi.alx', 'flags.alx', 'wc.alx', 'echo.alx', 'httpdemo.alx', 'scripting.alx'];
+const browserless = ['ffi.alx', 'echo.alx', 'httpdemo.alx', 'scripting.alx'];
+// Cases that need a file system: they run, and fail as Go's js/wasm does.
+const fileless = ['wc.alx'];
 for (const f of browserless.filter(f => f.includes(filter))) {
   const r = await run(f, readFileSync(cases + f, 'utf8'));
   const ok = (r.compileError ?? '').includes("aren't available in the browser") && !(r.compileError ?? '').includes('internal');
   if (!ok) fail++;
   console.log(`${ok ? 'ok  ' : 'FAIL'} ${f} refused in the browser ${ok ? '' : JSON.stringify(r)}`);
 }
-for (const f of readdirSync(cases).filter(f => /^[a-z]+\d*\.alx$/.test(f) && !browserless.includes(f) && readdirSync(cases).includes(f.replace('.alx', '.expected')) && f.includes(filter)).sort()) {
+for (const f of readdirSync(cases).filter(f => /^[a-z]+\d*\.alx$/.test(f) && !browserless.includes(f) && !fileless.includes(f) && readdirSync(cases).includes(f.replace('.alx', '.expected')) && f.includes(filter)).sort()) {
   const want = readFileSync(cases + f.replace('.alx', '.expected'), 'utf8').trim();
   const r = await run(f, readFileSync(cases + f, 'utf8'));
   const got = (r.stdout ?? '').trim();
@@ -79,11 +81,19 @@ for (const f of readdirSync(cases).filter(f => /^[a-z]+\d*\.alx$/.test(f) && !br
   console.log(`${ok ? 'ok  ' : 'FAIL'} ${f.padEnd(10)} compile ${r.compileMs?.toFixed(1)} ms  inst ${r.instMs?.toFixed(1)} ms  run ${r.runMs?.toFixed(1)} ms` + (ok ? '' : `  got ${JSON.stringify(got)} ${r.compileError ?? ''} ${r.stderr ?? ''} ${r.status}`));
 }
 // Runtime failures.
-for (const [f, status, needle] of [['pe020.bad.alx', 'abort', 'overflow at pe020.bad.alx:1:'], ['pe022.missing.alx', 1, 'File.read: no such file `fixtures/nope.txt` (pe022.missing.alx:1:10)'], ['concurrency.deadlock.alx', 'abort', 'alexandrite: all tasks are asleep: deadlock']]) {
+for (const [f, status, needle] of [['wc.alx', 1, 'open wc.alx: function not implemented'], ['pe020.bad.alx', 'abort', 'overflow at pe020.bad.alx:1:'], ['pe022.missing.alx', 1, 'File.read: no such file `fixtures/nope.txt` (pe022.missing.alx:1:10)'], ['concurrency.deadlock.alx', 'abort', 'alexandrite: all tasks are asleep: deadlock']]) {
   const r = await run(f, readFileSync(cases + f, 'utf8'));
   const ok = r.status === status && r.stderr.includes(needle);
   if (!ok) fail++;
   console.log(`${ok ? 'ok  ' : 'FAIL'} ${f} (${r.status}) ${ok ? '' : JSON.stringify(r)}`);
+}
+// The browser's own runtime (os, randomness): web/tests.
+for (const f of readdirSync(here + 'tests').filter(f => f.endsWith('.alx') && f.includes(filter))) {
+  const want = readFileSync(here + 'tests/' + f.replace('.alx', '.expected'), 'utf8');
+  const r = await run(f, readFileSync(here + 'tests/' + f, 'utf8'));
+  const ok = r.stdout === want && r.status === 0;
+  if (!ok) fail++;
+  console.log(`${ok ? 'ok  ' : 'FAIL'} tests/${f}` + (ok ? '' : `  got ${JSON.stringify(r.stdout)} ${r.compileError ?? ''} ${r.stderr ?? ''} ${r.status}`));
 }
 // Compile errors.
 for (const f of readdirSync(cases).filter(f => f.endsWith('.expected_error'))) {

@@ -374,9 +374,9 @@ impl<'a> G<'a> {
                 self.w(ind, format!("{m} = {dest}"));
                 self.w(ind, format!("for {i} in 0...{n} {{"));
                 self.w(ind + 1, format!("{k}: {} = {}", type_src(&args[0]), self.zero(&args[0])));
-                self.dec(&args[0], &kw, &k, &format!("key of {name}"), ind + 1);
+                self.dec(&args[0], &kw, &k, name, ind + 1);
                 self.w(ind + 1, format!("{v}: {} = {}", type_src(&args[1]), self.zero(&args[1])));
-                self.dec(&args[1], &ew, &v, &format!("element of {name}"), ind + 1);
+                self.dec(&args[1], &ew, &v, name, ind + 1);
                 self.w(ind + 1, format!("{m}[{k}] = {v}"));
                 self.w(ind, "}");
                 self.w(ind, format!("{dest} = {m}"));

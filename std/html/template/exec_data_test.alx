@@ -1,0 +1,321 @@
+# Go's exec_test.go data: T, tVal and the test FuncMap. T has methods and
+# fields of type interface{}, which a derived type can't hold (a Value field
+# would make the type contain itself), so tVal is built with
+# Value.struct_with: its fields are Values and its methods are TM's.
+
+import "bytes"
+import "strings"
+import ttmpl "text/template"
+
+# Go's U: a struct with a method.
+#[derive(Template)]
+#[template("template.U")]
+struct U {
+  #[template("V")] v: Str
+
+  #[template("TrueFalse")]
+  pub def true_false(b: Bool) -> Str {
+    b ? "true" : ""
+  }
+}
+
+# Go's V: String() on *V.
+#[derive(Template)]
+#[template("template.V")]
+struct V {
+  j: Int
+
+  pub def to_s -> Str { "<#{j}>" }
+}
+
+# Go's W: Error() on *W.
+#[derive(Template)]
+#[template("template.W")]
+struct W {
+  k: Int
+
+  pub def to_s -> Str { "[#{k}]" }
+}
+
+# A fmt.Stringer (Go's bytes.Buffer holding "foozle").
+#[derive(Template)]
+#[template("*bytes.Buffer")]
+struct Buf {
+  text: Str
+
+  pub def to_s -> Str { text }
+}
+
+# T's methods (Go's methods on *T). `which` says which T it belongs to
+# (Copy and GetU need the rest of it).
+#[derive(Template)]
+#[template("template.T")]
+struct TM {
+  which: Int
+
+  #[template("Method0")]
+  pub def method0 -> Str { "M0" }
+
+  #[template("Method1")]
+  pub def method1(a: Int) -> Int { a }
+
+  #[template("Method2")]
+  pub def method2(a: U16, b: Str) -> Str { "Method2: #{a} #{b}" }
+
+  #[template("Method3")]
+  pub def method3(v: ttmpl.Value) -> Str { ttmpl.go_sprintf("Method3: %v", [v]) }
+
+  #[template("Copy")]
+  pub def copy -> ttmpl.Value { make_t(which) }
+
+  #[template("MAdd")]
+  pub def madd(a: Int, b: [Int]) -> [Int] { b.map { it + a } }
+
+  # MyError returns a value and an error according to its argument.
+  #[template("MyError")]
+  pub def my_error(error: Bool) -> ~Bool {
+    fail Failure.Msg("my error") if error
+    false
+  }
+
+  # A few methods to test chaining.
+  #[template("GetU")]
+  pub def get_u -> U? {
+    return U.new(v: "v") if which == 1
+    none
+  }
+}
+
+def str_list(xs: [Str]) -> ttmpl.Value { ttmpl.Value.list_of(xs.map { ttmpl.Value.str(it) }, "[]string") }
+
+def int_list(xs: [Int]) -> ttmpl.Value { ttmpl.Value.list_of(xs.map { ttmpl.Value.int(it) }, "[]int") }
+
+def msi(keys: [Str], vals: [Int]) -> ttmpl.Value {
+  ks: [ttmpl.Value] = []
+  vs: [ttmpl.Value] = []
+  i = 0
+  while i < keys.size {
+    ks << ttmpl.Value.str(keys[i])
+    vs << ttmpl.Value.int(vals[i])
+    i += 1
+  }
+  ttmpl.Value.map_of(ks, vs, "map[string]int")
+}
+
+# map[K]string with integer keys of type kt.
+def mks(kt: Str, keys: [Int], vals: [Str], unsigned: Bool) -> ttmpl.Value {
+  ks: [ttmpl.Value] = []
+  vs: [ttmpl.Value] = []
+  i = 0
+  while i < keys.size {
+    if unsigned {
+      ks << ttmpl.Value.uint_of(keys[i].as_u64, kt)
+    } else {
+      ks << ttmpl.Value.int_of(keys[i], kt)
+    }
+    vs << ttmpl.Value.str(vals[i])
+    i += 1
+  }
+  ttmpl.Value.map_of(ks, vs, "map[#{kt}]string")
+}
+
+def iv(i: Int) -> ttmpl.Value { ttmpl.Value.int(i) }
+
+def strs_of(a: [ttmpl.Value]) -> [Str] { a.map { it.str_val } }
+
+# A T: 0 is Go's T{}, 1 is tVal, 2 is &T{X: "x"} (NonEmptyInterface).
+def make_t(which: Int) -> ttmpl.Value {
+  full = which == 1
+  names: [Str] = []
+  vals: [ttmpl.Value] = []
+  add = ->(n: Str, v: ttmpl.Value) {
+    names << n
+    vals << v
+  }
+  add.call("True", ttmpl.Value.bool(full))
+  add.call("I", iv(full ? 17 : 0))
+  add.call("U16", ttmpl.Value.uint_of((full ? 16 : 0).as_u64, "uint16"))
+  add.call("X", sv(which == 0 ? "" : "x"))
+  add.call("S", sv(full ? "xyz" : ""))
+  add.call("FloatZero", ttmpl.Value.float(0.0))
+  add.call("ComplexZero", ttmpl.Value.complex(Complex.new(0.0, 0.0)))
+  add.call("U", full ? U.new(v: "v").to_tmpl.ptr : ttmpl.Value.nil_of("*template.U"))
+  # (html/template prints a V value with fmt: String is on *V)
+  add.call("V0", ttmpl.Value.struct_of("template.V", ["j"], [iv(full ? 6666 : 0)]))
+  add.call("V1", full ? V.new(j: 7777).to_tmpl.ptr : ttmpl.Value.nil_of("*template.V"))
+  add.call("V2", ttmpl.Value.nil_of("*template.V"))
+  add.call("W0", ttmpl.Value.struct_of("template.W", ["k"], [iv(full ? 888 : 0)]))
+  add.call("W1", full ? W.new(k: 999).to_tmpl.ptr : ttmpl.Value.nil_of("*template.W"))
+  add.call("W2", ttmpl.Value.nil_of("*template.W"))
+  add.call("SI", full ? int_list([3, 4, 5]) : ttmpl.Value.nil_of("[]int"))
+  add.call("SICap", full ? ttmpl.Value.list_cap([iv(0), iv(0), iv(0), iv(0), iv(0)], 10, iv(0), "[]int") : ttmpl.Value.nil_of("[]int"))
+  add.call("SIEmpty", ttmpl.Value.nil_of("[]int"))
+  add.call("SB", full ? ttmpl.Value.list_of([ttmpl.Value.bool(true), ttmpl.Value.bool(false)], "[]bool") : ttmpl.Value.nil_of("[]bool"))
+  add.call("AI", ttmpl.Value.list_of(full ? [iv(3), iv(4), iv(5)] : [iv(0), iv(0), iv(0)], "[3]int"))
+  add.call("PAI", full ? ttmpl.Value.list_of([iv(3), iv(4), iv(5)], "[3]int").ptr : ttmpl.Value.nil_of("*[3]int"))
+  add.call("MSI", full ? msi(["one", "two", "three"], [1, 2, 3]) : ttmpl.Value.nil_of("map[string]int"))
+  add.call("MSIone", full ? msi(["one"], [1]) : ttmpl.Value.nil_of("map[string]int"))
+  add.call("MSIEmpty", ttmpl.Value.nil_of("map[string]int"))
+  add.call("MXI", full ? ttmpl.Value.map_of([sv("one")], [iv(1)], "map[interface {}]int") : ttmpl.Value.nil_of("map[interface {}]int"))
+  add.call("MII", full ? ttmpl.Value.map_of([iv(1)], [iv(1)], "map[int]int") : ttmpl.Value.nil_of("map[int]int"))
+  add.call("MI32S", full ? mks("int32", [1, 2], ["one", "two"], false) : ttmpl.Value.nil_of("map[int32]string"))
+  add.call("MI64S", full ? mks("int64", [2, 3], ["i642", "i643"], false) : ttmpl.Value.nil_of("map[int64]string"))
+  add.call("MUI32S", full ? mks("uint32", [2, 3], ["u322", "u323"], true) : ttmpl.Value.nil_of("map[uint32]string"))
+  add.call("MUI64S", full ? mks("uint64", [2, 3], ["ui642", "ui643"], true) : ttmpl.Value.nil_of("map[uint64]string"))
+  add.call("MI8S", full ? mks("int8", [2, 3], ["i82", "i83"], false) : ttmpl.Value.nil_of("map[int8]string"))
+  add.call("MUI8S", full ? mks("uint8", [2, 3], ["u82", "u83"], true) : ttmpl.Value.nil_of("map[uint8]string"))
+  add.call("SMSI", full ? ttmpl.Value.list_of([msi(["one", "two"], [1, 2]), msi(["eleven", "twelve"], [11, 12])], "[]map[string]int") : ttmpl.Value.nil_of("[]map[string]int"))
+  # Empty interfaces; used to see if we can dig inside one.
+  add.call("Empty0", ttmpl.Value.nil_of("interface {}"))
+  add.call("Empty1", full ? iv(3) : ttmpl.Value.nil_of("interface {}"))
+  add.call("Empty2", full ? sv("empty2") : ttmpl.Value.nil_of("interface {}"))
+  add.call("Empty3", full ? int_list([7, 8]) : ttmpl.Value.nil_of("interface {}"))
+  add.call("Empty4", full ? U.new(v: "UinEmpty").to_tmpl.ptr : ttmpl.Value.nil_of("interface {}"))
+  # Non-empty interfaces.
+  add.call("NonEmptyInterface", full ? make_t(2).ptr : ttmpl.Value.nil_of("template.I"))
+  add.call("NonEmptyInterfacePtS", full ? ttmpl.Value.list_of([sv("a"), sv("b")], "template.S").ptr : ttmpl.Value.nil_of("*template.I"))
+  add.call("NonEmptyInterfaceNil", ttmpl.Value.nil_of("template.I"))
+  add.call("NonEmptyInterfaceTypedNil", full ? ttmpl.Value.nil_of("*template.T") : ttmpl.Value.nil_of("template.I"))
+  # Stringer.
+  add.call("Str", full ? Buf.new(text: "foozle").to_tmpl.ptr : ttmpl.Value.nil_of("fmt.Stringer"))
+  add.call("Err", full ? ttmpl.Value.str_of("erroozle", "*errors.errorString") : ttmpl.Value.nil_of("error"))
+  # Pointers
+  add.call("PI", full ? iv(23).ptr : ttmpl.Value.nil_of("*int"))
+  add.call("PS", full ? sv("a string").ptr : ttmpl.Value.nil_of("*string"))
+  add.call("PSI", full ? int_list([21, 22, 23]).ptr : ttmpl.Value.nil_of("*[]int"))
+  add.call("NIL", ttmpl.Value.nil_of("*int"))
+  # Function (not method)
+  if full {
+    add.call("BinaryFunc", ttmpl.Value.func(ttmpl.Func.of("func(string, string) string", ->(a: [ttmpl.Value]) -> ~ttmpl.Value { sv("[#{a[0].str_val}=#{a[1].str_val}]") })))
+    add.call("VariadicFunc", ttmpl.Value.func(ttmpl.Func.of("func(...string) string", ->(a: [ttmpl.Value]) -> ~ttmpl.Value { sv(ttmpl.go_sprint([sv("<"), sv(strings.join(strs_of(a), "+")), sv(">")])) })))
+    add.call("VariadicFuncInt", ttmpl.Value.func(ttmpl.Func.of("func(int, ...string) string", ->(a: [ttmpl.Value]) -> ~ttmpl.Value { sv(ttmpl.go_sprint([a[0], sv("=<"), sv(strings.join(strs_of(a[1...a.size]), "+")), sv(">")])) })))
+    add.call("NilOKFunc", ttmpl.Value.func(ttmpl.Func.of("func(*int) bool", ->(a: [ttmpl.Value]) -> ~ttmpl.Value { ttmpl.Value.bool(a[0].nil?) })))
+    add.call("ErrFunc", ttmpl.Value.func(ttmpl.Func.of("func() (string, error)", ->(a: [ttmpl.Value]) -> ~ttmpl.Value { sv("bla") })))
+    add.call("PanicFunc", ttmpl.Value.func(ttmpl.Func.of("func() string", ->(a: [ttmpl.Value]) -> ~ttmpl.Value {
+      # alx has no recover: the panic is an error.
+      fail Failure.Msg("test panic")
+      ttmpl.Value.invalid
+    })))
+    add.call("TooFewReturnCountFunc", ttmpl.Value.func(ttmpl.Func.of("func()", ->(a: [ttmpl.Value]) -> ~ttmpl.Value { ttmpl.Value.invalid })))
+    add.call("TooManyReturnCountFunc", ttmpl.Value.func(ttmpl.Func.of("func() (string, error, int)", ->(a: [ttmpl.Value]) -> ~ttmpl.Value { sv("") })))
+    add.call("InvalidReturnTypeFunc", ttmpl.Value.func(ttmpl.Func.of("func() (string, bool)", ->(a: [ttmpl.Value]) -> ~ttmpl.Value { sv("") })))
+  } else {
+    for f in ["func(string, string) string", "func(...string) string", "func(int, ...string) string", "func(*int) bool", "func() (string, error)", "func() string", "func()", "func() (string, error, int)", "func() (string, bool)"] {
+      vals << ttmpl.Value.nil_of(f)
+    }
+    for n in ["BinaryFunc", "VariadicFunc", "VariadicFuncInt", "NilOKFunc", "ErrFunc", "PanicFunc", "TooFewReturnCountFunc", "TooManyReturnCountFunc", "InvalidReturnTypeFunc"] {
+      names << n
+    }
+  }
+  # Template to test evaluation of templates.
+  add.call("Tmpl", ttmpl.Value.nil_of("*Template"))
+  # Unexported field; cannot be accessed by template.
+  add.call("unexported", iv(0))
+  ttmpl.Value.struct_with("template.T", names, vals, TM.new(which: which))
+}
+
+def tval -> ttmpl.Value { make_t(1).ptr }
+
+def tzero -> ttmpl.Value { make_t(0) }
+
+# Go's "Interface Call" data: map[string]any{"S": bytes.NewBufferString("foozle")}.
+def stringer_map -> ttmpl.Value {
+  ttmpl.Value.map_of([sv("S")], [Buf.new(text: "foozle").to_tmpl.ptr], "map[string]interface {}")
+}
+
+# The FuncMap of Go's testExecute.
+def test_funcs -> Map[Str, ttmpl.Func] {
+  m: Map[Str, ttmpl.Func] = {}
+  m["add"] = ttmpl.Func.of("func(...int) int", ->(a: [ttmpl.Value]) -> ~ttmpl.Value {
+    s = 0
+    for x in a { s += x.int_val }
+    iv(s)
+  })
+  m["dddArg"] = ttmpl.Func.of("func(int, ...string) string", ->(a: [ttmpl.Value]) -> ~ttmpl.Value {
+    sv(ttmpl.go_sprintln([a[0], ttmpl.Value.list_of(a[1...a.size], "[]string")]))
+  })
+  m["die"] = ttmpl.Func.of("func() bool", ->(a: [ttmpl.Value]) -> ~ttmpl.Value {
+    # Go's die panics; alx has no recover, so it fails instead.
+    fail Failure.Msg("die")
+    ttmpl.Value.invalid
+  })
+  m["echo"] = ttmpl.Func.of("func(interface {}) interface {}", ->(a: [ttmpl.Value]) -> ~ttmpl.Value { a[0] })
+  m["makemap"] = ttmpl.Func.of("func(...string) map[string]string", ->(a: [ttmpl.Value]) -> ~ttmpl.Value {
+    fail Failure.Msg("bad makemap") if a.size % 2 != 0
+    ks: [ttmpl.Value] = []
+    vs: [ttmpl.Value] = []
+    i = 0
+    while i < a.size {
+      ks << a[i]
+      vs << a[i + 1]
+      i += 2
+    }
+    ttmpl.Value.map_of(ks, vs, "map[string]string")
+  })
+  m["mapOfThree"] = ttmpl.Func.of("func() interface {}", ->(a: [ttmpl.Value]) -> ~ttmpl.Value { msi(["three"], [3]) })
+  m["oneArg"] = ttmpl.Func.of("func(string) string", ->(a: [ttmpl.Value]) -> ~ttmpl.Value { sv("oneArg=" + a[0].str_val) })
+  m["returnInt"] = ttmpl.Func.of("func() int", ->(a: [ttmpl.Value]) -> ~ttmpl.Value { iv(7) })
+  m["stringer"] = ttmpl.Func.of("func(fmt.Stringer) string", ->(a: [ttmpl.Value]) -> ~ttmpl.Value { sv(a[0].obj.unwrap.tmpl_string.unwrap) })
+  m["twoArgs"] = ttmpl.Func.of("func(string, string) string", ->(a: [ttmpl.Value]) -> ~ttmpl.Value { sv("twoArgs=" + a[0].str_val + a[1].str_val) })
+  m["typeOf"] = ttmpl.Func.of("func(interface {}) string", ->(a: [ttmpl.Value]) -> ~ttmpl.Value { sv(ttmpl.go_sprintf("%T", [a[0]])) })
+  m["valueString"] = ttmpl.Func.of("func(string) string", ->(a: [ttmpl.Value]) -> ~ttmpl.Value { sv("value is ignored") })
+  m["vfunc"] = ttmpl.Func.of("func(template.V, *template.V) string", ->(a: [ttmpl.Value]) -> ~ttmpl.Value { sv("vfunc") })
+  m["zeroArgs"] = ttmpl.Func.of("func() string", ->(a: [ttmpl.Value]) -> ~ttmpl.Value { sv("zeroArgs") })
+  m
+}
+
+# One case of Go's testExecute.
+def run_exec(tmpl: Template, name: Str, input: Str, output: Str, data: ttmpl.Value, ok: Bool) {
+  pr = tmpl.funcs(test_funcs()).parse(input)
+  assert pr.ok?, "#{name}: parse error: #{pr.err?.message || ""}"
+  b = bytes.new_buffer([])
+  r = pr.unwrap.execute(b, data)
+  if ok {
+    assert r.ok?, "#{name}: unexpected execute error: #{r.err?.message || ""}"
+  } else {
+    assert r.err?, "#{name}: expected error; got none"
+  }
+  assert_eq b.string, output
+}
+
+def check_exec(name: Str, input: Str, output: Str, data: ttmpl.Value, ok: Bool) {
+  run_exec(new(name), name, input, output, data, ok)
+}
+
+# These strings are also in testdata/*.
+MULTI_TEXT1 = "\n\t{{define \"x\"}}TEXT{{end}}\n\t{{define \"dotV\"}}{{.V}}{{end}}\n"
+MULTI_TEXT2 = "\n\t{{define \"dot\"}}{{.}}{{end}}\n\t{{define \"nested\"}}{{template \"dot\" .}}{{end}}\n"
+
+def multi_root -> Template {
+  t = new("root").parse(MULTI_TEXT1).unwrap
+  t.parse(MULTI_TEXT2).unwrap
+}
+
+def check_multi_exec(name: Str, input: Str, output: Str, data: ttmpl.Value, ok: Bool) {
+  run_exec(multi_root().new(name), name, input, output, data, ok)
+}
+
+# TestComparison's data.
+def cmp_struct -> ttmpl.Value {
+  names = ["Uthree", "Ufour", "NegOne", "Three", "Ptr", "NilPtr", "NonNilMap", "Map", "V1", "V2", "Iface1", "Iface2"]
+  vals = [
+    ttmpl.Value.uint(3.as_u64), ttmpl.Value.uint(4.as_u64), iv(-1), iv(3), iv(0).ptr, ttmpl.Value.nil_of("*int"),
+    ttmpl.Value.map_of([], [], "map[int]int"), ttmpl.Value.nil_of("map[int]int"),
+    V.new(j: 0).to_tmpl, V.new(j: 0).to_tmpl,
+    Buf.new(text: "").to_tmpl.ptr, ttmpl.Value.nil_of("fmt.Stringer"),
+  ]
+  ttmpl.Value.struct_of("struct { Uthree uint; Ufour uint; NegOne int; Three int; Ptr *int; NilPtr *int; NonNilMap map[int]int; Map map[int]int; V1 template.V; V2 template.V; Iface1 fmt.Stringer; Iface2 fmt.Stringer }", names, vals).ptr
+}
+
+def check_cmp(expr: Str, truth: Str, ok: Bool) {
+  text = "{{if #{expr}}}true{{else}}false{{end}}"
+  t = new("empty").parse(text).unwrap
+  b = bytes.new_buffer([])
+  r = t.execute(b, cmp_struct())
+  if ok {
+    assert r.ok?, "#{expr} errored incorrectly: #{r.err?.message || ""}"
+  } else {
+    assert r.err?, "#{expr} did not error"
+  }
+  assert_eq b.string, truth
+}

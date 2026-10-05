@@ -1415,7 +1415,9 @@ const ARRAY_EXTRA: &[&str] = &["each_index", "each_cons", "pmap", "last", "<<", 
 const INT_METHODS: &[&str] = &["to_s", "to_f", "to_i", "to_u8", "to_i32", "to_u32", "to_u64", "as_u8", "as_i32", "as_u32", "as_u64", "even?", "odd?", "digits", "step"];
 const FLOAT_METHODS: &[&str] = &["to_s", "to_f", "to_i", "abs", "sqrt"];
 /// `fmt` functions the compiler provides (std/fmt/fmt.alx documents them).
-const FMT_BUILTINS: &[&str] = &["sprintf", "printf", "sprint", "sprintln", "print", "println", "errorf"];
+const FMT_BUILTINS: &[&str] = &[
+    "sprintf", "printf", "sprint", "sprintln", "print", "println", "errorf", "fprint", "fprintf", "fprintln", "append", "appendf", "appendln", "sscan", "sscanf", "sscanln", "fscan", "fscanf", "fscanln", "scan", "scanf", "scanln",
+];
 const STR_METHODS: &[&str] = &["chars", "bytes", "runes", "size", "length", "reverse", "delete", "split", "to_i", "to_s", "strip", "lstrip", "rstrip", "lines", "start_with?", "end_with?", "include?", "byteindex"];
 
 fn lev(a: &str, b: &str) -> usize {
@@ -6315,32 +6317,13 @@ impl<'w, 'a> FnCx<'w, 'a> {
         if name == "errorf" {
             return self.errorf(args, sp);
         }
-        let text = match name {
-            "sprintf" | "printf" => self.format(name, args, sp)?,
-            _ => {
-                // sprint / sprintln / print / println: every operand as `%v`.
-                let line = name.ends_with("ln");
-                let vals = args.iter().map(|a| self.value(a)).collect::<R<Vec<_>>>()?;
-                let mut pieces = vec![];
-                for (i, v) in vals.iter().enumerate() {
-                    let t = self.resolve(&v.ty);
-                    if !printable(&t) {
-                        return Err(Diag::new(v.span, format!("`fmt.{name}` can't show a {}", t.show())));
-                    }
-                    if i > 0 {
-                        let prev = self.resolve(&vals[i - 1].ty);
-                        if line || (prev != Ty::Str && t != Ty::Str) {
-                            pieces.push(FmtPiece::Lit(" ".into()));
-                        }
-                    }
-                    pieces.push(FmtPiece::Str(i));
-                }
-                if line {
-                    pieces.push(FmtPiece::Lit("\n".into()));
-                }
-                self.mk(TK::Format(pieces, vals), Ty::Str, sp)
-            }
-        };
+        if name.starts_with("fprint") || name.starts_with("append") {
+            return self.fmt_to(name, args, sp);
+        }
+        if name.contains("scan") {
+            return self.fmt_scan(name, args, sp);
+        }
+        let text = self.print_any(&format!("fmt.{name}"), args, sp)?;
         match name {
             "printf" | "print" | "println" => {
                 if self.pure_decl {

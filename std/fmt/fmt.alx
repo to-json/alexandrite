@@ -1,18 +1,124 @@
-# Package fmt: Go's formatted printing. Its functions are compiler builtins,
-# because they take any number of arguments of any type and check each
-# against its verb at compile time:
+# Package fmt: Go's formatted printing and scanning.
 #
-#   fmt.sprintf(format, args...) -> Str     fmt.printf(format, args...)
-#   fmt.sprint(args...) -> Str              fmt.print(args...)
-#   fmt.sprintln(args...) -> Str            fmt.println(args...)
-#   fmt.errorf(format, args...) -> Error
+# The printing and scanning functions are compiler builtins: they take any
+# number of arguments of any type (alx has no variadics or `any`), and the
+# format string, a literal, is checked against the arguments at compile
+# time. The formatting itself is Go's fmt/format.go, in alx (the engine in
+# the compiler's builtin.alx, so `format(...)` and `"#{x}"` share it
+# without importing fmt; GO-VS-RUBY.md D65); scanning is Go's scan.go
+# (scan.alx here).
 #
-# Verbs: %v %d %s %q %t %f %e %E %x %X %o %b %c %T %%, with flags `-+0 `, a
-# width and a precision (`%-8s`, `%05d`, `%+.2f`, `%10.3e`). `sprint` puts
-# spaces between operands when neither is a Str; `sprintln` always does
-# and ends with a newline.
+#   Go                                      alx
+#   Sprintf / Sprint / Sprintln             sprintf / sprint / sprintln -> Str (also the
+#                                             builtin `format(f, args)`)
+#   Printf / Print / Println                printf / print / println
+#   Fprintf / Fprint / Fprintln(w, ...)     fprintf / fprint / fprintln(w, ...) -> ~Int
+#                                             (w: anything with write!([Byte]) -> ~Int)
+#   Appendf / Append / Appendln(b, ...)     appendf / append / appendln(b, ...) -> [Byte]
+#   Errorf(format, ...)                     errorf -> Error ("...: %w" wraps, see below)
+#   Sscan / Sscanln / Sscanf(str, ...)      sscan / sscanln / sscanf(str, [format,] places...)
+#   Fscan / Fscanln / Fscanf(r, ...)        fscan / fscanln / fscanf(r, ...) (r: read!([Byte]))
+#   Scan / Scanln / Scanf(...)              scan / scanln / scanf (standard input)
+#     (n int, err error)                    ~Int: the count, or the error that stopped it
+#   Stringer (String() string)              a type's `to_s` (or `string`) method
+#   GoStringer (GoString() string)          `def go_string -> Str` (used by %#v)
+#   error (Error() string)                  Error values, and error types' `message`
+#   Formatter (Format(State, rune))         `def format(f: fmt.State, verb: Rune)`
+#   State (Write, Width, Precision, Flag)   State: write!, width -> Int?, precision -> Int?,
+#                                             flag?(c) (c a character code)
+#   ScanState, Scanner                      not ported (see below)
+#
+# Verbs, flags, widths and precisions are Go's: %v %+v %#v %T %t %d %b %o
+# %O %x %X %c %q %U %e %E %f %F %g %G %s %p-less; flags `+ - # 0 space`;
+# `*` widths and precisions; argument indexes `%[n]d`. A slice, map,
+# struct, tuple or optional applies the directive to each element, as Go
+# does (`%5d` of [1, 2] is `[    1     2]`). Go's tables
+# (fmt_test.go's fmtTests and reorderTests, and a matrix of verbs, flags,
+# widths and precisions) are vec_fmt*_test.alx.
+#
+# Differences from Go:
+#  - A bad verb (`%d` of a Str), a missing or an extra argument, a bad
+#    argument index are compile errors, not `%!d(string=x)` in the output.
+#  - %T shows alx's type names (Int, [Str], Map[Str, Int], pkg.Type).
+#  - %#v is alx syntax rather than Go syntax: `[1, 2]`, `{"a" => 1}`,
+#    `Point.new(x: 1, y: 2)`, `(1, "a")`, `none`; scalars are as Go
+#    (unsigned integers in 0x hex, quoted strings).
+#  - Maps print in insertion order (alx maps keep it; Go sorts the keys)
+#    (D8). An absent optional prints `none` (Go's nil pointer: <nil>).
+#  - Enums, interface values, errors and handles take %v and %s (with
+#    width and precision); an enum value shows as `Variant(fields)`.
+#  - %f %e %g of an integer format it as a Float (Go prints %!f(int=..)).
+#  - fmt.errorf: "context: %w" (the %w last, after ": ") gives the wrapped
+#    error itself with the context added (`e.wrap("context")`), so it still
+#    matches its type's variants (Go's errors.Is/As through Unwrap); %w
+#    anywhere else formats the error's message into a new Failure.
+#  - The scans take places (locals, fields, elements: `fmt.sscan(s, a,
+#    p.x)`) where Go takes pointers, and return ~Int: on an error the count
+#    is lost (the places filled before it keep their values, as in Go).
+#    They fill Int, sized integers, Float, Complex, Str, [Byte] and Bool;
+#    Go's Scanner interface (a type scanning itself through ScanState) is
+#    not ported: alx can't pass a place to a method. Messages are Go's
+#    (strconv errors with Go's function names, "unexpected newline", ...).
+#  - fscan reads its reader one byte at a time, as Go does for a reader
+#    without ReadRune (so a byte after the scanned text may be consumed).
+#  - The `-quickchecks`-like knobs, `Sprint` of `nil`, %p and pointers:
+#    alx has no pointers or nil.
 
-# The verbs this package understands (for reference).
-pub def verbs() -> Str {
-  "%v %d %s %q %t %f %e %E %x %X %o %b %c %T %%"
+# The state a Formatter's `format` method writes to (Go's State).
+pub struct State {
+  st: [StateData]
+
+  # Writes p to the formatted output (an io.Writer).
+  pub def write!(p: [Byte]) -> Int {
+    for b in p {
+      self.st[0].out << b
+    }
+    p.size
+  }
+
+  # The width, if the directive has one (Go's Width).
+  pub def width -> Int? {
+    d = st[0]
+    return none if d.flags & 32 == 0
+    d.wid
+  }
+
+  # The precision, if the directive has one (Go's Precision).
+  pub def precision -> Int? {
+    d = st[0]
+    return none if d.flags & 64 == 0
+    d.prec
+  }
+
+  # Whether flag c (`-`, `+`, `#`, ` `, `0`, as a character code) was given
+  # (Go's Flag).
+  pub def flag?(c: Int) -> Bool {
+    f = st[0].flags
+    case c {
+      45 => f & 1 != 0
+      43 => f & 2 != 0 || f & 128 != 0
+      35 => f & 4 != 0 || f & 256 != 0
+      32 => f & 8 != 0
+      48 => f & 16 != 0
+      _ => false
+    }
+  }
+
+  # What has been written.
+  pub def text -> Str { Str.from_bytes(st[0].out) }
+}
+
+struct StateData {
+  out: [Byte]
+  flags: Int
+  wid: Int
+  prec: Int
+}
+
+# A Formatter's text for one directive (the compiler calls this).
+pub def __format_with[T](x: T, verb: Int, flags: Int, wid: Int, prec: Int) -> Str {
+  e: [Byte] = []
+  s = State.new(st: [StateData.new(out: e, flags: flags, wid: wid, prec: prec)])
+  x.format(s, verb.as_i32)
+  s.text
 }

@@ -597,6 +597,10 @@ pub fn separable(p: &Package) -> bool {
         && !m.consts.iter().any(|c| matches!(c.value.kind, crate::ast::ExprKind::Array(_) | crate::ast::ExprKind::ArrayRepeat(..)))
         // The builtin Complex is declared with the program.
         && !uses_complex(&p.source)
+        // Formats with flags reach the fmt engine, declared with the program (builtin.alx).
+        && !["format(", "printf(", "sprintf(", "errorf("].iter().any(|f| p.source.contains(f))
+        // So is `==` on maps (`__map_eq`).
+        && !(p.source.contains("Map[") && (p.source.contains("==") || p.source.contains("!=")))
         // Embedded files aren't part of the source the cache is keyed by.
         && !m.consts.iter().any(|c| c.embed.is_some())
 }

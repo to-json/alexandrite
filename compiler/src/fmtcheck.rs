@@ -268,6 +268,21 @@ pub(super) fn alx_lit(s: &str) -> String {
     o
 }
 
+/// Flags, width and precision as engine arguments (text).
+fn fmt_nums(d: &Dir, names: &[String]) -> (String, String, String) {
+    let num = |n: &Num| match n {
+        Num::None => "0".to_string(),
+        Num::Lit(v) => v.to_string(),
+        Num::Arg(k) => format!("{}.to_i", names[*k]),
+    };
+    let flags = d.flags;
+    let (wid, prec) = (num(&d.wid), num(&d.prec));
+    let star = matches!(d.wid, Num::Arg(_)) || matches!(d.prec, Num::Arg(_));
+    let fl = if star { format!("__fmt_star({flags}, {wid}, {}, {prec}, {})", matches!(d.wid, Num::Arg(_)), matches!(d.prec, Num::Arg(_))) } else { flags.to_string() };
+    let wid = if matches!(d.wid, Num::Arg(_)) { format!("__fmt_abs({wid})") } else { wid };
+    (fl, wid, prec)
+}
+
 fn is_int(t: &Ty) -> bool {
     t.int_kind().is_some()
 }
@@ -334,6 +349,10 @@ impl<'w, 'a> FnCx<'w, 'a> {
                         if !allow_w {
                             return Err(Diag::new(fsp, format!("`{name}`: `%w` wraps an error: only `fmt.errorf` takes it")));
                         }
+                        let t = &tys[d.arg];
+                        if *t != Ty::Error && self.w.error_index(t).is_none() {
+                            return Err(Diag::new(args[d.arg + 1].span, format!("`{name}`: `%w` wraps an error, not a {}", t.show())));
+                        }
                         wrapped.push(d.arg);
                     }
                     let t = tys[d.arg].clone();
@@ -358,10 +377,31 @@ impl<'w, 'a> FnCx<'w, 'a> {
         if verb == 'T' {
             return Ok(FmtPiece::Lit(t.show()));
         }
+        // Go's Formatter: a type with `def format(f: fmt.State, verb: Rune)`
+        // prints itself, for every verb.
+        if let (Some(tn), Some(&fdef)) = (t.type_name(), self.w.by_name.get("fmt.__format_with")) {
+            if self.w.by_name.contains_key(&method_name(tn, "format")) {
+                let (fl, wid, prec) = fmt_nums(d, names);
+                let mut a = vec![v];
+                for txt in [(d.verb as u32).to_string(), fl, wid, prec] {
+                    a.push(self.fmt_expand(&txt, asp)?);
+                }
+                let e = self.call_def(fdef, "__format_with", asp, a, asp)?;
+                vals.push(e);
+                return Ok(FmtPiece::Str(k));
+            }
+        }
         // The runtime's own pieces, for the plain forms.
         let int = is_int(t);
+        // (The runtime's `%v` shows a type through its to_s; an error type
+        // shows its message, and a GoStringer's %#v isn't plain.)
         let stringer = self.fmt_stringer(t);
-        if plain && !stringer.is_some_and(|_| verb != 'v') {
+        let runtime_ok = match stringer {
+            None => true,
+            Some("to_s") => verb == 'v',
+            Some(_) => verb == 'v' && *t == Ty::Error,
+        };
+        if plain && runtime_ok {
             let piece = match (verb, t) {
                 ('v', _) if printable(t) && !matches!(t, Ty::Fn(..)) => {
                     self.stringers(t, asp)?;
@@ -394,13 +434,10 @@ impl<'w, 'a> FnCx<'w, 'a> {
             }
         }
         // Everything else: engine text over the argument's local.
-        let LocalName = |x: &TExpr| -> String {
-            match &x.kind {
-                TK::Local(id) => self.locals[*id].name.clone(),
-                _ => unreachable!("format arguments are locals"),
-            }
+        let vname = match &v.kind {
+            TK::Local(id) => self.locals[*id].name.clone(),
+            _ => unreachable!("format arguments are locals"),
         };
-        let vname = LocalName(&v);
         let text = self.fmt_text(name, d, verb, &vname, t, names, asp).map_err(|m| match m {
             FmtErr::Bad(what) => bad(&what),
             FmtErr::Diag(dg) => dg,
@@ -423,6 +460,10 @@ impl<'w, 'a> FnCx<'w, 'a> {
         if self.w.by_name.contains_key(&method_name(tn, "to_s")) {
             return Some("to_s");
         }
+        // An error type's message (Go's Error method).
+        if self.w.error_index(t).is_some() && self.w.by_name.contains_key(&method_name(tn, "message")) {
+            return Some("message");
+        }
         None
     }
 
@@ -431,16 +472,7 @@ impl<'w, 'a> FnCx<'w, 'a> {
     fn fmt_text(&mut self, name: &str, d: &Dir, verb: char, x: &str, t: &Ty, names: &[String], asp: Span) -> Result<String, FmtErr> {
         let flags = d.flags;
         let sharpv = flags & F_SHARPV != 0;
-        // Flags, width and precision as engine arguments.
-        let num = |n: &Num| match n {
-            Num::None => "0".to_string(),
-            Num::Lit(v) => v.to_string(),
-            Num::Arg(k) => format!("{}.to_i", names[*k]),
-        };
-        let (wid, prec) = (num(&d.wid), num(&d.prec));
-        let star = matches!(d.wid, Num::Arg(_)) || matches!(d.prec, Num::Arg(_));
-        let fl = if star { format!("__fmt_star({flags}, {wid}, {}, {prec}, {})", matches!(d.wid, Num::Arg(_)), matches!(d.prec, Num::Arg(_))) } else { flags.to_string() };
-        let wid = if matches!(d.wid, Num::Arg(_)) { format!("__fmt_abs({wid})") } else { wid };
+        let (fl, wid, prec) = fmt_nums(d, names);
         let v = verb as u32;
         let (spec, extra) = spec_text(d, names);
         let each = |e: &str| -> String {
@@ -450,14 +482,15 @@ impl<'w, 'a> FnCx<'w, 'a> {
             format!("format({})", a.join(", "))
         };
         // Go's handleMethods: a Stringer or error shows its text for v s x X q.
-        if let Some(m) = self.fmt_stringer(t) {
-            if sharpv {
-                if let Some(tn) = t.type_name() {
-                    if self.w.by_name.contains_key(&method_name(tn, "go_string")) {
-                        return Ok(format!("__fmt_str({x}.go_string, 115, {fl} &^ 256, {wid}, {prec})"));
-                    }
+        if sharpv {
+            if let Some(tn) = t.type_name() {
+                if self.w.by_name.contains_key(&method_name(tn, "go_string")) {
+                    return Ok(format!("__fmt_str({x}.go_string, 115, {fl} &^ 256, {wid}, {prec})"));
                 }
-            } else if matches!(verb, 'v' | 's' | 'x' | 'X' | 'q') {
+            }
+        }
+        if let Some(m) = self.fmt_stringer(t) {
+            if !sharpv && matches!(verb, 'v' | 's' | 'x' | 'X' | 'q') {
                 return Ok(format!("__fmt_str({x}.{m}, {v}, {fl}, {wid}, {prec})"));
             }
         }
@@ -555,6 +588,11 @@ impl<'w, 'a> FnCx<'w, 'a> {
     /// else shows the error's message in a new Failure.
     pub(super) fn errorf(&mut self, args: &[Expr], sp: Span) -> R<TExpr> {
         if let Some(Expr { kind: ExprKind::Str(f), span: fsp, id }) = args.first() {
+            if f == "%w" && args.len() == 2 {
+                // The error itself.
+                let e = self.value(&args[1])?;
+                return self.to_error(e);
+            }
             if args.len() >= 2 && f.ends_with(": %w") && f.matches("%w").count() == 1 && !f.contains("%[") && !f.contains('*') {
                 let prefix = f[..f.len() - 4].to_string();
                 let mut pargs = vec![Expr { id: *id, kind: ExprKind::Str(prefix), span: *fsp }];
@@ -573,6 +611,142 @@ impl<'w, 'a> FnCx<'w, 'a> {
         }
         pre.push(TStmt::Expr(e));
         Ok(self.mk(TK::Seq(pre), Ty::Error, sp))
+    }
+
+    /// Go's Sprint (`line`: Sprintln) of the operands: each as `%v`, spaces
+    /// between operands when neither is a Str (always for Sprintln).
+    pub(super) fn print_text(&mut self, name: &str, args: &[Expr], line: bool, sp: Span) -> R<TExpr> {
+        let mut pre = vec![];
+        let mut pieces = vec![];
+        let mut vals = vec![];
+        let mut prev: Option<Ty> = None;
+        for a in args {
+            let v = self.value(a)?;
+            let t = self.resolve(&v.ty);
+            let (id, st) = self.opt_tmp(v, a.span);
+            pre.push(st);
+            if let Some(p) = &prev {
+                if line || (*p != Ty::Str && t != Ty::Str) {
+                    pieces.push(FmtPiece::Lit(" ".into()));
+                }
+            }
+            let l = self.mk(TK::Local(id), t.clone(), a.span);
+            let d = Dir { flags: 0, wid: Num::None, prec: Num::None, verb: 'v', arg: 0 };
+            let piece = self.fmt_piece_for(name, &d, l, &t, &[], a.span, &mut vals)?;
+            pieces.push(piece);
+            prev = Some(t);
+        }
+        if line {
+            pieces.push(FmtPiece::Lit("\n".into()));
+        }
+        let f = self.mk(TK::Format(pieces, vals), Ty::Str, sp);
+        if pre.is_empty() {
+            return Ok(f);
+        }
+        pre.push(TStmt::Expr(f));
+        Ok(self.mk(TK::Seq(pre), Ty::Str, sp))
+    }
+
+    /// The text of fmt's printing functions: `f` formats, `ln` lines.
+    pub(super) fn print_any(&mut self, name: &str, args: &[Expr], sp: Span) -> R<TExpr> {
+        if name.ends_with('f') {
+            self.format(name, args, sp)
+        } else {
+            self.print_text(name, args, name.ends_with("ln"), sp)
+        }
+    }
+
+    /// `fmt.fprintf(w, ...)` / `fmt.appendf(b, ...)` and friends: the text,
+    /// then written to w (`~Int`, Go's (n, err)) or appended to b.
+    pub(super) fn fmt_to(&mut self, name: &str, args: &[Expr], sp: Span) -> R<TExpr> {
+        let Some((first, rest)) = args.split_first() else {
+            return Err(Diag::new(sp, format!("`fmt.{name}` takes a {} first", if name.starts_with('f') { "writer" } else { "[Byte]" })));
+        };
+        let base = &name[if name.starts_with('f') { 1 } else { 6 }..];
+        let base = if base.is_empty() { "print".to_string() } else { format!("print{base}") };
+        let target = self.value(first)?;
+        let text = self.print_any(&format!("fmt.{name}"), rest, sp)?;
+        let (def, short) = if name.starts_with('f') { ("fmt.__fwrite", "__fwrite") } else { ("__fmt_append", "__fmt_append") };
+        let _ = base;
+        let Some(&d) = self.w.by_name.get(def) else {
+            return Err(Diag::new(sp, format!("`fmt.{name}` needs the fmt package's own code (import \"fmt\")")));
+        };
+        let saved = std::mem::replace(&mut self.under_try, false);
+        let r = self.call_def(d, short, sp, vec![target, text], sp);
+        self.under_try = saved;
+        r
+    }
+
+    /// `fmt.sscan(input, a, b)` and the other scans: Go's Sscan with places
+    /// (locals, fields, elements) where Go takes pointers. Each place gets
+    /// the scanner method for its type; the value is the count (`~Int`:
+    /// the error that stopped the scan, the places filled so far keep
+    /// their values).
+    pub(super) fn fmt_scan(&mut self, name: &str, args: &[Expr], sp: Span) -> R<TExpr> {
+        let from = if name.starts_with("ss") { 1 } else if name.starts_with('f') { 1 } else { 0 };
+        let scanf = name.ends_with('f');
+        let (nl_space, nl_end) = if scanf { (false, false) } else if name.ends_with("ln") { (false, true) } else { (true, false) };
+        let nfixed = from + scanf as usize;
+        if args.len() < nfixed {
+            return Err(Diag::new(sp, format!("`fmt.{name}` takes {} first", if scanf { "the input and a format" } else { "the input" })));
+        }
+        let mut sargs = vec![];
+        if from == 1 {
+            sargs.push(self.value(&args[0])?);
+        }
+        sargs.push(self.mk(TK::Bool(nl_space), Ty::Bool, sp));
+        sargs.push(self.mk(TK::Bool(nl_end), Ty::Bool, sp));
+        sargs.push(if scanf { self.value(&args[from])? } else { self.mk(TK::Str(String::new()), Ty::Str, sp) });
+        let (def, short) = if name.starts_with("ss") {
+            ("fmt.__scan_str", "__scan_str")
+        } else if name.starts_with('f') {
+            ("fmt.__scan_reader", "__scan_reader")
+        } else {
+            ("fmt.__scan_stdin", "__scan_stdin")
+        };
+        let Some(&d) = self.w.by_name.get(def) else {
+            return Err(Diag::new(sp, format!("`fmt.{name}` needs the fmt package's own code (import \"fmt\")")));
+        };
+        let state = self.call_def(d, short, sp, sargs, sp)?;
+        let (sid, st) = self.opt_tmp(state, sp);
+        let s = self.locals[sid].name.clone();
+        let mut stmts = vec![st];
+        for (k, p) in args[nfixed..].iter().enumerate() {
+            let pv = self.value(p)?;
+            let t = self.resolve(&pv.ty);
+            // The place counts as used (Go: &x), whether or not it is read later.
+            stmts.push(TStmt::Expr(pv));
+            let place = self.w.sm.snippet(p.span).trim().to_string();
+            let verb = if scanf { format!("{s}.next_verb!") } else { "118".to_string() };
+            let (call, conv) = match &t {
+                Ty::Int => (format!("scan_int!({verb}, 64)"), String::new()),
+                Ty::IntK(k) if k.signed() => (format!("scan_int!({verb}, {})", k.bits()), format!(".as_{}", k.name().to_lowercase())),
+                Ty::IntK(k) => (format!("scan_uint!({verb}, {})", k.bits()), format!(".as_{}", k.name().to_lowercase())),
+                Ty::Float => (format!("scan_float!({verb})"), String::new()),
+                _ if is_complex(&t) => (format!("scan_complex!({verb})"), String::new()),
+                Ty::Str => (format!("scan_string!({verb})"), String::new()),
+                Ty::Bool => (format!("scan_bool!({verb})"), String::new()),
+                _ if is_bytes(&t) && matches!(t, Ty::Array(_)) => (format!("scan_string!({verb})"), ".bytes.to_a".to_string()),
+                _ => return Err(Diag::new(p.span, format!("`fmt.{name}` can't scan into a {}", t.show()))),
+            };
+            let text = format!("(if __sv{k} = {s}.{call} {{ {place} = __sv{k}{conv}; nil }} else {{ nil }})");
+            let e = self.fmt_expand(&text, p.span)?;
+            stmts.push(TStmt::Expr(e));
+        }
+        if nl_end {
+            stmts.push(TStmt::Expr(self.fmt_expand(&format!("{s}.finish_ln!"), sp)?));
+        }
+        if scanf {
+            stmts.push(TStmt::Expr(self.fmt_expand(&format!("{s}.finish_f!"), sp)?));
+        }
+        // A ~Int value (a `~` around the scan propagates it, as for a held result).
+        let saved = std::mem::replace(&mut self.under_try, false);
+        let res = self.fmt_expand(&format!("{s}.result"), sp);
+        self.under_try = saved;
+        let res = res?;
+        let ty = res.ty.clone();
+        stmts.push(TStmt::Expr(res));
+        Ok(self.mk(TK::Seq(stmts), ty, sp))
     }
 
     /// Check generated alx text (an expression) in the current scope.

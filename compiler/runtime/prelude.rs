@@ -501,6 +501,7 @@ mod rt {
     }
     pub unsafe fn shim_alx_sys_fstat(fd: i32, out: *mut u8) -> i32 {
         use std::os::fd::FromRawFd;
+        if fd < 0 { return -sysc("EBADF"); }
         let f = std::mem::ManuallyDrop::new(unsafe { std::fs::File::from_raw_fd(fd) });
         match f.metadata() {
             Ok(m) => {
@@ -589,9 +590,21 @@ mod rt {
         fn pipe(fds: *mut i32) -> i32;
         fn wait4(pid: i32, status: *mut i32, options: i32, ru: *mut i64) -> i32;
     }
+    /// A child's stdio from `fd` (negative: inherit): a close-on-exec
+    /// duplicate, or the negated errno if it can't be duplicated.
+    fn child_stdio(fd: i64) -> Result<std::process::Stdio, i64> {
+        use std::os::fd::FromRawFd;
+        if fd < 0 {
+            return Ok(std::process::Stdio::inherit());
+        }
+        let d = unsafe { libc_fcntl(fd as i32, sysc("F_DUPFD_CLOEXEC"), 3) };
+        if d < 0 {
+            return Err(neg_errno(&std::io::Error::last_os_error()));
+        }
+        Ok(std::process::Stdio::from(unsafe { std::fs::File::from_raw_fd(d) }))
+    }
     #[allow(clippy::too_many_arguments)]
     pub unsafe fn shim_alx_sys_spawn(argv: *mut u8, argc: i64, env: *mut u8, envc: i64, dir: *const std::ffi::c_char, fd0: i64, fd1: i64, fd2: i64) -> i64 {
-        use std::os::fd::FromRawFd;
         let av = unsafe { nul_list(argv, argc) };
         let mut cmd = std::process::Command::new(&av[0]);
         cmd.args(&av[1..]);
@@ -607,8 +620,11 @@ mod rt {
         if !d.as_os_str().is_empty() {
             cmd.current_dir(d);
         }
-        let io = |fd: i64| if fd < 0 { std::process::Stdio::inherit() } else { unsafe { std::process::Stdio::from(std::fs::File::from_raw_fd(libc_fcntl(fd as i32, sysc("F_DUPFD_CLOEXEC"), 3))) } };
-        cmd.stdin(io(fd0)).stdout(io(fd1)).stderr(io(fd2));
+        let (i0, i1, i2) = match (child_stdio(fd0), child_stdio(fd1), child_stdio(fd2)) {
+            (Ok(a), Ok(b), Ok(c)) => (a, b, c),
+            (Err(e), _, _) | (_, Err(e), _) | (_, _, Err(e)) => return e,
+        };
+        cmd.stdin(i0).stdout(i1).stderr(i2);
         match cmd.spawn() {
             Ok(c) => c.id() as i64,
             Err(e) => neg_errno(&e),
@@ -637,7 +653,6 @@ mod rt {
     }
     pub unsafe fn shim_alx_sys_exec(argv: *mut u8, argc: i64, env: *mut u8, envc: i64, dir: *const std::ffi::c_char, fd0: i64, fd1: i64, fd2: i64) -> i64 {
         use std::os::unix::process::CommandExt;
-        use std::os::fd::FromRawFd;
         let av = unsafe { nul_list(argv, argc) };
         let mut cmd = std::process::Command::new(&av[0]);
         cmd.args(&av[1..]);
@@ -653,8 +668,11 @@ mod rt {
         if !d.as_os_str().is_empty() {
             cmd.current_dir(d);
         }
-        let io = |fd: i64| if fd < 0 { std::process::Stdio::inherit() } else { unsafe { std::process::Stdio::from(std::fs::File::from_raw_fd(libc_fcntl(fd as i32, sysc("F_DUPFD_CLOEXEC"), 3))) } };
-        cmd.stdin(io(fd0)).stdout(io(fd1)).stderr(io(fd2));
+        let (i0, i1, i2) = match (child_stdio(fd0), child_stdio(fd1), child_stdio(fd2)) {
+            (Ok(a), Ok(b), Ok(c)) => (a, b, c),
+            (Err(e), _, _) | (_, Err(e), _) | (_, _, Err(e)) => return e,
+        };
+        cmd.stdin(i0).stdout(i1).stderr(i2);
         use std::io::Write;
         let _ = std::io::stdout().flush();
         neg_errno(&cmd.exec())
@@ -740,6 +758,7 @@ mod rt {
     }
     pub unsafe fn shim_alx_sock_accept(fd: i64, out: *mut u8) -> i64 {
         use std::os::fd::{FromRawFd, IntoRawFd};
+        if fd < 0 { return -(sysc("EBADF") as i64); }
         let l = std::mem::ManuallyDrop::new(unsafe { std::net::TcpListener::from_raw_fd(fd as i32) });
         match l.accept() {
             Ok((s, a)) => {
@@ -773,6 +792,7 @@ mod rt {
         f(&s)
     }
     pub unsafe fn shim_alx_sock_error(fd: i64) -> i64 {
+        if fd < 0 { return sysc("EBADF") as i64; }
         with_stream(fd, |s| match s.take_error() {
             Ok(None) => 0,
             Ok(Some(e)) => e.raw_os_error().unwrap_or(5) as i64,
@@ -780,24 +800,28 @@ mod rt {
         })
     }
     pub unsafe fn shim_alx_sock_local_addr(fd: i64, out: *mut u8) -> i64 {
+        if fd < 0 { return -(sysc("EBADF") as i64); }
         with_stream(fd, |s| match s.local_addr() {
             Ok(a) => put_addr(a, out),
             Err(e) => net_err(&e),
         })
     }
     pub unsafe fn shim_alx_sock_peer_addr(fd: i64, out: *mut u8) -> i64 {
+        if fd < 0 { return -(sysc("EBADF") as i64); }
         with_stream(fd, |s| match s.peer_addr() {
             Ok(a) => put_addr(a, out),
             Err(e) => net_err(&e),
         })
     }
     pub unsafe fn shim_alx_sock_set_nodelay(fd: i64, on: i64) -> i64 {
+        if fd < 0 { return -(sysc("EBADF") as i64); }
         with_stream(fd, |s| match s.set_nodelay(on != 0) {
             Ok(()) => 0,
             Err(e) => net_err(&e),
         })
     }
     pub unsafe fn shim_alx_sock_shutdown(fd: i64, how: i64) -> i64 {
+        if fd < 0 { return -(sysc("EBADF") as i64); }
         let h = match how {
             0 => std::net::Shutdown::Read,
             1 => std::net::Shutdown::Write,
@@ -835,10 +859,15 @@ mod rt {
     const SIGW: usize = 64;
     static SIG_MASK: [std::sync::atomic::AtomicU64; SIGW] = [const { std::sync::atomic::AtomicU64::new(0) }; SIGW];
     static SIG_WFD: [std::sync::atomic::AtomicI32; SIGW] = [const { std::sync::atomic::AtomicI32::new(-1) }; SIGW];
+    /// Handlers running right now: `unwatch` waits for none before it closes a pipe.
+    static SIG_BUSY: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     // (read fds per slot, handled, ignored)
     static SIG_STATE: std::sync::Mutex<([i32; SIGW], u64, u64)> = std::sync::Mutex::new(([-1; SIGW], 0, 0));
     extern "C" fn sig_handler(sig: i32) {
         use std::sync::atomic::Ordering::SeqCst;
+        // write(2) may set errno: the interrupted code must not see that.
+        let saved = unsafe { *errno_loc() };
+        SIG_BUSY.fetch_add(1, SeqCst);
         let bit = 1u64 << sig;
         for i in 0..SIGW {
             if SIG_MASK[i].load(SeqCst) & bit != 0 {
@@ -849,6 +878,8 @@ mod rt {
                 }
             }
         }
+        SIG_BUSY.fetch_sub(1, SeqCst);
+        unsafe { *errno_loc() = saved };
     }
     fn sig_catchable(s: i64) -> bool {
         s != sysc("SIGKILL") as i64 && s != sysc("SIGSTOP") as i64
@@ -895,6 +926,10 @@ mod rt {
                 SIG_MASK[i].store(0, SeqCst);
                 let w = SIG_WFD[i].swap(-1, SeqCst);
                 if w >= 0 {
+                    // A handler that read the old descriptor is still counted in.
+                    while SIG_BUSY.load(SeqCst) != 0 {
+                        std::hint::spin_loop();
+                    }
                     unsafe { close(w) };
                 }
                 st.0[i] = -1;

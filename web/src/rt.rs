@@ -26,7 +26,8 @@ pub struct Local {
     /// Aggregate results: up to three words (read back by generated code
     /// at `ret_addr()`, which each thread's program instance imports).
     ret: [i64; 4],
-    chunks: Vec<Vec<u8>>,
+    /// Chunks of words, so every block is 8-aligned.
+    chunks: Vec<Vec<u64>>,
     cur: usize,
     end: usize,
     bigs: Vec<Box<BigInt>>,
@@ -38,13 +39,16 @@ thread_local! {
     static LOCAL: UnsafeCell<Local> = const { UnsafeCell::new(Local { ret: [0; 4], chunks: Vec::new(), cur: 0, end: 0, bigs: Vec::new(), p10: Vec::new() }) };
 }
 
-/// This thread's state (never shared: no other thread touches it).
-pub fn lo() -> &'static mut Local {
-    LOCAL.with(|l| unsafe { &mut *l.get() })
+/// This thread's state (never shared: no other thread touches it). A raw
+/// pointer, so two `&mut Local` are never alive at once: borrow through it
+/// for one statement or one small function, never across a call that
+/// reaches `lo()` again (`alloc`, `ret`, `new_bytes`, `pint`, `p10`).
+pub fn lo() -> *mut Local {
+    LOCAL.with(|l| l.get())
 }
 
 pub fn ret_addr() -> i64 {
-    lo().ret.as_ptr() as usize as i64
+    unsafe { (&raw const (*lo()).ret) as usize as i64 }
 }
 
 /// State shared by every thread of a run.
@@ -70,7 +74,7 @@ const CHUNK: usize = 1 << 20;
 
 /// Free this thread's arena (the previous run's memory).
 pub fn reset_local() {
-    let l = lo();
+    let l = unsafe { &mut *lo() };
     l.chunks.clear();
     l.cur = 0;
     l.end = 0;
@@ -114,10 +118,11 @@ pub(crate) fn stop(how: Stop) -> ! {
 
 pub(crate) fn alloc(n: usize) -> usize {
     let n = (n.max(1) + 7) & !7;
-    let s = lo();
+    let s = unsafe { &mut *lo() };
     if s.end - s.cur < n {
         let size = n.max(CHUNK);
-        let mut v = Vec::<u8>::with_capacity(size);
+        // `n` and CHUNK are multiples of 8, so `size` is too.
+        let mut v = Vec::<u64>::with_capacity(size / 8);
         let p = v.as_mut_ptr() as usize;
         s.chunks.push(v);
         if n >= CHUNK {
@@ -143,7 +148,8 @@ pub(crate) fn new_bytes(b: &[u8]) -> i64 {
 }
 
 pub(crate) fn ret(words: &[i64]) {
-    lo().ret[..words.len()].copy_from_slice(words);
+    let l = unsafe { &mut *lo() };
+    l.ret[..words.len()].copy_from_slice(words);
 }
 
 pub(crate) fn ret_str(b: &[u8]) {
@@ -554,7 +560,8 @@ fn pint(x: BigInt) -> [i64; 2] {
         None => {
             let bx = Box::new(x);
             let p = &*bx as *const BigInt as usize as i64;
-            lo().bigs.push(bx);
+            let l = unsafe { &mut *lo() };
+            l.bigs.push(bx);
             [0, p]
         }
     }
@@ -696,8 +703,10 @@ pub extern "C" fn alxr_p_ndigits(v: i64, b: i64) -> i64 {
     d as i64 + x.is_negative() as i64
 }
 
+/// 10**k. The reference is only good until the next `p10` call on this
+/// thread (the table may grow and move): use it at once.
 fn p10(k: usize) -> &'static BigInt {
-    let t = &mut lo().p10;
+    let t = unsafe { &mut (*lo()).p10 };
     if t.is_empty() {
         t.push(BigInt::one());
     }
@@ -705,7 +714,7 @@ fn p10(k: usize) -> &'static BigInt {
         let next = t.last().unwrap() * 10u32;
         t.push(next);
     }
-    &lo().p10[k]
+    &t[k]
 }
 
 #[unsafe(no_mangle)]

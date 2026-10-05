@@ -118,6 +118,8 @@ struct Graph<'a> {
     ifaces: &'a Ifaces,
     edges: HashMap<Node, Vec<Node>>,
     sites: Vec<usize>,
+    /// Each site's expression (sites are keyed by address).
+    site_exprs: HashMap<usize, &'a TExpr>,
     /// The loops (innermost last) around the walk's current point, and
     /// each site's.
     loops: Vec<usize>,
@@ -164,7 +166,7 @@ impl<'a> Graph<'a> {
     /// The nodes an expression's value may refer to (walking it, adding
     /// the edges its effects create). A value with no storage (an Int, a
     /// Bool) refers to nothing.
-    fn expr(&mut self, e: &TExpr) -> Vec<Node> {
+    fn expr(&mut self, e: &'a TExpr) -> Vec<Node> {
         let saved = std::mem::replace(&mut self.at, e.span);
         let v = self.expr_nodes(e);
         self.at = saved;
@@ -172,7 +174,7 @@ impl<'a> Graph<'a> {
         if has_storage(&e.ty) || (promote && contains_int(&e.ty)) { v } else { vec![] }
     }
 
-    fn expr_nodes(&mut self, e: &TExpr) -> Vec<Node> {
+    fn expr_nodes(&mut self, e: &'a TExpr) -> Vec<Node> {
         let mut v = vec![];
         let promote = self.f.overflow == crate::ast::Overflow::Promote;
         // A call whose result has no storage (an Int, a Bool, ...) puts nothing in the
@@ -186,6 +188,7 @@ impl<'a> Graph<'a> {
         if allocates(e, promote) && !scalar_call {
             let s = site(e);
             self.sites.push(e as *const TExpr as usize);
+            self.site_exprs.insert(e as *const TExpr as usize, e);
             self.site_loops.insert(e as *const TExpr as usize, self.loops.clone());
             v.push(s);
         }
@@ -326,7 +329,7 @@ impl<'a> Graph<'a> {
                         if is_loop {
                             self.loops.push(e as *const TExpr as usize);
                             self.loop_at.insert(e as *const TExpr as usize, e.span);
-                            self.loop_bodies.insert(e as *const TExpr as usize, b.body.iter().map(|s| unsafe_stmt(s)).collect());
+                            self.loop_bodies.insert(e as *const TExpr as usize, b.body.iter().collect());
                         }
                         for s in &b.body {
                             let sv = self.stmt(s);
@@ -389,10 +392,8 @@ impl<'a> Graph<'a> {
             }
             _ => {
                 let mut kids = vec![];
-                crate::prove::each_child(e, &mut |c| kids.push(c as *const TExpr));
+                crate::prove::each_child(e, &mut |c| kids.push(c));
                 for c in kids {
-                    // SAFETY-free: `c` points into `e`, which outlives this call.
-                    let c = unsafe_ref(c);
                     v.extend(self.expr(c));
                 }
             }
@@ -402,7 +403,7 @@ impl<'a> Graph<'a> {
 
     /// Walk a statement; returns the nodes of its value (an expression
     /// statement's), for block results.
-    fn stmt(&mut self, s: &TStmt) -> Vec<Node> {
+    fn stmt(&mut self, s: &'a TStmt) -> Vec<Node> {
         match s {
             TStmt::Expr(e) => self.expr(e),
             TStmt::MultiAssign(ls, es) => {
@@ -419,7 +420,7 @@ impl<'a> Graph<'a> {
                 let key = s as *const TStmt as usize;
                 self.loop_at.insert(key, c.span);
                 self.loops.push(key);
-                self.loop_bodies.insert(key, b.iter().map(|s| unsafe_stmt(s)).collect());
+                self.loop_bodies.insert(key, b.iter().collect());
                 for s in b {
                     self.stmt(s);
                 }
@@ -473,19 +474,8 @@ pub fn has_storage(t: &Ty) -> bool {
     }
 }
 
-fn unsafe_stmt<'b>(s: &TStmt) -> &'b TStmt {
-    // Statements of the function being analyzed, which outlives the graph.
-    unsafe { &*(s as *const TStmt) }
-}
-
-fn unsafe_ref<'b>(p: *const TExpr) -> &'b TExpr {
-    // The children collected by `each_child` borrow from the tree being
-    // walked, which outlives the walk.
-    unsafe { &*p }
-}
-
 fn graph<'a>(f: &'a TFunc, sums: &'a [Summary], ifaces: &'a Ifaces) -> Graph<'a> {
-    let mut g = Graph { f, sums, ifaces, edges: HashMap::new(), sites: vec![], loops: vec![], site_loops: HashMap::new(), loop_bodies: HashMap::new(), mutations: vec![], defs: vec![], at: f.span, why_global: HashMap::new(), loop_at: HashMap::new() };
+    let mut g = Graph { f, sums, ifaces, edges: HashMap::new(), sites: vec![], site_exprs: HashMap::new(), loops: vec![], site_loops: HashMap::new(), loop_bodies: HashMap::new(), mutations: vec![], defs: vec![], at: f.span, why_global: HashMap::new(), loop_at: HashMap::new() };
     // Writing into a parameter's storage writes into the caller's objects.
     for p in &f.params {
         g.edge(Node::Local(*p), Node::Caller(*p));
@@ -934,11 +924,11 @@ pub fn explain(p: &TProgram, sm: &crate::diag::SourceMap, files: &[u32]) -> Stri
         let name = if f.is_main { "(top level)".to_string() } else { f.src_name.clone() };
         let mut lines = String::new();
         let mut sites: Vec<usize> = g.sites.clone();
-        sites.sort_by_key(|s| unsafe_ref(*s as *const TExpr).span.lo);
+        sites.sort_by_key(|s| g.site_exprs[s].span.lo);
         sites.dedup();
         let mut shown = std::collections::HashSet::new();
         for s in sites {
-            let e = unsafe_ref(s as *const TExpr);
+            let e = g.site_exprs[&s];
             let snip: String = sm.snippet(e.span).lines().next().unwrap_or("").chars().take(32).collect();
             let in_loop = g.site_loops.get(&s).is_some_and(|l| !l.is_empty());
             let loop_at = |key: usize| match g.loop_at.get(&key) {

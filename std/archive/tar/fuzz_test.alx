@@ -1,0 +1,78 @@
+# Go's FuzzReader, run over its seed, every testdata archive, and
+# deterministic mutations of the seed's header block (with and without a
+# fixed checksum): reading must not panic, and whatever reads back must
+# write again.
+
+import "bytes"
+import "io"
+
+LOREM = "Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat. Duis aute irure dolor in reprehenderit in voluptate velit esse cillum dolore eu fugiat nulla pariatur. Excepteur sint occaecat cupidatat non proident, sunt in culpa qui officia deserunt mollit anim id est laborum."
+
+def fuzz_seed -> ~[Byte] {
+  b = bytes.new_buffer([])
+  w = new_writer(b)
+  w.~write_header!(Header.new(name: "lorem.txt", mode: 0o600, size: LOREM.size))
+  w.~write!(LOREM.bytes.to_a)
+  w.~close!
+  b.bytes
+}
+
+struct FuzzFile {
+  header: Header
+  content: [Byte]
+}
+
+def fuzz_reader(data: [Byte]) -> ~Unit {
+  r = new_reader(bytes.new_reader(data))
+  files: [FuzzFile] = []
+  loop {
+    h = r.next!
+    break if h.err.some?
+    hdr = h.unwrap
+    break if hdr.none?
+    buf = bytes.new_buffer([])
+    c = io.copy(buf, r)
+    next if c.err.some?
+    files << FuzzFile.new(header: hdr.unwrap, content: buf.bytes)
+  }
+  return if files.size == 0
+  out = bytes.new_buffer([])
+  w = new_writer(out)
+  for f in files {
+    wh = w.write_header!(f.header)
+    assert wh.ok?, "unable to write previously parsed header #{f.header.name}: #{msg_of(wh.err)}"
+    ww = w.write!(f.content)
+    assert ww.ok?, "unable to write previously parsed content of #{f.header.name}: #{msg_of(ww.err)}"
+  }
+  assert w.close!.ok?, "unable to write archive"
+}
+
+test "fuzz reader seed" {
+  ~fuzz_reader(~fuzz_seed)
+}
+
+test "fuzz reader testdata" {
+  for name in ["gnu.tar", "sparse-formats.tar", "star.tar", "v7.tar", "pax.tar", "pax-bad-hdr-file.tar", "pax-bad-mtime-file.tar", "pax-pos-size-file.tar", "pax-records.tar", "pax-global-records.tar", "nil-uid.tar", "xattrs.tar", "gnu-multi-hdrs.tar", "pax-multi-hdrs.tar", "gnu-long-nul.tar", "gnu-utf8.tar", "gnu-not-utf8.tar", "pax-nul-xattrs.tar", "pax-nul-path.tar", "neg-size.tar.base64", "issue10968.tar", "issue11169.tar", "issue12435.tar", "invalid-go17.tar", "ustar-file-devs.tar", "gnu-nil-sparse-data.tar", "gnu-nil-sparse-hole.tar", "pax-nil-sparse-data.tar", "pax-nil-sparse-hole.tar", "trailing-slash.tar", "file-and-dir.tar", "hardlink.tar", "hdr-only.tar", "ustar.tar", "ustar-file-reg.tar", "writer.tar", "pax-path-hdr.tar"] {
+    ~fuzz_reader(~testdata_bytes(name))
+  }
+}
+
+test "fuzz reader mutations" {
+  seed = ~fuzz_seed
+  for i in 0...512 {
+    for v in [0, 0x30, 0x37, 0x7f, 0x80, 0xff] {
+      data = seed.dup
+      data[i] = v.as_u8
+      ~fuzz_reader(data)
+      # And with the checksum fixed, so the change gets past it.
+      if i < 148 || i >= 156 {
+        blk = data[0...512]
+        c1, _c2 = compute_checksum(blk)
+        f = Formatter.new()
+        f.format_octal!(f_chksum(blk)[0...7], c1)
+        blk[155] = 32
+        ~fuzz_reader(data)
+      }
+    }
+  }
+}

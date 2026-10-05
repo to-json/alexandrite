@@ -1,0 +1,135 @@
+import "io"
+
+struct SeekCase {
+  off: Int
+  seek: Int
+  n: Int
+  want: Str
+  wantpos: Int
+  seekerr: Str
+}
+
+test "reader" {
+  r = new_reader("0123456789".bytes.to_a)
+  tests = [
+    SeekCase.new(seek: io.SEEK_START, off: 0, n: 20, want: "0123456789"),
+    SeekCase.new(seek: io.SEEK_START, off: 1, n: 1, want: "1"),
+    SeekCase.new(seek: io.SEEK_CURRENT, off: 1, wantpos: 3, n: 2, want: "34"),
+    SeekCase.new(seek: io.SEEK_START, off: -1, seekerr: "bytes.Reader.Seek: negative position"),
+    SeekCase.new(seek: io.SEEK_START, off: 1 << 33, wantpos: 1 << 33),
+    SeekCase.new(seek: io.SEEK_CURRENT, off: 1, wantpos: (1 << 33) + 1),
+    SeekCase.new(seek: io.SEEK_START, n: 5, want: "01234"),
+    SeekCase.new(seek: io.SEEK_CURRENT, n: 5, want: "56789"),
+    SeekCase.new(seek: io.SEEK_END, off: -1, n: 1, wantpos: 9, want: "9"),
+  ]
+  for tt in tests {
+    res = r.seek!(tt.off, tt.seek)
+    if e = res.err {
+      assert_eq e.message, tt.seekerr
+      next
+    }
+    assert tt.seekerr == "", "want seek error"
+    assert_eq res.unwrap, tt.wantpos if tt.wantpos != 0
+    buf: [Byte] = [0; tt.n]
+    n = r.read!(buf)
+    assert_eq Str.from_bytes(buf[0...n]), tt.want
+  }
+}
+
+test "read after big seek" {
+  r = new_reader("0123456789".bytes.to_a)
+  r.~seek!((1 << 31) + 5, io.SEEK_START)
+  buf: [Byte] = [0; 10]
+  assert_eq r.read!(buf), 0
+}
+
+test "reader at" {
+  r = new_reader("0123456789".bytes.to_a)
+  tests = [(0, 10, "0123456789", ""), (1, 10, "123456789", ""), (1, 9, "123456789", ""), (11, 10, "", ""), (0, 0, "", ""), (-1, 0, "", "bytes.Reader.ReadAt: negative offset")]
+  for tt in tests {
+    b: [Byte] = [0; tt[1]]
+    res = r.read_at(b, tt[0])
+    if e = res.err {
+      assert_eq e.message, tt[3]
+      next
+    }
+    assert_eq Str.from_bytes(b[0...res.unwrap]), tt[2]
+  }
+}
+
+test "reader write to" {
+  s = "When in the course of human events it becomes necessary"
+  i = 0
+  while i < 30 {
+    l = i > 0 ? s.size / i : 0
+    r = new_reader(s[0...l].bytes.to_a)
+    b = new_buffer([])
+    n = r.~write_to!(b)
+    assert_eq n, l
+    assert_eq b.to_s, s[0...l]
+    assert_eq r.len, 0
+    i += 3
+  }
+}
+
+test "reader len" {
+  r = new_reader("hello world".bytes.to_a)
+  assert_eq r.len, 11
+  b10: [Byte] = [0; 10]
+  assert_eq r.read!(b10), 10
+  assert_eq r.len, 1
+  b1: [Byte] = [0; 1]
+  assert_eq r.read!(b1), 1
+  assert_eq r.len, 0
+}
+
+test "unread rune error" {
+  for k in 0...5 {
+    r = new_reader("0123456789".bytes.to_a)
+    assert r.read_rune!.some?, "read_rune"
+    if k == 0 {
+      b: [Byte] = [0]
+      r.read!(b)
+    } else if k == 1 {
+      r.read_byte!
+    } else if k == 2 {
+      r.unread_rune!
+    } else if k == 3 {
+      r.~seek!(0, io.SEEK_CURRENT)
+    } else {
+      r.~write_to!(Buffer.new())
+    }
+    assert !r.unread_rune!.ok?, "unreading after #{k}: expected error"
+  }
+}
+
+test "reader len size" {
+  r = new_reader("abc".bytes.to_a)
+  io.~copy_n(io.Discard.new(), r, 1)
+  assert_eq r.len, 2
+  assert_eq r.size, 3
+}
+
+test "reader reset" {
+  r = new_reader("世界".bytes.to_a)
+  assert r.read_rune!.some?, "read_rune"
+  r.reset!("abcdef".bytes.to_a)
+  assert !r.unread_rune!.ok?, "unread_rune after reset"
+  assert_eq Str.from_bytes(io.~read_all(r)), "abcdef"
+}
+
+test "reader zero" {
+  assert_eq Reader.new().len, 0
+  e: [Byte] = []
+  r = Reader.new()
+  assert_eq r.read!(e), 0
+  assert_eq Reader.new().~read_at(e, 11), 0
+  r = Reader.new()
+  assert r.read_byte!.none?, "read_byte"
+  r = Reader.new()
+  assert r.read_rune!.none?, "read_rune"
+  r = Reader.new()
+  assert_eq r.~seek!(11, io.SEEK_START), 11
+  r = Reader.new()
+  assert_eq r.~write_to!(Buffer.new()), 0
+}

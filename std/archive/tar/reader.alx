@@ -1,0 +1,634 @@
+# The tar Reader (Go's reader.go).
+
+import "io"
+import "strconv"
+import "strings"
+import "time"
+
+struct ReaderState[R] {
+  r: R
+  # Padding (ignored) after the current entry's data.
+  pad: Int
+  # The current entry (Go's fileReader): `nb` bytes of its data are left
+  # in r; a sparse entry also has its holes `sp` and logical position.
+  nb: Int
+  sparse: Bool
+  sp: [SparseEntry]
+  pos: Int
+  blk: [Byte]
+  err: Error?
+  # next! has returned none.
+  eof: Bool
+  insecure_check: Bool
+}
+
+# Reads a tar archive from R, one entry at a time (Go's Reader): next!
+# moves to the next entry, read! reads its data.
+pub struct Reader[R] {
+  st: [ReaderState[R]]
+
+  # Moves to the next entry and returns its header; none at the end of the
+  # archive. Data left in the current entry is skipped. Fails with
+  # TarError.Header on a bad header, io.StreamError.UnexpectedEof on a
+  # truncated archive; failures are sticky.
+  pub def next! -> ~Header? {
+    if e = st[0].err {
+      fail e
+    }
+    return none if st[0].eof
+    r = next_header!
+    if e = r.err {
+      self.st[0].err = e
+      fail e
+    }
+    h = r.unwrap
+    if h.none? {
+      self.st[0].eof = true
+      return none
+    }
+    hdr = h.unwrap
+    if st[0].insecure_check && !local_path?(hdr.name) {
+      fail TarError.InsecurePath(hdr.name)
+    }
+    hdr
+  }
+
+  # Reads the current entry's data into p; returns the count, 0 at the end
+  # of the entry (and for entries without data: links, directories...).
+  # A sparse entry's holes read as zeros.
+  pub def read!(p: [Byte]) -> ~Int {
+    if e = st[0].err {
+      fail e
+    }
+    n, err = cur_read!(p)
+    if e = err {
+      self.st[0].err = e
+      return n if n > 0
+      fail e
+    }
+    n
+  }
+
+  # Go's GODEBUG=tarinsecurepath=0: next! fails with InsecurePath (not
+  # sticky) for an entry whose name isn't local (absolute, or escaping with
+  # "..").
+  pub def insecure_path_check!(on: Bool) {
+    self.st[0].insecure_check = on
+  }
+
+  # Writes the rest of the current entry to w (Go's unexported writeTo).
+  def write_to![W](w: W) -> ~Int {
+    buf: [Byte] = [0; 32 * 1024]
+    total = 0
+    loop {
+      n = self.~read!(buf)
+      return total if n == 0
+      w.~write!(buf[0...n])
+      total += n
+    }
+  }
+
+  # ---------------------------------------------------------- raw input
+
+  def raw_read!(p: [Byte]) -> ~Int {
+    self.st[0].r.~read!(p)
+  }
+
+  # Reads into b until it is full or the input ends; returns the count.
+  def raw_full!(b: [Byte]) -> ~Int {
+    n = 0
+    while n < b.size {
+      m = ~raw_read!(b[n...b.size])
+      return n if m == 0
+      n += m
+    }
+    n
+  }
+
+  # Skips n bytes of input; UnexpectedEof if it ends first.
+  def discard!(n: Int) -> ~Unit {
+    left = n
+    buf = st[0].blk
+    while left > 0 {
+      k = left < buf.size ? left : buf.size
+      m = ~raw_read!(buf[0...k])
+      fail io.StreamError.UnexpectedEof if m == 0
+      left -= m
+    }
+  }
+
+  # ------------------------------------------------------ current entry
+
+  def logical_remaining -> Int {
+    return st[0].sp[st[0].sp.size - 1].end_offset - st[0].pos if st[0].sparse
+    st[0].nb
+  }
+
+  def physical_remaining -> Int { st[0].nb }
+
+  # Makes the current entry a plain one of nb bytes.
+  def set_reg!(nb: Int) {
+    self.st[0].nb = nb
+    self.st[0].sparse = false
+    self.st[0].sp = []
+    self.st[0].pos = 0
+  }
+
+  # Makes the current entry sparse with holes sph over its data.
+  def set_sparse!(sph: [SparseEntry]) {
+    self.st[0].sparse = true
+    self.st[0].sp = sph
+    self.st[0].pos = 0
+  }
+
+  # Go's fileReader.Read: the count and an error; the end of the entry
+  # (Go's io.EOF) is no error with logical_remaining == 0.
+  def cur_read!(b: [Byte]) -> (Int, Error?) {
+    return sparse_read!(b) if st[0].sparse
+    reg_read!(b)
+  }
+
+  # Go's regFileReader.Read.
+  def reg_read!(b: [Byte]) -> (Int, Error?) {
+    nb = st[0].nb
+    k = b.size > nb ? nb : b.size
+    return (0, none) if k == 0
+    r = raw_read!(b[0...k])
+    if e = r.err {
+      return (0, e)
+    }
+    n = r.unwrap
+    self.st[0].nb = nb - n
+    return (0, io.StreamError.UnexpectedEof) if n == 0
+    (n, none)
+  }
+
+  # Go's tryReadFull over the plain entry: the count, an error, and whether
+  # the entry ended before b was full (io.EOF).
+  def reg_full!(b: [Byte]) -> (Int, Error?, Bool) {
+    n = 0
+    while n < b.size {
+      m, err = reg_read!(b[n...b.size])
+      n += m
+      return (n, err, false) if err.some?
+      return (n, none, true) if m == 0
+    }
+    (n, none, false)
+  }
+
+  # Go's mustReadFull over the plain entry.
+  def reg_must_full!(b: [Byte]) -> ~Int {
+    n, err, eof = reg_full!(b)
+    if e = err {
+      fail e
+    }
+    fail io.StreamError.UnexpectedEof if eof
+    n
+  }
+
+  # Go's sparseFileReader.Read.
+  def sparse_read!(b0: [Byte]) -> (Int, Error?) {
+    lr = logical_remaining
+    finished = b0.size >= lr
+    b = finished ? b0[0...lr] : b0
+    off = 0
+    end_pos = st[0].pos + b.size
+    err: Error? = none
+    eof = false
+    while end_pos > st[0].pos && err.none? && !eof {
+      pos = st[0].pos
+      hole_start = st[0].sp[0].offset
+      hole_end = st[0].sp[0].end_offset
+      nf = 0
+      if pos < hole_start {
+        k = b.size - off
+        k = hole_start - pos if hole_start - pos < k
+        m, e, short = reg_full!(b[off...off + k])
+        nf = m
+        err = e
+        eof = short
+      } else {
+        k = b.size - off
+        k = hole_end - pos if hole_end - pos < k
+        i = off
+        while i < off + k {
+          b[i] = 0
+          i += 1
+        }
+        nf = k
+      }
+      off += nf
+      self.st[0].pos = pos + nf
+      if st[0].pos >= hole_end && st[0].sp.size > 1 {
+        self.st[0].sp = st[0].sp[1...st[0].sp.size]
+      }
+    }
+    return (off, TarError.MissData) if eof
+    return (off, err) if err.some?
+    return (off, TarError.UnrefData) if logical_remaining == 0 && physical_remaining > 0
+    (off, none)
+  }
+
+  # ----------------------------------------------------------- headers
+
+  # Go's next: the next file's header, after any meta headers (PAX, GNU
+  # long names); none at the end.
+  def next_header! -> ~Header? {
+    pax_hdrs: Map[Str, Str] = {}
+    gnu_long_name = ""
+    gnu_long_link = ""
+    format = FORMAT_USTAR | FORMAT_PAX | FORMAT_GNU
+    loop {
+      ~discard!(physical_remaining)
+      pad = st[0].pad
+      if pad > 0 {
+        n = ~raw_full!(st[0].blk[0...pad])
+        return none if n < pad
+      }
+      self.st[0].pad = 0
+
+      rh = ~read_header!
+      if rh.none? {
+        return none
+      }
+      hdr = rh.unwrap
+      ~handle_regular_file!(hdr)
+      format = format & hdr.format
+
+      t = hdr.typeflag
+      if t == TYPE_X_HEADER || t == TYPE_X_GLOBAL_HEADER {
+        format = format & FORMAT_PAX
+        pax_hdrs = ~parse_pax(self)
+        if t == TYPE_X_GLOBAL_HEADER {
+          hd = [hdr]
+          merge_pax(hd, pax_hdrs)
+          g = hd[0]
+          return Header.new(name: g.name, typeflag: g.typeflag, xattrs: g.xattrs, pax_records: g.pax_records, format: format)
+        }
+        next
+      }
+      if t == TYPE_GNU_LONG_NAME || t == TYPE_GNU_LONG_LINK {
+        format = format & FORMAT_GNU
+        realname = ~read_special_file(self)
+        if t == TYPE_GNU_LONG_NAME {
+          gnu_long_name = parse_string(realname)
+        } else {
+          gnu_long_link = parse_string(realname)
+        }
+        next
+      }
+
+      hd = [hdr]
+      ~merge_pax(hd, pax_hdrs)
+      hd[0].name = gnu_long_name if gnu_long_name != ""
+      hd[0].linkname = gnu_long_link if gnu_long_link != ""
+      if hd[0].typeflag == TYPE_REG_A {
+        hd[0].typeflag = strings.has_suffix(hd[0].name, "/") ? TYPE_DIR : TYPE_REG
+      }
+      ~handle_regular_file!(hd[0])
+      ~handle_sparse_file!(hd)
+      if format & FORMAT_USTAR != 0 && format & FORMAT_PAX != 0 {
+        format = format & FORMAT_USTAR
+      }
+      hd[0].format = format
+      return hd[0]
+    }
+  }
+
+  # Sets up the current entry for hdr's data.
+  def handle_regular_file!(hdr: Header) -> ~Unit {
+    nb = header_only_type?(hdr.typeflag) ? 0 : hdr.size
+    fail TarError.Header if nb < 0
+    self.st[0].pad = block_padding(nb)
+    set_reg!(nb)
+  }
+
+  # Reads the sparse map, if the entry is sparse, and makes it sparse.
+  def handle_sparse_file!(hd: [Header]) -> ~Unit {
+    spd: [SparseEntry]? = none
+    if hd[0].typeflag == TYPE_GNU_SPARSE {
+      spd = ~read_old_gnu_sparse_map!(hd, st[0].blk)
+    } else {
+      spd = ~read_gnu_sparse_pax_headers!(hd)
+    }
+    if d = spd {
+      fail TarError.Header if header_only_type?(hd[0].typeflag) || !validate_sparse_entries(d, hd[0].size)
+      set_sparse!(invert_sparse_entries(d, hd[0].size))
+    }
+  }
+
+  # The sparse map of a PAX sparse file (formats 0.0, 0.1 and 1.0); none
+  # if the entry isn't one. Sets hd[0]'s real name and size.
+  def read_gnu_sparse_pax_headers!(hd: [Header]) -> ~[SparseEntry]? {
+    recs = hd[0].pax_records
+    major = recs[PAX_GNU_SPARSE_MAJOR] || ""
+    minor = recs[PAX_GNU_SPARSE_MINOR] || ""
+    is1x0 = false
+    if major == "0" && (minor == "0" || minor == "1") {
+      is1x0 = false
+    } else if major == "1" && minor == "0" {
+      is1x0 = true
+    } else if major != "" || minor != "" {
+      return none
+    } else if (recs[PAX_GNU_SPARSE_MAP] || "") != "" {
+      is1x0 = false
+    } else {
+      return none
+    }
+    hd[0].format = hd[0].format & FORMAT_PAX
+
+    name = recs[PAX_GNU_SPARSE_NAME] || ""
+    hd[0].name = name if name != ""
+    size = recs[PAX_GNU_SPARSE_SIZE] || ""
+    size = recs[PAX_GNU_SPARSE_REAL_SIZE] || "" if size == ""
+    if size != "" {
+      r = strconv.parse_int(size, 10, 64)
+      fail TarError.Header if r.err.some?
+      hd[0].size = r.unwrap
+    }
+    if is1x0 {
+      return ~read_gnu_sparse_map_1x0!
+    }
+    ~read_gnu_sparse_map_0x1(recs)
+  }
+
+  # The sparse map of an old GNU sparse header (blk), with its extension
+  # blocks. Sets hd[0]'s real size.
+  def read_old_gnu_sparse_map!(hd: [Header], blk: [Byte]) -> ~[SparseEntry] {
+    fail TarError.Header if get_format(blk) != FORMAT_GNU
+    hd[0].format = hd[0].format & FORMAT_GNU
+    p = Parser.new()
+    hd[0].size = p.parse_numeric!(f_gnu_real_size(blk))
+    fail TarError.Header if p.err
+    s = f_gnu_sparse(blk)
+    spd: [SparseEntry] = []
+    total = s.size
+    while total < MAX_SPECIAL_FILE_SIZE {
+      i = 0
+      while i < sa_max_entries(s) {
+        break if sa_offset(s, i)[0] == 0
+        offset = p.parse_numeric!(sa_offset(s, i))
+        length = p.parse_numeric!(sa_length(s, i))
+        fail TarError.Header if p.err
+        fail TarError.SparseTooLong if spd.size >= MAX_SPARSE_FILE_ENTRIES
+        spd << sp(offset, length)
+        i += 1
+      }
+      if sa_is_extended(s)[0] > 0 {
+        n = ~raw_full!(blk)
+        fail io.StreamError.UnexpectedEof if n < blk.size
+        s = blk
+        total += s.size
+        next
+      }
+      return spd
+    }
+    fail TarError.SparseTooLong
+  }
+
+  # The sparse map of a PAX 1.0 sparse file, at the start of its data:
+  # decimal numbers, one per line (the count, then offset and length
+  # pairs), padded to a block.
+  def read_gnu_sparse_map_1x0! -> ~[SparseEntry] {
+    tk = Tokens.new(buf: [], blk: new_block)
+    tk.~feed!(self, 1)
+    r = strconv.parse_int(tk.next_token!, 10, 0)
+    fail TarError.Header if r.err.some?
+    num = r.unwrap
+    fail TarError.Header if num < 0 || num > 0x3fffffffffffffff
+    tk.~feed!(self, 2 * num)
+    spd: [SparseEntry] = []
+    i = 0
+    while i < num {
+      r1 = strconv.parse_int(tk.next_token!, 10, 64)
+      r2 = strconv.parse_int(tk.next_token!, 10, 64)
+      fail TarError.Header if r1.err.some? || r2.err.some?
+      fail TarError.SparseTooLong if spd.size >= MAX_SPARSE_FILE_ENTRIES
+      spd << sp(r1.unwrap, r2.unwrap)
+      i += 1
+    }
+    spd
+  }
+
+  # Go's readHeader: the next header block, none at the end of the archive
+  # (no input, or two zero blocks).
+  def read_header! -> ~Header? {
+    blk = st[0].blk
+    n = ~raw_full!(blk)
+    return none if n == 0
+    fail io.StreamError.UnexpectedEof if n < BLOCK_SIZE
+    if zero_block?(blk) {
+      n = ~raw_full!(blk)
+      return none if n == 0
+      fail io.StreamError.UnexpectedEof if n < BLOCK_SIZE
+      return none if zero_block?(blk)
+      fail TarError.Header
+    }
+    format = get_format(blk)
+    fail TarError.Header if format == FORMAT_UNKNOWN
+
+    p = Parser.new()
+    hdr = Header.new()
+    hdr.typeflag = blk[156]
+    hdr.name = parse_string(f_name(blk))
+    hdr.linkname = parse_string(f_link_name(blk))
+    hdr.size = p.parse_numeric!(f_size(blk))
+    hdr.mode = p.parse_numeric!(f_mode(blk))
+    hdr.uid = p.parse_numeric!(f_uid(blk))
+    hdr.gid = p.parse_numeric!(f_gid(blk))
+    hdr.mod_time = time.unix(p.parse_numeric!(f_mod_time(blk)), 0)
+
+    if format > FORMAT_V7 {
+      hdr.uname = parse_string(f_user_name(blk))
+      hdr.gname = parse_string(f_group_name(blk))
+      hdr.devmajor = p.parse_numeric!(f_dev_major(blk))
+      hdr.devminor = p.parse_numeric!(f_dev_minor(blk))
+
+      prefix = ""
+      if format & (FORMAT_USTAR | FORMAT_PAX) != 0 {
+        hdr.format = format
+        prefix = parse_string(f_ustar_prefix(blk))
+        # A USTAR header is ASCII, with NUL-terminated numbers.
+        for c in blk {
+          if c >= 0x80 {
+            hdr.format = FORMAT_UNKNOWN
+            break
+          }
+        }
+        if !(nul_end?(f_size(blk)) && nul_end?(f_mode(blk)) && nul_end?(f_uid(blk)) && nul_end?(f_gid(blk)) && nul_end?(f_mod_time(blk)) && nul_end?(f_dev_major(blk)) && nul_end?(f_dev_minor(blk))) {
+          hdr.format = FORMAT_UNKNOWN
+        }
+      } else if format & FORMAT_STAR != 0 {
+        prefix = parse_string(f_star_prefix(blk))
+        hdr.access_time = time.unix(p.parse_numeric!(f_star_access_time(blk)), 0)
+        hdr.change_time = time.unix(p.parse_numeric!(f_star_change_time(blk)), 0)
+      } else if format & FORMAT_GNU != 0 {
+        hdr.format = format
+        p2 = Parser.new()
+        at = f_gnu_access_time(blk)
+        hdr.access_time = time.unix(p2.parse_numeric!(at), 0) if at[0] != 0
+        ct = f_gnu_change_time(blk)
+        hdr.change_time = time.unix(p2.parse_numeric!(ct), 0) if ct[0] != 0
+        # Old GNU tar wrote a USTAR prefix (and no times) under the GNU
+        # magic: take the prefix if the times don't parse.
+        if p2.err {
+          hdr.access_time = time.Time.new()
+          hdr.change_time = time.Time.new()
+          s = parse_string(f_ustar_prefix(blk))
+          prefix = s if ascii?(s)
+          hdr.format = FORMAT_UNKNOWN
+        }
+      }
+      hdr.name = prefix + "/" + hdr.name if prefix.size > 0
+    }
+    fail TarError.Header if p.err
+    hdr
+  }
+}
+
+def nul_end?(b: [Byte]) -> Bool { b[b.size - 1] == 0 }
+
+# The newline-separated tokens of a PAX 1.0 sparse map, read a block at a
+# time (Go's feedTokens / nextToken closures).
+struct Tokens {
+  buf: [Byte]
+  off: Int
+  newlines: Int
+  total: Int
+  blk: [Byte]
+
+  # Reads blocks until n tokens are buffered.
+  def feed![R](tr: Reader[R], n: Int) -> ~Unit {
+    while newlines < n {
+      self.total += blk.size
+      fail TarError.SparseTooLong if total > MAX_SPECIAL_FILE_SIZE
+      tr.~reg_must_full!(blk)
+      for c in blk {
+        self.buf << c
+        self.newlines += 1 if c == 10
+      }
+    }
+  }
+
+  def next_token! -> Str {
+    self.newlines -= 1
+    i = off
+    while i < buf.size && buf[i] != 10 {
+      i += 1
+    }
+    tok = Str.from_bytes(buf[off...i])
+    self.off = i < buf.size ? i + 1 : i
+    tok
+  }
+}
+
+# The sparse map of a PAX 0.0 or 0.1 sparse file: GNU.sparse.numblocks and
+# GNU.sparse.map ("offset,length,...").
+def read_gnu_sparse_map_0x1(recs: Map[Str, Str]) -> ~[SparseEntry]<TarError> {
+  r = strconv.parse_int(recs[PAX_GNU_SPARSE_NUM_BLOCKS] || "", 10, 0)
+  fail TarError.Header if r.err.some?
+  num = r.unwrap
+  fail TarError.Header if num < 0 || num > 0x3fffffffffffffff
+  smap = strings.split(recs[PAX_GNU_SPARSE_MAP] || "", ",")
+  smap = [] if smap.size == 1 && smap[0] == ""
+  fail TarError.Header if smap.size != 2 * num
+  spd: [SparseEntry] = []
+  i = 0
+  while i + 1 < smap.size {
+    r1 = strconv.parse_int(smap[i], 10, 64)
+    r2 = strconv.parse_int(smap[i + 1], 10, 64)
+    fail TarError.Header if r1.err.some? || r2.err.some?
+    fail TarError.SparseTooLong if spd.size >= MAX_SPARSE_FILE_ENTRIES
+    spd << sp(r1.unwrap, r2.unwrap)
+    i += 2
+  }
+  spd
+}
+
+# Applies PAX records to hd[0] (Go's mergePAX); TarError.Header on a bad
+# number or time. The records become hd[0].pax_records.
+def merge_pax(hd: [Header], pax_hdrs: Map[Str, Str]) -> ~Unit<TarError> {
+  for k in pax_hdrs.keys {
+    v = pax_hdrs[k] || ""
+    next if v == ""
+    if k == PAX_PATH {
+      hd[0].name = v
+    } else if k == PAX_LINKPATH {
+      hd[0].linkname = v
+    } else if k == PAX_UNAME {
+      hd[0].uname = v
+    } else if k == PAX_GNAME {
+      hd[0].gname = v
+    } else if k == PAX_UID {
+      r = strconv.parse_int(v, 10, 64)
+      fail TarError.Header if r.err.some?
+      hd[0].uid = r.unwrap
+    } else if k == PAX_GID {
+      r = strconv.parse_int(v, 10, 64)
+      fail TarError.Header if r.err.some?
+      hd[0].gid = r.unwrap
+    } else if k == PAX_ATIME {
+      hd[0].access_time = ~parse_pax_time(v)
+    } else if k == PAX_MTIME {
+      hd[0].mod_time = ~parse_pax_time(v)
+    } else if k == PAX_CTIME {
+      hd[0].change_time = ~parse_pax_time(v)
+    } else if k == PAX_SIZE {
+      r = strconv.parse_int(v, 10, 64)
+      fail TarError.Header if r.err.some?
+      hd[0].size = r.unwrap
+    } else if strings.has_prefix(k, PAX_SCHILY_XATTR) {
+      xs = hd[0].xattrs
+      xs[k[PAX_SCHILY_XATTR.size...k.size]] = v
+      hd[0].xattrs = xs
+    }
+  }
+  hd[0].pax_records = pax_hdrs
+}
+
+# All of r (at most MAX_SPECIAL_FILE_SIZE bytes, else FieldTooLong).
+def read_special_file[R](r: R) -> ~[Byte] {
+  out: [Byte] = []
+  buf: [Byte] = [0; 4096]
+  loop {
+    n = r.~read!(buf)
+    break if n == 0
+    out = out + buf[0...n]
+    fail TarError.FieldTooLong if out.size > MAX_SPECIAL_FILE_SIZE
+  }
+  out
+}
+
+# The PAX records in r (a PAX header entry's data). GNU.sparse.offset and
+# .numbytes records (format 0.0) are collected into GNU.sparse.map.
+def parse_pax[R](r: R) -> ~Map[Str, Str] {
+  buf = ~read_special_file(r)
+  ~parse_pax_bytes(buf)
+}
+
+def parse_pax_bytes(buf: [Byte]) -> ~Map[Str, Str]<TarError> {
+  sbuf = Str.from_bytes(buf)
+  sparse_map: [Str] = []
+  pax_hdrs: Map[Str, Str] = {}
+  while sbuf.size > 0 {
+    r = parse_pax_record(sbuf)
+    fail TarError.Header if r.err.some?
+    key, value, residual = r.unwrap
+    sbuf = residual
+    if key == PAX_GNU_SPARSE_OFFSET || key == PAX_GNU_SPARSE_NUM_BYTES {
+      if (sparse_map.size % 2 == 0 && key != PAX_GNU_SPARSE_OFFSET) || (sparse_map.size % 2 == 1 && key != PAX_GNU_SPARSE_NUM_BYTES) || strings.contains(value, ",") {
+        fail TarError.Header
+      }
+      sparse_map << value
+    } else {
+      pax_hdrs[key] = value
+    }
+  }
+  pax_hdrs[PAX_GNU_SPARSE_MAP] = strings.join(sparse_map, ",") if sparse_map.size > 0
+  pax_hdrs
+}
+
+# A Reader of the tar archive in r.
+pub def new_reader[R](r: R) -> Reader[R] {
+  Reader[R].new(st: [ReaderState[R].new(r: r, pad: 0, nb: 0, sparse: false, sp: [], pos: 0, blk: new_block, err: none, eof: false, insecure_check: false)])
+}

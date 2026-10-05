@@ -263,28 +263,12 @@ fn resolve_c_symbol(name: &str) -> Option<usize> {
     if p.is_null() {
         static DIRS_LOADED: std::sync::Once = std::sync::Once::new();
         DIRS_LOADED.call_once(|| {
-            let mut libs = vec![
-                "libraylib.so".to_string(),
-                "raylib/src/libraylib.so".to_string(),
-                "/home/j/alexandrite/raylib/src/libraylib.so".to_string(),
-            ];
-            if let Ok(exe) = std::env::current_exe() {
-                if let Some(parent) = exe.parent() {
-                    let ws = parent.join("../../raylib/src/libraylib.so");
-                    if ws.exists() {
-                        libs.push(ws.to_string_lossy().to_string());
-                    }
-                }
-            }
             if let Ok(extra) = std::env::var("ALX_LIBS") {
                 for l in extra.split(':') {
-                    libs.insert(0, l.to_string());
-                }
-            }
-            for lib in libs {
-                if let Ok(cstr) = CString::new(lib) {
-                    unsafe {
-                        libc::dlopen(cstr.as_ptr(), libc::RTLD_NOW | libc::RTLD_GLOBAL);
+                    if let Ok(cstr) = CString::new(l) {
+                        unsafe {
+                            libc::dlopen(cstr.as_ptr(), libc::RTLD_NOW | libc::RTLD_GLOBAL);
+                        }
                     }
                 }
             }
@@ -1269,6 +1253,7 @@ impl Fx<'_, '_, '_> {
             LE::ChanNew(t, _) => LTy::Chan(Box::new(t.clone())),
             LE::ChanLen(_) => LTy::I64,
             LE::LockNew => LTy::Lock,
+            LE::NullTask(t) => t.clone(),
             LE::AtomicNew(_) => LTy::Atomic,
             LE::AtomicLoad(_) | LE::AtomicRmw(..) => LTy::I64,
             LE::AtomicCas(..) => LTy::Bool,
@@ -1552,6 +1537,7 @@ impl Fx<'_, '_, '_> {
                 vec![self.call_rt(rt::alxj_chan_len, &[c], true).unwrap()]
             }
             LE::LockNew => vec![self.call_rt(rt::alxj_lock_new, &[], true).unwrap()],
+            LE::NullTask(_) => vec![self.ic(0)],
             LE::AtomicNew(v) => {
                 let v = self.e1(v);
                 vec![self.call_rt(rt::alxj_atomic_new, &[v], true).unwrap()]

@@ -1,0 +1,508 @@
+# Go's archive/tar writer_test.go.
+
+import "bytes"
+import "io"
+import "io/fs"
+import "slices"
+import "strings"
+import "testing/fstest"
+import "time"
+
+# A step of Go's TestWriter: write_header!(h) (err "hdr" stands for any
+# CannotEncode), write!(s), or close!.
+struct WStep {
+  kind: Int
+  h: Header
+  s: Str
+  err: Str
+}
+
+def th(h: Header, err: Str) -> WStep { WStep.new(kind: 0, h: h, err: err) }
+def tw_(s: Str) -> WStep { WStep.new(kind: 1, s: s) }
+def tc -> WStep { WStep.new(kind: 2) }
+
+def run_writer(file: Str, steps: [WStep]) -> ~Unit {
+  buf = bytes.new_buffer([])
+  tw = new_writer(buf)
+  i = 0
+  for st in steps {
+    if st.kind == 0 {
+      r = tw.write_header!(st.h)
+      got = ""
+      if e = r.err {
+        got = e.message
+        case e {
+          TarError.CannotEncode(_r) => got = "hdr"
+          _ => {}
+        }
+      }
+      assert got == st.err, "#{file} test #{i}, write_header: got #{got}, want #{st.err}"
+    } else if st.kind == 1 {
+      rw = tw.write!(st.s.bytes.to_a)
+      assert rw.ok?, "#{file} test #{i}, write!: #{msg_of(rw.err)}"
+    } else {
+      rc = tw.close!
+      assert rc.ok?, "#{file} test #{i}, close!: #{msg_of(rc.err)}"
+    }
+    i += 1
+  }
+  if file != "" {
+    want = ~testdata_bytes(file)
+    got = buf.bytes
+    assert got.size == want.size, "#{file}: got #{got.size} bytes, want #{want.size}"
+    j = 0
+    while j < got.size && j < want.size {
+      assert got[j] == want[j], "#{file}: first difference at byte #{j}"
+      break if got[j] != want[j]
+      j += 1
+    }
+  }
+}
+
+test "writer" {
+  ~run_writer("writer.tar", [
+    th(Header.new(typeflag: TYPE_REG, name: "small.txt", size: 5, mode: 0o640, uid: 73025, gid: 5000, uname: "dsymonds", gname: "eng", mod_time: time.unix(1246508266, 0)), ""),
+    tw_("Kilts"),
+    th(Header.new(typeflag: TYPE_REG, name: "small2.txt", size: 11, mode: 0o640, uid: 73025, uname: "dsymonds", gname: "eng", gid: 5000, mod_time: time.unix(1245217492, 0)), ""),
+    tw_("Google.com\n"),
+    th(Header.new(typeflag: TYPE_SYMLINK, name: "link.txt", linkname: "small.txt", mode: 0o777, uid: 1000, gid: 1000, uname: "strings", gname: "strings", mod_time: time.unix(1314603082, 0)), ""),
+    tw_(""),
+    tc,
+  ])
+  ~run_writer("writer-big.tar", [
+    th(Header.new(typeflag: TYPE_REG, name: "tmp/16gig.txt", size: 16 << 30, mode: 0o640, uid: 73025, gid: 5000, uname: "dsymonds", gname: "eng", mod_time: time.unix(1254699560, 0), format: FORMAT_GNU), ""),
+  ])
+  ~run_writer("writer-big-long.tar.base64", [
+    th(Header.new(typeflag: TYPE_REG, name: strings.repeat("longname/", 15) + "16gig.txt", size: 16 << 30, mode: 0o644, uid: 1000, gid: 1000, uname: "guillaume", gname: "guillaume", mod_time: time.unix(1399583047, 0)), ""),
+  ])
+  ~run_writer("ustar.tar", [
+    th(Header.new(typeflag: TYPE_REG, name: strings.repeat("longname/", 15) + "file.txt", size: 6, mode: 0o644, uid: 501, gid: 20, uname: "shane", gname: "staff", mod_time: time.unix(1360135598, 0)), ""),
+    tw_("hello\n"),
+    tc,
+  ])
+  ~run_writer("hardlink.tar", [
+    th(Header.new(typeflag: TYPE_REG, name: "file.txt", size: 15, mode: 0o644, uid: 1000, gid: 100, uname: "vbatts", gname: "users", mod_time: time.unix(1425484303, 0)), ""),
+    tw_("Slartibartfast\n"),
+    th(Header.new(typeflag: TYPE_LINK, name: "hard.txt", linkname: "file.txt", mode: 0o644, uid: 1000, gid: 100, uname: "vbatts", gname: "users", mod_time: time.unix(1425484303, 0)), ""),
+    tw_(""),
+    tc,
+  ])
+  ~run_writer("", [th(Header.new(typeflag: TYPE_REG, name: "bad-null.txt", xattrs: {"null\x00null\x00" => "fizzbuzz"}), "hdr")])
+  ~run_writer("", [th(Header.new(typeflag: TYPE_REG, name: "null\x00.txt"), "hdr")])
+  ~run_writer("pax-records.tar", [
+    th(Header.new(typeflag: TYPE_REG, name: "file", uname: strings.repeat("long", 10), pax_records: {"path" => "FILE", "GNU.sparse.map" => "0,0", "comment" => "Hello, 世界", "GOLANG.pkg" => "tar"}), ""),
+    tc,
+  ])
+  ~run_writer("pax-global-records.tar", [
+    th(Header.new(typeflag: TYPE_X_GLOBAL_HEADER, pax_records: {"path" => "global1", "mtime" => "1500000000.0"}), ""),
+    th(Header.new(typeflag: TYPE_REG, name: "file1"), ""),
+    th(Header.new(typeflag: TYPE_REG, name: "file2", pax_records: {"path" => "file2"}), ""),
+    # Should delete "path", but keep "mtime".
+    th(Header.new(typeflag: TYPE_X_GLOBAL_HEADER, pax_records: {"path" => ""}), ""),
+    th(Header.new(typeflag: TYPE_REG, name: "file3"), ""),
+    th(Header.new(typeflag: TYPE_REG, name: "file4", mod_time: time.unix(1400000000, 0), pax_records: {"mtime" => "1400000000"}), ""),
+    tc,
+  ])
+  ~run_writer("gnu-utf8.tar", [
+    th(Header.new(typeflag: TYPE_REG, name: "☺☻☹☺☻☹☺☻☹☺☻☹☺☻☹☺☻☹☺☻☹☺☻☹☺☻☹☺☻☹☺☻☹☺☻☹☺☻☹☺☻☹☺☻☹☺☻☹☺☻☹☺☻☹", mode: 0o644, uid: 1000, gid: 1000, uname: "☺", gname: "⚹", mod_time: time.unix(0, 0), format: FORMAT_GNU), ""),
+    tc,
+  ])
+  ~run_writer("gnu-not-utf8.tar", [
+    th(Header.new(typeflag: TYPE_REG, name: Str.from_bytes([104, 105, 128, 129, 130, 131, 98, 121, 101]), mode: 0o644, uid: 1000, gid: 1000, uname: "rawr", gname: "dsnet", mod_time: time.unix(0, 0), format: FORMAT_GNU), ""),
+    tc,
+  ])
+  ~run_writer("trailing-slash.tar", [
+    th(Header.new(name: strings.repeat("123456789/", 30)), ""),
+    tc,
+  ])
+  # The zero Typeflag is promoted by the name.
+  ~run_writer("file-and-dir.tar", [
+    th(Header.new(name: "small.txt", size: 5), ""),
+    tw_("Kilts"),
+    th(Header.new(name: "dir/"), ""),
+    tc,
+  ])
+}
+
+def small_header -> ~Header {
+  fi = fs.dir_fs("testdata").~stat("small.txt")
+  ~file_info_header(fi, "")
+}
+
+test "pax" {
+  hdr = ~small_header
+  # Force a PAX long name.
+  long_name = strings.repeat("ab", 100)
+  contents = strings.repeat(" ", hdr.size)
+  hdr.name = long_name
+  buf = bytes.new_buffer([])
+  w = new_writer(buf)
+  w.~write_header!(hdr)
+  w.~write!(contents.bytes.to_a)
+  w.~close!
+  assert bytes.contains(buf.bytes, "PaxHeaders.0".bytes.to_a), "want a PAX header"
+  r = new_reader(buf)
+  assert_eq r.~next!.unwrap.name, long_name
+}
+
+test "pax symlink" {
+  hdr = ~small_header
+  hdr.typeflag = TYPE_SYMLINK
+  long_linkname = strings.repeat("1234567890/1234567890", 10)
+  hdr.linkname = long_linkname
+  hdr.size = 0
+  buf = bytes.new_buffer([])
+  w = new_writer(buf)
+  w.~write_header!(hdr)
+  w.~close!
+  assert bytes.contains(buf.bytes, "PaxHeaders.0".bytes.to_a), "want a PAX header"
+  r = new_reader(buf)
+  assert_eq r.~next!.unwrap.linkname, long_linkname
+}
+
+test "pax non ascii" {
+  hdr = ~small_header
+  hdr.name = "文件名"
+  hdr.gname = "組"
+  hdr.uname = "用戶名"
+  contents = strings.repeat(" ", hdr.size)
+  buf = bytes.new_buffer([])
+  w = new_writer(buf)
+  w.~write_header!(hdr)
+  w.~write!(contents.bytes.to_a)
+  w.~close!
+  assert bytes.contains(buf.bytes, "PaxHeaders.0".bytes.to_a), "want a PAX header"
+  r = new_reader(buf)
+  h = r.~next!.unwrap
+  assert_eq h.name, "文件名"
+  assert_eq h.gname, "組"
+  assert_eq h.uname, "用戶名"
+}
+
+test "pax xattrs" {
+  xattrs: Map[Str, Str] = {"user.key" => "value"}
+  hdr = ~small_header
+  hdr.xattrs = xattrs
+  buf = bytes.new_buffer([])
+  w = new_writer(buf)
+  w.~write_header!(hdr)
+  w.~write!("Kilts".bytes.to_a)
+  w.~close!
+  r = new_reader(buf)
+  h = r.~next!.unwrap
+  assert map_eq?(h.xattrs, xattrs), "xattrs: got #{map_str(h.xattrs)}"
+}
+
+test "pax headers sorted" {
+  hdr = ~small_header
+  contents = strings.repeat(" ", hdr.size)
+  hdr.xattrs = {"foo" => "foo", "bar" => "bar", "baz" => "baz", "qux" => "qux"}
+  buf = bytes.new_buffer([])
+  w = new_writer(buf)
+  w.~write_header!(hdr)
+  w.~write!(contents.bytes.to_a)
+  w.~close!
+  out = buf.bytes
+  assert bytes.contains(out, "PaxHeaders.0".bytes.to_a), "want a PAX header"
+  indices = ["bar=bar", "baz=baz", "foo=foo", "qux=qux"].map { bytes.index(out, it.bytes.to_a) }.to_a
+  assert slices.is_sorted(indices), "PAX headers are not sorted: #{indices}"
+}
+
+test "ustar long name" {
+  hdr = ~small_header
+  hdr.typeflag = TYPE_DIR
+  long_name = "/0000_0000000/00000-000000000/0000_0000000/00000-0000000000000/0000_0000000/00000-0000000-00000000/0000_0000000/00000000/0000_0000000/000/0000_0000000/00000000v00/0000_0000000/000000/0000_0000000/0000000/0000_0000000/00000y-00/0000/0000/00000000/0x000000/"
+  hdr.name = long_name
+  hdr.size = 0
+  buf = bytes.new_buffer([])
+  w = new_writer(buf)
+  w.~write_header!(hdr)
+  w.~close!
+  r = new_reader(buf)
+  assert_eq r.~next!.unwrap.name, long_name
+}
+
+test "valid typeflag with pax header" {
+  buf = bytes.new_buffer([])
+  tw = new_writer(buf)
+  file_name = strings.repeat("ab", 100)
+  tw.~write_header!(Header.new(name: file_name, size: 4, typeflag: 0))
+  tw.~write!("fooo".bytes.to_a)
+  tw.~close!
+  tr = new_reader(buf)
+  loop {
+    h = tr.~next!
+    break if h.none?
+    assert_eq h.unwrap.typeflag, TYPE_REG
+  }
+}
+
+# Fails every write (Go's failOnceWriter, which never stops failing).
+struct FailWriter {
+  pub def write!(p: [Byte]) -> ~Int {
+    fail io.StreamError.ShortWrite
+  }
+}
+
+test "writer errors" {
+  # Header only.
+  tw = new_writer(bytes.new_buffer([]))
+  tw.~write_header!(Header.new(name: "dir/", typeflag: TYPE_DIR))
+  assert_eq msg_of(tw.write!([0]).err), "archive/tar: write too long"
+
+  # Negative size.
+  tw = new_writer(bytes.new_buffer([]))
+  assert !tw.write_header!(Header.new(name: "small.txt", size: -1)).ok?, "want an error"
+
+  # Before the header.
+  tw = new_writer(bytes.new_buffer([]))
+  assert_eq msg_of(tw.write!("Kilts".bytes.to_a).err), "archive/tar: write too long"
+
+  # After close.
+  tw = new_writer(bytes.new_buffer([]))
+  tw.~write_header!(Header.new(name: "small.txt"))
+  tw.~close!
+  assert_eq msg_of(tw.write!("Kilts".bytes.to_a).err), "archive/tar: write after close"
+  assert_eq msg_of(tw.flush!.err), "archive/tar: write after close"
+  assert tw.close!.ok?, "close! again"
+
+  # Premature flush.
+  tw = new_writer(bytes.new_buffer([]))
+  tw.~write_header!(Header.new(name: "small.txt", size: 5))
+  assert !tw.flush!.ok?, "want an error"
+
+  # Premature close.
+  tw = new_writer(bytes.new_buffer([]))
+  tw.~write_header!(Header.new(name: "small.txt", size: 5))
+  assert !tw.close!.ok?, "want an error"
+
+  # Persistence.
+  fw = new_writer(FailWriter.new())
+  assert_eq msg_of(fw.write_header!(Header.new()).err), "short write"
+  assert !fw.write_header!(Header.new(name: "small.txt")).ok?, "write_header: want an error"
+  e: [Byte] = []
+  assert !fw.write!(e).ok?, "write: want an error"
+  assert !fw.flush!.ok?, "flush: want an error"
+  assert !fw.close!.ok?, "close: want an error"
+}
+
+test "split ustar path" {
+  vectors = [
+    ("", "", "", false),
+    ("abc", "", "", false),
+    ("用戶名", "", "", false),
+    (strings.repeat("a", NAME_SIZE), "", "", false),
+    (strings.repeat("a", NAME_SIZE) + "/", "", "", false),
+    (strings.repeat("a", NAME_SIZE) + "/a", strings.repeat("a", NAME_SIZE), "a", true),
+    (strings.repeat("a", PREFIX_SIZE) + "/", "", "", false),
+    (strings.repeat("a", PREFIX_SIZE) + "/a", strings.repeat("a", PREFIX_SIZE), "a", true),
+    (strings.repeat("a", NAME_SIZE + 1), "", "", false),
+    (strings.repeat("/", NAME_SIZE + 1), strings.repeat("/", NAME_SIZE - 1), "/", true),
+    (strings.repeat("a", PREFIX_SIZE) + "/" + strings.repeat("b", NAME_SIZE), strings.repeat("a", PREFIX_SIZE), strings.repeat("b", NAME_SIZE), true),
+    (strings.repeat("a", PREFIX_SIZE) + "//" + strings.repeat("b", NAME_SIZE), "", "", false),
+    (strings.repeat("a/", NAME_SIZE), strings.repeat("a/", 77) + "a", strings.repeat("a/", 22), true),
+  ]
+  for v in vectors {
+    r = split_ustar_path(v[0])
+    prefix = ""
+    suffix = ""
+    if x = r {
+      prefix = x[0]
+      suffix = x[1]
+    }
+    assert prefix == v[1] && suffix == v[2] && r.some? == v[3], "split_ustar_path(#{v[0]}): got (#{prefix}, #{suffix}, #{r.some?})"
+  }
+}
+
+# The Writer doesn't put a prefix into a GNU header.
+test "issue 12594" {
+  names = [
+    "0/1/2/3/4/5/6/7/8/9/10/11/12/13/14/15/16/17/18/19/20/21/22/23/24/25/26/27/28/29/30/file.txt",
+    "0/1/2/3/4/5/6/7/8/9/10/11/12/13/14/15/16/17/18/19/20/21/22/23/24/25/26/27/28/29/30/31/32/33/file.txt",
+    "0/1/2/3/4/5/6/7/8/9/10/11/12/13/14/15/16/17/18/19/20/21/22/23/24/25/26/27/28/29/30/31/32/333/file.txt",
+    "0/1/2/3/4/5/6/7/8/9/10/11/12/13/14/15/16/17/18/19/20/21/22/23/24/25/26/27/28/29/30/31/32/33/34/35/36/37/38/39/40/file.txt",
+    "0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000/file.txt",
+    "/home/support/.openoffice.org/3/user/uno_packages/cache/registry/com.sun.star.comp.deployment.executable.PackageRegistryBackend",
+  ]
+  for name in names {
+    buf = bytes.new_buffer([])
+    tw = new_writer(buf)
+    # A uid too big for USTAR.
+    tw.~write_header!(Header.new(name: name, uid: 1 << 25))
+    tw.~close!
+    blk = new_block
+    copy(blk, buf.bytes)
+    prefix = parse_string(f_ustar_prefix(blk))
+    assert !(get_format(blk) == FORMAT_GNU && prefix.size > 0 && strings.has_prefix(name, prefix)), "found prefix in GNU format: #{prefix}"
+    tr = new_reader(buf)
+    assert_eq tr.~next!.unwrap.name, name
+  }
+}
+
+test "write long header" {
+  long = strings.repeat("a", MAX_SPECIAL_FILE_SIZE)
+  for h in [Header.new(name: long), Header.new(linkname: long), Header.new(uname: long), Header.new(gname: long), Header.new(pax_records: {"GOLANG.x" => long})] {
+    w = new_writer(io.Discard.new())
+    assert_eq msg_of(w.write_header!(h).err), "archive/tar: header field too long"
+  }
+}
+
+# A writer that fails an empty write (Go's testNonEmptyWriter).
+struct NonEmptyWriter {
+  buf: bytes.Buffer
+
+  pub def write!(p: [Byte]) -> ~Int {
+    fail io.StreamError.InvalidArgument("unexpected empty Write call") if p.size == 0
+    b = buf
+    b.write!(p)
+  }
+}
+
+# Go's TestFileWriter over the Writer's current entry: makeReg (size, want)
+# and makeSparse (a plain entry, holes, logical size). Ops: (0, s, n, err)
+# writes s; (1, s, n, err) copies s in (Go's ReadFrom; where Go seeks over a
+# hole the reader holds zeros here); (2, "", l, "") / (3, "", p, "") check
+# what remains.
+struct FileWriterCase {
+  size: Int
+  want: Str
+  sparse: Bool
+  sph: [SparseEntry]
+  lsize: Int
+  ops: [(Int, Str, Int, Str)]
+}
+
+def wreg(size: Int, want: Str, ops: [(Int, Str, Int, Str)]) -> FileWriterCase {
+  FileWriterCase.new(size: size, want: want, sparse: false, sph: [], lsize: 0, ops: ops)
+}
+
+def wsparse(size: Int, want: Str, sph: [SparseEntry], lsize: Int, ops: [(Int, Str, Int, Str)]) -> FileWriterCase {
+  FileWriterCase.new(size: size, want: want, sparse: true, sph: sph, lsize: lsize, ops: ops)
+}
+
+def ww(s: Str, n: Int, err: Str) -> (Int, Str, Int, Str) { (0, s, n, err) }
+def wr(s: Str, n: Int, err: Str) -> (Int, Str, Int, Str) { (1, s, n, err) }
+def wrem(l: Int, p: Int) -> [(Int, Str, Int, Str)] { [(2, "", l, ""), (3, "", p, "")] }
+
+test "file writer" {
+  tl = "archive/tar: write too long"
+  miss = "archive/tar: sparse file references non-existent data"
+  unref = "archive/tar: sparse file contains unreferenced data"
+  hole = "archive/tar: write non-NUL byte in sparse hole"
+  z2 = "\x00\x00"
+  z3 = "\x00\x00\x00"
+  vectors = [
+    wreg(0, "", wrem(0, 0) + [ww("", 0, ""), ww("a", 0, tl), wr("", 0, ""), wr("a", 0, tl)] + wrem(0, 0)),
+    wreg(1, "a", wrem(1, 1) + [ww("", 0, ""), ww("a", 1, ""), ww("bcde", 0, tl), ww("", 0, ""), wr("", 0, ""), wr("a", 0, tl)] + wrem(0, 0)),
+    wreg(5, "hello", wrem(5, 5) + [ww("hello", 5, "")] + wrem(0, 0)),
+    wreg(5, "\x00\x00\x00\x00\x00", wrem(5, 5) + [wr("\x00\x00\x00\x00\x00", 5, "")] + wrem(0, 0)),
+    wreg(5, "\x00\x00\x00\x00\x00", wrem(5, 5) + [wr("\x00\x00\x00\x00\x00extra", 5, tl)] + wrem(0, 0)),
+    wreg(5, "abc\x00\x00", wrem(5, 5) + [ww("abc", 3, "")] + wrem(2, 2) + [wr(z2, 2, "")] + wrem(0, 0)),
+    wreg(5, "\x00\x00abc", wrem(5, 5) + [ww(z2, 2, "")] + wrem(3, 3) + [ww("abc", 3, ""), wr("z", 0, tl), ww("z", 0, tl)] + wrem(0, 0)),
+    wsparse(5, "abcde", [sp(2, 3)], 8, wrem(8, 5) + [ww("ab\x00\x00\x00cde", 8, ""), ww("a", 0, tl)] + wrem(0, 0)),
+    wsparse(5, "abcde", [sp(2, 3)], 8, [ww("ab\x00\x00\x00cdez", 8, tl)] + wrem(0, 0)),
+    wsparse(5, "abcde", [sp(2, 3)], 8, [ww("ab\x00", 3, "")] + wrem(5, 3) + [ww("\x00\x00cde", 5, ""), ww("a", 0, tl)] + wrem(0, 0)),
+    wsparse(5, "abcde", [sp(2, 3)], 8, [ww("ab", 2, "")] + wrem(6, 3) + [wr(z3 + "cde", 6, "")] + wrem(0, 0)),
+    wsparse(5, "abcde", [sp(2, 3)], 8, [wr("ab" + z3 + "cde", 8, "")] + wrem(0, 0)),
+    wsparse(5, "abcde", [sp(2, 3)], 8, [wr("ab" + z3 + "cdeX", 8, tl)] + wrem(0, 0)),
+    # Go: (7, io.ErrUnexpectedEOF), from its seeking path's read of the
+    # last byte; a plain copy (Go's own path for non-seekers) ends cleanly.
+    wsparse(4, "abcd", [sp(2, 3)], 8, [wr("ab" + z3 + "cd", 7, "")] + wrem(1, 0)),
+    wsparse(4, "abcd", [sp(2, 3)], 8, [wr("ab" + z3 + "cde", 7, miss)] + wrem(1, 0)),
+    wsparse(6, "abcde", [sp(2, 3)], 8, [wr("ab" + z3 + "cde", 8, unref)] + wrem(0, 1)),
+    wsparse(4, "abcd", [sp(2, 3)], 8, [ww("ab", 2, "")] + wrem(6, 2) + [ww(z3, 3, "")] + wrem(3, 2) + [ww("cde", 2, miss)] + wrem(1, 0)),
+    wsparse(6, "abcde", [sp(2, 3)], 8, [ww("ab", 2, "")] + wrem(6, 4) + [ww(z3, 3, "")] + wrem(3, 4) + [ww("cde", 3, unref)] + wrem(0, 1)),
+    wsparse(3, "abc", [sp(0, 2), sp(5, 2)], 7, wrem(7, 3) + [ww(z2 + "abc" + z2, 7, "")] + wrem(0, 0)),
+    wsparse(3, "abc", [sp(0, 2), sp(5, 2)], 7, wrem(7, 3) + [wr(z2 + "abc" + z2, 7, "")] + wrem(0, 0)),
+    wsparse(3, "", [sp(0, 2), sp(5, 2)], 7, [ww("abcdefg", 0, hole)]),
+    wsparse(3, "abc", [sp(0, 2), sp(5, 2)], 7, [ww(z2 + "abcde", 5, hole)]),
+    wsparse(3, "abc", [sp(0, 2), sp(5, 2)], 7, [ww(z2 + "abc" + z2 + "z", 7, tl)] + wrem(0, 0)),
+    wsparse(3, "abc", [sp(0, 2), sp(5, 2)], 7, [ww(z2, 2, "")] + wrem(5, 3) + [ww("abc", 3, "")] + wrem(2, 0) + [ww(z2, 2, "")] + wrem(0, 0)),
+    wsparse(2, "ab", [sp(0, 2), sp(5, 2)], 7, [ww(z2, 2, ""), ww("abc", 2, miss), ww(z2, 0, miss)]),
+    wsparse(4, "abc", [sp(0, 2), sp(5, 2)], 7, [ww(z2, 2, ""), ww("abc", 3, ""), ww(z2, 2, unref)]),
+  ]
+  i = 0
+  for v in vectors {
+    bb = bytes.new_buffer([])
+    tw = new_writer(NonEmptyWriter.new(buf: bb))
+    tw.set_reg!(v.size)
+    if v.sparse {
+      assert validate_sparse_entries(v.sph, v.lsize), "invalid sparse map"
+      tw.set_sparse!(invert_sparse_entries(v.sph, v.lsize))
+    }
+    j = 0
+    for op in v.ops {
+      if op[0] == 0 || op[0] == 1 {
+        n = 0
+        err: Error? = none
+        if op[0] == 0 {
+          n, err = tw.cur_write!(op[1].bytes.to_a)
+        } else {
+          n, err = tw.read_from!(bytes.new_reader(op[1].bytes.to_a))
+        }
+        msg = msg_of(err)
+        assert n == op[2] && msg == op[3], "test #{i}.#{j}, op #{op[0]}(#{op[1].size} bytes): got (#{n}, #{msg}), want (#{op[2]}, #{op[3]})"
+      } else if op[0] == 2 {
+        assert_eq tw.logical_remaining, op[2]
+      } else {
+        assert_eq tw.physical_remaining, op[2]
+      }
+      j += 1
+    }
+    assert bb.to_s == v.want, "test #{i}: got #{bb.to_s.bytes.to_a}, want #{v.want.bytes.to_a}"
+    i += 1
+  }
+}
+
+test "writer add fs" {
+  sym = fstest.map_file_str("file.go")
+  sym.mode = fs.mode(0o777 | fs.MODE_SYMLINK)
+  files: Map[Str, fstest.MapFile] = {
+    "emptyfolder" => fstest.MapFile.new(data: [], mode: fs.mode(0o755 | fs.MODE_DIR), mod_time: time.Time.new()),
+    "file.go" => fstest.map_file_str("hello"),
+    "subfolder/another.go" => fstest.map_file_str("world"),
+    "symlink.go" => sym,
+  }
+  fsys = fstest.map_fs(files)
+  buf = bytes.new_buffer([])
+  tw = new_writer(buf)
+  tw.~add_fs!(fsys)
+  tw.~close!
+
+  # The synthesised directory, as the archive has it.
+  files["subfolder"] = fstest.MapFile.new(data: [], mode: fs.mode(0o555 | fs.MODE_DIR), mod_time: time.Time.new())
+  tr = new_reader(buf)
+  names = files.keys.sort
+  left = files.size
+  for name in names {
+    left -= 1
+    info = fsys.~lstat(name)
+    h = tr.~next!
+    break if h.none?
+    hdr = h.unwrap
+    tmp = name
+    tmp += "/" if info.is_dir
+    assert_eq hdr.name, tmp
+    assert info.mode.bits == hdr.file_info.mode.bits, "#{name}: fs mode #{info.mode}, archive #{hdr.file_info.mode}"
+    t = info.mode.type.bits
+    if t == fs.MODE_DIR {
+      # Nothing more to check.
+    } else if t == fs.MODE_SYMLINK {
+      assert_eq hdr.linkname, Str.from_bytes(files["symlink.go"].unwrap.data)
+    } else {
+      data = io.~read_all(tr)
+      assert_eq data, files[name].unwrap.data
+    }
+  }
+  assert_eq left, 0
+}
+
+test "writer add fs non regular files" {
+  dev = fstest.map_file_str("hello")
+  dev.mode = fs.mode(0o755 | fs.MODE_DEVICE)
+  sym = fstest.map_file_str("world")
+  sym.mode = fs.mode(0o755 | fs.MODE_SYMLINK)
+  fsys = fstest.map_fs({"device" => dev, "symlink" => sym})
+  tw = new_writer(bytes.new_buffer([]))
+  assert !tw.add_fs!(fsys).ok?, "want an error"
+}

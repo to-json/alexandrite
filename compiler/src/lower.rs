@@ -4652,7 +4652,7 @@ fn zero_le(t: &LTy) -> LE {
         LTy::Region => LE::RegionProgram,
         // A fresh closed-over channel stands in for "no channel" (never observed).
         LTy::Chan(e) => LE::ChanNew((**e).clone(), Box::new(LE::I(0))),
-        LTy::Task(_) => panic!("a task handle has no zero value"),
+        LTy::Task(_) => LE::NullTask(t.clone()),
         LTy::Lock => LE::LockNew,
         LTy::Atomic => LE::AtomicNew(Box::new(LE::I(0))),
         LTy::I64 | LTy::IntK(_) => LE::I(0),

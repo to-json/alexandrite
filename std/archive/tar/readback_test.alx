@@ -1,0 +1,129 @@
+# Archives written by alx's Writer, for Go to read back. With
+# ALX_TAR_DUMP=dir set, the "dump readback archives" test writes them to dir;
+# a Go program read them and generated vec_readback_test.alx (what Go's
+# Reader saw: the SHA-256 of each archive, its headers and data).
+
+import "bytes"
+import "io/fs"
+import "os"
+import "strings"
+import "testing/fstest"
+import "time"
+
+struct RBFile {
+  h: Header
+  data: Str
+}
+
+def rb(name: Str, data: Str) -> RBFile {
+  RBFile.new(h: Header.new(typeflag: TYPE_REG, name: name, size: data.size, mode: 0o644, mod_time: time.unix(1700000000, 0)), data: data)
+}
+
+def rbh(h: Header, data: Str) -> RBFile {
+  RBFile.new(h: h, data: data)
+}
+
+def write_archive(files: [RBFile]) -> ~[Byte] {
+  b = bytes.new_buffer([])
+  tw = new_writer(b)
+  for f in files {
+    tw.~write_header!(f.h)
+    tw.~write!(f.data.bytes.to_a) if f.data != ""
+  }
+  tw.~close!
+  b.bytes
+}
+
+def readback_archives -> ~[(Str, [Byte])] {
+  t0 = time.unix(1700000000, 0)
+  out: [(Str, [Byte])] = []
+  out << ("simple", ~write_archive([rb("a.txt", "alpha\n"), rb("dir/b.txt", strings.repeat("beta ", 300))]))
+  formats = [FORMAT_UNKNOWN, FORMAT_USTAR, FORMAT_PAX, FORMAT_GNU]
+  for f in formats {
+    fs_ = format_string(f)
+    out << ("types #{fs_}", ~write_archive([
+      rbh(Header.new(typeflag: TYPE_DIR, name: "d/", mode: 0o755, mod_time: t0, format: f), ""),
+      rbh(Header.new(typeflag: TYPE_REG, name: "d/f", size: 3, mode: 0o600, uid: 1000, gid: 1000, uname: "u", gname: "g", mod_time: t0, format: f), "abc"),
+      rbh(Header.new(typeflag: TYPE_SYMLINK, name: "d/s", linkname: "f", mode: 0o777, mod_time: t0, format: f), ""),
+      rbh(Header.new(typeflag: TYPE_LINK, name: "d/h", linkname: "d/f", mode: 0o600, mod_time: t0, format: f), ""),
+      rbh(Header.new(typeflag: TYPE_CHAR, name: "d/c", devmajor: 4, devminor: 64, mode: 0o620, mod_time: t0, format: f), ""),
+      rbh(Header.new(typeflag: TYPE_BLOCK, name: "d/b", devmajor: 8, devminor: 1, mode: 0o660, mod_time: t0, format: f), ""),
+      rbh(Header.new(typeflag: TYPE_FIFO, name: "d/p", mode: 0o644, mod_time: t0, format: f), ""),
+    ]))
+  }
+  out << ("long names pax", ~write_archive([
+    rb(strings.repeat("very-long-directory-name/", 12) + "file.txt", "x"),
+    rbh(Header.new(typeflag: TYPE_SYMLINK, name: "l", linkname: strings.repeat("target/", 40), mod_time: t0), ""),
+  ]))
+  out << ("long names gnu", ~write_archive([
+    rbh(Header.new(typeflag: TYPE_REG, name: strings.repeat("gnu/", 50) + "f", size: 1, mod_time: t0, format: FORMAT_GNU), "g"),
+    rbh(Header.new(typeflag: TYPE_SYMLINK, name: "l", linkname: strings.repeat("t/", 80), mod_time: t0, format: FORMAT_GNU), ""),
+  ]))
+  out << ("ustar prefix", ~write_archive([rb(strings.repeat("p", 120) + "/" + strings.repeat("n", 90), "split")]))
+  out << ("unicode", ~write_archive([rbh(Header.new(typeflag: TYPE_REG, name: "日本語/ファイル.txt", size: 6, uname: "ユーザー", gname: "グループ", mod_time: t0), "héllo")]))
+  out << ("times", ~write_archive([
+    rbh(Header.new(typeflag: TYPE_REG, name: "nano", mod_time: time.unix(1700000000, 123456789), access_time: time.unix(1600000000, 5), change_time: time.unix(1500000000, 0), format: FORMAT_PAX), ""),
+    rbh(Header.new(typeflag: TYPE_REG, name: "gnu", mod_time: time.unix(1700000000, 0), access_time: time.unix(1600000000, 0), change_time: time.unix(1500000000, 0), format: FORMAT_GNU), ""),
+    rbh(Header.new(typeflag: TYPE_REG, name: "old", mod_time: time.unix(-86400 * 365, 0)), ""),
+    rbh(Header.new(typeflag: TYPE_REG, name: "future", mod_time: time.unix(1 << 35, 0)), ""),
+  ]))
+  out << ("big numbers", ~write_archive([
+    rbh(Header.new(typeflag: TYPE_REG, name: "uid", uid: 1 << 30, gid: (1 << 21) + 1, mode: 0o644, mod_time: t0), ""),
+    rbh(Header.new(typeflag: TYPE_REG, name: "gnu-uid", uid: 1 << 40, mode: 0o644, mod_time: t0, format: FORMAT_GNU), ""),
+    rbh(Header.new(typeflag: TYPE_CHAR, name: "dev", devmajor: -1, devminor: 1 << 40, mod_time: t0), ""),
+  ]))
+  out << ("xattrs and records", ~write_archive([
+    rbh(Header.new(typeflag: TYPE_REG, name: "x", size: 1, mod_time: t0, xattrs: {"user.mime" => "text/plain", "security.label" => "s0"}, pax_records: {"comment" => "written by alx", "GOLANG.pkg" => "tar", "VENDOR.key" => "a=b c"}), "x"),
+  ]))
+  out << ("global header", ~write_archive([
+    rbh(Header.new(typeflag: TYPE_X_GLOBAL_HEADER, pax_records: {"comment" => "global", "mtime" => "1234567890.5"}), ""),
+    rb("after-global", "data"),
+    rbh(Header.new(typeflag: TYPE_X_GLOBAL_HEADER, name: "named-global", pax_records: {"comment" => "second"}), ""),
+  ]))
+  out << ("sizes", ~write_archive([rb("0", ""), rb("1", "1"), rb("511", strings.repeat("a", 511)), rb("512", strings.repeat("b", 512)), rb("513", strings.repeat("c", 513)), rb("5000", strings.repeat("0123456789", 500))]))
+  out << ("modes", ~write_archive([
+    rbh(Header.new(typeflag: TYPE_REG, name: "suid", mode: 0o4755, mod_time: t0), ""),
+    rbh(Header.new(typeflag: TYPE_REG, name: "sgid", mode: 0o2755, mod_time: t0), ""),
+    rbh(Header.new(typeflag: TYPE_DIR, name: "sticky/", mode: 0o1777, mod_time: t0), ""),
+  ]))
+  # add_fs! over an in-memory file system.
+  link = fstest.map_file_str("a/one.txt")
+  link.mode = fs.mode(0o777 | fs.MODE_SYMLINK)
+  link.mod_time = t0
+  one = fstest.map_file_str("one\n")
+  one.mod_time = t0
+  two = fstest.map_file_str(strings.repeat("two ", 1000))
+  two.mode = fs.mode(0o600)
+  two.mod_time = time.unix(1600000000, 0)
+  fsys = fstest.map_fs({"a/one.txt" => one, "a/b/two.txt" => two, "link" => link})
+  b = bytes.new_buffer([])
+  tw = new_writer(b)
+  tw.~add_fs!(fsys)
+  tw.~close!
+  out << ("add_fs", b.bytes)
+  out
+}
+
+def readback_archive(name: Str) -> ~[Byte] {
+  for a in ~readback_archives {
+    return a[1] if a[0] == name
+  }
+  assert false, "no archive #{name}"
+  []
+}
+
+test "dump readback archives" {
+  if dir = os.getenv("ALX_TAR_DUMP") {
+    for a in ~readback_archives {
+      os.~write_file(dir + "/" + strings.replace_all(a[0], " ", "+") + ".tar", a[1], 0o644)
+    }
+  }
+}
+
+# What Go read from the archive alx wrote: its SHA-256, the headers and
+# each entry's data CRC-32.
+def check_readback(name: Str, sum: Str, want: [Header], sums: [Str]) -> ~Unit {
+  data = ~readback_archive(name)
+  assert sha256_hex(data) == sum, "#{name}: alx's archive changed since Go read it"
+  ~check_reader_on(name, bytes.new_reader(data), want, sums, true, "")
+}

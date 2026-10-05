@@ -1,0 +1,162 @@
+# Go's example_*_test.go.
+
+import "fmt"
+import "log"
+import "os"
+import "time"
+
+def remove_time(gs: [Str], a: Attr) -> Attr {
+  a.key == TIME_KEY && gs.size == 0 ? Attr.new : a
+}
+
+def stdout_opts -> HandlerOptions {
+  HandlerOptions.new(replace_attr: ->(gs: [Str], a: Attr) -> Attr { remove_time(gs, a) })
+}
+
+example "group" {
+  logger = new(new_text_handler(os.stdout, stdout_opts))
+  logger.info("finished", [group("req", [string("method", "GET"), string("url", "localhost")]), int("status", 200), duration("duration", time.second)])
+} outputs "level=INFO msg=finished req.method=GET req.url=localhost status=200 duration=1s\n"
+
+example "group attrs" {
+  opts = stdout_opts
+  opts.level = level_debug
+  logger = new(new_text_handler(os.stdout, opts))
+  attrs = [string("method", "POST")]
+  attrs << string("url", "localhost")
+  attrs << int("content-length", 0)
+  logger.log_attrs(level_info, "finished", [int("status", 200), group_attrs("req", attrs)])
+  logger.log_attrs(level_info, "finished", [int("status", 200), group_attrs("", attrs)])
+} outputs "level=INFO msg=finished status=200 req.method=POST req.url=localhost req.content-length=0\nlevel=INFO msg=finished status=200 method=POST url=localhost content-length=0\n"
+
+example "handler options custom levels" {
+  level_trace = Level.new(n: -8)
+  level_notice = Level.new(n: 2)
+  level_emergency = Level.new(n: 12)
+  th = new_text_handler(os.stdout, HandlerOptions.new(level: level_trace, replace_attr: ->(gs: [Str], a: Attr) -> Attr {
+    return Attr.new if a.key == TIME_KEY
+    if a.key == LEVEL_KEY {
+      level = a.value.level.unwrap
+      name = "EMERGENCY"
+      if level < level_debug {
+        name = "TRACE"
+      } else if level < level_info {
+        name = "DEBUG"
+      } else if level < Level.new(n: 2) {
+        name = "INFO"
+      } else if level < level_warn {
+        name = "NOTICE"
+      } else if level < level_error {
+        name = "WARNING"
+      } else if level < Level.new(n: 12) {
+        name = "ERROR"
+      }
+      return string("sev", name)
+    }
+    a
+  }))
+  logger = new(th)
+  logger.log(level_emergency, "missing pilots", [])
+  logger.error("failed to start engines", [string("err", "missing fuel")])
+  logger.warn("falling back to default value", [])
+  logger.log(level_notice, "all systems are running", [])
+  logger.info("initiating launch", [])
+  logger.debug("starting background job", [])
+  logger.log(level_trace, "button clicked", [])
+} outputs "sev=EMERGENCY msg=\"missing pilots\"\nsev=ERROR msg=\"failed to start engines\" err=\"missing fuel\"\nsev=WARNING msg=\"falling back to default value\"\nsev=NOTICE msg=\"all systems are running\"\nsev=INFO msg=\"initiating launch\"\nsev=DEBUG msg=\"starting background job\"\nsev=TRACE msg=\"button clicked\"\n"
+
+example "discard handler" {
+  logger1 = new(new_text_handler(os.stdout, stdout_opts))
+  logger1.info("message 1", [])
+  logger2 = new(discard_handler)
+  logger2.info("message 2", [])
+} outputs "level=INFO msg=\"message 1\"\n"
+
+# Go's ExampleSetLogLoggerLevel_log, with the default handler's level_var
+# in place of the global SetLogLoggerLevel.
+example "log logger level" {
+  ll = log.new(os.stdout, "", 0)
+  h = new_default_handler(ll)
+  l = new(h)
+  ll.print("log debug")
+  l.debug("debug", [])
+  l.info("info", [])
+  h.level_var.set(level_debug)
+  ll.print("log debug")
+  l.debug("debug", [])
+  l.info("info", [])
+} outputs "log debug\nINFO info\nlog debug\nDEBUG debug\nINFO info\n"
+
+# Go's ExampleSetLogLoggerLevel_slog: log output through a handler.
+example "log logger through handler" {
+  ll = new_log_logger(new_text_handler(os.stdout, stdout_opts), level_error)
+  ll.print("error")
+} outputs "level=ERROR msg=error\n"
+
+struct Token {
+  s: Str
+
+  def log_value -> Value { string_value("REDACTED_TOKEN") }
+}
+
+struct Name {
+  first: Str
+  last: Str
+
+  def log_value -> Value { group_value([string("first", first), string("last", last)]) }
+}
+
+example "log valuer group" {
+  logger = new(new_json_handler(os.stdout, stdout_opts))
+  logger.info("mission accomplished", [any("agent", valuer_value(Name.new(first: "Perry", last: "Platypus")))])
+} outputs "{\"level\":\"INFO\",\"msg\":\"mission accomplished\",\"agent\":{\"first\":\"Perry\",\"last\":\"Platypus\"}}\n"
+
+example "log valuer secret" {
+  logger = new(new_text_handler(os.stdout, stdout_opts))
+  logger.info("permission granted", [string("user", "Perry"), any("token", valuer_value(Token.new(s: "shhhh!")))])
+} outputs "level=INFO msg=\"permission granted\" user=Perry token=REDACTED_TOKEN\n"
+
+# Go's Example_wrapping: a helper that builds its own Record. Without caller
+# locations there is no source=... (Go: source=example_wrap_test.go:43).
+def infof(logger: Logger, msg: Str) {
+  return if !logger.enabled?(level_info)
+  r = new_record(time.now, level_info, msg, 0)
+  _ = logger.handler.handle(r)
+  nil
+}
+
+example "wrapping" {
+  opts = stdout_opts
+  opts.add_source = true
+  logger = new(new_text_handler(os.stdout, opts))
+  infof(logger, fmt.sprintf("message, %s", "formatted"))
+} outputs "level=INFO msg=\"message, formatted\"\n"
+
+example "multi handler" {
+  tb = new_buf
+  jb = new_buf
+  logger = new(new_multi_handler([new_text_handler(tb, stdout_opts), new_json_handler(jb, stdout_opts)]))
+  logger.info("login", [string("name", "whoami"), int("id", 42)])
+  print tb.string
+  print jb.string
+} outputs "level=INFO msg=login name=whoami id=42\n{\"level\":\"INFO\",\"msg\":\"login\",\"name\":\"whoami\",\"id\":42}\n"
+
+example "level handler" {
+  th = new_text_handler(os.stdout, stdout_opts)
+  logger = new(new_level_handler(level_warn, th))
+  logger.info("not printed", [])
+  logger.warn("printed", [])
+} outputs "level=WARN msg=printed\n"
+
+# Go's LevelHandler example, generic over the handler it wraps.
+struct LevelHandler[H] {
+  level: Level
+  handler: H
+
+  def enabled?(l: Level) -> Bool { l >= level }
+  def handle(r: Record) -> ~Unit { ~handler.handle(r) }
+  def with_attrs(as: [Attr]) -> LevelHandler[H] { LevelHandler[H].new(level: level, handler: handler.with_attrs(as)) }
+  def with_group(name: Str) -> LevelHandler[H] { LevelHandler[H].new(level: level, handler: handler.with_group(name)) }
+}
+
+def new_level_handler[H](level: Level, h: H) -> LevelHandler[H] { LevelHandler[H].new(level: level, handler: h) }

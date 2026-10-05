@@ -1,0 +1,293 @@
+# Tests for package tzdata, and for package time's tz database support with the
+# embedded database (Go's DisablePlatformSources tests). The Go-generated vectors
+# are in vec_*_test.alx.
+import "time"
+import "os"
+
+L = "2006-01-02 15:04:05 -07:00:00 MST"
+
+# A zone from the embedded database alone.
+def zone(name: Str) -> time.Location {
+  time.load_location_from_tzdata(name, tzinfo(name).unwrap).unwrap
+}
+
+# The instant `sec` in loc: "time|is_dst|zone start|zone end".
+def zs(loc: time.Location, sec: Int) -> Str {
+  t = time.unix(sec, 0).in_zone(loc)
+  s, e = t.zone_bounds
+  "#{t.format(L)}|#{t.is_dst}|#{s.format(L)}|#{e.format(L)}"
+}
+
+# time.date in loc: "time unix".
+def dz(loc: time.Location, y: Int, m: Int, d: Int, h: Int, mi: Int, s: Int) -> Str {
+  t = time.date(y, m, d, h, mi, s, 0, loc)
+  "#{t.format(L)} #{t.unix}"
+}
+
+# parse_in_location: "unix time offset location", or the error.
+def pz(layout: Str, value: Str, loc: time.Location) -> Str {
+  r = time.parse_in_location(layout, value, loc)
+  if e = r.err { return "error: " + e.message }
+  p = r.unwrap
+  _, off = p.zone_info
+  "#{p.unix} #{p.format(L)} #{off} #{p.location}"
+}
+
+def utcd(y: Int, m: Int, d: Int, h: Int, mi: Int) -> time.Time { time.date(y, m, d, h, mi, 0, 0, time.utc()) }
+
+test "embedded tzdata (TestEmbeddedTZData)" {
+  for name in ["Asia/Jerusalem", "America/Los_Angeles"] {
+    data = ~tzinfo(name)
+    assert data.size > 100, name
+    assert_eq Str.from_bytes(data[0...4]), "TZif"
+    loc = ~time.load_location_from_tzdata(name, data)
+    assert_eq loc.string, name
+    # the system's database, when there is one, agrees on the zones in use now
+    sys = time.load_location(name)
+    if l = sys.ok {
+      now = time.now
+      assert_eq now.in_zone(l).zone_info, now.in_zone(loc).zone_info
+    }
+  }
+  r = tzinfo("Asia/SomethingNotExist")
+  assert_eq r.err.unwrap.message, "no such file or directory"
+}
+
+test "the embedded archive is Go's zoneinfo.zip" {
+  z = zip_data
+  assert_eq z.size, ZIP_SIZE
+  assert_eq z[0...4], [0x50.as_u8, 0x4b, 0x03, 0x04]
+  # every name in the central directory loads
+  n = get2(z, z.size - 12)
+  assert n > 500
+  idx = get4(z, z.size - 6)
+  count = 0
+  for _i in 0...n {
+    namelen = get2(z, idx + 28)
+    name = Str.from_bytes(z[idx + 46...idx + 46 + namelen])
+    idx += 46 + namelen + get2(z, idx + 30) + get2(z, idx + 32)
+    loc = time.load_location_from_tzdata(name, ~tzinfo(name))
+    assert loc.ok?, name
+    count += 1
+  }
+  assert_eq count, n
+}
+
+test "load_location falls back to the embedded database" {
+  loc = ~load_location("Australia/Lord_Howe")
+  assert_eq loc.string, "Australia/Lord_Howe"
+  assert_eq (~load_location("UTC")).string, "UTC"
+  assert_eq (~load_location("Local")).string, "Local"
+  assert_eq load_location("Asia/SomethingNotExist").err.unwrap.message, "unknown time zone Asia/SomethingNotExist"
+  assert_eq load_location("../etc/passwd").err.unwrap.message, "time: invalid location name"
+  assert_eq load_location("/etc/localtime").err.unwrap.message, "time: invalid location name"
+}
+
+test "ZONEINFO names a zip archive (TestEnvVarUsage, TestLoadLocationFromTZData)" {
+  old = os.getenv("ZONEINFO")
+  dir = ~os.mkdir_temp("", "tzdata")
+  path = dir + "/zoneinfo.zip"
+  ~os.write_file(path, zip_data, 0o644)
+  ~os.setenv("ZONEINFO", path)
+  for name in ["Asia/Jerusalem", "America/New_York", "Pacific/Apia", "Europe/Dublin"] {
+    reference = ~time.load_location(name)
+    sample = zone(name)
+    assert reference == sample, name
+  }
+  # a name missing from the archive falls through to the system's database
+  r = time.load_location("Asia/SomethingNotExist")
+  assert_eq r.err.unwrap.message, "unknown time zone Asia/SomethingNotExist"
+  # a missing archive: the system's database
+  ~os.setenv("ZONEINFO", dir + "/foo.zip")
+  r2 = time.load_location("Asia/SomethingNotExist")
+  assert_eq r2.err.unwrap.message, "unknown time zone Asia/SomethingNotExist"
+  # a corrupt one is an error of its own, when the system has no such zone either
+  ~os.write_file(path, "not a zip archive at all".bytes.to_a, 0o644)
+  ~os.setenv("ZONEINFO", path)
+  r3 = time.load_location("Asia/SomethingNotExist")
+  assert_eq r3.err.unwrap.message, "corrupt zip file " + path
+  # ZONEINFO as a directory
+  ~os.mkdir_all(dir + "/Mars", 0o755)
+  ~os.write_file(dir + "/Mars/Olympus", ~tzinfo("Asia/Kolkata"), 0o644)
+  ~os.setenv("ZONEINFO", dir)
+  m = ~time.load_location("Mars/Olympus")
+  assert_eq m.string, "Mars/Olympus"
+  assert_eq time.date(2020, 1, 1, 0, 0, 0, 0, m).format(L), "2020-01-01 00:00:00 +05:30:00 IST"
+  if v = old {
+    ~os.setenv("ZONEINFO", v)
+  } else {
+    ~os.unsetenv("ZONEINFO")
+  }
+  ~os.remove_all(dir)
+}
+
+test "version 3 (TestVersion3)" {
+  loc = zone("Asia/Jerusalem")
+  assert_eq loc.string, "Asia/Jerusalem"
+}
+
+test "times before the first transition (TestFirstZone)" {
+  f = "Mon, 02 Jan 2006 15:04:05 -0700 (MST)"
+  pst = zone("PST8PDT")
+  assert_eq time.unix(-1633269601, 0).in_zone(pst).format(f), "Sun, 31 Mar 1918 01:59:59 -0800 (PST)"
+  assert_eq time.unix(-1633269600, 0).in_zone(pst).format(f), "Sun, 31 Mar 1918 03:00:00 -0700 (PDT)"
+  fak = zone("Pacific/Fakaofo")
+  assert_eq time.unix(1325242799, 0).in_zone(fak).format(f), "Thu, 29 Dec 2011 23:59:59 -1100 (-11)"
+  assert_eq time.unix(1325242800, 0).in_zone(fak).format(f), "Sat, 31 Dec 2011 00:00:00 +1300 (+13)"
+}
+
+test "early location (TestEarlyLocation)" {
+  loc = zone("America/New_York")
+  d = time.date(1900, time.JANUARY, 1, 0, 0, 0, 0, loc)
+  name, off = d.zone_info
+  assert_eq name, "EST"
+  assert_eq off, -18000
+}
+
+test "load fixed (TestLoadFixed)" {
+  loc = zone("Etc/GMT+1")
+  name, off = time.now.in_zone(loc).zone_info
+  assert name == "GMT+1" || name == "-01", name
+  assert_eq off, -3600
+}
+
+test "zip file (TestLoadLocationZipFile)" {
+  assert_eq zone("Australia/Sydney").string, "Australia/Sydney"
+}
+
+test "is_dst (TestTimeIsDST)" {
+  with_dst = zone("Australia/Sydney")
+  without_dst = zone("Australia/Brisbane")
+  fixed = time.fixed_zone("FIXED_TIME", 12345)
+  assert !time.date(2009, 1, 1, 12, 0, 0, 0, time.utc()).is_dst
+  assert !time.date(2009, 6, 1, 12, 0, 0, 0, time.utc()).is_dst
+  assert time.date(2009, 1, 1, 12, 0, 0, 0, with_dst).is_dst
+  assert !time.date(2009, 6, 1, 12, 0, 0, 0, with_dst).is_dst
+  assert !time.date(2009, 1, 1, 12, 0, 0, 0, without_dst).is_dst
+  assert !time.date(2009, 6, 1, 12, 0, 0, 0, without_dst).is_dst
+  assert !time.date(2009, 1, 1, 12, 0, 0, 0, fixed).is_dst
+  assert !time.date(2009, 6, 1, 12, 0, 0, 0, fixed).is_dst
+}
+
+test "zone transitions in date (TestTimeWithZoneTransition)" {
+  loc = zone("Asia/Shanghai")
+  # 14 Apr 1991: clocks went from 02:00 to 03:00 (13 Apr 18:00 UTC)
+  assert time.date(1991, 4, 13, 17, 50, 0, 0, loc) == utcd(1991, 4, 13, 9, 50)
+  assert time.date(1991, 4, 13, 18, 0, 0, 0, loc) == utcd(1991, 4, 13, 10, 0)
+  assert time.date(1991, 4, 14, 1, 50, 0, 0, loc) == utcd(1991, 4, 13, 17, 50)
+  assert time.date(1991, 4, 14, 3, 0, 0, 0, loc) == utcd(1991, 4, 13, 18, 0)
+  # 15 Sep 1991: clocks went from 02:00 back to 01:00 (14 Sep 17:00 UTC)
+  assert time.date(1991, 9, 14, 16, 50, 0, 0, loc) == utcd(1991, 9, 14, 7, 50)
+  assert time.date(1991, 9, 14, 17, 0, 0, 0, loc) == utcd(1991, 9, 14, 8, 0)
+  assert time.date(1991, 9, 15, 0, 50, 0, 0, loc) == utcd(1991, 9, 14, 15, 50)
+  assert time.date(1991, 9, 15, 2, 0, 0, 0, loc) == utcd(1991, 9, 14, 18, 0)
+}
+
+test "zone_bounds (TestZoneBounds)" {
+  loc = zone("Asia/Shanghai")
+  # UTC: two zero Times
+  for sec in [0, 1221681866, -1221681866, 1700000000] {
+    s, e = time.unix(sec, 0).utc.zone_bounds
+    assert s.is_zero && e.is_zero
+  }
+  # a zone from the beginning of time has a zero start
+  s, e = time.date(-2147483648, 1, 1, 0, 0, 0, 0, loc).zone_bounds
+  assert s.is_zero && !e.is_zero
+  # one that goes on forever a zero end
+  s, e = time.date(2147483647, 1, 1, 0, 0, 0, 0, loc).zone_bounds
+  assert !s.is_zero && e.is_zero
+
+  one = time.date(1990, 9, 16, 1, 0, 0, 0, loc)
+  two = time.date(1991, 4, 14, 3, 0, 0, 0, loc)
+  three = time.date(1991, 9, 15, 1, 0, 0, 0, loc)
+  zero = time.Time.new()
+  cases = [
+    (time.date(1991, 4, 13, 17, 50, 0, 0, loc), one, two),
+    (time.date(1991, 4, 13, 18, 0, 0, 0, loc), one, two),
+    (time.date(1991, 4, 14, 1, 50, 0, 0, loc), one, two),
+    (two, two, three),
+    (time.date(1991, 9, 14, 16, 50, 0, 0, loc), two, three),
+    (time.date(1991, 9, 14, 17, 0, 0, 0, loc), two, three),
+    (time.date(1991, 9, 15, 0, 50, 0, 0, loc), two, three),
+    (three, three, zero),
+    (time.date(1991, 12, 15, 1, 50, 0, 0, loc), three, zero),
+    (time.date(1992, 4, 13, 17, 50, 0, 0, loc), three, zero),
+    (time.date(1992, 4, 13, 18, 0, 0, 0, loc), three, zero),
+    (time.date(1992, 4, 14, 1, 50, 0, 0, loc), three, zero),
+    (time.date(1992, 9, 14, 16, 50, 0, 0, loc), three, zero),
+    (time.date(1992, 9, 14, 17, 0, 0, 0, loc), three, zero),
+    (time.date(1992, 9, 15, 0, 50, 0, 0, loc), three, zero),
+  ]
+  for c in cases {
+    s2, e2 = c[0].zone_bounds
+    assert s2 == c[1], c[0].to_s
+    assert e2 == c[2], c[0].to_s
+  }
+  # Go's test runs these in its forced Local, America/Los_Angeles
+  la = zone("America/Los_Angeles")
+  lt = ->(sec: Int) -> time.Time { time.unix(sec, 0).in_zone(la) }
+  bounds = [
+    (0, -5756400, 9972000),
+    (1221681866, 1205056800, 1225616400),
+    (2152173599, 2145916800, 2152173600),
+    (2152173600, 2152173600, 2172733200),
+    (2152173601, 2152173600, 2172733200),
+    (2159200800, 2152173600, 2172733200),
+    (2172733199, 2152173600, 2172733200),
+    (2172733200, 2172733200, 2177452800),
+  ]
+  for b in bounds {
+    s3, e3 = lt.call(b[0]).zone_bounds
+    assert_eq s3.unix, b[1]
+    assert_eq e3.unix, b[2]
+    assert_eq s3.location.string, "America/Los_Angeles"
+  }
+}
+
+test "parse in location (TestParseInLocation)" {
+  baghdad = zone("Asia/Baghdad")
+  t1 = ~time.parse_in_location("Jan 02 2006 MST", "Feb 01 2013 AST", baghdad)
+  _, off = t1.zone_info
+  # Since tzdata 2017a Baghdad is "+03", not "AST": then the offset is 0.
+  if off != 0 {
+    assert t1 == time.date(2013, 2, 1, 0, 0, 0, 0, baghdad)
+    assert_eq off, 3 * 60 * 60
+  }
+  blanc = zone("America/Blanc-Sablon")
+  t2 = ~time.parse_in_location("Jan 02 2006 MST", "Feb 01 2013 AST", blanc)
+  assert t2 == time.date(2013, 2, 1, 0, 0, 0, 0, blanc)
+  _, off2 = t2.zone_info
+  assert_eq off2, -4 * 60 * 60
+}
+
+example "load_location (ExampleLoadLocation)" {
+  location = zone("America/Los_Angeles")
+  time_in_utc = time.date(2018, 8, 30, 12, 0, 0, 0, time.utc())
+  puts time_in_utc.in_zone(location)
+} outputs "2018-08-30 05:00:00 -0700 PDT\n"
+
+example "parse_in_location (ExampleParseInLocation)" {
+  loc = zone("Europe/Berlin")
+  # This will look for the name CEST in the Europe/Berlin time zone.
+  long_form = "Jan 2, 2006 at 3:04pm (MST)"
+  t = time.parse_in_location(long_form, "Jul 9, 2012 at 5:02am (CEST)", loc).unwrap
+  puts t
+  # Note: without explicit zone, returns time in given location.
+  t = time.parse_in_location("2006-Jan-02", "2012-Jul-09", loc).unwrap
+  puts t
+} outputs "2012-07-09 05:02:00 +0200 CEST\n2012-07-09 00:00:00 +0200 CEST\n"
+
+example "add_date across a transition (ExampleTime_AddDate)" {
+  zurich = zone("Europe/Zurich")
+  start = time.date(2023, 3, 25, 12, 0, 0, 0, zurich)
+  later = start.add_date(0, 0, 1)
+  puts "oneDayLaterZurich: startZurich.AddDate(0, 0, 1) = #{later}"
+  puts "Day duration in Zürich: #{later.sub(start)}"
+} outputs "oneDayLaterZurich: startZurich.AddDate(0, 0, 1) = 2023-03-26 12:00:00 +0200 CEST\nDay duration in Zürich: 23h0m0s\n"
+
+example "in_zone (ExampleTime_Format with Asia/Shanghai)" {
+  t = time.parse_in_location(time.UNIX_DATE, "Wed Feb 25 11:06:39 PST 2015", time.utc()).unwrap
+  tz = zone("Asia/Shanghai")
+  puts "Same, in UTC: #{t.utc.format(time.UNIX_DATE)}"
+  puts "Same, in Shanghai: #{t.in_zone(tz).format(time.UNIX_DATE)}"
+} outputs "Same, in UTC: Wed Feb 25 11:06:39 UTC 2015\nSame, in Shanghai: Wed Feb 25 19:06:39 CST 2015\n"

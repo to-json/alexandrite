@@ -1,0 +1,419 @@
+# Values and attributes (Go's value.go, attr.go). See slog.alx for the map
+# from Go's API.
+
+import "math"
+import "strconv"
+import "time"
+
+# The kinds of Values (Go's Kind).
+pub KIND_ANY = 0
+pub KIND_BOOL = 1
+pub KIND_DURATION = 2
+pub KIND_FLOAT64 = 3
+pub KIND_INT64 = 4
+pub KIND_STRING = 5
+pub KIND_TIME = 6
+pub KIND_UINT64 = 7
+pub KIND_GROUP = 8
+pub KIND_LOG_VALUER = 9
+
+# Go's Kind.String.
+pub def kind_string(k: Int) -> Str {
+  case k {
+    0 => "Any"
+    1 => "Bool"
+    2 => "Duration"
+    3 => "Float64"
+    4 => "Int64"
+    5 => "String"
+    6 => "Time"
+    7 => "Uint64"
+    8 => "Group"
+    9 => "LogValuer"
+    _ => "<unknown slog.Kind>"
+  }
+}
+
+# What a Value holds (more cases than Kind: the ones Go tells apart by the
+# dynamic type of an `any`).
+T_NIL = 0 # KIND_ANY holding nothing (Go's zero Value, AnyValue(nil))
+T_BOOL = 1
+T_DURATION = 2
+T_FLOAT = 3
+T_INT = 4
+T_STRING = 5
+T_TIME = 6
+T_UINT = 7
+T_GROUP = 8
+T_VALUER = 9
+T_LEVEL = 10    # KIND_ANY: a Level
+T_ERROR = 11    # KIND_ANY: an error (its message)
+T_BYTES = 12    # KIND_ANY: a []byte
+T_RAW_JSON = 13 # KIND_ANY: a json.RawMessage
+T_SOURCE = 14   # KIND_ANY: a *Source (s = function + "\x00" + file, num = line)
+T_LOGGABLE = 15 # KIND_ANY: a Loggable
+T_KIND = 16     # KIND_ANY: a Kind (num)
+
+# A type that can log itself as another Value (Go's LogValuer): the handlers
+# call log_value (repeatedly, up to 100 times) before writing an attribute.
+# Its implementors can't hold a Value themselves (a Value contains them).
+pub interface LogValuer {
+  def log_value -> Value
+}
+
+# What alexandrite has instead of Go's `any` in a Value: a type that says how
+# it is written (Go finds out by reflection: encoding.TextMarshaler,
+# json.Marshaler, error, %+v). Make one with `any_value(x)`.
+pub interface Loggable {
+  # The TextHandler's form (Go's MarshalText, or %+v); quoted when it needs
+  # it. A failure is written as `!ERROR:<message>`.
+  def log_text -> ~Str
+  # The JSONHandler's form: JSON text (Go's MarshalJSON / json.Marshal). It is
+  # checked and compacted, as Go's encoder does. A failure: `!ERROR:<message>`.
+  def log_json -> ~Str
+}
+
+# The source position of a log call (Go's Source). alexandrite has no caller
+# locations at run time, so Records never carry one (see the header).
+pub struct Source {
+  function: Str
+  file: Str
+  line: Int
+
+  # The JSONHandler's form: a group of the non-empty fields.
+  pub def group -> Value {
+    as: [Attr] = []
+    as << string("function", function) if function != ""
+    as << string("file", file) if file != ""
+    as << int("line", line) if line != 0
+    group_value(as)
+  }
+
+  pub def empty? -> Bool { function == "" && file == "" && line == 0 }
+}
+
+# The payload of a Value or of one node of a group.
+struct Scalar {
+  tag: Int
+  num: Int
+  s: Str
+  t: time.Time
+  lv: LogValuer?
+  x: Loggable?
+}
+
+# One attribute inside a group, flattened: `n` nodes follow it that belong
+# to it (its own group's attributes, recursively).
+struct Node {
+  key: Str
+  sc: Scalar
+  n: Int
+}
+
+# A value of one of the kinds (Go's Value). Groups keep their attributes as
+# a flat preorder list (a Value can't contain Values: see the header).
+pub struct Value {
+  sc: Scalar
+  kids: [Node]
+
+  pub def kind -> Int {
+    t = sc.tag
+    t <= T_VALUER ? (t == T_NIL ? KIND_ANY : t) : KIND_ANY
+  }
+
+  # Go's Value.String: the text of any kind ("[a=1 b=true]" for a group).
+  pub def to_s -> Str {
+    case sc.tag {
+      T_STRING => sc.s
+      T_INT => sc.num.to_s
+      T_UINT => strconv.format_uint(sc.num.as_u64, 10)
+      T_FLOAT => strconv.format_float(float_of(sc.num), "g", -1, 64)
+      T_BOOL => sc.num == 1 ? "true" : "false"
+      T_DURATION => time.Duration.new(sc.num).to_s
+      T_TIME => sc.t.format("2006-01-02 15:04:05.999999999 -0700 MST")
+      T_GROUP => "[" + self.group.map { it.to_s }.to_a.join(" ") + "]"
+      T_NIL => "<nil>"
+      T_LEVEL => Level.new(n: sc.num).to_s
+      T_ERROR => sc.s
+      T_BYTES => bytes_text(sc.s)
+      T_RAW_JSON => bytes_text(sc.s)
+      T_SOURCE => "&{" + self.source.function + " " + self.source.file + " " + sc.num.to_s + "}"
+      T_KIND => sc.num.to_s
+      T_LOGGABLE => loggable_text(sc.x)
+      _ => valuer_text(sc.lv)
+    }
+  }
+  pub def string -> Str { self.to_s }
+
+  # The Int64 (Go's Int64; panics on another kind, as Go does).
+  pub def int64 -> Int {
+    want_kind(KIND_INT64)
+    sc.num
+  }
+
+  pub def uint64 -> U64 {
+    want_kind(KIND_UINT64)
+    sc.num.as_u64
+  }
+
+  pub def float64 -> Float {
+    want_kind(KIND_FLOAT64)
+    float_of(sc.num)
+  }
+
+  pub def bool -> Bool {
+    want_kind(KIND_BOOL)
+    sc.num == 1
+  }
+
+  pub def duration -> time.Duration {
+    want_kind(KIND_DURATION)
+    time.Duration.new(sc.num)
+  }
+
+  pub def time -> time.Time {
+    want_kind(KIND_TIME)
+    sc.t
+  }
+
+  # The attributes of a group (Go's Group; panics on another kind).
+  pub def group -> [Attr] {
+    assert sc.tag == T_GROUP, "Group: bad kind"
+    out: [Attr] = []
+    i = 0
+    while i < kids.size {
+      nd = kids[i]
+      out << Attr.new(key: nd.key, value: Value.new(sc: nd.sc, kids: kids[i + 1...i + 1 + nd.n]))
+      i += 1 + nd.n
+    }
+    out
+  }
+
+  # The LogValuer (Go's LogValuer; panics on another kind).
+  pub def log_valuer -> LogValuer {
+    want_kind(KIND_LOG_VALUER)
+    sc.lv.unwrap
+  }
+
+  # Go's `v.Any().(T)` for the KIND_ANY cases alexandrite tells apart: the
+  # Level, the error message, the bytes, the Source, the Loggable, the Kind.
+  pub def level -> Level? { sc.tag == T_LEVEL ? Level.new(n: sc.num) : none }
+  pub def error_message -> Str? { sc.tag == T_ERROR ? sc.s : none }
+  pub def bytes -> [Byte]? { sc.tag == T_BYTES || sc.tag == T_RAW_JSON ? sc.s.bytes : none }
+  pub def loggable -> Loggable? { sc.tag == T_LOGGABLE ? sc.x : none }
+  pub def any_kind -> Int? { sc.tag == T_KIND ? sc.num : none }
+  # Whether it is Go's zero Value (AnyValue(nil)).
+  pub def nil? -> Bool { sc.tag == T_NIL }
+
+  pub def source -> Source {
+    assert sc.tag == T_SOURCE, "Value kind is not a *Source"
+    i = 0
+    while i < sc.s.size && sc.s[i] != 0 {
+      i += 1
+    }
+    f = i < sc.s.size ? sc.s[i + 1...sc.s.size] : ""
+    Source.new(function: sc.s[0...i], file: f, line: sc.num)
+  }
+
+  # Go's Equal: same kind and value (groups element-wise). Go compares
+  # Loggables and LogValuers as `any` values (identity for pointers); here
+  # Loggables are equal when both of their forms are, LogValuers when their
+  # resolved values are.
+  pub def equal(w: Value) -> Bool {
+    return false if sc.tag != w.sc.tag
+    case sc.tag {
+      T_INT => sc.num == w.sc.num
+      T_UINT => sc.num == w.sc.num
+      T_BOOL => sc.num == w.sc.num
+      T_DURATION => sc.num == w.sc.num
+      T_LEVEL => sc.num == w.sc.num
+      T_KIND => sc.num == w.sc.num
+      T_FLOAT => float_of(sc.num) == float_of(w.sc.num)
+      T_STRING => sc.s == w.sc.s
+      T_ERROR => sc.s == w.sc.s
+      T_BYTES => sc.s == w.sc.s
+      T_RAW_JSON => sc.s == w.sc.s
+      T_SOURCE => sc.s == w.sc.s && sc.num == w.sc.num
+      T_TIME => sc.t == w.sc.t
+      T_NIL => true
+      T_GROUP => attrs_equal(self.group, w.group)
+      T_LOGGABLE => loggable_text(sc.x) == loggable_text(w.sc.x) && loggable_json(sc.x) == loggable_json(w.sc.x)
+      _ => self.resolve.equal(w.resolve)
+    }
+  }
+  pub def ==(w: Value) -> Bool { self.equal(w) }
+
+  # Go's Resolve: calls log_value until the value isn't a LogValuer (at most
+  # 100 times; then an error value).
+  pub def resolve -> Value {
+    v = self
+    i = 0
+    while i < MAX_LOG_VALUES {
+      return v if v.sc.tag != T_VALUER
+      v = v.sc.lv.unwrap.log_value
+      i += 1
+    }
+    error_value("LogValue called too many times on Value of type LogValuer")
+  }
+
+  def empty_group? -> Bool { sc.tag == T_GROUP && kids.size == 0 }
+
+  def want_kind(k: Int) {
+    g = self.kind
+    assert g == k, "Value kind is #{kind_string(g)}, not #{kind_string(k)}"
+  }
+}
+
+MAX_LOG_VALUES = 100
+
+def float_of(n: Int) -> Float { math.float64frombits(n.as_u64) }
+
+# Go's %v of a []byte: "[1 2 3]".
+def bytes_text(s: Str) -> Str {
+  "[" + s.bytes.map { it.to_s }.to_a.join(" ") + "]"
+}
+
+def loggable_text(x: Loggable?) -> Str {
+  if l = x {
+    r = l.log_text
+    if e = r.err {
+      return "!ERROR:" + e.message
+    }
+    return r.unwrap
+  }
+  "<nil>"
+}
+
+def loggable_json(x: Loggable?) -> Str {
+  if l = x {
+    r = l.log_json
+    if e = r.err {
+      return "!ERROR:" + e.message
+    }
+    return r.unwrap
+  }
+  "null"
+}
+
+def valuer_text(x: LogValuer?) -> Str {
+  if l = x {
+    return l.log_value.to_s
+  }
+  "<nil>"
+}
+
+def sc(tag: Int, num: Int) -> Scalar { Scalar.new(tag: tag, num: num) }
+
+# ------------------------------------------------------------ constructors
+
+pub def string_value(v: Str) -> Value { Value.new(sc: Scalar.new(tag: T_STRING, s: v)) }
+pub def int_value(v: Int) -> Value { Value.new(sc: sc(T_INT, v)) }
+pub def int64_value(v: Int) -> Value { Value.new(sc: sc(T_INT, v)) }
+pub def uint64_value(v: U64) -> Value { Value.new(sc: sc(T_UINT, v.as_i64)) }
+pub def float64_value(v: Float) -> Value { Value.new(sc: sc(T_FLOAT, math.float64bits(v).as_i64)) }
+pub def bool_value(v: Bool) -> Value { Value.new(sc: sc(T_BOOL, v ? 1 : 0)) }
+pub def duration_value(v: time.Duration) -> Value { Value.new(sc: sc(T_DURATION, v.nanoseconds)) }
+
+# Go's TimeValue: the monotonic reading is dropped (Go's t.Round(0)).
+pub def time_value(v: time.Time) -> Value { Value.new(sc: Scalar.new(tag: T_TIME, t: v.strip_mono)) }
+
+# Go's GroupValue: empty groups among `as` are left out.
+pub def group_value(as: [Attr]) -> Value {
+  kids: [Node] = []
+  n = 0
+  for a in as {
+    next if a.value.empty_group?
+    kids << Node.new(key: a.key, sc: a.value.sc, n: a.value.kids.size)
+    for k in a.value.kids {
+      kids << k
+    }
+    n += 1
+  }
+  Value.new(sc: sc(T_GROUP, n), kids: kids)
+}
+
+# Go's AnyValue of a LogValuer: a KIND_LOG_VALUER Value.
+pub def valuer_value(v: LogValuer) -> Value { Value.new(sc: Scalar.new(tag: T_VALUER, lv: v)) }
+
+# Go's AnyValue of anything else, said explicitly (see Loggable).
+pub def any_value(v: Loggable) -> Value { Value.new(sc: Scalar.new(tag: T_LOGGABLE, x: v)) }
+
+# Go's AnyValue(nil): the zero Value (`Value.new` is the same).
+pub def nil_value -> Value { Value.new }
+
+# Go's AnyValue(err) for an error: KIND_ANY, written as the error's message.
+pub def error_value(msg: Str) -> Value { Value.new(sc: Scalar.new(tag: T_ERROR, s: msg)) }
+
+# The same, from an Error.
+pub def err_value(e: Error) -> Value { error_value(e.message) }
+
+# Go's AnyValue of a []byte: quoted by the text handler, base64 in JSON.
+pub def bytes_value(b: [Byte]) -> Value { Value.new(sc: Scalar.new(tag: T_BYTES, s: Str.from_bytes(b))) }
+
+# Go's AnyValue of a json.RawMessage: written as is in JSON (compacted),
+# quoted by the text handler.
+pub def raw_json_value(s: Str) -> Value { Value.new(sc: Scalar.new(tag: T_RAW_JSON, s: s)) }
+
+# Go's AnyValue of a Level: KIND_ANY, written as its name.
+pub def level_value(l: Level) -> Value { Value.new(sc: sc(T_LEVEL, l.n)) }
+
+# Go's AnyValue of a *Source.
+pub def source_value(s: Source) -> Value {
+  Value.new(sc: Scalar.new(tag: T_SOURCE, num: s.line, s: s.function + Str.from_bytes([0]) + s.file))
+}
+
+# Go's AnyValue of a Kind (written as its name; a number in JSON).
+pub def kind_value(k: Int) -> Value { Value.new(sc: sc(T_KIND, k)) }
+
+# ---------------------------------------------------------------- Attrs
+
+# A key-value pair (Go's Attr).
+pub struct Attr {
+  key: Str
+  value: Value
+
+  pub def equal(b: Attr) -> Bool { key == b.key && value.equal(b.value) }
+  pub def ==(b: Attr) -> Bool { self.equal(b) }
+  pub def to_s -> Str { key + "=" + value.to_s }
+  pub def string -> Str { self.to_s }
+
+  # Go's isEmpty: the zero Attr (handlers leave it out).
+  pub def empty? -> Bool { key == "" && value.sc.tag == T_NIL }
+}
+
+pub def string(key: Str, v: Str) -> Attr { Attr.new(key: key, value: string_value(v)) }
+pub def int64(key: Str, v: Int) -> Attr { Attr.new(key: key, value: int64_value(v)) }
+pub def int(key: Str, v: Int) -> Attr { Attr.new(key: key, value: int_value(v)) }
+pub def uint64(key: Str, v: U64) -> Attr { Attr.new(key: key, value: uint64_value(v)) }
+pub def float64(key: Str, v: Float) -> Attr { Attr.new(key: key, value: float64_value(v)) }
+pub def bool(key: Str, v: Bool) -> Attr { Attr.new(key: key, value: bool_value(v)) }
+pub def time_attr(key: Str, v: time.Time) -> Attr { Attr.new(key: key, value: time_value(v)) }
+pub def duration(key: Str, v: time.Duration) -> Attr { Attr.new(key: key, value: duration_value(v)) }
+
+# Go's Group / GroupAttrs (a group of attributes).
+pub def group(key: Str, as: [Attr]) -> Attr { Attr.new(key: key, value: group_value(as)) }
+pub def group_attrs(key: Str, as: [Attr]) -> Attr { Attr.new(key: key, value: group_value(as)) }
+
+# Go's Any: an Attr with any Value (make it with the *_value functions).
+pub def any(key: Str, v: Value) -> Attr { Attr.new(key: key, value: v) }
+
+# Go's Any(key, err): the error's message, KIND_ANY.
+pub def err(key: Str, e: Error) -> Attr { Attr.new(key: key, value: err_value(e)) }
+
+def attrs_equal(a: [Attr], b: [Attr]) -> Bool {
+  return false if a.size != b.size
+  i = 0
+  while i < a.size {
+    return false if !a[i].equal(b[i])
+    i += 1
+  }
+  true
+}
+
+def count_empty_groups(as: [Attr]) -> Int {
+  n = 0
+  for a in as {
+    n += 1 if a.value.empty_group?
+  }
+  n
+}

@@ -7,7 +7,7 @@
 #   syscall.SIGHUP, SIGINT, ...             sighup, sigint, ... (functions: the
 #                                             numbers are the platform's)
 #   Notify(c, sigs...)                      notify(c, sigs) -> Notifier   ([] = all)
-#   Stop(c)                                 n.stop  (on the Notifier notify returned)
+#   Stop(c)                                 stop(c), or n.stop (on the Notifier notify returned)
 #   Reset(sigs...)                          reset(sigs)   ([] = all)
 #   Ignore(sigs...)                         ignore(sigs)  ([] = all)
 #   Ignored(sig)                            ignored?(sig)
@@ -22,13 +22,15 @@
 # a signal is dropped if the channel isn't ready, so give it a buffer.
 # `stop` closes the pipe, waits for the task to end (no signal is sent on
 # the channel after stop returns, as Go guarantees) and puts back the
-# default action of signals nothing watches any more.
+# default action of signals nothing watches any more. A package-level
+# Mutex (R11) keeps every channel's registration, as Go's handlers table
+# does: notifying a channel again replaces its registration with one for
+# the union of the signals (the new one starts before the old one stops, so
+# no signal falls through to its default action), and `stop(c)` ends it.
 #
 # Differences from Go:
-#  - Stop takes the Notifier, not the channel: channels have no identity to
-#    look up, and alexandrite has no package state to keep the table in.
-#    Each notify is its own registration: notifying the same channel twice
-#    makes two (each stopped separately); Go merges them.
+#  - notify also returns the registration (a Notifier): `n.stop` is
+#    `stop(c)` for the channel n was made for.
 #  - Signals are `Signal` values with Go's names for this platform
 #    (`Signal.to_s`); the constants are lower-case functions
 #    (`signal.sigint`): a def name
@@ -167,6 +169,8 @@ def mask_of(sigs: [Signal]) -> Int {
 # A registration made by notify; `stop` ends it (Go's Stop(c)).
 pub struct Notifier {
   fd: Int
+  # The signals it watches.
+  mask: Int
   # Closed by the forwarding task when it has ended.
   done: Chan[Bool]
   stopped: Atomic[Bool]
@@ -174,17 +178,54 @@ pub struct Notifier {
   # No more signals go to the channel once this returns.
   pub def stop {
     first = !stopped.swap(true)
-    alx_sig_unwatch(fd) if first
-    done.recv if first
+    if first {
+      me = fd
+      HANDLERS.lock { |hs| hs = hs.select { |h| h.n.fd != me }.to_a }
+      alx_sig_unwatch(fd)
+      done.recv
+    }
   }
 
   pub def stopped? -> Bool { stopped.load }
 }
 
+# A channel's registration (Go's handlers.m entry).
+struct Handler {
+  c: Chan[Signal]
+  n: Notifier
+}
+
+# R11: every channel's live registration.
+HANDLERS = Mutex[[Handler]].new([])
+
 # Go's Notify: the signals in sigs (every catchable signal for []) are sent
 # on c, without blocking: a signal is dropped if c isn't ready to take it.
+# Notifying c again adds sigs to the signals c gets.
 pub def notify(c: Chan[Signal], sigs: [Signal]) -> Notifier {
-  fd = alx_sig_watch(mask_of(sigs))
+  old = HANDLERS.lock { |hs| hs.select { |h| h.c == c }.map { |h| h.n }.to_a }
+  mask = mask_of(sigs)
+  for o in old {
+    mask |= o.mask
+  }
+  n = watch(c, mask)
+  HANDLERS.lock { |hs| hs << Handler.new(c: c, n: n) }
+  for o in old {
+    o.stop
+  }
+  n
+}
+
+# Go's Stop: no more signals go to c (none is sent after stop returns).
+pub def stop(c: Chan[Signal]) {
+  ns = HANDLERS.lock { |hs| hs.select { |h| h.c == c }.map { |h| h.n }.to_a }
+  for n in ns {
+    n.stop
+  }
+}
+
+# A registration sending the signals in mask on c.
+def watch(c: Chan[Signal], mask: Int) -> Notifier {
+  fd = alx_sig_watch(mask)
   assert fd >= 0, "os/signal: can't watch signals (#{-fd})"
   done = Chan[Bool].new
   stopped = Atomic.new(false)
@@ -212,7 +253,7 @@ pub def notify(c: Chan[Signal], sigs: [Signal]) -> Notifier {
     c_close(fd.to_i32)
     done.close
   }
-  Notifier.new(fd: fd, done: done, stopped: stopped)
+  Notifier.new(fd: fd, mask: mask, done: done, stopped: stopped)
 }
 
 # Go's Reset: the signals (all for []) go back to their default action,

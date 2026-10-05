@@ -289,7 +289,7 @@ impl<'a> Parser<'a> {
                             self.skip_line_continuation();
                             let value = self.expr()?;
                             m.public.insert(name.clone());
-                            m.consts.push(ConstDef { name, span: sp, ty, value });
+                            self.top_value(&mut m, name, sp, ty, value);
                         }
                         t => return Err(Diag::new(self.span(), format!("`pub` goes before a declaration, found {}", describe(&t)))),
                     }
@@ -321,7 +321,7 @@ impl<'a> Parser<'a> {
                     self.expect_op("=")?;
                     self.skip_line_continuation();
                     let value = self.expr()?;
-                    m.consts.push(ConstDef { name, span: sp, ty, value });
+                    self.top_value(&mut m, name, sp, ty, value);
                 }
                 Tok::Directive(..) => return Err(Diag::new(self.span(), "directives must come first in the file")),
                 _ => {
@@ -332,6 +332,17 @@ impl<'a> Parser<'a> {
         }
         self.expand_derives(&mut m)?;
         Ok(m)
+    }
+
+    /// `NAME = expr` at the top level: a constant, or (R11) a package-level
+    /// `Atomic[T]` / `Mutex[T]`, whose value a def `__init_NAME` computes.
+    fn top_value(&mut self, m: &mut Module, name: String, sp: Span, ty: Option<TypeExpr>, value: Expr) {
+        let var = is_sync_decl(ty.as_ref(), &value);
+        if var {
+            let body = vec![Stmt { span: value.span, kind: StmtKind::Expr(value.clone()) }];
+            m.defs.push(Def { name: var_init_name(&name), span: sp, tparams: vec![], name_span: sp, params: vec![], ret: ty.clone(), fallible: false, public: false, using: self.usings.clone(), errs: None, pure: false, ffi: None, body });
+        }
+        m.consts.push(ConstDef { name, span: sp, ty, value, var });
     }
 
     /// Are the `#[...]` attributes at the cursor followed by a struct or enum?
@@ -1179,7 +1190,16 @@ impl<'a> Parser<'a> {
             Tok::Kw(Kw::Def) | Tok::Kw(Kw::Fn) | Tok::Attr(_) => return Err(Diag::new(start, "methods can only be defined at the top level")),
             Tok::Kw(Kw::Defer) => {
                 self.bump();
-                StmtKind::Defer(self.expr()?)
+                if self.is_op("{") {
+                    // `defer { stmts }`: run the statements at scope exit (as
+                    // `if true { stmts }`; a map literal is never deferred).
+                    let sp = self.span();
+                    let body = self.braced_stmts()?;
+                    let cond = self.mk(ExprKind::Bool(true), sp);
+                    StmtKind::Defer(self.mk(ExprKind::If(Box::new(cond), body, vec![]), sp.to(self.prev_span())))
+                } else {
+                    StmtKind::Defer(self.expr()?)
+                }
             }
             Tok::Ident(kw) if kw == "using" && matches!(self.peek_at(1), Tok::Const(_) | Tok::Ident(_)) && !self.is_local("using") => {
                 self.bump();
@@ -1485,6 +1505,9 @@ impl<'a> Parser<'a> {
         if self.is_op("=") {
             if let Some(c) = const_root(&lhs) {
                 return Err(Diag::new(lhs.span, format!("`{c}` is a constant and can't be changed")).note(format!("copy it into a variable to get an array of your own: `xs = {c}`")));
+            }
+            if let ExprKind::Const(c) = &lhs.kind {
+                return Err(Diag::new(lhs.span, format!("`{c}` is declared at the top level and can't be assigned")).note(format!("a package-level `Atomic` changes with `{c}.store(v)`, a `Mutex` with `{c}.lock {{ |v| ... }}` (R11)")));
             }
             if !is_place(&lhs) {
                 return Err(Diag::new(lhs.span, "cannot assign to this expression"));

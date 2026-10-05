@@ -40,7 +40,8 @@ pub enum Ty {
     Handle(String),
     /// `Mutex[T]`: a T only reached under its lock (shared between tasks).
     Mutex(Box<Ty>),
-    /// `Atomic[T]` (Int or Bool): shared between tasks.
+    /// `Atomic[T]`: shared between tasks. An Int or a Bool is a runtime
+    /// cell; any other T sits behind a lock (`atomic_boxed`, R11).
     Atomic(Box<Ty>),
     /// A function value (`(A, B) -> R`): one of the program's lambda
     /// literals of this type, with its captured values.
@@ -70,6 +71,11 @@ pub enum Ty {
 }
 
 impl Ty {
+    /// The value type of an `Atomic[self]` that isn't a runtime cell (not
+    /// an Int or a Bool): it is kept behind a lock, laid out like a Mutex.
+    pub fn atomic_boxed(&self) -> bool {
+        !matches!(self, Ty::Int | Ty::Bool)
+    }
     pub fn arr(t: Ty) -> Ty {
         Ty::Array(Box::new(t))
     }
@@ -280,6 +286,9 @@ pub enum M {
     /// Array constant k, read in place (`TProgram::globals`). Only ever
     /// indexed down to elements without storage, so it is never changed.
     Global(usize),
+    /// Set global k (a package-level `Atomic` / `Mutex`, R11) to args[0],
+    /// once, at program start.
+    SetGlobal(usize),
     /// Maps: `{k => v, ...}` (args: k1, v1, k2, v2, ...), `m[k]` (V?),
     /// `m.fetch(k, d)`, `m[k] = v`, `delete` (V?), `key?`, `size`, `keys`, `values`.
     /// An enum value's variant index.
@@ -582,4 +591,7 @@ pub struct TProgram {
     /// Array constants read in place, by `M::Global` index: each one's
     /// value, a literal. Built before the program's first statement.
     pub globals: Vec<TExpr>,
+    /// The globals that are package-level values (R11), set by
+    /// `M::SetGlobal` at the start of main rather than from a literal.
+    pub vars: Vec<usize>,
 }

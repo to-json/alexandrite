@@ -1,0 +1,296 @@
+# Package syslog: Go's log/syslog — a client for the system log service,
+# local (a Unix socket) or remote (tcp / udp / unix).
+#
+#   w = syslog.dial("udp", "logs.example:514", syslog.LOG_WARNING | syslog.LOG_DAEMON, "demotag").unwrap
+#   w.write!("This is a daemon warning with demotag.".bytes.to_a)
+#   w.emerg("And this is a daemon emergency with demotag.")
+#
+#   Go                                      alx
+#   Priority (int), LOG_EMERG..LOG_DEBUG,   Int constants of the same names and values
+#     LOG_KERN..LOG_FTP, LOG_LOCAL0..7
+#   New(priority, tag) (*Writer, error)     new(priority, tag) -> ~Writer
+#   Dial(network, raddr, priority, tag)     dial(network, raddr, priority, tag) -> ~Writer
+#   w.Write(b) (int, error)                 w.write!(b) -> ~Int (also write_string!)
+#   w.Close() error                         w.close -> ~Unit
+#   w.Emerg / Alert / Crit / Err /          w.emerg / alert / crit / err /
+#     Warning / Notice / Info / Debug(m)      warning / notice / info / debug(m) -> ~Unit
+#   NewLogger(p, logFlag) (*log.Logger,     new_logger(p, log_flag) -> ~log.Logger[Writer]
+#     error)
+#
+# What goes on the wire is Go's, byte for byte:
+#   local (the system's socket, or a "unix" / "unixgram" dial):
+#     <PRI>Jan _2 15:04:05 TAG[PID]: MSG
+#   network (tcp, udp):
+#     <PRI>2006-01-02T15:04:05Z07:00 HOSTNAME TAG[PID]: MSG
+# with PRI the writer's facility and the message's severity, the local time,
+# os.getpid, and a newline added unless MSG ends with one. `new` tries the
+# Unix sockets /dev/log, /var/run/syslog and /var/run/log, as "unixgram"
+# and then as "unix", as Go's unixSyslog does. A failed write reconnects
+# once and retries, as Go's writeAndRetry. A Writer is a handle (its state
+# is under a Mutex), so copies, tasks and a Logger share one connection.
+#
+# Differences from Go:
+#  - Priority is Int (no named integer types); `dial` checks the range
+#    0..LOG_LOCAL7|LOG_DEBUG as Go does.
+#  - The hostname of a network writer is os.hostname, or the connection's
+#    local address if that fails (Go's order); "localhost" for the local
+#    socket.
+#  - An empty tag is os.args[0] (as Go).
+#  - Errors: SyslogError.InvalidPriority ("log/syslog: invalid priority")
+#    and SyslogError.UnixDelivery ("Unix syslog delivery error"), Go's
+#    texts; dial and write failures are net's NetErrors.
+#  - Go's Writer methods have pointer receivers; alx's share the state
+#    through the Mutex, so `write!` is the only `!` method (io.Writer's name).
+
+import "log"
+import "net"
+import "os"
+import "strings"
+import "time"
+
+pub LOG_EMERG = 0
+pub LOG_ALERT = 1
+pub LOG_CRIT = 2
+pub LOG_ERR = 3
+pub LOG_WARNING = 4
+pub LOG_NOTICE = 5
+pub LOG_INFO = 6
+pub LOG_DEBUG = 7
+
+pub LOG_KERN = 0 << 3
+pub LOG_USER = 1 << 3
+pub LOG_MAIL = 2 << 3
+pub LOG_DAEMON = 3 << 3
+pub LOG_AUTH = 4 << 3
+pub LOG_SYSLOG = 5 << 3
+pub LOG_LPR = 6 << 3
+pub LOG_NEWS = 7 << 3
+pub LOG_UUCP = 8 << 3
+pub LOG_CRON = 9 << 3
+pub LOG_AUTHPRIV = 10 << 3
+pub LOG_FTP = 11 << 3
+pub LOG_LOCAL0 = 16 << 3
+pub LOG_LOCAL1 = 17 << 3
+pub LOG_LOCAL2 = 18 << 3
+pub LOG_LOCAL3 = 19 << 3
+pub LOG_LOCAL4 = 20 << 3
+pub LOG_LOCAL5 = 21 << 3
+pub LOG_LOCAL6 = 22 << 3
+pub LOG_LOCAL7 = 23 << 3
+
+SEVERITY_MASK = 0x07
+FACILITY_MASK = 0xf8
+
+LOG_TYPES = ["unixgram", "unix"]
+LOG_PATHS = ["/dev/log", "/var/run/syslog", "/var/run/log"]
+
+pub error SyslogError {
+  InvalidPriority
+  UnixDelivery
+
+  def message -> Str {
+    case self {
+      InvalidPriority => "log/syslog: invalid priority"
+      UnixDelivery => "Unix syslog delivery error"
+    }
+  }
+}
+
+struct WriterState {
+  priority: Int
+  tag: Str
+  hostname: Str
+  network: Str
+  raddr: Str
+  conn: net.Conn?
+  # The local format (no hostname, time.Stamp): the system socket, or a
+  # unix / unixgram dial.
+  local: Bool
+}
+
+# A connection to a syslog server.
+pub struct Writer {
+  st: Mutex[WriterState]
+
+  # Sends b as one message with the writer's priority; b.size.
+  pub def write!(b: [Byte]) -> ~Int {
+    p = st.lock { |s| s.priority }
+    ~write_and_retry(p, Str.from_bytes(b))
+  }
+
+  pub def write_string!(s: Str) -> ~Int {
+    p = st.lock { |w| w.priority }
+    ~write_and_retry(p, s)
+  }
+
+  # Closes the connection to the server.
+  pub def close -> ~Unit {
+    r = st.lock { |s|
+      out: Error? = none
+      if c = s.conn {
+        cc = c
+        out = cc.close!.err
+        s.conn = none
+      }
+      out
+    }
+    if e = r {
+      fail e
+    }
+  }
+
+  # Logs m with severity LOG_EMERG, ignoring the writer's severity.
+  pub def emerg(m: Str) -> ~Unit {
+    ~write_and_retry(LOG_EMERG, m)
+    nil
+  }
+
+  pub def alert(m: Str) -> ~Unit {
+    ~write_and_retry(LOG_ALERT, m)
+    nil
+  }
+
+  pub def crit(m: Str) -> ~Unit {
+    ~write_and_retry(LOG_CRIT, m)
+    nil
+  }
+
+  pub def err(m: Str) -> ~Unit {
+    ~write_and_retry(LOG_ERR, m)
+    nil
+  }
+
+  pub def warning(m: Str) -> ~Unit {
+    ~write_and_retry(LOG_WARNING, m)
+    nil
+  }
+
+  pub def notice(m: Str) -> ~Unit {
+    ~write_and_retry(LOG_NOTICE, m)
+    nil
+  }
+
+  pub def info(m: Str) -> ~Unit {
+    ~write_and_retry(LOG_INFO, m)
+    nil
+  }
+
+  pub def debug(m: Str) -> ~Unit {
+    ~write_and_retry(LOG_DEBUG, m)
+    nil
+  }
+
+  # Go's writeAndRetry: the writer's facility with p's severity; on a failed
+  # write, reconnect once and write again. The length of s.
+  def write_and_retry(p: Int, s: Str) -> ~Int {
+    r = st.lock { |w|
+      pr = (w.priority & FACILITY_MASK) | (p & SEVERITY_MASK)
+      res: Error? = none
+      done = false
+      if c = w.conn {
+        done = write_msg(c, w, pr, s).ok?
+      }
+      if !done {
+        if c = w.conn {
+          cc = c
+          _ = cc.close!
+          w.conn = none
+        }
+        r = connect(w)
+        if x = r.err {
+          res = x
+        } else {
+          c2, local, host = r.unwrap
+          w.conn = c2
+          w.local = local
+          w.hostname = host
+          res = write_msg(c2, w, pr, s).err
+        }
+      }
+      res
+    }
+    if e = r {
+      fail e
+    }
+    s.size
+  }
+}
+
+# Go's (*Writer).write: the formatted message on c.
+def write_msg(c: net.Conn, w: WriterState, p: Int, msg: Str) -> ~Unit {
+  line = format_message(w.local, p, time.now, w.hostname, w.tag, os.getpid, msg, newline_for(msg))
+  cc = c
+  cc.~write!(line.bytes.to_a)
+  nil
+}
+
+# What Go's write adds to msg: a newline unless it ends with one.
+def newline_for(msg: Str) -> Str {
+  strings.has_suffix(msg, "\n") ? "" : "\n"
+}
+
+# Go's netConn.writeString: the line for priority p at time t.
+def format_message(local: Bool, p: Int, t: time.Time, hostname: Str, tag: Str, pid: Int, msg: Str, nl: Str) -> Str {
+  if local {
+    return "<#{p}>#{t.format(time.STAMP)} #{tag}[#{pid}]: #{msg}#{nl}"
+  }
+  "<#{p}>#{t.format(time.RFC3339)} #{hostname} #{tag}[#{pid}]: #{msg}#{nl}"
+}
+
+# Go's (*Writer).connect (the caller has closed the old connection): the
+# new connection, whether it takes the local format, and the hostname.
+def connect(w: WriterState) -> ~(net.Conn, Bool, Str) {
+  if w.network == "" {
+    c = ~unix_syslog
+    return (c, true, w.hostname == "" ? "localhost" : w.hostname)
+  }
+  c = ~net.dial(w.network, w.raddr)
+  local = w.network == "unixgram" || w.network == "unix"
+  (c, local, w.hostname == "" ? c.local_addr : w.hostname)
+}
+
+# Go's unixSyslog: the first of the system's syslog sockets that accepts a
+# connection, as unixgram and then as unix.
+def unix_syslog -> ~net.Conn {
+  for network in LOG_TYPES {
+    for path in LOG_PATHS {
+      r = net.dial(network, path)
+      if c = r.ok {
+        return c
+      }
+    }
+  }
+  fail SyslogError.UnixDelivery
+}
+
+# A connection to the system log daemon (a local Unix socket): each write
+# sends a message with `priority` (facility | severity) and `tag` (os.args[0]
+# if empty).
+pub def new(priority: Int, tag: Str) -> ~Writer {
+  ~dial("", "", priority, tag)
+}
+
+# A connection to the log daemon at raddr over network ("tcp", "udp",
+# "unix", "unixgram"; "" for the local daemon, as `new`).
+pub def dial(network: Str, raddr: Str, priority: Int, tag: Str) -> ~Writer {
+  fail SyslogError.InvalidPriority if priority < 0 || priority > LOG_LOCAL7 | LOG_DEBUG
+  t = tag
+  if t == "" {
+    args = os.args
+    t = args.size > 0 ? args[0] : ""
+  }
+  host = os.hostname.unwrap_or("")
+  ws = WriterState.new(priority: priority, tag: t, hostname: host, network: network, raddr: raddr)
+  c, local, h = ~connect(ws)
+  ws.conn = c
+  ws.local = local
+  ws.hostname = h
+  Writer.new(st: Mutex.new(ws))
+}
+
+# A log.Logger writing to the system log service with priority p; log_flag
+# is the Logger's flag set (log.new's).
+pub def new_logger(p: Int, log_flag: Int) -> ~log.Logger[Writer] {
+  s = ~new(p, "")
+  log.new(s, "", log_flag)
+}

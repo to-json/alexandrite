@@ -51,13 +51,16 @@ mod rt {
     }
 
     thread_local! {
-        /// True on threads started by `task_spawn`.
+        /// True on threads started by `task_spawn` and inside `pmap` elements.
         static IN_TASK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        /// The locks this thread holds, oldest first (lock blocks nest).
+        static HELD: std::cell::RefCell<Vec<AlxLock>> = const { std::cell::RefCell::new(Vec::new()) };
     }
     /// A runtime failure. On the main thread: flush stdout, print `text` to
-    /// stderr and abort. On a task thread: print nothing and unwind with
-    /// `text` as the payload; `task_spawn` catches it and `Task::wait`
-    /// reports it as `Err(text)`.
+    /// stderr and abort. On a task thread (or in a pmap element): print
+    /// nothing and unwind with `text` as the payload; `task_spawn` catches
+    /// it and `Task::wait` reports it as `Err(text)` (pmap raises it again
+    /// in its caller).
     pub fn fail(text: String) -> ! {
         if IN_TASK.with(|t| t.get()) {
             std::panic::resume_unwind(Box::new(text))
@@ -1437,19 +1440,40 @@ mod rt {
     pub fn pmap<T: Clone + Sync, R: Clone + Send + Default>(xs: &Sl<T>, f: fn(T) -> R) -> Sl<R> {
         Sl::from(pmap_v(&xs.to_vec(), f))
     }
+    /// A panic in an element stops the job (its locks are released and
+    /// poisoned); the caller raises the first one again once all threads
+    /// are done, so it ends the calling task (or aborts on main).
     fn pmap_v<T: Clone + Sync, R: Clone + Send + Default>(xs: &[T], f: fn(T) -> R) -> Vec<R> {
+        install_hook();
         let mut out = vec![R::default(); xs.len()];
         let workers = std::thread::available_parallelism().map_or(4, |n| n.get());
         let chunk = xs.len().div_ceil(workers).max(1);
+        let stop = std::sync::atomic::AtomicBool::new(false);
+        let first: Mutex<Option<String>> = Mutex::new(None);
         std::thread::scope(|s| {
             for (src, dst) in xs.chunks(chunk).zip(out.chunks_mut(chunk)) {
+                let (stop, first) = (&stop, &first);
                 s.spawn(move || {
-                    for (x, o) in src.iter().zip(dst) {
-                        *o = f(x.clone());
+                    IN_TASK.with(|t| t.set(true));
+                    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        for (x, o) in src.iter().zip(dst) {
+                            if stop.load(std::sync::atomic::Ordering::Relaxed) {
+                                break;
+                            }
+                            *o = f(x.clone());
+                        }
+                    }));
+                    if let Err(p) = r {
+                        poison_held(0);
+                        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+                        lk(first).get_or_insert(panic_text(p));
                     }
                 });
             }
         });
+        if let Some(text) = first.into_inner().unwrap_or_else(|e| e.into_inner()) {
+            fail(text)
+        }
         out
     }
 
@@ -1462,25 +1486,62 @@ mod rt {
         m.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    /// A lock's state: (held, poisoned).
+    type LockSt = (bool, bool);
     /// A lock handle (alexandrite's `Mutex[T]` keeps its value beside it).
+    /// A thread that panics holding it releases it and poisons it
+    /// (`poison_held`); taking a poisoned lock panics until `clear_poison`.
     #[derive(Clone)]
-    pub struct AlxLock(Arc<(Mutex<bool>, Condvar)>);
+    pub struct AlxLock(Arc<(Mutex<LockSt>, Condvar)>);
     impl Default for AlxLock {
         fn default() -> Self {
-            AlxLock(Arc::new((Mutex::new(false), Condvar::new())))
+            AlxLock(Arc::new((Mutex::new((false, false)), Condvar::new())))
         }
     }
     impl AlxLock {
-        pub fn lock(&self) {
-            let mut held = lk(&self.0.0);
-            while *held {
-                held = self.0.1.wait(held).unwrap_or_else(|e| e.into_inner());
+        pub fn lock(&self, loc: &str) {
+            {
+                let mut st = lk(&self.0.0);
+                while st.0 {
+                    st = self.0.1.wait(st).unwrap_or_else(|e| e.into_inner());
+                }
+                if !st.1 {
+                    st.0 = true;
+                    drop(st);
+                    HELD.with(|h| h.borrow_mut().push(self.clone()));
+                    return;
+                }
             }
-            *held = true;
+            panic("Mutex poisoned: a task panicked while holding it", loc)
         }
         pub fn unlock(&self) {
-            *lk(&self.0.0) = false;
-            self.0.1.notify_one();
+            HELD.with(|h| {
+                let mut h = h.borrow_mut();
+                if let Some(i) = h.iter().rposition(|l| Arc::ptr_eq(&l.0, &self.0)) {
+                    h.remove(i);
+                }
+            });
+            lk(&self.0.0).0 = false;
+            self.0.1.notify_all();
+        }
+        pub fn poisoned(&self) -> bool {
+            lk(&self.0.0).1
+        }
+        pub fn clear_poison(&self) {
+            lk(&self.0.0).1 = false;
+        }
+    }
+    /// After a panic: release and poison the locks this thread took after
+    /// the first `mark` it held, newest first.
+    fn poison_held(mark: usize) {
+        let ls: Vec<AlxLock> = HELD.with(|h| {
+            let mut h = h.borrow_mut();
+            let m = mark.min(h.len());
+            h.split_off(m)
+        });
+        for l in ls.iter().rev() {
+            *lk(&l.0.0) = (false, true);
+            l.0.1.notify_all();
         }
     }
     /// An atomic cell handle.
@@ -1554,7 +1615,7 @@ mod rt {
     /// Run `f(env)` on a new thread. Alexandrite panics in the task unwind
     /// quietly (see `fail`) and become the task's `Err`; Rust's own panic
     /// message is suppressed on task threads by a hook installed once.
-    pub fn task_spawn<E: Send + 'static, T: Send + 'static>(f: fn(E) -> T, env: E) -> Task<T> {
+    fn install_hook() {
         static HOOK: std::sync::Once = std::sync::Once::new();
         HOOK.call_once(|| {
             let prev = std::panic::take_hook();
@@ -1564,11 +1625,19 @@ mod rt {
                 }
             }));
         });
+    }
+
+    /// A task that panics releases and poisons the locks it holds.
+    pub fn task_spawn<E: Send + 'static, T: Send + 'static>(f: fn(E) -> T, env: E) -> Task<T> {
+        install_hook();
         let inner = Arc::new(TaskInner { res: Mutex::new(None), cv: Condvar::new() });
         let me = inner.clone();
         std::thread::spawn(move || {
             IN_TASK.with(|t| t.set(true));
             let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(env)));
+            if r.is_err() {
+                poison_held(0);
+            }
             let r = r.map_err(|p| Str::lit(panic_text(p).as_bytes()));
             *lk(&me.res) = Some(r);
             me.cv.notify_all();

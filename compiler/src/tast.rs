@@ -324,6 +324,9 @@ pub enum M {
     /// lock; `v` is the value, changed in place; the result is copied out).
     MutexNew,
     Lock,
+    /// `m.poisoned?`: a task panicked holding the lock. `m.clear_poison!`.
+    MutexPoisoned,
+    MutexClearPoison,
     /// `(a, b)`: a tuple of the args.
     TupleNew,
     /// `xs.join(sep)` (args[0] is sep).

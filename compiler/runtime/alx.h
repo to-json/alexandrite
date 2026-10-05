@@ -335,8 +335,11 @@ typedef struct AlxTask AlxTask;
 typedef struct AlxChan AlxChan;
 typedef struct AlxLock AlxLock;
 AlxLock *alx_lock_new(void);
-void alx_lock(AlxLock *l);
+/* Take the lock; a poisoned one (its holder panicked) panics at loc. */
+void alx_lock(AlxLock *l, const char *loc);
 void alx_unlock(AlxLock *l);
+bool alx_lock_poisoned(AlxLock *l);
+void alx_lock_clear_poison(AlxLock *l);
 int64_t *alx_atomic_new(int64_t v);
 /* A case of alx_select. `buf` holds the value to send / receives the value.
  * `ok` is written only on the chosen recv case (the caller presets it). */

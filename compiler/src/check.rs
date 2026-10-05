@@ -4654,6 +4654,59 @@ impl<'w, 'a> FnCx<'w, 'a> {
                 let neg = self.mk(TK::Not(Box::new(eq)), Ty::Bool, sp);
                 return Ok(self.mk(TK::Seq(vec![s1, s2, TStmt::If(neg, vec![TStmt::Expr(fail)], vec![])]), Ty::Unit, sp));
             }
+            "assert_panics" if self.w.by_name.get("assert_panics").is_none() => {
+                // `assert_panics("part") { body }`: the body runs as a task
+                // (spawn's rules: it gets copies of the locals it uses), and
+                // the assertion fails unless that task panicked (with a
+                // message containing "part").
+                let usage = "`assert_panics` takes a block and maybe a message part: `assert_panics { ... }` or `assert_panics(\"out of range\") { ... }`";
+                let Some(b) = block else { return Err(Diag::new(sp, usage)) };
+                if args.len() > 1 || !b.params.is_empty() {
+                    return Err(Diag::new(sp, usage));
+                }
+                let want = match args.first() {
+                    Some(a) => {
+                        let w = self.value(a)?;
+                        self.expect(&w.ty, &Ty::Str, a.span, "`assert_panics` message part")?;
+                        Some(w)
+                    }
+                    None => None,
+                };
+                self.impure = true;
+                let task = self.spawn(b, b.span)?;
+                let Ty::Task(t) = self.resolve(&task.ty) else { unreachable!() };
+                let t = self.resolve(&t);
+                if matches!(t, Ty::Result(_)) {
+                    return Err(Diag::new(b.span, "an `assert_panics` block can't fail with an error (`~`, `fail`, or ending in a `~T`): it checks for a panic; use `.unwrap` to turn the error into one"));
+                }
+                let loc = self.w.sm.loc(sp);
+                let rty = Ty::Result(Box::new(t));
+                let waited = self.mk(TK::M(M::TaskWait, Some(Box::new(task)), vec![], None), rty.clone(), sp);
+                let (rid, s1) = self.opt_tmp(waited, sp);
+                let rl = self.mk(TK::Local(rid), rty.clone(), sp);
+                let ok = self.mk(TK::M(M::ResIsOk, Some(Box::new(rl.clone())), vec![], None), Ty::Bool, sp);
+                let none = self.mk(TK::Str(format!("assert_panics failed at {loc}: the block didn't panic")), Ty::Str, sp);
+                let fail_none = self.mk(TK::Panic(Box::new(none)), Ty::Unit, sp);
+                let mut otherwise = vec![];
+                if let Some(w) = want {
+                    let (wid, s2) = self.opt_tmp(w, sp);
+                    let errt = Ty::Opt(Box::new(Ty::Error));
+                    let err = self.mk(TK::M(M::ResErr, Some(Box::new(rl)), vec![], None), errt.clone(), sp);
+                    let (eid, s3) = self.opt_tmp(err, sp);
+                    let e = self.opt_get(eid, &errt, sp);
+                    let msg = self.mk(TK::M(M::ErrMessage, Some(Box::new(e)), vec![], None), Ty::Str, sp);
+                    let (mid, s4) = self.opt_tmp(msg, sp);
+                    let ml = self.mk(TK::Local(mid), Ty::Str, sp);
+                    let wl = self.mk(TK::Local(wid), Ty::Str, sp);
+                    let has = self.mk(TK::M(M::StrHelper(5), Some(Box::new(ml.clone())), vec![wl.clone()], None), Ty::Bool, sp);
+                    let pieces = vec![FmtPiece::Lit(format!("assert_panics failed at {loc}: the panic message doesn't contain \"")), FmtPiece::Str(0), FmtPiece::Lit("\": ".into()), FmtPiece::Str(1)];
+                    let text = self.mk(TK::Format(pieces, vec![wl, ml]), Ty::Str, sp);
+                    let fail = self.mk(TK::Panic(Box::new(text)), Ty::Unit, sp);
+                    let neg = self.mk(TK::Not(Box::new(has)), Ty::Bool, sp);
+                    otherwise = vec![s2, s3, s4, TStmt::If(neg, vec![TStmt::Expr(fail)], vec![])];
+                }
+                return Ok(self.mk(TK::Seq(vec![s1, TStmt::If(ok, vec![TStmt::Expr(fail_none)], otherwise)]), Ty::Unit, sp));
+            }
             "loop" => {
                 let Some(b) = block else { return Err(Diag::new(sp, "`loop` needs a block")) };
                 self.loops.push(LoopKind::While);
@@ -5650,7 +5703,9 @@ impl<'w, 'a> FnCx<'w, 'a> {
                     let (blk, bt) = r?;
                     Ok(mk_m(self, M::Lock, recv, vec![], Some(blk), bt))
                 }
-                _ => Err(Diag::new(name_span, format!("no method `{name}` on {}; reach the value with `lock {{ |v| ... }}`", rt.show()))),
+                ("poisoned?", 0) => Ok(mk_m(self, M::MutexPoisoned, recv, vec![], None, Ty::Bool)),
+                ("clear_poison!", 0) => Ok(mk_m(self, M::MutexClearPoison, recv, vec![], None, Ty::Unit)),
+                _ => Err(Diag::new(name_span, format!("no method `{name}` on {}; reach the value with `lock {{ |v| ... }}` (it also has poisoned? and clear_poison!)", rt.show()))),
             };
         }
         if let Ty::Atomic(t) = &rt {

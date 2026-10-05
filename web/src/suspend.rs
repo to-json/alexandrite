@@ -48,7 +48,7 @@ enum Node {
 pub fn kids(e: &mut LE) -> Vec<&mut LE> {
     match e {
         LE::Tup(_, v) | LE::Call(_, v) | LE::Ffi(_, v) | LE::Rt(_, v) | LE::Prim(_, v) | LE::ArrLit(_, v) | LE::GenNew(_, v) => v.iter_mut().collect(),
-        LE::Field(x, _) | LE::Neg(x, _) | LE::FNeg(x) | LE::Not(x) | LE::Len(x) | LE::RangeField(x, _) | LE::ToP(x) | LE::ChanNew(_, x) | LE::ChanLen(x) | LE::AtomicNew(x) | LE::AtomicLoad(x) | LE::RegionOf(x) | LE::RegionNew(x) | LE::RegionBytes(x) | LE::ArrWithCap(_, x) => vec![&mut **x],
+        LE::Field(x, _) | LE::Neg(x, _) | LE::FNeg(x) | LE::Not(x) | LE::Len(x) | LE::RangeField(x, _) | LE::ToP(x) | LE::ChanNew(_, x) | LE::ChanLen(x) | LE::LockPoisoned(x) | LE::AtomicNew(x) | LE::AtomicLoad(x) | LE::RegionOf(x) | LE::RegionNew(x) | LE::RegionBytes(x) | LE::ArrWithCap(_, x) => vec![&mut **x],
         LE::Arith(_, a, b, _) | LE::PArith(_, a, b) | LE::Cmp(_, a, b, _) | LE::FArith(_, a, b) | LE::AtomicRmw(_, a, b) | LE::Range(a, b, _) | LE::ArrNew(_, a, b, _) => vec![&mut **a, &mut **b],
         LE::Index { arr, idx, .. } => vec![&mut **arr, &mut **idx],
         LE::Cond(a, b, c) | LE::Slice(_, a, b, c) | LE::AtomicCas(a, b, c) => vec![&mut **a, &mut **b, &mut **c],
@@ -59,7 +59,7 @@ pub fn kids(e: &mut LE) -> Vec<&mut LE> {
 /// A statement's own expressions, in evaluation order (not nested blocks').
 fn exprs(s: &mut LS) -> Vec<&mut LE> {
     match s {
-        LS::Set(_, e) | LS::Push(_, e) | LS::Eval(e) | LS::Return(Some(e)) | LS::Yield(e) | LS::Puts(e, _) | LS::Print(e) | LS::PanicStr(e) | LS::Exit(e) | LS::Die(e) | LS::SetGlobal(_, e) | LS::RegionFree(e) | LS::Lock(e) | LS::Unlock(e) => vec![e],
+        LS::Set(_, e) | LS::Push(_, e) | LS::Eval(e) | LS::Return(Some(e)) | LS::Yield(e) | LS::Puts(e, _) | LS::Print(e) | LS::PanicStr(e) | LS::Exit(e) | LS::Die(e) | LS::SetGlobal(_, e) | LS::RegionFree(e) | LS::Lock(e, _) | LS::Unlock(e) | LS::LockClearPoison(e) => vec![e],
         LS::Wait { task: e, .. } | LS::ChanRecv { ch: e, .. } | LS::ChanClose { ch: e, .. } | LS::NextOrBreak { source: e, .. } | LS::Pmap { arr: e, .. } | LS::Spawn { env: e, .. } | LS::RegionUse { region: e, .. } => vec![e],
         LS::If(c, _, _) => vec![c],
         LS::SetIndex { idx, val, .. } => vec![idx, val],
@@ -95,7 +95,7 @@ fn blocks(s: &mut LS) -> Vec<&mut Vec<LS>> {
 
 /// A statement that blocks the task (a suspension point of its own).
 pub fn blocking(s: &LS) -> bool {
-    matches!(s, LS::Wait { .. } | LS::ChanSend { .. } | LS::ChanRecv { .. } | LS::Select { .. } | LS::Lock(_))
+    matches!(s, LS::Wait { .. } | LS::ChanSend { .. } | LS::ChanRecv { .. } | LS::Select { .. } | LS::Lock(..))
 }
 
 fn each_expr(e: &mut LE, f: &mut impl FnMut(&LE)) {

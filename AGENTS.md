@@ -109,6 +109,7 @@ add = ->(a: Int, b: Int) -> Int { a + b }; add.call(1, 2)
 out = `ls -l #{dir}`.~output                    # a command literal (no shell): os/exec.Cmd
 extern def c_getpid() -> I32 = "getpid"       # C FFI; std uses it only for OS access
 test "adds" { assert_eq 1 + 1, 2; assert x > 0, "why" }   # in *_test.alx beside the package
+assert_panics("out of bounds") { xs[9] }      # body runs as a task (gets copies of locals); fails unless it panics
 example "hi" { puts "hi" } outputs "hi\n"
 # Warnings (unused locals/imports) are errors under `alx test`; name a local `_x` to silence it.
 ```

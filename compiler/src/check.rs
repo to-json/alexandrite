@@ -162,6 +162,9 @@ pub struct World<'a> {
     pub consts: HashMap<String, (CVal, Option<Ty>)>,
     /// Interfaces: each method's name, parameter types (after self), return type, has a default.
     pub ifaces: HashMap<String, Vec<IfaceMethod>>,
+    /// Interface names in declaration order: a default method two interfaces
+    /// offer comes from the one declared first (deterministic, D62).
+    pub iface_order: Vec<String>,
     /// Each interface's implementors so far, with their method instances.
     pub impls: HashMap<String, Vec<(Ty, Vec<FuncId>)>>,
     pub stringers: HashMap<String, FuncId>,
@@ -285,7 +288,7 @@ impl<'a> World<'a> {
         }
         GENERICS.with(|g| g.borrow_mut().clear());
         INSTS.with(|g| g.borrow_mut().clear());
-        Ok(World { sm, defs, by_name, instances: HashMap::new(), funcs: vec![], sigs: HashMap::new(), fatal: None, structs: HashMap::new(), consts: HashMap::new(), ifaces: HashMap::new(), impls: HashMap::new(), stringers: HashMap::new(), errors: vec![], refines: HashMap::new(), warnings: vec![], globals: vec![], pending_consts: vec![] })
+        Ok(World { sm, defs, by_name, instances: HashMap::new(), funcs: vec![], sigs: HashMap::new(), fatal: None, structs: HashMap::new(), consts: HashMap::new(), ifaces: HashMap::new(), iface_order: vec![], impls: HashMap::new(), stringers: HashMap::new(), errors: vec![], refines: HashMap::new(), warnings: vec![], globals: vec![], pending_consts: vec![] })
     }
 
     /// Evaluate top-level constants, in order (each may use earlier ones).
@@ -587,7 +590,9 @@ impl<'a> World<'a> {
                 };
                 ms.push(IfaceMethod { name: name.clone(), params: ps, ret, default: *default, span: *span });
             }
-            self.ifaces.insert(d.name.clone(), ms);
+            if self.ifaces.insert(d.name.clone(), ms).is_none() {
+                self.iface_order.push(d.name.clone());
+            }
         }
         Ok(())
     }
@@ -752,7 +757,8 @@ impl<'a> World<'a> {
 
     /// An interface default named `m` that a value of type `tn` can use.
     fn default_for(&self, tn: &str, m: &str) -> Option<usize> {
-        for (iname, ms) in &self.ifaces {
+        for iname in &self.iface_order {
+            let ms = &self.ifaces[iname];
             if ms.iter().any(|x| x.name == m && x.default) && ms.iter().filter(|x| !x.default).all(|x| self.by_name.contains_key(&method_name(tn, &x.name))) {
                 return self.by_name.get(&method_name(iname, m)).copied();
             }
@@ -4549,7 +4555,8 @@ impl<'w, 'a> FnCx<'w, 'a> {
                 }
             }
             if let Some(sn) = st.as_ref().and_then(|t| t.type_name()) {
-                if let Some(&def) = self.w.by_name.get(&method_name(sn, name)) {
+                // (An interface's default `!` method too: `c.set_twice!(3)`.)
+                if let Some(&def) = self.w.by_name.get(&method_name(sn, name)).or(self.w.default_for(sn, name).as_ref()) {
                     return self.mutating_call(recv, def, name, name_span, args, block, sp);
                 }
             }

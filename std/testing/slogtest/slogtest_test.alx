@@ -1,0 +1,138 @@
+# Go's testing/slogtest tests (run_test.go, example_test.go) and log/slog's
+# slogtest_test.go (which lives here: a log/slog test importing this package
+# would compile a second log/slog, port issue 54).
+
+import "bytes"
+import "encoding/json"
+import "log/slog"
+import "strconv"
+import "strings"
+
+# A buffer that copies share (a handler owns a copy of its writer).
+struct SharedBuf {
+  mu: Mutex[bytes.Buffer]
+
+  pub def write!(p: [Byte]) -> ~Int {
+    mu.lock { |b| b.write!(p) }
+    p.size
+  }
+  def string -> Str { mu.lock { |b| b.string } }
+  def reset { mu.lock { |b| b = bytes.Buffer.new } }
+}
+
+def new_buf -> SharedBuf { SharedBuf.new(mu: Mutex.new(bytes.Buffer.new)) }
+
+def parse_lines(src: Str, text: Bool) -> ~[json.Value] {
+  out: [json.Value] = []
+  for line in src.split("\n") {
+    next if line.size == 0
+    out << (text ? ~parse_text(line) : ~json.parse(line))
+  }
+  out
+}
+
+# Go's parseText: "a=b G.c=d" into {"a":"b","G":{"c":"d"}} (assumes one
+# space between attributes and no quoting, as Go's does).
+def parse_text(line: Str) -> ~json.Value {
+  paths: [[Str]] = []
+  vals: [Str] = []
+  for kv in strings.trim_space(line).split(" ") {
+    i = strings.index(kv, "=")
+    fail json.JsonError.Syntax(msg: "no '=' in " + strconv.quote(kv), offset: 0) if i < 0
+    paths << kv[0...i].split(".")
+    vals << kv[i + 1...kv.size]
+  }
+  ~json.parse(object(paths, vals, 0))
+}
+
+# The JSON object of the entries whose paths share a prefix of length
+# `depth` (the caller passes only those), in first-seen key order.
+def object(paths: [[Str]], vals: [Str], depth: Int) -> Str {
+  keys: [Str] = []
+  for p in paths {
+    keys << p[depth] if !keys.include?(p[depth])
+  }
+  parts: [Str] = []
+  for k in keys {
+    sub: [[Str]] = []
+    sv: [Str] = []
+    leaf = ""
+    i = 0
+    while i < paths.size {
+      if paths[i][depth] == k {
+        if paths[i].size == depth + 1 {
+          leaf = vals[i]
+        } else {
+          sub << paths[i]
+          sv << vals[i]
+        }
+      }
+      i += 1
+    }
+    v = sub.size > 0 ? object(sub, sv, depth + 1) : json.quote(leaf)
+    parts << json.quote(k) + ":" + v
+  }
+  "{" + parts.join(",") + "}"
+}
+
+test "slogtest json" {
+  buf = new_buf
+  h = slog.new_json_handler(buf, slog.HandlerOptions.new)
+  test_handler(h, -> {~parse_lines(buf.string, false)}).unwrap
+}
+
+test "slogtest text" {
+  buf = new_buf
+  h = slog.new_text_handler(buf, slog.HandlerOptions.new)
+  test_handler(h, -> {~parse_lines(buf.string, true)}).unwrap
+}
+
+test "run" {
+  buf = new_buf
+  new_handler = -> {
+    buf.reset
+    slog.new_json_handler(buf, slog.HandlerOptions.new)
+  }
+  result = ->() -> ~json.Value { ~json.parse(strings.trim_space(buf.string)) }
+  assert_eq run(new_handler, result), []
+}
+
+# A handler that ignores groups and attributes from with_attrs: slogtest
+# reports it.
+struct Flat {
+  buf: SharedBuf
+
+  def enabled?(level: slog.Level) -> Bool { true }
+  def handle(r: slog.Record) -> ~Unit {
+    parts = ["\"msg\":" + json.quote(r.message)]
+    for a in r.attr_list {
+      parts << json.quote(a.key) + ":" + json.quote(a.value.to_s)
+    }
+    b = buf
+    ~b.write!(("{" + parts.join(",") + "}\n").bytes.to_a)
+    nil
+  }
+  def with_attrs(as: [slog.Attr]) -> Flat { self }
+  def with_group(name: Str) -> Flat { self }
+}
+
+test "bad handler" {
+  buf = new_buf
+  e = test_handler(Flat.new(buf: buf), -> {~parse_lines(buf.string, false)}).err.unwrap
+  m = e.message
+  assert m.include?("missing key \"time\": this test expects slog.TimeKey, slog.LevelKey and slog.MessageKey"), m
+  assert m.include?("missing key \"a\": a Handler should include the attributes from the WithAttrs method"), m
+  assert m.include?("value for group \"G\" is not map[string]any: a Handler should handle Group attributes"), m
+  assert m.include?("unexpected key \"\": a Handler should ignore an empty Attr"), m
+  # the wrong number of records
+  e2 = test_handler(Flat.new(buf: new_buf), -> {~parse_lines("", false)}).err.unwrap
+  assert_eq e2.message, "got 0 results, want 17"
+}
+
+example "parsing" {
+  buf = new_buf
+  h = slog.new_json_handler(buf, slog.HandlerOptions.new)
+  if e = test_handler(h, -> {~parse_lines(buf.string, false)}).err {
+    puts e.message
+  }
+} outputs ""

@@ -1,0 +1,134 @@
+# Package slog: Go's log/slog -- structured logging: records with a time,
+# level, message and key-value attributes, written by a Handler as text
+# (`time=... level=INFO msg=hi k=v`) or JSON lines.
+#
+#   l = slog.new(slog.new_json_handler(os.stderr, slog.HandlerOptions.new))
+#   l.info("hello", [slog.string("user", "ann"), slog.int("n", 3)])
+#   l.with([slog.string("req", id)]).with_group("db").warn("slow", [slog.duration("took", d)])
+#
+#   Go                                      alx
+#   Logger: New(h), Default()               Logger: new(h), default
+#   l.Info(msg, args...) / Debug/Warn/Error l.info(msg, attrs) / debug / warn / error
+#   l.Log / LogAttrs(ctx, level, msg, ...)  l.log(level, msg, attrs) / log_attrs (the same)
+#   l.InfoContext(ctx, ...) etc.            -- (no context argument: see below)
+#   l.With(args...) / WithGroup(name)       l.with(attrs) / with_group(name)
+#   l.Enabled(ctx, level) / l.Handler()     l.enabled?(level) / l.handler
+#   Info, Debug, Warn, Error, Log, LogAttrs, With   the same names, on `default`
+#   NewLogLogger(h, level) *log.Logger      new_log_logger(h, level) -> log.Logger[HandlerWriter]
+#   Handler interface                       Handler: enabled?(level), handle(r) -> ~Unit,
+#                                             with_attrs(attrs) -> Handler, with_group(name) -> Handler
+#   NewTextHandler(w, opts) *TextHandler    new_text_handler(w, opts) -> TextHandler[W]
+#   NewJSONHandler(w, opts) *JSONHandler    new_json_handler(w, opts) -> JSONHandler[W]
+#   NewMultiHandler(hs...) *MultiHandler    new_multi_handler(hs: [LeafHandler]) -> MultiHandler
+#   DiscardHandler                          discard_handler -> DiscardHandler
+#   HandlerOptions{AddSource, Level, ReplaceAttr}   HandlerOptions{add_source, level: Leveler?,
+#                                             replace_attr: (([Str], Attr) -> Attr)?}
+#   TimeKey LevelKey MessageKey SourceKey   TIME_KEY LEVEL_KEY MESSAGE_KEY SOURCE_KEY
+#   Attr{Key, Value}, a.Equal, a.String     Attr{key, value}, a.equal (==), a.to_s
+#   String Int Int64 Uint64 Float64 Bool    string int int64 uint64 float64 bool
+#     Duration Time Group GroupAttrs Any      duration time_attr group group_attrs any(key, Value)
+#   StringValue ... GroupValue              string_value int_value int64_value uint64_value
+#                                             float64_value bool_value duration_value
+#                                             time_value group_value(attrs)
+#   AnyValue(x)                             by what x is (see "Values" below)
+#   Kind, KindAny ... KindLogValuer         Int constants KIND_ANY ... KIND_LOG_VALUER;
+#                                             kind_string(k) is Go's Kind.String
+#   v.Kind / String / Int64 / Uint64 /      v.kind / to_s / int64 / uint64 / float64 / bool /
+#     Float64 / Bool / Duration / Time /      duration / time / group / log_valuer
+#     Group / LogValuer
+#   v.Any()                                 v.level, v.error_message, v.bytes, v.loggable,
+#                                             v.any_kind, v.source, v.nil? (see below)
+#   v.Equal / v.Resolve                     v.equal (==) / v.resolve
+#   LogValuer interface                     LogValuer: def log_value -> Value
+#   Level (int) LevelDebug ... LevelError   struct Level { n }, level_debug ... level_error
+#                                             (functions: a struct can't be a constant);
+#                                             `+ - <=>` with Ints and Levels
+#   l.String/MarshalJSON/MarshalText/       l.to_s / marshal_json / marshal_text /
+#     AppendText/UnmarshalJSON/UnmarshalText  append_text / unmarshal_json! / unmarshal_text!;
+#                                             parse_level(s) -> ~Level<LevelError>
+#   Leveler, LevelVar                       Leveler; LevelVar (new_level_var; level, set,
+#                                             to_s, marshal_text, unmarshal_text)
+#   Record: NewRecord, Time, Message,       Record: new_record(t, level, msg, pc); fields
+#     Level, PC, NumAttrs, Attrs(f),          time, message, level, pc; num_attrs, attrs { |a| },
+#     AddAttrs, Clone, Source                 attr_list, add_attrs!, clone, source
+#   Source{Function, File, Line}            Source{function, file, line}; source_value(s)
+#   SetDefault, SetLogLoggerLevel           -- (see below)
+#
+# Values. Go's Value holds an `any` for KindAny and KindLogValuer and asks it
+# by reflection how to print itself; alexandrite has no `any`, so the
+# constructor says what it is:
+#   valuer_value(x: LogValuer)  KIND_LOG_VALUER (handlers resolve it)
+#   any_value(x: Loggable)      KIND_ANY: x writes itself (log_text for the text
+#                               handler, Go's MarshalText or %+v; log_json, JSON
+#                               text, Go's MarshalJSON / json.Marshal)
+#   error_value(msg), err_value(e: Error), err(key, e)   an error: its message
+#   bytes_value(b)              a []byte: quoted in text, base64 in JSON
+#   raw_json_value(s)           a json.RawMessage: quoted in text, compacted in JSON
+#   level_value(l)              a Level (the built-in level attribute is one)
+#   source_value(s)             a *Source: "file:line" in text, an object in JSON
+#   kind_value(k)               a Kind
+#   nil_value / Value.new       Go's zero Value / AnyValue(nil): `<nil>`, null
+# Output is byte-for-byte Go's for all of these (thousands of generated
+# vectors: vec_*_test.alx), including Go 1.27's JSON escaping (invalid UTF-8
+# as a raw U+FFFD) and its float, time and quoting rules.
+#
+# Differences from Go:
+#  - No variadic `args ...any` (key, value, key, value...): every logging
+#    function takes `[Attr]` (Go's LogAttrs style), so there is no "!BADKEY".
+#    There are no default arguments either: write `l.info("msg", [])`.
+#  - No context.Context arguments (Handler.Enabled/Handle, the *Context
+#    methods): std/context carries no values, which is all handlers use it
+#    for, and making one per call would cost a lock and a channel.
+#  - No caller locations at run time: Records never carry a PC/Source, so
+#    add_source writes nothing (what Go writes for a record without a PC),
+#    and Record.source is always none.
+#  - No package-level mutable state yet (port issues #30/#51): `default` is
+#    a fresh Logger over a DefaultHandler writing through std/log's standard
+#    logger (stderr, LSTD_FLAGS), "2009/11/10 23:00:00 INFO msg k=v", and
+#    there is no SetDefault or SetLogLoggerLevel. The package functions (info,
+#    with, ...) reach it only through `default`, the one accessor to switch to
+#    a package-level `Atomic[Logger]` once R11 (state behind Atomic/Mutex)
+#    lands. Meanwhile pass a Logger around, use new_default_handler(l) to
+#    write through your own log.Logger, and its level_var for
+#    SetLogLoggerLevel. The other direction (log's output going to slog after
+#    SetDefault) is new_log_logger(h, level).
+#  - A Value can't contain Values (recursive types come with the memory
+#    model), so a group keeps its attributes flattened, and a LogValuer or
+#    Loggable can't hold a Value itself (Go's tests' `replace{v Value}`).
+#  - Interface values contain their implementors, so a handler can't hold a
+#    Handler and be one. Handlers return their own type from with_attrs /
+#    with_group (TextHandler[W] returns TextHandler[W]); wrapping handlers are
+#    generic over what they wrap (`struct LevelHandler[H] { handler: H }`);
+#    MultiHandler holds LeafHandlers -- the same methods returning
+#    LeafHandler, which every handler but MultiHandler is.
+#  - Handlers are generic over their writer and own a copy of it (as
+#    std/log's Logger does; copies of the handler share it under one lock):
+#    read a buffer back with `h.writer`, or write to a type whose copies
+#    share state.
+#  - Value.to_s of a LogValuer is its resolved value's text (Go prints the
+#    struct with %v). Values compare as Go's Equal except that Loggables are
+#    equal when their text and JSON forms are, and LogValuers when their
+#    resolved values are (Go compares the `any` values: identity for
+#    pointers).
+#  - A log_text / log_json failure is written as `!ERROR:<its message>`: Go
+#    prefixes MarshalJSON errors with "json: error calling MarshalJSON for
+#    type T: ", and alexandrite can't name T. log_json output is checked,
+#    compacted and HTML-escaped as Go's encoder does with a Marshaler.
+#  - Resolve's error after 100 LogValue calls says "of type LogValuer" (Go
+#    names the dynamic type), and a log_value that panics isn't recovered
+#    (Go writes "LogValue panicked"; alexandrite has no recover). Same for
+#    panics in handlers (Go writes "!PANIC: ...").
+#  - Record.add_attrs! copies the attribute list, so copies of a Record never
+#    see each other's additions (Go needs Clone and adds a "!BUG" attribute
+#    otherwise); clone is a plain copy. attrs(f) is Go's Attrs; attr_list
+#    gives the list.
+#  - MultiHandler.handle fails with the one error, or with an error whose
+#    message joins several (Go's errors.Join).
+#  - Level is also a std/flag Value (`set!`), for Go's flag.TextVar use.
+#  - Skipped: Go's allocation tests (TestAlloc, ...), the call-depth tests
+#    (caller locations), TestContext, TestPanics, TestSetAttrs / !BADKEY
+#    (variadic args), SetDefault's log.SetOutput coupling (TestConnections
+#    is ported for the default handler's direction).
+#
+# testing/slogtest (Go's handler conformance cases) is std/testing/slogtest;
+# this package's own handlers are checked by its tests.

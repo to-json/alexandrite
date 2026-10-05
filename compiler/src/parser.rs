@@ -416,6 +416,7 @@ impl<'a> Parser<'a> {
         // encoding/json/v2's methods, for files that use v2 (derive_json2.rs).
         let wants_v2 = m.imports.iter().any(|i| i.path == "encoding/json/v2" || i.path == "encoding/json/jsontext");
         let mut v2_texts = vec![];
+        let mut v2_only: Vec<String> = vec![];
         if wants_v2 {
             let mut alias_of = |path: &str, fallback: &str| match m.imports.iter().find(|i| i.path == path) {
                 Some(i) => import_name(i),
@@ -426,6 +427,7 @@ impl<'a> Parser<'a> {
             };
             let j2 = alias_of("encoding/json/v2", "alxjson2");
             let jt = alias_of("encoding/json/jsontext", "alxjsontext");
+            v2_only.push(format!("{jt}.Value"));
             let go_names: std::collections::HashMap<String, String> = jobs.iter().filter_map(|j| j.go_name.clone().map(|g| (j.name.clone(), g))).collect();
             let cx = crate::derive_json2::Ctx { j: &j2, t: &jt, types: &types, go_names: &go_names };
             for job in &jobs {
@@ -434,7 +436,7 @@ impl<'a> Parser<'a> {
             }
         }
         for (k, job) in jobs.iter().enumerate() {
-            let text = crate::derive::json_source(job, &alias, &types, wants_v2)?;
+            let text = crate::derive::json_source(job, &alias, &types, wants_v2, &v2_only)?;
             // One struct body: v1's methods, then v2's (both texts are `struct Name { ... }`).
             let text = if wants_v2 {
                 let v1 = &text[..text.rfind('}').unwrap()];

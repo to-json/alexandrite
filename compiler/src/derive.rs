@@ -431,6 +431,8 @@ struct Gen<'a> {
     /// for (fixed arrays, non-Str map keys, Complex) fails at run time in v1
     /// instead of failing the derive.
     lenient: bool,
+    /// Types only v2 encodes (jsontext.Value under the file's alias).
+    v2_only: Vec<String>,
     tparams: &'a [String],
     types: &'a ModuleTypes,
     owner: &'a str,
@@ -500,7 +502,7 @@ impl<'a> Gen<'a> {
     /// becomes one interpolated string, so a record costs one allocation and one
     /// push into the encoder, however many fields it has.
     fn enc(&mut self, t: &'a TypeExpr, x: &str, ind: usize) -> GResult<Vec<Frag>> {
-        if self.lenient && self.classify(t).is_err() && self.zero(t).is_some() {
+        if self.lenient && (self.classify(t).is_err() || self.v2_only_type(t)) && self.zero(t).is_some() {
             return Ok(vec![Frag::Ex(format!("_e.unsupported!({})", lit(&type_src(t))))]);
         }
         Ok(match self.classify(t)? {
@@ -550,6 +552,10 @@ impl<'a> Gen<'a> {
                 fr
             }
         })
+    }
+
+    fn v2_only_type(&self, t: &TypeExpr) -> bool {
+        matches!(t, TypeExpr::Named(n, _) if self.v2_only.contains(n))
     }
 
     /// Does the module declare its own type named like a builtin (`Int`)?
@@ -613,7 +619,7 @@ impl<'a> Gen<'a> {
 
     /// Statements that read a value of type `t` from `d` into a new local `dest`.
     fn dec(&mut self, t: &'a TypeExpr, dest: &str, ind: usize) -> GResult<()> {
-        if self.lenient && self.classify(t).is_err() {
+        if self.lenient && (self.classify(t).is_err() || self.v2_only_type(t)) {
             if let Some(z) = self.zero(t) {
                 self.w(ind, format!("{dest}: {} = {z}", type_src(t)));
                 self.w(ind, "_d.skip!");
@@ -702,9 +708,9 @@ fn check_keys<'a>(fields: impl Iterator<Item = &'a DField>, what: &str) -> Resul
 }
 
 /// The source text of `struct Name[T] { defs }` holding the derived methods.
-pub fn json_source(job: &DeriveJob, alias: &str, types: &ModuleTypes, lenient: bool) -> Result<String, Diag> {
+pub fn json_source(job: &DeriveJob, alias: &str, types: &ModuleTypes, lenient: bool, v2_only: &[String]) -> Result<String, Diag> {
     let fail = |m: String| Diag::new(job.span, format!("derive(Json) on `{}`: {m}", job.name));
-    let mut g = Gen { alias, lenient, tparams: &job.tparams, types, owner: &job.name, out: String::new(), n: 0 };
+    let mut g = Gen { alias, lenient, v2_only: v2_only.to_vec(), tparams: &job.tparams, types, owner: &job.name, out: String::new(), n: 0 };
     if !job.tparams.is_empty() {
         return Err(fail("generic types can't derive Json yet; derive it on a concrete wrapper, or write json_enc / json_dec by hand".to_string()));
     }

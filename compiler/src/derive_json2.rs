@@ -546,7 +546,7 @@ fn struct_methods<'a>(g: &mut G<'a>, job: &'a DeriveJob, fields: &'a [DField], g
         let names: Vec<String> = direct.iter().map(|f| lit(&json_name(f))).collect();
         let casings: Vec<String> = direct.iter().map(|f| f.opts.casing.to_string()).collect();
         let (names, casings) = if names.is_empty() { (format!("{j}.no_names"), format!("{j}.no_casings")) } else { (format!("[{}]", names.join(", ")), format!("[{}]", casings.join(", "))) };
-        g.w(2, format!("_fb = {j}.Fallback.new(seen: _w, names: {names}, casings: {casings})"));
+        g.w(2, format!("_fb = {j}.Fallback.new(seen: _w, names: {names}, casings: {casings}, checked: {})", !embedded.is_empty()));
         match g.kind(&f.ty)? {
             K::Raw => g.w(2, format!("~{j}.marshal_fallback_raw(_e, _fo, self.{}, _fb)", f.name)),
             K::Map(_, vt) => {

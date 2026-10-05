@@ -1,24 +1,27 @@
-# Template data: the dynamic `Value` a template executes on (Go's
-# reflect.Value), the `Doc` arena its containers live in, the `Data`
-# protocol that exposes a derived type's methods, and `Func`, a function a
-# template can call.
+# Package dyn: dynamic values, alx's stand-in for Go's reflect.Value
+# (GO-VS-RUBY S5; docs/notes/data-derive.md).
 #
-# Go evaluates `.Field`, `.Method args`, `index` and `range` by reflection.
-# alx has none (GO-VS-RUBY S3), so data reaches a template as a Value:
+# Go code that inspects arbitrary values at run time (text/template and
+# html/template, slog's Any, expvar, testing/quick, fmt's %v of user types)
+# does it by reflection. alx has none (S3), so such values travel as a
+# `Value` tree, a superset of encoding/json's Value:
 #
 #   - scalars carry their Go kind and type name (int, uint16, float64,
-#     string, template.HTML, ...), so `eq`, `lt`, `printf "%T"`, argument
-#     checks and error messages follow Go's rules;
-#   - lists (slices and arrays), maps and structs are nodes in a Doc (alx
-#     values can't contain themselves, so a tree of values is stored flat);
+#     string, template.HTML, ...), so comparisons, `%T`, argument checks and
+#     error messages can follow Go's rules;
+#   - lists (slices and arrays), maps, structs and pointers are nodes in a
+#     `Doc` arena (alx values can't contain themselves, so a tree of values
+#     is stored flat, as json.Value is);
 #   - a struct may carry a `Data` object: the original alx value, whose
-#     exposed methods the template calls by name (`.Method args`);
+#     exposed methods a consumer calls by name (a template's `.Method args`);
 #   - functions are `Func`s: a Go-style signature (`Sig`) and a closure over
 #     `[Value]`.
 #
-# `#[derive(Template)]` writes the conversion for a struct or enum (and the
-# Data methods when it has public methods); Value's static constructors
-# build data by hand.
+# `#[derive(Data)]` writes `to_data` / `from_data` for a struct or enum
+# (and the Data methods when it has public methods); Value's static
+# constructors build values by hand, `Value.from_json` from a JSON
+# document, and fmt.alx prints them as Go's fmt does (`fmt_print`,
+# `fmt_printf`, `fmt_println`).
 
 import "encoding/json"
 import "strconv"
@@ -46,17 +49,17 @@ pub KIND_FUNC = 10
 # non-empty interface type
 pub KIND_PTR = 11
 # The marker for "no final argument" in the executor (Go's missingVal).
-KIND_MISSING = 12
+pub KIND_MISSING = 12
 
 # The interface a derived type implements when it exposes methods: the
 # executor asks it for a method's signature and calls it by name.
 pub interface Data {
   # The signature of the exposed method `name`, or none.
-  def tmpl_sig(name: Str) -> Sig?
+  def data_sig(name: Str) -> Sig?
   # Calls the exposed method `name`; the arguments already match its Sig.
-  def tmpl_call(name: Str, args: [Value]) -> ~Value
+  def data_call(name: Str, args: [Value]) -> ~Value
   # The text fmt prints for the value (Go's String() or Error()), if any.
-  def tmpl_string -> Str?
+  def data_string -> Str?
 }
 
 # A function value's interface (Func is the implementation; the interface
@@ -469,8 +472,8 @@ pub struct Value {
   def node -> Node { d[0].nodes[id] }
   def doc -> Doc { Doc.new(st: d) }
 
-  # The value itself (so generic code can call `x.to_tmpl` on a Value).
-  pub def to_tmpl -> Value { self }
+  # The value itself (so generic code can call `x.to_data` on a Value).
+  pub def to_data -> Value { self }
 
   # Constructors.
   # No value: Go's invalid reflect.Value (an untyped nil).
@@ -641,7 +644,7 @@ pub struct Value {
   }
 
   # Any value that converts itself (a derived type, or a Value).
-  pub def self.from[T](x: T) -> Value { x.to_tmpl }
+  pub def self.from[T](x: T) -> Value { x.to_data }
 
   # A pointer to the value (Go's &x), of type "*T".
   pub def ptr -> Value {
@@ -820,7 +823,7 @@ pub struct Value {
   }
 
   # The value as Go's fmt prints it with %v.
-  pub def to_s -> Str { go_sprint([self]) }
+  pub def to_s -> Str { fmt_print([self]) }
 }
 
 # A JSON value inside an array or object: null is a nil interface{}.
@@ -950,7 +953,7 @@ pub def iface_type?(t: Str) -> Bool {
 
 # v as read from a container whose element type is t: an interface type
 # is remembered (Value.it).
-def through(v: Value, t: Str) -> Value {
+pub def through(v: Value, t: Str) -> Value {
   return v if !(t == "any" || t == "error" || strings.has_prefix(t, "interface"))
   r = v
   r.it = t
@@ -958,6 +961,159 @@ def through(v: Value, t: Str) -> Value {
 }
 
 # Whether t is an empty interface or reflect.Value: anything is assignable.
-def any_type?(t: Str) -> Bool {
+pub def any_type?(t: Str) -> Bool {
   t == "interface {}" || t == "any" || t == "reflect.Value" || t == "interface{}"
 }
+
+# Reading values back (what `from_data` of #[derive(Data)] calls). Each
+# fails with a "dyn: ..." message when the value doesn't fit; numbers
+# convert between kinds when the value is exact (JSON's numbers are
+# float64: 3.0 is an Int, 3.5 isn't).
+
+def mismatch(v: Value, want: Str) -> Error {
+  Failure.Msg("dyn: cannot use #{v.valid? ? v.type_name : "nil"} value as #{want}")
+}
+
+# The value behind any pointers (a nil pointer: INVALID).
+pub def deref(v: Value) -> Value {
+  x = v
+  while x.k == KIND_PTR {
+    x = x.elem
+  }
+  x
+}
+
+# Whether v is no value: INVALID, a nil pointer or nil interface.
+pub def absent?(v: Value) -> Bool { v.k == KIND_INVALID || v.k == KIND_PTR && v.nil? }
+
+pub def to_int(v0: Value) -> ~Int {
+  v = deref(v0)
+  case v.k {
+    KIND_INT => {return v.n}
+    KIND_UINT => {
+      return v.u.as_i64 if v.u <= 9223372036854775807.as_u64
+    }
+    KIND_FLOAT => {
+      if v.f >= -9223372036854775808.0 && v.f < 9223372036854775808.0 && v.f.to_i.to_f == v.f {
+        return v.f.to_i
+      }
+    }
+    _ => {}
+  }
+  fail mismatch(v, "int")
+}
+
+pub def to_uint(v0: Value) -> ~U64 {
+  v = deref(v0)
+  case v.k {
+    KIND_UINT => {return v.u}
+    KIND_INT => {
+      return v.n.as_u64 if v.n >= 0
+    }
+    KIND_FLOAT => {
+      if v.f >= 0.0 && v.f < 18446744073709551616.0 && v.f.to_u64.to_f == v.f {
+        return v.f.to_u64
+      }
+    }
+    _ => {}
+  }
+  fail mismatch(v, "uint")
+}
+
+pub def to_float(v0: Value) -> ~Float {
+  v = deref(v0)
+  case v.k {
+    KIND_FLOAT => {return v.f}
+    KIND_INT => {return v.n.to_f}
+    KIND_UINT => {return v.u.to_f}
+    _ => {}
+  }
+  fail mismatch(v, "float64")
+}
+
+pub def to_complex(v0: Value) -> ~Complex {
+  v = deref(v0)
+  return v.complex_val if v.k == KIND_COMPLEX
+  Complex.new(~to_float(v), 0.0)
+}
+
+pub def to_bool(v0: Value) -> ~Bool {
+  v = deref(v0)
+  fail mismatch(v, "bool") if v.k != KIND_BOOL
+  v.bool_val
+}
+
+pub def to_str(v0: Value) -> ~Str {
+  v = deref(v0)
+  fail mismatch(v, "string") if v.k != KIND_STRING
+  v.str_val
+}
+
+# A LIST (of n elements, if n >= 0); a nil slice is an empty one.
+pub def want_list(v0: Value, n: Int) -> ~Value {
+  v = deref(v0)
+  return Value.list([]) if v.k == KIND_INVALID && n < 0
+  fail mismatch(v, n < 0 ? "a slice" : "[#{n}] array") if v.k != KIND_LIST
+  fail Failure.Msg("dyn: an array of #{v.len} elements for [#{n}]") if n >= 0 && v.len != n
+  v
+}
+
+# A MAP; a nil map is an empty one.
+pub def want_map(v0: Value) -> ~Value {
+  v = deref(v0)
+  return Value.map_of([], [], "map[string]interface {}") if v.k == KIND_INVALID
+  fail mismatch(v, "a map") if v.k != KIND_MAP
+  v
+}
+
+# A STRUCT (or a map[string]..., as JSON objects are) for the type named t.
+pub def want_struct(v: Value, t: Str) -> ~Value {
+  fail mismatch(v, t) if v.k != KIND_STRUCT && v.k != KIND_MAP
+  v
+}
+
+# A FUNC's function.
+pub def want_func(v0: Value) -> ~Callable {
+  v = deref(v0)
+  if v.k == KIND_FUNC {
+    if c = v.callable {
+      return c
+    }
+  }
+  fail mismatch(v, "a func")
+}
+
+# Field `name` of a struct, or the entry for key `name` of a map.
+pub def get_field(v: Value, name: Str) -> ~Value {
+  if x = lookup_field(v, name) {
+    return x
+  }
+  fail Failure.Msg("dyn: #{v.type_name} has no field #{name}")
+}
+
+# Like get_field, but a missing field is INVALID (for optional fields).
+pub def field_or_nil(v: Value, name: Str) -> Value { lookup_field(v, name) || Value.invalid }
+
+def lookup_field(v: Value, name: Str) -> Value? {
+  if v.k == KIND_MAP {
+    return v.map_get(Value.str(name))
+  }
+  if f = v.field(name) {
+    return f[0]
+  }
+  none
+}
+
+# An enum's variant: a string (a payload-free variant of a type without
+# methods) or the "variant" field of a struct.
+pub def variant_name(v: Value, t: Str) -> ~Str {
+  return v.str_val if v.k == KIND_STRING
+  if v.k == KIND_STRUCT || v.k == KIND_MAP {
+    return ~to_str(~get_field(v, "variant"))
+  }
+  fail mismatch(v, t)
+}
+
+pub def no_variant(t: Str, name: Str) -> Error { Failure.Msg("dyn: #{t} has no variant #{strconv.quote(name)}") }
+
+pub def no_method(t: Str, name: Str) -> Error { Failure.Msg("dyn: #{t} has no method #{name}") }

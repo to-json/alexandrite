@@ -1,5 +1,8 @@
-# Compiler fixes from the text/template and html/template ports (S3).
+# Compiler fixes from the text/template and html/template ports (S3), and
+# #[derive(Data)] with #[field(...)] tags (S5).
 
+import "dyn"
+import "encoding/json"
 import "text/template"
 
 # 1. Mutually recursive `!` methods with declared error sets: a call to a
@@ -60,22 +63,22 @@ puts eval("1+2+(3+4)")
 puts eval("1+(2+")
 puts eval("((9))+x")
 
-# 2. #[derive(Template)] (D59): the generated conversion and Data protocol on
+# 2. #[derive(Data)] (S5, D59): the generated conversion and Data protocol on
 # every backend. The derive gives all its tokens the declaration's span; two
 # lambdas in one generated def (two function fields here, and the FuncMap
 # of the methods) used to collide (lambdas were known by their span; now by
 # their block's id).
-#[derive(Template)]
-#[template("main.Pet")]
+#[derive(Data)]
+#[data("main.Pet")]
 struct Pet {
-  #[template("Name")] name: Str
+  #[field(data: "Name")] name: Str
   age: Int
   tags: [Str]
   owner: Str?
   greet: (Str) -> Str
   shout: (Str) -> Str
 
-  #[template("Describe")]
+  #[data("Describe")]
   pub def describe(prefix: Str, n: Int) -> Str { "#{prefix}#{name} (#{age * n})" }
 
   pub def check(n: Int) -> ~Int {
@@ -88,6 +91,44 @@ struct Pet {
 
 pet = Pet.new(name: "Rex", age: 3, tags: ["good", "dog"], greet: ->(s: Str) -> Str { "hi " + s }, shout: ->(s: Str) -> Str { s + "!" })
 text = "{{.Name}} {{.age}} {{range $i, $t := .tags}}{{$i}}:{{$t}} {{end}}{{.owner}} {{call .greet .Name}} {{call .shout `woof`}} {{.Describe `a ` 2}} {{Describe `b ` 3}} {{check 2}} {{.}} {{printf `%T %v %q` . .tags .Name}}"
-t = template.new("pet").funcs(pet.tmpl_funcs).parse(text).unwrap
+t = template.new("pet").funcs(pet.data_funcs).parse(text).unwrap
 puts t.execute_str(pet).unwrap
-puts template.new("e").funcs(pet.tmpl_funcs).parse("{{check 9}}").unwrap.execute_str(pet).err?.message || ""
+puts template.new("e").funcs(pet.data_funcs).parse("{{check 9}}").unwrap.execute_str(pet).err?.message || ""
+
+# 3. #[derive(Data)] both ways (S5): to_data / from_data through every field
+# kind and one #[field(...)] carrying several derives' tags. (Function
+# fields only go to data: Pet above has no from_data.)
+#[derive(Data)]
+enum Shape {
+  Dot
+  Circle(r: Float)
+  #[data("Rect")] Box(w: Int, h: Int)
+}
+
+#[derive(Data)]
+struct Drawing {
+  #[field(data: "Title")] title: Str
+  #[field(data: "-")] scratch: Int
+  shapes: [Shape]
+  layers: Map[Str, I16]
+  origin: [Int; 2]
+  parent: Layer?
+}
+
+#[derive(Data, Json)]
+struct Layer {
+  #[field(json: "nm,omitempty", data: "Name", xml: "n,attr")] name: Str
+  #[json(skip)] depth: U8
+}
+
+d = Drawing.new(title: "plan", scratch: 7, shapes: [Shape.Dot, Shape.Circle(1.5), Shape.Box(2, 3)], layers: {"bg" => 1, "fg" => -2}, origin: [4, 5], parent: Layer.new(name: "base", depth: 2))
+v = d.to_data
+puts template.new("d").parse("{{.Title}} {{.shapes}} {{.layers}} {{.origin}} {{.parent.Name}}").unwrap.execute_str(v).unwrap
+back = Drawing.from_data(v).unwrap
+puts "#{back.title} #{back.scratch} #{back.shapes.size} #{back.shapes[2] == Shape.Box(2, 3)} #{back.layers["fg"].unwrap} #{back.origin[1]} #{back.parent.unwrap.name}"
+puts Layer.from_data(Layer.new(name: "x", depth: 9).to_data.ptr).unwrap.depth
+puts Layer.from_data(dyn.Value.from_json(json.parse("{\"Name\": \"js\", \"depth\": 4}").unwrap)).unwrap.depth
+puts Layer.from_data(dyn.Value.int(3)).err?.message || ""
+puts Shape.from_data(dyn.Value.str("Hexagon")).err?.message || ""
+puts Layer.new(name: "j", depth: 1).to_json.unwrap
+puts Layer.new(name: "", depth: 1).to_json.unwrap

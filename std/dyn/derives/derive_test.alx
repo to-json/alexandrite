@@ -1,0 +1,143 @@
+# #[derive(Data)]: types to and from dyn.Value trees. (In a directory of its
+# own: a derive imports "dyn", which package dyn's own tests can't.)
+
+import "dyn"
+import "strings"
+
+#[derive(Data)]
+struct Point {
+  x: Int
+  y: Int
+}
+
+#[derive(Data)]
+enum Shape {
+  Dot
+  Circle(r: Float)
+  #[data("Rect")] Box(w: Int, h: Int)
+  Path(pts: [Point])
+}
+
+#[derive(Data)]
+#[data("geo.Figure")]
+struct Figure {
+  #[field(data: "Name", json: "name")] name: Str
+  #[data(skip)] cache: [Int]
+  #[field(data: "-")] count: Int
+  i8: I8
+  u16: U16
+  u64: U64
+  r: Rune
+  b: Byte
+  f: Float
+  c: Complex
+  ok: Bool
+  shapes: [Shape]
+  grid: [[Int]]
+  corners: [Point; 2]
+  tags: Map[Str, Int]
+  ids: Map[Int, Str]
+  origin: Point?
+  missing: Point?
+  err: Error
+  extra: dyn.Value
+}
+
+def figure -> Figure {
+  Figure.new(name: "f", cache: [1], count: 3, i8: -8, u16: 65535, u64: 18446744073709551615, r: 120, b: 7, f: 0.25, c: Complex.new(1.0, -1.0), ok: true, shapes: [Shape.Dot, Shape.Circle(2.0), Shape.Box(3, 4), Shape.Path([Point.new(x: 1, y: 2)])], grid: [[1, 2], [3]], corners: [Point.new(x: 0, y: 0), Point.new(x: 9, y: 9)], tags: {"a" => 1}, ids: {2 => "two"}, origin: Point.new(x: 5, y: 6), err: Failure.Msg("bad"), extra: dyn.Value.list_of([dyn.Value.str("e")], "[]string"))
+}
+
+test "to data" {
+  v = figure().to_data
+  assert_eq v.type_name, "geo.Figure"
+  assert_eq v.field_names, ["Name", "i8", "u16", "u64", "r", "b", "f", "c", "ok", "shapes", "grid", "corners", "tags", "ids", "origin", "missing", "err", "extra"]
+  assert_eq dyn.fmt_printf("%T|%T|%T|%T|%T|%T|%T", [(~dyn.get_field(v, "i8")), (~dyn.get_field(v, "u64")), (~dyn.get_field(v, "r")), (~dyn.get_field(v, "b")), (~dyn.get_field(v, "corners")), (~dyn.get_field(v, "ids")), (~dyn.get_field(v, "origin"))]), "int8|uint64|int32|uint8|[2]Point|map[int]string|*Point"
+  assert_eq dyn.fmt_print([~dyn.get_field(v, "shapes")]), "[Dot {Circle 2} {Rect 3 4} {Path [{1 2}]}]"
+  assert_eq dyn.fmt_printf("%+v", [~dyn.get_field(v, "corners")]), "[{x:0 y:0} {x:9 y:9}]"
+  assert_eq dyn.fmt_print([~dyn.get_field(v, "missing")]), "<nil>"
+  assert_eq dyn.fmt_print([~dyn.get_field(v, "err")]), "bad"
+  assert_eq dyn.fmt_print([~dyn.get_field(v, "extra")]), "[e]"
+}
+
+test "round trip" {
+  f = figure()
+  g = ~Figure.from_data(f.to_data)
+  assert_eq g.name, "f"
+  assert_eq g.cache, []
+  assert_eq g.count, 0
+  assert_eq g.i8, -8
+  assert_eq g.u16, 65535
+  assert_eq g.u64, f.u64
+  assert_eq g.r, 120
+  assert_eq g.b, 7
+  assert_eq g.f, 0.25
+  assert_eq g.c, Complex.new(1.0, -1.0)
+  assert_eq g.ok, true
+  assert g.shapes == f.shapes, "shapes"
+  assert_eq g.grid, [[1, 2], [3]]
+  assert g.corners[1] == Point.new(x: 9, y: 9), "corners"
+  assert_eq g.tags["a"].unwrap, 1
+  assert_eq g.ids[2].unwrap, "two"
+  assert g.origin.unwrap == Point.new(x: 5, y: 6), "origin"
+  assert g.missing == none, "missing"
+  assert_eq g.err.message, "bad"
+  assert_eq g.extra.to_s, "[e]"
+}
+
+test "from json-shaped values" {
+  # A map stands for a struct, numbers convert when exact, missing optional
+  # fields are none.
+  v = dyn.Value.map({"x" => dyn.Value.float(3.0), "y" => dyn.Value.int(4)})
+  p = ~Point.from_data(v)
+  assert_eq p.x, 3
+  s = ~Shape.from_data(dyn.Value.map({"variant" => dyn.Value.str("Rect"), "w" => dyn.Value.int(1), "h" => dyn.Value.int(2)}))
+  assert s == Shape.Box(1, 2), "Rect"
+  assert ~Shape.from_data(dyn.Value.str("Dot")) == Shape.Dot, "Dot"
+}
+
+test "errors" {
+  assert_eq Point.from_data(dyn.Value.map({"x" => dyn.Value.int(1)})).err?.message || "", "dyn: map[string]interface {} has no field y"
+  assert_eq Point.from_data(dyn.Value.map({"x" => dyn.Value.float(1.5), "y" => dyn.Value.int(1)})).err?.message || "", "dyn: cannot use float64 value as int"
+  assert_eq Point.from_data(dyn.Value.str("p")).err?.message || "", "dyn: cannot use string value as Point"
+  assert_eq Shape.from_data(dyn.Value.str("Box")).err?.message || "", "dyn: Shape has no variant \"Box\""
+}
+
+# Methods: public ones are callable through the Data interface by name
+# (renamed or skipped by options); to_s is its string.
+#[derive(Data)]
+struct Counter {
+  n: Int
+
+  pub def add(k: Int) -> Int { n + k }
+  #[data("Join")]
+  pub def join(xs: [Str], sep: Str) -> Str { strings.join(xs, sep) }
+  pub def check(k: Int) -> ~Int {
+    fail Failure.Msg("too big") if k > n
+    k
+  }
+  #[data(skip)]
+  pub def hidden -> Int { 0 }
+  pub def to_s -> Str { "Counter(#{n})" }
+}
+
+test "methods" {
+  c = Counter.new(n: 10)
+  v = c.to_data
+  o = v.obj.unwrap
+  assert_eq o.data_sig("add").unwrap.to_s, "func(int) int"
+  assert_eq o.data_sig("Join").unwrap.to_s, "func([]string, string) string"
+  assert_eq o.data_sig("check").unwrap.to_s, "func(int) (int, error)"
+  assert o.data_sig("hidden") == none, "skipped"
+  assert o.data_sig("join") == none, "renamed"
+  assert_eq (~o.data_call("add", [dyn.Value.int(5)])).int_val, 15
+  assert_eq (~o.data_call("Join", [dyn.Value.list_of([dyn.Value.str("a"), dyn.Value.str("b")], "[]string"), dyn.Value.str("-")])).str_val, "a-b"
+  assert_eq o.data_call("check", [dyn.Value.int(11)]).err?.message || "", "too big"
+  assert_eq o.data_call("nope", []).err?.message || "", "dyn: Counter has no method nope"
+  assert_eq o.data_string.unwrap, "Counter(10)"
+  assert_eq v.to_s, "Counter(10)"
+  fm = c.data_funcs
+  # add, Join, check and to_s (Go's String, callable as .to_s)
+  assert_eq fm.keys.size, 4
+  assert_eq (~fm["add"].unwrap.call([dyn.Value.int(1)])).int_val, 11
+  assert_eq (~Counter.from_data(v)).n, 10
+}

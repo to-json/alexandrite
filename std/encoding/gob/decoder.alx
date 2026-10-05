@@ -27,13 +27,13 @@ struct DecState {
   # decoding plans of struct types: "local type#wire id" -> local field per wire field
   plans: Map[Str, [Int]]
   types: Types
-  reg: Registry
   depth: Int
   # decoding the top-level value itself (Go names the local type *T then:
   # Decode was given a pointer)
   at_top: Bool
   # Go's maxIgnoreNestingDepth
   max_depth: Int
+  seen: Map[Int, Bool]
 }
 
 BUILTIN_NAMES = ["", "bool", "int", "uint", "float", "bytes", "string", "complex", "interface"]
@@ -43,7 +43,6 @@ pub struct Dec {
   st: [DecState]
 
   pub def types -> Types { self.st[0].types }
-  pub def registry -> Registry { self.st[0].reg }
 
   # How deep skipped values may nest (Go's maxIgnoreNestingDepth, 10000).
   pub def set_max_depth!(n: Int) { self.st[0].max_depth = n }
@@ -542,6 +541,33 @@ pub struct Dec {
     nil
   }
 
+  # Whether a value of wire type w could be skipped: Go compiles the
+  # skipping code for an unmatched field before decoding anything, which
+  # reports undefined types and too-deep nesting first.
+  pub def ignorable!(w: Int) -> ~Unit {
+    self.st[0].seen = {}
+    self.~ign_walk!(w, 1)
+  }
+
+  def ign_walk!(w: Int, depth: Int) -> ~Unit {
+    fail gerr("invalid nesting depth") if depth > self.st[0].max_depth
+    return if w >= T_BOOL && w <= T_INTERFACE
+    return if self.st[0].seen.key?(w)
+    self.st[0].seen[w] = true
+    t = self.~wire_or(w, gerr("gob: bad data: undefined type #{self.type_string(w)}"))
+    if t.kind == K_ARRAY || t.kind == K_SLICE {
+      self.~ign_walk!(t.elem, depth + 1)
+    } elsif t.kind == K_MAP {
+      self.~ign_walk!(t.key, depth + 1)
+      self.~ign_walk!(t.elem, depth + 1)
+    } elsif t.kind == K_STRUCT {
+      for f in t.fids {
+        self.~ign_walk!(f, depth + 1)
+      }
+    }
+    nil
+  }
+
   # A whole top-level value of wire type w, skipped (Decode(nil)).
   pub def skip_value!(w: Int) -> ~Unit {
     if t = self.st[0].wire[w] {
@@ -556,8 +582,8 @@ pub struct Dec {
 
 def ovfl(name: Str) -> GobError { gerr("value for \"#{name}\" out of range") }
 
-pub def new_dec(read: ([Byte]) -> ~Int, reg: Registry) -> Dec {
-  Dec.new(st: [DecState.new(read: read, buf: [], pos: 0, wire: {}, plans: {}, types: new_types(), reg: reg, depth: 0, at_top: false, max_depth: MAX_IGNORE_DEPTH)])
+pub def new_dec(read: ([Byte]) -> ~Int) -> Dec {
+  Dec.new(st: [DecState.new(read: read, buf: [], pos: 0, wire: {}, plans: {}, types: new_types(), depth: 0, at_top: false, max_depth: MAX_IGNORE_DEPTH, seen: {})])
 }
 
 # Go's Decoder: values from a stream of messages on a reader.
@@ -586,18 +612,13 @@ pub struct Decoder[Rdr] {
     d.~skip_value!(id)
   }
 
-  pub def registry -> Registry { self.dd.registry }
-
   # The decoder's state, for hand-written gob_dec methods and tests.
   pub def dec -> Dec { self.dd }
 }
 
 # Go's NewDecoder.
-pub def new_decoder[Rdr](r: Rdr) -> Decoder[Rdr] { new_decoder_with(r, default_registry()) }
-
-# A Decoder reading interface values' names through `reg`.
-pub def new_decoder_with[Rdr](r: Rdr, reg: Registry) -> Decoder[Rdr] {
+pub def new_decoder[Rdr](r: Rdr) -> Decoder[Rdr] {
   rs = [r]
   f = ->(p: [Byte]) -> ~Int { rs[0].~read!(p) }
-  Decoder.new(rs: rs, dd: new_dec(f, reg))
+  Decoder.new(rs: rs, dd: new_dec(f))
 }

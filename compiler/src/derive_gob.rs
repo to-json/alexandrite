@@ -1,5 +1,5 @@
 //! `#[derive(Gob)]`: compile-time generation of `encoding/gob` code
-//! (GO-VS-RUBY D63, docs/notes/gob-derive.md).
+//! (GO-VS-RUBY D66, docs/notes/gob-derive.md).
 //!
 //! Like `#[derive(Json)]` (derive.rs) and `#[derive(Data)]`
 //! (derive_data.rs), this is expansion by source text: the parser records
@@ -150,7 +150,8 @@ impl<'a> G<'a> {
                 match self.locals.get(n) {
                     Some(l) if l.derived => Ok(()),
                     Some(_) => Err(format!("field type `{n}` doesn't derive Gob; add #[derive(Gob)] to it")),
-                    None => Err(format!("can't encode a field of type `{n}` with gob")),
+                    // another file of the package (or a hand-written protocol type): its methods say
+                    None => Ok(()),
                 }
             }
             TypeExpr::Array(e, _) | TypeExpr::Opt(e, _) => self.check(e),
@@ -381,6 +382,10 @@ impl<'a> G<'a> {
                 self.w(ind, "}");
                 self.w(ind, format!("{dest} = {m}"));
             }
+            TypeExpr::Opt(e, _) if matches!(**e, TypeExpr::Fixed(..)) => {
+                // a fresh array straight into dest (no fixed-array local copies, port-issues #88)
+                self.dec(e, w, dest, name, ind);
+            }
             TypeExpr::Opt(e, _) => {
                 let (o, x) = (self.fresh("o"), self.fresh("x"));
                 self.w(ind, format!("{o}: {} = {}", type_src(e), self.zero(e)));
@@ -564,7 +569,7 @@ pub fn source(gj: &GobJob, alias: &str, locals: &HashMap<String, LocalType>) -> 
                 let vals: Vec<String> = (0..v.fields.len()).map(|k| format!("_f{k}")).collect();
                 let pat = if v.fields.is_empty() { v.name.clone() } else { format!("{}({})", v.name, vals.join(", ")) };
                 g.w(3, format!("{pat} => {{"));
-                g.w(4, format!("_e.str!(_e.registry.name_of({}))", lit(&vnames[i])));
+                g.w(4, format!("_e.str!({a}.name_of({}))", lit(&vnames[i])));
                 if v.fields.len() == 1 && v.fields[0].name == "0" {
                     let t = v.fields[0].ty.clone();
                     let rt = g.rt(&t);
@@ -611,7 +616,7 @@ pub fn source(gj: &GobJob, alias: &str, locals: &HashMap<String, LocalType>) -> 
             g.w(1, format!("def gob_dec_named(_d0: {a}.Dec, _name: Str) -> ~{name} {{"));
             g.w(2, "_d = _d0");
     g.w(2, "_t = _d.types");
-            g.w(2, "_ty = _d.registry.type_of(_name)");
+            g.w(2, format!("_ty = {a}.type_of(_name)"));
             for (i, vn) in vnames.iter().enumerate() {
                 g.w(2, format!("if _ty == {} {{", lit(vn)));
                 g.w(3, "_cid = _d.~iface_value_id!");
@@ -693,6 +698,7 @@ fn gen_struct_dec(g: &mut G, name: &str, go: &str, sh: &Shape, var: Option<(usiz
         g.w(4, format!("fail _d.wrong_type(_t.str_of({}), _wid, {}) unless _ok", g.rt(&t), lit(n)));
         g.w(3, "}");
     }
+    g.w(3, "_d.~ignorable!(_f) if _i < 0");
     g.w(3, "_p << _i");
     g.w(2, "}");
     g.w(2, format!("_d.store_plan!({}, _wid, _p)", lit(go)));

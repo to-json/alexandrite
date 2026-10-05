@@ -2,9 +2,10 @@
 # Encoding: Go's encoder.go and encode.go. The derived `gob_enc` methods
 # write values through an `Enc`; `Encoder[Wtr]` frames them into messages on W.
 
+import "math/bits"
+
 struct EncState {
   types: Types
-  reg: Registry
   # Go's enc.sent: the types whose descriptors went out, by Go's String()
   sent: Map[Str, Int]
   # The buffer being written; `stack` holds the ones it interrupted (an
@@ -22,7 +23,6 @@ pub struct Enc {
   st: [EncState]
 
   pub def types -> Types { self.st[0].types }
-  pub def registry -> Registry { self.st[0].reg }
 
   # Keep the first error; the value being encoded is not sent.
   pub def set_error!(e: Error) {
@@ -31,25 +31,48 @@ pub struct Enc {
 
   pub def fail!(msg: Str) { self.set_error!(gerr(msg)) }
 
-  pub def uint!(x: Int) { self.st[0].cur = append_uint(self.st[0].cur, x.as_u64) }
-  pub def uint64!(x: U64) { self.st[0].cur = append_uint(self.st[0].cur, x) }
-  pub def int!(x: Int) { self.st[0].cur = append_uint(self.st[0].cur, int_bits(x)) }
+  # Bytes onto the current buffer, one push each (a `+=` would copy the
+  # whole buffer every time).
+  def put!(b: [Byte]) {
+    for c in b {
+      self.st[0].cur << c
+    }
+  }
+
+  # gob's unsigned integer onto the current buffer.
+  def put_uint!(x: U64) {
+    if x <= 0x7f {
+      self.st[0].cur << x.as_u8
+      return
+    }
+    n = 8 - (bits.leading_zeros64(x) >> 3)
+    self.st[0].cur << (256 - n).as_u8
+    i = n - 1
+    while i >= 0 {
+      self.st[0].cur << (x >> (i * 8).as_u64).as_u8
+      i -= 1
+    }
+  }
+
+  pub def uint!(x: Int) { self.put_uint!(x.as_u64) }
+  pub def uint64!(x: U64) { self.put_uint!(x) }
+  pub def int!(x: Int) { self.put_uint!(int_bits(x)) }
   pub def bool!(b: Bool) { self.st[0].cur << (b ? 1 : 0).as_u8 }
-  pub def float!(f: Float) { self.st[0].cur = append_uint(self.st[0].cur, float_bits(f)) }
+  pub def float!(f: Float) { self.put_uint!(float_bits(f)) }
 
   pub def complex!(c: Complex) {
-    self.st[0].cur = append_uint(self.st[0].cur, float_bits(c.real))
-    self.st[0].cur = append_uint(self.st[0].cur, float_bits(c.imag))
+    self.put_uint!(float_bits(c.real))
+    self.put_uint!(float_bits(c.imag))
   }
 
   pub def str!(s: Str) {
-    self.st[0].cur = append_uint(self.st[0].cur, s.size.as_u64)
-    self.st[0].cur += s.bytes
+    self.put_uint!(s.size.as_u64)
+    self.put!(s.bytes)
   }
 
   pub def bytes!(b: [Byte]) {
-    self.st[0].cur = append_uint(self.st[0].cur, b.size.as_u64)
-    self.st[0].cur += b
+    self.put_uint!(b.size.as_u64)
+    self.put!(b)
   }
 
   # A field's number, as the delta from the last one sent (`last`); returns it.
@@ -78,9 +101,13 @@ pub struct Enc {
     }
     n = self.st[0].stack.size
     if n == 0 {
-      self.st[0].out += m
+      for c in m {
+        self.st[0].out << c
+      }
     } else {
-      self.st[0].stack[n - 1] += m
+      for c in m {
+        self.st[0].stack[n - 1] << c
+      }
     }
     self.st[0].cur = []
   }
@@ -93,7 +120,7 @@ pub struct Enc {
     return false if self.st[0].sent.key?(astr)
     info = ty.type_info!(r)
     self.int!(-info.id)
-    self.st[0].cur += ty.wire_bytes(info)
+    self.put!(ty.wire_bytes(info))
     self.write_message!
     b = ty.base(r)
     self.st[0].sent[ty.str_of(b)] = info.id
@@ -190,8 +217,8 @@ pub struct Enc {
   pub def err -> Error? { self.st[0].err }
 }
 
-pub def new_enc(reg: Registry) -> Enc {
-  Enc.new(st: [EncState.new(types: new_types(), reg: reg, sent: {}, cur: [], stack: [], out: [], err: none)])
+pub def new_enc -> Enc {
+  Enc.new(st: [EncState.new(types: new_types(), sent: {}, cur: [], stack: [], out: [], err: none)])
 }
 
 struct EncoderState[Wtr] {
@@ -224,17 +251,9 @@ pub struct Encoder[Wtr] {
     }
   }
 
-  # The registry the encoder names interface values by.
-  pub def registry -> Registry { self.en.registry }
-
   # The encoder's state, for hand-written gob_enc methods and tests.
   pub def enc -> Enc { self.en }
 }
 
 # Go's NewEncoder.
-pub def new_encoder[Wtr](w: Wtr) -> Encoder[Wtr] { new_encoder_with(w, default_registry()) }
-
-# An Encoder naming interface values by `reg`.
-pub def new_encoder_with[Wtr](w: Wtr, reg: Registry) -> Encoder[Wtr] {
-  Encoder.new(st: [EncoderState.new(w: w)], en: new_enc(reg))
-}
+pub def new_encoder[Wtr](w: Wtr) -> Encoder[Wtr] { Encoder.new(st: [EncoderState.new(w: w)], en: new_enc()) }

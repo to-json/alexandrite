@@ -125,60 +125,47 @@ struct RegState {
   type_to_name: Map[Str, Str]
 }
 
-# Names for the concrete types sent in interface values (enum variants,
-# GO-VS-RUBY D63). Go keeps one registry per process; alx has no package-level
-# mutable state yet (R11), so a Registry is a value that Encoders and Decoders
-# hold (`default_registry()` makes the one they start with). Copies share it.
-pub struct Registry {
-  st: [RegState]
+# Go's package-level registry (nameToConcreteType / concreteTypeToName), a
+# package global (R11).
+REGISTRY = Mutex.new(RegState.new(name_to_type: {}, type_to_name: {}))
 
-  # Go's RegisterName: values of v's type (an enum value: its variant) travel
-  # in interface values as `name`. Panics, as Go does, when the name or the
-  # type is already registered differently.
-  pub def register_name![T](name: Str, v: T) {
-    self.register_type!(name, v.gob_type_name)
-  }
+# Go's RegisterName: values of v's type (an enum value: its variant, D66)
+# travel in interface values as `name`. Panics, as Go does, when the name or
+# the type is already registered differently.
+pub def register_name[T](name: Str, v: T) { register_type(name, v.gob_type_name) }
 
-  # Go's Register: under the type's own name (Go's rule: "main.Circle",
-  # "*main.Circle", "int"). Every derived type is usable without it; it only
-  # claims the name.
-  pub def register![T](v: T) {
-    t = v.gob_type_name
-    self.register_type!(t, t)
-  }
+# Go's Register: under the type's own name (Go's rule: "main.Circle",
+# "*big.Int", "int"). A derived type is usable without registering; this
+# only claims the name.
+pub def register[T](v: T) {
+  t = v.gob_type_name
+  register_type(t, t)
+}
 
-  # RegisterName by the type's own name (`gob_type_name`).
-  pub def register_type!(name: Str, v_type: Str) {
-    panic("attempt to register empty name") if name == ""
-    s = self.st[0]
+# RegisterName by the type's own name (what `gob_type_name` returns).
+pub def register_type(name: Str, v_type: Str) {
+  panic("attempt to register empty name") if name == ""
+  msg = REGISTRY.lock { |s|
+    m = ""
     if t = s.name_to_type[name] {
-      panic("gob: registering duplicate types for #{gq(name)}: #{t} != #{v_type}") if t != v_type
+      m = "gob: registering duplicate types for #{gq(name)}: #{t} != #{v_type}" if t != v_type
     }
-    if n = s.type_to_name[v_type] {
-      if n != name {
-        self.st[0].name_to_type.delete(name)
-        panic("gob: registering duplicate names for #{v_type}: #{gq(n)} != #{gq(name)}")
+    if m == "" {
+      if n = s.type_to_name[v_type] {
+        m = "gob: registering duplicate names for #{v_type}: #{gq(n)} != #{gq(name)}" if n != name
       }
     }
-    self.st[0].name_to_type[name] = v_type
-    self.st[0].type_to_name[v_type] = name
+    if m == "" {
+      s.name_to_type[name] = v_type
+      s.type_to_name[v_type] = name
+    }
+    m
   }
-
-  # The name values of the type travel as: registered, or the type's own.
-  pub def name_of(v_type: Str) -> Str { self.st[0].type_to_name[v_type] || v_type }
-
-  # The type a received name stands for: registered, or the name itself.
-  pub def type_of(name: Str) -> Str { self.st[0].name_to_type[name] || name }
+  panic(msg) if msg != ""
 }
 
-# A new, empty registry.
-pub def new_registry -> Registry {
-  Registry.new(st: [RegState.new(name_to_type: {}, type_to_name: {})])
-}
+# The name values of the type travel as: registered, or the type's own.
+pub def name_of(v_type: Str) -> Str { REGISTRY.lock { |s| s.type_to_name[v_type] || v_type } }
 
-# The registry an Encoder or Decoder starts with. Go's is one per process
-# (package-level maps); this is the one place that would return a
-# package-level `Mutex[Registry]` once alx has those (R11). Today it is a new
-# registry each time: share one between an Encoder and a Decoder with
-# `new_encoder_with` / `new_decoder_with`.
-pub def default_registry -> Registry { new_registry() }
+# The type a received name stands for: registered, or the name itself.
+pub def type_of(name: Str) -> Str { REGISTRY.lock { |s| s.name_to_type[name] || name } }

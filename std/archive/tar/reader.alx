@@ -77,7 +77,21 @@ pub struct Reader[R] {
   }
 
   # Writes the rest of the current entry to w (Go's unexported writeTo).
+  # A sparse entry's holes are seeked over when w can seek (W is an
+  # io.WriteSeeker), as Go does, so a file gets holes instead of zeros.
   def write_to![W](w: W) -> ~Int {
+    if W is io.WriteSeeker {
+      ws = w
+      # Not every seeker can seek: try one that moves nowhere.
+      if st[0].sparse && st[0].err.none? && ws.seek!(0, io.SEEK_CURRENT).ok? {
+        n, err = sparse_write_to!(ws)
+        if e = err {
+          self.st[0].err = e
+          fail e
+        }
+        return n
+      }
+    }
     buf: [Byte] = [0; 32 * 1024]
     total = 0
     loop {
@@ -86,6 +100,59 @@ pub struct Reader[R] {
       w.~write!(buf[0...n])
       total += n
     }
+  }
+
+  # Go's sparseFileReader.WriteTo into an io.WriteSeeker: data fragments
+  # are copied, holes seeked over; a trailing hole ends with one written
+  # zero byte, so the output has the right size.
+  def sparse_write_to![W](w: W) -> (Int, Error?) {
+    ws = w
+    write_last = false
+    pos0 = st[0].pos
+    err: Error? = none
+    eof = false
+    buf: [Byte] = [0; 32 * 1024]
+    while logical_remaining > 0 && !write_last && err.none? && !eof {
+      hole_start = st[0].sp[0].offset
+      hole_end = st[0].sp[0].end_offset
+      nf = 0
+      if st[0].pos < hole_start {
+        # io.CopyN(ws, the plain entry, hole_start - pos)
+        want = hole_start - st[0].pos
+        while nf < want && err.none? && !eof {
+          k = want - nf < buf.size ? want - nf : buf.size
+          m, e = reg_read!(buf[0...k])
+          if m == 0 && e.none? {
+            eof = true
+          } else if m > 0 {
+            wr = ws.write!(buf[0...m])
+            err = wr.err
+            nf += m
+          }
+          err = e if e.some?
+        }
+      } else {
+        nf = hole_end - st[0].pos
+        if physical_remaining == 0 {
+          write_last = true
+          nf -= 1
+        }
+        err = ws.seek!(nf, io.SEEK_CURRENT).err
+      }
+      self.st[0].pos += nf
+      if st[0].pos >= hole_end && st[0].sp.size > 1 {
+        self.st[0].sp = st[0].sp[1...st[0].sp.size]
+      }
+    }
+    if write_last && err.none? {
+      err = ws.write!([0.as_u8]).err
+      self.st[0].pos += 1
+    }
+    n = st[0].pos - pos0
+    return (n, TarError.MissData) if eof
+    return (n, err) if err.some?
+    return (n, TarError.UnrefData) if logical_remaining == 0 && physical_remaining > 0
+    (n, none)
   }
 
   # ---------------------------------------------------------- raw input
@@ -105,9 +172,22 @@ pub struct Reader[R] {
     n
   }
 
-  # Skips n bytes of input; UnexpectedEof if it ends first.
+  # Skips n bytes of input; UnexpectedEof if it ends first. An input that
+  # can seek (R is an io.Seeker) seeks over all but the last byte, which is
+  # read: a seek past the end isn't an error, the read is (Go's discard). A
+  # seeker whose seek fails at once (os.stdin) is read instead.
   def discard!(n: Int) -> ~Unit {
     left = n
+    if R is io.Seeker {
+      if n > 1 {
+        if pos1 = self.st[0].r.seek!(0, io.SEEK_CURRENT).ok {
+          if pos1 >= 0 {
+            pos2 = self.st[0].r.~seek!(n - 1, io.SEEK_CURRENT)
+            left -= pos2 - pos1
+          }
+        }
+      }
+    }
     buf = st[0].blk
     while left > 0 {
       k = left < buf.size ? left : buf.size

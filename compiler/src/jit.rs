@@ -313,7 +313,14 @@ pub fn run(p: &LProgram) -> Result<(), String> {
     set(&mut fb, "use_colocated_libcalls", "false")?;
     set(&mut fb, "is_pic", "false")?;
     let isa = cranelift_native::builder().map_err(|e| format!("jit: {e}"))?.finish(settings::Flags::new(fb)).map_err(|e| format!("jit: {e}"))?;
-    let mut m = JITModule::new(JITBuilder::with_isa(isa, default_libcall_names()));
+    let mut jb = JITBuilder::with_isa(isa, default_libcall_names());
+    // All code in one reserved region: functions refer to each other with
+    // PC-relative ADRP (±2 GB on arm64); separately mapped functions of a big
+    // program could land further apart.
+    if let Ok(arena) = cranelift_jit::ArenaMemoryProvider::new_with_size(1 << 30) {
+        jb.memory_provider(Box::new(arena));
+    }
+    let mut m = JITModule::new(jb);
 
     let mut externs = vec![];
     // `#[link("sqlite3")]`: load the library into the process first.

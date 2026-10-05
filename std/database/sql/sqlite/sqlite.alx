@@ -1,0 +1,677 @@
+# Package sqlite: a database/sql driver for SQLite, over the system's
+# libsqlite3 through the C FFI (`#[link("sqlite3")] extern def`).
+#
+#   import "database/sql"
+#   import "database/sql/sqlite"
+#
+#   db = ~sql.open_driver(sqlite.Driver.new, "app.db?_busy_timeout=5000")
+#   # or: sqlite.register (once), then sql.~open("sqlite3", "app.db")
+#   db.~exec("create table people(id integer primary key, name text not null, age int)", nil)
+#   res = db.~exec("insert into people(name, age) values(?, ?)", ("ann", 30))
+#   id = res.~last_insert_id
+#   p: (Int, Str, Int?) = db.query_row("select id, name, age from people where id = ?", id).~scan
+#
+# Not a Go std package: Go leaves drivers to third parties
+# (github.com/mattn/go-sqlite3 is the usual one, and this driver follows its
+# conventions: the driver name "sqlite3", DSN parameters, type mapping, time
+# formats). It lives under database/sql because that is what it plugs into,
+# beside the interface it implements, as std/raylib sits beside the packages
+# it serves; the browser backend refuses FFI, so it is native only.
+#
+# DSN: a file name (or ":memory:", or a "file:" URI), then optionally
+# `?key=value&...`:
+#   _busy_timeout=MS (also _timeout)   wait for locks this long; default 5000
+#   _foreign_keys=1 / 0 (also _fk)     PRAGMA foreign_keys
+#   _journal_mode=WAL|DELETE|...       PRAGMA journal_mode
+#   _synchronous=OFF|NORMAL|FULL|EXTRA PRAGMA synchronous
+#   _txlock=deferred|immediate|exclusive   how `begin` starts a transaction
+#   mode=ro|rw|rwc|memory              open read-only / read-write / create
+#
+# Types. Arguments: Int -> INTEGER, Float -> REAL, Bool -> 0/1, Str -> TEXT,
+# [Byte] -> BLOB, time.Time -> TEXT "2006-01-02 15:04:05.999999999-07:00",
+# NULL -> NULL. Results by storage class: INTEGER -> Int (Bool when the
+# column is declared BOOLEAN/BOOL), REAL -> Float, TEXT -> Str (a time.Time
+# when the column is declared DATE, DATETIME or TIMESTAMP and the text parses
+# in one of mattn's formats), BLOB -> [Byte], NULL -> Null. database/sql's
+# scan converts from there (a TEXT "42" scans into an Int, ...).
+#
+# Errors are SqliteError.Error(code, extended, msg); the message is
+# SQLite's own (`UNIQUE constraint failed: people.name`), as mattn's. `code`
+# is the primary result code (CONSTRAINT = 19, BUSY = 5, ...); `extended` the
+# extended one (SQLITE_CONSTRAINT_UNIQUE = 2067, ...).
+#
+# Placeholders: `?`, `?NNN`, `:name`, `@name`, `$name`; named arguments
+# (sql.named("name", v)) bind to `:name`, `@name` or `$name`.
+#
+# Concurrency: database/sql uses a connection from one task at a time; the
+# pool gives each task its own connection, and SQLite's locking (with the
+# busy timeout) arbitrates between them. A context that ends interrupts the
+# running statement (sqlite3_interrupt). For ":memory:" every connection is
+# its own database: use `db.set_max_open_conns(1)`, or a shared-cache URI
+# ("file::memory:?cache=shared").
+#
+# Exec runs every statement of a multi-statement string (as mattn's),
+# giving each the arguments its placeholders take, in order; a query runs
+# the first statement.
+
+import "context"
+import "database/sql"
+import "database/sql/driver"
+import "strconv"
+import "strings"
+import "time"
+
+# ---------------------------------------------------------------- the C API
+
+#[link("sqlite3")]
+extern def sqlite3_libversion -> Ptr
+#[link("sqlite3")]
+extern def sqlite3_open_v2(name: Str, out: [Byte], flags: I32, vfs: Ptr) -> I32
+#[link("sqlite3")]
+extern def sqlite3_close_v2(db: Int) -> I32
+#[link("sqlite3")]
+extern def sqlite3_errmsg(db: Int) -> Ptr
+#[link("sqlite3")]
+extern def sqlite3_errstr(code: I32) -> Ptr
+#[link("sqlite3")]
+extern def sqlite3_extended_errcode(db: Int) -> I32
+#[link("sqlite3")]
+extern def sqlite3_extended_result_codes(db: Int, on: I32) -> I32
+#[link("sqlite3")]
+extern def sqlite3_busy_timeout(db: Int, ms: I32) -> I32
+#[link("sqlite3")]
+extern def sqlite3_interrupt(db: Int)
+#[link("sqlite3")]
+extern def sqlite3_get_autocommit(db: Int) -> I32
+#[link("sqlite3")]
+extern def sqlite3_changes(db: Int) -> I32
+#[link("sqlite3")]
+extern def sqlite3_last_insert_rowid(db: Int) -> Int
+#[link("sqlite3")]
+extern def sqlite3_prepare_v2(db: Int, sql: [Byte], n: I32, out: [Byte], tail: [Byte]) -> I32
+#[link("sqlite3")]
+extern def sqlite3_finalize(st: Int) -> I32
+#[link("sqlite3")]
+extern def sqlite3_reset(st: Int) -> I32
+#[link("sqlite3")]
+extern def sqlite3_clear_bindings(st: Int) -> I32
+#[link("sqlite3")]
+extern def sqlite3_bind_parameter_count(st: Int) -> I32
+#[link("sqlite3")]
+extern def sqlite3_bind_parameter_index(st: Int, name: Str) -> I32
+#[link("sqlite3")]
+extern def sqlite3_bind_null(st: Int, i: I32) -> I32
+#[link("sqlite3")]
+extern def sqlite3_bind_int64(st: Int, i: I32, v: Int) -> I32
+#[link("sqlite3")]
+extern def sqlite3_bind_double(st: Int, i: I32, v: Float) -> I32
+#[link("sqlite3")]
+extern def sqlite3_bind_text(st: Int, i: I32, p: [Byte], n: I32, destructor: Int) -> I32
+#[link("sqlite3")]
+extern def sqlite3_bind_blob(st: Int, i: I32, p: [Byte], n: I32, destructor: Int) -> I32
+#[link("sqlite3")]
+extern def sqlite3_step(st: Int) -> I32
+#[link("sqlite3")]
+extern def sqlite3_column_count(st: Int) -> I32
+#[link("sqlite3")]
+extern def sqlite3_column_name(st: Int, i: I32) -> Ptr
+#[link("sqlite3")]
+extern def sqlite3_column_decltype(st: Int, i: I32) -> Ptr
+#[link("sqlite3")]
+extern def sqlite3_column_type(st: Int, i: I32) -> I32
+#[link("sqlite3")]
+extern def sqlite3_column_int64(st: Int, i: I32) -> Int
+#[link("sqlite3")]
+extern def sqlite3_column_double(st: Int, i: I32) -> Float
+#[link("sqlite3")]
+extern def sqlite3_column_text(st: Int, i: I32) -> Ptr
+#[link("sqlite3")]
+extern def sqlite3_column_blob(st: Int, i: I32) -> Ptr
+#[link("sqlite3")]
+extern def sqlite3_column_bytes(st: Int, i: I32) -> I32
+# The address of a [Byte]'s first element: memchr finds its first byte there.
+extern def c_memchr(p: [Byte], c: I32, n: Int) -> Int = "memchr"
+
+SQLITE_OK = 0
+SQLITE_ROW = 100
+SQLITE_DONE = 101
+SQLITE_INTEGER = 1
+SQLITE_FLOAT = 2
+SQLITE_TEXT = 3
+SQLITE_BLOB = 4
+SQLITE_NULL = 5
+SQLITE_OPEN_READONLY = 1
+SQLITE_OPEN_READWRITE = 2
+SQLITE_OPEN_CREATE = 4
+SQLITE_OPEN_URI = 64
+SQLITE_OPEN_MEMORY = 128
+SQLITE_OPEN_NOMUTEX = 32768
+# SQLITE_TRANSIENT: SQLite copies bound text and blobs.
+SQLITE_TRANSIENT = -1
+
+# The primary result codes database code usually tests.
+pub ERR_BUSY = 5
+pub ERR_LOCKED = 6
+pub ERR_READONLY = 8
+pub ERR_INTERRUPT = 9
+pub ERR_CONSTRAINT = 19
+pub ERR_MISMATCH = 20
+# Extended codes for constraint violations.
+pub ERR_CONSTRAINT_CHECK = 275
+pub ERR_CONSTRAINT_FOREIGNKEY = 787
+pub ERR_CONSTRAINT_NOTNULL = 1299
+pub ERR_CONSTRAINT_PRIMARYKEY = 1555
+pub ERR_CONSTRAINT_UNIQUE = 2067
+
+pub error SqliteError {
+  # A failed SQLite call: its result codes and SQLite's message.
+  Error(code: Int, extended: Int, msg: Str)
+
+  def message -> Str {
+    case self {
+      Error(_, _, m) => m
+    }
+  }
+}
+
+# The library's version ("3.43.2").
+pub def version -> Str { Str.from_cstr(sqlite3_libversion) }
+
+def cstr(p: Ptr) -> Str { p.null? ? "" : Str.from_cstr(p) }
+
+def read_ptr(b: [Byte]) -> Int {
+  h = 0
+  for i in 0...8 {
+    h = h | (b[i].to_i << (8 * i))
+  }
+  h
+}
+
+def db_error(db: Int, rc: Int) -> SqliteError {
+  ext = sqlite3_extended_errcode(db).to_i
+  msg = cstr(sqlite3_errmsg(db))
+  msg = cstr(sqlite3_errstr(rc.as_i32)) if msg == ""
+  SqliteError.Error(code: rc & 255, extended: ext, msg: msg)
+}
+
+# Text with a terminating NUL (a pointer to an empty slice would be NULL,
+# which binds as SQL NULL).
+def zbytes(s: [Byte]) -> [Byte] {
+  out: [Byte] = []
+  out = out + s
+  out << 0
+  out
+}
+
+# ------------------------------------------------------------------- driver
+
+# The driver: open(dsn) makes a connection.
+pub struct Driver {
+  pub def open(dsn: Str) -> ~driver.Conn { ~open_conn(dsn) }
+}
+
+# Registers the driver as "sqlite3" with database/sql (once; Go's driver
+# packages do this in init).
+pub def register {
+  if !sql.drivers.include?("sqlite3") {
+    sql.register("sqlite3", Driver.new)
+  }
+}
+
+struct Opts {
+  busy_ms: Int
+  pragmas: [Str]
+  txlock: Str
+  flags: Int
+  name: Str
+}
+
+def parse_dsn(dsn: Str) -> ~Opts {
+  o = Opts.new(busy_ms: 5000, pragmas: [], txlock: "BEGIN", flags: SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, name: dsn)
+  if dsn.start_with?("file:") {
+    o.flags = o.flags | SQLITE_OPEN_URI
+  }
+  cut = strings.cut(dsn, "?")
+  if c = cut {
+    if !dsn.start_with?("file:") {
+      o.name = c[0]
+    }
+    for kv in strings.split(c[1], "&") {
+      next if kv == ""
+      p = strings.cut(kv, "=") || (kv, "")
+      k = p[0]
+      v = p[1]
+      if k == "_busy_timeout" || k == "_timeout" {
+        n = strconv.atoi(v)
+        fail "sqlite: bad #{k}: #{v}" if n.err?
+        o.busy_ms = n.unwrap
+      } else if k == "_foreign_keys" || k == "_fk" {
+        on = v == "1" || strings.to_lower(v) == "true" || strings.to_lower(v) == "on"
+        o.pragmas << "PRAGMA foreign_keys = #{on ? "ON" : "OFF"}"
+      } else if k == "_journal_mode" || k == "_journal" {
+        o.pragmas << "PRAGMA journal_mode = #{strings.to_upper(v)}"
+      } else if k == "_synchronous" || k == "_sync" {
+        o.pragmas << "PRAGMA synchronous = #{strings.to_upper(v)}"
+      } else if k == "_txlock" {
+        l = strings.to_lower(v)
+        fail "sqlite: bad _txlock: #{v}" if l != "deferred" && l != "immediate" && l != "exclusive"
+        o.txlock = "BEGIN #{strings.to_upper(l)}"
+      } else if k == "mode" && !dsn.start_with?("file:") {
+        if v == "ro" {
+          o.flags = SQLITE_OPEN_READONLY
+        } else if v == "rw" {
+          o.flags = SQLITE_OPEN_READWRITE
+        } else if v == "memory" {
+          o.flags = o.flags | SQLITE_OPEN_MEMORY
+        }
+      }
+    }
+  }
+  o
+}
+
+def open_conn(dsn: Str) -> ~Conn {
+  o = ~parse_dsn(dsn)
+  out: [Byte] = [0; 8]
+  rc = sqlite3_open_v2(o.name, out, o.flags.as_i32, Ptr.null).to_i
+  h = read_ptr(out)
+  if rc != SQLITE_OK {
+    e = SqliteError.Error(code: rc, extended: rc, msg: h == 0 ? cstr(sqlite3_errstr(rc.as_i32)) : cstr(sqlite3_errmsg(h)))
+    _ = sqlite3_close_v2(h) if h != 0
+    fail e
+  }
+  _ = sqlite3_extended_result_codes(h, 1)
+  _ = sqlite3_busy_timeout(h, o.busy_ms.as_i32)
+  c = Conn.new(h: h, txlock: o.txlock, st: Mutex.new(ConnState.new(closed: false)))
+  for p in o.pragmas {
+    r = c.exec_all(p, [])
+    if e = r.err {
+      _ = sqlite3_close_v2(h)
+      fail e
+    }
+  }
+  c
+}
+
+# ------------------------------------------------------------------- conn
+
+struct ConnState {
+  closed: Bool
+}
+
+# A connection (one sqlite3 handle).
+pub struct Conn {
+  h: Int
+  txlock: Str
+  st: Mutex[ConnState]
+
+  def prepare(query: Str) -> ~driver.Stmt { ~prepare_one(query) }
+
+  def prepare_context(ctx: context.Context, query: Str) -> ~driver.Stmt {
+    fail ctx.err.unwrap if ctx.done?
+    ~prepare_one(query)
+  }
+
+  # The first statement of `query`.
+  def prepare_one(query: Str) -> ~Stmt {
+    p = ~prepare_at(query.bytes, 0)
+    fail SqliteError.Error(code: 21, extended: 21, msg: "sqlite: empty query") if p[0] == 0
+    new_stmt(self, p[0])
+  }
+
+  # Prepares the statement starting at byte `from` of `sql`: (handle or 0
+  # for none, the offset after it).
+  def prepare_at(sql: [Byte], from: Int) -> ~(Int, Int) {
+    buf = zbytes(sql[from...sql.size])
+    out: [Byte] = [0; 8]
+    tail: [Byte] = [0; 8]
+    rc = sqlite3_prepare_v2(h, buf, buf.size.as_i32, out, tail).to_i
+    fail db_error(h, rc) if rc != SQLITE_OK
+    base = c_memchr(buf, buf[0].to_i32, 1)
+    t = read_ptr(tail)
+    used = t == 0 ? buf.size - 1 : t - base
+    (read_ptr(out), from + used)
+  }
+
+  def close -> ~Unit {
+    first = st.lock { |s|
+      f = !s.closed
+      s.closed = true
+      f
+    }
+    return nil if !first
+    rc = sqlite3_close_v2(h).to_i
+    fail db_error(h, rc) if rc != SQLITE_OK
+    nil
+  }
+
+  def begin -> ~driver.Tx {
+    ~exec_all(txlock, [])
+    Tx.new(c: self)
+  }
+
+  def begin_tx(ctx: context.Context, opts: driver.TxOptions) -> ~driver.Tx {
+    # SQLite's transactions are serializable; read-only is a pragma.
+    fail "sqlite: isolation level #{sql.isolation_name(opts.isolation)} is not supported" if opts.isolation != sql.LEVEL_DEFAULT && opts.isolation != sql.LEVEL_SERIALIZABLE
+    fail ctx.err.unwrap if ctx.done?
+    if opts.read_only {
+      ~exec_all("PRAGMA query_only = ON", [])
+    }
+    r = exec_all(txlock, [])
+    if e = r.err {
+      _ = exec_all("PRAGMA query_only = OFF", []) if opts.read_only
+      fail e
+    }
+    Tx.new(c: self, read_only: opts.read_only)
+  }
+
+  def exec_context(ctx: context.Context, query: Str, args: [driver.NamedValue]) -> ~driver.Result {
+    fail ctx.err.unwrap if ctx.done?
+    w = watch(ctx)
+    r = exec_all(query, args)
+    w.close
+    ~r
+  }
+
+  def ping(ctx: context.Context) -> ~Unit {
+    closed = st.lock { |s| s.closed }
+    fail driver.ERR_BAD_CONN if closed
+    nil
+  }
+
+  def valid? -> Bool { !st.lock { |s| s.closed } }
+
+  # A task that interrupts this connection when ctx ends; close the
+  # returned channel when the call finishes.
+  def watch(ctx: context.Context) -> Chan[Bool] {
+    stop = Chan[Bool].new
+    if ctx.cancelable? {
+      d = ctx.done
+      hh = h
+      _ = spawn {
+        select {
+          when d.recv => sqlite3_interrupt(hh)
+          when stop.recv => {}
+        }
+      }
+    }
+    stop
+  }
+
+  # Runs every statement of `query`; each takes the next arguments its
+  # placeholders need. The Result is the last statement's.
+  def exec_all(query: Str, args: [driver.NamedValue]) -> ~Result {
+    sqlb = query.bytes
+    pos = 0
+    used = 0
+    res = Result.new(id: sqlite3_last_insert_rowid(h), changes: 0)
+    loop {
+      p = ~prepare_at(sqlb, pos)
+      pos = p[1]
+      break if p[0] == 0
+      s = new_stmt(self, p[0])
+      n = s.num_input
+      take = args[used...(used + n > args.size ? args.size : used + n)]
+      r = s.run_exec(take, used)
+      _ = s.close
+      res = ~r
+      used += n
+      break if pos >= sqlb.size
+    }
+    fail "sqlite: not all arguments used: #{args.size - used} left" if used < args.size && args.all? { |a| a.name == "" }
+    res
+  }
+}
+
+# --------------------------------------------------------------------- tx
+
+pub struct Tx {
+  c: Conn
+  read_only: Bool
+
+  def commit -> ~Unit {
+    r = c.exec_all("COMMIT", [])
+    _ = c.exec_all("PRAGMA query_only = OFF", []) if read_only
+    if e = r.err {
+      # A failed COMMIT may leave the transaction open: end it.
+      _ = c.exec_all("ROLLBACK", []) if sqlite3_get_autocommit(c.h) == 0
+      fail e
+    }
+    nil
+  }
+
+  def rollback -> ~Unit {
+    r = c.exec_all("ROLLBACK", [])
+    _ = c.exec_all("PRAGMA query_only = OFF", []) if read_only
+    ~r
+    nil
+  }
+}
+
+# ------------------------------------------------------------------- stmt
+
+pub struct Result {
+  id: Int
+  changes: Int
+  pub def last_insert_id -> ~Int { id }
+  pub def rows_affected -> ~Int { changes }
+}
+
+struct StmtState {
+  closed: Bool
+  # The Rows reading this statement, if any (reset when they close).
+  busy: Bool
+}
+
+pub struct Stmt {
+  c: Conn
+  s: Int
+  st: Mutex[StmtState]
+
+  def close -> ~Unit {
+    first = st.lock { |x|
+      f = !x.closed
+      x.closed = true
+      f
+    }
+    return nil if !first
+    _ = sqlite3_finalize(s)
+    nil
+  }
+
+  def num_input -> Int { sqlite3_bind_parameter_count(s).to_i }
+
+  def exec(args: [driver.Value]) -> ~driver.Result {
+    nv: [driver.NamedValue] = []
+    for a in args {
+      nv << driver.NamedValue.new(name: "", ordinal: nv.size + 1, value: a)
+    }
+    ~run_exec(nv, 0)
+  }
+
+  def query(args: [driver.Value]) -> ~driver.Rows {
+    nv: [driver.NamedValue] = []
+    for a in args {
+      nv << driver.NamedValue.new(name: "", ordinal: nv.size + 1, value: a)
+    }
+    ~run_query(nv, none)
+  }
+
+  def exec_context(ctx: context.Context, args: [driver.NamedValue]) -> ~driver.Result {
+    fail ctx.err.unwrap if ctx.done?
+    w = c.watch(ctx)
+    r = run_exec(args, 0)
+    w.close
+    ~r
+  }
+
+  def query_context(ctx: context.Context, args: [driver.NamedValue]) -> ~driver.Rows {
+    fail ctx.err.unwrap if ctx.done?
+    w = c.watch(ctx)
+    r = run_query(args, w)
+    w.close if r.err?
+    ~r
+  }
+
+  # Binds `args` (positional ones from `ordinal0 + 1` in the whole list).
+  def bind(args: [driver.NamedValue], ordinal0: Int) -> ~Unit {
+    _ = sqlite3_reset(s)
+    _ = sqlite3_clear_bindings(s)
+    for a in args {
+      i = a.ordinal - ordinal0
+      if a.name != "" {
+        i = 0
+        for pre in [":", "@", "$"] {
+          i = sqlite3_bind_parameter_index(s, "#{pre}#{a.name}").to_i if i == 0
+        }
+        fail "sqlite: no parameter named #{a.name}" if i == 0
+      }
+      ii = i.as_i32
+      rc = case a.value {
+        Null => sqlite3_bind_null(s, ii)
+        Int(v) => sqlite3_bind_int64(s, ii, v)
+        Float(v) => sqlite3_bind_double(s, ii, v)
+        Bool(v) => sqlite3_bind_int64(s, ii, v ? 1 : 0)
+        Str(v) => sqlite3_bind_text(s, ii, zbytes(v.bytes), v.size.as_i32, SQLITE_TRANSIENT)
+        Bytes(v) => sqlite3_bind_blob(s, ii, zbytes(v), v.size.as_i32, SQLITE_TRANSIENT)
+        Time(t) => {
+          tb = t.format(TIME_FORMATS[0]).bytes
+          sqlite3_bind_text(s, ii, zbytes(tb), tb.size.as_i32, SQLITE_TRANSIENT)
+        }
+      }
+      fail db_error(c.h, rc.to_i) if rc.to_i != SQLITE_OK
+    }
+    nil
+  }
+
+  def run_exec(args: [driver.NamedValue], ordinal0: Int) -> ~Result {
+    ~bind(args, ordinal0)
+    loop {
+      rc = sqlite3_step(s).to_i
+      break if rc == SQLITE_DONE
+      if rc != SQLITE_ROW {
+        e = db_error(c.h, rc)
+        _ = sqlite3_reset(s)
+        fail e
+      }
+    }
+    r = Result.new(id: sqlite3_last_insert_rowid(c.h), changes: sqlite3_changes(c.h).to_i)
+    _ = sqlite3_reset(s)
+    r
+  }
+
+  def run_query(args: [driver.NamedValue], w: Chan[Bool]?) -> ~Rows {
+    ~bind(args, 0)
+    n = sqlite3_column_count(s).to_i
+    cols: [Str] = []
+    decl: [Str] = []
+    for i in 0...n {
+      cols << cstr(sqlite3_column_name(s, i.as_i32))
+      decl << strings.to_lower(cstr(sqlite3_column_decltype(s, i.as_i32)))
+    }
+    Rows.new(stmt: self, cols: cols, decl: decl, watch: w, st: Mutex.new(RowsState.new(closed: false, done: false)))
+  }
+}
+
+def new_stmt(c: Conn, s: Int) -> Stmt { Stmt.new(c: c, s: s, st: Mutex.new(StmtState.new(closed: false, busy: false))) }
+
+# ------------------------------------------------------------------- rows
+
+# mattn's SQLiteTimestampFormats: how times are written (the first) and read.
+TIME_FORMATS = ["2006-01-02 15:04:05.999999999-07:00", "2006-01-02T15:04:05.999999999-07:00", "2006-01-02 15:04:05.999999999", "2006-01-02T15:04:05.999999999", "2006-01-02 15:04:05", "2006-01-02T15:04:05", "2006-01-02 15:04", "2006-01-02T15:04", "2006-01-02"]
+
+struct RowsState {
+  closed: Bool
+  done: Bool
+}
+
+pub struct Rows {
+  stmt: Stmt
+  cols: [Str]
+  decl: [Str]
+  watch: Chan[Bool]?
+  st: Mutex[RowsState]
+
+  def columns -> [Str] { cols }
+
+  def close -> ~Unit {
+    first = st.lock { |x|
+      f = !x.closed
+      x.closed = true
+      f
+    }
+    return nil if !first
+    if w = watch {
+      w.close
+    }
+    _ = sqlite3_reset(stmt.s)
+    nil
+  }
+
+  def next(dest: [driver.Value]) -> ~Bool {
+    done = st.lock { |x| x.done || x.closed }
+    return false if done
+    s = stmt.s
+    rc = sqlite3_step(s).to_i
+    if rc == SQLITE_DONE {
+      st.lock { |x|
+        x.done = true
+        nil
+      }
+      return false
+    }
+    fail db_error(stmt.c.h, rc) if rc != SQLITE_ROW
+    for i in 0...cols.size {
+      ii = i.as_i32
+      t = sqlite3_column_type(s, ii).to_i
+      dest[i] = if t == SQLITE_INTEGER {
+        v = sqlite3_column_int64(s, ii)
+        d = decl[i]
+        d == "boolean" || d == "bool" ? driver.Value.Bool(v != 0) : driver.Value.Int(v)
+      } else if t == SQLITE_FLOAT {
+        driver.Value.Float(sqlite3_column_double(s, ii))
+      } else if t == SQLITE_TEXT {
+        p = sqlite3_column_text(s, ii)
+        n = sqlite3_column_bytes(s, ii).to_i
+        text_value(n == 0 ? "" : Str.from_ptr(p, n), decl[i])
+      } else if t == SQLITE_BLOB {
+        p = sqlite3_column_blob(s, ii)
+        n = sqlite3_column_bytes(s, ii).to_i
+        b: [Byte] = n == 0 ? [] : Str.from_ptr(p, n).bytes
+        driver.Value.Bytes(b)
+      } else {
+        driver.Value.Null
+      }
+    }
+    true
+  }
+
+  def column_type_database_type_name(index: Int) -> Str { strings.to_upper(decl[index]) }
+
+  def column_type_scan_type(index: Int) -> Str {
+    d = decl[index]
+    return "Bool" if d == "boolean" || d == "bool"
+    return "time.Time" if d == "date" || d == "datetime" || d == "timestamp"
+    return "Int" if d.include?("int")
+    return "Str" if d.include?("char") || d.include?("clob") || d.include?("text")
+    return "[Byte]" if d.include?("blob")
+    return "Float" if d.include?("real") || d.include?("floa") || d.include?("doub")
+    "any"
+  }
+
+  def column_type_nullable(index: Int) -> Bool? { none }
+}
+
+# A TEXT value: a time for date/time columns when it parses, else a Str.
+def text_value(s: Str, decl: Str) -> driver.Value {
+  if decl == "date" || decl == "datetime" || decl == "timestamp" {
+    t = strings.trim_suffix(s, "Z")
+    for f in TIME_FORMATS {
+      r = time.parse(f, t)
+      if x = r.ok {
+        return driver.Value.Time(s.end_with?("Z") ? x.utc : x)
+      }
+    }
+  }
+  driver.Value.Str(s)
+}

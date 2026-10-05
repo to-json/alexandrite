@@ -1,0 +1,59 @@
+# Go's auth_test.go. The tlssha1=1 GODEBUG rows aren't translated (alx
+# has no GODEBUG; SHA-1 is always disabled in TLS 1.2 handshakes).
+
+import "crypto"
+
+def with_algs(c0: Certificate, algs: [U16]) -> Certificate {
+  c = c0
+  c.supported_signature_algorithms = algs
+  c
+}
+
+test "SignatureSelection" {
+  rsa = test_cert("rsa2048")
+  ec = test_cert("ecdsa_p256")
+  ed = test_cert("ed25519")
+  pkcs1 = with_algs(rsa, [PKCS1_WITH_SHA1, PKCS1_WITH_SHA256])
+  good = [(rsa, [PKCS1_WITH_SHA1, PKCS1_WITH_SHA256], VERSION_TLS12, PKCS1_WITH_SHA256, SIGNATURE_PKCS1V15, crypto.Hash.SHA256), (rsa, [PKCS1_WITH_SHA512, PKCS1_WITH_SHA1], VERSION_TLS12, PKCS1_WITH_SHA512, SIGNATURE_PKCS1V15, crypto.Hash.SHA512), (rsa, [PSS_WITH_SHA256, PKCS1_WITH_SHA256], VERSION_TLS12, PSS_WITH_SHA256, SIGNATURE_RSAPSS, crypto.Hash.SHA256), (pkcs1, [PSS_WITH_SHA256, PKCS1_WITH_SHA256], VERSION_TLS12, PKCS1_WITH_SHA256, SIGNATURE_PKCS1V15, crypto.Hash.SHA256), (rsa, [PSS_WITH_SHA384, PKCS1_WITH_SHA1], VERSION_TLS13, PSS_WITH_SHA384, SIGNATURE_RSAPSS, crypto.Hash.SHA384), (rsa, [PKCS1_WITH_SHA1, PSS_WITH_SHA384], VERSION_TLS13, PSS_WITH_SHA384, SIGNATURE_RSAPSS, crypto.Hash.SHA384), (ec, [ECDSA_WITH_SHA1, ECDSA_WITH_P256_AND_SHA256], VERSION_TLS12, ECDSA_WITH_P256_AND_SHA256, SIGNATURE_ECDSA, crypto.Hash.SHA256), (ec, [ECDSA_WITH_P256_AND_SHA256], VERSION_TLS12, ECDSA_WITH_P256_AND_SHA256, SIGNATURE_ECDSA, crypto.Hash.SHA256), (ec, [ECDSA_WITH_P256_AND_SHA256], VERSION_TLS13, ECDSA_WITH_P256_AND_SHA256, SIGNATURE_ECDSA, crypto.Hash.SHA256), (ec, [ECDSA_WITH_P384_AND_SHA384], VERSION_TLS12, ECDSA_WITH_P384_AND_SHA384, SIGNATURE_ECDSA, crypto.Hash.SHA384)]
+  for t in good {
+    cert, peer, v, want, want_type, want_hash = t
+    alg = select_signature_scheme(v, cert, peer).unwrap
+    assert_eq alg, want
+    st, h = type_and_hash_from_signature_scheme(alg).unwrap
+    assert_eq st, want_type
+    assert (h || crypto.Hash.MD4) == want_hash
+  }
+  for v in [VERSION_TLS12, VERSION_TLS13] {
+    alg = select_signature_scheme(v, ed, [ED25519]).unwrap
+    assert_eq alg, ED25519
+    st, h = type_and_hash_from_signature_scheme(alg).unwrap
+    assert_eq st, SIGNATURE_ED25519
+    assert h.none?
+  }
+  broken = with_algs(rsa, [ED25519])
+  bad = [(rsa, [ECDSA_WITH_P256_AND_SHA256, ECDSA_WITH_SHA1], VERSION_TLS12), (ec, [PKCS1_WITH_SHA256, PKCS1_WITH_SHA1], VERSION_TLS12), (rsa, [0.as_u16], VERSION_TLS12), (ed, [ECDSA_WITH_P256_AND_SHA256, ECDSA_WITH_SHA1], VERSION_TLS12), (ec, [ED25519], VERSION_TLS12), (broken, [ED25519], VERSION_TLS12), (broken, [PKCS1_WITH_SHA256], VERSION_TLS12), (ed, [], VERSION_TLS12), (rsa, [], VERSION_TLS13), (ec, [], VERSION_TLS13), (ed, [], VERSION_TLS13), (ec, [ECDSA_WITH_P384_AND_SHA384], VERSION_TLS13), (rsa, [PKCS1_WITH_SHA256], VERSION_TLS13), (pkcs1, [PSS_WITH_SHA256, PKCS1_WITH_SHA256], VERSION_TLS13), (ec, [ECDSA_WITH_SHA1], VERSION_TLS13), (test_cert("rsa1024"), [PSS_WITH_SHA512], VERSION_TLS12), (rsa, [PKCS1_WITH_SHA1], VERSION_TLS12), (ec, [ECDSA_WITH_SHA1], VERSION_TLS12), (rsa, [], VERSION_TLS12), (ec, [], VERSION_TLS12), (rsa, [MLDSA44], VERSION_TLS13), (ec, [MLDSA44], VERSION_TLS13)]
+  i = 0
+  for t in bad {
+    cert, peer, v = t
+    assert !select_signature_scheme(v, cert, peer).ok?, "bad test #{i}"
+    i += 1
+  }
+}
+
+test "LegacyTypeAndHash" {
+  st, h = legacy_type_and_hash_from_public_key(test_cert("rsa2048").private_key.public).unwrap
+  assert_eq st, SIGNATURE_PKCS1V15
+  assert (h || crypto.Hash.MD4) == crypto.Hash.MD5SHA1
+  st2, h2 = legacy_type_and_hash_from_public_key(test_cert("ecdsa_p256").private_key.public).unwrap
+  assert_eq st2, SIGNATURE_ECDSA
+  assert (h2 || crypto.Hash.MD4) == crypto.Hash.SHA1
+  assert !legacy_type_and_hash_from_public_key(test_cert("ed25519").private_key.public).ok?
+}
+
+test "SupportedSignatureAlgorithms" {
+  # Go's TestSupportedSignatureAlgorithms: every advertised algorithm is
+  # known to typeAndHashFromSignatureScheme.
+  for s in supported_signature_algorithms(VERSION_TLS12, VERSION_TLS13) {
+    assert type_and_hash_from_signature_scheme(s).ok?, signature_scheme_string(s)
+  }
+}

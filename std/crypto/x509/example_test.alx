@@ -1,0 +1,76 @@
+# Go's crypto/x509/example_test.go. Go's examples have no Output lines
+# (they aren't run); these print what they check. The PEM constants are in
+# xc_data_test.alx.
+#
+# Differences: Certificate_Verify verifies at a time inside the
+# certificate's validity (the certificate expired in 2014) and prints the
+# error Go's example gets too (a SHA1-signed intermediate);
+# ParsePKIXPublicKey prints the key's type and size instead of Go's %v of
+# the key.
+
+import "crypto/mldsa"
+import "encoding/pem"
+import "time"
+
+example "Certificate_Verify" {
+  # Verifying with a custom list of root certificates.
+  #
+  # First, create the set of root certificates. For this example we only
+  # have one. It's also possible to omit this in order to use the default
+  # root set of the current operating system.
+  roots = new_cert_pool()
+  ok = roots.append_certs_from_pem!(xc_ex_root_pem().bytes)
+  panic("failed to parse root certificate") if !ok
+  block, _ = pem.decode(xc_ex_cert_pem().bytes)
+  blk = block || panic("failed to parse certificate PEM")
+  r = parse_certificate(blk.bytes)
+  if e = r.err {
+    panic("failed to parse certificate: " + e.message)
+  }
+  cert = r.unwrap
+  opts = VerifyOptions.new(dns_name: "mail.google.com", roots: roots, current_time: cert.not_before.add(time.hour()))
+  v = cert.verify(opts)
+  # The intermediate is signed with SHA1-RSA, which Go (and alx) no longer
+  # accept in chains: Go's example fails the same way (checked with Go
+  # 1.27).
+  if e = v.err {
+    puts "failed to verify certificate: " + e.message
+  }
+} outputs "failed to verify certificate: x509: certificate signed by unknown authority (possibly because of \"x509: cannot verify signature: insecure algorithm SHA1-RSA\" while trying to verify candidate authority certificate \"Google Internet Authority G2\")\n"
+
+example "ParsePKIXPublicKey" {
+  block, _ = pem.decode(xc_ex_pub_pem().bytes)
+  blk = block || panic("failed to parse PEM block containing the public key")
+  r = parse_pkix_public_key(blk.bytes)
+  if e = r.err {
+    panic("failed to parse DER encoded public key: " + e.message)
+  }
+  case r.unwrap {
+    Rsa(k) => puts "pub is of type RSA: #{k.n.bit_len} bits, e = #{k.e}"
+    Dsa(_) => puts "pub is of type DSA"
+    Ecdsa(_) => puts "pub is of type ECDSA"
+    Ed25519(_) => puts "pub is of type Ed25519"
+    MlDsa(_) => puts "pub is of type ML-DSA"
+    _ => panic("unknown type of public key")
+  }
+} outputs "pub is of type RSA: 4096 bits, e = 65537\n"
+
+example "MarshalPKCS8PrivateKey_mlDSA" {
+  # Generate an ML-DSA-44 key, marshal it to PKCS #8, and PEM-encode it.
+  # ML-DSA private keys are encoded in their seed-only representation per
+  # RFC 9881.
+  priv = mldsa.generate_key(mldsa.mldsa44()).unwrap
+  der = marshal_pkcs8_private_key(PrivateKey.MlDsa(priv)).unwrap
+  h: Map[Str, Str] = {}
+  pem_bytes = pem.encode_to_memory(pem.Block.new(type: "PRIVATE KEY", headers: h, bytes: der)).unwrap
+  # Round-trip the PEM-encoded key back into an mldsa.PrivateKey.
+  block, _ = pem.decode(pem_bytes)
+  blk = block || panic("failed to decode PEM block")
+  parsed = parse_pkcs8_private_key(blk.bytes).unwrap
+  same = case parsed {
+    MlDsa(k) => k.equal?(priv)
+    _ => false
+  }
+  panic("round-tripped key does not match original") if !same
+  puts "round trip ok (#{der.size} bytes)"
+} outputs "round trip ok (54 bytes)\n"

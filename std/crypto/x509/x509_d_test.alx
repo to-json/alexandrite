@@ -1,0 +1,529 @@
+# Go's crypto/x509/x509_test.go, last part: TestRSAPSAParameters to the
+# end (the first part, up to TestCreateRevocationList, is x509_a_test.alx
+# to x509_c_test.alx). The PEM constants are in xc_data_test.alx.
+#
+# Not translated:
+#   - TestUnknownExtKey: ExtKeyUsage is an enum, ExtKeyUsage(-1) can't be
+#     built.
+#   - TestCreateCertificateBrokenSigner and TestMessageSigner: they pass a
+#     custom crypto.Signer (crypto.MessageSigner); PrivateKey is a closed
+#     enum of the standard key types. TestCreateCertificateLegacy (which
+#     uses the broken signer only to reach the MD5 check) is translated
+#     with a real RSA key.
+#   - TestCertificateOIDPoliciesGODEBUG: the x509usepolicies=0 GODEBUG
+#     setting doesn't exist (the default behaviour is TestCertificatePolicies).
+#   - TestGob: encoding/gob (reflection).
+#   - BenchmarkCreateCertificate / BenchmarkParseCertificate are bench
+#     blocks.
+
+import "bytes"
+import "crypto"
+import "crypto/ecdsa"
+import "crypto/ed25519"
+import "crypto/elliptic"
+import "crypto/mldsa"
+import "crypto/rand"
+import "crypto/rsa"
+import "crypto/x509/pkix"
+import "encoding/asn1"
+import "encoding/base64"
+import "encoding/hex"
+import "encoding/pem"
+import "math/big"
+import "net/url"
+import "time"
+
+# ---------------------------------------------------------------- helpers
+
+# The DER of the first PEM block in s.
+def xc_pem_der(s: Str) -> [Byte] {
+  b, _ = pem.decode(s.bytes)
+  if blk = b {
+    return blk.bytes
+  }
+  panic("couldn't decode PEM string")
+}
+
+# Go's testPrivateKey (pemPrivateKey).
+def xc_test_private_key -> rsa.PrivateKey { parse_pkcs1_private_key(xc_pem_der(xc_pem_private_key())).unwrap }
+
+# Go's rsaPrivateKey.
+def xc_rsa_private_key -> rsa.PrivateKey { parse_pkcs1_private_key(hex.decode_string(xc_rsa_private_key_hex()).unwrap).unwrap }
+
+def xc_must_oid(ints: [U64]) -> OID { oid_from_ints(ints).unwrap }
+
+def xc_err(r: ~[Byte]) -> Str { r.err?.message || "" }
+
+# ---------------------------------------------------------------- tests
+
+test "RSAPSAParameters" {
+  generate_params = ->(hash_func: crypto.Hash) -> [Byte] {
+    hash_oid = asn1.oid([])
+    if hash_func == crypto.Hash.SHA256 {
+      hash_oid = oid_sha256()
+    } else if hash_func == crypto.Hash.SHA384 {
+      hash_oid = oid_sha384()
+    } else if hash_func == crypto.Hash.SHA512 {
+      hash_oid = oid_sha512()
+    }
+    mgf1_params = pkix.AlgorithmIdentifier.new(algorithm: hash_oid, parameters: asn1.null_raw_value())
+    mgf = pkix.AlgorithmIdentifier.new(algorithm: oid_mgf1(), parameters: asn1.RawValue.new(full_bytes: mgf1_params.to_asn1.unwrap))
+    params = PssParameters.new(hash: pkix.AlgorithmIdentifier.new(algorithm: hash_oid, parameters: asn1.null_raw_value()), mgf: mgf, salt_length: hash_func.size, trailer_field: 1)
+    params.to_asn1.unwrap
+  }
+  n = 0
+  for detail in signature_algorithm_details() {
+    next if !detail.is_rsa_pss
+    generated = generate_params.call(detail.hash.unwrap)
+    assert_eq detail.params.full_bytes, generated
+    n += 1
+  }
+  assert_eq n, 3
+}
+
+test "IA5SANEnforcement" {
+  k = PrivateKey.Ecdsa(ecdsa.generate_key(elliptic.p256(), rand.reader()).unwrap)
+  test_url = url.parse("https://example.com/").unwrap
+  test_url.raw_query = "∞"
+  marshal_tests = [
+    ("marshal: unicode dNSName", Certificate.new(serial_number: big.new_int(0), dns_names: ["∞"]), "x509: \"∞\" cannot be encoded as an IA5String"),
+    ("marshal: unicode rfc822Name", Certificate.new(serial_number: big.new_int(0), email_addresses: ["∞"]), "x509: \"∞\" cannot be encoded as an IA5String"),
+    ("marshal: unicode uniformResourceIdentifier", Certificate.new(serial_number: big.new_int(0), uris: [test_url]), "x509: \"https://example.com/?∞\" cannot be encoded as an IA5String")
+  ]
+  for tc in marshal_tests {
+    r = create_certificate(rand.reader(), tc[1], tc[1], k.public, k)
+    assert !r.ok?, "#{tc[0]}: expected CreateCertificate to fail"
+    assert_eq xc_err(r), tc[2]
+  }
+  unmarshal_tests = [
+    ("unmarshal: unicode dNSName", xc_ia5_dns_cert(), "x509: SAN dNSName is malformed"),
+    ("unmarshal: unicode rfc822Name", xc_ia5_rfc822_cert(), "x509: SAN rfc822Name is malformed"),
+    ("unmarshal: unicode uniformResourceIdentifier", xc_ia5_uri_cert(), "x509: SAN uniformResourceIdentifier is malformed")
+  ]
+  for tc in unmarshal_tests {
+    der = hex.decode_string(tc[1]).unwrap
+    r = parse_certificate(der)
+    assert !r.ok?, "#{tc[0]}: expected ParseCertificate to fail"
+    assert_eq r.err?.message || "", tc[2]
+  }
+}
+
+struct XcSigAlgCase {
+  name: Str
+  key: PrivateKey
+  sig_algo: SignatureAlgorithm
+  want_err: Str
+  want_algo: SignatureAlgorithm
+}
+
+def xc_check_err(op: Str, e: Error?, want_err: Str) {
+  if want_err == "" {
+    assert e.none?, "#{op}: unexpected error: #{e?.message || ""}"
+    return
+  }
+  assert e.some?, "#{op}: expected error containing #{want_err}, got nil"
+  msg = e?.message || ""
+  assert msg.include?(want_err), "#{op}: error = #{msg}, want substring #{want_err}"
+}
+
+test "MismatchedTemplateSignatureAlgorithm" {
+  rsa_priv = PrivateKey.Rsa(xc_test_private_key())
+  ecdsa_priv = PrivateKey.Ecdsa(ecdsa.generate_key(elliptic.p256(), rand.reader()).unwrap)
+  _, ed = ed25519.generate_key(rand.reader()).unwrap
+  ed25519_priv = PrivateKey.Ed25519(ed)
+  mldsa44_priv = PrivateKey.MlDsa(mldsa.generate_key(mldsa.mldsa44()).unwrap)
+  mldsa87_priv = PrivateKey.MlDsa(mldsa.generate_key(mldsa.mldsa87()).unwrap)
+  mismatch_err = "x509: requested SignatureAlgorithm does not match private key type"
+  mldsa_params_err = "x509: requested SignatureAlgorithm does not match ML-DSA parameters"
+  u = SignatureAlgorithm.UnknownSignatureAlgorithm
+  tests = [
+    # Cross-key types: the requested SignatureAlgorithm's public key type
+    # doesn't match the signer's key.
+    XcSigAlgCase.new(name: "RSA-key/ECDSA-algo", key: rsa_priv, sig_algo: SignatureAlgorithm.ECDSAWithSHA256, want_err: mismatch_err, want_algo: u),
+    XcSigAlgCase.new(name: "RSA-key/Ed25519-algo", key: rsa_priv, sig_algo: SignatureAlgorithm.PureEd25519, want_err: mismatch_err, want_algo: u),
+    XcSigAlgCase.new(name: "ECDSA-key/RSA-algo", key: ecdsa_priv, sig_algo: SignatureAlgorithm.SHA256WithRSA, want_err: mismatch_err, want_algo: u),
+    XcSigAlgCase.new(name: "ECDSA-key/RSAPSS-algo", key: ecdsa_priv, sig_algo: SignatureAlgorithm.SHA256WithRSAPSS, want_err: mismatch_err, want_algo: u),
+    XcSigAlgCase.new(name: "ECDSA-key/Ed25519-algo", key: ecdsa_priv, sig_algo: SignatureAlgorithm.PureEd25519, want_err: mismatch_err, want_algo: u),
+    XcSigAlgCase.new(name: "Ed25519-key/ECDSA-algo", key: ed25519_priv, sig_algo: SignatureAlgorithm.ECDSAWithSHA256, want_err: mismatch_err, want_algo: u),
+    XcSigAlgCase.new(name: "Ed25519-key/RSA-algo", key: ed25519_priv, sig_algo: SignatureAlgorithm.SHA256WithRSA, want_err: mismatch_err, want_algo: u),
+    # PKCS#1 v1.5 vs PSS: both are valid for an RSA signer, so either
+    # choice succeeds and the requested algorithm is honored.
+    XcSigAlgCase.new(name: "RSA-key/PKCS1v15-algo", key: rsa_priv, sig_algo: SignatureAlgorithm.SHA256WithRSA, want_err: "", want_algo: SignatureAlgorithm.SHA256WithRSA),
+    XcSigAlgCase.new(name: "RSA-key/PSS-algo", key: rsa_priv, sig_algo: SignatureAlgorithm.SHA256WithRSAPSS, want_err: "", want_algo: SignatureAlgorithm.SHA256WithRSAPSS),
+    XcSigAlgCase.new(name: "MLDSA-key/ECDSA-algo", key: mldsa44_priv, sig_algo: SignatureAlgorithm.ECDSAWithSHA256, want_err: mismatch_err, want_algo: u),
+    XcSigAlgCase.new(name: "ECDSA-key/MLDSA-algo", key: ecdsa_priv, sig_algo: SignatureAlgorithm.MLDSA44, want_err: mismatch_err, want_algo: u),
+    # ML-DSA-44 vs ML-DSA-87: same PublicKeyAlgorithm, but
+    # signing_params_for_key rejects the parameter mismatch.
+    XcSigAlgCase.new(name: "MLDSA44-key/MLDSA87-algo", key: mldsa44_priv, sig_algo: SignatureAlgorithm.MLDSA87, want_err: mldsa_params_err, want_algo: u),
+    XcSigAlgCase.new(name: "MLDSA87-key/MLDSA44-algo", key: mldsa87_priv, sig_algo: SignatureAlgorithm.MLDSA44, want_err: mldsa_params_err, want_algo: u),
+    XcSigAlgCase.new(name: "MLDSA44-key/MLDSA44-algo", key: mldsa44_priv, sig_algo: SignatureAlgorithm.MLDSA44, want_err: "", want_algo: SignatureAlgorithm.MLDSA44),
+    XcSigAlgCase.new(name: "MLDSA87-key/MLDSA87-algo", key: mldsa87_priv, sig_algo: SignatureAlgorithm.MLDSA87, want_err: "", want_algo: SignatureAlgorithm.MLDSA87)
+  ]
+  for tc in tests {
+    cert_tmpl = Certificate.new(serial_number: big.new_int(1), subject: pkix.Name.new(common_name: "test"), signature_algorithm: tc.sig_algo)
+    cr = create_certificate(rand.reader(), cert_tmpl, cert_tmpl, tc.key.public, tc.key)
+    xc_check_err("#{tc.name}: CreateCertificate", cr.err, tc.want_err)
+    if tc.want_err == "" && cr.ok? {
+      cert = parse_certificate(cr.unwrap).unwrap
+      assert_eq cert.signature_algorithm, tc.want_algo
+    }
+    csr_tmpl = CertificateRequest.new(subject: pkix.Name.new(common_name: "test"), signature_algorithm: tc.sig_algo)
+    rr = create_certificate_request(rand.reader(), csr_tmpl, tc.key)
+    xc_check_err("#{tc.name}: CreateCertificateRequest", rr.err, tc.want_err)
+    if tc.want_err == "" && rr.ok? {
+      csr = parse_certificate_request(rr.unwrap).unwrap
+      assert_eq csr.signature_algorithm, tc.want_algo
+    }
+    crl_issuer = Certificate.new(key_usage: KEY_USAGE_CRL_SIGN, subject: pkix.Name.new(common_name: "test"), subject_key_id: [1.as_u8, 2, 3])
+    crl_tmpl = RevocationList.new(signature_algorithm: tc.sig_algo, number: big.new_int(1), this_update: time.Time.new().add(time.hour() * 24), next_update: time.Time.new().add(time.hour() * 48))
+    lr = create_revocation_list(rand.reader(), crl_tmpl, crl_issuer, tc.key)
+    xc_check_err("#{tc.name}: CreateRevocationList", lr.err, tc.want_err)
+    if tc.want_err == "" && lr.ok? {
+      crl = parse_revocation_list(lr.unwrap).unwrap
+      assert_eq crl.signature_algorithm, tc.want_algo
+    }
+  }
+}
+
+test "CreateCertificateLegacy" {
+  # Go passes a broken signer: the MD5 check fails first.
+  priv = PrivateKey.Rsa(xc_test_private_key())
+  template = Certificate.new(serial_number: big.new_int(10), dns_names: ["example.com"], signature_algorithm: SignatureAlgorithm.MD5WithRSA)
+  r = create_certificate(rand.reader(), template, template, priv.public, priv)
+  assert !r.ok?, "CreateCertificate didn't fail when SignatureAlgorithm = MD5WithRSA"
+}
+
+test "CertificateRequestRoundtripFields" {
+  url_a = url.parse("https://example.com/_").unwrap
+  url_b = url.parse("https://example.org/_").unwrap
+  ip4: [Byte] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 192, 0, 2, 0]
+  ip6: [Byte] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]
+  input = CertificateRequest.new(dns_names: ["example.com", "example.org"], email_addresses: ["a@example.com", "b@example.com"], ip_addresses: [ip4, ip6], uris: [url_a, url_b])
+  priv = PrivateKey.Rsa(xc_test_private_key())
+  der = create_certificate_request(rand.reader(), input, priv).unwrap
+  out = parse_certificate_request(der).unwrap
+  assert_eq out.dns_names, input.dns_names
+  assert_eq out.email_addresses, input.email_addresses
+  assert_eq out.ip_addresses.size, 2
+  assert ip_equal?(input.ip_addresses[0], out.ip_addresses[0]), "IP 0: #{ip_string(out.ip_addresses[0])}"
+  assert ip_equal?(input.ip_addresses[1], out.ip_addresses[1]), "IP 1: #{ip_string(out.ip_addresses[1])}"
+  assert_eq out.uris.size, 2
+  assert_eq out.uris[0].to_s, url_a.to_s
+  assert_eq out.uris[1].to_s, url_b.to_s
+  assert out.uris[0] == url_a, "URI 0 differs"
+  assert out.check_signature.ok?, "signature"
+}
+
+def xc_check_ai(raw: [Byte], want_oid: asn1.ObjectIdentifier) {
+  assert raw.size > 0, "RawSignatureAlgorithm is empty"
+  ai, rest = pkix.AlgorithmIdentifier.from_asn1(raw).unwrap
+  assert_eq rest.size, 0
+  assert ai.algorithm.equal?(want_oid), "unexpected OID: got #{ai.algorithm.to_s}, want #{want_oid.to_s}"
+}
+
+test "RawSignatureAlgorithm" {
+  oid_sha256_with_rsa = asn1.oid([1, 2, 840, 113549, 1, 1, 11])
+  oid_ecdsa_with_sha256 = asn1.oid([1, 2, 840, 10045, 4, 3, 2])
+  # Certificate
+  cert = parse_certificate(xc_pem_der(xc_pem_certificate())).unwrap
+  xc_check_ai(cert.raw_signature_algorithm, oid_sha256_with_rsa)
+  priv = PrivateKey.Ecdsa(ecdsa.generate_key(elliptic.p256(), rand.reader()).unwrap)
+  # CertificateRequest
+  csr_der = create_certificate_request(rand.reader(), CertificateRequest.new, priv).unwrap
+  csr = parse_certificate_request(csr_der).unwrap
+  xc_check_ai(csr.raw_signature_algorithm, oid_ecdsa_with_sha256)
+  # RevocationList
+  issuer_tmpl = Certificate.new(serial_number: big.new_int(1), subject: pkix.Name.new(common_name: "issuer"), not_before: time.now(), not_after: time.now().add(time.hour()), key_usage: KEY_USAGE_CRL_SIGN, is_ca: true, basic_constraints_valid: true)
+  issuer_der = create_certificate(rand.reader(), issuer_tmpl, issuer_tmpl, priv.public, priv).unwrap
+  issuer = parse_certificate(issuer_der).unwrap
+  crl_der = create_revocation_list(rand.reader(), RevocationList.new(number: big.new_int(1), this_update: time.now(), next_update: time.now().add(time.hour())), issuer, priv).unwrap
+  crl = parse_revocation_list(crl_der).unwrap
+  xc_check_ai(crl.raw_signature_algorithm, oid_ecdsa_with_sha256)
+}
+
+test "ParseCertificateRawEquals" {
+  der = xc_pem_der(xc_pem_certificate())
+  cert = parse_certificate(der).unwrap
+  assert_eq cert.raw, der
+}
+
+test "SigAlgMismatch" {
+  for cert_pem in [xc_mismatching_sig_alg_id_pem(), xc_mismatching_sig_alg_param_pem()] {
+    r = parse_certificate(xc_pem_der(cert_pem))
+    assert !r.ok?, "expected ParseCertificate to fail"
+    assert_eq r.err?.message || "", "x509: inner and outer signature algorithm identifiers don't match"
+  }
+}
+
+test "AuthKeyIdOptional" {
+  r = parse_certificate(xc_pem_der(xc_optional_auth_key_id_pem()))
+  assert r.ok?, "ParseCertificate failed to parse certificate with optional authority key identifier fields: #{r.err?.message || ""}"
+}
+
+test "LargeOID" {
+  # See Issue 49678.
+  r = parse_certificate(xc_pem_der(xc_large_oid_pem()))
+  assert r.ok?, "ParseCertificate failed to parse certificate with large OID: #{r.err?.message || ""}"
+}
+
+test "ParseUniqueID" {
+  cert = parse_certificate(xc_pem_der(xc_unique_id_pem())).unwrap
+  assert_eq cert.extensions.size, 7
+}
+
+test "DisableSHA1ForCertOnly" {
+  priv = PrivateKey.Rsa(xc_rsa_private_key())
+  tmpl = Certificate.new(serial_number: big.new_int(1), not_before: time.now().add(time.hour() * -1), not_after: time.now().add(time.hour()), signature_algorithm: SignatureAlgorithm.SHA1WithRSA, basic_constraints_valid: true, is_ca: true, key_usage: KEY_USAGE_CERT_SIGN | KEY_USAGE_CRL_SIGN)
+  cert_der = create_certificate(rand.reader(), tmpl, tmpl, priv.public, priv).unwrap
+  cert = parse_certificate(cert_der).unwrap
+  r = cert.check_signature_from(cert)
+  assert !r.ok?, "expected CheckSignatureFrom to fail"
+  if e = r.err {
+    is_insecure = case e {
+      X509Error.InsecureAlgorithm(_) => true
+      _ => false
+    }
+    assert is_insecure, "expected InsecureAlgorithmError, got #{e.message}"
+  }
+  crl_der = create_revocation_list(rand.reader(), RevocationList.new(signature_algorithm: SignatureAlgorithm.SHA1WithRSA, number: big.new_int(1), this_update: time.now().add(time.hour() * -1), next_update: time.now().add(time.hour())), cert, priv).unwrap
+  crl = parse_revocation_list(crl_der).unwrap
+  rc = crl.check_signature_from(cert)
+  assert rc.ok?, "unexpected error: #{rc.err?.message || ""}"
+  # This is an unrelated OCSP response, which will fail signature
+  # verification but shouldn't return an InsecureAlgorithmError, since SHA1
+  # should be allowed for OCSP.
+  ocsp_tbs = hex.decode_string(xc_ocsp_tbs_hex()).unwrap
+  r2 = cert.check_signature(SignatureAlgorithm.SHA1WithRSA, ocsp_tbs, [])
+  assert_eq r2.err?.message || "", "crypto/rsa: verification error"
+}
+
+test "ParseRevocationList" {
+  der_bytes = base64.std_encoding().decode_string(xc_der_crl_base64()).unwrap
+  cert_list = parse_revocation_list(der_bytes).unwrap
+  assert_eq cert_list.revoked_certificate_entries.size, 88
+  assert_eq cert_list.revoked_certificates.size, 88
+}
+
+test "RevocationListCheckSignatureFrom" {
+  good_key = ecdsa.generate_key(elliptic.p224(), rand.reader()).unwrap
+  bad_key = ecdsa.generate_key(elliptic.p224(), rand.reader()).unwrap
+  good_pub = PublicKey.Ecdsa(good_key.public_key)
+  bad_pub = PublicKey.Ecdsa(bad_key.public_key)
+  cannot_sign = "x509: invalid signature: parent certificate cannot sign this kind of certificate"
+  tests = [
+    ("valid", Certificate.new(version: 3, basic_constraints_valid: true, is_ca: true, public_key_algorithm: PublicKeyAlgorithm.ECDSA, public_key: good_pub), ""),
+    ("valid, key usage set", Certificate.new(version: 3, basic_constraints_valid: true, is_ca: true, public_key_algorithm: PublicKeyAlgorithm.ECDSA, public_key: good_pub, key_usage: KEY_USAGE_CRL_SIGN), ""),
+    ("invalid issuer, wrong key usage", Certificate.new(version: 3, basic_constraints_valid: true, is_ca: true, public_key_algorithm: PublicKeyAlgorithm.ECDSA, public_key: good_pub, key_usage: KEY_USAGE_CERT_SIGN), cannot_sign),
+    ("invalid issuer, no basic constraints/ca", Certificate.new(version: 3, public_key_algorithm: PublicKeyAlgorithm.ECDSA, public_key: good_pub), cannot_sign),
+    ("invalid issuer, unsupported public key type", Certificate.new(version: 3, basic_constraints_valid: true, is_ca: true, public_key_algorithm: PublicKeyAlgorithm.UnknownPublicKeyAlgorithm, public_key: good_pub), "x509: cannot verify signature: algorithm unimplemented"),
+    ("wrong key", Certificate.new(version: 3, basic_constraints_valid: true, is_ca: true, public_key_algorithm: PublicKeyAlgorithm.ECDSA, public_key: bad_pub), "x509: ECDSA verification failure")
+  ]
+  crl_issuer = Certificate.new(basic_constraints_valid: true, is_ca: true, public_key_algorithm: PublicKeyAlgorithm.ECDSA, public_key: good_pub, key_usage: KEY_USAGE_CRL_SIGN, subject_key_id: [1.as_u8, 2, 3])
+  for tc in tests {
+    crl_der = create_revocation_list(rand.reader(), RevocationList.new(number: big.new_int(1)), crl_issuer, PrivateKey.Ecdsa(good_key)).unwrap
+    crl = parse_revocation_list(crl_der).unwrap
+    r = crl.check_signature_from(tc[1])
+    assert_eq r.err?.message || "", tc[2]
+  }
+}
+
+test "OmitEmptyExtensions" {
+  k = PrivateKey.Ecdsa(ecdsa.generate_key(elliptic.p256(), rand.reader()).unwrap)
+  tmpl = Certificate.new(serial_number: big.new_int(1), subject: pkix.Name.new(common_name: ":)"), not_after: time.now().add(time.hour()), not_before: time.now().add(time.hour() * -1))
+  der = create_certificate(rand.reader(), tmpl, tmpl, k.public, k).unwrap
+  empty_ext_seq: [Byte] = [0xa3, 0x02, 0x30, 0x00]
+  assert !bytes.contains(der, empty_ext_seq), "DER encoding contains the an empty extensions SEQUENCE"
+}
+
+test "ParseNegativeSerial" {
+  r = parse_certificate(xc_pem_der(xc_negative_serial_cert()))
+  assert !r.ok?, "parsed certificate with negative serial"
+}
+
+test "CreateNegativeSerial" {
+  k = PrivateKey.Ecdsa(ecdsa.generate_key(elliptic.p256(), rand.reader()).unwrap)
+  tmpl = Certificate.new(serial_number: big.new_int(-1), subject: pkix.Name.new(common_name: ":)"), not_after: time.now().add(time.hour()), not_before: time.now().add(time.hour() * -1))
+  r = create_certificate(rand.reader(), tmpl, tmpl, k.public, k)
+  assert_eq xc_err(r), "x509: serial number must be positive"
+}
+
+test "DuplicateExtensionsCert" {
+  r = parse_certificate(xc_pem_der(xc_dup_ext_cert()))
+  assert !r.ok?, "ParseCertificate should fail when parsing certificate with duplicate extensions"
+}
+
+test "DuplicateExtensionsCSR" {
+  r = parse_certificate_request(xc_pem_der(xc_dup_ext_csr()))
+  assert !r.ok?, "ParseCertificateRequest should fail when parsing CSR with duplicate extensions"
+}
+
+test "DuplicateAttributesCSR" {
+  r = parse_certificate_request(xc_pem_der(xc_dup_att_csr()))
+  assert r.ok?, "ParseCertificateRequest should succeed when parsing CSR with duplicate attributes: #{r.err?.message || ""}"
+}
+
+test "CertificatePolicies" {
+  priv = PrivateKey.Rsa(xc_rsa_private_key())
+  max_u32_plus_one: U64 = 4294967296
+  template = Certificate.new(serial_number: big.new_int(1), subject: pkix.Name.new(common_name: "Cert"), not_before: time.unix(1000, 0), not_after: time.unix(100000, 0), policy_identifiers: [asn1.oid([1, 2, 3])], policies: [xc_must_oid([1, 2, max_u32_plus_one])])
+  expect_policies = [xc_must_oid([1, 2, max_u32_plus_one])]
+  # Twice in Go: by default and with x509usepolicies=1 (the same here).
+  for _i in 0...2 {
+    cert_der = create_certificate(rand.reader(), template, template, priv.public, priv).unwrap
+    cert = parse_certificate(cert_der).unwrap
+    assert_eq cert.policies.size, expect_policies.size
+    assert cert.policies[0].equal?(expect_policies[0]), "cert.Policies = #{cert.policies[0].to_s}"
+  }
+}
+
+def xc_reject_critical(oid: [Int], expected_err: Str) {
+  priv = PrivateKey.Rsa(xc_rsa_private_key())
+  template = Certificate.new(serial_number: big.new_int(1), subject: pkix.Name.new(common_name: "Cert"), not_before: time.unix(1000, 0), not_after: time.unix(100000, 0), extra_extensions: [pkix.Extension.new(id: asn1.oid(oid), critical: true, value: [1.as_u8, 2, 3])])
+  cert_der = create_certificate(rand.reader(), template, template, priv.public, priv).unwrap
+  r = parse_certificate(cert_der)
+  assert_eq r.err?.message || "", expected_err
+}
+
+test "RejectCriticalAKI" { xc_reject_critical([2, 5, 29, 35], "x509: authority key identifier incorrectly marked critical") }
+
+test "RejectCriticalAIA" { xc_reject_critical([1, 3, 6, 1, 5, 5, 7, 1, 1], "x509: authority info access incorrectly marked critical") }
+
+test "RejectCriticalSKI" { xc_reject_critical([2, 5, 29, 14], "x509: subject key identifier incorrectly marked critical") }
+
+test "CreateCertificateNegativeMaxPathLength" {
+  priv = PrivateKey.Rsa(xc_rsa_private_key())
+  # create_certificate treats -1 in the same way as: max_path_len == 0 &&
+  # max_path_len_zero == false.
+  template = Certificate.new(serial_number: big.new_int(1), subject: pkix.Name.new(common_name: "TEST"), not_before: time.unix(1000, 0), not_after: time.unix(100000, 0), basic_constraints_valid: true, is_ca: true, max_path_len: -1)
+  r = create_certificate(rand.reader(), template, template, priv.public, priv)
+  assert r.ok?, "CreateCertificate() unexpected error: #{xc_err(r)}"
+  template.max_path_len = -2
+  r2 = create_certificate(rand.reader(), template, template, priv.public, priv)
+  assert_eq xc_err(r2), "x509: invalid MaxPathLen, must be greater or equal to -1"
+}
+
+test "EKUOIDS" {
+  # Go's extKeyUsageOIDs table.
+  table = [
+    (ExtKeyUsage.Any, [2, 5, 29, 37, 0]),
+    (ExtKeyUsage.ServerAuth, [1, 3, 6, 1, 5, 5, 7, 3, 1]),
+    (ExtKeyUsage.ClientAuth, [1, 3, 6, 1, 5, 5, 7, 3, 2]),
+    (ExtKeyUsage.CodeSigning, [1, 3, 6, 1, 5, 5, 7, 3, 3]),
+    (ExtKeyUsage.EmailProtection, [1, 3, 6, 1, 5, 5, 7, 3, 4]),
+    (ExtKeyUsage.IPSECEndSystem, [1, 3, 6, 1, 5, 5, 7, 3, 5]),
+    (ExtKeyUsage.IPSECTunnel, [1, 3, 6, 1, 5, 5, 7, 3, 6]),
+    (ExtKeyUsage.IPSECUser, [1, 3, 6, 1, 5, 5, 7, 3, 7]),
+    (ExtKeyUsage.TimeStamping, [1, 3, 6, 1, 5, 5, 7, 3, 8]),
+    (ExtKeyUsage.OCSPSigning, [1, 3, 6, 1, 5, 5, 7, 3, 9]),
+    (ExtKeyUsage.MicrosoftServerGatedCrypto, [1, 3, 6, 1, 4, 1, 311, 10, 3, 3]),
+    (ExtKeyUsage.NetscapeServerGatedCrypto, [2, 16, 840, 1, 113730, 4, 1]),
+    (ExtKeyUsage.MicrosoftCommercialCodeSigning, [1, 3, 6, 1, 4, 1, 311, 2, 1, 22]),
+    (ExtKeyUsage.MicrosoftKernelCodeSigning, [1, 3, 6, 1, 4, 1, 311, 61, 1, 1])
+  ]
+  for eku in table {
+    oid = eku[0].oid
+    assert oid.equal_asn1_oid?(asn1.oid(eku[1])), "extKeyUsage #{eku[0].value}: got #{oid.to_s}"
+    assert ext_key_usage_from_oid(asn1.oid(eku[1])) == eku[0], "ext_key_usage_from_oid"
+  }
+}
+
+def xc_test_mldsa(private_key_pem: Str, public_key_pem: Str, cert_pem: Str) {
+  priv_key = parse_pkcs8_private_key(xc_pem_der(private_key_pem)).unwrap
+  mpriv = case priv_key {
+    PrivateKey.MlDsa(k) => k
+    _ => panic("ParsePKCS8PrivateKey returned wrong type")
+  }
+  assert_eq hex.encode_to_string(mpriv.bytes), "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"
+  got = marshal_pkcs8_private_key(priv_key).unwrap
+  assert_eq got, xc_pem_der(private_key_pem)
+  pub_key = parse_pkix_public_key(xc_pem_der(public_key_pem)).unwrap
+  mpub = case pub_key {
+    PublicKey.MlDsa(k) => k
+    _ => panic("ParsePKIXPublicKey returned wrong type")
+  }
+  assert mpub.equal?(mpriv.public_key), "ParsePKIXPublicKey returned public key that does not match private key"
+  got2 = marshal_pkix_public_key(pub_key).unwrap
+  assert_eq got2, xc_pem_der(public_key_pem)
+  cert = parse_certificate(xc_pem_der(cert_pem)).unwrap
+  assert cert.public_key.equal?(PublicKey.MlDsa(mpriv.public_key)), "certificate public key does not match private key"
+  assert_eq cert.public_key_algorithm, PublicKeyAlgorithm.MLDSA
+  p = mpub.parameters
+  if p == mldsa.mldsa44() {
+    assert_eq cert.signature_algorithm, SignatureAlgorithm.MLDSA44
+  } else if p == mldsa.mldsa65() {
+    assert_eq cert.signature_algorithm, SignatureAlgorithm.MLDSA65
+  } else if p == mldsa.mldsa87() {
+    assert_eq cert.signature_algorithm, SignatureAlgorithm.MLDSA87
+  } else {
+    assert false, "unknown MLDSA parameters"
+  }
+  r = cert.check_signature_from(cert)
+  assert r.ok?, "CheckSignatureFrom failed: #{r.err?.message || ""}"
+  got3 = create_certificate(rand.reader(), cert, cert, PublicKey.MlDsa(mpriv.public_key), priv_key).unwrap
+  cert2 = parse_certificate(got3).unwrap
+  assert cert2.public_key.equal?(PublicKey.MlDsa(mpriv.public_key)), "cert2 public key"
+  assert_eq cert2.signature_algorithm, cert.signature_algorithm
+  r2 = cert2.check_signature_from(cert2)
+  assert r2.ok?, "CheckSignatureFrom failed: #{r2.err?.message || ""}"
+  msg = "test message".bytes
+  sig = priv_key.sign(rand.reader(), msg, SignOpts.new).unwrap
+  cert_params = mpub.parameters
+  for tc in [(SignatureAlgorithm.MLDSA44, mldsa.mldsa44(), "ML-DSA-44"), (SignatureAlgorithm.MLDSA65, mldsa.mldsa65(), "ML-DSA-65"), (SignatureAlgorithm.MLDSA87, mldsa.mldsa87(), "ML-DSA-87")] {
+    rc = cert.check_signature(tc[0], msg, sig)
+    if tc[1] == cert_params {
+      assert rc.ok?, "CheckSignature(#{tc[2]}): #{rc.err?.message || ""}"
+    } else {
+      m = rc.err?.message || ""
+      assert m.include?(tc[2]), "CheckSignature(#{tc[2]}) on #{cert_params.to_s} key: got #{m}"
+    }
+  }
+}
+
+test "MLDSA" {
+  xc_test_mldsa(xc_mldsa44_priv(), xc_mldsa44_pub(), xc_mldsa44_cert())
+  xc_test_mldsa(xc_mldsa65_priv(), xc_mldsa65_pub(), xc_mldsa65_cert())
+  xc_test_mldsa(xc_mldsa87_priv(), xc_mldsa87_pub(), xc_mldsa87_cert())
+  r = parse_pkcs8_private_key(xc_pem_der(xc_mldsa44_priv_expanded()))
+  assert (r.err?.message || "").include?("supported"), "expanded ML-DSA-44 key: #{r.err?.message || "no error"}"
+  r2 = parse_pkcs8_private_key(xc_pem_der(xc_mldsa44_priv_both()))
+  assert (r2.err?.message || "").include?("openssl"), "seed and expanded ML-DSA-44 key: #{r2.err?.message || "no error"}"
+}
+
+test "IPv4MappedIPsParse" {
+  for tc in [("SAN", xc_ipv4_mapped_san_cert()), ("constraint", xc_ipv4_mapped_constraint_cert())] {
+    der = hex.decode_string(tc[1]).unwrap
+    r = parse_certificate(der)
+    assert !r.ok?, "#{tc[0]}: expected error when parsing certificate containing IPv4-mapped IPv6 address"
+    m = r.err?.message || ""
+    assert m.include?("IPv4-mapped IPv6 address"), "#{tc[0]}: unexpected error: #{m}"
+  }
+}
+
+test "IPv4MappedIPsSANCreate" {
+  priv = PrivateKey.Rsa(xc_rsa_private_key())
+  tmpl = Certificate.new(serial_number: big.new_int(1), not_before: time.now().add(time.hour() * -24), not_after: time.now().add(time.hour() * 24), dns_names: ["localhost"], ip_addresses: [parse_ip("::ffff:192.0.2.1").unwrap])
+  der = create_certificate(rand.reader(), tmpl, tmpl, priv.public, priv).unwrap
+  cert = parse_certificate(der).unwrap
+  assert_eq cert.ip_addresses.size, 1
+  assert_eq cert.ip_addresses[0].size, 4
+}
+
+test "IPv4MappedIPsConstraintCreate" {
+  priv = PrivateKey.Rsa(xc_rsa_private_key())
+  mask: [Byte] = [0xff; 16]
+  mapped_network = IPNet.new(ip: parse_ip("::ffff:192.0.2.1").unwrap, mask: mask)
+  tmpl = Certificate.new(serial_number: big.new_int(1), not_before: time.now().add(time.hour() * -24), not_after: time.now().add(time.hour() * 24), dns_names: ["localhost"], permitted_ip_ranges: [mapped_network])
+  r = create_certificate(rand.reader(), tmpl, tmpl, priv.public, priv)
+  assert !r.ok?, "unexpected success creating certificate with IPv4-mapped IPv6 address constraint"
+}
+
+bench "CreateCertificate" {
+  template = Certificate.new(serial_number: big.new_int(10), dns_names: ["example.com"])
+  k = PrivateKey.Ecdsa(ecdsa.generate_key(elliptic.p256(), rand.reader()).unwrap)
+  create_certificate(rand.reader(), template, template, k.public, k).unwrap
+}
+
+bench "ParseCertificate" {
+  parse_certificate(xc_pem_der(xc_bench_ecdsa_leaf())).unwrap
+  parse_certificate(xc_pem_der(xc_bench_rsa_leaf())).unwrap
+}

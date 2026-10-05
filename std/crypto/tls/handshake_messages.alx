@@ -1,0 +1,1265 @@
+# The handshake messages (Go's handshake_messages.go), on cryptobyte.
+# marshal -> ~[Byte] gives the message with its 4-byte header;
+# `Type.unmarshal(data) -> Type?` parses one (none: malformed).
+
+import "golang.org/x/crypto/cryptobyte"
+
+# A failed parse inside the unmarshal helpers (never escapes).
+def bad -> TlsError { TlsError.Msg("tls: malformed handshake message") }
+
+def need[T](o: T?) -> ~T<TlsError> {
+  if v = o {
+    return v
+  }
+  fail bad()
+}
+
+def check(c: Bool) -> ~Unit<TlsError> {
+  fail bad() if !c
+}
+
+def add_u16s(b: cryptobyte.Builder, vs: [U16]) {
+  bb = b
+  for v in vs {
+    bb.add_u16!(v)
+  }
+}
+
+def read_u16_list!(s0: cryptobyte.String) -> ~[U16] {
+  s = s0
+  out: [U16] = []
+  while !s.empty? {
+    out << ~need(s.read_u16!)
+  }
+  out
+}
+
+pub struct KeyShare {
+  group: U16
+  data: [Byte]
+}
+
+pub struct PskIdentity {
+  label: [Byte]
+  obfuscated_ticket_age: U32
+}
+
+# ---------------------------------------------------------------- ClientHello
+
+pub struct ClientHelloMsg {
+  original: [Byte]
+  vers: U16
+  random: [Byte]
+  session_id: [Byte]
+  cipher_suites: [U16]
+  compression_methods: [Byte]
+  server_name: Str
+  ocsp_stapling: Bool
+  supported_curves: [U16]
+  supported_points: [Byte]
+  ticket_supported: Bool
+  session_ticket: [Byte]
+  supported_signature_algorithms: [U16]
+  supported_signature_algorithms_cert: [U16]
+  secure_renegotiation_supported: Bool
+  secure_renegotiation: [Byte]
+  extended_master_secret: Bool
+  alpn_protocols: [Str]
+  scts: Bool
+  supported_versions: [U16]
+  cookie: [Byte]
+  key_shares: [KeyShare]
+  early_data: Bool
+  psk_modes: [Byte]
+  psk_identities: [PskIdentity]
+  psk_binders: [[Byte]]
+  quic_transport_parameters: [Byte]?
+  encrypted_client_hello: [Byte]
+  # The extensions in the order they were received.
+  extensions: [U16]
+
+  pub def marshal -> ~[Byte] {
+    m = self
+    exts = cryptobyte.new_builder([])
+    if m.server_name.size > 0 {
+      exts.add_u16!(EXTENSION_SERVER_NAME)
+      exts.add_u16_length_prefixed! { |e|
+        e.add_u16_length_prefixed! { |e2|
+          # name_type = host_name
+          e2.add_u8!(0)
+          e2.add_u16_length_prefixed! { |e3| e3.add_bytes!(m.server_name.bytes) }
+        }
+      }
+    }
+    if m.supported_points.size > 0 {
+      exts.add_u16!(EXTENSION_SUPPORTED_POINTS)
+      exts.add_u16_length_prefixed! { |e| e.add_u8_length_prefixed! { |e2| e2.add_bytes!(m.supported_points) } }
+    }
+    if m.ticket_supported {
+      exts.add_u16!(EXTENSION_SESSION_TICKET)
+      exts.add_u16_length_prefixed! { |e| e.add_bytes!(m.session_ticket) }
+    }
+    if m.secure_renegotiation_supported {
+      exts.add_u16!(EXTENSION_RENEGOTIATION_INFO)
+      exts.add_u16_length_prefixed! { |e| e.add_u8_length_prefixed! { |e2| e2.add_bytes!(m.secure_renegotiation) } }
+    }
+    if m.extended_master_secret {
+      exts.add_u16!(EXTENSION_EXTENDED_MASTER_SECRET)
+      exts.add_u16!(0)
+    }
+    if m.scts {
+      exts.add_u16!(EXTENSION_SCT)
+      exts.add_u16!(0)
+    }
+    if m.early_data {
+      exts.add_u16!(EXTENSION_EARLY_DATA)
+      exts.add_u16!(0)
+    }
+    if q = m.quic_transport_parameters {
+      exts.add_u16!(EXTENSION_QUIC_TRANSPORT_PARAMETERS)
+      exts.add_u16_length_prefixed! { |e| e.add_bytes!(q) }
+    }
+    if m.encrypted_client_hello.size > 0 {
+      exts.add_u16!(EXTENSION_ENCRYPTED_CLIENT_HELLO)
+      exts.add_u16_length_prefixed! { |e| e.add_bytes!(m.encrypted_client_hello) }
+    }
+    if m.ocsp_stapling {
+      exts.add_u16!(EXTENSION_STATUS_REQUEST)
+      exts.add_u16_length_prefixed! { |e|
+        # status_type = ocsp, empty responder_id_list and request_extensions
+        e.add_u8!(1)
+        e.add_u16!(0)
+        e.add_u16!(0)
+      }
+    }
+    if m.supported_curves.size > 0 {
+      exts.add_u16!(EXTENSION_SUPPORTED_CURVES)
+      exts.add_u16_length_prefixed! { |e| e.add_u16_length_prefixed! { |e2| add_u16s(e2, m.supported_curves) } }
+    }
+    if m.supported_signature_algorithms.size > 0 {
+      exts.add_u16!(EXTENSION_SIGNATURE_ALGORITHMS)
+      exts.add_u16_length_prefixed! { |e| e.add_u16_length_prefixed! { |e2| add_u16s(e2, m.supported_signature_algorithms) } }
+    }
+    if m.supported_signature_algorithms_cert.size > 0 {
+      exts.add_u16!(EXTENSION_SIGNATURE_ALGORITHMS_CERT)
+      exts.add_u16_length_prefixed! { |e| e.add_u16_length_prefixed! { |e2| add_u16s(e2, m.supported_signature_algorithms_cert) } }
+    }
+    if m.alpn_protocols.size > 0 {
+      exts.add_u16!(EXTENSION_ALPN)
+      exts.add_u16_length_prefixed! { |e|
+        e.add_u16_length_prefixed! { |e2|
+          for proto in m.alpn_protocols {
+            e2.add_u8_length_prefixed! { |e3| e3.add_bytes!(proto.bytes) }
+          }
+        }
+      }
+    }
+    if m.supported_versions.size > 0 {
+      exts.add_u16!(EXTENSION_SUPPORTED_VERSIONS)
+      exts.add_u16_length_prefixed! { |e| e.add_u8_length_prefixed! { |e2| add_u16s(e2, m.supported_versions) } }
+    }
+    if m.cookie.size > 0 {
+      exts.add_u16!(EXTENSION_COOKIE)
+      exts.add_u16_length_prefixed! { |e| e.add_u16_length_prefixed! { |e2| e2.add_bytes!(m.cookie) } }
+    }
+    if m.key_shares.size > 0 {
+      exts.add_u16!(EXTENSION_KEY_SHARE)
+      exts.add_u16_length_prefixed! { |e|
+        e.add_u16_length_prefixed! { |e2|
+          for ks in m.key_shares {
+            e2.add_u16!(ks.group)
+            e2.add_u16_length_prefixed! { |e3| e3.add_bytes!(ks.data) }
+          }
+        }
+      }
+    }
+    if m.psk_modes.size > 0 {
+      exts.add_u16!(EXTENSION_PSK_MODES)
+      exts.add_u16_length_prefixed! { |e| e.add_u8_length_prefixed! { |e2| e2.add_bytes!(m.psk_modes) } }
+    }
+    if m.psk_identities.size > 0 && (m.encrypted_client_hello.size == 0 || m.encrypted_client_hello == [INNER_ECH_EXT]) {
+      exts.add_u16!(EXTENSION_PRE_SHARED_KEY)
+      exts.add_u16_length_prefixed! { |e|
+        e.add_u16_length_prefixed! { |e2|
+          for psk in m.psk_identities {
+            e2.add_u16_length_prefixed! { |e3| e3.add_bytes!(psk.label) }
+            e2.add_u32!(psk.obfuscated_ticket_age)
+          }
+        }
+        e.add_u16_length_prefixed! { |e2|
+          for binder in m.psk_binders {
+            e2.add_u8_length_prefixed! { |e3| e3.add_bytes!(binder) }
+          }
+        }
+      }
+    }
+    ext_bytes = exts.~bytes
+    b = cryptobyte.new_builder([])
+    b.add_u8!(TYPE_CLIENT_HELLO)
+    b.add_u24_length_prefixed! { |c|
+      c.add_u16!(m.vers)
+      add_bytes_with_length(c, m.random, 32)
+      c.add_u8_length_prefixed! { |c2| c2.add_bytes!(m.session_id) }
+      c.add_u16_length_prefixed! { |c2| add_u16s(c2, m.cipher_suites) }
+      c.add_u8_length_prefixed! { |c2| c2.add_bytes!(m.compression_methods) }
+      if ext_bytes.size > 0 {
+        c.add_u16_length_prefixed! { |c2| c2.add_bytes!(ext_bytes) }
+      }
+    }
+    b.~bytes
+  }
+
+  # The message without its PSK binders (for computing them).
+  pub def marshal_without_binders -> ~[Byte] {
+    binders_len = 2
+    for binder in psk_binders {
+      binders_len += 1 + binder.size
+    }
+    full = original
+    full = self.~marshal if full.size == 0
+    full[0...full.size - binders_len]
+  }
+
+  pub def update_binders!(binders: [[Byte]]) -> ~Unit<TlsError> {
+    fail TlsError.Msg("tls: internal error: pskBinders length mismatch") if binders.size != psk_binders.size
+    i = 0
+    while i < binders.size {
+      fail TlsError.Msg("tls: internal error: pskBinders length mismatch") if binders[i].size != psk_binders[i].size
+      i += 1
+    }
+    self.psk_binders = binders
+  }
+
+  pub def self.unmarshal(data: [Byte]) -> ClientHelloMsg? { parse_client_hello(data).ok }
+}
+
+def add_bytes_with_length(b: cryptobyte.Builder, v: [Byte], n: Int) {
+  bb = b
+  if v.size != n {
+    bb.set_error!(TlsError.Msg("invalid value length: expected #{n}, got #{v.size}"))
+    return
+  }
+  bb.add_bytes!(v)
+}
+
+def parse_client_hello(data: [Byte]) -> ~ClientHelloMsg {
+  m = ClientHelloMsg.new(original: data)
+  s = cryptobyte.string(data)
+  ~check(s.skip!(4))
+  m.vers = ~need(s.read_u16!)
+  m.random = ~need(s.read_bytes!(32))
+  m.session_id = (~need(s.read_u8_length_prefixed!)).bytes
+  cs = ~need(s.read_u16_length_prefixed!)
+  m.cipher_suites = []
+  while !cs.empty? {
+    suite = ~need(cs.read_u16!)
+    m.secure_renegotiation_supported = true if suite == SCSV_RENEGOTIATION
+    m.cipher_suites << suite
+  }
+  m.compression_methods = (~need(s.read_u8_length_prefixed!)).bytes
+  return m if s.empty?
+  extensions = ~need(s.read_u16_length_prefixed!)
+  ~check(s.empty?)
+  seen: Map[U16, Bool] = {}
+  while !extensions.empty? {
+    extension = ~need(extensions.read_u16!)
+    ext_data = ~need(extensions.read_u16_length_prefixed!)
+    ~check(!seen.has_key?(extension))
+    seen[extension] = true
+    m.extensions << extension
+    known = true
+    if extension == EXTENSION_SERVER_NAME {
+      name_list = ~need(ext_data.read_u16_length_prefixed!)
+      ~check(!name_list.empty?)
+      while !name_list.empty? {
+        name_type = ~need(name_list.read_u8!)
+        server_name = ~need(name_list.read_u16_length_prefixed!)
+        ~check(!server_name.empty?)
+        if name_type == 0 {
+          ~check(m.server_name.size == 0)
+          m.server_name = Str.from_bytes(server_name.bytes)
+          # An SNI value may not include a trailing dot.
+          ~check(!m.server_name.end_with?("."))
+        }
+      }
+    } else if extension == EXTENSION_STATUS_REQUEST {
+      status_type = ~need(ext_data.read_u8!)
+      ~need(ext_data.read_u16_length_prefixed!)
+      ~need(ext_data.read_u16_length_prefixed!)
+      m.ocsp_stapling = status_type == STATUS_TYPE_OCSP
+    } else if extension == EXTENSION_SUPPORTED_CURVES {
+      curves = ~need(ext_data.read_u16_length_prefixed!)
+      ~check(!curves.empty?)
+      m.supported_curves = ~read_u16_list!(curves)
+    } else if extension == EXTENSION_SUPPORTED_POINTS {
+      m.supported_points = (~need(ext_data.read_u8_length_prefixed!)).bytes
+      ~check(m.supported_points.size > 0)
+    } else if extension == EXTENSION_SESSION_TICKET {
+      m.ticket_supported = true
+      m.session_ticket = ext_data.read_bytes!(ext_data.size) || []
+    } else if extension == EXTENSION_SIGNATURE_ALGORITHMS {
+      l = ~need(ext_data.read_u16_length_prefixed!)
+      ~check(!l.empty?)
+      m.supported_signature_algorithms = ~read_u16_list!(l)
+    } else if extension == EXTENSION_SIGNATURE_ALGORITHMS_CERT {
+      l = ~need(ext_data.read_u16_length_prefixed!)
+      ~check(!l.empty?)
+      m.supported_signature_algorithms_cert = ~read_u16_list!(l)
+    } else if extension == EXTENSION_RENEGOTIATION_INFO {
+      m.secure_renegotiation = (~need(ext_data.read_u8_length_prefixed!)).bytes
+      m.secure_renegotiation_supported = true
+    } else if extension == EXTENSION_EXTENDED_MASTER_SECRET {
+      m.extended_master_secret = true
+    } else if extension == EXTENSION_ALPN {
+      proto_list = ~need(ext_data.read_u16_length_prefixed!)
+      ~check(!proto_list.empty?)
+      while !proto_list.empty? {
+        proto = ~need(proto_list.read_u8_length_prefixed!)
+        ~check(!proto.empty?)
+        m.alpn_protocols << Str.from_bytes(proto.bytes)
+      }
+    } else if extension == EXTENSION_SCT {
+      m.scts = true
+    } else if extension == EXTENSION_SUPPORTED_VERSIONS {
+      vl = ~need(ext_data.read_u8_length_prefixed!)
+      ~check(!vl.empty?)
+      m.supported_versions = ~read_u16_list!(vl)
+    } else if extension == EXTENSION_COOKIE {
+      c = ~need(ext_data.read_u16_length_prefixed!)
+      ~check(!c.empty?)
+      m.cookie = c.bytes
+    } else if extension == EXTENSION_KEY_SHARE {
+      client_shares = ~need(ext_data.read_u16_length_prefixed!)
+      while !client_shares.empty? {
+        g = ~need(client_shares.read_u16!)
+        d = ~need(client_shares.read_u16_length_prefixed!)
+        ~check(!d.empty?)
+        m.key_shares << KeyShare.new(group: g, data: d.bytes)
+      }
+    } else if extension == EXTENSION_EARLY_DATA {
+      m.early_data = true
+    } else if extension == EXTENSION_PSK_MODES {
+      m.psk_modes = (~need(ext_data.read_u8_length_prefixed!)).bytes
+    } else if extension == EXTENSION_QUIC_TRANSPORT_PARAMETERS {
+      m.quic_transport_parameters = ext_data.bytes + []
+      ext_data.skip!(ext_data.size)
+    } else if extension == EXTENSION_PRE_SHARED_KEY {
+      # pre_shared_key must be the last extension
+      ~check(extensions.empty?)
+      identities = ~need(ext_data.read_u16_length_prefixed!)
+      ~check(!identities.empty?)
+      while !identities.empty? {
+        label = ~need(identities.read_u16_length_prefixed!)
+        age = ~need(identities.read_u32!)
+        ~check(!label.empty?)
+        m.psk_identities << PskIdentity.new(label: label.bytes, obfuscated_ticket_age: age)
+      }
+      binders = ~need(ext_data.read_u16_length_prefixed!)
+      ~check(!binders.empty?)
+      while !binders.empty? {
+        binder = ~need(binders.read_u8_length_prefixed!)
+        ~check(!binder.empty?)
+        m.psk_binders << binder.bytes
+      }
+    } else if extension == EXTENSION_ENCRYPTED_CLIENT_HELLO {
+      m.encrypted_client_hello = ext_data.bytes
+      ext_data.skip!(ext_data.size)
+    } else {
+      # Ignore unknown extensions.
+      known = false
+    }
+    ~check(ext_data.empty?) if known
+  }
+  m
+}
+
+# ---------------------------------------------------------------- ServerHello
+
+pub struct ServerHelloMsg {
+  original: [Byte]
+  vers: U16
+  random: [Byte]
+  session_id: [Byte]
+  cipher_suite: U16
+  compression_method: Byte
+  ocsp_stapling: Bool
+  ticket_supported: Bool
+  secure_renegotiation_supported: Bool
+  secure_renegotiation: [Byte]
+  extended_master_secret: Bool
+  alpn_protocol: Str
+  scts: [[Byte]]
+  supported_version: U16
+  server_share: KeyShare
+  selected_identity_present: Bool
+  selected_identity: U16
+  supported_points: [Byte]
+  encrypted_client_hello: [Byte]
+  server_name_ack: Bool
+  # HelloRetryRequest extensions
+  cookie: [Byte]
+  selected_group: U16
+
+  pub def marshal -> ~[Byte] {
+    m = self
+    exts = cryptobyte.new_builder([])
+    if m.ocsp_stapling {
+      exts.add_u16!(EXTENSION_STATUS_REQUEST)
+      exts.add_u16!(0)
+    }
+    if m.ticket_supported {
+      exts.add_u16!(EXTENSION_SESSION_TICKET)
+      exts.add_u16!(0)
+    }
+    if m.secure_renegotiation_supported {
+      exts.add_u16!(EXTENSION_RENEGOTIATION_INFO)
+      exts.add_u16_length_prefixed! { |e| e.add_u8_length_prefixed! { |e2| e2.add_bytes!(m.secure_renegotiation) } }
+    }
+    if m.extended_master_secret {
+      exts.add_u16!(EXTENSION_EXTENDED_MASTER_SECRET)
+      exts.add_u16!(0)
+    }
+    if m.alpn_protocol.size > 0 {
+      exts.add_u16!(EXTENSION_ALPN)
+      exts.add_u16_length_prefixed! { |e| e.add_u16_length_prefixed! { |e2| e2.add_u8_length_prefixed! { |e3| e3.add_bytes!(m.alpn_protocol.bytes) } } }
+    }
+    if m.scts.size > 0 {
+      exts.add_u16!(EXTENSION_SCT)
+      exts.add_u16_length_prefixed! { |e|
+        e.add_u16_length_prefixed! { |e2|
+          for sct in m.scts {
+            e2.add_u16_length_prefixed! { |e3| e3.add_bytes!(sct) }
+          }
+        }
+      }
+    }
+    if m.supported_version != 0 {
+      exts.add_u16!(EXTENSION_SUPPORTED_VERSIONS)
+      exts.add_u16_length_prefixed! { |e| e.add_u16!(m.supported_version) }
+    }
+    if m.server_share.group != 0 {
+      exts.add_u16!(EXTENSION_KEY_SHARE)
+      exts.add_u16_length_prefixed! { |e|
+        e.add_u16!(m.server_share.group)
+        e.add_u16_length_prefixed! { |e2| e2.add_bytes!(m.server_share.data) }
+      }
+    }
+    if m.selected_identity_present {
+      exts.add_u16!(EXTENSION_PRE_SHARED_KEY)
+      exts.add_u16_length_prefixed! { |e| e.add_u16!(m.selected_identity) }
+    }
+    if m.cookie.size > 0 {
+      exts.add_u16!(EXTENSION_COOKIE)
+      exts.add_u16_length_prefixed! { |e| e.add_u16_length_prefixed! { |e2| e2.add_bytes!(m.cookie) } }
+    }
+    if m.selected_group != 0 {
+      exts.add_u16!(EXTENSION_KEY_SHARE)
+      exts.add_u16_length_prefixed! { |e| e.add_u16!(m.selected_group) }
+    }
+    if m.supported_points.size > 0 {
+      exts.add_u16!(EXTENSION_SUPPORTED_POINTS)
+      exts.add_u16_length_prefixed! { |e| e.add_u8_length_prefixed! { |e2| e2.add_bytes!(m.supported_points) } }
+    }
+    if m.encrypted_client_hello.size > 0 {
+      exts.add_u16!(EXTENSION_ENCRYPTED_CLIENT_HELLO)
+      exts.add_u16_length_prefixed! { |e| e.add_bytes!(m.encrypted_client_hello) }
+    }
+    if m.server_name_ack {
+      exts.add_u16!(EXTENSION_SERVER_NAME)
+      exts.add_u16!(0)
+    }
+    ext_bytes = exts.~bytes
+    b = cryptobyte.new_builder([])
+    b.add_u8!(TYPE_SERVER_HELLO)
+    b.add_u24_length_prefixed! { |c|
+      c.add_u16!(m.vers)
+      add_bytes_with_length(c, m.random, 32)
+      c.add_u8_length_prefixed! { |c2| c2.add_bytes!(m.session_id) }
+      c.add_u16!(m.cipher_suite)
+      c.add_u8!(m.compression_method)
+      if ext_bytes.size > 0 {
+        c.add_u16_length_prefixed! { |c2| c2.add_bytes!(ext_bytes) }
+      }
+    }
+    b.~bytes
+  }
+
+  pub def self.unmarshal(data: [Byte]) -> ServerHelloMsg? { parse_server_hello(data).ok }
+}
+
+def parse_server_hello(data: [Byte]) -> ~ServerHelloMsg {
+  m = ServerHelloMsg.new(original: data)
+  s = cryptobyte.string(data)
+  ~check(s.skip!(4))
+  m.vers = ~need(s.read_u16!)
+  m.random = ~need(s.read_bytes!(32))
+  m.session_id = (~need(s.read_u8_length_prefixed!)).bytes
+  m.cipher_suite = ~need(s.read_u16!)
+  m.compression_method = ~need(s.read_u8!)
+  return m if s.empty?
+  extensions = ~need(s.read_u16_length_prefixed!)
+  ~check(s.empty?)
+  seen: Map[U16, Bool] = {}
+  while !extensions.empty? {
+    extension = ~need(extensions.read_u16!)
+    ext_data = ~need(extensions.read_u16_length_prefixed!)
+    ~check(!seen.has_key?(extension))
+    seen[extension] = true
+    known = true
+    if extension == EXTENSION_STATUS_REQUEST {
+      m.ocsp_stapling = true
+    } else if extension == EXTENSION_SESSION_TICKET {
+      m.ticket_supported = true
+    } else if extension == EXTENSION_RENEGOTIATION_INFO {
+      m.secure_renegotiation = (~need(ext_data.read_u8_length_prefixed!)).bytes
+      m.secure_renegotiation_supported = true
+    } else if extension == EXTENSION_EXTENDED_MASTER_SECRET {
+      m.extended_master_secret = true
+    } else if extension == EXTENSION_ALPN {
+      proto_list = ~need(ext_data.read_u16_length_prefixed!)
+      ~check(!proto_list.empty?)
+      proto = ~need(proto_list.read_u8_length_prefixed!)
+      ~check(!proto.empty? && proto_list.empty?)
+      m.alpn_protocol = Str.from_bytes(proto.bytes)
+    } else if extension == EXTENSION_SCT {
+      sct_list = ~need(ext_data.read_u16_length_prefixed!)
+      ~check(!sct_list.empty?)
+      while !sct_list.empty? {
+        sct = ~need(sct_list.read_u16_length_prefixed!)
+        ~check(!sct.empty?)
+        m.scts << sct.bytes
+      }
+    } else if extension == EXTENSION_SUPPORTED_VERSIONS {
+      m.supported_version = ~need(ext_data.read_u16!)
+    } else if extension == EXTENSION_COOKIE {
+      c = ~need(ext_data.read_u16_length_prefixed!)
+      ~check(!c.empty?)
+      m.cookie = c.bytes
+    } else if extension == EXTENSION_KEY_SHARE {
+      # This extension has different formats in SH and HRR, accept either
+      # and let the handshake logic decide.
+      if ext_data.size == 2 {
+        m.selected_group = ~need(ext_data.read_u16!)
+      } else {
+        g = ~need(ext_data.read_u16!)
+        d = ~need(ext_data.read_u16_length_prefixed!)
+        m.server_share = KeyShare.new(group: g, data: d.bytes)
+      }
+    } else if extension == EXTENSION_PRE_SHARED_KEY {
+      m.selected_identity_present = true
+      m.selected_identity = ~need(ext_data.read_u16!)
+    } else if extension == EXTENSION_SUPPORTED_POINTS {
+      m.supported_points = (~need(ext_data.read_u8_length_prefixed!)).bytes
+      ~check(m.supported_points.size > 0)
+    } else if extension == EXTENSION_ENCRYPTED_CLIENT_HELLO {
+      m.encrypted_client_hello = ext_data.bytes + []
+      ext_data.skip!(ext_data.size)
+    } else if extension == EXTENSION_SERVER_NAME {
+      ~check(ext_data.size == 0)
+      m.server_name_ack = true
+    } else {
+      known = false
+    }
+    ~check(ext_data.empty?) if known
+  }
+  m
+}
+
+# ---------------------------------------------------------------- EncryptedExtensions
+
+pub struct EncryptedExtensionsMsg {
+  alpn_protocol: Str
+  quic_transport_parameters: [Byte]?
+  early_data: Bool
+  ech_retry_configs: [Byte]
+  server_name_ack: Bool
+
+  pub def marshal -> ~[Byte] {
+    m = self
+    b = cryptobyte.new_builder([])
+    b.add_u8!(TYPE_ENCRYPTED_EXTENSIONS)
+    b.add_u24_length_prefixed! { |c|
+      c.add_u16_length_prefixed! { |e|
+        if m.alpn_protocol.size > 0 {
+          e.add_u16!(EXTENSION_ALPN)
+          e.add_u16_length_prefixed! { |e2| e2.add_u16_length_prefixed! { |e3| e3.add_u8_length_prefixed! { |e4| e4.add_bytes!(m.alpn_protocol.bytes) } } }
+        }
+        if q = m.quic_transport_parameters {
+          e.add_u16!(EXTENSION_QUIC_TRANSPORT_PARAMETERS)
+          e.add_u16_length_prefixed! { |e2| e2.add_bytes!(q) }
+        }
+        if m.early_data {
+          e.add_u16!(EXTENSION_EARLY_DATA)
+          e.add_u16!(0)
+        }
+        if m.ech_retry_configs.size > 0 {
+          e.add_u16!(EXTENSION_ENCRYPTED_CLIENT_HELLO)
+          e.add_u16_length_prefixed! { |e2| e2.add_bytes!(m.ech_retry_configs) }
+        }
+        if m.server_name_ack {
+          e.add_u16!(EXTENSION_SERVER_NAME)
+          e.add_u16!(0)
+        }
+      }
+    }
+    b.~bytes
+  }
+
+  pub def self.unmarshal(data: [Byte]) -> EncryptedExtensionsMsg? { parse_encrypted_extensions(data).ok }
+}
+
+def parse_encrypted_extensions(data: [Byte]) -> ~EncryptedExtensionsMsg {
+  m = EncryptedExtensionsMsg.new
+  s = cryptobyte.string(data)
+  ~check(s.skip!(4))
+  extensions = ~need(s.read_u16_length_prefixed!)
+  ~check(s.empty?)
+  seen: Map[U16, Bool] = {}
+  while !extensions.empty? {
+    extension = ~need(extensions.read_u16!)
+    ext_data = ~need(extensions.read_u16_length_prefixed!)
+    ~check(!seen.has_key?(extension))
+    seen[extension] = true
+    known = true
+    if extension == EXTENSION_ALPN {
+      proto_list = ~need(ext_data.read_u16_length_prefixed!)
+      ~check(!proto_list.empty?)
+      proto = ~need(proto_list.read_u8_length_prefixed!)
+      ~check(!proto.empty? && proto_list.empty?)
+      m.alpn_protocol = Str.from_bytes(proto.bytes)
+    } else if extension == EXTENSION_QUIC_TRANSPORT_PARAMETERS {
+      m.quic_transport_parameters = ext_data.bytes + []
+      ext_data.skip!(ext_data.size)
+    } else if extension == EXTENSION_EARLY_DATA {
+      m.early_data = true
+    } else if extension == EXTENSION_ENCRYPTED_CLIENT_HELLO {
+      m.ech_retry_configs = ext_data.bytes + []
+      ext_data.skip!(ext_data.size)
+    } else if extension == EXTENSION_SERVER_NAME {
+      ~check(ext_data.size == 0)
+      m.server_name_ack = true
+    } else {
+      known = false
+    }
+    ~check(ext_data.empty?) if known
+  }
+  m
+}
+
+# ---------------------------------------------------------------- small messages
+
+pub struct EndOfEarlyDataMsg {
+  pub def marshal -> ~[Byte] { [TYPE_END_OF_EARLY_DATA, 0, 0, 0] }
+  pub def self.unmarshal(data: [Byte]) -> EndOfEarlyDataMsg? {
+    return EndOfEarlyDataMsg.new if data.size == 4
+    none
+  }
+}
+
+pub struct KeyUpdateMsg {
+  update_requested: Bool
+
+  pub def marshal -> ~[Byte] { [TYPE_KEY_UPDATE, 0, 0, 1, update_requested ? 1.as_u8 : 0.as_u8] }
+
+  pub def self.unmarshal(data: [Byte]) -> KeyUpdateMsg? {
+    s = cryptobyte.string(data)
+    return none if !s.skip!(4)
+    if u = s.read_u8! {
+      return none if !s.empty?
+      return KeyUpdateMsg.new(update_requested: false) if u == 0
+      return KeyUpdateMsg.new(update_requested: true) if u == 1
+    }
+    none
+  }
+}
+
+pub struct NewSessionTicketMsgTLS13 {
+  lifetime: U32
+  age_add: U32
+  nonce: [Byte]
+  label: [Byte]
+  max_early_data: U32
+
+  pub def marshal -> ~[Byte] {
+    m = self
+    b = cryptobyte.new_builder([])
+    b.add_u8!(TYPE_NEW_SESSION_TICKET)
+    b.add_u24_length_prefixed! { |c|
+      c.add_u32!(m.lifetime)
+      c.add_u32!(m.age_add)
+      c.add_u8_length_prefixed! { |c2| c2.add_bytes!(m.nonce) }
+      c.add_u16_length_prefixed! { |c2| c2.add_bytes!(m.label) }
+      c.add_u16_length_prefixed! { |c2|
+        if m.max_early_data > 0 {
+          c2.add_u16!(EXTENSION_EARLY_DATA)
+          c2.add_u16_length_prefixed! { |c3| c3.add_u32!(m.max_early_data) }
+        }
+      }
+    }
+    b.~bytes
+  }
+
+  pub def self.unmarshal(data: [Byte]) -> NewSessionTicketMsgTLS13? { parse_nst13(data).ok }
+}
+
+def parse_nst13(data: [Byte]) -> ~NewSessionTicketMsgTLS13 {
+  m = NewSessionTicketMsgTLS13.new
+  s = cryptobyte.string(data)
+  ~check(s.skip!(4))
+  m.lifetime = ~need(s.read_u32!)
+  m.age_add = ~need(s.read_u32!)
+  m.nonce = (~need(s.read_u8_length_prefixed!)).bytes
+  m.label = (~need(s.read_u16_length_prefixed!)).bytes
+  extensions = ~need(s.read_u16_length_prefixed!)
+  ~check(s.empty?)
+  while !extensions.empty? {
+    extension = ~need(extensions.read_u16!)
+    ext_data = ~need(extensions.read_u16_length_prefixed!)
+    if extension == EXTENSION_EARLY_DATA {
+      m.max_early_data = ~need(ext_data.read_u32!)
+      ~check(ext_data.empty?)
+    }
+  }
+  m
+}
+
+pub struct CertificateRequestMsgTLS13 {
+  ocsp_stapling: Bool
+  scts: Bool
+  supported_signature_algorithms: [U16]
+  supported_signature_algorithms_cert: [U16]
+  certificate_authorities: [[Byte]]
+
+  pub def marshal -> ~[Byte] {
+    m = self
+    b = cryptobyte.new_builder([])
+    b.add_u8!(TYPE_CERTIFICATE_REQUEST)
+    b.add_u24_length_prefixed! { |c|
+      # certificate_request_context (SHALL be zero length unless used for
+      # post-handshake authentication)
+      c.add_u8!(0)
+      c.add_u16_length_prefixed! { |e|
+        if m.ocsp_stapling {
+          e.add_u16!(EXTENSION_STATUS_REQUEST)
+          e.add_u16!(0)
+        }
+        if m.scts {
+          e.add_u16!(EXTENSION_SCT)
+          e.add_u16!(0)
+        }
+        if m.supported_signature_algorithms.size > 0 {
+          e.add_u16!(EXTENSION_SIGNATURE_ALGORITHMS)
+          e.add_u16_length_prefixed! { |e2| e2.add_u16_length_prefixed! { |e3| add_u16s(e3, m.supported_signature_algorithms) } }
+        }
+        if m.supported_signature_algorithms_cert.size > 0 {
+          e.add_u16!(EXTENSION_SIGNATURE_ALGORITHMS_CERT)
+          e.add_u16_length_prefixed! { |e2| e2.add_u16_length_prefixed! { |e3| add_u16s(e3, m.supported_signature_algorithms_cert) } }
+        }
+        if m.certificate_authorities.size > 0 {
+          e.add_u16!(EXTENSION_CERTIFICATE_AUTHORITIES)
+          e.add_u16_length_prefixed! { |e2|
+            e2.add_u16_length_prefixed! { |e3|
+              for ca in m.certificate_authorities {
+                e3.add_u16_length_prefixed! { |e4| e4.add_bytes!(ca) }
+              }
+            }
+          }
+        }
+      }
+    }
+    b.~bytes
+  }
+
+  pub def self.unmarshal(data: [Byte]) -> CertificateRequestMsgTLS13? { parse_cert_request13(data).ok }
+}
+
+def parse_cert_request13(data: [Byte]) -> ~CertificateRequestMsgTLS13 {
+  m = CertificateRequestMsgTLS13.new
+  s = cryptobyte.string(data)
+  ~check(s.skip!(4))
+  context = ~need(s.read_u8_length_prefixed!)
+  ~check(context.empty?)
+  extensions = ~need(s.read_u16_length_prefixed!)
+  ~check(s.empty?)
+  while !extensions.empty? {
+    extension = ~need(extensions.read_u16!)
+    ext_data = ~need(extensions.read_u16_length_prefixed!)
+    known = true
+    if extension == EXTENSION_STATUS_REQUEST {
+      m.ocsp_stapling = true
+    } else if extension == EXTENSION_SCT {
+      m.scts = true
+    } else if extension == EXTENSION_SIGNATURE_ALGORITHMS {
+      l = ~need(ext_data.read_u16_length_prefixed!)
+      ~check(!l.empty?)
+      m.supported_signature_algorithms = ~read_u16_list!(l)
+    } else if extension == EXTENSION_SIGNATURE_ALGORITHMS_CERT {
+      l = ~need(ext_data.read_u16_length_prefixed!)
+      ~check(!l.empty?)
+      m.supported_signature_algorithms_cert = ~read_u16_list!(l)
+    } else if extension == EXTENSION_CERTIFICATE_AUTHORITIES {
+      auths = ~need(ext_data.read_u16_length_prefixed!)
+      ~check(!auths.empty?)
+      while !auths.empty? {
+        ca = ~need(auths.read_u16_length_prefixed!)
+        ~check(!ca.empty?)
+        m.certificate_authorities << ca.bytes
+      }
+    } else {
+      known = false
+    }
+    ~check(ext_data.empty?) if known
+  }
+  m
+}
+
+pub struct CertificateMsg {
+  certificates: [[Byte]]
+
+  pub def marshal -> ~[Byte] {
+    i = 0
+    for c in certificates {
+      i += c.size
+    }
+    length = 3 + 3 * certificates.size + i
+    x: [Byte] = [TYPE_CERTIFICATE, (length >> 16).as_u8, (length >> 8).as_u8, length.as_u8]
+    co = length - 3
+    x = x + [(co >> 16).as_u8, (co >> 8).as_u8, co.as_u8]
+    for c in certificates {
+      x = x + [(c.size >> 16).as_u8, (c.size >> 8).as_u8, c.size.as_u8] + c
+    }
+    x
+  }
+
+  pub def self.unmarshal(data: [Byte]) -> CertificateMsg? {
+    return none if data.size < 7
+    certs_len = (data[4].to_i << 16) | (data[5].to_i << 8) | data[6].to_i
+    return none if data.size != certs_len + 7
+    out: [[Byte]] = []
+    d = data[7...data.size]
+    while certs_len > 0 {
+      return none if d.size < 4
+      cert_len = (d[0].to_i << 16) | (d[1].to_i << 8) | d[2].to_i
+      return none if d.size < 3 + cert_len
+      out << d[3...3 + cert_len]
+      d = d[3 + cert_len...d.size]
+      certs_len -= 3 + cert_len
+    }
+    CertificateMsg.new(certificates: out)
+  }
+}
+
+# A certificate chain with its TLS 1.3 per-certificate extensions (the
+# parts of Go's tls.Certificate that travel in a Certificate message).
+pub struct CertificateChain {
+  certificate: [[Byte]]
+  ocsp_staple: [Byte]?
+  signed_certificate_timestamps: [[Byte]]?
+}
+
+pub struct CertificateMsgTLS13 {
+  certificate: CertificateChain
+  ocsp_stapling: Bool
+  scts: Bool
+
+  pub def marshal -> ~[Byte] {
+    m = self
+    chain = m.certificate
+    chain.ocsp_staple = none if !m.ocsp_stapling
+    chain.signed_certificate_timestamps = none if !m.scts
+    b = cryptobyte.new_builder([])
+    b.add_u8!(TYPE_CERTIFICATE)
+    b.add_u24_length_prefixed! { |c|
+      # certificate_request_context
+      c.add_u8!(0)
+      marshal_certificate(c, certificate)
+    }
+    b.~bytes
+  }
+
+  pub def self.unmarshal(data: [Byte]) -> CertificateMsgTLS13? { parse_cert_msg13(data).ok }
+}
+
+def marshal_certificate(b: cryptobyte.Builder, certificate: CertificateChain) {
+  bb = b
+  bb.add_u24_length_prefixed! { |c|
+    i = 0
+    for cert in certificate.certificate {
+      c.add_u24_length_prefixed! { |c2| c2.add_bytes!(cert) }
+      first = i == 0
+      c.add_u16_length_prefixed! { |e|
+        if first {
+          # Extensions are only on the leaf certificate.
+          if staple = certificate.ocsp_staple {
+            e.add_u16!(EXTENSION_STATUS_REQUEST)
+            e.add_u16_length_prefixed! { |e2|
+              e2.add_u8!(STATUS_TYPE_OCSP)
+              e2.add_u24_length_prefixed! { |e3| e3.add_bytes!(staple) }
+            }
+          }
+          if scts = certificate.signed_certificate_timestamps {
+            e.add_u16!(EXTENSION_SCT)
+            e.add_u16_length_prefixed! { |e2|
+              e2.add_u16_length_prefixed! { |e3|
+                for sct in scts {
+                  e3.add_u16_length_prefixed! { |e4| e4.add_bytes!(sct) }
+                }
+              }
+            }
+          }
+        }
+      }
+      i += 1
+    }
+  }
+}
+
+def parse_cert_msg13(data: [Byte]) -> ~CertificateMsgTLS13 {
+  s = cryptobyte.string(data)
+  ~check(s.skip!(4))
+  context = ~need(s.read_u8_length_prefixed!)
+  ~check(context.empty?)
+  certificate, rest = ~unmarshal_certificate(s)
+  ~check(rest.empty?)
+  CertificateMsgTLS13.new(certificate: certificate, scts: certificate.signed_certificate_timestamps.some?, ocsp_stapling: certificate.ocsp_staple.some?)
+}
+
+# A certificate chain at the start of s, and the rest of s.
+def unmarshal_certificate(s0: cryptobyte.String) -> ~(CertificateChain, cryptobyte.String) {
+  s = s0
+  certificate = CertificateChain.new
+  cert_list = ~need(s.read_u24_length_prefixed!)
+  while !cert_list.empty? {
+    cert = ~need(cert_list.read_u24_length_prefixed!)
+    extensions = ~need(cert_list.read_u16_length_prefixed!)
+    certificate.certificate << cert.bytes
+    while !extensions.empty? {
+      extension = ~need(extensions.read_u16!)
+      ext_data = ~need(extensions.read_u16_length_prefixed!)
+      # Ignore extensions for non-leaf certificates.
+      next if certificate.certificate.size > 1
+      known = true
+      if extension == EXTENSION_STATUS_REQUEST {
+        status_type = ~need(ext_data.read_u8!)
+        ~check(status_type == STATUS_TYPE_OCSP)
+        staple = ~need(ext_data.read_u24_length_prefixed!)
+        ~check(!staple.empty?)
+        certificate.ocsp_staple = staple.bytes
+      } else if extension == EXTENSION_SCT {
+        sct_list = ~need(ext_data.read_u16_length_prefixed!)
+        ~check(!sct_list.empty?)
+        scts: [[Byte]] = certificate.signed_certificate_timestamps || []
+        while !sct_list.empty? {
+          sct = ~need(sct_list.read_u16_length_prefixed!)
+          ~check(!sct.empty?)
+          scts << sct.bytes
+        }
+        certificate.signed_certificate_timestamps = scts
+      } else {
+        known = false
+      }
+      ~check(ext_data.empty?) if known
+    }
+  }
+  (certificate, s)
+}
+
+pub struct ServerKeyExchangeMsg {
+  key: [Byte]
+
+  pub def marshal -> ~[Byte] {
+    l = key.size
+    [TYPE_SERVER_KEY_EXCHANGE, (l >> 16).as_u8, (l >> 8).as_u8, l.as_u8] + key
+  }
+
+  pub def self.unmarshal(data: [Byte]) -> ServerKeyExchangeMsg? {
+    return none if data.size < 4
+    ServerKeyExchangeMsg.new(key: data[4...data.size])
+  }
+}
+
+pub struct CertificateStatusMsg {
+  response: [Byte]
+
+  pub def marshal -> ~[Byte] {
+    m = self
+    b = cryptobyte.new_builder([])
+    b.add_u8!(TYPE_CERTIFICATE_STATUS)
+    b.add_u24_length_prefixed! { |c|
+      c.add_u8!(STATUS_TYPE_OCSP)
+      c.add_u24_length_prefixed! { |c2| c2.add_bytes!(m.response) }
+    }
+    b.~bytes
+  }
+
+  pub def self.unmarshal(data: [Byte]) -> CertificateStatusMsg? {
+    s = cryptobyte.string(data)
+    return none if !s.skip!(4)
+    if t = s.read_u8! {
+      return none if t != STATUS_TYPE_OCSP
+      if r = s.read_u24_length_prefixed! {
+        return CertificateStatusMsg.new(response: r.bytes) if r.size > 0 && s.empty?
+      }
+    }
+    none
+  }
+}
+
+pub struct ServerHelloDoneMsg {
+  pub def marshal -> ~[Byte] { [TYPE_SERVER_HELLO_DONE, 0, 0, 0] }
+  pub def self.unmarshal(data: [Byte]) -> ServerHelloDoneMsg? {
+    return ServerHelloDoneMsg.new if data.size == 4
+    none
+  }
+}
+
+pub struct ClientKeyExchangeMsg {
+  ciphertext: [Byte]
+
+  pub def marshal -> ~[Byte] {
+    l = ciphertext.size
+    [TYPE_CLIENT_KEY_EXCHANGE, (l >> 16).as_u8, (l >> 8).as_u8, l.as_u8] + ciphertext
+  }
+
+  pub def self.unmarshal(data: [Byte]) -> ClientKeyExchangeMsg? {
+    return none if data.size < 4
+    l = (data[1].to_i << 16) | (data[2].to_i << 8) | data[3].to_i
+    return none if l != data.size - 4
+    ClientKeyExchangeMsg.new(ciphertext: data[4...data.size])
+  }
+}
+
+pub struct FinishedMsg {
+  verify_data: [Byte]
+
+  pub def marshal -> ~[Byte] {
+    l = verify_data.size
+    [TYPE_FINISHED, (l >> 16).as_u8, (l >> 8).as_u8, l.as_u8] + verify_data
+  }
+
+  pub def self.unmarshal(data: [Byte]) -> FinishedMsg? {
+    s = cryptobyte.string(data)
+    return none if !s.skip!(1)
+    if v = s.read_u24_length_prefixed! {
+      return FinishedMsg.new(verify_data: v.bytes) if s.empty?
+    }
+    none
+  }
+}
+
+pub struct CertificateRequestMsg {
+  # Whether this message includes a list of supported signature
+  # algorithms (TLS 1.2).
+  has_signature_algorithm: Bool
+  certificate_types: [Byte]
+  supported_signature_algorithms: [U16]
+  certificate_authorities: [[Byte]]
+
+  pub def marshal -> ~[Byte] {
+    cas_length = 0
+    for ca in certificate_authorities {
+      cas_length += 2 + ca.size
+    }
+    length = 1 + certificate_types.size + 2 + cas_length
+    length += 2 + 2 * supported_signature_algorithms.size if has_signature_algorithm
+    x: [Byte] = [TYPE_CERTIFICATE_REQUEST, (length >> 16).as_u8, (length >> 8).as_u8, length.as_u8, certificate_types.size.as_u8]
+    x = x + certificate_types
+    if has_signature_algorithm {
+      n = supported_signature_algorithms.size * 2
+      x = x + [(n >> 8).as_u8, n.as_u8]
+      for a in supported_signature_algorithms {
+        x = x + [(a >> 8).as_u8, a.as_u8]
+      }
+    }
+    x = x + [(cas_length >> 8).as_u8, cas_length.as_u8]
+    for ca in certificate_authorities {
+      x = x + [(ca.size >> 8).as_u8, ca.size.as_u8] + ca
+    }
+    x
+  }
+
+  pub def self.unmarshal(data0: [Byte], has_signature_algorithm: Bool) -> CertificateRequestMsg? {
+    data = data0
+    return none if data.size < 5
+    length = (data[1].to_i << 16) | (data[2].to_i << 8) | data[3].to_i
+    return none if data.size - 4 != length
+    m = CertificateRequestMsg.new(has_signature_algorithm: has_signature_algorithm)
+    num_cert_types = data[4].to_i
+    data = data[5...data.size]
+    return none if num_cert_types == 0 || data.size <= num_cert_types
+    m.certificate_types = data[0...num_cert_types] + []
+    data = data[num_cert_types...data.size]
+    if has_signature_algorithm {
+      return none if data.size < 2
+      sl = (data[0].to_i << 8) | data[1].to_i
+      data = data[2...data.size]
+      return none if sl & 1 != 0 || sl == 0 || data.size < sl
+      i = 0
+      while i < sl / 2 {
+        m.supported_signature_algorithms << ((data[0].to_u16 << 8) | data[1].to_u16)
+        data = data[2...data.size]
+        i += 1
+      }
+    }
+    return none if data.size < 2
+    cas_length = (data[0].to_i << 8) | data[1].to_i
+    data = data[2...data.size]
+    return none if data.size < cas_length
+    cas = data[0...cas_length] + []
+    data = data[cas_length...data.size]
+    while cas.size > 0 {
+      return none if cas.size < 2
+      ca_len = (cas[0].to_i << 8) | cas[1].to_i
+      cas = cas[2...cas.size]
+      return none if cas.size < ca_len
+      m.certificate_authorities << cas[0...ca_len]
+      cas = cas[ca_len...cas.size]
+    }
+    return none if data.size != 0
+    m
+  }
+}
+
+pub struct CertificateVerifyMsg {
+  # format change introduced in TLS 1.2
+  has_signature_algorithm: Bool
+  signature_algorithm: U16
+  signature: [Byte]
+
+  pub def marshal -> ~[Byte] {
+    m = self
+    b = cryptobyte.new_builder([])
+    b.add_u8!(TYPE_CERTIFICATE_VERIFY)
+    b.add_u24_length_prefixed! { |c|
+      c.add_u16!(m.signature_algorithm) if m.has_signature_algorithm
+      c.add_u16_length_prefixed! { |c2| c2.add_bytes!(m.signature) }
+    }
+    b.~bytes
+  }
+
+  pub def self.unmarshal(data: [Byte], has_signature_algorithm: Bool) -> CertificateVerifyMsg? {
+    s = cryptobyte.string(data)
+    return none if !s.skip!(4)
+    m = CertificateVerifyMsg.new(has_signature_algorithm: has_signature_algorithm)
+    if has_signature_algorithm {
+      if a = s.read_u16! {
+        m.signature_algorithm = a
+      } else {
+        return none
+      }
+    }
+    if sig = s.read_u16_length_prefixed! {
+      m.signature = sig.bytes
+      return m if s.empty?
+    }
+    none
+  }
+}
+
+pub struct NewSessionTicketMsg {
+  ticket: [Byte]
+
+  pub def marshal -> ~[Byte] {
+    tl = ticket.size
+    length = 2 + 4 + tl
+    [TYPE_NEW_SESSION_TICKET, (length >> 16).as_u8, (length >> 8).as_u8, length.as_u8, 0, 0, 0, 0, (tl >> 8).as_u8, tl.as_u8] + ticket
+  }
+
+  pub def self.unmarshal(data: [Byte]) -> NewSessionTicketMsg? {
+    return none if data.size < 10
+    length = (data[1].to_i << 16) | (data[2].to_i << 8) | data[3].to_i
+    return none if data.size - 4 != length
+    tl = (data[8].to_i << 8) + data[9].to_i
+    return none if data.size - 10 != tl
+    NewSessionTicketMsg.new(ticket: data[10...data.size])
+  }
+}
+
+pub struct HelloRequestMsg {
+  pub def marshal -> ~[Byte] { [TYPE_HELLO_REQUEST, 0, 0, 0] }
+  pub def self.unmarshal(data: [Byte]) -> HelloRequestMsg? {
+    return HelloRequestMsg.new if data.size == 4
+    none
+  }
+}
+
+# Any handshake message (Go's handshakeMessage values).
+pub enum HandshakeMessage {
+  HelloRequest(HelloRequestMsg)
+  ClientHello(ClientHelloMsg)
+  ServerHello(ServerHelloMsg)
+  NewSessionTicket(NewSessionTicketMsg)
+  NewSessionTicket13(NewSessionTicketMsgTLS13)
+  EndOfEarlyData(EndOfEarlyDataMsg)
+  EncryptedExtensions(EncryptedExtensionsMsg)
+  Certificate(CertificateMsg)
+  Certificate13(CertificateMsgTLS13)
+  ServerKeyExchange(ServerKeyExchangeMsg)
+  CertificateRequest(CertificateRequestMsg)
+  CertificateRequest13(CertificateRequestMsgTLS13)
+  ServerHelloDone(ServerHelloDoneMsg)
+  CertificateVerify(CertificateVerifyMsg)
+  ClientKeyExchange(ClientKeyExchangeMsg)
+  Finished(FinishedMsg)
+  CertificateStatus(CertificateStatusMsg)
+  KeyUpdate(KeyUpdateMsg)
+
+  pub def marshal -> ~[Byte] {
+    r: [Byte] = []
+    case self {
+      HelloRequest(m) => {r = m.~marshal}
+      ClientHello(m) => {r = m.~marshal}
+      ServerHello(m) => {r = m.~marshal}
+      NewSessionTicket(m) => {r = m.~marshal}
+      NewSessionTicket13(m) => {r = m.~marshal}
+      EndOfEarlyData(m) => {r = m.~marshal}
+      EncryptedExtensions(m) => {r = m.~marshal}
+      Certificate(m) => {r = m.~marshal}
+      Certificate13(m) => {r = m.~marshal}
+      ServerKeyExchange(m) => {r = m.~marshal}
+      CertificateRequest(m) => {r = m.~marshal}
+      CertificateRequest13(m) => {r = m.~marshal}
+      ServerHelloDone(m) => {r = m.~marshal}
+      CertificateVerify(m) => {r = m.~marshal}
+      ClientKeyExchange(m) => {r = m.~marshal}
+      Finished(m) => {r = m.~marshal}
+      CertificateStatus(m) => {r = m.~marshal}
+      KeyUpdate(m) => {r = m.~marshal}
+    }
+    r
+  }
+
+  # The original bytes, for the messages that keep them (Go's
+  # handshakeMessageWithOriginalBytes).
+  pub def original_bytes -> [Byte] {
+    case self {
+      ClientHello(m) => m.original
+      ServerHello(m) => m.original
+      _ => []
+    }
+  }
+
+  # Go's %T of the message, for errors.
+  pub def type_name -> Str {
+    case self {
+      HelloRequest(_) => "*tls.helloRequestMsg"
+      ClientHello(_) => "*tls.clientHelloMsg"
+      ServerHello(_) => "*tls.serverHelloMsg"
+      NewSessionTicket(_) => "*tls.newSessionTicketMsg"
+      NewSessionTicket13(_) => "*tls.newSessionTicketMsgTLS13"
+      EndOfEarlyData(_) => "*tls.endOfEarlyDataMsg"
+      EncryptedExtensions(_) => "*tls.encryptedExtensionsMsg"
+      Certificate(_) => "*tls.certificateMsg"
+      Certificate13(_) => "*tls.certificateMsgTLS13"
+      ServerKeyExchange(_) => "*tls.serverKeyExchangeMsg"
+      CertificateRequest(_) => "*tls.certificateRequestMsg"
+      CertificateRequest13(_) => "*tls.certificateRequestMsgTLS13"
+      ServerHelloDone(_) => "*tls.serverHelloDoneMsg"
+      CertificateVerify(_) => "*tls.certificateVerifyMsg"
+      ClientKeyExchange(_) => "*tls.clientKeyExchangeMsg"
+      Finished(_) => "*tls.finishedMsg"
+      CertificateStatus(_) => "*tls.certificateStatusMsg"
+      KeyUpdate(_) => "*tls.keyUpdateMsg"
+    }
+  }
+}

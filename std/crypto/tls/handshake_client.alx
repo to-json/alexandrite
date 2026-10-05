@@ -1,0 +1,684 @@
+# The client handshake, TLS 1.0-1.2 (Go's handshake_client.go).
+
+import "crypto"
+import "crypto/subtle"
+import "crypto/x509"
+import "hash"
+import "time"
+
+# Sends an alert and gives an error with Go's text for the failure.
+def alert_err(c: Conn, a: Int, msg: Str) -> TlsError {
+  cc = c
+  cc.send_alert!(a)
+  TlsError.Msg(msg)
+}
+
+# Go's makeClientHello: the hello and the TLS 1.3 key share private keys.
+def make_client_hello(c0: Conn) -> ~(ClientHelloMsg, KeySharePrivateKeys?) {
+  c = c0
+  config = c.config
+  if config.server_name.size == 0 && !config.insecure_skip_verify {
+    fail TlsError.Msg("tls: either ServerName or InsecureSkipVerify must be specified in the tls.Config")
+  }
+  next_protos_length = 0
+  for proto in config.next_protos {
+    l = proto.size
+    fail TlsError.Msg("tls: invalid NextProtos value") if l == 0 || l > 255
+    next_protos_length += 1 + l
+  }
+  fail TlsError.Msg("tls: NextProtos values too large") if next_protos_length > 0xffff
+  supported_versions = config.supported_versions_for(true)
+  fail TlsError.Msg("tls: no supported versions satisfy MinVersion and MaxVersion") if supported_versions.size == 0
+  max_version = supported_versions[0]
+  min_version = supported_versions[supported_versions.size - 1]
+  hello = ClientHelloMsg.new(vers: max_version, compression_methods: [COMPRESSION_NONE], extended_master_secret: true, ocsp_stapling: true, scts: true, server_name: hostname_in_sni(config.server_name), supported_curves: config.curve_preferences_for(max_version), supported_points: [POINT_FORMAT_UNCOMPRESSED], secure_renegotiation_supported: true, alpn_protocols: config.next_protos, supported_versions: supported_versions)
+  # The version at the beginning of the ClientHello was capped at TLS 1.2
+  # for compatibility reasons. The supported_versions extension is used to
+  # negotiate versions now. See RFC 8446, Section 4.2.1.
+  hello.vers = VERSION_TLS12 if hello.vers > VERSION_TLS12
+  hello.secure_renegotiation = c.st[0].client_finished if c.st[0].handshakes > 0
+  hello.cipher_suites = config.cipher_suite_list(HAS_AES_GCM_HARDWARE_SUPPORT)
+  # Don't advertise TLS 1.2-only cipher suites unless we're attempting TLS
+  # 1.2.
+  if max_version < VERSION_TLS12 {
+    hello.cipher_suites = hello.cipher_suites.select { ((cipher_suite_by_id(it) || CipherSuiteImpl.new).flags & SUITE_TLS12) == 0 }.to_a
+  }
+  rr = config.rand_bytes(32)
+  if e = rr.err {
+    fail TlsError.Msg("tls: short read from Rand: " + e.message)
+  }
+  hello.random = rr.unwrap
+  # A random session ID is used to detect when the server accepted a ticket
+  # and is resuming a session (see RFC 5077). In TLS 1.3, it's always set
+  # as a compatibility measure (see RFC 8446, Section 4.1.2).
+  sr = config.rand_bytes(32)
+  if e = sr.err {
+    fail TlsError.Msg("tls: short read from Rand: " + e.message)
+  }
+  hello.session_id = sr.unwrap
+  if max_version >= VERSION_TLS12 {
+    hello.supported_signature_algorithms = supported_signature_algorithms(min_version, max_version)
+    hello.supported_signature_algorithms_cert = supported_signature_algorithms_cert(min_version, max_version)
+  }
+  key_share_keys: KeySharePrivateKeys? = none
+  if max_version >= VERSION_TLS13 {
+    # Reset the list of ciphers when the client only supports TLS 1.3.
+    hello.cipher_suites = [] if min_version >= VERSION_TLS13
+    hello.cipher_suites = hello.cipher_suites + (HAS_AES_GCM_HARDWARE_SUPPORT ? default_cipher_suites_tls13() : default_cipher_suites_tls13_no_aes())
+    fail TlsError.Msg("tls: no supported key exchange methods (CurveIDs)") if hello.supported_curves.size == 0
+    curve_id = hello.supported_curves[0]
+    fail TlsError.Msg("tls: internal error: supportsCurve accepted unimplemented curve") if !known_key_exchange?(curve_id)
+    keys, shares = ~key_shares(curve_id, config.rand_reader)
+    key_share_keys = keys
+    hello.key_shares = shares
+    # Only send the fallback ECDH share if the corresponding CurveID is
+    # enabled.
+    if shares.size == 2 && !hello.supported_curves.include?(shares[1].group) {
+      hello.key_shares = shares[0...1]
+    }
+  }
+  (hello, key_share_keys)
+}
+
+# Go's clientHandshake.
+def client_handshake(c0: Conn) -> ~Unit {
+  c = c0
+  c.st[0].did_resume = false
+  c.st[0].curve_id = 0
+  hello, key_share_keys = ~make_client_hello(c)
+  hello2, session, early_secret, binder_key = ~load_session_for(c, hello)
+  hello = hello2
+  hr = client_handshake_after_hello(c, hello, key_share_keys, session, early_secret, binder_key)
+  if e = hr.err {
+    if session.some? {
+      # If we had a successful handshake and hs.session is different from
+      # the one already cached - cache a new one. If we got a handshake
+      # failure, remove the cached session.
+      if cache = c.config.client_session_cache {
+        key = client_session_cache_key(c)
+        cache.put(key, none) if key != ""
+      }
+    }
+    fail e
+  }
+}
+
+def client_handshake_after_hello(c0: Conn, hello0: ClientHelloMsg, key_share_keys: KeySharePrivateKeys?, session: SessionState?, early_secret: EarlySecret?, binder_key: [Byte]) -> ~Unit {
+  c = c0
+  hello = hello0
+  c.st[0].server_name = hello.server_name
+  hello_bytes = c.~write_handshake_record!(HandshakeMessage.ClientHello(hello))
+  hello.original = hello_bytes
+  msg, _ = c.~read_handshake!
+  server_hello = ServerHelloMsg.new
+  case msg {
+    ServerHello(m) => {
+      server_hello = m
+    }
+    _ => {
+      c.send_alert!(ALERT_UNEXPECTED_MESSAGE)
+      fail unexpected_message_error("*tls.serverHelloMsg", msg)
+    }
+  }
+  ~pick_tls_version(c, server_hello)
+  # If we are negotiating a protocol version that's lower than what we
+  # support, check for the server downgrade canaries. See RFC 8446,
+  # Section 4.1.3.
+  max_vers = c.config.max_supported_version(true)
+  canary = Str.from_bytes(server_hello.random[24...32])
+  tls12_downgrade = canary == DOWNGRADE_CANARY_TLS12
+  tls11_downgrade = canary == DOWNGRADE_CANARY_TLS11
+  if (max_vers == VERSION_TLS13 && c.vers <= VERSION_TLS12 && (tls12_downgrade || tls11_downgrade)) || (max_vers == VERSION_TLS12 && c.vers <= VERSION_TLS11 && tls11_downgrade) {
+    fail alert_err(c, ALERT_ILLEGAL_PARAMETER, "tls: downgrade attempt detected, possibly due to a MitM attack or a broken middlebox")
+  }
+  if c.vers == VERSION_TLS13 {
+    hs = ClientHandshakeStateTLS13.new(c: c, server_hello: server_hello, hello: hello, key_share_keys: key_share_keys || KeySharePrivateKeys.new, session: session, early_secret: early_secret, binder_key: binder_key, transcript: new_transcript(crypto.Hash.SHA256))
+    return hs.~handshake!
+  }
+  hs12 = ClientHandshakeState.new(c: c, server_hello: server_hello, hello: hello, session: session)
+  hs12.~handshake!
+}
+
+# Go's pickTLSVersion.
+def pick_tls_version(c0: Conn, server_hello: ServerHelloMsg) -> ~Unit {
+  c = c0
+  peer_version = server_hello.vers
+  peer_version = server_hello.supported_version if server_hello.supported_version != 0
+  if v = c.config.mutual_version(true, [peer_version]) {
+    c.st[0].vers = v
+    c.st[0].have_vers = true
+    c.st[0].in.version = v
+    c.st[0].out.version = v
+    return
+  }
+  fail alert_err(c, ALERT_PROTOCOL_VERSION, "tls: server selected unsupported protocol version " + strconv_hex(peer_version.to_i))
+}
+
+# Go's clientSessionCacheKey.
+def client_session_cache_key(c: Conn) -> Str {
+  return c.config.server_name if c.config.server_name.size > 0
+  c.remote_addr
+}
+
+# Go's checkALPN.
+def check_alpn(client_protos: [Str], server_proto: Str) -> ~Unit {
+  return if server_proto == ""
+  fail TlsError.Msg("tls: server advertised unrequested ALPN extension") if client_protos.size == 0
+  return if client_protos.include?(server_proto)
+  fail TlsError.Msg("tls: server selected unadvertised ALPN protocol")
+}
+
+# Go's verifyServerCertificate.
+def verify_server_certificate(c0: Conn, certificates: [[Byte]]) -> ~Unit {
+  c = c0
+  config = c.config
+  certs: [x509.Certificate] = []
+  for der in certificates {
+    r = x509.parse_certificate(der)
+    if e = r.err {
+      c.send_alert!(ALERT_DECODE_ERROR)
+      fail TlsError.Msg("tls: failed to parse certificate from server: " + e.message)
+    }
+    cert = r.unwrap
+    case cert.public_key {
+      Rsa(k) => {
+        if k.n.bit_len > DEFAULT_MAX_RSA_KEY_SIZE {
+          fail alert_err(c, ALERT_BAD_CERTIFICATE, "tls: server sent certificate containing RSA key larger than #{DEFAULT_MAX_RSA_KEY_SIZE} bits")
+        }
+      }
+      _ => nil
+    }
+    certs << cert
+  }
+  if !config.insecure_skip_verify {
+    opts = x509.VerifyOptions.new(roots: config.root_cas, current_time: config.now, dns_name: config.server_name, intermediates: x509.new_cert_pool())
+    pool = x509.new_cert_pool()
+    for cert in certs[1...certs.size] {
+      pool.add_cert!(cert)
+    }
+    opts.intermediates = pool
+    r = certs[0].verify(opts)
+    if e = r.err {
+      c.send_alert!(ALERT_BAD_CERTIFICATE)
+      fail TlsError.Msg("tls: failed to verify certificate: " + e.message)
+    }
+    c.st[0].verified_chains = r.unwrap
+  }
+  case certs[0].public_key {
+    Rsa(_) => nil
+    Ecdsa(_) => nil
+    Ed25519(_) => nil
+    MlDsa(_) => {
+      if c.vers < VERSION_TLS13 {
+        fail alert_err(c, ALERT_ILLEGAL_PARAMETER, "tls: server's certificate uses ML-DSA, which requires TLS 1.3")
+      }
+    }
+    _ => {
+      fail alert_err(c, ALERT_UNSUPPORTED_CERTIFICATE, "tls: server's certificate contains an unsupported type of public key: " + key_type_name(certs[0].public_key))
+    }
+  }
+  c.st[0].peer_certificates = certs
+  if f = config.verify_peer_certificate {
+    vr = f.call(certificates, c.st[0].verified_chains)
+    if e = vr.err {
+      c.send_alert!(ALERT_BAD_CERTIFICATE)
+      fail e
+    }
+  }
+  if vcf = config.verify_connection {
+    vcr = vcf.call(c.connection_state)
+    if e = vcr.err {
+      c.send_alert!(ALERT_BAD_CERTIFICATE)
+      fail e
+    }
+  }
+}
+
+DEFAULT_MAX_RSA_KEY_SIZE = 8192
+
+# Go's certificateRequestInfoFromMsg.
+def certificate_request_info_from_msg(vers: U16, cert_req: CertificateRequestMsg) -> CertificateRequestInfo {
+  cri = CertificateRequestInfo.new(acceptable_cas: cert_req.certificate_authorities, version: vers)
+  rsa_avail = false
+  ec_avail = false
+  for t in cert_req.certificate_types {
+    rsa_avail = true if t == CERT_TYPE_RSA_SIGN
+    ec_avail = true if t == CERT_TYPE_ECDSA_SIGN
+  }
+  if !cert_req.has_signature_algorithm {
+    # Prior to TLS 1.2, signature schemes did not exist. In this case we
+    # make up a list based on the acceptable certificate types, to help
+    # GetClientCertificate and SupportsCertificate select the right
+    # certificate. The hash part of the SignatureScheme is a lie here,
+    # because TLS 1.0 and 1.1 always use MD5+SHA1 for RSA and SHA1 for
+    # ECDSA.
+    if rsa_avail && ec_avail {
+      cri.signature_schemes = [ECDSA_WITH_P256_AND_SHA256, ECDSA_WITH_P384_AND_SHA384, ECDSA_WITH_P521_AND_SHA512, PKCS1_WITH_SHA256, PKCS1_WITH_SHA384, PKCS1_WITH_SHA512, PKCS1_WITH_SHA1]
+    } else if rsa_avail {
+      cri.signature_schemes = [PKCS1_WITH_SHA256, PKCS1_WITH_SHA384, PKCS1_WITH_SHA512, PKCS1_WITH_SHA1]
+    } else if ec_avail {
+      cri.signature_schemes = [ECDSA_WITH_P256_AND_SHA256, ECDSA_WITH_P384_AND_SHA384, ECDSA_WITH_P521_AND_SHA512]
+    }
+    return cri
+  }
+  # Filter the signature schemes based on the certificate types. See RFC
+  # 5246, Section 7.4.4 (where it calls this "somewhat complicated").
+  for s in cert_req.supported_signature_algorithms {
+    if r = type_and_hash_from_signature_scheme(s).ok {
+      t, _ = r
+      if t == SIGNATURE_ECDSA || t == SIGNATURE_ED25519 {
+        cri.signature_schemes << s if ec_avail
+      } else if t == SIGNATURE_RSAPSS || t == SIGNATURE_PKCS1V15 {
+        cri.signature_schemes << s if rsa_avail
+      }
+    }
+  }
+  cri
+}
+
+# Go's getClientCertificate: the configured chain to send (maybe empty).
+def get_client_certificate(c: Conn, cri: CertificateRequestInfo) -> ~Certificate {
+  config = c.config
+  if f = config.get_client_certificate {
+    return f.~call(cri)
+  }
+  for chain in config.certificates {
+    return chain if cri.supports_certificate(chain).ok?
+  }
+  # No acceptable certificate found. Don't send a certificate.
+  Certificate.new
+}
+
+# Go's clientHandshakeState.
+struct ClientHandshakeState {
+  c: Conn
+  server_hello: ServerHelloMsg
+  hello: ClientHelloMsg
+  suite: CipherSuiteImpl
+  finished_hash: FinishedHash
+  master_secret: [Byte]
+  # the session being resumed
+  session: SessionState?
+  # a fresh ticket received during this handshake
+  ticket: [Byte]?
+
+  def handshake! -> ~Unit {
+    cc = c
+    # If we did not load a session (hs.session == nil), but we did set a
+    # session ID in the transmitted client hello (hs.hello.sessionId != nil),
+    # it means we tried to negotiate TLS 1.3 and sent a random session ID
+    # as a compatibility measure (see RFC 8446, Section 4.1.2).
+    #
+    # Since we're now handshaking for TLS 1.2, if the server echoed the
+    # random session ID we sent, it is likely attempting to resume a
+    # session.
+    if session.none? && hello.session_id.size > 0 && hello.session_id == server_hello.session_id {
+      fail alert_err(cc, ALERT_ILLEGAL_PARAMETER, "tls: server echoed TLS 1.3 compatibility session ID in TLS 1.2")
+    }
+    is_resume = self.~process_server_hello!
+    self.finished_hash = new_finished_hash(cc.vers, suite)
+    # No signatures of the handshake are needed in a resumption. Otherwise,
+    # in a full handshake, if we don't have any certificates configured
+    # then we will never send a CertificateVerify message and thus no
+    # signatures are needed in that case either.
+    if is_resume || (cc.config.certificates.size == 0 && cc.config.get_client_certificate.none?) {
+      self.finished_hash.discard_handshake_buffer!
+    }
+    self.finished_hash.write!(hello.original)
+    self.finished_hash.write!(server_hello.original)
+    cc.st[0].buffering = true
+    cc.st[0].did_resume = is_resume
+    if is_resume {
+      self.~establish_keys!
+      self.~read_session_ticket!
+      cc.st[0].server_finished = ~self.read_finished!
+      cc.st[0].client_finished_is_first = false
+      # Make sure the connection is still being verified whether or not
+      # this is a resumption. Resumptions currently don't reverify
+      # certificates so they don't call verifyServerCertificate. See Issue
+      # 31641.
+      if vcf = cc.config.verify_connection {
+        vcr = vcf.call(cc.connection_state)
+        if e = vcr.err {
+          cc.send_alert!(ALERT_BAD_CERTIFICATE)
+          fail e
+        }
+      }
+      cc.st[0].client_finished = ~self.send_finished!
+      cc.~flush!
+    } else {
+      self.~do_full_handshake!
+      self.~establish_keys!
+      cc.st[0].client_finished = ~self.send_finished!
+      cc.~flush!
+      cc.st[0].client_finished_is_first = true
+      self.~read_session_ticket!
+      cc.st[0].server_finished = ~self.read_finished!
+    }
+    self.~save_session_ticket!
+    cc.st[0].ekm = Ekm.new(kind: EKM_TLS12, version: cc.vers, suite: suite, master_secret: master_secret, client_random: hello.random, server_random: server_hello.random)
+    cc.st[0].handshake_complete = true
+  }
+
+  def pick_cipher_suite! -> ~Unit {
+    cc = c
+    if s = mutual_cipher_suite(hello.cipher_suites, server_hello.cipher_suite) {
+      self.suite = s
+      cc.st[0].cipher_suite = s.id
+      return
+    }
+    fail alert_err(cc, ALERT_HANDSHAKE_FAILURE, "tls: server chose an unconfigured cipher suite")
+  }
+
+  def read_hs!(record: Bool) -> ~HandshakeMessage {
+    cc = c
+    msg, data = cc.~read_handshake!
+    self.finished_hash.write!(data) if record
+    msg
+  }
+
+  def do_full_handshake! -> ~Unit {
+    cc = c
+    msg = ~self.read_hs!(true)
+    cert_msg = CertificateMsg.new
+    case msg {
+      Certificate(m) => {
+        cert_msg = m
+      }
+      _ => nil
+    }
+    if cert_msg.certificates.size == 0 {
+      cc.send_alert!(ALERT_UNEXPECTED_MESSAGE)
+      fail unexpected_message_error("*tls.certificateMsg", msg)
+    }
+    msg = ~self.read_hs!(true)
+    case msg {
+      CertificateStatus(cs) => {
+        # RFC4366 on Certificate Status Request: The server MAY return a
+        # "certificate_status" message.
+        if !server_hello.ocsp_stapling {
+          # If a server returns a "CertificateStatus" message, then the
+          # server MUST have included an extension of type
+          # "status_request" with empty "extension_data" in the extended
+          # server hello.
+          fail alert_err(cc, ALERT_UNEXPECTED_MESSAGE, "tls: received unexpected CertificateStatus message")
+        }
+        cc.st[0].ocsp_response = cs.response
+        msg = ~self.read_hs!(true)
+      }
+      _ => nil
+    }
+    if cc.st[0].handshakes == 0 {
+      # If this is the first handshake on a connection, process and
+      # (optionally) verify the server's certificates.
+      ~verify_server_certificate(cc, cert_msg.certificates)
+    } else {
+      # This is a renegotiation handshake. We require that the server's
+      # identity (i.e. leaf certificate) is unchanged and thus any previous
+      # trust decision is still valid.
+      #
+      # See https://mitls.org/pages/attacks/3SHAKE for the motivation
+      # behind this requirement.
+      if cc.st[0].peer_certificates[0].raw != cert_msg.certificates[0] {
+        fail alert_err(cc, ALERT_BAD_CERTIFICATE, "tls: server's identity changed during renegotiation")
+      }
+    }
+    ka = key_agreement_for(suite, cc.vers)
+    case msg {
+      ServerKeyExchange(skx) => {
+        r = ka.process_server_key_exchange!(cc.config, hello, server_hello, cc.st[0].peer_certificates[0], skx)
+        if e = r.err {
+          cc.send_alert!(ALERT_ILLEGAL_PARAMETER)
+          fail e
+        }
+        if ka.ecdhe {
+          cc.st[0].curve_id = ka.curve_id
+          cc.st[0].peer_sig_alg = ka.signature_algorithm
+        }
+        msg = ~self.read_hs!(true)
+      }
+      _ => nil
+    }
+    chain_to_send: Certificate? = none
+    cert_requested = false
+    cert_req = CertificateRequestMsg.new
+    case msg {
+      CertificateRequest(m) => {
+        cert_requested = true
+        cert_req = m
+        cri = certificate_request_info_from_msg(cc.vers, m)
+        r = get_client_certificate(cc, cri)
+        if e = r.err {
+          cc.send_alert!(ALERT_INTERNAL_ERROR)
+          fail e
+        }
+        chain_to_send = r.unwrap
+        msg = ~self.read_hs!(true)
+      }
+      _ => nil
+    }
+    if ch = chain_to_send {
+      cc.st[0].local_certificate = ch.certificate
+    }
+    case msg {
+      ServerHelloDone(_) => nil
+      _ => {
+        cc.send_alert!(ALERT_UNEXPECTED_MESSAGE)
+        fail unexpected_message_error("*tls.serverHelloDoneMsg", msg)
+      }
+    }
+    # If the server requested a certificate then we have to send a
+    # Certificate message, even if it's empty because we don't have a
+    # certificate to send.
+    if cert_requested {
+      certs = (chain_to_send || Certificate.new).certificate
+      data = cc.~write_handshake_record!(HandshakeMessage.Certificate(CertificateMsg.new(certificates: certs)))
+      self.finished_hash.write!(data)
+    }
+    pkr = ka.generate_client_key_exchange(cc.config, hello, cc.st[0].peer_certificates[0])
+    if e = pkr.err {
+      cc.send_alert!(ALERT_INTERNAL_ERROR)
+      fail e
+    }
+    pre_master_secret, ckx = pkr.unwrap
+    data = cc.~write_handshake_record!(HandshakeMessage.ClientKeyExchange(ckx))
+    self.finished_hash.write!(data)
+    if server_hello.extended_master_secret {
+      cc.st[0].ext_master_secret = true
+      self.master_secret = ext_master_from_pre_master_secret(cc.vers, suite, pre_master_secret, self.finished_hash.sum)
+    } else {
+      self.master_secret = master_from_pre_master_secret(cc.vers, suite, pre_master_secret, hello.random, server_hello.random)
+    }
+    kl = cc.config.write_key_log(KEY_LOG_LABEL_TLS12, hello.random, master_secret)
+    if e = kl.err {
+      cc.send_alert!(ALERT_INTERNAL_ERROR)
+      fail TlsError.Msg("tls: failed to write to key log: " + e.message)
+    }
+    if ch = chain_to_send {
+      if ch.certificate.size > 0 {
+        cv = CertificateVerifyMsg.new
+        if !ch.private_key.signer? {
+          fail alert_err(cc, ALERT_INTERNAL_ERROR, "tls: client certificate private key of type " + private_key_type_name(ch.private_key) + " does not implement crypto.Signer")
+        }
+        if cc.vers >= VERSION_TLS12 {
+          sr = select_signature_scheme(cc.vers, ch, cert_req.supported_signature_algorithms)
+          if e = sr.err {
+            cc.send_alert!(ALERT_HANDSHAKE_FAILURE)
+            fail e
+          }
+          alg = sr.unwrap
+          th = type_and_hash_from_signature_scheme(alg)
+          fail cc.send_alert!(ALERT_INTERNAL_ERROR) if !th.ok?
+          sig_type, sig_hash = th.unwrap
+          cv.has_signature_algorithm = true
+          cv.signature_algorithm = alg
+          if !finished_hash.keep_buffer {
+            fail alert_err(cc, ALERT_INTERNAL_ERROR, "tls: internal error: did not keep handshake transcript for TLS 1.2")
+          }
+          s = sign_handshake(ch.private_key, cc.config.rand_reader, finished_hash.buffer, sig_type, sig_hash)
+          if e = s.err {
+            cc.send_alert!(ALERT_INTERNAL_ERROR)
+            fail e
+          }
+          cv.signature = s.unwrap
+        } else {
+          lr = legacy_type_and_hash_from_public_key(ch.private_key.public)
+          if e = lr.err {
+            cc.send_alert!(ALERT_ILLEGAL_PARAMETER)
+            fail e
+          }
+          sig_type, sig_hash = lr.unwrap
+          signed = finished_hash.hash_for_client_certificate(sig_type)
+          s = ch.private_key.sign(cc.config.rand_reader, signed, sig_hash || crypto.Hash.SHA256)
+          if e = s.err {
+            cc.send_alert!(ALERT_INTERNAL_ERROR)
+            fail e
+          }
+          cv.signature = s.unwrap
+        }
+        data2 = cc.~write_handshake_record!(HandshakeMessage.CertificateVerify(cv))
+        self.finished_hash.write!(data2)
+      }
+    }
+    self.finished_hash.discard_handshake_buffer!
+  }
+
+  def establish_keys! -> ~Unit {
+    cc = c
+    kb = keys_from_master_secret(cc.vers, suite, master_secret, hello.random, server_hello.random, suite.mac_len, suite.key_len, suite.iv_len)
+    client_cipher = suite_cipher(suite, kb.client_key, kb.client_iv, false)
+    server_cipher = suite_cipher(suite, kb.server_key, kb.server_iv, true)
+    cc.st[0].in.prepare_cipher_spec!(cc.vers, server_cipher, suite_mac(suite, kb.server_mac))
+    cc.st[0].out.prepare_cipher_spec!(cc.vers, client_cipher, suite_mac(suite, kb.client_mac))
+  }
+
+  def server_resumed_session? -> Bool {
+    # If the server responded with the same sessionId then it means the
+    # sessionTicket is being used to resume a TLS session.
+    session.some? && hello.session_id.size > 0 && server_hello.session_id == hello.session_id
+  }
+
+  def process_server_hello! -> ~Bool {
+    cc = c
+    self.~pick_cipher_suite!
+    if server_hello.compression_method != COMPRESSION_NONE {
+      fail alert_err(cc, ALERT_ILLEGAL_PARAMETER, "tls: server selected unsupported compression format")
+    }
+    supports_point_format = false
+    offered_non_compressed_format = false
+    for format in server_hello.supported_points {
+      if format == POINT_FORMAT_UNCOMPRESSED {
+        supports_point_format = true
+      } else {
+        offered_non_compressed_format = true
+      }
+    }
+    if !supports_point_format && offered_non_compressed_format {
+      fail TlsError.Msg("tls: server offered only incompatible point formats")
+    }
+    if cc.st[0].handshakes == 0 && server_hello.secure_renegotiation_supported {
+      cc.st[0].secure_renegotiation = true
+      if server_hello.secure_renegotiation.size != 0 {
+        fail alert_err(cc, ALERT_HANDSHAKE_FAILURE, "tls: initial handshake had non-empty renegotiation extension")
+      }
+    }
+    if cc.st[0].handshakes > 0 && cc.st[0].secure_renegotiation {
+      expected = cc.st[0].client_finished + cc.st[0].server_finished
+      if server_hello.secure_renegotiation != expected {
+        fail alert_err(cc, ALERT_HANDSHAKE_FAILURE, "tls: incorrect renegotiation extension contents")
+      }
+    }
+    ar = check_alpn(hello.alpn_protocols, server_hello.alpn_protocol)
+    if e = ar.err {
+      cc.send_alert!(ALERT_UNSUPPORTED_EXTENSION)
+      fail e
+    }
+    cc.st[0].client_protocol = server_hello.alpn_protocol
+    cc.st[0].scts = server_hello.scts
+    return false if !self.server_resumed_session?
+    s = session || SessionState.new
+    fail alert_err(cc, ALERT_HANDSHAKE_FAILURE, "tls: server resumed a session with a different version") if s.version != cc.vers
+    fail alert_err(cc, ALERT_HANDSHAKE_FAILURE, "tls: server resumed a session with a different cipher suite") if s.cipher_suite != suite.id
+    fail alert_err(cc, ALERT_HANDSHAKE_FAILURE, "tls: server resumed a session with a different EMS extension") if s.ext_master_secret != server_hello.extended_master_secret
+    # Restore master secret and certificates from previous state
+    self.master_secret = s.secret
+    cc.st[0].ext_master_secret = s.ext_master_secret
+    cc.st[0].peer_certificates = s.peer_certificates
+    cc.st[0].verified_chains = s.verified_chains
+    cc.st[0].ocsp_response = s.ocsp_response || []
+    # Let the ServerHello SCTs override the session SCTs from the original
+    # connection, if any are provided.
+    cc.st[0].scts = s.scts || [] if cc.st[0].scts.size == 0
+    cc.st[0].curve_id = s.curve_id
+    true
+  }
+
+  def read_finished! -> ~[Byte] {
+    cc = c
+    cc.~read_change_cipher_spec!
+    msg, data = cc.~read_handshake!
+    sf = FinishedMsg.new
+    case msg {
+      Finished(m) => {
+        sf = m
+      }
+      _ => {
+        cc.send_alert!(ALERT_UNEXPECTED_MESSAGE)
+        fail unexpected_message_error("*tls.finishedMsg", msg)
+      }
+    }
+    verify = finished_hash.server_sum(master_secret)
+    if verify.size != sf.verify_data.size || subtle.constant_time_compare(verify, sf.verify_data) != 1 {
+      fail alert_err(cc, ALERT_HANDSHAKE_FAILURE, "tls: server's Finished message was incorrect")
+    }
+    self.finished_hash.write!(data)
+    verify
+  }
+
+  def read_session_ticket! -> ~Unit {
+    return if !server_hello.ticket_supported
+    cc = c
+    if !hello.ticket_supported {
+      fail alert_err(cc, ALERT_ILLEGAL_PARAMETER, "tls: server sent unrequested session ticket")
+    }
+    msg = ~self.read_hs!(true)
+    case msg {
+      NewSessionTicket(m) => {
+        self.ticket = m.ticket
+      }
+      _ => {
+        cc.send_alert!(ALERT_UNEXPECTED_MESSAGE)
+        fail unexpected_message_error("*tls.newSessionTicketMsg", msg)
+      }
+    }
+  }
+
+  def save_session_ticket! -> ~Unit {
+    if t = ticket {
+      cc = c
+      key = client_session_cache_key(cc)
+      return if key == ""
+      s = session_state_of(cc)
+      s.secret = master_secret
+      s.ticket = t
+      if cache = cc.config.client_session_cache {
+        cache.put(key, ClientSessionState.new(session: s))
+      }
+    }
+  }
+
+  def send_finished! -> ~[Byte] {
+    cc = c
+    cc.~write_change_cipher_record!
+    verify = finished_hash.client_sum(master_secret)
+    data = cc.~write_handshake_record!(HandshakeMessage.Finished(FinishedMsg.new(verify_data: verify)))
+    self.finished_hash.write!(data)
+    verify
+  }
+}
+
+# Go's Conn.sessionState.
+def session_state_of(c: Conn) -> SessionState {
+  s = c.st[0]
+  SessionState.new(version: s.vers, cipher_suite: s.cipher_suite, created_at: s.config.now.unix.to_u64, alpn_protocol: s.client_protocol, peer_certificates: s.peer_certificates, ocsp_response: s.ocsp_response.size > 0 ? s.ocsp_response : none, scts: s.scts.size > 0 ? s.scts : none, is_client: s.is_client, ext_master_secret: s.ext_master_secret, verified_chains: s.verified_chains, curve_id: s.curve_id)
+}

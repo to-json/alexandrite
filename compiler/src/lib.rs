@@ -8,6 +8,7 @@ pub mod cgen;
 pub mod check;
 pub mod consts;
 pub mod derive;
+pub mod derive_asn1;
 pub mod derive_data;
 pub mod derive_json2;
 pub mod derive_gob;

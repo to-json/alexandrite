@@ -1,0 +1,516 @@
+# golang.org/x/crypto/cryptobyte's tests (cryptobyte_test.go, asn1_test.go,
+# example_test.go).
+#
+# Not translated: TestContinuationError / TestContinuationNonError /
+# TestGeneratedPanic / TestWriteWithPendingChild /
+# TestFixedBuilderPanicReallocate and the panicking halves of TestUnwrite
+# (they test panics recovered inside a continuation; alx has no recover,
+# and a child builder can't be written through its parent here).
+
+import "encoding/asn1"
+import "math/big"
+import "time"
+import cbasn1 "golang.org/x/crypto/cryptobyte/asn1"
+
+def builder -> Builder { new_builder([]) }
+
+def bs(ints: [Int]) -> [Byte] { ints.map { it.as_u8 }.to_a }
+
+test "Bytes" {
+  b = builder()
+  v = "foobarbaz".bytes
+  b.add_bytes!(v[0...3])
+  b.add_bytes!(v[3...4])
+  b.add_bytes!(v[4...9])
+  assert_eq b.bytes_or_panic, v
+  s = string(b.bytes_or_panic)
+  for w in ["foo", "bar", "baz"] {
+    got = s.read_bytes!(3)
+    assert got.some?, w
+    assert_eq got || [], w.bytes
+  }
+  assert_eq s.size, 0
+}
+
+test "Uint8" {
+  b = builder()
+  b.add_u8!(42)
+  assert_eq b.bytes_or_panic, bs([42])
+  s = string(b.bytes_or_panic)
+  assert_eq s.read_u8!, 42.as_u8
+  assert_eq s.size, 0
+}
+
+test "Uint16" {
+  b = builder()
+  b.add_u16!(65534)
+  assert_eq b.bytes_or_panic, bs([255, 254])
+  s = string(b.bytes_or_panic)
+  assert_eq s.read_u16!, 65534.as_u16
+  assert_eq s.size, 0
+}
+
+test "Uint24" {
+  b = builder()
+  b.add_u24!(0xfffefd)
+  assert_eq b.bytes_or_panic, bs([255, 254, 253])
+  s = string(b.bytes_or_panic)
+  assert_eq s.read_u24!, 0xfffefd.as_u32
+  assert_eq s.size, 0
+}
+
+test "Uint24Truncation" {
+  b = builder()
+  b.add_u24!(0x10111213)
+  assert_eq b.bytes_or_panic, bs([0x11, 0x12, 0x13])
+}
+
+test "Uint32" {
+  b = builder()
+  b.add_u32!(0xfffefdfc)
+  assert_eq b.bytes_or_panic, bs([255, 254, 253, 252])
+  s = string(b.bytes_or_panic)
+  assert_eq s.read_u32!, 0xfffefdfc.as_u32
+  assert_eq s.size, 0
+}
+
+test "Uint48" {
+  b = builder()
+  u: U64 = 0xfefcff3cfdfc
+  b.add_u48!(u)
+  assert_eq b.bytes_or_panic, bs([254, 252, 255, 60, 253, 252])
+  s = string(b.bytes_or_panic)
+  assert_eq s.read_u48!, u
+  assert_eq s.size, 0
+}
+
+test "Uint64" {
+  b = builder()
+  u: U64 = 0xf2fefefcff3cfdfc
+  b.add_u64!(u)
+  assert_eq b.bytes_or_panic, bs([242, 254, 254, 252, 255, 60, 253, 252])
+  s = string(b.bytes_or_panic)
+  assert_eq s.read_u64!, u
+  assert_eq s.size, 0
+}
+
+test "UMultiple" {
+  b = builder()
+  b.add_u8!(23)
+  b.add_u32!(0xfffefdfc)
+  b.add_u16!(42)
+  assert_eq b.bytes_or_panic, bs([23, 255, 254, 253, 252, 0, 42])
+  s = string(b.bytes_or_panic)
+  assert_eq s.read_u8!, 23.as_u8
+  assert_eq s.read_u32!, 0xfffefdfc.as_u32
+  assert_eq s.read_u16!, 42.as_u16
+  assert_eq s.size, 0
+}
+
+test "Uint8LengthPrefixedSimple" {
+  b = builder()
+  b.add_u8_length_prefixed! { |c|
+    c.add_u8!(23)
+    c.add_u8!(42)
+  }
+  assert_eq b.bytes_or_panic, bs([2, 23, 42])
+  base = string(b.bytes_or_panic)
+  child = base.read_u8_length_prefixed! || String.new
+  assert_eq child.read_u8!, 23.as_u8
+  assert_eq child.read_u8!, 42.as_u8
+  assert_eq base.size, 0
+  assert_eq child.size, 0
+}
+
+test "Uint8LengthPrefixedMulti" {
+  b = builder()
+  b.add_u8_length_prefixed! { |c|
+    c.add_u8!(23)
+    c.add_u8!(42)
+  }
+  b.add_u8!(5)
+  b.add_u8_length_prefixed! { |c|
+    c.add_u8!(123)
+    c.add_u8!(234)
+  }
+  assert_eq b.bytes_or_panic, bs([2, 23, 42, 5, 2, 123, 234])
+  s = string(b.bytes_or_panic)
+  child = s.read_u8_length_prefixed! || String.new
+  assert_eq child.read_u8!, 23.as_u8
+  assert_eq child.read_u8!, 42.as_u8
+  assert_eq s.read_u8!, 5.as_u8
+  child = s.read_u8_length_prefixed! || String.new
+  assert_eq child.read_u8!, 123.as_u8
+  assert_eq child.read_u8!, 234.as_u8
+  assert_eq s.size, 0
+  assert_eq child.size, 0
+}
+
+test "Uint8LengthPrefixedNested" {
+  b = builder()
+  b.add_u8_length_prefixed! { |c|
+    c.add_u8!(5)
+    c.add_u8_length_prefixed! { |d|
+      d.add_u8!(23)
+      d.add_u8!(42)
+    }
+    c.add_u8!(123)
+  }
+  assert_eq b.bytes_or_panic, bs([5, 5, 2, 23, 42, 123])
+  base = string(b.bytes_or_panic)
+  child1 = base.read_u8_length_prefixed! || String.new
+  assert_eq child1.read_u8!, 5.as_u8
+  child2 = child1.read_u8_length_prefixed! || String.new
+  assert_eq child1.read_u8!, 123.as_u8
+  assert_eq child2.read_u8!, 23.as_u8
+  assert_eq child2.read_u8!, 42.as_u8
+  assert_eq base.size, 0
+  assert_eq child1.size, 0
+  assert_eq child2.size, 0
+}
+
+test "PreallocatedBuffer" {
+  b = new_builder([])
+  b.add_u8!(1)
+  b.add_u8_length_prefixed! { |c|
+    c.add_u8!(3)
+    c.add_u8!(4)
+  }
+  # Outgrow buf by one byte.
+  b.add_u16!(1286)
+  assert_eq b.bytes_or_panic, bs([1, 2, 3, 4, 5, 6])
+}
+
+test "SetError" {
+  b = builder()
+  b.set_error!(CryptobyteError.Msg("TestSetError"))
+  r = b.bytes
+  assert !r.ok?
+  assert_eq r.err?.message || "", "TestSetError"
+}
+
+test "Unwrite" {
+  b = builder()
+  b.add_bytes!([1, 2, 3, 4, 5])
+  b.unwrite!(2)
+  assert_eq b.bytes_or_panic, bs([1, 2, 3])
+}
+
+test "FixedBuilderLengthPrefixed" {
+  buf_cap = 10
+  inner = [0xff.as_u8; buf_cap - 2]
+  b = new_fixed_builder([], buf_cap)
+  b.add_u16_length_prefixed! { |c|
+    c.add_bytes!(inner)
+  }
+  assert_eq b.bytes_or_panic.size, buf_cap
+  # One byte more doesn't fit.
+  b2 = new_fixed_builder([], buf_cap)
+  b2.add_u16_length_prefixed! { |c|
+    c.add_bytes!(inner + [1.as_u8])
+  }
+  assert !b2.bytes.ok?
+}
+
+test "zero Builder" {
+  b = Builder.new
+  b.add_u8!(7)
+  assert_eq b.bytes_or_panic, bs([7])
+}
+
+# ---------------------------------------------------------------- ASN.1
+
+test "ASN1Int64" {
+  tests = [(-0x800000, [2, 3, 128, 0, 0]), (-256, [2, 2, 255, 0]), (-129, [2, 2, 255, 127]), (-128, [2, 1, 128]), (-1, [2, 1, 255]), (0, [2, 1, 0]), (1, [2, 1, 1]), (2, [2, 1, 2]), (127, [2, 1, 127]), (128, [2, 2, 0, 128]), (256, [2, 2, 1, 0]), (0x800000, [2, 4, 0, 128, 0, 0])]
+  for t in tests {
+    in_, want = t
+    b = builder()
+    b.add_asn1_int64!(in_)
+    assert_eq b.bytes_or_panic, bs(want)
+    s = string(b.bytes_or_panic)
+    assert_eq s.read_asn1_int64!, in_
+    assert_eq s.size, 0
+  }
+}
+
+test "ASN1Uint64" {
+  tests: [(U64, [Int])] = [(0, [2, 1, 0]), (1, [2, 1, 1]), (2, [2, 1, 2]), (127, [2, 1, 127]), (128, [2, 2, 0, 128]), (256, [2, 2, 1, 0]), (0x800000, [2, 4, 0, 128, 0, 0]), (0x7fffffffffffffff, [2, 8, 127, 255, 255, 255, 255, 255, 255, 255]), (0x8000000000000000, [2, 9, 0, 128, 0, 0, 0, 0, 0, 0, 0]), (0xffffffffffffffff, [2, 9, 0, 255, 255, 255, 255, 255, 255, 255, 255])]
+  for t in tests {
+    in_, want = t
+    b = builder()
+    b.add_asn1_uint64!(in_)
+    assert_eq b.bytes_or_panic, bs(want)
+    s = string(b.bytes_or_panic)
+    assert_eq s.read_asn1_uint64!, in_
+    assert_eq s.size, 0
+  }
+}
+
+test "ReadASN1" {
+  data: [(Str, [Byte], Byte, Bool, [Byte])] = [("valid", bs([0x30, 2, 1, 2]), 0x30, true, bs([1, 2])), ("truncated", bs([0x30, 3, 1, 2]), 0x30, false, []), ("zero length of length", bs([0x30, 0x80]), 0x30, false, []), ("invalid long form length", bs([0x30, 0x81, 1, 1]), 0x30, false, []), ("non-minimal length", bs([0x30, 0x82, 0, 0x80]) + [0.as_u8; 0x80], 0x30, false, []), ("invalid tag", bs([0xa1, 3, 0x4, 1, 1]), 31, false, []), ("high tag", bs([0x1f, 0x81, 0x80, 0x01, 2, 1, 2]), 0xff, false, []), ("2**31 - 1 length", bs([0x30, 0x84, 0x7f, 0xff, 0xff, 0xff]), 0x30, false, []), ("2**32 - 1 length", bs([0x30, 0x84, 0xff, 0xff, 0xff, 0xff]), 0x30, false, []), ("2**63 - 1 length", bs([0x30, 0x88, 0x7f, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff]), 0x30, false, []), ("2**64 - 1 length", bs([0x30, 0x88, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff]), 0x30, false, [])]
+  for d in data {
+    name, in_, tag, ok, out = d
+    s = string(in_)
+    r = s.read_asn1!(tag)
+    assert r.some? == ok, name
+    if c = r {
+      assert_eq c.bytes, out
+    }
+  }
+}
+
+test "ReadASN1Optional" {
+  empty = String.new
+  r = empty.read_optional_asn1!(0xa0)
+  assert r.some? && !(r || (String.new, true))[1]
+  s = string(bs([0xa1, 3, 0x4, 1, 1]))
+  r2 = s.read_optional_asn1!(0xa0)
+  assert r2.some? && !(r2 || (String.new, true))[1]
+  r3 = s.read_optional_asn1!(0xa1) || (String.new, false)
+  assert r3[1]
+  assert_eq r3[0].bytes, bs([4, 1, 1])
+}
+
+test "ReadASN1OptionalOctetString" {
+  data: [(Str, [Byte], Byte, Bool, [Byte], Bool)] = [("empty", [], 0xa0, true, [], false), ("invalid", bs([0xa1, 3, 0x4, 2, 1]), 0xa1, false, [], true), ("missing", bs([0xa1, 3, 0x4, 1, 1]), 0xa0, true, [], false), ("present", bs([0xa1, 3, 0x4, 1, 1]), 0xa1, true, bs([1]), true)]
+  for d in data {
+    name, in_, tag, ok, out, present = d
+    s = string(in_)
+    r = s.read_optional_asn1_octet_string!(tag)
+    assert r.some? == ok, name
+    if v = r {
+      assert_eq v[0], out
+      assert v[1] == present, name
+    }
+  }
+}
+
+test "ReadASN1OptionalInteger" {
+  default_int = -1
+  data: [(Str, [Byte], Byte, Bool, Int)] = [("empty", [], 0xa0, true, default_int), ("invalid", bs([0xa1, 3, 0x2, 2, 127]), 0xa1, false, 0), ("missing", bs([0xa1, 3, 0x2, 1, 127]), 0xa0, true, default_int), ("present", bs([0xa1, 3, 0x2, 1, 42]), 0xa1, true, 42)]
+  for d in data {
+    name, in_, tag, ok, out = d
+    s = string(in_)
+    r = s.read_optional_asn1_int64!(tag, default_int)
+    assert r.some? == ok, name
+    assert_eq r || 0, out if ok
+  }
+}
+
+test "ReadASN1OptionalBoolean" {
+  data: [(Str, [Byte], Byte, Bool, Bool)] = [("empty", [], 0xa0, true, false), ("invalid", bs([0xa1, 0x3, 0x1, 0x2, 0x7f]), 0xa1, false, false), ("missing", bs([0xa1, 0x3, 0x1, 0x1, 0x7f]), 0xa0, true, false), ("present", bs([0xa1, 0x3, 0x1, 0x1, 0xff]), 0xa1, true, true)]
+  for d in data {
+    name, in_, tag, ok, out = d
+    s = string(in_)
+    r = s.read_optional_asn1_boolean!(tag, false)
+    assert r.some? == ok, name
+    assert (r || false) == out, name if ok
+  }
+}
+
+test "ReadASN1IntegerSigned" {
+  data = [([2, 3, 128, 0, 0], -0x800000), ([2, 2, 255, 0], -256), ([2, 2, 255, 127], -129), ([2, 1, 128], -128), ([2, 1, 255], -1), ([2, 1, 0], 0), ([2, 1, 1], 1), ([2, 1, 2], 2), ([2, 1, 127], 127), ([2, 2, 0, 128], 128), ([2, 2, 1, 0], 256), ([2, 4, 0, 128, 0, 0], 0x800000)]
+  for d in data {
+    in_, out = d
+    s = string(bs(in_))
+    assert_eq s.read_asn1_int64!, out
+  }
+  # Repeat the same cases, reading into a big.Int.
+  for d in data {
+    in_, out = d
+    s = string(bs(in_))
+    assert_eq (s.read_asn1_big_int! || big.Int.new).int64, out
+  }
+  # Repeat the same cases, reading into a []byte.
+  for d in data {
+    in_, out = d
+    s = string(bs(in_))
+    r = s.read_asn1_int_bytes!
+    if out < 0 {
+      assert r.none?
+      next
+    }
+    b = r || []
+    n = big.Int.new
+    n.set_bytes!(b)
+    assert_eq n.int64, out
+    assert !(b[0] == 0 && b.size > 1), "leading zeroes"
+  }
+  # Repeat with the implicit-tagging functions
+  i = 0
+  for d in data {
+    in_, out = d
+    tag = cbasn1.context_specific(((i * 3) % 32).as_u8)
+    test_data = bs(in_)
+    # Alter the tag of the test case.
+    test_data[0] = tag
+    s = string(test_data)
+    assert_eq s.read_asn1_int64_with_tag!(tag), out
+    b = builder()
+    b.add_asn1_int64_with_tag!(out, tag)
+    assert_eq b.bytes.unwrap, test_data
+    i += 1
+  }
+}
+
+test "ReadASN1IntegerUnsigned" {
+  data: [([Int], U64)] = [([2, 1, 0], 0), ([2, 1, 1], 1), ([2, 1, 2], 2), ([2, 1, 127], 127), ([2, 2, 0, 128], 128), ([2, 2, 1, 0], 256), ([2, 4, 0, 128, 0, 0], 0x800000), ([2, 8, 127, 255, 255, 255, 255, 255, 255, 255], 0x7fffffffffffffff), ([2, 9, 0, 128, 0, 0, 0, 0, 0, 0, 0], 0x8000000000000000), ([2, 9, 0, 255, 255, 255, 255, 255, 255, 255, 255], 0xffffffffffffffff)]
+  for d in data {
+    in_, out = d
+    s = string(bs(in_))
+    assert_eq s.read_asn1_uint64!, out
+  }
+}
+
+test "ReadASN1IntegerInvalid" {
+  # invalid tag; truncated; not minimally encoded
+  for t in [[3, 1, 0], [2, 1], [2, 2, 0], [2, 2, 0, 1], [2, 2, 0xff, 0xff]] {
+    s = string(bs(t))
+    assert s.read_asn1_int64!.none?
+  }
+}
+
+test "ASN1ObjectIdentifier" {
+  data: [([Int], Bool, [Int])] = [([], false, []), ([6, 0], false, []), ([5, 1, 85], false, [2, 5]), ([6, 1, 85], true, [2, 5]), ([6, 2, 85, 0x02], true, [2, 5, 2]), ([6, 4, 85, 0x02, 0xc0, 0x00], true, [2, 5, 2, 0x2000]), ([6, 3, 0x81, 0x34, 0x03], true, [2, 100, 3]), ([6, 7, 85, 0x02, 0xc0, 0x80, 0x80, 0x80, 0x80], false, []), ([6, 7, 85, 0x02, 0x85, 0xc7, 0xcc, 0xfb, 0x01], true, [2, 5, 2, 1492336001]), ([6, 7, 0x55, 0x02, 0x87, 0xff, 0xff, 0xff, 0x7f], true, [2, 5, 2, 2147483647]), ([6, 7, 0x55, 0x02, 0x88, 0x80, 0x80, 0x80, 0x00], false, []), ([6, 3, 85, 0x80, 0x02], false, [])]
+  for d in data {
+    in_, ok, out = d
+    s = string(bs(in_))
+    r = s.read_asn1_object_identifier!
+    assert r.some? == ok
+    oid = r || asn1.oid([])
+    assert oid.equal?(asn1.oid(out)) if ok
+    b = builder()
+    b.add_asn1_object_identifier!(oid)
+    res = b.bytes
+    assert res.ok? == ok
+    assert_eq res.unwrap, bs(in_) if ok
+  }
+}
+
+test "ReadASN1GeneralizedTime" {
+  data = [("20100102030405Z", true, time.date(2010, 1, 2, 3, 4, 5, 0, time.utc())), ("20100102030405", false, time.Time.new), ("20100102030405+0607", true, time.date(2010, 1, 2, 3, 4, 5, 0, time.fixed_zone("", 6 * 60 * 60 + 7 * 60))), ("20100102030405-0607", true, time.date(2010, 1, 2, 3, 4, 5, 0, time.fixed_zone("", -6 * 60 * 60 - 7 * 60))), ("00000100000000Z", false, time.Time.new), ("20101302030405Z", false, time.Time.new), ("20100002030405Z", false, time.Time.new), ("20100100030405Z", false, time.Time.new), ("20100132030405Z", false, time.Time.new), ("20100231030405Z", false, time.Time.new), ("20100102240405Z", false, time.Time.new), ("20100102036005Z", false, time.Time.new), ("20100102030460Z", false, time.Time.new), ("-20100102030410Z", false, time.Time.new), ("2010-0102030410Z", false, time.Time.new), ("2010-0002030410Z", false, time.Time.new), ("201001-02030410Z", false, time.Time.new), ("20100102-030410Z", false, time.Time.new), ("2010010203-0410Z", false, time.Time.new), ("201001020304-10Z", false, time.Time.new)]
+  for d in data {
+    in_, ok, out = d
+    s = string([cbasn1.GENERALIZED_TIME, in_.size.as_u8] + in_.bytes)
+    r = s.read_asn1_generalized_time!
+    assert r.some? == ok, in_
+    if t = r {
+      assert t == out, in_
+      assert_eq t.zone_info[1], out.zone_info[1]
+    }
+  }
+}
+
+test "ReadASN1UTCTime" {
+  data = [("000102030405Z", true, time.date(2000, 1, 2, 3, 4, 5, 0, time.utc())), ("500102030405Z", true, time.date(1950, 1, 2, 3, 4, 5, 0, time.utc())), ("490102030405Z", true, time.date(2049, 1, 2, 3, 4, 5, 0, time.utc())), ("990102030405Z", true, time.date(1999, 1, 2, 3, 4, 5, 0, time.utc())), ("250102030405Z", true, time.date(2025, 1, 2, 3, 4, 5, 0, time.utc())), ("750102030405Z", true, time.date(1975, 1, 2, 3, 4, 5, 0, time.utc())), ("000102030405+0905", true, time.date(2000, 1, 2, 3, 4, 5, 0, time.fixed_zone("", 9 * 60 * 60 + 5 * 60))), ("000102030405-0905", true, time.date(2000, 1, 2, 3, 4, 5, 0, time.fixed_zone("", -9 * 60 * 60 - 5 * 60))), ("0001020304Z", true, time.date(2000, 1, 2, 3, 4, 0, 0, time.utc())), ("5001020304Z", true, time.date(1950, 1, 2, 3, 4, 0, 0, time.utc())), ("0001020304+0905", true, time.date(2000, 1, 2, 3, 4, 0, 0, time.fixed_zone("", 9 * 60 * 60 + 5 * 60))), ("0001020304-0905", true, time.date(2000, 1, 2, 3, 4, 0, 0, time.fixed_zone("", -9 * 60 * 60 - 5 * 60))), ("000102030405Z0700", false, time.Time.new), ("000102030405", false, time.Time.new)]
+  for d in data {
+    in_, ok, out = d
+    s = string([cbasn1.UTC_TIME, in_.size.as_u8] + in_.bytes)
+    r = s.read_asn1_utc_time!
+    assert r.some? == ok, in_
+    if t = r {
+      assert t == out, in_
+      assert_eq t.zone_info[1], out.zone_info[1]
+    }
+  }
+}
+
+test "ReadASN1BitString" {
+  data: [([Int], Bool, [Int], Int)] = [([], false, [], 0), ([0x00], true, [], 0), ([0x07, 0x00], true, [0], 1), ([0x07, 0x01], false, [], 0), ([0x07, 0x40], false, [], 0), ([0x08, 0x00], false, [], 0), ([0xff], false, [], 0), ([0xfe, 0x00], false, [], 0)]
+  for d in data {
+    in_, ok, out, bit_length = d
+    s = string([3.as_u8, in_.size.as_u8] + bs(in_))
+    r = s.read_asn1_bit_string!
+    assert r.some? == ok
+    if v = r {
+      assert_eq v.bytes, bs(out)
+      assert_eq v.bit_length, bit_length
+    }
+  }
+}
+
+test "AddASN1BigInt" {
+  x = big.new_int(-1)
+  b = builder()
+  b.add_asn1_big_int!(x)
+  got = b.bytes.unwrap
+  s = string(got)
+  y = s.read_asn1_big_int!
+  assert_eq y, x
+}
+
+test "ReadASN1Boolean" {
+  data: [([Int], Bool, Bool)] = [([], false, false), ([0x01, 0x01, 0x00], true, false), ([0x01, 0x01, 0xff], true, true), ([0x01, 0x01, 0x01], false, false)]
+  for d in data {
+    in_, ok, out = d
+    s = string(bs(in_))
+    r = s.read_asn1_boolean!
+    assert r.some? == ok
+    assert (r || false) == out if ok
+  }
+}
+
+# ---------------------------------------------------------------- examples
+
+example "String" {
+  # This is an example of parsing a structure that looks like:
+  #   A ::= SEQUENCE { ... }
+  input = string([0x30.as_u8, 11, 0x02, 1, 2, 0x04, 3, 1, 2, 3, 0x01, 1, 0xff])
+  if inner0 = input.read_asn1!(cbasn1.SEQUENCE) {
+    inner = inner0
+    version = inner.read_asn1_int64! || -1
+    data = inner.read_asn1_bytes!(cbasn1.OCTET_STRING) || []
+    flag = inner.read_asn1_boolean! || false
+    puts "#{version} #{data} #{flag} #{inner.empty?} #{input.empty?}"
+  }
+} outputs "2 [1 2 3] true true true\n"
+
+example "Builder ASN1" {
+  b = new_builder([])
+  b.add_asn1!(cbasn1.SEQUENCE) { |c|
+    c.add_asn1_int64!(2)
+    c.add_asn1_octet_string!([1, 2, 3])
+    c.add_asn1_boolean!(true)
+  }
+  puts b.bytes_or_panic
+} outputs "[48 11 2 1 2 4 3 1 2 3 1 1 255]\n"
+
+example "Builder lengthPrefixed" {
+  # This is an example of building a structure with two length-prefixed
+  # fields: a two-byte length and a one-byte length.
+  b = new_builder([])
+  b.add_u16_length_prefixed! { |c|
+    c.add_bytes!([1, 2, 3])
+  }
+  b.add_u8_length_prefixed! { |c|
+    c.add_u8!(42)
+  }
+  puts b.bytes_or_panic
+} outputs "[0 3 1 2 3 1 42]\n"
+
+# ---------------------------------------------------------------- alx additions
+
+test "long ASN.1 lengths" {
+  for n in [0x7f, 0x80, 0xff, 0x100, 0xffff, 0x10000] {
+    b = builder()
+    b.add_asn1_octet_string!([0x5a.as_u8; n])
+    der = b.bytes.unwrap
+    s = string(der)
+    v = s.read_asn1_bytes!(cbasn1.OCTET_STRING) || []
+    assert_eq v.size, n
+    assert s.empty?
+    assert_eq der, asn1.marshal_bytes([0x5a.as_u8; n]).unwrap
+  }
+}
+
+test "errors" {
+  b = builder()
+  b.add_asn1!(0x1f) { |c| c.add_u8!(1) }
+  assert_eq b.bytes.err?.message || "", "cryptobyte: high-tag number identifier octets not supported: 0x1f"
+  b2 = builder()
+  b2.add_u8_length_prefixed! { |c| c.add_bytes!([0.as_u8; 256]) }
+  assert_eq b2.bytes.err?.message || "", "cryptobyte: pending child length 256 exceeds 1-byte length prefix"
+  b3 = builder()
+  b3.add_asn1_object_identifier!(asn1.oid([3, 1]))
+  assert_eq b3.bytes.err?.message || "", "cryptobyte: invalid OID: [3 1]"
+}

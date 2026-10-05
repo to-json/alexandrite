@@ -1,0 +1,280 @@
+# Handshake signatures (Go's auth.go).
+
+import "crypto"
+import "crypto/ecdsa"
+import "crypto/ed25519"
+import "crypto/mldsa"
+import "crypto/rsa"
+import "crypto/x509"
+import "hash"
+import "io"
+
+# crypto.SignerOpts for signing a message as it is (Go's crypto.Hash(0)).
+struct DirectSigning {
+  def hash_func -> crypto.Hash? { none }
+}
+
+# Go's verifyHandshakeSignature; hash none is direct signing.
+def verify_handshake_signature(sig_type: Byte, pubkey: x509.PublicKey, hash_func: crypto.Hash?, signed0: [Byte], sig: [Byte]) -> ~Unit {
+  signed = signed0
+  if hf = hash_func {
+    h = hf.new
+    h.write!(signed)
+    signed = h.sum([])
+  }
+  if sig_type == SIGNATURE_ECDSA {
+    case pubkey {
+      Ecdsa(k) => {
+        fail TlsError.Msg("ECDSA verification failure") if !ecdsa.verify_asn1(k, signed, sig)
+      }
+      _ => {
+        fail TlsError.Msg("expected an ECDSA public key, got " + key_type_name(pubkey))
+      }
+    }
+  } else if sig_type == SIGNATURE_ED25519 {
+    case pubkey {
+      Ed25519(k) => {
+        fail TlsError.Msg("Ed25519 verification failure") if !ed25519.verify(k, signed, sig)
+      }
+      _ => {
+        fail TlsError.Msg("expected an Ed25519 public key, got " + key_type_name(pubkey))
+      }
+    }
+  } else if sig_type == SIGNATURE_MLDSA {
+    case pubkey {
+      MlDsa(k) => {
+        r = mldsa.verify(k, signed, sig, mldsa.Options.new)
+        if e = r.err {
+          fail TlsError.Msg("ML-DSA verification failure: " + e.message)
+        }
+      }
+      _ => {
+        fail TlsError.Msg("expected an ML-DSA public key, got " + key_type_name(pubkey))
+      }
+    }
+  } else if sig_type == SIGNATURE_PKCS1V15 {
+    case pubkey {
+      Rsa(k) => {
+        rsa.~verify_pkcs1v15(k, hash_func, signed, sig)
+      }
+      _ => {
+        fail TlsError.Msg("expected an RSA public key, got " + key_type_name(pubkey))
+      }
+    }
+  } else if sig_type == SIGNATURE_RSAPSS {
+    case pubkey {
+      Rsa(k) => {
+        rsa.~verify_pss(k, hash_func || crypto.Hash.SHA256, signed, sig, rsa.PSSOptions.new(salt_length: rsa.PSS_SALT_LENGTH_EQUALS_HASH))
+      }
+      _ => {
+        fail TlsError.Msg("expected an RSA public key, got " + key_type_name(pubkey))
+      }
+    }
+  } else {
+    fail TlsError.Msg("internal error: unknown signature type")
+  }
+}
+
+# Go's verifyLegacyHandshakeSignature (TLS 1.0/1.1: hashed is the digest).
+def verify_legacy_handshake_signature(sig_type: Byte, pubkey: x509.PublicKey, hash_func: crypto.Hash?, hashed: [Byte], sig: [Byte]) -> ~Unit {
+  if sig_type == SIGNATURE_ECDSA {
+    case pubkey {
+      Ecdsa(k) => {
+        fail TlsError.Msg("ECDSA verification failure") if !ecdsa.verify_asn1(k, hashed, sig)
+      }
+      _ => {
+        fail TlsError.Msg("expected an ECDSA public key, got " + key_type_name(pubkey))
+      }
+    }
+  } else if sig_type == SIGNATURE_PKCS1V15 {
+    case pubkey {
+      Rsa(k) => {
+        rsa.~verify_pkcs1v15(k, hash_func, hashed, sig)
+      }
+      _ => {
+        fail TlsError.Msg("expected an RSA public key, got " + key_type_name(pubkey))
+      }
+    }
+  } else {
+    fail TlsError.Msg("internal error: unknown signature type")
+  }
+}
+
+# Go's %T of a key.
+def key_type_name(k: x509.PublicKey) -> Str {
+  case k {
+    Rsa(_) => "*rsa.PublicKey"
+    Ecdsa(_) => "*ecdsa.PublicKey"
+    Ed25519(_) => "ed25519.PublicKey"
+    Ecdh(_) => "*ecdh.PublicKey"
+    Dsa(_) => "*dsa.PublicKey"
+    MlDsa(_) => "*mldsa.PublicKey"
+    None => "<nil>"
+  }
+}
+
+def private_key_type_name(k: x509.PrivateKey) -> Str {
+  case k {
+    Rsa(_) => "*rsa.PrivateKey"
+    Ecdsa(_) => "*ecdsa.PrivateKey"
+    Ed25519(_) => "ed25519.PrivateKey"
+    Ecdh(_) => "*ecdh.PrivateKey"
+    MlDsa(_) => "*mldsa.PrivateKey"
+    None => "<nil>"
+  }
+}
+
+SERVER_SIGNATURE_CONTEXT = "TLS 1.3, server CertificateVerify\u0000"
+CLIENT_SIGNATURE_CONTEXT = "TLS 1.3, client CertificateVerify\u0000"
+
+# Go's signedMessage: the TLS 1.3 CertificateVerify input.
+def signed_message(context: Str, transcript: Transcript) -> [Byte] { [0x20.as_u8; 64] + context.bytes + transcript.sum([]) }
+
+# Go's typeAndHashFromSignatureScheme: the signature type and hash (none:
+# direct signing).
+def type_and_hash_from_signature_scheme(s: U16) -> ~(Byte, crypto.Hash?)<TlsError> {
+  t: Byte = 0
+  if s == PKCS1_WITH_SHA1 || s == PKCS1_WITH_SHA256 || s == PKCS1_WITH_SHA384 || s == PKCS1_WITH_SHA512 {
+    t = SIGNATURE_PKCS1V15
+  } else if s == PSS_WITH_SHA256 || s == PSS_WITH_SHA384 || s == PSS_WITH_SHA512 {
+    t = SIGNATURE_RSAPSS
+  } else if s == ECDSA_WITH_SHA1 || s == ECDSA_WITH_P256_AND_SHA256 || s == ECDSA_WITH_P384_AND_SHA384 || s == ECDSA_WITH_P521_AND_SHA512 {
+    t = SIGNATURE_ECDSA
+  } else if s == ED25519 {
+    return (SIGNATURE_ED25519, none)
+  } else if s == MLDSA44 || s == MLDSA65 || s == MLDSA87 {
+    return (SIGNATURE_MLDSA, none)
+  } else {
+    fail TlsError.Msg("unsupported signature algorithm: " + signature_scheme_string(s))
+  }
+  h = crypto.Hash.SHA512
+  if s == PKCS1_WITH_SHA1 || s == ECDSA_WITH_SHA1 {
+    h = crypto.Hash.SHA1
+  } else if s == PKCS1_WITH_SHA256 || s == PSS_WITH_SHA256 || s == ECDSA_WITH_P256_AND_SHA256 {
+    h = crypto.Hash.SHA256
+  } else if s == PKCS1_WITH_SHA384 || s == PSS_WITH_SHA384 || s == ECDSA_WITH_P384_AND_SHA384 {
+    h = crypto.Hash.SHA384
+  }
+  (t, h)
+}
+
+# Go's legacyTypeAndHashFromPublicKey (TLS 1.0/1.1).
+def legacy_type_and_hash_from_public_key(pub: x509.PublicKey) -> ~(Byte, crypto.Hash?)<TlsError> {
+  case pub {
+    Rsa(_) => {
+      return (SIGNATURE_PKCS1V15, crypto.Hash.MD5SHA1)
+    }
+    Ecdsa(_) => {
+      return (SIGNATURE_ECDSA, crypto.Hash.SHA1)
+    }
+    Ed25519(_) => {
+      fail TlsError.Msg("tls: Ed25519 public keys are not supported before TLS 1.2")
+    }
+    MlDsa(_) => {
+      fail TlsError.Msg("tls: ML-DSA public keys are not supported before TLS 1.3")
+    }
+    _ => {
+      fail TlsError.Msg("tls: unsupported public key: " + key_type_name(pub))
+    }
+  }
+  (0.as_u8, none)
+}
+
+# Go's signatureSchemesForPublicKey.
+def signature_schemes_for_public_key(version: U16, pub: x509.PublicKey) -> [U16] {
+  case pub {
+    Ecdsa(k) => {
+      return [ECDSA_WITH_P256_AND_SHA256, ECDSA_WITH_P384_AND_SHA384, ECDSA_WITH_P521_AND_SHA512, ECDSA_WITH_SHA1] if version < VERSION_TLS13
+      c = curve_id_for_ecdsa(k)
+      return [ECDSA_WITH_P256_AND_SHA256] if c == CURVE_P256
+      return [ECDSA_WITH_P384_AND_SHA384] if c == CURVE_P384
+      return [ECDSA_WITH_P521_AND_SHA512] if c == CURVE_P521
+      return []
+    }
+    Rsa(k) => {
+      size = k.size
+      out: [U16] = []
+      out << PSS_WITH_SHA256 if size >= 32 * 2 + 2
+      out << PSS_WITH_SHA384 if size >= 48 * 2 + 2
+      out << PSS_WITH_SHA512 if size >= 64 * 2 + 2
+      out << PKCS1_WITH_SHA256 if size >= 19 + 32 + 11
+      out << PKCS1_WITH_SHA384 if size >= 19 + 48 + 11
+      out << PKCS1_WITH_SHA512 if size >= 19 + 64 + 11
+      out << PKCS1_WITH_SHA1 if size >= 15 + 20 + 11
+      return out
+    }
+    Ed25519(_) => {
+      return [ED25519]
+    }
+    MlDsa(k) => {
+      n = k.parameters.to_s
+      return [MLDSA44] if n == "ML-DSA-44"
+      return [MLDSA65] if n == "ML-DSA-65"
+      return [MLDSA87]
+    }
+    _ => {
+      return []
+    }
+  }
+  []
+}
+
+# Go's selectSignatureScheme: the first of the peer's algorithms the
+# certificate's key supports.
+def select_signature_scheme(vers: U16, c: Certificate, peer_algs0: [U16]) -> ~U16 {
+  fail unsupported_certificate_error(c) if !c.private_key.signer?
+  supported = signature_schemes_for_public_key(vers, c.private_key.public)
+  if restrict = c.supported_signature_algorithms {
+    supported = supported.select { supported_signature_algorithm?(it, restrict) }.to_a
+  }
+  supported = supported.select { !disabled_signature_algorithm?(vers, it, false) }.to_a
+  fail unsupported_certificate_error(c) if supported.size == 0
+  peer_algs = peer_algs0
+  if peer_algs.size == 0 && vers == VERSION_TLS12 {
+    # For TLS 1.2, if the client didn't send signature_algorithms then we
+    # can assume that it supports SHA1. See RFC 5246, Section 7.4.1.4.1.
+    # SHA-1 signatures are disabled by default (Go's tlssha1=0).
+    fail TlsError.Msg("tls: missing signature_algorithms from TLS 1.2 peer")
+  }
+  for preferred in peer_algs {
+    return preferred if supported_signature_algorithm?(preferred, supported)
+  }
+  fail TlsError.Msg("tls: peer doesn't support any of the certificate's signature algorithms")
+}
+
+# Go's unsupportedCertificateError.
+def unsupported_certificate_error(c: Certificate) -> TlsError {
+  return TlsError.Msg("tls: certificate private key (" + private_key_type_name(c.private_key) + ") does not implement crypto.Signer") if !c.private_key.signer?
+  case c.private_key.public {
+    Ecdsa(k) => {
+      return TlsError.Msg("tls: unsupported certificate curve (" + k.curve.params.name + ")") if curve_id_for_ecdsa(k) == 0
+    }
+    Rsa(_) => {
+      return TlsError.Msg("tls: certificate RSA key size too small for supported signature algorithms")
+    }
+    Ed25519(_) => nil
+    MlDsa(_) => {
+      return TlsError.Msg("tls: ML-DSA certificates require TLS 1.3")
+    }
+    _ => {
+      return TlsError.Msg("tls: unsupported certificate key (" + key_type_name(c.private_key.public) + ")")
+    }
+  }
+  return TlsError.Msg("tls: peer doesn't support the certificate custom signature algorithms") if c.supported_signature_algorithms.some?
+  TlsError.Msg("tls: internal error: unsupported key (" + private_key_type_name(c.private_key) + ")")
+}
+
+# Go's crypto.SignMessage on a certificate key with a signature type and
+# hash (none: sign the message itself).
+def sign_handshake(key: x509.PrivateKey, rand: io.Reader, msg: [Byte], sig_type: Byte, sig_hash: crypto.Hash?) -> ~[Byte] {
+  if h = sig_hash {
+    d = h.new
+    d.write!(msg)
+    digest = d.sum([])
+    if sig_type == SIGNATURE_RSAPSS {
+      return key.~sign(rand, digest, rsa.PSSOptions.new(salt_length: rsa.PSS_SALT_LENGTH_EQUALS_HASH, hash: h))
+    }
+    return key.~sign(rand, digest, h)
+  }
+  key.~sign(rand, msg, DirectSigning.new)
+}

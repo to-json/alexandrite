@@ -1,4 +1,5 @@
 import "bufio"
+import "crypto/tls"
 import "net"
 import "strings"
 import "strconv"
@@ -11,8 +12,9 @@ import "encoding/base64"
 # `Connection: close` (no connection pool, no keep-alive on the client side).
 # Responses may be length-framed, chunked or read to end of stream. Redirects
 # (301, 302, 303, 307, 308) are followed up to `max_redirects` times, to http://
-# locations or paths on the same host. No timeouts (net has no deadlines), no
-# TLS (an https:// URL is an error), no proxies. With a `jar`, cookies are
+# locations or paths on the same host. https:// URLs go over crypto/tls with
+# `tls_config` (Go's Transport.TLSClientConfig; none: the defaults, with the
+# URL's host as ServerName). No timeouts (net has no deadlines), no proxies. With a `jar`, cookies are
 # sent from it and Set-Cookie headers stored in it on every hop (Go's
 # Client.Jar); a request's trace hooks (httptrace) fire on every hop.
 pub struct Client {
@@ -20,6 +22,8 @@ pub struct Client {
   max_redirects: Int
   # Where cookies come from and go to (none: no cookie handling).
   jar: CookieJar?
+  # The TLS configuration for https:// URLs (none: tls.Config defaults).
+  tls_config: tls.Config?
 
   # Sends `req` and reads the whole response.
   pub def do(req: Request) -> ~Response {
@@ -30,7 +34,7 @@ pub struct Client {
       if j = jar {
         sent = with_jar_cookies(cur, j)
       }
-      resp = ~send_once(sent)
+      resp = ~send_once(sent, tls_config)
       if j = jar {
         rc = read_set_cookies(resp.header)
         pu = nurl.parse(cur.url)
@@ -108,7 +112,7 @@ def first_addr(addrs: [Str]) -> Str {
   addrs[0]
 }
 
-def send_once(req: Request) -> ~Response {
+def send_once(req: Request, tls_config: tls.Config?) -> ~Response {
   u = ~parse_url(req.url)
   tr = req.trace || httptrace.ClientTrace.new
   tr.fire_get_conn(u.host_port)
@@ -126,8 +130,32 @@ def send_once(req: Request) -> ~Response {
   tr.fire_connect_done("tcp", addr, dc.err)
   conn = ~dc
   tr.fire_got_conn(httptrace.GotConnInfo.new(conn: conn, reused: false, was_idle: false, idle_time: 0))
-  bw = bufio.new_writer(conn)
-  br = bufio.new_reader(conn)
+  if u.scheme == "https" {
+    cfg = tls_config || tls.Config.new
+    cfg.server_name = u.host if cfg.server_name == ""
+    tc = tls.client(conn, cfg)
+    hs = tc.handshake!
+    if hs.err? {
+      conn.close!
+      ~hs
+    }
+    return ~exchange(req, u, tr, bufio.new_writer(tc), bufio.new_reader(tc), ->() {
+      t2 = tc
+      t2.close!
+      nil
+    })
+  }
+  ~exchange(req, u, tr, bufio.new_writer(conn), bufio.new_reader(conn), ->() {
+    c2 = conn
+    c2.close!
+    nil
+  })
+}
+
+# Writes the request and reads the response over an open connection, then
+# closes it.
+def exchange(req: Request, u: Url, tr: httptrace.ClientTrace, bw: bufio.Writer, br0: bufio.Reader, close: () -> Unit) -> ~Response {
+  br = br0
   h = req.header.clone
   h.set!("Host", req.host) unless h.has?("Host")
   # (the request's own Connection tokens are kept, as Go's transport does)
@@ -147,13 +175,13 @@ def send_once(req: Request) -> ~Response {
   wr = send_request_head(bw, req, h, u, tr)
   tr.fire_wrote_request(httptrace.WroteRequestInfo.new(err: wr.err))
   if wr.err? {
-    conn.close!
+    close.call
     ~wr
   }
   pk = br.peek!(1)
   tr.fire_got_first_response_byte if pk.ok? && pk.unwrap.size > 0
   resp = read_response(br, req.method == "HEAD")
-  conn.close!
+  close.call
   ~resp
 }
 

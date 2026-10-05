@@ -1,0 +1,372 @@
+# Go's cryptobyte Builder: building length-prefixed messages. A child
+# builder is filled by a block and then flushed into its parent with its
+# length prefix (Go's flushChild).
+
+import "encoding/asn1"
+import "math/big"
+import "strconv"
+import "time"
+import cbasn1 "golang.org/x/crypto/cryptobyte/asn1"
+
+pub error CryptobyteError {
+  Msg(msg: Str)
+
+  def message -> Str {
+    case self {
+      Msg(m) => m
+    }
+  }
+}
+
+struct BuilderState {
+  err: Error?
+  result: [Byte]
+  # The start of this builder's own bytes (a fixed builder's buffer is kept).
+  fixed_size: Bool
+  # A fixed builder's capacity.
+  cap: Int
+}
+
+# Go's cryptobyte.Builder. Copies share their state (D36): make one with
+# new_builder or new_fixed_builder.
+pub struct Builder {
+  st: [BuilderState]
+
+  # Sets the error; every later write is ignored and bytes fails with it.
+  pub def set_error!(e: Error) {
+    self.ensure!
+    self.st[0].err = e
+  }
+
+  # The built bytes, or the first error.
+  pub def bytes -> ~[Byte] {
+    return [] if st.size == 0
+    if e = st[0].err {
+      fail e
+    }
+    st[0].result
+  }
+
+  # The built bytes; panics on an error.
+  pub def bytes_or_panic -> [Byte] {
+    return [] if st.size == 0
+    if e = st[0].err {
+      panic(e.message)
+    }
+    st[0].result
+  }
+
+  pub def err -> Error? {
+    return none if st.size == 0
+    st[0].err
+  }
+
+  # The zero Builder (Builder.new) gets its state on its first write.
+  def ensure! {
+    self.st << BuilderState.new if st.size == 0
+  }
+
+  def add!(v: [Byte]) {
+    self.ensure!
+    return if st[0].err.some?
+    if st[0].fixed_size && st[0].result.size + v.size > st[0].cap {
+      self.st[0].err = CryptobyteError.Msg("cryptobyte: Builder is exceeding its fixed-size buffer")
+      return
+    }
+    self.st[0].result = st[0].result + v
+    nil
+  }
+
+  pub def add_u8!(v: U8) { self.add!([v]) }
+  pub def add_u16!(v: U16) { self.add!([(v >> 8).as_u8, v.as_u8]) }
+  pub def add_u24!(v: U32) { self.add!([(v >> 16).as_u8, (v >> 8).as_u8, v.as_u8]) }
+  pub def add_u32!(v: U32) { self.add!([(v >> 24).as_u8, (v >> 16).as_u8, (v >> 8).as_u8, v.as_u8]) }
+  pub def add_u48!(v: U64) { self.add!([(v >> 40).as_u8, (v >> 32).as_u8, (v >> 24).as_u8, (v >> 16).as_u8, (v >> 8).as_u8, v.as_u8]) }
+  pub def add_u64!(v: U64) { self.add!([(v >> 56).as_u8, (v >> 48).as_u8, (v >> 40).as_u8, (v >> 32).as_u8, (v >> 24).as_u8, (v >> 16).as_u8, (v >> 8).as_u8, v.as_u8]) }
+  pub def add_bytes!(v: [Byte]) { self.add!(v) }
+
+  # Removes the last n bytes written (they must be this builder's).
+  pub def unwrite!(n: Int) {
+    self.ensure!
+    return if st[0].err.some?
+    panic("cryptobyte: attempted to unwrite negative number of bytes") if n < 0
+    panic("cryptobyte: attempted to unwrite more than was written") if n > st[0].result.size
+    self.st[0].result = st[0].result[0...st[0].result.size - n]
+    nil
+  }
+
+  # A child builder for a length-prefixed part.
+  def child(len_len: Int) -> Builder {
+    s = st[0]
+    room = s.cap - s.result.size - len_len
+    room = 0 if room < 0
+    Builder.new(st: [BuilderState.new(fixed_size: s.fixed_size, cap: room)])
+  }
+
+  # Go's flushChild: the child's bytes with an n-byte length prefix (or an
+  # ASN.1 DER length when asn1 is set).
+  def flush!(c: Builder, len_len: Int, is_asn1: Bool) {
+    self.ensure!
+    if e = c.st[0].err {
+      self.st[0].err = e
+      return
+    }
+    body = c.st[0].result
+    length = body.size
+    if is_asn1 {
+      prefix: [Byte] = []
+      if length > 0xfffffffe {
+        self.st[0].err = CryptobyteError.Msg("pending ASN.1 child too long")
+        return
+      } else if length > 0xffffff {
+        prefix = [0x84.as_u8, (length >> 24).as_u8, (length >> 16).as_u8, (length >> 8).as_u8, length.as_u8]
+      } else if length > 0xffff {
+        prefix = [0x83.as_u8, (length >> 16).as_u8, (length >> 8).as_u8, length.as_u8]
+      } else if length > 0xff {
+        prefix = [0x82.as_u8, (length >> 8).as_u8, length.as_u8]
+      } else if length > 0x7f {
+        prefix = [0x81.as_u8, length.as_u8]
+      } else {
+        prefix = [length.as_u8]
+      }
+      self.add!(prefix + body)
+      return
+    }
+    prefix = [0.as_u8; len_len]
+    l = length
+    i = len_len - 1
+    while i >= 0 {
+      prefix[i] = l.as_u8
+      l = l >> 8
+      i -= 1
+    }
+    if l != 0 {
+      self.st[0].err = CryptobyteError.Msg("cryptobyte: pending child length #{length} exceeds #{len_len}-byte length prefix")
+      return
+    }
+    self.add!(prefix + body)
+  }
+
+  def add_length_prefixed!(len_len: Int, is_asn1: Bool, f: (Builder) -> Unit) {
+    self.ensure!
+    return if st[0].err.some?
+    c = self.child(len_len)
+    f.call(c)
+    self.flush!(c, len_len, is_asn1)
+  }
+
+  # A part prefixed by its length in one byte, filled by the block.
+  pub def add_u8_length_prefixed!(f: (Builder) -> Unit) { self.add_length_prefixed!(1, false, f) }
+  pub def add_u16_length_prefixed!(f: (Builder) -> Unit) { self.add_length_prefixed!(2, false, f) }
+  pub def add_u24_length_prefixed!(f: (Builder) -> Unit) { self.add_length_prefixed!(3, false, f) }
+  pub def add_u32_length_prefixed!(f: (Builder) -> Unit) { self.add_length_prefixed!(4, false, f) }
+
+  # An ASN.1 element with the given tag, its contents filled by the block.
+  pub def add_asn1!(tag: Byte, f: (Builder) -> Unit) {
+    self.ensure!
+    return if st[0].err.some?
+    # Identifiers with the low five bits set indicate high-tag-number
+    # format (two or more octets), which we don't support.
+    if tag & 0x1f == 0x1f {
+      self.st[0].err = CryptobyteError.Msg("cryptobyte: high-tag number identifier octets not supported: 0x#{strconv.format_int(tag.to_i, 16)}")
+      return
+    }
+    self.add_u8!(tag)
+    self.add_length_prefixed!(1, true, f)
+  }
+
+  # An ASN.1 element with the given tag and contents.
+  def add_asn1_raw!(tag: Byte, contents: [Byte]) {
+    self.ensure!
+    return if st[0].err.some?
+    c = self.child(1)
+    c.add_bytes!(contents)
+    self.add_u8!(tag)
+    self.flush!(c, 1, true)
+  }
+
+  def add_asn1_signed!(tag: Byte, v: Int) {
+    length = 1
+    i = v
+    while i >= 0x80 || i < -0x80 {
+      length += 1
+      i = i >> 8
+    }
+    out: [Byte] = []
+    while length > 0 {
+      out << ((v >> ((length - 1) * 8)) & 0xff).as_u8
+      length -= 1
+    }
+    self.add_asn1_raw!(tag, out)
+  }
+
+  # An ASN.1 INTEGER.
+  pub def add_asn1_int64!(v: Int) { self.add_asn1_signed!(cbasn1.INTEGER, v) }
+
+  # An INTEGER-encoded value with another tag.
+  pub def add_asn1_int64_with_tag!(v: Int, tag: Byte) { self.add_asn1_signed!(tag, v) }
+
+  # An ASN.1 ENUMERATED.
+  pub def add_asn1_enum!(v: Int) { self.add_asn1_signed!(cbasn1.ENUM, v) }
+
+  pub def add_asn1_uint64!(v: U64) {
+    length = 1
+    i = v
+    while i >= 0x80 {
+      length += 1
+      i = i >> 8
+    }
+    out: [Byte] = []
+    while length > 0 {
+      out << ((v >> ((length - 1) * 8)) & 0xff).as_u8
+      length -= 1
+    }
+    self.add_asn1_raw!(cbasn1.INTEGER, out)
+  }
+
+  pub def add_asn1_big_int!(n: big.Int) {
+    self.ensure!
+    return if st[0].err.some?
+    out: [Byte] = []
+    if n.sign < 0 {
+      # A negative number has to be converted to two's-complement form. So
+      # we'll invert and subtract 1. If the most-significant-bit isn't set
+      # then we'll need to pad the beginning with 0xff in order to keep the
+      # number negative.
+      n_minus1 = big.Int.new
+      n_minus1.neg!(n)
+      n_minus1.sub!(n_minus1, big.new_int(1))
+      bytes = n_minus1.bytes
+      k = 0
+      while k < bytes.size {
+        bytes[k] = bytes[k] ^ 0xff
+        k += 1
+      }
+      out << 0xff if bytes.size == 0 || bytes[0] & 0x80 == 0
+      out = out + bytes
+    } else if n.sign == 0 {
+      out << 0
+    } else {
+      bytes = n.bytes
+      out << 0 if bytes[0] & 0x80 != 0
+      out = out + bytes
+    }
+    self.add_asn1_raw!(cbasn1.INTEGER, out)
+  }
+
+  pub def add_asn1_octet_string!(bytes: [Byte]) { self.add_asn1_raw!(cbasn1.OCTET_STRING, bytes) }
+
+  pub def add_asn1_generalized_time!(t: time.Time) {
+    self.ensure!
+    if t.year < 0 || t.year > 9999 {
+      self.st[0].err = CryptobyteError.Msg("cryptobyte: cannot represent #{t} as a GeneralizedTime")
+      return
+    }
+    self.add_asn1_raw!(cbasn1.GENERALIZED_TIME, t.format(GENERALIZED_TIME_FORMAT_STR).bytes)
+  }
+
+  pub def add_asn1_utc_time!(t: time.Time) {
+    self.ensure!
+    # As utilized by the X.509 profile, UTCTime can only represent the
+    # years 1950 through 2049.
+    if t.year < 1950 || t.year >= 2050 {
+      # Go writes the tag before it notices (the continuation sets the
+      # error), so nothing usable is written either way.
+      self.add_u8!(cbasn1.UTC_TIME)
+      self.st[0].err = CryptobyteError.Msg("cryptobyte: cannot represent #{t} as a UTCTime")
+      return
+    }
+    self.add_asn1_raw!(cbasn1.UTC_TIME, t.format(DEFAULT_UTC_TIME_FORMAT_STR).bytes)
+  }
+
+  # A BIT STRING of whole bytes.
+  pub def add_asn1_bit_string!(data: [Byte]) { self.add_asn1_raw!(cbasn1.BIT_STRING, [0.as_u8] + data) }
+
+  pub def add_asn1_object_identifier!(oid: asn1.ObjectIdentifier) {
+    self.ensure!
+    if !valid_oid?(oid) {
+      self.add_u8!(cbasn1.OBJECT_IDENTIFIER)
+      self.st[0].err = CryptobyteError.Msg("cryptobyte: invalid OID: [#{oid.arcs.map { it.to_s }.to_a.join(" ")}]")
+      return
+    }
+    out = add_base128_int([], oid.arcs[0] * 40 + oid.arcs[1])
+    for v in oid.arcs[2...oid.arcs.size] {
+      out = add_base128_int(out, v)
+    }
+    self.add_asn1_raw!(cbasn1.OBJECT_IDENTIFIER, out)
+  }
+
+  pub def add_asn1_boolean!(v: Bool) { self.add_asn1_raw!(cbasn1.BOOLEAN, [v ? 0xff.as_u8 : 0.as_u8]) }
+
+  pub def add_asn1_null! { self.add!([cbasn1.NULL, 0]) }
+
+  # Appends the DER encoding of v (encoding/asn1's Marshal; v derives Asn1).
+  pub def marshal_asn1![T: asn1.Marshaler](v: T) {
+    self.ensure!
+    return if st[0].err.some?
+    r = asn1.marshal(v)
+    if e = r.err {
+      self.st[0].err = e
+      return
+    }
+    self.add_bytes!(r.unwrap)
+  }
+
+  # Calls v.marshal(self); an error becomes the builder's.
+  pub def add_value![V: MarshalingValue](v: V) {
+    self.ensure!
+    r = v.marshal(self)
+    if e = r.err {
+      self.st[0].err = e
+    }
+  }
+}
+
+# A value that can marshal itself into a Builder (Go's MarshalingValue).
+pub interface MarshalingValue {
+  def marshal(b: Builder) -> ~Unit
+}
+
+# A Builder appending to buffer (Go's NewBuilder).
+pub def new_builder(buffer: [Byte]) -> Builder {
+  Builder.new(st: [BuilderState.new(result: buffer + [])])
+}
+
+# A Builder that may not grow past the size of buffer (Go's
+# NewFixedBuilder; there the limit is cap(buffer) and the bytes already in
+# buffer are kept). The result starts with buffer's bytes.
+pub def new_fixed_builder(buffer: [Byte], capacity: Int) -> Builder {
+  Builder.new(st: [BuilderState.new(result: buffer + [], fixed_size: true, cap: capacity)])
+}
+
+def add_base128_int(dst: [Byte], n: Int) -> [Byte] {
+  out = dst
+  length = 0
+  if n == 0 {
+    length = 1
+  } else {
+    i = n
+    while i > 0 {
+      length += 1
+      i = i >> 7
+    }
+  }
+  i = length - 1
+  while i >= 0 {
+    o = (n >> (i * 7)).as_u8 & 0x7f
+    o = o | 0x80 if i != 0
+    out << o
+    i -= 1
+  }
+  out
+}
+
+def valid_oid?(oid: asn1.ObjectIdentifier) -> Bool {
+  a = oid.arcs
+  return false if a.size < 2
+  return false if a[0] > 2 || (a[0] <= 1 && a[1] >= 40)
+  for v in a {
+    return false if v < 0
+  }
+  true
+}

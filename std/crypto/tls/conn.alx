@@ -1,0 +1,1002 @@
+# The connection and its record layer (Go's conn.go).
+
+import "crypto/subtle"
+import "strconv"
+import "crypto/x509"
+import "io"
+import "net"
+
+# What a Conn runs over: Go's net.Conn as functions, so any transport works
+# (a net.Conn through `net_transport`, an in-memory pipe in the tests).
+pub struct Transport {
+  read: ([Byte]) -> ~Int
+  write: ([Byte]) -> ~Int
+  close: () -> ~Unit
+  close_write: () -> ~Unit
+  local_addr: Str
+  remote_addr: Str
+}
+
+# A Transport over a net.Conn.
+pub def net_transport(conn: net.Conn) -> Transport {
+  c = conn
+  Transport.new(
+    read: ->(p: [Byte]) -> ~Int {
+      cc = c
+      cc.~read!(p)
+    },
+    write: ->(p: [Byte]) -> ~Int {
+      cc = c
+      cc.~write!(p)
+    },
+    close: ->() -> ~Unit {
+      cc = c
+      cc.~close!
+    },
+    close_write: ->() -> ~Unit {
+      cc = c
+      cc.~close_write!
+    },
+    local_addr: conn.local_addr,
+    remote_addr: conn.remote_addr
+  )
+}
+
+# One direction of the record layer (Go's halfConn).
+struct HalfConn {
+  # The first permanent error.
+  err: Error?
+  version: U16
+  ciph: RecordCipher
+  mac: RecordMac?
+  seq: [Byte]
+  next_cipher: RecordCipher
+  next_mac: RecordMac?
+  has_next: Bool
+  # The current TLS 1.3 traffic secret.
+  traffic_secret: [Byte]
+
+  def prepare_cipher_spec!(version: U16, c: RecordCipher, m: RecordMac?) {
+    self.version = version
+    self.next_cipher = c
+    self.next_mac = m
+    self.has_next = true
+  }
+
+  # Switches to the prepared ciph; false is Go's alertInternalError.
+  def change_cipher_spec! -> Bool {
+    return false if !has_next || version == VERSION_TLS13
+    self.ciph = next_cipher
+    self.mac = next_mac
+    self.next_cipher = RecordCipher.Null
+    self.next_mac = none
+    self.has_next = false
+    self.seq = [0.as_u8; 8]
+    true
+  }
+
+  def set_traffic_secret!(suite: CipherSuiteTLS13, secret: [Byte]) {
+    self.traffic_secret = secret
+    key, iv = traffic_key(suite, secret)
+    self.ciph = RecordCipher.Aead(aead_tls13(suite, key, iv))
+    self.seq = [0.as_u8; 8]
+  }
+
+  def inc_seq! {
+    s = seq
+    i = 7
+    while i >= 0 {
+      s[i] = s[i] +% 1
+      return if s[i] != 0
+      i -= 1
+    }
+    # Not allowed to let sequence number wrap. Instead, must renegotiate
+    # before it does. Not likely enough to bother.
+    panic("TLS: sequence number wraparound")
+  }
+
+  def explicit_nonce_len -> Int {
+    case ciph {
+      Aead(a) => a.explicit_nonce_len
+      Null => 0
+      Rc4(_) => 0
+      _ => version >= VERSION_TLS11 ? ciph.block_size : 0
+    }
+  }
+
+  # Go's decrypt: the plaintext and type, or the alert to send (third
+  # element >= 0).
+  def decrypt!(record: [Byte]) -> ([Byte], Byte, Int) {
+    typ = record[0]
+    payload = record[RECORD_HEADER_LEN...record.size]
+    # In TLS 1.3, change_cipher_spec messages are to be ignored without
+    # being decrypted. See RFC 8446, Appendix D.4.
+    return (payload, typ, -1) if version == VERSION_TLS13 && typ == RECORD_TYPE_CHANGE_CIPHER_SPEC
+    padding_good = 255
+    padding_len = 0
+    explicit = self.explicit_nonce_len
+    plaintext = payload
+    if !ciph.null? {
+      case ciph {
+        Rc4(_) => {
+          ciph.crypt_blocks(payload, payload)
+          plaintext = payload
+        }
+        Aead(c) => {
+          return ([], 0, ALERT_BAD_RECORD_MAC) if payload.size < explicit
+          nonce = payload[0...explicit]
+          nonce = seq if nonce.size == 0
+          payload = payload[explicit...payload.size]
+          ad: [Byte] = []
+          if version == VERSION_TLS13 {
+            ad = record[0...RECORD_HEADER_LEN]
+          } else {
+            n = payload.size - c.overhead
+            ad = seq + record[0...3] + [(n >> 8).as_u8, n.as_u8]
+          }
+          r = c.open([], nonce, payload, ad)
+          return ([], 0, ALERT_BAD_RECORD_MAC) if !r.ok?
+          plaintext = r.unwrap
+        }
+        _ => {
+          block_size = ciph.block_size
+          ms = (mac || RecordMac.new).size
+          min_payload = explicit + round_up(ms + 1, block_size)
+          return ([], 0, ALERT_BAD_RECORD_MAC) if payload.size % block_size != 0 || payload.size < min_payload
+          if explicit > 0 {
+            ciph.set_iv(payload[0...explicit])
+            payload = payload[explicit...payload.size]
+          }
+          ciph.crypt_blocks(payload, payload)
+          # In a limited attempt to protect against CBC padding oracles like
+          # Lucky13, the data past paddingLen (which is secret) is passed to
+          # the MAC function as extra data, to be fed into the HMAC after
+          # computing the digest. (Go; here the MAC is computed once.)
+          padding_len, padding_good = extract_padding(payload)
+          plaintext = payload
+        }
+      }
+      if version == VERSION_TLS13 {
+        return ([], 0, ALERT_UNEXPECTED_MESSAGE) if typ != RECORD_TYPE_APPLICATION_DATA
+        return ([], 0, ALERT_RECORD_OVERFLOW) if plaintext.size > MAX_PLAINTEXT + 1
+        # Remove padding and find the ContentType scanning from the end.
+        i = plaintext.size - 1
+        found = false
+        while i >= 0 {
+          if plaintext[i] != 0 {
+            typ = plaintext[i]
+            plaintext = plaintext[0...i]
+            found = true
+            break
+          }
+          i -= 1
+        }
+        return ([], 0, ALERT_UNEXPECTED_MESSAGE) if !found
+      }
+    }
+    if m = mac {
+      mac_size = m.size
+      return ([], 0, ALERT_BAD_RECORD_MAC) if payload.size < mac_size
+      n = payload.size - mac_size - padding_len
+      # if n < 0 { n = 0 }
+      n = 0 if n < 0
+      hdr = record[0...3] + [(n >> 8).as_u8, n.as_u8]
+      remote_mac = payload[n...n + mac_size]
+      local_mac = m.compute(seq, hdr, payload[0...n])
+      # This is equivalent to checking the MACs and paddingGood separately,
+      # but in constant-time to prevent distinguishing padding failures
+      # from MAC failures. Depending on what value of paddingLen was
+      # returned on bad padding, distinguishing bad MAC from bad padding
+      # can lead to an attack.
+      good = subtle.constant_time_compare(local_mac, remote_mac) & (padding_good == 255 ? 1 : 0)
+      return ([], 0, ALERT_BAD_RECORD_MAC) if good != 1
+      plaintext = payload[0...n]
+    }
+    self.inc_seq!
+    (plaintext, typ, -1)
+  }
+
+  # Go's encrypt: record (a 5-byte header) with the protected payload.
+  def encrypt!(record0: [Byte], payload: [Byte], rand: Config) -> ~[Byte] {
+    record = record0
+    return record + payload if ciph.null?
+    explicit_nonce: [Byte] = []
+    explicit = self.explicit_nonce_len
+    if explicit > 0 {
+      if !ciph.cbc? && explicit < 16 {
+        explicit_nonce = seq + []
+      } else {
+        explicit_nonce = ~rand.rand_bytes(explicit)
+      }
+      record = record + explicit_nonce
+    }
+    case ciph {
+      Rc4(_) => {
+        m = mac || RecordMac.new
+        mc = m.compute(seq, record[0...RECORD_HEADER_LEN], payload)
+        dst = payload + mc
+        ciph.crypt_blocks(dst, dst)
+        record = record + dst
+      }
+      Aead(c) => {
+        nonce = explicit_nonce
+        nonce = seq if nonce.size == 0
+        if version == VERSION_TLS13 {
+          inner = payload + [record[0]]
+          n = payload.size + 1 + c.overhead
+          hdr = [RECORD_TYPE_APPLICATION_DATA, record[1], record[2], (n >> 8).as_u8, n.as_u8]
+          record = c.seal(hdr, nonce, inner, hdr)
+        } else {
+          ad = seq + record[0...RECORD_HEADER_LEN]
+          record = c.seal(record, nonce, payload, ad)
+        }
+      }
+      _ => {
+        m = mac || RecordMac.new
+        mc = m.compute(seq, record[0...RECORD_HEADER_LEN], payload)
+        block_size = ciph.block_size
+        plaintext_len = payload.size + mc.size
+        padding_len = block_size - plaintext_len % block_size
+        dst = payload + mc + [(padding_len - 1).as_u8; padding_len]
+        ciph.set_iv(explicit_nonce) if explicit_nonce.size > 0
+        ciph.crypt_blocks(dst, dst)
+        record = record + dst
+      }
+    }
+    # Update length to include nonce, MAC and any block padding needed.
+    n = record.size - RECORD_HEADER_LEN
+    record[3] = (n >> 8).as_u8
+    record[4] = n.as_u8
+    self.inc_seq!
+    record
+  }
+}
+
+def new_half_conn -> HalfConn { HalfConn.new(ciph: RecordCipher.Null, next_cipher: RecordCipher.Null, seq: [0.as_u8; 8]) }
+
+def round_up(a: Int, b: Int) -> Int { a + (b - a % b) % b }
+
+# Go's extractPadding: the number of bytes to remove and 255 if the padding
+# is good (0 if not), in constant time.
+def extract_padding(payload: [Byte]) -> (Int, Int) {
+  return (0, 0) if payload.size < 1
+  padding_len = payload[payload.size - 1].to_i
+  t = payload.size - 1 - padding_len
+  # if len(payload) >= (paddingLen - 1) then the MSB of t is zero
+  good = t < 0 ? 0 : 255
+  # The maximum possible padding length plus the actual length field
+  to_check = 256
+  to_check = payload.size if to_check > payload.size
+  i = 0
+  while i < to_check {
+    tt = padding_len - i
+    # if i <= paddingLen then the MSB of t is zero
+    mask = tt < 0 ? 0 : 255
+    b = payload[payload.size - 1 - i].to_i
+    good = good & ^((mask & padding_len) ^ (mask & b)) & 255
+    i += 1
+  }
+  # We AND together the bits of good and replicate the result across all
+  # the bits.
+  good = good == 255 ? 255 : 0
+  padding_len = padding_len & good
+  (padding_len + 1, good)
+}
+
+# The state of a connection; every copy of a Conn shares it (D36).
+struct ConnState {
+  transport: Transport
+  is_client: Bool
+  config: Config
+  handshake_complete: Bool
+  handshake_err: Error?
+  vers: U16
+  have_vers: Bool
+  handshakes: Int
+  ext_master_secret: Bool
+  did_resume: Bool
+  did_hrr: Bool
+  cipher_suite: U16
+  curve_id: U16
+  peer_sig_alg: U16
+  ocsp_response: [Byte]
+  scts: [[Byte]]
+  peer_certificates: [x509.Certificate]
+  local_certificate: [[Byte]]
+  verified_chains: [[x509.Certificate]]
+  server_name: Str
+  secure_renegotiation: Bool
+  ekm: Ekm
+  resumption_secret: [Byte]
+  ticket_keys: [TicketKey]
+  client_finished_is_first: Bool
+  close_notify_err: Error?
+  close_notify_sent: Bool
+  closed: Bool
+  client_finished: [Byte]
+  server_finished: [Byte]
+  client_protocol: Str
+  in: HalfConn
+  out: HalfConn
+  raw_input: [Byte]
+  input: [Byte]
+  hand: [Byte]
+  buffering: Bool
+  send_buf: [Byte]
+  bytes_sent: Int
+  packets_sent: Int
+  retry_count: Int
+}
+
+TCP_MSS_ESTIMATE = 1208
+RECORD_SIZE_BOOST_THRESHOLD = 128 * 1024
+
+# A secured connection (Go's tls.Conn). Copies are the same connection.
+# Unlike Go's, a Conn isn't safe for concurrent use: read and write from
+# one task at a time.
+pub struct Conn {
+  st: [ConnState]
+
+  pub def local_addr -> Str { st[0].transport.local_addr }
+  pub def remote_addr -> Str { st[0].transport.remote_addr }
+
+  # Go's NetConn: the underlying transport.
+  pub def transport -> Transport { st[0].transport }
+
+  def config -> Config { st[0].config }
+  def vers -> U16 { st[0].vers }
+
+  def set_in_err!(e: Error) -> Error {
+    self.st[0].in.err = e
+    e
+  }
+
+  def set_out_err!(e: Error) -> Error {
+    self.st[0].out.err = e
+    e
+  }
+
+  # Go's sendAlertLocked: sends the alert and records the error (the
+  # returned error is Go's).
+  def send_alert!(a: Int) -> Error {
+    level = (a == ALERT_NO_RENEGOTIATION || a == ALERT_CLOSE_NOTIFY) ? ALERT_LEVEL_WARNING : ALERT_LEVEL_ERROR
+    r = self.write_record!(RECORD_TYPE_ALERT, [level, a.as_u8])
+    if a == ALERT_CLOSE_NOTIFY {
+      if e = r.err {
+        return e
+      }
+      return TlsError.Alert(a)
+    }
+    self.set_out_err!(TlsError.LocalAlert(a))
+  }
+
+  # Go's newRecordHeaderError.
+  def record_header_error(msg: Str) -> TlsError {
+    raw = st[0].raw_input
+    n = raw.size < 5 ? raw.size : 5
+    TlsError.RecordHeader(msg, raw[0...n] + [0.as_u8; 5 - n])
+  }
+
+  # Go's readFromUntil: reads until raw_input holds n bytes.
+  def read_from_until!(n: Int) -> ~Unit {
+    while st[0].raw_input.size < n {
+      buf = [0.as_u8; 16384 + 2048 + 5]
+      k = st[0].transport.read.~call(buf)
+      if k == 0 {
+        fail io.StreamError.UnexpectedEof
+      }
+      self.st[0].raw_input = st[0].raw_input + buf[0...k]
+    }
+  }
+
+  def read_record! -> ~Unit { self.~read_record_or_ccs!(false) }
+
+  def read_change_cipher_spec! -> ~Unit { self.~read_record_or_ccs!(true) }
+
+  # Go's readRecordOrCCS.
+  def read_record_or_ccs!(expect_change_cipher_spec: Bool) -> ~Unit {
+    if e = st[0].in.err {
+      fail e
+    }
+    handshake_complete = st[0].handshake_complete
+    # This function modifies c.rawInput, which owns the c.input memory.
+    if st[0].input.size != 0 {
+      fail self.set_in_err!(TlsError.Msg("tls: internal error: attempted to read record with pending application data"))
+    }
+    # Read header, payload.
+    r = self.read_from_until!(RECORD_HEADER_LEN)
+    if e = r.err {
+      # RFC 8446, Section 6.1 suggests that EOF without an alertCloseNotify
+      # is an error, but popular web sites seem to do this, so we accept it
+      # if and only if at the record boundary.
+      if st[0].raw_input.size == 0 {
+        case e {
+          io.StreamError.UnexpectedEof => {
+            fail self.set_in_err!(TlsError.Eof)
+          }
+          _ => nil
+        }
+      }
+      fail self.set_in_err!(e)
+    }
+    hdr = st[0].raw_input[0...RECORD_HEADER_LEN]
+    typ = hdr[0]
+    # No valid TLS record has a type of 0x80, however SSLv2 handshakes start
+    # with a uint16 length where the MSB is set and the first record is
+    # always < 256 bytes long. Therefore typ == 0x80 strongly suggests an
+    # SSLv2 client.
+    if !handshake_complete && typ == 0x80 {
+      self.send_alert!(ALERT_PROTOCOL_VERSION)
+      fail self.set_in_err!(self.record_header_error("unsupported SSLv2 handshake received"))
+    }
+    vers = (hdr[1].to_u16 << 8) | hdr[2].to_u16
+    expected_vers = st[0].vers
+    expected_vers = VERSION_TLS12 if expected_vers == VERSION_TLS13
+    n = (hdr[3].to_i << 8) | hdr[4].to_i
+    if st[0].have_vers && vers != expected_vers {
+      self.send_alert!(ALERT_PROTOCOL_VERSION)
+      fail self.set_in_err!(self.record_header_error("received record with version " + hexs16(vers) + " when expecting version " + hexs16(expected_vers)))
+    }
+    if !st[0].have_vers {
+      # First message, be extra suspicious: this might not be a TLS client.
+      # Bail out before reading a full 'body', if possible. The current max
+      # version is 3.3 so if the version is >= 16.0, it's probably not
+      # real.
+      if (typ != RECORD_TYPE_ALERT && typ != RECORD_TYPE_HANDSHAKE) || vers >= 0x1000 {
+        fail self.set_in_err!(self.record_header_error("first record does not look like a TLS handshake"))
+      }
+    }
+    if (st[0].vers == VERSION_TLS13 && n > MAX_CIPHERTEXT_TLS13) || n > MAX_CIPHERTEXT {
+      self.send_alert!(ALERT_RECORD_OVERFLOW)
+      fail self.set_in_err!(self.record_header_error("oversized record received with length #{n}"))
+    }
+    r2 = self.read_from_until!(RECORD_HEADER_LEN + n)
+    if e = r2.err {
+      fail self.set_in_err!(e)
+    }
+    # Process message.
+    raw = st[0].raw_input
+    record = raw[0...RECORD_HEADER_LEN + n] + []
+    self.st[0].raw_input = raw[RECORD_HEADER_LEN + n...raw.size]
+    data, typ2, al = self.st[0].in.decrypt!(record)
+    typ = typ2
+    if al >= 0 {
+      fail self.set_in_err!(self.send_alert!(al))
+    }
+    if data.size > MAX_PLAINTEXT {
+      fail self.set_in_err!(self.send_alert!(ALERT_RECORD_OVERFLOW))
+    }
+    # Application Data messages are always protected.
+    if st[0].in.ciph.null? && typ == RECORD_TYPE_APPLICATION_DATA {
+      fail self.set_in_err!(self.send_alert!(ALERT_UNEXPECTED_MESSAGE))
+    }
+    if typ != RECORD_TYPE_ALERT && typ != RECORD_TYPE_CHANGE_CIPHER_SPEC && data.size > 0 {
+      # This is a state-advancing message: reset the retry count.
+      self.st[0].retry_count = 0
+    }
+    # Handshake messages MUST NOT be interleaved with other record types in
+    # TLS 1.3.
+    if st[0].vers == VERSION_TLS13 && typ != RECORD_TYPE_HANDSHAKE && st[0].hand.size > 0 {
+      fail self.set_in_err!(self.send_alert!(ALERT_UNEXPECTED_MESSAGE))
+    }
+    if typ == RECORD_TYPE_ALERT {
+      fail self.set_in_err!(self.send_alert!(ALERT_UNEXPECTED_MESSAGE)) if data.size != 2
+      a = data[1].to_i
+      fail self.set_in_err!(TlsError.Eof) if a == ALERT_CLOSE_NOTIFY
+      if st[0].vers == VERSION_TLS13 {
+        # TLS 1.3 removed warning-level alerts except for alertUserCanceled
+        # (RFC 8446, § 6.1). Since at least one major implementation
+        # (https://bugs.openjdk.org/browse/JDK-8323517) misuses this alert,
+        # many TLS stacks now ignore it outright when seen in a TLS 1.3
+        # handshake (e.g. BoringSSL, NSS, Rustls).
+        return self.~retry_read_record!(expect_change_cipher_spec) if a == ALERT_USER_CANCELED
+        fail self.set_in_err!(TlsError.RemoteAlert(a))
+      }
+      return self.~retry_read_record!(expect_change_cipher_spec) if data[0] == ALERT_LEVEL_WARNING
+      fail self.set_in_err!(TlsError.RemoteAlert(a)) if data[0] == ALERT_LEVEL_ERROR
+      fail self.set_in_err!(self.send_alert!(ALERT_UNEXPECTED_MESSAGE))
+    } else if typ == RECORD_TYPE_CHANGE_CIPHER_SPEC {
+      fail self.set_in_err!(self.send_alert!(ALERT_DECODE_ERROR)) if data.size != 1 || data[0] != 1
+      # Handshake messages are not allowed to fragment across the CCS.
+      fail self.set_in_err!(self.send_alert!(ALERT_UNEXPECTED_MESSAGE)) if st[0].hand.size > 0
+      # In TLS 1.3, change_cipher_spec records are ignored until the
+      # Finished. See RFC 8446, Appendix D.4. Note that according to Section
+      # 5, a server can send a ChangeCipherSpec before its ServerHello, when
+      # c.vers is still unset. That's not useful though and suspicious if
+      # the server then selects a lower protocol version, so don't allow
+      # that.
+      return self.~retry_read_record!(expect_change_cipher_spec) if st[0].vers == VERSION_TLS13
+      fail self.set_in_err!(self.send_alert!(ALERT_UNEXPECTED_MESSAGE)) if !expect_change_cipher_spec
+      if !self.st[0].in.change_cipher_spec! {
+        fail self.set_in_err!(self.send_alert!(ALERT_INTERNAL_ERROR))
+      }
+    } else if typ == RECORD_TYPE_APPLICATION_DATA {
+      fail self.set_in_err!(self.send_alert!(ALERT_UNEXPECTED_MESSAGE)) if !handshake_complete || expect_change_cipher_spec
+      # Some OpenSSL servers send empty records in order to randomize the
+      # CBC IV. Ignore a limited number of empty records.
+      return self.~retry_read_record!(expect_change_cipher_spec) if data.size == 0
+      # Note that data is owned by c.rawInput, following the Next call
+      # above, to avoid copying the plaintext. This is safe because c.input
+      # is drained before the next record read.
+      self.st[0].input = data
+    } else if typ == RECORD_TYPE_HANDSHAKE {
+      fail self.set_in_err!(self.send_alert!(ALERT_UNEXPECTED_MESSAGE)) if data.size == 0 || expect_change_cipher_spec
+      self.st[0].hand = st[0].hand + data
+    } else {
+      fail self.set_in_err!(self.send_alert!(ALERT_UNEXPECTED_MESSAGE))
+    }
+    nil
+  }
+
+  # Go's retryReadRecord: a record that didn't advance the handshake.
+  def retry_read_record!(expect_change_cipher_spec: Bool) -> ~Unit {
+    self.st[0].retry_count = st[0].retry_count + 1
+    if st[0].retry_count > MAX_USELESS_RECORDS {
+      self.send_alert!(ALERT_UNEXPECTED_MESSAGE)
+      fail self.set_in_err!(TlsError.Msg("tls: too many ignored records"))
+    }
+    self.~read_record_or_ccs!(expect_change_cipher_spec)
+  }
+
+  # Go's maxPayloadSizeForWrite (dynamic record sizing).
+  def max_payload_size_for_write!(typ: Byte) -> Int {
+    return MAX_PLAINTEXT if st[0].config.dynamic_record_sizing_disabled || typ != RECORD_TYPE_APPLICATION_DATA
+    return MAX_PLAINTEXT if st[0].bytes_sent >= RECORD_SIZE_BOOST_THRESHOLD
+    # Subtract TLS overheads to get the maximum payload size.
+    payload_bytes = TCP_MSS_ESTIMATE - RECORD_HEADER_LEN - st[0].out.explicit_nonce_len
+    c = st[0].out.ciph
+    case c {
+      Null => nil
+      Rc4(_) => {
+        payload_bytes -= (st[0].out.mac || RecordMac.new).size
+      }
+      Aead(a) => {
+        payload_bytes -= a.overhead
+      }
+      _ => {
+        bs = c.block_size
+        # The payload must fit in a multiple of blockSize, with room for at
+        # least one padding byte.
+        payload_bytes = (payload_bytes & ^(bs - 1)) - 1
+        # The MAC is appended before padding so affects the payload size
+        # directly.
+        payload_bytes -= (st[0].out.mac || RecordMac.new).size
+      }
+    }
+    payload_bytes -= 1 if st[0].vers == VERSION_TLS13
+    # Allow packet growth in arithmetic progression up to max.
+    pkt = st[0].packets_sent
+    self.st[0].packets_sent = pkt + 1
+    return MAX_PLAINTEXT if pkt > 1000
+    n = payload_bytes * (pkt + 1)
+    n = MAX_PLAINTEXT if n > MAX_PLAINTEXT
+    n
+  }
+
+  def write_raw!(data: [Byte]) -> ~Int {
+    if st[0].buffering {
+      self.st[0].send_buf = st[0].send_buf + data
+      return data.size
+    }
+    n = st[0].transport.write.~call(data)
+    self.st[0].bytes_sent = st[0].bytes_sent + n
+    n
+  }
+
+  def flush! -> ~Int {
+    return 0 if st[0].send_buf.size == 0
+    buf = st[0].send_buf
+    self.st[0].send_buf = []
+    self.st[0].buffering = false
+    n = st[0].transport.write.~call(buf)
+    self.st[0].bytes_sent = st[0].bytes_sent + n
+    n
+  }
+
+  # Go's writeRecordLocked: writes data as records of type typ.
+  def write_record!(typ: Byte, data0: [Byte]) -> ~Int {
+    data = data0
+    n = 0
+    while data.size > 0 {
+      m = data.size
+      max_payload = self.max_payload_size_for_write!(typ)
+      m = max_payload if m > max_payload
+      vers = st[0].vers
+      if vers == 0 {
+        # Some TLS servers fail if the record version is greater than
+        # TLS 1.0 for the initial ClientHello.
+        vers = VERSION_TLS10
+      } else if vers == VERSION_TLS13 {
+        # TLS 1.3 froze the record layer version to 1.2. See RFC 8446,
+        # Section 5.1.
+        vers = VERSION_TLS12
+      }
+      hdr = [typ, (vers >> 8).as_u8, vers.as_u8, (m >> 8).as_u8, m.as_u8]
+      cfg = st[0].config
+      out = self.st[0].out.~encrypt!(hdr, data[0...m], cfg)
+      self.~write_raw!(out)
+      n += m
+      data = data[m...data.size]
+    }
+    if typ == RECORD_TYPE_CHANGE_CIPHER_SPEC && st[0].vers != VERSION_TLS13 {
+      if !self.st[0].out.change_cipher_spec! {
+        fail self.send_alert!(ALERT_INTERNAL_ERROR)
+      }
+    }
+    n
+  }
+
+  # Go's writeHandshakeRecord: also adds the message to transcript (if
+  # any; the transcript is returned updated).
+  def write_handshake_record!(msg: HandshakeMessage) -> ~[Byte] {
+    data = msg.~marshal
+    self.~write_record!(RECORD_TYPE_HANDSHAKE, data)
+    data
+  }
+
+  def write_change_cipher_record! -> ~Unit {
+    self.~write_record!(RECORD_TYPE_CHANGE_CIPHER_SPEC, [1])
+    nil
+  }
+
+  def read_handshake_bytes!(n: Int) -> ~Unit {
+    while st[0].hand.size < n {
+      self.~read_record!
+    }
+  }
+
+  # Go's readHandshake: the next handshake message and its bytes (for the
+  # transcript).
+  def read_handshake! -> ~(HandshakeMessage, [Byte]) {
+    self.~read_handshake_bytes!(4)
+    data = st[0].hand
+    max_size = MAX_HANDSHAKE
+    max_size = MAX_HANDSHAKE_CERTIFICATE_MSG if st[0].have_vers && data[0] == TYPE_CERTIFICATE
+    n = (data[1].to_i << 16) | (data[2].to_i << 8) | data[3].to_i
+    if n > max_size {
+      self.send_alert!(ALERT_INTERNAL_ERROR)
+      fail self.set_in_err!(TlsError.Msg("tls: handshake message of length #{n} bytes exceeds maximum of #{max_size} bytes"))
+    }
+    self.~read_handshake_bytes!(4 + n)
+    hand = st[0].hand
+    msg_bytes = hand[0...4 + n] + []
+    self.st[0].hand = hand[4 + n...hand.size]
+    m = ~self.unmarshal_handshake_message!(msg_bytes)
+    (m, msg_bytes)
+  }
+
+  def unmarshal_handshake_message!(data: [Byte]) -> ~HandshakeMessage {
+    v = st[0].vers
+    t = data[0]
+    known = true
+    m: HandshakeMessage? = none
+    if t == TYPE_HELLO_REQUEST {
+      if x = HelloRequestMsg.unmarshal(data) {
+        m = HandshakeMessage.HelloRequest(x)
+      }
+    } else if t == TYPE_CLIENT_HELLO {
+      if x = ClientHelloMsg.unmarshal(data) {
+        m = HandshakeMessage.ClientHello(x)
+      }
+    } else if t == TYPE_SERVER_HELLO {
+      if x = ServerHelloMsg.unmarshal(data) {
+        m = HandshakeMessage.ServerHello(x)
+      }
+    } else if t == TYPE_NEW_SESSION_TICKET {
+      if v == VERSION_TLS13 {
+        if x = NewSessionTicketMsgTLS13.unmarshal(data) {
+          m = HandshakeMessage.NewSessionTicket13(x)
+        }
+      } else if x = NewSessionTicketMsg.unmarshal(data) {
+        m = HandshakeMessage.NewSessionTicket(x)
+      }
+    } else if t == TYPE_CERTIFICATE {
+      if v == VERSION_TLS13 {
+        if x = CertificateMsgTLS13.unmarshal(data) {
+          m = HandshakeMessage.Certificate13(x)
+        }
+      } else if x = CertificateMsg.unmarshal(data) {
+        m = HandshakeMessage.Certificate(x)
+      }
+    } else if t == TYPE_CERTIFICATE_REQUEST {
+      if v == VERSION_TLS13 {
+        if x = CertificateRequestMsgTLS13.unmarshal(data) {
+          m = HandshakeMessage.CertificateRequest13(x)
+        }
+      } else if x = CertificateRequestMsg.unmarshal(data, v >= VERSION_TLS12) {
+        m = HandshakeMessage.CertificateRequest(x)
+      }
+    } else if t == TYPE_CERTIFICATE_STATUS {
+      if x = CertificateStatusMsg.unmarshal(data) {
+        m = HandshakeMessage.CertificateStatus(x)
+      }
+    } else if t == TYPE_SERVER_KEY_EXCHANGE {
+      if x = ServerKeyExchangeMsg.unmarshal(data) {
+        m = HandshakeMessage.ServerKeyExchange(x)
+      }
+    } else if t == TYPE_SERVER_HELLO_DONE {
+      if x = ServerHelloDoneMsg.unmarshal(data) {
+        m = HandshakeMessage.ServerHelloDone(x)
+      }
+    } else if t == TYPE_CLIENT_KEY_EXCHANGE {
+      if x = ClientKeyExchangeMsg.unmarshal(data) {
+        m = HandshakeMessage.ClientKeyExchange(x)
+      }
+    } else if t == TYPE_CERTIFICATE_VERIFY {
+      if x = CertificateVerifyMsg.unmarshal(data, v >= VERSION_TLS12) {
+        m = HandshakeMessage.CertificateVerify(x)
+      }
+    } else if t == TYPE_FINISHED {
+      if x = FinishedMsg.unmarshal(data) {
+        m = HandshakeMessage.Finished(x)
+      }
+    } else if t == TYPE_ENCRYPTED_EXTENSIONS {
+      if x = EncryptedExtensionsMsg.unmarshal(data) {
+        m = HandshakeMessage.EncryptedExtensions(x)
+      }
+    } else if t == TYPE_END_OF_EARLY_DATA {
+      if x = EndOfEarlyDataMsg.unmarshal(data) {
+        m = HandshakeMessage.EndOfEarlyData(x)
+      }
+    } else if t == TYPE_KEY_UPDATE {
+      if x = KeyUpdateMsg.unmarshal(data) {
+        m = HandshakeMessage.KeyUpdate(x)
+      }
+    } else {
+      known = false
+    }
+    fail self.set_in_err!(self.send_alert!(ALERT_UNEXPECTED_MESSAGE)) if !known
+    if mm = m {
+      return mm
+    }
+    fail self.set_in_err!(self.send_alert!(ALERT_DECODE_ERROR))
+  }
+
+  # Writes p as application data, handshaking first if needed (Go's
+  # Write). Writes all of p or fails.
+  pub def write!(p: [Byte]) -> ~Int {
+    fail TlsError.Msg("use of closed network connection") if st[0].closed
+    self.~handshake!
+    if e = st[0].out.err {
+      fail e
+    }
+    fail TlsError.Alert(ALERT_INTERNAL_ERROR) if !st[0].handshake_complete
+    fail TlsError.Msg("tls: protocol is shutdown") if st[0].close_notify_sent
+    # TLS 1.0 is susceptible to a chosen-plaintext attack when using CBC
+    # mode ciphers. We use 1/n-1 record splitting: the first byte is sent
+    # alone so the attacker can't control the first block's IV.
+    b = p
+    m = 0
+    if b.size > 1 && st[0].vers == VERSION_TLS10 && st[0].out.ciph.cbc? {
+      r = self.write_record!(RECORD_TYPE_APPLICATION_DATA, b[0...1])
+      if e = r.err {
+        fail self.set_out_err!(e)
+      }
+      m = 1
+      b = b[1...b.size]
+    }
+    r = self.write_record!(RECORD_TYPE_APPLICATION_DATA, b)
+    if e = r.err {
+      fail self.set_out_err!(e)
+    }
+    r.unwrap + m
+  }
+
+  pub def write_string!(s: Str) -> ~Int { self.~write!(s.bytes) }
+
+  # Go's handleRenegotiation: a HelloRequest from a TLS 1.0-1.2 server.
+  def handle_renegotiation! -> ~Unit {
+    fail TlsError.Msg("tls: internal error: unexpected renegotiation") if st[0].vers == VERSION_TLS13
+    msg, _ = self.~read_handshake!
+    case msg {
+      HelloRequest(_) => nil
+      _ => {
+        self.send_alert!(ALERT_UNEXPECTED_MESSAGE)
+        fail unexpected_message_error("*tls.helloRequestMsg", msg)
+      }
+    }
+    fail self.send_alert!(ALERT_NO_RENEGOTIATION) if !st[0].is_client
+    r = st[0].config.renegotiation
+    fail self.send_alert!(ALERT_NO_RENEGOTIATION) if r == RENEGOTIATE_NEVER
+    fail self.send_alert!(ALERT_NO_RENEGOTIATION) if r == RENEGOTIATE_ONCE_AS_CLIENT && st[0].handshakes > 1
+    if r != RENEGOTIATE_FREELY_AS_CLIENT && r != RENEGOTIATE_ONCE_AS_CLIENT {
+      self.send_alert!(ALERT_INTERNAL_ERROR)
+      fail TlsError.Msg("tls: unknown Renegotiation value")
+    }
+    self.st[0].handshake_complete = false
+    hr = client_handshake(self)
+    if e = hr.err {
+      self.st[0].handshake_err = e
+      fail e
+    }
+    self.st[0].handshakes = st[0].handshakes + 1
+  }
+
+  # Go's handlePostHandshakeMessage.
+  def handle_post_handshake_message! -> ~Unit {
+    return self.~handle_renegotiation! if st[0].vers != VERSION_TLS13
+    msg, _ = self.~read_handshake!
+    self.st[0].retry_count = st[0].retry_count + 1
+    if st[0].retry_count > MAX_USELESS_RECORDS {
+      self.send_alert!(ALERT_UNEXPECTED_MESSAGE)
+      fail self.set_in_err!(TlsError.Msg("tls: too many non-advancing records"))
+    }
+    case msg {
+      NewSessionTicket13(m) => {
+        ~handle_new_session_ticket(self, m)
+      }
+      KeyUpdate(m) => {
+        self.~handle_key_update!(m)
+      }
+      _ => {
+        self.send_alert!(ALERT_UNEXPECTED_MESSAGE)
+        fail TlsError.Msg("tls: received unexpected handshake message of type " + msg.type_name)
+      }
+    }
+    nil
+  }
+
+  def handle_key_update!(key_update: KeyUpdateMsg) -> ~Unit {
+    suite0 = cipher_suite_tls13_by_id(st[0].cipher_suite)
+    fail self.set_in_err!(self.send_alert!(ALERT_INTERNAL_ERROR)) if suite0.none?
+    suite = suite0 || CipherSuiteTLS13.new
+    if key_update.update_requested {
+      msg_bytes = KeyUpdateMsg.new.~marshal
+      r = self.write_record!(RECORD_TYPE_HANDSHAKE, msg_bytes)
+      if e = r.err {
+        # Surface the error at the next write.
+        self.set_out_err!(e)
+        return
+      }
+      new_secret = next_traffic_secret(suite, st[0].out.traffic_secret)
+      self.st[0].out.set_traffic_secret!(suite, new_secret)
+    }
+    new_secret = next_traffic_secret(suite, st[0].in.traffic_secret)
+    self.~set_read_traffic_secret!(suite, new_secret)
+  }
+
+  # Reads application data into p, handshaking first if needed (Go's
+  # Read). Returns 0 at the end of the stream (the peer's close_notify).
+  pub def read!(p: [Byte]) -> ~Int {
+    self.~handshake!
+    return 0 if p.size == 0
+    while st[0].input.size == 0 {
+      r = self.read_record!
+      if e = r.err {
+        case e {
+          TlsError.Eof => {
+            return 0
+          }
+          _ => nil
+        }
+        fail e
+      }
+      while st[0].hand.size > 0 {
+        self.~handle_post_handshake_message!
+      }
+    }
+    input = st[0].input
+    n = p.size < input.size ? p.size : input.size
+    copy(p[0...n], input[0...n])
+    self.st[0].input = input[n...input.size]
+    # If a close-notify alert is waiting, read it so that we can return
+    # (n, EOF) instead of (n, nil), to signal to the HTTP response reading
+    # goroutine that the connection is now closed. (Go; here the EOF is
+    # reported by the next read.)
+    n
+  }
+
+  # Sends a close_notify (after a completed handshake) and closes the
+  # transport (Go's Close).
+  pub def close! -> ~Unit {
+    fail TlsError.Msg("use of closed network connection") if st[0].closed
+    self.st[0].closed = true
+    alert_err: Error? = none
+    if st[0].handshake_complete {
+      r = self.close_notify!
+      if e = r.err {
+        alert_err = TlsError.Msg("tls: failed to send closeNotify alert (but connection was closed anyway): " + e.message)
+      }
+    }
+    st[0].transport.close.~call
+    if e = alert_err {
+      fail e
+    }
+  }
+
+  # Shuts down the writing side (Go's CloseWrite).
+  pub def close_write! -> ~Unit {
+    fail TlsError.Msg("tls: CloseWrite called before handshake complete") if !st[0].handshake_complete
+    self.~close_notify!
+  }
+
+  def close_notify! -> ~Unit {
+    if !st[0].close_notify_sent {
+      e = self.send_alert!(ALERT_CLOSE_NOTIFY)
+      case e {
+        TlsError.Alert(_) => nil
+        _ => {
+          self.st[0].close_notify_err = e
+        }
+      }
+      self.st[0].close_notify_sent = true
+    }
+    if e = st[0].close_notify_err {
+      fail e
+    }
+  }
+
+  # Runs the handshake if it hasn't run yet (Go's Handshake).
+  pub def handshake! -> ~Unit {
+    return if st[0].handshake_complete
+    if e = st[0].handshake_err {
+      fail e
+    }
+    r = st[0].is_client ? client_handshake(self) : server_handshake(self)
+    if e = r.err {
+      self.flush!
+      self.st[0].handshake_err = e
+      fail e
+    }
+    self.st[0].handshakes = st[0].handshakes + 1
+    if !st[0].handshake_complete {
+      e = TlsError.Msg("tls: internal error: handshake should have had a result")
+      self.st[0].handshake_err = e
+      fail e
+    }
+  }
+
+  # Go's ConnectionState.
+  pub def connection_state -> ConnectionState {
+    s = st[0]
+    state = ConnectionState.new(handshake_complete: s.handshake_complete, version: s.vers, negotiated_protocol: s.client_protocol, did_resume: s.did_resume, hello_retry_request: s.did_hrr, testing_only_peer_signature_algorithm: s.peer_sig_alg, curve_id: s.curve_id, negotiated_protocol_is_mutual: true, server_name: s.server_name, cipher_suite: s.cipher_suite, peer_certificates: s.peer_certificates, local_certificate: s.local_certificate, verified_chains: s.verified_chains, signed_certificate_timestamps: s.scts, ocsp_response: s.ocsp_response)
+    if (!s.did_resume || s.ext_master_secret) && s.vers != VERSION_TLS13 {
+      state.tls_unique = s.client_finished_is_first ? s.client_finished : s.server_finished
+    }
+    ekm = s.ekm
+    if s.config.renegotiation != RENEGOTIATE_NEVER {
+      ekm.kind = EKM_NONE_RENEGOTIATION
+    } else if s.vers != VERSION_TLS13 && !s.ext_master_secret {
+      ekm.kind = EKM_NONE_NO_EMS
+    }
+    state.ekm = ekm
+    state
+  }
+
+  # The stapled OCSP response from the server, if any.
+  pub def ocsp_response -> [Byte] { st[0].ocsp_response }
+
+  # Checks that the peer certificate chain is valid for host (Go's
+  # VerifyHostname).
+  pub def verify_hostname(host: Str) -> ~Unit {
+    fail TlsError.Msg("tls: VerifyHostname called on TLS server connection") if !st[0].is_client
+    fail TlsError.Msg("tls: handshake has not yet been performed") if !st[0].handshake_complete
+    fail TlsError.Msg("tls: handshake did not verify certificate chain") if st[0].verified_chains.size == 0
+    st[0].peer_certificates[0].~verify_hostname(host)
+  }
+
+  def set_read_traffic_secret!(suite: CipherSuiteTLS13, secret: [Byte]) -> ~Unit {
+    # Ensure that there are no buffered handshake messages before changing
+    # the read keys, since that can cause messages to be parsed that were
+    # encrypted using old keys which are no longer appropriate.
+    if st[0].hand.size != 0 {
+      self.send_alert!(ALERT_UNEXPECTED_MESSAGE)
+      fail TlsError.Msg("tls: handshake buffer not empty before setting read traffic secret")
+    }
+    self.st[0].in.set_traffic_secret!(suite, secret)
+  }
+
+  def set_write_traffic_secret!(suite: CipherSuiteTLS13, secret: [Byte]) {
+    self.st[0].out.set_traffic_secret!(suite, secret)
+  }
+}
+
+def hexs16(v: U16) -> Str { strconv_hex(v.to_i) }
+
+def strconv_hex(v: Int) -> Str { strconv.format_int(v, 16) }
+
+def new_conn(t: Transport, config: Config, is_client: Bool) -> Conn {
+  cfg = config
+  cfg.prepare!
+  Conn.new(st: [ConnState.new(transport: t, config: cfg, is_client: is_client, in: new_half_conn(), out: new_half_conn())])
+}

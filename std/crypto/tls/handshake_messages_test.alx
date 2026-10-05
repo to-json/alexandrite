@@ -1,0 +1,149 @@
+# Go's handshake_messages_test.go. TestMarshalUnmarshal and TestFuzz use
+# testing/quick's reflection-driven generators; here their outputs come
+# from Go (vec_messages_test.alx): every Go-marshalled message must
+# unmarshal and marshal back to the same bytes, no prefix of one (except
+# ClientHello, ServerHello, Finished) may unmarshal, and random inputs must
+# get Go's verdict. TestECHRemoveOuterPSK isn't translated (no ECH).
+
+def parse_msg(name: Str, b: [Byte]) -> HandshakeMessage? {
+  case name {
+    "ClientHello" => {
+      if m = ClientHelloMsg.unmarshal(b) {
+        return HandshakeMessage.ClientHello(m)
+      }
+    }
+    "ServerHello" => {
+      if m = ServerHelloMsg.unmarshal(b) {
+        return HandshakeMessage.ServerHello(m)
+      }
+    }
+    "Finished" => {
+      if m = FinishedMsg.unmarshal(b) {
+        return HandshakeMessage.Finished(m)
+      }
+    }
+    "Certificate" => {
+      if m = CertificateMsg.unmarshal(b) {
+        return HandshakeMessage.Certificate(m)
+      }
+    }
+    "CertificateRequest" => {
+      if m = CertificateRequestMsg.unmarshal(b, false) {
+        return HandshakeMessage.CertificateRequest(m)
+      }
+    }
+    "CertificateVerify" => {
+      if m = CertificateVerifyMsg.unmarshal(b, true) {
+        return HandshakeMessage.CertificateVerify(m)
+      }
+    }
+    "CertificateStatus" => {
+      if m = CertificateStatusMsg.unmarshal(b) {
+        return HandshakeMessage.CertificateStatus(m)
+      }
+    }
+    "ClientKeyExchange" => {
+      if m = ClientKeyExchangeMsg.unmarshal(b) {
+        return HandshakeMessage.ClientKeyExchange(m)
+      }
+    }
+    "NewSessionTicket" => {
+      if m = NewSessionTicketMsg.unmarshal(b) {
+        return HandshakeMessage.NewSessionTicket(m)
+      }
+    }
+    "EncryptedExtensions" => {
+      if m = EncryptedExtensionsMsg.unmarshal(b) {
+        return HandshakeMessage.EncryptedExtensions(m)
+      }
+    }
+    "EndOfEarlyData" => {
+      if m = EndOfEarlyDataMsg.unmarshal(b) {
+        return HandshakeMessage.EndOfEarlyData(m)
+      }
+    }
+    "KeyUpdate" => {
+      if m = KeyUpdateMsg.unmarshal(b) {
+        return HandshakeMessage.KeyUpdate(m)
+      }
+    }
+    "NewSessionTicket13" => {
+      if m = NewSessionTicketMsgTLS13.unmarshal(b) {
+        return HandshakeMessage.NewSessionTicket13(m)
+      }
+    }
+    "CertificateRequest13" => {
+      if m = CertificateRequestMsgTLS13.unmarshal(b) {
+        return HandshakeMessage.CertificateRequest13(m)
+      }
+    }
+    "Certificate13" => {
+      if m = CertificateMsgTLS13.unmarshal(b) {
+        return HandshakeMessage.Certificate13(m)
+      }
+    }
+    _ => nil
+  }
+  none
+}
+
+def roundtrip(name: Str, h: Str) {
+  b = hx(h)
+  if m = parse_msg(name, b) {
+    assert_eq hs(m.marshal.unwrap), h
+  } else {
+    assert false, "#{name} failed to unmarshal #{h}"
+  }
+  if name != "ClientHello" && name != "ServerHello" && name != "Finished" {
+    j = 0
+    while j < b.size {
+      assert parse_msg(name, b[0...j]).none?, "#{name} unmarshaled a prefix of length #{j}"
+      j += 1
+    }
+  }
+}
+
+def verdict(name: Str, h: Str, ok: Bool) {
+  assert parse_msg(name, hx(h)).some? == ok, "#{name} #{h}"
+}
+
+test "RejectEmptySCTList" {
+  sct = [0x42.as_u8, 0x42, 0x42, 0x42]
+  sh = ServerHelloMsg.new(vers: VERSION_TLS12, random: [0.as_u8; 32], scts: [sct])
+  b = sh.marshal.unwrap
+  assert ServerHelloMsg.unmarshal(b).some?
+  # Find the SCT and replace the list with an empty one.
+  i = 0
+  while b[i...i + 4] != sct {
+    i += 1
+  }
+  e = b[0...i - 6] + [0.as_u8, 2, 0, 0] + b[i + 4...b.size]
+  e[1] = ((e.size - 4) >> 16).as_u8
+  e[2] = ((e.size - 4) >> 8).as_u8
+  e[3] = (e.size - 4).as_u8
+  e[42] = ((e.size - 44) >> 8).as_u8
+  e[43] = (e.size - 44).as_u8
+  assert ServerHelloMsg.unmarshal(e).none?, "Unmarshaled ServerHello with empty SCT list"
+}
+
+test "RejectEmptySCT" {
+  sh = ServerHelloMsg.new(vers: VERSION_TLS12, random: [0.as_u8; 32], scts: [[]])
+  assert ServerHelloMsg.unmarshal(sh.marshal.unwrap).none?, "Unmarshaled ServerHello with zero-length SCT"
+}
+
+test "RejectDuplicateExtensions" {
+  assert ClientHelloMsg.unmarshal(hx("010000440303000000000000000000000000000000000000000000000000000000000000000000000000001c0000000a000800000568656c6c6f0000000a000800000568656c6c6f")).none?
+  assert ServerHelloMsg.unmarshal(hx("02000030030300000000000000000000000000000000000000000000000000000000000000000000000000080005000000050000")).none?
+}
+
+test "ClientHello fields round trip" {
+  ch = ClientHelloMsg.new(vers: VERSION_TLS12, random: [7.as_u8; 32], session_id: [1, 2], cipher_suites: [TLS_AES_128_GCM_SHA256, SCSV_RENEGOTIATION], compression_methods: [0], server_name: "example.com", ocsp_stapling: true, supported_curves: [X25519, CURVE_P256], supported_points: [0], ticket_supported: true, session_ticket: [9, 9], supported_signature_algorithms: [PSS_WITH_SHA256], supported_signature_algorithms_cert: [ED25519], secure_renegotiation_supported: true, extended_master_secret: true, alpn_protocols: ["h2", "http/1.1"], scts: true, supported_versions: [VERSION_TLS13, VERSION_TLS12], cookie: [5], key_shares: [KeyShare.new(group: X25519, data: [1, 2, 3])], psk_modes: [1], psk_identities: [PskIdentity.new(label: [4, 4], obfuscated_ticket_age: 77)], psk_binders: [[8.as_u8; 32]])
+  b = ch.marshal.unwrap
+  m = ClientHelloMsg.unmarshal(b) || ClientHelloMsg.new
+  assert_eq m.server_name, "example.com"
+  assert_eq m.alpn_protocols, ["h2", "http/1.1"]
+  assert_eq m.psk_identities[0].obfuscated_ticket_age, 77.as_u32
+  assert m.secure_renegotiation_supported
+  assert_eq m.marshal.unwrap, b
+  assert_eq m.marshal_without_binders.unwrap, b[0...b.size - 35]
+}

@@ -1,0 +1,334 @@
+# Go's pkcs1.go, pkcs8.go and sec1.go: RSA keys in PKCS #1, any private key
+# in PKCS #8, EC private keys in SEC 1 (RFC 5915).
+#
+# Differences from Go: the PKCS #1 optional CRT values are big.Int? (Go's
+# nil pointers); GODEBUG=x509rsacrt=0 doesn't exist (invalid CRT values
+# fail, Go's default). Errors from encoding/asn1 keep their text as
+# X509Error.Msg.
+
+import "crypto/ecdh"
+import "crypto/ecdsa"
+import "crypto/ed25519"
+import "crypto/elliptic"
+import "crypto/mldsa"
+import "crypto/rsa"
+import "crypto/x509/pkix"
+import "encoding/asn1"
+import "math/big"
+
+# ---------------------------------------------------------------- PKCS #1
+
+# The ASN.1 structure of an RSA private key (PKCS #1, RFC 8017).
+#[derive(Asn1)]
+struct PKCS1PrivateKey {
+  version: Int
+  n: big.Int
+  e: Int
+  d: big.Int
+  p: big.Int
+  q: big.Int
+  # We ignore these values, if present, because rsa will calculate them.
+  #[field(asn1: "optional")] dp: big.Int?
+  #[field(asn1: "optional")] dq: big.Int?
+  #[field(asn1: "optional")] qinv: big.Int?
+  #[field(asn1: "optional,omit_empty")] additional_primes: [PKCS1AdditionalRSAPrime]
+}
+
+#[derive(Asn1)]
+struct PKCS1AdditionalRSAPrime {
+  prime: big.Int
+  # We ignore these values because rsa will calculate them.
+  exp: big.Int
+  coeff: big.Int
+}
+
+# The ASN.1 structure of an RSA public key (PKCS #1).
+#[derive(Asn1)]
+struct PKCS1PublicKey {
+  n: big.Int
+  e: Int
+}
+
+def asn1_err(e: Error) -> X509Error { X509Error.Msg(e.message) }
+
+# Parses an RSA private key in PKCS #1, ASN.1 DER form ("RSA PRIVATE KEY"
+# in PEM).
+pub def parse_pkcs1_private_key(der: [Byte]) -> ~rsa.PrivateKey<X509Error> {
+  r = PKCS1PrivateKey.from_asn1(der)
+  if v = r.ok {
+    fail err("asn1: syntax error: trailing data") if v[1].size > 0
+  }
+  if e = r.err {
+    fail err("x509: failed to parse private key (use ParseECPrivateKey instead for this key format)") if ECPrivateKey.from_asn1(der).ok?
+    fail err("x509: failed to parse private key (use ParsePKCS8PrivateKey instead for this key format)") if PKCS8.from_asn1(der).ok?
+    fail asn1_err(e)
+  }
+  priv = r.unwrap[0]
+  fail err("x509: unsupported private key version") if priv.version > 1
+  bad = priv.n.sign <= 0 || priv.d.sign <= 0 || priv.p.sign <= 0 || priv.q.sign <= 0
+  if dp = priv.dp {
+    bad = bad || dp.sign <= 0
+  }
+  if dq = priv.dq {
+    bad = bad || dq.sign <= 0
+  }
+  if qinv = priv.qinv {
+    bad = bad || qinv.sign <= 0
+  }
+  fail err("x509: private key contains zero or negative value") if bad
+  primes = [priv.p, priv.q]
+  for a in priv.additional_primes {
+    fail err("x509: private key contains zero or negative prime") if a.prime.sign <= 0
+    primes << a.prime
+  }
+  key = rsa.PrivateKey.new(public_key: rsa.PublicKey.new(n: priv.n, e: priv.e), d: priv.d, primes: primes, precomputed: rsa.PrecomputedValues.new(dp: priv.dp, dq: priv.dq, qinv: priv.qinv))
+  key.precompute!
+  if e = key.validate.err {
+    fail err(e.message)
+  }
+  key
+}
+
+# Converts an RSA private key to PKCS #1, ASN.1 DER form ("RSA PRIVATE
+# KEY" in PEM).
+pub def marshal_pkcs1_private_key(key0: rsa.PrivateKey) -> [Byte] {
+  key = key0
+  key.precompute!
+  version = key.primes.size > 2 ? 1 : 0
+  priv = PKCS1PrivateKey.new(version: version, n: key.n, e: key.e, d: key.d, p: key.primes[0], q: key.primes[1], dp: key.precomputed.dp, dq: key.precomputed.dq, qinv: key.precomputed.qinv)
+  i = 0
+  for values in key.precomputed.crt_values {
+    priv.additional_primes << PKCS1AdditionalRSAPrime.new(prime: key.primes[2 + i], exp: values.exp, coeff: values.coeff)
+    i += 1
+  }
+  priv.to_asn1.unwrap
+}
+
+# Parses an RSA public key in PKCS #1, ASN.1 DER form ("RSA PUBLIC KEY" in
+# PEM).
+pub def parse_pkcs1_public_key(der: [Byte]) -> ~rsa.PublicKey<X509Error> {
+  r = PKCS1PublicKey.from_asn1(der)
+  if e = r.err {
+    fail err("x509: failed to parse public key (use ParsePKIXPublicKey instead for this key format)") if PublicKeyInfo.from_asn1(der).ok?
+    fail asn1_err(e)
+  }
+  pub_, rest = r.unwrap
+  fail err("asn1: syntax error: trailing data") if rest.size > 0
+  fail err("x509: public key contains zero or negative value") if pub_.n.sign <= 0 || pub_.e <= 0
+  fail err("x509: public key contains large public exponent") if pub_.e > 2147483647
+  rsa.PublicKey.new(n: pub_.n, e: pub_.e)
+}
+
+# Converts an RSA public key to PKCS #1, ASN.1 DER form ("RSA PUBLIC KEY"
+# in PEM).
+pub def marshal_pkcs1_public_key(key: rsa.PublicKey) -> [Byte] {
+  PKCS1PublicKey.new(n: key.n, e: key.e).to_asn1.unwrap
+}
+
+# ---------------------------------------------------------------- PKCS #8
+
+# A PKCS #8 PrivateKeyInfo (RFC 5208), without the optional attributes.
+#[derive(Asn1)]
+struct PKCS8 {
+  version: Int
+  algo: pkix.AlgorithmIdentifier
+  private_key: [Byte]
+  # Optional attributes omitted.
+}
+
+# Parses an unencrypted private key in PKCS #8, ASN.1 DER form ("PRIVATE
+# KEY" in PEM): RSA, ECDSA, Ed25519, X25519 (as an ecdh key) and ML-DSA
+# (seed form) keys.
+pub def parse_pkcs8_private_key(der: [Byte]) -> ~PrivateKey<X509Error> {
+  r = PKCS8.from_asn1(der)
+  if e = r.err {
+    fail err("x509: failed to parse private key (use ParseECPrivateKey instead for this key format)") if ECPrivateKey.from_asn1(der).ok?
+    fail err("x509: failed to parse private key (use ParsePKCS1PrivateKey instead for this key format)") if PKCS1PrivateKey.from_asn1(der).ok?
+    fail asn1_err(e)
+  }
+  priv_key = r.unwrap[0]
+  alg = priv_key.algo.algorithm
+  if alg.equal?(oid_public_key_rsa()) {
+    kr = parse_pkcs1_private_key(priv_key.private_key)
+    if e = kr.err {
+      fail err("x509: failed to parse RSA private key embedded in PKCS#8: " + e.message)
+    }
+    return PrivateKey.Rsa(kr.unwrap)
+  }
+  if alg.equal?(oid_public_key_ecdsa()) {
+    named: asn1.ObjectIdentifier? = none
+    if v = asn1.unmarshal_oid(priv_key.algo.parameters.full_bytes).ok {
+      named = v[0]
+    }
+    ke = parse_ec_private_key_with(named, priv_key.private_key)
+    if e = ke.err {
+      fail err("x509: failed to parse EC private key embedded in PKCS#8: " + e.message)
+    }
+    return PrivateKey.Ecdsa(ke.unwrap)
+  }
+  if alg.equal?(oid_public_key_ed25519()) {
+    fail err("x509: invalid Ed25519 private key parameters") if priv_key.algo.parameters.full_bytes.size != 0
+    cr = asn1.unmarshal_bytes(priv_key.private_key)
+    if e = cr.err {
+      fail err("x509: invalid Ed25519 private key: #{e.message}")
+    }
+    curve_private_key = cr.unwrap[0]
+    fail err("x509: invalid Ed25519 private key length: #{curve_private_key.size}") if curve_private_key.size != ed25519.SEED_SIZE
+    return PrivateKey.Ed25519(ed25519.new_key_from_seed(curve_private_key))
+  }
+  if alg.equal?(oid_public_key_mldsa44()) || alg.equal?(oid_public_key_mldsa65()) || alg.equal?(oid_public_key_mldsa87()) {
+    fail err("x509: invalid ML-DSA private key parameters") if priv_key.algo.parameters.full_bytes.size != 0
+    pk = priv_key.private_key
+    fail err("x509: invalid ML-DSA private key length: 0") if pk.size == 0
+    # IMPLICIT [0] OCTET STRING (seed) is the only supported form.
+    if pk[0] == 0x04 {
+      fail err("x509: semi-expanded ML-DSA private keys without seed are not supported")
+    } else if pk[0] == 0x30 {
+      fail err("x509: ML-DSA private keys with both seed and expanded key are not supported, use e.g. \"openssl pkey -provparam ml-dsa.output_formats=seed-only\" to convert to a seed-only key")
+    } else if pk[0] != 0x80 {
+      fail err("x509: invalid ML-DSA private key: invalid ASN.1 tag #{bytes_hex([pk[0]])}")
+    }
+    fail err("x509: invalid ML-DSA private key length: #{pk.size}") if pk.size != 2 + mldsa.PRIVATE_KEY_SIZE
+    fail err("x509: invalid ML-DSA private key ASN.1 encoding") if pk[1].to_i != mldsa.PRIVATE_KEY_SIZE
+    params = ~need(mldsa_parameters_from_oid(alg), "x509: unknown ML-DSA parameters")
+    km = mldsa.new_private_key(params, pk[2...pk.size])
+    if e = km.err {
+      fail err(e.message)
+    }
+    return PrivateKey.MlDsa(km.unwrap)
+  }
+  if alg.equal?(oid_public_key_x25519()) {
+    fail err("x509: invalid X25519 private key parameters") if priv_key.algo.parameters.full_bytes.size != 0
+    cr = asn1.unmarshal_bytes(priv_key.private_key)
+    if e = cr.err {
+      fail err("x509: invalid X25519 private key: #{e.message}")
+    }
+    kx = ecdh.x25519().new_private_key(cr.unwrap[0])
+    if e = kx.err {
+      fail err(e.message)
+    }
+    return PrivateKey.Ecdh(kx.unwrap)
+  }
+  fail err("x509: PKCS#8 wrapping contained private key with unknown algorithm: #{alg.to_s}")
+}
+
+# Converts a private key to PKCS #8, ASN.1 DER form ("PRIVATE KEY" in
+# PEM): RSA, ECDSA, Ed25519, ecdh (X25519 and NIST) and ML-DSA keys.
+pub def marshal_pkcs8_private_key(key: PrivateKey) -> ~[Byte]<X509Error> {
+  priv_key = PKCS8.new
+  case key {
+    Rsa(k0) => {
+      k = k0
+      priv_key.algo = pkix.AlgorithmIdentifier.new(algorithm: oid_public_key_rsa(), parameters: asn1.null_raw_value())
+      k.precompute!
+      if e = k.validate.err {
+        fail err(e.message)
+      }
+      priv_key.private_key = marshal_pkcs1_private_key(k)
+    }
+    Ecdsa(k) => {
+      oid = ~need(oid_from_named_curve(k.public_key.curve), "x509: unknown curve while marshaling to PKCS#8")
+      priv_key.algo = pkix.AlgorithmIdentifier.new(algorithm: oid_public_key_ecdsa(), parameters: asn1.RawValue.new(full_bytes: asn1.marshal_oid(oid).unwrap))
+      r = marshal_ec_private_key_with_oid(k, none)
+      if e = r.err {
+        fail err("x509: failed to marshal EC private key while building PKCS#8: " + e.message)
+      }
+      priv_key.private_key = r.unwrap
+    }
+    Ed25519(k) => {
+      priv_key.algo = pkix.AlgorithmIdentifier.new(algorithm: oid_public_key_ed25519())
+      priv_key.private_key = asn1.marshal_bytes(k.seed).unwrap
+    }
+    MlDsa(k) => {
+      oid = ~need(oid_from_mldsa_parameters(k.public_key.parameters), "x509: unknown ML-DSA parameters while marshaling to PKCS#8")
+      priv_key.algo = pkix.AlgorithmIdentifier.new(algorithm: oid)
+      priv_key.private_key = [0x80.as_u8, mldsa.PRIVATE_KEY_SIZE.as_u8] + k.bytes
+    }
+    Ecdh(k) => {
+      if k.curve == ecdh.x25519() {
+        priv_key.algo = pkix.AlgorithmIdentifier.new(algorithm: oid_public_key_x25519())
+        priv_key.private_key = asn1.marshal_bytes(k.bytes).unwrap
+      } else {
+        oid = ~need(oid_from_ecdh_curve(k.curve), "x509: unknown curve while marshaling to PKCS#8")
+        priv_key.algo = pkix.AlgorithmIdentifier.new(algorithm: oid_public_key_ecdsa(), parameters: asn1.RawValue.new(full_bytes: asn1.marshal_oid(oid).unwrap))
+        priv_key.private_key = marshal_ecdh_private_key(k)
+      }
+    }
+    None => {
+      fail err("x509: unknown key type while marshaling PKCS#8: <nil>")
+    }
+  }
+  priv_key.to_asn1.unwrap
+}
+
+# ---------------------------------------------------------------- SEC 1
+
+EC_PRIV_KEY_VERSION = 1
+
+# An EC private key (SEC 1, Elliptic Curve Cryptography, RFC 5915).
+#[derive(Asn1)]
+struct ECPrivateKey {
+  version: Int
+  private_key: [Byte]
+  #[field(asn1: "optional,explicit,tag:0")] named_curve_oid: asn1.ObjectIdentifier
+  #[field(asn1: "optional,explicit,tag:1")] public_key: asn1.BitString
+}
+
+# Parses an EC private key in SEC 1, ASN.1 DER form ("EC PRIVATE KEY" in
+# PEM).
+pub def parse_ec_private_key(der: [Byte]) -> ~ecdsa.PrivateKey<X509Error> { ~parse_ec_private_key_with(none, der) }
+
+# Converts an EC private key to SEC 1, ASN.1 DER form.
+pub def marshal_ec_private_key(key: ecdsa.PrivateKey) -> ~[Byte]<X509Error> {
+  oid = ~need(oid_from_named_curve(key.public_key.curve), "x509: unknown elliptic curve")
+  ~marshal_ec_private_key_with_oid(key, oid)
+}
+
+def marshal_ec_private_key_with_oid(key: ecdsa.PrivateKey, oid: asn1.ObjectIdentifier?) -> ~[Byte]<X509Error> {
+  pr = key.bytes
+  if e = pr.err {
+    fail err(e.message)
+  }
+  pb = key.public_key.bytes
+  if e = pb.err {
+    fail err(e.message)
+  }
+  ECPrivateKey.new(version: 1, private_key: pr.unwrap, named_curve_oid: oid || asn1.ObjectIdentifier.new, public_key: asn1.BitString.new(bytes: pb.unwrap)).to_asn1.unwrap
+}
+
+def marshal_ecdh_private_key(key: ecdh.PrivateKey) -> [Byte] {
+  ECPrivateKey.new(version: 1, private_key: key.bytes, public_key: asn1.BitString.new(bytes: key.public_key.bytes)).to_asn1.unwrap
+}
+
+# Go's parseECPrivateKey: named_curve_oid is the OID from the PKCS #8
+# wrapping, if any; otherwise the key's own.
+def parse_ec_private_key_with(named_curve_oid: asn1.ObjectIdentifier?, der: [Byte]) -> ~ecdsa.PrivateKey<X509Error> {
+  r = ECPrivateKey.from_asn1(der)
+  if e = r.err {
+    fail err("x509: failed to parse private key (use ParsePKCS8PrivateKey instead for this key format)") if PKCS8.from_asn1(der).ok?
+    fail err("x509: failed to parse private key (use ParsePKCS1PrivateKey instead for this key format)") if PKCS1PrivateKey.from_asn1(der).ok?
+    fail err("x509: failed to parse EC private key: " + e.message)
+  }
+  priv_key = r.unwrap[0]
+  fail err("x509: unknown EC private key version #{priv_key.version}") if priv_key.version != EC_PRIV_KEY_VERSION
+  curve_oid = named_curve_oid || priv_key.named_curve_oid
+  curve = ~need(named_curve_from_oid(curve_oid), "x509: unknown elliptic curve")
+  size = (curve.params.n.bit_len + 7) / 8
+  private_key = [0.as_u8; size]
+  pk = priv_key.private_key
+  # Some private keys have leading zero padding. This is invalid according
+  # to [SEC1], but this code will ignore it.
+  while pk.size > private_key.size {
+    fail err("x509: invalid private key length") if pk[0] != 0
+    pk = pk[1...pk.size]
+  }
+  # Some private keys remove all leading zeros, this is also invalid
+  # according to [SEC1] but since OpenSSL used to do this, we ignore this
+  # too.
+  copy(private_key[private_key.size - pk.size...private_key.size], pk)
+  k = ecdsa.parse_raw_private_key(curve, private_key)
+  if e = k.err {
+    fail err(e.message)
+  }
+  k.unwrap
+}

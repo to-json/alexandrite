@@ -1,0 +1,186 @@
+#![overflow(wrap)]
+# Package chacha20poly1305: golang.org/x/crypto/chacha20poly1305 (the copy
+# Go's std vendors), the ChaCha20-Poly1305 AEAD and its extended nonce
+# variant XChaCha20-Poly1305, as specified in RFC 8439 and
+# draft-irtf-cfrg-xchacha-01. Go's generic code
+# (chacha20poly1305_generic.go, xchacha20poly1305.go) on the ported
+# golang.org/x/crypto/chacha20 and internal/poly1305.
+#
+#   Go                                  alx
+#   KeySize / NonceSize / NonceSizeX    KEY_SIZE / NONCE_SIZE / NONCE_SIZE_X
+#   Overhead                            OVERHEAD
+#   New(key) (cipher.AEAD, error)       new(key) -> ~ChaCha20Poly1305<ChaCha20Poly1305Error>
+#   NewX(key) (cipher.AEAD, error)      new_x(key) -> ~XChaCha20Poly1305<ChaCha20Poly1305Error>
+#   a.NonceSize / Overhead              a.nonce_size / a.overhead
+#   a.Seal(dst, nonce, pt, ad)          a.seal(dst, nonce, pt, ad) -> [Byte]
+#   a.Open(dst, nonce, ct, ad)          a.open(dst, nonce, ct, ad) -> ~[Byte]<ChaCha20Poly1305Error>
+#   errors "chacha20poly1305: ..."      ChaCha20Poly1305Error.BadKeyLength / Open (Go's text)
+#
+# Both types are cipher.AEADs (they convert where a cipher.AEAD is wanted).
+#
+# Differences from Go:
+#   - The constructors return the concrete types (Go: cipher.AEAD).
+#   - seal and open return a new slice holding dst followed by the output
+#     (Go appends into dst's spare capacity when it has some; alx slices
+#     have no capacity), as crypto/cipher's GCM does here. A failed open
+#     writes nothing.
+#   - Aliasing panics ("invalid buffer overlap") can't happen: alx slices
+#     don't expose addresses.
+#   - No FIPS 140-only mode (its error can't happen) and no assembly.
+#
+# Timing: constant time (ChaCha20 and Poly1305 are; the tag is compared
+# with crypto/subtle).
+
+import "golang.org/x/crypto/chacha20"
+import "golang.org/x/crypto/internal/poly1305"
+
+pub KEY_SIZE = 32
+pub NONCE_SIZE = 12
+pub NONCE_SIZE_X = 24
+pub OVERHEAD = 16
+
+pub error ChaCha20Poly1305Error {
+  BadKeyLength
+  Open
+
+  def message -> Str {
+    case self {
+      BadKeyLength => "chacha20poly1305: bad key length"
+      Open => "chacha20poly1305: message authentication failed"
+    }
+  }
+}
+
+# The ChaCha20-Poly1305 AEAD with a 12-byte nonce.
+pub struct ChaCha20Poly1305 {
+  key: [Byte]
+
+  pub def nonce_size -> Int { NONCE_SIZE }
+  pub def overhead -> Int { OVERHEAD }
+
+  # Encrypts and authenticates plaintext, authenticates additional_data,
+  # and returns dst followed by the ciphertext and the tag.
+  pub def seal(dst: [Byte], nonce: [Byte], plaintext: [Byte], additional_data: [Byte]) -> [Byte] {
+    panic("chacha20poly1305: bad nonce length passed to Seal") if nonce.size != NONCE_SIZE
+    panic("chacha20poly1305: plaintext too large") if plaintext.size > (1 << 38) - 64
+    dst + seal_generic(key, nonce, plaintext, additional_data)
+  }
+
+  # Decrypts and authenticates ciphertext and additional_data; returns dst
+  # followed by the plaintext.
+  pub def open(dst: [Byte], nonce: [Byte], ciphertext: [Byte], additional_data: [Byte]) -> ~[Byte]<ChaCha20Poly1305Error> {
+    panic("chacha20poly1305: bad nonce length passed to Open") if nonce.size != NONCE_SIZE
+    fail ChaCha20Poly1305Error.Open if ciphertext.size < 16
+    panic("chacha20poly1305: ciphertext too large") if ciphertext.size > (1 << 38) - 48
+    dst + ~open_generic(key, nonce, ciphertext, additional_data)
+  }
+}
+
+# XChaCha20-Poly1305: ChaCha20-Poly1305 with a 24-byte nonce, safe to pick
+# at random.
+pub struct XChaCha20Poly1305 {
+  key: [Byte]
+
+  pub def nonce_size -> Int { NONCE_SIZE_X }
+  pub def overhead -> Int { OVERHEAD }
+
+  pub def seal(dst: [Byte], nonce: [Byte], plaintext: [Byte], additional_data: [Byte]) -> [Byte] {
+    panic("chacha20poly1305: bad nonce length passed to Seal") if nonce.size != NONCE_SIZE_X
+    panic("chacha20poly1305: plaintext too large") if plaintext.size > (1 << 38) - 64
+    k, n = x_key_nonce(key, nonce)
+    dst + seal_generic(k, n, plaintext, additional_data)
+  }
+
+  pub def open(dst: [Byte], nonce: [Byte], ciphertext: [Byte], additional_data: [Byte]) -> ~[Byte]<ChaCha20Poly1305Error> {
+    panic("chacha20poly1305: bad nonce length passed to Open") if nonce.size != NONCE_SIZE_X
+    fail ChaCha20Poly1305Error.Open if ciphertext.size < 16
+    panic("chacha20poly1305: ciphertext too large") if ciphertext.size > (1 << 38) - 48
+    k, n = x_key_nonce(key, nonce)
+    dst + ~open_generic(k, n, ciphertext, additional_data)
+  }
+}
+
+# A ChaCha20-Poly1305 AEAD that uses the given 256-bit key (Go's New).
+pub def new(key: [Byte]) -> ~ChaCha20Poly1305<ChaCha20Poly1305Error> {
+  fail ChaCha20Poly1305Error.BadKeyLength if key.size != KEY_SIZE
+  ChaCha20Poly1305.new(key: key + [])
+}
+
+# An XChaCha20-Poly1305 AEAD that uses the given 256-bit key (Go's NewX).
+pub def new_x(key: [Byte]) -> ~XChaCha20Poly1305<ChaCha20Poly1305Error> {
+  fail ChaCha20Poly1305Error.BadKeyLength if key.size != KEY_SIZE
+  XChaCha20Poly1305.new(key: key + [])
+}
+
+# The ChaCha20 key and nonce of an XChaCha20 nonce (HChaCha20 subkey).
+def x_key_nonce(key: [Byte], nonce: [Byte]) -> ([Byte], [Byte]) {
+  h_key = chacha20.hchacha20(key, nonce[0...16]).unwrap
+  c_nonce = [0.as_u8; NONCE_SIZE]
+  copy(c_nonce[4...12], nonce[16...24])
+  (h_key, c_nonce)
+}
+
+# Go's writeWithPadding.
+def write_with_padding(p: poly1305.MAC, b: [Byte]) {
+  m = p
+  m.write!(b).unwrap
+  rem = b.size % 16
+  if rem != 0 {
+    m.write!([0.as_u8; 16 - rem]).unwrap
+  }
+  nil
+}
+
+def write_u64(p: poly1305.MAC, n: Int) {
+  m = p
+  buf = [0.as_u8; 8]
+  k = 0
+  while k < 8 {
+    buf[k] = (n >> (8 * k)).as_u8
+    k += 1
+  }
+  m.write!(buf).unwrap
+  nil
+}
+
+# The stream cipher for (key, nonce) and the Poly1305 key (its first 32
+# bytes of key stream); the stream is left at block 1.
+def setup(key: [Byte], nonce: [Byte]) -> (chacha20.Cipher, poly1305.MAC) {
+  s = chacha20.new_unauthenticated_cipher(key, nonce).unwrap
+  poly_key = [0.as_u8; 32]
+  s.xor_key_stream!(poly_key, poly_key)
+  # set the counter to 1, skipping 32 bytes
+  s.set_counter!(1)
+  (s, poly1305.new(poly_key))
+}
+
+# Go's sealGeneric: ciphertext followed by the tag.
+def seal_generic(key: [Byte], nonce: [Byte], plaintext: [Byte], additional_data: [Byte]) -> [Byte] {
+  s, p = setup(key, nonce)
+  out = [0.as_u8; plaintext.size + OVERHEAD]
+  ciphertext = out[0...plaintext.size]
+  s.xor_key_stream!(ciphertext, plaintext)
+  write_with_padding(p, additional_data)
+  write_with_padding(p, ciphertext)
+  write_u64(p, additional_data.size)
+  write_u64(p, plaintext.size)
+  tag = p.sum!([])
+  copy(out[plaintext.size...out.size], tag)
+  out
+}
+
+# Go's openGeneric: the plaintext, or ChaCha20Poly1305Error.Open.
+def open_generic(key: [Byte], nonce: [Byte], ciphertext0: [Byte], additional_data: [Byte]) -> ~[Byte]<ChaCha20Poly1305Error> {
+  n = ciphertext0.size - 16
+  tag = ciphertext0[n...ciphertext0.size]
+  ciphertext = ciphertext0[0...n]
+  s, p = setup(key, nonce)
+  write_with_padding(p, additional_data)
+  write_with_padding(p, ciphertext)
+  write_u64(p, additional_data.size)
+  write_u64(p, ciphertext.size)
+  fail ChaCha20Poly1305Error.Open if !p.verify!(tag)
+  out = [0.as_u8; n]
+  s.xor_key_stream!(out, ciphertext)
+  out
+}

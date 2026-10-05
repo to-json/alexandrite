@@ -1,0 +1,253 @@
+# Go's cert_pool.go and root*.go: certificate pools and the system roots.
+#
+# Differences from Go: certificates are parsed when added (Go parses a
+# PEM certificate lazily, once, on first use). A pool shares its state
+# across copies (D36), like Go's *CertPool; the zero CertPool
+# (CertPool.new) is Go's nil *CertPool for equal?. The system roots are read
+# from the bundle files Go reads on Linux and the BSDs, which includes
+# macOS's /etc/ssl/cert.pem (Go on macOS asks the platform verifier
+# instead); SSL_CERT_FILE and SSL_CERT_DIR override them as in Go. There
+# is no process-wide cache (alx has no package state): each
+# system_cert_pool() reads and parses the files again. set_fallback_roots
+# doesn't exist for the same reason.
+
+import "crypto/sha256"
+import "encoding/pem"
+import "os"
+import "strings"
+
+struct PoolState {
+  # raw subject (as Str) -> indexes into certs
+  by_name: Map[Str, [Int]]
+  certs: [Certificate]
+  constraints: [(([Certificate]) -> ~Unit)?]
+  # SHA-224 of each certificate's raw bytes (as Str).
+  have_sum: Map[Str, Bool]
+}
+
+# A set of certificates. Make one with new_cert_pool (or
+# system_cert_pool); copies are the same pool.
+pub struct CertPool {
+  st: [PoolState]
+
+  def ensure! {
+    self.st << PoolState.new if st.size == 0
+  }
+
+  def len -> Int {
+    return 0 if st.size == 0
+    st[0].certs.size
+  }
+
+  # The certificates in the pool, in the order they were added.
+  pub def certs -> [Certificate] {
+    return [] if st.size == 0
+    st[0].certs
+  }
+
+  # A copy of the pool (later additions to either don't affect the other).
+  pub def clone -> CertPool {
+    return CertPool.new if st.size == 0
+    s = st[0]
+    by_name: Map[Str, [Int]] = {}
+    for k, v in s.by_name {
+      by_name[k] = v + []
+    }
+    have_sum: Map[Str, Bool] = {}
+    for k, v in s.have_sum {
+      have_sum[k] = v
+    }
+    CertPool.new(st: [PoolState.new(by_name: by_name, certs: s.certs + [], constraints: s.constraints + [], have_sum: have_sum)])
+  }
+
+  def find_potential_parents(cert: Certificate) -> [PotentialParent] {
+    return [] if st.size == 0
+    s = st[0]
+    matching_key_id: [PotentialParent] = []
+    one_key_id: [PotentialParent] = []
+    mismatch_key_id: [PotentialParent] = []
+    # Prioritize potential parents that have a matching Subject Key ID,
+    # then those with no key ID at all on one side, then mismatching ones.
+    for c in s.by_name[Str.from_bytes(cert.raw_issuer)] || [] {
+      candidate = s.certs[c]
+      pp = PotentialParent.new(cert: candidate, constraint: s.constraints[c])
+      kid_match = candidate.subject_key_id == cert.authority_key_id
+      if kid_match {
+        matching_key_id << pp
+      } else if (candidate.subject_key_id.size == 0 && cert.authority_key_id.size > 0) || (candidate.subject_key_id.size > 0 && cert.authority_key_id.size == 0) {
+        one_key_id << pp
+      } else {
+        mismatch_key_id << pp
+      }
+    }
+    matching_key_id + one_key_id + mismatch_key_id
+  }
+
+  def contains?(cert: Certificate) -> Bool {
+    return false if st.size == 0
+    st[0].have_sum.has_key?(sum224_key(cert.raw))
+  }
+
+  # Adds a certificate to the pool.
+  pub def add_cert!(cert: Certificate) { self.add_cert_func!(cert, none) }
+
+  # Adds a certificate with an additional constraint: when the certificate
+  # is a candidate root while building a chain, constraint is called with
+  # the chain so far, and the root is rejected if it fails (Go's
+  # AddCertWithConstraint).
+  pub def add_cert_with_constraint!(cert: Certificate, constraint: ([Certificate]) -> ~Unit) {
+    self.add_cert_func!(cert, constraint)
+  }
+
+  def add_cert_func!(cert: Certificate, constraint: (([Certificate]) -> ~Unit)?) {
+    self.ensure!
+    sum = sum224_key(cert.raw)
+    # Check that the certificate isn't being added twice.
+    return if self.st[0].have_sum.has_key?(sum)
+    self.st[0].have_sum[sum] = true
+    self.st[0].certs << cert
+    self.st[0].constraints << constraint
+    key = Str.from_bytes(cert.raw_subject)
+    lst = self.st[0].by_name[key] || []
+    lst << self.st[0].certs.size - 1
+    self.st[0].by_name[key] = lst
+    nil
+  }
+
+  # Parses a series of PEM encoded certificates and adds them; true if any
+  # was added. Blocks that aren't CERTIFICATEs, have headers or fail to
+  # parse are skipped.
+  pub def append_certs_from_pem!(pem_certs0: [Byte]) -> Bool {
+    ok = false
+    pem_certs = pem_certs0
+    while pem_certs.size > 0 {
+      block0, rest = pem.decode(pem_certs)
+      pem_certs = rest
+      if block = block0 {
+        next if block.type != "CERTIFICATE" || block.headers.size != 0
+        r = parse_certificate(block.bytes)
+        if cert = r.ok {
+          self.add_cert!(cert)
+          ok = true
+        }
+      } else {
+        break
+      }
+    }
+    ok
+  }
+
+  # The DER-encoded subjects of all of the certificates in the pool
+  # (deprecated in Go).
+  pub def subjects -> [[Byte]] {
+    res: [[Byte]] = []
+    for c in self.certs {
+      res << c.raw_subject
+    }
+    res
+  }
+
+  # Whether the pools hold the same certificates. The zero CertPool
+  # (CertPool.new, not made by new_cert_pool) is Go's nil pool: equal only
+  # to another zero pool.
+  pub def equal?(other: CertPool) -> Bool {
+    return st.size == 0 && other.st.size == 0 if st.size == 0 || other.st.size == 0
+    a = st[0]
+    b = other.st[0]
+    return false if a.have_sum.size != b.have_sum.size
+    for h in a.have_sum.keys {
+      return false if !b.have_sum.has_key?(h)
+    }
+    true
+  }
+}
+
+# A new, empty CertPool.
+pub def new_cert_pool -> CertPool { CertPool.new(st: [PoolState.new]) }
+
+def sum224_key(raw: [Byte]) -> Str {
+  s = sha256.sum224(raw)
+  b: [Byte] = []
+  for x in s {
+    b << x
+  }
+  Str.from_bytes(b)
+}
+
+# ---------------------------------------------------------------- system roots
+
+# Go's certFiles for Linux and the BSDs (macOS has /etc/ssl/cert.pem).
+def cert_files -> [Str] {
+  ["/etc/ssl/certs/ca-certificates.crt", "/etc/pki/tls/certs/ca-bundle.crt", "/etc/ssl/ca-bundle.pem", "/etc/pki/tls/cacert.pem", "/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem", "/etc/ssl/cert.pem", "/usr/local/etc/ssl/cert.pem", "/usr/local/share/certs/ca-root-nss.crt", "/etc/openssl/certs/ca-certificates.crt"]
+}
+
+# Go's certDirectories for Linux and the BSDs.
+def cert_directories -> [Str] { ["/etc/ssl/certs", "/etc/pki/tls/certs", "/usr/local/share/certs", "/etc/openssl/certs"] }
+
+# A copy of the system cert pool: the certificates of the first bundle
+# file found (or SSL_CERT_FILE) and of the certificate directories (or
+# SSL_CERT_DIR, a colon-separated list).
+pub def system_cert_pool -> ~CertPool<X509Error> { ~load_system_roots() }
+
+# Go's loadSystemRoots.
+def load_system_roots -> ~CertPool<X509Error> { ~load_system_roots_from(cert_files(), cert_directories()) }
+
+# load_system_roots with Go's certFiles and certDirectories as parameters
+# (tests replace them).
+def load_system_roots_from(cert_files0: [Str], cert_dirs0: [Str]) -> ~CertPool<X509Error> {
+  cert_file_path = os.getenv("SSL_CERT_FILE") || ""
+  cert_dir_path = os.getenv("SSL_CERT_DIR") || ""
+  ~load_on_disk_roots(cert_file_path, cert_dir_path, cert_files0, cert_dirs0)
+}
+
+# Go's loadOnDiskRoots (cert_files0, cert_dirs0: Go's certFiles and
+# certDirectories).
+def load_on_disk_roots(cert_file_path: Str, cert_dir_path: Str, cert_files0: [Str], cert_dirs0: [Str]) -> ~CertPool<X509Error> {
+  roots = new_cert_pool()
+  files = cert_files0
+  files = [cert_file_path] if cert_file_path != ""
+  first_err: Str? = none
+  for file in files {
+    r = os.read_file(file)
+    if data = r.ok {
+      roots.append_certs_from_pem!(data)
+      break
+    }
+    if e = r.err {
+      first_err = e.message if first_err.none? && !strings.contains(e.message, "no such file")
+    }
+  }
+  dirs = cert_dirs0
+  dirs = cert_dir_path.split(":") if cert_dir_path != ""
+  for directory in dirs {
+    r = read_unique_directory_entries(directory)
+    if e = r.err {
+      first_err = e.message if first_err.none? && !strings.contains(e.message, "no such file")
+      next
+    }
+    for fi in r.unwrap {
+      if data = os.read_file(directory + "/" + fi.name).ok {
+        roots.append_certs_from_pem!(data)
+      }
+    }
+  }
+  return roots if roots.len > 0 || first_err.none?
+  fail err(first_err || "")
+}
+
+# Go's readUniqueDirectoryEntries: os.read_dir without the symlinks that
+# point within the directory (their targets would be read twice).
+def read_unique_directory_entries(dir: Str) -> ~[os.DirEntry] {
+  files = ~os.read_dir(dir)
+  uniq: [os.DirEntry] = []
+  for f in files {
+    same_dir_symlink = false
+    if f.is_symlink {
+      if target = os.readlink(dir + "/" + f.name).ok {
+        same_dir_symlink = !target.include?("/")
+      }
+    }
+    uniq << f if !same_dir_symlink
+  }
+  uniq
+}

@@ -1,0 +1,377 @@
+# Key agreement: the TLS 1.0-1.2 RSA and ECDHE exchanges (Go's
+# key_agreement.go) and the TLS 1.3 key shares (key_schedule.go).
+
+import "crypto"
+import "crypto/ecdh"
+import "crypto/md5"
+import "crypto/mlkem"
+import "crypto/rsa"
+import "crypto/sha1"
+import "crypto/x509"
+import "io"
+
+def err_client_key_exchange -> TlsError { TlsError.Msg("tls: invalid ClientKeyExchange message") }
+def err_server_key_exchange -> TlsError { TlsError.Msg("tls: invalid ServerKeyExchange message") }
+
+def curve_for_curve_id(id: U16) -> ecdh.Curve? {
+  return ecdh.x25519() if id == X25519
+  return ecdh.p256() if id == CURVE_P256
+  return ecdh.p384() if id == CURVE_P384
+  return ecdh.p521() if id == CURVE_P521
+  none
+}
+
+def generate_ecdhe_key(rand: io.Reader, curve_id: U16) -> ~ecdh.PrivateKey {
+  if curve = curve_for_curve_id(curve_id) {
+    return curve.~generate_key(rand)
+  }
+  fail TlsError.Msg("tls: internal error: unsupported curve")
+}
+
+def sha1_hash(slices: [[Byte]]) -> [Byte] {
+  h = sha1.new()
+  for s in slices {
+    h.write!(s)
+  }
+  h.sum([])
+}
+
+def md5_sha1_hash(slices: [[Byte]]) -> [Byte] {
+  h = md5.new()
+  for s in slices {
+    h.write!(s)
+  }
+  h.sum([]) + sha1_hash(slices)
+}
+
+# Go's hashForServerKeyExchange (TLS 1.0/1.1).
+def hash_for_server_key_exchange(sig_type: Byte, slices: [[Byte]]) -> [Byte] {
+  return sha1_hash(slices) if sig_type == SIGNATURE_ECDSA
+  md5_sha1_hash(slices)
+}
+
+# A TLS 1.0-1.2 key agreement (Go's keyAgreement: rsaKeyAgreement or
+# ecdheKeyAgreement), with the ECDHE state.
+struct KeyAgreement {
+  ecdhe: Bool
+  version: U16
+  is_rsa: Bool
+  ckx: ClientKeyExchangeMsg?
+  pre_master_secret: [Byte]
+  curve_id: U16
+  signature_algorithm: U16
+  key: ecdh.PrivateKey?
+
+  # The server's ServerKeyExchange (none for RSA key exchange).
+  def generate_server_key_exchange!(config: Config, cert: Certificate, client_hello: ClientHelloMsg, hello: ServerHelloMsg) -> ~ServerKeyExchangeMsg? {
+    return none if !ecdhe
+    for c in client_hello.supported_curves {
+      if config.supports_curve?(version, c) {
+        self.curve_id = c
+        break
+      }
+    }
+    fail TlsError.Msg("tls: no supported elliptic curves offered") if curve_id == 0
+    fail TlsError.Msg("tls: internal error: supportsCurve accepted unimplemented curve") if curve_for_curve_id(curve_id).none?
+    k = ~generate_ecdhe_key(config.rand_reader, curve_id)
+    self.key = k
+    ecdhe_public = k.public_key.bytes
+    params: [Byte] = [3.as_u8, (curve_id >> 8).as_u8, curve_id.as_u8, ecdhe_public.size.as_u8] + ecdhe_public
+    fail TlsError.Msg("tls: certificate private key of type " + private_key_type_name(cert.private_key) + " does not implement crypto.Signer") if !cert.private_key.signer?
+    sig: [Byte] = []
+    if version >= VERSION_TLS12 {
+      self.signature_algorithm = ~select_signature_scheme(version, cert, client_hello.supported_signature_algorithms)
+      sig_type, sig_hash = ~type_and_hash_from_signature_scheme(signature_algorithm)
+      signed = client_hello.random + hello.random + params
+      if (sig_type == SIGNATURE_PKCS1V15 || sig_type == SIGNATURE_RSAPSS) != is_rsa {
+        fail TlsError.Msg("tls: certificate cannot be used with the selected cipher suite")
+      }
+      r = sign_handshake(cert.private_key, config.rand_reader, signed, sig_type, sig_hash)
+      if e = r.err {
+        fail TlsError.Msg("tls: failed to sign ECDHE parameters: " + e.message)
+      }
+      sig = r.unwrap
+    } else {
+      sig_type, sig_hash = ~legacy_type_and_hash_from_public_key(cert.private_key.public)
+      signed = hash_for_server_key_exchange(sig_type, [client_hello.random, hello.random, params])
+      if (sig_type == SIGNATURE_PKCS1V15) != is_rsa {
+        fail TlsError.Msg("tls: certificate cannot be used with the selected cipher suite")
+      }
+      r = cert.private_key.sign(config.rand_reader, signed, sig_hash || crypto.Hash.SHA1)
+      if e = r.err {
+        fail TlsError.Msg("tls: failed to sign ECDHE parameters: " + e.message)
+      }
+      sig = r.unwrap
+    }
+    key: [Byte] = params
+    key = key + [(signature_algorithm >> 8).as_u8, signature_algorithm.as_u8] if version >= VERSION_TLS12
+    key = key + [(sig.size >> 8).as_u8, sig.size.as_u8] + sig
+    ServerKeyExchangeMsg.new(key: key)
+  }
+
+  # The pre-master secret from the client's ClientKeyExchange.
+  def process_client_key_exchange(config: Config, cert: Certificate, ckx_msg: ClientKeyExchangeMsg, ver: U16) -> ~[Byte] {
+    ct = ckx_msg.ciphertext
+    if !ecdhe {
+      fail err_client_key_exchange() if ct.size < 2
+      l = (ct[0].to_i << 8) | ct[1].to_i
+      fail err_client_key_exchange() if l != ct.size - 2
+      ciphertext = ct[2...ct.size]
+      case cert.private_key {
+        Rsa(priv) => {
+          # Go's Decrypt with SessionKeyLen 48: a padding failure gives a
+          # random key (and a failed handshake later), in constant time.
+          return priv.~decrypt(config.rand_reader, ciphertext, rsa.PKCS1v15DecryptOptions.new(session_key_len: 48))
+        }
+        _ => {
+          fail TlsError.Msg("tls: certificate private key does not implement crypto.Decrypter")
+        }
+      }
+    }
+    fail err_client_key_exchange() if ct.size == 0 || ct[0].to_i != ct.size - 1
+    k = key || ecdh.x25519().generate_key(config.rand_reader).unwrap
+    rk = ct[1...ct.size]
+    peer = k.curve.new_public_key(rk)
+    fail err_client_key_exchange() if !peer.ok?
+    r = k.ecdh(peer.unwrap)
+    fail err_client_key_exchange() if !r.ok?
+    r.unwrap
+  }
+
+  # The client's processing of the ServerKeyExchange.
+  def process_server_key_exchange!(config: Config, client_hello: ClientHelloMsg, server_hello: ServerHelloMsg, cert: x509.Certificate, skx: ServerKeyExchangeMsg) -> ~Unit {
+    fail TlsError.Msg("tls: unexpected ServerKeyExchange") if !ecdhe
+    k = skx.key
+    fail err_server_key_exchange() if k.size < 4
+    fail TlsError.Msg("tls: server selected unsupported curve") if k[0] != 3
+    self.curve_id = (k[1].to_u16 << 8) | k[2].to_u16
+    public_len = k[3].to_i
+    fail err_server_key_exchange() if public_len + 4 > k.size
+    params = k[0...4 + public_len]
+    public_key = params[4...params.size]
+    sig = k[4 + public_len...k.size]
+    fail err_server_key_exchange() if sig.size < 2
+    if version >= VERSION_TLS12 {
+      self.signature_algorithm = (sig[0].to_u16 << 8) | sig[1].to_u16
+      sig = sig[2...sig.size]
+      fail err_server_key_exchange() if sig.size < 2
+      if signature_algorithm == MLDSA44 || signature_algorithm == MLDSA65 || signature_algorithm == MLDSA87 {
+        fail TlsError.Msg("tls: server selected ML-DSA with TLS version < 1.3")
+      }
+    }
+    sig_len = (sig[0].to_i << 8) | sig[1].to_i
+    fail err_server_key_exchange() if sig_len + 2 != sig.size
+    sig = sig[2...sig.size]
+    fail TlsError.Msg("tls: server selected unoffered curve") if !client_hello.supported_curves.include?(curve_id)
+    fail TlsError.Msg("tls: server selected unsupported curve") if curve_for_curve_id(curve_id).none?
+    our = ~generate_ecdhe_key(config.rand_reader, curve_id)
+    self.key = our
+    peer = our.curve.new_public_key(public_key)
+    fail err_server_key_exchange() if !peer.ok?
+    pms = our.ecdh(peer.unwrap)
+    fail err_server_key_exchange() if !pms.ok?
+    self.pre_master_secret = pms.unwrap
+    our_public = our.public_key.bytes
+    self.ckx = ClientKeyExchangeMsg.new(ciphertext: [our_public.size.as_u8] + our_public)
+    if version >= VERSION_TLS12 {
+      if !supported_signature_algorithm?(signature_algorithm, client_hello.supported_signature_algorithms) {
+        fail TlsError.Msg("tls: certificate used with invalid signature algorithm")
+      }
+      sig_type, sig_hash = ~type_and_hash_from_signature_scheme(signature_algorithm)
+      fail err_server_key_exchange() if (sig_type == SIGNATURE_PKCS1V15 || sig_type == SIGNATURE_RSAPSS) != is_rsa
+      signed = client_hello.random + server_hello.random + params
+      r = verify_handshake_signature(sig_type, cert.public_key, sig_hash, signed, sig)
+      if e = r.err {
+        fail TlsError.Msg("tls: invalid signature by the server certificate: " + e.message)
+      }
+    } else {
+      sig_type, sig_hash = ~legacy_type_and_hash_from_public_key(cert.public_key)
+      fail err_server_key_exchange() if (sig_type == SIGNATURE_PKCS1V15) != is_rsa
+      signed = hash_for_server_key_exchange(sig_type, [client_hello.random, server_hello.random, params])
+      r = verify_legacy_handshake_signature(sig_type, cert.public_key, sig_hash, signed, sig)
+      if e = r.err {
+        fail TlsError.Msg("tls: invalid signature by the server certificate: " + e.message)
+      }
+    }
+  }
+
+  # The client's pre-master secret and ClientKeyExchange.
+  def generate_client_key_exchange(config: Config, client_hello: ClientHelloMsg, cert: x509.Certificate) -> ~([Byte], ClientKeyExchangeMsg) {
+    if ecdhe {
+      if c = ckx {
+        return (pre_master_secret, c)
+      }
+      fail TlsError.Msg("tls: missing ServerKeyExchange message")
+    }
+    rnd = ~config.rand_bytes(46)
+    pms = [(client_hello.vers >> 8).as_u8, client_hello.vers.as_u8] + rnd
+    case cert.public_key {
+      Rsa(k) => {
+        encrypted = rsa.~encrypt_pkcs1v15(config.rand_reader, k, pms)
+        return (pms, ClientKeyExchangeMsg.new(ciphertext: [(encrypted.size >> 8).as_u8, encrypted.size.as_u8] + encrypted))
+      }
+      _ => {
+        fail TlsError.Msg("tls: server certificate contains incorrect key type for selected ciphersuite")
+      }
+    }
+    ([], ClientKeyExchangeMsg.new)
+  }
+}
+
+def key_agreement_for(s: CipherSuiteImpl, version: U16) -> KeyAgreement { KeyAgreement.new(ecdhe: s.ka != KA_RSA, is_rsa: s.ka == KA_ECDHE_RSA, version: version) }
+
+# ---------------------------------------------------------------- TLS 1.3 key shares
+
+# Go's keySharePrivateKeys.
+struct KeySharePrivateKeys {
+  ecdhe: ecdh.PrivateKey?
+  mlkem768: mlkem.DecapsulationKey768?
+  mlkem1024: mlkem.DecapsulationKey1024?
+}
+
+def ecdh_part(id: U16) -> U16 {
+  return X25519 if id == X25519_MLKEM768
+  return CURVE_P256 if id == SECP256R1_MLKEM768
+  return CURVE_P384 if id == SECP384R1_MLKEM1024
+  id
+}
+
+def ecdh_element_size(id: U16) -> Int {
+  return 32 if id == X25519_MLKEM768
+  return 65 if id == SECP256R1_MLKEM768
+  97
+}
+
+def known_key_exchange?(id: U16) -> Bool { curve_for_curve_id(id).some? || pq_key_exchange?(id) }
+
+# Go's keyExchange.keyShares: the private keys and the key shares to send
+# (a hybrid also sends its classical share).
+def key_shares(id: U16, rand: io.Reader) -> ~(KeySharePrivateKeys, [KeyShare]) {
+  if id == MLKEM1024 {
+    dk1 = ~mlkem_key1024(rand)
+    return (KeySharePrivateKeys.new(mlkem1024: dk1), [KeyShare.new(group: MLKEM1024, data: dk1.encapsulation_key.bytes)])
+  }
+  if curve = curve_for_curve_id(id) {
+    p1 = curve.~generate_key(rand)
+    return (KeySharePrivateKeys.new(ecdhe: p1), [KeyShare.new(group: id, data: p1.public_key.bytes)])
+  }
+  fail TlsError.Msg("tls: unsupported key exchange") if !pq_key_exchange?(id)
+  e = ecdh_part(id)
+  priv = (curve_for_curve_id(e) || ecdh.x25519()).~generate_key(rand)
+  classical = priv.public_key.bytes
+  if id == SECP384R1_MLKEM1024 {
+    dk2 = ~mlkem_key1024(rand)
+    return (KeySharePrivateKeys.new(ecdhe: priv, mlkem1024: dk2), [KeyShare.new(group: id, data: classical + dk2.encapsulation_key.bytes), KeyShare.new(group: e, data: classical)])
+  }
+  dk = ~mlkem_key768(rand)
+  share = id == X25519_MLKEM768 ? dk.encapsulation_key.bytes + classical : classical + dk.encapsulation_key.bytes
+  (KeySharePrivateKeys.new(ecdhe: priv, mlkem768: dk), [KeyShare.new(group: id, data: share), KeyShare.new(group: e, data: classical)])
+}
+
+# Go's keyExchange.serverSharedSecret: the shared secret and the server's
+# key share.
+def server_shared_secret(id: U16, rand: io.Reader, client_key_share: [Byte]) -> ~([Byte], KeyShare) {
+  if id == MLKEM1024 {
+    pk1 = mlkem.~new_encapsulation_key1024(client_key_share)
+    m1 = ~read_rand(rand, 32)
+    s1, ct1 = mlkem.~encapsulate1024(pk1, m1)
+    return (s1, KeyShare.new(group: MLKEM1024, data: ct1))
+  }
+  if curve = curve_for_curve_id(id) {
+    key = curve.~generate_key(rand)
+    peer = curve.~new_public_key(client_key_share)
+    s2 = key.~ecdh(peer)
+    return (s2, KeyShare.new(group: id, data: key.public_key.bytes))
+  }
+  fail TlsError.Msg("tls: unsupported key exchange") if !pq_key_exchange?(id)
+  es = ecdh_element_size(id)
+  mk_size = id == SECP384R1_MLKEM1024 ? mlkem.ENCAPSULATION_KEY_SIZE1024 : mlkem.ENCAPSULATION_KEY_SIZE768
+  fail TlsError.Msg("tls: invalid client key share length for hybrid key exchange") if client_key_share.size != es + mk_size
+  ecdh_data: [Byte] = []
+  mlkem_data: [Byte] = []
+  if id == X25519_MLKEM768 {
+    mlkem_data = client_key_share[0...mk_size]
+    ecdh_data = client_key_share[mk_size...client_key_share.size]
+  } else {
+    ecdh_data = client_key_share[0...es]
+    mlkem_data = client_key_share[es...client_key_share.size]
+  }
+  ecdh_shared, ks = ~server_shared_secret(ecdh_part(id), rand, ecdh_data)
+  ml: ([Byte], [Byte]) = ([], [])
+  if id == SECP384R1_MLKEM1024 {
+    pk2 = mlkem.~new_encapsulation_key1024(mlkem_data)
+    m2 = ~read_rand(rand, 32)
+    ml = mlkem.~encapsulate1024(pk2, m2)
+  } else {
+    pk3 = mlkem.~new_encapsulation_key768(mlkem_data)
+    m3 = ~read_rand(rand, 32)
+    ml = mlkem.~encapsulate768(pk3, m3)
+  }
+  ml_shared, ml_ct = ml
+  if id == X25519_MLKEM768 {
+    return (ml_shared + ecdh_shared, KeyShare.new(group: id, data: ml_ct + ks.data))
+  }
+  (ecdh_shared + ml_shared, KeyShare.new(group: id, data: ks.data + ml_ct))
+}
+
+# Go's keyExchange.clientSharedSecret.
+def client_shared_secret(id: U16, priv: KeySharePrivateKeys, server_key_share: [Byte]) -> ~[Byte] {
+  if id == MLKEM1024 {
+    if dk1 = priv.mlkem1024 {
+      return dk1.~decapsulate(server_key_share)
+    }
+    fail TlsError.Msg("tls: internal error: missing ML-KEM key")
+  }
+  if curve = curve_for_curve_id(id) {
+    peer = curve.~new_public_key(server_key_share)
+    if k = priv.ecdhe {
+      return k.~ecdh(peer)
+    }
+    fail TlsError.Msg("tls: internal error: missing ECDHE key")
+  }
+  fail TlsError.Msg("tls: unsupported key exchange") if !pq_key_exchange?(id)
+  es = ecdh_element_size(id)
+  ct_size = id == SECP384R1_MLKEM1024 ? mlkem.CIPHERTEXT_SIZE1024 : mlkem.CIPHERTEXT_SIZE768
+  fail TlsError.Msg("tls: invalid server key share length for hybrid key exchange") if server_key_share.size != es + ct_size
+  ecdh_data: [Byte] = []
+  mlkem_data: [Byte] = []
+  if id == X25519_MLKEM768 {
+    mlkem_data = server_key_share[0...ct_size]
+    ecdh_data = server_key_share[ct_size...server_key_share.size]
+  } else {
+    ecdh_data = server_key_share[0...es]
+    mlkem_data = server_key_share[es...server_key_share.size]
+  }
+  ecdh_shared = ~client_shared_secret(ecdh_part(id), priv, ecdh_data)
+  ml_shared: [Byte] = []
+  if id == SECP384R1_MLKEM1024 {
+    if dk2 = priv.mlkem1024 {
+      ml_shared = dk2.~decapsulate(mlkem_data)
+    }
+  } else if dk3 = priv.mlkem768 {
+    ml_shared = dk3.~decapsulate(mlkem_data)
+  }
+  return ml_shared + ecdh_shared if id == X25519_MLKEM768
+  ecdh_shared + ml_shared
+}
+
+# ML-KEM randomness comes from the config's reader (Go draws it from its
+# DRBG, which the tests replace with the same deterministic stream), in
+# Go's order: d, then z; m for encapsulation.
+def read_rand(rand: io.Reader, n: Int) -> ~[Byte] {
+  b = [0.as_u8; n]
+  io.~read_full(rand, b)
+  b
+}
+
+def mlkem_key768(rand: io.Reader) -> ~mlkem.DecapsulationKey768 {
+  d = ~read_rand(rand, 32)
+  z = ~read_rand(rand, 32)
+  mlkem.generate_key_internal768(d, z)
+}
+
+def mlkem_key1024(rand: io.Reader) -> ~mlkem.DecapsulationKey1024 {
+  d = ~read_rand(rand, 32)
+  z = ~read_rand(rand, 32)
+  mlkem.generate_key_internal1024(d, z)
+}

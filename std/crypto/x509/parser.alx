@@ -1,0 +1,905 @@
+# Go's x509 parser.go: certificates, CRLs and their pieces, parsed with
+# golang.org/x/crypto/cryptobyte.
+
+import "crypto/x509/pkix"
+import "encoding/asn1"
+import "math/big"
+import "net/url"
+import "strconv"
+import "time"
+import "unicode/utf8"
+import "unicode/utf16"
+import "golang.org/x/crypto/cryptobyte"
+import cbasn1 "golang.org/x/crypto/cryptobyte/asn1"
+
+NAME_TYPE_EMAIL = 1
+NAME_TYPE_DNS = 2
+NAME_TYPE_URI = 6
+NAME_TYPE_IP = 7
+
+def x509_printable?(b: Byte) -> Bool {
+  # a-z A-Z 0-9 ' ( ) + , - . / space : = ? * &
+  (b >= 97 && b <= 122) || (b >= 65 && b <= 90) || (b >= 48 && b <= 57) || (b >= 39 && b <= 41) || (b >= 43 && b <= 47) || b == 32 || b == 58 || b == 61 || b == 63 || b == 42 || b == 38
+}
+
+# Go's parseASN1String: the string of an element with a string tag.
+def parse_asn1_string(tag: Byte, value: [Byte]) -> ~Str<X509Error> {
+  if tag == cbasn1.T61_STRING {
+    # T.61 is a defunct ITU 8-bit character encoding; Go maps each byte to
+    # the rune of the same value.
+    buf: [Byte] = []
+    for v in value {
+      buf = utf8.append_rune(buf, v.to_i.as_i32)
+    }
+    return Str.from_bytes(buf)
+  }
+  if tag == cbasn1.PRINTABLE_STRING {
+    for b in value {
+      fail err("invalid PrintableString") if !x509_printable?(b)
+    }
+    return Str.from_bytes(value)
+  }
+  if tag == cbasn1.UTF8_STRING {
+    fail err("invalid UTF-8 string") if !utf8.valid(value)
+    return Str.from_bytes(value)
+  }
+  if tag == asn1.TAG_BMP_STRING.as_u8 {
+    # BMPString uses the defunct UCS-2 16-bit character encoding, which
+    # covers the Basic Multilingual Plane.
+    fail err("invalid BMPString") if value.size % 2 != 0
+    v = value
+    l = v.size
+    # Strip terminator if present.
+    v = v[0...l - 2] if l >= 2 && v[l - 1] == 0 && v[l - 2] == 0
+    s: [U16] = []
+    i = 0
+    while i < v.size {
+      point = (v[i].to_u16 << 8) + v[i + 1].to_u16
+      if point == 0xfffe || point == 0xffff || (point >= 0xfdd0 && point <= 0xfdef) || (point >= 0xd800 && point <= 0xdfff) {
+        fail err("invalid BMPString")
+      }
+      s << point
+      i += 2
+    }
+    buf: [Byte] = []
+    for r in utf16.decode(s) {
+      buf = utf8.append_rune(buf, r)
+    }
+    return Str.from_bytes(buf)
+  }
+  if tag == cbasn1.IA5_STRING {
+    ia5 = Str.from_bytes(value)
+    fail err("invalid IA5String") if !ia5_string?(ia5)
+    return ia5
+  }
+  if tag == asn1.TAG_NUMERIC_STRING.as_u8 {
+    for b in value {
+      fail err("invalid NumericString") if !((b >= 48 && b <= 57) || b == 32)
+    }
+    return Str.from_bytes(value)
+  }
+  fail err("unsupported string type: #{tag}")
+}
+
+# Whether s is an IA5String (ASCII).
+def ia5_string?(s: Str) -> Bool {
+  for b in s.bytes {
+    return false if b >= 0x80
+  }
+  true
+}
+
+# Go's readASN1Any: the value of an attribute.
+def read_asn1_any(der: cryptobyte.String) -> ~(asn1.Any, cryptobyte.String)<X509Error> {
+  d = der
+  _h1 = d.read_any_asn1_element!
+  r = ~need(_h1, "invalid ASN.1 element")
+  full0, value_tag = r
+  full = full0
+  if value_tag == cbasn1.T61_STRING || value_tag == cbasn1.PRINTABLE_STRING || value_tag == cbasn1.UTF8_STRING || value_tag == asn1.TAG_BMP_STRING.as_u8 || value_tag == cbasn1.IA5_STRING || value_tag == asn1.TAG_NUMERIC_STRING.as_u8 {
+    _h2 = full.read_asn1_bytes!(value_tag)
+    raw = ~need(_h2, "invalid ASN.1 element")
+    return (asn1.Any.Str(~parse_asn1_string(value_tag, raw)), d)
+  }
+  if value_tag == cbasn1.INTEGER {
+    _h3 = full.read_asn1_int64!
+    i = ~need(_h3, "invalid ASN.1 integer")
+    return (asn1.Any.Int(i), d)
+  }
+  if value_tag == cbasn1.BIT_STRING {
+    _h4 = full.read_asn1_bit_string!
+    bs = ~need(_h4, "invalid ASN.1 BIT STRING")
+    return (asn1.Any.BitString(bs), d)
+  }
+  if value_tag == cbasn1.OCTET_STRING {
+    _h5 = full.read_asn1_bytes!(cbasn1.OCTET_STRING)
+    s = ~need(_h5, "invalid ASN.1 OCTET STRING")
+    return (asn1.Any.Bytes(s), d)
+  }
+  if value_tag == cbasn1.OBJECT_IDENTIFIER {
+    _h6 = full.read_asn1_object_identifier!
+    oid = ~need(_h6, "invalid ASN.1 OBJECT IDENTIFIER")
+    return (asn1.Any.Oid(oid), d)
+  }
+  if value_tag == cbasn1.UTC_TIME || value_tag == cbasn1.GENERALIZED_TIME {
+    t, _ = ~read_asn1_time(full)
+    return (asn1.Any.Time(t), d)
+  }
+  if value_tag == cbasn1.BOOLEAN {
+    _h7 = full.read_asn1_boolean!
+    b = ~need(_h7, "invalid ASN.1 BOOLEAN")
+    return (asn1.Any.Bool(b), d)
+  }
+  return (asn1.Any.Nil, d) if value_tag == cbasn1.NULL
+  v = asn1.RawValue.new(class: (value_tag >> 6).to_i, is_compound: value_tag & 0x20 == 0x20, tag: (value_tag & 0x1f).to_i, full_bytes: full.bytes)
+  _h8 = full.read_any_asn1!
+  inner = ~need(_h8, "invalid ASN.1 element")
+  v.bytes = inner[0].bytes
+  (asn1.Any.Raw(v), d)
+}
+
+# Go's parseName: the RDNSequence of a DER Name.
+def parse_name(raw0: [Byte]) -> ~pkix.RDNSequence<X509Error> {
+  outer = cryptobyte.string(raw0)
+  _h9 = outer.read_asn1!(cbasn1.SEQUENCE)
+  raw = ~need(_h9, "x509: invalid RDNSequence")
+  rdn_seq = pkix.RDNSequence.new
+  while !raw.empty? {
+    rdn_set = pkix.RelativeDistinguishedNameSET.new
+    _h10 = raw.read_asn1!(cbasn1.SET)
+    set = ~need(_h10, "x509: invalid RDNSequence")
+    while !set.empty? {
+      _h11 = set.read_asn1!(cbasn1.SEQUENCE)
+      atav = ~need(_h11, "x509: invalid RDNSequence: invalid attribute")
+      _h12 = atav.read_asn1_object_identifier!
+      t = ~need(_h12, "x509: invalid RDNSequence: invalid attribute type")
+      r = read_asn1_any(atav)
+      if e = r.err {
+        fail err("x509: invalid RDNSequence: invalid attribute value: #{e.message}")
+      }
+      rdn_set.atvs << pkix.AttributeTypeAndValue.new(type: t, value: r.unwrap[0])
+    }
+    rdn_seq.rdns << rdn_set
+  }
+  rdn_seq
+}
+
+# Go's parseAI.
+def parse_ai(der0: cryptobyte.String) -> ~pkix.AlgorithmIdentifier<X509Error> {
+  der = der0
+  ai = pkix.AlgorithmIdentifier.new
+  _h13 = der.read_asn1_object_identifier!
+  ai.algorithm = ~need(_h13, "x509: malformed OID")
+  return ai if der.empty?
+  _h14 = der.read_any_asn1_element!
+  r = ~need(_h14, "x509: malformed parameters")
+  ai.parameters.tag = r[1].to_i
+  ai.parameters.full_bytes = r[0].bytes
+  ai
+}
+
+# Go's readASN1Time: a UTCTime or GeneralizedTime, and the rest.
+def read_asn1_time(der0: cryptobyte.String) -> ~(time.Time, cryptobyte.String)<X509Error> {
+  der = der0
+  if der.peek_asn1_tag?(cbasn1.UTC_TIME) {
+    _h15 = der.read_asn1_utc_time!
+    t = ~need(_h15, "x509: malformed UTCTime")
+    return (t, der)
+  }
+  if der.peek_asn1_tag?(cbasn1.GENERALIZED_TIME) {
+    _h16 = der.read_asn1_generalized_time!
+    t = ~need(_h16, "x509: malformed GeneralizedTime")
+    return (t, der)
+  }
+  fail err("x509: unsupported time format")
+}
+
+def parse_validity(der: cryptobyte.String) -> ~(time.Time, time.Time)<X509Error> {
+  not_before, rest = ~read_asn1_time(der)
+  not_after, _ = ~read_asn1_time(rest)
+  (not_before, not_after)
+}
+
+def parse_extension(der0: cryptobyte.String) -> ~pkix.Extension<X509Error> {
+  der = der0
+  ext = pkix.Extension.new
+  _h17 = der.read_asn1_object_identifier!
+  ext.id = ~need(_h17, "x509: malformed extension OID field")
+  if der.peek_asn1_tag?(cbasn1.BOOLEAN) {
+    _h18 = der.read_asn1_boolean!
+    ext.critical = ~need(_h18, "x509: malformed extension critical field")
+  }
+  _h19 = der.read_asn1!(cbasn1.OCTET_STRING)
+  val = ~need(_h19, "x509: malformed extension value field")
+  ext.value = val.bytes
+  ext
+}
+
+def parse_key_usage_extension(der0: [Byte]) -> ~Int<X509Error> {
+  der = cryptobyte.string(der0)
+  _h20 = der.read_asn1_bit_string!
+  usage_bits = ~need(_h20, "x509: invalid key usage")
+  usage = 0
+  i = 0
+  while i < 9 {
+    usage = usage | (1 << i) if usage_bits.at(i) != 0
+    i += 1
+  }
+  usage
+}
+
+def parse_basic_constraints_extension(der0: [Byte]) -> ~(Bool, Int)<X509Error> {
+  outer = cryptobyte.string(der0)
+  _h21 = outer.read_asn1!(cbasn1.SEQUENCE)
+  der = ~need(_h21, "x509: invalid basic constraints")
+  is_ca = false
+  if der.peek_asn1_tag?(cbasn1.BOOLEAN) {
+    _h22 = der.read_asn1_boolean!
+    is_ca = ~need(_h22, "x509: invalid basic constraints")
+  }
+  max_path_len = -1
+  if der.peek_asn1_tag?(cbasn1.INTEGER) {
+    _h23 = der.read_asn1_uint64!
+    mpl = ~need(_h23, "x509: invalid basic constraints")
+    fail err("x509: invalid basic constraints") if mpl > 9223372036854775807
+    max_path_len = mpl.to_i
+  }
+  (is_ca, max_path_len)
+}
+
+# The (tag, data) pairs of a GeneralNames SEQUENCE (Go's forEachSAN).
+def san_entries(der0: [Byte]) -> ~[(Int, [Byte])]<X509Error> {
+  outer = cryptobyte.string(der0)
+  _h24 = outer.read_asn1!(cbasn1.SEQUENCE)
+  der = ~need(_h24, "x509: invalid subject alternative names")
+  out: [(Int, [Byte])] = []
+  while !der.empty? {
+    _h25 = der.read_any_asn1!
+    r = ~need(_h25, "x509: invalid subject alternative name")
+    out << ((r[1] ^ 0x80).to_i, r[0].bytes)
+  }
+  out
+}
+
+# Go's parseSANExtension.
+def parse_san_extension(der: [Byte]) -> ~([Str], [Str], [[Byte]], [url.Url])<X509Error> {
+  dns_names: [Str] = []
+  email_addresses: [Str] = []
+  ip_addresses: [[Byte]] = []
+  uris: [url.Url] = []
+  for entry in ~san_entries(der) {
+    tag, data = entry
+    if tag == NAME_TYPE_EMAIL {
+      email = Str.from_bytes(data)
+      fail err("x509: SAN rfc822Name is malformed") if !ia5_string?(email)
+      email_addresses << email
+    } else if tag == NAME_TYPE_DNS {
+      name = Str.from_bytes(data)
+      fail err("x509: SAN dNSName is malformed") if !ia5_string?(name)
+      dns_names << name
+    } else if tag == NAME_TYPE_URI {
+      uri_str = Str.from_bytes(data)
+      fail err("x509: SAN uniformResourceIdentifier is malformed") if !ia5_string?(uri_str)
+      r = url.parse(uri_str)
+      if e = r.err {
+        fail err("x509: cannot parse URI #{strconv.quote(uri_str)}: #{e.message}")
+      }
+      uri = r.unwrap
+      if uri.host.size > 0 && !domain_name_valid?(uri.host, false) {
+        fail err("x509: cannot parse URI #{strconv.quote(uri_str)}: invalid domain")
+      }
+      uris << uri
+    } else if tag == NAME_TYPE_IP {
+      if data.size == 16 {
+        fail err("x509: SAN iPAddress contains IPv4-mapped IPv6 address") if to4(data).some?
+        ip_addresses << data + []
+      } else if data.size == 4 {
+        ip_addresses << data + []
+      } else {
+        fail err("x509: cannot parse IP address of length #{data.size}")
+      }
+    }
+  }
+  (dns_names, email_addresses, ip_addresses, uris)
+}
+
+def parse_authority_key_identifier(e: pkix.Extension) -> ~[Byte]<X509Error> {
+  # RFC 5280, Section 4.2.1.1
+  fail err("x509: authority key identifier incorrectly marked critical") if e.critical
+  val = cryptobyte.string(e.value)
+  _h26 = val.read_asn1!(cbasn1.SEQUENCE)
+  akid = ~need(_h26, "x509: invalid authority key identifier")
+  tag0 = cbasn1.context_specific(0)
+  if akid.peek_asn1_tag?(tag0) {
+    _h27 = akid.read_asn1!(tag0)
+    a = ~need(_h27, "x509: invalid authority key identifier")
+    return a.bytes
+  }
+  []
+}
+
+def parse_ext_key_usage_extension(der0: [Byte]) -> ~([ExtKeyUsage], [asn1.ObjectIdentifier])<X509Error> {
+  ext_key_usages: [ExtKeyUsage] = []
+  unknown_usages: [asn1.ObjectIdentifier] = []
+  outer = cryptobyte.string(der0)
+  _h28 = outer.read_asn1!(cbasn1.SEQUENCE)
+  der = ~need(_h28, "x509: invalid extended key usages")
+  while !der.empty? {
+    _h29 = der.read_asn1_object_identifier!
+    eku = ~need(_h29, "x509: invalid extended key usages")
+    if u = ext_key_usage_from_oid(eku) {
+      ext_key_usages << u
+    } else {
+      unknown_usages << eku
+    }
+  }
+  (ext_key_usages, unknown_usages)
+}
+
+def parse_certificate_policies_extension(der0: [Byte]) -> ~[OID]<X509Error> {
+  oids: [OID] = []
+  seen: Map[Str, Bool] = {}
+  outer = cryptobyte.string(der0)
+  _h30 = outer.read_asn1!(cbasn1.SEQUENCE)
+  der = ~need(_h30, "x509: invalid certificate policies")
+  while !der.empty? {
+    _h31 = der.read_asn1!(cbasn1.SEQUENCE)
+    cp = ~need(_h31, "x509: invalid certificate policies")
+    _h32 = cp.read_asn1!(cbasn1.OBJECT_IDENTIFIER)
+    oid_bytes = ~need(_h32, "x509: invalid certificate policies")
+    key = Str.from_bytes(oid_bytes.bytes)
+    fail err("x509: invalid certificate policies") if seen.has_key?(key)
+    seen[key] = true
+    oid = ~need(new_oid_from_der(oid_bytes.bytes), "x509: invalid certificate policies")
+    oids << oid
+  }
+  oids
+}
+
+def valid_ip_mask?(mask: [Byte]) -> Bool {
+  seen_zero = false
+  for b in mask {
+    if seen_zero {
+      return false if b != 0
+      next
+    }
+    if b == 0x00 || b == 0x80 || b == 0xc0 || b == 0xe0 || b == 0xf0 || b == 0xf8 || b == 0xfc || b == 0xfe {
+      seen_zero = true
+    } else if b != 0xff {
+      return false
+    }
+  }
+  true
+}
+
+# The values of one GeneralSubtrees (Go's getValues in
+# parseNameConstraintsExtension) and whether an unhandled type was seen.
+struct Subtrees {
+  dns_names: [Str]
+  ips: [IPNet]
+  emails: [Str]
+  uri_domains: [Str]
+  unhandled: Bool
+}
+
+def name_constraint_values(subtrees0: cryptobyte.String) -> ~Subtrees<X509Error> {
+  subtrees = subtrees0
+  out = Subtrees.new
+  dns_tag = cbasn1.context_specific(2)
+  email_tag = cbasn1.context_specific(1)
+  ip_tag = cbasn1.context_specific(7)
+  uri_tag = cbasn1.context_specific(6)
+  while !subtrees.empty? {
+    _h33 = subtrees.read_asn1!(cbasn1.SEQUENCE)
+    seq = ~need(_h33, "x509: invalid NameConstraints extension")
+    _h34 = seq.read_any_asn1!
+    r = ~need(_h34, "x509: invalid NameConstraints extension")
+    value = r[0].bytes
+    tag = r[1]
+    if tag == dns_tag {
+      domain = Str.from_bytes(value)
+      fail err("x509: invalid constraint value: #{ia5_error(domain)}") if !ia5_string?(domain)
+      fail err("x509: failed to parse dnsName constraint #{strconv.quote(domain)}") if !domain_name_valid?(domain, true)
+      out.dns_names << domain
+    } else if tag == ip_tag {
+      l = value.size
+      ip: [Byte] = []
+      mask: [Byte] = []
+      if l == 8 {
+        ip = value[0...4]
+        mask = value[4...8]
+      } else if l == 32 {
+        ip = value[0...16]
+        mask = value[16...32]
+      } else {
+        fail err("x509: IP constraint contained value of length #{l}")
+      }
+      fail err("x509: IP constraint contained invalid mask #{bytes_hex(mask)}") if !valid_ip_mask?(mask)
+      fail err("x509: IP constraint contained IPv4-mapped IPv6 address") if ip.size == 16 && to4(ip).some?
+      out.ips << IPNet.new(ip: ip + [], mask: mask + [])
+    } else if tag == email_tag {
+      constraint = Str.from_bytes(value)
+      fail err("x509: invalid constraint value: #{ia5_error(constraint)}") if !ia5_string?(constraint)
+      # If the constraint contains an @ then it specifies an exact mailbox
+      # name.
+      if constraint.include?("@") {
+        fail err("x509: failed to parse rfc822Name constraint #{strconv.quote(constraint)}") if parse_rfc2821_mailbox(constraint).none?
+      } else {
+        # Otherwise it's a domain name.
+        fail err("x509: failed to parse rfc822Name constraint #{strconv.quote(constraint)}") if !domain_name_valid?(constraint, true)
+      }
+      out.emails << constraint
+    } else if tag == uri_tag {
+      domain = Str.from_bytes(value)
+      fail err("x509: invalid constraint value: #{ia5_error(domain)}") if !ia5_string?(domain)
+      fail err("x509: failed to parse URI constraint #{strconv.quote(domain)}: cannot be IP address") if parse_ip(domain).some?
+      fail err("x509: failed to parse URI constraint #{strconv.quote(domain)}") if !domain_name_valid?(domain, true)
+      out.uri_domains << domain
+    } else {
+      out.unhandled = true
+    }
+  }
+  out
+}
+
+# Go's isIA5String error text.
+def ia5_error(s: Str) -> Str {
+  for r in s.runes {
+    # Per RFC5280 "IA5String is limited to the set of ASCII characters"
+    return "x509: #{strconv.quote(s)} cannot be encoded as an IA5String" if r > 127
+  }
+  ""
+}
+
+# Go's parseNameConstraintsExtension: fills the name constraint fields of
+# out; returns whether part of the extension was unhandled.
+def parse_name_constraints_extension(out: Certificate, e: pkix.Extension) -> ~(Certificate, Bool)<X509Error> {
+  # RFC 5280, 4.2.1.10
+  # NameConstraints ::= SEQUENCE {
+  #      permittedSubtrees       [0]     GeneralSubtrees OPTIONAL,
+  #      excludedSubtrees        [1]     GeneralSubtrees OPTIONAL }
+  # GeneralSubtrees ::= SEQUENCE SIZE (1..MAX) OF GeneralSubtree
+  # GeneralSubtree ::= SEQUENCE {
+  #      base                    GeneralName,
+  #      minimum         [0]     BaseDistance DEFAULT 0,
+  #      maximum         [1]     BaseDistance OPTIONAL }
+  # BaseDistance ::= INTEGER (0..MAX)
+  c = out
+  outer = cryptobyte.string(e.value)
+  bad = "x509: invalid NameConstraints extension"
+  _h35 = outer.read_asn1!(cbasn1.SEQUENCE)
+  toplevel = ~need(_h35, bad)
+  ~check(outer.empty?, bad)
+  _h36 = toplevel.read_optional_asn1!(cbasn1.constructed(cbasn1.context_specific(0)))
+  p = ~need(_h36, bad)
+  _h37 = toplevel.read_optional_asn1!(cbasn1.constructed(cbasn1.context_specific(1)))
+  x = ~need(_h37, bad)
+  ~check(toplevel.empty?, bad)
+  permitted, have_permitted = p
+  excluded, have_excluded = x
+  if (!have_permitted && !have_excluded) || (permitted.size == 0 && excluded.size == 0) {
+    fail err("x509: empty name constraints extension")
+  }
+  ps = ~name_constraint_values(permitted)
+  xs = ~name_constraint_values(excluded)
+  c.permitted_dns_domains = ps.dns_names
+  c.permitted_ip_ranges = ps.ips
+  c.permitted_email_addresses = ps.emails
+  c.permitted_uri_domains = ps.uri_domains
+  c.excluded_dns_domains = xs.dns_names
+  c.excluded_ip_ranges = xs.ips
+  c.excluded_email_addresses = xs.emails
+  c.excluded_uri_domains = xs.uri_domains
+  c.permitted_dns_domains_critical = e.critical
+  (c, ps.unhandled || xs.unhandled)
+}
+
+# Go's processExtensions: the fields of the extensions in out.extensions.
+def process_extensions(cert: Certificate) -> ~Certificate<X509Error> {
+  out = cert
+  for e in cert.extensions {
+    unhandled = false
+    id = e.id.arcs
+    if id.size == 4 && id[0] == 2 && id[1] == 5 && id[2] == 29 {
+      k = id[3]
+      if k == 15 {
+        # RFC 5280, 4.2.1.3
+        out.key_usage = ~parse_key_usage_extension(e.value)
+      } else if k == 19 {
+        # RFC 5280, 4.2.1.9
+        is_ca, max_path_len = ~parse_basic_constraints_extension(e.value)
+        out.is_ca = is_ca
+        out.max_path_len = max_path_len
+        out.basic_constraints_valid = true
+        out.max_path_len_zero = out.max_path_len == 0
+      } else if k == 17 {
+        dns, emails, ips, uris = ~parse_san_extension(e.value)
+        out.dns_names = dns
+        out.email_addresses = emails
+        out.ip_addresses = ips
+        out.uris = uris
+        # If we didn't parse anything then we do the critical check, below.
+        unhandled = true if dns.size == 0 && emails.size == 0 && ips.size == 0 && uris.size == 0
+      } else if k == 30 {
+        c2, u = ~parse_name_constraints_extension(out, e)
+        out = c2
+        unhandled = u
+      } else if k == 31 {
+        # RFC 5280, 4.2.1.13
+        # CRLDistributionPoints ::= SEQUENCE SIZE (1..MAX) OF DistributionPoint
+        # DistributionPoint ::= SEQUENCE {
+        #     distributionPoint       [0]     DistributionPointName OPTIONAL,
+        #     reasons                 [1]     ReasonFlags OPTIONAL,
+        #     cRLIssuer               [2]     GeneralNames OPTIONAL }
+        # DistributionPointName ::= CHOICE {
+        #     fullName                [0]     GeneralNames,
+        #     nameRelativeToCRLIssuer [1]     RelativeDistinguishedName }
+        v0 = cryptobyte.string(e.value)
+        _h38 = v0.read_asn1!(cbasn1.SEQUENCE)
+        val = ~need(_h38, "x509: invalid CRL distribution points")
+        while !val.empty? {
+          _h39 = val.read_asn1!(cbasn1.SEQUENCE)
+          dp_der = ~need(_h39, "x509: invalid CRL distribution point")
+          _h40 = dp_der.read_optional_asn1!(cbasn1.context_specific(cbasn1.constructed(0)))
+          dp = ~need(_h40, "x509: invalid CRL distribution point")
+          dp_name_der0, dp_name_present = dp
+          next if !dp_name_present
+          dp_name_der1 = dp_name_der0
+          _h41 = dp_name_der1.read_asn1!(cbasn1.context_specific(cbasn1.constructed(0)))
+          dp_name_der = ~need(_h41, "x509: invalid CRL distribution point")
+          while !dp_name_der.empty? {
+            break if !dp_name_der.peek_asn1_tag?(cbasn1.context_specific(6))
+            _h42 = dp_name_der.read_asn1!(cbasn1.context_specific(6))
+            uri = ~need(_h42, "x509: invalid CRL distribution point")
+            out.crl_distribution_points << Str.from_bytes(uri.bytes)
+          }
+        }
+      } else if k == 35 {
+        # RFC 5280, 4.2.1.1
+        out.authority_key_id = ~parse_authority_key_identifier(e)
+      } else if k == 36 {
+        v0 = cryptobyte.string(e.value)
+        _h43 = v0.read_asn1!(cbasn1.SEQUENCE)
+        val = ~need(_h43, "x509: invalid policy constraints extension")
+        if val.peek_asn1_tag?(cbasn1.context_specific(0)) {
+          _h44 = val.read_asn1_int64_with_tag!(cbasn1.context_specific(0))
+          v = ~need(_h44, "x509: invalid policy constraints extension")
+          out.require_explicit_policy = v
+          out.require_explicit_policy_zero = v == 0
+        }
+        if val.peek_asn1_tag?(cbasn1.context_specific(1)) {
+          _h45 = val.read_asn1_int64_with_tag!(cbasn1.context_specific(1))
+          v = ~need(_h45, "x509: invalid policy constraints extension")
+          out.inhibit_policy_mapping = v
+          out.inhibit_policy_mapping_zero = v == 0
+        }
+      } else if k == 37 {
+        ekus, unknown = ~parse_ext_key_usage_extension(e.value)
+        out.ext_key_usage = ekus
+        out.unknown_ext_key_usage = unknown
+      } else if k == 14 {
+        # RFC 5280, 4.2.1.2
+        fail err("x509: subject key identifier incorrectly marked critical") if e.critical
+        val = cryptobyte.string(e.value)
+        _h46 = val.read_asn1!(cbasn1.OCTET_STRING)
+        skid = ~need(_h46, "x509: invalid subject key identifier")
+        out.subject_key_id = skid.bytes
+      } else if k == 32 {
+        out.policies = ~parse_certificate_policies_extension(e.value)
+        out.policy_identifiers = []
+        for oid in out.policies {
+          if a = oid.to_asn1_oid {
+            out.policy_identifiers << a
+          }
+        }
+      } else if k == 33 {
+        v0 = cryptobyte.string(e.value)
+        _h47 = v0.read_asn1!(cbasn1.SEQUENCE)
+        val = ~need(_h47, "x509: invalid policy mappings extension")
+        while !val.empty? {
+          _h48 = val.read_asn1!(cbasn1.SEQUENCE)
+          s = ~need(_h48, "x509: invalid policy mappings extension")
+          _h49 = s.read_asn1!(cbasn1.OBJECT_IDENTIFIER)
+          issuer = ~need(_h49, "x509: invalid policy mappings extension")
+          _h50 = s.read_asn1!(cbasn1.OBJECT_IDENTIFIER)
+          subject = ~need(_h50, "x509: invalid policy mappings extension")
+          out.policy_mappings << PolicyMapping.new(issuer_domain_policy: OID.new(der: issuer.bytes), subject_domain_policy: OID.new(der: subject.bytes))
+        }
+      } else if k == 54 {
+        val = cryptobyte.string(e.value)
+        _h51 = val.read_asn1_int64!
+        v = ~need(_h51, "x509: invalid inhibit any policy extension")
+        out.inhibit_any_policy = v
+        out.inhibit_any_policy_zero = v == 0
+      } else {
+        # Unknown extensions are recorded if critical.
+        unhandled = true
+      }
+    } else if e.id.equal?(oid_extension_authority_info_access()) {
+      # RFC 5280 4.2.2.1: Authority Information Access
+      fail err("x509: authority info access incorrectly marked critical") if e.critical
+      v0 = cryptobyte.string(e.value)
+      _h52 = v0.read_asn1!(cbasn1.SEQUENCE)
+      val = ~need(_h52, "x509: invalid authority info access")
+      while !val.empty? {
+        _h53 = val.read_asn1!(cbasn1.SEQUENCE)
+        aia_der = ~need(_h53, "x509: invalid authority info access")
+        _h54 = aia_der.read_asn1_object_identifier!
+        method = ~need(_h54, "x509: invalid authority info access")
+        next if !aia_der.peek_asn1_tag?(cbasn1.context_specific(6))
+        _h55 = aia_der.read_asn1!(cbasn1.context_specific(6))
+        loc = ~need(_h55, "x509: invalid authority info access")
+        if method.equal?(oid_authority_info_access_ocsp()) {
+          out.ocsp_server << Str.from_bytes(loc.bytes)
+        } else if method.equal?(oid_authority_info_access_issuers()) {
+          out.issuing_certificate_url << Str.from_bytes(loc.bytes)
+        }
+      }
+    } else {
+      # Unknown extensions are recorded if critical.
+      unhandled = true
+    }
+    out.unhandled_critical_extensions << e.id if e.critical && unhandled
+  }
+  out
+}
+
+# Go's parseCertificate (the certificate at the start of der; trailing
+# bytes are allowed).
+def parse_certificate_at(der: [Byte]) -> ~Certificate<X509Error> {
+  cert = Certificate.new(max_path_len: 0)
+  in0 = cryptobyte.string(der)
+  _h56 = in0.read_asn1_element!(cbasn1.SEQUENCE)
+  input0 = ~need(_h56, "x509: malformed certificate")
+  cert.raw = input0.bytes
+  _h57 = input0.read_asn1!(cbasn1.SEQUENCE)
+  input = ~need(_h57, "x509: malformed certificate")
+  _h58 = input.read_asn1_element!(cbasn1.SEQUENCE)
+  tbs0 = ~need(_h58, "x509: malformed tbs certificate")
+  cert.raw_tbs_certificate = tbs0.bytes
+  _h59 = tbs0.read_asn1!(cbasn1.SEQUENCE)
+  tbs = ~need(_h59, "x509: malformed tbs certificate")
+  _h60 = tbs.read_optional_asn1_int64!(cbasn1.context_specific(cbasn1.constructed(0)), 0)
+  version = ~need(_h60, "x509: malformed version")
+  fail err("x509: malformed version") if version < 0
+  # for backwards compat reasons Version is one-indexed, rather than
+  # zero-indexed as defined in 5280
+  version += 1
+  fail err("x509: invalid version") if version > 3
+  cert.version = version
+  _h61 = tbs.read_asn1_big_int!
+  serial = ~need(_h61, "x509: malformed serial number")
+  # Go accepts negative serial numbers only with GODEBUG=x509negativeserial=1.
+  fail err("x509: negative serial number") if serial.sign == -1
+  cert.serial_number = serial
+  _h62 = tbs.read_asn1_element!(cbasn1.SEQUENCE)
+  sig_ai_seq0 = ~need(_h62, "x509: malformed signature algorithm identifier")
+  cert.raw_signature_algorithm = sig_ai_seq0.bytes
+  # Before parsing the inner algorithm identifier, extract the outer
+  # algorithm identifier and make sure that they match.
+  _h63 = sig_ai_seq0.read_asn1!(cbasn1.SEQUENCE)
+  sig_ai_seq = ~need(_h63, "x509: malformed signature algorithm identifier")
+  _h64 = input.read_asn1!(cbasn1.SEQUENCE)
+  outer_sig_ai_seq = ~need(_h64, "x509: malformed algorithm identifier")
+  fail err("x509: inner and outer signature algorithm identifiers don't match") if outer_sig_ai_seq.bytes != sig_ai_seq.bytes
+  sig_ai = ~parse_ai(sig_ai_seq)
+  cert.signature_algorithm = get_signature_algorithm_from_ai(sig_ai)
+  _h65 = tbs.read_asn1_element!(cbasn1.SEQUENCE)
+  issuer_seq = ~need(_h65, "x509: malformed issuer")
+  cert.raw_issuer = issuer_seq.bytes
+  issuer_rdns = ~parse_name(issuer_seq.bytes)
+  cert.issuer.fill_from_rdn_sequence!(issuer_rdns)
+  _h66 = tbs.read_asn1!(cbasn1.SEQUENCE)
+  validity = ~need(_h66, "x509: malformed validity")
+  nb, na = ~parse_validity(validity)
+  cert.not_before = nb
+  cert.not_after = na
+  _h67 = tbs.read_asn1_element!(cbasn1.SEQUENCE)
+  subject_seq = ~need(_h67, "x509: malformed issuer")
+  cert.raw_subject = subject_seq.bytes
+  subject_rdns = ~parse_name(subject_seq.bytes)
+  cert.subject.fill_from_rdn_sequence!(subject_rdns)
+  _h68 = tbs.read_asn1_element!(cbasn1.SEQUENCE)
+  spki0 = ~need(_h68, "x509: malformed spki")
+  cert.raw_subject_public_key_info = spki0.bytes
+  _h69 = spki0.read_asn1!(cbasn1.SEQUENCE)
+  spki = ~need(_h69, "x509: malformed spki")
+  _h70 = spki.read_asn1!(cbasn1.SEQUENCE)
+  pk_ai_seq = ~need(_h70, "x509: malformed public key algorithm identifier")
+  pk_ai = ~parse_ai(pk_ai_seq)
+  cert.public_key_algorithm = get_public_key_algorithm_from_oid(pk_ai.algorithm)
+  _h71 = spki.read_asn1_bit_string!
+  spk = ~need(_h71, "x509: malformed subjectPublicKey")
+  if cert.public_key_algorithm != PublicKeyAlgorithm.UnknownPublicKeyAlgorithm {
+    cert.public_key = ~parse_public_key(pk_ai, spk)
+  }
+  if cert.version > 1 {
+    _h1 = tbs.skip_optional_asn1!(cbasn1.context_specific(1))
+    ~check(_h1, "x509: malformed issuerUniqueID")
+    _h2 = tbs.skip_optional_asn1!(cbasn1.context_specific(2))
+    ~check(_h2, "x509: malformed subjectUniqueID")
+    if cert.version == 3 {
+      _h72 = tbs.read_optional_asn1!(cbasn1.context_specific(cbasn1.constructed(3)))
+      r = ~need(_h72, "x509: malformed extensions")
+      extensions0, present = r
+      if present {
+        seen_exts: Map[Str, Bool] = {}
+        ext_outer = extensions0
+        _h73 = ext_outer.read_asn1!(cbasn1.SEQUENCE)
+        extensions = ~need(_h73, "x509: malformed extensions")
+        while !extensions.empty? {
+          _h74 = extensions.read_asn1!(cbasn1.SEQUENCE)
+          extension = ~need(_h74, "x509: malformed extension")
+          ext = ~parse_extension(extension)
+          oid_str = ext.id.to_s
+          fail err("x509: certificate contains duplicate extension with OID #{strconv.quote(oid_str)}") if seen_exts.has_key?(oid_str)
+          seen_exts[oid_str] = true
+          cert.extensions << ext
+        }
+        cert = ~process_extensions(cert)
+      }
+    }
+  }
+  _h75 = input.read_asn1_bit_string!
+  signature = ~need(_h75, "x509: malformed signature")
+  cert.signature = signature.right_align
+  cert
+}
+
+# Parses a single certificate from the given ASN.1 DER data.
+pub def parse_certificate(der: [Byte]) -> ~Certificate<X509Error> {
+  cert = ~parse_certificate_at(der)
+  fail err("x509: trailing data") if der.size != cert.raw.size
+  cert
+}
+
+# Parses one or more certificates from the given ASN.1 DER data (simply
+# concatenated, with no intermediate padding).
+pub def parse_certificates(der0: [Byte]) -> ~[Certificate]<X509Error> {
+  certs: [Certificate] = []
+  der = der0
+  while der.size > 0 {
+    cert = ~parse_certificate_at(der)
+    certs << cert
+    der = der[cert.raw.size...der.size]
+  }
+  certs
+}
+
+X509V2_VERSION = 1
+
+# Parses an X509 v2 Certificate Revocation List from the given ASN.1 DER
+# data.
+pub def parse_revocation_list(der: [Byte]) -> ~RevocationList<X509Error> {
+  rl = RevocationList.new
+  in0 = cryptobyte.string(der)
+  # we read the SEQUENCE including length and tag bytes so that we can
+  # populate RevocationList.Raw, before unwrapping the SEQUENCE so it can be
+  # operated on
+  _h76 = in0.read_asn1_element!(cbasn1.SEQUENCE)
+  input0 = ~need(_h76, "x509: malformed crl")
+  rl.raw = input0.bytes
+  _h77 = input0.read_asn1!(cbasn1.SEQUENCE)
+  input = ~need(_h77, "x509: malformed crl")
+  _h78 = input.read_asn1_element!(cbasn1.SEQUENCE)
+  tbs0 = ~need(_h78, "x509: malformed tbs crl")
+  rl.raw_tbs_revocation_list = tbs0.bytes
+  _h79 = tbs0.read_asn1!(cbasn1.SEQUENCE)
+  tbs = ~need(_h79, "x509: malformed tbs crl")
+  ~check(tbs.peek_asn1_tag?(cbasn1.INTEGER), "x509: unsupported crl version")
+  _h80 = tbs.read_asn1_int64!
+  version = ~need(_h80, "x509: malformed crl")
+  fail err("x509: unsupported crl version: #{version}") if version != X509V2_VERSION
+  _h81 = tbs.read_asn1_element!(cbasn1.SEQUENCE)
+  sig_ai_seq0 = ~need(_h81, "x509: malformed signature algorithm identifier")
+  rl.raw_signature_algorithm = sig_ai_seq0.bytes
+  _h82 = sig_ai_seq0.read_asn1!(cbasn1.SEQUENCE)
+  sig_ai_seq = ~need(_h82, "x509: malformed signature algorithm identifier")
+  _h83 = input.read_asn1!(cbasn1.SEQUENCE)
+  outer_sig_ai_seq = ~need(_h83, "x509: malformed algorithm identifier")
+  fail err("x509: inner and outer signature algorithm identifiers don't match") if outer_sig_ai_seq.bytes != sig_ai_seq.bytes
+  sig_ai = ~parse_ai(sig_ai_seq)
+  rl.signature_algorithm = get_signature_algorithm_from_ai(sig_ai)
+  _h84 = input.read_asn1_bit_string!
+  signature = ~need(_h84, "x509: malformed signature")
+  rl.signature = signature.right_align
+  _h85 = tbs.read_asn1_element!(cbasn1.SEQUENCE)
+  issuer_seq = ~need(_h85, "x509: malformed issuer")
+  rl.raw_issuer = issuer_seq.bytes
+  issuer_rdns = ~parse_name(issuer_seq.bytes)
+  rl.issuer.fill_from_rdn_sequence!(issuer_rdns)
+  tu, rest = ~read_asn1_time(tbs)
+  rl.this_update = tu
+  tbs = rest
+  if tbs.peek_asn1_tag?(cbasn1.GENERALIZED_TIME) || tbs.peek_asn1_tag?(cbasn1.UTC_TIME) {
+    nu, rest2 = ~read_asn1_time(tbs)
+    rl.next_update = nu
+    tbs = rest2
+  }
+  if tbs.peek_asn1_tag?(cbasn1.SEQUENCE) {
+    _h86 = tbs.read_asn1!(cbasn1.SEQUENCE)
+    revoked_seq = ~need(_h86, "x509: malformed crl")
+    while !revoked_seq.empty? {
+      rce = RevocationListEntry.new
+      _h87 = revoked_seq.read_asn1_element!(cbasn1.SEQUENCE)
+      cert_seq0 = ~need(_h87, "x509: malformed crl")
+      rce.raw = cert_seq0.bytes
+      _h88 = cert_seq0.read_asn1!(cbasn1.SEQUENCE)
+      cert_seq = ~need(_h88, "x509: malformed crl")
+      _h89 = cert_seq.read_asn1_big_int!
+      rce.serial_number = ~need(_h89, "x509: malformed serial number")
+      rt, rest3 = ~read_asn1_time(cert_seq)
+      rce.revocation_time = rt
+      cert_seq = rest3
+      _h90 = cert_seq.read_optional_asn1!(cbasn1.SEQUENCE)
+      r = ~need(_h90, "x509: malformed extensions")
+      extensions0, present = r
+      if present {
+        extensions = extensions0
+        while !extensions.empty? {
+          _h91 = extensions.read_asn1!(cbasn1.SEQUENCE)
+          extension = ~need(_h91, "x509: malformed extension")
+          ext = ~parse_extension(extension)
+          if ext.id.equal?(oid_extension_reason_code()) {
+            val = cryptobyte.string(ext.value)
+            _h92 = val.read_asn1_enum!
+            rce.reason_code = ~need(_h92, "x509: malformed reasonCode extension")
+          }
+          rce.extensions << ext
+        }
+      }
+      rl.revoked_certificate_entries << rce
+      rl.revoked_certificates << pkix.RevokedCertificate.new(serial_number: rce.serial_number, revocation_time: rce.revocation_time, extensions: rce.extensions)
+    }
+  }
+  _h93 = tbs.read_optional_asn1!(cbasn1.context_specific(cbasn1.constructed(0)))
+  r = ~need(_h93, "x509: malformed extensions")
+  extensions0, present = r
+  if present {
+    ext_outer = extensions0
+    _h94 = ext_outer.read_asn1!(cbasn1.SEQUENCE)
+    extensions = ~need(_h94, "x509: malformed extensions")
+    while !extensions.empty? {
+      _h95 = extensions.read_asn1!(cbasn1.SEQUENCE)
+      extension = ~need(_h95, "x509: malformed extension")
+      ext = ~parse_extension(extension)
+      if ext.id.equal?(oid_extension_authority_key_id()) {
+        rl.authority_key_id = ~parse_authority_key_identifier(ext)
+      } else if ext.id.equal?(oid_extension_crl_number()) {
+        value = cryptobyte.string(ext.value)
+        _h96 = value.read_asn1_big_int!
+        rl.number = ~need(_h96, "x509: malformed crl number")
+      }
+      rl.extensions << ext
+    }
+  }
+  rl
+}
+
+# Go's domainNameValid: whether s is a valid domain name (or a name
+# constraint, which may start with a period).
+def domain_name_valid?(s0: Str, constraint: Bool) -> Bool {
+  # This function implements the domain name validation logic from RFC
+  # 5280 (and its references) and RFC 1034, with some loosening.
+  return true if s0.size == 0
+  # Do not allow trailing period (FQDN format is not allowed in SANs or
+  # constraints).
+  return false if s0[s0.size - 1] == 46
+  s = s0
+  # Constraints may start with a period.
+  s = s[1...s.size] if constraint && s[0] == 46
+  last_dot = -1
+  i = 0
+  while i <= s.size {
+    # Not printable ASCII
+    return false if i < s.size && (s[i] < 33 || s[i] > 126)
+    if i == s.size || s[i] == 46 {
+      label_len = i
+      label_len -= last_dot + 1 if last_dot >= 0
+      return false if label_len == 0
+      last_dot = i
+    }
+    i += 1
+  }
+  true
+}

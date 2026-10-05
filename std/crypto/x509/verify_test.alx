@@ -1,0 +1,912 @@
+# Go's verify_test.go, translated. The PEM constants are in
+# verify_data_test.alx (generated from verify_test.go).
+#
+# Not translated:
+# - TestSystemVerify: runs the table against the Windows platform verifier
+#   (Go skips it elsewhere); alx always verifies itself, which TestGoVerify
+#   covers.
+# - TestIssue51759: macOS's SecCertificateCreateWithData rejecting a
+#   certificate (platform verifier only).
+# - TestSystemRootsErrorUnwrap: errors.Is through SystemRootsError.Err;
+#   alx's X509Error.SystemRoots carries the message only.
+# Adapted:
+# - TestSystemRootsError sets Go's cached systemRoots to nil; alx has no
+#   cache, so the test points SSL_CERT_FILE at a directory (an unreadable
+#   bundle) and SSL_CERT_DIR at nothing instead.
+# - generatePEMCertWithRepeatSAN uses 2048-bit RSA keys (Go: 4096): the key
+#   size doesn't matter to the test and 4096-bit generation is slow.
+# - TestVerifyNilPubKey calls build_chains (Go's buildChains) directly, as
+#   Go does.
+
+import "crypto/dsa"
+import "crypto/ecdsa"
+import "crypto/elliptic"
+import "crypto/rand"
+import "crypto/rsa"
+import "crypto/x509/pkix"
+import "encoding/asn1"
+import "encoding/pem"
+import "math/big"
+import "os"
+import "slices"
+import "time"
+
+def vt_cert_from_pem(s: Str) -> ~Certificate {
+  block0, _rest = pem.decode(s.bytes)
+  if b = block0 {
+    return ~parse_certificate(b.bytes)
+  }
+  fail err("failed to decode PEM")
+}
+
+def vt_name_to_key(n: pkix.Name) -> Str { n.country.join(",") + "/" + n.organization.join(",") + "/" + n.organizational_unit.join(",") + "/" + n.common_name }
+
+def vt_chain_to_debug_string(chain: [Certificate]) -> Str { chain.map { vt_name_to_key(it.subject) }.to_a.join(" -> ") }
+
+def vt_generate_pem_cert_with_repeat_san(current_time: Int, count: Int, san: Str) -> Str {
+  cert = Certificate.new(not_before: time.unix(current_time, 0), not_after: time.unix(current_time, 0))
+  if ip = parse_ip(san) {
+    ips: [[Byte]] = []
+    for _i in 0...count {
+      ips << ip
+    }
+    cert.ip_addresses = ips
+  } else {
+    names: [Str] = []
+    for _j in 0...count {
+      names << san
+    }
+    cert.dns_names = names
+  }
+  priv = rsa.generate_key(rand.reader(), 2048).unwrap
+  der = create_certificate(rand.reader(), cert, cert, PublicKey.Rsa(priv.public_key), PrivateKey.Rsa(priv)).unwrap
+  Str.from_bytes(pem.encode_to_memory(pem.Block.new(type: "CERTIFICATE", bytes: der)) || [])
+}
+
+# One verifyTest. expect names Go's errorCallback ("" for none): hostname
+# (with msg), expired, usage, authority, hash, constraints, not_authorized,
+# critical.
+struct VtVerifyCase {
+  name: Str
+  leaf: Str
+  intermediates: [Str]
+  roots: [Str]
+  current_time: Int
+  dns_name: Str
+  key_usages: [ExtKeyUsage]
+  expect: Str
+  msg: Str
+  expected_chains: [[Str]]
+}
+
+def vt_verify_tests -> [VtVerifyCase] {
+  google_chain = [["www.google.com", "GTS CA 1C3", "GTS Root R1"]]
+  [
+    VtVerifyCase.new(name: "Valid", leaf: vt_google_leaf(), intermediates: [vt_gts_intermediate()], roots: [vt_gts_root()], current_time: 1677615892, dns_name: "www.google.com", expected_chains: google_chain),
+    VtVerifyCase.new(name: "Valid (fqdn)", leaf: vt_google_leaf(), intermediates: [vt_gts_intermediate()], roots: [vt_gts_root()], current_time: 1677615892, dns_name: "www.google.com.", expected_chains: google_chain),
+    VtVerifyCase.new(name: "MixedCase", leaf: vt_google_leaf(), intermediates: [vt_gts_intermediate()], roots: [vt_gts_root()], current_time: 1677615892, dns_name: "WwW.GooGLE.coM", expected_chains: google_chain),
+    VtVerifyCase.new(name: "HostnameMismatch", leaf: vt_google_leaf(), intermediates: [vt_gts_intermediate()], roots: [vt_gts_root()], current_time: 1677615892, dns_name: "www.example.com", expect: "hostname", msg: "certificate is valid for"),
+    VtVerifyCase.new(name: "TooManyDNS", leaf: vt_generate_pem_cert_with_repeat_san(1677615892, 200, "fake.dns"), roots: [vt_generate_pem_cert_with_repeat_san(1677615892, 200, "fake.dns")], current_time: 1677615892, dns_name: "www.example.com", expect: "hostname", msg: "certificate is valid for 200 names, but none matched"),
+    VtVerifyCase.new(name: "TooManyIPs", leaf: vt_generate_pem_cert_with_repeat_san(1677615892, 150, "4.3.2.1"), roots: [vt_generate_pem_cert_with_repeat_san(1677615892, 150, "4.3.2.1")], current_time: 1677615892, dns_name: "1.2.3.4", expect: "hostname", msg: "certificate is valid for 150 IP SANs, but none matched"),
+    VtVerifyCase.new(name: "IPMissing", leaf: vt_google_leaf(), intermediates: [vt_gts_intermediate()], roots: [vt_gts_root()], current_time: 1677615892, dns_name: "1.2.3.4", expect: "hostname", msg: "doesn't contain any IP SANs"),
+    VtVerifyCase.new(name: "Expired", leaf: vt_google_leaf(), intermediates: [vt_gts_intermediate()], roots: [vt_gts_root()], current_time: 1, dns_name: "www.example.com", expect: "expired"),
+    VtVerifyCase.new(name: "MissingIntermediate", leaf: vt_google_leaf(), roots: [vt_gts_root()], current_time: 1677615892, dns_name: "www.google.com", expect: "authority"),
+    VtVerifyCase.new(name: "RootInIntermediates", leaf: vt_google_leaf(), intermediates: [vt_gts_root(), vt_gts_intermediate()], roots: [vt_gts_root()], current_time: 1677615892, dns_name: "www.google.com", expected_chains: google_chain),
+    VtVerifyCase.new(name: "InvalidHash", leaf: vt_google_leaf_with_invalid_hash(), intermediates: [vt_gts_intermediate()], roots: [vt_gts_root()], current_time: 1677615892, dns_name: "www.google.com", expect: "hash"),
+    # EKULeaf tests use an unconstrained chain leading to a leaf certificate
+    # with an E-mail Protection EKU but not a Server Auth one, checking that
+    # the EKUs on the leaf are enforced.
+    VtVerifyCase.new(name: "EKULeaf", leaf: vt_smime_leaf(), intermediates: [vt_smime_intermediate()], roots: [vt_smime_root()], current_time: 1594673418, expect: "usage"),
+    VtVerifyCase.new(name: "EKULeafExplicit", leaf: vt_smime_leaf(), intermediates: [vt_smime_intermediate()], roots: [vt_smime_root()], current_time: 1594673418, key_usages: [ExtKeyUsage.ServerAuth], expect: "usage"),
+    VtVerifyCase.new(name: "EKULeafValid", leaf: vt_smime_leaf(), intermediates: [vt_smime_intermediate()], roots: [vt_smime_root()], current_time: 1594673418, key_usages: [ExtKeyUsage.EmailProtection], expected_chains: [["CORPORATIVO FICTICIO ACTIVO", "EAEko Herri Administrazioen CA - CA AAPP Vascas (2)", "IZENPE S.A."]]),
+    # Check that a name constrained intermediate works even when it lists
+    # multiple constraints.
+    VtVerifyCase.new(name: "MultipleConstraints", leaf: vt_name_constraints_leaf(), intermediates: [vt_name_constraints_intermediate1(), vt_name_constraints_intermediate2()], roots: [vt_global_sign_root()], current_time: 1524771953, dns_name: "udctest.ads.vt.edu", expected_chains: [["udctest.ads.vt.edu", "Virginia Tech Global Qualified Server CA", "Trusted Root CA SHA256 G2", "GlobalSign"]]),
+    # Check that SHA-384 intermediates (which are popping up) work.
+    VtVerifyCase.new(name: "SHA-384", leaf: vt_trust_asia_leaf(), intermediates: [vt_trust_asia_sha384_intermediate()], roots: [vt_digicert_root()], current_time: 1558051200, dns_name: "tm.cn", expected_chains: [["tm.cn", "TrustAsia ECC OV TLS Pro CA", "DigiCert Global Root CA"]]),
+    # Putting a certificate as a root directly should work as a way of
+    # saying “exactly this”.
+    VtVerifyCase.new(name: "LeafInRoots", leaf: vt_self_signed(), roots: [vt_self_signed()], current_time: 1471624472, dns_name: "foo.example", expected_chains: [["Acme Co"]]),
+    # Putting a certificate as a root directly should not skip other checks
+    # however.
+    VtVerifyCase.new(name: "LeafInRootsInvalid", leaf: vt_self_signed(), roots: [vt_self_signed()], current_time: 1471624472, dns_name: "notfoo.example", expect: "hostname", msg: "certificate is valid for"),
+    # An X.509 v1 certificate should not be accepted as an intermediate.
+    VtVerifyCase.new(name: "X509v1Intermediate", leaf: vt_x509v1_test_leaf(), intermediates: [vt_x509v1_test_intermediate()], roots: [vt_x509v1_test_root()], current_time: 1481753183, expect: "not_authorized"),
+    VtVerifyCase.new(name: "IgnoreCNWithSANs", leaf: vt_ignore_cn_with_san_leaf(), dns_name: "foo.example.com", roots: [vt_ignore_cn_with_san_root()], current_time: 1486684488, expect: "hostname", msg: "certificate is not valid for any names"),
+    # Test that excluded names are respected.
+    VtVerifyCase.new(name: "ExcludedNames", leaf: vt_excluded_names_leaf(), dns_name: "bender.local", intermediates: [vt_excluded_names_intermediate()], roots: [vt_excluded_names_root()], current_time: 1486684488, expect: "constraints"),
+    # Test that unknown critical extensions in a leaf cause a verify error.
+    VtVerifyCase.new(name: "CriticalExtLeaf", leaf: vt_critical_ext_leaf_with_ext(), intermediates: [vt_critical_ext_intermediate()], roots: [vt_critical_ext_root()], current_time: 1486684488, expect: "critical"),
+    # Test that unknown critical extensions in an intermediate cause a verify
+    # error.
+    VtVerifyCase.new(name: "CriticalExtIntermediate", leaf: vt_critical_ext_leaf(), intermediates: [vt_critical_ext_intermediate_with_ext()], roots: [vt_critical_ext_root()], current_time: 1486684488, expect: "critical"),
+    VtVerifyCase.new(name: "ValidCN", leaf: vt_valid_cn_without_san(), dns_name: "foo.example.com", roots: [vt_invalid_cn_root()], current_time: 1540000000, expect: "hostname", msg: "certificate relies on legacy Common Name field"),
+    # A certificate with an AKID should still chain to a parent without
+    # SKID. See Issue 30079.
+    VtVerifyCase.new(name: "AKIDNoSKID", leaf: vt_leaf_with_akid(), roots: [vt_root_without_skid()], current_time: 1550000000, dns_name: "example", expected_chains: [["Acme LLC", "Acme Co"]]),
+    # When there are two parents, one with an incorrect subject but matching
+    # SKID and one with a correct subject but missing SKID, the latter should
+    # be considered as a possible parent.
+    VtVerifyCase.new(name: "(AKID matching, issuer matching)", leaf: vt_leaf_matching_akid_matching_issuer(), roots: [vt_root_matching_skid_mismatching_subject(), vt_root_mismatching_skid_matching_subject()], current_time: 1550000000, dns_name: "example", expected_chains: [["Leaf", "Root B"]]),
+  ]
+}
+
+def vt_chain_matches?(expected: [Str], chain: [Certificate]) -> Bool {
+  return false if chain.size != expected.size
+  k = 0
+  while k < chain.size {
+    return false if !vt_name_to_key(chain[k].subject).include?(expected[k])
+    k += 1
+  }
+  true
+}
+
+def vt_error_matches?(e: Error, expect: Str, msg: Str) -> Bool {
+  return e.message.include?("algorithm unimplemented") if expect == "hash"
+  case e {
+    X509Error.Hostname(_, m) => expect == "hostname" && m.include?(msg)
+    X509Error.CertificateInvalid(reason, _, _) => (expect == "expired" && reason == INVALID_REASON_EXPIRED) || (expect == "usage" && reason == INVALID_REASON_INCOMPATIBLE_USAGE) || (expect == "constraints" && reason == INVALID_REASON_CA_NOT_AUTHORIZED_FOR_THIS_NAME) || (expect == "not_authorized" && reason == INVALID_REASON_NOT_AUTHORIZED_TO_SIGN)
+    X509Error.UnknownAuthority(_) => expect == "authority"
+    X509Error.UnhandledCriticalExtension => expect == "critical"
+    _ => false
+  }
+}
+
+# Go's testVerify (without system roots): "" if the case behaves as
+# expected, else what went wrong.
+def vt_run_verify(tc: VtVerifyCase) -> Str {
+  roots = new_cert_pool()
+  for root in tc.roots {
+    return "#{tc.name}: failed to parse root" if !roots.append_certs_from_pem!(root.bytes)
+  }
+  inters = new_cert_pool()
+  for inter in tc.intermediates {
+    return "#{tc.name}: failed to parse intermediate" if !inters.append_certs_from_pem!(inter.bytes)
+  }
+  lr = vt_cert_from_pem(tc.leaf)
+  if e = lr.err {
+    return "#{tc.name}: failed to parse leaf: #{e.message}"
+  }
+  leaf = lr.unwrap
+  opts = VerifyOptions.new(intermediates: inters, roots: roots, dns_name: tc.dns_name, current_time: time.unix(tc.current_time, 0), key_usages: tc.key_usages)
+  r = leaf.verify(opts)
+  if e = r.err {
+    return "#{tc.name}: unexpected error: #{e.message}" if tc.expect == ""
+    return "" if vt_error_matches?(e, tc.expect, tc.msg)
+    return "#{tc.name}: want a #{tc.expect} error, got: #{e.message}"
+  }
+  return "#{tc.name}: want a #{tc.expect} error, got none" if tc.expect != ""
+  chains = r.unwrap
+  # Every expected chain should match one (or more) returned chain.
+  for expected in tc.expected_chains {
+    found = false
+    for chain in chains {
+      found = true if vt_chain_matches?(expected, chain)
+    }
+    return "#{tc.name}: no match found for #{expected}" if !found
+  }
+  # Every returned chain should match 1 expected chain.
+  for chain in chains {
+    n = 0
+    for expected in tc.expected_chains {
+      n += 1 if vt_chain_matches?(expected, chain)
+    }
+    return "#{tc.name}: got #{n} matches for chain #{vt_chain_to_debug_string(chain)}" if n != 1
+  }
+  ""
+}
+
+test "GoVerify" {
+  for tc in vt_verify_tests() {
+    assert_eq vt_run_verify(tc), ""
+  }
+}
+
+test "UnknownAuthorityError" {
+  tests = [("self-signed, cn", vt_self_signed_with_common_name(), "x509: certificate signed by unknown authority (possibly because of \"empty\" while trying to verify candidate authority certificate \"test\")"), ("self-signed, no cn, org", vt_self_signed_no_common_name_with_org_name(), "x509: certificate signed by unknown authority (possibly because of \"empty\" while trying to verify candidate authority certificate \"ca\")"), ("self-signed, no cn, no org", vt_self_signed_no_common_name_no_org_name(), "x509: certificate signed by unknown authority (possibly because of \"empty\" while trying to verify candidate authority certificate \"serial:0\")")]
+  for tt in tests {
+    c = ~vt_cert_from_pem(tt[1])
+    uae = unknown_authority_error((err("empty"), c))
+    assert_eq uae.message, tt[2]
+  }
+}
+
+test "ValidHostname" {
+  # host, validInput, validPattern
+  tests = [("example.com", true, true), ("eXample123-.com", true, true), ("-eXample123-.com", false, false), ("", false, false), (".", false, false), ("example..com", false, false), (".example.com", false, false), ("example.com.", true, false), ("*.example.com.", false, false), ("*.example.com", false, true), ("*foo.example.com", false, false), ("foo.*.example.com", false, false), ("exa_mple.com", true, true), ("foo,bar", false, false), ("project-dev:us-central1:main", false, false)]
+  for tt in tests {
+    assert valid_hostname?(tt[0], true) == tt[2], "validHostnamePattern(#{tt[0]})"
+    assert valid_hostname?(tt[0], false) == tt[1], "validHostnameInput(#{tt[0]})"
+  }
+}
+
+# Go's generateCert: a certificate for cn signed by issuer (self-signed
+# when none), with a new P-256 key unless priv is given.
+def vt_generate_cert(cn: Str, is_ca: Bool, issuer: Certificate?, issuer_key: PrivateKey, priv0: PrivateKey) -> ~(Certificate, PrivateKey) {
+  priv = priv0
+  if priv.none? {
+    k = ~ecdsa.generate_key(elliptic.p256(), rand.reader())
+    priv = PrivateKey.Ecdsa(k)
+  }
+  now = time.now()
+  template = Certificate.new(subject: pkix.Name.new(common_name: cn), not_before: now.add(time.hour * -1), not_after: now.add(time.hour * 24), dns_names: [rand.text()], key_usage: KEY_USAGE_KEY_ENCIPHERMENT | KEY_USAGE_DIGITAL_SIGNATURE | KEY_USAGE_CERT_SIGN, ext_key_usage: [ExtKeyUsage.ServerAuth], basic_constraints_valid: true, is_ca: is_ca)
+  parent = template
+  signer = issuer_key
+  if i = issuer {
+    parent = i
+  } else {
+    signer = priv
+  }
+  der = ~create_certificate(rand.reader(), template, parent, priv.public, signer)
+  cert = ~parse_certificate(der)
+  (cert, priv)
+}
+
+test "PathologicalChains" {
+  # Test four pathological cases, where the intermediates in the chain have
+  # the same/different subjects and the same/different keys. In all cases
+  # there is no root in the pool, so a valid chain cannot actually be
+  # built; verification must give up (Go: errSignatureLimit) rather than
+  # take forever.
+  for test_case in [(false, false), (true, false), (false, true), (true, true)] {
+    same_subject, same_key = test_case
+    intermediates = new_cert_pool()
+    intermediate_key = PrivateKey.None
+    if same_key {
+      k = ~ecdsa.generate_key(elliptic.p256(), rand.reader())
+      intermediate_key = PrivateKey.Ecdsa(k)
+    }
+    leaf_signer = PrivateKey.None
+    intermediate: Certificate? = none
+    for i in 0...100 {
+      cn = "Intermediate CA"
+      cn = cn + " ##{i}" if !same_subject
+      ic, signer = ~vt_generate_cert(cn, true, intermediate, leaf_signer, intermediate_key)
+      intermediate = ic
+      leaf_signer = signer
+      intermediates.add_cert!(ic)
+    }
+    leaf, _key = ~vt_generate_cert("Leaf", false, intermediate, leaf_signer, PrivateKey.None)
+    r = leaf.verify(VerifyOptions.new(roots: new_cert_pool(), intermediates: intermediates))
+    assert_eq "sameSubject=#{same_subject},sameKey=#{same_key}: #{r.err?.message || "no error"}", "sameSubject=#{same_subject},sameKey=#{same_key}: x509: signature check attempts limit reached while verifying certificate chain"
+  }
+}
+
+test "SystemRootsError" {
+  # Go sets its cached system roots to nil; alx reads them per call, so
+  # make loading them fail instead (a bundle that can't be read, no
+  # directories).
+  old_file = os.getenv("SSL_CERT_FILE")
+  old_dir = os.getenv("SSL_CERT_DIR")
+  ~os.setenv("SSL_CERT_FILE", "testdata")
+  ~os.setenv("SSL_CERT_DIR", "testdata/does-not-exist")
+  inters = new_cert_pool()
+  assert inters.append_certs_from_pem!(vt_gts_intermediate().bytes), "failed to parse intermediate"
+  leaf = ~vt_cert_from_pem(vt_google_leaf())
+  r = leaf.verify(VerifyOptions.new(intermediates: inters, dns_name: "www.google.com", current_time: time.unix(1677615892, 0)))
+  if f = old_file {
+    ~os.setenv("SSL_CERT_FILE", f)
+  } else {
+    ~os.unsetenv("SSL_CERT_FILE")
+  }
+  if d = old_dir {
+    ~os.setenv("SSL_CERT_DIR", d)
+  } else {
+    ~os.unsetenv("SSL_CERT_DIR")
+  }
+  is_system_roots = false
+  if e = r.err {
+    is_system_roots = case e {
+      X509Error.SystemRoots(_) => true
+      _ => false
+    }
+  }
+  assert is_system_roots, "error was not SystemRootsError"
+}
+
+# ---------------------------------------------------------------- path building
+
+struct VtEdge {
+  issuer: Str
+  subject: Str
+  cert_type: Int
+  mutate: ((Certificate) -> Certificate)?
+  constraint: (([Certificate]) -> ~Unit)?
+}
+
+struct VtRootDesc {
+  subject: Str
+  mutate: ((Certificate) -> Certificate)?
+  constraint: (([Certificate]) -> ~Unit)?
+}
+
+struct VtGraph {
+  roots: [VtRootDesc]
+  leaf: Str
+  graph: [VtEdge]
+}
+
+# Go's genCertEdge.
+def vt_gen_cert_edge(subject: Str, key: PrivateKey, mutate: ((Certificate) -> Certificate)?, cert_type: Int, issuer: Certificate, signer: PrivateKey) -> ~Certificate {
+  now = time.now()
+  tmpl = Certificate.new(subject: pkix.Name.new(common_name: subject), not_before: now.add(time.hour * -1), not_after: now.add(time.hour))
+  if cert_type == ROOT_CERTIFICATE || cert_type == INTERMEDIATE_CERTIFICATE {
+    tmpl.is_ca = true
+    tmpl.basic_constraints_valid = true
+    tmpl.key_usage = KEY_USAGE_CERT_SIGN
+  } else if cert_type == LEAF_CERTIFICATE {
+    tmpl.dns_names = ["localhost"]
+  }
+  if m = mutate {
+    tmpl = m.call(tmpl)
+  }
+  parent = issuer
+  sgn = signer
+  if cert_type == ROOT_CERTIFICATE {
+    parent = tmpl
+    sgn = key
+  }
+  d = ~create_certificate(rand.reader(), tmpl, parent, key.public, sgn)
+  ~parse_certificate(d)
+}
+
+# Go's buildTrustGraph: (roots, intermediates, leaf).
+def vt_build_trust_graph(d: VtGraph) -> ~(CertPool, CertPool, Certificate) {
+  certs: Map[Str, Certificate] = {}
+  keys: Map[Str, PrivateKey] = {}
+  root_pool = new_cert_pool()
+  for r in d.roots {
+    k = PrivateKey.Ecdsa(~ecdsa.generate_key(elliptic.p256(), rand.reader()))
+    root = ~vt_gen_cert_edge(r.subject, k, r.mutate, ROOT_CERTIFICATE, Certificate.new, PrivateKey.None)
+    if c = r.constraint {
+      root_pool.add_cert_with_constraint!(root, c)
+    } else {
+      root_pool.add_cert!(root)
+    }
+    certs[r.subject] = root
+    keys[r.subject] = k
+  }
+  intermediate_pool = new_cert_pool()
+  leaf: Certificate? = none
+  for e in d.graph {
+    issuer_cert = certs[e.issuer]
+    issuer_key = keys[e.issuer]
+    if issuer_cert.none? || issuer_key.none? {
+      fail err("unknown issuer #{e.issuer}")
+    }
+    k = keys[e.subject] || PrivateKey.None
+    if k.none? {
+      k = PrivateKey.Ecdsa(~ecdsa.generate_key(elliptic.p256(), rand.reader()))
+      keys[e.subject] = k
+    }
+    ic = issuer_cert || Certificate.new
+    ik = issuer_key || PrivateKey.None
+    cert = ~vt_gen_cert_edge(e.subject, k, e.mutate, e.cert_type, ic, ik)
+    certs[e.subject] = cert
+    if e.subject == d.leaf {
+      leaf = cert
+    } else if c = e.constraint {
+      intermediate_pool.add_cert_with_constraint!(cert, c)
+    } else {
+      intermediate_pool.add_cert!(cert)
+    }
+  }
+  (root_pool, intermediate_pool, leaf || Certificate.new)
+}
+
+def vt_chains_to_strings(chains: [[Certificate]]) -> [Str] {
+  chain_strings: [Str] = []
+  for chain in chains {
+    names: [Str] = []
+    for c in chain {
+      names << c.subject.to_s
+    }
+    chain_strings << names.join(" -> ")
+  }
+  slices.sort(chain_strings)
+  chain_strings
+}
+
+def vt_edge(issuer: Str, subject: Str, cert_type: Int) -> VtEdge { VtEdge.new(issuer: issuer, subject: subject, cert_type: cert_type) }
+
+def vt_edge_m(issuer: Str, subject: Str, cert_type: Int, mutate: (Certificate) -> Certificate) -> VtEdge { VtEdge.new(issuer: issuer, subject: subject, cert_type: cert_type, mutate: mutate) }
+
+def vt_simple_roots -> [VtRootDesc] { [VtRootDesc.new(subject: "root")] }
+
+def vt_set_dns_names(names: [Str]) -> (Certificate) -> Certificate {
+  ->(c: Certificate) -> Certificate {
+    t = c
+    t.dns_names = names
+    t
+  }
+}
+
+def vt_path_building_tests -> [(Str, VtGraph, [Str], Str)] {
+  code_signing = ->(c: Certificate) -> Certificate {
+    t = c
+    t.ext_key_usage = [ExtKeyUsage.CodeSigning]
+    t
+  }
+  server_auth = ->(c: Certificate) -> Certificate {
+    t = c
+    t.ext_key_usage = [ExtKeyUsage.ServerAuth]
+    t
+  }
+  bad_san = ->(c: Certificate) -> Certificate {
+    t = c
+    t.permitted_dns_domains = ["good"]
+    t.dns_names = ["bad"]
+    t
+  }
+  permit_example = ->(c: Certificate) -> Certificate {
+    t = c
+    t.permitted_dns_domains = ["example.com"]
+    t
+  }
+  beep_permit_example = ->(c: Certificate) -> Certificate {
+    t = c
+    t.dns_names = ["beep.com"]
+    t.permitted_dns_domains = ["example.com"]
+    t
+  }
+  reject_inter_a = ->(chain: [Certificate]) -> ~Unit {
+    for c in chain {
+      fail err("bad") if c.subject.common_name == "inter a"
+    }
+  }
+  reject_leaf = ->(chain: [Certificate]) -> ~Unit {
+    for c in chain {
+      fail err("bad") if c.subject.common_name == "leaf"
+    }
+  }
+  [
+    # Build the following graph from RFC 4158, figure 7 (note that in this
+    # graph edges represent certificates where the parent is the issuer and
+    # the child is the subject.) For the certificate C->B, use an
+    # unsupported ExtKeyUsage (in this case ExtKeyUsageCodeSigning) which
+    # invalidates the path Trust Anchor -> C -> B -> EE. The remaining valid
+    # paths should be:
+    #   * Trust Anchor -> A -> B -> EE
+    #   * Trust Anchor -> C -> A -> B -> EE
+    #
+    #     +---------+
+    #     |  Trust  |
+    #     | Anchor  |
+    #     +---------+
+    #      |       |
+    #      v       v
+    #   +---+    +---+
+    #   | A |<-->| C |
+    #   +---+    +---+
+    #    |         |
+    #    |  +---+  |
+    #    +->| B |<-+
+    #       +---+
+    #         |
+    #         v
+    #       +----+
+    #       | EE |
+    #       +----+
+    ("bad EKU", VtGraph.new(roots: vt_simple_roots(), leaf: "leaf", graph: [vt_edge("root", "inter a", INTERMEDIATE_CERTIFICATE), vt_edge("root", "inter c", INTERMEDIATE_CERTIFICATE), vt_edge("inter c", "inter a", INTERMEDIATE_CERTIFICATE), vt_edge("inter a", "inter c", INTERMEDIATE_CERTIFICATE), vt_edge_m("inter c", "inter b", INTERMEDIATE_CERTIFICATE, code_signing), vt_edge("inter a", "inter b", INTERMEDIATE_CERTIFICATE), vt_edge("inter b", "leaf", LEAF_CERTIFICATE)]), ["CN=leaf -> CN=inter b -> CN=inter a -> CN=inter c -> CN=root", "CN=leaf -> CN=inter b -> CN=inter a -> CN=root"], ""),
+    # The same graph; for the certificate C->B, use an unconstrained SAN
+    # which invalidates the path Trust Anchor -> C -> B -> EE (Go names
+    # this case "bad EKU" too).
+    ("bad EKU (SAN)", VtGraph.new(roots: vt_simple_roots(), leaf: "leaf", graph: [vt_edge("root", "inter a", INTERMEDIATE_CERTIFICATE), vt_edge("root", "inter c", INTERMEDIATE_CERTIFICATE), vt_edge("inter c", "inter a", INTERMEDIATE_CERTIFICATE), vt_edge("inter a", "inter c", INTERMEDIATE_CERTIFICATE), vt_edge_m("inter c", "inter b", INTERMEDIATE_CERTIFICATE, bad_san), vt_edge("inter a", "inter b", INTERMEDIATE_CERTIFICATE), vt_edge("inter b", "leaf", LEAF_CERTIFICATE)]), ["CN=leaf -> CN=inter b -> CN=inter a -> CN=inter c -> CN=root", "CN=leaf -> CN=inter b -> CN=inter a -> CN=root"], ""),
+    ("all paths", VtGraph.new(roots: vt_simple_roots(), leaf: "leaf", graph: [vt_edge("root", "inter a", INTERMEDIATE_CERTIFICATE), vt_edge("inter a", "inter b", INTERMEDIATE_CERTIFICATE), vt_edge("inter a", "inter c", INTERMEDIATE_CERTIFICATE), vt_edge("inter b", "inter c", INTERMEDIATE_CERTIFICATE), vt_edge("inter c", "leaf", LEAF_CERTIFICATE)]), ["CN=leaf -> CN=inter c -> CN=inter a -> CN=root", "CN=leaf -> CN=inter c -> CN=inter b -> CN=inter a -> CN=root"], ""),
+    ("ignore cross-sig loops", VtGraph.new(roots: vt_simple_roots(), leaf: "leaf", graph: [vt_edge("root", "inter a", INTERMEDIATE_CERTIFICATE), vt_edge("root", "inter c", INTERMEDIATE_CERTIFICATE), vt_edge("inter c", "inter a", INTERMEDIATE_CERTIFICATE), vt_edge("inter a", "inter c", INTERMEDIATE_CERTIFICATE), vt_edge("inter c", "inter b", INTERMEDIATE_CERTIFICATE), vt_edge("inter a", "inter b", INTERMEDIATE_CERTIFICATE), vt_edge("inter b", "leaf", LEAF_CERTIFICATE)]), ["CN=leaf -> CN=inter b -> CN=inter a -> CN=inter c -> CN=root", "CN=leaf -> CN=inter b -> CN=inter a -> CN=root", "CN=leaf -> CN=inter b -> CN=inter c -> CN=inter a -> CN=root", "CN=leaf -> CN=inter b -> CN=inter c -> CN=root"], ""),
+    ("leaf with same subject, key, as parent but with SAN", VtGraph.new(roots: vt_simple_roots(), leaf: "root", graph: [vt_edge_m("root", "root", LEAF_CERTIFICATE, vt_set_dns_names(["localhost"]))]), ["CN=root -> CN=root"], ""),
+    ("ignore invalid EKU path", VtGraph.new(roots: vt_simple_roots(), leaf: "leaf", graph: [vt_edge("root", "inter a", INTERMEDIATE_CERTIFICATE), vt_edge("root", "inter c", INTERMEDIATE_CERTIFICATE), vt_edge_m("inter c", "inter b", INTERMEDIATE_CERTIFICATE, code_signing), vt_edge_m("inter a", "inter b", INTERMEDIATE_CERTIFICATE, server_auth), vt_edge_m("inter b", "leaf", LEAF_CERTIFICATE, server_auth)]), ["CN=leaf -> CN=inter b -> CN=inter a -> CN=root"], ""),
+    ("constrained root, invalid intermediate", VtGraph.new(roots: [VtRootDesc.new(subject: "root", mutate: permit_example)], leaf: "leaf", graph: [vt_edge_m("root", "inter", INTERMEDIATE_CERTIFICATE, vt_set_dns_names(["beep.com"])), vt_edge_m("inter", "leaf", LEAF_CERTIFICATE, vt_set_dns_names(["www.example.com"]))]), [], "x509: a root or intermediate certificate is not authorized to sign for this name: DNS name \"beep.com\" is not permitted by any constraint"),
+    ("constrained intermediate, non-matching SAN", VtGraph.new(roots: vt_simple_roots(), leaf: "leaf", graph: [vt_edge_m("root", "inter", INTERMEDIATE_CERTIFICATE, beep_permit_example), vt_edge_m("inter", "leaf", LEAF_CERTIFICATE, vt_set_dns_names(["www.example.com"]))]), ["CN=leaf -> CN=inter -> CN=root"], ""),
+    ("code constrained root, two paths, one valid", VtGraph.new(roots: [VtRootDesc.new(subject: "root", constraint: reject_inter_a)], leaf: "leaf", graph: [vt_edge("root", "inter a", INTERMEDIATE_CERTIFICATE), vt_edge("root", "inter b", INTERMEDIATE_CERTIFICATE), vt_edge("inter a", "inter c", INTERMEDIATE_CERTIFICATE), vt_edge("inter b", "inter c", INTERMEDIATE_CERTIFICATE), vt_edge("inter c", "leaf", LEAF_CERTIFICATE)]), ["CN=leaf -> CN=inter c -> CN=inter b -> CN=root"], ""),
+    ("code constrained root, one invalid path", VtGraph.new(roots: [VtRootDesc.new(subject: "root", constraint: reject_leaf)], leaf: "leaf", graph: [vt_edge("root", "inter", INTERMEDIATE_CERTIFICATE), vt_edge("inter", "leaf", LEAF_CERTIFICATE)]), [], "x509: certificate signed by unknown authority (possibly because of \"bad\" while trying to verify candidate authority certificate \"root\")"),
+  ]
+}
+
+test "PathBuilding" {
+  for tc in vt_path_building_tests() {
+    name, graph, expected_chains, expected_err = tc
+    roots, intermediates, leaf = ~vt_build_trust_graph(graph)
+    r = leaf.verify(VerifyOptions.new(roots: roots, intermediates: intermediates))
+    if e = r.err {
+      assert_eq "#{name}: #{e.message}", "#{name}: #{expected_err}"
+    } else {
+      assert expected_err == "", "#{name}: no error, want #{expected_err}"
+      assert_eq vt_chains_to_strings(r.unwrap), expected_chains
+    }
+  }
+}
+
+# ---------------------------------------------------------------- EKUs
+
+struct VtEkuDesc {
+  ekus: [ExtKeyUsage]
+  unknown: [asn1.ObjectIdentifier]
+}
+
+def vt_eku_mutate(d: VtEkuDesc) -> (Certificate) -> Certificate {
+  ->(c: Certificate) -> Certificate {
+    t = c
+    t.ext_key_usage = d.ekus
+    t.unknown_ext_key_usage = d.unknown
+    t
+  }
+}
+
+def vt_eku(ekus: [ExtKeyUsage]) -> VtEkuDesc { VtEkuDesc.new(ekus: ekus) }
+
+test "EKUEnforcement" {
+  server = ExtKeyUsage.ServerAuth
+  client = ExtKeyUsage.ClientAuth
+  incompatible = "x509: certificate specifies an incompatible key usage"
+  # name, root, inters, leaf, verifyEKUs, err
+  tests = [
+    ("valid, full chain", vt_eku([server]), [vt_eku([server])], vt_eku([server]), [server], ""),
+    ("valid, only leaf has EKU", vt_eku([]), [vt_eku([])], vt_eku([server]), [server], ""),
+    ("invalid, serverAuth not nested", vt_eku([client]), [vt_eku([server, client])], vt_eku([server, client]), [server], incompatible),
+    ("valid, two EKUs, one path", vt_eku([server]), [vt_eku([server, client])], vt_eku([server, client]), [server, client], ""),
+    ("invalid, ladder", vt_eku([server]), [vt_eku([server, client]), vt_eku([client]), vt_eku([server, client]), vt_eku([server])], vt_eku([server]), [server, client], incompatible),
+    ("valid, intermediate has no EKU", vt_eku([server]), [vt_eku([])], vt_eku([server]), [server], ""),
+    ("invalid, intermediate has no EKU and no nested path", vt_eku([client]), [vt_eku([])], vt_eku([server]), [server, client], incompatible),
+    ("invalid, intermediate has unknown EKU", vt_eku([server]), [VtEkuDesc.new(unknown: [asn1.oid([1, 2, 3])])], vt_eku([server]), [server], incompatible),
+  ]
+  k = PrivateKey.Ecdsa(~ecdsa.generate_key(elliptic.p256(), rand.reader()))
+  for tc in tests {
+    name, root_ekus, inters, leaf_ekus, verify_ekus, want = tc
+    root_pool = new_cert_pool()
+    root = ~vt_gen_cert_edge("root", k, vt_eku_mutate(root_ekus), ROOT_CERTIFICATE, Certificate.new, k)
+    root_pool.add_cert!(root)
+    parent = root
+    inter_pool = new_cert_pool()
+    i = 0
+    for inter_ekus in inters {
+      inter = ~vt_gen_cert_edge("inter #{i}", k, vt_eku_mutate(inter_ekus), INTERMEDIATE_CERTIFICATE, parent, k)
+      inter_pool.add_cert!(inter)
+      parent = inter
+      i += 1
+    }
+    leaf = ~vt_gen_cert_edge("leaf", k, vt_eku_mutate(leaf_ekus), INTERMEDIATE_CERTIFICATE, parent, k)
+    r = leaf.verify(VerifyOptions.new(roots: root_pool, intermediates: inter_pool, key_usages: verify_ekus))
+    got = ""
+    if e = r.err {
+      got = e.message
+    }
+    assert_eq "#{name}: #{got}", "#{name}: #{want}"
+  }
+}
+
+test "VerifyEKURootAsLeaf" {
+  k = PrivateKey.Ecdsa(~ecdsa.generate_key(elliptic.p256(), rand.reader()))
+  server = ExtKeyUsage.ServerAuth
+  # rootEKUs, verifyEKUs, succeed
+  tests = [([], [server], true), ([server], [], true), ([server], [server], true), ([server], [ExtKeyUsage.Any], true), ([ExtKeyUsage.Any], [server], true), ([ExtKeyUsage.ClientAuth], [server], false)]
+  for tc in tests {
+    root_ekus, verify_ekus, succeed = tc
+    now = time.now()
+    tmpl = Certificate.new(serial_number: big.new_int(1), subject: pkix.Name.new(common_name: "root"), not_before: now.add(time.hour * -1), not_after: now.add(time.hour), dns_names: ["localhost"], ext_key_usage: root_ekus)
+    root_der = ~create_certificate(rand.reader(), tmpl, tmpl, k.public, k)
+    root = ~parse_certificate(root_der)
+    roots = new_cert_pool()
+    roots.add_cert!(root)
+    r = root.verify(VerifyOptions.new(roots: roots, key_usages: verify_ekus))
+    assert r.ok? == succeed, "root EKUs #{root_ekus.size}, verify EKUs #{verify_ekus.size}: #{r.err?.message || "success"}"
+  }
+}
+
+test "VerifyNilPubKey" {
+  c = Certificate.new(raw_issuer: [1.as_u8, 2, 3], authority_key_id: [1.as_u8, 2, 3])
+  roots = new_cert_pool()
+  r = Certificate.new(raw_subject: [1.as_u8, 2, 3], subject_key_id: [1.as_u8, 2, 3])
+  roots.add_cert!(r)
+  res = build_chains(c, [r], 0, VerifyOptions.new(roots: roots))
+  is_unknown = false
+  if e = res.err {
+    is_unknown = case e {
+      X509Error.UnknownAuthority(_) => true
+      _ => false
+    }
+  }
+  assert is_unknown, "buildChains returned unexpected error"
+}
+
+test "VerifyBareWildcard" {
+  k = PrivateKey.Ecdsa(~ecdsa.generate_key(elliptic.p256(), rand.reader()))
+  now = time.now()
+  tmpl = Certificate.new(serial_number: big.new_int(1), subject: pkix.Name.new(common_name: "test"), not_before: now.add(time.hour * -1), not_after: now.add(time.hour), dns_names: ["*"])
+  c_der = ~create_certificate(rand.reader(), tmpl, tmpl, k.public, k)
+  c = ~parse_certificate(c_der)
+  assert !c.verify_hostname("label").ok?, "VerifyHostname unexpected success with bare wildcard SAN"
+}
+
+# ---------------------------------------------------------------- policies
+
+def vt_load_test_cert(path: Str) -> ~Certificate {
+  b = ~os.read_file(path)
+  p0, _rest = pem.decode(b)
+  if p = p0 {
+    return ~parse_certificate(p.bytes)
+  }
+  fail err("no PEM block in #{path}")
+}
+
+def vt_test_oid(n: Int) -> OID {
+  arcs: [U64] = [1, 2, 840, 113554, 4, 1, 72585, 2, 0]
+  arcs[8] = n.as_u64
+  oid_from_ints(arcs).unwrap
+}
+
+struct VtPolicyCase {
+  chain: [Certificate]
+  policies: [OID]
+  require_explicit_policy: Bool
+  inhibit_policy_mapping: Bool
+  inhibit_any_policy: Bool
+  valid: Bool
+}
+
+def vt_pc(chain: [Certificate], policies: [OID], require_explicit_policy: Bool, valid: Bool) -> VtPolicyCase { VtPolicyCase.new(chain: chain, policies: policies, require_explicit_policy: require_explicit_policy, valid: valid) }
+
+test "PoliciesValid" {
+  # These test cases, the comments, and the certificates they rely on, are
+  # stolen from BoringSSL. The tests which involve certificate parsing as
+  # part of the verification process are in TestParsePolicies.
+  oid1 = vt_test_oid(1)
+  oid2 = vt_test_oid(2)
+  oid3 = vt_test_oid(3)
+  oid4 = vt_test_oid(4)
+  oid5 = vt_test_oid(5)
+  root = ~vt_load_test_cert("testdata/policy_root.pem")
+  root_cross_inhibit_mapping = ~vt_load_test_cert("testdata/policy_root_cross_inhibit_mapping.pem")
+  root2 = ~vt_load_test_cert("testdata/policy_root2.pem")
+  intermediate = ~vt_load_test_cert("testdata/policy_intermediate.pem")
+  intermediate_any = ~vt_load_test_cert("testdata/policy_intermediate_any.pem")
+  intermediate_mapped = ~vt_load_test_cert("testdata/policy_intermediate_mapped.pem")
+  intermediate_mapped_any = ~vt_load_test_cert("testdata/policy_intermediate_mapped_any.pem")
+  intermediate_mapped_oid3 = ~vt_load_test_cert("testdata/policy_intermediate_mapped_oid3.pem")
+  intermediate_require = ~vt_load_test_cert("testdata/policy_intermediate_require.pem")
+  intermediate_require1 = ~vt_load_test_cert("testdata/policy_intermediate_require1.pem")
+  intermediate_require2 = ~vt_load_test_cert("testdata/policy_intermediate_require2.pem")
+  intermediate_require_no_policies = ~vt_load_test_cert("testdata/policy_intermediate_require_no_policies.pem")
+  leaf = ~vt_load_test_cert("testdata/policy_leaf.pem")
+  leaf_any = ~vt_load_test_cert("testdata/policy_leaf_any.pem")
+  leaf_none = ~vt_load_test_cert("testdata/policy_leaf_none.pem")
+  leaf_oid1 = ~vt_load_test_cert("testdata/policy_leaf_oid1.pem")
+  leaf_oid2 = ~vt_load_test_cert("testdata/policy_leaf_oid2.pem")
+  leaf_oid3 = ~vt_load_test_cert("testdata/policy_leaf_oid3.pem")
+  leaf_oid4 = ~vt_load_test_cert("testdata/policy_leaf_oid4.pem")
+  leaf_oid5 = ~vt_load_test_cert("testdata/policy_leaf_oid5.pem")
+  leaf_require = ~vt_load_test_cert("testdata/policy_leaf_require.pem")
+  leaf_require1 = ~vt_load_test_cert("testdata/policy_leaf_require1.pem")
+  tests = [
+    # The chain is good for |oid1| and |oid2|, but not |oid3|.
+    vt_pc([leaf, intermediate, root], [], true, true),
+    vt_pc([leaf, intermediate, root], [oid1], true, true),
+    vt_pc([leaf, intermediate, root], [oid2], true, true),
+    vt_pc([leaf, intermediate, root], [oid3], true, false),
+    vt_pc([leaf, intermediate, root], [oid1, oid2], true, true),
+    vt_pc([leaf, intermediate, root], [oid1, oid3], true, true),
+    # Without |X509_V_FLAG_EXPLICIT_POLICY|, the policy tree is built and
+    # intersected with user-specified policies, but it is not required to
+    # result in any valid policies.
+    vt_pc([leaf, intermediate, root], [oid1], false, true),
+    vt_pc([leaf, intermediate, root], [oid3], false, true),
+    # However, a CA with policy constraints can require an explicit policy.
+    vt_pc([leaf, intermediate_require, root], [oid1], false, true),
+    vt_pc([leaf, intermediate_require, root], [oid3], false, false),
+    # requireExplicitPolicy applies even if the application does not
+    # configure a user-initial-policy-set. If the validation results in no
+    # policies, the chain is invalid.
+    vt_pc([leaf_none, intermediate_require, root], [], true, false),
+    # A leaf can also set requireExplicitPolicy.
+    vt_pc([leaf_require, intermediate, root], [], false, true),
+    vt_pc([leaf_require, intermediate, root], [oid1], false, true),
+    vt_pc([leaf_require, intermediate, root], [oid3], false, false),
+    # requireExplicitPolicy is a count of certificates to skip. If the value
+    # is not zero by the end of the chain, it doesn't count.
+    vt_pc([leaf, intermediate_require1, root], [oid3], false, false),
+    vt_pc([leaf, intermediate_require2, root], [oid3], false, true),
+    vt_pc([leaf_require1, intermediate, root], [oid3], false, true),
+    # If multiple certificates specify the constraint, the more constrained
+    # value wins.
+    vt_pc([leaf_require1, intermediate_require1, root], [oid3], false, false),
+    vt_pc([leaf_require, intermediate_require2, root], [oid3], false, false),
+    # An intermediate that requires an explicit policy, but then specifies
+    # no policies should fail verification as a result.
+    vt_pc([leaf, intermediate_require_no_policies, root], [oid1], false, false),
+    # The leaf asserts anyPolicy, but the intermediate does not. The
+    # resulting valid policies are the intersection.
+    vt_pc([leaf_any, intermediate, root], [oid1], true, true),
+    vt_pc([leaf_any, intermediate, root], [oid3], true, false),
+    # The intermediate asserts anyPolicy, but the leaf does not. The
+    # resulting valid policies are the intersection.
+    vt_pc([leaf, intermediate_any, root], [oid1], true, true),
+    vt_pc([leaf, intermediate_any, root], [oid3], true, false),
+    # Both assert anyPolicy. All policies are valid.
+    vt_pc([leaf_any, intermediate_any, root], [oid1], true, true),
+    vt_pc([leaf_any, intermediate_any, root], [oid3], true, true),
+    # With just a trust anchor, policy checking silently succeeds.
+    vt_pc([root], [oid1], true, true),
+    # Although |intermediate_mapped_oid3| contains many mappings, it only
+    # accepts OID3. Nodes should not be created for the other mappings.
+    vt_pc([leaf_oid1, intermediate_mapped_oid3, root], [oid3], true, true),
+    vt_pc([leaf_oid4, intermediate_mapped_oid3, root], [oid4], true, false),
+    # Policy mapping can be inhibited, either by the caller or a certificate
+    # in the chain, in which case mapped policies are unassertable (apart
+    # from some anyPolicy edge cases).
+    VtPolicyCase.new(chain: [leaf_oid1, intermediate_mapped_oid3, root], policies: [oid3], require_explicit_policy: true, inhibit_policy_mapping: true, valid: false),
+    vt_pc([leaf_oid1, intermediate_mapped_oid3, root_cross_inhibit_mapping, root2], [oid3], true, false),
+  ]
+  for use_any in [false, true] {
+    inter = use_any ? intermediate_mapped_any : intermediate_mapped
+    # OID3 is mapped to {OID1, OID2}, which means OID1 and OID2 (or both)
+    # are acceptable for OID3.
+    tests << vt_pc([leaf, inter, root], [oid3], true, true)
+    tests << vt_pc([leaf_oid1, inter, root], [oid3], true, true)
+    tests << vt_pc([leaf_oid2, inter, root], [oid3], true, true)
+    # If the intermediate's policies were anyPolicy, OID3 at the leaf,
+    # despite being mapped, is still acceptable as OID3 at the root.
+    # Despite the OID3 having expected_policy_set = {OID1, OID2}, it can
+    # match the anyPolicy node instead.
+    #
+    # If the intermediate's policies listed OIDs explicitly, OID3 at the
+    # leaf is not acceptable as OID3 at the root. OID3 has
+    # expected_polciy_set = {OID1, OID2} and no other node allows OID3.
+    tests << vt_pc([leaf_oid3, inter, root], [oid3], true, use_any)
+    # If the intermediate's policies were anyPolicy, OID1 at the leaf is no
+    # longer acceptable as OID1 at the root because policies only match
+    # anyPolicy when they match no other policy.
+    #
+    # If the intermediate's policies listed OIDs explicitly, OID1 at the
+    # leaf is acceptable as OID1 at the root because it will match both
+    # OID1 and OID3 (mapped) policies.
+    tests << vt_pc([leaf_oid1, inter, root], [oid1], true, !use_any)
+    # All pairs of OID4 and OID5 are mapped together, so either can stand
+    # for the other.
+    tests << vt_pc([leaf_oid4, inter, root], [oid4], true, true)
+    tests << vt_pc([leaf_oid4, inter, root], [oid5], true, true)
+    tests << vt_pc([leaf_oid5, inter, root], [oid4], true, true)
+    tests << vt_pc([leaf_oid5, inter, root], [oid5], true, true)
+    tests << vt_pc([leaf_oid4, inter, root], [oid4, oid5], true, true)
+  }
+  i = 0
+  for tc in tests {
+    valid = policies_valid?(tc.chain, VerifyOptions.new(certificate_policies: tc.policies, require_explicit_policy: tc.require_explicit_policy, inhibit_policy_mapping: tc.inhibit_policy_mapping, inhibit_any_policy: tc.inhibit_any_policy))
+    assert valid == tc.valid, "case #{i}: policiesValid: got #{valid}, want #{tc.valid}"
+    i += 1
+  }
+}
+
+test "InvalidPolicyWithAnyKeyUsage" {
+  oid3 = vt_test_oid(3)
+  root = ~vt_load_test_cert("testdata/policy_root.pem")
+  intermediate = ~vt_load_test_cert("testdata/policy_intermediate_require.pem")
+  leaf = ~vt_load_test_cert("testdata/policy_leaf.pem")
+  roots = new_cert_pool()
+  intermediates = new_cert_pool()
+  roots.add_cert!(root)
+  intermediates.add_cert!(intermediate)
+  r = leaf.verify(VerifyOptions.new(roots: roots, intermediates: intermediates, key_usages: [ExtKeyUsage.Any], certificate_policies: [oid3]))
+  assert !r.ok?, "unexpected success, invalid policy shouldn't be bypassed by passing VerifyOptions.KeyUsages with ExtKeyUsageAny"
+  assert_eq r.err?.message || "", "x509: no valid chains built: 1 candidate chains with invalid policies"
+}
+
+# ---------------------------------------------------------------- DSA intermediate
+
+#[derive(Asn1)]
+struct VtDsaParams {
+  p: big.Int
+  q: big.Int
+  g: big.Int
+}
+
+# Go's dsaSelfSignedCNX: a DER certificate with Subject=Issuer=CN=X, a DSA
+# SPKI, matching inner/outer signature OIDs and a dummy signature.
+def vt_dsa_self_signed_cnx -> ~[Byte] {
+  params = ~dsa.generate_parameters(rand.reader(), dsa.L1024N160)
+  dsa_priv = ~dsa.generate_key(dsa.PrivateKey.new(public_key: dsa.PublicKey.new(parameters: params)), rand.reader())
+  dsa_pub = dsa_priv.public_key
+  dp = VtDsaParams.new(p: dsa_pub.parameters.p, q: dsa_pub.parameters.q, g: dsa_pub.parameters.g)
+  param_der = dp.~to_asn1
+  y_der = asn1.~marshal_big(dsa_pub.y)
+  spki = PublicKeyInfo.new(algorithm: pkix.AlgorithmIdentifier.new(algorithm: oid_public_key_dsa(), parameters: asn1.RawValue.new(full_bytes: param_der)), public_key: asn1.BitString.new(bytes: y_der, bit_length: 8 * y_der.size))
+  rdn = pkix.Name.new(common_name: "X").to_rdn_sequence
+  b = rdn.~to_asn1
+  raw_name = asn1.RawValue.new(full_bytes: b)
+  algo_ident = pkix.AlgorithmIdentifier.new(algorithm: asn1.oid([2, 16, 840, 1, 101, 3, 4, 3, 2]))
+  now = time.now()
+  tbs = TbsCertificate.new(version: 0, serial_number: big.new_int(1002), signature_algorithm: algo_ident, issuer: raw_name, validity: Validity.new(not_before: now.add(time.hour * -1).utc, not_after: now.add(time.hour * 24).utc), subject: raw_name, public_key: spki)
+  c = CertificateDer.new(tbs_certificate: tbs, signature_algorithm: algo_ident, signature_value: asn1.BitString.new(bytes: [0.as_u8], bit_length: 8))
+  c.~to_asn1
+}
+
+test "CertificateChainSignedByECDSA" {
+  ca_key = ~ecdsa.generate_key(elliptic.p256(), rand.reader())
+  now = time.now()
+  root_tmpl = Certificate.new(serial_number: big.new_int(1), subject: pkix.Name.new(common_name: "X"), not_before: now.add(time.hour * -1), not_after: now.add(time.hour * 24 * 365), is_ca: true, key_usage: KEY_USAGE_CERT_SIGN | KEY_USAGE_CRL_SIGN, basic_constraints_valid: true)
+  ca_der = ~create_certificate(rand.reader(), root_tmpl, root_tmpl, PublicKey.Ecdsa(ca_key.public_key), PrivateKey.Ecdsa(ca_key))
+  root = ~parse_certificate(ca_der)
+  leaf_key = ~ecdsa.generate_key(elliptic.p256(), rand.reader())
+  leaf_tmpl = Certificate.new(serial_number: big.new_int(42), subject: pkix.Name.new(common_name: "leaf"), not_before: now.add(time.minute * -10), not_after: now.add(time.hour * 24), key_usage: KEY_USAGE_DIGITAL_SIGNATURE, ext_key_usage: [ExtKeyUsage.ServerAuth], basic_constraints_valid: true)
+  leaf_der = ~create_certificate(rand.reader(), leaf_tmpl, root, PublicKey.Ecdsa(leaf_key.public_key), PrivateKey.Ecdsa(ca_key))
+  leaf = ~parse_certificate(leaf_der)
+  dsa_der = ~vt_dsa_self_signed_cnx()
+  inter = ~parse_certificate(dsa_der)
+  inters = new_cert_pool()
+  inters.add_cert!(root)
+  inters.add_cert!(inter)
+  r = leaf.verify(VerifyOptions.new(intermediates: inters, roots: new_cert_pool()))
+  msg = r.err?.message || ""
+  assert msg.include?("certificate signed by unknown authority"), "got #{msg}"
+}
+
+test "VerifyHostnameIPAddresses" {
+  cert = Certificate.new(ip_addresses: [parse_ip("192.0.2.1") || [], parse_ip("fe80::1") || []])
+  tests = [("IPv4", "192.0.2.1", true), ("IPv4 bracketed", "[192.0.2.1]", true), ("IPv4 mismatch", "192.0.2.2", false), ("IPv6", "fe80::1", true), ("IPv6 bracketed", "[fe80::1]", true), ("IPv6 with zone", "fe80::1%eth0", true), ("IPv6 with zone bracketed", "[fe80::1%eth0]", true), ("IPv6 mismatch", "fe80::2", false), ("IPv6 with zone mismatch", "fe80::2%eth0", false)]
+  for tc in tests {
+    name, host, match = tc
+    r = cert.verify_hostname(host)
+    assert r.ok? == match, "#{name}: VerifyHostname(#{host}) = #{r.err?.message || "nil"}"
+  }
+}
+
+# ---------------------------------------------------------------- vector helpers
+
+# For vec_verify_test.alx: leaf.verify with the given pools, time (UTC),
+# DNS name and key usages, as "error: <message>" or "chains: <subjects
+# joined by ' -> '>" (chains joined by " | ").
+def vt_vec_verify(leaf_pem: Str, inters: [Str], roots: [Str], t: Int, dns_name: Str, key_usages: [ExtKeyUsage]) -> Str {
+  inter_pool = new_cert_pool()
+  for p in inters {
+    inter_pool.append_certs_from_pem!(p.bytes)
+  }
+  root_pool = new_cert_pool()
+  for p in roots {
+    root_pool.append_certs_from_pem!(p.bytes)
+  }
+  leaf = vt_cert_from_pem(leaf_pem).unwrap
+  r = leaf.verify(VerifyOptions.new(intermediates: inter_pool, roots: root_pool, current_time: time.unix(t, 0).utc, dns_name: dns_name, key_usages: key_usages))
+  if e = r.err {
+    return "error: " + e.message
+  }
+  chains: [Str] = []
+  for chain in r.unwrap {
+    chains << chain.map { it.subject.to_s }.to_a.join(" -> ")
+  }
+  "chains: " + chains.join(" | ")
+}
+
+# For vec_verify_test.alx: testdata/policy_<leaf>.pem verified through
+# policy_<inter>.pem to policy_root.pem at time t, accepting any key usage,
+# with the test policy OIDs ending in the given arcs.
+def vt_vec_policy(leaf_name: Str, inter_name: Str, t: Int, policies: [Int]) -> Str {
+  leaf = vt_load_test_cert("testdata/policy_#{leaf_name}.pem").unwrap
+  inter_pool = new_cert_pool()
+  inter_pool.add_cert!(vt_load_test_cert("testdata/policy_#{inter_name}.pem").unwrap)
+  root_pool = new_cert_pool()
+  root_pool.add_cert!(vt_load_test_cert("testdata/policy_root.pem").unwrap)
+  oids: [OID] = []
+  for p in policies {
+    oids << vt_test_oid(p)
+  }
+  r = leaf.verify(VerifyOptions.new(intermediates: inter_pool, roots: root_pool, current_time: time.unix(t, 0).utc, certificate_policies: oids, key_usages: [ExtKeyUsage.Any]))
+  if e = r.err {
+    return "error: " + e.message
+  }
+  chains: [Str] = []
+  for chain in r.unwrap {
+    chains << chain.map { it.subject.to_s }.to_a.join(" -> ")
+  }
+  "chains: " + chains.join(" | ")
+}
+
+# For vec_verify_test.alx: verify_hostname on a certificate with the given
+# SANs ("ok" or the error message).
+def vt_vec_hostname(dns_names: [Str], ips: [Str], host: Str) -> Str {
+  ip_addresses: [[Byte]] = []
+  for ip in ips {
+    ip_addresses << (parse_ip(ip) || [])
+  }
+  c = Certificate.new(dns_names: dns_names, ip_addresses: ip_addresses)
+  r = c.verify_hostname(host)
+  r.err?.message || "ok"
+}

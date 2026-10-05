@@ -49,6 +49,8 @@ pub struct Parser<'a> {
     extern_mode: bool,
     /// `#[derive(...)]` names read before the declaration being parsed.
     cur_derives: Vec<String>,
+    /// Type-level `#[asn1(...)]` options read before the declaration.
+    cur_asn1: crate::derive_asn1::A1,
     /// Derives to expand once the whole module is read (see derive.rs).
     jobs: Vec<crate::derive::DeriveJob>,
     /// `#[data("pkg.Name")]` read before the declaration being parsed.
@@ -69,7 +71,7 @@ type PResult<T> = Result<T, Diag>;
 const CMD_PKG: &str = "alxexec";
 
 pub fn parse(file: u32, toks: &[Token], next_id: &mut NodeId) -> PResult<Module> {
-    let mut p = Parser { toks, pos: 0, next_id, scopes: vec![HashSet::new()], in_cond: false, usings: vec![], extern_mode: false, cur_derives: vec![], jobs: vec![], cur_data_name: None, djobs: vec![], xjobs: vec![], cur_transparent: false, gjobs: vec![] };
+    let mut p = Parser { toks, pos: 0, next_id, scopes: vec![HashSet::new()], in_cond: false, usings: vec![], extern_mode: false, cur_derives: vec![], cur_asn1: Default::default(), jobs: vec![], cur_data_name: None, djobs: vec![], xjobs: vec![], cur_transparent: false, gjobs: vec![] };
     let mut m = p.module(file)?;
     // Command literals call into os/exec (also from inside `#{...}`).
     let has_cmd = toks.iter().any(|t| match &t.tok {
@@ -88,7 +90,7 @@ pub fn parse(file: u32, toks: &[Token], next_id: &mut NodeId) -> PResult<Module>
 /// text (`format`'s composite values: check.rs `fmt_text`). `locals` are the
 /// names in scope.
 pub fn parse_expr(toks: &[Token], next_id: &mut NodeId, locals: &[String]) -> PResult<Expr> {
-    let mut p = Parser { toks, pos: 0, next_id, scopes: vec![locals.iter().cloned().collect()], in_cond: false, usings: vec![], extern_mode: false, cur_derives: vec![], jobs: vec![], cur_data_name: None, djobs: vec![], xjobs: vec![], cur_transparent: false, gjobs: vec![] };
+    let mut p = Parser { toks, pos: 0, next_id, scopes: vec![locals.iter().cloned().collect()], in_cond: false, usings: vec![], extern_mode: false, cur_derives: vec![], cur_asn1: Default::default(), jobs: vec![], cur_data_name: None, djobs: vec![], xjobs: vec![], cur_transparent: false, gjobs: vec![] };
     let e = p.expr()?;
     p.skip_newlines();
     if !matches!(p.peek(), Tok::Eof) {
@@ -168,7 +170,7 @@ impl<'a> Parser<'a> {
     /// The expression in an embedded piece of source (`#{...}`).
     fn code_expr(&mut self, src: &str, base: u32, sp: Span, what: &str) -> PResult<Expr> {
         let toks = crate::lexer::lex_at(sp.file, src, base)?;
-        let mut sub = Parser { toks: &toks, pos: 0, next_id: self.next_id, scopes: self.scopes.clone(), in_cond: false, usings: vec![], extern_mode: false, cur_derives: vec![], jobs: vec![], cur_data_name: None, djobs: vec![], xjobs: vec![], cur_transparent: false, gjobs: vec![] };
+        let mut sub = Parser { toks: &toks, pos: 0, next_id: self.next_id, scopes: self.scopes.clone(), in_cond: false, usings: vec![], extern_mode: false, cur_derives: vec![], cur_asn1: Default::default(), jobs: vec![], cur_data_name: None, djobs: vec![], xjobs: vec![], cur_transparent: false, gjobs: vec![] };
         sub.skip_newlines();
         let e = sub.expr()?;
         sub.skip_newlines();
@@ -456,6 +458,11 @@ impl<'a> Parser<'a> {
     fn type_attrs(&mut self) -> PResult<()> {
         while let Tok::Attr(a) = self.peek().clone() {
             let sp = self.bump().span;
+            if a.trim_start().starts_with("asn1") {
+                crate::derive_asn1::apply_asn1_attr(&a, sp, &mut self.cur_asn1)?;
+                self.skip_newlines();
+                continue;
+            }
             if crate::derive::is_transparent_attr(&a, sp)? {
                 self.cur_transparent = true;
                 self.skip_newlines();
@@ -508,6 +515,16 @@ impl<'a> Parser<'a> {
         let quick = alias_of(m, "testing/quick", "alxquick", "Arbitrary");
         let rand = alias_of(m, "math/rand", "alxrand", "Arbitrary");
         let sql_alias = alias_of(m, "database/sql", "alxsql", "Row");
+        let asn1_alias = alias_of(m, "encoding/asn1", "alxasn1", "Asn1");
+        let imports: std::collections::HashMap<String, String> = m.imports.iter().map(|i| (import_name(i), i.path.clone())).collect();
+        let mut asn1_types = crate::derive::ModuleTypes { local: Default::default(), enums: Default::default() };
+        for s in &m.structs {
+            asn1_types.local.insert(s.name.clone(), jobs.iter().any(|j| j.name == s.name && j.derive == "Asn1"));
+        }
+        for e in &m.enums {
+            asn1_types.local.insert(e.name.clone(), jobs.iter().any(|j| j.name == e.name && j.derive == "Asn1"));
+            asn1_types.enums.insert(e.name.clone());
+        }
         let mut types = crate::derive::ModuleTypes { local: Default::default(), enums: Default::default() };
         for s in &m.structs {
             types.local.insert(s.name.clone(), jobs.iter().any(|j| j.name == s.name && j.derive == "Json"));
@@ -539,7 +556,7 @@ impl<'a> Parser<'a> {
             }
         }
         for job in &jobs {
-            let text = if job.derive == "Row" { crate::derive::row_source(job, &sql_alias)? } else if job.derive == "Arbitrary" { crate::derive::arbitrary_source(job, &quick, &rand)? } else { crate::derive::json_source(job, &alias, &types, wants_v2, &v2_only)? };
+            let text = if job.derive == "Asn1" { crate::derive_asn1::asn1_source(job, &asn1_alias, &imports, &asn1_types)? } else if job.derive == "Row" { crate::derive::row_source(job, &sql_alias)? } else if job.derive == "Arbitrary" { crate::derive::arbitrary_source(job, &quick, &rand)? } else { crate::derive::json_source(job, &alias, &types, wants_v2, &v2_only)? };
             // One struct body: v1's methods, then v2's (both texts are `struct Name { ... }`).
             let text = match v2_texts.get(&job.name).filter(|_| job.derive == "Json") {
                 Some(v2) => {
@@ -555,7 +572,7 @@ impl<'a> Parser<'a> {
             for t in &mut toks {
                 t.span = job.span;
             }
-            let mut sub = Parser { toks: &toks, pos: 0, next_id: self.next_id, scopes: vec![HashSet::new()], in_cond: false, usings: vec![], extern_mode: false, cur_derives: vec![], jobs: vec![], cur_data_name: None, djobs: vec![], xjobs: vec![], cur_transparent: false, gjobs: vec![] };
+            let mut sub = Parser { toks: &toks, pos: 0, next_id: self.next_id, scopes: vec![HashSet::new()], in_cond: false, usings: vec![], extern_mode: false, cur_derives: vec![], cur_asn1: Default::default(), jobs: vec![], cur_data_name: None, djobs: vec![], xjobs: vec![], cur_transparent: false, gjobs: vec![] };
             sub.skip_newlines();
             let mut defs = vec![];
             sub.struct_def(&mut defs).map_err(|d| Diag::new(job.span, format!("derive({}) on `{}` made code that doesn't parse: {}\n{text}", job.derive, job.name, d.msg)))?;
@@ -592,7 +609,7 @@ impl<'a> Parser<'a> {
             for t in &mut toks {
                 t.span = job.span;
             }
-            let mut sub = Parser { toks: &toks, pos: 0, next_id: self.next_id, scopes: vec![HashSet::new()], in_cond: false, usings: vec![], extern_mode: false, cur_derives: vec![], jobs: vec![], cur_data_name: None, djobs: vec![], xjobs: vec![], cur_transparent: false, gjobs: vec![] };
+            let mut sub = Parser { toks: &toks, pos: 0, next_id: self.next_id, scopes: vec![HashSet::new()], in_cond: false, usings: vec![], extern_mode: false, cur_derives: vec![], cur_asn1: Default::default(), jobs: vec![], cur_data_name: None, djobs: vec![], xjobs: vec![], cur_transparent: false, gjobs: vec![] };
             sub.skip_newlines();
             let mut defs = vec![];
             sub.struct_def(&mut defs).map_err(|d| Diag::new(job.span, format!("derive(Xml) on `{}` made code that doesn't parse: {}\n{text}", job.name, d.msg)))?;
@@ -634,7 +651,7 @@ impl<'a> Parser<'a> {
             for t in &mut toks {
                 t.span = job.span;
             }
-            let mut sub = Parser { toks: &toks, pos: 0, next_id: self.next_id, scopes: vec![HashSet::new()], in_cond: false, usings: vec![], extern_mode: false, cur_derives: vec![], jobs: vec![], cur_data_name: None, djobs: vec![], cur_transparent: false, gjobs: vec![], xjobs: vec![] };
+            let mut sub = Parser { toks: &toks, pos: 0, next_id: self.next_id, scopes: vec![HashSet::new()], in_cond: false, usings: vec![], extern_mode: false, cur_derives: vec![], cur_asn1: Default::default(), jobs: vec![], cur_data_name: None, djobs: vec![], cur_transparent: false, gjobs: vec![], xjobs: vec![] };
             sub.skip_newlines();
             let mut defs = vec![];
             sub.struct_def(&mut defs).map_err(|d| Diag::new(job.span, format!("derive(Gob) on `{}` made code that doesn't parse: {}\n{text}", job.name, d.msg)))?;
@@ -700,7 +717,7 @@ impl<'a> Parser<'a> {
             for t in &mut toks {
                 t.span = job.span;
             }
-            let mut sub = Parser { toks: &toks, pos: 0, next_id: self.next_id, scopes: vec![HashSet::new()], in_cond: false, usings: vec![], extern_mode: false, cur_derives: vec![], jobs: vec![], cur_data_name: None, djobs: vec![], xjobs: vec![], cur_transparent: false, gjobs: vec![] };
+            let mut sub = Parser { toks: &toks, pos: 0, next_id: self.next_id, scopes: vec![HashSet::new()], in_cond: false, usings: vec![], extern_mode: false, cur_derives: vec![], cur_asn1: Default::default(), jobs: vec![], cur_data_name: None, djobs: vec![], xjobs: vec![], cur_transparent: false, gjobs: vec![] };
             sub.skip_newlines();
             let mut defs = vec![];
             sub.struct_def(&mut defs).map_err(|d| Diag::new(job.span, format!("derive(Data) on `{}` made code that doesn't parse: {}\n{text}", job.name, d.msg)))?;
@@ -1078,16 +1095,17 @@ impl<'a> Parser<'a> {
         }
         let span = start.to(self.prev_span());
         if derives.iter().any(|d| d == "Gob") {
-            let job = crate::derive::DeriveJob { derive: "Gob".into(), go_name: data_name.clone(), transparent, name: name.clone(), tparams: tparams.iter().map(|t| t.name.clone()).collect(), public: false, span, shape: crate::derive::DShape::Enum(dvariants.clone()) };
+            let job = crate::derive::DeriveJob { type_opts: Default::default(), derive: "Gob".into(), go_name: data_name.clone(), transparent, name: name.clone(), tparams: tparams.iter().map(|t| t.name.clone()).collect(), public: false, span, shape: crate::derive::DShape::Enum(dvariants.clone()) };
             self.gjobs.push(crate::derive_gob::GobJob { job, go_name: data_name.clone() });
         }
         if derives.iter().any(|d| d == "Data") {
-            let job = crate::derive::DeriveJob { derive: "Data".into(), go_name: data_name.clone(), transparent, name: name.clone(), tparams: tparams.iter().map(|t| t.name.clone()).collect(), public: false, span, shape: crate::derive::DShape::Enum(dvariants.clone()) };
+            let job = crate::derive::DeriveJob { type_opts: Default::default(), derive: "Data".into(), go_name: data_name.clone(), transparent, name: name.clone(), tparams: tparams.iter().map(|t| t.name.clone()).collect(), public: false, span, shape: crate::derive::DShape::Enum(dvariants.clone()) };
             let ms = data_methods(methods, &mopts);
             self.djobs.push(crate::derive_data::DataJob { job, go_name: data_name.clone(), methods: ms });
         }
-        for d in derives.iter().filter(|d| matches!(d.as_str(), "Json" | "Arbitrary" | "Row")) {
-            self.jobs.push(crate::derive::DeriveJob { derive: d.clone(), go_name: data_name.clone(), transparent, name: name.clone(), tparams: tparams.iter().map(|t| t.name.clone()).collect(), public: false, span, shape: crate::derive::DShape::Enum(dvariants.clone()) });
+        let type_opts = std::mem::take(&mut self.cur_asn1);
+        for d in derives.iter().filter(|d| matches!(d.as_str(), "Json" | "Asn1" | "Arbitrary" | "Row")) {
+            self.jobs.push(crate::derive::DeriveJob { type_opts: type_opts.clone(), derive: d.clone(), go_name: data_name.clone(), transparent, name: name.clone(), tparams: tparams.iter().map(|t| t.name.clone()).collect(), public: false, span, shape: crate::derive::DShape::Enum(dvariants.clone()) });
         }
         Ok(EnumDef { name, span, error: false, tparams, variants })
     }
@@ -1160,23 +1178,24 @@ impl<'a> Parser<'a> {
         let span = start.to(self.prev_span());
         if derives.iter().any(|d| d == "Gob") {
             let dfields = fields.iter().zip(fopts.iter()).map(|((n, t, s), o)| crate::derive::DField { name: n.clone(), ty: t.clone(), opts: o.clone(), span: *s }).collect();
-            let job = crate::derive::DeriveJob { derive: "Gob".into(), go_name: data_name.clone(), transparent, name: name.clone(), tparams: tparams.iter().map(|t| t.name.clone()).collect(), public: false, span, shape: crate::derive::DShape::Struct(dfields) };
+            let job = crate::derive::DeriveJob { type_opts: Default::default(), derive: "Gob".into(), go_name: data_name.clone(), transparent, name: name.clone(), tparams: tparams.iter().map(|t| t.name.clone()).collect(), public: false, span, shape: crate::derive::DShape::Struct(dfields) };
             self.gjobs.push(crate::derive_gob::GobJob { job, go_name: data_name.clone() });
         }
         if derives.iter().any(|d| d == "Data") {
             let dfields = fields.iter().zip(fopts.iter()).map(|((n, t, s), o)| crate::derive::DField { name: n.clone(), ty: t.clone(), opts: o.clone(), span: *s }).collect();
-            let job = crate::derive::DeriveJob { derive: "Data".into(), go_name: data_name.clone(), transparent, name: name.clone(), tparams: tparams.iter().map(|t| t.name.clone()).collect(), public: false, span, shape: crate::derive::DShape::Struct(dfields) };
+            let job = crate::derive::DeriveJob { type_opts: Default::default(), derive: "Data".into(), go_name: data_name.clone(), transparent, name: name.clone(), tparams: tparams.iter().map(|t| t.name.clone()).collect(), public: false, span, shape: crate::derive::DShape::Struct(dfields) };
             let ms = data_methods(methods, &mopts);
             self.djobs.push(crate::derive_data::DataJob { job, go_name: data_name.clone(), methods: ms });
         }
         let dfields: Vec<crate::derive::DField> = fields.iter().zip(fopts).map(|((n, t, s), o)| crate::derive::DField { name: n.clone(), ty: t.clone(), opts: o, span: *s }).collect();
         if derives.iter().any(|d| d == "Xml") {
-            let job = crate::derive::DeriveJob { derive: "Xml".into(), go_name: data_name.clone(), transparent, name: name.clone(), tparams: tparams.iter().map(|t| t.name.clone()).collect(), public: false, span, shape: crate::derive::DShape::Struct(dfields.clone()) };
+            let job = crate::derive::DeriveJob { type_opts: Default::default(), derive: "Xml".into(), go_name: data_name.clone(), transparent, name: name.clone(), tparams: tparams.iter().map(|t| t.name.clone()).collect(), public: false, span, shape: crate::derive::DShape::Struct(dfields.clone()) };
             let ms = methods[first_method..].iter().map(|d| d.name.rsplit('.').next().unwrap_or(&d.name).to_string()).collect();
             self.xjobs.push(crate::derive_xml::XmlJob { job, methods: ms });
         }
-        for d in derives.iter().filter(|d| matches!(d.as_str(), "Json" | "Arbitrary" | "Row")) {
-            self.jobs.push(crate::derive::DeriveJob { derive: d.clone(), go_name: data_name.clone(), transparent, name: name.clone(), tparams: tparams.iter().map(|t| t.name.clone()).collect(), public: false, span, shape: crate::derive::DShape::Struct(dfields.clone()) });
+        let type_opts = std::mem::take(&mut self.cur_asn1);
+        for d in derives.iter().filter(|d| matches!(d.as_str(), "Json" | "Asn1" | "Arbitrary" | "Row")) {
+            self.jobs.push(crate::derive::DeriveJob { type_opts: type_opts.clone(), derive: d.clone(), go_name: data_name.clone(), transparent, name: name.clone(), tparams: tparams.iter().map(|t| t.name.clone()).collect(), public: false, span, shape: crate::derive::DShape::Struct(dfields.clone()) });
         }
         Ok(StructDef { name, span, tparams, fields })
     }

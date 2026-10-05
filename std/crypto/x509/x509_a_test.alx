@@ -1,0 +1,510 @@
+# Go's crypto/x509/x509_test.go, first part (the top through
+# TestRSAPSSSelfSigned / TestEd25519SelfSigned): PKCS #1 / PKIX keys,
+# hostname matching, certificate parsing and creation, ECDSA, DSA, RSA-PSS
+# and Ed25519 certificates. The rest of the first part is in
+# x509_b_test.alx; the test data is in x509_data_test.alx (generated).
+# Helpers are prefixed x1_ (other agents' test files share the package).
+#
+# Not translated, or translated in part:
+#   - TestCertificateEqualOnNil: alx has no nil *Certificate.
+#   - TestMarshalRSAPrivateKey: Go's MarshalPKCS1PrivateKey precomputes
+#     the caller's key in place (a pointer); alx keys are values, so the
+#     final `priv.Precomputed.Dp != nil` check is made on the parsed key.
+#   - TestMarshalRSAPrivateKeyInvalid: the GODEBUG=x509rsacrt=0 half
+#     (GODEBUG doesn't exist).
+#   - TestMarshalRSAPublicKey: asn1.Marshal / Unmarshal of rsa.PublicKey
+#     work through reflection in Go; here through a derived struct with
+#     the same shape (x1 RsaPub).
+#   - TestMarshalInvalidPublicKey: the zero ecdsa.PublicKey{} (nil curve)
+#     can't exist: elliptic.Curve is an interface value, never nil.
+
+import "bytes"
+import "crypto/ecdh"
+import "crypto/ecdsa"
+import "crypto/ed25519"
+import "crypto/elliptic"
+import "crypto/mldsa"
+import "crypto/rand"
+import "crypto/rsa"
+import "crypto/x509/pkix"
+import "encoding/asn1"
+import "encoding/base64"
+import "encoding/hex"
+import "encoding/pem"
+import "math/big"
+import "net/url"
+import "time"
+
+# ---------------------------------------------------------------- helpers
+
+# The bytes of the first PEM block in s.
+def x1_pem_der(s: Str) -> [Byte] {
+  blk, _rest = pem.decode(s.bytes)
+  if b = blk {
+    return b.bytes
+  }
+  panic("x1_pem_der: no PEM block")
+}
+
+def x1_from_base64(s: Str) -> [Byte] { base64.std_encoding.decode_string(s).unwrap }
+
+def x1_big(s: Str, base: Int) -> big.Int {
+  z = big.new_int(0)
+  if v = z.set_string!(s, base) {
+    return v
+  }
+  panic("x1_big: bad number #{s}")
+}
+
+# Go's testPrivateKey (pemPrivateKey, parsed).
+def x1_test_private_key -> rsa.PrivateKey { parse_pkcs1_private_key(x1_pem_der(x1_pem_private_key())).unwrap }
+
+# Go's rsaPrivateKey.
+def x1_rsa_private_key -> rsa.PrivateKey {
+  n = x1_big("124737666279038955318614287965056875799409043964547386061640914307192830334599556034328900586693254156136128122194531292927142396093148164407300419162827624945636708870992355233833321488652786796134504707628792159725681555822420087112284637501705261187690946267527866880072856272532711620639179596808018872997", 10)
+  d = x1_big("69322600686866301945688231018559005300304807960033948687567105312977055197015197977971637657636780793670599180105424702854759606794705928621125408040473426339714144598640466128488132656829419518221592374964225347786430566310906679585739468938549035854760501049443920822523780156843263434219450229353270690889", 10)
+  p = x1_big("11405025354575369741595561190164746858706645478381139288033759331174478411254205003127028642766986913445391069745480057674348716675323735886284176682955723", 10)
+  q = x1_big("10937079261204603443118731009201819560867324167189758120988909645641782263430128449826989846631183550578761324239709121189827307416350485191350050332642639", 10)
+  rsa.PrivateKey.new(public_key: rsa.PublicKey.new(n: n, e: 65537), d: d, primes: [p, q])
+}
+
+def x1_key_kind(k: PublicKey) -> Str {
+  case k {
+    None => "none"
+    Rsa(_) => "rsa"
+    Ecdsa(_) => "ecdsa"
+    Ed25519(_) => "ed25519"
+    Ecdh(_) => "ecdh"
+    Dsa(_) => "dsa"
+    MlDsa(_) => "mldsa"
+  }
+}
+
+# The partial PKCS #1 key of TestParsePKCS1PrivateKey (no CRT values).
+#[derive(Asn1)]
+struct X1PartialKey {
+  version: Int
+  n: big.Int
+  e: Int
+  d: big.Int
+  p: big.Int
+  q: big.Int
+}
+
+# rsa.PublicKey's shape, for asn1.Marshal / Unmarshal (Go uses reflection
+# on rsa.PublicKey itself).
+#[derive(Asn1)]
+struct X1RsaPub {
+  n: big.Int
+  e: Int
+}
+
+# ---------------------------------------------------------------- keys
+
+test "ParsePKCS1PrivateKey" {
+  priv = ~parse_pkcs1_private_key(x1_pem_der(x1_pem_private_key()))
+  want = x1_rsa_private_key()
+  assert priv.public_key.n.cmp(want.public_key.n) == 0, "N"
+  assert_eq priv.public_key.e, want.public_key.e
+  assert priv.d.cmp(want.d) == 0, "D"
+  assert priv.primes[0].cmp(want.primes[0]) == 0, "P"
+  assert priv.primes[1].cmp(want.primes[1]) == 0, "Q"
+
+  # This private key includes an invalid prime that rsa.PrivateKey.Validate
+  # should reject.
+  data = "0\x16\x02\x00\x02\x02\x7f\x00\x02\x0200\x02\x0200\x02\x02\x00\x01\x02\x02\x7f\x00".bytes
+  assert !parse_pkcs1_private_key(data).ok?, "parsing invalid private key did not result in an error"
+
+  # A partial key without CRT values should still parse.
+  b = X1PartialKey.new(n: priv.public_key.n, e: priv.public_key.e, d: priv.d, p: priv.primes[0], q: priv.primes[1]).~to_asn1
+  p2 = ~parse_pkcs1_private_key(b)
+  assert p2.equal?(priv), "partial private key did not match original key"
+  assert p2.precomputed.dp.some? && p2.precomputed.dq.some? && p2.precomputed.qinv.some?, "precomputed values not recomputed"
+}
+
+test "PKCS1MismatchPublicKeyFormat" {
+  der = ~hex.decode_string(x1_test_pkcs1_mismatch_public_key_format_pkix_public_key())
+  r = parse_pkcs1_public_key(der)
+  msg = r.err?.message || ""
+  assert msg.include?("use ParsePKIXPublicKey instead"), "got #{msg}"
+}
+
+test "MarshalInvalidPublicKey" {
+  k = ecdsa.PublicKey.new(curve: elliptic.p256(), x: big.new_int(1), y: big.new_int(2))
+  assert !marshal_pkix_public_key(PublicKey.Ecdsa(k)).ok?, "expected error, got MarshalPKIXPublicKey success"
+}
+
+test "ParsePKIXPublicKey" {
+  pems = [x1_pem_public_key(), x1_pem_ed25519_key(), x1_pem_x25519_key()]
+  kinds = ["rsa", "ed25519", "ecdh"]
+  for i in 0...pems.size {
+    der = x1_pem_der(pems[i])
+    pub = ~parse_pkix_public_key(der)
+    pub_bytes2 = ~marshal_pkix_public_key(pub)
+    assert pub_bytes2 == der, "#{kinds[i]}: reserialization of public key didn't match"
+    assert_eq x1_key_kind(pub), kinds[i]
+    case pub {
+      Ecdh(k) => assert(k.curve == ecdh.x25519(), "not an X25519 public key")
+      _ => nil
+    }
+  }
+}
+
+test "PKIXMismatchPublicKeyFormat" {
+  der = ~hex.decode_string(x1_test_pkix_mismatch_public_key_format_pkcs1_public_key())
+  r = parse_pkix_public_key(der)
+  msg = r.err?.message || ""
+  assert msg.include?("use ParsePKCS1PublicKey instead"), "got #{msg}"
+}
+
+test "MarshalRSAPrivateKey" {
+  n = x1_big("16346378922382193400538269749936049106320265317511766357599732575277382844051791096569333808598921852351577762718529818072849191122419410612033592401403764925096136759934497687765453905884149505175426053037420486697072448609022753683683718057795566811401938833367954642951433473337066311978821180526439641496973296037000052546108507805269279414789035461158073156772151892452251106173507240488993608650881929629163465099476849643165682709047462010581308719577053905787496296934240246311806555924593059995202856826239801816771116902778517096212527979497399966526283516447337775509777558018145573127308919204297111496233", 10)
+  d = x1_big("10897585948254795600358846499957366070880176878341177571733155050184921896034527397712889205732614568234385175145686545381899460748279607074689061600935843283397424506622998458510302603922766336783617368686090042765718290914099334449154829375179958369993407724946186243249568928237086215759259909861748642124071874879861299389874230489928271621259294894142840428407196932444474088857746123104978617098858619445675532587787023228852383149557470077802718705420275739737958953794088728369933811184572620857678792001136676902250566845618813972833750098806496641114644760255910789397593428910198080271317419213080834885003", 10)
+  p1 = x1_big("1025363189502892836833747188838978207017355117492483312747347695538428729137306368764177201532277413433182799108299960196606011786562992097313508180436744488171474690412562218914213688661311117337381958560443", 10)
+  p2 = x1_big("3467903426626310123395340254094941045497208049900750380025518552334536945536837294961497712862519984786362199788654739924501424784631315081391467293694361474867825728031147665777546570788493758372218019373", 10)
+  p3 = x1_big("4597024781409332673052708605078359346966325141767460991205742124888960305710298765592730135879076084498363772408626791576005136245060321874472727132746643162385746062759369754202494417496879741537284589047", 10)
+  priv = rsa.PrivateKey.new(public_key: rsa.PublicKey.new(n: n, e: 3), d: d, primes: [p1, p2, p3])
+
+  der_bytes = marshal_pkcs1_private_key(priv)
+  priv2 = ~parse_pkcs1_private_key(der_bytes)
+  assert priv.public_key.n.cmp(priv2.public_key.n) == 0, "N"
+  assert_eq priv.public_key.e, priv2.public_key.e
+  assert priv.d.cmp(priv2.d) == 0, "D"
+  assert_eq priv2.primes.size, 3
+  assert priv.primes[0].cmp(priv2.primes[0]) == 0, "P0"
+  assert priv.primes[1].cmp(priv2.primes[1]) == 0, "P1"
+  assert priv.primes[2].cmp(priv2.primes[2]) == 0, "P2"
+  assert priv2.precomputed.dp.some?, "Precomputed.Dp is none"
+}
+
+test "MarshalRSAPrivateKeyInvalid" {
+  test_rsa2048 = ~parse_pkcs1_private_key(x1_pem_der(x1_rsa2048_testing_key()))
+  broken = test_rsa2048
+  pre = broken.precomputed
+  pre.dp = big.new_int(42)
+  broken.precomputed = pre
+  r = parse_pkcs1_private_key(marshal_pkcs1_private_key(broken))
+  assert !r.ok?, "expected error, got success"
+}
+
+test "MarshalRSAPublicKey" {
+  n = x1_big("16346378922382193400538269749936049106320265317511766357599732575277382844051791096569333808598921852351577762718529818072849191122419410612033592401403764925096136759934497687765453905884149505175426053037420486697072448609022753683683718057795566811401938833367954642951433473337066311978821180526439641496973296037000052546108507805269279414789035461158073156772151892452251106173507240488993608650881929629163465099476849643165682709047462010581308719577053905787496296934240246311806555924593059995202856826239801816771116902778517096212527979497399966526283516447337775509777558018145573127308919204297111496233", 10)
+  pub = rsa.PublicKey.new(n: n, e: 3)
+  der_bytes = marshal_pkcs1_public_key(pub)
+  pub2 = ~parse_pkcs1_public_key(der_bytes)
+  assert pub.n.cmp(pub2.n) == 0 && pub.e == pub2.e, "ParsePKCS1PublicKey mismatch"
+
+  # asn1.Marshal / Unmarshal of the same shape.
+  der_bytes2 = X1RsaPub.new(n: pub.n, e: pub.e).~to_asn1
+  assert der_bytes2 == der_bytes, "Marshal(rsa.PublicKey) differs"
+  pub3, rest = ~X1RsaPub.from_asn1(der_bytes)
+  assert rest.size == 0 && pub.n.cmp(pub3.n) == 0 && pub.e == pub3.e, "Unmarshal(rsa.PublicKey) differs"
+
+  # (DER, expected error substring; "" = must succeed and reserialize)
+  public_keys: [([Byte], Str)] = [
+    ([0x30.as_u8, 6, 0x02, 1, 17, 0x02, 1, 3], ""),
+    ([0x30.as_u8, 6, 0x02, 1, 0xff, 0x02, 1, 3], "zero or negative"),
+    ([0x30.as_u8, 6, 0x02, 1, 17, 0x02, 1, 0xff], "zero or negative"),
+    ([0x30.as_u8, 6, 0x02, 1, 17, 0x02, 1, 3, 1], "trailing data"),
+    ([0x30.as_u8, 9, 0x02, 1, 17, 0x02, 4, 0x7f, 0xff, 0xff, 0xff], ""),
+    ([0x30.as_u8, 10, 0x02, 1, 17, 0x02, 5, 0x00, 0x80, 0x00, 0x00, 0x00], "large"),
+  ]
+  for i in 0...public_keys.size {
+    der, want_err = public_keys[i]
+    r = parse_pkcs1_public_key(der)
+    if want_err.size > 0 {
+      msg = r.err?.message || ""
+      assert !r.ok? && msg.include?(want_err), "##{i}: want error containing #{want_err}, got #{msg}"
+    } else {
+      assert r.ok?, "##{i}: unexpected failure: #{r.err?.message || ""}"
+      if k = r.ok {
+        assert marshal_pkcs1_public_key(k) == der, "##{i}: failed to reserialize"
+      }
+    }
+  }
+}
+
+# ---------------------------------------------------------------- hostnames
+
+test "MatchHostnames" {
+  tests = [
+    ("a.b.c", "a.b.c", true),
+    ("a.b.c", "b.b.c", false),
+    ("", "b.b.c", false),
+    ("a.b.c", "", false),
+    ("example.com", "example.com", true),
+    ("example.com", "www.example.com", false),
+    ("*.example.com", "example.com", false),
+    ("*.example.com", "www.example.com", true),
+    ("*.example.com", "www.example.com.", true),
+    ("*.example.com", "xyz.www.example.com", false),
+    ("*.example.com", "https://www.example.com", false),
+    ("*.example..com", "www.example..com", false),
+    ("www.example..com", "www.example..com", true),
+    ("*.*.example.com", "xyz.www.example.com", false),
+    ("*.www.*.com", "xyz.www.example.com", false),
+    ("*bar.example.com", "foobar.example.com", false),
+    ("f*.example.com", "foobar.example.com", false),
+    ("www.example.com", "*.example.com", false),
+    ("", ".", false),
+    (".", "", false),
+    (".", ".", false),
+    ("example.com", "example.com.", true),
+    ("example.com.", "example.com", false),
+    ("example.com.", "example.com.", true),
+    ("*.com.", "example.com.", false),
+    ("*.com.", "example.com", false),
+    ("*.com", "example.com", true),
+    ("*.com", "example.com.", true),
+    ("foo:bar", "foo:bar", true),
+    ("*.foo:bar", "xxx.foo:bar", false),
+    ("*.2.3.4", "1.2.3.4", false),
+    ("*.2.3.4", "[1.2.3.4]", false),
+    ("*:4860:4860::8888", "2001:4860:4860::8888", false),
+    ("*:4860:4860::8888", "[2001:4860:4860::8888]", false),
+    ("2001:4860:4860::8888", "2001:4860:4860::8888", false),
+    ("2001:4860:4860::8888", "[2001:4860:4860::8888]", false),
+    ("[2001:4860:4860::8888]", "2001:4860:4860::8888", false),
+    ("[2001:4860:4860::8888]", "[2001:4860:4860::8888]", false),
+  ]
+  for i in 0...tests.size {
+    pattern, host, ok = tests[i]
+    c = Certificate.new(dns_names: [pattern])
+    r = c.verify_hostname(host).ok?
+    assert r == ok, "##{i} mismatch got: #{r} want: #{ok} when matching '#{host}' against '#{pattern}'"
+  }
+}
+
+test "MatchIP" {
+  # Check that pattern matching is working.
+  c = Certificate.new(dns_names: ["*.foo.bar.baz"], subject: pkix.Name.new(common_name: "*.foo.bar.baz"))
+  c.~verify_hostname("quux.foo.bar.baz")
+
+  # But check that if we change it to be matching against an IP address,
+  # it is rejected.
+  c = Certificate.new(dns_names: ["*.2.3.4"], subject: pkix.Name.new(common_name: "*.2.3.4"))
+  assert !c.verify_hostname("1.2.3.4").ok?, "VerifyHostname(1.2.3.4) should have failed, did not"
+
+  ips: [[Byte]] = [parse_ip("127.0.0.1") || [], parse_ip("::1") || []]
+  c = Certificate.new(ip_addresses: ips)
+  c.~verify_hostname("127.0.0.1")
+  c.~verify_hostname("::1")
+  c.~verify_hostname("[::1]")
+}
+
+# ---------------------------------------------------------------- parsing
+
+test "CertificateParse" {
+  s = x1_from_base64(x1_cert_bytes())
+  certs = ~parse_certificates(s)
+  assert_eq certs.size, 2
+  certs[0].~check_signature_from(certs[1])
+  certs[0].~verify_hostname("mail.google.com")
+  assert_eq certs[0].extensions.size, 10
+}
+
+test "MismatchedSignatureAlgorithm" {
+  cert = ~parse_certificate(x1_pem_der(x1_rsa_pss_self_signed_pem()))
+  r = cert.check_signature(SignatureAlgorithm.ECDSAWithSHA256, [], [])
+  assert !r.ok?, "CheckSignature unexpectedly return no error"
+  msg = r.err?.message || ""
+  assert msg.include?(" but have public key of type "), "got #{msg}"
+}
+
+# ---------------------------------------------------------------- creation
+
+test "CreateSelfSignedCertificate" {
+  random = rand.reader()
+  test_key = x1_test_private_key()
+  rsa_pub = PublicKey.Rsa(test_key.public_key)
+  rsa_priv = PrivateKey.Rsa(test_key)
+  ecdsa_priv = ~ecdsa.generate_key(elliptic.p256(), random)
+  ed_pub, ed_priv = ~ed25519.generate_key(random)
+  mldsa_priv = ~mldsa.generate_key(mldsa.mldsa44())
+
+  tests: [(Str, PublicKey, PrivateKey, Bool, SignatureAlgorithm)] = [
+    ("RSA/RSA", rsa_pub, rsa_priv, true, SignatureAlgorithm.SHA384WithRSA),
+    ("RSA/ECDSA", rsa_pub, PrivateKey.Ecdsa(ecdsa_priv), false, SignatureAlgorithm.ECDSAWithSHA384),
+    ("ECDSA/RSA", PublicKey.Ecdsa(ecdsa_priv.public_key), rsa_priv, false, SignatureAlgorithm.SHA256WithRSA),
+    ("ECDSA/ECDSA", PublicKey.Ecdsa(ecdsa_priv.public_key), PrivateKey.Ecdsa(ecdsa_priv), true, SignatureAlgorithm.ECDSAWithSHA256),
+    ("RSAPSS/RSAPSS", rsa_pub, rsa_priv, true, SignatureAlgorithm.SHA256WithRSAPSS),
+    ("ECDSA/RSAPSS", PublicKey.Ecdsa(ecdsa_priv.public_key), rsa_priv, false, SignatureAlgorithm.SHA256WithRSAPSS),
+    ("RSAPSS/ECDSA", rsa_pub, PrivateKey.Ecdsa(ecdsa_priv), false, SignatureAlgorithm.ECDSAWithSHA384),
+    ("Ed25519", PublicKey.Ed25519(ed_pub), PrivateKey.Ed25519(ed_priv), true, SignatureAlgorithm.PureEd25519),
+    ("ML-DSA-44", PublicKey.MlDsa(mldsa_priv.public_key), PrivateKey.MlDsa(mldsa_priv), true, SignatureAlgorithm.MLDSA44),
+  ]
+
+  test_ext_key_usage = [ExtKeyUsage.ClientAuth, ExtKeyUsage.ServerAuth]
+  test_unknown_ext_key_usage = [asn1.oid([1, 2, 3]), asn1.oid([2, 59, 1])]
+  extra_extension_data = "extra extension".bytes
+  policy_arcs: [U64] = [1, 2, 3, 4294967295, 18446744073709551615]
+  policy = ~oid_from_ints(policy_arcs)
+  v6 = parse_ip("2001:4860:0:2001::68") || []
+  ips: [[Byte]] = [[127.as_u8, 0, 0, 1], v6]
+  uri = url.parse("https://foo.com/wibble#foo").unwrap
+  ex_ip: [Byte] = [0x20.as_u8, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+  ex_mask: [Byte] = [0xff.as_u8, 0xff, 0xff, 0xff, 0xff, 0xff, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+
+  for t in tests {
+    name, pub, priv, check_sig, sig_algo = t
+    common_name = "test.example.com"
+    template = Certificate.new(
+      serial_number: big.new_int(1),
+      subject: pkix.Name.new(
+        common_name: common_name,
+        organization: ["Σ Acme Co"],
+        country: ["US"],
+        extra_names: [
+          pkix.AttributeTypeAndValue.new(type: asn1.oid([2, 5, 4, 42]), value: asn1.Any.Str("Gopher")),
+          # This should override the Country, above.
+          pkix.AttributeTypeAndValue.new(type: asn1.oid([2, 5, 4, 6]), value: asn1.Any.Str("NL")),
+        ],
+      ),
+      not_before: time.unix(1000, 0),
+      not_after: time.unix(100000, 0),
+      signature_algorithm: sig_algo,
+      subject_key_id: [1.as_u8, 2, 3, 4],
+      key_usage: KEY_USAGE_CERT_SIGN,
+      ext_key_usage: test_ext_key_usage,
+      unknown_ext_key_usage: test_unknown_ext_key_usage,
+      basic_constraints_valid: true,
+      is_ca: true,
+      ocsp_server: ["http://ocsp.example.com"],
+      issuing_certificate_url: ["http://crt.example.com/ca1.crt"],
+      dns_names: ["test.example.com"],
+      email_addresses: ["gopher@golang.org"],
+      ip_addresses: ips,
+      uris: [uri],
+      policies: [policy],
+      permitted_dns_domains: [".example.com", "example.com"],
+      excluded_dns_domains: ["bar.example.com"],
+      permitted_ip_ranges: [IPNet.new(ip: [192.as_u8, 168, 0, 0], mask: [255.as_u8, 255, 0, 0]), IPNet.new(ip: [1.as_u8, 0, 0, 0], mask: [255.as_u8, 0, 0, 0])],
+      excluded_ip_ranges: [IPNet.new(ip: ex_ip, mask: ex_mask)],
+      permitted_email_addresses: ["foo@example.com"],
+      excluded_email_addresses: [".example.com", "example.com"],
+      permitted_uri_domains: [".bar.com", "bar.com"],
+      excluded_uri_domains: [".bar2.com", "bar2.com"],
+      crl_distribution_points: ["http://crl1.example.com/ca1.crl", "http://crl2.example.com/ca1.crl"],
+      extra_extensions: [
+        pkix.Extension.new(id: asn1.oid([1, 2, 3, 4]), value: extra_extension_data),
+        # This extension should override the SubjectKeyId, above.
+        pkix.Extension.new(id: oid_extension_subject_key_id(), critical: false, value: [0x04.as_u8, 0x04, 4, 3, 2, 1]),
+      ],
+    )
+
+    dr = create_certificate(random, template, template, pub, priv)
+    assert dr.ok?, "#{name}: failed to create certificate: #{dr.err?.message || ""}"
+    der_bytes = dr.ok || []
+    next if der_bytes.size == 0
+    pr = parse_certificate(der_bytes)
+    assert pr.ok?, "#{name}: failed to parse certificate: #{pr.err?.message || ""}"
+    if cert = pr.ok {
+      assert cert.policies.size == 1 && cert.policies[0].equal?(policy), "#{name}: failed to parse policy identifiers"
+      assert_eq cert.permitted_dns_domains, [".example.com", "example.com"]
+      assert_eq cert.excluded_dns_domains, ["bar.example.com"]
+      assert_eq cert.permitted_ip_ranges.map { it.to_s }.to_a, ["192.168.0.0/16", "1.0.0.0/8"]
+      assert_eq cert.excluded_ip_ranges.map { it.to_s }.to_a, ["2001:db8::/48"]
+      assert_eq cert.permitted_email_addresses, ["foo@example.com"]
+      assert_eq cert.excluded_email_addresses, [".example.com", "example.com"]
+      assert_eq cert.permitted_uri_domains, [".bar.com", "bar.com"]
+      assert_eq cert.excluded_uri_domains, [".bar2.com", "bar2.com"]
+      assert_eq cert.subject.common_name, common_name
+      assert_eq cert.subject.country, ["NL"]
+      for ext in cert.extensions {
+        assert !(ext.id.equal?(oid_extension_subject_alt_name()) && ext.critical), "SAN extension is marked critical"
+      }
+      found = false
+      for atv in cert.subject.names {
+        found = true if atv.type.equal?(asn1.oid([2, 5, 4, 42]))
+      }
+      assert found, "#{name}: Names didn't contain oid 2.5.4.42 from ExtraNames"
+      assert_eq cert.issuer.common_name, common_name
+      assert cert.signature_algorithm == sig_algo, "#{name}: SignatureAlgorithm wasn't copied from template: #{cert.signature_algorithm.to_s}"
+      assert_eq cert.ext_key_usage.map { it.value }.to_a, test_ext_key_usage.map { it.value }.to_a
+      assert_eq cert.unknown_ext_key_usage.map { it.to_s }.to_a, test_unknown_ext_key_usage.map { it.to_s }.to_a
+      assert_eq cert.ocsp_server, template.ocsp_server
+      assert_eq cert.issuing_certificate_url, template.issuing_certificate_url
+      assert_eq cert.dns_names, template.dns_names
+      assert_eq cert.email_addresses, template.email_addresses
+      assert cert.uris.size == 1 && cert.uris[0].to_s == "https://foo.com/wibble#foo", "#{name}: URIs differ from template"
+      assert cert.ip_addresses == template.ip_addresses, "#{name}: SAN IPs differ from template"
+      assert_eq cert.crl_distribution_points, template.crl_distribution_points
+      assert cert.subject_key_id == [4.as_u8, 3, 2, 1], "#{name}: ExtraExtensions didn't override SubjectKeyId"
+      assert bytes.contains(der_bytes, extra_extension_data), "#{name}: didn't find extra extension in DER output"
+      if check_sig {
+        r = cert.check_signature_from(cert)
+        assert r.ok?, "#{name}: signature verification failed: #{r.err?.message || ""}"
+      }
+    }
+  }
+}
+
+# ---------------------------------------------------------------- ECDSA, DSA, PSS, Ed25519
+
+test "ECDSA" {
+  tests = [
+    (SignatureAlgorithm.ECDSAWithSHA256, x1_ecdsa_sha256p256_cert_pem()),
+    (SignatureAlgorithm.ECDSAWithSHA256, x1_ecdsa_sha256p384_cert_pem()),
+    (SignatureAlgorithm.ECDSAWithSHA384, x1_ecdsa_sha384p521_cert_pem()),
+  ]
+  for i in 0...tests.size {
+    sig_algo, pem_cert = tests[i]
+    cert = ~parse_certificate(x1_pem_der(pem_cert))
+    assert cert.signature_algorithm == sig_algo, "#{i}: signature algorithm is #{cert.signature_algorithm.to_s}, want #{sig_algo.to_s}"
+    assert_eq x1_key_kind(cert.public_key), "ecdsa"
+    assert cert.public_key_algorithm == PublicKeyAlgorithm.ECDSA, "#{i}: public key algorithm is not ECDSA"
+    r = cert.check_signature_from(cert)
+    assert r.ok?, "#{i}: certificate verification failed: #{r.err?.message || ""}"
+  }
+}
+
+test "ParseCertificateWithDsaPublicKey" {
+  p = x1_big("00BC84B52743B169158BB85974E3E832AF5EFCFC42B264349095313A4A013EEE069A1B937D92E51ACF297A1C77880DF25C8607D8204B4DC45651305EF4A63B40C7D8C42D91EDA397D8F51CBC9D0A531FE2C6F1E55E9357D205C39D395358968CBEDAC11320C607BE16CB9DB492B6E78163305A34DD99CE43C64927D13A0040EB97", 16)
+  q = x1_big("009A67067F66A323F5D4EC7902C73FE5D9E36FA74F", 16)
+  g = x1_big("009147778295BF5893542BC41BA806898A29E43261DBC85441C37D92E97ED80D323D44825FDDE8374D0FF15877798812682599B216BBCC31B9DCCAD527465FEAFFD7FC2A193612E575E34E7A98AF4D10339FE47390A518CB9975B3160B1D0285D1418D0977C52994F43C29A053E3D685834104C9FAFDC221E38BE9F3989D7A8E42", 16)
+  y = x1_big("59A27C269FCDE45AA2160A5C980C19211A820095091AB9C5DC8309AB7EC1B3A48C2E267C6D35FEE9B71BCBB92F16AC8E559129347FB5C00BEEDD10BA8915C90698755CA965735A32DC7575BED806E1E38F768FFBC24E41123DC73F1C6E9E4D0C9E692128853AFE29DC665FA993DCA9C903B7BF00B6442B9A76A5DADC6186317A", 16)
+  cert = ~parse_certificate(x1_pem_der(x1_dsa_cert_pem()))
+  assert cert.public_key_algorithm == PublicKeyAlgorithm.DSA, "Parsed key algorithm was not DSA"
+  case cert.public_key {
+    Dsa(k) => {
+      assert k.y.cmp(y) == 0 && k.parameters.p.cmp(p) == 0 && k.parameters.q.cmp(q) == 0 && k.parameters.g.cmp(g) == 0, "Parsed key differs from expected key"
+    }
+    _ => {
+      assert false, "Parsed key was not a DSA key"
+    }
+  }
+}
+
+test "ParseCertificateWithDSASignatureAlgorithm" {
+  cert = ~parse_certificate(x1_pem_der(x1_dsa_cert_pem()))
+  assert cert.signature_algorithm == SignatureAlgorithm.DSAWithSHA1, "Parsed signature algorithm was not DSAWithSHA1"
+}
+
+test "VerifyCertificateWithDSASignature" {
+  cert = ~parse_certificate(x1_pem_der(x1_dsa_cert_pem()))
+  # test cert is self-signed
+  assert !cert.check_signature_from(cert).ok?, "Expected error verifying DSA certificate"
+}
+
+test "RSAPSSSelfSigned" {
+  pems = [x1_rsa_pss_self_signed_pem(), x1_rsa_pss_self_signed_open_ssl110_pem()]
+  for i in 0...pems.size {
+    cert = ~parse_certificate(x1_pem_der(pems[i]))
+    r = cert.check_signature_from(cert)
+    assert r.ok?, "##{i}: signature check failed: #{r.err?.message || ""}"
+  }
+}
+
+test "Ed25519SelfSigned" {
+  cert = ~parse_certificate(x1_pem_der(x1_ed25519_certificate()))
+  assert cert.public_key_algorithm == PublicKeyAlgorithm.Ed25519, "Parsed key algorithm was not Ed25519"
+  case cert.public_key {
+    Ed25519(k) => {
+      assert_eq k.key.size, ed25519.PUBLIC_KEY_SIZE
+    }
+    _ => {
+      assert false, "Parsed key was not an Ed25519 key"
+    }
+  }
+  cert.~check_signature_from(cert)
+}

@@ -1,0 +1,212 @@
+# Go's crypto/x509/parser_test.go. The PEM constants are in
+# xc_data_test.alx.
+#
+# Not translated: FuzzDomainNameValid (fuzzing; DomainNameValid covers the
+# function). Go's domainToReverseLabels (verify.go; only its test uses it
+# now) is translated below as xp_domain_to_reverse_labels.
+
+import "crypto/ecdsa"
+import "crypto/elliptic"
+import "crypto/rand"
+import "crypto/x509/pkix"
+import "encoding/asn1"
+import "encoding/pem"
+import "os"
+import "strings"
+import "time"
+import cbasn1 "golang.org/x/crypto/cryptobyte/asn1"
+
+test "ParseASN1String" {
+  bmp = asn1.TAG_BMP_STRING.as_u8
+  numeric = asn1.TAG_NUMERIC_STRING.as_u8
+  # (name, tag, value, expected, expected error)
+  tests = [
+    ("T61String", cbasn1.T61_STRING, [0xbf.as_u8, 0x61, 0x3f], "¿a?", ""),
+    ("PrintableString", cbasn1.PRINTABLE_STRING, [80.as_u8, 81, 82], "PQR", ""),
+    ("PrintableString (invalid)", cbasn1.PRINTABLE_STRING, [1.as_u8, 2, 3], "", "invalid PrintableString"),
+    ("UTF8String", cbasn1.UTF8_STRING, [80.as_u8, 81, 82], "PQR", ""),
+    ("UTF8String (invalid)", cbasn1.UTF8_STRING, [255.as_u8], "", "invalid UTF-8 string"),
+    ("BMPString", bmp, [80.as_u8, 81], "偑", ""),
+    ("BMPString (invalid length)", bmp, [255.as_u8], "", "invalid BMPString"),
+    ("BMPString (invalid surrogate)", bmp, [80.as_u8, 81, 216, 1], "", "invalid BMPString"),
+    ("BMPString (invalid noncharacter 0xfdd1)", bmp, [80.as_u8, 81, 253, 209], "", "invalid BMPString"),
+    ("BMPString (invalid noncharacter 0xffff)", bmp, [80.as_u8, 81, 255, 255], "", "invalid BMPString"),
+    ("BMPString (invalid noncharacter 0xfffe)", bmp, [80.as_u8, 81, 255, 254], "", "invalid BMPString"),
+    ("IA5String", cbasn1.IA5_STRING, [80.as_u8, 81], "PQ", ""),
+    ("IA5String (invalid)", cbasn1.IA5_STRING, [255.as_u8], "", "invalid IA5String"),
+    ("NumericString", numeric, [49.as_u8, 50], "12", ""),
+    ("NumericString (invalid)", numeric, [80.as_u8], "", "invalid NumericString")
+  ]
+  for tc in tests {
+    r = parse_asn1_string(tc[1], tc[2])
+    assert_eq r.err?.message || "", tc[4]
+    assert_eq r.ok || "", tc[3]
+  }
+}
+
+test "PolicyParse" {
+  b, _ = pem.decode(xc_policy_pem().bytes)
+  c = parse_certificate(b.unwrap.bytes).unwrap
+  assert_eq c.policies.size, 9
+  assert_eq c.policy_mappings.size, 9
+  assert c.require_explicit_policy_zero, "expected RequireExplicitPolicyZero to be set"
+  assert c.inhibit_policy_mapping_zero, "expected InhibitPolicyMappingZero to be set"
+  assert c.inhibit_any_policy_zero, "expected InhibitAnyPolicyZero to be set"
+}
+
+test "ParsePolicies" {
+  for tc in ["testdata/policy_leaf_duplicate.pem", "testdata/policy_leaf_invalid.pem"] {
+    b = os.read_file(tc).unwrap
+    p, _ = pem.decode(b)
+    r = parse_certificate(p.unwrap.bytes)
+    assert !r.ok?, "#{tc}: parsing should've failed"
+  }
+}
+
+test "ParseCertificateNegativeMaxPathLength" {
+  for cert in [xc_neg_max_path_len1(), xc_neg_max_path_len2()] {
+    b, _ = pem.decode(cert.bytes)
+    r = parse_certificate(b.unwrap.bytes)
+    assert_eq r.err?.message || "", "x509: invalid basic constraints"
+  }
+}
+
+# Go's domainToReverseLabels (verify.go): the labels of a domain name in
+# reverse order, or none if it's invalid.
+def xp_domain_to_reverse_labels(domain0: Str) -> [Str]? {
+  reverse_labels: [Str] = []
+  domain = domain0
+  while domain.size > 0 {
+    i = strings.last_index_byte(domain, 46)
+    if i == -1 {
+      reverse_labels << domain
+      domain = ""
+    } else {
+      reverse_labels << domain[i + 1...domain.size]
+      domain = domain[0...i]
+      # domain is prefixed with an empty label, append an empty string to
+      # reverse_labels to indicate this.
+      reverse_labels << "" if i == 0
+    }
+  }
+  # An empty label at the end indicates an absolute value.
+  return none if reverse_labels.size > 0 && reverse_labels[0].size == 0
+  for label in reverse_labels {
+    # Empty labels are otherwise invalid.
+    return none if label.size == 0
+    for c in label.runes {
+      # Invalid character.
+      return none if c < 33 || c > 126
+    }
+  }
+  reverse_labels
+}
+
+test "DomainNameValid" {
+  # (name, dns name, constraint, valid)
+  tests = [
+    # TODO(#75835): the inverse of the stricter checks Go had to disable.
+    ("254 char label, name", "a.a" * 84 + "aaa", false, true),
+    ("254 char label, constraint", "a.a" * 84 + "aaa", true, true),
+    ("253 char label, name", "a.a" * 84 + "aa", false, true),
+    ("253 char label, constraint", "a.a" * 84 + "aa", true, true),
+    ("64 char single label, name", "a" * 64, false, true),
+    ("64 char single label, constraint", "a" * 64, true, true),
+    ("64 char label, name", "a." + "a" * 64, false, true),
+    ("64 char label, constraint", "a." + "a" * 64, true, true),
+    # Check we properly enforce properties of domain names.
+    ("empty name, constraint", "", true, true),
+    ("empty label, name", "a..a", false, false),
+    ("empty label, constraint", "a..a", true, false),
+    ("period, name", ".", false, false),
+    ("period, constraint", ".", true, false),
+    ("valid, name", "a.b.c", false, true),
+    ("valid, constraint", "a.b.c", true, true),
+    ("leading period, name", ".a.b.c", false, false),
+    ("leading period, constraint", ".a.b.c", true, true),
+    ("trailing period, name", "a.", false, false),
+    ("trailing period, constraint", "a.", true, false),
+    ("bare label, name", "a", false, true),
+    ("bare label, constraint", "a", true, true),
+    ("63 char single label, name", "a" * 63, false, true),
+    ("63 char single label, constraint", "a" * 63, true, true),
+    ("63 char label, name", "a." + "a" * 63, false, true),
+    ("63 char label, constraint", "a." + "a" * 63, true, true)
+  ]
+  for tc in tests {
+    valid = domain_name_valid?(tc[1], tc[2])
+    assert valid == tc[3], "#{tc[0]}: domain_name_valid?(#{tc[1]}, #{tc[2]}) = #{valid}"
+    # Also check that we enforce the same properties as
+    # domain_to_reverse_labels.
+    trimmed_name = tc[1]
+    if tc[2] && trimmed_name.size > 1 && trimmed_name[0] == 46 {
+      trimmed_name = trimmed_name[1...trimmed_name.size]
+    }
+    rev_valid = xp_domain_to_reverse_labels(trimmed_name).some?
+    assert valid == rev_valid, "#{tc[0]}: domain_name_valid? = #{valid} != domain_to_reverse_labels(#{trimmed_name}) = #{rev_valid}"
+  }
+}
+
+test "RoundtripWeirdSANs" {
+  # TODO(#75835): certificates created with malformed SAN values can be
+  # parsed (people rely on it).
+  k = PrivateKey.Ecdsa(ecdsa.generate_key(elliptic.p256(), rand.reader()).unwrap)
+  bad_names = ["baredomain", "baredomain.", "a" * 255, "a" * 65 + ".com"]
+  tmpl = Certificate.new(email_addresses: bad_names, dns_names: bad_names)
+  b = create_certificate(rand.reader(), tmpl, tmpl, k.public, k).unwrap
+  r = parse_certificate(b)
+  assert r.ok?, "Couldn't roundtrip certificate: #{r.err?.message || ""}"
+}
+
+# A description of a parsed attribute value (Go compares them with
+# reflect.DeepEqual).
+def xp_any_desc(v: asn1.Any) -> Str {
+  case v {
+    Nil => "nil"
+    Bool(b) => "bool #{b}"
+    Int(i) => "int64 #{i}"
+    Str(s) => "string #{s}"
+    BitString(b) => "bitstring #{b.bit_length} #{b.bytes}"
+    Oid(o) => "oid #{o.to_s}"
+    Time(t) => "time #{t.utc.format(time.RFC3339)}"
+    Bytes(b) => "bytes #{b}"
+    Raw(r) => "raw #{r.class} #{r.tag} #{r.is_compound} #{r.bytes} #{r.full_bytes}"
+  }
+}
+
+test "ParseNameTypes" {
+  block, _ = pem.decode(xc_name_types_pem().bytes)
+  expected: Map[Str, Str] = {
+    "1.2.840.113554.4.1.72585.2.1" => "string utf8-string🦊",
+    "1.2.840.113554.4.1.72585.2.2" => "bytes #{"octet-string".bytes}",
+    "1.2.840.113554.4.1.72585.2.3" => "raw 0 13 false [1 2 3 4 5] [13 5 1 2 3 4 5]",
+    "1.2.840.113554.4.1.72585.2.4" => "nil",
+    "1.2.840.113554.4.1.72585.2.5" => "raw 0 16 true [1 2] [48 2 1 2]",
+    "1.2.840.113554.4.1.72585.2.6" => "int64 42",
+    "1.2.840.113554.4.1.72585.2.7" => "oid 1.2.840.113554.4.1.72585.2.7",
+    "1.2.840.113554.4.1.72585.2.8" => "bitstring 32 [170 187 204 221]",
+    "1.2.840.113554.4.1.72585.2.9" => "time 2025-09-02T18:43:17Z",
+    "1.2.840.113554.4.1.72585.2.10" => "bool true"
+  }
+  cert = parse_certificate(block.unwrap.bytes).unwrap
+  assert_eq cert.subject.names.size, 10
+  for attr in cert.subject.names {
+    if want = expected[attr.type.to_s] {
+      assert_eq xp_any_desc(attr.value), want
+    } else {
+      assert false, "unexpected attribute type: #{attr.type.to_s}"
+    }
+  }
+  # asn1 marshalling doesn't encode Nil: use NULL.
+  extra: [pkix.AttributeTypeAndValue] = []
+  for atv0 in cert.subject.names {
+    atv = atv0
+    if xp_any_desc(atv.value) == "nil" {
+      atv.value = asn1.Any.Raw(asn1.null_raw_value())
+    }
+    extra << atv
+  }
+  name = pkix.Name.new(extra_names: extra)
+  got = name.to_rdn_sequence.to_asn1.unwrap
+  assert_eq got, cert.raw_subject
+}

@@ -1,0 +1,549 @@
+#![overflow(wrap)]
+# Package chacha20: golang.org/x/crypto/chacha20 (the copy Go's std
+# vendors), the ChaCha20 and XChaCha20 stream ciphers as specified in RFC
+# 8439 and draft-irtf-cfrg-xchacha-01. Go's generic code (chacha_generic.go,
+# xor.go).
+#
+#   Go                                        alx
+#   KeySize / NonceSize / NonceSizeX          KEY_SIZE / NONCE_SIZE / NONCE_SIZE_X
+#   NewUnauthenticatedCipher(key, nonce)      new_unauthenticated_cipher(key, nonce) -> ~Cipher<ChaCha20Error>
+#   (*Cipher).XORKeyStream(dst, src)          c.xor_key_stream!(dst, src)   (a cipher.Stream)
+#   (*Cipher).SetCounter(counter)             c.set_counter!(counter: U32)
+#   HChaCha20(key, nonce) ([]byte, error)     hchacha20(key, nonce) -> ~[Byte]<ChaCha20Error>
+#   errors.New("chacha20: wrong key size")... ChaCha20Error.WrongKeySize ... (Go's messages)
+#
+# Differences from Go:
+#   - A Cipher shares its state across copies (GO-VS-RUBY D36), as Go's
+#     *Cipher does; make it with new_unauthenticated_cipher.
+#   - Go's generic code precomputes the first column round, which doesn't
+#     depend on the counter; this port runs the 20 rounds in full (same
+#     output). There is no assembly: every platform runs this code.
+#   - Aliasing: "invalid buffer overlap" can't be detected (alx slices
+#     don't expose addresses); dst == src works as in Go.
+#   - The panics are Go's (counter overflow, rollback, short dst).
+#
+# Timing: ChaCha20 is constant time (additions, XORs and rotations only).
+
+import "crypto/cipher"
+
+pub KEY_SIZE = 32
+pub NONCE_SIZE = 12
+pub NONCE_SIZE_X = 24
+
+BLOCK_SIZE = 64
+BUF_SIZE = 64
+
+pub error ChaCha20Error {
+  WrongKeySize
+  WrongNonceSize
+  WrongHKeySize
+  WrongHNonceSize
+
+  def message -> Str {
+    case self {
+      WrongKeySize => "chacha20: wrong key size"
+      WrongNonceSize => "chacha20: wrong nonce size"
+      WrongHKeySize => "chacha20: wrong HChaCha20 key size"
+      WrongHNonceSize => "chacha20: wrong HChaCha20 nonce size"
+    }
+  }
+}
+
+def le32(b: [Byte], i: Int) -> U32 {
+  b[i].as_u32 | (b[i + 1].as_u32 << 8) | (b[i + 2].as_u32 << 16) | (b[i + 3].as_u32 << 24)
+}
+
+def put_le32(b: [Byte], i: Int, v: U32) {
+  d = b
+  d[i] = v.as_u8
+  d[i + 1] = (v >> 8).as_u8
+  d[i + 2] = (v >> 16).as_u8
+  d[i + 3] = (v >> 24).as_u8
+  nil
+}
+
+struct State {
+  key: [U32]
+  counter: U32
+  nonce: [U32]
+  # The unused key stream of the last block (its last `len` bytes).
+  buf: [Byte]
+  len: Int
+  # The counter wrapped around: all the key stream has been used.
+  overflow: Bool
+}
+
+# A stateful ChaCha20 or XChaCha20 instance (Go's *Cipher). Copies share
+# the state.
+pub struct Cipher {
+  st: [State]
+
+  # Sets the Cipher counter (the 32-bit block counter). Panics if the
+  # counter would go backwards (Go's rule: the key stream can't be reused).
+  pub def set_counter!(counter: U32) {
+    s = st[0]
+    # Internally, s.counter is the counter of the next block to generate,
+    # and s.len bytes of the current block are still buffered.
+    output_counter = s.counter - (s.len / BLOCK_SIZE).as_u32
+    if s.overflow || counter < output_counter {
+      panic("chacha20: SetCounter attempted to rollback counter")
+    }
+    # In the general case, we set the new counter value and reset s.len to
+    # 0, causing the next call to XORKeyStream to refill the buffer. If
+    # the new counter value is less than s.counter, the buffered key stream
+    # covers it.
+    if counter < s.counter {
+      self.st[0].len = (s.counter - counter).to_i * BLOCK_SIZE
+    } else {
+      self.st[0].counter = counter
+      self.st[0].len = 0
+    }
+    nil
+  }
+
+  # XORs each byte in src with a byte from the key stream into dst. dst
+  # and src must overlap entirely or not at all. Panics if dst is shorter
+  # than src; only dst[0...src.size] changes.
+  pub def xor_key_stream!(dst0: [Byte], src0: [Byte]) {
+    return if src0.size == 0
+    panic("chacha20: output smaller than input") if dst0.size < src0.size
+    dst = dst0[0...src0.size]
+    src = src0
+    s = st[0]
+    # First, drain any remaining key stream from a previous call.
+    if s.len != 0 {
+      ks = s.buf[BUF_SIZE - s.len...BUF_SIZE]
+      ks = ks[0...src.size] if src.size < ks.size
+      i = 0
+      while i < ks.size {
+        dst[i] = src[i] ^ ks[i]
+        i += 1
+      }
+      self.st[0].len = s.len - ks.size
+      dst = dst[ks.size...dst.size]
+      src = src[ks.size...src.size]
+    }
+    return if src.size == 0
+    # If we'd need to let the counter overflow and keep generating output,
+    # panic immediately. If instead we'd only reach the last block, remember
+    # not to generate any more output after the buffer is drained.
+    num_blocks = (src.size + BLOCK_SIZE - 1) / BLOCK_SIZE
+    ctr = st[0].counter.to_i
+    if st[0].overflow || ctr + num_blocks > 1 << 32 {
+      panic("chacha20: counter overflow")
+    } else if ctr + num_blocks == 1 << 32 {
+      self.st[0].overflow = true
+    }
+    full = src.size - src.size % BUF_SIZE
+    if full > 0 {
+      self.xor_blocks!(dst[0...full], src[0...full])
+    }
+    dst = dst[full...dst.size]
+    src = src[full...src.size]
+    # If we have a partial (multi-)block, pad it for xor_blocks, and keep
+    # the leftover key stream for the next call.
+    if src.size > 0 {
+      buf = [0.as_u8; BUF_SIZE]
+      copy(buf, src)
+      self.xor_blocks!(buf, buf)
+      self.st[0].buf = buf
+      self.st[0].len = BUF_SIZE - copy(dst, buf)
+    }
+    nil
+  }
+
+  # Go's xorKeyStreamBlocksGeneric: dst = src ^ key stream, whole blocks.
+  def xor_blocks!(dst: [Byte], src: [Byte]) {
+    panic("chacha20: internal error: wrong dst and/or src length") if dst.size != src.size || dst.size % BLOCK_SIZE != 0
+    s = st[0]
+    c0: U32 = 0x61707865
+    c1: U32 = 0x3320646e
+    c2: U32 = 0x79622d32
+    c3: U32 = 0x6b206574
+    k = s.key
+    c4 = k[0]
+    c5 = k[1]
+    c6 = k[2]
+    c7 = k[3]
+    c8 = k[4]
+    c9 = k[5]
+    c10 = k[6]
+    c11 = k[7]
+    c13 = s.nonce[0]
+    c14 = s.nonce[1]
+    c15 = s.nonce[2]
+    counter = s.counter
+    off = 0
+    while off < src.size {
+      x0 = c0
+      x1 = c1
+      x2 = c2
+      x3 = c3
+      x4 = c4
+      x5 = c5
+      x6 = c6
+      x7 = c7
+      x8 = c8
+      x9 = c9
+      x10 = c10
+      x11 = c11
+      x12 = counter
+      x13 = c13
+      x14 = c14
+      x15 = c15
+      r = 0
+      while r < 10 {
+        x0 = x0 + x4
+        x12 = x12 ^ x0
+        x12 = (x12 << 16) | (x12 >> 16)
+        x8 = x8 + x12
+        x4 = x4 ^ x8
+        x4 = (x4 << 12) | (x4 >> 20)
+        x0 = x0 + x4
+        x12 = x12 ^ x0
+        x12 = (x12 << 8) | (x12 >> 24)
+        x8 = x8 + x12
+        x4 = x4 ^ x8
+        x4 = (x4 << 7) | (x4 >> 25)
+        x1 = x1 + x5
+        x13 = x13 ^ x1
+        x13 = (x13 << 16) | (x13 >> 16)
+        x9 = x9 + x13
+        x5 = x5 ^ x9
+        x5 = (x5 << 12) | (x5 >> 20)
+        x1 = x1 + x5
+        x13 = x13 ^ x1
+        x13 = (x13 << 8) | (x13 >> 24)
+        x9 = x9 + x13
+        x5 = x5 ^ x9
+        x5 = (x5 << 7) | (x5 >> 25)
+        x2 = x2 + x6
+        x14 = x14 ^ x2
+        x14 = (x14 << 16) | (x14 >> 16)
+        x10 = x10 + x14
+        x6 = x6 ^ x10
+        x6 = (x6 << 12) | (x6 >> 20)
+        x2 = x2 + x6
+        x14 = x14 ^ x2
+        x14 = (x14 << 8) | (x14 >> 24)
+        x10 = x10 + x14
+        x6 = x6 ^ x10
+        x6 = (x6 << 7) | (x6 >> 25)
+        x3 = x3 + x7
+        x15 = x15 ^ x3
+        x15 = (x15 << 16) | (x15 >> 16)
+        x11 = x11 + x15
+        x7 = x7 ^ x11
+        x7 = (x7 << 12) | (x7 >> 20)
+        x3 = x3 + x7
+        x15 = x15 ^ x3
+        x15 = (x15 << 8) | (x15 >> 24)
+        x11 = x11 + x15
+        x7 = x7 ^ x11
+        x7 = (x7 << 7) | (x7 >> 25)
+        x0 = x0 + x5
+        x15 = x15 ^ x0
+        x15 = (x15 << 16) | (x15 >> 16)
+        x10 = x10 + x15
+        x5 = x5 ^ x10
+        x5 = (x5 << 12) | (x5 >> 20)
+        x0 = x0 + x5
+        x15 = x15 ^ x0
+        x15 = (x15 << 8) | (x15 >> 24)
+        x10 = x10 + x15
+        x5 = x5 ^ x10
+        x5 = (x5 << 7) | (x5 >> 25)
+        x1 = x1 + x6
+        x12 = x12 ^ x1
+        x12 = (x12 << 16) | (x12 >> 16)
+        x11 = x11 + x12
+        x6 = x6 ^ x11
+        x6 = (x6 << 12) | (x6 >> 20)
+        x1 = x1 + x6
+        x12 = x12 ^ x1
+        x12 = (x12 << 8) | (x12 >> 24)
+        x11 = x11 + x12
+        x6 = x6 ^ x11
+        x6 = (x6 << 7) | (x6 >> 25)
+        x2 = x2 + x7
+        x13 = x13 ^ x2
+        x13 = (x13 << 16) | (x13 >> 16)
+        x8 = x8 + x13
+        x7 = x7 ^ x8
+        x7 = (x7 << 12) | (x7 >> 20)
+        x2 = x2 + x7
+        x13 = x13 ^ x2
+        x13 = (x13 << 8) | (x13 >> 24)
+        x8 = x8 + x13
+        x7 = x7 ^ x8
+        x7 = (x7 << 7) | (x7 >> 25)
+        x3 = x3 + x4
+        x14 = x14 ^ x3
+        x14 = (x14 << 16) | (x14 >> 16)
+        x9 = x9 + x14
+        x4 = x4 ^ x9
+        x4 = (x4 << 12) | (x4 >> 20)
+        x3 = x3 + x4
+        x14 = x14 ^ x3
+        x14 = (x14 << 8) | (x14 >> 24)
+        x9 = x9 + x14
+        x4 = x4 ^ x9
+        x4 = (x4 << 7) | (x4 >> 25)
+        r += 1
+      }
+      # Go's addXor, inlined on 64-byte views (constant indexes)
+      d = dst[off...off + 64]
+      w = src[off...off + 64]
+      v0 = x0 + c0
+      d[0] = w[0] ^ v0.as_u8
+      d[1] = w[1] ^ (v0 >> 8).as_u8
+      d[2] = w[2] ^ (v0 >> 16).as_u8
+      d[3] = w[3] ^ (v0 >> 24).as_u8
+      v1 = x1 + c1
+      d[4] = w[4] ^ v1.as_u8
+      d[5] = w[5] ^ (v1 >> 8).as_u8
+      d[6] = w[6] ^ (v1 >> 16).as_u8
+      d[7] = w[7] ^ (v1 >> 24).as_u8
+      v2 = x2 + c2
+      d[8] = w[8] ^ v2.as_u8
+      d[9] = w[9] ^ (v2 >> 8).as_u8
+      d[10] = w[10] ^ (v2 >> 16).as_u8
+      d[11] = w[11] ^ (v2 >> 24).as_u8
+      v3 = x3 + c3
+      d[12] = w[12] ^ v3.as_u8
+      d[13] = w[13] ^ (v3 >> 8).as_u8
+      d[14] = w[14] ^ (v3 >> 16).as_u8
+      d[15] = w[15] ^ (v3 >> 24).as_u8
+      v4 = x4 + c4
+      d[16] = w[16] ^ v4.as_u8
+      d[17] = w[17] ^ (v4 >> 8).as_u8
+      d[18] = w[18] ^ (v4 >> 16).as_u8
+      d[19] = w[19] ^ (v4 >> 24).as_u8
+      v5 = x5 + c5
+      d[20] = w[20] ^ v5.as_u8
+      d[21] = w[21] ^ (v5 >> 8).as_u8
+      d[22] = w[22] ^ (v5 >> 16).as_u8
+      d[23] = w[23] ^ (v5 >> 24).as_u8
+      v6 = x6 + c6
+      d[24] = w[24] ^ v6.as_u8
+      d[25] = w[25] ^ (v6 >> 8).as_u8
+      d[26] = w[26] ^ (v6 >> 16).as_u8
+      d[27] = w[27] ^ (v6 >> 24).as_u8
+      v7 = x7 + c7
+      d[28] = w[28] ^ v7.as_u8
+      d[29] = w[29] ^ (v7 >> 8).as_u8
+      d[30] = w[30] ^ (v7 >> 16).as_u8
+      d[31] = w[31] ^ (v7 >> 24).as_u8
+      v8 = x8 + c8
+      d[32] = w[32] ^ v8.as_u8
+      d[33] = w[33] ^ (v8 >> 8).as_u8
+      d[34] = w[34] ^ (v8 >> 16).as_u8
+      d[35] = w[35] ^ (v8 >> 24).as_u8
+      v9 = x9 + c9
+      d[36] = w[36] ^ v9.as_u8
+      d[37] = w[37] ^ (v9 >> 8).as_u8
+      d[38] = w[38] ^ (v9 >> 16).as_u8
+      d[39] = w[39] ^ (v9 >> 24).as_u8
+      v10 = x10 + c10
+      d[40] = w[40] ^ v10.as_u8
+      d[41] = w[41] ^ (v10 >> 8).as_u8
+      d[42] = w[42] ^ (v10 >> 16).as_u8
+      d[43] = w[43] ^ (v10 >> 24).as_u8
+      v11 = x11 + c11
+      d[44] = w[44] ^ v11.as_u8
+      d[45] = w[45] ^ (v11 >> 8).as_u8
+      d[46] = w[46] ^ (v11 >> 16).as_u8
+      d[47] = w[47] ^ (v11 >> 24).as_u8
+      v12 = x12 + counter
+      d[48] = w[48] ^ v12.as_u8
+      d[49] = w[49] ^ (v12 >> 8).as_u8
+      d[50] = w[50] ^ (v12 >> 16).as_u8
+      d[51] = w[51] ^ (v12 >> 24).as_u8
+      v13 = x13 + c13
+      d[52] = w[52] ^ v13.as_u8
+      d[53] = w[53] ^ (v13 >> 8).as_u8
+      d[54] = w[54] ^ (v13 >> 16).as_u8
+      d[55] = w[55] ^ (v13 >> 24).as_u8
+      v14 = x14 + c14
+      d[56] = w[56] ^ v14.as_u8
+      d[57] = w[57] ^ (v14 >> 8).as_u8
+      d[58] = w[58] ^ (v14 >> 16).as_u8
+      d[59] = w[59] ^ (v14 >> 24).as_u8
+      v15 = x15 + c15
+      d[60] = w[60] ^ v15.as_u8
+      d[61] = w[61] ^ (v15 >> 8).as_u8
+      d[62] = w[62] ^ (v15 >> 16).as_u8
+      d[63] = w[63] ^ (v15 >> 24).as_u8
+      counter += 1
+      off += 64
+    }
+    self.st[0].counter = counter
+    nil
+  }
+}
+
+# A new ChaCha20 stream cipher with the given 32-byte key and a 12-byte
+# (ChaCha20) or 24-byte (XChaCha20) nonce. It doesn't authenticate: use
+# chacha20poly1305 for that. Go's NewUnauthenticatedCipher.
+pub def new_unauthenticated_cipher(key0: [Byte], nonce0: [Byte]) -> ~Cipher<ChaCha20Error> {
+  fail ChaCha20Error.WrongKeySize if key0.size != KEY_SIZE
+  key = key0
+  nonce = nonce0
+  if nonce.size == NONCE_SIZE_X {
+    # XChaCha20 uses the ChaCha20 core to mix 16 bytes of the nonce into a
+    # new key, then uses the remaining 8 bytes as the last 8 bytes of the
+    # ChaCha20 nonce.
+    hn = nonce0[0...16]
+    key = ~hchacha20(key0, hn)
+    c_nonce = [0.as_u8; NONCE_SIZE]
+    copy(c_nonce[4...12], nonce0[16...24])
+    nonce = c_nonce
+  } else if nonce.size != NONCE_SIZE {
+    fail ChaCha20Error.WrongNonceSize
+  }
+  ks: [U32] = [0; 8]
+  i = 0
+  while i < 8 {
+    ks[i] = le32(key, 4 * i)
+    i += 1
+  }
+  ns: [U32] = [le32(nonce, 0), le32(nonce, 4), le32(nonce, 8)]
+  Cipher.new(st: [State.new(key: ks, nonce: ns, buf: [0.as_u8; BUF_SIZE])])
+}
+
+# Go's HChaCha20: the ChaCha20 core on a 32-byte key and a 16-byte nonce,
+# as used by XChaCha20 to derive a subkey. Unlike the ChaCha20 block, the
+# input isn't added back.
+pub def hchacha20(key: [Byte], nonce: [Byte]) -> ~[Byte]<ChaCha20Error> {
+  fail ChaCha20Error.WrongHKeySize if key.size != KEY_SIZE
+  fail ChaCha20Error.WrongHNonceSize if nonce.size != 16
+  x0: U32 = 0x61707865
+  x1: U32 = 0x3320646e
+  x2: U32 = 0x79622d32
+  x3: U32 = 0x6b206574
+  x4 = le32(key, 0)
+  x5 = le32(key, 4)
+  x6 = le32(key, 8)
+  x7 = le32(key, 12)
+  x8 = le32(key, 16)
+  x9 = le32(key, 20)
+  x10 = le32(key, 24)
+  x11 = le32(key, 28)
+  x12 = le32(nonce, 0)
+  x13 = le32(nonce, 4)
+  x14 = le32(nonce, 8)
+  x15 = le32(nonce, 12)
+  r = 0
+  while r < 10 {
+    x0 = x0 + x4
+    x12 = x12 ^ x0
+    x12 = (x12 << 16) | (x12 >> 16)
+    x8 = x8 + x12
+    x4 = x4 ^ x8
+    x4 = (x4 << 12) | (x4 >> 20)
+    x0 = x0 + x4
+    x12 = x12 ^ x0
+    x12 = (x12 << 8) | (x12 >> 24)
+    x8 = x8 + x12
+    x4 = x4 ^ x8
+    x4 = (x4 << 7) | (x4 >> 25)
+    x1 = x1 + x5
+    x13 = x13 ^ x1
+    x13 = (x13 << 16) | (x13 >> 16)
+    x9 = x9 + x13
+    x5 = x5 ^ x9
+    x5 = (x5 << 12) | (x5 >> 20)
+    x1 = x1 + x5
+    x13 = x13 ^ x1
+    x13 = (x13 << 8) | (x13 >> 24)
+    x9 = x9 + x13
+    x5 = x5 ^ x9
+    x5 = (x5 << 7) | (x5 >> 25)
+    x2 = x2 + x6
+    x14 = x14 ^ x2
+    x14 = (x14 << 16) | (x14 >> 16)
+    x10 = x10 + x14
+    x6 = x6 ^ x10
+    x6 = (x6 << 12) | (x6 >> 20)
+    x2 = x2 + x6
+    x14 = x14 ^ x2
+    x14 = (x14 << 8) | (x14 >> 24)
+    x10 = x10 + x14
+    x6 = x6 ^ x10
+    x6 = (x6 << 7) | (x6 >> 25)
+    x3 = x3 + x7
+    x15 = x15 ^ x3
+    x15 = (x15 << 16) | (x15 >> 16)
+    x11 = x11 + x15
+    x7 = x7 ^ x11
+    x7 = (x7 << 12) | (x7 >> 20)
+    x3 = x3 + x7
+    x15 = x15 ^ x3
+    x15 = (x15 << 8) | (x15 >> 24)
+    x11 = x11 + x15
+    x7 = x7 ^ x11
+    x7 = (x7 << 7) | (x7 >> 25)
+    x0 = x0 + x5
+    x15 = x15 ^ x0
+    x15 = (x15 << 16) | (x15 >> 16)
+    x10 = x10 + x15
+    x5 = x5 ^ x10
+    x5 = (x5 << 12) | (x5 >> 20)
+    x0 = x0 + x5
+    x15 = x15 ^ x0
+    x15 = (x15 << 8) | (x15 >> 24)
+    x10 = x10 + x15
+    x5 = x5 ^ x10
+    x5 = (x5 << 7) | (x5 >> 25)
+    x1 = x1 + x6
+    x12 = x12 ^ x1
+    x12 = (x12 << 16) | (x12 >> 16)
+    x11 = x11 + x12
+    x6 = x6 ^ x11
+    x6 = (x6 << 12) | (x6 >> 20)
+    x1 = x1 + x6
+    x12 = x12 ^ x1
+    x12 = (x12 << 8) | (x12 >> 24)
+    x11 = x11 + x12
+    x6 = x6 ^ x11
+    x6 = (x6 << 7) | (x6 >> 25)
+    x2 = x2 + x7
+    x13 = x13 ^ x2
+    x13 = (x13 << 16) | (x13 >> 16)
+    x8 = x8 + x13
+    x7 = x7 ^ x8
+    x7 = (x7 << 12) | (x7 >> 20)
+    x2 = x2 + x7
+    x13 = x13 ^ x2
+    x13 = (x13 << 8) | (x13 >> 24)
+    x8 = x8 + x13
+    x7 = x7 ^ x8
+    x7 = (x7 << 7) | (x7 >> 25)
+    x3 = x3 + x4
+    x14 = x14 ^ x3
+    x14 = (x14 << 16) | (x14 >> 16)
+    x9 = x9 + x14
+    x4 = x4 ^ x9
+    x4 = (x4 << 12) | (x4 >> 20)
+    x3 = x3 + x4
+    x14 = x14 ^ x3
+    x14 = (x14 << 8) | (x14 >> 24)
+    x9 = x9 + x14
+    x4 = x4 ^ x9
+    x4 = (x4 << 7) | (x4 >> 25)
+    r += 1
+  }
+  out = [0.as_u8; 32]
+  put_le32(out, 0, x0)
+  put_le32(out, 4, x1)
+  put_le32(out, 8, x2)
+  put_le32(out, 12, x3)
+  put_le32(out, 16, x12)
+  put_le32(out, 20, x13)
+  put_le32(out, 24, x14)
+  put_le32(out, 28, x15)
+  out
+}
+
+# A Cipher is a cipher.Stream.
+def as_stream(c: Cipher) -> cipher.Stream { c }

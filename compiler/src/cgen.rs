@@ -4,7 +4,25 @@ use crate::lir::*;
 use std::collections::HashSet;
 use std::fmt::Write;
 
+/// The C name of a type. Names spell the layout (`Tup2_I64_Str`); a long
+/// one (a struct with dozens of fields, nested) becomes `Ty_<hash>`, so a
+/// big program's C doesn't grow lines of a megabyte (crypto/tls's tests
+/// made 200 MB of C that clang took over half an hour on).
 pub fn ty_name(t: &LTy) -> String {
+    let n = ty_name_full(t);
+    if n.len() <= 96 {
+        return n;
+    }
+    // FNV-1a, 64 bits: stable across runs and backends.
+    let mut h: u64 = 0xcbf29ce484222325;
+    for b in n.bytes() {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    format!("Ty_{h:016x}")
+}
+
+fn ty_name_full(t: &LTy) -> String {
     match t {
         LTy::Region => "Region".into(),
         LTy::Task(t) => format!("Task_{}", ty_name(t)),
@@ -24,6 +42,21 @@ pub fn ty_name(t: &LTy) -> String {
         LTy::Tup(ts) => format!("Tup{}_{}", ts.len(), ts.iter().map(ty_name).collect::<Vec<_>>().join("_")),
         LTy::Range => "Range".into(),
         LTy::Gen(t) => format!("Gen_{}", ty_name(t)),
+    }
+}
+
+/// Is this value all-zero bytes in C, or equivalent to them (so a
+/// designated initialiser may leave it out)? An empty string is: a zeroed
+/// AlxStr (null pointer, length 0) already stands for "" in every
+/// zero-initialised local.
+fn c_zero(e: &LE) -> bool {
+    match e {
+        LE::I(0) | LE::B(false) | LE::Unit => true,
+        LE::S(s) => s.is_empty(),
+        LE::F(f) => *f == 0.0 && f.is_sign_positive(),
+        LE::ArrWithCap(_, n) => matches!(**n, LE::I(0)),
+        LE::Tup(_, vs) => vs.iter().all(c_zero),
+        _ => false,
     }
 }
 
@@ -751,6 +784,14 @@ impl FnEmit<'_> {
             LE::Tup(t, vs) => {
                 // A literal's type may be held by no variable (`Zero[T].new.v`).
                 LITERAL_TYPES.with(|l| l.borrow_mut().push(t.clone()));
+                // Fields whose value is all-zero bytes are left to C's zero
+                // fill: a closure or sum value names one live variant, and
+                // spelling every other variant's zero payload made lines of
+                // tens of kilobytes (crypto/tls's builders).
+                if vs.iter().any(c_zero) {
+                    let parts: Vec<String> = vs.iter().enumerate().filter(|(_, x)| !c_zero(x)).map(|(k, x)| format!(".f{k} = {}", self.e(x))).collect();
+                    return format!("(({}){{{}}})", cty(t), parts.join(", "));
+                }
                 format!("(({}){{{}}})", cty(t), vs.iter().map(|x| self.e(x)).collect::<Vec<_>>().join(", "))
             }
             LE::Field(x, i) => format!("({}).f{i}", self.e(x)),

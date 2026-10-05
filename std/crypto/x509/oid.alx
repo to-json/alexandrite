@@ -1,0 +1,242 @@
+# Go's x509.OID (oid.go): an ASN.1 OBJECT IDENTIFIER of any size, kept in
+# its DER form (encoding/asn1's ObjectIdentifier is limited to 31-bit
+# arcs).
+
+import "encoding/asn1"
+import "math/big"
+import "strings"
+
+# An ASN.1 OBJECT IDENTIFIER.
+pub struct OID {
+  der: [Byte]
+
+  # The DER contents (Go's MarshalBinary / AppendBinary).
+  pub def marshal_binary -> [Byte] { der + [] }
+
+  # The dotted form (Go's MarshalText).
+  pub def marshal_text -> [Byte] { self.to_s.bytes }
+
+  # Whether the OIDs are the same.
+  pub def equal?(other: OID) -> Bool { der == other.der }
+
+  # Whether the OID equals an encoding/asn1 ObjectIdentifier.
+  pub def equal_asn1_oid?(other: asn1.ObjectIdentifier) -> Bool {
+    o = other.arcs
+    return false if o.size < 2
+    r = oid_parse_base128_int(der, 0)
+    return false if r.none?
+    v, offset0 = r || (0, 0)
+    offset = offset0
+    if v < 80 {
+      return false if o[0] != v / 40 || o[1] != v % 40
+    } else {
+      return false if o[0] != 2 || o[1] != v - 80
+    }
+    i = 2
+    while offset < der.size {
+      r2 = oid_parse_base128_int(der, offset)
+      return false if r2.none?
+      w, o2 = r2 || (0, 0)
+      offset = o2
+      return false if i >= o.size || w != o[i]
+      i += 1
+    }
+    i == o.size
+  }
+
+  # The dotted form ("1.2.840.113549"), of any size.
+  pub def to_s -> Str {
+    b = ""
+    start = 0
+    val = big.Int.new
+    i = 0
+    while i < der.size {
+      v = der[i]
+      cur_val = (v & 0x7f).to_i
+      val_end = v & 0x80 == 0
+      b = b + "." if val_end && start != 0
+      val.lsh!(val, 7)
+      val.or!(val, big.new_int(cur_val))
+      if val_end {
+        if start == 0 {
+          if val.cmp(big.new_int(80)) < 0 {
+            x = val.int64
+            b = b + "#{x / 40}.#{x % 40}"
+          } else {
+            val.sub!(val, big.new_int(80))
+            b = b + "2." + val.to_s
+          }
+        } else {
+          b = b + val.to_s
+        }
+        val = big.Int.new
+        start = i + 1
+      }
+      i += 1
+    }
+    b
+  }
+  pub def string -> Str { self.to_s }
+
+  # The OID as an encoding/asn1 ObjectIdentifier, if its arcs fit 31 bits.
+  pub def to_asn1_oid -> asn1.ObjectIdentifier? {
+    out: [Int] = []
+    max_val_safe_shift = (1 << (31 - 7)) - 1
+    val = 0
+    for v in der {
+      return none if val > max_val_safe_shift
+      val = (val << 7) | (v & 0x7f).to_i
+      if v & 0x80 == 0 {
+        if out.size == 0 {
+          if val < 80 {
+            out << val / 40
+            out << val % 40
+          } else {
+            out << 2
+            out << val - 80
+          }
+          val = 0
+          next
+        }
+        out << val
+        val = 0
+      }
+    }
+    asn1.oid(out)
+  }
+}
+
+# Parses a dotted OID ("1.2.3"), any size.
+pub def parse_oid(oid: Str) -> ~OID<X509Error> {
+  for c in oid.bytes {
+    fail err("invalid oid") if !((c >= 48 && c <= 57) || c == 46)
+  }
+  parts = oid.split(".")
+  fail err("invalid oid") if parts.size < 2
+  first = big.Int.new
+  second = big.Int.new
+  fail err("invalid oid") if first.set_string!(parts[0], 10).none?
+  fail err("invalid oid") if second.set_string!(parts[1], 10).none?
+  two = big.new_int(2)
+  if first.cmp(two) > 0 || (first.cmp(two) < 0 && second.cmp(big.new_int(40)) >= 0) {
+    fail err("invalid oid")
+  }
+  first_component = big.Int.new
+  first_component.mul!(first, big.new_int(40))
+  first_component.add!(first_component, second)
+  der = append_base128_big_int([], first_component)
+  i = 2
+  while i < parts.size {
+    b = big.Int.new
+    fail err("invalid oid") if b.set_string!(parts[i], 10).none?
+    der = append_base128_big_int(der, b)
+    i += 1
+  }
+  OID.new(der: der)
+}
+
+# Go's newOIDFromDER: an OID from its DER contents, if minimally encoded.
+pub def new_oid_from_der(der: [Byte]) -> OID? {
+  return none if der.size == 0 || der[der.size - 1] & 0x80 != 0
+  start = 0
+  i = 0
+  while i < der.size {
+    v = der[i]
+    # ITU-T X.690, section 8.19.2:
+    # The subidentifier shall be encoded in the fewest possible octets,
+    # that is, the leading octet of the subidentifier shall not have the
+    # value 0x80.
+    return none if i == start && v == 0x80
+    start = i + 1 if v & 0x80 == 0
+    i += 1
+  }
+  OID.new(der: der + [])
+}
+
+# An OID from its arcs (Go's OIDFromInts).
+pub def oid_from_ints(oid: [U64]) -> ~OID<X509Error> {
+  if oid.size < 2 || oid[0] > 2 || (oid[0] < 2 && oid[1] >= 40) {
+    fail err("invalid oid")
+  }
+  der = append_base128_u64([], oid[0] * 40 + oid[1])
+  for v in oid[2...oid.size] {
+    der = append_base128_u64(der, v)
+  }
+  OID.new(der: der)
+}
+
+# An OID from an encoding/asn1 ObjectIdentifier.
+pub def oid_from_asn1_oid(oid: asn1.ObjectIdentifier) -> ~OID<X509Error> {
+  u: [U64] = []
+  for c in oid.arcs {
+    fail err("x509: OID components must be non-negative") if c < 0
+    u << c.to_u64
+  }
+  ~oid_from_ints(u)
+}
+
+# Go's OID.UnmarshalBinary.
+pub def oid_from_binary(b: [Byte]) -> ~OID<X509Error> { ~need(new_oid_from_der(b), "invalid oid") }
+
+def base128_u64_length(n: U64) -> Int {
+  return 1 if n == 0
+  l = 0
+  x = n
+  while x > 0 {
+    l += 1
+    x = x >> 7
+  }
+  l
+}
+
+def append_base128_u64(dst: [Byte], n: U64) -> [Byte] {
+  out = dst
+  i = base128_u64_length(n) - 1
+  while i >= 0 {
+    o = (n >> (i * 7)).as_u8 & 0x7f
+    o = o | 0x80 if i != 0
+    out << o
+    i -= 1
+  }
+  out
+}
+
+def append_base128_big_int(dst: [Byte], n: big.Int) -> [Byte] {
+  out = dst
+  if n.sign == 0 {
+    out << 0
+    return out
+  }
+  l = (n.bit_len + 6) / 7
+  i = l - 1
+  while i >= 0 {
+    t = big.Int.new
+    t.rsh!(n, i * 7)
+    o = (t.uint64 & 0x7f).as_u8
+    o = o | 0x80 if i != 0
+    out << o
+    i -= 1
+  }
+  out
+}
+
+# Go's (x509) parseBase128Int: the value and the offset after it, or none.
+def oid_parse_base128_int(bytes: [Byte], init_offset: Int) -> (Int, Int)? {
+  offset = init_offset
+  ret64 = 0
+  shifted = 0
+  while offset < bytes.size {
+    return none if shifted == 5
+    ret64 = ret64 << 7
+    b = bytes[offset]
+    return none if shifted == 0 && b == 0x80
+    ret64 = ret64 | (b & 0x7f).to_i
+    offset += 1
+    if b & 0x80 == 0 {
+      return none if ret64 > 2147483647
+      return (ret64, offset)
+    }
+    shifted += 1
+  }
+  none
+}

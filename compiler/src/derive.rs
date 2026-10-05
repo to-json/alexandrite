@@ -52,6 +52,8 @@ pub struct Opts {
     pub dskip: bool,
     /// Every `key: "value"` of `#[field(...)]`, in order.
     pub tags: Vec<(String, String)>,
+    /// derive(Asn1): `asn1: "optional,explicit,tag:0"` (or `#[asn1(...)]`).
+    pub asn1: crate::derive_asn1::A1,
 }
 
 impl Opts {
@@ -65,7 +67,7 @@ impl Opts {
 /// `data(...)` or `field(...)`.
 pub fn is_field_attr(text: &str) -> bool {
     let t = text.trim_start();
-    ["json", "data", "field"].iter().any(|k| t.strip_prefix(k).is_some_and(|r| r.trim_start().starts_with('(')))
+    ["json", "data", "asn1", "field"].iter().any(|k| t.strip_prefix(k).is_some_and(|r| r.trim_start().starts_with('(')))
 }
 
 /// Apply one field-options attribute (`#[json(...)]`, `#[data(...)]`,
@@ -77,6 +79,9 @@ pub fn apply_field_attr(text: &str, sp: Span, o: &mut Opts) -> Result<(), Diag> 
     }
     if t.starts_with("data") {
         return apply_data_attr(text, sp, o);
+    }
+    if t.starts_with("asn1") {
+        return crate::derive_asn1::apply_asn1_attr(text, sp, &mut o.asn1);
     }
     let inner = t.strip_prefix("field").map(str::trim_start).and_then(|r| r.strip_prefix('(')).and_then(|r| r.trim_end().strip_suffix(')'));
     let Some(inner) = inner else {
@@ -103,6 +108,7 @@ pub fn apply_field_attr(text: &str, sp: Span, o: &mut Opts) -> Result<(), Diag> 
         match k {
             "json" => apply_json_tag(&v, sp, o)?,
             "data" => apply_data_tag(&v, o),
+            "asn1" => crate::derive_asn1::apply_asn1_attr(&format!("asn1({v})"), sp, &mut o.asn1)?,
             _ => {}
         }
         o.tags.push((k.to_string(), v));
@@ -280,8 +286,8 @@ pub fn derive_names(text: &str, sp: Span) -> Result<Option<Vec<String>>, Diag> {
     let names: Vec<String> = inner.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
     for n in &names {
         // Eq and Show are structural already (D13, D14): accepted, nothing to generate.
-        if !matches!(n.as_str(), "Json" | "Data" | "Gob" | "Xml" | "Arbitrary" | "Row" | "Eq" | "Show") {
-            return Err(Diag::new(sp, format!("can't derive `{n}`")).note("derivable: Json (generates to_json / from_json), Data (a dynamic dyn.Value tree: to_data / from_data), Xml (encoding/xml: to_xml / from_xml and the Marshal protocol), Arbitrary (generates `self.arbitrary` for testing/quick), Row (database/sql: `Type.from_sql_row`); Eq and Show are accepted and need nothing: structs, tuples and enums already compare and print field by field"));
+        if !matches!(n.as_str(), "Json" | "Asn1" | "Data" | "Gob" | "Xml" | "Arbitrary" | "Row" | "Eq" | "Show") {
+            return Err(Diag::new(sp, format!("can't derive `{n}`")).note("derivable: Json (generates to_json / from_json), Asn1 (encoding/asn1: to_asn1 / from_asn1), Data (a dynamic dyn.Value tree: to_data / from_data), Xml (encoding/xml: to_xml / from_xml and the Marshal protocol), Arbitrary (generates `self.arbitrary` for testing/quick), Row (database/sql: `Type.from_sql_row`); Eq and Show are accepted and need nothing: structs, tuples and enums already compare and print field by field"));
         }
     }
     Ok(Some(names))
@@ -310,8 +316,10 @@ pub enum DShape {
 
 #[derive(Clone, Debug)]
 pub struct DeriveJob {
-    /// `Json`, `Arbitrary` or `Row`.
+    /// `Json`, `Asn1`, `Arbitrary` or `Row`.
     pub derive: String,
+    /// Type-level `#[asn1(set)]` / `#[asn1(transparent)]` (derive(Asn1)).
+    pub type_opts: crate::derive_asn1::A1,
     pub name: String,
     /// `#[data("pkg.T")]`: the Go type name consumers see (json/v2 errors).
     pub go_name: Option<String>,

@@ -1,0 +1,377 @@
+# Go's tls_test.go (the tests that don't need the external network,
+# deadlines, reflection on Config, ECH, QUIC, FIPS or crypto.Signer
+# wrappers), and handshake_test.go's key update test.
+
+import "net"
+import "os"
+import "strings"
+import "time"
+
+def read_all(c: Conn) -> ~[Byte] {
+  cc = c
+  out: [Byte] = []
+  buf = [0.as_u8; 4096]
+  loop {
+    n = cc.~read!(buf)
+    break if n == 0
+    out = out + buf[0...n]
+  }
+  out
+}
+
+test "VersionName" {
+  assert_eq version_name(VERSION_TLS13), "TLS 1.3"
+  assert_eq version_name(0x12a), "0x012A"
+}
+
+def http2_bad_cipher?(id: U16) -> Bool {
+  [TLS_RSA_WITH_RC4_128_SHA, TLS_RSA_WITH_3DES_EDE_CBC_SHA, TLS_RSA_WITH_AES_128_CBC_SHA, TLS_RSA_WITH_AES_256_CBC_SHA, TLS_RSA_WITH_AES_128_CBC_SHA256, TLS_RSA_WITH_AES_128_GCM_SHA256, TLS_RSA_WITH_AES_256_GCM_SHA384, TLS_ECDHE_ECDSA_WITH_RC4_128_SHA, TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA, TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA, TLS_ECDHE_RSA_WITH_RC4_128_SHA, TLS_ECDHE_RSA_WITH_3DES_EDE_CBC_SHA, TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA, TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA, TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA256, TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA256].include?(id)
+}
+
+def public_suite(id: U16) -> CipherSuite? {
+  for c in cipher_suites() + insecure_cipher_suites() {
+    return c if c.id == id
+  }
+  none
+}
+
+test "CipherSuites" {
+  last: U16 = 0
+  for c in cipher_suites() {
+    assert last <= c.id, "CipherSuites are not ordered by ID"
+    last = c.id
+    assert !c.insecure
+  }
+  last = 0
+  for c in insecure_cipher_suites() {
+    assert last <= c.id, "InsecureCipherSuites are not ordered by ID"
+    last = c.id
+    assert c.insecure
+  }
+  for s in cipher_suite_impls() {
+    cc = public_suite(s.id) || CipherSuite.new
+    assert cc.id == s.id, "no CipherSuite entry"
+    if s.flags & SUITE_TLS12 != 0 {
+      assert_eq cc.supported_versions.size, 1
+    } else {
+      assert_eq cc.supported_versions.size, 3
+    }
+    assert default_cipher_suites(false).include?(s.id) == !cc.insecure, cc.name
+    assert_eq cipher_suite_name(s.id), cc.name
+  }
+  for s in cipher_suites_tls13() {
+    cc = public_suite(s.id) || CipherSuite.new
+    assert !cc.insecure
+    assert_eq cc.supported_versions, [VERSION_TLS13]
+    assert_eq cipher_suite_name(s.id), cc.name
+  }
+  assert_eq cipher_suite_name(0xabc), "0x0ABC"
+  assert_eq cipher_suites_preference_order().size, cipher_suite_impls().size
+  assert_eq cipher_suites_preference_order_no_aes().size, cipher_suites_preference_order().size
+  for order in [cipher_suites_preference_order(), cipher_suites_preference_order_no_aes()] {
+    saw_insecure = false
+    saw_bad = false
+    for id in order {
+      c = public_suite(id) || CipherSuite.new
+      if c.insecure {
+        saw_insecure = true
+      } else {
+        assert !saw_insecure, "secure suite after insecure one(s)"
+      }
+      if http2_bad_cipher?(id) {
+        saw_bad = true
+      } else {
+        assert !saw_bad, "non-bad suite after bad HTTP/2 one(s)"
+      }
+      assert !disabled_cipher_suite?(id) || c.insecure, "disabled by default but not marked insecure"
+    }
+  }
+}
+
+test "TLSUniqueMatches" {
+  ln = net.listen("tcp", "127.0.0.1:0").unwrap
+  addr = "127.0.0.1:#{ln.port}"
+  sc = test_config_server()
+  sc.max_version = VERSION_TLS12
+  sc.prepare!
+  uniques = Chan[[Byte]].new(2)
+  task = spawn {
+    i = 0
+    while i < 2 {
+      sconn = ln.accept.unwrap
+      srv = server(sconn, sc.dup)
+      srv.handshake!.unwrap
+      uniques << srv.connection_state.tls_unique.dup
+      i += 1
+    }
+    nil
+  }
+  cc = test_config_client()
+  cc.client_session_cache = new_lru_client_session_cache(1)
+  conn = dial("tcp", addr, cc).unwrap
+  sv = uniques.recv || []
+  assert conn.connection_state.tls_unique == sv, "client and server channel bindings differ"
+  assert sv.size == 12 && sv != [0.as_u8; 12], "tls-unique is empty or zero"
+  conn.close!
+  conn2 = dial("tcp", addr, cc).unwrap
+  assert conn2.connection_state.did_resume, "second session did not use resumption"
+  sv2 = uniques.recv || []
+  assert conn2.connection_state.tls_unique == sv2, "client and server channel bindings differ when session resumption is used"
+  assert sv2.size == 12 && sv2 != [0.as_u8; 12], "resumption tls-unique is empty or zero"
+  conn2.close!
+  task.wait
+  ln.close!
+}
+
+# Go's testResumption (the parts that don't reach into the cache's
+# internals).
+def resumption_test(version: U16) {
+  sc = Config.new(max_version: version, cipher_suites: [TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256, TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384], certificates: [test_cert("rsa2048")], time: ->() -> time.Time { test_time() })
+  sc.prepare!
+  cc = Config.new(max_version: version, cipher_suites: [TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256], client_session_cache: new_lru_client_session_cache(32), root_cas: test_pool("root"), server_name: "test.golang.example", time: ->() -> time.Time { test_time() })
+  check = ->(name: Str, did_resume: Bool) {
+    r = test_handshake(cc, sc)
+    assert r.ok?, name + ": handshake failed: " + (r.err?.message || "")
+    _, cs = r.unwrap
+    assert cs.did_resume == did_resume, name + " resumed: #{cs.did_resume}"
+    assert cs.peer_certificates.size > 0 && cs.verified_chains.size > 0, name if did_resume
+    assert_eq cs.server_name, "test.golang.example"
+  }
+  check.call("Handshake", false)
+  check.call("Resume", true)
+  # A server with tickets disabled doesn't resume.
+  sd = sc
+  sd.session_tickets_disabled = true
+  r = test_handshake(cc, sd)
+  assert !r.unwrap[1].did_resume, "resumed with tickets disabled"
+  # New ticket keys invalidate the old tickets.
+  sk = sc.dup
+  sk.shared = none
+  sk.set_session_ticket_keys!([[7.as_u8; 32]])
+  r2 = test_handshake(cc, sk)
+  assert !r2.unwrap[1].did_resume, "resumed with different ticket keys"
+  r3 = test_handshake(cc, sk)
+  assert r3.unwrap[1].did_resume, "didn't resume with the new keys"
+}
+
+test "Resumption" {
+  resumption_test(VERSION_TLS12)
+  resumption_test(VERSION_TLS13)
+}
+
+test "LRUClientSessionCache" {
+  c = new_lru_client_session_cache(4)
+  css = [ClientSessionState.new(session: SessionState.new(ticket: [0])), ClientSessionState.new(session: SessionState.new(ticket: [1])), ClientSessionState.new(session: SessionState.new(ticket: [2])), ClientSessionState.new(session: SessionState.new(ticket: [3])), ClientSessionState.new(session: SessionState.new(ticket: [4])), ClientSessionState.new(session: SessionState.new(ticket: [5]))]
+  keys = ["0", "1", "2", "3", "4", "5", "6"]
+  # Add 4 entries in order.
+  i = 0
+  while i < 4 {
+    c.put(keys[i], css[i])
+    i += 1
+  }
+  i = 0
+  while i < 4 {
+    assert_eq (c.get(keys[i]) || ClientSessionState.new).session.ticket, [i.as_u8]
+    i += 1
+  }
+  # Add 4 more: the first 4 are evicted.
+  while i < 6 {
+    c.put(keys[i], css[i])
+    i += 1
+  }
+  assert c.get(keys[0]).none? && c.get(keys[1]).none?, "evicted"
+  assert c.get(keys[4]).some? && c.get(keys[5]).some?
+  # Overwrite and remove.
+  c.put(keys[4], css[0])
+  assert_eq (c.get(keys[4]) || ClientSessionState.new).session.ticket, [0.as_u8]
+  c.put(keys[4], none)
+  assert c.get(keys[4]).none?, "session not removed"
+}
+
+struct LogWriter {
+  m: Mutex[[Byte]]
+
+  def write!(p: [Byte]) -> ~Int {
+    m.lock { |b| b = b + p }
+    p.size
+  }
+}
+
+def keylog_test(version: U16) {
+  cw = LogWriter.new(m: Mutex.new([]))
+  sw = LogWriter.new(m: Mutex.new([]))
+  cc = test_config_client()
+  cc.key_log_writer = ->(p: [Byte]) -> ~Int {
+    w = cw
+    w.~write!(p)
+  }
+  sc = test_config_server()
+  sc.key_log_writer = ->(p: [Byte]) -> ~Int {
+    w = sw
+    w.~write!(p)
+  }
+  sc.max_version = version
+  test_handshake(cc, sc).unwrap
+  cl = Str.from_bytes(cw.m.lock { |b| b.dup })
+  sl = Str.from_bytes(sw.m.lock { |b| b.dup })
+  assert cl == sl, "client and server key logs differ"
+  lines = cl.split("\n").select { it != "" }.to_a
+  if version == VERSION_TLS12 {
+    assert_eq lines.size, 1
+    assert lines[0].start_with?("CLIENT_RANDOM ")
+    assert_eq lines[0].size, 14 + 64 + 1 + 96
+  } else {
+    assert_eq lines.size, 4
+    for l in lines {
+      parts = l.split(" ")
+      assert_eq parts.size, 3
+      assert_eq parts[1].size, 64
+    }
+  }
+}
+
+test "KeyLogTLS12" { keylog_test(VERSION_TLS12) }
+
+test "KeyLogTLS13" { keylog_test(VERSION_TLS13) }
+
+test "ConnCloseWrite" {
+  ln = net.listen("tcp", "127.0.0.1:0").unwrap
+  addr = "127.0.0.1:#{ln.port}"
+  sc = test_config_server()
+  done = Chan[Bool].new(1)
+  task = spawn {
+    sconn = ln.accept.unwrap
+    srv = server(sconn, sc)
+    srv.handshake!.unwrap
+    data = read_all(srv).unwrap
+    out = data.size > 0 ? "Read data; want nothing" : ""
+    w = srv.close_write!
+    out = "server CloseWrite: " + (w.err?.message || "") if !w.ok?
+    done.recv
+    srv.close!
+    out
+  }
+  conn = dial("tcp", addr, test_config_client()).unwrap
+  conn.close_write!.unwrap
+  w = conn.write!([0])
+  assert_eq w.err?.message || "", "tls: protocol is shutdown"
+  data = read_all(conn).unwrap
+  assert_eq data.size, 0
+  done << true
+  conn.close!
+  assert_eq task.wait.unwrap, ""
+  # CloseWrite before the handshake.
+  ln2 = net.listen("tcp", "127.0.0.1:0").unwrap
+  nc = net.dial("tcp", "127.0.0.1:#{ln2.port}").unwrap
+  early = client(nc, test_config_client())
+  assert_eq early.close_write!.err?.message || "", "tls: CloseWrite called before handshake complete"
+  nc.close!
+  ln2.close!
+  ln.close!
+}
+
+test "ConnectionState" {
+  for v in [VERSION_TLS12, VERSION_TLS13] {
+    sc = test_config_server()
+    sc.max_version = v
+    sc.next_protos = ["h2"]
+    sc.client_auth = REQUIRE_AND_VERIFY_CLIENT_CERT
+    cc = test_config_client()
+    cc.next_protos = ["h2"]
+    ss, cs = test_handshake(cc, sc).unwrap
+    for s in [ss, cs] {
+      assert_eq s.version, v
+      assert s.handshake_complete
+      assert !s.did_resume
+      assert_eq s.negotiated_protocol, "h2"
+      assert s.negotiated_protocol_is_mutual
+      assert_eq s.server_name, "test.golang.example"
+      assert_eq s.peer_certificates.size, 1
+      assert_eq s.verified_chains.size, 1
+      if v == VERSION_TLS12 {
+        assert_eq s.tls_unique.size, 12
+      } else {
+        assert_eq s.tls_unique.size, 0
+      }
+      assert s.export_keying_material("test", none, 32).ok?
+    }
+  }
+}
+
+test "LocalCertificate" {
+  for v in [VERSION_TLS12, VERSION_TLS13] {
+    sc = test_config_server()
+    sc.max_version = v
+    sc.client_auth = REQUIRE_ANY_CLIENT_CERT
+    cc = test_config_client()
+    ss, cs = test_handshake(cc, sc).unwrap
+    assert_eq ss.local_certificate, test_cert("ecdsa_p256").certificate
+    assert_eq cs.local_certificate, test_cert("client_ecdsa_p256").certificate
+    assert_eq ss.peer_certificates[0].raw, cs.local_certificate[0]
+  }
+}
+
+test "X509KeyPairErrors" {
+  rsa_pem = os_read("rsa2048")
+  ec_pem = os_read("ecdsa_p256")
+  # The certificate and key swapped.
+  r = x509_key_pair(key_part(rsa_pem), cert_part(rsa_pem))
+  assert strings.contains(r.err?.message || "", "PEM inputs may have been switched")
+  r2 = x509_key_pair(cert_part(rsa_pem), cert_part(rsa_pem))
+  assert_eq r2.err?.message || "", "tls: found a certificate rather than a key in the PEM for the private key"
+  r3 = x509_key_pair(cert_part(rsa_pem), key_part(ec_pem))
+  assert_eq r3.err?.message || "", "tls: private key type does not match public key type"
+  r4 = x509_key_pair([], [])
+  assert_eq r4.err?.message || "", "tls: failed to find any PEM data in certificate input"
+  ok = x509_key_pair(cert_part(ec_pem), key_part(ec_pem)).unwrap
+  assert ok.leaf.some?, "leaf not populated"
+}
+
+def os_read(name: Str) -> [Byte] { os.read_file("testdata/certs/" + name + ".pem").unwrap }
+
+def cert_part(p: [Byte]) -> [Byte] {
+  s = Str.from_bytes(p)
+  i = strings.index(s, "-----BEGIN TESTING KEY-----")
+  i = strings.index(s, "-----BEGIN PRIVATE KEY-----") if i < 0
+  i = strings.index(s, "-----BEGIN") if i < 0
+  j = strings.index(s[1...s.size], "-----BEGIN") + 1
+  s[0...j].bytes
+}
+
+def key_part(p: [Byte]) -> [Byte] {
+  s = Str.from_bytes(p)
+  j = strings.index(s[1...s.size], "-----BEGIN") + 1
+  s[j...s.size].bytes
+}
+
+# Go's TestMultipleKeyUpdate-style check: both sides update keys and keep
+# talking (a KeyUpdate with update_requested).
+test "KeyUpdate" {
+  c, s = local_pipe()
+  sc = test_config_server()
+  ccfg = test_config_client().dup
+  task = spawn {
+    cli = client(c, ccfg)
+    buf = [0.as_u8; 64]
+    n = cli.read!(buf).unwrap
+    first = Str.from_bytes(buf[0...n])
+    cli.write!("pong".bytes).unwrap
+    n2 = cli.read!(buf).unwrap
+    second = Str.from_bytes(buf[0...n2])
+    cli.close!
+    first + "," + second
+  }
+  srv = server(s, sc)
+  srv.write!("ping".bytes).unwrap
+  # Send a KeyUpdate asking the peer to update too.
+  ku = KeyUpdateMsg.new(update_requested: true).marshal.unwrap
+  srv.write_record!(RECORD_TYPE_HANDSHAKE, ku).unwrap
+  suite = cipher_suite_tls13_by_id(srv.st[0].cipher_suite) || CipherSuiteTLS13.new
+  srv.set_write_traffic_secret!(suite, next_traffic_secret(suite, srv.st[0].out.traffic_secret))
+  buf = [0.as_u8; 64]
+  n = srv.read!(buf).unwrap
+  assert_eq Str.from_bytes(buf[0...n]), "pong"
+  srv.write!("again".bytes).unwrap
+  assert_eq task.wait.unwrap, "ping,again"
+  srv.close!
+}

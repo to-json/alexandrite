@@ -1,0 +1,96 @@
+# golang.org/x/crypto/internal/poly1305's tests (poly1305_test.go); the
+# vectors of vectors_test.go are in vec_poly1305_test.alx, checked by
+# check_vector (TestSum and TestWrite for each, aligned and unaligned).
+#
+# Not translated: TestBurnin (a 1e10-iteration stress test Go skips by
+# default). TestSumGeneric / TestWriteGeneric are TestSum / TestWrite: there
+# is only the generic implementation.
+
+import "encoding/hex"
+
+def hd(s: Str) -> [Byte] { hex.decode_string(s).unwrap }
+
+# Go's unalignBytes: the same bytes at an odd offset of a bigger buffer.
+def unalign_bytes(input: [Byte]) -> [Byte] {
+  out = [0.as_u8; input.size + 1]
+  copy(out[1...out.size], input)
+  out[1...out.size]
+}
+
+# The initial accumulator of a vector (hex, big-endian h2 h1 h0), or none.
+def initial_state(state: Str) -> (U64, U64, U64)? {
+  return none if state == ""
+  b = hd(state)
+  be = ->(i: Int) -> U64 {
+    v: U64 = 0
+    for x in b[i...i + 8] {
+      v = (v << 8) | x.as_u64
+    }
+    v
+  }
+  (be.call(16), be.call(8), be.call(0))
+}
+
+def check_vector(input: Str, key_hex: Str, tag_hex: Str, state: Str) {
+  key = hd(key_hex)
+  tag = hd(tag_hex)
+  for unaligned in [false, true] {
+    in_ = hd(input)
+    in_ = unalign_bytes(in_) if unaligned
+    init = initial_state(state)
+    # TestSum (only without an initial state: sum can't set it).
+    if init.none? {
+      got = sum(in_, key)
+      assert_eq hex.encode_to_string(got), tag_hex
+      assert verify?(got, in_, key), "tag didn't verify"
+      # If the key is zero, the tag will always be zero, independent of the input.
+      if in_.size > 0 && key != [0.as_u8; 32] {
+        in_[0] = in_[0] ^ 0xff
+        assert !verify?(got, in_, key), "tag verified after altering the input"
+        in_[0] = in_[0] ^ 0xff
+      }
+      # If the input is empty, the tag only depends on the second half of the key.
+      if in_.size > 0 {
+        key[0] = key[0] ^ 0xff
+        assert !verify?(got, in_, key), "tag verified after altering the key"
+        key[0] = key[0] ^ 0xff
+      }
+      got[0] = got[0] ^ 0xff
+      assert !verify?(got, in_, key), "tag verified after altering the tag"
+    }
+    # TestWrite: two writes, with the initial state if any.
+    h = new(key)
+    if s = init {
+      h.st[0].h0 = s[0]
+      h.st[0].h1 = s[1]
+      h.st[0].h2 = s[2]
+    }
+    third = in_.size / 3
+    assert_eq h.write!(in_[0...third]).unwrap, third
+    assert_eq h.write!(in_[third...in_.size]).unwrap, in_.size - third
+    out = h.tag
+    assert_eq hex.encode_to_string(out), tag_hex
+    assert h.verify!(tag), "Verify failed"
+    t2 = tag + []
+    t2[0] = t2[0] ^ 0xff
+    assert !h.verify!(t2), "Verify succeeded after modifying the tag"
+    # sum! after verify! gives the same tag
+    assert_eq h.sum!([1.as_u8]), [1.as_u8] + tag
+  }
+  nil
+}
+
+test "many small writes" {
+  key = hd("746869732069732033322d62797465206b657920666f7220506f6c7931333035")
+  msg = ("Hello world!" * 40).bytes
+  h = new(key)
+  for b in msg {
+    h.write!([b]).unwrap
+  }
+  assert_eq h.sum!([]), sum(msg, key)
+}
+
+bench "Sum 1K" {
+  key = [1.as_u8; 32]
+  sum([2.as_u8; 1024], key)
+}

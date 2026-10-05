@@ -1,0 +1,210 @@
+# Interop with Go's crypto/tls over loopback: an alx client against a Go
+# server and a Go client against an alx server (testdata/interop/main.go,
+# built with `go build`; the tests pass vacuously when `go` isn't on
+# PATH). Each connection is checked on both sides: version, cipher suite,
+# resumption, ALPN, and a 16-byte exported keying material, which only
+# matches when both sides derived the same secrets.
+
+import "encoding/hex"
+import "net"
+import "os"
+import "os/exec"
+import "strconv"
+import "strings"
+import "time"
+
+# The built Go peer, or none without a Go toolchain.
+def interop_bin -> Str? {
+  return none if !exec.look_path("go").ok?
+  dir = os.mkdir_temp("", "alx-tls-interop").unwrap
+  bin = dir + "/interop"
+  exec.command("go", ["build", "-o", bin, "testdata/interop/main.go"]).run.unwrap
+  bin
+}
+
+def report_line(i: Int, c: Conn) -> Str {
+  st = c.connection_state
+  ekm = st.export_keying_material("interop", none, 16).unwrap
+  "#{i} ver=#{hex4(st.version.to_i)} suite=#{hex4(st.cipher_suite.to_i)} resumed=#{st.did_resume} alpn=#{st.negotiated_protocol} ekm=#{hex.encode_to_string(ekm)}"
+}
+
+# Reads up to and including the first newline.
+def read_line(c: Conn) -> ~Str {
+  cc = c
+  out: [Byte] = []
+  b = [0.as_u8; 1]
+  loop {
+    n = cc.~read!(b)
+    break if n == 0
+    out << b[0]
+    break if b[0] == 10
+  }
+  Str.from_bytes(out)
+}
+
+# Go server, alx client: n connections; the lines of both sides.
+def alx_client_go_server(bin: Str, cfg: Config, args: [Str], n: Int) -> (Str, Str) {
+  # The Go server listens on a port of its own choosing and writes its
+  # address to a file (a port picked here and closed again could be taken
+  # by another test's listener before the Go server binds it).
+  af = os.mkdir_temp("", "alx-tls-addr").unwrap + "/addr"
+  go_args = ["-mode", "server", "-addr", "127.0.0.1:0", "-addrfile", af, "-n", "#{n}"] + args
+  ga = go_args.join("\n")
+  task = spawn { exec.command(bin, ga.split("\n")).~output }
+  c = cfg
+  c.client_session_cache = new_lru_client_session_cache(4) if c.client_session_cache.none?
+  addr = ""
+  tries = 0
+  while addr == "" && tries < 1500 {
+    addr = os.read_file_string(af).ok || ""
+    time.sleep(time.millisecond * 20) if addr == ""
+    tries += 1
+  }
+  if addr == "" {
+    r = task.wait
+    assert false, "go server didn't start: " + (r.err?.message || "")
+  }
+  lines = ""
+  i = 0
+  while i < n {
+    tc = dial("tcp", addr, c).unwrap
+    tc.write!("hello #{i}\n".bytes).unwrap
+    assert_eq read_line(tc).unwrap, "echo hello #{i}\n"
+    lines = lines + report_line(i, tc) + "\n"
+    tc.close!
+    i += 1
+  }
+  (lines, task.wait.unwrap)
+}
+
+# Go client, alx server.
+def go_client_alx_server(bin: Str, cfg: Config, args: [Str], n: Int) -> (Str, Str) {
+  ln = listen("tcp", "127.0.0.1:0", cfg.dup).unwrap
+  addr = "127.0.0.1:#{ln.port}"
+  go_args = ["-mode", "client", "-addr", addr, "-n", "#{n}"] + args
+  # The server runs in a task so that a failing Go client can't leave it
+  # blocked in accept: the main task then connects and hangs up instead.
+  task = spawn {
+    l = ln
+    lines = ""
+    i = 0
+    while i < n {
+      tc = l.~accept
+      tc.~handshake!
+      line = ~read_line(tc)
+      tc.~write!(("echo " + line).bytes)
+      lines = lines + report_line(i, tc) + "\n"
+      tc.close!
+      i += 1
+    }
+    l.close!
+    lines
+  }
+  r = exec.command(bin, go_args).output
+  if !r.ok? {
+    j = 0
+    while j < n {
+      c = net.dial("tcp", addr)
+      if cc = c.ok {
+        cx = cc
+        cx.close!
+      }
+      j += 1
+    }
+  }
+  s = task.wait
+  assert r.ok?, "go client: " + (r.err?.message || "") + "; alx server: " + (s.err?.message || "")
+  (s.unwrap, r.unwrap)
+}
+
+def check_lines(name: Str, alx: Str, go: Str, want: [Str]) {
+  assert alx == go, "#{name}: alx\n#{alx}go\n#{go}"
+  rows = alx.split("\n").select { it != "" }.to_a
+  assert rows.size == want.size, name
+  i = 0
+  for w in want {
+    assert strings.contains(rows[i], w), "#{name}: #{rows[i]} lacks #{w}"
+    i += 1
+  }
+}
+
+def client_cfg -> Config {
+  c = test_config_client()
+  c.min_version = VERSION_TLS10
+  c
+}
+
+def server_cfg -> Config {
+  c = test_config_server()
+  c.min_version = VERSION_TLS10
+  c
+}
+
+test "InteropAlxClientGoServer" {
+  bin = interop_bin() || ""
+  return nil if bin == ""
+  base = ["-cert", "ecdsa_p256"]
+  # TLS 1.3, Go's default key shares (X25519MLKEM768 first), resumption.
+  a, g = alx_client_go_server(bin, client_cfg(), base, 2)
+  check_lines("tls13", a, g, ["resumed=false", "resumed=true"])
+  # TLS 1.3 with P-256 only on the server: HelloRetryRequest.
+  a, g = alx_client_go_server(bin, client_cfg(), base + ["-curve", "23"], 1)
+  check_lines("tls13 hrr", a, g, ["ver=0304"])
+  # TLS 1.3 with each hybrid / curve the client offers.
+  for curve in [X25519, CURVE_P384, CURVE_P521, X25519_MLKEM768, SECP256R1_MLKEM768, SECP384R1_MLKEM1024] {
+    cc = client_cfg()
+    cc.curve_preferences = [curve]
+    a, g = alx_client_go_server(bin, cc, base + ["-curve", "#{curve.to_i}"], 1)
+    check_lines("tls13 curve #{curve_id_string(curve)}", a, g, ["ver=0304"])
+  }
+  # RSA server certificate (RSA-PSS), ALPN, client certificate.
+  ca = client_cfg()
+  ca.next_protos = ["h2"]
+  a, g = alx_client_go_server(bin, ca, ["-cert", "rsa2048", "-alpn", "h2", "-clientauth"], 1)
+  check_lines("tls13 rsa alpn clientauth", a, g, ["alpn=h2"])
+  # TLS 1.2 suites, resumption by ticket.
+  for t in [("c02b", "ecdsa_p256"), ("c02c", "ecdsa_p256"), ("cca9", "ecdsa_p256"), ("c02f", "rsa2048"), ("cca8", "rsa2048"), ("c013", "rsa2048"), ("c009", "ecdsa_p256")] {
+    suite, cert = t
+    a, g = alx_client_go_server(bin, client_cfg(), ["-max", "0303", "-suite", suite, "-cert", cert], 2)
+    check_lines("tls12 #{suite}", a, g, ["ver=0303 suite=#{strings.to_upper(suite)} resumed=false", "resumed=true"])
+  }
+  # TLS 1.2 with a client certificate; TLS 1.0 and 1.1.
+  a, g = alx_client_go_server(bin, client_cfg(), ["-max", "0303", "-cert", "rsa2048", "-clientauth"], 1)
+  check_lines("tls12 clientauth", a, g, ["ver=0303"])
+  a, g = alx_client_go_server(bin, client_cfg(), ["-max", "0302", "-suite", "c013", "-cert", "rsa2048"], 1)
+  check_lines("tls11", a, g, ["ver=0302"])
+  a, g = alx_client_go_server(bin, client_cfg(), ["-max", "0301", "-suite", "c014", "-cert", "rsa2048"], 1)
+  check_lines("tls10", a, g, ["ver=0301"])
+}
+
+test "InteropGoClientAlxServer" {
+  bin = interop_bin() || ""
+  return nil if bin == ""
+  # TLS 1.3, Go's default key shares, resumption.
+  a, g = go_client_alx_server(bin, server_cfg(), [], 2)
+  check_lines("tls13", a, g, ["resumed=false", "resumed=true"])
+  # The server only takes P-256: HelloRetryRequest.
+  sc = server_cfg()
+  sc.curve_preferences = [CURVE_P256]
+  a, g = go_client_alx_server(bin, sc, [], 1)
+  check_lines("tls13 hrr", a, g, ["ver=0304"])
+  for curve in [X25519, CURVE_P384, CURVE_P521, X25519_MLKEM768, SECP256R1_MLKEM768, SECP384R1_MLKEM1024] {
+    a, g = go_client_alx_server(bin, server_cfg(), ["-curve", "#{curve.to_i}"], 1)
+    check_lines("tls13 curve #{curve_id_string(curve)}", a, g, ["ver=0304"])
+  }
+  # ALPN and a client certificate.
+  sc2 = server_cfg()
+  sc2.next_protos = ["h2", "http/1.1"]
+  sc2.client_auth = REQUIRE_AND_VERIFY_CLIENT_CERT
+  a, g = go_client_alx_server(bin, sc2, ["-alpn", "h2", "-cert", "client_rsa2048"], 1)
+  check_lines("tls13 alpn clientauth", a, g, ["alpn=h2"])
+  # TLS 1.2 suites with resumption.
+  for suite in ["c02b", "c02c", "cca9", "c02f", "c030", "cca8", "c013", "c00a"] {
+    a, g = go_client_alx_server(bin, server_cfg(), ["-max", "0303", "-suite", suite], 2)
+    check_lines("tls12 #{suite}", a, g, ["ver=0303 suite=#{strings.to_upper(suite)} resumed=false", "resumed=true"])
+  }
+  a, g = go_client_alx_server(bin, sc2, ["-max", "0303", "-cert", "client_ecdsa_p256"], 1)
+  check_lines("tls12 clientauth", a, g, ["ver=0303"])
+  a, g = go_client_alx_server(bin, server_cfg(), ["-max", "0302", "-suite", "c013"], 1)
+  check_lines("tls11", a, g, ["ver=0302"])
+}

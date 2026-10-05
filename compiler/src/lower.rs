@@ -1315,7 +1315,9 @@ impl<'a> Lw<'a> {
                     LE::Slice(at, Box::new(av), Box::new(lo_v), Box::new(LE::Var(len)))
                 }
             }
-            TK::Index(a, i) if self.try_mode => {
+            // The element reads of a slice `==` (check.rs arr_eq) are always in
+            // range: no IndexError under `~`.
+            TK::Index(a, i) if self.try_mode && !matches!(&i.kind, TK::Local(l) if self.f.locals[*l].name.starts_with("_eqi")) => {
                 let av = self.expr(a);
                 let av = self.bind_arr(av, self.lty(&a.ty));
                 let iv = self.expr(i);
@@ -2305,6 +2307,9 @@ impl<'a> Lw<'a> {
                     BinOp::Shl => wrap_to(k, LE::Prim(Prim::Shl, vec![a, LE::I(n)])),
                     _ if k == IntKind::U64 && n >= 64 => LE::I(0),
                     _ if k == IntKind::U64 => LE::Prim(Prim::ShrU, vec![a, LE::I(n)]),
+                    // A narrow unsigned value: saying so (a no-op wrap) lets
+                    // clang see `(x << k) | (x >> (w - k))` as a rotate.
+                    _ if !k.signed() => LE::Prim(Prim::ShrS, vec![wrap_to(k, a), LE::I(n.min(63))]),
                     _ => LE::Prim(Prim::ShrS, vec![a, LE::I(n.min(63))]),
                 };
             }

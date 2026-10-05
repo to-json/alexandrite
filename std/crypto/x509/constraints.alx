@@ -1,0 +1,394 @@
+# Go's constraints.go: name constraint checking over a chain (RFC 5280,
+# 4.2.1.10), with Go's sorted-and-pruned constraint sets and binary search.
+
+import "bytes"
+import "net"
+import "net/netip"
+import "net/url"
+import "slices"
+import "strconv"
+import "strings"
+
+# ---------------------------------------------------------------- IP constraints
+
+def ip_network_subset?(a: IPNet, b: IPNet) -> Bool {
+  return false if !a.contains?(b.ip)
+  broadcast = [0.as_u8; b.ip.size]
+  i = 0
+  while i < b.ip.size {
+    broadcast[i] = b.ip[i] | (^b.mask[i])
+    i += 1
+  }
+  a.contains?(broadcast)
+}
+
+def ip_network_compare(a: IPNet, b: IPNet) -> Int {
+  i = bytes.compare(a.ip, b.ip)
+  return i if i != 0
+  bytes.compare(a.mask, b.mask)
+}
+
+# Sorts the set and drops entries that are subsets of an earlier one (Go's
+# sortAndPrune).
+def prune_ipnets(set0: [IPNet]) -> [IPNet] {
+  return set0 if set0.size < 2
+  set = set0 + []
+  slices.sort_func(set) { |a, b| ip_network_compare(a, b) }
+  out = [set[0]]
+  i = 1
+  while i < set.size {
+    out << set[i] if !ip_network_subset?(out[out.size - 1], set[i])
+    i += 1
+  }
+  out
+}
+
+# Go's nameConstraintsSet.search for IPs: the matching constraint, if any.
+def search_ipnets(set: [IPNet], ip: [Byte]) -> IPNet? {
+  return none if set.size == 0
+  # slices.BinarySearchFunc: the first index whose IP is >= ip.
+  lo = 0
+  hi = set.size
+  while lo < hi {
+    mid = (lo + hi) / 2
+    if bytes.compare(set[mid].ip, ip) < 0 {
+      lo = mid + 1
+    } else {
+      hi = mid
+    }
+  }
+  return set[lo] if lo < set.size && bytes.compare(set[lo].ip, ip) == 0
+  constraint = lo == 0 ? set[0] : set[lo - 1]
+  return constraint if constraint.contains?(ip)
+  none
+}
+
+struct IPConstraints {
+  ipv4: [IPNet]
+  ipv6: [IPNet]
+
+  def query(ip: [Byte]) -> IPNet? {
+    return search_ipnets(ipv4, ip) if ip.size == 4
+    search_ipnets(ipv6, ip)
+  }
+}
+
+def new_ipnet_constraints(l: [IPNet]) -> IPConstraints? {
+  return none if l.size == 0
+  ipv4: [IPNet] = []
+  ipv6: [IPNet] = []
+  for n0 in l {
+    n = n0
+    # Go's IP.Mask: the masked IP (in the mask's length).
+    if n.ip.size == n.mask.size {
+      masked = [0.as_u8; n.ip.size]
+      i = 0
+      while i < n.ip.size {
+        masked[i] = n.ip[i] & n.mask[i]
+        i += 1
+      }
+      n = IPNet.new(ip: masked, mask: n.mask) if masked != n.ip
+    }
+    if n.ip.size == 4 {
+      ipv4 << n
+    } else {
+      ipv6 << n
+    }
+  }
+  IPConstraints.new(ipv4: prune_ipnets(ipv4), ipv6: prune_ipnets(ipv6))
+}
+
+# ---------------------------------------------------------------- DNS constraints
+
+# Whether b is a (case-insensitive) DNS suffix of a constraint a.
+def dns_has_suffix?(a: Str, b: Str) -> Bool {
+  len_a = a.size
+  len_b = b.size
+  return false if len_a > len_b
+  i = len_a - 1
+  offset = len_a - len_b
+  while i >= 0 {
+    ar = a[i]
+    br = b[i - offset]
+    if ar != br {
+      if br < ar {
+        t = ar
+        ar = br
+        br = t
+      }
+      return false if !(ar >= 65 && ar <= 90 && br == ar + 32)
+    }
+    i -= 1
+  }
+  return false if a[0] != 46 && len_b > len_a && b[len_b - len_a - 1] != 46
+  true
+}
+
+def dns_compare_byte(c: Byte) -> Byte {
+  return 0 if c == 46
+  return c + 32 if c >= 65 && c <= 90
+  c
+}
+
+# Compares DNS names from the last label (dots sort first), case
+# insensitively (Go's dnsCompare).
+def dns_compare(a: Str, b: Str) -> Int {
+  idx_a = a.size - 1
+  idx_b = b.size - 1
+  while idx_a >= 0 && idx_b >= 0 {
+    byte_a = dns_compare_byte(a[idx_a])
+    byte_b = dns_compare_byte(b[idx_b])
+    if byte_a == byte_b {
+      idx_a -= 1
+      idx_b -= 1
+      next
+    }
+    return byte_a < byte_b ? -1 : 1
+  }
+  return -1 if idx_a < idx_b
+  return 1 if idx_b < idx_a
+  0
+}
+
+struct DNSConstraints {
+  # A "" constraint: every name matches.
+  all: Bool
+  permitted: Bool
+  set: [Str]
+  parent_constraints: Map[Str, Str]
+
+  # The matching constraint, if any.
+  def query(s0: Str) -> Str? {
+    return "" if all
+    if c = search_dns(set, s0) {
+      return c
+    }
+    if !permitted && s0.size > 0 && s0[0] == 42 {
+      s = strings.to_lower(s0)
+      trimmed = trim_first_label(s)
+      if c = parent_constraints[trimmed] {
+        return c
+      }
+    }
+    none
+  }
+}
+
+def search_dns(set: [Str], s: Str) -> Str? {
+  return none if set.size == 0
+  lo = 0
+  hi = set.size
+  while lo < hi {
+    mid = (lo + hi) / 2
+    if dns_compare(set[mid], s) < 0 {
+      lo = mid + 1
+    } else {
+      hi = mid
+    }
+  }
+  return set[lo] if lo < set.size && dns_compare(set[lo], s) == 0
+  constraint = lo == 0 ? set[0] : set[lo - 1]
+  return constraint if dns_has_suffix?(constraint, s)
+  none
+}
+
+def new_dns_constraints(l: [Str], permitted: Bool) -> DNSConstraints? {
+  return none if l.size == 0
+  for n in l {
+    return DNSConstraints.new(all: true) if n.size == 0
+  }
+  set = l + []
+  slices.sort_func(set) { |a, b| dns_compare(a, b) }
+  pruned = [set[0]]
+  i = 1
+  while i < set.size {
+    pruned << set[i] if !dns_has_suffix?(pruned[pruned.size - 1], set[i])
+    i += 1
+  }
+  nc = DNSConstraints.new(set: pruned, permitted: permitted)
+  if !permitted {
+    for name0 in pruned {
+      name = strings.to_lower(name0)
+      trimmed = trim_first_label(name)
+      nc.parent_constraints[trimmed] = name if trimmed != ""
+    }
+  }
+  nc
+}
+
+def trim_first_label(dns_name: Str) -> Str {
+  i = strings.index_byte(dns_name, 46)
+  return "" if i < 0
+  dns_name[i...dns_name.size]
+}
+
+# ---------------------------------------------------------------- email constraints
+
+struct EmailConstraints {
+  dns: DNSConstraints?
+  full_emails: Map[Str, Bool]
+
+  def query(s: Rfc2821Mailbox) -> Str? {
+    return "#{s.local}@#{s.domain}" if full_emails.size > 0 && full_emails.has_key?(mailbox_key(s))
+    if d = dns {
+      return d.query(s.domain)
+    }
+    none
+  }
+}
+
+def mailbox_key(m: Rfc2821Mailbox) -> Str { m.local + "\u0000" + m.domain }
+
+def new_email_constraints(l: [Str], permitted: Bool) -> EmailConstraints? {
+  return none if l.size == 0
+  ec = EmailConstraints.new
+  domains: [Str] = []
+  for c in l {
+    if !c.include?("@") {
+      domains << c
+      next
+    }
+    if parsed0 = parse_rfc2821_mailbox(c) {
+      parsed = parsed0
+      parsed.domain = strings.to_lower(parsed.domain)
+      ec.full_emails[mailbox_key(parsed)] = true
+    }
+  }
+  ec.dns = new_dns_constraints(domains, permitted) if domains.size > 0
+  ec
+}
+
+# ---------------------------------------------------------------- chains
+
+# The constraints of one certificate in a chain.
+struct ChainConstraints {
+  ip_permitted: IPConstraints?
+  ip_excluded: IPConstraints?
+  dns_permitted: DNSConstraints?
+  dns_excluded: DNSConstraints?
+  uri_permitted: DNSConstraints?
+  uri_excluded: DNSConstraints?
+  email_permitted: EmailConstraints?
+  email_excluded: EmailConstraints?
+  index: Int
+
+  def check(dns: [Str], uris: [ParsedURI], emails: [Rfc2821Mailbox], ips: [[Byte]]) -> ~Unit<X509Error> {
+    for ip in ips {
+      shown = ip_string(ip)
+      if p = ip_permitted {
+        fail err("IP address #{strconv.quote(shown)} is not permitted by any constraint") if p.query(ip).none?
+      }
+      if x = ip_excluded {
+        if c = x.query(ip) {
+          fail err("IP address #{strconv.quote(shown)} is excluded by constraint #{strconv.quote(c.to_s)}")
+        }
+      }
+    }
+    for d in dns {
+      fail err("x509: cannot parse dnsName #{strconv.quote(d)}") if !domain_name_valid?(d, false)
+      ~check_dns("DNS name", dns_permitted, dns_excluded, d, d)
+    }
+    for u in uris {
+      fail err("x509: internal error: URI SAN #{strconv.quote(u.uri.to_s)} failed to parse") if !domain_name_valid?(u.domain, false)
+      ~check_dns("URI", uri_permitted, uri_excluded, u.domain, u.uri.to_s)
+    }
+    for e in emails {
+      fail err("x509: cannot parse rfc822Name #{strconv.quote(e.to_s)}") if !domain_name_valid?(e.domain, false)
+      if p = email_permitted {
+        fail err("email address #{strconv.quote(e.to_s)} is not permitted by any constraint") if p.query(e).none?
+      }
+      if x = email_excluded {
+        if c = x.query(e) {
+          fail err("email address #{strconv.quote(e.to_s)} is excluded by constraint #{strconv.quote(c)}")
+        }
+      }
+    }
+  }
+}
+
+def check_dns(constraint_type: Str, permitted: DNSConstraints?, excluded: DNSConstraints?, s: Str, shown: Str) -> ~Unit<X509Error> {
+  if p = permitted {
+    fail err("#{constraint_type} #{strconv.quote(shown)} is not permitted by any constraint") if p.query(s).none?
+  }
+  if x = excluded {
+    if c = x.query(s) {
+      fail err("#{constraint_type} #{strconv.quote(shown)} is excluded by constraint #{strconv.quote(c)}")
+    }
+  }
+}
+
+# Go's checkChainConstraints: every SAN of every certificate in the chain
+# satisfies the constraints of the certificates above it.
+def check_chain_constraints(chain: [Certificate]) -> ~Unit<X509Error> {
+  ccs: [ChainConstraints] = []
+  i = 0
+  for c in chain {
+    if c.has_name_constraints? {
+      ccs << ChainConstraints.new(ip_permitted: new_ipnet_constraints(c.permitted_ip_ranges), ip_excluded: new_ipnet_constraints(c.excluded_ip_ranges), dns_permitted: new_dns_constraints(c.permitted_dns_domains, true), dns_excluded: new_dns_constraints(c.excluded_dns_domains, false), uri_permitted: new_dns_constraints(c.permitted_uri_domains, true), uri_excluded: new_dns_constraints(c.excluded_uri_domains, false), email_permitted: new_email_constraints(c.permitted_email_addresses, true), email_excluded: new_email_constraints(c.excluded_email_addresses, false), index: i)
+    }
+    i += 1
+  }
+  return if ccs.size == 0
+  current = 0
+  i = 0
+  for c in chain {
+    if !c.has_san_extension? {
+      i += 1
+      next
+    }
+    if i >= ccs[current].index {
+      while ccs[current].index <= i {
+        return if current + 1 >= ccs.size
+        current += 1
+      }
+    }
+    uris = ~parse_uris(c.uris)
+    emails = ~parse_mailboxes(c.email_addresses)
+    k = current
+    while k < ccs.size {
+      cc = ccs[k]
+      cc.~check(c.dns_names, uris, emails, c.ip_addresses)
+      k += 1
+    }
+    i += 1
+  }
+}
+
+struct ParsedURI {
+  uri: url.Url
+  domain: Str
+}
+
+def parse_uris(uris: [url.Url]) -> ~[ParsedURI]<X509Error> {
+  parsed: [ParsedURI] = []
+  for uri in uris {
+    host = strings.to_lower(uri.host)
+    fail err("URI with empty host (#{strconv.quote(uri.to_s)}) cannot be matched against constraints") if host.size == 0
+    if host.include?(":") && !host.end_with?("]") {
+      r = net.split_host_port(uri.host)
+      if e = r.err {
+        fail err("cannot parse URI host #{strconv.quote(uri.host)}: #{e.message}")
+      }
+      host = r.unwrap[0]
+    }
+    # netip.ParseAddr will reject the URI IPv6 literal form "[...]", so we
+    # check if _either_ the string parses as an IP, or if it is enclosed in
+    # square brackets.
+    if netip.parse_addr(host).ok? || (host.start_with?("[") && host.end_with?("]")) {
+      fail err("URI with IP (#{strconv.quote(uri.to_s)}) cannot be matched against constraints")
+    }
+    parsed << ParsedURI.new(uri: uri, domain: host)
+  }
+  parsed
+}
+
+def parse_mailboxes(emails: [Str]) -> ~[Rfc2821Mailbox]<X509Error> {
+  parsed: [Rfc2821Mailbox] = []
+  for email in emails {
+    m0 = ~need(parse_rfc2821_mailbox(email), "cannot parse rfc822Name #{strconv.quote(email)}")
+    m = m0
+    m.domain = strings.to_lower(m.domain)
+    parsed << m
+  }
+  parsed
+}

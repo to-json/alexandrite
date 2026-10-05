@@ -1,0 +1,271 @@
+#![overflow(wrap)]
+# Package poly1305: golang.org/x/crypto/internal/poly1305 (the copy Go's
+# std vendors), the Poly1305 one-time message authentication code of RFC
+# 8439 section 2.5. Go's generic code (poly1305.go, sum_generic.go).
+#
+# Poly1305 is a one-time authenticator: a key must only be used for a
+# single message. Authenticating two different messages with the same key
+# allows an attacker to forge messages at will.
+#
+#   Go                                  alx
+#   TagSize                             TAG_SIZE
+#   Sum(out *[16]byte, m, key *[32]byte) sum(m, key) -> [Byte]  (16 bytes)
+#   Verify(mac *[16]byte, m, key) bool  verify?(mac, m, key) -> Bool
+#   New(key *[32]byte) *MAC             new(key) -> MAC
+#   (*MAC).Size / Write / Sum / Verify  m.size / m.write!(p) -> ~Int / m.sum!(b) -> [Byte] / m.verify!(expected) -> Bool
+#
+# Differences from Go:
+#   - Keys are [Byte] of 32 bytes (Go's *[32]byte); sum returns the tag.
+#   - A MAC shares its state across copies (D36), as Go's *MAC does. sum!
+#     and verify! end in `!` because they mark the MAC finalized (a later
+#     write! panics, as in Go).
+#   - No assembly: every platform runs the generic code (64-bit limbs,
+#     math/bits-style 128-bit products through U64.__mulhi).
+#
+# Timing: constant time, as Go's generic code; verify? and verify! compare
+# with crypto/subtle.
+
+import "crypto/subtle"
+
+pub TAG_SIZE = 16
+
+R_MASK0: U64 = 0x0FFFFFFC0FFFFFFF
+R_MASK1: U64 = 0x0FFFFFFC0FFFFFFC
+MASK_LOW2_BITS: U64 = 3
+MASK_NOT_LOW2_BITS: U64 = 0xFFFFFFFFFFFFFFFC
+P0: U64 = 0xFFFFFFFFFFFFFFFB
+P1: U64 = 0xFFFFFFFFFFFFFFFF
+P2: U64 = 3
+
+def le64(b: [Byte], i: Int) -> U64 {
+  b[i].as_u64 | (b[i + 1].as_u64 << 8) | (b[i + 2].as_u64 << 16) | (b[i + 3].as_u64 << 24) | (b[i + 4].as_u64 << 32) | (b[i + 5].as_u64 << 40) | (b[i + 6].as_u64 << 48) | (b[i + 7].as_u64 << 56)
+}
+
+def put_le64(b: [Byte], i: Int, v: U64) {
+  d = b
+  k = 0
+  while k < 8 {
+    d[i + k] = (v >> (8 * k)).as_u8
+    k += 1
+  }
+  nil
+}
+
+# The carry out of x + y + c (math/bits.Add64's carry).
+def carry(x: U64, y: U64, sum: U64) -> U64 { ((x & y) | ((x | y) & ^sum)) >> 63 }
+
+struct MacState {
+  h0: U64
+  h1: U64
+  h2: U64
+  r0: U64
+  r1: U64
+  s0: U64
+  s1: U64
+  buffer: [Byte]
+  offset: Int
+  finalized: Bool
+}
+
+# Go's updateGeneric: absorbs msg (whole 16-byte blocks; a final partial
+# block is padded with a 1 byte and no high bit) into the accumulator
+# (h0, h1, h2) under (r0, r1); returns the new accumulator.
+def update(h0_in: U64, h1_in: U64, h2_in: U64, r0: U64, r1: U64, msg: [Byte]) -> (U64, U64, U64) {
+  h0 = h0_in
+  h1 = h1_in
+  h2 = h2_in
+  i = 0
+  n = msg.size
+  while i < n {
+    m0: U64 = 0
+    m1: U64 = 0
+    hibit: U64 = 1
+    if n - i >= TAG_SIZE {
+      w = msg[i...i + 16]
+      m0 = le64(w, 0)
+      m1 = le64(w, 8)
+    } else {
+      buf = [0.as_u8; TAG_SIZE]
+      copy(buf, msg[i...n])
+      buf[n - i] = 1
+      m0 = le64(buf, 0)
+      m1 = le64(buf, 8)
+      hibit = 0
+    }
+    i += 16
+    # h += m
+    t = h0 + m0
+    c = carry(h0, m0, t)
+    h0 = t
+    t = h1 + m1 + c
+    c = carry(h1, m1, t)
+    h1 = t
+    h2 = h2 + c + hibit
+    # h *= r (Go's mul64 / add128 schedule). The products of h2 (at most
+    # 2 bits plus carries) don't overflow 64 bits, nor do m1 and m2,
+    # thanks to the masked bits of r.
+    h0r0_lo = h0 * r0
+    h0r0_hi = h0.__mulhi(r0)
+    h1r0_lo = h1 * r0
+    h1r0_hi = h1.__mulhi(r0)
+    h2r0_lo = h2 * r0
+    h0r1_lo = h0 * r1
+    h0r1_hi = h0.__mulhi(r1)
+    h1r1_lo = h1 * r1
+    h1r1_hi = h1.__mulhi(r1)
+    h2r1_lo = h2 * r1
+    m1lo = h1r0_lo + h0r1_lo
+    m1hi = h1r0_hi + h0r1_hi + carry(h1r0_lo, h0r1_lo, m1lo)
+    m2lo = h2r0_lo + h1r1_lo
+    m2hi = h1r1_hi + carry(h2r0_lo, h1r1_lo, m2lo)
+    m3lo = h2r1_lo
+    t0 = h0r0_lo
+    t1 = m1lo + h0r0_hi
+    c = carry(m1lo, h0r0_hi, t1)
+    t2 = m2lo + m1hi + c
+    c = carry(m2lo, m1hi, t2)
+    t3 = m3lo + m2hi + c
+    # Partial reduction modulo 2^130 - 5: h = t mod 2^130 plus 5 times
+    # the part above, as cc + cc/4 where cc is that part times 4.
+    h0 = t0
+    h1 = t1
+    h2 = t2 & MASK_LOW2_BITS
+    cclo = t2 & MASK_NOT_LOW2_BITS
+    cchi = t3
+    t = h0 + cclo
+    c = carry(h0, cclo, t)
+    h0 = t
+    t = h1 + cchi + c
+    c = carry(h1, cchi, t)
+    h1 = t
+    h2 += c
+    cclo = (cclo >> 2) | ((cchi & 3) << 62)
+    cchi = cchi >> 2
+    t = h0 + cclo
+    c = carry(h0, cclo, t)
+    h0 = t
+    t = h1 + cchi + c
+    c = carry(h1, cchi, t)
+    h1 = t
+    h2 += c
+  }
+  (h0, h1, h2)
+}
+
+# Go's finalize: h mod 2^130 - 5, plus s, as 16 little-endian bytes.
+def finalize(h0_in: U64, h1_in: U64, h2: U64, s0: U64, s1: U64) -> [Byte] {
+  h0 = h0_in
+  h1 = h1_in
+  # After the partial reduction, h is at most 2 * (2^130 - 5) - 1; one
+  # subtraction of p, selected by its borrow, reduces it fully.
+  d0 = h0 - P0
+  b = ((^h0 & P0) | (^(h0 ^ P0) & d0)) >> 63
+  d1 = h1 - P1 - b
+  b = ((^h1 & P1) | (^(h1 ^ P1) & d1)) >> 63
+  d2 = h2 - P2 - b
+  b = ((^h2 & P2) | (^(h2 ^ P2) & d2)) >> 63
+  # select64(b, h, h - p)
+  h0 = (^(b - 1) & h0) | ((b - 1) & d0)
+  h1 = (^(b - 1) & h1) | ((b - 1) & d1)
+  # h + s (mod 2^128)
+  t = h0 + s0
+  c = carry(h0, s0, t)
+  h0 = t
+  h1 = h1 + s1 + c
+  out = [0.as_u8; TAG_SIZE]
+  put_le64(out, 0, h0)
+  put_le64(out, 8, h1)
+  out
+}
+
+# A Poly1305 MAC computed over written data (Go's *MAC). Copies share the
+# state; make one with new(key).
+pub struct MAC {
+  st: [MacState]
+
+  pub def size -> Int { TAG_SIZE }
+
+  # Adds more data to the running message authentication code. Panics
+  # after sum! or verify!. Never fails.
+  pub def write!(p0: [Byte]) -> ~Int {
+    s = st[0]
+    panic("poly1305: write to MAC after Sum or Verify") if s.finalized
+    nn = p0.size
+    p = p0
+    h0 = s.h0
+    h1 = s.h1
+    h2 = s.h2
+    offset = s.offset
+    if offset > 0 {
+      n = copy(s.buffer[offset...TAG_SIZE], p)
+      if offset + n < TAG_SIZE {
+        self.st[0].offset = offset + n
+        return nn
+      }
+      p = p[n...p.size]
+      offset = 0
+      h0, h1, h2 = update(h0, h1, h2, s.r0, s.r1, s.buffer)
+    }
+    n = p.size - p.size % TAG_SIZE
+    if n > 0 {
+      h0, h1, h2 = update(h0, h1, h2, s.r0, s.r1, p[0...n])
+      p = p[n...p.size]
+    }
+    if p.size > 0 {
+      offset += copy(s.buffer[offset...TAG_SIZE], p)
+    }
+    self.st[0].h0 = h0
+    self.st[0].h1 = h1
+    self.st[0].h2 = h2
+    self.st[0].offset = offset
+    nn
+  }
+
+  # The tag of the data written so far, appended to b. The MAC is
+  # finalized: further writes panic.
+  pub def sum!(b: [Byte]) -> [Byte] {
+    tag = self.tag
+    self.st[0].finalized = true
+    b + tag
+  }
+
+  # Whether expected is the tag of the data written so far (constant
+  # time). The MAC is finalized.
+  pub def verify!(expected: [Byte]) -> Bool {
+    tag = self.tag
+    self.st[0].finalized = true
+    subtle.constant_time_compare(expected, tag) == 1
+  }
+
+  # Go's macGeneric.Sum: the tag, without changing the state.
+  def tag -> [Byte] {
+    s = st[0]
+    h0 = s.h0
+    h1 = s.h1
+    h2 = s.h2
+    if s.offset > 0 {
+      h0, h1, h2 = update(h0, h1, h2, s.r0, s.r1, s.buffer[0...s.offset])
+    }
+    finalize(h0, h1, h2, s.s0, s.s1)
+  }
+}
+
+# A new MAC computing an authentication tag of all data written to it with
+# the given 32-byte key.
+pub def new(key: [Byte]) -> MAC {
+  panic("poly1305: key must be 32 bytes") if key.size != 32
+  MAC.new(st: [MacState.new(r0: le64(key, 0) & R_MASK0, r1: le64(key, 8) & R_MASK1, s0: le64(key, 16), s1: le64(key, 24), buffer: [0.as_u8; TAG_SIZE])])
+}
+
+# The authenticator of m using a one-time 32-byte key (Go's Sum).
+pub def sum(m: [Byte], key: [Byte]) -> [Byte] {
+  panic("poly1305: key must be 32 bytes") if key.size != 32
+  h0, h1, h2 = update(0, 0, 0, le64(key, 0) & R_MASK0, le64(key, 8) & R_MASK1, m)
+  finalize(h0, h1, h2, le64(key, 16), le64(key, 24))
+}
+
+# Whether mac is a valid authenticator for m with the given key (Go's
+# Verify; constant time).
+pub def verify?(mac: [Byte], m: [Byte], key: [Byte]) -> Bool {
+  subtle.constant_time_compare(sum(m, key), mac) == 1
+}

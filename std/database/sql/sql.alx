@@ -1,0 +1,1212 @@
+# Package sql: Go's database/sql — a connection pool and a generic SQL
+# interface over a database driver (database/sql/driver).
+#
+#   db = ~sql.open_driver(sqlite.Driver.new, "app.db")   # or reg.~open("sqlite3", dsn)
+#   db.~exec("insert into people(name, age) values(?, ?)", ("ann", 30))
+#   rows = db.~query("select id, name, age from people where age > ?", 20)
+#   while rows.next {
+#     p: Person = rows.~scan                           # #[derive(Row)] struct
+#     t: (Int, Str, Int?) = rows.~scan                 # or a tuple; NULL <-> optionals
+#   }
+#   ~rows.err_result
+#   n: Int = db.query_row("select count(*) from people", nil).~scan
+#
+#   Go                                    alx
+#   sql.Open(name, dsn)                   reg.open(name, dsn) -> ~DB  (a Registry; see below)
+#   sql.Register / Drivers                reg.register(name, d) / reg.drivers
+#   sql.OpenDB(connector)                 open_db(c) -> DB; open_driver(d, dsn) -> ~DB
+#   db.Exec(q, args...) (Result, error)   db.exec(q, args) -> ~Result; exec_context(ctx, q, args)
+#   db.Query(q, args...) (*Rows, error)   db.query(q, args) -> ~Rows; query_context
+#   db.QueryRow(q, args...) *Row          db.query_row(q, args) -> Row; query_row_context
+#   db.Prepare(q) (*Stmt, error)          db.prepare(q) -> ~Stmt; prepare_context
+#   db.Begin / BeginTx(ctx, opts)         db.begin -> ~Tx; begin_tx(ctx, opts?)
+#   db.Conn(ctx) (*Conn, error)           db.conn_context(ctx) -> ~Conn
+#   db.Ping / PingContext / Close         ping, ping_context, close
+#   db.SetMaxOpenConns / SetMaxIdleConns  set_max_open_conns, set_max_idle_conns,
+#     / SetConnMaxLifetime / ...IdleTime    set_conn_max_lifetime(d), set_conn_max_idle_time(d)
+#   db.Stats() DBStats                    db.stats -> DBStats (Go's field names, snake_case)
+#   db.Driver()                           db.driver -> driver.Driver? (none for open_db)
+#   rows.Next / NextResultSet / Err /     rows.next, next_result_set, err (Error?) /
+#     Close / Columns / ColumnTypes         err_result (~Unit), close, columns, column_types
+#   rows.Scan(&a, &b, &c)                 rows.scan -> ~T (T: a tuple, a #[derive(Row)]
+#                                           struct, one scalar); rows.get(i) -> ~T; rows.values
+#   row.Scan(&a, ...) / row.Err()         row.scan -> ~T / row.err
+#   stmt.Exec / Query / QueryRow / Close  stmt.exec(args), query(args), query_row(args), close
+#   tx.Commit / Rollback / Exec / Query / tx.commit, rollback, exec, query, query_row,
+#     Prepare / Stmt(s)                     prepare, stmt(s) (and *_context)
+#   conn.ExecContext / ... / Raw / Close  conn.exec_context, ..., raw { |ci| }, close
+#   Result LastInsertId / RowsAffected    Result: last_insert_id / rows_affected -> ~Int
+#   Named("n", v) / NamedArg              named("n", v) -> NamedArg[T]
+#   NullString{String, Valid} ...         NullString.new(string: s, valid: true) ...; Null[T]
+#                                           (v, valid); alx's own `T?` is the usual choice
+#   Scanner (Scan(src any) error)         a static `def self.sql_scan(src: driver.Value) -> ~T`
+#   driver.Valuer                         `def sql_value -> ~driver.Value` (driver.Valuer)
+#   ErrNoRows / ErrConnDone / ErrTxDone   ERR_NO_ROWS / ERR_CONN_DONE / ERR_TX_DONE (SqlError)
+#   LevelDefault ... LevelLinearizable    LEVEL_DEFAULT ... LEVEL_LINEARIZABLE; isolation_name(i)
+#   TxOptions{Isolation, ReadOnly}        TxOptions.new(isolation: i, read_only: b)
+#
+# Scanning without pointers or reflection. Go's `rows.Scan(&a, &b)` writes
+# through pointers into arbitrary types, choosing a conversion by reflection.
+# Here the destination is the *result type* of `scan`, known at compile time:
+#  - `t: (Int, Str?, Float) = rows.~scan` — a tuple of up to 8 values; each
+#    element converts with Go's convertAssign rules for that type (strings
+#    parse into numbers, numbers format into strings, []byte <-> Str, ...);
+#    a NULL needs an optional (`T?`; Go's pointer-to-pointer) or a Null type,
+#    else Go's error "converting NULL to int64 is unsupported".
+#  - `p: Person = rows.~scan` with `#[derive(Row)] struct Person { ... }`:
+#    columns go to fields by name (`#[field(db: "user_id")]` renames, `db: "-"`
+#    skips), case-insensitively; a column without a field is an error
+#    ("sql: missing destination name x in Person"); fields without a column
+#    stay zero. (Go has no struct scanning; this is sqlx's convention.)
+#  - `n: Int = row.~scan` — one column into one value.
+#  - `rows.get(i)` converts column i alone; `rows.values` gives the raw
+#    driver.Values (Go's Scan into `*any`).
+# How it works: every scannable type has a static `sql_scan(src) -> ~T`. The
+# builtins (all integer types, Float, Bool, Str, [Byte], time.Time,
+# driver.Value, `T?`, tuples) get theirs from refinements in convert.alx,
+# found through the type parameter of `scan` at compile time (generic
+# refinements, GO-VS-RUBY D59); your own type defines `def self.sql_scan`
+# (Go's Scanner); `#[derive(Row)]` writes `Type.from_sql_row`.
+#
+# Arguments: a query takes ONE argument value: `nil` (none), a single value,
+# a tuple of up to 8 values of any types (Go's `args ...any`), `[driver.Value]`
+# or `[driver.NamedValue]`; `sql.named("n", v)` inside a tuple names one.
+# Each value converts at compile time (driver.to_value: Go's
+# DefaultParameterConverter rules, `sql_value` for Valuers).
+#
+# Differences from Go:
+#  - Package-level registry (sql.Register / sql.Open / sql.Drivers): until
+#    package-level `Mutex` state lands (GO-VS-RUBY R11), the table is a value,
+#    `Registry` (`new_registry`, `register`, `drivers`, `open`); `open_driver`
+#    needs none. When R11 lands, `registry()` becomes the package's own
+#    `Mutex` and `register`/`open`/`drivers` its package functions.
+#  - Optional driver interfaces are default methods (see driver.alx); a
+#    driver's NamedValueChecker is asked on the Stmt, then on the Conn (Go
+#    asks only the first that implements it).
+#  - A connection that needs opening while requests wait is opened by a task
+#    started for it (Go runs one opener goroutine fed by a channel).
+#  - No RawBytes (scanning into driver-owned memory needs pointers): scan into
+#    `[Byte]`, which copies. No `Out` parameters (pointers). No Rows as a
+#    column value (driver cursors), no uuid.UUID or decimal destinations.
+#  - Panics in drivers end the task (no recover); Go's TestDriverPanic is not
+#    portable.
+#  - Times: a Value.Time is a std/time Time.
+#  - Every type here is a handle: copies are the same DB/Tx/Stmt/Rows.
+
+import "context"
+import "database/sql/driver"
+import "strconv"
+import "sync"
+import "time"
+
+# ------------------------------------------------------------------- errors
+
+pub error SqlError {
+  NoRows
+  ConnDone
+  TxDone
+  DbClosed
+  RowsClosed
+  NoRowsAvailable
+  StmtClosed
+  UnknownDriver(name: Str)
+  DuplicateConnClose
+  MissingDestination(name: Str, type_name: Str)
+
+  def message -> Str {
+    case self {
+      NoRows => "sql: no rows in result set"
+      ConnDone => "sql: connection is already closed"
+      TxDone => "sql: transaction has already been committed or rolled back"
+      DbClosed => "sql: database is closed"
+      RowsClosed => "sql: Rows are closed"
+      NoRowsAvailable => "sql: no Rows available"
+      StmtClosed => "sql: statement is closed"
+      UnknownDriver(n) => "sql: unknown driver #{strconv.quote(n)} (forgotten import?)"
+      DuplicateConnClose => "sql: duplicate driverConn close"
+      MissingDestination(n, t) => "sql: missing destination name #{n} in #{t}"
+    }
+  }
+}
+
+pub ERR_NO_ROWS = SqlError.NoRows
+pub ERR_CONN_DONE = SqlError.ConnDone
+pub ERR_TX_DONE = SqlError.TxDone
+
+# Whether `e` is ERR_NO_ROWS (Go's errors.Is(err, sql.ErrNoRows)).
+pub def no_rows?(e: Error) -> Bool {
+  case e {
+    SqlError.NoRows => true
+    _ => false
+  }
+}
+
+def is_tx_done?(e: Error) -> Bool {
+  case e {
+    SqlError.TxDone => true
+    _ => false
+  }
+}
+
+# ctx.err as an Error?.
+def ctx_err(ctx: context.Context) -> Error? {
+  if e = ctx.err {
+    return e
+  }
+  none
+}
+
+def ctx_error(ctx: context.Context) -> Error {
+  if e = ctx.err {
+    return e
+  }
+  Failure.Msg("context: not done")
+}
+
+# Go's DB.retry tries twice with a cached connection, then once with a new
+# one, while the error is ERR_BAD_CONN: `r = f(CACHED); r = f(CACHED) if
+# retry?(r.err); r = f(ALWAYS_NEW) if retry?(r.err)`.
+def retry?(e: Error?) -> Bool { bad_conn?(e) }
+
+def bad_conn?(e: Error?) -> Bool {
+  if x = e {
+    return driver.bad_conn?(x)
+  }
+  false
+}
+
+# -------------------------------------------------------- isolation levels
+
+pub LEVEL_DEFAULT = 0
+pub LEVEL_READ_UNCOMMITTED = 1
+pub LEVEL_READ_COMMITTED = 2
+pub LEVEL_WRITE_COMMITTED = 3
+pub LEVEL_REPEATABLE_READ = 4
+pub LEVEL_SNAPSHOT = 5
+pub LEVEL_SERIALIZABLE = 6
+pub LEVEL_LINEARIZABLE = 7
+
+# Go's IsolationLevel.String.
+pub def isolation_name(i: Int) -> Str {
+  case i {
+    0 => "Default"
+    1 => "Read Uncommitted"
+    2 => "Read Committed"
+    3 => "Write Committed"
+    4 => "Repeatable Read"
+    5 => "Snapshot"
+    6 => "Serializable"
+    7 => "Linearizable"
+    _ => "IsolationLevel(#{i})"
+  }
+}
+
+# Options for begin_tx: an isolation level (LEVEL_*) and read-only.
+pub struct TxOptions {
+  isolation: Int
+  read_only: Bool
+}
+
+# ------------------------------------------------------------- named args
+
+# An argument with a name (Go's sql.Named): put it in the argument tuple.
+pub struct NamedArg[T] {
+  name: Str
+  value: T
+
+  pub def sql_value -> ~driver.Value { driver.~to_value(value) }
+  pub def sql_arg(ordinal: Int) -> ~driver.NamedValue {
+    driver.NamedValue.new(name: name, ordinal: ordinal, value: driver.~to_value(value))
+  }
+  pub def sql_args -> ~[driver.NamedValue] { [self.~sql_arg(1)] }
+}
+
+pub def named[T](name: Str, value: T) -> NamedArg[T] { NamedArg.new(name: name, value: value) }
+
+# ---------------------------------------------------------------- registry
+
+# A table of drivers by name (Go's package-level Register/Open/Drivers; see
+# the header).
+pub struct Registry {
+  st: Mutex[Map[Str, driver.Driver]]
+
+  # Makes a driver available by `name`. Registering a name twice panics,
+  # as in Go.
+  pub def register(name: Str, d: driver.Driver) {
+    dup = st.lock { |m|
+      had = m[name] != none
+      m[name] = d if !had
+      had
+    }
+    panic "sql: Register called twice for driver #{name}" if dup
+  }
+
+  # The registered names, sorted.
+  pub def drivers -> [Str] {
+    names = st.lock { |m| m.keys }
+    names.sort
+  }
+
+  # Opens a DB for the driver `name` (Go's sql.Open): no connection is made
+  # yet.
+  pub def open(name: Str, dsn: Str) -> ~DB {
+    d = st.lock { |m| m[name] }
+    if x = d {
+      return ~open_driver(x, dsn)
+    }
+    fail SqlError.UnknownDriver(name: name)
+  }
+}
+
+pub def new_registry -> Registry {
+  m: Map[Str, driver.Driver] = {}
+  Registry.new(st: Mutex.new(m))
+}
+
+# ------------------------------------------------------------------ the DB
+
+# Where a DB gets connections: a Connector, or a Driver and its DSN (Go's
+# dsnConnector; kept apart because a Connector can't hold a Driver, D12).
+enum Source {
+  Dsn(d: driver.Driver, dsn: Str)
+  Conn(c: driver.Connector)
+}
+
+# Strategies for getting a connection.
+ALWAYS_NEW_CONN = 0
+CACHED_OR_NEW_CONN = 1
+
+DEFAULT_MAX_IDLE_CONNS = 2
+MAX_BAD_CONN_RETRIES = 2
+
+# A connection the pool owns (Go's driverConn): the driver's Conn and its
+# lock (held around every driver call: a driver Conn is used by one task at
+# a time), plus pool bookkeeping. Copies share it.
+struct DriverConn {
+  id: Int
+  ci: driver.Conn
+  created_at: Int
+  lock: sync.Lock
+  st: Mutex[DcState]
+
+  def expired?(timeout: Int, now: Int) -> Bool {
+    timeout > 0 && created_at + timeout < now
+  }
+
+  def in_use? -> Bool { st.lock { |d| d.in_use } }
+}
+
+struct DcState {
+  need_reset: Bool
+  closed: Bool
+  final_closed: Bool
+  open_stmt: Map[Int, DriverStmt]
+  in_use: Bool
+  dbmu_closed: Bool
+  returned_at: Int
+  # Statements to close when the connection is next returned (Go's onPut).
+  on_put: [DriverStmt]
+}
+
+# A driver statement on one connection (Go's driverStmt); its lock is the
+# connection's.
+struct DriverStmt {
+  id: Int
+  si: driver.Stmt
+  lock: sync.Lock
+  st: Mutex[DsState]
+
+  def close -> ~Unit {
+    lock.lock
+    defer lock.unlock
+    first = st.lock { |s|
+      f = !s.closed
+      s.closed = true
+      f
+    }
+    if !first {
+      err = st.lock { |s| s.close_err }
+      if e = err {
+        fail e
+      }
+      return nil
+    }
+    r = si.close
+    st.lock { |s|
+      s.close_err = r.err
+      nil
+    }
+    ~r
+  }
+}
+
+struct DsState {
+  closed: Bool
+  close_err: Error?
+}
+
+def new_driver_stmt(id: Int, si: driver.Stmt, lock: sync.Lock) -> DriverStmt {
+  DriverStmt.new(id: id, si: si, lock: lock, st: Mutex.new(DsState.new(closed: false, close_err: none)))
+}
+
+# A pending wait for a connection.
+struct ConnRequest {
+  conn: DriverConn?
+  err: Error?
+}
+
+struct DbState {
+  free_conn: [DriverConn]
+  conn_requests: Map[Int, Chan[ConnRequest]]
+  next_request: Int
+  num_open: Int
+  closed: Bool
+  # finalCloser id -> the ids depending on it (Go's dep map).
+  dep: Map[Int, [Int]]
+  max_idle_count: Int
+  max_open: Int
+  max_lifetime: Int
+  max_idle_time: Int
+  cleaner_ch: Chan[Bool]?
+  wait_count: Int
+  max_idle_closed: Int
+  max_idle_time_closed: Int
+  max_lifetime_closed: Int
+  rng: U64
+
+  def max_idle_conns_locked -> Int {
+    n = max_idle_count
+    if n == 0 {
+      return DEFAULT_MAX_IDLE_CONNS
+    }
+    n < 0 ? 0 : n
+  }
+
+  def shortest_idle_time_locked -> Int {
+    return max_lifetime if max_idle_time <= 0
+    return max_idle_time if max_lifetime <= 0
+    max_idle_time < max_lifetime ? max_idle_time : max_lifetime
+  }
+
+  def add_dep_locked!(x: Int, d: Int) {
+    if deps = dep[x] {
+      self.dep[x] = deps + [d]
+    } else {
+      self.dep[x] = [d]
+    }
+  }
+
+  # Removes `dep` from x's dependencies; true when it was the last (x must
+  # then be finally closed by the caller). Unpaired removals panic, as Go's.
+  def remove_dep_locked!(x: Int, d: Int) -> Bool {
+    deps = dep[x] || []
+    panic "unpaired removeDep: no deps for #{x}" if dep[x] == none
+    i = -1
+    k = 0
+    while k < deps.size {
+      if deps[k] == d {
+        i = k
+        break
+      }
+      k += 1
+    }
+    panic "unpaired removeDep: no #{d} dep on #{x}" if i < 0
+    rest = deps[0...i] + deps[i + 1...deps.size]
+    if rest.size == 0 {
+      self.dep.delete(x)
+      return true
+    }
+    self.dep[x] = rest
+    false
+  }
+
+  # Go's connectionCleanerRunLocked: takes the idle connections past
+  # max_idle_time and those past max_lifetime out of the pool; returns the
+  # time until the next one expires and the connections to close.
+  def cleaner_run_locked!(d0: Int, now: Int) -> (Int, [DriverConn]) {
+    d = d0
+    idle_closing = 0
+    closing: [DriverConn] = []
+    if max_idle_time > 0 {
+      idle_since = now - max_idle_time
+      i = free_conn.size - 1
+      while i >= 0 {
+        c = free_conn[i]
+        if c.st.lock { |x| x.returned_at } < idle_since {
+          i += 1
+          closing = free_conn[0...i]
+          self.free_conn = free_conn[i...free_conn.size]
+          idle_closing = closing.size
+          self.max_idle_time_closed += idle_closing
+          break
+        }
+        i -= 1
+      }
+      if free_conn.size > 0 {
+        d2 = free_conn[0].st.lock { |x| x.returned_at } - idle_since
+        d = d2 if d2 < d
+      }
+    }
+    if max_lifetime > 0 {
+      expired_since = now - max_lifetime
+      keep: [DriverConn] = []
+      for c in free_conn {
+        if c.created_at < expired_since {
+          closing << c
+        } else {
+          keep << c
+          d2 = c.created_at - expired_since
+          d = d2 if d2 < d
+        }
+      }
+      self.free_conn = keep
+      self.max_lifetime_closed += closing.size - idle_closing
+    }
+    (d, closing)
+  }
+
+  def add_request!(req: Chan[ConnRequest]) -> Int {
+    self.next_request += 1
+    self.conn_requests[next_request] = req
+    next_request
+  }
+
+  # A waiting request, chosen at random (Go's TakeRandom), and removed.
+  def take_random!(dummy: Int) -> Chan[ConnRequest]? {
+    n = conn_requests.size
+    return none if n == 0
+    self.rng = rng *% 6364136223846793005 +% 1442695040888963407
+    pick = ((rng >> 33) % n.to_u64).to_i
+    k = conn_requests.keys[pick]
+    conn_requests[k]
+    self.conn_requests.delete(k)
+  }
+
+  # Go's maybeOpenNewConnections: how many connections to open for the
+  # waiting requests (counted in num_open already); the caller starts them.
+  def maybe_open_new_connections!(dummy: Int) -> Int {
+    num_requests = conn_requests.size
+    if max_open > 0 {
+      can = max_open - num_open
+      num_requests = can if num_requests > can
+    }
+    n = 0
+    while num_requests > 0 {
+      self.num_open += 1
+      num_requests -= 1
+      return n if closed
+      n += 1
+    }
+    n
+  }
+
+  # Go's putConnDBLocked: hands dc (or err) to a waiting request, or keeps
+  # dc idle. False when the caller must close dc.
+  def put_conn_db_locked!(dc: DriverConn?, err: Error?) -> Bool {
+    return false if closed
+    return false if max_open > 0 && num_open > max_open
+    if req = self.take_random!(0) {
+      if err == none {
+        if c = dc {
+          c.st.lock { |d|
+            d.in_use = true
+            nil
+          }
+        }
+      }
+      req << ConnRequest.new(conn: dc, err: err)
+      return true
+    } else if err == none && !closed {
+      if max_idle_conns_locked > free_conn.size {
+        if c = dc {
+          self.free_conn << c
+        }
+        return true
+      }
+      self.max_idle_closed += 1
+    }
+    false
+  }
+}
+
+# A pool of connections to one database (Go's *DB). Safe for concurrent use
+# by any number of tasks; copies are the same pool.
+pub struct DB {
+  src: Source
+  # Tells DBs apart (Go compares *DB pointers).
+  uid: Int
+  st: Mutex[DbState]
+  wait_duration: Atomic[Int]
+  num_closed: Atomic[Int]
+  ids: Atomic[Int]
+  # Added to the clock (Go's nowFunc, for tests of lifetimes).
+  clock_skew: Atomic[Int]
+
+  def now_ns -> Int { time.now.unix_nano + clock_skew.load }
+  def next_id -> Int { ids.add(1) }
+
+  # The driver (Go's DB.Driver); none for a DB made by open_db.
+  pub def driver -> driver.Driver? {
+    case src {
+      Dsn(d, _) => d
+      Conn(_) => none
+    }
+  }
+
+  def connect(ctx: context.Context) -> ~driver.Conn {
+    case src {
+      Dsn(d, dsn) => d.~open(dsn)
+      Conn(c) => c.~connect(ctx)
+    }
+  }
+
+  def new_driver_conn(ci: driver.Conn, in_use: Bool) -> DriverConn {
+    now = now_ns
+    om: Map[Int, DriverStmt] = {}
+    st0 = DcState.new(need_reset: false, closed: false, final_closed: false, open_stmt: om, in_use: in_use, dbmu_closed: false, returned_at: now, on_put: [])
+    DriverConn.new(id: next_id, ci: ci, created_at: now, lock: sync.new_lock, st: Mutex.new(st0))
+  }
+
+  # Starts `n` connection openers (Go's connectionOpener receives one per
+  # request).
+  def start_openers(n: Int) -> Unit {
+    db = self
+    for _i in 0...n {
+      _ = spawn { db.open_new_connection }
+    }
+  }
+
+  def open_new_connection -> Unit {
+    r = connect(context.background)
+    keep = false
+    dc: DriverConn? = none
+    opens = st.lock { |s|
+      k = 0
+      if s.closed {
+        s.num_open -= 1
+      } else if e = r.err {
+        s.num_open -= 1
+        _ = s.put_conn_db_locked!(none, e)
+        k = s.maybe_open_new_connections!(0)
+      } else {
+        c = new_driver_conn(r.unwrap, false)
+        dc = c
+        if s.put_conn_db_locked!(c, none) {
+          s.add_dep_locked!(c.id, c.id)
+          keep = true
+        } else {
+          s.num_open -= 1
+        }
+      }
+      k
+    }
+    start_openers(opens)
+    if !keep {
+      if ci = r.ok {
+        _ = ci.close
+      }
+    }
+    maybe_start_cleaner if keep
+  }
+
+  # Go's DB.conn: a connection, new or cached.
+  def conn(ctx: context.Context, strategy: Int) -> ~DriverConn {
+    req: Chan[ConnRequest]? = none
+    handle = 0
+    cached: DriverConn? = none
+    cached_expired = false
+    closed = false
+    canceled = false
+    open_new = false
+    lifetime = 0
+    st.lock { |s|
+      lifetime = s.max_lifetime
+      if s.closed {
+        closed = true
+      } else if ctx.done? {
+        canceled = true
+      } else if strategy == CACHED_OR_NEW_CONN && s.free_conn.size > 0 {
+        last = s.free_conn.size - 1
+        c = s.free_conn[last]
+        s.free_conn = s.free_conn[0...last]
+        c.st.lock { |d|
+          d.in_use = true
+          nil
+        }
+        cached = c
+        if c.expired?(lifetime, now_ns) {
+          s.max_lifetime_closed += 1
+          cached_expired = true
+        }
+      } else if s.max_open > 0 && s.num_open >= s.max_open {
+        ch = Chan[ConnRequest].new(1)
+        handle = s.add_request!(ch)
+        s.wait_count += 1
+        req = ch
+      } else {
+        s.num_open += 1
+        open_new = true
+      }
+      nil
+    }
+    fail SqlError.DbClosed if closed
+    fail ctx_error(ctx) if canceled
+    if c = cached {
+      if cached_expired {
+        _ = close_conn(c)
+        fail driver.ERR_BAD_CONN
+      }
+      r = reset_session(c, ctx)
+      if e = r.err {
+        if driver.bad_conn?(e) {
+          _ = close_conn(c)
+          fail e
+        }
+      }
+      return c
+    }
+    if ch = req {
+      wait_start = time.now.unix_nano
+      got: ConnRequest? = none
+      done = ctx.done
+      ended = false
+      select {
+        when r = ch.recv => {
+          got = r
+          ended = r == none
+        }
+        when done.recv => {}
+      }
+      wait_duration.add(time.now.unix_nano - wait_start)
+      if got == none && !ended {
+        # The context ended first.
+        deleted = st.lock { |s| s.conn_requests.delete(handle) != none }
+        if !deleted {
+          select {
+            when r = ch.recv => {
+              if x = r {
+                if c = x.conn {
+                  put_conn(c, x.err, false)
+                }
+              }
+            }
+            else => {}
+          }
+        }
+        fail ctx_error(ctx)
+      }
+      fail SqlError.DbClosed if ended
+      ret = got.unwrap
+      if strategy == CACHED_OR_NEW_CONN && ret.err == none {
+        if c = ret.conn {
+          if c.expired?(lifetime, now_ns) {
+            st.lock { |s|
+              s.max_lifetime_closed += 1
+              nil
+            }
+            _ = close_conn(c)
+            fail driver.ERR_BAD_CONN
+          }
+        }
+      }
+      if c = ret.conn {
+        r = reset_session(c, ctx)
+        if e = r.err {
+          if driver.bad_conn?(e) {
+            _ = close_conn(c)
+            fail e
+          }
+        }
+        if e = ret.err {
+          fail e
+        }
+        return c
+      }
+      if e = ret.err {
+        fail e
+      }
+      fail driver.ERR_BAD_CONN
+    }
+    # open_new
+    r = connect(ctx)
+    if e = r.err {
+      n = st.lock { |s|
+        s.num_open -= 1
+        s.maybe_open_new_connections!(0)
+      }
+      start_openers(n)
+      fail e
+    }
+    dc = new_driver_conn(r.unwrap, true)
+    st.lock { |s|
+      s.add_dep_locked!(dc.id, dc.id)
+      nil
+    }
+    dc
+  }
+
+  def reset_session(dc: DriverConn, ctx: context.Context) -> ~Unit {
+    dc.lock.lock
+    defer dc.lock.unlock
+    need = dc.st.lock { |d| d.need_reset }
+    return nil if !need
+    dc.ci.~reset_session(ctx)
+  }
+
+  def validate_connection(dc: DriverConn, needs_reset: Bool) -> Bool {
+    dc.lock.lock
+    defer dc.lock.unlock
+    if needs_reset {
+      dc.st.lock { |d|
+        d.need_reset = true
+        nil
+      }
+    }
+    dc.ci.valid?
+  }
+
+  # Go's driverConn.Close: the pool's reference to dc ends; the driver Conn
+  # closes once nothing depends on it.
+  def close_conn(dc: DriverConn) -> ~Unit {
+    dup = dc.st.lock { |d|
+      was = d.closed
+      d.closed = true
+      d.dbmu_closed = true if !was
+      was
+    }
+    fail SqlError.DuplicateConnClose if dup
+    last = st.lock { |s| s.remove_dep_locked!(dc.id, dc.id) }
+    return nil if !last
+    ~final_close_conn(dc)
+  }
+
+  # Go's driverConn.closeDBLocked, for close: marks dc closed; true when the
+  # caller must final-close it.
+  def final_close_conn(dc: DriverConn) -> ~Unit {
+    stmts = dc.st.lock { |d|
+      xs = d.open_stmt.values
+      d.open_stmt = {}
+      xs
+    }
+    for ds in stmts {
+      _ = ds.close
+    }
+    dc.lock.lock
+    dc.st.lock { |d|
+      d.final_closed = true
+      nil
+    }
+    r = dc.ci.close
+    dc.lock.unlock
+    n = st.lock { |s|
+      s.num_open -= 1
+      s.maybe_open_new_connections!(0)
+    }
+    start_openers(n)
+    num_closed.add(1)
+    ~r
+  }
+
+  # Go's noteUnusedDriverStatement.
+  def note_unused_driver_statement(c: DriverConn, ds: DriverStmt) -> Unit {
+    close_now = false
+    st.lock { |s|
+      c.st.lock { |d|
+        if d.in_use {
+          d.on_put << ds
+        } else {
+          close_now = !d.final_closed
+        }
+        nil
+      }
+      nil
+    }
+    if close_now {
+      _ = ds.close
+    }
+  }
+
+  # Go's putConn: returns dc to the pool (or closes it after a bad-conn error).
+  def put_conn(dc: DriverConn, err0: Error?, reset_sess: Bool) -> Unit {
+    err = err0
+    if !bad_conn?(err) {
+      if !validate_connection(dc, reset_sess) {
+        err = driver.ERR_BAD_CONN
+      }
+    }
+    pending: [DriverStmt] = []
+    close_it = false
+    opens = 0
+    added = false
+    st.lock { |s|
+      in_use = dc.st.lock { |d| d.in_use }
+      panic "sql: connection returned that was never out" if !in_use
+      if !bad_conn?(err) && dc.expired?(s.max_lifetime, now_ns) {
+        s.max_lifetime_closed += 1
+        err = driver.ERR_BAD_CONN
+      }
+      now = now_ns
+      pending = dc.st.lock { |d|
+        d.in_use = false
+        d.returned_at = now
+        p = d.on_put
+        d.on_put = []
+        p
+      }
+      if bad_conn?(err) {
+        opens = s.maybe_open_new_connections!(0)
+        close_it = true
+      } else {
+        added = s.put_conn_db_locked!(dc, none)
+        close_it = !added
+      }
+      nil
+    }
+    for ds in pending {
+      _ = ds.close
+    }
+    maybe_start_cleaner if added
+    start_openers(opens)
+    if close_it {
+      _ = close_conn(dc)
+    }
+  }
+
+  # ------------------------------------------------------------ settings
+
+  # Go's SetMaxIdleConns: n <= 0 keeps no idle connections.
+  pub def set_max_idle_conns(n: Int) {
+    closing = st.lock { |s|
+      s.max_idle_count = n > 0 ? n : -1
+      if s.max_open > 0 && s.max_idle_conns_locked > s.max_open {
+        s.max_idle_count = s.max_open
+      }
+      out: [DriverConn] = []
+      idle = s.free_conn.size
+      max_idle = s.max_idle_conns_locked
+      if idle > max_idle {
+        out = s.free_conn[max_idle...idle]
+        s.free_conn = s.free_conn[0...max_idle]
+      }
+      s.max_idle_closed += out.size
+      out
+    }
+    for c in closing {
+      _ = close_conn(c)
+    }
+  }
+
+  # Go's SetMaxOpenConns: n <= 0 means no limit.
+  pub def set_max_open_conns(n: Int) {
+    sync_idle = st.lock { |s|
+      s.max_open = n < 0 ? 0 : n
+      s.max_open > 0 && s.max_idle_conns_locked > s.max_open
+    }
+    set_max_idle_conns(n) if sync_idle
+  }
+
+  # Go's SetConnMaxLifetime: connections older than d are closed lazily.
+  pub def set_conn_max_lifetime(d: time.Duration) {
+    ns = d.nanoseconds < 0 ? 0 : d.nanoseconds
+    st.lock { |s|
+      if ns > 0 && ns < s.shortest_idle_time_locked {
+        if ch = s.cleaner_ch {
+          select {
+            when ch.send(true) => {}
+            else => {}
+          }
+        }
+      }
+      s.max_lifetime = ns
+      nil
+    }
+    maybe_start_cleaner
+  }
+
+  # Go's SetConnMaxIdleTime.
+  pub def set_conn_max_idle_time(d: time.Duration) {
+    ns = d.nanoseconds < 0 ? 0 : d.nanoseconds
+    st.lock { |s|
+      if ns > 0 && ns < s.shortest_idle_time_locked {
+        if ch = s.cleaner_ch {
+          select {
+            when ch.send(true) => {}
+            else => {}
+          }
+        }
+      }
+      s.max_idle_time = ns
+      nil
+    }
+    maybe_start_cleaner
+  }
+
+  # Go's startCleanerLocked: starts the cleaner task if limits are set,
+  # connections are open and none runs yet.
+  def maybe_start_cleaner -> Unit {
+    go = st.lock { |s|
+      r: (Chan[Bool], Int)? = none
+      if (s.max_lifetime > 0 || s.max_idle_time > 0) && s.num_open > 0 && s.cleaner_ch == none {
+        c = Chan[Bool].new(1)
+        s.cleaner_ch = c
+        r = (c, s.shortest_idle_time_locked)
+      }
+      r
+    }
+    if x = go {
+      db = self
+      ch = x[0]
+      d = x[1]
+      _ = spawn { db.connection_cleaner(d, ch) }
+    }
+  }
+
+  def connection_cleaner(d0: Int, ch: Chan[Bool]) -> Unit {
+    min_interval = 1000000000
+    d = d0 < min_interval ? min_interval : d0
+    loop {
+      timer = time.after(time.duration(d))
+      select {
+        when timer.recv => {}
+        when ch.recv => {}
+      }
+      stop = false
+      now = now_ns
+      closing = st.lock { |s|
+        d = s.shortest_idle_time_locked
+        out: [DriverConn] = []
+        if s.closed || s.num_open == 0 || d <= 0 {
+          s.cleaner_ch = none
+          stop = true
+        } else {
+          r = s.cleaner_run_locked!(d, now)
+          d = r[0]
+          out = r[1]
+        }
+        out
+      }
+      break if stop
+      for c in closing {
+        _ = close_conn(c)
+      }
+      d = min_interval if d < min_interval
+    }
+  }
+
+  # ------------------------------------------------------------- the API
+
+  def add_dep(x: Int, dep: Int) {
+    st.lock { |s|
+      s.add_dep_locked!(x, dep)
+      nil
+    }
+  }
+
+  # True when it was x's last dependency (the caller final-closes x).
+  def remove_dep(x: Int, dep: Int) -> Bool {
+    st.lock { |s| s.remove_dep_locked!(x, dep) }
+  }
+
+  def rel(dc: DriverConn) -> Release { db_release(self, dc) }
+
+  # Executes a statement that returns no rows (see the header for `args`).
+  pub def exec[A](query: Str, args: A) -> ~Result { ~exec_context(context.background, query, args) }
+
+  pub def exec_context[A](ctx: context.Context, query: Str, args: A) -> ~Result {
+    nv = driver.~to_named_values(args)
+    r = exec_once(ctx, query, nv, CACHED_OR_NEW_CONN)
+    r = exec_once(ctx, query, nv, CACHED_OR_NEW_CONN) if retry?(r.err)
+    r = exec_once(ctx, query, nv, ALWAYS_NEW_CONN) if retry?(r.err)
+    ~r
+  }
+
+  def exec_once(ctx: context.Context, query: Str, nv: [driver.NamedValue], strategy: Int) -> ~Result {
+    dc = ~conn(ctx, strategy)
+    ~exec_dc(self, ctx, dc, rel(dc), query, nv)
+  }
+
+  # Runs a query that returns rows.
+  pub def query[A](query: Str, args: A) -> ~Rows { ~query_context(context.background, query, args) }
+
+  pub def query_context[A](ctx: context.Context, query: Str, args: A) -> ~Rows {
+    nv = driver.~to_named_values(args)
+    r = query_once(ctx, query, nv, CACHED_OR_NEW_CONN)
+    r = query_once(ctx, query, nv, CACHED_OR_NEW_CONN) if retry?(r.err)
+    r = query_once(ctx, query, nv, ALWAYS_NEW_CONN) if retry?(r.err)
+    ~r
+  }
+
+  def query_once(ctx: context.Context, query: Str, nv: [driver.NamedValue], strategy: Int) -> ~Rows {
+    dc = ~conn(ctx, strategy)
+    ~query_dc(self, ctx, none, dc, rel(dc), query, nv)
+  }
+
+  # Runs a query expected to return at most one row; errors wait for scan.
+  pub def query_row[A](query: Str, args: A) -> Row { query_row_context(context.background, query, args) }
+
+  pub def query_row_context[A](ctx: context.Context, query: Str, args: A) -> Row {
+    r = query_context(ctx, query, args)
+    if e = r.err {
+      return Row.new(e0: e, rows: none)
+    }
+    Row.new(e0: none, rows: r.unwrap)
+  }
+
+  # Prepares a statement for later queries or execs, on any connection.
+  pub def prepare(query: Str) -> ~Stmt { ~prepare_context(context.background, query) }
+
+  pub def prepare_context(ctx: context.Context, query: Str) -> ~Stmt {
+    r = prepare_once(ctx, query, CACHED_OR_NEW_CONN)
+    r = prepare_once(ctx, query, CACHED_OR_NEW_CONN) if retry?(r.err)
+    r = prepare_once(ctx, query, ALWAYS_NEW_CONN) if retry?(r.err)
+    ~r
+  }
+
+  def prepare_once(ctx: context.Context, query: Str, strategy: Int) -> ~Stmt {
+    dc = ~conn(ctx, strategy)
+    ~prepare_dc(self, ctx, dc, rel(dc), no_grabber, query)
+  }
+
+  # Starts a transaction with the default options.
+  pub def begin -> ~Tx { ~begin_tx(context.background, none) }
+
+  # Starts a transaction; it rolls back if ctx ends before commit.
+  pub def begin_tx(ctx: context.Context, opts: TxOptions?) -> ~Tx {
+    r = begin_once(ctx, opts, CACHED_OR_NEW_CONN)
+    r = begin_once(ctx, opts, CACHED_OR_NEW_CONN) if retry?(r.err)
+    r = begin_once(ctx, opts, ALWAYS_NEW_CONN) if retry?(r.err)
+    ~r
+  }
+
+  def begin_once(ctx: context.Context, opts: TxOptions?, strategy: Int) -> ~Tx {
+    dc = ~conn(ctx, strategy)
+    ~begin_dc(self, ctx, dc, BaseRelease.new(db: self, dc: dc, conn: none), opts)
+  }
+
+  # A single connection, for work that needs one session (Go's DB.Conn).
+  pub def conn_context(ctx: context.Context) -> ~Conn {
+    r = conn(ctx, CACHED_OR_NEW_CONN)
+    r = conn(ctx, CACHED_OR_NEW_CONN) if retry?(r.err)
+    r = conn(ctx, ALWAYS_NEW_CONN) if retry?(r.err)
+    dc = ~r
+    Conn.new(db: self, dc: dc, closemu: new_closing_mutex, done: Atomic.new(false))
+  }
+
+  # Go's Stats.
+  pub def stats -> DBStats {
+    wait = wait_duration.load
+    st.lock { |s|
+      DBStats.new(max_open_connections: s.max_open, open_connections: s.num_open, in_use: s.num_open - s.free_conn.size, idle: s.free_conn.size, wait_count: s.wait_count, wait_duration: time.duration(wait), max_idle_closed: s.max_idle_closed, max_idle_time_closed: s.max_idle_time_closed, max_lifetime_closed: s.max_lifetime_closed)
+    }
+  }
+
+  pub def ping -> ~Unit { ~ping_context(context.background) }
+
+  # Verifies a connection to the database is alive, connecting if needed.
+  pub def ping_context(ctx: context.Context) -> ~Unit {
+    r = conn(ctx, CACHED_OR_NEW_CONN)
+    r = conn(ctx, CACHED_OR_NEW_CONN) if retry?(r.err)
+    r = conn(ctx, ALWAYS_NEW_CONN) if retry?(r.err)
+    dc = ~r
+    ~ping_dc(ctx, dc, db_release(self, dc))
+  }
+
+  def ping_dc(ctx: context.Context, dc: DriverConn, rel: Release) -> ~Unit {
+    dc.lock.lock
+    r = dc.ci.ping(ctx)
+    dc.lock.unlock
+    release(rel, r.err)
+    ~r
+  }
+
+  # Closes the database and its idle connections; waits for nothing.
+  # Closing twice is fine (Go).
+  pub def close -> ~Unit {
+    already = false
+    free: [DriverConn] = []
+    reqs: [Chan[ConnRequest]] = []
+    cleaner: Chan[Bool]? = none
+    st.lock { |s|
+      if s.closed {
+        already = true
+      } else {
+        cleaner = s.cleaner_ch
+        free = s.free_conn
+        s.free_conn = []
+        s.closed = true
+        reqs = s.conn_requests.values
+        s.conn_requests = {}
+      }
+      nil
+    }
+    return nil if already
+    if ch = cleaner {
+      ch.close
+    }
+    err: Error? = none
+    for dc in free {
+      dup = dc.st.lock { |d|
+        was = d.closed
+        d.closed = true
+        was
+      }
+      if dup {
+        err = SqlError.DuplicateConnClose
+        next
+      }
+      last = st.lock { |s| s.remove_dep_locked!(dc.id, dc.id) }
+      if last {
+        r = final_close_conn(dc)
+        err = r.err if r.err?
+      }
+    }
+    for ch in reqs {
+      ch.close
+    }
+    case src {
+      Conn(c) => {
+        r = c.close
+        err = r.err if r.err?
+      }
+      _ => {}
+    }
+    if e = err {
+      fail e
+    }
+    nil
+  }
+}
+
+# Go's DBStats.
+pub struct DBStats {
+  max_open_connections: Int
+  open_connections: Int
+  in_use: Int
+  idle: Int
+  wait_count: Int
+  wait_duration: time.Duration
+  max_idle_closed: Int
+  max_idle_time_closed: Int
+  max_lifetime_closed: Int
+}
+
+def new_db(src: Source) -> DB {
+  cr: Map[Int, Chan[ConnRequest]] = {}
+  dep: Map[Int, [Int]] = {}
+  s = DbState.new(free_conn: [], conn_requests: cr, next_request: 0, num_open: 0, closed: false, dep: dep, max_idle_count: 0, max_open: 0, max_lifetime: 0, max_idle_time: 0, cleaner_ch: none, wait_count: 0, max_idle_closed: 0, max_idle_time_closed: 0, max_lifetime_closed: 0, rng: 88172645463325252)
+  DB.new(src: src, uid: time.now.unix_nano, st: Mutex.new(s), wait_duration: Atomic.new(0), num_closed: Atomic.new(0), ids: Atomic.new(0), clock_skew: Atomic.new(0))
+}
+
+# A DB over a Connector (Go's OpenDB). No connection is made yet.
+pub def open_db(c: driver.Connector) -> DB { new_db(Source.Conn(c: c)) }
+
+# A DB over a Driver and a data source name (Go's Open without the
+# registry): the driver's own Connector if it has one (DriverContext).
+pub def open_driver(d: driver.Driver, dsn: Str) -> ~DB {
+  r = d.open_connector(dsn)
+  if e = r.err {
+    return new_db(Source.Dsn(d: d, dsn: dsn)) if driver.skip?(e)
+    fail e
+  }
+  new_db(Source.Conn(c: r.unwrap))
+}

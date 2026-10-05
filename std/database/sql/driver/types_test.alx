@@ -1,0 +1,135 @@
+# Go's driver/types_test.go (TestValueConverters), plus the argument
+# protocol that replaces DefaultParameterConverter's reflection.
+
+import "time"
+
+struct ConvCase {
+  input: Value
+  out: Value
+  err: Str
+}
+
+def cc(input: Value, out: Value) -> ConvCase { ConvCase.new(input: input, out: out, err: "") }
+def ce(input: Value, err: Str) -> ConvCase { ConvCase.new(input: input, out: Value.Null, err: err) }
+
+def check_conv[C](c: C, cases: [ConvCase]) {
+  i = 0
+  for tt in cases {
+    r = c.convert_value(tt.input)
+    goterr = ""
+    if e = r.err {
+      goterr = e.message
+    }
+    assert goterr == tt.err, "test #{i}: #{tt.input} error = #{goterr}; want #{tt.err}"
+    if tt.err == "" {
+      assert r.unwrap == tt.out, "test #{i}: #{tt.input} = #{r.unwrap}; want #{tt.out}"
+    }
+    i += 1
+  }
+}
+
+test "value converters: Bool" {
+  check_conv(bool, [
+    cc(Value.Str("true"), Value.Bool(true)),
+    cc(Value.Str("True"), Value.Bool(true)),
+    cc(Value.Bytes("t".bytes), Value.Bool(true)),
+    cc(Value.Bool(true), Value.Bool(true)),
+    cc(Value.Str("1"), Value.Bool(true)),
+    cc(~to_value(1), Value.Bool(true)),
+    cc(~to_value(1.as_i64), Value.Bool(true)),
+    cc(~to_value(1.as_u16), Value.Bool(true)),
+    cc(Value.Str("false"), Value.Bool(false)),
+    cc(Value.Bool(false), Value.Bool(false)),
+    cc(Value.Str("0"), Value.Bool(false)),
+    cc(~to_value(0), Value.Bool(false)),
+    cc(~to_value(0.as_i64), Value.Bool(false)),
+    cc(~to_value(0.as_u16), Value.Bool(false)),
+    ce(Value.Str("foo"), "sql/driver: couldn't convert \"foo\" into type bool"),
+    ce(~to_value(2), "sql/driver: couldn't convert 2 into type bool"),
+    ce(Value.Float(1.5), "sql/driver: couldn't convert 1.5 (float64) into type bool"),
+  ])
+}
+
+test "value converters: Int32 and String" {
+  check_conv(int32, [
+    cc(~to_value(5), Value.Int(5)),
+    cc(Value.Str("-12"), Value.Int(-12)),
+    ce(~to_value(1 << 31), "sql/driver: value 2147483648 overflows int32"),
+    ce(Value.Str("x"), "sql/driver: value \"x\" can't be converted to int32"),
+    ce(Value.Bool(true), "sql/driver: unsupported value true (type bool) converting to int32"),
+  ])
+  check_conv(string, [
+    cc(Value.Str("a"), Value.Str("a")),
+    cc(Value.Bytes([1]), Value.Bytes([1])),
+    cc(Value.Int(7), Value.Str("7")),
+    cc(Value.Float(0.25), Value.Str("0.25")),
+    cc(Value.Bool(false), Value.Str("false")),
+  ])
+  check_conv(Null.new(converter: bool()), [cc(Value.Null, Value.Null), cc(Value.Str("t"), Value.Bool(true))])
+  check_conv(NotNull.new(converter: bool()), [ce(Value.Null, "nil value not allowed"), cc(Value.Int(0), Value.Bool(false))])
+}
+
+# A type of ours with a Value (Go's Valuer).
+struct Cents {
+  n: Int
+  def sql_value -> ~Value { Value.Str("$#{n / 100}.#{n % 100}") }
+}
+
+test "default parameter converter" {
+  now = time.now
+  check_conv(default_parameter_converter, [cc(Value.Time(now), Value.Time(now))])
+  assert_eq ~to_value(now), Value.Time(now)
+  n: Int? = none
+  assert_eq ~to_value(n), Value.Null
+  answer: Int? = 42
+  assert_eq ~to_value(answer), Value.Int(42)
+  assert_eq ~to_value(9.as_i8), Value.Int(9)
+  assert_eq ~to_value(0.1), Value.Float(0.1)
+  assert_eq ~to_value(true), Value.Bool(true)
+  bs: [Byte] = [1]
+  assert_eq ~to_value(bs), Value.Bytes([1])
+  assert_eq ~to_value("a"), Value.Str("a")
+  assert_eq ~to_value(Cents.new(n: 1234)), Value.Str("$12.34")
+  big: U64 = 1 << 63
+  assert_eq to_value(big).err?.message || "", "uint64 values with high bit set are not supported"
+  ok: U64 = (1 << 63) - 1
+  assert_eq ~to_value(ok), Value.Int(MAX_I64)
+}
+
+MAX_I64 = 9223372036854775807
+
+test "argument lists" {
+  assert_eq (~to_named_values(nil)).size, 0
+  one = ~to_named_values(5)
+  assert one == [NamedValue.new(name: "", ordinal: 1, value: Value.Int(5))], "one"
+  s: Str? = none
+  two = ~to_named_values(("x", s))
+  assert_eq two[0].value, Value.Str("x")
+  assert_eq two[1].value, Value.Null
+  assert_eq two[1].ordinal, 2
+  mixed = ~to_named_values((1, 2.5, true, "s", Cents.new(n: 5), NamedValue.new(name: "p", ordinal: 0, value: Value.Int(3))))
+  assert_eq mixed.size, 6
+  assert_eq mixed[4].value, Value.Str("$0.5")
+  assert_eq mixed[5].name, "p"
+  assert_eq mixed[5].ordinal, 6
+  vs = ~to_named_values([Value.Int(1), Value.Null])
+  assert_eq vs[1].ordinal, 2
+  hb: U64 = 1 << 63
+  assert_eq to_named_values((1, hb)).err?.message || "", "uint64 values with high bit set are not supported"
+}
+
+test "named values to values" {
+  vals = ~named_values_to_values(~to_named_values((1, "a")))
+  assert vals == [Value.Int(1), Value.Str("a")], "vals"
+  r = named_values_to_values([NamedValue.new(name: "x", ordinal: 1, value: Value.Null)])
+  assert_eq r.err?.message || "", "sql: driver does not support the use of Named Parameters"
+}
+
+test "errors and results" {
+  assert_eq ERR_BAD_CONN.message, "driver: bad connection"
+  assert_eq ERR_SKIP.message, "driver: skip fast-path; continue as if unimplemented"
+  ra = RowsAffected.new(n: 3)
+  assert_eq ~ra.rows_affected, 3
+  assert_eq ra.last_insert_id.err?.message || "", "LastInsertId is not supported by this driver"
+  assert_eq ResultNoRows.new.rows_affected.err?.message || "", "no RowsAffected available after DDL statement"
+}

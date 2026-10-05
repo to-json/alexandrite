@@ -346,6 +346,9 @@ pub enum M {
     ToIface(usize),
     /// Call method `k` (declaration order) of an interface value.
     IfaceCall(usize),
+    /// `v.as(T)`: the interface value as implementor `k` (a `T?`; Go's
+    /// `t, ok := v.(T)`).
+    IfaceAs(usize),
     /// Build variant `k` of an enum: args are every slot after the tag.
     VariantNew(usize),
     /// `find { pred }` → T? (a select stage, then this terminal).

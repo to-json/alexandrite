@@ -33,6 +33,72 @@ pub struct Opts {
     pub rename: Option<String>,
     pub skip: bool,
     pub omit_empty: bool,
+    /// `#[field(db: "user_id", json: "id,omitempty")]`: one string per key,
+    /// Go's struct tag in alx syntax; each derive reads its own key.
+    pub tags: Vec<(String, String)>,
+}
+
+impl Opts {
+    /// The value of `#[field(key: "...")]`.
+    pub fn tag(&self, key: &str) -> Option<&str> {
+        self.tags.iter().find(|(k, _)| k == key).map(|(_, v)| v.as_str())
+    }
+}
+
+/// Parse `#[field(key: "value", ...)]` (Go's struct tag: `db:"x" json:"y"`)
+/// into `o`. The `json` key is read as Go's json tag (`"name,omitempty"`,
+/// `"-"`), so the Json derive honours it too.
+pub fn apply_field_attr(text: &str, sp: Span, o: &mut Opts) -> Result<(), Diag> {
+    let inner = text.trim().strip_prefix("field").map(str::trim_start).and_then(|r| r.strip_prefix('(')).and_then(|r| r.trim_end().strip_suffix(')'));
+    let Some(inner) = inner else {
+        return Err(Diag::new(sp, format!("unknown attribute `#[{text}]`")).note("write `#[field(db: \"name\", json: \"name,omitempty\")]`"));
+    };
+    for a in split_args(inner) {
+        let a = a.trim();
+        if a.is_empty() {
+            continue;
+        }
+        let bad = || Diag::new(sp, format!("`#[field(...)]` takes `key: \"value\"` pairs, found `{a}`"));
+        let (k, v) = a.split_once(':').ok_or_else(bad)?;
+        let (k, v) = (k.trim(), v.trim());
+        if k.is_empty() || !k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+            return Err(bad());
+        }
+        let v = v.strip_prefix('"').and_then(|v| v.strip_suffix('"')).ok_or_else(bad)?;
+        let v = unescape(v);
+        if o.tag(k).is_some() {
+            return Err(Diag::new(sp, format!("`#[field(...)]` names `{k}` twice")));
+        }
+        if k == "json" {
+            let mut parts = v.split(',');
+            match parts.next().unwrap_or("") {
+                "-" if !v.contains(',') => o.skip = true,
+                "" => {}
+                n => o.rename = Some(n.to_string()),
+            }
+            for p in parts {
+                match p {
+                    "omitempty" | "omit_empty" => o.omit_empty = true,
+                    "" => {}
+                    _ => return Err(Diag::new(sp, format!("unknown json tag option `{p}`")).note("options: omitempty")),
+                }
+            }
+        }
+        o.tags.push((k.to_string(), v));
+    }
+    Ok(())
+}
+
+/// A field or variant attribute (`#[json(...)]` or `#[field(...)]`), if `text` is one.
+pub fn apply_member_attr(text: &str, sp: Span, o: &mut Opts) -> Option<Result<(), Diag>> {
+    let t = text.trim_start();
+    if t.starts_with("json") {
+        Some(apply_json_attr(text, sp, o))
+    } else if t.starts_with("field") {
+        Some(apply_field_attr(text, sp, o))
+    } else {
+        None
+    }
 }
 
 /// Parse the text of one `#[json(...)]` attribute into `o`.
@@ -114,8 +180,8 @@ pub fn derive_names(text: &str, sp: Span) -> Result<Option<Vec<String>>, Diag> {
     let names: Vec<String> = inner.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
     for n in &names {
         // Eq and Show are structural already (D13, D14): accepted, nothing to generate.
-        if !matches!(n.as_str(), "Json" | "Eq" | "Show") {
-            return Err(Diag::new(sp, format!("can't derive `{n}`")).note("derivable: Json (generates to_json / from_json); Eq and Show are accepted and need nothing: structs, tuples and enums already compare and print field by field"));
+        if !matches!(n.as_str(), "Json" | "Row" | "Eq" | "Show") {
+            return Err(Diag::new(sp, format!("can't derive `{n}`")).note("derivable: Json (generates to_json / from_json), Row (database/sql: `Type.from_sql_row`); Eq and Show are accepted and need nothing: structs, tuples and enums already compare and print field by field"));
         }
     }
     Ok(Some(names))
@@ -144,6 +210,8 @@ pub enum DShape {
 
 #[derive(Clone, Debug)]
 pub struct DeriveJob {
+    /// Which derive: "Json" or "Row".
+    pub kind: &'static str,
     pub name: String,
     pub tparams: Vec<String>,
     pub public: bool,
@@ -781,4 +849,49 @@ impl<'a> Gen<'a> {
             _ => return None,
         })
     }
+}
+
+/// `#[derive(Row)]`: `def self.from_sql_row(r: S.RawRow) -> ~T`, where `S` is
+/// the local name of the `database/sql` import. Columns map to fields by
+/// name: `#[field(db: "name")]`, else the field's name; case-insensitively,
+/// as sqlx does. A column no field takes is an error (sqlx's "missing
+/// destination name"); `#[field(db: "-")]` leaves a field out; fields no
+/// column names stay zero. Each value converts with `S.convert_column`, the
+/// conversion `rows.scan` uses (Go's convertAssign).
+pub fn row_source(job: &DeriveJob, alias: &str) -> Result<String, Diag> {
+    let fail = |m: String| Diag::new(job.span, format!("derive(Row) on `{}`: {m}", job.name));
+    if !job.tparams.is_empty() {
+        return Err(fail("generic types can't derive Row yet".to_string()));
+    }
+    let DShape::Struct(fields) = &job.shape else {
+        return Err(fail("only a struct can derive Row (its fields are the columns)".to_string()));
+    };
+    let name = &job.name;
+    let mut o = String::new();
+    o.push_str(&format!("struct {name} {{\n  pub def self.from_sql_row(_row: {alias}.RawRow) -> ~{name} {{\n"));
+    o.push_str(&format!("    _r = {name}.new\n    _i = 0\n    while _i < _row.columns.size {{\n      _c = {alias}.lower_ascii(_row.columns[_i])\n"));
+    let mut seen: Vec<String> = vec![];
+    let mut first = true;
+    for (k, f) in fields.iter().enumerate() {
+        let key = f.opts.tag("db").unwrap_or(&f.name).to_string();
+        if key == "-" {
+            continue;
+        }
+        let low = key.to_ascii_lowercase();
+        if seen.contains(&low) {
+            return Err(fail(format!("two fields take the column `{key}`")));
+        }
+        seen.push(low.clone());
+        let kw = if first { "if" } else { "} else if" };
+        first = false;
+        o.push_str(&format!("      {kw} _c == {} {{\n        _v{k}: {} = ~{alias}.convert_column(_row, _i)\n        _r.{} = _v{k}\n", lit(&low), type_src(&f.ty), f.name));
+    }
+    let missing = format!("fail {alias}.SqlError.MissingDestination(name: _row.columns[_i], type_name: {})", lit(name));
+    if first {
+        o.push_str(&format!("      {missing}\n"));
+    } else {
+        o.push_str(&format!("      }} else {{\n        {missing}\n      }}\n"));
+    }
+    o.push_str("      _i += 1\n    }\n    _r\n  }\n}\n");
+    Ok(o)
 }

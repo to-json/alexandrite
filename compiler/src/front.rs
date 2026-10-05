@@ -367,7 +367,8 @@ fn load_pkg(
             Err(_) => shown_root.join(f.strip_prefix(&mods.root).unwrap_or(f)).display().to_string(),
         };
         let m = parse_file(sm, shown, text, next_id)?;
-        if let Some(s) = m.main.first() {
+        // `using R` at a package's top level applies to the defs below it.
+        if let Some(s) = m.main.iter().find(|s| !matches!(s.kind, crate::ast::StmtKind::Using(_))) {
             return Err(Diag::new(s.span, format!("a package (`{path}`) holds only declarations; move statements into a def")));
         }
         if let Some(t) = m.tests.first() {
@@ -886,7 +887,7 @@ pub fn load_tests(dir: &Path, dir_shown: &str, only: Option<&Path>, o: &TestOpts
             Ok(m) => m,
             Err(d) => return Err((sm, d)),
         };
-        if let Some(s) = m.main.first() {
+        if let Some(s) = m.main.iter().find(|s| !matches!(s.kind, crate::ast::StmtKind::Using(_))) {
             let why = if test_file { "a test file holds only declarations and test blocks; move statements into a `test`" } else { "a package holds only declarations; move statements into a def" };
             return Err((sm, Diag::new(s.span, why)));
         }

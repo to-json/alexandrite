@@ -171,6 +171,9 @@ pub struct World<'a> {
     pub warnings: Vec<Diag>,
     /// Refinements by (qualified) name: each target type with its methods.
     pub refines: HashMap<String, Vec<(Ty, HashMap<String, usize>)>>,
+    /// Generic refinements (`refine OptScan[T] for T?`) by name: the target
+    /// pattern, its type parameters, its package and its methods.
+    pub grefines: HashMap<String, Vec<(TypeExpr, Vec<TParam>, String, HashMap<String, usize>)>>,
     /// Array constants read in place (`MONTHS[i]`): name and value, by
     /// `M::Global` index. Set once, before the program runs; never written.
     pub globals: Vec<(String, TExpr)>,
@@ -285,7 +288,7 @@ impl<'a> World<'a> {
         }
         GENERICS.with(|g| g.borrow_mut().clear());
         INSTS.with(|g| g.borrow_mut().clear());
-        Ok(World { sm, defs, by_name, instances: HashMap::new(), funcs: vec![], sigs: HashMap::new(), fatal: None, structs: HashMap::new(), consts: HashMap::new(), ifaces: HashMap::new(), impls: HashMap::new(), stringers: HashMap::new(), errors: vec![], refines: HashMap::new(), warnings: vec![], globals: vec![], pending_consts: vec![] })
+        Ok(World { sm, defs, by_name, instances: HashMap::new(), funcs: vec![], sigs: HashMap::new(), fatal: None, structs: HashMap::new(), consts: HashMap::new(), ifaces: HashMap::new(), impls: HashMap::new(), stringers: HashMap::new(), errors: vec![], refines: HashMap::new(), grefines: HashMap::new(), warnings: vec![], globals: vec![], pending_consts: vec![] })
     }
 
     /// Evaluate top-level constants, in order (each may use earlier ones).
@@ -495,6 +498,13 @@ impl<'a> World<'a> {
     /// Resolve refinement targets (after structs).
     pub fn add_refines(&mut self, defs: &[RefineDef]) -> R<()> {
         for r in defs {
+            if !r.tparams.is_empty() {
+                let word = texpr_word(&r.target);
+                let ms: HashMap<String, usize> = r.methods.iter().map(|m| (m.clone(), self.by_name[&refine_def_name(&r.name, &word, m)])).collect();
+                self.refines.entry(r.name.clone()).or_default();
+                self.grefines.entry(r.name.clone()).or_default().push((r.target.clone(), r.tparams.clone(), pkg_of(&r.name), ms));
+                continue;
+            }
             let prev = enter_pkg(&pkg_of(&r.name));
             let t = type_from(&r.target, &self.structs, &self.consts);
             leave_pkg(prev);
@@ -3682,11 +3692,27 @@ impl<'w, 'a> FnCx<'w, 'a> {
     }
 
     /// A method from an active refinement, innermost `using` first.
-    fn refined(&self, t: &Ty, name: &str) -> Option<usize> {
+    /// A generic refinement's method also gives the type arguments that
+    /// match its target (`refine OptScan[T] for T?` on `Int?`: `[Int]`).
+    fn refined(&self, t: &Ty, name: &str) -> Option<(usize, Vec<Ty>)> {
         for (_, r) in self.usings.iter().rev() {
             if let Some(entries) = self.w.refines.get(r) {
                 if let Some(def) = entries.iter().find(|(x, _)| x == t).and_then(|(_, ms)| ms.get(name)) {
-                    return Some(*def);
+                    return Some((*def, vec![]));
+                }
+            }
+            for (te, tps, pkg, ms) in self.w.grefines.get(r).into_iter().flatten() {
+                let Some(def) = ms.get(name) else { continue };
+                let mut out = HashMap::new();
+                bind_tparams(te, t, tps, &mut out);
+                if !tps.iter().all(|tp| out.contains_key(&tp.name)) {
+                    continue;
+                }
+                let prev = enter_pkg(pkg);
+                let back = subst_type(te, &out, &self.w.structs, &self.w.consts);
+                leave_pkg(prev);
+                if back.as_ref() == Some(t) {
+                    return Some((*def, tps.iter().map(|tp| out[&tp.name].clone()).collect()));
                 }
             }
         }
@@ -4739,7 +4765,10 @@ impl<'w, 'a> FnCx<'w, 'a> {
         let owner_targs = std::mem::take(&mut self.owner_targs);
         let d = self.w.defs[def].def.clone();
         let via_targ = d.name.rsplit_once('.').is_some_and(|(owner, _)| self.targ_types.iter().any(|t| t == owner));
-        if !d.public && self.w.defs[def].pkg != current_pkg() && !via_targ {
+        // An interface's default method calls its implementor's own methods
+        // (the interface is the contract; they needn't be `pub`).
+        let via_default = d.params.first().is_some_and(|p| p.name == "self") && self.fn_name.rsplit_once('.').is_some_and(|(o, _)| self.w.ifaces.contains_key(o));
+        if !d.public && self.w.defs[def].pkg != current_pkg() && !via_targ && !via_default {
             let shown = d.name.rsplit('/').next().unwrap_or(&d.name);
             return Err(Diag::new(name_span, format!("`{shown}` isn't public; its package must declare it `pub def`")));
         }
@@ -4967,6 +4996,39 @@ impl<'w, 'a> FnCx<'w, 'a> {
     fn const_call_named(&mut self, c: &str, named: Option<Ty>, csp: Span, name: &str, name_span: Span, args: &[Expr], block: Option<&Block>, sp: Span) -> R<TExpr> {
         let argv = |cx: &mut Self| args.iter().map(|a| cx.value(a)).collect::<R<Vec<_>>>();
         let named = named.or_else(|| self.w.structs.get(c).cloned());
+        // `Int.from_sql(v)`, or `T.from_sql(v)` with T bound to Int, `Str?`,
+        // `(A, B)`: a static method of an active refinement of the type.
+        let rnamed = named.clone().or_else(|| match c {
+            "Int" | "Float" | "F64" | "Bool" | "Str" => type_from(&TypeExpr::Named(c.to_string(), csp), &self.w.structs, &self.w.consts).ok(),
+            _ => IntKind::from_name(c).map(Ty::IntK).or(None),
+        });
+        if let Some(t) = rnamed.filter(|t| !matches!(t, Ty::Unit)).map(|t| self.resolve(&t)) {
+            let own = t.type_name().is_some_and(|tn| self.w.by_name.contains_key(&method_name(tn, name)));
+            if let Some((def, rtargs)) = (!own).then(|| self.refined(&t, name)).flatten() {
+                let d = self.w.defs[def].def.clone();
+                if d.params.first().is_none_or(|p| p.name != "self") {
+                    if block.is_some() {
+                        return Err(Diag::new(sp, format!("`{c}.{name}` doesn't take a block")));
+                    }
+                    if args.len() != d.params.len() {
+                        return Err(Diag::new(name_span, format!("`{c}.{name}` takes {} argument(s), got {}", d.params.len(), args.len())));
+                    }
+                    let env: HashMap<String, Ty> = d.tparams.iter().map(|tp| tp.name.clone()).zip(rtargs.iter().cloned()).collect();
+                    let mut targs = vec![];
+                    for (a, p) in args.iter().zip(&d.params) {
+                        let prev = enter_pkg(&self.w.defs[def].pkg);
+                        let want = p.ty.as_ref().and_then(|te| subst_type(te, &env, &self.w.structs, &self.w.consts));
+                        leave_pkg(prev);
+                        targs.push(match want {
+                            Some(w) if !w.has_var() => self.value_as(a, &w)?,
+                            _ => self.value(a)?,
+                        });
+                    }
+                    self.owner_targs = rtargs;
+                    return self.call_def(def, name, name_span, targs, sp);
+                }
+            }
+        }
         // `T.from_json(s)` inside a generic def: `T` is bound to a concrete type in
         // this instance, whose static methods are found under its own name.
         let real: Option<String> = named
@@ -5409,7 +5471,10 @@ impl<'w, 'a> FnCx<'w, 'a> {
             let t = self.fresh();
             return Ok(self.mk(TK::Unit, t, sp));
         }
-        if let Some(def) = self.refined(&rt, name) {
+        if let Some((def, rtargs)) = self.refined(&rt, name) {
+            if self.w.defs[def].def.params.first().is_none_or(|p| p.name != "self") {
+                return Err(Diag::new(name_span, format!("`{name}` is a static method of a refinement: call it on the type")));
+            }
             if block.is_some() {
                 return Err(Diag::new(sp, format!("`{name}` doesn't take a block")));
             }
@@ -5417,6 +5482,7 @@ impl<'w, 'a> FnCx<'w, 'a> {
             for a in args {
                 targs.push(self.value(a)?);
             }
+            self.owner_targs = rtargs;
             return self.call_def(def, name, name_span, targs, sp);
         }
         let argv = |cx: &mut Self| args.iter().map(|a| cx.value(a)).collect::<R<Vec<_>>>();
@@ -5702,6 +5768,23 @@ impl<'w, 'a> FnCx<'w, 'a> {
             return self.fn_call(recv, args, sp);
         }
         if let Ty::Iface(iname) = &rt {
+            // `v.as(T)`: Go's type assertion `v.(T)` to a concrete type, as a `T?`.
+            if name == "as" && args.len() == 1 && !ms_has(&self.w.ifaces[iname], "as") {
+                let te = match &args[0].kind {
+                    ExprKind::Const(n) => Some(TypeExpr::Named(n.clone(), args[0].span)),
+                    ExprKind::Call { recv: Some(p), name: n, args: a, block: None, .. } if a.is_empty() && n.starts_with(|c: char| c.is_ascii_uppercase()) => match &p.kind {
+                        ExprKind::Name(pkg) => Some(TypeExpr::Named(format!("{pkg}.{n}"), args[0].span)),
+                        _ => None,
+                    },
+                    _ => None,
+                };
+                let Some(te) = te else {
+                    return Err(Diag::new(args[0].span, format!("`{iname}.as(T)` takes a type: a struct or enum that implements {iname}")));
+                };
+                let t = type_from(&te, &self.w.structs, &self.w.consts)?;
+                let k = self.w.implement(iname, &t, args[0].span)?;
+                return Ok(mk_m(self, M::IfaceAs(k), recv, vec![], None, Ty::Opt(Box::new(t))));
+            }
             let ms = self.w.ifaces[iname].clone();
             let Some(k) = ms.iter().position(|m| m.name == name) else {
                 return Err(Diag::new(name_span, format!("no method `{name}` on {iname}; it has {}", ms.iter().map(|m| m.name.as_str()).collect::<Vec<_>>().join(", "))));
@@ -6618,4 +6701,9 @@ pub fn self_containing_closures(funcs: &[TFunc], ifaces: &HashMap<String, Vec<(T
         }
     }
     Ok(())
+}
+
+/// Whether an interface declares a method `name`.
+fn ms_has(ms: &[IfaceMethod], name: &str) -> bool {
+    ms.iter().any(|m| m.name == name)
 }

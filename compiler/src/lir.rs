@@ -211,6 +211,8 @@ impl FfiTy {
 pub struct FfiSig {
     /// The link name (without the platform's leading underscore).
     pub sym: String,
+    /// The library `#[link("lib")]` names (`-llib`; the JIT dlopens it).
+    pub lib: Option<String>,
     pub params: Vec<FfiTy>,
     pub ret: FfiTy,
 }

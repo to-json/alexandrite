@@ -223,7 +223,8 @@ fn ffi_fns(p: &LProgram) -> String {
                 let _ = writeln!(o, "unsafe fn ffi_c_{i}({}){cret} {{ {f}({}) }}", cparams.join(", "), names.join(", "));
             }
             None => {
-                let _ = writeln!(o, "unsafe extern \"C\" {{\n    #[link_name = {:?}]\n    fn ffi_c_{i}({}){cret};\n}}", x.sym, cparams.join(", "));
+                let link = x.lib.as_ref().map(|l| format!("#[link(name = {l:?})]\n")).unwrap_or_default();
+                let _ = writeln!(o, "{link}unsafe extern \"C\" {{\n    #[link_name = {:?}]\n    fn ffi_c_{i}({}){cret};\n}}", x.sym, cparams.join(", "));
             }
         }
         let rparams: Vec<String> = x.params.iter().enumerate().map(|(k, t)| format!("a{k}: {}", rty(&t.lty()))).collect();

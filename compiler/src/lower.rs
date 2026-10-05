@@ -225,6 +225,7 @@ fn collect_enters(ss: &[LS], out: &mut Vec<(V, V)>) {
 /// An `extern def` as a function: its body is one C call, with Ints
 /// converted to machine words (and back) in a `#![overflow(promote)]` file.
 fn ffi_wrapper(p: &TProgram, sm: &SourceMap, opts: &Opts, f: &TFunc, sym: &str, prog: &RefCell<LProgram>) -> LFunc {
+    let (lib, sym) = crate::ast::ffi_split(sym);
     let mut lw = Lw::new(p, sm, opts, f, f.overflow, ErrPath::Return(vec![]), prog);
     let params: Vec<V> = f.params.iter().map(|l| lw.var_of(*l)).collect();
     let ffi_ty = |t: &Ty| match t {
@@ -245,7 +246,7 @@ fn ffi_wrapper(p: &TProgram, sm: &SourceMap, opts: &Opts, f: &TFunc, sym: &str, 
         let a = LE::Var(*v);
         args.push(if promote && *t == Ty::Int { LE::Rt(Rt::PToI64, vec![a, LE::Loc(sym.to_string())]) } else { a });
     }
-    let sig = FfiSig { sym: sym.to_string(), params: tys, ret: ffi_ty(&f.ret) };
+    let sig = FfiSig { sym: sym.to_string(), lib: lib.map(str::to_string), params: tys, ret: ffi_ty(&f.ret) };
     let idx = {
         let mut pr = prog.borrow_mut();
         match pr.externs.iter().position(|x| *x == sig) {
@@ -3467,6 +3468,19 @@ impl<'a> Lw<'a> {
                     Some(o) => LE::Var(o),
                     None => LE::Unit,
                 }
+            }
+            IfaceAs(k) => {
+                let r = recv.unwrap();
+                let rv = self.expr(r);
+                let rv = self.bind(rv, self.lty(&r.ty));
+                let t = self.lty(&e.ty);
+                let LTy::Tup(ts) = &t else { unreachable!() };
+                let out = self.tmp(t.clone());
+                self.emit(LS::Set(out, LE::Tup(t.clone(), vec![LE::B(false), zero_le(&ts[1])])));
+                let tag = LE::Field(Box::new(rv.clone()), 0);
+                let got = LS::Set(out, LE::Tup(t.clone(), vec![LE::B(true), LE::Field(Box::new(rv), k + 1)]));
+                self.emit(LS::If(LE::Cmp(Op::Eq, Box::new(tag), Box::new(LE::I(k as i64)), LTy::I64), vec![got], vec![]));
+                LE::Var(out)
             }
             IfaceCall(mi) => {
                 let r = recv.unwrap();

@@ -287,6 +287,16 @@ fn build_loaded(l: front::Loaded, file: &str, o: &Options) -> Result<PathBuf, Ex
             cmd.arg("-lGL").arg("-lX11");
         }
     }
+    // `#[link("sqlite3")] extern def ...`: each library once, after the objects.
+    let mut libs: Vec<&str> = vec![];
+    for x in &lp.externs {
+        if let Some(l) = x.lib.as_deref().filter(|l| !libs.contains(l)) {
+            libs.push(l);
+        }
+    }
+    for l in libs {
+        cmd.arg(format!("-l{l}"));
+    }
     if let Ok(ldflags) = std::env::var("ALX_LDFLAGS") {
         for arg in ldflags.split_whitespace() {
             cmd.arg(arg);

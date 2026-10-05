@@ -231,6 +231,9 @@ pub struct IfaceDef {
 #[derive(Debug, Clone)]
 pub struct RefineDef {
     pub name: String,
+    /// `refine OptScan[T] for T? { }`: a generic refinement; its methods
+    /// are generic over these (first), bound by matching the target.
+    pub tparams: Vec<TParam>,
     pub target: TypeExpr,
     pub methods: Vec<String>,
     pub span: Span,
@@ -248,6 +251,20 @@ pub fn texpr_word(t: &TypeExpr) -> String {
         TypeExpr::Handle(n, args, _) => format!("H{}{}", n.replace(['.', '/'], "_"), args.iter().map(texpr_word).collect::<String>()),
         TypeExpr::Fn(ps, r, _) => format!("Fn{}To{}", ps.iter().map(texpr_word).collect::<String>(), texpr_word(r)),
         TypeExpr::Tuple(ts, _) => format!("Tup{}End", ts.iter().map(texpr_word).collect::<String>()),
+    }
+}
+
+/// An `extern def`'s link name with the library `#[link("lib")]` names
+/// (`Def::ffi` holds both; `ffi_split` takes them apart).
+pub fn ffi_with_lib(lib: &str, sym: &str) -> String {
+    format!("{lib}\0{sym}")
+}
+
+/// (library, symbol) of a `Def::ffi`.
+pub fn ffi_split(ffi: &str) -> (Option<&str>, &str) {
+    match ffi.split_once('\0') {
+        Some((l, s)) => (Some(l), s),
+        None => (None, ffi),
     }
 }
 

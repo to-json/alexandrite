@@ -1,0 +1,549 @@
+# Executing statements: the paths Go's DB, Conn, Tx and Stmt share
+# (execDC, queryDC, prepareDC, beginDC), how a connection goes back when an
+# operation ends (Go's releaseConn funcs), Results, Conn and Tx.
+
+import "context"
+import "database/sql/driver"
+import "strconv"
+import "sync"
+import "unicode"
+
+# --------------------------------------------------------------- releasing
+
+# How a borrowed connection is given back (Go passes a `func(error)`; a
+# closure can't hold a value holding a closure of its own type, so these are
+# data). A Tx keeps the BaseRelease it was begun with.
+#
+# (Structs with optional parts rather than enums: an enum's every variant
+# needs zero values for the others' fields, and a DB, Conn or Tx has none.)
+struct BaseRelease {
+  db: DB
+  dc: DriverConn
+  # Set: a sql.Conn's read lock (Go's closemuRUnlockCondReleaseConn);
+  # none: back to the pool (Go's dc.releaseConn).
+  conn: Conn?
+}
+
+struct Release {
+  base: BaseRelease
+  # Set: a Tx's read lock (Go's closemuRUnlockRelease).
+  tx: Tx?
+}
+
+def db_release(db: DB, dc: DriverConn) -> Release { Release.new(base: BaseRelease.new(db: db, dc: dc, conn: none), tx: none) }
+
+def release_base(b: BaseRelease, err: Error?) -> Unit {
+  if c = b.conn {
+    c.closemu.runlock
+    if bad_conn?(err) {
+      _ = c.close_with(err)
+    }
+    return nil
+  }
+  b.db.put_conn(b.dc, err, true)
+}
+
+def release(r: Release, err: Error?) -> Unit {
+  if tx = r.tx {
+    tx.closemu.runlock
+    return nil
+  }
+  release_base(r.base, err)
+}
+
+# ------------------------------------------------------------------ Result
+
+# The result of an exec: Go's Result (an interface there; the driver's
+# Result read under its connection's lock).
+pub struct Result {
+  lock: sync.Lock
+  resi: driver.Result
+
+  # The id the database generated for an inserted row, if it has one.
+  pub def last_insert_id -> ~Int {
+    lock.lock
+    defer lock.unlock
+    resi.~last_insert_id
+  }
+
+  # How many rows the statement changed.
+  pub def rows_affected -> ~Int {
+    lock.lock
+    defer lock.unlock
+    resi.~rows_affected
+  }
+}
+
+# --------------------------------------------------------- argument checks
+
+# Go's describeNamedValue.
+def describe_named_value(nv: driver.NamedValue) -> Str {
+  nv.name.size == 0 ? "$#{nv.ordinal}" : "with name #{strconv.quote(nv.name)}"
+}
+
+# Go's validateNamedValueName.
+def validate_named_value_name(name: Str) -> ~Unit {
+  return nil if name.size == 0
+  r = name.runes[0]
+  return nil if unicode.is_letter(r)
+  fail "name #{strconv.quote(name)} does not begin with a letter"
+}
+
+# Go's driverArgsConnLocked: the driver's NamedValueChecker (the statement's,
+# then the connection's), else the statement's ColumnConverter, else the
+# default (every Value is already a Value). Called with the connection's
+# lock held.
+def driver_args_conn_locked(ci: driver.Conn, ds: DriverStmt?, args: [driver.NamedValue]) -> ~[driver.NamedValue] {
+  out: [driver.NamedValue] = []
+  want = -1
+  if d = ds {
+    want = d.si.num_input
+  }
+  for arg in args {
+    ~validate_named_value_name(arg.name)
+    nv = driver.NamedValue.new(name: arg.name, ordinal: out.size + 1, value: arg.value)
+    r = check_named_value(ci, ds, nv, want)
+    if e = r.err {
+      if driver.remove_argument?(e) {
+        next
+      }
+      fail e.wrap("sql: converting argument #{describe_named_value(nv)} type")
+    }
+    out << r.unwrap
+  }
+  if want != -1 && out.size != want {
+    fail "sql: expected #{want} arguments, got #{out.size}"
+  }
+  out
+}
+
+def check_named_value(ci: driver.Conn, ds: DriverStmt?, nv: driver.NamedValue, want: Int) -> ~driver.NamedValue {
+  if d = ds {
+    r = d.si.check_named_value(nv)
+    if e = r.err {
+      fail e if !driver.skip?(e)
+    } else {
+      return r.unwrap
+    }
+  }
+  r = ci.check_named_value(nv)
+  if e = r.err {
+    fail e if !driver.skip?(e)
+  } else {
+    return r.unwrap
+  }
+  if d = ds {
+    # Go's ccChecker: the column converter for this placeholder, unless the
+    # statement takes fewer arguments than this one's position.
+    index = nv.ordinal - 1
+    return nv if want >= 0 && want <= index
+    if cc = d.si.column_converter(index) {
+      v = cc.~convert_value(nv.value)
+      return driver.NamedValue.new(name: nv.name, ordinal: nv.ordinal, value: v)
+    }
+  }
+  nv
+}
+
+# ------------------------------------------------------ the shared paths
+
+# Go's driverConn.prepareLocked (with dc's lock held).
+def prepare_locked(db: DB, ctx: context.Context, dc: DriverConn, has_cg: Bool, query: Str) -> ~DriverStmt {
+  si = dc.ci.~prepare_context(ctx, query)
+  ds = new_driver_stmt(db.next_id, si, dc.lock)
+  if !has_cg {
+    dc.st.lock { |d|
+      d.open_stmt[ds.id] = ds
+      nil
+    }
+  }
+  ds
+}
+
+# Go's execDC.
+def exec_dc(db: DB, ctx: context.Context, dc: DriverConn, rel: Release, query: Str, args: [driver.NamedValue]) -> ~Result {
+  r = exec_dc_inner(db, ctx, dc, query, args)
+  release(rel, r.err)
+  ~r
+}
+
+def exec_dc_inner(db: DB, ctx: context.Context, dc: DriverConn, query: Str, args: [driver.NamedValue]) -> ~Result {
+  dc.lock.lock
+  r = exec_conn_locked(ctx, dc, query, args)
+  dc.lock.unlock
+  if e = r.err {
+    fail e if !driver.skip?(e)
+  } else {
+    return Result.new(lock: dc.lock, resi: r.unwrap)
+  }
+  dc.lock.lock
+  sr = dc.ci.prepare_context(ctx, query)
+  dc.lock.unlock
+  si = ~sr
+  ds = new_driver_stmt(db.next_id, si, dc.lock)
+  res = result_from_statement(ctx, dc.ci, ds, args)
+  _ = ds.close
+  ~res
+}
+
+def exec_conn_locked(ctx: context.Context, dc: DriverConn, query: Str, args: [driver.NamedValue]) -> ~driver.Result {
+  nv = ~driver_args_conn_locked(dc.ci, none, args)
+  dc.ci.~exec_context(ctx, query, nv)
+}
+
+def query_conn_locked(ctx: context.Context, dc: DriverConn, query: Str, args: [driver.NamedValue]) -> ~driver.Rows {
+  nv = ~driver_args_conn_locked(dc.ci, none, args)
+  dc.ci.~query_context(ctx, query, nv)
+}
+
+# Go's resultFromStatement.
+def result_from_statement(ctx: context.Context, ci: driver.Conn, ds: DriverStmt, args: [driver.NamedValue]) -> ~Result {
+  ds.lock.lock
+  defer ds.lock.unlock
+  dargs = ~driver_args_conn_locked(ci, ds, args)
+  resi = ds.si.~exec_context(ctx, dargs)
+  Result.new(lock: ds.lock, resi: resi)
+}
+
+# Go's rowsiFromStatement.
+def rowsi_from_statement(ctx: context.Context, ci: driver.Conn, ds: DriverStmt, args: [driver.NamedValue]) -> ~driver.Rows {
+  ds.lock.lock
+  defer ds.lock.unlock
+  dargs = ~driver_args_conn_locked(ci, ds, args)
+  ds.si.~query_context(ctx, dargs)
+}
+
+# Go's queryDC.
+def query_dc(db: DB, ctx: context.Context, txctx: context.Context?, dc: DriverConn, rel: Release, query: Str, args: [driver.NamedValue]) -> ~Rows {
+  dc.lock.lock
+  r = query_conn_locked(ctx, dc, query, args)
+  dc.lock.unlock
+  if e = r.err {
+    if !driver.skip?(e) {
+      release(rel, e)
+      fail e
+    }
+  } else {
+    rows = new_rows(db, dc, rel, none, r.unwrap, none)
+    rows.init_context_close(ctx, txctx)
+    return rows
+  }
+  dc.lock.lock
+  sr = dc.ci.prepare_context(ctx, query)
+  dc.lock.unlock
+  if e = sr.err {
+    release(rel, e)
+    fail e
+  }
+  ds = new_driver_stmt(db.next_id, sr.unwrap, dc.lock)
+  rr = rowsi_from_statement(ctx, dc.ci, ds, args)
+  if e = rr.err {
+    _ = ds.close
+    release(rel, e)
+    fail e
+  }
+  rows = new_rows(db, dc, rel, none, rr.unwrap, ds)
+  rows.init_context_close(ctx, txctx)
+  rows
+}
+
+# Go's prepareDC.
+def prepare_dc(db: DB, ctx: context.Context, dc: DriverConn, rel: Release, cg: Grabber, query: Str) -> ~Stmt {
+  has_cg = cg.some?
+  dc.lock.lock
+  r = prepare_locked(db, ctx, dc, has_cg, query)
+  dc.lock.unlock
+  release(rel, r.err)
+  ds = ~r
+  css: [ConnStmt] = []
+  if !has_cg {
+    css << ConnStmt.new(dc: dc, ds: ds)
+  }
+  cgds: DriverStmt? = none
+  cgds = ds if has_cg
+  core = new_stmt_core(db.next_id, css, db.num_closed.load, cgds)
+  s = Stmt.new(db: db, query: query, sticky_err: none, closemu: new_closing_mutex, cg: cg, parent: none, core: core)
+  if !has_cg {
+    db.add_dep(core.id, core.id)
+  }
+  s
+}
+
+# Go's beginDC.
+def begin_dc(db: DB, ctx: context.Context, dc: DriverConn, rel: BaseRelease, opts: TxOptions?) -> ~Tx {
+  o = opts || TxOptions.new(isolation: 0, read_only: false)
+  dopts = driver.TxOptions.new(isolation: o.isolation, read_only: o.read_only)
+  dc.lock.lock
+  keep = dc.ci.has_session_resetter? && dc.ci.has_validator?
+  r = dc.ci.begin_tx(ctx, dopts)
+  dc.lock.unlock
+  if e = r.err {
+    release_base(rel, e)
+    fail e
+  }
+  tctx, cancel = context.with_cancel(ctx)
+  stmts: [StmtCloser] = []
+  tx = Tx.new(db: db, dc: dc, txi: r.unwrap, rel: rel, done: Atomic.new(false), keep_conn_on_rollback: keep, stmts: Mutex.new(stmts), cancel: cancel, ctx: tctx, closemu: new_closing_mutex)
+  spawn { tx.await_done }
+  tx
+}
+
+# ------------------------------------------------------------------- Conn
+
+# One connection taken from the pool for the caller's exclusive use (Go's
+# *Conn): queries on it run on the same session. Close returns it.
+pub struct Conn {
+  db: DB
+  dc: DriverConn
+  closemu: ClosingMutex
+  done: Atomic[Bool]
+
+  def grab_conn(ctx: context.Context) -> ~DriverConn {
+    fail SqlError.ConnDone if done.load
+    closemu.rlock
+    dc
+  }
+
+  def rel -> Release { Release.new(base: BaseRelease.new(db: db, dc: dc, conn: self), tx: none) }
+
+  pub def ping_context(ctx: context.Context) -> ~Unit {
+    d = ~grab_conn(ctx)
+    db.~ping_dc(ctx, d, rel)
+  }
+
+  pub def exec_context[A](ctx: context.Context, query: Str, args: A) -> ~Result {
+    nv = driver.~to_named_values(args)
+    d = ~grab_conn(ctx)
+    ~exec_dc(db, ctx, d, rel, query, nv)
+  }
+
+  pub def query_context[A](ctx: context.Context, query: Str, args: A) -> ~Rows {
+    nv = driver.~to_named_values(args)
+    d = ~grab_conn(ctx)
+    ~query_dc(db, ctx, none, d, rel, query, nv)
+  }
+
+  pub def query_row_context[A](ctx: context.Context, query: Str, args: A) -> Row {
+    r = query_context(ctx, query, args)
+    if e = r.err {
+      return Row.new(e0: e, rows: none)
+    }
+    Row.new(e0: none, rows: r.unwrap)
+  }
+
+  pub def prepare_context(ctx: context.Context, query: Str) -> ~Stmt {
+    d = ~grab_conn(ctx)
+    ~prepare_dc(db, ctx, d, rel, Grabber.new(tx: none, c: self), query)
+  }
+
+  pub def begin_tx(ctx: context.Context, opts: TxOptions?) -> ~Tx {
+    d = ~grab_conn(ctx)
+    ~begin_dc(db, ctx, d, BaseRelease.new(db: db, dc: dc, conn: self), opts)
+  }
+
+  # Go's Conn.Raw: runs f with the driver's connection, under its lock. If
+  # f fails with ERR_BAD_CONN the connection is discarded.
+  pub def raw(f: (driver.Conn) -> ~Unit) -> ~Unit {
+    d = ~grab_conn(context.background)
+    d.lock.lock
+    r = f(d.ci)
+    d.lock.unlock
+    release(rel, r.err)
+    ~r
+  }
+
+  def close_with(err: Error?) -> ~Unit {
+    fail SqlError.ConnDone if !done.compare_and_swap(false, true)
+    closemu.lock
+    defer closemu.unlock
+    db.put_conn(dc, err, true)
+    if e = err {
+      fail e
+    }
+    nil
+  }
+
+  # Returns the connection to the pool; using it afterwards fails with
+  # ERR_CONN_DONE.
+  pub def close -> ~Unit { ~close_with(none) }
+}
+
+# --------------------------------------------------------------------- Tx
+
+# A transaction (Go's *Tx): ends with commit or rollback; its context ending
+# rolls it back.
+pub struct Tx {
+  db: DB
+  dc: DriverConn
+  txi: driver.Tx
+  rel: BaseRelease
+  done: Atomic[Bool]
+  keep_conn_on_rollback: Bool
+  stmts: Mutex[[StmtCloser]]
+  cancel: () -> Unit
+  ctx: context.Context
+  closemu: ClosingMutex
+
+  def await_done {
+    _ = ctx.done.recv
+    _ = rollback_with(!keep_conn_on_rollback)
+  }
+
+  def done? -> Bool { done.load }
+
+  def close_tx(err: Error?) {
+    release_base(rel, err)
+  }
+
+  def grab_conn(c: context.Context) -> ~DriverConn {
+    fail ctx_error(c) if c.done?
+    closemu.rlock
+    if done? {
+      closemu.runlock
+      fail SqlError.TxDone
+    }
+    dc
+  }
+
+  def close_prepared {
+    xs = stmts.lock { |v| v }
+    for s in xs {
+      _ = s.close
+    }
+  }
+
+  # Commits the transaction.
+  pub def commit -> ~Unit {
+    if ctx.done? {
+      fail SqlError.TxDone if done?
+      fail ctx_error(ctx)
+    }
+    fail SqlError.TxDone if !done.compare_and_swap(false, true)
+    cancel()
+    closemu.lock
+    closemu.unlock
+    dc.lock.lock
+    r = txi.commit
+    dc.lock.unlock
+    close_prepared if !bad_conn?(r.err)
+    close_tx(r.err)
+    ~r
+  }
+
+  def rollback_with(discard_conn: Bool) -> ~Unit {
+    fail SqlError.TxDone if !done.compare_and_swap(false, true)
+    cancel()
+    closemu.lock
+    closemu.unlock
+    dc.lock.lock
+    r = txi.rollback
+    dc.lock.unlock
+    close_prepared if !bad_conn?(r.err)
+    err = r.err
+    err = driver.ERR_BAD_CONN if discard_conn
+    close_tx(err)
+    ~r
+  }
+
+  # Aborts the transaction.
+  pub def rollback -> ~Unit { ~rollback_with(false) }
+
+  def rel_tx -> Release { Release.new(base: rel, tx: self) }
+
+  pub def prepare(query: Str) -> ~Stmt { ~prepare_context(context.background, query) }
+
+  pub def prepare_context(c: context.Context, query: Str) -> ~Stmt {
+    d = ~grab_conn(c)
+    s = ~prepare_dc(db, c, d, rel_tx, Grabber.new(tx: self, c: none), query)
+    stmts.lock { |v|
+      v << s.closer
+      nil
+    }
+    s
+  }
+
+  pub def exec[A](query: Str, args: A) -> ~Result { ~exec_context(context.background, query, args) }
+
+  pub def exec_context[A](c: context.Context, query: Str, args: A) -> ~Result {
+    nv = driver.~to_named_values(args)
+    d = ~grab_conn(c)
+    ~exec_dc(db, c, d, rel_tx, query, nv)
+  }
+
+  pub def query[A](query: Str, args: A) -> ~Rows { ~query_context(context.background, query, args) }
+
+  pub def query_context[A](c: context.Context, query: Str, args: A) -> ~Rows {
+    nv = driver.~to_named_values(args)
+    d = ~grab_conn(c)
+    ~query_dc(db, c, ctx, d, rel_tx, query, nv)
+  }
+
+  pub def query_row[A](query: Str, args: A) -> Row { query_row_context(context.background, query, args) }
+
+  pub def query_row_context[A](c: context.Context, query: Str, args: A) -> Row {
+    r = query_context(c, query, args)
+    if e = r.err {
+      return Row.new(e0: e, rows: none)
+    }
+    Row.new(e0: none, rows: r.unwrap)
+  }
+
+  pub def stmt(s: Stmt) -> Stmt { stmt_context(context.background, s) }
+
+  # Go's Tx.StmtContext: s on this transaction's connection, re-using the
+  # driver statement s already has there if any.
+  pub def stmt_context(c: context.Context, s: Stmt) -> Stmt {
+    gr = grab_conn(c)
+    if e = gr.err {
+      return sticky_stmt(db, e)
+    }
+    d = gr.unwrap
+    defer closemu.runlock
+    if s.db.uid != db.uid {
+      return sticky_stmt(db, Failure.Msg("sql: Tx.Stmt: statement from different database used"))
+    }
+    si: driver.Stmt? = none
+    parent: StmtCore? = none
+    plain = !s.cg.some?
+    closed = s.core.st.lock { |x| x.closed }
+    if closed || !plain {
+      d.lock.lock
+      r = d.ci.prepare_context(c, s.query)
+      d.lock.unlock
+      if e = r.err {
+        return sticky_stmt(db, e)
+      }
+      si = r.unwrap
+    } else {
+      s.remove_closed_stmt
+      found = s.core.st.lock { |x| x.css.find { |v| v.dc.id == d.id } }
+      if v = found {
+        si = v.ds.si
+      } else {
+        d.lock.lock
+        r = s.prepare_on_conn_locked(c, d)
+        d.lock.unlock
+        if e = r.err {
+          return sticky_stmt(db, e)
+        }
+        si = r.unwrap.si
+      }
+      parent = s.core
+    }
+    cgds = new_driver_stmt(db.next_id, si.unwrap, d.lock)
+    core = new_stmt_core(db.next_id, [], 0, cgds)
+    txs = Stmt.new(db: db, query: s.query, sticky_err: none, closemu: new_closing_mutex, cg: Grabber.new(tx: self, c: none), parent: parent, core: core)
+    if p = parent {
+      db.add_dep(p.id, core.id)
+    }
+    stmts.lock { |v|
+      v << txs.closer
+      nil
+    }
+    txs
+  }
+}
+
+def sticky_stmt(db: DB, e: Error) -> Stmt {
+  Stmt.new(db: db, query: "", sticky_err: e, closemu: new_closing_mutex, cg: no_grabber, parent: none, core: new_stmt_core(0, [], 0, none))
+}

@@ -1,0 +1,374 @@
+# Package driver: Go's database/sql/driver — the interfaces a database
+# driver implements for database/sql, and the values that cross them.
+#
+#   Go                                    alx
+#   Value (any: nil, int64, float64,      Value: an enum Null, Int, Float, Bool,
+#     bool, []byte, string, time.Time)      Bytes, Str, Time
+#   NamedValue{Name, Ordinal, Value}      NamedValue: name, ordinal, value
+#   Driver.Open(name) (Conn, error)       Driver: open(name) -> ~Conn
+#   DriverContext.OpenConnector           Driver: open_connector(name) -> ~Connector
+#                                           (default: fails ERR_SKIP = "not implemented")
+#   Connector Connect(ctx) / Driver()     Connector: connect(ctx) -> ~Conn
+#   Conn Prepare / Close / Begin          Conn: prepare(q) -> ~Stmt, close, begin -> ~Tx
+#   ConnPrepareContext                    Conn: prepare_context(ctx, q)    (default: prepare)
+#   ConnBeginTx                           Conn: begin_tx(ctx, opts)        (default: Go's
+#                                           fallback: begin, refusing non-default options)
+#   Execer / ExecerContext                Conn: exec(q, [Value]) / exec_context(ctx, q,
+#                                           [NamedValue])                (default: ERR_SKIP)
+#   Queryer / QueryerContext              Conn: query / query_context      (default: ERR_SKIP)
+#   Pinger                                Conn: ping(ctx)                  (default: succeeds)
+#   SessionResetter                       Conn: reset_session(ctx)         (default: succeeds)
+#   Validator                             Conn: valid? -> Bool             (default: true)
+#   (whether a Conn is either)            Conn: has_session_resetter?, has_validator?
+#   NamedValueChecker                     Conn and Stmt: check_named_value(nv) -> ~NamedValue
+#                                           (default: ERR_SKIP)
+#   Stmt Close / NumInput / Exec / Query  Stmt: close, num_input, exec([Value]), query([Value])
+#   StmtExecContext / StmtQueryContext    Stmt: exec_context / query_context (default:
+#                                           the plain ones; named parameters refused)
+#   ColumnConverter                       Stmt: column_converter(i) -> ValueConverter?
+#                                           (default: none)
+#   Rows Columns / Close / Next(dest)     Rows: columns, close, next(dest) -> ~Bool
+#   RowsNextResultSet                     Rows: has_next_result_set?, next_result_set
+#   RowsColumnTypeScanType                Rows: column_type_scan_type(i) -> Str
+#   RowsColumnTypeDatabaseTypeName        Rows: column_type_database_type_name(i) -> Str
+#   RowsColumnTypeLength                  Rows: column_type_length(i) -> Int?
+#   RowsColumnTypeNullable                Rows: column_type_nullable(i) -> Bool?
+#   RowsColumnTypePrecisionScale          Rows: column_type_precision_scale(i) -> (Int, Int)?
+#   Tx Commit / Rollback                  Tx: commit, rollback
+#   Result LastInsertId / RowsAffected    Result: last_insert_id, rows_affected -> ~Int
+#   RowsAffected(n) / ResultNoRows        RowsAffected.new(n) / ResultNoRows.new
+#   ErrSkip / ErrBadConn /                DriverError.Skip / BadConn / RemoveArgument
+#     ErrRemoveArgument                     (constants ERR_SKIP, ERR_BAD_CONN, ERR_REMOVE_ARGUMENT)
+#   IsolationLevel / TxOptions            Int / TxOptions: isolation, read_only
+#   ValueConverter.ConvertValue(any)      ValueConverter: convert_value(v: Value) -> ~Value
+#   Valuer.Value() (Value, error)         Valuer: sql_value -> ~Value
+#   Bool / Int32 / String converters      bool, int32, string (BoolType, Int32Type, StringType)
+#   Null{c} / NotNull{c}                  Null[C].new(converter: c) / NotNull[C]
+#   DefaultParameterConverter             default_parameter_converter; to_value(x) for any
+#                                           alx value (below)
+#   IsValue / IsScanValue                 not needed: a Value is one by construction
+#
+# How the shape differs from Go, and why:
+#  - Optional interfaces are default methods. Go discovers them at run time
+#    with type assertions (`conn.(driver.ExecerContext)`); alexandrite has no
+#    run-time type information, and an interface value is a closed sum over
+#    the program's implementors (GO-VS-RUBY D12). So `Conn`, `Stmt` and `Rows`
+#    carry every optional method with a default body that behaves as Go does
+#    when the interface is missing: the fast paths (`exec_context`,
+#    `query_context`, `check_named_value`, `open_connector`) fail with
+#    ERR_SKIP, which database/sql treats as "not implemented" (Go's own
+#    convention for these), and the others do what Go does without them
+#    (`ping` and `reset_session` succeed, `valid?` is true, the column type
+#    queries say "unknown"). A driver overrides what it supports.
+#  - Driver methods are plain (not `!`): drivers keep their mutable state in
+#    shared handles (a Mutex, a one-element slice; D36), as Go's drivers keep
+#    it behind pointers. database/sql calls a Conn from one task at a time
+#    (Go's driverConn lock), as Go promises.
+#  - Value is a closed enum instead of `any`. Arguments reach a driver as
+#    Values: database/sql converts every alx argument at compile time
+#    (`to_value`, Go's DefaultParameterConverter plus Valuer), so a driver's
+#    `check_named_value` and column converters see Values, not the caller's
+#    original Go value. A converter's input is therefore a Value too.
+#  - `Rows.next(dest)` returns false at the end instead of failing with
+#    io.EOF (alexandrite's EOF idiom, D35).
+#  - ColumnTypeScanType returns a type name ("Int", "Str", "Float", "Bool",
+#    "[Byte]", "time.Time", "any"): there is no reflect.Type.
+#  - Connector has no `driver` method: a type that holds a Driver interface
+#    value can't itself be an interface value (D12), which would forbid the
+#    common Connector shape (a Driver plus a DSN). database/sql keeps the
+#    Driver beside the Connector instead.
+#  - Not ported: RowsColumnScanner and ScanContext (Go 1.26's per-column
+#    scanning into `any` destinations: reflection), decimalDecompose (no
+#    decimal Value), uuid conversion.
+
+import "context"
+import "strconv"
+import "time"
+
+# --------------------------------------------------------------------- errors
+
+pub error DriverError {
+  # A driver's fast path is not available; database/sql uses the general path.
+  Skip
+  # The connection is unusable; database/sql retries on a new one.
+  BadConn
+  # From check_named_value: leave this argument out of the query.
+  RemoveArgument
+
+  def message -> Str {
+    case self {
+      Skip => "driver: skip fast-path; continue as if unimplemented"
+      BadConn => "driver: bad connection"
+      RemoveArgument => "driver: remove argument from query"
+    }
+  }
+}
+
+pub ERR_SKIP = DriverError.Skip
+pub ERR_BAD_CONN = DriverError.BadConn
+pub ERR_REMOVE_ARGUMENT = DriverError.RemoveArgument
+
+# Whether `e` is ERR_SKIP (wrapped or not).
+pub def skip?(e: Error) -> Bool {
+  case e {
+    DriverError.Skip => true
+    _ => false
+  }
+}
+
+# Whether `e` is ERR_BAD_CONN (wrapped or not).
+pub def bad_conn?(e: Error) -> Bool {
+  case e {
+    DriverError.BadConn => true
+    _ => false
+  }
+}
+
+# Whether `e` is ERR_REMOVE_ARGUMENT.
+pub def remove_argument?(e: Error) -> Bool {
+  case e {
+    DriverError.RemoveArgument => true
+    _ => false
+  }
+}
+
+# --------------------------------------------------------------------- values
+
+# A value a driver handles: Go's driver.Value (nil, int64, float64, bool,
+# []byte, string, time.Time).
+pub enum Value {
+  Null
+  Int(v: Int)
+  Float(v: Float)
+  Bool(v: Bool)
+  Bytes(v: [Byte])
+  Str(v: Str)
+  Time(v: time.Time)
+
+  pub def null? -> Bool {
+    case self {
+      Null => true
+      _ => false
+    }
+  }
+
+  # Go's name for the value's type (`%T`), as Go's messages show it.
+  pub def go_type -> Str {
+    case self {
+      Null => "<nil>"
+      Int(_) => "int64"
+      Float(_) => "float64"
+      Bool(_) => "bool"
+      Bytes(_) => "[]uint8"
+      Str(_) => "string"
+      Time(_) => "time.Time"
+    }
+  }
+
+  # The value as `%v` prints it in Go.
+  pub def to_s -> Str {
+    case self {
+      Null => "<nil>"
+      Int(n) => "#{n}"
+      Float(f) => strconv.format_float(f, "g", -1, 64)
+      Bool(b) => b ? "true" : "false"
+      Bytes(b) => "#{b}"
+      Str(s) => s
+      Time(t) => t.to_s
+    }
+  }
+
+  # Equality as reflect.DeepEqual compares Go's values (times by instant
+  # and location, as `==` on time.Time).
+  pub def ==(o: Value) -> Bool {
+    case self {
+      Null => o.null?
+      Int(a) => case o {
+        Int(b) => a == b
+        _ => false
+      }
+      Float(a) => case o {
+        Float(b) => a == b
+        _ => false
+      }
+      Bool(a) => case o {
+        Bool(b) => a == b
+        _ => false
+      }
+      Bytes(a) => case o {
+        Bytes(b) => a == b
+        _ => false
+      }
+      Str(a) => case o {
+        Str(b) => a == b
+        _ => false
+      }
+      Time(a) => case o {
+        Time(b) => a == b
+        _ => false
+      }
+    }
+  }
+}
+
+# A Value with its parameter name ("" when positional) and 1-based position.
+pub struct NamedValue {
+  name: Str
+  ordinal: Int
+  value: Value
+}
+
+# The Values of positional arguments (Go's namedValueToValue); named ones
+# are refused.
+pub def named_values_to_values(named: [NamedValue]) -> ~[Value] {
+  out: [Value] = []
+  for n in named {
+    fail "sql: driver does not support the use of Named Parameters" if n.name != ""
+    out << n.value
+  }
+  out
+}
+
+# ------------------------------------------------------------- the interfaces
+
+pub interface Driver {
+  # A new connection to the database `name` (a driver-specific string).
+  def open(name: Str) -> ~Conn
+  # Go's DriverContext: a Connector for `name`, parsed once.
+  def open_connector(name: Str) -> ~Connector { fail ERR_SKIP }
+}
+
+pub interface Connector {
+  # A new connection; may watch ctx while connecting.
+  def connect(ctx: context.Context) -> ~Conn
+  # Go's io.Closer on a Connector: DB.close calls it.
+  def close -> ~Unit { nil }
+}
+
+# Go's IsolationLevel values (database/sql names them: LEVEL_DEFAULT ...).
+pub struct TxOptions {
+  isolation: Int
+  read_only: Bool
+}
+
+pub interface Conn {
+  def prepare(query: Str) -> ~Stmt
+  # Invalidates the connection's statements and transactions.
+  def close -> ~Unit
+  # Deprecated in Go for begin_tx.
+  def begin -> ~Tx
+
+  def prepare_context(ctx: context.Context, query: Str) -> ~Stmt {
+    si = ~prepare(query)
+    if e = ctx.err {
+      _ = si.close
+      fail e
+    }
+    si
+  }
+  # Without its own begin_tx, a driver supports only the default options
+  # (Go's ctxDriverBegin).
+  def begin_tx(ctx: context.Context, opts: TxOptions) -> ~Tx {
+    fail "sql: driver does not support non-default isolation level" if opts.isolation != 0
+    fail "sql: driver does not support read-only transactions" if opts.read_only
+    txi = ~begin
+    if e = ctx.err {
+      _ = txi.rollback
+      fail e
+    }
+    txi
+  }
+  # Go's Execer: ERR_SKIP means "prepare, execute, close".
+  def exec(query: Str, args: [Value]) -> ~Result { fail ERR_SKIP }
+  # (Named arguments skip to the prepared-statement path, which reports them.)
+  def exec_context(ctx: context.Context, query: Str, args: [NamedValue]) -> ~Result {
+    vals = named_values_to_values(args)
+    fail ERR_SKIP if vals.err?
+    if e = ctx.err {
+      fail e
+    }
+    ~exec(query, vals.unwrap)
+  }
+  def query(query: Str, args: [Value]) -> ~Rows { fail ERR_SKIP }
+  def query_context(ctx: context.Context, query: Str, args: [NamedValue]) -> ~Rows {
+    vals = named_values_to_values(args)
+    fail ERR_SKIP if vals.err?
+    if e = ctx.err {
+      fail e
+    }
+    ~query(query, vals.unwrap)
+  }
+  def ping(ctx: context.Context) -> ~Unit { nil }
+  def reset_session(ctx: context.Context) -> ~Unit { nil }
+  def valid? -> Bool { true }
+  # Whether reset_session / valid? are the driver's own (Go asks whether the
+  # Conn is a SessionResetter and a Validator: a Tx rolled back after its
+  # context ended keeps such a connection instead of discarding it).
+  def has_session_resetter? -> Bool { false }
+  def has_validator? -> Bool { false }
+  def check_named_value(nv: NamedValue) -> ~NamedValue { fail ERR_SKIP }
+}
+
+pub interface Stmt {
+  def close -> ~Unit
+  # The number of placeholders, or -1 if the driver doesn't know.
+  def num_input -> Int
+  def exec(args: [Value]) -> ~Result
+  def query(args: [Value]) -> ~Rows
+
+  def exec_context(ctx: context.Context, args: [NamedValue]) -> ~Result {
+    vals = ~named_values_to_values(args)
+    if e = ctx.err {
+      fail e
+    }
+    ~exec(vals)
+  }
+  def query_context(ctx: context.Context, args: [NamedValue]) -> ~Rows {
+    vals = ~named_values_to_values(args)
+    if e = ctx.err {
+      fail e
+    }
+    ~query(vals)
+  }
+  def check_named_value(nv: NamedValue) -> ~NamedValue { fail ERR_SKIP }
+  # Go's ColumnConverter: how to convert the argument for placeholder idx.
+  def column_converter(idx: Int) -> ValueConverter? { none }
+}
+
+pub interface Rows {
+  def columns -> [Str]
+  def close -> ~Unit
+  # Fills dest (columns.size Values) with the next row; false at the end.
+  def next(dest: [Value]) -> ~Bool
+
+  def has_next_result_set? -> Bool { false }
+  def next_result_set -> ~Unit { fail "driver: no further result sets" }
+  def column_type_scan_type(index: Int) -> Str { "any" }
+  def column_type_database_type_name(index: Int) -> Str { "" }
+  def column_type_length(index: Int) -> Int? { none }
+  def column_type_nullable(index: Int) -> Bool? { none }
+  def column_type_precision_scale(index: Int) -> (Int, Int)? { none }
+}
+
+pub interface Tx {
+  def commit -> ~Unit
+  def rollback -> ~Unit
+}
+
+pub interface Result {
+  def last_insert_id -> ~Int
+  def rows_affected -> ~Int
+}
+
+# A Result for a statement that changed `n` rows and has no insert id.
+pub struct RowsAffected {
+  n: Int
+  pub def last_insert_id -> ~Int { fail "LastInsertId is not supported by this driver" }
+  pub def rows_affected -> ~Int { n }
+}
+
+# The Result of a DDL statement: neither number is available.
+pub struct ResultNoRows {
+  pub def last_insert_id -> ~Int { fail "no LastInsertId available after DDL statement" }
+  pub def rows_affected -> ~Int { fail "no RowsAffected available after DDL statement" }
+}

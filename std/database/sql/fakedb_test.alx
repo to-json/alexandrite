@@ -1,0 +1,932 @@
+# Go's fakedb_test.go: a fake database driver, the test driver most of
+# Go's database/sql tests run against.
+#
+# It speaks a query language that's semantically similar to but
+# syntactically different and simpler than SQL:
+#
+#   WIPE
+#   CREATE|<tablename>|<col>=<type>,<col>=<type>,...
+#     where types are: "string", [u]int{8,16,32,64}, "bool"
+#   INSERT|<tablename>|col=val,col2=val2,col3=?
+#   SELECT|<tablename>|projectcol1,projectcol2|filtercol=?,filtercol2=?
+#   SELECT|<tablename>|projectcol1,projectcol2|filtercol=?param1,filtercol2=?param2
+#
+# Any of these can be preceded by PANIC|<method>|, to cause the named method
+# on the statement to panic, or WAIT|<duration>| to sleep that long first.
+# Several can be combined, separated with a semicolon.
+#
+# Differences from Go's: Go's test hooks are package variables; here they
+# live in the driver value (`FakeDriver.hooks`), and every test makes its
+# own driver. A row's columns are driver Values (no cursor columns: the
+# `table` type is not ported). The memToucher machinery (for the race
+# detector) is left out.
+
+import "context"
+import "database/sql/driver"
+import "strings"
+import "strconv"
+import "sync"
+import "time"
+
+# ------------------------------------------------------------------ hooks
+
+struct HookState {
+  open_err: (() -> Error?)?
+  post_close_conn: ((Error?) -> Unit)?
+  prepare_bad_conn: (() -> Bool)?
+  exec_bad_conn: (() -> Bool)?
+  query_bad_conn: (() -> Bool)?
+  commit_bad_conn: (() -> Bool)?
+  rollback_bad_conn: (() -> Bool)?
+  rows_cursor_next: (([driver.Value]) -> Error?)?
+  strict_close: Bool
+  strict_close_errors: [Str]
+}
+
+struct Hooks {
+  st: Mutex[HookState]
+
+  def set_open_err(f: (() -> Error?)?) { st.lock { |h| h.open_err = f; nil } }
+  def set_post_close_conn(f: ((Error?) -> Unit)?) { st.lock { |h| h.post_close_conn = f; nil } }
+  def set_prepare_bad_conn(f: (() -> Bool)?) { st.lock { |h| h.prepare_bad_conn = f; nil } }
+  def set_exec_bad_conn(f: (() -> Bool)?) { st.lock { |h| h.exec_bad_conn = f; nil } }
+  def set_query_bad_conn(f: (() -> Bool)?) { st.lock { |h| h.query_bad_conn = f; nil } }
+  def set_commit_bad_conn(f: (() -> Bool)?) { st.lock { |h| h.commit_bad_conn = f; nil } }
+  def set_rollback_bad_conn(f: (() -> Bool)?) { st.lock { |h| h.rollback_bad_conn = f; nil } }
+  def set_rows_cursor_next(f: (([driver.Value]) -> Error?)?) { st.lock { |h| h.rows_cursor_next = f; nil } }
+
+  def call_bool(which: Int) -> Bool {
+    f: (() -> Bool)? = st.lock { |h|
+      case which {
+        0 => h.prepare_bad_conn
+        1 => h.exec_bad_conn
+        2 => h.query_bad_conn
+        3 => h.commit_bad_conn
+        _ => h.rollback_bad_conn
+      }
+    }
+    if g = f {
+      return g()
+    }
+    false
+  }
+}
+
+HOOK_PREPARE = 0
+HOOK_EXEC = 1
+HOOK_QUERY = 2
+HOOK_COMMIT = 3
+HOOK_ROLLBACK = 4
+
+# ----------------------------------------------------------------- driver
+
+struct FakeDriverState {
+  open_count: Int
+  close_count: Int
+  wait_ch: Chan[Bool]?
+  waiting_ch: Chan[Bool]?
+  dbs: Map[Str, FakeDB]
+}
+
+struct FakeDriver {
+  st: Mutex[FakeDriverState]
+  hooks: Hooks
+  # Go's fakeDriverCtx: a DriverContext (open_connector).
+  with_connector: Bool
+
+  def open(dsn: Str) -> ~driver.Conn { ~open_fake(dsn) }
+
+  def open_fake(dsn: Str) -> ~FakeConn {
+    f = hooks.st.lock { |h| h.open_err }
+    if g = f {
+      if e = g() {
+        fail e
+      }
+    }
+    parts = strings.split(dsn, ";")
+    fail errf("no database name") if parts.size < 1
+    db = get_db(parts[0])
+    waits = st.lock { |s|
+      s.open_count += 1
+      w = (s.wait_ch, s.waiting_ch)
+      s.wait_ch = none
+      s.waiting_ch = none
+      w
+    }
+    conn = new_fake_conn(db, self, parts.size >= 2 && parts[1] == "badConn")
+    if ch = waits[1] {
+      ch << true
+    }
+    if ch = waits[0] {
+      _ = ch.recv
+    }
+    conn
+  }
+
+  def open_connector(name: Str) -> ~driver.Connector {
+    fail driver.ERR_SKIP if !with_connector
+    new_fake_connector(self, name)
+  }
+
+  def get_db(name: Str) -> FakeDB {
+    st.lock { |s|
+      if db = s.dbs[name] {
+        db
+      } else {
+        tables: Map[Str, Table] = {}
+        db = FakeDB.new(name: name, st: Mutex.new(FakeDbState.new(tables: tables, bad_conn: false, allow_any: false)))
+        s.dbs[name] = db
+        db
+      }
+    }
+  }
+
+  def open_count -> Int { st.lock { |s| s.open_count } }
+  def close_count -> Int { st.lock { |s| s.close_count } }
+}
+
+def new_fake_driver -> FakeDriver {
+  dbs: Map[Str, FakeDB] = {}
+  hs = HookState.new(open_err: none, post_close_conn: none, prepare_bad_conn: none, exec_bad_conn: none, query_bad_conn: none, commit_bad_conn: none, rollback_bad_conn: none, rows_cursor_next: none, strict_close: false, strict_close_errors: [])
+  FakeDriver.new(st: Mutex.new(FakeDriverState.new(open_count: 0, close_count: 0, wait_ch: none, waiting_ch: none, dbs: dbs)), hooks: Hooks.new(st: Mutex.new(hs)), with_connector: false)
+}
+
+struct FakeConnector {
+  name: Str
+  drv: FakeDriver
+  waiter: ((context.Context) -> Unit)?
+  closed: Mutex[Bool]
+
+  def connect(ctx: context.Context) -> ~driver.Conn {
+    c = drv.~open_fake(name)
+    w = waiter
+    c.st.lock { |s|
+      s.waiter = w
+      nil
+    }
+    c
+  }
+
+  def close -> ~Unit {
+    was = closed.lock { |c|
+      w = c
+      c = true
+      w
+    }
+    fail "fakedb: connector is closed" if was
+    nil
+  }
+}
+
+def new_fake_connector(drv: FakeDriver, name: Str) -> FakeConnector {
+  FakeConnector.new(name: name, drv: drv, waiter: none, closed: Mutex.new(false))
+}
+
+def errf(msg: Str) -> Error { Failure.Msg("fakedb: #{msg}") }
+
+# Go's fakeError{Message: msg, Wrapped: driver.ErrBadConn}: errors.Is finds
+# ERR_BAD_CONN in it (its text is "msg: driver: bad connection" here).
+def bad_conn_error(msg: Str) -> Error {
+  e: Error = driver.ERR_BAD_CONN
+  msg == "" ? e : e.wrap(msg)
+}
+
+# --------------------------------------------------------------- database
+
+struct Table {
+  colname: [Str]
+  coltype: [Str]
+  rows: [[driver.Value]]
+
+  def column_index(name: Str) -> Int {
+    i = 0
+    while i < colname.size {
+      return i if colname[i] == name
+      i += 1
+    }
+    -1
+  }
+}
+
+struct FakeDbState {
+  tables: Map[Str, Table]
+  bad_conn: Bool
+  allow_any: Bool
+}
+
+struct FakeDB {
+  name: Str
+  st: Mutex[FakeDbState]
+
+  def wipe {
+    st.lock { |s|
+      s.tables = {}
+      nil
+    }
+  }
+
+  def create_table(name: Str, names: [Str], types: [Str]) -> ~Unit {
+    err = st.lock { |s|
+      e: Str? = none
+      if s.tables[name] != none {
+        e = "fakedb: table #{strconv.quote(name)} already exists"
+      } else if names.size != types.size {
+        e = "fakedb: create table of #{strconv.quote(name)} len(names) != len(types): #{names.size} vs #{types.size}"
+      } else {
+        s.tables[name] = Table.new(colname: names, coltype: types, rows: [])
+      }
+      e
+    }
+    if e = err {
+      fail e
+    }
+    nil
+  }
+
+  def table(name: Str) -> Table? { st.lock { |s| s.tables[name] } }
+
+  def column_type(table: Str, column: Str) -> Str? {
+    t = st.lock { |s| s.tables[table] }
+    if x = t {
+      i = x.column_index(column)
+      return x.coltype[i] if i >= 0
+    }
+    none
+  }
+
+  def append_row(table: Str, row: [driver.Value]) {
+    st.lock { |s|
+      if t = s.tables[table] {
+        t.rows << row
+        s.tables[table] = t
+      }
+      nil
+    }
+  }
+}
+
+# ------------------------------------------------------------------- conn
+
+struct FakeConnState {
+  curr_tx: Bool
+  closed: Bool
+  stmts_made: Int
+  stmts_closed: Int
+  num_prepare: Int
+  sticky_bad: Bool
+  skip_dirty_session: Bool
+  dirty_session: Bool
+  waiter: ((context.Context) -> Unit)?
+}
+
+struct FakeConn {
+  id: Int
+  db: FakeDB
+  drv: FakeDriver
+  bad: Bool
+  st: Mutex[FakeConnState]
+
+  def is_bad -> Bool {
+    sticky = st.lock { |s| s.sticky_bad }
+    return true if sticky
+    if bad {
+      return db.st.lock { |s|
+        s.bad_conn = !s.bad_conn
+        s.bad_conn
+      }
+    }
+    false
+  }
+
+  def is_dirty_and_mark -> Bool {
+    st.lock { |s|
+      r = false
+      if s.skip_dirty_session {
+        r = false
+      } else if s.curr_tx {
+        s.dirty_session = true
+      } else if s.dirty_session {
+        r = true
+      } else {
+        s.dirty_session = true
+      }
+      r
+    }
+  }
+
+  def begin -> ~driver.Tx {
+    fail bad_conn_error("") if is_bad
+    in_tx = st.lock { |s|
+      was = s.curr_tx
+      s.curr_tx = true if !was
+      was
+    }
+    fail "fakedb: already in a transaction" if in_tx
+    FakeTx.new(c: self)
+  }
+
+  def reset_session(ctx: context.Context) -> ~Unit {
+    st.lock { |s|
+      s.dirty_session = false
+      s.curr_tx = false
+      nil
+    }
+    fail bad_conn_error("Reset Session: bad conn") if is_bad
+    nil
+  }
+
+  def valid? -> Bool { !is_bad }
+  def has_session_resetter? -> Bool { true }
+  def has_validator? -> Bool { true }
+
+  def close -> ~Unit {
+    r = close_inner
+    strict = drv.hooks.st.lock { |h|
+      if e = r.err {
+        h.strict_close_errors << "failed to close a test fakeConn: #{e.message}" if h.strict_close
+      }
+      h.post_close_conn
+    }
+    if f = strict {
+      f(r.err)
+    }
+    if !r.err? {
+      drv.st.lock { |s|
+        s.close_count += 1
+        nil
+      }
+    }
+    ~r
+  }
+
+  def close_inner -> ~Unit {
+    s = st.lock { |s| (s.curr_tx, s.closed, s.stmts_made, s.stmts_closed) }
+    fail "fakedb: can't close fakeConn; in a Transaction" if s[0]
+    fail "fakedb: can't close fakeConn; already closed" if s[1]
+    fail "fakedb: can't close; dangling statement(s)" if s[2] > s[3]
+    st.lock { |x|
+      x.closed = true
+      nil
+    }
+    nil
+  }
+
+  def closed? -> Bool { st.lock { |s| s.closed } }
+
+  def exec(query: Str, args: [driver.Value]) -> ~driver.Result { panic "ExecContext was not called." }
+
+  def exec_context(ctx: context.Context, query: Str, args: [driver.NamedValue]) -> ~driver.Result {
+    fail driver.ERR_SKIP
+  }
+
+  def query(query: Str, args: [driver.Value]) -> ~driver.Rows { panic "QueryContext was not called." }
+
+  def query_context(ctx: context.Context, query: Str, args: [driver.NamedValue]) -> ~driver.Rows {
+    fail driver.ERR_SKIP
+  }
+
+  def prepare(query: Str) -> ~driver.Stmt { panic "use PrepareContext" }
+
+  def prepare_context(ctx: context.Context, query: Str) -> ~driver.Stmt { ~fake_prepare(self, ctx, query) }
+  def prepare_fake(ctx: context.Context, query: Str) -> ~FakeStmt { ~fake_prepare(self, ctx, query) }
+
+  def incr_made { st.lock { |s| s.stmts_made += 1; nil } }
+  def incr_closed { st.lock { |s| s.stmts_closed += 1; nil } }
+  def stmts -> (Int, Int) { st.lock { |s| (s.stmts_made, s.stmts_closed) } }
+  def set_waiter(f: ((context.Context) -> Unit)?) { st.lock { |s| s.waiter = f; nil } }
+  def set_skip_dirty_session { st.lock { |s| s.skip_dirty_session = true; nil } }
+  def set_sticky_bad(b: Bool) { st.lock { |s| s.sticky_bad = b; nil } }
+  def num_prepare -> Int { st.lock { |s| s.num_prepare } }
+}
+
+def new_fake_conn(db: FakeDB, drv: FakeDriver, bad: Bool) -> FakeConn {
+  st = FakeConnState.new(curr_tx: false, closed: false, stmts_made: 0, stmts_closed: 0, num_prepare: 0, sticky_bad: false, skip_dirty_session: false, dirty_session: false, waiter: none)
+  id = drv.st.lock { |s| s.open_count }
+  FakeConn.new(id: id, db: db, drv: drv, bad: bad, st: Mutex.new(st))
+}
+
+struct FakeTx {
+  c: FakeConn
+
+  def commit -> ~Unit {
+    c.st.lock { |s|
+      s.curr_tx = false
+      nil
+    }
+    fail bad_conn_error("Commit: Hook Bad Conn") if c.drv.hooks.call_bool(HOOK_COMMIT)
+    nil
+  }
+
+  def rollback -> ~Unit {
+    c.st.lock { |s|
+      s.curr_tx = false
+      nil
+    }
+    fail bad_conn_error("Rollback: Hook Bad Conn") if c.drv.hooks.call_bool(HOOK_ROLLBACK)
+    nil
+  }
+}
+
+# -------------------------------------------------------------- statements
+
+struct BoundCol {
+  column: Str
+  placeholder: Str
+  ordinal: Int
+}
+
+# An INSERT value: a placeholder ("?" or "?name") or a pre-bound value.
+enum ColVal {
+  Placeholder(name: Str)
+  Lit(v: driver.Value)
+}
+
+# One statement of a (possibly ';'-separated) query.
+struct StmtPart {
+  q: Str
+  cmd: Str
+  table: Str
+  panic_on: Str
+  wait: Int
+  col_name: [Str]
+  col_type: [Str]
+  col_value: [ColVal]
+  placeholders: Int
+  where_col: [BoundCol]
+  converter_types: [Str]
+}
+
+struct FakeStmt {
+  c: FakeConn
+  parts: [StmtPart]
+  closed: Mutex[[Bool]]
+
+  def first -> StmtPart { parts[0] }
+
+  def column_converter(idx: Int) -> driver.ValueConverter? {
+    panic "ColumnConverter" if first.panic_on == "ColumnConverter"
+    return driver.default_parameter_converter if first.converter_types.size == 0
+    converter_for_type(first.converter_types[idx])
+  }
+
+  def close -> ~Unit {
+    panic "Close" if first.panic_on == "Close"
+    panic "in fakeStmt.Close, conn's db is nil (already closed)" if c.closed?
+    newly = closed.lock { |cs|
+      n = 0
+      i = 0
+      while i < cs.size {
+        if !cs[i] {
+          n += 1
+          cs[i] = true
+        }
+        i += 1
+      }
+      n
+    }
+    for _i in 0...newly {
+      c.incr_closed
+    }
+    nil
+  }
+
+  def closed? -> Bool { closed.lock { |cs| cs[0] } }
+
+  def num_input -> Int {
+    panic "NumInput" if first.panic_on == "NumInput"
+    first.placeholders
+  }
+
+  def exec(args: [driver.Value]) -> ~driver.Result { panic "Using ExecContext" }
+
+  def exec_context(ctx: context.Context, args: [driver.NamedValue]) -> ~driver.Result {
+    s = first
+    panic "Exec" if s.panic_on == "Exec"
+    fail "fakedb: statement has been closed" if closed?
+    sticky = c.st.lock { |x| x.sticky_bad }
+    fail bad_conn_error("Exec: Sticky Bad") if sticky || c.drv.hooks.call_bool(HOOK_EXEC)
+    fail "fakedb: session is dirty" if c.is_dirty_and_mark
+    if s.wait > 0 {
+      time.sleep(time.duration(s.wait))
+    }
+    fail ctx_error(ctx) if ctx.done?
+    db = c.db
+    case s.cmd {
+      "WIPE" => {
+        db.wipe
+        return driver.ResultNoRows.new
+      }
+      "CREATE" => {
+        ~db.create_table(s.table, s.col_name, s.col_type)
+        return driver.ResultNoRows.new
+      }
+      "INSERT" => { return ~exec_insert(s, args, true) }
+      "NOSERT" => { return ~exec_insert(s, args, false) }
+      _ => {}
+    }
+    fail "fakedb: unimplemented statement Exec command type of #{strconv.quote(s.cmd)}"
+  }
+
+  def exec_insert(s: StmtPart, args: [driver.NamedValue], do_insert: Bool) -> ~driver.Result {
+    db = c.db
+    panic "error in pkg db; should only get here if size is correct" if args.size != s.placeholders
+    tt = db.table(s.table)
+    fail "fakedb: table #{strconv.quote(s.table)} doesn't exist" if tt == none
+    t = tt.unwrap
+    cols = [driver.Value.Null; t.colname.size]
+    arg_pos = 0
+    n = 0
+    while n < s.col_name.size {
+      colidx = t.column_index(s.col_name[n])
+      fail "fakedb: column #{strconv.quote(s.col_name[n])} doesn't exist or dropped since prepared statement was created" if colidx == -1
+      val = driver.Value.Null
+      case s.col_value[n] {
+        Placeholder(name) => {
+          if name == "" {
+            val = args[arg_pos].value
+          } else {
+            val = value_from_placeholder_name(args, name)
+          }
+          arg_pos += 1
+        }
+        Lit(v) => val = v
+      }
+      cols[colidx] = val
+      n += 1
+    }
+    db.append_row(s.table, cols) if do_insert
+    driver.RowsAffected.new(n: 1)
+  }
+
+  def query(args: [driver.Value]) -> ~driver.Rows { panic "Use QueryContext" }
+
+  def query_context(ctx: context.Context, args: [driver.NamedValue]) -> ~driver.Rows {
+    s0 = first
+    panic "Query" if s0.panic_on == "Query"
+    fail "fakedb: statement has been closed" if closed?
+    sticky = c.st.lock { |x| x.sticky_bad }
+    fail bad_conn_error("Query: Sticky Bad") if sticky || c.drv.hooks.call_bool(HOOK_QUERY)
+    fail "fakedb: session is dirty" if c.is_dirty_and_mark
+    db = c.db
+    panic "error in pkg db; should only get here if size is correct" if args.size != s0.placeholders
+    set_rows: [[[driver.Value]]] = []
+    set_columns: [[Str]] = []
+    set_col_type: [[Str]] = []
+    for s in parts {
+      tt = db.table(s.table)
+      fail "fakedb: table #{strconv.quote(s.table)} doesn't exist" if tt == none
+      t = tt.unwrap
+      if s.table == "magicquery" {
+        if s.where_col.size == 2 && s.where_col[0].column == "op" && s.where_col[1].column == "millis" {
+          if args[0].value == driver.Value.Str("sleep") {
+            ms = case args[1].value {
+              Int(i) => i
+              _ => 0
+            }
+            time.sleep(time.duration(ms * 1000000))
+          }
+        }
+      }
+      if s.table == "tx_status" && s.col_name[0] == "tx_status" {
+        status = c.st.lock { |x| x.curr_tx } ? "transaction" : "autocommit"
+        return new_rows_cursor(c, [[[driver.Value.Str(status)]]], [["tx_status"]], [["string"]])
+      }
+      col_idx: [Int] = []
+      for name in s.col_name {
+        idx = t.column_index(name)
+        fail "fakedb: unknown column name #{strconv.quote(name)}" if idx == -1
+        col_idx << idx
+      }
+      mrows: [[driver.Value]] = []
+      for trow in t.rows {
+        keep = true
+        for wcol in s.where_col {
+          idx = t.column_index(wcol.column)
+          fail "fakedb: invalid where clause column #{wcol.column}" if idx == -1
+          arg_value = driver.Value.Null
+          if wcol.placeholder == "?" {
+            arg_value = args[wcol.ordinal - 1].value
+          } else {
+            arg_value = value_from_placeholder_name(args, wcol.placeholder[1...wcol.placeholder.size])
+          }
+          if show_value(trow[idx]) != show_value(arg_value) {
+            keep = false
+            break
+          }
+        }
+        next if !keep
+        mrow: [driver.Value] = []
+        for i in col_idx {
+          mrow << trow[i]
+        }
+        mrows << mrow
+      }
+      col_type: [Str] = []
+      for column in s.col_name {
+        col_type << t.coltype[t.column_index(column)]
+      }
+      set_rows << mrows
+      set_columns << s.col_name
+      set_col_type << col_type
+    }
+    new_rows_cursor(c, set_rows, set_columns, set_col_type)
+  }
+}
+
+# Go's fmt.Sprintf("%v") on a column, []byte read as a string.
+def show_value(v: driver.Value) -> Str {
+  case v {
+    Bytes(b) => Str.from_bytes(b)
+    _ => v.to_s
+  }
+}
+
+def value_from_placeholder_name(args: [driver.NamedValue], name: Str) -> driver.Value {
+  for a in args {
+    return a.value if a.name == name
+  }
+  driver.Value.Null
+}
+
+def new_part(q: Str) -> StmtPart {
+  StmtPart.new(q: q, cmd: "", table: "", panic_on: "", wait: 0, col_name: [], col_type: [], col_value: [], placeholders: 0, where_col: [], converter_types: [])
+}
+
+# Go's fakeConn.PrepareContext.
+def fake_prepare(c: FakeConn, ctx: context.Context, query: Str) -> ~FakeStmt {
+  st = c.st.lock { |s|
+    s.num_prepare += 1
+    (s.closed, s.sticky_bad)
+  }
+  panic "nil c.db; conn = #{c.id}" if st[0]
+  fail bad_conn_error("Prepare: Sticky Bad") if st[1] || c.drv.hooks.call_bool(HOOK_PREPARE)
+  parts: [StmtPart] = []
+  made = 0
+  for q in strings.split(query, ";") {
+    p = strings.split(q, "|")
+    s = new_part(q)
+    if p.size >= 3 {
+      if p[0] == "PANIC" {
+        s.panic_on = p[1]
+        p = p[2...p.size]
+      } else if p[0] == "WAIT" {
+        d = time.parse_duration(p[1])
+        if e = d.err {
+          fail errf("expected section after WAIT to be a duration, got #{strconv.quote(p[1])} #{e.message}")
+        }
+        p = p[2...p.size]
+        s.wait = d.unwrap.nanoseconds
+      }
+    }
+    s.cmd = p[0]
+    p = p[1...p.size]
+    waiter = c.st.lock { |x| x.waiter }
+    if w = waiter {
+      w(ctx)
+      fail ctx_error(ctx) if ctx.done?
+    }
+    if s.wait > 0 {
+      timer = time.after(time.duration(s.wait))
+      done = ctx.done
+      canceled = false
+      select {
+        when timer.recv => {}
+        when done.recv => canceled = true
+      }
+      fail ctx_error(ctx) if canceled
+    }
+    c.incr_made
+    made += 1
+    r = case s.cmd {
+      "WIPE" => ok_part(s)
+      "SELECT" => prepare_select(c, s, p)
+      "CREATE" => prepare_create(s, p)
+      "INSERT" => prepare_insert(c, s, p)
+      "NOSERT" => prepare_insert(c, s, p)
+      _ => err_part(errf("unsupported command type #{strconv.quote(s.cmd)}"))
+    }
+    if e = r.err {
+      # Go closes the failed statement (counting it closed).
+      c.incr_closed
+      fail e
+    }
+    parts << r.unwrap
+  }
+  FakeStmt.new(c: c, parts: parts, closed: Mutex.new([false; parts.size]))
+}
+
+def ok_part(s: StmtPart) -> ~StmtPart { s }
+def err_part(e: Error) -> ~StmtPart { fail e }
+
+def prepare_select(c: FakeConn, s0: StmtPart, parts: [Str]) -> ~StmtPart {
+  s = s0
+  fail errf("invalid SELECT syntax with #{parts.size} parts; want 3") if parts.size != 3
+  s.table = parts[0]
+  s.col_name = strings.split(parts[1], ",")
+  n = 0
+  for colspec in strings.split(parts[2], ",") {
+    if colspec == "" {
+      n += 1
+      next
+    }
+    name_val = strings.split(colspec, "=")
+    fail errf("SELECT on table #{strconv.quote(s.table)} has invalid column spec of #{strconv.quote(colspec)} (index #{n})") if name_val.size != 2
+    column = name_val[0]
+    value = name_val[1]
+    fail errf("SELECT on table #{strconv.quote(s.table)} references non-existent column #{strconv.quote(column)}") if c.db.column_type(s.table, column) == none
+    fail errf("SELECT on table #{strconv.quote(s.table)} has pre-bound value for where column #{strconv.quote(column)}; need a question mark") if !value.start_with?("?")
+    s.placeholders += 1
+    s.where_col << BoundCol.new(column: column, placeholder: value, ordinal: s.placeholders)
+    n += 1
+  }
+  s
+}
+
+def prepare_create(s0: StmtPart, parts: [Str]) -> ~StmtPart {
+  s = s0
+  fail errf("invalid CREATE syntax with #{parts.size} parts; want 2") if parts.size != 2
+  s.table = parts[0]
+  n = 0
+  for colspec in strings.split(parts[1], ",") {
+    name_type = strings.split(colspec, "=")
+    fail errf("CREATE table #{strconv.quote(s.table)} has invalid column spec of #{strconv.quote(colspec)} (index #{n})") if name_type.size != 2
+    s.col_name << name_type[0]
+    s.col_type << name_type[1]
+    n += 1
+  }
+  s
+}
+
+def prepare_insert(c: FakeConn, s0: StmtPart, parts: [Str]) -> ~StmtPart {
+  s = s0
+  fail errf("invalid INSERT syntax with #{parts.size} parts; want 2") if parts.size != 2
+  s.table = parts[0]
+  n = 0
+  for colspec in strings.split(parts[1], ",") {
+    name_val = strings.split(colspec, "=")
+    fail errf("INSERT table #{strconv.quote(s.table)} has invalid column spec of #{strconv.quote(colspec)} (index #{n})") if name_val.size != 2
+    column = name_val[0]
+    value = name_val[1]
+    ct = c.db.column_type(s.table, column)
+    fail errf("INSERT table #{strconv.quote(s.table)} references non-existent column #{strconv.quote(column)}") if ct == none
+    ctype = ct.unwrap
+    s.col_name << column
+    if !value.start_with?("?") {
+      v = driver.Value.Null
+      if ctype == "string" || ctype == "blob" {
+        v = driver.Value.Bytes(value.bytes)
+      } else if ctype == "int32" {
+        i = strconv.atoi(value)
+        fail errf("invalid conversion to int32 from #{strconv.quote(value)}") if i.err?
+        v = driver.Value.Int(i.unwrap)
+      } else {
+        fail errf("unsupported conversion for pre-bound parameter #{strconv.quote(value)} to type #{strconv.quote(ctype)}")
+      }
+      s.col_value << ColVal.Lit(v: v)
+    } else {
+      s.placeholders += 1
+      s.converter_types << ctype
+      s.col_value << ColVal.Placeholder(name: value[1...value.size])
+    }
+    n += 1
+  }
+  s
+}
+
+# ------------------------------------------------------------------ cursor
+
+struct CursorState {
+  pos_set: Int
+  pos_row: Int
+  closed: Bool
+  err_pos: Int
+  err: Error?
+  close_err: Error?
+}
+
+struct RowsCursor {
+  c: FakeConn
+  rows: [[[driver.Value]]]
+  cols: [[Str]]
+  col_type: [[Str]]
+  st: Mutex[CursorState]
+
+  def close -> ~Unit {
+    e = st.lock { |s|
+      s.closed = true
+      s.close_err
+    }
+    if x = e {
+      fail x
+    }
+    nil
+  }
+
+  def columns -> [Str] { cols[st.lock { |s| s.pos_set }] }
+
+  def column_type_scan_type(index: Int) -> Str {
+    col_type_to_scan_type(col_type[st.lock { |s| s.pos_set }][index])
+  }
+
+  def next(dest: [driver.Value]) -> ~Bool {
+    hook = c.drv.hooks.st.lock { |h| h.rows_cursor_next }
+    if f = hook {
+      if e = f(dest) {
+        fail e
+      }
+      return true
+    }
+    s = st.lock { |s|
+      s.pos_row += 1 if !s.closed
+      (s.closed, s.pos_row, s.err_pos, s.err, s.pos_set)
+    }
+    fail "fakedb: cursor is closed" if s[0]
+    if s[1] == s[2] {
+      if e = s[3] {
+        fail e
+      }
+    }
+    set = rows[s[4]]
+    return false if s[1] >= set.size
+    i = 0
+    for v in set[s[1]] {
+      dest[i] = case v {
+        Bytes(b) => driver.Value.Bytes(b.dup)
+        _ => v
+      }
+      i += 1
+    }
+    true
+  }
+
+  def has_next_result_set? -> Bool { st.lock { |s| s.pos_set } < rows.size - 1 }
+
+  def next_result_set -> ~Unit {
+    if has_next_result_set? {
+      st.lock { |s|
+        s.pos_set += 1
+        s.pos_row = -1
+        nil
+      }
+      return nil
+    }
+    fail "EOF"
+  }
+}
+
+def new_rows_cursor(c: FakeConn, rows: [[[driver.Value]]], cols: [[Str]], col_type: [[Str]]) -> RowsCursor {
+  RowsCursor.new(c: c, rows: rows, cols: cols, col_type: col_type, st: Mutex.new(CursorState.new(pos_set: 0, pos_row: -1, closed: false, err_pos: -1, err: none, close_err: none)))
+}
+
+# -------------------------------------------------------------- converters
+
+# Go's fakeDriverString.
+struct FakeDriverString {
+  pub def convert_value(v: driver.Value) -> ~driver.Value {
+    case v {
+      Str(_) => v
+      Bytes(_) => v
+      _ => driver.Value.Str(v.to_s)
+    }
+  }
+}
+
+# Go's anyTypeConverter.
+struct AnyTypeConverter {
+  pub def convert_value(v: driver.Value) -> ~driver.Value { v }
+}
+
+def converter_for_type(typ: Str) -> driver.ValueConverter {
+  dpc = driver.default_parameter_converter
+  return driver.bool if typ == "bool"
+  return driver.Null.new(converter: driver.bool) if typ == "nullbool"
+  return driver.NotNull.new(converter: dpc) if typ == "byte" || typ == "int16"
+  return driver.int32 if typ == "int32"
+  return driver.Null.new(converter: dpc) if typ == "nullbyte" || typ == "nullint32" || typ == "nullint16"
+  return driver.NotNull.new(converter: FakeDriverString.new) if typ == "string"
+  return driver.Null.new(converter: FakeDriverString.new) if typ == "nullstring"
+  return driver.NotNull.new(converter: dpc) if typ == "int64" || typ == "float64" || typ == "datetime"
+  return driver.Null.new(converter: dpc) if typ == "nullint64" || typ == "nullfloat64" || typ == "nulldatetime"
+  return AnyTypeConverter.new if typ == "any"
+  panic "invalid fakedb column type of #{typ}"
+}
+
+def col_type_to_scan_type(typ: Str) -> Str {
+  case typ {
+    "bool" => "Bool"
+    "nullbool" => "NullBool"
+    "int16" => "I16"
+    "nullint16" => "NullInt16"
+    "int32" => "I32"
+    "nullint32" => "NullInt32"
+    "string" => "Str"
+    "nullstring" => "NullString"
+    "int64" => "Int"
+    "nullint64" => "NullInt64"
+    "float64" => "Float"
+    "nullfloat64" => "NullFloat64"
+    "datetime" => "time.Time"
+    "any" => "any"
+    _ => panic "invalid fakedb column type of #{typ}"
+  }
+}

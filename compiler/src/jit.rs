@@ -316,6 +316,22 @@ pub fn run(p: &LProgram) -> Result<(), String> {
     let mut m = JITModule::new(JITBuilder::with_isa(isa, default_libcall_names()));
 
     let mut externs = vec![];
+    // `#[link("sqlite3")]`: load the library into the process first.
+    let mut opened: Vec<&str> = vec![];
+    for l in p.externs.iter().filter_map(|x| x.lib.as_deref()) {
+        if opened.contains(&l) {
+            continue;
+        }
+        opened.push(l);
+        let names = if cfg!(target_os = "macos") { vec![format!("lib{l}.dylib")] } else { vec![format!("lib{l}.so"), format!("lib{l}.so.0")] };
+        let ok = names.iter().any(|n| {
+            let c = CString::new(n.as_str()).unwrap_or_default();
+            !unsafe { libc::dlopen(c.as_ptr(), libc::RTLD_NOW | libc::RTLD_GLOBAL) }.is_null()
+        });
+        if !ok {
+            return Err(format!("cannot load the C library `{l}` (tried {})", names.join(", ")));
+        }
+    }
     for x in &p.externs {
         let addr = resolve_c_symbol(&x.sym).ok_or_else(|| format!("undefined extern symbol `{}` (no such C function in this process)", x.sym))?;
         externs.push((addr, x.clone()));

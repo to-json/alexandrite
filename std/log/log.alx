@@ -11,9 +11,10 @@
 #   l.Output(calldepth, s) error            l.output(calldepth, s) -> ~Unit
 #   l.Flags / SetFlags / Prefix /           l.flags / set_flags(f) / prefix /
 #     SetPrefix / Writer / SetOutput          set_prefix(p) / writer / set_output(w)
-#   Default() *Logger                       default -> Logger[os.File] (stderr)
-#   Print, Printf, Println, Fatal..., Panic..., Output, Flags, Prefix, Writer
-#                                           the same names, on `default`
+#   Default() *Logger                       default -> Logger[io.Writer] (the
+#                                             standard logger: stderr at first)
+#   Print, Printf, Println, Fatal..., Panic..., Output, Flags, Prefix, Writer,
+#     SetFlags, SetPrefix, SetOutput        the same names, on `default`
 #
 # A line is: the prefix (unless LMSGPREFIX), the date `2009/01/23 ` (LDATE),
 # the time `01:23:23 ` or `01:23:23.123123 ` (LTIME / LMICROSECONDS), the
@@ -33,10 +34,11 @@
 #  - LSHORTFILE / LLONGFILE write `???:0` (what Go writes when
 #    runtime.Caller fails): alexandrite has no caller locations at run time.
 #    `calldepth` is accepted and ignored.
-#  - The package-level functions log to a fresh `default` logger (stderr,
-#    LSTD_FLAGS, no prefix): alexandrite has no mutable package state, so
-#    Go's SetOutput / SetFlags / SetPrefix on the standard logger don't
-#    exist. Make a Logger with `new` and pass it around instead.
+#  - The standard logger (Go's `std`) is a package-level `Mutex` (R11)
+#    holding its state; `default` returns a Logger[io.Writer] over it, so
+#    every copy and every package-level function shares it, and
+#    `set_output(w)` / `set_flags` / `set_prefix` change it for all of them.
+#    Its writer is an io.Writer (`os.stderr` at first).
 #  - A Logger is generic over its writer (any type with
 #    `write!(p: [Byte]) -> ~Int`, or an io.Writer value). It holds the
 #    writer under its lock, so the writer moves into the logger: read a
@@ -47,6 +49,7 @@
 #  - Write errors are returned by `output` and ignored by the print
 #    functions (as in Go).
 
+import "io"
 import "os"
 import "time"
 
@@ -170,10 +173,15 @@ pub def new[W](out: W, prefix: Str, flag: Int) -> Logger[W] {
   Logger[W].new(st: Mutex.new(LogState[W].new(prefix: prefix, flag: flag, out: o)))
 }
 
-# The standard logger: stderr, LSTD_FLAGS, no prefix (a fresh one each call;
-# see the header).
-pub def default -> Logger[os.File] {
-  new(os.stderr, "", LSTD_FLAGS)
+# The standard logger's state (Go's `std`): stderr, LSTD_FLAGS, no prefix.
+STD = Mutex.new(LogState[io.Writer].new(prefix: "", flag: LSTD_FLAGS, out: stderr_writer()))
+
+def stderr_writer -> io.Writer { os.stderr }
+
+# The standard logger, which the package-level functions use. Every copy
+# shares its state.
+pub def default -> Logger[io.Writer] {
+  Logger[io.Writer].new(st: STD)
 }
 
 pub def print(s: Str) { default.print(s) }
@@ -186,9 +194,12 @@ pub def panic(s: Str) { default.panic(s) }
 pub def panicf(s: Str) { default.panicf(s) }
 pub def panicln(s: Str) { default.panicln(s) }
 pub def output(calldepth: Int, s: Str) -> ~Unit { default.output(calldepth, s) }
-pub def flags -> Int { LSTD_FLAGS }
-pub def prefix -> Str { "" }
-pub def writer -> os.File { os.stderr }
+pub def flags -> Int { default.flags }
+pub def set_flags(flag: Int) { default.set_flags(flag) }
+pub def prefix -> Str { default.prefix }
+pub def set_prefix(prefix: Str) { default.set_prefix(prefix) }
+pub def writer -> io.Writer { default.writer }
+pub def set_output(w: io.Writer) { default.set_output(w) }
 
 # Panics with s (a helper: the methods named panic hide the builtin).
 def raise(s: Str) {

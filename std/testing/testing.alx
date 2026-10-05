@@ -1,0 +1,980 @@
+# Package testing: Go's testing — the API a test, benchmark or TestMain
+# uses, mapped onto alx's built-in test runner (`alx test`).
+#
+# How Go's model maps onto alx (the design; GO-VS-RUBY.md D67):
+#  - Go finds `func TestX(t *testing.T)` by name; alx has `test "x" { }`
+#    blocks in `*_test.alx` files. A block that names a parameter,
+#    `test "x" { |t| ... }`, gets a `testing.T` (the front end gives the
+#    parameter its type and imports this package); `bench "x" { |b| ... }`
+#    gets a `testing.B`. Blocks without a parameter work as before (assert,
+#    assert_eq, `~` propagation).
+#  - `def test_main(m: testing.M)` in a test file is Go's TestMain: the
+#    runner calls it instead of running the tests; `m.run` runs them and
+#    returns the exit code, which is the test binary's (Go 1.15+).
+#  - Each test (and subtest) runs as its own task. Go stops a test with
+#    runtime.Goexit (FailNow, Fatal, SkipNow, Skip); alx stops the test's
+#    task with a panic the runner recognises, so `t.fatal("x")` needs no
+#    `~` and works from helpers. `assert`/`assert_eq` and any other panic
+#    or propagated error fail the test, as before.
+#  - Cleanups run, last first, after the test (and its subtests) finish,
+#    also when it failed or was skipped.
+#  - `alx test` prints Go's `-v` output: `=== RUN`, `--- PASS/FAIL/SKIP:
+#    name (0.00s)`, log lines indented under their test, subtest results
+#    under their parent (indented 4 per level), `PASS`/`FAIL`, `ok`.
+#
+#   Go                                      alx
+#   func TestX(t *testing.T)                test "X" { |t| ... }
+#   func BenchmarkX(b *testing.B)           bench "X" { |b| ... }
+#   func TestMain(m *testing.M)             def test_main(m: testing.M) { ... m.run ... }
+#   T, B (and TB)                           T, B (and interface TB)
+#   t.Log / Error / Fatal / Skip(args...)   t.log / error / fatal / skip(msg: Str)
+#   t.Logf / Errorf / Fatalf / Skipf        t.log(fmt.sprintf(...)) or "#{...}" (no variadics)
+#   t.Fail / FailNow / Failed               fail / fail_now / failed?
+#   t.SkipNow / Skipped                     skip_now / skipped?
+#   t.Name / Helper                         name / helper (a no-op)
+#   t.Cleanup(func())                       t.cleanup { |tb| ... } (tb: the test, as a TB;
+#                                             the block may use `~`, a failure fails
+#                                             the test)
+#   t.TempDir / Setenv / Chdir              temp_dir -> Str / setenv(k, v) / chdir(dir)
+#   t.Run(name, func(t *T)) bool            t.run(name) { |t| ... } -> Bool
+#   t.Parallel                              parallel (a no-op: tests run one at a time)
+#   t.Output() io.Writer                    output -> TestOutput (write! logs each line)
+#   t.Attr(key, value)                      attr(key, value)
+#   b.N                                     b.n
+#   b.ResetTimer / StartTimer / StopTimer   reset_timer / start_timer / stop_timer
+#   b.ReportAllocs / ReportMetric           report_allocs / report_metric(n, unit)
+#   b.SetBytes / Elapsed / Loop             set_bytes(n) / elapsed (ns) / loop
+#   b.Run / RunParallel / SetParallelism    run(name) { |b| } / run_parallel { |pb| } /
+#                                             set_parallelism(p); pb.next
+#   testing.Short / Verbose / Testing       short? / verbose? / testing?
+#   testing.AllocsPerRun(runs, f)           allocs_per_run(runs) { ... } -> Float
+#   testing.Benchmark(f) BenchmarkResult    benchmark { |b| ... } -> BenchmarkResult
+#   BenchmarkResult                         n, t (ns), bytes, mem_allocs, mem_bytes, extra;
+#                                             ns_per_op, allocs_per_op,
+#                                             alloced_bytes_per_op, to_s, mem_string
+#   testing.CoverMode / Coverage            cover_mode -> "" / coverage -> 0.0
+#
+# Flags: `alx test -short` (short?), `-v` (verbose?), `-run A/B` (a
+# subtest filter level per `/`, each a substring with `|` alternatives),
+# `-bench`, `-benchtime`. The runner hands them over in environment
+# variables (ALX_TEST_SHORT, ALX_TEST_VERBOSE, ALX_TEST_RUN, ALX_TESTING),
+# alx having no mutable package state for Go's flag variables.
+#
+# Differences from Go:
+#  - No variadic `...any`: log, error, fatal and skip take one Str.
+#  - A cleanup block gets the test as a parameter (`t.cleanup { |t| ... }`)
+#    instead of capturing it: a T holds its cleanups, and a closure can't
+#    capture a value that holds closures of its own type (port issue 71).
+#  - `b.n` is a method (Go's field b.N); `b.loop` is `while b.loop { }`.
+#  - run_parallel runs 4 x parallelism tasks (Go: GOMAXPROCS x parallelism).
+#  - A benchmark's result line has no `-GOMAXPROCS` suffix and no column
+#    alignment across benchmarks; bodies without `|b|` keep alx's own
+#    `name   N   x ns/op` line.
+#  - No caller locations: a log line is `    msg`, not `    x_test.go:12:
+#    msg` (port issue 52), and `helper` changes nothing.
+#  - `parallel` doesn't run tests concurrently; parallel subtests run in
+#    order. There is no `-timeout`, so no `deadline` and no `context`.
+#  - Allocation counts are of alx's region allocations; there is no byte
+#    count, so `b.report_allocs` prints `allocs/op` only and `mem_bytes`
+#    and `alloced_bytes_per_op` are 0.
+#  - TempDir makes one directory per call (named after the test) and
+#    removes it at cleanup; Go nests them in one per-test directory.
+#  - `testing?` reads ALX_TESTING, which subprocesses inherit.
+#  - Not ported: fuzzing (F, `Fuzz`), coverage instrumentation, `Init`,
+#    `Main`, `RunTests`/`RunBenchmarks`/`RunExamples` and `ArtifactDir`
+#    (the runner does those jobs), `B.SetParallelism` beyond the task count.
+#  - This package imports os: a package os depends on can still use `|t|`,
+#    but then two copies of it are compiled (port issue 54).
+
+import "os"
+
+# The panic message that stops a test's task (Go's runtime.Goexit).
+STOP = "testing: the test was stopped (FailNow or SkipNow)"
+
+# ------------------------------------------------------------------- flags
+
+# Whether `alx test -short` was given (Go's Short).
+pub def short? -> Bool { os.getenv("ALX_TEST_SHORT") == "1" }
+
+# Whether `alx test -v` was given (Go's Verbose).
+pub def verbose? -> Bool { os.getenv("ALX_TEST_VERBOSE") == "1" }
+
+# Whether the program is a test binary (Go's Testing).
+pub def testing? -> Bool { os.getenv("ALX_TESTING") == "1" }
+
+# There is no coverage instrumentation: "" and 0.
+pub def cover_mode -> Str { "" }
+pub def coverage -> Float { 0.0 }
+
+# ------------------------------------------------------------------ naming
+
+# Go's rewrite: a subtest name with spaces as `_` and unprintable bytes
+# escaped.
+def rewrite(s: Str) -> Str {
+  out: [Byte] = []
+  hex = "0123456789abcdef"
+  for c in s.bytes {
+    if c == 32 {
+      out << 95.as_u8
+    } elsif c < 32 || c == 127 {
+      for b in "\\x".bytes {
+        out << b
+      }
+      out << hex[(c >> 4).to_i]
+      out << hex[(c & 15).to_i]
+    } else {
+      out << c
+    }
+  }
+  Str.from_bytes(out)
+}
+
+# Does `name` (a full test name, levels joined by `/`) pass the `-run`
+# filter? Level k must contain one of the `|` alternatives of the filter's
+# element k; levels past the filter's elements pass.
+def run_wanted?(name: Str) -> Bool {
+  f = os.getenv("ALX_TEST_RUN") || ""
+  return true if f == ""
+  pats = f.split("/")
+  levels = name.split("/")
+  k = 0
+  while k < levels.size && k < pats.size {
+    alts = pats[k].split("|")
+    return false if !alts.any? { |a| levels[k].include?(a) }
+    k += 1
+  }
+  true
+}
+
+def secs(ns: Int) -> Str { format("%.2f", ns.to_f / 1000000000.0) }
+
+def indent_all(lines: [Str], by: Str) -> [Str] {
+  lines.map { |l| by + l }.to_a
+}
+
+def strip_prefix(m: Str) -> Str {
+  p = "alexandrite: "
+  return m[p.size...m.size] if m.start_with?(p)
+  m
+}
+
+# A failure message's lines, as Go indents logs: the first after 4 spaces,
+# the rest after 8.
+def log_lines(msg: Str) -> [Str] {
+  parts = msg.split("\n")
+  out: [Str] = []
+  i = 0
+  for p in parts {
+    out << (i == 0 ? "    " : "        ") + p
+    i += 1
+  }
+  out
+}
+
+# ------------------------------------------------------------------ common
+
+# What T and B share (Go's `common`): the state lives behind a Mutex, so
+# every copy of a T (in helpers, closures, subtests' tasks) is the same
+# test.
+struct CState {
+  name: Str
+  depth: Int
+  failed: Bool
+  skipped: Bool
+  # Lines printed under this test's result line (its subtests' results),
+  # already indented relative to it.
+  report: [Str]
+  cleanups: [(TB) -> ~Unit]
+  subs: Map[Str, Int]
+  temps: Int
+}
+
+struct Common {
+  st: Mutex[CState]
+
+  def name -> Str { st.lock { |s| s.name } }
+  def depth -> Int { st.lock { |s| s.depth } }
+
+  def log(msg: Str) {
+    for l in log_lines(msg) {
+      puts l
+    }
+  }
+
+  def mark_failed {
+    st.lock { |s| s.failed = true }
+    nil
+  }
+  def failed? -> Bool { st.lock { |s| s.failed } }
+  def skipped? -> Bool { st.lock { |s| s.skipped } }
+
+  def fail_now {
+    mark_failed
+    panic(STOP)
+  }
+
+  def skip_now {
+    st.lock { |s| s.skipped = true }
+    panic(STOP)
+  }
+
+  def cleanup(f: (TB) -> ~Unit) {
+    st.lock { |s| s.cleanups << f }
+    nil
+  }
+
+  def add_report(lines: [Str]) {
+    st.lock { |s| s.report = s.report + lines }
+  }
+
+  # Run the cleanups, last registered first; a failing one fails the test.
+  # Cleanups registered while cleaning up (a temp_dir in a cleanup) run
+  # too.
+  def run_cleanups(tb: TB) {
+    loop {
+      fs = st.lock { |s|
+        out = s.cleanups
+        e: [(TB) -> ~Unit] = []
+        s.cleanups = e
+        out
+      }
+      break if fs.size == 0
+      i = fs.size - 1
+      while i >= 0 {
+        f = fs[i]
+        r = f.call(tb)
+        if e = r.err {
+          log("cleanup failed: #{e.message}")
+          mark_failed
+        }
+        i -= 1
+      }
+    }
+  }
+
+  # A subtest's unique full name (Go's testNameUniquer: `x`, `x#01`, ...).
+  def sub_name(name: Str) -> Str {
+    base = rewrite(name)
+    st.lock { |s|
+      n = s.subs[base] || 0
+      s.subs[base] = n + 1
+      full = n == 0 ? base : base + format("#%02d", n)
+      s.name + "/" + full
+    }
+  }
+
+  # A new directory, removed when the test ends (Go's TempDir).
+  def temp_dir -> Str {
+    pat: [Byte] = []
+    for c in name.bytes {
+      ok = c >= 97 && c <= 122 || c >= 65 && c <= 90 || c >= 48 && c <= 57
+      pat << (ok ? c : 95.as_u8)
+      break if pat.size >= 64
+    }
+    r = os.mkdir_temp("", Str.from_bytes(pat))
+    if e = r.err {
+      log("TempDir: #{e.message}")
+      fail_now
+    }
+    dir = r.unwrap
+    cleanup { |_tb| ~os.remove_all(dir) }
+    dir
+  }
+
+  # Sets an environment variable until the test ends (Go's Setenv).
+  def setenv(key: Str, value: Str) {
+    prev = os.getenv(key)
+    r = os.setenv(key, value)
+    if e = r.err {
+      log("Setenv: #{e.message}")
+      fail_now
+    }
+    cleanup { |_tb|
+      if p = prev {
+        ~os.setenv(key, p)
+      } else {
+        ~os.unsetenv(key)
+      }
+    }
+  }
+
+  # Changes the working directory until the test ends (Go's Chdir; PWD
+  # follows, as in Go).
+  def chdir(dir: Str) {
+    old = os.getwd
+    if e = old.err {
+      log("Chdir: #{e.message}")
+      fail_now
+    }
+    r = os.chdir(dir)
+    if e = r.err {
+      log("Chdir: #{e.message}")
+      fail_now
+    }
+    prev_pwd = os.getenv("PWD")
+    if now = os.getwd.ok {
+      _r = os.setenv("PWD", now)
+    }
+    o = old.unwrap
+    cleanup { |_tb|
+      ~os.chdir(o)
+      if p = prev_pwd {
+        ~os.setenv("PWD", p)
+      } else {
+        ~os.unsetenv("PWD")
+      }
+    }
+  }
+}
+
+def new_common(name: Str, depth: Int) -> Common {
+  e: [Str] = []
+  cs: [(TB) -> ~Unit] = []
+  m: Map[Str, Int] = {}
+  Common.new(st: Mutex.new(CState.new(name: name, depth: depth, report: e, cleanups: cs, subs: m)))
+}
+
+# What T and B have in common (Go's TB).
+pub interface TB {
+  def name -> Str
+  def log(msg: Str)
+  def error(msg: Str)
+  def fatal(msg: Str)
+  def skip(msg: Str)
+  def fail
+  def fail_now
+  def failed? -> Bool
+  def skip_now
+  def skipped? -> Bool
+  def helper
+  def cleanup(f: (TB) -> ~Unit)
+  def temp_dir -> Str
+  def setenv(key: Str, value: Str)
+  def chdir(dir: Str)
+}
+
+# --------------------------------------------------------------------- T
+
+# A test's handle (Go's *T). Copies are the same test.
+pub struct T {
+  c: Common
+
+  # The full name: the test's, then each subtest's, joined by `/`.
+  pub def name -> Str { c.name }
+
+  # Logs a line (shown under the test, indented).
+  pub def log(msg: Str) { c.log(msg) }
+
+  # Log, then fail but keep going (Go's Error).
+  pub def error(msg: Str) {
+    c.log(msg)
+    c.mark_failed
+  }
+
+  # Log, then fail and stop the test (Go's Fatal).
+  pub def fatal(msg: Str) {
+    c.log(msg)
+    c.fail_now
+  }
+
+  # Log, then stop the test as skipped (Go's Skip).
+  pub def skip(msg: Str) {
+    c.log(msg)
+    c.skip_now
+  }
+
+  pub def fail { c.mark_failed }
+  pub def fail_now { c.fail_now }
+  pub def failed? -> Bool { c.failed? }
+  pub def skip_now { c.skip_now }
+  pub def skipped? -> Bool { c.skipped? }
+
+  # Go's Helper marks a function to leave out of log locations; alx logs
+  # have no locations.
+  pub def helper {}
+
+  # Go's Parallel: alx runs tests one at a time, so this changes nothing.
+  pub def parallel {}
+
+  # Run f when the test (and its subtests) end, last registered first.
+  pub def cleanup(f: (TB) -> ~Unit) { c.cleanup(f) }
+
+  pub def temp_dir -> Str { c.temp_dir }
+  pub def setenv(key: Str, value: Str) { c.setenv(key, value) }
+  pub def chdir(dir: Str) { c.chdir(dir) }
+
+  # Go's Attr: an `=== ATTR` line.
+  pub def attr(key: Str, value: Str) {
+    if key.bytes.any? { |b| b == 32 || b == 9 || b == 13 || b == 10 } {
+      error("disallowed whitespace in attribute key #{key}")
+      return
+    }
+    if value.bytes.any? { |b| b == 13 || b == 10 } {
+      error("disallowed newline in attribute value #{value}")
+      return
+    }
+    puts "=== ATTR  #{c.name} #{key} #{value}"
+  }
+
+  # A writer whose lines go to the test's log (Go's Output).
+  pub def output -> TestOutput { TestOutput.new(c: c, st: [""]) }
+
+  # Runs f as a subtest named `name` in its own task and waits for it;
+  # true if it passed (or was skipped). Go's Run.
+  pub def run(name: Str, f: (T) -> ~Unit) -> Bool {
+    full = c.sub_name(name)
+    return true if !run_wanted?(full)
+    sub = T.new(c: new_common(full, c.depth + 1))
+    ok, lines = run_one(sub.c, full, sub, f)
+    c.add_report(indent_all(lines, "    "))
+    c.mark_failed if !ok
+    ok
+  }
+}
+
+# The writer of T.output: complete lines are logged as they're written.
+pub struct TestOutput {
+  c: Common
+  st: [Str]
+
+  pub def write!(p: [Byte]) -> ~Int {
+    text = st[0] + Str.from_bytes(p)
+    parts = text.split("\n")
+    i = 0
+    while i < parts.size - 1 {
+      c.log(parts[i])
+      i += 1
+    }
+    self.st[0] = parts[parts.size - 1]
+    p.size
+  }
+}
+
+# Run body (a test or subtest of common c) in its own task, then the
+# cleanups: whether it passed, and its result line and report (its
+# subtests' results), to print (a top-level test) or to add to the
+# parent's report (a subtest).
+def run_one[X](c: Common, full: Str, x: X, body: (X) -> ~Unit) -> (Bool, [Str]) {
+  puts "=== RUN   #{full}"
+  t0 = Time.now_ns
+  g = body.dup
+  r = (spawn { ~g(x); 0 }).wait
+  if e = r.err {
+    m = strip_prefix(e.message)
+    if !m.include?(STOP) {
+      for l in m.split("\n") {
+        puts "    #{l}"
+      }
+      c.mark_failed
+    }
+  }
+  c.run_cleanups(x)
+  d = Time.now_ns - t0
+  failed = c.failed?
+  word = failed ? "FAIL" : (c.skipped? ? "SKIP" : "PASS")
+  report = c.st.lock { |s| s.report }
+  (!failed, ["--- #{word}: #{full} (#{secs(d)}s)"] + report)
+}
+
+# ------------------------------------------------------------- the runner
+
+# Runs one top-level test (the runner's call for `test "x" { |t| }`):
+# 1 if it failed, else 0.
+pub def run_test(name: Str, f: (T) -> ~Unit) -> Int {
+  t = T.new(c: new_common(name, 0))
+  ok, lines = run_one(t.c, name, t, f)
+  for l in lines {
+    puts l
+  }
+  ok ? 0 : 1
+}
+
+# ---------------------------------------------------------------------- M
+
+# Go's *M: what `def test_main(m: testing.M)` gets.
+pub struct M {
+  run_all: () -> Int
+  st: Mutex[Int]
+
+  # Runs the tests, benchmarks and examples; the exit code (0: all passed).
+  pub def run -> Int {
+    code = run_all.call
+    st.lock { |c| c = code }
+    code
+  }
+
+  # The code of the last `run` (the runner exits with it).
+  pub def code -> Int { st.lock { |c| c } }
+}
+
+# The runner's M: f runs everything.
+pub def new_m(f: () -> Int) -> M {
+  M.new(run_all: f, st: Mutex.new(0))
+}
+
+# ---------------------------------------------------------- allocations
+
+extern def alx_count_allocs(on: Bool) -> Bool = "alx_count_allocs"
+extern def alx_alloc_count -> Int = "alx_alloc_count"
+
+# The average number of allocations a call of f makes, over `runs` calls
+# after a warm-up call (Go's AllocsPerRun; the division is an integer one,
+# as Go's). The count is of alx's region allocations.
+pub def allocs_per_run(runs: Int, f: () -> Unit) -> Float {
+  f.call
+  was = alx_count_allocs(true)
+  start = alx_alloc_count
+  i = 0
+  while i < runs {
+    f.call
+    i += 1
+  }
+  n = alx_alloc_count - start
+  _w = alx_count_allocs(was)
+  return 0.0 if runs <= 0
+  (n / runs).to_f
+}
+
+# ---------------------------------------------------------------------- B
+
+struct BState {
+  n: Int
+  bench_ns: Int
+  timer_on: Bool
+  start: Int
+  elapsed: Int
+  allocs_start: Int
+  allocs: Int
+  report_allocs: Bool
+  bytes: Int
+  extra: Map[Str, Float]
+  loop_n: Int
+  loop_i: Int
+  loop_done: Bool
+  has_sub: Bool
+  parallelism: Int
+}
+
+# A benchmark's handle (Go's *B). Copies are the same benchmark.
+pub struct B {
+  c: Common
+  bs: Mutex[BState]
+  # This run's b.n (a plain field: reading it in the loop costs nothing).
+  iters: Atomic[Int]
+
+  # The number of iterations to run (Go's b.N).
+  pub def n -> Int { iters.load }
+
+  pub def name -> Str { c.name }
+  pub def log(msg: Str) { c.log(msg) }
+
+  pub def error(msg: Str) {
+    c.log(msg)
+    c.mark_failed
+  }
+
+  pub def fatal(msg: Str) {
+    c.log(msg)
+    c.fail_now
+  }
+
+  pub def skip(msg: Str) {
+    c.log(msg)
+    c.skip_now
+  }
+
+  pub def fail { c.mark_failed }
+  pub def fail_now { c.fail_now }
+  pub def failed? -> Bool { c.failed? }
+  pub def skip_now { c.skip_now }
+  pub def skipped? -> Bool { c.skipped? }
+  pub def helper {}
+  pub def cleanup(f: (TB) -> ~Unit) { c.cleanup(f) }
+  pub def temp_dir -> Str { c.temp_dir }
+  pub def setenv(key: Str, value: Str) { c.setenv(key, value) }
+  pub def chdir(dir: Str) { c.chdir(dir) }
+
+  # Starts timing (Go's StartTimer; the timer runs when the body starts).
+  pub def start_timer {
+    now = Time.now_ns
+    count = alx_alloc_count
+    bs.lock { |s|
+      if !s.timer_on {
+        s.start = now
+        s.allocs_start = count
+        s.timer_on = true
+      }
+    }
+  }
+
+  # Stops timing (Go's StopTimer), e.g. around setup in the loop.
+  pub def stop_timer {
+    now = Time.now_ns
+    count = alx_alloc_count
+    bs.lock { |s|
+      if s.timer_on {
+        s.elapsed += now - s.start
+        s.allocs += count - s.allocs_start
+        s.timer_on = false
+      }
+    }
+  }
+
+  # Zeroes the time and allocations so far, and the reported metrics
+  # (Go's ResetTimer).
+  pub def reset_timer {
+    now = Time.now_ns
+    count = alx_alloc_count
+    m: Map[Str, Float] = {}
+    bs.lock { |s|
+      if s.timer_on {
+        s.start = now
+        s.allocs_start = count
+      }
+      s.elapsed = 0
+      s.allocs = 0
+      s.extra = m
+    }
+  }
+
+  # The time measured so far, in ns (Go's Elapsed).
+  pub def elapsed -> Int {
+    now = Time.now_ns
+    bs.lock { |s| s.timer_on ? s.elapsed + now - s.start : s.elapsed }
+  }
+
+  # Print allocs/op for this benchmark (Go's ReportAllocs).
+  pub def report_allocs { bs.lock { |s| s.report_allocs = true } }
+
+  # Bytes processed per iteration: the result shows MB/s (Go's SetBytes).
+  pub def set_bytes(n: Int) { bs.lock { |s| s.bytes = n } }
+
+  # A custom metric `n unit` (Go's ReportMetric): "ns/op" etc. override
+  # the measured ones.
+  pub def report_metric(n: Float, unit: Str) {
+    bs.lock { |s| s.extra[unit] = n }
+  }
+
+  # Go's SetParallelism: run_parallel uses p times the default task count.
+  pub def set_parallelism(p: Int) {
+    bs.lock { |s| s.parallelism = p < 1 ? 1 : p }
+  }
+
+  # Go's Loop: `while b.loop { body }` runs the body until the benchmark
+  # has run long enough, timing only the loop (the first call resets the
+  # timer, the last stops it). b.n is 0 inside, then the count.
+  pub def loop -> Bool {
+    fast = bs.lock { |s|
+      if s.loop_i < s.loop_n && s.timer_on {
+        s.loop_i += 1
+        true
+      } else {
+        false
+      }
+    }
+    return true if fast
+    fatal("B.Loop called with timer stopped") if !bs.lock { |s| s.timer_on }
+    first = bs.lock { |s| s.loop_n == 0 }
+    if first {
+      bs.lock { |s|
+        s.loop_n = 1
+        s.n = 0
+      }
+      iters.store(0)
+      reset_timer
+      bs.lock { |s| s.loop_i += 1 }
+      return true
+    }
+    t = elapsed
+    more = bs.lock { |s|
+      if t >= s.bench_ns {
+        false
+      } else {
+        prev = s.loop_n
+        s.loop_n = predict_n(s.bench_ns, prev, t, prev)
+        prev < s.loop_n
+      }
+    }
+    if !more {
+      stop_timer
+      bs.lock { |s|
+        s.n = s.loop_n
+        s.loop_done = true
+      }
+      iters.store(bs.lock { |s| s.n })
+      return false
+    }
+    bs.lock { |s| s.loop_i += 1 }
+    true
+  }
+
+  # Runs f as a sub-benchmark named `name` (Go's Run), which prints its
+  # own result line; true unless it failed.
+  pub def run(name: Str, f: (B) -> ~Unit) -> Bool {
+    bs.lock { |s| s.has_sub = true }
+    full = c.sub_name(name)
+    bench_ns = bs.lock { |s| s.bench_ns }
+    ok, lines = bench_one(full, c.depth + 1, bench_ns, f)
+    c.add_report(indent_all(lines, "    "))
+    c.mark_failed if !ok
+    ok
+  }
+
+  # Runs f in parallel tasks, sharing b.n iterations between them through
+  # pb.next (Go's RunParallel).
+  pub def run_parallel(f: (PB) -> ~Unit) {
+    n = self.n
+    p = bs.lock { |s| s.parallelism }
+    counter = Atomic.new(0)
+    tasks = 4 * p
+    hs = (0...tasks).map { |_i|
+      pb = PB.new(counter: counter, total: n)
+      g = f.dup
+      spawn { ~g(pb); 0 }
+    }.to_a
+    for h in hs {
+      r = h.wait
+      if e = r.err {
+        m = strip_prefix(e.message)
+        if !m.include?(STOP) {
+          c.log(m)
+          c.mark_failed
+        }
+      }
+    }
+  }
+}
+
+# One task's share of a parallel benchmark (Go's *PB).
+pub struct PB {
+  counter: Atomic[Int]
+  total: Int
+
+  # Whether there is another iteration to run (Go's Next).
+  pub def next -> Bool { counter.add(1) <= total }
+}
+
+# Go's predictN: the next iteration count aiming at goal_ns, growing by at
+# least one and at most 100 times, by a fifth more than the estimate.
+def predict_n(goal_ns: Int, prev_iters: Int, prev_ns: Int, last: Int) -> Int {
+  pns = prev_ns <= 0 ? 1 : prev_ns
+  n = goal_ns.to_f * prev_iters.to_f / pns.to_f
+  m = n > 1.0e15 ? 1000000000000000 : n.to_i
+  m += m / 5
+  m = last * 100 if m > last * 100
+  m = last + 1 if m <= last
+  m = 1000000000 if m > 1000000000
+  m
+}
+
+def new_b(name: Str, depth: Int, bench_ns: Int) -> B {
+  m: Map[Str, Float] = {}
+  B.new(c: new_common(name, depth), bs: Mutex.new(BState.new(n: 1, bench_ns: bench_ns, extra: m, parallelism: 1)), iters: Atomic.new(1))
+}
+
+# One run of a benchmark body with b.n = n: whether it ended without
+# failing or being skipped (the reason is logged).
+def bench_run(b: B, n: Int, f: (B) -> ~Unit) -> Bool {
+  m: Map[Str, Float] = {}
+  b.bs.lock { |s|
+    s.n = n
+    s.elapsed = 0
+    s.allocs = 0
+    s.timer_on = false
+    s.extra = m
+    s.loop_n = 0
+    s.loop_i = 0
+    s.loop_done = false
+  }
+  b.start_timer
+  g = f.dup
+  bb = B.new(c: b.c, bs: b.bs, iters: Atomic.new(n))
+  r = (spawn { ~g(bb); 0 }).wait
+  b.stop_timer
+  unfinished = b.bs.lock { |s| s.loop_n > 0 && !s.loop_done }
+  if unfinished && r.ok? && !b.failed? {
+    b.error("benchmark function returned without B.Loop() == false (break or return in loop?)")
+  }
+  if e = r.err {
+    msg = strip_prefix(e.message)
+    if !msg.include?(STOP) {
+      b.c.log(msg)
+      b.c.mark_failed
+    }
+  }
+  !b.failed? && !b.skipped?
+}
+
+# The result of b's last run.
+def result_of(b: B) -> BenchmarkResult {
+  b.bs.lock { |s|
+    BenchmarkResult.new(n: s.n, t: s.elapsed, bytes: s.bytes, mem_allocs: s.allocs, extra: s.extra)
+  }
+}
+
+# Runs a benchmark as Go's runN/launch do: once with n = 1, then (unless it
+# has sub-benchmarks, failed, or used b.loop) with growing n until it ran
+# for bench_ns. Prints the result line (or FAIL/SKIP) at depth 0; returns
+# whether it passed and the lines for the parent otherwise.
+def bench_one(full: Str, depth: Int, bench_ns: Int, f: (B) -> ~Unit) -> (Bool, [Str]) {
+  b = new_b(full, depth, bench_ns)
+  was = alx_count_allocs(true)
+  ok = bench_run(b, 1, f)
+  subs = b.bs.lock { |s| s.has_sub }
+  looped = b.bs.lock { |s| s.loop_done }
+  if ok && !subs && !looped {
+    n = 1
+    loop {
+      d = b.elapsed
+      break if d >= bench_ns || n >= 1000000000
+      n = predict_n(bench_ns, n, d, n)
+      ok = bench_run(b, n, f)
+      break if !ok
+    }
+  }
+  _w = alx_count_allocs(was)
+  b.c.run_cleanups(b)
+  report = b.c.st.lock { |s| s.report }
+  if b.failed? || b.skipped? {
+    word = b.failed? ? "FAIL" : "SKIP"
+    lines = ["--- #{word}: #{full}"] + report
+    print_lines(lines) if depth == 0
+    return (!b.failed?, lines)
+  }
+  if !subs {
+    r = result_of(b)
+    line = full + "\t" + r.to_s
+    line += "\t" + format("%8d allocs/op", r.allocs_per_op) if b.bs.lock { |s| s.report_allocs }
+    puts line
+  }
+  print_lines(report) if depth == 0
+  (true, depth == 0 ? [] : report)
+}
+
+def print_lines(lines: [Str]) {
+  for l in lines {
+    puts l
+  }
+}
+
+# Runs one top-level benchmark (the runner's call for `bench "x" { |b| }`):
+# 1 if it failed, else 0.
+pub def run_bench(name: Str, bench_ns: Int, f: (B) -> ~Unit) -> Int {
+  ok, _lines = bench_one("Benchmark" + rewrite(name), 0, bench_ns, f)
+  ok ? 0 : 1
+}
+
+# Benchmarks f outside `alx test` (Go's Benchmark), for ALX_BENCHTIME
+# (default 1s).
+pub def benchmark(f: (B) -> ~Unit) -> BenchmarkResult {
+  bench_ns = (os.getenv("ALX_TEST_BENCHTIME_NS") || "1000000000").to_i
+  b = new_b("", 0, bench_ns)
+  was = alx_count_allocs(true)
+  ok = bench_run(b, 1, f)
+  looped = b.bs.lock { |s| s.loop_done }
+  if ok && !looped {
+    n = 1
+    loop {
+      d = b.elapsed
+      break if d >= bench_ns || n >= 1000000000
+      n = predict_n(bench_ns, n, d, n)
+      break if !bench_run(b, n, f)
+    }
+  }
+  _w = alx_count_allocs(was)
+  b.c.run_cleanups(b)
+  return BenchmarkResult.new if b.failed? || b.skipped?
+  result_of(b)
+}
+
+# ------------------------------------------------------- BenchmarkResult
+
+# A benchmark's result (Go's BenchmarkResult).
+pub struct BenchmarkResult {
+  # Iterations and total time (ns).
+  n: Int
+  t: Int
+  # Bytes per iteration (set_bytes).
+  bytes: Int
+  # Allocations in total; bytes allocated aren't counted (0).
+  mem_allocs: Int
+  mem_bytes: Int
+  # report_metric's metrics, by unit.
+  extra: Map[Str, Float]
+
+  pub def ns_per_op -> Int {
+    if v = extra["ns/op"] {
+      return v.to_i
+    }
+    return 0 if n <= 0
+    t / n
+  }
+
+  pub def allocs_per_op -> Int {
+    if v = extra["allocs/op"] {
+      return v.to_i
+    }
+    return 0 if n <= 0
+    mem_allocs / n
+  }
+
+  pub def alloced_bytes_per_op -> Int {
+    if v = extra["B/op"] {
+      return v.to_i
+    }
+    return 0 if n <= 0
+    mem_bytes / n
+  }
+
+  def mb_per_sec -> Float {
+    if v = extra["MB/s"] {
+      return v
+    }
+    return 0.0 if bytes <= 0 || t <= 0 || n <= 0
+    (bytes.to_f * n.to_f / 1000000.0) / (t.to_f / 1000000000.0)
+  }
+
+  # Go's String: `     100	     12345 ns/op	  12.34 MB/s` and the extra
+  # metrics, sorted by unit.
+  pub def to_s -> Str {
+    out = format("%8d", n)
+    ns = extra["ns/op"] || (n > 0 ? t.to_f / n.to_f : 0.0)
+    out += "\t" + pretty(ns, "ns/op") if ns != 0.0
+    mbs = mb_per_sec
+    out += "\t" + format("%7.2f MB/s", mbs) if mbs != 0.0
+    keys = extra.keys.reject { |k| k == "ns/op" || k == "MB/s" || k == "B/op" || k == "allocs/op" }.sort
+    for k in keys {
+      out += "\t" + pretty(extra[k] || 0.0, k)
+    }
+    out
+  }
+
+  # Go's MemString: `   16 B/op	    1 allocs/op`.
+  pub def mem_string -> Str {
+    format("%8d B/op\t%8d allocs/op", alloced_bytes_per_op, allocs_per_op)
+  }
+}
+
+# Go's prettyPrint: whole numbers in 10 places, small ones to four
+# significant figures, decimal points aligned.
+def pretty(x: Float, unit: Str) -> Str {
+  y = x < 0.0 ? -x : x
+  s = if y == 0.0 || y >= 999.95 {
+    format("%10.0f", x)
+  } elsif y >= 99.995 {
+    format("%12.1f", x)
+  } elsif y >= 9.9995 {
+    format("%13.2f", x)
+  } elsif y >= 0.99995 {
+    format("%14.3f", x)
+  } elsif y >= 0.099995 {
+    format("%15.4f", x)
+  } elsif y >= 0.0099995 {
+    format("%16.5f", x)
+  } elsif y >= 0.00099995 {
+    format("%17.6f", x)
+  } else {
+    format("%18.7f", x)
+  }
+  s + " " + unit
+}

@@ -360,6 +360,18 @@ pub fn test(target: &str, t: &front::TestOpts, o: &Options) -> ExitCode {
     // Warnings are errors in tests (P3).
     // Bodies that aren't run aren't checked, so only a full run can judge unused imports.
     let strict = Options { strict: all, release: o.release, sanitize: o.sanitize, verbose: o.verbose, ..Default::default() };
+    // The package testing reads the flags from the environment (alx has
+    // no mutable package state for Go's flag variables).
+    let mut env = vec![("ALX_TESTING", "1".to_string()), ("ALX_TEST_BENCHTIME_NS", t.bench_ns.to_string())];
+    if t.short {
+        env.push(("ALX_TEST_SHORT", "1".into()));
+    }
+    if o.verbose {
+        env.push(("ALX_TEST_VERBOSE", "1".into()));
+    }
+    if let Some(r) = &t.run {
+        env.push(("ALX_TEST_RUN", r.clone()));
+    }
     if o.release || o.sanitize {
         let file = dir.join("alx_test.alx").to_string_lossy().to_string();
         let bin = match build_loaded(l, &file, &strict) {
@@ -368,7 +380,7 @@ pub fn test(target: &str, t: &front::TestOpts, o: &Options) -> ExitCode {
         };
         let bin = std::fs::canonicalize(&bin).unwrap_or(bin);
         // Tests run in the package's directory, as Go's do (testdata/ paths).
-        return match Command::new(&bin).current_dir(&dir).status() {
+        return match Command::new(&bin).current_dir(&dir).envs(env.iter().map(|(k, v)| (k, v))).status() {
             Ok(s) => ExitCode::from(s.code().unwrap_or(1) as u8),
             Err(e) => {
                 eprintln!("alx: cannot run {}: {e}", bin.display());
@@ -380,6 +392,11 @@ pub fn test(target: &str, t: &front::TestOpts, o: &Options) -> ExitCode {
     if let Err(e) = std::env::set_current_dir(&dir) {
         eprintln!("alx: cannot enter {}: {e}", dir.display());
         return ExitCode::from(3);
+    }
+    for (k, v) in &env {
+        // SAFETY: the compiler is single-threaded here; the JIT program
+        // (whose tasks read the environment) hasn't started yet.
+        unsafe { std::env::set_var(k, v) };
     }
     run_loaded(l, &strict)
 }

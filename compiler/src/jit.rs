@@ -42,7 +42,7 @@ mod rt {
         alxj_die_str, alxj_panic_str, alxj_exit, alxj_now_ns, alxj_cap_begin, alxj_cap_end, alxj_file_status, alxj_file_read_or_empty,
         alxj_ffi_enter, alxj_ffi_save_errno, alxj_cstr_new, alxj_cstr_free, alxj_errno, alxj_strerror, alxj_str_from_cstr, alxj_str_from_ptr,
         alx_sys_open, alx_sys_fcntl, alx_sys_const, alx_sys_stat, alx_sys_fstat, alx_sys_dir_open, alx_sys_dir_next, alx_sys_dir_close, alx_environ, alx_sys_spawn, alx_sys_wait, alx_sys_pipe, alx_sys_exec, alx_sys_poll2, alx_argc, alx_argv, alx_sleep_ns, alx_wall_ns, alx_mono_ns, alx_local_offset, alx_local_zone,
-        alx_fd_wait, alx_fd_close, alx_sock_listen, alx_sock_accept, alx_sock_connect, alx_sock_error, alx_sock_local_addr, alx_sock_peer_addr, alx_sock_set_nodelay, alx_sock_shutdown, alx_sock_lookup, alx_sock_open, alx_sock_recvfrom, alx_mem_held, alx_mem_peak,
+        alx_fd_wait, alx_fd_close, alx_sock_listen, alx_sock_accept, alx_sock_connect, alx_sock_error, alx_sock_local_addr, alx_sock_peer_addr, alx_sock_set_nodelay, alx_sock_shutdown, alx_sock_lookup, alx_sock_open, alx_sock_recvfrom, alx_mem_held, alx_mem_peak, alx_count_allocs, alx_alloc_count,
         alx_sig_watch, alx_sig_unwatch, alx_sig_reset, alx_sig_ignored, alx_user_lookup, alx_user_groups,
         alxj_spawn, alxj_task_wait, alxj_lock_new, alxj_lock, alxj_unlock, alxj_lock_poisoned, alxj_lock_clear_poison, alxj_atomic_new, alxj_chan_new, alxj_chan_len, alxj_chan_send, alxj_chan_recv, alxj_chan_close, alxj_select,
     );
@@ -255,6 +255,8 @@ fn resolve_c_symbol(name: &str) -> Option<usize> {
         "alx_user_groups" => Some(rt::alx_user_groups as usize),
         "alx_mem_held" => Some(rt::alx_mem_held as usize),
         "alx_mem_peak" => Some(rt::alx_mem_peak as usize),
+        "alx_count_allocs" => Some(rt::alx_count_allocs as usize),
+        "alx_alloc_count" => Some(rt::alx_alloc_count as usize),
         _ => None,
     };
     if own.is_some() {
@@ -449,13 +451,13 @@ fn worker_sig(m: &JITModule) -> Signature {
 /// String literals and locations, leaked: they live as long as the program.
 #[derive(Default)]
 struct Strs {
-    bytes: HashMap<String, usize>,
+    bytes: HashMap<Vec<u8>, usize>,
     cstrs: HashMap<String, usize>,
 }
 
 impl Strs {
-    fn bytes(&mut self, s: &str) -> i64 {
-        *self.bytes.entry(s.to_string()).or_insert_with(|| Box::leak(s.as_bytes().to_vec().into_boxed_slice()).as_ptr() as usize) as i64
+    fn bytes(&mut self, s: &[u8]) -> i64 {
+        *self.bytes.entry(s.to_vec()).or_insert_with(|| Box::leak(s.to_vec().into_boxed_slice()).as_ptr() as usize) as i64
     }
     fn cstr(&mut self, s: &str) -> i64 {
         *self.cstrs.entry(s.to_string()).or_insert_with(|| Box::leak(CString::new(s.replace('\0', "")).unwrap().into_boxed_c_str()).as_ptr() as usize) as i64
@@ -1288,7 +1290,7 @@ impl Fx<'_, '_, '_> {
             LE::Prim(Prim::ULt | Prim::ULe | Prim::MulOvf, _) => LTy::Bool,
             LE::Prim(..) => LTy::I64,
             LE::B(_) | LE::Cmp(..) | LE::Not(_) => LTy::Bool,
-            LE::S(_) => LTy::Str,
+            LE::S(_) | LE::SB(_) => LTy::Str,
             LE::Unit => LTy::Unit,
             LE::Tup(t, _) => t.clone(),
             LE::Field(x, i) => match self.ty(x) {
@@ -1644,6 +1646,10 @@ impl Fx<'_, '_, '_> {
             }
             LE::B(b) => vec![self.b.ins().iconst(I8, *b as i64)],
             LE::S(s) => {
+                let p = self.strs.bytes(s.as_bytes());
+                vec![self.ic(p), self.ic(s.len() as i64)]
+            }
+            LE::SB(s) => {
                 let p = self.strs.bytes(s);
                 vec![self.ic(p), self.ic(s.len() as i64)]
             }

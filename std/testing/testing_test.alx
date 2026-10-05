@@ -1,0 +1,525 @@
+# Go's testing tests (testing_test.go, benchmark_test.go, allocs_test.go,
+# loop_test.go, sub_test.go's output checks), translated.
+
+import "os"
+
+# ------------------------------------------------------- benchmark_test.go
+
+# testing.benchmark runs for ALX_TEST_BENCHTIME_NS (-benchtime): 20ms is
+# enough here (Go's tests set the package's benchTime).
+def quick_benchmarks(t: T) {
+  t.setenv("ALX_TEST_BENCHTIME_NS", "20000000")
+}
+
+def pretty_print_tests -> [(Float, Str)] {
+  [
+    (0.0, "         0 x"),
+    (1234.1, "      1234 x"),
+    (-1234.1, "     -1234 x"),
+    (999.950001, "      1000 x"),
+    (999.949999, "       999.9 x"),
+    (99.9950001, "       100.0 x"),
+    (99.9949999, "        99.99 x"),
+    (-99.9949999, "       -99.99 x"),
+    (0.000999950001, "         0.001000 x"),
+    (0.000999949999, "         0.0009999 x"),
+    (0.0000999949999, "         0.0001000 x"),
+  ]
+}
+
+test "PrettyPrint" { |t|
+  for tt in pretty_print_tests {
+    got = pretty(tt[0], "x")
+    t.error("prettyPrint(#{tt[0]}): expected #{tt[1]}, actual #{got}") if got != tt[1]
+  }
+}
+
+test "ResultString" { |t|
+  m: Map[Str, Float] = {}
+  # Fractional ns/op.
+  r = BenchmarkResult.new(n: 100, t: 240, extra: m)
+  t.error("NsPerOp: expected 2, actual #{r.ns_per_op}") if r.ns_per_op != 2
+  assert_eq r.to_s, "     100\t         2.400 ns/op"
+  # Sub-1 ns/op (Go issue 31005).
+  r = BenchmarkResult.new(n: 100, t: 40, extra: m)
+  assert_eq r.to_s, "     100\t         0.4000 ns/op"
+  # 0 ns/op.
+  r = BenchmarkResult.new(n: 100, t: 0, extra: m)
+  assert_eq r.to_s, "     100"
+  # MB/s and the memory string.
+  r = BenchmarkResult.new(n: 100, t: 1000, bytes: 10, mem_allocs: 300, extra: m)
+  assert_eq r.to_s, "     100\t        10.00 ns/op\t1000.00 MB/s"
+  assert_eq r.mem_string, "       0 B/op\t       3 allocs/op"
+}
+
+test "RunParallel" { |t|
+  quick_benchmarks(t)
+  t.skip("skipping in short mode") if short?
+  procs = Atomic.new(0)
+  iters = Atomic.new(0)
+  ns = Atomic.new(0)
+  benchmark { |b|
+    procs.store(0)
+    iters.store(0)
+    b.set_parallelism(3)
+    b.run_parallel { |pb|
+      procs.add(1)
+      while pb.next {
+        iters.add(1)
+      }
+    }
+    ns.store(b.n)
+  }
+  # Go: 3 * GOMAXPROCS; alx: 3 * 4 tasks.
+  assert_eq procs.load, 12
+  assert_eq iters.load, ns.load
+}
+
+test "RunParallelFail" { |t|
+  quick_benchmarks(t)
+  benchmark { |b|
+    b.run_parallel { |_pb|
+      # The function must be able to log/abort without crashing or
+      # deadlocking the whole benchmark.
+      b.log("log")
+      b.error("error")
+    }
+  }
+}
+
+test "RunParallelFatal" { |t|
+  quick_benchmarks(t)
+  benchmark { |b|
+    b.run_parallel { |pb|
+      while pb.next {
+        b.fatal("error") if b.n > 1
+      }
+    }
+  }
+}
+
+test "RunParallelSkipNow" { |t|
+  quick_benchmarks(t)
+  benchmark { |b|
+    b.run_parallel { |pb|
+      while pb.next {
+        b.skip_now if b.n > 1
+      }
+    }
+  }
+}
+
+test "ReportMetric" { |t|
+  quick_benchmarks(t)
+  res = benchmark { |b|
+    b.report_metric(12345.0, "ns/op")
+    b.report_metric(0.2, "frobs/op")
+  }
+  # Built-in overriding.
+  t.error("NsPerOp: expected 12345, actual #{res.ns_per_op}") if res.ns_per_op != 12345
+  # Stringing (N = 1 makes the output stable).
+  stable = BenchmarkResult.new(n: 1, t: res.t, extra: res.extra)
+  assert_eq stable.to_s, "       1\t     12345 ns/op\t         0.2000 frobs/op"
+}
+
+test "TempDirInBenchmark" { |t|
+  quick_benchmarks(t)
+  benchmark { |b|
+    ok = b.run("test") { |b|
+      i = 0
+      while i < b.n {
+        _d = b.temp_dir
+        i += 1
+      }
+    }
+    t.fatal("Sub test failure in a benchmark") if !ok
+  }
+}
+
+# --------------------------------------------------------- loop_test.go
+
+test "BenchmarkBLoop" { |t|
+  quick_benchmarks(t)
+  runs = Atomic.new(0)
+  iters = Atomic.new(0)
+  first_n = Atomic.new(-1)
+  final_n = Atomic.new(0)
+  ret = benchmark { |b|
+    runs.add(1)
+    while b.loop {
+      first_n.store(b.n) if iters.load == 0
+      iters.add(1)
+    }
+    final_n.store(b.n)
+  }
+  # A b.loop benchmark is called just once.
+  t.error("want runs == 1, got #{runs.load}") if runs.load != 1
+  t.fatal("no iterations ran") if iters.load == 0
+  # b.n, the result's n and the loop's count agree.
+  if final_n.load != iters.load || ret.n != iters.load {
+    t.error("benchmark iterations mismatch: #{iters.load} loop iterations, final b.n=#{final_n.load}, ret.n=#{ret.n}")
+  }
+  # b.n is 0 inside the loop.
+  t.error("want b.n == 0 on the first iteration, got #{first_n.load}") if first_n.load != 0
+}
+
+# B is sent out of the benchmark to look at it afterwards (Go keeps a *B).
+test "BenchmarkBLoopBreak" { |t|
+  quick_benchmarks(t)
+  ch = Chan[B].new(1)
+  Test.begin_capture
+  ret = benchmark { |b|
+    ch << b
+    i = 0
+    while b.loop {
+      break if i == 2
+      i += 1
+    }
+  }
+  log = Test.end_capture
+  st = ch.recv.unwrap
+  t.error("benchmark should have failed") if !st.failed?
+  want = "benchmark function returned without B.Loop"
+  t.error("missing error #{want} in output:\n#{log}") if !log.include?(want)
+  # A benchmark that exits early doesn't report its target count.
+  t.error("want N == 0, got #{ret.n}") if ret.n != 0
+}
+
+test "BenchmarkBLoopError" { |t|
+  quick_benchmarks(t)
+  ch = Chan[B].new(1)
+  Test.begin_capture
+  ret = benchmark { |b|
+    ch << b
+    while b.loop {
+      b.error("error")
+      return
+    }
+  }
+  log = Test.end_capture
+  st = ch.recv.unwrap
+  t.error("benchmark should have failed") if !st.failed?
+  no_want = "benchmark function returned without B.Loop"
+  t.error("unexpected error #{no_want} in output:\n#{log}") if log.include?(no_want)
+  t.error("want N == 0, got #{ret.n}") if ret.n != 0
+}
+
+test "BenchmarkBLoopStop" { |t|
+  quick_benchmarks(t)
+  ch = Chan[B].new(1)
+  Test.begin_capture
+  ret = benchmark { |b|
+    ch << b
+    while b.loop {
+      b.stop_timer
+    }
+  }
+  log = Test.end_capture
+  st = ch.recv.unwrap
+  t.error("benchmark should have failed") if !st.failed?
+  want = "B.Loop called with timer stopped"
+  t.error("missing error #{want} in output:\n#{log}") if !log.include?(want)
+  t.error("want N == 0, got #{ret.n}") if ret.n != 0
+}
+
+# -------------------------------------------------------- allocs_test.go
+
+def alloc_slice {
+  xs = [1, 2, 3]
+  _n = xs.size
+}
+
+def alloc_none {
+  x = 1 + 2
+  _y = x
+}
+
+test "AllocsPerRun" { |t|
+  a = allocs_per_run(100) { alloc_slice }
+  t.error("AllocsPerRun(100, alloc slice) = #{a}, want 1") if a != 1.0
+  a = allocs_per_run(100) { alloc_none }
+  t.error("AllocsPerRun(100, nothing) = #{a}, want 0") if a != 0.0
+}
+
+# ------------------------------------------------------- testing_test.go
+
+test "TempDirInCleanup" { |t|
+  dir = Mutex.new("")
+  t.run("test") { |t|
+    t.cleanup { |t| dir.lock { |d| d = t.temp_dir } }
+    _x = t.temp_dir
+  }
+  d = dir.lock { |d| d }
+  assert d != ""
+  st = os.stat(d)
+  t.fatal("Directory #{d} from user Cleanup still exists") if st.ok?
+  t.fatal("Unexpected error: #{st.err.unwrap}") if !os.is_not_exist(st.err.unwrap)
+}
+
+def check_temp_dir(t: T) -> ~Unit {
+  dir_ch = Chan[Str].new(1)
+  t.cleanup { |t|
+    # The directory has been removed.
+    if dir = dir_ch.recv {
+      st = os.stat(dir)
+      if st.ok? {
+        t.error("directory #{dir} still exists")
+      }
+    } elsif !t.failed? {
+      t.fatal("never received dir channel")
+    }
+  }
+  dir = t.temp_dir
+  t.fatal("expected dir") if dir == ""
+  dir2 = t.temp_dir
+  t.fatal("subsequent calls to TempDir returned the same directory") if dir == dir2
+  dir_ch << dir
+  dir_ch.close
+  info = os.~stat(dir)
+  t.error("dir #{dir} is not a dir") if !info.is_dir
+  files = os.~read_dir(dir)
+  t.error("unexpected #{files.size} files in TempDir") if files.size > 0
+}
+
+test "TempDir" { |t|
+  ~check_temp_dir(t)
+  for name in ["InSubtest", "test/subtest", "test\\subtest", "test:subtest", "test/..", "../test", "test[]", "test*", "äöüéè", "a" * 300] {
+    t.run(name) { |t| ~check_temp_dir(t) }
+  }
+}
+
+struct SetenvCase {
+  name: Str
+  key: Str
+  initial_exists: Bool
+  initial: Str
+  new_value: Str
+}
+
+test "Setenv" { |t|
+  tests = [
+    SetenvCase.new(name: "initial value exists", key: "GO_TEST_KEY_1", initial_exists: true, initial: "111", new_value: "222"),
+    SetenvCase.new(name: "initial value exists but empty", key: "GO_TEST_KEY_2", initial_exists: true, initial: "", new_value: "222"),
+    SetenvCase.new(name: "initial value is not exists", key: "GO_TEST_KEY_3", initial_exists: false, initial: "", new_value: "222"),
+  ]
+  for tc in tests {
+    if tc.initial_exists {
+      ~os.setenv(tc.key, tc.initial)
+    } else {
+      ~os.unsetenv(tc.key)
+    }
+    t.run(tc.name) { |t|
+      t.setenv(tc.key, tc.new_value)
+      got = os.getenv(tc.key) || ""
+      t.fatal("unexpected value after t.setenv: got #{got}, want #{tc.new_value}") if got != tc.new_value
+    }
+    got = os.getenv(tc.key)
+    t.fatal("unexpected value after t.setenv cleanup: got #{got || ""}, want #{tc.initial}") if (got || "") != tc.initial
+    t.fatal("unexpected existence after t.setenv cleanup") if (got != none) != tc.initial_exists
+  }
+}
+
+test "Chdir" { |t|
+  old = os.~getwd
+  dir = t.temp_dir
+  t.run("chdir") { |t|
+    t.chdir(dir)
+    now = os.~getwd
+    # macOS's temp directories sit behind a symlink: compare the last part.
+    want = dir.split("/").last
+    t.error("getwd = #{now}, want .../#{want}") if !now.end_with?(want)
+    t.error("PWD = #{os.getenv("PWD") || ""}") if (os.getenv("PWD") || "") != now
+  }
+  back = os.~getwd
+  t.error("getwd after the subtest = #{back}, want #{old}") if back != old
+}
+
+test "Testing" { |t|
+  t.error("testing? is false inside a test") if !testing?
+}
+
+# Go checks the output of a child test binary; here a test is run in place
+# with its output captured.
+def output_of(name: Str, f: (T) -> ~Unit) -> Str {
+  Test.begin_capture
+  _r = run_test(name, f)
+  Test.end_capture
+}
+
+# The time in a result line varies: drop it.
+def no_times(s: Str) -> Str {
+  out: [Str] = []
+  for l in s.split("\n") {
+    i = l.byteindex(" (")
+    out << (i >= 0 && l.include?("--- ") ? l[0...i] : l)
+  }
+  out.join("\n")
+}
+
+test "AttrSet" { |t|
+  out = output_of("TestAttrExample") { |t| t.attr("key", "value") }
+  want = "=== ATTR  TestAttrExample key value\n"
+  t.error("expected output containing #{want}, got:\n#{out}") if !out.include?(want)
+}
+
+test "AttrInvalid" { |t|
+  tests = [("k ey", "value"), ("k\tey", "value"), ("k\rey", "value"), ("k\ney", "value"), ("key", "val\rue"), ("key", "val\nue")]
+  out = output_of("TestAttrInvalid") { |t|
+    i = 0
+    for tc in tests {
+      t.run("#{i}") { |t| t.attr(tc[0], tc[1]) }
+      i += 1
+    }
+  }
+  i = 0
+  while i < tests.size {
+    want = "--- FAIL: TestAttrInvalid/#{i} "
+    t.error("expected output containing #{want}, got:\n#{out}") if !out.include?(want)
+    i += 1
+  }
+}
+
+# ----------------------------------------------------------- sub_test.go
+
+test "TRun output" { |t|
+  out = output_of("TestX") { |t|
+    t.log("top")
+    t.run("a b") { |t|
+      t.run("deep") { |t| t.error("bad") }
+    }
+    t.run("a b") { |t| t.skip("later") }
+    t.run("c") { |t|
+      t.fatal("stop")
+      t.log("never")
+    }
+  }
+  want = [
+    "=== RUN   TestX",
+    "    top",
+    "=== RUN   TestX/a_b",
+    "=== RUN   TestX/a_b/deep",
+    "    bad",
+    "=== RUN   TestX/a_b#01",
+    "    later",
+    "=== RUN   TestX/c",
+    "    stop",
+    "--- FAIL: TestX",
+    "    --- FAIL: TestX/a_b",
+    "        --- FAIL: TestX/a_b/deep",
+    "    --- SKIP: TestX/a_b#01",
+    "    --- FAIL: TestX/c",
+  ].join("\n") + "\n"
+  assert_eq no_times(out), want
+}
+
+test "TRun results" { |t|
+  ok = Atomic.new(0)
+  out = output_of("TestY") { |t|
+    a = t.run("pass") { |_t| }
+    b = t.run("fail") { |t| t.fail }
+    c = t.run("skip") { |t| t.skip_now }
+    d = t.run("assert") { |_t| assert 1 == 2, "nope" }
+    ok.store(1) if a && !b && c && !d
+    t.error("failed? is false after a failing subtest") if !t.failed?
+  }
+  assert_eq ok.load, 1
+  assert out.include?("--- FAIL: TestY/assert")
+  assert out.include?("assertion failed: 1 == 2")
+}
+
+test "cleanup order and failure" { |t|
+  out = output_of("TestZ") { |t|
+    t.cleanup { |_t| puts "first registered" }
+    t.cleanup { |_t|
+      puts "second registered"
+      fail "cleanup broke"
+    }
+  }
+  assert_eq no_times(out), "=== RUN   TestZ\nsecond registered\n    cleanup failed: cleanup broke\nfirst registered\n--- FAIL: TestZ\n"
+}
+
+test "names" { |t|
+  assert_eq rewrite("a b\tc"), "a_b\\x09c"
+  assert_eq t.name, "names"
+  t.run("x y") { |t| assert_eq t.name, "names/x_y" }
+}
+
+test "run filter" { |t|
+  t.setenv("ALX_TEST_RUN", "names|other/x")
+  assert run_wanted?("names")
+  assert run_wanted?("names/x_y")
+  assert !run_wanted?("names/z")
+  assert !run_wanted?("third")
+  assert run_wanted?("other/xx/anything")
+}
+
+test "short and verbose" { |t|
+  t.setenv("ALX_TEST_SHORT", "1")
+  assert short?
+  t.setenv("ALX_TEST_SHORT", "")
+  assert !short?
+  t.setenv("ALX_TEST_VERBOSE", "1")
+  assert verbose?
+}
+
+test "output writer" { |t|
+  out = output_of("TestW") { |t|
+    w = t.output
+    ~w.write!("one\ntw".bytes.to_a)
+    ~w.write!("o\n".bytes.to_a)
+  }
+  assert_eq no_times(out), "=== RUN   TestW\n    one\n    two\n--- PASS: TestW\n"
+}
+
+test "TB interface" { |t|
+  tbs: [TB] = [t]
+  for tb in tbs {
+    assert_eq tb.name, "TB interface"
+    tb.helper
+    tb.log("through TB")
+  }
+}
+
+test "M" {
+  m = new_m(->() -> Int { 3 })
+  assert_eq m.code, 0
+  assert_eq m.run, 3
+  assert_eq m.code, 3
+}
+
+bench "loop" { |b|
+  xs = [3, 1, 2]
+  while b.loop {
+    _s = xs.sort
+  }
+}
+
+bench "classic" { |b|
+  b.report_allocs
+  b.set_bytes(3)
+  i = 0
+  while i < b.n {
+    _x = [1, 2, 3]
+    i += 1
+  }
+}
+
+bench "sub" { |b|
+  b.run("one") { |b|
+    i = 0
+    while i < b.n {
+      i += 1
+    }
+  }
+}
+
+example "B.Loop" {
+  # Go's ExampleB_Loop: the body is timed; setup before the loop isn't.
+  r = benchmark { |b|
+    data = [5, 4, 3, 2, 1]
+    while b.loop {
+      _s = data.sort
+    }
+  }
+  puts r.n > 0
+} outputs "true"

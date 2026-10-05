@@ -1,0 +1,223 @@
+# Go's state_test.go (TestPointer, TestStateMachine, TestObjectNamespace)
+# and value_test.go (TestValueMethods; its table is vec_value_test.alx).
+
+test "pointer" {
+  cases: [(Str, Str, Str, [Str], Bool)] = [
+    ("", "", "", [], true),
+    ("a", "", "a", ["a"], false),
+    ("~", "", "~", ["~"], false),
+    ("/a", "", "a", ["a"], true),
+    ("/foo/bar", "/foo", "bar", ["foo", "bar"], true),
+    ("///", "//", "", ["", "", ""], true),
+    ("/~0~1", "", "~/", ["~/"], true),
+    ("/" + hs("deadbeef"), "", hs("deadbeef"), [hs("deadbeef")], false),
+  ]
+  for c in cases {
+    p = Pointer.new(s: c[0])
+    check_eq(p.parent.s, c[1], "parent of #{c[0]}")
+    check_eq(p.last_token, c[2], "last of #{c[0]}")
+    if c[0].start_with?("/") {
+      want = c[0]
+      if c[4] {
+        check_eq(p.parent.append_token(p.last_token).s, want, "roundtrip #{c[0]}")
+      }
+      inp = p
+      loop {
+        assert !Pointer.new(s: inp.s + "x").contains?(p), "#{inp.s}x contains #{p.s}"
+        assert inp.contains?(p), "#{inp.s} contains #{p.s}"
+        break if inp.s == inp.parent.s
+        inp = inp.parent
+      }
+    }
+    check_eq(p.tokens, c[3], "tokens of #{c[0]}")
+    check_eq(p.valid?, c[4], "valid? #{c[0]}")
+  }
+}
+
+# Appends a token of kind k (Go's stateMachine.append test helper).
+def sm_append(m: Machine, k: Byte) -> (Machine, Str) {
+  mm = m
+  c: Cause? = none
+  case k {
+    110 => {c = mm.append_literal!}
+    102 => {c = mm.append_literal!}
+    116 => {c = mm.append_literal!}
+    34 => {c = mm.append_string!}
+    48 => {c = mm.append_literal!}
+    123 => {c = mm.push_object!}
+    125 => {c = mm.pop_object!}
+    91 => {c = mm.push_array!}
+    93 => {c = mm.pop_array!}
+    _ => panic("invalid token kind")
+  }
+  (mm, cause_text(c))
+}
+
+def sm_tokens(m: Machine, toks: Str) -> Machine {
+  mm = m
+  for i in 0...toks.size {
+    m2, e = sm_append(mm, toks[i])
+    check_eq(e, "", "append #{toks}")
+    mm = m2
+  }
+  mm
+}
+
+def sm_lengths(m: Machine) -> [Int] {
+  out: [Int] = []
+  for i in 0...m.depth { out << e_length(m.at(i)) }
+  out
+}
+
+def sm_err(m: Machine, k: Byte, want: Cause) -> Machine {
+  m2, e = sm_append(m, k)
+  check_eq(e, want.message, "append error")
+  m2
+}
+
+test "state machine" {
+  m = Machine.new(stack: [], last: 0)
+  check_eq(sm_lengths(m), [0], "TopLevelValues")
+  check_eq(m.need_delim(Kind.Null), 0.as_u8, "TopLevelValues delim")
+  m = sm_tokens(m, "nft")
+  check_eq(sm_lengths(m), [3], "TopLevelValues")
+  check_eq(m.need_delim(Kind.String), 0.as_u8, "TopLevelValues delim")
+  m = sm_tokens(m, "\"0[]{}")
+  check_eq(sm_lengths(m), [7], "TopLevelValues")
+
+  m = Machine.new(stack: [], last: 0)
+  check_eq(m.need_delim(Kind.BeginArray), 0.as_u8, "ArrayValues")
+  m = sm_tokens(m, "[")
+  check_eq(sm_lengths(m), [1, 0], "ArrayValues")
+  check_eq(m.need_delim(Kind.Null), 0.as_u8, "ArrayValues")
+  m = sm_tokens(m, "nft")
+  check_eq(sm_lengths(m), [1, 3], "ArrayValues")
+  check_eq(m.need_delim(Kind.String), 44.as_u8, "ArrayValues")
+  m = sm_tokens(m, "\"0[]{}")
+  check_eq(sm_lengths(m), [1, 7], "ArrayValues")
+  check_eq(m.need_delim(Kind.EndArray), 0.as_u8, "ArrayValues")
+  m = sm_tokens(m, "]")
+  check_eq(sm_lengths(m), [1], "ArrayValues")
+
+  m = Machine.new(stack: [], last: 0)
+  check_eq(m.need_delim(Kind.BeginObject), 0.as_u8, "ObjectValues")
+  m = sm_tokens(m, "{")
+  check_eq(sm_lengths(m), [1, 0], "ObjectValues")
+  check_eq(m.need_delim(Kind.String), 0.as_u8, "ObjectValues")
+  m = sm_tokens(m, "\"")
+  check_eq(sm_lengths(m), [1, 1], "ObjectValues")
+  check_eq(m.need_delim(Kind.Null), 58.as_u8, "ObjectValues")
+  m = sm_tokens(m, "n")
+  check_eq(sm_lengths(m), [1, 2], "ObjectValues")
+  check_eq(m.need_delim(Kind.String), 44.as_u8, "ObjectValues")
+  m = sm_tokens(m, "\"f\"t")
+  check_eq(sm_lengths(m), [1, 6], "ObjectValues")
+  m = sm_tokens(m, "\"\"\"0\"[]\"{}")
+  check_eq(sm_lengths(m), [1, 14], "ObjectValues")
+  check_eq(m.need_delim(Kind.EndObject), 0.as_u8, "ObjectValues")
+  m = sm_tokens(m, "}")
+  check_eq(sm_lengths(m), [1], "ObjectValues")
+
+  m = Machine.new(stack: [], last: 0)
+  m = sm_tokens(m, "{")
+  for k in "nft0{[".bytes { m = sm_err(m, k, Cause.NonStringName) }
+  m = sm_tokens(m, "\"")
+  m = sm_err(m, 125, Cause.MissingValue)
+  m = sm_tokens(m, "\"")
+  m = sm_tokens(m, "}")
+
+  m = Machine.new(stack: [], last: 0)
+  m = sm_err(m, 125, Cause.MismatchDelim)
+  m = sm_tokens(m, "[[{")
+  m = sm_err(m, 93, Cause.MismatchDelim)
+  m = sm_tokens(m, "}]")
+  m = sm_err(m, 125, Cause.MismatchDelim)
+  m = sm_tokens(m, "]")
+  m = sm_err(m, 93, Cause.MismatchDelim)
+}
+
+test "object namespace" {
+  ops: [(Str, Bool, Bool)] = [
+    ("\"\"", true, false), ("", false, true), ("\"\"", true, false), ("\"\"", false, false),
+    ("\"alpha\"", true, false), ("\"ALPHA\"", true, false), ("\"alpha\"", false, false),
+    ("\"\\u0061\\u006c\\u0070\\u0068\\u0061\"", false, false),
+    ("", false, true), ("\"alpha\"", false, false), ("", false, true), ("\"alpha\"", true, false), ("", false, true),
+  ]
+  for w in ["alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf", "hotel", "india", "juliet",
+    "kilo", "lima", "mike", "november", "oscar", "papa", "quebec", "romeo", "sierra", "tango", "uniform",
+    "victor", "whiskey", "xray", "yankee", "zulu"] {
+    ops << ("\"" + w + "\"", true, false)
+  }
+  ops = ops + [
+    ("\"\uFFFD\"", true, false), ("\"\uFFFD\"", false, false), ("\"\\ufffd\"", false, false),
+    ("\"\\uFFFD\"", false, false), ("\"" + hs("ff") + "\"", false, false), ("", false, true),
+    ("\"\uFFFD\"", true, false),
+    ("\"\u263A\u263B\u2639\"", true, false), ("\"\u263A\u263B\u2639\"", false, false), ("", false, true),
+    ("\"\u263A\u263B\u2639\"", true, false),
+  ]
+  ns = Namespace.new(names: [], set: {}, big: false)
+  want: [Str] = []
+  for i in 0...ops.size {
+    op = ops[i]
+    if op[2] {
+      ns.remove_last!
+      want = want[0...want.size - 1]
+    } else {
+      name = Str.from_bytes(unquote_may_copy_any(op[0].bytes))
+      got = ns.insert!(name)
+      check_eq(got, op[1], "#{i}: insert #{op[0]}")
+      want << name if got
+    }
+    check_eq(ns.names, want, "#{i}: names")
+  }
+  assert !ns.big, "still a list"
+  for i in 0...64 { ns.insert!("name#{i}") }
+  assert ns.big, "a map after many names"
+}
+
+struct ValueCase {
+  name: Str
+  input: Str
+  valid: Bool
+  compacted: Str
+  compact_err: Str
+  indented: Str
+  indent_err: Str
+  canonicalized: Str
+  canonicalize_err: Str
+}
+
+test "value methods" {
+  for td in value_cases {
+    check_eq(Value.of(td.input).valid?([]), td.valid, "#{td.name}: valid?")
+    v = Value.of(td.input)
+    e = v.compact!([])
+    check_eq(Str.from_bytes(v.raw), td.compacted, "#{td.name}: compact")
+    check_eq(err_text(e.err), td.compact_err, "#{td.name}: compact error")
+    v = Value.of(td.input)
+    e = v.indent!([with_indent_prefix("\t"), with_indent("    ")])
+    check_eq(Str.from_bytes(v.raw), td.indented, "#{td.name}: indent")
+    check_eq(err_text(e.err), td.indent_err, "#{td.name}: indent error")
+    v = Value.of(td.input)
+    e = v.canonicalize!([])
+    check_eq(Str.from_bytes(v.raw), td.canonicalized, "#{td.name}: canonicalize")
+    check_eq(err_text(e.err), td.canonicalize_err, "#{td.name}: canonicalize error")
+  }
+}
+
+test "append format" {
+  input = "[ null , false , true , \"fizzbuzz\" , 3.14159 , { \"fizz\" : \"buzz\" } ]"
+  out = append_format([], input.bytes, []).unwrap
+  check_eq(Str.from_bytes(out), "[null,false,true,\"fizzbuzz\",3.14159,{\"fizz\":\"buzz\"}]", "append_format")
+}
+
+test "options" {
+  o = join_options([allow_duplicate_names(true), multiline(false), with_indent("  ")])
+  check_eq(get_option(o, allow_duplicate_names), true, "dupes")
+  check_eq(get_option(o, multiline), true, "multiline set by with_indent")
+  check_eq(get_option(o, escape_for_html).none?, true, "unset")
+  check_eq(get_str_option(o, with_indent) || "?", "  ", "indent")
+  check_eq(get_str_option(o, with_indent_prefix).none?, true, "prefix unset")
+  assert_panics("json: invalid character 'x' in indent") { with_indent(" x") }
+  assert_panics("in indent prefix") { with_indent_prefix("\tq") }
+}

@@ -1,0 +1,293 @@
+# Go's codec_test.go and encoder_test.go: the parts that need no derived
+# type (the rest is in derives/, a package of its own because derived code
+# imports encoding/gob).
+import "bytes"
+import "encoding/hex"
+import "math"
+import "math/big"
+
+# A Dec over one message's bytes.
+def dec_buf(b: [Byte]) -> Dec {
+  d = new_dec(->(p: [Byte]) -> ~Int { 0 })
+  d.st[0].buf = b
+  d
+}
+
+def bs(x: [Byte]) -> [Byte] { x }
+
+# Go's encodeT: hand-written encodings of unsigned integers.
+test "TestUintCodec" {
+  table: [(U64, [Byte])] = [
+    (0x00, bs([0x00])),
+    (0x0F, bs([0x0F])),
+    (0xFF, bs([0xFF, 0xFF])),
+    (0xFFFF, bs([0xFE, 0xFF, 0xFF])),
+    (0xFFFFFF, bs([0xFD, 0xFF, 0xFF, 0xFF])),
+    (0xFFFFFFFF, bs([0xFC, 0xFF, 0xFF, 0xFF, 0xFF])),
+    (0xFFFFFFFFFF, bs([0xFB, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF])),
+    (0xFFFFFFFFFFFF, bs([0xFA, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF])),
+    (0xFFFFFFFFFFFFFF, bs([0xF9, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF])),
+    (0xFFFFFFFFFFFFFFFF, bs([0xF8, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF])),
+    (0x1111, bs([0xFE, 0x11, 0x11])),
+    (0x1111111111111111, bs([0xF8, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11])),
+    (0x8888888888888888, bs([0xF8, 0x88, 0x88, 0x88, 0x88, 0x88, 0x88, 0x88, 0x88])),
+    (1 << 63, bs([0xF8, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00])),
+  ]
+  for t in table {
+    assert_eq append_uint([], t[0]), t[1]
+  }
+  u: U64 = 0
+  loop {
+    d = dec_buf(append_uint([], u))
+    assert_eq d.uint!.unwrap, u
+    break if u & (1 << 63) != 0
+    u = (u + 1) *% 7
+  }
+}
+
+def verify_int(i: Int) -> Bool {
+  d = dec_buf(append_uint([], int_bits(i)))
+  d.int!.unwrap == i
+}
+
+test "TestIntCodec" {
+  u: U64 = 0
+  loop {
+    i = u.as_i64
+    assert verify_int(i), "#{i}"
+    assert verify_int(0 -% i), "-#{i}"
+    assert verify_int(^i), "^#{i}"
+    break if u & (1 << 63) != 0
+    u = (u + 1) *% 7
+  }
+  assert verify_int(-9223372036854775808), "min int"
+}
+
+# Field number 7 (delta from -1 to 6), then the value.
+def field7(f: (Enc) -> Unit) -> [Byte] {
+  e = new_enc()
+  e.field!(6, -1)
+  f.call(e)
+  e.st[0].cur
+}
+
+BOOL_RESULT = [0x07, 0x01]
+SIGNED_RESULT = [0x07, 2 * 17]
+UNSIGNED_RESULT = [0x07, 17]
+FLOAT_RESULT = [0x07, 0xFE, 0x31, 0x40]
+COMPLEX_RESULT = [0x07, 0xFE, 0x31, 0x40, 0xFE, 0x33, 0x40]
+BYTES_RESULT = [0x07, 0x05, 104, 101, 108, 108, 111]
+
+def bytes_of(xs: [Int]) -> [Byte] { xs.map { it.as_u8 } }
+
+test "TestScalarEncInstructions" {
+  assert_eq field7 { |e| e.bool!(true) }, bytes_of(BOOL_RESULT)
+  assert_eq field7 { |e| e.int!(17) }, bytes_of(SIGNED_RESULT)
+  assert_eq field7 { |e| e.uint64!(17) }, bytes_of(UNSIGNED_RESULT)
+  assert_eq field7 { |e| e.float!(17.0) }, bytes_of(FLOAT_RESULT)
+  assert_eq field7 { |e| e.complex!(Complex.new(17.0, 19.0)) }, bytes_of(COMPLEX_RESULT)
+  assert_eq field7 { |e| e.bytes!("hello".bytes) }, bytes_of(BYTES_RESULT)
+  assert_eq field7 { |e| e.str!("hello") }, bytes_of(BYTES_RESULT)
+}
+
+# Decode after the field delta (Go's execDec).
+def after7(xs: [Int]) -> Dec {
+  d = dec_buf(bytes_of(xs))
+  assert_eq d.uint!.unwrap, 7
+  d
+}
+
+test "TestScalarDecInstructions" {
+  d = after7(BOOL_RESULT)
+  assert d.bool!.unwrap, "bool"
+  d = after7(SIGNED_RESULT)
+  assert_eq d.int!.unwrap, 17
+  d = after7(SIGNED_RESULT)
+  assert_eq d.i8!("x").unwrap, 17
+  d = after7(SIGNED_RESULT)
+  assert_eq d.i16!("x").unwrap, 17
+  d = after7(SIGNED_RESULT)
+  assert_eq d.i32!("x").unwrap, 17
+  d = after7(UNSIGNED_RESULT)
+  assert_eq d.uint!.unwrap, 17
+  d = after7(UNSIGNED_RESULT)
+  assert_eq d.u8!("x").unwrap, 17
+  d = after7(UNSIGNED_RESULT)
+  assert_eq d.u16!("x").unwrap, 17
+  d = after7(UNSIGNED_RESULT)
+  assert_eq d.u32!("x").unwrap, 17
+  d = after7(FLOAT_RESULT)
+  assert_eq d.float!.unwrap, 17.0
+  d = after7(COMPLEX_RESULT)
+  assert_eq d.complex!.unwrap, Complex.new(17.0, 19.0)
+  d = after7(BYTES_RESULT)
+  assert_eq d.bytes!.unwrap, "hello".bytes
+  d = after7(BYTES_RESULT)
+  assert_eq d.str!.unwrap, "hello"
+}
+
+# Encode v, decode it from the bytes into zero.
+def round[T](v: T, zero: T) -> T {
+  buf = bytes.new_buffer([])
+  e = new_encoder(buf)
+  e.encode!(v).unwrap
+  d = new_decoder(buf)
+  d.decode!(zero).unwrap
+}
+
+test "TestBasicEncoderDecoder" {
+  # (uintptr, float32 and complex64 have no alx type)
+  assert_eq round(true, false), true
+  assert_eq round(123, 0), 123
+  assert_eq round(123.to_i8, 0.to_i8), 123.to_i8
+  assert_eq round((-12345).to_i16, 0.to_i16), (-12345).to_i16
+  assert_eq round(123456.to_i32, 0.to_i32), 123456.to_i32
+  assert_eq round(-1234567, 0), -1234567
+  assert_eq round(123.to_u64, 0.to_u64), 123.to_u64
+  assert_eq round(123.to_u8, 0.to_u8), 123.to_u8
+  assert_eq round(12345.to_u16, 0.to_u16), 12345.to_u16
+  assert_eq round(123456.to_u32, 0.to_u32), 123456.to_u32
+  assert_eq round(1.2345678, 0.0), 1.2345678
+  assert_eq round(Complex.new(1.2345678, 2.3456789), Complex.new(0.0, 0.0)), Complex.new(1.2345678, 2.3456789)
+  assert_eq round("hello".bytes, bs([])), "hello".bytes
+  assert_eq round("hello", ""), "hello"
+}
+
+test "TestEncodeIntSlice" {
+  s8: [I8] = [1, 5, 12, 22, 35, 51, 70, 92, 117]
+  s16: [I16] = [145, 176, 210, 247, 287, 330, 376, 425, 477]
+  s32: [I32] = [532, 590, 651, 715, 782, 852, 925, 1001, 1080]
+  s64: [Int] = [1162, 1247, 1335, 1426, 1520, 1617, 1717, 1820, 1926]
+  z8: [I8] = [0; 9]
+  z16: [I16] = [0; 9]
+  z32: [I32] = [0; 9]
+  z64: [Int] = [0; 9]
+  assert_eq round(s8, z8), s8
+  assert_eq round(s16, z16), s16
+  assert_eq round(s32, z32), s32
+  assert_eq round(s64, z64), s64
+}
+
+test "TestSingletons" {
+  buf = bytes.new_buffer([])
+  e = new_encoder(buf)
+  d = new_decoder(buf)
+  e.encode!(17).unwrap
+  assert_eq d.decode!(0).unwrap, 17
+  e.encode!("bike shed").unwrap
+  assert_eq d.decode!("").unwrap, "bike shed"
+  e.encode!(["bike", "shed", "paint", "color"]).unwrap
+  none_s: [Str] = []
+  assert_eq d.decode!(none_s).unwrap, ["bike", "shed", "paint", "color"]
+  m: Map[Str, Int] = {"seven" => 7, "twelve" => 12}
+  e.encode!(m).unwrap
+  m0: Map[Str, Int] = {}
+  m2 = d.decode!(m0).unwrap
+  assert_eq m2.size, 2
+  assert_eq m2["seven"] || 0, 7
+  assert_eq m2["twelve"] || 0, 12
+  # (float32 and [7]int have no alx counterpart at the top level)
+  # Decode errors
+  e.encode!(172).unwrap
+  r = d.decode!(0.0)
+  assert (r.err?.message || "").include?("type"), "type error"
+}
+
+test "TestSliceIncompatibility" {
+  buf = bytes.new_buffer([])
+  e = new_encoder(buf)
+  e.encode!(bs([1, 2, 3])).unwrap
+  d = new_decoder(buf)
+  out: [Int] = []
+  assert d.decode!(out).err != none, "expected compatibility error"
+}
+
+test "TestSequentialDecoder" {
+  buf = bytes.new_buffer([])
+  e = new_encoder(buf)
+  for i in 0...10 {
+    e.encode!("#{i}").unwrap
+  }
+  for i in 0...10 {
+    d = new_decoder(buf)
+    assert_eq d.decode!("").unwrap, "#{i}"
+  }
+}
+
+test "TestBadCount" {
+  d = new_decoder(bytes.new_buffer(bs([0xfb, 0xa5, 0x82, 0x2f, 0xca, 0x1])))
+  r = d.skip!
+  assert_eq r.err?.message || "", "invalid message length"
+}
+
+test "TestErrorForHugeSlice" {
+  buf = bytes.new_buffer([])
+  slice = [1, 1, 1, 1, 1, 1, 1, 1, 1, 1]
+  e = new_encoder(buf)
+  e.encode!(slice).unwrap
+  b = buf.bytes
+  b[b.size - slice.size - 1] = 0xfa
+  d = new_decoder(bytes.new_buffer(b))
+  r = d.decode!(slice)
+  assert (r.err?.message || "").include?("slice too big"), "#{r.err?.message || ""}"
+}
+
+test "TestBadData (into nothing)" {
+  cases = [("", "EOF"), ("7F6869", "unexpected EOF"), ("05100028557b02027f8302", "interface encoding"), ("130a00fb5dad0bf8ff020263e70002fa28020202a89859", "slice length too large"), ("0f1000fb285d003316020735ff023a65c5", "interface encoding"), ("03fffb0616fffc00f902ff02ff03bf005d02885802a311a8120228022c028ee7", "GobDecoder"), ("10fe010f020102fe01100001fe010e000016fe010d030102fe010e00010101015801fe01100000000bfe011000f85555555555555555", "exceeds input size")]
+  for c in cases {
+    d = new_decoder(bytes.new_buffer(hex.decode_string(c[0]).unwrap))
+    r = d.skip!
+    msg = r.err?.message || "no error"
+    assert msg.include?(c[1]), "#{c[0]}: want #{c[1]}, got #{msg}"
+  }
+}
+
+test "TestIgnoreRecursiveType" {
+  data = bs([0x1d, 0xff, 0xd3, 0x02, 0x01, 0x01, 0x0e, 0x72, 0x65, 0x63, 0x75, 0x72, 0x73, 0x69, 0x76, 0x65, 0x53, 0x6c, 0x69, 0x63, 0x65, 0x01, 0xff, 0xd4, 0x00, 0x01, 0xff, 0xd4, 0x00, 0x00, 0x07, 0xff, 0xd4, 0x00, 0x02, 0x01, 0x00, 0x00])
+  d = new_decoder(bytes.new_buffer(data))
+  d.skip!.unwrap
+}
+
+test "TestDecoderOverflow" {
+  d = new_decoder(bytes.new_buffer(bs([0x12, 0xff, 0xff, 0x2, 0x2, 0x20, 0x0, 0xf8, 0x7f, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x20, 0x20, 0x20, 0x20, 0x20])))
+  assert d.skip!.err != none, "expected an error"
+}
+
+test "EOF" {
+  d = new_decoder(bytes.new_buffer([]))
+  r = d.decode!(0)
+  assert r.err?.message == "EOF", "clean end"
+  if e = r.err {
+    case e {
+      GobError.Eof => nil
+      _ => assert false, "want GobError.Eof"
+    }
+  }
+}
+
+test "big numbers through the protocol (math/big's gob_encode)" {
+  x = big.new_int(0)
+  x.set_string!("-123456789012345678901234567890", 10)
+  assert_eq round(x, big.new_int(0)).to_s, "-123456789012345678901234567890"
+  r = big.new_rat(-22, 7)
+  assert_eq round(r, big.new_rat(0, 1)).to_s, "-22/7"
+  f = big.new_float(math.PI)
+  assert_eq round(f, big.new_float(0.0)).text("g", 20), f.text("g", 20)
+  # Go's bytes for Encode(big.NewInt(5)) in a fresh process
+  buf = bytes.new_buffer([])
+  e = new_encoder(buf)
+  e.encode!(big.new_int(5)).unwrap
+  assert_eq hex.encode_to_string(buf.bytes), "097f050102ff8200000006ff8000020205"
+}
+
+test "registry" {
+  register_type("main.Reg1", "main.Reg1")
+  register_type("main.Reg1", "main.Reg1")
+  register_type("r2", "main.Reg2")
+  assert_eq name_of("main.Reg2"), "r2"
+  assert_eq type_of("r2"), "main.Reg2"
+  assert_eq name_of("main.Other"), "main.Other"
+  assert_panics("registering duplicate types") { register_type("r2", "main.Reg3") }
+  assert_panics("registering duplicate names") { register_type("r3", "main.Reg2") }
+  assert_panics("empty name") { register_type("", "x") }
+}

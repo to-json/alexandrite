@@ -40,6 +40,13 @@ pub struct Opts {
     pub rename: Option<String>,
     pub skip: bool,
     pub omit_empty: bool,
+    /// encoding/json/v2's tag options (derive_json2.rs): omitzero, string,
+    /// case:ignore (1) / case:strict (2), embed, format:...
+    pub omit_zero: bool,
+    pub string_tag: bool,
+    pub casing: u8,
+    pub embed: bool,
+    pub format: Option<String>,
     /// derive(Data): `data: "Name"` / `data: "-"`.
     pub drename: Option<String>,
     pub dskip: bool,
@@ -103,13 +110,18 @@ pub fn apply_field_attr(text: &str, sp: Span, o: &mut Opts) -> Result<(), Diag> 
     Ok(())
 }
 
-/// Go's json tag: `name`, `-`, `name,omitempty`, `,omitempty`.
+/// Go's json tag: `name`, `-`, then options: omitempty, and encoding/json/v2's
+/// omitzero, string, case:ignore|strict, embed, format:F (last).
 fn apply_json_tag(v: &str, sp: Span, o: &mut Opts) -> Result<(), Diag> {
     if v == "-" {
         o.skip = true;
         return Ok(());
     }
-    let mut parts = v.split(',');
+    let (head, fmt) = match v.find(",format:") {
+        Some(i) => (&v[..i], Some(v[i + ",format:".len()..].to_string())),
+        None => (v, None),
+    };
+    let mut parts = head.split(',');
     let name = parts.next().unwrap_or("");
     if !name.is_empty() {
         o.rename = Some(name.to_string());
@@ -117,9 +129,20 @@ fn apply_json_tag(v: &str, sp: Span, o: &mut Opts) -> Result<(), Diag> {
     for p in parts {
         match p.trim() {
             "omitempty" | "omit_empty" => o.omit_empty = true,
+            "omitzero" => o.omit_zero = true,
+            "string" => o.string_tag = true,
+            "embed" | "inline" => o.embed = true,
+            "case:ignore" | "nocase" => o.casing = 1,
+            "case:strict" | "strictcase" => o.casing = 2,
             "" => {}
-            p => return Err(Diag::new(sp, format!("unknown json tag option `{p}`")).note("options: omitempty")),
+            p => return Err(Diag::new(sp, format!("unknown json tag option `{p}`")).note("options: omitempty, omitzero, string, case:ignore, case:strict, embed, format:F (last)")),
         }
+    }
+    if let Some(f) = fmt {
+        if f.is_empty() || f.contains(',') {
+            return Err(Diag::new(sp, format!("bad `format:` in json tag `{v}`")).note("format:F comes last: `format:base64`"));
+        }
+        o.format = Some(f);
     }
     Ok(())
 }
@@ -238,6 +261,18 @@ fn unescape(s: &str) -> String {
     out
 }
 
+/// Is this attribute `#[json(transparent)]` (before a type)? Other `json(...)`
+/// attributes there are an error.
+pub fn is_transparent_attr(text: &str, sp: Span) -> Result<bool, Diag> {
+    let t = text.trim();
+    let Some(r) = t.strip_prefix("json") else { return Ok(false) };
+    let inner = r.trim_start().strip_prefix('(').and_then(|r| r.trim_end().strip_suffix(')')).map(str::trim);
+    match inner {
+        Some("transparent") => Ok(true),
+        _ => Err(Diag::new(sp, format!("unknown attribute `#[{text}]` on a type")).note("before a type: #[json(transparent)] (a one-field struct encoded as its field); #[json(...)] options go on fields")),
+    }
+}
+
 /// The names in `#[derive(A, B)]`.
 pub fn derive_names(text: &str, sp: Span) -> Result<Option<Vec<String>>, Diag> {
     let Some(rest) = text.trim().strip_prefix("derive") else { return Ok(None) };
@@ -245,8 +280,8 @@ pub fn derive_names(text: &str, sp: Span) -> Result<Option<Vec<String>>, Diag> {
     let names: Vec<String> = inner.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
     for n in &names {
         // Eq and Show are structural already (D13, D14): accepted, nothing to generate.
-        if !matches!(n.as_str(), "Json" | "Data" | "Row" | "Eq" | "Show") {
-            return Err(Diag::new(sp, format!("can't derive `{n}`")).note("derivable: Json (generates to_json / from_json), Data (a dynamic dyn.Value tree: to_data / from_data), Row (database/sql: `Type.from_sql_row`); Eq and Show are accepted and need nothing: structs, tuples and enums already compare and print field by field"));
+        if !matches!(n.as_str(), "Json" | "Data" | "Gob" | "Xml" | "Arbitrary" | "Row" | "Eq" | "Show") {
+            return Err(Diag::new(sp, format!("can't derive `{n}`")).note("derivable: Json (generates to_json / from_json), Data (a dynamic dyn.Value tree: to_data / from_data), Xml (encoding/xml: to_xml / from_xml and the Marshal protocol), Arbitrary (generates `self.arbitrary` for testing/quick), Row (database/sql: `Type.from_sql_row`); Eq and Show are accepted and need nothing: structs, tuples and enums already compare and print field by field"));
         }
     }
     Ok(Some(names))
@@ -275,9 +310,13 @@ pub enum DShape {
 
 #[derive(Clone, Debug)]
 pub struct DeriveJob {
-    /// Which derive: "Json" or "Row".
-    pub kind: &'static str,
+    /// `Json`, `Arbitrary` or `Row`.
+    pub derive: String,
     pub name: String,
+    /// `#[data("pkg.T")]`: the Go type name consumers see (json/v2 errors).
+    pub go_name: Option<String>,
+    /// `#[json(transparent)]`: a struct with one field is encoded as that field.
+    pub transparent: bool,
     pub tparams: Vec<String>,
     pub public: bool,
     pub span: Span,
@@ -397,6 +436,12 @@ enum Ty<'a> {
 
 struct Gen<'a> {
     alias: &'a str,
+    /// In a file that uses encoding/json/v2, a field type v1 has no encoding
+    /// for (fixed arrays, non-Str map keys, Complex) fails at run time in v1
+    /// instead of failing the derive.
+    lenient: bool,
+    /// Types only v2 encodes (jsontext.Value under the file's alias).
+    v2_only: Vec<String>,
     tparams: &'a [String],
     types: &'a ModuleTypes,
     owner: &'a str,
@@ -466,6 +511,9 @@ impl<'a> Gen<'a> {
     /// becomes one interpolated string, so a record costs one allocation and one
     /// push into the encoder, however many fields it has.
     fn enc(&mut self, t: &'a TypeExpr, x: &str, ind: usize) -> GResult<Vec<Frag>> {
+        if self.lenient && (self.classify(t).is_err() || self.v2_only_type(t)) && self.zero(t).is_some() {
+            return Ok(vec![Frag::Ex(format!("_e.unsupported!({})", lit(&type_src(t))))]);
+        }
         Ok(match self.classify(t)? {
             Ty::Int(_) | Ty::Bool => vec![Frag::Ex(x.to_string())],
             Ty::Float => vec![Frag::Ex(format!("_e.f!({x})"))],
@@ -513,6 +561,10 @@ impl<'a> Gen<'a> {
                 fr
             }
         })
+    }
+
+    fn v2_only_type(&self, t: &TypeExpr) -> bool {
+        matches!(t, TypeExpr::Named(n, _) if self.v2_only.contains(n))
     }
 
     /// Does the module declare its own type named like a builtin (`Int`)?
@@ -576,6 +628,14 @@ impl<'a> Gen<'a> {
 
     /// Statements that read a value of type `t` from `d` into a new local `dest`.
     fn dec(&mut self, t: &'a TypeExpr, dest: &str, ind: usize) -> GResult<()> {
+        if self.lenient && (self.classify(t).is_err() || self.v2_only_type(t)) {
+            if let Some(z) = self.zero(t) {
+                self.w(ind, format!("{dest}: {} = {z}", type_src(t)));
+                self.w(ind, "_d.skip!");
+                self.w(ind, format!("_d.fail!({}.JsonError.Unsupported({}))", self.alias, lit(&format!("type {}", type_src(t)))));
+                return Ok(());
+            }
+        }
         match self.classify(t)? {
             Ty::Int(k) => match k {
                 IntKind::I64 => self.w(ind, format!("{dest} = _d.int!")),
@@ -633,6 +693,15 @@ impl<'a> Gen<'a> {
 
 }
 
+/// The one field of a `#[json(transparent)]` struct.
+pub fn transparent_field(fields: &[DField]) -> Result<&DField, String> {
+    let live: Vec<&DField> = fields.iter().filter(|f| !f.opts.skip).collect();
+    match live.as_slice() {
+        [f] => Ok(f),
+        _ => Err("#[json(transparent)] needs exactly one (non-skipped) field".to_string()),
+    }
+}
+
 fn check_keys<'a>(fields: impl Iterator<Item = &'a DField>, what: &str) -> Result<(), String> {
     let mut seen: HashSet<String> = HashSet::new();
     for f in fields {
@@ -648,9 +717,9 @@ fn check_keys<'a>(fields: impl Iterator<Item = &'a DField>, what: &str) -> Resul
 }
 
 /// The source text of `struct Name[T] { defs }` holding the derived methods.
-pub fn json_source(job: &DeriveJob, alias: &str, types: &ModuleTypes) -> Result<String, Diag> {
+pub fn json_source(job: &DeriveJob, alias: &str, types: &ModuleTypes, lenient: bool, v2_only: &[String]) -> Result<String, Diag> {
     let fail = |m: String| Diag::new(job.span, format!("derive(Json) on `{}`: {m}", job.name));
-    let mut g = Gen { alias, tparams: &job.tparams, types, owner: &job.name, out: String::new(), n: 0 };
+    let mut g = Gen { alias, lenient, v2_only: v2_only.to_vec(), tparams: &job.tparams, types, owner: &job.name, out: String::new(), n: 0 };
     if !job.tparams.is_empty() {
         return Err(fail("generic types can't derive Json yet; derive it on a concrete wrapper, or write json_enc / json_dec by hand".to_string()));
     }
@@ -661,6 +730,11 @@ pub fn json_source(job: &DeriveJob, alias: &str, types: &ModuleTypes) -> Result<
     // ---- encoding
     g.w(1, format!("{pubk}def json_str(_e: {a}.Encoder) -> Str {{"));
     match &job.shape {
+        DShape::Struct(fields) if job.transparent => {
+            let f = transparent_field(fields).map_err(&fail)?;
+            let fr = g.enc(&f.ty, &format!("self.{}", f.name), 2).map_err(&fail)?;
+            g.w(2, frags_expr(&fr));
+        }
         DShape::Struct(fields) => {
             check_keys(fields.iter(), "").map_err(&fail)?;
             let vals: Vec<String> = fields.iter().map(|f| format!("self.{}", f.name)).collect();
@@ -743,6 +817,11 @@ pub fn json_source(job: &DeriveJob, alias: &str, types: &ModuleTypes) -> Result<
     let mut helpers = String::new();
     g.w(1, format!("{pubk}def self.json_dec(_d: {a}.Decoder) -> {name} {{"));
     match &job.shape {
+        DShape::Struct(fields) if job.transparent => {
+            let f = transparent_field(fields).map_err(&fail)?;
+            g.dec(&f.ty, "_v", 2).map_err(&fail)?;
+            g.w(2, format!("{name}.new({}: _v)", f.name));
+        }
         DShape::Struct(fields) => {
             g.w(2, format!("_r = {name}.new"));
             g.w(2, "if _d.open_obj! {");
@@ -911,6 +990,11 @@ impl<'a> Gen<'a> {
             TypeExpr::Named(n, _) if n == "Str" => "\"\"".into(),
             TypeExpr::Named(n, _) if !self.tparams.contains(n) => format!("{n}.json_zero"),
             TypeExpr::Array(..) => "[]".into(),
+            TypeExpr::Fixed(e, n, _) => match &n.kind {
+                ExprKind::Int(v) => format!("[{}; {v}]", self.zero(e)?),
+                _ => return None,
+            },
+            TypeExpr::Named(n, _) if n == "Complex" => "Complex.new(0.0, 0.0)".into(),
             TypeExpr::App(n, ..) if n == "Map" => "{}".into(),
             TypeExpr::Opt(..) => "none".into(),
             TypeExpr::Tuple(ts, _) => format!("({})", ts.iter().map(|t| self.zero(t)).collect::<Option<Vec<_>>>()?.join(", ")),
@@ -962,4 +1046,85 @@ pub fn row_source(job: &DeriveJob, alias: &str) -> Result<String, Diag> {
     }
     o.push_str("      _i += 1\n    }\n    _r\n  }\n}\n");
     Ok(o)
+}
+
+// ---------------------------------------------------------------- Arbitrary
+
+/// `#[derive(Arbitrary)]`: `def self.arbitrary(r: R.Rand, size: Int) -> T`,
+/// the random values testing/quick checks with (Go's quick.sizedValue for a
+/// struct: each field gets size / fields; an enum picks a variant
+/// uniformly). `q` and `r` are the local names of testing/quick and
+/// math/rand.
+pub fn arbitrary_source(job: &DeriveJob, q: &str, r: &str) -> Result<String, Diag> {
+    let fail = |m: String| Diag::new(job.span, format!("derive(Arbitrary) on `{}`: {m}", job.name));
+    if !job.tparams.is_empty() {
+        return Err(fail("generic types can't derive Arbitrary yet; write `def self.arbitrary(r, size)` by hand".to_string()));
+    }
+    let name = &job.name;
+    let args = |fields: &[DField], size: &str| -> Result<String, Diag> {
+        let named = fields.iter().any(|f| f.name.parse::<usize>().is_err());
+        let mut parts = vec![];
+        for f in fields {
+            let g = arb_gen(&f.ty, q, r).map_err(&fail)?;
+            let v = format!("{g}.generate(_r, {size})");
+            parts.push(if named { format!("{}: {v}", f.name) } else { v });
+        }
+        Ok(parts.join(", "))
+    };
+    let mut o = format!("struct {name} {{\n  pub def self.arbitrary(_r: {r}.Rand, _size: Int) -> {name} {{\n");
+    match &job.shape {
+        DShape::Struct(fields) => {
+            o.push_str(&format!("    _s = {q}.field_size(_size, {})\n", fields.len()));
+            o.push_str(&format!("    {name}.new({})\n", args(fields, "_s")?));
+        }
+        DShape::Enum(vs) => {
+            if vs.is_empty() {
+                return Err(fail("an enum without variants has no values".to_string()));
+            }
+            o.push_str("    _rr = _r\n");
+            o.push_str(&format!("    _k = _rr.intn!({})\n", vs.len()));
+            o.push_str("    case _k {\n");
+            for (k, v) in vs.iter().enumerate() {
+                let arm = if k + 1 == vs.len() { "_".to_string() } else { k.to_string() };
+                if v.fields.is_empty() {
+                    o.push_str(&format!("      {arm} => {name}.{}\n", v.name));
+                } else {
+                    o.push_str(&format!("      {arm} => {{\n        _s = {q}.field_size(_size, {})\n        {name}.{}({})\n      }}\n", v.fields.len(), v.name, args(&v.fields, "_s")?));
+                }
+            }
+            o.push_str("    }\n");
+        }
+    }
+    o.push_str("  }\n}\n");
+    Ok(o)
+}
+
+/// The testing/quick generator expression for a field of type `t`.
+fn arb_gen(t: &TypeExpr, q: &str, r: &str) -> Result<String, String> {
+    Ok(match t {
+        TypeExpr::Named(n, _) => match n.as_str() {
+            "Int" => format!("{q}.int"),
+            "I64" => format!("{q}.i64"),
+            "I32" => format!("{q}.i32"),
+            "I16" => format!("{q}.i16"),
+            "I8" => format!("{q}.i8"),
+            "U64" => format!("{q}.u64"),
+            "U32" => format!("{q}.u32"),
+            "U16" => format!("{q}.u16"),
+            "U8" | "Byte" => format!("{q}.u8"),
+            "Rune" => format!("{q}.rune"),
+            "Float" | "F64" => format!("{q}.float"),
+            "Complex" => format!("{q}.complex"),
+            "Bool" => format!("{q}.bool"),
+            "Str" => format!("{q}.str"),
+            _ if n.chars().next().is_some_and(|c| c.is_uppercase()) || n.contains('.') => format!("{q}.Arb[{n}].gen"),
+            _ => return Err(format!("no generator for a field of type `{n}`")),
+        },
+        TypeExpr::Array(e, _) => format!("{q}.slice_of({})", arb_gen(e, q, r)?),
+        TypeExpr::Opt(e, _) => format!("{q}.opt_of({})", arb_gen(e, q, r)?),
+        TypeExpr::App(n, args, _) if n == "Map" && args.len() == 2 => format!("{q}.map_of({}, {})", arb_gen(&args[0], q, r)?, arb_gen(&args[1], q, r)?),
+        TypeExpr::Tuple(ts, _) if ts.len() == 2 => format!("{q}.tuple2({}, {})", arb_gen(&ts[0], q, r)?, arb_gen(&ts[1], q, r)?),
+        TypeExpr::Tuple(ts, _) if ts.len() == 3 => format!("{q}.tuple3({}, {}, {})", arb_gen(&ts[0], q, r)?, arb_gen(&ts[1], q, r)?, arb_gen(&ts[2], q, r)?),
+        _ => return Err(format!("no generator for a field of type `{}`; write `def self.arbitrary(r, size)` by hand", type_src(t))),
+    })
 }

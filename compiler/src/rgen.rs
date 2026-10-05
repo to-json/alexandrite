@@ -54,8 +54,12 @@ fn is_copy(t: &LTy) -> bool {
 }
 
 fn lit(s: &str) -> String {
+    lit_bytes(s.as_bytes())
+}
+
+fn lit_bytes(s: &[u8]) -> String {
     let mut o = String::from("b\"");
-    for b in s.bytes() {
+    for &b in s {
         match b {
             b'"' => o.push_str("\\\""),
             b'\\' => o.push_str("\\\\"),
@@ -585,6 +589,7 @@ impl FnEmit<'_> {
             }
             LE::B(b) => b.to_string(),
             LE::S(s) => format!("Str::lit({})", lit(s)),
+            LE::SB(b) => format!("Str::lit({})", lit_bytes(b)),
             LE::Loc(s) => loc(s),
             LE::Unit => "()".into(),
             LE::Tup(_, vs) if vs.is_empty() => "()".into(),

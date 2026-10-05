@@ -1,0 +1,223 @@
+#![overflow(wrap)]
+# The state machine both coders share (Go's jsontext/state.go): the stack of
+# open objects and arrays with their lengths, the current member name of each
+# open object (for JSON Pointers), and the names seen in each open object (to
+# reject duplicates).
+
+# Errors of the state machine are Causes (jsontext.alx).
+MAX_NESTING_DEPTH = 10000
+
+# A stack entry: the type of the container (top bit), namespace flags, and
+# the number of tokens in it so far (an object counts names and values).
+ST_TYPE_MASK: U64 = 0x8000_0000_0000_0000
+ST_OBJECT: U64 = 0x8000_0000_0000_0000
+ST_DISABLE_NS: U64 = 0x4000_0000_0000_0000
+ST_INVALID_NS: U64 = 0x2000_0000_0000_0000
+ST_COUNT_MASK: U64 = 0x1fff_ffff_ffff_ffff
+
+def e_length(e: U64) -> Int { (e & ST_COUNT_MASK).as_i64 }
+def e_object?(e: U64) -> Bool { e & ST_TYPE_MASK == ST_OBJECT }
+def e_array?(e: U64) -> Bool { e & ST_TYPE_MASK == 0 }
+def e_need_name?(e: U64) -> Bool { e & (ST_TYPE_MASK | 1) == ST_OBJECT }
+def e_need_value?(e: U64) -> Bool { e & (ST_TYPE_MASK | 1) == ST_OBJECT | 1 }
+def e_need_comma?(e: U64, nk: Kind) -> Bool {
+  !e_need_value?(e) && e_length(e) > 0 && nk != Kind.EndObject && nk != Kind.EndArray
+}
+def e_active_ns?(e: U64) -> Bool { e & ST_DISABLE_NS == 0 }
+def e_valid_ns?(e: U64) -> Bool { e & ST_INVALID_NS == 0 }
+
+# The open containers: `stack` holds the outer entries, `last` the innermost
+# (the top level is a virtual array that is never closed).
+pub struct Machine {
+  stack: [U64]
+  last: U64
+
+  pub def depth -> Int { stack.size + 1 }
+
+  def at(i: Int) -> U64 { i == stack.size ? last : stack[i] }
+
+  def append_literal! -> Cause? {
+    return Cause.NonStringName if e_need_name?(last)
+    return Cause.InvalidNamespace if !e_valid_ns?(last)
+    self.last = last + 1
+    none
+  }
+
+  def append_string! -> Cause? {
+    return Cause.InvalidNamespace if !e_valid_ns?(last)
+    self.last = last + 1
+    none
+  }
+
+  def push_object! -> Cause? {
+    return Cause.NonStringName if e_need_name?(last)
+    return Cause.InvalidNamespace if !e_valid_ns?(last)
+    return Cause.MaxDepth if stack.size == MAX_NESTING_DEPTH
+    self.last = last + 1
+    self.stack << last
+    self.last = ST_OBJECT
+    none
+  }
+
+  def pop_object! -> Cause? {
+    return Cause.MismatchDelim if !e_object?(last)
+    return Cause.MissingValue if e_need_value?(last)
+    return Cause.InvalidNamespace if !e_valid_ns?(last)
+    self.last = stack[stack.size - 1]
+    self.stack = stack[0...stack.size - 1]
+    none
+  }
+
+  def push_array! -> Cause? {
+    return Cause.NonStringName if e_need_name?(last)
+    return Cause.InvalidNamespace if !e_valid_ns?(last)
+    return Cause.MaxDepth if stack.size == MAX_NESTING_DEPTH
+    self.last = last + 1
+    self.stack << last
+    self.last = 0
+    none
+  }
+
+  def pop_array! -> Cause? {
+    return Cause.MismatchDelim if !e_array?(last) || stack.size == 0
+    return Cause.InvalidNamespace if !e_valid_ns?(last)
+    self.last = stack[stack.size - 1]
+    self.stack = stack[0...stack.size - 1]
+    none
+  }
+
+  # How many levels of indentation come before a token of kind next.
+  def need_indent(nk: Kind) -> Int {
+    will_end = nk == Kind.EndObject || nk == Kind.EndArray
+    return 0 if depth == 1
+    return 0 if e_length(last) == 0 && will_end
+    return depth if e_length(last) == 0 || e_need_comma?(last, nk)
+    return depth - 1 if will_end
+    0
+  }
+
+  # The delimiter (':' or ',', or 0) needed before a token of kind next.
+  def need_delim(nk: Kind) -> Byte {
+    return 58 if e_need_value?(last)
+    return 44 if e_need_comma?(last, nk) && stack.size != 0
+    0
+  }
+}
+
+# The names of one object, to find duplicates (Go's objectNamespace); a map
+# takes over from the list beyond 64 names.
+struct Namespace {
+  names: [Str]
+  set: Map[Str, Bool]
+  big: Bool
+
+  # Adds name; false if it is already there.
+  def insert!(name: Str) -> Bool {
+    if !big && names.size > 64 {
+      self.big = true
+      for n in names { self.set[n] = true }
+    }
+    if big {
+      return false if set.has_key?(name)
+      self.set[name] = true
+    } else {
+      for n in names {
+        return false if n == name
+      }
+    }
+    self.names << name
+    true
+  }
+
+  def remove_last! {
+    return if names.size == 0
+    n = names[names.size - 1]
+    self.set.delete(n) if big
+    self.names = names[0...names.size - 1]
+    nil
+  }
+}
+
+# Everything the coders track besides their buffers.
+pub struct CoderState {
+  m: Machine
+  # The current member name of each open object, outermost first.
+  names: [Str]
+  # The names seen so far in each open object (when duplicates are checked).
+  spaces: [Namespace]
+
+  def reset! {
+    self.m = Machine.new(stack: [], last: 0)
+    self.names = []
+    self.spaces = []
+  }
+
+  # Records name as the current member name of the innermost object.
+  def set_name!(name: Str) {
+    self.names[names.size - 1] = name if names.size > 0
+  }
+
+  # Checks and records name in the innermost namespace (duplicates).
+  def insert_name!(name: Str) -> Bool {
+    k = spaces.size - 1
+    return true if k < 0
+    self.spaces[k].insert!(name)
+  }
+
+  def push_names! {
+    self.names << ""
+  }
+
+  def pop_names! {
+    self.names = names[0...names.size - 1] if names.size > 0
+  }
+
+  def push_space! {
+    self.spaces << Namespace.new(names: [], set: {}, big: false)
+  }
+
+  def pop_space! {
+    self.spaces = spaces[0...spaces.size - 1] if spaces.size > 0
+  }
+
+  # Go's appendStackPointer: the pointer to the current position. `where`:
+  # <0 the last value read or written, 0 the next one, >0 the next token.
+  def stack_pointer(where_: Int) -> Str {
+    b: [Byte] = []
+    od = 0
+    i = 1
+    d = m.depth
+    while i < d {
+      e = m.at(i)
+      delta = -1
+      if i == d - 1 {
+        if (where_ < 0 && e_length(e) == 0) || (where_ == 0 && !e_need_value?(e)) || (where_ > 0 && e_need_name?(e)) {
+          return Str.from_bytes(b)
+        }
+        delta = 0 if where_ > 0 && e_array?(e)
+      }
+      if e_object?(e) {
+        b << 47
+        b = append_escape_pointer_name(b, od < names.size ? names[od] : "")
+        od += 1
+      } else {
+        b << 47
+        b = app_s(b, (e_length(e) + delta).to_s)
+      }
+      i += 1
+    }
+    Str.from_bytes(b)
+  }
+
+  # Marks every disabled namespace invalid (Go's InvalidateDisabledNamespaces).
+  def invalidate_disabled_namespaces! {
+    for i in 0...m.stack.size {
+      self.m.stack[i] = m.stack[i] | ST_INVALID_NS if !e_active_ns?(m.stack[i])
+    }
+    self.m.last = m.last | ST_INVALID_NS if !e_active_ns?(m.last)
+  }
+}
+
+def new_coder_state -> CoderState {
+  CoderState.new(m: Machine.new(stack: [], last: 0), names: [], spaces: [])
+}

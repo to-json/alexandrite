@@ -66,7 +66,7 @@ Go's struct tag in alx syntax, one key per derive: `#[field(json: "id,omitempty"
 - The per-derive shorthands stay: `#[json("name")]`, `#[json(omit_empty)]`, `#[json(skip)]`, `#[data("Name")]`, `#[data(skip)]`, and they combine with `#[field(...)]` on the same field.
 - Before a type, `#[data("pkg.T")]` gives the Go type name consumers see (default: the alx name).
 
-A new derive reads its key from `Opts.tags` (e.g. `o.tags.iter().find(|(k, _)| k == "xml")`) and parses Go's tag syntax for it; nothing in the parser changes.
+A new derive reads its key from `Opts.tags` and parses Go's tag syntax for it; nothing in the parser changes. `#[derive(Xml)]` (D65, xml-derive.md) reads `xml:` this way.
 
 ## Tests
 

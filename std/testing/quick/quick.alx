@@ -1,0 +1,384 @@
+# Package quick: Go's testing/quick — property checks over generated
+# values.
+#
+# Go finds out at run time (reflection) what values a function takes and
+# makes random ones. alx has no reflection (S3): the values come from
+# generators, `Gen[T]`, given explicitly — one per builtin type, combinators
+# for slices, maps, optionals and tuples, and `#[derive(Arbitrary)]` on a
+# struct or enum, which writes `def self.arbitrary(r: rand.Rand, size: Int)`
+# with Go's distribution for each field (so `quick.arbitrary[T]` works for
+# it). Writing `self.arbitrary` by hand is Go's Generator interface.
+# (GO-VS-RUBY.md D68.)
+#
+#   Go                                      alx
+#   Check(f, config) error                  check(g, config) { |a| ... } -> ~Unit<QuickError>,
+#                                             check2(ga, gb, config) { |a, b| }, check3
+#   CheckEqual(f, g, config) error          check_equal(g, config, f, h) (and 2, 3 arguments)
+#   Value(t, rand) (reflect.Value, bool)    value(g, r) -> T (g.generate(r, 50))
+#   Generator (Generate(rand, size))        `def self.arbitrary(r: rand.Rand, size: Int) -> T`
+#                                             on the type, or a Gen made with from { |r, size| }
+#   Config{MaxCount, MaxCountScale, Rand}   Config.new(max_count:, max_count_scale:, rand:);
+#                                             `none` for Go's nil config
+#   Config.Values                           not ported: give generators instead
+#   SetupError                              QuickError.Setup (Go's are about the function's
+#                                             shape, which alx checks at compile time)
+#   CheckError{Count, In}                   QuickError.Check(count, input)
+#   CheckEqualError{.., Out1, Out2}         QuickError.CheckEqual(count, input, out1, out2)
+#   -quickchecks flag                       ALX_QUICKCHECKS (default 100)
+#
+# Generators (Go's sizedValue, the same distributions):
+#   int, i8, i16, i32, i64, u8 (byte), u16, u32, u64, rune     all bit patterns, uniform
+#   float                                   ±[0, MaxFloat64), uniform
+#   complex                                 two such floats
+#   bool                                    uniform
+#   str                                     up to 49 code points below 0x10ffff
+#   slice_of(g)                             up to size-1 elements (their size: what's left)
+#   array_of(g, n)                          n elements (Go's arrays)
+#   map_of(k, v)                            up to size-1 entries
+#   opt_of(g)                               none 1 time in size (Go's nil pointer)
+#   tuple2(a, b), tuple3(a, b, c)           Go's structs of those fields
+#   arbitrary[T] (via Arb[T].gen)           T.arbitrary (a derive or a hand-written one)
+#   from { |r, size| ... }, just(v)         custom
+#
+# Differences from Go:
+#  - Generators are explicit (see above). Values are those Go's sizedValue
+#    makes for the same type and the same random source, draw for draw.
+#  - The failing input is shown with `%v`, not Go's `%#v`.
+#  - Recursive types: a derived `arbitrary` of a type holding itself in a
+#    slice or map ends (sizes shrink); there are no pointers to recurse
+#    through (Go's nil pointers), so Go's recursive-struct tests don't apply.
+#  - No float32/complex64 (alx has neither) and no uintptr.
+
+import "math/rand"
+import "os"
+import "unicode/utf8"
+
+# Go's complexSize: the size Value and Check start from.
+COMPLEX_SIZE = 50
+MAX_FLOAT64 = 1.79769313486231570814527423731704356798070e+308
+
+# ------------------------------------------------------------- generators
+
+# A generator of T values: `gen(r, size)` makes one, `size` bounding the
+# length of what it makes (Go's sizedValue).
+pub struct Gen[T] {
+  gen: (rand.Rand, Int) -> T
+
+  # One value of size `size` drawn from r.
+  pub def generate(r: rand.Rand, size: Int) -> T { gen.call(r, size) }
+}
+
+# A generator from a function (Go's Generator interface).
+pub def from[T](f: (rand.Rand, Int) -> T) -> Gen[T] {
+  Gen.new(gen: f)
+}
+
+# A generator that always makes v.
+pub def just[T](v: T) -> Gen[T] {
+  Gen.new(gen: ->(_r: rand.Rand, _s: Int) -> T { v })
+}
+
+# The generator of a type with `def self.arbitrary(r: rand.Rand, size:
+# Int) -> T` (from `#[derive(Arbitrary)]` or hand-written):
+# `quick.Arb[Point].gen`.
+pub struct Arb[T] {
+  pub def self.gen -> Gen[T] {
+    Gen.new(gen: ->(r: rand.Rand, s: Int) -> T { T.arbitrary(r, s) })
+  }
+}
+
+# One value of g at Go's default size (Go's Value).
+pub def value[T](g: Gen[T], r: rand.Rand) -> T {
+  g.generate(r, COMPLEX_SIZE)
+}
+
+# Go's randInt64: all 64 bits.
+def rand_int64(r: rand.Rand) -> Int {
+  rr = r
+  rr.uint64!.as_i64
+}
+
+# Go's randFloat64: uniform in (-MaxFloat64, MaxFloat64).
+def rand_float64(r: rand.Rand) -> Float {
+  rr = r
+  f = rr.float64! * MAX_FLOAT64
+  f = -f if rr.int! & 1 == 1
+  f
+}
+
+def intn(r: rand.Rand, n: Int) -> Int {
+  rr = r
+  rr.intn!(n)
+}
+
+pub def int -> Gen[Int] { Gen.new(gen: ->(r: rand.Rand, _s: Int) -> Int { rand_int64(r) }) }
+pub def i64 -> Gen[I64] { Gen.new(gen: ->(r: rand.Rand, _s: Int) -> I64 { rand_int64(r) }) }
+pub def i32 -> Gen[I32] { Gen.new(gen: ->(r: rand.Rand, _s: Int) -> I32 { rand_int64(r).as_i32 }) }
+pub def i16 -> Gen[I16] { Gen.new(gen: ->(r: rand.Rand, _s: Int) -> I16 { rand_int64(r).as_i16 }) }
+pub def i8 -> Gen[I8] { Gen.new(gen: ->(r: rand.Rand, _s: Int) -> I8 { rand_int64(r).as_i8 }) }
+pub def u64 -> Gen[U64] { Gen.new(gen: ->(r: rand.Rand, _s: Int) -> U64 { rand_int64(r).as_u64 }) }
+pub def u32 -> Gen[U32] { Gen.new(gen: ->(r: rand.Rand, _s: Int) -> U32 { rand_int64(r).as_u32 }) }
+pub def u16 -> Gen[U16] { Gen.new(gen: ->(r: rand.Rand, _s: Int) -> U16 { rand_int64(r).as_u16 }) }
+pub def u8 -> Gen[U8] { Gen.new(gen: ->(r: rand.Rand, _s: Int) -> U8 { rand_int64(r).as_u8 }) }
+pub def byte -> Gen[Byte] { u8 }
+pub def rune -> Gen[Rune] { i32 }
+
+pub def float -> Gen[Float] {
+  Gen.new(gen: ->(r: rand.Rand, _s: Int) -> Float { rand_float64(r) })
+}
+
+pub def complex -> Gen[Complex] {
+  Gen.new(gen: ->(r: rand.Rand, _s: Int) -> Complex {
+    re = rand_float64(r)
+    im = rand_float64(r)
+    Complex.new(re, im)
+  })
+}
+
+pub def bool -> Gen[Bool] {
+  Gen.new(gen: ->(r: rand.Rand, _s: Int) -> Bool {
+    rr = r
+    rr.int! & 1 == 0
+  })
+}
+
+# Up to 49 code points, each below 0x10ffff (surrogates become U+FFFD, as
+# Go's string([]rune) makes them).
+pub def str -> Gen[Str] {
+  Gen.new(gen: ->(r: rand.Rand, _s: Int) -> Str {
+    n = intn(r, COMPLEX_SIZE)
+    out: [U8] = []
+    i = 0
+    while i < n {
+      out = utf8.append_rune(out, intn(r, 0x10ffff).as_i32)
+      i += 1
+    }
+    Str.from_bytes(out)
+  })
+}
+
+# Slices of up to size-1 elements; each element gets the size left.
+pub def slice_of[T](g: Gen[T]) -> Gen[[T]] {
+  Gen.new(gen: ->(r: rand.Rand, size: Int) -> [T] {
+    n = intn(r, size)
+    left = size - n
+    out: [T] = []
+    i = 0
+    while i < n {
+      out << g.generate(r, left)
+      i += 1
+    }
+    out
+  })
+}
+
+# Slices of exactly n elements (Go's arrays), each of the whole size.
+pub def array_of[T](g: Gen[T], n: Int) -> Gen[[T]] {
+  Gen.new(gen: ->(r: rand.Rand, size: Int) -> [T] {
+    out: [T] = []
+    i = 0
+    while i < n {
+      out << g.generate(r, size)
+      i += 1
+    }
+    out
+  })
+}
+
+# Maps of up to size-1 entries (fewer if keys repeat).
+pub def map_of[K, V](k: Gen[K], v: Gen[V]) -> Gen[Map[K, V]] {
+  Gen.new(gen: ->(r: rand.Rand, size: Int) -> Map[K, V] {
+    n = intn(r, size)
+    out: Map[K, V] = {}
+    i = 0
+    while i < n {
+      key = k.generate(r, size)
+      out[key] = v.generate(r, size)
+      i += 1
+    }
+    out
+  })
+}
+
+# none one time in size, else a value (Go's pointers).
+pub def opt_of[T](g: Gen[T]) -> Gen[T?] {
+  Gen.new(gen: ->(r: rand.Rand, size: Int) -> T? {
+    return none if intn(r, size) == 0
+    g.generate(r, size)
+  })
+}
+
+# Pairs and triples (Go's structs with those fields: each gets size/n).
+pub def tuple2[A, B](a: Gen[A], b: Gen[B]) -> Gen[(A, B)] {
+  Gen.new(gen: ->(r: rand.Rand, size: Int) -> (A, B) {
+    s = field_size(size, 2)
+    x = a.generate(r, s)
+    y = b.generate(r, s)
+    (x, y)
+  })
+}
+
+pub def tuple3[A, B, C](a: Gen[A], b: Gen[B], c: Gen[C]) -> Gen[(A, B, C)] {
+  Gen.new(gen: ->(r: rand.Rand, size: Int) -> (A, B, C) {
+    s = field_size(size, 3)
+    x = a.generate(r, s)
+    y = b.generate(r, s)
+    z = c.generate(r, s)
+    (x, y, z)
+  })
+}
+
+# Go's size for each of n struct fields.
+pub def field_size(size: Int, n: Int) -> Int {
+  return 1 if n > size
+  return size / n if n > 0
+  size
+}
+
+# ----------------------------------------------------------------- config
+
+# How a check runs (Go's Config). The zero Config is Go's default.
+pub struct Config {
+  # The most iterations; 0: ALX_QUICKCHECKS (default 100) times
+  # max_count_scale, if that isn't 0.
+  max_count: Int
+  max_count_scale: Float
+  # The source of values; none: seeded from the clock.
+  rand: rand.Rand?
+
+  pub def get_rand -> rand.Rand {
+    if r = rand {
+      return r
+    }
+    clock_rand()
+  }
+
+  pub def get_max_count -> Int {
+    return max_count if max_count != 0
+    d = default_max_count
+    return (max_count_scale * d.to_f).to_i if max_count_scale != 0.0
+    d
+  }
+}
+
+# A source seeded from the clock (Go's time.Now().UnixNano()).
+def clock_rand -> rand.Rand {
+  rand.new(rand.new_source(Time.now_ns))
+}
+
+# Go's -quickchecks flag.
+def default_max_count -> Int {
+  if s = os.getenv("ALX_QUICKCHECKS") {
+    return s.to_i if s != ""
+  }
+  100
+}
+
+# ----------------------------------------------------------------- errors
+
+pub error QuickError {
+  # Go's SetupError.
+  Setup(msg: Str)
+  # Go's CheckError: the iteration (from 1) and the inputs.
+  Check(count: Int, input: [Str])
+  # Go's CheckEqualError: also both functions' outputs.
+  CheckEqual(count: Int, input: [Str], out1: [Str], out2: [Str])
+
+  def message -> Str {
+    case self {
+      Setup(msg) => msg
+      Check(count, input) => "##{count}: failed on input #{input.join(", ")}"
+      CheckEqual(count, input, out1, out2) => "##{count}: failed on input #{input.join(", ")}. Output 1: #{out1.join(", ")}. Output 2: #{out2.join(", ")}"
+    }
+  }
+}
+
+# ----------------------------------------------------------------- checks
+
+# Go's Check for a one-argument property: f must hold for config's number
+# of values from g; the first input it fails on is the error.
+pub def check[A](g: Gen[A], config: Config?, f: (A) -> Bool) -> ~Unit<QuickError> {
+  c = config || Config.new
+  r = c.get_rand
+  n = c.get_max_count
+  i = 0
+  while i < n {
+    a = g.generate(r, COMPLEX_SIZE)
+    fail QuickError.Check(count: i + 1, input: ["#{a}"]) if !f(a)
+    i += 1
+  }
+}
+
+pub def check2[A, B](ga: Gen[A], gb: Gen[B], config: Config?, f: (A, B) -> Bool) -> ~Unit<QuickError> {
+  c = config || Config.new
+  r = c.get_rand
+  n = c.get_max_count
+  i = 0
+  while i < n {
+    a = ga.generate(r, COMPLEX_SIZE)
+    b = gb.generate(r, COMPLEX_SIZE)
+    fail QuickError.Check(count: i + 1, input: ["#{a}", "#{b}"]) if !f(a, b)
+    i += 1
+  }
+}
+
+pub def check3[A, B, C](ga: Gen[A], gb: Gen[B], gc: Gen[C], config: Config?, f: (A, B, C) -> Bool) -> ~Unit<QuickError> {
+  c = config || Config.new
+  r = c.get_rand
+  n = c.get_max_count
+  i = 0
+  while i < n {
+    a = ga.generate(r, COMPLEX_SIZE)
+    b = gb.generate(r, COMPLEX_SIZE)
+    x = gc.generate(r, COMPLEX_SIZE)
+    fail QuickError.Check(count: i + 1, input: ["#{a}", "#{b}", "#{x}"]) if !f(a, b, x)
+    i += 1
+  }
+}
+
+# Go's CheckEqual for one argument: f and h agree on config's number of
+# values from g.
+pub def check_equal[A, R](g: Gen[A], config: Config?, f: (A) -> R, h: (A) -> R) -> ~Unit<QuickError> {
+  c = config || Config.new
+  r = c.get_rand
+  n = c.get_max_count
+  i = 0
+  while i < n {
+    a = g.generate(r, COMPLEX_SIZE)
+    x = f(a)
+    y = h(a)
+    fail QuickError.CheckEqual(count: i + 1, input: ["#{a}"], out1: ["#{x}"], out2: ["#{y}"]) if x != y
+    i += 1
+  }
+}
+
+pub def check_equal2[A, B, R](ga: Gen[A], gb: Gen[B], config: Config?, f: (A, B) -> R, h: (A, B) -> R) -> ~Unit<QuickError> {
+  c = config || Config.new
+  r = c.get_rand
+  n = c.get_max_count
+  i = 0
+  while i < n {
+    a = ga.generate(r, COMPLEX_SIZE)
+    b = gb.generate(r, COMPLEX_SIZE)
+    x = f(a, b)
+    y = h(a, b)
+    fail QuickError.CheckEqual(count: i + 1, input: ["#{a}", "#{b}"], out1: ["#{x}"], out2: ["#{y}"]) if x != y
+    i += 1
+  }
+}
+
+pub def check_equal3[A, B, C, R](ga: Gen[A], gb: Gen[B], gc: Gen[C], config: Config?, f: (A, B, C) -> R, h: (A, B, C) -> R) -> ~Unit<QuickError> {
+  c = config || Config.new
+  r = c.get_rand
+  n = c.get_max_count
+  i = 0
+  while i < n {
+    a = ga.generate(r, COMPLEX_SIZE)
+    b = gb.generate(r, COMPLEX_SIZE)
+    z = gc.generate(r, COMPLEX_SIZE)
+    x = f(a, b, z)
+    y = h(a, b, z)
+    fail QuickError.CheckEqual(count: i + 1, input: ["#{a}", "#{b}", "#{z}"], out1: ["#{x}"], out2: ["#{y}"]) if x != y
+    i += 1
+  }
+}

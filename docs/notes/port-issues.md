@@ -163,3 +163,4 @@ Open problems agents reported; each gets fixed in a compiler round between waves
 | 157 | crypto/tls | C type names spelled the whole layout: megabyte lines, 200 MB of C for crypto/tls tests | fixed: names over 96 characters become Ty_<hash> (cgen ty_name) |
 | 158 | x509 | JIT: sections mapped more than 2 GB apart on arm64 panicked in cranelift relocation (std/crypto/x509 tests) | fixed: one reserved arena |
 | 159 | (main) | the browser has no `getentropy` (no OS randomness): programs seeding math/rand's global source, testing/quick and maphash are refused there; acceptance case `quick_derive` is kept out of the web run | open: a wasm import of crypto.getRandomValues would fix it |
+| 160 | (main, S6) | the checker finds the branch an `if R is X` skips by scanning the AST's Debug text for `Name("...")` (crude; works) | open: replace with a real AST walk |

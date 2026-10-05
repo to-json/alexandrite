@@ -1,0 +1,192 @@
+# Go's uuid_test.go. The Go-generated vectors are in vec_uuid_test.alx.
+import "time"
+
+# "string vVERSION varVARIANT" of a parse, or the error.
+def ps(s: Str) -> Str {
+  r = parse(s)
+  if e = r.err { return "error: " + e.message }
+  u = r.unwrap
+  "#{u} v#{u.version} var#{u.variant}"
+}
+
+def cmp_s(a: Str, b: Str) -> Int { must_parse(a).compare(must_parse(b)) }
+
+def u1 -> UUID {
+  a: [Byte; 16] = [0xf8, 0x1d, 0x4f, 0xae, 0x7d, 0xec, 0x11, 0xd0, 0xa7, 0x65, 0x00, 0xa0, 0xc9, 0x1e, 0x6b, 0xf6]
+  from_bytes(a)
+}
+
+# The 48-bit unix_ts_ms field of a v7 UUID.
+def millis(u: UUID) -> Int {
+  m = 0
+  for i in 0...6 { m = (m << 8) | u[i].to_i }
+  m
+}
+
+test "versions and variants (TestNew)" {
+  cases = [("New", new_uuid(), 4), ("NewV4", new_v4(), 4), ("NewV7", new_v7(), 7), ("V7Generator", new_v7_generator().new_v7, 7)]
+  for c in cases {
+    assert_eq c[1].version, c[2]
+    assert_eq c[1].variant, 0b10
+    assert_eq c[1][6] >> 4, c[2].as_u8
+    assert_eq c[1][8] >> 6, 0b10.as_u8
+  }
+  # random UUIDs differ
+  assert new_v4() != new_v4()
+  assert new_v7() != new_v7()
+}
+
+test "v7 millisecond field (TestNewV7Millis)" {
+  # Go checks against a fake clock (testing/synctest); here the field lies
+  # between the clock readings before and after.
+  g = new_v7_generator()
+  for _i in 0...20 {
+    before = time.now().unix_milli
+    u = g.new_v7
+    v = new_v7()
+    after = time.now().unix_milli
+    assert millis(u) >= before && millis(u) <= after, u.to_s
+    assert millis(v) >= before && millis(v) <= after, v.to_s
+  }
+}
+
+test "v7 UUIDs increase (TestNewV7Collision)" {
+  g = new_v7_generator()
+  last = g.new_v7
+  for _r in 0...3 {
+    # enough to overflow the fractional millisecond several times
+    for _i in 0...4096 * 3 {
+      u = g.new_v7
+      assert u.compare(last) == 1, "NewV7 returned UUIDs out of order: #{last} then #{u}"
+      last = u
+    }
+    time.sleep(time.millisecond)
+  }
+}
+
+test "a generator is shared by its copies and tasks" {
+  g = new_v7_generator()
+  h = g
+  a = g.new_v7
+  b = h.new_v7
+  assert b.compare(a) == 1
+  ts = (0...4).map { |_k|
+    spawn {
+      xs: [UUID] = []
+      for _j in 0...500 { xs << g.new_v7 }
+      xs
+    }
+  }.to_a
+  all: [UUID] = []
+  for t in ts {
+    for u in t.~wait { all << u }
+  }
+  assert_eq all.size, 2000
+  seen: Map[Str, Bool] = {}
+  for u in all {
+    assert !seen.has_key?(u.to_s)
+    seen[u.to_s] = true
+  }
+}
+
+test "encode (TestEncode)" {
+  u = u1()
+  want = "f81d4fae-7dec-11d0-a765-00a0c91e6bf6"
+  assert_eq u.to_s, want
+  assert_eq u.string, want
+  assert_eq "#{u}", want
+  assert_eq Str.from_bytes(u.marshal_text), want
+  assert_eq Str.from_bytes(u.append_text("urn:uuid:".bytes.to_a)), "urn:uuid:" + want
+}
+
+test "unmarshal_text (TestUnmarshalText)" {
+  got = ~unmarshal_text("f81d4fae-7dec-11d0-a765-00a0c91e6bf6".bytes.to_a)
+  assert got == u1()
+}
+
+test "parse success (TestParseSuccess)" {
+  cases = [
+    ("00000000-0000-0000-0000-000000000000", nil_uuid()),
+    ("ffffffff-ffff-ffff-ffff-ffffffffffff", max_uuid()),
+    ("f81d4fae-7dec-11d0-a765-00a0c91e6bf6", u1()),
+    ("F81D4FAE-7DEC-11D0-A765-00A0C91E6BF6", u1()),
+    ("f81d4fae7dec11d0a76500a0c91e6bf6", u1()),
+    ("{f81d4fae-7dec-11d0-a765-00a0c91e6bf6}", u1()),
+    ("urn:uuid:f81d4fae-7dec-11d0-a765-00a0c91e6bf6", u1()),
+  ]
+  for c in cases {
+    u = ~parse(c[0])
+    assert u == c[1], c[0]
+  }
+}
+
+test "parse errors (TestParseErrors)" {
+  bad = [
+    "",
+    "0000000000000-0000-0000-000000000000",
+    "00000000-000000000-0000-000000000000",
+    "00000000-0000-000000000-000000000000",
+    "00000000-0000-0000-00000000000000000",
+    "00000000-0000-0000-0000-00000000000",
+    "x0000000-0000-0000-0000-000000000000",
+    "00000000-x000-0000-0000-000000000000",
+    "00000000-0000-x000-0000-000000000000",
+    "00000000-0000-0000-x000-000000000000",
+    "00000000-0000-0000-0000-x00000000000",
+    "{x0000000-0000-0000-0000-000000000000}",
+    "urn:uuid:x000000-0000-0000-0000-000000000000",
+    "x0000000000000000000000000000000",
+    # hyphens in non-standard places
+    "0000-0000-0000-0000-0000-0000-0000-0000",
+    # combinations of the forms
+    "{00000000000000000000000000000000}",
+    "{urn:uuid:00000000-0000-0000-0000-000000000000}",
+    "urn:uuid:00000000000000000000000000000000",
+  ]
+  for s in bad {
+    r = parse(s)
+    assert r.err?, s
+    assert_eq r.err.unwrap.message, "invalid uuid"
+  }
+}
+
+test "compare (TestCompare)" {
+  uuids = [nil_uuid(), must_parse("f81d4fae-7dec-11d0-a765-00a0c91e6bf6"), max_uuid()]
+  for i in 0...uuids.size {
+    u = uuids[i]
+    assert_eq u.compare(u), 0
+    next if i == 0
+    prev = uuids[i - 1]
+    assert_eq u.compare(prev), 1
+    assert_eq prev.compare(u), -1
+    assert u > prev
+    assert prev < u
+  }
+}
+
+test "nil, max and from_bytes" {
+  assert_eq nil_uuid().to_s, "00000000-0000-0000-0000-000000000000"
+  assert_eq max_uuid().to_s, "ffffffff-ffff-ffff-ffff-ffffffffffff"
+  assert UUID.new() == nil_uuid()
+  assert_eq u1().bytes, [0xf8.as_u8, 0x1d, 0x4f, 0xae, 0x7d, 0xec, 0x11, 0xd0, 0xa7, 0x65, 0x00, 0xa0, 0xc9, 0x1e, 0x6b, 0xf6]
+}
+
+bench "new_v4 (BenchmarkNewV4)" {
+  new_v4()
+}
+
+bench "new_v7 (BenchmarkNewV7)" {
+  new_v7()
+}
+
+bench "string (BenchmarkString)" {
+  u1().to_s
+}
+
+bench "parse success (BenchmarkParseSuccess)" {
+  parse("f81d4fae-7dec-11d0-a765-00a0c91e6bf6")
+}
+
+bench "parse error (BenchmarkParseError)" {
+  parse("00000000-0000-0000-0000-00000000000X")
+}

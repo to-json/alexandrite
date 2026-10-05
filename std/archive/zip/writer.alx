@@ -13,6 +13,27 @@ def crc32_update(crc: U32, p: [Byte]) -> U32 {
   crc32.update(crc, crc32.ieee_table(), p)
 }
 
+# R11: Go's package-level compressor registry (register.go), past the
+# built-in Store and Deflate.
+COMPRESSORS = Mutex[Map[U16, (bytes.Buffer) -> ~io.WriteCloser]].new({})
+
+# Go's RegisterCompressor: a compressor for method, for every Writer that
+# doesn't register its own. Panics if method has one (Store and Deflate
+# are built in).
+pub def register_compressor(method: U16, comp: (bytes.Buffer) -> ~io.WriteCloser) {
+  added = method != STORE && method != DEFLATE && COMPRESSORS.lock { |m|
+    ok = !m.key?(method)
+    m[method] = comp if ok
+    ok
+  }
+  panic("compressor already registered") if !added
+}
+
+# The package-level compressor for method, if one was registered.
+def registered_compressor(method: U16) -> ((bytes.Buffer) -> ~io.WriteCloser)? {
+  COMPRESSORS.lock { |m| m[method] }
+}
+
 def store_compressor(b: bytes.Buffer) -> ~io.WriteCloser {
   NopCloser.new(b: b)
 }
@@ -352,7 +373,9 @@ pub struct Writer[W] {
       } else if fh.method == DEFLATE {
         comps << ~flate_compressor(st[0].sink)
       } else if fh.method != STORE {
-        fail ZipError.Algorithm
+        c2 = registered_compressor(fh.method)
+        fail ZipError.Algorithm if c2.none?
+        comps << ~c2.unwrap.call(st[0].sink)
       }
     }
     h = Hdr.new(fh: fh, offset: st[0].count.as_u64, raw: false)

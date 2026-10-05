@@ -354,8 +354,14 @@ impl<'a> G<'a> {
                 let (xs, i, v, ew) = (self.fresh("xs"), self.fresh("i"), self.fresh("v"), self.fresh("w"));
                 self.w(ind, format!("{ew} = _d.array_elem({w}, {len})"));
                 self.w(ind, format!("_d.~array_len!({len})"));
-                // a fresh array: decoding in place into dest's storage
-                // corrupted memory (port-issues)
+                // [U8; N]: Go sends each element as a uint; one call reads them all
+                if matches!(&**e, TypeExpr::Named(n, _) if n == "U8" || n == "Byte") {
+                    self.w(ind, format!("{xs}: {} = {}", type_src(t), self.zero(t)));
+                    self.w(ind, format!("copy({xs}, _d.~u8s!({len}, {}))", lit(&format!("element of {name}"))));
+                    self.w(ind, format!("{dest} = {xs}"));
+                    let _ = (i, v, ew);
+                    return;
+                }
                 self.w(ind, format!("{xs}: {} = {}", type_src(t), self.zero(t)));
                 self.w(ind, format!("for {i} in 0...{len} {{"));
                 self.w(ind + 1, format!("_d.~elem_check!({len})"));
@@ -753,7 +759,7 @@ fn gen_struct_dec(g: &mut G, name: &str, go: &str, sh: &Shape, var: Option<(usiz
     g.w(2, "_t = _d.types");
     g.w(2, format!("_p = {name}.~gob_plan{sfx}(_d, _wid)"));
     if nfields > 0 {
-        g.w(2, format!("fail {a}.gerr({}) if _p.size > 0 && _p.all? {{ it < 0 }}", lit(&format!("gob: type mismatch: no fields matched compiling decoder for {}", crate::derive_gob::short(go)))));
+        g.w(2, format!("fail {a}.gerr({}) if _wid >= 64 && _p.size > 0 && _p.all? {{ it < 0 }}", lit(&format!("gob: type mismatch: no fields matched compiling decoder for {}", crate::derive_gob::short(go)))));
     }
     g.w(2, call);
     g.w(1, "}");

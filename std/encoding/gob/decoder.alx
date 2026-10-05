@@ -178,6 +178,24 @@ pub struct Dec {
   pub def u16!(name: Str) -> ~U16 { self.~uint_in!(0xffff, name).as_u16 }
   pub def u32!(name: Str) -> ~U32 { self.~uint_in!(0xffffffff, name).as_u32 }
 
+  # n uint8 elements of an array (one call for what the derive would read
+  # element by element).
+  pub def u8s!(n: Int, name: Str) -> ~[Byte] {
+    out: [Byte] = [0; n]
+    for i in 0...n {
+      fail gerr("gob: decoding array or slice: length exceeds input size (#{n} elements)") if self.remaining == 0
+      p = self.st[0].pos
+      b = self.st[0].buf[p]
+      if b <= 0x7f {
+        self.st[0].pos = p + 1
+        out[i] = b
+      } else {
+        out[i] = self.~u8!(name)
+      }
+    }
+    out
+  }
+
   # getLength: a length that fits the rest of the message, or err.
   def length!(err: GobError) -> ~Int {
     n = self.~count!
@@ -382,7 +400,7 @@ pub struct Dec {
 
   # The wire struct for a local struct type (compileDec's checks).
   pub def wire_struct(w: Int, local: Str) -> ~Wire {
-    if w > 0 && w < FIRST_USER_ID {
+    if w > 0 && w < T_WIRE_TYPE {
       fail gerr("gob: type mismatch in decoder: want struct type #{local}; got non-struct")
     }
     t = self.~wire_or(w, gerr("gob: unknown type id or corrupted data"))
@@ -582,8 +600,25 @@ pub struct Dec {
 
 def ovfl(name: Str) -> GobError { gerr("value for \"#{name}\" out of range") }
 
+# Go's predefined struct types (ids 16-23: the type descriptors themselves),
+# which a stream can name like any struct.
+def builtin_wires -> Map[Int, Wire] {
+  m: Map[Int, Wire] = {}
+  st = ->(name: Str, id: Int, fs: [Str], ids: [Int]) -> Wire { Wire.new(kind: K_STRUCT, name: name, id: id, elem: 0, key: 0, len: 0, fnames: fs, fids: ids) }
+  m[T_WIRE_TYPE] = st.call("wireType", T_WIRE_TYPE, ["ArrayT", "SliceT", "StructT", "MapT", "GobEncoderT", "BinaryMarshalerT", "TextMarshalerT"], [T_ARRAY_TYPE, T_SLICE_TYPE, T_STRUCT_TYPE, T_MAP_TYPE, T_COMMON_TYPE + 6, T_COMMON_TYPE + 6, T_COMMON_TYPE + 6])
+  m[T_ARRAY_TYPE] = st.call("arrayType", T_ARRAY_TYPE, ["CommonType", "Elem", "Len"], [T_COMMON_TYPE, T_INT, T_INT])
+  m[T_COMMON_TYPE] = st.call("CommonType", T_COMMON_TYPE, ["Name", "Id"], [T_STRING, T_INT])
+  m[T_SLICE_TYPE] = st.call("sliceType", T_SLICE_TYPE, ["CommonType", "Elem"], [T_COMMON_TYPE, T_INT])
+  m[T_STRUCT_TYPE] = st.call("structType", T_STRUCT_TYPE, ["CommonType", "Field"], [T_COMMON_TYPE, T_FIELD_TYPE + 1])
+  m[T_FIELD_TYPE] = st.call("fieldType", T_FIELD_TYPE, ["Name", "Id"], [T_STRING, T_INT])
+  m[T_FIELD_TYPE + 1] = Wire.new(kind: K_SLICE, name: "", id: T_FIELD_TYPE + 1, elem: T_FIELD_TYPE, key: 0, len: 0, fnames: [], fids: [])
+  m[T_MAP_TYPE] = st.call("mapType", T_MAP_TYPE, ["CommonType", "Key", "Elem"], [T_COMMON_TYPE, T_INT, T_INT])
+  m[T_COMMON_TYPE + 6] = st.call("gobEncoderType", T_COMMON_TYPE + 6, ["CommonType"], [T_COMMON_TYPE])
+  m
+}
+
 pub def new_dec(read: ([Byte]) -> ~Int) -> Dec {
-  Dec.new(st: [DecState.new(read: read, buf: [], pos: 0, wire: {}, plans: {}, types: new_types(), depth: 0, at_top: false, max_depth: MAX_IGNORE_DEPTH, seen: {})])
+  Dec.new(st: [DecState.new(read: read, buf: [], pos: 0, wire: builtin_wires(), plans: {}, types: new_types(), depth: 0, at_top: false, max_depth: MAX_IGNORE_DEPTH, seen: {})])
 }
 
 # Go's Decoder: values from a stream of messages on a reader.

@@ -3120,7 +3120,7 @@ impl<'w, 'a> FnCx<'w, 'a> {
                             }
                             None if subj.as_ref().is_some_and(|(_, t)| matches!(self.resolve(t), Ty::Iface(_))) => {
                                 // Over an interface value: an arm names an implementor
-                                // and binds the value as that type (Go's type switch, D64).
+                                // and binds the value as that type (Go's type switch, D65).
                                 let Ty::Iface(iname) = self.resolve(&subj.as_ref().unwrap().1) else { unreachable!() };
                                 let te = TypeExpr::Named(full.clone(), *vsp);
                                 let ty = type_from(&te, &self.w.structs, &self.w.consts).map_err(|_| Diag::new(*vsp, format!("`{full}` names no type; a `case` over an interface value ({iname}) matches implementors: `case x {{ Circle(c) => ... }}`")))?;

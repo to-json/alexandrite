@@ -435,7 +435,11 @@ impl<'a> World<'a> {
     }
 
     /// The package-level value (R11) named `q` (qualified), if there is one.
+    /// (The main file's, unqualified, are seen only from the main file.)
     pub fn var_index(&self, q: &str) -> Option<usize> {
+        if !q.contains('.') && !current_pkg().is_empty() {
+            return None;
+        }
         self.vars.iter().position(|v| v.name == q)
     }
 
@@ -2267,11 +2271,11 @@ impl<'w, 'a> FnCx<'w, 'a> {
                 }
             },
             ExprKind::Const(c) => {
-                let q = resolve_name(c, sp, &|q| self.w.consts.contains_key(q) || self.w.vars.iter().any(|v| v.name == q))?;
+                let q = resolve_name(c, sp, &|q| self.w.consts.contains_key(q) || self.w.var_index(q).is_some())?;
                 if let Some((v, ty)) = self.w.consts.get(&q).cloned() {
                     return self.const_value(v, ty, sp);
                 }
-                if let Some(k) = self.w.vars.iter().position(|v| v.name == q) {
+                if let Some(k) = self.w.var_index(&q) {
                     // R11: a package-level Atomic / Mutex, read in place.
                     let (g, t) = self.w.var_global(k, sp)?;
                     self.impure = true;

@@ -122,8 +122,10 @@ pub fn lower(p: &TProgram, sm: &SourceMap, opts: &Opts) -> LProgram {
                     // call, above a mark; the way out rolls it back.
                     let (mark, larges, dest) = (lw.new_var("mark", LTy::Region), lw.new_var("larges", LTy::Region), lw.new_var("dest", LTy::Region));
                     // (The region itself is only named from inside loops that
-                    // have iteration regions of their own.)
-                    if !pl.loops.is_empty() {
+                    // have iteration regions of their own, or from inside an
+                    // allocation in the program region: a map set under a
+                    // package-level Mutex's lock with a key built for it.)
+                    if !pl.loops.is_empty() || pl.sites.values().any(|p| *p == crate::regions::Place::Global) {
                         prologue.push(LS::Set(dest, LE::Rt(Rt::RegionCur, vec![])));
                     }
                     prologue.push(LS::Set(mark, LE::Rt(Rt::RegionMark, vec![])));

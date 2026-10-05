@@ -3638,6 +3638,15 @@ impl<'a> Lw<'a> {
                 let v = self.expr(recv.unwrap());
                 LE::Field(Box::new(err_body(v)), 3 + k)
             }
+            // An interface value is (tag, implementor 0, implementor 1, ...).
+            IfaceIs(k) => {
+                let v = self.expr(recv.unwrap());
+                LE::Cmp(Op::Eq, Box::new(LE::Field(Box::new(v), 0)), Box::new(LE::I(k as i64)), LTy::I64)
+            }
+            IfaceAs(k) => {
+                let v = self.expr(recv.unwrap());
+                LE::Field(Box::new(v), 1 + k)
+            }
             ResOk | ResErr | ResIsOk | ResUnwrap | ResUnwrapOr | ResRescue => {
                 let r = recv.unwrap();
                 let rv = self.expr(r);

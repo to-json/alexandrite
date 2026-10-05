@@ -2693,10 +2693,11 @@ impl<'w, 'a> FnCx<'w, 'a> {
                 return Ok(self.mk(TK::M(M::ToIface(k), Some(Box::new(e)), vec![], None), want.clone(), sp));
             }
         }
-        // A T where a T? is wanted is present.
+        // A T where a T? is wanted is present. (A Never value, such as a
+        // `case` whose arms all return, has no value to wrap.)
         if let Ty::Opt(inner) = &want {
             let et = self.resolve(&e.ty);
-            if !matches!(et, Ty::Opt(_) | Ty::Var(_)) {
+            if !matches!(et, Ty::Opt(_) | Ty::Var(_) | Ty::Never) {
                 let e = self.coerce(e, inner)?;
                 if self.unify(&e.ty, inner) {
                     let sp = e.span;
@@ -2973,6 +2974,29 @@ impl<'w, 'a> FnCx<'w, 'a> {
                                     let eq = self.mk(TK::Bin(BinOp::Eq, Box::new(tag), Box::new(jv)), Ty::Bool, *vsp);
                                     self.mk(TK::Bin(BinOp::And, Box::new(is), Box::new(eq)), Ty::Bool, *vsp)
                                 }
+                            }
+                            None if subj.as_ref().is_some_and(|(_, t)| matches!(self.resolve(t), Ty::Iface(_))) => {
+                                // Over an interface value: an arm names an implementor
+                                // and binds the value as that type (Go's type switch, D64).
+                                let Ty::Iface(iname) = self.resolve(&subj.as_ref().unwrap().1) else { unreachable!() };
+                                let te = TypeExpr::Named(full.clone(), *vsp);
+                                let ty = type_from(&te, &self.w.structs, &self.w.consts).map_err(|_| Diag::new(*vsp, format!("`{full}` names no type; a `case` over an interface value ({iname}) matches implementors: `case x {{ Circle(c) => ... }}`")))?;
+                                let k = self.w.implement(&iname, &ty, *vsp)?;
+                                let l = local(self).unwrap();
+                                if let Some(bs) = bs {
+                                    if bs.len() != 1 {
+                                        return Err(Diag::new(*vsp, format!("`{full}(...)` over an interface binds the one value it holds: `{full}(v)`")));
+                                    }
+                                    if arm.pats.len() > 1 {
+                                        return Err(Diag::new(*vsp, "an arm with alternatives (`|`) can't bind fields"));
+                                    }
+                                    let (b, _) = &bs[0];
+                                    if b != "_" {
+                                        let get = self.mk(TK::M(M::IfaceAs(k), Some(Box::new(l.clone())), vec![], None), ty.clone(), *vsp);
+                                        binds.push((b.clone(), ty.clone(), get));
+                                    }
+                                }
+                                self.mk(TK::M(M::IfaceIs(k), Some(Box::new(l)), vec![], None), Ty::Bool, *vsp)
                             }
                             None if bs.is_none() => {
                                 let e = Expr { kind: ExprKind::Const(vn.clone()), span: *vsp, id: NodeId::MAX };

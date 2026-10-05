@@ -293,6 +293,10 @@ pub enum M {
     /// Is `Error` value of error type `k`? / its value as that type.
     ErrIs(usize),
     ErrAs(usize),
+    /// Does an interface value hold implementor `k`? / its value as that type
+    /// (`case shape { Circle(c) => }`, Go's type switch; D64).
+    IfaceIs(usize),
+    IfaceAs(usize),
     /// Results: `ok` (T?), `err` (Error?), `ok?`, `unwrap`, `unwrap_or(d)`,
     /// `rescue { |e| v }`.
     ResOk,

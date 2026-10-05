@@ -1,0 +1,396 @@
+# Package suffixarray: Go's index/suffixarray, with alx idioms (S2).
+#
+# Substring search in logarithmic time using an in-memory suffix array.
+# The suffix array is built in linear time by Go's SA-IS construction
+# (sais.alx, and its generated _8_64, _32 and _64 variants in sais2.alx,
+# made by tools/gen_sais.alx as Go's gen.go makes sais2.go). The suffix
+# array is the same as Go's for every input (it is unique), and Write
+# produces Go's bytes, so indexes move between Go and alx in both
+# directions.
+#
+#   index := suffixarray.New(data)
+#   offsets1 := index.Lookup(s, -1) // all indices where s occurs in data
+#   offsets2 := index.Lookup(s, 3)  // at most 3 indices where s occurs in data
+#
+#   Go                                  alx
+#   New(data) *Index                    new(data) -> Index
+#   x.Bytes() []byte                    x.bytes -> [Byte]
+#   x.Lookup(s, n) []int                x.lookup(s, n) -> [Int]
+#   x.FindAllIndex(r, n) [][]int        x.find_all_index(r, n) -> [[Int]]   (r: regexp.Regexp)
+#   x.Read(r io.Reader) error           x.read!(r) -> ~Unit
+#   x.Write(w io.Writer) error          x.write(w) -> ~Unit
+#   errCorrupted                        SuffixArrayError.Corrupted ("suffixarray: data corrupted")
+#   var x Index; x.Read(r)              x = Index.new; x.~read!(r)
+#
+# The suffix array holds I32 entries when data.size fits an I32 and I64
+# entries otherwise, as Go's (the `Ints` type is Go's `ints`).
+#
+# Differences from Go:
+#   - Lookup and FindAllIndex return an empty list where Go returns nil
+#     (no match, empty s, n == 0).
+#   - An Index is a value, not a pointer: read! fills the variable it is
+#     called on. Read always allocates new buffers (Go reuses the old ones
+#     when their capacity fits, an optimization that also overwrites the
+#     slice an earlier Bytes() returned).
+#   - Read fails with io's StreamError.UnexpectedEof where Go returns io.EOF
+#     (input ended before the length) or io.ErrUnexpectedEOF: alx has no EOF
+#     error (io's header).
+#   - A corrupted chunk size larger than the 16 KiB buffer (or smaller than
+#     its 10-byte header) is SuffixArrayError.Corrupted; Go panics slicing
+#     its buffer. Every other corruption Go detects is detected the same way.
+#   - Write writes each chunk with io.write_all (Go: one w.Write call, which
+#     must write everything anyway).
+#   - FindAllIndex matches the regexp against a Str copy of the data made
+#     once per call (std/regexp matches Strs; its [Byte] methods copy their
+#     input each call, which would make Go's per-candidate anchored search
+#     quadratic).
+#     It skips the anchored search at candidates inside an earlier match
+#     (Go runs it and then drops the match): the same result.
+#   - Go's maxData32 package variable, which its tests change to force the
+#     64-bit code, is a parameter of the private new_with / read_index here.
+#   - The SAIS variants are generated per element type, as in Go, rather
+#     than written once over type parameters: alx can't convert an Int to a
+#     `like Int` type parameter (port-issues #79).
+#
+# Nothing is skipped. Tests: Go's suffixarray_test.go and example_test.go
+# (suffixarray_test.alx, example_test.alx; the exhaustive inputs run to
+# lengths 16 over {1,2} and 10 over {1,2,3}, between Go's -short limits and
+# its full ones), and vectors from Go 1.27 (vec_*_test.alx): suffix arrays,
+# Lookup and FindAllIndex results in Go's order, and Write's bytes, which
+# Read accepts.
+
+import "bytes"
+import "encoding/binary"
+import "io"
+import "regexp"
+import "slices"
+import "sort"
+
+# Errors raised by Read.
+pub error SuffixArrayError {
+  # The serialized index is inconsistent (Go's errCorrupted).
+  Corrupted
+
+  def message -> Str {
+    case self {
+      Corrupted => "suffixarray: data corrupted"
+    }
+  }
+}
+
+# Go's realMaxData32: the largest data.size indexed with I32 entries.
+REAL_MAX_DATA32 = 2147483647
+
+# Buffer size for Read and Write: reasonable for the "save_restore" benchmark.
+BUF_SIZE = 16 << 10
+
+# The suffix array entries: either [I32] or [I64] (Go's ints). One of them is
+# empty, and `wide` says which holds the real data.
+struct Ints {
+  int32: [I32]
+  int64: [I64]
+  wide: Bool
+
+  def len -> Int { wide ? int64.size : int32.size }
+
+  def get(i: Int) -> Int { wide ? int64[i] : int32[i].to_i }
+
+  # (The slices share storage with every copy of the Ints.)
+  def set(i: Int, v: Int) {
+    if wide {
+      s64 = int64
+      s64[i] = v
+    } else {
+      s32 = int32
+      s32[i] = v.as_i32
+    }
+  }
+
+  def slice(i: Int, j: Int) -> Ints {
+    if wide {
+      return Ints.new(int64: int64[i...j], wide: true)
+    }
+    Ints.new(int32: int32[i...j])
+  }
+}
+
+# A suffix array for fast substring search (Go's *Index).
+pub struct Index {
+  data: [Byte]
+  sa: Ints # suffix array for data; sa.len == data.size
+
+  # The data over which the index was created. It must not be modified.
+  pub def bytes -> [Byte] { data }
+
+  # An unsorted list of at most n indices where the byte string s occurs in
+  # the indexed data. If n < 0, all occurrences are returned. The result is
+  # empty if s is empty, s is not found, or n == 0. Lookup time is
+  # O(log(N)*s.size + result.size) where N is the size of the indexed data.
+  pub def lookup(s: [Byte], n: Int) -> [Int] {
+    result: [Int] = []
+    if s.size > 0 && n != 0 {
+      matches = lookup_all(self, s)
+      count = matches.len
+      k = n
+      if n < 0 || count < n {
+        k = count
+      }
+      # 0 <= k <= count
+      if k > 0 {
+        result = [0; k]
+        if matches.wide {
+          for i in 0...k {
+            result[i] = matches.int64[i]
+          }
+        } else {
+          for i in 0...k {
+            result[i] = matches.int32[i].to_i
+          }
+        }
+      }
+    }
+    result
+  }
+
+  # A sorted list of non-overlapping matches of the regular expression r,
+  # where a match is a pair of indices specifying the matched slice of
+  # x.bytes. If n < 0, all matches are returned in successive order.
+  # Otherwise, at most n matches are returned and they may not be
+  # successive. The result is empty if there are no matches, or if n == 0.
+  pub def find_all_index(r: regexp.Regexp, n: Int) -> [[Int]] { find_all_index_in(self, r, n) }
+
+  # Reads the index from r into this variable.
+  pub def read!(r: io.Reader) -> ~Unit {
+    x = ~read_index(r, REAL_MAX_DATA32)
+    self.data = x.data
+    self.sa = x.sa
+  }
+
+  # Writes the index to w.
+  pub def write(w: io.Writer) -> ~Unit {
+    # buffer for all writes
+    buf: [Byte] = [0; BUF_SIZE]
+
+    # write length
+    ~write_int(w, buf, data.size)
+
+    # write data
+    ~io.write_all(w, data)
+
+    # write index
+    s = sa
+    while s.len > 0 {
+      n = ~write_slice(w, buf, s)
+      s = s.slice(n, s.len)
+    }
+  }
+}
+
+# Creates a new Index for data. Index creation time is O(N) for N = data.size.
+pub def new(data: [Byte]) -> Index { new_with(data, REAL_MAX_DATA32) }
+
+# New with Go's maxData32 as a parameter (the tests force the 64-bit code).
+def new_with(data: [Byte], max_data32: Int) -> Index {
+  if data.size <= max_data32 {
+    sa32: [I32] = [0; data.size]
+    text_32(data, sa32)
+    return Index.new(data: data, sa: Ints.new(int32: sa32))
+  }
+  sa: [I64] = [0; data.size]
+  text_64(data, sa)
+  Index.new(data: data, sa: Ints.new(int64: sa, wide: true))
+}
+
+# Writes an int x to w using buf to buffer the write.
+def write_int(w: io.Writer, buf: [Byte], x: Int) -> ~Unit {
+  binary.put_varint(buf, x)
+  b = buf[0...binary.MAX_VARINT_LEN64]
+  ~io.write_all(w, b)
+}
+
+# Reads an int from r using buf to buffer the read.
+def read_int(r: io.Reader, buf: [Byte]) -> ~Int {
+  b = buf[0...binary.MAX_VARINT_LEN64]
+  ~io.read_exact(r, b)
+  x, _w = binary.varint(buf)
+  x
+}
+
+# Writes data[:n] to w and returns n. It uses buf to buffer the write.
+def write_slice(w: io.Writer, buf: [Byte], data: Ints) -> ~Int {
+  # encode as many elements as fit into buf
+  p = binary.MAX_VARINT_LEN64
+  m = data.len
+  n = 0
+  while n < m && p + binary.MAX_VARINT_LEN64 <= buf.size {
+    p += binary.put_uvarint(buf[p...buf.size], data.get(n).as_u64)
+    n += 1
+  }
+
+  # update buffer size
+  binary.put_varint(buf, p)
+
+  # write buffer
+  b = buf[0...p]
+  ~io.write_all(w, b)
+  n
+}
+
+# Reads data[:n] from r and returns n; max_index is the length of the suffix
+# array. It uses buf to buffer the read.
+def read_slice(r: io.Reader, buf: [Byte], data: Ints, max_index: U64) -> ~Int {
+  # read buffer size
+  size = ~read_int(r, buf)
+  if size < binary.MAX_VARINT_LEN64 || size > buf.size {
+    # We never write chunks this big anyway. (Go: a negative size is
+    # corrupted, a size beyond the buffer panics.)
+    fail SuffixArrayError.Corrupted
+  }
+
+  # read buffer w/o the size
+  b = buf[binary.MAX_VARINT_LEN64...size]
+  ~io.read_exact(r, b)
+
+  # decode as many elements as present in buf
+  len = data.len
+  n = 0
+  p = binary.MAX_VARINT_LEN64
+  while p < size {
+    x, w = binary.uvarint(buf[p...buf.size])
+    # - prevent index-out-of-bounds panic if there are more indices than expected
+    #   (was go.dev/issue/53352)
+    # - prevent index-out-of-bounds panic in a future Lookup
+    #   by ensuring all indices x satisfy x < max_index
+    if n >= len || x >= max_index {
+      fail SuffixArrayError.Corrupted
+    }
+    data.set(n, x.as_i64)
+    p += w
+    n += 1
+  }
+  n
+}
+
+# Go's Read, with maxData32 as a parameter; returns the index read.
+def read_index(r: io.Reader, max_data32: Int) -> ~Index {
+  # buffer for all reads
+  buf: [Byte] = [0; BUF_SIZE]
+
+  # read length
+  n = ~read_int(r, buf)
+  fail SuffixArrayError.Corrupted if n < 0
+
+  # allocate space
+  data: [Byte] = [0; n]
+  x = Index.new(data: data)
+  if n <= max_data32 {
+    sa32: [I32] = [0; n]
+    x.sa = Ints.new(int32: sa32)
+  } else {
+    sa: [I64] = [0; n]
+    x.sa = Ints.new(int64: sa, wide: true)
+  }
+
+  # read data
+  ~io.read_exact(r, data)
+
+  # read index
+  rest = x.sa
+  max_index = n.as_u64
+  while rest.len > 0 {
+    k = ~read_slice(r, buf, rest, max_index)
+    rest = rest.slice(k, rest.len)
+  }
+  x
+}
+
+def at(x: Index, i: Int) -> [Byte] { x.data[x.sa.get(i)...x.data.size] }
+
+# A slice into the matching region of the index.
+# The runtime is O(log(N)*s.size).
+def lookup_all(x: Index, s: [Byte]) -> Ints {
+  # find matching suffix index range [i:j]
+  # find the first index where s would be the prefix
+  n = x.sa.len
+  i = sort.search(n) { |k| bytes.compare(at(x, k), s) >= 0 }
+  # starting at i, find the first index at which s is not a prefix
+  j = i + sort.search(n - i) { |k| !bytes.has_prefix(at(x, k + i), s) }
+  x.sa.slice(i, j)
+}
+
+def find_all_index_in(x: Index, r: regexp.Regexp, n: Int) -> [[Int]] {
+  result: [[Int]] = []
+  # a non-empty literal prefix is used to determine possible
+  # match start indices with Lookup
+  prefix, complete = r.literal_prefix
+  lit = prefix.bytes.to_a
+
+  # worst-case scenario: no literal prefix
+  if prefix == "" {
+    return r.find_all_index(x.data, n)
+  }
+
+  # if regexp is a literal just use Lookup and convert its
+  # result into match pairs
+  if complete {
+    # Lookup returns indices that may belong to overlapping matches.
+    # After eliminating them, we may end up with fewer than n matches.
+    # If we don't have enough at the end, redo the search with an
+    # increased value n1, but only if Lookup returned all the requested
+    # indices in the first place (if it returned fewer than that then
+    # there cannot be more).
+    n1 = n
+    loop {
+      indices = x.lookup(lit, n1)
+      return result if indices.size == 0
+      slices.sort(indices)
+      result = []
+      prev = 0
+      for i in indices {
+        break if result.size == n
+        # ignore indices leading to overlapping matches
+        if prev <= i {
+          result << [i, i + lit.size]
+          prev = i + lit.size
+        }
+      }
+      # found all matches or there's no chance to find more
+      # (n and n1 can be negative)
+      break if result.size >= n || indices.size != n1
+      n1 = n1 +% 2 *% (n - result.size) # overflow ok
+    }
+    return result
+  }
+
+  # regexp has a non-empty literal prefix; Lookup(lit) computes
+  # the indices of possible complete matches; use these as starting
+  # points for anchored searches
+  # (regexp "^" matches beginning of input, not beginning of line)
+  ra = regexp.must_compile("^" + r.to_s) # compiles because r compiled
+  text = Str.from_bytes(x.data)
+
+  # same comment about Lookup applies here as in the loop above
+  n1 = n
+  loop {
+    indices = x.lookup(lit, n1)
+    return result if indices.size == 0
+    slices.sort(indices)
+    result = []
+    prev = 0
+    for i in indices {
+      break if result.size == n
+      # ignore indices leading to overlapping matches
+      # (Go runs the anchored search first; the result is the same)
+      if prev <= i {
+        if m = ra.find_string_index(text[i...text.size]) {
+          # anchored search - will not run off
+          result << [i, m[1] + i]
+          prev = m[1] + i
+        }
+      }
+    }
+    break if result.size >= n || indices.size != n1
+    n1 = n1 +% 2 *% (n - result.size) # overflow ok
+  }
+  result
+}

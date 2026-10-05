@@ -1,0 +1,145 @@
+# Go's transcript-replay harness (handshake_test.go: parseTestData,
+# replayingConn; handshake_client_test.go / handshake_server_test.go:
+# clientTest.run / serverTest.run without -update): the recorded flows in
+# testdata/Client-* and Server-* are replayed, and every byte the alx side
+# writes must match the recording. Randomness is Go's test source
+# (cryptotest.SetGlobalRandom(t, 0): a ChaCha8 stream with seed 0) and the
+# time is Go's testTime.
+
+import "math/rand/v2"
+import "os"
+import "strconv"
+import "strings"
+import "time"
+
+# Go's cryptotest global random: ChaCha8 seeded with 0, as an io.Reader.
+struct TestRand {
+  c: [rand.ChaCha8]
+
+  def read!(p: [Byte]) -> ~Int { self.c[0].read!(p) }
+}
+
+def test_rand -> TestRand {
+  seed: [Byte; 32] = [0; 32]
+  TestRand.new(c: [rand.new_chacha8(seed)])
+}
+
+# Go's parseTestData.
+def parse_test_data(name: Str) -> [[Byte]] {
+  text = os.read_file_string("testdata/" + name).unwrap
+  flows: [[Byte]] = []
+  current: [Byte] = []
+  started = false
+  for line in text.split("\n") {
+    if line.start_with?(">>> ") {
+      if current.size > 0 || flows.size > 0 || started {
+        flows << current if current.size > 0 || flows.size > 0
+      }
+      started = true
+      current = []
+      next
+    }
+    next if line.size == 0
+    sp = strings.index(line, " ")
+    next if sp < 0
+    rest = line[sp + 1...line.size]
+    bar = strings.index(rest, "|")
+    rest = rest[0...bar] if bar >= 0
+    for h in strings.fields(rest) {
+      current << strconv.parse_uint(h, 16, 8).unwrap.as_u8
+    }
+  }
+  flows << current if current.size > 0
+  flows
+}
+
+struct ReplayState {
+  flows: [[Byte]]
+  reading: Bool
+  errors: [Str]
+}
+
+# Go's replayingConn as a Transport. reading starts false for a client
+# (it writes first) and true for a server.
+def replaying_transport(st: [ReplayState]) -> Transport {
+  s = st
+  Transport.new(
+    read: ->(b: [Byte]) -> ~Int {
+      r = s
+      if !r[0].reading {
+        r[0].errors << "expected write, got read"
+        fail TlsError.Msg("recording expected write, got read")
+      }
+      return 0 if r[0].flows.size == 0
+      f = r[0].flows[0]
+      n = b.size < f.size ? b.size : f.size
+      copy(b[0...n], f[0...n])
+      r[0].flows[0] = f[n...f.size]
+      if r[0].flows[0].size == 0 {
+        r[0].flows = r[0].flows[1...r[0].flows.size]
+        r[0].reading = false if r[0].flows.size > 0
+      }
+      n
+    },
+    write: ->(b: [Byte]) -> ~Int {
+      r = s
+      if r[0].reading || r[0].flows.size == 0 {
+        r[0].errors << "expected read, got write"
+        fail TlsError.Msg("recording expected read, got write")
+      }
+      f = r[0].flows[0]
+      if b.size > f.size || f[0...b.size] != b {
+        r[0].errors << mismatch_text(f, b)
+        fail TlsError.Msg("write mismatch")
+      }
+      r[0].flows[0] = f[b.size...f.size]
+      if r[0].flows[0].size == 0 {
+        r[0].flows = r[0].flows[1...r[0].flows.size]
+        r[0].reading = true
+      }
+      b.size
+    },
+    close: ->() -> ~Unit {
+      r = s
+      r[0].errors << "closed with unfinished flows" if r[0].flows.size > 0
+      nil
+    },
+    close_write: ->() -> ~Unit { nil },
+    local_addr: "",
+    remote_addr: ""
+  )
+}
+
+def replay_config(base: Config) -> Config {
+  c = base
+  tr = test_rand()
+  c.rand = ->(p: [Byte]) -> ~Int {
+    r = tr
+    r.~read!(p)
+  }
+  c.time = ->() -> time.Time { test_time() }
+  c
+}
+
+# Go's clientTest.run in replay mode. Returns "" or the failures.
+def run_client_replay(name: Str, config: Config) -> Str {
+  st = [ReplayState.new(flows: parse_test_data("Client-" + name), reading: false)]
+  c = client_transport(replaying_transport(st), replay_config(config))
+  w = c.write!("hello\n".bytes)
+  if e = w.err {
+    st[0].errors << "Client.Write failed: " + e.message
+  }
+  c.close!
+  st[0].errors.join("; ")
+}
+
+def mismatch_text(f: [Byte], b: [Byte]) -> Str {
+  i = 0
+  while i < b.size && i < f.size && f[i] == b[i] {
+    i += 1
+  }
+  lo = i < 16 ? 0 : i - 16
+  fe = f.size < i + 24 ? f.size : i + 24
+  be = b.size < i + 24 ? b.size : i + 24
+  "write mismatch at byte #{i} of #{b.size} (flow #{f.size}): expected ..." + hexs(f[lo...fe]) + ", got ..." + hexs(b[lo...be])
+}

@@ -1,0 +1,712 @@
+# Go's common.go and defaults.go: Config, Certificate, ConnectionState and
+# the version / curve / signature-algorithm policy.
+
+import "crypto"
+import "crypto/ecdsa"
+import crand "crypto/rand"
+import "crypto/sha512"
+import "crypto/x509"
+import "io"
+import "net/netip"
+import "strings"
+import "time"
+
+# A certificate chain and its private key (Go's tls.Certificate).
+pub struct Certificate {
+  # The DER certificates, leaf first.
+  certificate: [[Byte]]
+  # The leaf's private key.
+  private_key: x509.PrivateKey
+  # Restricts the signature algorithms the private key may be used for.
+  supported_signature_algorithms: [U16]?
+  # An OCSP response to staple (server side).
+  ocsp_staple: [Byte]?
+  # Signed certificate timestamps to send (server side).
+  signed_certificate_timestamps: [[Byte]]?
+  # The parsed leaf, if known.
+  leaf: x509.Certificate?
+
+  # The parsed leaf (Go's leaf()).
+  def leaf_cert -> ~x509.Certificate {
+    if l = leaf {
+      return l
+    }
+    fail TlsError.Msg("tls: certificate list is empty") if certificate.size == 0
+    x509.~parse_certificate(certificate[0])
+  }
+
+  def chain -> CertificateChain { CertificateChain.new(certificate: certificate, ocsp_staple: ocsp_staple, signed_certificate_timestamps: signed_certificate_timestamps) }
+}
+
+# What the server learned from the ClientHello (Go's ClientHelloInfo).
+pub struct ClientHelloInfo {
+  cipher_suites: [U16]
+  server_name: Str
+  supported_curves: [U16]
+  supported_points: [Byte]
+  signature_schemes: [U16]
+  supported_protos: [Str]
+  supported_versions: [U16]
+  extensions: [U16]
+  # The peer's address (Go gives the net.Conn).
+  remote_addr: Str
+  hello_retry_request: Bool
+}
+
+# What the server asked for in a CertificateRequest (Go's
+# CertificateRequestInfo).
+pub struct CertificateRequestInfo {
+  acceptable_cas: [[Byte]]
+  signature_schemes: [U16]
+  version: U16
+
+  # Whether the server accepts c (Go's SupportsCertificate).
+  pub def supports_certificate(c: Certificate) -> ~Unit {
+    ~select_signature_scheme(version, c, signature_schemes)
+    return if acceptable_cas.size == 0
+    j = 0
+    for cert in c.certificate {
+      x: x509.Certificate? = none
+      if j == 0 {
+        x = c.leaf
+      }
+      if x.none? {
+        r = x509.parse_certificate(cert)
+        if e = r.err {
+          fail TlsError.Msg("failed to parse certificate ##{j} in the chain: " + e.message)
+        }
+        x = r.unwrap
+      }
+      xc = x || x509.Certificate.new
+      for ca in acceptable_cas {
+        return if xc.raw_issuer == ca
+      }
+      j += 1
+    }
+    fail TlsError.Msg("chain is not signed by an acceptable CA")
+  }
+}
+
+# A client session cache (Go's ClientSessionCache): put of none removes.
+pub interface ClientSessionCache {
+  def get(session_key: Str) -> ClientSessionState?
+  def put(session_key: Str, cs: ClientSessionState?)
+}
+
+struct LruState {
+  keys: [Str]
+  states: Map[Str, ClientSessionState]
+  capacity: Int
+}
+
+def without_key(keys: [Str], k: Str) -> [Str] { keys.select { it != k }.to_a }
+
+# Go's NewLRUClientSessionCache: an LRU cache of client sessions. Copies
+# share the cache.
+pub struct LruClientSessionCache {
+  m: Mutex[LruState]
+
+  pub def get(session_key: Str) -> ClientSessionState? {
+    m.lock { |s|
+      r: ClientSessionState? = none
+      if v = s.states[session_key] {
+        r = v
+        s.keys = [session_key] + without_key(s.keys, session_key)
+      }
+      r
+    }
+  }
+
+  pub def put(session_key: Str, cs: ClientSessionState?) {
+    m.lock { |s|
+      if s.states.has_key?(session_key) {
+        s.keys = without_key(s.keys, session_key)
+        if c = cs {
+          s.states[session_key] = c
+          s.keys = [session_key] + s.keys
+        } else {
+          s.states.delete(session_key)
+        }
+      } else if c = cs {
+        if s.keys.size >= s.capacity {
+          old = s.keys[s.keys.size - 1]
+          s.keys = s.keys[0...s.keys.size - 1]
+          s.states.delete(old)
+        }
+        s.states[session_key] = c
+        s.keys = [session_key] + s.keys
+      }
+      nil
+    }
+    nil
+  }
+}
+
+# An LRU client session cache of the given capacity (64 if < 1).
+pub def new_lru_client_session_cache(capacity: Int) -> LruClientSessionCache {
+  cap = capacity < 1 ? 64 : capacity
+  LruClientSessionCache.new(m: Mutex.new(LruState.new(capacity: cap)))
+}
+
+TICKET_KEY_LIFETIME_SECONDS = 7 * 24 * 3600
+TICKET_KEY_ROTATION_SECONDS = 24 * 3600
+MAX_SESSION_TICKET_LIFETIME_SECONDS = 7 * 24 * 3600
+
+struct TicketKey {
+  aes_key: [Byte]
+  hmac_key: [Byte]
+  created: time.Time
+}
+
+# The Config state shared by every connection made with it (Go keeps it
+# behind the *Config's mutex): the session ticket keys.
+struct ConfigShared {
+  session_ticket_keys: [TicketKey]
+  auto_session_ticket_keys: [TicketKey]
+  legacy_key_done: Bool
+}
+
+# Config.rand as an io.Reader.
+struct FuncReader {
+  f: ([Byte]) -> ~Int
+
+  def read!(p: [Byte]) -> ~Int { f.~call(p) }
+}
+
+# A TLS client or server configuration (Go's tls.Config). Copy it freely:
+# copies made after `prepare!` (which tls.client / tls.server /
+# tls.new_listener / tls.listen do) share the session ticket keys.
+pub struct Config {
+  # The source of entropy (Go's Rand; none: crypto/rand), as a read function
+  # filling its argument: a Conn is an io.Reader and io.Writer itself, so it
+  # can't hold io.Reader / io.Writer values.
+  rand: (([Byte]) -> ~Int)?
+  # The current time (Go's Time; none: time.now).
+  time: (() -> time.Time)?
+  certificates: [Certificate]
+  name_to_certificate: Map[Str, Certificate]
+  get_certificate: ((ClientHelloInfo) -> ~Certificate?)?
+  get_client_certificate: ((CertificateRequestInfo) -> ~Certificate)?
+  verify_peer_certificate: (([[Byte]], [[x509.Certificate]]) -> ~Unit)?
+  verify_connection: ((ConnectionState) -> ~Unit)?
+  root_cas: x509.CertPool?
+  next_protos: [Str]
+  server_name: Str
+  client_auth: Int
+  client_cas: x509.CertPool?
+  insecure_skip_verify: Bool
+  # The enabled TLS 1.0-1.2 cipher suites (none: the defaults).
+  cipher_suites: [U16]?
+  prefer_server_cipher_suites: Bool
+  session_tickets_disabled: Bool
+  # 32 bytes, or empty.
+  session_ticket_key: [Byte]
+  client_session_cache: ClientSessionCache?
+  unwrap_session: (([Byte], ConnectionState) -> ~SessionState?)?
+  wrap_session: ((ConnectionState, SessionState) -> ~[Byte])?
+  min_version: U16
+  max_version: U16
+  curve_preferences: [U16]
+  dynamic_record_sizing_disabled: Bool
+  renegotiation: Int
+  # Where NSS key log lines go (Go's KeyLogWriter), as a write function for
+  # the same reason as `rand`.
+  key_log_writer: (([Byte]) -> ~Int)?
+  shared: Mutex[ConfigShared]?
+
+  # Go's Config.Clone: a copy sharing the session ticket state.
+  pub def clone -> Config { self }
+
+  # Makes the shared state (session ticket keys) if this config has none
+  # yet; connections made from copies taken after this share it.
+  pub def prepare! {
+    if shared.none? {
+      self.shared = Mutex.new(ConfigShared.new)
+    }
+    nil
+  }
+
+  def rand_bytes(n: Int) -> ~[Byte] {
+    b = [0.as_u8; n]
+    if r = rand {
+      io.~read_full(FuncReader.new(f: r), b)
+    } else {
+      crypto_rand_read(b)
+    }
+    b
+  }
+
+  def rand_reader -> io.Reader {
+    if r = rand {
+      return FuncReader.new(f: r)
+    }
+    crand.reader()
+  }
+
+  def now -> time.Time {
+    if t = time {
+      return t.call
+    }
+    time.now()
+  }
+
+  # Go's SetSessionTicketKeys: the keys, newest first (32 bytes each).
+  pub def set_session_ticket_keys!(keys: [[Byte]]) {
+    panic("tls: keys must have at least one key") if keys.size == 0
+    self.prepare!
+    nk: [TicketKey] = []
+    for k in keys {
+      nk << self.ticket_key_from_bytes(k)
+    }
+    if s = shared {
+      s.lock { |st| st.session_ticket_keys = nk }
+    }
+    nil
+  }
+
+  def ticket_key_from_bytes(b: [Byte]) -> TicketKey {
+    hashed = sha512.sum512(b)
+    h = hashed.to_a
+    TicketKey.new(aes_key: h[16...32], hmac_key: h[32...48], created: self.now)
+  }
+
+  # Go's ticketKeys.
+  def ticket_keys -> [TicketKey] {
+    return [] if session_tickets_disabled
+    if session_ticket_key.size == 32 {
+      return [self.ticket_key_from_bytes(session_ticket_key)]
+    }
+    cfg = self
+    if s = shared {
+      return s.lock { |st|
+        if !st.legacy_key_done {
+          # Go's initLegacySessionTicketKeyRLocked: a random
+          # SessionTicketKey (prefixed "DEPRECATED", so unused) is drawn
+          # once per Config; it consumes 32 bytes of randomness.
+          cfg.rand_bytes(32).unwrap
+          st.legacy_key_done = true
+        }
+        if st.session_ticket_keys.size != 0 {
+          st.session_ticket_keys
+        } else {
+          now = cfg.now
+          if st.auto_session_ticket_keys.size == 0 || now.sub(st.auto_session_ticket_keys[0].created).seconds >= TICKET_KEY_ROTATION_SECONDS.to_f {
+            nk = cfg.ticket_key_from_bytes(cfg.rand_bytes(32).unwrap)
+            valid = [nk]
+            for k in st.auto_session_ticket_keys {
+              valid << k if now.sub(k.created).seconds < TICKET_KEY_LIFETIME_SECONDS.to_f
+            }
+            st.auto_session_ticket_keys = valid
+          }
+          st.auto_session_ticket_keys
+        }
+      }
+    }
+    # Unprepared config: a key for this connection only.
+    self.rand_bytes(32).unwrap
+    [self.ticket_key_from_bytes(self.rand_bytes(32).unwrap)]
+  }
+
+  def cipher_suite_list(aes_gcm_preferred: Bool) -> [U16] {
+    if cs = cipher_suites {
+      return supported_cipher_suites(aes_gcm_preferred).select { cs.include?(it) }.to_a
+    }
+    default_cipher_suites(aes_gcm_preferred)
+  }
+
+  def supported_cipher_suite_list -> [U16] { self.cipher_suite_list(false) }
+
+  def supported_versions_for(is_client: Bool) -> [U16] {
+    out: [U16] = []
+    for v in [VERSION_TLS13, VERSION_TLS12, VERSION_TLS11, VERSION_TLS10] {
+      next if min_version == 0 && v < VERSION_TLS12
+      next if min_version != 0 && v < min_version
+      next if max_version != 0 && v > max_version
+      out << v
+    }
+    out
+  }
+
+  def max_supported_version(is_client: Bool) -> U16 {
+    vs = self.supported_versions_for(is_client)
+    return 0 if vs.size == 0
+    vs[0]
+  }
+
+  def curve_preferences_for(version: U16) -> [U16] {
+    out: [U16] = []
+    for c in curve_preference_order() {
+      out << c if self.supports_curve?(version, c)
+    }
+    out
+  }
+
+  def supports_curve?(version: U16, x: U16) -> Bool {
+    if curve_preferences.size != 0 {
+      return false if !curve_preferences.include?(x)
+      return false if !curve_preference_order().include?(x)
+    } else {
+      return false if !default_curve_enabled?(x)
+    }
+    return false if version < VERSION_TLS13 && tls13_only_key_exchange?(x)
+    true
+  }
+
+  def mutual_version(is_client: Bool, peer_versions: [U16]) -> U16? {
+    for v in self.supported_versions_for(is_client) {
+      return v if peer_versions.include?(v)
+    }
+    none
+  }
+
+  # Go's getCertificate.
+  def get_certificate_for(hello: ClientHelloInfo) -> ~Certificate {
+    if f = get_certificate {
+      if certificates.size == 0 || hello.server_name.size > 0 {
+        if c = f.~call(hello) {
+          return c
+        }
+      }
+    }
+    fail TlsError.Msg("tls: no certificates configured") if certificates.size == 0
+    return certificates[0] if certificates.size == 1
+    if name_to_certificate.size > 0 {
+      name = strings.to_lower(hello.server_name)
+      if c = name_to_certificate[name] {
+        return c
+      }
+      if name.size > 0 {
+        labels = name.split(".")
+        labels[0] = "*"
+        if c = name_to_certificate[labels.join(".")] {
+          return c
+        }
+      }
+    }
+    for c in certificates {
+      return c if supports_certificate_with(self, hello, c).ok?
+    }
+    certificates[0]
+  }
+
+  # Go's BuildNameToCertificate.
+  pub def build_name_to_certificate! {
+    m: Map[Str, Certificate] = {}
+    for c in certificates {
+      if x = c.leaf_cert.ok {
+        m[x.subject.common_name] = c if x.subject.common_name != "" && x.dns_names.size == 0
+        for san in x.dns_names {
+          m[san] = c
+        }
+      }
+    }
+    self.name_to_certificate = m
+  }
+
+  # Go's writeKeyLog: "LABEL clientrandom secret" in hex.
+  def write_key_log(label: Str, client_random: [Byte], secret: [Byte]) -> ~Unit {
+    if w = key_log_writer {
+      line = label + " " + hexs(client_random) + " " + hexs(secret) + "\n"
+      r = w.call(line.bytes)
+      if e = r.err {
+        fail TlsError.Msg("tls: KeyLogWriter: " + e.message)
+      }
+    }
+  }
+}
+
+def hexs(b: [Byte]) -> Str {
+  digits = "0123456789abcdef"
+  out: [Byte] = []
+  for x in b {
+    out << digits[(x >> 4).to_i]
+    out << digits[(x & 15).to_i]
+  }
+  Str.from_bytes(out)
+}
+
+def crypto_rand_read(b: [Byte]) { crand.read(b) }
+
+KEY_LOG_LABEL_TLS12 = "CLIENT_RANDOM"
+KEY_LOG_LABEL_CLIENT_HANDSHAKE = "CLIENT_HANDSHAKE_TRAFFIC_SECRET"
+KEY_LOG_LABEL_SERVER_HANDSHAKE = "SERVER_HANDSHAKE_TRAFFIC_SECRET"
+KEY_LOG_LABEL_CLIENT_TRAFFIC = "CLIENT_TRAFFIC_SECRET_0"
+KEY_LOG_LABEL_SERVER_TRAFFIC = "SERVER_TRAFFIC_SECRET_0"
+
+# ---------------------------------------------------------------- defaults
+
+def default_curve_enabled?(c: U16) -> Bool {
+  c == X25519 || c == CURVE_P256 || c == CURVE_P384 || c == CURVE_P521 || c == X25519_MLKEM768 || c == SECP256R1_MLKEM768 || c == SECP384R1_MLKEM1024
+}
+
+def curve_preference_order -> [U16] { [X25519_MLKEM768, SECP256R1_MLKEM768, SECP384R1_MLKEM1024, MLKEM1024, X25519, CURVE_P256, CURVE_P384, CURVE_P521] }
+
+def default_supported_signature_algorithms -> [U16] { [MLDSA44, MLDSA65, MLDSA87, PSS_WITH_SHA256, ECDSA_WITH_P256_AND_SHA256, ED25519, PSS_WITH_SHA384, PSS_WITH_SHA512, PKCS1_WITH_SHA256, PKCS1_WITH_SHA384, PKCS1_WITH_SHA512, ECDSA_WITH_P384_AND_SHA384, ECDSA_WITH_P521_AND_SHA512, PKCS1_WITH_SHA1, ECDSA_WITH_SHA1] }
+
+def supported_cipher_suites(aes_gcm_preferred: Bool) -> [U16] {
+  return cipher_suites_preference_order() if aes_gcm_preferred
+  cipher_suites_preference_order_no_aes()
+}
+
+def default_cipher_suites(aes_gcm_preferred: Bool) -> [U16] { supported_cipher_suites(aes_gcm_preferred).select { !disabled_cipher_suite?(it) }.to_a }
+
+def default_cipher_suites_tls13 -> [U16] { [TLS_AES_128_GCM_SHA256, TLS_AES_256_GCM_SHA384, TLS_CHACHA20_POLY1305_SHA256] }
+
+def default_cipher_suites_tls13_no_aes -> [U16] { [TLS_CHACHA20_POLY1305_SHA256, TLS_AES_128_GCM_SHA256, TLS_AES_256_GCM_SHA384] }
+
+def supported_versions_from_max(max_version: U16) -> [U16] { [VERSION_TLS13, VERSION_TLS12, VERSION_TLS11, VERSION_TLS10].select { it <= max_version }.to_a }
+
+def supported_signature_algorithms(min_vers: U16, max_vers: U16) -> [U16] {
+  default_supported_signature_algorithms().select { |s|
+    keep = false
+    v = min_vers
+    while v <= max_vers {
+      keep = true if !disabled_signature_algorithm?(v, s, false)
+      v += 1
+    }
+    keep
+  }.to_a
+}
+
+def supported_signature_algorithms_cert(min_vers: U16, max_vers: U16) -> [U16] {
+  default_supported_signature_algorithms().select { |s|
+    keep = false
+    v = min_vers
+    while v <= max_vers {
+      keep = true if !disabled_signature_algorithm?(v, s, true)
+      v += 1
+    }
+    keep
+  }.to_a
+}
+
+# Go's isDisabledSignatureAlgorithm (with the default GODEBUG: no SHA-1
+# signatures in TLS 1.2 handshakes).
+def disabled_signature_algorithm?(version: U16, s: U16, is_cert: Bool) -> Bool {
+  if s == MLDSA44 || s == MLDSA65 || s == MLDSA87 {
+    return true if version < VERSION_TLS13
+  }
+  return false if is_cert
+  if r = type_and_hash_from_signature_scheme(s).ok {
+    sig_type, sig_hash = r
+    if version > VERSION_TLS12 {
+      return true if sig_type == SIGNATURE_PKCS1V15 || sig_hash == crypto.Hash.SHA1
+    } else {
+      return true if sig_hash == crypto.Hash.SHA1
+    }
+  }
+  false
+}
+
+def supported_signature_algorithm?(alg: U16, supported: [U16]) -> Bool { supported.include?(alg) }
+
+# The Go type of a message, for unexpectedMessageError.
+def unexpected_message_error(wanted: Str, got: HandshakeMessage) -> TlsError { TlsError.Msg("tls: received unexpected handshake message of type " + got.type_name + " when waiting for " + wanted) }
+
+# Go's ClientHelloInfo.SupportsCertificate.
+pub def supports_certificate(chi: ClientHelloInfo, c: Certificate) -> ~Unit { ~supports_certificate_with(Config.new, chi, c) }
+
+def supports_certificate_with(config: Config, chi: ClientHelloInfo, c: Certificate) -> ~Unit {
+  vers0 = config.mutual_version(false, chi.supported_versions)
+  fail TlsError.Msg("no mutually supported protocol versions") if vers0.none?
+  vers = vers0 || 0
+  if chi.server_name != "" {
+    lr = c.leaf_cert
+    if e = lr.err {
+      fail TlsError.Msg("failed to parse certificate: " + e.message)
+    }
+    hr = lr.unwrap.verify_hostname(chi.server_name)
+    if e = hr.err {
+      fail TlsError.Msg("certificate is not valid for requested server name: " + e.message)
+    }
+  }
+  # supportsRSAFallback: the certificate is still usable with plain RSA key
+  # exchange (TLS < 1.3, an RSA key, a non-ECDHE suite in common).
+  rsa_fallback = false
+  if vers != VERSION_TLS13 {
+    case c.private_key.public {
+      Rsa(_) => {
+        s = select_cipher_suite(chi.cipher_suites, config.supported_cipher_suite_list) { |cs| cs.flags & SUITE_ECDHE == 0 && !(vers < VERSION_TLS12 && cs.flags & SUITE_TLS12 != 0) }
+        rsa_fallback = s.some?
+      }
+      _ => nil
+    }
+  }
+  if chi.signature_schemes.size > 0 {
+    r = select_signature_scheme(vers, c, chi.signature_schemes)
+    if e = r.err {
+      return if rsa_fallback
+      fail e
+    }
+  }
+  return if vers == VERSION_TLS13
+  ecdhe_supported = ~supports_ecdhe(config, vers, chi.supported_curves, chi.supported_points)
+  if !ecdhe_supported {
+    return if rsa_fallback
+    fail TlsError.Msg("client doesn't support ECDHE, can only use legacy RSA key exchange")
+  }
+  ecdsa_cipher_suite = false
+  case c.private_key.public {
+    Ecdsa(pub) => {
+      curve = curve_id_for_ecdsa(pub)
+      if curve == 0 {
+        return if rsa_fallback
+        fail unsupported_certificate_error(c)
+      }
+      curve_ok = false
+      for cc in chi.supported_curves {
+        curve_ok = true if cc == curve && config.supports_curve?(vers, cc)
+      }
+      fail TlsError.Msg("client doesn't support certificate curve") if !curve_ok
+      ecdsa_cipher_suite = true
+    }
+    Ed25519(_) => {
+      fail TlsError.Msg("connection doesn't support Ed25519") if vers < VERSION_TLS12 || chi.signature_schemes.size == 0
+      ecdsa_cipher_suite = true
+    }
+    MlDsa(_) => {
+      fail TlsError.Msg("connection doesn't support ML-DSA")
+    }
+    Rsa(_) => nil
+    _ => {
+      return if rsa_fallback
+      fail unsupported_certificate_error(c)
+    }
+  }
+  s = select_cipher_suite(chi.cipher_suites, config.supported_cipher_suite_list) { |cs|
+    ok = cs.flags & SUITE_ECDHE != 0
+    ok = false if (cs.flags & SUITE_EC_SIGN != 0) != ecdsa_cipher_suite
+    ok = false if vers < VERSION_TLS12 && cs.flags & SUITE_TLS12 != 0
+    ok
+  }
+  if s.none? {
+    return if rsa_fallback
+    fail TlsError.Msg("client doesn't support any cipher suites compatible with the certificate")
+  }
+}
+
+# The TLS CurveID of an ECDSA key's curve, or 0.
+def curve_id_for_ecdsa(pub: ecdsa.PublicKey) -> U16 {
+  n = pub.curve.params.name
+  return CURVE_P256 if n == "P-256"
+  return CURVE_P384 if n == "P-384"
+  return CURVE_P521 if n == "P-521"
+  0
+}
+
+# Go's supportsECDHE (handshake_server.go).
+def supports_ecdhe(c: Config, version: U16, supported_curves: [U16], supported_points: [Byte]) -> ~Bool {
+  supports_curve = false
+  for curve in supported_curves {
+    supports_curve = true if c.supports_curve?(version, curve)
+  }
+  supports_point_format = false
+  offered_non_compressed_format = false
+  for p in supported_points {
+    if p == POINT_FORMAT_UNCOMPRESSED {
+      supports_point_format = true
+    } else {
+      offered_non_compressed_format = true
+    }
+  }
+  # Per RFC 8422, Section 5.1.2, if the Supported Point Formats extension is
+  # missing, uncompressed points are supported. If supportedPoints is empty,
+  # the extension must be missing, as an empty extension body is rejected by
+  # the parser.
+  if supported_points.size == 0 {
+    supports_point_format = true
+  } else if offered_non_compressed_format && !supports_point_format {
+    fail TlsError.Msg("tls: client offered only incompatible point formats")
+  }
+  supports_curve && supports_point_format
+}
+
+# Go's hostnameInSNI: the name to send in SNI ("" for IP literals), without
+# trailing dots.
+def hostname_in_sni(name0: Str) -> Str {
+  host = name0
+  host = host[1...host.size - 1] if host.size > 0 && host[0] == 0x5b && host[host.size - 1] == 0x5d
+  i = strings.last_index(host, "%")
+  host = host[0...i] if i > 0
+  return "" if netip.parse_addr(host).ok?
+  name = name0
+  while name.size > 0 && name[name.size - 1] == 0x2e {
+    name = name[0...name.size - 1]
+  }
+  name
+}
+
+# Go's ConnectionState.
+pub struct ConnectionState {
+  version: U16
+  handshake_complete: Bool
+  did_resume: Bool
+  cipher_suite: U16
+  curve_id: U16
+  negotiated_protocol: Str
+  negotiated_protocol_is_mutual: Bool
+  server_name: Str
+  peer_certificates: [x509.Certificate]
+  verified_chains: [[x509.Certificate]]
+  signed_certificate_timestamps: [[Byte]]
+  ocsp_response: [Byte]
+  tls_unique: [Byte]
+  ech_accepted: Bool
+  hello_retry_request: Bool
+  local_certificate: [[Byte]]
+  ekm: Ekm
+  testing_only_peer_signature_algorithm: U16
+
+  # RFC 5705 / RFC 8446 keying material (Go's ExportKeyingMaterial);
+  # context none is Go's nil context.
+  pub def export_keying_material(label: Str, context: [Byte]?, length: Int) -> ~[Byte] { ekm.~export(label, context, length) }
+}
+
+EKM_NONE_RENEGOTIATION = 0
+EKM_NONE_NO_EMS = 1
+EKM_TLS12 = 2
+EKM_TLS13 = 3
+
+# How keying material is exported (Go's ekm closure).
+struct Ekm {
+  kind: Int
+  version: U16
+  suite: CipherSuiteImpl
+  master_secret: [Byte]
+  client_random: [Byte]
+  server_random: [Byte]
+  exporter: ExporterMasterSecret
+
+  def export(label: Str, context: [Byte]?, length: Int) -> ~[Byte] {
+    if kind == EKM_NONE_RENEGOTIATION {
+      fail TlsError.Msg("crypto/tls: ExportKeyingMaterial is unavailable when renegotiation is enabled")
+    }
+    if kind == EKM_NONE_NO_EMS {
+      fail TlsError.Msg("crypto/tls: ExportKeyingMaterial is unavailable when neither TLS 1.3 nor Extended Master Secret are negotiated")
+    }
+    return exporter.exporter(label, context || [], length) if kind == EKM_TLS13
+    ~ekm_from_master_secret(version, suite, master_secret, client_random, server_random, label, context, length)
+  }
+}
+
+# Go's anyValidVerifiedChain (darwin's form: re-verify each chain's leaf).
+def any_valid_verified_chain(verified_chains: [[x509.Certificate]], opts: x509.VerifyOptions) -> Bool {
+  for chain in verified_chains {
+    next if chain.size == 0
+    expired = false
+    for cert in chain {
+      expired = true if opts.current_time.before(cert.not_before) || opts.current_time.after(cert.not_after)
+    }
+    next if expired
+    o = opts
+    pool = x509.new_cert_pool()
+    i = 1
+    while i < (chain.size - 1 > 1 ? chain.size - 1 : 1) {
+      pool.add_cert!(chain[i])
+      i += 1
+    }
+    o.intermediates = pool
+    return true if chain[0].verify(o).ok?
+  }
+  false
+}

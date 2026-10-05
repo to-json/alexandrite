@@ -1,0 +1,218 @@
+# Session state and session tickets (Go's ticket.go).
+
+import "crypto/aes"
+import "crypto/cipher"
+import "crypto/hmac"
+import "crypto/sha256"
+import "crypto/subtle"
+import "crypto/x509"
+import "golang.org/x/crypto/cryptobyte"
+
+# A resumable session (Go's SessionState).
+pub struct SessionState {
+  # Application data carried in the ticket (Go's Extra).
+  extra: [[Byte]]
+  # Whether the ticket may be used for 0-RTT (QUIC only).
+  early_data: Bool
+  version: U16
+  is_client: Bool
+  cipher_suite: U16
+  # Seconds since the UNIX epoch.
+  created_at: U64
+  # The master secret for TLS 1.2, or the PSK for TLS 1.3.
+  secret: [Byte]
+  ext_master_secret: Bool
+  peer_certificates: [x509.Certificate]
+  ocsp_response: [Byte]?
+  scts: [[Byte]]?
+  verified_chains: [[x509.Certificate]]
+  alpn_protocol: Str
+  # Client-side TLS 1.3 fields: when to stop using the ticket (seconds
+  # since the epoch) and the age obfuscation value.
+  use_by: U64
+  age_add: U32
+  ticket: [Byte]
+  curve_id: U16
+
+  # The session's encoding (Go's Bytes).
+  pub def bytes -> ~[Byte] {
+    s = self
+    b = cryptobyte.new_builder([])
+    b.add_u16!(s.version)
+    b.add_u8!(s.is_client ? 2.as_u8 : 1.as_u8)
+    b.add_u16!(s.cipher_suite)
+    b.add_u64!(s.created_at)
+    b.add_u8_length_prefixed! { |c| c.add_bytes!(s.secret) }
+    b.add_u24_length_prefixed! { |c|
+      for e in s.extra {
+        c.add_u24_length_prefixed! { |c2| c2.add_bytes!(e) }
+      }
+    }
+    b.add_u8!(s.ext_master_secret ? 1.as_u8 : 0.as_u8)
+    b.add_u8!(s.early_data ? 1.as_u8 : 0.as_u8)
+    marshal_certificate(b, CertificateChain.new(certificate: s.peer_certificates.map { it.raw }.to_a, ocsp_staple: s.ocsp_response, signed_certificate_timestamps: s.scts))
+    b.add_u24_length_prefixed! { |c|
+      for chain in s.verified_chains {
+        c.add_u24_length_prefixed! { |c2|
+          # We elide the first certificate because it's always the leaf.
+          if chain.size == 0 {
+            c2.set_error!(TlsError.Msg("tls: internal error: empty verified chain"))
+          } else {
+            for cert in chain[1...chain.size] {
+              c2.add_u24_length_prefixed! { |c3| c3.add_bytes!(cert.raw) }
+            }
+          }
+          nil
+        }
+      }
+    }
+    if s.early_data {
+      b.add_u8_length_prefixed! { |c| c.add_bytes!(s.alpn_protocol.bytes) }
+    }
+    if s.version >= VERSION_TLS13 {
+      if s.is_client {
+        b.add_u64!(s.use_by)
+        b.add_u32!(s.age_add)
+      }
+    } else {
+      b.add_u16!(s.curve_id)
+    }
+    b.~bytes
+  }
+}
+
+def invalid_session -> TlsError { TlsError.Msg("tls: invalid session encoding") }
+
+def need_session[T](o: T?) -> ~T<TlsError> {
+  if v = o {
+    return v
+  }
+  fail invalid_session()
+}
+
+# Go's ParseSessionState.
+pub def parse_session_state(data: [Byte]) -> ~SessionState {
+  ss = SessionState.new
+  s = cryptobyte.string(data)
+  ss.version = ~need_session(s.read_u16!)
+  typ = ~need_session(s.read_u8!)
+  ss.cipher_suite = ~need_session(s.read_u16!)
+  ss.created_at = ~need_session(s.read_u64!)
+  ss.secret = (~need_session(s.read_u8_length_prefixed!)).bytes
+  extra = ~need_session(s.read_u24_length_prefixed!)
+  ems = ~need_session(s.read_u8!)
+  early = ~need_session(s.read_u8!)
+  fail invalid_session() if ss.secret.size == 0
+  cr = unmarshal_certificate(s)
+  fail invalid_session() if !cr.ok?
+  cert, rest = cr.unwrap
+  s = rest
+  while !extra.empty? {
+    ss.extra << (~need_session(extra.read_u24_length_prefixed!)).bytes
+  }
+  if typ == 1 {
+    ss.is_client = false
+  } else if typ == 2 {
+    ss.is_client = true
+  } else {
+    fail TlsError.Msg("tls: unknown session encoding")
+  }
+  fail invalid_session() if ems > 1
+  ss.ext_master_secret = ems == 1
+  fail invalid_session() if early > 1
+  ss.early_data = early == 1
+  for c in cert.certificate {
+    ss.peer_certificates << x509.~parse_certificate(c)
+  }
+  fail TlsError.Msg("tls: no server certificates in client session") if ss.is_client && ss.peer_certificates.size == 0
+  ss.ocsp_response = cert.ocsp_staple
+  ss.scts = cert.signed_certificate_timestamps
+  chain_list = ~need_session(s.read_u24_length_prefixed!)
+  while !chain_list.empty? {
+    cert_list = ~need_session(chain_list.read_u24_length_prefixed!)
+    fail invalid_session() if ss.peer_certificates.size == 0
+    chain = [ss.peer_certificates[0]]
+    while !cert_list.empty? {
+      c = (~need_session(cert_list.read_u24_length_prefixed!)).bytes
+      chain << x509.~parse_certificate(c)
+    }
+    ss.verified_chains << chain
+  }
+  if ss.early_data {
+    ss.alpn_protocol = Str.from_bytes((~need_session(s.read_u8_length_prefixed!)).bytes)
+  }
+  if ss.version >= VERSION_TLS13 {
+    if ss.is_client {
+      ss.use_by = ~need_session(s.read_u64!)
+      ss.age_add = ~need_session(s.read_u32!)
+    }
+  } else {
+    ss.curve_id = ~need_session(s.read_u16!)
+  }
+  ss
+}
+
+# Go's ClientSessionState: a session a client can resume.
+pub struct ClientSessionState {
+  session: SessionState
+
+  # The ticket and state to resume with (Go's ResumptionState).
+  pub def resumption_state -> ([Byte], SessionState) { (session.ticket, session) }
+}
+
+# Go's NewResumptionState.
+pub def new_resumption_state(ticket: [Byte], state: SessionState) -> ClientSessionState {
+  s = state
+  s.ticket = ticket
+  ClientSessionState.new(session: s)
+}
+
+# Go's Config.encryptTicket: AES-128-CTR then HMAC-SHA256 with the first key.
+def encrypt_ticket(c: Config, state: [Byte], ticket_keys: [TicketKey]) -> ~[Byte] {
+  fail TlsError.Msg("tls: internal error: session ticket keys unavailable") if ticket_keys.size == 0
+  iv = ~c.rand_bytes(aes.BLOCK_SIZE)
+  key = ticket_keys[0]
+  block = aes.new_cipher(key.aes_key).unwrap
+  ciphertext = [0.as_u8; state.size]
+  ctr = cipher.new_ctr(block, iv)
+  ctr.xor_key_stream!(ciphertext, state)
+  authenticated = iv + ciphertext
+  mac = hmac.new(->() -> sha256.Digest { sha256.new() }, key.hmac_key)
+  mac.write!(authenticated)
+  authenticated + mac.sum([])
+}
+
+# Go's Config.decryptTicket: the state, or none if no key authenticates it.
+def decrypt_ticket(encrypted: [Byte], ticket_keys: [TicketKey]) -> [Byte]? {
+  return none if encrypted.size < aes.BLOCK_SIZE + 32
+  iv = encrypted[0...aes.BLOCK_SIZE]
+  ciphertext = encrypted[aes.BLOCK_SIZE...encrypted.size - 32]
+  authenticated = encrypted[0...encrypted.size - 32]
+  mac_bytes = encrypted[encrypted.size - 32...encrypted.size]
+  for key in ticket_keys {
+    mac = hmac.new(->() -> sha256.Digest { sha256.new() }, key.hmac_key)
+    mac.write!(authenticated)
+    expected = mac.sum([])
+    next if subtle.constant_time_compare(mac_bytes, expected) != 1
+    block = aes.new_cipher(key.aes_key).unwrap
+    plaintext = [0.as_u8; ciphertext.size]
+    ctr = cipher.new_ctr(block, iv)
+    ctr.xor_key_stream!(plaintext, ciphertext)
+    return plaintext
+  }
+  none
+}
+
+# Go's Config.EncryptTicket.
+pub def encrypt_session_ticket(c: Config, ss: SessionState) -> ~[Byte] {
+  state = ss.~bytes
+  ~encrypt_ticket(c, state, c.ticket_keys)
+}
+
+# Go's Config.DecryptTicket: none when the ticket is unusable.
+pub def decrypt_session_ticket(c: Config, identity: [Byte]) -> SessionState? {
+  if state = decrypt_ticket(identity, c.ticket_keys) {
+    return parse_session_state(state).ok
+  }
+  none
+}

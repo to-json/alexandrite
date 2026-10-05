@@ -1,0 +1,145 @@
+# The TLS 1.3 key schedule (Go's key_schedule.go and
+# crypto/internal/fips140/tls13).
+
+import "crypto"
+import "crypto/hkdf"
+import "crypto/hmac"
+import "hash"
+
+# Go's tls13.ExpandLabel: HKDF-Expand-Label (RFC 8446, Section 7.1).
+def expand_label(h: crypto.Hash, secret: [Byte], label: Str, context: [Byte], length: Int) -> [Byte] {
+  if 6 + label.size > 255 || context.size > 255 {
+    panic("tls13: label or context too long")
+  }
+  hl: [Byte] = [(length >> 8).as_u8, length.as_u8, (6 + label.size).as_u8]
+  hl = hl + "tls13 ".bytes + label.bytes + [context.size.as_u8] + context
+  hkdf.expand(hash_ctor(h), secret, Str.from_bytes(hl), length).unwrap
+}
+
+def hkdf_extract13(h: crypto.Hash, new_secret: [Byte]?, current_secret: [Byte]) -> [Byte] {
+  ns = new_secret || [0.as_u8; h.size]
+  hkdf.extract(hash_ctor(h), ns, current_secret)
+}
+
+# Go's deriveSecret; transcript none is an empty transcript.
+def derive_secret(h: crypto.Hash, secret: [Byte], label: Str, transcript: Transcript?) -> [Byte] {
+  t = transcript || new_transcript(h)
+  expand_label(h, secret, label, t.sum([]), t.size)
+}
+
+RESUMPTION_BINDER_LABEL = "res binder"
+CLIENT_EARLY_TRAFFIC_LABEL = "c e traffic"
+CLIENT_HANDSHAKE_TRAFFIC_LABEL = "c hs traffic"
+SERVER_HANDSHAKE_TRAFFIC_LABEL = "s hs traffic"
+CLIENT_APPLICATION_TRAFFIC_LABEL = "c ap traffic"
+SERVER_APPLICATION_TRAFFIC_LABEL = "s ap traffic"
+EARLY_EXPORTER_LABEL = "e exp master"
+EXPORTER_LABEL = "exp master"
+RESUMPTION_LABEL = "res master"
+
+struct EarlySecret {
+  secret: [Byte]
+  hash: crypto.Hash
+
+  def resumption_binder_key -> [Byte] { derive_secret(self.hash, secret, RESUMPTION_BINDER_LABEL, none) }
+
+  def client_early_traffic_secret(t: Transcript) -> [Byte] { derive_secret(self.hash, secret, CLIENT_EARLY_TRAFFIC_LABEL, t) }
+
+  def handshake_secret(shared_secret: [Byte]) -> HandshakeSecret {
+    derived = derive_secret(self.hash, secret, "derived", none)
+    HandshakeSecret.new(secret: hkdf_extract13(self.hash, shared_secret, derived), hash: self.hash)
+  }
+
+  def early_exporter_master_secret(t: Transcript) -> ExporterMasterSecret { ExporterMasterSecret.new(secret: derive_secret(self.hash, secret, EARLY_EXPORTER_LABEL, t), hash: self.hash) }
+}
+
+def new_early_secret(h: crypto.Hash, psk: [Byte]?) -> EarlySecret { EarlySecret.new(secret: hkdf_extract13(h, psk, []), hash: h) }
+
+struct HandshakeSecret {
+  secret: [Byte]
+  hash: crypto.Hash
+
+  def client_handshake_traffic_secret(t: Transcript) -> [Byte] { derive_secret(self.hash, secret, CLIENT_HANDSHAKE_TRAFFIC_LABEL, t) }
+
+  def server_handshake_traffic_secret(t: Transcript) -> [Byte] { derive_secret(self.hash, secret, SERVER_HANDSHAKE_TRAFFIC_LABEL, t) }
+
+  def master_secret -> MasterSecret13 {
+    derived = derive_secret(self.hash, secret, "derived", none)
+    MasterSecret13.new(secret: hkdf_extract13(self.hash, none, derived), hash: self.hash)
+  }
+}
+
+struct MasterSecret13 {
+  secret: [Byte]
+  hash: crypto.Hash
+
+  def client_application_traffic_secret(t: Transcript) -> [Byte] { derive_secret(self.hash, secret, CLIENT_APPLICATION_TRAFFIC_LABEL, t) }
+
+  def server_application_traffic_secret(t: Transcript) -> [Byte] { derive_secret(self.hash, secret, SERVER_APPLICATION_TRAFFIC_LABEL, t) }
+
+  def resumption_master_secret(t: Transcript) -> [Byte] { derive_secret(self.hash, secret, RESUMPTION_LABEL, t) }
+
+  def exporter_master_secret(t: Transcript) -> ExporterMasterSecret { ExporterMasterSecret.new(secret: derive_secret(self.hash, secret, EXPORTER_LABEL, t), hash: self.hash) }
+}
+
+struct ExporterMasterSecret {
+  secret: [Byte]
+  hash: crypto.Hash
+
+  # RFC 8446 Section 7.5 exporter output.
+  def exporter(label: Str, context: [Byte], length: Int) -> [Byte] {
+    s = derive_secret(self.hash, secret, label, none)
+    h = self.hash.new
+    h.write!(context)
+    expand_label(self.hash, s, "exporter", h.sum([]), length)
+  }
+}
+
+# Go's cipherSuiteTLS13 methods.
+def next_traffic_secret(c: CipherSuiteTLS13, traffic_secret: [Byte]) -> [Byte] { expand_label(c.hash, traffic_secret, "traffic upd", [], c.hash.size) }
+
+def traffic_key(c: CipherSuiteTLS13, traffic_secret: [Byte]) -> ([Byte], [Byte]) {
+  (expand_label(c.hash, traffic_secret, "key", [], c.key_len), expand_label(c.hash, traffic_secret, "iv", [], AEAD_NONCE_LENGTH))
+}
+
+def finished_hash13(c: CipherSuiteTLS13, base_key: [Byte], transcript: Transcript) -> [Byte] {
+  finished_key = expand_label(c.hash, base_key, "finished", [], c.hash.size)
+  verify_data = hmac.new(hash_ctor(c.hash), finished_key)
+  verify_data.write!(transcript.sum([]))
+  verify_data.sum([])
+}
+
+# The AEAD of a TLS 1.3 suite with a traffic key.
+def aead_tls13(c: CipherSuiteTLS13, key: [Byte], iv: [Byte]) -> RecordAead {
+  return aead_chacha20_poly1305(key, iv) if c.chacha
+  aead_aes_gcm_tls13(key, iv)
+}
+
+# A handshake transcript hash (Go keeps a hash.Hash and clones it with
+# hash.Cloner). alx's hashes keep their state in shared storage, so a copy
+# isn't a clone; this keeps the messages and hashes them on demand, so a
+# copy is an independent clone. It is a hash.Hash.
+struct Transcript {
+  hash: crypto.Hash
+  data: [Byte]
+
+  def write!(p: [Byte]) -> ~Int {
+    self.data = data + p
+    p.size
+  }
+
+  def sum(b: [Byte]) -> [Byte] {
+    h = self.hash.new
+    h.write!(data)
+    h.sum(b)
+  }
+
+  def reset! {
+    self.data = []
+  }
+
+  def size -> Int { self.hash.size }
+  def block_size -> Int { 64 }
+}
+
+def new_transcript(h: crypto.Hash) -> Transcript { Transcript.new(hash: h) }

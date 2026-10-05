@@ -1,4 +1,5 @@
 import "bufio"
+import "crypto/tls"
 import "net"
 import "sync"
 
@@ -12,6 +13,8 @@ struct Ctl {
   idle: Map[Int, net.Conn]
   # Every open connection (close_client_connections closes them).
   all: Map[Int, net.Conn]
+  # Go's Server.TLSConfig: the base configuration for serve_tls.
+  tls_config: tls.Config?
 }
 
 # An HTTP/1.1 server: one task per connection, keep-alive, a handler per
@@ -22,7 +25,7 @@ struct Ctl {
 # connection's task: state it needs to share across requests belongs in a
 # Mutex, an Atomic or a channel, not in captured variables.
 #
-# Gaps: no read/write timeouts (the net package has no deadlines), no TLS, no
+# Gaps: no read/write timeouts (the net package has no deadlines), no
 # HTTP/2, no hijacking, no streaming of request bodies (a body is read in full
 # before the handler runs), no `Expect: 100-continue`. A handler that panics
 # kills its connection's task, not the server; the connection is not closed and
@@ -35,6 +38,41 @@ pub struct Server {
   # Accepts connections on `ln` until `shutdown` (then returns ok) or the
   # listener fails.
   pub def serve(ln: net.Listener) -> ~Unit {
+    self.~serve_with(ln, none)
+  }
+
+  # Listens on addr ("host:port") and serves.
+  pub def listen_and_serve(addr: Str) -> ~Unit {
+    ln = ~net.listen("tcp", addr)
+    self.~serve(ln)
+  }
+
+  # Go's Server.TLSConfig = cfg: the base configuration for serve_tls.
+  pub def set_tls_config(cfg: tls.Config) {
+    c = cfg
+    ctl.lock { |s| s.tls_config = c }
+  }
+
+  # Go's ServeTLS: serves HTTPS on `ln`. The configuration is the one from
+  # set_tls_config (or the defaults) with the certificate and key from the
+  # PEM files added when cert_file is not ""; "http/1.1" is offered over ALPN
+  # when it sets no protocols.
+  pub def serve_tls(ln: net.Listener, cert_file: Str, key_file: Str) -> ~Unit {
+    cfg = ctl.lock { |c| c.tls_config } || tls.Config.new
+    if cert_file != "" || key_file != "" {
+      cfg.certificates = cfg.certificates + [~tls.load_x509_key_pair(cert_file, key_file)]
+    }
+    cfg.next_protos = ["http/1.1"] if cfg.next_protos.size == 0
+    self.~serve_with(ln, cfg)
+  }
+
+  # Go's ListenAndServeTLS.
+  pub def listen_and_serve_tls(addr: Str, cert_file: Str, key_file: Str) -> ~Unit {
+    ln = ~net.listen("tcp", addr)
+    self.~serve_tls(ln, cert_file, key_file)
+  }
+
+  def serve_with(ln: net.Listener, tls_cfg: tls.Config?) -> ~Unit {
     ctl.lock { |c| c.listeners << ln }
     loop {
       accepted = ln.accept
@@ -47,14 +85,12 @@ pub struct Server {
       conn = accepted.unwrap
       wg.add(1)
       s = self
-      spawn { serve_conn(conn, s) }
+      tc: tls.Config? = none
+      if t = tls_cfg {
+        tc = t.dup
+      }
+      spawn { serve_conn(conn, s, tc) }
     }
-  }
-
-  # Listens on addr ("host:port") and serves.
-  pub def listen_and_serve(addr: Str) -> ~Unit {
-    ln = ~net.listen("tcp", addr)
-    self.~serve(ln)
   }
 
   def shutting? -> Bool {
@@ -126,11 +162,23 @@ pub def listen_and_serve(addr: Str, mux: ServeMux) -> ~Unit {
   s.~listen_and_serve(addr)
 }
 
+# Serves HTTPS for `mux` on an existing listener (Go's ServeTLS).
+pub def serve_tls(ln: net.Listener, mux: ServeMux, cert_file: Str, key_file: Str) -> ~Unit {
+  s = new_server(mux)
+  s.~serve_tls(ln, cert_file, key_file)
+}
+
+# Listens on addr and serves HTTPS for `mux` (Go's ListenAndServeTLS).
+pub def listen_and_serve_tls(addr: Str, cert_file: Str, key_file: Str, mux: ServeMux) -> ~Unit {
+  s = new_server(mux)
+  s.~listen_and_serve_tls(addr, cert_file, key_file)
+}
+
 ERROR_HEADERS = "\r\nContent-Type: text/plain; charset=utf-8\r\nConnection: close\r\n\r\n"
 
 # Answers a request that couldn't be read, as Go's conn.serve does; network
 # read errors get no answer.
-def write_error_reply(conn: net.Conn, e: Error) {
+def write_error_reply(conn: Wire, e: Error) {
   msg = ""
   case e {
     HeadersTooLarge => msg = "HTTP/1.1 431 Request Header Fields Too Large" + ERROR_HEADERS + "431 Request Header Fields Too Large"
@@ -143,9 +191,52 @@ def write_error_reply(conn: net.Conn, e: Error) {
     net.NetError.Closed => msg = ""
     net.NetError.BadAddr => msg = ""
     net.NetError.Other => msg = ""
+    tls.TlsError.Msg(_) => msg = ""
+    tls.TlsError.LocalAlert(_) => msg = ""
+    tls.TlsError.RemoteAlert(_) => msg = ""
+    tls.TlsError.Alert(_) => msg = ""
+    tls.TlsError.RecordHeader(_, _) => msg = ""
+    tls.TlsError.Eof => msg = ""
     _ => msg = "HTTP/1.1 400 Bad Request" + ERROR_HEADERS + "400 Bad Request"
   }
-  conn.write_string!(msg) if msg.size > 0
+  w = conn
+  w.write!(msg.bytes) if msg.size > 0
+}
+
+# A served connection: the TCP connection, and the TLS connection over it
+# for serve_tls.
+struct Wire {
+  conn: net.Conn
+  tls_conn: tls.Conn?
+
+  def read!(p: [Byte]) -> ~Int {
+    if t = tls_conn {
+      tc = t
+      return tc.~read!(p)
+    }
+    c = conn
+    c.~read!(p)
+  }
+
+  def write!(p: [Byte]) -> ~Int {
+    if t = tls_conn {
+      tc = t
+      return tc.~write!(p)
+    }
+    c = conn
+    c.~write!(p)
+  }
+
+  def close! {
+    if t = tls_conn {
+      tc = t
+      tc.close!
+    } else {
+      c = conn
+      c.close!
+    }
+    nil
+  }
 }
 
 # Go's httpguts.ValidHostHeader: no byte outside the URI host characters.
@@ -176,21 +267,34 @@ def server_check(req: Request) -> HttpError? {
   none
 }
 
-def serve_conn(conn: net.Conn, srv: Server) {
+def serve_conn(tcp: net.Conn, srv: Server, tls_config: tls.Config?) {
   defer srv.wg.done
+  tcp.set_nodelay(true)
+  conn = Wire.new(conn: tcp)
+  tls_state: tls.ConnectionState? = none
+  if cfg = tls_config {
+    tc = tls.server(tcp, cfg)
+    # (Go handshakes in conn.serve too; a failed handshake just closes.)
+    if tc.handshake!.err? {
+      t = tcp
+      t.close!
+      return
+    }
+    conn = Wire.new(conn: tcp, tls_conn: tc)
+    tls_state = tc.connection_state
+  }
   defer conn.close!
-  conn.set_nodelay(true)
   br = bufio.new_reader(conn)
-  fd = conn.fd
+  fd = tcp.fd
   last_post = false
   # A connection that hasn't sent its first request yet is idle too:
   # shutdown closes it rather than waiting for it.
   late = srv.ctl.lock { |c|
-    c.all[fd] = conn
+    c.all[fd] = tcp
     if c.shutting {
       true
     } else {
-      c.idle[fd] = conn
+      c.idle[fd] = tcp
       false
     }
   }
@@ -212,7 +316,8 @@ def serve_conn(conn: net.Conn, srv: Server) {
       break
     }
     req.header.del_raw!("Host")
-    req.remote_addr = conn.remote_addr
+    req.remote_addr = tcp.remote_addr
+    req.tls_state = tls_state
     last_post = req.method == "POST"
     srv.ctl.lock { |c| c.idle.delete(fd) }
     http10 = req.proto == "HTTP/1.0"
@@ -226,7 +331,7 @@ def serve_conn(conn: net.Conn, srv: Server) {
       break
     }
     if expect.size > 0 && req.proto_at_least?(1, 1) && req.content_length != 0 {
-      conn.write_string!("HTTP/1.1 100 Continue\r\n\r\n")
+      conn.write!("HTTP/1.1 100 Continue\r\n\r\n".bytes)
     }
     body = read_request_body(br, req)
     if e = body.err {
@@ -279,7 +384,7 @@ def serve_conn(conn: net.Conn, srv: Server) {
         if c.shutting {
           true
         } else {
-          c.idle[fd] = conn
+          c.idle[fd] = tcp
           false
         }
       }

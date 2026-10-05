@@ -1,0 +1,197 @@
+# The TLS 1.0-1.2 pseudo-random functions and Finished hashes (Go's prf.go
+# and crypto/internal/fips140/tls12).
+
+import "crypto"
+import "crypto/hmac"
+import "hash"
+
+def hash_ctor(h: crypto.Hash) -> () -> hash.Hash { ->() -> hash.Hash { h.new } }
+
+# Go's pHash: fills result with HMAC(secret) expansions of seed.
+def p_hash(result: [Byte], secret: [Byte], seed: [Byte], h: crypto.Hash) {
+  m = hmac.new(hash_ctor(h), secret)
+  m.write!(seed)
+  a = m.sum([])
+  j = 0
+  while j < result.size {
+    m.reset!
+    m.write!(a)
+    m.write!(seed)
+    b = m.sum([])
+    n = b.size
+    n = result.size - j if n > result.size - j
+    copy(result[j...j + n], b[0...n])
+    j += b.size
+    m.reset!
+    m.write!(a)
+    a = m.sum([])
+  }
+  nil
+}
+
+def split_pre_master_secret(secret: [Byte]) -> ([Byte], [Byte]) {
+  (secret[0...(secret.size + 1) / 2], secret[secret.size / 2...secret.size])
+}
+
+# Go's prf10: the TLS 1.0 PRF (MD5 xor SHA-1).
+def prf10(secret: [Byte], label: Str, seed: [Byte], key_len: Int) -> [Byte] {
+  result = [0.as_u8; key_len]
+  label_and_seed = label.bytes + seed
+  s1, s2 = split_pre_master_secret(secret)
+  p_hash(result, s1, label_and_seed, crypto.Hash.MD5)
+  result2 = [0.as_u8; key_len]
+  p_hash(result2, s2, label_and_seed, crypto.Hash.SHA1)
+  i = 0
+  while i < key_len {
+    result[i] = result[i] ^ result2[i]
+    i += 1
+  }
+  result
+}
+
+# Go's tls12.PRF.
+def prf12(h: crypto.Hash, secret: [Byte], label: Str, seed: [Byte], key_len: Int) -> [Byte] {
+  result = [0.as_u8; key_len]
+  p_hash(result, secret, label.bytes + seed, h)
+  result
+}
+
+MASTER_SECRET_LENGTH = 48
+FINISHED_VERIFY_LENGTH = 12
+MASTER_SECRET_LABEL = "master secret"
+EXTENDED_MASTER_SECRET_LABEL = "extended master secret"
+KEY_EXPANSION_LABEL = "key expansion"
+CLIENT_FINISHED_LABEL = "client finished"
+SERVER_FINISHED_LABEL = "server finished"
+
+# A version's PRF (Go's prfFunc): TLS 1.0/1.1's, or TLS 1.2's with a hash.
+struct Prf {
+  tls12: Bool
+  hash: crypto.Hash
+
+  def call(secret: [Byte], label: Str, seed: [Byte], key_len: Int) -> [Byte] {
+    return prf12(hash, secret, label, seed, key_len) if tls12
+    prf10(secret, label, seed, key_len)
+  }
+}
+
+# Go's prfAndHashForVersion: the PRF, and the hash (none for TLS 1.0/1.1).
+def prf_and_hash_for_version(version: U16, suite: CipherSuiteImpl) -> (Prf, crypto.Hash?) {
+  if version == VERSION_TLS10 || version == VERSION_TLS11 {
+    return (Prf.new(tls12: false, hash: crypto.Hash.SHA1), none)
+  }
+  if version != VERSION_TLS12 {
+    panic("unknown version")
+  }
+  if suite.flags & SUITE_SHA384 != 0 {
+    return (Prf.new(tls12: true, hash: crypto.Hash.SHA384), crypto.Hash.SHA384)
+  }
+  (Prf.new(tls12: true, hash: crypto.Hash.SHA256), crypto.Hash.SHA256)
+}
+
+def prf_for_version(version: U16, suite: CipherSuiteImpl) -> Prf { prf_and_hash_for_version(version, suite)[0] }
+
+def master_from_pre_master_secret(version: U16, suite: CipherSuiteImpl, pre_master_secret: [Byte], client_random: [Byte], server_random: [Byte]) -> [Byte] {
+  prf_for_version(version, suite).call(pre_master_secret, MASTER_SECRET_LABEL, client_random + server_random, MASTER_SECRET_LENGTH)
+}
+
+def ext_master_from_pre_master_secret(version: U16, suite: CipherSuiteImpl, pre_master_secret: [Byte], transcript: [Byte]) -> [Byte] {
+  prf_for_version(version, suite).call(pre_master_secret, EXTENDED_MASTER_SECRET_LABEL, transcript, MASTER_SECRET_LENGTH)
+}
+
+# The connection keys: client MAC, server MAC, client key, server key,
+# client IV, server IV.
+struct KeyBlock {
+  client_mac: [Byte]
+  server_mac: [Byte]
+  client_key: [Byte]
+  server_key: [Byte]
+  client_iv: [Byte]
+  server_iv: [Byte]
+}
+
+def keys_from_master_secret(version: U16, suite: CipherSuiteImpl, master_secret: [Byte], client_random: [Byte], server_random: [Byte], mac_len: Int, key_len: Int, iv_len: Int) -> KeyBlock {
+  n = 2 * mac_len + 2 * key_len + 2 * iv_len
+  km = prf_for_version(version, suite).call(master_secret, KEY_EXPANSION_LABEL, server_random + client_random, n)
+  o = 0
+  cm = km[o...o + mac_len]
+  o += mac_len
+  sm = km[o...o + mac_len]
+  o += mac_len
+  ck = km[o...o + key_len]
+  o += key_len
+  sk = km[o...o + key_len]
+  o += key_len
+  ci = km[o...o + iv_len]
+  o += iv_len
+  si = km[o...o + iv_len]
+  KeyBlock.new(client_mac: cm, server_mac: sm, client_key: ck, server_key: sk, client_iv: ci, server_iv: si)
+}
+
+# Go's finishedHash: the running hash of the handshake messages, for the
+# Finished messages and TLS 1.2 client certificate signatures.
+struct FinishedHash {
+  client: hash.Hash
+  server: hash.Hash
+  client_md5: hash.Hash
+  server_md5: hash.Hash
+  # The handshake messages so far, while a client certificate signature may
+  # still need them (Go: nil once discarded, or before TLS 1.2).
+  buffer: [Byte]
+  keep_buffer: Bool
+  version: U16
+  prf: Prf
+
+  def write!(msg: [Byte]) -> ~Int {
+    self.client.write!(msg)
+    self.server.write!(msg)
+    if version < VERSION_TLS12 {
+      self.client_md5.write!(msg)
+      self.server_md5.write!(msg)
+    }
+    self.buffer = buffer + msg if keep_buffer
+    msg.size
+  }
+
+  def sum -> [Byte] {
+    return client.sum([]) if version >= VERSION_TLS12
+    client_md5.sum([]) + client.sum([])
+  }
+
+  def client_sum(master_secret: [Byte]) -> [Byte] { prf.call(master_secret, CLIENT_FINISHED_LABEL, self.sum, FINISHED_VERIFY_LENGTH) }
+
+  def server_sum(master_secret: [Byte]) -> [Byte] { prf.call(master_secret, SERVER_FINISHED_LABEL, self.sum, FINISHED_VERIFY_LENGTH) }
+
+  # The hash to be signed for client certificates (TLS 1.0/1.1).
+  def hash_for_client_certificate(sig_type: Byte) -> [Byte] {
+    return server.sum([]) if sig_type == SIGNATURE_ECDSA
+    self.sum
+  }
+
+  def discard_handshake_buffer! {
+    self.keep_buffer = false
+    self.buffer = []
+  }
+}
+
+def new_finished_hash(version: U16, suite: CipherSuiteImpl) -> FinishedHash {
+  p, h = prf_and_hash_for_version(version, suite)
+  if hh = h {
+    return FinishedHash.new(client: hh.new, server: hh.new, client_md5: hh.new, server_md5: hh.new, keep_buffer: version >= VERSION_TLS12, version: version, prf: p)
+  }
+  FinishedHash.new(client: crypto.Hash.SHA1.new, server: crypto.Hash.SHA1.new, client_md5: crypto.Hash.MD5.new, server_md5: crypto.Hash.MD5.new, keep_buffer: false, version: version, prf: p)
+}
+
+# Go's ekmFromMasterSecret: RFC 5705 keying material from a TLS 1.0-1.2
+# master secret. context none is Go's nil context.
+def ekm_from_master_secret(version: U16, suite: CipherSuiteImpl, master_secret: [Byte], client_random: [Byte], server_random: [Byte], label: Str, context: [Byte]?, length: Int) -> ~[Byte]<TlsError> {
+  if label == "client finished" || label == "server finished" || label == "master secret" || label == "key expansion" {
+    fail TlsError.Msg("crypto/tls: reserved ExportKeyingMaterial label: " + label)
+  }
+  seed = client_random + server_random
+  if c = context {
+    fail TlsError.Msg("crypto/tls: ExportKeyingMaterial context too long") if c.size >= 1 << 16
+    seed = seed + [(c.size >> 8).as_u8, c.size.as_u8] + c
+  }
+  prf_for_version(version, suite).call(master_secret, label, seed, length)
+}

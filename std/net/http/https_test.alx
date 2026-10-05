@@ -1,0 +1,62 @@
+# HTTPS over loopback: Server.serve_tls with a certificate from PEM files,
+# Client.tls_config trusting its root (Go's test certificates from
+# crypto/tls/testdata/certs, valid at their fixed test time).
+
+import "crypto/tls"
+import "crypto/x509"
+import "net"
+import "os"
+import "time"
+
+CERTS = "../../crypto/tls/testdata/certs/"
+
+def https_client_config -> tls.Config {
+  pool = x509.new_cert_pool()
+  pool.append_certs_from_pem!(os.read_file(CERTS + "root.pem").unwrap)
+  tls.Config.new(root_cas: pool, server_name: "test.golang.example", time: ->() -> time.Time { time.unix(1476984729, 0) })
+}
+
+test "https get and post" {
+  mux = new_serve_mux
+  mux.handle_func("/hello") { |w, r|
+    v = "none"
+    if st = r.tls_state {
+      v = tls.version_name(st.version) + " " + st.negotiated_protocol
+    }
+    w.write_string!("hello over #{v}: #{r.method} #{Str.from_bytes(r.body)}").unwrap
+  }
+  srv = new_server(mux)
+  ln = net.listen("tcp", "127.0.0.1:0").unwrap
+  port = ln.port
+  pem = CERTS + "ecdsa_p256.pem"
+  task = spawn { srv.serve_tls(ln, pem, pem) }
+  c = new_client
+  c.tls_config = https_client_config()
+  r = c.get("https://127.0.0.1:#{port}/hello").unwrap
+  assert_eq r.status, 200
+  assert_eq Str.from_bytes(r.body), "hello over TLS 1.3 : GET "
+  r2 = c.post("https://127.0.0.1:#{port}/hello", "text/plain", "body").unwrap
+  assert_eq Str.from_bytes(r2.body), "hello over TLS 1.3 : POST body"
+  # TLS 1.2, ALPN.
+  cfg = https_client_config()
+  cfg.max_version = tls.VERSION_TLS12
+  cfg.next_protos = ["http/1.1"]
+  c.tls_config = cfg
+  r3 = c.get("https://127.0.0.1:#{port}/hello").unwrap
+  assert_eq Str.from_bytes(r3.body), "hello over TLS 1.2 http/1.1: GET "
+  # An untrusted server certificate fails the request.
+  c.tls_config = tls.Config.new(server_name: "test.golang.example")
+  bad = c.get("https://127.0.0.1:#{port}/hello")
+  assert bad.err?
+  # Plain HTTP to the TLS port gets no HTTP answer.
+  assert get("http://127.0.0.1:#{port}/hello").err?
+  srv.shutdown
+  task.wait.unwrap
+}
+
+test "parse https url" {
+  u = parse_url("https://example.com/p").unwrap
+  assert_eq u.port, 443
+  assert_eq u.host_header, "example.com"
+  assert_eq parse_url("https://example.com:8443/").unwrap.host_header, "example.com:8443"
+}

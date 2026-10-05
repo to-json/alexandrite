@@ -1,0 +1,270 @@
+# Package tls: Go's crypto/tls, TLS 1.2 and TLS 1.3 (RFC 5246, RFC 8446)
+# clients and servers (TLS 1.0/1.1 when enabled with min_version), over
+# std/net connections or any Transport.
+#
+#   Go                                        alx
+#   tls.Client(conn, config) / Server         client(conn, config) / server(conn, config) -> Conn
+#     (any net.Conn)                          client_transport(t, config) / server_transport(t, config)
+#   tls.Dial(network, addr, config)           dial(network, addr, config) -> ~Conn
+#   tls.Listen / NewListener                  listen(network, addr, config) -> ~Listener / new_listener(ln, config)
+#   ln.Accept() (net.Conn, error)             ln.accept -> ~Conn (the handshake runs on first use)
+#   c.Handshake() / Read / Write / Close      c.handshake! / read! / write! / close! / close_write!
+#   c.ConnectionState()                       c.connection_state -> ConnectionState
+#   cs.ExportKeyingMaterial(label, ctx, n)    cs.export_keying_material(label, ctx: [Byte]?, n)
+#   c.VerifyHostname(h) / OCSPResponse()      c.verify_hostname(h) / c.ocsp_response
+#   c.NetConn()                               c.transport (a Transport)
+#   Config{...} (Go's field names)            Config.new(...) (snake_case fields; see common.alx)
+#   Certificate{Certificate, PrivateKey, ...} Certificate{certificate, private_key: x509.PrivateKey, ...}
+#   X509KeyPair / LoadX509KeyPair             x509_key_pair(cert_pem, key_pem) / load_x509_key_pair(cert_file, key_file)
+#   CipherSuites / InsecureCipherSuites       cipher_suites / insecure_cipher_suites -> [CipherSuite]
+#   CipherSuiteName / VersionName             cipher_suite_name / version_name
+#   VersionTLS12, TLS_AES_128_GCM_SHA256 ...  VERSION_TLS12, TLS_AES_128_GCM_SHA256 ... (U16)
+#   CurveID / SignatureScheme (uint16)        U16 constants: X25519, CURVE_P256, X25519_MLKEM768, ...,
+#                                             PSS_WITH_SHA256, ED25519, ...; curve_id_string / signature_scheme_string
+#   ClientAuthType / RenegotiationSupport     NO_CLIENT_CERT ... / RENEGOTIATE_NEVER ...
+#   NewLRUClientSessionCache(n)               new_lru_client_session_cache(n)
+#   SessionState / ParseSessionState          SessionState (bytes) / parse_session_state
+#   NewResumptionState / ClientSessionState   new_resumption_state / ClientSessionState
+#   Config.EncryptTicket / DecryptTicket      encrypt_session_ticket(config, ss) / decrypt_session_ticket(config, ticket)
+#   errors (alerts, RecordHeaderError, ...)   TlsError (Go's messages)
+#
+# Differences from Go:
+#   - A Conn isn't safe for concurrent use: Go lets one goroutine Read
+#     while another Writes; here one task at a time does either.
+#   - Conn.read! returns 0 at the end of the stream (the peer's
+#     close_notify, or EOF at a record boundary), alx's io convention.
+#   - No QUIC (QUICConn), no Encrypted Client Hello (ECH configs, keys and
+#     rejection errors), no 0-RTT, no GetConfigForClient (a Config can't
+#     hold a function returning a Config: it would contain itself), no
+#     GetEncryptedClientHelloKeys, no context-aware handshakes, no
+#     deadlines (std/net has none).
+#   - Keys are x509.PrivateKey values (an enum of RSA, ECDSA, Ed25519,
+#     ECDH, ML-DSA keys), not any crypto.Signer: alx has no type
+#     assertions to ask a key what it implements.
+#   - ClientHelloInfo carries the peer address instead of the net.Conn and
+#     has no Context; its supports_certificate uses an empty Config (Go
+#     uses the server's).
+#   - The session ticket keys of a Config live in shared state made by
+#     `config.prepare!` (client, server, listen and new_listener call it):
+#     every connection made from copies taken after it shares the
+#     automatically rotated keys, as connections sharing a Go *Config do.
+#   - CertificateVerificationError is TlsError.Msg with Go's text ("tls:
+#     failed to verify certificate: ..."); the unverified certificates are
+#     in the connection state's peer certificates instead.
+#   - No GODEBUG: SHA-1 signatures in TLS 1.2 handshakes are disabled
+#     (Go's default tlssha1=0); X25519MLKEM768 and the SecP*MLKEM hybrids
+#     are enabled by default as in Go 1.27; no FIPS 140 mode; the maximum
+#     RSA key size is 8192 bits.
+#   - AES-GCM is treated as not hardware-accelerated (alx's AES is
+#     software; Go asks the CPU): ChaCha20-Poly1305 comes first in the
+#     client's preferences and the server prefers it unless the client
+#     puts AES-GCM first, as Go does on CPUs without AES instructions (and
+#     as Go's own tests force).
+#   - Config.rand and Config.key_log_writer are functions (`([Byte]) ->
+#     ~Int`, reading into / writing their argument), not io.Reader /
+#     io.Writer values: a Conn is itself an io.Reader and io.Writer (for
+#     bufio and net/http), and a type can't hold the interface it
+#     implements.
+#   - net/http: Client.tls_config, Server.serve_tls / listen_and_serve_tls
+#     / set_tls_config, Request.tls_state (std/net/http).
+#   - The Lucky13 countermeasures of the CBC suites (Go's constant-time
+#     MAC over extra data) aren't reproduced; the padding check is
+#     constant time.
+#   - The record layer builds new slices (Go reuses buffers from a pool).
+
+import "crypto/x509"
+import "encoding/pem"
+import "net"
+import "os"
+
+# A client-side TLS connection over conn (Go's tls.Client).
+pub def client(conn: net.Conn, config: Config) -> Conn { new_conn(net_transport(conn), config, true) }
+
+# A server-side TLS connection over conn (Go's tls.Server).
+pub def server(conn: net.Conn, config: Config) -> Conn { new_conn(net_transport(conn), config, false) }
+
+# A client over any transport.
+pub def client_transport(t: Transport, config: Config) -> Conn { new_conn(t, config, true) }
+
+# A server over any transport.
+pub def server_transport(t: Transport, config: Config) -> Conn { new_conn(t, config, false) }
+
+# Connects to addr and handshakes (Go's Dial). If config.server_name is
+# empty, the host part of addr is used.
+pub def dial(network: Str, addr: Str, config: Config) -> ~Conn {
+  cfg = config
+  if cfg.server_name == "" {
+    host, _ = ~split_host_port_tls(addr)
+    cfg.server_name = host
+  }
+  raw = net.~dial(network, addr)
+  c = client(raw, cfg)
+  r = c.handshake!
+  if e = r.err {
+    raw.close!
+    fail e
+  }
+  c
+}
+
+def split_host_port_tls(addr: Str) -> ~(Str, Str) { net.~split_host_port(addr) }
+
+# A TLS listener (Go's tls.listener): accepted connections are servers.
+pub struct Listener {
+  inner: net.Listener
+  config: Config
+
+  # The next connection; its handshake runs on the first read, write or
+  # handshake!.
+  pub def accept -> ~Conn {
+    c = inner.~accept
+    server(c, config.dup)
+  }
+
+  pub def close! -> ~Unit {
+    l = inner
+    l.~close!
+  }
+
+  pub def addr -> Str { inner.addr }
+  pub def port -> Int { inner.port }
+  pub def net_listener -> net.Listener { inner }
+}
+
+# Go's NewListener.
+pub def new_listener(inner: net.Listener, config: Config) -> Listener {
+  cfg = config
+  cfg.prepare!
+  Listener.new(inner: inner, config: cfg)
+}
+
+# Go's Listen: the config must have certificates (or get_certificate).
+pub def listen(network: Str, laddr: Str, config: Config) -> ~Listener {
+  if config.certificates.size == 0 && config.get_certificate.none? {
+    fail TlsError.Msg("tls: neither Certificates, GetCertificate, nor GetConfigForClient set in Config")
+  }
+  l = net.~listen(network, laddr)
+  new_listener(l, config)
+}
+
+# Go's LoadX509KeyPair.
+pub def load_x509_key_pair(cert_file: Str, key_file: Str) -> ~Certificate {
+  cert_pem = os.~read_file(cert_file)
+  key_pem = os.~read_file(key_file)
+  ~x509_key_pair(cert_pem, key_pem)
+}
+
+# Go's X509KeyPair: a certificate chain and key from PEM data.
+pub def x509_key_pair(cert_pem0: [Byte], key_pem0: [Byte]) -> ~Certificate {
+  cert = Certificate.new
+  skipped: [Str] = []
+  rest = cert_pem0
+  loop {
+    blk, r = pem.decode(rest)
+    rest = r
+    if b = blk {
+      if b.type == "CERTIFICATE" {
+        cert.certificate << b.bytes
+      } else {
+        skipped << b.type
+      }
+    } else {
+      break
+    }
+  }
+  if cert.certificate.size == 0 {
+    fail TlsError.Msg("tls: failed to find any PEM data in certificate input") if skipped.size == 0
+    if skipped.size == 1 && skipped[0].end_with?("PRIVATE KEY") {
+      fail TlsError.Msg("tls: failed to find certificate PEM data in certificate input, but did find a private key; PEM inputs may have been switched")
+    }
+    fail TlsError.Msg("tls: failed to find \"CERTIFICATE\" PEM block in certificate input after skipping PEM blocks of the following types: [" + skipped.join(" ") + "]")
+  }
+  skipped = []
+  krest = key_pem0
+  key_der: [Byte] = []
+  loop {
+    kblk, kr = pem.decode(krest)
+    krest = kr
+    if b = kblk {
+      if b.type == "PRIVATE KEY" || b.type.end_with?(" PRIVATE KEY") {
+        key_der = b.bytes
+        break
+      }
+      skipped << b.type
+    } else {
+      fail TlsError.Msg("tls: failed to find any PEM data in key input") if skipped.size == 0
+      fail TlsError.Msg("tls: found a certificate rather than a key in the PEM for the private key") if skipped.size == 1 && skipped[0] == "CERTIFICATE"
+      fail TlsError.Msg("tls: failed to find PEM block with type ending in \"PRIVATE KEY\" in key input after skipping PEM blocks of the following types: [" + skipped.join(" ") + "]")
+    }
+  }
+  leaf = x509.~parse_certificate(cert.certificate[0])
+  cert.leaf = leaf
+  cert.private_key = ~parse_private_key(key_der)
+  pub_ok = false
+  type_ok = false
+  case leaf.public_key {
+    Rsa(p) => {
+      case cert.private_key {
+        Rsa(k) => {
+          type_ok = true
+          pub_ok = k.public_key.equal?(p)
+        }
+        _ => nil
+      }
+    }
+    Ecdsa(p) => {
+      case cert.private_key {
+        Ecdsa(k) => {
+          type_ok = true
+          pub_ok = k.public_key.equal?(p)
+        }
+        _ => nil
+      }
+    }
+    Ed25519(p) => {
+      case cert.private_key {
+        Ed25519(k) => {
+          type_ok = true
+          pub_ok = k.public_key.equal?(p)
+        }
+        _ => nil
+      }
+    }
+    MlDsa(p) => {
+      case cert.private_key {
+        MlDsa(k) => {
+          type_ok = true
+          pub_ok = k.public_key.equal?(p)
+        }
+        _ => nil
+      }
+    }
+    _ => {
+      fail TlsError.Msg("tls: unknown public key algorithm")
+    }
+  }
+  fail TlsError.Msg("tls: private key type does not match public key type") if !type_ok
+  fail TlsError.Msg("tls: private key does not match public key") if !pub_ok
+  cert
+}
+
+# Go's parsePrivateKey: PKCS #8, then PKCS #1, then SEC 1.
+def parse_private_key(der: [Byte]) -> ~x509.PrivateKey {
+  r8 = x509.parse_pkcs8_private_key(der)
+  if k = r8.ok {
+    case k {
+      Ecdh(_) => {
+        fail TlsError.Msg("tls: found unknown private key type in PKCS#8 wrapping")
+      }
+      _ => nil
+    }
+    return k
+  }
+  if k1 = x509.parse_pkcs1_private_key(der).ok {
+    return x509.PrivateKey.Rsa(k1)
+  }
+  if ke = x509.parse_ec_private_key(der).ok {
+    return x509.PrivateKey.Ecdsa(ke)
+  }
+  fail TlsError.Msg("tls: failed to parse private key: " + (r8.err?.message || ""))
+}

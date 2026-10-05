@@ -1,0 +1,259 @@
+# Go's handshake_server_test.go: the recorded server transcripts
+# (testdata/Server-*), replayed byte for byte, and the ClientHello tests.
+#
+# Not translated (and why): BenchmarkHandshakeServer (see the perf
+# programs), the OpenSSL-driven -update mode, TestHandshakeServerGet*
+# extensions checks that inspect ClientHelloInfo.Conn / Context, the
+# GetConfigForClient tests (no GetConfigForClient), the ECH and QUIC tests.
+
+import "encoding/pem"
+import "os"
+
+struct ServerTest {
+  name: Str
+  config: Config?
+  expected_peer_certs: [Str]
+  expect_handshake_error_including: Str
+  validate: (ConnectionState) -> Str
+
+  def run(version: Str) -> Str {
+    base = config || test_config_server()
+    st = [ReplayState.new(flows: parse_test_data("Server-" + version + "-" + name), reading: true)]
+    srv = server_transport(replaying_transport(st), replay_config(base))
+    errs: [Str] = []
+    w = srv.write!("hello, world\n".bytes)
+    if expect_handshake_error_including != "" {
+      if e = w.err {
+        errs << "Error expected containing '" + expect_handshake_error_including + "' but got '" + e.message + "'" if !strings_contains(e.message, expect_handshake_error_including)
+      } else {
+        errs << "Error expected, but no error returned"
+      }
+    } else if e = w.err {
+      errs << "Error from Server.Write: '" + e.message + "'"
+    }
+    srv.close!
+    cs = srv.connection_state
+    if cs.peer_certificates.size == expected_peer_certs.size {
+      i = 0
+      for pc in cs.peer_certificates {
+        blk, _ = pem.decode(os.read_file("testdata/certs/" + expected_peer_certs[i] + ".pem").unwrap)
+        errs << "mismatch on peer cert #{i + 1}" if (blk || pem.Block.new).bytes != pc.raw
+        i += 1
+      }
+    } else {
+      errs << "mismatch on peer list length: #{expected_peer_certs.size} (wanted) != #{cs.peer_certificates.size} (got)"
+    }
+    if errs.size == 0 {
+      v = validate.call(cs)
+      errs << "validate callback returned error: " + v if v != ""
+    }
+    for e in st[0].errors {
+      errs << e
+    }
+    errs.join("; ")
+  }
+}
+
+def strings_contains(s: Str, sub: Str) -> Bool { s.include?(sub) }
+
+def stest(name: Str, config: Config?, validate: (ConnectionState) -> Str) -> ServerTest { ServerTest.new(name: name, config: config, validate: validate) }
+
+def server_with_suites(suites: [U16]) -> Config {
+  c = test_config_server()
+  c.cipher_suites = suites
+  c
+}
+
+def server_run_all(t0: ServerTest, versions: [Str]) {
+  t = t0
+  for v in versions {
+    cfg = t.config || test_config_server()
+    if v == "TLSv10" || v == "TLSv11" {
+      cfg.min_version = (v == "TLSv10" ? VERSION_TLS10 : VERSION_TLS11) if cfg.min_version == 0
+      t.config = cfg
+    }
+    r = t.run(v)
+    assert r == "", v + "-" + t.name + ": " + r
+  }
+}
+
+def check_server_name(want: Str) -> (ConnectionState) -> Str {
+  ->(cs: ConnectionState) -> Str { cs.server_name == want ? "" : "got ServerName " + cs.server_name + ", want " + want }
+}
+
+def check_protocol(want: Str) -> (ConnectionState) -> Str {
+  ->(cs: ConnectionState) -> Str { cs.negotiated_protocol == want ? "" : "got protocol " + cs.negotiated_protocol + ", want " + want }
+}
+
+def check_did_resume(want: Bool) -> (ConnectionState) -> Str {
+  ->(cs: ConnectionState) -> Str { cs.did_resume == want ? "" : "got DidResume #{cs.did_resume}, want #{want}" }
+}
+
+test "HandshakeServerRSARC4" { server_run_all(stest("RSA-RC4", server_with_suites([TLS_RSA_WITH_RC4_128_SHA]), check_suite(TLS_RSA_WITH_RC4_128_SHA)), ["TLSv10", "TLSv11", "TLSv12"]) }
+
+test "HandshakeServerRSA3DES" { server_run_all(stest("RSA-3DES", server_with_suites([TLS_RSA_WITH_3DES_EDE_CBC_SHA]), check_suite(TLS_RSA_WITH_3DES_EDE_CBC_SHA)), ["TLSv10", "TLSv12"]) }
+
+test "HandshakeServerRSAAES" { server_run_all(stest("RSA-AES", server_with_suites([TLS_RSA_WITH_AES_128_CBC_SHA]), check_suite(TLS_RSA_WITH_AES_128_CBC_SHA)), ["TLSv10", "TLSv12"]) }
+
+test "HandshakeServerAESGCM" { server_run_all(stest("RSA-AES-GCM", none, check_suite(TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256)), ["TLSv12"]) }
+
+test "HandshakeServerAES256GCMSHA384" { server_run_all(stest("RSA-AES256-GCM-SHA384", none, check_suite(TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384)), ["TLSv12"]) }
+
+test "HandshakeServerAES128SHA256" { server_run_all(stest("AES128-SHA256", none, check_suite(TLS_AES_128_GCM_SHA256)), ["TLSv13"]) }
+
+test "HandshakeServerAES256SHA384" { server_run_all(stest("AES256-SHA384", none, check_suite(TLS_AES_256_GCM_SHA384)), ["TLSv13"]) }
+
+test "HandshakeServerCHACHA20SHA256" { server_run_all(stest("CHACHA20-SHA256", none, check_suite(TLS_CHACHA20_POLY1305_SHA256)), ["TLSv13"]) }
+
+test "HandshakeServerECDHEECDSAAES" { server_run_all(stest("ECDHE-ECDSA-AES", none, no_check()), ["TLSv10", "TLSv12", "TLSv13"]) }
+
+test "HandshakeServerX25519" { server_run_all(stest("X25519", none, check_curve(X25519)), ["TLSv12", "TLSv13"]) }
+
+test "HandshakeServerP256" { server_run_all(stest("P256", none, check_curve(CURVE_P256)), ["TLSv12", "TLSv13"]) }
+
+test "HandshakeServerHelloRetryRequest" {
+  called = [false, false]
+  c = test_config_server()
+  c.curve_preferences = [CURVE_P256]
+  c.get_certificate = ->(chi: ClientHelloInfo) -> ~Certificate? {
+    cc = called
+    cc[0] = true
+    cc[1] = chi.hello_retry_request
+    none
+  }
+  server_run_all(stest("HelloRetryRequest", c, ->(cs: ConnectionState) -> Str {
+    return "expected HelloRetryRequest" if !cs.hello_retry_request
+    return "expected GetCertificate to be called" if !called[0]
+    return "expected ClientHelloInfo.HelloRetryRequest to be true" if !called[1]
+    ""
+    }), ["TLSv13"])
+}
+
+test "HandshakeServerKeySharePreference" {
+  called = [false, false]
+  c = test_config_server()
+  c.curve_preferences = [X25519, CURVE_P256]
+  first = c.certificates[0]
+  c.get_certificate = ->(chi: ClientHelloInfo) -> ~Certificate? {
+    cc = called
+    cc[0] = true
+    cc[1] = chi.hello_retry_request
+    first
+  }
+  server_run_all(stest("KeySharePreference", c, ->(cs: ConnectionState) -> Str {
+    return "unexpected HelloRetryRequest" if cs.hello_retry_request
+    return "expected GetCertificate to be called" if !called[0]
+    return "expected ClientHelloInfo.HelloRetryRequest to be false" if called[1]
+    ""
+    }), ["TLSv13"])
+}
+
+test "HandshakeServerALPN" {
+  c = test_config_server()
+  c.next_protos = ["proto1", "proto2"]
+  server_run_all(stest("ALPN", c, check_protocol("proto1")), ["TLSv12", "TLSv13"])
+}
+
+test "HandshakeServerALPNNoMatch" {
+  c = test_config_server()
+  c.next_protos = ["proto3"]
+  t = stest("ALPN-NoMatch", c, no_check())
+  t.expect_handshake_error_including = "client requested unsupported application protocol"
+  server_run_all(t, ["TLSv12", "TLSv13"])
+}
+
+test "HandshakeServerALPNNotConfigured" { server_run_all(stest("ALPN-NotConfigured", none, check_protocol("")), ["TLSv12", "TLSv13"]) }
+
+test "HandshakeServerALPNFallback" {
+  c = test_config_server()
+  c.next_protos = ["proto1", "h2", "proto2"]
+  server_run_all(stest("ALPN-Fallback", c, check_protocol("")), ["TLSv12", "TLSv13"])
+}
+
+test "HandshakeServerSNI" { server_run_all(stest("SNI", none, check_server_name("different.example.com")), ["TLSv12", "TLSv13"]) }
+
+test "HandshakeServerSNIGetCertificate" {
+  c = test_config_server()
+  sni = test_cert("sni")
+  c.get_certificate = ->(chi: ClientHelloInfo) -> ~Certificate? { sni }
+  server_run_all(stest("SNI-GetCertificate", c, check_server_name("different.example.com")), ["TLSv12", "TLSv13"])
+}
+
+test "HandshakeServerSNIGetCertificateNotFound" {
+  c = test_config_server()
+  c.get_certificate = ->(chi: ClientHelloInfo) -> ~Certificate? { none }
+  server_run_all(stest("SNI-GetCertificateNotFound", c, check_server_name("different.example.com")), ["TLSv12", "TLSv13"])
+}
+
+test "ServerResumption" {
+  issue = stest("IssueTicket", none, no_check())
+  resume = stest("Resume", none, check_did_resume(true))
+  server_run_all(issue, ["TLSv12"])
+  server_run_all(resume, ["TLSv12"])
+  server_run_all(issue, ["TLSv13"])
+  server_run_all(resume, ["TLSv13"])
+  c = test_config_server()
+  c.curve_preferences = [CURVE_P256]
+  server_run_all(stest("Resume-HelloRetryRequest", c, ->(cs: ConnectionState) -> Str {
+    return "did not resume" if !cs.did_resume
+    return "expected HelloRetryRequest" if !cs.hello_retry_request
+    ""
+    }), ["TLSv13"])
+}
+
+test "ServerResumptionDisabled" {
+  c = test_config_server()
+  c.session_tickets_disabled = false
+  server_run_all(stest("IssueTicketPreDisable", c, no_check()), ["TLSv12"])
+  c.session_tickets_disabled = true
+  server_run_all(stest("ResumeDisabled", c, check_did_resume(false)), ["TLSv12"])
+  c.session_tickets_disabled = false
+  server_run_all(stest("IssueTicketPreDisable", c, no_check()), ["TLSv13"])
+  c.session_tickets_disabled = true
+  server_run_all(stest("ResumeDisabled", c, check_did_resume(false)), ["TLSv13"])
+}
+
+test "FallbackSCSV" {
+  t = stest("FallbackSCSV", none, no_check())
+  t.expect_handshake_error_including = "inappropriate protocol fallback"
+  server_run_all(t, ["TLSv11"])
+}
+
+test "HandshakeServerExportKeyingMaterial" {
+  server_run_all(stest("ExportKeyingMaterial", none, ->(cs: ConnectionState) -> Str {
+    r = cs.export_keying_material("test", none, 42)
+    return "ExportKeyingMaterial failed: " + (r.err?.message || "") if !r.ok?
+    r.unwrap.size == 42 ? "" : "wrong size"
+    }), ["TLSv10", "TLSv12", "TLSv13"])
+}
+
+test "HandshakeServerRSAPKCS1v15" { server_run_all(stest("RSA-RSAPKCS1v15", none, no_check()), ["TLSv12"]) }
+
+test "HandshakeServerRSAPSS" {
+  c = test_config_server()
+  c.certificates = [test_cert("rsa1024")]
+  server_run_all(stest("RSA-RSAPSS", c, no_check()), ["TLSv12", "TLSv13"])
+  t = stest("RSA-RSAPSS-TooSmall", c, no_check())
+  t.expect_handshake_error_including = "peer doesn't support any of the certificate's signature algorithms"
+  server_run_all(t, ["TLSv13"])
+}
+
+test "HandshakeServerEd25519" { server_run_all(stest("Ed25519", none, no_check()), ["TLSv12", "TLSv13"]) }
+
+test "ClientAuth" {
+  c = test_config_server()
+  c.client_auth = REQUEST_CLIENT_CERT
+  server_run_all(stest("ClientAuthRequestedNotGiven", c, no_check()), ["TLSv12", "TLSv13"])
+  t = stest("ClientAuthRequestedAndGiven", c, no_check())
+  t.expected_peer_certs = ["client_rsa2048"]
+  server_run_all(t, ["TLSv12", "TLSv13"])
+  t2 = stest("ClientAuthRequestedAndECDSAGiven", c, no_check())
+  t2.expected_peer_certs = ["client_ecdsa_p256"]
+  server_run_all(t2, ["TLSv12", "TLSv13"])
+  t3 = stest("ClientAuthRequestedAndEd25519Given", c, no_check())
+  t3.expected_peer_certs = ["client_ed25519"]
+  server_run_all(t3, ["TLSv12", "TLSv13"])
+  t4 = stest("ClientAuthRequestedAndPKCS1v15Given", c, no_check())
+  t4.expected_peer_certs = ["client_rsa2048"]
+  server_run_all(t4, ["TLSv12"])
+}

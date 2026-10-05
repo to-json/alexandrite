@@ -1,0 +1,280 @@
+# Go's handshake_client_test.go: the recorded client transcripts
+# (testdata/Client-*), replayed byte for byte, and the tests that don't
+# need OpenSSL.
+#
+# Not translated (and why): the tests that drive OpenSSL live (-update
+# mode), TestClientHandshakeContextCancellation (no contexts),
+# TestTLS13ECHRejectionCallbacks / TestECHTLS12Server (no ECH),
+# TestHandshakeRace / TestCloseClientConnectionOnIdleServer (deadlines),
+# TestFailedWrite (a net.Conn whose Write fails partway: covered by the
+# replay write-mismatch path).
+
+import "crypto/x509"
+import "encoding/base64"
+import "strings"
+
+def check_suite(id: U16) -> (ConnectionState) -> Str {
+  ->(cs: ConnectionState) -> Str { cs.cipher_suite == id ? "" : "Got cipher suite " + cipher_suite_name(cs.cipher_suite) + ", expected " + cipher_suite_name(id) }
+}
+
+def check_curve(id: U16) -> (ConnectionState) -> Str {
+  ->(cs: ConnectionState) -> Str { cs.curve_id == id ? "" : "Got curve " + curve_id_string(cs.curve_id) + ", expected " + curve_id_string(id) }
+}
+
+def check_peer_type(algo: Str) -> (ConnectionState) -> Str {
+  ->(cs: ConnectionState) -> Str {
+    return "no peer certificates" if cs.peer_certificates.size == 0
+    a = cs.peer_certificates[0].public_key_algorithm.to_s
+    a == algo ? "" : "peer certificate public key algorithm is " + a + ", but expected " + algo
+  }
+}
+
+def no_check -> (ConnectionState) -> Str { ->(cs: ConnectionState) -> Str { "" } }
+
+# A client test (Go's clientTest) in replay mode.
+struct ClientTest {
+  name: Str
+  config: Config?
+  validate: (ConnectionState) -> Str
+  num_renegotiations: Int
+  renegotiation_expected_to_fail: Int
+  # "" or the substring expected in a renegotiation's error.
+  renegotiation_error: Str
+  send_key_update: Bool
+
+  def run(version: Str) -> Str {
+    base = config || test_config_client()
+    if version == "TLSv10" && base.min_version == 0 {
+      base.min_version = VERSION_TLS10
+    }
+    if version == "TLSv11" && base.min_version == 0 {
+      base.min_version = VERSION_TLS11
+    }
+    st = [ReplayState.new(flows: parse_test_data("Client-" + version + "-" + name), reading: false)]
+    c = client_transport(replaying_transport(st), replay_config(base))
+    errs: [Str] = []
+    w = c.write!("hello\n".bytes)
+    if e = w.err {
+      errs << "Client.Write failed: " + e.message
+    }
+    i = 1
+    while i <= num_renegotiations && errs.size == 0 {
+      buf = [0.as_u8; 256]
+      r = c.read!(buf)
+      if e = r.err {
+        if renegotiation_error == "" || (renegotiation_expected_to_fail != 0 && i != renegotiation_expected_to_fail) {
+          errs << "Client.Read failed after renegotiation ##{i}: " + e.message
+        } else if !strings.contains(e.message, renegotiation_error) {
+          errs << "expected renegotiation to be rejected but got " + e.message
+        }
+        break
+      }
+      if renegotiation_expected_to_fail == i {
+        errs << "expected error from renegotiation but got nil"
+        break
+      }
+      got = Str.from_bytes(buf[0...r.unwrap])
+      errs << "Client.Read returned #{got}" if got != "SENTINEL\n"
+      errs << "handshakes #{c.st[0].handshakes}" if c.st[0].handshakes != i + 1
+      i += 1
+    }
+    if send_key_update && errs.size == 0 {
+      buf = [0.as_u8; 256]
+      r = c.read!(buf)
+      if e = r.err {
+        errs << "Client.Read failed after KeyUpdate: " + e.message
+      } else if Str.from_bytes(buf[0...r.unwrap]) != "SENTINEL\n" {
+        errs << "bad read after KeyUpdate"
+      }
+      w2 = c.write!("hello again\n".bytes)
+      if e = w2.err {
+        errs << "Client.Write failed: " + e.message
+      }
+    }
+    if errs.size == 0 {
+      v = validate.call(c.connection_state)
+      errs << "validate callback returned error: " + v if v != ""
+    }
+    c.close!
+    for e in st[0].errors {
+      errs << e
+    }
+    errs.join("; ")
+  }
+}
+
+def ct(name: Str, config: Config?, validate: (ConnectionState) -> Str) -> ClientTest { ClientTest.new(name: name, config: config, validate: validate) }
+
+def client_with_suites(suites: [U16]) -> Config {
+  c = test_config_client()
+  c.cipher_suites = suites
+  c
+}
+
+# Go's runClientTestTLS10/11 set the template's MinVersion when it is 0, and
+# the template (with that MinVersion) is reused for the later versions.
+def run_all(t0: ClientTest, versions: [Str]) {
+  t = t0
+  for v in versions {
+    cfg = t.config || test_config_client()
+    if v == "TLSv10" || v == "TLSv11" {
+      cfg.min_version = (v == "TLSv10" ? VERSION_TLS10 : VERSION_TLS11) if cfg.min_version == 0
+      t.config = cfg
+    }
+    r = t.run(v)
+    assert r == "", v + "-" + t.name + ": " + r
+  }
+}
+
+test "HandshakeClientRSARC4" { run_all(ct("RSA-RC4", client_with_suites([TLS_RSA_WITH_RC4_128_SHA]), check_suite(TLS_RSA_WITH_RC4_128_SHA)), ["TLSv10", "TLSv11", "TLSv12"]) }
+
+test "HandshakeClientRSAAES128GCM" { run_all(ct("AES128-GCM-SHA256", client_with_suites([TLS_RSA_WITH_AES_128_GCM_SHA256]), check_suite(TLS_RSA_WITH_AES_128_GCM_SHA256)), ["TLSv12"]) }
+
+test "HandshakeClientRSAAES256GCM" { run_all(ct("AES256-GCM-SHA384", client_with_suites([TLS_RSA_WITH_AES_256_GCM_SHA384]), check_suite(TLS_RSA_WITH_AES_256_GCM_SHA384)), ["TLSv12"]) }
+
+test "HandshakeClientECDHERSAAES" { run_all(ct("ECDHE-RSA-AES", none, check_suite(TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA)), ["TLSv10", "TLSv11", "TLSv12"]) }
+
+test "HandshakeClientECDHEECDSAAES" { run_all(ct("ECDHE-ECDSA-AES", none, check_suite(TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA)), ["TLSv10", "TLSv11", "TLSv12"]) }
+
+test "HandshakeClientECDHEECDSAAESGCM" { run_all(ct("ECDHE-ECDSA-AES-GCM", none, check_suite(TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256)), ["TLSv12"]) }
+
+test "HandshakeClientAES256GCMSHA384" { run_all(ct("ECDHE-ECDSA-AES256-GCM-SHA384", none, check_suite(TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384)), ["TLSv12"]) }
+
+test "HandshakeClientAES128CBCSHA256" { run_all(ct("AES128-SHA256", client_with_suites([TLS_RSA_WITH_AES_128_CBC_SHA256]), check_suite(TLS_RSA_WITH_AES_128_CBC_SHA256)), ["TLSv12"]) }
+
+test "HandshakeClientECDHERSAAES128CBCSHA256" { run_all(ct("ECDHE-RSA-AES128-SHA256", client_with_suites([TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA256]), check_suite(TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA256)), ["TLSv12"]) }
+
+test "HandshakeClientECDHEECDSAAES128CBCSHA256" { run_all(ct("ECDHE-ECDSA-AES128-SHA256", client_with_suites([TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA256]), check_suite(TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA256)), ["TLSv12"]) }
+
+test "HandshakeClientX25519" { run_all(ct("X25519-ECDHE", none, check_curve(X25519)), ["TLSv12", "TLSv13"]) }
+
+test "HandshakeClientP256" { run_all(ct("P256-ECDHE", none, check_curve(CURVE_P256)), ["TLSv12", "TLSv13"]) }
+
+test "HandshakeClientHelloRetryRequest" {
+  c = test_config_client()
+  c.curve_preferences = [X25519, CURVE_P256]
+  run_all(ct("HelloRetryRequest", c, ->(cs: ConnectionState) -> Str { cs.hello_retry_request ? "" : "expected HelloRetryRequest" }), ["TLSv13"])
+}
+
+test "HandshakeClientECDHERSAChaCha20" { run_all(ct("ECDHE-RSA-CHACHA20-POLY1305", none, check_suite(TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256)), ["TLSv12"]) }
+
+test "HandshakeClientECDHEECDSAChaCha20" { run_all(ct("ECDHE-ECDSA-CHACHA20-POLY1305", none, check_suite(TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256)), ["TLSv12"]) }
+
+test "HandshakeClientAES128SHA256" { run_all(ct("AES128-SHA256", none, check_suite(TLS_AES_128_GCM_SHA256)), ["TLSv13"]) }
+
+test "HandshakeClientAES256SHA384" { run_all(ct("AES256-SHA384", none, check_suite(TLS_AES_256_GCM_SHA384)), ["TLSv13"]) }
+
+test "HandshakeClientCHACHA20SHA256" { run_all(ct("CHACHA20-SHA256", none, check_suite(TLS_CHACHA20_POLY1305_SHA256)), ["TLSv13"]) }
+
+test "HandshakeClientRSATLS13" { run_all(ct("RSA", none, check_peer_type("RSA")), ["TLSv13"]) }
+
+test "HandshakeClientECDSATLS13" { run_all(ct("ECDSA", none, check_peer_type("ECDSA")), ["TLSv13"]) }
+
+test "HandshakeClientEd25519" { run_all(ct("Ed25519", none, check_peer_type("Ed25519")), ["TLSv12", "TLSv13"]) }
+
+test "HandshakeClientCertEd25519" {
+  run_all(ct("ClientCert-Ed25519-Ed25519", none, no_check()), ["TLSv12", "TLSv13"])
+  run_all(ct("ClientCert-Ed25519-RSA-ECDHE", none, no_check()), ["TLSv12", "TLSv13"])
+  run_all(ct("ClientCert-Ed25519-RSA", client_with_suites([TLS_RSA_WITH_AES_128_CBC_SHA256]), check_suite(TLS_RSA_WITH_AES_128_CBC_SHA256)), ["TLSv12"])
+}
+
+test "HandshakeClientCertRSA" {
+  c = test_config_client()
+  c.certificates = [test_cert("client_rsa2048")]
+  run_all(ct("ClientCert-RSA-RSA-ECDHE", c, no_check()), ["TLSv10", "TLSv12", "TLSv13"])
+  run_all(ct("ClientCert-RSA-ECDSA", c, no_check()), ["TLSv10", "TLSv12", "TLSv13"])
+  c.cipher_suites = [TLS_RSA_WITH_AES_128_CBC_SHA]
+  run_all(ct("ClientCert-RSA-RSA", c, check_suite(TLS_RSA_WITH_AES_128_CBC_SHA)), ["TLSv10", "TLSv12"])
+}
+
+test "HandshakeClientCertECDSA" {
+  c = test_config_client()
+  c.certificates = [test_cert("client_ecdsa_p256")]
+  run_all(ct("ClientCert-ECDSA-ECDSA", c, no_check()), ["TLSv10", "TLSv12", "TLSv13"])
+  run_all(ct("ClientCert-ECDSA-RSA-ECDHE", c, no_check()), ["TLSv10", "TLSv12", "TLSv13"])
+  c.cipher_suites = [TLS_RSA_WITH_AES_128_CBC_SHA]
+  run_all(ct("ClientCert-ECDSA-RSA", c, check_suite(TLS_RSA_WITH_AES_128_CBC_SHA)), ["TLSv10", "TLSv12"])
+}
+
+test "HandshakeClientCertRSAPSS" {
+  c = test_config_client()
+  c.certificates = [test_cert("client_rsapss")]
+  run_all(ct("ClientCert-RSA-RSAPSS", c, ->(cs: ConnectionState) -> Str {
+    a = cs.peer_certificates[0].signature_algorithm.to_s
+    a == "SHA512-RSAPSS" ? "" : "peer certificate signature algorithm is " + a
+    }), ["TLSv12", "TLSv13"])
+}
+
+test "HandshakeClientCertRSAPKCS1v15" { run_all(ct("ClientCert-RSA-RSAPKCS1v15", none, no_check()), ["TLSv12"]) }
+
+test "ClientKeyUpdate" {
+  t = ct("KeyUpdate", none, no_check())
+  t.send_key_update = true
+  run_all(t, ["TLSv13"])
+}
+
+test "HandshakeClientALPNMatch" {
+  c = test_config_client()
+  c.next_protos = ["proto2", "proto1"]
+  run_all(ct("ALPN", c, ->(cs: ConnectionState) -> Str { cs.negotiated_protocol == "proto1" ? "" : "got protocol " + cs.negotiated_protocol }), ["TLSv12", "TLSv13"])
+}
+
+test "HandshakeClientSCTs" {
+  scts = base64.std_encoding().decode_string("ABIBaQFnAHUApLkJkLQYWBSHuxOizGdwCjw1mAT5G9+443fNDsgN3BAAAAFHl5nuFgAABAMARjBEAiAcS4JdlW5nW9sElUv2zvQyPoZ6ejKrGGB03gjaBZFMLwIgc1Qbbn+hsH0RvObzhS+XZhr3iuQQJY8S9G85D9KeGPAAdgBo9pj4H2SCvjqM7rkoHUz8cVFdZ5PURNEKZ6y7T0/7xAAAAUeX4bVwAAAEAwBHMEUCIDIhFDgG2HIuADBkGuLobU5a4dlCHoJLliWJ1SYT05z6AiEAjxIoZFFPRNWMGGIjskOTMwXzQ1Wh2e7NxXE1kd1J0QsAdgDuS723dc5guuFCaR+r4Z5mow9+X7By2IMAxHuJeqj9ywAAAUhcZIqHAAAEAwBHMEUCICmJ1rBT09LpkbzxtUC+Hi7nXLR0J+2PmwLp+sJMuqK+AiEAr0NkUnEVKVhAkccIFpYDqHOlZaBsuEhWWrYpg2RtKp0=").unwrap
+  expected = [scts[8...125], scts[127...245], scts[247...scts.size]]
+  run_all(ct("SCT", none, ->(cs: ConnectionState) -> Str {
+    return "Got #{cs.signed_certificate_timestamps.size} scts" if cs.signed_certificate_timestamps.size != 3
+    cs.signed_certificate_timestamps == expected ? "" : "SCTs differ"
+    }), ["TLSv12"])
+}
+
+test "RenegotiationRejected" {
+  t = ct("RenegotiationRejected", none, no_check())
+  t.num_renegotiations = 1
+  t.renegotiation_expected_to_fail = 1
+  t.renegotiation_error = "no renegotiation"
+  run_all(t, ["TLSv12"])
+}
+
+test "RenegotiateOnce" {
+  c = test_config_client()
+  c.renegotiation = RENEGOTIATE_ONCE_AS_CLIENT
+  t = ct("RenegotiateOnce", c, no_check())
+  t.num_renegotiations = 1
+  run_all(t, ["TLSv12"])
+}
+
+test "RenegotiateTwice" {
+  c = test_config_client()
+  c.renegotiation = RENEGOTIATE_FREELY_AS_CLIENT
+  t = ct("RenegotiateTwice", c, no_check())
+  t.num_renegotiations = 2
+  run_all(t, ["TLSv12"])
+}
+
+test "RenegotiateTwiceRejected" {
+  c = test_config_client()
+  c.renegotiation = RENEGOTIATE_ONCE_AS_CLIENT
+  t = ct("RenegotiateTwiceRejected", c, no_check())
+  t.num_renegotiations = 2
+  t.renegotiation_expected_to_fail = 2
+  t.renegotiation_error = "no renegotiation"
+  run_all(t, ["TLSv12"])
+}
+
+test "HandshakeClientExportKeyingMaterial" {
+  run_all(ct("ExportKeyingMaterial", none, ->(cs: ConnectionState) -> Str {
+    r = cs.export_keying_material("test", none, 42)
+    return "ExportKeyingMaterial failed: " + (r.err?.message || "") if !r.ok?
+    r.unwrap.size == 42 ? "" : "wrong size"
+    }), ["TLSv10", "TLSv12", "TLSv13"])
+}
+
+test "HostnameInSNI" {
+  for t in [("", ""), ("localhost", "localhost"), ("foo, bar, baz and qux", "foo, bar, baz and qux"), ("golang.org", "golang.org"), ("golang.org.", "golang.org"), ("1.2.3.4", ""), ("::1", ""), ("::1%lo0", ""), ("[::1]", ""), ("[::1%lo0]", "")] {
+    i, o = t
+    assert_eq hostname_in_sni(i), o
+  }
+}
+
+def _x509_unused(c: x509.Certificate) -> Int { c.version }

@@ -1,0 +1,94 @@
+# Test helpers: Go's test certificates (testdata/certs, from Go's
+# certificates_test.go), test configs and a loopback pipe (Go's
+# localPipe).
+
+import "crypto/x509"
+import "net"
+import "os"
+import "time"
+
+def test_time -> time.Time { time.unix(1476984729, 0) }
+
+def test_cert(name: Str) -> Certificate {
+  pem_data = os.read_file("testdata/certs/" + name + ".pem").unwrap
+  x509_key_pair(pem_data, pem_data).unwrap
+}
+
+def test_pool(name: Str) -> x509.CertPool {
+  pool = x509.new_cert_pool()
+  pool.add_cert!(test_cert(name).leaf_cert.unwrap)
+  pool
+}
+
+def test_config_server -> Config {
+  Config.new(time: ->() -> time.Time { test_time() }, certificates: [test_cert("ecdsa_p256"), test_cert("rsa2048"), test_cert("ed25519"), test_cert("sni")], client_cas: test_pool("client_root"))
+}
+
+def test_config_client -> Config {
+  Config.new(time: ->() -> time.Time { test_time() }, certificates: [test_cert("client_ecdsa_p256"), test_cert("client_rsa2048"), test_cert("client_ed25519")], root_cas: test_pool("root"), server_name: "test.golang.example")
+}
+
+# Go's localPipe: two connected loopback TCP connections.
+def local_pipe -> (net.Conn, net.Conn) {
+  ln = net.listen("tcp", "127.0.0.1:0").unwrap
+  addr = "127.0.0.1:#{ln.port}"
+  t = spawn { ln.~accept }
+  c = net.dial("tcp", addr).unwrap
+  s = t.wait.unwrap
+  ln.close!
+  (c, s)
+}
+
+# Go's testHandshake: handshakes over a pipe, the server writes a sentinel
+# and closes. The states of both sides, or the first error ("client: ..."
+# / "server: ...").
+def test_handshake(client_config: Config, server_config: Config) -> ~(ConnectionState, ConnectionState) {
+  sentinel = "SENTINEL\n"
+  c, s = local_pipe()
+  ccfg = client_config.dup
+  task = spawn {
+    cli = client(c, ccfg)
+    r = cli.handshake!
+    out = ""
+    st = ConnectionState.new
+    if e = r.err {
+      out = "client: " + e.message
+      cc = c
+      cc.close!
+    } else {
+      st = cli.connection_state
+      buf: [Byte] = []
+      chunk = [0.as_u8; 1024]
+      loop {
+        rr = cli.read!(chunk)
+        if e2 = rr.err {
+          out = "client (from Read): " + e2.message
+          break
+        }
+        n = rr.unwrap
+        break if n == 0
+        buf = buf + chunk[0...n]
+      }
+      out = "read " + Str.from_bytes(buf) if out == "" && Str.from_bytes(buf) != sentinel
+      cli.close!
+    }
+    (out, st)
+  }
+  srv = server(s, server_config)
+  r = srv.handshake!
+  server_err = ""
+  server_state = ConnectionState.new
+  if e = r.err {
+    server_err = "server: " + e.message
+    ss = s
+    ss.close!
+  } else {
+    server_state = srv.connection_state
+    srv.write!(sentinel.bytes).unwrap
+    srv.close!
+  }
+  client_err, client_state = task.wait.unwrap
+  fail TlsError.Msg(server_err) if server_err != ""
+  fail TlsError.Msg(client_err) if client_err != ""
+  (server_state, client_state)
+}

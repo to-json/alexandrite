@@ -391,7 +391,7 @@ impl<'a> Gen<'a> {
             TypeExpr::Named(n, _) => {
                 if let Some(k) = IntKind::from_name(n) {
                     K::Int(k)
-                } else if n == "Float" {
+                } else if n == "Float" || n == "F64" {
                     K::Float
                 } else if n == "Bool" {
                     K::Bool
@@ -399,7 +399,7 @@ impl<'a> Gen<'a> {
                     K::Str
                 } else if n == "dyn.Value" {
                     K::Dyn
-                } else if matches!(n.as_str(), "F32" | "F64" | "Float32" | "Ptr" | "Unit" | "Complex" | "Error") {
+                } else if matches!(n.as_str(), "F32" | "Float32" | "Ptr" | "Unit" | "Complex" | "Error") {
                     return Err(format!("xml: unsupported type: {n}"));
                 } else {
                     K::Named(n.clone())

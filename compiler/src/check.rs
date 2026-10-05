@@ -194,6 +194,8 @@ pub struct World<'a> {
     /// R11: package-level `Atomic[T]` / `Mutex[T]` values, in declaration
     /// order (each package after its imports, the main file last).
     pub vars: Vec<VarInfo>,
+    /// Interfaces whose values are compared with `==` (`iface_eq_instances`).
+    pub eq_ifaces: Vec<String>,
 }
 
 /// A package-level `Atomic[T]` / `Mutex[T]` (R11): the global holding it
@@ -328,8 +330,9 @@ impl<'a> World<'a> {
             }
         }
         GENERICS.with(|g| g.borrow_mut().clear());
+        RECS.with(|r| r.borrow_mut().clear());
         INSTS.with(|g| g.borrow_mut().clear());
-        Ok(World { sm, defs, by_name, instances: HashMap::new(), funcs: vec![], sigs: HashMap::new(), fatal: None, structs: HashMap::new(), consts: HashMap::new(), ifaces: HashMap::new(), iface_order: vec![], impls: HashMap::new(), stringers: HashMap::new(), errors: vec![], refines: HashMap::new(), grefines: HashMap::new(), warnings: vec![], globals: vec![], pending_consts: vec![], vars: vec![] })
+        Ok(World { sm, defs, by_name, instances: HashMap::new(), funcs: vec![], sigs: HashMap::new(), fatal: None, structs: HashMap::new(), consts: HashMap::new(), ifaces: HashMap::new(), iface_order: vec![], impls: HashMap::new(), stringers: HashMap::new(), errors: vec![], refines: HashMap::new(), grefines: HashMap::new(), warnings: vec![], globals: vec![], pending_consts: vec![], vars: vec![], eq_ifaces: vec![] })
     }
 
     /// Evaluate top-level constants, in order (each may use earlier ones).
@@ -639,10 +642,11 @@ impl<'a> World<'a> {
                 Def::S(s) => s.span,
                 Def::E(e) => e.span,
             };
-            if visiting.iter().any(|v| v == name) {
-                return Err(Diag::new(span, format!("`{name}` contains itself; it is a value, so it can't (recursive types come with the memory model)")));
-            }
+            let _ = span;
             visiting.push(name.to_string());
+            // While its fields are resolved, a mention of the type itself is
+            // a `Rec` (R12); `inline_cycle` refuses the layouts that can't be.
+            done.insert(name.to_string(), Ty::Rec(name.to_string()));
             let prev = enter_pkg(&pkg_of(name));
             let t = match d {
                 Def::S(s) => Ty::Struct(name.to_string(), fields_of(&s.fields, by_name, done, visiting, consts)?),
@@ -659,9 +663,33 @@ impl<'a> World<'a> {
             done.insert(name.to_string(), t.clone());
             Ok(t)
         }
-        let names: Vec<&str> = by_name.keys().copied().collect();
-        for n in names {
+        let mut names: Vec<&str> = by_name.keys().copied().collect();
+        names.sort_unstable();
+        for n in &names {
             resolve(n, &by_name, &mut self.structs, &mut vec![], &self.consts)?;
+        }
+        // The types that mention themselves get their definitions recorded
+        // (for `Ty::Rec`), then each must have a finite layout.
+        let mut recs = vec![];
+        for n in &names {
+            rec_names(&self.structs[*n], &mut recs);
+        }
+        recs.sort();
+        for n in &recs {
+            if let Some(t) = self.structs.get(n) {
+                define_rec(n, t.clone());
+            }
+        }
+        for n in &recs {
+            if by_name.contains_key(n.as_str()) {
+                if let Some(path) = inline_cycle(n) {
+                    let span = match by_name[n.as_str()] {
+                        Def::S(s) => s.span,
+                        Def::E(e) => e.span,
+                    };
+                    return Err(infinite_layout(span, n, &path));
+                }
+            }
         }
         for e in enums.iter().filter(|e| e.error) {
             let t = self.structs[&e.name].clone();
@@ -721,6 +749,30 @@ impl<'a> World<'a> {
     }
 
     /// Instances of each error type's `message` method.
+    /// `==` on interface values (#108): for each interface compared, the
+    /// instance of `__eq` for each implementor, in tag order. The
+    /// implementors are known only now (closed world, D12); making these
+    /// instances may compare more interfaces, so it runs to a fixpoint.
+    pub fn iface_eq_instances(&mut self) -> R<HashMap<String, Vec<FuncId>>> {
+        let mut out: HashMap<String, Vec<FuncId>> = HashMap::new();
+        let Some(&def) = self.by_name.get("__eq") else { return Ok(out) };
+        loop {
+            let mut changed = false;
+            for n in self.eq_ifaces.clone() {
+                let impls: Vec<Ty> = self.impls.get(&n).map(|v| v.iter().map(|(t, _)| t.clone()).collect()).unwrap_or_default();
+                let have = out.get(&n).map_or(0, Vec::len);
+                for t in impls.iter().skip(have) {
+                    let fid = self.instance(def, vec![t.clone(), t.clone()], Span::default())?;
+                    out.entry(n.clone()).or_default().push(fid);
+                    changed = true;
+                }
+            }
+            if !changed {
+                return Ok(out);
+            }
+        }
+    }
+
     pub fn message_instances(&mut self) -> R<HashMap<usize, FuncId>> {
         let mut out = HashMap::new();
         for (k, t) in self.errors.clone().iter().enumerate() {
@@ -779,31 +831,17 @@ impl<'a> World<'a> {
         Ok(())
     }
 
-    /// Whether a value of type `t` contains (not behind a handle) a value
-    /// of interface `iface`.
-    fn contains_iface(&self, t: &Ty, iface: &str, seen: &mut Vec<String>) -> bool {
-        match t {
-            Ty::Iface(j) if j == iface => true,
-            Ty::Iface(j) => {
-                if seen.contains(j) {
-                    return false;
-                }
-                seen.push(j.clone());
-                let impls: Vec<Ty> = self.impls.get(j).map(|v| v.iter().map(|(t, _)| t.clone()).collect()).unwrap_or_default();
-                impls.iter().any(|x| self.contains_iface(x, iface, seen))
-            }
-            Ty::Struct(_, fs) => fs.iter().any(|(_, f)| self.contains_iface(f, iface, seen)),
-            Ty::Enum(_, vs) => vs.iter().any(|(_, fs)| fs.iter().any(|(_, f)| self.contains_iface(f, iface, seen))),
-            Ty::Tuple(ts) => ts.iter().any(|x| self.contains_iface(x, iface, seen)),
-            Ty::Opt(x) | Ty::Array(x) | Ty::Fixed(x, _) | Ty::Result(x) | Ty::Mutex(x) | Ty::Chan(x) => self.contains_iface(x, iface, seen),
-            Ty::Map(k, v) => self.contains_iface(k, iface, seen) || self.contains_iface(v, iface, seen),
-            _ => false,
-        }
-    }
 
     /// Make `t` an implementor of interface `iface` (checking it has every
     /// method), returning its tag.
     fn implement(&mut self, iface: &str, t: &Ty, sp: Span) -> R<usize> {
+        let unfolded;
+        let t = if let Ty::Rec(_) = t {
+            unfolded = t.unrec();
+            &unfolded
+        } else {
+            t
+        };
         if let Some(k) = self.impls.get(iface).and_then(|v| v.iter().position(|(x, _)| x == t)) {
             return Ok(k);
         }
@@ -811,11 +849,8 @@ impl<'a> World<'a> {
             return Err(Diag::new(sp, format!("{} can't satisfy {iface}: only structs and enums have methods", t.show())));
         };
         let tn = tn.to_string();
-        // An interface value holds its implementors by value: one that holds
-        // the interface itself would be infinitely large.
-        if self.contains_iface(t, iface, &mut vec![]) {
-            return Err(Diag::new(sp, format!("{tn} can't be a {iface}: it holds a {iface} value itself, and an interface value contains its implementors")).note(format!("make {tn} generic over what it holds (`struct {tn}[T] {{ inner: T }}`, like Rust's BufReader<R>), or keep the inner value in a Pool and hold an @handle")));
-        }
+        // An implementor may hold the interface itself (a wrapper, a list of
+        // handlers): then the interface's values are boxed (R13, lowering).
         let methods = self.ifaces[iface].clone();
         let impls = self.impls.entry(iface.to_string()).or_default();
         impls.push((t.clone(), vec![]));
@@ -909,7 +944,7 @@ impl<'a> World<'a> {
             let tps = d.tparams.clone();
             for tp in &tps {
                 if let Some(Bound::Iface(i)) = &tp.bound {
-                    let t = out[&tp.name].clone();
+                    let t = out[&tp.name].unrec();
                     // `io.Reader` through an import alias; `Reader` in its own package.
                     let prev = enter_pkg(&self.defs[def].pkg);
                     let key = match i.split_once('.') {
@@ -925,6 +960,8 @@ impl<'a> World<'a> {
             }
         }
         Ok(b.into_iter().map(|(n, t)| {
+            // A recursive type's self-mention (R12) binds as the type itself.
+            let t = if let Ty::Rec(_) = t { t.unrec() } else { t };
             let old = self.structs.insert(n.clone(), t);
             (n, old)
         }).collect())
@@ -986,6 +1023,7 @@ impl<'a> World<'a> {
     }
 
     fn instance(&mut self, def: usize, args: Vec<Ty>, call_span: Span) -> R<FuncId> {
+        let args: Vec<Ty> = if args.iter().any(|t| matches!(t, Ty::Rec(_))) { args.iter().map(Ty::unrec).collect() } else { args };
         if let Some(id) = self.instances.get(&(def, args.clone())) {
             return Ok(*id);
         }
@@ -1176,6 +1214,12 @@ pub fn cname(s: &str) -> String {
 /// Values `puts` and interpolation can show.
 pub fn printable(t: &Ty) -> bool {
     match t {
+        Ty::Rec(n) => with_rec(n, true, printable),
+        Ty::Struct(n, _) | Ty::Enum(n, _) if is_rec(n) => with_rec(n, true, |d| match d {
+            Ty::Struct(_, fs) => fs.iter().all(|(_, t)| printable(t)),
+            Ty::Enum(_, vs) => vs.iter().all(|(_, fs)| fs.iter().all(|(_, t)| printable(t))),
+            _ => true,
+        }),
         Ty::Int | Ty::IntK(_) | Ty::Float | Ty::Str | Ty::Bool | Ty::Var(_) | Ty::Iface(_) | Ty::Error | Ty::Handle(_) => true,
         Ty::Opt(t) | Ty::Array(t) | Ty::Fixed(t, _) => printable(t),
         Ty::Map(k, v) => printable(k) && printable(v),
@@ -1186,11 +1230,85 @@ pub fn printable(t: &Ty) -> bool {
     }
 }
 
+/// The names of the `Rec` types mentioned anywhere in `t`.
+pub fn rec_names(t: &Ty, out: &mut Vec<String>) {
+    match t {
+        Ty::Rec(n) => {
+            if !out.contains(n) {
+                out.push(n.clone());
+            }
+        }
+        Ty::Struct(_, fs) => fs.iter().for_each(|(_, x)| rec_names(x, out)),
+        Ty::Enum(_, vs) => vs.iter().for_each(|(_, fs)| fs.iter().for_each(|(_, x)| rec_names(x, out))),
+        Ty::Array(x) | Ty::Fixed(x, _) | Ty::Seq(x, _) | Ty::Gen(x) | Ty::Yielder(x) | Ty::Opt(x) | Ty::Result(x) | Ty::Task(x) | Ty::Chan(x) | Ty::Pool(x) | Ty::Mutex(x) | Ty::Atomic(x) => rec_names(x, out),
+        Ty::Tuple(ts) => ts.iter().for_each(|x| rec_names(x, out)),
+        Ty::Map(k, v) => {
+            rec_names(k, out);
+            rec_names(v, out);
+        }
+        Ty::Fn(ps, r) => {
+            ps.iter().for_each(|x| rec_names(x, out));
+            rec_names(r, out);
+        }
+        _ => {}
+    }
+}
+
+/// A recursive struct or enum whose value would contain itself directly
+/// (not behind a slice, a map, an optional field, a closure or an
+/// interface value, which hold it elsewhere: R12): the path that does.
+pub fn inline_cycle(name: &str) -> Option<Vec<String>> {
+    fn walk(t: &Ty, field: bool, target: &str, path: &mut Vec<String>, seen: &mut Vec<String>) -> bool {
+        match t {
+            Ty::Struct(n, _) | Ty::Enum(n, _) | Ty::Rec(n) => {
+                if n == target {
+                    return true;
+                }
+                if seen.contains(n) {
+                    return false;
+                }
+                seen.push(n.clone());
+                let def = t.unrec();
+                fields(&def, target, path, seen)
+            }
+            // An optional field of a struct or an enum variant is boxed when it
+            // leads back to its type; anywhere else it is inline.
+            Ty::Opt(x) if !field => walk(x, false, target, path, seen),
+            Ty::Tuple(ts) => ts.iter().any(|x| walk(x, false, target, path, seen)),
+            Ty::Fixed(x, _) | Ty::Result(x) => walk(x, false, target, path, seen),
+            _ => false,
+        }
+    }
+    fn fields(def: &Ty, target: &str, path: &mut Vec<String>, seen: &mut Vec<String>) -> bool {
+        let fs: Vec<(String, Ty)> = match def {
+            Ty::Struct(_, fs) => fs.clone(),
+            Ty::Enum(_, vs) => vs.iter().flat_map(|(v, fs)| fs.iter().map(move |(f, t)| (format!("{v}({f})"), t.clone()))).collect(),
+            _ => return false,
+        };
+        for (f, t) in fs {
+            path.push(format!("{}.{f}", def.show()));
+            if walk(&t, true, target, path, seen) {
+                return true;
+            }
+            path.pop();
+        }
+        false
+    }
+    let def = rec_def(name)?;
+    let mut path = vec![];
+    fields(&def, name, &mut path, &mut vec![name.to_string()]).then_some(path)
+}
+
+fn infinite_layout(sp: Span, name: &str, path: &[String]) -> Diag {
+    Diag::new(sp, format!("`{name}` contains itself directly ({}), so a value of it would never end", path.join(" -> ")))
+        .note("hold it through a slice, a map or an optional field (`[T]`, `Map[K, T]`, `T?`), which keep it elsewhere")
+}
+
 pub fn map_key_ok(t: &Ty) -> bool {
     matches!(t, Ty::Str | Ty::Bool | Ty::Var(_)) || t.int_kind().is_some()
 }
 
-fn type_names(t: &TypeExpr, out: &mut Vec<String>) {
+pub fn type_names(t: &TypeExpr, out: &mut Vec<String>) {
     match t {
         TypeExpr::Named(n, _) => out.push(n.clone()),
         TypeExpr::Array(t, _) | TypeExpr::Opt(t, _) | TypeExpr::Fixed(t, _, _) => type_names(t, out),
@@ -1228,6 +1346,8 @@ thread_local! {
     /// Generic instances: `Stack[Int]` → (`Stack`, [Int]).
     pub static INSTS: std::cell::RefCell<HashMap<String, (String, Vec<Ty>)>> = std::cell::RefCell::new(HashMap::new());
     static DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Generic instances whose fields are being resolved (`Tree[Int]`).
+    static INSTANTIATING: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(vec![]) };
     /// Every struct and enum name (for `@T` handles to types not resolved yet).
     pub static DECLARED: std::cell::RefCell<std::collections::HashSet<String>> = std::cell::RefCell::new(Default::default());
 }
@@ -1254,15 +1374,20 @@ pub fn instantiate(n: &str, g: &GenDef, targs: Vec<Ty>, sp: Span, structs: &Stru
     for (tp, t) in tps.iter().zip(&targs) {
         check_bound(tp, t, sp)?;
     }
-    if DEPTH.with(|d| d.get()) > 16 {
-        return Err(Diag::new(sp, format!("`{n}` contains itself; it is a value, so it can't (recursive types come with the memory model)")));
-    }
     let name = format!("{n}[{}]", targs.iter().map(Ty::show).collect::<Vec<_>>().join(", "));
+    // An instance mentioning itself (`struct Tree[T] { kids: [Tree[T]] }`): R12.
+    if INSTANTIATING.with(|i| i.borrow().contains(&name)) {
+        return Ok(Ty::Rec(name));
+    }
+    if DEPTH.with(|d| d.get()) > 16 {
+        return Err(Diag::new(sp, format!("`{n}` is instantiated with ever larger type arguments (`{name}`): its instances would never end")));
+    }
     let mut env = structs.clone();
     for (tp, t) in tps.iter().zip(&targs) {
         env.insert(tp.name.clone(), t.clone());
     }
     DEPTH.with(|d| d.set(d.get() + 1));
+    INSTANTIATING.with(|i| i.borrow_mut().push(name.clone()));
     // The field types are the generic's package's names (`list.List[Int]`
     // made in another package still finds list's private `Node`).
     let prev = enter_pkg(&pkg_of(n));
@@ -1273,8 +1398,17 @@ pub fn instantiate(n: &str, g: &GenDef, targs: Vec<Ty>, sp: Span, structs: &Stru
     };
     leave_pkg(prev);
     DEPTH.with(|d| d.set(d.get() - 1));
+    INSTANTIATING.with(|i| i.borrow_mut().pop());
     let t = r?;
-    INSTS.with(|m| m.borrow_mut().insert(name, (n.to_string(), targs)));
+    INSTS.with(|m| m.borrow_mut().insert(name.clone(), (n.to_string(), targs)));
+    let mut recs = vec![];
+    rec_names(&t, &mut recs);
+    if recs.contains(&name) {
+        define_rec(&name, t.clone());
+        if let Some(path) = inline_cycle(&name) {
+            return Err(infinite_layout(sp, &name, &path));
+        }
+    }
     Ok(t)
 }
 
@@ -1553,6 +1687,8 @@ struct FnCx<'w, 'a> {
     targ_types: Vec<String>,
     /// The next block checked has its value discarded (`each`, `step`).
     block_unused: bool,
+    /// Checking `__eq`'s body: its `==` compares one level, inline.
+    eq_top: bool,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -1623,6 +1759,7 @@ impl<'w, 'a> FnCx<'w, 'a> {
             ret: Ty::Unit,
             impure: false,
             fallible_decl: def.is_some_and(|d| d.fallible),
+            eq_top: def.is_some_and(|d| d.name == "__eq"),
             under_try: false,
             bare_name: false,
             declared_errs: def.is_some_and(|d| d.errs.is_some()),
@@ -1676,6 +1813,7 @@ impl<'w, 'a> FnCx<'w, 'a> {
             Ty::Opt(t) => Ty::Opt(Box::new(self.resolve(t))),
             Ty::Yielder(t) => Ty::Yielder(Box::new(self.resolve(t))),
             Ty::Tuple(ts) => Ty::Tuple(ts.iter().map(|t| self.resolve(t)).collect()),
+            Ty::Rec(_) => t.unrec(),
             t => t.clone(),
         }
     }
@@ -2277,6 +2415,8 @@ impl<'w, 'a> FnCx<'w, 'a> {
     }
 
     fn mk(&self, kind: TK, ty: Ty, span: Span) -> TExpr {
+        // A recursive type's mention of itself, reached (`node.kids[0]`): R12.
+        let ty = if let Ty::Rec(_) = ty { ty.unrec() } else { ty };
         TExpr { kind, ty, span }
     }
 
@@ -3421,7 +3561,16 @@ impl<'w, 'a> FnCx<'w, 'a> {
                 return Ok(());
             }
         }
-        match &t {
+        // A type that contains itself is walked once (R12).
+        if let Some(n) = t.type_name().map(|_| t.show()).filter(|n| is_rec(n)) {
+            let t2 = t.clone();
+            return with_rec(&n, Ok(()), |_| self.stringer_parts(&t2, sp));
+        }
+        self.stringer_parts(&t, sp)
+    }
+
+    fn stringer_parts(&mut self, t: &Ty, sp: Span) -> R<()> {
+        match t {
             Ty::Array(e) | Ty::Fixed(e, _) | Ty::Opt(e) => self.stringers(e, sp),
             Ty::Map(k, v) => {
                 self.stringers(k, sp)?;
@@ -3448,6 +3597,14 @@ impl<'w, 'a> FnCx<'w, 'a> {
     /// `a == b` field by field (Go's comparable structs).
     fn struct_eq(&mut self, l: TExpr, r: TExpr, sp: Span) -> R<TExpr> {
         let t = self.resolve(&l.ty);
+        // A type that contains itself (R12) is compared by a function
+        // (`__eq`, whose own `==` compares one level here): comparing it
+        // inline would never end.
+        let top = std::mem::take(&mut self.eq_top);
+        if !top && matches!(&t, Ty::Struct(n, _) | Ty::Enum(n, _) if is_rec(n)) {
+            let def = *self.w.by_name.get("__eq").expect("builtin __eq");
+            return self.call_def(def, "__eq", sp, vec![l, r], sp);
+        }
         let fts: Vec<Ty> = match &t {
             Ty::Struct(_, fs) => fs.iter().map(|(_, t)| t.clone()).collect(),
             Ty::Tuple(ts) => ts.clone(),
@@ -4641,6 +4798,29 @@ impl<'w, 'a> FnCx<'w, 'a> {
             }
             let def = *self.w.by_name.get("__map_eq").expect("builtin __map_eq");
             let eq = self.call_def(def, "__map_eq", sp, vec![l, r], sp)?;
+            return Ok(if op == BinOp::Ne { self.mk(TK::Not(Box::new(eq)), Ty::Bool, sp) } else { eq });
+        }
+        // Interface values: the same implementor, and equal values of it
+        // (#108). Lowering dispatches on the tag to each implementor's `__eq`.
+        let rres = self.resolve(&r.ty);
+        if matches!(op, BinOp::Eq | BinOp::Ne) && (matches!(lres, Ty::Iface(_)) || matches!(rres, Ty::Iface(_))) && lres != rres {
+            // `iface == concrete`: the concrete value as the interface.
+            let (l, r) = if let Ty::Iface(_) = lres { let r = self.coerce(r, &lres)?; (l, r) } else { let l = self.coerce(l, &rres)?; (l, r) };
+            let (a, b) = (self.resolve(&l.ty), self.resolve(&r.ty));
+            if a != b {
+                return Err(Diag::new(sp, format!("`{}` between {} and {}", op.text(), a.show(), b.show())));
+            }
+            return self.binary(op, l, r, sp);
+        }
+        if matches!(op, BinOp::Eq | BinOp::Ne) && matches!(lres, Ty::Iface(_)) {
+            if !self.unify(&l.ty, &r.ty) {
+                return Err(Diag::new(sp, format!("`{}` between {} and {}", op.text(), lres.show(), self.resolve(&r.ty).show())));
+            }
+            let Ty::Iface(n) = &lres else { unreachable!() };
+            if !self.w.eq_ifaces.contains(n) {
+                self.w.eq_ifaces.push(n.clone());
+            }
+            let eq = self.mk(TK::M(M::IfaceEq, Some(Box::new(l)), vec![r], None), Ty::Bool, sp);
             return Ok(if op == BinOp::Ne { self.mk(TK::Not(Box::new(eq)), Ty::Bool, sp) } else { eq });
         }
         if matches!(op, BinOp::Eq | BinOp::Ne) && matches!(lres, Ty::Struct(..) | Ty::Tuple(_) | Ty::Enum(..)) {
@@ -6907,51 +7087,6 @@ fn expr_breaks_out(e: &TExpr) -> bool {
             hit
         }
     }
-}
-
-/// A closure value holds its captures, so a closure that captures a value
-/// holding the closure's own type would be infinitely large (and can't be
-/// laid out): `s.f = -> () { s.n }` where `s: S` has a field of that type.
-pub fn self_containing_closures(funcs: &[TFunc], ifaces: &HashMap<String, Vec<(Ty, Vec<FuncId>)>>) -> Result<(), Diag> {
-    let sites: Vec<(Ty, Vec<Ty>)> = funcs.iter().flat_map(|f| f.lambdas.iter().map(move |(_, t, caps)| (t.clone(), caps.iter().map(|c| f.locals[*c].ty.clone()).collect()))).collect();
-    fn holds(t: &Ty, want: &Ty, sites: &[(Ty, Vec<Ty>)], ifaces: &HashMap<String, Vec<(Ty, Vec<FuncId>)>>, seen: &mut Vec<Ty>) -> bool {
-        if t == want {
-            return true;
-        }
-        let go = |x: &Ty, seen: &mut Vec<Ty>| holds(x, want, sites, ifaces, seen);
-        match t {
-            Ty::Struct(_, fs) => fs.iter().any(|(_, f)| go(f, seen)),
-            Ty::Enum(_, vs) => vs.iter().any(|(_, fs)| fs.iter().any(|(_, f)| go(f, seen))),
-            Ty::Tuple(ts) => ts.iter().any(|x| go(x, seen)),
-            Ty::Opt(x) | Ty::Array(x) | Ty::Fixed(x, _) | Ty::Result(x) | Ty::Mutex(x) | Ty::Chan(x) => go(x, seen),
-            Ty::Map(k, v) => go(k, seen) || go(v, seen),
-            Ty::Fn(..) | Ty::Iface(_) => {
-                if seen.contains(t) {
-                    return false;
-                }
-                seen.push(t.clone());
-                match t {
-                    Ty::Iface(n) => ifaces.get(n).is_some_and(|v| v.iter().any(|(x, _)| go(x, seen))),
-                    _ => sites.iter().filter(|(ft, _)| ft == t).any(|(_, caps)| caps.iter().any(|c| go(c, seen))),
-                }
-            }
-            _ => false,
-        }
-    }
-    for f in funcs {
-        for (lo, t, caps) in &f.lambdas {
-            for c in caps {
-                let ct = &f.locals[*c].ty;
-                if holds(ct, t, &sites, ifaces, &mut vec![]) {
-                    let l = (*lo & 0xffff_ffff) as u32;
-                    let sp = Span { file: f.span.file, lo: l, hi: l + 1 };
-                    return Err(Diag::new(sp, format!("this closure captures `{}` ({}), which holds a closure of this same type ({}): a closure contains what it captures, so it would contain itself", f.locals[*c].name, ct.show(), t.show()))
-                        .note("pass the value as a parameter instead, or keep it in a Pool and capture its @handle"));
-                }
-            }
-        }
-    }
-    Ok(())
 }
 
 /// Whether an interface declares a method `name`.

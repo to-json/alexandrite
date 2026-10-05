@@ -209,6 +209,8 @@ fn lay(t: &LTy) -> Lay {
             }
             Lay { size: off.next_multiple_of(align).max(1), align, fields }
         }
+        // A type that contains itself (R12): laid out as its body.
+        LTy::Rec(_) => lay(&t.unrec()),
     }
 }
 
@@ -324,6 +326,7 @@ fn worker_sig(w: &LWorker) -> (Vec<ValType>, Vec<ValType>) {
 }
 
 pub fn emit(p: &LProgram) -> Result<Vec<u8>, String> {
+    alx::lir::set_recs(&p.recs);
     let mut owned = p.clone();
     let info = suspend::prepare(&mut owned)?;
     let p = &owned;
@@ -1290,7 +1293,7 @@ impl<'c, 'p> Fx<'c, 'p> {
                 for st in steps {
                     match st {
                         Step::Field(k) => {
-                            let LTy::Tup(ts) = ty.clone() else { panic!("wasmgen: field of {ty:?}") };
+                            let LTy::Tup(ts) = ty.unrec() else { panic!("wasmgen: field of {ty:?}") };
                             match &mut mem {
                                 None => start += ts[..*k].iter().map(|t| vts(t).len()).sum::<usize>(),
                                 Some((_, off)) => *off += field_offset(&ty, *k),
@@ -1934,12 +1937,12 @@ impl<'c, 'p> Fx<'c, 'p> {
                 let a = self.eval_locals(arr);
                 let iv = self.eval_locals(idx)[0];
                 let addr = self.elem_addr(a[0], a[1], iv, &et, check.as_deref());
-                let LTy::Tup(ts) = &et else { unreachable!() };
+                let LTy::Tup(ts) = &et.unrec() else { unreachable!() };
                 let off = field_offset(&et, *i);
                 self.load(&ts[*i].clone(), addr, off);
             }
             LE::Field(x, i) => {
-                let LTy::Tup(ts) = self.ty(x) else { unreachable!() };
+                let LTy::Tup(ts) = self.ty(x).unrec() else { unreachable!() };
                 let ls = self.eval_locals(x);
                 let start: usize = ts[..*i].iter().map(|t| vts(t).len()).sum();
                 let n = vts(&ts[*i]).len();
@@ -2404,7 +2407,7 @@ pub(crate) fn ty_of(tys: &Tys, vars: &[LVar], e: &LE) -> LTy {
         LE::B(_) | LE::Cmp(..) | LE::Not(_) => LTy::Bool,
         LE::Unit => LTy::Unit,
         LE::Tup(t, _) => t.clone(),
-        LE::Field(x, i) => match ty(x) {
+        LE::Field(x, i) => match ty(x).unrec() {
             LTy::Tup(ts) => ts[*i].clone(),
             t => panic!("wasmgen: field of {t:?}"),
         },
@@ -2454,6 +2457,7 @@ pub(crate) fn ty_of(tys: &Tys, vars: &[LVar], e: &LE) -> LTy {
 
 /// Byte offset of field `k` of a tuple type (C layout).
 fn field_offset(t: &LTy, k: usize) -> u32 {
+    let t = &t.unrec();
     let LTy::Tup(ts) = t else { panic!("wasmgen: field of {t:?}") };
     let mut off = 0u32;
     for (i, ft) in ts.iter().enumerate() {

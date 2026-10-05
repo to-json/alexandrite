@@ -72,6 +72,9 @@ fn convert_fn(f: &mut TFunc) {
 /// A zero value of a type, if it's simple to build here.
 fn zero(t: &Ty) -> Option<TExpr> {
     let sp = crate::diag::Span::default();
+    if let Ty::Rec(_) = t {
+        return zero(&t.unrec());
+    }
     let kind = match t {
         Ty::Int | Ty::IntK(_) => TK::Int(0),
         Ty::Float => TK::Float(0.0),

@@ -28,6 +28,8 @@ thread_local! {
     /// index, type): an Int is a bignum in promote mode, so one constant
     /// can need two.
     static GLOBALS: RefCell<Vec<(usize, LTy)>> = const { RefCell::new(Vec::new()) };
+    /// The generated helper functions made so far (`Lw::helper`).
+    static HELPERS: RefCell<std::collections::HashSet<String>> = RefCell::new(Default::default());
 }
 
 /// The LIR global for array constant `k` as an `t`.
@@ -94,6 +96,7 @@ pub fn lower(p: &TProgram, sm: &SourceMap, opts: &Opts) -> LProgram {
         *l.borrow_mut() = p.funcs.iter().flat_map(|f| f.lambdas.iter().map(move |(lo, t, caps)| (f.cname.clone(), *lo, t.clone(), caps.iter().map(|c| f.locals[*c].ty.clone()).collect()))).collect();
     });
     GLOBALS.with(|g| g.borrow_mut().clear());
+    reset_recs();
     let prog = RefCell::new(LProgram::default());
 
     // R1: where each allocation lives (unless turned off, for comparison).
@@ -163,6 +166,7 @@ pub fn lower(p: &TProgram, sm: &SourceMap, opts: &Opts) -> LProgram {
         main.body.splice(0..0, init);
     }
     prog.globals = globals.into_iter().map(|(_, t)| t).collect();
+    prog.recs = crate::lir::recs();
     drop_idle_regions(&mut prog);
     prog
 }
@@ -311,7 +315,243 @@ fn fn_ret(f: &TFunc) -> LTy {
     if f.fallible && !f.is_main { result_lty(t, f.overflow) } else { t }
 }
 
+// ---------- types that contain themselves (R12, R13) ----------
+//
+// A struct, enum, interface or function type is *recursive* when its
+// layout reaches itself: `struct Node { kids: [Node] }`, an interface
+// with an implementor that holds the interface, a closure type with a
+// lambda capturing a value that holds such closures. Its LIR type is an
+// `LTy::Rec` (a named tuple), and its self-mentions are kept behind an
+// array, so the layout is finite:
+//
+// - slices, maps, pools, mutexes, channels already are arrays;
+// - an optional *field* (of a struct or an enum variant) whose value
+//   leads back to its type is boxed: a zero- or one-element array
+//   instead of (present, value);
+// - a recursive interface value is (tag, [implementor 0], [implementor 1],
+//   ...): each implementor's value in a one-element array (R13);
+// - a recursive closure type holds each lambda's captures in a
+//   one-element array.
+//
+// A box is never written through (an optional, an interface value and a
+// closure's captures change only by being replaced), so copies share it.
+// An empty box stands for the zero value: none, the first implementor's
+// zero, the first lambda with zero captures.
+
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+enum Node {
+    Named(String),
+    Iface(String),
+    /// A function type, by `Ty::show`.
+    Fn(String),
+    /// `Error`: every error type's value.
+    Err,
+}
+
+thread_local! {
+    /// Struct and enum definitions met so far, by name.
+    static NAMED: RefCell<HashMap<String, Ty>> = RefCell::new(HashMap::new());
+    /// Whether each node's layout reaches itself.
+    static RECURSIVE: RefCell<HashMap<Node, bool>> = RefCell::new(HashMap::new());
+    /// The `LTy::Rec` of each recursive node, per overflow mode.
+    static REC_LTY: RefCell<HashMap<(Node, bool), usize>> = RefCell::new(HashMap::new());
+    /// Whether an optional field (container, payload by `Ty::show`) is boxed.
+    static BOXED: RefCell<HashMap<(String, String), bool>> = RefCell::new(HashMap::new());
+}
+
+fn reset_recs() {
+    HELPERS.with(|h| h.borrow_mut().clear());
+    NAMED.with(|m| m.borrow_mut().clear());
+    RECURSIVE.with(|m| m.borrow_mut().clear());
+    REC_LTY.with(|m| m.borrow_mut().clear());
+    BOXED.with(|m| m.borrow_mut().clear());
+    crate::lir::set_recs(&[]);
+}
+
+fn named_def(n: &str) -> Option<Ty> {
+    NAMED.with(|m| m.borrow().get(n).cloned()).or_else(|| rec_def(n))
+}
+
+fn node_of(t: &Ty) -> Option<Node> {
+    match t {
+        Ty::Struct(n, _) | Ty::Enum(n, _) => {
+            NAMED.with(|m| {
+                if !m.borrow().contains_key(n) {
+                    m.borrow_mut().insert(n.clone(), t.clone());
+                }
+            });
+            Some(Node::Named(n.clone()))
+        }
+        Ty::Rec(n) => Some(Node::Named(n.clone())),
+        Ty::Iface(n) => Some(Node::Iface(n.clone())),
+        Ty::Fn(..) => Some(Node::Fn(t.show())),
+        Ty::Error => Some(Node::Err),
+        _ => None,
+    }
+}
+
+/// The nodes `t`'s layout reaches first (not looking inside them).
+fn nodes_in(t: &Ty, out: &mut Vec<Node>) {
+    if let Some(n) = node_of(t) {
+        if !out.contains(&n) {
+            out.push(n);
+        }
+        return;
+    }
+    match t {
+        Ty::Array(x) | Ty::Fixed(x, _) | Ty::Seq(x, _) | Ty::Gen(x) | Ty::Opt(x) | Ty::Task(x) | Ty::Chan(x) | Ty::Pool(x) | Ty::Mutex(x) | Ty::Atomic(x) => nodes_in(x, out),
+        Ty::Result(x) => {
+            nodes_in(x, out);
+            nodes_in(&Ty::Error, out);
+        }
+        Ty::Tuple(ts) => ts.iter().for_each(|x| nodes_in(x, out)),
+        Ty::Map(k, v) => {
+            nodes_in(k, out);
+            nodes_in(v, out);
+        }
+        _ => {}
+    }
+}
+
+fn fields_of_def(def: &Ty) -> Vec<Ty> {
+    match def {
+        Ty::Struct(_, fs) => fs.iter().map(|(_, t)| t.clone()).collect(),
+        Ty::Enum(_, vs) => vs.iter().flat_map(|(_, fs)| fs.iter().map(|(_, t)| t.clone())).collect(),
+        _ => vec![],
+    }
+}
+
+/// What a node's layout is made of.
+fn node_parts(n: &Node) -> Vec<Ty> {
+    match n {
+        Node::Named(name) => named_def(name).map(|d| fields_of_def(&d)).unwrap_or_default(),
+        Node::Iface(name) => IFACES.with(|m| m.borrow().get(name).cloned().unwrap_or_default()),
+        Node::Fn(key) => LAMBDAS.with(|l| l.borrow().iter().filter(|s| s.2.show() == *key).flat_map(|s| s.3.clone()).collect()),
+        Node::Err => ERRORS.with(|e| e.borrow().clone()),
+    }
+}
+
+fn succ(n: &Node) -> Vec<Node> {
+    let mut out = vec![];
+    for t in node_parts(n) {
+        nodes_in(&t, &mut out);
+    }
+    out
+}
+
+/// Does the node's layout reach itself?
+fn recursive(n: &Node) -> bool {
+    if let Some(r) = RECURSIVE.with(|m| m.borrow().get(n).copied()) {
+        return r;
+    }
+    let mut seen: Vec<Node> = vec![];
+    let mut stack = succ(n);
+    let mut found = false;
+    while let Some(x) = stack.pop() {
+        if x == *n {
+            found = true;
+            break;
+        }
+        if seen.contains(&x) {
+            continue;
+        }
+        let next = succ(&x);
+        seen.push(x);
+        stack.extend(next);
+    }
+    RECURSIVE.with(|m| m.borrow_mut().insert(n.clone(), found));
+    found
+}
+
+fn ty_recursive(t: &Ty) -> bool {
+    match t {
+        Ty::Struct(..) | Ty::Enum(..) | Ty::Rec(_) | Ty::Iface(_) | Ty::Fn(..) => node_of(t).is_some_and(|n| recursive(&n)),
+        _ => false,
+    }
+}
+
+/// Is an optional field of `container` holding a `payload` boxed? When the
+/// payload leads back to the container without passing an array (or a
+/// boxed interface value or closure).
+fn boxed_opt(container: &str, payload: &Ty) -> bool {
+    let key = (container.to_string(), payload.show());
+    if let Some(b) = BOXED.with(|m| m.borrow().get(&key).copied()) {
+        return b;
+    }
+    fn reaches(t: &Ty, target: &str, seen: &mut Vec<Node>) -> bool {
+        match t {
+            Ty::Struct(..) | Ty::Enum(..) | Ty::Rec(_) | Ty::Iface(_) | Ty::Fn(..) => {
+                let n = node_of(t).unwrap();
+                if n == Node::Named(target.to_string()) {
+                    return true;
+                }
+                if seen.contains(&n) || (matches!(n, Node::Iface(_) | Node::Fn(_)) && recursive(&n)) {
+                    return false;
+                }
+                seen.push(n.clone());
+                node_parts(&n).iter().any(|x| reaches(x, target, seen))
+            }
+            Ty::Opt(x) | Ty::Fixed(x, _) | Ty::Result(x) => reaches(x, target, seen),
+            Ty::Tuple(ts) => ts.iter().any(|x| reaches(x, target, seen)),
+            _ => false,
+        }
+    }
+    let b = reaches(payload, container, &mut vec![]);
+    BOXED.with(|m| m.borrow_mut().insert(key, b));
+    b
+}
+
+/// The payload of slot `k` of a struct or enum value (an enum's slot 0 is
+/// its tag) when that slot is a boxed optional.
+fn boxed_slot(container: &Ty, k: usize) -> Option<Ty> {
+    let def = container.unrec();
+    let (name, ft) = match &def {
+        Ty::Struct(n, fs) => (n, fs.get(k)?.1.clone()),
+        Ty::Enum(n, vs) => (n, vs.iter().flat_map(|(_, fs)| fs.iter().map(|(_, t)| t.clone())).nth(k.checked_sub(1)?)?),
+        _ => return None,
+    };
+    let Ty::Opt(x) = ft else { return None };
+    (recursive(&Node::Named(name.clone())) && boxed_opt(name, &x)).then(|| *x)
+}
+
+/// The LIR type of field `ft` of recursive struct or enum `container`.
+fn slot_lty(container: &str, ft: &Ty, mode: Overflow) -> LTy {
+    match ft {
+        Ty::Opt(x) if boxed_opt(container, x) => LTy::Arr(Box::new(lty(x, mode))),
+        t => lty(t, mode),
+    }
+}
+
+/// The `LTy::Rec` of a recursive node (its body made on first use).
+fn rec_lty(n: Node, mode: Overflow, body: impl FnOnce() -> LTy) -> LTy {
+    let key = (n, mode == Overflow::Promote);
+    if let Some(i) = REC_LTY.with(|m| m.borrow().get(&key).copied()) {
+        return LTy::Rec(i);
+    }
+    let i = crate::lir::new_rec();
+    REC_LTY.with(|m| m.borrow_mut().insert(key, i));
+    let b = body();
+    crate::lir::define_rec(i, b);
+    LTy::Rec(i)
+}
+
 pub fn lty(t: &Ty, mode: Overflow) -> LTy {
+    match t {
+        Ty::Rec(_) => lty(&t.unrec(), mode),
+        Ty::Struct(n, fs) if ty_recursive(t) => rec_lty(Node::Named(n.clone()), mode, || LTy::Tup(fs.iter().map(|(_, ft)| slot_lty(n, ft, mode)).collect())),
+        Ty::Enum(n, vs) if ty_recursive(t) => rec_lty(Node::Named(n.clone()), mode, || LTy::Tup(std::iter::once(LTy::I64).chain(vs.iter().flat_map(|(_, fs)| fs.iter().map(|(_, ft)| slot_lty(n, ft, mode)))).collect())),
+        Ty::Iface(n) if ty_recursive(t) => rec_lty(Node::Iface(n.clone()), mode, || {
+            let impls = IFACES.with(|m| m.borrow().get(n).cloned().unwrap_or_default());
+            LTy::Tup(std::iter::once(LTy::I64).chain(impls.iter().map(|t| LTy::Arr(Box::new(lty(t, mode))))).collect())
+        }),
+        Ty::Fn(..) if ty_recursive(t) => rec_lty(Node::Fn(t.show()), mode, || {
+            LTy::Tup(std::iter::once(LTy::I64).chain(lambda_sites(t).iter().map(|(_, caps)| LTy::Arr(Box::new(LTy::Tup(caps.iter().map(|c| lty(c, mode)).collect()))))).collect())
+        }),
+        _ => lty_plain(t, mode),
+    }
+}
+
+fn lty_plain(t: &Ty, mode: Overflow) -> LTy {
     match t {
         Ty::Int => {
             if mode == Overflow::Promote {
@@ -355,6 +595,7 @@ pub fn lty(t: &Ty, mode: Overflow) -> LTy {
         Ty::Tuple(ts) => LTy::Tup(ts.iter().map(|t| lty(t, mode)).collect()),
         Ty::Range => LTy::Range,
         Ty::Gen(t) => LTy::Gen(Box::new(lty(t, mode))),
+        Ty::Rec(_) => unreachable!(),
     }
 }
 
@@ -1081,7 +1322,7 @@ impl<'a> Lw<'a> {
             TK::Zero => zero_le(&self.lty(&e.ty)),
             TK::None => {
                 let t = self.lty(&e.ty);
-                let LTy::Tup(ts) = &t else { unreachable!() };
+                let ts = t.tup_fields();
                 let z = zero_le(&ts[1]);
                 LE::Tup(t, vec![LE::B(false), z])
             }
@@ -1392,6 +1633,99 @@ impl<'a> Lw<'a> {
     }
 
     /// A copy of an array with its own storage (elements copied as values).
+    /// Call the generated function `name` (making it on first use): its
+    /// parameters are `params`, its body what `body` makes of them. For
+    /// work on types that contain themselves (R12), which can't be done
+    /// inline. It has no region of its own: it allocates in its caller's.
+    fn helper(&mut self, name: String, params: Vec<LTy>, ret: LTy, body: impl FnOnce(&mut Lw<'a>, Vec<LE>) -> LE) -> String {
+        if HELPERS.with(|h| h.borrow_mut().insert(name.clone())) {
+            let mut w = Lw::new(self.p, self.sm, self.opts, self.f, self.mode, ErrPath::Return(vec![]), self.prog);
+            let pvs: Vec<V> = params.into_iter().map(|t| w.new_var("p", t)).collect();
+            let args: Vec<LE> = pvs.iter().map(|v| LE::Var(*v)).collect();
+            let (mut stmts, v) = w.sub_val(|w| body(w, args));
+            stmts.push(LS::Return(Some(v)));
+            let func = LFunc { name: name.clone(), params: pvs, vars: w.vars, ret, body: stmts, external: false, is_main: false, labels: w.labels };
+            self.prog.borrow_mut().funcs.push(func);
+        }
+        name
+    }
+
+    /// Slot `k` of a struct or enum value `v` of type `container` (a
+    /// boxed optional field read as an optional).
+    fn slot_read(&mut self, container: &Ty, v: LE, k: usize) -> LE {
+        let f = LE::Field(Box::new(v), k);
+        match boxed_slot(container, k) {
+            Some(x) => self.opt_unbox(f, &x),
+            None => f,
+        }
+    }
+
+    /// A boxed optional (a zero- or one-element array) as a `x?`.
+    fn opt_unbox(&mut self, b: LE, x: &Ty) -> LE {
+        let xt = self.lty(x);
+        let ot = self.lty(&Ty::Opt(Box::new(x.clone())));
+        let b = self.bind(b, LTy::Arr(Box::new(xt.clone())));
+        let o = self.tmp(ot.clone());
+        self.emit(LS::Set(o, LE::Tup(ot.clone(), vec![LE::B(false), zero_le(&xt)])));
+        let got = LE::Tup(ot, vec![LE::B(true), LE::Index { arr: Box::new(b.clone()), idx: Box::new(LE::I(0)), check: None }]);
+        self.emit(LS::If(LE::Cmp(Op::Gt, Box::new(LE::Len(Box::new(b))), Box::new(LE::I(0)), LTy::I64), vec![LS::Set(o, got)], vec![]));
+        LE::Var(o)
+    }
+
+    /// A `x?` boxed, for an optional field that leads back to its type.
+    fn opt_box(&mut self, o: LE, x: &Ty) -> LE {
+        let xt = self.lty(x);
+        let ot = self.lty(&Ty::Opt(Box::new(x.clone())));
+        let at = LTy::Arr(Box::new(xt.clone()));
+        let o = self.bind(o, ot);
+        let b = self.tmp(at);
+        self.emit(LS::Set(b, LE::ArrWithCap(xt.clone(), Box::new(LE::I(0)))));
+        let set = LS::Set(b, LE::ArrLit(xt, vec![LE::Field(Box::new(o.clone()), 1)]));
+        self.emit(LS::If(LE::Field(Box::new(o), 0), vec![set], vec![]));
+        LE::Var(b)
+    }
+
+    /// The value of a box (a one-element array), or the zero value of `t`
+    /// when it is empty (a zero interface value or closure, R13).
+    fn unbox(&mut self, b: LE, t: &LTy) -> LE {
+        let b = self.bind(b, LTy::Arr(Box::new(t.clone())));
+        let x = self.tmp(t.clone());
+        self.emit(LS::Set(x, zero_le(t)));
+        let got = LE::Index { arr: Box::new(b.clone()), idx: Box::new(LE::I(0)), check: None };
+        self.emit(LS::If(LE::Cmp(Op::Gt, Box::new(LE::Len(Box::new(b))), Box::new(LE::I(0)), LTy::I64), vec![LS::Set(x, got)], vec![]));
+        LE::Var(x)
+    }
+
+    /// Implementor `k`'s value of interface value `v` (bound) of type `it`.
+    fn iface_get(&mut self, v: LE, it: &Ty, k: usize) -> LE {
+        let f = LE::Field(Box::new(v), k + 1);
+        if !ty_recursive(it) {
+            return f;
+        }
+        let Ty::Iface(n) = it else { unreachable!() };
+        let impl_t = self.p.ifaces[n][k].0.clone();
+        let lt = self.lty(&impl_t);
+        self.unbox(f, &lt)
+    }
+
+    /// The interface value of type `it` holding `v` as implementor `k`.
+    fn make_iface(&mut self, it: &Ty, k: usize, v: LE) -> LE {
+        let lt = self.lty(it);
+        let ts = lt.tup_fields();
+        let boxed = ty_recursive(it);
+        let mut vals = vec![LE::I(k as i64)];
+        for (j, t) in ts[1..].iter().enumerate() {
+            vals.push(if j != k {
+                zero_le(t)
+            } else if boxed {
+                LE::ArrLit(t.clone().arr_elem_lty(), vec![v.clone()])
+            } else {
+                v.clone()
+            });
+        }
+        LE::Tup(lt, vals)
+    }
+
     fn copy_arr(&mut self, v: LE, el: &Ty) -> LE {
         let lt = LTy::Arr(Box::new(self.lty(el)));
         let c = self.tmp(lt);
@@ -1547,13 +1881,7 @@ impl<'a> Lw<'a> {
         if let (Ty::Iface(n), Ty::Struct(..) | Ty::Enum(..)) = (&e.ty, &f.ret) {
             let impls = self.p.ifaces.get(n).cloned().unwrap_or_default();
             let k = impls.iter().position(|(t, _)| *t == f.ret).expect("covariant result implements the interface");
-            let lt = self.lty(&e.ty);
-            let LTy::Tup(ts) = &lt else { unreachable!() };
-            let mut vals = vec![LE::I(k as i64)];
-            for (j, t) in ts[1..].iter().enumerate() {
-                vals.push(if j == k { call.clone() } else { zero_le(t) });
-            }
-            return (vec![], LE::Tup(lt, vals));
+            return (vec![], self.make_iface(&e.ty, k, call));
         }
         let Ty::Result(t) = &e.ty else { return (vec![], call) };
         if f.fallible {
@@ -1625,7 +1953,7 @@ impl<'a> Lw<'a> {
                 // A Mutex (a one-element array of lock and value) is a handle:
                 // copies share it, like channels and atomics.
                 LTy::Arr(el) if matches!(&**el, LTy::Tup(ts) if ts.first() == Some(&LTy::Lock)) => false,
-                LTy::Str | LTy::Arr(_) | LTy::PInt => true,
+                LTy::Str | LTy::Arr(_) | LTy::PInt | LTy::Rec(_) => true,
                 LTy::Tup(ts) => ts.iter().any(has_storage),
                 _ => false,
             }
@@ -1634,6 +1962,16 @@ impl<'a> Lw<'a> {
             return v;
         }
         match t {
+            // A type that contains itself: a function (copying inline would never end).
+            LTy::Rec(i) => {
+                let body = t.unrec();
+                let rt = t.clone();
+                let name = self.helper(format!("__dup_rec{i}"), vec![t.clone()], t.clone(), move |w, ps| {
+                    let fields = body.tup_fields().iter().enumerate().map(|(k, ft)| w.deep_copy(LE::Field(Box::new(ps[0].clone()), k), ft)).collect();
+                    LE::Tup(rt, fields)
+                });
+                LE::Call(name, vec![v])
+            }
             // (A one-part concatenation always copies.)
             LTy::Str => LE::Rt(Rt::StrCat, vec![v]),
             LTy::PInt => v,
@@ -2008,6 +2346,13 @@ impl<'a> Lw<'a> {
         if !ty.is_value_array() {
             return v;
         }
+        let unfolded;
+        let ty = if let Ty::Rec(_) = ty {
+            unfolded = ty.unrec();
+            &unfolded
+        } else {
+            ty
+        };
         match ty {
             Ty::Fixed(el, n) => {
                 let lt = self.lty(ty);
@@ -2045,7 +2390,8 @@ impl<'a> Lw<'a> {
             Ty::Struct(_, fs) => {
                 let lt = self.lty(ty);
                 let t = self.bind(v, lt.clone());
-                let vals = fs.iter().enumerate().map(|(k, (_, ft))| self.copy_value(LE::Field(Box::new(t.clone()), k), ft)).collect();
+                // A boxed optional field is never written through: copies share it.
+                let vals = fs.iter().enumerate().map(|(k, (_, ft))| if boxed_slot(ty, k).is_some() { LE::Field(Box::new(t.clone()), k) } else { self.copy_value(LE::Field(Box::new(t.clone()), k), ft) }).collect();
                 LE::Tup(lt, vals)
             }
             Ty::Tuple(ts) => {
@@ -2427,6 +2773,21 @@ impl<'a> Lw<'a> {
                 };
             }
         }
+        // The type at each step: the last one may be a boxed optional field.
+        let mut cur_t = self.f.locals[l].ty.clone();
+        let mut last_box = None;
+        for (k, st) in steps.iter().enumerate() {
+            let u = cur_t.unrec();
+            if let (TStep::Field(f), true) = (st, k + 1 == steps.len()) {
+                last_box = boxed_slot(&u, *f);
+            }
+            cur_t = match (st, &u) {
+                (TStep::Index(_), _) => u.arr_elem().unwrap_or(Ty::Unit),
+                (TStep::Field(f), Ty::Struct(_, fs)) => fs.get(*f).map(|x| x.1.clone()).unwrap_or(Ty::Unit),
+                (TStep::Field(f), Ty::Tuple(ts)) => ts.get(*f).cloned().unwrap_or(Ty::Unit),
+                _ => Ty::Unit,
+            };
+        }
         let pty = self.lty(&e.ty);
         let rhs = self.expr(v);
         let val = match op {
@@ -2445,6 +2806,9 @@ impl<'a> Lw<'a> {
         let val = self.bind(val, pty);
         if lsteps.is_empty() {
             self.emit(LS::Set(var, val.clone()));
+        } else if let Some(x) = last_box {
+            let b = self.opt_box(val.clone(), &x);
+            self.emit(LS::SetPlace { var, steps: lsteps, val: b });
         } else {
             self.emit(LS::SetPlace { var, steps: lsteps, val: val.clone() });
         }
@@ -2566,6 +2930,25 @@ impl<'a> Lw<'a> {
         if *t == Ty::Error {
             return self.error_message(v);
         }
+        let unfolded;
+        let t = if let Ty::Rec(_) = t {
+            unfolded = t.unrec();
+            &unfolded
+        } else {
+            t
+        };
+        // A type that contains itself: a function (printing inline would never end).
+        if matches!(t, Ty::Struct(..) | Ty::Enum(..) | Ty::Iface(_)) && ty_recursive(t) {
+            let lt = self.lty(t);
+            let LTy::Rec(i) = lt else { unreachable!() };
+            let t2 = t.clone();
+            let name = self.helper(format!("__to_s_rec{i}"), vec![lt], LTy::Str, move |w, ps| w.to_s_parts(ps[0].clone(), &t2));
+            return LE::Call(name, vec![v]);
+        }
+        self.to_s_parts(v, t)
+    }
+
+    fn to_s_parts(&mut self, v: LE, t: &Ty) -> LE {
         match t {
             Ty::Opt(inner) => {
                 let lt = self.lty(t);
@@ -2603,7 +2986,8 @@ impl<'a> Lw<'a> {
                 self.emit(LS::Set(s, LE::S(String::new())));
                 for (k, (it, _)) in impls.iter().enumerate() {
                     let body = self.sub(|lw| {
-                        let v = lw.to_s(LE::Field(Box::new(x.clone()), k + 1), it);
+                        let v = lw.iface_get(x.clone(), t, k);
+                        let v = lw.to_s(v, it);
                         lw.emit(LS::Set(s, v));
                     });
                     self.emit(LS::If(LE::Cmp(Op::Eq, Box::new(LE::Field(Box::new(x.clone()), 0)), Box::new(LE::I(k as i64)), LTy::I64), body, vec![]));
@@ -2626,7 +3010,8 @@ impl<'a> Lw<'a> {
                             if j > 0 {
                                 parts.push(LE::S(", ".into()));
                             }
-                            let f = self.to_s(LE::Field(Box::new(x.clone()), slot + j), ft);
+                            let f = self.slot_read(t, x.clone(), slot + j);
+                            let f = self.to_s(f, ft);
                             let fv = self.tmp(LTy::Str);
                             self.emit(LS::Set(fv, f));
                             parts.push(LE::Var(fv));
@@ -2657,7 +3042,8 @@ impl<'a> Lw<'a> {
                     if k > 0 {
                         parts.push(LE::S(" ".into()));
                     }
-                    let fs = self.to_s(LE::Field(Box::new(x.clone()), k), ft);
+                    let fs = self.slot_read(t, x.clone(), k);
+                    let fs = self.to_s(fs, ft);
                     let fv = self.tmp(LTy::Str);
                     self.emit(LS::Set(fv, fs));
                     parts.push(LE::Var(fv));
@@ -3004,7 +3390,14 @@ impl<'a> Lw<'a> {
             }
             StructNew => {
                 let t = self.lty(&e.ty);
-                let vs = args.iter().map(|a| self.arg(a)).collect();
+                let mut vs = vec![];
+                for (k, a) in args.iter().enumerate() {
+                    let v = self.arg(a);
+                    vs.push(match boxed_slot(&e.ty, k) {
+                        Some(x) => self.opt_box(v, &x),
+                        None => v,
+                    });
+                }
                 LE::Tup(t, vs)
             }
             OptPresent => LE::Field(Box::new(self.expr(recv.unwrap())), 0),
@@ -3075,11 +3468,21 @@ impl<'a> Lw<'a> {
                 let func = LFunc { name: format!("__lambda_{g}"), params, vars: std::mem::take(&mut w.vars), ret, body, external: false, is_main: false, labels: w.labels };
                 self.prog.borrow_mut().funcs.push(func);
                 let lt = self.lty(&e.ty);
-                let LTy::Tup(ts) = &lt else { unreachable!() };
+                let ts = lt.tup_fields();
                 let caps: Vec<LE> = args.iter().map(|a| self.arg(a)).collect();
+                // A closure type that contains itself (R12) holds each
+                // lambda's captures in a box.
+                let boxed = ty_recursive(&e.ty);
                 let mut vals = vec![LE::I(tag as i64)];
                 for (j, t) in ts[1..].iter().enumerate() {
-                    vals.push(if j == tag { LE::Tup(t.clone(), caps.clone()) } else { zero_le(t) });
+                    vals.push(if j != tag {
+                        zero_le(t)
+                    } else if boxed {
+                        let ct = t.clone().arr_elem_lty();
+                        LE::ArrLit(ct.clone(), vec![LE::Tup(ct, caps.clone())])
+                    } else {
+                        LE::Tup(t.clone(), caps.clone())
+                    });
                 }
                 LE::Tup(lt, vals)
             }
@@ -3098,8 +3501,21 @@ impl<'a> Lw<'a> {
                     self.emit(LS::Set(o, zero_le(&rt)));
                 }
                 let tag = LE::Field(Box::new(fv.clone()), 0);
+                let boxed = ty_recursive(&f.ty);
+                let fts = self.lty(&f.ty).tup_fields();
                 for (k, (g, caps)) in lambda_sites(&f.ty).iter().enumerate() {
                     let env = LE::Field(Box::new(fv.clone()), k + 1);
+                    let env = if boxed {
+                        let ct = fts[k + 1].clone().arr_elem_lty();
+                        let (pre, env) = self.sub_val(|lw| lw.unbox(env, &ct));
+                        let env_v = self.tmp(ct.clone());
+                        let mut pre = pre;
+                        pre.push(LS::Set(env_v, env));
+                        self.emit(LS::If(LE::Cmp(Op::Eq, Box::new(tag.clone()), Box::new(LE::I(k as i64)), LTy::I64), pre, vec![]));
+                        LE::Var(env_v)
+                    } else {
+                        env
+                    };
                     let cargs = (0..caps.len()).map(|j| LE::Field(Box::new(env.clone()), j)).chain(avs.iter().cloned()).collect();
                     let call = LE::Call(format!("__lambda_{g}"), cargs);
                     let st = match out {
@@ -3465,14 +3881,34 @@ impl<'a> Lw<'a> {
                 }
             }
             ToIface(k) => {
-                let lt = self.lty(&e.ty);
-                let LTy::Tup(ts) = &lt else { unreachable!() };
                 let v = self.arg(recv.unwrap());
-                let mut vals = vec![LE::I(k as i64)];
-                for (j, t) in ts[1..].iter().enumerate() {
-                    vals.push(if j == k { v.clone() } else { zero_le(t) });
-                }
-                LE::Tup(lt, vals)
+                self.make_iface(&e.ty, k, v)
+            }
+            IfaceEq => {
+                // The same implementor, and its `__eq` of the two values (#108).
+                let r = recv.unwrap();
+                let Ty::Iface(n) = &r.ty else { unreachable!() };
+                let lt = self.lty(&r.ty);
+                let a = self.expr(r);
+                let a = self.bind(a, lt.clone());
+                let b = self.expr(&args[0]);
+                let b = self.bind(b, lt);
+                let out = self.tmp(LTy::Bool);
+                self.emit(LS::Set(out, LE::B(false)));
+                let eqs = self.p.iface_eqs.get(n).cloned().unwrap_or_default();
+                let tag_a = LE::Field(Box::new(a.clone()), 0);
+                let same = LE::Cmp(Op::Eq, Box::new(tag_a.clone()), Box::new(LE::Field(Box::new(b.clone()), 0)), LTy::I64);
+                let body = self.sub(|lw| {
+                    for (k, fid) in eqs.iter().enumerate() {
+                        let arm = lw.sub(|lw| {
+                            let (x, y) = (lw.iface_get(a.clone(), &r.ty, k), lw.iface_get(b.clone(), &r.ty, k));
+                            lw.emit(LS::Set(out, LE::Call(lw.p.funcs[*fid].cname.clone(), vec![x, y])));
+                        });
+                        lw.emit(LS::If(LE::Cmp(Op::Eq, Box::new(tag_a.clone()), Box::new(LE::I(k as i64)), LTy::I64), arm, vec![]));
+                    }
+                });
+                self.emit(LS::If(same, body, vec![]));
+                LE::Var(out)
             }
             IfaceCall(mi) if matches!(recv.unwrap().ty, Ty::Array(_)) => {
                 // A `!` method: the receiver is a one-element slice holding the
@@ -3496,6 +3932,7 @@ impl<'a> Lw<'a> {
                 }
                 let held = LE::Index { arr: Box::new(LE::Var(tv)), idx: Box::new(LE::I(0)), check: None };
                 let tag = LE::Field(Box::new(held.clone()), 0);
+                let boxed = ty_recursive(it);
                 for (k, (ty, fids)) in impls.iter().enumerate() {
                     let ct = self.lty(ty);
                     let cell = self.tmp(LTy::Arr(Box::new(ct.clone())));
@@ -3503,7 +3940,8 @@ impl<'a> Lw<'a> {
                     let body = self.sub(|lw| {
                         let saved = lw.tmp(LTy::Region);
                         lw.emit(LS::RegionUse { region: LE::RegionOf(Box::new(LE::Var(tv))), saved });
-                        lw.emit(LS::Set(cell, LE::ArrLit(ct.clone(), vec![LE::Field(Box::new(held.clone()), k + 1)])));
+                        let cur = lw.iface_get(held.clone(), it, k);
+                        lw.emit(LS::Set(cell, LE::ArrLit(ct.clone(), vec![cur])));
                         lw.emit(LS::RegionRestore(saved));
                         let call = LE::Call(f.clone(), std::iter::once(LE::Var(cell)).chain(avs.iter().cloned()).collect());
                         let (pre, call) = lw.iface_result(e, fids[mi], call);
@@ -3514,7 +3952,8 @@ impl<'a> Lw<'a> {
                             Some(o) => lw.emit(LS::Set(o, call)),
                             None => lw.emit(LS::Eval(call)),
                         }
-                        let back = LE::Index { arr: Box::new(LE::Var(cell)), idx: Box::new(LE::I(0)), check: None };
+                        // A boxed implementor (R13): the cell is its new box.
+                        let back = if boxed { LE::Var(cell) } else { LE::Index { arr: Box::new(LE::Var(cell)), idx: Box::new(LE::I(0)), check: None } };
                         lw.emit(LS::SetPlace { var: tv, steps: vec![crate::lir::Step::Index(LE::I(0), None), crate::lir::Step::Field(k + 1)], val: back });
                     });
                     self.emit(LS::If(LE::Cmp(Op::Eq, Box::new(tag.clone()), Box::new(LE::I(k as i64)), LTy::I64), body, vec![]));
@@ -3529,12 +3968,15 @@ impl<'a> Lw<'a> {
                 let rv = self.expr(r);
                 let rv = self.bind(rv, self.lty(&r.ty));
                 let t = self.lty(&e.ty);
-                let LTy::Tup(ts) = &t else { unreachable!() };
+                let ts = t.tup_fields();
                 let out = self.tmp(t.clone());
                 self.emit(LS::Set(out, LE::Tup(t.clone(), vec![LE::B(false), zero_le(&ts[1])])));
                 let tag = LE::Field(Box::new(rv.clone()), 0);
-                let got = LS::Set(out, LE::Tup(t.clone(), vec![LE::B(true), LE::Field(Box::new(rv), k + 1)]));
-                self.emit(LS::If(LE::Cmp(Op::Eq, Box::new(tag), Box::new(LE::I(k as i64)), LTy::I64), vec![got], vec![]));
+                let arm = self.sub(|lw| {
+                    let v = lw.iface_get(rv.clone(), &r.ty, k);
+                    lw.emit(LS::Set(out, LE::Tup(t.clone(), vec![LE::B(true), v])));
+                });
+                self.emit(LS::If(LE::Cmp(Op::Eq, Box::new(tag), Box::new(LE::I(k as i64)), LTy::I64), arm, vec![]));
                 LE::Var(out)
             }
             IfaceCall(mi) => {
@@ -3555,14 +3997,20 @@ impl<'a> Lw<'a> {
                 }
                 let tag = LE::Field(Box::new(rv.clone()), 0);
                 for (k, (_, fids)) in impls.iter().enumerate() {
-                    let f = &self.p.funcs[fids[mi]];
-                    let call = LE::Call(f.cname.clone(), std::iter::once(LE::Field(Box::new(rv.clone()), k + 1)).chain(avs.iter().cloned()).collect());
-                    let (mut sts, call) = self.iface_result(e, fids[mi], call);
-                    sts.push(match out {
-                        Some(o) => LS::Set(o, call),
-                        None => LS::Eval(call),
+                    let fname = self.p.funcs[fids[mi]].cname.clone();
+                    let arm = self.sub(|lw| {
+                        let me = lw.iface_get(rv.clone(), &r.ty, k);
+                        let call = LE::Call(fname, std::iter::once(me).chain(avs.iter().cloned()).collect());
+                        let (sts, call) = lw.iface_result(e, fids[mi], call);
+                        for st in sts {
+                            lw.emit(st);
+                        }
+                        lw.emit(match out {
+                            Some(o) => LS::Set(o, call),
+                            None => LS::Eval(call),
+                        });
                     });
-                    self.emit(LS::If(LE::Cmp(Op::Eq, Box::new(tag.clone()), Box::new(LE::I(k as i64)), LTy::I64), sts, vec![]));
+                    self.emit(LS::If(LE::Cmp(Op::Eq, Box::new(tag.clone()), Box::new(LE::I(k as i64)), LTy::I64), arm, vec![]));
                 }
                 match out {
                     Some(o) => LE::Var(o),
@@ -3572,8 +4020,17 @@ impl<'a> Lw<'a> {
             VariantNew(k) => {
                 let lt = self.lty(&e.ty);
                 let mut vals = vec![LE::I(k as i64)];
-                for a in args {
-                    vals.push(self.arg(a));
+                for (j, a) in args.iter().enumerate() {
+                    let v = match (boxed_slot(&e.ty, j + 1), &a.kind) {
+                        // Another variant's slot: an empty box.
+                        (Some(x), TK::None | TK::Zero) => LE::ArrWithCap(self.lty(&x), Box::new(LE::I(0))),
+                        (Some(x), _) => {
+                            let v = self.arg(a);
+                            self.opt_box(v, &x)
+                        }
+                        (None, _) => self.arg(a),
+                    };
+                    vals.push(v);
                 }
                 LE::Tup(lt, vals)
             }
@@ -3582,7 +4039,13 @@ impl<'a> Lw<'a> {
                 self.int_out(LE::Field(Box::new(v), 0))
             }
             TupleGet(k) => {
-                let v = self.expr(recv.unwrap());
+                let r = recv.unwrap();
+                let v = self.expr(r);
+                if boxed_slot(&r.ty, k).is_some() {
+                    let lt = self.lty(&r.ty);
+                    let v = self.bind(v, lt);
+                    return self.slot_read(&r.ty, v, k);
+                }
                 LE::Field(Box::new(v), k)
             }
             Push => {
@@ -3698,8 +4161,10 @@ impl<'a> Lw<'a> {
                 LE::Cmp(Op::Eq, Box::new(LE::Field(Box::new(v), 0)), Box::new(LE::I(k as i64)), LTy::I64)
             }
             IfaceAs(k) => {
-                let v = self.expr(recv.unwrap());
-                LE::Field(Box::new(v), 1 + k)
+                let r = recv.unwrap();
+                let v = self.expr(r);
+                let v = self.bind(v, self.lty(&r.ty));
+                self.iface_get(v, &r.ty, k)
             }
             ResOk | ResErr | ResIsOk | ResUnwrap | ResUnwrapOr | ResRescue => {
                 let r = recv.unwrap();
@@ -4736,6 +5201,7 @@ fn zero_le(t: &LTy) -> LE {
         LTy::PInt => LE::ToP(Box::new(LE::I(0))),
         LTy::Arr(e) => LE::ArrWithCap((**e).clone(), Box::new(LE::I(0))),
         LTy::Tup(ts) => LE::Tup(t.clone(), ts.iter().map(zero_le).collect()),
+        LTy::Rec(_) => LE::Tup(t.clone(), t.tup_fields().iter().map(zero_le).collect()),
         LTy::Range => LE::Range(Box::new(LE::I(0)), Box::new(LE::I(0)), false),
         LTy::Gen(_) => panic!("an optional generator has no zero value yet"),
     }
@@ -4743,7 +5209,7 @@ fn zero_le(t: &LTy) -> LE {
 
 fn lty_has_storage(t: &LTy) -> bool {
     match t {
-        LTy::Str | LTy::Arr(_) | LTy::PInt | LTy::Gen(_) => true,
+        LTy::Str | LTy::Arr(_) | LTy::PInt | LTy::Gen(_) | LTy::Rec(_) => true,
         LTy::Tup(ts) => ts.iter().any(lty_has_storage),
         _ => false,
     }

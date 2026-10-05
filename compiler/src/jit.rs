@@ -173,6 +173,8 @@ fn lay(t: &LTy) -> Lay {
             }
             Lay { size: off.next_multiple_of(align).max(1), align, fields, mem }
         }
+        // A type that contains itself (R12): laid out as its body.
+        LTy::Rec(_) => lay(&t.unrec()),
     }
 }
 
@@ -310,6 +312,7 @@ pub fn set_args(args: &[String]) {
 /// Compile the program and run it in this process. Returns only if the
 /// program finishes normally (panics abort; uncaught errors exit 1).
 pub fn run(p: &LProgram) -> Result<(), String> {
+    crate::lir::set_recs(&p.recs);
     let mut fb = settings::builder();
     let set = |fb: &mut settings::Builder, k: &str, v: &str| fb.set(k, v).map_err(|e| format!("jit: {k}: {e}"));
     set(&mut fb, "opt_level", "speed")?;
@@ -1025,7 +1028,7 @@ impl Fx<'_, '_, '_> {
                 for st in steps {
                     match st {
                         Step::Field(k) => {
-                            let LTy::Tup(ts) = ty.clone() else { panic!("jit: field of {ty:?}") };
+                            let LTy::Tup(ts) = ty.unrec() else { panic!("jit: field of {ty:?}") };
                             match &mut mem {
                                 None => start += ts[..*k].iter().map(nflat).sum::<usize>(),
                                 Some((_, off)) => *off += field_offset(&ty, *k) as i32,
@@ -1293,7 +1296,7 @@ impl Fx<'_, '_, '_> {
             LE::S(_) | LE::SB(_) => LTy::Str,
             LE::Unit => LTy::Unit,
             LE::Tup(t, _) => t.clone(),
-            LE::Field(x, i) => match self.ty(x) {
+            LE::Field(x, i) => match self.ty(x).unrec() {
                 LTy::Tup(ts) => ts[*i].clone(),
                 t => panic!("jit: field of {t:?}"),
             },
@@ -1670,12 +1673,12 @@ impl Fx<'_, '_, '_> {
                 let a = self.e(arr);
                 let iv = self.e1(idx);
                 let addr = self.elem_addr(&a, iv, &et, check.as_deref());
-                let LTy::Tup(ts) = &et else { unreachable!() };
+                let LTy::Tup(ts) = &et.unrec() else { unreachable!() };
                 let off = field_offset(&et, *i) as i32;
                 self.load(&ts[*i].clone(), addr, off)
             }
             LE::Field(x, i) => {
-                let LTy::Tup(ts) = self.ty(x) else { unreachable!() };
+                let LTy::Tup(ts) = self.ty(x).unrec() else { unreachable!() };
                 let start: usize = ts[..*i].iter().map(nflat).sum();
                 let n = nflat(&ts[*i]);
                 self.e(x)[start..start + n].to_vec()
@@ -2101,6 +2104,7 @@ impl Fx<'_, '_, '_> {
 
 /// Byte offset of field `k` of a tuple type (C layout).
 fn field_offset(t: &LTy, k: usize) -> u32 {
+    let t = &t.unrec();
     let LTy::Tup(ts) = t else { panic!("jit: field of {t:?}") };
     let mut off = 0u32;
     for (i, ft) in ts.iter().enumerate() {

@@ -93,6 +93,9 @@ fn site(e: &TExpr) -> Node {
 /// children)?
 pub fn allocates(e: &TExpr, promote: bool) -> bool {
     match &e.kind {
+        // Setting an optional field that may be boxed (R12: it leads back to
+        // its own type) makes the box.
+        TK::PlaceAssign(_, steps, _, x) => matches!(steps.last(), Some(TStep::Field(_))) && matches!(&x.ty, Ty::Opt(p) if mentions_rec(p)),
         TK::Array(_) | TK::Format(..) | TK::Call(..) => true,
         // Strings concatenate; Ints are bignums in promote mode.
         TK::Bin(..) | TK::Neg(_) => matches!(e.ty, Ty::Str | Ty::Array(_)) || (promote && e.ty == Ty::Int),
@@ -100,7 +103,7 @@ pub fn allocates(e: &TExpr, promote: bool) -> bool {
             m,
             // Scalars, reads, and terminals that produce an element or a number
             // (their blocks' allocations are sites of their own).
-            M::TupleGet(_) | M::OptPresent | M::OptGet | M::Unwrap | M::EnumTag | M::Size | M::MapSize | M::MapHas | M::ChanLen | M::ResIsOk | M::ErrIs(_) | M::ErrAs(_) | M::IfaceIs(_) | M::IfaceAs(_)
+            M::TupleGet(_) | M::OptPresent | M::OptGet | M::Unwrap | M::EnumTag | M::Size | M::MapSize | M::MapHas | M::ChanLen | M::ResIsOk | M::ErrIs(_) | M::ErrAs(_) | M::IfaceIs(_) | M::IfaceAs(_) | M::IfaceEq
                 | M::Even | M::Odd | M::IntSqrt | M::ToF | M::FloatToI | M::Conv(..) | M::FloatAbs | M::Sqrt | M::Math(_) | M::FloatBits | M::FloatFromBits | M::UMulHi | M::NowNs | M::PtrNull | M::CErrno
                 | M::Sum | M::Max | M::Min | M::MaxBy | M::MinBy | M::Count | M::All | M::Any | M::Include | M::First | M::Last | M::Find | M::Each | M::Loop | M::Step
                 | M::ChanClose | M::CapBegin | M::Exit | M::Global(_) | M::SetGlobal(_)
@@ -215,6 +218,9 @@ impl<'a> Graph<'a> {
                 }
                 let xv = self.expr(x);
                 self.flow(&xv, &[Node::Local(*l)]);
+                // A boxed optional field's box (R12) lives with the variable.
+                let boxes = v.clone();
+                self.flow(&boxes, &[Node::Local(*l)]);
             }
             TK::Call(fid, args) => {
                 let sum = self.sums.get(*fid).cloned().unwrap_or_default();
@@ -458,6 +464,7 @@ impl<'a> Graph<'a> {
 /// Does the type contain an Int (a bignum, in promote mode)?
 pub fn contains_int(t: &Ty) -> bool {
     match t {
+        Ty::Rec(n) => with_rec(n, false, contains_int),
         Ty::Int => true,
         Ty::Opt(t) => contains_int(t),
         Ty::Tuple(ts) => ts.iter().any(contains_int),
@@ -469,6 +476,8 @@ pub fn contains_int(t: &Ty) -> bool {
 /// Can a value of this type refer to heap storage?
 pub fn has_storage(t: &Ty) -> bool {
     match t {
+        // A type that contains itself does so through storage (R12).
+        Ty::Rec(_) => true,
         // An Int or Bool atomic is a runtime cell outside every region.
         Ty::Int | Ty::IntK(_) | Ty::Float | Ty::Bool | Ty::Unit | Ty::Range | Ty::Never | Ty::Handle(_) | Ty::Ptr => false,
         Ty::Atomic(t) => t.atomic_boxed(), // boxed: a lock and the value, like a Mutex

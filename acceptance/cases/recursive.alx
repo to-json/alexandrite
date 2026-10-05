@@ -1,0 +1,205 @@
+# R12: values that contain their own type through indirection: slices,
+# maps, optional fields, closure captures. Trees are built, walked,
+# copied (`dup`), compared (`==`) and printed; a JSON-like enum holds
+# itself in slices and maps; closures hold closures of their own type.
+
+# ---- a tree through a slice
+struct Node {
+  name: Str
+  kids: [Node]
+
+  def size -> Int {
+    n = 1
+    for k in kids { n += k.size }
+    n
+  }
+
+  def depth -> Int {
+    d = 0
+    for k in kids { d = [d, k.depth].max }
+    d + 1
+  }
+
+  def names -> [Str] {
+    out = [name]
+    for k in kids { out += k.names }
+    out
+  }
+}
+
+def tree(name: Str, d: Int) -> Node {
+  n = Node.new(name: name)
+  for i in 0...d { n.kids << tree("#{name}.#{i}", d - 1) }
+  n
+}
+
+t = tree("r", 3)
+puts "size #{t.size}, depth #{t.depth}"
+puts t.names[0...5].join(" ")
+c = t.dup
+puts c == t
+c.kids[1].kids[0].name = "changed"
+puts c == t
+puts t.kids[1].kids[0].name
+puts tree("x", 2)
+
+# ---- a generic tree, and one through a map
+struct Tree[T] {
+  val: T
+  kids: [Tree[T]]
+
+  def sum -> T {
+    s = val
+    for k in kids { s += k.sum }
+    s
+  }
+}
+
+g = Tree[Int].new(val: 1, kids: [Tree[Int].new(val: 2), Tree[Int].new(val: 3, kids: [Tree[Int].new(val: 4)])])
+puts g.sum
+puts g
+
+struct Dir {
+  files: [Str]
+  subs: Map[Str, Dir]
+
+  def count -> Int {
+    n = files.size
+    for k in subs.keys { n += subs[k].unwrap.count }
+    n
+  }
+}
+
+root = Dir.new(files: ["a"])
+src = Dir.new(files: ["main.alx", "lib.alx"])
+src.subs["vendor"] = Dir.new(files: ["x.alx"])
+root.subs["src"] = src
+puts root.count
+puts root
+
+# ---- a binary search tree through optional fields
+struct Bst {
+  key: Int
+  left: Bst?
+  right: Bst?
+
+  def insert(k: Int) -> Bst {
+    b = self
+    if k < key {
+      b.left = if l = left { l.insert(k) } else { Bst.new(key: k) }
+    } else {
+      b.right = if r = right { r.insert(k) } else { Bst.new(key: k) }
+    }
+    b
+  }
+
+  def inorder -> [Int] {
+    out: [Int] = []
+    if l = left { out += l.inorder }
+    out << key
+    if r = right { out += r.inorder }
+    out
+  }
+}
+
+b = Bst.new(key: 50)
+for k in [30, 70, 20, 40, 60, 80, 35] { b = b.insert(k) }
+puts b.inorder.map { it.to_s }.to_a.join(" ")
+puts b.left.unwrap.right.unwrap.left.unwrap.key
+b2 = b.insert(10)
+puts b == b2
+puts b == b.dup
+puts Bst.new(key: 1).insert(2)
+
+# A singly linked list, built in a loop (each node outlives its iteration).
+struct List {
+  head: Int
+  tail: List?
+}
+
+def list(n: Int) -> List? {
+  l: List? = none
+  for i in 0...n { l = List.new(head: i, tail: l) }
+  l
+}
+
+def total(l: List?) -> Int {
+  s = 0
+  cur = l
+  while c = cur {
+    s += c.head
+    cur = c.tail
+  }
+  s
+}
+
+puts total(list(1000))
+puts list(3)
+
+# ---- a JSON-like enum: itself in slices and maps
+enum Json {
+  Null
+  Bool(b: Bool)
+  Num(n: Float)
+  Text(s: Str)
+  List(items: [Json])
+  Obj(fields: Map[Str, Json])
+
+  def encode -> Str {
+    case self {
+      Null => "null"
+      Bool(b) => "#{b}"
+      Num(n) => "#{n}"
+      Text(s) => "\"#{s}\""
+      List(items) => "[" + items.map { it.encode }.to_a.join(",") + "]"
+      Obj(fields) => "{" + fields.keys.map { |k| "\"#{k}\":#{fields[k].unwrap.encode}" }.to_a.join(",") + "}"
+    }
+  }
+}
+
+doc = Json.Obj(fields: {"name" => Json.Text(s: "alx"), "tags" => Json.List(items: [Json.Num(n: 1.5), Json.Null, Json.Bool(b: true)])})
+puts doc.encode
+puts doc == doc
+puts doc == Json.List(items: [])
+puts Json.List(items: [Json.Num(n: 2.0), Json.List(items: [Json.Null])])
+
+# ---- closures holding closures of their own type
+struct Server {
+  name: Str
+  routes: Map[Str, (Str) -> Str]
+}
+
+srv = Server.new(name: "srv")
+srv.routes["/"] = ->(p: Str) -> Str { "#{srv.name} root (#{srv.routes.size} routes) #{p}" }
+srv.routes["/x"] = ->(p: Str) -> Str { "x #{p}" }
+puts srv.routes["/"].unwrap.call("q")
+
+# Middleware: each layer captures the handler it wraps.
+def logged(tag: Str, inner: (Str) -> Str) -> (Str) -> Str {
+  ->(req: Str) -> Str { "#{tag}(#{inner.call(req)})" }
+}
+
+h = ->(req: Str) -> Str { "handled #{req}" }
+for tag in ["auth", "log", "gzip"] { h = logged(tag, h) }
+puts h.call("GET /")
+
+# A test-like value whose cleanups capture it (port-issues #112).
+struct Case {
+  name: Str
+  cleanups: [() -> Str]
+}
+
+tc = Case.new(name: "t1")
+tc.cleanups << ->() -> Str { "cleanup of #{tc.name} (#{tc.cleanups.size} registered)" }
+tc.cleanups << ->() -> Str { "second" }
+for f in tc.cleanups { puts f.call() }
+
+# An optional closure field set to a closure capturing its struct.
+struct S {
+  n: Int
+  f: (() -> Int)?
+}
+
+s = S.new(n: 3)
+s.f = ->() -> Int { s.n + 1 }
+puts s.f?.call

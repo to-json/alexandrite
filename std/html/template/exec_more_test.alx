@@ -1,0 +1,570 @@
+# The rest of Go's html/template exec_test.go and multi_test.go (the tests
+# shared with text/template, with html/template's expected output).
+# TestRecursiveExecute(ViaMethod) aren't translated: a function or method
+# that executes the template it belongs to is a closure (or value) holding
+# itself, which alx refuses (port-issues #71). TestEscapeRace runs one
+# template in many goroutines; an alx Template can't be shared by tasks
+# without a Mutex. TestIssue31810 is skipped in Go ('broken in html/template').
+
+import "encoding/json"
+import "io/fs"
+import "strings"
+import ttmpl "text/template"
+import "text/template/parse"
+
+test "delims" {
+  hello = "Hello, world"
+  value = ttmpl.Value.struct_of("struct { Str string }", ["Str"], [sv(hello)])
+  pairs = [("", ""), ("{{", "}}"), ("|", "|"), ("(日)", "(本)")]
+  for pr in pairs {
+    true_left = pr[0] == "" ? "{{" : pr[0]
+    true_right = pr[1] == "" ? "}}" : pr[1]
+    text = true_left + ".Str" + true_right
+    # Now add a comment
+    text = text + true_left + "/*comment*/" + true_right
+    # Now add an action containing a string.
+    text = text + true_left + "\"" + true_left + "\"" + true_right
+    # At this point text looks like `{{.Str}}{{/*comment*/}}{{"{{"}}`.
+    tmpl = new("delims").delims(pr[0], pr[1]).~parse(text)
+    assert_eq tmpl.~execute_str(value), hello + true_left
+  }
+}
+
+# Check that an error from a method flows back to the top.
+test "execute error" {
+  tmpl = new("error").~parse("{{.MyError true}}")
+  r = tmpl.execute_str(tval())
+  assert strings.contains(r.err?.message || "", "my error"), r.err?.message || ""
+}
+
+EXEC_ERROR_TEXT = "line 1\nline 2\nline 3\n{{template \"one\" .}}\n{{define \"one\"}}{{template \"two\" .}}{{end}}\n{{define \"two\"}}{{template \"three\" .}}{{end}}\n{{define \"three\"}}{{index \"hi\" $}}{{end}}"
+
+# Check that an error from a nested template contains all the relevant
+# information.
+test "exec error" {
+  tmpl = new("top").~parse(EXEC_ERROR_TEXT)
+  r = tmpl.execute_str(iv(5))
+  assert_eq r.err?.message || "", "template: top:7:20: executing \"three\" at <index \"hi\" $>: error calling index: index out of range: 5"
+}
+
+def tree_node(val: Int, left: ttmpl.Value?, right: ttmpl.Value?) -> ttmpl.Value {
+  l = left || ttmpl.Value.nil_of("*template.Tree")
+  r = right || ttmpl.Value.nil_of("*template.Tree")
+  ttmpl.Value.struct_of("template.Tree", ["Val", "Left", "Right"], [iv(val), l, r]).ptr
+}
+
+TREE_TEMPLATE = "\n\t(- define \"tree\" -)\n\t[\n\t\t(- .Val -)\n\t\t(- with .Left -)\n\t\t\t(template \"tree\" . -)\n\t\t(- end -)\n\t\t(- with .Right -)\n\t\t\t(- template \"tree\" . -)\n\t\t(- end -)\n\t]\n\t(- end -)\n"
+
+test "tree" {
+  tree = tree_node(1,
+    tree_node(2, tree_node(3, tree_node(4, none, none), none), tree_node(5, tree_node(6, none, none), none)),
+    tree_node(7, tree_node(8, tree_node(9, none, none), none), tree_node(10, tree_node(11, none, none), none)))
+  tmpl = new("root").delims("(", ")").~parse(TREE_TEMPLATE)
+  expect = "[1[2[3[4]][5[6]]][7[8[9]][10[11]]]]"
+  # First by looking up the template.
+  assert_eq tmpl.lookup("tree").unwrap.~execute_str(tree), expect
+  # Then direct to execution.
+  assert_eq tmpl.~execute_template_str("tree", tree), expect
+}
+
+test "message for execute empty" {
+  # Test a truly empty template.
+  tmpl = new("empty")
+  want = "template: \"empty\" is an incomplete or empty template"
+  assert_eq tmpl.execute_str(iv(0)).err?.message || "", want
+  # Add a non-empty template to check that the error is helpful.
+  tmpl = new("empty")
+  tests = new("").~parse("{{define \"one\"}}one{{end}}{{define \"two\"}}two{{end}}")
+  _a = tmpl.~add_parse_tree("secondary", tests.tree.unwrap)
+  assert_eq tmpl.execute_str(iv(0)).err?.message || "", want
+  # Make sure we can execute the secondary.
+  _b = tmpl.~execute_template_str("secondary", iv(0))
+}
+
+test "missing map key" {
+  data = ttmpl.Value.map_of([sv("x")], [iv(99)], "map[string]int")
+  tmpl = new("t1").~parse("{{.x}} {{.y}}")
+  # By default, just get "<no value>" (printed as "" in html/template)
+  assert_eq tmpl.~execute_str(data), "99 "
+  # Same if we set the option explicitly to the default.
+  tmpl.option(["missingkey=default"])
+  assert_eq tmpl.~execute_str(data), "99 "
+  # Next we ask for a zero value
+  tmpl.option(["missingkey=zero"])
+  assert_eq tmpl.~execute_str(data), "99 0"
+  # Now we ask for an error.
+  tmpl.option(["missingkey=error"])
+  assert tmpl.execute_str(data).err?, "expected error; got none"
+}
+
+# Issue 43295.
+test "template funcs after clone" {
+  s = "{{ f . }}"
+  want = "test"
+  orig = new("orig").funcs({"f" => ttmpl.Func.of("func(string) string", ->(a: [ttmpl.Value]) -> ~ttmpl.Value { a[0] })}).new("child")
+  cl = orig.clone
+  overview = must(must(cl).parse(s))
+  assert_eq overview.~execute_str(sv(want)), want
+}
+
+test "final for printf" {
+  tmpl = new("").~parse("{{\"x\" | printf}}")
+  assert_eq tmpl.~execute_str(iv(0)), "x"
+}
+
+# multi_test.go
+
+def multi_case(tmpl: Template) {
+  cases = [
+    ("empty", "", "", ttmpl.Value.invalid),
+    ("text", "some text", "some text", ttmpl.Value.invalid),
+    ("invoke x", "{{template \"x\" .SI}}", "TEXT", tval()),
+    ("invoke x no args", "{{template \"x\"}}", "TEXT", tval()),
+    ("invoke dot int", "{{template \"dot\" .I}}", "17", tval()),
+    ("invoke dot []int", "{{template \"dot\" .SI}}", "[3 4 5]", tval()),
+    ("invoke dotV", "{{template \"dotV\" .U}}", "v", tval()),
+    ("invoke nested int", "{{template \"nested\" .I}}", "17", tval()),
+    ("variable declared by template", "{{template \"nested\" $x:=.SI}},{{index $x 1}}", "[3 4 5],4", tval()),
+    ("testFunc literal", "{{oneArg \"joe\"}}", "oneArg=joe", tval()),
+    ("testFunc .", "{{oneArg .}}", "oneArg=joe", sv("joe")),
+  ]
+  for c in cases {
+    run_exec(tmpl.clone.unwrap.new(c[0]), c[0], c[1], c[2], c[3], true)
+  }
+}
+
+test "parse files" {
+  assert parse_files(["DOES NOT EXIST"]).err?, "expected error for non-existent file; got none"
+  multi_case(new("root").~parse_files(["testdata/file1.tmpl", "testdata/file2.tmpl"]))
+}
+
+test "parse glob" {
+  assert parse_glob("DOES NOT EXIST").err?, "expected error for non-existent file; got none"
+  assert new("error").parse_glob("[x").err?, "expected error for bad pattern; got none"
+  multi_case(new("root").~parse_glob("testdata/file*.tmpl"))
+}
+
+test "parse files with data" {
+  for which in [0, 1] {
+    t = new("root")
+    tmpl = which == 0 ? t.~parse_files(["testdata/tmpl1.tmpl", "testdata/tmpl2.tmpl"]) : t.~parse_glob("testdata/tmpl*.tmpl")
+    run_exec(tmpl.clone.unwrap.new("test"), "test", "{{template \"tmpl1.tmpl\"}}{{template \"tmpl2.tmpl\"}}", "template1\n\ny\ntemplate2\n\nx\n", iv(0), true)
+  }
+}
+
+CLONE_TEXT3 = "{{define \"c\"}}root{{end}}"
+
+# Issue 7032
+test "add parse tree to unparsed template" {
+  master = "{{define \"master\"}}{{end}}"
+  tmpl = new("master")
+  tree = parse.parse("master", master, "", "", []).unwrap
+  _a = tmpl.add_parse_tree("master", tree["master"].unwrap)
+}
+
+test "redefinition" {
+  tmpl = new("tmpl1").~parse("{{define \"test\"}}foo{{end}}")
+  _a = tmpl.~parse("{{define \"test\"}}bar{{end}}")
+  _b = tmpl.new("tmpl2").~parse("{{define \"test\"}}bar{{end}}")
+}
+
+# Issue 10879
+test "empty template clone crash" {
+  t1 = new("base")
+  # used to panic
+  _a = t1.clone
+}
+
+# Issue 10910, 10926
+test "template look up" {
+  t1 = new("foo")
+  assert t1.lookup("foo") != none, "t1.Lookup(foo)"
+  t1.new("bar")
+  assert t1.lookup("bar") != none, "t1.Lookup(bar)"
+  _a = t1.parse("{{define \"foo\"}}test{{end}}")
+  assert t1.lookup("foo") != none, "Lookup returned nil value for defined template"
+}
+
+test "parse" {
+  # In multiple calls to Parse with the same receiver template, only one
+  # call can contain text other than space, comments, and template
+  # definitions
+  t1 = new("test")
+  _a = t1.~parse("{{define \"test\"}}{{end}}")
+  _b = t1.~parse("{{define \"test\"}}{{/* this is a comment */}}{{end}}")
+  _c = t1.~parse("{{define \"test\"}}foo{{end}}")
+}
+
+test "empty template" {
+  cases = [
+    (["x", "y"], "", "y"),
+    ([""], "once", ""),
+    (["", ""], "twice", ""),
+    (["{{.}}", "{{.}}"], "twice", "twice"),
+    (["{{/* a comment */}}", "{{/* a comment */}}"], "comment", ""),
+    (["{{.}}", ""], "twice", "twice"),
+  ]
+  for c in cases {
+    root = new("root")
+    m = root
+    for d in c[0] {
+      m = root.new(c[1]).~parse(d)
+    }
+    assert_eq m.~execute_str(sv(c[1])), c[2]
+  }
+}
+
+# Issue 19249 was a regression in 1.8 caused by the handling of empty
+# templates added in that release.
+test "issue 19294" {
+  inlined: Map[Str, Str] = {
+    "stylesheet" => "{{define \"stylesheet\"}}stylesheet{{end}}",
+    "xhtml" => "{{block \"stylesheet\" .}}{{end}}",
+  }
+  all = ["stylesheet", "xhtml"]
+  i = 0
+  while i < 100 {
+    res = new("title.xhtml").~parse("{{template \"xhtml\" .}}")
+    for name in all {
+      _a = res.new(name).~parse(inlined[name].unwrap)
+    }
+    assert_eq res.~execute_str(iv(0)), "stylesheet"
+    i += 1
+  }
+}
+
+# template_test.go
+
+test "template clone" {
+  # https://golang.org/issue/12996
+  orig = new("name")
+  cl = orig.~clone
+  assert_eq cl.templates.size, orig.templates.size
+  parsed = must(cl.parse("stuff"))
+  assert_eq parsed.~execute_str(ttmpl.Value.invalid), "stuff"
+}
+
+def must_parse(t: Template, text: Str) { assert t.parse(text).ok?, "parse: #{text}" }
+
+def must_not_parse(t: Template, text: Str) { assert t.parse(text).err?, "parse: unexpected success" }
+
+def must_execute(t: Template, v: ttmpl.Value, want: Str) {
+  r = t.execute_str(v)
+  assert r.ok?, "execute: #{r.err?.message || ""}"
+  assert_eq r.unwrap, want
+}
+
+test "redefine non empty after execution" {
+  root = new("root")
+  must_parse(root, "foo")
+  must_execute(root, ttmpl.Value.invalid, "foo")
+  must_not_parse(root, "bar")
+}
+
+test "redefine empty after execution" {
+  root = new("root")
+  must_parse(root, "")
+  must_execute(root, ttmpl.Value.invalid, "")
+  must_not_parse(root, "foo")
+  must_execute(root, ttmpl.Value.invalid, "")
+}
+
+test "redefine after non execution" {
+  root = new("root")
+  must_parse(root, "{{if .}}<{{template \"X\"}}>{{end}}{{define \"X\"}}foo{{end}}")
+  must_execute(root, iv(0), "")
+  must_not_parse(root, "{{define \"X\"}}bar{{end}}")
+  must_execute(root, iv(1), "&lt;foo>")
+}
+
+test "redefine after named execution" {
+  root = new("root")
+  must_parse(root, "<{{template \"X\" .}}>{{define \"X\"}}foo{{end}}")
+  must_execute(root, ttmpl.Value.invalid, "&lt;foo>")
+  must_not_parse(root, "{{define \"X\"}}bar{{end}}")
+  must_execute(root, ttmpl.Value.invalid, "&lt;foo>")
+}
+
+test "redefine nested by name after execution" {
+  root = new("root")
+  must_parse(root, "{{define \"X\"}}foo{{end}}")
+  must_execute(root.lookup("X").unwrap, ttmpl.Value.invalid, "foo")
+  must_not_parse(root, "{{define \"X\"}}bar{{end}}")
+  must_execute(root.lookup("X").unwrap, ttmpl.Value.invalid, "foo")
+}
+
+test "redefine nested by template after execution" {
+  root = new("root")
+  must_parse(root, "{{define \"X\"}}foo{{end}}")
+  must_execute(root.lookup("X").unwrap, ttmpl.Value.invalid, "foo")
+  must_not_parse(root.lookup("X").unwrap, "bar")
+  must_execute(root.lookup("X").unwrap, ttmpl.Value.invalid, "foo")
+}
+
+test "redefine safety" {
+  root = new("root")
+  must_parse(root, "<html><a href=\"{{template \"X\"}}\">{{define \"X\"}}{{end}}")
+  must_execute(root, ttmpl.Value.invalid, "<html><a href=\"\">")
+  # Note: Every version of Go prior to Go 1.8 accepted the redefinition of
+  # "X" on the next line, but luckily kept it from being used in the outer
+  # template. Now we reject it, which makes clearer that we're not going to
+  # use it.
+  must_not_parse(root, "{{define \"X\"}}\" bar=\"baz{{end}}")
+  must_execute(root, ttmpl.Value.invalid, "<html><a href=\"\">")
+}
+
+test "redefine top use" {
+  root = new("root")
+  must_parse(root, "{{template \"X\"}}{{.}}{{define \"X\"}}{{end}}")
+  must_execute(root, iv(42), "42")
+  must_not_parse(root, "{{define \"X\"}}<script>{{end}}")
+  must_execute(root, iv(42), "42")
+}
+
+test "redefine other parsers" {
+  root = new("root")
+  must_parse(root, "")
+  must_execute(root, ttmpl.Value.invalid, "")
+  r1 = root.parse_files(["no.template"])
+  assert strings.contains(r1.err?.message || "", "Execute"), "ParseFiles: #{r1.err?.message || ""}"
+  r2 = root.parse_glob("*.no.template")
+  assert strings.contains(r2.err?.message || "", "Execute"), "ParseGlob: #{r2.err?.message || ""}"
+  r3 = root.add_parse_tree("t1", root.tree.unwrap)
+  assert strings.contains(r3.err?.message || "", "Execute"), "AddParseTree: #{r3.err?.message || ""}"
+}
+
+test "numbers" {
+  root = new("root")
+  must_parse(root, "{{print 1_2.3_4}} {{print 0x0_1.e_0p+02}}")
+  must_execute(root, ttmpl.Value.invalid, "12.34 7.5")
+}
+
+test "strings in scripts with json content type are correctly escaped" {
+  # See #33671 and #37634 for more context on this.
+  ins = ["", Str.from_bytes([0xef, 0xbf, 0xbd]), "\x00", "\x1f", "\t", "<>", "'\"", "ASCII letters", "ʕ⊙ϖ⊙ʔ", "🍕"]
+  prefix = "<script type=\"application/ld+json\">"
+  suffix = "</script>"
+  tpl = must(new("JS string is JSON string").parse(prefix + "\"{{.}}\"" + suffix))
+  for s in ins {
+    out = tpl.~execute_str(sv(s))
+    trimmed = strings.trim_suffix(strings.trim_prefix(out, prefix), suffix)
+    got = json_unquote(trimmed)
+    assert_eq got, s
+  }
+}
+
+def json_unquote(s: Str) -> Str { json.parse(s).unwrap.as_str.unwrap }
+
+test "skip escape comments" {
+  tr = parse.new_tree("root")
+  tr.set_mode(parse.PARSE_COMMENTS)
+  set: Map[Str, parse.Tree] = {}
+  new_t = tr.~parse("{{/* A comment */}}{{ 1 }}{{/* Another comment */}}", "", "", set, [])
+  root = new("root").~add_parse_tree("root", new_t)
+  must_execute(root, ttmpl.Value.invalid, "1")
+}
+
+test "js escaping" {
+  cases = [
+    ("a", "a"),
+    ("'foo", "\\'foo"),
+    ("Go \"jump\" \\", "Go \\\"jump\\\" \\\\"),
+    ("Yukihiro says \"今日は世界\"", "Yukihiro says \\\"今日は世界\\\""),
+    ("unprintable \uFFFE", "unprintable \\uFFFE"),
+    ("<html>", "\\u003Chtml\\u003E"),
+    ("no = in attributes", "no \\u003D in attributes"),
+    ("&#x27; does not become HTML entity", "\\u0026#x27; does not become HTML entity"),
+  ]
+  for c in cases {
+    assert_eq js_escape_string(c[0]), c[1]
+  }
+}
+
+test "execute on new template" {
+  # This is issue 3872.
+  _a = new("Name").templates
+}
+
+test "unterminated string error" {
+  r = new("X").parse("hello\n\n{{`unterminated\n\n\n\n}}\n some more\n\n")
+  assert r.err?, "expected error"
+  assert strings.contains(r.err?.message || "", "X:3: unterminated raw quoted string"), r.err?.message || ""
+}
+
+struct ErrorWriter {
+  pub def write!(p: [Byte]) -> ~Int {
+    fail Failure.Msg("always be failing")
+  }
+}
+
+def exec_error?(r: ~Str) -> Bool {
+  if e = r.err {
+    case e {
+      ttmpl.ExecError.Exec(_, _) => {return true}
+      _ => {return false}
+    }
+  }
+  false
+}
+
+test "execute gives exec error" {
+  # First, a non-execution error shouldn't be an ExecError.
+  tmpl = new("X").~parse("hello")
+  w = ErrorWriter.new
+  r = tmpl.execute(w, iv(0))
+  assert_eq r.err?.message || "", "always be failing"
+  # This one should be an ExecError.
+  tmpl2 = new("X").~parse("hello, {{.X.Y}}")
+  r2 = tmpl2.execute_str(iv(0))
+  assert exec_error?(r2), "expected ExecError"
+  assert strings.contains(r2.err?.message || "", "field X in type int"), r2.err?.message || ""
+}
+
+def func_name_test_func -> ttmpl.Func { ttmpl.Func.of("func() int", ->(a: [ttmpl.Value]) -> ~ttmpl.Value { iv(0) }) }
+
+test "good func names" {
+  for name in ["_", "a", "a1", "a1", "Ӵ"] {
+    tmpl = new("X").funcs({name => func_name_test_func()})
+    assert_eq tmpl.name, "X"
+  }
+}
+
+test "bad func names" {
+  for name in ["", "2", "a-b"] {
+    # Funcs panics, as Go's does.
+    t = spawn { new("X").funcs({name => func_name_test_func()}).name }
+    assert t.wait.err?, "#{name} succeeded incorrectly as function name"
+  }
+}
+
+test "block" {
+  input = "a({{block \"inner\" .}}bar({{.}})baz{{end}})b"
+  want = "a(bar(hello)baz)b"
+  overlay = "{{define \"inner\"}}foo({{.}})bar{{end}}"
+  want2 = "a(foo(goodbye)bar)b"
+  tmpl = new("outer").~parse(input)
+  cl = tmpl.clone
+  tmpl2 = must(cl).~parse(overlay)
+  assert_eq tmpl.~execute_str(sv("hello")), want
+  assert_eq tmpl2.~execute_str(sv("goodbye")), want2
+}
+
+test "eval field errors" {
+  t_ = ttmpl.Value.struct_of("template.T", ["X"], [sv("")])
+  # Go's MissingFieldOnNil wants "can't evaluate field MissingField in type
+  # *template.T": alx's nil pointer doesn't know its element's fields, so
+  # it says "nil pointer evaluating *template.T.MissingField".
+  cases = [
+    ("{{.MissingField}}", t_.ptr, "can't evaluate field MissingField in type *template.T"),
+    ("{{.X}}", ttmpl.Value.nil_of("*template.T"), "nil pointer evaluating *template.T.X"),
+    ("{{.MissingKey}}", ttmpl.Value.nil_of("*map[string]string"), "nil pointer evaluating *map[string]string.MissingKey"),
+    ("{{.MissingKey}}", ttmpl.Value.map_of([], [], "map[string]string").ptr, "<nil>"),
+  ]
+  for c in cases {
+    tmpl = must(new("tmpl").parse(c[0]))
+    r = tmpl.execute_str(c[1])
+    got = r.err?.message || "<nil>"
+    assert strings.has_suffix(got, c[2]), "got error #{got}, want #{c[2]}"
+  }
+}
+
+test "max exec depth" {
+  tmpl = must(new("tmpl").parse("{{template \"tmpl\" .}}"))
+  r = tmpl.execute_str(ttmpl.Value.invalid)
+  assert strings.contains(r.err?.message || "<nil>", "exceeded maximum template depth"), r.err?.message || "<nil>"
+}
+
+# golang.org/issue/14916. (V's String is to_s in alx, so the templates ask
+# for .to_s.)
+test "addr of index" {
+  texts = ["{{range .}}{{.to_s}}{{end}}", "{{with index . 0}}{{.to_s}}{{end}}"]
+  for text in texts {
+    tmpl = must(new("tmpl").parse(text))
+    data = ttmpl.Value.list_of([V.new(j: 1).to_tmpl], "[]template.V")
+    assert_eq tmpl.~execute_str(data), "&lt;1&gt;"
+  }
+}
+
+test "interface values" {
+  cases = [
+    ("{{index .Nil 1}}", "ERROR: index of untyped nil"),
+    ("{{index .Slice 2}}", "2"),
+    ("{{index .Slice .Two}}", "2"),
+    ("{{call .Nil 1}}", "ERROR: call of nil"),
+    ("{{call .PlusOne 1}}", "2"),
+    ("{{call .PlusOne .One}}", "2"),
+    ("{{and (index .Slice 0) true}}", "0"),
+    ("{{and .Zero true}}", "0"),
+    ("{{and (index .Slice 1) false}}", "false"),
+    ("{{and .One false}}", "false"),
+    ("{{or (index .Slice 0) false}}", "false"),
+    ("{{or .Zero false}}", "false"),
+    ("{{or (index .Slice 1) true}}", "1"),
+    ("{{or .One true}}", "1"),
+    ("{{not (index .Slice 0)}}", "true"),
+    ("{{not .Zero}}", "true"),
+    ("{{not (index .Slice 1)}}", "false"),
+    ("{{not .One}}", "false"),
+    ("{{eq (index .Slice 0) .Zero}}", "true"),
+    ("{{eq (index .Slice 1) .One}}", "true"),
+    ("{{ne (index .Slice 0) .Zero}}", "false"),
+    ("{{ne (index .Slice 1) .One}}", "false"),
+    ("{{ge (index .Slice 0) .One}}", "false"),
+    ("{{ge (index .Slice 1) .Zero}}", "true"),
+    ("{{gt (index .Slice 0) .One}}", "false"),
+    ("{{gt (index .Slice 1) .Zero}}", "true"),
+    ("{{le (index .Slice 0) .One}}", "true"),
+    ("{{le (index .Slice 1) .Zero}}", "false"),
+    ("{{lt (index .Slice 0) .One}}", "true"),
+    ("{{lt (index .Slice 1) .Zero}}", "false"),
+  ]
+  plus_one = ttmpl.Func.of("func(int) int", ->(a: [ttmpl.Value]) -> ~ttmpl.Value { iv(a[0].int_val + 1) })
+  data = ttmpl.Value.map({
+    "PlusOne" => ttmpl.Value.func(plus_one),
+    "Slice" => ttmpl.Value.list_of([iv(0), iv(1), iv(2), iv(3)], "[]int"),
+    "One" => iv(1),
+    "Two" => iv(2),
+    "Nil" => ttmpl.Value.invalid,
+    "Zero" => iv(0),
+  })
+  for c in cases {
+    tmpl = must(new("tmpl").parse(c[0]))
+    r = tmpl.execute_str(data)
+    if strings.has_prefix(c[1], "ERROR:") {
+      e = strings.trim_space(strings.trim_prefix(c[1], "ERROR:"))
+      assert strings.contains(r.err?.message || "", e), "#{c[0]}: Execute: #{r.err?.message || ""}, want error #{e}"
+      next
+    }
+    assert r.ok?, "#{c[0]}: Execute: #{r.err?.message || ""}"
+    assert_eq r.unwrap, c[1]
+  }
+}
+
+# Panics during calls are errors in Go (recovered); alx functions fail
+# instead. The method calls on nil receivers (GetU on a nil *T) can't
+# exist in alx.
+test "execute panic during call" {
+  do_panic = ttmpl.Func.of("func() string", ->(a: [ttmpl.Value]) -> ~ttmpl.Value {
+    fail Failure.Msg("custom panic string")
+    ttmpl.Value.invalid
+  })
+  cases = [
+    ("direct func call panics", "{{doPanic}}", ttmpl.Value.nil_of("*template.T"), "template: t:1:2: executing \"t\" at <doPanic>: error calling doPanic: custom panic string"),
+    ("indirect func call panics", "{{call doPanic}}", ttmpl.Value.nil_of("*template.T"), "template: t:1:7: executing \"t\" at <doPanic>: error calling doPanic: custom panic string"),
+    ("func field call panics", "{{call .PanicFunc}}", tval(), "template: t:1:2: executing \"t\" at <call .PanicFunc>: error calling call: test panic"),
+    ("method call on nil interface", "{{.NonEmptyInterfaceNil.Method0}}", tval(), "template: t:1:23: executing \"t\" at <.NonEmptyInterfaceNil.Method0>: nil pointer evaluating template.I.Method0"),
+  ]
+  for c in cases {
+    tmpl = new("t").funcs({"doPanic" => do_panic}).~parse(c[1])
+    r = tmpl.execute_str(c[2])
+    assert r.err?, "#{c[0]}: expected error; got none"
+    assert strings.contains(r.err?.message || "", c[3]), "#{c[0]}: got #{r.err?.message || ""}"
+  }
+}
+
+test "parse fs" {
+  fsys = fs.dir_fs("testdata")
+  assert parse_fs(fsys, ["DOES NOT EXIST"]).err?, "expected error for non-existent file; got none"
+  multi_case(new("root").~parse_fs(fsys, ["file1.tmpl", "file2.tmpl"]))
+  multi_case(new("root").~parse_fs(fsys, ["file*.tmpl"]))
+}

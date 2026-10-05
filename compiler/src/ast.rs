@@ -86,6 +86,9 @@ pub enum Overflow {
 pub struct Module {
     pub file: u32,
     pub overflow: Overflow,
+    /// `#![test(external)]` (S11): a test file compiled as a package of its
+    /// own that imports the package under test.
+    pub external_test: bool,
     /// `import "path"` / `import alias "path"`.
     pub imports: Vec<Import>,
     /// Top-level names declared `pub` (types, constants; defs carry a flag).
@@ -140,10 +143,18 @@ pub struct Def {
     /// (`~T<ParseError | IoError>`; `Error` = open).
     pub errs: Option<Vec<String>>,
     pub pure: bool,
+    /// `#[track_caller]` (S9): each instance takes a hidden last parameter
+    /// (`CALLER_PARAM`, a `CallSite`) that every call fills in.
+    pub track_caller: bool,
     /// `extern def`: a C function, bound to this link name; no body.
     pub ffi: Option<String>,
     pub body: Vec<Stmt>,
 }
+
+/// S9: a `#[track_caller]` def's hidden parameter, a `CallSite`
+/// (builtin.alx). A call passes its own location, or, from inside another
+/// tracked def, that def's (Rust's semantics); `caller_location` reads it.
+pub const CALLER_PARAM: &str = "__caller";
 
 #[derive(Debug, Clone)]
 pub struct Import {
@@ -267,6 +278,9 @@ pub struct IfaceDef {
     pub span: Span,
     /// Every method's signature (defaults too): name, params (after self), ret, has a default.
     pub methods: Vec<(String, Vec<Param>, Option<TypeExpr>, bool, Span)>,
+    /// The methods declared `#[track_caller]` (S9): their implementations
+    /// must be too, and calls through the interface pass the call site.
+    pub tracked: Vec<String>,
 }
 
 /// `refine Name for Type { def m ... }`: methods on an existing type,

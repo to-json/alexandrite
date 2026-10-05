@@ -32,6 +32,9 @@ pub struct DefSig {
     pub ret: Option<TypeExpr>,
     pub fallible: bool,
     pub pure: bool,
+    pub track_caller: bool,
+    /// `#[attr] pub def`: `pub` after the attributes.
+    pub public: bool,
     pub ffi: Option<String>,
     pub body: Option<Vec<Stmt>>,
 }
@@ -193,7 +196,7 @@ impl<'a> Parser<'a> {
     // ---------- module ----------
 
     fn module(&mut self, file: u32) -> PResult<Module> {
-        let mut m = Module { file, overflow: Overflow::Abort, imports: vec![], public: Default::default(), defs: vec![], structs: vec![], enums: vec![], refines: vec![], ifaces: vec![], consts: vec![], main: vec![], tests: vec![] };
+        let mut m = Module { file, overflow: Overflow::Abort, external_test: false, imports: vec![], public: Default::default(), defs: vec![], structs: vec![], enums: vec![], refines: vec![], ifaces: vec![], consts: vec![], main: vec![], tests: vec![] };
         self.skip_newlines();
         while let Tok::Directive(name, arg) = self.peek().clone() {
             let sp = self.bump().span;
@@ -201,7 +204,9 @@ impl<'a> Parser<'a> {
                 ("overflow", "abort") => m.overflow = Overflow::Abort,
                 ("overflow", "wrap") => m.overflow = Overflow::Wrap,
                 ("overflow", "promote") => m.overflow = Overflow::Promote,
-                _ => return Err(Diag::new(sp, format!("unknown directive `#![{name}({arg})]`")).note("known: #![overflow(abort | wrap | promote)]")),
+                // S11: an external test file (Go's `package x_test`).
+                ("test", "external") => m.external_test = true,
+                _ => return Err(Diag::new(sp, format!("unknown directive `#![{name}({arg})]`")).note("known: #![overflow(abort | wrap | promote)], #![test(external)]")),
             }
             self.skip_newlines();
         }
@@ -269,7 +274,7 @@ impl<'a> Parser<'a> {
                         }
                     }
                     let span = start.to(self.prev_span());
-                    let def = Def { public: false, using: self.usings.clone(), name: name.clone(), span, tparams: vec![], name_span, params: param.into_iter().collect(), ret: None, fallible: true, errs: None, pure: false, ffi: None, body };
+                    let def = Def { public: false, using: self.usings.clone(), name: name.clone(), span, tparams: vec![], name_span, params: param.into_iter().collect(), ret: None, fallible: true, errs: None, pure: false, track_caller: false, ffi: None, body };
                     m.tests.push(TestDecl { kind, name, span, outputs, def });
                 }
                 Tok::Ident(kw) if kw == "pub" => {
@@ -437,7 +442,7 @@ impl<'a> Parser<'a> {
         let var = is_sync_decl(ty.as_ref(), &value);
         if var {
             let body = vec![Stmt { span: value.span, kind: StmtKind::Expr(value.clone()) }];
-            m.defs.push(Def { name: var_init_name(&name), span: sp, tparams: vec![], name_span: sp, params: vec![], ret: ty.clone(), fallible: false, public: false, using: self.usings.clone(), errs: None, pure: false, ffi: None, body });
+            m.defs.push(Def { name: var_init_name(&name), span: sp, tparams: vec![], name_span: sp, params: vec![], ret: ty.clone(), fallible: false, public: false, using: self.usings.clone(), errs: None, pure: false, track_caller: false, ffi: None, body });
         }
         m.consts.push(ConstDef { name, span: sp, ty, value, var, embed: None });
     }
@@ -748,14 +753,14 @@ impl<'a> Parser<'a> {
         if d.fallible || !d.tparams.is_empty() {
             return Err(Diag::new(d.name_span, "an `extern def` can't be fallible or generic"));
         }
-        Ok(Def { public: false, using: self.usings.clone(), name: d.name, span: sp.to(self.prev_span()), tparams: vec![], name_span: d.name_span, params: d.params, ret: d.ret, fallible: false, errs: None, pure: d.pure, ffi: Some(sym), body: vec![] })
+        Ok(Def { public: false, using: self.usings.clone(), name: d.name, span: sp.to(self.prev_span()), tparams: vec![], name_span: d.name_span, params: d.params, ret: d.ret, fallible: false, errs: None, pure: d.pure, track_caller: d.track_caller, ffi: Some(sym), body: vec![] })
     }
 
     /// A def; inside `struct Owner { }` it is a method taking `self`.
     fn def_in(&mut self, owner: Option<&str>) -> PResult<Def> {
         let d = self.def_sig(owner.map(|o| (o, false)))?;
         let Some(body) = d.body else { unreachable!("a body is required outside interfaces") };
-        Ok(Def { public: false, using: self.usings.clone(), name: d.name, span: d.span, tparams: d.tparams, name_span: d.name_span, params: d.params, ret: d.ret, fallible: d.fallible, errs: d.errs, pure: d.pure, ffi: d.ffi, body })
+        Ok(Def { public: d.public, using: self.usings.clone(), name: d.name, span: d.span, tparams: d.tparams, name_span: d.name_span, params: d.params, ret: d.ret, fallible: d.fallible, errs: d.errs, pure: d.pure, track_caller: d.track_caller, ffi: d.ffi, body })
     }
 
     /// A def's signature and body. In an interface (`owner.1`), `self` is
@@ -765,13 +770,21 @@ impl<'a> Parser<'a> {
         let owner = owner.map(|o| o.0);
         let start = self.span();
         let mut pure = false;
+        let mut track_caller = false;
         while let Tok::Attr(a) = self.peek().clone() {
             let sp = self.bump().span;
             match a.as_str() {
                 "pure" => pure = true,
+                "track_caller" if self.extern_mode => return Err(Diag::new(sp, "an `extern def` can't be `#[track_caller]`")),
+                "track_caller" => track_caller = true,
                 _ => return Err(Diag::new(sp, format!("unknown attribute `#[{a}]`"))),
             }
             self.skip_newlines();
+        }
+        // `#[track_caller] pub def`: the attributes may come before `pub` too.
+        let public = !in_iface && start != self.span() && matches!(self.peek(), Tok::Ident(p) if p == "pub") && matches!(self.peek_at(1), Tok::Kw(Kw::Def) | Tok::Kw(Kw::Fn));
+        if public {
+            self.bump();
         }
         if self.is_kw(Kw::Fn) {
             // `fn` / `ƒ`: a pure def
@@ -863,7 +876,7 @@ impl<'a> Parser<'a> {
             Some(self.braced_stmts()?)
         };
         self.scopes.pop();
-        Ok(DefSig { name, span: start.to(self.prev_span()), tparams, name_span, params, ret, fallible, errs, pure, ffi, body })
+        Ok(DefSig { name, span: start.to(self.prev_span()), tparams, name_span, params, ret, fallible, errs, pure, track_caller, public, ffi, body })
     }
 
     /// `[T, U: Shape, N: like Int]` after a type or def name (no space before `[`).
@@ -972,6 +985,7 @@ impl<'a> Parser<'a> {
         };
         self.expect_op("{")?;
         let mut methods = vec![];
+        let mut tracked = vec![];
         loop {
             self.skip_newlines();
             while self.eat_op(",") || self.eat_op(";") {
@@ -980,10 +994,13 @@ impl<'a> Parser<'a> {
             if self.eat_op("}") {
                 break;
             }
-            if !matches!(self.peek(), Tok::Kw(Kw::Def)) {
+            if !matches!(self.peek(), Tok::Kw(Kw::Def) | Tok::Attr(_)) {
                 return Err(Diag::new(self.span(), format!("an interface holds `def`s, found {}", describe(self.peek()))));
             }
             let d = self.def_sig(Some((&name, true)))?;
+            if d.track_caller {
+                tracked.push(d.name.rsplit_once('.').map_or(d.name.clone(), |(_, m)| m.to_string()));
+            }
             let has_body = d.body.is_some();
             let short = d.name.rsplit_once('.').map_or(d.name.clone(), |(_, m)| m.to_string());
             // `def m -> ~T`: the call's value is a held `~T`.
@@ -995,10 +1012,10 @@ impl<'a> Parser<'a> {
             };
             methods.push((short, d.params[1..].to_vec(), ret, has_body, d.name_span));
             if let Some(body) = d.body {
-                defaults.push(Def { public: true, using: self.usings.clone(), name: d.name, span: d.span, tparams: d.tparams, name_span: d.name_span, params: d.params, ret: d.ret, fallible: d.fallible, errs: d.errs, pure: d.pure, ffi: d.ffi, body });
+                defaults.push(Def { public: true, using: self.usings.clone(), name: d.name, span: d.span, tparams: d.tparams, name_span: d.name_span, params: d.params, ret: d.ret, fallible: d.fallible, errs: d.errs, pure: d.pure, track_caller: d.track_caller, ffi: d.ffi, body });
             }
         }
-        Ok(IfaceDef { name, span: start.to(self.prev_span()), methods })
+        Ok(IfaceDef { name, span: start.to(self.prev_span()), methods, tracked })
     }
 
     fn enum_def(&mut self, methods: &mut Vec<Def>) -> PResult<EnumDef> {

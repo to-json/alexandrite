@@ -622,6 +622,8 @@ pub fn separable(p: &Package) -> bool {
         && !m.consts.iter().any(|c| c.var || matches!(c.value.kind, crate::ast::ExprKind::Array(_) | crate::ast::ExprKind::ArrayRepeat(..)))
         // The builtin Complex is declared with the program.
         && !uses_complex(&p.source)
+        // So is CallSite (S9).
+        && !["track_caller", "caller_location", "CallSite"].iter().any(|w| p.source.contains(w))
         // Formats with flags reach the fmt engine, declared with the program (builtin.alx).
         && !["format(", "printf(", "sprintf(", "errorf("].iter().any(|f| p.source.contains(f))
         // So is `==` on maps (`__map_eq`).
@@ -728,6 +730,7 @@ pub fn parse_header(text: &str, overflow: Overflow, span: Span, pkg: &str) -> Re
             fallible: flags.contains(&"fallible"),
             errs: Some(vec!["Error".into()]),
             pure: flags.contains(&"pure"),
+            track_caller: false,
             ffi: None,
             body: vec![],
         };

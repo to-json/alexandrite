@@ -1,0 +1,161 @@
+# Go's sql_test.go, part 7: TestIssue20575 .. TestTxEndBadConn.
+
+import "context"
+import "database/sql/driver"
+import "time"
+
+test "Issue20575" {
+  test_database([], ->(db: DB) -> ~Unit {
+    populate(db, "people")
+    tx = db.~begin
+    ctx, cancel = context.with_timeout(context.background, time.second * 3)
+    defer cancel()
+    _r = tx.~query_context(ctx, "SELECT|people|age,name|", nil)
+    ~tx.rollback
+    assert !ctx.done?, "timeout: failed to rollback query without closing rows"
+    nil
+  }).unwrap
+}
+
+test "Issue20622" {
+  test_database([], ->(db: DB) -> ~Unit {
+    populate(db, "people")
+    ctx, cancel = context.with_cancel(context.background)
+    defer cancel()
+    tx = db.~begin_tx(ctx, none)
+    rows = tx.~query("SELECT|people|age,name|", nil)
+    count = 0
+    while rows.next {
+      count += 1
+      _r: (Int, Str) = rows.~scan
+      cancel() if count == 1
+      time.sleep(time.millisecond * 20)
+    }
+    _ = rows.close
+    _ = tx.commit
+    nil
+  }).unwrap
+}
+
+def set_hook(h: Hooks, which: Int, f: (() -> Bool)?) {
+  case which {
+    0 => h.set_prepare_bad_conn(f)
+    1 => h.set_exec_bad_conn(f)
+    2 => h.set_query_bad_conn(f)
+    3 => h.set_commit_bad_conn(f)
+    _ => h.set_rollback_bad_conn(f)
+  }
+}
+
+# Go's simulateBadConn in TestErrBadConnReconnect: the hook fails once, the
+# operation must retry and succeed without leaking connections.
+def simulate_bad_conn(db: DB, name: Str, which: Int, op: (Int) -> ~Unit) {
+  st = Mutex.new((false, false))
+  num_open = db.st.lock { |s| s.num_open }
+  set_hook(drv_of(db).hooks, which, ->() -> Bool {
+    st.lock { |x|
+      r = !x[0]
+      if r {
+        x = (true, x[1])
+      } else {
+        x = (x[0], true)
+      }
+      r
+    }
+  })
+  r = op(0)
+  set_hook(drv_of(db).hooks, which, none)
+  assert !r.err?, "#{name}: #{r.err}"
+  s = st.lock { |x| x }
+  assert s[0] && s[1], "#{name}: Failed to simulate broken connection"
+  n = db.st.lock { |s| s.num_open }
+  assert n == num_open, "#{name}: leaked #{n - num_open} connection(s)!"
+}
+
+def force_prepare(s: Stmt) {
+  s.core.st.lock { |x|
+    x.css = []
+    nil
+  }
+}
+
+test "ErrBadConnReconnect" {
+  test_database([], ->(db: DB) -> ~Unit {
+    exec_t(db, "CREATE|t1|name=string,age=int32,dead=bool", nil)
+    db_exec = ->(_i: Int) -> ~Unit {
+      db.~exec("INSERT|t1|name=?,age=?,dead=?", ("Gordon", 3, true))
+      nil
+    }
+    simulate_bad_conn(db, "db.Exec prepare", HOOK_PREPARE, db_exec)
+    simulate_bad_conn(db, "db.Exec exec", HOOK_EXEC, db_exec)
+    db_query = ->(_i: Int) -> ~Unit {
+      rows = db.~query("SELECT|t1|age,name|", nil)
+      ~rows.close
+    }
+    simulate_bad_conn(db, "db.Query prepare", HOOK_PREPARE, db_query)
+    simulate_bad_conn(db, "db.Query query", HOOK_QUERY, db_query)
+    simulate_bad_conn(db, "db.Prepare", HOOK_PREPARE, ->(_i: Int) -> ~Unit {
+      stmt = db.~prepare("INSERT|t1|name=?,age=?,dead=?")
+      _ = stmt.close
+      nil
+    })
+    stmt1 = db.~prepare("INSERT|t1|name=?,age=?,dead=?")
+    defer stmt1.close
+    force_prepare(stmt1)
+    stmt_exec = ->(_i: Int) -> ~Unit {
+      stmt1.~exec(("Gopher", 3, false))
+      nil
+    }
+    simulate_bad_conn(db, "stmt.Exec prepare", HOOK_PREPARE, stmt_exec)
+    simulate_bad_conn(db, "stmt.Exec exec", HOOK_EXEC, stmt_exec)
+    stmt2 = db.~prepare("SELECT|t1|age,name|")
+    defer stmt2.close
+    force_prepare(stmt2)
+    stmt_query = ->(_i: Int) -> ~Unit {
+      rows = stmt2.~query(nil)
+      ~rows.close
+    }
+    simulate_bad_conn(db, "stmt.Query prepare", HOOK_PREPARE, stmt_query)
+    simulate_bad_conn(db, "stmt.Query exec", HOOK_QUERY, stmt_query)
+    nil
+  }).unwrap
+}
+
+# Go's simulateBadConn in TestTxEndBadConn: the hook always fails, and the
+# operation reports ERR_BAD_CONN without leaking connections.
+def simulate_tx_end_bad_conn(db: DB, name: Str, which: Int, op: (Int) -> ~Unit) {
+  broken = Atomic.new(false)
+  num_open = db.st.lock { |s| s.num_open }
+  set_hook(drv_of(db).hooks, which, ->() -> Bool {
+    broken.store(true)
+    true
+  })
+  r = op(0)
+  set_hook(drv_of(db).hooks, which, none)
+  assert driver.bad_conn?(r.err || Failure.Msg("no error")), "#{name}: #{r.err}"
+  assert broken.load, "#{name}: Failed to simulate broken connection"
+  n = db.st.lock { |s| s.num_open }
+  assert n == num_open, "#{name}: leaked #{n - num_open} connection(s)!"
+}
+
+test "TxEndBadConn" {
+  test_database([], ->(db: DB) -> ~Unit {
+    db.set_max_idle_conns(0)
+    exec_t(db, "CREATE|t1|name=string,age=int32,dead=bool", nil)
+    db.set_max_idle_conns(1)
+    for commit in [true, false] {
+      simulate_tx_end_bad_conn(db, "db.Tx.Exec #{commit ? "commit" : "rollback"}", commit ? HOOK_COMMIT : HOOK_ROLLBACK, ->(_i: Int) -> ~Unit {
+        tx = db.~begin
+        tx.~exec("INSERT|t1|name=?,age=?,dead=?", ("Gordon", 3, true))
+        commit ? tx.~commit : tx.~rollback
+      })
+      simulate_tx_end_bad_conn(db, "db.Tx.Query #{commit ? "commit" : "rollback"}", commit ? HOOK_COMMIT : HOOK_ROLLBACK, ->(_i: Int) -> ~Unit {
+        tx = db.~begin
+        rows = tx.~query("SELECT|t1|age,name|", nil)
+        ~rows.close
+        commit ? tx.~commit : tx.~rollback
+      })
+    }
+    nil
+  }).unwrap
+}

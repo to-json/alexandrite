@@ -4601,7 +4601,21 @@ impl<'w, 'a> FnCx<'w, 'a> {
         if args.is_empty() && block.is_none() {
             let bare = Expr { kind: ExprKind::Name(name.to_string()), span: name_span, id: NodeId::MAX };
             if let Some(f) = self.self_field(&bare) {
-                return self.expr(&f);
+                // `cancel()` on a field holding a function calls it (it was
+                // read and dropped).
+                let fv = self.expr(&f)?;
+                if let Ty::Fn(..) = self.resolve(&fv.ty) {
+                    return self.fn_call(fv, args, sp);
+                }
+                return Ok(fv);
+            }
+        } else if let Some(f) = self.self_field(&Expr { kind: ExprKind::Name(name.to_string()), span: name_span, id: NodeId::MAX }) {
+            // `on_put(x)`: a field holding a function, called.
+            if block.is_none() && !self.w.by_name.contains_key(name) {
+                let fv = self.expr(&f)?;
+                if let Ty::Fn(..) = self.resolve(&fv.ty) {
+                    return self.fn_call(fv, args, sp);
+                }
             }
         }
         match name {

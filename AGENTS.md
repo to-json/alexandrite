@@ -103,6 +103,8 @@ defer { cleanup() }
 t = spawn { work() }; r = t.~wait    # M:N tasks (8 MiB stack each; ALX_TASK_STACK)
 ch = Chan[Int].new(4); ch << 1; v = ch.recv
 mu = Mutex.new(0); mu.lock { |v| v += 1 }   # assigning v updates it; the block's value is lock's result
+pub HITS = Atomic.new(0)             # top level: package state only as Atomic[T] (any T; load copies) or Mutex[T],
+REG = Mutex[Map[Str, Int]].new({})   #   set before main runs; read as HITS / pkg.HITS (R11)
 
 # Lambdas, shell, FFI, tests --------------------------------------------------------
 add = ->(a: Int, b: Int) -> Int { a + b }; add.call(1, 2)

@@ -353,12 +353,16 @@ impl<'a> G<'a> {
                 let (xs, i, v, ew) = (self.fresh("xs"), self.fresh("i"), self.fresh("v"), self.fresh("w"));
                 self.w(ind, format!("{ew} = _d.array_elem({w}, {len})"));
                 self.w(ind, format!("_d.~array_len!({len})"));
-                self.w(ind, format!("{xs} = {dest}"));
+                // a fresh array: decoding in place into dest's storage
+                // corrupted memory (port-issues)
+                self.w(ind, format!("{xs}: {} = {}", type_src(t), self.zero(t)));
                 self.w(ind, format!("for {i} in 0...{len} {{"));
                 self.w(ind + 1, format!("_d.~elem_check!({len})"));
-                self.w(ind + 1, format!("{v} = {xs}[{i}]"));
-                self.dec(e, &ew, &v, &format!("element of {name}"), ind + 1);
-                self.w(ind + 1, format!("{xs}[{i}] = {v}"));
+                // straight into the element: a fixed-array local assigned to
+                // another is copied into the loop's region, which the store
+                // into xs then outlives (port-issues #88)
+                self.dec(e, &ew, &format!("{xs}[{i}]"), &format!("element of {name}"), ind + 1);
+                let _ = v;
                 self.w(ind, "}");
                 self.w(ind, format!("{dest} = {xs}"));
             }

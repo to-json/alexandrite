@@ -45,6 +45,21 @@ fn ty_name_full(t: &LTy) -> String {
     }
 }
 
+/// Is this value all-zero bytes in C, or equivalent to them (so a
+/// designated initialiser may leave it out)? An empty string is: a zeroed
+/// AlxStr (null pointer, length 0) already stands for "" in every
+/// zero-initialised local.
+fn c_zero(e: &LE) -> bool {
+    match e {
+        LE::I(0) | LE::B(false) | LE::Unit => true,
+        LE::S(s) => s.is_empty(),
+        LE::F(f) => *f == 0.0 && f.is_sign_positive(),
+        LE::ArrWithCap(_, n) => matches!(**n, LE::I(0)),
+        LE::Tup(_, vs) => vs.iter().all(c_zero),
+        _ => false,
+    }
+}
+
 pub fn cty(t: &LTy) -> String {
     match t {
         LTy::Region => "AlxRegion *".into(),
@@ -764,6 +779,14 @@ impl FnEmit<'_> {
             LE::Tup(t, vs) => {
                 // A literal's type may be held by no variable (`Zero[T].new.v`).
                 LITERAL_TYPES.with(|l| l.borrow_mut().push(t.clone()));
+                // Fields whose value is all-zero bytes are left to C's zero
+                // fill: a closure or sum value names one live variant, and
+                // spelling every other variant's zero payload made lines of
+                // tens of kilobytes (crypto/tls's builders).
+                if vs.iter().any(c_zero) {
+                    let parts: Vec<String> = vs.iter().enumerate().filter(|(_, x)| !c_zero(x)).map(|(k, x)| format!(".f{k} = {}", self.e(x))).collect();
+                    return format!("(({}){{{}}})", cty(t), parts.join(", "));
+                }
                 format!("(({}){{{}}})", cty(t), vs.iter().map(|x| self.e(x)).collect::<Vec<_>>().join(", "))
             }
             LE::Field(x, i) => format!("({}).f{i}", self.e(x)),

@@ -3656,7 +3656,7 @@ impl<'w, 'a> FnCx<'w, 'a> {
                 (vec![save, TStmt::If(cond, vec![set], vec![]), res], Ty::Bool)
             }
         };
-        let blk = TBlock { params: vec![p], destructure: false, body, pure: false, span: sp, own: (own0, self.locals.len()) };
+        let blk = TBlock { params: vec![p], destructure: false, body, pure: false, span: sp, own: (own0, self.locals.len()), id: 0 };
         self.impure = true;
         let lock = self.mk(TK::M(M::Lock, Some(Box::new(recv)), vec![], Some(Box::new(blk))), bt.clone(), sp);
         if pre.is_empty() {

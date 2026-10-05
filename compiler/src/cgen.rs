@@ -4,7 +4,25 @@ use crate::lir::*;
 use std::collections::HashSet;
 use std::fmt::Write;
 
+/// The C name of a type. Names spell the layout (`Tup2_I64_Str`); a long
+/// one (a struct with dozens of fields, nested) becomes `Ty_<hash>`, so a
+/// big program's C doesn't grow lines of a megabyte (crypto/tls's tests
+/// made 200 MB of C that clang took over half an hour on).
 pub fn ty_name(t: &LTy) -> String {
+    let n = ty_name_full(t);
+    if n.len() <= 96 {
+        return n;
+    }
+    // FNV-1a, 64 bits: stable across runs and backends.
+    let mut h: u64 = 0xcbf29ce484222325;
+    for b in n.bytes() {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    format!("Ty_{h:016x}")
+}
+
+fn ty_name_full(t: &LTy) -> String {
     match t {
         LTy::Region => "Region".into(),
         LTy::Task(t) => format!("Task_{}", ty_name(t)),

@@ -1,0 +1,215 @@
+# Go's sql_test.go, part 3: TestExec .. TestConnRaw.
+
+import "context"
+import "database/sql/driver"
+
+def check_exec[A](stmt: Stmt, args: A, want_err: Str) {
+  r = stmt.exec(args)
+  got = r.err?.message || ""
+  assert got == want_err, "stmt.Exec: got error #{got}, want #{want_err}"
+}
+
+def stmt_closed?(s: Stmt) -> Bool { s.core.st.lock { |x| x.closed } }
+
+test "Exec" {
+  test_database([], ->(db: DB) -> ~Unit {
+    exec_t(db, "CREATE|t1|name=string,age=int32,dead=bool", nil)
+    stmt = db.~prepare("INSERT|t1|name=?,age=?")
+    defer stmt.close
+    check_exec(stmt, ("Brad", 31), "")
+    check_exec(stmt, ("Brad", 31.as_i64), "")
+    check_exec(stmt, ("Bob", "32"), "")
+    check_exec(stmt, (7, 9), "")
+    check_exec(stmt, ("Brad", 0xFFFFFFFF), "sql: converting argument $2 type: sql/driver: value 4294967295 overflows int32")
+    check_exec(stmt, ("Brad", "strconv fail"), "sql: converting argument $2 type: sql/driver: value \"strconv fail\" can't be converted to int32")
+    check_exec(stmt, nil, "sql: expected 2 arguments, got 0")
+    check_exec(stmt, (1, 2, 3), "sql: expected 2 arguments, got 3")
+    nil
+  }).unwrap
+}
+
+test "TxPrepare" {
+  test_database([], ->(db: DB) -> ~Unit {
+    exec_t(db, "CREATE|t1|name=string,age=int32,dead=bool", nil)
+    tx = db.~begin
+    stmt = tx.~prepare("INSERT|t1|name=?,age=?")
+    defer stmt.close
+    stmt.~exec(("Bobby", 7))
+    ~tx.commit
+    assert stmt_closed?(stmt), "Stmt not closed after Commit"
+    nil
+  }).unwrap
+}
+
+test "TxStmt" {
+  test_database([], ->(db: DB) -> ~Unit {
+    exec_t(db, "CREATE|t1|name=string,age=int32,dead=bool", nil)
+    stmt = db.~prepare("INSERT|t1|name=?,age=?")
+    defer stmt.close
+    tx = db.~begin
+    txs = tx.stmt(stmt)
+    defer txs.close
+    txs.~exec(("Bobby", 7))
+    ~tx.commit
+    assert stmt_closed?(txs), "Stmt not closed after Commit"
+    nil
+  }).unwrap
+}
+
+test "TxStmtPreparedOnce" {
+  test_database([], ->(db: DB) -> ~Unit {
+    exec_t(db, "CREATE|t1|name=string,age=int32", nil)
+    prepares0 = num_prepares(db)
+    stmt = db.~prepare("INSERT|t1|name=?,age=?")
+    defer stmt.close
+    tx = db.~begin
+    txs1 = tx.stmt(stmt)
+    txs2 = tx.stmt(stmt)
+    txs1.~exec(("Go", 7))
+    ~txs1.close
+    txs2.~exec(("Gopher", 8))
+    ~txs2.close
+    ~tx.commit
+    assert_eq num_prepares(db) - prepares0, 1
+    nil
+  }).unwrap
+}
+
+test "TxStmtClosedRePrepares" {
+  test_database([], ->(db: DB) -> ~Unit {
+    exec_t(db, "CREATE|t1|name=string,age=int32", nil)
+    prepares0 = num_prepares(db)
+    stmt = db.~prepare("INSERT|t1|name=?,age=?")
+    tx = db.~begin
+    ~stmt.close
+    txs = tx.stmt(stmt)
+    if e = txs.sticky_err {
+      fail e
+    }
+    assert txs.parent == none, "expected nil parentStmt"
+    txs.~exec(("Eric", 82))
+    ~txs.close
+    _ = tx.rollback
+    assert_eq num_prepares(db) - prepares0, 2
+    nil
+  }).unwrap
+}
+
+test "ParentStmtOutlivesTxStmt" {
+  test_database([], ->(db: DB) -> ~Unit {
+    exec_t(db, "CREATE|t1|name=string,age=int32", nil)
+    db.set_max_open_conns(1)
+    prepares0 = num_prepares(db)
+    stmt = db.~prepare("INSERT|t1|name=?,age=?")
+    defer stmt.close
+    tx = db.~begin
+    txs = tx.stmt(stmt)
+    n = stmt.core.st.lock { |s| s.css.size }
+    assert n == 1, "len(stmt.css) = #{n}; want 1"
+    ~txs.close
+    ~tx.rollback
+    assert txs.exec(("Suzan", 30)).err?, "txs.Exec(), expected err"
+    stmt.~exec(("Janina", 25))
+    assert_eq num_prepares(db) - prepares0, 1
+    nil
+  }).unwrap
+}
+
+test "TxStmtFromTxStmtRePrepares" {
+  test_database([], ->(db: DB) -> ~Unit {
+    exec_t(db, "CREATE|t1|name=string,age=int32", nil)
+    prepares0 = num_prepares(db)
+    stmt = db.~prepare("INSERT|t1|name=?,age=?")
+    defer stmt.close
+    tx = db.~begin
+    txs1 = tx.stmt(stmt)
+    txs2 = tx.stmt(txs1)
+    if e = txs2.sticky_err {
+      fail e
+    }
+    assert txs2.parent == none, "expected nil parentStmt"
+    txs2.~exec(("Eric", 82))
+    ~txs1.close
+    ~txs2.close
+    ~tx.rollback
+    assert_eq num_prepares(db) - prepares0, 2
+    nil
+  }).unwrap
+}
+
+test "TxQuery" {
+  test_database([], ->(db: DB) -> ~Unit {
+    exec_t(db, "CREATE|t1|name=string,age=int32,dead=bool", nil)
+    exec_t(db, "INSERT|t1|name=Alice", nil)
+    tx = db.~begin
+    defer tx.rollback
+    r = tx.~query("SELECT|t1|name|", nil)
+    defer r.close
+    if !r.next {
+      ~r.err_result
+      fail "expected one row"
+    }
+    _x: Str = r.~scan
+    nil
+  }).unwrap
+}
+
+test "TxQueryInvalid" {
+  test_database([], ->(db: DB) -> ~Unit {
+    tx = db.~begin
+    defer tx.rollback
+    assert tx.query("SELECT|t1|name|", nil).err?, "Error expected"
+    nil
+  }).unwrap
+}
+
+test "TxErrBadConn" {
+  drv = new_fake_driver
+  db = ~open_driver(drv, "#{FAKE_DB_NAME};badConn")
+  db.~exec("WIPE", nil)
+  exec_t(db, "CREATE|t1|name=string,age=int32,dead=bool", nil)
+  stmt = db.~prepare("INSERT|t1|name=?,age=?")
+  tx = db.~begin
+  txs = tx.stmt(stmt)
+  txs.~exec(("Bobby", 7))
+  ~tx.commit
+  ~txs.close
+  ~stmt.close
+  close_db(db)
+}
+
+test "ConnQuery" {
+  test_database([], ->(db: DB) -> ~Unit {
+    populate(db, "people")
+    ctx = context.background
+    conn = db.~conn_context(ctx)
+    get_fake_conn(conn.dc.ci).set_skip_dirty_session
+    defer conn.close
+    name: Str = conn.query_row_context(ctx, "SELECT|people|name|age=?", 3).~scan
+    assert_eq name, "Chris"
+    ~conn.ping_context(ctx)
+    nil
+  }).unwrap
+}
+
+test "ConnRaw" {
+  test_database([], ->(db: DB) -> ~Unit {
+    populate(db, "people")
+    conn = db.~conn_context(context.background)
+    get_fake_conn(conn.dc.ci).set_skip_dirty_session
+    defer conn.close
+    saw = Atomic.new(false)
+    conn.~raw(->(dc: driver.Conn) -> ~Unit {
+      saw.store(true)
+      _fc = get_fake_conn(dc)
+      nil
+    })
+    assert saw.load, "Raw func not called"
+    # (Go's second half: a panic in the func discards the connection; alx
+    # has no recover. A func failing with ERR_BAD_CONN does the same.)
+    r = conn.raw(->(dc: driver.Conn) -> ~Unit { fail driver.ERR_BAD_CONN })
+    assert r.err?, "want the bad-conn error"
+    assert conn.done.load, "expected connection to be closed after a bad connection"
+    nil
+  }).unwrap
+}

@@ -68,8 +68,8 @@ Open problems agents reported; each gets fixed in a compiler round between waves
 | 62 | net/rpc | `x: ~Reply = h.get` bound R to `~Reply` | fixed |
 | 63 | net/smtp | `spawn { f(x) }` with `f -> ~T` (T not Unit): bad C, lost value on the JIT | fixed: a checker error asking for `spawn { ~f(x) }` |
 | 64 | net/http/pprof | the JIT didn't resolve `alx_mem_held` / `alx_mem_peak` | fixed |
-| 65 | net/http audit | a `Mutex` captured by a lambda that moves into another task (`f.dup`, a handler in its request task) is copied: updates under `lock` there are lost (JIT and C); `Atomic` and `Chan` share | open (serious) |
-| 66 | httputil | `def f { spawn { 1 } }; t = spawn { f() }` crashes the compiler: "a task handle has no zero value" (`lower.rs` `zero_le`) | open (workaround: explicit `return`) |
+| 65 | net/http audit | a `Mutex` captured by a lambda that moves into another task (`f.dup`, a handler in its request task) is copied: updates under `lock` there are lost (JIT and C); `Atomic` and `Chan` share | fixed by the sync port (D55: copies of closures and structs keep a captured Mutex shared); acceptance cases tasksharing, mutex_http |
+| 66 | httputil | `def f { spawn { 1 } }; t = spawn { f() }` crashes the compiler: "a task handle has no zero value" (`lower.rs` `zero_le`) | fixed: task handles have a zero value (`LE::NullTask`, all backends); acceptance case tasksharing |
 | 67 | cookiejar | `mu.lock { \|s\| if c { s.m.delete(k) } else { s.m[k] = 1 } }`: C emits `v = 0;` for the store arm (typed `Int?`) | open (workaround: end the block with `nil`) |
 | 68 | net/mail | C mistypes a statement `case` whose arms assign locals of different types (as in json-derive.md) | open |
 | 69 | net/http/cgi | spawning with a struct holding a lambda: the error suggests `h.dup`, which doesn't exist | open |
@@ -77,3 +77,7 @@ Open problems agents reported; each gets fixed in a compiler round between waves
 | 71 | httptest, httptrace, fcgi | a closure can't capture a value holding a closure of its own type (handler capturing its server, a director wrapping the old one, composed trace hooks) | open (design; see #2) |
 | 72 | sniff | `b("RIFF") + [0, 0, 0, 0]`: a literal after `+` on a `[Byte]` stays `[Int]` | open (workaround: a `[Byte]` parameter) |
 | 73 | (main, net merge) | the Rust oracle of httpdemo grew to 7.4 MB and rustc ran for hours: every `fail` inlined a deep copy of the program-wide Error type (all error types' variants) | fixed: one shared `__error_copy` function (2.4 MB, rustc 64 s) |
+| 74 | archive/zip, archive/tar | `op=` on a non-scalar field or element place (`h.name += "/"`, `o.parts += [..]`) was lowered as integer arithmetic: the JIT panicked ("expected a scalar"), C called `alx_add` on strings | fixed: the checker stores `place = place op rhs` for non-scalars (acceptance place_opassign, place_concat_assign) |
+| 75 | archive/tar | assigning to an element of a call's result (`sa_is_extended(sa)[0] = 0x80`, the call returning a slice that shares storage) is refused: "cannot assign to this expression" | open (small; workaround: a local) |
+| 76 | archive/tar | `time.unix(MAX_I64, 0)` overflowed (panic) where Go wraps and round-trips through `t.Unix()`; a tar header's base-256 mtime can hold any Int | fixed: `time.unix`, `in_local`, `Time.unix` and `civil` wrap as Go's do |
+| 77 | archive/tar | a generic `R` can't be asked whether it also has `seek!` (Go's `r.(io.Seeker)`): tar skips entry data by reading, and its sparse write_to/read_from write holes as zeros instead of seeking | open (design; see #27) |

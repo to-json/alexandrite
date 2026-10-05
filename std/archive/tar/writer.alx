@@ -1,0 +1,460 @@
+# The tar Writer (Go's writer.go).
+
+import "io/fs"
+import "path"
+import "strings"
+import "time"
+
+struct WriterState[W] {
+  w: W
+  # Padding to write after the current entry's data.
+  pad: Int
+  # The current entry (Go's fileWriter): `nb` bytes of data still to
+  # write; a sparse entry also has its data fragments `sp` and logical
+  # position.
+  nb: Int
+  sparse: Bool
+  sp: [SparseEntry]
+  pos: Int
+  blk: [Byte]
+  err: Error?
+  closed: Bool
+}
+
+# Writes a tar archive to W (Go's Writer): write_header! starts an entry,
+# write! writes its data, close! ends the archive.
+pub struct Writer[W] {
+  st: [WriterState[W]]
+
+  # Finishes the current entry's padding. Fails if the entry's data isn't
+  # all written (Go's Flush). Rarely needed: write_header! and close! flush.
+  pub def flush! -> ~Unit {
+    if e = st[0].err {
+      fail e
+    }
+    nb = logical_remaining
+    fail TarError.MissedWriting(nb) if nb > 0
+    z: [Byte] = [0; st[0].pad]
+    r = raw_write!(z)
+    if e = r.err {
+      self.st[0].err = e
+      fail e
+    }
+    self.st[0].pad = 0
+  }
+
+  # Writes hdr and starts its entry; write! its data next (hdr.size bytes).
+  # Picks USTAR, PAX or GNU (hdr.format narrows the choice); fails with
+  # TarError.CannotEncode if none can hold the header (not sticky).
+  pub def write_header!(hdr: Header) -> ~Unit {
+    ~flush!
+    h = hdr
+    if h.typeflag == TYPE_REG_A {
+      h.typeflag = strings.has_suffix(h.name, "/") ? TYPE_DIR : TYPE_REG
+    }
+    # Round ModTime and ignore AccessTime and ChangeTime unless the format
+    # is explicitly chosen (Go's compatibility rule).
+    if h.format == FORMAT_UNKNOWN {
+      h.mod_time = h.mod_time.round(time.second)
+      h.access_time = time.Time.new()
+      h.change_time = time.Time.new()
+    }
+    allowed, pax_hdrs, err = h.allowed_formats
+    werr: Error? = none
+    if allowed & FORMAT_USTAR != 0 {
+      werr = write_ustar_header!(h).err
+    } else if allowed & FORMAT_PAX != 0 {
+      werr = write_pax_header!(h, pax_hdrs).err
+    } else if allowed & FORMAT_GNU != 0 {
+      werr = write_gnu_header!(h).err
+    } else {
+      fail err.unwrap
+    }
+    if e = werr {
+      self.st[0].err = e
+      fail e
+    }
+  }
+
+  # Writes p as the current entry's data; returns p.size. Writing more than
+  # the header's size writes what fits, then fails with WriteTooLong.
+  pub def write!(p: [Byte]) -> ~Int {
+    if e = st[0].err {
+      fail e
+    }
+    n, err = cur_write!(p)
+    if e = err {
+      if !write_too_long?(e) {
+        self.st[0].err = e
+      }
+      fail e
+    }
+    n
+  }
+
+  pub def write_string!(s: Str) -> ~Int {
+    self.~write!(s.bytes.to_a)
+  }
+
+  # Writes the end of the archive (two zero blocks), after flushing the
+  # current entry. Doesn't close the underlying writer. Closing again does
+  # nothing; writing after close! fails with WriteAfterClose.
+  pub def close! -> ~Unit {
+    return if st[0].closed
+    if e = st[0].err {
+      fail e
+    }
+    err = flush!.err
+    if err.none? {
+      z = new_block
+      i = 0
+      while i < 2 && err.none? {
+        err = raw_write!(z).err
+        i += 1
+      }
+    }
+    self.st[0].err = TarError.WriteAfterClose
+    self.st[0].closed = true
+    if e = err {
+      fail e
+    }
+  }
+
+  # Adds every file of fsys, walking it from its root in lexical order
+  # (Go's AddFS): directories, regular files and symlinks; anything else
+  # fails with NonRegular. Names are slash paths relative to the root.
+  pub def add_fs![F](fsys: F) -> ~Unit {
+    tw = self
+    fs.~walk_dir(fsys, ".") { |name, d, err|
+      if e = err {
+        fail e
+      }
+      if name != "." {
+        de = d.unwrap
+        info = de.~info
+        link = ""
+        typ = de.type
+        if typ.bits == fs.MODE_SYMLINK {
+          link = fs.~read_link(fsys, name)
+        } else if !typ.is_regular? && typ.bits != fs.MODE_DIR {
+          fail TarError.NonRegular
+        }
+        h = ~file_info_header(info, link)
+        h.name = name
+        h.name += "/" if de.is_dir
+        tw.~write_header!(h)
+        if de.type.is_regular? {
+          f = fsys.~open(name)
+          buf: [Byte] = [0; 32 * 1024]
+          ferr: Error? = none
+          loop {
+            rn = f.read!(buf)
+            if e = rn.err {
+              ferr = e
+              break
+            }
+            n = rn.unwrap
+            break if n == 0
+            wr = tw.write!(buf[0...n])
+            if e = wr.err {
+              ferr = e
+              break
+            }
+          }
+          f.close!
+          if e = ferr {
+            fail e
+          }
+        }
+      }
+    }
+  }
+
+  # ----------------------------------------------------- current entry
+
+  def raw_write!(p: [Byte]) -> ~Int {
+    self.st[0].w.~write!(p)
+  }
+
+  def logical_remaining -> Int {
+    return st[0].sp[st[0].sp.size - 1].end_offset - st[0].pos if st[0].sparse
+    st[0].nb
+  }
+
+  def physical_remaining -> Int { st[0].nb }
+
+  def set_reg!(nb: Int) {
+    self.st[0].nb = nb
+    self.st[0].sparse = false
+    self.st[0].sp = []
+    self.st[0].pos = 0
+  }
+
+  # Makes the current entry sparse with data fragments spd.
+  def set_sparse!(spd: [SparseEntry]) {
+    self.st[0].sparse = true
+    self.st[0].sp = spd
+    self.st[0].pos = 0
+  }
+
+  # Go's fileWriter.Write: the count and an error.
+  def cur_write!(b: [Byte]) -> (Int, Error?) {
+    return sparse_write!(b) if st[0].sparse
+    reg_write!(b)
+  }
+
+  # Go's regFileWriter.Write.
+  def reg_write!(b: [Byte]) -> (Int, Error?) {
+    nb = st[0].nb
+    overwrite = b.size > nb
+    k = overwrite ? nb : b.size
+    n = 0
+    if k > 0 {
+      r = raw_write!(b[0...k])
+      if e = r.err {
+        return (0, e)
+      }
+      n = k
+      self.st[0].nb = nb - n
+    }
+    return (n, TarError.WriteTooLong) if overwrite
+    (n, none)
+  }
+
+  # Go's sparseFileWriter.Write: holes must be written as zeros.
+  def sparse_write!(b0: [Byte]) -> (Int, Error?) {
+    lr = logical_remaining
+    overwrite = b0.size > lr
+    b = overwrite ? b0[0...lr] : b0
+    off = 0
+    end_pos = st[0].pos + b.size
+    err: Error? = none
+    while end_pos > st[0].pos && err.none? {
+      pos = st[0].pos
+      data_start = st[0].sp[0].offset
+      data_end = st[0].sp[0].end_offset
+      nf = 0
+      if pos < data_start {
+        k = b.size - off
+        k = data_start - pos if data_start - pos < k
+        i = 0
+        while i < k && b[off + i] == 0 {
+          i += 1
+        }
+        nf = i
+        err = TarError.WriteHole if i < k
+      } else {
+        k = b.size - off
+        k = data_end - pos if data_end - pos < k
+        m, e = reg_write!(b[off...off + k])
+        nf = m
+        err = e
+      }
+      off += nf
+      self.st[0].pos = pos + nf
+      if st[0].pos >= data_end && st[0].sp.size > 1 {
+        self.st[0].sp = st[0].sp[1...st[0].sp.size]
+      }
+    }
+    if e = err {
+      return (off, TarError.MissData) if write_too_long?(e)
+      return (off, e)
+    }
+    return (off, TarError.UnrefData) if logical_remaining == 0 && physical_remaining > 0
+    return (off, TarError.WriteTooLong) if overwrite
+    (off, none)
+  }
+
+  # Copies r into the current entry (Go's unexported readFrom, without its
+  # seeking over holes): the count and an error.
+  def read_from![R](r: R) -> (Int, Error?) {
+    if e = st[0].err {
+      return (0, e)
+    }
+    buf: [Byte] = [0; 32 * 1024]
+    total = 0
+    loop {
+      rr = read_some(r, buf)
+      if e = rr.err {
+        return (total, e)
+      }
+      n = rr.unwrap
+      return (total, none) if n == 0
+      m, err = cur_write!(buf[0...n])
+      total += m
+      if e = err {
+        self.st[0].err = e if !write_too_long?(e)
+        return (total, e)
+      }
+    }
+  }
+
+  # ------------------------------------------------------------ headers
+
+  def write_ustar_header!(hdr: Header) -> ~Unit {
+    h = hdr
+    name_prefix = ""
+    if parts = split_ustar_path(h.name) {
+      name_prefix = parts[0]
+      h.name = parts[1]
+    }
+    bad = template_v7_plus!(h, false, false)
+    blk = st[0].blk
+    f = Formatter.new()
+    f.format_string!(f_ustar_prefix(blk), name_prefix)
+    set_format(blk, FORMAT_USTAR)
+    fail TarError.FieldTooLong if f.err || bad
+    ~write_raw_header!(blk, h.size, h.typeflag)
+  }
+
+  def write_pax_header!(h: Header, pax_hdrs: Map[Str, Str]) -> ~Unit {
+    real_name = h.name
+    is_global = h.typeflag == TYPE_X_GLOBAL_HEADER
+    if pax_hdrs.size > 0 || is_global {
+      data = ""
+      for k in pax_hdrs.keys.sort {
+        data += ~format_pax_record(k, pax_hdrs[k] || "")
+      }
+      name = ""
+      flag = TYPE_X_HEADER
+      if is_global {
+        name = real_name == "" ? "GlobalHead.0.0" : real_name
+        flag = TYPE_X_GLOBAL_HEADER
+      } else {
+        dir, file = path.split(real_name)
+        name = path.join([dir, "PaxHeaders.0", file])
+      }
+      fail TarError.FieldTooLong if data.size > MAX_SPECIAL_FILE_SIZE
+      ~write_raw_file!(name, data, flag, FORMAT_PAX)
+      return if is_global
+    }
+    # Errors are expected (the PAX records hold what doesn't fit).
+    template_v7_plus!(h, true, false)
+    blk = st[0].blk
+    set_format(blk, FORMAT_PAX)
+    ~write_raw_header!(blk, h.size, h.typeflag)
+  }
+
+  def write_gnu_header!(h: Header) -> ~Unit {
+    long_name = "././@LongLink"
+    if h.name.size > NAME_SIZE {
+      ~write_raw_file!(long_name, h.name + "\x00", TYPE_GNU_LONG_NAME, FORMAT_GNU)
+    }
+    if h.linkname.size > NAME_SIZE {
+      ~write_raw_file!(long_name, h.linkname + "\x00", TYPE_GNU_LONG_LINK, FORMAT_GNU)
+    }
+    # Errors are expected (truncated long names).
+    template_v7_plus!(h, false, true)
+    blk = st[0].blk
+    f = Formatter.new()
+    f.format_numeric!(f_gnu_access_time(blk), h.access_time.unix) if !h.access_time.is_zero
+    f.format_numeric!(f_gnu_change_time(blk), h.change_time.unix) if !h.change_time.is_zero
+    set_format(blk, FORMAT_GNU)
+    ~write_raw_header!(blk, h.size, h.typeflag)
+  }
+
+  # Fills the block with the V7 and USTAR fields of h (strings as ASCII if
+  # `ascii`, numbers in GNU's base-256 if `numeric`); true if a field
+  # didn't fit.
+  def template_v7_plus!(h: Header, ascii: Bool, numeric: Bool) -> Bool {
+    blk = st[0].blk
+    i = 0
+    while i < blk.size {
+      blk[i] = 0
+      i += 1
+    }
+    mod_time = h.mod_time
+    mod_time = time.unix(0, 0) if mod_time.is_zero
+    f = Formatter.new()
+    blk[156] = h.typeflag
+    if ascii {
+      f.format_ascii!(f_name(blk), h.name)
+      f.format_ascii!(f_link_name(blk), h.linkname)
+    } else {
+      f.format_string!(f_name(blk), h.name)
+      f.format_string!(f_link_name(blk), h.linkname)
+    }
+    if numeric {
+      f.format_numeric!(f_mode(blk), h.mode)
+      f.format_numeric!(f_uid(blk), h.uid)
+      f.format_numeric!(f_gid(blk), h.gid)
+      f.format_numeric!(f_size(blk), h.size)
+      f.format_numeric!(f_mod_time(blk), mod_time.unix)
+    } else {
+      f.format_octal!(f_mode(blk), h.mode)
+      f.format_octal!(f_uid(blk), h.uid)
+      f.format_octal!(f_gid(blk), h.gid)
+      f.format_octal!(f_size(blk), h.size)
+      f.format_octal!(f_mod_time(blk), mod_time.unix)
+    }
+    if ascii {
+      f.format_ascii!(f_user_name(blk), h.uname)
+      f.format_ascii!(f_group_name(blk), h.gname)
+    } else {
+      f.format_string!(f_user_name(blk), h.uname)
+      f.format_string!(f_group_name(blk), h.gname)
+    }
+    if numeric {
+      f.format_numeric!(f_dev_major(blk), h.devmajor)
+      f.format_numeric!(f_dev_minor(blk), h.devminor)
+    } else {
+      f.format_octal!(f_dev_major(blk), h.devmajor)
+      f.format_octal!(f_dev_minor(blk), h.devminor)
+    }
+    f.err
+  }
+
+  # Writes a meta file (PAX records, a GNU long name) with its data.
+  def write_raw_file!(name0: Str, data: Str, flag: Byte, format: Int) -> ~Unit {
+    blk = st[0].blk
+    i = 0
+    while i < blk.size {
+      blk[i] = 0
+      i += 1
+    }
+    name = to_ascii(name0)
+    name = name[0...NAME_SIZE] if name.size > NAME_SIZE
+    name = strings.trim_right(name, "/")
+    f = Formatter.new()
+    blk[156] = flag
+    f.format_string!(f_name(blk), name)
+    f.format_octal!(f_mode(blk), 0)
+    f.format_octal!(f_uid(blk), 0)
+    f.format_octal!(f_gid(blk), 0)
+    f.format_octal!(f_size(blk), data.size)
+    f.format_octal!(f_mod_time(blk), 0)
+    set_format(blk, format)
+    fail TarError.FieldTooLong if f.err
+    ~write_raw_header!(blk, data.size, flag)
+    n, err = cur_write!(data.bytes.to_a)
+    if e = err {
+      fail e
+    }
+    _n = n
+  }
+
+  # Writes a header block and starts its entry (size bytes of data).
+  def write_raw_header!(blk: [Byte], size0: Int, flag: Byte) -> ~Unit {
+    ~flush!
+    ~raw_write!(blk)
+    size = header_only_type?(flag) ? 0 : size0
+    set_reg!(size)
+    self.st[0].pad = block_padding(size)
+  }
+}
+
+def read_some[R](r: R, p: [Byte]) -> ~Int {
+  r.~read!(p)
+}
+
+def write_too_long?(e: Error) -> Bool {
+  case e {
+    TarError.WriteTooLong => true
+    _ => false
+  }
+}
+
+# A Writer of a tar archive to w.
+pub def new_writer[W](w: W) -> Writer[W] {
+  Writer[W].new(st: [WriterState[W].new(w: w, pad: 0, nb: 0, sparse: false, sp: [], pos: 0, blk: new_block, err: none, closed: false)])
+}

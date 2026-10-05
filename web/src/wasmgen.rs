@@ -1752,6 +1752,7 @@ impl<'c, 'p> Fx<'c, 'p> {
                 self.rt("alxr_chan_len");
             }
             LE::LockNew => self.rt("alxr_lock_new"),
+            LE::NullTask(_) => self.i64c(0),
             // Without threads atomics are plain loads and stores.
             LE::AtomicNew(v) => {
                 let x = self.eval_locals(v)[0];
@@ -2365,6 +2366,7 @@ pub(crate) fn ty_of(tys: &Tys, vars: &[LVar], e: &LE) -> LTy {
         LE::Ffi(i, _) => tys.ffi[*i].clone(),
         LE::Global(k) => tys.globals[*k].clone(),
         LE::LockNew => LTy::Lock,
+        LE::NullTask(t) => t.clone(),
         LE::AtomicNew(_) => LTy::Atomic,
         LE::AtomicLoad(_) | LE::AtomicRmw(..) => LTy::I64,
         LE::AtomicCas(..) => LTy::Bool,

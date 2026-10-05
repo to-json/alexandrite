@@ -262,9 +262,9 @@ impl Ck<'_> {
             }
             TK::IndexAssign(l, ..) | TK::PlaceAssign(l, ..) => {
                 let mut kids = vec![];
-                crate::prove::each_child(e, &mut |c| kids.push(c as *const TExpr));
+                crate::prove::each_child(e, &mut |c| kids.push(c));
                 for k in kids {
-                    self.expr(unsafe { &*k });
+                    self.expr(k);
                 }
                 self.use_of(*l, e.span);
             }
@@ -383,10 +383,9 @@ impl Ck<'_> {
             }
             _ => {
                 let mut kids = vec![];
-                crate::prove::each_child(e, &mut |c| kids.push(c as *const TExpr));
+                crate::prove::each_child(e, &mut |c| kids.push(c));
                 for k in kids {
-                    // Children borrow from `e`, which outlives this call.
-                    self.expr(unsafe { &*k });
+                    self.expr(k);
                 }
             }
         }

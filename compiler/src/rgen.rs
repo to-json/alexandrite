@@ -204,7 +204,16 @@ fn ffi_fns(p: &LProgram) -> String {
     let _ = writeln!(o, "fn sys_consts() -> &'static [(&'static str, i64)] {{\n    &[{}]\n}}\n", sys_consts().iter().map(|(n, v)| format!("({n:?}, {v}i64)")).collect::<Vec<_>>().join(", "));
     for (i, x) in p.externs.iter().enumerate() {
         let cparams: Vec<String> = x.params.iter().enumerate().map(|(k, t)| format!("a{k}: {}", ffi_rty(*t))).collect();
-        let cret = if x.ret == FfiTy::Unit { String::new() } else { format!(" -> {}", ffi_rty(x.ret)) };
+        // A C `bool` result is read as a byte: any nonzero value is true (a
+        // Rust `bool` holding anything but 0 or 1 is undefined behavior).
+        let c_bool = x.ret == FfiTy::Bool && !x.sym.starts_with("alx_");
+        let cret = if x.ret == FfiTy::Unit {
+            String::new()
+        } else if c_bool {
+            " -> u8".to_string()
+        } else {
+            format!(" -> {}", ffi_rty(x.ret))
+        };
         // Every `alx_*` symbol is the C runtime's: the prelude has it as `shim_alx_*`.
         let shim_name = format!("shim_{}", x.sym);
         let shim = if x.sym.starts_with("alx_") { Some(shim_name.as_str()) } else { None };
@@ -243,6 +252,7 @@ fn ffi_fns(p: &LProgram) -> String {
         let _ = writeln!(o, "    clear_errno();\n    let r = {call};\n    save_errno();\n{post}    {}\n}}\n", match x.ret {
             FfiTy::Int(_) => "r as i64",
             FfiTy::Ptr => "r as usize as i64",
+            FfiTy::Bool if c_bool => "r != 0",
             _ => "r",
         });
     }
@@ -501,6 +511,7 @@ impl FnEmit<'_> {
             LE::ChanNew(t, cap) => format!("Chan::<{}>::new({})", rty(t), self.e(cap)),
             LE::ChanLen(c) => format!("({}).len()", self.e(c)),
             LE::LockNew => "AlxLock::default()".into(),
+            LE::NullTask(_) => "Default::default()".into(),
             LE::AtomicNew(v) => format!("AlxAtomic::new({})", self.e(v)),
             LE::AtomicLoad(a) => format!("({}).load()", self.e(a)),
             LE::AtomicRmw(AtomicOp::Add, a, v) => format!("({}).add({})", self.e(a), self.e(v)),

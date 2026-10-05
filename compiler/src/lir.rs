@@ -143,6 +143,8 @@ pub enum LE {
     ChanLen(Box<LE>),
     /// A new, unheld lock.
     LockNew,
+    /// A task handle that names no task (an LTy::Task's zero value; never waited on).
+    NullTask(LTy),
     /// A new atomic cell holding this I64.
     AtomicNew(Box<LE>),
     /// The cell's value (I64). Lowering binds it right away: reads and

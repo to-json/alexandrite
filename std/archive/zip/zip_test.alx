@@ -1,0 +1,470 @@
+import "bytes"
+import "io"
+import "os"
+import "time"
+
+# Go's zip_test.go (tests that read and write).
+
+# The multi-GiB tests (Go skips them with -short) run only with
+# ALX_SLOW_TESTS set.
+def slow_tests? -> Bool { os.getenv("ALX_SLOW_TESTS").some? }
+
+test "round trip" {
+  buf = bytes.new_buffer([])
+  w = new_writer(buf)
+  f = w.~create!("hello.txt")
+  f.~write!(b("hello, world hello, world"))
+  g = w.~create_header!(FileHeader.new(name: "raw.txt", method: STORE))
+  g.~write!(b("stored"))
+  w.~close!
+  r = ~reader_of(buf)
+  assert_eq r.file.size, 2
+  assert_eq r.file[0].header.name, "hello.txt"
+  rc = r.file[0].~open
+  assert_eq Str.from_bytes(io.~read_all(rc)), "hello, world hello, world"
+  rc2 = r.file[1].~open
+  assert_eq Str.from_bytes(io.~read_all(rc2)), "stored"
+}
+
+test "over 65k files" {
+  buf = bytes.new_buffer([])
+  w = new_writer(buf)
+  n_files = (1 << 16) + 42
+  for i in 0...n_files {
+    w.~create_header!(FileHeader.new(name: "#{i}.dat", method: STORE))
+  }
+  w.~close!
+  zr = ~reader_of(buf)
+  assert_eq zr.file.size, n_files
+  for i in 0...n_files {
+    assert_eq zr.file[i].header.name, "#{i}.dat"
+  }
+}
+
+test "mod time" {
+  t = time.date(2009, 11, 10, 23, 45, 58, 0, time.utc)
+  fh = FileHeader.new()
+  fh.set_mod_time!(t)
+  assert fh.mod_time.equal(t), "times don't match: got #{fh.mod_time}, want #{t}"
+}
+
+def header_round_trip(fh: FileHeader, want_size: U32, want_size64: U64) {
+  fi = fh.file_info
+  fh2 = file_info_header(fi)
+  assert_eq fh2.name, fh.name
+  assert_eq fh2.uncompressed_size, want_size
+  assert_eq fh2.uncompressed_size64, want_size64
+  assert_eq fh2.modified_time, fh.modified_time
+  assert_eq fh2.modified_date, fh.modified_date
+}
+
+test "file header round trip" {
+  fh = FileHeader.new(name: "foo.txt", uncompressed_size: 987654321, modified_time: 1234, modified_date: 5678)
+  header_round_trip(fh, fh.uncompressed_size, fh.uncompressed_size.as_u64)
+}
+
+test "file header round trip 64" {
+  fh = FileHeader.new(name: "foo.txt", uncompressed_size64: 9876543210, modified_time: 1234, modified_date: 5678)
+  header_round_trip(fh, U32MAX, fh.uncompressed_size64)
+}
+
+test "file header round trip modified" {
+  fh = FileHeader.new(name: "foo.txt", uncompressed_size: 987654321, modified: time.now.local, modified_time: 1234, modified_date: 5678)
+  fi = fh.file_info
+  fh2 = file_info_header(fi)
+  assert fh2.modified.equal(fh.modified.utc), "Modified: got #{fh2.modified}, want #{fh.modified.utc}"
+  assert_eq fh2.modified.zone_info, fh.modified.utc.zone_info
+  assert fi.mod_time.equal(fh.modified.utc), "ModTime: got #{fi.mod_time}"
+}
+
+test "file header round trip without modified" {
+  fh = FileHeader.new(name: "foo.txt", uncompressed_size: 987654321, modified_time: 1234, modified_date: 5678)
+  fi = fh.file_info
+  fh2 = file_info_header(fi)
+  assert fh2.mod_time.equal(fh.mod_time), "Modified: got #{fh2.mod_time}, want #{fh.mod_time}"
+  assert fi.mod_time.equal(fh.mod_time), "ModTime: got #{fi.mod_time}, want #{fh.mod_time}"
+}
+
+# ------------------------------------------------------------ rleBuffer
+
+struct RepeatedByte {
+  off: Int
+  b: Byte
+  n: Int
+}
+
+# A run-length-encoded byte buffer: an io.Writer and a ReaderAt (Go's
+# rleBuffer). Copies share it.
+struct RleBuffer {
+  st: [[RepeatedByte]]
+
+  def size -> Int {
+    bf = st[0]
+    return 0 if bf.size == 0
+    last = bf[bf.size - 1]
+    last.off + last.n
+  }
+
+  def write!(p: [Byte]) -> Int {
+    bf = st[0]
+    if bf.size > 0 && p.size > 0 {
+      lb = bf[bf.size - 1].b
+      if p[0] == lb && bytes.count(p, [lb]) == p.size {
+        self.st[0][bf.size - 1].n += p.size
+        return p.size
+      }
+    }
+    for c in p {
+      k = st[0].size
+      if k == 0 || st[0][k - 1].b != c {
+        sz = self.size
+        self.st[0] << RepeatedByte.new(off: sz, b: c, n: 1)
+      } else {
+        self.st[0][k - 1].n += 1
+      }
+    }
+    p.size
+  }
+
+  def read_at(p: [Byte], off: Int) -> ~Int {
+    return 0 if p.size == 0
+    bf = st[0]
+    lo = 0
+    hi = bf.size
+    while lo < hi {
+      h = lo + (hi - lo) / 2
+      if bf[h].off + bf[h].n < off {
+        lo = h + 1
+      } else {
+        hi = h
+      }
+    }
+    n = 0
+    if lo < bf.size {
+      skip = off - bf[lo].off
+      for k in lo...bf.size {
+        part = bf[k]
+        rep = part.n - skip
+        rep = p.size - n if rep > p.size - n
+        memset(p[n...n + rep], part.b)
+        n += rep
+        return n if n == p.size
+        skip = 0
+      }
+    }
+    fail io.StreamError.UnexpectedEof if n != p.size
+    n
+  }
+}
+
+def rle_buffer -> RleBuffer {
+  e: [RepeatedByte] = []
+  RleBuffer.new(st: [e])
+}
+
+def memset(a: [Byte], v: Byte) {
+  return if a.size == 0
+  a[0] = v
+  i = 1
+  while i < a.size {
+    copy(a[i...a.size], a[0...i])
+    i *= 2
+  }
+}
+
+test "rle buffer" {
+  rb = rle_buffer
+  all: [Byte] = []
+  for w in ["abcdeee", "eeeeeee", "eeeefghaaiii"] {
+    rb.write!(b(w))
+    all = all + b(w)
+  }
+  assert_eq rb.st[0].size, 10
+  for i in 0...all.size {
+    for j in 0...all.size - i {
+      buf: [Byte] = [0; j]
+      n = rb.~read_at(buf, i)
+      assert_eq n, j
+      assert buf == all[i...i + j], "ReadAt(#{i}, #{j})"
+    }
+  }
+}
+
+# ------------------------------------------------------------ zip64
+
+# A zip of size bytes of '.' plus "END\n", read back (Go's testZip64).
+def test_zip64(size: Int) -> ~RleBuffer {
+  chunk_size = 1024
+  chunks = size / chunk_size
+  buf = rle_buffer
+  w = new_writer(buf)
+  f = w.~create_header!(FileHeader.new(name: "huge.txt", method: STORE))
+  w.st[0].fake_crc = true
+  chunk: [Byte] = [0x2e; 1024]
+  for _i in 0...chunks {
+    f.~write!(chunk)
+  }
+  frag = size % chunk_size
+  f.~write!(chunk[0...frag]) if frag > 0
+  end_bytes = b("END\n")
+  f.~write!(end_bytes)
+  w.~close!
+
+  r = ~new_reader(buf, buf.size)
+  f0 = r.file[0]
+  rc = f0.~open
+  rc.st[0].fake_hash = true
+  for _i in 0...chunks {
+    ~io.read_exact(rc, chunk)
+  }
+  ~io.read_exact(rc, chunk[0...frag]) if frag > 0
+  got_end = io.~read_all(rc)
+  assert got_end == end_bytes, "end of zip64 archive #{got_end}, want #{end_bytes}"
+  if size + 4 >= UINT32MAX {
+    assert_eq f0.header.uncompressed_size, U32MAX
+  }
+  assert_eq f0.header.uncompressed_size64, (size + 4).as_u64
+  buf
+}
+
+test "zip64" {
+  return if !slow_tests?
+  buf = ~test_zip64(1 << 32)
+  assert ~suffix_is_zip64(buf, buf.size), "not a zip64"
+}
+
+test "zip64 edge case" {
+  return if !slow_tests?
+  buf = ~test_zip64((1 << 32) - 1 - 4)
+  assert ~suffix_is_zip64(buf, buf.size), "not a zip64"
+}
+
+test "zip64 small" {
+  # testZip64 at the size of Go's benchmark (BenchmarkZip64Test).
+  buf = ~test_zip64(1 << 20)
+  assert !~suffix_is_zip64(buf, buf.size), "unexpected zip64"
+}
+
+# Go's generatesZip64 with gen(wantOff) of TestZip64DirectoryOffset.
+def gen_directory_offset(want_off: Int) -> ~Bool {
+  ss = suffix_saver(10 << 20)
+  w = new_writer(ss)
+  seen: [U64] = []
+  w.st[0].close_hook = [->(size: U64, off: U64) { seen << off }]
+  f = w.~create_header!(FileHeader.new(name: "huge.txt", method: STORE))
+  w.st[0].fake_crc = true
+  size = want_off - FILE_HEADER_LEN - "huge.txt".size - DATA_DESCRIPTOR_LEN
+  ~write_zeros(f, size)
+  w.~close!
+  assert_eq seen, [want_off.as_u64]
+  ~suffix_is_zip64(ss, ss.size)
+}
+
+def write_zeros[W](f: FileWriter[W], n: Int) -> ~Unit {
+  fw = f
+  z: [Byte] = [0; 32 * 1024]
+  left = n
+  while left > 0 {
+    k = left < z.size ? left : z.size
+    fw.~write!(z[0...k])
+    left -= k
+  }
+}
+
+test "zip64 directory offset" {
+  assert !~gen_directory_offset(0xfffffffe), "unexpected zip64"
+  assert ~gen_directory_offset(0xffffffff), "expected zip64"
+}
+
+def gen_many_records(num_rec: Int) -> ~Bool {
+  ss = suffix_saver(10 << 20)
+  w = new_writer(ss)
+  for _i in 0...num_rec {
+    w.~create_header!(FileHeader.new(name: "a.txt", method: STORE))
+  }
+  w.~close!
+  ~suffix_is_zip64(ss, ss.size)
+}
+
+test "zip64 many records" {
+  assert !~gen_many_records(0xfffe), "unexpected zip64"
+  assert ~gen_many_records(0xffff), "expected zip64"
+}
+
+# Writes a central directory of want_len bytes (TestZip64LargeDirectory's gen).
+def gen_large_directory[W](w: Writer[W], want_len: Int) -> ~Unit {
+  seen: [U64] = []
+  w.st[0].close_hook = [->(size: U64, off: U64) { seen << size }]
+  w.st[0].fake_crc = true
+  name = "." * UINT16MAX
+  remain = want_len
+  while remain > 0 {
+    comment_len = UINT16MAX - DIRECTORY_HEADER_LEN - 1
+    rec_len = DIRECTORY_HEADER_LEN + UINT16MAX + comment_len
+    if rec_len > remain {
+      remove = rec_len - remain
+      comment_len -= remove
+      rec_len -= remove
+    }
+    remain -= rec_len
+    zw = w
+    zw.~create_header!(FileHeader.new(name: name, comment: name[0...comment_len]))
+  }
+  zw = w
+  zw.~close!
+  assert_eq seen, [want_len.as_u64]
+}
+
+test "zip64 large directory" {
+  return if !slow_tests?
+  buf = rle_buffer
+  ~gen_large_directory(new_writer(buf), UINT32MAX - 1)
+  assert !~suffix_is_zip64(buf, buf.size), "unexpected zip64"
+  assert new_reader(buf, buf.size).ok?, "NewReader"
+  buf2 = rle_buffer
+  ~gen_large_directory(new_writer(buf2), UINT32MAX)
+  assert ~suffix_is_zip64(buf2, buf2.size), "expected zip64"
+  assert new_reader(buf2, buf2.size).ok?, "NewReader"
+}
+
+# Go's suffixIsZip64.
+def suffix_is_zip64[R](z: R, size: Int) -> ~Bool {
+  d: [Byte] = [0; 1024]
+  ~read_full_at(z, d, size - d.size)
+  sig_off = find_signature_in_block(d)
+  assert sig_off >= 0, "failed to find signature in block"
+  dir_off = ~find_directory64_end(z, size - d.size + sig_off)
+  return false if dir_off == -1
+  d2: [Byte] = [0; DIRECTORY64_END_LEN]
+  ~read_full_at(z, d2, dir_off)
+  rb = read_buf(d2)
+  return false if rb.u32! != DIRECTORY64_END_SIGNATURE
+  assert_eq rb.u64!, (DIRECTORY64_END_LEN - 12).as_u64
+  true
+}
+
+# ------------------------------------------------------------ headers
+
+def test_valid_header(h: FileHeader) -> ~Unit {
+  buf = bytes.new_buffer([])
+  z = new_writer(buf)
+  f = z.~create_header!(h)
+  f.~write!(b("hi"))
+  z.~close!
+  zf = ~reader_of(buf)
+  zh = zf.file[0].header
+  assert zh.name == h.name && zh.method == h.method && zh.uncompressed_size64 == 2, "got #{zh.name}/#{zh.method}/#{zh.uncompressed_size64}"
+}
+
+test "header invalid tag and size" {
+  ts = time.now
+  h = FileHeader.new(name: ts.format("20060102T150405.000.txt"), method: DEFLATE, extra: b(ts.format(time.RFC3339_NANO)))
+  h.set_mod_time!(ts)
+  ~test_valid_header(h)
+}
+
+test "header too short" {
+  ~test_valid_header(FileHeader.new(name: "foo.txt", method: DEFLATE, extra: [ZIP64_EXTRA_ID.as_u8]))
+}
+
+test "header too long err" {
+  buf = bytes.new_buffer([])
+  w = new_writer(buf)
+  e: [Byte] = []
+  r = w.create_header!(FileHeader.new(name: "x" * (1 << 16), extra: e))
+  assert_eq r.err.unwrap.message, "zip: FileHeader.Name too long"
+  r2 = w.create_header!(FileHeader.new(name: "long_extra", extra: bytes.repeat([0xff], 1 << 16)))
+  assert_eq r2.err.unwrap.message, "zip: FileHeader.Extra too long"
+  w.~close!
+}
+
+test "header ignored size" {
+  extra: [Byte] = [0x01, 0x00, 24, 0, 1, 2, 3, 4, 5, 6, 7, 8, 1, 2, 3, 4, 5, 6, 7, 8, 1, 2, 3, 4, 5, 6, 7, 8, 1, 2, 3, 4, 5, 6, 7, 8]
+  ~test_valid_header(FileHeader.new(name: "foo.txt", method: DEFLATE, extra: extra))
+}
+
+test "zero length header" {
+  extra: [Byte] = [85, 84, 5, 0, 3, 154, 144, 195, 77, 85, 120, 0, 0]
+  ~test_valid_header(FileHeader.new(name: "extadata.txt", method: DEFLATE, extra: extra))
+}
+
+# ------------------------------------------------------------ suffixSaver
+
+struct SaverState {
+  # buf[0...filled] holds data; once full, a ring starting at start.
+  buf: [Byte]
+  filled: Int
+  start: Int
+  size: Int
+}
+
+# Remembers the last `keep` bytes written (Go's suffixSaver); a ReaderAt
+# of them.
+struct SuffixSaver {
+  keep: Int
+  st: [SaverState]
+
+  def size -> Int { st[0].size }
+
+  def read_at(p: [Byte], off: Int) -> ~Int {
+    back = st[0].size - off
+    fail "ReadAt of discarded bytes" if back > keep
+    suf = self.suffix
+    copy(p, suf[suf.size - back...suf.size])
+  }
+
+  def suffix -> [Byte] {
+    bf = st[0].buf
+    return bf[0...st[0].filled] if st[0].filled < keep
+    out: [Byte] = [0; keep]
+    n = copy(out, bf[st[0].start...keep])
+    copy(out[n...keep], bf)
+    out
+  }
+
+  def write!(p: [Byte]) -> Int {
+    n = p.size
+    self.st[0].size += p.size
+    q = p
+    f = st[0].filled
+    if f < keep {
+      add = q.size < keep - f ? q.size : keep - f
+      copy(st[0].buf[f...f + add], q[0...add])
+      self.st[0].filled = f + add
+      q = q[add...q.size]
+    }
+    while q.size > 0 {
+      s = st[0].start
+      k = copy(st[0].buf[s...keep], q)
+      q = q[k...q.size]
+      self.st[0].start = s + k == keep ? 0 : s + k
+    }
+    n
+  }
+}
+
+def suffix_saver(keep: Int) -> SuffixSaver {
+  e: [Byte] = [0; keep]
+  SuffixSaver.new(keep: keep, st: [SaverState.new(buf: e, filled: 0, start: 0, size: 0)])
+}
+test "suffix saver" {
+  keep = 10
+  ss = suffix_saver(keep)
+  ss.write!(b("abc"))
+  assert_eq Str.from_bytes(ss.suffix), "abc"
+  ss.write!(b("defghijklmno"))
+  assert_eq Str.from_bytes(ss.suffix), "fghijklmno"
+  assert_eq ss.size, 15
+  buf: [Byte] = [0; ss.size]
+  for off in 0...ss.size {
+    for size in 1..(ss.size - off) {
+      rb = buf[0...size]
+      res = ss.read_at(rb, off)
+      if off < ss.size - keep {
+        assert_eq res.err.unwrap.message, "ReadAt of discarded bytes"
+        next
+      }
+      assert_eq Str.from_bytes(rb[0...res.unwrap]), "abcdefghijklmno"[off...off + size]
+    }
+  }
+}

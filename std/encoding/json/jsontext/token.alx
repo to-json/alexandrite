@@ -1,0 +1,248 @@
+#![overflow(wrap)]
+# Token: one lexical element of JSON (Go's jsontext/token.go).
+
+import "strconv"
+import "math"
+
+MAX_I64 = 9223372036854775807
+MIN_I64 = -9223372036854775808
+MAX_U64: U64 = 18446744073709551615
+
+# A JSON token: a literal (null, false, true), a string, a number, or an
+# object or array delimiter. A Token's zero value (Token.new) is invalid.
+#
+# Inside, a token read from a Decoder (or a literal or delimiter) holds its
+# raw JSON text (`tag` 'r'); Token.string holds the unescaped string ('s');
+# Token.int / uint / float hold the number ('i', 'u', 'f').
+pub struct Token {
+  tag: Byte
+  raw: Str
+  str: Str
+  num: U64
+
+  def self.raw_token(s: Str) -> Token { Token.new(tag: 114, raw: s) }
+
+  pub def self.null -> Token { Token.raw_token("null") }
+  pub def self.false_ -> Token { Token.raw_token("false") }
+  pub def self.true_ -> Token { Token.raw_token("true") }
+  pub def self.begin_object -> Token { Token.raw_token("{") }
+  pub def self.end_object -> Token { Token.raw_token("}") }
+  pub def self.begin_array -> Token { Token.raw_token("[") }
+  pub def self.end_array -> Token { Token.raw_token("]") }
+
+  # A copy (tokens own their bytes here, so this is the token itself).
+  pub def clone -> Token { self }
+
+  # The kind of the token.
+  pub def kind -> Kind {
+    return Kind.of(raw[0]) if tag == 114 && raw.size > 0
+    return Kind.Number if tag == 105 || tag == 117 || tag == 102
+    return Kind.String if tag == 115
+    Kind.Invalid
+  }
+
+  # The value of a true or false token; panics for other kinds.
+  pub def bool -> Bool {
+    if tag == 114 {
+      return true if raw == "true"
+      return false if raw == "false"
+    }
+    panic("invalid JSON token kind: " + kind.to_s)
+  }
+
+  # Go's String: the unescaped value of a string token, the JSON text of any
+  # other token ("<invalid jsontext.Token>" for the zero Token).
+  pub def to_s -> Str {
+    if tag == 114 {
+      if raw.size > 0 && raw[0] == 34 {
+        b = raw.bytes
+        return Str.from_bytes(unquote_may_copy(b, consume_simple_string(b, 0) == b.size))
+      }
+      return raw
+    }
+    return str if tag == 115
+    return Str.from_bytes(append_float([], math.float64frombits(num), 64)) if tag == 102
+    return num.as_i64.to_s if tag == 105
+    return num.to_s if tag == 117
+    "<invalid jsontext.Token>"
+  }
+
+  # Appends a string token, quoted and escaped per o.
+  def append_string(dst: [Byte], o: Options) -> ([Byte], Cause?) {
+    if tag == 114 && raw.size > 0 && raw[0] == 34 {
+      b = raw.bytes
+      return (app_b(dst, b), none) if consume_simple_string(b, 0) == b.size
+      d, _n, err = reformat_string(dst, b, o)
+      return (d, err)
+    }
+    if tag == 115 {
+      return append_quote_opts(dst, str.bytes, o)
+    }
+    panic("invalid JSON token kind: " + kind.to_s)
+  }
+
+  # Appends a number token.
+  def append_number(dst: [Byte], o: Options) -> ([Byte], Cause?) {
+    if tag == 114 && Kind.of(raw[0]) == Kind.Number {
+      d, _n, err = reformat_number(dst, raw.bytes, o)
+      return (d, err)
+    }
+    return (append_float(dst, math.float64frombits(num), 64), none) if tag == 102
+    return (app_s(dst, num.as_i64.to_s), none) if tag == 105
+    return (app_s(dst, num.to_s), none) if tag == 117
+    panic("invalid JSON token kind: " + kind.to_s)
+  }
+
+  # The value of a number token as a Float (a string token "NaN", "Infinity"
+  # or "-Infinity" as those). Fails with a range error beyond float64.
+  pub def float -> ~Float<JsonTextError> {
+    if tag == 114 && raw.size > 0 && Kind.of(raw[0]) == Kind.Number {
+      r = strconv.parse_float(raw)
+      return r.unwrap if r.ok?
+      fail JsonTextError.Num(accessor: "Float", value: to_s, range: true)
+    }
+    return math.float64frombits(num) if tag == 102
+    return num.as_i64.to_f if tag == 105
+    return num.to_f if tag == 117
+    if kind == Kind.String {
+      s = to_s
+      return math.nan if s == "NaN"
+      return math.inf(1) if s == "Infinity"
+      return math.inf(-1) if s == "-Infinity"
+    }
+    panic("invalid JSON token kind: " + kind.to_s)
+  }
+
+  # Go's Float with the clamped value it returns alongside an error.
+  pub def float_clamped -> (Float, Bool) {
+    r = self.float
+    return (r.unwrap, true) if r.ok?
+    (raw.size > 0 && raw[0] == 45 ? math.inf(-1) : math.inf(1), false)
+  }
+
+  # The value of a number token as an Int: fails for a fraction or exponent
+  # (invalid syntax) or beyond the Int range.
+  pub def int -> ~Int<JsonTextError> {
+    v, err = self.int_clamped
+    if e = err { fail e }
+    v
+  }
+
+  # Go's Int: the value, clamped (or truncated toward zero), with its error.
+  pub def int_clamped -> (Int, JsonTextError?) {
+    if tag == 114 && raw.size > 0 {
+      b = raw.bytes
+      if b[0] == 45 {
+        abs, ok = parse_uint(b[1...b.size])
+        return (MIN_I64, JsonTextError.Num(accessor: "Int", value: to_s, range: true)) if abs > 9223372036854775808
+        return ((0 -% abs).as_i64, none) if ok
+      } else {
+        abs, ok = parse_uint(b)
+        return (MAX_I64, JsonTextError.Num(accessor: "Int", value: to_s, range: true)) if abs > 9223372036854775807
+        return (abs.as_i64, none) if ok
+      }
+      if Kind.of(b[0]) == Kind.Number {
+        f = parse_float_clamped(raw)
+        return (f64toi64(f), JsonTextError.Num(accessor: "Int", value: to_s, range: false))
+      }
+    } else if tag == 105 {
+      return (num.as_i64, none)
+    } else if tag == 117 {
+      return (MAX_I64, JsonTextError.Num(accessor: "Int", value: to_s, range: true)) if num > 9223372036854775807
+      return (num.as_i64, none)
+    } else if tag == 102 {
+      f = math.float64frombits(num)
+      i = f64toi64(f)
+      if f != f || math.trunc(f) != f {
+        return (i, JsonTextError.Num(accessor: "Int", value: to_s, range: false))
+      }
+      if (i == MIN_I64 && f < -9223372036854775808.0) || (i == MAX_I64 && f > 9223372036854775807.0) {
+        return (i, JsonTextError.Num(accessor: "Int", value: to_s, range: true))
+      }
+      return (i, none)
+    }
+    panic("invalid JSON token kind: " + kind.to_s)
+  }
+
+  # The value of a number token as a U64.
+  pub def uint -> ~U64<JsonTextError> {
+    v, err = self.uint_clamped
+    if e = err { fail e }
+    v
+  }
+
+  # Go's Uint: the value, clamped, with its error.
+  pub def uint_clamped -> (U64, JsonTextError?) {
+    if tag == 114 && raw.size > 0 {
+      b = raw.bytes
+      abs, ok = parse_uint(b)
+      return (abs, none) if ok
+      return (MAX_U64, JsonTextError.Num(accessor: "Uint", value: to_s, range: true)) if abs == MAX_U64
+      if Kind.of(b[0]) == Kind.Number {
+        f = parse_float_clamped(raw)
+        return (f64tou64(f), JsonTextError.Num(accessor: "Uint", value: to_s, range: false))
+      }
+    } else if tag == 117 {
+      return (num, none)
+    } else if tag == 105 {
+      return (0, JsonTextError.Num(accessor: "Uint", value: to_s, range: false)) if num.as_i64 < 0
+      return (num, none)
+    } else if tag == 102 {
+      f = math.float64frombits(num)
+      u = f64tou64(f)
+      if f != f || math.trunc(f) != f || f < 0.0 || (f == 0.0 && 1.0 / f < 0.0) {
+        return (u, JsonTextError.Num(accessor: "Uint", value: to_s, range: false))
+      }
+      if (u == 0 && f < 0.0) || (u == MAX_U64 && f > 18446744073709551615.0) {
+        return (u, JsonTextError.Num(accessor: "Uint", value: to_s, range: true))
+      }
+      return (u, none)
+    }
+    panic("invalid JSON token kind: " + kind.to_s)
+  }
+}
+
+# Go's Bool(b).
+pub def bool(b: Bool) -> Token { b ? Token.true_ : Token.false_ }
+
+# Go's String(s): a string token for s (escaped when written).
+pub def string(s: Str) -> Token {
+  return Token.raw_token("\"\"") if s.size == 0
+  Token.new(tag: 115, str: s)
+}
+
+# Go's Float(f). NaN and the infinities are the strings "NaN", "Infinity"
+# and "-Infinity".
+pub def float(f: Float) -> Token {
+  return Token.raw_token("0") if f == 0.0 && 1.0 / f > 0.0
+  return string("NaN") if f != f
+  return string("Infinity") if f > MAX_FLOAT
+  return string("-Infinity") if f < -MAX_FLOAT
+  Token.new(tag: 102, num: math.float64bits(f))
+}
+
+# Go's Int(n).
+pub def int(n: Int) -> Token {
+  return Token.raw_token("0") if n == 0
+  Token.new(tag: 105, num: n.as_u64)
+}
+
+# Go's Uint(n).
+pub def uint(n: U64) -> Token {
+  return Token.raw_token("0") if n == 0
+  Token.new(tag: 117, num: n)
+}
+
+def f64toi64(f: Float) -> Int {
+  return 0 if f != f
+  return MAX_I64 if f >= 9223372036854775808.0
+  return MIN_I64 if f < -9223372036854775808.0
+  f.to_i
+}
+
+def f64tou64(f: Float) -> U64 {
+  return 0 if f != f
+  return MAX_U64 if f >= 18446744073709551616.0
+  return 0 if f < 0.0
+  f.to_u64
+}

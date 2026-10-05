@@ -1,0 +1,191 @@
+#![overflow(wrap)]
+# Value: the raw text of one JSON value (Go's jsontext/value.go).
+
+import "slices"
+
+# The raw text of a JSON value (Go's Value, a []byte). It may hold
+# whitespace around the value; `valid?` checks it.
+pub struct Value {
+  raw: [Byte]
+
+  # The value of JSON text s.
+  pub def self.of(s: Str) -> Value { Value.new(raw: s.bytes) }
+
+  # The text (Go's String; an empty Value prints as null).
+  pub def to_s -> Str {
+    return "null" if raw.size == 0
+    Str.from_bytes(raw)
+  }
+
+  # A copy that doesn't share storage.
+  pub def clone -> Value {
+    b: [Byte] = []
+    Value.new(raw: app_b(b, raw))
+  }
+
+  # The kind of the value, after leading whitespace (Invalid when empty).
+  pub def kind -> Kind {
+    i = consume_whitespace(raw, 0)
+    return Kind.of(raw[i]) if i < raw.size
+    Kind.Invalid
+  }
+
+  # Whether the text is exactly one valid JSON value (with whitespace around
+  # it), under opts (duplicate names and invalid UTF-8 are invalid unless
+  # allowed).
+  pub def valid?(opts: [Options]) -> Bool {
+    d = new_bytes_decoder(raw, opts)
+    v = d.read_value!
+    return false if !v.ok? || v.unwrap.none?
+    t = d.read_token!
+    t.ok? && t.unwrap.none?
+  }
+
+  # Reformats the value in place per opts (Go's Format).
+  pub def format!(opts: [Options]) -> ~Unit<JsonTextError> {
+    self.~format_with!(opts, [])
+  }
+
+  def format_with!(opts1: [Options], opts2: [Options]) -> ~Unit<JsonTextError> {
+    e = new_buffered_encoder(opts1)
+    e.join_options!(join_options(opts2))
+    e.set_flag!(F_OMIT_TOP_LEVEL_NEWLINE, true)
+    e.~write_value!(self)
+    out = e.bytes
+    self.raw = out if out != raw
+    nil
+  }
+
+  # Removes all whitespace (Go's Compact). Strings are left as they are,
+  # duplicate names and invalid UTF-8 allowed, unless opts say otherwise.
+  pub def compact!(opts: [Options]) -> ~Unit<JsonTextError> {
+    self.~format_with!([allow_duplicate_names(true), allow_invalid_utf8(true), preserve_raw_strings(true)], opts)
+  }
+
+  # Reformats with one member or element per line (Go's Indent: "\t" unless
+  # with_indent says otherwise).
+  pub def indent!(opts: [Options]) -> ~Unit<JsonTextError> {
+    self.~format_with!([allow_duplicate_names(true), allow_invalid_utf8(true), preserve_raw_strings(true), multiline(true)], opts)
+  }
+
+  # Reformats as RFC 8785's JSON Canonicalization Scheme: no whitespace,
+  # canonical strings and numbers, members sorted (Go's Canonicalize).
+  pub def canonicalize!(opts: [Options]) -> ~Unit<JsonTextError> {
+    self.~format_with!([canonicalize_raw_ints(true), canonicalize_raw_floats(true), reorder_raw_objects(true)], opts)
+  }
+
+  # Go's MarshalJSON: the text, or null when empty.
+  pub def marshal_json -> [Byte] {
+    return "null".bytes if raw.size == 0
+    raw
+  }
+}
+
+# Appends src reformatted per opts to dst (Go's AppendFormat). On an error,
+# src is appended as it is with the error.
+pub def append_format(dst: [Byte], src: [Byte], opts: [Options]) -> ~[Byte]<JsonTextError> {
+  e = new_buffered_encoder(opts)
+  e.set_flag!(F_OMIT_TOP_LEVEL_NEWLINE, true)
+  e.~write_value!(Value.new(raw: src))
+  app_b(dst, e.bytes)
+}
+
+# Appends the float64 f (bits 64) or float32 (bits 32) as JSON writes it.
+pub def append_float_bits(dst: [Byte], f: Float, bits: Int) -> [Byte] {
+  panic("illegal AppendFloat bit size") if bits != 32 && bits != 64
+  append_float(dst, f, bits)
+}
+
+# An object member being sorted: its unquoted name, the bytes from after the
+# previous member (comma and whitespace included) to the end of its value,
+# and its position before sorting.
+struct Member {
+  name: [Byte]
+  buf: [Byte]
+  idx: Int
+}
+
+def trim_comma_ws(b: [Byte]) -> [Byte] {
+  i = 0
+  while i < b.size && (b[i] == 44 || is_ws(b[i])) { i += 1 }
+  b[i...b.size]
+}
+
+def comma_ws_prefix(b: [Byte]) -> [Byte] {
+  i = 0
+  while i < b.size && (b[i] == 44 || is_ws(b[i])) { i += 1 }
+  b[0...i]
+}
+
+def member_cmp(x: Member, y: Member) -> Int {
+  c = compare_utf16(x.name, y.name)
+  return c if c != 0
+  compare_utf16(trim_comma_ws(x.buf), trim_comma_ws(y.buf))
+}
+
+# b with the objects in b[pos...] (a valid value) sorted by member name
+# (RFC 8785, section 3.2.3); the length doesn't change.
+def reorder_objects_at(b: [Byte], pos: Int) -> [Byte] {
+  seg: [Byte] = []
+  seg = app_b(seg, b[pos...b.size])
+  d = new_bytes_decoder(seg, [allow_duplicate_names(true), allow_invalid_utf8(true)])
+  reorder_from_decoder(d)
+  out = b
+  sorted = d.st[0].buf
+  for k in 0...sorted.size { out[pos + k] = sorted[k] }
+  out
+}
+
+def reorder_from_decoder(d: Decoder) -> Unit {
+  t = d.read_token!
+  tok = t.unwrap_or(none) || Token.new
+  k = tok.kind
+  if k == Kind.BeginObject {
+    members: [Member] = []
+    sorted_already = true
+    before_body = d.input_offset
+    while d.peek_kind! != Kind.EndObject {
+      before_name = d.input_offset
+      v = d.read_value_flags!
+      name: [Byte] = []
+      if v.ok? {
+        rb, verbatim = v.unwrap
+        name = unquote_may_copy(rb || [], verbatim)
+      }
+      reorder_from_decoder(d)
+      after_value = d.input_offset
+      buf = d.st[0].buf
+      m = Member.new(name: name, buf: buf[before_name...after_value], idx: members.size)
+      if sorted_already && members.size > 0 {
+        sorted_already = member_cmp(members[members.size - 1], m) < 0
+      }
+      members << m
+    }
+    after_body = d.input_offset
+    _t = d.read_token!
+    return if sorted_already
+    first_before = members[0].buf
+    slices.sort_func(members, ->(x: Member, y: Member) -> Int { member_cmp(x, y) })
+    first_after = members[0].buf
+    sorted: [Byte] = []
+    for i in 0...members.size {
+      m = members[i]
+      if i == 0 && m.idx != 0 {
+        sorted = app_b(sorted, comma_ws_prefix(first_before))
+        sorted = app_b(sorted, trim_comma_ws(m.buf))
+      } else if i != 0 && m.idx == 0 {
+        sorted = app_b(sorted, comma_ws_prefix(first_after))
+        sorted = app_b(sorted, trim_comma_ws(m.buf))
+      } else {
+        sorted = app_b(sorted, m.buf)
+      }
+    }
+    panic("BUG: length invariant violated") if after_body - before_body != sorted.size
+    for j in 0...sorted.size { d.st[0].buf[before_body + j] = sorted[j] }
+  } else if k == Kind.BeginArray {
+    while d.peek_kind! != Kind.EndArray {
+      reorder_from_decoder(d)
+    }
+    _t = d.read_token!
+  }
+}

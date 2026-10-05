@@ -1,0 +1,857 @@
+#![overflow(wrap)]
+# Decoder: reads a stream of JSON tokens and values (Go's jsontext/decode.go).
+
+import "io"
+
+struct DecState {
+  cs: CoderState
+  # Where the next token starts after a peek_kind (0: nothing peeked, -1: the
+  # peek failed with peek_err, or reached the end if peek_eof).
+  peek_pos: Int
+  peek_err: JsonTextError?
+  peek_eof: Bool
+  buf: [Byte]
+  prev_start: Int
+  prev_end: Int
+  # The previous token or value can't be read again (consumed input may
+  # have been discarded).
+  prev_gone: Bool
+  base: Int
+  rd: io.Reader?
+  opts: Options
+}
+
+# The result of an internal read: a position, or a problem (eof: the clean
+# end of the input at the top level, Go's io.EOF).
+struct Got {
+  pos: Int
+  err: JsonTextError?
+  eof: Bool
+}
+
+# Reads JSON from an io.Reader (or from given bytes), checking the grammar.
+# Copies of a Decoder share it.
+pub struct Decoder {
+  st: [DecState]
+
+  # Starts over, reading from r with opts.
+  pub def reset!(r: io.Reader, opts: [Options]) {
+    panic("jsontext: cannot reset Decoder passed to json.UnmarshalerFrom") if st[0].opts.get(F_WITHIN_ARSHAL_CALL)
+    self.st[0] = new_dec_state(r, [], opts)
+  }
+
+  # The options in effect.
+  pub def options -> Options { st[0].opts }
+
+  pub def set_flag!(f: U64, v: Bool) { self.st[0].opts.set!(f, v) }
+  pub def clear_flags!(f: U64) { self.st[0].opts.clear!(f) }
+  pub def join_options!(o: Options) { self.st[0].opts.join!(o) }
+
+  # Reads more input after the bytes already buffered, dropping what was
+  # consumed before the previous token.
+  def fetch! -> Cause? {
+    r = st[0].rd
+    if rd = r {
+      ps = st[0].prev_start
+      if ps > 0 {
+        old = st[0].buf
+        nb: [Byte] = []
+        for k in ps...old.size { nb << old[k] }
+        self.st[0].buf = nb
+        self.st[0].base = st[0].base + ps
+        self.st[0].prev_end = st[0].prev_end - ps
+        self.st[0].prev_start = 0
+      }
+      size = st[0].buf.size
+      size = 64 if size < 64
+      size = 4096 if size > 4096
+      tmp: [Byte] = [0; size]
+      res = rd.read!(tmp)
+      self.st[0].rd = rd
+      if e = res.err {
+        return Cause.Io(action: "read", msg: e.message)
+      }
+      n = res.unwrap
+      return Cause.UnexpectedEof if n == 0
+      for k in 0...n { self.st[0].buf << tmp[k] }
+      return none
+    }
+    Cause.UnexpectedEof
+  }
+
+  def need_more(pos: Int) -> Bool { pos == st[0].buf.size }
+
+  def offset_at(pos: Int) -> Int { st[0].base + pos }
+
+  # Go's wrapSyntacticError for the decoder.
+  def wrap(f: Fault, pos: Int, where_: Int) -> JsonTextError {
+    case f.cause {
+      Io(a, m) => {return JsonTextError.Io(action: a, msg: m)}
+      _ => {}
+    }
+    off = offset_at(pos)
+    ptr = st[0].cs.stack_pointer(where_) + f.suffix
+    cause = f.cause
+    if cause == Cause.MismatchDelim {
+      wh = "at start of value"
+      last = st[0].cs.m.last
+      if st[0].cs.m.stack.size > 0 && e_length(last) > 0 {
+        if e_array?(last) {
+          wh = "after array element (expecting ',' or ']')"
+          ptr = Pointer.new(s: ptr).parent.s
+        } else if e_object?(last) {
+          wh = "after object value (expecting ',' or '}')"
+          ptr = Pointer.new(s: ptr).parent.s
+        }
+      }
+      b = st[0].buf
+      cause = invalid_char(b[pos...b.size], wh)
+    }
+    if st[0].opts.get(F_REPORT_ERRORS_WITH_LEGACY_SEMANTICS) && cause != Cause.UnexpectedEof {
+      case cause {
+        InvalidText(_l, what, _w) => {off += what.size}
+        _ => {off += 1}
+      }
+    }
+    JsonTextError.Syntactic(e: SyntacticError.new(byte_offset: off, json_pointer: Pointer.new(s: ptr), err: cause))
+  }
+
+  # Skips whitespace from pos, reading more input as needed.
+  def consume_ws!(pos0: Int) -> (Int, Cause?) {
+    pos = pos0
+    loop {
+      pos += consume_whitespace(st[0].buf, pos)
+      if need_more(pos) {
+        abs = st[0].base + pos
+        if c = self.fetch! {
+          return (abs - st[0].base, c)
+        }
+        pos = abs - st[0].base
+        next
+      }
+      return (pos, none)
+    }
+  }
+
+  def invalidate_previous_read! {
+    if st[0].rd.present? && st[0].prev_start < st[0].prev_end {
+      self.st[0].prev_gone = true
+      self.st[0].prev_start = st[0].prev_end
+    }
+  }
+
+  # The position of the next token after any delimiter, checking that the
+  # delimiter is the one the grammar needs there.
+  def next_start! -> Got {
+    self.invalidate_previous_read!
+    pos = st[0].prev_end
+    pos += consume_whitespace(st[0].buf, pos)
+    if need_more(pos) {
+      p2, c = self.consume_ws!(pos)
+      pos = p2
+      if cc = c {
+        if cc == Cause.UnexpectedEof && st[0].cs.m.depth == 1 {
+          return Got.new(pos: pos, eof: true)
+        }
+        return Got.new(pos: pos, err: self.wrap(fault(cc), pos, 0))
+      }
+    }
+    delim: Byte = 0
+    c0 = st[0].buf[pos]
+    if c0 == 58 || c0 == 44 {
+      delim = c0
+      pos += 1
+      pos += consume_whitespace(st[0].buf, pos)
+      if need_more(pos) {
+        p2, c = self.consume_ws!(pos)
+        pos = p2
+        if cc = c {
+          err = self.wrap(fault(cc), pos, 0)
+          return Got.new(pos: pos, err: self.check_delim_before_io_error(delim, err))
+        }
+      }
+    }
+    nk = Kind.of(st[0].buf[pos])
+    if st[0].cs.m.need_delim(nk) != delim {
+      return Got.new(pos: pos, err: self.check_delim(delim, nk))
+    }
+    Got.new(pos: pos)
+  }
+
+  # The kind of the next token or value without reading it (Invalid at the
+  # end of the input or on an error, which the next read reports).
+  pub def peek_kind! -> Kind {
+    if st[0].peek_pos > 0 {
+      return Kind.of(st[0].buf[st[0].peek_pos])
+    }
+    g = self.next_start!
+    if g.eof || g.err.present? {
+      self.st[0].peek_pos = -1
+      self.st[0].peek_err = g.err
+      self.st[0].peek_eof = g.eof
+      return Kind.Invalid
+    }
+    self.st[0].peek_pos = g.pos
+    self.st[0].peek_err = none
+    Kind.of(st[0].buf[g.pos])
+  }
+
+  def check_delim_before_io_error(delim: Byte, err: JsonTextError) -> JsonTextError {
+    if st[0].cs.m.need_delim(Kind.String) != delim {
+      return self.check_delim(delim, Kind.String)
+    }
+    err
+  }
+
+  # The number of delimiter and whitespace bytes before the next token.
+  pub def count_next_delim_whitespace! -> Int {
+    self.peek_kind!
+    b = unread_buffer
+    n = 0
+    while n < b.size && (b[n] == 44 || b[n] == 58 || is_ws(b[n])) { n += 1 }
+    n
+  }
+
+  def check_delim(delim: Byte, nk: Kind) -> JsonTextError {
+    wh = "at start of value"
+    nd = st[0].cs.m.need_delim(nk)
+    if nd == 58 {
+      wh = "after object name (expecting ':')"
+    } else if nd == 44 {
+      if e_object?(st[0].cs.m.last) {
+        wh = "after object value (expecting ',' or '}')"
+      } else {
+        wh = "after array element (expecting ',' or ']')"
+      }
+    }
+    pos = st[0].prev_end
+    pos += consume_whitespace(st[0].buf, pos)
+    b = st[0].buf
+    self.wrap(fault(invalid_char(b[pos...b.size], wh)), pos, 0)
+  }
+
+  # Skips the next value (a whole object or array).
+  pub def skip_value! -> ~Unit<JsonTextError> {
+    k = self.peek_kind!
+    if k == Kind.BeginObject || k == Kind.BeginArray {
+      depth = st[0].cs.m.depth
+      loop {
+        t = self.~read_token!
+        fail self.wrap(fault(Cause.UnexpectedEof), st[0].prev_end, 0) if t.none?
+        return nil if depth >= st[0].cs.m.depth
+      }
+    }
+    v = self.~read_value!
+    fail self.wrap(fault(Cause.UnexpectedEof), st[0].prev_end, 0) if v.none?
+    nil
+  }
+
+  # Skips the rest of the object or array just opened (for json/v2).
+  pub def skip_value_remainder! -> ~Unit<JsonTextError> {
+    if st[0].cs.m.depth - 1 > 0 && e_length(st[0].cs.m.last) == 0 {
+      n = st[0].cs.m.depth
+      while st[0].cs.m.depth >= n {
+        self.~read_token!
+      }
+    }
+    nil
+  }
+
+  # Reads tokens until the container at `depth` has `length` tokens.
+  pub def skip_until!(depth: Int, length: Int) -> ~Unit<JsonTextError> {
+    while st[0].cs.m.depth > depth || (st[0].cs.m.depth == depth && e_length(st[0].cs.m.last) < length) {
+      self.~read_token!
+    }
+    nil
+  }
+
+  # Takes the result of a peek, or finds the next token's start.
+  def start_read! -> Got {
+    pos = st[0].peek_pos
+    if pos != 0 {
+      if pos < 0 {
+        g = Got.new(pos: 0, err: st[0].peek_err, eof: st[0].peek_eof)
+        self.st[0].peek_pos = 0
+        self.st[0].peek_err = none
+        self.st[0].peek_eof = false
+        return g
+      }
+      self.st[0].peek_pos = 0
+      return Got.new(pos: pos)
+    }
+    self.next_start!
+  }
+
+  # Reads the next token; none at the end of the input (Go's io.EOF).
+  pub def read_token! -> ~Token?<JsonTextError> {
+    g = self.start_read!
+    return none if g.eof
+    if e = g.err { fail e }
+    pos = g.pos
+    nk = Kind.of(st[0].buf[pos])
+    case nk {
+      Null => {return self.~read_lit!(pos, "null")}
+      False => {return self.~read_lit!(pos, "false")}
+      True => {return self.~read_lit!(pos, "true")}
+      String => {
+        n = consume_simple_string(st[0].buf, pos)
+        vflags = 0
+        if n == 0 {
+          old = st[0].base + pos
+          p2, fl, c = self.consume_string!(pos)
+          pos = p2
+          vflags = fl
+          n = st[0].base + pos - old
+          if cc = c { fail self.wrap(fault(cc), pos, 1) }
+        } else {
+          pos += n
+        }
+        raw = st[0].buf[pos - n...pos]
+        if e_need_name?(st[0].cs.m.last) {
+          if c = self.check_name!(raw, vflags) {
+            fail self.wrap(name_fault(c, st[0].buf, pos - n), pos - n, 1)
+          }
+        }
+        if c = self.st[0].cs.m.append_string! {
+          fail self.wrap(fault(c), pos - n, 1)
+        }
+        self.st[0].prev_start = pos - n
+        self.st[0].prev_end = pos
+        self.st[0].prev_gone = false
+        return Token.raw_token(Str.from_bytes(raw))
+      }
+      Number => {
+        n = consume_simple_number(st[0].buf, pos)
+        if n == 0 || need_more(pos + n) {
+          old = st[0].base + pos
+          p2, c = self.consume_number!(pos)
+          pos = p2
+          n = st[0].base + pos - old
+          if cc = c { fail self.wrap(fault(cc), pos, 1) }
+        } else {
+          pos += n
+        }
+        if c = self.st[0].cs.m.append_literal! {
+          fail self.wrap(fault(c), pos - n, 1)
+        }
+        self.st[0].prev_start = pos - n
+        self.st[0].prev_end = pos
+        self.st[0].prev_gone = false
+        return Token.raw_token(Str.from_bytes(st[0].buf[pos - n...pos]))
+      }
+      BeginObject => {
+        if c = self.st[0].cs.m.push_object! { fail self.wrap(fault(c), pos, 1) }
+        self.st[0].cs.push_names!
+        self.st[0].cs.push_space! if !st[0].opts.get(F_ALLOW_DUPLICATE_NAMES)
+        self.st[0].opts.clear!(F_TAG_FLAGS)
+        self.st[0].prev_start = pos + 1
+        self.st[0].prev_end = pos + 1
+        return Token.begin_object
+      }
+      EndObject => {
+        if c = self.st[0].cs.m.pop_object! { fail self.wrap(fault(c), pos, 1) }
+        self.st[0].cs.pop_names!
+        self.st[0].cs.pop_space! if !st[0].opts.get(F_ALLOW_DUPLICATE_NAMES)
+        self.st[0].prev_start = pos + 1
+        self.st[0].prev_end = pos + 1
+        return Token.end_object
+      }
+      BeginArray => {
+        if c = self.st[0].cs.m.push_array! { fail self.wrap(fault(c), pos, 1) }
+        self.st[0].opts.clear!(F_TAG_FLAGS)
+        self.st[0].prev_start = pos + 1
+        self.st[0].prev_end = pos + 1
+        return Token.begin_array
+      }
+      EndArray => {
+        if c = self.st[0].cs.m.pop_array! { fail self.wrap(fault(c), pos, 1) }
+        self.st[0].prev_start = pos + 1
+        self.st[0].prev_end = pos + 1
+        return Token.end_array
+      }
+      Invalid => {
+        b = st[0].buf
+        fail self.wrap(fault(invalid_char(b[pos...b.size], "at start of value")), pos, 1)
+      }
+    }
+  }
+
+  def read_lit!(pos0: Int, lit: Str) -> ~Token?<JsonTextError> {
+    pos = pos0
+    if consume_word(st[0].buf, pos, lit) == 0 {
+      p2, c = self.consume_literal!(pos, lit)
+      pos = p2
+      if cc = c { fail self.wrap(fault(cc), pos, 1) }
+    } else {
+      pos += lit.size
+    }
+    if c = self.st[0].cs.m.append_literal! {
+      fail self.wrap(fault(c), pos - lit.size, 1)
+    }
+    self.st[0].prev_start = pos
+    self.st[0].prev_end = pos
+    Token.raw_token(lit)
+  }
+
+  # Checks the quoted name `raw` against the innermost namespace and records
+  # it as the current member name.
+  def check_name!(raw: [Byte], vflags: Int) -> Cause? {
+    verbatim = vflags & STRING_NON_VERBATIM == 0
+    name = Str.from_bytes(unquote_may_copy(raw, verbatim))
+    if !st[0].opts.get(F_ALLOW_DUPLICATE_NAMES) {
+      return Cause.InvalidNamespace if !e_valid_ns?(st[0].cs.m.last)
+      if e_active_ns?(st[0].cs.m.last) && !self.st[0].cs.insert_name!(name) {
+        return Cause.DuplicateName
+      }
+    }
+    self.st[0].cs.set_name!(name)
+    none
+  }
+
+  # Reads the next whole value; none at the end of the input (Go's io.EOF).
+  pub def read_value! -> ~Value?<JsonTextError> {
+    v, _fl = self.~read_value_flags!
+    if b = v { return Value.new(raw: b) }
+    none
+  }
+
+  # read_value! with the string flags of the value (for json/v2): (bytes or
+  # none at the end, verbatim? for a string).
+  pub def read_value_flags! -> ~([Byte]?, Bool)<JsonTextError> {
+    g = self.start_read!
+    return (none, true) if g.eof
+    if e = g.err { fail e }
+    pos = g.pos
+    nk = Kind.of(st[0].buf[pos])
+    old = st[0].base + pos
+    p2, fl, f = self.consume_value!(pos, st[0].cs.m.depth)
+    pos = p2
+    n = st[0].base + pos - old
+    if ff = f { fail self.wrap(ff, pos, 1) }
+    c: Cause? = none
+    case nk {
+      Null => {c = self.st[0].cs.m.append_literal!}
+      False => {c = self.st[0].cs.m.append_literal!}
+      True => {c = self.st[0].cs.m.append_literal!}
+      String => {
+        if e_need_name?(st[0].cs.m.last) {
+          c = self.check_name!(st[0].buf[pos - n...pos], fl)
+        }
+        c = self.st[0].cs.m.append_string! if c.none?
+      }
+      Number => {c = self.st[0].cs.m.append_literal!}
+      BeginObject => {
+        c = self.st[0].cs.m.push_object!
+        _c = self.st[0].cs.m.pop_object! if c.none?
+      }
+      BeginArray => {
+        c = self.st[0].cs.m.push_array!
+        _c = self.st[0].cs.m.pop_array! if c.none?
+      }
+      _ => {}
+    }
+    if cc = c {
+      fail self.wrap(name_fault(cc, st[0].buf, pos - n), pos - n, 1)
+    }
+    self.st[0].prev_end = pos
+    self.st[0].prev_start = pos - n
+    self.st[0].prev_gone = false
+    out: [Byte] = []
+    out = app_b(out, st[0].buf[pos - n...pos])
+    (out, fl & STRING_NON_VERBATIM == 0)
+  }
+
+  # Checks the next value without reading it (and that nothing follows, if
+  # last); for json/v2.
+  pub def check_next_value!(last: Bool) -> ~Unit<JsonTextError> {
+    self.peek_kind!
+    pos = st[0].peek_pos
+    err = st[0].peek_err
+    eof = st[0].peek_eof
+    self.st[0].peek_pos = 0
+    self.st[0].peek_err = none
+    self.st[0].peek_eof = false
+    if e = err { fail e }
+    if eof { fail self.wrap(fault(Cause.UnexpectedEof), pos, 0) }
+    p2, _fl, f = self.consume_value!(pos, st[0].cs.m.depth)
+    if ff = f { fail self.wrap(ff, p2, 1) }
+    if last {
+      if e = self.check_eof_at!(p2) { fail e }
+    }
+    nil
+  }
+
+  # Whether only whitespace remains.
+  pub def at_eof! -> Bool {
+    _p, c = self.consume_ws!(st[0].prev_end)
+    c == Cause.UnexpectedEof
+  }
+
+  # Fails unless only whitespace follows the previous value.
+  pub def check_eof! -> ~Unit<JsonTextError> {
+    if e = self.check_eof_at!(st[0].prev_end) { fail e }
+    nil
+  }
+
+  def check_eof_at!(pos0: Int) -> JsonTextError? {
+    pos, c = self.consume_ws!(pos0)
+    if cc = c {
+      return none if cc == Cause.UnexpectedEof
+      return self.wrap(fault(cc), pos, 0)
+    }
+    b = st[0].buf
+    self.wrap(fault(invalid_char(b[pos...b.size], "after top-level value")), pos, 0)
+  }
+
+  # Go's consumeValue: the end of the value at pos (reading more as needed),
+  # with the string flags of everything in it. Go's recursion over objects
+  # and arrays is a loop over an explicit stack here (10000 levels would
+  # overflow a task's stack).
+  def consume_value!(pos0: Int, depth0: Int) -> (Int, Int, Fault?) {
+    pos = pos0
+    flags = 0
+    check = !st[0].opts.get(F_ALLOW_DUPLICATE_NAMES)
+    frames: [Frame] = []
+    # 0: a value starts at pos; 1: a member name is next; 2: a value ended
+    phase = 0
+    loop {
+      if phase == 0 {
+        b = st[0].buf
+        k = Kind.of(b[pos])
+        if k == Kind.BeginObject || k == Kind.BeginArray {
+          if depth0 + frames.size == MAX_NESTING_DEPTH + 1 {
+            return (pos, flags, frames_fault(frames, fault(Cause.MaxDepth)))
+          }
+          is_obj = k == Kind.BeginObject
+          frames << Frame.new(obj: is_obj, space: Namespace.new(names: [], set: {}, big: false), seg: "", idx: 0)
+          pos += 1
+          pos += consume_whitespace(st[0].buf, pos)
+          if need_more(pos) {
+            p2, c = self.consume_ws!(pos)
+            pos = p2
+            if cc = c { return (pos, flags, frames_fault(frames, fault(cc))) }
+          }
+          close: Byte = is_obj ? 125 : 93
+          if st[0].buf[pos] == close {
+            pos += 1
+            frames = frames[0...frames.size - 1]
+            phase = 2
+            next
+          }
+          if is_obj {
+            phase = 1
+          } else {
+            pos += consume_whitespace(st[0].buf, pos)
+            if need_more(pos) {
+              p2, c = self.consume_ws!(pos)
+              pos = p2
+              if cc = c { return (pos, flags, frames_fault(frames, fault(cc))) }
+            }
+            frames[frames.size - 1].seg = "/0"
+          }
+          next
+        }
+        p2, fl, f = self.consume_scalar!(pos, frames)
+        pos = p2
+        flags = flags | fl
+        if ff = f { return (pos, flags, frames_fault(frames, ff)) }
+        phase = 2
+        next
+      }
+      if phase == 1 {
+        pos += consume_whitespace(st[0].buf, pos)
+        if need_more(pos) {
+          p2, c = self.consume_ws!(pos)
+          pos = p2
+          if cc = c { return (pos, flags, frames_fault(frames, fault(cc))) }
+        }
+        fl2 = 0
+        n = consume_simple_string(st[0].buf, pos)
+        if n == 0 {
+          old = st[0].base + pos
+          p2, f2, c = self.consume_string!(pos)
+          pos = p2
+          n = st[0].base + pos - old
+          fl2 = f2
+          flags = flags | f2
+          if cc = c { return (pos, flags, frames_fault(frames, fault(cc))) }
+        } else {
+          pos += n
+        }
+        quoted: [Byte] = []
+        quoted = app_b(quoted, st[0].buf[pos - n...pos])
+        name = Str.from_bytes(unquote_may_copy(quoted, fl2 & STRING_NON_VERBATIM == 0))
+        top = frames.size - 1
+        nb: [Byte] = [47]
+        frames[top].seg = Str.from_bytes(append_escape_pointer_name(nb, name))
+        if check && !frames[top].space.insert!(name) {
+          return (pos - n, flags, frames_fault(frames, fault(Cause.DuplicateName)))
+        }
+        pos += consume_whitespace(st[0].buf, pos)
+        if need_more(pos) {
+          p2, c = self.consume_ws!(pos)
+          pos = p2
+          if cc = c { return (pos, flags, frames_fault(frames, fault(cc))) }
+        }
+        if st[0].buf[pos] != 58 {
+          b = st[0].buf
+          return (pos, flags, frames_fault(frames, fault(invalid_char(b[pos...b.size], "after object name (expecting ':')"))))
+        }
+        pos += 1
+        pos += consume_whitespace(st[0].buf, pos)
+        if need_more(pos) {
+          p2, c = self.consume_ws!(pos)
+          pos = p2
+          if cc = c { return (pos, flags, frames_fault(frames, fault(cc))) }
+        }
+        phase = 0
+        next
+      }
+      # phase 2: after a value
+      return (pos, flags, none) if frames.size == 0
+      top = frames.size - 1
+      frames[top].seg = ""
+      pos += consume_whitespace(st[0].buf, pos)
+      if need_more(pos) {
+        p2, c = self.consume_ws!(pos)
+        pos = p2
+        if cc = c { return (pos, flags, frames_fault(frames, fault(cc))) }
+      }
+      c0 = st[0].buf[pos]
+      if frames[top].obj {
+        if c0 == 44 {
+          pos += 1
+          phase = 1
+          next
+        }
+        if c0 == 125 {
+          pos += 1
+          frames = frames[0...top]
+          next
+        }
+        b = st[0].buf
+        return (pos, flags, frames_fault(frames, fault(invalid_char(b[pos...b.size], "after object value (expecting ',' or '}')"))))
+      }
+      if c0 == 44 {
+        pos += 1
+        frames[top].idx = frames[top].idx + 1
+        pos += consume_whitespace(st[0].buf, pos)
+        if need_more(pos) {
+          p2, c = self.consume_ws!(pos)
+          pos = p2
+          if cc = c { return (pos, flags, frames_fault(frames, fault(cc))) }
+        }
+        frames[top].seg = "/" + frames[top].idx.to_s
+        phase = 0
+        next
+      }
+      if c0 == 93 {
+        pos += 1
+        frames = frames[0...top]
+        next
+      }
+      b = st[0].buf
+      return (pos, flags, frames_fault(frames, fault(invalid_char(b[pos...b.size], "after array element (expecting ',' or ']')"))))
+    }
+  }
+
+  # A literal, string or number at pos: (end, string flags, problem).
+  def consume_scalar!(pos0: Int, frames: [Frame]) -> (Int, Int, Fault?) {
+    pos = pos0
+    loop {
+      b = st[0].buf
+      n = 0
+      err: Cause? = none
+      k = Kind.of(b[pos])
+      lit = ""
+      if k == Kind.Null {
+        lit = "null"
+      } else if k == Kind.False {
+        lit = "false"
+      } else if k == Kind.True {
+        lit = "true"
+      } else if k == Kind.String {
+        n = consume_simple_string(b, pos)
+        if n == 0 {
+          p2, fl, c = self.consume_string!(pos)
+          return (p2, fl, c.none? ? none : fault(c.unwrap))
+        }
+        return (pos + n, 0, none)
+      } else if k == Kind.Number {
+        n = consume_simple_number(b, pos)
+        if n == 0 || need_more(pos + n) {
+          p2, c = self.consume_number!(pos)
+          return (p2, 0, c.none? ? none : fault(c.unwrap))
+        }
+        return (pos + n, 0, none)
+      } else {
+        inner = e_object?(st[0].cs.m.last)
+        if (inner && k == Kind.EndArray) || (!inner && k == Kind.EndObject) {
+          return (pos, 0, fault(Cause.MismatchDelim))
+        }
+        return (pos, 0, fault(invalid_char(b[pos...b.size], "at start of value")))
+      }
+      n = consume_word(b, pos, lit)
+      if n == 0 {
+        n2, e2 = consume_literal(b, pos, lit)
+        n = n2
+        err = e2
+      }
+      if err == Cause.UnexpectedEof {
+        abs = st[0].base + pos
+        c = self.fetch!
+        pos = abs - st[0].base
+        if cc = c { return (pos + n, 0, fault(cc)) }
+        next
+      }
+      return (pos + n, 0, err.none? ? none : fault(err.unwrap))
+    }
+  }
+
+  def consume_literal!(pos0: Int, lit: Str) -> (Int, Cause?) {
+    pos = pos0
+    loop {
+      n, err = consume_literal(st[0].buf, pos, lit)
+      if err == Cause.UnexpectedEof {
+        abs = st[0].base + pos
+        c = self.fetch!
+        pos = abs - st[0].base
+        if cc = c { return (pos + n, cc) }
+        next
+      }
+      return (pos + n, err)
+    }
+  }
+
+  # (end, string flags, problem)
+  def consume_string!(pos0: Int) -> (Int, Int, Cause?) {
+    pos = pos0
+    n = 0
+    flags = 0
+    loop {
+      n2, fl, err = consume_string_resumable(st[0].buf, pos, n, !st[0].opts.get(F_ALLOW_INVALID_UTF8))
+      n = n2
+      flags = flags | fl
+      if err == Cause.UnexpectedEof {
+        abs = st[0].base + pos
+        c = self.fetch!
+        pos = abs - st[0].base
+        if cc = c { return (pos + n, flags, cc) }
+        next
+      }
+      return (pos + n, flags, err)
+    }
+  }
+
+  def consume_number!(pos0: Int) -> (Int, Cause?) {
+    pos = pos0
+    n = 0
+    state = NUM_INIT
+    loop {
+      n2, s2, err = consume_number_resumable(st[0].buf, pos, n, state)
+      n = n2
+      state = s2
+      if err == Cause.UnexpectedEof || need_more(pos + n) {
+        may_end = err.none?
+        abs = st[0].base + pos
+        c = self.fetch!
+        pos = abs - st[0].base
+        if cc = c {
+          return (pos + n, none) if may_end && cc == Cause.UnexpectedEof
+          return (pos, cc)
+        }
+        next
+      }
+      return (pos + n, err)
+    }
+  }
+
+  # The number of bytes read so far (Go's InputOffset).
+  pub def input_offset -> Int { st[0].base + st[0].prev_end }
+
+  # The buffered input not yet read.
+  pub def unread_buffer -> [Byte] {
+    b = st[0].buf
+    b[st[0].prev_end...b.size]
+  }
+
+  # The raw text of the previous token or value (empty when not available).
+  pub def previous_token_or_value -> [Byte] {
+    return [] if st[0].peek_pos > 0 || st[0].prev_gone
+    b = st[0].buf
+    p = b[st[0].prev_start...st[0].prev_end]
+    if p.size == 0 {
+      whole = b[0...st[0].prev_end]
+      for tok in ["null", "false", "true", "{", "}", "[", "]"] {
+        if whole.size >= tok.size && Str.from_bytes(whole[whole.size - tok.size...whole.size]) == tok {
+          return whole[whole.size - tok.size...whole.size]
+        }
+      }
+    }
+    p
+  }
+
+  pub def stack_depth -> Int { st[0].cs.m.depth - 1 }
+
+  pub def stack_index(i: Int) -> (Kind, Int) {
+    e = st[0].cs.m.at(i)
+    return (Kind.BeginObject, e_length(e)) if i > 0 && e_object?(e)
+    return (Kind.BeginArray, e_length(e)) if i > 0 && e_array?(e)
+    (Kind.Invalid, e_length(e))
+  }
+
+  # The pointer to the most recently read token or value.
+  pub def stack_pointer -> Pointer { Pointer.new(s: st[0].cs.stack_pointer(-1)) }
+
+  # The pointer at the next (where_ 0) or last (-1) value (for json/v2).
+  pub def pointer_at(where_: Int) -> Pointer { Pointer.new(s: st[0].cs.stack_pointer(where_)) }
+
+  pub def last_entry -> U64 { st[0].cs.m.last }
+
+  # Go's (*Decoder).DisableNamespace on the innermost object (json/v2's
+  # inlined fallback): duplicate names in it are not checked any more.
+  pub def disable_namespace! {
+    self.st[0].cs.m.last = st[0].cs.m.last | ST_DISABLE_NS
+  }
+
+  # Wraps a problem found by json/v2 at the next (0) or previous (-1) value.
+  pub def syntax_error(c: Cause, where_: Int) -> JsonTextError {
+    self.wrap(fault(c), st[0].prev_end, where_)
+  }
+}
+
+def new_dec_state(r: io.Reader?, b: [Byte], opts: [Options]) -> DecState {
+  DecState.new(cs: new_coder_state(), buf: b, rd: r, opts: join_options(opts))
+}
+
+# A Decoder reading from r (Go's NewDecoder).
+pub def new_decoder(r: io.Reader, opts: [Options]) -> Decoder {
+  Decoder.new(st: [new_dec_state(r, [], opts)])
+}
+
+# A Decoder over the bytes b (Go's bytes.NewReader / a buffered decoder).
+pub def new_bytes_decoder(b: [Byte], opts: [Options]) -> Decoder {
+  Decoder.new(st: [new_dec_state(none, b, opts)])
+}
+
+# A Decoder over the string s.
+pub def new_str_decoder(s: Str, opts: [Options]) -> Decoder {
+  new_bytes_decoder(s.bytes, opts)
+}
+
+# An open object or array inside a value being consumed or reformatted: its
+# names (for duplicates), the pointer segment errors inside its current
+# member or element get, and its element index.
+struct Frame {
+  obj: Bool
+  space: Namespace
+  seg: Str
+  idx: Int
+}
+
+# f with the pointer segments of the open frames in front of its suffix.
+def frames_fault(frames: [Frame], f: Fault) -> Fault {
+  s = ""
+  for fr in frames { s = s + fr.seg }
+  Fault.new(cause: f.cause, suffix: s + f.suffix)
+}

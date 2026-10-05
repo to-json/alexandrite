@@ -1,0 +1,638 @@
+#![overflow(wrap)]
+# Encoder: writes a stream of JSON tokens and values (Go's jsontext/encode.go).
+
+import "io"
+
+# A problem found while formatting: the cause and the JSON Pointer suffix
+# (below the current position) where it is, as Go's pointerSuffixError.
+struct Fault {
+  cause: Cause
+  suffix: Str
+}
+
+def fault(c: Cause) -> Fault { Fault.new(cause: c, suffix: "") }
+
+# f inside the member named `name` (a quoted JSON string).
+def with_name(f: Fault, quoted: [Byte]) -> Fault {
+  name = unquote_may_copy_any(quoted)
+  b: [Byte] = [47]
+  b = append_escape_pointer_name(b, Str.from_bytes(name))
+  Fault.new(cause: f.cause, suffix: Str.from_bytes(b) + f.suffix)
+}
+
+def with_index(f: Fault, i: Int) -> Fault {
+  Fault.new(cause: f.cause, suffix: "/" + i.to_s + f.suffix)
+}
+
+def unquote_may_copy_any(quoted: [Byte]) -> [Byte] {
+  r, _e = unquote_into([], quoted)
+  r
+}
+
+struct EncState {
+  cs: CoderState
+  buf: [Byte]
+  base: Int
+  wr: io.Writer?
+  opts: Options
+}
+
+# Writes JSON to an io.Writer (or to its own buffer: Encoder.buffered),
+# checking the grammar as it goes. Copies of an Encoder share it.
+pub struct Encoder {
+  st: [EncState]
+
+  # Starts over, writing to w with opts.
+  pub def reset!(w: io.Writer, opts: [Options]) {
+    panic("jsontext: cannot reset Encoder passed to json.MarshalerTo") if st[0].opts.get(F_WITHIN_ARSHAL_CALL)
+    self.st[0] = new_enc_state(w, opts)
+  }
+
+  # The options in effect (Go's Options()).
+  pub def options -> Options { st[0].opts }
+
+  # Sets option flags in place (for encoding/json/v2).
+  pub def set_flag!(f: U64, v: Bool) { self.st[0].opts.set!(f, v) }
+  pub def clear_flags!(f: U64) { self.st[0].opts.clear!(f) }
+  pub def join_options!(o: Options) { self.st[0].opts.join!(o) }
+
+  # The bytes written but not yet flushed to the writer (all of them for a
+  # buffered Encoder).
+  pub def bytes -> [Byte] { st[0].buf }
+
+  # Takes the buffered bytes, leaving the buffer empty.
+  pub def take_bytes! -> [Byte] {
+    b = st[0].buf
+    self.st[0].base = st[0].base + b.size
+    self.st[0].buf = []
+    b
+  }
+
+  def need_flush -> Bool {
+    return false if st[0].wr.none?
+    st[0].cs.m.depth == 1 || st[0].buf.size > 3072
+  }
+
+  def avoid_flush -> Bool {
+    last = st[0].cs.m.last
+    return true if e_length(last) == 0
+    return true if e_need_value?(last)
+    b = st[0].buf
+    if e_need_name?(last) && b.size >= 2 {
+      c1 = b[b.size - 2]
+      c2 = b[b.size - 1]
+      return true if (c1 == 108 && c2 == 108) || (c1 == 34 && c2 == 34) || (c1 == 123 && c2 == 125) || (c1 == 91 && c2 == 93)
+    }
+    false
+  }
+
+  # Writes the buffer to the writer (with a newline after a top-level value).
+  def flush! -> Fault? {
+    w = st[0].wr
+    if wr = w {
+      return none if avoid_flush
+      if st[0].cs.m.depth == 1 && !st[0].opts.get(F_OMIT_TOP_LEVEL_NEWLINE) {
+        self.st[0].buf << 10
+      }
+      r = wr.write!(st[0].buf)
+      if e = r.err {
+        return fault(Cause.Io(action: "write", msg: e.message))
+      }
+      self.st[0].base = st[0].base + st[0].buf.size
+      self.st[0].buf = []
+      self.st[0].wr = wr
+    }
+    none
+  }
+
+  def offset_at(pos: Int) -> Int { st[0].base + pos }
+
+  # Go's wrapSyntacticError for the encoder.
+  def wrap(f: Fault, pos: Int, where_: Int) -> JsonTextError {
+    case f.cause {
+      Io(a, m) => {return JsonTextError.Io(action: a, msg: m)}
+      _ => {}
+    }
+    off = offset_at(pos)
+    ptr = st[0].cs.stack_pointer(where_) + f.suffix
+    if st[0].opts.get(F_REPORT_ERRORS_WITH_LEGACY_SEMANTICS) && f.cause != Cause.UnexpectedEof {
+      case f.cause {
+        InvalidText(_l, what, _w) => {off += what.size}
+        _ => {off += 1}
+      }
+    }
+    JsonTextError.Syntactic(e: SyntacticError.new(byte_offset: off, json_pointer: Pointer.new(s: ptr), err: f.cause))
+  }
+
+  # After writing an object member's value: removes the member again if the
+  # value is empty (null, "", {}, []); for v2's omitempty. prev_name restores
+  # the name the stack pointer reports. True if it was removed.
+  pub def unwrite_empty_object_member!(prev_name: Str?) -> Bool {
+    last = st[0].cs.m.last
+    if !e_object?(last) || !e_need_name?(last) || e_length(last) == 0 {
+      panic("BUG: must be called on an object after writing a value")
+    }
+    b = st[0].buf
+    n = 0
+    if b.size >= 3 {
+      c1 = b[b.size - 2]
+      c2 = b[b.size - 1]
+      if c1 == 108 && c2 == 108 {
+        n = 4
+      } else if c1 == 34 && c2 == 34 {
+        return false if b[b.size - 3] == 92
+        n = 2
+      } else if (c1 == 123 && c2 == 125) || (c1 == 91 && c2 == 93) {
+        n = 2
+      }
+    }
+    return false if n == 0
+    b = b[0...b.size - n]
+    b = trim_suffix_whitespace(b)
+    b = trim_suffix_byte(b, 58)
+    b = trim_suffix_string(b)
+    b = trim_suffix_whitespace(b)
+    b = trim_suffix_byte(b, 44)
+    self.st[0].buf = b
+    self.st[0].cs.m.last = st[0].cs.m.last - 2
+    if !st[0].opts.get(F_ALLOW_DUPLICATE_NAMES) && e_active_ns?(st[0].cs.m.last) {
+      k = st[0].cs.spaces.size - 1
+      self.st[0].cs.spaces[k].remove_last! if k >= 0
+    }
+    self.st[0].cs.set_name!(prev_name || "")
+    true
+  }
+
+  # After writing only the first member name of an object: removes it and
+  # returns it (unquoted).
+  pub def unwrite_only_object_member_name! -> Str {
+    last = st[0].cs.m.last
+    if !e_object?(last) || e_length(last) != 1 {
+      panic("BUG: must be called on an object after writing first name")
+    }
+    buf = st[0].buf
+    b = trim_suffix_string(buf)
+    quoted = buf[b.size...buf.size]
+    name = Str.from_bytes(unquote_may_copy_any(quoted))
+    self.st[0].buf = trim_suffix_whitespace(b)
+    self.st[0].cs.m.last = st[0].cs.m.last - 1
+    if !st[0].opts.get(F_ALLOW_DUPLICATE_NAMES) && e_active_ns?(st[0].cs.m.last) {
+      k = st[0].cs.spaces.size - 1
+      self.st[0].cs.spaces[k].remove_last! if k >= 0
+    }
+    self.st[0].cs.set_name!("")
+    name
+  }
+
+  # Writes the next token (Go's WriteToken).
+  pub def write_token!(t: Token) -> ~Unit<JsonTextError> {
+    k = t.kind
+    b = st[0].buf
+    m = st[0].cs.m
+    d = m.need_delim(k)
+    b << d if d != 0
+    b = append_ws(b, k, d) if st[0].opts.get(F_ANY_WHITESPACE)
+    pos = b.size
+    err: Cause? = none
+    case k {
+      Null => {
+        b = app_s(b, "null")
+        err = m.append_literal!
+      }
+      False => {
+        b = app_s(b, "false")
+        err = m.append_literal!
+      }
+      True => {
+        b = app_s(b, "true")
+        err = m.append_literal!
+      }
+      String => {
+        b2, e2 = t.append_string(b, st[0].opts)
+        b = b2
+        err = e2
+        if err.none? {
+          if e_need_name?(m.last) {
+            err = self.check_name!(b, pos)
+          }
+          err = m.append_string! if err.none?
+        }
+      }
+      Number => {
+        b2, e2 = t.append_number(b, st[0].opts)
+        b = b2
+        err = e2
+        err = m.append_literal! if err.none?
+      }
+      BeginObject => {
+        b << 123
+        err = m.push_object!
+        if err.none? {
+          self.st[0].cs.push_names!
+          self.st[0].cs.push_space! if !st[0].opts.get(F_ALLOW_DUPLICATE_NAMES)
+          self.st[0].opts.clear!(F_TAG_FLAGS)
+        }
+      }
+      EndObject => {
+        b << 125
+        err = m.pop_object!
+        if err.none? {
+          self.st[0].cs.pop_names!
+          self.st[0].cs.pop_space! if !st[0].opts.get(F_ALLOW_DUPLICATE_NAMES)
+        }
+      }
+      BeginArray => {
+        b << 91
+        err = m.push_array!
+        self.st[0].opts.clear!(F_TAG_FLAGS) if err.none?
+      }
+      EndArray => {
+        b << 93
+        err = m.pop_array!
+      }
+      Invalid => {err = Cause.InvalidToken}
+    }
+    if c = err {
+      fail self.wrap(name_fault(c, b, pos), pos, 1)
+    }
+    self.st[0].cs.m = m
+    self.st[0].buf = b
+    if need_flush {
+      if f = self.flush! { fail self.wrap(f, 0, 1) }
+    }
+    nil
+  }
+
+  # Checks the name at b[pos...] against the innermost namespace and records
+  # it as the current member name.
+  def check_name!(b: [Byte], pos: Int) -> Cause? {
+    quoted = b[pos...b.size]
+    name = Str.from_bytes(unquote_may_copy_any(quoted))
+    if !st[0].opts.get(F_ALLOW_DUPLICATE_NAMES) {
+      return Cause.InvalidNamespace if !e_valid_ns?(st[0].cs.m.last)
+      if e_active_ns?(st[0].cs.m.last) && !self.st[0].cs.insert_name!(name) {
+        return Cause.DuplicateName
+      }
+    }
+    self.st[0].cs.set_name!(name)
+    none
+  }
+
+  # Appends a string (`s`, unquoted: it is quoted and escaped here) or a
+  # number (`s`, its text) as the next token (Go's AppendRaw). safe_ascii says
+  # a string needs no escaping.
+  pub def append_raw!(k: Kind, safe_ascii: Bool, s: [Byte]) -> ~Unit<JsonTextError> {
+    b = st[0].buf
+    m = st[0].cs.m
+    d = m.need_delim(k)
+    b << d if d != 0
+    b = append_ws(b, k, d) if st[0].opts.get(F_ANY_WHITESPACE)
+    pos = b.size
+    if k == Kind.String {
+      verbatim = safe_ascii || !need_escape(s)
+      if verbatim {
+        b << 34
+        b = app_b(b, s)
+        b << 34
+      } else {
+        b2, err = append_quote_opts(b, s, st[0].opts)
+        if c = err { fail self.wrap(fault(c), pos, 1) }
+        b = b2
+      }
+      if e_need_name?(m.last) {
+        if c = self.check_name!(b, pos) {
+          fail self.wrap(name_fault(c, b, pos), pos, 1)
+        }
+      }
+      if c = m.append_string! { fail self.wrap(fault(c), pos, 1) }
+    } else if k == Kind.Number {
+      b = app_b(b, s)
+      if c = m.append_literal! { fail self.wrap(fault(c), pos, 1) }
+    } else {
+      panic("BUG: invalid kind")
+    }
+    self.st[0].cs.m = m
+    self.st[0].buf = b
+    if need_flush {
+      if f = self.flush! { fail self.wrap(f, 0, 1) }
+    }
+    nil
+  }
+
+  # Writes the next value, reformatting it per the options (Go's WriteValue).
+  pub def write_value!(v: Value) -> ~Unit<JsonTextError> {
+    src = v.raw
+    k = v.kind
+    b = st[0].buf
+    m = st[0].cs.m
+    d = m.need_delim(k)
+    b << d if d != 0
+    b = append_ws(b, k, d) if st[0].opts.get(F_ANY_WHITESPACE)
+    pos = b.size
+    n = consume_whitespace(src, 0)
+    b2, used, err = self.reformat_value!(b, src[n...src.size], m.depth)
+    if f = err {
+      fail self.wrap(f, pos + n + used, 1)
+    }
+    b = b2
+    n += used
+    n += consume_whitespace(src, n)
+    if src.size > n {
+      fail self.wrap(fault(invalid_char(src[n...src.size], "after top-level value")), pos + n, 0)
+    }
+    c: Cause? = none
+    case k {
+      Null => {c = m.append_literal!}
+      False => {c = m.append_literal!}
+      True => {c = m.append_literal!}
+      String => {
+        if e_need_name?(m.last) {
+          c = self.check_name!(b, pos)
+        }
+        c = m.append_string! if c.none?
+      }
+      Number => {c = m.append_literal!}
+      BeginObject => {
+        c = m.push_object!
+        if c.none? {
+          _c = m.pop_object!
+          if st[0].opts.get(F_REORDER_RAW_OBJECTS) {
+            b = reorder_objects_at(b, pos)
+          }
+        }
+      }
+      BeginArray => {
+        c = m.push_array!
+        if c.none? {
+          _c = m.pop_array!
+          if st[0].opts.get(F_REORDER_RAW_OBJECTS) {
+            b = reorder_objects_at(b, pos)
+          }
+        }
+      }
+      _ => {}
+    }
+    if cc = c {
+      fail self.wrap(name_fault(cc, b, pos), pos, 1)
+    }
+    self.st[0].cs.m = m
+    self.st[0].buf = b
+    if need_flush {
+      if f = self.flush! { fail self.wrap(f, 0, 1) }
+    }
+    nil
+  }
+
+  # Whitespace before a token of kind next, after delimiter d (0 if none).
+  def append_ws(b0: [Byte], nk: Kind, d: Byte) -> [Byte] {
+    b = b0
+    o = st[0].opts
+    if d == 58 {
+      b << 32 if o.get(F_SPACE_AFTER_COLON)
+    } else {
+      b << 32 if d == 44 && o.get(F_SPACE_AFTER_COMMA)
+      if o.get(F_MULTILINE) {
+        b = append_indent(b, o, st[0].cs.m.need_indent(nk))
+      }
+    }
+    b
+  }
+
+  # How many bytes of delimiter and whitespace come before the next value.
+  pub def count_next_delim_whitespace -> Int {
+    o = st[0].opts
+    m = st[0].cs.m
+    d = m.need_delim(Kind.String)
+    n = d != 0 ? 1 : 0
+    if d == 58 {
+      n += 1 if o.get(F_SPACE_AFTER_COLON)
+    } else {
+      n += 1 if d == 44 && o.get(F_SPACE_AFTER_COMMA)
+      if o.get(F_MULTILINE) {
+        k = m.need_indent(Kind.String)
+        n += 1 + o.indent_prefix.size + (k - 1) * o.indent.size if k > 0
+      }
+    }
+    n
+  }
+
+  # Go's reformatValue: copies the value at src[0...] into dst per the
+  # options: (dst, bytes of src consumed, problem). Objects and arrays are
+  # walked with an explicit stack (Go recurses).
+  def reformat_value!(dst0: [Byte], src: [Byte], depth0: Int) -> ([Byte], Int, Fault?) {
+    o = st[0].opts
+    ml = o.get(F_MULTILINE)
+    check = !o.get(F_ALLOW_DUPLICATE_NAMES)
+    dst = dst0
+    n = 0
+    frames: [Frame] = []
+    # 0: a value; 1: an object member; 2: after a value; 3: an array element
+    phase = 0
+    loop {
+      if phase == 0 {
+        return (dst, n, frames_fault(frames, fault(Cause.UnexpectedEof))) if n >= src.size
+        k = Kind.of(src[n])
+        if k == Kind.BeginObject || k == Kind.BeginArray {
+          if depth0 + frames.size == MAX_NESTING_DEPTH + 1 {
+            return (dst, n, frames_fault(frames, fault(Cause.MaxDepth)))
+          }
+          is_obj = k == Kind.BeginObject
+          dst << src[n]
+          n += 1
+          frames << Frame.new(obj: is_obj, space: Namespace.new(names: [], set: {}, big: false), seg: "", idx: 0)
+          n += consume_whitespace(src, n)
+          return (dst, n, frames_fault(frames, fault(Cause.UnexpectedEof))) if n >= src.size
+          close: Byte = is_obj ? 125 : 93
+          if src[n] == close {
+            dst << close
+            n += 1
+            frames = frames[0...frames.size - 1]
+            phase = 2
+            next
+          }
+          phase = is_obj ? 1 : 3
+          next
+        }
+        d2, m, f = reformat_scalar(dst, src[n...src.size], o)
+        dst = d2
+        if ff = f { return (dst, n + m, frames_fault(frames, ff)) }
+        n += m
+        phase = 2
+        next
+      }
+      if phase == 3 {
+        dst = append_indent(dst, o, depth0 + frames.size) if ml
+        n += consume_whitespace(src, n)
+        return (dst, n, frames_fault(frames, fault(Cause.UnexpectedEof))) if n >= src.size
+        top = frames.size - 1
+        frames[top].seg = "/" + frames[top].idx.to_s
+        phase = 0
+        next
+      }
+      if phase == 1 {
+        dst = append_indent(dst, o, depth0 + frames.size) if ml
+        n += consume_whitespace(src, n)
+        return (dst, n, frames_fault(frames, fault(Cause.UnexpectedEof))) if n >= src.size
+        m = consume_simple_string(src, n)
+        verbatim = m > 0
+        if verbatim {
+          dst = app_b(dst, src[n...n + m])
+        } else {
+          d2, m2, err = reformat_string(dst, src[n...src.size], o)
+          dst = d2
+          if e = err { return (dst, n + m2, frames_fault(frames, fault(e))) }
+          m = m2
+        }
+        quoted = src[n...n + m]
+        name = Str.from_bytes(unquote_may_copy(quoted, verbatim))
+        top = frames.size - 1
+        nb: [Byte] = [47]
+        frames[top].seg = Str.from_bytes(append_escape_pointer_name(nb, name))
+        if check && !frames[top].space.insert!(name) {
+          return (dst, n, frames_fault(frames, fault(Cause.DuplicateName)))
+        }
+        n += m
+        n += consume_whitespace(src, n)
+        return (dst, n, frames_fault(frames, fault(Cause.UnexpectedEof))) if n >= src.size
+        if src[n] != 58 {
+          return (dst, n, frames_fault(frames, fault(invalid_char(src[n...src.size], "after object name (expecting ':')"))))
+        }
+        dst << 58
+        n += 1
+        dst << 32 if o.get(F_SPACE_AFTER_COLON)
+        n += consume_whitespace(src, n)
+        return (dst, n, frames_fault(frames, fault(Cause.UnexpectedEof))) if n >= src.size
+        phase = 0
+        next
+      }
+      # phase 2: after a value
+      return (dst, n, none) if frames.size == 0
+      top = frames.size - 1
+      frames[top].seg = ""
+      n += consume_whitespace(src, n)
+      return (dst, n, frames_fault(frames, fault(Cause.UnexpectedEof))) if n >= src.size
+      c0 = src[n]
+      is_obj = frames[top].obj
+      close: Byte = is_obj ? 125 : 93
+      if c0 == 44 {
+        dst << 44
+        dst << 32 if o.get(F_SPACE_AFTER_COMMA)
+        n += 1
+        if is_obj {
+          phase = 1
+        } else {
+          frames[top].idx = frames[top].idx + 1
+          phase = 3
+        }
+        next
+      }
+      if c0 == close {
+        dst = append_indent(dst, o, depth0 + frames.size - 1) if ml
+        dst << close
+        n += 1
+        frames = frames[0...top]
+        next
+      }
+      if is_obj {
+        return (dst, n, frames_fault(frames, fault(invalid_char(src[n...src.size], "after object value (expecting ',' or '}')"))))
+      }
+      return (dst, n, frames_fault(frames, fault(invalid_char(src[n...src.size], "after array value (expecting ',' or ']')"))))
+    }
+  }
+
+  # The number of bytes written so far (Go's OutputOffset).
+  pub def output_offset -> Int { st[0].base + st[0].buf.size }
+
+  # The number of open objects and arrays.
+  pub def stack_depth -> Int { st[0].cs.m.depth - 1 }
+
+  # The kind and length of the i-th open container (0: the top level, whose
+  # kind is Invalid and length the number of top-level values).
+  pub def stack_index(i: Int) -> (Kind, Int) {
+    e = st[0].cs.m.at(i)
+    return (Kind.BeginObject, e_length(e)) if i > 0 && e_object?(e)
+    return (Kind.BeginArray, e_length(e)) if i > 0 && e_array?(e)
+    (Kind.Invalid, e_length(e))
+  }
+
+  # The pointer to the most recently written value.
+  pub def stack_pointer -> Pointer { Pointer.new(s: st[0].cs.stack_pointer(-1)) }
+
+  # The pointer to the next value or token to be written (for json/v2 errors).
+  pub def pointer_at(where_: Int) -> Pointer { Pointer.new(s: st[0].cs.stack_pointer(where_)) }
+
+  # The innermost open container entry (for json/v2).
+  pub def last_entry -> U64 { st[0].cs.m.last }
+}
+
+# A duplicate-name cause carries the name as its pointer suffix.
+def name_fault(c: Cause, b: [Byte], pos: Int) -> Fault {
+  return with_name(fault(c), b[pos...b.size]) if c == Cause.DuplicateName
+  fault(c)
+}
+
+def reformat_lit(dst: [Byte], src: [Byte], lit: Str) -> ([Byte], Int, Fault?) {
+  if consume_word(src, 0, lit) == 0 {
+    n, err = consume_literal(src, 0, lit)
+    return (dst, n, err.none? ? none : fault(err.unwrap))
+  }
+  (app_s(dst, lit), lit.size, none)
+}
+
+# A newline, the prefix and n-1 indents (nothing for n == 0).
+def append_indent(b0: [Byte], o: Options, n: Int) -> [Byte] {
+  return b0 if n == 0
+  b = b0
+  b << 10
+  b = app_s(b, o.indent_prefix)
+  k = n
+  while k > 1 {
+    b = app_s(b, o.indent)
+    k -= 1
+  }
+  b
+}
+
+def new_enc_state(w: io.Writer?, opts: [Options]) -> EncState {
+  o = join_options(opts)
+  o.initialize_multiline! if o.get(F_MULTILINE)
+  EncState.new(cs: new_coder_state(), buf: [], base: 0, wr: w, opts: o)
+}
+
+# An Encoder writing to w (Go's NewEncoder).
+pub def new_encoder(w: io.Writer, opts: [Options]) -> Encoder {
+  Encoder.new(st: [new_enc_state(w, opts)])
+}
+
+# An Encoder writing into its own buffer (bytes / take_bytes!), without a
+# newline after top-level values: what encoding/json/v2's Marshal uses.
+pub def new_buffered_encoder(opts: [Options]) -> Encoder {
+  e = Encoder.new(st: [new_enc_state(none, opts)])
+  e.set_flag!(F_OMIT_TOP_LEVEL_NEWLINE, true)
+  e
+}
+
+# A literal, string or number at src[0...] reformatted into dst.
+def reformat_scalar(dst: [Byte], src: [Byte], o: Options) -> ([Byte], Int, Fault?) {
+  k = Kind.of(src[0])
+  if k == Kind.Null {
+    return reformat_lit(dst, src, "null")
+  } else if k == Kind.False {
+    return reformat_lit(dst, src, "false")
+  } else if k == Kind.True {
+    return reformat_lit(dst, src, "true")
+  } else if k == Kind.String {
+    n = consume_simple_string(src, 0)
+    return (app_b(dst, src[0...n]), n, none) if n > 0
+    d2, n2, err = reformat_string(dst, src, o)
+    return (d2, n2, err.none? ? none : fault(err.unwrap))
+  } else if k == Kind.Number {
+    n = consume_simple_number(src, 0)
+    if n > 0 && !o.get(F_CANONICALIZE_NUMBERS) {
+      return (app_b(dst, src[0...n]), n, none)
+    }
+    d2, n2, err = reformat_number(dst, src, o)
+    return (d2, n2, err.none? ? none : fault(err.unwrap))
+  }
+  (dst, 0, fault(invalid_char(src, "at start of value")))
+}

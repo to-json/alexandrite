@@ -1,0 +1,1001 @@
+#![overflow(wrap)]
+# Stateless handling of JSON text: Go's encoding/json/internal/jsonwire.
+#
+# Functions take a [Byte] (a slice of the input from the position of
+# interest, as Go's take b[n:]) and return the number of bytes consumed with
+# an error, (Int, Cause?) instead of Go's (int, error).
+
+import "strconv"
+import "strings"
+import "unicode"
+import "unicode/utf16"
+
+HEX = "0123456789abcdef"
+
+# ------------------------------------------------------------------ bytes
+
+# b with the bytes of s appended.
+pub def app_s(b0: [Byte], s: Str) -> [Byte] {
+  b = b0
+  for i in 0...s.size { b << s[i] }
+  b
+}
+
+# b with the bytes of src appended.
+pub def app_b(b0: [Byte], src: [Byte]) -> [Byte] {
+  b = b0
+  for c in src { b << c }
+  b
+}
+
+# b with the UTF-8 encoding of r appended (invalid runes as U+FFFD).
+def app_rune(b0: [Byte], r0: Rune) -> [Byte] {
+  b = b0
+  r = r0.to_i
+  r = 0xFFFD if r < 0 || r > 0x10FFFF || (r >= 0xD800 && r <= 0xDFFF)
+  if r < 0x80 {
+    b << r.as_u8
+  } else if r < 0x800 {
+    b << (0xC0 | (r >> 6)).as_u8
+    b << (0x80 | (r & 0x3F)).as_u8
+  } else if r < 0x10000 {
+    b << (0xE0 | (r >> 12)).as_u8
+    b << (0x80 | ((r >> 6) & 0x3F)).as_u8
+    b << (0x80 | (r & 0x3F)).as_u8
+  } else {
+    b << (0xF0 | (r >> 18)).as_u8
+    b << (0x80 | ((r >> 12) & 0x3F)).as_u8
+    b << (0x80 | ((r >> 6) & 0x3F)).as_u8
+    b << (0x80 | (r & 0x3F)).as_u8
+  }
+  b
+}
+
+# Go's utf8.DecodeRune on b[i...]: (rune, size); (0xFFFD, 1) when invalid,
+# (0xFFFD, 0) when empty.
+pub def decode_rune_b(s: [Byte], i: Int) -> (Rune, Int) {
+  n = s.size - i
+  return (0xFFFD, 0) if n <= 0
+  b0 = s[i].to_i
+  return (b0.to_i32, 1) if b0 < 0x80
+  return (0xFFFD, 1) if b0 < 0xC2 || b0 > 0xF4
+  if b0 < 0xE0 {
+    return (0xFFFD, 1) if n < 2
+    b1 = s[i + 1].to_i
+    return (0xFFFD, 1) if (b1 & 0xC0) != 0x80
+    return ((((b0 & 0x1F) << 6) | (b1 & 0x3F)).to_i32, 2)
+  }
+  if b0 < 0xF0 {
+    return (0xFFFD, 1) if n < 3
+    b1 = s[i + 1].to_i
+    b2 = s[i + 2].to_i
+    lo = b0 == 0xE0 ? 0xA0 : 0x80
+    hi = b0 == 0xED ? 0x9F : 0xBF
+    return (0xFFFD, 1) if b1 < lo || b1 > hi
+    return (0xFFFD, 1) if (b2 & 0xC0) != 0x80
+    return ((((b0 & 0x0F) << 12) | ((b1 & 0x3F) << 6) | (b2 & 0x3F)).to_i32, 3)
+  }
+  return (0xFFFD, 1) if n < 4
+  b1 = s[i + 1].to_i
+  b2 = s[i + 2].to_i
+  b3 = s[i + 3].to_i
+  lo = b0 == 0xF0 ? 0x90 : 0x80
+  hi = b0 == 0xF4 ? 0x8F : 0xBF
+  return (0xFFFD, 1) if b1 < lo || b1 > hi
+  return (0xFFFD, 1) if (b2 & 0xC0) != 0x80 || (b3 & 0xC0) != 0x80
+  r = ((b0 & 0x07) << 18) | ((b1 & 0x3F) << 12) | ((b2 & 0x3F) << 6) | (b3 & 0x3F)
+  (r.to_i32, 4)
+}
+
+# The same on a Str.
+pub def decode_rune_s(s: Str, i: Int) -> (Rune, Int) {
+  n = s.size - i
+  return (0xFFFD, 0) if n <= 0
+  return (s[i].to_i32, 1) if s[i] < 0x80
+  k = n < 4 ? n : 4
+  bs: [Byte] = []
+  for j in 0...k { bs << s[i + j] }
+  decode_rune_b(bs, 0)
+}
+
+# Go's utf8.FullRune on b[i...].
+def full_rune_b(s: [Byte], i: Int) -> Bool {
+  n = s.size - i
+  return false if n <= 0
+  b0 = s[i].to_i
+  return true if b0 < 0xC2 || b0 > 0xF4
+  need = b0 < 0xE0 ? 2 : (b0 < 0xF0 ? 3 : 4)
+  return true if n >= need
+  if n >= 2 {
+    b1 = s[i + 1].to_i
+    lo = 0x80
+    hi = 0xBF
+    if b0 == 0xE0 {
+      lo = 0xA0
+    } else if b0 == 0xED {
+      hi = 0x9F
+    } else if b0 == 0xF0 {
+      lo = 0x90
+    } else if b0 == 0xF4 {
+      hi = 0x8F
+    }
+    return true if b1 < lo || b1 > hi
+  }
+  if n >= 3 {
+    return true if (s[i + 2].to_i & 0xC0) != 0x80
+  }
+  false
+}
+
+def is_invalid_utf8(r: Rune, n: Int) -> Bool { r == 0xFFFD && n == 1 }
+
+# ------------------------------------------------------------------ errors
+
+# Go's QuoteRune: the first rune of b quoted as a Go character literal, or
+# '\xNN' for an invalid byte.
+pub def quote_rune_b(b: [Byte]) -> Str {
+  r, n = decode_rune_b(b, 0)
+  if r == 0xFFFD && n == 1 {
+    return "'\\x" + strconv.format_uint(b[0].to_u64, 16) + "'"
+  }
+  strconv.quote_rune(r)
+}
+
+# The message of Go's jsonwire.InvalidTextError.
+def invalid_text_message(label: Str, what: Str, where_: Str) -> Str {
+  need_escape = false
+  i = 0
+  while i < what.size {
+    r, n = decode_rune_s(what, i)
+    if r == 96 || r == 0xFFFD || unicode.is_space(r) || !unicode.is_print(r) {
+      need_escape = true
+    }
+    i += n
+  }
+  w = ""
+  if rune_count_s(what) == 1 {
+    w = quote_rune_b(what.bytes)
+  } else if need_escape {
+    w = strconv.quote(what)
+  } else {
+    w = "`" + what + "`"
+  }
+  strings.trim_suffix("invalid " + label + " " + w + " " + where_, " ")
+}
+
+def rune_count_s(s: Str) -> Int {
+  i = 0
+  c = 0
+  while i < s.size {
+    _r, n = decode_rune_s(s, i)
+    i += n
+    c += 1
+  }
+  c
+}
+
+# Go's NewInvalidCharacterError: the first rune of prefix is invalid `where`.
+pub def invalid_char(prefix: [Byte], where_: Str) -> Cause {
+  _r, n = decode_rune_b(prefix, 0)
+  Cause.InvalidText(label: "character", what: Str.from_bytes(prefix[0...n]), where_: where_)
+}
+
+# Go's NewInvalidEscapeSequenceError.
+pub def invalid_escape(what: [Byte]) -> Cause {
+  if what.size > 6 {
+    return Cause.InvalidText(label: "surrogate pair", what: Str.from_bytes(what), where_: "in string")
+  }
+  Cause.InvalidText(label: "escape sequence", what: Str.from_bytes(what), where_: "in string")
+}
+
+# Go's TruncatePointer: s shortened to about n bytes around an ellipsis.
+pub def truncate_pointer(s: Str, n: Int) -> Str {
+  return s if s.size <= n
+  i = n / 2
+  j = s.size - n / 2
+  k = strings.last_index_byte(s[0...i], 47)
+  i = k if k > 0
+  k2 = strings.index_byte(s[j...s.size], 47)
+  j += k2 + 1 if k2 >= 0
+  while i > 0 {
+    r, sz = last_rune_s(s, i)
+    break if !is_invalid_utf8(r, sz)
+    i -= 1
+  }
+  while j < s.size {
+    r, sz = decode_rune_s(s, j)
+    break if !is_invalid_utf8(r, sz)
+    j += 1
+  }
+  mid = s[i...j]
+  middle = "…/…/…"
+  cnt = strings.count(mid, "/")
+  if cnt == 0 {
+    middle = "…"
+  } else if cnt == 1 {
+    middle = "…/…"
+  }
+  if mid.start_with?("/") && middle != "…" {
+    middle = strings.trim_prefix(middle, "…")
+  }
+  if mid.end_with?("/") && middle != "…" {
+    middle = strings.trim_suffix(middle, "…")
+  }
+  s[0...i] + middle + s[j...s.size]
+}
+
+# Go's utf8.DecodeLastRuneInString(s[:end]).
+def last_rune_s(s: Str, end_: Int) -> (Rune, Int) {
+  return (0xFFFD, 0) if end_ == 0
+  last = s[end_ - 1]
+  return (last.to_i32, 1) if last < 0x80
+  lim = end_ - 4
+  lim = 0 if lim < 0
+  start = end_ - 2
+  while start >= lim {
+    break if (s[start] & 0xC0) != 0x80
+    start -= 1
+  }
+  start = 0 if start < 0
+  r, size = decode_rune_s(s[0...end_], start)
+  return (0xFFFD, 1) if start + size != end_
+  (r, size)
+}
+
+# ------------------------------------------------------------------ comparing
+
+# Compares x and y by their UTF-16 code units (RFC 8785, section 3.2.3).
+pub def compare_utf16(x0: [Byte], y0: [Byte]) -> Int {
+  x = x0
+  y = y0
+  loop {
+    if x.size == 0 || y.size == 0 {
+      return x.size < y.size ? -1 : (x.size > y.size ? 1 : 0)
+    }
+    if x[0] < 0x80 || y[0] < 0x80 {
+      if x[0] != y[0] {
+        return x[0] < y[0] ? -1 : 1
+      }
+      x = x[1...x.size]
+      y = y[1...y.size]
+      next
+    }
+    rx, nx = decode_rune_b(x, 0)
+    ry, ny = decode_rune_b(y, 0)
+    selfx = is_utf16_self(rx)
+    selfy = is_utf16_self(ry)
+    if selfx && !selfy {
+      ry = utf16.encode_rune(ry)[0]
+    } else if selfy && !selfx {
+      rx = utf16.encode_rune(rx)[0]
+    }
+    if rx != ry {
+      return rx < ry ? -1 : 1
+    }
+    if is_invalid_utf8(rx, nx) || is_invalid_utf8(ry, ny) {
+      if x[0] != y[0] {
+        return x[0] < y[0] ? -1 : 1
+      }
+    }
+    x = x[nx...x.size]
+    y = y[ny...y.size]
+  }
+}
+
+def is_utf16_self(r: Rune) -> Bool {
+  (r >= 0 && r <= 0xD7FF) || (r >= 0xE000 && r <= 0xFFFF)
+}
+
+# ------------------------------------------------------------------ consuming
+
+# Value flags: whether a string must be unescaped (not verbatim) and whether
+# it isn't in RFC 8785's canonical form.
+STRING_NON_VERBATIM = 1
+STRING_NON_CANONICAL = 2
+
+def is_ws(c: Byte) -> Bool { c == 32 || c == 9 || c == 13 || c == 10 }
+
+# The number of whitespace bytes at the start of b[i...].
+pub def consume_whitespace(b: [Byte], i: Int) -> Int {
+  n = i
+  while n < b.size && is_ws(b[n]) { n += 1 }
+  n - i
+}
+
+# The length of the literal lit at b[i...] if it is all there, else 0.
+def consume_word(b: [Byte], i: Int, lit: Str) -> Int {
+  return 0 if b.size - i < lit.size
+  for k in 0...lit.size {
+    return 0 if b[i + k] != lit[k]
+  }
+  lit.size
+}
+
+# Consumes the literal lit (null, false, true) at b[i...]: its length, or how
+# far it matched with an error (UnexpectedEof if b ends first).
+pub def consume_literal(b: [Byte], i: Int, lit: Str) -> (Int, Cause?) {
+  k = 0
+  while i + k < b.size && k < lit.size {
+    if b[i + k] != lit[k] {
+      return (k, invalid_char(b[i + k...b.size], "in literal " + lit + " (expecting " + strconv.quote_rune(lit[k].to_i32) + ")"))
+    }
+    k += 1
+  }
+  return (b.size - i, Cause.UnexpectedEof) if b.size - i < lit.size
+  (lit.size, none)
+}
+
+ESCAPE_ASCII: [U8; 128] = [
+  1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+  1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+  0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 1, 0,
+  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+]
+
+# The length of a string at b[i...] without escapes or non-ASCII (0 if not one).
+pub def consume_simple_string(b: [Byte], i: Int) -> Int {
+  n = i
+  if n < b.size && b[n] == 34 {
+    n += 1
+    while n < b.size && b[n] < 0x80 && ESCAPE_ASCII[b[n].to_i] == 0 { n += 1 }
+    if n < b.size && b[n] == 34 {
+      return n + 1 - i
+    }
+  }
+  0
+}
+
+# Consumes a string at b[i...], resuming after `resume` bytes already checked
+# (0 to start). Returns (length consumed, flags, error); with UnexpectedEof the
+# length is where to resume.
+pub def consume_string_resumable(b: [Byte], i: Int, resume: Int, validate_utf8: Bool) -> (Int, Int, Cause?) {
+  flags = 0
+  n = i + resume
+  if resume == 0 {
+    return (0, flags, Cause.UnexpectedEof) if i >= b.size
+    return (0, flags, invalid_char(b[i...b.size], "at start of string (expecting '\"')")) if b[i] != 34
+    n += 1
+  }
+  while n < b.size {
+    while n < b.size {
+      c = b[n]
+      break if c >= 0x80 || c < 32 || c == 92 || c == 34
+      n += 1
+    }
+    return (n - i, flags, Cause.UnexpectedEof) if n >= b.size
+    if b[n] == 34 {
+      return (n + 1 - i, flags, none)
+    }
+    r, rn = decode_rune_b(b, n)
+    if rn > 1 {
+      n += rn
+    } else if r == 92 {
+      flags = flags | STRING_NON_VERBATIM
+      resume_at = n
+      return (resume_at - i, flags, Cause.UnexpectedEof) if b.size < n + 2
+      c = b[n + 1]
+      if c == 47 {
+        flags = flags | STRING_NON_CANONICAL
+        n += 2
+      } else if c == 34 || c == 92 || c == 98 || c == 102 || c == 110 || c == 114 || c == 116 {
+        n += 2
+      } else if c == 117 {
+        if b.size < n + 6 {
+          if has_escaped_utf16_prefix(b[n...b.size], false) {
+            return (resume_at - i, flags, Cause.UnexpectedEof)
+          }
+          flags = flags | STRING_NON_CANONICAL
+          return (n - i, flags, invalid_escape(b[n...b.size]))
+        }
+        v1 = parse_hex_u16(b[n + 2...n + 6])
+        if v1 < 0 {
+          flags = flags | STRING_NON_CANONICAL
+          return (n - i, flags, invalid_escape(b[n...n + 6]))
+        }
+        if v1 == 8 || v1 == 12 || v1 == 10 || v1 == 13 || v1 == 9 {
+          flags = flags | STRING_NON_CANONICAL
+        } else if v1 >= 32 {
+          flags = flags | STRING_NON_CANONICAL
+        } else {
+          for k in n + 2...n + 6 {
+            if b[k] >= 65 && b[k] <= 70 {
+              flags = flags | STRING_NON_CANONICAL
+            }
+          }
+        }
+        n += 6
+        if validate_utf8 && v1 >= 0xD800 && v1 < 0xE000 {
+          if b.size < n + 6 {
+            if has_escaped_utf16_prefix(b[n...b.size], true) {
+              return (resume_at - i, flags, Cause.UnexpectedEof)
+            }
+            flags = flags | STRING_NON_CANONICAL
+            return (n - 6 - i, flags, invalid_escape(b[n - 6...b.size]))
+          }
+          v2 = parse_hex_u16(b[n + 2...n + 6])
+          if b[n] != 92 || b[n + 1] != 117 || v2 < 0 {
+            flags = flags | STRING_NON_CANONICAL
+            return (n - 6 - i, flags, invalid_escape(b[n - 6...n + 6]))
+          }
+          rr = utf16.decode_rune(v1.to_i32, v2.to_i32)
+          if rr == 0xFFFD {
+            flags = flags | STRING_NON_CANONICAL
+            return (n - 6 - i, flags, invalid_escape(b[n - 6...n + 6]))
+          }
+          n += 6
+        }
+      } else {
+        flags = flags | STRING_NON_CANONICAL
+        return (n - i, flags, invalid_escape(b[n...n + 2]))
+      }
+    } else if r == 0xFFFD {
+      return (n - i, flags, Cause.UnexpectedEof) if !full_rune_b(b, n)
+      flags = flags | STRING_NON_VERBATIM | STRING_NON_CANONICAL
+      return (n - i, flags, Cause.InvalidUtf8) if validate_utf8
+      n += 1
+    } else {
+      # r < ' '
+      flags = flags | STRING_NON_VERBATIM | STRING_NON_CANONICAL
+      return (n - i, flags, invalid_char(b[n...b.size], "in string (expecting non-control character)"))
+    }
+  }
+  (n - i, flags, Cause.UnexpectedEof)
+}
+
+# Consumes a whole string at b[i...]: (length, flags, error).
+pub def consume_string(b: [Byte], i: Int, validate_utf8: Bool) -> (Int, Int, Cause?) {
+  consume_string_resumable(b, i, 0, validate_utf8)
+}
+
+# Whether b could be the start of a \uXXXX escape (of a low surrogate, if lower).
+def has_escaped_utf16_prefix(b: [Byte], lower: Bool) -> Bool {
+  for i in 0...b.size {
+    c = b[i]
+    return false if i == 0 && c != 92
+    return false if i == 1 && c != 117
+    return false if i == 2 && lower && c != 100 && c != 68
+    return false if i == 3 && lower && !(c >= 99 && c <= 102) && !(c >= 67 && c <= 70)
+    return false if i >= 2 && i < 6 && !is_hex(c)
+  }
+  true
+}
+
+def is_hex(c: Byte) -> Bool { (c >= 48 && c <= 57) || (c >= 97 && c <= 102) || (c >= 65 && c <= 70) }
+
+# The value of 4 hex digits, or -1.
+def parse_hex_u16(b: [Byte]) -> Int {
+  return -1 if b.size != 4
+  v = 0
+  for c in b {
+    d = 0
+    if c >= 48 && c <= 57 {
+      d = c.to_i - 48
+    } else if c >= 97 && c <= 102 {
+      d = c.to_i - 87
+    } else if c >= 65 && c <= 70 {
+      d = c.to_i - 55
+    } else {
+      return -1
+    }
+    v = v * 16 + d
+  }
+  v
+}
+
+# Appends the unquoted form of the string src (with its quotes) to dst.
+# Invalid UTF-8 and unpaired surrogates become U+FFFD with an InvalidUtf8 /
+# escape error reported after the whole string is copied, as Go's.
+pub def unquote_into(dst0: [Byte], src: [Byte]) -> ([Byte], Cause?) {
+  dst = dst0
+  err: Cause? = none
+  return (dst, Cause.UnexpectedEof) if src.size == 0
+  return (dst, invalid_char(src, "at start of string (expecting '\"')")) if src[0] != 34
+  i = 1
+  n = 1
+  while n < src.size {
+    while n < src.size {
+      c = src[n]
+      break if c >= 0x80 || c < 32 || c == 92 || c == 34
+      n += 1
+    }
+    if n >= src.size {
+      for k in i...n { dst << src[k] }
+      return (dst, Cause.UnexpectedEof)
+    }
+    if src[n] == 34 {
+      for k in i...n { dst << src[k] }
+      n += 1
+      if n < src.size {
+        err = invalid_char(src[n...src.size], "after string value")
+      }
+      return (dst, err)
+    }
+    r, rn = decode_rune_b(src, n)
+    if rn > 1 {
+      n += rn
+    } else if r == 92 {
+      for k in i...n { dst << src[k] }
+      return (dst, Cause.UnexpectedEof) if src.size < n + 2
+      c = src[n + 1]
+      if c == 34 || c == 92 || c == 47 {
+        dst << c
+        n += 2
+      } else if c == 98 {
+        dst << 8
+        n += 2
+      } else if c == 102 {
+        dst << 12
+        n += 2
+      } else if c == 110 {
+        dst << 10
+        n += 2
+      } else if c == 114 {
+        dst << 13
+        n += 2
+      } else if c == 116 {
+        dst << 9
+        n += 2
+      } else if c == 117 {
+        if src.size < n + 6 {
+          return (dst, Cause.UnexpectedEof) if has_escaped_utf16_prefix(src[n...src.size], false)
+          return (dst, invalid_escape(src[n...src.size]))
+        }
+        v1 = parse_hex_u16(src[n + 2...n + 6])
+        return (dst, invalid_escape(src[n...n + 6])) if v1 < 0
+        n += 6
+        rr = v1.to_i32
+        if v1 >= 0xD800 && v1 < 0xE000 {
+          rr = 0xFFFD
+          if src.size < n + 6 {
+            if has_escaped_utf16_prefix(src[n...src.size], true) {
+              return (app_rune(dst, rr), Cause.UnexpectedEof)
+            }
+            err = invalid_escape(src[n - 6...src.size])
+          } else {
+            v2 = parse_hex_u16(src[n + 2...n + 6])
+            if src[n] != 92 || src[n + 1] != 117 || v2 < 0 {
+              err = invalid_escape(src[n - 6...n + 6])
+            } else {
+              rr = utf16.decode_rune(v1.to_i32, v2.to_i32)
+              if rr == 0xFFFD {
+                err = invalid_escape(src[n - 6...n + 6])
+              } else {
+                n += 6
+              }
+            }
+          }
+        }
+        dst = app_rune(dst, rr)
+      } else {
+        return (dst, invalid_escape(src[n...n + 2]))
+      }
+      i = n
+    } else if r == 0xFFFD {
+      for k in i...n { dst << src[k] }
+      return (dst, Cause.UnexpectedEof) if !full_rune_b(src, n)
+      dst = app_s(dst, "\uFFFD")
+      n += rn
+      i = n
+      err = Cause.InvalidUtf8
+    } else {
+      for k in i...n { dst << src[k] }
+      return (dst, invalid_char(src[n...src.size], "in string (expecting non-control character)"))
+    }
+  }
+  for k in i...n { dst << src[k] }
+  (dst, Cause.UnexpectedEof)
+}
+
+# The unquoted bytes of a valid quoted string.
+pub def unquote_may_copy(b: [Byte], verbatim: Bool) -> [Byte] {
+  return b[1...b.size - 1] if verbatim
+  r, _e = unquote_into([], b)
+  r
+}
+
+# The length of a number at b[i...] without fraction or exponent, followed by
+# something else (0 if not one).
+pub def consume_simple_number(b: [Byte], i: Int) -> Int {
+  n = i
+  if n < b.size {
+    if b[n] == 48 {
+      n += 1
+    } else if b[n] >= 49 && b[n] <= 57 {
+      n += 1
+      while n < b.size && b[n] >= 48 && b[n] <= 57 { n += 1 }
+    } else {
+      return 0
+    }
+    if n >= b.size || (b[n] != 46 && b[n] != 101 && b[n] != 69) {
+      return n - i
+    }
+  }
+  0
+}
+
+# The states of a number being consumed across buffer refills.
+NUM_INIT = 0
+NUM_BEFORE_INT = 1
+NUM_WITHIN_INT = 2
+NUM_BEFORE_FRAC = 3
+NUM_WITHIN_FRAC = 4
+NUM_BEFORE_EXP = 5
+NUM_WITHIN_EXP = 6
+
+def is_digit(c: Byte) -> Bool { c >= 48 && c <= 57 }
+
+# Consumes a number at b[i...] (Go's ConsumeNumberResumable): (length, state,
+# error). `resume` is a length already consumed in state `state0`.
+pub def consume_number_resumable(b: [Byte], i: Int, resume: Int, state0: Int) -> (Int, Int, Cause?) {
+  n = i + resume
+  state = state0
+  stage = 0
+  if state > NUM_INIT {
+    if state == NUM_WITHIN_INT || state == NUM_WITHIN_FRAC || state == NUM_WITHIN_EXP {
+      while n < b.size && is_digit(b[n]) { n += 1 }
+      return (n - i, state, none) if n >= b.size
+      state += 1
+    }
+    if state == NUM_BEFORE_INT {
+      stage = 0
+    } else if state == NUM_BEFORE_FRAC {
+      stage = 1
+    } else if state == NUM_BEFORE_EXP {
+      stage = 2
+    } else {
+      return (n - i, state, none)
+    }
+  }
+  if stage == 0 {
+    resume_at = n
+    n += 1 if b.size > i && b[i] == 45
+    if n >= b.size {
+      return (resume_at - i, NUM_BEFORE_INT, Cause.UnexpectedEof)
+    }
+    if b[n] == 48 {
+      n += 1
+      state = NUM_BEFORE_FRAC
+    } else if b[n] >= 49 && b[n] <= 57 {
+      n += 1
+      while n < b.size && is_digit(b[n]) { n += 1 }
+      state = NUM_WITHIN_INT
+    } else {
+      return (n - i, state, invalid_char(b[n...b.size], "in number (expecting digit)"))
+    }
+  }
+  if stage <= 1 {
+    if n < b.size && b[n] == 46 {
+      resume_at = n
+      n += 1
+      if n >= b.size {
+        return (resume_at - i, NUM_BEFORE_FRAC, Cause.UnexpectedEof)
+      }
+      if !is_digit(b[n]) {
+        return (n - i, state, invalid_char(b[n...b.size], "in number (expecting digit)"))
+      }
+      while n < b.size && is_digit(b[n]) { n += 1 }
+      state = NUM_WITHIN_FRAC
+    }
+  }
+  if n < b.size && (b[n] == 101 || b[n] == 69) {
+    resume_at = n
+    n += 1
+    n += 1 if n < b.size && (b[n] == 45 || b[n] == 43)
+    if n >= b.size {
+      return (resume_at - i, NUM_BEFORE_EXP, Cause.UnexpectedEof)
+    }
+    if !is_digit(b[n]) {
+      return (n - i, state, invalid_char(b[n...b.size], "in number (expecting digit)"))
+    }
+    while n < b.size && is_digit(b[n]) { n += 1 }
+    state = NUM_WITHIN_EXP
+  }
+  (n - i, state, none)
+}
+
+# Consumes a whole number at b[i...].
+pub def consume_number(b: [Byte], i: Int) -> (Int, Cause?) {
+  n, _st, err = consume_number_resumable(b, i, 0, NUM_INIT)
+  (n, err)
+}
+
+# Go's jsonwire.ParseUint: the value of a plain unsigned decimal, with ok;
+# on overflow (MAX_U64, false).
+pub def parse_uint(b: [Byte]) -> (U64, Bool) {
+  v: U64 = 0
+  n = 0
+  while n < b.size && is_digit(b[n]) {
+    v = 10 * v + (b[n] - 48).to_u64
+    n += 1
+  }
+  if n == 0 || b.size != n || (b[0] == 48 && b.size != 1) {
+    return (0, false)
+  }
+  if n >= 20 && (b[0] != 49 || v < 10000000000000000000 || n > 20) {
+    return (18446744073709551615, false)
+  }
+  (v, true)
+}
+
+# ------------------------------------------------------------------ encoding
+
+# Whether src needs escaping or replacing (control characters, ", \, <, >,
+# &, U+2028/9, invalid UTF-8) to be quoted.
+pub def need_escape(src: [Byte]) -> Bool {
+  i = 0
+  while i < src.size {
+    c = src[i]
+    if c < 0x80 {
+      return true if ESCAPE_ASCII[c.to_i] > 0
+      i += 1
+    } else {
+      r, rn = decode_rune_b(src, i)
+      return true if r == 0xFFFD || r == 0x2028 || r == 0x2029
+      i += rn
+    }
+  }
+  false
+}
+
+# Appends src as a quoted JSON string with the escaping options of `o`.
+# Invalid UTF-8 becomes U+FFFD; it's an error unless allow_invalid_utf8.
+pub def append_quote_opts(dst0: [Byte], src: [Byte], o: Options) -> ([Byte], Cause?) {
+  dst = dst0
+  html = o.get(F_ESCAPE_FOR_HTML)
+  js = o.get(F_ESCAPE_FOR_JS)
+  bad = false
+  dst << 34
+  i = 0
+  n = 0
+  while n < src.size {
+    c = src[n]
+    if c < 0x80 {
+      n += 1
+      next if ESCAPE_ASCII[c.to_i] == 0
+      if !(c == 60 || c == 62 || c == 38) || html {
+        for k in i...n - 1 { dst << src[k] }
+        dst = append_escaped_ascii(dst, c)
+        i = n
+      }
+    } else {
+      r, rn = decode_rune_b(src, n)
+      n += rn
+      next if r != 0xFFFD && r != 0x2028 && r != 0x2029
+      if is_invalid_utf8(r, rn) {
+        bad = true
+        for k in i...n - rn { dst << src[k] }
+        dst = app_s(dst, "\uFFFD")
+        i = n
+      } else if (r == 0x2028 || r == 0x2029) && js {
+        for k in i...n - rn { dst << src[k] }
+        dst = append_escaped_unicode(dst, r)
+        i = n
+      }
+    }
+  }
+  for k in i...n { dst << src[k] }
+  dst << 34
+  return (dst, Cause.InvalidUtf8) if bad && !o.get(F_ALLOW_INVALID_UTF8)
+  (dst, none)
+}
+
+# Go's AppendQuote: dst with src quoted as a JSON string (no HTML or JS
+# escaping). Invalid UTF-8 becomes U+FFFD and is reported with the result,
+# as Go returns both.
+pub def append_quote(dst: [Byte], src: Str) -> ([Byte], JsonTextError?) {
+  b, err = append_quote_opts(dst, src.bytes, Options.new)
+  if e = err {
+    return (b, JsonTextError.Syntactic(e: SyntacticError.new(byte_offset: 0, json_pointer: Pointer.new(s: ""), err: e)))
+  }
+  (b, none)
+}
+
+# Go's AppendUnquote: dst with the JSON string src unquoted; on an error,
+# what was unquoted so far, with the error.
+pub def append_unquote(dst: [Byte], src: Str) -> ([Byte], JsonTextError?) {
+  b, err = unquote_into(dst, src.bytes)
+  if e = err {
+    return (b, JsonTextError.Syntactic(e: SyntacticError.new(byte_offset: 0, json_pointer: Pointer.new(s: ""), err: e)))
+  }
+  (b, none)
+}
+
+def append_escaped_ascii(dst0: [Byte], c: Byte) -> [Byte] {
+  dst = dst0
+  if c == 34 || c == 92 {
+    dst << 92
+    dst << c
+  } else if c == 8 {
+    dst = app_s(dst, "\\b")
+  } else if c == 12 {
+    dst = app_s(dst, "\\f")
+  } else if c == 10 {
+    dst = app_s(dst, "\\n")
+  } else if c == 13 {
+    dst = app_s(dst, "\\r")
+  } else if c == 9 {
+    dst = app_s(dst, "\\t")
+  } else {
+    dst = append_escaped_utf16(dst, c.to_i)
+  }
+  dst
+}
+
+def append_escaped_unicode(dst0: [Byte], r: Rune) -> [Byte] {
+  dst = dst0
+  r1, r2 = utf16.encode_rune(r)
+  if r1 != 0xFFFD && r2 != 0xFFFD {
+    dst = append_escaped_utf16(dst, r1.to_i)
+    dst = append_escaped_utf16(dst, r2.to_i)
+  } else {
+    dst = append_escaped_utf16(dst, r.to_i)
+  }
+  dst
+}
+
+def append_escaped_utf16(dst0: [Byte], x: Int) -> [Byte] {
+  dst = dst0
+  dst << 92
+  dst << 117
+  dst << HEX[(x >> 12) & 0xf]
+  dst << HEX[(x >> 8) & 0xf]
+  dst << HEX[(x >> 4) & 0xf]
+  dst << HEX[x & 0xf]
+  dst
+}
+
+# Reformats the string at src[0...] into dst per the options: canonical
+# strings are copied verbatim, others unquoted and quoted again (or, with
+# preserve_raw_strings, copied with only the requested escapes added).
+# Returns (dst, bytes consumed, error).
+pub def reformat_string(dst0: [Byte], src: [Byte], o: Options) -> ([Byte], Int, Cause?) {
+  dst = dst0
+  n, vflags, err = consume_string(src, 0, !o.get(F_ALLOW_INVALID_UTF8))
+  if e = err {
+    return (dst, n, e)
+  }
+  preserve = o.get(F_PRESERVE_RAW_STRINGS)
+  if !o.get(F_ANY_ESCAPE) && (vflags & STRING_NON_CANONICAL == 0 || preserve) {
+    for k in 0...n { dst << src[k] }
+    return (dst, n, none)
+  }
+  if preserve {
+    html = o.get(F_ESCAPE_FOR_HTML)
+    js = o.get(F_ESCAPE_FOR_JS)
+    i = 0
+    last = 0
+    while i < n {
+      c = src[i]
+      if c < 0x80 {
+        if (c == 60 || c == 62 || c == 38) && html {
+          for k in last...i { dst << src[k] }
+          dst = append_escaped_ascii(dst, c)
+          last = i + 1
+        }
+        i += 1
+      } else {
+        r, rn = decode_rune_b(src, i)
+        if (r == 0x2028 || r == 0x2029) && js {
+          for k in last...i { dst << src[k] }
+          dst = append_escaped_unicode(dst, r)
+          last = i + rn
+        }
+        i += rn
+      }
+    }
+    for k in last...n { dst << src[k] }
+    return (dst, n, none)
+  }
+  b, _e = unquote_into([], src[0...n])
+  dst2, _e2 = append_quote_opts(dst, b, o)
+  (dst2, n, none)
+}
+
+MAX_FLOAT = 1.7976931348623157e308
+
+# Go's jsonwire.AppendFloat: the shortest representation of src as a float64
+# (bits 64) or float32 (bits 32), in 'f' form unless tiny or huge ('e', with
+# a two-digit exponent kept as Go's ES6 form: 1e-7, not 1e-07).
+pub def append_float(dst: [Byte], src0: Float, bits: Int) -> [Byte] {
+  src = src0
+  src = round_f32(src) if bits == 32
+  a = src < 0.0 ? -src : src
+  f = "f"
+  if a != 0.0 {
+    if bits == 64 && (a < 1e-6 || a >= 1e21) {
+      f = "e"
+    }
+    if bits == 32 && (a < round_f32(1e-6) || a >= round_f32(1e21)) {
+      f = "e"
+    }
+  }
+  s = strconv.format_float(src, f, -1, bits)
+  if f == "e" {
+    k = s.size
+    if k >= 4 && s[k - 4] == 101 && s[k - 3] == 45 && s[k - 2] == 48 {
+      s = s[0...k - 2] + s[k - 1...k]
+    }
+  }
+  app_s(dst, s)
+}
+
+# The float32 nearest to f (round to nearest even), as a Float.
+pub def round_f32(f: Float) -> Float {
+  return f if f != f || f == 0.0
+  strconv.parse_float_bits(strconv.format_float(f, "g", -1, 32), 64).unwrap_or(f)
+}
+
+# Reformats the number at src[0...] into dst: verbatim unless the canonicalize
+# options ask for float64's form. Returns (dst, consumed, error).
+pub def reformat_number(dst0: [Byte], src: [Byte], o: Options) -> ([Byte], Int, Cause?) {
+  dst = dst0
+  n, err = consume_number(src, 0)
+  if e = err {
+    return (dst, n, e)
+  }
+  if !o.get(F_CANONICALIZE_NUMBERS) {
+    for k in 0...n { dst << src[k] }
+    return (dst, n, none)
+  }
+  is_float = false
+  for k in 0...n {
+    c = src[k]
+    if c == 46 || c == 101 || c == 69 {
+      is_float = true
+      break
+    }
+  }
+  neg_zero = n == 2 && src[0] == 45 && src[1] == 48
+  if !neg_zero {
+    if is_float {
+      if !o.get(F_CANONICALIZE_RAW_FLOATS) {
+        for k in 0...n { dst << src[k] }
+        return (dst, n, none)
+      }
+    } else if !o.get(F_CANONICALIZE_RAW_INTS) || n < 16 {
+      for k in 0...n { dst << src[k] }
+      return (dst, n, none)
+    }
+  }
+  fv = parse_float_clamped(Str.from_bytes(src[0...n]))
+  fv = 0.0 if fv == 0.0
+  (append_float(dst, fv, 64), n, none)
+}
+
+# strconv.ParseFloat of a valid JSON number, with overflow clamped to
+# ±MaxFloat64 (Go gets ±Inf with ErrRange and clamps).
+pub def parse_float_clamped(s: Str) -> Float {
+  r = strconv.parse_float(s)
+  if r.ok? {
+    return r.unwrap
+  }
+  s.size > 0 && s[0] == 45 ? -MAX_FLOAT : MAX_FLOAT
+}
+
+# ------------------------------------------------------------------ trimming
+
+pub def trim_suffix_whitespace(b: [Byte]) -> [Byte] {
+  n = b.size - 1
+  while n >= 0 && is_ws(b[n]) { n -= 1 }
+  b[0...n + 1]
+}
+
+# b without a valid JSON string at its end.
+pub def trim_suffix_string(b0: [Byte]) -> [Byte] {
+  b = b0
+  b = b[0...b.size - 1] if b.size > 0 && b[b.size - 1] == 34
+  while b.size >= 2 && !(b[b.size - 1] == 34 && b[b.size - 2] != 92) {
+    b = b[0...b.size - 1]
+  }
+  b = b[0...b.size - 1] if b.size > 0 && b[b.size - 1] == 34
+  b
+}
+
+pub def trim_suffix_byte(b: [Byte], c: Byte) -> [Byte] {
+  return b[0...b.size - 1] if b.size > 0 && b[b.size - 1] == c
+  b
+}

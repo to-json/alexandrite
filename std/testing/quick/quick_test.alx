@@ -87,9 +87,85 @@ test "Failure" { |t|
   }
 }
 
-# Go's TestRecursive and TestMutuallyRecursive build types holding
-# themselves through pointers; alx values can't contain themselves (not
-# even through slices), so there's nothing to check.
+# Recursive data structures didn't terminate (Go's issues 8818 and 11148).
+# Go's pointers become optionals. Go's MapR (map[*R]*R) has no counterpart:
+# alx map keys are integers, Str or Bool.
+struct R {
+  ptr: R?
+  slice_p: [R?]
+  slice: [R]
+  map: Map[Int, R]
+  map_p: Map[Int, R?]
+  slice_map: [Map[Int, R]]
+
+  def self.arbitrary(r: rand.Rand, size: Int) -> R {
+    s = field_size(size, 6)
+    R.new(
+      ptr: opt_of(Arb[R].gen).generate(r, s),
+      slice_p: slice_of(opt_of(Arb[R].gen)).generate(r, s),
+      slice: slice_of(Arb[R].gen).generate(r, s),
+      map: map_of(int, Arb[R].gen).generate(r, s),
+      map_p: map_of(int, opt_of(Arb[R].gen)).generate(r, s),
+      slice_map: slice_of(map_of(int, Arb[R].gen)).generate(r, s),
+    )
+  }
+}
+
+def larger(a: Int, b: Int) -> Int { a > b ? a : b }
+
+# How deep an R goes.
+def depth(x: R) -> Int {
+  d = 0
+  if p = x.ptr { d = larger(d, depth(p)) }
+  for e in x.slice_p {
+    if p = e { d = larger(d, depth(p)) }
+  }
+  for e in x.slice { d = larger(d, depth(e)) }
+  for _k, v in x.map { d = larger(d, depth(v)) }
+  for _k, v in x.map_p {
+    if p = v { d = larger(d, depth(p)) }
+  }
+  for m in x.slice_map {
+    for _k, v in m { d = larger(d, depth(v)) }
+  }
+  d + 1
+}
+
+test "Recursive" {
+  ~check(Arb[R].gen, none) { |_r| true }
+}
+
+# The generated values do nest (size shrinks per level, so not deeply), and
+# compare and copy like any value.
+test "Recursive values" {
+  deepest = Atomic.new(0)
+  ~check(Arb[R].gen, Config.new(max_count: 300)) { |x|
+    deepest.store(depth(x)) if depth(x) > deepest.load
+    x == x.dup
+  }
+  assert deepest.load >= 2
+  assert deepest.load < 10
+}
+
+struct A {
+  b: B?
+
+  def self.arbitrary(r: rand.Rand, size: Int) -> A {
+    A.new(b: opt_of(Arb[B].gen).generate(r, field_size(size, 1)))
+  }
+}
+
+struct B {
+  a: A?
+
+  def self.arbitrary(r: rand.Rand, size: Int) -> B {
+    B.new(a: opt_of(Arb[A].gen).generate(r, field_size(size, 1)))
+  }
+}
+
+test "MutuallyRecursive" {
+  ~check(Arb[A].gen, none) { |_a| true }
+}
 
 struct Empty {
   def self.arbitrary(_r: rand.Rand, _size: Int) -> Empty { Empty.new }

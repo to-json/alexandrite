@@ -1,0 +1,309 @@
+# Helpers for Go's html/template test tables (tables_test.alx, generated)
+# and the data of TestEscape.
+
+import "bytes"
+import "math"
+import "html"
+import "strings"
+import ttmpl "text/template"
+
+def sv(s: Str) -> ttmpl.Value { ttmpl.Value.str(s) }
+
+# Go's badMarshaler: MarshalJSON returns invalid JSON.
+#[derive(Template)]
+#[template("template.badMarshaler")]
+struct BadMarshaler {
+  #[template("MarshalJSON")]
+  pub def marshal_json -> Str { "{ foo: 'not quite valid JSON' }" }
+}
+
+# Go's goodMarshaler.
+#[derive(Template)]
+#[template("template.goodMarshaler")]
+struct GoodMarshaler {
+  #[template("MarshalJSON")]
+  pub def marshal_json -> Str { "{ \"<foo>\": \"O'Reilly\" }" }
+}
+
+# Go's jsonErrType: MarshalJSON fails.
+#[derive(Template)]
+#[template("template.jsonErrType")]
+struct JsonErrType {
+  #[template("MarshalJSON")]
+  pub def marshal_json -> ~Str {
+    fail Failure.Msg("a */ b <script c </script d <!-- e <sCrIpT f </sCrIpT")
+    ""
+  }
+}
+
+def json_err_type -> ttmpl.Value { JsonErrType.new.to_tmpl.ptr }
+
+# TestEscape's data.
+def escape_data -> ttmpl.Value {
+  ttmpl.Value.struct_of("struct { F bool; T bool; C string; G string; H string; I string; A []string; E []string; B json.Marshaler; M json.Marshaler; N int; U interface {}; Z *int; W template.HTML }", ["F", "T", "C", "G", "H", "I", "A", "E", "B", "M", "N", "U", "Z", "W"], [
+    ttmpl.Value.bool(false),
+    ttmpl.Value.bool(true),
+    sv("<Cincinnati>"),
+    sv("<Goodbye>"),
+    sv("<Hello>"),
+    sv("${ asd `` }"),
+    ttmpl.Value.list_of([sv("<a>"), sv("<b>")], "[]string"),
+    ttmpl.Value.list_of([], "[]string"),
+    BadMarshaler.new.to_tmpl.ptr,
+    GoodMarshaler.new.to_tmpl.ptr,
+    ttmpl.Value.int(42),
+    ttmpl.Value.nil_of("interface {}"),
+    ttmpl.Value.nil_of("*int"),
+    html("&iexcl;<b class=\"foo\">Hello</b>, <textarea>O'World</textarea>!"),
+  ])
+}
+
+def exec_buf(t: Template, data: ttmpl.Value) -> (Str, Str) {
+  b = bytes.new_buffer([])
+  r = t.execute(b, data)
+  (b.string, r.err?.message || "")
+}
+
+def check_escape(name: Str, input: Str, output: Str) {
+  tmpl = must(new(name).parse(input))
+  data = escape_data()
+  got, err = exec_buf(tmpl, data)
+  assert err == "", "#{name}: template execution failed: #{err}"
+  assert_eq got, output
+  got2, err2 = exec_buf(tmpl, data.ptr)
+  assert err2 == "", "#{name}: template execution failed for pointer: #{err2}"
+  assert_eq got2, output
+}
+
+# TestEscapeSet's data: a recursive tree (built as values).
+def data_item(x: Str, kids: [ttmpl.Value]) -> ttmpl.Value {
+  ttmpl.Value.struct_of("template.dataItem", ["Children", "X"], [kids.size == 0 ? ttmpl.Value.nil_of("[]*template.dataItem") : ttmpl.Value.list_of(kids, "[]*template.dataItem"), sv(x)]).ptr
+}
+
+def check_escape_set(inputs: Map[Str, Str], want: Str) {
+  data = data_item("", [data_item("foo", []), data_item("<bar>", []), data_item("", [data_item("baz", [])])]).elem
+  # pred is a template function that returns the predecessor of a natural
+  # number for testing recursive templates.
+  pred = ttmpl.Func.of("func(...interface {}) (interface {}, error)", ->(a: [ttmpl.Value]) -> ~ttmpl.Value {
+    if a.size == 1 && a[0].kind == ttmpl.KIND_INT && a[0].type_name == "int" && a[0].int_val > 0 {
+      return ttmpl.Value.int(a[0].int_val - 1)
+    }
+    fail Failure.Msg("undefined pred(#{ttmpl.go_sprint([ttmpl.Value.list(a)])})")
+    ttmpl.Value.invalid
+  })
+  source = ""
+  for name, body in inputs {
+    source = source + "{{define #{strconv_quote(name)}}}#{body}{{end}} "
+  }
+  tmpl = new("root").funcs({"pred" => pred}).parse(source).unwrap
+  b = bytes.new_buffer([])
+  r = tmpl.execute_template(b, "main", data)
+  assert r.ok?, r.err?.message || ""
+  assert_eq b.string, want
+}
+
+def strconv_quote(s: Str) -> Str { gq(s) }
+
+def check_errors(input: Str, err: Str) {
+  tmpl = new("z").parse(input).unwrap
+  b = bytes.new_buffer([])
+  r = tmpl.execute(b, ttmpl.Value.invalid)
+  got = r.err?.message || ""
+  if err == "" {
+    assert got == "", "input=#{input}: unexpected error #{got}"
+    return nil
+  }
+  assert strings.contains(got, err), "input=#{input}: error #{got} does not contain #{err}"
+  # Check that we get the same error if we call Execute again.
+  r2 = tmpl.execute(b, ttmpl.Value.invalid)
+  assert_eq r2.err?.message || "", got
+  nil
+}
+
+def tctx(state: Int, delim: Int, url_part: Int, js_ctx: Int, depth: [Int], set: Bool, attr: Int, element: Int) -> Context {
+  Context.new(state: state, delim: delim, url_part: url_part, js_ctx: js_ctx, js_brace_depth: depth, jsbd_set: set, attr: attr, element: element)
+}
+
+def check_escape_text(input: Str, output: Context) {
+  e = make_escaper({}, ttmpl.new(""))
+  n = parse.new_identifier("x").new_text(0, input)
+  c = e.escape_text!(ctx(STATE_TEXT), n)
+  assert output.eq(c), "input #{input}: want context #{output.to_s} got #{c.to_s}"
+  assert_eq n.text, input
+}
+
+def check_ensure_pipeline_contains(input: Str, output: Str, ids: [Str]) {
+  tmpl = ttmpl.must(ttmpl.new("test").parse(input))
+  action = tmpl.tree.unwrap.root.unwrap.nodes[0]
+  assert_eq action.typ, parse.NODE_ACTION
+  pipe = action.pipe.unwrap
+  ensure_pipeline_contains(pipe, ids)
+  assert_eq pipe.to_s, output
+}
+
+def check_escape_malformed_pipelines(t: Str) {
+  tmpl = new("test").parse(t).unwrap
+  assert tmpl.execute_str(ttmpl.Value.invalid).err?, "Expected error for #{t}"
+}
+
+def check_cve202656858(name: Str, tmpl_text: Str, input: Str, want: Str) {
+  tmpl = must(new("test").parse(tmpl_text))
+  assert_eq tmpl.execute_str(sv(input)).unwrap, want
+}
+
+TYPED_DATA_COUNT = 9
+
+def typed_data -> [ttmpl.Value] {
+  [
+    sv("<b> \"foo%\" O'Reilly &bar;"),
+    css("a[href =~ \"//example.com\"]#foo"),
+    html("Hello, <b>World</b> &amp;tc!"),
+    html_attr(" dir=\"ltr\""),
+    js("c && alert(\"Hello, World!\");"),
+    js_str("Hello, World & O'Reilly\\u0021"),
+    url("greeting=H%69,&addressee=(World)"),
+    srcset("greeting=H%69,&addressee=(World) 2x, https://golang.org/favicon.ico 500.5w"),
+    url(",foo/,"),
+  ]
+}
+
+def check_typed_content(input: Str, want: [Str]) {
+  tmpl = must(new("x").parse(input))
+  pre = input.byteindex("{{.}}")
+  post = input.size - (pre + 5)
+  i = 0
+  for x in typed_data() {
+    got = tmpl.execute_str(x).unwrap
+    assert_eq got[pre...got.size - post], want[i]
+    i += 1
+  }
+}
+
+def check_find_end_tag(s: Str, tag: Str, want: Int) {
+  assert_eq index_tag_end(s, tag), want
+}
+
+def check_ends_with_csskeyword(c: Str, kw: Str, want: Bool) {
+  assert ends_with_css_keyword(c, kw) == want, "css=#{c}, kw=#{kw}"
+}
+
+def check_is_cssnmchar(r: Rune, want: Bool) {
+  assert is_css_nmchar(r) == want, "#{r}"
+}
+
+def check_decode_css(c: Str, want: Str) {
+  got1 = decode_css(c)
+  assert_eq got1, want
+  recoded = css_escaper([sv(got1)])
+  assert_eq decode_css(recoded), want
+}
+
+def check_skip_cssspace(c: Str, want: Str) { assert_eq skip_css_space(c), want }
+
+def check_cssvalue_filter(c: Str, want: Str) { assert_eq css_value_filter([sv(c)]), want }
+
+def check_next_js_ctx(js_ctx: Int, s: Str) {
+  assert_eq next_js_ctx(s, JS_CTX_REGEXP), js_ctx
+  assert_eq next_js_ctx(s, JS_CTX_DIV_OP), js_ctx
+}
+
+def check_jsval_escaper(x: ttmpl.Value, js_: Str, skip_nest: Bool) {
+  assert_eq js_val_escaper([x]), js_
+  return nil if skip_nest
+  # Make sure that escaping corner cases are not broken by nesting.
+  a = ttmpl.Value.list([x])
+  assert_eq js_val_escaper([a]), "[" + strings.trim_space(js_) + "]"
+  nil
+}
+
+def check_jsstr_escaper(x: ttmpl.Value, esc: Str) { assert_eq js_str_escaper([x]), esc }
+
+def check_jsregexp_escaper(x: ttmpl.Value, esc: Str) { assert_eq js_regexp_escaper([x]), esc }
+
+def escaper_named(name: Str, s: Str) -> Str {
+  a = [sv(s)]
+  case name {
+    "jsStrEscaper" => js_str_escaper(a)
+    "jsRegexpEscaper" => js_regexp_escaper(a)
+    "urlEscaper" => url_escaper(a)
+    "urlNormalizer" => url_normalizer(a)
+    _ => ""
+  }
+}
+
+def check_escapers_on_lower_input(s: Str) {}
+
+def check_urlfilters_input(s: Str) {}
+
+def check_escapers_on_lower7_and_select_high_codepoints(name: Str, escaper: Str, escaped: Str) {
+  input = lower7_input()
+  assert_eq escaper_named(escaper, input), escaped
+  # Escape it rune by rune to make sure that any fast-path checking does
+  # not break escaping.
+  out: [Str] = []
+  for r in input.runes {
+    out << escaper_named(escaper, Str.from_bytes(utf8_encode(r)))
+  }
+  assert_eq out.join(""), escaped
+}
+
+def check_urlfilters(name: Str, escaper: Str, escaped: Str) {
+  assert_eq escaper_named(escaper, url_filters_input()), escaped
+}
+
+def check_is_js_mime_type(i: Str, o: Bool) { assert is_js_type(i) == o, i }
+
+def check_urlnormalizer(u: Str, want: Str) {
+  assert_eq url_normalizer([sv(u)]), want
+  assert_eq url_normalizer([sv(want)]), want
+}
+
+def check_srcset_filter(name: Str, input: Str, want: Str) {
+  assert_eq srcset_filter_and_escaper([sv(input)]), want
+}
+
+def check_strip_tags(input: Str, want: Str) { assert_eq strip_tags(input), want }
+
+def utf8_encode(r: Rune) -> [Byte] { utf8.encode_rune(r) }
+
+LOWER7 = "\x00\x01\x02\x03\x04\x05\x06\x07\x08\t\n\x0b\x0c\r\x0e\x0f\x10\x11\x12\x13\x14\x15\x16\x17\x18\x19\x1a\x1b\x1c\x1d\x1e\x1f !\"\#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~\x7f"
+
+test "html nospace escaper" {
+  bad = Str.from_bytes([0x96])
+  input = LOWER7 + "\u00A0\u0100\u2028\u2029\ufeff\ufdec𝄞" + "erroneous" + bad + "0"
+  want = "&#xfffd;\x01\x02\x03\x04\x05\x06\x07\x08&#9;&#10;&#11;&#12;&#13;\x0e\x0f\x10\x11\x12\x13\x14\x15\x16\x17\x18\x19\x1a\x1b\x1c\x1d\x1e\x1f&#32;!&#34;\#$%&amp;&#39;()*&#43;,-./0123456789:;&lt;&#61;&gt;?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_&#96;abcdefghijklmnopqrstuvwxyz{|}~\x7f\u00A0\u0100\u2028\u2029\ufeff&#xfdec;𝄞erroneous&#xfffd;0"
+  got = html_nospace_escaper([sv(input)])
+  assert_eq got, want
+  repl = strings.replace_all(strings.replace_all(input, "\x00", "\ufffd"), bad, "\ufffd")
+  assert_eq html.unescape_string(got), repl
+}
+
+test "css escaper" {
+  input = LOWER7 + "\u00A0\u0100\u2028\u2029\ufeff𝄞"
+  want = "\\0\x01\x02\x03\x04\x05\x06\x07\x08\\9 \\a\x0b\\c \\d\x0e\x0f\x10\x11\x12\x13\x14\x15\x16\x17\x18\x19\x1a\x1b\x1c\x1d\x1e\x1f !\\22\#$%\\26\\27\\28\\29*\\2b,-.\\2f 0123456789\\3a\\3b\\3c=\\3e?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\\\]^_`abcdefghijklmnopqrstuvwxyz\\7b|\\7d~\x7f\u00A0\u0100\u2028\u2029\ufeff𝄞"
+  got = css_escaper([sv(input)])
+  assert_eq got, want
+  assert_eq decode_css(got), input
+}
+
+test "hex decode" {
+  i = 0
+  while i < 0x200000 {
+    s = strconv_format_hex(i)
+    assert_eq hex_decode(s), i
+    assert_eq hex_decode(strings.to_upper(s)), i
+    i += 101
+  }
+}
+
+def strconv_format_hex(i: Int) -> Str {
+  d = "0123456789abcdef"
+  return "0" if i == 0
+  out = ""
+  x = i
+  while x > 0 {
+    out = d[x % 16...x % 16 + 1] + out
+    x = x / 16
+  }
+  out
+}

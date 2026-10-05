@@ -1,0 +1,203 @@
+# CSS escaping: Go's html/template/css.go.
+
+import ttmpl "text/template"
+import "unicode/utf8"
+
+# Whether the text b ends with the CSS keyword kw, case-insensitively.
+def ends_with_css_keyword(b: Str, kw: Str) -> Bool {
+  i = b.size - kw.size
+  return false if i < 0
+  if i != 0 {
+    r, _ = utf8.decode_last_rune_in_string(b[0...i])
+    return false if is_css_nmchar(r)
+  }
+  to_lower_ascii(b[i...b.size]) == kw
+}
+
+# Whether rune is allowed anywhere in a CSS identifier.
+def is_css_nmchar(r: Rune) -> Bool {
+  # Based on the CSS3 nmchar production but ignores multi-rune escape
+  # sequences.
+  # https://www.w3.org/TR/css3-syntax/#SUBTOK-nmchar
+  (97 <= r && r <= 122) || (65 <= r && r <= 90) || (48 <= r && r <= 57) || r == 45 || r == 95 || (0x80 <= r && r <= 0xd7ff) || (0xe000 <= r && r <= 0xfffd) || (0x10000 <= r && r <= 0x10ffff)
+}
+
+# Decodes CSS3 escapes given a sequence of stringchars. If there is no
+# change, it returns the input, otherwise it returns a new string.
+def decode_css(s0: Str) -> Str {
+  return s0 if index_byte(s0, 92) == -1
+  s = s0
+  b: [Byte] = []
+  while s.size != 0 {
+    i = index_byte(s, 92)
+    i = s.size if i == -1
+    for x in s[0...i].bytes { b << x }
+    s = s[i...s.size]
+    break if s.size < 2
+    # https://www.w3.org/TR/css3-syntax/#SUBTOK-escape
+    # escape ::= unicode | '\' [#x20-#x7E#x80-#xD7FF#xE000-#xFFFD#x10000-#x10FFFF]
+    if is_hex(s[1]) {
+      # https://www.w3.org/TR/css3-syntax/#SUBTOK-unicode
+      #   unicode ::= '\' [0-9a-fA-F]{1,6} wc?
+      j = 2
+      while j < s.size && j < 7 && is_hex(s[j]) { j += 1 }
+      r = hex_decode(s[1...j])
+      if r > 0x10FFFF {
+        r = r / 16
+        j -= 1
+      }
+      rr = r.to_i32
+      rr = utf8.RUNE_ERROR if !utf8.valid_rune(rr)
+      for x in utf8.encode_rune(rr) { b << x }
+      s = skip_css_space(s[j...s.size])
+    } else {
+      # `\\` decodes to `\` and `\"` to `"`.
+      _, n = utf8.decode_rune_at(s, 1)
+      for x in s[1...1 + n].bytes { b << x }
+      s = s[1 + n...s.size]
+    }
+  }
+  Str.from_bytes(b)
+}
+
+# Whether the given character is a hex digit.
+def is_hex(c: Byte) -> Bool {
+  (48 <= c && c <= 57) || (97 <= c && c <= 102) || (65 <= c && c <= 70)
+}
+
+# The value of the hex digits in s.
+def hex_decode(s: Str) -> Int {
+  n = 0
+  for c in s.bytes {
+    n = n << 4
+    if 48 <= c && c <= 57 {
+      n = n | (c - 48).to_i
+    } else if 97 <= c && c <= 102 {
+      n = n | (c - 97).to_i + 10
+    } else if 65 <= c && c <= 70 {
+      n = n | (c - 65).to_i + 10
+    } else {
+      panic("Bad hex digit in #{gq(s)}")
+    }
+  }
+  n
+}
+
+# Skips a single space or a CRLF sequence at the start of s.
+def skip_css_space(c: Str) -> Str {
+  return c if c.size == 0
+  # wc ::= #x9 | #xA | #xC | #xD | #x20
+  case c[0] {
+    9 | 10 | 12 | 32 => c[1...c.size]
+    13 => {
+      # This differs from CSS3's wc production because it contains a
+      # probable spec error whereby wc contains all the single byte
+      # sequences in nl (newline) but not CRLF.
+      return c[2...c.size] if c.size >= 2 && c[1] == 10
+      c[1...c.size]
+    }
+    _ => c
+  }
+}
+
+# Whether b is a CSS space char as defined in wc.
+def is_css_space(b: Byte) -> Bool {
+  b == 9 || b == 10 || b == 12 || b == 13 || b == 32
+}
+
+def css_replacement(r: Rune) -> Str {
+  case r {
+    0 => "\\0"
+    9 => "\\9"
+    10 => "\\a"
+    12 => "\\c"
+    13 => "\\d"
+    # Encode HTML specials as hex so the output can be embedded in HTML
+    # attributes without further encoding.
+    34 => "\\22"
+    38 => "\\26"
+    39 => "\\27"
+    40 => "\\28"
+    41 => "\\29"
+    43 => "\\2b"
+    47 => "\\2f"
+    58 => "\\3a"
+    59 => "\\3b"
+    60 => "\\3c"
+    62 => "\\3e"
+    92 => "\\\\"
+    123 => "\\7b"
+    125 => "\\7d"
+    _ => ""
+  }
+}
+
+# Escapes HTML and CSS special characters using \<hex>+ escapes.
+def css_escaper(args: [ttmpl.Value]) -> Str {
+  s, _ = stringify(args)
+  out: [Str] = []
+  written = 0
+  i = 0
+  while i < s.size {
+    r, w = utf8.decode_rune_at(s, i)
+    repl = r < 128 ? css_replacement(r) : ""
+    if repl == "" {
+      i += w
+      next
+    }
+    out << s[written...i]
+    out << repl
+    written = i + w
+    if repl != "\\\\" && (written == s.size || is_hex(s[written]) || is_css_space(s[written])) {
+      out << " "
+    }
+    i += w
+  }
+  return s if written == 0
+  out << s[written...s.size]
+  out.join("")
+}
+
+# Allows innocuous CSS values in the output including CSS quantities
+# (10px or 25%), ID or class literals (#foo, .bar), keyword values
+# (inherit, blue), and colors (#888). It filters out unsafe values, such as
+# those that affect token boundaries, and anything that might execute
+# scripts.
+def css_value_filter(args: [ttmpl.Value]) -> Str {
+  s, t = stringify(args)
+  return s if t == CONTENT_CSS
+  b = decode_css(s)
+  id: [Byte] = []
+  # CSS3 error handling is specified as honoring string boundaries per
+  # https://www.w3.org/TR/css3-syntax/#error-handling :
+  #     Malformed declarations. User agents must handle unexpected
+  #     tokens encountered while parsing a declaration by reading until
+  #     the end of the declaration, while observing the rules for
+  #     matching pairs of (), [], {}, "", and '', and correctly handling
+  #     escapes. For example, a malformed declaration may be missing a
+  #     property, colon (:) or value.
+  # So we need to make sure that values do not have mismatched bracket or
+  # quote characters to prevent the browser from restarting parsing inside
+  # a string that might embed JavaScript source.
+  i = 0
+  while i < b.size {
+    c = b[i]
+    case c {
+      0 | 34 | 39 | 40 | 41 | 47 | 59 | 64 | 91 | 92 | 93 | 96 | 123 | 125 | 60 | 62 => {
+        return FILTER_FAILSAFE
+      }
+      45 => {
+        # Disallow <!-- or -->.
+        # -- should not appear in valid identifiers.
+        return FILTER_FAILSAFE if i != 0 && b[i - 1] == 45
+      }
+      _ => {
+        id << lower_byte(c.to_i).as_u8 if c < 0x80 && is_css_nmchar(c.to_i.to_i32)
+      }
+    }
+    i += 1
+  }
+  ids = Str.from_bytes(id)
+  return FILTER_FAILSAFE if ids.byteindex("expression") >= 0 || ids.byteindex("mozbinding") >= 0
+  b
+}

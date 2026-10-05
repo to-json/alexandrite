@@ -1,0 +1,193 @@
+# HTML escaping: Go's html/template/html.go.
+
+import "strconv"
+import "strings"
+import ttmpl "text/template"
+import "unicode/utf8"
+
+# Escapes for inclusion in unquoted attribute values.
+def html_nospace_escaper(args: [ttmpl.Value]) -> Str {
+  s, t = stringify(args)
+  return FILTER_FAILSAFE if s == ""
+  if t == CONTENT_HTML {
+    return html_replacer(strip_tags(s), 3, false)
+  }
+  html_replacer(s, 2, false)
+}
+
+# Escapes for inclusion in quoted attribute values.
+def attr_escaper(args: [ttmpl.Value]) -> Str {
+  s, t = stringify(args)
+  if t == CONTENT_HTML {
+    return html_replacer(strip_tags(s), 1, true)
+  }
+  html_replacer(s, 0, true)
+}
+
+# Escapes for inclusion in an RCDATA element body.
+def rcdata_escaper(args: [ttmpl.Value]) -> Str {
+  s, t = stringify(args)
+  if t == CONTENT_HTML {
+    return html_replacer(s, 1, true)
+  }
+  html_replacer(s, 0, true)
+}
+
+# Escapes for inclusion in HTML text.
+def html_escaper(args: [ttmpl.Value]) -> Str {
+  s, t = stringify(args)
+  return s if t == CONTENT_HTML
+  html_replacer(s, 0, true)
+}
+
+# The replacement tables: 0 htmlReplacementTable, 1 htmlNormReplacementTable,
+# 2 htmlNospaceReplacementTable, 3 htmlNospaceNormReplacementTable. The
+# Norm tables don't escape '&' (it is a valid entity start in HTML).
+def html_replacement(table: Int, r: Rune) -> Str {
+  if table <= 1 {
+    return case r {
+      # U+0000 is "Reserved" so it is replaced with the replacement
+      # character.
+      0 => "�"
+      34 => "&#34;"
+      38 => table == 0 ? "&amp;" : ""
+      39 => "&#39;"
+      43 => "&#43;"
+      60 => "&lt;"
+      62 => "&gt;"
+      _ => ""
+    }
+  }
+  case r {
+    0 => "&#xfffd;"
+    9 => "&#9;"
+    10 => "&#10;"
+    11 => "&#11;"
+    12 => "&#12;"
+    13 => "&#13;"
+    32 => "&#32;"
+    34 => "&#34;"
+    38 => table == 2 ? "&amp;" : ""
+    39 => "&#39;"
+    43 => "&#43;"
+    60 => "&lt;"
+    61 => "&#61;"
+    62 => "&gt;"
+    # A parse error in the attribute value (unquoted) and before attribute
+    # value states. Treated as a quoting character by IE.
+    96 => "&#96;"
+    _ => ""
+  }
+}
+
+# The table length (Go's len(replacementTable)): runes below it are looked
+# up; others pass.
+def table_len(table: Int) -> Int { table <= 1 ? 63 : 97 }
+
+# Escapes s using the replacement table and, when bad_runes is false,
+# rewrites noncharacters as numeric entities.
+def html_replacer(s: Str, table: Int, bad_runes: Bool) -> Str {
+  out: [Str] = []
+  written = 0
+  i = 0
+  n = table_len(table)
+  while i < s.size {
+    r, w = utf8.decode_rune_at(s, i)
+    if r.to_i < n {
+      repl = html_replacement(table, r)
+      if repl.size != 0 {
+        out << s[written...i]
+        out << repl
+        written = i + w
+      }
+    } else if bad_runes {
+      # No-op. IE does not allow these ranges in unquoted attrs.
+    } else if (0xfdd0 <= r && r <= 0xfdef) || (0xfff0 <= r && r <= 0xffff) {
+      out << s[written...i]
+      out << "&#x" + strconv.format_int(r.to_i, 16) + ";"
+      written = i + w
+    }
+    i += w
+  }
+  return s if written == 0
+  out << s[written...s.size]
+  out.join("")
+}
+
+# Takes a snippet of HTML and returns only the text content. For example,
+# `<b>&iexcl;Hi!</b> <script>...</script>` -> `&iexcl;Hi! `.
+def strip_tags(html: Str) -> Str {
+  b: [Str] = []
+  s = html
+  c = ctx(STATE_TEXT)
+  i = 0
+  all_text = true
+  while i != s.size {
+    if c.delim == DELIM_NONE {
+      st = c.state
+      # Use RCDATA instead of parsing into JS or CSS styles.
+      st = STATE_RCDATA if c.element != ELEMENT_NONE && !is_in_tag(st)
+      d, nread = transition_for(st, c, s[i...s.size])
+      i1 = i + nread
+      if c.state == STATE_TEXT || c.state == STATE_RCDATA {
+        # Emit text up to the start of the tag or comment.
+        j = i1
+        if d.state != c.state {
+          j1 = j - 1
+          while j1 >= i {
+            if s[j1] == 60 {
+              j = j1
+              break
+            }
+            j1 -= 1
+          }
+        }
+        b << s[i...j]
+      } else {
+        all_text = false
+      }
+      c = d
+      i = i1
+      next
+    }
+    x = index_any(s[i...s.size], delim_ends(c.delim))
+    break if x < 0
+    i1 = i + x
+    # On exiting an attribute, we discard all state information except the
+    # state and element.
+    i1 += 1 if c.delim != DELIM_SPACE_OR_TAG_END
+    e = c.element
+    c = ctx(STATE_TAG)
+    c.element = e
+    i = i1
+  }
+  return html if all_text
+  if c.state == STATE_TEXT || c.state == STATE_RCDATA {
+    b << s[i...s.size]
+  }
+  b.join("")
+}
+
+# Accepts valid parts of an HTML attribute or tag name or a known-safe HTML
+# attribute.
+def html_name_filter(args: [ttmpl.Value]) -> Str {
+  s0, t = stringify(args)
+  return s0 if t == CONTENT_HTML_ATTR
+  return FILTER_FAILSAFE if s0.size == 0
+  s = strings.to_lower(s0)
+  if attr_type(s) != CONTENT_PLAIN {
+    # TODO: Split attr and element name part filters so we can allowlist
+    # attributes.
+    return FILTER_FAILSAFE
+  }
+  for r in s.runes {
+    if !((48 <= r && r <= 57) || (97 <= r && r <= 122)) {
+      return FILTER_FAILSAFE
+    }
+  }
+  s
+}
+
+# Elides comment content. Comments are not allowed (they're stripped), so
+# the result is always empty.
+def comment_escaper(args: [ttmpl.Value]) -> Str { "" }

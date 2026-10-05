@@ -1,0 +1,183 @@
+# URL filtering and escaping: Go's html/template/url.go.
+
+import "strings"
+import ttmpl "text/template"
+
+# Returns its input unless it contains an unsafe scheme in which case it
+# defangs the entire URL.
+#
+# Schemes that cause unintended side effects that are irreversible without
+# user interaction are considered unsafe. For example, clicking on a
+# "javascript:" link can immediately trigger JavaScript code execution.
+#
+# This filter conservatively assumes that all schemes other than the
+# following are unsafe:
+#    * http:   Navigates to a new website, and may open a new window or tab.
+#    * https:  Same as http.
+#    * mailto: Opens an email program and starts a new draft.
+#
+# This filter is applied to all URL attribute values with a URL content
+# type and to URLs in CSS and srcset.
+def url_filter(args: [ttmpl.Value]) -> Str {
+  s, t = stringify(args)
+  return s if t == CONTENT_URL
+  return "#" + FILTER_FAILSAFE if !is_safe_url(s)
+  s
+}
+
+# Whether s is a relative URL or if it has a protocol in (http, https,
+# mailto).
+def is_safe_url(s: Str) -> Bool {
+  if pr = strings.cut(s, ":") {
+    protocol = pr[0]
+    if !strings.contains(protocol, "/") {
+      if !strings.equal_fold(protocol, "http") && !strings.equal_fold(protocol, "https") && !strings.equal_fold(protocol, "mailto") {
+        return false
+      }
+    }
+  }
+  true
+}
+
+# Produces an output that can be embedded in a URL query. The output can be
+# embedded in an HTML attribute without further escaping.
+def url_escaper(args: [ttmpl.Value]) -> Str { url_processor(false, args) }
+
+# Normalizes URL content so it can be embedded in a quote-delimited string
+# or parenthesis delimited url(...). The normalizer does not encode all
+# HTML specials. Specifically, it does not encode '&' so correct embedding
+# in an HTML attribute requires escaping of '&' to '&amp;'.
+def url_normalizer(args: [ttmpl.Value]) -> Str { url_processor(true, args) }
+
+# Normalizes (when norm is true) or escapes its input to produce a valid
+# hierarchical or opaque URL part.
+def url_processor(norm0: Bool, args: [ttmpl.Value]) -> Str {
+  s, t = stringify(args)
+  norm = norm0 || t == CONTENT_URL
+  out, changed = process_url(s, norm)
+  changed ? out : s
+}
+
+HEX = "0123456789abcdef"
+
+# Normalizes or escapes s: (the result, whether anything changed).
+def process_url(s: Str, norm: Bool) -> (Str, Bool) {
+  b: [Str] = []
+  written = 0
+  # The byte loop below assumes that all URLs use UTF-8 as the
+  # content-encoding. This is similar to the URI to IRI encoding scheme
+  # defined in section 3.1 of RFC 3987, and behaves the same as the
+  # EcmaScript builtin encodeURIComponent. It should not cause any
+  # misencoding of URLs in pages with Content-type: text/html;charset=UTF-8.
+  i = 0
+  n = s.size
+  while i < n {
+    c = s[i]
+    keep = false
+    case c {
+      # Single quote and parens are sub-delims in RFC 3986, but we escape
+      # them so the output can be embedded in single quoted attributes and
+      # unquoted CSS url(...) constructs. Single quotes are reserved in
+      # URLs, but are only used in the obsolete "mark" rule in an appendix
+      # in RFC 3986 so can be safely encoded.
+      33 | 35 | 36 | 38 | 42 | 43 | 44 | 47 | 58 | 59 | 61 | 63 | 64 | 91 | 93 => keep = norm
+      # Unreserved according to RFC 3986 sec 2.3
+      # "For consistency, percent-encoded octets in the ranges of ALPHA
+      # (%41-%5A and %61-%7A), DIGIT (%30-%39), hyphen (%2D), period (%2E),
+      # underscore (%5F), or tilde (%7E) should not be created by URI
+      # producers
+      45 | 46 | 95 | 126 => keep = true
+      37 => {
+        # When normalizing do not re-encode valid escapes.
+        keep = norm && i + 2 < s.size && is_hex(s[i + 1]) && is_hex(s[i + 2])
+      }
+      _ => {
+        # Unreserved according to RFC 3986 sec 2.3
+        keep = (97 <= c && c <= 122) || (65 <= c && c <= 90) || (48 <= c && c <= 57)
+      }
+    }
+    if !keep {
+      b << s[written...i]
+      b << "%" + HEX[(c >> 4).to_i...(c >> 4).to_i + 1] + HEX[(c & 15).to_i...(c & 15).to_i + 1]
+      written = i + 1
+    }
+    i += 1
+  }
+  b << s[written...s.size]
+  (b.join(""), written != 0)
+}
+
+# Filters and normalizes srcset values which are comma separated URLs
+# followed by metadata.
+def srcset_filter_and_escaper(args: [ttmpl.Value]) -> Str {
+  s, t = stringify(args)
+  case t {
+    CONTENT_SRCSET => {
+      return s
+    }
+    CONTENT_URL => {
+      # Normalizing gets rid of all HTML whitespace which separate the image
+      # URL from its metadata.
+      out, changed = process_url(s, true)
+      x = changed ? out : s
+      # Additionally, commas separate one source from another.
+      return strings.replace_all(x, ",", "%2c")
+    }
+    _ => {}
+  }
+  b: [Str] = []
+  written = 0
+  i = 0
+  while i < s.size {
+    if s[i] == 44 {
+      b << filter_srcset_element(s, written, i)
+      b << ","
+      written = i + 1
+    }
+    i += 1
+  }
+  b << filter_srcset_element(s, written, s.size)
+  b.join("")
+}
+
+# Whether c is an HTML space character.
+def is_html_space(c: Byte) -> Bool {
+  c == 32 || c == 9 || c == 10 || c == 12 || c == 13
+}
+
+def is_html_space_or_ascii_alnum(c: Byte) -> Bool {
+  is_html_space(c) || (97 <= c && c <= 122) || (65 <= c && c <= 90) || (48 <= c && c <= 57)
+}
+
+def filter_srcset_element(s: Str, left: Int, right: Int) -> Str {
+  start = left
+  while start < right && is_html_space(s[start]) { start += 1 }
+  end = right
+  i = start
+  while i < right {
+    if is_html_space(s[i]) {
+      end = i
+      break
+    }
+    i += 1
+  }
+  url = s[start...end]
+  if is_safe_url(url) {
+    # If image metadata is only spaces or alnums then we don't need to URL
+    # normalize it.
+    metadata_ok = true
+    i = end
+    while i < right {
+      if !is_html_space_or_ascii_alnum(s[i]) {
+        metadata_ok = false
+        break
+      }
+      i += 1
+    }
+    if metadata_ok {
+      out, _ = process_url(url, true)
+      return s[left...start] + out + s[end...right]
+    }
+  }
+  "#" + FILTER_FAILSAFE
+}

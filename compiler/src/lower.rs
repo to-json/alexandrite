@@ -2617,7 +2617,7 @@ impl<'a> Lw<'a> {
                 let tag = LE::Field(Box::new(x.clone()), 0);
                 let mut slot = 1;
                 let mut shown = vec![];
-                for (name, fs) in vs {
+                for (name, fs) in vs.iter() {
                     let s = if fs.is_empty() {
                         LE::S(name.clone())
                     } else {

@@ -7,6 +7,7 @@
 //! records the concrete types it learned per binding site and the next pass
 //! starts from them. Only the final pass reports errors.
 
+use std::rc::Rc;
 use crate::ast::*;
 use crate::consts;
 use crate::diag::{Diag, SourceMap, Span};
@@ -649,13 +650,13 @@ impl<'a> World<'a> {
             visiting.push(name.to_string());
             let prev = enter_pkg(&pkg_of(name));
             let t = match d {
-                Def::S(s) => Ty::Struct(name.to_string(), fields_of(&s.fields, by_name, done, visiting, consts)?),
+                Def::S(s) => Ty::Struct(name.to_string(), Rc::new(fields_of(&s.fields, by_name, done, visiting, consts)?)),
                 Def::E(e) => {
                     let mut vs = vec![];
                     for (v, fs, _) in &e.variants {
                         vs.push((v.clone(), fields_of(fs, by_name, done, visiting, consts)?));
                     }
-                    Ty::Enum(name.to_string(), vs)
+                    Ty::Enum(name.to_string(), Rc::new(vs))
                 }
             };
             leave_pkg(prev);
@@ -713,7 +714,7 @@ impl<'a> World<'a> {
             ("TaskError", vec![("Panicked".to_string(), vec![("message".to_string(), Ty::Str)])]),
         ];
         for (n, vs) in builtins {
-            let t = Ty::Enum(n.into(), vs);
+            let t = Ty::Enum(n.into(), Rc::new(vs));
             self.structs.insert(n.into(), t.clone());
             self.errors.push(t);
         }
@@ -1278,8 +1279,8 @@ pub fn instantiate(n: &str, g: &GenDef, targs: Vec<Ty>, sp: Span, structs: &Stru
     let prev = enter_pkg(&pkg_of(n));
     let fields = |fs: &[(String, TypeExpr, Span)]| fs.iter().map(|(f, te, _)| Ok((f.clone(), type_from(te, &env, consts)?))).collect::<R<Vec<_>>>();
     let r = match g {
-        GenDef::S(d) => fields(&d.fields).map(|fs| Ty::Struct(name.clone(), fs)),
-        GenDef::E(d) => d.variants.iter().map(|(v, fs, _)| Ok((v.clone(), fields(fs)?))).collect::<R<Vec<_>>>().map(|vs| Ty::Enum(name.clone(), vs)),
+        GenDef::S(d) => fields(&d.fields).map(|fs| Ty::Struct(name.clone(), Rc::new(fs))),
+        GenDef::E(d) => d.variants.iter().map(|(v, fs, _)| Ok((v.clone(), fields(fs)?))).collect::<R<Vec<_>>>().map(|vs| Ty::Enum(name.clone(), Rc::new(vs))),
     };
     leave_pkg(prev);
     DEPTH.with(|d| d.set(d.get() - 1));
@@ -3112,9 +3113,9 @@ impl<'w, 'a> FnCx<'w, 'a> {
             Ty::Enum(_, vs) => {
                 // The first variant, with zero fields.
                 let mut slots = vec![];
-                for (_, fs) in vs.clone() {
+                for (_, fs) in vs.clone().iter() {
                     for (_, ft) in fs {
-                        slots.push(self.zero_of(&ft, sp)?);
+                        slots.push(self.zero_of(ft, sp)?);
                     }
                 }
                 TK::M(M::VariantNew(0), None, slots, None)
@@ -4712,7 +4713,7 @@ impl<'w, 'a> FnCx<'w, 'a> {
             }
             Ty::Struct(_, fields) => {
                 let mut vals = vec![];
-                for (f, ft) in fields.clone() {
+                for (f, ft) in fields.clone().iter().cloned() {
                     let v = match f.as_str() {
                         "names" => {
                             let items = files.iter().map(|(n, _)| self.mk(TK::Str(n.clone()), Ty::Str, sp)).collect();
@@ -4741,7 +4742,7 @@ impl<'w, 'a> FnCx<'w, 'a> {
             (CVal::Enum(_, k), Some(et @ Ty::Enum(..))) => {
                 let Ty::Enum(_, vs) = &et else { unreachable!() };
                 let mut slots = vec![];
-                for (_, fs) in vs {
+                for (_, fs) in vs.iter() {
                     for (_, ft) in fs {
                         slots.push(self.zero_of(ft, sp).ok_or_else(|| Diag::new(sp, format!("{} has no zero value", ft.show())))?);
                     }
@@ -5392,7 +5393,7 @@ impl<'w, 'a> FnCx<'w, 'a> {
             let tn = st.as_ref().and_then(|t| t.type_name()).map(str::to_string);
             if let Some(sn) = &tn {
                 let fs: Vec<(String, Ty)> = match &st {
-                    Some(Ty::Struct(_, fs)) => fs.clone(),
+                    Some(Ty::Struct(_, fs)) => fs.to_vec(),
                     _ => vec![],
                 };
                 let is_field = args.is_empty() && block.is_none() && fs.iter().any(|(f, _)| f == name);
@@ -5850,7 +5851,7 @@ impl<'w, 'a> FnCx<'w, 'a> {
                 return Err(Diag::new(sp, format!("`{c}.new` takes {} arguments ({}), got {}", fields.len(), fields.iter().map(|(f, _)| f.as_str()).collect::<Vec<_>>().join(", "), args.len())));
             }
             let mut vals = vec![];
-            for (a, (f, ft)) in args.iter().zip(fields) {
+            for (a, (f, ft)) in args.iter().zip(fields.iter()) {
                 let v = self.value(a)?;
                 let v = self.coerce(v, ft)?;
                 if !self.unify(&v.ty, ft) {

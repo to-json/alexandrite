@@ -1,0 +1,274 @@
+#![overflow(wrap)]
+# Package v2: Go's encoding/json/v2 (semantic JSON: marshaling typed values),
+# on compile-time derives and package encoding/json/jsontext.
+#
+#   import json "encoding/json/v2"     # the package's name is v2; alias it
+#   import "encoding/json/jsontext"
+#
+#   #[derive(Json)]
+#   struct User {
+#     #[field(json: "name")] name: Str
+#     #[field(json: "age,omitzero")] age: Int
+#     #[field(json: "tags,omitempty")] tags: [Str]
+#     #[field(json: "id,string")] id: U64
+#   }
+#
+#   b = ~json.marshal(u, [json.deterministic(true), jsontext.multiline(true)])
+#   u2: User = ~json.unmarshal(b, [json.reject_unknown_members(true)])
+#
+# The same `#[derive(Json)]` gives a type both encoding/json (v1: to_json /
+# from_json, the fast string-building path) and this package (v2: options
+# and Go's v2 semantics through a jsontext Encoder / Decoder). GO-VS-RUBY D62
+# says why v1 is not implemented on top of v2 here (Go 1.25+ does that).
+#
+#   Go                                    alx
+#   Marshal(v, opts...) ([]byte, error)   marshal(v, [opts]) -> ~[Byte]
+#   MarshalWrite(w, v, opts...)           marshal_write(w, v, [opts]) -> ~Unit
+#   MarshalEncode(enc, v, opts...)        marshal_encode(enc, v, [opts]) -> ~Unit
+#   Unmarshal(b, &v, opts...)             unmarshal(b, [opts]) -> ~T (a fresh T), or
+#                                         unmarshal_into(b, v, [opts]) -> ~T (Go's
+#                                         merge into an existing value)
+#   UnmarshalRead(r, &v, opts...)         unmarshal_read(r, [opts]) -> ~T
+#   UnmarshalDecode(dec, &v, opts...)     unmarshal_decode(dec, [opts]) -> ~T? (none: io.EOF)
+#   Options (StringifyNumbers, Deterministic, FormatNilSliceAsNull,
+#   FormatNilMapAsNull, OmitZeroStructFields, MatchCaseInsensitiveNames,
+#   RejectUnknownMembers, WithMarshalers, WithUnmarshalers, JoinOptions,
+#   GetOption, DefaultOptionsV2)          stringify_numbers(b), deterministic(b),
+#                                         format_nil_slice_as_null(b), format_nil_map_as_null(b),
+#                                         omit_zero_struct_fields(b), match_case_insensitive_names(b),
+#                                         reject_unknown_members(b), with_marshalers(m),
+#                                         with_unmarshalers(u), join_options([..]),
+#                                         jsontext.get_option(opts, setter), default_options_v2
+#   *SemanticError                        JsonError.Semantic(SemanticError): action, byte_offset,
+#                                         json_pointer, json_kind, json_value, go_type, err
+#   ErrUnknownName                        ErrCause.UnknownName
+#   MarshalerTo / UnmarshalerFrom         the protocol below (a hand-written type provides it)
+#   MarshalFunc / MarshalToFunc /         marshal_func[T](f) / marshal_to_func[T](f) /
+#   UnmarshalFunc / UnmarshalFromFunc     unmarshal_func[T](f) / unmarshal_from_func[T](f)
+#                                         (funcs.alx)
+#
+# What `#[derive(Json)]` writes for v2 (compiler/src/derive.rs), the protocol a
+# hand-written type implements instead (Go's MarshalerTo / UnmarshalerFrom):
+#
+#   def json_v2_enc(e: jsontext.Encoder, o: jsontext.Options) -> ~Unit<Error>
+#   def json_v2_dec(d: jsontext.Decoder, o: jsontext.Options) -> ~T<Error>
+#       decodes into a copy of self and returns it (Go merges into *T)
+#   def self.json_zero -> T
+#
+# plus, for a struct, json_v2_is_zero (omitzero), json_v2_fields_enc /
+# json_v2_lookup / json_v2_field_dec (so another struct can embed it).
+#
+# ---- Representation (Go's v2 rules, alx types)
+#
+#   Bool, Str, Int/I8..U64, Float    as Go's bool, string, ints, float64. `string`
+#                                    tag or stringify_numbers: numbers in strings.
+#                                    Float NaN/Inf: an error unless `format:nonfinite`.
+#   [Byte], [Byte; N]                a base64 string (Go's []byte, [N]byte);
+#                                    format: base64url, base32, base32hex, base16/hex, array
+#   [T], [T; N]                      an array ([T; N] needs exactly N elements)
+#   Map[K, V]                        an object; K: Str, an integer type, Bool, Float
+#                                    (names are the keys' text). Insertion order unless
+#                                    deterministic(true) (sorted by name)
+#   T?                               the value, or null (Go's *T); decoding into a
+#                                    present value merges into it
+#   struct                           an object (field tag options below)
+#   jsontext.Value                   raw JSON, copied (reformatted per the options)
+#   enum, tuple                      as encoding/json v1 (alx extensions; Go has neither)
+#   Complex, functions               no representation: a SemanticError at run time
+#
+# Field tags (`#[field(json: "...")]`, Go's syntax): the name (default: the alx
+# field name), `-` (skip), omitzero, omitempty, string, case:ignore,
+# case:strict, embed (a struct field's members are promoted into this object;
+# a jsontext.Value or Map[Str, V] field collects unknown members), format:...
+#
+# ---- Differences from Go, and why
+#
+#   - No reflection: marshal / unmarshal take a type that derives Json (or
+#     implements the protocol), not `any`. Top-level builtins are wrapped
+#     (jsontext.Value works as is). There is no `any`/interface{} decoding into
+#     map[string]any; use jsontext.Value (or encoding/json v1's Value / dyn.Value
+#     through a protocol type).
+#   - alx slices and maps have no nil: an empty slice or map is the zero value,
+#     so FormatNilSliceAsNull / FormatNilMapAsNull and `format:emitnull` have
+#     nothing to apply to (accepted, no effect); omitzero omits an empty one.
+#   - Default JSON names are the alx field names (snake_case), not Go's
+#     exported field names.
+#   - Embedding (`embed`) promotes a derived struct's members, but Go's
+#     breadth-first dominance rules among conflicting promoted names are
+#     simplified: the embedding struct's own fields win, then embedded ones in
+#     declaration order. Exact names are matched before folded ones per level.
+#   - Go's type names in errors: Int is "int" (alx has no separate int64), Rune
+#     "int32", Byte "uint8", Float "float64"; a derived type is its alx name
+#     unless `#[data("pkg.T")]` names it (the Go type name consumers see, S5).
+#   - Error texts always say "cannot" (Go picks "cannot" or "unable to" at
+#     random per process, so nobody matches on them).
+#   - The v1 compatibility options (Go's encoding/json flags passed to v2:
+#     MergeWithLegacySemantics, StringifyWithLegacySemantics, ...) are carried
+#     by jsontext.Options but not implemented: v1 is its own package here.
+#   - time.Time / time.Duration have no v2 format here (alx's time types don't
+#     derive Json); write the protocol for them.
+#   - WithMarshalers / WithUnmarshalers apply to types that derive Json (and to
+#     the builtin types through their own constructors); see funcs.alx.
+
+import "io"
+import "encoding/json/jsontext"
+
+# ------------------------------------------------------------------ options
+
+# Numbers as JSON strings.
+pub def stringify_numbers(v: Bool) -> jsontext.Options { jsontext.flag_option(jsontext.F_STRINGIFY_NUMBERS, v) }
+# Map members sorted by name.
+pub def deterministic(v: Bool) -> jsontext.Options { jsontext.flag_option(jsontext.F_DETERMINISTIC, v) }
+# Go: a nil slice as null (alx has no nil slices: no effect).
+pub def format_nil_slice_as_null(v: Bool) -> jsontext.Options { jsontext.flag_option(jsontext.F_FORMAT_NIL_SLICE_AS_NULL, v) }
+# Go: a nil map as null (alx has no nil maps: no effect).
+pub def format_nil_map_as_null(v: Bool) -> jsontext.Options { jsontext.flag_option(jsontext.F_FORMAT_NIL_MAP_AS_NULL, v) }
+# Leave out every struct field with a zero value.
+pub def omit_zero_struct_fields(v: Bool) -> jsontext.Options { jsontext.flag_option(jsontext.F_OMIT_ZERO_STRUCT_FIELDS, v) }
+# Match member names to fields ignoring case, '-' and '_'.
+pub def match_case_insensitive_names(v: Bool) -> jsontext.Options { jsontext.flag_option(jsontext.F_MATCH_CASE_INSENSITIVE_NAMES, v) }
+# Fail on members no struct field takes.
+pub def reject_unknown_members(v: Bool) -> jsontext.Options { jsontext.flag_option(jsontext.F_REJECT_UNKNOWN_MEMBERS, v) }
+
+# The options joined into one (Go's JoinOptions).
+pub def join_options(opts: [jsontext.Options]) -> jsontext.Options { jsontext.join_options(opts) }
+
+# Go's DefaultOptionsV2: every v1 compatibility option explicitly false.
+pub def default_options_v2 -> jsontext.Options {
+  jsontext.Options.new(presence: jsontext.F_DEFAULT_V1, values: 0)
+}
+
+# ------------------------------------------------------------------ entry points
+
+# The value as JSON (Go's Marshal): no trailing newline.
+pub def marshal[T](v: T, opts: [jsontext.Options]) -> ~[Byte]<Error> {
+  e = jsontext.new_buffered_encoder(opts)
+  ~marshal_top(e, v)
+  e.bytes
+}
+
+# (The marshal functions of WithMarshalers are tried by the type's own
+# json_v2_enc, as they are for every value inside it.)
+def marshal_top[T](e: jsontext.Encoder, v: T) -> ~Unit<Error> {
+  o = e.options
+  r = v.json_v2_enc(e, o)
+  if er = r.err {
+    e.invalidate_disabled_namespaces! if !o.get(jsontext.F_ALLOW_DUPLICATE_NAMES)
+    fail er
+  }
+  nil
+}
+
+# The value as JSON written to w (Go's MarshalWrite).
+pub def marshal_write[T](w: io.Writer, v: T, opts: [jsontext.Options]) -> ~Unit<Error> {
+  e = jsontext.new_encoder(w, opts)
+  e.set_flag!(jsontext.F_OMIT_TOP_LEVEL_NEWLINE, true)
+  ~marshal_top(e, v)
+  nil
+}
+
+# Writes the value as the next JSON value of e (Go's MarshalEncode); opts
+# apply to this call only.
+pub def marshal_encode[T](e: jsontext.Encoder, v: T, opts: [jsontext.Options]) -> ~Unit<Error> {
+  if opts.size == 0 {
+    return ~marshal_top(e, v)
+  }
+  old = e.options
+  o = old
+  o.join_all!(opts)
+  if e.need_object_name {
+    if old.get(jsontext.F_ALLOW_DUPLICATE_NAMES) != o.get(jsontext.F_ALLOW_DUPLICATE_NAMES) {
+      fail marshal_error_before(e, v.json_v2_type, ErrCause.Msg(text: "cannot change duplicate name checks after a JSON object has already begun processing"))
+    }
+    if old.get(jsontext.F_ALLOW_INVALID_UTF8) != o.get(jsontext.F_ALLOW_INVALID_UTF8) {
+      fail marshal_error_before(e, v.json_v2_type, ErrCause.Msg(text: "cannot change UTF-8 checks after a JSON object has already begun processing"))
+    }
+  }
+  if o.has(jsontext.F_MULTILINE | jsontext.F_SPACE_AFTER_COLON | jsontext.F_SPACE_AFTER_COMMA) {
+    o.initialize_multiline! if o.get(jsontext.F_MULTILINE)
+    changed = old.get(jsontext.F_MULTILINE) != o.get(jsontext.F_MULTILINE) || old.get(jsontext.F_SPACE_AFTER_COLON) != o.get(jsontext.F_SPACE_AFTER_COLON) || old.get(jsontext.F_SPACE_AFTER_COMMA) != o.get(jsontext.F_SPACE_AFTER_COMMA) || (o.get(jsontext.F_MULTILINE) && (old.indent != o.indent || old.indent_prefix != o.indent_prefix))
+    if changed {
+      fail marshal_error_before(e, v.json_v2_type, ErrCause.Msg(text: "cannot change whitespace formatting within a MarshalEncode call"))
+    }
+  }
+  e.set_options!(o)
+  r = marshal_top(e, v)
+  e.set_options!(old)
+  if er = r.err { fail er }
+  nil
+}
+
+# A T from the JSON in b (Go's Unmarshal into a zero T): exactly one value,
+# with whitespace around it.
+pub def unmarshal[T](b: [Byte], opts: [jsontext.Options]) -> ~T<Error> {
+  d = jsontext.new_bytes_decoder(b, opts)
+  ~unmarshal_top(d, T.json_zero, true)
+}
+
+# Go's Unmarshal into an existing value: objects merge into it (struct fields
+# and map entries the input doesn't mention keep their values).
+pub def unmarshal_into[T](b: [Byte], out: T, opts: [jsontext.Options]) -> ~T<Error> {
+  d = jsontext.new_bytes_decoder(b, opts)
+  ~unmarshal_top(d, out, true)
+}
+
+# A T from all of r's input (Go's UnmarshalRead).
+pub def unmarshal_read[T](r: io.Reader, opts: [jsontext.Options]) -> ~T<Error> {
+  d = jsontext.new_decoder(r, opts)
+  ~unmarshal_top(d, T.json_zero, true)
+}
+
+# The next T from a stream (Go's UnmarshalDecode); none at its end.
+pub def unmarshal_decode[T](d: jsontext.Decoder, opts: [jsontext.Options]) -> ~T?<Error> {
+  zero = T.json_zero
+  old = d.options
+  if opts.size > 0 {
+    o = old
+    o.join_all!(opts)
+    if d.need_object_name {
+      if old.get(jsontext.F_ALLOW_DUPLICATE_NAMES) != o.get(jsontext.F_ALLOW_DUPLICATE_NAMES) {
+        fail unmarshal_error_before(d, zero.json_v2_type, ErrCause.Msg(text: "cannot change duplicate name checks after a JSON object has already begun processing"))
+      }
+      if old.get(jsontext.F_ALLOW_INVALID_UTF8) != o.get(jsontext.F_ALLOW_INVALID_UTF8) {
+        fail unmarshal_error_before(d, zero.json_v2_type, ErrCause.Msg(text: "cannot change UTF-8 checks after a JSON object has already begun processing"))
+      }
+    }
+    d.set_options!(o)
+  }
+  k = d.peek_kind!
+  r = unmarshal_top(d, zero, false)
+  d.set_options!(old) if opts.size > 0
+  if er = r.err {
+    case er {
+      JsonError.Eof => { return none if k == jsontext.Kind.Invalid }
+      _ => {}
+    }
+    fail er
+  }
+  r.unwrap
+}
+
+def unmarshal_top[T](d: jsontext.Decoder, cur: T, last: Bool) -> ~T<Error> {
+  o = d.options
+  r = cur.json_v2_dec(d, o)
+  if er = r.err {
+    d.invalidate_disabled_namespaces! if !o.get(jsontext.F_ALLOW_DUPLICATE_NAMES)
+    fail eof_error(d, er, last)
+  }
+  d.~check_eof! if last
+  r.unwrap
+}
+
+# Go turns io.EOF at the top level into an unexpected-EOF SyntacticError.
+def eof_error(d: jsontext.Decoder, er: Error, last: Bool) -> Error {
+  case er {
+    JsonError.Eof => {
+      if last {
+        off = d.input_offset + d.unread_buffer.size
+        return jsontext.JsonTextError.Syntactic(e: jsontext.SyntacticError.new(byte_offset: off, json_pointer: jsontext.Pointer.new(s: ""), err: jsontext.Cause.UnexpectedEof))
+      }
+      return er
+    }
+    _ => { return er }
+  }
+}

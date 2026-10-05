@@ -1,0 +1,513 @@
+#![overflow(wrap)]
+# WithMarshalers / WithUnmarshalers (Go's arshal_funcs.go).
+#
+# Go looks a function up by the value's run-time type. Here a function's type
+# is erased into a jsontext hook that gets the value as a jsontext.Arg and
+# takes its own type back out with a `case` over the interface (D65): for a
+# type that derives Json, marshal_func[T] and its siblings; for the builtin
+# types (which can't be interface values) the *_bool, *_str, *_int, *_uint
+# and *_float variants (Go: MarshalFunc[bool], ...; the int and uint ones
+# apply to Int and U64, Go's int and uint64). A function fails with
+# JsonError.Unsupported to pass the value on to the next function or the
+# default (Go's errors.ErrUnsupported).
+
+import "encoding/json/jsontext"
+
+# Go's *Marshalers: functions tried in order.
+pub struct Marshalers {
+  hooks: [jsontext.MarshalHook]
+}
+
+# Go's *Unmarshalers.
+pub struct Unmarshalers {
+  hooks: [jsontext.UnmarshalHook]
+}
+
+# All of the functions, in order (Go's JoinMarshalers).
+pub def join_marshalers(ms: [Marshalers]) -> Marshalers {
+  hs: [jsontext.MarshalHook] = []
+  for m in ms { hs = hs + m.hooks }
+  Marshalers.new(hooks: hs)
+}
+
+pub def join_unmarshalers(us: [Unmarshalers]) -> Unmarshalers {
+  hs: [jsontext.UnmarshalHook] = []
+  for u in us { hs = hs + u.hooks }
+  Unmarshalers.new(hooks: hs)
+}
+
+# The option that uses m (Go's WithMarshalers).
+pub def with_marshalers(m: Marshalers) -> jsontext.Options {
+  o = jsontext.flag_option(jsontext.F_MARSHALERS, true)
+  o.marshalers = m.hooks
+  o
+}
+
+pub def with_unmarshalers(u: Unmarshalers) -> jsontext.Options {
+  o = jsontext.flag_option(jsontext.F_UNMARSHALERS, true)
+  o.unmarshalers = u.hooks
+  o
+}
+
+# Go's errors.ErrUnsupported, from a marshal function: not for this value.
+def unsupported?(e: Error) -> Bool {
+  case e {
+    JsonError.Unsupported => true
+    _ => false
+  }
+}
+
+def wrap_unsupported(e: Error, what: Str) -> Error {
+  return JsonError.Other(msg: what + " may not return errors.ErrUnsupported") if unsupported?(e)
+  e
+}
+
+# Runs the marshal hooks for a; true if one wrote it.
+pub def call_marshalers(e: jsontext.Encoder, a: jsontext.Arg, o: jsontext.Options) -> ~Bool<Error> {
+  for h in o.marshalers {
+    he: jsontext.HookEncoder = e
+    return true if ~h.f.call(he, a)
+  }
+  false
+}
+
+# Runs the unmarshal hooks for a; the decoded value if one decoded it.
+pub def call_unmarshalers(d: jsontext.Decoder, a: jsontext.Arg, o: jsontext.Options) -> ~jsontext.Arg?<Error> {
+  for h in o.unmarshalers {
+    hd: jsontext.HookDecoder = d
+    r = ~h.f.call(hd, a)
+    return r if r.present?
+  }
+  none
+}
+
+# Go's MarshalFunc's body, given the bytes fn made.
+def write_func_result(e: jsontext.Encoder, t: Str, r: ~[Byte]) -> ~Bool<Error> {
+  if er = r.err {
+    er2 = wrap_unsupported(er, "marshal function of type func(T) ([]byte, error)")
+    fail collapse(marshal_error_before(e, t, user_cause(er2)))
+  }
+  w = e.write_value!(jsontext.Value.new(raw: r.unwrap))
+  if er = w.err {
+    if s = jsontext.syntactic(er) { fail marshal_error_before(e, t, ErrCause.Syntax(e: s)) }
+    fail er
+  }
+  true
+}
+
+# Go's MarshalToFunc's body around fn(e, v): fn must write exactly one value.
+def run_to_func(e: jsontext.Encoder, t: Str, f: () -> ~Unit) -> ~Bool<Error> {
+  d0, l0 = depth_length(e.stack_depth, e.stack_index(e.stack_depth)[1])
+  e.set_flag!(jsontext.F_WITHIN_ARSHAL_CALL, true)
+  r = f.call()
+  e.set_flag!(jsontext.F_WITHIN_ARSHAL_CALL, false)
+  d1, l1 = depth_length(e.stack_depth, e.stack_index(e.stack_depth)[1])
+  er: Error? = r.err
+  if er.none? && (d0 != d1 || l0 + 1 != l1) {
+    er = JsonError.Other(msg: "must read or write exactly one value")
+  }
+  if x = er {
+    if unsupported?(x) {
+      return false if d0 == d1 && l0 == l1
+      fail semantic_with_position(e.output_offset + e.count_next_delim_whitespace, e.pointer_at(position_where(d0, l0, d1, l1)), "marshal", t, ErrCause.Msg(text: "unsupported calls must not read or write any tokens"))
+    }
+    case x {
+      jsontext.JsonTextError.Io(_a, _m) => { fail x }
+      _ => {}
+    }
+    fail semantic_with_position(e.output_offset + e.count_next_delim_whitespace, e.pointer_at(position_where(d0, l0, d1, l1)), "marshal", t, user_cause(x))
+  }
+  true
+}
+
+def depth_length(depth: Int, length: Int) -> (Int, Int) { (depth, length) }
+
+def position_where(d0: Int, l0: Int, d1: Int, l1: Int) -> Int {
+  return 1 if d0 == d1 && l0 == l1
+  return -1 if d0 == d1 && l0 + 1 == l1
+  0
+}
+
+# Go's newSemanticErrorWithPosition for a function's error: a SemanticError
+# keeps its own position (collapsed into this one), anything else is wrapped.
+def semantic_with_position(off: Int, ptr: jsontext.Pointer, action: Str, t: Str, c: ErrCause) -> JsonError {
+  sem(action, off, ptr, jsontext.Kind.Invalid, "", t, c)
+}
+
+# The cause for a user function's error: a SemanticError it returned is
+# collapsed into the new one by its message.
+def user_cause(e: Error) -> ErrCause {
+  if s = semantic(e) { return ErrCause.Msg(text: s.message) }
+  cause_of(e)
+}
+
+def collapse(e: JsonError) -> JsonError { e }
+
+# ------------------------------------------------------------------ derived types
+
+# Go's MarshalFunc for a type that derives Json: fn's bytes are the value's JSON.
+pub def marshal_func[T](f: (T) -> ~[Byte]) -> Marshalers {
+  h = jsontext.MarshalHook.new(f: ->(he: jsontext.HookEncoder, a: jsontext.Arg) -> ~Bool {
+    case he {
+      jsontext.Encoder(e) => {
+        case a {
+          O(m) => {
+            case m {
+              T(v) => { return ~write_func_result(e, v.json_v2_type, f.call(v)) }
+              _ => {}
+            }
+          }
+          _ => {}
+        }
+      }
+      _ => {}
+    }
+    false
+  })
+  Marshalers.new(hooks: [h])
+}
+
+# Go's MarshalToFunc: fn writes the value to the Encoder (exactly one value),
+# or fails with JsonError.Unsupported (having written nothing) to pass it on.
+pub def marshal_to_func[T](f: (jsontext.Encoder, T) -> ~Unit) -> Marshalers {
+  h = jsontext.MarshalHook.new(f: ->(he: jsontext.HookEncoder, a: jsontext.Arg) -> ~Bool {
+    case he {
+      jsontext.Encoder(e) => {
+        case a {
+          O(m) => {
+            case m {
+              T(v) => { return ~run_to_func(e, v.json_v2_type, ->() -> ~Unit { f.call(e, v) }) }
+              _ => {}
+            }
+          }
+          _ => {}
+        }
+      }
+      _ => {}
+    }
+    false
+  })
+  Marshalers.new(hooks: [h])
+}
+
+# Go's UnmarshalFunc: fn gets the next JSON value and the current value, and
+# returns the new one.
+pub def unmarshal_func[T](f: ([Byte], T) -> ~T) -> Unmarshalers {
+  h = jsontext.UnmarshalHook.new(f: ->(hd: jsontext.HookDecoder, a: jsontext.Arg) -> ~jsontext.Arg? {
+    case hd {
+      jsontext.Decoder(d) => {
+        case a {
+          O(m) => {
+            case m {
+              T(v) => {
+                val = d.~read_value!
+                b = val?.raw || []
+                r = f.call(b, v)
+                if er = r.err {
+                  fail unmarshal_error_after(d, v.json_v2_type, user_cause(wrap_unsupported(er, "unmarshal function of type func([]byte, T) error")))
+                }
+                return jsontext.Arg.O(r.unwrap)
+              }
+              _ => {}
+            }
+          }
+          _ => {}
+        }
+      }
+      _ => {}
+    }
+    none
+  })
+  Unmarshalers.new(hooks: [h])
+}
+
+# Go's UnmarshalFromFunc: fn reads exactly one value from the Decoder (or
+# fails with JsonError.Unsupported having read nothing).
+pub def unmarshal_from_func[T](f: (jsontext.Decoder, T) -> ~T) -> Unmarshalers {
+  h = jsontext.UnmarshalHook.new(f: ->(hd: jsontext.HookDecoder, a: jsontext.Arg) -> ~jsontext.Arg? {
+    case hd {
+      jsontext.Decoder(d) => {
+        case a {
+          O(m) => {
+            case m {
+              T(v) => {
+                r = ~run_from_func(d, v.json_v2_type, ->() -> ~jsontext.Arg? {
+                  x = ~f.call(d, v)
+                  jsontext.Arg.O(x)
+                })
+                return r
+              }
+              _ => {}
+            }
+          }
+          _ => {}
+        }
+      }
+      _ => {}
+    }
+    none
+  })
+  Unmarshalers.new(hooks: [h])
+}
+
+def run_from_func(d: jsontext.Decoder, t: Str, f: () -> ~jsontext.Arg?) -> ~jsontext.Arg?<Error> {
+  d0 = d.stack_depth
+  l0 = d.stack_index(d0)[1]
+  if d0 == 0 && d.at_eof! {
+    fail JsonError.Eof
+  }
+  d.set_flag!(jsontext.F_WITHIN_ARSHAL_CALL, true)
+  r = f.call()
+  d.set_flag!(jsontext.F_WITHIN_ARSHAL_CALL, false)
+  d1 = d.stack_depth
+  l1 = d.stack_index(d1)[1]
+  er: Error? = r.err
+  if er.none? && (d0 != d1 || l0 + 1 != l1) {
+    er = JsonError.Other(msg: "must read or write exactly one value")
+  }
+  if x = er {
+    if unsupported?(x) {
+      return none if d0 == d1 && l0 == l1
+      fail sem("unmarshal", d.input_offset, d.pointer_at(position_where(d0, l0, d1, l1)), jsontext.Kind.Invalid, "", t, ErrCause.Msg(text: "unsupported calls must not read or write any tokens"))
+    }
+    if jsontext.syntactic(x).present? { fail x }
+    case x {
+      jsontext.JsonTextError.Io(_a, _m) => { fail x }
+      _ => {}
+    }
+    fail sem("unmarshal", d.input_offset, d.pointer_at(position_where(d0, l0, d1, l1)), jsontext.Kind.Invalid, "", t, user_cause(x))
+  }
+  r.unwrap
+}
+
+# ------------------------------------------------------------------ builtin types
+
+def marshal_func_for(kind: Int, f: (jsontext.Arg) -> ~[Byte]?) -> Marshalers {
+  h = jsontext.MarshalHook.new(f: ->(he: jsontext.HookEncoder, a: jsontext.Arg) -> ~Bool {
+    case he {
+      jsontext.Encoder(e) => {
+        if b = ~f.call(a) {
+          return ~write_func_result(e, arg_type(a), b)
+        }
+      }
+      _ => {}
+    }
+    false
+  })
+  Marshalers.new(hooks: [h])
+}
+
+def arg_type(a: jsontext.Arg) -> Str {
+  case a {
+    B(_v) => "bool"
+    S(_v) => "string"
+    I(_v, t) => t
+    U(_v, t) => t
+    F(_v, t) => t
+    O(m) => m.json_v2_type
+  }
+}
+
+# MarshalFunc[bool].
+pub def marshal_func_bool(f: (Bool) -> ~[Byte]) -> Marshalers {
+  marshal_func_for(0, ->(a: jsontext.Arg) -> ~[Byte]? {
+    case a {
+      B(v) => { return ~f.call(v) }
+      _ => { return none }
+    }
+  })
+}
+
+# MarshalFunc[string].
+pub def marshal_func_str(f: (Str) -> ~[Byte]) -> Marshalers {
+  marshal_func_for(1, ->(a: jsontext.Arg) -> ~[Byte]? {
+    case a {
+      S(v) => { return ~f.call(v) }
+      _ => { return none }
+    }
+  })
+}
+
+# MarshalFunc[int] (alx Int).
+pub def marshal_func_int(f: (Int) -> ~[Byte]) -> Marshalers {
+  marshal_func_for(2, ->(a: jsontext.Arg) -> ~[Byte]? {
+    case a {
+      I(v, t) => {
+        return none if t != "int"
+        return ~f.call(v)
+      }
+      _ => { return none }
+    }
+  })
+}
+
+# MarshalFunc[uint64] (alx U64).
+pub def marshal_func_uint(f: (U64) -> ~[Byte]) -> Marshalers {
+  marshal_func_for(3, ->(a: jsontext.Arg) -> ~[Byte]? {
+    case a {
+      U(v, t) => {
+        return none if t != "uint64"
+        return ~f.call(v)
+      }
+      _ => { return none }
+    }
+  })
+}
+
+# MarshalFunc[float64] (alx Float).
+pub def marshal_func_float(f: (Float) -> ~[Byte]) -> Marshalers {
+  marshal_func_for(4, ->(a: jsontext.Arg) -> ~[Byte]? {
+    case a {
+      F(v, _t) => { return ~f.call(v) }
+      _ => { return none }
+    }
+  })
+}
+
+def marshal_to_func_for(f: (jsontext.Encoder, jsontext.Arg) -> ~Bool) -> Marshalers {
+  h = jsontext.MarshalHook.new(f: ->(he: jsontext.HookEncoder, a: jsontext.Arg) -> ~Bool {
+    case he {
+      jsontext.Encoder(e) => {
+        return ~run_to_func(e, arg_type(a), ->() -> ~Unit {
+          ~f.call(e, a)
+          nil
+        })
+      }
+      _ => {}
+    }
+    false
+  })
+  Marshalers.new(hooks: [h])
+}
+
+# MarshalToFunc[bool].
+pub def marshal_to_func_bool(f: (jsontext.Encoder, Bool) -> ~Unit) -> Marshalers {
+  marshal_to_func_for(->(e: jsontext.Encoder, a: jsontext.Arg) -> ~Bool {
+    case a {
+      B(v) => {
+        ~f.call(e, v)
+        return true
+      }
+      _ => { fail JsonError.Unsupported }
+    }
+  })
+}
+
+# MarshalToFunc[string].
+pub def marshal_to_func_str(f: (jsontext.Encoder, Str) -> ~Unit) -> Marshalers {
+  marshal_to_func_for(->(e: jsontext.Encoder, a: jsontext.Arg) -> ~Bool {
+    case a {
+      S(v) => {
+        ~f.call(e, v)
+        return true
+      }
+      _ => { fail JsonError.Unsupported }
+    }
+  })
+}
+
+# MarshalToFunc[int].
+pub def marshal_to_func_int(f: (jsontext.Encoder, Int) -> ~Unit) -> Marshalers {
+  marshal_to_func_for(->(e: jsontext.Encoder, a: jsontext.Arg) -> ~Bool {
+    case a {
+      I(v, t) => {
+        fail JsonError.Unsupported if t != "int"
+        ~f.call(e, v)
+        return true
+      }
+      _ => { fail JsonError.Unsupported }
+    }
+  })
+}
+
+def unmarshal_func_for(accepts: (jsontext.Arg) -> Bool, f: ([Byte], jsontext.Arg) -> ~jsontext.Arg) -> Unmarshalers {
+  h = jsontext.UnmarshalHook.new(f: ->(hd: jsontext.HookDecoder, a: jsontext.Arg) -> ~jsontext.Arg? {
+    return none if !accepts.call(a)
+    case hd {
+      jsontext.Decoder(d) => {
+        val = d.~read_value!
+        b = val?.raw || []
+        r = f.call(b, a)
+        if er = r.err {
+          fail unmarshal_error_after(d, arg_type(a), user_cause(wrap_unsupported(er, "unmarshal function of type func([]byte, T) error")))
+        }
+        return r.unwrap
+      }
+      _ => {}
+    }
+    none
+  })
+  Unmarshalers.new(hooks: [h])
+}
+
+# UnmarshalFunc[bool].
+pub def unmarshal_func_bool(f: ([Byte], Bool) -> ~Bool) -> Unmarshalers {
+  unmarshal_func_for(->(a: jsontext.Arg) -> Bool {
+    case a {
+      B(_v) => true
+      _ => false
+    }
+  }, ->(b: [Byte], a: jsontext.Arg) -> ~jsontext.Arg {
+    v = false
+    case a {
+      B(x) => { v = x }
+      _ => {}
+    }
+    jsontext.Arg.B(~f.call(b, v))
+  })
+}
+
+# UnmarshalFunc[string].
+pub def unmarshal_func_str(f: ([Byte], Str) -> ~Str) -> Unmarshalers {
+  unmarshal_func_for(->(a: jsontext.Arg) -> Bool {
+    case a {
+      S(_v) => true
+      _ => false
+    }
+  }, ->(b: [Byte], a: jsontext.Arg) -> ~jsontext.Arg {
+    v = ""
+    case a {
+      S(x) => { v = x }
+      _ => {}
+    }
+    jsontext.Arg.S(~f.call(b, v))
+  })
+}
+
+# UnmarshalFunc[int].
+pub def unmarshal_func_int(f: ([Byte], Int) -> ~Int) -> Unmarshalers {
+  unmarshal_func_for(->(a: jsontext.Arg) -> Bool {
+    case a {
+      I(_v, t) => t == "int"
+      _ => false
+    }
+  }, ->(b: [Byte], a: jsontext.Arg) -> ~jsontext.Arg {
+    v = 0
+    case a {
+      I(x, _t) => { v = x }
+      _ => {}
+    }
+    jsontext.Arg.I(~f.call(b, v), "int")
+  })
+}
+
+# UnmarshalFunc[float64].
+pub def unmarshal_func_float(f: ([Byte], Float) -> ~Float) -> Unmarshalers {
+  unmarshal_func_for(->(a: jsontext.Arg) -> Bool {
+    case a {
+      F(_v, _t) => true
+      _ => false
+    }
+  }, ->(b: [Byte], a: jsontext.Arg) -> ~jsontext.Arg {
+    v = 0.0
+    t = "float64"
+    case a {
+      F(x, tt) => {
+        v = x
+        t = tt
+      }
+      _ => {}
+    }
+    jsontext.Arg.F(~f.call(b, v), t)
+  })
+}

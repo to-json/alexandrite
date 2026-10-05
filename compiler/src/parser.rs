@@ -403,8 +403,36 @@ impl<'a> Parser<'a> {
             types.local.insert(e.name.clone(), jobs.iter().any(|j| j.name == e.name));
             types.enums.insert(e.name.clone());
         }
-        for job in &jobs {
+        // encoding/json/v2's methods, for files that use v2 (derive_json2.rs).
+        let wants_v2 = m.imports.iter().any(|i| i.path == "encoding/json/v2" || i.path == "encoding/json/jsontext");
+        let mut v2_texts = vec![];
+        if wants_v2 {
+            let mut alias_of = |path: &str, fallback: &str| match m.imports.iter().find(|i| i.path == path) {
+                Some(i) => import_name(i),
+                None => {
+                    m.imports.push(Import { alias: Some(fallback.into()), path: path.into(), span: jobs[0].span });
+                    fallback.to_string()
+                }
+            };
+            let j2 = alias_of("encoding/json/v2", "alxjson2");
+            let jt = alias_of("encoding/json/jsontext", "alxjsontext");
+            let go_names: std::collections::HashMap<String, String> = jobs.iter().filter_map(|j| j.go_name.clone().map(|g| (j.name.clone(), g))).collect();
+            let cx = crate::derive_json2::Ctx { j: &j2, t: &jt, types: &types, go_names: &go_names };
+            for job in &jobs {
+                let gn = job.go_name.clone().unwrap_or_else(|| job.name.clone());
+                v2_texts.push(crate::derive_json2::json2_source(job, &gn, &cx)?);
+            }
+        }
+        for (k, job) in jobs.iter().enumerate() {
             let text = crate::derive::json_source(job, &alias, &types)?;
+            // One struct body: v1's methods, then v2's (both texts are `struct Name { ... }`).
+            let text = if wants_v2 {
+                let v1 = &text[..text.rfind('}').unwrap()];
+                let v2 = &v2_texts[k];
+                format!("{v1}{}", &v2[v2.find('\n').unwrap() + 1..])
+            } else {
+                text
+            };
             if std::env::var("ALX_DERIVE_DEBUG").is_ok() {
                 eprintln!("{text}");
             }
@@ -843,12 +871,12 @@ impl<'a> Parser<'a> {
         }
         let span = start.to(self.prev_span());
         if derives.iter().any(|d| d == "Data") {
-            let job = crate::derive::DeriveJob { name: name.clone(), tparams: tparams.iter().map(|t| t.name.clone()).collect(), public: false, span, shape: crate::derive::DShape::Enum(dvariants.clone()) };
+            let job = crate::derive::DeriveJob { name: name.clone(), go_name: data_name.clone(), tparams: tparams.iter().map(|t| t.name.clone()).collect(), public: false, span, shape: crate::derive::DShape::Enum(dvariants.clone()) };
             let ms = data_methods(methods, &mopts);
-            self.djobs.push(crate::derive_data::DataJob { job, go_name: data_name, methods: ms });
+            self.djobs.push(crate::derive_data::DataJob { job, go_name: data_name.clone(), methods: ms });
         }
         if derives.iter().any(|d| d == "Json") {
-            self.jobs.push(crate::derive::DeriveJob { name: name.clone(), tparams: tparams.iter().map(|t| t.name.clone()).collect(), public: false, span, shape: crate::derive::DShape::Enum(dvariants) });
+            self.jobs.push(crate::derive::DeriveJob { name: name.clone(), go_name: data_name.clone(), tparams: tparams.iter().map(|t| t.name.clone()).collect(), public: false, span, shape: crate::derive::DShape::Enum(dvariants) });
         }
         Ok(EnumDef { name, span, error: false, tparams, variants })
     }
@@ -920,13 +948,13 @@ impl<'a> Parser<'a> {
         let span = start.to(self.prev_span());
         if derives.iter().any(|d| d == "Data") {
             let dfields = fields.iter().zip(fopts.iter()).map(|((n, t, s), o)| crate::derive::DField { name: n.clone(), ty: t.clone(), opts: o.clone(), span: *s }).collect();
-            let job = crate::derive::DeriveJob { name: name.clone(), tparams: tparams.iter().map(|t| t.name.clone()).collect(), public: false, span, shape: crate::derive::DShape::Struct(dfields) };
+            let job = crate::derive::DeriveJob { name: name.clone(), go_name: data_name.clone(), tparams: tparams.iter().map(|t| t.name.clone()).collect(), public: false, span, shape: crate::derive::DShape::Struct(dfields) };
             let ms = data_methods(methods, &mopts);
-            self.djobs.push(crate::derive_data::DataJob { job, go_name: data_name, methods: ms });
+            self.djobs.push(crate::derive_data::DataJob { job, go_name: data_name.clone(), methods: ms });
         }
         if derives.iter().any(|d| d == "Json") {
             let dfields = fields.iter().zip(fopts).map(|((n, t, s), o)| crate::derive::DField { name: n.clone(), ty: t.clone(), opts: o, span: *s }).collect();
-            self.jobs.push(crate::derive::DeriveJob { name: name.clone(), tparams: tparams.iter().map(|t| t.name.clone()).collect(), public: false, span, shape: crate::derive::DShape::Struct(dfields) });
+            self.jobs.push(crate::derive::DeriveJob { name: name.clone(), go_name: data_name.clone(), tparams: tparams.iter().map(|t| t.name.clone()).collect(), public: false, span, shape: crate::derive::DShape::Struct(dfields) });
         }
         Ok(StructDef { name, span, tparams, fields })
     }

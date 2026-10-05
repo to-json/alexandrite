@@ -40,6 +40,13 @@ pub struct Opts {
     pub rename: Option<String>,
     pub skip: bool,
     pub omit_empty: bool,
+    /// encoding/json/v2's tag options (derive_json2.rs): omitzero, string,
+    /// case:ignore (1) / case:strict (2), embed, format:...
+    pub omit_zero: bool,
+    pub string_tag: bool,
+    pub casing: u8,
+    pub embed: bool,
+    pub format: Option<String>,
     /// derive(Data): `data: "Name"` / `data: "-"`.
     pub drename: Option<String>,
     pub dskip: bool,
@@ -96,13 +103,18 @@ pub fn apply_field_attr(text: &str, sp: Span, o: &mut Opts) -> Result<(), Diag> 
     Ok(())
 }
 
-/// Go's json tag: `name`, `-`, `name,omitempty`, `,omitempty`.
+/// Go's json tag: `name`, `-`, then options: omitempty, and encoding/json/v2's
+/// omitzero, string, case:ignore|strict, embed, format:F (last).
 fn apply_json_tag(v: &str, sp: Span, o: &mut Opts) -> Result<(), Diag> {
     if v == "-" {
         o.skip = true;
         return Ok(());
     }
-    let mut parts = v.split(',');
+    let (head, fmt) = match v.find(",format:") {
+        Some(i) => (&v[..i], Some(v[i + ",format:".len()..].to_string())),
+        None => (v, None),
+    };
+    let mut parts = head.split(',');
     let name = parts.next().unwrap_or("");
     if !name.is_empty() {
         o.rename = Some(name.to_string());
@@ -110,9 +122,20 @@ fn apply_json_tag(v: &str, sp: Span, o: &mut Opts) -> Result<(), Diag> {
     for p in parts {
         match p.trim() {
             "omitempty" | "omit_empty" => o.omit_empty = true,
+            "omitzero" => o.omit_zero = true,
+            "string" => o.string_tag = true,
+            "embed" | "inline" => o.embed = true,
+            "case:ignore" | "nocase" => o.casing = 1,
+            "case:strict" | "strictcase" => o.casing = 2,
             "" => {}
-            p => return Err(Diag::new(sp, format!("unknown json tag option `{p}`")).note("options: omitempty")),
+            p => return Err(Diag::new(sp, format!("unknown json tag option `{p}`")).note("options: omitempty, omitzero, string, case:ignore, case:strict, embed, format:F (last)")),
         }
+    }
+    if let Some(f) = fmt {
+        if f.is_empty() || f.contains(',') {
+            return Err(Diag::new(sp, format!("bad `format:` in json tag `{v}`")).note("format:F comes last: `format:base64`"));
+        }
+        o.format = Some(f);
     }
     Ok(())
 }
@@ -269,6 +292,8 @@ pub enum DShape {
 #[derive(Clone, Debug)]
 pub struct DeriveJob {
     pub name: String,
+    /// `#[data("pkg.T")]`: the Go type name consumers see (json/v2 errors).
+    pub go_name: Option<String>,
     pub tparams: Vec<String>,
     pub public: bool,
     pub span: Span,

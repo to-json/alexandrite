@@ -1,0 +1,320 @@
+#![overflow(wrap)]
+# Structs and enums (Go's makeStructArshaler, fields.go, fold.go,
+# arshal_embedded.go): the helpers the derived code calls.
+
+import "strconv"
+import "strings"
+import "unicode"
+import "encoding/json/jsontext"
+
+# ------------------------------------------------------------------ names
+
+# Go's foldName: ASCII letters upper-cased, '_' and '-' dropped, other runes
+# folded to the smallest rune of their case-folding set.
+pub def fold_name(s: Str) -> Str {
+  b: [Byte] = []
+  i = 0
+  while i < s.size {
+    c = s[i]
+    if c < 0x80 {
+      if c != 95 && c != 45 {
+        b << (c >= 97 && c <= 122 ? c - 32 : c)
+      }
+      i += 1
+      next
+    }
+    r, n = jsontext.decode_rune_s(s, i)
+    b = jsontext.app_rune(b, fold_rune(r))
+    i += n
+  }
+  Str.from_bytes(b)
+}
+
+def fold_rune(r0: Rune) -> Rune {
+  r = r0
+  loop {
+    r2 = unicode.simple_fold(r)
+    return r2 if r2 <= r
+    r = r2
+  }
+}
+
+# `case:` tag values.
+pub CASE_IGNORE = 1
+pub CASE_STRICT = 2
+
+# Go's matchFoldedName: whether `name` may match a field named `fname` (with
+# the same folded name) under its `case:` option and the options.
+pub def match_folded(name: Str, fname: Str, casing: Int, o: jsontext.Options) -> Bool {
+  if casing == CASE_IGNORE || (o.get(jsontext.F_MATCH_CASE_INSENSITIVE_NAMES) && casing != CASE_STRICT) {
+    if !o.get(jsontext.F_MATCH_CASE_SENSITIVE_DELIMITER) || strings.equal_fold(name, fname) {
+      return true
+    }
+  }
+  false
+}
+
+# The index of the field `name` matches after no exact match: -1 if none,
+# -2 if several do (ambiguous).
+pub def fold_match(name: Str, names: [Str], casings: [Int], o: jsontext.Options) -> Int {
+  folded = fold_name(name)
+  found = -1
+  count = 0
+  for i in 0...names.size {
+    if fold_name(names[i]) == folded && match_folded(name, names[i], casings[i], o) {
+      found = i if found < 0
+      count += 1
+    }
+  }
+  return -2 if count > 1
+  found
+}
+
+# ------------------------------------------------------------------ structs: marshal
+
+# Starts a struct's object; returns the options for its fields.
+pub def begin_struct(e: jsontext.Encoder, o: jsontext.Options, t: Str) -> ~jsontext.Options<Error> {
+  if er = tag_error_enc(e, o, t) { fail er }
+  e.~write_token!(jsontext.Token.begin_object)
+  e.disable_namespace!
+  inner_opts(o)
+}
+
+pub def end_struct(e: jsontext.Encoder) -> ~Unit<Error> {
+  e.~write_token!(jsontext.Token.end_object)
+}
+
+# Writes a member name.
+pub def write_name(e: jsontext.Encoder, name: Str) -> ~Unit<Error> {
+  e.~write_token!(jsontext.string(name))
+}
+
+# After an `omitempty` field's value: takes the member back out if the value
+# was empty (null, "", {}, []). `prev` is the name of the member before it.
+pub def unwrite_if_empty(e: jsontext.Encoder, prev: Str) -> Bool {
+  e.unwrite_empty_object_member!(prev == "" ? none : prev)
+}
+
+# ------------------------------------------------------------------ structs: unmarshal
+
+# Starts reading a struct: the token was read; true for an object (then
+# members follow), false for null (the zero value). Other tokens fail.
+pub def begin_struct_dec(d: jsontext.Decoder, o: jsontext.Options, t: Str) -> ~Bool<Error> {
+  if er = tag_error_dec(d, o, t) { fail er }
+  tok = ~read_token(d)
+  k = tok.kind
+  return false if k == jsontext.Kind.Null
+  fail unmarshal_error_after(d, t, ErrCause.Nothing) if k != jsontext.Kind.BeginObject
+  d.disable_namespace!
+  true
+}
+
+# Reads a member name: (unquoted name, length of its JSON text).
+pub def read_name(d: jsontext.Decoder) -> ~(Str, Int)<Error> {
+  val, verbatim = ~read_value(d)
+  (Str.from_bytes(jsontext.unquote_may_copy(val, verbatim)), val.size)
+}
+
+pub def more_members(d: jsontext.Decoder) -> Bool {
+  d.peek_kind! != jsontext.Kind.EndObject
+}
+
+pub def end_struct_dec(d: jsontext.Decoder) -> ~Unit<Error> {
+  ~read_token(d)
+  nil
+}
+
+# A member no field takes: fails under reject_unknown_members (unless an
+# embedded fallback collects it), checks it isn't a duplicate, and skips it
+# unless `fallback` (the caller decodes it into the fallback).
+pub def unknown_member(d: jsontext.Decoder, o: jsontext.Options, t: Str, name: Str, raw_len: Int, fallback: Bool) -> ~Unit<Error> {
+  if o.get(jsontext.F_REJECT_UNKNOWN_MEMBERS) && !fallback {
+    fail unmarshal_error_after(d, t, ErrCause.UnknownName)
+  }
+  if !o.get(jsontext.F_ALLOW_DUPLICATE_NAMES) && !d.insert_namespace_name!(name) {
+    fail duplicate_name_error(d.stack_pointer, none, d.input_offset - raw_len)
+  }
+  d.~skip_value! if !fallback
+  nil
+}
+
+# The error for a member name several fields match.
+pub def ambiguous_error(d: jsontext.Decoder, t: Str) -> JsonError {
+  unmarshal_error_after(d, t, ErrCause.AmbiguousName)
+}
+
+# A field's name seen twice: Go's duplicate-name SyntacticError.
+pub def duplicate_field_error(d: jsontext.Decoder, raw_len: Int) -> jsontext.JsonTextError {
+  duplicate_name_error(d.stack_pointer, none, d.input_offset - raw_len)
+}
+
+# ------------------------------------------------------------------ embedded fallbacks
+
+# Writes the members of a jsontext.Value field tagged `embed` (an object).
+pub def marshal_fallback_raw(e: jsontext.Encoder, o: jsontext.Options, v: jsontext.Value, known: [Str]) -> ~Unit<Error> {
+  return nil if v.raw.size == 0
+  t = "jsontext.Value"
+  d = jsontext.new_bytes_decoder(v.raw, [jsontext.allow_duplicate_names(true), jsontext.allow_invalid_utf8(true)])
+  rt = d.read_token!
+  if er = rt.err { fail marshal_error_before(e, t, cause_of(er)) }
+  tok = rt.unwrap
+  if tok.none? {
+    fail marshal_error_before(e, t, ErrCause.Syntax(e: jsontext.SyntacticError.new(byte_offset: 0, json_pointer: jsontext.Pointer.new(s: ""), err: jsontext.Cause.UnexpectedEof)))
+  }
+  if tok.unwrap.kind != jsontext.Kind.BeginObject {
+    fail marshal_error_before(e, t, ErrCause.Msg(text: "embedded raw value must be a JSON object"))
+  }
+  check = !o.get(jsontext.F_ALLOW_DUPLICATE_NAMES)
+  while d.peek_kind! != jsontext.Kind.EndObject {
+    r = d.read_value_flags!
+    if er = r.err { fail marshal_error_before(e, t, cause_of(er)) }
+    nv, verbatim = r.unwrap
+    name_raw = nv || []
+    if check {
+      name = Str.from_bytes(jsontext.unquote_may_copy(name_raw, verbatim))
+      if known.include?(name) || !e.insert_namespace_name!(name) {
+        fail duplicate_name_error(e.stack_pointer.parent, name, e.output_offset)
+      }
+    }
+    e.~write_value!(jsontext.Value.new(raw: name_raw))
+    r2 = d.read_value!
+    if er = r2.err { fail marshal_error_before(e, t, cause_of(er)) }
+    e.~write_value!(r2.unwrap || jsontext.Value.new(raw: []))
+  }
+  r3 = d.read_token!
+  if er = r3.err { fail marshal_error_before(e, t, cause_of(er)) }
+  r4 = d.check_eof!
+  if er = r4.err { fail marshal_error_before(e, t, cause_of(er)) }
+  nil
+}
+
+# Adds an unknown member (its quoted name, then its value read from d) to a
+# jsontext.Value fallback, which holds a JSON object.
+pub def unmarshal_fallback_raw(d: jsontext.Decoder, cur: jsontext.Value, quoted: Str) -> ~jsontext.Value<Error> {
+  b = cur.raw
+  if b.size == 0 {
+    b = [123]
+  } else {
+    b = jsontext.trim_suffix_whitespace(b)
+    if b.size > 0 && b[b.size - 1] == 125 {
+      b = jsontext.trim_suffix_whitespace(b[0...b.size - 1])
+      b << 44 if !(b.size > 0 && (b[b.size - 1] == 44 || b[b.size - 1] == 123))
+    } else {
+      fail unmarshal_error_after(d, "jsontext.Value", ErrCause.Msg(text: "embedded raw value must be a JSON object"))
+    }
+  }
+  out: [Byte] = []
+  out = jsontext.app_b(out, b)
+  out = jsontext.app_s(out, quoted)
+  out << 58
+  v = d.~read_value!
+  out = jsontext.app_b(out, (v || jsontext.Value.new(raw: [])).raw)
+  out << 125
+  jsontext.Value.new(raw: out)
+}
+
+# Writes the entries of a Map[Str, V] field tagged `embed`.
+pub def marshal_fallback_map[V](e: jsontext.Encoder, o: jsontext.Options, m: Map[Str, V], known: [Str], fv: (jsontext.Encoder, V, jsontext.Options) -> ~Unit<Error>) -> ~Unit<Error> {
+  return nil if m.size == 0
+  check = !o.get(jsontext.F_ALLOW_DUPLICATE_NAMES)
+  names: [Str] = []
+  for k, _v in m { names << k }
+  if o.get(jsontext.F_DETERMINISTIC) {
+    names = names.sort
+  }
+  for k in names {
+    if check && (known.include?(k) || !e.insert_namespace_name!(k)) {
+      fail duplicate_name_error(e.stack_pointer.parent, k, e.output_offset)
+    }
+    e.~write_token!(jsontext.string(k))
+    if v = m[k] { ~fv(e, v, o) }
+  }
+  nil
+}
+
+# Decodes an unknown member into a Map[Str, V] fallback.
+pub def unmarshal_fallback_map[V](d: jsontext.Decoder, o: jsontext.Options, cur: Map[Str, V], name: Str, zv: V, fv: (jsontext.Decoder, V, jsontext.Options) -> ~V<Error>) -> ~Map[Str, V]<Error> {
+  m = cur
+  v = m[name] || zv
+  m[name] = ~fv(d, v, o)
+  m
+}
+
+# ------------------------------------------------------------------ enums
+
+# Starts an enum value with a payload: {"Variant": ...}.
+pub def begin_variant(e: jsontext.Encoder, o: jsontext.Options, t: Str, name: Str) -> ~jsontext.Options<Error> {
+  if er = tag_error_enc(e, o, t) { fail er }
+  e.~write_token!(jsontext.Token.begin_object)
+  e.~write_token!(jsontext.string(name))
+  inner_opts(o)
+}
+
+# A payload-free variant: "Variant".
+pub def unit_variant(e: jsontext.Encoder, o: jsontext.Options, t: Str, name: Str) -> ~Unit<Error> {
+  if er = tag_error_enc(e, o, t) { fail er }
+  e.~write_token!(jsontext.string(name))
+}
+
+# Reads the start of an enum value: (variant name, wrapped in an object?).
+# null gives ("", false) (the zero value).
+pub def read_variant(d: jsontext.Decoder, o: jsontext.Options, t: Str) -> ~(Str, Bool)<Error> {
+  if er = tag_error_dec(d, o, t) { fail er }
+  k = d.peek_kind!
+  if k == jsontext.Kind.String {
+    n, _len = ~read_name(d)
+    return (n, false)
+  }
+  tok = ~read_token(d)
+  return ("", false) if tok.kind == jsontext.Kind.Null
+  fail unmarshal_error_after(d, t, ErrCause.Nothing) if tok.kind != jsontext.Kind.BeginObject
+  n, _len = ~read_name(d)
+  (n, true)
+}
+
+# After a wrapped variant's payload: the closing '}'.
+pub def end_variant(d: jsontext.Decoder, t: Str) -> ~Unit<Error> {
+  tok = ~read_token(d)
+  if tok.kind != jsontext.Kind.EndObject {
+    fail unmarshal_error_after(d, t, ErrCause.Msg(text: "an enum value is an object with one member"))
+  }
+  nil
+}
+
+pub def unknown_variant(d: jsontext.Decoder, t: Str, name: Str) -> JsonError {
+  unmarshal_error_after(d, t, ErrCause.Msg(text: "unknown variant " + strconv.quote(name)))
+}
+
+# A variant with a payload written as a bare string, or the reverse.
+pub def variant_shape_error(d: jsontext.Decoder, t: Str, name: Str) -> JsonError {
+  unmarshal_error_after(d, t, ErrCause.Msg(text: "variant " + name + " has the wrong shape"))
+}
+
+# A tuple's JSON array must have exactly n elements.
+pub def begin_tuple(d: jsontext.Decoder, o: jsontext.Options, t: Str) -> ~Bool<Error> {
+  if er = tag_error_dec(d, o, t) { fail er }
+  tok = ~read_token(d)
+  return false if tok.kind == jsontext.Kind.Null
+  fail unmarshal_error_after(d, t, ErrCause.Nothing) if tok.kind != jsontext.Kind.BeginArray
+  true
+}
+
+# Before tuple element i of n: fails if the array already ended.
+pub def tuple_elem(d: jsontext.Decoder, t: Str) -> ~Unit<Error> {
+  if d.peek_kind! == jsontext.Kind.EndArray {
+    ~read_token(d)
+    fail unmarshal_error_after(d, t, ErrCause.Msg(text: "too few array elements"))
+  }
+  nil
+}
+
+pub def end_tuple(d: jsontext.Decoder, t: Str) -> ~Unit<Error> {
+  over = false
+  while d.peek_kind! != jsontext.Kind.EndArray {
+    d.~skip_value!
+    over = true
+  }
+  ~read_token(d)
+  fail unmarshal_error_after(d, t, ErrCause.Msg(text: "too many array elements")) if over
+  nil
+}

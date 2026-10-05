@@ -539,6 +539,11 @@ pub fn check_program(l: &Loaded, externs: Vec<DefInfo>) -> Result<TProgram, Diag
             // Only reached code records uses (generic and untested defs
             // aren't checked), so a reference in the file's text counts too.
             let in_text = l.sm.files.get(i.span.file as usize).is_some_and(|f| mentions(&f.text, &alias));
+            // An import a derive added for its own code (`alxjson`, `alxdyn`, ...):
+            // the derived methods the program doesn't call aren't checked.
+            if i.alias.as_deref().is_some_and(|a| matches!(a, "alxjson" | "alxjson2" | "alxjsontext" | "alxdyn")) {
+                continue;
+            }
             if !crate::check::import_used(&pkg, &alias) && !in_text && !ext.contains(i.path.trim_end_matches('/')) {
                 warnings.push(Diag::new(i.span, format!("`{}` is imported but not used", i.path)));
             }

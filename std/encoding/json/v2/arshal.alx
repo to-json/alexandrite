@@ -1,0 +1,607 @@
+#![overflow(wrap)]
+# The default representations (Go's arshal_default.go): one function pair per
+# kind of type. The code `#[derive(Json)]` writes for a type calls these for
+# its fields, passing Go's name of the field's type for error messages (`t`)
+# and the options in effect (`o`: the coder's, with a field's `string` and
+# `format` tag options set for that field only).
+
+import "math"
+import "strconv"
+import "slices"
+import "encoding/base64"
+import "encoding/base32"
+import "encoding/hex"
+import "encoding/json/jsontext"
+
+# ------------------------------------------------------------------ helpers
+
+# Reads the next token; the end of the input is JsonError.Eof (Go's io.EOF).
+pub def read_token(d: jsontext.Decoder) -> ~jsontext.Token<Error> {
+  t = d.~read_token!
+  if tok = t { return tok }
+  fail JsonError.Eof
+}
+
+# Reads the next value with its "verbatim string" flag.
+pub def read_value(d: jsontext.Decoder) -> ~([Byte], Bool)<Error> {
+  v, verbatim = d.~read_value_flags!
+  if b = v { return (b, verbatim) }
+  fail JsonError.Eof
+}
+
+# The options for the values inside a container: tag options apply only to
+# the field's own value (Go clears them when an object or array starts).
+pub def inner_opts(o: jsontext.Options) -> jsontext.Options {
+  o2 = o
+  o2.clear!(jsontext.F_TAG_FLAGS)
+  o2
+}
+
+# The options for a field with `string` and `format:` tag options.
+pub def field_opts(o: jsontext.Options, string_tag: Bool, format: Str) -> jsontext.Options {
+  o2 = o
+  o2.set!(jsontext.F_STRING_TAG, true) if string_tag
+  if format != "" {
+    o2.set!(jsontext.F_FORMAT_TAG, true)
+    o2.format = format
+  }
+  o2
+}
+
+def stringify?(need_name: Bool, o: jsontext.Options) -> Bool {
+  need_name || o.get(jsontext.F_STRINGIFY_NUMBERS | jsontext.F_STRING_TAG)
+}
+
+def tag_error_enc(e: jsontext.Encoder, o: jsontext.Options, t: Str) -> JsonError? {
+  if o.has(jsontext.F_TAG_FLAGS) {
+    return marshal_error_before(e, t, ErrCause.Msg(text: ERR_INVALID_STRING_TAG)) if o.get(jsontext.F_STRING_TAG)
+    return invalid_format_enc(e, o, t) if o.has(jsontext.F_FORMAT_TAG)
+  }
+  none
+}
+
+# The tag errors of a tuple (an array: no `string`, no `format:`).
+pub def tuple_tag_error(e: jsontext.Encoder, o: jsontext.Options, t: Str) -> JsonError? { tag_error_enc(e, o, t) }
+
+def tag_error_dec(d: jsontext.Decoder, o: jsontext.Options, t: Str) -> JsonError? {
+  if o.has(jsontext.F_TAG_FLAGS) {
+    return unmarshal_error_before(d, t, ErrCause.Msg(text: ERR_INVALID_STRING_TAG)) if o.get(jsontext.F_STRING_TAG)
+    return invalid_format_dec(d, o, t) if o.has(jsontext.F_FORMAT_TAG)
+  }
+  none
+}
+
+# Fails for a type with no JSON representation (Go: complex numbers,
+# channels, functions).
+pub def marshal_unsupported(e: jsontext.Encoder, t: Str) -> ~Unit<Error> {
+  fail marshal_error_before(e, t, ErrCause.Nothing)
+}
+
+pub def unmarshal_unsupported[T](d: jsontext.Decoder, cur: T, t: Str) -> ~T<Error> {
+  fail unmarshal_error_before(d, t, ErrCause.Nothing)
+}
+
+# ------------------------------------------------------------------ bool
+
+pub def marshal_bool(e: jsontext.Encoder, v: Bool, o: jsontext.Options, t: Str) -> ~Unit<Error> {
+  if o.marshalers.size > 0 {
+    return nil if ~call_marshalers(e, jsontext.Arg.B(v), o)
+  }
+  if er = tag_error_enc(e, o, t) { fail er }
+  e.~write_token!(jsontext.bool(v))
+}
+
+pub def unmarshal_bool(d: jsontext.Decoder, cur: Bool, o: jsontext.Options, t: Str) -> ~Bool<Error> {
+  if o.unmarshalers.size > 0 {
+    if r = ~call_unmarshalers(d, jsontext.Arg.B(cur), o) {
+      case r {
+        B(x) => { return x }
+        _ => {}
+      }
+    }
+  }
+  if er = tag_error_dec(d, o, t) { fail er }
+  tok = ~read_token(d)
+  k = tok.kind
+  return false if k == jsontext.Kind.Null
+  return tok.bool if k == jsontext.Kind.True || k == jsontext.Kind.False
+  fail unmarshal_error_after(d, t, ErrCause.Nothing)
+}
+
+# ------------------------------------------------------------------ string
+
+pub def marshal_string(e: jsontext.Encoder, v: Str, o: jsontext.Options, t: Str) -> ~Unit<Error> {
+  if o.marshalers.size > 0 {
+    return nil if ~call_marshalers(e, jsontext.Arg.S(v), o)
+  }
+  if er = tag_error_enc(e, o, t) { fail er }
+  e.~write_token!(jsontext.string(v))
+}
+
+pub def unmarshal_string(d: jsontext.Decoder, cur: Str, o: jsontext.Options, t: Str) -> ~Str<Error> {
+  if o.unmarshalers.size > 0 {
+    if r = ~call_unmarshalers(d, jsontext.Arg.S(cur), o) {
+      case r {
+        S(x) => { return x }
+        _ => {}
+      }
+    }
+  }
+  if er = tag_error_dec(d, o, t) { fail er }
+  val, verbatim = ~read_value(d)
+  k = jsontext.Kind.of(val[0])
+  return "" if k == jsontext.Kind.Null
+  if k == jsontext.Kind.String {
+    return Str.from_bytes(jsontext.unquote_may_copy(val, verbatim))
+  }
+  fail unmarshal_error_after(d, t, ErrCause.Nothing)
+}
+
+# ------------------------------------------------------------------ numbers
+
+ERR_SYNTAX = "invalid syntax"
+ERR_RANGE = "value out of range"
+
+# A signed integer of `bits` bits (Go's int, int8, ...).
+pub def marshal_int(e: jsontext.Encoder, v: Int, o: jsontext.Options, t: Str) -> ~Unit<Error> {
+  if o.marshalers.size > 0 {
+    return nil if ~call_marshalers(e, jsontext.Arg.I(v, t), o)
+  }
+  s = stringify?(e.need_object_name, o)
+  fail invalid_format_enc(e, o, t) if o.has(jsontext.F_FORMAT_TAG)
+  e.~append_raw!(s ? jsontext.Kind.String : jsontext.Kind.Number, true, v.to_s.bytes)
+}
+
+# An unsigned integer (Go's uint, uint8, ...).
+pub def marshal_uint(e: jsontext.Encoder, v: U64, o: jsontext.Options, t: Str) -> ~Unit<Error> {
+  if o.marshalers.size > 0 {
+    return nil if ~call_marshalers(e, jsontext.Arg.U(v, t), o)
+  }
+  s = stringify?(e.need_object_name, o)
+  fail invalid_format_enc(e, o, t) if o.has(jsontext.F_FORMAT_TAG)
+  e.~append_raw!(s ? jsontext.Kind.String : jsontext.Kind.Number, true, v.to_s.bytes)
+}
+
+# The digits of a number read where a number (or a stringified one) is
+# wanted, or the error Go reports for the token.
+def number_text(d: jsontext.Decoder, o: jsontext.Options, t: Str, allow_nonfinite: Bool) -> ~([Byte], Bool)<Error> {
+  s = stringify?(d.need_object_name, o)
+  val, verbatim = ~read_value(d)
+  k = jsontext.Kind.of(val[0])
+  return ([], true) if k == jsontext.Kind.Null
+  if k == jsontext.Kind.String {
+    raw = jsontext.unquote_may_copy(val, verbatim)
+    if allow_nonfinite {
+      txt = Str.from_bytes(raw)
+      return (raw, false) if txt == "NaN" || txt == "Infinity" || txt == "-Infinity"
+    }
+    fail unmarshal_error_after(d, t, ErrCause.Nothing) if !s
+    return (raw, false)
+  }
+  if k == jsontext.Kind.Number {
+    fail unmarshal_error_after(d, t, ErrCause.Nothing) if s
+    return (val, false)
+  }
+  fail unmarshal_error_after(d, t, ErrCause.Nothing)
+}
+
+pub def unmarshal_int(d: jsontext.Decoder, cur: Int, o: jsontext.Options, t: Str, bits: Int) -> ~Int<Error> {
+  if o.unmarshalers.size > 0 {
+    if r = ~call_unmarshalers(d, jsontext.Arg.I(cur, t), o) {
+      case r {
+        I(x, _t) => { return x }
+        _ => {}
+      }
+    }
+  }
+  fail invalid_format_dec(d, o, t) if o.has(jsontext.F_FORMAT_TAG)
+  val, null = ~number_text(d, o, t, false)
+  return 0 if null
+  neg = val.size > 0 && val[0] == 45
+  digits = neg ? val[1...val.size] : val
+  n, ok = jsontext.parse_uint(digits)
+  max: U64 = 1.as_u64 << (bits - 1)
+  overflow = (neg && n > max) || (!neg && n > max - 1)
+  if !ok {
+    fail unmarshal_error_after_value(d, t, ErrCause.Msg(text: ERR_SYNTAX)) if n != 18446744073709551615
+    overflow = true
+  }
+  fail unmarshal_error_after_value(d, t, ErrCause.Msg(text: ERR_RANGE)) if overflow
+  neg ? (0 -% n).as_i64 : n.as_i64
+}
+
+pub def unmarshal_uint(d: jsontext.Decoder, cur: U64, o: jsontext.Options, t: Str, bits: Int) -> ~U64<Error> {
+  if o.unmarshalers.size > 0 {
+    if r = ~call_unmarshalers(d, jsontext.Arg.U(cur, t), o) {
+      case r {
+        U(x, _t) => { return x }
+        _ => {}
+      }
+    }
+  }
+  fail invalid_format_dec(d, o, t) if o.has(jsontext.F_FORMAT_TAG)
+  val, null = ~number_text(d, o, t, false)
+  return 0 if null
+  n, ok = jsontext.parse_uint(val)
+  overflow = bits < 64 && n > (1.as_u64 << bits) - 1
+  if !ok {
+    fail unmarshal_error_after_value(d, t, ErrCause.Msg(text: ERR_SYNTAX)) if n != 18446744073709551615
+    overflow = true
+  }
+  fail unmarshal_error_after_value(d, t, ErrCause.Msg(text: ERR_RANGE)) if overflow
+  n
+}
+
+# Go's %v of a non-finite float.
+def nonfinite_text(f: Float) -> Str {
+  return "NaN" if f != f
+  f > 0.0 ? "+Inf" : "-Inf"
+}
+
+pub def marshal_float(e: jsontext.Encoder, v: Float, o: jsontext.Options, t: Str, bits: Int) -> ~Unit<Error> {
+  if o.marshalers.size > 0 {
+    return nil if ~call_marshalers(e, jsontext.Arg.F(v, t), o)
+  }
+  s = stringify?(e.need_object_name, o)
+  allow = false
+  if o.has(jsontext.F_FORMAT_TAG) {
+    fail invalid_format_enc(e, o, t) if o.format != "nonfinite"
+    allow = true
+  }
+  if v != v || v > 1.7976931348623157e308 || v < -1.7976931348623157e308 {
+    fail marshal_error_before(e, t, ErrCause.Msg(text: "unsupported value: " + nonfinite_text(v))) if !allow
+    return e.~write_token!(jsontext.float(v))
+  }
+  e.~append_raw!(s ? jsontext.Kind.String : jsontext.Kind.Number, true, jsontext.append_float([], v, bits))
+}
+
+pub def unmarshal_float(d: jsontext.Decoder, cur: Float, o: jsontext.Options, t: Str, bits: Int) -> ~Float<Error> {
+  if o.unmarshalers.size > 0 {
+    if r = ~call_unmarshalers(d, jsontext.Arg.F(cur, t), o) {
+      case r {
+        F(x, _t) => { return x }
+        _ => {}
+      }
+    }
+  }
+  allow = false
+  if o.has(jsontext.F_FORMAT_TAG) {
+    fail invalid_format_dec(d, o, t) if o.format != "nonfinite"
+    allow = true
+  }
+  val, null = ~number_text(d, o, t, allow)
+  return 0.0 if null
+  txt = Str.from_bytes(val)
+  if allow {
+    return math.nan if txt == "NaN"
+    return math.inf(1) if txt == "Infinity"
+    return math.inf(-1) if txt == "-Infinity"
+  }
+  n, err = jsontext.consume_number(val, 0)
+  if n != val.size || err.present? {
+    fail unmarshal_error_after_value(d, t, ErrCause.Msg(text: ERR_SYNTAX))
+  }
+  r = strconv.parse_float_bits(txt, bits)
+  return r.unwrap if r.ok?
+  fail unmarshal_error_after_value(d, t, ErrCause.Msg(text: ERR_RANGE))
+}
+
+# ------------------------------------------------------------------ bytes
+
+# [Byte] (and [Byte; N]: `array_len`) as a base64 string by default, or as
+# `format:` says: base64, base64url, base32, base32hex, base16/hex, array.
+pub def marshal_bytes(e: jsontext.Encoder, v: [Byte], o: jsontext.Options, t: Str) -> ~Unit<Error> {
+  f = "base64"
+  if o.has(jsontext.F_TAG_FLAGS) {
+    fail marshal_error_before(e, t, ErrCause.Msg(text: ERR_INVALID_STRING_TAG)) if o.get(jsontext.F_STRING_TAG)
+    if o.has(jsontext.F_FORMAT_TAG) {
+      f = o.format
+      if f == "array" {
+        o2 = o
+        o2.clear!(jsontext.F_FORMAT_TAG)
+        return ~marshal_byte_array(e, v, o2, t)
+      }
+      if f != "base64" && f != "base64url" && f != "base32" && f != "base32hex" && f != "base16" && f != "hex" {
+        fail invalid_format_enc(e, o, t)
+      }
+    }
+  }
+  e.~append_raw!(jsontext.Kind.String, true, encode_bytes(f, v))
+}
+
+def marshal_byte_array(e: jsontext.Encoder, v: [Byte], o: jsontext.Options, t: Str) -> ~Unit<Error> {
+  e.~write_token!(jsontext.Token.begin_array)
+  for b in v {
+    e.~append_raw!(jsontext.Kind.Number, true, b.to_s.bytes)
+  }
+  e.~write_token!(jsontext.Token.end_array)
+}
+
+def encode_bytes(f: Str, v: [Byte]) -> [Byte] {
+  return base64.url_encoding.append_encode([], v) if f == "base64url"
+  return base32.std_encoding.append_encode([], v) if f == "base32"
+  return base32.hex_encoding.append_encode([], v) if f == "base32hex"
+  return hex.append_encode([], v) if f == "base16" || f == "hex"
+  base64.std_encoding.append_encode([], v)
+}
+
+def encoded_len(f: Str, n: Int) -> Int {
+  return base64.url_encoding.encoded_len(n) if f == "base64url"
+  return base32.std_encoding.encoded_len(n) if f == "base32"
+  return base32.hex_encoding.encoded_len(n) if f == "base32hex"
+  return hex.encoded_len(n) if f == "base16" || f == "hex"
+  base64.std_encoding.encoded_len(n)
+}
+
+def decode_bytes(f: Str, v: [Byte]) -> ~[Byte]<Error> {
+  return ~base64.url_encoding.append_decode([], v) if f == "base64url"
+  return ~base32.std_encoding.append_decode([], v) if f == "base32"
+  return ~base32.hex_encoding.append_decode([], v) if f == "base32hex"
+  return ~hex.append_decode([], v) if f == "base16" || f == "hex"
+  ~base64.std_encoding.append_decode([], v)
+}
+
+# Decodes bytes; `array_len` is N for a [Byte; N] (the result has exactly N
+# bytes), -1 for a slice.
+pub def unmarshal_bytes(d: jsontext.Decoder, cur: [Byte], o: jsontext.Options, t: Str, array_len: Int) -> ~[Byte]<Error> {
+  f = "base64"
+  if o.has(jsontext.F_TAG_FLAGS) {
+    fail unmarshal_error_before(d, t, ErrCause.Msg(text: ERR_INVALID_STRING_TAG)) if o.get(jsontext.F_STRING_TAG)
+    if o.has(jsontext.F_FORMAT_TAG) {
+      f = o.format
+      if f == "array" {
+        o2 = o
+        o2.clear!(jsontext.F_FORMAT_TAG)
+        return ~unmarshal_byte_array(d, o2, t, array_len)
+      }
+      if f != "base64" && f != "base64url" && f != "base32" && f != "base32hex" && f != "base16" && f != "hex" {
+        fail invalid_format_dec(d, o, t)
+      }
+    }
+  }
+  val, verbatim = ~read_value(d)
+  k = jsontext.Kind.of(val[0])
+  if k == jsontext.Kind.Null {
+    return zero_bytes(array_len)
+  }
+  if k == jsontext.Kind.String {
+    raw = jsontext.unquote_may_copy(val, verbatim)
+    r = decode_bytes(f, raw)
+    if e = r.err { fail unmarshal_error_after(d, t, ErrCause.Msg(text: e.message)) }
+    b = r.unwrap
+    if raw.size != encoded_len(f, b.size) {
+      i = 0
+      while i < raw.size && raw[i] != 13 && raw[i] != 10 { i += 1 }
+      fail unmarshal_error_after(d, t, ErrCause.Msg(text: "illegal character " + jsontext.quote_rune_b(raw[i...raw.size]) + " at offset " + i.to_s))
+    }
+    if array_len >= 0 {
+      out = zero_bytes(array_len)
+      n = b.size < array_len ? b.size : array_len
+      for j in 0...n { out[j] = b[j] }
+      if b.size != array_len {
+        fail unmarshal_error_after(d, t, ErrCause.Msg(text: "decoded length of " + b.size.to_s + " mismatches array length of " + array_len.to_s))
+      }
+      return out
+    }
+    return b
+  }
+  fail unmarshal_error_after(d, t, ErrCause.Nothing)
+}
+
+def unmarshal_byte_array(d: jsontext.Decoder, o: jsontext.Options, t: Str, array_len: Int) -> ~[Byte]<Error> {
+  et = "uint8"
+  tok = ~read_token(d)
+  k = tok.kind
+  if k == jsontext.Kind.Null {
+    return zero_bytes(array_len)
+  }
+  fail unmarshal_error_after(d, t, ErrCause.Nothing) if k != jsontext.Kind.BeginArray
+  o2 = inner_opts(o)
+  out: [Byte] = []
+  over = false
+  while d.peek_kind! != jsontext.Kind.EndArray {
+    if array_len >= 0 && out.size >= array_len {
+      d.~skip_value!
+      over = true
+      next
+    }
+    v = ~unmarshal_uint(d, 0, o2, et, 8)
+    out << v.as_u8
+  }
+  ~read_token(d)
+  if array_len >= 0 {
+    under = out.size < array_len
+    while out.size < array_len { out << 0 }
+    fail unmarshal_error_after(d, t, ErrCause.Msg(text: "too many array elements")) if over
+    fail unmarshal_error_after(d, t, ErrCause.Msg(text: "too few array elements")) if under
+  }
+  out
+}
+
+# ------------------------------------------------------------------ slices
+
+def list_tag_error_enc(e: jsontext.Encoder, o: jsontext.Options, t: Str) -> JsonError? {
+  if o.has(jsontext.F_TAG_FLAGS) {
+    return marshal_error_before(e, t, ErrCause.Msg(text: ERR_INVALID_STRING_TAG)) if o.get(jsontext.F_STRING_TAG)
+    if o.has(jsontext.F_FORMAT_TAG) && o.format != "emitnull" && o.format != "emitempty" {
+      return invalid_format_enc(e, o, t)
+    }
+  }
+  none
+}
+
+def list_tag_error_dec(d: jsontext.Decoder, o: jsontext.Options, t: Str) -> JsonError? {
+  if o.has(jsontext.F_TAG_FLAGS) {
+    return unmarshal_error_before(d, t, ErrCause.Msg(text: ERR_INVALID_STRING_TAG)) if o.get(jsontext.F_STRING_TAG)
+    if o.has(jsontext.F_FORMAT_TAG) && o.format != "emitnull" && o.format != "emitempty" {
+      return invalid_format_dec(d, o, t)
+    }
+  }
+  none
+}
+
+# A slice as a JSON array; `f` marshals one element.
+pub def marshal_slice[T](e: jsontext.Encoder, xs: [T], o: jsontext.Options, t: Str, f: (jsontext.Encoder, T, jsontext.Options) -> ~Unit<Error>) -> ~Unit<Error> {
+  if er = list_tag_error_enc(e, o, t) { fail er }
+  e.~write_token!(jsontext.Token.begin_array)
+  o2 = inner_opts(o)
+  for x in xs { ~f(e, x, o2) }
+  e.~write_token!(jsontext.Token.end_array)
+}
+
+# A JSON array into a slice: the elements are decoded from `zero` by `f`.
+pub def unmarshal_slice[T](d: jsontext.Decoder, cur: [T], o: jsontext.Options, t: Str, zero: T, f: (jsontext.Decoder, T, jsontext.Options) -> ~T<Error>) -> ~[T]<Error> {
+  if er = list_tag_error_dec(d, o, t) { fail er }
+  tok = ~read_token(d)
+  k = tok.kind
+  out: [T] = []
+  return out if k == jsontext.Kind.Null
+  fail unmarshal_error_after(d, t, ErrCause.Nothing) if k != jsontext.Kind.BeginArray
+  o2 = inner_opts(o)
+  while d.peek_kind! != jsontext.Kind.EndArray {
+    out << ~f(d, zero, o2)
+  }
+  ~read_token(d)
+  out
+}
+
+# A fixed-size array (given as a slice of its elements) as a JSON array.
+pub def marshal_array[T](e: jsontext.Encoder, xs: [T], o: jsontext.Options, t: Str, f: (jsontext.Encoder, T, jsontext.Options) -> ~Unit<Error>) -> ~Unit<Error> {
+  if er = tag_error_enc(e, o, t) { fail er }
+  e.~write_token!(jsontext.Token.begin_array)
+  o2 = inner_opts(o)
+  for x in xs { ~f(e, x, o2) }
+  e.~write_token!(jsontext.Token.end_array)
+}
+
+# A JSON array of exactly `cur.size` elements into a fixed-size array (given
+# and returned as a slice).
+pub def unmarshal_array[T](d: jsontext.Decoder, cur: [T], o: jsontext.Options, t: Str, zero: T, f: (jsontext.Decoder, T, jsontext.Options) -> ~T<Error>) -> ~[T]<Error> {
+  if er = tag_error_dec(d, o, t) { fail er }
+  n = cur.size
+  tok = ~read_token(d)
+  k = tok.kind
+  out: [T] = []
+  if k == jsontext.Kind.Null {
+    for _i in 0...n { out << zero }
+    return out
+  }
+  fail unmarshal_error_after(d, t, ErrCause.Nothing) if k != jsontext.Kind.BeginArray
+  o2 = inner_opts(o)
+  over = false
+  while d.peek_kind! != jsontext.Kind.EndArray {
+    if out.size >= n {
+      d.~skip_value!
+      over = true
+      next
+    }
+    out << ~f(d, zero, o2)
+  }
+  under = out.size < n
+  while out.size < n { out << zero }
+  ~read_token(d)
+  fail unmarshal_error_after(d, t, ErrCause.Msg(text: "too many array elements")) if over
+  fail unmarshal_error_after(d, t, ErrCause.Msg(text: "too few array elements")) if under
+  out
+}
+
+# ------------------------------------------------------------------ maps
+
+# A map as a JSON object. Keys are marshaled by `fk` in the name position
+# (numbers become strings there); `unique` says distinct keys always give
+# distinct names, so names aren't checked for duplicates: 1 for integer and
+# Bool keys, 2 for Str keys (unless invalid UTF-8 is allowed, which turns
+# distinct invalid keys into equal names), 0 otherwise. Deterministic sorts
+# the names.
+pub def marshal_map[K, V](e: jsontext.Encoder, m: Map[K, V], o: jsontext.Options, t: Str, unique: Int, fk: (jsontext.Encoder, K, jsontext.Options) -> ~Unit<Error>, fv: (jsontext.Encoder, V, jsontext.Options) -> ~Unit<Error>) -> ~Unit<Error> {
+  if er = list_tag_error_enc(e, o, t) { fail er }
+  e.~write_token!(jsontext.Token.begin_object)
+  o2 = inner_opts(o)
+  n = m.size
+  if n > 0 {
+    e.disable_namespace! if unique == 1 || (unique == 2 && !o.get(jsontext.F_ALLOW_INVALID_UTF8))
+    if !o.get(jsontext.F_DETERMINISTIC) || n <= 1 {
+      for k, v in m {
+        ~fk(e, k, o2)
+        ~fv(e, v, o2)
+      }
+    } else {
+      names: [Str] = []
+      vals: [V] = []
+      for k, v in m {
+        ~fk(e, k, o2)
+        names << e.unwrite_only_object_member_name!
+        vals << v
+      }
+      idx: [Int] = []
+      for i in 0...n { idx << i }
+      slices.sort_func(idx, ->(a: Int, b: Int) -> Int { names[a] < names[b] ? -1 : (names[a] > names[b] ? 1 : 0) })
+      for i in idx {
+        e.~write_token!(jsontext.string(names[i]))
+        ~fv(e, vals[i], o2)
+      }
+    }
+  }
+  e.~write_token!(jsontext.Token.end_object)
+}
+
+# A JSON object into a map (merged into `cur`: existing entries are kept,
+# and a member decodes into an existing entry's value).
+pub def unmarshal_map[K, V](d: jsontext.Decoder, cur: Map[K, V], o: jsontext.Options, t: Str, unique: Int, zk: K, zv: V, fk: (jsontext.Decoder, K, jsontext.Options) -> ~K<Error>, fv: (jsontext.Decoder, V, jsontext.Options) -> ~V<Error>) -> ~Map[K, V]<Error> {
+  if er = list_tag_error_dec(d, o, t) { fail er }
+  tok = ~read_token(d)
+  k = tok.kind
+  if k == jsontext.Kind.Null {
+    empty: Map[K, V] = {}
+    return empty
+  }
+  fail unmarshal_error_after(d, t, ErrCause.Nothing) if k != jsontext.Kind.BeginObject
+  o2 = inner_opts(o)
+  m = cur
+  d.disable_namespace! if unique == 1 || (unique == 2 && !o.get(jsontext.F_ALLOW_INVALID_UTF8))
+  check = !o.get(jsontext.F_ALLOW_DUPLICATE_NAMES)
+  had = m.size > 0
+  seen: Map[K, Bool] = {}
+  while d.peek_kind! != jsontext.Kind.EndObject {
+    key = ~fk(d, zk, o2)
+    v = zv
+    if old = m[key] {
+      if check && (!had || seen.has_key?(key)) {
+        name = d.previous_token_or_value
+        fail duplicate_name_error(d.stack_pointer, none, d.input_offset - name.size)
+      }
+      v = old
+    }
+    v = ~fv(d, v, o2)
+    m[key] = v
+    seen[key] = true if check && had
+  }
+  ~read_token(d)
+  m
+}
+
+# ------------------------------------------------------------------ raw values
+
+# A jsontext.Value written as it is (reformatted per the options).
+pub def marshal_raw(e: jsontext.Encoder, v: jsontext.Value, o: jsontext.Options, t: Str) -> ~Unit<Error> {
+  if er = tag_error_enc(e, o, t) { fail er }
+  if v.raw.size == 0 {
+    return e.~write_token!(jsontext.Token.null)
+  }
+  r = e.write_value!(v)
+  if er = r.err { fail marshal_error_before(e, t, cause_of(er)) }
+  nil
+}
+
+pub def unmarshal_raw(d: jsontext.Decoder, cur: jsontext.Value, o: jsontext.Options, t: Str) -> ~jsontext.Value<Error> {
+  if er = tag_error_dec(d, o, t) { fail er }
+  v = d.~read_value!
+  if x = v { return x.clone }
+  fail JsonError.Eof
+}
+
+def zero_bytes(n: Int) -> [Byte] {
+  b: [Byte] = []
+  for _i in 0...n { b << 0 }
+  b
+}

@@ -1,0 +1,322 @@
+# Go's exec_test.go data: T, tVal and the test FuncMap. T has methods and
+# fields of type interface{}, which a derived type can't hold (a Value field
+# would make the type contain itself), so tVal is built with
+# Value.struct_with: its fields are Values and its methods are TM's.
+
+import "dyn"
+import "bytes"
+import "strings"
+import ttmpl "text/template"
+
+# Go's U: a struct with a method.
+#[derive(Data)]
+#[data("template.U")]
+struct U {
+  #[data("V")] v: Str
+
+  #[data("TrueFalse")]
+  pub def true_false(b: Bool) -> Str {
+    b ? "true" : ""
+  }
+}
+
+# Go's V: String() on *V.
+#[derive(Data)]
+#[data("template.V")]
+struct V {
+  j: Int
+
+  pub def to_s -> Str { "<#{j}>" }
+}
+
+# Go's W: Error() on *W.
+#[derive(Data)]
+#[data("template.W")]
+struct W {
+  k: Int
+
+  pub def to_s -> Str { "[#{k}]" }
+}
+
+# A fmt.Stringer (Go's bytes.Buffer holding "foozle").
+#[derive(Data)]
+#[data("*bytes.Buffer")]
+struct Buf {
+  text: Str
+
+  pub def to_s -> Str { text }
+}
+
+# T's methods (Go's methods on *T). `which` says which T it belongs to
+# (Copy and GetU need the rest of it).
+#[derive(Data)]
+#[data("template.T")]
+struct TM {
+  which: Int
+
+  #[data("Method0")]
+  pub def method0 -> Str { "M0" }
+
+  #[data("Method1")]
+  pub def method1(a: Int) -> Int { a }
+
+  #[data("Method2")]
+  pub def method2(a: U16, b: Str) -> Str { "Method2: #{a} #{b}" }
+
+  #[data("Method3")]
+  pub def method3(v: dyn.Value) -> Str { dyn.fmt_printf("Method3: %v", [v]) }
+
+  #[data("Copy")]
+  pub def copy -> dyn.Value { make_t(which) }
+
+  #[data("MAdd")]
+  pub def madd(a: Int, b: [Int]) -> [Int] { b.map { it + a } }
+
+  # MyError returns a value and an error according to its argument.
+  #[data("MyError")]
+  pub def my_error(error: Bool) -> ~Bool {
+    fail Failure.Msg("my error") if error
+    false
+  }
+
+  # A few methods to test chaining.
+  #[data("GetU")]
+  pub def get_u -> U? {
+    return U.new(v: "v") if which == 1
+    none
+  }
+}
+
+def str_list(xs: [Str]) -> dyn.Value { dyn.Value.list_of(xs.map { dyn.Value.str(it) }, "[]string") }
+
+def int_list(xs: [Int]) -> dyn.Value { dyn.Value.list_of(xs.map { dyn.Value.int(it) }, "[]int") }
+
+def msi(keys: [Str], vals: [Int]) -> dyn.Value {
+  ks: [dyn.Value] = []
+  vs: [dyn.Value] = []
+  i = 0
+  while i < keys.size {
+    ks << dyn.Value.str(keys[i])
+    vs << dyn.Value.int(vals[i])
+    i += 1
+  }
+  dyn.Value.map_of(ks, vs, "map[string]int")
+}
+
+# map[K]string with integer keys of type kt.
+def mks(kt: Str, keys: [Int], vals: [Str], unsigned: Bool) -> dyn.Value {
+  ks: [dyn.Value] = []
+  vs: [dyn.Value] = []
+  i = 0
+  while i < keys.size {
+    if unsigned {
+      ks << dyn.Value.uint_of(keys[i].as_u64, kt)
+    } else {
+      ks << dyn.Value.int_of(keys[i], kt)
+    }
+    vs << dyn.Value.str(vals[i])
+    i += 1
+  }
+  dyn.Value.map_of(ks, vs, "map[#{kt}]string")
+}
+
+def iv(i: Int) -> dyn.Value { dyn.Value.int(i) }
+
+def strs_of(a: [dyn.Value]) -> [Str] { a.map { it.str_val } }
+
+# A T: 0 is Go's T{}, 1 is tVal, 2 is &T{X: "x"} (NonEmptyInterface).
+def make_t(which: Int) -> dyn.Value {
+  full = which == 1
+  names: [Str] = []
+  vals: [dyn.Value] = []
+  add = ->(n: Str, v: dyn.Value) {
+    names << n
+    vals << v
+  }
+  add.call("True", dyn.Value.bool(full))
+  add.call("I", iv(full ? 17 : 0))
+  add.call("U16", dyn.Value.uint_of((full ? 16 : 0).as_u64, "uint16"))
+  add.call("X", sv(which == 0 ? "" : "x"))
+  add.call("S", sv(full ? "xyz" : ""))
+  add.call("FloatZero", dyn.Value.float(0.0))
+  add.call("ComplexZero", dyn.Value.complex(Complex.new(0.0, 0.0)))
+  add.call("U", full ? U.new(v: "v").to_data.ptr : dyn.Value.nil_of("*template.U"))
+  # (html/template prints a V value with fmt: String is on *V)
+  add.call("V0", dyn.Value.struct_of("template.V", ["j"], [iv(full ? 6666 : 0)]))
+  add.call("V1", full ? V.new(j: 7777).to_data.ptr : dyn.Value.nil_of("*template.V"))
+  add.call("V2", dyn.Value.nil_of("*template.V"))
+  add.call("W0", dyn.Value.struct_of("template.W", ["k"], [iv(full ? 888 : 0)]))
+  add.call("W1", full ? W.new(k: 999).to_data.ptr : dyn.Value.nil_of("*template.W"))
+  add.call("W2", dyn.Value.nil_of("*template.W"))
+  add.call("SI", full ? int_list([3, 4, 5]) : dyn.Value.nil_of("[]int"))
+  add.call("SICap", full ? dyn.Value.list_cap([iv(0), iv(0), iv(0), iv(0), iv(0)], 10, iv(0), "[]int") : dyn.Value.nil_of("[]int"))
+  add.call("SIEmpty", dyn.Value.nil_of("[]int"))
+  add.call("SB", full ? dyn.Value.list_of([dyn.Value.bool(true), dyn.Value.bool(false)], "[]bool") : dyn.Value.nil_of("[]bool"))
+  add.call("AI", dyn.Value.list_of(full ? [iv(3), iv(4), iv(5)] : [iv(0), iv(0), iv(0)], "[3]int"))
+  add.call("PAI", full ? dyn.Value.list_of([iv(3), iv(4), iv(5)], "[3]int").ptr : dyn.Value.nil_of("*[3]int"))
+  add.call("MSI", full ? msi(["one", "two", "three"], [1, 2, 3]) : dyn.Value.nil_of("map[string]int"))
+  add.call("MSIone", full ? msi(["one"], [1]) : dyn.Value.nil_of("map[string]int"))
+  add.call("MSIEmpty", dyn.Value.nil_of("map[string]int"))
+  add.call("MXI", full ? dyn.Value.map_of([sv("one")], [iv(1)], "map[interface {}]int") : dyn.Value.nil_of("map[interface {}]int"))
+  add.call("MII", full ? dyn.Value.map_of([iv(1)], [iv(1)], "map[int]int") : dyn.Value.nil_of("map[int]int"))
+  add.call("MI32S", full ? mks("int32", [1, 2], ["one", "two"], false) : dyn.Value.nil_of("map[int32]string"))
+  add.call("MI64S", full ? mks("int64", [2, 3], ["i642", "i643"], false) : dyn.Value.nil_of("map[int64]string"))
+  add.call("MUI32S", full ? mks("uint32", [2, 3], ["u322", "u323"], true) : dyn.Value.nil_of("map[uint32]string"))
+  add.call("MUI64S", full ? mks("uint64", [2, 3], ["ui642", "ui643"], true) : dyn.Value.nil_of("map[uint64]string"))
+  add.call("MI8S", full ? mks("int8", [2, 3], ["i82", "i83"], false) : dyn.Value.nil_of("map[int8]string"))
+  add.call("MUI8S", full ? mks("uint8", [2, 3], ["u82", "u83"], true) : dyn.Value.nil_of("map[uint8]string"))
+  add.call("SMSI", full ? dyn.Value.list_of([msi(["one", "two"], [1, 2]), msi(["eleven", "twelve"], [11, 12])], "[]map[string]int") : dyn.Value.nil_of("[]map[string]int"))
+  # Empty interfaces; used to see if we can dig inside one.
+  add.call("Empty0", dyn.Value.nil_of("interface {}"))
+  add.call("Empty1", full ? iv(3) : dyn.Value.nil_of("interface {}"))
+  add.call("Empty2", full ? sv("empty2") : dyn.Value.nil_of("interface {}"))
+  add.call("Empty3", full ? int_list([7, 8]) : dyn.Value.nil_of("interface {}"))
+  add.call("Empty4", full ? U.new(v: "UinEmpty").to_data.ptr : dyn.Value.nil_of("interface {}"))
+  # Non-empty interfaces.
+  add.call("NonEmptyInterface", full ? make_t(2).ptr : dyn.Value.nil_of("template.I"))
+  add.call("NonEmptyInterfacePtS", full ? dyn.Value.list_of([sv("a"), sv("b")], "template.S").ptr : dyn.Value.nil_of("*template.I"))
+  add.call("NonEmptyInterfaceNil", dyn.Value.nil_of("template.I"))
+  add.call("NonEmptyInterfaceTypedNil", full ? dyn.Value.nil_of("*template.T") : dyn.Value.nil_of("template.I"))
+  # Stringer.
+  add.call("Str", full ? Buf.new(text: "foozle").to_data.ptr : dyn.Value.nil_of("fmt.Stringer"))
+  add.call("Err", full ? dyn.Value.str_of("erroozle", "*errors.errorString") : dyn.Value.nil_of("error"))
+  # Pointers
+  add.call("PI", full ? iv(23).ptr : dyn.Value.nil_of("*int"))
+  add.call("PS", full ? sv("a string").ptr : dyn.Value.nil_of("*string"))
+  add.call("PSI", full ? int_list([21, 22, 23]).ptr : dyn.Value.nil_of("*[]int"))
+  add.call("NIL", dyn.Value.nil_of("*int"))
+  # Function (not method)
+  if full {
+    add.call("BinaryFunc", dyn.Value.func(dyn.Func.of("func(string, string) string", ->(a: [dyn.Value]) -> ~dyn.Value { sv("[#{a[0].str_val}=#{a[1].str_val}]") })))
+    add.call("VariadicFunc", dyn.Value.func(dyn.Func.of("func(...string) string", ->(a: [dyn.Value]) -> ~dyn.Value { sv(dyn.fmt_print([sv("<"), sv(strings.join(strs_of(a), "+")), sv(">")])) })))
+    add.call("VariadicFuncInt", dyn.Value.func(dyn.Func.of("func(int, ...string) string", ->(a: [dyn.Value]) -> ~dyn.Value { sv(dyn.fmt_print([a[0], sv("=<"), sv(strings.join(strs_of(a[1...a.size]), "+")), sv(">")])) })))
+    add.call("NilOKFunc", dyn.Value.func(dyn.Func.of("func(*int) bool", ->(a: [dyn.Value]) -> ~dyn.Value { dyn.Value.bool(a[0].nil?) })))
+    add.call("ErrFunc", dyn.Value.func(dyn.Func.of("func() (string, error)", ->(a: [dyn.Value]) -> ~dyn.Value { sv("bla") })))
+    add.call("PanicFunc", dyn.Value.func(dyn.Func.of("func() string", ->(a: [dyn.Value]) -> ~dyn.Value {
+      # alx has no recover: the panic is an error.
+      fail Failure.Msg("test panic")
+      dyn.Value.invalid
+    })))
+    add.call("TooFewReturnCountFunc", dyn.Value.func(dyn.Func.of("func()", ->(a: [dyn.Value]) -> ~dyn.Value { dyn.Value.invalid })))
+    add.call("TooManyReturnCountFunc", dyn.Value.func(dyn.Func.of("func() (string, error, int)", ->(a: [dyn.Value]) -> ~dyn.Value { sv("") })))
+    add.call("InvalidReturnTypeFunc", dyn.Value.func(dyn.Func.of("func() (string, bool)", ->(a: [dyn.Value]) -> ~dyn.Value { sv("") })))
+  } else {
+    for f in ["func(string, string) string", "func(...string) string", "func(int, ...string) string", "func(*int) bool", "func() (string, error)", "func() string", "func()", "func() (string, error, int)", "func() (string, bool)"] {
+      vals << dyn.Value.nil_of(f)
+    }
+    for n in ["BinaryFunc", "VariadicFunc", "VariadicFuncInt", "NilOKFunc", "ErrFunc", "PanicFunc", "TooFewReturnCountFunc", "TooManyReturnCountFunc", "InvalidReturnTypeFunc"] {
+      names << n
+    }
+  }
+  # Template to test evaluation of templates.
+  add.call("Tmpl", dyn.Value.nil_of("*Template"))
+  # Unexported field; cannot be accessed by template.
+  add.call("unexported", iv(0))
+  dyn.Value.struct_with("template.T", names, vals, TM.new(which: which))
+}
+
+def tval -> dyn.Value { make_t(1).ptr }
+
+def tzero -> dyn.Value { make_t(0) }
+
+# Go's "Interface Call" data: map[string]any{"S": bytes.NewBufferString("foozle")}.
+def stringer_map -> dyn.Value {
+  dyn.Value.map_of([sv("S")], [Buf.new(text: "foozle").to_data.ptr], "map[string]interface {}")
+}
+
+# The FuncMap of Go's testExecute.
+def test_funcs -> Map[Str, dyn.Func] {
+  m: Map[Str, dyn.Func] = {}
+  m["add"] = dyn.Func.of("func(...int) int", ->(a: [dyn.Value]) -> ~dyn.Value {
+    s = 0
+    for x in a { s += x.int_val }
+    iv(s)
+  })
+  m["dddArg"] = dyn.Func.of("func(int, ...string) string", ->(a: [dyn.Value]) -> ~dyn.Value {
+    sv(dyn.fmt_println([a[0], dyn.Value.list_of(a[1...a.size], "[]string")]))
+  })
+  m["die"] = dyn.Func.of("func() bool", ->(a: [dyn.Value]) -> ~dyn.Value {
+    # Go's die panics; alx has no recover, so it fails instead.
+    fail Failure.Msg("die")
+    dyn.Value.invalid
+  })
+  m["echo"] = dyn.Func.of("func(interface {}) interface {}", ->(a: [dyn.Value]) -> ~dyn.Value { a[0] })
+  m["makemap"] = dyn.Func.of("func(...string) map[string]string", ->(a: [dyn.Value]) -> ~dyn.Value {
+    fail Failure.Msg("bad makemap") if a.size % 2 != 0
+    ks: [dyn.Value] = []
+    vs: [dyn.Value] = []
+    i = 0
+    while i < a.size {
+      ks << a[i]
+      vs << a[i + 1]
+      i += 2
+    }
+    dyn.Value.map_of(ks, vs, "map[string]string")
+  })
+  m["mapOfThree"] = dyn.Func.of("func() interface {}", ->(a: [dyn.Value]) -> ~dyn.Value { msi(["three"], [3]) })
+  m["oneArg"] = dyn.Func.of("func(string) string", ->(a: [dyn.Value]) -> ~dyn.Value { sv("oneArg=" + a[0].str_val) })
+  m["returnInt"] = dyn.Func.of("func() int", ->(a: [dyn.Value]) -> ~dyn.Value { iv(7) })
+  m["stringer"] = dyn.Func.of("func(fmt.Stringer) string", ->(a: [dyn.Value]) -> ~dyn.Value { sv(a[0].obj.unwrap.data_string.unwrap) })
+  m["twoArgs"] = dyn.Func.of("func(string, string) string", ->(a: [dyn.Value]) -> ~dyn.Value { sv("twoArgs=" + a[0].str_val + a[1].str_val) })
+  m["typeOf"] = dyn.Func.of("func(interface {}) string", ->(a: [dyn.Value]) -> ~dyn.Value { sv(dyn.fmt_printf("%T", [a[0]])) })
+  m["valueString"] = dyn.Func.of("func(string) string", ->(a: [dyn.Value]) -> ~dyn.Value { sv("value is ignored") })
+  m["vfunc"] = dyn.Func.of("func(template.V, *template.V) string", ->(a: [dyn.Value]) -> ~dyn.Value { sv("vfunc") })
+  m["zeroArgs"] = dyn.Func.of("func() string", ->(a: [dyn.Value]) -> ~dyn.Value { sv("zeroArgs") })
+  m
+}
+
+# One case of Go's testExecute.
+def run_exec(tmpl: Template, name: Str, input: Str, output: Str, data: dyn.Value, ok: Bool) {
+  pr = tmpl.funcs(test_funcs()).parse(input)
+  assert pr.ok?, "#{name}: parse error: #{pr.err?.message || ""}"
+  b = bytes.new_buffer([])
+  r = pr.unwrap.execute(b, data)
+  if ok {
+    assert r.ok?, "#{name}: unexpected execute error: #{r.err?.message || ""}"
+  } else {
+    assert r.err?, "#{name}: expected error; got none"
+  }
+  assert_eq b.string, output
+}
+
+def check_exec(name: Str, input: Str, output: Str, data: dyn.Value, ok: Bool) {
+  run_exec(new(name), name, input, output, data, ok)
+}
+
+# These strings are also in testdata/*.
+MULTI_TEXT1 = "\n\t{{define \"x\"}}TEXT{{end}}\n\t{{define \"dotV\"}}{{.V}}{{end}}\n"
+MULTI_TEXT2 = "\n\t{{define \"dot\"}}{{.}}{{end}}\n\t{{define \"nested\"}}{{template \"dot\" .}}{{end}}\n"
+
+def multi_root -> Template {
+  t = new("root").parse(MULTI_TEXT1).unwrap
+  t.parse(MULTI_TEXT2).unwrap
+}
+
+def check_multi_exec(name: Str, input: Str, output: Str, data: dyn.Value, ok: Bool) {
+  run_exec(multi_root().new(name), name, input, output, data, ok)
+}
+
+# TestComparison's data.
+def cmp_struct -> dyn.Value {
+  names = ["Uthree", "Ufour", "NegOne", "Three", "Ptr", "NilPtr", "NonNilMap", "Map", "V1", "V2", "Iface1", "Iface2"]
+  vals = [
+    dyn.Value.uint(3.as_u64), dyn.Value.uint(4.as_u64), iv(-1), iv(3), iv(0).ptr, dyn.Value.nil_of("*int"),
+    dyn.Value.map_of([], [], "map[int]int"), dyn.Value.nil_of("map[int]int"),
+    V.new(j: 0).to_data, V.new(j: 0).to_data,
+    Buf.new(text: "").to_data.ptr, dyn.Value.nil_of("fmt.Stringer"),
+  ]
+  dyn.Value.struct_of("struct { Uthree uint; Ufour uint; NegOne int; Three int; Ptr *int; NilPtr *int; NonNilMap map[int]int; Map map[int]int; V1 template.V; V2 template.V; Iface1 fmt.Stringer; Iface2 fmt.Stringer }", names, vals).ptr
+}
+
+def check_cmp(expr: Str, truth: Str, ok: Bool) {
+  text = "{{if #{expr}}}true{{else}}false{{end}}"
+  t = new("empty").parse(text).unwrap
+  b = bytes.new_buffer([])
+  r = t.execute(b, cmp_struct())
+  if ok {
+    assert r.ok?, "#{expr} errored incorrectly: #{r.err?.message || ""}"
+  } else {
+    assert r.err?, "#{expr} did not error"
+  }
+  assert_eq b.string, truth
+}

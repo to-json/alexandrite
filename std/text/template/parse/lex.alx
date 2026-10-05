@@ -1,0 +1,758 @@
+# The lexer: Go's text/template/parse/lex.go. Go's state functions become a
+# state number dispatched in a loop (`next_item!`); everything else is a
+# line-by-line port.
+
+import "strconv"
+import "strings"
+import "unicode"
+import "unicode/utf8"
+
+# Item types (Go's itemType constants, same order and values).
+pub ITEM_ERROR = 0
+pub ITEM_BOOL = 1
+pub ITEM_CHAR = 2
+pub ITEM_CHAR_CONSTANT = 3
+pub ITEM_COMMENT = 4
+pub ITEM_COMPLEX = 5
+pub ITEM_ASSIGN = 6
+pub ITEM_DECLARE = 7
+pub ITEM_EOF = 8
+pub ITEM_FIELD = 9
+pub ITEM_IDENTIFIER = 10
+pub ITEM_LEFT_DELIM = 11
+pub ITEM_LEFT_PAREN = 12
+pub ITEM_NUMBER = 13
+pub ITEM_PIPE = 14
+pub ITEM_RAW_STRING = 15
+pub ITEM_RIGHT_DELIM = 16
+pub ITEM_RIGHT_PAREN = 17
+pub ITEM_SPACE = 18
+pub ITEM_STRING = 19
+pub ITEM_TEXT = 20
+pub ITEM_VARIABLE = 21
+# Keywords appear after all the rest.
+pub ITEM_KEYWORD = 22
+pub ITEM_BLOCK = 23
+pub ITEM_BREAK = 24
+pub ITEM_CONTINUE = 25
+pub ITEM_DOT = 26
+pub ITEM_DEFINE = 27
+pub ITEM_ELSE = 28
+pub ITEM_END = 29
+pub ITEM_IF = 30
+pub ITEM_NIL = 31
+pub ITEM_RANGE = 32
+pub ITEM_TEMPLATE = 33
+pub ITEM_WITH = 34
+
+EOF = -1
+
+DEFAULT_LEFT_DELIM = "{{"
+DEFAULT_RIGHT_DELIM = "}}"
+LEFT_COMMENT = "/*"
+RIGHT_COMMENT = "*/"
+SPACE_CHARS = " \t\r\n"
+# marker plus space before or after
+TRIM_MARKER_LEN = 2
+
+# States of the scanner (Go's state functions).
+S_DONE = 0
+S_TEXT = 1
+S_LEFT_DELIM = 2
+S_COMMENT = 3
+S_RIGHT_DELIM = 4
+S_INSIDE_ACTION = 5
+S_SPACE = 6
+S_IDENTIFIER = 7
+S_FIELD = 8
+S_VARIABLE = 9
+S_CHAR = 10
+S_NUMBER = 11
+S_QUOTE = 12
+S_RAW_QUOTE = 13
+
+# A token or text string returned from the scanner.
+pub struct Item {
+  # The type of this item.
+  typ: Int
+  # The starting position, in bytes, of this item in the input string.
+  pos: Int
+  # The value of this item.
+  val: Str
+  # The line number at the start of this item.
+  line: Int
+
+  pub def to_s -> Str {
+    if typ == ITEM_EOF {
+      return "EOF"
+    }
+    if typ == ITEM_ERROR {
+      return val
+    }
+    if typ > ITEM_KEYWORD {
+      return "<#{val}>"
+    }
+    if utf8.rune_count_in_string(val) > 10 {
+      return "#{strconv.quote(first_runes(val, 10))}..."
+    }
+    strconv.quote(val)
+  }
+}
+
+# The first n runes of s (fmt's %.nq precision).
+def first_runes(s: Str, n: Int) -> Str {
+  i = 0
+  k = 0
+  while i < s.size && k < n {
+    _, w = utf8.decode_rune_at(s, i)
+    i += w
+    k += 1
+  }
+  s[0...i]
+}
+
+# The keyword item type for a word, or 0.
+def keyword(word: Str) -> Int {
+  case word {
+    "." => ITEM_DOT
+    "block" => ITEM_BLOCK
+    "break" => ITEM_BREAK
+    "continue" => ITEM_CONTINUE
+    "define" => ITEM_DEFINE
+    "else" => ITEM_ELSE
+    "end" => ITEM_END
+    "if" => ITEM_IF
+    "range" => ITEM_RANGE
+    "nil" => ITEM_NIL
+    "template" => ITEM_TEMPLATE
+    "with" => ITEM_WITH
+    _ => 0
+  }
+}
+
+# Go's %#U: U+0023 '#' (the character only when printable).
+pub def sharp_u(r: Int) -> Str {
+  h = strings.to_upper(strconv.format_int(r, 16))
+  while h.size < 4 { h = "0" + h }
+  if r >= 0 && strconv.is_print(r.to_i32) {
+    return "U+#{h} '#{Str.from_bytes(utf8.encode_rune(r.to_i32))}'"
+  }
+  "U+#{h}"
+}
+
+# The scanner's state.
+pub struct Lexer {
+  # the name of the input; used only for error reports
+  name: Str
+  # the string being scanned
+  input: Str
+  # start of action marker
+  left_delim: Str
+  # end of action marker
+  right_delim: Str
+  # current position in the input
+  pos: Int
+  # start position of this item
+  start: Int
+  # we have hit the end of input and returned eof
+  at_eof: Bool
+  # nesting depth of ( ) exprs
+  paren_depth: Int
+  # 1+number of newlines seen
+  line: Int
+  # start line of this item
+  start_line: Int
+  # item to return to parser
+  item: Item
+  # are we inside an action?
+  inside_action: Bool
+  # Options. All default to false.
+  # emit ITEM_COMMENT tokens.
+  emit_comment: Bool
+  # break keyword allowed
+  break_ok: Bool
+  # continue keyword allowed
+  continue_ok: Bool
+
+  # Returns the next rune in the input.
+  def next! -> Int {
+    if pos >= input.size {
+      self.at_eof = true
+      return EOF
+    }
+    r, w = utf8.decode_rune_at(input, pos)
+    self.pos += w
+    self.line += 1 if r == 10
+    r.to_i
+  }
+
+  # Returns but does not consume the next rune in the input.
+  def peek! -> Int {
+    r = next!
+    backup!
+    r
+  }
+
+  # Steps back one rune.
+  def backup! {
+    if !at_eof && pos > 0 {
+      r, w = last_rune(input, pos)
+      self.pos -= w
+      # Correct newline count.
+      self.line -= 1 if r == 10
+    }
+  }
+
+  # The item at the current input point with the specified type, and
+  # advances the input.
+  def this_item!(t: Int) -> Item {
+    i = Item.new(typ: t, pos: start, val: input[start...pos], line: start_line)
+    self.start = pos
+    self.start_line = line
+    i
+  }
+
+  # Passes the trailing text as an item back to the parser.
+  def emit!(t: Int) -> Int {
+    self.item = this_item!(t)
+    S_DONE
+  }
+
+  # Passes the specified item to the parser.
+  def emit_item!(i: Item) -> Int {
+    self.item = i
+    S_DONE
+  }
+
+  # Skips over the pending input before this point. It tracks newlines in
+  # the ignored text, so use it only for text that is skipped without
+  # calling next!.
+  def ignore! {
+    self.line += strings.count(input[start...pos], "\n")
+    self.start = pos
+    self.start_line = line
+  }
+
+  # Consumes the next rune if it's from the valid set.
+  def accept!(valid: Str) -> Bool {
+    if contains_rune(valid, next!) {
+      return true
+    }
+    backup!
+    false
+  }
+
+  # Consumes a run of runes from the valid set.
+  def accept_run!(valid: Str) {
+    while contains_rune(valid, next!) {}
+    backup!
+  }
+
+  # Returns an error token and terminates the scan.
+  def errorf!(msg: Str) -> Int {
+    self.item = Item.new(typ: ITEM_ERROR, pos: start, val: msg, line: start_line)
+    self.start = 0
+    self.pos = 0
+    self.input = ""
+    S_DONE
+  }
+
+  # Returns the next item from the input.
+  pub def next_item! -> Item {
+    self.item = Item.new(typ: ITEM_EOF, pos: pos, val: "EOF", line: start_line)
+    state = inside_action ? S_INSIDE_ACTION : S_TEXT
+    while state != S_DONE {
+      state = step!(state)
+    }
+    item
+  }
+
+  def step!(state: Int) -> Int {
+    case state {
+      S_TEXT => lex_text!
+      S_LEFT_DELIM => lex_left_delim!
+      S_COMMENT => lex_comment!
+      S_RIGHT_DELIM => lex_right_delim!
+      S_INSIDE_ACTION => lex_inside_action!
+      S_SPACE => lex_space!
+      S_IDENTIFIER => lex_identifier!
+      S_FIELD => lex_field_or_variable!(ITEM_FIELD)
+      S_VARIABLE => lex_variable!
+      S_CHAR => lex_char!
+      S_NUMBER => lex_number!
+      S_QUOTE => lex_quote!
+      S_RAW_QUOTE => lex_raw_quote!
+      _ => S_DONE
+    }
+  }
+
+  # Scans until an opening action delimiter, "{{".
+  def lex_text! -> Int {
+    x = input.byteindex(left_delim, pos)
+    if x >= 0 {
+      x -= pos
+      if x > 0 {
+        self.pos += x
+        # Do we trim any trailing space?
+        trim_length = 0
+        delim_end = pos + left_delim.size
+        if has_left_trim_marker(input, delim_end) {
+          trim_length = right_trim_length(input[start...pos])
+        }
+        self.pos -= trim_length
+        self.line += strings.count(input[start...pos], "\n")
+        i = this_item!(ITEM_TEXT)
+        self.pos += trim_length
+        ignore!
+        if i.val.size > 0 {
+          return emit_item!(i)
+        }
+      }
+      return S_LEFT_DELIM
+    }
+    self.pos = input.size
+    # Correctly reached EOF.
+    if pos > start {
+      self.line += strings.count(input[start...pos], "\n")
+      return emit!(ITEM_TEXT)
+    }
+    emit!(ITEM_EOF)
+  }
+
+  # Whether the lexer is at a right delimiter, possibly preceded by a trim
+  # marker: (delim, trim_spaces).
+  def at_right_delim -> (Bool, Bool) {
+    if has_right_trim_marker(input, pos) && has_prefix_at(input, pos + TRIM_MARKER_LEN, right_delim) {
+      return (true, true)
+    }
+    if has_prefix_at(input, pos, right_delim) {
+      return (true, false)
+    }
+    (false, false)
+  }
+
+  # Scans the left delimiter, which is known to be present, possibly with
+  # a trim marker.
+  def lex_left_delim! -> Int {
+    self.pos += left_delim.size
+    trim_space = has_left_trim_marker(input, pos)
+    after_marker = trim_space ? TRIM_MARKER_LEN : 0
+    if has_prefix_at(input, pos + after_marker, LEFT_COMMENT) {
+      self.pos += after_marker
+      ignore!
+      return S_COMMENT
+    }
+    i = this_item!(ITEM_LEFT_DELIM)
+    self.inside_action = true
+    self.pos += after_marker
+    ignore!
+    self.paren_depth = 0
+    emit_item!(i)
+  }
+
+  # Scans a comment. The left comment marker is known to be present.
+  def lex_comment! -> Int {
+    self.pos += LEFT_COMMENT.size
+    x = input.byteindex(RIGHT_COMMENT, pos)
+    if x < 0 {
+      return errorf!("unclosed comment")
+    }
+    self.pos = x + RIGHT_COMMENT.size
+    delim, trim_space = at_right_delim()
+    if !delim {
+      return errorf!("comment ends before closing delimiter")
+    }
+    self.line += strings.count(input[start...pos], "\n")
+    i = this_item!(ITEM_COMMENT)
+    self.pos += TRIM_MARKER_LEN if trim_space
+    self.pos += right_delim.size
+    self.pos += left_trim_length(input, pos) if trim_space
+    ignore!
+    if emit_comment {
+      return emit_item!(i)
+    }
+    S_TEXT
+  }
+
+  # Scans the right delimiter, which is known to be present, possibly with
+  # a trim marker.
+  def lex_right_delim! -> Int {
+    _, trim_space = at_right_delim()
+    if trim_space {
+      self.pos += TRIM_MARKER_LEN
+      ignore!
+    }
+    self.pos += right_delim.size
+    i = this_item!(ITEM_RIGHT_DELIM)
+    if trim_space {
+      self.pos += left_trim_length(input, pos)
+      ignore!
+    }
+    self.inside_action = false
+    emit_item!(i)
+  }
+
+  # Scans the elements inside action delimiters.
+  def lex_inside_action! -> Int {
+    # Either number, quoted string, or identifier.
+    # Spaces separate arguments; runs of spaces turn into ITEM_SPACE.
+    # Pipe symbols separate and are emitted.
+    delim, _ = at_right_delim()
+    if delim {
+      if paren_depth == 0 {
+        return S_RIGHT_DELIM
+      }
+      return errorf!("unclosed left paren")
+    }
+    r = next!
+    if r == EOF {
+      return errorf!("unclosed action")
+    }
+    if is_space(r) {
+      # Put space back in case we have " -}}".
+      backup!
+      return S_SPACE
+    }
+    if r == 61 { # '='
+      return emit!(ITEM_ASSIGN)
+    }
+    if r == 58 { # ':'
+      if next! != 61 {
+        return errorf!("expected :=")
+      }
+      return emit!(ITEM_DECLARE)
+    }
+    if r == 124 { # '|'
+      return emit!(ITEM_PIPE)
+    }
+    if r == 34 { # '"'
+      return S_QUOTE
+    }
+    if r == 96 { # '`'
+      return S_RAW_QUOTE
+    }
+    if r == 36 { # '$'
+      return S_VARIABLE
+    }
+    if r == 39 { # '\''
+      return S_CHAR
+    }
+    if r == 46 { # '.'
+      # special look-ahead for ".field" so we don't break backup!.
+      if pos < input.size {
+        c = input[pos]
+        if c < 48 || 57 < c {
+          return S_FIELD
+        }
+      }
+      # '.' can start a number.
+      backup!
+      return S_NUMBER
+    }
+    if r == 43 || r == 45 || (48 <= r && r <= 57) {
+      backup!
+      return S_NUMBER
+    }
+    if is_alpha_numeric(r) {
+      backup!
+      return S_IDENTIFIER
+    }
+    if r == 40 { # '('
+      self.paren_depth += 1
+      return emit!(ITEM_LEFT_PAREN)
+    }
+    if r == 41 { # ')'
+      self.paren_depth -= 1
+      if paren_depth < 0 {
+        return errorf!("unexpected right paren")
+      }
+      return emit!(ITEM_RIGHT_PAREN)
+    }
+    if r <= 127 && r >= 32 && r < 127 {
+      return emit!(ITEM_CHAR)
+    }
+    errorf!("unrecognized character in action: #{sharp_u(r)}")
+  }
+
+  # Scans a run of space characters. We have not consumed the first space,
+  # which is known to be present. Take care if there is a trim-marked right
+  # delimiter, which starts with a space.
+  def lex_space! -> Int {
+    num_spaces = 0
+    loop {
+      r = peek!
+      break if !is_space(r)
+      next!
+      num_spaces += 1
+    }
+    # Be careful about a trim-marked closing delimiter, which has a minus
+    # after a space. We know there is a space, so check for the '-' that
+    # might follow.
+    if has_right_trim_marker(input, pos - 1) && has_prefix_at(input, pos - 1 + TRIM_MARKER_LEN, right_delim) {
+      # Before the space.
+      backup!
+      if num_spaces == 1 {
+        # On the delim, so go right to that.
+        return S_RIGHT_DELIM
+      }
+    }
+    emit!(ITEM_SPACE)
+  }
+
+  # Scans an alphanumeric.
+  def lex_identifier! -> Int {
+    loop {
+      r = next!
+      if !is_alpha_numeric(r) {
+        backup!
+        word = input[start...pos]
+        if !at_terminator!() {
+          return errorf!("bad character #{sharp_u(r)}")
+        }
+        k = keyword(word)
+        if k > ITEM_KEYWORD {
+          if (k == ITEM_BREAK && !break_ok) || (k == ITEM_CONTINUE && !continue_ok) {
+            return emit!(ITEM_IDENTIFIER)
+          }
+          return emit!(k)
+        }
+        if word[0] == 46 {
+          return emit!(ITEM_FIELD)
+        }
+        if word == "true" || word == "false" {
+          return emit!(ITEM_BOOL)
+        }
+        return emit!(ITEM_IDENTIFIER)
+      }
+    }
+    S_DONE
+  }
+
+  # Scans a variable: $Alphanumeric. The $ has been scanned.
+  def lex_variable! -> Int {
+    if at_terminator!() {
+      # Nothing interesting follows -> "$".
+      return emit!(ITEM_VARIABLE)
+    }
+    lex_field_or_variable!(ITEM_VARIABLE)
+  }
+
+  # Scans a field or variable: [.$]Alphanumeric. The . or $ has been
+  # scanned.
+  def lex_field_or_variable!(typ: Int) -> Int {
+    if at_terminator!() {
+      # Nothing interesting follows -> "." or "$".
+      if typ == ITEM_VARIABLE {
+        return emit!(ITEM_VARIABLE)
+      }
+      return emit!(ITEM_DOT)
+    }
+    r = 0
+    loop {
+      r = next!
+      if !is_alpha_numeric(r) {
+        backup!
+        break
+      }
+    }
+    if !at_terminator!() {
+      return errorf!("bad character #{sharp_u(r)}")
+    }
+    emit!(typ)
+  }
+
+  # Whether the input is at a valid termination character to appear after
+  # an identifier. Breaks .X.Y into two pieces. Also catches cases like
+  # "$x+2" not being acceptable without a space, in case we decide one day
+  # to implement arithmetic.
+  def at_terminator! -> Bool {
+    r = peek!
+    if is_space(r) {
+      return true
+    }
+    # eof, '.', ',', '|', ':', ')', '('
+    if r == EOF || r == 46 || r == 44 || r == 124 || r == 58 || r == 41 || r == 40 {
+      return true
+    }
+    has_prefix_at(input, pos, right_delim)
+  }
+
+  # Scans a character constant. The initial quote is already scanned.
+  # Syntax checking is done by the parser.
+  def lex_char! -> Int {
+    loop {
+      c = next!
+      if c == 92 { # '\\'
+        r = next!
+        if r != EOF && r != 10 {
+          next
+        }
+        return errorf!("unterminated character constant")
+      }
+      if c == EOF || c == 10 {
+        return errorf!("unterminated character constant")
+      }
+      break if c == 39
+    }
+    emit!(ITEM_CHAR_CONSTANT)
+  }
+
+  # Scans a number: decimal, octal, hex, float, or imaginary. This isn't a
+  # perfect number scanner - for instance it accepts "." and "0x0.2" and
+  # "089" - but when it's wrong the input is invalid and the parser (via
+  # strconv) will notice.
+  def lex_number! -> Int {
+    if !scan_number!() {
+      return errorf!("bad number syntax: #{strconv.quote(input[start...pos])}")
+    }
+    sign = peek!
+    if sign == 43 || sign == 45 {
+      # Complex: 1+2i. No spaces, must end in 'i'.
+      if !scan_number!() || input[pos - 1] != 105 {
+        return errorf!("bad number syntax: #{strconv.quote(input[start...pos])}")
+      }
+      return emit!(ITEM_COMPLEX)
+    }
+    emit!(ITEM_NUMBER)
+  }
+
+  def scan_number! -> Bool {
+    # Optional leading sign.
+    accept!("+-")
+    # Is it hex?
+    digits = "0123456789_"
+    if accept!("0") {
+      # Note: Leading 0 does not mean octal in floats.
+      if accept!("xX") {
+        digits = "0123456789abcdefABCDEF_"
+      } else if accept!("oO") {
+        digits = "01234567_"
+      } else if accept!("bB") {
+        digits = "01_"
+      }
+    }
+    accept_run!(digits)
+    if accept!(".") {
+      accept_run!(digits)
+    }
+    if digits.size == 10 + 1 && accept!("eE") {
+      accept!("+-")
+      accept_run!("0123456789_")
+    }
+    if digits.size == 16 + 6 + 1 && accept!("pP") {
+      accept!("+-")
+      accept_run!("0123456789_")
+    }
+    # Is it imaginary?
+    accept!("i")
+    # Next thing mustn't be alphanumeric.
+    if is_alpha_numeric(peek!) {
+      next!
+      return false
+    }
+    true
+  }
+
+  # Scans a quoted string.
+  def lex_quote! -> Int {
+    loop {
+      c = next!
+      if c == 92 {
+        r = next!
+        if r != EOF && r != 10 {
+          next
+        }
+        return errorf!("unterminated quoted string")
+      }
+      if c == EOF || c == 10 {
+        return errorf!("unterminated quoted string")
+      }
+      break if c == 34
+    }
+    emit!(ITEM_STRING)
+  }
+
+  # Scans a raw quoted string.
+  def lex_raw_quote! -> Int {
+    loop {
+      c = next!
+      if c == EOF {
+        return errorf!("unterminated raw quoted string")
+      }
+      break if c == 96
+    }
+    emit!(ITEM_RAW_STRING)
+  }
+}
+
+# Creates a new scanner for the input string.
+pub def lex(name: Str, input: Str, left: Str, right: Str) -> Lexer {
+  l = left == "" ? DEFAULT_LEFT_DELIM : left
+  r = right == "" ? DEFAULT_RIGHT_DELIM : right
+  Lexer.new(name: name, input: input, left_delim: l, right_delim: r, line: 1, start_line: 1)
+}
+
+# The rune ending at byte offset `e` of `s`, and its width.
+def last_rune(s: Str, e: Int) -> (Int, Int) {
+  k = 1
+  while k <= 4 && e - k >= 0 {
+    if utf8.rune_start(s[e - k]) {
+      r, w = utf8.decode_rune_at(s, e - k)
+      if w == k {
+        return (r.to_i, w)
+      }
+      return (utf8.RUNE_ERROR.to_i, 1)
+    }
+    k += 1
+  }
+  (utf8.RUNE_ERROR.to_i, 1)
+}
+
+def contains_rune(valid: Str, r: Int) -> Bool {
+  return false if r < 0
+  if r < 128 {
+    return valid.byteindex(Str.from_bytes([r.as_u8])) >= 0
+  }
+  strings.contains_rune(valid, r.to_i32)
+}
+
+def has_prefix_at(s: Str, at: Int, p: Str) -> Bool {
+  return false if at < 0 || at + p.size > s.size
+  i = 0
+  while i < p.size {
+    return false if s[at + i] != p[i]
+    i += 1
+  }
+  true
+}
+
+# The length of the spaces at the end of the string.
+def right_trim_length(s: Str) -> Int {
+  s.size - strings.trim_right(s, SPACE_CHARS).size
+}
+
+# The length of the spaces at the beginning of s[at...].
+def left_trim_length(s: Str, at: Int) -> Int {
+  i = at
+  while i < s.size && is_space(s[i].to_i) { i += 1 }
+  i - at
+}
+
+# Whether r is a space character.
+def is_space(r: Int) -> Bool {
+  r == 32 || r == 9 || r == 13 || r == 10
+}
+
+# Whether r is an alphabetic, digit, or underscore.
+def is_alpha_numeric(r: Int) -> Bool {
+  return false if r < 0
+  r == 95 || unicode.is_letter(r.to_i32) || unicode.is_digit(r.to_i32)
+}
+
+def has_left_trim_marker(s: Str, at: Int) -> Bool {
+  s.size - at >= 2 && s[at] == 45 && is_space(s[at + 1].to_i)
+}
+
+def has_right_trim_marker(s: Str, at: Int) -> Bool {
+  at >= 0 && s.size - at >= 2 && is_space(s[at].to_i) && s[at + 1] == 45
+}

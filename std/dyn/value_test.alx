@@ -1,0 +1,106 @@
+# Values by hand: constructors, type names, Go's fmt over them, JSON, and
+# the conversions from_data uses. (fmt is exercised much further by
+# text/template's generated vectors.)
+
+import "encoding/json"
+import "strings"
+
+test "scalars and type names" {
+  assert_eq Value.int(3).type_name, "int"
+  assert_eq Value.int_of(-3, "int8").type_name, "int8"
+  assert_eq Value.uint_of(7.as_u64, "uint16").type_name, "uint16"
+  assert_eq Value.float_of(0.5, "float32").type_name, "float32"
+  assert_eq Value.str_of("<b>", "template.HTML").type_name, "template.HTML"
+  assert_eq Value.bool(true).kind, KIND_BOOL
+  assert_eq Value.invalid.valid?, false
+  assert_eq Value.complex(Complex.new(1.0, -2.0)).type_name, "complex128"
+}
+
+test "containers" {
+  l = Value.list_of([Value.int(1), Value.int(2)], "[]int")
+  assert_eq l.len, 2
+  assert_eq l.at(1).int_val, 2
+  assert_eq l.type_name, "[]int"
+  m = Value.map_of([Value.str("b"), Value.str("a")], [Value.int(2), Value.int(1)], "map[string]int")
+  assert_eq m.map_get(Value.str("a")).unwrap.int_val, 1
+  ks: [Str] = []
+  for e in m.sorted_entries {
+    ks << e[0].str_val
+  }
+  assert_eq ks, ["a", "b"]
+  s = Value.struct_of("main.P", ["X", "y"], [Value.int(1), Value.str("q")])
+  assert_eq s.field_names, ["X", "y"]
+  assert_eq s.field("X").unwrap[1], true
+  assert_eq s.field("y").unwrap[1], false
+  assert s.field("Z") == none, "no field Z"
+}
+
+test "pointers and nil" {
+  p = Value.int(5).ptr
+  assert_eq p.kind, KIND_PTR
+  assert_eq p.type_name, "*int"
+  assert_eq p.elem.int_val, 5
+  n = Value.nil_of("*int")
+  assert n.nil?, "nil pointer"
+  assert_eq deref(n.ptr.ptr).kind, KIND_INVALID
+  assert absent?(n), "a nil pointer is absent"
+  assert absent?(Value.invalid), "invalid is absent"
+  assert !absent?(Value.int(0)), "zero is a value"
+  assert Value.nil_of("[]int").nil?, "nil slice"
+}
+
+test "fmt" {
+  s = Value.struct_of("main.P", ["X", "Y"], [Value.int(1), Value.list_of([Value.str("a")], "[]string")])
+  assert_eq fmt_print([s]), "{1 [a]}"
+  assert_eq fmt_printf("%+v", [s]), "{X:1 Y:[a]}"
+  assert_eq fmt_printf("%#v", [s]), "main.P{X:1, Y:[]string{\"a\"}}"
+  assert_eq fmt_printf("%T %d %05.1f %q %x", [s, Value.int(42), Value.float(3.14159), Value.str("hi"), Value.str("hi")]), "main.P 42 003.1 \"hi\" 6869"
+  assert_eq fmt_println([Value.int(1), Value.str("a")]), "1 a\n"
+  assert_eq fmt_print([Value.str("a"), Value.str("b"), Value.int(1), Value.int(2)]), "ab1 2"
+  assert_eq fmt_printf("%d", [Value.str("x")]), "%!d(string=x)"
+  assert_eq fmt_printf("%d %d", [Value.int(1)]), "1 %!d(MISSING)"
+  assert_eq Value.map_of([Value.str("b"), Value.str("a")], [Value.int(2), Value.int(1)], "map[string]int").to_s, "map[a:1 b:2]"
+  assert_eq Value.nil_of("*int").to_s, "<nil>"
+}
+
+test "from json" {
+  v = Value.from_json(json.parse("{\"a\": [1, 2.5, \"x\", null, true], \"b\": {\"c\": 1}}").unwrap)
+  assert_eq v.type_name, "map[string]interface {}"
+  assert_eq v.to_s, "map[a:[1 2.5 x <nil> true] b:map[c:1]]"
+  a = v.map_get(Value.str("a")).unwrap
+  assert_eq a.type_name, "[]interface {}"
+  assert_eq a.at(0).type_name, "float64"
+}
+
+test "conversions" {
+  assert_eq ~to_int(Value.float(3.0)), 3
+  assert_eq to_int(Value.float(3.5)).err?.message || "", "dyn: cannot use float64 value as int"
+  assert_eq ~to_int(Value.uint_of(9.as_u64, "uint8")), 9
+  assert_eq to_uint(Value.int(-1)).err?.message || "", "dyn: cannot use int value as uint"
+  assert_eq ~to_float(Value.int(2)), 2.0
+  assert_eq ~to_str(Value.str("s").ptr), "s"
+  assert_eq to_str(Value.invalid).err?.message || "", "dyn: cannot use nil value as string"
+  assert_eq ~to_bool(Value.bool(true)), true
+  assert_eq ~to_complex(Value.int(2)), Complex.new(2.0, 0.0)
+  assert_eq (~want_list(Value.invalid, -1)).len, 0
+  assert_eq want_list(Value.list([Value.int(1)]), 2).err?.message || "", "dyn: an array of 1 elements for [2]"
+  m = Value.map({"k" => Value.int(1)})
+  assert_eq (~get_field(m, "k")).int_val, 1
+  assert_eq get_field(m, "z").err?.message || "", "dyn: map[string]interface {} has no field z"
+  assert_eq field_or_nil(m, "z").kind, KIND_INVALID
+  assert_eq ~variant_name(Value.str("Dot"), "Shape"), "Dot"
+  assert_eq ~variant_name(Value.struct_of("Shape", ["variant", "r"], [Value.str("Circle"), Value.float(1.0)]), "Shape"), "Circle"
+  assert strings.contains(no_method("T", "m").message, "no method m"), "no_method"
+}
+
+test "functions" {
+  f = Func.of("func(int, ...string) (string, error)", ->(a: [Value]) -> ~Value { Value.str("#{a[0].int_val}:#{a.size}") })
+  assert_eq f.sig.to_s, "func(int, ...string) (string, error)"
+  assert_eq f.sig.params, ["int", "string"]
+  assert f.sig.variadic, "variadic"
+  assert_eq (~f.call([Value.int(4), Value.str("x")])).str_val, "4:2"
+  v = Value.func(f)
+  assert_eq v.type_name, "func(int, ...string) (string, error)"
+  c = ~want_func(v)
+  assert_eq (~c.call([Value.int(1)])).str_val, "1:1"
+}

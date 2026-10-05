@@ -1,0 +1,180 @@
+# Go's example_test.go and examplefiles_test.go.
+
+import "dyn"
+import "os"
+import "path/filepath"
+import "strings"
+import ttmpl "text/template"
+
+def page_data(title: Str, items: [Str]) -> dyn.Value {
+  dyn.Value.struct_of("struct { Title string; Items []string }", ["Title", "Items"], [sv(title), dyn.Value.list_of(items.map { sv(it) }, "[]string")])
+}
+
+example "example" {
+  tpl = "\n<!DOCTYPE html>\n<html>\n\t<head>\n\t\t<meta charset=\"UTF-8\">\n\t\t<title>{{.Title}}</title>\n\t</head>\n\t<body>\n\t\t{{range .Items}}<div>{{ . }}</div>{{else}}<div><strong>no rows</strong></div>{{end}}\n\t</body>\n</html>"
+  t = new("webpage").parse(tpl).unwrap
+  print t.execute_str(page_data("My page", ["My photos", "My blog"])).unwrap
+  print t.execute_str(page_data("My another page", [])).unwrap
+} outputs "\n<!DOCTYPE html>\n<html>\n\t<head>\n\t\t<meta charset=\"UTF-8\">\n\t\t<title>My page</title>\n\t</head>\n\t<body>\n\t\t<div>My photos</div><div>My blog</div>\n\t</body>\n</html>\n<!DOCTYPE html>\n<html>\n\t<head>\n\t\t<meta charset=\"UTF-8\">\n\t\t<title>My another page</title>\n\t</head>\n\t<body>\n\t\t<div><strong>no rows</strong></div>\n\t</body>\n</html>"
+
+example "autoescaping" {
+  t = new("foo").parse("{{define \"T\"}}Hello, {{.}}!{{end}}").unwrap
+  print t.execute_template_str("T", sv("<script>alert('you have been pwned')</script>")).unwrap
+} outputs "Hello, &lt;script&gt;alert(&#39;you have been pwned&#39;)&lt;/script&gt;!"
+
+# (Go's HTMLEscape and JSEscape write the escaped bytes to a Writer; alx's
+# escape a Str.)
+example "escape" {
+  s = "\"Fran & Freddie's Diner\" <tasty@example.com>"
+  v = [sv("\"Fran & Freddie's Diner\""), dyn.Value.int_of(32, "int32"), sv("<tasty@example.com>")]
+  puts html_escape_string(s)
+  puts html_escape_string(Str.from_bytes(s.bytes))
+  puts html_escaper_values(v)
+  puts js_escape_string(s)
+  puts js_escape_string(Str.from_bytes(s.bytes))
+  puts js_escaper_values(v)
+  puts url_query_escaper(v)
+} outputs "&#34;Fran &amp; Freddie&#39;s Diner&#34; &lt;tasty@example.com&gt;\n&#34;Fran &amp; Freddie&#39;s Diner&#34; &lt;tasty@example.com&gt;\n&#34;Fran &amp; Freddie&#39;s Diner&#34;32&lt;tasty@example.com&gt;\n\\\"Fran \\u0026 Freddie\\'s Diner\\\" \\u003Ctasty@example.com\\u003E\n\\\"Fran \\u0026 Freddie\\'s Diner\\\" \\u003Ctasty@example.com\\u003E\n\\\"Fran \\u0026 Freddie\\'s Diner\\\"32\\u003Ctasty@example.com\\u003E\n%22Fran+%26+Freddie%27s+Diner%2232%3Ctasty%40example.com%3E\n"
+
+example "template delims" {
+  text = "<<.Greeting>> {{.Name}}"
+  data = dyn.Value.struct_of("struct { Greeting string; Name string }", ["Greeting", "Name"], [sv("Hello"), sv("Joe")])
+  t = must(new("tpl").delims("<<", ">>").parse(text))
+  print t.execute_str(data).unwrap
+} outputs "Hello {{.Name}}"
+
+# The following example is duplicated in text/template; keep them in sync.
+example "template block" {
+  master = "Names:{{block \"list\" .}}{{\"\\n\"}}{{range .}}{{println \"-\" .}}{{end}}{{end}}"
+  overlay = "{{define \"list\"}} {{join . \", \"}}{{end}} "
+  funcs: Map[Str, dyn.Func] = {
+    "join" => dyn.Func.of("func([]string, string) string", ->(a: [dyn.Value]) -> ~dyn.Value {
+      dyn.Value.str(strings.join(a[0].elems.map { it.str_val }, a[1].str_val))
+    }),
+  }
+  guardians = dyn.Value.list_of(["Gamora", "Groot", "Nebula", "Rocket", "Star-Lord"].map { sv(it) }, "[]string")
+  master_tmpl = new("master").funcs(funcs).parse(master).unwrap
+  cl = master_tmpl.clone
+  overlay_tmpl = must(cl).parse(overlay).unwrap
+  print master_tmpl.execute_str(guardians).unwrap
+  print overlay_tmpl.execute_str(guardians).unwrap
+} outputs "Names:\n- Gamora\n- Groot\n- Nebula\n- Rocket\n- Star-Lord\nNames: Gamora, Groot, Nebula, Rocket, Star-Lord"
+
+# examplefiles_test.go: templates in files.
+
+struct TemplateFile {
+  name: Str
+  contents: Str
+}
+
+def create_test_dir(files: [TemplateFile]) -> Str {
+  dir = os.mkdir_temp("", "template").unwrap
+  for file in files {
+    f = os.create(filepath.join([dir, file.name])).unwrap
+    f.write_string!(file.contents).unwrap
+    f.close!.unwrap
+  }
+  dir
+}
+
+# Here we demonstrate loading a set of templates from a directory.
+example "template glob" {
+  # Here we create a temporary directory and populate it with our sample
+  # template definition files; usually the template files would already
+  # exist in some location known to the program.
+  dir = create_test_dir([
+    # T0.tmpl is a plain template file that just invokes T1.
+    TemplateFile.new(name: "T0.tmpl", contents: "T0 invokes T1: ({{template \"T1\"}})"),
+    # T1.tmpl defines a template, T1 that invokes T2.
+    TemplateFile.new(name: "T1.tmpl", contents: "{{define \"T1\"}}T1 invokes T2: ({{template \"T2\"}}){{end}}"),
+    # T2.tmpl defines a template T2.
+    TemplateFile.new(name: "T2.tmpl", contents: "{{define \"T2\"}}This is T2{{end}}"),
+  ])
+  # pattern is the glob pattern used to find all the template files.
+  pattern = filepath.join([dir, "*.tmpl"])
+  # T0.tmpl is the first name matched, so it becomes the starting template,
+  # the value returned by ParseGlob.
+  tmpl = must(parse_glob(pattern))
+  print tmpl.execute_str(dyn.Value.invalid).unwrap
+  os.remove_all(dir).unwrap
+} outputs "T0 invokes T1: (T1 invokes T2: (This is T2))"
+
+# Here we demonstrate loading a set of templates from files in different
+# directories
+example "template parsefiles" {
+  # Here we create different temporary directories and populate them with
+  # our sample template definition files; usually the template files would
+  # already exist in some location known to the program.
+  dir1 = create_test_dir([
+    # T1.tmpl is a plain template file that just invokes T2.
+    TemplateFile.new(name: "T1.tmpl", contents: "T1 invokes T2: ({{template \"T2\"}})"),
+  ])
+  dir2 = create_test_dir([
+    # T2.tmpl defines a template T2.
+    TemplateFile.new(name: "T2.tmpl", contents: "{{define \"T2\"}}This is T2{{end}}"),
+  ])
+  # Here starts the example proper. Let's just parse only dir1/T0 and
+  # dir2/T2
+  paths = [filepath.join([dir1, "T1.tmpl"]), filepath.join([dir2, "T2.tmpl"])]
+  tmpl = must(parse_files(paths))
+  print tmpl.execute_str(dyn.Value.invalid).unwrap
+  os.remove_all(dir1).unwrap
+  os.remove_all(dir2).unwrap
+} outputs "T1 invokes T2: (This is T2)"
+
+# This example demonstrates one way to share some templates and use them in
+# different contexts. In this variant we add multiple driver templates by
+# hand to an existing bundle of templates.
+example "template helpers" {
+  dir = create_test_dir([
+    # T1.tmpl defines a template, T1 that invokes T2.
+    TemplateFile.new(name: "T1.tmpl", contents: "{{define \"T1\"}}T1 invokes T2: ({{template \"T2\"}}){{end}}"),
+    # T2.tmpl defines a template T2.
+    TemplateFile.new(name: "T2.tmpl", contents: "{{define \"T2\"}}This is T2{{end}}"),
+  ])
+  pattern = filepath.join([dir, "*.tmpl"])
+  # Load the helpers.
+  templates = must(parse_glob(pattern))
+  # Add one driver template to the bunch; we do this with an explicit
+  # template definition.
+  _a = templates.parse("{{define `driver1`}}Driver 1 calls T1: ({{template `T1`}})\n{{end}}").unwrap
+  # Add another driver template.
+  _b = templates.parse("{{define `driver2`}}Driver 2 calls T2: ({{template `T2`}})\n{{end}}").unwrap
+  # We load all the templates before execution. This package does not
+  # require that behavior but html/template's escaping does, so it's a good
+  # habit.
+  print templates.execute_template_str("driver1", dyn.Value.invalid).unwrap
+  print templates.execute_template_str("driver2", dyn.Value.invalid).unwrap
+  os.remove_all(dir).unwrap
+} outputs "Driver 1 calls T1: (T1 invokes T2: (This is T2))\nDriver 2 calls T2: (This is T2)\n"
+
+# This example demonstrates how to use one group of driver templates with
+# distinct sets of helper templates.
+example "template share" {
+  dir = create_test_dir([
+    # T0.tmpl is a plain template file that just invokes T1.
+    TemplateFile.new(name: "T0.tmpl", contents: "T0 ({{.}} version) invokes T1: ({{template `T1`}})\n"),
+    # T1.tmpl defines a template, T1 that invokes T2. Note T2 is not defined
+    TemplateFile.new(name: "T1.tmpl", contents: "{{define \"T1\"}}T1 invokes T2: ({{template \"T2\"}}){{end}}"),
+  ])
+  pattern = filepath.join([dir, "*.tmpl"])
+  # Load the drivers.
+  drivers = must(parse_glob(pattern))
+  # We must define an implementation of the T2 template. First we clone the
+  # drivers, then add a definition of T2 to the template name space.
+  # 1. Clone the helper set to create a new name space from which to run
+  # them.
+  first = drivers.clone.unwrap
+  # 2. Define T2, version A, and parse it.
+  _a = first.parse("{{define `T2`}}T2, version A{{end}}").unwrap
+  # Now repeat the whole thing, using a different version of T2.
+  # 1. Clone the drivers.
+  second = drivers.clone.unwrap
+  # 2. Define T2, version B, and parse it.
+  _b = second.parse("{{define `T2`}}T2, version B{{end}}").unwrap
+  # Execute the templates in the reverse order to verify the first is
+  # unaffected by the second.
+  print second.execute_template_str("T0.tmpl", sv("second")).unwrap
+  print first.execute_template_str("T0.tmpl", sv("first")).unwrap
+  os.remove_all(dir).unwrap
+} outputs "T0 (second version) invokes T1: (T1 invokes T2: (T2, version B))\nT0 (first version) invokes T1: (T1 invokes T2: (T2, version A))\n"

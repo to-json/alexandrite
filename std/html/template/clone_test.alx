@@ -1,0 +1,166 @@
+# Go's clone_test.go.
+
+import "dyn"
+import "strings"
+import ttmpl "text/template"
+import "text/template/parse"
+
+def nov -> dyn.Value { dyn.Value.invalid }
+
+test "add parse tree html" {
+  root = must(new("root").parse("{{define \"a\"}} {{.}} {{template \"b\"}} {{.}} \"></a>{{end}}"))
+  tree = parse.parse("t", "{{define \"b\"}}<a href=\"{{end}}", "", "", []).unwrap
+  added = must(root.add_parse_tree("b", tree["b"].unwrap))
+  assert_eq added.~execute_template_str("a", sv("1>0")), " 1&gt;0 <a href=\" 1%3e0 \"></a>"
+}
+
+test "clone" {
+  # The {{.}} will be executed with data "<i>*/" in different contexts. In
+  # the t0 template, it will be in a text context. In the t1 template, it
+  # will be in a URL context. In the t2 template, it will be in a
+  # JavaScript context. In the t3 template, it will be in a CSS context.
+  tmpl = "{{define \"a\"}}{{template \"lhs\"}}{{.}}{{template \"rhs\"}}{{end}}"
+  # Create an incomplete template t0.
+  t0 = must(new("t0").parse(tmpl))
+  # Clone t0 as t1.
+  t1 = must(t0.clone)
+  _a = must(t1.parse("{{define \"lhs\"}} <a href=\" {{end}}"))
+  _b = must(t1.parse("{{define \"rhs\"}} \"></a> {{end}}"))
+  # Execute t1.
+  assert_eq t1.~execute_template_str("a", sv("<i>*/")), " <a href=\" %3ci%3e*/ \"></a> "
+  # Clone t0 as t2.
+  t2 = must(t0.clone)
+  _c = must(t2.parse("{{define \"lhs\"}} <p onclick=\"javascript: {{end}}"))
+  _d = must(t2.parse("{{define \"rhs\"}} \"></p> {{end}}"))
+  # Execute t2.
+  assert_eq t2.~execute_template_str("a", sv("<i>*/")), " <p onclick=\"javascript: &#34;\\u003ci\\u003e*/&#34; \"></p> "
+  # Clone t0 as t3, but do not execute t3 yet.
+  t3 = must(t0.clone)
+  _e = must(t3.parse("{{define \"lhs\"}} <style> {{end}}"))
+  _f = must(t3.parse("{{define \"rhs\"}} </style> {{end}}"))
+  # Complete t0.
+  _g = must(t0.parse("{{define \"lhs\"}} ( {{end}}"))
+  _h = must(t0.parse("{{define \"rhs\"}} ) {{end}}"))
+  # Clone t0 as t4. Redefining the "lhs" template should not fail.
+  t4 = must(t0.clone)
+  assert t4.parse("{{define \"lhs\"}} OK {{end}}").ok?, "redefine lhs"
+  # Cloning t1 should fail as it has been executed.
+  assert t1.clone.err?, "cloning t1: got nil err want non-nil"
+  # Redefining the "lhs" template in t1 should fail as it has been executed.
+  assert t1.parse("{{define \"lhs\"}} OK {{end}}").err?, "redefine lhs: got nil err want non-nil"
+  # Execute t0.
+  assert_eq t0.~execute_template_str("a", sv("<i>*/")), " ( &lt;i&gt;*/ ) "
+  # Clone t0. This should fail, as t0 has already executed.
+  assert t0.clone.err?, "t0.Clone(): got nil err want non-nil"
+  # Similarly, cloning sub-templates should fail.
+  assert t0.lookup("a").unwrap.clone.err?, "t0.Lookup(\"a\").Clone()"
+  assert t0.lookup("lhs").unwrap.clone.err?, "t0.Lookup(\"lhs\").Clone()"
+  # Execute t3.
+  assert_eq t3.~execute_template_str("a", sv("<i>*/")), " <style> ZgotmplZ </style> "
+}
+
+test "templates" {
+  names = ["t0", "a", "lhs", "rhs"]
+  # Some template definitions borrowed from TestClone.
+  tmpl = "\n\t\t{{define \"a\"}}{{template \"lhs\"}}{{.}}{{template \"rhs\"}}{{end}}\n\t\t{{define \"lhs\"}} <a href=\" {{end}}\n\t\t{{define \"rhs\"}} \"></a> {{end}}"
+  t0 = must(new("t0").parse(tmpl))
+  templates = t0.templates
+  assert_eq templates.size, names.size
+  for name in names {
+    assert templates.any? { it.text.name == name }, "could not find template #{name}"
+  }
+}
+
+# This used to crash; https://golang.org/issue/3281
+test "clone crash" {
+  t1 = new("all")
+  _a = must(t1.new("t1").parse("{{define \"foo\"}}foo{{end}}"))
+  _b = t1.clone
+}
+
+# Ensure that this guarantee from the docs is upheld: "Further calls to
+# Parse in the copy will add templates to the copy but not to the
+# original."
+test "clone then parse" {
+  t0 = must(new("t0").parse("{{define \"a\"}}{{template \"embedded\"}}{{end}}"))
+  t1 = must(t0.clone)
+  _a = must(t1.parse("{{define \"embedded\"}}t1{{end}}"))
+  assert_eq t0.templates.size + 1, t1.templates.size
+  # double check that the embedded template isn't available in the original
+  assert t0.execute_template_str("a", nov()).err?, "expected 'no such template' error"
+}
+
+# https://golang.org/issue/5980
+test "func map works after clone" {
+  funcs: Map[Str, dyn.Func] = {
+    "customFunc" => dyn.Func.of("func() (string, error)", ->(a: [dyn.Value]) -> ~dyn.Value {
+      fail Failure.Msg("issue5980")
+      nov()
+    }),
+  }
+  # get the expected error output (no clone)
+  uncloned = must(new("").funcs(funcs).parse("{{customFunc}}"))
+  want_err = uncloned.execute_str(nov()).err?.message || ""
+  # toClone must be the same as uncloned. It has to be recreated from
+  # scratch, since cloning cannot occur after execution.
+  to_clone = must(new("").funcs(funcs).parse("{{customFunc}}"))
+  cloned = must(to_clone.clone)
+  got_err = cloned.execute_str(nov()).err?.message || ""
+  assert_eq got_err, want_err
+}
+
+# https://golang.org/issue/16101 (sequentially: a Template can't be shared
+# by tasks without a Mutex in alx)
+test "template clone execute" {
+  input = "<title>{{block \"a\" .}}a{{end}}</title><body>{{block \"b\" .}}b{{end}}<body>"
+  overlay = "{{define \"b\"}}A{{end}}"
+  outer = must(new("outer").parse(input))
+  tmpl = must(must(outer.clone).parse(overlay))
+  i = 0
+  while i < 100 {
+    assert_eq tmpl.~execute_str(sv("data")), "<title>a</title><body>A<body>"
+    i += 1
+  }
+}
+
+test "template clone lookup" {
+  # Template.escape makes an assumption that the template associated with
+  # t.Name() is t. Check that this holds.
+  tmpl = must(new("x").parse("a"))
+  tmpl = must(tmpl.clone)
+  assert tmpl.lookup(tmpl.name).unwrap.same?(tmpl), "after Clone, tmpl.Lookup(tmpl.Name()) != tmpl"
+}
+
+test "clone growth" {
+  tmpl = must(new("root").parse("<title>{{block \"B\". }}Arg{{end}}</title>"))
+  tmpl = must(tmpl.clone)
+  _a = must(tmpl.parse("{{define \"B\"}}Text{{end}}"))
+  i = 0
+  while i < 10 {
+    _r = tmpl.execute_str(nov())
+    i += 1
+  }
+  assert tmpl.defined_templates.size <= 200, "too many templates: #{tmpl.defined_templates.size}"
+}
+
+# https://golang.org/issue/17735
+test "clone redefined name" {
+  base = "\n{{ define \"a\" -}}<title>{{ template \"b\" . -}}</title>{{ end -}}\n{{ define \"b\" }}{{ end -}}\n"
+  page = "{{ template \"a\" . }}"
+  t1 = must(new("a").parse(base))
+  i = 0
+  while i < 2 {
+    t2 = must(t1.clone)
+    t2 = must(t2.new("#{i}").parse(page))
+    _s = t2.~execute_str(nov())
+    i += 1
+  }
+}
+
+# Issue 24791.
+test "clone pipe" {
+  a = must(new("a").parse("{{define \"a\"}}{{range $v := .A}}{{$v}}{{end}}{{end}}"))
+  data = dyn.Value.struct_of("struct { A []string }", ["A"], [dyn.Value.list_of([sv("hi")], "[]string")])
+  b = must(a.clone)
+  assert_eq b.~execute_str(data.ptr), "hi"
+}

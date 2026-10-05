@@ -173,6 +173,7 @@ The logic: **fallibility is a prefix** ("approximately do this", "you'll probabl
 | R8 | Reporting | **silent, plus `alx explain mem`** showing each allocation's region or refcount and why; a lint for refcounting in hot loops |
 | R9 | Order | **memory model first**, then the standard library |
 | R10 | Backends | **alx's own checker enforces the model**; C + JIT stay primary; Rust stays the oracle (with the model expressed as safe Rust) |
+| R11 | Package-level mutable state (user, 2026-10-04; port-issues #51) | **allowed only behind `Atomic[T]` or `Mutex[T]`, `Atomic` preferred**: a package may declare a top-level value of those types (Go's package `var`s such as log's std logger, rand's global source, slog's default, expvar's registry, zip's compressor table); everything else at package level stays constant. Contention is expected only on writes, and most programs write these 0-1 times, so `Atomic[T]` extends to any T: `load` returns a copy, `store`/`swap`/`compare_and_swap` replace the value as a whole. `Mutex[T]` stays for state updated in place (a registry map). Initialized once, before first use |
 | S1 | Stdlib first wave | **text & data core**: strings, strconv, unicode/utf8, bytes, slices/maps/sort, math, fmt, errors |
 | S2 | API shape | **Go names (snake_case), alx idioms**: `~T` for (T, error), `T?` for (T, bool), Enumerable, method sugar alongside package functions |
 | S3 | Reflection | **compile-time derives** (`#[derive(Json)]`), no runtime type info |

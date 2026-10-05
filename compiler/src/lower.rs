@@ -2007,8 +2007,18 @@ impl<'a> Lw<'a> {
         match ty {
             Ty::Fixed(el, n) => {
                 let lt = self.lty(ty);
-                let c = self.tmp(lt);
-                self.emit(LS::Set(c, LE::Rt(Rt::ArrCopy, vec![v])));
+                let c = self.tmp(lt.clone());
+                // The copy goes into the region of the array it copies: the
+                // region analysis placed that one where the value must live
+                // (`v = ys; xs[i] = v` stores v somewhere longer-lived than
+                // the current region, which a loop iteration frees; port-issues #88).
+                let src = self.bind(v, lt.clone());
+                let saved = (*n > 0).then(|| {
+                    let saved = self.tmp(LTy::Region);
+                    self.emit(LS::RegionUse { region: LE::RegionOf(Box::new(src.clone())), saved });
+                    saved
+                });
+                self.emit(LS::Set(c, LE::Rt(Rt::ArrCopy, vec![src])));
                 if el.is_value_array() {
                     let i = self.tmp(LTy::I64);
                     self.emit(LS::Set(i, LE::I(0)));
@@ -2022,6 +2032,9 @@ impl<'a> Lw<'a> {
                         lw.emit(LS::Set(i, LE::Arith(Op::Add, Box::new(LE::Var(i)), Box::new(LE::I(1)), Ovf::Unchecked)));
                     });
                     self.emit(LS::Loop(l, body));
+                }
+                if let Some(saved) = saved {
+                    self.emit(LS::RegionRestore(saved));
                 }
                 LE::Var(c)
             }

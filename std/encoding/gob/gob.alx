@@ -1,0 +1,279 @@
+#![overflow(wrap)]
+# Package gob: Go's encoding/gob, byte for byte, on compile-time derives
+# (GO-VS-RUBY D66, docs/notes/gob-derive.md).
+#
+#   import "encoding/gob"
+#
+#   #[derive(Gob)]
+#   struct P {
+#     x: Int
+#     #[field(gob: "Name")] name: Str
+#     pts: [Point]
+#     tag: Str?
+#   }
+#
+#   enc = gob.new_encoder(conn)          # any writer: a bytes.Buffer, an os.File, a net.Conn
+#   enc.~encode!(P.new(x: 3, name: "p"))
+#   dec = gob.new_decoder(conn)
+#   p = dec.~decode!(P.new)              # decoded into a copy of the value given
+#
+# ---- Go's API in alx
+#
+#   NewEncoder(w)            new_encoder(w) -> Encoder[W]
+#   (*Encoder).Encode(v)     enc.encode!(v) -> ~Unit
+#   (*Encoder).EncodeValue   (no reflect.Value: encode!)
+#   NewDecoder(r)            new_decoder(r) -> Decoder[R]
+#   (*Decoder).Decode(&v)    v = dec.decode!(v) -> ~T   (fields the stream lacks
+#                            keep v's values, as Go's do)
+#   (*Decoder).Decode(nil)   dec.skip! -> ~Unit
+#   (*Decoder).DecodeValue   (no reflect.Value: decode!)
+#   Register(v)              register(v)        (v: a derived value; an enum
+#   RegisterName(name, v)    register_name(name, v)   value names its variant)
+#   GobEncoder, GobDecoder   gob_encode -> ~[Byte] / gob_decode!(b) -> ~Unit,
+#   BinaryMarshaler, ...     marshal_binary / unmarshal_binary!: such a type
+#                            joins the gob protocol (below) as math/big's
+#                            Int, Float and Rat do (std/math/big, derives/ext_test.alx)
+#   CommonType               (internal: types.alx)
+#   io.EOF at the end        GobError.Eof (message "EOF", `e.eof?`);
+#                            io.ErrUnexpectedEOF: GobError.UnexpectedEof
+#   other errors             GobError.Msg, with Go's text ("gob: decoding into
+#                            local type *int, received remote type string",
+#                            `value for "A" out of range`, ...)
+#
+# ---- Types (Go's, on the wire)
+#
+#   Int int, I8..I32 int8..int32, Rune int32, U8/Byte uint8 .. U64 uint64,
+#   Float float64, Bool bool, Str string, Complex complex128, [Byte] []byte,
+#   [T] []T, [T; N] [N]T, Map[K, V] map[K]V, T? *T (none is a nil pointer),
+#   a derived struct a struct (named by `#[data("pkg.T")]`, default main.T;
+#   fields by `#[field(gob: "Name")]`, default the field's name in CamelCase,
+#   `gob: "-"` leaves one out), a derived enum an interface (D66): its
+#   variants are the concrete types sent in it, each under the name
+#   `#[field(gob: "name")]` on the variant gives (default pkg.Variant), or
+#   that register_name gave. A variant with one unnamed field sends that
+#   field's value (`Circle(Float)` is Go's `type Circle float64`,
+#   `Rect(Rect)` sends the struct Rect); any other variant is a struct named
+#   after the variant (unnamed fields F0, F1, ...). `E?` of an enum is an
+#   interface that may be nil.
+#   Top level: derived types, the types math/big and others give the
+#   protocol, the predeclared scalars, [scalar] and some Map[Str/Int, scalar]
+#   (basics.alx); other composites go inside a struct.
+#
+# ---- The gob protocol (what #[derive(Gob)] writes; compiler/src/derive_gob.rs)
+#
+#   def self.gob_rtype(t: gob.Types) -> Int   the Go type, described
+#   def gob_type(t: gob.Types) -> Int         the same through a value (the
+#                                             top-level type: big's is *big.Int)
+#   def gob_type_name -> Str                  Go's Register name
+#   def self.gob_zero -> T                    what decoding starts from
+#   def gob_enc(e: gob.Enc)                   the value's encoding
+#   def self.gob_compat(d: gob.Dec, w) -> ~Bool   Go's compatibleType
+#   def gob_dec(d: gob.Dec, w) -> ~T          a value of wire type w (into a copy of self)
+#   def gob_top(d: gob.Dec, w) -> ~T          the same as a whole value (Go's decodeValue)
+#
+# ---- Differences from Go
+#
+#  - No reflection: a type is encodable when it derives Gob or provides the
+#    protocol; a field of any other type is a compile-time error. Chan and
+#    func fields don't exist (Go skips them); unexported-field rules become
+#    `#[field(gob: "-")]`.
+#  - Type ids are per Encoder (Go's are per process), so a fresh Encoder
+#    numbers types from 64 as a fresh Go process does; the bytes are Go's in
+#    that case (vec_enc_test.alx). Go's own quirks are kept: a *big.Int
+#    field sends two ids, struct types first reached as map elements are
+#    nameless.
+#  - Maps encode in insertion order (Go's is random), so multi-entry maps
+#    aren't byte-comparable; an empty map is left out of a struct (alx has
+#    no nil map; Go sends an empty non-nil one).
+#  - Decoding: slices and arrays decode into fresh elements (Go reuses a
+#    slice's storage when it is long enough, merging into struct elements);
+#    a nil interface decodes into an enum field as the enum's zero value
+#    (its first variant): use `E?` to keep nil.
+#  - Errors are found as decoding reaches them: Go compiles a decoder for a
+#    whole type first, so a type error in a later field can come before a
+#    range error in an earlier one in Go and after it here (the plan of a
+#    struct, with its compatibility checks and the "no fields matched"
+#    check, is still made before any of its fields are read).
+#  - The Decoder reads exactly the bytes of each message (no read-ahead), so
+#    several Decoders can take turns on one reader (Go needs an
+#    io.ByteReader for that); wrap a slow reader in bufio.
+#  - Messages are limited to Go's tooBig (8 GiB); a corrupt length doesn't
+#    allocate more than it reads.
+#  - Register's table is a package global (R11), shared by every Encoder
+#    and Decoder, as Go's is; registering is optional for derived types
+#    (they know their names) and is only needed to send a type under
+#    another name.
+#  - float32 and complex64 don't exist in alx; a Go float32/complex64 field
+#    decodes into a Float/Complex (gob sends floats as float64).
+#  - Not ported: debug.go (Debug), TextMarshaler (Go's gob no longer treats
+#    it specially either), time.Time / net.IP's gob encodings (their packages
+#    don't provide the protocol yet).
+
+import "math"
+import "math/bits"
+
+# What can go wrong. Messages are Go's (most of Go's gob errors are
+# errors.New / fmt.Errorf text starting "gob: ").
+pub error GobError {
+  # Any of Go's gob errors, by its message.
+  Msg(text: Str)
+  # The stream ended cleanly before a value (Go's io.EOF).
+  Eof
+  # The stream ended inside a message (Go's io.ErrUnexpectedEOF).
+  UnexpectedEof
+
+  def message -> Str {
+    case self {
+      Msg(t) => t
+      Eof => "EOF"
+      UnexpectedEof => "unexpected EOF"
+    }
+  }
+
+  # Whether this is the clean end of the stream (Go's err == io.EOF).
+  pub def eof? -> Bool {
+    case self {
+      Eof => true
+      _ => false
+    }
+  }
+}
+
+pub def gerr(t: Str) -> GobError { GobError.Msg(text: t) }
+
+# ---- predefined type ids (Go's bootstrap types)
+pub T_BOOL = 1
+pub T_INT = 2
+pub T_UINT = 3
+pub T_FLOAT = 4
+pub T_BYTES = 5
+pub T_STRING = 6
+pub T_COMPLEX = 7
+pub T_INTERFACE = 8
+T_WIRE_TYPE = 16
+T_ARRAY_TYPE = 17
+T_COMMON_TYPE = 18
+T_SLICE_TYPE = 19
+T_STRUCT_TYPE = 20
+T_FIELD_TYPE = 21
+T_MAP_TYPE = 23
+# The lowest id an encoder gives a user type.
+FIRST_USER_ID = 64
+
+# Go's tooBig: the largest message (8 GiB on 64-bit machines).
+TOO_BIG = 1 << 33
+
+# ---- kinds of the local type descriptions (types.alx)
+pub K_BOOL = 1
+pub K_INT = 2
+pub K_UINT = 3
+pub K_FLOAT = 4
+pub K_BYTES = 5
+pub K_STRING = 6
+pub K_COMPLEX = 7
+pub K_IFACE = 8
+pub K_ARRAY = 9
+pub K_SLICE = 10
+pub K_MAP = 11
+pub K_STRUCT = 12
+pub K_PTR = 13
+
+# ---- external encodings (Go's xGob, xBinary, xText)
+pub X_GOB = 1
+pub X_BINARY = 2
+pub X_TEXT = 3
+
+# ---- the wire format's numbers
+
+# x appended to b as gob's unsigned integer: one byte below 128, else the
+# negated byte count and the big-endian bytes.
+pub def append_uint(b: [Byte], x: U64) -> [Byte] {
+  out = b
+  if x <= 0x7f {
+    out << x.as_u8
+    return out
+  }
+  n = 8 - (bits.leading_zeros64(x) >> 3)
+  out << (256 - n).as_u8
+  i = n - 1
+  while i >= 0 {
+    out << (x >> (i * 8).as_u64).as_u8
+    i -= 1
+  }
+  out
+}
+
+# i as gob's signed integer: the sign in the low bit.
+pub def int_bits(i: Int) -> U64 {
+  return ((^i) << 1).as_u64 | 1 if i < 0
+  (i << 1).as_u64
+}
+
+# The signed integer an unsigned wire value stands for.
+pub def bits_int(x: U64) -> Int {
+  i = (x >> 1).as_i64
+  return ^i if x & 1 != 0
+  i
+}
+
+# A float on the wire: its bits, byte-reversed (so small exponents compress).
+pub def float_bits(f: Float) -> U64 { bits.reverse_bytes64(math.float64bits(f)) }
+
+pub def bits_float(u: U64) -> Float { math.float64frombits(bits.reverse_bytes64(u)) }
+
+# Go's %q of a name in an error message (names are plain text).
+pub def gq(s: Str) -> Str { "\"" + s + "\"" }
+
+# ---- the registry (Go's Register / RegisterName)
+
+struct RegState {
+  # wire name -> the type's own name (its Go type string)
+  name_to_type: Map[Str, Str]
+  # the type's own name -> wire name
+  type_to_name: Map[Str, Str]
+}
+
+# Go's package-level registry (nameToConcreteType / concreteTypeToName), a
+# package global (R11).
+REGISTRY = Mutex.new(RegState.new(name_to_type: {}, type_to_name: {}))
+
+# Go's RegisterName: values of v's type (an enum value: its variant, D66)
+# travel in interface values as `name`. Panics, as Go does, when the name or
+# the type is already registered differently.
+pub def register_name[T](name: Str, v: T) { register_type(name, v.gob_type_name) }
+
+# Go's Register: under the type's own name (Go's rule: "main.Circle",
+# "*big.Int", "int"). A derived type is usable without registering; this
+# only claims the name.
+pub def register[T](v: T) {
+  t = v.gob_type_name
+  register_type(t, t)
+}
+
+# RegisterName by the type's own name (what `gob_type_name` returns).
+pub def register_type(name: Str, v_type: Str) {
+  panic("attempt to register empty name") if name == ""
+  msg = REGISTRY.lock { |s|
+    m = ""
+    if t = s.name_to_type[name] {
+      m = "gob: registering duplicate types for #{gq(name)}: #{t} != #{v_type}" if t != v_type
+    }
+    if m == "" {
+      if n = s.type_to_name[v_type] {
+        m = "gob: registering duplicate names for #{v_type}: #{gq(n)} != #{gq(name)}" if n != name
+      }
+    }
+    if m == "" {
+      s.name_to_type[name] = v_type
+      s.type_to_name[v_type] = name
+    }
+    m
+  }
+  panic(msg) if msg != ""
+}
+
+# The name values of the type travel as: registered, or the type's own.
+pub def name_of(v_type: Str) -> Str { REGISTRY.lock { |s| s.type_to_name[v_type] || v_type } }
+
+# The type a received name stands for: registered, or the name itself.
+pub def type_of(name: Str) -> Str { REGISTRY.lock { |s| s.name_to_type[name] || name } }

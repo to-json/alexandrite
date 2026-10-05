@@ -1,0 +1,387 @@
+# Go's codec_test.go, the parts with structs and interfaces. Not translated:
+# TestBadRecursiveType, TestNesting (recursive types: alx refuses them), the
+# debug tests (debug.go isn't ported), TestFuzz* (random corruption; Go runs
+# them only with -gob.fuzz; TestBadData's cases cover the decoder's checks),
+# TestStressParallel/TestTypeRace (Go's global type tables; alx's are per
+# Encoder). Pointer chains (**int, ***[3]int) are one `T?` here, and map
+# keys are what alx maps allow (no complex or array keys).
+import "bytes"
+import "encoding/gob"
+import "unicode/utf8"
+
+#[derive(Gob)]
+struct ET2 {
+  #[field(gob: "T")] t: Str
+}
+
+#[derive(Gob)]
+struct T3 {
+  x: Float
+  z: Int?
+}
+
+#[derive(Gob)]
+struct EndT1 {
+  a: Int
+  b: Int
+  c: Int
+  m: Map[Str, Float?]
+  m2: Map[Int, T3]
+  mstring: Map[Str, Str]
+  mintptr: Map[Int, Int?]
+  empty_map: Map[Str, Int]
+  n: [Float; 3]?
+  strs: [Str; 2]?
+  int64s: [Int]?
+  ri: Complex
+  s: Str
+  y: [Byte]
+  t: ET2?
+}
+
+test "TestEndToEnd" {
+  t1 = EndT1.new(a: 17, b: 18, c: -5, m: {"pi" => 3.14159, "e" => 2.71828}, m2: {4 => T3.new(x: 3.14159, z: 42), 10 => T3.new(x: 2.71828, z: 5)}, mstring: {"pi" => "3.14", "e" => "2.71"}, mintptr: {42 => 5, 5 => 42}, n: [1.5, 2.5, 3.5], strs: ["string1", "string2"], int64s: [77, 89, 123412342134], ri: Complex.new(17.0, -23.0), s: "Now is the time", y: "hello, sailor".bytes, t: ET2.new(t: "this is T2"))
+  t2 = enc_dec(t1, EndT1.new).unwrap
+  assert_eq hexof(t2), hexof(t1)
+  assert_eq t2.m2[10]?.z || 0, 5
+  assert_eq (t2.n || [0.0; 3])[2], 3.5
+  assert_eq t2.t?.t || "", "this is T2"
+}
+
+#[derive(Gob)]
+struct InputT {
+  maxi: Int
+  mini: Int
+  maxu: U64
+  maxf: Float
+  minf: Float
+}
+
+#[derive(Gob)]
+struct OutI8 {
+  maxi: I8
+  mini: I8
+}
+
+#[derive(Gob)]
+struct OutI16 {
+  maxi: I16
+  mini: I16
+}
+
+#[derive(Gob)]
+struct OutI32 {
+  maxi: I32
+  mini: I32
+}
+
+#[derive(Gob)]
+struct OutU8 {
+  maxu: U8
+}
+
+#[derive(Gob)]
+struct OutU16 {
+  maxu: U16
+}
+
+#[derive(Gob)]
+struct OutU32 {
+  maxu: U32
+}
+
+def err_of[A, B](a: A, b: B) -> Str { enc_dec(a, b).err?.message || "" }
+
+# (float32 and complex64 have no alx types: their two cases are left out.)
+test "TestOverflow" {
+  assert_eq err_of(InputT.new(maxi: 128), OutI8.new), "value for \"Maxi\" out of range"
+  assert_eq err_of(InputT.new(mini: -129), OutI8.new), "value for \"Mini\" out of range"
+  assert_eq err_of(InputT.new(maxi: 32768), OutI16.new), "value for \"Maxi\" out of range"
+  assert_eq err_of(InputT.new(mini: -32769), OutI16.new), "value for \"Mini\" out of range"
+  assert_eq err_of(InputT.new(maxi: 2147483648), OutI32.new), "value for \"Maxi\" out of range"
+  assert_eq err_of(InputT.new(mini: -2147483649), OutI32.new), "value for \"Mini\" out of range"
+  assert_eq err_of(InputT.new(maxu: 256), OutU8.new), "value for \"Maxu\" out of range"
+  assert_eq err_of(InputT.new(maxu: 65536), OutU16.new), "value for \"Maxu\" out of range"
+  assert_eq err_of(InputT.new(maxu: 4294967296), OutU32.new), "value for \"Maxu\" out of range"
+}
+
+#[derive(Gob)]
+struct T0 {
+  a: Int
+  b: Int
+  c: Int
+  d: Int
+}
+
+#[derive(Gob)]
+struct TP1 {
+  a: Int
+  b: Int?
+  c: Int?
+  d: Int?
+}
+
+test "TestAutoIndirection" {
+  t1 = TP1.new(a: 17, b: 177, c: 1777, d: 17777)
+  t0 = enc_dec(t1, T0.new).unwrap
+  assert_eq [t0.a, t0.b, t0.c, t0.d], [17, 177, 1777, 17777]
+  back = enc_dec(T0.new(a: 17, b: 177, c: 1777, d: 17777), TP1.new).unwrap
+  assert_eq [back.a, back.b || 0, back.c || 0, back.d || 0], [17, 177, 1777, 17777]
+  # into pointers already set
+  again = enc_dec(T0.new(a: 17, b: 177, c: 1777, d: 17777), TP1.new(b: 0, c: 0, d: 0)).unwrap
+  assert_eq again.d || 0, 17777
+}
+
+#[derive(Gob)]
+struct RT0 {
+  a: Int
+  b: Str
+  c: Float
+}
+
+#[derive(Gob)]
+struct RT1 {
+  c: Float
+  b: Str
+  a: Int
+  not_set: Str
+}
+
+test "TestReorderedFields" {
+  rt1 = enc_dec(RT0.new(a: 17, b: "hello", c: 3.14159), RT1.new).unwrap
+  assert_eq rt1.a, 17
+  assert_eq rt1.b, "hello"
+  assert_eq rt1.c, 3.14159
+}
+
+#[derive(Gob)]
+struct IT0 {
+  a: Int
+  b: Str
+  #[field(gob: "Ignore_d")] ignore_d: [Int]
+  #[field(gob: "Ignore_e")] ignore_e: [Float; 3]
+  #[field(gob: "Ignore_f")] ignore_f: Bool
+  #[field(gob: "Ignore_g")] ignore_g: Str
+  #[field(gob: "Ignore_h")] ignore_h: [Byte]
+  #[field(gob: "Ignore_i")] ignore_i: RT1?
+  #[field(gob: "Ignore_m")] ignore_m: Map[Str, Int]
+  c: Float
+}
+
+test "TestIgnoredFields" {
+  it0 = IT0.new(a: 17, b: "hello", c: 3.14159, ignore_d: [1, 2, 3], ignore_e: [1.0, 2.0, 3.0], ignore_f: true, ignore_g: "pay no attention", ignore_h: "to the curtain".bytes, ignore_i: RT1.new(c: 3.1, b: "hi", a: 7, not_set: "hello"), ignore_m: {"one" => 1, "two" => 2})
+  rt1 = enc_dec(it0, RT1.new).unwrap
+  assert_eq rt1.a, 17
+  assert_eq rt1.b, "hello"
+  assert_eq rt1.c, 3.14159
+}
+
+#[derive(Gob)]
+struct Indirect {
+  a: [Int; 3]?
+  s: [Int]?
+  m: Map[Str, Int]?
+}
+
+#[derive(Gob)]
+struct Direct {
+  a: [Int; 3]
+  s: [Int]
+  m: Map[Str, Int]
+}
+
+test "TestIndirectSliceMapArray" {
+  d = enc_dec(Indirect.new(a: [1, 2, 3], s: [4, 5, 6], m: {"one" => 1, "two" => 2, "three" => 3}), Direct.new).unwrap
+  assert_eq d.a, [1, 2, 3]
+  assert_eq d.s, [4, 5, 6]
+  assert_eq d.m.size, 3
+  assert_eq d.m["three"] || 0, 3
+  i = enc_dec(Direct.new(a: [11, 22, 33], s: [44, 55, 66], m: {"four" => 4, "five" => 5, "six" => 6}), Indirect.new).unwrap
+  assert_eq i.a || [0; 3], [11, 22, 33]
+  assert_eq i.s || [], [44, 55, 66]
+  assert_eq (i.m || {})["six"] || 0, 6
+}
+
+#[derive(Gob)]
+struct Point {
+  x: Int
+  y: Int
+}
+
+# Go's Squarer interface with its implementations Int, Float, Vector, Point.
+#[derive(Gob)]
+enum Squarer {
+  #[field(gob: "gob.Int")] Int(Int)
+  #[field(gob: "gob.Float")] Float(Float)
+  #[field(gob: "gob.Vector")] Vector([Int])
+  #[field(gob: "gob.Point")] Point(Point)
+
+  def square -> Int {
+    case self {
+      Int(i) => i * i
+      Float(f) => (f * f).to_i
+      Vector(v) => v.reduce(0) { |s, x| s + x * x }
+      Point(p) => p.x * p.x + p.y * p.y
+    }
+  }
+}
+
+#[derive(Gob)]
+struct InterfaceItem {
+  i: Int
+  sq1: Squarer
+  sq2: Squarer
+  sq3: Squarer
+  f: Float
+  sq: [Squarer?]
+}
+
+#[derive(Gob)]
+struct NoInterfaceItem {
+  i: Int
+  f: Float
+}
+
+test "TestInterface" {
+  sq: [Squarer?] = [Squarer.Int(3), Squarer.Float(5.0), none, Squarer.Vector([1, 2, 3])]
+  item1 = InterfaceItem.new(i: 1, sq1: Squarer.Int(3), sq2: Squarer.Float(5.0), sq3: Squarer.Vector([1, 2, 3]), f: 11.5, sq: sq)
+  item2 = enc_dec(item1, InterfaceItem.new).unwrap
+  assert_eq item2.i, 1
+  assert_eq item2.sq1.square, 9
+  assert_eq item2.sq2.square, 25
+  assert_eq item2.sq3.square, 14
+  assert_eq item2.f, 11.5
+  assert_eq item2.sq.size, 4
+  assert item2.sq[2] == none, "nil element"
+  assert_eq (item2.sq[3] || Squarer.Int(0)).square, 14
+}
+
+test "TestIgnoreInterface" {
+  item1 = InterfaceItem.new(i: 1, sq1: Squarer.Int(3), sq2: Squarer.Float(5.0), sq3: Squarer.Point(Point.new(x: 2, y: 3)), f: 11.5)
+  item2 = enc_dec(item1, NoInterfaceItem.new).unwrap
+  assert_eq item2.i, 1
+  assert_eq item2.f, 11.5
+}
+
+# Go's basic types in interfaces: an enum whose variants are named as Go
+# registers its basic types.
+#[derive(Gob)]
+enum Basic {
+  #[field(gob: "int")] I(Int)
+  #[field(gob: "int8")] I8(I8)
+  #[field(gob: "int16")] I16(I16)
+  #[field(gob: "int32")] I32(I32)
+  #[field(gob: "int64")] I64(Int)
+  #[field(gob: "uint8")] U8(U8)
+  #[field(gob: "uint16")] U16(U16)
+  #[field(gob: "uint32")] U32(U32)
+  #[field(gob: "uint64")] U64(U64)
+  #[field(gob: "float64")] F64(Float)
+  #[field(gob: "complex128")] C128(Complex)
+  #[field(gob: "bool")] B(Bool)
+  #[field(gob: "string")] S(Str)
+  #[field(gob: "[]uint8")] Bytes([Byte])
+}
+
+#[derive(Gob)]
+struct BasicInterfaceItem {
+  int: Basic
+  int8: Basic
+  int16: Basic
+  int32: Basic
+  int64: Basic
+  uint8: Basic
+  uint16: Basic
+  uint32: Basic
+  uint64: Basic
+  float64: Basic
+  complex128: Basic
+  bool: Basic
+  string: Basic
+  bytes: Basic
+}
+
+test "TestInterfaceBasic" {
+  item1 = BasicInterfaceItem.new(int: Basic.I(1), int8: Basic.I8(1), int16: Basic.I16(1), int32: Basic.I32(1), int64: Basic.I64(1), uint8: Basic.U8(1), uint16: Basic.U16(1), uint32: Basic.U32(1), uint64: Basic.U64(1), float64: Basic.F64(1.0), complex128: Basic.C128(Complex.new(0.0, 1.0)), bool: Basic.B(true), string: Basic.S("hello"), bytes: Basic.Bytes("sailor".bytes))
+  item2 = enc_dec(item1, BasicInterfaceItem.new).unwrap
+  assert_eq hexof(item2), hexof(item1)
+  case item2.bool {
+    B(v) => assert v, "boolean should be true"
+    _ => assert false, "bool variant"
+  }
+  case item2.string {
+    S(v) => assert_eq v, "hello"
+    _ => assert false, "string variant"
+  }
+}
+
+#[derive(Gob)]
+struct UFields {
+  a: Int
+  b: Str
+  #[field(gob: "-")] c: Float
+  d: U64
+}
+
+test "TestUnexportedFields" {
+  u1 = enc_dec(UFields.new(a: 17, b: "hello", c: 3.14159, d: 23), UFields.new(c: 1234.0)).unwrap
+  assert_eq u1.a, 17
+  assert_eq u1.b, "hello"
+  assert_eq u1.d, 23
+  assert_eq u1.c, 1234.0
+}
+
+test "TestErrorInvalidTypeId" {
+  d = gob.new_decoder(bytes.new_buffer(bs([0x01, 0x00, 0x01, 0x00])))
+  for _i in 0...2 {
+    assert_eq d.decode!(Empty.new).err?.message || "", "gob: unknown type id or corrupted data"
+  }
+}
+
+#[derive(Gob)]
+struct LargeSliceByte {
+  s: [Byte]
+}
+
+#[derive(Gob)]
+struct StringPair {
+  a: Str
+  b: Str
+}
+
+#[derive(Gob)]
+struct LargeSliceStruct {
+  s: [StringPair]
+}
+
+#[derive(Gob)]
+struct LargeSliceString {
+  s: [Str]
+}
+
+test "TestLargeSlice" {
+  b: [Byte] = [0; 10 << 18]
+  for i in 0...b.size {
+    b[i] = i.as_u8
+  }
+  out = enc_dec(LargeSliceByte.new(s: b), LargeSliceByte.new).unwrap
+  assert out.s == b, "bytes"
+  # (Go's sizes / 8, to keep the JIT run short; int8 is the same path as the strings)
+  ps: [StringPair] = []
+  ss: [Str] = []
+  for i in 0...(1 << 18) {
+    s = Str.from_bytes(utf8.encode_rune(i.to_i32))
+    ps << StringPair.new(a: s, b: s)
+    ss << s
+  }
+  outp = enc_dec(LargeSliceStruct.new(s: ps), LargeSliceStruct.new).unwrap
+  assert_eq outp.s.size, ps.size
+  assert_eq outp.s[70000].b, ps[70000].b
+  outs = enc_dec(LargeSliceString.new(s: ss), LargeSliceString.new).unwrap
+  assert outs.s == ss, "strings"
+}
+
+test "TestLocalRemoteTypesMismatch" {
+  d = gob.new_decoder(bytes.new_buffer(bs([9, 127, 3, 1, 2, 255, 128, 0, 0, 0, 3, 255, 128, 0])))
+  assert d.decode!(ints([])).err != none, "expected error"
+}

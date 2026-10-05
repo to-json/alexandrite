@@ -1,0 +1,265 @@
+# S5: `!` calls take their receiver by reference: the method gets a view
+# of the place (a local, a field, a slice element, an interface value) and
+# writes through it, with no copy in and out (docs/notes/bang-calls.md).
+
+struct Vec2 {
+  x: Int
+  y: Int
+  def set_x!(v: Int) { self.x = v }
+  def add!(o: Vec2) {
+    self.x += o.x
+    self.y += o.y
+  }
+  def bump! -> Int {
+    self.x += 1
+    self.x
+  }
+}
+
+struct Bag {
+  items: [Int]
+  total: Int
+  def add!(v: Int) {
+    self.items << v
+    self.total += v
+  }
+  def add_all!(vs: [Int]) {
+    for v in vs { add!(v) }
+  }
+}
+
+struct Grid {
+  rows: [Bag]
+  corner: Vec2
+  def put!(r: Int, v: Int) { self.rows[r].add!(v) }
+}
+
+struct Outer {
+  inner: Grid
+  name: Str
+}
+
+# 1. Aliasing: arguments are values taken before the call writes; an
+# argument that calls a `!` method on the receiver runs first.
+p = Vec2.new(x: 1, y: 2)
+p.set_x!(p.x + 10)
+puts "#{p.x} #{p.y}"
+p.add!(p)
+puts "#{p.x} #{p.y}"
+p.set_x!(p.bump!)
+puts p.x
+b = Bag.new()
+b.add!(1)
+b.add!(2)
+b.add_all!(b.items)
+puts "#{b.items} #{b.total}"
+
+# 2. Slice elements, nested fields, elements of fields of elements.
+bs = [Bag.new(), Bag.new(), Bag.new()]
+for i in 0...6 { bs[i % 3].add!(i) }
+puts "#{bs[0].items} #{bs[1].items} #{bs[2].items} #{bs[2].total}"
+o = Outer.new(inner: Grid.new(rows: [Bag.new(), Bag.new()]), name: "o")
+o.inner.put!(1, 5)
+o.inner.rows[0].add!(7)
+o.inner.corner.add!(Vec2.new(x: 3, y: 4))
+o.inner.corner.set_x!(o.inner.corner.y * 2)
+puts "#{o.inner.rows[0].items} #{o.inner.rows[1].items} #{o.inner.corner.x} #{o.inner.corner.y}"
+# A copy taken before the calls doesn't change (struct copies are values;
+# the slices inside still share storage, as always).
+q = o.inner.corner
+o.inner.corner.set_x!(100)
+puts "#{q.x} #{o.inner.corner.x}"
+# An index out of range fails before the call.
+if e = (spawn { bs[7].add!(1) }).wait.err { puts e.message.include?("out of bounds") }
+
+# 3. Interface values: in a local, a field, a slice; the implementor's
+# method writes into the interface value.
+interface Src {
+  def next! -> Int
+}
+struct Count {
+  n: Int
+  def next! -> Int {
+    self.n += 1
+    self.n
+  }
+}
+struct Log {
+  seen: [Int]
+  def next! -> Int {
+    self.seen << self.seen.size * 10
+    self.seen.last
+  }
+}
+struct Pump {
+  src: Src
+  def pull2! -> Int { self.src.next! + self.src.next! }
+}
+s: Src = Count.new()
+puts "#{s.next!} #{s.next!}"
+pu = Pump.new(src: Log.new())
+puts pu.pull2!
+puts pu.pull2!
+srcs: [Src] = [Count.new(n: 5), Log.new()]
+for _i in 0...3 {
+  srcs[0].next!
+  srcs[1].next!
+}
+puts "#{srcs[0].next!} #{srcs[1].next!}"
+
+# 4. Recursion: `!` on self, and on slice elements of a field.
+struct Tree {
+  vals: [Int]
+  left: [Int]
+  right: [Int]
+  def insert!(at: Int, v: Int) -> Unit {
+    if self.vals.size == 0 {
+      add!(v)
+      return
+    }
+    if v < self.vals[at] {
+      if self.left[at] < 0 {
+        self.left[at] = self.vals.size
+        add!(v)
+      } else {
+        insert!(self.left[at], v)
+      }
+    } else if self.right[at] < 0 {
+      self.right[at] = self.vals.size
+      add!(v)
+    } else {
+      self.insert!(self.right[at], v)
+    }
+  }
+  def add!(v: Int) {
+    self.vals << v
+    self.left << -1
+    self.right << -1
+  }
+  def depth(at: Int) -> Int {
+    return 0 if at < 0
+    1 + [depth(left[at]), depth(right[at])].max
+  }
+}
+struct Forest {
+  trees: [Tree]
+  def plant!(k: Int, v: Int) { self.trees[k].insert!(0, v) }
+}
+f = Forest.new(trees: [Tree.new(), Tree.new()])
+for v in [50, 20, 70, 10, 30, 60, 80, 25, 27, 26] { f.plant!(v % 2, v) }
+puts "#{f.trees[0].vals} #{f.trees[0].depth(0)} #{f.trees[1].vals} #{f.trees[1].depth(0)}"
+
+# 5. A fallible `!` method: its writes before the failure stay; `~`
+# propagates the error.
+error Full {
+  Over(n: Int)
+  def message -> Str {
+    case self { Over(n) => "full at #{n}" }
+  }
+}
+struct Cap {
+  items: [Int]
+  def push!(v: Int) -> ~Unit {
+    self.items << v
+    fail Full.Over(self.items.size) if self.items.size > 2
+  }
+}
+def fill(c: Cap) -> ~Cap {
+  c2 = c
+  for v in 0...5 { c2.~push!(v) }
+  c2
+}
+c = Cap.new()
+if e = fill(c).err { puts e.message }
+res = c.push!(9)
+puts "#{res.ok?} #{c.items}"
+
+# 6. A `!` method that keeps `self` (a lambda capturing it): its receiver
+# is a copy for the call, written back after.
+struct Tally {
+  n: Int
+  def twice! -> Int {
+    f = -> { self.n += 1 }
+    f.call
+    f.call
+    self.n
+  }
+}
+ts = [Tally.new(), Tally.new()]
+ts[1].twice!
+puts "#{ts[1].twice!} #{ts[0].n} #{ts[1].n}"
+
+# 7. Enums and generics.
+enum Light {
+  Red
+  Green
+  def flip! {
+    self = case self {
+      Red => Light.Green
+      Green => Light.Red
+    }
+  }
+}
+l = Light.Red
+l.flip!
+ls = [Light.Red, Light.Green]
+ls[1].flip!
+puts "#{l} #{ls}"
+struct Stack[T] {
+  xs: [T]
+  def push!(v: T) { self.xs << v }
+  def pop! -> T? {
+    return none if self.xs.size == 0
+    v = self.xs.last
+    self.xs = self.xs[0...self.xs.size - 1]
+    v
+  }
+}
+st = Stack[Str].new()
+st.push!("a")
+st.push!("b")
+puts "#{st.pop! || "-"} #{st.xs}"
+
+# 8. A panic mid-call inside `lock`: the guarded value is a variable
+# written back only when the block finishes, so it keeps the value from
+# before, and the lock is poisoned. (Outside a lock, what a panicking `!`
+# call leaves in shared storage is unspecified: the C and JIT backends keep
+# the writes made before the panic, as a Go pointer receiver does; the
+# oracle and wasm copy the receiver for the call.)
+struct Acct {
+  bal: Int
+  ops: Int
+  def take!(v: Int) {
+    self.ops += 1
+    self.bal -= v
+    panic("overdrawn") if self.bal < 0
+  }
+}
+accts = [Acct.new(bal: 10)]
+puts (spawn { accts[0].take!(15) }).wait.ok?
+mu = Mutex.new(Acct.new(bal: 10))
+w2 = spawn { mu.lock { |a| a.take!(15) } }
+puts w2.wait.ok?
+puts mu.poisoned?
+mu.clear_poison!
+puts mu.lock { |a| "#{a.bal} #{a.ops}" }
+mu.lock { |a| a.take!(3) }
+puts mu.lock { |a| "#{a.bal} #{a.ops}" }
+ms = Mutex.new([Acct.new(bal: 1), Acct.new(bal: 5)])
+w3 = spawn { ms.lock { |xs| xs[1].take!(2) } }
+puts w3.wait.ok?
+puts ms.lock { |xs| "#{xs[1].bal} #{xs[1].ops}" }
+
+# 9. Many calls on a local in a loop: nothing piles up per call.
+def churn(n: Int) -> Int {
+  v = Vec2.new()
+  bag = Bag.new()
+  for i in 0...n {
+    v.bump!
+    bag.add!(i % 3)
+  }
+  v.x + bag.total
+}
+tot = 0
+for _j in 0...2000 { tot += churn(100) }
+puts tot

@@ -450,6 +450,11 @@ pub enum TK {
     Array(Vec<TExpr>),
     /// `place = v`, or `place op= v`: a local, then index and field steps.
     PlaceAssign(LocalId, Vec<TStep>, Option<BinOp>, Box<TExpr>),
+    /// `place.m!(args)`: the call (whose receiver argument is `Local(view)`)
+    /// runs with `view` a one-element slice that *is* the place (a local,
+    /// then index and field steps): writes through it land in the place.
+    /// See docs/notes/bang-calls.md.
+    Bang(LocalId, Vec<TStep>, LocalId, Box<TExpr>),
     /// `format("...", args)`: pieces checked against the arguments.
     Format(Vec<FmtPiece>, Vec<TExpr>),
     /// Statements whose value is the last one's (a `case` arm, a desugaring).

@@ -567,6 +567,22 @@ impl FnEmit<'_> {
                 let x = self.e(val);
                 self.line(&format!("{lv} = {x};"));
             }
+            LS::View { dst, var, steps, region, .. } => {
+                let mut lv = self.v(*var);
+                for st in steps {
+                    lv = match st {
+                        Step::Index(i, Some(loc)) => format!("ALX_IDX_SET({lv}, {}, {})", self.e(i), c_str(loc)),
+                        Step::Index(i, None) => format!("({lv}).ptr[{}]", self.e(i)),
+                        Step::Field(k) => format!("({lv}).f{k}"),
+                    };
+                }
+                let r = self.e(region);
+                let ty = cty(&self.f.vars[*dst].ty);
+                let d = self.v(*dst);
+                self.line(&format!("{d} = ({ty}){{ .ptr = &{lv}, .len = 1, .cap = -(int64_t)(intptr_t)({r}) }};"));
+            }
+            // The callee wrote through the view.
+            LS::Unview { .. } => {}
             LS::Push(v, e) => {
                 let ty = ty_name(&self.f.vars[*v].ty);
                 let x = self.e(e);
@@ -724,6 +740,7 @@ impl FnEmit<'_> {
             LE::RegionNew(p) => format!("alx_region_new_child({})", self.e(p)),
             LE::RegionBytes(r) => format!("alx_region_bytes({})", self.e(r)),
             LE::RegionOf(x) => format!("alx_region_of(({}).ptr)", self.e(x)),
+            LE::ViewRegion(x) => format!("ALX_VIEW_REGION({})", self.e(x)),
             LE::RegionProgram => "alx_region_program()".into(),
             LE::ChanNew(t, cap) => format!("alx_chan_new({}, sizeof({}))", self.e(cap), cty_mem(t)),
             LE::ChanLen(c) => format!("alx_chan_len({})", self.e(c)),

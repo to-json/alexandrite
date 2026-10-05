@@ -325,6 +325,7 @@ fn worker_sig(w: &LWorker) -> (Vec<ValType>, Vec<ValType>) {
 
 pub fn emit(p: &LProgram) -> Result<Vec<u8>, String> {
     let mut owned = p.clone();
+    alx::lir::copy_views(&mut owned);
     let info = suspend::prepare(&mut owned)?;
     let p = &owned;
     rt::sh().consts.clear();
@@ -1229,6 +1230,7 @@ impl<'c, 'p> Fx<'c, 'p> {
                 self.store(&t, base, 0, &vals);
             }
             LS::RegionFree(_) => {}
+            LS::View { .. } | LS::Unview { .. } => unreachable!("copy_views ran first"),
             LS::RegionEnter { .. } | LS::RegionExit { .. } | LS::RegionUse { .. } | LS::RegionRestore(_) => {}
             LS::Spawn { dst, worker, env } => {
                 let p = self.boxed(env);
@@ -1725,7 +1727,7 @@ impl<'c, 'p> Fx<'c, 'p> {
         match e {
             LE::RegionNew(_) => self.i64c(0),
             LE::RegionBytes(_) => self.i64c(0),
-            LE::RegionOf(_) => self.i64c(0),
+            LE::RegionOf(_) | LE::ViewRegion(_) => self.i64c(0),
             // The browser never frees: regions are no-ops (handle 0).
             LE::RegionProgram => self.i64c(0),
             LE::Ffi(i, args) => {
@@ -2390,7 +2392,7 @@ pub(crate) fn ty_of(tys: &Tys, vars: &[LVar], e: &LE) -> LTy {
         LE::AtomicCas(..) => LTy::Bool,
         LE::RegionNew(_) => LTy::Region,
         LE::RegionBytes(_) => LTy::I64,
-        LE::RegionOf(_) => LTy::Region,
+        LE::RegionOf(_) | LE::ViewRegion(_) => LTy::Region,
         LE::RegionProgram => LTy::Region,
         LE::ChanNew(t, _) => LTy::Chan(Box::new(t.clone())),
         LE::ChanLen(_) => LTy::I64,

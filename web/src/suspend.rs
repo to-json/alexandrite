@@ -48,7 +48,7 @@ enum Node {
 pub fn kids(e: &mut LE) -> Vec<&mut LE> {
     match e {
         LE::Tup(_, v) | LE::Call(_, v) | LE::Ffi(_, v) | LE::Rt(_, v) | LE::Prim(_, v) | LE::ArrLit(_, v) | LE::GenNew(_, v) => v.iter_mut().collect(),
-        LE::Field(x, _) | LE::Neg(x, _) | LE::FNeg(x) | LE::Not(x) | LE::Len(x) | LE::RangeField(x, _) | LE::ToP(x) | LE::ChanNew(_, x) | LE::ChanLen(x) | LE::LockPoisoned(x) | LE::AtomicNew(x) | LE::AtomicLoad(x) | LE::RegionOf(x) | LE::RegionNew(x) | LE::RegionBytes(x) | LE::ArrWithCap(_, x) => vec![&mut **x],
+        LE::Field(x, _) | LE::Neg(x, _) | LE::FNeg(x) | LE::Not(x) | LE::Len(x) | LE::RangeField(x, _) | LE::ToP(x) | LE::ChanNew(_, x) | LE::ChanLen(x) | LE::LockPoisoned(x) | LE::AtomicNew(x) | LE::AtomicLoad(x) | LE::RegionOf(x) | LE::ViewRegion(x) | LE::RegionNew(x) | LE::RegionBytes(x) | LE::ArrWithCap(_, x) => vec![&mut **x],
         LE::Arith(_, a, b, _) | LE::PArith(_, a, b) | LE::Cmp(_, a, b, _) | LE::FArith(_, a, b) | LE::AtomicRmw(_, a, b) | LE::Range(a, b, _) | LE::ArrNew(_, a, b, _) => vec![&mut **a, &mut **b],
         LE::Index { arr, idx, .. } => vec![&mut **arr, &mut **idx],
         LE::Cond(a, b, c) | LE::Slice(_, a, b, c) | LE::AtomicCas(a, b, c) => vec![&mut **a, &mut **b, &mut **c],
@@ -81,7 +81,7 @@ fn exprs(s: &mut LS) -> Vec<&mut LE> {
                 SelCase::Recv { ch, .. } => vec![ch],
             })
             .collect(),
-        LS::Return(None) | LS::Loop(..) | LS::Break(_) | LS::Continue(_) | LS::Panic(..) | LS::RegionEnter { .. } | LS::RegionExit { .. } | LS::RegionRestore(_) | LS::SortInPlace(..) => vec![],
+        LS::Return(None) | LS::Loop(..) | LS::Break(_) | LS::Continue(_) | LS::Panic(..) | LS::RegionEnter { .. } | LS::RegionExit { .. } | LS::RegionRestore(_) | LS::SortInPlace(..) | LS::View { .. } | LS::Unview { .. } => vec![],
     }
 }
 

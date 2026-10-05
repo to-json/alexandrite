@@ -391,7 +391,7 @@ pub fn run(p: &LProgram) -> Result<(), String> {
         };
         {
             let b = FunctionBuilder::new(&mut ctx.func, &mut fbc);
-            let mut fx = Fx { b, m: &mut m, d: &d, strs: &mut strs, f, kind, lgen: g, vars: vec![], loops: HashMap::new(), params: vec![], gstate: None, resume: vec![], yields: 0, sigs: HashMap::new(), frefs: HashMap::new(), slot_pool: vec![] };
+            let mut fx = Fx { b, m: &mut m, d: &d, strs: &mut strs, f, kind, lgen: g, vars: vec![], loops: HashMap::new(), params: vec![], gstate: None, resume: vec![], yields: 0, sigs: HashMap::new(), frefs: HashMap::new(), slot_pool: vec![], view_slots: HashMap::new() };
             fx.body();
             fx.b.seal_all_blocks();
             fx.b.finalize(fcfg);
@@ -486,6 +486,9 @@ struct Fx<'m, 'b, 'p> {
     /// within one statement, so each statement starts with all of them free
     /// (without reuse, deep call chains overflowed a task's stack).
     slot_pool: Vec<(StackSlot, u32, bool)>,
+    /// `LS::View` of a place held in variables (not memory): the stack slot
+    /// it is copied into for the call, by the view's variable.
+    view_slots: HashMap<V, StackSlot>,
 }
 
 fn bargs(v: &[Value]) -> Vec<BlockArg> {
@@ -1054,6 +1057,39 @@ impl Fx<'_, '_, '_> {
                     Some((addr, off)) => self.store(&ty, &x, addr, off),
                 }
             }
+            LS::View { dst, var, steps, ty, region } => {
+                let r = self.e1(region);
+                let (start, mem) = self.place_addr(*var, steps);
+                let addr = match mem {
+                    Some((addr, off)) => self.b.ins().iadd_imm_s(addr, off as i64),
+                    // In variables: copied to a slot of its own for the call,
+                    // and back at the `Unview`.
+                    None => {
+                        let n = nflat(ty);
+                        let vals = self.get(*var)[start..start + n].to_vec();
+                        let size = lay(ty).size.max(1).next_multiple_of(8);
+                        let ss = *self.view_slots.entry(*dst).or_insert_with(|| self.b.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, size, 3)));
+                        let a = self.b.ins().stack_addr(I64, ss, 0);
+                        self.store(ty, &vals, a, 0);
+                        a
+                    }
+                };
+                let one = self.ic(1);
+                let neg = self.b.ins().ineg(r);
+                self.set(*dst, &[addr, one, neg]);
+            }
+            LS::Unview { dst, var, steps } => {
+                if steps.iter().all(|s| matches!(s, Step::Field(_))) {
+                    let (start, _) = self.place_addr(*var, steps);
+                    let ty = elem(&self.f.vars[*dst].ty).clone();
+                    let ss = self.view_slots[dst];
+                    let a = self.b.ins().stack_addr(I64, ss, 0);
+                    let x = self.load(&ty, a, 0);
+                    let mut all = self.get(*var);
+                    all.splice(start..start + x.len(), x);
+                    self.set(*var, &all);
+                }
+            }
             LS::Push(v, e) => {
                 let x = self.e(e);
                 let et = elem(&self.f.vars[*v].ty).clone();
@@ -1274,7 +1310,7 @@ impl Fx<'_, '_, '_> {
             LE::Global(k) => self.d.globals[*k].0.clone(),
             LE::RegionNew(_) => LTy::Region,
             LE::RegionBytes(_) => LTy::I64,
-            LE::RegionOf(_) => LTy::Region,
+            LE::RegionOf(_) | LE::ViewRegion(_) => LTy::Region,
             LE::RegionProgram => LTy::Region,
             LE::ChanNew(t, _) => LTy::Chan(Box::new(t.clone())),
             LE::ChanLen(_) => LTy::I64,
@@ -1346,6 +1382,39 @@ impl Fx<'_, '_, '_> {
         let v = self.e(e);
         assert_eq!(v.len(), 1, "jit: expected a scalar: {e:?}");
         v[0]
+    }
+
+    /// Where the place `var` + `steps` is: through the variable's own
+    /// scalars until the first index (`start`: its first scalar there), then
+    /// through memory (`Some((address, offset))`).
+    fn place_addr(&mut self, var: V, steps: &[Step]) -> (usize, Option<(Value, i32)>) {
+        let mut ty = self.f.vars[var].ty.clone();
+        let mut start = 0usize;
+        let mut mem: Option<(Value, i32)> = None;
+        for st in steps {
+            match st {
+                Step::Field(k) => {
+                    let LTy::Tup(ts) = ty.clone() else { panic!("jit: field of {ty:?}") };
+                    match &mut mem {
+                        None => start += ts[..*k].iter().map(nflat).sum::<usize>(),
+                        Some((_, off)) => *off += field_offset(&ty, *k) as i32,
+                    }
+                    ty = ts[*k].clone();
+                }
+                Step::Index(i, check) => {
+                    let a = match mem {
+                        None => self.get(var)[start..start + 3].to_vec(),
+                        Some((addr, off)) => self.load(&ty, addr, off),
+                    };
+                    let iv = self.e1(i);
+                    let et = elem(&ty).clone();
+                    let addr = self.elem_addr(&a, iv, &et, check.as_deref());
+                    mem = Some((addr, 0));
+                    ty = et;
+                }
+            }
+        }
+        (start, mem)
     }
 
     fn elem_addr(&mut self, a: &[Value], i: Value, et: &LTy, check: Option<&str>) -> Value {
@@ -1552,6 +1621,20 @@ impl Fx<'_, '_, '_> {
                 // Arr and Str both keep their data pointer in word 0.
                 let v = self.e(x);
                 vec![self.call_rt(rt::alxj_region_of, &[v[0]], true).unwrap()]
+            }
+            LE::ViewRegion(x) => {
+                // A view carries its region as a negative cap.
+                let v = self.e(x);
+                let neg = self.b.ins().icmp_imm(IntCC::SignedLessThan, v[2], 0);
+                let (slow, done) = (self.b.create_block(), self.b.create_block());
+                let out = self.b.append_block_param(done, I64);
+                let r = self.b.ins().ineg(v[2]);
+                self.b.ins().brif(neg, done, &bargs(&[r]), slow, &[]);
+                self.b.switch_to_block(slow);
+                let rr = self.call_rt(rt::alxj_region_of, &[v[0]], true).unwrap();
+                self.b.ins().jump(done, &bargs(&[rr]));
+                self.b.switch_to_block(done);
+                vec![out]
             }
             LE::RegionProgram => vec![self.call_rt(rt::alxj_region_program, &[], true).unwrap()],
             LE::ChanNew(t, cap) => {

@@ -260,7 +260,7 @@ impl Ck<'_> {
                 self.expr(v);
                 self.moved.remove(l);
             }
-            TK::IndexAssign(l, ..) | TK::PlaceAssign(l, ..) => {
+            TK::IndexAssign(l, ..) | TK::PlaceAssign(l, ..) | TK::Bang(l, ..) => {
                 let mut kids = vec![];
                 crate::prove::each_child(e, &mut |c| kids.push(c));
                 for k in kids {
@@ -424,7 +424,7 @@ fn locals_read(e: &TExpr, out: &mut Vec<LocalId>) {
 /// The locals an expression assigns or stores into (blocks included).
 fn written_locals(e: &TExpr, out: &mut Vec<LocalId>) {
     match &e.kind {
-        TK::Assign(l, _) | TK::IndexAssign(l, ..) | TK::PlaceAssign(l, ..) => out.push(*l),
+        TK::Assign(l, _) | TK::IndexAssign(l, ..) | TK::PlaceAssign(l, ..) | TK::Bang(l, ..) => out.push(*l),
         TK::M(M::Push | M::MapSet | M::CopyInto | M::PoolAdd | M::PoolSet, Some(r), ..) => {
             if let TK::Local(l) = r.kind {
                 out.push(l);

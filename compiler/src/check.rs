@@ -2055,7 +2055,8 @@ impl<'w, 'a> FnCx<'w, 'a> {
     }
 
     fn assign_local(&mut self, name: &str, sp: Span, ty: &Ty, _site: NodeId) -> R<LocalId> {
-        if let Some(id) = self.lookup(name) {
+        // `_ = e` discards: each one is a fresh local of e's type (Go's blank).
+        if let Some(id) = self.lookup(name).filter(|_| name != "_") {
             let lt = self.locals[id].ty.clone();
             if !self.unify(&lt, ty) {
                 return Err(Diag::new(sp, format!("`{name}` is {}, cannot assign {}", self.resolve(&lt).show(), self.resolve(ty).show())));
@@ -2273,7 +2274,7 @@ impl<'w, 'a> FnCx<'w, 'a> {
                 }
                 ExprKind::Name(n) => {
                     let v = self.value(v)?;
-                    let v = match self.lookup(n) {
+                    let v = match self.lookup(n).filter(|_| n != "_") {
                         Some(id) => {
                             let lt = self.locals[id].ty.clone();
                             self.coerce(v, &lt)?
@@ -5711,7 +5712,12 @@ impl<'w, 'a> FnCx<'w, 'a> {
                         return Err(Diag::new(sp, "`lock` needs a block: `m.lock { |v| ... }`"));
                     };
                     let saved = self.lock_floor.replace(self.loops.len());
+                    // `!` calls on the guarded value get cells of their own: a
+                    // function-wide cell shared with another block would hold a
+                    // reference into the guarded value past this block.
+                    let saved_cells = self.cells.take();
                     let r = self.block(b, &t);
+                    self.cells = saved_cells;
                     self.lock_floor = saved;
                     let (blk, bt) = r?;
                     Ok(mk_m(self, M::Lock, recv, vec![], Some(blk), bt))

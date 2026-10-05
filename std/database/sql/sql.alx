@@ -570,16 +570,16 @@ pub struct DB {
   # Starts `n` connection openers (Go's connectionOpener receives one per
   # request).
   def start_openers(n: Int) -> Unit {
-    db = self
+    db = self.dup
     for _i in 0...n {
-      _ = spawn { db.open_new_connection }
+      d2 = db.dup
+      _ = spawn { d2.open_new_connection }
     }
   }
 
   def open_new_connection -> Unit {
     r = connect(context.background)
     keep = false
-    dc: DriverConn? = none
     opens = st.lock { |s|
       k = 0
       if s.closed {
@@ -590,7 +590,6 @@ pub struct DB {
         k = s.maybe_open_new_connections!(0)
       } else {
         c = new_driver_conn(r.unwrap, false)
-        dc = c
         if s.put_conn_db_locked!(c, none) {
           s.add_dep_locked!(c.id, c.id)
           keep = true
@@ -617,7 +616,6 @@ pub struct DB {
     cached_expired = false
     closed = false
     canceled = false
-    open_new = false
     lifetime = 0
     st.lock { |s|
       lifetime = s.max_lifetime
@@ -645,7 +643,6 @@ pub struct DB {
         req = ch
       } else {
         s.num_open += 1
-        open_new = true
       }
       nil
     }
@@ -732,7 +729,8 @@ pub struct DB {
     if e = r.err {
       n = st.lock { |s|
         s.num_open -= 1
-        s.maybe_open_new_connections!(0)
+        k = s.maybe_open_new_connections!(0)
+        k
       }
       start_openers(n)
       fail e
@@ -775,7 +773,10 @@ pub struct DB {
       was
     }
     fail SqlError.DuplicateConnClose if dup
-    last = st.lock { |s| s.remove_dep_locked!(dc.id, dc.id) }
+    last = st.lock { |s|
+      k = s.remove_dep_locked!(dc.id, dc.id)
+      k
+    }
     return nil if !last
     ~final_close_conn(dc)
   }
@@ -800,7 +801,8 @@ pub struct DB {
     dc.lock.unlock
     n = st.lock { |s|
       s.num_open -= 1
-      s.maybe_open_new_connections!(0)
+      k = s.maybe_open_new_connections!(0)
+      k
     }
     start_openers(n)
     num_closed.add(1)
@@ -954,7 +956,7 @@ pub struct DB {
       r
     }
     if x = go {
-      db = self
+      db = self.dup
       ch = x[0]
       d = x[1]
       _ = spawn { db.connection_cleaner(d, ch) }
@@ -1004,7 +1006,10 @@ pub struct DB {
 
   # True when it was x's last dependency (the caller final-closes x).
   def remove_dep(x: Int, dep: Int) -> Bool {
-    st.lock { |s| s.remove_dep_locked!(x, dep) }
+    st.lock { |s|
+      k = s.remove_dep_locked!(x, dep)
+      k
+    }
   }
 
   def rel(dc: DriverConn) -> Release { db_release(self, dc) }
@@ -1122,22 +1127,24 @@ pub struct DB {
   # Closes the database and its idle connections; waits for nothing.
   # Closing twice is fine (Go).
   pub def close -> ~Unit {
-    already = false
+    got = st.lock { |s|
+      r: ([DriverConn], [Chan[ConnRequest]], Chan[Bool]?)? = none
+      if !s.closed {
+        r = (s.free_conn, s.conn_requests.values, s.cleaner_ch)
+        s.free_conn = []
+        s.closed = true
+        s.conn_requests = {}
+      }
+      r
+    }
+    already = got == none
     free: [DriverConn] = []
     reqs: [Chan[ConnRequest]] = []
     cleaner: Chan[Bool]? = none
-    st.lock { |s|
-      if s.closed {
-        already = true
-      } else {
-        cleaner = s.cleaner_ch
-        free = s.free_conn
-        s.free_conn = []
-        s.closed = true
-        reqs = s.conn_requests.values
-        s.conn_requests = {}
-      }
-      nil
+    if g = got {
+      free = g[0]
+      reqs = g[1]
+      cleaner = g[2]
     }
     return nil if already
     if ch = cleaner {
@@ -1154,7 +1161,10 @@ pub struct DB {
         err = SqlError.DuplicateConnClose
         next
       }
-      last = st.lock { |s| s.remove_dep_locked!(dc.id, dc.id) }
+      last = st.lock { |s|
+      k = s.remove_dep_locked!(dc.id, dc.id)
+      k
+    }
       if last {
         r = final_close_conn(dc)
         err = r.err if r.err?

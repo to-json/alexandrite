@@ -102,10 +102,10 @@ def drv_of(db: DB) -> FakeDriver {
 }
 
 # Polls `f` until it holds (Go's synctest.Wait before a check); false after 5s.
-def wait_until(f: () -> Bool) -> Bool {
+def wait_until(f: (Int) -> Bool) -> Bool {
   deadline = time.now.unix_nano + 5000000000
   loop {
-    return true if f()
+    return true if f(0)
     return false if time.now.unix_nano > deadline
     time.sleep(time.duration(200000))
   }
@@ -197,7 +197,7 @@ def close_db(db: DB) {
   if e = r.err {
     panic "error closing DB: #{e.message}"
   }
-  ok = wait_until(->() -> Bool { db.st.lock { |s| s.num_open } == 0 })
+  ok = wait_until(->(_i: Int) -> Bool { db.st.lock { |s| s.num_open } == 0 })
   n = db.st.lock { |s| s.num_open }
   assert ok, "#{n} connections still open after closing DB"
   drv.hooks.set_post_close_conn(none)
@@ -222,13 +222,13 @@ def clear_all_conns(db: DB) {
 }
 
 def wait_for_free(db: DB, want: Int) {
-  wait_until(->() -> Bool { num_free_conns(db) == want })
+  wait_until(->(_i: Int) -> Bool { num_free_conns(db) == want })
   n = num_free_conns(db)
   assert n == want, "free conns after hitting EOF = #{n}; want #{want}"
 }
 
 def wait_for_rows_close(rows: Rows) {
-  ok = wait_until(->() -> Bool { rows.st.lock { |s| s.closed } })
+  ok = wait_until(->(_i: Int) -> Bool { rows.st.lock { |s| s.closed } })
   assert ok, "failed to close rows"
 }
 
@@ -318,7 +318,7 @@ test "QueryContext" {
       index += 1
     }
     assert ctx.done?, "context err = nil; want context.Canceled"
-    assert canceled?(ctx.err), "context err = #{ctx.err}"
+    assert canceled?(ctx_err(ctx)), "context err not Canceled"
     assert got == [(1, "Alice"), (2, "Bob")], "mismatch: #{got}"
     wait_for_rows_close(rows)
     wait_for_free(db, 1)
@@ -337,6 +337,7 @@ test "QueryContextWait" {
     get_fake_conn(c.dc.ci).set_waiter(->(x: context.Context) {
       cancel()
       _ = ctx.done.recv
+      nil
     })
     r = c.query_context(ctx, "SELECT|people|age,name|", nil)
     _ = c.close
@@ -350,17 +351,15 @@ test "QueryContextWait" {
 def test_context_wait(keep_conn_on_rollback: Bool, db: DB) -> ~Unit {
   populate(db, "people")
   ctx, cancel = context.with_cancel(context.background)
-  tx0 = db.~begin_tx(ctx, none)
-  tx = Tx.new(db: tx0.db, dc: tx0.dc, txi: tx0.txi, rel: tx0.rel, done: tx0.done, keep_conn_on_rollback: keep_conn_on_rollback, stmts: tx0.stmts, cancel: tx0.cancel, ctx: tx0.ctx, closemu: tx0.closemu)
+  tx = db.~begin_tx(ctx, none)
+  tx.keep_conn_on_rollback.store(keep_conn_on_rollback)
   get_fake_conn(tx.dc.ci).set_waiter(->(x: context.Context) {
     cancel()
     _ = ctx.done.recv
-  }).unwrap
+    nil
+  })
   r = tx.query_context(ctx, "SELECT|people|age,name|", nil)
   assert canceled?(r.err), "expected QueryContext to error with context canceled but returned #{r.err}"
-  # (The rollback that the cancel starts uses tx0's keep flag; Go sets the
-  # field on the one Tx. Roll back with the wanted flag here first.)
-  _ = tx.rollback_with(!keep_conn_on_rollback)
   wait_for_free(db, keep_conn_on_rollback ? 1 : 0)
   nil
 }

@@ -31,14 +31,16 @@
 #     does not produce unique values") by comparing the pointers; alx values
 #     have no identity, so a constructor that hands out one shared hash
 #     gives wrong MACs instead of a panic.
-#   - Go saves the keyed inner and outer states with MarshalBinary on the
-#     first reset when the hash supports it, and restores them after; here
-#     reset! and sum always rehash the padded key (the same results, one
-#     more block per reset and sum), since a generic H can't be asked at run
-#     time whether it is marshalable.
+#   - As in Go, the first reset! saves the keyed inner and outer states
+#     when H is an encoding.BinaryMarshaler and BinaryUnmarshaler (asked at
+#     compile time, `if H is ...`, S6), and later resets and sums restore
+#     them instead of rehashing the padded key. Go asks the hash value at
+#     run time; a hash.Hash interface value (crypto.SHA256.new) has no
+#     marshal methods here, so its HMAC rehashes the key each time.
 #   - No BoringCrypto or FIPS 140-only mode.
 
 import "crypto/subtle"
+import "encoding"
 
 # A new HMAC using the hash made by h and the given key.
 pub def new[H](h: () -> H, key: [Byte]) -> HMAC[H] {
@@ -61,7 +63,7 @@ pub def new[H](h: () -> H, key: [Byte]) -> HMAC[H] {
     i += 1
   }
   inner.write!(ipad)
-  HMAC.new(opad: opad, ipad: ipad, outer: outer, inner: inner)
+  HMAC.new(opad: opad, ipad: ipad, outer: outer, inner: inner, marshaled: false)
 }
 
 # Whether two MACs are equal, compared in time that depends only on their
@@ -76,6 +78,8 @@ pub struct HMAC[H] {
   ipad: [Byte]
   outer: H
   inner: H
+  # ipad and opad hold the marshaled keyed states (Go's h.marshaled).
+  marshaled: Bool
 
   # Adds p to the message.
   pub def write!(p: [Byte]) -> ~Int {
@@ -88,8 +92,17 @@ pub struct HMAC[H] {
     full = inner.sum(b)
     # The outer hash's state is shared storage: this reuses it.
     o = outer
-    o.reset!
-    o.write!(opad)
+    restored = false
+    if H is encoding.BinaryUnmarshaler {
+      if marshaled {
+        o.unmarshal_binary!(opad).unwrap
+        restored = true
+      }
+    }
+    if !restored {
+      o.reset!
+      o.write!(opad)
+    }
     o.write!(full[orig...full.size])
     o.sum(b)
   }
@@ -102,13 +115,35 @@ pub struct HMAC[H] {
 
   # Back to the keyed initial state.
   pub def reset! {
+    if H is encoding.BinaryUnmarshaler {
+      if marshaled {
+        inner.unmarshal_binary!(ipad).unwrap
+        return nil
+      }
+    }
     inner.reset!
     inner.write!(ipad)
+    # Save the keyed states when the hash can restore them (Go's Reset).
+    if H is encoding.BinaryMarshaler && H is encoding.BinaryUnmarshaler {
+      mi: encoding.BinaryMarshaler = inner
+      imarshal = mi.marshal_binary
+      if istate = imarshal.ok {
+        o = outer
+        o.reset!
+        o.write!(opad)
+        mo: encoding.BinaryMarshaler = o
+        if ostate = mo.marshal_binary.ok {
+          self.ipad = istate
+          self.opad = ostate
+          self.marshaled = true
+        }
+      }
+    }
     nil
   }
 
   # An independent copy of the HMAC in its current state.
   pub def clone -> HMAC[H] {
-    HMAC.new(opad: opad, ipad: ipad, outer: outer.clone, inner: inner.clone)
+    HMAC.new(opad: opad, ipad: ipad, outer: outer.clone, inner: inner.clone, marshaled: marshaled)
   }
 }

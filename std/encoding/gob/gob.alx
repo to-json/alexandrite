@@ -1,0 +1,184 @@
+#![overflow(wrap)]
+# HEADER
+
+import "math"
+import "math/bits"
+
+# What can go wrong. Messages are Go's (most of Go's gob errors are
+# errors.New / fmt.Errorf text starting "gob: ").
+pub error GobError {
+  # Any of Go's gob errors, by its message.
+  Msg(text: Str)
+  # The stream ended cleanly before a value (Go's io.EOF).
+  Eof
+  # The stream ended inside a message (Go's io.ErrUnexpectedEOF).
+  UnexpectedEof
+
+  def message -> Str {
+    case self {
+      Msg(t) => t
+      Eof => "EOF"
+      UnexpectedEof => "unexpected EOF"
+    }
+  }
+
+  # Whether this is the clean end of the stream (Go's err == io.EOF).
+  pub def eof? -> Bool {
+    case self {
+      Eof => true
+      _ => false
+    }
+  }
+}
+
+pub def gerr(t: Str) -> GobError { GobError.Msg(text: t) }
+
+# ---- predefined type ids (Go's bootstrap types)
+pub T_BOOL = 1
+pub T_INT = 2
+pub T_UINT = 3
+pub T_FLOAT = 4
+pub T_BYTES = 5
+pub T_STRING = 6
+pub T_COMPLEX = 7
+pub T_INTERFACE = 8
+T_WIRE_TYPE = 16
+T_ARRAY_TYPE = 17
+T_COMMON_TYPE = 18
+T_SLICE_TYPE = 19
+T_STRUCT_TYPE = 20
+T_FIELD_TYPE = 21
+T_MAP_TYPE = 23
+# The lowest id an encoder gives a user type.
+FIRST_USER_ID = 64
+
+# Go's tooBig: the largest message (1 GiB on 64-bit machines).
+TOO_BIG = 1 << 31
+
+# ---- kinds of the local type descriptions (types.alx)
+pub K_BOOL = 1
+pub K_INT = 2
+pub K_UINT = 3
+pub K_FLOAT = 4
+pub K_BYTES = 5
+pub K_STRING = 6
+pub K_COMPLEX = 7
+pub K_IFACE = 8
+pub K_ARRAY = 9
+pub K_SLICE = 10
+pub K_MAP = 11
+pub K_STRUCT = 12
+pub K_PTR = 13
+
+# ---- external encodings (Go's xGob, xBinary, xText)
+pub X_GOB = 1
+pub X_BINARY = 2
+pub X_TEXT = 3
+
+# ---- the wire format's numbers
+
+# x appended to b as gob's unsigned integer: one byte below 128, else the
+# negated byte count and the big-endian bytes.
+pub def append_uint(b: [Byte], x: U64) -> [Byte] {
+  out = b
+  if x <= 0x7f {
+    out << x.as_u8
+    return out
+  }
+  n = 8 - (bits.leading_zeros64(x) >> 3)
+  out << (256 - n).as_u8
+  i = n - 1
+  while i >= 0 {
+    out << (x >> (i * 8).as_u64).as_u8
+    i -= 1
+  }
+  out
+}
+
+# i as gob's signed integer: the sign in the low bit.
+pub def int_bits(i: Int) -> U64 {
+  return ((^i) << 1).as_u64 | 1 if i < 0
+  (i << 1).as_u64
+}
+
+# The signed integer an unsigned wire value stands for.
+pub def bits_int(x: U64) -> Int {
+  i = (x >> 1).as_i64
+  return ^i if x & 1 != 0
+  i
+}
+
+# A float on the wire: its bits, byte-reversed (so small exponents compress).
+pub def float_bits(f: Float) -> U64 { bits.reverse_bytes64(math.float64bits(f)) }
+
+pub def bits_float(u: U64) -> Float { math.float64frombits(bits.reverse_bytes64(u)) }
+
+# Go's %q of a name in an error message (names are plain text).
+pub def gq(s: Str) -> Str { "\"" + s + "\"" }
+
+# ---- the registry (Go's Register / RegisterName)
+
+struct RegState {
+  # wire name -> the type's own name (its Go type string)
+  name_to_type: Map[Str, Str]
+  # the type's own name -> wire name
+  type_to_name: Map[Str, Str]
+}
+
+# Names for the concrete types sent in interface values (enum variants,
+# GO-VS-RUBY D63). Go keeps one registry per process; alx has no package-level
+# mutable state yet (R11), so a Registry is a value that Encoders and Decoders
+# hold (`default_registry()` makes the one they start with). Copies share it.
+pub struct Registry {
+  st: [RegState]
+
+  # Go's RegisterName: values of v's type (an enum value: its variant) travel
+  # in interface values as `name`. Panics, as Go does, when the name or the
+  # type is already registered differently.
+  pub def register_name![T](name: Str, v: T) {
+    self.register_type!(name, v.gob_type_name)
+  }
+
+  # Go's Register: under the type's own name (Go's rule: "main.Circle",
+  # "*main.Circle", "int"). Every derived type is usable without it; it only
+  # claims the name.
+  pub def register![T](v: T) {
+    t = v.gob_type_name
+    self.register_type!(t, t)
+  }
+
+  # RegisterName by the type's own name (`gob_type_name`).
+  pub def register_type!(name: Str, v_type: Str) {
+    panic("attempt to register empty name") if name == ""
+    s = self.st[0]
+    if t = s.name_to_type[name] {
+      panic("gob: registering duplicate types for #{gq(name)}: #{t} != #{v_type}") if t != v_type
+    }
+    if n = s.type_to_name[v_type] {
+      if n != name {
+        self.st[0].name_to_type.delete(name)
+        panic("gob: registering duplicate names for #{v_type}: #{gq(n)} != #{gq(name)}")
+      }
+    }
+    self.st[0].name_to_type[name] = v_type
+    self.st[0].type_to_name[v_type] = name
+  }
+
+  # The name values of the type travel as: registered, or the type's own.
+  pub def name_of(v_type: Str) -> Str { self.st[0].type_to_name[v_type] || v_type }
+
+  # The type a received name stands for: registered, or the name itself.
+  pub def type_of(name: Str) -> Str { self.st[0].name_to_type[name] || name }
+}
+
+# A new, empty registry.
+pub def new_registry -> Registry {
+  Registry.new(st: [RegState.new(name_to_type: {}, type_to_name: {})])
+}
+
+# The registry an Encoder or Decoder starts with. Go's is one per process
+# (package-level maps); this is the one place that would return a
+# package-level `Mutex[Registry]` once alx has those (R11). Today it is a new
+# registry each time: share one between an Encoder and a Decoder with
+# `new_encoder_with` / `new_decoder_with`.
+pub def default_registry -> Registry { new_registry() }

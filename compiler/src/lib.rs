@@ -9,6 +9,7 @@ pub mod check;
 pub mod consts;
 pub mod derive;
 pub mod derive_data;
+pub mod derive_gob;
 pub mod diag;
 pub mod fmt;
 pub mod front;

@@ -55,6 +55,8 @@ pub struct Parser<'a> {
     cur_data_name: Option<String>,
     /// derive(Data) jobs (see derive_data.rs).
     djobs: Vec<crate::derive_data::DataJob>,
+    /// derive(Gob) jobs (see derive_gob.rs).
+    gjobs: Vec<crate::derive_gob::GobJob>,
 }
 
 type PResult<T> = Result<T, Diag>;
@@ -63,7 +65,7 @@ type PResult<T> = Result<T, Diag>;
 const CMD_PKG: &str = "alxexec";
 
 pub fn parse(file: u32, toks: &[Token], next_id: &mut NodeId) -> PResult<Module> {
-    let mut p = Parser { toks, pos: 0, next_id, scopes: vec![HashSet::new()], in_cond: false, usings: vec![], extern_mode: false, cur_derives: vec![], jobs: vec![], cur_data_name: None, djobs: vec![] };
+    let mut p = Parser { toks, pos: 0, next_id, scopes: vec![HashSet::new()], in_cond: false, usings: vec![], extern_mode: false, cur_derives: vec![], jobs: vec![], cur_data_name: None, djobs: vec![], gjobs: vec![] };
     let mut m = p.module(file)?;
     // Command literals call into os/exec (also from inside `#{...}`).
     let has_cmd = toks.iter().any(|t| match &t.tok {
@@ -149,7 +151,7 @@ impl<'a> Parser<'a> {
     /// The expression in an embedded piece of source (`#{...}`).
     fn code_expr(&mut self, src: &str, base: u32, sp: Span, what: &str) -> PResult<Expr> {
         let toks = crate::lexer::lex_at(sp.file, src, base)?;
-        let mut sub = Parser { toks: &toks, pos: 0, next_id: self.next_id, scopes: self.scopes.clone(), in_cond: false, usings: vec![], extern_mode: false, cur_derives: vec![], jobs: vec![], cur_data_name: None, djobs: vec![] };
+        let mut sub = Parser { toks: &toks, pos: 0, next_id: self.next_id, scopes: self.scopes.clone(), in_cond: false, usings: vec![], extern_mode: false, cur_derives: vec![], jobs: vec![], cur_data_name: None, djobs: vec![], gjobs: vec![] };
         sub.skip_newlines();
         let e = sub.expr()?;
         sub.skip_newlines();
@@ -372,6 +374,7 @@ impl<'a> Parser<'a> {
     /// Write the code of every recorded derive and parse it in as methods.
     fn expand_derives(&mut self, m: &mut Module) -> PResult<()> {
         self.expand_data_derives(m)?;
+        self.expand_gob_derives(m)?;
         if self.jobs.is_empty() {
             return Ok(());
         }
@@ -401,12 +404,55 @@ impl<'a> Parser<'a> {
             for t in &mut toks {
                 t.span = job.span;
             }
-            let mut sub = Parser { toks: &toks, pos: 0, next_id: self.next_id, scopes: vec![HashSet::new()], in_cond: false, usings: vec![], extern_mode: false, cur_derives: vec![], jobs: vec![], cur_data_name: None, djobs: vec![] };
+            let mut sub = Parser { toks: &toks, pos: 0, next_id: self.next_id, scopes: vec![HashSet::new()], in_cond: false, usings: vec![], extern_mode: false, cur_derives: vec![], jobs: vec![], cur_data_name: None, djobs: vec![], gjobs: vec![] };
             sub.skip_newlines();
             let mut defs = vec![];
             sub.struct_def(&mut defs).map_err(|d| Diag::new(job.span, format!("derive(Json) on `{}` made code that doesn't parse: {}\n{text}", job.name, d.msg)))?;
             for d in &mut defs {
                 d.span = job.span;
+            }
+            m.defs.extend(defs);
+        }
+        Ok(())
+    }
+
+    /// Write the code of every derive(Gob) and parse it in as methods.
+    fn expand_gob_derives(&mut self, m: &mut Module) -> PResult<()> {
+        if self.gjobs.is_empty() {
+            return Ok(());
+        }
+        let gjobs = std::mem::take(&mut self.gjobs);
+        let alias = match m.imports.iter().find(|i| i.path == "encoding/gob") {
+            Some(i) => import_name(i),
+            None => {
+                m.imports.push(Import { alias: Some("alxgob".into()), path: "encoding/gob".into(), span: gjobs[0].job.span });
+                "alxgob".to_string()
+            }
+        };
+        let mut locals = std::collections::HashMap::new();
+        for s in &m.structs {
+            locals.insert(s.name.clone(), crate::derive_gob::LocalType { is_enum: false, derived: gjobs.iter().any(|j| j.job.name == s.name) });
+        }
+        for e in &m.enums {
+            locals.insert(e.name.clone(), crate::derive_gob::LocalType { is_enum: true, derived: gjobs.iter().any(|j| j.job.name == e.name) });
+        }
+        for gj in &gjobs {
+            let text = crate::derive_gob::source(gj, &alias, &locals)?;
+            if std::env::var("ALX_DERIVE_DEBUG").is_ok() {
+                eprintln!("{text}");
+            }
+            let job = &gj.job;
+            let mut toks = crate::lexer::lex(job.span.file, &text).map_err(|d| Diag::new(job.span, format!("derive(Gob) on `{}` made code that doesn't lex: {}\n{text}", job.name, d.msg)))?;
+            for t in &mut toks {
+                t.span = job.span;
+            }
+            let mut sub = Parser { toks: &toks, pos: 0, next_id: self.next_id, scopes: vec![HashSet::new()], in_cond: false, usings: vec![], extern_mode: false, cur_derives: vec![], jobs: vec![], cur_data_name: None, djobs: vec![], gjobs: vec![] };
+            sub.skip_newlines();
+            let mut defs = vec![];
+            sub.struct_def(&mut defs).map_err(|d| Diag::new(job.span, format!("derive(Gob) on `{}` made code that doesn't parse: {}\n{text}", job.name, d.msg)))?;
+            for d in &mut defs {
+                d.span = job.span;
+                d.public = true;
             }
             m.defs.extend(defs);
         }
@@ -466,7 +512,7 @@ impl<'a> Parser<'a> {
             for t in &mut toks {
                 t.span = job.span;
             }
-            let mut sub = Parser { toks: &toks, pos: 0, next_id: self.next_id, scopes: vec![HashSet::new()], in_cond: false, usings: vec![], extern_mode: false, cur_derives: vec![], jobs: vec![], cur_data_name: None, djobs: vec![] };
+            let mut sub = Parser { toks: &toks, pos: 0, next_id: self.next_id, scopes: vec![HashSet::new()], in_cond: false, usings: vec![], extern_mode: false, cur_derives: vec![], jobs: vec![], cur_data_name: None, djobs: vec![], gjobs: vec![] };
             sub.skip_newlines();
             let mut defs = vec![];
             sub.struct_def(&mut defs).map_err(|d| Diag::new(job.span, format!("derive(Data) on `{}` made code that doesn't parse: {}\n{text}", job.name, d.msg)))?;
@@ -831,6 +877,10 @@ impl<'a> Parser<'a> {
             generic_self(&mut methods[first_method..], &tparams);
         }
         let span = start.to(self.prev_span());
+        if derives.iter().any(|d| d == "Gob") {
+            let job = crate::derive::DeriveJob { name: name.clone(), tparams: tparams.iter().map(|t| t.name.clone()).collect(), public: false, span, shape: crate::derive::DShape::Enum(dvariants.clone()) };
+            self.gjobs.push(crate::derive_gob::GobJob { job, go_name: data_name.clone() });
+        }
         if derives.iter().any(|d| d == "Data") {
             let job = crate::derive::DeriveJob { name: name.clone(), tparams: tparams.iter().map(|t| t.name.clone()).collect(), public: false, span, shape: crate::derive::DShape::Enum(dvariants.clone()) };
             let ms = data_methods(methods, &mopts);
@@ -907,6 +957,11 @@ impl<'a> Parser<'a> {
             generic_self(&mut methods[first_method..], &tparams);
         }
         let span = start.to(self.prev_span());
+        if derives.iter().any(|d| d == "Gob") {
+            let dfields = fields.iter().zip(fopts.iter()).map(|((n, t, s), o)| crate::derive::DField { name: n.clone(), ty: t.clone(), opts: o.clone(), span: *s }).collect();
+            let job = crate::derive::DeriveJob { name: name.clone(), tparams: tparams.iter().map(|t| t.name.clone()).collect(), public: false, span, shape: crate::derive::DShape::Struct(dfields) };
+            self.gjobs.push(crate::derive_gob::GobJob { job, go_name: data_name.clone() });
+        }
         if derives.iter().any(|d| d == "Data") {
             let dfields = fields.iter().zip(fopts.iter()).map(|((n, t, s), o)| crate::derive::DField { name: n.clone(), ty: t.clone(), opts: o.clone(), span: *s }).collect();
             let job = crate::derive::DeriveJob { name: name.clone(), tparams: tparams.iter().map(|t| t.name.clone()).collect(), public: false, span, shape: crate::derive::DShape::Struct(dfields) };

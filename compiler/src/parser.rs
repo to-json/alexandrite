@@ -1840,7 +1840,29 @@ impl<'a> Parser<'a> {
             let full = sp.to(e.span);
             return Ok(self.mk(ExprKind::Not(Box::new(e)), full));
         }
-        self.equality()
+        let e = self.equality()?;
+        // `R is io.Seeker` / `T is like Int`: a compile-time type test (S6).
+        if matches!(self.peek(), Tok::Ident(w) if w == "is") && matches!(e.kind, ExprKind::Const(_) | ExprKind::TypeApp(..)) {
+            self.bump();
+            let lhs = match &e.kind {
+                ExprKind::Const(c) => TypeExpr::Named(c.clone(), e.span),
+                ExprKind::TypeApp(c, args) => TypeExpr::App(c.clone(), args.clone(), e.span),
+                _ => unreachable!(),
+            };
+            let test = if matches!(self.peek(), Tok::Ident(w) if w == "like") {
+                self.bump();
+                let lsp = self.span();
+                match self.bump().tok {
+                    Tok::Const(t) => IsTest::Like(t),
+                    t => return Err(Diag::new(lsp, format!("expected a type after `like`, found {}", describe(&t)))),
+                }
+            } else {
+                IsTest::Type(self.type_expr()?)
+            };
+            let sp = e.span.to(self.prev_span());
+            return Ok(self.mk(ExprKind::Is(lhs, test), sp));
+        }
+        Ok(e)
     }
     fn equality(&mut self) -> PResult<Expr> {
         self.binary_level(&[("==", BinOp::Eq), ("!=", BinOp::Ne)], Self::comparison)

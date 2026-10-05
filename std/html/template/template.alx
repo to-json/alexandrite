@@ -1,0 +1,470 @@
+# Package template (html/template): data-driven templates for generating
+# HTML output safe against code injection. It has the same interface as
+# text/template and is used instead of it whenever the output is HTML:
+# templates are parsed by text/template/parse, data reaches them as
+# text/template Values (see text/template's header), and before a template
+# first runs, its actions are rewritten to end in escapers chosen by the
+# context each action appears in (HTML text, attribute values, URLs,
+# JavaScript, CSS, srcset ...), exactly as Go's contextual autoescaper does.
+#
+#   Go                                  alx
+#   template.New(name)                  template.new(name)
+#   template.Must(t, err)               template.must(r)
+#   t.Parse / ParseFiles / ParseGlob / ParseFS   t.parse / parse_files / parse_glob / parse_fs
+#   t.Execute(w, data)                  t.execute(w, data), t.execute_str(data)
+#   t.ExecuteTemplate(w, name, data)    t.execute_template(w, name, data), t.execute_template_str
+#   t.Funcs / Delims / Option / Lookup  t.funcs / t.delims / t.option / t.lookup
+#   t.New / Clone / AddParseTree        t.new / t.clone / t.add_parse_tree
+#   t.Templates / DefinedTemplates      t.templates / t.defined_templates
+#   t.Name / t.Tree                     t.name / t.tree
+#   HTML("..."), CSS, HTMLAttr, JS, JSStr, URL, Srcset
+#                                       html("..."), css, html_attr, js, js_str, url, srcset
+#                                       (string Values typed template.HTML ...)
+#   *Error, ErrorCode, ErrAmbigContext ...   EscapeError.Esc(code, text), ERR_AMBIG_CONTEXT ...
+#   HTMLEscape(String/r), JSEscape..., URLQueryEscaper, IsTrue
+#                                       from text/template (html_escape_string ...)
+#
+# Differences from Go (besides text/template's, which all apply):
+#   - Typed content is a string Value whose Go type name is template.HTML
+#     etc.; a json.Marshaler is a value with a method named MarshalJSON
+#     (`#[data("MarshalJSON")]` on a derived type's method returning Str).
+#   - The GODEBUG settings jstmpllitinterp and htmlmetacontenturlescape have
+#     their default behaviour.
+#   - A Template is a handle (copies share it); its methods chain without
+#     `!`, as text/template's do.
+
+import "dyn"
+import "io/fs"
+import "os"
+import "path"
+import "path/filepath"
+import "strconv"
+import ttmpl "text/template"
+import "text/template/parse"
+
+ESCAPE_NONE = 0
+ESCAPE_OK = 1
+ESCAPE_FAILED = 2
+
+# One template (Go's Template): its text/template, its escaping status and
+# its namespace.
+struct HState {
+  escape: Int
+  err: EscapeError?
+  text: ttmpl.Template
+  tree: parse.Tree?
+  ns: Int
+}
+
+# A set of associated templates (Go's nameSpace).
+struct NSData {
+  set: Map[Str, Int]
+  escaped: Bool
+  esc: Escaper
+}
+
+# The templates and namespaces made from one New (a template that a later
+# New of its name replaces moves to a namespace of its own here).
+struct World {
+  states: [HState]
+  spaces: [NSData]
+}
+
+# A specialized text/template Template that produces a safe HTML document
+# fragment.
+pub struct Template {
+  w: [World]
+  i: Int
+
+  def st -> HState { w[0].states[i] }
+  def ns -> NSData { w[0].spaces[st().ns] }
+
+  def ns_esc -> Escaper { ns().esc }
+  def set_ns_esc(e: Escaper) {
+    x = w
+    x[0].spaces[st().ns].esc = e
+  }
+  def lookup_state(name: Str) -> Int? { ns().set[name] }
+  def set_escape_err(idx: Int, e: EscapeError) {
+    x = w
+    x[0].states[idx].escape = ESCAPE_FAILED
+    x[0].states[idx].err = e
+    x[0].states[idx].text.set_tree(none)
+    x[0].states[idx].tree = none
+  }
+  def set_escape_ok(idx: Int) {
+    x = w
+    x[0].states[idx].escape = ESCAPE_OK
+    x[0].states[idx].tree = x[0].states[idx].text.tree
+  }
+  def at(idx: Int) -> Template { Template.new(w: w, i: idx) }
+
+  # Whether two handles are the same template.
+  pub def same?(o: Template) -> Bool { i == o.i && st().text.same?(o.st.text) }
+
+  # The text/template underneath (Go's unexported t.text).
+  pub def text -> ttmpl.Template { st().text }
+
+  # The parse tree (Go's Template.Tree): set when parsed, and the escaped
+  # tree after escaping.
+  pub def tree -> parse.Tree? { st().tree }
+
+  # The name of the template.
+  pub def name -> Str { st().text.name }
+
+  # The templates associated with t, not including t itself... and including
+  # it, as Go's does: every template of the namespace.
+  pub def templates -> [Template] {
+    out: [Template] = []
+    for _, idx in ns().set { out << at(idx) }
+    out
+  }
+
+  # Sets options for the template (see text/template's option).
+  pub def option(opts: [Str]) -> Template {
+    st().text.option(opts)
+    self
+  }
+
+  # Returns an error if escaping has already happened.
+  def check_can_parse -> ~Unit {
+    if ns().escaped {
+      fail Failure.Msg("html/template: cannot Parse after Execute")
+    }
+    nil
+  }
+
+  # Rewrites the template and returns an error if it can't be escaped.
+  def escape -> ~Unit {
+    x = w
+    x[0].spaces[st().ns].escaped = true
+    s = st()
+    if s.escape == ESCAPE_NONE {
+      if s.tree == none {
+        fail Failure.Msg("template: #{strconv.quote(name)} is an incomplete or empty template")
+      }
+      ~escape_template(self, s.text.root.unwrap, name)
+    } else if s.escape == ESCAPE_FAILED {
+      fail s.err.unwrap
+    }
+    nil
+  }
+
+  # Applies a parsed template to the specified data object, writing the
+  # output to w. If an error occurs executing the template or writing its
+  # output, execution stops, but partial results may already have been
+  # written to the output writer. A template may be executed safely in
+  # parallel, although if parallel executions share a Writer the output may
+  # be interleaved.
+  pub def execute[W, D](wr: W, data: D) -> ~Unit {
+    ~escape()
+    st().text.~execute(wr, data)
+  }
+
+  # Execute to a Str (alx's convenience).
+  pub def execute_str[D](data: D) -> ~Str {
+    ~escape()
+    st().text.~execute_str(data)
+  }
+
+  # Applies the template associated with t that has the given name to the
+  # specified data object and writes the output to wr.
+  pub def execute_template[W, D](wr: W, nm: Str, data: D) -> ~Unit {
+    tmpl = ~lookup_and_escape_template(nm)
+    tmpl.st.text.~execute(wr, data)
+  }
+
+  pub def execute_template_str[D](nm: Str, data: D) -> ~Str {
+    tmpl = ~lookup_and_escape_template(nm)
+    tmpl.st.text.~execute_str(data)
+  }
+
+  # Guarantees that the template with the given name is escaped, or
+  # returns an error if it cannot be. It returns the named template.
+  def lookup_and_escape_template(nm: Str) -> ~Template {
+    x = w
+    x[0].spaces[st().ns].escaped = true
+    idx = ns().set[nm]
+    if idx == none {
+      fail Failure.Msg("html/template: #{strconv.quote(nm)} is undefined")
+    }
+    tmpl = at(idx.unwrap)
+    ts = tmpl.st
+    if ts.escape == ESCAPE_FAILED {
+      fail ts.err.unwrap
+    }
+    if ts.text.tree == none || ts.text.root == none {
+      fail Failure.Msg("html/template: #{strconv.quote(nm)} is an incomplete template")
+    }
+    if st().text.lookup(nm) == none {
+      panic("html/template internal error: template escaping out of sync")
+    }
+    if ts.escape == ESCAPE_NONE {
+      ~escape_template(tmpl, ts.text.root.unwrap, nm)
+    }
+    tmpl
+  }
+
+  # A string listing the defined templates, prefixed by the string
+  # "; defined templates are: ". If there are none, it returns the empty
+  # string.
+  pub def defined_templates -> Str { st().text.defined_templates }
+
+  # Parses text as a template body for t. Named template definitions
+  # ({{define ...}} or {{block ...}} statements) in text define additional
+  # templates associated with t and are removed from the definition of t
+  # itself. Templates can be redefined in successive calls to parse, before
+  # the first use of execute on t or any associated template.
+  pub def parse(text_: Str) -> ~Template {
+    ~check_can_parse()
+    ret = st().text.~parse(text_)
+    for v in ret.templates {
+      nm = v.name
+      idx = ns().set[nm]
+      j = 0
+      if k = idx {
+        j = k
+      } else {
+        j = new_in_ns(nm).i
+      }
+      x = w
+      x[0].states[j].text = v
+      x[0].states[j].tree = v.tree
+    }
+    self
+  }
+
+  # Creates a new template with the given name and parse tree and
+  # associates it with t. If a template with the name already exists, its
+  # tree is replaced. It is an error after t or any associated template has
+  # been executed.
+  pub def add_parse_tree(nm: Str, tree: parse.Tree) -> ~Template {
+    ~check_can_parse()
+    tx = st().text.~add_parse_tree(nm, tree)
+    x = w
+    ss = x[0].states
+    ss << HState.new(text: tx, tree: tx.tree, ns: st().ns)
+    x[0].states = ss
+    x[0].spaces[st().ns].set[nm] = ss.size - 1
+    at(ss.size - 1)
+  }
+
+  # A duplicate of the template, including all associated templates. The
+  # actual representation is not copied, but the name space of associated
+  # templates is, so further calls to parse in the copy will add templates
+  # to the copy but not to the original. It returns an error if t has
+  # already been executed.
+  pub def clone -> ~Template {
+    if st().escape != ESCAPE_NONE {
+      fail Failure.Msg("html/template: cannot Clone #{strconv.quote(name)} after it has executed")
+    }
+    text_clone = st().text.~clone
+    nw = new_world(text_clone)
+    ret = Template.new(w: nw, i: 0)
+    for xt in text_clone.templates {
+      nm = xt.name
+      src = ns().set[nm]
+      if src == none || at(src.unwrap).st.escape != ESCAPE_NONE {
+        fail Failure.Msg("html/template: cannot Clone #{strconv.quote(name)} after it has executed")
+      }
+      if tr = xt.tree {
+        xt.set_tree(tr.copy)
+      }
+      if nm == ret.name {
+        y = nw
+        y[0].states[0].text = xt
+        y[0].states[0].tree = xt.tree
+        next
+      }
+      y = nw
+      ss = y[0].states
+      ss << HState.new(text: xt, tree: xt.tree, ns: 0)
+      y[0].states = ss
+      y[0].spaces[0].set[nm] = ss.size - 1
+    }
+    ret
+  }
+
+  # A new HTML template associated with the given one and with the same
+  # delimiters. The association, which is transitive, allows one template
+  # to invoke another with a {{template}} action. If a template with the
+  # given name already exists, the new HTML template will replace it. The
+  # existing template will be reset and disassociated with t.
+  pub def new(nm: Str) -> Template { new_in_ns(nm) }
+
+  def new_in_ns(nm: Str) -> Template {
+    x = w
+    sp = st().ns
+    tx = st().text.new(nm)
+    ss = x[0].states
+    ss << HState.new(text: tx, ns: sp)
+    x[0].states = ss
+    idx = ss.size - 1
+    if existing = x[0].spaces[sp].set[nm] {
+      # The existing template becomes a new, empty template of its own
+      # (Go's `*existing = *New(existing.Name())`).
+      empty_text = ttmpl.new(nm)
+      spaces = x[0].spaces
+      set: Map[Str, Int] = {nm => existing}
+      spaces << NSData.new(set: set, esc: make_escaper(set, empty_text))
+      x[0].spaces = spaces
+      x[0].states[existing] = HState.new(text: empty_text, ns: spaces.size - 1)
+    }
+    x[0].spaces[sp].set[nm] = idx
+    at(idx)
+  }
+
+  # Adds the elements of the argument map to the template's function map.
+  # It must be called before the template is parsed. It panics if a value
+  # in the map is not a function with appropriate return type. However, it
+  # is legal to overwrite elements of the map.
+  pub def funcs(m: Map[Str, dyn.Func]) -> Template {
+    st().text.funcs(m)
+    self
+  }
+
+  # Sets the action delimiters to the specified strings, to be used in
+  # subsequent calls to parse, parse_files, or parse_glob. Nested template
+  # definitions will inherit the settings. An empty delimiter stands for
+  # the corresponding default: {{ or }}.
+  pub def delims(left: Str, right: Str) -> Template {
+    st().text.delims(left, right)
+    self
+  }
+
+  # The template with the given name that is associated with t, or none if
+  # there is no such template.
+  pub def lookup(nm: Str) -> Template? {
+    if idx = ns().set[nm] {
+      return at(idx)
+    }
+    none
+  }
+
+  # Parses the named files and associates the resulting templates with t.
+  pub def parse_files(filenames: [Str]) -> ~Template {
+    ~parse_files_into(self, filenames, ->(f: Str) -> ~(Str, [Byte]) { (filepath.base(f), ~os.read_file(f)) })
+  }
+
+  # Parses the template definitions in the files identified by the pattern
+  # and associates the resulting templates with t.
+  pub def parse_glob(pattern: Str) -> ~Template {
+    ~check_can_parse()
+    filenames = ~filepath.glob(pattern)
+    if filenames.size == 0 {
+      fail Failure.Msg("html/template: pattern matches no files: #{bquote(pattern)}")
+    }
+    ~parse_files(filenames)
+  }
+
+  # Like parse_files or parse_glob but reads from the file system fsys
+  # instead of the host operating system's file system.
+  pub def parse_fs[F](fsys: F, patterns: [Str]) -> ~Template {
+    filenames = ~fs_glob_all(fsys, patterns)
+    ~parse_files_into(self, filenames, ->(f: Str) -> ~(Str, [Byte]) { (path.base(f), ~fs.read_file(fsys, f)) })
+  }
+}
+
+def new_world(text: ttmpl.Template) -> [World] {
+  set: Map[Str, Int] = {text.name => 0}
+  [World.new(states: [HState.new(text: text, tree: text.tree, ns: 0)], spaces: [NSData.new(set: set, esc: make_escaper(set, text))])]
+}
+
+# A new HTML template with the given name.
+pub def new(name: Str) -> Template {
+  Template.new(w: new_world(ttmpl.new(name)), i: 0)
+}
+
+# A helper that panics if the error is non-nil (Go's Must).
+pub def must(r: ~Template) -> Template {
+  if e = r.err {
+    panic(e.message)
+  }
+  r.unwrap
+}
+
+# Parses the named files into a new Template named after the first file.
+pub def parse_files(filenames: [Str]) -> ~Template {
+  fail Failure.Msg("html/template: no files named in call to ParseFiles") if filenames.size == 0
+  t = new(filepath.base(filenames[0]))
+  ~t.parse_files(filenames)
+}
+
+# Parses the files matching the pattern into a new Template named after
+# the first one.
+pub def parse_glob(pattern: Str) -> ~Template {
+  filenames = ~filepath.glob(pattern)
+  if filenames.size == 0 {
+    fail Failure.Msg("html/template: pattern matches no files: #{bquote(pattern)}")
+  }
+  ~parse_files(filenames)
+}
+
+# Like parse_files or parse_glob but reads from the file system fsys.
+pub def parse_fs[F](fsys: F, patterns: [Str]) -> ~Template {
+  filenames = ~fs_glob_all(fsys, patterns)
+  fail Failure.Msg("html/template: no files named in call to ParseFiles") if filenames.size == 0
+  t = new(path.base(filenames[0]))
+  ~parse_files_into(t, filenames, ->(f: Str) -> ~(Str, [Byte]) { (path.base(f), ~fs.read_file(fsys, f)) })
+}
+
+def fs_glob_all[F](fsys: F, patterns: [Str]) -> ~[Str] {
+  filenames: [Str] = []
+  for pattern in patterns {
+    list = ~fs.glob(fsys, pattern)
+    fail Failure.Msg("template: pattern matches no files: #{bquote(pattern)}") if list.size == 0
+    for f in list { filenames << f }
+  }
+  filenames
+}
+
+# Go's parseFiles: the helper for the function and the method.
+def parse_files_into(t: Template, filenames: [Str], read: (Str) -> ~(Str, [Byte])) -> ~Template {
+  ~t.check_can_parse()
+  fail Failure.Msg("html/template: no files named in call to ParseFiles") if filenames.size == 0
+  for filename in filenames {
+    nm, b = ~read.call(filename)
+    s = Str.from_bytes(b)
+    # First template becomes return value if not already defined, and we
+    # use that one for subsequent New calls to associate all the templates
+    # together. Also, if this file has the same name as t, this file
+    # becomes the contents of t, so
+    #   t = template.new("x").parse_files(["x"])
+    # works. Otherwise we create a new template associated with t.
+    tmpl = nm == t.name ? t : t.new(nm)
+    _ = tmpl.~parse(s)
+  }
+  t
+}
+
+# Go's %#q.
+def bquote(s: Str) -> Str {
+  return "`" + s + "`" if strconv.can_backquote(s)
+  strconv.quote(s)
+}
+
+# Whether the value is 'true', in the sense of not the zero of its type,
+# and whether the value has a meaningful truth value. This is the
+# definition of truth used by if and other such actions.
+pub def is_true(v: dyn.Value) -> (Bool, Bool) { ttmpl.is_true(v) }
+
+# Forwarding functions so that clients need only import this package to
+# reach the general escaping functions of text/template.
+
+# The escaped HTML equivalent of the plain text data s.
+pub def html_escape_string(s: Str) -> Str { ttmpl.html_escape_string(s) }
+
+# The escaped HTML equivalent of the textual representation of its
+# arguments.
+pub def html_escaper_values(args: [dyn.Value]) -> Str { ttmpl.html_escaper(args) }
+
+# The escaped JavaScript equivalent of the plain text data s.
+pub def js_escape_string(s: Str) -> Str { ttmpl.js_escape_string(s) }
+
+# The escaped JavaScript equivalent of the textual representation of its
+# arguments.
+pub def js_escaper_values(args: [dyn.Value]) -> Str { ttmpl.js_escaper(args) }
+
+# The escaped value of the textual representation of its arguments in a
+# form suitable for embedding in a URL query.
+pub def url_query_escaper(args: [dyn.Value]) -> Str { ttmpl.url_query_escaper(args) }

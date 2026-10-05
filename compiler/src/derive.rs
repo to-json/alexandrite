@@ -27,76 +27,142 @@ use crate::ast::*;
 use crate::diag::{Diag, Span};
 use std::collections::{HashMap, HashSet};
 
-/// Options from `#[json(...)]` on a field or variant.
+/// The options on a field or variant (or a method, for derive(Data)).
+///
+/// Every derive reads one attribute form, Go's struct tag in alx syntax
+/// (GO-VS-RUBY S5): `#[field(json: "id,omitempty", data: "ID", xml: "id,attr")]`,
+/// each derive reading its own key; a key no derive here knows is kept in
+/// `tags` for the derive that does. The per-derive shorthands
+/// `#[json(...)]` and `#[data(...)]` say the same.
 #[derive(Default, Clone, Debug)]
 pub struct Opts {
+    /// derive(Json): `json: "name"`, `json: "-"`, `json: ",omitempty"`.
     pub rename: Option<String>,
     pub skip: bool,
     pub omit_empty: bool,
-    /// `#[asn1(...)]` options (derive_asn1.rs).
+    /// derive(Data): `data: "Name"` / `data: "-"`.
+    pub drename: Option<String>,
+    pub dskip: bool,
+    /// Every `key: "value"` of `#[field(...)]`, in order.
+    pub tags: Vec<(String, String)>,
+    /// derive(Asn1): `asn1: "optional,explicit,tag:0"` (or `#[asn1(...)]`).
     pub asn1: crate::derive_asn1::A1,
 }
 
-/// A field or variant attribute: `#[json(...)]` or `#[asn1(...)]`.
-pub fn apply_field_attr(text: &str, sp: Span, o: &mut Opts) -> Result<(), Diag> {
-    if text.trim_start().starts_with("field") {
-        for (fmt, tag) in field_attr(text, sp)? {
-            match fmt.as_str() {
-                "json" => apply_json_tag(&tag, o),
-                "asn1" => crate::derive_asn1::apply_asn1_attr(&format!("asn1({tag})"), sp, &mut o.asn1)?,
-                // Other formats' derives read their own key.
-                _ => {}
-            }
-        }
-        return Ok(());
-    }
-    if text.trim_start().starts_with("asn1") {
-        return crate::derive_asn1::apply_asn1_attr(text, sp, &mut o.asn1);
-    }
-    apply_json_attr(text, sp, o)
+/// Whether `text` is an attribute that sets field options: `json(...)`,
+/// `data(...)` or `field(...)`.
+pub fn is_field_attr(text: &str) -> bool {
+    let t = text.trim_start();
+    ["json", "data", "asn1", "field"].iter().any(|k| t.strip_prefix(k).is_some_and(|r| r.trim_start().starts_with('(')))
 }
 
-/// The `format: "tag"` pairs of a `#[field(json: "name,omitempty", asn1:
-/// "explicit,tag:0")]` attribute: Go's struct tag in alx syntax (S5), one
-/// entry per format; each derive reads its own key.
-pub fn field_attr(text: &str, sp: Span) -> Result<Vec<(String, String)>, Diag> {
-    let inner = text.trim().strip_prefix("field").map(str::trim_start).and_then(|r| r.strip_prefix('(')).and_then(|r| r.trim_end().strip_suffix(')'));
+/// Apply one field-options attribute (`#[json(...)]`, `#[data(...)]`,
+/// `#[field(...)]`) to `o`.
+pub fn apply_field_attr(text: &str, sp: Span, o: &mut Opts) -> Result<(), Diag> {
+    let t = text.trim();
+    if t.starts_with("json") {
+        return apply_json_attr(text, sp, o);
+    }
+    if t.starts_with("data") {
+        return apply_data_attr(text, sp, o);
+    }
+    if t.starts_with("asn1") {
+        return crate::derive_asn1::apply_asn1_attr(text, sp, &mut o.asn1);
+    }
+    let inner = t.strip_prefix("field").map(str::trim_start).and_then(|r| r.strip_prefix('(')).and_then(|r| r.trim_end().strip_suffix(')'));
     let Some(inner) = inner else {
-        return Err(Diag::new(sp, format!("unknown attribute `#[{text}]`")).note(r#"write #[field(json: "name,omitempty", asn1: "explicit,tag:0")]"#));
+        return Err(Diag::new(sp, format!("unknown attribute `#[{text}]`")));
     };
-    let mut out = vec![];
+    let note = "write Go's struct tag as `#[field(json: \"id,omitempty\", data: \"ID\", xml: \"id,attr\")]`";
     for a in split_args(inner) {
         let a = a.trim();
         if a.is_empty() {
             continue;
         }
         let Some((k, v)) = a.split_once(':') else {
-            return Err(Diag::new(sp, format!(r#"`{a}` in #[field(...)]: write `format: "tag"`"#)));
+            return Err(Diag::new(sp, format!("`{a}` in `#[field(...)]` isn't `key: \"value\"`")).note(note));
         };
-        let v = v.trim();
-        let Some(v) = v.strip_prefix('"').and_then(|v| v.strip_suffix('"')) else {
-            return Err(Diag::new(sp, format!("`{a}` in #[field(...)]: the tag is a string")));
-        };
-        out.push((k.trim().to_string(), unescape(v)));
+        let (k, v) = (k.trim(), v.trim());
+        if k.is_empty() || !k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+            return Err(Diag::new(sp, format!("`{k}` isn't a tag key")).note(note));
+        }
+        let v = v.strip_prefix('"').and_then(|s| s.strip_suffix('"')).ok_or_else(|| Diag::new(sp, format!("the `{k}` tag's value must be a string")).note(note))?;
+        let v = unescape(v);
+        if o.tags.iter().any(|(k2, _)| k2 == k) {
+            return Err(Diag::new(sp, format!("the `{k}` tag is given twice")));
+        }
+        match k {
+            "json" => apply_json_tag(&v, sp, o)?,
+            "data" => apply_data_tag(&v, o),
+            "asn1" => crate::derive_asn1::apply_asn1_attr(&format!("asn1({v})"), sp, &mut o.asn1)?,
+            _ => {}
+        }
+        o.tags.push((k.to_string(), v));
     }
-    Ok(out)
+    Ok(())
 }
 
-/// Go's json struct tag: "name,omitempty", "-" (skip), ",omitempty".
-fn apply_json_tag(tag: &str, o: &mut Opts) {
-    if tag == "-" {
+/// Go's json tag: `name`, `-`, `name,omitempty`, `,omitempty`.
+fn apply_json_tag(v: &str, sp: Span, o: &mut Opts) -> Result<(), Diag> {
+    if v == "-" {
         o.skip = true;
-        return;
+        return Ok(());
     }
-    let mut parts = tag.split(',');
-    if let Some(n) = parts.next().filter(|n| !n.is_empty()) {
-        o.rename = Some(n.to_string());
+    let mut parts = v.split(',');
+    let name = parts.next().unwrap_or("");
+    if !name.is_empty() {
+        o.rename = Some(name.to_string());
     }
     for p in parts {
-        if p == "omitempty" || p == "omit_empty" {
-            o.omit_empty = true;
+        match p.trim() {
+            "omitempty" | "omit_empty" => o.omit_empty = true,
+            "" => {}
+            p => return Err(Diag::new(sp, format!("unknown json tag option `{p}`")).note("options: omitempty")),
         }
     }
+    Ok(())
+}
+
+/// The data tag: `Name` (the name in the value tree) or `-` (left out).
+fn apply_data_tag(v: &str, o: &mut Opts) {
+    if v == "-" {
+        o.dskip = true;
+    } else if !v.is_empty() {
+        o.drename = Some(v.to_string());
+    }
+}
+
+/// `#[data("Name")]` / `#[data(skip)]`.
+pub fn apply_data_attr(text: &str, sp: Span, o: &mut Opts) -> Result<(), Diag> {
+    let (r, s) = parse_data_attr(text, sp)?;
+    if r.is_some() {
+        o.drename = r;
+    }
+    o.dskip |= s;
+    Ok(())
+}
+
+/// Parse `#[data("Name")]` / `#[data(skip)]`: (rename, skip).
+pub fn parse_data_attr(text: &str, sp: Span) -> Result<(Option<String>, bool), Diag> {
+    let inner = text.trim().strip_prefix("data").map(str::trim_start).and_then(|r| r.strip_prefix('(')).and_then(|r| r.trim_end().strip_suffix(')'));
+    let Some(inner) = inner else {
+        return Err(Diag::new(sp, format!("unknown attribute `#[{text}]`")).note("known: #[data(\"Name\")], #[data(skip)]"));
+    };
+    let (mut rename, mut skip) = (None, false);
+    for a in split_args(inner) {
+        let a = a.trim();
+        if a.is_empty() {
+            continue;
+        }
+        if let Some(s) = a.strip_prefix('"') {
+            rename = Some(unescape(s.strip_suffix('"').ok_or_else(|| Diag::new(sp, "unterminated string in `#[data(...)]`"))?));
+        } else if a == "skip" {
+            skip = true;
+        } else {
+            return Err(Diag::new(sp, format!("unknown data option `{a}`")).note("options: \"Name\" (rename), skip"));
+        }
+    }
+    Ok((rename, skip))
 }
 
 /// Parse the text of one `#[json(...)]` attribute into `o`.
@@ -178,8 +244,8 @@ pub fn derive_names(text: &str, sp: Span) -> Result<Option<Vec<String>>, Diag> {
     let names: Vec<String> = inner.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
     for n in &names {
         // Eq and Show are structural already (D13, D14): accepted, nothing to generate.
-        if !matches!(n.as_str(), "Json" | "Asn1" | "Eq" | "Show") {
-            return Err(Diag::new(sp, format!("can't derive `{n}`")).note("derivable: Json (generates to_json / from_json), Asn1 (to_asn1 / from_asn1); Eq and Show are accepted and need nothing: structs, tuples and enums already compare and print field by field"));
+        if !matches!(n.as_str(), "Json" | "Asn1" | "Data" | "Eq" | "Show") {
+            return Err(Diag::new(sp, format!("can't derive `{n}`")).note("derivable: Json (generates to_json / from_json), Asn1 (to_asn1 / from_asn1), Data (a dynamic dyn.Value tree: to_data / from_data); Eq and Show are accepted and need nothing: structs, tuples and enums already compare and print field by field"));
         }
     }
     Ok(Some(names))
@@ -208,7 +274,7 @@ pub enum DShape {
 
 #[derive(Clone, Debug)]
 pub struct DeriveJob {
-    /// "Json" or "Asn1".
+    /// "Json", "Asn1" or "Data".
     pub which: &'static str,
     /// Type-level `#[asn1(...)]` options.
     pub type_opts: crate::derive_asn1::A1,
@@ -231,7 +297,10 @@ pub fn type_src(t: &TypeExpr) -> String {
         TypeExpr::Named(n, _) => n.clone(),
         TypeExpr::Array(e, _) => format!("[{}]", type_src(e)),
         TypeExpr::Opt(e, _) => format!("{}?", type_src(e)),
-        TypeExpr::Fixed(e, _, _) => format!("[{}; _]", type_src(e)),
+        TypeExpr::Fixed(e, n, _) => match &n.kind {
+            ExprKind::Int(v) => format!("[{}; {v}]", type_src(e)),
+            _ => format!("[{}; _]", type_src(e)),
+        },
         TypeExpr::App(n, args, _) => format!("{n}[{}]", args.iter().map(type_src).collect::<Vec<_>>().join(", ")),
         TypeExpr::Result(e, _, _) => format!("~{}", type_src(e)),
         TypeExpr::Handle(n, args, _) if args.is_empty() => format!("@{n}"),

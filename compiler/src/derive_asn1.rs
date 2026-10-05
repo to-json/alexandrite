@@ -1,4 +1,4 @@
-//! `#[derive(Asn1)]`: compile-time generation of `encoding/asn1` code (D59).
+//! `#[derive(Asn1)]`: compile-time generation of `encoding/asn1` code (D61).
 //!
 //! The same mechanism as `#[derive(Json)]` (derive.rs): the parser records the
 //! struct and its fields' `#[asn1(...)]` options, and at the end of the module

@@ -1345,8 +1345,8 @@ struct FnCx<'w, 'a> {
     /// functions of their own).
     cells: Option<Vec<(LocalId, Ty)>>,
     /// Lambda literals checked so far: (block span start, fn type, captures).
-    lambdas: Vec<(u32, Ty, Vec<LocalId>)>,
-    lambda_info: Vec<(u32, Vec<LocalId>, (usize, usize))>,
+    lambdas: Vec<(u64, Ty, Vec<LocalId>)>,
+    lambda_info: Vec<(u64, Vec<LocalId>, (usize, usize))>,
     /// The type the expression being checked is wanted as (for inferring
     /// a generic constructor's type arguments).
     want_hint: Option<Ty>,
@@ -1631,6 +1631,16 @@ impl<'w, 'a> FnCx<'w, 'a> {
                         let d = def.unwrap();
                         return Err(Diag::new(d.name_span, format!("`{}` can fail with {e}, which its `~T<{}>` doesn't list", d.name, declared.join(" | "))).note("add it, or declare `~T<Error>` (any error)"));
                     }
+                }
+            }
+        }
+        // A def whose failures all come from calls covered by its declared set
+        // (recursion through defs still being checked) fails with that set: its
+        // callers see the declaration, not an empty set.
+        if self.errs.is_empty() {
+            if let Some(Some(declared)) = def.map(|d| d.errs.clone()) {
+                for n in &declared {
+                    self.errs.insert(resolve_name(n, Span::default(), &|q| self.w.structs.contains_key(q)).unwrap_or_else(|_| n.clone()));
                 }
             }
         }
@@ -2420,7 +2430,7 @@ impl<'w, 'a> FnCx<'w, 'a> {
                 let held = if let Ty::Result(t) = self.resolve(&inner.ty) {
                     match (&inner.kind, self.mut_errs.take()) {
                         (TK::Seq(..), Some(es)) if !es.is_empty() => {
-                            errs.extend(es);
+                            errs.extend(es.into_iter().filter(|e| !e.is_empty()));
                             mut_call = true;
                         }
                         _ => {
@@ -3260,7 +3270,7 @@ impl<'w, 'a> FnCx<'w, 'a> {
         let body = self.binary(BinOp::Eq, ea, eb, sp)?;
         let zero = self.mk(TK::Int(0), Ty::Int, sp);
         let range = self.mk(TK::Range(Box::new(zero), Box::new(na), true), Ty::Range, sp);
-        let blk = TBlock { params: vec![i], destructure: false, body: vec![TStmt::Expr(body)], pure: false, span: sp, own: (i, i + 1) };
+        let blk = TBlock { params: vec![i], destructure: false, body: vec![TStmt::Expr(body)], pure: false, span: sp, own: (i, i + 1), id: 0 };
         let all = self.mk(TK::M(M::All, Some(Box::new(range)), vec![], Some(Box::new(blk))), Ty::Bool, sp);
         let both = self.mk(TK::Bin(BinOp::And, Box::new(same_size), Box::new(all)), Ty::Bool, sp);
         Ok(self.mk(TK::Seq(vec![s1, s2, TStmt::Expr(both)]), Ty::Bool, sp))
@@ -3339,7 +3349,7 @@ impl<'w, 'a> FnCx<'w, 'a> {
                     Some(TStmt::Expr(e)) => e.ty.clone(),
                     _ => Ty::Unit,
                 };
-                (TBlock { params: vec![], destructure: false, body, pure: false, span: blk.span, own: (own_start, self.locals.len()) }, ty)
+                (TBlock { params: vec![], destructure: false, body, pure: false, span: blk.span, own: (own_start, self.locals.len()), id: 0 }, ty)
             })
         } else {
             self.block_n(blk, &ptys, false)
@@ -3377,7 +3387,11 @@ impl<'w, 'a> FnCx<'w, 'a> {
         used.dedup();
         let caps: Vec<LocalId> = used.into_iter().filter(|l| *l < tb.own.0 || *l >= tb.own.1).filter(|l| !tb.params.contains(l)).collect();
         let ty = Ty::Fn(ptys, Box::new(rt));
-        let lo = blk.span.lo;
+        // A lambda is known by its AST block's id and its span (derived code
+        // gives every token the declaration's span, so spans aren't unique).
+        tb.id = blk.id;
+        // (with its span: synthesized lambdas share an id, u32::MAX)
+        let lo = ((blk.id as u64) << 32) | blk.span.lo as u64;
         self.lambdas.retain(|(l, _, _)| *l != lo);
         self.lambdas.push((lo, ty.clone(), caps.clone()));
         self.lambda_info.retain(|(l, _, _)| *l != lo);
@@ -3527,7 +3541,7 @@ impl<'w, 'a> FnCx<'w, 'a> {
             return Err(Diag::new(e.span, "a `spawn` body can't end in a held `~T`: propagate it with `~` (`spawn { ~f(x) }`), so its error becomes the task's"));
             }
         }
-        let tb = TBlock { params: vec![], destructure: false, body, pure: false, span: blk.span, own: (own_start, self.locals.len()) };
+        let tb = TBlock { params: vec![], destructure: false, body, pure: false, span: blk.span, own: (own_start, self.locals.len()), id: 0 };
         let mut used = vec![];
         for s in &tb.body {
             crate::lower::collect_locals_stmt(s, &mut used);
@@ -3755,7 +3769,13 @@ impl<'w, 'a> FnCx<'w, 'a> {
         self.under_try = saved;
         let call = call?;
         if let TK::Call(f, _) = &call.kind {
-            self.mut_errs = self.w.funcs[*f].as_ref().map(|f| f.errs.clone());
+            // (A `!` method still being checked, in a def with a declared set: its
+            // failures are covered by the declaration, as for plain calls.)
+            self.mut_errs = match self.w.funcs[*f].as_ref() {
+                Some(f) => Some(f.errs.clone()),
+                None if self.declared_errs => Some(vec![String::new()]),
+                None => None,
+            };
         }
         let rty = call.ty.clone();
         if matches!(self.resolve(&rty), Ty::Unit) {
@@ -4648,7 +4668,7 @@ impl<'w, 'a> FnCx<'w, 'a> {
                 self.loops.pop();
                 // A loop nothing breaks out of never finishes (it returns, fails or panics).
                 let ty = if breaks_out(&body) { Ty::Unit } else { Ty::Never };
-                let blk = TBlock { params: vec![], destructure: false, body, pure: true, span: b.span , own: (0, 0) };
+                let blk = TBlock { params: vec![], destructure: false, body, pure: true, span: b.span , own: (0, 0), id: 0 };
                 return Ok(self.mk(TK::M(M::Loop, None, vec![], Some(Box::new(blk))), ty, sp));
             }
             "it" => return Err(Diag::new(sp, "`it` can only be used inside a block")),
@@ -5236,7 +5256,7 @@ impl<'w, 'a> FnCx<'w, 'a> {
                 self.impure = saved || self.impure;
                 self.loops.pop();
                 self.pop_scope();
-                let blk = TBlock { params: vec![y], destructure: false, body, pure, span: b.span, own: (own_start, self.locals.len()) };
+                let blk = TBlock { params: vec![y], destructure: false, body, pure, span: b.span, own: (own_start, self.locals.len()), id: 0 };
                 Ok(self.mk(TK::M(M::EnumNew, None, vec![], Some(Box::new(blk))), Ty::Gen(Box::new(el)), sp))
             }
             _ => {
@@ -5308,9 +5328,9 @@ impl<'w, 'a> FnCx<'w, 'a> {
         // The block's value: materialize unless it feeds flat_map (caller decides).
         if let Some(TStmt::Expr(e)) = body.last_mut() {
             let ty = e.ty.clone();
-            return Ok((TBlock { params: ids, destructure, body, pure, span: b.span, own }, ty));
+            return Ok((TBlock { params: ids, destructure, body, pure, span: b.span, own, id: b.id }, ty));
         }
-        Ok((TBlock { params: ids, destructure, body, pure, span: b.span, own }, if matches!(ty, Ty::Never) { Ty::Never } else { Ty::Unit }))
+        Ok((TBlock { params: ids, destructure, body, pure, span: b.span, own, id: b.id }, if matches!(ty, Ty::Never) { Ty::Never } else { Ty::Unit }))
     }
 
     /// `&:name` as a block: `{ |x| x.name }`.
@@ -5322,7 +5342,7 @@ impl<'w, 'a> FnCx<'w, 'a> {
         self.pop_scope();
         let body = body?;
         let ty = body.ty.clone();
-        Ok((TBlock { params: vec![p], destructure: false, body: vec![TStmt::Expr(body)], pure: true, span: sym.1 , own: (0, 0) }, ty))
+        Ok((TBlock { params: vec![p], destructure: false, body: vec![TStmt::Expr(body)], pure: true, span: sym.1 , own: (0, 0), id: 0 }, ty))
     }
 
     /// Block given as `{ ... }` or `&:sym`.
@@ -6102,7 +6122,7 @@ impl<'w, 'a> FnCx<'w, 'a> {
                             let la = self.mk(TK::Local(a), el.clone(), sp);
                             let lx = self.mk(TK::Local(x), el.clone(), sp);
                             let body = self.binary(bop, la, lx, sp)?;
-                            TBlock { params: vec![a, x], destructure: false, body: vec![TStmt::Expr(body)], pure: true, span: ssp , own: (0, 0) }
+                            TBlock { params: vec![a, x], destructure: false, body: vec![TStmt::Expr(body)], pure: true, span: ssp , own: (0, 0), id: 0 }
                         }
                         None => {
                             let (b, t) = self.block_n(block.unwrap(), &[acc_ty.clone(), el.clone()], false)?;
@@ -6620,7 +6640,8 @@ pub fn self_containing_closures(funcs: &[TFunc], ifaces: &HashMap<String, Vec<(T
             for c in caps {
                 let ct = &f.locals[*c].ty;
                 if holds(ct, t, &sites, ifaces, &mut vec![]) {
-                    let sp = Span { file: f.span.file, lo: *lo, hi: *lo + 1 };
+                    let l = (*lo & 0xffff_ffff) as u32;
+                    let sp = Span { file: f.span.file, lo: l, hi: l + 1 };
                     return Err(Diag::new(sp, format!("this closure captures `{}` ({}), which holds a closure of this same type ({}): a closure contains what it captures, so it would contain itself", f.locals[*c].name, ct.show(), t.show()))
                         .note("pass the value as a parameter instead, or keep it in a Pool and capture its @handle"));
                 }

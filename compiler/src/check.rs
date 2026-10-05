@@ -4266,6 +4266,14 @@ impl<'w, 'a> FnCx<'w, 'a> {
         let v = self.value(rhs)?;
         let vt = self.resolve(&v.ty);
         if !matches!(vt, Ty::Opt(_)) {
+            if n.starts_with(crate::parser::OR_JUMP_TMP) {
+                let note = match vt {
+                    Ty::Bool => "for a condition, write the jump with `unless`: `return unless ok`",
+                    Ty::Result(_) => "a `~T` result propagates with `~` (`v = ~r`); `r.ok?` / `r.err` test it",
+                    _ => "the left side of `|| return` (`|| fail`, `|| break`, `|| next`) must be a T?",
+                };
+                return Err(Diag::new(rhs.span, format!("`|| jump` unwraps a T?, but this is {}", vt.show())).note(note));
+            }
             return Err(Diag::new(c.span, format!("`if {n} = ...` unwraps a T?, but this is {}", vt.show())).note("to compare, use `==`"));
         }
         let (tmp, pre) = self.opt_tmp(v, c.span);
@@ -4964,7 +4972,14 @@ impl<'w, 'a> FnCx<'w, 'a> {
                 }
             }
         }
-        match name {
+        // S12: a def of the current package (or of the main file, there)
+        // shadows a builtin of the same name, as in Go.
+        let own_def = {
+            let pkg = current_pkg();
+            let q = if pkg.is_empty() { name.to_string() } else { format!("{pkg}.{name}") };
+            self.w.by_name.get(&q).is_some_and(|&d| self.w.defs[d].pkg == pkg)
+        };
+        match if own_def { "" } else { name } {
             "puts" | "print" | "p" => {
                 if self.pure_decl {
                     return Err(Diag::new(sp, format!("`#[pure] def {}` can't do I/O: `{name}`", self.fn_name)));

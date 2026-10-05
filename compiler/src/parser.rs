@@ -1692,6 +1692,9 @@ impl<'a> Parser<'a> {
             self.expect_op("=>")?;
             let body = if self.is_op("{") {
                 self.braced_stmts()?
+            } else if self.at_jump() {
+                // S8: `X => return v`, `X => fail e`, `X => break`, `X => next`.
+                vec![self.jump()?]
             } else {
                 let e = self.expr()?;
                 vec![Stmt { span: e.span, kind: StmtKind::Expr(e) }]
@@ -1828,7 +1831,51 @@ impl<'a> Parser<'a> {
     }
 
     fn or(&mut self) -> PResult<Expr> {
-        self.binary_level(&[("||", BinOp::Or)], Self::and)
+        let mut l = self.and()?;
+        while self.is_op("||") {
+            self.bump();
+            self.skip_line_continuation();
+            if self.at_jump() {
+                // S8: `opt || return v` (`|| fail e`, `|| break`, `|| next`):
+                // the optional's value, else the jump. Desugared to
+                // `if tmp = opt { tmp } else { jump }`.
+                let jump = self.jump()?;
+                let sp = l.span.to(jump.span);
+                let tmp = format!("{OR_JUMP_TMP}{}", *self.next_id);
+                let t1 = self.mk(ExprKind::Name(tmp.clone()), l.span);
+                let cond = self.mk(ExprKind::Assign(Box::new(t1), Box::new(l)), sp);
+                let t2 = self.mk(ExprKind::Name(tmp), sp);
+                let then = vec![Stmt { span: sp, kind: StmtKind::Expr(t2) }];
+                return Ok(self.mk(ExprKind::If(Box::new(cond), then, vec![jump]), sp));
+            }
+            let r = self.and()?;
+            let sp = l.span.to(r.span);
+            l = self.mk(ExprKind::Binary(BinOp::Or, Box::new(l), Box::new(r)), sp);
+        }
+        Ok(l)
+    }
+
+    /// Does a jump (`return`, `fail`, `break`, `next`) start here?
+    fn at_jump(&self) -> bool {
+        match self.peek() {
+            Tok::Kw(Kw::Return) | Tok::Kw(Kw::Break) | Tok::Kw(Kw::Next) => true,
+            Tok::Ident(n) => n == "fail" && !self.is_local("fail") && !matches!(self.peek_at(1), Tok::Op("(") | Tok::Op("=")),
+            _ => false,
+        }
+    }
+
+    /// A jump where an expression or a case arm ends (S8): `return [v]`,
+    /// `fail e`, `break [v]`, `next`. No `return a, b` (write a tuple).
+    fn jump(&mut self) -> PResult<Stmt> {
+        let start = self.span();
+        let ends = |p: &Self| p.at_stmt_end() || p.is_op(",") || p.is_op(")") || p.is_op("]");
+        let kind = match self.bump().tok {
+            Tok::Kw(Kw::Next) => StmtKind::Next,
+            Tok::Kw(Kw::Break) => StmtKind::Break(if ends(self) { None } else { Some(self.ternary()?) }),
+            Tok::Kw(Kw::Return) => StmtKind::Return(if ends(self) { None } else { Some(self.ternary()?) }),
+            _ => StmtKind::Fail(self.ternary()?),
+        };
+        Ok(Stmt { kind, span: start.to(self.prev_span()) })
     }
     fn and(&mut self) -> PResult<Expr> {
         self.binary_level(&[("&&", BinOp::And)], Self::not)
@@ -2483,6 +2530,10 @@ impl<'a> Parser<'a> {
                 self.expect_op("]")?;
                 self.mk(ExprKind::Array(items), sp.to(self.prev_span()))
             }
+            Tok::Ident(name) if name == "fail" && !self.is_local("fail") && !matches!(self.peek(), Tok::Op("(") | Tok::Op("=")) => {
+                return Err(jump_here(sp, "fail"));
+            }
+            Tok::Kw(k @ (Kw::Return | Kw::Break | Kw::Next)) => return Err(jump_here(sp, &kw_name(k))),
             Tok::Ident(name) => {
                 if self.is_local(&name) {
                     // `f(x)` on a local: calling a lambda.
@@ -2544,6 +2595,15 @@ pub fn is_place(e: &Expr) -> bool {
 }
 
 /// A keyword's spelling, for keywords used as method names (`e.next`).
+/// Prefix of the temporaries `opt || jump` binds (check.rs names them in errors).
+pub const OR_JUMP_TMP: &str = "__or_jump";
+
+/// A jump where a value is wanted.
+fn jump_here(sp: Span, kw: &str) -> Diag {
+    Diag::new(sp, format!("`{kw}` is a statement, not a value"))
+        .note(format!("as part of an expression it can only follow `||` (`v = opt || {kw}`) or be a whole `case` arm (`X => {kw}`) (S8)"))
+}
+
 fn kw_name(k: Kw) -> String {
     format!("{k:?}").to_lowercase()
 }

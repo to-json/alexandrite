@@ -11,6 +11,7 @@ pub mod derive;
 pub mod derive_data;
 pub mod derive_xml;
 pub mod diag;
+pub mod embed;
 pub mod fmt;
 pub mod front;
 pub mod lexer;

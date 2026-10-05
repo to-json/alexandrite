@@ -266,6 +266,9 @@ pub enum M {
     FloatBits,
     /// U64 -> Float (`u.__from_bits`).
     FloatFromBits,
+    /// `x.__ffmt_f(n)` / `x.__ffmt_e(n)`: `%.nf` / `%.ne` of a Float (the fmt engine).
+    FloatFmtF,
+    FloatFmtE,
     /// `Name.new(fields...)`
     StructNew,
     /// T? → Bool
@@ -415,6 +418,8 @@ pub enum TK {
     /// An untyped constant (Go): exact until its use gives it a type.
     Const(ConstVal),
     Str(String),
+    /// A Str literal of arbitrary bytes (an `#[embed]`ded file that isn't UTF-8).
+    Bytes(Vec<u8>),
     Bool(bool),
     Unit,
     Local(LocalId),

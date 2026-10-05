@@ -80,6 +80,19 @@ pub fn parse(file: u32, toks: &[Token], next_id: &mut NodeId) -> PResult<Module>
     Ok(m)
 }
 
+/// One expression (the whole token stream), for code the checker writes as
+/// text (`format`'s composite values: check.rs `fmt_text`). `locals` are the
+/// names in scope.
+pub fn parse_expr(toks: &[Token], next_id: &mut NodeId, locals: &[String]) -> PResult<Expr> {
+    let mut p = Parser { toks, pos: 0, next_id, scopes: vec![locals.iter().cloned().collect()], in_cond: false, usings: vec![], extern_mode: false, cur_derives: vec![], jobs: vec![], cur_data_name: None, djobs: vec![], xjobs: vec![] };
+    let e = p.expr()?;
+    p.skip_newlines();
+    if !matches!(p.peek(), Tok::Eof) {
+        return Err(Diag::new(p.span(), format!("generated code: unexpected {}", describe(p.peek()))));
+    }
+    Ok(e)
+}
+
 impl<'a> Parser<'a> {
     fn peek(&self) -> &Tok {
         &self.toks[self.pos].tok
@@ -216,7 +229,21 @@ impl<'a> Parser<'a> {
                     let Tok::Str(name) = self.bump().tok else { unreachable!() };
                     let name_span = self.prev_span();
                     self.scopes.push(HashSet::new());
-                    let body = self.braced_stmts();
+                    // `test "x" { |t| ... }` / `bench "x" { |b| ... }`: the body takes
+                    // the package testing's T (or B); the front end gives its type.
+                    let mut param = None;
+                    let body = if kw != "example" && matches!(self.peek_at(1), Tok::Op("|")) && matches!(self.peek_at(2), Tok::Ident(_)) && matches!(self.peek_at(3), Tok::Op("|")) {
+                        self.bump();
+                        self.bump();
+                        let psp = self.span();
+                        let Tok::Ident(p) = self.bump().tok else { unreachable!() };
+                        self.bump();
+                        self.declare(&p);
+                        param = Some(Param { name: p, ty: None, span: psp });
+                        self.stmts_to_brace()
+                    } else {
+                        self.braced_stmts()
+                    };
                     self.scopes.pop();
                     let body = body?;
                     let kind = match kw.as_str() {
@@ -236,7 +263,7 @@ impl<'a> Parser<'a> {
                         }
                     }
                     let span = start.to(self.prev_span());
-                    let def = Def { public: false, using: self.usings.clone(), name: name.clone(), span, tparams: vec![], name_span, params: vec![], ret: None, fallible: true, errs: None, pure: false, ffi: None, body };
+                    let def = Def { public: false, using: self.usings.clone(), name: name.clone(), span, tparams: vec![], name_span, params: param.into_iter().collect(), ret: None, fallible: true, errs: None, pure: false, ffi: None, body };
                     m.tests.push(TestDecl { kind, name, span, outputs, def });
                 }
                 Tok::Ident(kw) if kw == "pub" => {
@@ -294,6 +321,13 @@ impl<'a> Parser<'a> {
                         t => return Err(Diag::new(self.span(), format!("`pub` goes before a declaration, found {}", describe(&t)))),
                     }
                 }
+                Tok::Attr(a) if is_embed_attr(&a) => {
+                    let (c, public) = self.embed_const()?;
+                    if public {
+                        m.public.insert(c.name.clone());
+                    }
+                    m.consts.push(c);
+                }
                 Tok::Attr(_) if self.attrs_precede_type() => self.type_attrs()?,
                 Tok::Attr(_) | Tok::Kw(Kw::Def) | Tok::Kw(Kw::Fn) => m.defs.push(self.def()?),
                 Tok::Ident(kw) if kw == "extern" && matches!(self.peek_at(1), Tok::Kw(Kw::Def)) => m.defs.push(self.extern_def()?),
@@ -334,6 +368,43 @@ impl<'a> Parser<'a> {
         Ok(m)
     }
 
+    /// `#[embed("pattern", ...)] [pub] NAME: Type` (Go's `//go:embed`): a
+    /// constant whose value is the matching files, read by the front end.
+    fn embed_const(&mut self) -> PResult<(ConstDef, bool)> {
+        let Tok::Attr(a) = self.peek().clone() else { unreachable!() };
+        let asp = self.bump().span;
+        let mut patterns = embed_patterns(&a).map_err(|m| Diag::new(asp, m))?;
+        self.skip_newlines();
+        // Several `#[embed]` lines add up, as Go's `//go:embed` lines do.
+        while let Tok::Attr(a) = self.peek().clone() {
+            if !is_embed_attr(&a) {
+                break;
+            }
+            let sp = self.bump().span;
+            patterns.extend(embed_patterns(&a).map_err(|m| Diag::new(sp, m))?);
+            self.skip_newlines();
+        }
+        let public = matches!(self.peek(), Tok::Ident(p) if p == "pub");
+        if public {
+            self.bump();
+        }
+        let Tok::Const(name) = self.peek().clone() else {
+            return Err(Diag::new(self.span(), "`#[embed(...)]` goes before a constant declaration: `NAME: Str`, `NAME: [Byte]` or `NAME: embed.FS`"));
+        };
+        let sp = self.bump().span;
+        if !self.is_op(":") {
+            return Err(Diag::new(self.span(), "an embedded constant needs its type: `NAME: Str`, `NAME: [Byte]` or `NAME: embed.FS`"));
+        }
+        self.bump();
+        let ty = self.type_expr()?;
+        if self.is_op("=") {
+            return Err(Diag::new(self.span(), "an embedded constant has no `= value`: the files are its value"));
+        }
+        let value = Expr { id: self.id(), kind: ExprKind::Bool(false), span: sp };
+        let embed = Some(Embed { patterns, span: asp, files: Default::default() });
+        Ok((ConstDef { name, span: sp, ty: Some(ty), value, embed, var: false }, public))
+    }
+
     /// `NAME = expr` at the top level: a constant, or (R11) a package-level
     /// `Atomic[T]` / `Mutex[T]`, whose value a def `__init_NAME` computes.
     fn top_value(&mut self, m: &mut Module, name: String, sp: Span, ty: Option<TypeExpr>, value: Expr) {
@@ -342,7 +413,7 @@ impl<'a> Parser<'a> {
             let body = vec![Stmt { span: value.span, kind: StmtKind::Expr(value.clone()) }];
             m.defs.push(Def { name: var_init_name(&name), span: sp, tparams: vec![], name_span: sp, params: vec![], ret: ty.clone(), fallible: false, public: false, using: self.usings.clone(), errs: None, pure: false, ffi: None, body });
         }
-        m.consts.push(ConstDef { name, span: sp, ty, value, var });
+        m.consts.push(ConstDef { name, span: sp, ty, value, var, embed: None });
     }
 
     /// Are the `#[...]` attributes at the cursor followed by a struct or enum?
@@ -377,7 +448,7 @@ impl<'a> Parser<'a> {
     }
 
     fn mark_pub(&mut self, name: &str) {
-        if let Some(j) = self.jobs.iter_mut().rev().find(|j| j.name == name) {
+        for j in self.jobs.iter_mut().filter(|j| j.name == name) {
             j.public = true;
         }
     }
@@ -390,14 +461,22 @@ impl<'a> Parser<'a> {
             return Ok(());
         }
         let jobs = std::mem::take(&mut self.jobs);
-        // The local name of the `encoding/json` import (added if the file has none).
-        let alias = match m.imports.iter().find(|i| i.path == "encoding/json") {
-            Some(i) => import_name(i),
-            None => {
-                m.imports.push(Import { alias: Some("alxjson".into()), path: "encoding/json".into(), span: jobs[0].span });
-                "alxjson".to_string()
+        // The local name of an import the generated code needs (added if the file has none).
+        let mut alias_of = |m: &mut Module, path: &str, own: &str, kind: &str| -> String {
+            if !jobs.iter().any(|j| j.derive == kind) {
+                return String::new();
+            }
+            match m.imports.iter().find(|i| i.path == path) {
+                Some(i) => import_name(i),
+                None => {
+                    m.imports.push(Import { alias: Some(own.into()), path: path.into(), span: jobs[0].span });
+                    own.to_string()
+                }
             }
         };
+        let alias = alias_of(m, "encoding/json", "alxjson", "Json");
+        let quick = alias_of(m, "testing/quick", "alxquick", "Arbitrary");
+        let rand = alias_of(m, "math/rand", "alxrand", "Arbitrary");
         let mut types = crate::derive::ModuleTypes { local: Default::default(), enums: Default::default() };
         for s in &m.structs {
             types.local.insert(s.name.clone(), jobs.iter().any(|j| j.name == s.name));
@@ -407,18 +486,18 @@ impl<'a> Parser<'a> {
             types.enums.insert(e.name.clone());
         }
         for job in &jobs {
-            let text = crate::derive::json_source(job, &alias, &types)?;
+            let text = if job.derive == "Arbitrary" { crate::derive::arbitrary_source(job, &quick, &rand)? } else { crate::derive::json_source(job, &alias, &types)? };
             if std::env::var("ALX_DERIVE_DEBUG").is_ok() {
                 eprintln!("{text}");
             }
-            let mut toks = crate::lexer::lex(job.span.file, &text).map_err(|d| Diag::new(job.span, format!("derive(Json) on `{}` made code that doesn't lex: {}\n{text}", job.name, d.msg)))?;
+            let mut toks = crate::lexer::lex(job.span.file, &text).map_err(|d| Diag::new(job.span, format!("derive({}) on `{}` made code that doesn't lex: {}\n{text}", job.derive, job.name, d.msg)))?;
             for t in &mut toks {
                 t.span = job.span;
             }
             let mut sub = Parser { toks: &toks, pos: 0, next_id: self.next_id, scopes: vec![HashSet::new()], in_cond: false, usings: vec![], extern_mode: false, cur_derives: vec![], jobs: vec![], cur_data_name: None, djobs: vec![], xjobs: vec![] };
             sub.skip_newlines();
             let mut defs = vec![];
-            sub.struct_def(&mut defs).map_err(|d| Diag::new(job.span, format!("derive(Json) on `{}` made code that doesn't parse: {}\n{text}", job.name, d.msg)))?;
+            sub.struct_def(&mut defs).map_err(|d| Diag::new(job.span, format!("derive({}) on `{}` made code that doesn't parse: {}\n{text}", job.derive, job.name, d.msg)))?;
             for d in &mut defs {
                 d.span = job.span;
             }
@@ -883,12 +962,12 @@ impl<'a> Parser<'a> {
         }
         let span = start.to(self.prev_span());
         if derives.iter().any(|d| d == "Data") {
-            let job = crate::derive::DeriveJob { name: name.clone(), tparams: tparams.iter().map(|t| t.name.clone()).collect(), public: false, span, shape: crate::derive::DShape::Enum(dvariants.clone()) };
+            let job = crate::derive::DeriveJob { derive: "Data".into(), name: name.clone(), tparams: tparams.iter().map(|t| t.name.clone()).collect(), public: false, span, shape: crate::derive::DShape::Enum(dvariants.clone()) };
             let ms = data_methods(methods, &mopts);
             self.djobs.push(crate::derive_data::DataJob { job, go_name: data_name, methods: ms });
         }
-        if derives.iter().any(|d| d == "Json") {
-            self.jobs.push(crate::derive::DeriveJob { name: name.clone(), tparams: tparams.iter().map(|t| t.name.clone()).collect(), public: false, span, shape: crate::derive::DShape::Enum(dvariants) });
+        for d in derives.iter().filter(|d| matches!(d.as_str(), "Json" | "Arbitrary")) {
+            self.jobs.push(crate::derive::DeriveJob { derive: d.clone(), name: name.clone(), tparams: tparams.iter().map(|t| t.name.clone()).collect(), public: false, span, shape: crate::derive::DShape::Enum(dvariants.clone()) });
         }
         Ok(EnumDef { name, span, error: false, tparams, variants })
     }
@@ -960,19 +1039,18 @@ impl<'a> Parser<'a> {
         let span = start.to(self.prev_span());
         if derives.iter().any(|d| d == "Data") {
             let dfields = fields.iter().zip(fopts.iter()).map(|((n, t, s), o)| crate::derive::DField { name: n.clone(), ty: t.clone(), opts: o.clone(), span: *s }).collect();
-            let job = crate::derive::DeriveJob { name: name.clone(), tparams: tparams.iter().map(|t| t.name.clone()).collect(), public: false, span, shape: crate::derive::DShape::Struct(dfields) };
+            let job = crate::derive::DeriveJob { derive: "Data".into(), name: name.clone(), tparams: tparams.iter().map(|t| t.name.clone()).collect(), public: false, span, shape: crate::derive::DShape::Struct(dfields) };
             let ms = data_methods(methods, &mopts);
             self.djobs.push(crate::derive_data::DataJob { job, go_name: data_name, methods: ms });
         }
+        let dfields: Vec<crate::derive::DField> = fields.iter().zip(fopts).map(|((n, t, s), o)| crate::derive::DField { name: n.clone(), ty: t.clone(), opts: o, span: *s }).collect();
         if derives.iter().any(|d| d == "Xml") {
-            let dfields = fields.iter().zip(fopts.iter()).map(|((n, t, s), o)| crate::derive::DField { name: n.clone(), ty: t.clone(), opts: o.clone(), span: *s }).collect();
-            let job = crate::derive::DeriveJob { name: name.clone(), tparams: tparams.iter().map(|t| t.name.clone()).collect(), public: false, span, shape: crate::derive::DShape::Struct(dfields) };
+            let job = crate::derive::DeriveJob { derive: "Xml".into(), name: name.clone(), tparams: tparams.iter().map(|t| t.name.clone()).collect(), public: false, span, shape: crate::derive::DShape::Struct(dfields.clone()) };
             let ms = methods[first_method..].iter().map(|d| d.name.rsplit('.').next().unwrap_or(&d.name).to_string()).collect();
             self.xjobs.push(crate::derive_xml::XmlJob { job, methods: ms });
         }
-        if derives.iter().any(|d| d == "Json") {
-            let dfields = fields.iter().zip(fopts).map(|((n, t, s), o)| crate::derive::DField { name: n.clone(), ty: t.clone(), opts: o, span: *s }).collect();
-            self.jobs.push(crate::derive::DeriveJob { name: name.clone(), tparams: tparams.iter().map(|t| t.name.clone()).collect(), public: false, span, shape: crate::derive::DShape::Struct(dfields) });
+        for d in derives.iter().filter(|d| matches!(d.as_str(), "Json" | "Arbitrary")) {
+            self.jobs.push(crate::derive::DeriveJob { derive: d.clone(), name: name.clone(), tparams: tparams.iter().map(|t| t.name.clone()).collect(), public: false, span, shape: crate::derive::DShape::Struct(dfields.clone()) });
         }
         Ok(StructDef { name, span, tparams, fields })
     }
@@ -1115,6 +1193,11 @@ impl<'a> Parser<'a> {
 
     fn braced_stmts(&mut self) -> PResult<Vec<Stmt>> {
         self.expect_op("{")?;
+        self.stmts_to_brace()
+    }
+
+    /// Statements up to the closing `}` (the `{` already read).
+    fn stmts_to_brace(&mut self) -> PResult<Vec<Stmt>> {
         let saved = std::mem::replace(&mut self.in_cond, false);
         let mut out = vec![];
         loop {
@@ -2326,6 +2409,60 @@ pub fn describe(t: &Tok) -> String {
         Tok::Newline => "end of line".into(),
         Tok::Eof => "end of file".into(),
     }
+}
+
+
+/// Is `#[...]`'s text an `embed(...)` attribute?
+fn is_embed_attr(a: &str) -> bool {
+    a.trim_start().strip_prefix("embed").is_some_and(|r| r.trim_start().starts_with('('))
+}
+
+/// The patterns of `embed("a.txt", "static/*.html")`: string literals
+/// (double-quoted with Go's simple escapes, or backquoted), comma-separated.
+fn embed_patterns(a: &str) -> Result<Vec<String>, String> {
+    let usage = "write `#[embed(\"file.txt\")]` (one or more quoted patterns, comma-separated)";
+    let inner = a.trim().strip_prefix("embed").map(str::trim).and_then(|r| r.strip_prefix('(')).and_then(|r| r.trim_end().strip_suffix(')')).ok_or(usage)?;
+    let mut out = vec![];
+    let mut cs = inner.trim().chars().peekable();
+    loop {
+        while cs.peek().is_some_and(|c| c.is_whitespace()) {
+            cs.next();
+        }
+        let Some(q) = cs.next() else { break };
+        if q != '"' && q != '`' {
+            return Err(usage.into());
+        }
+        let mut p = String::new();
+        loop {
+            match cs.next() {
+                None => return Err("unterminated pattern in `#[embed(...)]`".into()),
+                Some(c) if c == q => break,
+                Some('\\') if q == '"' => match cs.next() {
+                    Some('n') => p.push('\n'),
+                    Some('t') => p.push('\t'),
+                    Some(c) => p.push(c),
+                    None => return Err("unterminated pattern in `#[embed(...)]`".into()),
+                },
+                Some(c) => p.push(c),
+            }
+        }
+        if p.is_empty() {
+            return Err("an empty pattern in `#[embed(...)]`".into());
+        }
+        out.push(p);
+        while cs.peek().is_some_and(|c| c.is_whitespace()) {
+            cs.next();
+        }
+        match cs.next() {
+            None => break,
+            Some(',') => {}
+            _ => return Err(usage.into()),
+        }
+    }
+    if out.is_empty() {
+        return Err(usage.into());
+    }
+    Ok(out)
 }
 
 /// The methods a derive(Data) sees: each recorded method with its

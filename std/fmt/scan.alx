@@ -1,0 +1,798 @@
+# Scanning: Go's fmt/scan.go. `fmt.sscan(input, a, b)` and the other scan
+# functions are compiler builtins over this file: they take the places to
+# fill (locals, fields, elements) where Go takes pointers, and the checker
+# writes, for each place, a call of the ScanState method for its type
+# (scan_int!, scan_uint!, scan_float!, scan_complex!, scan_string!,
+# scan_bool!). Go stops at the first error by panicking inside its scanner;
+# here the state keeps the first error and every later step does nothing.
+
+import "math"
+import "os"
+import "strconv"
+
+# EOF: Go's io.EOF is the error of a scan that finds no input at all.
+EOF_RUNE = -1
+HUGE_WID = 1 << 30
+
+# Why a scan stopped (Go's io.EOF, io.ErrUnexpectedEOF, and the scanner's
+# own messages; strconv's errors keep their own messages).
+pub error ScanError {
+  # Go's io.EOF: the input ended before anything was scanned.
+  Eof
+  # Go's io.ErrUnexpectedEOF.
+  UnexpectedEof
+  Msg(text: Str)
+  # A strconv error (ParseInt, ParseFloat, Unquote), as Go reports it.
+  Conv(text: Str)
+
+  def message -> Str {
+    case self {
+      Eof => "EOF"
+      UnexpectedEof => "unexpected EOF"
+      Msg(text) => text
+      Conv(text) => text
+    }
+  }
+}
+
+# Go's isSpace: Unicode white space, as fmt's scanner counts it.
+pub def is_space(r: Int) -> Bool {
+  return false if r < 0 || r >= 0x10000
+  r >= 9 && r <= 13 || r == 32 || r == 0x85 || r == 0xA0 || r == 0x1680 || r >= 0x2000 && r <= 0x200A || r == 0x2028 || r == 0x2029 || r == 0x202F || r == 0x205F || r == 0x3000
+}
+
+def index_rune(s: Str, r: Int) -> Int {
+  i = 0
+  while i < s.size {
+    c, w = __fmt_rune_at(s, i)
+    return i if c == r
+    i += w
+  }
+  -1
+}
+
+# The byte source of a scan of a Str.
+pub struct StrSource {
+  s: Str
+  st: [Int]
+
+  pub def read!(p: [Byte]) -> ~Int {
+    pos = st[0]
+    return 0 if pos >= s.size || p.size == 0
+    n = s.size - pos
+    n = p.size if p.size < n
+    i = 0
+    while i < n {
+      p[i] = s[pos + i]
+      i += 1
+    }
+    self.st[0] = pos + n
+    n
+  }
+}
+
+# The scanner (Go's ss over a readRune): reads runes from r one byte at a
+# time (never past what it scans, but for one rune of lookahead).
+pub struct ScanState[R] {
+  r: R
+  # Go's readRune: bytes left over from bad UTF-8, the rune to read again.
+  pending: [Byte]
+  peek: Int
+  has_peek: Bool
+  last: Int
+  # Go's ss.
+  buf: [Byte]
+  count: Int
+  at_eof: Bool
+  nl_is_end: Bool
+  nl_is_space: Bool
+  arg_limit: Int
+  limit: Int
+  max_wid: Int
+  err: Error?
+  # How many operands were filled.
+  filled: Int
+  # Scanf: the format and where it has got to.
+  format: Str
+  fpos: Int
+
+  pub def failed? -> Bool { err != none }
+
+  def fail!(e: Error) {
+    self.err = e if err == none
+  }
+
+  def fail_msg!(m: Str) { fail!(ScanError.Msg(m)) }
+
+  # One read from the source (fallible or not, it is a ~Int here).
+  def fetch!(p: [Byte]) -> ~Int {
+    self.r.~read!(p)
+  }
+
+  def read_byte! -> Int {
+    if pending.size > 0 {
+      b = pending[0]
+      self.pending = pending[1...pending.size]
+      return b.to_i
+    }
+    one: [Byte] = [0]
+    r2 = fetch!(one)
+    if e = r2.err {
+      fail!(e)
+      return -1
+    }
+    return -1 if r2.unwrap == 0
+    one[0].to_i
+  }
+
+  # Go's readRune.ReadRune: -1 at the end.
+  def raw_rune! -> Int {
+    if has_peek {
+      self.has_peek = false
+      self.last = peek
+      return peek
+    }
+    b0 = read_byte!
+    return -1 if b0 < 0
+    if b0 < 0x80 {
+      self.last = b0
+      return b0
+    }
+    bytes: [Byte] = [b0.as_u8]
+    need = b0 >= 0xF0 ? 4 : (b0 >= 0xE0 ? 3 : 2)
+    while bytes.size < need {
+      b = read_byte!
+      break if b < 0
+      bytes << b.as_u8
+      # A byte that can't continue the sequence ends it.
+      break if b & 0xC0 != 0x80
+    }
+    s = Str.from_bytes(bytes)
+    rr, w = __fmt_rune_at(s, 0)
+    if w < bytes.size {
+      self.pending = bytes[w...bytes.size] + pending
+    }
+    self.last = rr
+    rr
+  }
+
+  def unread_raw! {
+    self.peek = last
+    self.has_peek = true
+  }
+
+  # Go's ss.ReadRune / getRune: -1 at the end (or the width limit, or a
+  # newline when it ends the scan).
+  pub def get_rune! -> Int {
+    return -1 if at_eof || count >= arg_limit || err != none
+    r2 = raw_rune!
+    if r2 >= 0 {
+      self.count += 1
+      self.at_eof = true if nl_is_end && r2 == 10
+    } else {
+      self.at_eof = true
+    }
+    r2
+  }
+
+  def must_read_rune! -> Int {
+    r2 = get_rune!
+    fail!(ScanError.UnexpectedEof) if r2 < 0
+    r2
+  }
+
+  pub def unread_rune! {
+    unread_raw!
+    self.at_eof = false
+    self.count -= 1
+    nil
+  }
+
+  def write_rune!(r2: Int) {
+    for b in __fmt_rune_str(r2).bytes {
+      self.buf << b
+    }
+  }
+
+  def skip_space! {
+    loop {
+      r2 = get_rune!
+      return if r2 < 0
+      if r2 == 13 && peek_is!("\n") {
+        next
+      }
+      if r2 == 10 {
+        next if nl_is_space
+        fail_msg!("unexpected newline")
+        return
+      }
+      if !is_space(r2) {
+        unread_rune!
+        return
+      }
+    }
+  }
+
+  def peek_is!(ok: Str) -> Bool {
+    r2 = get_rune!
+    unread_rune! if r2 >= 0
+    index_rune(ok, r2) >= 0
+  }
+
+  def consume!(ok: Str, accept: Bool) -> Bool {
+    r2 = get_rune!
+    return false if r2 < 0
+    if index_rune(ok, r2) >= 0 {
+      write_rune!(r2) if accept
+      return true
+    }
+    unread_rune! if accept
+    false
+  }
+
+  def accept!(ok: Str) -> Bool { consume!(ok, true) }
+
+  def not_eof! {
+    r2 = get_rune!
+    if r2 < 0 {
+      fail!(ScanError.Eof)
+      return
+    }
+    unread_rune!
+  }
+
+  def ok_verb!(verb: Int, ok_verbs: Str, typ: Str) -> Bool {
+    return true if index_rune(ok_verbs, verb) >= 0
+    fail_msg!("bad verb '%" + __fmt_rune_str(verb) + "' for " + typ)
+    false
+  }
+
+  def token!(skip: Bool) -> Str {
+    skip_space! if skip
+    loop {
+      r2 = get_rune!
+      break if r2 < 0
+      if is_space(r2) {
+        unread_rune!
+        break
+      }
+      write_rune!(r2)
+    }
+    Str.from_bytes(buf)
+  }
+
+  # Go's scanBool.
+  pub def scan_bool!(verb: Int) -> Bool? {
+    self.buf = []
+    return none if err != none
+    skip_space!
+    not_eof!
+    return none if err != none || !ok_verb!(verb, "tv", "boolean")
+    v = false
+    case get_rune! {
+      48 => v = false
+      49 => v = true
+      116 | 84 => {
+        fail_msg!("syntax error scanning boolean") if accept!("rR") && (!accept!("uU") || !accept!("eE"))
+        v = true
+      }
+      102 | 70 => {
+        fail_msg!("syntax error scanning boolean") if accept!("aA") && (!accept!("lL") || !accept!("sS") || !accept!("eE"))
+        v = false
+      }
+      _ => v = false
+    }
+    return none if err != none
+    self.filled += 1
+    v
+  }
+
+  def get_base!(verb: Int) -> (Int, Str) {
+    ok_verb!(verb, "bdoUxXv", "integer")
+    case verb {
+      98 => (2, "01")
+      111 => (8, "01234567")
+      120 | 88 | 85 => (16, "0123456789aAbBcCdDeEfF")
+      _ => (10, "0123456789")
+    }
+  }
+
+  def scan_number!(digits: Str, have: Bool) -> Str {
+    if !have {
+      not_eof!
+      fail_msg!("expected integer") if err == none && !accept!(digits)
+    }
+    while err == none && accept!(digits) {}
+    Str.from_bytes(buf)
+  }
+
+  def scan_rune!(bits: Int) -> Int {
+    not_eof!
+    r2 = get_rune!
+    n = (64 - bits).to_u64
+    fail_msg!("overflow on character value " + __fmt_rune_str(r2)) if (r2 << n) >> n != r2
+    r2
+  }
+
+  # Go's scanBasePrefix: the prefix of %v (0b, 0o, 0x, or 0 for octal).
+  def scan_base_prefix! -> (Int, Str, Bool) {
+    return (0, "0123456789_", false) if !peek_is!("0")
+    accept!("0")
+    if peek_is!("bB") {
+      consume!("bB", true)
+      return (0, "01_", true)
+    }
+    if peek_is!("oO") {
+      consume!("oO", true)
+      return (0, "01234567_", true)
+    }
+    if peek_is!("xX") {
+      consume!("xX", true)
+      return (0, "0123456789aAbBcCdDeEfF_", true)
+    }
+    (0, "01234567_", true)
+  }
+
+  # Go's scanInt: a signed integer of `bits` bits.
+  pub def scan_int!(verb: Int, bits: Int) -> Int? {
+    self.buf = []
+    return none if err != none
+    if verb == 99 {
+      v = scan_rune!(bits)
+      return none if err != none
+      self.filled += 1
+      return v
+    }
+    skip_space!
+    not_eof!
+    return none if err != none
+    base, digits = get_base!(verb)
+    return none if err != none
+    have = false
+    if verb == 85 {
+      fail_msg!("bad unicode format ") if !consume!("U", false) || !consume!("+", false)
+    } else {
+      accept!("+-")
+      if verb == 118 {
+        base, digits, have = scan_base_prefix!
+      }
+    }
+    return none if err != none
+    tok = scan_number!(digits, have)
+    return none if err != none
+    r2 = strconv.parse_int(tok, base, 64)
+    if e = r2.err {
+      fail!(ScanError.Conv(go_strconv(e.message)))
+      return none
+    }
+    i = r2.unwrap
+    n = (64 - bits).to_u64
+    if (i << n) >> n != i {
+      fail_msg!("integer overflow on token " + tok)
+      return none
+    }
+    self.filled += 1
+    i
+  }
+
+  # Go's scanUint.
+  pub def scan_uint!(verb: Int, bits: Int) -> U64? {
+    self.buf = []
+    return none if err != none
+    if verb == 99 {
+      v = scan_rune!(bits)
+      return none if err != none
+      self.filled += 1
+      return v.as_u64
+    }
+    skip_space!
+    not_eof!
+    return none if err != none
+    base, digits = get_base!(verb)
+    return none if err != none
+    have = false
+    if verb == 85 {
+      fail_msg!("bad unicode format ") if !consume!("U", false) || !consume!("+", false)
+    } elsif verb == 118 {
+      base, digits, have = scan_base_prefix!
+    }
+    return none if err != none
+    tok = scan_number!(digits, have)
+    return none if err != none
+    r2 = strconv.parse_uint(tok, base, 64)
+    if e = r2.err {
+      fail!(ScanError.Conv(go_strconv(e.message)))
+      return none
+    }
+    i = r2.unwrap
+    n = (64 - bits).to_u64
+    if (i << n) >> n != i {
+      fail_msg!("unsigned integer overflow on token " + tok)
+      return none
+    }
+    self.filled += 1
+    i
+  }
+
+  # Go's floatToken.
+  def float_token! -> Str {
+    self.buf = []
+    return Str.from_bytes(buf) if accept!("nN") && accept!("aA") && accept!("nN")
+    accept!("+-")
+    return Str.from_bytes(buf) if accept!("iI") && accept!("nN") && accept!("fF")
+    digits = "0123456789_"
+    exp = "eEpP"
+    if accept!("0") && accept!("xX") {
+      digits = "0123456789aAbBcCdDeEfF_"
+      exp = "pP"
+    }
+    while accept!(digits) {}
+    if accept!(".") {
+      while accept!(digits) {}
+    }
+    if accept!(exp) {
+      accept!("+-")
+      while accept!("0123456789_") {}
+    }
+    Str.from_bytes(buf)
+  }
+
+  # Go's convertFloat: a decimal mantissa may take a binary exponent (p).
+  def convert_float!(s: Str) -> Float {
+    p = index_rune(s, 112)
+    if p >= 0 && index_rune(s, 120) < 0 && index_rune(s, 88) < 0 {
+      f = strconv.parse_float(s[0...p])
+      if e = f.err {
+        fail!(ScanError.Conv(go_strconv(replace_quoted(e.message, s[0...p], s))))
+        return 0.0
+      }
+      m = strconv.atoi(s[p + 1...s.size])
+      if e = m.err {
+        fail!(ScanError.Conv(go_strconv(replace_quoted(e.message, s[p + 1...s.size], s))))
+        return 0.0
+      }
+      return math.ldexp(f.unwrap, m.unwrap)
+    }
+    f = strconv.parse_float(s)
+    if e = f.err {
+      fail!(ScanError.Conv(go_strconv(e.message)))
+      return 0.0
+    }
+    f.unwrap
+  }
+
+  # A Float (Go's *float64 case).
+  pub def scan_float!(verb: Int) -> Float? {
+    self.buf = []
+    return none if err != none || !ok_verb!(verb, "beEfFgGv", "float64")
+    skip_space!
+    not_eof!
+    return none if err != none
+    v = convert_float!(float_token!)
+    return none if err != none
+    self.filled += 1
+    v
+  }
+
+  # Go's scanComplex.
+  pub def scan_complex!(verb: Int) -> Complex? {
+    self.buf = []
+    return none if err != none || !ok_verb!(verb, "beEfFgGv", "complex")
+    skip_space!
+    not_eof!
+    return none if err != none
+    parens = accept!("(")
+    re = float_token!
+    self.buf = []
+    fail_msg!("syntax error scanning complex number") if !accept!("+-")
+    return none if err != none
+    sign = Str.from_bytes(buf)
+    im = float_token!
+    fail_msg!("syntax error scanning complex number") if !accept!("i")
+    fail_msg!("syntax error scanning complex number") if parens && err == none && !accept!(")")
+    return none if err != none
+    x = convert_float!(re)
+    y = convert_float!(sign + im)
+    return none if err != none
+    self.filled += 1
+    Complex.new(x, y)
+  }
+
+  def quoted_string! -> Str {
+    not_eof!
+    return "" if err != none
+    q = get_rune!
+    if q == 96 {
+      loop {
+        r2 = must_read_rune!
+        break if r2 == 96 || err != none
+        write_rune!(r2)
+      }
+      return Str.from_bytes(buf)
+    }
+    if q == 34 {
+      self.buf << 34.as_u8
+      loop {
+        r2 = must_read_rune!
+        break if err != none
+        write_rune!(r2)
+        if r2 == 92 {
+          write_rune!(must_read_rune!)
+        } elsif r2 == 34 {
+          break
+        }
+      }
+      return "" if err != none
+      u = strconv.unquote(Str.from_bytes(buf))
+      if e = u.err {
+        fail!(ScanError.Conv(go_strconv(e.message)))
+        return ""
+      }
+      return u.unwrap
+    }
+    fail_msg!("expected quoted string")
+    ""
+  }
+
+  def hex_digit(d: Int) -> Int {
+    return d - 48 if d >= 48 && d <= 57
+    return 10 + d - 97 if d >= 97 && d <= 102
+    return 10 + d - 65 if d >= 65 && d <= 70
+    -1
+  }
+
+  def hex_string! -> Str {
+    not_eof!
+    loop {
+      r1 = get_rune!
+      break if r1 < 0
+      v1 = hex_digit(r1)
+      if v1 < 0 {
+        unread_rune!
+        break
+      }
+      v2 = hex_digit(must_read_rune!)
+      if v2 < 0 {
+        fail_msg!("illegal hex digit")
+        break
+      }
+      self.buf << (v1 << 4 | v2).as_u8
+    }
+    fail_msg!("no hex data for %x string") if buf.size == 0
+    Str.from_bytes(buf)
+  }
+
+  # Go's convertString: a word (%s %v), a quoted string (%q), hex (%x %X).
+  pub def scan_string!(verb: Int) -> Str? {
+    self.buf = []
+    return none if err != none || !ok_verb!(verb, "svqxX", "string")
+    skip_space!
+    not_eof!
+    return none if err != none
+    s = case verb {
+      113 => quoted_string!
+      120 | 88 => hex_string!
+      _ => token!(true)
+    }
+    return none if err != none
+    self.filled += 1
+    s
+  }
+
+  # Sscanln and friends: only spaces may follow, up to a newline.
+  pub def finish_ln! {
+    return if err != none || !nl_is_end
+    loop {
+      r2 = get_rune!
+      break if r2 == 10 || r2 < 0
+      if !is_space(r2) {
+        fail_msg!("expected newline")
+        break
+      }
+    }
+  }
+
+  # ------------------------------------------------------------ Scanf
+
+  # Go's advance: match the format's literal text (and spaces, newlines)
+  # against the input; the bytes of format consumed, -1 on a mismatch.
+  def advance!(f: Str) -> Int {
+    i = 0
+    while i < f.size {
+      fc, w = __fmt_rune_at(f, i)
+      if is_space(fc) {
+        newlines = 0
+        trailing = false
+        while i < f.size && is_space(fc) {
+          if fc == 10 {
+            newlines += 1
+            trailing = false
+          } else {
+            trailing = true
+          }
+          i += w
+          if i < f.size {
+            fc, w = __fmt_rune_at(f, i)
+          } else {
+            fc = -2
+          }
+        }
+        j = 0
+        while j < newlines {
+          ic = get_rune!
+          while is_space(ic) && ic != 10 {
+            ic = get_rune!
+          }
+          if ic != 10 && ic >= 0 {
+            fail_msg!("newline in format does not match input")
+            return i
+          }
+          j += 1
+        }
+        if trailing {
+          ic = get_rune!
+          if newlines == 0 {
+            if !is_space(ic) && ic >= 0 {
+              fail_msg!("expected space in input to match format")
+              return i
+            }
+            if ic == 10 {
+              fail_msg!("newline in input does not match format")
+              return i
+            }
+          }
+          while is_space(ic) && ic != 10 {
+            ic = get_rune!
+          }
+          unread_rune! if ic >= 0
+        }
+        next
+      }
+      if fc == 37 {
+        if i + w == f.size {
+          fail_msg!("missing verb: % at end of format string")
+          return i
+        }
+        nc, _w2 = __fmt_rune_at(f, i + w)
+        return i if nc != 37
+        i += w
+      }
+      ic = must_read_rune!
+      return i if err != none
+      if fc != ic {
+        unread_rune!
+        return -1
+      }
+      i += w
+    }
+    i
+  }
+
+  # Go's doScanf up to the next operand's verb: the verb, or -1 when the
+  # format has none left (`too many operands`) or the scan failed.
+  pub def next_verb! -> Int {
+    # The previous operand's width limit ends with it.
+    self.arg_limit = limit
+    return -1 if err != none
+    loop {
+      if fpos >= format.size {
+        fail_msg!("too many operands")
+        return -1
+      }
+      w = advance!(format[fpos...format.size])
+      return -1 if err != none
+      if w > 0 {
+        self.fpos += w
+        next
+      }
+      if format[fpos] != 37 {
+        fail_msg!("input does not match format") if w < 0
+        fail_msg!("too many operands") if w >= 0
+        return -1
+      }
+      self.fpos += 1
+      # A width.
+      wid = 0
+      have_wid = false
+      while fpos < format.size && format[fpos] >= 48 && format[fpos] <= 57 {
+        wid = wid * 10 + (format[fpos] - 48).to_i
+        have_wid = true
+        self.fpos += 1
+      }
+      self.max_wid = have_wid ? wid : HUGE_WID
+      if fpos >= format.size {
+        fail_msg!("missing verb: % at end of format string")
+        return -1
+      }
+      c, cw = __fmt_rune_at(format, fpos)
+      self.fpos += cw
+      skip_space! if c != 99
+      if c == 37 {
+        skip_space!
+        not_eof!
+        fail_msg!("missing literal %") if err == none && !accept!("%")
+        return -1 if err != none
+        next
+      }
+      self.arg_limit = limit
+      self.arg_limit = count + max_wid if count + max_wid < arg_limit
+      return -1 if err != none
+      return c
+    }
+  }
+
+  # After the operands: the rest of the format must have no verbs left.
+  pub def finish_f! {
+    self.arg_limit = limit
+    return if err != none
+    while fpos < format.size {
+      w = advance!(format[fpos...format.size])
+      return if err != none
+      if w > 0 {
+        self.fpos += w
+        next
+      }
+      if format[fpos] != 37 {
+        fail_msg!("input does not match format") if w < 0
+        return
+      }
+      fail_msg!("too few operands for format '" + format[fpos...format.size] + "'")
+      return
+    }
+  }
+
+  # The number of operands filled, or the error that stopped the scan (Go
+  # returns both; alx gives the error, the places keep what was filled).
+  pub def result -> ~Int {
+    if e = err {
+      fail e
+    }
+    filled
+  }
+}
+
+def new_state[R](r: R, nl_is_space: Bool, nl_is_end: Bool, format: Str) -> ScanState[R] {
+  e: [Byte] = []
+  ScanState[R].new(r: r, pending: e, buf: e, nl_is_end: nl_is_end, nl_is_space: nl_is_space, arg_limit: HUGE_WID, limit: HUGE_WID, max_wid: HUGE_WID, format: format)
+}
+
+# The scanners the builtins start from: over a Str (sscan, sscanln,
+# sscanf), a reader (fscan...), and standard input (scan...).
+pub def __scan_str(s: Str, nl_is_space: Bool, nl_is_end: Bool, format: Str) -> ScanState[StrSource] {
+  new_state(StrSource.new(s: s, st: [0]), nl_is_space, nl_is_end, format)
+}
+
+pub def __scan_reader[R](r: R, nl_is_space: Bool, nl_is_end: Bool, format: Str) -> ScanState[R] {
+  new_state(r, nl_is_space, nl_is_end, format)
+}
+
+pub def __scan_stdin(nl_is_space: Bool, nl_is_end: Bool, format: Str) -> ScanState[os.File] {
+  new_state(os.stdin, nl_is_space, nl_is_end, format)
+}
+
+# Writing (fprint, fprintf, fprintln): the text to w, as Go's Fprint does.
+pub def __fwrite[W](w: W, s: Str) -> ~Int {
+  ww = w
+  ww.~write!(s.bytes.to_a)
+}
+
+# A strconv message about `part` made about `whole` (Go's convertFloat sets
+# the NumError's Num to the whole token).
+def replace_quoted(msg: Str, part: Str, whole: Str) -> Str {
+  q = strconv.quote(part)
+  i = msg.byteindex(q)
+  return msg if i < 0
+  msg[0...i] + strconv.quote(whole) + msg[i + q.size...msg.size]
+}
+
+# A strconv error message with Go's function name (alx's strconv names
+# its functions in snake_case: `strconv.parse_float:` is Go's
+# `strconv.ParseFloat:`).
+def go_strconv(msg: Str) -> Str {
+  names = [("parse_float", "ParseFloat"), ("parse_int", "ParseInt"), ("parse_uint", "ParseUint"), ("atoi", "Atoi")]
+  for nm in names {
+    p = "strconv." + nm[0] + ":"
+    return "strconv." + nm[1] + ":" + msg[p.size...msg.size] if msg.start_with?(p)
+  }
+  msg
+}

@@ -1027,7 +1027,16 @@ impl<'a> Parser<'a> {
             Tok::Kw(Kw::Def) | Tok::Kw(Kw::Fn) | Tok::Attr(_) => return Err(Diag::new(start, "methods can only be defined at the top level")),
             Tok::Kw(Kw::Defer) => {
                 self.bump();
-                StmtKind::Defer(self.expr()?)
+                if self.is_op("{") {
+                    // `defer { stmts }`: run the statements at scope exit (as
+                    // `if true { stmts }`; a map literal is never deferred).
+                    let sp = self.span();
+                    let body = self.braced_stmts()?;
+                    let cond = self.mk(ExprKind::Bool(true), sp);
+                    StmtKind::Defer(self.mk(ExprKind::If(Box::new(cond), body, vec![]), sp.to(self.prev_span())))
+                } else {
+                    StmtKind::Defer(self.expr()?)
+                }
             }
             Tok::Ident(kw) if kw == "using" && matches!(self.peek_at(1), Tok::Const(_) | Tok::Ident(_)) && !self.is_local("using") => {
                 self.bump();

@@ -1,0 +1,249 @@
+# Package uuid: Go's uuid (new in Go 1.27), Universally Unique Identifiers as
+# specified in RFC 9562. Random components come from crypto/rand.
+#
+#   Go                                  alx
+#   type UUID [16]byte                  UUID { b: [Byte; 16] } (a comparable value: ==, <=>)
+#   UUID{...} / u[i] / u[:]             uuid.from_bytes(a: [Byte; 16]) / u[i] / u.bytes -> [Byte; 16]
+#   Parse(s) (UUID, error)              parse(s) -> ~UUID<UuidError>
+#   MustParse(s)                        must_parse(s) (panics)
+#   New() / NewV4() / NewV7()           new_uuid / new_v4 / new_v7   (see below for v7)
+#   Nil() / Max()                       nil_uuid / max_uuid
+#   u.String()                          u.to_s / u.string
+#   u.MarshalText() / AppendText(b)     u.marshal_text -> [Byte] / u.append_text(b) -> [Byte]
+#   (*UUID).UnmarshalText(b) error      unmarshal_text(b) -> ~UUID<UuidError> (a constructor)
+#   u.Compare(v)                        u.compare(v) -> Int; also <=>
+#   (none)                              u.version / u.variant (the version and variant fields)
+#
+# Differences from Go, and why:
+#   - Go's New, Nil and Max are `new_uuid`, `nil_uuid` and `max_uuid`: `new` names a
+#     type's constructor (UUID.new is the Nil UUID too) and `nil` is a keyword.
+#   - Go's NewV7 keeps the last timestamp in package variables (behind a mutex) so that
+#     every UUID it returns sorts after the previous one, even within the same
+#     1/4096 ms. alx has no mutable package state (port-issues #30), so that state
+#     lives in a V7Generator the caller keeps (`g = uuid.new_v7_generator; g.new_v7`):
+#     it is Go's NewV7 exactly, generators shared across tasks included (it holds a
+#     Mutex). The package function `new_v7` has no memory: its UUIDs carry the clock's
+#     timestamp at 1/4096 ms resolution (Go's layout), and two made in the same tick
+#     order by their random bits.
+#   - Go's Unmarshal method writes through a pointer; alx's is a constructor
+#     (as in net/netip). MarshalText and AppendText can't fail, so they return the bytes.
+#   - The error is UuidError.InvalidUuid, with Go's message "invalid uuid".
+import "crypto/rand"
+import "encoding/hex"
+import "time"
+
+pub error UuidError {
+  InvalidUuid
+
+  def message -> Str {
+    case self {
+      InvalidUuid => "invalid uuid"
+    }
+  }
+}
+
+# A Universally Unique Identifier (RFC 9562): 16 bytes, comparable.
+pub struct UUID {
+  b: [Byte; 16]
+
+  # Byte i (0..15).
+  pub def [](i: Int) -> Byte { b[i] }
+  # The 16 bytes.
+  pub def bytes -> [Byte; 16] { b }
+
+  # The lowercase hex-and-dash form: f81d4fae-7dec-11d0-a765-00a0c91e6bf6.
+  pub def to_s -> Str { Str.from_bytes(self.append_text([])) }
+  pub def string -> Str { self.to_s }
+
+  pub def marshal_text -> [Byte] { self.append_text([]) }
+
+  # b with the string form appended.
+  pub def append_text(dst: [Byte]) -> [Byte] {
+    out = dst
+    src: [Byte] = [0; 16]
+    for i in 0...16 { src[i] = b[i] }
+    h: [Byte] = [0; 32]
+    hex.encode(h, src)
+    for i in 0...32 {
+      out << 45 if i == 8 || i == 12 || i == 16 || i == 20
+      out << h[i]
+    }
+    out
+  }
+
+  # -1, 0 or +1 comparing u and v byte by byte (RFC 9562's big-endian order).
+  pub def compare(v: UUID) -> Int {
+    for i in 0...16 {
+      return -1 if b[i] < v.b[i]
+      return 1 if b[i] > v.b[i]
+    }
+    0
+  }
+  pub def <=>(v: UUID) -> Int { self.compare(v) }
+  pub def ==(v: UUID) -> Bool { self.compare(v) == 0 }
+
+  # The version field (the high 4 bits of byte 6).
+  pub def version -> Int { (b[6] >> 4).to_i }
+  # The variant field (the high 2 bits of byte 8; 0b10 for RFC 9562 UUIDs).
+  pub def variant -> Int { (b[8] >> 6).to_i }
+}
+
+# The UUID with these 16 bytes.
+pub def from_bytes(a: [Byte; 16]) -> UUID { UUID.new(b: a) }
+
+def from_slice(s: [Byte]) -> UUID {
+  a: [Byte; 16] = [0; 16]
+  for i in 0...16 { a[i] = s[i] }
+  UUID.new(b: a)
+}
+
+# The UUID represented by s, in one of the forms
+#   f81d4fae-7dec-11d0-a765-00a0c91e6bf6
+#   {f81d4fae-7dec-11d0-a765-00a0c91e6bf6}
+#   urn:uuid:f81d4fae-7dec-11d0-a765-00a0c91e6bf6
+#   f81d4fae7dec11d0a76500a0c91e6bf6
+# with hex digits in either case.
+pub def parse(s: Str) -> ~UUID<UuidError> {
+  ~unmarshal_text(s.bytes.to_a)
+}
+
+# Like parse, but panics if s isn't a UUID.
+pub def must_parse(s: Str) -> UUID {
+  r = parse(s)
+  if e = r.err { panic(e.message) }
+  r.unwrap
+}
+
+# Decodes hex src into dst; false on a non-hex digit.
+def unhex(dst: [Byte], src: [Byte]) -> Bool { hex.decode(dst, src).ok? }
+
+def has_prefix?(b: [Byte], p: Str) -> Bool {
+  return false if b.size < p.size
+  for i in 0...p.size {
+    return false if b[i] != p[i]
+  }
+  true
+}
+
+# The UUID in text b, in a form parse accepts (Go's UnmarshalText).
+pub def unmarshal_text(b0: [Byte]) -> ~UUID<UuidError> {
+  b = b0
+  dst: [Byte] = [0; 16]
+  if b.size == 9 + 36 {
+    # urn:uuid:00000000-0000-0000-0000-000000000000
+    b = b[9...b.size] if has_prefix?(b, "urn:uuid:")
+  } else if b.size == 2 + 36 {
+    # {00000000-0000-0000-0000-000000000000}
+    b = b[1...b.size] if b[0] == 123
+    b = b[0...b.size - 1] if b.size > 0 && b[b.size - 1] == 125
+  } else if b.size == 32 {
+    # 00000000000000000000000000000000
+    fail UuidError.InvalidUuid if !unhex(dst, b)
+    return from_slice(dst)
+  }
+  # 00000000-0000-0000-0000-000000000000
+  fail UuidError.InvalidUuid if b.size != 36
+  fail UuidError.InvalidUuid if b[8] != 45 || b[13] != 45 || b[18] != 45 || b[23] != 45
+  ok = unhex(dst[0...4], b[0...8]) && unhex(dst[4...6], b[9...13]) && unhex(dst[6...8], b[14...18]) && unhex(dst[8...10], b[19...23]) && unhex(dst[10...16], b[24...36])
+  fail UuidError.InvalidUuid if !ok
+  from_slice(dst)
+}
+
+# The Nil UUID 00000000-0000-0000-0000-000000000000 (RFC 9562 section 5.9).
+pub def nil_uuid -> UUID { UUID.new() }
+
+# The Max UUID ffffffff-ffff-ffff-ffff-ffffffffffff (RFC 9562 section 5.10).
+pub def max_uuid -> UUID {
+  a: [Byte; 16] = [0xff; 16]
+  UUID.new(b: a)
+}
+
+# A new UUID made with the algorithm suitable for most purposes: at this time
+# new_v4 (Go's New).
+pub def new_uuid -> UUID { new_v4() }
+
+def set_version(u: [Byte], version: Int) {
+  u[6] = (u[6] & 0x0f) | (version << 4).as_u8
+}
+
+def set_variant(u: [Byte], variant: Int) {
+  u[8] = (u[8] & 0x3f) | (variant << 6).as_u8
+}
+
+# A new version 4 UUID: 122 bits of random data.
+pub def new_v4 -> UUID {
+  u: [Byte] = [0; 16]
+  rand.read(u)
+  set_version(u, 4)
+  set_variant(u, 0b10)
+  from_slice(u)
+}
+
+# The 60-bit UUIDv7 timestamp of t: 48 bits of Unix milliseconds, then 12 bits of
+# 1/4096 ms (RFC 9562 section 5.7, the optional sub-millisecond fraction in rand_a).
+def v7_timestamp(t: time.Time) -> (U64, U64) {
+  secs = t.unix.as_u64
+  nanos = t.nanosecond.as_u64
+  msecs = nanos / 1000000
+  frac = nanos - 1000000 * msecs
+  ts = (1000 *% secs +% msecs) << 12
+  ts +%= (frac * 4096) / 1000000
+  return secs, ts
+}
+
+# The v7 UUID with timestamp ts and random bits.
+def v7_from(ts: U64) -> UUID {
+  # a gap for the 4 bits of the version field
+  hibits = ((ts << 4) & 0xffffffffffff0000) | (ts & 0x0ffff)
+  u: [Byte] = [0; 16]
+  for i in 0...8 {
+    u[i] = (hibits >> (56 - 8 * i)).as_u8
+  }
+  rand.read(u[8...16])
+  set_version(u, 7)
+  set_variant(u, 0b10)
+  from_slice(u)
+}
+
+# A new version 7 UUID: a millisecond timestamp in the top 48 bits, 12 bits of
+# sub-millisecond time and 62 random bits. Without Go's package state (see the
+# header), UUIDs made in the same 1/4096 ms order by their random bits; use a
+# V7Generator for strictly increasing ones.
+pub def new_v7 -> UUID {
+  _, ts = v7_timestamp(time.now())
+  v7_from(ts)
+}
+
+struct V7State {
+  last_secs: U64
+  last_timestamp: U64
+}
+
+# Go's NewV7 with its state: every UUID sorts after the previous one (unless the
+# clock goes backwards). Copies and tasks share it.
+pub struct V7Generator {
+  st: Mutex[V7State]
+
+  # A new version 7 UUID, after every earlier one from this generator.
+  pub def new_v7 -> UUID {
+    secs, ts0 = v7_timestamp(time.now())
+    ts = st.lock { |s|
+      t = ts0
+      if s.last_secs > secs {
+        # Time has gone backwards (the system clock changed): ignore the
+        # earlier UUIDs.
+      } else if t <= s.last_timestamp {
+        # The same timestamp as an earlier UUID: 1/4096 ms after the last.
+        t = s.last_timestamp + 1
+      }
+      s.last_secs = secs
+      s.last_timestamp = t
+      t
+    }
+    v7_from(ts)
+  }
+}
+
+pub def new_v7_generator -> V7Generator {
+  V7Generator.new(st: Mutex.new(V7State.new()))
+}

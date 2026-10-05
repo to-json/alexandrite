@@ -113,6 +113,10 @@ extern def c_getpid() -> I32 = "getpid"       # C FFI; std uses it only for OS a
 test "adds" { assert_eq 1 + 1, 2; assert x > 0, "why" }   # in *_test.alx beside the package
 assert_panics("out of bounds") { xs[9] }      # body runs as a task (gets copies of locals); fails unless it panics
 example "hi" { puts "hi" } outputs "hi\n"
+# `#![test(external)]` as the FIRST line of a *_test.alx: Go's `package x_test`, a package of its
+#   own that imports the one under test (S11); in-package test files can `pub` helpers for it
+#[track_caller]
+def check_pos(n: Int) { assert n > 0, "at #{caller_location}" }   # failures report the caller's line (S9)
 # Warnings (unused locals/imports) are errors under `alx test`; name a local `_x` to silence it.
 ```
 
@@ -124,7 +128,7 @@ Every line above compiles (checked 2026-10-03). The design decisions and their r
 
 - **`compiler/src/`**, in the order a program goes through:
   - `lexer.rs` → `parser.rs` (`struct_def`, `case_rest`, `type_expr`, `call_args`, `primary`)
-  - → `front.rs` (loads packages; `check_program`)
+  - → `front.rs` (loads packages; `check_program`; `load_tests`: the runner, in-package and external test packages)
   - → `check.rs`, the type checker:
     - `binary` (operators, `||` on optionals), `coerce`, `case`, `implement` (interfaces), `bind` / `bind_tparams` / `instance` (generics);
     - `const_call` / `const_call_named` (`Type.method`), `call_def`, `format` (the `%` verbs), `type_from`.

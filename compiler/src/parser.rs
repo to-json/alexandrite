@@ -1386,7 +1386,18 @@ impl<'a> Parser<'a> {
                     };
                     let mut qual = String::new();
                     let qsp = self.span();
-                    if qualified {
+                    // `pkg.Type(v)`: an implementor of an interface from another
+                    // package (a type switch, D65); the name keeps its package.
+                    let pkg_type = k == 2 && !has_type && matches!(self.peek_at(0), Tok::Ident(_)) && matches!(self.peek_at(2), Tok::Const(_)) && matches!(self.peek_at(3), Tok::Op("(")) && !self.space_before_at(3);
+                    if pkg_type {
+                        if let Tok::Ident(p) = self.bump().tok {
+                            qual.push_str(&p);
+                            qual.push('.');
+                        }
+                        self.bump();
+                    }
+                    let qualified = qualified || pkg_type;
+                    if qualified && !pkg_type {
                         for _ in 0..k / 2 {
                             if let Tok::Const(c) = self.bump().tok {
                                 qual.push_str(&c);

@@ -1,0 +1,302 @@
+# Go's example_test.go and example_marshaljson_test.go, as far as they don't
+# need time, netip, interfaces or `any` (adapted where noted), jsontext's
+# ExampleEscapeForHTML and ExampleMultiline, and tests of WithMarshalers /
+# WithUnmarshalers, MarshalEncode / UnmarshalDecode.
+
+import json "encoding/json/v2"
+import "encoding/json/jsontext"
+import "bytes"
+import "strings"
+
+def bs(s: Str) -> [Byte] { s.bytes }
+
+#[derive(Json)]
+struct Strict {
+  #[field(json: "firstName")] x: Bool
+}
+
+#[derive(Json)]
+struct Loose {
+  #[field(json: "firstName,case:ignore")] x: Bool
+}
+
+#[derive(Json)]
+#[json(transparent)]
+struct StrictList {
+  v: [Strict]
+}
+
+#[derive(Json)]
+#[json(transparent)]
+struct LooseList {
+  v: [Loose]
+}
+
+example "case sensitivity" {
+  input = "[{\"firstname\": true}, {\"firstName\": true}, {\"FirstName\": true}, {\"FIRSTNAME\": true}, {\"first_name\": true}, {\"FIRST_NAME\": true}, {\"first-name\": true}, {\"FIRST-NAME\": true}, {\"unknown\": true}]"
+  s: StrictList = json.unmarshal(input.bytes, []).unwrap
+  puts s.v.map { it.x }
+  l: LooseList = json.unmarshal(input.bytes, []).unwrap
+  puts l.v.map { it.x }
+} outputs "[false true false false false false false false false]\n[true true true true true true true true false]\n"
+
+#[derive(Json)]
+struct MyStruct {
+  #[field(json: "Foo,omitzero")] foo: Str
+  #[field(json: "Bar,omitempty")] bar: [Int]
+  #[field(json: "Baz,omitzero,omitempty")] baz: Inner?
+}
+
+#[derive(Json)]
+struct Inner {
+  #[field(json: "Foo,omitzero")] foo: Str
+}
+
+#[derive(Json)]
+struct OmitZero {
+  #[field(json: "Bool,omitzero")] b: Bool
+  #[field(json: "Int,omitzero")] i: Int
+  #[field(json: "String,omitzero")] s: Str
+  #[field(json: "Struct,omitzero")] st: MyStruct
+  #[field(json: "Slice,omitzero")] sl: [Int]
+  #[field(json: "Map,omitzero")] m: Map[Int, Int]
+  #[field(json: "PointerNil,omitzero")] pn: Str?
+  #[field(json: "Pointer,omitzero")] p: Str?
+}
+
+#[derive(Json)]
+struct OmitEmpty {
+  #[field(json: "Bool,omitempty")] b: Bool
+  #[field(json: "Int,omitempty")] i: Int
+  #[field(json: "String,omitempty")] s: Str
+  #[field(json: "Struct,omitempty")] st: MyStruct
+  #[field(json: "Slice,omitempty")] sl: [Int]
+  #[field(json: "Map,omitempty")] m: Map[Int, Int]
+  #[field(json: "PointerNil,omitempty")] pn: Str?
+  #[field(json: "Pointer,omitempty")] p: Str?
+}
+
+# Go's Example_omitFields without time.Time, netip.Addr and interfaces; and
+# alx has no nil slices or maps, so an empty Slice and Map are omitted by
+# omitzero too (Go keeps a non-nil empty one).
+example "omit fields" {
+  z = OmitZero.new(st: MyStruct.new(baz: Inner.new), p: "")
+  v = jsontext.Value.new(raw: json.marshal(z, []).unwrap)
+  v.~indent!([])
+  puts "OmitZero: " + v.to_s
+  e = OmitEmpty.new(st: MyStruct.new(baz: Inner.new), p: "")
+  v = jsontext.Value.new(raw: json.marshal(e, []).unwrap)
+  v.~indent!([])
+  puts "OmitEmpty: " + v.to_s
+} outputs "OmitZero: {\n\t\"Struct\": {},\n\t\"Pointer\": \"\"\n}\nOmitEmpty: {\n\t\"Bool\": false,\n\t\"Int\": 0\n}\n"
+
+#[derive(Json)]
+struct Base {
+  #[field(json: "ID")] id: Str
+  #[field(json: "Type")] type_: Str
+}
+
+#[derive(Json)]
+struct Other {
+  #[field(json: "Cost")] cost: Float
+}
+
+#[derive(Json)]
+struct EmbedPart {
+  #[field(json: "User")] user: Str
+}
+
+#[derive(Json)]
+struct Container {
+  #[field(json: ",embed")] base: Base
+  #[field(json: "Type")] type_: Int
+  #[field(json: ",embed")] embed: EmbedPart
+  #[field(json: "uuid")] id: Str
+  #[field(json: "other")] other: Other
+}
+
+# Go's Example_embeddedFields without the time.Time fields (Go cancels two
+# promoted fields of the same name at the same depth; alx reports them as a
+# duplicate name).
+example "embedded fields" {
+  v = jsontext.Value.new(raw: json.marshal(Container.new, []).unwrap)
+  v.~indent!([])
+  puts v.to_s
+  c: Container = json.unmarshal("{\"ID\":\"x\",\"Type\":3,\"User\":\"u\",\"uuid\":\"y\"}".bytes, []).unwrap
+  puts "#{c.base.id} #{c.type_} #{c.base.type_.size} #{c.embed.user} #{c.id}"
+} outputs "{\n\t\"ID\": \"\",\n\t\"Type\": 0,\n\t\"User\": \"\",\n\t\"uuid\": \"\",\n\t\"other\": {\n\t\t\"Cost\": 0\n\t}\n}\nx 3 0 u y\n"
+
+#[derive(Json)]
+struct Animal {
+  #[field(json: "Name")] name: Str
+  #[field(json: "Order")] order: Str
+}
+
+example "unmarshal decode stream" {
+  stream = "\n\t{\"Name\": \"Platypus\", \"Order\": \"Monotremata\"}\n\t{\"Name\": \"Quoll\",    \"Order\": \"Dasyuromorphia\"}\n\t{\"Name\": \"Gopher\",   \"Order\": \"Rodentia\"}\n"
+  dec = jsontext.new_decoder(bytes.new_buffer_string(stream), [])
+  loop {
+    r: ~Animal? = json.unmarshal_decode(dec, [])
+    a = r.unwrap
+    break if a.none?
+    puts "#{a.unwrap.name}: #{a.unwrap.order}"
+  }
+} outputs "Platypus: Monotremata\nQuoll: Dasyuromorphia\nGopher: Rodentia\n"
+
+#[derive(Json)]
+struct Pet {
+  #[field(json: "Name")] name: Str
+  #[field(json: "Species")] species: Str
+  #[field(json: "Breed")] breed: Str
+}
+
+example "marshal multiline" {
+  p = Pet.new(name: "Oliver", species: "Dog", breed: "Goldendoodle")
+  puts Str.from_bytes(json.marshal(p, [jsontext.multiline(true)]).unwrap)
+} outputs "{\n\t\"Name\": \"Oliver\",\n\t\"Species\": \"Dog\",\n\t\"Breed\": \"Goldendoodle\"\n}\n"
+
+#[derive(Json)]
+struct Page {
+  #[field(json: "Title")] title: Str
+  #[field(json: "Body")] body: Str
+}
+
+example "escape for html" {
+  page = Page.new(title: "Example Embedded Javascript", body: "<script> console.log(\"Hello, world!\"); </script>")
+  puts Str.from_bytes(json.marshal(page, [jsontext.escape_for_html(true), jsontext.escape_for_js(true), jsontext.multiline(true)]).unwrap)
+} outputs "{\n\t\"Title\": \"Example Embedded Javascript\",\n\t\"Body\": \"\\u003cscript\\u003e console.log(\\\"Hello, world!\\\"); \\u003c/script\\u003e\"\n}\n"
+
+# Go's ExampleMarshalerTo / ExampleUnmarshalerFrom: a type with its own
+# protocol methods (Go's MarshalJSONTo / UnmarshalJSONFrom), here a pair
+# encoded as a two-element array.
+struct Pair {
+  a: Int
+  b: Str
+
+  pub def json_v2_type -> Str { "main.Pair" }
+  pub def self.json_zero -> Pair { Pair.new }
+  pub def json_v2_is_zero -> Bool { a == 0 && b == "" }
+  pub def json_v2_enc(e: jsontext.Encoder, o: jsontext.Options) -> ~Unit<Error> {
+    e.~write_token!(jsontext.Token.begin_array)
+    e.~write_token!(jsontext.int(a))
+    e.~write_token!(jsontext.string(b))
+    e.~write_token!(jsontext.Token.end_array)
+  }
+  pub def json_v2_dec(d: jsontext.Decoder, o: jsontext.Options) -> ~Pair<Error> {
+    d.~read_token!
+    x = d.~read_token!
+    y = d.~read_token!
+    d.~read_token!
+    Pair.new(a: x.unwrap.~int, b: y.unwrap.to_s)
+  }
+}
+
+#[derive(Json)]
+struct Holder {
+  #[field(json: "P")] p: Pair
+  #[field(json: "Q")] q: [Pair]
+}
+
+example "marshaler to" {
+  h = Holder.new(p: Pair.new(a: 1, b: "x"), q: [Pair.new(a: 2, b: "y")])
+  b = json.marshal(h, []).unwrap
+  puts Str.from_bytes(b)
+  h2: Holder = json.unmarshal(b, []).unwrap
+  puts "#{h2.p.a} #{h2.p.b} #{h2.q[0].a} #{h2.q[0].b}"
+} outputs "{\"P\":[1,\"x\"],\"Q\":[[2,\"y\"]]}\n1 x 2 y\n"
+
+#[derive(Json)]
+struct Response {
+  #[field(json: "Result,omitzero")] result: Str
+  #[field(json: "Count,omitzero")] count: Int
+  #[field(json: "Ok,omitzero")] ok: Bool
+}
+
+#[derive(Json)]
+#[json(transparent)]
+struct Responses {
+  v: [Response]
+}
+
+#[derive(Json)]
+#[json(transparent)]
+struct Ints {
+  v: [Int]
+}
+
+test "with marshalers" {
+  rs = Responses.new(v: [Response.new(result: "a", count: 2), Response.new(ok: true)])
+  # Strings in upper case, Ints doubled (as JSON text), Bools as yes/no.
+  m = json.join_marshalers([
+    json.marshal_to_func_str(->(e: jsontext.Encoder, s: Str) -> ~Unit { e.~write_token!(jsontext.string(strings.to_upper(s))) }),
+    json.marshal_func_int(->(n: Int) -> ~[Byte] { bs((n * 2).to_s) }),
+    json.marshal_func_bool(->(b: Bool) -> ~[Byte] { bs(b ? "\"yes\"" : "\"no\"") }),
+  ])
+  got = Str.from_bytes(json.marshal(rs, [json.with_marshalers(m)]).unwrap)
+  assert got == "[{\"Result\":\"A\",\"Count\":4},{\"Ok\":\"yes\"}]", got
+  # A function for a derived type; another that skips (JsonError.Unsupported).
+  m2 = json.join_marshalers([
+    json.marshal_to_func(->(e: jsontext.Encoder, r: Response) -> ~Unit {
+      fail json.JsonError.Unsupported if r.ok
+      e.~write_token!(jsontext.string("response " + r.result))
+    }),
+  ])
+  got2 = Str.from_bytes(json.marshal(rs, [json.with_marshalers(m2)]).unwrap)
+  assert got2 == "[\"response a\",{\"Ok\":true}]", got2
+  # A marshal function's error.
+  m3 = json.marshal_func(->(r: Response) -> ~[Byte] {
+    fail json.JsonError.Other(msg: "some error") if r.result != "zzz"
+    bs("1")
+  })
+  r3 = json.marshal(rs, [json.with_marshalers(m3)])
+  assert (r3.err?.message || "") == "json: cannot marshal from Go Response within \"/0\": some error", r3.err?.message || ""
+  # A MarshalToFunc that writes two values.
+  m4 = json.marshal_to_func_int(->(e: jsontext.Encoder, n: Int) -> ~Unit {
+    e.~write_token!(jsontext.int(n))
+    e.~write_token!(jsontext.int(n))
+  })
+  r4 = json.marshal(Ints.new(v: [1]), [json.with_marshalers(m4)])
+  assert (r4.err?.message || "") == "json: cannot marshal from Go int after offset 5: must read or write exactly one value", r4.err?.message || ""
+}
+
+test "with unmarshalers" {
+  input = "[{\"Result\":\"a\",\"Count\":3},{\"Ok\":true}]"
+  u = json.join_unmarshalers([
+    json.unmarshal_func_str(->(b: [Byte], cur: Str) -> ~Str { "<" + Str.from_bytes(b) + ">" }),
+    json.unmarshal_func_int(->(b: [Byte], cur: Int) -> ~Int { 100 }),
+  ])
+  rs: Responses = json.unmarshal(input.bytes, [json.with_unmarshalers(u)]).unwrap
+  assert rs.v[0].result == "<\"a\">", rs.v[0].result
+  assert rs.v[0].count == 100, "count"
+  assert rs.v[1].ok, "ok"
+  u2 = json.unmarshal_from_func(->(d: jsontext.Decoder, cur: Response) -> ~Response {
+    fail json.JsonError.Unsupported if d.peek_kind! != jsontext.Kind.String
+    t = d.~read_token!
+    Response.new(result: "from " + t.unwrap.to_s)
+  })
+  rs2: Responses = json.unmarshal("[\"x\",{\"Count\":1}]".bytes, [json.with_unmarshalers(u2)]).unwrap
+  assert rs2.v[0].result == "from x", rs2.v[0].result
+  assert rs2.v[1].count == 1, "count 2"
+}
+
+test "marshal encode options" {
+  buf = bytes.new_buffer([])
+  e = jsontext.new_encoder(buf, [])
+  e.~write_token!(jsontext.Token.begin_object)
+  e.~write_token!(jsontext.string("k"))
+  json.~marshal_encode(e, Animal.new(name: "a", order: "b"), [json.deterministic(true)])
+  r = json.marshal_encode(e, Animal.new(name: "a", order: "b"), [jsontext.allow_duplicate_names(true)])
+  assert (r.err?.message || "") == "json: cannot marshal from Go Animal after offset 30: cannot change duplicate name checks after a JSON object has already begun processing", r.err?.message || ""
+  e.~write_token!(jsontext.Token.end_object)
+  assert buf.string == "{\"k\":{\"Name\":\"a\",\"Order\":\"b\"}}\n", buf.string
+}
+
+test "marshal write and unmarshal read" {
+  buf = bytes.new_buffer([])
+  json.~marshal_write(buf, Animal.new(name: "x", order: "y"), [])
+  assert buf.string == "{\"Name\":\"x\",\"Order\":\"y\"}", buf.string
+  a: Animal = json.unmarshal_read(bytes.new_buffer_string(" {\"Name\":\"q\"} "), []).unwrap
+  assert a.name == "q", a.name
+  r: ~Animal = json.unmarshal_read(bytes.new_buffer_string("{\"Name\":\"q\"} {}"), [])
+  assert (r.err?.message || "") == "jsontext: invalid character '{' after top-level value after offset 13", r.err?.message || ""
+}

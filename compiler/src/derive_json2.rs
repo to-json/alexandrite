@@ -106,12 +106,9 @@ impl<'a> G<'a> {
                         "Complex" => K::Complex,
                         _ if n.ends_with(".Value") && n.split('.').next() == Some(self.c.t) => K::Raw,
                         _ if self.tparams.contains(n) => return Err(format!("the type parameter `{n}` can't be encoded: derive(Json) on a generic type isn't supported yet")),
-                        _ => {
-                            if let Some(false) = self.c.types.local.get(n.as_str()) {
-                                return Err(format!("`{n}` doesn't derive Json: add `#[derive(Json)]` to it"));
-                            }
-                            K::Named(n)
-                        }
+                        // A local type that doesn't derive Json provides the
+                        // protocol itself (json_v2_enc / json_v2_dec / json_zero).
+                        _ => K::Named(n),
                     }
                 }
             }
@@ -543,8 +540,8 @@ fn struct_methods<'a>(g: &mut G<'a>, job: &'a DeriveJob, fields: &'a [DField], g
     if let Some(ff) = &fmt_field {
         g.w(2, format!("fail {j}.unsupported_format_enc(_e, {gt}, {}) if !_o.get({jt}.F_FORMAT_TAG_SUPPORTED)", lit(ff)));
     }
-    g.w(2, format!("_fo = ~{j}.begin_struct(_e, _o, {gt})"));
-    g.w(2, format!("_w = self.~json_v2_fields_enc(_e, _fo, {j}.no_names)"));
+    g.w(2, format!("_fo = ~{j}.begin_struct(_e, _o, {gt}, {})", !embedded.is_empty()));
+    g.w(2, format!("_w = self.~json_v2_fields_enc(_e, _fo, {j}.no_names, {j}.no_names)"));
     if let Some(f) = fallback {
         let names: Vec<String> = direct.iter().map(|f| lit(&json_name(f))).collect();
         let casings: Vec<String> = direct.iter().map(|f| f.opts.casing.to_string()).collect();
@@ -564,17 +561,27 @@ fn struct_methods<'a>(g: &mut G<'a>, job: &'a DeriveJob, fields: &'a [DField], g
     // ---- the members (also what an embedding struct writes)
     // `_w`: the names written so far (the last one is what an omitempty
     // member that is taken back out restores).
-    g.w(1, format!("pub def json_v2_fields_enc(_e: {jt}.Encoder, _fo: {jt}.Options, _w0: [Str]) -> ~[Str]<Error> {{"));
+    // `_hide`: names of an embedding struct's own fields, which shadow these.
+    g.w(1, format!("pub def json_v2_fields_enc(_e: {jt}.Encoder, _fo: {jt}.Options, _w0: [Str], _hide: [Str]) -> ~[Str]<Error> {{"));
     g.w(2, "_w = _w0");
+    let own: Vec<String> = direct.iter().map(|f| lit(&json_name(f))).collect();
+    if !embedded.is_empty() {
+        if own.is_empty() {
+            g.w(2, "_hide2 = _hide");
+        } else {
+            g.w(2, format!("_hide2 = _hide + [{}]", own.join(", ")));
+        }
+    }
     g.w(2, format!("_oz = _fo.get({jt}.F_OMIT_ZERO_STRUCT_FIELDS)"));
     for f in &members {
         let x = format!("self.{}", f.name);
         if f.opts.embed {
-            g.w(2, format!("_w = {x}.~json_v2_fields_enc(_e, _fo, _w)"));
+            g.w(2, format!("_w = {x}.~json_v2_fields_enc(_e, _fo, _w, _hide2)"));
             continue;
         }
         let zero = g.is_zero(&f.ty, &x)?;
         let mut cond = if f.opts.omit_zero { format!("!({zero})") } else { format!("!(_oz && {zero})") };
+        cond = format!("!_hide.include?({}) && {cond}", lit(&json_name(f)));
         let fast = if f.opts.omit_empty { g.empty_fast(&f.ty, &x)? } else { None };
         if let Some(fe) = &fast {
             cond = format!("{cond} && !({fe})");
@@ -586,7 +593,7 @@ fn struct_methods<'a>(g: &mut G<'a>, job: &'a DeriveJob, fields: &'a [DField], g
         let ov = g.fresh("fo");
         g.w(3, format!("{ov} = {fo}"));
         g.enc(&f.ty, &x, "_e", &ov, 3)?;
-        if f.opts.omit_empty && fast.is_none() {
+        if f.opts.omit_empty {
             g.w(3, format!("_w << {} if !{j}.unwrite_if_empty(_e, {j}.last_name(_w))", lit(&jn)));
         } else {
             g.w(3, format!("_w << {}", lit(&jn)));

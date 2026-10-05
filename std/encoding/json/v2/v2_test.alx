@@ -1,12 +1,111 @@
+# Go's fold_test.go (TestEqualFold, TestFoldRune) and errors_test.go
+# (TestSemanticError), and the package's own entry points over jsontext.Value.
+# (Tests through derived types are in derives/; Go's TestMarshal and
+# TestUnmarshal tables in gotests/.)
+
 import "encoding/json/jsontext"
+import "encoding/hex"
+import "unicode"
+
+def check_eq[T](got: T, want: T, what: Str) {
+  assert got == want, what
+}
+
+def check_s(got: Str, want: Str, what: Str) {
+  assert got == want, "#{what}:\n  got  #{got}\n  want #{want}"
+}
+
+def hs(h: Str) -> Str { Str.from_bytes(hex.decode_string(h).unwrap) }
 
 test "raw value" {
   b = marshal(jsontext.Value.of(" [1, {\"a\" : true}] "), []).unwrap
-  check_eq(Str.from_bytes(b), "[1,{\"a\":true}]", "marshal raw")
+  check_s(Str.from_bytes(b), "[1,{\"a\":true}]", "marshal raw")
   v: jsontext.Value = unmarshal("  {\"x\":1}  ".bytes, []).unwrap
-  check_eq(v.to_s, "{\"x\":1}", "unmarshal raw")
+  check_s(v.to_s, "{\"x\":1}", "unmarshal raw")
+  r: ~jsontext.Value = unmarshal("  {\"x\":1} 2".bytes, [])
+  check_s(r.err?.message || "", "jsontext: invalid character '2' after top-level value after offset 10", "trailing")
+  r2: ~jsontext.Value = unmarshal("".bytes, [])
+  check_s(r2.err?.message || "", "jsontext: unexpected EOF", "empty")
 }
 
-def check_eq[T](got: T, want: T, what: Str) {
-  assert got == want, "#{what}:\n  got  #{got}\n  want #{want}"
+test "equal fold" {
+  cases: [(Str, Str, Bool)] = [
+    ("", "", true), ("abc", "abc", true), ("ABcd", "ABcd", true), ("123abc", "123ABC", true),
+    ("_1_2_-_3__--a-_-b-c-", "123ABC", true), ("αβδ", "ΑΒΔ", true),
+    ("abc", "xyz", false), ("abc", "XYZ", false), ("abcdefghijk", "abcdefghijX", false),
+    ("abcdefghijk", "abcdefghijK", true), ("abcdefghijK", "abcdefghijK", true),
+    ("abcdefghijkz", "abcdefghijKy", false), ("abcdefghijKz", "abcdefghijKy", false),
+    ("1", "2", false), ("utf-8", "US-ASCII", false), ("hello, world!", "hello, world!", true),
+    ("hello, world!", "Hello, World!", true), ("hello, world!", "HELLO, WORLD!", true),
+    ("hello, world!", "jello, world!", false),
+    ("γειά, κόσμε!", "Γειά, Κόσμε!", true),
+    ("γειά, κόσμε!", "ΓΕΙΆ, ΚΌΣΜΕ!", true),
+    ("γειά, κόσμε!", "ΛΕΙΆ, ΚΌΣΜΕ!", false),
+    ("AESKey", "aesKey", true),
+    ("γειά, κόσμε!", hs("ce93ce5fb5ceb9ceac2c20ce9acf8ccf83cebcceb521"), false),
+    ("aeskey", "AESKEY", true), ("AESKEY", "aes_key", true), ("aes_key", "AES_KEY", true),
+    ("AES_KEY", "aes-key", true), ("aes-key", "AES-KEY", true), ("AES-KEY", "aesKey", true),
+    ("aesKey", "AesKey", true), ("AesKey", "AESKey", true), ("AESKey", "aeskey", true),
+    ("DESKey", "aeskey", false), ("AES Key", "aeskey", false), ("aes﹏key", "aeskey", false),
+    ("aes〰key", "aeskey", false),
+  ]
+  for c in cases {
+    check_eq(fold_name(c[0]) == fold_name(c[1]), c[2], "equal fold #{c[0]} #{c[1]}")
+  }
+}
+
+test "fold rune" {
+  # Go checks all of Unicode; the BMP's first 0x3000 runes and the
+  # supplementary ranges with case here (the check is quadratic in the
+  # size of a fold set, which is at most 4).
+  r: Rune = 0
+  while r < 0x3000 {
+    set: [Rune] = [r]
+    x = unicode.simple_fold(r)
+    while x != r {
+      set << x
+      x = unicode.simple_fold(x)
+    }
+    f0 = fold_rune(set[0])
+    within = false
+    for y in set {
+      within = within || f0 == y
+      check_eq(fold_rune(y), f0, "fold_rune #{y}")
+    }
+    assert within, "fold_rune(#{r}) not in its fold set"
+    r += 1
+  }
+}
+
+def sem_err(action: Str, kind: jsontext.Kind, value: Str, t: Str, off: Int, ptr: Str, c: ErrCause) -> Str {
+  SemanticError.new(action: action, byte_offset: off, json_pointer: jsontext.Pointer.new(s: ptr), json_kind: kind, json_value: value, go_type: t, err: c).message
+}
+
+test "semantic error" {
+  k = jsontext.Kind.Invalid
+  n = ErrCause.Nothing
+  check_s(sem_err("", k, "", "", 0, "", n), "json: cannot handle", "1")
+  check_s(sem_err("", jsontext.Kind.Null, "", "", 0, "", n), "json: cannot handle JSON null", "2")
+  check_s(sem_err("unmarshal", jsontext.Kind.True, "", "", 0, "", n), "json: cannot unmarshal JSON boolean", "3")
+  check_s(sem_err("marshal", jsontext.Kind.String, "", "", 0, "", n), "json: cannot marshal JSON string", "5")
+  check_s(sem_err("", k, "", "bool", 0, "", n), "json: cannot handle Go bool", "6")
+  check_s(sem_err("marshal", k, "", "int", 0, "", n), "json: cannot marshal from Go int", "7")
+  check_s(sem_err("unmarshal", k, "", "uint", 0, "", n), "json: cannot unmarshal into Go uint", "8")
+  check_s(sem_err("", jsontext.Kind.Number, "", "tar.Header", 0, "", n), "json: cannot handle JSON number with Go tar.Header", "11")
+  check_s(sem_err("unmarshal", jsontext.Kind.Number, "1e1000", "int", 0, "", n), "json: cannot unmarshal JSON number 1e1000 into Go int", "12")
+  check_s(sem_err("marshal", jsontext.Kind.BeginObject, "", "bytes.Buffer", 0, "", n), "json: cannot marshal JSON object from Go bytes.Buffer", "13")
+  check_s(sem_err("unmarshal", jsontext.Kind.EndArray, "", "strings.Reader", 0, "", n), "json: cannot unmarshal JSON array into Go strings.Reader", "14")
+  check_s(sem_err("unmarshal", jsontext.Kind.BeginObject, "", "float64", 123, "", n), "json: cannot unmarshal JSON object into Go float64 after offset 123", "15")
+  check_s(sem_err("marshal", jsontext.Kind.False, "", "complex128", 123, "/foo/2/bar/3", n), "json: cannot marshal JSON boolean from Go complex128 within \"/foo/2/bar/3\"", "16")
+  check_s(sem_err("unmarshal", jsontext.Kind.EndObject, "", "io.Reader", 123, "/foo/2/bar/3", ErrCause.Msg(text: "some underlying error")), "json: cannot unmarshal JSON object into Go io.Reader within \"/foo/2/bar/3\": some underlying error", "17")
+  check_s(sem_err("", k, "", "", 0, "", ErrCause.Msg(text: "some underlying error")), "json: cannot handle: some underlying error", "18")
+  check_s(sem_err("", k, "", "", 123, "", n), "json: cannot handle after offset 123", "19")
+  check_s(sem_err("", k, "", "", 0, "/foo/2/bar/3", n), "json: cannot handle within \"/foo/2/bar/3\"", "20")
+  check_s(sem_err("unmarshal", k, "", "struct { Fizz string; Buzz string }", 0, "/3", ErrCause.UnknownName), "json: cannot unmarshal into Go struct { Fizz string; Buzz string }: unknown object member name \"3\"", "21")
+  check_s(sem_err("unmarshal", k, "", "struct { Foo string }", 0, "/foo/2/bar/3", ErrCause.UnknownName), "json: cannot unmarshal into Go struct { Foo string }: unknown object member name \"3\" within \"/foo/2/bar\"", "22")
+  syn = jsontext.SyntacticError.new(byte_offset: 53, json_pointer: jsontext.Pointer.new(s: "/foo/bar/baz"), err: jsontext.Cause.InvalidUtf8)
+  check_s(sem_err("", k, "", "string", 16, "/foo/bar", ErrCause.Syntax(e: syn)), "json: cannot handle Go string: invalid UTF-8 within \"/foo/bar/baz\" after offset 53", "23")
+  check_s(sem_err("", k, "", "string", 16, "/fizz/bar", ErrCause.Syntax(e: syn)), "json: cannot handle Go string within \"/fizz/bar\": invalid UTF-8 within \"/foo/bar/baz\" after offset 53", "24")
+  check_s(sem_err("", k, "", "string", 16, "", ErrCause.Syntax(e: syn)), "json: cannot handle Go string: invalid UTF-8 within \"/foo/bar/baz\" after offset 53", "25")
+  check_s(sem_err("", k, "", "string", 85, "", ErrCause.Syntax(e: syn)), "json: cannot handle Go string after offset 85: invalid UTF-8 within \"/foo/bar/baz\" after offset 53", "26")
 }

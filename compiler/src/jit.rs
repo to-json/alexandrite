@@ -424,13 +424,13 @@ fn worker_sig(m: &JITModule) -> Signature {
 /// String literals and locations, leaked: they live as long as the program.
 #[derive(Default)]
 struct Strs {
-    bytes: HashMap<String, usize>,
+    bytes: HashMap<Vec<u8>, usize>,
     cstrs: HashMap<String, usize>,
 }
 
 impl Strs {
-    fn bytes(&mut self, s: &str) -> i64 {
-        *self.bytes.entry(s.to_string()).or_insert_with(|| Box::leak(s.as_bytes().to_vec().into_boxed_slice()).as_ptr() as usize) as i64
+    fn bytes(&mut self, s: &[u8]) -> i64 {
+        *self.bytes.entry(s.to_vec()).or_insert_with(|| Box::leak(s.to_vec().into_boxed_slice()).as_ptr() as usize) as i64
     }
     fn cstr(&mut self, s: &str) -> i64 {
         *self.cstrs.entry(s.to_string()).or_insert_with(|| Box::leak(CString::new(s.replace('\0', "")).unwrap().into_boxed_c_str()).as_ptr() as usize) as i64
@@ -1257,7 +1257,7 @@ impl Fx<'_, '_, '_> {
             LE::Prim(Prim::ULt | Prim::ULe | Prim::MulOvf, _) => LTy::Bool,
             LE::Prim(..) => LTy::I64,
             LE::B(_) | LE::Cmp(..) | LE::Not(_) => LTy::Bool,
-            LE::S(_) => LTy::Str,
+            LE::S(_) | LE::SB(_) => LTy::Str,
             LE::Unit => LTy::Unit,
             LE::Tup(t, _) => t.clone(),
             LE::Field(x, i) => match self.ty(x) {
@@ -1608,6 +1608,10 @@ impl Fx<'_, '_, '_> {
             }
             LE::B(b) => vec![self.b.ins().iconst(I8, *b as i64)],
             LE::S(s) => {
+                let p = self.strs.bytes(s.as_bytes());
+                vec![self.ic(p), self.ic(s.len() as i64)]
+            }
+            LE::SB(s) => {
                 let p = self.strs.bytes(s);
                 vec![self.ic(p), self.ic(s.len() as i64)]
             }

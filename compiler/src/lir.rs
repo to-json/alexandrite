@@ -94,6 +94,8 @@ pub enum LE {
     F(f64),
     B(bool),
     S(String),
+    /// A Str literal of arbitrary bytes (not UTF-8: `#[embed]`).
+    SB(Vec<u8>),
     /// A source location string (C: `const char *`).
     Loc(String),
     Unit,

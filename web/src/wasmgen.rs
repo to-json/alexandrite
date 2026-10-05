@@ -261,7 +261,7 @@ struct Ctx<'p> {
     funcs: HashMap<&'p str, (u32, &'p LFunc)>,
     gens: HashMap<usize, (u32, u32, &'p LGen)>, // func index, table index
     workers: HashMap<usize, (u32, &'p LWorker)>,
-    consts: HashMap<String, (i64, i64)>,
+    consts: HashMap<Vec<u8>, (i64, i64)>,
     /// Each global's type and address in the runtime's memory.
     globals: Vec<(LTy, i64)>,
     tys: Tys,
@@ -289,14 +289,14 @@ impl Ctx<'_> {
     }
 
     /// A constant byte string in the runtime's memory: (address, length).
-    fn bytes(&mut self, s: &str) -> (i64, i64) {
+    fn bytes(&mut self, s: &[u8]) -> (i64, i64) {
         if let Some(c) = self.consts.get(s) {
             return *c;
         }
-        let b: Box<[u8]> = s.as_bytes().to_vec().into_boxed_slice();
+        let b: Box<[u8]> = s.to_vec().into_boxed_slice();
         let c = (b.as_ptr() as usize as i64, b.len() as i64);
         rt::sh().consts.push(b);
-        self.consts.insert(s.to_string(), c);
+        self.consts.insert(s.to_vec(), c);
         c
     }
 }
@@ -796,6 +796,10 @@ impl<'c, 'p> Fx<'c, 'p> {
     }
 
     fn str_const(&mut self, s: &str) {
+        self.bytes_const(s.as_bytes());
+    }
+
+    fn bytes_const(&mut self, s: &[u8]) {
         let (p, n) = self.cx.bytes(s);
         self.i64c(p);
         self.i64c(n);
@@ -1904,6 +1908,7 @@ impl<'c, 'p> Fx<'c, 'p> {
                 self.ins().i32_const(*b as i32);
             }
             LE::S(s) | LE::Loc(s) => self.str_const(s),
+            LE::SB(b) => self.bytes_const(b),
             LE::Unit => {}
             LE::Tup(_, vs) => {
                 for v in vs {
@@ -2381,7 +2386,7 @@ pub(crate) fn ty_of(tys: &Tys, vars: &[LVar], e: &LE) -> LTy {
         LE::F(_) | LE::FArith(..) | LE::FNeg(_) | LE::Prim(Prim::UToF, _) => LTy::F64,
         LE::Prim(Prim::ULt | Prim::ULe | Prim::MulOvf, _) => LTy::Bool,
         LE::Prim(..) => LTy::I64,
-        LE::Loc(_) | LE::S(_) => LTy::Str,
+        LE::Loc(_) | LE::S(_) | LE::SB(_) => LTy::Str,
         LE::B(_) | LE::Cmp(..) | LE::Not(_) => LTy::Bool,
         LE::Unit => LTy::Unit,
         LE::Tup(t, _) => t.clone(),

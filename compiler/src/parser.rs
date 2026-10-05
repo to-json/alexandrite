@@ -283,10 +283,17 @@ impl<'a> Parser<'a> {
                             self.skip_line_continuation();
                             let value = self.expr()?;
                             m.public.insert(name.clone());
-                            m.consts.push(ConstDef { name, span: sp, ty, value });
+                            m.consts.push(ConstDef { name, span: sp, ty, value, embed: None });
                         }
                         t => return Err(Diag::new(self.span(), format!("`pub` goes before a declaration, found {}", describe(&t)))),
                     }
+                }
+                Tok::Attr(a) if is_embed_attr(&a) => {
+                    let (c, public) = self.embed_const()?;
+                    if public {
+                        m.public.insert(c.name.clone());
+                    }
+                    m.consts.push(c);
                 }
                 Tok::Attr(_) if self.attrs_precede_type() => self.type_attrs()?,
                 Tok::Attr(_) | Tok::Kw(Kw::Def) | Tok::Kw(Kw::Fn) => m.defs.push(self.def()?),
@@ -315,7 +322,7 @@ impl<'a> Parser<'a> {
                     self.expect_op("=")?;
                     self.skip_line_continuation();
                     let value = self.expr()?;
-                    m.consts.push(ConstDef { name, span: sp, ty, value });
+                    m.consts.push(ConstDef { name, span: sp, ty, value, embed: None });
                 }
                 Tok::Directive(..) => return Err(Diag::new(self.span(), "directives must come first in the file")),
                 _ => {
@@ -326,6 +333,43 @@ impl<'a> Parser<'a> {
         }
         self.expand_derives(&mut m)?;
         Ok(m)
+    }
+
+    /// `#[embed("pattern", ...)] [pub] NAME: Type` (Go's `//go:embed`): a
+    /// constant whose value is the matching files, read by the front end.
+    fn embed_const(&mut self) -> PResult<(ConstDef, bool)> {
+        let Tok::Attr(a) = self.peek().clone() else { unreachable!() };
+        let asp = self.bump().span;
+        let mut patterns = embed_patterns(&a).map_err(|m| Diag::new(asp, m))?;
+        self.skip_newlines();
+        // Several `#[embed]` lines add up, as Go's `//go:embed` lines do.
+        while let Tok::Attr(a) = self.peek().clone() {
+            if !is_embed_attr(&a) {
+                break;
+            }
+            let sp = self.bump().span;
+            patterns.extend(embed_patterns(&a).map_err(|m| Diag::new(sp, m))?);
+            self.skip_newlines();
+        }
+        let public = matches!(self.peek(), Tok::Ident(p) if p == "pub");
+        if public {
+            self.bump();
+        }
+        let Tok::Const(name) = self.peek().clone() else {
+            return Err(Diag::new(self.span(), "`#[embed(...)]` goes before a constant declaration: `NAME: Str`, `NAME: [Byte]` or `NAME: embed.FS`"));
+        };
+        let sp = self.bump().span;
+        if !self.is_op(":") {
+            return Err(Diag::new(self.span(), "an embedded constant needs its type: `NAME: Str`, `NAME: [Byte]` or `NAME: embed.FS`"));
+        }
+        self.bump();
+        let ty = self.type_expr()?;
+        if self.is_op("=") {
+            return Err(Diag::new(self.span(), "an embedded constant has no `= value`: the files are its value"));
+        }
+        let value = Expr { id: self.id(), kind: ExprKind::Bool(false), span: sp };
+        let embed = Some(Embed { patterns, span: asp, files: Default::default() });
+        Ok((ConstDef { name, span: sp, ty: Some(ty), value, embed }, public))
     }
 
     /// Are the `#[...]` attributes at the cursor followed by a struct or enum?
@@ -2160,4 +2204,57 @@ pub fn describe(t: &Tok) -> String {
         Tok::Newline => "end of line".into(),
         Tok::Eof => "end of file".into(),
     }
+}
+
+/// Is `#[...]`'s text an `embed(...)` attribute?
+fn is_embed_attr(a: &str) -> bool {
+    a.trim_start().strip_prefix("embed").is_some_and(|r| r.trim_start().starts_with('('))
+}
+
+/// The patterns of `embed("a.txt", "static/*.html")`: string literals
+/// (double-quoted with Go's simple escapes, or backquoted), comma-separated.
+fn embed_patterns(a: &str) -> Result<Vec<String>, String> {
+    let usage = "write `#[embed(\"file.txt\")]` (one or more quoted patterns, comma-separated)";
+    let inner = a.trim().strip_prefix("embed").map(str::trim).and_then(|r| r.strip_prefix('(')).and_then(|r| r.trim_end().strip_suffix(')')).ok_or(usage)?;
+    let mut out = vec![];
+    let mut cs = inner.trim().chars().peekable();
+    loop {
+        while cs.peek().is_some_and(|c| c.is_whitespace()) {
+            cs.next();
+        }
+        let Some(q) = cs.next() else { break };
+        if q != '"' && q != '`' {
+            return Err(usage.into());
+        }
+        let mut p = String::new();
+        loop {
+            match cs.next() {
+                None => return Err("unterminated pattern in `#[embed(...)]`".into()),
+                Some(c) if c == q => break,
+                Some('\\') if q == '"' => match cs.next() {
+                    Some('n') => p.push('\n'),
+                    Some('t') => p.push('\t'),
+                    Some(c) => p.push(c),
+                    None => return Err("unterminated pattern in `#[embed(...)]`".into()),
+                },
+                Some(c) => p.push(c),
+            }
+        }
+        if p.is_empty() {
+            return Err("an empty pattern in `#[embed(...)]`".into());
+        }
+        out.push(p);
+        while cs.peek().is_some_and(|c| c.is_whitespace()) {
+            cs.next();
+        }
+        match cs.next() {
+            None => break,
+            Some(',') => {}
+            _ => return Err(usage.into()),
+        }
+    }
+    if out.is_empty() {
+        return Err(usage.into());
+    }
+    Ok(out)
 }

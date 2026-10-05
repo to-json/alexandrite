@@ -808,7 +808,7 @@ impl<'a> Lw<'a> {
         match s {
             TStmt::Expr(e) => {
                 let v = self.expr(e);
-                if !matches!(v, LE::Var(_) | LE::I(_) | LE::B(_) | LE::S(_) | LE::Unit | LE::Field(..) | LE::Cmp(..)) {
+                if !matches!(v, LE::Var(_) | LE::I(_) | LE::B(_) | LE::S(_) | LE::SB(_) | LE::Unit | LE::Field(..) | LE::Cmp(..)) {
                     self.emit(LS::Eval(v));
                 }
             }
@@ -1134,6 +1134,7 @@ impl<'a> Lw<'a> {
                 LE::Unit
             }
             TK::Str(s) => LE::S(s.clone()),
+            TK::Bytes(b) => LE::SB(b.clone()),
             TK::Bool(b) => LE::B(*b),
             TK::Unit => LE::Unit,
             TK::Local(l) => LE::Var(self.var_of(*l)),
@@ -4677,7 +4678,7 @@ fn le_allocates(e: &LE, rets: &(std::collections::HashSet<String>, std::collecti
     let any = |xs: &[LE]| xs.iter().any(|x| le_allocates(x, rets));
     let one = |x: &LE| le_allocates(x, rets);
     match e {
-        LE::Var(_) | LE::I(_) | LE::F(_) | LE::B(_) | LE::S(_) | LE::Loc(_) | LE::Unit | LE::RegionProgram | LE::Global(_) => false,
+        LE::Var(_) | LE::I(_) | LE::F(_) | LE::B(_) | LE::S(_) | LE::SB(_) | LE::Loc(_) | LE::Unit | LE::RegionProgram | LE::Global(_) => false,
         LE::Tup(_, xs) | LE::Prim(_, xs) => any(xs),
         LE::Field(x, _) | LE::Neg(x, _) | LE::FNeg(x) | LE::Not(x) | LE::Len(x) | LE::RangeField(x, _) | LE::ChanLen(x) | LE::AtomicLoad(x) | LE::RegionOf(x) | LE::RegionBytes(x) => one(x),
         LE::Arith(_, a, b, _) | LE::Cmp(_, a, b, _) | LE::FArith(_, a, b) | LE::Range(a, b, _) => one(a) || one(b),

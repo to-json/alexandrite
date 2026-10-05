@@ -244,6 +244,17 @@ fn std_list(dir: &Path) -> Option<Vec<PathBuf>> {
     Some(fs)
 }
 
+/// The directory `#[embed]` patterns of file `f` are relative to: its own,
+/// or for a std package, its directory under `ALX_STD_DIR` (the embedded
+/// standard library has no files beside it).
+fn embed_dir(f: &Path) -> PathBuf {
+    let d = f.parent().unwrap_or(Path::new(".")).to_path_buf();
+    match (d.strip_prefix(STD_DIR), std::env::var_os("ALX_STD_DIR")) {
+        (Ok(rel), Some(root)) => PathBuf::from(root).join(rel),
+        _ => d,
+    }
+}
+
 fn std_read(f: &Path) -> Option<String> {
     let rel = f.strip_prefix(STD_DIR).ok()?.to_string_lossy().replace('\\', "/");
     std_files().iter().find(|(p, _)| *p == rel).map(|(_, t)| t.to_string())
@@ -297,10 +308,13 @@ pub fn load_with(path: &Path, display: &str, read: &dyn Fn(&Path) -> std::io::Re
             return Err((sm, d));
         }
     };
-    let main = match parse_file(&mut sm, display.to_string(), text, &mut next_id) {
+    let mut main = match parse_file(&mut sm, display.to_string(), text, &mut next_id) {
         Ok(m) => m,
         Err(d) => return Err((sm, d)),
     };
+    if let Err(d) = crate::embed::resolve(&mut main, path.parent().unwrap_or(Path::new("."))) {
+        return Err((sm, d));
+    }
     if let Some(t) = main.tests.first() {
         return Err((sm, not_a_test_file(t)));
     }
@@ -366,7 +380,8 @@ fn load_pkg(
             Ok(rel) => format!("std/{}", rel.display()),
             Err(_) => shown_root.join(f.strip_prefix(&mods.root).unwrap_or(f)).display().to_string(),
         };
-        let m = parse_file(sm, shown, text, next_id)?;
+        let mut m = parse_file(sm, shown, text, next_id)?;
+        crate::embed::resolve(&mut m, &embed_dir(f))?;
         if let Some(s) = m.main.first() {
             return Err(Diag::new(s.span, format!("a package (`{path}`) holds only declarations; move statements into a def")));
         }
@@ -578,6 +593,8 @@ pub fn separable(p: &Package) -> bool {
         && !m.consts.iter().any(|c| matches!(c.value.kind, crate::ast::ExprKind::Array(_) | crate::ast::ExprKind::ArrayRepeat(..)))
         // The builtin Complex is declared with the program.
         && !uses_complex(&p.source)
+        // Embedded files aren't part of the source the cache is keyed by.
+        && !m.consts.iter().any(|c| c.embed.is_some())
 }
 
 fn uses_complex(src: &str) -> bool {
@@ -886,6 +903,9 @@ pub fn load_tests(dir: &Path, dir_shown: &str, only: Option<&Path>, o: &TestOpts
             Ok(m) => m,
             Err(d) => return Err((sm, d)),
         };
+        if let Err(d) = crate::embed::resolve(&mut m, &embed_dir(f)) {
+            return Err((sm, d));
+        }
         if let Some(s) = m.main.first() {
             let why = if test_file { "a test file holds only declarations and test blocks; move statements into a `test`" } else { "a package holds only declarations; move statements into a def" };
             return Err((sm, Diag::new(s.span, why)));

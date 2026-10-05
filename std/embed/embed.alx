@@ -1,0 +1,238 @@
+# Package embed: Go's embed — files embedded in the program at compile
+# time, read through an fs.FS.
+#
+#   Go                                      alx
+#   //go:embed hello.txt                    #[embed("hello.txt")]
+#   var s string                            HELLO: Str
+#   //go:embed hello.txt                    #[embed("hello.txt")]
+#   var b []byte                            HELLO_BYTES: [Byte]
+#   //go:embed static/*.html img            #[embed("static/*.html", "img")]
+#   var content embed.FS                    CONTENT: embed.FS
+#   FS.Open / ReadDir / ReadFile            FS.open / read_dir / read_file (fs.FS: also
+#                                             stat, glob, ... and fs.sub, fs.walk_dir)
+#
+# The directive (D59 in GO-VS-RUBY.md) is part of the language: the front
+# end resolves the patterns against the directory of the file declaring the
+# constant, by Go's rules, and reads the files; every backend gets the
+# contents as literals. The rules:
+#  - Patterns are path.Match globs over slash-separated paths, relative to
+#    the declaring file's directory; `.`, `..`, empty elements and a leading
+#    `/` are invalid. Several patterns (in one attribute, comma-separated,
+#    or several `#[embed]` lines) add up.
+#  - A pattern naming a directory embeds every file under it, except names
+#    starting with `.` or `_` (unless the pattern starts with `all:`) and
+#    directories holding an `alx.mod` (another module). A file named
+#    explicitly (or matched by a glob) is embedded whatever its name.
+#  - A pattern matching nothing, or a directory with nothing to embed, is a
+#    compile error (Go's messages: "pattern x: no matching files found").
+#  - A Str or [Byte] constant takes exactly one file; an embed.FS any
+#    number. A Str holds the file's bytes as they are (UTF-8 or not).
+#
+# Differences from Go:
+#  - Go embeds into package variables; alx has no mutable package state, so
+#    an embedded file is a constant (`NAME: Type`, no `= value`), `pub` to
+#    export it. A [Byte] constant gives a fresh copy at each use, as alx's
+#    array constants do (changing it never changes the embedded data).
+#  - Go's `import _ "embed"` isn't needed for Str and [Byte]; embed.FS
+#    needs `import "embed"`, as in Go.
+#  - FS is a value holding the file table (names and contents); its zero
+#    value (`embed.FS.new`) is an empty file system, as Go's is.
+#  - An opened file's `seek!` and `read_at` are methods of the concrete
+#    File type (fs.File has neither in alx; Go asserts io.Seeker /
+#    io.ReaderAt at run time). `FS.open_file(name)` returns that type.
+#  - Directory reads end with an empty slice rather than io.EOF (io/fs's
+#    shape), and read! at the end of a file returns 0 (io's shape).
+#  - The embedded files' FileInfo has a zero mod_time and mode 0444 (dirs:
+#    MODE_DIR | 0555), as Go's; there is no `sys`.
+#  - The browser playground has no file system: `#[embed]` is a compile
+#    error there.
+
+import "io/fs"
+import "time"
+
+# Go's split: the directory and element of an embedded name (a trailing
+# `/` marks a directory).
+def split(name: Str) -> (Str, Str, Bool) {
+  is_dir = name.size > 0 && name[name.size - 1] == 47
+  n = is_dir ? name[0...name.size - 1] : name
+  i = n.size - 1
+  while i >= 0 && n[i] != 47 {
+    i -= 1
+  }
+  return (".", n, is_dir) if i < 0
+  (n[0...i], n[i + 1...n.size], is_dir)
+}
+
+def info_of(name: Str, data: Str) -> fs.FileInfo {
+  _dir, elem, is_dir = split(name)
+  mode = is_dir ? fs.mode(fs.MODE_DIR | 0o555) : fs.mode(0o444)
+  fs.FileInfo.new(name: elem, size: data.size, mode: mode, mod_time: time.Time.new)
+}
+
+# The files embedded by an `#[embed]` constant: a read-only fs.FS.
+pub struct FS {
+  # Every file and directory (with a trailing `/`), sorted by directory,
+  # then name (Go's order); datas[i] is names[i]'s content.
+  names: [Str]
+  datas: [Str]
+
+  # The index of name in the table, -1 for none.
+  def lookup(name: Str) -> Int {
+    return -1 if !fs.valid_path?(name)
+    dir, elem, _d = split(name)
+    lo = 0
+    hi = names.size
+    while lo < hi {
+      h = (lo + hi) / 2
+      idir, ielem, _x = split(names[h])
+      if idir > dir || idir == dir && ielem >= elem {
+        hi = h
+      } else {
+        lo = h + 1
+      }
+    }
+    return -1 if lo >= names.size
+    n = names[lo]
+    n = n[0...n.size - 1] if n.size > 0 && n[n.size - 1] == 47
+    n == name ? lo : -1
+  }
+
+  # The entries of directory dir: indexes lo...hi of the table.
+  def dir_range(dir: Str) -> (Int, Int) {
+    lo = 0
+    while lo < names.size {
+      idir, _e, _d = split(names[lo])
+      break if idir >= dir
+      lo += 1
+    }
+    hi = lo
+    while hi < names.size {
+      jdir, _e, _d = split(names[hi])
+      break if jdir > dir
+      hi += 1
+    }
+    (lo, hi)
+  }
+
+  def entries(dir: Str) -> [fs.DirEntry] {
+    lo, hi = dir_range(dir)
+    out: [fs.DirEntry] = []
+    i = lo
+    while i < hi {
+      out << fs.file_info_to_dir_entry(info_of(names[i], datas[i]))
+      i += 1
+    }
+    out
+  }
+
+  # Opens the named file for reading (Go's Open).
+  pub def open(name: Str) -> ~fs.File {
+    if name == "." {
+      return OpenDir.new(path: ".", info: info_of("./", ""), entries: entries("."), st: [0])
+    }
+    k = lookup(name)
+    fail fs.path_error("open", name, "file does not exist") if k < 0
+    _dir, _elem, is_dir = split(names[k])
+    if is_dir {
+      return OpenDir.new(path: name, info: info_of(names[k], ""), entries: entries(name), st: [0])
+    }
+    OpenFile.new(path: name, info: info_of(names[k], datas[k]), data: datas[k], st: [0])
+  }
+
+  # Opens a regular file as the concrete OpenFile (with seek! and
+  # read_at, Go's io.Seeker and io.ReaderAt).
+  pub def open_file(name: Str) -> ~OpenFile {
+    k = lookup(name)
+    fail fs.path_error("open", name, "file does not exist") if k < 0
+    _dir, _elem, is_dir = split(names[k])
+    fail fs.path_error("read", name, "is a directory") if is_dir
+    OpenFile.new(path: name, info: info_of(names[k], datas[k]), data: datas[k], st: [0])
+  }
+
+  # The entries of the named directory, sorted by name (Go's ReadDir).
+  pub def read_dir(name: Str) -> ~[fs.DirEntry] {
+    return entries(".") if name == "."
+    k = lookup(name)
+    fail fs.path_error("open", name, "file does not exist") if k < 0
+    _dir, _elem, is_dir = split(names[k])
+    fail fs.path_error("read", name, "not a directory") if !is_dir
+    entries(name)
+  }
+
+  # The contents of the named file (Go's ReadFile).
+  pub def read_file(name: Str) -> ~[Byte] {
+    fail fs.path_error("read", name, "is a directory") if name == "."
+    k = lookup(name)
+    fail fs.path_error("open", name, "file does not exist") if k < 0
+    _dir, _elem, is_dir = split(names[k])
+    fail fs.path_error("read", name, "is a directory") if is_dir
+    datas[k].bytes.to_a
+  }
+}
+
+# An open embedded file. `st[0]` is the read offset.
+pub struct OpenFile {
+  path: Str
+  info: fs.FileInfo
+  data: Str
+  st: [Int]
+
+  pub def stat -> ~fs.FileInfo { info }
+  pub def close! -> ~Unit {}
+
+  pub def read!(p: [Byte]) -> ~Int {
+    off = st[0]
+    return 0 if off >= data.size
+    fail fs.path_error("read", path, "invalid argument") if off < 0
+    n = data.size - off
+    n = p.size if p.size < n
+    copy(p, data[off...off + n].bytes.to_a)
+    self.st[0] = off + n
+    n
+  }
+
+  # Go's Seek (whence 0: from the start, 1: from the offset, 2: from the end).
+  pub def seek!(offset: Int, whence: Int) -> ~Int {
+    o = offset
+    o += st[0] if whence == 1
+    o += data.size if whence == 2
+    fail fs.path_error("seek", path, "invalid argument") if o < 0 || o > data.size
+    self.st[0] = o
+    o
+  }
+
+  # Go's ReadAt: reads at offset, ignoring (and not moving) the read
+  # offset. Fewer than p.size bytes only at the end of the file, where Go
+  # also returns io.EOF.
+  pub def read_at(p: [Byte], offset: Int) -> ~Int {
+    fail fs.path_error("read", path, "invalid argument") if offset < 0 || offset > data.size
+    n = data.size - offset
+    n = p.size if p.size < n
+    copy(p, data[offset...offset + n].bytes.to_a)
+    n
+  }
+}
+
+# An open embedded directory. `st[0]` is how many entries were read.
+pub struct OpenDir {
+  path: Str
+  info: fs.FileInfo
+  entries: [fs.DirEntry]
+  st: [Int]
+
+  pub def stat -> ~fs.FileInfo { info }
+  pub def close! -> ~Unit {}
+
+  pub def read!(p: [Byte]) -> ~Int {
+    fail fs.path_error("read", path, "is a directory")
+  }
+
+  # Up to count entries (all the rest for count <= 0); empty at the end.
+  pub def read_dir!(count: Int) -> ~[fs.DirEntry] {
+    off = st[0]
+    n = entries.size - off
+    n = count if count > 0 && n > count
+    self.st[0] = off + n
+    entries[off...off + n]
+  }
+}

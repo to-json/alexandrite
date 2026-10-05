@@ -176,6 +176,21 @@ pub struct ConstDef {
     pub span: Span,
     pub ty: Option<TypeExpr>,
     pub value: Expr,
+    /// `#[embed("pattern", ...)] NAME: Type` (Go's `//go:embed`): the
+    /// patterns, then the files the front end found for them.
+    pub embed: Option<Embed>,
+}
+
+/// The files of an `#[embed(...)]` constant (D59).
+#[derive(Debug, Clone, Default)]
+pub struct Embed {
+    pub patterns: Vec<String>,
+    pub span: Span,
+    /// Slash-separated names relative to the declaring file's directory,
+    /// with their contents, in Go's embed.FS order (by directory, then
+    /// name). Directories are listed too, named with a trailing `/` and
+    /// no data.
+    pub files: std::rc::Rc<Vec<(String, Vec<u8>)>>,
 }
 
 /// `struct Name { field: Type, ... }`: a value type.

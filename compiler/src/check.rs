@@ -200,6 +200,9 @@ pub enum CVal {
     /// A variant without fields of an enum (`pub SHA256 = Hash.SHA256`):
     /// the enum's qualified name and the variant's index.
     Enum(String, usize),
+    /// The files of an `#[embed]` constant (D59), its type Str, [Byte] or
+    /// embed.FS: (slash-separated name, contents); directories end in `/`.
+    Embed(std::rc::Rc<Vec<(String, Vec<u8>)>>),
 }
 
 /// The type of a constant's value: `want` if given (checking that the value
@@ -240,6 +243,7 @@ fn const_type(v: &CVal, want: Option<&Ty>, sp: Span) -> R<Ty> {
             Ok(Ty::arr(el))
         }
         (CVal::Enum(..), _) => Err(Diag::new(sp, "an array constant can't hold enum values")),
+        (CVal::Embed(_), _) => Err(Diag::new(sp, "an array constant can't hold embedded files")),
         (_, Some(t)) => Err(Diag::new(sp, format!("this constant isn't {}", t.show()))),
     }
 }
@@ -260,6 +264,7 @@ pub fn const_lit(v: &CVal, ty: &Ty, sp: Span) -> TExpr {
             TK::Array(vs.iter().map(|v| const_lit(v, &el, sp)).collect())
         }
         (CVal::Enum(..), _) => unreachable!("enum constants aren't array elements"),
+        (CVal::Embed(_), _) => unreachable!("embedded constants aren't array elements"),
     };
     TExpr { kind, ty: ty.clone(), span: sp }
 }
@@ -294,8 +299,8 @@ impl<'a> World<'a> {
             if self.consts.contains_key(&d.name) || self.structs.contains_key(&d.name) {
                 return Err(Diag::new(d.span, format!("`{}` is already defined", d.name)));
             }
-            // `Enum.Variant`, or a constant naming one: after the types.
-            let deferred = match &d.value.kind {
+            // `Enum.Variant`, or a constant naming one, or embedded files: after the types.
+            let deferred = d.embed.is_some() || match &d.value.kind {
                 ExprKind::Call { recv: Some(r), args, block: None, .. } => args.is_empty() && matches!(r.kind, ExprKind::Const(_)),
                 ExprKind::Const(c) => {
                     let prev = enter_pkg(&pkg_of(&d.name));
@@ -357,6 +362,29 @@ impl<'a> World<'a> {
     pub fn add_enum_consts(&mut self) -> R<()> {
         let pending = std::mem::take(&mut self.pending_consts);
         for d in &pending {
+            if let Some(e) = &d.embed {
+                let prev = enter_pkg(&pkg_of(&d.name));
+                let t = type_from(d.ty.as_ref().expect("an embedded constant is typed"), &self.structs, &self.consts);
+                leave_pkg(prev);
+                let t = t?;
+                let files = e.files.iter().filter(|(n, _)| !n.ends_with('/')).count();
+                let short = d.name.rsplit('.').next().unwrap_or(&d.name);
+                match &t {
+                    Ty::Str | Ty::Array(_) if !matches!(&t, Ty::Array(el) if **el != Ty::IntK(IntKind::U8)) => {
+                        if files != 1 {
+                            return Err(Diag::new(e.span, format!("`{short}` is {}, which holds one file; the patterns match {files} files", t.show())).note("embed several files, or a directory, as an `embed.FS`"));
+                        }
+                        let one: Vec<_> = e.files.iter().filter(|(n, _)| !n.ends_with('/')).cloned().collect();
+                        self.consts.insert(d.name.clone(), (CVal::Embed(std::rc::Rc::new(one)), Some(t)));
+                        continue;
+                    }
+                    // embed.FS (just `FS` in embed's own tests).
+                    Ty::Struct(n, fs) if (n == "embed.FS" || n == "FS") && fs.iter().any(|(f, _)| f == "names") && fs.iter().any(|(f, _)| f == "datas") => {}
+                    _ => return Err(Diag::new(d.span, format!("an embedded constant is a Str, a [Byte] or an embed.FS, not {}", t.show()))),
+                }
+                self.consts.insert(d.name.clone(), (CVal::Embed(e.files.clone()), Some(t)));
+                continue;
+            }
             let prev = enter_pkg(&pkg_of(&d.name));
             let ev = self.enum_const(&d.value);
             let want = d.ty.as_ref().map(|te| type_from(te, &self.structs, &self.consts));
@@ -4101,6 +4129,42 @@ impl<'w, 'a> FnCx<'w, 'a> {
         Ok(Some(cur))
     }
 
+    /// An `#[embed]` constant used as a value: the file as a Str literal,
+    /// a fresh [Byte] copy of it, or an embed.FS holding every file.
+    fn embed_value(&mut self, files: &[(String, Vec<u8>)], t: Ty, sp: Span) -> TExpr {
+        let lit = |cx: &mut Self, b: &[u8]| match std::str::from_utf8(b) {
+            Ok(s) => cx.mk(TK::Str(s.to_string()), Ty::Str, sp),
+            Err(_) => cx.mk(TK::Bytes(b.to_vec()), Ty::Str, sp),
+        };
+        match &t {
+            Ty::Str => lit(self, &files[0].1),
+            Ty::Array(_) => {
+                let s = lit(self, &files[0].1);
+                let bytes = self.mk(TK::M(M::Bytes, Some(Box::new(s)), vec![], None), Ty::seq(Ty::IntK(IntKind::U8), false), sp);
+                self.mk(TK::M(M::ToA, Some(Box::new(bytes)), vec![], None), t.clone(), sp)
+            }
+            Ty::Struct(_, fields) => {
+                let mut vals = vec![];
+                for (f, ft) in fields.clone() {
+                    let v = match f.as_str() {
+                        "names" => {
+                            let items = files.iter().map(|(n, _)| self.mk(TK::Str(n.clone()), Ty::Str, sp)).collect();
+                            self.mk(TK::Array(items), ft.clone(), sp)
+                        }
+                        "datas" => {
+                            let items = files.iter().map(|(_, d)| lit(self, d)).collect();
+                            self.mk(TK::Array(items), ft.clone(), sp)
+                        }
+                        _ => self.zero_of(&ft, sp).expect("embed.FS's other fields have zero values"),
+                    };
+                    vals.push(v);
+                }
+                self.mk(TK::M(M::StructNew, None, vals, None), t.clone(), sp)
+            }
+            _ => unreachable!("checked in add_enum_consts"),
+        }
+    }
+
     /// A top-level constant used as a value.
     fn const_value(&mut self, v: CVal, ty: Option<Ty>, sp: Span) -> R<TExpr> {
         Ok(match (v, ty) {
@@ -4118,6 +4182,8 @@ impl<'w, 'a> FnCx<'w, 'a> {
                 self.mk(TK::M(M::VariantNew(k), None, slots, None), et.clone(), sp)
             }
             (CVal::Enum(..), _) => unreachable!("enum constants are typed"),
+            (CVal::Embed(files), Some(t)) => self.embed_value(&files, t, sp),
+            (CVal::Embed(_), None) => unreachable!("embedded constants are typed"),
             (CVal::Str(s), _) => self.mk(TK::Str(s), Ty::Str, sp),
             (CVal::Bool(b), _) => self.mk(TK::Bool(b), Ty::Bool, sp),
             (CVal::Num(n), None) => {

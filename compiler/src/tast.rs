@@ -403,6 +403,8 @@ pub enum TK {
     /// An untyped constant (Go): exact until its use gives it a type.
     Const(ConstVal),
     Str(String),
+    /// A Str literal of arbitrary bytes (an `#[embed]`ded file that isn't UTF-8).
+    Bytes(Vec<u8>),
     Bool(bool),
     Unit,
     Local(LocalId),

@@ -52,7 +52,7 @@ pub fn kids(e: &mut LE) -> Vec<&mut LE> {
         LE::Arith(_, a, b, _) | LE::PArith(_, a, b) | LE::Cmp(_, a, b, _) | LE::FArith(_, a, b) | LE::AtomicRmw(_, a, b) | LE::Range(a, b, _) | LE::ArrNew(_, a, b, _) => vec![&mut **a, &mut **b],
         LE::Index { arr, idx, .. } => vec![&mut **arr, &mut **idx],
         LE::Cond(a, b, c) | LE::Slice(_, a, b, c) | LE::AtomicCas(a, b, c) => vec![&mut **a, &mut **b, &mut **c],
-        LE::Var(_) | LE::I(_) | LE::F(_) | LE::B(_) | LE::S(_) | LE::Loc(_) | LE::Unit | LE::LockNew | LE::NullTask(_) | LE::RegionProgram | LE::Global(_) => vec![],
+        LE::Var(_) | LE::I(_) | LE::F(_) | LE::B(_) | LE::S(_) | LE::SB(_) | LE::Loc(_) | LE::Unit | LE::LockNew | LE::NullTask(_) | LE::RegionProgram | LE::Global(_) => vec![],
     }
 }
 
@@ -266,7 +266,7 @@ struct Fl<'a> {
 }
 
 fn trivial(e: &LE) -> bool {
-    matches!(e, LE::Var(_) | LE::I(_) | LE::F(_) | LE::B(_) | LE::S(_) | LE::Loc(_) | LE::Unit | LE::Global(_))
+    matches!(e, LE::Var(_) | LE::I(_) | LE::F(_) | LE::B(_) | LE::S(_) | LE::SB(_) | LE::Loc(_) | LE::Unit | LE::Global(_))
 }
 
 impl Fl<'_> {

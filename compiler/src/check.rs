@@ -5225,7 +5225,7 @@ impl<'w, 'a> FnCx<'w, 'a> {
         self.call_def(def, name, name_span, targs, sp)
     }
 
-    /// Call def `def` with checked arguments (a method's include `self`).
+    /// S9: the builtin struct `CallSite` (builtin.alx).
     fn call_site_ty(&self, sp: Span) -> R<Ty> {
         type_from(&TypeExpr::Named("CallSite".into(), sp), &self.w.structs, &self.w.consts)
     }
@@ -5265,6 +5265,7 @@ impl<'w, 'a> FnCx<'w, 'a> {
         }
     }
 
+    /// Call def `def` with checked arguments (a method's include `self`).
     fn call_def(&mut self, def: usize, name: &str, name_span: Span, args: Vec<TExpr>, sp: Span) -> R<TExpr> {
         let owner_targs = std::mem::take(&mut self.owner_targs);
         let d = self.w.defs[def].def.clone();

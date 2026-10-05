@@ -1,0 +1,400 @@
+# Package xml: Go's encoding/xml (HEADER: see the end of this comment block).
+
+import "bytes"
+import "io"
+import "strconv"
+import "strings"
+import "unicode/utf8"
+
+# Go's xml.Header: a generic XML header for the output of marshal.
+pub HEADER = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+
+XML_URL = "http://www.w3.org/XML/1998/namespace"
+XMLNS_PREFIX = "xmlns"
+XML_PREFIX = "xml"
+
+# The maximum element depth unmarshaling descends to (Go's maxUnmarshalDepth).
+pub MAX_UNMARSHAL_DEPTH = 10000
+
+# ---------------------------------------------------------------------- errors
+
+pub error XmlError {
+  # A syntax error in the input (Go's *SyntaxError): "XML syntax error on
+  # line N: msg".
+  Syntax(msg: Str, line: Int)
+  # An error in unmarshaling (Go's UnmarshalError): the text itself.
+  Unmarshal(msg: Str)
+  # A value that has no XML form (Go's *UnsupportedTypeError): "xml:
+  # unsupported type: T".
+  UnsupportedType(type_name: Str)
+  # The input ended before an element was found (Go returns io.EOF from
+  # Decode and Unmarshal there).
+  Eof
+  # Every other error of the package, with Go's text (errors.New and
+  # fmt.Errorf in Go).
+  Other(msg: Str)
+
+  def message -> Str {
+    case self {
+      Syntax(m, l) => "XML syntax error on line #{l}: #{m}"
+      Unmarshal(m) => m
+      UnsupportedType(t) => "xml: unsupported type: #{t}"
+      Eof => "EOF"
+      Other(m) => m
+    }
+  }
+}
+
+# Go's errUnmarshalDepth.
+pub def err_unmarshal_depth -> Error { XmlError.Other("exceeded max depth") }
+
+# Go's errRawToken.
+pub def err_raw_token -> Error { XmlError.Other("xml: cannot use RawToken from UnmarshalXML method") }
+
+def other(m: Str) -> Error { XmlError.Other(m) }
+
+# ---------------------------------------------------------------------- tokens
+
+# An XML name (Local) annotated with a name space identifier (Space). In
+# tokens from Decoder.token!, Space is the name space URL, not the prefix.
+pub struct Name {
+  space: Str
+  local: Str
+
+  # A Name in an element field: written as an empty element named by the
+  # field (Go has no fields in Name's type info); read by recording the
+  # element's name.
+  pub def xml_enc(e: Encoder, tmpl: StartElement?, fname: Name) -> ~Unit {
+    start = start_for(tmpl, Name.new, fname, "Name")
+    e.~write_start!(start)
+    e.~write_end!(start.name)
+  }
+  pub def xml_attr(name: Name) -> ~Attr? {
+    fail XmlError.UnsupportedType("xml.Name")
+  }
+  pub def xml_chardata -> ~[Byte]? { none }
+  pub def xml_dec!(d: Decoder, start: StartElement) -> ~Unit {
+    self.space = start.name.space
+    self.local = start.name.local
+    d.~skip!
+  }
+  pub def xml_attr_dec!(a: Attr) -> ~Unit { fail other("cannot unmarshal into xml.Name") }
+  pub def xml_text_dec!(b: [Byte]) -> ~Unit { fail other("cannot unmarshal into xml.Name") }
+}
+
+# An attribute of an element (Name=Value).
+pub struct Attr {
+  name: Name
+  value: Str
+
+  # As an attribute field ([Attr] with ",any,attr"), an Attr is written as
+  # itself and records the attribute as it was read.
+  pub def xml_attr(n: Name) -> ~Attr? { self }
+  pub def xml_attr_dec!(a: Attr) -> ~Unit {
+    self.name = a.name
+    self.value = a.value
+  }
+  # As an element: Go's struct walk over the fields Name and Value.
+  pub def xml_enc(e: Encoder, tmpl: StartElement?, fname: Name) -> ~Unit {
+    start = start_for(tmpl, Name.new, fname, "Attr")
+    e.~write_start!(start)
+    nm = Name.new(local: "Name")
+    e.~write_start!(StartElement.new(name: nm))
+    e.~write_end!(nm)
+    vn = Name.new(local: "Value")
+    e.~write_start!(StartElement.new(name: vn))
+    e.~escape_string!(value)
+    e.~write_end!(vn)
+    e.~write_end!(start.name)
+  }
+  pub def xml_chardata -> ~[Byte]? { none }
+  pub def xml_dec!(d: Decoder, start: StartElement) -> ~Unit {
+    d.~check_depth
+    loop {
+      t = d.~need_token!
+      case t {
+        StartElement(s) => {
+          if s.name.local == "Value" {
+            self.value = Str.from_bytes(d.~read_text!)
+          } else if s.name.local == "Name" {
+            self.name.~xml_dec!(d, s)
+          } else {
+            d.~skip!
+          }
+        }
+        EndElement(_) => {break}
+        _ => nil
+      }
+    }
+  }
+  pub def xml_text_dec!(b: [Byte]) -> ~Unit { fail other("cannot unmarshal into xml.Attr") }
+}
+
+# The start element to write for a value: the template's name (and
+# attributes) if there is one, else the value's own name (its xml_name
+# field), else the field's name, else the type's name.
+pub def start_for(tmpl: StartElement?, own: Name, fname: Name, type_name: Str) -> StartElement {
+  if t = tmpl {
+    return StartElement.new(name: t.name, attr: t.attr.dup)
+  }
+  start = StartElement.new(name: own)
+  start.name = fname if start.name.local == ""
+  start.name = Name.new(local: type_name) if start.name.local == ""
+  start
+}
+
+# A start element (Go's StartElement).
+pub struct StartElement {
+  name: Name
+  attr: [Attr]
+
+  # A copy whose attribute slice is not shared.
+  pub def copy -> StartElement { StartElement.new(name: name, attr: attr.dup) }
+
+  # The matching end element.
+  pub def end -> EndElement { EndElement.new(name: name) }
+}
+
+# An end element (Go's EndElement).
+pub struct EndElement {
+  name: Name
+}
+
+# A processing instruction <?target inst?> (Go's ProcInst).
+pub struct ProcInst {
+  target: Str
+  inst: [Byte]
+
+  pub def copy -> ProcInst { ProcInst.new(target: target, inst: inst.dup) }
+}
+
+# One XML token (Go's Token, an interface holding one of these types).
+# CharData is character data with entities replaced; Comment the bytes
+# between <!-- and -->; Directive the bytes between <! and >.
+pub enum Token {
+  StartElement(StartElement)
+  EndElement(EndElement)
+  CharData([Byte])
+  Comment([Byte])
+  ProcInst(ProcInst)
+  Directive([Byte])
+}
+
+# A copy of a token that shares no storage with it (Go's CopyToken).
+pub def copy_token(t: Token) -> Token {
+  case t {
+    StartElement(s) => Token.StartElement(s.copy)
+    EndElement(e) => Token.EndElement(e)
+    CharData(b) => Token.CharData(b.dup)
+    Comment(b) => Token.Comment(b.dup)
+    ProcInst(p) => Token.ProcInst(p.copy)
+    Directive(b) => Token.Directive(b.dup)
+  }
+}
+
+# Shorthands for building tokens.
+pub def start_token(name: Name, attr: [Attr]) -> Token { Token.StartElement(StartElement.new(name: name, attr: attr)) }
+pub def end_token(name: Name) -> Token { Token.EndElement(EndElement.new(name: name)) }
+pub def char_data(s: Str) -> Token { Token.CharData(s.bytes) }
+pub def comment(s: Str) -> Token { Token.Comment(s.bytes) }
+pub def directive(s: Str) -> Token { Token.Directive(s.bytes) }
+pub def proc_inst(target: Str, inst: Str) -> Token { Token.ProcInst(ProcInst.new(target: target, inst: inst.bytes)) }
+pub def name(space: Str, local: Str) -> Name { Name.new(space: space, local: local) }
+pub def attr(space: Str, local: Str, value: Str) -> Attr { Attr.new(name: Name.new(space: space, local: local), value: value) }
+
+# ---------------------------------------------------------------- characters
+
+# Whether r is in the XML Character Range (the Char production of XML 1.0,
+# section 2.2).
+pub def in_character_range?(r: Int) -> Bool {
+  r == 0x09 || r == 0x0A || r == 0x0D || r >= 0x20 && r <= 0xD7FF || r >= 0xE000 && r <= 0xFFFD || r >= 0x10000 && r <= 0x10FFFF
+}
+
+def in_table?(t: [Int], r: Int) -> Bool {
+  lo = 0
+  hi = t.size / 3
+  while lo < hi {
+    m = (lo + hi) / 2
+    a = t[m * 3]
+    b = t[m * 3 + 1]
+    if r < a {
+      hi = m
+    } else if r > b {
+      lo = m + 1
+    } else {
+      return (r - a) % t[m * 3 + 2] == 0
+    }
+  }
+  false
+}
+
+def name_byte?(c: Byte) -> Bool {
+  c >= 0x41 && c <= 0x5A || c >= 0x61 && c <= 0x7A || c >= 0x30 && c <= 0x39 || c == 0x5F || c == 0x3A || c == 0x2E || c == 0x2D
+}
+
+# Whether s is an XML name (Go's isName / isNameString).
+def name_str?(s: Str) -> Bool {
+  return false if s.size == 0
+  c, n = utf8.decode_rune_at(s, 0)
+  return false if c == utf8.RUNE_ERROR && n == 1
+  return false if !in_table?(NAME_FIRST, c.to_i)
+  i = n
+  while i < s.size {
+    c2, n2 = utf8.decode_rune_at(s, i)
+    return false if c2 == utf8.RUNE_ERROR && n2 == 1
+    return false if !in_table?(NAME_FIRST, c2.to_i) && !in_table?(NAME_SECOND, c2.to_i)
+    i += n2
+  }
+  true
+}
+
+# ---------------------------------------------------------------- escaping
+
+# The escape for the rune r (of `width` bytes), or none if it is written as
+# it is.
+def escape_for(r: Rune, width: Int, esc_newline: Bool) -> Str? {
+  case r {
+    0x22 => "&#34;"
+    0x27 => "&#39;"
+    0x26 => "&amp;"
+    0x3C => "&lt;"
+    0x3E => "&gt;"
+    0x09 => "&#x9;"
+    0x0A => esc_newline ? "&#xA;" : none
+    0x0D => "&#xD;"
+    _ => {
+      return "\uFFFD" if !in_character_range?(r.to_i) || (r == 0xFFFD && width == 1)
+      none
+    }
+  }
+}
+
+# The escaped XML form of s (Go's EscapeString on the printer).
+pub def escape_str(s: Str, esc_newline: Bool) -> Str {
+  i = 0
+  last = 0
+  out: [Str] = []
+  while i < s.size {
+    c = s[i]
+    if c >= 0x80 || c == 0x22 || c == 0x27 || c == 0x26 || c == 0x3C || c == 0x3E || c < 0x20 {
+      r, w = utf8.decode_rune_at(s, i)
+      i += w
+      if e = escape_for(r, w, esc_newline) {
+        out << s[last...i - w]
+        out << e
+        last = i
+      }
+    } else {
+      i += 1
+    }
+  }
+  return s if last == 0
+  out << s[last...s.size]
+  out.join("")
+}
+
+# Writes the properly escaped XML equivalent of the plain text s to w (Go's
+# EscapeText).
+pub def escape_text[W](w: W, s: [Byte]) -> ~Unit {
+  w.~write!(escape_str(Str.from_bytes(s), true).bytes)
+  nil
+}
+
+# Like escape_text without the error (Go's Escape, kept for Go 1.0).
+pub def escape[W](w: W, s: [Byte]) {
+  _ = escape_text(w, s)
+}
+
+# The CDATA-wrapped form of s, with nested "]]>" split (Go's emitCDATA).
+pub def cdata_str(s: Str) -> Str {
+  return "" if s.size == 0
+  out: [Str] = ["<![CDATA["]
+  rest = s
+  loop {
+    k = strings.index(rest, "]]>")
+    break if k < 0
+    out << rest[0...k]
+    out << "]]]]><![CDATA[>"
+    rest = rest[k + 3...rest.size]
+  }
+  out << rest
+  out << "]]>"
+  out.join("")
+}
+
+# The value of `param="..."` or `param='...'` in a processing instruction's
+# text s, or "" (Go's procInst).
+pub def proc_inst_param(param0: Str, s: Str) -> Str {
+  param = param0 + "="
+  lenp = param.size
+  i = 0
+  sep = 0
+  while i < s.size {
+    sub = s[i...s.size]
+    k = strings.index(sub, param)
+    return "" if k < 0 || lenp + k >= sub.size
+    i += lenp + k + 1
+    c = sub[lenp + k].to_i
+    if c == 0x27 || c == 0x22 {
+      sep = c
+      break
+    }
+  }
+  return "" if sep == 0
+  j = strings.index_byte(s[i...s.size], sep.as_u8)
+  return "" if j < 0
+  s[i...i + j]
+}
+
+# Whether dir has matched angle brackets outside comments and quotes (Go's
+# isValidDirective).
+pub def valid_directive?(dir: [Byte]) -> Bool {
+  depth = 0
+  inquote = 0
+  incomment = false
+  i = 0
+  while i < dir.size {
+    c = dir[i].to_i
+    if incomment {
+      if c == 0x3E {
+        n = 1 + i - 3
+        if n >= 0 && dir[n] == 0x2D && dir[n + 1] == 0x2D {
+          incomment = false
+        }
+      }
+    } else if inquote != 0 {
+      inquote = 0 if c == inquote
+    } else if c == 0x27 || c == 0x22 {
+      inquote = c
+    } else if c == 0x3C {
+      if i + 4 < dir.size && dir[i + 1] == 0x21 && dir[i + 2] == 0x2D && dir[i + 3] == 0x2D {
+        incomment = true
+      } else {
+        depth += 1
+      }
+    } else if c == 0x3E {
+      return false if depth == 0
+      depth -= 1
+    }
+    i += 1
+  }
+  depth == 0 && inquote == 0 && !incomment
+}
+
+# ---------------------------------------------------------------- HTML
+
+# The standard HTML entity names and their text (Go's HTMLEntity), for
+# Decoder.entity with strict = false.
+pub def html_entity -> Map[Str, Str] {
+  m: Map[Str, Str] = {}
+  i = 0
+  while i < HTML_ENTITY_NAMES.size {
+    m[HTML_ENTITY_NAMES[i]] = Str.from_bytes(utf8.encode_rune(HTML_ENTITY_RUNES[i].to_i32))
+    i += 1
+  }
+  m
+}
+
+# The HTML elements that close themselves (Go's HTMLAutoClose), for
+# Decoder.auto_close with strict = false.
+pub HTML_AUTO_CLOSE = ["basefont", "br", "area", "link", "img", "param", "hr", "input", "col", "frame", "isindex", "base", "meta"]

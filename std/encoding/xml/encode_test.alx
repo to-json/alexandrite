@@ -1,0 +1,155 @@
+import "bytes"
+import "strings"
+
+# Go's marshal_test.go, the token-level tests: TestEncodeToken (the
+# encodeTokenTests table), TestProcInstEncodeToken, TestDecodeEncode,
+# TestIsValidDirective, TestSimpleUseOfEncodeToken, TestClose and
+# TestMarshalFlush.
+
+# Encodes the tokens, then flushes: the output, and after "|" the error of
+# the last token (an error before it is reported as such).
+def enc_toks(toks: [Token]) -> Str {
+  buf = bytes.new_buffer([])
+  e = new_encoder(buf)
+  err = ""
+  i = 0
+  for t in toks {
+    r = e.encode_token!(t)
+    if x = r.err {
+      return "token #{i}: #{x.message}" if i < toks.size - 1
+      err = x.message
+    }
+    i += 1
+  }
+  if x = e.flush!.err {
+    return "flush: #{x.message}"
+  }
+  "#{buf.string}|#{err}"
+}
+
+def s0(local: Str) -> Token { start_token(name("", local), []) }
+
+test "EncodeToken" {
+  assert_eq enc_toks([sen("space", "local", [])]), "<local xmlns=\"space\">|"
+  assert_eq enc_toks([sen("space", "", [])]), "|xml: start tag with no name"
+  assert_eq enc_toks([enn("space", "")]), "|xml: end tag with no name"
+  assert_eq enc_toks([cd("foo")]), "foo|"
+  assert_eq enc_toks([cd(" \t\n")]), " &#x9;\n|"
+  assert_eq enc_toks([comment("foo")]), "<!--foo-->|"
+  assert_eq enc_toks([comment("foo-->")]), "|xml: EncodeToken of Comment containing --> marker"
+  assert_eq enc_toks([proc_inst("Target", "Instruction")]), "<?Target Instruction?>|"
+  assert_eq enc_toks([proc_inst("", "Instruction")]), "|xml: EncodeToken of ProcInst with invalid Target"
+  assert_eq enc_toks([proc_inst("", "Instruction?>")]), "|xml: EncodeToken of ProcInst with invalid Target"
+  assert_eq enc_toks([directive("foo")]), "<!foo>|"
+  assert_eq enc_toks([directive("DOCTYPE doc [ <!ELEMENT doc '>'> <!-- com>ment --> ]")]), "<!DOCTYPE doc [ <!ELEMENT doc '>'> <!-- com>ment --> ]>|"
+  assert_eq enc_toks([directive("foo>")]), "|xml: EncodeToken of Directive containing wrong < or > markers"
+  assert_eq enc_toks([enn("foo", "bar")]), "|xml: end tag </bar> without start tag"
+  assert_eq enc_toks([s0("foo"), en("bar")]), "<foo>|xml: end tag </bar> does not match start tag <foo>"
+  assert_eq enc_toks([sen("space", "foo", []), enn("another", "foo")]), "<foo xmlns=\"space\">|xml: end tag </foo> in namespace another does not match start tag <foo> in namespace space"
+  assert_eq enc_toks([sen("space", "local", [at("xmlns", "x", "space"), at("space", "foo", "value")])]), "<local xmlns=\"space\" xmlns:_xmlns=\"xmlns\" _xmlns:x=\"space\" xmlns:space=\"space\" space:foo=\"value\">|"
+  assert_eq enc_toks([sen("space", "local", [at("xmlns", "x", "space"), at("space", "foo", "value"), at("x", "bar", "other")])]), "<local xmlns=\"space\" xmlns:_xmlns=\"xmlns\" _xmlns:x=\"space\" xmlns:space=\"space\" space:foo=\"value\" xmlns:x=\"x\" x:bar=\"other\">|"
+  assert_eq enc_toks([se("local", [at("xmlns", "x", "space")]), sen("space", "foo", [at("space", "x", "y")])]), "<local xmlns:_xmlns=\"xmlns\" _xmlns:x=\"space\"><foo xmlns=\"space\" xmlns:space=\"space\" space:x=\"y\">|"
+  assert_eq enc_toks([se("foo", [at("xmlns", "x", "space1")]), se("foo", [at("xmlns", "x", "space2")]), se("foo", [at("space1", "a", "space1 value"), at("space2", "b", "space2 value")]), en("foo"), en("foo"), se("foo", [at("space1", "a", "space1 value"), at("space2", "b", "space2 value")])]), "<foo xmlns:_xmlns=\"xmlns\" _xmlns:x=\"space1\"><foo _xmlns:x=\"space2\"><foo xmlns:space1=\"space1\" space1:a=\"space1 value\" xmlns:space2=\"space2\" space2:b=\"space2 value\"></foo></foo><foo xmlns:space1=\"space1\" space1:a=\"space1 value\" xmlns:space2=\"space2\" space2:b=\"space2 value\">|"
+  assert_eq enc_toks([sen("space", "foo", [at("xmlns", "a", "space"), at("xmlns", "b", "space"), at("space", "x", "value")])]), "<foo xmlns=\"space\" xmlns:_xmlns=\"xmlns\" _xmlns:a=\"space\" _xmlns:b=\"space\" xmlns:space=\"space\" space:x=\"value\">|"
+  assert_eq enc_toks([se("foo", [at("xmlns", "x", "space")]), sen("space", "foo", [at("xmlns", "y", "space"), at("space", "a", "value")])]), "<foo xmlns:_xmlns=\"xmlns\" _xmlns:x=\"space\"><foo xmlns=\"space\" _xmlns:y=\"space\" xmlns:space=\"space\" space:a=\"value\">|"
+  assert_eq enc_toks([sen("space", "foo", [at("", "xmlns", "space")]), sen("space", "foo", [at("xmlns", "y", "space"), at("space", "a", "value")])]), "<foo xmlns=\"space\" xmlns=\"space\"><foo xmlns=\"space\" xmlns:_xmlns=\"xmlns\" _xmlns:y=\"space\" xmlns:space=\"space\" space:a=\"value\">|"
+  assert_eq enc_toks([se("foo", [at("xmlns", "x", "space")]), sen("space", "foo", [at("", "xmlns", "space"), at("space", "a", "value")])]), "<foo xmlns:_xmlns=\"xmlns\" _xmlns:x=\"space\"><foo xmlns=\"space\" xmlns=\"space\" xmlns:space=\"space\" space:a=\"value\">|"
+  assert_eq enc_toks([sen("space", "foo", [at("", "xmlns", "space")]), sen("space", "foo", [at("", "attr", "value")])]), "<foo xmlns=\"space\" xmlns=\"space\"><foo xmlns=\"space\" attr=\"value\">|"
+  assert_eq enc_toks([se("foo", [at("foo", "xmlns", "space")])]), "<foo xmlns:foo=\"foo\" foo:xmlns=\"space\">|"
+  assert_eq enc_toks([sen("space", "foo", [at("xml", "xmlns", "space")])]), "<foo xmlns=\"space\" xmlns:_xml=\"xml\" _xml:xmlns=\"space\">|"
+  assert_eq enc_toks([sen("space", "foo", [at(XML_URL, "xmlns", "space")])]), "<foo xmlns=\"space\" xml:xmlns=\"space\">|"
+  assert_eq enc_toks([se("foo", [at("xmlns", "foo", "")])]), "<foo xmlns:_xmlns=\"xmlns\" _xmlns:foo=\"\">|"
+  assert_eq enc_toks([se("foo", [at("", "", "value")])]), "<foo>|"
+  assert_eq enc_toks([sen("/34", "foo", [at("/34", "x", "value")])]), "<foo xmlns=\"/34\" xmlns:_=\"/34\" _:x=\"value\">|"
+  assert_eq enc_toks([sen("space", "foo", [at("", "xmlns", "space")]), se("foo", [at("", "xmlns", ""), at("", "x", "value"), at("space", "x", "value")])]), "<foo xmlns=\"space\" xmlns=\"space\"><foo xmlns=\"\" x=\"value\" xmlns:space=\"space\" space:x=\"value\">|"
+  assert_eq enc_toks([sen("space", "foo", [at("", "xmlns", "space")]), s0("foo")]), "<foo xmlns=\"space\" xmlns=\"space\"><foo>|"
+  assert_eq enc_toks([sen("some/space", "foo", [at("", "attr", "value"), at("some/space", "other", "other value")])]), "<foo xmlns=\"some/space\" attr=\"value\" xmlns:space=\"some/space\" space:other=\"other value\">|"
+  assert_eq enc_toks([sen("space", "foo", [at("", "xmlns", "space"), at("xmlns", "bar", "space"), at("space", "baz", "foo")]), sen("space", "baz", []), enn("space", "baz"), enn("space", "foo")]), "<foo xmlns=\"space\" xmlns=\"space\" xmlns:_xmlns=\"xmlns\" _xmlns:bar=\"space\" xmlns:space=\"space\" space:baz=\"foo\"><baz xmlns=\"space\"></baz></foo>|"
+  assert_eq enc_toks([sen("space", "foo", [at("", "xmlns", "space"), at("space", "baz", "foo")]), sen("space", "baz", []), enn("space", "baz"), enn("space", "foo")]), "<foo xmlns=\"space\" xmlns=\"space\" xmlns:space=\"space\" space:baz=\"foo\"><baz xmlns=\"space\"></baz></foo>|"
+  assert_eq enc_toks([se("foo", [at("", "xmlns", "space")]), sen("space", "bar", [at("space", "attr", "value")])]), "<foo xmlns=\"space\"><bar xmlns=\"space\" xmlns:space=\"space\" space:attr=\"value\">|"
+  assert_eq enc_toks([se("foo", [at("http://www.w3.org/2001/xmlSchema-instance", "nil", "true")])]), "<foo xmlns:_xmlSchema-instance=\"http://www.w3.org/2001/xmlSchema-instance\" _xmlSchema-instance:nil=\"true\">|"
+  assert_eq enc_toks([se("foo", [at("http://www.w3.org/2001/XMLSchema-instance", "nil", "true")])]), "<foo xmlns:_XMLSchema-instance=\"http://www.w3.org/2001/XMLSchema-instance\" _XMLSchema-instance:nil=\"true\">|"
+  assert_eq enc_toks([se("foo", [at("http://www.w3.org/2001/XmLSchema-instance", "nil", "true")])]), "<foo xmlns:_XmLSchema-instance=\"http://www.w3.org/2001/XmLSchema-instance\" _XmLSchema-instance:nil=\"true\">|"
+}
+
+test "ProcInstEncodeToken" {
+  buf = bytes.new_buffer([])
+  e = new_encoder(buf)
+  assert e.encode_token!(proc_inst("xml", "Instruction")).ok?, "the xml declaration as first token"
+  assert e.encode_token!(proc_inst("Target", "Instruction")).ok?, "a non-xml target"
+  assert !e.encode_token!(proc_inst("xml", "Instruction")).ok?, "the xml target only first"
+}
+
+test "DecodeEncode" {
+  input = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<?Target Instruction?>\n<root>\n</root>\n"
+  d = new_string_decoder(input)
+  out = bytes.new_buffer([])
+  e = new_encoder(out)
+  loop {
+    r = d.token!
+    break if !r.ok?
+    t = r.unwrap
+    break if t.none?
+    e.~encode_token!(t || cd(""))
+  }
+  e.~flush!
+  assert_eq out.string, input
+}
+
+test "IsValidDirective" {
+  ok = ["<>", "< < > >", "<!DOCTYPE '<' '>' '>' <!--nothing-->>", "<!DOCTYPE doc [ <!ELEMENT doc ANY> <!ELEMENT doc ANY> ]>", "<!DOCTYPE doc [ <!ELEMENT doc \"ANY> '<' <!E\" LEMENT '>' doc ANY> ]>", "<!DOCTYPE doc <!-- just>>>> a < comment --> [ <!ITEM anything> ] >"]
+  ko = ["<", ">", "<!--", "-->", "< > > < < >", "<!dummy <!-- > -->", "<!DOCTYPE doc '>", "<!DOCTYPE doc '>'", "<!DOCTYPE doc <!--comment>"]
+  for s in ok {
+    assert valid_directive?(s.bytes), "Directive #{s} is expected to be valid"
+  }
+  for s in ko {
+    assert !valid_directive?(s.bytes), "Directive #{s} is expected to be invalid"
+  }
+}
+
+test "SimpleUseOfEncodeToken" {
+  buf = bytes.new_buffer([])
+  e = new_encoder(buf)
+  e.~encode_token!(s0("object2"))
+  e.~encode_token!(en("object2"))
+  e.~flush!
+  assert_eq buf.string, "<object2></object2>"
+}
+
+test "Close" {
+  cases = [([s0("foo")], "<foo>", "unclosed tag <foo>"), ([s0("foo"), en("foo")], "<foo></foo>", ""), ([directive("foo")], "<!foo>", "")]
+  for c in cases {
+    out = bytes.new_buffer([])
+    e = new_encoder(out)
+    for t in c[0] {
+      e.~encode_token!(t)
+    }
+    r = e.close!
+    assert_eq r.err?.message || "", c[2]
+    assert_eq out.string, c[1]
+    assert !e.encode_token!(directive("foo")).ok?, "unexpected success when encoding after Close"
+  }
+}
+
+test "MarshalFlush" {
+  buf = bytes.new_buffer([])
+  e = new_encoder(buf)
+  e.~encode_token!(cd("hello world"))
+  assert_eq buf.size, 0
+  e.~flush!
+  assert_eq buf.string, "hello world"
+}
+
+test "Indent with tokens" {
+  e = new_buffer_encoder()
+  e.indent!(">", "  ")
+  e.~encode_token!(s0("a"))
+  e.~encode_token!(s0("b"))
+  e.~encode_token!(cd("x"))
+  e.~encode_token!(en("b"))
+  e.~encode_token!(s0("c"))
+  e.~encode_token!(en("c"))
+  e.~encode_token!(en("a"))
+  e.~flush!
+  assert_eq e.output, "><a>\n>  <b>x</b>\n>  <c></c>\n></a>"
+}

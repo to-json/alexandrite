@@ -1,0 +1,1085 @@
+# The XML tokenizer (Go's xml.go: Decoder, Token, RawToken, the name space
+# translation and the element stack).
+
+import "bytes"
+import "io"
+import "strconv"
+import "strings"
+import "unicode/utf8"
+
+STK_START = 0
+STK_NS = 1
+STK_EOF = 2
+
+# One record of the element stack: an open element (its raw name), an undo
+# record for a name space binding (local = prefix, space = old URL, ok = it
+# was bound), or the end marker of an Unmarshaler's element.
+struct StkEntry {
+  kind: Int
+  name: Name
+  ok: Bool
+}
+
+# The mutable part of a Decoder, kept in a one-element slice (D36).
+struct DecState {
+  # The input: a reader (refilling `inbuf`), or the whole input in `inbuf`.
+  rd: io.Reader?
+  # A token source instead of text (new_token_decoder).
+  src: [() -> ~Token?]
+  inbuf: [Byte]
+  ipos: Int
+  iend: Int
+  # The input is exhausted (Go: d.err == io.EOF).
+  eof: Bool
+  err: Error?
+  saving: Bool
+  saved: [Byte]
+  stk: [StkEntry]
+  stk_depth: Int
+  need_close: Bool
+  to_close: Name
+  next_token: Token?
+  next_byte: Int
+  ns: Map[Str, Str]
+  line: Int
+  linestart: Int
+  offset: Int
+  in_unmarshal: Bool
+}
+
+# An XML parser reading one input stream (Go's Decoder). The fields are
+# Go's exported fields; set them before reading. A Decoder is a handle:
+# copies read from the same stream.
+pub struct Decoder {
+  # Enforce the XML specification (default true). Without it the parser
+  # invents missing end tags, keeps unknown or malformed entities as they
+  # are, and accepts unquoted and value-less attributes.
+  strict: Bool
+  # With strict off: elements closed right after they open (HTML_AUTO_CLOSE).
+  auto_close: [Str]
+  # Entity names besides lt, gt, amp, apos and quot (html_entity()).
+  entity: Map[Str, Str]
+  # Converts input in a non-UTF-8 charset named by the XML declaration
+  # (Go's CharsetReader). It is given a reader of the rest of the input.
+  charset_reader: ((Str, io.Reader) -> ~io.Reader)?
+  # The name space of unprefixed element names, as if the input were
+  # wrapped in an element with xmlns="default_space".
+  default_space: Str
+  st: [DecState]
+
+  # ------------------------------------------------------------ the token API
+
+  # The next token, with name spaces translated and elements checked to
+  # nest and match; none at the end of the input (Go: nil, io.EOF). A
+  # self-closing <x/> comes as a start and an end token.
+  pub def token! -> ~Token? {
+    return none if st[0].stk.size > 0 && st[0].stk[st[0].stk.size - 1].kind == STK_EOF
+    tok = Token.CharData([])
+    if nt = st[0].next_token {
+      tok = nt
+      self.st[0].next_token = none
+    } else {
+      r = self.raw_tok!
+      if e = r.err {
+        fail e
+      }
+      t0 = r.unwrap
+      if t = t0 {
+        tok = t
+      } else {
+        n = st[0].stk.size
+        fail self.syntax_error("unexpected EOF") if n > 0 && st[0].stk[n - 1].kind != STK_EOF
+        return none
+      }
+    }
+    if !strict {
+      if t1 = self.auto_close_tok(tok) {
+        self.st[0].next_token = tok
+        tok = t1
+      }
+    }
+    case tok {
+      StartElement(s0) => {
+        s = s0
+        for a in s.attr {
+          if a.name.space == XMLNS_PREFIX {
+            self.push_ns!(a.name.local)
+            self.st[0].ns[a.name.local] = a.value
+          }
+          if a.name.space == "" && a.name.local == XMLNS_PREFIX {
+            self.push_ns!("")
+            self.st[0].ns[""] = a.value
+          }
+        }
+        self.push_element!(s.name)
+        s.name = self.translate(s.name, true)
+        attrs: [Attr] = []
+        for a in s.attr {
+          attrs << Attr.new(name: self.translate(a.name, false), value: a.value)
+        }
+        s.attr = attrs
+        return Token.StartElement(s)
+      }
+      EndElement(e0) => {
+        e = e0
+        if n = self.pop_element!(e) {
+          return Token.EndElement(EndElement.new(name: n))
+        }
+        fail st[0].err || XmlError.Other("xml: invalid end element")
+      }
+      _ => nil
+    }
+    tok
+  }
+
+  # The next token without name space translation or end element checks
+  # (Go's RawToken); none at the end of the input. Not allowed inside an
+  # Unmarshaler's unmarshal_xml!.
+  pub def raw_token! -> ~Token? {
+    fail err_raw_token() if st[0].in_unmarshal
+    self.~raw_tok!
+  }
+
+  # The input offset of the decoder's position: the end of the most
+  # recently returned token and the start of the next one.
+  pub def input_offset -> Int { st[0].offset }
+
+  # The line and the 1-based column of the decoder's position.
+  pub def input_pos -> (Int, Int) { (st[0].line, st[0].offset - st[0].linestart + 1) }
+
+  # Reads tokens until the end element matching the most recent start
+  # element already read, skipping nested elements (Go's Skip).
+  pub def skip! -> ~Unit {
+    depth = 0
+    loop {
+      t = self.~need_token!
+      case t {
+        StartElement(_) => depth += 1
+        EndElement(_) => {
+          return nil if depth == 0
+          depth -= 1
+        }
+        _ => nil
+      }
+    }
+  }
+
+  # ------------------------------------------------------------ for unmarshaling
+
+  # The next token; the end of the input is an error here (Go returns
+  # io.EOF from Token, and unmarshal returns it).
+  pub def need_token! -> ~Token {
+    t = self.~token!
+    if x = t {
+      return x
+    }
+    fail XmlError.Eof
+  }
+
+  # Fails with Go's errUnmarshalDepth when elements nest too deeply.
+  pub def check_depth -> ~Unit {
+    fail err_unmarshal_depth() if st[0].stk_depth > MAX_UNMARSHAL_DEPTH
+    nil
+  }
+
+  # The character data directly inside the current element (not in its
+  # children), reading up to its end element (Go's unmarshal of a simple
+  # value).
+  pub def read_text! -> ~[Byte] {
+    data: [Byte] = []
+    loop {
+      t = self.~need_token!
+      case t {
+        StartElement(_) => self.~skip!
+        EndElement(_) => {break}
+        CharData(b) => data = data + b
+        _ => nil
+      }
+    }
+    data
+  }
+
+  # The character data of an element as a string (Go's DecodeElement(&s,
+  # start) with a string s): the text directly inside it, children skipped;
+  # start none: the next element.
+  pub def decode_text!(start: StartElement?) -> ~Str {
+    if start.none? {
+      self.~find_start!
+    }
+    self.~check_depth
+    b = self.~read_text!
+    Str.from_bytes(b)
+  }
+
+  # The first start element from here on (Go's Decode looking for one).
+  pub def find_start! -> ~StartElement {
+    loop {
+      t = self.~need_token!
+      case t {
+        StartElement(s) => {return s}
+        _ => nil
+      }
+    }
+  }
+
+  # Start recording the raw input for an innerxml field: returns the
+  # position to record from.
+  pub def begin_inner! -> Int {
+    if !st[0].saving {
+      self.st[0].saving = true
+      self.st[0].saved = []
+      return 0
+    }
+    self.saved_offset
+  }
+
+  # The raw input recorded from `from` up to `to`; stops recording when
+  # `from` is 0 (the outermost innerxml field).
+  pub def end_inner!(from: Int, to: Int) -> [Byte] {
+    data = st[0].saved[from...to].dup
+    if from == 0 {
+      self.st[0].saving = false
+      self.st[0].saved = []
+    }
+    data
+  }
+
+  # The recorded raw input's length, before a byte read back with ungetc.
+  pub def saved_offset -> Int {
+    n = st[0].saved.size
+    n -= 1 if st[0].next_byte >= 0
+    n
+  }
+
+  # Reads the next element into a copy of v and returns it (Go's
+  # Decode(&v)); fails with XmlError.Eof if the input has no element.
+  pub def decode![T](v: T) -> ~T {
+    self.~decode_element!(v, none)
+  }
+
+  # Like decode!, with the element's start token already read (Go's
+  # DecodeElement); none: read up to the next start element.
+  pub def decode_element![T](v: T, start: StartElement?) -> ~T {
+    s = start || self.~find_start!
+    x = v
+    x.~xml_dec!(self, s)
+    x
+  }
+
+  # Starts an Unmarshaler's unmarshal_xml!: token! returns none after its
+  # element ends; raw_token! is refused. Returns the state to restore.
+  pub def begin_unmarshaler! -> Bool {
+    self.push_eof!
+    saved = st[0].in_unmarshal
+    self.st[0].in_unmarshal = true
+    saved
+  }
+
+  # Ends an Unmarshaler's unmarshal_xml!, which failed with err or must have
+  # consumed its element exactly (Go's unmarshalInterface).
+  pub def end_unmarshaler!(saved: Bool, err: Error?, type_name: Str, start: StartElement) -> ~Unit {
+    self.st[0].in_unmarshal = saved
+    if e = err {
+      self.pop_eof!
+      fail e
+    }
+    fail other("xml: #{type_name}.UnmarshalXML did not consume entire <#{start.name.local}> element") if !self.pop_eof!
+    nil
+  }
+
+  # For a TextUnmarshaler: the character data
+  # directly inside the element (Go's unmarshalTextInterface).
+  pub def element_text! -> ~[Byte] {
+    buf: [Byte] = []
+    depth = 1
+    while depth > 0 {
+      t = self.~need_token!
+      case t {
+        CharData(b) => {
+          buf = buf + b if depth == 1
+        }
+        StartElement(_) => depth += 1
+        EndElement(_) => depth -= 1
+        _ => nil
+      }
+    }
+    buf
+  }
+
+  # ------------------------------------------------------------ name spaces and the stack
+
+  def translate(n0: Name, element: Bool) -> Name {
+    n = n0
+    if n.space == XMLNS_PREFIX {
+      return n
+    }
+    if n.space == "" && !element {
+      return n
+    }
+    if n.space == XML_PREFIX {
+      n.space = XML_URL
+    } else if n.space == "" && n.local == XMLNS_PREFIX {
+      return n
+    }
+    if v = st[0].ns[n.space] {
+      n.space = v
+    } else if n.space == "" {
+      n.space = default_space
+    }
+    n
+  }
+
+  def push!(e: StkEntry) {
+    self.st[0].stk << e
+    self.st[0].stk_depth += 1 if e.kind == STK_START
+  }
+
+  def pop! -> StkEntry? {
+    n = st[0].stk.size
+    return none if n == 0
+    e = st[0].stk[n - 1]
+    self.st[0].stk = st[0].stk[0...n - 1]
+    self.st[0].stk_depth -= 1 if e.kind == STK_START
+    e
+  }
+
+  def push_element!(name: Name) {
+    self.push!(StkEntry.new(kind: STK_START, name: name))
+  }
+
+  def push_ns!(local: Str) {
+    old = st[0].ns[local]
+    self.push!(StkEntry.new(kind: STK_NS, name: Name.new(space: old || "", local: local), ok: !old.none?))
+  }
+
+  # After the current element ends, token! returns none until pop_eof!.
+  def push_eof! {
+    stk = st[0].stk
+    i = stk.size - 1
+    while stk[i].kind != STK_START {
+      i -= 1
+    }
+    while i > 0 && stk[i - 1].kind == STK_NS {
+      i -= 1
+    }
+    out: [StkEntry] = []
+    out = out + stk[0...i]
+    out << StkEntry.new(kind: STK_EOF)
+    out = out + stk[i...stk.size]
+    self.st[0].stk = out
+  }
+
+  def pop_eof! -> Bool {
+    n = st[0].stk.size
+    return false if n == 0 || st[0].stk[n - 1].kind != STK_EOF
+    self.pop!
+    true
+  }
+
+  def syntax_error(msg: Str) -> Error { XmlError.Syntax(msg: msg, line: st[0].line) }
+
+  def set_err!(e: Error) { self.st[0].err = e }
+
+  # Checks the end element against the open one and undoes the name space
+  # bindings of the element; the translated name, or none (error in st).
+  def pop_element!(t: EndElement) -> Name? {
+    s0 = self.pop!
+    name = t.name
+    s = s0 || StkEntry.new(kind: STK_NS)
+    if s0.none? || s.kind != STK_START {
+      self.set_err!(self.syntax_error("unexpected end element </#{name.local}>"))
+      return none
+    }
+    if s.name.local != name.local {
+      if !strict {
+        self.st[0].need_close = true
+        self.st[0].to_close = t.name
+        return s.name
+      }
+      self.set_err!(self.syntax_error("element <#{s.name.local}> closed by </#{name.local}>"))
+      return none
+    }
+    if s.name.space != name.space {
+      ns = name.space == "" ? "\"\"" : name.space
+      self.set_err!(self.syntax_error("element <#{s.name.local}> in space #{s.name.space} closed by </#{name.local}> in space #{ns}"))
+      return none
+    }
+    out = self.translate(t.name, true)
+    loop {
+      n = st[0].stk.size
+      break if n == 0
+      k = st[0].stk[n - 1].kind
+      break if k == STK_START || k == STK_EOF
+      e = self.pop! || StkEntry.new
+      if e.ok {
+        self.st[0].ns[e.name.local] = e.name.space
+      } else {
+        self.st[0].ns.delete(e.name.local)
+      }
+    }
+    out
+  }
+
+  # The end element to invent when the open element auto-closes and t
+  # doesn't close it.
+  def auto_close_tok(t: Token) -> Token? {
+    n = st[0].stk.size
+    return none if n == 0 || st[0].stk[n - 1].kind != STK_START
+    top = st[0].stk[n - 1].name
+    for s in auto_close {
+      if strings.equal_fold(s, top.local) {
+        case t {
+          EndElement(et) => {
+            return none if strings.equal_fold(et.name.local, top.local)
+          }
+          _ => nil
+        }
+        return Token.EndElement(EndElement.new(name: top))
+      }
+    }
+    none
+  }
+
+  # ------------------------------------------------------------ reading bytes
+
+  # Refills the input buffer; false at the end of the input or on an error.
+  def fill! -> Bool {
+    if r0 = st[0].rd {
+      r = r0
+      if st[0].inbuf.size == 0 {
+        b: [Byte] = [0; 4096]
+        self.st[0].inbuf = b
+      }
+      loop {
+        res = r.read!(st[0].inbuf)
+        self.st[0].rd = r
+        if e = res.err {
+          self.set_err!(e)
+          return false
+        }
+        n = res.unwrap
+        if n > 0 {
+          self.st[0].ipos = 0
+          self.st[0].iend = n
+          return true
+        }
+        self.st[0].eof = true
+        return false
+      }
+    }
+    self.st[0].eof = true
+    false
+  }
+
+  # One byte, or -1 (the error, or the end, is in the state). Counts lines.
+  def getc! -> Int {
+    return -1 if !st[0].err.none? || st[0].eof
+    b = 0
+    if st[0].next_byte >= 0 {
+      b = st[0].next_byte
+      self.st[0].next_byte = -1
+    } else {
+      if st[0].ipos >= st[0].iend {
+        return -1 if !self.fill!
+      }
+      b = st[0].inbuf[st[0].ipos].to_i
+      self.st[0].ipos += 1
+      self.st[0].saved << b.as_u8 if st[0].saving
+    }
+    if b == 0x0A {
+      self.st[0].line += 1
+      self.st[0].linestart = st[0].offset + 1
+    }
+    self.st[0].offset += 1
+    b
+  }
+
+  # Like getc!, but the end of the input is a syntax error.
+  def mustgetc! -> Int {
+    b = self.getc!
+    if b < 0 && st[0].err.none? && st[0].eof {
+      self.set_err!(self.syntax_error("unexpected EOF"))
+    }
+    b
+  }
+
+  def ungetc!(b: Int) {
+    self.st[0].line -= 1 if b == 0x0A
+    self.st[0].next_byte = b
+    self.st[0].offset -= 1
+  }
+
+  # A failure at a -1 from getc!/mustgetc!: the stored error, or none at the
+  # plain end of the input.
+  def stop -> ~Token? {
+    if e = st[0].err {
+      fail e
+    }
+    none
+  }
+
+  def space! {
+    loop {
+      b = self.getc!
+      return if b < 0
+      if b != 0x20 && b != 0x0D && b != 0x0A && b != 0x09 {
+        self.ungetc!(b)
+        return
+      }
+    }
+  }
+
+  # ------------------------------------------------------------ the tokenizer
+
+  def raw_tok! -> ~Token? {
+    if st[0].src.size > 0 {
+      f = st[0].src[0]
+      return ~f.call
+    }
+    if e = st[0].err {
+      fail e
+    }
+    if st[0].need_close {
+      self.st[0].need_close = false
+      return Token.EndElement(EndElement.new(name: st[0].to_close))
+    }
+    b = self.getc!
+    return self.~stop if b < 0
+    if b != 0x3C {
+      self.ungetc!(b)
+      if data = self.text!(-1, false) {
+        return Token.CharData(data)
+      }
+      return self.~stop
+    }
+    b = self.mustgetc!
+    return self.~stop if b < 0
+    if b == 0x2F {
+      # </: an end element
+      nm = self.nsname!
+      if name = nm {
+        self.space!
+        b = self.mustgetc!
+        return self.~stop if b < 0
+        if b != 0x3E {
+          self.set_err!(self.syntax_error("invalid characters between </#{name.local} and >"))
+          return self.~stop
+        }
+        return Token.EndElement(EndElement.new(name: name))
+      }
+      self.set_err!(self.syntax_error("expected element name after </")) if st[0].err.none?
+      return self.~stop
+    }
+    if b == 0x3F {
+      return self.~proc_inst!
+    }
+    if b == 0x21 {
+      return self.~bang!
+    }
+    # An open element like <a href="foo">.
+    self.ungetc!(b)
+    nm = self.nsname!
+    name = nm || Name.new
+    if nm.none? {
+      self.set_err!(self.syntax_error("expected element name after <")) if st[0].err.none?
+      return self.~stop
+    }
+    attrs: [Attr] = []
+    empty = false
+    loop {
+      self.space!
+      b = self.mustgetc!
+      return self.~stop if b < 0
+      if b == 0x2F {
+        empty = true
+        b = self.mustgetc!
+        return self.~stop if b < 0
+        if b != 0x3E {
+          self.set_err!(self.syntax_error("expected /> in element"))
+          return self.~stop
+        }
+        break
+      }
+      break if b == 0x3E
+      self.ungetc!(b)
+      an = self.nsname!
+      aname = an || Name.new
+      if an.none? {
+        self.set_err!(self.syntax_error("expected attribute name in element")) if st[0].err.none?
+        return self.~stop
+      }
+      self.space!
+      b = self.mustgetc!
+      return self.~stop if b < 0
+      value = ""
+      if b != 0x3D {
+        if strict {
+          self.set_err!(self.syntax_error("attribute name without = in element"))
+          return self.~stop
+        }
+        self.ungetc!(b)
+        value = aname.local
+      } else {
+        self.space!
+        if data = self.attrval! {
+          value = Str.from_bytes(data)
+        } else {
+          return self.~stop
+        }
+      }
+      attrs << Attr.new(name: aname, value: value)
+    }
+    if empty {
+      self.st[0].need_close = true
+      self.st[0].to_close = name
+    }
+    Token.StartElement(StartElement.new(name: name, attr: attrs))
+  }
+
+  # <?target inst?>
+  def proc_inst! -> ~Token? {
+    tg = self.name!
+    target = tg || ""
+    if tg.none? {
+      self.set_err!(self.syntax_error("expected target name after <?")) if st[0].err.none?
+      return self.~stop
+    }
+    self.space!
+    buf: [Byte] = []
+    b0 = 0
+    loop {
+      b = self.mustgetc!
+      return self.~stop if b < 0
+      buf << b.as_u8
+      break if b0 == 0x3F && b == 0x3E
+      b0 = b
+    }
+    data = buf[0...buf.size - 2]
+    if target == "xml" {
+      content = Str.from_bytes(data)
+      ver = proc_inst_param("version", content)
+      if ver != "" && ver != "1.0" {
+        self.set_err!(XmlError.Other("xml: unsupported version #{strconv.quote(ver)}; only version 1.0 is supported"))
+        return self.~stop
+      }
+      enc = proc_inst_param("encoding", content)
+      if enc != "" && enc != "utf-8" && enc != "UTF-8" && !strings.equal_fold(enc, "utf-8") {
+        if cr = charset_reader {
+          rest = self.rest_reader!
+          res = cr.call(enc, rest)
+          if e = res.err {
+            self.set_err!(XmlError.Other("xml: opening charset #{strconv.quote(enc)}: #{e.message}"))
+            return self.~stop
+          }
+          self.st[0].rd = res.unwrap
+          self.st[0].ipos = 0
+          self.st[0].iend = 0
+          self.st[0].inbuf = []
+          self.st[0].eof = false
+        } else {
+          self.set_err!(XmlError.Other("xml: encoding #{strconv.quote(enc)} declared but Decoder.CharsetReader is nil"))
+          return self.~stop
+        }
+      }
+    }
+    Token.ProcInst(ProcInst.new(target: target, inst: data))
+  }
+
+  # A reader of the input not read yet (for a charset reader).
+  def rest_reader! -> io.Reader {
+    rest: [Byte] = st[0].inbuf[st[0].ipos...st[0].iend].dup
+    if r0 = st[0].rd {
+      r = r0
+      more = io.read_all(r)
+      self.st[0].rd = r
+      if m = more.ok {
+        rest = rest + m
+      }
+    }
+    bytes.new_reader(rest)
+  }
+
+  # <!-- comments -->, <![CDATA[ sections ]]> and <!directives>.
+  def bang! -> ~Token? {
+    b = self.mustgetc!
+    return self.~stop if b < 0
+    if b == 0x2D {
+      b = self.mustgetc!
+      return self.~stop if b < 0
+      if b != 0x2D {
+        self.set_err!(self.syntax_error("invalid sequence <!- not part of <!--"))
+        return self.~stop
+      }
+      buf: [Byte] = []
+      b0 = 0
+      b1 = 0
+      loop {
+        b = self.mustgetc!
+        return self.~stop if b < 0
+        buf << b.as_u8
+        if b0 == 0x2D && b1 == 0x2D {
+          if b != 0x3E {
+            self.set_err!(self.syntax_error("invalid sequence \"--\" not allowed in comments"))
+            return self.~stop
+          }
+          break
+        }
+        b0 = b1
+        b1 = b
+      }
+      return Token.Comment(buf[0...buf.size - 3])
+    }
+    if b == 0x5B {
+      cd = "CDATA["
+      i = 0
+      while i < 6 {
+        b = self.mustgetc!
+        return self.~stop if b < 0
+        if b != cd[i].to_i {
+          self.set_err!(self.syntax_error("invalid <![ sequence"))
+          return self.~stop
+        }
+        i += 1
+      }
+      if data = self.text!(-1, true) {
+        return Token.CharData(data)
+      }
+      return self.~stop
+    }
+    # A directive: <!DOCTYPE ...>, <!ENTITY ...>, ... Quoted angle brackets
+    # don't count for nesting; comments inside become one space.
+    buf: [Byte] = [b.as_u8]
+    inquote = 0
+    depth = 0
+    pending = -1
+    loop {
+      if pending >= 0 {
+        b = pending
+        pending = -1
+      } else {
+        b = self.mustgetc!
+        return self.~stop if b < 0
+        break if inquote == 0 && b == 0x3E && depth == 0
+      }
+      buf << b.as_u8
+      if b == inquote {
+        inquote = 0
+      } else if inquote != 0 {
+        nil
+      } else if b == 0x27 || b == 0x22 {
+        inquote = b
+      } else if b == 0x3E {
+        depth -= 1
+      } else if b == 0x3C {
+        s = "!--"
+        i = 0
+        matched = true
+        while i < 3 {
+          b = self.mustgetc!
+          return self.~stop if b < 0
+          if b != s[i].to_i {
+            j = 0
+            while j < i {
+              buf << s[j]
+              j += 1
+            }
+            depth += 1
+            matched = false
+            break
+          }
+          i += 1
+        }
+        if !matched {
+          # Go's `goto HandleB`: handle this byte like any other.
+          pending = b
+          next
+        }
+        buf = buf[0...buf.size - 1]
+        c0 = 0
+        c1 = 0
+        loop {
+          b = self.mustgetc!
+          return self.~stop if b < 0
+          break if c0 == 0x2D && c1 == 0x2D && b == 0x3E
+          c0 = c1
+          c1 = b
+        }
+        buf << 0x20
+      }
+    }
+    Token.Directive(buf)
+  }
+
+  def attrval! -> [Byte]? {
+    b = self.mustgetc!
+    return none if b < 0
+    if b == 0x22 || b == 0x27 {
+      return self.text!(b, false)
+    }
+    if strict {
+      self.set_err!(self.syntax_error("unquoted or missing attribute value in element"))
+      return none
+    }
+    self.ungetc!(b)
+    buf: [Byte] = []
+    loop {
+      b = self.mustgetc!
+      return none if b < 0
+      if b >= 0x61 && b <= 0x7A || b >= 0x41 && b <= 0x5A || b >= 0x30 && b <= 0x39 || b == 0x5F || b == 0x3A || b == 0x2D {
+        buf << b.as_u8
+      } else {
+        self.ungetc!(b)
+        break
+      }
+    }
+    buf
+  }
+
+  # Character data up to `<` (quote < 0, not cdata), the closing quote
+  # (quote >= 0), or `]]>` (cdata). Entities are replaced and \r\n / \r
+  # become \n. None on failure (the error is in the state).
+  def text!(quote: Int, cdata: Bool) -> [Byte]? {
+    b0 = 0
+    b1 = 0
+    trunc = 0
+    buf: [Byte] = []
+    loop {
+      b = self.getc!
+      if b < 0 {
+        if cdata {
+          if st[0].err.none? && st[0].eof {
+            self.set_err!(self.syntax_error("unexpected EOF in CDATA section"))
+          }
+          return none
+        }
+        break
+      }
+      if quote < 0 && b0 == 0x5D && b1 == 0x5D && b == 0x3E {
+        if cdata {
+          trunc = 2
+          break
+        }
+        self.set_err!(self.syntax_error("unescaped ]]> not in CDATA section"))
+        return none
+      }
+      if b == 0x3C && !cdata {
+        if quote >= 0 {
+          self.set_err!(self.syntax_error("unescaped < inside quoted string"))
+          return none
+        }
+        self.ungetc!(0x3C)
+        break
+      }
+      break if quote >= 0 && b == quote
+      if b == 0x26 && !cdata {
+        before = buf.size
+        buf << 0x26
+        text = ""
+        have = false
+        b = self.mustgetc!
+        return none if b < 0
+        if b == 0x23 {
+          buf << 0x23
+          b = self.mustgetc!
+          return none if b < 0
+          base = 10
+          if b == 0x78 {
+            base = 16
+            buf << 0x78
+            b = self.mustgetc!
+            return none if b < 0
+          }
+          start = buf.size
+          while b >= 0x30 && b <= 0x39 || base == 16 && b >= 0x61 && b <= 0x66 || base == 16 && b >= 0x41 && b <= 0x46 {
+            buf << b.as_u8
+            b = self.mustgetc!
+            return none if b < 0
+          }
+          if b != 0x3B {
+            self.ungetc!(b)
+          } else {
+            s = Str.from_bytes(buf[start...buf.size])
+            buf << 0x3B
+            n = strconv.parse_uint(s, base, 64)
+            if v = n.ok {
+              if v <= 0x10FFFF {
+                text = Str.from_bytes(utf8.encode_rune(v.to_i.to_i32))
+                have = true
+              }
+            }
+          }
+        } else {
+          self.ungetc!(b)
+          nb = self.read_name!
+          if nb.none? {
+            return none if !st[0].err.none?
+          }
+          nm: [Byte] = nb || []
+          buf = buf + nm
+          b = self.mustgetc!
+          return none if b < 0
+          if b != 0x3B {
+            self.ungetc!(b)
+          } else {
+            buf << 0x3B
+            name = Str.from_bytes(nm)
+            if name_str?(name) {
+              if r = std_entity(name) {
+                text = r
+                have = true
+              } else if v = entity[name] {
+                text = v
+                have = true
+              }
+            }
+          }
+        }
+        if have {
+          buf = buf[0...before] + text.bytes
+          b0 = 0
+          b1 = 0
+          next
+        }
+        if !strict {
+          b0 = 0
+          b1 = 0
+          next
+        }
+        ent = Str.from_bytes(buf[before...buf.size])
+        ent = ent + " (no semicolon)" if ent[ent.size - 1] != 0x3B
+        self.set_err!(self.syntax_error("invalid character entity #{ent}"))
+        return none
+      }
+      if b == 0x0D {
+        buf << 0x0A
+      } else if b1 == 0x0D && b == 0x0A {
+        nil
+      } else {
+        buf << b.as_u8
+      }
+      b0 = b1
+      b1 = b
+    }
+    data = buf[0...buf.size - trunc]
+    s = Str.from_bytes(data)
+    i = 0
+    while i < s.size {
+      if s[i] < 0x80 {
+        c = s[i].to_i
+        if c < 0x20 && c != 0x09 && c != 0x0A && c != 0x0D {
+          self.set_err!(self.syntax_error("illegal character code #{rune_name(c)}"))
+          return none
+        }
+        i += 1
+        next
+      }
+      r, size = utf8.decode_rune_at(s, i)
+      if r == utf8.RUNE_ERROR && size == 1 {
+        self.set_err!(self.syntax_error("invalid UTF-8"))
+        return none
+      }
+      i += size
+      if !in_character_range?(r.to_i) {
+        self.set_err!(self.syntax_error("illegal character code #{rune_name(r.to_i)}"))
+        return none
+      }
+    }
+    data
+  }
+
+  # A name with an optional prefix (`space:local`); none if there is none
+  # (the error is set only for the end of the input or a bad name).
+  def nsname! -> Name? {
+    s0 = self.name!
+    return none if s0.none?
+    s = s0 || ""
+    return none if strings.count(s, ":") > 1
+    if c = strings.cut(s, ":") {
+      if c[0] != "" && c[1] != "" {
+        return Name.new(space: c[0], local: c[1])
+      }
+    }
+    Name.new(local: s)
+  }
+
+  def name! -> Str? {
+    b0 = self.read_name!
+    return none if b0.none?
+    b: [Byte] = b0 || []
+    s = Str.from_bytes(b)
+    if !name_str?(s) {
+      self.set_err!(self.syntax_error("invalid XML name: #{s}"))
+      return none
+    }
+    s
+  }
+
+  # The bytes of a name, delimited by any single-byte character not valid in
+  # names (multi-byte characters are all taken; the caller checks them).
+  def read_name! -> [Byte]? {
+    b = self.mustgetc!
+    return none if b < 0
+    if b < 0x80 && !name_byte?(b.as_u8) {
+      self.ungetc!(b)
+      return none
+    }
+    buf: [Byte] = [b.as_u8]
+    loop {
+      b = self.mustgetc!
+      return none if b < 0
+      if b < 0x80 && !name_byte?(b.as_u8) {
+        self.ungetc!(b)
+        break
+      }
+      buf << b.as_u8
+    }
+    buf
+  }
+}
+
+def std_entity(name: Str) -> Str? {
+  case name {
+    "lt" => "<"
+    "gt" => ">"
+    "amp" => "&"
+    "apos" => "'"
+    "quot" => "\""
+    _ => none
+  }
+}
+
+# Go's %U.
+def rune_name(r: Int) -> Str {
+  h = strings.to_upper(strconv.format_int(r, 16))
+  h = "0" * (4 - h.size) + h if h.size < 4
+  "U+#{h}"
+}
+
+def new_state(rd: io.Reader?, inbuf: [Byte]) -> DecState {
+  DecState.new(rd: rd, inbuf: inbuf, iend: inbuf.size, next_byte: -1, line: 1, ns: {}, stk: [], src: [], saved: [])
+}
+
+# A Decoder reading r (Go's NewDecoder).
+pub def new_decoder(r: io.Reader) -> Decoder {
+  Decoder.new(strict: true, st: [new_state(r, [])])
+}
+
+# A Decoder reading the bytes of data (as Go's NewDecoder(bytes.NewReader(data))).
+pub def new_bytes_decoder(data: [Byte]) -> Decoder {
+  Decoder.new(strict: true, st: [new_state(none, data)])
+}
+
+# A Decoder reading the text s.
+pub def new_string_decoder(s: Str) -> Decoder { new_bytes_decoder(s.bytes) }
+
+# A Decoder over a token stream (Go's NewTokenDecoder): `t.token!` gives
+# the tokens, none at the end. t is any value with `token! -> ~Token?`
+# (Go's TokenReader); Decoder.token! does the nesting checks and name space
+# translation over it.
+pub def new_token_decoder[T](t: T) -> Decoder {
+  src = t
+  f = ->() -> ~Token? { src.~token! }
+  st = new_state(none, [])
+  st.src = [f]
+  Decoder.new(strict: true, st: [st])
+}

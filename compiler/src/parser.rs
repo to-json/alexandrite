@@ -1907,7 +1907,12 @@ impl<'a> Parser<'a> {
     fn at_jump(&self) -> bool {
         match self.peek() {
             Tok::Kw(Kw::Return) | Tok::Kw(Kw::Break) | Tok::Kw(Kw::Next) => true,
-            Tok::Ident(n) => n == "fail" && !self.is_local("fail") && !matches!(self.peek_at(1), Tok::Op("(") | Tok::Op("=")),
+            // (`fail` takes an error; without one it may be a def's name.)
+            Tok::Ident(n) => {
+                n == "fail"
+                    && !self.is_local("fail")
+                    && !matches!(self.peek_at(1), Tok::Op("(") | Tok::Op("=") | Tok::Op(";") | Tok::Op("}") | Tok::Op(")") | Tok::Op(",") | Tok::Op("]") | Tok::Newline | Tok::Eof)
+            }
             _ => false,
         }
     }

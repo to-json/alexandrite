@@ -702,7 +702,7 @@ impl<'a> Parser<'a> {
             }
             // `#[json("name")]` before a variant.
             if let Tok::Attr(a) = self.peek().clone() {
-                if a.trim_start().starts_with("json") || a.trim_start().starts_with("asn1") {
+                if a.trim_start().starts_with("json") || a.trim_start().starts_with("asn1") || a.trim_start().starts_with("field") {
                     let asp = self.bump().span;
                     crate::derive::apply_field_attr(&a, asp, &mut vpend)?;
                     continue;
@@ -795,7 +795,7 @@ impl<'a> Parser<'a> {
             }
             // `#[json("name")]`, `#[json(omit_empty)]`, `#[json(skip)]` on the next field.
             if let Tok::Attr(a) = self.peek().clone() {
-                if a.trim_start().starts_with("json") || a.trim_start().starts_with("asn1") {
+                if a.trim_start().starts_with("json") || a.trim_start().starts_with("asn1") || a.trim_start().starts_with("field") {
                     let asp = self.bump().span;
                     crate::derive::apply_field_attr(&a, asp, &mut pend)?;
                     continue;

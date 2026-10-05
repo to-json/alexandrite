@@ -39,10 +39,64 @@ pub struct Opts {
 
 /// A field or variant attribute: `#[json(...)]` or `#[asn1(...)]`.
 pub fn apply_field_attr(text: &str, sp: Span, o: &mut Opts) -> Result<(), Diag> {
+    if text.trim_start().starts_with("field") {
+        for (fmt, tag) in field_attr(text, sp)? {
+            match fmt.as_str() {
+                "json" => apply_json_tag(&tag, o),
+                "asn1" => crate::derive_asn1::apply_asn1_attr(&format!("asn1({tag})"), sp, &mut o.asn1)?,
+                // Other formats' derives read their own key.
+                _ => {}
+            }
+        }
+        return Ok(());
+    }
     if text.trim_start().starts_with("asn1") {
         return crate::derive_asn1::apply_asn1_attr(text, sp, &mut o.asn1);
     }
     apply_json_attr(text, sp, o)
+}
+
+/// The `format: "tag"` pairs of a `#[field(json: "name,omitempty", asn1:
+/// "explicit,tag:0")]` attribute: Go's struct tag in alx syntax (S5), one
+/// entry per format; each derive reads its own key.
+pub fn field_attr(text: &str, sp: Span) -> Result<Vec<(String, String)>, Diag> {
+    let inner = text.trim().strip_prefix("field").map(str::trim_start).and_then(|r| r.strip_prefix('(')).and_then(|r| r.trim_end().strip_suffix(')'));
+    let Some(inner) = inner else {
+        return Err(Diag::new(sp, format!("unknown attribute `#[{text}]`")).note(r#"write #[field(json: "name,omitempty", asn1: "explicit,tag:0")]"#));
+    };
+    let mut out = vec![];
+    for a in split_args(inner) {
+        let a = a.trim();
+        if a.is_empty() {
+            continue;
+        }
+        let Some((k, v)) = a.split_once(':') else {
+            return Err(Diag::new(sp, format!(r#"`{a}` in #[field(...)]: write `format: "tag"`"#)));
+        };
+        let v = v.trim();
+        let Some(v) = v.strip_prefix('"').and_then(|v| v.strip_suffix('"')) else {
+            return Err(Diag::new(sp, format!("`{a}` in #[field(...)]: the tag is a string")));
+        };
+        out.push((k.trim().to_string(), unescape(v)));
+    }
+    Ok(out)
+}
+
+/// Go's json struct tag: "name,omitempty", "-" (skip), ",omitempty".
+fn apply_json_tag(tag: &str, o: &mut Opts) {
+    if tag == "-" {
+        o.skip = true;
+        return;
+    }
+    let mut parts = tag.split(',');
+    if let Some(n) = parts.next().filter(|n| !n.is_empty()) {
+        o.rename = Some(n.to_string());
+    }
+    for p in parts {
+        if p == "omitempty" || p == "omit_empty" {
+            o.omit_empty = true;
+        }
+    }
 }
 
 /// Parse the text of one `#[json(...)]` attribute into `o`.

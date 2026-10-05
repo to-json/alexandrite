@@ -42,7 +42,7 @@ mod rt {
         alxj_die_str, alxj_panic_str, alxj_exit, alxj_now_ns, alxj_cap_begin, alxj_cap_end, alxj_file_status, alxj_file_read_or_empty,
         alxj_ffi_enter, alxj_ffi_save_errno, alxj_cstr_new, alxj_cstr_free, alxj_errno, alxj_strerror, alxj_str_from_cstr, alxj_str_from_ptr,
         alx_sys_open, alx_sys_fcntl, alx_sys_const, alx_sys_stat, alx_sys_fstat, alx_sys_dir_open, alx_sys_dir_next, alx_sys_dir_close, alx_environ, alx_sys_spawn, alx_sys_wait, alx_sys_pipe, alx_sys_exec, alx_sys_poll2, alx_argc, alx_argv, alx_sleep_ns, alx_wall_ns, alx_mono_ns, alx_local_offset, alx_local_zone,
-        alx_fd_wait, alx_fd_close, alx_sock_listen, alx_sock_accept, alx_sock_connect, alx_sock_error, alx_sock_local_addr, alx_sock_peer_addr, alx_sock_set_nodelay, alx_sock_shutdown, alx_sock_lookup, alx_mem_held, alx_mem_peak,
+        alx_fd_wait, alx_fd_close, alx_sock_listen, alx_sock_accept, alx_sock_connect, alx_sock_error, alx_sock_local_addr, alx_sock_peer_addr, alx_sock_set_nodelay, alx_sock_shutdown, alx_sock_lookup, alx_sock_open, alx_sock_recvfrom, alx_mem_held, alx_mem_peak,
         alx_sig_watch, alx_sig_unwatch, alx_sig_reset, alx_sig_ignored, alx_user_lookup, alx_user_groups,
         alxj_spawn, alxj_task_wait, alxj_lock_new, alxj_lock, alxj_unlock, alxj_atomic_new, alxj_chan_new, alxj_chan_len, alxj_chan_send, alxj_chan_recv, alxj_chan_close, alxj_select,
     );
@@ -245,6 +245,8 @@ fn resolve_c_symbol(name: &str) -> Option<usize> {
         "alx_sock_set_nodelay" => Some(rt::alx_sock_set_nodelay as usize),
         "alx_sock_shutdown" => Some(rt::alx_sock_shutdown as usize),
         "alx_sock_lookup" => Some(rt::alx_sock_lookup as usize),
+        "alx_sock_open" => Some(rt::alx_sock_open as usize),
+        "alx_sock_recvfrom" => Some(rt::alx_sock_recvfrom as usize),
         "alx_sig_watch" => Some(rt::alx_sig_watch as usize),
         "alx_sig_unwatch" => Some(rt::alx_sig_unwatch as usize),
         "alx_sig_reset" => Some(rt::alx_sig_reset as usize),

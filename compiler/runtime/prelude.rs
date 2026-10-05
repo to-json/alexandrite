@@ -759,6 +759,18 @@ mod rt {
     pub unsafe fn shim_alx_sock_accept(fd: i64, out: *mut u8) -> i64 {
         use std::os::fd::{FromRawFd, IntoRawFd};
         if fd < 0 { return -(sysc("EBADF") as i64); }
+        let ul = std::mem::ManuallyDrop::new(unsafe { std::os::unix::net::UnixListener::from_raw_fd(fd as i32) });
+        if ul.local_addr().is_ok() {
+            // A Unix stream listener: the peer has no address.
+            return match ul.accept() {
+                Ok((s, _)) => {
+                    let _ = s.set_nonblocking(true);
+                    put_str("", out);
+                    s.into_raw_fd() as i64
+                }
+                Err(e) => net_err(&e),
+            };
+        }
         let l = std::mem::ManuallyDrop::new(unsafe { std::net::TcpListener::from_raw_fd(fd as i32) });
         match l.accept() {
             Ok((s, a)) => {
@@ -803,15 +815,88 @@ mod rt {
         if fd < 0 { return -(sysc("EBADF") as i64); }
         with_stream(fd, |s| match s.local_addr() {
             Ok(a) => put_addr(a, out),
-            Err(e) => net_err(&e),
+            Err(e) => unix_addr(fd, false, out).unwrap_or_else(|| net_err(&e)),
         })
     }
     pub unsafe fn shim_alx_sock_peer_addr(fd: i64, out: *mut u8) -> i64 {
         if fd < 0 { return -(sysc("EBADF") as i64); }
         with_stream(fd, |s| match s.peer_addr() {
             Ok(a) => put_addr(a, out),
-            Err(e) => net_err(&e),
+            Err(e) => unix_addr(fd, true, out).unwrap_or_else(|| net_err(&e)),
         })
+    }
+    /// A Unix socket's own (or peer's) path, as the C runtime writes it; None
+    /// if fd isn't a Unix socket.
+    fn unix_addr(fd: i64, peer: bool, out: *mut u8) -> Option<i64> {
+        use std::os::fd::FromRawFd;
+        let s = std::mem::ManuallyDrop::new(unsafe { std::os::unix::net::UnixDatagram::from_raw_fd(fd as i32) });
+        let a = if peer { s.peer_addr() } else { s.local_addr() }.ok()?;
+        Some(put_str(&a.as_pathname().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default(), out))
+    }
+    fn put_str(s: &str, out: *mut u8) -> i64 {
+        let n = s.len().min(63);
+        unsafe {
+            std::ptr::copy_nonoverlapping(s.as_ptr(), out, n);
+            *out.add(n) = 0;
+        }
+        n as i64
+    }
+    // UDP and Unix-domain sockets (alx_sock_open / alx_sock_recvfrom in alx.c).
+    pub unsafe fn shim_alx_sock_open(kind: i64, host: *const std::ffi::c_char, port: i64, listen: i64, _backlog: i64) -> i64 {
+        use std::os::fd::IntoRawFd;
+        use std::os::unix::net::{UnixDatagram, UnixListener, UnixStream};
+        let h = host_str(host);
+        let fd = match (kind, listen != 0) {
+            (2, false) => UnixStream::connect(&h).map(|s| s.into_raw_fd()),
+            (2, true) => UnixListener::bind(&h).map(|s| s.into_raw_fd()),
+            (3, false) => UnixDatagram::unbound().and_then(|s| s.connect(&h).map(|_| s.into_raw_fd())),
+            (3, true) => UnixDatagram::bind(&h).map(|s| s.into_raw_fd()),
+            (_, l) => {
+                use std::net::ToSocketAddrs;
+                let hh = if !h.is_empty() { h.clone() } else if l { "0.0.0.0".into() } else { "127.0.0.1".into() };
+                let addrs: Vec<_> = match (hh.as_str(), port as u16).to_socket_addrs() {
+                    Ok(a) => a.collect(),
+                    Err(_) => return -100000,
+                };
+                let Some(a) = addrs.iter().find(|a| a.is_ipv4()).or(addrs.first()).copied() else { return -100000 };
+                if l {
+                    std::net::UdpSocket::bind(a).map(|s| s.into_raw_fd())
+                } else {
+                    let any: std::net::SocketAddr = if a.is_ipv4() { "0.0.0.0:0".parse().unwrap() } else { "[::]:0".parse().unwrap() };
+                    std::net::UdpSocket::bind(any).and_then(|s| s.connect(a).map(|_| s.into_raw_fd()))
+                }
+            }
+        };
+        match fd {
+            Ok(fd) => {
+                let fl = unsafe { libc_fcntl(fd, 3) }; // F_GETFL
+                unsafe { libc_fcntl(fd, 4, fl | sysc("O_NONBLOCK")) }; // F_SETFL
+                fd as i64
+            }
+            Err(e) => net_err(&e),
+        }
+    }
+    pub unsafe fn shim_alx_sock_recvfrom(fd: i64, buf: *mut u8, n: i64, out: *mut u8) -> i64 {
+        use std::os::fd::FromRawFd;
+        let b = unsafe { std::slice::from_raw_parts_mut(buf, n as usize) };
+        let u = std::mem::ManuallyDrop::new(unsafe { std::net::UdpSocket::from_raw_fd(fd as i32) });
+        if u.local_addr().is_ok() {
+            return match u.recv_from(b) {
+                Ok((k, a)) => {
+                    put_addr(a, out);
+                    k as i64
+                }
+                Err(e) => net_err(&e),
+            };
+        }
+        let d = std::mem::ManuallyDrop::new(unsafe { std::os::unix::net::UnixDatagram::from_raw_fd(fd as i32) });
+        match d.recv_from(b) {
+            Ok((k, a)) => {
+                put_str(&a.as_pathname().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default(), out);
+                k as i64
+            }
+            Err(e) => net_err(&e),
+        }
     }
     pub unsafe fn shim_alx_sock_set_nodelay(fd: i64, on: i64) -> i64 {
         if fd < 0 { return -(sysc("EBADF") as i64); }

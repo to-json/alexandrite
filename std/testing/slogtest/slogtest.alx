@@ -1,0 +1,228 @@
+# Package slogtest: Go's testing/slogtest -- checks that a log/slog Handler
+# follows the rules every handler should.
+#
+#   Go                                        alx
+#   TestHandler(h, results) error             test_handler(h, results) -> ~Unit<SlogtestError>
+#     results func() []map[string]any           results: () -> ~[json.Value] (one object per record)
+#   Run(t, newHandler, result)                run(new_handler, result) -> [Str] (the failures)
+#     newHandler func(*testing.T) slog.Handler  new_handler: () -> H
+#     result func(*testing.T) map[string]any    result: () -> ~json.Value
+#
+# The cases are Go's, in Go's order (built-ins, attrs, empty-attr, zero-time,
+# WithAttrs, groups, empty-group, inline-group, WithGroup, multi-With,
+# empty-group-record, nested-empty-group-record, resolve, resolve-groups,
+# resolve-WithAttrs, resolve-WithAttrs-groups, empty-PC), and so are the
+# problem texts ("missing key \"msg\"", "unexpected key \"G\"", ...).
+#
+# Differences from Go:
+#  - A record's attributes come back as a json.Value tree (std/encoding/json's
+#    dynamic Value) instead of a map[string]any: alexandrite has no `any`.
+#    Parse JSON lines with json.parse; for a text format, build the same tree
+#    (see this package's tests for the TextHandler's).
+#  - The handler is generic (`H`): two of the cases wrap it in a handler that
+#    changes the record (zero time, zero PC), and a handler can't hold a
+#    Handler value and be one (an interface value contains its implementors).
+#    H's with_attrs / with_group must return H, as slog's own handlers do.
+#  - Go's explanations end with the source position of the case
+#    (" (slogtest.go:52)"); alexandrite has no caller locations, so they don't.
+#  - Run takes no *testing.T: it returns the failures ("case: problem:
+#    explanation"), empty when the handler passes; assert on that.
+#  - TestHandler's error joins all problems with newlines, like errors.Join.
+
+import "encoding/json"
+import "log/slog"
+import "strconv"
+import "time"
+
+pub error SlogtestError {
+  Count(got: Int, want: Int)
+  Problems(list: [Str])
+
+  def message -> Str {
+    case self {
+      Count(g, w) => "got #{g} results, want #{w}"
+      Problems(l) => l.join("\n")
+    }
+  }
+}
+
+# One check on a record's tree: inside `groups`, the key exists (HAS_KEY),
+# doesn't (MISSING_KEY), or is the string `val` (HAS_ATTR).
+struct Check {
+  groups: [Str]
+  kind: Int
+  key: Str
+  val: Str
+}
+
+HAS_KEY = 0
+MISSING_KEY = 1
+HAS_ATTR = 2
+
+def has_key(k: Str) -> Check { Check.new(kind: HAS_KEY, key: k) }
+def missing_key(k: Str) -> Check { Check.new(kind: MISSING_KEY, key: k) }
+def has_attr(k: Str, v: Str) -> Check { Check.new(kind: HAS_ATTR, key: k, val: v) }
+def in_group(g: Str, c: Check) -> Check { Check.new(groups: [g] + c.groups, kind: c.kind, key: c.key, val: c.val) }
+
+struct Case {
+  name: Str
+  explanation: Str
+  # 0: none, 1: zero the time, 2: zero the PC (Go's mod functions)
+  modify: Int
+  checks: [Check]
+}
+
+def cases -> [Case] {
+  [
+    Case.new(name: "built-ins", explanation: "this test expects slog.TimeKey, slog.LevelKey and slog.MessageKey", checks: [has_key(slog.TIME_KEY), has_key(slog.LEVEL_KEY), has_attr(slog.MESSAGE_KEY, "message")]),
+    Case.new(name: "attrs", explanation: "a Handler should output attributes passed to the logging function", checks: [has_attr("k", "v")]),
+    Case.new(name: "empty-attr", explanation: "a Handler should ignore an empty Attr", checks: [has_attr("a", "b"), missing_key(""), has_attr("c", "d")]),
+    Case.new(name: "zero-time", explanation: "a Handler should ignore a zero Record.Time", modify: 1, checks: [missing_key(slog.TIME_KEY)]),
+    Case.new(name: "WithAttrs", explanation: "a Handler should include the attributes from the WithAttrs method", checks: [has_attr("a", "b"), has_attr("k", "v")]),
+    Case.new(name: "groups", explanation: "a Handler should handle Group attributes", checks: [has_attr("a", "b"), in_group("G", has_attr("c", "d")), has_attr("e", "f")]),
+    Case.new(name: "empty-group", explanation: "a Handler should ignore an empty group", checks: [has_attr("a", "b"), missing_key("G"), has_attr("e", "f")]),
+    Case.new(name: "inline-group", explanation: "a Handler should inline the Attrs of a group with an empty key", checks: [has_attr("a", "b"), has_attr("c", "d"), has_attr("e", "f")]),
+    Case.new(name: "WithGroup", explanation: "a Handler should handle the WithGroup method", checks: [has_key(slog.TIME_KEY), has_key(slog.LEVEL_KEY), has_attr(slog.MESSAGE_KEY, "msg"), missing_key("a"), in_group("G", has_attr("a", "b"))]),
+    Case.new(name: "multi-With", explanation: "a Handler should handle multiple WithGroup and WithAttr calls", checks: [has_key(slog.TIME_KEY), has_key(slog.LEVEL_KEY), has_attr(slog.MESSAGE_KEY, "msg"), has_attr("a", "b"), in_group("G", has_attr("c", "d")), in_group("G", in_group("H", has_attr("e", "f")))]),
+    Case.new(name: "empty-group-record", explanation: "a Handler should not output groups if there are no attributes", checks: [has_key(slog.TIME_KEY), has_key(slog.LEVEL_KEY), has_attr(slog.MESSAGE_KEY, "msg"), has_attr("a", "b"), in_group("G", has_attr("c", "d")), in_group("G", missing_key("H"))]),
+    Case.new(name: "nested-empty-group-record", explanation: "a Handler should not output nested groups if there are no attributes", checks: [has_key(slog.TIME_KEY), has_key(slog.LEVEL_KEY), has_attr(slog.MESSAGE_KEY, "msg"), has_attr("a", "b"), in_group("G", has_attr("c", "d")), in_group("G", missing_key("H")), in_group("G", missing_key("I"))]),
+    Case.new(name: "resolve", explanation: "a Handler should call Resolve on attribute values", checks: [has_attr("k", "replaced")]),
+    Case.new(name: "resolve-groups", explanation: "a Handler should call Resolve on attribute values in groups", checks: [in_group("G", has_attr("a", "v1")), in_group("G", has_attr("b", "v2"))]),
+    Case.new(name: "resolve-WithAttrs", explanation: "a Handler should call Resolve on attribute values from WithAttrs", checks: [has_attr("k", "replaced")]),
+    Case.new(name: "resolve-WithAttrs-groups", explanation: "a Handler should call Resolve on attribute values in groups from WithAttrs", checks: [in_group("G", has_attr("a", "v1")), in_group("G", has_attr("b", "v2"))]),
+    Case.new(name: "empty-PC", explanation: "a Handler should not output SourceKey if the PC is zero", modify: 2, checks: [missing_key(slog.SOURCE_KEY)]),
+  ]
+}
+
+# Go's `replace` LogValuer.
+struct Replace {
+  v: Str
+
+  def log_value -> slog.Value { slog.string_value(v) }
+}
+
+def rep(s: Str) -> slog.Value { slog.valuer_value(Replace.new(v: s)) }
+
+# Logs case i's record(s) to l (Go's testCase.f).
+def log_case(i: Int, l: slog.Logger) {
+  case i {
+    0 => l.info("message", [])
+    1 => l.info("message", [slog.string("k", "v")])
+    2 => l.info("msg", [slog.string("a", "b"), slog.any("", slog.nil_value), slog.string("c", "d")])
+    3 => l.info("msg", [slog.string("k", "v")])
+    4 => l.with([slog.string("a", "b")]).info("msg", [slog.string("k", "v")])
+    5 => l.info("msg", [slog.string("a", "b"), slog.group("G", [slog.string("c", "d")]), slog.string("e", "f")])
+    6 => l.info("msg", [slog.string("a", "b"), slog.group("G", []), slog.string("e", "f")])
+    7 => l.info("msg", [slog.string("a", "b"), slog.group("", [slog.string("c", "d")]), slog.string("e", "f")])
+    8 => l.with_group("G").info("msg", [slog.string("a", "b")])
+    9 => l.with([slog.string("a", "b")]).with_group("G").with([slog.string("c", "d")]).with_group("H").info("msg", [slog.string("e", "f")])
+    10 => l.with([slog.string("a", "b")]).with_group("G").with([slog.string("c", "d")]).with_group("H").info("msg", [])
+    11 => l.with([slog.string("a", "b")]).with_group("G").with([slog.string("c", "d")]).with_group("H").with_group("I").info("msg", [])
+    12 => l.info("msg", [slog.any("k", rep("replaced"))])
+    13 => l.info("msg", [slog.group("G", [slog.string("a", "v1"), slog.any("b", rep("v2"))])])
+    14 => l.with([slog.any("k", rep("replaced"))]).info("msg", [])
+    15 => l.with([slog.group("G", [slog.string("a", "v1"), slog.any("b", rep("v2"))])]).info("msg", [])
+    _ => l.info("message", [])
+  }
+}
+
+# Go's wrapper: changes each record before passing it on.
+struct Wrapper[H] {
+  h: H
+  modify: Int
+
+  pub def enabled?(level: slog.Level) -> Bool { h.enabled?(level) }
+
+  pub def handle(r: slog.Record) -> ~Unit {
+    r2 = r
+    r2.time = time.Time.new if modify == 1
+    r2.pc = 0 if modify == 2
+    ~h.handle(r2)
+  }
+
+  pub def with_attrs(attrs: [slog.Attr]) -> Wrapper[H] { Wrapper[H].new(h: h.with_attrs(attrs), modify: modify) }
+  pub def with_group(name: Str) -> Wrapper[H] { Wrapper[H].new(h: h.with_group(name), modify: modify) }
+}
+
+def logger_for[H](h: H, modify: Int) -> slog.Logger {
+  return slog.new(h) if modify == 0
+  slog.new(Wrapper[H].new(h: h, modify: modify))
+}
+
+# Go's TestHandler: logs every case to h, then checks results() (one parsed
+# record per case, in order).
+pub def test_handler[H](h: H, results: () -> ~[json.Value]) -> ~Unit<SlogtestError> {
+  cs = cases
+  i = 0
+  while i < cs.size {
+    log_case(i, logger_for(h, cs[i].modify))
+    i += 1
+  }
+  res = results.call
+  if e = res.err {
+    fail SlogtestError.Problems([e.message])
+  }
+  got = res.unwrap
+  fail SlogtestError.Count(got: got.size, want: cs.size) if got.size != cs.size
+  errs: [Str] = []
+  i = 0
+  while i < got.size {
+    for c in cs[i].checks {
+      if p = check(c, got[i]) {
+        errs << p + ": " + cs[i].explanation
+      }
+    }
+    i += 1
+  }
+  fail SlogtestError.Problems(errs) if errs.size > 0
+  nil
+}
+
+# Go's Run: for each case, a fresh handler from new_handler, the case logged
+# to it, and its record from result. The failures, as "case: problem:
+# explanation" (empty: the handler passes).
+pub def run[H](new_handler: () -> H, result: () -> ~json.Value) -> [Str] {
+  out: [Str] = []
+  cs = cases
+  i = 0
+  while i < cs.size {
+    c = cs[i]
+    log_case(i, logger_for(new_handler.call, c.modify))
+    r = result.call
+    if e = r.err {
+      out << c.name + ": " + e.message
+    } else {
+      got = r.unwrap
+      for ch in c.checks {
+        if p = check(ch, got) {
+          out << c.name + ": " + p + ": " + c.explanation
+        }
+      }
+    }
+    i += 1
+  }
+  out
+}
+
+# The problem check c finds in m, if any (Go's check functions).
+def check(c: Check, m: json.Value) -> Str? {
+  v = m
+  for g in c.groups {
+    x = v.get(g)
+    return "missing group " + strconv.quote(g) if x == none
+    return "value for group " + strconv.quote(g) + " is not map[string]any" if !x.unwrap.object?
+    v = x.unwrap
+  }
+  got = v.get(c.key)
+  if c.kind == MISSING_KEY {
+    return got == none ? none : "unexpected key " + strconv.quote(c.key)
+  }
+  return "missing key " + strconv.quote(c.key) if got == none
+  return none if c.kind == HAS_KEY
+  g = got.unwrap
+  if s = g.as_str {
+    return none if s == c.val
+    return strconv.quote(c.key) + ": got " + strconv.quote(s) + ", want " + strconv.quote(c.val)
+  }
+  strconv.quote(c.key) + ": got " + g.to_s + ", want " + strconv.quote(c.val)
+}

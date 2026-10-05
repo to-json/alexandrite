@@ -1,0 +1,560 @@
+# Go's suffixarray_test.go, translated.
+
+import "bytes"
+import "encoding/hex"
+import "math/rand/v2"
+import "regexp"
+import "slices"
+import "strings"
+
+struct SaCase {
+  name: Str       # name of test case
+  source: Str     # source to index
+  patterns: [Str] # patterns to lookup
+}
+
+def sa_cases -> [SaCase] {
+  [
+    SaCase.new(name: "empty string", source: "", patterns: ["", "foo", "(foo)", ".*", "a*"]),
+    SaCase.new(
+      name: "all a's",
+      source: "aaaaaaaaaa", # 10 a's
+      patterns: [
+        "",
+        "a",
+        "aa",
+        "aaa",
+        "aaaa",
+        "aaaaa",
+        "aaaaaa",
+        "aaaaaaa",
+        "aaaaaaaa",
+        "aaaaaaaaa",
+        "aaaaaaaaaa",
+        "aaaaaaaaaaa", # 11 a's
+        ".",
+        ".*",
+        "a+",
+        "aa+",
+        "aaaa[b]?",
+        "aaa*",
+      ],
+    ),
+    SaCase.new(name: "abc", source: "abc", patterns: ["a", "b", "c", "ab", "bc", "abc", "a.c", "a(b|c)", "abc?"]),
+    SaCase.new(name: "barbara*3", source: "barbarabarbarabarbara", patterns: ["a", "bar", "rab", "arab", "barbar", "bara?bar"]),
+    SaCase.new(
+      name: "typing drill",
+      source: "Now is the time for all good men to come to the aid of their country.",
+      patterns: ["Now", "the time", "to come the aid", "is the time for all good men to come to the aid of their", "to (come|the)?"],
+    ),
+    SaCase.new(name: "godoc simulation", source: "package main\n\nimport(\n    \"rand\"\n    ", patterns: []),
+  ]
+}
+
+def b(s: Str) -> [Byte] { s.bytes.to_a }
+
+# All occurrences of s in src; at most n of them.
+def find_naive(src: Str, s: Str, n: Int) -> [Int] {
+  res: [Int] = []
+  if s != "" && n != 0 {
+    # find at most n occurrences of s in src
+    i = -1
+    while n < 0 || res.size < n {
+      j = strings.index(src[i + 1...src.size], s)
+      break if j < 0
+      i += j + 1
+      res << i
+    }
+  }
+  res
+}
+
+def check_lookup(tc: SaCase, x: Index, s: Str, n: Int) {
+  res = x.lookup(b(s), n)
+  exp = find_naive(tc.source, s, n)
+
+  # check that the lengths match
+  assert res.size == exp.size, "test #{tc.name}, lookup #{s} (n = #{n}): result count"
+
+  # if n >= 0 the number of results is limited --- unless n >= all results,
+  # we may obtain different positions from the Index and from find (because
+  # Index may not find the results in the same order as find) => in general
+  # we cannot simply check that the res and exp lists are equal
+
+  # check that each result is in fact a correct match and there are no duplicates
+  slices.sort(res)
+  for i in 0...res.size {
+    r = res[i]
+    if r < 0 || tc.source.size <= r {
+      assert false, "test #{tc.name}, lookup #{s}, result #{i} (n = #{n}): index #{r} out of range"
+    } else {
+      assert strings.has_prefix(tc.source[r...tc.source.size], s), "test #{tc.name}, lookup #{s}, result #{i} (n = #{n}): index #{r} not a match"
+    }
+    if i > 0 {
+      assert res[i - 1] != r, "test #{tc.name}, lookup #{s}, result #{i} (n = #{n}): found duplicate index #{r}"
+    }
+  }
+
+  if n < 0 {
+    # all results computed - sorted res and exp must be equal
+    assert res == exp, "test #{tc.name}, lookup #{s}"
+  }
+}
+
+def check_find_all_index(tc: SaCase, x: Index, rx: regexp.Regexp, n: Int) {
+  res = x.find_all_index(rx, n)
+  exp = rx.find_all_string_index(tc.source, n)
+
+  # check that the lengths match
+  assert res.size == exp.size, "test #{tc.name}, FindAllIndex #{rx.to_s} (n = #{n}): result count"
+
+  # check that each result is in fact a correct match and the result is sorted
+  for i in 0...res.size {
+    r = res[i]
+    if r[0] < 0 || r[0] > r[1] || tc.source.size < r[1] {
+      assert false, "test #{tc.name}, FindAllIndex #{rx.to_s}, result #{i} (n == #{n}): illegal match [#{r[0]}, #{r[1]}]"
+    } else {
+      assert rx.match_string?(tc.source[r[0]...r[1]]), "test #{tc.name}, FindAllIndex #{rx.to_s}, result #{i} (n = #{n}): [#{r[0]}, #{r[1]}] not a match"
+    }
+  }
+
+  if n < 0 {
+    # all results computed - sorted res and exp must be equal
+    assert res == exp, "test #{tc.name}, FindAllIndex #{rx.to_s}"
+  }
+}
+
+def check_lookups(tc: SaCase, x: Index, n: Int) {
+  for pat in tc.patterns {
+    check_lookup(tc, x, pat, n)
+    r = regexp.compile(pat)
+    if rx = r.ok {
+      check_find_all_index(tc, x, rx, n)
+    }
+  }
+}
+
+# Whether the suffixes of x are in increasing order (Go: sort.IsSorted on the index).
+def check_construction(tc: SaCase, x: Index) {
+  sorted = true
+  for i in 1...x.sa.len {
+    if bytes.compare(at(x, i), at(x, i - 1)) < 0 {
+      sorted = false
+    }
+  }
+  assert sorted, "failed testConstruction #{tc.name}"
+}
+
+def index_equal(x: Index, y: Index) -> Bool {
+  return false if !bytes.equal(x.data, y.data)
+  return false if x.sa.len != y.sa.len
+  for i in 0...x.sa.len {
+    return false if x.sa.get(i) != y.sa.get(i)
+  }
+  true
+}
+
+# Returns the serialized index size.
+def check_save_restore(name: Str, x: Index) -> Int {
+  buf = bytes.new_buffer([])
+  r = x.write(buf)
+  assert r.ok?, "failed writing index #{name}"
+  size = buf.len
+  y = Index.new
+  rr = y.read!(bytes.new_reader(buf.bytes))
+  assert rr.ok?, "failed reading index #{name}"
+  assert index_equal(x, y), "restored index doesn't match saved index #{name}"
+
+  # Reread as forced 32.
+  y32 = read_index(bytes.new_reader(buf.bytes), REAL_MAX_DATA32).unwrap
+  assert !y32.sa.wide, "forced 32"
+  assert index_equal(x, y32), "restored index doesn't match saved index #{name}"
+
+  # Reread as forced 64.
+  y64 = read_index(bytes.new_reader(buf.bytes), -1).unwrap
+  assert y64.sa.wide, "forced 64"
+  assert index_equal(x, y64), "restored index doesn't match saved index #{name}"
+
+  size
+}
+
+def check_index(max_data32: Int) {
+  for tc in sa_cases {
+    x = new_with(b(tc.source), max_data32)
+    assert_eq x.sa.wide, max_data32 < 0
+    check_construction(tc, x)
+    check_save_restore(tc.name, x)
+    check_lookups(tc, x, 0)
+    check_lookups(tc, x, 1)
+    check_lookups(tc, x, 10)
+    check_lookups(tc, x, 2000000000)
+    check_lookups(tc, x, -1)
+  }
+}
+
+test "index32" {
+  check_index(REAL_MAX_DATA32)
+}
+
+test "index64" {
+  check_index(-1)
+}
+
+def build32(x: [Byte]) -> [Int] {
+  sa: [I32] = [0; x.size]
+  text_32(x, sa)
+  sa.map { it.to_i }
+}
+
+def build64(x: [Byte]) -> [Int] {
+  sa: [I64] = [0; x.size]
+  text_64(x, sa)
+  sa.map { it.to_i }
+}
+
+# Checks the suffix array build function on the input x: whether it builds a
+# correct suffix array.
+def check_sa(x: [Byte], build: ([Byte]) -> [Int]) -> Bool {
+  sa = build.call(x)
+  if sa.size != x.size {
+    assert false, "build #{x}: len(sa) = #{sa.size}, want #{x.size}"
+    return false
+  }
+  i = 0
+  while i + 1 < sa.size {
+    if sa[i] < 0 || sa[i] >= x.size || sa[i + 1] < 0 || sa[i + 1] >= x.size {
+      assert false, "build #{x}: sa out of range: #{sa}"
+      return false
+    }
+    if bytes.compare(x[sa[i]...x.size], x[sa[i + 1]...x.size]) >= 0 {
+      assert false, "build #{x} -> #{sa}: sa[#{i}:] = #{sa[i]},#{sa[i + 1]} out of order"
+      return false
+    }
+    i += 1
+  }
+  true
+}
+
+# Fills x[i:] with all possible combinations of values in [1,max] and checks
+# each one; returns the number of failures (stopping after 10).
+def check_rec(x: [Byte], i: Int, max: Int, num_fail: Int, build: ([Byte]) -> [Int]) -> Int {
+  fails = num_fail
+  if i < x.size {
+    v = 1
+    while v <= max {
+      x[i] = v.as_u8
+      fails = check_rec(x, i + 1, max, fails, build)
+      return fails if fails >= 10
+      v += 1
+    }
+    return fails
+  }
+  if !check_sa(x, build) {
+    fails += 1
+  }
+  fails
+}
+
+# Very repetitive input has num_lms = x.size/2-1 at top level, the largest it
+# can be. But max_id is only two (aba and ab$).
+def check_ababab(build: ([Byte]) -> [Int]) {
+  size = 100000
+  x: [Byte] = [0; size]
+  for i in 0...size {
+    x[i] = "ab"[i % 2]
+  }
+  assert check_sa(x, build), "ababab"
+}
+
+# A pathological input that forces recurse_32 to allocate a new temporary
+# buffer. The input must have more than N/3 LMS-substrings, which we arrange
+# by repeating an SLSLSLSLSLSL pattern like ababab... above, but then we must
+# also arrange for a large number of distinct LMS-substrings. We use this
+# pattern:
+# 1 255 1 254 1 253 1 ... 1 2 1 255 2 254 2 253 2 252 2 ...
+# This gives approximately 2¹⁵ distinct LMS-substrings. We need to repeat at
+# least one substring, though, or else the recursion can be bypassed entirely.
+def forcealloc_input -> [Byte] {
+  x: [Byte] = [0; 100000]
+  lo = 1
+  hi = 255
+  for i in 0...x.size {
+    if i % 2 == 0 {
+      x[i] = lo.as_u8
+    } else {
+      x[i] = hi.as_u8
+      hi -= 1
+      if hi <= lo {
+        lo = (lo + 1) % 256
+        if lo == 0 {
+          lo = 1
+        }
+        hi = 255
+      }
+    }
+  }
+  x
+}
+
+def check_forcealloc(build: ([Byte]) -> [Int]) {
+  assert check_sa(forcealloc_input, build), "forcealloc"
+}
+
+# All inputs over {1,...,max} up to length max_len.
+def check_exhaustive(max: Int, max_len: Int, build: ([Byte]) -> [Int]) {
+  x: [Byte] = [0; 30]
+  for n in 0..max_len {
+    fails = check_rec(x[0...n], 0, max, 0, build)
+    assert fails == 0, "exhaustive#{max} length #{n}: #{fails} failures"
+  }
+}
+
+test "new32_ababab" {
+  check_ababab(->(x: [Byte]) -> [Int] { build32(x) })
+}
+
+test "new32_forcealloc" {
+  check_forcealloc(->(x: [Byte]) -> [Int] { build32(x) })
+}
+
+test "new32_exhaustive2" {
+  check_exhaustive(2, 16, ->(x: [Byte]) -> [Int] { build32(x) })
+}
+
+test "new32_exhaustive3" {
+  check_exhaustive(3, 10, ->(x: [Byte]) -> [Int] { build32(x) })
+}
+
+test "new64_ababab" {
+  check_ababab(->(x: [Byte]) -> [Int] { build64(x) })
+}
+
+test "new64_forcealloc" {
+  check_forcealloc(->(x: [Byte]) -> [Int] { build64(x) })
+}
+
+test "new64_exhaustive2" {
+  check_exhaustive(2, 16, ->(x: [Byte]) -> [Int] { build64(x) })
+}
+
+test "new64_exhaustive3" {
+  check_exhaustive(3, 10, ->(x: [Byte]) -> [Int] { build64(x) })
+}
+
+test "issue53352" {
+  data = b("x")
+  index = new(data)
+  buf = bytes.new_buffer([])
+  ~index.write(buf)
+
+  # buffer encoding is as follows:
+  #
+  # [ data length n | data bytes | index slice buffer size |  indices  ] ... (next slice, if any)
+  # \__ 10 bytes __/\_ n bytes _/\_______ 10 bytes _______/\_ varuints /
+  #
+  # n and s are encoded as varints using 10 bytes always so they can be patched.
+  # For small values x >= 0 the varint encoded value is 2*x.
+
+  # For the above data we have n == len("x") == 1.
+  n = data.size
+  encoding = buf.bytes
+  assert_eq encoding[0].to_i, 2 * n
+
+  # For the above data, the index slice buffer contains a single index entry (0 for "x")
+  # plus the size of the index buffer (10 bytes), so s == 10 + 1 == 11; and s is encoded
+  # immediately following the data bytes.
+  s = 10 + 1
+  assert_eq encoding[10 + n].to_i, 2 * s
+
+  # Reading back the encoding should work without errors.
+  r = index.read!(bytes.new_buffer(encoding))
+  assert r.ok?, "read back"
+
+  # Adding an extra index corrupts the encoding (more indices than data bytes to be indexed).
+  s += 1                           # increase slice buffer size
+  encoding << 0                    # add one more index
+  encoding[10 + n] = (2 * s).as_u8 # update index slice buffer size
+
+  # Reading back the corrupted encoding should report an error.
+  # Before fixing go.dev/issue/53352, this resulted in an index-out-of-range panic.
+  r = index.read!(bytes.new_buffer(encoding))
+  assert_eq r.err?.message, "suffixarray: data corrupted"
+}
+
+test "index_corruption" {
+  data = b("x")
+  index = new(data)
+  buf = bytes.new_buffer([])
+  ~index.write(buf)
+
+  # The index data is at the end of the encoding (see issue53352 for the encoding format).
+  # The encoded indices i must be 0 <= i < data.size because they are used to index into the
+  # data. Corrupt one and make sure we get an error when reading the encoding.
+  bb = buf.bytes # (shares the buffer's storage)
+  bb[bb.size - 1] = data.size.as_u8
+
+  # Reading back the corrupted encoding should report an error.
+  r = index.read!(buf)
+  assert_eq r.err?.message, "suffixarray: data corrupted"
+}
+
+# Of all possible inputs, the random bytes have the least amount of substring
+# repetition, and the repeated bytes have the most. For most algorithms,
+# the running time of every input will be between these two.
+bench "new_repeated_1m" {
+  data: [Byte] = [0; 1000000]
+  new(data)
+}
+
+bench "new_random_1m" {
+  data: [Byte] = [0; 1000000]
+  r = rand.new(rand.new_pcg(1, 2))
+  for i in 0...data.size {
+    data[i] = r.int_n!(256).as_u8
+  }
+  new(data)
+}
+
+bench "save_restore_1m" {
+  r = rand.new(rand.new_pcg(0x5a77a1, 0))
+  data: [Byte] = [0; 1 << 20] # 1MB of data to index
+  for i in 0...data.size {
+    data[i] = r.int_n!(256).as_u8
+  }
+  x = new(data)
+  buf = bytes.new_buffer([])
+  ~x.write(buf)
+  y = Index.new
+  ~y.read!(buf)
+}
+
+# ---- Helpers of the generated vectors (vec_*_test.alx) ----
+
+# The generators of the Go program that wrote the vectors.
+def lcg_next(st: [U64]) -> U64 {
+  st[0] = st[0] *% 6364136223846793005 +% 1442695040888963407
+  st[0] >> 33
+}
+
+# kind 0: random over alpha symbols; 1: periodic with a random period of
+# length alpha; 2: the fibonacci word over {a, b}; 3: random runs (alpha
+# symbols, runs up to 8 long).
+def gen_input(kind: Int, seed: U64, n: Int, alpha: Int) -> [Byte] {
+  st = [seed]
+  out: [Byte] = [0; n]
+  if kind == 0 {
+    for i in 0...n {
+      out[i] = (lcg_next(st) % alpha.as_u64).as_u8
+    }
+  } else if kind == 1 {
+    per: [Byte] = [0; alpha]
+    for i in 0...alpha {
+      per[i] = (lcg_next(st) % 256).as_u8
+    }
+    for i in 0...n {
+      out[i] = per[i % alpha]
+    }
+  } else if kind == 2 {
+    a = b("a")
+    w = b("ab")
+    while w.size < n {
+      next_w = w + a
+      a = w
+      w = next_w
+    }
+    copy(out, w)
+  } else {
+    i = 0
+    while i < n {
+      c = (lcg_next(st) % alpha.as_u64).as_u8
+      r = (lcg_next(st) % 8).to_i + 1
+      while r > 0 && i < n {
+        out[i] = c
+        i += 1
+        r -= 1
+      }
+    }
+  }
+  out
+}
+
+def fnv_ints(xs: [Int]) -> U64 {
+  h: U64 = 14695981039346656037
+  for v in xs {
+    h = (h ^ v.as_u64) *% 1099511628211
+  }
+  h
+}
+
+def fnv_bytes(xs: [Byte]) -> U64 {
+  h: U64 = 14695981039346656037
+  for v in xs {
+    h = (h ^ v.as_u64) *% 1099511628211
+  }
+  h
+}
+
+# Both constructions give Go's suffix array.
+def vsa(x: [Byte], want: [Int]) {
+  assert_eq build32(x), want
+  assert_eq build64(x), want
+}
+
+def vsa_sum(kind: Int, seed: U64, n: Int, alpha: Int, want: U64) {
+  x = gen_input(kind, seed, n, alpha)
+  assert fnv_ints(build32(x)) == want, "sa32 of kind #{kind} seed #{seed} n #{n} alpha #{alpha}"
+  assert fnv_ints(build64(x)) == want, "sa64 of kind #{kind} seed #{seed} n #{n} alpha #{alpha}"
+}
+
+def vec_text(i: Int) -> Str {
+  case i {
+    0 => ""
+    1 => "aaaaaaaaaa"
+    2 => "barbarabarbarabarbara"
+    3 => "Now is the time for all good men to come to the aid of their country."
+    4 => "mississippi missouri mississauga"
+    5 => Str.from_bytes(gen_input(0, 99, 300, 3).map { it + 97 })
+    6 => Str.from_bytes(gen_input(3, 7, 200, 2).map { it + 97 })
+    _ => "abcab" * 40
+  }
+}
+
+# Lookup gives Go's result, in Go's order (both follow the suffix array).
+def vlookup(ti: Int, s: Str, n: Int, want: [Int]) {
+  x = new(b(vec_text(ti)))
+  assert x.lookup(b(s), n) == want, "lookup #{s} (n = #{n}) in text #{ti}"
+}
+
+def vfind(ti: Int, pat: Str, n: Int, want: [[Int]]) {
+  x = new(b(vec_text(ti)))
+  assert x.find_all_index(regexp.must_compile(pat), n) == want, "find_all_index #{pat} (n = #{n}) in text #{ti}"
+}
+
+# Write gives Go's bytes; Read of Go's bytes (as 32 and 64) gives the index,
+# and writing it again gives the bytes back.
+def vwrite(data: [Byte], want_hex: Str) {
+  x = new(data)
+  buf = bytes.new_buffer([])
+  x.write(buf).unwrap
+  assert_eq hex.encode_to_string(buf.bytes), want_hex
+  enc = hex.decode_string(want_hex).unwrap
+  y = Index.new
+  y.read!(bytes.new_reader(enc)).unwrap
+  assert index_equal(x, y), "read of Go's bytes"
+  assert index_equal(x, read_index(bytes.new_reader(enc), -1).unwrap), "read of Go's bytes as 64"
+  buf2 = bytes.new_buffer([])
+  y.write(buf2).unwrap
+  assert_eq buf2.bytes, enc
+}
+
+# Write of a generated input: Go's length and FNV-1a of the bytes; the bytes
+# read back.
+def vwrite_sum(kind: Int, seed: U64, n: Int, alpha: Int, want_len: Int, want_sum: U64) {
+  x = new(gen_input(kind, seed, n, alpha))
+  buf = bytes.new_buffer([])
+  x.write(buf).unwrap
+  enc = buf.bytes
+  assert_eq enc.size, want_len
+  assert fnv_bytes(enc) == want_sum, "write of kind #{kind} seed #{seed} n #{n}"
+  assert index_equal(x, read_index(bytes.new_reader(enc), REAL_MAX_DATA32).unwrap), "read back"
+}

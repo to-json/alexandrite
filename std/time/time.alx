@@ -12,6 +12,14 @@
 #   t.Format(layout) / time.Parse       t.format(layout) / parse(layout, value) -> ~Time<ParseError>
 #   time.Sleep / After / Tick           sleep(d) / after(d) -> Chan[Time] / tick(d) -> Chan[Time]
 #   time.Timer / time.Ticker            Timer / Ticker (new_timer, new_ticker; stop)
+#   time.UTC / time.Local               utc() / local()   (functions: no package variables)
+#   time.FixedZone(name, off)           fixed_zone(name, off)
+#   time.LoadLocation(name)             load_location(name) -> ~Location<LocationError>
+#   time.LoadLocationFromTZData(n, b)   load_location_from_tzdata(name, data) -> ~Location<LocationError>
+#   loc.String()                        loc.to_s / loc.string
+#   t.In(loc) / t.Location()            t.in_zone(loc) / t.location
+#   t.Zone() / t.IsDST() / t.ZoneBounds()  t.zone_info -> (Str, Int) / t.is_dst / t.zone_bounds -> (Time, Time)
+#   import _ "time/tzdata"              tzdata.load_location(name) (see std/time/tzdata)
 #
 # Differences from Go, and things worth knowing:
 #   - Duration is a struct (not an integer), so constants cannot be Durations:
@@ -24,12 +32,36 @@
 #     compares the instants (Go's Equal); `<`, `>` order them. Calendar math is exact
 #     proleptic Gregorian, valid over the whole Int range of seconds. The zero Time is
 #     0001-01-01 00:00:00 UTC, as in Go.
-#   - Locations: utc(), local(), fixed_zone(name, offset). `local()` is the C library's
-#     zone for the process (TZ), asked per instant for the offset and abbreviation. There
-#     is no tz database: load_location knows only "", "UTC" and "Local".
-#   - Parsing a zone abbreviation (MST) whose offset isn't in the layout gives a fixed
-#     zone with that name and offset 0 (as Go does for unknown abbreviations), except that
-#     "UTC" and "GMT+n" forms are understood.
+#   - Locations (zoneinfo.alx): UTC, the local zone, fixed zones, and zones of the IANA
+#     database. load_location is Go's: "" and "UTC" are UTC, "Local" the local zone,
+#     names with ".." or a leading slash are refused, and other names are read from the
+#     directory or uncompressed zip named by $ZONEINFO, then from the system's database
+#     (/usr/share/zoneinfo, /usr/share/lib/zoneinfo, /usr/lib/locale/TZ, /etc/zoneinfo).
+#     The TZif reader (versions 1-3), the lookup of a zone (binary search over the
+#     transitions, Go's rule for instants before the first one, the TZ-string rule
+#     after the last one) and date()'s choice in gaps and overlaps are Go's, and give
+#     Go's results (thousands of generated vectors in std/time/tzdata).
+#   - No package state (port-issues #30): Go reads $ZONEINFO once and caches each
+#     Location's current zone; here every load_location reads $ZONEINFO and the file,
+#     and a Location is an immutable value without the one-zone cache (lookups are a
+#     binary search). Go's last resort, $GOROOT/lib/time/zoneinfo.zip, doesn't exist
+#     (there is no GOROOT); the embedded database is std/time/tzdata, and since alx has
+#     no init functions it is an explicit call, `tzdata.load_location(name)`, not a
+#     fallback that importing it installs.
+#   - `local()` is the C library's zone for the process ($TZ), asked per instant for
+#     the offset and abbreviation (Go reads $TZ or /etc/localtime itself; the two agree
+#     on the zones). Its name is always "Local" (Go names it after $TZ when TZ is set).
+#     What the C library doesn't give, the DST flag and zone bounds (is_dst,
+#     zone_bounds) and the zone list Parse matches abbreviations against, comes from
+#     loading the zone as Go's initLocal does ($TZ, else /etc/localtime) on each call;
+#     Parse against Local matches an abbreviation against the zones in effect within
+#     half a year of the time (Go also knows the zone's historical abbreviations).
+#   - Parsing a zone abbreviation (MST) that the location doesn't have, with no offset
+#     in the layout, gives a fixed zone with that name and offset 0 (as Go does), except
+#     that "UTC" and "GMT+n" forms are understood.
+#   - The browser backend has no files: load_location, and is_dst / zone_bounds (which
+#     can read the local zone's file), are refused there; conversions, formatting,
+#     parsing, and zones made with load_location_from_tzdata (from tzdata.tzinfo) work.
 #   - Timers: after/tick run a spawned task that sleeps; Timer and Ticker can be stopped
 #     (the task then ends the next time it wakes). tick never stops; use a Ticker.
 #     A Ticker, like Go's, drops ticks the receiver is too slow to take.
@@ -420,16 +452,7 @@ pub def parse_duration(s0: Str) -> ~Duration<DurationError> {
 }
 
 # -------------------------------------------------------------- Locations
-
-# A zone: UTC, the process's local zone, or a fixed offset.
-pub struct Location {
-  name: Str
-  offset: Int # seconds east of UTC (fixed zones)
-  kind: Int   # 0 UTC, 1 Local, 2 fixed
-
-  pub def to_s -> Str { name }
-  pub def string -> Str { name }
-}
+# (Location, load_location and the tz database are in zoneinfo.alx.)
 
 pub def utc -> Location { utc_loc() }
 pub def local -> Location { local_loc() }
@@ -442,29 +465,13 @@ pub def fixed_zone(name: Str, offset: Int) -> Location {
   Location.new(name: name, offset: offset, kind: 2)
 }
 
-# Only "", "UTC" and "Local" (there is no tz database).
-pub def load_location(name: Str) -> ~Location<LocationError> {
-  return utc() if name == "" || name == "UTC"
-  return local() if name == "Local"
-  fail LocationError.Unknown(name)
-}
-
-pub error LocationError {
-  Unknown(name: Str)
-  def message -> Str {
-    case self {
-      Unknown(n) => "unknown time zone #{n}"
-    }
-  }
-}
-
 # ---------------------------------------------------------------------- Time
 
 # An instant with a zone. `sec` counts seconds since 0001-01-01 00:00:00 UTC,
 # `nsec` is 0..999999999; `mono` (when `has_mono`) is a monotonic clock reading
 # in nanoseconds, kept so that differences of two now() values ignore wall clock
 # jumps; `off` and `zone` are the offset and abbreviation in effect;
-# `kind` is 0 UTC, 1 Local, 2 fixed.
+# `loc` is the Location (its kind: 0 UTC, 1 Local, 2 fixed, 3 tz database).
 pub struct Time {
   sec: Int
   nsec: Int
@@ -472,7 +479,7 @@ pub struct Time {
   has_mono: Bool
   off: Int
   zone: Str
-  kind: Int
+  loc: Location
 
   # seconds since the epoch in the zone's wall clock
   def wall_sec -> Int { sec + off }
@@ -550,32 +557,42 @@ pub struct Time {
 
   # The same instant; the monotonic reading is kept.
   pub def utc -> Time {
-    Time.new(sec: sec, nsec: nsec, mono: mono, has_mono: has_mono, off: 0, zone: "UTC", kind: 0)
+    Time.new(sec: sec, nsec: nsec, mono: mono, has_mono: has_mono, off: 0, zone: "UTC", loc: utc_loc())
   }
   pub def local -> Time { self.in_zone(local_loc()) }
-  pub def in_zone(loc: Location) -> Time {
-    case loc.kind {
-      0 => self.utc
-      1 => in_local(sec, nsec, mono, has_mono)
-      _ => Time.new(sec: sec, nsec: nsec, mono: mono, has_mono: has_mono, off: loc.offset, zone: loc.name, kind: 2)
-    }
-  }
+  # The same instant in loc (Go's In).
+  pub def in_zone(l: Location) -> Time { at_loc(sec, nsec, mono, has_mono, l) }
   pub def location -> Location {
-    case kind {
-      0 => utc_loc()
-      1 => local_loc()
-      _ => fixed_zone(zone, off)
-    }
+    return utc_loc() if loc.kind == 0
+    loc
   }
-  # The zone's abbreviation and offset in seconds east of UTC.
+  # The zone's abbreviation and offset in seconds east of UTC (Go's Zone).
   pub def zone_info -> (Str, Int) {
     return self.zone_name, off
   }
-  def zone_name -> Str { kind == 0 ? "UTC" : zone }
+  def zone_name -> Str { loc.kind == 0 ? "UTC" : zone }
+
+  # Whether daylight saving time is in effect (Go's IsDST).
+  pub def is_dst -> Bool {
+    _, _, _, _, d = loc.lookup_full(sec -% UNIX_TO_YEAR1)
+    d
+  }
+
+  # The start and end of the zone in effect at t (Go's ZoneBounds): t is in
+  # [start, end). A zone that began at the beginning of time has a zero start;
+  # one that goes on forever a zero end. Both are in t's Location.
+  pub def zone_bounds -> (Time, Time) {
+    _, _, s, e, _ = loc.lookup_full(sec -% UNIX_TO_YEAR1)
+    start = Time.new()
+    finish = Time.new()
+    start = at_loc(s +% UNIX_TO_YEAR1, 0, 0, false, loc) if s != MIN_INT
+    finish = at_loc(e +% UNIX_TO_YEAR1, 0, 0, false, loc) if e != MAX_INT
+    return start, finish
+  }
 
   # Strips the monotonic reading (Go's t.Round(0)).
   pub def strip_mono -> Time {
-    Time.new(sec: sec, nsec: nsec, mono: 0, has_mono: false, off: off, zone: zone, kind: kind)
+    Time.new(sec: sec, nsec: nsec, mono: 0, has_mono: false, off: off, zone: zone, loc: loc)
   }
 
   pub def add(d: Duration) -> Time {
@@ -599,9 +616,9 @@ pub struct Time {
         m = mono + d.ns
       }
     }
-    # the local zone's offset depends on the instant
-    return in_local(s, dn, m, hm) if kind == 1
-    Time.new(sec: s, nsec: dn, mono: m, has_mono: hm, off: off, zone: zone, kind: kind)
+    # the offset of the local zone and of tz database zones depends on the instant
+    return at_loc(s, dn, m, hm, loc) if loc.kind == 1 || loc.kind == 3
+    Time.new(sec: s, nsec: dn, mono: m, has_mono: hm, off: off, zone: zone, loc: loc)
   }
 
   # self - u, saturating at the longest Durations. With a monotonic reading on
@@ -693,7 +710,20 @@ def in_local(sec: Int, nsec: Int, mono: Int, has_mono: Bool) -> Time {
   u = sec -% UNIX_TO_YEAR1
   off = alx_local_offset(u)
   name = Str.from_cstr(alx_local_zone(u))
-  Time.new(sec: sec, nsec: nsec, mono: mono, has_mono: has_mono, off: off, zone: name, kind: 1)
+  Time.new(sec: sec, nsec: nsec, mono: mono, has_mono: has_mono, off: off, zone: name, loc: local_loc())
+}
+
+# This instant in loc.
+def at_loc(sec: Int, nsec: Int, mono: Int, has_mono: Bool, loc: Location) -> Time {
+  if loc.kind == 0 {
+    return Time.new(sec: sec, nsec: nsec, mono: mono, has_mono: has_mono, off: 0, zone: "UTC", loc: utc_loc())
+  }
+  return in_local(sec, nsec, mono, has_mono) if loc.kind == 1
+  if loc.kind == 2 {
+    return Time.new(sec: sec, nsec: nsec, mono: mono, has_mono: has_mono, off: loc.offset, zone: loc.name, loc: loc)
+  }
+  name, off, _, _, _ = loc.lookup(sec -% UNIX_TO_YEAR1)
+  Time.new(sec: sec, nsec: nsec, mono: mono, has_mono: has_mono, off: off, zone: name, loc: loc)
 }
 
 # The Time `sec` seconds and `nsec` nanoseconds after the Unix epoch (nsec
@@ -739,7 +769,7 @@ def make_date(year: Int, month: Int, day: Int, hour: Int, min: Int, sec: Int, ns
   days = days_from_civil(y, m, day)
   wall = days * SEC_PER_DAY + hour * 3600 + min * 60 + s # as if UTC
   if loc.kind == 0 {
-    return Time.new(sec: wall + UNIX_TO_YEAR1, nsec: n, mono: 0, has_mono: false, off: 0, zone: "UTC", kind: 0)
+    return Time.new(sec: wall + UNIX_TO_YEAR1, nsec: n, mono: 0, has_mono: false, off: 0, zone: "UTC", loc: utc_loc())
   }
   if loc.kind == 1 {
     off = alx_local_offset(wall)
@@ -748,7 +778,19 @@ def make_date(year: Int, month: Int, day: Int, hour: Int, min: Int, sec: Int, ns
     u = wall - off2 if off2 != off
     return in_local(u + UNIX_TO_YEAR1, n, 0, false)
   }
-  Time.new(sec: wall - loc.offset + UNIX_TO_YEAR1, nsec: n, mono: 0, has_mono: false, off: loc.offset, zone: loc.name, kind: 2)
+  # Go's Date: the offset at `wall` read as UTC, unless the instant that gives
+  # falls outside that zone's span (near a transition): then the offset there.
+  unix = wall
+  _, offset, start, finish, _ = loc.lookup(unix)
+  if offset != 0 {
+    u = unix - offset
+    if u < start || u >= finish {
+      _, offset2, _, _, _ = loc.lookup(u)
+      offset = offset2
+    }
+    unix -= offset
+  }
+  at_loc(unix + UNIX_TO_YEAR1, n, 0, false, loc)
 }
 
 # ------------------------------------------------------- sleeping and timers

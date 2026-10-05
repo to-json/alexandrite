@@ -1,0 +1,907 @@
+# Suffix array construction by induced sorting (SAIS): Go's sais.go.
+# See Ge Nong, Sen Zhang, and Wai Hong Chen,
+# "Two Efficient Algorithms for Linear Time Suffix Array Construction",
+# especially section 3 (https://ieeexplore.ieee.org/document/5582081).
+# See also http://zork.net/~st/jottings/sais.html.
+#
+# With optimizations inspired by Yuta Mori's sais-lite
+# (https://sites.google.com/site/yuta256/sais).
+#
+# And with other new optimizations.
+#
+# As in Go, many of these functions are parameterized by the sizes of the
+# types they operate on, and tools/gen_sais.alx (Go's gen.go) makes copies of
+# them for the other sizes in sais2.alx:
+#
+# - A function with a name ending in _8_32 takes [Byte] and [I32] arguments
+#   and is duplicated into _32_32, _8_64, and _64_64 forms.
+#   The _32_32 and _64_64_ suffixes are shortened to plain _32 and _64.
+#   Any lines in the function body that contain the text "byte-only" or "256"
+#   are stripped when creating _32_32 and _64_64 forms.
+#   (Those lines are typically 8-bit-specific optimizations.)
+#
+# - A function with a name ending only in _32 operates on [I32]
+#   and is duplicated into a _64 form. (Note that it may still take a [Byte],
+#   but there is no need for a version of the function in which the [Byte]
+#   is widened to a full integer array.)
+#
+# The overall runtime of this code is linear in the input size:
+# it runs a sequence of linear passes to reduce the problem to
+# a subproblem at most half as big, invokes itself recursively,
+# and then runs a sequence of linear passes to turn the answer
+# for the subproblem into the answer for the original problem.
+# This gives T(N) = O(N) + T(N/2) = O(N) + O(N/2) + O(N/4) + ... = O(N).
+#
+# The outline of the code, with the forward and backward scans
+# through O(N)-sized arrays called out, is:
+#
+# sais_I_N
+#   place_lms_I_B
+#     bucket_max_I_B
+#       freq_I_B
+#         <scan +text> (1)
+#       <scan +freq> (2)
+#     <scan -text, random bucket> (3)
+#   induce_sub_l_I_B
+#     bucket_min_I_B
+#       freq_I_B
+#         <scan +text, often optimized away> (4)
+#       <scan +freq> (5)
+#     <scan +sa, random text, random bucket> (6)
+#   induce_sub_s_I_B
+#     bucket_max_I_B
+#       freq_I_B
+#         <scan +text, often optimized away> (7)
+#       <scan +freq> (8)
+#     <scan -sa, random text, random bucket> (9)
+#   assign_id_I_B
+#     <scan +sa, random text substrings> (10)
+#   map_B
+#     <scan -sa> (11)
+#   recurse_B
+#     (recursive call to sais_B_B for a subproblem of size at most 1/2 input, often much smaller)
+#   unmap_I_B
+#     <scan -text> (12)
+#     <scan +sa> (13)
+#   expand_I_B
+#     bucket_max_I_B
+#       freq_I_B
+#         <scan +text, often optimized away> (14)
+#       <scan +freq> (15)
+#     <scan -sa, random text, random bucket> (16)
+#   induce_l_I_B
+#     bucket_min_I_B
+#       freq_I_B
+#         <scan +text, often optimized away> (17)
+#       <scan +freq> (18)
+#     <scan +sa, random text, random bucket> (19)
+#   induce_s_I_B
+#     bucket_max_I_B
+#       freq_I_B
+#         <scan +text, often optimized away> (20)
+#       <scan +freq> (21)
+#     <scan -sa, random text, random bucket> (22)
+#
+# Here, _B indicates the suffix array size (_32 or _64) and _I the input size (_8 or _B).
+#
+# The outline shows there are in general 22 scans through
+# O(N)-sized arrays for a given level of the recursion.
+# In the top level, operating on 8-bit input text,
+# the six freq scans are fixed size (256) instead of potentially
+# input-sized. Also, the frequency is counted once and cached
+# whenever there is room to do so (there is nearly always room in general,
+# and always room at the top level), which eliminates all but
+# the first freq_I_B text scans (that is, 5 of the 6).
+# So the top level of the recursion only does 22 - 6 - 5 = 11
+# input-sized scans and a typical level does 16 scans.
+#
+# The linear scans do not cost anywhere near as much as
+# the random accesses to the text made during a few of
+# the scans (specifically #6, #9, #16, #19, #22 marked above).
+# In real texts, there is not much but some locality to
+# the accesses, due to the repetitive structure of the text
+# (the same reason Burrows-Wheeler compression is so effective).
+# For random inputs, there is no locality, which makes those
+# accesses even more expensive, especially once the text
+# no longer fits in cache.
+#
+# Differences from Go's sais.go: Go's nil freq slice is an empty one here;
+# the `x = x[:256]` lines that only eliminate bounds checks are left out;
+# the goto in assign_id is structured; backward loops decrement at the top.
+#
+# Every top-level def ends with a "}" line of its own: tools/gen_sais.alx
+# splits the file there, as gen.go does.
+
+# text_32 returns the suffix array for the input text.
+# It requires that text.size fit in an I32
+# and that the caller zero sa.
+def text_32(text: [Byte], sa: [I32]) {
+  if text.size.as_i32.to_i != text.size || text.size != sa.size {
+    panic("suffixarray: misuse of text_32")
+  }
+  tmp: [I32] = [0; 2 * 256]
+  sais_8_32(text, 256, sa, tmp)
+}
+
+# sais_8_32 computes the suffix array of text.
+# The text must contain only values in [0, text_max).
+# The suffix array is stored in sa, which the caller
+# must ensure is already zeroed.
+# The caller must also provide temporary space tmp
+# with tmp.size ≥ text_max. If tmp.size ≥ 2*text_max
+# then the algorithm runs a little faster.
+# If sais_8_32 modifies tmp, it sets tmp[0] = -1 on return.
+def sais_8_32(text: [Byte], text_max: Int, sa: [I32], tmp: [I32]) -> Unit {
+  if sa.size != text.size || tmp.size < text_max {
+    panic("suffixarray: misuse of sais_8_32")
+  }
+
+  # Trivial base cases. Sorting 0 or 1 things is easy.
+  return if text.size == 0
+  if text.size == 1 {
+    sa[0] = 0
+    return
+  }
+
+  # Establish slices indexed by text character
+  # holding character frequency and bucket-sort offsets.
+  # If there's only enough tmp for one slice,
+  # we make it the bucket offsets and recompute
+  # the character frequency each time we need it.
+  freq: [I32] = []
+  bucket: [I32] = []
+  if tmp.size >= 2 * text_max {
+    freq = tmp[0...text_max]
+    bucket = tmp[text_max...2 * text_max]
+    freq[0] = -1 # mark as uninitialized
+  } else {
+    bucket = tmp[0...text_max]
+  }
+
+  # The SAIS algorithm.
+  # Each of these calls makes one scan through sa.
+  # See the individual functions for documentation
+  # about each's role in the algorithm.
+  num_lms = place_lms_8_32(text, sa, freq, bucket)
+  if num_lms > 1 {
+    # (0 or 1 items are already sorted.)
+    induce_sub_l_8_32(text, sa, freq, bucket)
+    induce_sub_s_8_32(text, sa, freq, bucket)
+    length_8_32(text, sa, num_lms)
+    max_id = assign_id_8_32(text, sa, num_lms)
+    if max_id < num_lms {
+      map_32(sa, num_lms)
+      recurse_32(sa, tmp, num_lms, max_id)
+      unmap_8_32(text, sa, num_lms)
+    } else {
+      # If max_id == num_lms, then each LMS-substring
+      # is unique, so the relative ordering of two LMS-suffixes
+      # is determined by just the leading LMS-substring.
+      # That is, the LMS-suffix sort order matches the
+      # (simpler) LMS-substring sort order.
+      # Copy the original LMS-substring order into the
+      # suffix array destination.
+      copy(sa, sa[sa.size - num_lms...sa.size])
+    }
+    expand_8_32(text, freq, bucket, sa, num_lms)
+  }
+  induce_l_8_32(text, sa, freq, bucket)
+  induce_s_8_32(text, sa, freq, bucket)
+
+  # Mark for caller that we overwrote tmp.
+  tmp[0] = -1
+}
+
+# freq_8_32 returns the character frequencies
+# for text, as a slice indexed by character value.
+# If freq is empty, freq_8_32 uses and returns bucket.
+# If freq is non-empty, freq_8_32 assumes that freq[0] >= 0
+# means the frequencies are already computed.
+# If the frequency data is overwritten or uninitialized,
+# the caller must set freq[0] = -1 to force recomputation
+# the next time it is needed.
+def freq_8_32(text: [Byte], freq_in: [I32], bucket: [I32]) -> [I32] {
+  if freq_in.size > 0 && freq_in[0] >= 0 {
+    return freq_in # already computed
+  }
+  freq = freq_in.size == 0 ? bucket : freq_in
+
+  freq = freq[0...256] # byte-only
+  for i in 0...freq.size {
+    freq[i] = 0
+  }
+  for c in text {
+    freq[c] += 1
+  }
+  freq
+}
+
+# bucket_min_8_32 stores into bucket[c] the minimum index
+# in the bucket for character c in a bucket-sort of text.
+def bucket_min_8_32(text: [Byte], freq_in: [I32], bucket: [I32]) {
+  freq = freq_8_32(text, freq_in, bucket)
+  total: I32 = 0
+  for i in 0...freq.size {
+    n = freq[i]
+    bucket[i] = total
+    total += n
+  }
+}
+
+# bucket_max_8_32 stores into bucket[c] the maximum index
+# in the bucket for character c in a bucket-sort of text.
+# The bucket indexes for c are [min, max).
+# That is, max is one past the final index in that bucket.
+def bucket_max_8_32(text: [Byte], freq_in: [I32], bucket: [I32]) {
+  freq = freq_8_32(text, freq_in, bucket)
+  total: I32 = 0
+  for i in 0...freq.size {
+    total += freq[i]
+    bucket[i] = total
+  }
+}
+
+# The SAIS algorithm proceeds in a sequence of scans through sa.
+# Each of the following functions implements one scan,
+# and the functions appear here in the order they execute in the algorithm.
+
+# place_lms_8_32 places into sa the indexes of the
+# final characters of the LMS substrings of text,
+# sorted into the rightmost ends of their correct buckets
+# in the suffix array.
+#
+# The imaginary sentinel character at the end of the text
+# is the final character of the final LMS substring, but there
+# is no bucket for the imaginary sentinel character,
+# which has a smaller value than any real character.
+# The caller must therefore pretend that sa[-1] == text.size.
+#
+# The text indexes of LMS-substring characters are always ≥ 1
+# (the first LMS-substring must be preceded by one or more L-type
+# characters that are not part of any LMS-substring),
+# so using 0 as a “not present” suffix array entry is safe,
+# both in this function and in most later functions
+# (until induce_l_8_32 below).
+def place_lms_8_32(text: [Byte], sa: [I32], freq: [I32], bucket: [I32]) -> Int {
+  bucket_max_8_32(text, freq, bucket)
+
+  num_lms = 0
+  last_b: I32 = -1
+
+  # The next stanza of code (until the blank line) loops backward
+  # over text, stopping to execute a code body at each position i
+  # such that text[i] is an L-character and text[i+1] is an S-character.
+  # That is, i+1 is the position of the start of an LMS-substring.
+  # These could be hoisted out into a function with a callback,
+  # but at a significant speed cost. Instead, we just write these
+  # lines a few times in this source file. The copies below
+  # refer back to the pattern established by this original as the
+  # "LMS-substring iterator".
+  #
+  # In every scan through the text, c0, c1 are successive characters of text.
+  # In this backward scan, c0 == text[i] and c1 == text[i+1].
+  # By scanning backward, we can keep track of whether the current
+  # position is type-S or type-L according to the usual definition:
+  #
+  #   - position text.size is type S with text[text.size] == -1 (the sentinel)
+  #   - position i is type S if text[i] < text[i+1], or if text[i] == text[i+1] && i+1 is type S.
+  #   - position i is type L if text[i] > text[i+1], or if text[i] == text[i+1] && i+1 is type L.
+  #
+  # The backward scan lets us maintain the current type,
+  # update it when we see c0 != c1, and otherwise leave it alone.
+  # We want to identify all S positions with a preceding L.
+  # Position text.size is one such position by definition, but we have
+  # nowhere to write it down, so we eliminate it by untruthfully
+  # setting is_type_s = false at the start of the loop.
+  c0: Byte = 0
+  c1: Byte = 0
+  is_type_s = false
+  i = text.size
+  while i > 0 {
+    i -= 1
+    c1 = c0
+    c0 = text[i]
+    if c0 < c1 {
+      is_type_s = true
+    } else if c0 > c1 && is_type_s {
+      is_type_s = false
+
+      # Bucket the index i+1 for the start of an LMS-substring.
+      b = bucket[c1] - 1
+      bucket[c1] = b
+      sa[b] = (i + 1).as_i32
+      last_b = b
+      num_lms += 1
+    }
+  }
+
+  # We recorded the LMS-substring starts but really want the ends.
+  # Luckily, with two differences, the start indexes and the end indexes are the same.
+  # The first difference is that the rightmost LMS-substring's end index is text.size,
+  # so the caller must pretend that sa[-1] == text.size, as noted above.
+  # The second difference is that the first leftmost LMS-substring start index
+  # does not end an earlier LMS-substring, so as an optimization we can omit
+  # that leftmost LMS-substring start index (the last one we wrote).
+  #
+  # Exception: if num_lms <= 1, the caller is not going to bother with
+  # the recursion at all and will treat the result as containing LMS-substring starts.
+  # In that case, we don't remove the final entry.
+  if num_lms > 1 {
+    sa[last_b] = 0
+  }
+  num_lms
+}
+
+# induce_sub_l_8_32 inserts the L-type text indexes of LMS-substrings
+# into sa, assuming that the final characters of the LMS-substrings
+# are already inserted into sa, sorted by final character, and at the
+# right (not left) end of the corresponding character bucket.
+# Each LMS-substring has the form (as a regexp) /S+L+S/:
+# one or more S-type, one or more L-type, final S-type.
+# induce_sub_l_8_32 leaves behind only the leftmost L-type text
+# index for each LMS-substring. That is, it removes the final S-type
+# indexes that are present on entry, and it inserts but then removes
+# the interior L-type indexes too.
+# (Only the leftmost L-type index is needed by induce_sub_s_8_32.)
+def induce_sub_l_8_32(text: [Byte], sa: [I32], freq: [I32], bucket: [I32]) {
+  # Initialize positions for left side of character buckets.
+  bucket_min_8_32(text, freq, bucket)
+
+  # As we scan the array left-to-right, each sa[i] = j > 0 is a correctly
+  # sorted suffix array entry (for text[j:]) for which we know that j-1 is type L.
+  # Because j-1 is type L, inserting it into sa now will sort it correctly.
+  # But we want to distinguish a j-1 with j-2 of type L from type S.
+  # We can process the former but want to leave the latter for the caller.
+  # We record the difference by negating j-1 if it is preceded by type S.
+  # Either way, the insertion (into the text[j-1] bucket) is guaranteed to
+  # happen at sa[i´] for some i´ > i, that is, in the portion of sa we have
+  # yet to scan. A single pass therefore sees indexes j, j-1, j-2, j-3,
+  # and so on, in sorted but not necessarily adjacent order, until it finds
+  # one preceded by an index of type S, at which point it must stop.
+  #
+  # As we scan through the array, we clear the worked entries (sa[i] > 0) to zero,
+  # and we flip sa[i] < 0 to -sa[i], so that the loop finishes with sa containing
+  # only the indexes of the leftmost L-type indexes for each LMS-substring.
+  #
+  # The suffix array sa therefore serves simultaneously as input, output,
+  # and a miraculously well-tailored work queue.
+
+  # place_lms_8_32 left out the implicit entry sa[-1] == text.size,
+  # corresponding to the identified type-L index text.size-1.
+  # Process it before the left-to-right scan of sa proper.
+  # See body in loop for commentary.
+  k = text.size - 1
+  c0 = text[k - 1]
+  c1 = text[k]
+  if c0 < c1 {
+    k = -k
+  }
+
+  # Cache recently used bucket index:
+  # we're processing suffixes in sorted order
+  # and accessing buckets indexed by the
+  # character before the sorted order, which still
+  # has very good locality.
+  # Invariant: b is cached, possibly dirty copy of bucket[c_b].
+  c_b = c1
+  b = bucket[c_b]
+  sa[b] = k.as_i32
+  b += 1
+
+  for i in 0...sa.size {
+    j = sa[i].to_i
+    if j == 0 {
+      # Skip empty entry.
+      next
+    }
+    if j < 0 {
+      # Leave discovered type-S index for caller.
+      sa[i] = (-j).as_i32
+      next
+    }
+    sa[i] = 0
+
+    # Index j was on work queue, meaning k := j-1 is L-type,
+    # so we can now place k correctly into sa.
+    # If k-1 is L-type, queue k for processing later in this loop.
+    # If k-1 is S-type (text[k-1] < text[k]), queue -k to save for the caller.
+    k = j - 1
+    c0 = text[k - 1]
+    c1 = text[k]
+    if c0 < c1 {
+      k = -k
+    }
+
+    if c_b != c1 {
+      bucket[c_b] = b
+      c_b = c1
+      b = bucket[c_b]
+    }
+    sa[b] = k.as_i32
+    b += 1
+  }
+}
+
+# induce_sub_s_8_32 inserts the S-type text indexes of LMS-substrings
+# into sa, assuming that the leftmost L-type text indexes are already
+# inserted into sa, sorted by LMS-substring suffix, and at the
+# left end of the corresponding character bucket.
+# Each LMS-substring has the form (as a regexp) /S+L+S/:
+# one or more S-type, one or more L-type, final S-type.
+# induce_sub_s_8_32 leaves behind only the leftmost S-type text
+# index for each LMS-substring, in sorted order, at the right end of sa.
+# That is, it removes the L-type indexes that are present on entry,
+# and it inserts but then removes the interior S-type indexes too,
+# leaving the LMS-substring start indexes packed into sa[sa.size-num_lms:].
+# (Only the LMS-substring start indexes are processed by the recursion.)
+def induce_sub_s_8_32(text: [Byte], sa: [I32], freq: [I32], bucket: [I32]) {
+  # Initialize positions for right side of character buckets.
+  bucket_max_8_32(text, freq, bucket)
+
+  # Analogous to induce_sub_l_8_32 above,
+  # as we scan the array right-to-left, each sa[i] = j > 0 is a correctly
+  # sorted suffix array entry (for text[j:]) for which we know that j-1 is type S.
+  # Because j-1 is type S, inserting it into sa now will sort it correctly.
+  # But we want to distinguish a j-1 with j-2 of type S from type L.
+  # We can process the former but want to leave the latter for the caller.
+  # We record the difference by negating j-1 if it is preceded by type L.
+  # Either way, the insertion (into the text[j-1] bucket) is guaranteed to
+  # happen at sa[i´] for some i´ < i, that is, in the portion of sa we have
+  # yet to scan. A single pass therefore sees indexes j, j-1, j-2, j-3,
+  # and so on, in sorted but not necessarily adjacent order, until it finds
+  # one preceded by an index of type L, at which point it must stop.
+  # That index (preceded by one of type L) is an LMS-substring start.
+  #
+  # As we scan through the array, we clear the worked entries (sa[i] > 0) to zero,
+  # and we flip sa[i] < 0 to -sa[i] and compact into the top of sa,
+  # so that the loop finishes with the top of sa containing exactly
+  # the LMS-substring start indexes, sorted by LMS-substring.
+
+  # Cache recently used bucket index:
+  c_b: Byte = 0
+  b = bucket[c_b]
+
+  top = sa.size
+  i = sa.size
+  while i > 0 {
+    i -= 1
+    j = sa[i].to_i
+    if j == 0 {
+      # Skip empty entry.
+      next
+    }
+    sa[i] = 0
+    if j < 0 {
+      # Leave discovered LMS-substring start index for caller.
+      top -= 1
+      sa[top] = (-j).as_i32
+      next
+    }
+
+    # Index j was on work queue, meaning k := j-1 is S-type,
+    # so we can now place k correctly into sa.
+    # If k-1 is S-type, queue k for processing later in this loop.
+    # If k-1 is L-type (text[k-1] > text[k]), queue -k to save for the caller.
+    k = j - 1
+    c1 = text[k]
+    c0 = text[k - 1]
+    if c0 > c1 {
+      k = -k
+    }
+
+    if c_b != c1 {
+      bucket[c_b] = b
+      c_b = c1
+      b = bucket[c_b]
+    }
+    b -= 1
+    sa[b] = k.as_i32
+  }
+}
+
+# length_8_32 computes and records the length of each LMS-substring in text.
+# The length of the LMS-substring at index j is stored at sa[j/2],
+# avoiding the LMS-substring indexes already stored in the top half of sa.
+# (If index j is an LMS-substring start, then index j-1 is type L and cannot be.)
+# There are two exceptions, made for optimizations in assign_id_8_32 below.
+#
+# First, the final LMS-substring is recorded as having length 0, which is otherwise
+# impossible, instead of giving it a length that includes the implicit sentinel.
+# This ensures the final LMS-substring has length unequal to all others
+# and therefore can be detected as different without text comparison
+# (it is unequal because it is the only one that ends in the implicit sentinel,
+# and the text comparison would be problematic since the implicit sentinel
+# is not actually present at text[text.size]).
+#
+# Second, to avoid text comparison entirely, if an LMS-substring is very short,
+# sa[j/2] records its actual text instead of its length, so that if two such
+# substrings have matching “length,” the text need not be read at all.
+# The definition of “very short” is that the text bytes must pack into a U32,
+# and the unsigned encoding e must be ≥ text.size, so that it can be
+# distinguished from a valid length.
+def length_8_32(text: [Byte], sa: [I32], _num_lms: Int) {
+  end = 0 # index of current LMS-substring end (0 indicates final LMS-substring)
+
+  # The encoding of N text bytes into a “length” word
+  # adds 1 to each byte, packs them into the bottom
+  # N*8 bits of a word, and then bitwise inverts the result.
+  # That is, the text sequence A B C (hex 41 42 43)
+  # encodes as ^U32(0x42_43_44).
+  # LMS-substrings can never start or end with 0xFF.
+  # Adding 1 ensures the encoded byte sequence never
+  # starts or ends with 0x00, so that present bytes can be
+  # distinguished from zero-padding in the top bits,
+  # so the length need not be separately encoded.
+  # Inverting the bytes increases the chance that a
+  # 4-byte encoding will still be ≥ text.size.
+  # In particular, if the first byte is ASCII (<= 0x7E, so +1 <= 0x7F)
+  # then the high bit of the inversion will be set,
+  # making it clearly not a valid length (it would be a negative one).
+  #
+  # cx holds the pre-inverted encoding (the packed incremented bytes).
+  cx = 0.as_u32 # byte-only
+
+  # This stanza (until the blank line) is the "LMS-substring iterator",
+  # described in place_lms_8_32 above, with one line added to maintain cx.
+  c0: Byte = 0
+  c1: Byte = 0
+  is_type_s = false
+  i = text.size
+  while i > 0 {
+    i -= 1
+    c1 = c0
+    c0 = text[i]
+    cx = cx << 8 | (c1 +% 1).as_u32 # byte-only
+    if c0 < c1 {
+      is_type_s = true
+    } else if c0 > c1 && is_type_s {
+      is_type_s = false
+
+      # Index j = i+1 is the start of an LMS-substring.
+      # Compute length or encoded text to store in sa[j/2].
+      j = i + 1
+      code: I32 = 0
+      if end != 0 {
+        code = (end - j).as_i32
+        if code <= 32 / 8 && ^cx >= text.size.as_u32 { # byte-only
+          code = (^cx).as_i32                          # byte-only
+        }                                              # byte-only
+      }
+      sa[j >> 1] = code
+      end = j + 1
+      cx = (c1 +% 1).as_u32 # byte-only
+    }
+  }
+}
+
+# assign_id_8_32 assigns a dense ID numbering to the
+# set of LMS-substrings respecting string ordering and equality,
+# returning the maximum assigned ID.
+# For example given the input "ababab", the LMS-substrings
+# are "aba", "aba", and "ab", renumbered as 2 2 1.
+# sa[sa.size-num_lms:] holds the LMS-substring indexes
+# sorted in string order, so to assign numbers we can
+# consider each in turn, removing adjacent duplicates.
+# The new ID for the LMS-substring at index j is written to sa[j/2],
+# overwriting the length previously stored there (by length_8_32 above).
+def assign_id_8_32(text: [Byte], sa: [I32], num_lms: Int) -> Int {
+  id = 0
+  last_len: I32 = -1 # impossible
+  last_pos = 0
+  for x in sa.size - num_lms...sa.size {
+    j = sa[x].to_i
+    # Is the LMS-substring at index j new, or is it the same as the last one we saw?
+    n = sa[j / 2]
+    same = false
+    if n == last_len {
+      if n.as_u32 >= text.size.as_u32 {
+        # “Length” is really encoded full text, and they match.
+        same = true
+      } else {
+        # Compare actual texts.
+        m = n.to_i
+        same = true
+        k = 0
+        while k < m {
+          if text[j + k] != text[last_pos + k] {
+            same = false
+            break
+          }
+          k += 1
+        }
+      }
+    }
+    if !same {
+      id += 1
+      last_pos = j
+      last_len = n
+    }
+    sa[j / 2] = id.as_i32
+  }
+  id
+}
+
+# map_32 maps the LMS-substrings in text to their new IDs,
+# producing the subproblem for the recursion.
+# The mapping itself was mostly applied by assign_id_8_32:
+# sa[i] is either 0, the ID for the LMS-substring at index 2*i,
+# or the ID for the LMS-substring at index 2*i+1.
+# To produce the subproblem we need only remove the zeros
+# and change ID into ID-1 (our IDs start at 1, but text chars start at 0).
+#
+# map_32 packs the result, which is the input to the recursion,
+# into the top of sa, so that the recursion result can be stored
+# in the bottom of sa, which sets up for expand_8_32 well.
+def map_32(sa: [I32], _num_lms: Int) {
+  w = sa.size
+  i = sa.size / 2 + 1
+  while i > 0 {
+    i -= 1
+    j = sa[i]
+    if j > 0 {
+      w -= 1
+      sa[w] = j - 1
+    }
+  }
+}
+
+# recurse_32 calls sais_32 recursively to solve the subproblem we've built.
+# The subproblem is at the right end of sa, the suffix array result will be
+# written at the left end of sa, and the middle of sa is available for use as
+# temporary frequency and bucket storage.
+def recurse_32(sa: [I32], old_tmp: [I32], num_lms: Int, max_id: Int) -> Unit {
+  dst = sa[0...num_lms]
+  sa_tmp = sa[num_lms...sa.size - num_lms]
+  text = sa[sa.size - num_lms...sa.size]
+
+  # Set up temporary space for recursive call.
+  # We must pass sais_32 a tmp buffer with at least max_id entries.
+  #
+  # The subproblem is guaranteed to have length at most sa.size/2,
+  # so that sa can hold both the subproblem and its suffix array.
+  # Nearly all the time, however, the subproblem has length < sa.size/3,
+  # in which case there is a subproblem-sized middle of sa that
+  # we can reuse for temporary space (sa_tmp).
+  # When recurse_32 is called from sais_8_32, old_tmp is length 512
+  # (from text_32), and sa_tmp will typically be much larger, so we'll use sa_tmp.
+  # When deeper recursions come back to recurse_32, now old_tmp is
+  # the sa_tmp from the top-most recursion, it is typically larger than
+  # the current sa_tmp (because the current sa gets smaller and smaller
+  # as the recursion gets deeper), and we keep reusing that top-most
+  # large sa_tmp instead of the offered smaller ones.
+  #
+  # Why is the subproblem length so often just under sa.size/3?
+  # See Nong, Zhang, and Chen, section 3.6 for a plausible explanation.
+  # In brief, the sa.size/2 case would correspond to an SLSLSLSLSLSL pattern
+  # in the input, perfect alternation of larger and smaller input bytes.
+  # Real text doesn't do that. If each L-type index is randomly followed
+  # by either an L-type or S-type index, then half the substrings will
+  # be of the form SLS, but the other half will be longer. Of that half,
+  # half (a quarter overall) will be SLLS; an eighth will be SLLLS, and so on.
+  # Not counting the final S in each (which overlaps the first S in the next),
+  # This works out to an average length 2×½ + 3×¼ + 4×⅛ + ... = 3.
+  # The space we need is further reduced by the fact that many of the
+  # short patterns like SLS will often be the same character sequences
+  # repeated throughout the text, reducing max_id relative to num_lms.
+  #
+  # For short inputs, the averages may not run in our favor, but then we
+  # can often fall back to using the length-512 tmp available in the
+  # top-most call. (Also a short allocation would not be a big deal.)
+  #
+  # For pathological inputs, we fall back to allocating a new tmp of length
+  # max(max_id, num_lms/2). This level of the recursion needs max_id,
+  # and all deeper levels of the recursion will need no more than num_lms/2,
+  # so this one allocation is guaranteed to suffice for the entire stack
+  # of recursive calls.
+  tmp = old_tmp
+  if tmp.size < sa_tmp.size {
+    tmp = sa_tmp
+  }
+  if tmp.size < num_lms {
+    # The "forcealloc" test reaches this code.
+    n = max_id
+    if n < num_lms / 2 {
+      n = num_lms / 2
+    }
+    fresh: [I32] = [0; n]
+    tmp = fresh
+  }
+
+  # sais_32 requires that the caller arrange to clear dst,
+  # because in general the caller may know dst is
+  # freshly-allocated and already cleared. But this one is not.
+  for i in 0...dst.size {
+    dst[i] = 0
+  }
+  sais_32(text, max_id, dst, tmp)
+}
+
+# unmap_8_32 unmaps the subproblem back to the original.
+# sa[:num_lms] is the LMS-substring numbers, which don't matter much anymore.
+# sa[sa.size-num_lms:] is the sorted list of those LMS-substring numbers.
+# The key part is that if the list says K that means the K'th substring.
+# We can replace sa[:num_lms] with the indexes of the LMS-substrings.
+# Then if the list says K it really means sa[K].
+# Having mapped the list back to LMS-substring indexes,
+# we can place those into the right buckets.
+def unmap_8_32(text: [Byte], sa: [I32], num_lms: Int) {
+  unmap = sa[sa.size - num_lms...sa.size]
+  j = unmap.size
+
+  # "LMS-substring iterator" (see place_lms_8_32 above).
+  c0: Byte = 0
+  c1: Byte = 0
+  is_type_s = false
+  i = text.size
+  while i > 0 {
+    i -= 1
+    c1 = c0
+    c0 = text[i]
+    if c0 < c1 {
+      is_type_s = true
+    } else if c0 > c1 && is_type_s {
+      is_type_s = false
+
+      # Populate inverse map.
+      j -= 1
+      unmap[j] = (i + 1).as_i32
+    }
+  }
+
+  # Apply inverse map to subproblem suffix array.
+  for x in 0...num_lms {
+    sa[x] = unmap[sa[x]]
+  }
+}
+
+# expand_8_32 distributes the compacted, sorted LMS-suffix indexes
+# from sa[:num_lms] into the tops of the appropriate buckets in sa,
+# preserving the sorted order and making room for the L-type indexes
+# to be slotted into the sorted sequence by induce_l_8_32.
+def expand_8_32(text: [Byte], freq: [I32], bucket: [I32], sa: [I32], num_lms: Int) {
+  bucket_max_8_32(text, freq, bucket)
+
+  # Loop backward through sa, always tracking
+  # the next index to populate from sa[:num_lms].
+  # When we get to one, populate it.
+  # Zero the rest of the slots; they have dead values in them.
+  x = num_lms - 1
+  sa_x = sa[x]
+  c = text[sa_x]
+  b = bucket[c] - 1
+  bucket[c] = b
+
+  i = sa.size
+  while i > 0 {
+    i -= 1
+    if i != b.to_i {
+      sa[i] = 0
+      next
+    }
+    sa[i] = sa_x
+
+    # Load next entry to put down (if any).
+    if x > 0 {
+      x -= 1
+      sa_x = sa[x]
+      c = text[sa_x]
+      b = bucket[c] - 1
+      bucket[c] = b
+    }
+  }
+}
+
+# induce_l_8_32 inserts L-type text indexes into sa,
+# assuming that the leftmost S-type indexes are inserted
+# into sa, in sorted order, in the right bucket halves.
+# It leaves all the L-type indexes in sa, but the
+# leftmost L-type indexes are negated, to mark them
+# for processing by induce_s_8_32.
+def induce_l_8_32(text: [Byte], sa: [I32], freq: [I32], bucket: [I32]) {
+  # Initialize positions for left side of character buckets.
+  bucket_min_8_32(text, freq, bucket)
+
+  # This scan is similar to the one in induce_sub_l_8_32 above.
+  # That one arranges to clear all but the leftmost L-type indexes.
+  # This scan leaves all the L-type indexes and the original S-type
+  # indexes, but it negates the positive leftmost L-type indexes
+  # (the ones that induce_s_8_32 needs to process).
+
+  # expand_8_32 left out the implicit entry sa[-1] == text.size,
+  # corresponding to the identified type-L index text.size-1.
+  # Process it before the left-to-right scan of sa proper.
+  # See body in loop for commentary.
+  k = text.size - 1
+  c0 = text[k - 1]
+  c1 = text[k]
+  if c0 < c1 {
+    k = -k
+  }
+
+  # Cache recently used bucket index.
+  c_b = c1
+  b = bucket[c_b]
+  sa[b] = k.as_i32
+  b += 1
+
+  for i in 0...sa.size {
+    j = sa[i].to_i
+    if j <= 0 {
+      # Skip empty or negated entry (including negated zero).
+      next
+    }
+
+    # Index j was on work queue, meaning k := j-1 is L-type,
+    # so we can now place k correctly into sa.
+    # If k-1 is L-type, queue k for processing later in this loop.
+    # If k-1 is S-type (text[k-1] < text[k]), queue -k to save for the caller.
+    # If k is zero, k-1 doesn't exist, so we only need to leave it
+    # for the caller. The caller can't tell the difference between
+    # an empty slot and a non-empty zero, but there's no need
+    # to distinguish them anyway: the final suffix array will end up
+    # with one zero somewhere, and that will be a real zero.
+    k = j - 1
+    c1 = text[k]
+    if k > 0 {
+      c0 = text[k - 1]
+      if c0 < c1 {
+        k = -k
+      }
+    }
+
+    if c_b != c1 {
+      bucket[c_b] = b
+      c_b = c1
+      b = bucket[c_b]
+    }
+    sa[b] = k.as_i32
+    b += 1
+  }
+}
+
+def induce_s_8_32(text: [Byte], sa: [I32], freq: [I32], bucket: [I32]) {
+  # Initialize positions for right side of character buckets.
+  bucket_max_8_32(text, freq, bucket)
+
+  c_b: Byte = 0
+  b = bucket[c_b]
+
+  i = sa.size
+  while i > 0 {
+    i -= 1
+    j = sa[i].to_i
+    if j >= 0 {
+      # Skip non-flagged entry.
+      # (This loop can't see an empty entry; 0 means the real zero index.)
+      next
+    }
+
+    # Negative j is a work queue entry; rewrite to positive j for final suffix array.
+    j = -j
+    sa[i] = j.as_i32
+
+    # Index j was on work queue (encoded as -j but now decoded),
+    # meaning k := j-1 is L-type,
+    # so we can now place k correctly into sa.
+    # If k-1 is S-type, queue -k for processing later in this loop.
+    # If k-1 is L-type (text[k-1] > text[k]), queue k to save for the caller.
+    # If k is zero, k-1 doesn't exist, so we only need to leave it
+    # for the caller.
+    k = j - 1
+    c1 = text[k]
+    if k > 0 {
+      c0 = text[k - 1]
+      if c0 <= c1 {
+        k = -k
+      }
+    }
+
+    if c_b != c1 {
+      bucket[c_b] = b
+      c_b = c1
+      b = bucket[c_b]
+    }
+    b -= 1
+    sa[b] = k.as_i32
+  }
+}

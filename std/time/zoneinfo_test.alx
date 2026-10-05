@@ -1,0 +1,242 @@
+# Go's zoneinfo_test.go and zoneinfo_unix_test.go. The tests that need a known tz
+# database (Go's DisablePlatformSources ones) are in std/time/tzdata, which embeds
+# one; these use the system's database only where the outcome doesn't depend on it.
+
+extern def test_setenv(name: Str, value: Str, overwrite: I32) -> I32 = "setenv"
+extern def test_unsetenv(name: Str) -> I32 = "unsetenv"
+
+# Sets (or, with none, unsets) an environment variable.
+def put_env(name: Str, value: Str?) {
+  if v = value {
+    test_setenv(name, v, 1.to_i32)
+  } else {
+    test_unsetenv(name)
+  }
+}
+
+def lerr(name: Str) -> Str {
+  r = load_location(name)
+  if e = r.err { return e.message }
+  "ok"
+}
+
+test "bad location error message (TestBadLocationErrMsg)" {
+  assert_eq lerr("Asia/SomethingNotExist"), "unknown time zone Asia/SomethingNotExist"
+}
+
+test "load_location validates names (TestLoadLocationValidatesNames)" {
+  old = getenv("ZONEINFO")
+  put_env("ZONEINFO", "")
+  for v in ["/usr/foo/Foo", "\\UNC\\foo", "..", "a.."] {
+    assert_eq lerr(v), "time: invalid location name"
+  }
+  put_env("ZONEINFO", old)
+}
+
+test "location names (TestLocationNames)" {
+  assert_eq local().string, "Local"
+  assert_eq utc().string, "UTC"
+  assert_eq (~load_location("")).string, "UTC"
+  assert_eq (~load_location("UTC")).string, "UTC"
+  assert_eq (~load_location("Local")).string, "Local"
+}
+
+test "malformed tzdata (TestMalformedTZData)" {
+  # Go's issue 29437: the goal is an error, not a panic.
+  issue29437: [Byte] = "TZif".bytes.to_a
+  issue29437 << 0
+  issue29437 = issue29437 + "000000000000000".bytes.to_a
+  z3: [Byte] = [0; 3]
+  issue29437 = issue29437 + z3
+  issue29437 << 1
+  z20: [Byte] = [0; 20]
+  issue29437 = issue29437 + z20 + "00".bytes.to_a
+  r = load_location_from_tzdata("abc", issue29437)
+  assert r.err?
+  assert_eq r.err.unwrap.message, "malformed time zone information"
+  assert load_location_from_tzdata("abc", []).err?
+  assert load_location_from_tzdata("abc", "TZif".bytes.to_a).err?
+  assert load_location_from_tzdata("abc", "TZiX0000000000000000".bytes.to_a).err?
+}
+
+test "slim tzdata (TestLoadLocationFromTZDataSlim)" {
+  cases = [
+    ("Europe/Berlin", "2020b_Europe_Berlin", date(2020, OCTOBER, 29, 15, 30, 0, 0, utc()), "CET", 3600),
+    ("America/Nuuk", "2021a_America_Nuuk", date(2020, OCTOBER, 29, 15, 30, 0, 0, utc()), "-03", -10800),
+    ("Asia/Gaza", "2021a_Asia_Gaza", date(2020, OCTOBER, 29, 15, 30, 0, 0, utc()), "EET", 7200),
+    ("Europe/Dublin", "2021a_Europe_Dublin", date(2021, APRIL, 2, 11, 12, 13, 0, utc()), "IST", 3600),
+  ]
+  for c in cases {
+    data = ~read_file("testdata/" + c[1])
+    reference = ~load_location_from_tzdata(c[0], data)
+    # Go's date(..., reference): the same wall clock in the zone
+    w = c[2]
+    d = date(w.year, w.month, w.day, w.hour, w.minute, w.second, 0, reference)
+    name, off = d.zone_info
+    assert_eq name, c[3]
+    assert_eq off, c[4]
+  }
+}
+
+test "tzset (TestTzset)" {
+  assert tzset("", 0, 0) == none
+  cases = [
+    ("PST8PDT,M3.2.0,M11.1.0", 0, 2159200800, "PDT", -7 * 60 * 60, 2152173600, 2172733200, true),
+    ("PST8PDT,M3.2.0,M11.1.0", 0, 2152173599, "PST", -8 * 60 * 60, 2145916800, 2152173600, false),
+    ("PST8PDT,M3.2.0,M11.1.0", 0, 2152173600, "PDT", -7 * 60 * 60, 2152173600, 2172733200, true),
+    ("PST8PDT,M3.2.0,M11.1.0", 0, 2152173601, "PDT", -7 * 60 * 60, 2152173600, 2172733200, true),
+    ("PST8PDT,M3.2.0,M11.1.0", 0, 2172733199, "PDT", -7 * 60 * 60, 2152173600, 2172733200, true),
+    ("PST8PDT,M3.2.0,M11.1.0", 0, 2172733200, "PST", -8 * 60 * 60, 2172733200, 2177452800, false),
+    ("PST8PDT,M3.2.0,M11.1.0", 0, 2172733201, "PST", -8 * 60 * 60, 2172733200, 2177452800, false),
+    ("KST-9", 592333200, 1677246697, "KST", 9 * 60 * 60, 592333200, 9223372036854775807, false),
+  ]
+  for c in cases {
+    r = tzset(c[0], c[1], c[2]).unwrap
+    assert_eq r[0], c[3]
+    assert_eq r[1], c[4]
+    assert_eq r[2], c[5]
+    assert_eq r[3], c[6]
+    assert_eq r[4], c[7]
+  }
+}
+
+def tzname(s: Str) -> Str {
+  if r = tzset_name(s) { return "#{r[0]}|#{r[1]}" }
+  "fail"
+}
+
+test "tzset_name (TestTzsetName)" {
+  assert_eq tzname(""), "fail"
+  assert_eq tzname("X"), "fail"
+  assert_eq tzname("PST"), "PST|"
+  assert_eq tzname("PST8PDT"), "PST|8PDT"
+  assert_eq tzname("PST-08"), "PST|-08"
+  assert_eq tzname("<A+B>+08"), "A+B|+08"
+}
+
+def tzoff(s: Str) -> Str {
+  if r = tzset_offset(s) { return "#{r[0]}|#{r[1]}" }
+  "fail"
+}
+
+test "tzset_offset (TestTzsetOffset)" {
+  assert_eq tzoff(""), "fail"
+  assert_eq tzoff("X"), "fail"
+  assert_eq tzoff("+"), "fail"
+  assert_eq tzoff("+08"), "#{8 * 60 * 60}|"
+  assert_eq tzoff("-01:02:03"), "#{-1 * 60 * 60 - 2 * 60 - 3}|"
+  assert_eq tzoff("01"), "#{1 * 60 * 60}|"
+  assert_eq tzoff("100"), "#{100 * 60 * 60}|"
+  assert_eq tzoff("1000"), "fail"
+  assert_eq tzoff("8PDT"), "#{8 * 60 * 60}|PDT"
+}
+
+def tzrule(s: Str) -> Str {
+  if r = tzset_rule(s) {
+    x = r[0]
+    return "#{x.kind} #{x.day} #{x.week} #{x.mon} #{x.time}|#{r[1]}"
+  }
+  "fail"
+}
+
+test "tzset_rule (TestTzsetRule)" {
+  assert_eq tzrule(""), "fail"
+  assert_eq tzrule("X"), "fail"
+  assert_eq tzrule("J10"), "#{RULE_JULIAN} 10 0 0 7200|"
+  assert_eq tzrule("20"), "#{RULE_DOY} 20 0 0 7200|"
+  assert_eq tzrule("M1.2.3"), "#{RULE_MONTH_WEEK_DAY} 3 2 1 7200|"
+  assert_eq tzrule("30/03:00:00"), "#{RULE_DOY} 30 0 0 10800|"
+  assert_eq tzrule("M4.5.6/03:00:00"), "#{RULE_MONTH_WEEK_DAY} 6 5 4 10800|"
+  assert_eq tzrule("M4.5.7/03:00:00"), "fail"
+  assert_eq tzrule("M4.5.6/-04"), "#{RULE_MONTH_WEEK_DAY} 6 5 4 -14400|"
+}
+
+def local_name -> Str {
+  if l = local_tz() { return l.name }
+  "none"
+}
+
+test "TZ and the local zone (TestEnvTZUsage)" {
+  old = getenv("TZ")
+  local_zone_name = read_file("/etc/localtime").ok? ? "Local" : "UTC"
+  put_env("TZ", none)
+  assert_eq local_name(), local_zone_name
+  put_env("TZ", "")
+  assert_eq local_name(), "UTC"
+  put_env("TZ", ":")
+  assert_eq local_name(), "UTC"
+  put_env("TZ", "/etc/localtime")
+  assert_eq local_name(), local_zone_name
+  put_env("TZ", ":/etc/localtime")
+  assert_eq local_name(), local_zone_name
+  path = "/usr/share/zoneinfo/Asia/Shanghai"
+  if read_file(path).ok? {
+    put_env("TZ", "Asia/Shanghai")
+    assert_eq local_name(), "Asia/Shanghai"
+    put_env("TZ", ":Asia/Shanghai")
+    assert_eq local_name(), "Asia/Shanghai"
+    put_env("TZ", path)
+    assert_eq local_name(), path
+    sh = local_tz().unwrap
+    assert date(2009, 1, 1, 12, 0, 0, 0, utc()) == date(2009, 1, 1, 20, 0, 0, 0, sh)
+    put_env("TZ", ":" + path)
+    assert_eq local_name(), path
+    put_env("TZ", path[0...path.size - 1])
+    assert_eq local_name(), "UTC"
+  } else {
+    put_env("TZ", path)
+    assert_eq local_name(), "UTC"
+  }
+  put_env("TZ", old)
+}
+
+test "zone_bounds and is_dst of the local zone agree with its offsets" {
+  t = now()
+  s, e = t.zone_bounds
+  _, off = t.zone_info
+  if !s.is_zero {
+    assert !s.after(t)
+    _, soff = s.zone_info
+    assert_eq soff, off
+  }
+  if !e.is_zero {
+    assert e.after(t)
+    _, eoff = e.add(second() * -1).zone_info
+    assert_eq eoff, off
+  }
+  # a fixed zone has no bounds
+  fs, fe = t.in_zone(fixed_zone("X", 3600)).zone_bounds
+  assert fs.is_zero && fe.is_zero
+  assert !t.in_zone(fixed_zone("X", 3600)).is_dst
+}
+
+test "Location of a Time" {
+  assert_eq Time.new().location.string, "UTC"
+  assert_eq date(2020, 1, 1, 0, 0, 0, 0, fixed_zone("ABC", 60)).location.string, "ABC"
+  assert_eq now().location.string, "Local"
+  assert_eq now().utc.location.string, "UTC"
+}
+
+test "the system's database, when there is one" {
+  r = load_location("America/New_York")
+  if loc = r.ok {
+    assert_eq loc.string, "America/New_York"
+    t = date(2021, 7, 4, 12, 0, 0, 0, loc)
+    assert_eq t.format(RFC3339), "2021-07-04T12:00:00-04:00"
+    assert t.is_dst
+    assert_eq date(2021, 1, 4, 12, 0, 0, 0, loc).format("MST -0700"), "EST -0500"
+    # Go's Parse matches an abbreviation against the location's zones
+    p = ~parse_in_location("2006-01-02 15:04 MST", "2021-07-04 12:00 EDT", loc)
+    assert p == t
+    assert_eq p.location.string, "America/New_York"
+    # and an offset the location has at that time
+    q = ~parse_in_location(RFC3339, "2021-07-04T12:00:00-04:00", loc)
+    assert_eq q.location.string, "America/New_York"
+    q2 = ~parse_in_location(RFC3339, "2021-07-04T12:00:00-05:00", loc)
+    assert_eq q2.location.string, ""
+  }
+  # a directory is not a zone
+  if read_file("/usr/share/zoneinfo/America/New_York").ok? {
+    assert_eq lerr("America"), "is a directory"
+  }
+}

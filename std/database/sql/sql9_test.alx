@@ -1,0 +1,311 @@
+# Go's sql_test.go, part 9: TestOpenConnector .. TestNullTypeScanNil.
+#
+# Not translated: TestContextCancelDuringRawBytesScan, TestRawBytesReuse
+# (no RawBytes), TestGrabConnAllocs / BenchmarkGrabConn (allocation
+# counting), TestConnRequestSet (Go's internal request set; the pool keeps a
+# map here), TestQueryRowsScanner (RowsColumnScanner, not ported),
+# TestTypedString (no defined string types), and the Benchmark*s.
+
+import "context"
+import "database/sql/driver"
+import "time"
+
+test "OpenConnector" {
+  drv = new_fake_driver
+  drv2 = FakeDriver.new(st: drv.st, hooks: drv.hooks, with_connector: true)
+  register("testctx", drv2)
+  db = ~open("testctx", "people")
+  c = case db.src {
+    Conn(x) => x.as(FakeConnector)
+    _ => none
+  }
+  assert c != none, "not using FakeConnector"
+  ~db.close
+  assert c.unwrap.closed.lock { |x| x }, "connector is not closed"
+}
+
+# Go's ctxOnlyConn: only the context forms of exec and query.
+struct CtxOnlyConn {
+  fc: FakeConn
+  calls: Mutex[(Bool, Bool)]
+  def begin -> ~driver.Tx { fc.~begin }
+  def close -> ~Unit { fc.~close }
+  def prepare(q: Str) -> ~driver.Stmt { panic "not used" }
+  def prepare_context(ctx: context.Context, q: Str) -> ~driver.Stmt { fc.~prepare_context(ctx, q) }
+  def query_context(ctx: context.Context, q: Str, args: [driver.NamedValue]) -> ~driver.Rows {
+    calls.lock { |c|
+      c = (true, c[1])
+      nil
+    }
+    fc.~query_context(ctx, q, args)
+  }
+  def exec_context(ctx: context.Context, q: Str, args: [driver.NamedValue]) -> ~driver.Result {
+    calls.lock { |c|
+      c = (c[0], true)
+      nil
+    }
+    fc.~exec_context(ctx, q, args)
+  }
+}
+
+struct CtxOnlyDriver {
+  drv: FakeDriver
+  def open(dsn: Str) -> ~driver.Conn {
+    c = drv.~open_fake(dsn)
+    CtxOnlyConn.new(fc: c, calls: Mutex.new((false, false)))
+  }
+}
+
+test "QueryExecContextOnly" {
+  register("ContextOnly", CtxOnlyDriver.new(drv: new_fake_driver))
+  db = ~open("ContextOnly", "")
+  ctx = context.background
+  conn = db.~conn_context(ctx)
+  coc = conn.dc.ci.as(CtxOnlyConn).unwrap
+  coc.fc.set_skip_dirty_session
+  conn.~exec_context(ctx, "WIPE", nil)
+  conn.~exec_context(ctx, "CREATE|keys|v1=string", nil)
+  conn.~exec_context(ctx, "INSERT|keys|v1=?", "value1")
+  rows = conn.~query_context(ctx, "SELECT|keys|v1|", nil)
+  v1 = ""
+  while rows.next {
+    x: Str = rows.~scan
+    v1 = x
+  }
+  ~rows.close
+  assert_eq v1, "value1"
+  c = coc.calls.lock { |x| x }
+  assert c[1], "ExecContext not called"
+  assert c[0], "QueryContext not called"
+  ~conn.close
+  ~db.close
+}
+
+error TestErr {
+  ScanWrap
+  Empty
+  def message -> Str {
+    case self {
+      ScanWrap => "errTestScanWrap"
+      Empty => "empty value"
+    }
+  }
+}
+
+# Go's alwaysErrScanner: a Scanner (here a static sql_scan) that fails.
+struct AlwaysErrScanner {
+  def self.sql_scan(src: driver.Value) -> ~AlwaysErrScanner { fail TestErr.ScanWrap }
+  def self.from_sql_row(raw: RawRow) -> ~AlwaysErrScanner {
+    v: AlwaysErrScanner = ~one_column(raw)
+    v
+  }
+}
+
+def is_scan_wrap?(e: Error) -> Bool {
+  case e {
+    TestErr.ScanWrap => true
+    _ => false
+  }
+}
+
+test "RowsScanProperlyWrapsErrors" {
+  test_database([], ->(db: DB) -> ~Unit {
+    populate(db, "people")
+    rows = db.~query("SELECT|people|age|", nil)
+    while rows.next {
+      r: ~AlwaysErrScanner = rows.scan
+      e = r.err
+      assert e != none, "expecting back an error"
+      assert is_scan_wrap?(e.unwrap), "errors.Is mismatch: #{e}"
+      assert e.unwrap.message.include?("errTestScanWrap"), "Error #{e} does not contain errTestScanWrap"
+    }
+    nil
+  }).unwrap
+}
+
+# Go's alwaysErrValuer.
+struct AlwaysErrValuer {
+  def sql_value -> ~driver.Value { fail TestErr.Empty }
+}
+
+test "DriverArgsWrapsErrors" {
+  db = new_test_db("people")
+  r = db.exec("INSERT|keys|dec1=?", AlwaysErrValuer.new)
+  e = r.err.unwrap
+  assert (case e {
+    TestErr.Empty => true
+    _ => false
+  }), "errors.Is mismatch: #{e}"
+  assert e.message.include?("empty value"), "#{e}"
+  r2 = db.query("INSERT|keys|dec1=?", AlwaysErrValuer.new)
+  assert (r2.err?.message || "").include?("empty value"), "query: #{r2.err}"
+  close_db(db)
+}
+
+test "ContextCancelBetweenNextAndErr" {
+  test_database([], ->(db: DB) -> ~Unit {
+    populate(db, "people")
+    ctx, cancel = context.with_cancel(context.background)
+    defer cancel()
+    r = db.~query_context(ctx, "SELECT|people|name|", nil)
+    while r.next {
+    }
+    cancel()
+    time.sleep(time.millisecond * 5)
+    assert r.err == none, "#{r.err}"
+    nil
+  }).unwrap
+}
+
+test "NilErrorAfterClose" {
+  test_database([], ->(db: DB) -> ~Unit {
+    populate(db, "people")
+    ctx, cancel = context.with_cancel(context.background)
+    defer cancel()
+    r = db.~query_context(ctx, "SELECT|people|name|", nil)
+    ~r.close
+    time.sleep(time.millisecond * 5)
+    assert r.err == none, "#{r.err}"
+    nil
+  }).unwrap
+}
+
+# Go's badConn / badDriver: a connection whose Exec panics.
+struct BadConn {
+  def prepare(query: Str) -> ~driver.Stmt { fail "badConn Prepare" }
+  def close -> ~Unit { nil }
+  def begin -> ~driver.Tx { fail "badConn Begin" }
+  def exec(query: Str, args: [driver.Value]) -> ~driver.Result { panic "badConn.Exec" }
+}
+
+struct BadDriver {
+  def open(name: Str) -> ~driver.Conn { BadConn.new }
+}
+
+test "BadDriver" {
+  register("bad", BadDriver.new)
+  db = ~open("bad", "ignored")
+  assert_panics("badConn.Exec") {
+    _ = db.exec("ignored", nil)
+    nil
+  }
+}
+
+# Go's pingDriver / pingConn.
+struct PingConn {
+  fails: Atomic[Bool]
+  def prepare(query: Str) -> ~driver.Stmt { fail "badConn Prepare" }
+  def close -> ~Unit { nil }
+  def begin -> ~driver.Tx { fail "badConn Begin" }
+  def ping(ctx: context.Context) -> ~Unit {
+    fail "Ping failed" if fails.load
+    nil
+  }
+}
+
+struct PingDriver {
+  fails: Atomic[Bool]
+  def open(name: Str) -> ~driver.Conn { PingConn.new(fails: fails) }
+}
+
+test "Ping" {
+  d = PingDriver.new(fails: Atomic.new(false))
+  register("ping", d)
+  db = ~open("ping", "ignored")
+  ~db.ping
+  d.fails.store(true)
+  assert_eq db.ping.err?.message || "", "Ping failed"
+  ~db.close
+}
+
+test "Issue69837" {
+  u = Null[U64].new(v: 1, valid: true)
+  v = driver.~to_value(u)
+  assert v == driver.Value.Int(1), "val: got #{v}, expected 1"
+}
+
+# Go's issue69728Type: a Valuer inside Null[T].
+struct Issue69728 {
+  id: Int
+  name: Str
+  def sql_value -> ~driver.Value { driver.Value.Bytes("#{id}, #{name}".bytes) }
+}
+
+test "Issue69728" {
+  for_value = Null[Issue69728].new(v: Issue69728.new(id: 42, name: "foobar"), valid: true)
+  v1 = for_value.~sql_value
+  v2 = for_value.v.~sql_value
+  assert v1 == v2, "not equal; v1 = #{v1}, v2 = #{v2}"
+}
+
+# Go's unknownInputsConnector: NumInput -1 and a column converter.
+struct UnknownInputsValueConverter {
+  pub def convert_value(v: driver.Value) -> ~driver.Value { driver.Value.Str("string") }
+}
+
+struct UnknownInputsStmt {
+  def close -> ~Unit { nil }
+  def num_input -> Int { -1 }
+  def exec(args: [driver.Value]) -> ~driver.Result {
+    case args[0] {
+      Str(_) => {}
+      _ => { fail "Expected string, got #{args[0].go_type}" }
+    }
+    driver.RowsAffected.new(n: 0)
+  }
+  def query(args: [driver.Value]) -> ~driver.Rows { fail "unused" }
+  def column_converter(idx: Int) -> driver.ValueConverter? { UnknownInputsValueConverter.new }
+}
+
+struct UnknownInputsConn {
+  def prepare(q: Str) -> ~driver.Stmt { UnknownInputsStmt.new }
+  def close -> ~Unit { nil }
+  def begin -> ~driver.Tx { fail "unused" }
+}
+
+struct UnknownInputsConnector {
+  def connect(ctx: context.Context) -> ~driver.Conn { UnknownInputsConn.new }
+}
+
+test "ColumnConverterWithUnknownInputCount" {
+  db = open_db(UnknownInputsConnector.new)
+  stmt = db.~prepare("SELECT ?")
+  stmt.~exec(1)
+  ~stmt.close
+  ~db.close
+}
+
+def null_scan_check[T](name: Str, input: driver.Value, want_err: Bool, valid_of: (T) -> Bool) {
+  r: ~T = scan_value(input)
+  assert r.err? == want_err, "#{name}: Scan() error = #{r.err}, wantErr #{want_err}"
+  if x = r.ok {
+    assert valid_of(x), "#{name}: Scan() returned nil error but Valid=false"
+  }
+}
+
+test "NullTypeScanErrorConsistency" {
+  null_scan_check("NullInt32 with invalid input", driver.Value.Bytes("not_a_number".bytes), true, ->(x: NullInt32) -> Bool { x.valid })
+  null_scan_check("NullInt64 with invalid input", driver.Value.Bytes("not_a_number".bytes), true, ->(x: NullInt64) -> Bool { x.valid })
+  null_scan_check("NullFloat64 with invalid input", driver.Value.Bytes("not_a_float".bytes), true, ->(x: NullFloat64) -> Bool { x.valid })
+  null_scan_check("NullBool with invalid input", driver.Value.Bytes("not_a_bool".bytes), true, ->(x: NullBool) -> Bool { x.valid })
+  null_scan_check("NullInt32 with valid input", driver.Value.Int(42), false, ->(x: NullInt32) -> Bool { x.valid })
+  null_scan_check("NullInt64 with valid input", driver.Value.Int(42), false, ->(x: NullInt64) -> Bool { x.valid })
+  null_scan_check("NullFloat64 with valid input", driver.Value.Float(3.14), false, ->(x: NullFloat64) -> Bool { x.valid })
+  null_scan_check("NullBool with valid input", driver.Value.Bool(true), false, ->(x: NullBool) -> Bool { x.valid })
+  null_scan_check("NullString with valid input", driver.Value.Str("hello"), false, ->(x: NullString) -> Bool { x.valid })
+}
+
+test "NullTypeScanNil" {
+  n1: NullString = ~scan_value(driver.Value.Null)
+  assert !n1.valid, "NullString"
+  n2: NullInt64 = ~scan_value(driver.Value.Null)
+  assert !n2.valid, "NullInt64"
+  n3: NullInt32 = ~scan_value(driver.Value.Null)
+  assert !n3.valid, "NullInt32"
+  n4: NullFloat64 = ~scan_value(driver.Value.Null)
+  assert !n4.valid, "NullFloat64"
+  n5: NullBool = ~scan_value(driver.Value.Null)
+  assert !n5.valid, "NullBool"
+  n6: NullTime = ~scan_value(driver.Value.Null)
+  assert !n6.valid, "NullTime"
+}

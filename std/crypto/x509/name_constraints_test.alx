@@ -1,0 +1,417 @@
+# Go's crypto/x509/name_constraints_test.go. The nameConstraintsTests table
+# is generated into vec_name_constraints_test.alx (name_constraints_tests_N,
+# 18 cases each); the harness below builds each case's chain with
+# create_certificate and checks verify's result as TestConstraintCases does.
+#
+# Not translated:
+# - testChainAgainstOpenSSL / writePEMsToTempFile: disabled in Go too
+#   (testNameConstraintsAgainstOpenSSL = false; needs a system openssl).
+# - Go's sync.Pool of keys: each test block generates its own keys.
+
+import "crypto/ecdsa"
+import "crypto/elliptic"
+import "crypto/rand"
+import "crypto/x509/pkix"
+import "encoding/asn1"
+import "encoding/hex"
+import "math/big"
+import "net/netip"
+import "net/url"
+import "strings"
+import "time"
+
+struct ConstraintsSpec {
+  ok: [Str]
+  bad: [Str]
+  ekus: [Str]
+}
+
+struct LeafSpec {
+  sans: [Str]
+  ekus: [Str]
+  cn: Str
+}
+
+struct NameConstraintsTest {
+  index: Int
+  name: Str
+  roots: [ConstraintsSpec]
+  intermediates: [[ConstraintsSpec]]
+  leaf: LeafSpec
+  requested_ekus: [ExtKeyUsage]
+  expected_error: Str
+}
+
+def nc_serial -> big.Int {
+  serial_bytes = [0.as_u8; 16]
+  rand.read(serial_bytes)
+  n = big.new_int(0)
+  n.set_bytes!(serial_bytes)
+}
+
+# Go's net.ParseCIDR: the network (masked IP, 4-byte form for IPv4).
+def nc_parse_cidr(s: Str) -> ~IPNet {
+  p = netip.~parse_prefix(s)
+  ip = p.addr.as_slice
+  bits = p.bits
+  mask = [0.as_u8; ip.size]
+  i = 0
+  while i < mask.size {
+    if bits >= 8 {
+      mask[i] = 0xff
+      bits -= 8
+    } else if bits > 0 {
+      mask[i] = (0xff.as_u8 << (8 - bits).as_u8)
+      bits = 0
+    }
+    i += 1
+  }
+  masked = [0.as_u8; ip.size]
+  i = 0
+  while i < ip.size {
+    masked[i] = ip[i] & mask[i]
+    i += 1
+  }
+  IPNet.new(ip: masked, mask: mask)
+}
+
+def nc_parse_ekus(eku_strs: [Str]) -> ~([ExtKeyUsage], [asn1.ObjectIdentifier]) {
+  ekus: [ExtKeyUsage] = []
+  unknowns: [asn1.ObjectIdentifier] = []
+  for s in eku_strs {
+    case s {
+      "serverAuth" => ekus << ExtKeyUsage.ServerAuth
+      "clientAuth" => ekus << ExtKeyUsage.ClientAuth
+      "email" => ekus << ExtKeyUsage.EmailProtection
+      "netscapeSGC" => ekus << ExtKeyUsage.NetscapeServerGatedCrypto
+      "msSGC" => ekus << ExtKeyUsage.MicrosoftServerGatedCrypto
+      "any" => ekus << ExtKeyUsage.Any
+      "other" => unknowns << asn1.ObjectIdentifier.new(arcs: [2, 4, 1, 2, 3])
+      _ => {
+        fail err("unknown EKU \"#{s}\"")
+      }
+    }
+  }
+  (ekus, unknowns)
+}
+
+def custom_constraints_extension(type_num: Int, constraint: [Byte], is_excluded: Bool) -> pkix.Extension {
+  tag = is_excluded ? 1 : 0
+  contents: [Byte] = []
+  contents << (tag | 32 | 0x80).as_u8
+  contents << (4 + constraint.size).as_u8
+  contents << 0x30
+  contents << (2 + constraint.size).as_u8
+  contents << type_num.as_u8
+  contents << constraint.size.as_u8
+  contents = contents + constraint
+  value: [Byte] = [0x30, contents.size.as_u8]
+  value = value + contents
+  pkix.Extension.new(id: asn1.ObjectIdentifier.new(arcs: [2, 5, 29, 30]), value: value)
+}
+
+struct ParsedConstraints {
+  dns: [Str]
+  ips: [IPNet]
+  emails: [Str]
+  uris: [Str]
+}
+
+def nc_parse_constraints(constraints: [Str]) -> ~ParsedConstraints {
+  p = ParsedConstraints.new
+  for c in constraints {
+    if c.start_with?("dns:") {
+      p.dns << c[4...c.size]
+    } else if c.start_with?("ip:") {
+      s = c[3...c.size]
+      p.ips << ~nc_parse_cidr(s)
+    } else if c.start_with?("email:") {
+      p.emails << c[6...c.size]
+    } else if c.start_with?("uri:") {
+      p.uris << c[4...c.size]
+    } else {
+      fail err("unknown constraint \"#{c}\"")
+    }
+  }
+  p
+}
+
+def add_constraints_to_template(constraints: ConstraintsSpec, template0: Certificate) -> ~Certificate {
+  template = template0
+  if constraints.ok.size == 1 && constraints.bad.size == 0 && constraints.ok[0] == "unknown:" {
+    template.extra_extensions << custom_constraints_extension(9, [1.as_u8], false)
+    return template
+  }
+  if constraints.bad.size == 1 && constraints.ok.size == 0 && constraints.bad[0] == "unknown:" {
+    template.extra_extensions << custom_constraints_extension(9, [1.as_u8], true)
+    return template
+  }
+  ok = ~nc_parse_constraints(constraints.ok)
+  template.permitted_dns_domains = ok.dns
+  template.permitted_ip_ranges = ok.ips
+  template.permitted_email_addresses = ok.emails
+  template.permitted_uri_domains = ok.uris
+  bad = ~nc_parse_constraints(constraints.bad)
+  template.excluded_dns_domains = bad.dns
+  template.excluded_ip_ranges = bad.ips
+  template.excluded_email_addresses = bad.emails
+  template.excluded_uri_domains = bad.uris
+  ekus, unknowns = ~nc_parse_ekus(constraints.ekus)
+  template.ext_key_usage = ekus
+  template.unknown_ext_key_usage = unknowns
+  template
+}
+
+def make_constraints_ca_cert(constraints: ConstraintsSpec, name: Str, key: ecdsa.PrivateKey, parent0: Certificate?, parent_key: ecdsa.PrivateKey) -> ~Certificate {
+  template0 = Certificate.new(serial_number: nc_serial(), subject: pkix.Name.new(common_name: name), not_before: time.unix(1000, 0), not_after: time.unix(2000, 0), key_usage: KEY_USAGE_CERT_SIGN, basic_constraints_valid: true, is_ca: true)
+  template = ~add_constraints_to_template(constraints, template0)
+  parent = parent0 || template
+  der = ~create_certificate(rand.reader(), template, parent, PublicKey.Ecdsa(key.public_key), PrivateKey.Ecdsa(parent_key))
+  ~parse_certificate(der)
+}
+
+def make_constraints_leaf_cert(leaf: LeafSpec, key: ecdsa.PrivateKey, parent0: Certificate?, parent_key: ecdsa.PrivateKey) -> ~Certificate {
+  template = Certificate.new(serial_number: nc_serial(), subject: pkix.Name.new(organizational_unit: ["Leaf"], common_name: leaf.cn), not_before: time.unix(1000, 0), not_after: time.unix(2000, 0), key_usage: KEY_USAGE_DIGITAL_SIGNATURE, basic_constraints_valid: true, is_ca: false)
+  for name in leaf.sans {
+    if name.start_with?("dns:") {
+      template.dns_names << name[4...name.size]
+    } else if name.start_with?("ip:") {
+      s = name[3...name.size]
+      ip = parse_ip(s)
+      fail err("cannot parse IP \"#{s}\"") if ip.none?
+      template.ip_addresses << (ip || [])
+    } else if name.start_with?("invalidip:") {
+      s = name[10...name.size]
+      r = hex.decode_string(s)
+      if e = r.err {
+        fail err("cannot parse invalid IP: #{e.message}")
+      }
+      template.ip_addresses << r.unwrap
+    } else if name.start_with?("email:") {
+      template.email_addresses << name[6...name.size]
+    } else if name.start_with?("uri:") {
+      s = name[4...name.size]
+      ru = url.parse(s)
+      if e = ru.err {
+        fail err("cannot parse URI \"#{s}\": #{e.message}")
+      }
+      template.uris << ru.unwrap
+    } else if name.start_with?("unknown:") {
+      # This is a special case for testing unknown name types. A custom SAN
+      # extension is injected into the certificate.
+      fail err("when using unknown name types, it must be the sole name") if leaf.sans.size != 1
+      # SEQUENCE, three bytes, undefined GeneralName type 9.
+      v: [Byte] = [0x30, 3, 9, 1, 1]
+      template.extra_extensions << pkix.Extension.new(id: asn1.ObjectIdentifier.new(arcs: [2, 5, 29, 17]), value: v)
+    } else {
+      fail err("unknown name type \"#{name}\"")
+    }
+  }
+  ekus, unknowns = ~nc_parse_ekus(leaf.ekus)
+  template.ext_key_usage = ekus
+  template.unknown_ext_key_usage = unknowns
+  parent = parent0 || template
+  der = ~create_certificate(rand.reader(), template, parent, PublicKey.Ecdsa(key.public_key), PrivateKey.Ecdsa(parent_key))
+  ~parse_certificate(der)
+}
+
+def nc_new_key -> ecdsa.PrivateKey { ecdsa.generate_key(elliptic.p256(), rand.reader()).unwrap }
+
+# Go's TestConstraintCases for one case: "" if it behaved as expected, else
+# the failure.
+def run_constraint_case(test: NameConstraintsTest, keys: [ecdsa.PrivateKey]) -> ~Str {
+  root_pool = new_cert_pool()
+  root_key = keys[0]
+  root_name = "Root #{test.index}"
+  parent: Certificate? = none
+  parent_key = root_key
+  for root in test.roots {
+    root_cert = ~make_constraints_ca_cert(root, root_name, root_key, none, root_key)
+    parent = root_cert
+    root_pool.add_cert!(root_cert)
+  }
+  intermediate_pool = new_cert_pool()
+  level = 0
+  for intermediates in test.intermediates {
+    level_key = keys[1 + level]
+    level_name = "Intermediate level #{level}"
+    last: Certificate? = none
+    for intermediate in intermediates {
+      ca_cert = ~make_constraints_ca_cert(intermediate, level_name, level_key, parent, parent_key)
+      last = ca_cert
+      intermediate_pool.add_cert!(ca_cert)
+    }
+    parent = last
+    parent_key = level_key
+    level += 1
+  }
+  leaf_key = keys[1 + level]
+  leaf_cert = ~make_constraints_leaf_cert(test.leaf, leaf_key, parent, parent_key)
+  opts = VerifyOptions.new(roots: root_pool, intermediates: intermediate_pool, current_time: time.unix(1500, 0), key_usages: test.requested_ekus)
+  r = leaf_cert.verify(opts)
+  if test.expected_error.size == 0 {
+    if e = r.err {
+      return "unexpected failure: #{e.message}"
+    }
+  } else {
+    if e = r.err {
+      return "expected error containing #{test.expected_error}, but got: #{e.message}" if !strings.contains(e.message, test.expected_error)
+    } else {
+      return "unexpected success"
+    }
+  }
+  ""
+}
+
+def run_constraint_cases(tests: [NameConstraintsTest]) -> Int {
+  keys = [nc_new_key(), nc_new_key(), nc_new_key(), nc_new_key(), nc_new_key()]
+  n = 0
+  for t in tests {
+    r = run_constraint_case(t, keys)
+    msg = ""
+    if e = r.err {
+      msg = "setup failed: #{e.message}"
+    } else {
+      msg = r.unwrap
+    }
+    assert_eq "##{t.index} #{t.name}: #{msg}", "##{t.index} #{t.name}: "
+    n += 1
+  }
+  n
+}
+
+test "ConstraintCases_0" {
+  assert_eq run_constraint_cases(name_constraints_tests_0()), 18
+}
+
+test "ConstraintCases_1" {
+  assert_eq run_constraint_cases(name_constraints_tests_1()), 18
+}
+
+test "ConstraintCases_2" {
+  assert_eq run_constraint_cases(name_constraints_tests_2()), 18
+}
+
+test "ConstraintCases_3" {
+  assert_eq run_constraint_cases(name_constraints_tests_3()), 18
+}
+
+test "ConstraintCases_4" {
+  assert_eq run_constraint_cases(name_constraints_tests_4()), 18
+}
+
+test "ConstraintCases_5" {
+  assert_eq run_constraint_cases(name_constraints_tests_5()), 17
+}
+
+test "NameConstraintIPNonZeroHostBits" {
+  root_key = nc_new_key()
+  leaf_key = nc_new_key()
+  # Two excluded iPAddress subtrees: a lower-addressed range that takes the
+  # binary-search neighbor slot, and one whose address has host bits set
+  # (10.10.10.10/16, i.e. network 10.10.0.0/16).
+  st1: [Byte] = [0x30, 10, 0x87, 8, 10, 0, 0, 0, 255, 255, 255, 252]
+  st2: [Byte] = [0x30, 10, 0x87, 8, 10, 10, 10, 10, 255, 255, 0, 0]
+  subtrees = st1 + st2
+  excluded: [Byte] = [0xa1, subtrees.size.as_u8]
+  excluded = excluded + subtrees
+  nc_value: [Byte] = [0x30, excluded.size.as_u8]
+  nc_value = nc_value + excluded
+  root_tmpl = Certificate.new(serial_number: nc_serial(), subject: pkix.Name.new(common_name: "Root"), not_before: time.unix(1000, 0), not_after: time.unix(2000, 0), key_usage: KEY_USAGE_CERT_SIGN, basic_constraints_valid: true, is_ca: true, extra_extensions: [pkix.Extension.new(id: asn1.ObjectIdentifier.new(arcs: [2, 5, 29, 30]), critical: true, value: nc_value)])
+  root_der = ~create_certificate(rand.reader(), root_tmpl, root_tmpl, PublicKey.Ecdsa(root_key.public_key), PrivateKey.Ecdsa(root_key))
+  root = ~parse_certificate(root_der)
+  # The parsed range must keep the address as encoded, host bits and all.
+  assert_eq root.excluded_ip_ranges.size, 2
+  want: [Byte] = [10, 10, 10, 10]
+  assert ip_equal?(root.excluded_ip_ranges[1].ip, want), "excluded range IP = #{ip_string(root.excluded_ip_ranges[1].ip)}, want 10.10.10.10"
+  leaf = ~make_constraints_leaf_cert(LeafSpec.new(sans: ["ip:10.10.0.1"]), leaf_key, root, root_key)
+  roots = new_cert_pool()
+  roots.add_cert!(root)
+  r = leaf.verify(VerifyOptions.new(roots: roots, current_time: time.unix(1500, 0)))
+  assert !r.ok?, "leaf with IP SAN inside excluded range was accepted"
+  msg = r.err?.message || ""
+  assert strings.contains(msg, "excluded by constraint"), "got error #{msg}, want excluded-by-constraint"
+}
+
+struct Rfc2821Test {
+  input: Str
+  local_part: Str
+  domain: Str
+}
+
+def rfc2821_tests -> [Rfc2821Test] {
+  [
+    Rfc2821Test.new(input: "foo@example.com", local_part: "foo", domain: "example.com"),
+    Rfc2821Test.new(input: "@example.com"),
+    Rfc2821Test.new(input: "\"@example.com"),
+    Rfc2821Test.new(input: "\"\"@example.com", domain: "example.com"),
+    Rfc2821Test.new(input: "\"a\"@example.com", local_part: "a", domain: "example.com"),
+    Rfc2821Test.new(input: "\"\\a\"@example.com", local_part: "a", domain: "example.com"),
+    Rfc2821Test.new(input: "a\"@example.com"),
+    Rfc2821Test.new(input: "foo..bar@example.com"),
+    Rfc2821Test.new(input: ".foo.bar@example.com"),
+    Rfc2821Test.new(input: "foo.bar.@example.com"),
+    Rfc2821Test.new(input: "|{}?'@example.com", local_part: "|{}?'", domain: "example.com"),
+    Rfc2821Test.new(input: "a@b@c.com"),
+    # Examples from RFC 3696
+    Rfc2821Test.new(input: "Abc\\@def@example.com", local_part: "Abc@def", domain: "example.com"),
+    Rfc2821Test.new(input: "Fred\\ Bloggs@example.com", local_part: "Fred Bloggs", domain: "example.com"),
+    Rfc2821Test.new(input: "Joe.\\\\Blow@example.com", local_part: "Joe.\\Blow", domain: "example.com"),
+    Rfc2821Test.new(input: "\"Abc@def\"@example.com", local_part: "Abc@def", domain: "example.com"),
+    Rfc2821Test.new(input: "\"Fred Bloggs\"@example.com", local_part: "Fred Bloggs", domain: "example.com"),
+    Rfc2821Test.new(input: "customer/department=shipping@example.com", local_part: "customer/department=shipping", domain: "example.com"),
+    Rfc2821Test.new(input: "$A12345@example.com", local_part: "$A12345", domain: "example.com"),
+    Rfc2821Test.new(input: "!def!xyz%abc@example.com", local_part: "!def!xyz%abc", domain: "example.com"),
+    Rfc2821Test.new(input: "_somename@example.com", local_part: "_somename", domain: "example.com"),
+  ]
+}
+
+test "RFC2821Parsing" {
+  i = 0
+  for t in rfc2821_tests() {
+    mailbox = parse_rfc2821_mailbox(t.input)
+    expected_failure = t.local_part.size == 0 && t.domain.size == 0
+    if m = mailbox {
+      assert !expected_failure, "##{i}: #{t.input} unexpectedly parsed as (#{m.local}, #{m.domain})"
+      assert_eq "##{i} #{m.local} #{m.domain}", "##{i} #{t.local_part} #{t.domain}"
+    } else {
+      assert expected_failure, "##{i}: unexpected failure for #{t.input}"
+    }
+    i += 1
+  }
+  assert_eq i, 21
+}
+
+test "BadNamesInConstraints" {
+  # Bad names in constraints should not parse: (name, whether the error is
+  # an encoding error rather than a constraint parse error).
+  bad_names = [("dns:foo.com.", false), ("email:abc@foo.com.", false), ("email:foo.com.", false), ("uri:example.com.", false), ("uri:1.2.3.4", false), ("uri:ffff::1", false), ("dns:not–hyphen.com", true), ("email:foo@not–hyphen.com", true), ("uri:not–hyphen.com", true)]
+  priv = nc_new_key()
+  for t in bad_names {
+    name, encoding = t
+    r = make_constraints_ca_cert(ConstraintsSpec.new(ok: [name]), "TestAbsoluteNamesInConstraints", priv, none, priv)
+    assert !r.ok?, "bad name #{name} unexpectedly accepted in name constraint"
+    s = r.err?.message || ""
+    matched = false
+    if encoding {
+      matched = strings.contains(s, "cannot be encoded as an IA5String")
+    } else {
+      matched = strings.contains(s, "failed to parse ") && strings.contains(s, "constraint")
+    }
+    assert matched, "bad name #{name} triggered unrecognised error: #{s}"
+  }
+}
+
+test "BadNamesInSANs" {
+  # Bad names in URI and IP SANs should not parse. Bad DNS and email SANs
+  # will parse and are tested in name constraint tests at the top of this
+  # file.
+  bad_names = ["uri:https://example.com./dsf", "invalidip:0102", "invalidip:0102030405"]
+  priv = nc_new_key()
+  for bad_name in bad_names {
+    r = make_constraints_leaf_cert(LeafSpec.new(sans: [bad_name]), priv, none, priv)
+    assert !r.ok?, "bad name #{bad_name} unexpectedly accepted in SAN"
+    s = r.err?.message || ""
+    assert strings.contains(s, "cannot parse "), "bad name #{bad_name} triggered unrecognised error: #{s}"
+  }
+}

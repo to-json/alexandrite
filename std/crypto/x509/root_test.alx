@@ -1,0 +1,128 @@
+# Go's root_test.go (and root_linux_test.go), translated.
+#
+# alx reads the on-disk roots on every platform (it has no platform
+# verifier and no "system pool" placeholder), so TestEnvVars expects what
+# Go expects on Linux everywhere. Not translated:
+# - TestFallbackPanic, TestFallback, TestSetFallbackRoots
+#   (root_linux_test.go): SetFallbackRoots doesn't exist in alx (no
+#   package state to hold the fallback pool), and TestSetFallbackRoots
+#   also needs Linux mount namespaces.
+# - TestSSLCertEnvOverride: the x509sslcertoverrideplatform GODEBUG and the
+#   darwin/windows platform pool.
+# Go's certFiles/certDirectories package variables are parameters of
+# load_system_roots_from here.
+
+import "os"
+
+def rt_test_dir_cn -> Str { "test-dir" }
+
+def rt_test_file -> Str { "testdata/test-file.crt" }
+
+def rt_test_file_cn -> Str { "test-file" }
+
+def rt_test_missing -> Str { "missing" }
+
+# Sets (or, for none, unsets) an environment variable.
+def rt_restore_env(key: Str, value: Str?) -> ~Unit {
+  if v = value {
+    ~os.setenv(key, v)
+  } else {
+    ~os.unsetenv(key)
+  }
+}
+
+test "EnvVars" {
+  tmp_dir = ~os.mkdir_temp("", "x509-envvars")
+  test_cert = ~os.read_file("testdata/test-dir.crt")
+  ~os.write_file(tmp_dir + "/test-file.crt", test_cert, 420)
+  # name, fileEnv, dirEnv, files, dirs, cns
+  test_cases = [
+    # Environment variables override the default locations preventing fall
+    # through.
+    ("override-defaults", rt_test_missing(), rt_test_missing(), [rt_test_file()], [tmp_dir], []),
+    # File environment overrides default file locations.
+    ("file", rt_test_file(), "", [], [], [rt_test_file_cn()]),
+    # Directory environment overrides default directory locations.
+    ("dir", "", tmp_dir, [], [], [rt_test_dir_cn()]),
+    # File & directory environment overrides both default locations.
+    ("file+dir", rt_test_file(), tmp_dir, [], [], [rt_test_file_cn(), rt_test_dir_cn()]),
+    # Environment variable empty / unset uses default locations.
+    ("empty-fall-through", "", "", [rt_test_file()], [tmp_dir], [rt_test_file_cn(), rt_test_dir_cn()]),
+  ]
+  orig_file = os.getenv("SSL_CERT_FILE")
+  orig_dir = os.getenv("SSL_CERT_DIR")
+  results: [Str] = []
+  for tc in test_cases {
+    name, file_env, dir_env, files, dirs, cns = tc
+    ~os.setenv("SSL_CERT_FILE", file_env)
+    ~os.setenv("SSL_CERT_DIR", dir_env)
+    r = load_system_roots_from(files, dirs)
+    if e = r.err {
+      results << "#{name}: unexpected failure: #{e.message}"
+      next
+    }
+    got: [Str] = []
+    for c in r.unwrap.certs {
+      got << c.subject.common_name
+    }
+    results << "#{name}: #{got}"
+    assert_eq "#{name}: #{got}", "#{name}: #{cns}"
+  }
+  ~rt_restore_env("SSL_CERT_FILE", orig_file)
+  ~rt_restore_env("SSL_CERT_DIR", orig_dir)
+  ~os.remove_all(tmp_dir)
+  assert_eq results.size, 5
+}
+
+# Ensure that "SSL_CERT_DIR" when used as the environment variable
+# delimited by colons allows load_system_roots to load all the roots from
+# the respective directories. See https://golang.org/issue/35325.
+test "LoadSystemCertsLoadColonSeparatedDirs" {
+  orig_file = os.getenv("SSL_CERT_FILE")
+  orig_dir = os.getenv("SSL_CERT_DIR")
+  # To prevent any other certs from being loaded in through
+  # "SSL_CERT_FILE" or from known cert files, clear them all.
+  ~os.setenv("SSL_CERT_FILE", "")
+  tmp_dir = ~os.mkdir_temp("", "x509-colondirs")
+  root_pems = [vt_gts_root(), vt_google_leaf()]
+  cert_dirs: [Str] = []
+  i = 0
+  for cert_pem in root_pems {
+    cert_dir = tmp_dir + "/cert-#{i}"
+    ~os.mkdir_all(cert_dir, 493)
+    ~os.write_file(cert_dir + "/cert.crt", cert_pem.bytes, 429)
+    cert_dirs << cert_dir
+    i += 1
+  }
+  # Sanity check: the number of certDirs should be equal to the number of
+  # roots.
+  assert_eq cert_dirs.size, root_pems.size
+  # Now finally concatenate them with a colon.
+  ~os.setenv("SSL_CERT_DIR", cert_dirs.join(":"))
+  r = load_system_roots_from([], ["/does-not-exist"])
+  ~rt_restore_env("SSL_CERT_FILE", orig_file)
+  ~rt_restore_env("SSL_CERT_DIR", orig_dir)
+  ~os.remove_all(tmp_dir)
+  got_pool = ~r
+  # We expect exactly root_pems.size subjects back.
+  assert_eq got_pool.subjects.size, root_pems.size
+  want_pool = new_cert_pool()
+  for cert_pem in root_pems {
+    want_pool.append_certs_from_pem!(cert_pem.bytes)
+  }
+  assert got_pool.equal?(want_pool), "mismatched cert pools"
+}
+
+test "ReadUniqueDirectoryEntries" {
+  base_tmp_dir = ~os.mkdir_temp("", "x509-uniq")
+  ~os.write_file(base_tmp_dir + "/file", [], 420)
+  ~os.symlink("target-in", base_tmp_dir + "/link-in")
+  ~os.symlink("../target-out", base_tmp_dir + "/link-out")
+  got = ~read_unique_directory_entries(base_tmp_dir)
+  got_names: [Str] = []
+  for fi in got {
+    got_names << fi.name
+  }
+  ~os.remove_all(base_tmp_dir)
+  assert_eq got_names, ["file", "link-out"]
+}

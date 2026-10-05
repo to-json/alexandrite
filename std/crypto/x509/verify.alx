@@ -1,0 +1,919 @@
+# Go's verify.go: chain building and verification, host name matching,
+# key usage and certificate policy checks.
+#
+# Differences from Go: on macOS (and Windows) Go hands verification to the
+# platform when no roots are given; alx always verifies itself, against
+# system_cert_pool() (root.alx), so platform-only trust settings aren't
+# consulted. The system roots are read per call when VerifyOptions.roots
+# is none (no package state to cache them in): pass a pool to verify many
+# certificates. Error values carry their message (Go's errors hold the
+# certificate).
+
+import "crypto/x509/pkix"
+import "net/netip"
+import "strconv"
+import "strings"
+import "time"
+
+# Go's InvalidReason.
+pub INVALID_REASON_NOT_AUTHORIZED_TO_SIGN = 0
+pub INVALID_REASON_EXPIRED = 1
+pub INVALID_REASON_CA_NOT_AUTHORIZED_FOR_THIS_NAME = 2
+pub INVALID_REASON_TOO_MANY_INTERMEDIATES = 3
+pub INVALID_REASON_INCOMPATIBLE_USAGE = 4
+pub INVALID_REASON_NAME_MISMATCH = 5
+pub INVALID_REASON_NAME_CONSTRAINTS_WITHOUT_SANS = 6
+pub INVALID_REASON_UNCONSTRAINED_NAME = 7
+pub INVALID_REASON_TOO_MANY_CONSTRAINTS = 8
+pub INVALID_REASON_CA_NOT_AUTHORIZED_FOR_EXT_KEY_USAGE = 9
+pub INVALID_REASON_NO_VALID_CHAINS = 10
+
+# Go's CertificateInvalidError.
+pub def certificate_invalid_error(reason: Int, detail: Str) -> X509Error {
+  m = "x509: unknown error"
+  if reason == INVALID_REASON_NOT_AUTHORIZED_TO_SIGN {
+    m = "x509: certificate is not authorized to sign other certificates"
+  } else if reason == INVALID_REASON_EXPIRED {
+    m = "x509: certificate has expired or is not yet valid: " + detail
+  } else if reason == INVALID_REASON_CA_NOT_AUTHORIZED_FOR_THIS_NAME {
+    m = "x509: a root or intermediate certificate is not authorized to sign for this name: " + detail
+  } else if reason == INVALID_REASON_CA_NOT_AUTHORIZED_FOR_EXT_KEY_USAGE {
+    m = "x509: a root or intermediate certificate is not authorized for an extended key usage: " + detail
+  } else if reason == INVALID_REASON_TOO_MANY_INTERMEDIATES {
+    m = "x509: too many intermediates for path length constraint"
+  } else if reason == INVALID_REASON_INCOMPATIBLE_USAGE {
+    m = "x509: certificate specifies an incompatible key usage"
+  } else if reason == INVALID_REASON_NAME_MISMATCH {
+    m = "x509: issuer name does not match subject from issuing certificate"
+  } else if reason == INVALID_REASON_NAME_CONSTRAINTS_WITHOUT_SANS {
+    m = "x509: issuer has name constraints but leaf doesn't have a SAN extension"
+  } else if reason == INVALID_REASON_UNCONSTRAINED_NAME {
+    m = "x509: issuer has name constraints but leaf contains unknown or unconstrained name: " + detail
+  } else if reason == INVALID_REASON_NO_VALID_CHAINS {
+    m = "x509: no valid chains built"
+    m = "#{m}: #{detail}" if detail != ""
+  }
+  X509Error.CertificateInvalid(reason, detail, m)
+}
+
+# Go's HostnameError.
+pub def hostname_error(c: Certificate, host: Str) -> X509Error {
+  max_names_included = 100
+  if !c.has_san_extension? && match_hostnames?(c.subject.common_name, split_hostname(host)) {
+    return X509Error.Hostname(host, "x509: certificate relies on legacy Common Name field, use SANs instead")
+  }
+  valid = ""
+  if parse_ip(host).some? {
+    # Trying to validate an IP
+    if c.ip_addresses.size == 0 {
+      return X509Error.Hostname(host, "x509: cannot validate certificate for " + host + " because it doesn't contain any IP SANs")
+    }
+    if c.ip_addresses.size >= max_names_included {
+      return X509Error.Hostname(host, "x509: certificate is valid for #{c.ip_addresses.size} IP SANs, but none matched #{host}")
+    }
+    for san in c.ip_addresses {
+      valid = valid + ", " if valid.size > 0
+      valid = valid + ip_string(san)
+    }
+  } else {
+    if c.dns_names.size >= max_names_included {
+      return X509Error.Hostname(host, "x509: certificate is valid for #{c.dns_names.size} names, but none matched #{host}")
+    }
+    valid = c.dns_names.join(", ")
+  }
+  return X509Error.Hostname(host, "x509: certificate is not valid for any names, but wanted to match " + host) if valid.size == 0
+  X509Error.Hostname(host, "x509: certificate is valid for " + valid + ", not " + host)
+}
+
+# Go's UnknownAuthorityError (hint: the first error from a candidate
+# parent, and that parent).
+def unknown_authority_error(hint: (X509Error, Certificate)?) -> X509Error {
+  s = "x509: certificate signed by unknown authority"
+  if h = hint {
+    e, hint_cert = h
+    cert_name = hint_cert.subject.common_name
+    if cert_name.size == 0 {
+      if hint_cert.subject.organization.size > 0 {
+        cert_name = hint_cert.subject.organization[0]
+      } else {
+        cert_name = "serial:" + hint_cert.serial_number.to_s
+      }
+    }
+    s = s + " (possibly because of #{strconv.quote(e.message)} while trying to verify candidate authority certificate #{strconv.quote(cert_name)})"
+  }
+  X509Error.UnknownAuthority(s)
+}
+
+# The parameters for Certificate.verify.
+pub struct VerifyOptions {
+  # If set, checked against the leaf certificate with
+  # Certificate.verify_hostname or the platform verifier.
+  dns_name: Str
+  # Intermediate certificates that may be used to build chains.
+  intermediates: CertPool?
+  # The trusted roots; none: the system roots.
+  roots: CertPool?
+  # The time to check validity at; zero: the current time.
+  current_time: time.Time
+  # The acceptable extended key usages (empty: ServerAuth; Any: accept
+  # any).
+  key_usages: [ExtKeyUsage]
+  # Unused (as in Go).
+  max_constraint_comparisions: Int
+  # The initial set of policy OIDs (RFC 5280 6.1.1).
+  certificate_policies: [OID]
+  # Test hooks for the policy validation (Go's unexported fields).
+  inhibit_policy_mapping: Bool
+  require_explicit_policy: Bool
+  inhibit_any_policy: Bool
+}
+
+LEAF_CERTIFICATE = 0
+INTERMEDIATE_CERTIFICATE = 1
+ROOT_CERTIFICATE = 2
+
+# An email address (RFC 2821 mailbox), local part unquoted.
+struct Rfc2821Mailbox {
+  local: Str
+  domain: Str
+
+  pub def to_s -> Str { "#{local}@#{domain}" }
+}
+
+def in_range?(c: Byte, lo: Int, hi: Int) -> Bool { c.to_i >= lo && c.to_i <= hi }
+
+# Go's parseRFC2821Mailbox: an email address, or none if it isn't one.
+def parse_rfc2821_mailbox(input: Str) -> Rfc2821Mailbox? {
+  return none if input.size == 0
+  inb = input.bytes
+  local_part: [Byte] = []
+  pos = 0
+  if inb[0] == 34 {
+    # We will make the simplifying assumption that, since the mailbox
+    # will be quoted, the quoted-string will be enclosed entirely in
+    # double quotes.
+    pos = 1
+    loop {
+      return none if pos >= inb.size
+      c = inb[pos]
+      pos += 1
+      break if c == 34
+      if c == 92 {
+        # quoted-pair
+        return none if pos >= inb.size
+        d = inb[pos]
+        if d == 11 || d == 12 || in_range?(d, 1, 9) || in_range?(d, 14, 127) {
+          local_part << d
+          pos += 1
+        } else {
+          return none
+        }
+      } else if c == 11 || c == 12 || c == 32 || c == 33 || c == 127 || in_range?(c, 1, 8) || in_range?(c, 14, 31) || in_range?(c, 35, 91) || in_range?(c, 93, 126) {
+        # qtext
+        local_part << c
+      } else {
+        return none
+      }
+    }
+  } else {
+    # Atom ("." Atom)*
+    while pos < inb.size {
+      c = inb[pos]
+      if c == 92 {
+        # Examples given in RFC 3696 suggest that escaped characters can
+        # appear outside of a quoted string. Several "verified" errata
+        # continue to argue about this point. We choose to accept it.
+        pos += 1
+        return none if pos >= inb.size
+        local_part << inb[pos]
+        pos += 1
+        next
+      }
+      # atext from RFC 2822, Section 3.2.4: ALPHA DIGIT ! # $ % & ' * + - /
+      # = ? ^ _ ` { | } ~ and the dot of the dot-atom.
+      if in_range?(c, 48, 57) || in_range?(c, 97, 122) || in_range?(c, 65, 90) || c == 33 || c == 35 || c == 36 || c == 37 || c == 38 || c == 39 || c == 42 || c == 43 || c == 45 || c == 47 || c == 61 || c == 63 || c == 94 || c == 95 || c == 96 || c == 123 || c == 124 || c == 125 || c == 126 || c == 46 {
+        local_part << c
+        pos += 1
+      } else {
+        break
+      }
+    }
+    return none if local_part.size == 0
+    # https://tools.ietf.org/html/rfc3696#section-3
+    # "period (".") may also appear, but may not be used to start or end
+    # the local part, nor may two or more consecutive periods appear."
+    return none if local_part[0] == 46 || local_part[local_part.size - 1] == 46
+    i = 0
+    while i + 1 < local_part.size {
+      return none if local_part[i] == 46 && local_part[i + 1] == 46
+      i += 1
+    }
+  }
+  return none if pos >= inb.size || inb[pos] != 64
+  domain = Str.from_bytes(inb[pos + 1...inb.size])
+  # The RFC species a format for domains, but that's known to be violated
+  # in practice so we accept that anything after an '@' is the domain part.
+  return none if !domain_name_valid?(domain, false)
+  # The domain must not contain an '@'.
+  return none if domain.include?("@")
+  Rfc2821Mailbox.new(local: Str.from_bytes(local_part), domain: domain)
+}
+
+def to_lower_case_ascii(input: Str) -> Str {
+  # If the string is already lower-case then there's nothing to do.
+  already = true
+  for b in input.bytes {
+    if b >= 65 && b <= 90 {
+      already = false
+      break
+    }
+  }
+  return input if already
+  out = input.bytes + []
+  i = 0
+  while i < out.size {
+    out[i] = out[i] + 32 if out[i] >= 65 && out[i] <= 90
+    i += 1
+  }
+  Str.from_bytes(out)
+}
+
+# Go's Certificate.isValid.
+def is_valid_cert(c: Certificate, cert_type: Int, current_chain: [Certificate], opts: VerifyOptions) -> ~Unit<X509Error> {
+  fail X509Error.UnhandledCriticalExtension if c.unhandled_critical_extensions.size > 0
+  if current_chain.size > 0 {
+    child = current_chain[current_chain.size - 1]
+    fail certificate_invalid_error(INVALID_REASON_NAME_MISMATCH, "") if child.raw_issuer != c.raw_subject
+  }
+  now = opts.current_time
+  now = time.now() if now.is_zero
+  if now.before(c.not_before) {
+    fail certificate_invalid_error(INVALID_REASON_EXPIRED, "current time #{now.format(time.RFC3339)} is before #{c.not_before.format(time.RFC3339)}")
+  } else if now.after(c.not_after) {
+    fail certificate_invalid_error(INVALID_REASON_EXPIRED, "current time #{now.format(time.RFC3339)} is after #{c.not_after.format(time.RFC3339)}")
+  }
+  if cert_type == INTERMEDIATE_CERTIFICATE || cert_type == ROOT_CERTIFICATE {
+    fail err("x509: internal error: empty chain when appending CA cert") if current_chain.size == 0
+  }
+  # KeyUsage status flags are ignored. From Engineering Security, Peter
+  # Gutmann: A European government CA marked its signing certificates as
+  # being valid for encryption only, but no-one noticed. ...
+  if cert_type == INTERMEDIATE_CERTIFICATE && (!c.basic_constraints_valid || !c.is_ca) {
+    fail certificate_invalid_error(INVALID_REASON_NOT_AUTHORIZED_TO_SIGN, "")
+  }
+  if c.basic_constraints_valid && c.max_path_len >= 0 {
+    num_intermediates = current_chain.size - 1
+    fail certificate_invalid_error(INVALID_REASON_TOO_MANY_INTERMEDIATES, "") if num_intermediates > c.max_path_len
+  }
+}
+
+# Verifies c by building one or more chains from c to a certificate in
+# opts.roots, using certificates in opts.intermediates if needed. On
+# success, the chains begin with c and end with a root. See Go's
+# documentation of Certificate.Verify.
+pub def verify_certificate(c: Certificate, opts0: VerifyOptions) -> ~[[Certificate]]<X509Error> {
+  opts = opts0
+  # Platform-specific verification needs the ASN.1 contents so this makes
+  # the behavior consistent across platforms.
+  fail err("x509: missing ASN.1 contents; use ParseCertificate") if c.raw.size == 0
+  if inter = opts.intermediates {
+    for ic in inter.certs {
+      fail err("x509: missing ASN.1 contents; use ParseCertificate") if ic.raw.size == 0
+    }
+  }
+  roots = CertPool.new
+  if r = opts.roots {
+    roots = r
+  } else {
+    sr = load_system_roots()
+    if e = sr.err {
+      fail X509Error.SystemRoots("x509: failed to load system roots and no roots provided; #{e.message}")
+    }
+    roots = sr.unwrap
+  }
+  opts.roots = roots
+  ~is_valid_cert(c, LEAF_CERTIFICATE, [], opts)
+  ~c.verify_hostname(opts.dns_name) if opts.dns_name.size > 0
+  candidate_chains: [[Certificate]] = []
+  if roots.contains?(c) {
+    candidate_chains = [[c]]
+  } else {
+    res = build_chains(c, [c], 0, opts)
+    if e = res.err {
+      fail e
+    }
+    candidate_chains = res.chains
+  }
+  any_key_usage = false
+  for eku in opts.key_usages {
+    any_key_usage = true if eku == ExtKeyUsage.Any
+  }
+  opts.key_usages = [ExtKeyUsage.ServerAuth] if opts.key_usages.size == 0
+  invalid_policies_chains = 0
+  incompatible_key_usage_chains = 0
+  constraints_hint: X509Error? = none
+  kept: [[Certificate]] = []
+  for chain in candidate_chains {
+    if !policies_valid?(chain, opts) {
+      invalid_policies_chains += 1
+      next
+    }
+    if !any_key_usage && !check_chain_for_key_usage?(chain, opts.key_usages) {
+      incompatible_key_usage_chains += 1
+      next
+    }
+    r = check_chain_constraints(chain)
+    if e = r.err {
+      if constraints_hint.none? {
+        constraints_hint = certificate_invalid_error(INVALID_REASON_CA_NOT_AUTHORIZED_FOR_THIS_NAME, e.message)
+      }
+      next
+    }
+    kept << chain
+  }
+  if kept.size == 0 {
+    if h = constraints_hint {
+      # Preserve previous constraint behavior
+      fail h
+    }
+    details: [Str] = []
+    if incompatible_key_usage_chains > 0 {
+      fail certificate_invalid_error(INVALID_REASON_INCOMPATIBLE_USAGE, "") if invalid_policies_chains == 0
+      details << "#{incompatible_key_usage_chains} candidate chains with incompatible key usage"
+    }
+    details << "#{invalid_policies_chains} candidate chains with invalid policies" if invalid_policies_chains > 0
+    fail certificate_invalid_error(INVALID_REASON_NO_VALID_CHAINS, details.join(", "))
+  }
+  kept
+}
+
+def already_in_chain?(candidate: Certificate, chain: [Certificate]) -> Bool {
+  candidate_san: pkix.Extension? = none
+  for ext in candidate.extensions {
+    if ext.id.equal?(oid_extension_subject_alt_name()) {
+      candidate_san = ext
+      break
+    }
+  }
+  for cert in chain {
+    next if candidate.raw_subject != cert.raw_subject
+    next if candidate.raw_subject_public_key_info != cert.raw_subject_public_key_info
+    cert_san: pkix.Extension? = none
+    for ext in cert.extensions {
+      if ext.id.equal?(oid_extension_subject_alt_name()) {
+        cert_san = ext
+        break
+      }
+    }
+    return true if candidate_san.none? && cert_san.none?
+    return false if candidate_san.none? || cert_san.none?
+    if a = candidate_san {
+      if b = cert_san {
+        return true if a.value == b.value
+      }
+    }
+  }
+  false
+}
+
+MAX_CHAIN_SIGNATURE_CHECKS = 100
+
+# The result of build_chains: Go's (chains, err), and the shared count of
+# signature checks.
+struct Chains {
+  chains: [[Certificate]]
+  sig_checks: Int
+  err: X509Error?
+  limit: Bool
+}
+
+# Go's buildChains: the chains from current_chain (ending in c) to a root.
+def build_chains(c: Certificate, current_chain: [Certificate], sig_checks0: Int, opts: VerifyOptions) -> Chains {
+  sig_checks = sig_checks0
+  hint: (X509Error, Certificate)? = none
+  chains: [[Certificate]] = []
+  err_v: X509Error? = none
+  limit = false
+  roots = opts.roots || CertPool.new
+  inter = opts.intermediates || CertPool.new
+  groups = [(ROOT_CERTIFICATE, roots.find_potential_parents(c)), (INTERMEDIATE_CERTIFICATE, inter.find_potential_parents(c))]
+  for g in groups {
+    break if limit
+    cert_type, potentials = g
+    for candidate in potentials {
+      sig_checks += 1
+      if sig_checks > MAX_CHAIN_SIGNATURE_CHECKS {
+        err_v = err("x509: signature check attempts limit reached while verifying certificate chain")
+        limit = true
+        break
+      }
+      cc = candidate.cert
+      next if cc.public_key.none? || already_in_chain?(cc, current_chain)
+      r = c.check_signature_from(cc)
+      if e = r.err {
+        hint = (to_x509_error(e), cc) if hint.none?
+        next
+      }
+      vr = is_valid_cert(cc, cert_type, current_chain, opts)
+      if e = vr.err {
+        err_v = to_x509_error(e)
+        hint = (to_x509_error(e), cc) if hint.none?
+        next
+      }
+      err_v = none
+      if f = candidate.constraint {
+        cr = f.call(current_chain)
+        if e = cr.err {
+          hint = (err(e.message), cc) if hint.none?
+          next
+        }
+      }
+      if cert_type == ROOT_CERTIFICATE {
+        chains << current_chain + [cc]
+      } else {
+        sub = build_chains(cc, current_chain + [cc], sig_checks, opts)
+        sig_checks = sub.sig_checks
+        chains = chains + sub.chains
+        err_v = sub.err
+        if sub.limit {
+          limit = true
+          break
+        }
+      }
+    }
+  }
+  err_v = none if chains.size > 0
+  err_v = unknown_authority_error(hint) if chains.size == 0 && err_v.none?
+  Chains.new(chains: chains, sig_checks: sig_checks, err: err_v, limit: limit && chains.size == 0)
+}
+
+def to_x509_error(e: Error) -> X509Error {
+  case e {
+    X509Error.CertificateInvalid(r, d, m) => X509Error.CertificateInvalid(r, d, m)
+    X509Error.UnhandledCriticalExtension => X509Error.UnhandledCriticalExtension
+    X509Error.ConstraintViolation => X509Error.ConstraintViolation
+    X509Error.UnsupportedAlgorithm => X509Error.UnsupportedAlgorithm
+    X509Error.InsecureAlgorithm(a) => X509Error.InsecureAlgorithm(a)
+    X509Error.Hostname(h, m) => X509Error.Hostname(h, m)
+    X509Error.UnknownAuthority(m) => X509Error.UnknownAuthority(m)
+    X509Error.SystemRoots(m) => X509Error.SystemRoots(m)
+    _ => err(e.message)
+  }
+}
+
+def valid_hostname?(host0: Str, is_pattern: Bool) -> Bool {
+  host = host0
+  host = strings.trim_suffix(host, ".") if !is_pattern
+  return false if host.size == 0
+  return false if host == "*"
+  i = 0
+  for part in host.split(".") {
+    # Empty label.
+    return false if part == ""
+    if is_pattern && i == 0 && part == "*" {
+      # Only allow full left-most wildcards, as those are the only ones we
+      # match, and matching literal '*' characters is probably never the
+      # expected behavior.
+      i += 1
+      next
+    }
+    j = 0
+    for c in part.bytes {
+      ok = (c >= 97 && c <= 122) || (c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c == 45 && j != 0) || c == 95
+      return false if !ok
+      j += 1
+    }
+    i += 1
+  }
+  true
+}
+
+def match_exactly?(host_a: Str, host_b: Str) -> Bool {
+  return false if host_a == "" || host_a == "." || host_b == "" || host_b == "."
+  to_lower_case_ascii(host_a) == to_lower_case_ascii(host_b)
+}
+
+def match_hostnames?(pattern0: Str, host_parts: [Str]) -> Bool {
+  pattern = to_lower_case_ascii(pattern0)
+  return false if pattern.size == 0 || host_parts.size == 0
+  pattern_parts = pattern.split(".")
+  return false if pattern_parts.size != host_parts.size
+  i = 0
+  while i < pattern_parts.size {
+    if !(i == 0 && pattern_parts[i] == "*") {
+      return false if pattern_parts[i] != host_parts[i]
+    }
+    i += 1
+  }
+  true
+}
+
+def split_hostname(host: Str) -> [Str] { to_lower_case_ascii(strings.trim_suffix(host, ".")).split(".") }
+
+# Go's net.IP.Equal: 4-byte and IPv4-mapped 16-byte forms are equal.
+def ip_equal?(a: [Byte], b: [Byte]) -> Bool {
+  return a == b if a.size == b.size
+  a4 = to4(a)
+  b4 = to4(b)
+  if x = a4 {
+    if y = b4 {
+      return x == y
+    }
+  }
+  false
+}
+
+# Go's net.ParseIP: the 16-byte form of an IPv4 or IPv6 address.
+pub def parse_ip(s: Str) -> [Byte]? {
+  r = netip.parse_addr(s)
+  return none if !r.ok?
+  a = r.unwrap
+  # Go's ParseIP doesn't accept zones.
+  return none if strings.contains(s, "%")
+  b = a.as_slice
+  return [0.as_u8; 10] + [0xff.as_u8, 0xff] + b if b.size == 4
+  b
+}
+
+struct PotentialParent {
+  cert: Certificate
+  constraint: (([Certificate]) -> ~Unit)?
+}
+
+def check_chain_for_key_usage?(chain: [Certificate], key_usages: [ExtKeyUsage]) -> Bool {
+  usages: [Int] = []
+  for u in key_usages {
+    usages << u.value
+  }
+  return false if chain.size == 0
+  usages_remaining = usages.size
+  # We walk down the list and cross out any usages that aren't supported
+  # by each certificate. If we cross out all the usages, then the chain
+  # is unacceptable.
+  i = chain.size - 1
+  while i >= 0 {
+    cert = chain[i]
+    any_eku = false
+    for usage in cert.ext_key_usage {
+      any_eku = true if usage == ExtKeyUsage.Any
+    }
+    if (cert.ext_key_usage.size == 0 && cert.unknown_ext_key_usage.size == 0) || any_eku {
+      # The certificate doesn't have any extended key usage specified, or
+      # allows any usage.
+      i -= 1
+      next
+    }
+    k = 0
+    while k < usages.size {
+      requested = usages[k]
+      if requested != -1 {
+        found = false
+        for usage in cert.ext_key_usage {
+          found = true if usage.value == requested
+        }
+        if !found {
+          usages[k] = -1
+          usages_remaining -= 1
+          return false if usages_remaining == 0
+        }
+      }
+      k += 1
+    }
+    i -= 1
+  }
+  true
+}
+
+# ---------------------------------------------------------------- policies
+
+def any_policy_oid -> OID { oid_from_ints([2, 5, 29, 32, 0]).unwrap }
+
+# A node of the RFC 9618 policy graph; nodes live in PolicyGraph.nodes and
+# refer to each other by index.
+struct PolicyGraphNode {
+  valid_policy: OID
+  expected_policy_set: [OID]
+  parents: Map[Int, Bool]
+  children: Map[Int, Bool]
+  alive: Bool
+}
+
+struct PolicyGraph {
+  nodes: [PolicyGraphNode]
+  # Per depth, valid policy (DER as Str) -> node index.
+  strata: [Map[Str, Int]]
+  # Expected policy (DER as Str) -> parent node indexes at depth-1.
+  parent_index: Map[Str, [Int]]
+  depth: Int
+
+  def key(o: OID) -> Str { Str.from_bytes(o.der) }
+
+  def add_node!(valid: OID, parents: [Int]) -> Int {
+    n = PolicyGraphNode.new(valid_policy: valid, expected_policy_set: [valid], alive: true)
+    id = self.nodes.size
+    for p in parents {
+      n.parents[p] = true
+    }
+    self.nodes << n
+    for p in parents {
+      self.nodes[p].children[id] = true
+    }
+    id
+  }
+
+  def insert!(n: Int) {
+    k = self.key(self.nodes[n].valid_policy)
+    self.strata[depth][k] = n
+  }
+
+  def parents_with_expected(expected: OID) -> [Int] {
+    return [] if depth == 0
+    parent_index[self.key(expected)] || []
+  }
+
+  def parent_with_any_policy -> Int? {
+    return none if depth == 0
+    strata[depth - 1][self.key(any_policy_oid())]
+  }
+
+  def parents -> [Int] {
+    return [] if depth == 0
+    strata[depth - 1].values
+  }
+
+  def leaf_with_policy(policy: OID) -> Int? { strata[depth][self.key(policy)] }
+
+  def unlink!(n: Int) {
+    for p in self.nodes[n].parents.keys {
+      self.nodes[p].children.delete(n)
+    }
+    for c in self.nodes[n].children.keys {
+      self.nodes[c].parents.delete(n)
+    }
+    self.nodes[n].alive = false
+  }
+
+  def delete_leaf!(policy: OID) {
+    k = self.key(policy)
+    if n = strata[depth][k] {
+      self.unlink!(n)
+      self.strata[depth].delete(k)
+    }
+  }
+
+  def valid_policy_nodes -> [Int] {
+    valid_nodes: [Int] = []
+    any = any_policy_oid()
+    i = depth
+    while i >= 0 {
+      for n in strata[i].values {
+        node = nodes[n]
+        next if node.valid_policy.equal?(any)
+        if node.parents.size == 1 {
+          for p in node.parents.keys {
+            valid_nodes << n if nodes[p].valid_policy.equal?(any)
+          }
+        }
+      }
+      i -= 1
+    }
+    valid_nodes
+  }
+
+  def prune! {
+    i = depth - 1
+    while i > 0 {
+      for k in strata[i].keys {
+        n = strata[i][k] || -1
+        if self.nodes[n].children.size == 0 {
+          for p in self.nodes[n].parents.keys {
+            self.nodes[p].children.delete(n)
+          }
+          self.strata[i].delete(k)
+        }
+      }
+      i -= 1
+    }
+  }
+
+  def incr_depth! {
+    self.parent_index = {}
+    for n in strata[depth].values {
+      for e in nodes[n].expected_policy_set {
+        k = self.key(e)
+        lst = parent_index[k] || []
+        lst << n
+        self.parent_index[k] = lst
+      }
+    }
+    self.depth += 1
+    self.strata << {}
+  }
+}
+
+def new_policy_graph -> PolicyGraph {
+  g = PolicyGraph.new
+  root = g.add_node!(any_policy_oid(), [])
+  g.strata << {}
+  g.strata[0][Str.from_bytes(any_policy_oid().der)] = root
+  g
+}
+
+# Go's policiesValid (RFC 9618's policy graph algorithm).
+def policies_valid?(chain: [Certificate], opts: VerifyOptions) -> Bool {
+  # The following code implements the policy verification algorithm as
+  # specified in RFC 5280 and updated by RFC 9618.
+  return true if chain.size == 1
+  n = chain.size - 1
+  any = any_policy_oid()
+  any_key = Str.from_bytes(any.der)
+  pg = new_policy_graph()
+  have_pg = true
+  inhibit_any_policy = 0
+  explicit_policy = 0
+  policy_mapping = 0
+  inhibit_any_policy = n + 1 if !opts.inhibit_any_policy
+  explicit_policy = n + 1 if !opts.require_explicit_policy
+  policy_mapping = n + 1 if !opts.inhibit_policy_mapping
+  initial_user_policy_set: Map[Str, Bool] = {}
+  for p in opts.certificate_policies {
+    initial_user_policy_set[Str.from_bytes(p.der)] = true
+  }
+  # If the user does not pass any policies, we consider that equivalent to
+  # passing anyPolicyOID.
+  initial_user_policy_set[any_key] = true if initial_user_policy_set.size == 0
+  i = n - 1
+  while i >= 0 {
+    cert = chain[i]
+    is_self_signed = cert.raw_issuer == cert.raw_subject
+    # 6.1.3 (e) -- as updated by RFC 9618
+    have_pg = false if cert.policies.size == 0
+    # 6.1.3 (f) -- as updated by RFC 9618
+    return false if explicit_policy == 0 && !have_pg
+    if have_pg {
+      pg.incr_depth!
+      policies: Map[Str, Bool] = {}
+      # 6.1.3 (d) (1) -- as updated by RFC 9618
+      for policy in cert.policies {
+        policies[Str.from_bytes(policy.der)] = true
+        next if policy.equal?(any)
+        # 6.1.3 (d) (1) (i) -- as updated by RFC 9618
+        parents = pg.parents_with_expected(policy)
+        if parents.size == 0 {
+          # 6.1.3 (d) (1) (ii) -- as updated by RFC 9618
+          if any_parent = pg.parent_with_any_policy {
+            parents = [any_parent]
+          }
+        }
+        if parents.size > 0 {
+          node = pg.add_node!(policy, parents)
+          pg.insert!(node)
+        }
+      }
+      # 6.1.3 (d) (2) -- as updated by RFC 9618
+      # NOTE: in the check "n-i < n" our i is different from the i in the
+      # specification. In the specification chains go from the trust
+      # anchor to the leaf, whereas our chains go from the leaf to the
+      # trust anchor, so our i's our inverted. Our check here matches the
+      # check "i < n" in the specification.
+      if policies.has_key?(any_key) && (inhibit_any_policy > 0 || (n - i < n && is_self_signed)) {
+        missing: Map[Str, [Int]] = {}
+        leaves = pg.strata[pg.depth]
+        for p in pg.parents {
+          for expected in pg.nodes[p].expected_policy_set {
+            ek = Str.from_bytes(expected.der)
+            if !leaves.has_key?(ek) {
+              lst = missing[ek] || []
+              lst << p
+              missing[ek] = lst
+            }
+          }
+        }
+        for oid_str, parents in missing {
+          node = pg.add_node!(OID.new(der: oid_str.bytes), parents)
+          pg.insert!(node)
+        }
+      }
+      # 6.1.3 (d) (3) -- as updated by RFC 9618
+      pg.prune!
+      if i != 0 {
+        # 6.1.4 (b) -- as updated by RFC 9618
+        if cert.policy_mappings.size > 0 {
+          # collect map of issuer -> []subject
+          mappings: Map[Str, [OID]] = {}
+          for mapping in cert.policy_mappings {
+            if policy_mapping > 0 {
+              return false if mapping.issuer_domain_policy.equal?(any) || mapping.subject_domain_policy.equal?(any)
+              ik = Str.from_bytes(mapping.issuer_domain_policy.der)
+              lst = mappings[ik] || []
+              lst << mapping.subject_domain_policy
+              mappings[ik] = lst
+            } else {
+              # 6.1.4 (b) (3) (i) -- as updated by RFC 9618
+              pg.delete_leaf!(mapping.issuer_domain_policy)
+              # 6.1.4 (b) (3) (ii) -- as updated by RFC 9618
+              pg.prune!
+            }
+          }
+          for issuer_str, subject_policies in mappings {
+            # 6.1.4 (b) (1) -- as updated by RFC 9618
+            issuer_oid = OID.new(der: issuer_str.bytes)
+            if matching = pg.leaf_with_policy(issuer_oid) {
+              pg.nodes[matching].expected_policy_set = subject_policies
+            } else if matching_any = pg.leaf_with_policy(any) {
+              # 6.1.4 (b) (2) -- as updated by RFC 9618
+              nn = pg.add_node!(issuer_oid, [matching_any])
+              pg.nodes[nn].expected_policy_set = subject_policies
+              pg.insert!(nn)
+            }
+          }
+        }
+      }
+    }
+    if i != 0 {
+      # 6.1.4 (h)
+      if !is_self_signed {
+        explicit_policy -= 1 if explicit_policy > 0
+        policy_mapping -= 1 if policy_mapping > 0
+        inhibit_any_policy -= 1 if inhibit_any_policy > 0
+      }
+      # 6.1.4 (i)
+      if (cert.require_explicit_policy > 0 || cert.require_explicit_policy_zero) && cert.require_explicit_policy < explicit_policy {
+        explicit_policy = cert.require_explicit_policy
+      }
+      if (cert.inhibit_policy_mapping > 0 || cert.inhibit_policy_mapping_zero) && cert.inhibit_policy_mapping < policy_mapping {
+        policy_mapping = cert.inhibit_policy_mapping
+      }
+      # 6.1.4 (j)
+      if (cert.inhibit_any_policy > 0 || cert.inhibit_any_policy_zero) && cert.inhibit_any_policy < inhibit_any_policy {
+        inhibit_any_policy = cert.inhibit_any_policy
+      }
+    }
+    i -= 1
+  }
+  # 6.1.5 (a)
+  explicit_policy -= 1 if explicit_policy > 0
+  # 6.1.5 (b)
+  explicit_policy = 0 if chain[0].require_explicit_policy_zero
+  # 6.1.5 (g) (1) -- as updated by RFC 9618
+  valid_policy_node_set: [Int] = []
+  if have_pg {
+    valid_policy_node_set = pg.valid_policy_nodes
+    if current_any = pg.leaf_with_policy(any) {
+      valid_policy_node_set << current_any
+    }
+  }
+  # 6.1.5 (g) (2) -- as updated by RFC 9618
+  authority_constrained: Map[Str, Bool] = {}
+  for nd in valid_policy_node_set {
+    authority_constrained[Str.from_bytes(pg.nodes[nd].valid_policy.der)] = true
+  }
+  # 6.1.5 (g) (3) -- as updated by RFC 9618
+  user_constrained: Map[Str, Bool] = {}
+  for k, v in authority_constrained {
+    user_constrained[k] = v
+  }
+  # 6.1.5 (g) (3) (i) -- as updated by RFC 9618
+  if initial_user_policy_set.size != 1 || !initial_user_policy_set.has_key?(any_key) {
+    # 6.1.5 (g) (3) (ii) -- as updated by RFC 9618
+    for p in user_constrained.keys {
+      user_constrained.delete(p) if !initial_user_policy_set.has_key?(p)
+    }
+    # 6.1.5 (g) (3) (iii) -- as updated by RFC 9618
+    if authority_constrained.has_key?(any_key) {
+      for policy in initial_user_policy_set.keys {
+        user_constrained[policy] = true
+      }
+    }
+  }
+  return false if explicit_policy == 0 && user_constrained.size == 0
+  true
+}
+
+# Go's Certificate.VerifyHostname.
+def verify_hostname_of(c: Certificate, h: Str) -> ~Unit<X509Error> {
+  # IP addresses may be written in [ ].
+  candidate_ip = h
+  candidate_ip = h[1...h.size - 1] if h.size >= 3 && h[0] == 91 && h[h.size - 1] == 93
+  r = netip.parse_addr(candidate_ip)
+  if a = r.ok {
+    # We only match IP addresses against IP SANs.
+    # See RFC 6125, Appendix B.2.
+    ip = a.as_slice
+    for candidate in c.ip_addresses {
+      return if ip_equal?(ip, candidate)
+    }
+    fail hostname_error(c, ip_string(ip))
+  }
+  candidate_name = to_lower_case_ascii(h)
+  valid_candidate_name = valid_hostname?(candidate_name, false)
+  host_parts = split_hostname(candidate_name)
+  for m in c.dns_names {
+    if valid_candidate_name && valid_hostname?(m, true) {
+      return if match_hostnames?(m, host_parts)
+    } else {
+      return if match_exactly?(m, candidate_name)
+    }
+  }
+  fail hostname_error(c, h)
+}

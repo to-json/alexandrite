@@ -1,0 +1,937 @@
+# Go's x509.go, second half: creating certificates, CRLs and certificate
+# requests (CreateCertificate, CreateRevocationList, CreateCRL,
+# CreateCertificateRequest), and the CSR / CRL types and parsers.
+
+import "crypto"
+import "crypto/rsa"
+import "crypto/sha256"
+import "crypto/x509/pkix"
+import "encoding/asn1"
+import "encoding/pem"
+import "io"
+import "math/big"
+import "net/url"
+import "time"
+import "golang.org/x/crypto/cryptobyte"
+import cbasn1 "golang.org/x/crypto/cryptobyte/asn1"
+
+# ---------------------------------------------------------------- ASN.1 structures
+
+#[derive(Asn1)]
+struct CertificateDer {
+  tbs_certificate: TbsCertificate
+  signature_algorithm: pkix.AlgorithmIdentifier
+  signature_value: asn1.BitString
+}
+
+#[derive(Asn1)]
+struct TbsCertificate {
+  #[asn1(raw_content)] raw: [Byte]
+  #[asn1(optional, explicit, default: 0, tag: 0)] version: Int
+  serial_number: big.Int
+  signature_algorithm: pkix.AlgorithmIdentifier
+  issuer: asn1.RawValue
+  validity: Validity
+  subject: asn1.RawValue
+  public_key: PublicKeyInfo
+  #[asn1(optional, tag: 1)] unique_id: asn1.BitString
+  #[asn1(optional, tag: 2)] subject_unique_id: asn1.BitString
+  #[asn1(omit_empty, optional, explicit, tag: 3)] extensions: [pkix.Extension]
+}
+
+#[derive(Asn1)]
+struct Validity {
+  not_before: time.Time
+  not_after: time.Time
+}
+
+#[derive(Asn1)]
+struct AuthKeyId {
+  #[asn1(optional, tag: 0)] id: [Byte]
+}
+
+#[derive(Asn1)]
+struct BasicConstraints {
+  #[asn1(optional)] is_ca: Bool
+  #[asn1(optional, default: -1)] max_path_len: Int
+}
+
+#[derive(Asn1)]
+struct AuthorityInfoAccess {
+  method: asn1.ObjectIdentifier
+  location: asn1.RawValue
+}
+
+#[derive(Asn1)]
+struct DistributionPoint {
+  #[asn1(optional, tag: 0)] distribution_point: DistributionPointName
+  #[asn1(optional, tag: 1)] reason: asn1.BitString
+  #[asn1(optional, tag: 2)] crl_issuer: asn1.RawValue
+}
+
+#[derive(Asn1)]
+struct DistributionPointName {
+  #[asn1(optional, tag: 0)] full_name: [asn1.RawValue]
+  #[asn1(optional, tag: 1)] relative_name: pkix.RDNSequence
+}
+
+#[derive(Asn1)]
+#[asn1(transparent)]
+struct ObjectIdentifiers {
+  oids: [asn1.ObjectIdentifier]
+}
+
+#[derive(Asn1)]
+#[asn1(transparent)]
+struct AiaValues {
+  values: [AuthorityInfoAccess]
+}
+
+#[derive(Asn1)]
+#[asn1(transparent)]
+struct CrlDps {
+  dps: [DistributionPoint]
+}
+
+#[derive(Asn1)]
+#[asn1(transparent)]
+struct RawValues {
+  values: [asn1.RawValue]
+}
+
+# ---------------------------------------------------------------- extensions
+
+def reverse_bits_in_a_byte(input: Byte) -> Byte {
+  b1 = (input >> 4) | (input << 4)
+  b2 = ((b1 >> 2) & 0x33) | ((b1 << 2) & 0xcc)
+  ((b2 >> 1) & 0x55) | ((b2 << 1) & 0xaa)
+}
+
+# Go's asn1BitLength: the bit-length of bit_string by considering the
+# most-significant bit in a byte to be the "first" bit.
+def asn1_bit_length(bit_string: [Byte]) -> Int {
+  bit_len = bit_string.size * 8
+  i = 0
+  while i < bit_string.size {
+    b = bit_string[bit_string.size - i - 1]
+    bit = 0
+    while bit < 8 {
+      return bit_len if (b >> bit) & 1 == 1
+      bit_len -= 1
+      bit += 1
+    }
+    i += 1
+  }
+  0
+}
+
+def ia5_check(s: Str) -> ~Unit<X509Error> {
+  msg = ia5_error(s)
+  fail err(msg) if msg != ""
+}
+
+def context_raw(tag: Int, b: [Byte]) -> asn1.RawValue { asn1.RawValue.new(tag: tag, class: 2, bytes: b) }
+
+# Go's marshalSANs.
+def marshal_sans(dns_names: [Str], email_addresses: [Str], ip_addresses: [[Byte]], uris: [url.Url]) -> ~[Byte]<X509Error> {
+  raw_values: [asn1.RawValue] = []
+  for name in dns_names {
+    ~ia5_check(name)
+    raw_values << context_raw(NAME_TYPE_DNS, name.bytes)
+  }
+  for email in email_addresses {
+    ~ia5_check(email)
+    raw_values << context_raw(NAME_TYPE_EMAIL, email.bytes)
+  }
+  for raw_ip in ip_addresses {
+    # If possible, we always want to encode IPv4 addresses in 4 bytes.
+    raw_values << context_raw(NAME_TYPE_IP, to4(raw_ip) || raw_ip)
+  }
+  for uri in uris {
+    uri_str = uri.to_s
+    ~ia5_check(uri_str)
+    raw_values << context_raw(NAME_TYPE_URI, uri_str.bytes)
+  }
+  RawValues.new(values: raw_values).to_asn1.unwrap
+}
+
+def marshal_key_usage(ku: Int) -> pkix.Extension {
+  a0 = reverse_bits_in_a_byte(ku.as_u8)
+  a1 = reverse_bits_in_a_byte((ku >> 8).as_u8)
+  bit_string = a1 != 0 ? [a0, a1] : [a0]
+  value = asn1.marshal_bit_string(asn1.BitString.new(bytes: bit_string, bit_length: asn1_bit_length(bit_string))).unwrap
+  pkix.Extension.new(id: oid_extension_key_usage(), critical: true, value: value)
+}
+
+def marshal_ext_key_usage(ext_usages: [ExtKeyUsage], unknown_usages: [asn1.ObjectIdentifier]) -> ~pkix.Extension<X509Error> {
+  oids: [asn1.ObjectIdentifier] = []
+  for u in ext_usages {
+    oids << u.asn1_oid
+  }
+  oids = oids + unknown_usages
+  r = ObjectIdentifiers.new(oids: oids).to_asn1
+  if e = r.err {
+    fail err(e.message)
+  }
+  pkix.Extension.new(id: oid_extension_extended_key_usage(), value: r.unwrap)
+}
+
+def marshal_basic_constraints(is_ca: Bool, max_path_len0: Int, max_path_len_zero: Bool) -> pkix.Extension {
+  max_path_len = max_path_len0
+  # Leaving MaxPathLen as zero indicates that no maximum path length is
+  # desired, unless MaxPathLenZero is set. A value of -1 causes encoding/asn1
+  # to omit the value as desired.
+  max_path_len = -1 if max_path_len == 0 && !max_path_len_zero
+  value = BasicConstraints.new(is_ca: is_ca, max_path_len: max_path_len).to_asn1.unwrap
+  pkix.Extension.new(id: oid_extension_basic_constraints(), critical: true, value: value)
+}
+
+def marshal_certificate_policies(policies: [OID]) -> ~pkix.Extension<X509Error> {
+  b = cryptobyte.new_builder([])
+  b.add_asn1!(cbasn1.SEQUENCE) { |child|
+    for v in policies {
+      child.add_asn1!(cbasn1.SEQUENCE) { |c2|
+        c2.add_asn1!(cbasn1.OBJECT_IDENTIFIER) { |c3|
+          if v.der.size == 0 {
+            c3.set_error!(err("invalid policy object identifier"))
+          } else {
+            c3.add_bytes!(v.der)
+          }
+          nil
+        }
+      }
+    }
+  }
+  r = b.bytes
+  if e = r.err {
+    fail err(e.message)
+  }
+  pkix.Extension.new(id: oid_extension_certificate_policies(), value: r.unwrap)
+}
+
+# The IP and mask of a name constraint, the IP masked.
+def ip_and_mask(n: IPNet) -> ~[Byte]<X509Error> {
+  masked: [Byte] = []
+  ip = n.ip
+  m = n.mask
+  # Go's IP.Mask: a 16-byte IPv4-mapped address with a 4-byte mask is
+  # masked as its 4-byte form.
+  if m.size == 4 && ip.size == 16 {
+    if v4 = to4(ip) {
+      ip = v4
+    }
+  }
+  if m.size == 16 && ip.size == 4 {
+    ip = [0.as_u8; 10] + [0xff.as_u8, 0xff] + ip
+  }
+  if ip.size == m.size {
+    i = 0
+    while i < ip.size {
+      masked << (ip[i] & m[i])
+      i += 1
+    }
+  }
+  if masked.size == 16 && to4(masked).some? {
+    fail err("x509: IP constraint contained IPv4-mapped IPv6 address with a IPv6 mask")
+  }
+  masked + m
+}
+
+def serialise_constraints(dns: [Str], ips: [IPNet], emails: [Str], uri_domains: [Str]) -> ~[Byte]<X509Error> {
+  b = cryptobyte.new_builder([])
+  for name in dns {
+    ~ia5_check(name)
+    b.add_asn1!(cbasn1.SEQUENCE) { |c|
+      c.add_asn1!(cbasn1.context_specific(2)) { |d| d.add_bytes!(name.bytes) }
+    }
+  }
+  for ip_net in ips {
+    encoded = ~ip_and_mask(ip_net)
+    b.add_asn1!(cbasn1.SEQUENCE) { |c|
+      c.add_asn1!(cbasn1.context_specific(7)) { |d| d.add_bytes!(encoded) }
+    }
+  }
+  for email in emails {
+    ~ia5_check(email)
+    b.add_asn1!(cbasn1.SEQUENCE) { |c|
+      c.add_asn1!(cbasn1.context_specific(1)) { |d| d.add_bytes!(email.bytes) }
+    }
+  }
+  for uri_domain in uri_domains {
+    ~ia5_check(uri_domain)
+    b.add_asn1!(cbasn1.SEQUENCE) { |c|
+      c.add_asn1!(cbasn1.context_specific(6)) { |d| d.add_bytes!(uri_domain.bytes) }
+    }
+  }
+  r = b.bytes
+  if e = r.err {
+    fail err(e.message)
+  }
+  r.unwrap
+}
+
+# Go's buildCertExtensions.
+def build_cert_extensions(template: Certificate, subject_is_empty: Bool, authority_key_id: [Byte], subject_key_id: [Byte]) -> ~[pkix.Extension]<X509Error> {
+  ret: [pkix.Extension] = []
+  extra = template.extra_extensions
+  if template.key_usage != 0 && !oid_in_extensions?(oid_extension_key_usage(), extra) {
+    ret << marshal_key_usage(template.key_usage)
+  }
+  if (template.ext_key_usage.size > 0 || template.unknown_ext_key_usage.size > 0) && !oid_in_extensions?(oid_extension_extended_key_usage(), extra) {
+    ret << ~marshal_ext_key_usage(template.ext_key_usage, template.unknown_ext_key_usage)
+  }
+  if template.basic_constraints_valid && !oid_in_extensions?(oid_extension_basic_constraints(), extra) {
+    ret << marshal_basic_constraints(template.is_ca, template.max_path_len, template.max_path_len_zero)
+  }
+  if subject_key_id.size > 0 && !oid_in_extensions?(oid_extension_subject_key_id(), extra) {
+    ret << pkix.Extension.new(id: oid_extension_subject_key_id(), value: asn1.marshal_bytes(subject_key_id).unwrap)
+  }
+  if authority_key_id.size > 0 && !oid_in_extensions?(oid_extension_authority_key_id(), extra) {
+    ret << pkix.Extension.new(id: oid_extension_authority_key_id(), value: AuthKeyId.new(id: authority_key_id).to_asn1.unwrap)
+  }
+  if (template.ocsp_server.size > 0 || template.issuing_certificate_url.size > 0) && !oid_in_extensions?(oid_extension_authority_info_access(), extra) {
+    aia: [AuthorityInfoAccess] = []
+    for name in template.ocsp_server {
+      aia << AuthorityInfoAccess.new(method: oid_authority_info_access_ocsp(), location: context_raw(6, name.bytes))
+    }
+    for name in template.issuing_certificate_url {
+      aia << AuthorityInfoAccess.new(method: oid_authority_info_access_issuers(), location: context_raw(6, name.bytes))
+    }
+    ret << pkix.Extension.new(id: oid_extension_authority_info_access(), value: AiaValues.new(values: aia).to_asn1.unwrap)
+  }
+  if (template.dns_names.size > 0 || template.email_addresses.size > 0 || template.ip_addresses.size > 0 || template.uris.size > 0) && !oid_in_extensions?(oid_extension_subject_alt_name(), extra) {
+    ret << pkix.Extension.new(id: oid_extension_subject_alt_name(), critical: subject_is_empty, value: ~marshal_sans(template.dns_names, template.email_addresses, template.ip_addresses, template.uris))
+  }
+  # Go writes the policies field (GODEBUG x509usepolicies=1, the default).
+  if template.policies.size > 0 && !oid_in_extensions?(oid_extension_certificate_policies(), extra) {
+    ret << ~marshal_certificate_policies(template.policies)
+  }
+  if (template.permitted_dns_domains.size > 0 || template.excluded_dns_domains.size > 0 || template.permitted_ip_ranges.size > 0 || template.excluded_ip_ranges.size > 0 || template.permitted_email_addresses.size > 0 || template.excluded_email_addresses.size > 0 || template.permitted_uri_domains.size > 0 || template.excluded_uri_domains.size > 0) && !oid_in_extensions?(oid_extension_name_constraints(), extra) {
+    permitted = ~serialise_constraints(template.permitted_dns_domains, template.permitted_ip_ranges, template.permitted_email_addresses, template.permitted_uri_domains)
+    excluded = ~serialise_constraints(template.excluded_dns_domains, template.excluded_ip_ranges, template.excluded_email_addresses, template.excluded_uri_domains)
+    b = cryptobyte.new_builder([])
+    b.add_asn1!(cbasn1.SEQUENCE) { |c|
+      if permitted.size > 0 {
+        c.add_asn1!(cbasn1.constructed(cbasn1.context_specific(0))) { |d| d.add_bytes!(permitted) }
+      }
+      if excluded.size > 0 {
+        c.add_asn1!(cbasn1.constructed(cbasn1.context_specific(1))) { |d| d.add_bytes!(excluded) }
+      }
+    }
+    v = b.bytes
+    if e = v.err {
+      fail err(e.message)
+    }
+    ret << pkix.Extension.new(id: oid_extension_name_constraints(), critical: template.permitted_dns_domains_critical, value: v.unwrap)
+  }
+  if template.crl_distribution_points.size > 0 && !oid_in_extensions?(oid_extension_crl_distribution_points(), extra) {
+    crl_dp: [DistributionPoint] = []
+    for name in template.crl_distribution_points {
+      crl_dp << DistributionPoint.new(distribution_point: DistributionPointName.new(full_name: [context_raw(6, name.bytes)]))
+    }
+    ret << pkix.Extension.new(id: oid_extension_crl_distribution_points(), value: CrlDps.new(dps: crl_dp).to_asn1.unwrap)
+  }
+  # Adding another extension here? Remember to update the maximum number of
+  # elements in the make() at the top of the function and the list of
+  # template fields used in CreateCertificate documentation.
+  ret + extra
+}
+
+def build_csr_extensions(template: CertificateRequest) -> ~[pkix.Extension]<X509Error> {
+  ret: [pkix.Extension] = []
+  if (template.dns_names.size > 0 || template.email_addresses.size > 0 || template.ip_addresses.size > 0 || template.uris.size > 0) && !oid_in_extensions?(oid_extension_subject_alt_name(), template.extra_extensions) {
+    ret << pkix.Extension.new(id: oid_extension_subject_alt_name(), value: ~marshal_sans(template.dns_names, template.email_addresses, template.ip_addresses, template.uris))
+  }
+  ret + template.extra_extensions
+}
+
+def subject_bytes(cert: Certificate) -> [Byte] {
+  return cert.raw_subject if cert.raw_subject.size > 0
+  cert.subject.to_rdn_sequence.to_asn1.unwrap
+}
+
+# Go's signingParamsForKey: the signature algorithm and its identifier for
+# a key and a requested algorithm (UnknownSignatureAlgorithm: the key's
+# default).
+def signing_params_for_key(key: PrivateKey, sig_algo0: SignatureAlgorithm) -> ~(SignatureAlgorithm, pkix.AlgorithmIdentifier)<X509Error> {
+  pub_type = PublicKeyAlgorithm.UnknownPublicKeyAlgorithm
+  default_algo = SignatureAlgorithm.UnknownSignatureAlgorithm
+  case key.public {
+    Rsa(_) => {
+      pub_type = PublicKeyAlgorithm.RSA
+      default_algo = SignatureAlgorithm.SHA256WithRSA
+    }
+    Ecdsa(p) => {
+      pub_type = PublicKeyAlgorithm.ECDSA
+      b = p.curve.nist_bits
+      if b == 224 || b == 256 {
+        default_algo = SignatureAlgorithm.ECDSAWithSHA256
+      } else if b == 384 {
+        default_algo = SignatureAlgorithm.ECDSAWithSHA384
+      } else if b == 521 {
+        default_algo = SignatureAlgorithm.ECDSAWithSHA512
+      } else {
+        fail err("x509: unsupported elliptic curve")
+      }
+    }
+    Ed25519(_) => {
+      pub_type = PublicKeyAlgorithm.Ed25519
+      default_algo = SignatureAlgorithm.PureEd25519
+    }
+    MlDsa(p) => {
+      pub_type = PublicKeyAlgorithm.MLDSA
+      prm = p.parameters
+      if prm == mldsa.mldsa44() {
+        default_algo = SignatureAlgorithm.MLDSA44
+      } else if prm == mldsa.mldsa65() {
+        default_algo = SignatureAlgorithm.MLDSA65
+      } else if prm == mldsa.mldsa87() {
+        default_algo = SignatureAlgorithm.MLDSA87
+      } else {
+        fail err("x509: unsupported ML-DSA parameters: #{prm.to_s}")
+      }
+    }
+    _ => {
+      fail err("x509: only RSA, ECDSA, ML-DSA and Ed25519 keys supported")
+    }
+  }
+  sig_algo = sig_algo0
+  sig_algo = default_algo if sig_algo == SignatureAlgorithm.UnknownSignatureAlgorithm
+  for d in signature_algorithm_details() {
+    if d.algo == sig_algo {
+      fail err("x509: requested SignatureAlgorithm does not match private key type") if d.pub_key_algo != pub_type
+      fail err("x509: requested SignatureAlgorithm does not match ML-DSA parameters") if pub_type == PublicKeyAlgorithm.MLDSA && sig_algo != default_algo
+      fail err("x509: signing with MD5 is not supported") if d.hash == crypto.Hash.MD5
+      return (sig_algo, pkix.AlgorithmIdentifier.new(algorithm: d.oid, parameters: d.params))
+    }
+  }
+  fail err("x509: unknown SignatureAlgorithm")
+}
+
+# Signer options: a hash (or none), or PSS options for RSA-PSS.
+struct SignOpts {
+  hash: crypto.Hash?
+  pss: Bool
+
+  pub def hash_func -> crypto.Hash? { hash }
+  pub def pss_salt_length -> Int? {
+    return rsa.PSS_SALT_LENGTH_EQUALS_HASH if pss
+    none
+  }
+}
+
+# Go's signTBS: the signature of tbs, checked against the key.
+def sign_tbs(tbs: [Byte], key: PrivateKey, sig_alg: SignatureAlgorithm, rand: io.Reader) -> ~[Byte]<X509Error> {
+  hash_func = sig_alg.hash_func
+  digest = tbs
+  if h = hash_func {
+    hh = h.new
+    hh.write!(tbs).unwrap
+    digest = hh.sum([])
+  }
+  r = key.sign(rand, digest, SignOpts.new(hash: hash_func, pss: sig_alg.rsa_pss?))
+  if e = r.err {
+    fail err(e.message)
+  }
+  signature = r.unwrap
+  # Check the signature to ensure the crypto.Signer behaved correctly.
+  c = check_signature_of(sig_alg, tbs, signature, key.public, true)
+  if e = c.err {
+    fail err("x509: signature returned by signer is invalid: #{e.message}")
+  }
+  signature
+}
+
+EMPTY_ASN1_SUBJECT: [Byte; 2] = [0x30, 0]
+
+# Creates a new X.509 v3 certificate based on a template, signed by parent
+# (the template itself for a self-signed certificate) with priv; pub is
+# the certificate's public key. Returns the DER. See Go's documentation
+# for the template fields used. A zero serial_number gets a random 159-bit
+# serial (Go: a nil SerialNumber).
+pub def create_certificate(rand: io.Reader, template: Certificate, parent: Certificate, pub: PublicKey, priv: PrivateKey) -> ~[Byte]<X509Error> {
+  fail err("x509: certificate private key does not implement crypto.Signer") if !priv.signer?
+  serial_number = template.serial_number
+  if serial_number.sign == 0 {
+    # Generate a serial number following RFC 5280, Section 4.1.2.2 if one
+    # is not provided. The serial number must be positive and at most 20
+    # octets *when encoded*.
+    serial_bytes = [0.as_u8; 20]
+    rr = io.read_full(rand, serial_bytes)
+    if e = rr.err {
+      fail err(e.message)
+    }
+    # If the top bit is set, the serial will be padded with a leading zero
+    # byte during encoding, so that it's not interpreted as a negative
+    # integer. This padding would make the serial 21 octets so we clear
+    # the top bit to ensure the correct length in all cases.
+    serial_bytes[0] = serial_bytes[0] & 0x7f
+    serial_number = big.Int.new
+    serial_number.set_bytes!(serial_bytes)
+  }
+  # RFC 5280 Section 4.1.2.2: serial number must positive
+  fail err("x509: serial number must be positive") if serial_number.sign == -1
+  fail err("x509: invalid MaxPathLen, must be greater or equal to -1") if template.basic_constraints_valid && template.max_path_len < -1
+  if template.basic_constraints_valid && !template.is_ca && template.max_path_len != -1 && (template.max_path_len != 0 || template.max_path_len_zero) {
+    fail err("x509: only CAs are allowed to specify MaxPathLen")
+  }
+  sig, algorithm_identifier = ~signing_params_for_key(priv, template.signature_algorithm)
+  public_key_bytes, public_key_algorithm = ~marshal_public_key(pub)
+  if get_public_key_algorithm_from_oid(public_key_algorithm.algorithm) == PublicKeyAlgorithm.UnknownPublicKeyAlgorithm {
+    fail err("x509: unsupported public key type: #{key_type_name(pub)}")
+  }
+  asn1_issuer = subject_bytes(parent)
+  asn1_subject = subject_bytes(template)
+  authority_key_id = template.authority_key_id
+  if asn1_issuer != asn1_subject && parent.subject_key_id.size > 0 {
+    authority_key_id = parent.subject_key_id
+  }
+  subject_key_id = template.subject_key_id
+  if subject_key_id.size == 0 && template.is_ca {
+    # SubjectKeyId generated using method 1 in RFC 7093, Section 2:
+    #    1) The keyIdentifier is composed of the leftmost 160-bits of the
+    #    SHA-256 hash of the value of the BIT STRING subjectPublicKey
+    #    (excluding the tag, length, and number of unused bits).
+    subject_key_id = sha256.sum256(public_key_bytes)[0...20] + []
+  }
+  # Check that the signer's public key matches the private key, if
+  # available.
+  if !parent.public_key.none? && !priv.public.equal?(parent.public_key) {
+    fail err("x509: provided PrivateKey doesn't match parent's PublicKey")
+  }
+  extensions = ~build_cert_extensions(template, asn1_subject == [0x30.as_u8, 0], authority_key_id, subject_key_id)
+  encoded_public_key = asn1.BitString.new(bit_length: public_key_bytes.size * 8, bytes: public_key_bytes)
+  c = TbsCertificate.new(version: 2, serial_number: serial_number, signature_algorithm: algorithm_identifier, issuer: asn1.RawValue.new(full_bytes: asn1_issuer), validity: Validity.new(not_before: template.not_before.utc, not_after: template.not_after.utc), subject: asn1.RawValue.new(full_bytes: asn1_subject), public_key: PublicKeyInfo.new(algorithm: public_key_algorithm, public_key: encoded_public_key), extensions: extensions)
+  tr = c.to_asn1
+  if e = tr.err {
+    fail err(e.message)
+  }
+  tbs_cert_contents = tr.unwrap
+  c.raw = tbs_cert_contents
+  signature = ~sign_tbs(tbs_cert_contents, priv, sig, rand)
+  CertificateDer.new(tbs_certificate: c, signature_algorithm: algorithm_identifier, signature_value: asn1.BitString.new(bytes: signature, bit_length: signature.size * 8)).to_asn1.unwrap
+}
+
+# Parses a CRL (PEM "X509 CRL" or DER). Deprecated in Go: use
+# parse_revocation_list.
+pub def parse_crl(crl_bytes0: [Byte]) -> ~pkix.CertificateList<X509Error> {
+  crl_bytes = crl_bytes0
+  prefix = "-----BEGIN X509 CRL".bytes
+  if crl_bytes.size >= prefix.size && crl_bytes[0...prefix.size] == prefix {
+    if block = pem.decode(crl_bytes)[0] {
+      crl_bytes = block.bytes if block.type == "X509 CRL"
+    }
+  }
+  ~parse_der_crl(crl_bytes)
+}
+
+# Parses a DER encoded CRL. Deprecated in Go: use parse_revocation_list.
+pub def parse_der_crl(der_bytes: [Byte]) -> ~pkix.CertificateList<X509Error> {
+  r = pkix.CertificateList.from_asn1(der_bytes)
+  if e = r.err {
+    fail err(e.message)
+  }
+  cl, rest = r.unwrap
+  fail err("x509: trailing data after CRL") if rest.size != 0
+  cl
+}
+
+# Returns a DER encoded CRL, signed by this certificate's key. Deprecated
+# in Go: use create_revocation_list.
+pub def create_crl_from(c: Certificate, rand: io.Reader, priv: PrivateKey, revoked_certs: [pkix.RevokedCertificate], now: time.Time, expiry: time.Time) -> ~[Byte]<X509Error> {
+  fail err("x509: certificate private key does not implement crypto.Signer") if !priv.signer?
+  sig, algorithm_identifier = ~signing_params_for_key(priv, SignatureAlgorithm.UnknownSignatureAlgorithm)
+  revoked_certs_utc: [pkix.RevokedCertificate] = []
+  for rc0 in revoked_certs {
+    rc = rc0
+    rc.revocation_time = rc.revocation_time.utc
+    revoked_certs_utc << rc
+  }
+  tbs_cert_list = pkix.TBSCertificateList.new(version: 1, signature: algorithm_identifier, issuer: c.subject.to_rdn_sequence, this_update: now.utc, next_update: expiry.utc, revoked_certificates: revoked_certs_utc)
+  # Authority Key Id
+  if c.subject_key_id.size > 0 {
+    tbs_cert_list.extensions << pkix.Extension.new(id: oid_extension_authority_key_id(), value: AuthKeyId.new(id: c.subject_key_id).to_asn1.unwrap)
+  }
+  tr = tbs_cert_list.to_asn1
+  if e = tr.err {
+    fail err(e.message)
+  }
+  tbs_cert_list_contents = tr.unwrap
+  tbs_cert_list.raw = tbs_cert_list_contents
+  signature = ~sign_tbs(tbs_cert_list_contents, priv, sig, rand)
+  pkix.CertificateList.new(tbs_cert_list: tbs_cert_list, signature_algorithm: algorithm_identifier, signature_value: asn1.BitString.new(bytes: signature, bit_length: signature.size * 8)).to_asn1.unwrap
+}
+
+# ---------------------------------------------------------------- CSRs
+
+# A PKCS #10 certificate signature request.
+pub struct CertificateRequest {
+  # Complete ASN.1 DER content (CSR, signature algorithm and signature).
+  raw: [Byte]
+  # Certificate request info part of raw ASN.1 DER content.
+  raw_tbs_certificate_request: [Byte]
+  raw_subject_public_key_info: [Byte]
+  raw_subject: [Byte]
+  raw_signature_algorithm: [Byte]
+
+  version: Int
+  signature: [Byte]
+  signature_algorithm: SignatureAlgorithm
+
+  public_key_algorithm: PublicKeyAlgorithm
+  public_key: PublicKey
+
+  subject: pkix.Name
+
+  # Deprecated in Go: use extensions and extra_extensions.
+  attributes: [pkix.AttributeTypeAndValueSET]
+
+  # The requested extensions (parsing); ignored when creating (see
+  # extra_extensions).
+  extensions: [pkix.Extension]
+  # Extensions to be copied, raw, into any CSR marshaled by
+  # create_certificate_request.
+  extra_extensions: [pkix.Extension]
+
+  # Subject Alternate Name values.
+  dns_names: [Str]
+  email_addresses: [Str]
+  ip_addresses: [[Byte]]
+  uris: [url.Url]
+
+  # Reports whether the signature on the request is valid.
+  pub def check_signature -> ~Unit<X509Error> {
+    ~check_signature_of(signature_algorithm, raw_tbs_certificate_request, signature, public_key, true)
+  }
+}
+
+#[derive(Asn1)]
+struct TbsCertificateRequest {
+  #[asn1(raw_content)] raw: [Byte]
+  version: Int
+  subject: asn1.RawValue
+  public_key: PublicKeyInfo
+  #[asn1(tag: 0)] raw_attributes: [asn1.RawValue]
+}
+
+#[derive(Asn1)]
+struct CsrSignatureAlgorithm {
+  #[asn1(raw_content)] raw: [Byte]
+  algorithm: asn1.ObjectIdentifier
+  #[asn1(optional)] parameters: asn1.RawValue
+}
+
+#[derive(Asn1)]
+struct CertificateRequestDer {
+  #[asn1(raw_content)] raw: [Byte]
+  tbs_csr: TbsCertificateRequest
+  signature_algorithm: CsrSignatureAlgorithm
+  signature_value: asn1.BitString
+}
+
+#[derive(Asn1)]
+#[asn1(transparent)]
+struct AttributeSets {
+  sets: [pkix.AttributeTypeAndValueSET]
+}
+
+#[derive(Asn1)]
+struct Pkcs10Attribute {
+  id: asn1.ObjectIdentifier
+  #[asn1(set)] values: [asn1.RawValue]
+}
+
+#[derive(Asn1)]
+#[asn1(transparent)]
+struct Extensions {
+  exts: [pkix.Extension]
+}
+
+#[derive(Asn1)]
+struct ExtensionRequestAttr {
+  type: asn1.ObjectIdentifier
+  #[asn1(set)] value: [Extensions]
+}
+
+def oid_extension_request -> asn1.ObjectIdentifier { asn1.oid([1, 2, 840, 113549, 1, 9, 14]) }
+
+def new_raw_attributes(attributes: [pkix.AttributeTypeAndValueSET]) -> ~[asn1.RawValue]<X509Error> {
+  b = AttributeSets.new(sets: attributes).to_asn1
+  if e = b.err {
+    fail err(e.message)
+  }
+  r = RawValues.from_asn1(b.unwrap)
+  if e = r.err {
+    fail err(e.message)
+  }
+  raw, rest = r.unwrap
+  fail err("x509: failed to unmarshal raw CSR Attributes") if rest.size != 0
+  raw.values
+}
+
+def parse_raw_attributes(raw_attributes: [asn1.RawValue]) -> [pkix.AttributeTypeAndValueSET] {
+  attributes: [pkix.AttributeTypeAndValueSET] = []
+  for raw_attr in raw_attributes {
+    if v = pkix.AttributeTypeAndValueSET.from_asn1(raw_attr.full_bytes).ok {
+      attributes << v[0] if v[1].size == 0
+    }
+  }
+  attributes
+}
+
+def parse_csr_extensions(raw_attributes: [asn1.RawValue]) -> ~[pkix.Extension]<X509Error> {
+  ret: [pkix.Extension] = []
+  requested_exts: Map[Str, Bool] = {}
+  for raw_attr in raw_attributes {
+    r = Pkcs10Attribute.from_asn1(raw_attr.full_bytes)
+    next if !r.ok?
+    attr, rest = r.unwrap
+    next if rest.size != 0 || attr.values.size == 0
+    next if !attr.id.equal?(oid_extension_request())
+    er = Extensions.from_asn1(attr.values[0].full_bytes)
+    if e = er.err {
+      fail err(e.message)
+    }
+    extensions = er.unwrap[0].exts
+    for ext in extensions {
+      oid_str = ext.id.to_s
+      fail err("x509: certificate request contains duplicate requested extensions") if requested_exts.has_key?(oid_str)
+      requested_exts[oid_str] = true
+    }
+    ret = ret + extensions
+  }
+  ret
+}
+
+# Creates a new certificate request based on a template, signed with
+# priv. See Go's documentation for the template fields used.
+pub def create_certificate_request(rand: io.Reader, template: CertificateRequest, priv: PrivateKey) -> ~[Byte]<X509Error> {
+  fail err("x509: certificate private key does not implement crypto.Signer") if !priv.signer?
+  sig, algorithm_identifier = ~signing_params_for_key(priv, template.signature_algorithm)
+  public_key_bytes, public_key_algorithm = ~marshal_public_key(priv.public)
+  extensions = ~build_csr_extensions(template)
+  # Make a copy of template.Attributes because we may alter it below.
+  attributes: [pkix.AttributeTypeAndValueSET] = []
+  for attr in template.attributes {
+    attributes << pkix.AttributeTypeAndValueSET.new(type: attr.type, value: attr.value + [])
+  }
+  extensions_appended = false
+  if extensions.size > 0 {
+    # Append the extensions to an existing attribute if possible.
+    i = 0
+    while i < attributes.size {
+      atv_set = attributes[i]
+      if !atv_set.type.equal?(oid_extension_request()) || atv_set.value.size == 0 {
+        i += 1
+        next
+      }
+      # specifiedExtensions contains all the extensions that we found
+      # specified via template.Attributes.
+      specified: Map[Str, Bool] = {}
+      for atvs in atv_set.value {
+        for atv in atvs {
+          specified[atv.type.to_s] = true
+        }
+      }
+      new_value = atv_set.value[0] + []
+      for e in extensions {
+        next if specified.has_key?(e.id.to_s)
+        new_value << pkix.AttributeTypeAndValue.new(type: e.id, value: asn1.Any.Bytes(e.value))
+      }
+      vals = atv_set.value + []
+      vals[0] = new_value
+      attributes[i] = pkix.AttributeTypeAndValueSET.new(type: atv_set.type, value: vals)
+      extensions_appended = true
+      break
+    }
+  }
+  raw_attributes = ~new_raw_attributes(attributes)
+  # If not included in attributes, add a new attribute for the extensions.
+  if extensions.size > 0 && !extensions_appended {
+    b = ExtensionRequestAttr.new(type: oid_extension_request(), value: [Extensions.new(exts: extensions)]).to_asn1
+    if e = b.err {
+      fail err("x509: failed to serialise extensions attribute: " + e.message)
+    }
+    rv = asn1.unmarshal_raw(b.unwrap)
+    if e = rv.err {
+      fail err(e.message)
+    }
+    raw_attributes << rv.unwrap[0]
+  }
+  asn1_subject = template.raw_subject
+  asn1_subject = template.subject.to_rdn_sequence.to_asn1.unwrap if asn1_subject.size == 0
+  tbs_csr = TbsCertificateRequest.new(version: 0, subject: asn1.RawValue.new(full_bytes: asn1_subject), public_key: PublicKeyInfo.new(algorithm: public_key_algorithm, public_key: asn1.BitString.new(bytes: public_key_bytes, bit_length: public_key_bytes.size * 8)), raw_attributes: raw_attributes)
+  tr = tbs_csr.to_asn1
+  if e = tr.err {
+    fail err(e.message)
+  }
+  tbs_csr_contents = tr.unwrap
+  tbs_csr.raw = tbs_csr_contents
+  signature = ~sign_tbs(tbs_csr_contents, priv, sig, rand)
+  cr = CertificateRequestDer.new(tbs_csr: tbs_csr, signature_algorithm: CsrSignatureAlgorithm.new(algorithm: algorithm_identifier.algorithm, parameters: algorithm_identifier.parameters), signature_value: asn1.BitString.new(bytes: signature, bit_length: signature.size * 8))
+  cr.to_asn1.unwrap
+}
+
+# Parses a single certificate request from the given ASN.1 DER data.
+pub def parse_certificate_request(asn1_data: [Byte]) -> ~CertificateRequest<X509Error> {
+  r = CertificateRequestDer.from_asn1(asn1_data)
+  if e = r.err {
+    fail err(e.message)
+  }
+  csr, rest = r.unwrap
+  fail err("asn1: syntax error: trailing data") if rest.size != 0
+  ~parse_certificate_request_der(csr)
+}
+
+def parse_certificate_request_der(input: CertificateRequestDer) -> ~CertificateRequest<X509Error> {
+  out = CertificateRequest.new(raw: input.raw, raw_tbs_certificate_request: input.tbs_csr.raw, raw_subject_public_key_info: input.tbs_csr.public_key.raw, raw_subject: input.tbs_csr.subject.full_bytes, raw_signature_algorithm: input.signature_algorithm.raw, signature: input.signature_value.right_align, signature_algorithm: get_signature_algorithm_from_ai(pkix.AlgorithmIdentifier.new(algorithm: input.signature_algorithm.algorithm, parameters: input.signature_algorithm.parameters)), public_key_algorithm: get_public_key_algorithm_from_oid(input.tbs_csr.public_key.algorithm.algorithm), version: input.tbs_csr.version, attributes: parse_raw_attributes(input.tbs_csr.raw_attributes))
+  if out.public_key_algorithm != PublicKeyAlgorithm.UnknownPublicKeyAlgorithm {
+    out.public_key = ~parse_public_key(input.tbs_csr.public_key.algorithm, input.tbs_csr.public_key.public_key)
+  }
+  subject = ~parse_name(input.tbs_csr.subject.full_bytes)
+  out.subject.fill_from_rdn_sequence!(subject)
+  out.extensions = ~parse_csr_extensions(input.tbs_csr.raw_attributes)
+  for extension in out.extensions {
+    if extension.id.equal?(oid_extension_subject_alt_name()) {
+      dns, emails, ips, uris = ~parse_san_extension(extension.value)
+      out.dns_names = dns
+      out.email_addresses = emails
+      out.ip_addresses = ips
+      out.uris = uris
+    }
+  }
+  out
+}
+
+# ---------------------------------------------------------------- CRLs
+
+# An entry in the revokedCertificates sequence of a CRL.
+pub struct RevocationListEntry {
+  # The raw bytes of the revokedCertificates entry (ignored when creating).
+  raw: [Byte]
+  serial_number: big.Int
+  revocation_time: time.Time
+  # The CRLReason (RFC 5280, 5.3.1); 0 is unspecified or absent.
+  reason_code: Int
+  # The raw extensions, as parsed (ignored when creating, but see
+  # extra_extensions).
+  extensions: [pkix.Extension]
+  # Extensions to be added to the entry when creating (not ReasonCode).
+  extra_extensions: [pkix.Extension]
+}
+
+# A Certificate Revocation List (RFC 5280).
+pub struct RevocationList {
+  # The complete ASN.1 DER content of the CRL.
+  raw: [Byte]
+  raw_tbs_revocation_list: [Byte]
+  raw_issuer: [Byte]
+  raw_signature_algorithm: [Byte]
+
+  # Ignored when creating: the issuing certificate's name is used.
+  issuer: pkix.Name
+  # Ignored when creating: from the issuer's subject key id.
+  authority_key_id: [Byte]
+
+  signature: [Byte]
+  # The algorithm to sign with when creating (Unknown: the key's default).
+  signature_algorithm: SignatureAlgorithm
+
+  revoked_certificate_entries: [RevocationListEntry]
+  # Deprecated in Go: use revoked_certificate_entries.
+  revoked_certificates: [pkix.RevokedCertificate]
+
+  # The CRL number (required when creating; zero is none there).
+  number: big.Int
+
+  this_update: time.Time
+  next_update: time.Time
+
+  # The raw extensions, as parsed (ignored when creating).
+  extensions: [pkix.Extension]
+  # Extensions added to the CRL when creating.
+  extra_extensions: [pkix.Extension]
+
+  # Verifies that the signature on the CRL is a valid signature from
+  # parent.
+  pub def check_signature_from(parent: Certificate) -> ~Unit<X509Error> {
+    # RFC 5280, 4.2.1.9 / 4.2.1.3
+    fail X509Error.ConstraintViolation if (parent.version == 3 && !parent.basic_constraints_valid) || (parent.basic_constraints_valid && !parent.is_ca)
+    fail X509Error.ConstraintViolation if parent.key_usage != 0 && parent.key_usage & KEY_USAGE_CRL_SIGN == 0
+    fail X509Error.UnsupportedAlgorithm if parent.public_key_algorithm == PublicKeyAlgorithm.UnknownPublicKeyAlgorithm
+    ~parent.check_signature(signature_algorithm, raw_tbs_revocation_list, signature)
+  }
+}
+
+#[derive(Asn1)]
+struct CertificateListDer {
+  tbs_cert_list: TbsCertificateListDer
+  signature_algorithm: pkix.AlgorithmIdentifier
+  signature_value: asn1.BitString
+}
+
+#[derive(Asn1)]
+struct TbsCertificateListDer {
+  #[asn1(raw_content)] raw: [Byte]
+  #[asn1(optional, default: 0)] version: Int
+  signature: pkix.AlgorithmIdentifier
+  issuer: asn1.RawValue
+  this_update: time.Time
+  #[asn1(optional)] next_update: time.Time
+  #[asn1(optional)] revoked_certificates: [pkix.RevokedCertificate]
+  #[asn1(tag: 0, optional, explicit)] extensions: [pkix.Extension]
+}
+
+# Creates a new X.509 v2 CRL (RFC 5280) based on template, signed by
+# issuer's key priv. The issuer must have the crlSign key usage and a
+# subject key identifier.
+pub def create_revocation_list(rand: io.Reader, template: RevocationList, issuer: Certificate, priv: PrivateKey) -> ~[Byte]<X509Error> {
+  fail err("x509: issuer must have the crlSign key usage bit set") if issuer.key_usage & KEY_USAGE_CRL_SIGN == 0
+  fail err("x509: issuer certificate doesn't contain a subject key identifier") if issuer.subject_key_id.size == 0
+  fail err("x509: template.ThisUpdate is after template.NextUpdate") if template.next_update.before(template.this_update)
+  fail err("x509: template contains nil Number field") if template.number.sign == 0
+  sig, algorithm_identifier = ~signing_params_for_key(priv, template.signature_algorithm)
+  revoked_certs: [pkix.RevokedCertificate] = []
+  if template.revoked_certificates.size > 0 && template.revoked_certificate_entries.size == 0 {
+    # Only deprecated RevokedCertificates are present
+    for rc0 in template.revoked_certificates {
+      rc = rc0
+      rc.revocation_time = rc.revocation_time.utc
+      revoked_certs << rc
+    }
+  } else {
+    for rce in template.revoked_certificate_entries {
+      fail err("x509: template contains entry with zero RevocationTime field") if rce.revocation_time.is_zero
+      rc = pkix.RevokedCertificate.new(serial_number: rce.serial_number, revocation_time: rce.revocation_time.utc)
+      exts: [pkix.Extension] = []
+      for ext in rce.extra_extensions {
+        fail err("x509: template contains entry with ReasonCode ExtraExtension; use ReasonCode field instead") if ext.id.equal?(oid_extension_reason_code())
+        exts << ext
+      }
+      # Only add reasonCode extension if the reason is non-zero, as per RFC
+      # 5280 Section 5.3.1.
+      if rce.reason_code != 0 {
+        exts << pkix.Extension.new(id: oid_extension_reason_code(), value: asn1.marshal_enumerated(rce.reason_code).unwrap)
+      }
+      rc.extensions = exts
+      revoked_certs << rc
+    }
+  }
+  aki = AuthKeyId.new(id: issuer.subject_key_id).to_asn1.unwrap
+  # Enforce the 20 octet limit (RFC 5280, Section 5.2.3) on the CRL number.
+  num_bytes = template.number.bytes
+  fail err("x509: CRL number exceeds 20 octets") if num_bytes.size > 20 || (num_bytes.size == 20 && num_bytes[0] & 0x80 != 0)
+  crl_num = asn1.marshal_big(template.number).unwrap
+  issuer_subject = subject_bytes(issuer)
+  tbs_cert_list = TbsCertificateListDer.new(version: 1, signature: algorithm_identifier, issuer: asn1.RawValue.new(full_bytes: issuer_subject), this_update: template.this_update.utc, next_update: template.next_update.utc, extensions: [pkix.Extension.new(id: oid_extension_authority_key_id(), value: aki), pkix.Extension.new(id: oid_extension_crl_number(), value: crl_num)])
+  tbs_cert_list.revoked_certificates = revoked_certs if revoked_certs.size > 0
+  tbs_cert_list.extensions = tbs_cert_list.extensions + template.extra_extensions if template.extra_extensions.size > 0
+  tr = tbs_cert_list.to_asn1
+  if e = tr.err {
+    fail err(e.message)
+  }
+  tbs_cert_list_contents = tr.unwrap
+  tbs_cert_list.raw = tbs_cert_list_contents
+  signature = ~sign_tbs(tbs_cert_list_contents, priv, sig, rand)
+  CertificateListDer.new(tbs_cert_list: tbs_cert_list, signature_algorithm: algorithm_identifier, signature_value: asn1.BitString.new(bytes: signature, bit_length: signature.size * 8)).to_asn1.unwrap
+}

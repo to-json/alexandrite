@@ -1,0 +1,1078 @@
+# Package x509: Go's crypto/x509, X.509 certificates, CRLs, CSRs and keys
+# (RFC 5280): parsing (on golang.org/x/crypto/cryptobyte, as Go does),
+# creation (encoding/asn1 derives and cryptobyte builders), PKCS #1 /
+# PKCS #8 / SEC 1 / PKIX key encodings, chain verification with name
+# constraints, key usages and policies, and the system roots.
+#
+# API map (Go -> alx); names are Go's in snake_case unless listed:
+#
+#   Certificate{...}                          Certificate{...} (fields below)
+#   ParseCertificate(der) / ParseCertificates parse_certificate(der) -> ~Certificate / parse_certificates
+#   CreateCertificate(rand, tmpl, parent, pub, priv)
+#                                             create_certificate(rand, tmpl, parent, pub: PublicKey, priv: PrivateKey)
+#   c.CheckSignatureFrom(parent) / CheckSignature
+#                                             c.check_signature_from(parent) / c.check_signature(algo, signed, sig) -> ~Unit
+#   c.Verify(opts) (chains, err)              c.verify(opts) -> ~[[Certificate]]
+#   c.VerifyHostname(h)                       c.verify_hostname(h) -> ~Unit
+#   c.Equal(other)                            c.equal?(other)
+#   PublicKey any / PrivateKey any            PublicKey / PrivateKey enums (keys.alx)
+#   ParsePKIXPublicKey / MarshalPKIXPublicKey parse_pkix_public_key / marshal_pkix_public_key
+#   ParsePKCS1PrivateKey / MarshalPKCS1...    parse_pkcs1_private_key -> ~rsa.PrivateKey ... (pkcs1.alx)
+#   ParsePKCS8PrivateKey (any)                parse_pkcs8_private_key -> ~PrivateKey (pkcs8.alx)
+#   ParseECPrivateKey / MarshalECPrivateKey   parse_ec_private_key / marshal_ec_private_key (sec1.alx)
+#   SignatureAlgorithm / PublicKeyAlgorithm   enums (Go's constant names as variants)
+#   KeyUsage (bit flags)                      Int, KEY_USAGE_DIGITAL_SIGNATURE ... KEY_USAGE_DECIPHER_ONLY
+#   ExtKeyUsage                               ExtKeyUsage enum (Any, ServerAuth, ...)
+#   OID / ParseOID / OIDFromInts              OID / parse_oid / oid_from_ints (oid.alx)
+#   net.IP / *net.IPNet                       [Byte] / IPNet{ip, mask} (Go's representations)
+#   *url.URL                                  url.Url
+#   errors (ErrUnsupportedAlgorithm,          X509Error variants with Go's messages
+#     InsecureAlgorithmError, ConstraintViolationError, CertificateInvalidError,
+#     HostnameError, UnknownAuthorityError, SystemRootsError, UnhandledCriticalExtension)
+#
+#   IsEncryptedPEMBlock / DecryptPEMBlock /   is_encrypted_pem_block? / decrypt_pem_block /
+#     EncryptPEMBlock (deprecated)              encrypt_pem_block (pem_decrypt.alx)
+#   CreateCertificateRequest / ParseCertificateRequest / csr.CheckSignature
+#                                             create_certificate_request / parse_certificate_request /
+#                                             csr.check_signature (create.alx)
+#   CreateRevocationList / ParseRevocationList / rl.CheckSignatureFrom
+#                                             create_revocation_list / parse_revocation_list /
+#                                             rl.check_signature_from; deprecated ParseCRL /
+#                                             ParseDERCRL / c.CreateCRL: parse_crl / parse_der_crl / c.create_crl
+#   NewCertPool / SystemCertPool / pool.*     new_cert_pool / system_cert_pool / add_cert! ... (cert_pool.alx)
+#   VerifyOptions{DNSName, Intermediates,     VerifyOptions{dns_name, intermediates: CertPool?,
+#     Roots, CurrentTime, KeyUsages, ...}       roots: CertPool?, current_time, key_usages, ...}
+#
+# Differences from Go (each file's header has the details):
+#   - Keys are the PublicKey / PrivateKey enums (Go: any + type switches):
+#     a key type x509 doesn't know can't be passed, and there is no custom
+#     crypto.Signer (Go's opaque signers, e.g. hardware keys).
+#   - No nil: a zero serial_number in a template means "generate one"
+#     (Go: nil); a zero RevocationList.number is Go's nil Number; IPs are
+#     [Byte] and URIs url.Url values. Empty slices count as nil where Go
+#     distinguishes (pkix.Name.extra_names).
+#   - Values, not pointers: Certificate is copied; Equal compares raw.
+#     CertPool shares its state across copies (D36).
+#   - Verification is always alx's own: Go hands it to the platform on
+#     macOS and Windows when no roots are given; alx reads the system roots
+#     from the Linux/BSD bundle paths (which include macOS's
+#     /etc/ssl/cert.pem) or SSL_CERT_FILE / SSL_CERT_DIR, per call (no
+#     package state to cache them in; pass roots to verify many
+#     certificates). No SetFallbackRoots.
+#   - No GODEBUG: the defaults of Go 1.27 (negative serials rejected,
+#     x509usepolicies=1, SHA-256 subject key ids, x509rsacrt=1).
+#   - SignatureAlgorithm, PublicKeyAlgorithm, ExtKeyUsage and PEMCipher are
+#     enums (value gives Go's number), so out-of-range values (Go's
+#     ExtKeyUsage(-1)) can't be made.
+#   - Errors are X509Error variants holding Go's message (Go's error types
+#     hold the certificate).
+
+import "bytes"
+import "crypto"
+import "crypto/dsa"
+import "crypto/ecdh"
+import "crypto/ecdsa"
+import "crypto/ed25519"
+import "crypto/elliptic"
+import "crypto/mldsa"
+import "crypto/rsa"
+import "crypto/x509/pkix"
+import "encoding/asn1"
+import "math/big"
+import "net/url"
+import "strconv"
+import "time"
+import "golang.org/x/crypto/cryptobyte"
+import cbasn1 "golang.org/x/crypto/cryptobyte/asn1"
+
+# ---------------------------------------------------------------- errors
+
+pub error X509Error {
+  # Go's errors.New / fmt.Errorf errors, with their text.
+  Msg(msg: Str)
+  # Go's ErrUnsupportedAlgorithm.
+  UnsupportedAlgorithm
+  # Go's InsecureAlgorithmError.
+  InsecureAlgorithm(algo: SignatureAlgorithm)
+  # Go's ConstraintViolationError.
+  ConstraintViolation
+  # Go's UnhandledCriticalExtension.
+  UnhandledCriticalExtension
+  # Go's CertificateInvalidError: reason is one of the INVALID_REASON_*
+  # constants (Go's InvalidReason); msg is Go's Error() text.
+  CertificateInvalid(reason: Int, detail: Str, msg: Str)
+  # Go's HostnameError (msg is its Error() text).
+  Hostname(host: Str, msg: Str)
+  # Go's UnknownAuthorityError (msg is its Error() text).
+  UnknownAuthority(msg: Str)
+  # Go's SystemRootsError.
+  SystemRoots(msg: Str)
+
+  def message -> Str {
+    case self {
+      Msg(m) => m
+      UnsupportedAlgorithm => "x509: cannot verify signature: algorithm unimplemented"
+      InsecureAlgorithm(a) => "x509: cannot verify signature: insecure algorithm #{a.to_s}"
+      ConstraintViolation => "x509: invalid signature: parent certificate cannot sign this kind of certificate"
+      UnhandledCriticalExtension => "x509: unhandled critical extension"
+      CertificateInvalid(_, _, m) => m
+      Hostname(_, m) => m
+      UnknownAuthority(m) => m
+      SystemRoots(m) => m
+    }
+  }
+}
+
+def err(msg: Str) -> X509Error { X509Error.Msg(msg) }
+
+# The value in o, or an X509Error.Msg(msg) (Go's `if !s.ReadX(&v) {
+# return errors.New(msg) }`).
+def need[T](o: T?, msg: Str) -> ~T<X509Error> {
+  if v = o {
+    return v
+  }
+  fail X509Error.Msg(msg)
+}
+
+# Fails with msg unless ok.
+def check(ok: Bool, msg: Str) -> ~Unit<X509Error> {
+  fail X509Error.Msg(msg) if !ok
+}
+
+# ---------------------------------------------------------------- algorithms
+
+pub enum SignatureAlgorithm {
+  UnknownSignatureAlgorithm
+  MD2WithRSA
+  MD5WithRSA
+  SHA1WithRSA
+  SHA256WithRSA
+  SHA384WithRSA
+  SHA512WithRSA
+  DSAWithSHA1
+  DSAWithSHA256
+  ECDSAWithSHA1
+  ECDSAWithSHA256
+  ECDSAWithSHA384
+  ECDSAWithSHA512
+  SHA256WithRSAPSS
+  SHA384WithRSAPSS
+  SHA512WithRSAPSS
+  PureEd25519
+  MLDSA44
+  MLDSA65
+  MLDSA87
+
+  # Go's number for the algorithm (its iota position).
+  pub def value -> Int {
+    case self {
+      UnknownSignatureAlgorithm => 0
+      MD2WithRSA => 1
+      MD5WithRSA => 2
+      SHA1WithRSA => 3
+      SHA256WithRSA => 4
+      SHA384WithRSA => 5
+      SHA512WithRSA => 6
+      DSAWithSHA1 => 7
+      DSAWithSHA256 => 8
+      ECDSAWithSHA1 => 9
+      ECDSAWithSHA256 => 10
+      ECDSAWithSHA384 => 11
+      ECDSAWithSHA512 => 12
+      SHA256WithRSAPSS => 13
+      SHA384WithRSAPSS => 14
+      SHA512WithRSAPSS => 15
+      PureEd25519 => 16
+      MLDSA44 => 17
+      MLDSA65 => 18
+      MLDSA87 => 19
+    }
+  }
+
+  pub def to_s -> Str {
+    if d = sig_details(self) {
+      return d.name
+    }
+    self.value.to_s
+  }
+  pub def string -> Str { self.to_s }
+
+  def rsa_pss? -> Bool {
+    if d = sig_details(self) {
+      return d.is_rsa_pss
+    }
+    false
+  }
+
+  # The hash, or none (Go's crypto.Hash(0)).
+  def hash_func -> crypto.Hash? {
+    if d = sig_details(self) {
+      return d.hash
+    }
+    none
+  }
+}
+
+pub enum PublicKeyAlgorithm {
+  UnknownPublicKeyAlgorithm
+  RSA
+  DSA
+  ECDSA
+  Ed25519
+  MLDSA
+
+  pub def value -> Int {
+    case self {
+      UnknownPublicKeyAlgorithm => 0
+      RSA => 1
+      DSA => 2
+      ECDSA => 3
+      Ed25519 => 4
+      MLDSA => 5
+    }
+  }
+
+  pub def to_s -> Str {
+    case self {
+      UnknownPublicKeyAlgorithm => "0"
+      RSA => "RSA"
+      DSA => "DSA"
+      ECDSA => "ECDSA"
+      Ed25519 => "Ed25519"
+      MLDSA => "ML-DSA"
+    }
+  }
+  pub def string -> Str { self.to_s }
+}
+
+# One row of Go's signatureAlgorithmDetails.
+struct SigDetails {
+  algo: SignatureAlgorithm
+  name: Str
+  oid: asn1.ObjectIdentifier
+  params: asn1.RawValue
+  pub_key_algo: PublicKeyAlgorithm
+  hash: crypto.Hash?
+  is_rsa_pss: Bool
+}
+
+def sd(algo: SignatureAlgorithm, name: Str, oid: [Int], params: asn1.RawValue, pk: PublicKeyAlgorithm, hash: crypto.Hash?, pss: Bool) -> SigDetails {
+  SigDetails.new(algo: algo, name: name, oid: asn1.oid(oid), params: params, pub_key_algo: pk, hash: hash, is_rsa_pss: pss)
+}
+
+def pss_params(h: Int, salt: Int) -> asn1.RawValue {
+  asn1.RawValue.new(full_bytes: [48.as_u8, 52, 160, 15, 48, 13, 6, 9, 96, 134, 72, 1, 101, 3, 4, 2, h.as_u8, 5, 0, 161, 28, 48, 26, 6, 9, 42, 134, 72, 134, 247, 13, 1, 1, 8, 48, 13, 6, 9, 96, 134, 72, 1, 101, 3, 4, 2, h.as_u8, 5, 0, 162, 3, 2, 1, salt.as_u8])
+}
+
+# Go's signatureAlgorithmDetails.
+def signature_algorithm_details -> [SigDetails] {
+  null = asn1.null_raw_value()
+  empty = asn1.RawValue.new
+  [
+    sd(SignatureAlgorithm.MD5WithRSA, "MD5-RSA", [1, 2, 840, 113549, 1, 1, 4], null, PublicKeyAlgorithm.RSA, crypto.Hash.MD5, false),
+    sd(SignatureAlgorithm.SHA1WithRSA, "SHA1-RSA", [1, 2, 840, 113549, 1, 1, 5], null, PublicKeyAlgorithm.RSA, crypto.Hash.SHA1, false),
+    sd(SignatureAlgorithm.SHA1WithRSA, "SHA1-RSA", [1, 3, 14, 3, 2, 29], null, PublicKeyAlgorithm.RSA, crypto.Hash.SHA1, false),
+    sd(SignatureAlgorithm.SHA256WithRSA, "SHA256-RSA", [1, 2, 840, 113549, 1, 1, 11], null, PublicKeyAlgorithm.RSA, crypto.Hash.SHA256, false),
+    sd(SignatureAlgorithm.SHA384WithRSA, "SHA384-RSA", [1, 2, 840, 113549, 1, 1, 12], null, PublicKeyAlgorithm.RSA, crypto.Hash.SHA384, false),
+    sd(SignatureAlgorithm.SHA512WithRSA, "SHA512-RSA", [1, 2, 840, 113549, 1, 1, 13], null, PublicKeyAlgorithm.RSA, crypto.Hash.SHA512, false),
+    sd(SignatureAlgorithm.SHA256WithRSAPSS, "SHA256-RSAPSS", [1, 2, 840, 113549, 1, 1, 10], pss_params(1, 32), PublicKeyAlgorithm.RSA, crypto.Hash.SHA256, true),
+    sd(SignatureAlgorithm.SHA384WithRSAPSS, "SHA384-RSAPSS", [1, 2, 840, 113549, 1, 1, 10], pss_params(2, 48), PublicKeyAlgorithm.RSA, crypto.Hash.SHA384, true),
+    sd(SignatureAlgorithm.SHA512WithRSAPSS, "SHA512-RSAPSS", [1, 2, 840, 113549, 1, 1, 10], pss_params(3, 64), PublicKeyAlgorithm.RSA, crypto.Hash.SHA512, true),
+    sd(SignatureAlgorithm.DSAWithSHA1, "DSA-SHA1", [1, 2, 840, 10040, 4, 3], empty, PublicKeyAlgorithm.DSA, crypto.Hash.SHA1, false),
+    sd(SignatureAlgorithm.DSAWithSHA256, "DSA-SHA256", [2, 16, 840, 1, 101, 3, 4, 3, 2], empty, PublicKeyAlgorithm.DSA, crypto.Hash.SHA256, false),
+    sd(SignatureAlgorithm.ECDSAWithSHA1, "ECDSA-SHA1", [1, 2, 840, 10045, 4, 1], empty, PublicKeyAlgorithm.ECDSA, crypto.Hash.SHA1, false),
+    sd(SignatureAlgorithm.ECDSAWithSHA256, "ECDSA-SHA256", [1, 2, 840, 10045, 4, 3, 2], empty, PublicKeyAlgorithm.ECDSA, crypto.Hash.SHA256, false),
+    sd(SignatureAlgorithm.ECDSAWithSHA384, "ECDSA-SHA384", [1, 2, 840, 10045, 4, 3, 3], empty, PublicKeyAlgorithm.ECDSA, crypto.Hash.SHA384, false),
+    sd(SignatureAlgorithm.ECDSAWithSHA512, "ECDSA-SHA512", [1, 2, 840, 10045, 4, 3, 4], empty, PublicKeyAlgorithm.ECDSA, crypto.Hash.SHA512, false),
+    sd(SignatureAlgorithm.PureEd25519, "Ed25519", [1, 3, 101, 112], empty, PublicKeyAlgorithm.Ed25519, none, false),
+    sd(SignatureAlgorithm.MLDSA44, "ML-DSA-44", [2, 16, 840, 1, 101, 3, 4, 3, 17], empty, PublicKeyAlgorithm.MLDSA, none, false),
+    sd(SignatureAlgorithm.MLDSA65, "ML-DSA-65", [2, 16, 840, 1, 101, 3, 4, 3, 18], empty, PublicKeyAlgorithm.MLDSA, none, false),
+    sd(SignatureAlgorithm.MLDSA87, "ML-DSA-87", [2, 16, 840, 1, 101, 3, 4, 3, 19], empty, PublicKeyAlgorithm.MLDSA, none, false)
+  ]
+}
+
+def sig_details(algo: SignatureAlgorithm) -> SigDetails? {
+  for d in signature_algorithm_details() {
+    return d if d.algo == algo
+  }
+  none
+}
+
+# ---------------------------------------------------------------- OIDs
+
+def oid_signature_ed25519 -> asn1.ObjectIdentifier { asn1.oid([1, 3, 101, 112]) }
+def oid_signature_rsa_pss -> asn1.ObjectIdentifier { asn1.oid([1, 2, 840, 113549, 1, 1, 10]) }
+def oid_sha256 -> asn1.ObjectIdentifier { asn1.oid([2, 16, 840, 1, 101, 3, 4, 2, 1]) }
+def oid_sha384 -> asn1.ObjectIdentifier { asn1.oid([2, 16, 840, 1, 101, 3, 4, 2, 2]) }
+def oid_sha512 -> asn1.ObjectIdentifier { asn1.oid([2, 16, 840, 1, 101, 3, 4, 2, 3]) }
+def oid_mgf1 -> asn1.ObjectIdentifier { asn1.oid([1, 2, 840, 113549, 1, 1, 8]) }
+
+def oid_public_key_rsa -> asn1.ObjectIdentifier { asn1.oid([1, 2, 840, 113549, 1, 1, 1]) }
+def oid_public_key_dsa -> asn1.ObjectIdentifier { asn1.oid([1, 2, 840, 10040, 4, 1]) }
+def oid_public_key_ecdsa -> asn1.ObjectIdentifier { asn1.oid([1, 2, 840, 10045, 2, 1]) }
+def oid_public_key_x25519 -> asn1.ObjectIdentifier { asn1.oid([1, 3, 101, 110]) }
+def oid_public_key_ed25519 -> asn1.ObjectIdentifier { asn1.oid([1, 3, 101, 112]) }
+def oid_public_key_mldsa44 -> asn1.ObjectIdentifier { asn1.oid([2, 16, 840, 1, 101, 3, 4, 3, 17]) }
+def oid_public_key_mldsa65 -> asn1.ObjectIdentifier { asn1.oid([2, 16, 840, 1, 101, 3, 4, 3, 18]) }
+def oid_public_key_mldsa87 -> asn1.ObjectIdentifier { asn1.oid([2, 16, 840, 1, 101, 3, 4, 3, 19]) }
+
+def oid_named_curve_p224 -> asn1.ObjectIdentifier { asn1.oid([1, 3, 132, 0, 33]) }
+def oid_named_curve_p256 -> asn1.ObjectIdentifier { asn1.oid([1, 2, 840, 10045, 3, 1, 7]) }
+def oid_named_curve_p384 -> asn1.ObjectIdentifier { asn1.oid([1, 3, 132, 0, 34]) }
+def oid_named_curve_p521 -> asn1.ObjectIdentifier { asn1.oid([1, 3, 132, 0, 35]) }
+
+def oid_extension_subject_key_id -> asn1.ObjectIdentifier { asn1.oid([2, 5, 29, 14]) }
+def oid_extension_key_usage -> asn1.ObjectIdentifier { asn1.oid([2, 5, 29, 15]) }
+def oid_extension_extended_key_usage -> asn1.ObjectIdentifier { asn1.oid([2, 5, 29, 37]) }
+def oid_extension_authority_key_id -> asn1.ObjectIdentifier { asn1.oid([2, 5, 29, 35]) }
+def oid_extension_basic_constraints -> asn1.ObjectIdentifier { asn1.oid([2, 5, 29, 19]) }
+def oid_extension_subject_alt_name -> asn1.ObjectIdentifier { asn1.oid([2, 5, 29, 17]) }
+def oid_extension_certificate_policies -> asn1.ObjectIdentifier { asn1.oid([2, 5, 29, 32]) }
+def oid_extension_name_constraints -> asn1.ObjectIdentifier { asn1.oid([2, 5, 29, 30]) }
+def oid_extension_crl_distribution_points -> asn1.ObjectIdentifier { asn1.oid([2, 5, 29, 31]) }
+def oid_extension_authority_info_access -> asn1.ObjectIdentifier { asn1.oid([1, 3, 6, 1, 5, 5, 7, 1, 1]) }
+def oid_extension_crl_number -> asn1.ObjectIdentifier { asn1.oid([2, 5, 29, 20]) }
+def oid_extension_reason_code -> asn1.ObjectIdentifier { asn1.oid([2, 5, 29, 21]) }
+def oid_authority_info_access_ocsp -> asn1.ObjectIdentifier { asn1.oid([1, 3, 6, 1, 5, 5, 7, 48, 1]) }
+def oid_authority_info_access_issuers -> asn1.ObjectIdentifier { asn1.oid([1, 3, 6, 1, 5, 5, 7, 48, 2]) }
+
+# Go's getSignatureAlgorithmFromAI.
+def get_signature_algorithm_from_ai(ai: pkix.AlgorithmIdentifier) -> SignatureAlgorithm {
+  a = ai.algorithm
+  if a.equal?(oid_signature_ed25519()) || a.equal?(oid_public_key_mldsa44()) || a.equal?(oid_public_key_mldsa65()) || a.equal?(oid_public_key_mldsa87()) {
+    # RFC 8410, Section 3
+    # > For all of the OIDs, the parameters MUST be absent.
+    return SignatureAlgorithm.UnknownSignatureAlgorithm if ai.parameters.full_bytes.size != 0
+  }
+  if !a.equal?(oid_signature_rsa_pss()) {
+    for d in signature_algorithm_details() {
+      return d.algo if a.equal?(d.oid)
+    }
+    return SignatureAlgorithm.UnknownSignatureAlgorithm
+  }
+  # RSA PSS is special because it encodes important parameters in the
+  # Parameters.
+  pr = PssParameters.from_asn1(ai.parameters.full_bytes)
+  return SignatureAlgorithm.UnknownSignatureAlgorithm if !pr.ok?
+  params = pr.unwrap[0]
+  mr = pkix.AlgorithmIdentifier.from_asn1(params.mgf.parameters.full_bytes)
+  return SignatureAlgorithm.UnknownSignatureAlgorithm if !mr.ok?
+  mgf1_hash_func = mr.unwrap[0]
+  # PSS is greatly overburdened with options. This code forces them into
+  # three buckets by requiring that the MGF1 hash function always match the
+  # message hash function (as recommended in RFC 3447, Section 8.1), that
+  # the salt length matches the hash length, and that the trailer field has
+  # the default value.
+  null = asn1.null_bytes()
+  if (params.hash.parameters.full_bytes.size != 0 && params.hash.parameters.full_bytes != null) || !params.mgf.algorithm.equal?(oid_mgf1()) || !mgf1_hash_func.algorithm.equal?(params.hash.algorithm) || (mgf1_hash_func.parameters.full_bytes.size != 0 && mgf1_hash_func.parameters.full_bytes != null) || params.trailer_field != 1 {
+    return SignatureAlgorithm.UnknownSignatureAlgorithm
+  }
+  h = params.hash.algorithm
+  return SignatureAlgorithm.SHA256WithRSAPSS if h.equal?(oid_sha256()) && params.salt_length == 32
+  return SignatureAlgorithm.SHA384WithRSAPSS if h.equal?(oid_sha384()) && params.salt_length == 48
+  return SignatureAlgorithm.SHA512WithRSAPSS if h.equal?(oid_sha512()) && params.salt_length == 64
+  SignatureAlgorithm.UnknownSignatureAlgorithm
+}
+
+# RFC 3447, A.2.3.
+#[derive(Asn1)]
+struct PssParameters {
+  # The following three fields are not marked as optional because the
+  # default values specify SHA-1, which is no longer suitable for use in
+  # signatures.
+  #[asn1(explicit, tag: 0)] hash: pkix.AlgorithmIdentifier
+  #[asn1(explicit, tag: 1)] mgf: pkix.AlgorithmIdentifier
+  #[asn1(explicit, tag: 2)] salt_length: Int
+  #[asn1(optional, explicit, tag: 3, default: 1)] trailer_field: Int
+}
+
+# Go's getPublicKeyAlgorithmFromOID.
+def get_public_key_algorithm_from_oid(oid: asn1.ObjectIdentifier) -> PublicKeyAlgorithm {
+  return PublicKeyAlgorithm.RSA if oid.equal?(oid_public_key_rsa())
+  return PublicKeyAlgorithm.DSA if oid.equal?(oid_public_key_dsa())
+  return PublicKeyAlgorithm.ECDSA if oid.equal?(oid_public_key_ecdsa())
+  return PublicKeyAlgorithm.Ed25519 if oid.equal?(oid_public_key_ed25519())
+  return PublicKeyAlgorithm.MLDSA if oid.equal?(oid_public_key_mldsa44()) || oid.equal?(oid_public_key_mldsa65()) || oid.equal?(oid_public_key_mldsa87())
+  PublicKeyAlgorithm.UnknownPublicKeyAlgorithm
+}
+
+# The named curve of an OID (Go's namedCurveFromOID; none is nil).
+def named_curve_from_oid(oid: asn1.ObjectIdentifier) -> elliptic.Curve? {
+  return elliptic.p224() if oid.equal?(oid_named_curve_p224())
+  return elliptic.p256() if oid.equal?(oid_named_curve_p256())
+  return elliptic.p384() if oid.equal?(oid_named_curve_p384())
+  return elliptic.p521() if oid.equal?(oid_named_curve_p521())
+  none
+}
+
+# Go's oidFromNamedCurve: only the named curves (elliptic.p256() ...) have
+# OIDs.
+def oid_from_named_curve(curve: elliptic.Curve) -> asn1.ObjectIdentifier? {
+  b = curve.nist_bits
+  return oid_named_curve_p224() if b == 224
+  return oid_named_curve_p256() if b == 256
+  return oid_named_curve_p384() if b == 384
+  return oid_named_curve_p521() if b == 521
+  none
+}
+
+def oid_from_ecdh_curve(curve: ecdh.Curve) -> asn1.ObjectIdentifier? {
+  return oid_public_key_x25519() if curve == ecdh.x25519()
+  return oid_named_curve_p256() if curve == ecdh.p256()
+  return oid_named_curve_p384() if curve == ecdh.p384()
+  return oid_named_curve_p521() if curve == ecdh.p521()
+  none
+}
+
+def mldsa_parameters_from_oid(oid: asn1.ObjectIdentifier) -> mldsa.Parameters? {
+  return mldsa.mldsa44() if oid.equal?(oid_public_key_mldsa44())
+  return mldsa.mldsa65() if oid.equal?(oid_public_key_mldsa65())
+  return mldsa.mldsa87() if oid.equal?(oid_public_key_mldsa87())
+  none
+}
+
+def oid_from_mldsa_parameters(params: mldsa.Parameters) -> asn1.ObjectIdentifier? {
+  return oid_public_key_mldsa44() if params == mldsa.mldsa44()
+  return oid_public_key_mldsa65() if params == mldsa.mldsa65()
+  return oid_public_key_mldsa87() if params == mldsa.mldsa87()
+  none
+}
+
+# ---------------------------------------------------------------- key usage
+
+# KeyUsage bits (Go's KeyUsage bitmap), most significant first in the
+# extension's BIT STRING.
+pub KEY_USAGE_DIGITAL_SIGNATURE = 1
+pub KEY_USAGE_CONTENT_COMMITMENT = 2
+pub KEY_USAGE_KEY_ENCIPHERMENT = 4
+pub KEY_USAGE_DATA_ENCIPHERMENT = 8
+pub KEY_USAGE_KEY_AGREEMENT = 16
+pub KEY_USAGE_CERT_SIGN = 32
+pub KEY_USAGE_CRL_SIGN = 64
+pub KEY_USAGE_ENCIPHER_ONLY = 128
+pub KEY_USAGE_DECIPHER_ONLY = 256
+
+# An extended set of actions that are valid for a given key (RFC 5280,
+# 4.2.1.12).
+pub enum ExtKeyUsage {
+  Any
+  ServerAuth
+  ClientAuth
+  CodeSigning
+  EmailProtection
+  IPSECEndSystem
+  IPSECTunnel
+  IPSECUser
+  TimeStamping
+  OCSPSigning
+  MicrosoftServerGatedCrypto
+  NetscapeServerGatedCrypto
+  MicrosoftCommercialCodeSigning
+  MicrosoftKernelCodeSigning
+
+  # Go's number for the usage (its iota position).
+  pub def value -> Int {
+    case self {
+      Any => 0
+      ServerAuth => 1
+      ClientAuth => 2
+      CodeSigning => 3
+      EmailProtection => 4
+      IPSECEndSystem => 5
+      IPSECTunnel => 6
+      IPSECUser => 7
+      TimeStamping => 8
+      OCSPSigning => 9
+      MicrosoftServerGatedCrypto => 10
+      NetscapeServerGatedCrypto => 11
+      MicrosoftCommercialCodeSigning => 12
+      MicrosoftKernelCodeSigning => 13
+    }
+  }
+
+  # The usage's OID.
+  pub def oid -> OID { oid_from_asn1_oid(self.asn1_oid).unwrap }
+
+  # The usage's encoding/asn1 OID (Go's oidFromExtKeyUsage).
+  pub def asn1_oid -> asn1.ObjectIdentifier {
+    case self {
+      Any => asn1.oid([2, 5, 29, 37, 0])
+      ServerAuth => asn1.oid([1, 3, 6, 1, 5, 5, 7, 3, 1])
+      ClientAuth => asn1.oid([1, 3, 6, 1, 5, 5, 7, 3, 2])
+      CodeSigning => asn1.oid([1, 3, 6, 1, 5, 5, 7, 3, 3])
+      EmailProtection => asn1.oid([1, 3, 6, 1, 5, 5, 7, 3, 4])
+      IPSECEndSystem => asn1.oid([1, 3, 6, 1, 5, 5, 7, 3, 5])
+      IPSECTunnel => asn1.oid([1, 3, 6, 1, 5, 5, 7, 3, 6])
+      IPSECUser => asn1.oid([1, 3, 6, 1, 5, 5, 7, 3, 7])
+      TimeStamping => asn1.oid([1, 3, 6, 1, 5, 5, 7, 3, 8])
+      OCSPSigning => asn1.oid([1, 3, 6, 1, 5, 5, 7, 3, 9])
+      MicrosoftServerGatedCrypto => asn1.oid([1, 3, 6, 1, 4, 1, 311, 10, 3, 3])
+      NetscapeServerGatedCrypto => asn1.oid([2, 16, 840, 1, 113730, 4, 1])
+      MicrosoftCommercialCodeSigning => asn1.oid([1, 3, 6, 1, 4, 1, 311, 2, 1, 22])
+      MicrosoftKernelCodeSigning => asn1.oid([1, 3, 6, 1, 4, 1, 311, 61, 1, 1])
+    }
+  }
+}
+
+def all_ext_key_usages -> [ExtKeyUsage] {
+  [ExtKeyUsage.Any, ExtKeyUsage.ServerAuth, ExtKeyUsage.ClientAuth, ExtKeyUsage.CodeSigning, ExtKeyUsage.EmailProtection, ExtKeyUsage.IPSECEndSystem, ExtKeyUsage.IPSECTunnel, ExtKeyUsage.IPSECUser, ExtKeyUsage.TimeStamping, ExtKeyUsage.OCSPSigning, ExtKeyUsage.MicrosoftServerGatedCrypto, ExtKeyUsage.NetscapeServerGatedCrypto, ExtKeyUsage.MicrosoftCommercialCodeSigning, ExtKeyUsage.MicrosoftKernelCodeSigning]
+}
+
+def ext_key_usage_from_oid(oid: asn1.ObjectIdentifier) -> ExtKeyUsage? {
+  for u in all_ext_key_usages() {
+    return u if oid.equal?(u.asn1_oid)
+  }
+  none
+}
+
+# ---------------------------------------------------------------- Certificate
+
+# An IP network (Go's net.IPNet): ip and mask are 4 or 16 bytes.
+pub struct IPNet {
+  ip: [Byte]
+  mask: [Byte]
+
+  # Go's IPNet.String: "192.168.0.0/16" for a canonical mask, else
+  # ip + "/" + the hex mask.
+  pub def to_s -> Str {
+    ones = mask_ones(mask)
+    return "#{ip_string(ip)}/#{ones}" if ones >= 0
+    "#{ip_string(ip)}/#{bytes_hex(mask)}"
+  }
+  pub def string -> Str { self.to_s }
+
+  # Whether the network includes ip (Go's IPNet.Contains).
+  pub def contains?(ip0: [Byte]) -> Bool {
+    nn = ip
+    m = mask
+    x = ip0
+    if nn.size == 4 && x.size == 16 {
+      x4 = to4(x)
+      return false if x4.none?
+      x = x4 || []
+    } else if nn.size == 16 && x.size == 4 {
+      return false
+    }
+    if x.size == 16 && nn.size == 16 {
+      nil
+    }
+    return false if x.size != nn.size || m.size != x.size
+    i = 0
+    while i < x.size {
+      return false if nn[i] & m[i] != x[i] & m[i]
+      i += 1
+    }
+    true
+  }
+}
+
+# The number of leading ones of a canonical mask, or -1.
+def mask_ones(m: [Byte]) -> Int {
+  n = 0
+  i = 0
+  while i < m.size {
+    v = m[i]
+    if v == 0xff {
+      n += 8
+      i += 1
+      next
+    }
+    while v & 0x80 != 0 {
+      n += 1
+      v = v << 1
+    }
+    return -1 if v != 0
+    i += 1
+    while i < m.size {
+      return -1 if m[i] != 0
+      i += 1
+    }
+    return n
+  }
+  n
+}
+
+def bytes_hex(b: [Byte]) -> Str {
+  digits = "0123456789abcdef"
+  out: [Byte] = []
+  for x in b {
+    out << digits[(x >> 4).to_i]
+    out << digits[(x & 0xf).to_i]
+  }
+  Str.from_bytes(out)
+}
+
+# The IPv4 form of a 16-byte IPv4-mapped address (Go's IP.To4).
+def to4(ip: [Byte]) -> [Byte]? {
+  return ip if ip.size == 4
+  if ip.size == 16 {
+    i = 0
+    while i < 10 {
+      return none if ip[i] != 0
+      i += 1
+    }
+    return ip[12...16] if ip[10] == 0xff && ip[11] == 0xff
+  }
+  none
+}
+
+# Go's net.IP.String for a 4- or 16-byte address.
+pub def ip_string(ip: [Byte]) -> Str {
+  return "<nil>" if ip.size == 0
+  if v4 = to4(ip) {
+    return "#{v4[0]}.#{v4[1]}.#{v4[2]}.#{v4[3]}"
+  }
+  return "?" + bytes_hex(ip) if ip.size != 16
+  # The longest run of zero groups becomes "::" (RFC 5952).
+  groups: [Int] = []
+  i = 0
+  while i < 16 {
+    groups << ((ip[i].to_i << 8) | ip[i + 1].to_i)
+    i += 2
+  }
+  best = -1
+  best_len = 0
+  i = 0
+  while i < 8 {
+    j = i
+    while j < 8 && groups[j] == 0 {
+      j += 1
+    }
+    if j - i > best_len && j - i >= 2 {
+      best = i
+      best_len = j - i
+    }
+    i = j > i ? j : i + 1
+  }
+  out = ""
+  i = 0
+  while i < 8 {
+    if i == best {
+      out = out + "::"
+      i += best_len
+      next
+    }
+    out = out + ":" if i > 0 && i != best + best_len
+    out = out + strconv.format_int(groups[i], 16)
+    i += 1
+  }
+  out
+}
+
+# An X.509 certificate.
+pub struct Certificate {
+  # Complete ASN.1 DER content (certificate, signature algorithm and signature).
+  raw: [Byte]
+  # Certificate part of raw ASN.1 DER content.
+  raw_tbs_certificate: [Byte]
+  # DER encoded SubjectPublicKeyInfo.
+  raw_subject_public_key_info: [Byte]
+  # DER encoded Subject.
+  raw_subject: [Byte]
+  # DER encoded Issuer.
+  raw_issuer: [Byte]
+  # DER encoded AlgorithmIdentifier.
+  raw_signature_algorithm: [Byte]
+
+  signature: [Byte]
+  signature_algorithm: SignatureAlgorithm
+
+  public_key_algorithm: PublicKeyAlgorithm
+  public_key: PublicKey
+
+  version: Int
+  serial_number: big.Int
+  issuer: pkix.Name
+  subject: pkix.Name
+  not_before: time.Time
+  not_after: time.Time
+  # KEY_USAGE_* bits.
+  key_usage: Int
+
+  # The raw X.509 extensions, as parsed (when creating, ignored: see
+  # extra_extensions).
+  extensions: [pkix.Extension]
+  # Extensions to be copied, raw, into any marshaled certificates;
+  # override any extensions that would otherwise be produced.
+  extra_extensions: [pkix.Extension]
+  # The critical extensions that weren't (fully) processed when parsing.
+  unhandled_critical_extensions: [asn1.ObjectIdentifier]
+
+  # Sequence of extended key usages.
+  ext_key_usage: [ExtKeyUsage]
+  # Encountered extended key usages unknown to this package.
+  unknown_ext_key_usage: [asn1.ObjectIdentifier]
+
+  # basic_constraints_valid: is_ca, max_path_len and max_path_len_zero are
+  # valid (the extension is present, or to be written).
+  basic_constraints_valid: Bool
+  is_ca: Bool
+  # -1: unset; 0 with max_path_len_zero: explicitly zero.
+  max_path_len: Int
+  max_path_len_zero: Bool
+
+  subject_key_id: [Byte]
+  authority_key_id: [Byte]
+
+  # RFC 5280, 4.2.2.1 (Authority Information Access)
+  ocsp_server: [Str]
+  issuing_certificate_url: [Str]
+
+  # Subject Alternate Name values.
+  dns_names: [Str]
+  email_addresses: [Str]
+  ip_addresses: [[Byte]]
+  uris: [url.Url]
+
+  # Name constraints
+  permitted_dns_domains_critical: Bool
+  permitted_dns_domains: [Str]
+  excluded_dns_domains: [Str]
+  permitted_ip_ranges: [IPNet]
+  excluded_ip_ranges: [IPNet]
+  permitted_email_addresses: [Str]
+  excluded_email_addresses: [Str]
+  permitted_uri_domains: [Str]
+  excluded_uri_domains: [Str]
+
+  # CRL Distribution Points
+  crl_distribution_points: [Str]
+
+  # The policy OIDs that fit asn1.ObjectIdentifier (deprecated in Go:
+  # use policies).
+  policy_identifiers: [asn1.ObjectIdentifier]
+  # The certificatePolicies extension's policies.
+  policies: [OID]
+
+  inhibit_any_policy: Int
+  inhibit_any_policy_zero: Bool
+  inhibit_policy_mapping: Int
+  inhibit_policy_mapping_zero: Bool
+  require_explicit_policy: Int
+  require_explicit_policy_zero: Bool
+  policy_mappings: [PolicyMapping]
+
+  # Whether the DER encodings are the same.
+  pub def equal?(other: Certificate) -> Bool { raw == other.raw }
+
+  def has_san_extension? -> Bool { oid_in_extensions?(oid_extension_subject_alt_name(), extensions) }
+
+  def has_name_constraints? -> Bool { oid_in_extensions?(oid_extension_name_constraints(), extensions) }
+
+  def get_san_extension -> [Byte] {
+    for e in extensions {
+      return e.value if e.id.equal?(oid_extension_subject_alt_name())
+    }
+    []
+  }
+
+  # Verifies that the signature on c is a valid signature from parent.
+  # SHA1WithRSA and ECDSAWithSHA1 signatures are not supported.
+  pub def check_signature_from(parent: Certificate) -> ~Unit<X509Error> {
+    # RFC 5280, 4.2.1.9:
+    # "If the basic constraints extension is not present in a version 3
+    # certificate, or the extension is present but the cA boolean is not
+    # asserted, then the certified public key MUST NOT be used to verify
+    # certificate signatures."
+    fail X509Error.ConstraintViolation if (parent.version == 3 && !parent.basic_constraints_valid) || (parent.basic_constraints_valid && !parent.is_ca)
+    fail X509Error.ConstraintViolation if parent.key_usage != 0 && parent.key_usage & KEY_USAGE_CERT_SIGN == 0
+    fail X509Error.UnsupportedAlgorithm if parent.public_key_algorithm == PublicKeyAlgorithm.UnknownPublicKeyAlgorithm
+    ~check_signature_of(signature_algorithm, raw_tbs_certificate, signature, parent.public_key, false)
+  }
+
+  # Verifies that signature is a valid signature over signed from c's
+  # public key. Note that the hash is computed here.
+  pub def check_signature(algo: SignatureAlgorithm, signed: [Byte], sig: [Byte]) -> ~Unit<X509Error> {
+    ~check_signature_of(algo, signed, sig, public_key, true)
+  }
+
+  # Checks that the signature on crl is from c.
+  pub def check_crl_signature(crl: pkix.CertificateList) -> ~Unit<X509Error> {
+    algo = get_signature_algorithm_from_ai(crl.signature_algorithm)
+    ~check_signature_of(algo, crl.tbs_cert_list.raw, crl.signature_value.right_align, public_key, true)
+  }
+
+  # Fails unless c is a valid certificate for the named host. IP addresses
+  # can be enclosed in square brackets and are checked against
+  # ip_addresses; other names are checked case insensitively against
+  # dns_names, with wildcards in the leftmost label. The legacy Common Name
+  # field is ignored.
+  pub def verify_hostname(h: Str) -> ~Unit<X509Error> { ~verify_hostname_of(self, h) }
+
+  # Builds and checks the chains from c to opts.roots (Go's Verify; see
+  # verify_certificate).
+  pub def verify(opts: VerifyOptions) -> ~[[Certificate]]<X509Error> { ~verify_certificate(self, opts) }
+
+  # A certificate created by create_certificate with this one as the
+  # parent (Go's (*Certificate).CreateCRL; deprecated there).
+  pub def create_crl(rand: io.Reader, priv: PrivateKey, revoked_certs: [pkix.RevokedCertificate], now: time.Time, expiry: time.Time) -> ~[Byte]<X509Error> {
+    ~create_crl_from(self, rand, priv, revoked_certs, now, expiry)
+  }
+}
+
+# A policy mapping (RFC 5280, 4.2.1.5).
+pub struct PolicyMapping {
+  # The issuer's policy OID.
+  issuer_domain_policy: OID
+  # The subject's policy OID.
+  subject_domain_policy: OID
+}
+
+def oid_in_extensions?(oid: asn1.ObjectIdentifier, extensions: [pkix.Extension]) -> Bool {
+  for e in extensions {
+    return true if e.id.equal?(oid)
+  }
+  false
+}
+
+def key_type_name(k: PublicKey) -> Str {
+  case k {
+    None => "<nil>"
+    Rsa(_) => "*rsa.PublicKey"
+    Ecdsa(_) => "*ecdsa.PublicKey"
+    Ed25519(_) => "ed25519.PublicKey"
+    Ecdh(_) => "*ecdh.PublicKey"
+    Dsa(_) => "*dsa.PublicKey"
+    MlDsa(_) => "*mldsa.PublicKey"
+  }
+}
+
+def signature_public_key_algo_mismatch(expected: PublicKeyAlgorithm, pub_key: PublicKey) -> X509Error {
+  err("x509: signature algorithm specifies an #{expected.to_s} public key, but have public key of type #{key_type_name(pub_key)}")
+}
+
+# Go's checkSignature: whether signature is a valid signature over signed
+# by public_key with algo.
+pub def check_signature_of(algo: SignatureAlgorithm, signed0: [Byte], signature: [Byte], public_key: PublicKey, allow_sha1: Bool) -> ~Unit<X509Error> {
+  hash_type: crypto.Hash? = none
+  pub_key_algo = PublicKeyAlgorithm.UnknownPublicKeyAlgorithm
+  if d = sig_details(algo) {
+    hash_type = d.hash
+    pub_key_algo = d.pub_key_algo
+  }
+  signed = signed0
+  if h = hash_type {
+    fail X509Error.InsecureAlgorithm(algo) if h == crypto.Hash.MD5
+    fail X509Error.InsecureAlgorithm(algo) if h == crypto.Hash.SHA1 && !allow_sha1
+    fail X509Error.UnsupportedAlgorithm if !h.available?
+    hh = h.new
+    hh.write!(signed).unwrap
+    signed = hh.sum([])
+  } else {
+    fail X509Error.UnsupportedAlgorithm if pub_key_algo != PublicKeyAlgorithm.Ed25519 && pub_key_algo != PublicKeyAlgorithm.MLDSA
+  }
+  case public_key {
+    Rsa(pub) => {
+      fail signature_public_key_algo_mismatch(pub_key_algo, public_key) if pub_key_algo != PublicKeyAlgorithm.RSA
+      h = hash_type || crypto.Hash.SHA256
+      if algo.rsa_pss? {
+        r = rsa.verify_pss(pub, h, signed, signature, rsa.PSSOptions.new(salt_length: rsa.PSS_SALT_LENGTH_EQUALS_HASH))
+        if e = r.err {
+          fail err(e.message)
+        }
+      } else {
+        r = rsa.verify_pkcs1v15(pub, hash_type, signed, signature)
+        if e = r.err {
+          fail err(e.message)
+        }
+      }
+      return
+    }
+    Ecdsa(pub) => {
+      fail signature_public_key_algo_mismatch(pub_key_algo, public_key) if pub_key_algo != PublicKeyAlgorithm.ECDSA
+      fail err("x509: ECDSA verification failure") if !ecdsa.verify_asn1(pub, signed, signature)
+      return
+    }
+    Ed25519(pub) => {
+      fail signature_public_key_algo_mismatch(pub_key_algo, public_key) if pub_key_algo != PublicKeyAlgorithm.Ed25519
+      fail err("x509: Ed25519 verification failure") if !ed25519.verify(pub, signed, signature)
+      return
+    }
+    MlDsa(pub) => {
+      fail signature_public_key_algo_mismatch(pub_key_algo, public_key) if pub_key_algo != PublicKeyAlgorithm.MLDSA
+      p = pub.parameters
+      want = SignatureAlgorithm.UnknownSignatureAlgorithm
+      if p == mldsa.mldsa44() {
+        want = SignatureAlgorithm.MLDSA44
+      } else if p == mldsa.mldsa65() {
+        want = SignatureAlgorithm.MLDSA65
+      } else if p == mldsa.mldsa87() {
+        want = SignatureAlgorithm.MLDSA87
+      } else {
+        fail err("x509: unknown ML-DSA parameters: #{p.to_s}")
+      }
+      if algo != want {
+        fail err("x509: signature algorithm specifies an ML-DSA public key with #{algo.to_s} parameters, but have a public key with #{p.to_s} parameters")
+      }
+      r = mldsa.verify(pub, signed, signature, mldsa.Options.new)
+      if e = r.err {
+        fail err("x509: ML-DSA verification failure: #{e.message}")
+      }
+      return
+    }
+    _ => nil
+  }
+  fail X509Error.UnsupportedAlgorithm
+}
+
+# ---------------------------------------------------------------- PKIX public keys
+
+#[derive(Asn1)]
+struct PublicKeyInfo {
+  #[asn1(raw_content)] raw: [Byte]
+  algorithm: pkix.AlgorithmIdentifier
+  public_key: asn1.BitString
+}
+
+#[derive(Asn1)]
+struct PkixPublicKey {
+  algo: pkix.AlgorithmIdentifier
+  bit_string: asn1.BitString
+}
+
+# Parses a public key in PKIX, ASN.1 DER form (a SubjectPublicKeyInfo,
+# "PUBLIC KEY" in PEM): RSA, DSA, ECDSA, Ed25519, X25519 (as an ecdh key)
+# and ML-DSA keys.
+pub def parse_pkix_public_key(der_bytes: [Byte]) -> ~PublicKey<X509Error> {
+  r = PublicKeyInfo.from_asn1(der_bytes)
+  if e = r.err {
+    if PKCS1PublicKey.from_asn1(der_bytes).ok? {
+      fail err("x509: failed to parse public key (use ParsePKCS1PublicKey instead for this key format)")
+    }
+    fail err(e.message)
+  }
+  pki, rest = r.unwrap
+  fail err("x509: trailing data after ASN.1 of public-key") if rest.size != 0
+  ~parse_public_key(pki.algorithm, pki.public_key)
+}
+
+# Go's marshalPublicKey: the public key bytes and algorithm identifier.
+def marshal_public_key(pub: PublicKey) -> ~([Byte], pkix.AlgorithmIdentifier)<X509Error> {
+  ai = pkix.AlgorithmIdentifier.new
+  case pub {
+    Rsa(k) => {
+      b = PKCS1PublicKey.new(n: k.n, e: k.e).to_asn1
+      if e = b.err {
+        fail err(e.message)
+      }
+      ai.algorithm = oid_public_key_rsa()
+      ai.parameters = asn1.null_raw_value()
+      return (b.unwrap, ai)
+    }
+    Ecdsa(k) => {
+      oid = ~need(oid_from_named_curve(k.curve), "x509: unsupported elliptic curve")
+      kb = k.bytes
+      if e = kb.err {
+        fail err(e.message)
+      }
+      ai.algorithm = oid_public_key_ecdsa()
+      ai.parameters = asn1.RawValue.new(full_bytes: asn1.marshal_oid(oid).unwrap)
+      return (kb.unwrap, ai)
+    }
+    Ed25519(k) => {
+      ai.algorithm = oid_public_key_ed25519()
+      return (k.bytes, ai)
+    }
+    MlDsa(k) => {
+      oid = ~need(oid_from_mldsa_parameters(k.parameters), "x509: unsupported ML-DSA parameters")
+      ai.algorithm = oid
+      return (k.bytes, ai)
+    }
+    Ecdh(k) => {
+      if k.curve == ecdh.x25519() {
+        ai.algorithm = oid_public_key_x25519()
+      } else {
+        oid = ~need(oid_from_ecdh_curve(k.curve), "x509: unsupported elliptic curve")
+        ai.algorithm = oid_public_key_ecdsa()
+        ai.parameters = asn1.RawValue.new(full_bytes: asn1.marshal_oid(oid).unwrap)
+      }
+      return (k.bytes, ai)
+    }
+    _ => nil
+  }
+  fail err("x509: unsupported public key type: #{key_type_name(pub)}")
+}
+
+# Converts a public key to PKIX, ASN.1 DER form ("PUBLIC KEY" in PEM):
+# RSA, ECDSA (named curves), Ed25519, X25519 / NIST ecdh and ML-DSA keys.
+pub def marshal_pkix_public_key(pub: PublicKey) -> ~[Byte]<X509Error> {
+  public_key_bytes, public_key_algorithm = ~marshal_public_key(pub)
+  pk = PkixPublicKey.new(algo: public_key_algorithm, bit_string: asn1.BitString.new(bytes: public_key_bytes, bit_length: 8 * public_key_bytes.size))
+  pk.to_asn1.unwrap
+}
+
+# Go's parsePublicKey.
+def parse_public_key(alg: pkix.AlgorithmIdentifier, key: asn1.BitString) -> ~PublicKey<X509Error> {
+  oid = alg.algorithm
+  params = alg.parameters
+  data = key.right_align
+  if oid.equal?(oid_public_key_rsa()) {
+    # RSA public keys must have a NULL in the parameters. See RFC 3279,
+    # Section 2.3.1.
+    ~check(params.full_bytes == asn1.null_bytes(), "x509: RSA key missing NULL parameters")
+    der0 = cryptobyte.string(data)
+    _h97 = der0.read_asn1!(cbasn1.SEQUENCE)
+    der = ~need(_h97, "x509: invalid RSA public key")
+    _h98 = der.read_asn1_big_int!
+    n = ~need(_h98, "x509: invalid RSA modulus")
+    _h99 = der.read_asn1_integer_in!(-9223372036854775807 - 1, 9223372036854775807)
+    e = ~need(_h99, "x509: invalid RSA public exponent")
+    ~check(n.sign > 0, "x509: RSA modulus is not a positive number")
+    ~check(e > 0, "x509: RSA public exponent is not a positive number")
+    return PublicKey.Rsa(rsa.PublicKey.new(n: n, e: e))
+  }
+  if oid.equal?(oid_public_key_ecdsa()) {
+    params_der = cryptobyte.string(params.full_bytes)
+    _h100 = params_der.read_asn1_object_identifier!
+    named_curve_oid = ~need(_h100, "x509: invalid ECDSA parameters")
+    named_curve = ~need(named_curve_from_oid(named_curve_oid), "x509: unsupported elliptic curve")
+    re = ecdsa.parse_uncompressed_public_key(named_curve, data)
+    if e = re.err {
+      fail err(e.message)
+    }
+    return PublicKey.Ecdsa(re.unwrap)
+  }
+  if oid.equal?(oid_public_key_ed25519()) {
+    # RFC 8410, Section 3
+    # > For all of the OIDs, the parameters MUST be absent.
+    ~check(params.full_bytes.size == 0, "x509: Ed25519 key encoded with illegal parameters")
+    ~check(data.size == ed25519.PUBLIC_KEY_SIZE, "x509: wrong Ed25519 public key size")
+    return PublicKey.Ed25519(ed25519.PublicKey.new(key: data + []))
+  }
+  if oid.equal?(oid_public_key_mldsa44()) || oid.equal?(oid_public_key_mldsa65()) || oid.equal?(oid_public_key_mldsa87()) {
+    ~check(params.full_bytes.size == 0, "x509: ML-DSA key encoded with illegal parameters")
+    mp = ~need(mldsa_parameters_from_oid(oid), "x509: unsupported ML-DSA parameters")
+    rm = mldsa.new_public_key(mp, data)
+    if e = rm.err {
+      fail err(e.message)
+    }
+    return PublicKey.MlDsa(rm.unwrap)
+  }
+  if oid.equal?(oid_public_key_x25519()) {
+    # RFC 8410, Section 3
+    # > For all of the OIDs, the parameters MUST be absent.
+    ~check(params.full_bytes.size == 0, "x509: X25519 key encoded with illegal parameters")
+    rx = ecdh.x25519().new_public_key(data)
+    if e = rx.err {
+      fail err(e.message)
+    }
+    return PublicKey.Ecdh(rx.unwrap)
+  }
+  if oid.equal?(oid_public_key_dsa()) {
+    der = cryptobyte.string(data)
+    _h101 = der.read_asn1_big_int!
+    y = ~need(_h101, "x509: invalid DSA public key")
+    params_der0 = cryptobyte.string(params.full_bytes)
+    _h102 = params_der0.read_asn1!(cbasn1.SEQUENCE)
+    params_der = ~need(_h102, "x509: invalid DSA parameters")
+    _h103 = params_der.read_asn1_big_int!
+    p = ~need(_h103, "x509: invalid DSA parameters")
+    _h104 = params_der.read_asn1_big_int!
+    q = ~need(_h104, "x509: invalid DSA parameters")
+    _h105 = params_der.read_asn1_big_int!
+    g = ~need(_h105, "x509: invalid DSA parameters")
+    ~check(y.sign > 0 && p.sign > 0 && q.sign > 0 && g.sign > 0, "x509: zero or negative DSA parameter")
+    return PublicKey.Dsa(dsa.PublicKey.new(parameters: dsa.Parameters.new(p: p, q: q, g: g), y: y))
+  }
+  fail err("x509: unknown public key algorithm")
+}

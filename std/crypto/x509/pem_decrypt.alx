@@ -1,0 +1,182 @@
+# RFC 1423 encryption of PEM blocks (Go's crypto/x509/pem_decrypt.go).
+# Deprecated in Go: legacy PEM encryption is insecure by design (no
+# authentication, an MD5-based key derivation), kept for compatibility.
+#
+#   Go                                        alx
+#   PEMCipher (PEMCipherDES, PEMCipher3DES,   PEMCipher enum: DES, TripleDES, AES128,
+#     PEMCipherAES128/192/256)                  AES192, AES256
+#   IsEncryptedPEMBlock(b)                    is_encrypted_pem_block?(b)
+#   DecryptPEMBlock(b, password)              decrypt_pem_block(b, password) -> ~[Byte]
+#   EncryptPEMBlock(rand, type, data, pw, alg) encrypt_pem_block(rand, type, data, pw, alg) -> ~pem.Block
+#   IncorrectPasswordError                    incorrect_password_error() (X509Error.Msg with
+#                                             Go's text; compare messages)
+#
+# Differences from Go:
+#   - PEMCipher is an enum, so Go's "unknown encryption mode" error of
+#     EncryptPEMBlock (an out-of-range PEMCipher) can't happen.
+
+import "crypto/aes"
+import "crypto/cipher"
+import "crypto/des"
+import "crypto/md5"
+import "encoding/hex"
+import "encoding/pem"
+import "io"
+import "strings"
+
+pub enum PEMCipher {
+  DES
+  TripleDES
+  AES128
+  AES192
+  AES256
+
+  # Go's number for the cipher (PEMCipherDES is 1).
+  pub def value -> Int {
+    case self {
+      DES => 1
+      TripleDES => 2
+      AES128 => 3
+      AES192 => 4
+      AES256 => 5
+    }
+  }
+}
+
+# One of Go's rfc1423Algos.
+struct Rfc1423Algo {
+  cipher: PEMCipher
+  name: Str
+  key_size: Int
+  block_size: Int
+
+  # Go's deriveKey: the EVP_BytesToKey key derivation with MD5, one
+  # iteration.
+  def derive_key(password: [Byte], salt: [Byte]) -> [Byte] {
+    hash = md5.new()
+    out: [Byte] = [0; key_size]
+    digest: [Byte] = []
+    i = 0
+    while i < out.size {
+      hash.reset!
+      hash.write!(digest)
+      hash.write!(password)
+      hash.write!(salt)
+      digest = hash.sum([])
+      copy(out[i...out.size], digest)
+      i += digest.size
+    }
+    out
+  }
+
+  # Encrypts (or decrypts) src in CBC mode with key and iv.
+  def crypt(key: [Byte], iv: [Byte], src: [Byte], encrypt: Bool) -> [Byte] {
+    case cipher {
+      DES => cbc_crypt(des.new_cipher(key).unwrap, iv, src, encrypt)
+      TripleDES => cbc_crypt(des.new_triple_des_cipher(key).unwrap, iv, src, encrypt)
+      _ => cbc_crypt(aes.new_cipher(key).unwrap, iv, src, encrypt)
+    }
+  }
+}
+
+def cbc_crypt[B](b: B, iv: [Byte], src: [Byte], encrypt: Bool) -> [Byte] {
+  data: [Byte] = [0; src.size]
+  if encrypt {
+    enc = cipher.new_cbc_encrypter(b, iv)
+    enc.crypt_blocks!(data, src)
+  } else {
+    dec = cipher.new_cbc_decrypter(b, iv)
+    dec.crypt_blocks!(data, src)
+  }
+  data
+}
+
+# Go's rfc1423Algos.
+def rfc1423_algos -> [Rfc1423Algo] {
+  [
+    Rfc1423Algo.new(cipher: PEMCipher.DES, name: "DES-CBC", key_size: 8, block_size: des.BLOCK_SIZE),
+    Rfc1423Algo.new(cipher: PEMCipher.TripleDES, name: "DES-EDE3-CBC", key_size: 24, block_size: des.BLOCK_SIZE),
+    Rfc1423Algo.new(cipher: PEMCipher.AES128, name: "AES-128-CBC", key_size: 16, block_size: aes.BLOCK_SIZE),
+    Rfc1423Algo.new(cipher: PEMCipher.AES192, name: "AES-192-CBC", key_size: 24, block_size: aes.BLOCK_SIZE),
+    Rfc1423Algo.new(cipher: PEMCipher.AES256, name: "AES-256-CBC", key_size: 32, block_size: aes.BLOCK_SIZE)
+  ]
+}
+
+def cipher_by_name(name: Str) -> Rfc1423Algo? {
+  for alg in rfc1423_algos() {
+    return alg if alg.name == name
+  }
+  none
+}
+
+def cipher_by_key(key: PEMCipher) -> Rfc1423Algo? {
+  for alg in rfc1423_algos() {
+    return alg if alg.cipher == key
+  }
+  none
+}
+
+# Whether the PEM block is password encrypted according to RFC 1423
+# (it has a DEK-Info header).
+pub def is_encrypted_pem_block?(b: pem.Block) -> Bool { b.headers["DEK-Info"].some? }
+
+# The error decrypt_pem_block returns for a wrong password (Go's
+# IncorrectPasswordError).
+pub def incorrect_password_error -> X509Error { err("x509: decryption password incorrect") }
+
+# Decrypts a PEM block encrypted according to RFC 1423 with password and
+# returns the DER bytes. The legacy encryption can't always detect a wrong
+# password: the result may then be garbage.
+pub def decrypt_pem_block(b: pem.Block, password: [Byte]) -> ~[Byte]<X509Error> {
+  dek = ~need(b.headers["DEK-Info"], "x509: no DEK-Info header in block")
+  mode, hex_iv = ~need(strings.cut(dek, ","), "x509: malformed DEK-Info header")
+  ciph = ~need(cipher_by_name(mode), "x509: unknown encryption mode")
+  r = hex.decode_string(hex_iv)
+  if e = r.err {
+    fail err(e.message)
+  }
+  iv = r.unwrap
+  fail err("x509: incorrect IV size") if iv.size != ciph.block_size
+  salt = iv[0...8]
+  key = ciph.derive_key(password, salt)
+  fail err("x509: encrypted PEM data is not a multiple of the block size") if b.bytes.size % ciph.block_size != 0
+  data = ciph.crypt(key, iv, b.bytes, false)
+  # Blocks are padded using a scheme where the last n bytes of padding
+  # are all equal to n. It can pad from 1 to blocksize bytes inclusive.
+  # See RFC 1423. For example:
+  #   [x y z 2 2]
+  #   [x y 7 7 7 7 7 7 7]
+  # If we detect a bad padding, we assume it is an invalid password.
+  dlen = data.size
+  fail err("x509: invalid padding") if dlen == 0 || dlen % ciph.block_size != 0
+  last = data[dlen - 1].to_i
+  fail incorrect_password_error() if dlen < last
+  fail incorrect_password_error() if last == 0 || last > ciph.block_size
+  for val in data[dlen - last...dlen] {
+    fail incorrect_password_error() if val.to_i != last
+  }
+  data[0...dlen - last]
+}
+
+# Returns a PEM block of the given type holding data encrypted with
+# password and alg (RFC 1423).
+pub def encrypt_pem_block(rand: io.Reader, block_type: Str, data: [Byte], password: [Byte], alg: PEMCipher) -> ~pem.Block<X509Error> {
+  ciph = ~need(cipher_by_key(alg), "x509: unknown encryption mode")
+  iv: [Byte] = [0; ciph.block_size]
+  r = io.read_full(rand, iv)
+  if e = r.err {
+    fail err("x509: cannot generate IV: " + e.message)
+  }
+  salt = iv[0...8]
+  key = ciph.derive_key(password, salt)
+  pad = ciph.block_size - data.size % ciph.block_size
+  plain = data + []
+  i = 0
+  while i < pad {
+    plain << pad.as_u8
+    i += 1
+  }
+  encrypted = ciph.crypt(key, iv, plain, true)
+  headers: Map[Str, Str] = {"Proc-Type" => "4,ENCRYPTED", "DEK-Info" => ciph.name + "," + hex.encode_to_string(iv)}
+  pem.Block.new(type: block_type, headers: headers, bytes: encrypted)
+}

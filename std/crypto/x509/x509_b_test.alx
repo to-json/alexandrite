@@ -1,0 +1,634 @@
+# Go's crypto/x509/x509_test.go, first part continued (TestCRLCreation
+# through TestCreateRevocationList): CRLs, CSRs, MaxPathLen, key ids,
+# insecure algorithms, odd certificates, pkix.Name strings and
+# TestCreateRevocationList. Helpers (x1_*) are in x509_a_test.alx, the
+# data in x509_data_test.alx.
+#
+# Not translated, or translated in part:
+#   - TestImports: runs `go run x509_test_import.go`.
+#   - TestInsecureAlgorithmErrorString: the rows for -1 and 9999
+#     (SignatureAlgorithm is an enum; values outside it can't exist).
+#   - TestPKIXNameString: the "zero-length non-nil ExtraNames hide Names"
+#     row (alx has no nil slices: an empty extra_names is Go's nil).
+#   - TestCreateRevocationList: the "nil template" and "nil issuer" rows
+#     (no nil values); "nil Number" is the zero number (big.Int has no
+#     nil, so a CRL number 0 can't be created).
+#   - TestSystemCertPool: Go skips it on darwin; here it runs everywhere
+#     (alx reads the system roots from files on every platform).
+
+import "crypto/ecdsa"
+import "crypto/ed25519"
+import "crypto/elliptic"
+import "crypto/mldsa"
+import "crypto/rand"
+import "crypto/x509/pkix"
+import "encoding/asn1"
+import "encoding/hex"
+import "math/big"
+import "net/url"
+import "time"
+
+# ---------------------------------------------------------------- CRLs
+
+test "CRLCreation" {
+  priv_rsa = PrivateKey.Rsa(x1_test_private_key())
+  cert_rsa = ~parse_certificate(x1_pem_der(x1_pem_certificate()))
+  priv_ed25519 = ~parse_pkcs8_private_key(x1_pem_der(x1_ed25519_crl_key()))
+  cert_ed25519 = ~parse_certificate(x1_pem_der(x1_ed25519_crl_certificate()))
+  tests = [("RSA CA", priv_rsa, cert_rsa), ("Ed25519 CA", priv_ed25519, cert_ed25519)]
+
+  loc = time.fixed_zone("Oz/Atlantis", 2 * 3600)
+  now = time.unix(1000, 0).in_zone(loc)
+  now_utc = now.utc
+  expiry = time.unix(10000, 0)
+  revoked_certs = [
+    pkix.RevokedCertificate.new(serial_number: big.new_int(1), revocation_time: now_utc),
+    # RevocationTime should be converted to UTC before marshaling.
+    pkix.RevokedCertificate.new(serial_number: big.new_int(42), revocation_time: now),
+  ]
+  for t in tests {
+    name, priv, cert = t
+    cr = cert.create_crl(rand.reader(), priv, revoked_certs, now, expiry)
+    assert cr.ok?, "#{name}: error creating CRL: #{cr.err?.message || ""}"
+    crl_bytes = cr.ok || []
+    next if crl_bytes.size == 0
+    parsed_crl = ~parse_der_crl(crl_bytes)
+    got = parsed_crl.tbs_cert_list.revoked_certificates
+    assert_eq got.size, 2
+    assert_eq got[0].serial_number.to_s, "1"
+    assert_eq got[1].serial_number.to_s, "42"
+    for rc in got {
+      assert rc.revocation_time.equal(now_utc), "#{name}: revocation time"
+      assert_eq rc.revocation_time.format(time.RFC3339), "1970-01-01T00:16:40Z"
+      assert_eq rc.extensions.size, 0
+    }
+  }
+}
+
+test "ParseDERCRL" {
+  cert_list = ~parse_der_crl(x1_from_base64(x1_der_crl_base64()))
+  assert_eq cert_list.tbs_cert_list.revoked_certificates.size, 88
+  assert !cert_list.has_expired?(time.unix(1302517272, 0)), "CRL has expired (but shouldn't have)"
+}
+
+test "CRLWithoutExpiry" {
+  cert_list = ~parse_der_crl(x1_from_base64(x1_crl_without_expiry_base64()))
+  assert cert_list.tbs_cert_list.next_update.is_zero, "NextUpdate is not the zero value"
+}
+
+test "ParsePEMCRL" {
+  cert_list = ~parse_crl(x1_from_base64(x1_pem_crl_base64()))
+  assert_eq cert_list.tbs_cert_list.revoked_certificates.size, 2
+  assert !cert_list.has_expired?(time.unix(1302517272, 0)), "CRL has expired (but shouldn't have)"
+}
+
+# ---------------------------------------------------------------- CSRs
+
+test "CreateCertificateRequest" {
+  random = rand.reader()
+  ecdsa256_priv = ~ecdsa.generate_key(elliptic.p256(), random)
+  ecdsa384_priv = ~ecdsa.generate_key(elliptic.p384(), random)
+  ecdsa521_priv = ~ecdsa.generate_key(elliptic.p521(), random)
+  _ed_pub, ed25519_priv = ~ed25519.generate_key(random)
+  mldsa_priv = ~mldsa.generate_key(mldsa.mldsa44())
+  test_key = PrivateKey.Rsa(x1_test_private_key())
+  tests = [
+    ("RSA", test_key, SignatureAlgorithm.SHA256WithRSA),
+    ("RSA-PSS-SHA256", test_key, SignatureAlgorithm.SHA256WithRSAPSS),
+    ("ECDSA-256", PrivateKey.Ecdsa(ecdsa256_priv), SignatureAlgorithm.ECDSAWithSHA256),
+    ("ECDSA-384", PrivateKey.Ecdsa(ecdsa384_priv), SignatureAlgorithm.ECDSAWithSHA256),
+    ("ECDSA-521", PrivateKey.Ecdsa(ecdsa521_priv), SignatureAlgorithm.ECDSAWithSHA256),
+    ("Ed25519", PrivateKey.Ed25519(ed25519_priv), SignatureAlgorithm.PureEd25519),
+    ("ML-DSA-44", PrivateKey.MlDsa(mldsa_priv), SignatureAlgorithm.MLDSA44),
+  ]
+  v6 = parse_ip("2001:4860:0:2001::68") || []
+  ips: [[Byte]] = [[127.as_u8, 0, 0, 1], v6]
+  for t in tests {
+    name, priv, sig_algo = t
+    template = CertificateRequest.new(
+      subject: pkix.Name.new(common_name: "test.example.com", organization: ["Σ Acme Co"]),
+      signature_algorithm: sig_algo,
+      dns_names: ["test.example.com"],
+      email_addresses: ["gopher@golang.org"],
+      ip_addresses: ips,
+    )
+    dr = create_certificate_request(random, template, priv)
+    assert dr.ok?, "#{name}: failed to create certificate request: #{dr.err?.message || ""}"
+    der_bytes = dr.ok || []
+    next if der_bytes.size == 0
+    out = ~parse_certificate_request(der_bytes)
+    r = out.check_signature
+    assert r.ok?, "#{name}: failed to check certificate request signature: #{r.err?.message || ""}"
+    assert_eq out.subject.common_name, template.subject.common_name
+    assert_eq out.subject.organization.size, template.subject.organization.size
+    assert_eq out.dns_names.size, template.dns_names.size
+    assert_eq out.email_addresses.size, template.email_addresses.size
+    assert_eq out.ip_addresses.size, template.ip_addresses.size
+  }
+}
+
+def x1_marshal_and_parse_csr(template: CertificateRequest) -> ~CertificateRequest {
+  der_bytes = ~create_certificate_request(rand.reader(), template, PrivateKey.Rsa(x1_test_private_key()))
+  ~parse_certificate_request(der_bytes)
+}
+
+test "CertificateRequestOverrides" {
+  no_ips: [[Byte]] = []
+  no_uris: [url.Url] = []
+  san_contents = ~marshal_sans(["foo.example.com"], [], no_ips, no_uris)
+  template = CertificateRequest.new(
+    subject: pkix.Name.new(common_name: "test.example.com", organization: ["Σ Acme Co"]),
+    dns_names: ["test.example.com"],
+    # An explicit extension should override the DNSNames from the
+    # template.
+    extra_extensions: [pkix.Extension.new(id: oid_extension_subject_alt_name(), value: san_contents, critical: true)],
+  )
+  csr = ~x1_marshal_and_parse_csr(template)
+  assert_eq csr.dns_names, ["foo.example.com"]
+  assert csr.extensions.size == 1 && csr.extensions[0].id.equal?(oid_extension_subject_alt_name()) && csr.extensions[0].critical, "SAN extension was not faithfully copied"
+
+  # If there is already an attribute with X.509 extensions then the extra
+  # extensions should be added to it rather than creating a CSR with two
+  # extension attributes.
+  aia = pkix.AttributeTypeAndValue.new(type: oid_extension_authority_info_access(), value: asn1.Any.Bytes("foo".bytes))
+  template.attributes = [pkix.AttributeTypeAndValueSET.new(type: oid_extension_request(), value: [[aia]])]
+  csr = ~x1_marshal_and_parse_csr(template)
+  assert_eq csr.attributes.size, 1
+  assert csr.attributes[0].type.equal?(oid_extension_request()) && csr.attributes[0].value.size == 1 && csr.attributes[0].value[0].size == 2, "bad attributes"
+
+  san_contents2 = ~marshal_sans(["foo2.example.com"], [], no_ips, no_uris)
+  # Extensions in Attributes should override those in ExtraExtensions.
+  san2 = pkix.AttributeTypeAndValue.new(type: oid_extension_subject_alt_name(), value: asn1.Any.Bytes(san_contents2))
+  template.attributes = [pkix.AttributeTypeAndValueSET.new(type: oid_extension_request(), value: [[aia, san2]])]
+  csr = ~x1_marshal_and_parse_csr(template)
+  assert_eq csr.dns_names, ["foo2.example.com"]
+}
+
+test "ParseCertificateRequest" {
+  for csr_base64 in x1_csr_base64_array() {
+    csr = ~parse_certificate_request(x1_from_base64(csr_base64))
+    assert_eq csr.email_addresses, ["gopher@golang.org"]
+    assert_eq csr.dns_names, ["test.example.com"]
+    assert_eq csr.subject.country, ["AU"]
+    found = false
+    for e in csr.extensions {
+      found = true if e.id.equal?(oid_extension_basic_constraints())
+    }
+    assert found, "basic constraints extension not found in CSR"
+  }
+}
+
+test "CriticalFlagInCSRRequestedExtensions" {
+  csr = ~parse_certificate_request(x1_from_base64(x1_test_critical_flag_in_csr_requested_extensions_csr_base64()))
+  expected = [(oid_extension_basic_constraints(), x1_from_base64("MAYBAf8CAQA=")), (oid_extension_key_usage(), x1_from_base64("AwIChA=="))]
+  assert_eq csr.extensions.size, expected.size
+  for i in 0...csr.extensions.size {
+    id, value = expected[i]
+    assert csr.extensions[i].id.equal?(id), "extension ##{i} has unexpected type #{csr.extensions[i].id.to_s}"
+    assert csr.extensions[i].value == value, "extension ##{i} has unexpected contents"
+  }
+}
+
+# ---------------------------------------------------------------- MaxPathLen, key ids
+
+# Go's serialiseAndParse: a self-signed certificate from template, parsed.
+def x1_serialise_and_parse(template: Certificate) -> ~Certificate {
+  k = x1_test_private_key()
+  der_bytes = ~create_certificate(rand.reader(), template, template, PublicKey.Rsa(k.public_key), PrivateKey.Rsa(k))
+  ~parse_certificate(der_bytes)
+}
+
+def x1_acme_template -> Certificate {
+  Certificate.new(
+    serial_number: big.new_int(1),
+    subject: pkix.Name.new(common_name: "Σ Acme Co"),
+    not_before: time.unix(1000, 0),
+    not_after: time.unix(100000, 0),
+    basic_constraints_valid: true,
+    is_ca: true,
+  )
+}
+
+test "MaxPathLenNotCA" {
+  template = x1_acme_template()
+  template.is_ca = false
+  k = x1_test_private_key()
+  assert_eq x1_serialise_and_parse(template).unwrap.max_path_len, -1
+
+  template.max_path_len = -1
+  assert_eq x1_serialise_and_parse(template).unwrap.max_path_len, -1
+
+  template.max_path_len = 5
+  assert !create_certificate(rand.reader(), template, template, PublicKey.Rsa(k.public_key), PrivateKey.Rsa(k)).ok?, "specifying a MaxPathLen when IsCA is false should fail"
+
+  template.max_path_len = 0
+  template.max_path_len_zero = true
+  assert !create_certificate(rand.reader(), template, template, PublicKey.Rsa(k.public_key), PrivateKey.Rsa(k)).ok?, "setting MaxPathLenZero when IsCA is false should fail"
+
+  template.basic_constraints_valid = false
+  assert_eq x1_serialise_and_parse(template).unwrap.max_path_len, 0
+}
+
+test "MaxPathLen" {
+  template = x1_acme_template()
+  cert1 = ~x1_serialise_and_parse(template)
+  assert_eq cert1.max_path_len, -1
+  assert !cert1.max_path_len_zero, "Omitting MaxPathLen resulted in MaxPathLenZero"
+
+  template.max_path_len = 1
+  cert2 = ~x1_serialise_and_parse(template)
+  assert_eq cert2.max_path_len, 1
+  assert !cert2.max_path_len_zero, "Setting MaxPathLen resulted in MaxPathLenZero"
+
+  template.max_path_len = 0
+  template.max_path_len_zero = true
+  cert3 = ~x1_serialise_and_parse(template)
+  assert_eq cert3.max_path_len, 0
+  assert cert3.max_path_len_zero, "Setting MaxPathLen to zero didn't result in MaxPathLenZero"
+}
+
+test "NoAuthorityKeyIdInSelfSignedCert" {
+  template = x1_acme_template()
+  template.subject_key_id = [1.as_u8, 2, 3, 4]
+  assert_eq x1_serialise_and_parse(template).unwrap.authority_key_id.size, 0
+
+  template.authority_key_id = [1.as_u8, 2, 3, 4]
+  assert x1_serialise_and_parse(template).unwrap.authority_key_id.size > 0, "self-signed certificate erased explicit authority key id"
+}
+
+test "NoSubjectKeyIdInCert" {
+  template = x1_acme_template()
+  assert x1_serialise_and_parse(template).unwrap.subject_key_id.size > 0, "self-signed certificate did not generate subject key id using the public key"
+
+  template.is_ca = false
+  assert_eq x1_serialise_and_parse(template).unwrap.subject_key_id.size, 0
+
+  template.subject_key_id = [1.as_u8, 2, 3, 4]
+  assert x1_serialise_and_parse(template).unwrap.subject_key_id.size > 0, "self-signed certificate erased explicit subject key id"
+}
+
+test "ASN1BitLength" {
+  tests: [([Byte], Int)] = [
+    ([], 0),
+    ([0x00.as_u8], 0),
+    ([0x00.as_u8, 0x00], 0),
+    ([0xf0.as_u8], 4),
+    ([0x88.as_u8], 5),
+    ([0xff.as_u8], 8),
+    ([0xff.as_u8, 0x80], 9),
+    ([0xff.as_u8, 0x81], 16),
+  ]
+  for t in tests {
+    b, want = t
+    assert_eq asn1_bit_length(b), want
+  }
+}
+
+test "VerifyEmptyCertificate" {
+  r = Certificate.new.verify(VerifyOptions.new)
+  assert_eq r.err?.message || "", "x509: missing ASN.1 contents; use ParseCertificate"
+}
+
+test "InsecureAlgorithmErrorString" {
+  tests = [
+    (SignatureAlgorithm.MD5WithRSA, "x509: cannot verify signature: insecure algorithm MD5-RSA"),
+    (SignatureAlgorithm.SHA1WithRSA, "x509: cannot verify signature: insecure algorithm SHA1-RSA"),
+    (SignatureAlgorithm.ECDSAWithSHA1, "x509: cannot verify signature: insecure algorithm ECDSA-SHA1"),
+    (SignatureAlgorithm.MD2WithRSA, "x509: cannot verify signature: insecure algorithm 1"),
+    (SignatureAlgorithm.UnknownSignatureAlgorithm, "x509: cannot verify signature: insecure algorithm 0"),
+  ]
+  for t in tests {
+    sa, want = t
+    assert_eq X509Error.InsecureAlgorithm(sa).message, want
+  }
+}
+
+def x1_insecure?(r: ~Unit) -> Bool {
+  if e = r.err {
+    return case e {
+      X509Error.InsecureAlgorithm(_) => true
+      _ => false
+    }
+  }
+  false
+}
+
+test "MD5" {
+  cert = ~parse_certificate(x1_pem_der(x1_md5cert()))
+  assert cert.signature_algorithm == SignatureAlgorithm.MD5WithRSA, "signature algorithm is #{cert.signature_algorithm.to_s}"
+  r = cert.check_signature_from(cert)
+  assert !r.ok?, "certificate verification succeeded incorrectly"
+  assert x1_insecure?(r), "certificate verification returned #{r.err?.message || ""}, wanted InsecureAlgorithmError"
+}
+
+test "SHA1" {
+  cert = ~parse_certificate(x1_pem_der(x1_ecdsa_sha1_cert_pem()))
+  assert cert.signature_algorithm == SignatureAlgorithm.ECDSAWithSHA1, "signature algorithm is #{cert.signature_algorithm.to_s}"
+  r = cert.check_signature_from(cert)
+  assert !r.ok?, "certificate verification succeeded incorrectly"
+  assert x1_insecure?(r), "certificate verification returned #{r.err?.message || ""}, wanted InsecureAlgorithmError"
+}
+
+# ---------------------------------------------------------------- odd certificates
+
+test "RSAMissingNULLParameters" {
+  r = parse_certificate(x1_pem_der(x1_cert_missing_rsanull()))
+  assert !r.ok?, "unexpected success when parsing certificate with missing RSA NULL parameter"
+  msg = r.err?.message || ""
+  assert msg.include?("missing NULL"), "unrecognised error: #{msg}"
+}
+
+test "ISOOIDInCertificate" {
+  cert = ~parse_certificate(x1_pem_der(x1_cert_isooid()))
+  assert cert.signature_algorithm != SignatureAlgorithm.UnknownSignatureAlgorithm, "ISO OID not recognised in certificate"
+}
+
+test "MultipleRDN" {
+  cert = ~parse_certificate(x1_pem_der(x1_cert_multiple_rdn()))
+  assert_eq cert.subject.common_name, "eportal.mss.edus.si"
+  assert_eq cert.subject.serial_number, "1236484010010"
+}
+
+test "SystemCertPool" {
+  a = ~system_cert_pool()
+  b = ~system_cert_pool()
+  assert a.equal?(b), "two calls to SystemCertPool had different results"
+  pem_s = "\n-----BEGIN CERTIFICATE-----\nMIIDBjCCAe6gAwIBAgIRANXM5I3gjuqDfTp/PYrs+u8wDQYJKoZIhvcNAQELBQAw\nEjEQMA4GA1UEChMHQWNtZSBDbzAeFw0xODAzMjcxOTU2MjFaFw0xOTAzMjcxOTU2\nMjFaMBIxEDAOBgNVBAoTB0FjbWUgQ28wggEiMA0GCSqGSIb3DQEBAQUAA4IBDwAw\nggEKAoIBAQDK+9m3rjsO2Djes6bIYQZ3eV29JF09ZrjOrEHLtaKrD6/acsoSoTsf\ncQr+rzzztdB5ijWXCS64zo/0OiqBeZUNZ67jVdToa9qW5UYe2H0Y+ZNdfA5GYMFD\nyk/l3/uBu3suTZPfXiW2TjEi27Q8ruNUIZ54DpTcs6y2rBRFzadPWwn/VQMlvRXM\njrzl8Y08dgnYmaAHprxVzwMXcQ/Brol+v9GvjaH1DooHqkn8O178wsPQNhdtvN01\nIXL46cYdcUwWrE/GX5u+9DaSi+0KWxAPQ+NVD5qUI0CKl4714yGGh7feXMjJdHgl\nVG4QJZlJvC4FsURgCHJT6uHGIelnSwhbAgMBAAGjVzBVMA4GA1UdDwEB/wQEAwIF\noDATBgNVHSUEDDAKBggrBgEFBQcDATAMBgNVHRMBAf8EAjAAMCAGA1UdEQQZMBeC\nFVRlc3RTeXN0ZW1DZXJ0UG9vbC5nbzANBgkqhkiG9w0BAQsFAAOCAQEAwuSRx/VR\nBKh2ICxZjL6jBwk/7UlU1XKbhQD96RqkidDNGEc6eLZ90Z5XXTurEsXqdm5jQYPs\n1cdcSW+fOSMl7MfW9e5tM66FaIPZl9rKZ1r7GkOfgn93xdLAWe8XHd19xRfDreub\nYC8DVqgLASOEYFupVSl76ktPfxkU5KCvmUf3P2PrRybk1qLGFytGxfyice2gHSNI\ngify3K/+H/7wCkyFW4xYvzl7WW4mXxoqPRPjQt1J423DhnnQ4G1P8V/vhUpXNXOq\nN9IEPnWuihC09cyx/WMQIUlWnaQLHdfpPS04Iez3yy2PdfXJzwfPrja7rNE+skK6\npa/O1nF0AfWOpw==\n-----END CERTIFICATE-----\n\t"
+  assert b.append_certs_from_pem!(pem_s.bytes), "AppendCertsFromPEM failed"
+  assert !a.equal?(b), "changing one pool modified the other"
+}
+
+test "EmptyNameConstraints" {
+  r = parse_certificate(x1_pem_der(x1_empty_name_constraints_pem()))
+  assert !r.ok?, "unexpected success"
+  msg = r.err?.message || ""
+  assert msg.include?("empty name constraints"), "expected \"empty name constraints\" in error but got #{msg}"
+}
+
+# ---------------------------------------------------------------- names
+
+test "PKIXNameString" {
+  certs = ~parse_certificates(x1_from_base64(x1_cert_bytes()))
+
+  # Check that parsed non-standard attributes are printed.
+  rdns = pkix.Name.new(locality: ["Gophertown"], extra_names: [pkix.AttributeTypeAndValue.new(type: asn1.oid([1, 2, 3, 4, 5]), value: asn1.Any.Str("golang.org"))]).to_rdn_sequence
+  nn = pkix.Name.new
+  nn.fill_from_rdn_sequence!(rdns)
+
+  tests = [
+    (nn, "L=Gophertown,1.2.3.4.5=golang.org"),
+    (pkix.Name.new(common_name: "Steve Kille", organization: ["Isode Limited"], organizational_unit: ["RFCs"], locality: ["Richmond"], province: ["Surrey"], street_address: ["The Square"], postal_code: ["TW9 1DT"], serial_number: "RFC 2253", country: ["GB"]), "SERIALNUMBER=RFC 2253,CN=Steve Kille,OU=RFCs,O=Isode Limited,POSTALCODE=TW9 1DT,STREET=The Square,L=Richmond,ST=Surrey,C=GB"),
+    (certs[0].subject, "CN=mail.google.com,O=Google LLC,L=Mountain View,ST=California,C=US"),
+    (pkix.Name.new(organization: ["\#Google, Inc. \n-> 'Alphabet\" "], country: ["US"]), "O=\\\#Google\\, Inc. \n-\\> 'Alphabet\\\"\\ ,C=US"),
+    (pkix.Name.new(common_name: "foo.com", organization: ["Gopher Industries"], extra_names: [pkix.AttributeTypeAndValue.new(type: asn1.oid([2, 5, 4, 3]), value: asn1.Any.Str("bar.com"))]), "CN=bar.com,O=Gopher Industries"),
+    (pkix.Name.new(locality: ["Gophertown"], extra_names: [pkix.AttributeTypeAndValue.new(type: asn1.oid([1, 2, 3, 4, 5]), value: asn1.Any.Str("golang.org"))]), "1.2.3.4.5=golang.org,L=Gophertown"),
+    # If there are no ExtraNames, the Names are printed instead.
+    (pkix.Name.new(locality: ["Gophertown"], names: [pkix.AttributeTypeAndValue.new(type: asn1.oid([1, 2, 3, 4, 5]), value: asn1.Any.Str("golang.org"))]), "L=Gophertown,1.2.3.4.5=golang.org"),
+    # If there are both, print only the ExtraNames.
+    (pkix.Name.new(locality: ["Gophertown"], extra_names: [pkix.AttributeTypeAndValue.new(type: asn1.oid([1, 2, 3, 4, 5]), value: asn1.Any.Str("golang.org"))], names: [pkix.AttributeTypeAndValue.new(type: asn1.oid([1, 2, 3, 4, 6]), value: asn1.Any.Str("example.com"))]), "1.2.3.4.5=golang.org,L=Gophertown"),
+    # Non-string value falls back to hex-encoded DER (issue 33093).
+    (pkix.Name.new(common_name: "foobar", extra_names: [pkix.AttributeTypeAndValue.new(type: asn1.oid([1, 2, 3, 4]), value: asn1.Any.Int(42))]), "1.2.3.4=\#02012a,CN=foobar"),
+    # String containing non-PrintableString chars (here, UTF-8) is still
+    # rendered as a string per RFC 2253 2.4, not hex-encoded.
+    (pkix.Name.new(common_name: "foobar", extra_names: [pkix.AttributeTypeAndValue.new(type: asn1.oid([2, 3, 4, 5]), value: asn1.Any.Str("Lučić"))]), "2.3.4.5=Lučić,CN=foobar"),
+    # String beginning with '#' has the '#' escaped (RFC 2253 2.4).
+    (pkix.Name.new(common_name: "foobar", extra_names: [pkix.AttributeTypeAndValue.new(type: asn1.oid([2, 3, 4, 5]), value: asn1.Any.Str("\#abcdef"))]), "2.3.4.5=\\\#abcdef,CN=foobar"),
+    # Printable string with an embedded RFC 2253 escapable character.
+    (pkix.Name.new(common_name: "foobar", extra_names: [pkix.AttributeTypeAndValue.new(type: asn1.oid([2, 3, 4, 5]), value: asn1.Any.Str("abcdef,GHI"))]), "2.3.4.5=abcdef\\,GHI,CN=foobar"),
+    # Printable string with leading and trailing space gets escaped.
+    (pkix.Name.new(common_name: "foobar", extra_names: [pkix.AttributeTypeAndValue.new(type: asn1.oid([2, 3, 4, 5]), value: asn1.Any.Str("   abcdef "))]), "2.3.4.5=\\   abcdef\\ ,CN=foobar"),
+  ]
+  for t in tests {
+    dn, want = t
+    assert_eq dn.to_s, want
+  }
+}
+
+test "RDNSequenceString" {
+  # Test some extra cases that get lost in pkix.Name conversions such as
+  # multi-valued attributes.
+  oid_country = asn1.oid([2, 5, 4, 6])
+  oid_organization = asn1.oid([2, 5, 4, 10])
+  oid_organizational_unit = asn1.oid([2, 5, 4, 11])
+  oid_common_name = asn1.oid([2, 5, 4, 3])
+  seq = pkix.RDNSequence.new(rdns: [
+    pkix.RelativeDistinguishedNameSET.new(atvs: [pkix.AttributeTypeAndValue.new(type: oid_country, value: asn1.Any.Str("US"))]),
+    pkix.RelativeDistinguishedNameSET.new(atvs: [pkix.AttributeTypeAndValue.new(type: oid_organization, value: asn1.Any.Str("Widget Inc."))]),
+    pkix.RelativeDistinguishedNameSET.new(atvs: [
+      pkix.AttributeTypeAndValue.new(type: oid_organizational_unit, value: asn1.Any.Str("Sales")),
+      pkix.AttributeTypeAndValue.new(type: oid_common_name, value: asn1.Any.Str("J. Smith")),
+    ]),
+  ])
+  assert_eq seq.to_s, "OU=Sales+CN=J. Smith,O=Widget Inc.,C=US"
+}
+
+test "CriticalNameConstraintWithUnknownType" {
+  cert = ~parse_certificate(x1_pem_der(x1_critical_name_constraint_with_unknown_type_pem()))
+  assert_eq cert.unhandled_critical_extensions.size, 1
+}
+
+test "BadIPMask" {
+  r = parse_certificate(x1_pem_der(x1_bad_ip_mask_pem()))
+  assert !r.ok?, "unexpected success"
+  msg = r.err?.message || ""
+  assert msg.include?("contained invalid mask"), "expected \"contained invalid mask\" in error but got: #{msg}"
+}
+
+test "AdditionFieldsInGeneralSubtree" {
+  # Very rarely, certificates can include additional fields in the
+  # GeneralSubtree structure. This tests that such certificates can be
+  # parsed.
+  _cert = ~parse_certificate(x1_pem_der(x1_additional_general_subtree_pem()))
+}
+
+test "EmptySerialNumber" {
+  template = Certificate.new(dns_names: ["example.com"])
+  k = x1_test_private_key()
+  for _i in 0...100 {
+    der_bytes = ~create_certificate(rand.reader(), template, template, PublicKey.Rsa(k.public_key), PrivateKey.Rsa(k))
+    cert = ~parse_certificate(der_bytes)
+    assert_eq cert.serial_number.sign, 1
+    b = ~asn1.marshal_big(cert.serial_number)
+    # subtract 2 for tag and length
+    assert b.size - 2 <= 20, "generated serial number larger than 20 octets when encoded: #{b.size - 2}"
+  }
+}
+
+test "EmptySubject" {
+  template = Certificate.new(serial_number: big.new_int(1), dns_names: ["example.com"])
+  k = x1_test_private_key()
+  der_bytes = ~create_certificate(rand.reader(), template, template, PublicKey.Rsa(k.public_key), PrivateKey.Rsa(k))
+  cert = ~parse_certificate(der_bytes)
+  found = false
+  for ext in cert.extensions {
+    if ext.id.equal?(oid_extension_subject_alt_name()) {
+      found = true
+      assert ext.critical, "SAN extension is not critical"
+    }
+  }
+  assert found, "SAN extension is missing"
+}
+
+test "MultipleURLsInCRLDP" {
+  cert = ~parse_certificate(x1_pem_der(x1_multiple_ur_ls_in_crldppem()))
+  assert_eq cert.crl_distribution_points, ["http://epscd.catcert.net/crl/ec-acc.crl", "http://epscd2.catcert.net/crl/ec-acc.crl"]
+}
+
+test "PKCS1MismatchKeyFormat" {
+  tests = [(x1_hex_pkcs1_test_pkcs8_key(), "use ParsePKCS8PrivateKey instead"), (x1_hex_pkcs1_test_ec_key(), "use ParseECPrivateKey instead")]
+  for t in tests {
+    hex_key, error_contains = t
+    der_bytes = ~hex.decode_string(hex_key)
+    msg = parse_pkcs1_private_key(der_bytes).err?.message || ""
+    assert msg.include?(error_contains), "expected error containing #{error_contains}, got #{msg}"
+  }
+}
+
+# ---------------------------------------------------------------- CreateRevocationList
+
+# One row of TestCreateRevocationList.
+struct X1CrlCase {
+  name: Str
+  key: PrivateKey
+  issuer: Certificate
+  template: RevocationList
+  expected_error: Str
+}
+
+def x1_crl_issuer -> Certificate {
+  Certificate.new(key_usage: KEY_USAGE_CRL_SIGN, subject: pkix.Name.new(common_name: "testing"), subject_key_id: [1.as_u8, 2, 3])
+}
+
+# A RevocationList with Number 5, ThisUpdate zero+24h, NextUpdate
+# zero+48h and one entry (serial 2, revoked at zero+1h).
+def x1_crl_template(entry: RevocationListEntry) -> RevocationList {
+  RevocationList.new(revoked_certificate_entries: [entry], number: big.new_int(5), this_update: time.Time.new.add(time.hour * 24), next_update: time.Time.new.add(time.hour * 48))
+}
+
+def x1_crl_entry -> RevocationListEntry { RevocationListEntry.new(serial_number: big.new_int(2), revocation_time: time.Time.new.add(time.hour)) }
+
+def x1_crl_cases -> ~[X1CrlCase] {
+  ec256_priv = PrivateKey.Ecdsa(~ecdsa.generate_key(elliptic.p256(), rand.reader()))
+  _ed_pub, ed_priv = ~ed25519.generate_key(rand.reader())
+  ed25519_priv = PrivateKey.Ed25519(ed_priv)
+  mldsa_priv = PrivateKey.MlDsa(~mldsa.generate_key(mldsa.mldsa44()))
+
+  # Generation command:
+  # openssl req -x509 -newkey rsa -keyout key.pem -out cert.pem -days 365 -nodes -subj '/C=US/ST=California/L=San Francisco/O=Internet Widgets, Inc./OU=WWW/CN=Root/emailAddress=admin@example.com' -sha256 -addext basicConstraints=CA:TRUE -addext "keyUsage = digitalSignature, keyEncipherment, dataEncipherment, cRLSign, keyCertSign" -utf8
+  utf8_ca = ~parse_certificate(x1_from_base64(x1_test_create_revocation_list_utf8_ca_str()))
+  utf8_key = ~parse_pkcs8_private_key(x1_from_base64(x1_test_create_revocation_list_utf8_key_str()))
+
+  issuer = x1_crl_issuer()
+  day = time.Time.new.add(time.hour * 24)
+  two_days = time.Time.new.add(time.hour * 48)
+  long_number = big.new_int(0)
+  long_number.set_bytes!([1.as_u8] + [0.as_u8; 20])
+  long_number_msb = big.new_int(0)
+  long_number_msb.set_bytes!([255.as_u8] + [0.as_u8; 19])
+  ext99 = pkix.Extension.new(id: asn1.oid([2, 5, 29, 99]), value: [5.as_u8, 0])
+
+  reason = x1_crl_entry()
+  reason.reason_code = 1
+  extra_entry = x1_crl_entry()
+  extra_entry.extra_extensions = [ext99]
+  non_default = x1_crl_template(x1_crl_entry())
+  non_default.signature_algorithm = SignatureAlgorithm.ECDSAWithSHA512
+  extra_ext = x1_crl_template(x1_crl_entry())
+  extra_ext.extra_extensions = [ext99]
+
+  [
+    X1CrlCase.new(name: "issuer doesn't have crlSign key usage bit set", key: ec256_priv, issuer: Certificate.new(key_usage: KEY_USAGE_CERT_SIGN), template: RevocationList.new, expected_error: "x509: issuer must have the crlSign key usage bit set"),
+    X1CrlCase.new(name: "issuer missing SubjectKeyId", key: ec256_priv, issuer: Certificate.new(key_usage: KEY_USAGE_CRL_SIGN), template: RevocationList.new, expected_error: "x509: issuer certificate doesn't contain a subject key identifier"),
+    X1CrlCase.new(name: "nextUpdate before thisUpdate", key: ec256_priv, issuer: issuer, template: RevocationList.new(this_update: time.Time.new.add(time.hour), next_update: time.Time.new), expected_error: "x509: template.ThisUpdate is after template.NextUpdate"),
+    X1CrlCase.new(name: "nil Number", key: ec256_priv, issuer: issuer, template: RevocationList.new(this_update: day, next_update: two_days), expected_error: "x509: template contains nil Number field"),
+    X1CrlCase.new(name: "long Number", key: ec256_priv, issuer: issuer, template: RevocationList.new(this_update: day, next_update: two_days, number: long_number), expected_error: "x509: CRL number exceeds 20 octets"),
+    X1CrlCase.new(name: "long Number (20 bytes, MSB set)", key: ec256_priv, issuer: issuer, template: RevocationList.new(this_update: day, next_update: two_days, number: long_number_msb), expected_error: "x509: CRL number exceeds 20 octets"),
+    X1CrlCase.new(name: "invalid signature algorithm", key: ec256_priv, issuer: issuer, template: RevocationList.new(signature_algorithm: SignatureAlgorithm.SHA256WithRSA, revoked_certificates: [pkix.RevokedCertificate.new(serial_number: big.new_int(2), revocation_time: time.Time.new.add(time.hour))], number: big.new_int(5), this_update: day, next_update: two_days), expected_error: "x509: requested SignatureAlgorithm does not match private key type"),
+    X1CrlCase.new(name: "valid", key: ec256_priv, issuer: issuer, template: x1_crl_template(x1_crl_entry())),
+    X1CrlCase.new(name: "valid, reason code", key: ec256_priv, issuer: issuer, template: x1_crl_template(reason)),
+    X1CrlCase.new(name: "valid, extra entry extension", key: ec256_priv, issuer: issuer, template: x1_crl_template(extra_entry)),
+    X1CrlCase.new(name: "valid, Ed25519 key", key: ed25519_priv, issuer: issuer, template: x1_crl_template(x1_crl_entry())),
+    X1CrlCase.new(name: "valid, non-default signature algorithm", key: ec256_priv, issuer: issuer, template: non_default),
+    X1CrlCase.new(name: "valid, extra extension", key: ec256_priv, issuer: issuer, template: extra_ext),
+    X1CrlCase.new(name: "valid, deprecated entries with extension", key: ec256_priv, issuer: issuer, template: RevocationList.new(revoked_certificates: [pkix.RevokedCertificate.new(serial_number: big.new_int(2), revocation_time: time.Time.new.add(time.hour), extensions: [ext99])], number: big.new_int(5), this_update: day, next_update: two_days)),
+    X1CrlCase.new(name: "valid, empty list", key: ec256_priv, issuer: issuer, template: RevocationList.new(number: big.new_int(5), this_update: day, next_update: two_days)),
+    X1CrlCase.new(name: "valid CA with utf8 Subject fields including Email, empty list", key: utf8_key, issuer: utf8_ca, template: RevocationList.new(number: big.new_int(5), this_update: day, next_update: two_days)),
+    X1CrlCase.new(name: "valid, ML-DSA-44 key", key: mldsa_priv, issuer: issuer, template: x1_crl_template(x1_crl_entry())),
+  ]
+}
+
+def x1_ext_eq?(a: pkix.Extension, b: pkix.Extension) -> Bool { a.id.equal?(b.id) && a.critical == b.critical && a.value == b.value }
+
+test "CreateRevocationList" {
+  for tc in ~x1_crl_cases() {
+    name = tc.name
+    r = create_revocation_list(rand.reader(), tc.template, tc.issuer, tc.key)
+    if tc.expected_error != "" {
+      assert_eq "#{name}: #{r.err?.message || "<success>"}", "#{name}: #{tc.expected_error}"
+      next
+    }
+    assert r.ok?, "#{name}: CreateRevocationList failed unexpectedly: #{r.err?.message || ""}"
+    crl = r.ok || []
+    next if crl.size == 0
+
+    parsed_crl = ~parse_revocation_list(crl)
+    if tc.template.signature_algorithm != SignatureAlgorithm.UnknownSignatureAlgorithm {
+      assert parsed_crl.signature_algorithm == tc.template.signature_algorithm, "#{name}: SignatureAlgorithm mismatch: got #{parsed_crl.signature_algorithm.to_s}"
+    }
+
+    if tc.template.revoked_certificates.size > 0 {
+      got = parsed_crl.revoked_certificates
+      want = tc.template.revoked_certificates
+      assert_eq got.size, want.size
+      for i in 0...got.size {
+        assert got[i].serial_number.cmp(want[i].serial_number) == 0, "#{name}: RevokedCertificates serial mismatch"
+        assert got[i].revocation_time.equal(want[i].revocation_time), "#{name}: RevokedCertificates time mismatch"
+        assert_eq got[i].extensions.size, want[i].extensions.size
+        for j in 0...got[i].extensions.size {
+          assert x1_ext_eq?(got[i].extensions[j], want[i].extensions[j]), "#{name}: RevokedCertificates extension mismatch"
+        }
+      }
+    } else {
+      assert_eq parsed_crl.revoked_certificate_entries.size, tc.template.revoked_certificate_entries.size
+      for i in 0...parsed_crl.revoked_certificate_entries.size {
+        rce = parsed_crl.revoked_certificate_entries[i]
+        expected = tc.template.revoked_certificate_entries[i]
+        assert rce.serial_number.cmp(expected.serial_number) == 0, "#{name}: RevocationListEntry serial mismatch: got #{rce.serial_number.to_s}"
+        assert rce.revocation_time.equal(expected.revocation_time), "#{name}: RevocationListEntry revocation time mismatch"
+        assert_eq rce.reason_code, expected.reason_code
+      }
+    }
+
+    assert_eq parsed_crl.extensions.size, 2 + tc.template.extra_extensions.size
+    expected_aki = AuthKeyId.new(id: tc.issuer.subject_key_id).~to_asn1
+    aki_ext = pkix.Extension.new(id: oid_extension_authority_key_id(), value: expected_aki)
+    assert x1_ext_eq?(parsed_crl.extensions[0], aki_ext), "#{name}: unexpected first extension"
+    expected_num = ~asn1.marshal_big(tc.template.number)
+    crl_ext = pkix.Extension.new(id: oid_extension_crl_number(), value: expected_num)
+    assert x1_ext_eq?(parsed_crl.extensions[1], crl_ext), "#{name}: unexpected second extension"
+
+    if tc.issuer.raw_subject.size > 0 {
+      issuer_subj = subject_bytes(tc.issuer)
+      assert issuer_subj == parsed_crl.raw_issuer, "#{name}: unexpected issuer subject"
+    } else {
+      # Round-trip the hacked issuer's Subject through an RDNSequence so
+      # that Names is filled in for the comparison.
+      issuer_rdn = tc.issuer.subject.to_rdn_sequence
+      ca_issuer = pkix.Name.new
+      ca_issuer.fill_from_rdn_sequence!(issuer_rdn)
+      assert_eq parsed_crl.issuer.to_s, ca_issuer.to_s
+      assert_eq parsed_crl.issuer.common_name, ca_issuer.common_name
+      assert_eq parsed_crl.issuer.names.size, ca_issuer.names.size
+      assert_eq parsed_crl.issuer.extra_names.size, 0
+    }
+
+    rest = parsed_crl.extensions[2...parsed_crl.extensions.size]
+    next if rest.size == 0 && tc.template.extra_extensions.size == 0
+    assert_eq rest.size, tc.template.extra_extensions.size
+    for i in 0...rest.size {
+      assert x1_ext_eq?(rest[i], tc.template.extra_extensions[i]), "#{name}: Extensions mismatch"
+    }
+    assert tc.template.number.cmp(parsed_crl.number) == 0, "#{name}: wrong Number: got #{parsed_crl.number.to_s}"
+    assert parsed_crl.authority_key_id == tc.issuer.subject_key_id, "#{name}: wrong AuthorityKeyId"
+  }
+}

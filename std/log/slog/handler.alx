@@ -1,0 +1,655 @@
+# Handlers (Go's handler.go, text_handler.go, json_handler.go,
+# multi_handler.go).
+
+import "encoding/base64"
+import "encoding/json"
+import "errors"
+import "log"
+import "strconv"
+import "time"
+import "unicode"
+import "unicode/utf8"
+
+# Keys of the built-in attributes.
+pub TIME_KEY = "time"
+pub LEVEL_KEY = "level"
+pub MESSAGE_KEY = "msg"
+pub SOURCE_KEY = "source"
+
+# Options for a TextHandler or JSONHandler (Go's HandlerOptions); the zero
+# value is the defaults.
+pub struct HandlerOptions {
+  # Go's AddSource. Records carry no source position here, so with it the
+  # handlers write what Go writes for a record without a PC: nothing.
+  add_source: Bool
+  # The minimum level (none: level_info). A Level, a LevelVar, or any Leveler.
+  level: Leveler?
+  # Rewrites each non-group attribute before it is written; the first
+  # argument is the open groups. A zero Attr (`Attr.new`) drops it.
+  replace_attr: (([Str], Attr) -> Attr)?
+}
+
+# What a Logger sends records to (Go's Handler, without the context
+# arguments: see the header). Implementations must be safe to call from
+# several tasks at once. with_attrs and with_group should return the
+# implementing type itself (all of this package's handlers do), so that the
+# handler can also be a LeafHandler (in a MultiHandler) or wrapped by a
+# generic handler.
+pub interface Handler {
+  # Whether records at `level` are handled; called before the record is built.
+  def enabled?(level: Level) -> Bool
+  # Handles a record (only called when enabled? said yes).
+  def handle(r: Record) -> ~Unit
+  # A handler with these attributes added to every record.
+  def with_attrs(attrs: [Attr]) -> Handler
+  # A handler that puts the attributes of later records in group `name`.
+  def with_group(name: Str) -> Handler
+}
+
+# A Handler that doesn't hold other Handler values, as an element of a
+# MultiHandler (an interface value contains its implementors, so a type that
+# holds Handlers can't itself be one of them; see the header). Every handler
+# of this package except MultiHandler is one, and so is any user handler
+# whose with_attrs / with_group return its own type.
+pub interface LeafHandler {
+  def enabled?(level: Level) -> Bool
+  def handle(r: Record) -> ~Unit
+  def with_attrs(attrs: [Attr]) -> LeafHandler
+  def with_group(name: Str) -> LeafHandler
+}
+
+# ---------------------------------------------------------- formatting
+
+# Go's commonHandler without the writer: the options and the attributes
+# and groups added by with_attrs / with_group, preformatted.
+struct Fmt {
+  json: Bool
+  opts: HandlerOptions
+  pre: Str
+  group_prefix: Str
+  groups: [Str]
+  n_open: Int
+
+  def enabled?(l: Level) -> Bool {
+    min = level_info
+    if lv = opts.level {
+      min = lv.level
+    }
+    l >= min
+  }
+
+  def attr_sep -> Str { json ? "," : " " }
+
+  def with_attrs(as: [Attr]) -> Fmt {
+    return self if count_empty_groups(as) == as.size
+    h2 = self
+    st = new_state(self, pre, "")
+    st.prefix = group_prefix
+    if pre.size > 0 {
+      st.sep = attr_sep
+      st.sep = "" if json && pre[pre.size - 1] == 123
+    }
+    pos = st.buf.size
+    st.open_groups!
+    if !st.append_attrs!(as) {
+      st.buf = st.buf[0...pos]
+    } else {
+      h2.group_prefix = st.prefix
+      h2.n_open = groups.size
+    }
+    h2.pre = st.buf
+    h2
+  }
+
+  def with_group(name: Str) -> Fmt {
+    h2 = self
+    h2.groups = groups + [name]
+    h2
+  }
+
+  # The line Go's commonHandler.handle writes for r (with the newline).
+  def format(r: Record) -> Str {
+    st = new_state(self, json ? "{" : "", "")
+    state_groups = st.groups
+    st.groups = []
+    if opts.replace_attr != none {
+      if !r.time.is_zero {
+        _ = st.append_attr!(time_attr(TIME_KEY, r.time.strip_mono))
+      }
+      _ = st.append_attr!(any(LEVEL_KEY, level_value(r.level)))
+      _ = st.add_source!(r) if opts.add_source
+      _ = st.append_attr!(string(MESSAGE_KEY, r.message))
+    } else {
+      if !r.time.is_zero {
+        st.append_key!(TIME_KEY)
+        st.append_time!(r.time.strip_mono)
+      }
+      st.append_key!(LEVEL_KEY)
+      st.append_string!(r.level.to_s)
+      _ = st.add_source!(r) if opts.add_source
+      st.append_key!(MESSAGE_KEY)
+      st.append_string!(r.message)
+    }
+    st.groups = state_groups
+    st.append_non_builtins!(r)
+    st.buf + "\n"
+  }
+}
+
+# Go's handleState: one record (or one with_attrs call) being formatted.
+struct HState {
+  h: Fmt
+  buf: Str
+  # written before the next key
+  sep: Str
+  # text: the dotted prefix of the open groups
+  prefix: Str
+  # the open groups, for replace_attr
+  groups: [Str]
+
+  def add_source!(r: Record) -> Bool {
+    src = r.source || Source.new
+    self.append_attr!(any(SOURCE_KEY, source_value(src)))
+  }
+
+  def open_groups! {
+    i = h.n_open
+    while i < h.groups.size {
+      self.open_group!(h.groups[i])
+      i += 1
+    }
+  }
+
+  def open_group!(name: Str) {
+    if h.json {
+      self.append_key!(name)
+      self.buf += "{"
+      self.sep = ""
+    } else {
+      self.prefix += name + "."
+    }
+    self.groups = self.groups + [name] if h.opts.replace_attr != none
+  }
+
+  def close_group!(name: Str) {
+    if h.json {
+      self.buf += "}"
+    } else {
+      self.prefix = self.prefix[0...self.prefix.size - name.size - 1]
+    }
+    self.sep = h.attr_sep
+    if h.opts.replace_attr != none {
+      self.groups = self.groups[0...self.groups.size - 1]
+    }
+  }
+
+  # Whether something was written.
+  def append_attrs!(as: [Attr]) -> Bool {
+    non_empty = false
+    for a in as {
+      non_empty = true if self.append_attr!(a)
+    }
+    non_empty
+  }
+
+  # Go's appendAttr: resolve, replace, elide empty attributes, write.
+  def append_attr!(attr: Attr) -> Bool {
+    a = Attr.new(key: attr.key, value: attr.value.resolve)
+    if rep = h.opts.replace_attr {
+      if a.value.kind != KIND_GROUP {
+        a = rep.call(self.groups, a)
+        a = Attr.new(key: a.key, value: a.value.resolve)
+      }
+    }
+    return false if a.empty?
+    if a.value.sc.tag == T_SOURCE {
+      src = a.value.source
+      return false if src.empty?
+      if h.json {
+        a = Attr.new(key: a.key, value: src.group)
+      } else {
+        a = Attr.new(key: a.key, value: string_value(src.file + ":" + src.line.to_s))
+      }
+    }
+    if a.value.kind == KIND_GROUP {
+      attrs = a.value.group
+      if attrs.size > 0 {
+        pos = self.buf.size
+        self.open_group!(a.key) if a.key != ""
+        if !self.append_attrs!(attrs) {
+          self.buf = self.buf[0...pos]
+          return false
+        }
+        self.close_group!(a.key) if a.key != ""
+      }
+    } else {
+      self.append_key!(a.key)
+      self.append_value!(a.value)
+    }
+    true
+  }
+
+  def append_error!(msg: Str) {
+    self.append_string!("!ERROR:" + msg)
+  }
+
+  def append_key!(key: Str) {
+    self.buf += self.sep
+    if self.prefix.size > 0 {
+      self.append_two_strings!(self.prefix, key)
+    } else {
+      self.append_string!(key)
+    }
+    self.buf += h.json ? ":" : "="
+    self.sep = h.attr_sep
+  }
+
+  def append_two_strings!(x: Str, y: Str) {
+    if h.json {
+      self.buf += "\"" + escape_json(x) + escape_json(y) + "\""
+    } else if !needs_quoting(x) && !needs_quoting(y) {
+      self.buf += x + y
+    } else {
+      self.buf += strconv.quote(x + y)
+    }
+  }
+
+  def append_string!(s: Str) {
+    if h.json {
+      self.buf += "\"" + escape_json(s) + "\""
+    } else if needs_quoting(s) {
+      self.buf += strconv.quote(s)
+    } else {
+      self.buf += s
+    }
+  }
+
+  def append_value!(v: Value) {
+    e = h.json ? self.append_json_value!(v) : self.append_text_value!(v)
+    if m = e {
+      self.append_error!(m)
+    }
+  }
+
+  def append_time!(t: time.Time) {
+    if h.json {
+      y = t.year
+      if y < 0 || y >= 10000 {
+        self.append_error!("time.Time year outside of range [0,9999]")
+        return
+      }
+      self.buf += "\"" + t.format("2006-01-02T15:04:05.999999999Z07:00") + "\""
+    } else {
+      self.buf += rfc3339_millis(t)
+    }
+    nil
+  }
+
+  # Go's appendTextValue; the error message, if any.
+  def append_text_value!(v: Value) -> Str? {
+    sc = v.sc
+    case sc.tag {
+      T_STRING => self.append_string!(sc.s)
+      T_TIME => self.append_time!(sc.t)
+      T_NIL => self.append_string!("<nil>")
+      T_LEVEL => self.append_string!(Level.new(n: sc.num).to_s)
+      T_ERROR => self.append_string!(sc.s)
+      T_BYTES => self.buf += strconv.quote(sc.s)
+      T_RAW_JSON => self.buf += strconv.quote(sc.s)
+      T_KIND => self.append_string!(kind_string(sc.num))
+      T_SOURCE => self.append_string!("&{Function:" + v.source.function + " File:" + v.source.file + " Line:" + sc.num.to_s + "}")
+      T_LOGGABLE => {
+        r = sc.x.unwrap.log_text
+        if e = r.err {
+          return e.message
+        }
+        self.append_string!(r.unwrap)
+      }
+      _ => self.buf += v.to_s
+    }
+    none
+  }
+
+  # Go's appendJSONValue; the error message, if any.
+  def append_json_value!(v: Value) -> Str? {
+    sc = v.sc
+    case sc.tag {
+      T_STRING => self.append_string!(sc.s)
+      T_INT => self.buf += sc.num.to_s
+      T_UINT => self.buf += strconv.format_uint(sc.num.as_u64, 10)
+      T_FLOAT => {
+        f = float_of(sc.num)
+        s = json_float(f)
+        return "json: unsupported value: " + strconv.format_float(f, "g", -1, 64) if s == ""
+        self.buf += s
+      }
+      T_BOOL => self.buf += sc.num == 1 ? "true" : "false"
+      T_DURATION => self.buf += sc.num.to_s
+      T_TIME => self.append_time!(sc.t)
+      T_NIL => self.buf += "null"
+      T_LEVEL => self.buf += "\"" + Level.new(n: sc.num).to_s + "\""
+      T_ERROR => self.append_string!(sc.s)
+      T_BYTES => self.buf += "\"" + base64.std_encoding.encode_to_string(sc.s.bytes.to_a) + "\""
+      T_RAW_JSON => {
+        r = json.compact(sc.s)
+        if e = r.err {
+          return "json: error calling MarshalJSON for type json.RawMessage: " + e.message
+        }
+        self.buf += r.unwrap
+      }
+      T_KIND => self.buf += sc.num.to_s
+      T_SOURCE => {
+        src = v.source
+        self.buf += "{\"function\":\"" + escape_json(src.function) + "\",\"file\":\"" + escape_json(src.file) + "\",\"line\":" + src.line.to_s + "}"
+      }
+      T_LOGGABLE => {
+        r = sc.x.unwrap.log_json
+        if e = r.err {
+          return e.message
+        }
+        c = json.compact(r.unwrap)
+        if e = c.err {
+          return "json: error calling MarshalJSON: " + e.message
+        }
+        self.buf += json.html_escape(c.unwrap)
+      }
+      _ => assert false, "bad kind: " + kind_string(v.kind)
+    }
+    none
+  }
+
+  def append_non_builtins!(r: Record) {
+    pfa = h.pre
+    if pfa.size > 0 {
+      self.buf += self.sep + pfa
+      self.sep = h.attr_sep
+      self.sep = "" if h.json && pfa[pfa.size - 1] == 123
+    }
+    n_open = h.n_open
+    if r.num_attrs > 0 {
+      self.prefix += h.group_prefix
+      pos = self.buf.size
+      self.open_groups!
+      n_open = h.groups.size
+      empty = true
+      for a in r.list {
+        empty = false if self.append_attr!(a)
+      }
+      if empty {
+        self.buf = self.buf[0...pos]
+        n_open = h.n_open
+      }
+    }
+    if h.json {
+      i = 0
+      while i < n_open {
+        self.buf += "}"
+        i += 1
+      }
+      self.buf += "}"
+    }
+  }
+}
+
+def new_state(h: Fmt, buf: Str, sep: Str) -> HState {
+  gs: [Str] = []
+  if h.opts.replace_attr != none {
+    i = 0
+    while i < h.n_open {
+      gs << h.groups[i]
+      i += 1
+    }
+  }
+  HState.new(h: h, buf: buf, sep: sep, prefix: "", groups: gs)
+}
+
+# Go's appendRFC3339Millis: RFC 3339 with exactly three fraction digits.
+# Go formats RFC3339Nano after adding 0.1ms to the truncated time, then
+# drops the fourth fraction digit (by position: years beyond 9999 lose
+# another digit, as in Go).
+def rfc3339_millis(t: time.Time) -> Str {
+  s = t.truncate(time.millisecond).add(time.microsecond * 100).format("2006-01-02T15:04:05.999999999Z07:00")
+  s[0...23] + s[24...s.size]
+}
+
+# Go's float64 JSON text (encoding/json); "" for NaN and the infinities.
+def json_float(f: Float) -> Str {
+  return "" if f != f || f > 1.7976931348623157e308 || f < -1.7976931348623157e308
+  a = f < 0.0 ? -f : f
+  fmt = "f"
+  fmt = "e" if a != 0.0 && (a < 1.0e-6 || a >= 1.0e21)
+  s = strconv.format_float(f, fmt, -1, 64)
+  n = s.size
+  if fmt == "e" && n >= 4 && s[n - 4] == 101 && s[n - 3] == 45 && s[n - 2] == 48 {
+    # e-09 -> e-9
+    return s[0...n - 2] + s[n - 1...n]
+  }
+  s
+}
+
+HEX = "0123456789abcdef"
+
+# Bytes 0..127 a string may hold without quoting (text) or escaping (JSON):
+# Go's safeSet. Everything printable except `"` and `\`.
+def safe?(b: Byte) -> Bool {
+  b >= 32 && b != 34 && b != 92
+}
+
+# Go's appendEscapedJSONString, without the quotes.
+def escape_json(s: Str) -> Str {
+  out: [Byte] = []
+  start = 0
+  i = 0
+  n = s.size
+  while i < n {
+    b = s[i]
+    if b < 128 {
+      if safe?(b) {
+        i += 1
+        next
+      }
+      out = put(out, s, start, i)
+      out << 92
+      case b {
+        92 => out << 92
+        34 => out << 34
+        10 => out << 110
+        13 => out << 114
+        9 => out << 116
+        _ => {
+          out << 117
+          out << 48
+          out << 48
+          out << HEX[(b >> 4).to_i]
+          out << HEX[(b & 15).to_i]
+        }
+      }
+      i += 1
+      start = i
+      next
+    }
+    c, size = utf8.decode_rune_at(s, i)
+    if c == 0xFFFD && size == 1 {
+      out = put(out, s, start, i)
+      out = put(out, "\ufffd", 0, 3)
+      i += size
+      start = i
+      next
+    }
+    if c == 0x2028 || c == 0x2029 {
+      out = put(out, s, start, i)
+      out = put(out, "\\u202", 0, 5)
+      out << HEX[(c & 15).to_i]
+      i += size
+      start = i
+      next
+    }
+    i += size
+  }
+  return s if start == 0
+  out = put(out, s, start, n)
+  Str.from_bytes(out)
+}
+
+def put(out: [Byte], s: Str, from: Int, to: Int) -> [Byte] {
+  o = out
+  i = from
+  while i < to {
+    o << s[i]
+    i += 1
+  }
+  o
+}
+
+# Go's needsQuoting (text handler): empty, or holding a space, `=`, `"`, a
+# control character, invalid UTF-8, U+FFFD, a Unicode space or a
+# non-printing rune.
+def needs_quoting(s: Str) -> Bool {
+  return true if s.size == 0
+  i = 0
+  while i < s.size {
+    b = s[i]
+    if b < 128 {
+      return true if b != 92 && (b == 32 || b == 61 || !safe?(b))
+      i += 1
+      next
+    }
+    r, size = utf8.decode_rune_at(s, i)
+    return true if r == 0xFFFD || unicode.is_space(r) || !unicode.is_print(r)
+    i += size
+  }
+  false
+}
+
+# ---------------------------------------------------------- the handlers
+
+# The writer of a handler, under its lock.
+struct Out[W] {
+  w: W
+
+  def emit!(p: [Byte]) -> ~Int { self.w.~write!(p) }
+}
+
+def write_line[W](out: Mutex[Out[W]], line: Str) -> ~Unit {
+  e = out.lock { |o| o.emit!(line.bytes.to_a).err }
+  if x = e {
+    fail x
+  }
+}
+
+# Writes records as `key=value` pairs separated by spaces, one line each
+# (Go's TextHandler). Copies share the writer and its lock.
+pub struct TextHandler[W] {
+  fm: Fmt
+  out: Mutex[Out[W]]
+
+  pub def enabled?(level: Level) -> Bool { fm.enabled?(level) }
+  pub def handle(r: Record) -> ~Unit { ~write_line(out, fm.format(r)) }
+  pub def with_attrs(attrs: [Attr]) -> TextHandler[W] { TextHandler[W].new(fm: fm.with_attrs(attrs), out: out) }
+  pub def with_group(name: Str) -> TextHandler[W] { TextHandler[W].new(fm: fm.with_group(name), out: out) }
+
+  # The writer (a copy, taken under the lock: see the header).
+  pub def writer -> W { out.lock { |o| o.w } }
+}
+
+# Go's NewTextHandler: the handler owns a copy of w (`writer` reads it back).
+pub def new_text_handler[W](w: W, opts: HandlerOptions) -> TextHandler[W] {
+  o = w.dup
+  TextHandler[W].new(fm: Fmt.new(json: false, opts: opts), out: Mutex.new(Out[W].new(w: o)))
+}
+
+# Writes records as JSON objects, one line each (Go's JSONHandler).
+pub struct JSONHandler[W] {
+  fm: Fmt
+  out: Mutex[Out[W]]
+
+  pub def enabled?(level: Level) -> Bool { fm.enabled?(level) }
+  pub def handle(r: Record) -> ~Unit { ~write_line(out, fm.format(r)) }
+  pub def with_attrs(attrs: [Attr]) -> JSONHandler[W] { JSONHandler[W].new(fm: fm.with_attrs(attrs), out: out) }
+  pub def with_group(name: Str) -> JSONHandler[W] { JSONHandler[W].new(fm: fm.with_group(name), out: out) }
+
+  pub def writer -> W { out.lock { |o| o.w } }
+}
+
+pub def new_json_handler[W](w: W, opts: HandlerOptions) -> JSONHandler[W] {
+  o = w.dup
+  JSONHandler[W].new(fm: Fmt.new(json: true, opts: opts), out: Mutex.new(Out[W].new(w: o)))
+}
+
+# Discards everything; enabled? is always false (Go's DiscardHandler).
+pub struct DiscardHandler {
+  pub def enabled?(level: Level) -> Bool { false }
+  pub def handle(r: Record) -> ~Unit { nil }
+  pub def with_attrs(attrs: [Attr]) -> DiscardHandler { self }
+  pub def with_group(name: Str) -> DiscardHandler { self }
+}
+
+pub def discard_handler -> DiscardHandler { DiscardHandler.new }
+
+# The handler of `default`: writes "LEVEL message k=v ..." through a
+# log.Logger, which adds its own header (Go's defaultHandler).
+pub struct DefaultHandler[W] {
+  fm: Fmt
+  out: log.Logger[W]
+  min: LevelVar
+
+  pub def enabled?(level: Level) -> Bool { level >= min.level }
+
+  pub def handle(r: Record) -> ~Unit {
+    st = new_state(fm, r.level.to_s + " " + r.message, " ")
+    st.append_non_builtins!(r)
+    ~out.output(0, st.buf)
+  }
+
+  pub def with_attrs(attrs: [Attr]) -> DefaultHandler[W] { DefaultHandler[W].new(fm: fm.with_attrs(attrs), out: out, min: min) }
+  pub def with_group(name: Str) -> DefaultHandler[W] { DefaultHandler[W].new(fm: fm.with_group(name), out: out, min: min) }
+
+  # The minimum level (Go's SetLogLoggerLevel sets it for the default logger).
+  pub def level_var -> LevelVar { min }
+}
+
+# A handler like the default logger's, writing through `l` (an extension:
+# Go's defaultHandler always writes through log's standard logger).
+pub def new_default_handler[W](l: log.Logger[W]) -> DefaultHandler[W] {
+  DefaultHandler[W].new(fm: Fmt.new(json: false), out: l, min: new_level_var)
+}
+
+# Sends each record to every handler that is enabled for it (Go's
+# MultiHandler). The handlers are LeafHandlers (see LeafHandler).
+pub struct MultiHandler {
+  multi: [LeafHandler]
+
+  pub def enabled?(level: Level) -> Bool {
+    for h in multi {
+      return true if h.enabled?(level)
+    }
+    false
+  }
+
+  # Errors: the one error, or (several) an error whose message is theirs
+  # joined by newlines (Go's errors.Join).
+  pub def handle(r: Record) -> ~Unit {
+    errs: [Error] = []
+    for h in multi {
+      if h.enabled?(r.level) {
+        if e = h.handle(r).err {
+          errs << e
+        }
+      }
+    }
+    return nil if errs.size == 0
+    fail errs[0] if errs.size == 1
+    fail errors.new(errs.map { it.message }.to_a.join("\n"))
+  }
+
+  pub def with_attrs(attrs: [Attr]) -> MultiHandler { MultiHandler.new(multi: multi.map { it.with_attrs(attrs) }) }
+  pub def with_group(name: Str) -> MultiHandler { MultiHandler.new(multi: multi.map { it.with_group(name) }) }
+}
+
+pub def new_multi_handler(handlers: [LeafHandler]) -> MultiHandler {
+  hs: [LeafHandler] = []
+  for h in handlers {
+    hs << h
+  }
+  MultiHandler.new(multi: hs)
+}

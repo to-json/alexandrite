@@ -37,12 +37,14 @@
 #     arithmetic (NormFloat64, ExpFloat64) is reproduced with f32(), which
 #     rounds a Float to the nearest float32 (correct for one + - * of
 #     float32 operands, as Go's float32 operations are).
-#   - The top-level functions draw from the operating system (getentropy(3),
-#     8 bytes per value; perm and shuffle from a ChaCha8 seeded with 32 bytes
-#     of it) instead of Go's per-thread runtime ChaCha8, because alx has no
-#     mutable package globals. They are slower than Go's (a system call per
-#     value) and, like any FFI, aren't available in the browser (wasm refuses
-#     programs that call them; the seeded sources work there).
+#   - The top-level functions share one ChaCha8, seeded from the operating
+#     system (getentropy(3)) on first use and kept in a package-level Mutex
+#     (R11), where Go has a per-thread runtime ChaCha8: both are
+#     unpredictable and unseedable, but calls from many tasks take turns on
+#     the lock. perm and shuffle run a ChaCha8 of their own seeded from the
+#     shared one (so shuffle's swap may call the top-level functions). Like
+#     any FFI, getentropy isn't available in the browser (wasm refuses
+#     programs that call it; the seeded sources work there).
 #   - Go's zero PCG and ChaCha8 are usable; here they come from new_pcg and
 #     new_chacha8 (`PCG.new` has no state). MarshalBinary and AppendBinary
 #     never fail in Go, so they return [Byte]; UnmarshalBinary returns
@@ -289,101 +291,148 @@ def entropy(buf: [Byte]) {
   panic("rand: getentropy failed") if c_getentropy(buf, buf.size) != 0
 }
 
-# A Source reading the operating system's randomness.
-struct OsSource {
-  def uint64! -> U64 {
-    buf: [Byte] = [0; 8]
-    entropy(buf)
-    w: U64 = 0
-    for k in 0...8 { w |= buf[k].as_u64 << (8 * k) }
-    w
+# The top-level functions' Rand: a ChaCha8 seeded from the operating
+# system on first use.
+struct GlobalRand {
+  r: Rand?
+
+  # The Rand (copies share its state).
+  def cur! -> Rand {
+    if r.none? {
+      self.r = Rand.new(src: new_chacha8(os_seed()))
+    }
+    r.unwrap
   }
 }
 
-def os_rand -> Rand { Rand.new(src: OsSource.new) }
+# R11: the shared Rand, behind its lock.
+GLOBAL = Mutex.new(GlobalRand.new(r: none))
 
-# A ChaCha8 Rand seeded from the operating system.
-def seeded_rand -> Rand {
+# 32 bytes from the operating system.
+def os_seed -> [Byte; 32] {
   seed: [Byte; 32] = [0; 32]
   buf: [Byte] = [0; 32]
   entropy(buf)
   for k in 0...32 { seed[k] = buf[k] }
+  seed
+}
+
+# A ChaCha8 Rand of its own, seeded from the shared one.
+def seeded_rand -> Rand {
+  seed: [Byte; 32] = [0; 32]
+  GLOBAL.lock { |g|
+    r = g.cur!()
+    for k in 0...4 {
+      w = r.uint64!
+      for b in 0...8 { seed[8 * k + b] = (w >> (8 * b)).as_u8 }
+    }
+  }
   Rand.new(src: new_chacha8(seed))
 }
 
 pub def int64 -> I64 {
-  r = os_rand()
-  r.int64!
+  GLOBAL.lock { |g|
+    r = g.cur!()
+    r.int64!
+  }
 }
 
 pub def uint32 -> U32 {
-  r = os_rand()
-  r.uint32!
+  GLOBAL.lock { |g|
+    r = g.cur!()
+    r.uint32!
+  }
 }
 
 pub def uint64_n(n: U64) -> U64 {
-  r = os_rand()
-  r.uint64_n!(n)
+  GLOBAL.lock { |g|
+    r = g.cur!()
+    r.uint64_n!(n)
+  }
 }
 
 pub def uint32_n(n: U32) -> U32 {
-  r = os_rand()
-  r.uint32_n!(n)
+  GLOBAL.lock { |g|
+    r = g.cur!()
+    r.uint32_n!(n)
+  }
 }
 
 pub def uint64 -> U64 {
-  r = os_rand()
-  r.uint64!
+  GLOBAL.lock { |g|
+    r = g.cur!()
+    r.uint64!
+  }
 }
 
 pub def int32 -> I32 {
-  r = os_rand()
-  r.int32!
+  GLOBAL.lock { |g|
+    r = g.cur!()
+    r.int32!
+  }
 }
 
 pub def int -> Int {
-  r = os_rand()
-  r.int!
+  GLOBAL.lock { |g|
+    r = g.cur!()
+    r.int!
+  }
 }
 
 pub def uint -> U64 {
-  r = os_rand()
-  r.uint!
+  GLOBAL.lock { |g|
+    r = g.cur!()
+    r.uint!
+  }
 }
 
 pub def int64_n(n: I64) -> I64 {
-  r = os_rand()
-  r.int64_n!(n)
+  GLOBAL.lock { |g|
+    r = g.cur!()
+    r.int64_n!(n)
+  }
 }
 
 pub def int32_n(n: I32) -> I32 {
-  r = os_rand()
-  r.int32_n!(n)
+  GLOBAL.lock { |g|
+    r = g.cur!()
+    r.int32_n!(n)
+  }
 }
 
 pub def int_n(n: Int) -> Int {
-  r = os_rand()
-  r.int_n!(n)
+  GLOBAL.lock { |g|
+    r = g.cur!()
+    r.int_n!(n)
+  }
 }
 
 pub def uint_n(n: U64) -> U64 {
-  r = os_rand()
-  r.uint_n!(n)
+  GLOBAL.lock { |g|
+    r = g.cur!()
+    r.uint_n!(n)
+  }
 }
 
 pub def n[T: like Int](bound: T) -> T {
-  r = os_rand()
-  r.n!(bound)
+  GLOBAL.lock { |g|
+    r = g.cur!()
+    r.n!(bound)
+  }
 }
 
 pub def float64 -> Float {
-  r = os_rand()
-  r.float64!
+  GLOBAL.lock { |g|
+    r = g.cur!()
+    r.float64!
+  }
 }
 
 pub def float32 -> Float {
-  r = os_rand()
-  r.float32!
+  GLOBAL.lock { |g|
+    r = g.cur!()
+    r.float32!
+  }
 }
 
 pub def perm(n: Int) -> [Int] {
@@ -397,11 +446,15 @@ pub def shuffle(n: Int, swap: (Int, Int) -> Unit) {
 }
 
 pub def norm_float64 -> Float {
-  r = os_rand()
-  r.norm_float64!
+  GLOBAL.lock { |g|
+    r = g.cur!()
+    r.norm_float64!
+  }
 }
 
 pub def exp_float64 -> Float {
-  r = os_rand()
-  r.exp_float64!
+  GLOBAL.lock { |g|
+    r = g.cur!()
+    r.exp_float64!
+  }
 }

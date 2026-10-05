@@ -1,0 +1,304 @@
+# Go's value_test.go, attr_test.go, level_test.go and record_test.go.
+
+import "flag"
+import "time"
+
+test "kind string" {
+  assert_eq kind_string(KIND_GROUP), "Group"
+  assert_eq kind_string(99), "<unknown slog.Kind>"
+}
+
+test "value equal" {
+  vals = [
+    Value.new,
+    int64_value(1),
+    int64_value(2),
+    float64_value(3.5),
+    float64_value(3.7),
+    bool_value(true),
+    bool_value(false),
+    time_value(test_time),
+    time_value(time.Time.new),
+    time_value(time.date(2001, 1, 2, 3, 4, 5, 0, time.utc)),
+    time_value(time.date(2300, 1, 1, 0, 0, 0, 0, time.utc)),
+    time_value(time.date(1715, 6, 13, 0, 25, 26, 290448384, time.utc)),
+    any_value(AB.new(a: 1)),
+    any_value(AB.new(a: 2)),
+    group_value([bool("b", true), int("i", 3)]),
+    group_value([bool("b", true), int("i", 4)]),
+    group_value([bool("b", true), int("j", 4)]),
+    duration_value(time.second * 3),
+    duration_value(time.second * 2),
+    string_value("foo"),
+    string_value("fuu"),
+  ]
+  i = 0
+  while i < vals.size {
+    j = 0
+    while j < vals.size {
+      assert_eq vals[i].equal(vals[j]), i == j
+      j += 1
+    }
+    i += 1
+  }
+}
+
+test "value string" {
+  cases: [(Value, Str)] = [
+    (int64_value(-3), "-3"),
+    (uint64_value(1), "1"),
+    (float64_value(0.15), "0.15"),
+    (bool_value(true), "true"),
+    (string_value("foo"), "foo"),
+    (time_value(test_time), "2000-01-02 03:04:05 +0000 UTC"),
+    (duration_value(time.second * 3), "3s"),
+    (group_value([int("a", 1), bool("b", true)]), "[a=1 b=true]"),
+  ]
+  for c in cases {
+    assert_eq c[0].to_s, c[1]
+  }
+}
+
+test "value accessors" {
+  assert_eq int64_value(1).int64, 1
+  assert_eq uint64_value(1).uint64, 1
+  assert_eq float64_value(1.0).float64, 1.0
+  assert bool_value(true).bool
+  assert_eq string_value("foo").to_s, "foo"
+  assert_eq duration_value(time.second).duration, time.second
+  assert_eq time_value(test_time).time, test_time
+  assert_eq int64("key", 1).value.int64, 1
+  assert_eq level_value(level_warn).level.unwrap, level_warn
+  assert_eq error_value("x").error_message.unwrap, "x"
+  assert_eq bytes_value([1, 2]).bytes.unwrap, [1.as_u8, 2]
+  assert int_value(1).level == none
+  assert Value.new.nil?
+}
+
+test "any value" {
+  # Go's AnyValue maps Go types onto kinds; alexandrite names the kind.
+  assert int_value(1).equal(int64_value(1))
+  assert_eq int_value(1).kind, KIND_INT64
+  assert_eq uint64_value(2).kind, KIND_UINT64
+  assert_eq float64_value(1.5).kind, KIND_FLOAT64
+  assert_eq string_value("s").kind, KIND_STRING
+  assert_eq bool_value(true).kind, KIND_BOOL
+  assert_eq time_value(test_time).kind, KIND_TIME
+  assert_eq duration_value(time.hour).kind, KIND_DURATION
+  assert_eq group_value([int("i", 3)]).kind, KIND_GROUP
+  assert_eq valuer_value(Replace.new(s: "x")).kind, KIND_LOG_VALUER
+  for v in [Value.new, level_value(level_debug + 100), kind_value(KIND_BOOL), error_value("e"), bytes_value([]), any_value(AB.new)] {
+    assert_eq v.kind, KIND_ANY
+  }
+}
+
+test "log value" {
+  v = valuer_value(Replace.new(s: "replaced"))
+  assert_eq v.kind, KIND_LOG_VALUER
+  assert_eq v.log_valuer.log_value.to_s, "replaced"
+  assert_eq v.resolve.to_s, "replaced"
+  # A LogValuer that always returns a LogValuer: an error value.
+  r = valuer_value(Forever.new).resolve
+  assert_eq r.kind, KIND_ANY
+  assert r.error_message != none
+  # Go resolves only the top level: a group's members stay LogValuers.
+  g = valuer_value(GroupOfReplace.new).resolve
+  want = [int("a", 1), group("b", [any("c", valuer_value(Replace.new(s: "d")))])]
+  assert attrs_equal(g.group, want)
+}
+
+# A LogValuer whose value is itself (Go's cycle through `replace`).
+struct Forever {
+  n: Int
+
+  def log_value -> Value { valuer_value(Forever.new(n: n + 1)) }
+}
+
+struct GroupOfReplace {
+  def log_value -> Value { group_value([int("a", 1), group("b", [any("c", valuer_value(Replace.new(s: "d")))])]) }
+}
+
+test "value time" {
+  for tm in [time.Time.new, time.unix(0, 1000000000000000), time.date(2300, 1, 1, 0, 0, 0, 0, time.utc)] {
+    got = time_value(tm).time
+    assert got == tm
+    assert_eq got.location.to_s, tm.location.to_s
+  }
+}
+
+test "empty group" {
+  g = group_value([int("a", 1), group("g1", [group("g2", [])]), group("g3", [group("g4", [int("b", 2)])])])
+  want = [int("a", 1), group("g3", [group("g4", [int("b", 2)])])]
+  assert attrs_equal(g.group, want)
+}
+
+test "attr string" {
+  assert_eq int64("key", 1).to_s, "key=1"
+  assert_eq uint64("key", 1).to_s, "key=1"
+  assert_eq float64("key", 1.0).to_s, "key=1"
+  assert_eq bool("key", true).to_s, "key=true"
+  assert_eq string("key", "foo").to_s, "key=foo"
+  assert_eq duration("key", time.Duration.new(0)).to_s, "key=0s"
+}
+
+# ---------------------------------------------------------------- levels
+
+test "level string" {
+  cases: [(Level, Str)] = [
+    (Level.new(n: 0), "INFO"),
+    (level_error, "ERROR"),
+    (level_error + 2, "ERROR+2"),
+    (level_error - 2, "WARN+2"),
+    (level_warn, "WARN"),
+    (level_warn - 1, "INFO+3"),
+    (level_info, "INFO"),
+    (level_info + 1, "INFO+1"),
+    (level_info - 3, "DEBUG+1"),
+    (level_debug, "DEBUG"),
+    (level_debug - 2, "DEBUG-2"),
+  ]
+  for c in cases {
+    assert_eq c[0].to_s, c[1]
+  }
+}
+
+test "level var" {
+  al = new_level_var
+  assert_eq al.level, level_info
+  al.set(level_warn)
+  assert_eq al.level, level_warn
+  al.set(level_info)
+  assert_eq al.level, level_info
+}
+
+test "level marshal json" {
+  want = level_warn - 3
+  data = want.marshal_json
+  assert_eq data, "\"INFO+1\""
+  got = Level.new
+  got.unmarshal_json!(data).unwrap
+  assert_eq got, want
+}
+
+test "level marshal text" {
+  want = level_warn - 3
+  data = want.marshal_text
+  assert_eq data, "INFO+1"
+  got = Level.new
+  got.unmarshal_text!(data).unwrap
+  assert_eq got, want
+}
+
+test "level append text" {
+  buf: [Byte] = [0, 0, 0, 0]
+  data = (level_warn - 3).append_text(buf)
+  assert_eq data, [0.as_u8, 0, 0, 0] + "INFO+1".bytes.to_a
+}
+
+test "level parse" {
+  cases: [(Str, Level)] = [("DEBUG", level_debug), ("INFO", level_info), ("WARN", level_warn), ("ERROR", level_error), ("debug", level_debug), ("iNfo", level_info), ("INFO+87", level_info + 87), ("Error-18", level_error - 18), ("Error-8", level_info)]
+  for c in cases {
+    assert_eq parse_level(c[0]).unwrap, c[1]
+  }
+}
+
+test "level parse error" {
+  cases: [(Str, Str)] = [("", "unknown name"), ("dbg", "unknown name"), ("INFO+", "invalid syntax"), ("INFO-", "invalid syntax"), ("ERROR+23x", "invalid syntax")]
+  for c in cases {
+    e = parse_level(c[0]).err
+    assert e != none
+    assert e.unwrap.message.include?(c[1]), e.unwrap.message
+  }
+}
+
+test "level flag" {
+  fs = flag.new_set("test")
+  lf = level_info
+  fs.var!("level", lf, "set level")
+  fs.parse!(["-level", "WARN+3"]).unwrap
+  assert_eq fs.get_value("level").to_s, (level_warn + 3).to_s
+}
+
+test "level var marshal text" {
+  v = new_level_var
+  v.set(level_warn)
+  data = v.marshal_text
+  v2 = new_level_var
+  v2.unmarshal_text(data).unwrap
+  assert_eq v2.level, level_warn
+}
+
+test "level var append text" {
+  v = new_level_var
+  v.set(level_warn)
+  data = v.append_text([0, 0, 0, 0])
+  v2 = new_level_var
+  v2.unmarshal_text(Str.from_bytes(data[4...data.size])).unwrap
+  assert_eq v2.level, level_warn
+}
+
+test "level var string" {
+  v = new_level_var
+  v.set(level_error)
+  assert_eq v.to_s, "LevelVar(ERROR)"
+}
+
+bench "level string" {
+  for n in [0, 8, 10, 6, 4, 3, 0, 1, -3, -4, -6] {
+    _ = Level.new(n: n).to_s
+  }
+}
+
+# --------------------------------------------------------------- records
+
+test "record attrs" {
+  as = [int("k1", 1), string("k2", "foo"), int("k3", 3), int64("k4", -1), float64("f", 3.1), uint64("u", 999)]
+  r = new_record(time.now, level_info, "", 0)
+  r.add_attrs!(as)
+  assert_eq r.num_attrs, as.size
+  assert attrs_equal(attrs_of(r), as)
+  for stop in [2, 6] {
+    got: [Attr] = []
+    r.attrs { |a|
+      got << a
+      got.size < stop
+    }
+    assert attrs_equal(got, as[0...stop])
+  }
+}
+
+test "record source" {
+  # No caller locations: a Record never has a Source.
+  for pc in [0, -16, 1, 2] {
+    assert new_record(time.Time.new, Level.new, "", pc).source == none
+  }
+}
+
+test "aliasing and clone" {
+  ints = ->(from: Int, to: Int) -> [Attr] { (from...to).map { int("k", it) }.to_a }
+  r1 = new_record(time.Time.new, Level.new, "", 0)
+  r1.add_attrs!(ints.call(0, 6))
+  r2 = r1
+  before = attrs_of(r1)
+  r1.add_attrs!([int("p", 0)])
+  r2.add_attrs!([int("p", 1)])
+  # Copies are independent (Go needs Clone, and reports a !BUG otherwise).
+  assert attrs_equal(attrs_of(r1), before + [int("p", 0)])
+  assert attrs_equal(attrs_of(r2), before + [int("p", 1)])
+  r1_attrs = attrs_of(r1)
+  r2 = r1.clone
+  assert attrs_equal(attrs_of(r2), r1_attrs)
+  r2.add_attrs!([int("p", 2)])
+  assert attrs_equal(attrs_of(r1), r1_attrs)
+  assert attrs_equal(attrs_of(r2), r1_attrs + [int("p", 2)])
+}
+
+bench "record" {
+  r = new_record(time.Time.new, level_info, "", 0)
+  j = 0
+  while j < 50 {
+    r.add_attrs!([int("k", j)])
+    j += 1
+  }
+  r.attrs { |a| true }
+}

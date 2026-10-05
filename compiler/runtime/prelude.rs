@@ -51,13 +51,16 @@ mod rt {
     }
 
     thread_local! {
-        /// True on threads started by `task_spawn`.
+        /// True on threads started by `task_spawn` and inside `pmap` elements.
         static IN_TASK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        /// The locks this thread holds, oldest first (lock blocks nest).
+        static HELD: std::cell::RefCell<Vec<AlxLock>> = const { std::cell::RefCell::new(Vec::new()) };
     }
     /// A runtime failure. On the main thread: flush stdout, print `text` to
-    /// stderr and abort. On a task thread: print nothing and unwind with
-    /// `text` as the payload; `task_spawn` catches it and `Task::wait`
-    /// reports it as `Err(text)`.
+    /// stderr and abort. On a task thread (or in a pmap element): print
+    /// nothing and unwind with `text` as the payload; `task_spawn` catches
+    /// it and `Task::wait` reports it as `Err(text)` (pmap raises it again
+    /// in its caller).
     pub fn fail(text: String) -> ! {
         if IN_TASK.with(|t| t.get()) {
             std::panic::resume_unwind(Box::new(text))
@@ -759,6 +762,18 @@ mod rt {
     pub unsafe fn shim_alx_sock_accept(fd: i64, out: *mut u8) -> i64 {
         use std::os::fd::{FromRawFd, IntoRawFd};
         if fd < 0 { return -(sysc("EBADF") as i64); }
+        let ul = std::mem::ManuallyDrop::new(unsafe { std::os::unix::net::UnixListener::from_raw_fd(fd as i32) });
+        if ul.local_addr().is_ok() {
+            // A Unix stream listener: the peer has no address.
+            return match ul.accept() {
+                Ok((s, _)) => {
+                    let _ = s.set_nonblocking(true);
+                    put_str("", out);
+                    s.into_raw_fd() as i64
+                }
+                Err(e) => net_err(&e),
+            };
+        }
         let l = std::mem::ManuallyDrop::new(unsafe { std::net::TcpListener::from_raw_fd(fd as i32) });
         match l.accept() {
             Ok((s, a)) => {
@@ -803,15 +818,88 @@ mod rt {
         if fd < 0 { return -(sysc("EBADF") as i64); }
         with_stream(fd, |s| match s.local_addr() {
             Ok(a) => put_addr(a, out),
-            Err(e) => net_err(&e),
+            Err(e) => unix_addr(fd, false, out).unwrap_or_else(|| net_err(&e)),
         })
     }
     pub unsafe fn shim_alx_sock_peer_addr(fd: i64, out: *mut u8) -> i64 {
         if fd < 0 { return -(sysc("EBADF") as i64); }
         with_stream(fd, |s| match s.peer_addr() {
             Ok(a) => put_addr(a, out),
-            Err(e) => net_err(&e),
+            Err(e) => unix_addr(fd, true, out).unwrap_or_else(|| net_err(&e)),
         })
+    }
+    /// A Unix socket's own (or peer's) path, as the C runtime writes it; None
+    /// if fd isn't a Unix socket.
+    fn unix_addr(fd: i64, peer: bool, out: *mut u8) -> Option<i64> {
+        use std::os::fd::FromRawFd;
+        let s = std::mem::ManuallyDrop::new(unsafe { std::os::unix::net::UnixDatagram::from_raw_fd(fd as i32) });
+        let a = if peer { s.peer_addr() } else { s.local_addr() }.ok()?;
+        Some(put_str(&a.as_pathname().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default(), out))
+    }
+    fn put_str(s: &str, out: *mut u8) -> i64 {
+        let n = s.len().min(63);
+        unsafe {
+            std::ptr::copy_nonoverlapping(s.as_ptr(), out, n);
+            *out.add(n) = 0;
+        }
+        n as i64
+    }
+    // UDP and Unix-domain sockets (alx_sock_open / alx_sock_recvfrom in alx.c).
+    pub unsafe fn shim_alx_sock_open(kind: i64, host: *const std::ffi::c_char, port: i64, listen: i64, _backlog: i64) -> i64 {
+        use std::os::fd::IntoRawFd;
+        use std::os::unix::net::{UnixDatagram, UnixListener, UnixStream};
+        let h = host_str(host);
+        let fd = match (kind, listen != 0) {
+            (2, false) => UnixStream::connect(&h).map(|s| s.into_raw_fd()),
+            (2, true) => UnixListener::bind(&h).map(|s| s.into_raw_fd()),
+            (3, false) => UnixDatagram::unbound().and_then(|s| s.connect(&h).map(|_| s.into_raw_fd())),
+            (3, true) => UnixDatagram::bind(&h).map(|s| s.into_raw_fd()),
+            (_, l) => {
+                use std::net::ToSocketAddrs;
+                let hh = if !h.is_empty() { h.clone() } else if l { "0.0.0.0".into() } else { "127.0.0.1".into() };
+                let addrs: Vec<_> = match (hh.as_str(), port as u16).to_socket_addrs() {
+                    Ok(a) => a.collect(),
+                    Err(_) => return -100000,
+                };
+                let Some(a) = addrs.iter().find(|a| a.is_ipv4()).or(addrs.first()).copied() else { return -100000 };
+                if l {
+                    std::net::UdpSocket::bind(a).map(|s| s.into_raw_fd())
+                } else {
+                    let any: std::net::SocketAddr = if a.is_ipv4() { "0.0.0.0:0".parse().unwrap() } else { "[::]:0".parse().unwrap() };
+                    std::net::UdpSocket::bind(any).and_then(|s| s.connect(a).map(|_| s.into_raw_fd()))
+                }
+            }
+        };
+        match fd {
+            Ok(fd) => {
+                let fl = unsafe { libc_fcntl(fd, 3) }; // F_GETFL
+                unsafe { libc_fcntl(fd, 4, fl | sysc("O_NONBLOCK")) }; // F_SETFL
+                fd as i64
+            }
+            Err(e) => net_err(&e),
+        }
+    }
+    pub unsafe fn shim_alx_sock_recvfrom(fd: i64, buf: *mut u8, n: i64, out: *mut u8) -> i64 {
+        use std::os::fd::FromRawFd;
+        let b = unsafe { std::slice::from_raw_parts_mut(buf, n as usize) };
+        let u = std::mem::ManuallyDrop::new(unsafe { std::net::UdpSocket::from_raw_fd(fd as i32) });
+        if u.local_addr().is_ok() {
+            return match u.recv_from(b) {
+                Ok((k, a)) => {
+                    put_addr(a, out);
+                    k as i64
+                }
+                Err(e) => net_err(&e),
+            };
+        }
+        let d = std::mem::ManuallyDrop::new(unsafe { std::os::unix::net::UnixDatagram::from_raw_fd(fd as i32) });
+        match d.recv_from(b) {
+            Ok((k, a)) => {
+                put_str(&a.as_pathname().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default(), out);
+                k as i64
+            }
+            Err(e) => net_err(&e),
+        }
     }
     pub unsafe fn shim_alx_sock_set_nodelay(fd: i64, on: i64) -> i64 {
         if fd < 0 { return -(sysc("EBADF") as i64); }
@@ -1437,19 +1525,40 @@ mod rt {
     pub fn pmap<T: Clone + Sync, R: Clone + Send + Default>(xs: &Sl<T>, f: fn(T) -> R) -> Sl<R> {
         Sl::from(pmap_v(&xs.to_vec(), f))
     }
+    /// A panic in an element stops the job (its locks are released and
+    /// poisoned); the caller raises the first one again once all threads
+    /// are done, so it ends the calling task (or aborts on main).
     fn pmap_v<T: Clone + Sync, R: Clone + Send + Default>(xs: &[T], f: fn(T) -> R) -> Vec<R> {
+        install_hook();
         let mut out = vec![R::default(); xs.len()];
         let workers = std::thread::available_parallelism().map_or(4, |n| n.get());
         let chunk = xs.len().div_ceil(workers).max(1);
+        let stop = std::sync::atomic::AtomicBool::new(false);
+        let first: Mutex<Option<String>> = Mutex::new(None);
         std::thread::scope(|s| {
             for (src, dst) in xs.chunks(chunk).zip(out.chunks_mut(chunk)) {
+                let (stop, first) = (&stop, &first);
                 s.spawn(move || {
-                    for (x, o) in src.iter().zip(dst) {
-                        *o = f(x.clone());
+                    IN_TASK.with(|t| t.set(true));
+                    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        for (x, o) in src.iter().zip(dst) {
+                            if stop.load(std::sync::atomic::Ordering::Relaxed) {
+                                break;
+                            }
+                            *o = f(x.clone());
+                        }
+                    }));
+                    if let Err(p) = r {
+                        poison_held(0);
+                        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+                        lk(first).get_or_insert(panic_text(p));
                     }
                 });
             }
         });
+        if let Some(text) = first.into_inner().unwrap_or_else(|e| e.into_inner()) {
+            fail(text)
+        }
         out
     }
 
@@ -1462,25 +1571,62 @@ mod rt {
         m.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    /// A lock's state: (held, poisoned).
+    type LockSt = (bool, bool);
     /// A lock handle (alexandrite's `Mutex[T]` keeps its value beside it).
+    /// A thread that panics holding it releases it and poisons it
+    /// (`poison_held`); taking a poisoned lock panics until `clear_poison`.
     #[derive(Clone)]
-    pub struct AlxLock(Arc<(Mutex<bool>, Condvar)>);
+    pub struct AlxLock(Arc<(Mutex<LockSt>, Condvar)>);
     impl Default for AlxLock {
         fn default() -> Self {
-            AlxLock(Arc::new((Mutex::new(false), Condvar::new())))
+            AlxLock(Arc::new((Mutex::new((false, false)), Condvar::new())))
         }
     }
     impl AlxLock {
-        pub fn lock(&self) {
-            let mut held = lk(&self.0.0);
-            while *held {
-                held = self.0.1.wait(held).unwrap_or_else(|e| e.into_inner());
+        pub fn lock(&self, loc: &str) {
+            {
+                let mut st = lk(&self.0.0);
+                while st.0 {
+                    st = self.0.1.wait(st).unwrap_or_else(|e| e.into_inner());
+                }
+                if !st.1 {
+                    st.0 = true;
+                    drop(st);
+                    HELD.with(|h| h.borrow_mut().push(self.clone()));
+                    return;
+                }
             }
-            *held = true;
+            panic("Mutex poisoned: a task panicked while holding it", loc)
         }
         pub fn unlock(&self) {
-            *lk(&self.0.0) = false;
-            self.0.1.notify_one();
+            HELD.with(|h| {
+                let mut h = h.borrow_mut();
+                if let Some(i) = h.iter().rposition(|l| Arc::ptr_eq(&l.0, &self.0)) {
+                    h.remove(i);
+                }
+            });
+            lk(&self.0.0).0 = false;
+            self.0.1.notify_all();
+        }
+        pub fn poisoned(&self) -> bool {
+            lk(&self.0.0).1
+        }
+        pub fn clear_poison(&self) {
+            lk(&self.0.0).1 = false;
+        }
+    }
+    /// After a panic: release and poison the locks this thread took after
+    /// the first `mark` it held, newest first.
+    fn poison_held(mark: usize) {
+        let ls: Vec<AlxLock> = HELD.with(|h| {
+            let mut h = h.borrow_mut();
+            let m = mark.min(h.len());
+            h.split_off(m)
+        });
+        for l in ls.iter().rev() {
+            *lk(&l.0.0) = (false, true);
+            l.0.1.notify_all();
         }
     }
     /// An atomic cell handle.
@@ -1554,7 +1700,7 @@ mod rt {
     /// Run `f(env)` on a new thread. Alexandrite panics in the task unwind
     /// quietly (see `fail`) and become the task's `Err`; Rust's own panic
     /// message is suppressed on task threads by a hook installed once.
-    pub fn task_spawn<E: Send + 'static, T: Send + 'static>(f: fn(E) -> T, env: E) -> Task<T> {
+    fn install_hook() {
         static HOOK: std::sync::Once = std::sync::Once::new();
         HOOK.call_once(|| {
             let prev = std::panic::take_hook();
@@ -1564,11 +1710,19 @@ mod rt {
                 }
             }));
         });
+    }
+
+    /// A task that panics releases and poisons the locks it holds.
+    pub fn task_spawn<E: Send + 'static, T: Send + 'static>(f: fn(E) -> T, env: E) -> Task<T> {
+        install_hook();
         let inner = Arc::new(TaskInner { res: Mutex::new(None), cv: Condvar::new() });
         let me = inner.clone();
         std::thread::spawn(move || {
             IN_TASK.with(|t| t.set(true));
             let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(env)));
+            if r.is_err() {
+                poison_held(0);
+            }
             let r = r.map_err(|p| Str::lit(panic_text(p).as_bytes()));
             *lk(&me.res) = Some(r);
             me.cv.notify_all();
@@ -1598,6 +1752,12 @@ mod rt {
         }
     }
     /// The zero value: a closed, unbuffered channel (send panics, recv gives ok = false).
+    // A channel's identity (`==`): the same channel, as in Go.
+    impl<T> PartialEq for Chan<T> {
+        fn eq(&self, o: &Self) -> bool {
+            Arc::ptr_eq(&self.0, &o.0)
+        }
+    }
     impl<T> Default for Chan<T> {
         fn default() -> Self {
             let c = Chan::new(0);

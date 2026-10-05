@@ -21,7 +21,12 @@
 #    "::" any IPv6 (dual-stack).
 #  - Networks: "tcp", "tcp4", "tcp6" (all the same here: the runtime prefers
 #    IPv4 when a name has several addresses and doesn't fall back to the next
-#    one). No UDP, no Unix sockets, no read/write deadlines yet.
+#    one); "udp" (udp4, udp6): `dial` (a connected socket, a Conn whose
+#    write! sends one datagram and read! receives one) and `listen_packet`;
+#    "unix" (stream; the address is a path): `dial` and `listen` (closing the
+#    listener removes its socket file, as Go's); "unixgram": `dial` and
+#    `listen_packet`. A PacketConn has read_from! (no write_to yet). No
+#    read/write deadlines yet.
 #  - `lookup_host` and the name resolution inside `dial` / `listen` (a name
 #    that isn't an IP address) call getaddrinfo, which BLOCKS the worker
 #    thread; numeric addresses don't wait.
@@ -46,6 +51,9 @@ extern def alx_sock_set_nodelay(fd: Int, on: Int) -> Int
 extern def alx_sock_shutdown(fd: Int, how: Int) -> Int
 extern def alx_sock_lookup(host: Str, out: [Byte], n: Int) -> Int
 extern def alx_sleep_ns(ns: Int)
+extern def alx_sock_open(kind: Int, host: Str, port: Int, listen: Int, backlog: Int) -> Int
+extern def alx_sock_recvfrom(fd: Int, buf: [Byte], n: Int, out: [Byte]) -> Int
+extern def c_unlink(p: Str) -> I32 = "unlink"
 
 # getaddrinfo's "host not found", as the runtime reports it (not an errno).
 NO_HOST = 100000
@@ -62,6 +70,8 @@ pub struct NetFailure {
   addr: Str
   syscall: Str
   code: Int
+  # The network of a dial / listen ("" is "tcp").
+  network: Str
 }
 
 pub error NetError {
@@ -120,7 +130,8 @@ pub def errno_message(code: Int) -> Str {
 }
 
 def describe(f: NetFailure, kind: Int) -> Str {
-  net = f.op == "dial" || f.op == "listen" ? " tcp" : ""
+  nw = f.network.size == 0 ? "tcp" : f.network
+  net = f.op == "dial" || f.op == "listen" ? " " + nw : ""
   where = f.addr.size == 0 ? "" : " " + f.addr
   head = "#{f.op}#{net}#{where}"
   return "#{head}: i/o timeout" if kind == 1
@@ -212,6 +223,52 @@ def parse_port(addr: Str, port: Str) -> ~Int {
 def check_network(op: Str, network: Str, addr: Str) -> ~Unit {
   ok = network == "tcp" || network == "tcp4" || network == "tcp6"
   fail NetError.Other(NetFailure.new(op: op, addr: addr, syscall: "unknown network #{network}", code: 0)) unless ok
+}
+
+# The runtime's socket kind for a network (alx_sock_open): 0 tcp, 1 udp,
+# 2 unix, 3 unixgram; -1 unknown.
+def sock_kind(network: Str) -> Int {
+  return 0 if network == "tcp" || network == "tcp4" || network == "tcp6"
+  return 1 if network == "udp" || network == "udp4" || network == "udp6"
+  return 2 if network == "unix"
+  return 3 if network == "unixgram"
+  -1
+}
+
+def unknown_network(op: Str, network: Str, addr: Str) -> NetError {
+  NetError.Other(NetFailure.new(op: op, addr: addr, syscall: "unknown network #{network}", code: 0, network: network))
+}
+
+# A NetError for a dial / listen on a network other than tcp.
+def op_error(op: Str, network: Str, addr: Str, syscall: Str, code: Int) -> NetError {
+  at = NetFailure.new(op: op, addr: addr, syscall: syscall, code: code, network: network)
+  return NetError.ConnRefused(at) if code == c("ECONNREFUSED")
+  return NetError.AddrInUse(at) if code == c("EADDRINUSE")
+  return NetError.Closed(at) if code == c("EBADF")
+  return NetError.Timeout(at) if code == c("ETIMEDOUT")
+  NetError.Other(at)
+}
+
+# Opens a UDP or Unix socket (kind as sock_kind) for dial (bind false) or
+# listen / listen_packet: the descriptor.
+def open_sock(op: Str, network: Str, kind: Int, addr: Str, bind: Bool) -> ~Int {
+  host = addr
+  port = 0
+  if kind == 1 {
+    h, portstr = ~split_host_port(addr)
+    host = h
+    port = ~parse_port(addr, portstr)
+  }
+  fd = alx_sock_open(kind, host, port, bind ? 1 : 0, 1024)
+  fail op_error(op, network, addr, bind ? "bind" : "connect", -fd) if fd < 0
+  if kind == 2 && !bind {
+    e = finish_connect(fd)
+    if e != 0 {
+      alx_fd_close(fd)
+      fail op_error(op, network, addr, "connect", e)
+    }
+  }
+  fd
 }
 
 def zeros(n: Int) -> [Byte] {
@@ -351,9 +408,16 @@ def finish_connect(fd: Int) -> Int {
   }
 }
 
-# Connects to addr ("host:port") over "tcp".
+# Connects to addr: "host:port" over "tcp" or "udp", a path over "unix" or
+# "unixgram".
 pub def dial(network: Str, addr: Str) -> ~Conn {
-  ~check_network("dial", network, addr)
+  kind = sock_kind(network)
+  fail unknown_network("dial", network, addr) if kind < 0
+  if kind > 0 {
+    fd = ~open_sock("dial", network, kind, addr, false)
+    b = zeros(64)
+    return new_conn(fd, addr_of(b, alx_sock_local_addr(fd, b)), addr)
+  }
   host, portstr = ~split_host_port(addr)
   port = ~parse_port(addr, portstr)
   fd = alx_sock_connect(host, port)
@@ -397,13 +461,16 @@ pub def dial_timeout(network: Str, addr: Str, d_ns: Int) -> ~Conn {
 
 # ------------------------------------------------------------------ Listener
 
-# A TCP listening socket. The descriptor lives in shared state (D36).
+# A TCP (or Unix stream) listening socket. The descriptor lives in shared
+# state (D36).
 pub struct Listener {
   # The descriptor, -1 once closed. Atomic: copies share it, and tasks may
   # share a connection (one reads while another closes).
   fdv: Atomic[Int]
-  # The bound address, "ip:port" (the real port after ":0").
+  # The bound address, "ip:port" (the real port after ":0"), or the path.
   addr: Str
+  # A Unix socket file to remove on close (Go's UnixListener does).
+  unlink_path: Str
 
   pub def fd -> Int { fdv.load }
 
@@ -442,19 +509,79 @@ pub struct Listener {
   pub def close! -> ~Unit {
     f = fdv.swap(-1)
     fail closed_error("close", addr) if f < 0
+    c_unlink(unlink_path) if unlink_path.size > 0
     r = alx_fd_close(f)
     fail net_error("close", addr, "close", -r) if r < 0
   }
 }
 
-# Listens on addr ("host:port"; ":0" picks a free port) over "tcp".
+# Listens on addr ("host:port"; ":0" picks a free port) over "tcp", or on
+# the path addr over "unix".
 pub def listen(network: Str, addr: Str) -> ~Listener {
-  ~check_network("listen", network, addr)
+  if network == "unix" {
+    fd = ~open_sock("listen", network, 2, addr, true)
+    return Listener.new(fdv: Atomic.new(fd), addr: addr, unlink_path: addr)
+  }
+  fail unknown_network("listen", network, addr) if sock_kind(network) != 0
   host, portstr = ~split_host_port(addr)
   port = ~parse_port(addr, portstr)
   fd = alx_sock_listen(host, port, 1024)
   fail net_error("listen", addr, "bind", -fd) if fd < 0
   buf = zeros(64)
   bound = addr_of(buf, alx_sock_local_addr(fd, buf))
-  Listener.new(fdv: Atomic.new(fd), addr: bound)
+  Listener.new(fdv: Atomic.new(fd), addr: bound, unlink_path: "")
+}
+
+# ---------------------------------------------------------------- PacketConn
+
+# A datagram socket bound to an address ("udp" or "unixgram"), from
+# listen_packet. The descriptor lives in shared state (D36).
+pub struct PacketConn {
+  fdv: Atomic[Int]
+  local: Str
+
+  pub def fd -> Int { fdv.load }
+
+  # The bound address: "ip:port" (the real port after ":0"), or the path.
+  pub def local_addr -> Str { local }
+
+  # Waits for a datagram and reads it into p (the rest of a longer one is
+  # lost, as in Go): its length and the sender's address ("" for an unbound
+  # unixgram sender).
+  pub def read_from!(p: [Byte]) -> ~(Int, Str) {
+    from = zeros(64)
+    loop {
+      f = fd
+      fail closed_error("read", local) if f < 0
+      n = alx_sock_recvfrom(f, p, p.size, from)
+      return (n, cstr_of(from)) if n >= 0
+      code = -n
+      if code == c("EAGAIN") {
+        w = alx_fd_wait(f, 1)
+        fail net_error("read", local, "recvfrom", -w) if w < 0
+      } else {
+        fail net_error("read", local, "recvfrom", code) if code != c("EINTR")
+      }
+    }
+  }
+
+  # Closes the socket (every copy) and wakes tasks waiting in read_from!.
+  pub def close! -> ~Unit {
+    f = fdv.swap(-1)
+    fail closed_error("close", local) if f < 0
+    r = alx_fd_close(f)
+    fail net_error("close", local, "close", -r) if r < 0
+  }
+}
+
+# A datagram socket bound to addr: "host:port" over "udp" (":0" picks a
+# port), a path over "unixgram". Go's ListenPacket.
+pub def listen_packet(network: Str, addr: Str) -> ~PacketConn {
+  kind = sock_kind(network)
+  fail unknown_network("listen", network, addr) if kind != 1 && kind != 3
+  fd = ~open_sock("listen", network, kind, addr, true)
+  b = zeros(64)
+  local = addr_of(b, alx_sock_local_addr(fd, b))
+  local = addr if kind == 3
+  PacketConn.new(fdv: Atomic.new(fd), local: local)
 }

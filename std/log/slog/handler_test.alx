@@ -1,0 +1,346 @@
+# Go's handler_test.go.
+
+import "log"
+import "strings"
+import "time"
+
+# The output of a default handler (writing through a log.Logger without a
+# header) for one record.
+def default_out(ops: [Op], attrs: [Attr]) -> Str {
+  buf = new_buf
+  h = new_default_handler(log.new(buf, "", 0))
+  for o in ops {
+    h = o.is_group ? h.with_group(o.group) : h.with_attrs(o.attrs)
+  }
+  r = new_record(time.Time.new, level_info, "message", 0)
+  r.add_attrs!(attrs)
+  h.handle(r).unwrap
+  strings.trim_suffix(buf.string, "\n")
+}
+
+test "default handle" {
+  pre = [int("pre", 0)]
+  attrs = [int("a", 1), string("b", "two")]
+  assert_eq default_out([], []), "INFO message"
+  assert_eq default_out([], attrs), "INFO message a=1 b=two"
+  assert_eq default_out([wa(pre)], attrs), "INFO message pre=0 a=1 b=two"
+  assert_eq default_out([], [int("a", 1), group("g", [int("b", 2), group("h", [int("c", 3)]), int("d", 4)]), int("e", 5)]), "INFO message a=1 g.b=2 g.h.c=3 g.d=4 e=5"
+  assert_eq default_out([wa(pre), wg("s")], attrs), "INFO message pre=0 s.a=1 s.b=two"
+  assert_eq default_out([wa([int("p1", 1)]), wg("s1"), wa([int("p2", 2)]), wg("s2")], attrs), "INFO message p1=1 s1.p2=2 s1.s2.a=1 s1.s2.b=two"
+  assert_eq default_out([wa([int("p1", 1)]), wg("s1"), wg("s2")], attrs), "INFO message p1=1 s1.s2.a=1 s1.s2.b=two"
+}
+
+def write_both[H](sub1: H, sub2: H, i: Int) -> ~Unit {
+  r1 = new_record(time.Time.new, level_info, "hello from sub1", 0)
+  r1.add_attrs!([int("i", i)])
+  r2 = new_record(time.Time.new, level_info, "hello from sub2", 0)
+  r2.add_attrs!([int("i", i)])
+  ~sub1.handle(r1)
+  ~sub2.handle(r2)
+}
+
+test "concurrent writes" {
+  count = 1000
+  tb = new_buf
+  th = new_text_handler(tb, HandlerOptions.new)
+  t1 = th.with_attrs([bool("sub1", true)])
+  t2 = th.with_attrs([bool("sub2", true)])
+  jb = new_buf
+  jh = new_json_handler(jb, HandlerOptions.new)
+  j1 = jh.with_attrs([bool("sub1", true)])
+  j2 = jh.with_attrs([bool("sub2", true)])
+  tasks = (0...count).map { |i|
+    a1 = t1.dup
+    a2 = t2.dup
+    b1 = j1.dup
+    b2 = j2.dup
+    spawn {
+      ~write_both(a1, a2, i)
+      ~write_both(b1, b2, i)
+    }
+  }.to_a
+  for t in tasks {
+    t.wait.unwrap
+  }
+  for s in [tb.string, jb.string] {
+    assert_eq strings.count(s, "hello from sub1"), count
+    assert_eq strings.count(s, "hello from sub2"), count
+  }
+}
+
+def remove_all(gs: [Str], a: Attr) -> Attr { Attr.new }
+
+# Go's TestJSONAndTextHandlers: the record of every case, run through both
+# handlers.
+def both(rep: (([Str], Attr) -> Attr)?, add_source: Bool, ops: [Op], attrs: [Attr]) -> (Str, Str) {
+  opts = HandlerOptions.new(replace_attr: rep, add_source: add_source)
+  r = new_record(test_time, level_info, "message", 0)
+  r.add_attrs!(attrs)
+  tb = new_buf
+  th = new_text_handler(tb, opts)
+  jb = new_buf
+  jh = new_json_handler(jb, opts)
+  for o in ops {
+    th = o.is_group ? th.with_group(o.group) : th.with_attrs(o.attrs)
+    jh = o.is_group ? jh.with_group(o.group) : jh.with_attrs(o.attrs)
+  }
+  th.handle(r).unwrap
+  jh.handle(r).unwrap
+  return strings.trim_suffix(tb.string, "\n"), strings.trim_suffix(jb.string, "\n")
+}
+
+def no_rep -> (([Str], Attr) -> Attr)? { none }
+def rk(keys: [Str]) -> (([Str], Attr) -> Attr)? { remove_keys(keys) }
+def upper -> (([Str], Attr) -> Attr)? { ->(gs: [Str], a: Attr) -> Attr { upper_case_key(gs, a) } }
+def drop_all -> (([Str], Attr) -> Attr)? { ->(gs: [Str], a: Attr) -> Attr { remove_all(gs, a) } }
+
+test "json and text handlers" {
+  attrs = [string("a", "one"), int("b", 2), any("", nil_value)]
+  pre = [int("pre", 3), string("x", "y")]
+  tl = "2000-01-02T03:04:05.000Z"
+  jt = "2000-01-02T03:04:05Z"
+
+  t, j = both(no_rep, false, [], attrs)
+  assert_eq t, "time=#{tl} level=INFO msg=message a=one b=2"
+  assert_eq j, "{\"time\":\"#{jt}\",\"level\":\"INFO\",\"msg\":\"message\",\"a\":\"one\",\"b\":2}"
+
+  t, j = both(no_rep, false, [], attrs + [any("", string_value("v"))])
+  assert_eq t, "time=#{tl} level=INFO msg=message a=one b=2 \"\"=v"
+  assert_eq j, "{\"time\":\"#{jt}\",\"level\":\"INFO\",\"msg\":\"message\",\"a\":\"one\",\"b\":2,\"\":\"v\"}"
+
+  t, j = both(upper, false, [], attrs)
+  assert_eq t, "TIME=#{tl} LEVEL=INFO MSG=message A=one B=2"
+  assert_eq j, "{\"TIME\":\"#{jt}\",\"LEVEL\":\"INFO\",\"MSG\":\"message\",\"A\":\"one\",\"B\":2}"
+
+  t, j = both(drop_all, false, [], attrs)
+  assert_eq t, ""
+  assert_eq j, "{}"
+
+  t, j = both(no_rep, false, [wa(pre)], attrs)
+  assert_eq t, "time=#{tl} level=INFO msg=message pre=3 x=y a=one b=2"
+  assert_eq j, "{\"time\":\"#{jt}\",\"level\":\"INFO\",\"msg\":\"message\",\"pre\":3,\"x\":\"y\",\"a\":\"one\",\"b\":2}"
+
+  t, j = both(upper, false, [wa(pre)], attrs)
+  assert_eq t, "TIME=#{tl} LEVEL=INFO MSG=message PRE=3 X=y A=one B=2"
+  assert_eq j, "{\"TIME\":\"#{jt}\",\"LEVEL\":\"INFO\",\"MSG\":\"message\",\"PRE\":3,\"X\":\"y\",\"A\":\"one\",\"B\":2}"
+
+  t, j = both(drop_all, false, [wa(pre)], attrs)
+  assert_eq t, ""
+  assert_eq j, "{}"
+
+  t, j = both(rk([TIME_KEY, LEVEL_KEY, MESSAGE_KEY]), false, [], attrs)
+  assert_eq t, "a=one b=2"
+  assert_eq j, "{\"a\":\"one\",\"b\":2}"
+
+  t, j = both(rk([TIME_KEY, LEVEL_KEY, MESSAGE_KEY]), false, [wa(pre)], attrs)
+  assert_eq t, "pre=3 x=y a=one b=2"
+  assert_eq j, "{\"pre\":3,\"x\":\"y\",\"a\":\"one\",\"b\":2}"
+
+  tl2 = rk([TIME_KEY, LEVEL_KEY])
+  t, j = both(tl2, false, [], [int("a", 1), group("g", [int("b", 2), group("h", [int("c", 3)]), int("d", 4)]), int("e", 5)])
+  assert_eq t, "msg=message a=1 g.b=2 g.h.c=3 g.d=4 e=5"
+  assert_eq j, "{\"msg\":\"message\",\"a\":1,\"g\":{\"b\":2,\"h\":{\"c\":3},\"d\":4},\"e\":5}"
+
+  t, j = both(tl2, false, [], [group("g", []), group("h", [int("a", 1)])])
+  assert_eq t, "msg=message h.a=1"
+  assert_eq j, "{\"msg\":\"message\",\"h\":{\"a\":1}}"
+
+  t, j = both(tl2, false, [], [group("g", [group("h", [group("i", []), group("j", [])])])])
+  assert_eq t, "msg=message"
+  assert_eq j, "{\"msg\":\"message\"}"
+
+  t, j = both(tl2, false, [], [group("g", [group("h", [group("i", []), group("j", [int("a", 1)])])])])
+  assert_eq t, "msg=message g.h.j.a=1"
+  assert_eq j, "{\"msg\":\"message\",\"g\":{\"h\":{\"j\":{\"a\":1}}}}"
+
+  t, j = both(tl2, false, [], [string("a b", "x\t\n\x00y"), group(" b.c=\"\\x2E\t", [string("d=e", "f.g\""), int("m.d", 1)])])
+  assert_eq t, "msg=message \"a b\"=\"x\\t\\n\\x00y\" \" b.c=\\\"\\\\x2E\\t.d=e\"=\"f.g\\\"\" \" b.c=\\\"\\\\x2E\\t.m.d\"=1"
+  assert_eq j, "{\"msg\":\"message\",\"a b\":\"x\\t\\n\\u0000y\",\" b.c=\\\"\\\\x2E\\t\":{\"d=e\":\"f.g\\\"\",\"m.d\":1}}"
+
+  t, j = both(tl2, false, [], [int("a", 1), any("name", valuer_value(LogValueName.new(first: "Ren", last: "Hoek"))), int("b", 2)])
+  assert_eq t, "msg=message a=1 name.first=Ren name.last=Hoek b=2"
+  assert_eq j, "{\"msg\":\"message\",\"a\":1,\"name\":{\"first\":\"Ren\",\"last\":\"Hoek\"},\"b\":2}"
+
+  # resolve, without a ReplaceAttr
+  t, j = both(no_rep, false, [], [any("", valuer_value(Replace.new(nil_value: true))), any("name", valuer_value(LogValueName.new(first: "Ren", last: "Hoek")))])
+  assert_eq t, "time=#{tl} level=INFO msg=message name.first=Ren name.last=Hoek"
+  assert_eq j, "{\"time\":\"#{jt}\",\"level\":\"INFO\",\"msg\":\"message\",\"name\":{\"first\":\"Ren\",\"last\":\"Hoek\"}}"
+
+  t, j = both(tl2, false, [wa(pre), wg("s")], attrs)
+  assert_eq t, "msg=message pre=3 x=y s.a=one s.b=2"
+  assert_eq j, "{\"msg\":\"message\",\"pre\":3,\"x\":\"y\",\"s\":{\"a\":\"one\",\"b\":2}}"
+
+  t, j = both(tl2, false, [wa([int("p1", 1)]), wg("s1"), wa([int("p2", 2)]), wg("s2"), wa([int("p3", 3)])], attrs)
+  assert_eq t, "msg=message p1=1 s1.p2=2 s1.s2.p3=3 s1.s2.a=one s1.s2.b=2"
+  assert_eq j, "{\"msg\":\"message\",\"p1\":1,\"s1\":{\"p2\":2,\"s2\":{\"p3\":3,\"a\":\"one\",\"b\":2}}}"
+
+  t, j = both(tl2, false, [wa([int("p1", 1)]), wg("s1"), wg("s2")], attrs)
+  assert_eq t, "msg=message p1=1 s1.s2.a=one s1.s2.b=2"
+  assert_eq j, "{\"msg\":\"message\",\"p1\":1,\"s1\":{\"s2\":{\"a\":\"one\",\"b\":2}}}"
+
+  t, j = both(tl2, false, [wg("x"), wg("y")], [])
+  assert_eq t, "msg=message"
+  assert_eq j, "{\"msg\":\"message\"}"
+
+  t, j = both(tl2, false, [wg("x"), wa([group("g", [])]), wg("y")], [])
+  assert_eq t, "msg=message"
+  assert_eq j, "{\"msg\":\"message\"}"
+
+  t, j = both(tl2, false, [wg("x"), wa([int("a", 1)]), wg("y")], [group("g", [group("h", [])])])
+  assert_eq t, "msg=message x.a=1"
+  assert_eq j, "{\"msg\":\"message\",\"x\":{\"a\":1}}"
+
+  # GroupValue as Attr value (Go's AnyValue(IntValue(3)) is the Value)
+  t, j = both(tl2, false, [], [any("v", int_value(3))])
+  assert_eq t, "msg=message v=3"
+  assert_eq j, "{\"msg\":\"message\",\"v\":3}"
+
+  t, j = both(tl2, false, [], [any("bs", bytes_value([1, 2, 3, 4]))])
+  assert_eq t, "msg=message bs=\"\\x01\\x02\\x03\\x04\""
+  assert_eq j, "{\"msg\":\"message\",\"bs\":\"AQIDBA==\"}"
+
+  t, j = both(tl2, false, [], [any("bs", raw_json_value("1234"))])
+  assert_eq t, "msg=message bs=\"1234\""
+  assert_eq j, "{\"msg\":\"message\",\"bs\":1234}"
+
+  t, j = both(tl2, false, [], [int("a", 1), group("", [int("b", 2), int("c", 3)]), int("d", 4)])
+  assert_eq t, "msg=message a=1 b=2 c=3 d=4"
+  assert_eq j, "{\"msg\":\"message\",\"a\":1,\"b\":2,\"c\":3,\"d\":4}"
+
+  # Source: records carry no source position (no caller locations), so
+  # add_source writes nothing, as Go does for a record without a PC. A
+  # Source value given explicitly is written as Go writes it.
+  t, j = both(tl2, true, [], [])
+  assert_eq t, "msg=message"
+  assert_eq j, "{\"msg\":\"message\"}"
+  src = source_value(Source.new(function: "log/slog.TestJSONAndTextHandlers", file: "handler_test.go", line: 7))
+  t, j = both(tl2, false, [], [any(SOURCE_KEY, src)])
+  assert_eq t, "msg=message source=handler_test.go:7"
+  assert_eq j, "{\"msg\":\"message\",\"source\":{\"function\":\"log/slog.TestJSONAndTextHandlers\",\"file\":\"handler_test.go\",\"line\":7}}"
+
+  # replace built-in with group
+  bg: (([Str], Attr) -> Attr)? = ->(gs: [Str], a: Attr) -> Attr {
+    return group(TIME_KEY, [int("mins", 3), int("secs", 2)]) if a.key == TIME_KEY
+    return Attr.new if a.key == LEVEL_KEY
+    a
+  }
+  t, j = both(bg, false, [], [])
+  assert_eq t, "time.mins=3 time.secs=2 msg=message"
+  assert_eq j, "{\"time\":{\"mins\":3,\"secs\":2},\"msg\":\"message\"}"
+
+  t, j = both(drop_all, false, [], [group("g", [int("a", 1)])])
+  assert_eq t, ""
+  assert_eq j, "{}"
+
+  t, j = both(drop_all, false, [wg("g"), wa([int("a", 1)])], [group("h", [int("b", 2)])])
+  assert_eq t, ""
+  assert_eq j, "{}"
+
+  t, j = both(drop_all, false, [wg("g"), wa([int("a", 1)]), wg("h"), wa([int("b", 2)])], [group("i", [int("c", 3)])])
+  assert_eq t, ""
+  assert_eq j, "{}"
+
+  t, j = both(drop_all, false, [wg("g")], [int("a", 1)])
+  assert_eq t, ""
+  assert_eq j, "{}"
+
+  t, j = both(drop_all, false, [wg("g"), wa([int("a", 1)]), wg("h"), wa([int("b", 2)])], [group("", [int("c", 3)])])
+  assert_eq t, ""
+  assert_eq j, "{}"
+
+  t, j = both(rk([TIME_KEY, LEVEL_KEY, MESSAGE_KEY, "a"]), false, [wg("g"), wa([int("a", 1)]), wg("h"), wa([int("b", 2)])], [group("i", [int("c", 3)])])
+  assert_eq t, "g.h.b=2 g.h.i.c=3"
+  assert_eq j, "{\"g\":{\"h\":{\"b\":2,\"i\":{\"c\":3}}}}"
+
+  t, j = both(rk([TIME_KEY, LEVEL_KEY, MESSAGE_KEY, "a", "b"]), false, [wg("g"), wa([int("a", 1)]), wa([int("n", 4)]), wg("h"), wa([int("b", 2)])], [group("i", [int("c", 3)])])
+  assert_eq t, "g.n=4 g.h.i.c=3"
+  assert_eq j, "{\"g\":{\"n\":4,\"h\":{\"i\":{\"c\":3}}}}"
+
+  t, j = both(rk([TIME_KEY, LEVEL_KEY, MESSAGE_KEY, "a", "c"]), false, [wg("g"), wa([int("x", 0)]), wa([int("a", 1)]), wa([int("n", 4)]), wg("h"), wa([int("b", 2)])], [group("i", [int("c", 3)])])
+  assert_eq t, "g.x=0 g.n=4 g.h.b=2"
+  assert_eq j, "{\"g\":{\"x\":0,\"n\":4,\"h\":{\"b\":2}}}"
+
+  # replace resolved group
+  rg: (([Str], Attr) -> Attr)? = ->(gs: [Str], a: Attr) -> Attr {
+    return Attr.new(key: "bad", value: int_value(1)) if a.value.kind == KIND_GROUP
+    return Attr.new if a.key == TIME_KEY || a.key == LEVEL_KEY || a.key == MESSAGE_KEY
+    a
+  }
+  t, j = both(rg, false, [], [any("name", valuer_value(LogValueName.new(first: "Perry", last: "Platypus")))])
+  assert_eq t, "name.first=Perry name.last=Platypus"
+  assert_eq j, "{\"name\":{\"first\":\"Perry\",\"last\":\"Platypus\"}}"
+
+  t, j = both(tl2, false, [], [group("prefix", [string(" needs quoting ", "v"), string("NotNeedsQuoting", "v")]), group("prefix needs quoting", [string(" needs quoting ", "v"), string("NotNeedsQuoting", "v")])])
+  assert_eq t, "msg=message \"prefix. needs quoting \"=v prefix.NotNeedsQuoting=v \"prefix needs quoting. needs quoting \"=v \"prefix needs quoting.NotNeedsQuoting\"=v"
+  assert_eq j, "{\"msg\":\"message\",\"prefix\":{\" needs quoting \":\"v\",\"NotNeedsQuoting\":\"v\"},\"prefix needs quoting\":{\" needs quoting \":\"v\",\"NotNeedsQuoting\":\"v\"}}"
+}
+
+test "handler enabled" {
+  lv = new_level_var
+  lv.set(level_warn)
+  ld = new_level_var
+  ld.set(level_debug)
+  cases: [(Leveler?, Bool)] = [(none, true), (level_warn, false), (new_level_var, true), (lv, false), (level_debug, true), (ld, true)]
+  for c in cases {
+    h = Fmt.new(opts: HandlerOptions.new(level: c[0]))
+    assert_eq h.enabled?(level_info), c[1]
+  }
+}
+
+test "json and text handlers with unavailable source" {
+  opts = HandlerOptions.new(replace_attr: remove_keys([LEVEL_KEY]), add_source: true)
+  tb = new_buf
+  jb = new_buf
+  r = new_record(time.Time.new, level_info, "message", 0)
+  new_text_handler(tb, opts).handle(r).unwrap
+  new_json_handler(jb, opts).handle(r).unwrap
+  assert_eq strings.trim_space(tb.string), "msg=message"
+  assert_eq strings.trim_space(jb.string), "{\"msg\":\"message\"}"
+}
+
+test "second with" {
+  buf = new_buf
+  h = new_text_handler(buf, HandlerOptions.new(replace_attr: remove_keys([TIME_KEY])))
+  logger = new(h).with([string("app", "playground"), string("role", "tester"), int("data_version", 2)])
+  app_logger = logger.with([string("type", "log")])
+  _ = logger.with([string("type", "metric")])
+  app_logger.info("foo", [])
+  assert_eq strings.trim_space(buf.string), "level=INFO msg=foo app=playground role=tester data_version=2 type=log"
+}
+
+test "replace attr groups" {
+  got: Mutex[[Str]] = Mutex.new([])
+  h = new_text_handler(new_buf, HandlerOptions.new(replace_attr: ->(gs: [Str], a: Attr) -> Attr {
+    v = a.key == TIME_KEY ? "<now>" : a.value.to_s
+    line = gs.join(",") + "|" + a.key + "|" + v
+    got.lock { |g| g << line }
+    a
+  }))
+  new(h).with([int("a", 1)]).with_group("g1").with([int("b", 2)]).with_group("g2").with([int("c", 3), group("g3", [int("d", 4)]), int("e", 5)]).info("m", [int("f", 6), group("g4", [int("h", 7)]), int("i", 8)])
+  want = ["|a|1", "g1|b|2", "g1,g2|c|3", "g1,g2,g3|d|4", "g1,g2|e|5", "|time|<now>", "|level|INFO", "|msg|m", "g1,g2|f|6", "g1,g2,g4|h|7", "g1,g2|i|8"]
+  assert_eq got.lock { |g| g }, want
+}
+
+test "write time rfc3339" {
+  for tm in [time.date(2000, 1, 2, 3, 4, 5, 0, time.utc), time.date(2000, 1, 2, 3, 4, 5, 400, time.local), time.date(2000, 11, 12, 3, 4, 500, 50000000, time.utc)] {
+    assert_eq rfc3339_millis(tm), tm.format("2006-01-02T15:04:05.000Z07:00")
+  }
+}
+
+test "discard handler" {
+  l = new(discard_handler)
+  l.info("msg", [int("a", 1), int("b", 2)])
+  l.debug("bg", [int("a", 1), int("b", 2)])
+  l.warn("w", [duration("dur", time.second * 3)])
+  l.error("bad", [int("a", 1)])
+  l.log(level_warn + 1, "w", [int("a", 1), string("b", "two")])
+  l.log_attrs(level_info + 1, "a b c", [int("a", 1), string("b", "two")])
+  l.info("info", [group("a", [int("i", 1)])])
+  l.info("info", [any("a", group_value([int("i", 1)]))])
+  assert !l.enabled?(level_error)
+}
+
+bench "write time" {
+  tm = time.date(2022, 3, 4, 5, 6, 7, 823456789, time.local)
+  _ = rfc3339_millis(tm)
+}

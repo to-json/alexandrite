@@ -1,0 +1,166 @@
+# Helpers shared by the tests (and the generated vectors).
+
+import "bytes"
+import "encoding/json"
+import "errors"
+import "regexp"
+import "strconv"
+import "strings"
+import "time"
+
+# Go's checkLogOutput: got (without its final newline, other newlines as
+# "~") matches the regexp want entirely.
+def check_log(got: Str, want: Str) -> Bool {
+  g = got
+  g = g[0...g.size - 1] if g.size > 0 && g[g.size - 1] == 10
+  g = strings.replace_all(g, "\n", "~")
+  ok = regexp.match_string("^" + want + "$", g).unwrap
+  puts "got  #{g}\nwant #{want}" if !ok
+  ok
+}
+
+# Go's textTimeRE / jsonTimeRE.
+TEXT_TIME_RE = "\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}\\.\\d{3}(Z|[+-]\\d{2}:\\d{2})"
+JSON_TIME_RE = "\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(\\.\\d+)?(Z|[+-]\\d{2}:\\d{2})"
+
+# Go's `replace` test type, for the values it is used with (a LogValuer
+# can't hold a Value here: see the header).
+struct Replace {
+  s: Str
+  nil_value: Bool
+
+  def log_value -> Value { nil_value ? Value.new : string_value(s) }
+}
+
+# Go's attrsSlice.
+def attrs_of(r: Record) -> [Attr] {
+  out: [Attr] = []
+  r.attrs { |a|
+    out << a
+    true
+  }
+  out
+}
+
+# A buffer that copies share (a handler owns a copy of its writer).
+struct SharedBuf {
+  mu: Mutex[bytes.Buffer]
+
+  pub def write!(p: [Byte]) -> ~Int {
+    mu.lock { |b| b.write!(p) }
+    p.size
+  }
+  def string -> Str { mu.lock { |b| b.string } }
+  def reset { mu.lock { |b| b = bytes.Buffer.new } }
+}
+
+def new_buf -> SharedBuf { SharedBuf.new(mu: Mutex.new(bytes.Buffer.new)) }
+
+def test_time -> time.Time { time.date(2000, 1, 2, 3, 4, 5, 0, time.utc) }
+
+def b(xs: [Byte]) -> [Byte] { xs }
+
+# Go's logValueName.
+struct LogValueName {
+  first: Str
+  last: Str
+
+  def log_value -> Value { group_value([string("first", first), string("last", last)]) }
+}
+
+# A value with a MarshalText (Go's test type `text`).
+struct TextM {
+  s: Str
+
+  def log_text -> ~Str {
+    fail errors.new("text: empty string") if s == ""
+    "text{" + strconv.quote(s) + "}"
+  }
+
+  def log_json -> ~Str {
+    fail errors.new("json: error calling MarshalText for type *main.textM: text: empty string") if s == ""
+    strconv.quote("text{" + strconv.quote(s) + "}")
+  }
+}
+
+# A value with a MarshalJSON (Go's test type `jsonMarshaler`); its text is
+# Go's %+v of the struct.
+struct JsonM {
+  s: Str
+
+  def log_text -> ~Str { "{s:" + s + "}" }
+
+  def log_json -> ~Str {
+    fail errors.new("json: error calling MarshalJSON for type *main.jsonM: json: empty string") if s == ""
+    "[" + json.quote(s) + "]"
+  }
+}
+
+# One with_attrs / with_group step.
+struct Op {
+  group: Str
+  attrs: [Attr]
+  is_group: Bool
+}
+
+def wg(name: Str) -> Op { Op.new(group: name, is_group: true) }
+def wa(attrs: [Attr]) -> Op { Op.new(attrs: attrs) }
+
+def upper_case_key(gs: [Str], a: Attr) -> Attr { Attr.new(key: strings.to_upper(a.key), value: a.value) }
+
+def remove_keys(keys: [Str]) -> ([Str], Attr) -> Attr {
+  ->(gs: [Str], a: Attr) -> Attr { keys.include?(a.key) ? Attr.new : a }
+}
+
+# The ReplaceAttr functions of the generated vectors, by number.
+def rep(n: Int) -> HandlerOptions {
+  f: (([Str], Attr) -> Attr)? = none
+  case n {
+    1 => f = ->(gs: [Str], a: Attr) -> Attr { upper_case_key(gs, a) }
+    2 => f = ->(gs: [Str], a: Attr) -> Attr { a.key == TIME_KEY || a.key == LEVEL_KEY ? Attr.new : a }
+    3 => f = ->(gs: [Str], a: Attr) -> Attr { Attr.new }
+    4 => f = ->(gs: [Str], a: Attr) -> Attr {
+      if a.key == "a" || a.key == TIME_KEY {
+        return Attr.new
+      }
+      return Attr.new(key: gs.join("/") + ":" + a.key, value: a.value) if gs.size > 0
+      a
+    }
+    5 => f = ->(gs: [Str], a: Attr) -> Attr {
+      return Attr.new if a.key == TIME_KEY
+      return a if a.key == LEVEL_KEY || a.key == MESSAGE_KEY
+      string(a.key, kind_string(a.value.kind))
+    }
+    6 => f = ->(gs: [Str], a: Attr) -> Attr {
+      return group(TIME_KEY, [int("mins", 3), int("secs", 2)]) if a.key == TIME_KEY
+      return Attr.new if a.key == LEVEL_KEY
+      a
+    }
+    _ => nil
+  }
+  HandlerOptions.new(replace_attr: f)
+}
+
+def text_line(r: Int, ops: [Op], attrs: [Attr], t: time.Time, level: Level, msg: Str) -> Str {
+  buf = new_buf
+  h = new_text_handler(buf, rep(r))
+  for o in ops {
+    h = o.is_group ? h.with_group(o.group) : h.with_attrs(o.attrs)
+  }
+  rec = new_record(t, level, msg, 0)
+  rec.add_attrs!(attrs)
+  h.handle(rec).unwrap
+  strings.trim_suffix(buf.string, "\n")
+}
+
+def json_line(r: Int, ops: [Op], attrs: [Attr], t: time.Time, level: Level, msg: Str) -> Str {
+  buf = new_buf
+  h = new_json_handler(buf, rep(r))
+  for o in ops {
+    h = o.is_group ? h.with_group(o.group) : h.with_attrs(o.attrs)
+  }
+  rec = new_record(t, level, msg, 0)
+  rec.add_attrs!(attrs)
+  h.handle(rec).unwrap
+  strings.trim_suffix(buf.string, "\n")
+}

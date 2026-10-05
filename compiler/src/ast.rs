@@ -176,6 +176,34 @@ pub struct ConstDef {
     pub span: Span,
     pub ty: Option<TypeExpr>,
     pub value: Expr,
+    /// R11: a package-level `Atomic[T]` / `Mutex[T]` (`NAME = Atomic.new(v)`),
+    /// not a compile-time constant. Its value is computed once, at program
+    /// start, by the def `var_init_name(name)` the parser adds.
+    pub var: bool,
+}
+
+/// The def computing package-level value `name` (`pkg.NAME` → `pkg.__init_NAME`).
+pub fn var_init_name(name: &str) -> String {
+    match name.rfind('.') {
+        Some(i) => format!("{}.__init_{}", &name[..i], &name[i + 1..]),
+        None => format!("__init_{name}"),
+    }
+}
+
+/// Is this top-level declaration an `Atomic[T]` or a `Mutex[T]` (R11)?
+/// Its declared type says so, or its value is `Atomic.new(..)`,
+/// `Mutex[T].new(..)`, ...
+pub fn is_sync_decl(ty: Option<&TypeExpr>, value: &Expr) -> bool {
+    if let Some(TypeExpr::App(n, ..)) = ty {
+        return matches!(n.as_str(), "Atomic" | "Mutex");
+    }
+    match &value.kind {
+        ExprKind::Call { recv: Some(r), name, .. } if name == "new" => match &r.kind {
+            ExprKind::Const(c) | ExprKind::TypeApp(c, _) => matches!(c.as_str(), "Atomic" | "Mutex"),
+            _ => false,
+        },
+        _ => false,
+    }
 }
 
 /// `struct Name { field: Type, ... }`: a value type.

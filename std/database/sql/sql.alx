@@ -1,7 +1,7 @@
 # Package sql: Go's database/sql — a connection pool and a generic SQL
 # interface over a database driver (database/sql/driver).
 #
-#   db = ~sql.open_driver(sqlite.Driver.new, "app.db")   # or reg.~open("sqlite3", dsn)
+#   db = sql.~open("sqlite3", "app.db")          # after sqlite.register; or sql.open_driver(d, dsn)
 #   db.~exec("insert into people(name, age) values(?, ?)", ("ann", 30))
 #   rows = db.~query("select id, name, age from people where age > ?", 20)
 #   while rows.next {
@@ -12,8 +12,8 @@
 #   n: Int = db.query_row("select count(*) from people", nil).~scan
 #
 #   Go                                    alx
-#   sql.Open(name, dsn)                   reg.open(name, dsn) -> ~DB  (a Registry; see below)
-#   sql.Register / Drivers                reg.register(name, d) / reg.drivers
+#   sql.Open(name, dsn)                   open(name, dsn) -> ~DB
+#   sql.Register / Drivers                register(name, d) / drivers
 #   sql.OpenDB(connector)                 open_db(c) -> DB; open_driver(d, dsn) -> ~DB
 #   db.Exec(q, args...) (Result, error)   db.exec(q, args) -> ~Result; exec_context(ctx, q, args)
 #   db.Query(q, args...) (*Rows, error)   db.query(q, args) -> ~Rows; query_context
@@ -75,11 +75,9 @@
 # DefaultParameterConverter rules, `sql_value` for Valuers).
 #
 # Differences from Go:
-#  - Package-level registry (sql.Register / sql.Open / sql.Drivers): until
-#    package-level `Mutex` state lands (GO-VS-RUBY R11), the table is a value,
-#    `Registry` (`new_registry`, `register`, `drivers`, `open`); `open_driver`
-#    needs none. When R11 lands, `registry()` becomes the package's own
-#    `Mutex` and `register`/`open`/`drivers` its package functions.
+#  - The driver table is package-level state behind a Mutex (R11), as Go's
+#    is behind an RWMutex. A driver package registers itself when asked
+#    (`sqlite.register`): alx has no init functions.
 #  - Optional driver interfaces are default methods (see driver.alx); a
 #    driver's NamedValueChecker is asked on the Stmt, then on the Conn (Go
 #    asks only the first that implements it).
@@ -225,42 +223,42 @@ pub def named[T](name: Str, value: T) -> NamedArg[T] { NamedArg.new(name: name, 
 
 # ---------------------------------------------------------------- registry
 
-# A table of drivers by name (Go's package-level Register/Open/Drivers; see
-# the header).
-pub struct Registry {
-  st: Mutex[Map[Str, driver.Driver]]
+# The registered drivers by name (Go's package-level `drivers` map; R11).
+DRIVERS = Mutex[Map[Str, driver.Driver]].new({})
 
-  # Makes a driver available by `name`. Registering a name twice panics,
-  # as in Go.
-  pub def register(name: Str, d: driver.Driver) {
-    dup = st.lock { |m|
-      had = m[name] != none
-      m[name] = d if !had
-      had
-    }
-    panic "sql: Register called twice for driver #{name}" if dup
+# Makes a driver available by `name` (Go's Register). Registering a name
+# twice panics, as in Go.
+pub def register(name: Str, d: driver.Driver) {
+  dup = DRIVERS.lock { |m|
+    had = m[name] != none
+    m[name] = d if !had
+    had
   }
+  panic "sql: Register called twice for driver #{name}" if dup
+}
 
-  # The registered names, sorted.
-  pub def drivers -> [Str] {
-    names = st.lock { |m| m.keys }
-    names.sort
-  }
+# The registered names, sorted (Go's Drivers).
+pub def drivers -> [Str] {
+  names = DRIVERS.lock { |m| m.keys }
+  names.sort
+}
 
-  # Opens a DB for the driver `name` (Go's sql.Open): no connection is made
-  # yet.
-  pub def open(name: Str, dsn: Str) -> ~DB {
-    d = st.lock { |m| m[name] }
-    if x = d {
-      return ~open_driver(x, dsn)
-    }
-    fail SqlError.UnknownDriver(name: name)
+# Go's unregisterAllDrivers (tests).
+def unregister_all_drivers {
+  DRIVERS.lock { |m|
+    m = {}
+    nil
   }
 }
 
-pub def new_registry -> Registry {
-  m: Map[Str, driver.Driver] = {}
-  Registry.new(st: Mutex.new(m))
+# Opens a DB for the registered driver `name` (Go's sql.Open): no
+# connection is made yet.
+pub def open(name: Str, dsn: Str) -> ~DB {
+  d = DRIVERS.lock { |m| m[name] }
+  if x = d {
+    return ~open_driver(x, dsn)
+  }
+  fail SqlError.UnknownDriver(name: name)
 }
 
 # ------------------------------------------------------------------ the DB

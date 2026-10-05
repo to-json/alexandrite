@@ -1,0 +1,457 @@
+# Go's sql_test.go, part 8: the concurrent tests (TestConcurrency and its
+# concurrent*Test types), TestIssue6081 .. TestNamedValueCheckerSkip.
+#
+# Not translated: TestIssue18719 (needs sql.go's hookTxGrabConn test hook).
+# TestNamedValueChecker is partial: Go's checker accepts non-Value argument
+# types (decimalInt, []int64, Out); alx arguments are driver Values by the
+# time a checker sees them, so what remains is a checker rewriting and
+# removing arguments.
+
+import "context"
+import "database/sql/driver"
+import "sync"
+import "time"
+
+# Go's concurrent*Test types, as kinds of one operation (Go's interface of
+# test objects; here the objects a kind needs travel in a ConcCtx, copied
+# into each worker).
+CONC_QUERY = 0
+CONC_EXEC = 1
+CONC_STMT_QUERY = 2
+CONC_STMT_EXEC = 3
+CONC_TX_QUERY = 4
+CONC_TX_EXEC = 5
+CONC_TX_STMT_QUERY = 6
+CONC_TX_STMT_EXEC = 7
+CONC_RANDOM = 8
+
+struct ConcCtx {
+  db: DB
+  stmt_q: Stmt?
+  stmt_e: Stmt?
+  tx: Tx?
+  tx_q: Stmt?
+  tx_e: Stmt?
+}
+
+def query_names(rows: Rows) -> ~Unit {
+  while rows.next {
+    _n: ~Str = rows.scan
+  }
+  ~rows.close
+}
+
+def conc_op(kind: Int, c: ConcCtx) -> ~Unit {
+  case kind {
+    0 => ~query_names(c.db.~query("SELECT|people|name|", nil))
+    1 => {
+      c.db.~exec("NOSERT|people|name=Chris,age=?,photo=CPHOTO,bdate=?", (3, chris_birthday))
+      nil
+    }
+    2 => ~query_names(c.stmt_q.unwrap.~query(nil))
+    3 => {
+      c.stmt_e.unwrap.~exec((3, chris_birthday))
+      nil
+    }
+    4 => ~query_names(c.db.~query("SELECT|people|name|", nil))
+    5 => {
+      c.tx.unwrap.~exec("NOSERT|people|name=Chris,age=?,photo=CPHOTO,bdate=?", (3, chris_birthday))
+      nil
+    }
+    6 => ~query_names(c.tx_q.unwrap.~query(nil))
+    _ => {
+      c.tx_e.unwrap.~exec((3, chris_birthday))
+      nil
+    }
+  }
+}
+
+# Go's concurrentTest.init for each kind.
+def conc_init(kind: Int, db: DB) -> ConcCtx {
+  c = ConcCtx.new(db: db, stmt_q: none, stmt_e: none, tx: none, tx_q: none, tx_e: none)
+  if kind == CONC_STMT_QUERY || kind == CONC_RANDOM {
+    c.stmt_q = db.prepare("SELECT|people|name|").unwrap
+  }
+  if kind == CONC_STMT_EXEC || kind == CONC_RANDOM {
+    c.stmt_e = db.prepare("NOSERT|people|name=Chris,age=?,photo=CPHOTO,bdate=?").unwrap
+  }
+  if kind >= CONC_TX_QUERY {
+    tx = db.begin.unwrap
+    c.tx = tx
+    if kind == CONC_TX_STMT_QUERY || kind == CONC_RANDOM {
+      c.tx_q = tx.prepare("SELECT|people|name|").unwrap
+    }
+    if kind == CONC_TX_STMT_EXEC || kind == CONC_RANDOM {
+      c.tx_e = tx.prepare("NOSERT|people|name=Chris,age=?,photo=CPHOTO,bdate=?").unwrap
+    }
+  }
+  c
+}
+
+# Go's concurrentTest.finish.
+def conc_finish(c: ConcCtx) {
+  for s in [c.stmt_q, c.stmt_e, c.tx_q, c.tx_e] {
+    if x = s {
+      x.close.unwrap
+    }
+  }
+  if tx = c.tx {
+    tx.rollback.unwrap
+  }
+}
+
+# Go's doConcurrentTest: workers run the kind's operation numReqs times in
+# all (Random: the kinds in turn).
+def do_concurrent_test(kind: Int) {
+  num_reqs = 50
+  workers = 8
+  db = new_test_db("people")
+  c = conc_init(kind, db)
+  wg = sync.new_wait_group
+  wg.add(num_reqs)
+  reqs = Chan[Int].new
+  failures = Mutex.new([""; 0])
+  for _w in 0...workers {
+    mine = c.dup
+    _ = spawn {
+      for k in reqs {
+        r = conc_op(kind == CONC_RANDOM ? k % 8 : kind, mine)
+        if e = r.err {
+          failures.lock { |v|
+            v << e.message
+            nil
+          }
+        }
+        wg.done
+      }
+    }
+  }
+  for i in 0...num_reqs {
+    reqs << i
+  }
+  wg.wait
+  reqs.close
+  got = failures.lock { |v| v }
+  assert got.size == 0, "#{got}"
+  conc_finish(c)
+  close_db(db)
+}
+
+test "Concurrency/Query" { do_concurrent_test(CONC_QUERY) }
+test "Concurrency/Exec" { do_concurrent_test(CONC_EXEC) }
+test "Concurrency/StmtQuery" { do_concurrent_test(CONC_STMT_QUERY) }
+test "Concurrency/StmtExec" { do_concurrent_test(CONC_STMT_EXEC) }
+test "Concurrency/TxQuery" { do_concurrent_test(CONC_TX_QUERY) }
+test "Concurrency/TxExec" { do_concurrent_test(CONC_TX_EXEC) }
+test "Concurrency/TxStmtQuery" { do_concurrent_test(CONC_TX_STMT_QUERY) }
+test "Concurrency/TxStmtExec" { do_concurrent_test(CONC_TX_STMT_EXEC) }
+test "Concurrency/Random" { do_concurrent_test(CONC_RANDOM) }
+
+test "Issue6081" {
+  test_database([], ->(db: DB) -> ~Unit {
+    populate(db, "people")
+    drv = drv_of(db)
+    opens0 = drv.open_count
+    closes0 = drv.close_count
+    stmt = db.~prepare("SELECT|people|name|")
+    drv.hooks.st.lock { |h|
+      h.rows_close_err = driver.ERR_BAD_CONN
+      nil
+    }
+    for _i in 0...10 {
+      rows = stmt.~query(nil)
+      _ = rows.close
+    }
+    drv.hooks.st.lock { |h|
+      h.rows_close_err = none
+      nil
+    }
+    n = stmt.core.st.lock { |s| s.css.size }
+    assert n <= 1, "len(css slice) = #{n}; want <= 1"
+    _ = stmt.close
+    n = stmt.core.st.lock { |s| s.css.size }
+    assert n == 0, "len(css slice) after Close = #{n}; want 0"
+    opens = drv.open_count - opens0
+    closes = drv.close_count - closes0
+    assert opens >= 9, "opens = #{opens}; want >= 9"
+    assert closes >= 9, "closes = #{closes}; want >= 9"
+    nil
+  }).unwrap
+}
+
+# A small deterministic random source for the issue tests.
+def rnd(seed: Atomic[Int], n: Int) -> Int {
+  x = seed.add(7919)
+  (x * 2654435761 % 1000003) % n
+}
+
+test "Issue18429" {
+  test_database([], ->(db: DB) -> ~Unit {
+    populate(db, "people")
+    ctx = context.background
+    sem = Chan[Bool].new(20)
+    wg = sync.new_wait_group
+    seed = Atomic.new(1)
+    milli_wait = 30
+    for _i in 0...100 {
+      sem << true
+      wg.add(1)
+      d = db.dup
+      qwait = rnd(seed, milli_wait)
+      to = rnd(seed, milli_wait)
+      _ = spawn {
+        c, cancel = context.with_timeout(ctx, time.millisecond * to)
+        r = d.begin_tx(c, none)
+        if tx = r.ok {
+          rr = tx.query_context(c, "WAIT|#{qwait}ms|SELECT|people|name|", nil)
+          if rows = rr.ok {
+            while rows.next {
+              _n: ~Str = rows.scan
+            }
+            _ = rows.close
+          }
+          _ = tx.rollback
+        }
+        cancel()
+        _ = sem.recv
+        wg.done
+      }
+    }
+    wg.wait
+    nil
+  }).unwrap
+}
+
+test "Issue20160" {
+  test_database([], ->(db: DB) -> ~Unit {
+    populate(db, "people")
+    ctx = context.background
+    sem = Chan[Bool].new(20)
+    wg = sync.new_wait_group
+    seed = Atomic.new(3)
+    stmt = db.~prepare_context(ctx, "SELECT|people|name|")
+    defer stmt.close
+    for _i in 0...100 {
+      sem << true
+      wg.add(1)
+      s = stmt.dup
+      to = rnd(seed, 30)
+      _ = spawn {
+        c, cancel = context.with_timeout(ctx, time.millisecond * to)
+        r = s.query_context(c, nil)
+        if rows = r.ok {
+          _ = rows.close
+        }
+        cancel()
+        _ = sem.recv
+        wg.done
+      }
+    }
+    wg.wait
+    nil
+  }).unwrap
+}
+
+test "Issue20647" {
+  test_database([], ->(db: DB) -> ~Unit {
+    populate(db, "people")
+    ctx = context.background
+    conn = db.~conn_context(ctx)
+    get_fake_conn(conn.dc.ci).set_skip_dirty_session
+    defer conn.close
+    stmt = conn.~prepare_context(ctx, "SELECT|people|name|")
+    defer stmt.close
+    rows1 = stmt.~query_context(ctx, nil)
+    defer rows1.close
+    rows2 = stmt.~query_context(ctx, nil)
+    defer rows2.close
+    assert rows1.dc.id == rows2.dc.id, "stmt prepared on Conn does not use same connection"
+    nil
+  }).unwrap
+}
+
+test "ConnectionLeak" {
+  test_database([], ->(db: DB) -> ~Unit {
+    populate(db, "people")
+    db.set_max_open_conns(DEFAULT_MAX_IDLE_CONNS + 1)
+    rows: [Rows] = []
+    for _i in 0...DEFAULT_MAX_IDLE_CONNS {
+      r = db.~query("SELECT|people|name|", nil)
+      _ = r.next
+      ~r.err_result
+      rows << r
+    }
+    drv = drv_of(db)
+    wait_ch = Chan[Bool].new(1)
+    waiting_ch = Chan[Bool].new(1)
+    drv.st.lock { |s|
+      s.wait_ch = wait_ch
+      s.waiting_ch = waiting_ch
+      nil
+    }
+    done = Chan[Str].new(1)
+    d = db.dup
+    _ = spawn {
+      r = d.query("SELECT|people|name|", nil)
+      if x = r.ok {
+        _ = x.close
+        done << ""
+      } else {
+        done << (r.err?.message || "")
+      }
+    }
+    _ = waiting_ch.recv
+    for v in rows {
+      _ = v.close
+    }
+    wait_ch << true
+    got = done.recv || "closed"
+    assert got == "", got
+    nil
+  }).unwrap
+}
+
+def stats_max_idle_closed(max_idle: Int, want: Int) {
+  test_database([], ->(db: DB) -> ~Unit {
+    populate(db, "people")
+    db.set_max_open_conns(1)
+    db.set_max_idle_conns(max_idle)
+    db.set_conn_max_lifetime(time.duration(0))
+    pre = db.stats.max_idle_closed
+    for _i in 0...10 {
+      rows = db.~query("SELECT|people|name|", nil)
+      _ = rows.close
+    }
+    got = db.stats.max_idle_closed - pre
+    assert got == want, "expected #{want} max idle closed conns, got: #{got}"
+    nil
+  }).unwrap
+}
+
+test "StatsMaxIdleClosedZero" { stats_max_idle_closed(1, 0) }
+
+test "StatsMaxIdleClosedTen" { stats_max_idle_closed(0, 10) }
+
+# Go's testUseConns, on the DB's stopped clock (Go's time.Sleep(1ns) on the
+# synctest clock).
+def use_conns(db: DB, count: Int) {
+  conns: [Conn] = []
+  for _i in 0...count {
+    db.clock_fixed.add(1)
+    conns << db.conn_context(context.background).unwrap
+  }
+  i = conns.size - 1
+  while i >= 0 {
+    db.clock_fixed.add(1)
+    conns[i].close.unwrap
+    i -= 1
+  }
+}
+
+test "MaxIdleTime" {
+  used = 5
+  reused = 2
+  ms = 1000000
+  cases = [(ms, 0, ms - 1, used - reused, used - reused, 10 * ms, 0), (ms, 10 * ms + 103, 1, used - reused + 1, used - reused, 10 * ms, 100), (3600000000000, 0, 1000000000, 0, 0, 10 * ms, 0)]
+  for item in cases {
+    # (Go's startTime is taken just before newTestDB opens its first
+    # connection: that connection's creation time here.)
+    db = new_test_db("people")
+    start = db.st.lock { |s| s.free_conn[0].created_at }
+    db.clock_fixed.store(start)
+    db.set_max_open_conns(used)
+    db.set_max_idle_conns(used)
+    db.set_conn_max_idle_time(time.duration(item[0]))
+    db.set_conn_max_lifetime(time.duration(item[1]))
+    pre = db.stats.max_idle_time_closed
+    use_conns(db, used)
+    db.clock_fixed.store(start + item[5])
+    use_conns(db, reused)
+    db.clock_fixed.add(item[6])
+    now = db.now_ns
+    r = db.st.lock { |s|
+      x = s.cleaner_run_locked!(1000000000, now)
+      x
+    }
+    assert r[0] == item[2], "got #{r[0]}; want #{item[2]} next check duration"
+    free = db.st.lock { |s| s.free_conn }
+    last = 0
+    for c in free {
+      ra = c.st.lock { |d| d.returned_at }
+      assert last <= ra, "freeConn is not ordered by returnedAt"
+      last = ra
+    }
+    for c in r[1] {
+      _ = db.close_conn(c)
+    }
+    assert r[1].size == item[3], "got: #{r[1].size}; want #{item[3]} closed conns"
+    got = db.stats.max_idle_time_closed - pre
+    assert got == item[4], "got: #{got}; want #{item[4]} max idle closed conns"
+    close_db(db)
+  }
+}
+
+# Go's nvcConn: a connection with a NamedValueChecker.
+struct NvcConn {
+  fc: FakeConn
+  skip: Bool
+  def prepare(query: Str) -> ~driver.Stmt { fc.~prepare(query) }
+  def prepare_context(ctx: context.Context, query: Str) -> ~driver.Stmt { fc.~prepare_context(ctx, query) }
+  def begin -> ~driver.Tx { fc.~begin }
+  def close -> ~Unit { fc.~close }
+  def reset_session(ctx: context.Context) -> ~Unit { fc.~reset_session(ctx) }
+  def valid? -> Bool { fc.valid? }
+  def has_session_resetter? -> Bool { true }
+  def has_validator? -> Bool { true }
+  def exec_context(ctx: context.Context, query: Str, args: [driver.NamedValue]) -> ~driver.Result { fail driver.ERR_SKIP }
+  def query_context(ctx: context.Context, query: Str, args: [driver.NamedValue]) -> ~driver.Rows { fail driver.ERR_SKIP }
+  def check_named_value(nv: driver.NamedValue) -> ~driver.NamedValue {
+    fail driver.ERR_SKIP if skip
+    case nv.value {
+      Str(s) => {
+        fail driver.ERR_REMOVE_ARGUMENT if s == "doNotInclude"
+        return driver.NamedValue.new(name: nv.name, ordinal: nv.ordinal, value: driver.Value.Str("checked:#{s}")) if nv.name == "O1"
+        nil
+      }
+      _ => {}
+    }
+    fail driver.ERR_SKIP
+  }
+}
+
+struct NvcDriver {
+  drv: FakeDriver
+  skip: Bool
+  def open(dsn: Str) -> ~driver.Conn {
+    c = drv.~open_fake(dsn)
+    NvcConn.new(fc: c, skip: skip)
+  }
+}
+
+test "NamedValueChecker" {
+  register("NamedValueCheck", NvcDriver.new(drv: new_fake_driver, skip: false))
+  db = ~open("NamedValueCheck", "")
+  ctx = context.background
+  db.~exec_context(ctx, "WIPE", nil)
+  db.~exec_context(ctx, "CREATE|keys|dec1=any,str1=string,out1=string,array1=any", nil)
+  db.~exec_context(ctx, "INSERT|keys|dec1=?A,str1=?,out1=?O1,array1=?", (named("A", 123), "hello", named("O1", "x"), [42.as_u8, 128, 7], "doNotInclude"))
+  got: (Int, Str, Str, [Byte]) = db.query_row_context(ctx, "SELECT|keys|dec1,str1,out1,array1|", nil).~scan
+  assert_eq got[0], 123
+  assert_eq got[1], "hello"
+  assert_eq got[2], "checked:x"
+  assert got[3] == [42.as_u8, 128, 7], "#{got[3]}"
+  ~db.close
+}
+
+test "NamedValueCheckerSkip" {
+  register("NamedValueCheckSkip", NvcDriver.new(drv: new_fake_driver, skip: true))
+  db = ~open("NamedValueCheckSkip", "")
+  ctx = context.background
+  db.~exec_context(ctx, "WIPE", nil)
+  db.~exec_context(ctx, "CREATE|keys|dec1=any", nil)
+  # (Go's decimalInt is not a Value; here an argument the statement doesn't
+  # take is the error.)
+  r = db.exec_context(ctx, "INSERT|keys|dec1=?A", (named("A", 123), "doNotInclude"))
+  assert r.err?, "expected error with bad argument"
+  ~db.close
+}

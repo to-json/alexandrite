@@ -329,7 +329,13 @@ pub fn run(p: &LProgram) -> Result<(), String> {
     set(&mut fb, "use_colocated_libcalls", "false")?;
     set(&mut fb, "is_pic", "false")?;
     let isa = cranelift_native::builder().map_err(|e| format!("jit: {e}"))?.finish(settings::Flags::new(fb)).map_err(|e| format!("jit: {e}"))?;
-    let mut m = JITModule::new(JITBuilder::with_isa(isa, default_libcall_names()));
+    let mut jb = JITBuilder::with_isa(isa, default_libcall_names());
+    // One reserved arena for code and data: separately mapped sections of a
+    // big program (std/crypto/x509's tests) could land more than the 2 GB
+    // an arm64 ADRP reaches apart, which panicked in relocation.
+    let arena = cranelift_jit::ArenaMemoryProvider::new_with_size(1 << 30).map_err(|e| format!("jit: {e}"))?;
+    jb.memory_provider(Box::new(arena));
+    let mut m = JITModule::new(jb);
 
     let mut externs = vec![];
     for x in &p.externs {

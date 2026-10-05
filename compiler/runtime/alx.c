@@ -25,6 +25,10 @@ static bool alx_memstats;
 
 size_t alx_mem_held(void) { return __atomic_load_n(&mem_held, __ATOMIC_RELAXED); }
 size_t alx_mem_peak(void) { return __atomic_load_n(&mem_peak, __ATOMIC_RELAXED); }
+/* testing.allocs_per_run: count allocations from now on (returns whether
+ * counting was on) and read the count. */
+bool alx_count_allocs(bool on) { bool was = alx_counting; alx_counting = on || getenv("ALX_COUNT_ALLOCS") != NULL; return was; }
+int64_t alx_alloc_count(void) { return (int64_t)__atomic_load_n(&alx_allocs, __ATOMIC_RELAXED); }
 
 static void mem_add(size_t n) {
     size_t h = __atomic_add_fetch(&mem_held, n, __ATOMIC_RELAXED);

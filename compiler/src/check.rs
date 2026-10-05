@@ -15,6 +15,9 @@ use std::collections::HashMap;
 
 type R<T> = Result<T, Diag>;
 
+#[path = "fmtcheck.rs"]
+mod fmtcheck;
+
 pub struct ExternSig {
     pub params: Vec<Ty>,
     pub ret: Ty,
@@ -697,7 +700,9 @@ impl<'a> World<'a> {
                 }
                 _ => false,
             };
-            if ret != m.ret && !lifted && !covariant {
+            // A method that never returns (it panics or exits) satisfies one returning nothing.
+            let never = ret == Ty::Never && m.ret == Ty::Unit;
+            if ret != m.ret && !lifted && !covariant && !never {
                 self.impls.get_mut(iface).unwrap().pop();
                 return Err(Diag::new(sp, format!("{tn}.{} returns {}, but {iface}.{} returns {}", m.name, ret.show(), m.name, m.ret.show())));
             }
@@ -1019,6 +1024,7 @@ pub fn printable(t: &Ty) -> bool {
         Ty::Map(k, v) => printable(k) && printable(v),
         Ty::Struct(_, fs) => fs.iter().all(|(_, t)| printable(t)),
         Ty::Tuple(ts) => ts.iter().all(printable),
+        Ty::Enum(_, vs) => vs.iter().all(|(_, fs)| fs.iter().all(|(_, t)| printable(t))),
         _ => false,
     }
 }
@@ -1326,6 +1332,8 @@ pub fn type_from(t: &TypeExpr, structs: &Structs, consts: &Consts) -> R<Ty> {
 
 struct FnCx<'w, 'a> {
     w: &'w mut World<'a>,
+    /// Node ids for code the checker writes as text (fmtcheck.rs).
+    gen_id: NodeId,
     locals: Vec<Local>,
     scopes: Vec<HashMap<String, LocalId>>,
     subst: Vec<Option<Ty>>,
@@ -1435,6 +1443,7 @@ impl<'w, 'a> FnCx<'w, 'a> {
             sites: vec![],
             strict,
             unresolved: false,
+            gen_id: 0xC000_0000,
             const_err: std::cell::RefCell::new(None),
             pure_decl: def.is_some_and(|d| d.pure),
             fn_name: def.map_or("main".into(), |d| d.name.clone()),
@@ -3245,9 +3254,6 @@ impl<'w, 'a> FnCx<'w, 'a> {
         let (rid, s2) = self.opt_tmp(r, sp);
         let mut acc: Option<TExpr> = None;
         for (k, ft) in fts.iter().enumerate() {
-            if matches!(self.resolve(ft), Ty::Map(..)) {
-                return Err(Diag::new(sp, format!("`==` on {}: its field of type {} can't be compared; define `def ==(other)`", t.show(), ft.show())));
-            }
             let a = self.mk(TK::Local(lid), t.clone(), sp);
             let b = self.mk(TK::Local(rid), t.clone(), sp);
             let fa = self.mk(TK::M(M::TupleGet(k), Some(Box::new(a)), vec![], None), ft.clone(), sp);
@@ -4323,6 +4329,15 @@ impl<'w, 'a> FnCx<'w, 'a> {
             let eq = self.arr_eq(l, r, sp)?;
             return Ok(if op == BinOp::Ne { self.mk(TK::Not(Box::new(eq)), Ty::Bool, sp) } else { eq });
         }
+        // Maps: the same keys with equal values (builtin `__map_eq`).
+        if matches!(op, BinOp::Eq | BinOp::Ne) && matches!(lres, Ty::Map(..)) {
+            if !self.unify(&l.ty, &r.ty) {
+                return Err(Diag::new(sp, format!("`{}` between {} and {}", op.text(), lres.show(), self.resolve(&r.ty).show())));
+            }
+            let def = *self.w.by_name.get("__map_eq").expect("builtin __map_eq");
+            let eq = self.call_def(def, "__map_eq", sp, vec![l, r], sp)?;
+            return Ok(if op == BinOp::Ne { self.mk(TK::Not(Box::new(eq)), Ty::Bool, sp) } else { eq });
+        }
         if matches!(op, BinOp::Eq | BinOp::Ne) && matches!(lres, Ty::Struct(..) | Ty::Tuple(_) | Ty::Enum(..)) {
             if !self.unify(&l.ty, &r.ty) {
                 return Err(Diag::new(sp, format!("`{}` between {} and {}", op.text(), lres.show(), self.resolve(&r.ty).show())));
@@ -5001,6 +5016,9 @@ impl<'w, 'a> FnCx<'w, 'a> {
                     }
                 }
             }
+            // The arguments are checked again below: locals this first look
+            // declares (inside a lambda argument) aren't the ones used.
+            let decls = self.decl_spans.len();
             for (i, a) in args.iter().enumerate() {
                 let (te, v) = match &a.kind {
                     ExprKind::KwArg(n, _, v) => match fields.iter().find(|(f, _, _)| f == n) {
@@ -5016,6 +5034,7 @@ impl<'w, 'a> FnCx<'w, 'a> {
                 let t = self.resolve(&v.ty);
                 bind_tparams(te, &t, g.tparams(), &mut out);
             }
+            self.decl_spans.truncate(decls);
             let mut targs = vec![];
             for tp in g.tparams() {
                 match out.get(&tp.name) {
@@ -6216,207 +6235,13 @@ impl<'w, 'a> FnCx<'w, 'a> {
         Err(self.no_method(&rt, name, name_span))
     }
 
-    /// `format("...", args)`: Go's fmt verbs. The format string must be a
-    /// literal, so every directive is checked against its argument here.
-    fn format(&mut self, name: &str, args: &[Expr], sp: Span) -> R<TExpr> {
-        let Some(Expr { kind: ExprKind::Str(fmt), span: fsp, .. }) = args.first() else {
-            return Err(Diag::new(sp, format!("`{name}` takes a format string literal first")));
-        };
-        let mut vals = args[1..].iter().map(|a| self.value(a)).collect::<R<Vec<_>>>()?;
-        let mut pieces = vec![];
-        let mut lit = String::new();
-        let mut k = 0;
-        // Complex arguments of `%f`/`%e` (D53): held in temporaries, their parts shown as extra arguments.
-        let mut pre: Vec<TStmt> = vec![];
-        let mut extra: Vec<TExpr> = vec![];
-        let mut it = fmt.chars().peekable();
-        while let Some(c) = it.next() {
-            if c != '%' {
-                lit.push(c);
-                continue;
-            }
-            let mut spec = String::new();
-            while let Some(&d) = it.peek() {
-                spec.push(d);
-                it.next();
-                if d.is_ascii_alphabetic() || d == '%' {
-                    break;
-                }
-            }
-            if spec == "%" {
-                lit.push('%');
-                continue;
-            }
-            if !lit.is_empty() {
-                pieces.push(FmtPiece::Lit(std::mem::take(&mut lit)));
-            }
-            let Some(v) = vals.get(k) else {
-                return Err(Diag::new(*fsp, format!("`%{spec}` has no argument: {} given", vals.len())));
-            };
-            let t = self.resolve(&v.ty);
-            // Flags, width, precision, verb: `%-+ 08.3f`.
-            let (mut left, mut zero, mut plus, mut space) = (false, false, false, false);
-            let mut rest = spec.as_str();
-            while let Some(c) = rest.chars().next().filter(|c| "-+0 #".contains(*c)) {
-                match c {
-                    '-' => left = true,
-                    '+' => plus = true,
-                    '0' => zero = true,
-                    ' ' => space = true,
-                    _ => {}
-                }
-                rest = &rest[1..];
-            }
-            let wlen = rest.chars().take_while(char::is_ascii_digit).count();
-            let width: u32 = rest[..wlen].parse().unwrap_or(0).min(1000);
-            rest = &rest[wlen..];
-            let mut prec: Option<u32> = None;
-            if let Some(r) = rest.strip_prefix('.') {
-                let n = r.chars().take_while(char::is_ascii_digit).count();
-                prec = Some(r[..n].parse().unwrap_or(0).min(40));
-                rest = &r[n..];
-            }
-            let verb = rest;
-            // Go's fmtComplex: `(` real, imag with a sign, `i)`, each part formatted by the verb.
-            if is_complex(&t) && matches!(verb, "f" | "F" | "e" | "E") {
-                let z = self.mk(TK::Int(0), Ty::Int, sp);
-                let v = std::mem::replace(&mut vals[k], z);
-                let ty = v.ty.clone();
-                let (lid, st) = self.opt_tmp(v, sp);
-                pre.push(st);
-                pieces.push(FmtPiece::Lit("(".into()));
-                for (part, plus) in [(0, plus), (1, true)] {
-                    let l = self.mk(TK::Local(lid), ty.clone(), sp);
-                    let e = self.mk(TK::M(M::TupleGet(part), Some(Box::new(l)), vec![], None), Ty::Float, sp);
-                    let j = args.len() - 1 + extra.len();
-                    extra.push(e);
-                    let inner = if matches!(verb, "f" | "F") { FmtPiece::Fixed(j, prec.unwrap_or(6)) } else { FmtPiece::Exp(j, prec.unwrap_or(6), verb == "E") };
-                    pieces.push(if width > 0 || plus || space { FmtPiece::Padded { inner: Box::new(inner), width, left, zero: zero && !left, plus, space: space && !plus } } else { inner });
-                }
-                pieces.push(FmtPiece::Lit("i)".into()));
-                k += 1;
-                continue;
-            }
-            let bad = |what: &str| Diag::new(v.span, format!("`%{spec}` needs {what}, got {}", t.show()));
-            let numeric = t.int_kind().is_some() || t == Ty::Float;
-            let piece = match verb {
-                "d" | "i" => {
-                    if t.int_kind().is_none() {
-                        return Err(bad("an integer"));
-                    }
-                    FmtPiece::Int(k)
-                }
-                "x" | "X" | "o" | "b" => {
-                    if t.int_kind().is_none() {
-                        return Err(bad("an integer"));
-                    }
-                    let base = match verb {
-                        "o" => 8,
-                        "b" => 2,
-                        _ => 16,
-                    };
-                    FmtPiece::Base(k, base, verb == "X")
-                }
-                "c" => {
-                    if t.int_kind().is_none() {
-                        return Err(bad("a Rune"));
-                    }
-                    FmtPiece::Char(k)
-                }
-                "s" => {
-                    if t != Ty::Str {
-                        return Err(bad("a Str (use `%v` for any value)"));
-                    }
-                    FmtPiece::Str(k)
-                }
-                "q" => {
-                    if t != Ty::Str {
-                        return Err(bad("a Str"));
-                    }
-                    FmtPiece::Quote(k)
-                }
-                "v" => {
-                    if !printable(&t) {
-                        return Err(bad("a value that can be shown"));
-                    }
-                    FmtPiece::Str(k)
-                }
-                "T" => FmtPiece::Lit(t.show()),
-                "t" => {
-                    if t != Ty::Bool {
-                        return Err(bad("a Bool"));
-                    }
-                    FmtPiece::Str(k)
-                }
-                "f" | "F" => {
-                    if !matches!(t, Ty::Int | Ty::Float) {
-                        return Err(bad("a number"));
-                    }
-                    FmtPiece::Fixed(k, prec.unwrap_or(6))
-                }
-                "e" | "E" => {
-                    if !matches!(t, Ty::Int | Ty::Float) {
-                        return Err(bad("a number"));
-                    }
-                    FmtPiece::Exp(k, prec.unwrap_or(6), verb == "E")
-                }
-                // `%g`: Go's shortest form, which is how a Float shows (`%v`).
-                "g" if prec.is_none() => {
-                    if t != Ty::Float {
-                        return Err(bad("a Float"));
-                    }
-                    FmtPiece::Str(k)
-                }
-                "g" | "G" => return Err(Diag::new(*fsp, format!("`%{spec}`: only `%g` (shortest, as Go) so far; no precision or `%G`"))),
-                _ => return Err(Diag::new(*fsp, format!("unsupported directive `%{spec}`")).note("supported so far (Go's fmt verbs): %v, %d, %s, %q, %t, %f, %e, %E, %g, %x, %X, %o, %b, %c, %T, %%, with flags `-+0 `, a width and a precision")),
-            };
-            // Integer precision: minimum digits; Go ignores the 0 flag then.
-            let int_verb = matches!(verb, "d" | "i" | "x" | "X" | "o" | "b");
-            let piece = match prec {
-                Some(n) if int_verb => {
-                    zero = false;
-                    FmtPiece::Digits { inner: Box::new(piece), n }
-                }
-                _ => piece,
-            };
-            let piece = if width > 0 || plus || space {
-                FmtPiece::Padded { inner: Box::new(piece), width, left, zero: zero && !left && numeric, plus: plus && numeric, space: space && numeric && !plus }
-            } else {
-                piece
-            };
-            // `%T` shows no argument.
-            if verb == "T" {
-                pieces.push(piece);
-                k += 1;
-                continue;
-            }
-            pieces.push(piece);
-            k += 1;
-        }
-        if !lit.is_empty() {
-            pieces.push(FmtPiece::Lit(lit));
-        }
-        if k != vals.len() {
-            return Err(Diag::new(sp, format!("`{name}`: {} directive(s) but {} argument(s)", k, vals.len())));
-        }
-        vals.extend(extra);
-        let vals = vals
-            .into_iter()
-            .enumerate()
-            .map(|(i, v)| if pieces.iter().any(|p| p.wants_float() && p.arg() == Some(i)) { self.coerce(v, &Ty::Float) } else { Ok(v) })
-            .collect::<R<Vec<_>>>()?;
-        let f = self.mk(TK::Format(pieces, vals), Ty::Str, sp);
-        if pre.is_empty() {
-            return Ok(f);
-        }
-        pre.push(TStmt::Expr(f));
-        Ok(self.mk(TK::Seq(pre), Ty::Str, sp))
-    }
-
     /// `fmt.sprintf` and friends (std/fmt): builtins over `format`.
     fn fmt_call(&mut self, name: &str, args: &[Expr], sp: Span) -> R<TExpr> {
+        if name == "errorf" {
+            return self.errorf(args, sp);
+        }
         let text = match name {
-            "sprintf" | "printf" | "errorf" => self.format(name, args, sp)?,
+            "sprintf" | "printf" => self.format(name, args, sp)?,
             _ => {
                 // sprint / sprintln / print / println: every operand as `%v`.
                 let line = name.ends_with("ln");
@@ -6570,6 +6395,8 @@ impl<'w, 'a> FnCx<'w, 'a> {
         let (m, ty, arity) = match (rt, n) {
             (Ty::Float, "bits") => (M::FloatBits, Ty::IntK(IntKind::U64), 1),
             (Ty::IntK(IntKind::U64), "from_bits") => (M::FloatFromBits, Ty::Float, 1),
+            (Ty::Float, "ffmt_f") => (M::FloatFmtF, Ty::Str, 2),
+            (Ty::Float, "ffmt_e") => (M::FloatFmtE, Ty::Str, 2),
             (Ty::IntK(IntKind::U64), "mulhi") => (M::UMulHi, Ty::IntK(IntKind::U64), 2),
             (Ty::Float, _) => {
                 let f = crate::lir::MathFn::by_name(n)?;
@@ -6583,7 +6410,11 @@ impl<'w, 'a> FnCx<'w, 'a> {
             }
             let mut targs = vec![];
             for a in args {
-                let want = if m == M::UMulHi { Ty::IntK(IntKind::U64) } else { Ty::Float };
+                let want = match m {
+                    M::UMulHi => Ty::IntK(IntKind::U64),
+                    M::FloatFmtF | M::FloatFmtE => Ty::Int,
+                    _ => Ty::Float,
+                };
                 let v = self.value(a)?;
                 let v = self.coerce(v, &want)?;
                 self.expect(&v.ty, &want, v.span, name)?;

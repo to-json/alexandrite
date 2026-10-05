@@ -2962,6 +2962,16 @@ impl<'a> Lw<'a> {
             FloatBits => LE::Rt(Rt::FBits, vec![self.expr(recv.unwrap())]),
             UMulHi => LE::Prim(Prim::UMulHi, vec![self.expr(recv.unwrap()), self.expr(&args[0])]),
             FloatFromBits => LE::Rt(Rt::FFromBits, vec![self.expr(recv.unwrap())]),
+            FloatFmtF => {
+                let x = self.expr(recv.unwrap());
+                let n = self.expr(&args[0]);
+                LE::Rt(Rt::FFmt, vec![x, n])
+            }
+            FloatFmtE => {
+                let x = self.expr(recv.unwrap());
+                let n = self.expr(&args[0]);
+                LE::Rt(Rt::FFmtE, vec![x, n, LE::B(false)])
+            }
             StructNew => {
                 let t = self.lty(&e.ty);
                 let vs = args.iter().map(|a| self.arg(a)).collect();

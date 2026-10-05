@@ -260,6 +260,9 @@ pub enum M {
     FloatBits,
     /// U64 -> Float (`u.__from_bits`).
     FloatFromBits,
+    /// `x.__ffmt_f(n)` / `x.__ffmt_e(n)`: `%.nf` / `%.ne` of a Float (the fmt engine).
+    FloatFmtF,
+    FloatFmtE,
     /// `Name.new(fields...)`
     StructNew,
     /// T? → Bool

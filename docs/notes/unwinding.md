@@ -11,7 +11,7 @@ Status: **not scheduled** (user, 2026-10-04). Lock release and poisoning on pani
   - Browser (wasm): `abort_with` → `sched::task_panic`, then `stop(Stop::Abort)` throws out of the task (`web/src/rt.rs`).
 - **What is skipped:** nothing between the panic and the task entry runs.
   - `defer` statements don't run. They are lowered inline at each block exit (`emit_defers` in `compiler/src/lower.rs`), so they don't exist at run time as a list anyone could walk.
-  - Locks held in `mu.lock { }` stayed locked. Being fixed separately: the runtime tracks a task's held locks, releases them on panic, and poisons them.
+  - Locks held in `mu.lock { }` used to stay locked. Fixed (D59): the runtime tracks the locks each task holds, releases them on panic, and poisons them; `mu.poisoned?` / `mu.clear_poison!`.
   - Files, sockets, temp directories and child processes owned by the task stay open, or keep existing, until the program exits.
 
 ## What full unwinding means

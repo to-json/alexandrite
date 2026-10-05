@@ -59,6 +59,8 @@ pub struct Parser<'a> {
     djobs: Vec<crate::derive_data::DataJob>,
     /// derive(Gob) jobs (see derive_gob.rs).
     gjobs: Vec<crate::derive_gob::GobJob>,
+    /// derive(Xml) jobs (see derive_xml.rs).
+    xjobs: Vec<crate::derive_xml::XmlJob>,
 }
 
 type PResult<T> = Result<T, Diag>;
@@ -67,7 +69,7 @@ type PResult<T> = Result<T, Diag>;
 const CMD_PKG: &str = "alxexec";
 
 pub fn parse(file: u32, toks: &[Token], next_id: &mut NodeId) -> PResult<Module> {
-    let mut p = Parser { toks, pos: 0, next_id, scopes: vec![HashSet::new()], in_cond: false, usings: vec![], extern_mode: false, cur_derives: vec![], jobs: vec![], cur_data_name: None, djobs: vec![], cur_transparent: false, gjobs: vec![] };
+    let mut p = Parser { toks, pos: 0, next_id, scopes: vec![HashSet::new()], in_cond: false, usings: vec![], extern_mode: false, cur_derives: vec![], jobs: vec![], cur_data_name: None, djobs: vec![], xjobs: vec![], cur_transparent: false, gjobs: vec![] };
     let mut m = p.module(file)?;
     // Command literals call into os/exec (also from inside `#{...}`).
     let has_cmd = toks.iter().any(|t| match &t.tok {
@@ -80,6 +82,19 @@ pub fn parse(file: u32, toks: &[Token], next_id: &mut NodeId) -> PResult<Module>
         m.imports.push(Import { alias: Some(CMD_PKG.into()), path: "os/exec".into(), span });
     }
     Ok(m)
+}
+
+/// One expression (the whole token stream), for code the checker writes as
+/// text (`format`'s composite values: check.rs `fmt_text`). `locals` are the
+/// names in scope.
+pub fn parse_expr(toks: &[Token], next_id: &mut NodeId, locals: &[String]) -> PResult<Expr> {
+    let mut p = Parser { toks, pos: 0, next_id, scopes: vec![locals.iter().cloned().collect()], in_cond: false, usings: vec![], extern_mode: false, cur_derives: vec![], jobs: vec![], cur_data_name: None, djobs: vec![], xjobs: vec![], cur_transparent: false, gjobs: vec![] };
+    let e = p.expr()?;
+    p.skip_newlines();
+    if !matches!(p.peek(), Tok::Eof) {
+        return Err(Diag::new(p.span(), format!("generated code: unexpected {}", describe(p.peek()))));
+    }
+    Ok(e)
 }
 
 impl<'a> Parser<'a> {
@@ -153,7 +168,7 @@ impl<'a> Parser<'a> {
     /// The expression in an embedded piece of source (`#{...}`).
     fn code_expr(&mut self, src: &str, base: u32, sp: Span, what: &str) -> PResult<Expr> {
         let toks = crate::lexer::lex_at(sp.file, src, base)?;
-        let mut sub = Parser { toks: &toks, pos: 0, next_id: self.next_id, scopes: self.scopes.clone(), in_cond: false, usings: vec![], extern_mode: false, cur_derives: vec![], jobs: vec![], cur_data_name: None, djobs: vec![], cur_transparent: false, gjobs: vec![] };
+        let mut sub = Parser { toks: &toks, pos: 0, next_id: self.next_id, scopes: self.scopes.clone(), in_cond: false, usings: vec![], extern_mode: false, cur_derives: vec![], jobs: vec![], cur_data_name: None, djobs: vec![], xjobs: vec![], cur_transparent: false, gjobs: vec![] };
         sub.skip_newlines();
         let e = sub.expr()?;
         sub.skip_newlines();
@@ -218,7 +233,21 @@ impl<'a> Parser<'a> {
                     let Tok::Str(name) = self.bump().tok else { unreachable!() };
                     let name_span = self.prev_span();
                     self.scopes.push(HashSet::new());
-                    let body = self.braced_stmts();
+                    // `test "x" { |t| ... }` / `bench "x" { |b| ... }`: the body takes
+                    // the package testing's T (or B); the front end gives its type.
+                    let mut param = None;
+                    let body = if kw != "example" && matches!(self.peek_at(1), Tok::Op("|")) && matches!(self.peek_at(2), Tok::Ident(_)) && matches!(self.peek_at(3), Tok::Op("|")) {
+                        self.bump();
+                        self.bump();
+                        let psp = self.span();
+                        let Tok::Ident(p) = self.bump().tok else { unreachable!() };
+                        self.bump();
+                        self.declare(&p);
+                        param = Some(Param { name: p, ty: None, span: psp });
+                        self.stmts_to_brace()
+                    } else {
+                        self.braced_stmts()
+                    };
                     self.scopes.pop();
                     let body = body?;
                     let kind = match kw.as_str() {
@@ -238,7 +267,7 @@ impl<'a> Parser<'a> {
                         }
                     }
                     let span = start.to(self.prev_span());
-                    let def = Def { public: false, using: self.usings.clone(), name: name.clone(), span, tparams: vec![], name_span, params: vec![], ret: None, fallible: true, errs: None, pure: false, ffi: None, body };
+                    let def = Def { public: false, using: self.usings.clone(), name: name.clone(), span, tparams: vec![], name_span, params: param.into_iter().collect(), ret: None, fallible: true, errs: None, pure: false, ffi: None, body };
                     m.tests.push(TestDecl { kind, name, span, outputs, def });
                 }
                 Tok::Ident(kw) if kw == "pub" => {
@@ -296,6 +325,13 @@ impl<'a> Parser<'a> {
                         t => return Err(Diag::new(self.span(), format!("`pub` goes before a declaration, found {}", describe(&t)))),
                     }
                 }
+                Tok::Attr(a) if is_embed_attr(&a) => {
+                    let (c, public) = self.embed_const()?;
+                    if public {
+                        m.public.insert(c.name.clone());
+                    }
+                    m.consts.push(c);
+                }
                 Tok::Attr(_) if self.attrs_precede_type() => self.type_attrs()?,
                 Tok::Attr(_) | Tok::Kw(Kw::Def) | Tok::Kw(Kw::Fn) => m.defs.push(self.def()?),
                 Tok::Ident(kw) if kw == "extern" && matches!(self.peek_at(1), Tok::Kw(Kw::Def)) => m.defs.push(self.extern_def()?),
@@ -336,6 +372,43 @@ impl<'a> Parser<'a> {
         Ok(m)
     }
 
+    /// `#[embed("pattern", ...)] [pub] NAME: Type` (Go's `//go:embed`): a
+    /// constant whose value is the matching files, read by the front end.
+    fn embed_const(&mut self) -> PResult<(ConstDef, bool)> {
+        let Tok::Attr(a) = self.peek().clone() else { unreachable!() };
+        let asp = self.bump().span;
+        let mut patterns = embed_patterns(&a).map_err(|m| Diag::new(asp, m))?;
+        self.skip_newlines();
+        // Several `#[embed]` lines add up, as Go's `//go:embed` lines do.
+        while let Tok::Attr(a) = self.peek().clone() {
+            if !is_embed_attr(&a) {
+                break;
+            }
+            let sp = self.bump().span;
+            patterns.extend(embed_patterns(&a).map_err(|m| Diag::new(sp, m))?);
+            self.skip_newlines();
+        }
+        let public = matches!(self.peek(), Tok::Ident(p) if p == "pub");
+        if public {
+            self.bump();
+        }
+        let Tok::Const(name) = self.peek().clone() else {
+            return Err(Diag::new(self.span(), "`#[embed(...)]` goes before a constant declaration: `NAME: Str`, `NAME: [Byte]` or `NAME: embed.FS`"));
+        };
+        let sp = self.bump().span;
+        if !self.is_op(":") {
+            return Err(Diag::new(self.span(), "an embedded constant needs its type: `NAME: Str`, `NAME: [Byte]` or `NAME: embed.FS`"));
+        }
+        self.bump();
+        let ty = self.type_expr()?;
+        if self.is_op("=") {
+            return Err(Diag::new(self.span(), "an embedded constant has no `= value`: the files are its value"));
+        }
+        let value = Expr { id: self.id(), kind: ExprKind::Bool(false), span: sp };
+        let embed = Some(Embed { patterns, span: asp, files: Default::default() });
+        Ok((ConstDef { name, span: sp, ty: Some(ty), value, embed, var: false }, public))
+    }
+
     /// `NAME = expr` at the top level: a constant, or (R11) a package-level
     /// `Atomic[T]` / `Mutex[T]`, whose value a def `__init_NAME` computes.
     fn top_value(&mut self, m: &mut Module, name: String, sp: Span, ty: Option<TypeExpr>, value: Expr) {
@@ -344,7 +417,7 @@ impl<'a> Parser<'a> {
             let body = vec![Stmt { span: value.span, kind: StmtKind::Expr(value.clone()) }];
             m.defs.push(Def { name: var_init_name(&name), span: sp, tparams: vec![], name_span: sp, params: vec![], ret: ty.clone(), fallible: false, public: false, using: self.usings.clone(), errs: None, pure: false, ffi: None, body });
         }
-        m.consts.push(ConstDef { name, span: sp, ty, value, var });
+        m.consts.push(ConstDef { name, span: sp, ty, value, var, embed: None });
     }
 
     /// Are the `#[...]` attributes at the cursor followed by a struct or enum?
@@ -384,7 +457,7 @@ impl<'a> Parser<'a> {
     }
 
     fn mark_pub(&mut self, name: &str) {
-        if let Some(j) = self.jobs.iter_mut().rev().find(|j| j.name == name) {
+        for j in self.jobs.iter_mut().filter(|j| j.name == name) {
             j.public = true;
         }
     }
@@ -393,18 +466,27 @@ impl<'a> Parser<'a> {
     fn expand_derives(&mut self, m: &mut Module) -> PResult<()> {
         self.expand_data_derives(m)?;
         self.expand_gob_derives(m)?;
+        self.expand_xml_derives(m)?;
         if self.jobs.is_empty() {
             return Ok(());
         }
         let jobs = std::mem::take(&mut self.jobs);
-        // The local name of the `encoding/json` import (added if the file has none).
-        let alias = match m.imports.iter().find(|i| i.path == "encoding/json") {
-            Some(i) => import_name(i),
-            None => {
-                m.imports.push(Import { alias: Some("alxjson".into()), path: "encoding/json".into(), span: jobs[0].span });
-                "alxjson".to_string()
+        // The local name of an import the generated code needs (added if the file has none).
+        let mut alias_of = |m: &mut Module, path: &str, own: &str, kind: &str| -> String {
+            if !jobs.iter().any(|j| j.derive == kind) {
+                return String::new();
+            }
+            match m.imports.iter().find(|i| i.path == path) {
+                Some(i) => import_name(i),
+                None => {
+                    m.imports.push(Import { alias: Some(own.into()), path: path.into(), span: jobs[0].span });
+                    own.to_string()
+                }
             }
         };
+        let alias = alias_of(m, "encoding/json", "alxjson", "Json");
+        let quick = alias_of(m, "testing/quick", "alxquick", "Arbitrary");
+        let rand = alias_of(m, "math/rand", "alxrand", "Arbitrary");
         let mut types = crate::derive::ModuleTypes { local: Default::default(), enums: Default::default() };
         for s in &m.structs {
             types.local.insert(s.name.clone(), jobs.iter().any(|j| j.name == s.name));
@@ -414,48 +496,85 @@ impl<'a> Parser<'a> {
             types.enums.insert(e.name.clone());
         }
         // encoding/json/v2's methods, for files that use v2 (derive_json2.rs).
-        let wants_v2 = m.imports.iter().any(|i| i.path == "encoding/json/v2" || i.path == "encoding/json/jsontext");
-        let mut v2_texts = vec![];
+        let wants_v2 = jobs.iter().any(|j| j.derive == "Json") && m.imports.iter().any(|i| i.path == "encoding/json/v2" || i.path == "encoding/json/jsontext");
+        let mut v2_texts: std::collections::HashMap<String, String> = Default::default();
         let mut v2_only: Vec<String> = vec![];
         if wants_v2 {
-            let mut alias_of = |path: &str, fallback: &str| match m.imports.iter().find(|i| i.path == path) {
+            let mut alias_of2 = |m: &mut Module, path: &str, fallback: &str| match m.imports.iter().find(|i| i.path == path) {
                 Some(i) => import_name(i),
                 None => {
                     m.imports.push(Import { alias: Some(fallback.into()), path: path.into(), span: jobs[0].span });
                     fallback.to_string()
                 }
             };
-            let j2 = alias_of("encoding/json/v2", "alxjson2");
-            let jt = alias_of("encoding/json/jsontext", "alxjsontext");
+            let j2 = alias_of2(m, "encoding/json/v2", "alxjson2");
+            let jt = alias_of2(m, "encoding/json/jsontext", "alxjsontext");
             v2_only.push(format!("{jt}.Value"));
-            let go_names: std::collections::HashMap<String, String> = jobs.iter().filter_map(|j| j.go_name.clone().map(|g| (j.name.clone(), g))).collect();
+            let go_names: std::collections::HashMap<String, String> = jobs.iter().filter(|j| j.derive == "Json").filter_map(|j| j.go_name.clone().map(|g| (j.name.clone(), g))).collect();
             let cx = crate::derive_json2::Ctx { j: &j2, t: &jt, types: &types, go_names: &go_names };
-            for job in &jobs {
+            for job in jobs.iter().filter(|j| j.derive == "Json") {
                 let gn = job.go_name.clone().unwrap_or_else(|| job.name.clone());
-                v2_texts.push(crate::derive_json2::json2_source(job, &gn, &cx)?);
+                v2_texts.insert(job.name.clone(), crate::derive_json2::json2_source(job, &gn, &cx)?);
             }
         }
-        for (k, job) in jobs.iter().enumerate() {
-            let text = crate::derive::json_source(job, &alias, &types, wants_v2, &v2_only)?;
+        for job in &jobs {
+            let text = if job.derive == "Arbitrary" { crate::derive::arbitrary_source(job, &quick, &rand)? } else { crate::derive::json_source(job, &alias, &types, wants_v2, &v2_only)? };
             // One struct body: v1's methods, then v2's (both texts are `struct Name { ... }`).
-            let text = if wants_v2 {
-                let v1 = &text[..text.rfind('}').unwrap()];
-                let v2 = &v2_texts[k];
-                format!("{v1}{}", &v2[v2.find('\n').unwrap() + 1..])
-            } else {
-                text
+            let text = match v2_texts.get(&job.name).filter(|_| job.derive == "Json") {
+                Some(v2) => {
+                    let v1 = &text[..text.rfind('}').unwrap()];
+                    format!("{v1}{}", &v2[v2.find('\n').unwrap() + 1..])
+                }
+                None => text,
             };
             if std::env::var("ALX_DERIVE_DEBUG").is_ok() {
                 eprintln!("{text}");
             }
-            let mut toks = crate::lexer::lex(job.span.file, &text).map_err(|d| Diag::new(job.span, format!("derive(Json) on `{}` made code that doesn't lex: {}\n{text}", job.name, d.msg)))?;
+            let mut toks = crate::lexer::lex(job.span.file, &text).map_err(|d| Diag::new(job.span, format!("derive({}) on `{}` made code that doesn't lex: {}\n{text}", job.derive, job.name, d.msg)))?;
             for t in &mut toks {
                 t.span = job.span;
             }
-            let mut sub = Parser { toks: &toks, pos: 0, next_id: self.next_id, scopes: vec![HashSet::new()], in_cond: false, usings: vec![], extern_mode: false, cur_derives: vec![], jobs: vec![], cur_data_name: None, djobs: vec![], cur_transparent: false, gjobs: vec![] };
+            let mut sub = Parser { toks: &toks, pos: 0, next_id: self.next_id, scopes: vec![HashSet::new()], in_cond: false, usings: vec![], extern_mode: false, cur_derives: vec![], jobs: vec![], cur_data_name: None, djobs: vec![], xjobs: vec![], cur_transparent: false, gjobs: vec![] };
             sub.skip_newlines();
             let mut defs = vec![];
-            sub.struct_def(&mut defs).map_err(|d| Diag::new(job.span, format!("derive(Json) on `{}` made code that doesn't parse: {}\n{text}", job.name, d.msg)))?;
+            sub.struct_def(&mut defs).map_err(|d| Diag::new(job.span, format!("derive({}) on `{}` made code that doesn't parse: {}\n{text}", job.derive, job.name, d.msg)))?;
+            for d in &mut defs {
+                d.span = job.span;
+            }
+            m.defs.extend(defs);
+        }
+        Ok(())
+    }
+
+    /// Write the code of every derive(Xml) and parse it in as methods.
+    fn expand_xml_derives(&mut self, m: &mut Module) -> PResult<()> {
+        if self.xjobs.is_empty() {
+            return Ok(());
+        }
+        let xjobs = std::mem::take(&mut self.xjobs);
+        // The local name of the `encoding/xml` import (added if the file has none).
+        let alias = match m.imports.iter().find(|i| i.path == "encoding/xml") {
+            Some(i) => import_name(i),
+            None => {
+                m.imports.push(Import { alias: Some("alxxml".into()), path: "encoding/xml".into(), span: xjobs[0].job.span });
+                "alxxml".to_string()
+            }
+        };
+        let by_name: std::collections::HashMap<String, &crate::derive_xml::XmlJob> = xjobs.iter().map(|j| (j.job.name.clone(), j)).collect();
+        for xj in &xjobs {
+            let job = &xj.job;
+            let text = crate::derive_xml::xml_source(xj, &alias, &by_name)?;
+            if std::env::var("ALX_DERIVE_DEBUG").is_ok() {
+                eprintln!("{text}");
+            }
+            let mut toks = crate::lexer::lex(job.span.file, &text).map_err(|d| Diag::new(job.span, format!("derive(Xml) on `{}` made code that doesn't lex: {}\n{text}", job.name, d.msg)))?;
+            for t in &mut toks {
+                t.span = job.span;
+            }
+            let mut sub = Parser { toks: &toks, pos: 0, next_id: self.next_id, scopes: vec![HashSet::new()], in_cond: false, usings: vec![], extern_mode: false, cur_derives: vec![], jobs: vec![], cur_data_name: None, djobs: vec![], xjobs: vec![], cur_transparent: false, gjobs: vec![] };
+            sub.skip_newlines();
+            let mut defs = vec![];
+            sub.struct_def(&mut defs).map_err(|d| Diag::new(job.span, format!("derive(Xml) on `{}` made code that doesn't parse: {}\n{text}", job.name, d.msg)))?;
             for d in &mut defs {
                 d.span = job.span;
             }
@@ -494,7 +613,7 @@ impl<'a> Parser<'a> {
             for t in &mut toks {
                 t.span = job.span;
             }
-            let mut sub = Parser { toks: &toks, pos: 0, next_id: self.next_id, scopes: vec![HashSet::new()], in_cond: false, usings: vec![], extern_mode: false, cur_derives: vec![], jobs: vec![], cur_data_name: None, djobs: vec![], cur_transparent: false, gjobs: vec![] };
+            let mut sub = Parser { toks: &toks, pos: 0, next_id: self.next_id, scopes: vec![HashSet::new()], in_cond: false, usings: vec![], extern_mode: false, cur_derives: vec![], jobs: vec![], cur_data_name: None, djobs: vec![], cur_transparent: false, gjobs: vec![], xjobs: vec![] };
             sub.skip_newlines();
             let mut defs = vec![];
             sub.struct_def(&mut defs).map_err(|d| Diag::new(job.span, format!("derive(Gob) on `{}` made code that doesn't parse: {}\n{text}", job.name, d.msg)))?;
@@ -560,7 +679,7 @@ impl<'a> Parser<'a> {
             for t in &mut toks {
                 t.span = job.span;
             }
-            let mut sub = Parser { toks: &toks, pos: 0, next_id: self.next_id, scopes: vec![HashSet::new()], in_cond: false, usings: vec![], extern_mode: false, cur_derives: vec![], jobs: vec![], cur_data_name: None, djobs: vec![], cur_transparent: false, gjobs: vec![] };
+            let mut sub = Parser { toks: &toks, pos: 0, next_id: self.next_id, scopes: vec![HashSet::new()], in_cond: false, usings: vec![], extern_mode: false, cur_derives: vec![], jobs: vec![], cur_data_name: None, djobs: vec![], xjobs: vec![], cur_transparent: false, gjobs: vec![] };
             sub.skip_newlines();
             let mut defs = vec![];
             sub.struct_def(&mut defs).map_err(|d| Diag::new(job.span, format!("derive(Data) on `{}` made code that doesn't parse: {}\n{text}", job.name, d.msg)))?;
@@ -927,16 +1046,16 @@ impl<'a> Parser<'a> {
         }
         let span = start.to(self.prev_span());
         if derives.iter().any(|d| d == "Gob") {
-            let job = crate::derive::DeriveJob { name: name.clone(), go_name: data_name.clone(), transparent, tparams: tparams.iter().map(|t| t.name.clone()).collect(), public: false, span, shape: crate::derive::DShape::Enum(dvariants.clone()) };
+            let job = crate::derive::DeriveJob { derive: "Gob".into(), go_name: data_name.clone(), transparent, name: name.clone(), tparams: tparams.iter().map(|t| t.name.clone()).collect(), public: false, span, shape: crate::derive::DShape::Enum(dvariants.clone()) };
             self.gjobs.push(crate::derive_gob::GobJob { job, go_name: data_name.clone() });
         }
         if derives.iter().any(|d| d == "Data") {
-            let job = crate::derive::DeriveJob { name: name.clone(), go_name: data_name.clone(), transparent, tparams: tparams.iter().map(|t| t.name.clone()).collect(), public: false, span, shape: crate::derive::DShape::Enum(dvariants.clone()) };
+            let job = crate::derive::DeriveJob { derive: "Data".into(), go_name: data_name.clone(), transparent, name: name.clone(), tparams: tparams.iter().map(|t| t.name.clone()).collect(), public: false, span, shape: crate::derive::DShape::Enum(dvariants.clone()) };
             let ms = data_methods(methods, &mopts);
             self.djobs.push(crate::derive_data::DataJob { job, go_name: data_name.clone(), methods: ms });
         }
-        if derives.iter().any(|d| d == "Json") {
-            self.jobs.push(crate::derive::DeriveJob { name: name.clone(), go_name: data_name.clone(), transparent, tparams: tparams.iter().map(|t| t.name.clone()).collect(), public: false, span, shape: crate::derive::DShape::Enum(dvariants) });
+        for d in derives.iter().filter(|d| matches!(d.as_str(), "Json" | "Arbitrary")) {
+            self.jobs.push(crate::derive::DeriveJob { derive: d.clone(), go_name: data_name.clone(), transparent, name: name.clone(), tparams: tparams.iter().map(|t| t.name.clone()).collect(), public: false, span, shape: crate::derive::DShape::Enum(dvariants.clone()) });
         }
         Ok(EnumDef { name, span, error: false, tparams, variants })
     }
@@ -1009,18 +1128,23 @@ impl<'a> Parser<'a> {
         let span = start.to(self.prev_span());
         if derives.iter().any(|d| d == "Gob") {
             let dfields = fields.iter().zip(fopts.iter()).map(|((n, t, s), o)| crate::derive::DField { name: n.clone(), ty: t.clone(), opts: o.clone(), span: *s }).collect();
-            let job = crate::derive::DeriveJob { name: name.clone(), go_name: data_name.clone(), transparent, tparams: tparams.iter().map(|t| t.name.clone()).collect(), public: false, span, shape: crate::derive::DShape::Struct(dfields) };
+            let job = crate::derive::DeriveJob { derive: "Gob".into(), go_name: data_name.clone(), transparent, name: name.clone(), tparams: tparams.iter().map(|t| t.name.clone()).collect(), public: false, span, shape: crate::derive::DShape::Struct(dfields) };
             self.gjobs.push(crate::derive_gob::GobJob { job, go_name: data_name.clone() });
         }
         if derives.iter().any(|d| d == "Data") {
             let dfields = fields.iter().zip(fopts.iter()).map(|((n, t, s), o)| crate::derive::DField { name: n.clone(), ty: t.clone(), opts: o.clone(), span: *s }).collect();
-            let job = crate::derive::DeriveJob { name: name.clone(), go_name: data_name.clone(), transparent, tparams: tparams.iter().map(|t| t.name.clone()).collect(), public: false, span, shape: crate::derive::DShape::Struct(dfields) };
+            let job = crate::derive::DeriveJob { derive: "Data".into(), go_name: data_name.clone(), transparent, name: name.clone(), tparams: tparams.iter().map(|t| t.name.clone()).collect(), public: false, span, shape: crate::derive::DShape::Struct(dfields) };
             let ms = data_methods(methods, &mopts);
             self.djobs.push(crate::derive_data::DataJob { job, go_name: data_name.clone(), methods: ms });
         }
-        if derives.iter().any(|d| d == "Json") {
-            let dfields = fields.iter().zip(fopts).map(|((n, t, s), o)| crate::derive::DField { name: n.clone(), ty: t.clone(), opts: o, span: *s }).collect();
-            self.jobs.push(crate::derive::DeriveJob { name: name.clone(), go_name: data_name.clone(), transparent, tparams: tparams.iter().map(|t| t.name.clone()).collect(), public: false, span, shape: crate::derive::DShape::Struct(dfields) });
+        let dfields: Vec<crate::derive::DField> = fields.iter().zip(fopts).map(|((n, t, s), o)| crate::derive::DField { name: n.clone(), ty: t.clone(), opts: o, span: *s }).collect();
+        if derives.iter().any(|d| d == "Xml") {
+            let job = crate::derive::DeriveJob { derive: "Xml".into(), go_name: data_name.clone(), transparent, name: name.clone(), tparams: tparams.iter().map(|t| t.name.clone()).collect(), public: false, span, shape: crate::derive::DShape::Struct(dfields.clone()) };
+            let ms = methods[first_method..].iter().map(|d| d.name.rsplit('.').next().unwrap_or(&d.name).to_string()).collect();
+            self.xjobs.push(crate::derive_xml::XmlJob { job, methods: ms });
+        }
+        for d in derives.iter().filter(|d| matches!(d.as_str(), "Json" | "Arbitrary")) {
+            self.jobs.push(crate::derive::DeriveJob { derive: d.clone(), go_name: data_name.clone(), transparent, name: name.clone(), tparams: tparams.iter().map(|t| t.name.clone()).collect(), public: false, span, shape: crate::derive::DShape::Struct(dfields.clone()) });
         }
         Ok(StructDef { name, span, tparams, fields })
     }
@@ -1163,6 +1287,11 @@ impl<'a> Parser<'a> {
 
     fn braced_stmts(&mut self) -> PResult<Vec<Stmt>> {
         self.expect_op("{")?;
+        self.stmts_to_brace()
+    }
+
+    /// Statements up to the closing `}` (the `{` already read).
+    fn stmts_to_brace(&mut self) -> PResult<Vec<Stmt>> {
         let saved = std::mem::replace(&mut self.in_cond, false);
         let mut out = vec![];
         loop {
@@ -1444,7 +1573,7 @@ impl<'a> Parser<'a> {
                     let mut qual = String::new();
                     let qsp = self.span();
                     // `pkg.Type(v)`: an implementor of an interface from another
-                    // package (a type switch, D65); the name keeps its package.
+                    // package (a type switch, D71); the name keeps its package.
                     let pkg_type = k == 2 && !has_type && matches!(self.peek_at(0), Tok::Ident(_)) && matches!(self.peek_at(2), Tok::Const(_)) && matches!(self.peek_at(3), Tok::Op("(")) && !self.space_before_at(3);
                     if pkg_type {
                         if let Tok::Ident(p) = self.bump().tok {
@@ -2385,6 +2514,60 @@ pub fn describe(t: &Tok) -> String {
         Tok::Newline => "end of line".into(),
         Tok::Eof => "end of file".into(),
     }
+}
+
+
+/// Is `#[...]`'s text an `embed(...)` attribute?
+fn is_embed_attr(a: &str) -> bool {
+    a.trim_start().strip_prefix("embed").is_some_and(|r| r.trim_start().starts_with('('))
+}
+
+/// The patterns of `embed("a.txt", "static/*.html")`: string literals
+/// (double-quoted with Go's simple escapes, or backquoted), comma-separated.
+fn embed_patterns(a: &str) -> Result<Vec<String>, String> {
+    let usage = "write `#[embed(\"file.txt\")]` (one or more quoted patterns, comma-separated)";
+    let inner = a.trim().strip_prefix("embed").map(str::trim).and_then(|r| r.strip_prefix('(')).and_then(|r| r.trim_end().strip_suffix(')')).ok_or(usage)?;
+    let mut out = vec![];
+    let mut cs = inner.trim().chars().peekable();
+    loop {
+        while cs.peek().is_some_and(|c| c.is_whitespace()) {
+            cs.next();
+        }
+        let Some(q) = cs.next() else { break };
+        if q != '"' && q != '`' {
+            return Err(usage.into());
+        }
+        let mut p = String::new();
+        loop {
+            match cs.next() {
+                None => return Err("unterminated pattern in `#[embed(...)]`".into()),
+                Some(c) if c == q => break,
+                Some('\\') if q == '"' => match cs.next() {
+                    Some('n') => p.push('\n'),
+                    Some('t') => p.push('\t'),
+                    Some(c) => p.push(c),
+                    None => return Err("unterminated pattern in `#[embed(...)]`".into()),
+                },
+                Some(c) => p.push(c),
+            }
+        }
+        if p.is_empty() {
+            return Err("an empty pattern in `#[embed(...)]`".into());
+        }
+        out.push(p);
+        while cs.peek().is_some_and(|c| c.is_whitespace()) {
+            cs.next();
+        }
+        match cs.next() {
+            None => break,
+            Some(',') => {}
+            _ => return Err(usage.into()),
+        }
+    }
+    if out.is_empty() {
+        return Err(usage.into());
+    }
+    Ok(out)
 }
 
 /// The methods a derive(Data) sees: each recorded method with its

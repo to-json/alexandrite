@@ -160,6 +160,8 @@ static inline AlxRegion *alx_region_of(const void *p) {
 /* Stats (all threads): bytes held in chunks/large blocks, live regions + free lists. */
 size_t alx_mem_held(void);
 size_t alx_mem_peak(void);
+bool alx_count_allocs(bool on);
+int64_t alx_alloc_count(void);
 
 /* ---------- panics ---------- */
 _Noreturn void alx_panic(const char *what, const char *loc);

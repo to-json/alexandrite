@@ -1,0 +1,193 @@
+# Marshal and Unmarshal (Go's marshal.go and read.go without reflection):
+# the protocol that `#[derive(Xml)]` writes, the interfaces a hand-written
+# type implements instead (their default methods give it the protocol), and
+# the conversions of simple values.
+
+import "strconv"
+import "strings"
+
+# ---------------------------------------------------------------- interfaces
+#
+# The order of these declarations is the order of precedence when a type
+# has the required methods of several (Go's: Marshaler before
+# TextMarshaler, Unmarshaler before TextUnmarshaler).
+
+# A type that writes itself as zero or more XML elements (Go's Marshaler).
+# `start` is the element the value would be written as (its name from the
+# field, a template, or the value); using it is not required.
+pub interface Marshaler {
+  def marshal_xml(e: Encoder, start: StartElement) -> ~Unit
+
+  def xml_enc(e: Encoder, tmpl: StartElement?, fname: Name) -> ~Unit {
+    start = start_for(tmpl, Name.new, fname, "")
+    n = e.begin_marshaler!
+    self.~marshal_xml(e, start)
+    e.~end_marshaler!(n, "")
+  }
+}
+
+# A type that reads itself from one XML element (Go's Unmarshaler). It must
+# consume the element exactly, up to its end element, with d.token! (not
+# raw_token!).
+pub interface Unmarshaler {
+  def unmarshal_xml!(d: Decoder, start: StartElement) -> ~Unit
+
+  def xml_dec!(d: Decoder, start: StartElement) -> ~Unit {
+    d.~check_depth
+    saved = d.begin_unmarshaler!
+    r = self.unmarshal_xml!(d, start)
+    d.~end_unmarshaler!(saved, r.err, "", start)
+  }
+}
+
+# A type that writes itself as an attribute (Go's MarshalerAttr). An Attr
+# with an empty local name writes nothing.
+pub interface MarshalerAttr {
+  def marshal_xml_attr(name: Name) -> ~Attr
+
+  def xml_attr(name: Name) -> ~Attr? {
+    a = self.~marshal_xml_attr(name)
+    return none if a.name.local == ""
+    a
+  }
+}
+
+# A type that reads itself from an attribute (Go's UnmarshalerAttr).
+pub interface UnmarshalerAttr {
+  def unmarshal_xml_attr!(a: Attr) -> ~Unit
+
+  def xml_attr_dec!(a: Attr) -> ~Unit {
+    self.~unmarshal_xml_attr!(a)
+  }
+}
+
+# A type with a text form (Go's encoding.TextMarshaler, as XML uses it): an
+# element with the escaped text, an attribute value, character data.
+pub interface TextMarshaler {
+  def marshal_text -> ~[Byte]
+
+  def xml_enc(e: Encoder, tmpl: StartElement?, fname: Name) -> ~Unit {
+    start = start_for(tmpl, Name.new, fname, "")
+    e.~write_start!(start)
+    text = self.~marshal_text
+    e.escape_bytes!(text)
+    e.~write_end!(start.name)
+  }
+
+  def xml_attr(name: Name) -> ~Attr? {
+    text = self.~marshal_text
+    Attr.new(name: name, value: Str.from_bytes(text))
+  }
+
+  def xml_chardata -> ~[Byte]? {
+    self.~marshal_text
+  }
+}
+
+# A type read from its text form (Go's encoding.TextUnmarshaler): the
+# character data directly inside the element, or an attribute value.
+pub interface TextUnmarshaler {
+  def unmarshal_text!(text: [Byte]) -> ~Unit
+
+  def xml_dec!(d: Decoder, start: StartElement) -> ~Unit {
+    d.~check_depth
+    text = d.~element_text!
+    self.~unmarshal_text!(text)
+  }
+
+  def xml_attr_dec!(a: Attr) -> ~Unit {
+    self.~unmarshal_text!(a.value.bytes)
+  }
+
+  def xml_text_dec!(b: [Byte]) -> ~Unit {
+    self.~unmarshal_text!(b)
+  }
+}
+
+# Anything that gives tokens (Go's TokenReader); none at the end.
+pub interface TokenReader {
+  def token! -> ~Token?
+}
+
+# ---------------------------------------------------------------- Marshal / Unmarshal
+
+# The XML encoding of v (Go's Marshal): any value with the protocol (a
+# `#[derive(Xml)]` type, or one implementing Marshaler or TextMarshaler).
+pub def marshal[T](v: T) -> ~[Byte] {
+  e = new_buffer_encoder()
+  e.~encode!(v)
+  e.~close!
+  e.output.bytes
+}
+
+# Like marshal, with each element on a new line starting with prefix and one
+# indent per level (Go's MarshalIndent).
+pub def marshal_indent[T](v: T, prefix: Str, indent: Str) -> ~[Byte] {
+  e = new_buffer_encoder()
+  e.indent!(prefix, indent)
+  e.~encode!(v)
+  e.~close!
+  e.output.bytes
+}
+
+# Parses the XML document in data into a copy of v and returns it (Go's
+# Unmarshal(data, &v)): fields of v that the document doesn't mention keep
+# their values.
+pub def unmarshal[T](data: [Byte], v: T) -> ~T {
+  d = new_bytes_decoder(data)
+  d.~decode!(v)
+}
+
+# ---------------------------------------------------------------- simple values
+
+# Go's copyValue for each kind: the text of an element or an attribute.
+# Empty text is the zero value; numbers and booleans have their white space
+# trimmed.
+pub def text_int(b: [Byte], bits: Int) -> ~Int {
+  return 0 if b.size == 0
+  ~strconv.parse_int(strings.trim_space(Str.from_bytes(b)), 10, bits)
+}
+
+pub def text_uint(b: [Byte], bits: Int) -> ~U64 {
+  return 0 if b.size == 0
+  ~strconv.parse_uint(strings.trim_space(Str.from_bytes(b)), 10, bits)
+}
+
+pub def text_float(b: [Byte]) -> ~Float {
+  return 0.0 if b.size == 0
+  ~strconv.parse_float(strings.trim_space(Str.from_bytes(b)))
+}
+
+pub def text_bool(b: [Byte]) -> ~Bool {
+  return false if b.size == 0
+  ~strconv.parse_bool(strings.trim_space(Str.from_bytes(b)))
+}
+
+# Go's 'g' formatting of a float64 (strconv.FormatFloat(f, 'g', -1, 64)).
+pub def float_text(f: Float) -> Str {
+  strconv.format_float(f, "g", -1, 64)
+}
+
+# The error for character data, an attribute or an element that can't go
+# into a field of the type named t (Go's copyValue default).
+pub def cannot_unmarshal(t: Str) -> Error { other("cannot unmarshal into #{t}") }
+
+# Go's "unknown type" for an element into a field of a type unmarshal can't
+# fill.
+pub def unknown_type(t: Str) -> Error { other("unknown type #{t}") }
+
+# The error for a comment field that holds a value with no text (Go: a nil
+# pointer or interface).
+pub def bad_comment(t: Str) -> Error { other("xml: bad type for comment field of #{t}") }
+
+# UnmarshalError: an element whose name doesn't match the type's xml_name tag.
+pub def wrong_element(want_space: Str, want: Str, start: StartElement) -> ~Unit {
+  if want != "" && want != start.name.local {
+    fail XmlError.Unmarshal("expected element type <#{want}> but have <#{start.name.local}>")
+  }
+  if want_space != "" && want_space != start.name.space {
+    have = start.name.space == "" ? "no name space" : start.name.space
+    fail XmlError.Unmarshal("expected element <#{want}> in name space #{want_space} but have #{have}")
+  }
+  nil
+}

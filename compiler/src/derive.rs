@@ -273,8 +273,8 @@ pub fn derive_names(text: &str, sp: Span) -> Result<Option<Vec<String>>, Diag> {
     let names: Vec<String> = inner.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
     for n in &names {
         // Eq and Show are structural already (D13, D14): accepted, nothing to generate.
-        if !matches!(n.as_str(), "Json" | "Data" | "Gob" | "Eq" | "Show") {
-            return Err(Diag::new(sp, format!("can't derive `{n}`")).note("derivable: Json (generates to_json / from_json), Data (a dynamic dyn.Value tree: to_data / from_data), Gob (encoding/gob's protocol); Eq and Show are accepted and need nothing: structs, tuples and enums already compare and print field by field"));
+        if !matches!(n.as_str(), "Json" | "Data" | "Gob" | "Xml" | "Arbitrary" | "Eq" | "Show") {
+            return Err(Diag::new(sp, format!("can't derive `{n}`")).note("derivable: Json (generates to_json / from_json), Data (a dynamic dyn.Value tree: to_data / from_data), Xml (encoding/xml: to_xml / from_xml and the Marshal protocol), Arbitrary (generates `self.arbitrary` for testing/quick); Eq and Show are accepted and need nothing: structs, tuples and enums already compare and print field by field"));
         }
     }
     Ok(Some(names))
@@ -303,6 +303,8 @@ pub enum DShape {
 
 #[derive(Clone, Debug)]
 pub struct DeriveJob {
+    /// `Json` or `Arbitrary`.
+    pub derive: String,
     pub name: String,
     /// `#[data("pkg.T")]`: the Go type name consumers see (json/v2 errors).
     pub go_name: Option<String>,
@@ -992,4 +994,85 @@ impl<'a> Gen<'a> {
             _ => return None,
         })
     }
+}
+
+// ---------------------------------------------------------------- Arbitrary
+
+/// `#[derive(Arbitrary)]`: `def self.arbitrary(r: R.Rand, size: Int) -> T`,
+/// the random values testing/quick checks with (Go's quick.sizedValue for a
+/// struct: each field gets size / fields; an enum picks a variant
+/// uniformly). `q` and `r` are the local names of testing/quick and
+/// math/rand.
+pub fn arbitrary_source(job: &DeriveJob, q: &str, r: &str) -> Result<String, Diag> {
+    let fail = |m: String| Diag::new(job.span, format!("derive(Arbitrary) on `{}`: {m}", job.name));
+    if !job.tparams.is_empty() {
+        return Err(fail("generic types can't derive Arbitrary yet; write `def self.arbitrary(r, size)` by hand".to_string()));
+    }
+    let name = &job.name;
+    let args = |fields: &[DField], size: &str| -> Result<String, Diag> {
+        let named = fields.iter().any(|f| f.name.parse::<usize>().is_err());
+        let mut parts = vec![];
+        for f in fields {
+            let g = arb_gen(&f.ty, q, r).map_err(&fail)?;
+            let v = format!("{g}.generate(_r, {size})");
+            parts.push(if named { format!("{}: {v}", f.name) } else { v });
+        }
+        Ok(parts.join(", "))
+    };
+    let mut o = format!("struct {name} {{\n  pub def self.arbitrary(_r: {r}.Rand, _size: Int) -> {name} {{\n");
+    match &job.shape {
+        DShape::Struct(fields) => {
+            o.push_str(&format!("    _s = {q}.field_size(_size, {})\n", fields.len()));
+            o.push_str(&format!("    {name}.new({})\n", args(fields, "_s")?));
+        }
+        DShape::Enum(vs) => {
+            if vs.is_empty() {
+                return Err(fail("an enum without variants has no values".to_string()));
+            }
+            o.push_str("    _rr = _r\n");
+            o.push_str(&format!("    _k = _rr.intn!({})\n", vs.len()));
+            o.push_str("    case _k {\n");
+            for (k, v) in vs.iter().enumerate() {
+                let arm = if k + 1 == vs.len() { "_".to_string() } else { k.to_string() };
+                if v.fields.is_empty() {
+                    o.push_str(&format!("      {arm} => {name}.{}\n", v.name));
+                } else {
+                    o.push_str(&format!("      {arm} => {{\n        _s = {q}.field_size(_size, {})\n        {name}.{}({})\n      }}\n", v.fields.len(), v.name, args(&v.fields, "_s")?));
+                }
+            }
+            o.push_str("    }\n");
+        }
+    }
+    o.push_str("  }\n}\n");
+    Ok(o)
+}
+
+/// The testing/quick generator expression for a field of type `t`.
+fn arb_gen(t: &TypeExpr, q: &str, r: &str) -> Result<String, String> {
+    Ok(match t {
+        TypeExpr::Named(n, _) => match n.as_str() {
+            "Int" => format!("{q}.int"),
+            "I64" => format!("{q}.i64"),
+            "I32" => format!("{q}.i32"),
+            "I16" => format!("{q}.i16"),
+            "I8" => format!("{q}.i8"),
+            "U64" => format!("{q}.u64"),
+            "U32" => format!("{q}.u32"),
+            "U16" => format!("{q}.u16"),
+            "U8" | "Byte" => format!("{q}.u8"),
+            "Rune" => format!("{q}.rune"),
+            "Float" | "F64" => format!("{q}.float"),
+            "Complex" => format!("{q}.complex"),
+            "Bool" => format!("{q}.bool"),
+            "Str" => format!("{q}.str"),
+            _ if n.chars().next().is_some_and(|c| c.is_uppercase()) || n.contains('.') => format!("{q}.Arb[{n}].gen"),
+            _ => return Err(format!("no generator for a field of type `{n}`")),
+        },
+        TypeExpr::Array(e, _) => format!("{q}.slice_of({})", arb_gen(e, q, r)?),
+        TypeExpr::Opt(e, _) => format!("{q}.opt_of({})", arb_gen(e, q, r)?),
+        TypeExpr::App(n, args, _) if n == "Map" && args.len() == 2 => format!("{q}.map_of({}, {})", arb_gen(&args[0], q, r)?, arb_gen(&args[1], q, r)?),
+        TypeExpr::Tuple(ts, _) if ts.len() == 2 => format!("{q}.tuple2({}, {})", arb_gen(&ts[0], q, r)?, arb_gen(&ts[1], q, r)?),
+        TypeExpr::Tuple(ts, _) if ts.len() == 3 => format!("{q}.tuple3({}, {}, {})", arb_gen(&ts[0], q, r)?, arb_gen(&ts[1], q, r)?, arb_gen(&ts[2], q, r)?),
+        _ => return Err(format!("no generator for a field of type `{}`; write `def self.arbitrary(r, size)` by hand", type_src(t))),
+    })
 }

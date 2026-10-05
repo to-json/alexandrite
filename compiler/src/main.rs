@@ -10,7 +10,7 @@ const USAGE: &str = "usage: alx run [--release] [--sanitize] [--expect VALUE] [-
        alx check file.alx
        alx explain mem file.alx
        alx fmt [--check] [files|dirs...]
-       alx test [--release] [-run NAME] [-bench NAME] [-benchtime DUR] [dir | file_test.alx]";
+       alx test [--release] [-v] [-short] [-run NAME[/SUB]] [-bench NAME] [-benchtime DUR] [dir | file_test.alx]";
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -32,7 +32,7 @@ fn main() -> ExitCode {
     }
     let mut o = driver::Options::default();
     let mut file = None;
-    let mut t = alx::front::TestOpts { run: None, bench: None, bench_ns: 500_000_000 };
+    let mut t = alx::front::TestOpts { run: None, bench: None, bench_ns: 500_000_000, short: false };
     if let Some(v) = std::env::var("ALX_BENCHTIME").ok().and_then(|v| driver::parse_duration_ns(&v)) {
         t.bench_ns = v;
     }
@@ -50,6 +50,7 @@ fn main() -> ExitCode {
             "--strict" => o.strict = true,
             "--expect" => o.expect = val(),
             "-run" => t.run = val(),
+            "-short" => t.short = true,
             "-bench" => t.bench = val(),
             "-benchtime" => match val().as_deref().and_then(driver::parse_duration_ns) {
                 Some(ns) => t.bench_ns = ns,

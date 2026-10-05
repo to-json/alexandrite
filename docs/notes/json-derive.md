@@ -21,7 +21,7 @@ v = ~json.parse(s)              # a dynamic Value: v.get("name"), v.keys, ...
 ## Derives
 
 (encoding/json/v2's methods come from the same derive in files that use v2:
-docs/notes/json-v2.md, GO-VS-RUBY D62.)
+docs/notes/json-v2.md, GO-VS-RUBY D70.)
 
 - **Syntax:** `#[derive(Json)]` (a list is accepted: `#[derive(Json, Eq)]`; `Eq` and `Show` need nothing, structs, tuples and enums already compare and print field by field) before `struct` and `enum`. Field and variant options: `#[json("name")]`, `#[json(omit_empty)]`, `#[json(skip)]`, combinable (`#[json("n", omit_empty)]`). Go's tag form `#[field(json: "n,omitempty")]` says the same (S5, data-derive.md). The lexer's attribute token now ends at the matching `]` (strings and brackets inside count).
 - **Where it expands:** in the parser (`compiler/src/derive.rs`), as source text. The parser records each derived declaration while reading the module; at the end of the module the generator writes `struct Name { def ... }` as text, lexes it, gives every token the span of the declaration, and parses it with the same parser; the defs become methods of the type. No checker, lowering or backend change was needed for derives themselves. If the file has no `import "encoding/json"`, one is added.

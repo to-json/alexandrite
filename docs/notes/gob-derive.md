@@ -1,6 +1,6 @@
 # S5: `#[derive(Gob)]` and `encoding/gob`
 
-Go's gob, byte for byte, without reflection (GO-VS-RUBY D66). The user-facing description is the header of `std/encoding/gob/gob.alx`.
+Go's gob, byte for byte, without reflection (GO-VS-RUBY D72). The user-facing description is the header of `std/encoding/gob/gob.alx`.
 
 ```ruby
 import "encoding/gob"
@@ -57,7 +57,7 @@ A type outside the derive provides the same methods: math/big's Int, Float and R
 
 - **Names.** Go's field names are exported identifiers; an alx field's default is CamelCase (`user_id` -> `UserId`), the `gob:` key of `#[field(...)]` (parsed once in derive.rs, `Opts.tags`) overrides it, `"-"` leaves the field out. The type's Go name and package come from `#[data("pkg.T")]`, the attribute Data uses for the same thing; default `main.T`, which matches Go programs' `package main`.
 - **Enum mapping** as above. A positional variant with one field sends that field's type itself, so `Rect(Rect)` interoperates with Go code that puts a `Rect` in an interface; other variants are structs named after the variant. `E?` is a nil-able interface; a nil received into a plain `E` field gives the enum's zero value.
-- **Decode into a value** (`v = dec.~decode!(v)`): Go decodes into what a pointer points at, keeping fields the stream doesn't mention; a static `T.gob_decode` on a type parameter couldn't reach refinements anyway (port-issues #109).
+- **Decode into a value** (`v = dec.~decode!(v)`): Go decodes into what a pointer points at, keeping fields the stream doesn't mention; a static `T.gob_decode` on a type parameter couldn't reach refinements anyway (port-issues #121).
 - **Per-Encoder ids**: Go's are process-global; a fresh Encoder here numbers as a fresh Go process does, which is what the byte vectors compare against.
 
 ## Tests
@@ -73,4 +73,4 @@ A type outside the derive provides the same methods: math/big's Int, Float and R
 ## Compiler changes
 
 - `derive_gob.rs` (new), hooks in `parser.rs` (a `gjobs` list, `expand_gob_derives`) and `derive.rs` (`Gob` accepted).
-- `lower.rs` `copy_value`: a fixed array copied into a local is allocated in the region of the array it copies (port-issues #108).
+- `lower.rs` `copy_value`: a fixed array copied into a local is allocated in the region of the array it copies (port-issues #120).

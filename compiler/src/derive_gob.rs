@@ -1,5 +1,5 @@
 //! `#[derive(Gob)]`: compile-time generation of `encoding/gob` code
-//! (GO-VS-RUBY D66, docs/notes/gob-derive.md).
+//! (GO-VS-RUBY D72, docs/notes/gob-derive.md).
 //!
 //! Like `#[derive(Json)]` (derive.rs) and `#[derive(Data)]`
 //! (derive_data.rs), this is expansion by source text: the parser records

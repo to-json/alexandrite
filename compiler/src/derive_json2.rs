@@ -1,4 +1,4 @@
-//! `#[derive(Json)]`, part two: the encoding/json/v2 methods (GO-VS-RUBY D62).
+//! `#[derive(Json)]`, part two: the encoding/json/v2 methods (GO-VS-RUBY D70).
 //!
 //! The same derive as derive.rs (v1), the same field analysis and tags
 //! (`derive::Opts`, parsed once by `apply_field_attr`), written only when the

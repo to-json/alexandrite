@@ -1,0 +1,509 @@
+import "bytes"
+import "io"
+import "strings"
+import "unicode/utf8"
+
+# Go's xml_test.go (the tests that don't need a derived type; those are in
+# derives/), and the token-level tests of marshal_test.go.
+
+TEST_INPUT = "\n<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE html PUBLIC \"-//W3C//DTD XHTML 1.0 Transitional//EN\"\n  \"http://www.w3.org/TR/xhtml1/DTD/xhtml1-transitional.dtd\">\n<body xmlns:foo=\"ns1\" xmlns=\"ns2\" xmlns:tag=\"ns3\" \r\n\t  >\n  <hello lang=\"en\">World &lt;&gt;&apos;&quot; &#x767d;&#40300;翔</hello>\n  <query>&何; &is-it;</query>\n  <goodbye />\n  <outer foo:attr=\"value\" xmlns:tag=\"ns4\">\n    <inner/>\n  </outer>\n  <tag:name>\n    <![CDATA[Some text here.]]>\n  </tag:name>\n</body><!-- missing final newline -->"
+
+def test_entity -> Map[Str, Str] { {"何" => "What", "is-it" => "is it?"} }
+
+DOCTYPE = "DOCTYPE html PUBLIC \"-//W3C//DTD XHTML 1.0 Transitional//EN\"\n  \"http://www.w3.org/TR/xhtml1/DTD/xhtml1-transitional.dtd\""
+
+def raw_tokens -> [Token] {
+  [
+    cd("\n"),
+    proc_inst("xml", "version=\"1.0\" encoding=\"UTF-8\""),
+    cd("\n"),
+    directive(DOCTYPE),
+    cd("\n"),
+    se("body", [at("xmlns", "foo", "ns1"), at("", "xmlns", "ns2"), at("xmlns", "tag", "ns3")]),
+    cd("\n  "),
+    se("hello", [at("", "lang", "en")]),
+    cd("World <>'\" 白鵬翔"),
+    en("hello"),
+    cd("\n  "),
+    se("query", []),
+    cd("What is it?"),
+    en("query"),
+    cd("\n  "),
+    se("goodbye", []),
+    en("goodbye"),
+    cd("\n  "),
+    se("outer", [at("foo", "attr", "value"), at("xmlns", "tag", "ns4")]),
+    cd("\n    "),
+    se("inner", []),
+    en("inner"),
+    cd("\n  "),
+    en("outer"),
+    cd("\n  "),
+    sen("tag", "name", []),
+    cd("\n    "),
+    cd("Some text here."),
+    cd("\n  "),
+    enn("tag", "name"),
+    cd("\n"),
+    en("body"),
+    comment(" missing final newline "),
+  ]
+}
+
+def cooked_tokens -> [Token] {
+  [
+    cd("\n"),
+    proc_inst("xml", "version=\"1.0\" encoding=\"UTF-8\""),
+    cd("\n"),
+    directive(DOCTYPE),
+    cd("\n"),
+    sen("ns2", "body", [at("xmlns", "foo", "ns1"), at("", "xmlns", "ns2"), at("xmlns", "tag", "ns3")]),
+    cd("\n  "),
+    sen("ns2", "hello", [at("", "lang", "en")]),
+    cd("World <>'\" 白鵬翔"),
+    enn("ns2", "hello"),
+    cd("\n  "),
+    sen("ns2", "query", []),
+    cd("What is it?"),
+    enn("ns2", "query"),
+    cd("\n  "),
+    sen("ns2", "goodbye", []),
+    enn("ns2", "goodbye"),
+    cd("\n  "),
+    sen("ns2", "outer", [at("ns1", "attr", "value"), at("xmlns", "tag", "ns4")]),
+    cd("\n    "),
+    sen("ns2", "inner", []),
+    enn("ns2", "inner"),
+    cd("\n  "),
+    enn("ns2", "outer"),
+    cd("\n  "),
+    sen("ns3", "name", []),
+    cd("\n    "),
+    cd("Some text here."),
+    cd("\n  "),
+    enn("ns3", "name"),
+    cd("\n"),
+    enn("ns2", "body"),
+    comment(" missing final newline "),
+  ]
+}
+
+# Go's testRawToken: the tokens, and that InputOffset brackets each one.
+def check_raw_tokens(d0: Decoder, raw: Str, want: [Token]) -> Str? {
+  d = d0
+  last_end = 0
+  i = 0
+  for w in want {
+    start = d.input_offset
+    r = d.raw_token!
+    end_ = d.input_offset
+    if e = r.err {
+      return "token #{i}: unexpected error: #{e.message}"
+    }
+    have = r.unwrap || Token.CharData("<none>".bytes)
+    return "token #{i} = #{tok_text(have)}, want #{tok_text(w)}" if have != w
+    if start < last_end {
+      return "token #{i}: position [#{start},#{end_}) is before previous token"
+    } else if start >= end_ {
+      if !(start == end_ && end_ == last_end) {
+        return "token #{i}: position [#{start},#{end_}) is empty"
+      }
+    } else if end_ > raw.size {
+      return "token #{i}: position extends beyond input"
+    } else {
+      text = raw[start...end_]
+      if strings.contains_any(text, "<>") && (!strings.has_prefix(text, "<") || !strings.has_suffix(text, ">")) {
+        return "token #{i}: misaligned raw token #{text}"
+      }
+    }
+    last_end = end_
+    i += 1
+  }
+  none
+}
+
+test "RawToken" {
+  d = new_string_decoder(TEST_INPUT)
+  d.entity = test_entity()
+  assert_eq check_raw_tokens(d, TEST_INPUT, raw_tokens()), none
+}
+
+NON_STRICT_INPUT = "\n<tag>non&entity</tag>\n<tag>&unknown;entity</tag>\n<tag>&#123</tag>\n<tag>&#zzz;</tag>\n<tag>&なまえ3;</tag>\n<tag>&lt-gt;</tag>\n<tag>&;</tag>\n<tag>&0a;</tag>\n"
+
+test "NonStrictRawToken" {
+  want: [Token] = [cd("\n")]
+  for s in ["non&entity", "&unknown;entity", "&#123", "&#zzz;", "&なまえ3;", "&lt-gt;", "&;", "&0a;"] {
+    want << se("tag", [])
+    want << cd(s)
+    want << en("tag")
+    want << cd("\n")
+  }
+  d = new_string_decoder(NON_STRICT_INPUT)
+  d.strict = false
+  assert_eq check_raw_tokens(d, NON_STRICT_INPUT, want), none
+}
+
+ALT_INPUT = "\n<?xml version=\"1.0\" encoding=\"x-testing-uppercase\"?>\n<TAG>VALUE</TAG>"
+
+test "RawTokenAltEncoding" {
+  d = new_string_decoder(ALT_INPUT)
+  d.charset_reader = ->(charset: Str, input: io.Reader) -> ~io.Reader {
+    fail "unexpected charset #{charset}" if charset != "x-testing-uppercase"
+    data = ~io.read_all(input)
+    out: [Byte] = []
+    for c in data {
+      out << (c >= 0x41 && c <= 0x5A ? c + 32 : c)
+    }
+    bytes.new_reader(out)
+  }
+  want = [cd("\n"), proc_inst("xml", "version=\"1.0\" encoding=\"x-testing-uppercase\""), cd("\n"), se("tag", []), cd("value"), en("tag")]
+  assert_eq check_raw_tokens(d, ALT_INPUT, want), none
+}
+
+test "RawTokenAltEncodingNoConverter" {
+  d = new_string_decoder(ALT_INPUT)
+  t = d.raw_token!.unwrap
+  assert !t.none?, "expected a token on first RawToken call"
+  r = d.raw_token!
+  e = r.err || XmlError.Other("no error")
+  assert ssub(e.message, "x-testing-uppercase"), e.message
+}
+
+NESTED_DIRECTIVES = "\n<!DOCTYPE [<!ENTITY rdf \"http://www.w3.org/1999/02/22-rdf-syntax-ns\#\">]>\n<!DOCTYPE [<!ENTITY xlt \">\">]>\n<!DOCTYPE [<!ENTITY xlt \"<\">]>\n<!DOCTYPE [<!ENTITY xlt '>'>]>\n<!DOCTYPE [<!ENTITY xlt '<'>]>\n<!DOCTYPE [<!ENTITY xlt '\">'>]>\n<!DOCTYPE [<!ENTITY xlt \"'<\">]>\n"
+
+test "NestedDirectives" {
+  want = [cd("\n"), directive("DOCTYPE [<!ENTITY rdf \"http://www.w3.org/1999/02/22-rdf-syntax-ns\#\">]"), cd("\n"), directive("DOCTYPE [<!ENTITY xlt \">\">]"), cd("\n"), directive("DOCTYPE [<!ENTITY xlt \"<\">]"), cd("\n"), directive("DOCTYPE [<!ENTITY xlt '>'>]"), cd("\n"), directive("DOCTYPE [<!ENTITY xlt '<'>]"), cd("\n"), directive("DOCTYPE [<!ENTITY xlt '\">'>]"), cd("\n"), directive("DOCTYPE [<!ENTITY xlt \"'<\">]"), cd("\n")]
+  assert_eq toks_text(all_tokens(NESTED_DIRECTIVES).unwrap), toks_text(want)
+}
+
+test "Token" {
+  d = new_string_decoder(TEST_INPUT)
+  d.entity = test_entity()
+  for want in cooked_tokens() {
+    have = d.~token!
+    assert_eq ot(have), tok_text(want)
+  }
+}
+
+test "Syntax" {
+  inputs = ["<", "<t", "<t ", "<t/", "<!", "<!-", "<!--", "<!--c-", "<!--c--", "<!d", "<t></", "<t></t", "<?", "<?p", "<t a", "<t a=", "<t a='", "<t a=''", "<t/><![", "<t/><![C", "<t/><![CDATA[d", "<t/><![CDATA[d]", "<t/><![CDATA[d]]", "<>", "<t/a", "<0 />", "<?0 >", "</0>", "<t 0=''>", "<t a='&'>", "<t a='<'>", "<t>&nbspc;</t>", "<t a>", "<t a=>", "<t a=v>", "<t></e>", "<t></>", "<t></t!", "<t>cdata]]></t>"]
+  for s in inputs {
+    e = token_err(new_string_decoder(s))
+    ok = false
+    if x = e {
+      case x {
+        XmlError.Syntax(_, _) => ok = true
+        _ => nil
+      }
+    }
+    assert ok, "xmlInput #{s}: expected SyntaxError not received"
+  }
+}
+
+test "InputLinePos" {
+  input = "<root>\n<?pi\n ?>  <elt\natt\n=\n\"val\">\n<![CDATA[\n]]><!--\n\n--></elt>\n</root>"
+  want = [(1, 7), (2, 1), (3, 4), (3, 6), (6, 7), (7, 1), (8, 4), (10, 4), (10, 10), (11, 1), (11, 8)]
+  d = new_string_decoder(input)
+  for w in want {
+    d.~token!
+    assert_eq d.input_pos, w
+  }
+}
+
+test "Issue68387" {
+  d = new_string_decoder("<item b=']]>'/>")
+  t1 = d.~raw_token!
+  t2 = d.~raw_token!
+  t3 = d.~raw_token!
+  assert t3.none?, "Missed EOF"
+  assert_eq ot(t1), tok_text(se("item", [at("", "b", "]]>")]))
+  assert_eq ot(t2), tok_text(en("item"))
+}
+
+test "UnquotedAttrs" {
+  d = new_string_decoder("<tag attr=azAZ09:-_\t>")
+  d.strict = false
+  t = d.~token!
+  case t || cd("") {
+    StartElement(s) => {
+      assert_eq s.name.local, "tag"
+      assert_eq s.attr[0].value, "azAZ09:-_"
+      assert_eq s.attr[0].name.local, "attr"
+    }
+    _ => assert false, "not a start element"
+  }
+}
+
+test "ValuelessAttrs" {
+  for tt in [("<p nowrap>", "p", "nowrap"), ("<p nowrap >", "p", "nowrap"), ("<input checked/>", "input", "checked"), ("<input checked />", "input", "checked")] {
+    d = new_string_decoder(tt[0])
+    d.strict = false
+    t = d.~token!
+    case t || cd("") {
+      StartElement(s) => {
+        assert_eq s.name.local, tt[1]
+        assert_eq s.attr[0].value, tt[2]
+        assert_eq s.attr[0].name.local, tt[2]
+      }
+      _ => assert false, "not a start element"
+    }
+  }
+}
+
+test "CopyToken" {
+  data = "same data".bytes
+  tok1 = Token.CharData(data)
+  tok2 = copy_token(tok1)
+  assert tok1 == tok2, "copy differs"
+  data[1] = 0x6F
+  assert tok1 != tok2, "CopyToken(CharData) uses same buffer."
+  attrs = [at("", "lang", "en")]
+  t1 = Token.StartElement(StartElement.new(name: name("", "hello"), attr: attrs))
+  t2 = copy_token(t1)
+  assert t1 == t2, "copy differs"
+  attrs[0] = at("", "lang", "de")
+  assert t1 != t2, "CopyToken(StartElement) uses same buffer."
+  cdata = "<!-- some comment -->".bytes
+  c1 = Token.Comment(cdata)
+  c2 = copy_token(c1)
+  assert c1 == c2, "copy differs"
+  cdata[1] = 0x6F
+  assert c1 != c2, "CopyToken(Comment) uses same buffer."
+}
+
+test "SyntaxErrorLineNum" {
+  e = token_err(new_string_decoder("<P>Foo<P>\n\n<P>Bar</>\n"))
+  line = 0
+  if x = e {
+    case x {
+      XmlError.Syntax(_, l) => line = l
+      _ => nil
+    }
+  }
+  assert_eq line, 3
+}
+
+test "TrailingRawToken and TrailingToken" {
+  d = new_string_decoder("<FOO></FOO>  ")
+  loop {
+    t = d.~raw_token!
+    break if t.none?
+  }
+  assert_eq token_err(new_string_decoder("<FOO></FOO>  ")), none
+  assert_eq token_err(new_string_decoder("<test><![CDATA[ &val=foo ]]></test>")), none
+}
+
+test "DisallowedCharacters" {
+  cases = [
+    (Str.from_bytes([0x12]) + "<doc/>", "illegal character code U+0012"),
+    ("<?xml version=\"1.0\"?>\x0b<doc/>", "illegal character code U+000B"),
+    (Str.from_bytes([0xef, 0xbf, 0xbe]) + "<doc/>", "illegal character code U+FFFE"),
+    ("<?xml version=\"1.0\"?><doc>\r\n<hiya/>\x07<toots/></doc>", "illegal character code U+0007"),
+    ("<?xml version=\"1.0\"?><doc \x12='value'>what's up</doc>", "expected attribute name in element"),
+    ("<doc>&abc\x01;</doc>", "invalid character entity &abc (no semicolon)"),
+    ("<doc>&\x01;</doc>", "invalid character entity & (no semicolon)"),
+    ("<doc>&" + Str.from_bytes([0xef, 0xbf, 0xbe]) + ";</doc>", "invalid character entity &" + Str.from_bytes([0xef, 0xbf, 0xbe]) + ";"),
+    ("<doc>&hello;</doc>", "invalid character entity &hello;"),
+  ]
+  for c in cases {
+    assert_eq syntax_msg(token_err(new_string_decoder(c[0]))), c[1]
+  }
+}
+
+test "IsInCharacterRange" {
+  for r in [utf8.MAX_RUNE.to_i + 1, 0xD800, 0xDFFF, -1] {
+    assert !in_character_range?(r), "rune #{r} considered valid"
+  }
+}
+
+test "ProcInstEncoding" {
+  cases = [
+    ("version=\"1.0\" encoding=\"utf-8\"", "1.0", "utf-8"),
+    ("version=\"1.0\" encoding='utf-8'", "1.0", "utf-8"),
+    ("version=\"1.0\" encoding='utf-8' ", "1.0", "utf-8"),
+    ("version=\"1.0\" encoding=utf-8", "1.0", ""),
+    ("encoding=\"FOO\" ", "", "FOO"),
+    ("version=2.0 version=\"1.0\" encoding=utf-7 encoding='utf-8'", "1.0", "utf-8"),
+    ("version= encoding=", "", ""),
+    ("encoding=\"version=1.0\"", "", "version=1.0"),
+    ("", "", ""),
+    ("encoding=\"version='1.0'\"", "1.0", "version='1.0'"),
+    ("version=\"encoding='utf-8'\"", "encoding='utf-8'", "utf-8"),
+  ]
+  for c in cases {
+    assert_eq proc_inst_param("version", c[0]), c[1]
+    assert_eq proc_inst_param("encoding", c[0]), c[2]
+  }
+}
+
+test "DirectivesWithComments" {
+  input = "\n<!DOCTYPE [<!-- a comment --><!ENTITY rdf \"http://www.w3.org/1999/02/22-rdf-syntax-ns\#\">]>\n<!DOCTYPE [<!ENTITY go \"Golang\"><!-- a comment-->]>\n<!DOCTYPE <!-> <!> <!----> <!-->--> <!--->--> [<!ENTITY go \"Golang\"><!-- a comment-->]>\n"
+  want = [cd("\n"), directive("DOCTYPE [ <!ENTITY rdf \"http://www.w3.org/1999/02/22-rdf-syntax-ns\#\">]"), cd("\n"), directive("DOCTYPE [<!ENTITY go \"Golang\"> ]"), cd("\n"), directive("DOCTYPE <!-> <!>       [<!ENTITY go \"Golang\"> ]"), cd("\n")]
+  assert_eq toks_text(all_tokens(input).unwrap), toks_text(want)
+}
+
+# A Writer whose write! always fails.
+struct ErrWriter {
+  pub def write!(p: [Byte]) -> ~Int { fail "unwritable" }
+}
+
+test "EscapeText" {
+  r = escape_text(ErrWriter.new, [0x41])
+  assert_eq r.err?.message || "", "unwritable"
+  var_buf = bytes.new_buffer([])
+  escape_text(var_buf, "A \x00 terminated string.".bytes).unwrap
+  assert_eq var_buf.string, "A � terminated string."
+}
+
+test "Issue11405" {
+  for s in ["<root>", "<root><foo>", "<root><foo></foo>"] {
+    assert ssub(syntax_msg(token_err(new_string_decoder(s))), "unexpected EOF"), s
+  }
+}
+
+test "Issue12417" {
+  cases = [("<?xml encoding=\"UtF-8\" version=\"1.0\"?><root/>", true), ("<?xml encoding=\"UTF-8\" version=\"1.0\"?><root/>", true), ("<?xml encoding=\"utf-8\" version=\"1.0\"?><root/>", true), ("<?xml encoding=\"uuu-9\" version=\"1.0\"?><root/>", false)]
+  for c in cases {
+    assert_eq token_err(new_string_decoder(c[0])).none?, c[1]
+  }
+}
+
+test "Issue20685" {
+  cases = [
+    ("<x:book xmlns:x=\"abcd\" xmlns:y=\"abcd\"><unclosetag>one</x:book>", false),
+    ("<x:book xmlns:x=\"abcd\" xmlns:y=\"abcd\">one</x:book>", true),
+    ("<x:book xmlns:x=\"abcd\" xmlns:y=\"abcd\">one</y:book>", false),
+    ("<x:book xmlns:y=\"abcd\" xmlns:x=\"abcd\">one</y:book>", false),
+    ("<x:book xmlns:x=\"abcd\">one</y:book>", false),
+    ("<x:book>one</y:book>", false),
+    ("<xbook>one</ybook>", false),
+  ]
+  for c in cases {
+    assert_eq token_err(new_string_decoder(c[0])).none?, c[1]
+  }
+}
+
+# Go's testRoundTrip: decode, encode, decode again; the same tokens.
+def round_trip(input: Str) -> Str? {
+  d = new_string_decoder(input)
+  toks: [Token] = []
+  buf = bytes.new_buffer([])
+  e = new_encoder(buf)
+  loop {
+    r = d.token!
+    if er = r.err {
+      return "invalid input: #{er.message}"
+    }
+    t0 = r.unwrap
+    break if t0.none?
+    t = t0 || cd("")
+    if er = e.encode_token!(t).err {
+      return "failed to re-encode input: #{er.message}"
+    }
+    toks << copy_token(t)
+  }
+  return "flush failed" if !e.flush!.ok?
+  d2 = new_bytes_decoder(buf.bytes)
+  i = 0
+  loop {
+    r = d2.token!
+    if er = r.err {
+      return "failed to decode output: #{er.message}"
+    }
+    t0 = r.unwrap
+    break if t0.none?
+    t = t0 || cd("")
+    return "unexpected token: #{tok_text(t)}" if i >= toks.size
+    return "token mismatch: #{tok_text(toks[i])} vs #{tok_text(t)}" if toks[i] != t
+    i += 1
+  }
+  return "lost tokens" if i < toks.size
+  none
+}
+
+test "RoundTrip" {
+  assert_eq round_trip("<foo abc:=\"x\"></foo>"), none
+  assert_eq round_trip("<!ENTITY x<!<!-- c1 [ \" -->--x --> > <e></e> <!DOCTYPE xxx [ x<!-- c2 \" -->--x ]>"), none
+}
+
+test "ParseErrors" {
+  hdr = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
+  cases = [
+    (hdr + "</foo>", "unexpected end element </foo>"),
+    (hdr + "<x:foo></y:foo>", "element <foo> in space x closed by </foo> in space y"),
+    (hdr + "<? not ok ?>", "expected target name after <?"),
+    (hdr + "<!- not ok -->", "invalid sequence <!- not part of <!--"),
+    (hdr + "<!-? not ok -->", "invalid sequence <!- not part of <!--"),
+    (hdr + "<![not ok]>", "invalid <![ sequence"),
+    (hdr + "<zzz:foo xmlns:zzz=\"http://example.com\"><bar>baz</bar></foo>", "element <foo> in space zzz closed by </foo> in space \"\""),
+    (hdr + Str.from_bytes([0xf1]), "invalid UTF-8"),
+    ("<?xml version=\"1.1\" encoding=\"UTF-8\"?>", "unsupported version \"1.1\"; only version 1.0 is supported"),
+    (hdr + "<?ok?>", ""),
+    (hdr + "<?ok version=\"ok\"?>", ""),
+  ]
+  for c in cases {
+    e = token_err(new_string_decoder(c[0]))
+    if c[1] == "" {
+      assert e.none?, "parse #{c[0]}: have an error, expected none"
+    } else {
+      msg = e?.message || "no error"
+      assert ssub(msg, c[1]), "parse #{c[0]}: can't find #{c[1]} in #{msg}"
+    }
+  }
+}
+
+test "HTMLAutoClose" {
+  input = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<br>\n<br/><br/>\n<br><br>\n<br></br>\n<BR>\n<BR/><BR/>\n<Br></Br>\n<BR><span id=\"test\">abc</span><br/><br/>"
+  want = [
+    proc_inst("xml", "version=\"1.0\" encoding=\"UTF-8\""), cd("\n"),
+    se("br", []), en("br"), cd("\n"),
+    se("br", []), en("br"), se("br", []), en("br"), cd("\n"),
+    se("br", []), en("br"), se("br", []), en("br"), cd("\n"),
+    se("br", []), en("br"), cd("\n"),
+    se("BR", []), en("BR"), cd("\n"),
+    se("BR", []), en("BR"), se("BR", []), en("BR"), cd("\n"),
+    se("Br", []), en("Br"), cd("\n"),
+    se("BR", []), en("BR"), se("span", [at("", "id", "test")]), cd("abc"), en("span"),
+    se("br", []), en("br"), se("br", []), en("br"),
+  ]
+  d = new_string_decoder(input)
+  d.strict = false
+  d.auto_close = HTML_AUTO_CLOSE
+  d.entity = html_entity()
+  have: [Token] = []
+  loop {
+    t = d.~token!
+    break if t.none?
+    have << copy_token(t || cd(""))
+  }
+  assert_eq toks_text(have), toks_text(want)
+}
+
+# A token source over a list (Go's toks / toksNil in TestDecodeEOF and
+# TestDecodeNilToken; the decode half is in derives/).
+struct ToksState {
+  t: [Token]
+}
+
+struct Toks {
+  st: [ToksState]
+  pub def token! -> ~Token? {
+    return none if st[0].t.size == 0
+    x = st[0].t[0]
+    self.st[0].t = st[0].t[1...st[0].t.size]
+    x
+  }
+}
+
+test "token decoder" {
+  start = StartElement.new(name: name("", "test"))
+  ok = Toks.new(st: [ToksState.new(t: [Token.StartElement(start), Token.EndElement(start.end)])])
+  d = new_token_decoder(ok)
+  assert_eq ot(d.~token!), tok_text(Token.StartElement(start))
+  assert_eq ot(d.~token!), tok_text(Token.EndElement(start.end))
+  assert_eq ot(d.~token!), "none"
+  bad = Toks.new(st: [ToksState.new(t: [Token.StartElement(start), se("bad", []), Token.EndElement(start.end)])])
+  assert_eq syntax_msg(token_err(new_token_decoder(bad))), "element <bad> closed by </test>"
+  short = Toks.new(st: [ToksState.new(t: [Token.StartElement(start)])])
+  assert_eq syntax_msg(token_err(new_token_decoder(short))), "unexpected EOF"
+}

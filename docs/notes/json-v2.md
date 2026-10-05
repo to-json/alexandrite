@@ -1,4 +1,4 @@
-# encoding/json/jsontext and encoding/json/v2 (D62, D65)
+# encoding/json/jsontext and encoding/json/v2 (D70, D71)
 
 Go's JSON v2: the syntactic layer (`jsontext`) ported as it is, and the
 semantic layer (`v2`) on the same `#[derive(Json)]` as encoding/json (v1).
@@ -82,7 +82,7 @@ Go looks functions up by run-time type. Here:
 - `Arg` is a builtin by kind (with Go's type name) or a derived value as a
   `Marshalee` interface value (every derived type has `json_v2_type`).
   `marshal_func[T](f)` erases `f` and takes `T` back with `case m { T(v) => }`:
-  the type switch of D65, which this port added.
+  the type switch of D71, which this port added.
 - Builtins can't be interface values, so they have their own constructors
   (`marshal_func_str`, `marshal_to_func_int`, `unmarshal_func_bool`, ...).
 - `JsonError.Unsupported` is Go's errors.ErrUnsupported (skip to the next
@@ -105,7 +105,7 @@ Go looks functions up by run-time type. Here:
   sensitivity, omit fields, embedded fields, stream, multiline, EscapeForHTML,
   MarshalerTo/UnmarshalerFrom), marshal/unmarshal functions, MarshalEncode
   options, MarshalWrite/UnmarshalRead.
-- Acceptance: `jsonv2` (group S4) and `typeswitch` (D65).
+- Acceptance: `jsonv2` (group S4) and `typeswitch` (D71).
 
 ## Speed
 

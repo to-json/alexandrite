@@ -319,17 +319,44 @@ void *alx_alloc_slow(size_t n) {
 /* ---------- panics and errors ---------- */
 
 /* In a spawned task a panic ends only the task: the message is recorded and
- * control longjmps back to the task's entry (see task_main). Everywhere else
- * (main thread, pmap threads) a panic prints and aborts. */
+ * control longjmps back to the task's entry (see task_entry), which releases
+ * and poisons the locks the task holds. In a `pmap` element (on any thread)
+ * a panic stops the job, and the caller of pmap re-raises it once every
+ * thread is done (see pmap_run). Everywhere else (the main thread) a panic
+ * prints and aborts. */
 static _Thread_local AlxTask *tl_task;
 static _Noreturn void task_panic(char *msg);
 
+/* A pmap element running on this thread (or task): where its panic goes,
+ * and the newest lock held when it started (the element's locks are above). */
+typedef struct PmapCtx { jmp_buf jb; char *msg; AlxLock *mark; } PmapCtx;
+static PmapCtx **pm_slot(void);
+static bool panic_caught(void) { return tl_task || *pm_slot(); }
+
+/* m: a malloc'd message, or NULL (out of memory). */
+static _Noreturn void panic_catch(char *m) {
+    PmapCtx *p = *pm_slot();
+    if (p) {
+        p->msg = m ? m : (char *)"alexandrite: out of memory";
+        _longjmp(p->jb, 1);
+    }
+    task_panic(m);
+}
+
+/* Raise a whole panic message (with its `alexandrite: ` prefix) again. */
+static _Noreturn void panic_full(char *m) {
+    if (panic_caught()) panic_catch(m);
+    fflush(stdout);
+    fprintf(stderr, "%s\n", m);
+    abort();
+}
+
 void alx_panic(const char *what, const char *loc) {
-    if (tl_task) {
+    if (panic_caught()) {
         size_t n = (size_t)snprintf(NULL, 0, "alexandrite: %s at %s", what, loc) + 1;
         char *m = malloc(n);
         if (m) snprintf(m, n, "alexandrite: %s at %s", what, loc);
-        task_panic(m);
+        panic_catch(m);
     }
     fflush(stdout);
     fprintf(stderr, "alexandrite: %s at %s\n", what, loc);
@@ -337,11 +364,11 @@ void alx_panic(const char *what, const char *loc) {
 }
 
 void alx_panic_str(AlxStr msg) {
-    if (tl_task) {
+    if (panic_caught()) {
         size_t n = (size_t)msg.len + 14;
         char *m = malloc(n);
         if (m) snprintf(m, n, "alexandrite: %.*s", (int)msg.len, msg.ptr);
-        task_panic(m);
+        panic_catch(m);
     }
     fflush(stdout);
     fprintf(stderr, "alexandrite: %.*s\n", (int)msg.len, msg.ptr);
@@ -350,11 +377,11 @@ void alx_panic_str(AlxStr msg) {
 
 void alx_overflow(const char *loc) {
     static const char hint[] = "hint: add `#![overflow(promote)]` to this file to promote to bignums";
-    if (tl_task) {
+    if (panic_caught()) {
         size_t n = (size_t)snprintf(NULL, 0, "alexandrite: overflow at %s\n%s", loc, hint) + 1;
         char *m = malloc(n);
         if (m) snprintf(m, n, "alexandrite: overflow at %s\n%s", loc, hint);
-        task_panic(m);
+        panic_catch(m);
     }
     fflush(stdout);
     fprintf(stderr, "alexandrite: overflow at %s\n%s\n", loc, hint);
@@ -922,12 +949,14 @@ typedef struct {
     char *err;
     int64_t err_i;
     pthread_mutex_t err_mu;
+    char *panic;              /* the first element panic, raised again by the caller */
 } PmapJob;
 
 static _Thread_local bool tl_uncounted;
+static AlxLock **held_head(void);
+static void locks_poison(AlxLock **head, AlxLock *mark);
 
-static void *pmap_run(void *arg) {
-    PmapJob *j = arg;
+static void pmap_loop(PmapJob *j) {
     for (;;) {
         int64_t lo = __atomic_fetch_add(&j->next, j->blk, __ATOMIC_RELAXED);
         if (lo >= j->n) break;
@@ -951,6 +980,27 @@ static void *pmap_run(void *arg) {
             }
         }
     }
+}
+
+/* A panic in an element (on this thread or task) lands here: the element's
+ * locks are released and poisoned, no more blocks are claimed, and the
+ * first message is kept for the caller of pmap, which raises it again. */
+static void *pmap_run(void *arg) {
+    PmapJob *j = arg;
+    PmapCtx ctx = { .msg = NULL };
+    PmapCtx *prev = *pm_slot();
+    ctx.mark = *held_head();
+    *pm_slot() = &ctx;
+    if (_setjmp(ctx.jb) == 0) {
+        pmap_loop(j);
+    } else {
+        locks_poison(held_head(), ctx.mark);
+        __atomic_store_n(&j->next, j->n, __ATOMIC_RELAXED);
+        pthread_mutex_lock(&j->err_mu);
+        if (!j->panic) j->panic = ctx.msg;
+        pthread_mutex_unlock(&j->err_mu);
+    }
+    *pm_slot() = prev;
     return NULL;
 }
 
@@ -969,9 +1019,12 @@ static void pmap_go(PmapJob *job) {
     pthread_t tids[64];
     job->blk = n / (threads * 16);
     if (job->blk < 1) job->blk = 1;
+    pthread_mutex_init(&job->err_mu, NULL);
     for (int64_t t = 1; t < threads; t++) pthread_create(&tids[t], NULL, pmap_thread, job);
     pmap_run(job);
     for (int64_t t = 1; t < threads; t++) pthread_join(tids[t], NULL);
+    pthread_mutex_destroy(&job->err_mu);
+    if (job->panic) panic_full(job->panic);
 }
 
 void alx_pmap(const void *in, int64_t n, size_t in_size, void *out, size_t out_size, AlxWorker fn) {
@@ -985,9 +1038,7 @@ void alx_pmap_try(const void *in, int64_t n, size_t in_size, void *out, size_t v
                     .res_size = res_size, .val_off = val_off, .err = err, .err_i = INT64_MAX };
     memset(err, 0, res_size);
     *(bool *)err = true;
-    pthread_mutex_init(&job.err_mu, NULL);
     pmap_go(&job);
-    pthread_mutex_destroy(&job.err_mu);
 }
 
 /* ---------- tasks and channels ----------
@@ -1120,7 +1171,17 @@ struct AlxTask {
     char *save;                  /* copy of the live stack while parked */
     size_t nsave, csave;
     WNode wn[4], *wnp;           /* wait-list nodes while parked (not on the stack) */
+    AlxLock *held;               /* the locks it holds, newest first (through hnext) */
+    PmapCtx *pm;                 /* the pmap element it is running, if any */
 };
+
+/* Outside tasks (main, pmap helper threads) the same state is per thread.
+ * noinline: a task can move to another thread across a blocking call, so the
+ * thread-local address must be looked up again each time. */
+static _Thread_local AlxLock *tl_held;
+static _Thread_local PmapCtx *tl_pm;
+static __attribute__((noinline)) AlxLock **held_head(void) { return tl_task ? &tl_task->held : &tl_held; }
+static __attribute__((noinline)) PmapCtx **pm_slot(void) { return tl_task ? &tl_task->pm : &tl_pm; }
 
 struct Worker {
     pthread_cond_t cv;
@@ -1286,6 +1347,10 @@ static _Noreturn void task_panic(char *msg) {
     _longjmp(t->jb, 1);
 }
 
+/* After a panic: release the locks in *head above `mark` (newest first) and
+ * poison them, since what they guard may be half-updated. */
+static void locks_poison(AlxLock **head, AlxLock *mark);
+
 /* ---- stacks ---- */
 
 static size_t parse_size(const char *s, size_t dflt) {
@@ -1374,7 +1439,11 @@ static void task_entry(void) {
     __sanitizer_finish_switch_fiber(NULL, &t->home->sbot, &t->home->ssz);
 #endif
     if (_setjmp(t->jb) == 0) t->fn(t->env, t->res);
-    else t->panicked = true;
+    else {
+        t->panicked = true;
+        t->pm = NULL;
+        locks_poison(&t->held, NULL);
+    }
     task_finish(t);
     t->dead = true;
     sw_out(t, true);
@@ -1743,7 +1812,15 @@ int64_t alx_select(AlxSelCase *cs, int64_t n, bool has_default, const char *loc)
 /* A lock is a flag under the scheduler's lock with its own wait list: a
  * holder parks takers the way a full channel parks senders, so deadlock
  * detection covers it. */
-struct AlxLock { bool held; WNode *w; /* parked takers */ };
+/* Each holder (task, or thread outside tasks) keeps the locks it holds on
+ * an intrusive stack through `hnext` (lock blocks nest, so it's LIFO): a
+ * panic releases them and marks them poisoned. Taking a poisoned lock
+ * panics until `clear_poison!`. */
+struct AlxLock {
+    bool held, poisoned;
+    WNode *w;                    /* parked takers */
+    AlxLock *hnext;              /* the holder's next older lock */
+};
 
 AlxLock *alx_lock_new(void) {
     AlxLock *l = calloc(1, sizeof *l);
@@ -1751,18 +1828,56 @@ AlxLock *alx_lock_new(void) {
     return l;
 }
 
-void alx_lock(AlxLock *l) {
+void alx_lock(AlxLock *l, const char *loc) {
     pthread_mutex_lock(&g_mu);
     while (l->held)
         if (!block_wait1(&l->w)) deadlock();
+    if (l->poisoned) {
+        pthread_mutex_unlock(&g_mu);
+        alx_panic("Mutex poisoned: a task panicked while holding it", loc);
+    }
     l->held = true;
+    AlxLock **h = held_head();
+    l->hnext = *h;
+    *h = l;
     pthread_mutex_unlock(&g_mu);
 }
 
 void alx_unlock(AlxLock *l) {
     pthread_mutex_lock(&g_mu);
+    AlxLock **h = held_head();
+    while (*h && *h != l) h = &(*h)->hnext;
+    if (*h) *h = l->hnext;
+    l->hnext = NULL;
     l->held = false;
     wake(&l->w);
+    pthread_mutex_unlock(&g_mu);
+}
+
+static void locks_poison(AlxLock **head, AlxLock *mark) {
+    if (*head == mark) return;
+    pthread_mutex_lock(&g_mu);
+    while (*head && *head != mark) {
+        AlxLock *l = *head;
+        *head = l->hnext;
+        l->hnext = NULL;
+        l->held = false;
+        l->poisoned = true;
+        wake(&l->w);
+    }
+    pthread_mutex_unlock(&g_mu);
+}
+
+bool alx_lock_poisoned(AlxLock *l) {
+    pthread_mutex_lock(&g_mu);
+    bool p = l->poisoned;
+    pthread_mutex_unlock(&g_mu);
+    return p;
+}
+
+void alx_lock_clear_poison(AlxLock *l) {
+    pthread_mutex_lock(&g_mu);
+    l->poisoned = false;
     pthread_mutex_unlock(&g_mu);
 }
 
@@ -2380,6 +2495,7 @@ int64_t alx_user_groups(const char *name, int64_t gid, uint8_t *out, int64_t n) 
 #include <netinet/tcp.h>
 #include <arpa/inet.h>
 #include <netdb.h>
+#include <sys/un.h>
 #if defined(__linux__)
 #  include <sys/epoll.h>
 #  define ALX_EPOLL 1
@@ -2557,9 +2673,14 @@ static void sock_init(void) {
     pthread_once(&once, sigpipe_ignore);
 }
 
-/* "ip:port" or "[ip6]:port", NUL-terminated, into out (>= 64 bytes). Length. */
+/* "ip:port" or "[ip6]:port", NUL-terminated, into out (>= 64 bytes). Length.
+ * A Unix socket's address is its path (truncated to 63 bytes; "" if unbound). */
 static int64_t sock_fmt(const struct sockaddr_storage *ss, uint8_t *out) {
     char h[INET6_ADDRSTRLEN] = "";
+    if (ss->ss_family == AF_UNIX) {
+        const struct sockaddr_un *u = (const void *)ss;
+        return snprintf((char *)out, 64, "%s", u->sun_path);
+    }
     if (ss->ss_family == AF_INET6) {
         const struct sockaddr_in6 *a = (const void *)ss;
         inet_ntop(AF_INET6, &a->sin6_addr, h, sizeof h);
@@ -2691,4 +2812,62 @@ int64_t alx_sock_lookup(const char *host, uint8_t *out, int64_t n) {
     }
     freeaddrinfo(res);
     return len;
+}
+
+/* A UDP or Unix-domain socket. kind: 1 "udp", 2 "unix" (stream), 3
+ * "unixgram"; for kinds 2 and 3 `host` is the path and port is ignored.
+ * listen 0 connects (UDP and unixgram at once; a unix stream connect may be
+ * in progress: wait writable and read alx_sock_error, as for TCP), 1 binds
+ * (and listens, for "unix", with `backlog`). The fd (non-blocking,
+ * close-on-exec), or -errno / -ALX_ENOHOST. Resolution blocks the worker. */
+int64_t alx_sock_open(int64_t kind, const char *host, int64_t port, int64_t listen_, int64_t backlog) {
+    sock_init();
+    if (kind == 2 || kind == 3) {
+        struct sockaddr_un u;
+        memset(&u, 0, sizeof u);
+        u.sun_family = AF_UNIX;
+        size_t n = strlen(host);
+        if (n >= sizeof u.sun_path) return -EINVAL;
+        memcpy(u.sun_path, host, n);
+        int fd = socket(AF_UNIX, kind == 2 ? SOCK_STREAM : SOCK_DGRAM, 0);
+        if (fd < 0) return -errno;
+        sock_prep(fd);
+        int rc = listen_ ? bind(fd, (struct sockaddr *)&u, sizeof u) : connect(fd, (struct sockaddr *)&u, sizeof u);
+        if (rc == 0 && listen_ && kind == 2) rc = listen(fd, (int)backlog);
+        if (rc < 0 && !(errno == EINPROGRESS && !listen_)) { int e = errno; close(fd); return -e; }
+        return fd;
+    }
+    struct addrinfo hints, *res = NULL;
+    memset(&hints, 0, sizeof hints);
+    hints.ai_socktype = SOCK_DGRAM;
+    if (listen_) hints.ai_flags = AI_PASSIVE;
+    char ps[16];
+    snprintf(ps, sizeof ps, "%d", (int)port);
+    const char *h = host[0] ? host : (listen_ ? "0.0.0.0" : "127.0.0.1");
+    if (getaddrinfo(h, ps, &hints, &res) != 0) return -ALX_ENOHOST;
+    struct addrinfo *pick = res;
+    for (struct addrinfo *a = res; a; a = a->ai_next)
+        if (a->ai_family == AF_INET) { pick = a; break; }
+    int fd = socket(pick->ai_family, pick->ai_socktype, pick->ai_protocol);
+    if (fd < 0) { int e = errno; freeaddrinfo(res); return -e; }
+    sock_prep(fd);
+    int rc = listen_ ? bind(fd, pick->ai_addr, pick->ai_addrlen) : connect(fd, pick->ai_addr, pick->ai_addrlen);
+    int e = errno;
+    freeaddrinfo(res);
+    if (rc < 0) { close(fd); return -e; }
+    return fd;
+}
+
+/* Non-blocking recvfrom: the datagram's length (truncated to n) with the
+ * sender's address in out (>= 64 bytes; "" if it has none), or -errno
+ * (-EAGAIN: wait readable, retry). */
+int64_t alx_sock_recvfrom(int64_t fd, uint8_t *buf, int64_t n, uint8_t *out) {
+    struct sockaddr_storage ss;
+    socklen_t len = sizeof ss;
+    memset(&ss, 0, sizeof ss);
+    ssize_t r = recvfrom((int)fd, buf, (size_t)n, 0, (struct sockaddr *)&ss, &len);
+    if (r < 0) return -errno;
+    if (len == 0) ss.ss_family = AF_UNIX; /* an unbound unixgram sender */
+    sock_fmt(&ss, out);
+    return (int64_t)r;
 }

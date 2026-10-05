@@ -428,7 +428,7 @@ impl<'a> Gen<'a> {
             TypeExpr::Named(n, _) => {
                 if let Some(k) = IntKind::from_name(n) {
                     Ty::Int(k)
-                } else if n == "Float" {
+                } else if n == "Float" || n == "F64" {
                     Ty::Float
                 } else if n == "Bool" {
                     Ty::Bool
@@ -438,7 +438,7 @@ impl<'a> Gen<'a> {
                     return Err(format!("the type parameter `{n}` can't be encoded: derive(Json) on a generic type isn't supported yet (use a concrete type)"));
                 } else if let Some(false) = self.types.local.get(n.as_str()) {
                     return Err(format!("`{n}` doesn't derive Json: add `#[derive(Json)]` to it"));
-                } else if matches!(n.as_str(), "Float32" | "F32" | "F64" | "Ptr" | "Unit") {
+                } else if matches!(n.as_str(), "Float32" | "F32" | "Ptr" | "Unit") {
                     return Err(format!("{n} has no JSON encoding"));
                 } else {
                     Ty::Named(n)
@@ -526,7 +526,7 @@ impl<'a> Gen<'a> {
         match t {
             TypeExpr::Named(n, _) if self.shadowed(n) => None,
             TypeExpr::Named(n, _) if IntKind::from_name(n).is_some() => Some(format!("{x} == 0")),
-            TypeExpr::Named(n, _) if n == "Float" => Some(format!("{x} == 0.0")),
+            TypeExpr::Named(n, _) if n == "Float" || n == "F64" => Some(format!("{x} == 0.0")),
             TypeExpr::Named(n, _) if n == "Bool" => Some(format!("!{x}")),
             TypeExpr::Named(n, _) if n == "Str" => Some(format!("{x}.size == 0")),
             TypeExpr::Array(..) => Some(format!("{x}.size == 0")),
@@ -907,7 +907,7 @@ impl<'a> Gen<'a> {
         Some(match t {
             TypeExpr::Named(n, _) if self.shadowed(n) => format!("{n}.json_zero"),
             TypeExpr::Named(n, _) if IntKind::from_name(n).is_some() => "0".into(),
-            TypeExpr::Named(n, _) if n == "Float" => "0.0".into(),
+            TypeExpr::Named(n, _) if n == "Float" || n == "F64" => "0.0".into(),
             TypeExpr::Named(n, _) if n == "Bool" => "false".into(),
             TypeExpr::Named(n, _) if n == "Str" => "\"\"".into(),
             TypeExpr::Named(n, _) if !self.tparams.contains(n) => format!("{n}.json_zero"),

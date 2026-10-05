@@ -103,7 +103,7 @@ pub fn allocates(e: &TExpr, promote: bool) -> bool {
             M::TupleGet(_) | M::OptPresent | M::OptGet | M::Unwrap | M::EnumTag | M::Size | M::MapSize | M::MapHas | M::ChanLen | M::ResIsOk | M::ErrIs(_) | M::ErrAs(_)
                 | M::Even | M::Odd | M::IntSqrt | M::ToF | M::FloatToI | M::Conv(..) | M::FloatAbs | M::Sqrt | M::Math(_) | M::FloatBits | M::FloatFromBits | M::UMulHi | M::NowNs | M::PtrNull | M::CErrno
                 | M::Sum | M::Max | M::Min | M::MaxBy | M::MinBy | M::Count | M::All | M::Any | M::Include | M::First | M::Last | M::Find | M::Each | M::Loop | M::Step
-                | M::ChanClose | M::CapBegin | M::Exit | M::Global(_)
+                | M::ChanClose | M::CapBegin | M::Exit | M::Global(_) | M::SetGlobal(_)
         ) || (promote && e.ty == Ty::Int),
         _ => false,
     }
@@ -240,6 +240,11 @@ impl<'a> Graph<'a> {
                     // their parameters to themselves: the arguments stay put
                     // (the result may still be one of them, below).
                     M::FnCall if recv.as_ref().is_some_and(|r| clean_fn(&r.ty)) => {}
+                    // A global (an array constant, or a package-level Atomic /
+                    // Mutex, R11) outlives every task: what's stored in it,
+                    // or under its lock, lives in the program region.
+                    M::Global(_) => v.push(Node::Global),
+                    M::SetGlobal(_) => self.flow(&avs, &[Node::Global]),
                     M::ChanSend | M::Yield | M::Spawn | M::EnumNew | M::FnCall | M::Pmap => {
                         self.flow(&rv, &[Node::Global]);
                         self.flow(&avs, &[Node::Global]);
@@ -464,8 +469,9 @@ pub fn contains_int(t: &Ty) -> bool {
 /// Can a value of this type refer to heap storage?
 pub fn has_storage(t: &Ty) -> bool {
     match t {
-        // An atomic is a runtime cell outside every region.
-        Ty::Int | Ty::IntK(_) | Ty::Float | Ty::Bool | Ty::Unit | Ty::Range | Ty::Never | Ty::Handle(_) | Ty::Atomic(_) | Ty::Ptr => false,
+        // An Int or Bool atomic is a runtime cell outside every region.
+        Ty::Int | Ty::IntK(_) | Ty::Float | Ty::Bool | Ty::Unit | Ty::Range | Ty::Never | Ty::Handle(_) | Ty::Ptr => false,
+        Ty::Atomic(t) => t.atomic_boxed(), // boxed: a lock and the value, like a Mutex
         Ty::Opt(t) => has_storage(t),
         Ty::Tuple(ts) => ts.iter().any(has_storage),
         Ty::Struct(_, fs) => fs.iter().any(|(_, t)| has_storage(t)),
@@ -534,7 +540,7 @@ pub fn aliases(p: &TProgram) -> Vec<HashMap<LocalId, (Vec<LocalId>, Vec<LocalId>
                             Node::Ret | Node::Global => {}
                             // A mutex is a wall: what it guards is reached
                             // only under its lock.
-                            Node::Local(x) if matches!(f.locals[*x].ty, Ty::Mutex(_)) => {}
+                            Node::Local(x) if matches!(f.locals[*x].ty, Ty::Mutex(_) | Ty::Atomic(_)) => {}
                             // Nor does a value with no shared storage (a struct of
                             // scalars, strings and handles) carry an alias on.
                             Node::Local(x) if !crate::sharing::shares(&f.locals[*x].ty) && *x != l => {}

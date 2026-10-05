@@ -3,6 +3,7 @@
 # names: KN/WN/FN, KE/WE/FE, lemire_int31n!).
 
 import "math"
+import "os"
 import "slices"
 import "strconv"
 import "strings"
@@ -360,14 +361,71 @@ test "UniformFactorial" {
   }
 }
 
+# The global Rand back to its unchosen state (as at program start).
+def reset_global {
+  GLOBAL.lock { |g|
+    g.started = false
+    g.locked = false
+    g.r = none
+  }
+}
+
+# Go's t.Setenv("GODEBUG", v) around body, run on a global Rand not yet
+# chosen (Go's test binary keeps whatever earlier tests left; here the
+# GODEBUG settings are tested from the start and the later tests get the
+# default back).
+def with_godebug(v: Str, body: () -> Unit) {
+  old = os.getenv("GODEBUG")
+  os.setenv("GODEBUG", v).unwrap
+  reset_global()
+  body.call()
+  if o = old {
+    os.setenv("GODEBUG", o).unwrap
+  } else {
+    os.unsetenv("GODEBUG").unwrap
+  }
+  reset_global()
+}
+
 test "SeedNop" {
-  # The GODEBUG unset case: the global seed is a no-op (Go 1.24+), so
-  # re-seeding doesn't repeat the output. (randseednop=0 isn't supported.)
+  # If the global seed takes effect, re-seeding repeats the output.
+  with_godebug("randseednop=0") {
+    seed(1)
+    before = int63()
+    seed(1)
+    after = int63()
+    assert_eq before, after
+    # It is new(new_source(1))'s sequence.
+    r = new(new_source(1))
+    seed(1)
+    for _ in 0...5 { assert_eq int63(), r.int63!() }
+  }
+  # If seed is a no-op, re-seeding doesn't repeat it.
+  with_godebug("randseednop=1") {
+    seed(1)
+    before = int63()
+    seed(1)
+    after = int63()
+    assert before != after, "global seed should be a no-op"
+  }
+  # GODEBUG unset: a no-op by default (Go 1.24+).
   seed(1)
   before = int63()
   seed(1)
   after = int63()
-  assert before != after, "global seed should be a no-op"
+  assert before != after, "global seed should default to being a no-op"
+}
+
+# GODEBUG randautoseed=0: the global Rand starts as Seed(1)'s.
+test "randautoseed=0" {
+  with_godebug("x=1,randautoseed=0") {
+    r = new(new_source(1))
+    for _ in 0...5 { assert_eq int63(), r.int63!() }
+    assert_eq intn(1000), r.intn!(1000)
+  }
+  out = (0...3).map { int63() }
+  r = new(new_source(1))
+  assert out != (0...3).map { r.int63!() }, "the global Rand is the OS's again"
 }
 
 # ---- auto_test.go ----
@@ -454,11 +512,13 @@ test "new_source is an RngSource" {
 }
 
 test "panics are Go's" {
-  # (Checked by message in the source: n <= 0 panics "invalid argument to ...".)
   r = new(new_source(1))
   assert_eq r.intn!(1), 0
   assert_eq r.int63n!(1), 0
   assert_eq r.int31n!(1), 0
+  assert_panics("invalid argument to Intn") { r.intn!(0) }
+  assert_panics("invalid argument to Int63n") { r.int63n!(-1) }
+  assert_panics("invalid argument to Int31n") { r.int31n!(0) }
 }
 
 test "zipf none" {

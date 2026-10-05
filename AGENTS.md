@@ -103,12 +103,15 @@ defer { cleanup() }
 t = spawn { work() }; r = t.~wait    # M:N tasks (8 MiB stack each; ALX_TASK_STACK)
 ch = Chan[Int].new(4); ch << 1; v = ch.recv
 mu = Mutex.new(0); mu.lock { |v| v += 1 }   # assigning v updates it; the block's value is lock's result
+pub HITS = Atomic.new(0)             # top level: package state only as Atomic[T] (any T; load copies) or Mutex[T],
+REG = Mutex[Map[Str, Int]].new({})   #   set before main runs; read as HITS / pkg.HITS (R11)
 
 # Lambdas, shell, FFI, tests --------------------------------------------------------
 add = ->(a: Int, b: Int) -> Int { a + b }; add.call(1, 2)
 out = `ls -l #{dir}`.~output                    # a command literal (no shell): os/exec.Cmd
 extern def c_getpid() -> I32 = "getpid"       # C FFI; std uses it only for OS access
 test "adds" { assert_eq 1 + 1, 2; assert x > 0, "why" }   # in *_test.alx beside the package
+assert_panics("out of bounds") { xs[9] }      # body runs as a task (gets copies of locals); fails unless it panics
 example "hi" { puts "hi" } outputs "hi\n"
 # Warnings (unused locals/imports) are errors under `alx test`; name a local `_x` to silence it.
 ```

@@ -1,0 +1,164 @@
+# Package tzdata: Go's time/tzdata, an embedded copy of the IANA time zone database,
+# so that zones load on systems without one (minimal containers, the browser).
+#
+#   Go                                        alx
+#   import _ "time/tzdata"                    import "time/tzdata"
+#   time.LoadLocation(name) (with tzdata)     tzdata.load_location(name) -> ~time.Location
+#   (internal) loadFromEmbeddedTZData(name)   tzdata.tzinfo(name) -> ~[Byte]<TzdataError>
+#   (none)                                    tzdata.zip_data -> [Byte]  (the whole archive)
+#
+# Differences from Go, and why:
+#   - Go's tzdata registers itself with package time from an init function (through
+#     a linkname), so that every time.LoadLocation falls back to it. alx has no
+#     package initializers and no mutable package state (port-issues #30, #51), so
+#     the fallback is explicit: call `tzdata.load_location(name)` where Go would call
+#     time.LoadLocation with tzdata imported. It is exactly that: time.load_location
+#     ($ZONEINFO, then the system's database), then the embedded copy, with Go's
+#     error precedence. `time.load_location_from_tzdata(name, tzdata.tzinfo(name).unwrap)`
+#     uses the embedded copy alone (what Go's tests get with DisablePlatformSources).
+#   - The archive is Go's own lib/time/zoneinfo.zip (an uncompressed zip, as Go
+#     embeds it), generated into zzipdata.alx. Str literals are UTF-8 text and can't
+#     hold arbitrary bytes, so it is stored in base64: ~545 KB of program data where
+#     Go's is ~400 KB (only programs that import tzdata carry it). Lookups decode just
+#     the central directory entries and the one file they need, not the whole archive.
+#   - The browser backend runs tzinfo and load_location_from_tzdata (pure alx), but
+#     refuses load_location, which reads the system's database first.
+import "time"
+
+ZECHEADER = 0x06054b50
+ZCHEADER = 0x02014b50
+ZTAILSIZE = 22
+ZHEADER = 0x04034b50
+
+# Why the embedded database has no such file (Go's messages).
+pub error TzdataError {
+  NoSuchZone(name: Str)
+  Compressed(name: Str)
+  CorruptArchive
+
+  def message -> Str {
+    case self {
+      NoSuchZone(_) => "no such file or directory"
+      Compressed(n) => "unsupported compression for #{n} in embedded tzdata"
+      CorruptArchive => "corrupt embedded tzdata"
+    }
+  }
+}
+
+# The value of a base64 digit.
+def b64(c: Byte) -> Int {
+  x = c.to_i
+  return x - 65 if x >= 65 && x <= 90
+  return x - 71 if x >= 97 && x <= 122
+  return x + 4 if x >= 48 && x <= 57
+  return 62 if x == 43
+  return 63 if x == 47
+  0
+}
+
+# n bytes of the archive from offset `off` (cut at its end).
+def zip_bytes(off: Int, n: Int) -> [Byte] {
+  s = ZIP_BASE64
+  lo = off < 0 ? 0 : off
+  hi = off + n > ZIP_SIZE ? ZIP_SIZE : off + n
+  out: [Byte] = []
+  g = lo / 3
+  while g * 3 < hi {
+    i = g * 4
+    v = (b64(s[i]) << 18) | (b64(s[i + 1]) << 12) | (b64(s[i + 2]) << 6) | b64(s[i + 3])
+    for k in 0...3 {
+      p = g * 3 + k
+      out << ((v >> (16 - 8 * k)) & 255).as_u8 if p >= lo && p < hi
+    }
+    g += 1
+  }
+  out
+}
+
+# The whole embedded zip archive (Go's lib/time/zoneinfo.zip).
+pub def zip_data -> [Byte] { zip_bytes(0, ZIP_SIZE) }
+
+def get4(b: [Byte], i: Int) -> Int {
+  return 0 if b.size < i + 4
+  b[i].to_i | (b[i + 1].to_i << 8) | (b[i + 2].to_i << 16) | (b[i + 3].to_i << 24)
+}
+
+def get2(b: [Byte], i: Int) -> Int {
+  return 0 if b.size < i + 2
+  b[i].to_i | (b[i + 1].to_i << 8)
+}
+
+# The zoneinfo file of `name` ("America/New_York") in the embedded database
+# (Go's loadFromEmbeddedTZData).
+pub def tzinfo(name: Str) -> ~[Byte]<TzdataError> {
+  tail = zip_bytes(ZIP_SIZE - ZTAILSIZE, ZTAILSIZE)
+  n = get2(tail, 10)
+  idx = get4(tail, 16)
+  for _i in 0...n {
+    h = zip_bytes(idx, 46)
+    break if get4(h, 0) != ZCHEADER
+    meth = get2(h, 10)
+    size = get4(h, 24)
+    namelen = get2(h, 28)
+    xlen = get2(h, 30)
+    fclen = get2(h, 32)
+    off = get4(h, 42)
+    same = namelen == name.size && Str.from_bytes(zip_bytes(idx + 46, namelen)) == name
+    idx += 46 + namelen + xlen + fclen
+    next if !same
+    fail TzdataError.Compressed(name) if meth != 0
+    lh = zip_bytes(off, 30 + namelen)
+    if get4(lh, 0) != ZHEADER || get2(lh, 8) != meth || get2(lh, 26) != namelen || lh.size < 30 + namelen || Str.from_bytes(lh[30...30 + namelen]) != name {
+      fail TzdataError.CorruptArchive
+    }
+    lxlen = get2(lh, 28)
+    return zip_bytes(off + 30 + namelen + lxlen, size)
+  }
+  fail TzdataError.NoSuchZone(name)
+}
+
+# Go's time.LoadLocation with time/tzdata imported: time.load_location ($ZONEINFO,
+# then the system's database), falling back to the embedded database.
+pub def load_location(name: Str) -> ~time.Location {
+  r = time.load_location(name)
+  return r.unwrap if r.ok?
+  first = r.err.unwrap
+  # an invalid name is not looked up anywhere
+  fail first if invalid_name?(first)
+  emb_err: Error? = none
+  e = tzinfo(name)
+  if data = e.ok {
+    z = time.load_location_from_tzdata(name, data)
+    return z.unwrap if z.ok?
+    emb_err = z.err
+  } else if ee = e.err {
+    emb_err = ee if !not_found?(ee)
+  }
+  # Go keeps the first error from the system's sources; with none ("unknown time
+  # zone"), an embedded error other than "not found" wins.
+  if x = emb_err {
+    fail x if unknown_zone?(first)
+  }
+  fail first
+}
+
+def invalid_name?(e: Error) -> Bool {
+  case e {
+    time.LocationError.BadName => true
+    _ => false
+  }
+}
+
+def unknown_zone?(e: Error) -> Bool {
+  case e {
+    time.LocationError.Unknown(_) => true
+    _ => false
+  }
+}
+
+def not_found?(e: Error) -> Bool {
+  case e {
+    TzdataError.NoSuchZone(_) => true
+    _ => false
+  }
+}

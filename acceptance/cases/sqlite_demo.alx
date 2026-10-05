@@ -1,0 +1,84 @@
+# database/sql over the SQLite driver: typical use. A schema, inserts with
+# tuples of arguments, rows into a #[derive(Row)] struct and into tuples,
+# NULLs as optionals, a transaction rolled back and one committed, a
+# constraint violation with SQLite's message, the pool from several tasks.
+import "database/sql"
+import "database/sql/sqlite"
+import "os"
+import "sync"
+
+#[derive(Row)]
+struct Book {
+  id: Int
+  title: Str
+  #[field(db: "published")]
+  year: Int?
+  rating: Float?
+}
+
+def main_ -> ~Unit {
+  dir = ~os.mkdir_temp("", "alx-sqlite-demo-*")
+  defer os.remove_all(dir)
+  sqlite.register
+  db = sql.~open("sqlite3", "#{dir}/books.db?_busy_timeout=5000&_journal_mode=WAL")
+  defer db.close
+  db.~exec("create table books(id integer primary key, title text not null unique, published int, rating real)", nil)
+
+  ins = db.~prepare("insert into books(title, published, rating) values(?, ?, ?)")
+  none_year: Int? = none
+  none_rating: Float? = none
+  ~ins.exec(("Dune", 1965, 4.5))
+  ~ins.exec(("Neuromancer", 1984, 4.0))
+  r = ins.~exec(("Untitled draft", none_year, none_rating))
+  puts "inserted id #{r.~last_insert_id}, rows #{r.~rows_affected}"
+  ~ins.close
+
+  rows = db.~query("select id, title, published, rating from books order by id", nil)
+  while rows.next {
+    b: Book = rows.~scan
+    year = "unknown"
+    if y = b.year {
+      year = "#{y}"
+    }
+    puts "#{b.id}: #{b.title} (#{year}) #{b.rating || 0.0}"
+  }
+  ~rows.err_result
+
+  pair: (Str, Int) = db.query_row("select title, published from books where published < ?", 1970).~scan
+  puts "oldest: #{pair[0]}, #{pair[1]}"
+
+  tx = db.~begin
+  tx.~exec("delete from books", nil)
+  ~tx.rollback
+  n: Int = db.query_row("select count(*) from books", nil).~scan
+  puts "after rollback: #{n} books"
+
+  tx2 = db.~begin
+  tx2.~exec("update books set rating = rating + ? where rating is not null", 0.25)
+  ~tx2.commit
+  avg: Float = db.query_row("select avg(rating) from books", nil).~scan
+  puts "average rating: #{avg}"
+
+  dup = db.exec("insert into books(title) values(?)", "Dune")
+  puts "duplicate: #{dup.err?.message || "no error"}"
+  missing: ~Str = db.query_row("select title from books where id = ?", 99).scan
+  puts "missing: #{sql.no_rows?(missing.err.unwrap)}"
+
+  wg = sync.new_wait_group
+  for w in 0...4 {
+    wg.add(1)
+    d = db.dup
+    _ = spawn {
+      for i in 0...5 {
+        _ = d.exec("insert into books(title, published) values(?, ?)", ("vol #{w}.#{i}", 2000 + i))
+      }
+      wg.done
+    }
+  }
+  wg.wait
+  total: Int = db.query_row("select count(*) from books", nil).~scan
+  puts "after the tasks: #{total} books"
+  nil
+}
+
+~main_

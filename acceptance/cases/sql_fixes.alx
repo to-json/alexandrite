@@ -1,0 +1,136 @@
+# Language changes from the database/sql port (GO-VS-RUBY D65).
+
+# 1. Generic refinements and static methods through refinements: a
+#    refinement may have type parameters (`refine Opt[T] for T?`), a static
+#    method of a refinement is called on the type (`Int.from_text(s)`), and
+#    through a type parameter bound to a builtin, an optional or a tuple.
+using IntText
+using StrText
+using OptText
+using PairText
+refine IntText for Int {
+  def self.from_text(s: Str) -> ~Int {
+    n = 0
+    for c in s.bytes {
+      fail "not a digit: #{s}" if c < 48 || c > 57
+      n = n * 10 + (c - 48).to_i
+    }
+    n
+  }
+  def to_text -> Str { "#{self}" }
+}
+refine StrText for Str {
+  def self.from_text(s: Str) -> ~Str { s }
+  def to_text -> Str { self }
+}
+refine OptText[T] for T? {
+  def self.from_text(s: Str) -> ~T? {
+    return none if s == "-"
+    v: T = ~T.from_text(s)
+    v
+  }
+  def to_text -> Str {
+    if x = self {
+      return x.to_text
+    }
+    "-"
+  }
+}
+refine PairText[A, B] for (A, B) {
+  def self.from_text(s: Str) -> ~(A, B) {
+    i = s.byteindex(",")
+    fail "no comma" if i < 0
+    a: A = ~A.from_text(s[0...i])
+    b: B = ~B.from_text(s[i + 1...s.size])
+    (a, b)
+  }
+  def to_text -> Str { "#{self[0].to_text},#{self[1].to_text}" }
+}
+
+def parse[T](s: Str) -> ~T {
+  v: T = ~T.from_text(s)
+  v
+}
+def show[T](x: T) -> Str { x.to_text }
+
+puts Int.from_text("42").unwrap
+a: (Int, Str?) = parse("7,-").unwrap
+puts a
+b: (Int?, Str) = parse("-,x").unwrap
+puts show(b)
+c: ~Int = parse("4x")
+puts c.err?.message || ""
+
+# 2. `v.as(T)`: an interface value as one implementor (Go's v.(T)).
+interface Shape {
+  def area -> Float
+}
+struct Sq {
+  s: Float
+  def area -> Float { s * s }
+}
+struct Circle {
+  r: Float
+  def area -> Float { 3.0 * r * r }
+}
+shapes: [Shape] = [Sq.new(s: 2.0), Circle.new(r: 1.0)]
+for sh in shapes {
+  if q = sh.as(Sq) {
+    puts "square #{q.s}"
+  }
+  puts sh.as(Circle) != none
+}
+
+# 3. `_ = e` discards: each `_` is a fresh local of e's type.
+_ = 1
+_ = "two"
+_ = c
+
+# 4. `!` calls on a guarded value in two lock blocks of one function.
+struct Counter {
+  n: Int
+  def bump!(k: Int) -> Int {
+    self.n += k
+    n
+  }
+}
+def twice(m: Mutex[Counter]) -> Int {
+  x = m.lock { |v|
+    k = v.bump!(1)
+    k
+  }
+  y = m.lock { |v|
+    k = v.bump!(10)
+    k
+  }
+  x + y
+}
+puts twice(Mutex.new(Counter.new(n: 0)))
+
+# 5. A function-valued field called inside a method.
+struct Job {
+  run: (Int) -> Int
+  stop: () -> Unit
+  def go(x: Int) -> Int {
+    stop()
+    run(x) + 1
+  }
+}
+stopped = Atomic.new(false)
+j = Job.new(run: ->(x: Int) -> Int { x * 2 }, stop: ->() { stopped.store(true) })
+puts j.go(20)
+puts stopped.load
+
+# 6. A `~` around a call doesn't reach into a lambda passed to it.
+def apply(f: (Int) -> ~Int) -> ~Int { ~f(3) }
+def may_fail(k: Int) -> ~Int {
+  fail "odd" if k % 2 == 1
+  k
+}
+def outer -> ~Int {
+  ~apply(->(k: Int) -> ~Int {
+    r = may_fail(k)
+    r.ok? ? r.unwrap : -1
+  })
+}
+puts outer.unwrap

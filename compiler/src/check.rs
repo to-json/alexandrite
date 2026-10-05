@@ -1460,6 +1460,8 @@ struct FnCx<'w, 'a> {
     fallible_decl: bool,
     /// Depth of `try` directly enclosing the expression being checked.
     under_try: bool,
+    /// The call being checked is a bare name (`cancel`), not `cancel()`.
+    bare_name: bool,
     /// The def being checked declares its error set (`~T<A | B>`).
     declared_errs: bool,
     /// `#![overflow(wrap)]`: arithmetic under `~` can't fail with ArithError.
@@ -1573,6 +1575,7 @@ impl<'w, 'a> FnCx<'w, 'a> {
             impure: false,
             fallible_decl: def.is_some_and(|d| d.fallible),
             under_try: false,
+            bare_name: false,
             declared_errs: def.is_some_and(|d| d.errs.is_some()),
             wrap: _overflow == Overflow::Wrap,
             mut_errs: None,
@@ -2288,6 +2291,7 @@ impl<'w, 'a> FnCx<'w, 'a> {
                             return self.expr(&lam);
                         }
                     }
+                    self.bare_name = true;
                     return self.call(None, n, sp, &[], None, None, sp);
                 }
             },
@@ -4812,6 +4816,7 @@ impl<'w, 'a> FnCx<'w, 'a> {
     }
 
     fn global_call(&mut self, name: &str, name_span: Span, args: &[Expr], block: Option<&Block>, bsym: Option<&(String, Span)>, sp: Span) -> R<TExpr> {
+        let was_bare = std::mem::replace(&mut self.bare_name, false);
         if let Some(id) = self.lookup(name) {
             if let Ty::Fn(..) = self.resolve(&self.locals[id].ty) {
                 let f = self.mk(TK::Local(id), self.locals[id].ty.clone(), name_span);
@@ -4823,10 +4828,10 @@ impl<'w, 'a> FnCx<'w, 'a> {
         if args.is_empty() && block.is_none() {
             let bare = Expr { kind: ExprKind::Name(name.to_string()), span: name_span, id: NodeId::MAX };
             if let Some(f) = self.self_field(&bare) {
-                // `cancel()` on a field holding a function calls it (it was
-                // read and dropped).
+                // `cancel()` (not bare `cancel`) on a field holding a
+                // function calls it (it was read and dropped).
                 let fv = self.expr(&f)?;
-                if let Ty::Fn(..) = self.resolve(&fv.ty) {
+                if let (Ty::Fn(..), false) = (self.resolve(&fv.ty), was_bare) {
                     return self.fn_call(fv, args, sp);
                 }
                 return Ok(fv);

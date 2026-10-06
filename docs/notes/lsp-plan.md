@@ -216,5 +216,5 @@ Built on branch `lsp-m1` (merge of `lsp-rt`, `lsp-cli`, `lsp-checker`, `lsp-serv
 | 1.1-1.6 | done (`alx check --json`, `analyze`, collect mode, parser recovery, panic wrapper) |
 | 1.4 exit criterion | met for std packages (`std_packages_report_no_diagnostics`); 14 std `*_test.alx` files still report errors, port-issues rows |
 | 2.x server | done; deviation: overlays go through a temp file (`--overlays FILE`) because `os/exec` pins what a `Cmd` reaches |
-| 2.6 / 3.3 bounded memory | see the soak in the `LSP` acceptance group |
+| 2.6 / 3.3 bounded memory | done: 10k edits x 100 KB peak 22 MB (limit 150), ~1 KB/edit residual; server restructured around port-issues #177 (compiler limitation still open) |
 | 3.x | done: `docs/editors/neovim.md`, acceptance group `LSP` |

@@ -1,114 +1,1138 @@
+#![test(external)]
+# Go's path_test.go, match_test.go and the Unix examples (package
+# filepath_test), translated. TestWalkFileError needs Go's export_test hook
+# and is in walk_hook_test.alx. Not translated: the Windows and Plan 9 tables
+# and tests (this port is Unix-only), TestGlobUNC, TestVolumeName and
+# TestDriveLetterInEvalSymlinks (Windows-only), TestBug3486 (walks GOROOT),
+# the allocation checks in TestClean, the benchmarks.
+
+import "io/fs"
 import "os"
+import "path"
+import "path/filepath"
+import "slices"
+import "strings"
 
-test "rel" {
-  cases = [["a/b", "a/b", "."], ["a/b/.", "a/b", "."], ["a/b", "a/b/.", "."], ["./a/b", "a/b", "."], ["a/b", "./a/b", "."], ["ab/cd", "ab/cde", "../cde"], ["ab/cd", "ab/c", "../c"],
-    ["a/b", "a/b/c/d", "c/d"], ["a/b", "a/b/../c", "../c"], ["a/b/../c", "a/b", "../b"], ["a/b/c", "a/c/d", "../../c/d"], ["a/b", "c/d", "../../c/d"], ["a/b/c/d", "a/b", "../.."],
-    ["a/b/c/d", "a/b/", "../.."], ["a/b/c/d/", "a/b", "../.."], ["a/b/c/d/", "a/b/", "../.."], ["../../a/b", "../../a/b/c/d", "c/d"], ["/a/b", "/a/b", "."], ["/a/b/.", "/a/b", "."],
-    ["/a/b", "/a/b/.", "."], ["/ab/cd", "/ab/cde", "../cde"], ["/ab/cd", "/ab/c", "../c"], ["/a/b", "/a/b/c/d", "c/d"], ["/a/b", "/a/b/../c", "../c"], ["/a/b/../c", "/a/b", "../b"],
-    ["/a/b/c", "/a/c/d", "../../c/d"], ["/a/b", "/c/d", "../../c/d"], ["/a/b/c/d", "/a/b", "../.."], ["/a/b/c/d", "/a/b/", "../.."], ["/a/b/c/d/", "/a/b", "../.."],
-    ["/a/b/c/d/", "/a/b/", "../.."], ["/../../a/b", "/../../a/b/c/d", "c/d"], [".", "a/b", "a/b"], [".", "..", ".."]]
-  for c in cases {
-    assert_eq rel(c[0], c[1]).unwrap, c[2]
+#[track_caller]
+def check[T](got: T, want: T, what: Str) {
+  assert got == want, "#{what} = #{got}, want #{want} (at #{caller_location})"
+}
+
+# A fresh temporary directory (Go's t.TempDir); the caller removes it.
+def temp_dir -> Str {
+  os.mkdir_temp("", "alx-filepath-*").unwrap
+}
+
+def touch(name: Str) {
+  f = os.create(name).unwrap
+  f.close!.unwrap
+}
+
+# --------------------------------------------------------------- path_test.go
+
+test "Clean" {
+  tests = [
+    # Already clean
+    ["abc", "abc"],
+    ["abc/def", "abc/def"],
+    ["a/b/c", "a/b/c"],
+    [".", "."],
+    ["..", ".."],
+    ["../..", "../.."],
+    ["../../abc", "../../abc"],
+    ["/abc", "/abc"],
+    ["/", "/"],
+    # Empty is current dir
+    ["", "."],
+    # Remove trailing slash
+    ["abc/", "abc"],
+    ["abc/def/", "abc/def"],
+    ["a/b/c/", "a/b/c"],
+    ["./", "."],
+    ["../", ".."],
+    ["../../", "../.."],
+    ["/abc/", "/abc"],
+    # Remove doubled slash
+    ["abc//def//ghi", "abc/def/ghi"],
+    ["abc//", "abc"],
+    # Remove . elements
+    ["abc/./def", "abc/def"],
+    ["/./abc/def", "/abc/def"],
+    ["abc/.", "abc"],
+    # Remove .. elements
+    ["abc/def/ghi/../jkl", "abc/def/jkl"],
+    ["abc/def/../ghi/../jkl", "abc/jkl"],
+    ["abc/def/..", "abc"],
+    ["abc/def/../..", "."],
+    ["/abc/def/../..", "/"],
+    ["abc/def/../../..", ".."],
+    ["/abc/def/../../..", "/"],
+    ["abc/def/../../../ghi/jkl/../../../mno", "../../mno"],
+    ["/../abc", "/abc"],
+    ["a/../b:/../../c", "../c"],
+    # Combinations
+    ["abc/./../def", "def"],
+    ["abc//./../def", "def"],
+    ["abc/../../././../def", "../../def"],
+    # nonwincleantests
+    ["//abc", "/abc"],
+    ["///abc", "/abc"],
+    ["//abc//", "/abc"],
+  ]
+  for t in tests {
+    check(filepath.clean(t[0]), t[1], "Clean(#{t[0]})")
+    check(filepath.clean(t[1]), t[1], "Clean(#{t[1]})")
   }
-  for c in [["../..", "."], ["../..", "a"], ["../../a/b", "../a"], ["/a", "a"], ["a", "/a"]] {
-    assert rel(c[0], c[1]).err?, "#{c[0]} -> #{c[1]} should fail"
+}
+
+test "IsLocal" {
+  tests: [(Str, Bool)] = [
+    ("", false),
+    (".", true),
+    ("..", false),
+    ("../a", false),
+    ("/", false),
+    ("/a", false),
+    ("/a/../..", false),
+    ("a", true),
+    ("a/../a", true),
+    ("a/", true),
+    ("a/.", true),
+    ("a/./b/./c", true),
+    ("a/../b:/../../c", false),
+  ]
+  for t in tests {
+    check(filepath.local?(t[0]), t[1], "IsLocal(#{t[0]})")
   }
 }
 
-test "split_list and wrappers" {
-  assert_eq split_list("").size, 0
-  assert_eq split_list("a:b:c").size, 3
-  assert_eq split_list("a::b")[1], ""
-  assert_eq join(["a", "b"]), "a/b"
-  d, f = split("x/y")
-  assert_eq d + f, "x/y"
-  assert match("*.go", "x.go").unwrap
+test "Localize" {
+  tests = [
+    ["", ""],
+    [".", "."],
+    ["..", ""],
+    ["a/..", ""],
+    ["/", ""],
+    ["/a", ""],
+    ["a" + Str.from_bytes([0xff]) + "b", ""],
+    ["a/", ""],
+    ["a/./b", ""],
+    ["\0", ""],
+    ["a", "a"],
+    ["a/b/c", "a/b/c"],
+    # unixlocalizetests
+    ["\#a", "\#a"],
+    ["a\\b:c", "a\\b:c"],
+  ]
+  for t in tests {
+    r = filepath.localize(t[0])
+    if e = r.err {
+      check(t[1], "", "Localize(#{t[0]}) failed")
+      check(e.message, "invalid path", "Localize(#{t[0]}) error")
+    } else {
+      check(r.unwrap, t[1], "Localize(#{t[0]})")
+    }
+  }
 }
 
-# ---------------------------------------------------------- with the os package
-
-def tree -> Str {
-  d = os.mkdir_temp("", "alx-fp-test-*").unwrap
-  os.mkdir_all(d + "/a/b", 0o755).unwrap
-  os.mkdir_all(d + "/c", 0o755).unwrap
-  os.write_file(d + "/a/one.txt", "1".bytes.to_a, 0o644).unwrap
-  os.write_file(d + "/a/b/two.go", "22".bytes.to_a, 0o644).unwrap
-  os.write_file(d + "/a/b/three.txt", "333".bytes.to_a, 0o644).unwrap
-  os.write_file(d + "/z.txt", "4444".bytes.to_a, 0o644).unwrap
-  d
+test "FromAndToSlash" {
+  tests = [["", ""], ["/", "/"], ["/a/b", "/a/b"], ["a//b", "a//b"]]
+  for t in tests {
+    check(filepath.from_slash(t[0]), t[1], "FromSlash(#{t[0]})")
+    check(filepath.to_slash(t[1]), t[0], "ToSlash(#{t[1]})")
+  }
 }
 
-test "abs" {
-  assert_eq abs("/a/../b/./c").unwrap, "/b/c"
+test "SplitList" {
+  tests: [(Str, [Str])] = [("", []), ("a:b", ["a", "b"]), (":a:b", ["", "a", "b"])]
+  for t in tests {
+    check(filepath.split_list(t[0]), t[1], "SplitList(#{t[0]})")
+  }
+}
+
+test "Split" {
+  tests = [["a/b", "a/", "b"], ["a/b/", "a/b/", ""], ["a/", "a/", ""], ["a", "", "a"], ["/", "/", ""]]
+  for t in tests {
+    d, f = filepath.split(t[0])
+    check(d, t[1], "Split(#{t[0]}) dir")
+    check(f, t[2], "Split(#{t[0]}) file")
+  }
+}
+
+test "Join" {
+  tests: [([Str], Str)] = [
+    # zero parameters
+    ([], ""),
+    # one parameter
+    ([""], ""),
+    (["/"], "/"),
+    (["a"], "a"),
+    # two parameters
+    (["a", "b"], "a/b"),
+    (["a", ""], "a"),
+    (["", "b"], "b"),
+    (["/", "a"], "/a"),
+    (["/", "a/b"], "/a/b"),
+    (["/", ""], "/"),
+    (["/a", "b"], "/a/b"),
+    (["a", "/b"], "a/b"),
+    (["/a", "/b"], "/a/b"),
+    (["a/", "b"], "a/b"),
+    (["a/", ""], "a"),
+    (["", ""], ""),
+    # three parameters
+    (["/", "a", "b"], "/a/b"),
+    # nonwinjointests
+    (["//", "a"], "/a"),
+  ]
+  for t in tests {
+    check(filepath.join(t[0]), t[1], "Join(#{t[0]})")
+  }
+}
+
+test "Ext" {
+  tests = [["path.go", ".go"], ["path.pb.go", ".go"], ["a.dir/b", ""], ["a.dir/b.go", ".go"], ["a.dir/", ""]]
+  for t in tests {
+    check(filepath.ext(t[0]), t[1], "Ext(#{t[0]})")
+  }
+}
+
+test "Base" {
+  tests = [
+    # Already clean
+    ["", "."],
+    [".", "."],
+    ["/.", "."],
+    ["/", "/"],
+    ["////", "/"],
+    ["x/", "x"],
+    ["abc", "abc"],
+    ["abc/def", "def"],
+    ["a/b/.x", ".x"],
+    ["a/b/c.", "c."],
+    ["a/b/c.x", "c.x"],
+  ]
+  for t in tests {
+    check(filepath.base(t[0]), t[1], "Base(#{t[0]})")
+  }
+}
+
+test "Dir" {
+  tests = [
+    ["", "."],
+    [".", "."],
+    ["/.", "/"],
+    ["/", "/"],
+    ["/foo", "/"],
+    ["x/", "x"],
+    ["abc", "."],
+    ["abc/def", "abc"],
+    ["a/b/.x", "a/b"],
+    ["a/b/c.", "a/b"],
+    ["a/b/c.x", "a/b"],
+    # nonwindirtests
+    ["////", "/"],
+  ]
+  for t in tests {
+    check(filepath.dir(t[0]), t[1], "Dir(#{t[0]})")
+  }
+}
+
+test "IsAbs" {
+  tests: [(Str, Bool)] = [
+    ("", false),
+    ("/", true),
+    ("/usr/bin/gcc", true),
+    ("..", false),
+    ("/a/../bb", true),
+    (".", false),
+    ("./", false),
+    ("lala", false),
+  ]
+  for t in tests {
+    check(filepath.is_abs(t[0]), t[1], "IsAbs(#{t[0]})")
+  }
+}
+
+test "Rel" {
+  tests = [
+    ["a/b", "a/b", "."],
+    ["a/b/.", "a/b", "."],
+    ["a/b", "a/b/.", "."],
+    ["./a/b", "a/b", "."],
+    ["a/b", "./a/b", "."],
+    ["ab/cd", "ab/cde", "../cde"],
+    ["ab/cd", "ab/c", "../c"],
+    ["a/b", "a/b/c/d", "c/d"],
+    ["a/b", "a/b/../c", "../c"],
+    ["a/b/../c", "a/b", "../b"],
+    ["a/b/c", "a/c/d", "../../c/d"],
+    ["a/b", "c/d", "../../c/d"],
+    ["a/b/c/d", "a/b", "../.."],
+    ["a/b/c/d", "a/b/", "../.."],
+    ["a/b/c/d/", "a/b", "../.."],
+    ["a/b/c/d/", "a/b/", "../.."],
+    ["../../a/b", "../../a/b/c/d", "c/d"],
+    ["/a/b", "/a/b", "."],
+    ["/a/b/.", "/a/b", "."],
+    ["/a/b", "/a/b/.", "."],
+    ["/ab/cd", "/ab/cde", "../cde"],
+    ["/ab/cd", "/ab/c", "../c"],
+    ["/a/b", "/a/b/c/d", "c/d"],
+    ["/a/b", "/a/b/../c", "../c"],
+    ["/a/b/../c", "/a/b", "../b"],
+    ["/a/b/c", "/a/c/d", "../../c/d"],
+    ["/a/b", "/c/d", "../../c/d"],
+    ["/a/b/c/d", "/a/b", "../.."],
+    ["/a/b/c/d", "/a/b/", "../.."],
+    ["/a/b/c/d/", "/a/b", "../.."],
+    ["/a/b/c/d/", "/a/b/", "../.."],
+    ["/../../a/b", "/../../a/b/c/d", "c/d"],
+    [".", "a/b", "a/b"],
+    [".", "..", ".."],
+    ["", "../../.", "../.."],
+    # can't do purely lexically
+    ["..", ".", "err"],
+    ["..", "a", "err"],
+    ["../..", "..", "err"],
+    ["a", "/a", "err"],
+    ["/a", "a", "err"],
+  ]
+  for t in tests {
+    r = filepath.rel(t[0], t[1])
+    if t[2] == "err" {
+      assert r.err?, "Rel(#{t[0]}, #{t[1]}) = #{r.ok || ""}, want error"
+      check(r.err.unwrap.message, "Rel: can't make #{t[1]} relative to #{t[0]}", "Rel error")
+    } else {
+      check(r.unwrap, t[2], "Rel(#{t[0]}, #{t[1]})")
+    }
+  }
+}
+
+# --------------------------------------------------------------- Walk, WalkDir
+
+# Go's tree: testdata/{a, b/, c, d/{x, y/, z/{u, v}}}; marks by (unique) name.
+def tree_rows -> [(Str, Bool)] {
+  [
+    ("testdata", true),
+    ("testdata/a", false),
+    ("testdata/b", true),
+    ("testdata/c", false),
+    ("testdata/d", true),
+    ("testdata/d/x", false),
+    ("testdata/d/y", true),
+    ("testdata/d/z", true),
+    ("testdata/d/z/u", false),
+    ("testdata/d/z/v", false),
+  ]
+}
+
+def make_tree {
+  for r in tree_rows() {
+    if r[1] {
+      os.mkdir(r[0], 0o770).unwrap
+    } else {
+      touch(r[0])
+    }
+  }
+}
+
+def zero_marks -> Map[Str, Int] {
+  m: Map[Str, Int] = {}
+  for r in tree_rows() {
+    m[path.base(r[0])] = 0
+  }
+  m
+}
+
+# Go's markTree: a subtree's names, each marked once.
+def mark_subtree(marks: Map[Str, Int], top: Str) {
+  for r in tree_rows() {
+    if r[0] == top || r[0].start_with?(top + "/") {
+      b = path.base(r[0])
+      marks[b] = (marks[b] || 0) + 1
+    }
+  }
+}
+
+#[track_caller]
+def check_marks(marks: Map[Str, Int]) {
+  for r in tree_rows() {
+    b = path.base(r[0])
+    assert_eq "#{r[0]} #{marks[b] || 0}", "#{r[0]} 1"
+  }
+}
+
+# Go's testWalk, for Walk (err_visit 1) or WalkDir (err_visit 2).
+def test_walk(use_walk_dir: Bool, err_visit: Int) {
   wd = os.getwd.unwrap
-  assert_eq abs(".").unwrap, wd
-  assert_eq abs("x/y").unwrap, wd + "/x/y"
-  assert_eq abs("../x").unwrap, dir(wd) + "/x" if wd != "/"
+  td = temp_dir()
+  os.chdir(td).unwrap
+  defer {
+    os.chdir(wd).unwrap
+    os.remove_all(td).unwrap
+  }
+  make_tree()
+  marks = zero_marks()
+  errors: [Error] = []
+  clear = true
+  run = -> -> ~Unit {
+    if use_walk_dir {
+      ~filepath.walk_dir("testdata") { |_p, d, err|
+        name = d?.name || ""
+        marks[name] = (marks[name] || 0) + 1
+        if e = err {
+          errors << e
+          fail e if !clear
+        }
+      }
+    } else {
+      ~filepath.walk("testdata") { |_p, info, err|
+        name = info?.name || ""
+        marks[name] = (marks[name] || 0) + 1
+        if e = err {
+          errors << e
+          fail e if !clear
+        }
+      }
+    }
+  }
+  # Expect no errors.
+  run.call.unwrap
+  assert_eq errors.size, 0
+  check_marks(marks)
+  marks = zero_marks()
+  errors = []
+
+  # PermErr: only possible if we're not root.
+  return if os.getuid == 0
+  # Introduce 2 errors: chmod top-level directories to 0.
+  os.chmod("testdata/b", 0).unwrap
+  os.chmod("testdata/d", 0).unwrap
+  # Capture errors, expect two; mark the respective subtrees manually,
+  # correcting the double-marking of the directory itself.
+  mark_subtree(marks, "testdata/b")
+  mark_subtree(marks, "testdata/d")
+  marks["b"] = (marks["b"] || 0) - err_visit
+  marks["d"] = (marks["d"] || 0) - err_visit
+  run.call.unwrap
+  assert_eq errors.size, 2
+  check_marks(marks)
+  marks = zero_marks()
+  errors = []
+
+  # Capture errors, stop after the first one.
+  clear = false
+  r = run.call
+  assert r.err?, "expected an error from the walk"
+  assert_eq errors.size, 1
+  # Restore permissions.
+  os.chmod("testdata/b", 0o770).unwrap
+  os.chmod("testdata/d", 0o770).unwrap
 }
 
-test "walk_dir visits in lexical order" {
-  d = tree
-  seen = ""
-  count = 0
-  walk_dir(d) { |p, e|
-    seen = seen + p[d.size...p.size] + (e.is_dir ? "/" : "") + " "
-    count += 1
-    WalkAction.Continue
-  }.unwrap
-  assert_eq seen, "/ /a/ /a/b/ /a/b/three.txt /a/b/two.go /a/one.txt /c/ /z.txt "
-  assert_eq count, 8
-  os.remove_all(d).unwrap
+test "Walk" {
+  test_walk(false, 1)
 }
 
-test "walk_dir: SkipDir and Stop" {
-  d = tree
-  seen = ""
-  walk_dir(d) { |p, e|
-    seen = seen + e.name + " "
-    e.name == "b" ? WalkAction.SkipDir : WalkAction.Continue
-  }.unwrap
-  assert_eq seen, "#{base(d)} a b one.txt c z.txt "
-  seen = ""
-  walk_dir(d) { |p, e|
-    seen = seen + e.name + " "
-    e.name == "two.go" ? WalkAction.Stop : WalkAction.Continue
-  }.unwrap
-  assert_eq seen, "#{base(d)} a b three.txt two.go "
-  # SkipDir on a file skips the rest of its directory.
-  seen = ""
-  walk_dir(d) { |p, e|
-    seen = seen + e.name + " "
-    e.name == "three.txt" ? WalkAction.SkipDir : WalkAction.Continue
-  }.unwrap
-  assert_eq seen, "#{base(d)} a b three.txt one.txt c z.txt "
-  os.remove_all(d).unwrap
+test "WalkDir" {
+  test_walk(true, 2)
 }
 
-test "walk_dir: a file root and a missing root" {
-  d = tree
+test "WalkSkipDirOnFile" {
+  td = temp_dir()
+  defer { os.remove_all(td).unwrap }
+  os.mkdir_all(filepath.join([td, "dir"]), 0o755).unwrap
+  touch(filepath.join([td, "dir/foo1"]))
+  touch(filepath.join([td, "dir/foo2"]))
+  for root in [td, filepath.join([td, "dir"])] {
+    saw_foo2 = false
+    ~filepath.walk(root) { |p, _i, _e|
+      saw_foo2 = true if p.end_with?("foo2")
+      fail fs.FsError.SkipDir if p.end_with?("foo1")
+    }
+    assert !saw_foo2, "Walk: SkipDir on file foo1 did not block processing of foo2"
+    saw_foo2 = false
+    ~filepath.walk_dir(root) { |p, _d, _e|
+      saw_foo2 = true if p.end_with?("foo2")
+      fail fs.FsError.SkipDir if p.end_with?("foo1")
+    }
+    assert !saw_foo2, "WalkDir: SkipDir on file foo1 did not block processing of foo2"
+  }
+}
+
+test "WalkSkipAllOnFile" {
+  td = temp_dir()
+  defer { os.remove_all(td).unwrap }
+  os.mkdir_all(filepath.join([td, "dir", "subdir"]), 0o755).unwrap
+  os.mkdir_all(filepath.join([td, "dir2"]), 0o755).unwrap
+  touch(filepath.join([td, "dir", "foo1"]))
+  touch(filepath.join([td, "dir", "foo2"]))
+  touch(filepath.join([td, "dir", "subdir", "foo3"]))
+  touch(filepath.join([td, "dir", "foo4"]))
+  touch(filepath.join([td, "dir2", "bar"]))
+  touch(filepath.join([td, "last"]))
+  later = ["foo3", "foo4", "bar", "last"]
+  for root in [td, filepath.join([td, "dir"])] {
+    remaining_were_skipped = true
+    ~filepath.walk(root) { |p, _i, _e|
+      fail fs.FsError.SkipAll if p.end_with?("foo2")
+      remaining_were_skipped = false if later.any? { p.end_with?(it) }
+    }
+    assert remaining_were_skipped, "Walk: SkipAll on file foo2 did not block processing of remaining files and directories"
+    remaining_were_skipped = true
+    ~filepath.walk_dir(root) { |p, _d, _e|
+      fail fs.FsError.SkipAll if p.end_with?("foo2")
+      remaining_were_skipped = false if later.any? { p.end_with?(it) }
+    }
+    assert remaining_were_skipped, "WalkDir: SkipAll on file foo2 did not block processing of remaining files and directories"
+  }
+}
+
+test "WalkSymlinkRoot" {
+  td = temp_dir()
+  defer { os.remove_all(td).unwrap }
+  d = filepath.join([td, "dir"])
+  os.mkdir_all(d, 0o755).unwrap
+  touch(filepath.join([d, "foo"]))
+  link = filepath.join([td, "link"])
+  os.symlink("dir", link).unwrap
+  abslink = filepath.join([td, "abslink"])
+  os.symlink(d, abslink).unwrap
+  linklink = filepath.join([td, "linklink"])
+  os.symlink("link", linklink).unwrap
+  # Walk doesn't traverse symlinks itself: without a trailing slash it
+  # reports the link; with one, the path resolves to the directory.
+  tests: [(Str, Str, [Str], Bool)] = [
+    ("no slash", link, [link], false),
+    ("slash", link + "/", [link, filepath.join([link, "foo"])], false),
+    ("abs no slash", abslink, [abslink], false),
+    ("abs with slash", abslink + "/", [abslink, filepath.join([abslink, "foo"])], false),
+    ("double link no slash", linklink, [linklink], false),
+    # https://go.dev/issue/59586: buggy on darwin and ios.
+    ("double link with slash", linklink + "/", [linklink, filepath.join([linklink, "foo"])], true),
+  ]
+  for t in tests {
+    walked: [Str] = []
+    ~filepath.walk(t[1]) { |p, _info, err|
+      fail err.unwrap if err.some?
+      walked << filepath.clean(p)
+    }
+    check(walked, t[2], t[0]) if !t[3] || !darwin?()
+  }
+}
+
+def darwin? -> Bool {
+  # macOS has /System; Go's runtime.GOOS == "darwin".
+  os.stat("/System/Library").ok?
+}
+
+test "Issue51617" {
+  td = temp_dir()
+  defer {
+    os.chmod(filepath.join([td, "a", "bad"]), 0o700)
+    os.remove_all(td).unwrap
+  }
+  for sub in ["a", filepath.join(["a", "bad"]), filepath.join(["a", "next"])] {
+    os.mkdir(filepath.join([td, sub]), 0o755).unwrap
+  }
+  bad = filepath.join([td, "a", "bad"])
+  os.chmod(bad, 0).unwrap
+  saw: [Str] = []
+  ~filepath.walk_dir(td) { |p, d, err|
+    fail fs.FsError.SkipDir if err.some?
+    if e = d {
+      saw << ~filepath.rel(td, p) if e.is_dir
+    }
+  }
+  check(saw, [".", "a", filepath.join(["a", "bad"]), filepath.join(["a", "next"])], "directories")
+}
+
+test "WalkSymlink" {
+  td = temp_dir()
+  wd = os.getwd.unwrap
+  os.chdir(td).unwrap
+  defer {
+    os.chdir(wd).unwrap
+    os.remove_all(td).unwrap
+  }
+  os.symlink(td, "link").unwrap
+  visited: [Str] = []
+  ~filepath.walk(td) { |p, _info, err|
+    fail err.unwrap if err.some?
+    visited << ~filepath.rel(td, p)
+  }
+  slices.sort(visited)
+  check(visited, [".", "link"], "visited")
+}
+
+# A walk whose root can't be lstat'ed calls f once, with no entry.
+test "walk missing root" {
+  td = temp_dir()
+  defer { os.remove_all(td).unwrap }
   n = 0
-  walk_dir(d + "/z.txt") { |p, e|
+  r = filepath.walk_dir(filepath.join([td, "nope"])) { |_p, d, err|
     n += 1
-    WalkAction.Continue
-  }.unwrap
-  assert_eq n, 1
-  r = walk_dir(d + "/nope") { |p, e| WalkAction.Continue }
-  assert os.is_not_exist(r.err.unwrap)
-  os.remove_all(d).unwrap
+    assert d.none?, "no entry for a missing root"
+    fail err.unwrap if err.some?
+  }
+  assert os.is_not_exist(r.err.unwrap), "walk_dir error"
+  r2 = filepath.walk(filepath.join([td, "nope"])) { |_p, info, err|
+    n += 1
+    assert info.none?, "no info for a missing root"
+    fail err.unwrap if err.some?
+  }
+  assert os.is_not_exist(r2.err.unwrap), "walk error"
+  assert_eq n, 2
 }
 
-test "glob" {
-  d = tree
-  g = glob(d + "/a/*.txt").unwrap
-  assert_eq g.size, 1
-  assert_eq g[0], d + "/a/one.txt"
-  g2 = glob(d + "/*/b/*.txt").unwrap
-  assert_eq g2.size, 1
-  assert_eq g2[0], d + "/a/b/three.txt"
-  assert_eq glob(d + "/*").unwrap.size, 3
-  assert_eq glob(d + "/nothing*").unwrap.size, 0
-  assert_eq glob(d + "/z.txt").unwrap.size, 1
-  assert_eq glob(d + "/missing.txt").unwrap.size, 0
-  assert glob(d + "/[").err?
-  os.remove_all(d).unwrap
+# ------------------------------------------------------------- EvalSymlinks
+
+def eval_symlinks_test_dirs -> [[Str]] {
+  [
+    ["test", ""],
+    ["test/dir", ""],
+    ["test/dir/link3", "../../"],
+    ["test/link1", "../test"],
+    ["test/link2", "dir"],
+    ["test/linkabs", "/"],
+    ["test/link4", "../test2"],
+    ["test2", "test/dir"],
+    # Issue 23444.
+    ["src", ""],
+    ["src/pool", ""],
+    ["src/pool/test", ""],
+    ["src/versions", ""],
+    ["src/versions/current", "../../version"],
+    ["src/versions/v1", ""],
+    ["src/versions/v1/modules", ""],
+    ["src/versions/v1/modules/test", "../../../pool/test"],
+    ["version", "src/versions/v1"],
+  ]
 }
+
+def eval_symlinks_tests -> [[Str]] {
+  [
+    ["test", "test"],
+    ["test/dir", "test/dir"],
+    ["test/dir/../..", "."],
+    ["test/link1", "test"],
+    ["test/link2", "test/dir"],
+    ["test/link1/dir", "test/dir"],
+    ["test/link2/..", "test"],
+    ["test/dir/link3", "."],
+    ["test/link2/link3/test", "test"],
+    ["test/linkabs", "/"],
+    ["test/link4/..", "test"],
+    ["src/versions/current/modules/test", "src/pool/test"],
+  ]
+}
+
+# Joins without evaluating "..".
+def simple_join(d: Str, p: Str) -> Str {
+  d + "/" + p
+}
+
+#[track_caller]
+def test_eval_symlinks(p: Str, want: Str) {
+  r = filepath.eval_symlinks(p)
+  if e = r.err {
+    assert false, "EvalSymlinks(#{p}) error: #{e.message}"
+  } else {
+    check(filepath.clean(r.unwrap), filepath.clean(want), "EvalSymlinks(#{p})")
+  }
+}
+
+#[track_caller]
+def test_eval_symlinks_after_chdir(wd: Str, p: Str, want: Str) {
+  old = os.getwd.unwrap
+  os.chdir(wd).unwrap
+  r = filepath.eval_symlinks(p)
+  os.chdir(old).unwrap
+  if e = r.err {
+    assert false, "EvalSymlinks(#{p}) in #{wd} error: #{e.message}"
+  } else {
+    check(filepath.clean(r.unwrap), filepath.clean(want), "EvalSymlinks(#{p}) in #{wd}")
+  }
+}
+
+test "EvalSymlinks" {
+  td0 = temp_dir()
+  defer { os.remove_all(td0).unwrap }
+  # The temp dir may itself be a symlink (macOS: /var -> /private/var).
+  td = ~filepath.eval_symlinks(td0)
+  for d in eval_symlinks_test_dirs() {
+    p = simple_join(td, d[0])
+    if d[1] == "" {
+      ~os.mkdir(p, 0o755)
+    } else {
+      ~os.symlink(d[1], p)
+    }
+  }
+  for t in eval_symlinks_tests() {
+    p = simple_join(td, t[0])
+    dest = filepath.is_abs(t[1]) ? t[1] : simple_join(td, t[1])
+    test_eval_symlinks(p, dest)
+    # EvalSymlinks(".")
+    test_eval_symlinks_after_chdir(p, ".", ".")
+    # EvalSymlinks(".." + path)
+    dotdot = filepath.is_abs(t[1]) ? t[1] : simple_join("..", t[1])
+    test_eval_symlinks_after_chdir(simple_join(td, "test"), simple_join("..", t[0]), dotdot)
+    # EvalSymlinks(p) where p is a relative path
+    test_eval_symlinks_after_chdir(td, t[0], t[1])
+  }
+}
+
+test "EvalSymlinksIsNotExist" {
+  td = temp_dir()
+  wd = os.getwd.unwrap
+  os.chdir(td).unwrap
+  defer {
+    os.chdir(wd).unwrap
+    os.remove_all(td).unwrap
+  }
+  r = filepath.eval_symlinks("notexist")
+  assert os.is_not_exist(r.err.unwrap), "notexist"
+  os.symlink("notexist", "link").unwrap
+  r2 = filepath.eval_symlinks("link")
+  assert os.is_not_exist(r2.err.unwrap), "link"
+}
+
+test "Issue13582" {
+  td = temp_dir()
+  defer { os.remove_all(td).unwrap }
+  d = filepath.join([td, "dir"])
+  ~os.mkdir(d, 0o755)
+  link_to_dir = filepath.join([td, "link_to_dir"])
+  ~os.symlink(d, link_to_dir)
+  file = filepath.join([link_to_dir, "file"])
+  ~os.write_file(file, [], 0o644)
+  link1 = filepath.join([link_to_dir, "link1"])
+  ~os.symlink(file, link1)
+  link2 = filepath.join([link_to_dir, "link2"])
+  ~os.symlink(link1, link2)
+  # The temp dir may itself be a symlink.
+  real_tmp = ~filepath.eval_symlinks(td)
+  real_dir = filepath.join([real_tmp, "dir"])
+  real_file = filepath.join([real_dir, "file"])
+  tests = [[d, real_dir], [link_to_dir, real_dir], [file, real_file], [link1, real_file], [link2, real_file]]
+  for t in tests {
+    check(~filepath.eval_symlinks(t[0]), t[1], "EvalSymlinks(#{t[0]})")
+  }
+}
+
+# Issue 57905.
+test "RelativeSymlinkToAbsolute" {
+  td = temp_dir()
+  wd = os.getwd.unwrap
+  os.chdir(td).unwrap
+  defer {
+    os.chdir(wd).unwrap
+    os.remove_all(td).unwrap
+  }
+  ~os.symlink(td, "link")
+  p = ~filepath.eval_symlinks("link")
+  want = ~filepath.eval_symlinks(td)
+  check(p, want, "EvalSymlinks(link)")
+}
+
+test "Issue29372" {
+  td = temp_dir()
+  defer { os.remove_all(td).unwrap }
+  p = filepath.join([td, "file.txt"])
+  ~os.write_file(p, [], 0o644)
+  tests = [p + "/", p + "//", p + "/.", p + "//.", p + "/..", p + "//.."]
+  for t in tests {
+    r = filepath.eval_symlinks(t)
+    if e = r.err {
+      case e {
+        filepath.FilepathError.NotDir => check(e.message, "not a directory", "ENOTDIR text")
+        _ => assert false, "EvalSymlinks(#{t}): want ENOTDIR, got #{e.message}"
+      }
+    } else {
+      assert false, "EvalSymlinks(#{t}): want ENOTDIR, got #{r.unwrap}"
+    }
+  }
+}
+
+# Issue 30520 part 1.
+test "EvalSymlinksAboveRoot" {
+  td = temp_dir()
+  defer { os.remove_all(td).unwrap }
+  eval_tmp = ~filepath.eval_symlinks(td)
+  ~os.mkdir(filepath.join([eval_tmp, "a"]), 0o777)
+  ~os.symlink(filepath.join([eval_tmp, "a"]), filepath.join([eval_tmp, "b"]))
+  ~os.write_file(filepath.join([eval_tmp, "a", "file"]), [], 0o666)
+  # Count the ".." elements to get to the root directory.
+  c = strings.count(eval_tmp, "/")
+  dd: [Str] = []
+  i = 0
+  while i < c + 2 {
+    dd << ".."
+    i += 1
+  }
+  want_suffix = "a/file"
+  for k in [c, c + 1, c + 2] {
+    chk = strings.join([eval_tmp, strings.join(dd[0...k], "/"), eval_tmp[1...eval_tmp.size], "b", "file"], "/")
+    resolved = ~filepath.eval_symlinks(chk)
+    assert resolved.end_with?(want_suffix), "EvalSymlinks(#{chk}) = #{resolved} does not end with #{want_suffix}"
+  }
+}
+
+# Issue 30520 part 2.
+test "EvalSymlinksAboveRootChdir" {
+  td = temp_dir()
+  wd = os.getwd.unwrap
+  os.chdir(td).unwrap
+  defer {
+    os.chdir(wd).unwrap
+    os.remove_all(td).unwrap
+  }
+  subdir = filepath.join(["a", "b"])
+  ~os.mkdir_all(subdir, 0o777)
+  ~os.symlink(subdir, "c")
+  ~os.write_file(filepath.join([subdir, "file"]), [], 0o666)
+  subdir = filepath.join(["d", "e", "f"])
+  ~os.mkdir_all(subdir, 0o777)
+  ~os.chdir(subdir)
+  chk = filepath.join(["..", "..", "..", "c", "file"])
+  want_suffix = filepath.join(["a", "b", "file"])
+  resolved = ~filepath.eval_symlinks(chk)
+  assert resolved.end_with?(want_suffix), "EvalSymlinks(#{chk}) = #{resolved} does not end with #{want_suffix}"
+}
+
+test "Escaping" {
+  d = temp_dir()
+  d2 = temp_dir()
+  wd = os.getwd.unwrap
+  os.chdir(d2).unwrap
+  defer {
+    os.chdir(wd).unwrap
+    os.remove_all(d).unwrap
+    os.remove_all(d2).unwrap
+  }
+  for p in [filepath.join([d, "x"])] {
+    next if !filepath.local?(p)
+    os.create(p)
+    ents = ~os.read_dir(d)
+    for e in ents {
+      assert false, "found: #{e.name}"
+    }
+  }
+}
+
+test "EvalSymlinksTooManyLinks" {
+  td = temp_dir()
+  defer { os.remove_all(td).unwrap }
+  d = filepath.join([td, "dir"])
+  ~os.symlink(d, d)
+  r = filepath.eval_symlinks(d)
+  assert r.err?, "expected error"
+  check(r.err.unwrap.message, "EvalSymlinks: too many links", "error")
+}
+
+# --------------------------------------------------------------------- Abs
+
+test "Abs" {
+  root0 = temp_dir()
+  root = ~filepath.eval_symlinks(root0)
+  wd = os.getwd.unwrap
+  os.chdir(root).unwrap
+  defer {
+    os.chdir(wd).unwrap
+    os.remove_all(root).unwrap
+  }
+  for d in ["a", "a/b", "a/b/c"] {
+    ~os.mkdir(d, 0o777)
+  }
+  ~os.chdir("a")
+  tests = [
+    ".",
+    "b",
+    "b/",
+    "../a",
+    "../a/b",
+    "../a/b/./c/../../.././a",
+    "../a/b/./c/../../.././a/",
+    "$",
+    "$/.",
+    "$/a/../a/b",
+    "$/a/b/c/../../.././a",
+    "$/a/b/c/../../.././a/",
+  ]
+  for t in tests {
+    p = strings.replace_all(t, "$", root)
+    info = ~os.stat(p)
+    abspath = ~filepath.abs(p)
+    absinfo = ~os.stat(abspath)
+    assert absinfo.ino == info.ino, "Abs(#{p}) = #{abspath}, not the same file"
+    assert filepath.is_abs(abspath), "Abs(#{p}) = #{abspath}, not an absolute path"
+    check(abspath, filepath.clean(abspath), "Abs(#{p}) is clean")
+  }
+}
+
+test "AbsEmptyString" {
+  root = temp_dir()
+  wd = os.getwd.unwrap
+  os.chdir(root).unwrap
+  defer {
+    os.chdir(wd).unwrap
+    os.remove_all(root).unwrap
+  }
+  info = ~os.stat(root)
+  abspath = ~filepath.abs("")
+  absinfo = ~os.stat(abspath)
+  assert absinfo.ino == info.ino, "Abs(\"\") = #{abspath}, not the same file"
+  assert filepath.is_abs(abspath), "Abs(\"\") = #{abspath}, not an absolute path"
+  check(abspath, filepath.clean(abspath), "Abs(\"\") is clean")
+}
+
+# ------------------------------------------------------------ match_test.go
+
+struct MatchTest {
+  pattern: Str
+  s: Str
+  match: Bool
+  bad: Bool
+}
+
+def mt(pattern: Str, s: Str, m: Bool, bad: Bool = false) -> MatchTest {
+  MatchTest.new(pattern: pattern, s: s, match: m, bad: bad)
+}
+
+def match_tests -> [MatchTest] {
+  [
+    mt("abc", "abc", true),
+    mt("*", "abc", true),
+    mt("*c", "abc", true),
+    mt("a*", "a", true),
+    mt("a*", "abc", true),
+    mt("a*", "ab/c", false),
+    mt("a*/b", "abc/b", true),
+    mt("a*/b", "a/c/b", false),
+    mt("a*b*c*d*e*/f", "axbxcxdxe/f", true),
+    mt("a*b*c*d*e*/f", "axbxcxdxexxx/f", true),
+    mt("a*b*c*d*e*/f", "axbxcxdxe/xxx/f", false),
+    mt("a*b*c*d*e*/f", "axbxcxdxexxx/fff", false),
+    mt("a*b?c*x", "abxbbxdbxebxczzx", true),
+    mt("a*b?c*x", "abxbbxdbxebxczzy", false),
+    mt("ab[c]", "abc", true),
+    mt("ab[b-d]", "abc", true),
+    mt("ab[e-g]", "abc", false),
+    mt("ab[^c]", "abc", false),
+    mt("ab[^b-d]", "abc", false),
+    mt("ab[^e-g]", "abc", true),
+    mt("a\\*b", "a*b", true),
+    mt("a\\*b", "ab", false),
+    mt("a?b", "a☺b", true),
+    mt("a[^a]b", "a☺b", true),
+    mt("a???b", "a☺b", false),
+    mt("a[^a][^a][^a]b", "a☺b", false),
+    mt("[a-ζ]*", "α", true),
+    mt("*[a-ζ]", "A", false),
+    mt("a?b", "a/b", false),
+    mt("a*b", "a/b", false),
+    mt("[\\]a]", "]", true),
+    mt("[\\-]", "-", true),
+    mt("[x\\-]", "x", true),
+    mt("[x\\-]", "-", true),
+    mt("[x\\-]", "z", false),
+    mt("[\\-x]", "x", true),
+    mt("[\\-x]", "-", true),
+    mt("[\\-x]", "a", false),
+    mt("[]a]", "]", false, bad: true),
+    mt("[-]", "-", false, bad: true),
+    mt("[x-]", "x", false, bad: true),
+    mt("[x-]", "-", false, bad: true),
+    mt("[x-]", "z", false, bad: true),
+    mt("[-x]", "x", false, bad: true),
+    mt("[-x]", "-", false, bad: true),
+    mt("[-x]", "a", false, bad: true),
+    mt("\\", "a", false, bad: true),
+    mt("[a-b-c]", "a", false, bad: true),
+    mt("[", "a", false, bad: true),
+    mt("[^", "a", false, bad: true),
+    mt("[^bc", "a", false, bad: true),
+    mt("a[", "a", false, bad: true),
+    mt("a[", "ab", false, bad: true),
+    mt("a[", "x", false, bad: true),
+    mt("a/b[", "x", false, bad: true),
+    mt("*x", "xxx", true),
+  ]
+}
+
+def bad_pattern?(e: Error) -> Bool {
+  case e {
+    filepath.FilepathError.ErrBadPattern => true
+    _ => false
+  }
+}
+
+test "Match" {
+  for tt in match_tests() {
+    r = filepath.match(tt.pattern, tt.s)
+    if e = r.err {
+      assert tt.bad, "Match(#{tt.pattern}, #{tt.s}): unexpected error #{e.message}"
+      assert bad_pattern?(e), "Match(#{tt.pattern}, #{tt.s}): wrong error #{e.message}"
+    } else {
+      assert !tt.bad, "Match(#{tt.pattern}, #{tt.s}): want ErrBadPattern"
+      check(r.unwrap, tt.match, "Match(#{tt.pattern}, #{tt.s})")
+    }
+  }
+}
+
+# Go's globTests run in the package directory (match.go there is filepath.alx
+# here).
+test "Glob" {
+  tests = [["filepath.alx", "filepath.alx"], ["filepat?.alx", "filepath.alx"], ["*", "filepath.alx"], ["../*/filepath.alx", "../filepath/filepath.alx"]]
+  for t in tests {
+    matches = ~filepath.glob(t[0])
+    assert matches.include?(t[1]), "Glob(#{t[0]}) = #{matches}, want #{t[1]}"
+  }
+  for p in ["no_match", "../*/no_match"] {
+    check(~filepath.glob(p), [], "Glob(#{p})")
+  }
+}
+
+test "CVE202230632" {
+  # Prior to CVE-2022-30632, this would exhaust the stack given a large
+  # number of separators; now there is a limit of 10,000.
+  r = filepath.glob("/*" + "/" * 10001)
+  assert bad_pattern?(r.err.unwrap), "want ErrBadPattern"
+}
+
+test "GlobError" {
+  for p in ["[]", "nonexist/[]"] {
+    r = filepath.glob(p)
+    assert r.err? && bad_pattern?(r.err.unwrap), "Glob(#{p}): want ErrBadPattern"
+  }
+}
+
+test "GlobSymlink" {
+  td = temp_dir()
+  defer { os.remove_all(td).unwrap }
+  tests: [(Str, Str, Bool)] = [("test1", "link1", false), ("test2", "link2", true)]
+  for t in tests {
+    p = filepath.join([td, t[0]])
+    dest = filepath.join([td, t[1]])
+    touch(p)
+    ~os.symlink(p, dest)
+    # Break the symlink.
+    ~os.remove(p) if t[2]
+    matches = ~filepath.glob(dest)
+    assert matches.include?(dest), "Glob(#{dest}) = #{matches}, want #{dest}"
+  }
+}
+
+test "NonWindowsGlobEscape" {
+  check(~filepath.glob("\\filepath.alx"), ["filepath.alx"], "Glob(\\filepath.alx)")
+}
+
+# ------------------------------------------------------------- examples
+
+example "SplitList" {
+  puts "On Unix: #{filepath.split_list("/a/b/c:/usr/bin")}"
+} outputs "On Unix: [/a/b/c /usr/bin]\n"
+
+example "Rel" {
+  base = "/a"
+  puts "On Unix:"
+  for p in ["/a/b/c", "/b/c", "./b/c"] {
+    r = filepath.rel(base, p)
+    if e = r.err {
+      puts format("%q: %q %s", p, "", e.message)
+    } else {
+      puts format("%q: %q <nil>", p, r.unwrap)
+    }
+  }
+} outputs <<~'EOS'
+  On Unix:
+  "/a/b/c": "b/c" <nil>
+  "/b/c": "../b/c" <nil>
+  "./b/c": "" Rel: can't make ./b/c relative to /a
+EOS
+
+example "Split" {
+  puts "On Unix:"
+  for p in ["/home/arnie/amelia.jpg", "/mnt/photos/", "rabbit.jpg", "/usr/local//go"] {
+    d, f = filepath.split(p)
+    puts format("input: %q\n\tdir: %q\n\tfile: %q", p, d, f)
+  }
+} outputs "On Unix:\ninput: \"/home/arnie/amelia.jpg\"\n\tdir: \"/home/arnie/\"\n\tfile: \"amelia.jpg\"\ninput: \"/mnt/photos/\"\n\tdir: \"/mnt/photos/\"\n\tfile: \"\"\ninput: \"rabbit.jpg\"\n\tdir: \"\"\n\tfile: \"rabbit.jpg\"\ninput: \"/usr/local//go\"\n\tdir: \"/usr/local//\"\n\tfile: \"go\"\n"
+
+example "Join" {
+  puts "On Unix:"
+  puts filepath.join(["a", "b", "c"])
+  puts filepath.join(["a", "b/c"])
+  puts filepath.join(["a/b", "c"])
+  puts filepath.join(["a/b", "/c"])
+  puts filepath.join(["a/b", "../../../xyz"])
+} outputs "On Unix:\na/b/c\na/b/c\na/b/c\na/b/c\n../xyz\n"
+
+example "Match" {
+  puts "On Unix:"
+  puts filepath.match("/home/catch/*", "/home/catch/foo").unwrap
+  puts filepath.match("/home/catch/*", "/home/catch/foo/bar").unwrap
+  puts filepath.match("/home/?opher", "/home/gopher").unwrap
+  puts filepath.match("/home/\\*", "/home/*").unwrap
+} outputs "On Unix:\ntrue\nfalse\ntrue\ntrue\n"
+
+example "Base" {
+  puts "On Unix:"
+  for p in ["/foo/bar/baz.js", "/foo/bar/baz", "/foo/bar/baz/", "dev.txt", "../todo.txt", "..", ".", "/", ""] {
+    puts filepath.base(p)
+  }
+} outputs "On Unix:\nbaz.js\nbaz\nbaz\ndev.txt\ntodo.txt\n..\n.\n/\n.\n"
+
+example "Dir" {
+  puts "On Unix:"
+  for p in ["/foo/bar/baz.js", "/foo/bar/baz", "/foo/bar/baz/", "/dirty//path///", "dev.txt", "../todo.txt", "..", ".", "/", ""] {
+    puts filepath.dir(p)
+  }
+} outputs "On Unix:\n/foo/bar\n/foo/bar\n/foo/bar/baz\n/dirty/path\n.\n..\n.\n.\n/\n.\n"
+
+example "IsAbs" {
+  puts "On Unix:"
+  for p in ["/home/gopher", ".bashrc", "..", ".", "/", ""] {
+    puts filepath.is_abs(p)
+  }
+} outputs "On Unix:\ntrue\nfalse\nfalse\nfalse\ntrue\nfalse\n"
+
+example "Ext" {
+  puts format("No dots: %q", filepath.ext("index"))
+  puts format("One dot: %q", filepath.ext("index.js"))
+  puts format("Two dots: %q", filepath.ext("main.test.js"))
+} outputs "No dots: \"\"\nOne dot: \".js\"\nTwo dots: \".js\"\n"
+
+example "Walk" {
+  tmp = os.mkdir_temp("", "").unwrap
+  os.mkdir_all(filepath.join([tmp, "dir/to/walk/skip"]), 0o755).unwrap
+  wd = os.getwd.unwrap
+  os.chdir(tmp).unwrap
+  puts "On Unix:"
+  r = filepath.walk(".") { |p, info, err|
+    if e = err {
+      puts format("prevent panic by handling failure accessing a path %q: %s", p, e.message)
+      fail e
+    }
+    if i = info {
+      if i.is_dir && i.name == "skip" {
+        puts "skipping a dir without errors: #{i.name} "
+        fail fs.FsError.SkipDir
+      }
+    }
+    puts format("visited file or dir: %q", p)
+  }
+  if e = r.err {
+    puts format("error walking the path %q: %s", tmp, e.message)
+  }
+  os.chdir(wd).unwrap
+  os.remove_all(tmp).unwrap
+} outputs <<~'EOS'
+  On Unix:
+  visited file or dir: "."
+  visited file or dir: "dir"
+  visited file or dir: "dir/to"
+  visited file or dir: "dir/to/walk"
+  skipping a dir without errors: skip
+EOS

@@ -95,3 +95,34 @@ fn warnings_are_not_errors() {
     assert!(errors(&r).is_empty());
     assert!(r.items.iter().any(|i| !i.error && i.phase == alx::analyze::Phase::Warning));
 }
+
+/// Plan 1.4's exit criterion: check-all over every std package reports nothing.
+/// (Directories that hold only external tests have no package of their own.)
+#[test]
+fn std_packages_report_no_diagnostics() {
+    fn walk(d: &Path, out: &mut Vec<PathBuf>) {
+        let Ok(rd) = std::fs::read_dir(d) else { return };
+        let mut subs: Vec<PathBuf> = rd.filter_map(|e| e.ok().map(|e| e.path())).collect();
+        subs.sort();
+        if subs.iter().any(|p| p.extension().is_some_and(|e| e == "alx") && !p.to_string_lossy().ends_with("_test.alx")) {
+            out.push(d.to_path_buf());
+        }
+        for p in subs.into_iter().filter(|p| p.is_dir() && p.file_name().is_some_and(|n| n != "testdata")) {
+            walk(&p, out);
+        }
+    }
+    let std_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("std");
+    let mut dirs = vec![];
+    walk(&std_dir, &mut dirs);
+    assert!(dirs.len() > 100, "found only {} std packages", dirs.len());
+    let mut bad = vec![];
+    for d in &dirs {
+        // A package's own files: any one non-test file selects the package unit.
+        let Some(file) = std::fs::read_dir(d).unwrap().filter_map(|e| e.ok().map(|e| e.path())).filter(|p| p.extension().is_some_and(|e| e == "alx") && !p.to_string_lossy().ends_with("_test.alx")).min() else { continue };
+        let r = analyze(&file, Force::Package, &read, &list);
+        for i in &r.items {
+            bad.push(format!("{}: {}: {}", d.display(), r.sm.loc(i.diag.span), i.diag.msg));
+        }
+    }
+    assert!(bad.is_empty(), "{} diagnostics:\n{}", bad.len(), bad.join("\n"));
+}

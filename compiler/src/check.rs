@@ -3393,6 +3393,15 @@ impl<'w, 'a> FnCx<'w, 'a> {
             // zero value (filling another variant's slots of an enum, or a
             // field a keyword `new` leaves out; Go's would be nil).
             Ty::Iface(_) => TK::Zero,
+            // A type named inside its own definition (R12: `struct V { o: VOuter? }`
+            // with `struct VOuter { v: V }`): the zero of the type it names.
+            Ty::Rec(_) => {
+                let u = t.unrec();
+                if matches!(u, Ty::Rec(_)) {
+                    return None;
+                }
+                return self.zero_of(&u, sp);
+            }
             _ => return None,
         };
         Some(self.mk(kind, t.clone(), sp))

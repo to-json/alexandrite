@@ -1,124 +1,205 @@
 #![overflow(wrap)]
-# Package json: Go's encoding/json, built on compile-time derives (S3).
-#
-# There is no runtime type information, so a type opts in:
+# Package json: Go's encoding/json (v1), with Go 1.27's behaviour (Go 1.27
+# builds v1 on v2: its error texts and offsets, invalid UTF-8 written as a
+# raw U+FFFD), on compile-time derives instead of reflection (S3).
 #
 #   import "encoding/json"
 #
 #   #[derive(Json)]
 #   struct User {
 #     name: Str
-#     #[json("e-mail")] email: Str?
-#     #[json(omit_empty)] tags: [Str]
-#     #[json(skip)] cache: Int
+#     #[field(json: "e-mail,omitempty")] email: Str?
+#     #[field(json: "id,string")] id: U64
+#     #[field(json: "-")] cache: Int
 #   }
 #
-#   s = ~u.to_json                    # {"name":"ann","e-mail":null}
-#   u2 = ~User.from_json(s)           # also: u.to_json_indent("", "  ")
+#   s = ~json.marshal(u)                   # also u.to_json, json.marshal_indent
+#   u2: User = ~json.unmarshal(s)          # also User.from_json(s)
+#   u3 = ~json.unmarshal_into(s, u2)       # Go's Unmarshal into an existing value
 #
-# What `#[derive(Json)]` writes into the type (the parser expands it to plain
-# defs; see compiler/src/derive.rs, GO-VS-RUBY D37-D39):
+# ---- Go's API in alx
 #
-#   def to_json -> ~Str                        compact JSON (Go's Marshal)
-#   def to_json_indent(prefix, indent) -> ~Str (Go's MarshalIndent)
-#   def self.from_json(s: Str) -> ~T           one whole document (Go's Unmarshal)
+#   Marshal(v)                   marshal(v) -> ~Str (Str: JSON is UTF-8 text)
+#   MarshalIndent(v, p, i)       marshal_indent(v, p, i) -> ~Str
+#   Unmarshal(data, &v)          unmarshal(data) -> ~T (a fresh T), unmarshal_into(data, v)
+#                                -> ~T (merges into v, as Go does), unmarshal_partial(data, v)
+#                                -> (T, JsonError?) (Go exactly: the value as far as it got,
+#                                and the first error); data is a Str or [Byte]
+#   Valid / Compact / Indent /   valid(s) -> Bool, compact(s) -> ~Str, indent(s, p, i) -> ~Str,
+#   HTMLEscape                   html_escape(s) -> Str (Str in and out, not a bytes.Buffer);
+#                                check(s) -> ~Unit (Valid with the error)
+#   NewEncoder(w)                new_encoder(w) (w an io.Writer; `new_encoder()` without
+#                                one is the encoder marshal and the derives use)
+#   Encoder.Encode/SetIndent/    encode!(v) -> ~Unit, set_indent!(p, i), set_escape_html!(b)
+#   SetEscapeHTML
+#   NewDecoder(r)                new_decoder(r) (an io.Reader; a Str gives the decoder
+#                                hand-written json_dec methods use)
+#   Decoder.Decode               decode!(v) -> ~T? (into a copy of v; none at the end:
+#                                Go's io.EOF), decode_partial!(v) -> (T?, Error?) (Go exactly)
+#   Decoder.Token / More /       token! -> ~Token? (none at the end), has_more! (`more!` is
+#   Buffered / InputOffset /     the protocol's array step), buffered -> bytes.Reader,
+#   UseNumber /                  input_offset, use_number!, disallow_unknown_fields!;
+#   DisallowUnknownFields        read_value! -> ~Str? (the next value's text)
+#   Token, Delim                 enum Token { Delim(Rune), Bool, Float, Num(Number),
+#                                String, Null } (to_s is Go's %v); delim_text(r)
+#   Number (String/Float64/      Number (to_s, float64 -> ~Float, int64 -> ~Int); valid_number?(s)
+#   Int64)
+#   RawMessage                   RawMessage (data: [Byte]; RawMessage.from(s), to_s)
+#   Marshaler / Unmarshaler      interfaces Marshaler (marshal_json -> ~[Byte]) and
+#                                Unmarshaler (unmarshal_json!(data) -> ~Unit), honoured
+#                                before the derive's own code; encoding.TextMarshaler /
+#                                TextUnmarshaler (marshal_text / unmarshal_text!) too
+#   SyntaxError,                 JsonError.Syntax(msg, offset), .Type(value, type_name,
+#   UnmarshalTypeError,          offset, struct_name, field, cause), .UnsupportedType,
+#   UnsupportedTypeError,        .UnsupportedValue, .Marshaler(type_name, cause,
+#   UnsupportedValueError,       source_func), .UnknownField(name) (Go's `json: unknown
+#   MarshalerError               field "x"`), .Custom(msg) (an Unmarshaler's own error,
+#                                by its text), .Invalid(msg, offset) (alx's: enums)
 #
-# and the protocol those are built on, which a hand-written type can provide
-# instead of deriving (fields of a derived type are encoded and decoded by it):
+# ---- What `#[derive(Json)]` writes (compiler/src/derive.rs, GO-VS-RUBY D37-D39)
 #
-#   def json_str(e: json.Encoder) -> Str       the JSON text of the value
-#   def json_enc(e: json.Encoder)              writes it: e.raw!(json_str(e))
-#   def self.json_dec(d: json.Decoder) -> T    reads one value; after an error
-#                                              (kept in d) returns json_zero
-#   def self.json_zero -> T                    the value to return after an error
+#   def json_str(e: Encoder) -> Str, json_enc(e)   the encoding
+#   def json_merge(d: Decoder) -> T               decode into a copy of self (structs)
+#   def self.json_dec(d: Decoder) -> T, json_zero  decode a fresh value; the zero value
+#   def json_is_zero -> Bool                      omitzero; json_mergeable / json_derived
+#   def to_json, to_json_indent(p, i), self.from_json(s)   the conveniences
 #
-# `json.marshal(v)` takes anything with a `json_enc` (a derived type, a Value).
+# A hand-written type provides json_str (or json_enc) and json_dec / json_zero,
+# or Go's Marshaler / Unmarshaler / TextMarshaler methods. Encoding and
+# decoding dispatch per type with S6 capability checks (`enc_val`,
+# `dec_val`): Str, Bool, the integers and Float as Go writes them; then
+# Marshaler, TextMarshaler, the protocol.
 #
-# ---- Encoding table (Go's, where Go has the concept)
+# ---- Go's struct tags: `#[field(json: "...")]` (or `#[json("name")]`,
+# `#[json(omit_empty)]`, `#[json(skip)]`)
 #
-#   Int, I8..U64   a number, without a fraction          Bool    true / false
-#   Float          Go's shortest form ('f', or 'e' below 1e-6 / from 1e21);
-#                  NaN and the infinities fail the encoding (json: unsupported value)
-#   Str            a string, escaped as Go does by default: <, >, & as < >
-#                  & (see Encoder.set_escape_html!), U+2028/9 as  /9, invalid
-#                  UTF-8 as �
-#   T?             the value, or null
-#   [T]            an array (an empty slice is [] -- there is no nil slice)
-#   Map[Str, V]    an object, in insertion order (Go sorts the keys)
-#   (A, B)         an array of the elements
-#   struct         an object with the fields in order; options on a field:
-#                    #[json("name")]       the key
-#                    #[json(omit_empty)]   leave out false, 0, "", [], {} and none
-#                    #[json(skip)]         leave out of encoding and decoding
-#   enum           (an extension: Go has no sum types; serde's "externally tagged")
-#                    unit variant         "Red"
-#                    Circle(Float)        {"Circle":1.5}
-#                    Pair(Int, Str)       {"Pair":[1,"a"]}
-#                    Rect(w: Float, h: Float)   {"Rect":{"w":1,"h":2}}
-#                  A variant takes `#[json("name")]` to rename it, its named fields
-#                  take the field options.
+#   name          the key (Go's rule: letters, digits and !#$%&()*+-./:;<=>?@[]^_{|}~
+#                 and space; another name is ignored); "-" leaves the field out, "-,"
+#                 names it "-"; the default is the alx field name
+#   omitempty     false, 0, "", an empty slice or map, none (and an empty RawMessage /
+#                 Number, a null Value)
+#   omitzero      the zero value, or the type's IsZero (`zero?`, or `is_zero` as
+#                 std/time spells it); a struct is zero when all its fields are
+#   string        a number or bool inside a JSON string, a Str JSON-quoted inside one
+#                 (Go 1.27: read with Go's syntax, so "-0012" and "0x1p-2" are accepted;
+#                 "null" leaves the field)
+#   embed         Go's anonymous struct field: the fields of a struct derived in the
+#                 same file (or an option of one) are promoted, with Go's dominance rules
+#                 (a shallower field wins; at one depth a tagged one; equals vanish);
+#                 ignored on other types, as Go ignores options it doesn't know
 #
-# ---- Decoding (Go's Unmarshal rules)
+# ---- Decoding (Go 1.27's Unmarshal)
 #
-#   - The document is checked for syntax first (so a syntax error anywhere beats a
-#     type error earlier in the text, as in Go).
-#   - Unknown object keys are skipped. Keys match exactly (Go also matches case
-#     insensitively). A key given twice: the last wins. Fields absent from the
-#     input keep their zero value (an enum field: its first variant).
-#   - null leaves a field at its zero value (Go: unchanged), and is none for a `T?`.
-#   - Numbers into an Int type must be integers in range: 1.5, 1e2 and 300 into a
-#     U8 are type errors. Into a Float: any number that fits.
-#   - Strings are unescaped, \uXXXX with surrogate pairs; a lone surrogate and
-#     invalid UTF-8 become U+FFFD.
+#   - The document's syntax is checked first; a type error doesn't stop decoding (the
+#     field keeps its value, the others are decoded) and the first one is reported.
+#   - Keys match exactly first, then case-insensitively (Unicode folding); the last of
+#     a repeated key wins. Unknown keys are skipped (or an UnknownField error).
+#   - null leaves a value (Go: no effect), and is none for `T?`, [] for a slice, {} for
+#     a map, a null Value.
+#   - Maps merge into the existing map; slices are replaced; [T; N] takes the first N
+#     elements and zeroes the rest; integer map keys parse the key text.
+#   - [Byte] is base64 (standard, padded; \r and \n skipped), or an array of numbers.
+#   - Strings: \uXXXX with surrogate pairs; a lone surrogate and invalid UTF-8 become
+#     U+FFFD. Numbers into an integer type must be integers in range; a Float out of
+#     range is stored as ±Inf and reported.
+#   - Errors: Go's texts and offsets (SyntaxError: after the bytes that show the
+#     problem; UnmarshalTypeError: after the value, or after `[` / `{`), Struct the root
+#     type's name, Field the path with names as written in the input.
+#   - Depth: 10000 nested arrays/objects ("exceeded max depth"), any input size.
 #
-# ---- Errors (JsonError; messages are Go's where Go has the same error)
+# ---- Encoding
 #
-#   Syntax      unexpected end of JSON input
-#               invalid character 'x' looking for beginning of value
-#               (also: after object key, after array element, in string escape
-#               code, in literal true (expecting 'r'), in numeric literal, ...)
-#   Type        json: cannot unmarshal string into field User.age of type Int
-#               (`into value of type` when there is no field, `number 1.5`
-#               for a number that is not an integer)
-#   Unsupported json: unsupported value: NaN
-#   Invalid     json: unknown variant "Pentagon" for Shape
-#   A JsonError has `offset` (the byte where it was found) once matched out of
-#   an Error: `case e { JsonError.Syntax(msg, off) => ... }`.
-#   The Decoder keeps only the first error and returns zero values after it
-#   (`d.failed`); `d.~done!` reports it. Nothing on the decoding path is
-#   fallible, which keeps it fast (GO-VS-RUBY D39).
+#   Int, I8..U64 as numbers; Float in Go's shortest form ('f', or 'e' below 1e-6 /
+#   from 1e21; NaN and ±Inf: UnsupportedValue); Str escaped as Go does (<, >, & as
+#   <...; U+2028/9; invalid UTF-8 as a raw U+FFFD); T? the value or null; [T] and
+#   [T; N] arrays; [Byte] base64; Map objects with the keys sorted (Go's order);
+#   tuples arrays; enums (an alx extension: Go has no sum types) "Variant",
+#   {"Variant": payload}, a variant's `#[json("name")]` renames it.
+#   A Marshaler's output is checked and compacted (HTML-escaped too, by default).
+#
+# ---- Differences from Go, and why
+#
+#   - No reflection: marshal and unmarshal take a derived type (or one with the
+#     protocol or Go's methods), or a Str, Bool, integer or Float. A top-level slice
+#     or map is a one-field `#[json(transparent)]` struct. No `any`: json.Value
+#     (`parse(s)`, below) holds any JSON; it keeps an object's member order and a
+#     number's text (D40), where Go's map[string]any is written sorted and a float64
+#     loses digits.
+#   - No nil: an empty slice or map is the zero value, so it is written [] / {} (Go:
+#     null for a nil one), and omitzero omits it (Go keeps a non-nil empty one).
+#     RawMessage can't tell empty from nil (both null).
+#   - Map keys are Str or integers (alx Maps have no struct keys): no TextMarshaler keys.
+#   - No float32, uintptr, complex, channels or functions; no named int / []byte types
+#     (a transparent struct isn't a byte, so a slice of one isn't base64).
+#   - Names in errors are alx's (S10): `of type Int`, `[Byte]`, `Map[Str, Int]`, a
+#     derived type by its name (`#[data("")]` hides it, as Go does for an anonymous
+#     struct); `marshal_json` / `marshal_text` in MarshalerError. Go's sentence
+#     structure ("Go struct field") is kept.
+#   - An Unmarshaler's error that isn't a JsonError comes back as JsonError.Custom
+#     with its text (an error enum can't hold an open Error).
+#   - Decoding into an interface value or through a pointer to a pointer: alx has
+#     neither (T? is one level).
+#   - The Decoder reads 4096 bytes at a time; Go's InputOffset / Buffered rules are kept.
 #
 # ---- The dynamic API
 #
-# `parse(s)` gives a Value (an immutable tree stored in flat arrays: an enum
-# can't contain itself, "`Value` contains itself; it is a value", D40).
+# `parse(s)` gives a Value (an immutable tree stored in flat arrays, D40).
 # `v.kind`, `v.get("key")`, `v.at(i)`, `v.as_str`, `v.as_float`, `v.as_int`,
 # `v.as_bool`, `v.size`, `v.keys`, `v.to_s`. A Value can be a field of a derived
-# type (like Go's json.RawMessage / interface{}).
+# type (like Go's interface{}).
 #
-# ---- Also
+# ---- Protocol details for hand-written decoders
 #
-#   valid(s) -> Bool          check(s) -> ~Unit   (the error says where)
-#   indent(s, prefix, indent) -> ~Str     compact(s) -> ~Str     quote(s) -> Str
-#   html_escape(s) -> Str     marshal(v) -> ~Str  marshal_indent(v, prefix, indent)
-#   Encoder / Decoder for streaming and for hand-written json_enc / json_dec.
+# The Decoder over a Str keeps the first syntax error (`failed`: decoding stops)
+# and the first type error (decoding goes on); `done!` reports them. Nothing on
+# the decoding path is fallible, which keeps it fast (D39).
+#
+# Go tests not translated, by file (the test files' headers say why):
+# decode_test.go (interface targets, struct map keys, nil targets),
+# encode_test.go (cycles, interface fields, named byte types, float32),
+# stream_test.go (MaxBytesReader), fold_test.go and tags_test.go (Go's internal
+# foldName / parseTag: the derive parses tags, the vectors cover folding),
+# v2_diff_test.go (compares v1 with v2 option by option; v2 is its own alx
+# package), bench_test.go (benchmarks over Go's testdata corpus) and
+# fuzz_test.go (fuzzing).
 
 import "strconv"
 import "unicode/utf8"
 
-# What can go wrong. `offset` is a byte offset into the input.
+# What can go wrong: Go's error types, one variant each. `offset` is a byte
+# offset into the input.
 pub error JsonError {
+  # Go's *SyntaxError: the offset is after the bytes that show the problem.
   Syntax(msg: Str, offset: Int)
-  Type(value: Str, want: Str, field: Str, offset: Int)
-  Unsupported(msg: Str)
+  # Go's *UnmarshalTypeError: the JSON value ("string", "number 1.5"), the alx
+  # type it could not go into, the offset after the value (after `[` / `{` for
+  # an array / object), the root type's name and the path from the root
+  # ("a.b.2", names as written in the input), and the cause's text ("" for none).
+  Type(value: Str, type_name: Str, offset: Int, struct_name: Str, field: Str, cause: Str)
+  # Go's *UnsupportedTypeError
+  UnsupportedType(type_name: Str)
+  # Go's *UnsupportedValueError ("NaN", "+Inf", "-Inf")
+  UnsupportedValue(str: Str)
+  # Go's *MarshalerError: a marshal_json / marshal_text method failed (or
+  # marshal_json wrote invalid JSON).
+  Marshaler(type_name: Str, cause: Str, source_func: Str)
+  # Go's `json: unknown field "x"` (Decoder.disallow_unknown_fields!)
+  UnknownField(name: Str)
+  # alx's own: an unknown enum variant and the like
   Invalid(msg: Str, offset: Int)
+  # the error an Unmarshaler returned (Go returns it as it is)
+  Custom(msg: Str)
 
   def message -> Str {
     case self {
       Syntax(m, _) => m
-      Type(v, w, f, _) => f == "" ? "json: cannot unmarshal " + v + " into value of type " + w : "json: cannot unmarshal " + v + " into field " + f + " of type " + w
-      Unsupported(m) => "json: unsupported value: " + m
+      Type(v, t, _, st, f, c) => type_error_text(v, t, st, f, c)
+      UnsupportedType(t) => "json: unsupported type: " + t
+      UnsupportedValue(v) => "json: unsupported value: " + v
+      Marshaler(t, c, src) => "json: error calling " + (src == "" ? "marshal_json" : src) + " for type " + t + ": " + c
+      UnknownField(n) => "json: unknown field " + strconv.quote(n)
       Invalid(m, _) => "json: " + m
+      Custom(m) => m
     }
   }
 
@@ -126,27 +207,78 @@ pub error JsonError {
   pub def offset -> Int {
     case self {
       Syntax(_, o) => o
-      Type(_, _, _, o) => o
-      Unsupported(_) => 0
+      Type(_, _, o, _, _, _) => o
       Invalid(_, o) => o
+      _ => 0
     }
   }
+}
+
+# Go's UnmarshalTypeError.Error (Go 1.27): "Go struct field" unless the path
+# ends in an array index.
+def type_error_text(v: Str, t: Str, st: Str, f: Str, c: Str) -> Str {
+  s = ""
+  if st != "" || f != "" {
+    into = "Go struct field "
+    i = f.size
+    while i > 0 && f[i - 1] != 46 { i -= 1 }
+    digits = i < f.size
+    j = i
+    while j < f.size {
+      digits = false if !is_digit(f[j])
+      j += 1
+    }
+    into = "" if digits
+    s = "json: cannot unmarshal " + v + " into " + into + st + "." + f + " of type " + t
+  } else {
+    s = "json: cannot unmarshal " + v + " into Go value of type " + t
+  }
+  s = s + ": " + c if c != ""
+  s
 }
 
 HEX = "0123456789abcdef"
 
 # ------------------------------------------------------------------ helpers
 
-# Go's quoteChar: the byte c as a quoted character for syntax errors.
-def quote_char(c: Int) -> Str {
-  return "'\\''" if c == 39
-  return "'\"'" if c == 34
-  q = strconv.quote_rune(c.to_i32)
-  q
+# Go's jsonwire.QuoteRune: the rune at s[p] quoted ('\xff' for a byte that
+# isn't UTF-8), and its width.
+def quote_rune_at(s: Str, p: Int) -> (Str, Int) {
+  r, w = utf8.decode_rune_at(s, p)
+  return ("'\\x" + strconv.format_uint(s[p].to_u64, 16) + "'", 1) if r == 0xFFFD && w == 1
+  (strconv.quote_rune(r), w)
 }
 
-def err_char(c: Byte, ctx: Str, off: Int) -> JsonError {
-  JsonError.Syntax(msg: "invalid character " + quote_char(c.to_i) + " " + ctx, offset: off)
+# The invalid character at s[p] (Go 1.27's error, with v1's offset: after it).
+def err_char(s: Str, p: Int, ctx: Str) -> JsonError {
+  q, w = quote_rune_at(s, p)
+  JsonError.Syntax(msg: "invalid character " + q + " " + ctx, offset: p + w)
+}
+
+# unicode.IsSpace, without the tables.
+def space_rune?(r: Rune) -> Bool {
+  return true if (r >= 9 && r <= 13) || r == 32 || r == 0x85 || r == 0xA0 || r == 0x1680
+  return true if (r >= 0x2000 && r <= 0x200A) || r == 0x2028 || r == 0x2029 || r == 0x202F || r == 0x205F || r == 0x3000
+  false
+}
+
+# Go's jsonwire InvalidTextError text for the raw text w.
+def what_text(w: Str) -> Str {
+  return quote_rune_at(w, 0)[0] if utf8.rune_count_in_string(w) == 1
+  esc = false
+  i = 0
+  while i < w.size {
+    r, n = utf8.decode_rune_at(w, i)
+    esc = true if r == 96 || r == 0xFFFD || space_rune?(r) || !strconv.is_print(r)
+    i += n
+  }
+  return strconv.quote(w) if esc
+  "`" + w + "`"
+}
+
+# An invalid escape sequence: the text s[bs...e] (e is also the offset).
+def err_escape(s: Str, bs: Int, e: Int) -> JsonError {
+  JsonError.Syntax(msg: "invalid escape sequence " + what_text(s[bs...e]) + " in string", offset: e)
 }
 
 def err_eof(off: Int) -> JsonError {

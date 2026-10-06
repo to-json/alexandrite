@@ -8,6 +8,7 @@
 # three words, cheap to copy; copies share the arrays.
 
 import "strconv"
+import "strings"
 
 K_NULL = 0
 K_BOOL = 1
@@ -402,11 +403,65 @@ def put_newline(buf: [Byte], prefix: Str, ind: Str, depth: Int) -> [Byte] {
   b
 }
 
+# The check Compact and Indent make (Go formats with jsontext's encoder,
+# whose words differ in one place).
+def format_check(s: Str) -> ~Unit<JsonError> {
+  r = check(s)
+  if e = r.err {
+    case e {
+      JsonError.Syntax(m, o) => {
+        off = o
+        n = s.size
+        if m == "unexpected end of JSON input" && n > 0 && o < n {
+          # a number cut short: at its unfinished part
+          c = s[n - 1]
+          off = n - 1 if c == 46 || c == 101 || c == 69
+          off = n - 2 if (c == 43 || c == 45) && n >= 2 && (s[n - 2] == 101 || s[n - 2] == 69)
+        }
+        fail JsonError.Syntax(msg: strings.replace_all(m, " after array element", " after array value"), offset: off)
+      }
+      _ => fail e
+    }
+  }
+}
+
 # Go's json.Indent: each element of an object or array on its own line, starting
 # with `prefix`, then `ind` once per level; `{}` and `[]` stay as they are;
 # spaces between tokens are dropped, `: ` gets one space. Fails on invalid JSON.
 pub def indent(s: Str, prefix: Str, ind: Str) -> ~Str<JsonError> {
-  ~check(s)
+  if strings.trim(prefix, " \t").size + strings.trim(ind, " \t").size > 0 {
+    # Go formats with spaces, then writes prefix and ind over the spaces after
+    # each newline (the trailing spaces it keeps included)
+    out = ~indent(s, " " * prefix.size, " " * ind.size)
+    b = out.bytes
+    i = 0
+    while i < b.size {
+      if b[i] == 10 {
+        j = i + 1
+        while j < b.size && b[j] == 32 { j += 1 }
+        k = i + 1
+        q = 0
+        while k < j && q < prefix.size {
+          b[k] = prefix[q]
+          k += 1
+          q += 1
+        }
+        while k < j && ind.size > 0 {
+          q = 0
+          while k < j && q < ind.size {
+            b[k] = ind[q]
+            k += 1
+            q += 1
+          }
+        }
+        i = j
+      } else {
+        i += 1
+      }
+    }
+    return Str.from_bytes(b)
+  }
+  ~format_check(s)
   b: [Byte] = []
   depth = 0
   need = false
@@ -458,12 +513,15 @@ pub def indent(s: Str, prefix: Str, ind: Str) -> ~Str<JsonError> {
       b << c
     }
   }
-  Str.from_bytes(b)
+  # Go keeps the spaces after the value
+  t = s.size
+  while t > 0 && (s[t - 1] == 32 || s[t - 1] == 10 || s[t - 1] == 13 || s[t - 1] == 9) { t -= 1 }
+  Str.from_bytes(b) + s[t...s.size]
 }
 
 # Go's json.Compact: s without the spaces between tokens.
 pub def compact(s: Str) -> ~Str<JsonError> {
-  ~check(s)
+  ~format_check(s)
   b: [Byte] = []
   in_str = false
   esc = false
@@ -488,4 +546,11 @@ pub def compact(s: Str) -> ~Str<JsonError> {
     b << c
   }
   Str.from_bytes(b)
+}
+
+# The compact form of the valid JSON s, HTML-escaped when `html` (Go's
+# treatment of a Marshaler's output).
+def compact_text(s: Str, html: Bool) -> Str {
+  c = compact(s).unwrap_or(s)
+  html ? html_escape(c) : c
 }

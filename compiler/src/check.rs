@@ -5149,6 +5149,18 @@ impl<'w, 'a> FnCx<'w, 'a> {
     }
 
     fn binary(&mut self, op: BinOp, l: TExpr, r: TExpr, sp: Span) -> R<TExpr> {
+        // `e || errors.new(..)` with e an `E?` (S7's `r.err`) and an open
+        // Error default: E converts to Error, as it would where an `Error?`
+        // is wanted.
+        let widen = op == BinOp::Or
+            && match self.resolve(&l.ty) {
+                Ty::Opt(inner) => {
+                    let rt = self.resolve(&r.ty);
+                    self.w.error_index(&inner).is_some() && (rt == Ty::Error || rt == Ty::Opt(Box::new(Ty::Error)))
+                }
+                _ => false,
+            };
+        let l = if widen { self.coerce(l, &Ty::Opt(Box::new(Ty::Error)))? } else { l };
         if op == BinOp::Or {
             if let Ty::Opt(inner) = self.resolve(&l.ty) {
                 // `opt || default`: the value if present (the default is evaluated only if not).

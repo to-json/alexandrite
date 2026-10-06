@@ -6,6 +6,7 @@
 #include <pthread.h>
 #include <sched.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <setjmp.h>
 #include <signal.h>
 #include <sys/stat.h>
@@ -2041,7 +2042,18 @@ AlxStr alx_strerror(int64_t n) {
     return s;
 }
 
-int32_t alx_sys_open(const char *path, int32_t flags, int32_t mode) { return open(path, flags, (mode_t)mode); }
+/* open(2). In a task, opening a FIFO without O_NONBLOCK waits for the other
+ * end: that runs on a helper thread while the task parks (port-issues #166),
+ * so the task that opens the other end can run. */
+static int32_t open_on_helper(const char *path, int32_t flags, int32_t mode);
+static bool in_task(void);
+int32_t alx_sys_open(const char *path, int32_t flags, int32_t mode) {
+    if (!(flags & O_NONBLOCK) && in_task()) {
+        struct stat st;
+        if (stat(path, &st) == 0 && S_ISFIFO(st.st_mode)) return open_on_helper(path, flags, mode);
+    }
+    return open(path, flags, (mode_t)mode);
+}
 int32_t alx_sys_fcntl(int32_t fd, int32_t cmd, int64_t arg) { return fcntl(fd, cmd, (long)arg); }
 
 typedef struct { const char *name; int64_t val; } SysConst;
@@ -2070,6 +2082,7 @@ static const SysConst sys_consts[] = {
     SC(SIGHUP) SC(SIGINT) SC(SIGQUIT) SC(SIGILL) SC(SIGTRAP) SC(SIGABRT) SC(SIGFPE) SC(SIGKILL) SC(SIGUSR1)
     SC(SIGSEGV) SC(SIGUSR2) SC(SIGALRM) SC(SIGTERM) SC(SIGCHLD) SC(SIGCONT) SC(SIGSTOP) SC(SIGTSTP) SC(SIGTTIN)
     SC(SIGTTOU) SC(SIGURG) SC(SIGXCPU) SC(SIGXFSZ) SC(SIGVTALRM) SC(SIGPROF) SC(SIGWINCH) SC(SIGIO) SC(SIGSYS)
+    SC(UTIME_OMIT) SC(AT_FDCWD) SC(AT_SYMLINK_NOFOLLOW) SC(PIPE_BUF) SC(AT_REMOVEDIR)
 };
 #undef SC
 
@@ -2089,13 +2102,16 @@ int64_t alx_sys_const(const char *name) {
 #ifdef __APPLE__
 #define ALX_MTIME_NS(st) ((int64_t)(st).st_mtimespec.tv_sec * 1000000000 + (st).st_mtimespec.tv_nsec)
 #define ALX_ATIME_NS(st) ((int64_t)(st).st_atimespec.tv_sec * 1000000000 + (st).st_atimespec.tv_nsec)
+#define ALX_CTIME_NS(st) ((int64_t)(st).st_ctimespec.tv_sec * 1000000000 + (st).st_ctimespec.tv_nsec)
 #else
 #define ALX_MTIME_NS(st) ((int64_t)(st).st_mtim.tv_sec * 1000000000 + (st).st_mtim.tv_nsec)
 #define ALX_ATIME_NS(st) ((int64_t)(st).st_atim.tv_sec * 1000000000 + (st).st_atim.tv_nsec)
+#define ALX_CTIME_NS(st) ((int64_t)(st).st_ctim.tv_sec * 1000000000 + (st).st_ctim.tv_nsec)
 #endif
 
 static void stat_out(const struct stat *st, uint8_t *out) {
-    int64_t v[ALX_STAT_FIELDS] = { (int64_t)st->st_mode, (int64_t)st->st_size, ALX_MTIME_NS(*st), ALX_ATIME_NS(*st), (int64_t)st->st_ino, (int64_t)st->st_nlink };
+    int64_t v[ALX_STAT_FIELDS] = { (int64_t)st->st_mode, (int64_t)st->st_size, ALX_MTIME_NS(*st), ALX_ATIME_NS(*st), (int64_t)st->st_ino, (int64_t)st->st_nlink,
+                                   (int64_t)st->st_dev, (int64_t)st->st_uid, (int64_t)st->st_gid, (int64_t)st->st_rdev, ALX_CTIME_NS(*st) };
     memcpy(out, v, sizeof v);
 }
 
@@ -2138,6 +2154,17 @@ const char *alx_sys_dir_next(int64_t h, uint8_t *kind) {
     return NULL;
 }
 
+/* A directory handle over an open descriptor (a duplicate of it: closing the
+ * handle leaves fd open), or -errno (ENOTDIR for a file that isn't one). */
+int64_t alx_sys_dir_fdopen(int64_t fd) {
+    int d = dup((int)fd);
+    if (d < 0) return -(int64_t)errno;
+    fcntl(d, F_SETFD, FD_CLOEXEC);
+    DIR *dir = fdopendir(d);
+    if (!dir) { int e = errno; close(d); return -(int64_t)e; }
+    return (int64_t)(intptr_t)dir;
+}
+
 void alx_sys_dir_close(int64_t h) { closedir((DIR *)(intptr_t)h); }
 
 /* environ[i], NULL past the end. */
@@ -2147,6 +2174,25 @@ const char *alx_environ(int64_t i) {
     for (int64_t k = 0; k <= i; k++)
         if (!environ[k]) return NULL;
     return environ[i];
+}
+
+/* The running executable's path into out (n bytes): its length, or -errno
+ * (Go's os.Executable: /proc/self/exe on Linux, the loader's path on macOS). */
+#ifdef __APPLE__
+#include <mach-o/dyld.h>
+#endif
+int64_t alx_sys_executable(uint8_t *out, int64_t n) {
+#ifdef __APPLE__
+    uint32_t size = (uint32_t)n;
+    if (_NSGetExecutablePath((char *)out, &size) != 0) return -ENAMETOOLONG;
+    return (int64_t)strlen((const char *)out);
+#else
+    ssize_t r = readlink("/proc/self/exe", (char *)out, (size_t)n);
+    if (r < 0) return -errno;
+    if (r >= n) return -ENAMETOOLONG;
+    out[r] = 0;
+    return r;
+#endif
 }
 
 /* ---------- processes (std os/exec) ---------- */
@@ -2237,6 +2283,62 @@ int64_t alx_sys_pipe(uint8_t *out, int64_t nonblock) {
     int64_t v[2] = { p[0], p[1] };
     memcpy(out, v, sizeof v);
     return 0;
+}
+
+/* Like alx_sys_spawn, with the program's path apart from argv[0] (no $PATH
+ * search: a relative path is relative to this process's directory) and any
+ * number of descriptors: fds (nfds native-endian int64s) become the child's
+ * 0, 1, 2, 3, ...; -1 is inherited for 0-2 and closed above (Go's
+ * ProcAttr.Files / Cmd.ExtraFiles). The pid, or -errno. */
+int64_t alx_sys_spawn2(const char *path, const uint8_t *argv, int64_t argc, const uint8_t *env, int64_t envc,
+                       const char *dir, const uint8_t *fdblob, int64_t nfds) {
+    char **av = nul_list(argv, argc);
+    char **ev = envc >= 0 ? nul_list(env, envc) : environ;
+    if (!av || !ev) return -ENOMEM;
+    int64_t *fds = malloc(sizeof(int64_t) * (size_t)(nfds ? nfds : 1));
+    int *hi = malloc(sizeof(int) * (size_t)(nfds ? nfds : 1));
+    if (!fds || !hi) return -ENOMEM;
+    memcpy(fds, fdblob, sizeof(int64_t) * (size_t)nfds);
+    /* Each source first moves above every target number, so dup2(src, i)
+     * never overwrites a source still needed (and src == i still clears
+     * close-on-exec). */
+    int floor = (int)nfds + 3;
+    int rc = 0;
+    for (int64_t i = 0; i < nfds; i++) {
+        hi[i] = -1;
+        if (fds[i] >= 0) {
+            hi[i] = fcntl((int)fds[i], F_DUPFD_CLOEXEC, floor);
+            if (hi[i] < 0) { rc = errno; break; }
+        }
+    }
+    pid_t pid = 0;
+    if (!rc) {
+        posix_spawn_file_actions_t fa;
+        posix_spawn_file_actions_init(&fa);
+        for (int64_t i = 0; i < nfds; i++) {
+            if (hi[i] >= 0) posix_spawn_file_actions_adddup2(&fa, hi[i], (int)i);
+            else if (i > 2) posix_spawn_file_actions_addclose(&fa, (int)i);
+        }
+        if (dir && dir[0]) posix_spawn_file_actions_addchdir_np(&fa, dir);
+        posix_spawnattr_t at;
+        posix_spawnattr_init(&at);
+        sigset_t none, all;
+        sigemptyset(&none);
+        sigfillset(&all);
+        posix_spawnattr_setsigmask(&at, &none);
+        posix_spawnattr_setsigdefault(&at, &all);
+        posix_spawnattr_setflags(&at, POSIX_SPAWN_SETSIGMASK | POSIX_SPAWN_SETSIGDEF);
+        rc = posix_spawn(&pid, path, &fa, &at, av, ev);
+        posix_spawn_file_actions_destroy(&fa);
+        posix_spawnattr_destroy(&at);
+    }
+    for (int64_t i = 0; i < nfds; i++)
+        if (hi[i] >= 0) close(hi[i]);
+    free(hi);
+    free(fds);
+    free(av);
+    if (envc >= 0) free(ev);
+    return rc ? -(int64_t)rc : (int64_t)pid;
 }
 
 int64_t alx_sys_exec(const uint8_t *argv, int64_t argc, const uint8_t *env, int64_t envc, const char *dir,
@@ -2698,6 +2800,35 @@ int64_t alx_sys_poll2(int64_t a, int64_t b) {
     return 0;
 }
 
+/* Wait until one of n descriptors is ready: blob holds n (fd, mode) int64
+ * pairs, mode 1 read / 2 write (negative fds are skipped). A task parks on
+ * the poller; a plain thread poll(2)s. 0 or -errno. */
+int64_t alx_sys_polln(const uint8_t *blob, int64_t n) {
+    int *fds = malloc(sizeof(int) * (size_t)(n ? n : 1));
+    int *modes = malloc(sizeof(int) * (size_t)(n ? n : 1));
+    if (!fds || !modes) alx_panic("out of memory", "runtime");
+    for (int64_t i = 0; i < n; i++) {
+        int64_t v[2];
+        memcpy(v, blob + 16 * i, 16);
+        fds[i] = (int)v[0];
+        modes[i] = (int)v[1];
+    }
+    int64_t r = 0;
+    if (tl_task) {
+        r = fd_wait_task(fds, modes, (int)n);
+    } else {
+        struct pollfd *pf = calloc((size_t)(n ? n : 1), sizeof *pf);
+        if (!pf) alx_panic("out of memory", "runtime");
+        for (int64_t i = 0; i < n; i++) { pf[i].fd = fds[i]; pf[i].events = modes[i] == 1 ? POLLIN : POLLOUT; }
+        while (poll(pf, (nfds_t)n, -1) < 0)
+            if (errno != EINTR) { r = -errno; break; }
+        free(pf);
+    }
+    free(fds);
+    free(modes);
+    return r;
+}
+
 /* wait4(2) from a task: a helper thread blocks in it while the task parks
  * (for the same reason as alx_sys_poll2). */
 typedef struct WaitJob {
@@ -2766,6 +2897,238 @@ int64_t alx_fd_close(int64_t fd) {
 #endif
     pthread_mutex_unlock(&g_mu);
     return close((int)fd) == 0 ? 0 : -errno;
+}
+
+/* ---------- reads and writes that may block (std os, port-issues #166) ----------
+ * A task must not block its worker in read(2)/write(2) on a pipe, a FIFO, a
+ * terminal or a socket that isn't ready: the tasks pinned to that worker
+ * would stop with it (as exec's poll and wait4 did, #154). So, in a task:
+ *   - a non-blocking fd: the call, and on EAGAIN a park on the poller;
+ *   - a blocking fd that poll(2) says isn't ready: a park on the poller
+ *     until it is (then the call doesn't block: a read returns what's there;
+ *     a write to a pipe is cut to PIPE_BUF bytes, which a writable pipe
+ *     always takes; a socket is written with MSG_DONTWAIT);
+ *   - an fd the poller refuses: the call runs on a helper thread while the
+ *     task parks.
+ * Regular files and directories are always "ready" (as in Go: disk I/O isn't
+ * polled). Outside a task the call simply blocks (EAGAIN on a non-blocking fd
+ * poll(2)s and retries). A second reader racing for the same bytes can still
+ * block a worker between the readiness check and the read. */
+
+/* For mode 1 read / 2 write: 1 ready now (or in error: the call will say),
+ * 0 not ready, -1 poll(2) can't tell (macOS answers POLLNVAL for a named
+ * FIFO, and its kqueue misses the FIFO's end of file): the caller then makes
+ * the call on a helper thread. */
+static int fd_ready_now(int fd, int mode) {
+    struct pollfd pf;
+    pf.fd = fd; pf.events = mode == 1 ? POLLIN : POLLOUT; pf.revents = 0;
+    int r;
+    while ((r = poll(&pf, 1, 0)) < 0 && errno == EINTR) {}
+    if (r > 0 && (pf.revents & POLLNVAL)) return -1;
+    return r != 0;
+}
+
+typedef struct IoJob {
+    int fd, err, op; /* op: 0 read, 1 write, 2 open (path, flags, mode) */
+    int flags, mode;
+    char *path;
+    bool done, waiting;
+    uint8_t *buf;
+    size_t n;
+    ssize_t r;
+    Parker *p;
+} IoJob;
+
+static void *io_job_main(void *arg) {
+    IoJob *j = arg;
+    tl_uncounted = true;
+    ssize_t r;
+    do r = j->op == 2 ? open(j->path, j->flags, (mode_t)j->mode) : j->op == 1 ? write(j->fd, j->buf, j->n) : read(j->fd, j->buf, j->n);
+    while (r < 0 && errno == EINTR);
+    int err = r < 0 ? errno : 0;
+    pthread_mutex_lock(&g_mu);
+    j->r = r;
+    j->err = err;
+    j->done = true;
+    if (j->waiting) { j->waiting = false; g_sleepers--; unpark(j->p); }
+    pthread_mutex_unlock(&g_mu);
+    return NULL;
+}
+
+/* The call on a helper thread while the task parks. The bytes go through a
+ * heap copy: the task's stack may be another task's while it is parked. */
+static int64_t io_job_run(IoJob *j);
+static int64_t io_on_helper(int fd, bool wr, uint8_t *buf, int64_t n) {
+    IoJob *j = calloc(1, sizeof *j);
+    uint8_t *tmp = malloc(n > 0 ? (size_t)n : 1);
+    if (!j || !tmp) alx_panic("out of memory", "runtime");
+    if (wr && n > 0) memcpy(tmp, buf, (size_t)n);
+    j->fd = fd; j->op = wr ? 1 : 0; j->buf = tmp; j->n = (size_t)n;
+    int64_t r = io_job_run(j);
+    if (!wr && r > 0) memcpy(buf, tmp, (size_t)r);
+    free(tmp);
+    free(j);
+    return r;
+}
+
+static bool in_task(void) { return tl_task != NULL; }
+
+/* open(2) on a helper thread: the fd, or -1 with errno set. */
+static int32_t open_on_helper(const char *path, int32_t flags, int32_t mode) {
+    IoJob *j = calloc(1, sizeof *j);
+    char *pc = strdup(path);
+    if (!j || !pc) alx_panic("out of memory", "runtime");
+    j->op = 2; j->path = pc; j->flags = flags; j->mode = mode;
+    int64_t r = io_job_run(j);
+    free(pc);
+    free(j);
+    if (r < 0) { errno = (int)-r; return -1; }
+    return (int32_t)r;
+}
+
+/* Runs j on a new helper thread, the task parked until it's done: the
+ * result, or -errno. */
+static int64_t io_job_run(IoJob *j) {
+    j->p = cur_pk();
+    pthread_t th;
+    pthread_attr_t at;
+    pthread_attr_init(&at);
+    pthread_attr_setdetachstate(&at, PTHREAD_CREATE_DETACHED);
+    pthread_attr_setstacksize(&at, 64 << 10);
+    int rc = pthread_create(&th, &at, io_job_main, j);
+    pthread_attr_destroy(&at);
+    if (rc != 0) return -(int64_t)rc;
+    pthread_mutex_lock(&g_mu);
+    while (!j->done) {
+        Parker *p = j->p;
+        j->waiting = true;
+        g_sleepers++;
+        p->parked = true; p->dead = false;
+        if (p->counted) g_runnable--;
+        pthread_mutex_unlock(&g_mu);
+        sw_out(p->task, false);
+        pthread_mutex_lock(&g_mu);
+    }
+    pthread_mutex_unlock(&g_mu);
+    return j->r < 0 ? -(int64_t)j->err : (int64_t)j->r;
+}
+
+/* In a task, a blocking fd that isn't ready: park until it is. 0 = retry the
+ * check; 1 = the poller can't watch it (use a helper thread). */
+static int park_until_ready(int fd, int mode) {
+    int f = fd, m = mode;
+    return fd_wait_task(&f, &m, 1) < 0 ? 1 : 0;
+}
+
+/* A task whose reads or writes never wait (its peer keeps up) would never
+ * leave its worker: every 16th call lets the tasks queued there run (as a
+ * select with a default does). */
+static void io_fair(void) {
+    static _Thread_local unsigned calls;
+    if (tl_task && (++calls & 15) == 0) alx_task_yield();
+}
+
+/* A named FIFO on macOS: neither poll(2) nor kqueue ever reports its end of
+ * file (the last writer gone), so a read that would wait runs on a helper
+ * thread. (An anonymous pipe has no links.) */
+static bool named_fifo(int fd) {
+#ifdef __APPLE__
+    struct stat st;
+    return fstat(fd, &st) == 0 && S_ISFIFO(st.st_mode) && st.st_nlink > 0;
+#else
+    (void)fd;
+    return false;
+#endif
+}
+
+/* read(2): the count (0 at the end), or -errno. */
+int64_t alx_sys_read(int64_t fd, uint8_t *buf, int64_t n) {
+    bool woken = false;
+    int64_t backoff_ns = 1000000;
+    for (;;) {
+        if (tl_task && n > 0) {
+            int fl = fcntl((int)fd, F_GETFL);
+            if (fl >= 0 && !(fl & O_NONBLOCK)) {
+                int ready = fd_ready_now((int)fd, 1);
+                /* Woken by the poller but poll(2) still says no: an end of
+                 * file it doesn't report (macOS FIFOs). */
+                if (ready < 0 || (!ready && woken) || (!ready && named_fifo((int)fd))) return io_on_helper((int)fd, false, buf, n);
+                if (!ready) {
+                    woken = true;
+                    if (park_until_ready((int)fd, 1)) return io_on_helper((int)fd, false, buf, n);
+                    continue;
+                }
+            }
+        }
+        ssize_t r = read((int)fd, buf, (size_t)n);
+        if (r >= 0) { io_fair(); return r; }
+        if (errno == EINTR) continue;
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            if (named_fifo((int)fd)) {
+                /* Nothing would report the FIFO's end: look again soon (a
+                 * read at the end returns 0, not EAGAIN). */
+                alx_sleep_ns(backoff_ns);
+                if (backoff_ns < 20000000) backoff_ns *= 2;
+                continue;
+            }
+            int64_t w = alx_fd_wait(fd, 1);
+            if (w < 0) return w;
+            continue;
+        }
+        return -errno;
+    }
+}
+
+/* SIGPIPE, Go's way: a write to a broken pipe or socket fails with EPIPE,
+ * except on stdout and stderr, where SIGPIPE ends the program (as it would
+ * without the program's help). So SIGPIPE is ignored once anything else is
+ * written, and a broken stdout/stderr raises it with the default action. */
+static bool g_sigpipe_ignored;
+static void io_sigpipe_ignore(void) { signal(SIGPIPE, SIG_IGN); g_sigpipe_ignored = true; }
+static void io_epipe(int64_t fd) {
+    if (fd != 1 && fd != 2) return;
+    struct sigaction sa;
+    if (sigaction(SIGPIPE, NULL, &sa) == 0 && sa.sa_handler == SIG_IGN && g_sigpipe_ignored)
+        signal(SIGPIPE, SIG_DFL);
+    raise(SIGPIPE);
+}
+
+/* write(2): the count written (maybe fewer than n: callers loop), or -errno. */
+int64_t alx_sys_write(int64_t fd, const uint8_t *buf, int64_t n) {
+    if (fd > 2) {
+        static pthread_once_t once = PTHREAD_ONCE_INIT;
+        pthread_once(&once, io_sigpipe_ignore);
+    }
+    bool woken = false;
+    for (;;) {
+        size_t len = (size_t)n;
+        bool sock = false;
+        if (tl_task && n > 0) {
+            int fl = fcntl((int)fd, F_GETFL);
+            struct stat st;
+            if (fl >= 0 && !(fl & O_NONBLOCK) && fstat((int)fd, &st) == 0 && (S_ISFIFO(st.st_mode) || S_ISSOCK(st.st_mode))) {
+                int ready = fd_ready_now((int)fd, 2);
+                if (ready < 0 || (!ready && woken)) return io_on_helper((int)fd, true, (uint8_t *)buf, n);
+                if (!ready) {
+                    woken = true;
+                    if (park_until_ready((int)fd, 2)) return io_on_helper((int)fd, true, (uint8_t *)buf, n);
+                    continue;
+                }
+                if (S_ISSOCK(st.st_mode)) sock = true;
+                else if (len > PIPE_BUF) len = PIPE_BUF;
+            }
+        }
+        ssize_t r = sock ? send((int)fd, buf, len, MSG_DONTWAIT) : write((int)fd, buf, len);
+        if (r >= 0) { io_fair(); return r; }
+        if (errno == EINTR) continue;
+        if (errno == EPIPE) { io_epipe(fd); return -EPIPE; }
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            int64_t w = alx_fd_wait(fd, 2);
+            if (w < 0) return w;
+            continue;
+        }
+        return -errno;
+    }
 }
 
 /* ---------- sockets ---------- */

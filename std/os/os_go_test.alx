@@ -1,0 +1,1322 @@
+#![test(external)]
+# Go's os/os_test.go, translated. Differences: Go reads /etc, /usr/bin and
+# the os package's own sources; here a fixture directory in a temp dir
+# stands in (the tests stay hermetic). Untranslated tests are listed in
+# os.alx's header.
+
+import "os"
+import "os/exec"
+import "io"
+import "path/filepath"
+import "strings"
+import "testing"
+import "time"
+
+# Go's sysdir: a directory with known files (here made in a temp dir).
+def sysdir(t: testing.T) -> Str {
+  d = t.temp_dir + "/etc"
+  os.mkdir(d, 0o755).unwrap
+  os.write_file(d + "/group", "wheel:*:0:root\n".bytes, 0o644).unwrap
+  os.write_file(d + "/hosts", "127.0.0.1 localhost\n".bytes, 0o644).unwrap
+  os.write_file(d + "/passwd", "root:*:0:0::/root:/bin/sh\n".bytes, 0o644).unwrap
+  d
+}
+
+SYSFILES = ["group", "hosts", "passwd"]
+
+# Go's dot: files of the current directory (here, of a fixture).
+DOT = ["dir_unix.go", "env.go", "error.go", "file.go", "os_test.go", "types.go", "stat_darwin.go", "stat_linux.go"]
+
+def dotdir(t: testing.T) -> Str {
+  d = t.temp_dir + "/dot"
+  os.mkdir(d, 0o755).unwrap
+  for n in DOT {
+    os.write_file(d + "/" + n, "package os\n".bytes, 0o644).unwrap
+  }
+  d
+}
+
+# The size of the named file, by reading it.
+def size(name: Str) -> Int {
+  f = os.open(name).unwrap
+  n = 0
+  buf: [Byte] = [0; 512]
+  loop {
+    k = f.read!(buf).unwrap
+    break if k == 0
+    n += k
+  }
+  f.close!.unwrap
+  n
+}
+
+# Go's newFile: a temp file, closed and removed after the test.
+def new_file(t: testing.T) -> os.File {
+  f = os.create_temp("", "_Go_" + strings.replace_all(t.name, " ", "_")).unwrap
+  g = f
+  t.cleanup {
+    c = g.close!
+    if e = c.err {
+      t.fatal(e.message) if !os.is_closed(e)
+    }
+    os.remove(g.name).unwrap
+  }
+  f
+}
+
+def touch(name: Str) {
+  f = os.create(name).unwrap
+  f.close!.unwrap
+}
+
+test "Stat" { |t|
+  path = sysdir(t) + "/group"
+  dir = os.stat(path).unwrap
+  assert_eq dir.name, "group"
+  assert_eq dir.size, size(path)
+}
+
+test "StatError" { |t|
+  t.chdir(t.temp_dir)
+  path = "no-such-file"
+  r = os.stat(path)
+  assert r.err?, "got nil, want error"
+  assert r.err.unwrap.path_error?
+  os.symlink(path, "symlink").unwrap
+  r2 = os.stat("symlink")
+  assert r2.err?, "got nil, want error"
+  assert r2.err.unwrap.path_error?
+}
+
+test "StatSymlinkLoop" { |t|
+  t.chdir(t.temp_dir)
+  os.symlink("x", "y").unwrap
+  os.symlink("y", "x").unwrap
+  r = os.stat("x")
+  assert r.err.unwrap.path_error?, "expected PathError"
+  assert_eq r.err.unwrap.message, "stat x: too many levels of symbolic links"
+}
+
+test "Fstat" { |t|
+  path = sysdir(t) + "/group"
+  file = os.open(path).unwrap
+  dir = file.stat.unwrap
+  assert_eq dir.name, "group"
+  assert_eq dir.size, size(path)
+  file.close!.unwrap
+}
+
+test "Lstat" { |t|
+  path = sysdir(t) + "/group"
+  dir = os.lstat(path).unwrap
+  assert_eq dir.name, "group"
+  assert_eq dir.size, size(path) if !dir.is_symlink
+}
+
+test "Read0" { |t|
+  f = os.open(sysdir(t) + "/group").unwrap
+  b: [Byte] = []
+  assert_eq f.read!(b).unwrap, 0
+  b2: [Byte] = [0; 100]
+  assert f.read!(b2).unwrap > 0
+  f.close!.unwrap
+}
+
+test "ReadClosed" { |t|
+  file = os.open(sysdir(t) + "/group").unwrap
+  file.close!.unwrap
+  b: [Byte] = [0; 100]
+  e = file.read!(b).err.unwrap
+  assert e.path_error?
+  assert os.is_closed(e)
+}
+
+def check_names(t: testing.T, got: [Str], contents: [Str]) {
+  for m in contents {
+    found = false
+    for n in got {
+      t.error("got #{n} in directory") if n == "." || n == ".."
+      next if n != m
+      t.error("present twice: #{m}") if found
+      found = true
+    }
+    t.error("could not find #{m}") if !found
+  }
+}
+
+def test_readdirnames(t: testing.T, dir: Str, contents: [Str]) {
+  file = os.open(dir).unwrap
+  s = file.readdirnames!(-1).unwrap
+  check_names(t, s, contents)
+  file.close!.unwrap
+}
+
+def test_readdir(t: testing.T, dir: Str, contents: [Str]) {
+  file = os.open(dir).unwrap
+  s = file.readdir!(-1).unwrap
+  check_names(t, s.map { it.name }, contents)
+  file.close!.unwrap
+}
+
+def test_read_dir(t: testing.T, dir: Str, contents: [Str]) {
+  file = os.open(dir).unwrap
+  s = file.read_dir!(-1).unwrap
+  check_names(t, s.map { it.name }, contents)
+  for n in s {
+    next if !contents.include?(n.name)
+    lstat = os.lstat(dir + "/" + n.name).unwrap
+    assert_eq n.is_dir, lstat.is_dir
+    want_type = lstat.is_regular ? 0 : lstat.mode & os.MODE_TYPE
+    assert_eq n.type, want_type
+    info = n.info.unwrap
+    assert os.same_file(info, lstat), "#{n.name}: Info: SameFile(info, lstat) = false"
+  }
+  file.close!.unwrap
+}
+
+test "FileReaddirnames" { |t|
+  t.run(".") { |t| test_readdirnames(t, dotdir(t), DOT) }
+  t.run("sysdir") { |t| test_readdirnames(t, sysdir(t), SYSFILES) }
+  t.run("TempDir") { |t| test_readdirnames(t, t.temp_dir, []) }
+}
+
+test "FileReaddir" { |t|
+  t.run(".") { |t| test_readdir(t, dotdir(t), DOT) }
+  t.run("sysdir") { |t| test_readdir(t, sysdir(t), SYSFILES) }
+  t.run("TempDir") { |t| test_readdir(t, t.temp_dir, []) }
+}
+
+test "FileReadDir" { |t|
+  t.run(".") { |t| test_read_dir(t, dotdir(t), DOT) }
+  t.run("sysdir") { |t| test_read_dir(t, sysdir(t), SYSFILES) }
+  t.run("TempDir") { |t| test_read_dir(t, t.temp_dir, []) }
+}
+
+# Go reads /usr/bin; a directory of 300 files here.
+test "ReaddirnamesOneAtATime" { |t|
+  dir = t.temp_dir
+  for i in 0...300 { touch("#{dir}/f#{i}") }
+  file = os.open(dir).unwrap
+  all = file.readdirnames!(-1).unwrap
+  file1 = os.open(dir).unwrap
+  small: [Str] = []
+  loop {
+    d = file1.readdirnames!(1).unwrap
+    break if d.size == 0
+    small << d[0]
+  }
+  assert small.size >= all.size, "len(small) is #{small.size}, less than #{all.size}"
+  for i in 0...all.size { assert_eq small[i], all[i] }
+  file.close!.unwrap
+  file1.close!.unwrap
+}
+
+test "ReaddirNValues" { |t|
+  dir = t.temp_dir
+  for i in 1..105 {
+    f = os.create("#{dir}/#{i}").unwrap
+    f.write!(("X" * i).bytes.to_a).unwrap
+    f.close!.unwrap
+  }
+  # n, want (Go's io.EOF at the end is an empty result here).
+  cases = [[0, 105], [0, 0], [-1, 105], [-2, 0], [0, 0], [1, 1], [2, 2], [105, 102], [3, 0]]
+  reopen = [0, 2, 5] # case indexes that open the directory afresh
+  for kind in 0...3 {
+    d = os.open(dir).unwrap
+    for i in 0...cases.size {
+      c = cases[i]
+      if reopen.include?(i) {
+        d.close!.unwrap
+        d = os.open(dir).unwrap
+      }
+      n = case kind {
+        0 => d.readdir!(c[0]).unwrap.size
+        1 => d.readdirnames!(c[0]).unwrap.size
+        _ => d.read_dir!(c[0]).unwrap.size
+      }
+      assert n == c[1], "kind #{kind}: #{c[0]}: got #{n}, want #{c[1]}"
+    }
+    d.close!.unwrap
+  }
+}
+
+# Go's TestReaddirStatFailures hooks lstat (SetStatHook, an export_test.go
+# hook); here a file removed between listing and lstat is the vanishing
+# entry Go simulates, and readdir! leaves it out.
+test "ReaddirStatFailures" { |t|
+  dir = t.temp_dir
+  touch(dir + "/good1")
+  touch(dir + "/x")
+  touch(dir + "/good2")
+  names = ->(fis: [os.FileInfo]) -> [Str] { fis.map { it.name }.sort }
+  d = os.open(dir).unwrap
+  assert_eq names.call(d.readdir!(-1).unwrap), ["good1", "good2", "x"]
+  d.close!.unwrap
+  d2 = os.open(dir).unwrap
+  es = d2.read_dir!(1).unwrap
+  os.remove(dir + "/x").unwrap
+  rest = d2.readdir!(-1).unwrap
+  got = names.call(rest + es.select { it.name != "x" }.map { it.info.unwrap })
+  assert_eq got, ["good1", "good2"]
+  d2.close!.unwrap
+}
+
+test "ReaddirOfFile" { |t|
+  f = os.create_temp(t.temp_dir, "_Go_ReaddirOfFile").unwrap
+  f.write!("foo".bytes.to_a).unwrap
+  f.close!.unwrap
+  reg = os.open(f.name).unwrap
+  r = reg.readdirnames!(-1)
+  assert r.err?, "Readdirnames succeeded; want non-nil error"
+  e = r.err.unwrap
+  assert e.path_error? && e.path == f.name, "Readdirnames returned #{e.message}; want a PathError with path #{f.name}"
+  reg.close!.unwrap
+}
+
+test "HardLink" { |t|
+  t.chdir(t.temp_dir)
+  from = "hardlinktestfrom"
+  to = "hardlinktestto"
+  file = os.create(to).unwrap
+  file.close!.unwrap
+  os.link(to, from).unwrap
+  nn = "hardlinktestnone"
+  e0 = os.link(nn, nn).err.unwrap
+  assert e0.link_error? && e0.message != "", "link #{nn} failed to return a valid error"
+  tostat = os.stat(to).unwrap
+  fromstat = os.stat(from).unwrap
+  assert os.same_file(tostat, fromstat), "link #{to}, #{from} did not create hard link"
+  e = os.link(to, from).err.unwrap
+  assert e.link_error?
+  f = e.failure
+  assert_eq f.op, "link"
+  assert_eq f.path, to
+  assert_eq f.new_path, from
+  assert os.is_exist(e)
+}
+
+test "Symlink" { |t|
+  t.chdir(t.temp_dir)
+  from = "symlinktestfrom"
+  to = "symlinktestto"
+  file = os.create(to).unwrap
+  file.close!.unwrap
+  os.symlink(to, from).unwrap
+  tostat = os.lstat(to).unwrap
+  assert !tostat.is_symlink
+  fromstat = os.stat(from).unwrap
+  assert os.same_file(tostat, fromstat), "Symlink(#{to}, #{from}) did not create symlink"
+  fromstat = os.lstat(from).unwrap
+  assert fromstat.is_symlink
+  fromstat = os.stat(from).unwrap
+  assert_eq fromstat.name, from
+  assert !fromstat.is_symlink
+  assert_eq os.readlink(from).unwrap, to
+  f = os.open(from).unwrap
+  f.close!.unwrap
+}
+
+test "LongSymlink" { |t|
+  t.chdir(t.temp_dir)
+  s = "0123456789abcdef" * 15
+  from = "longsymlinktestfrom"
+  os.symlink(s, from).unwrap
+  assert_eq os.readlink(from).unwrap, s
+}
+
+test "Rename" { |t|
+  t.chdir(t.temp_dir)
+  from = "renamefrom"
+  to = "renameto"
+  file = os.create(from).unwrap
+  file.close!.unwrap
+  os.rename(from, to).unwrap
+  os.stat(to).unwrap
+}
+
+test "RenameOverwriteDest" { |t|
+  t.chdir(t.temp_dir)
+  from = "renamefrom"
+  to = "renameto"
+  os.write_file(to, "to".bytes, 0o777).unwrap
+  os.write_file(from, "from".bytes, 0o777).unwrap
+  os.rename(from, to).unwrap
+  r = os.stat(from)
+  assert r.err?, "from file still exists"
+  assert os.is_not_exist(r.err.unwrap)
+  assert_eq os.stat(to).unwrap.size, 4
+}
+
+test "RenameFailed" { |t|
+  t.chdir(t.temp_dir)
+  from = "renamefrom"
+  to = "renameto"
+  e = os.rename(from, to).err.unwrap
+  assert e.link_error?
+  assert_eq e.op, "rename"
+  assert_eq e.failure.path, from
+  assert_eq e.failure.new_path, to
+}
+
+test "RenameNotExisting" { |t|
+  t.chdir(t.temp_dir)
+  from = "doesnt-exist"
+  to = "dest"
+  _ = os.mkdir(to, 0o777)
+  assert os.is_not_exist(os.rename(from, to).err.unwrap)
+}
+
+test "RenameToDirFailed" { |t|
+  t.chdir(t.temp_dir)
+  from = "renamefrom"
+  to = "renameto"
+  _ = os.mkdir(from, 0o777)
+  _ = os.mkdir(to, 0o777)
+  e = os.rename(from, to).err.unwrap
+  assert e.link_error?
+  assert_eq e.op, "rename"
+  assert_eq e.failure.path, from
+  assert_eq e.failure.new_path, to
+}
+
+test "RenameCaseDifference" { |pt|
+  from = "renameFROM"
+  to = "RENAMEfrom"
+  for kind in ["dir", "file"] {
+    pt.run(kind) { |t|
+      t.chdir(t.temp_dir)
+      if kind == "dir" {
+        os.mkdir(from, 0o777).unwrap
+      } else {
+        touch(from)
+      }
+      r = os.stat(to)
+      if e = r.err {
+        t.skip("case sensitive filesystem") if os.is_not_exist(e)
+        t.fatal("stat #{to}, got: #{e}")
+      }
+      os.rename(from, to).unwrap
+      fd = os.open(".").unwrap
+      names = fd.readdirnames!(-1).unwrap
+      fd.close!.unwrap
+      assert_eq names.size, 1
+      assert_eq names[0], to
+    }
+  }
+}
+
+def test_start_process(dir: Str, cmd: Str, args: [Str], expect: Str) {
+  r, w = os.pipe.unwrap
+  files: [os.File?] = [none, w, os.stderr]
+  attr = os.ProcAttr.new(dir: dir, env: none, files: files)
+  p = os.start_process(cmd, args, attr).unwrap
+  w.close!.unwrap
+  out = Str.from_bytes(io.read_all(r).unwrap)
+  fi1 = os.stat(out.strip).unwrap
+  fi2 = os.stat(expect).unwrap
+  assert os.same_file(fi1, fi2), "exec #{cmd} returned #{out} wanted #{expect}"
+  p.wait!.unwrap
+  r.close!.unwrap
+}
+
+test "StartProcess" { |t|
+  cmd = exec.look_path("pwd").unwrap
+  dir = "/"
+  cmddir = filepath.dir(cmd)
+  cmdbase = filepath.base(cmd)
+  t.run("absolute") { |_t| test_start_process(dir, cmd, [cmdbase], dir) }
+  t.run("relative") { |_t| test_start_process(cmddir, cmdbase, [cmdbase], cmddir) }
+}
+
+def check_mode(path: Str, mode: Int) {
+  dir = os.stat(path).unwrap
+  assert dir.perm == mode, "Stat #{path}: mode #{dir.perm} want #{mode}"
+}
+
+test "Chmod" { |t|
+  f = new_file(t)
+  os.chmod(f.name, 0o456).unwrap
+  check_mode(f.name, 0o456)
+  f.chmod!(0o123).unwrap
+  check_mode(f.name, 0o123)
+}
+
+def check_size(f: os.File, size: Int) {
+  assert_eq f.stat.unwrap.size, size
+}
+
+test "FTruncate" { |t|
+  f = new_file(t)
+  check_size(f, 0)
+  f.write!("hello, world\n".bytes.to_a).unwrap
+  check_size(f, 13)
+  f.truncate!(10).unwrap
+  check_size(f, 10)
+  f.truncate!(1024).unwrap
+  check_size(f, 1024)
+  f.truncate!(0).unwrap
+  check_size(f, 0)
+  if f.write!("surprise!".bytes.to_a).ok? {
+    check_size(f, 13 + 9) # wrote at offset past where hello, world was.
+  }
+}
+
+test "Truncate" { |t|
+  f = new_file(t)
+  check_size(f, 0)
+  f.write!("hello, world\n".bytes.to_a).unwrap
+  check_size(f, 13)
+  os.truncate(f.name, 10).unwrap
+  check_size(f, 10)
+  os.truncate(f.name, 1024).unwrap
+  check_size(f, 1024)
+  os.truncate(f.name, 0).unwrap
+  check_size(f, 0)
+  if f.write!("surprise!".bytes.to_a).ok? {
+    check_size(f, 13 + 9)
+  }
+}
+
+test "TruncateNonexistentFile" { |t|
+  path = t.temp_dir + "/nonexistent"
+  e = os.truncate(path, 1).err.unwrap
+  assert e.path_error? && os.is_not_exist(e) && e.path == path, "got error: #{e}"
+  e2 = os.stat(path).err.unwrap
+  assert e2.path_error? && os.is_not_exist(e2) && e2.path == path, "got error: #{e2}"
+}
+
+SECOND = 1_000_000_000
+
+def test_chtimes(name: Str) {
+  pre = os.stat(name).unwrap
+  at = pre.access_time
+  mt = pre.mod_time
+  os.chtimes(name, at - SECOND, mt - SECOND).unwrap
+  post = os.stat(name).unwrap
+  assert post.access_time < at, "AccessTime didn't go backwards; was=#{at}, after=#{post.access_time}"
+  assert post.mod_time < mt, "ModTime didn't go backwards; was=#{mt}, after=#{post.mod_time}"
+}
+
+test "Chtimes" { |t|
+  f = new_file(t)
+  f.close!.unwrap
+  test_chtimes(f.name)
+}
+
+def test_chtimes_omit(t: testing.T, omit_at: Bool, omit_mt: Bool) {
+  file = new_file(t)
+  name = file.name
+  file.close!.unwrap
+  fs = os.stat(name).unwrap
+  want_atime = fs.access_time
+  want_mtime = fs.mod_time
+  set_atime: Int? = none
+  set_mtime: Int? = none
+  if !omit_at {
+    want_atime -= SECOND
+    set_atime = want_atime
+  }
+  if !omit_mt {
+    want_mtime -= SECOND
+    set_mtime = want_mtime
+  }
+  os.chtimes(name, set_atime, set_mtime).unwrap
+  fs2 = os.stat(name).unwrap
+  assert_eq fs2.access_time, want_atime
+  assert_eq fs2.mod_time, want_mtime
+}
+
+test "ChtimesOmit" { |t|
+  test_chtimes_omit(t, true, false)
+  test_chtimes_omit(t, false, true)
+  test_chtimes_omit(t, true, true)
+  test_chtimes_omit(t, false, false)
+}
+
+test "ChtimesDir" { |t|
+  test_chtimes(t.temp_dir)
+}
+
+test "ChtimesToUnixZero" { |t|
+  file = new_file(t)
+  file.write!("hi".bytes.to_a).unwrap
+  file.close!.unwrap
+  os.chtimes(file.name, 0, 0).unwrap
+  assert_eq os.stat(file.name).unwrap.mod_time, 0
+}
+
+test "FileChdir" { |t|
+  wd = os.getwd.unwrap
+  t.chdir(".") # Ensure wd is restored after the test.
+  fd = os.open(".").unwrap
+  os.chdir("/").unwrap
+  fd.chdir!.unwrap
+  wd_new = os.getwd.unwrap
+  wd_info = fd.stat.unwrap
+  new_info = os.stat(wd_new).unwrap
+  assert os.same_file(wd_info, new_info), "fd.Chdir failed: got #{wd_new}, want #{wd}"
+  fd.close!.unwrap
+}
+
+# The directory's path with symlinks resolved (filepath.EvalSymlinks).
+def real_path(d: Str) -> Str {
+  wd = os.getwd.unwrap
+  os.chdir(d).unwrap
+  r = os.getwd.unwrap
+  os.chdir(wd).unwrap
+  r
+}
+
+# Go chdirs to "/", "/usr/bin" and "/tmp"; "/" and two temp dirs (symlinks
+# resolved, as on Go's ios/windows) here.
+test "ChdirAndGetwd" { |t|
+  t.chdir(t.temp_dir)
+  dirs = ["/", real_path(t.temp_dir), real_path(t.temp_dir)]
+  for mode in 0...2 {
+    for d in dirs {
+      if mode == 0 {
+        os.chdir(d).unwrap
+      } else {
+        fd1 = os.open(d).unwrap
+        fd1.chdir!.unwrap
+        fd1.close!.unwrap
+      }
+      assert_eq os.getwd.unwrap, d
+    }
+  }
+}
+
+test "ProgWideChdir" { |t|
+  d = t.temp_dir
+  t.chdir(d)
+  hold = Chan[Int].new(0)
+  os.chdir(d).unwrap
+  want = os.getwd.unwrap
+  tasks: [Task[Int]] = []
+  for _i in 0...10 {
+    h = hold
+    w = want
+    tasks << spawn {
+      h.recv
+      f0 = os.stat(".").unwrap
+      pwd = os.getwd.unwrap
+      assert_eq pwd, w
+      f1 = os.stat(pwd).unwrap
+      assert os.same_file(f0, f1), "Samefile(Stat(\".\"), Getwd()) reports false"
+      0
+    }
+  }
+  hold.close
+  for tk in tasks { tk.wait.unwrap }
+}
+
+test "Seek" { |t|
+  f = new_file(t)
+  data = "hello, world\n"
+  f.write_string!(data).unwrap
+  tests = [
+    [0, io.SEEK_CURRENT, data.size],
+    [0, io.SEEK_START, 0],
+    [5, io.SEEK_START, 5],
+    [0, io.SEEK_END, data.size],
+    [0, io.SEEK_START, 0],
+    [-1, io.SEEK_END, data.size - 1],
+    [1 << 33, io.SEEK_START, 1 << 33],
+    [1 << 33, io.SEEK_END, (1 << 33) + data.size],
+    [(1 << 32) - 1, io.SEEK_START, (1 << 32) - 1],
+    [0, io.SEEK_CURRENT, (1 << 32) - 1],
+    [(2 << 32) - 1, io.SEEK_START, (2 << 32) - 1],
+    [0, io.SEEK_CURRENT, (2 << 32) - 1],
+  ]
+  for i in 0...tests.size {
+    tt = tests[i]
+    off = f.seek!(tt[0], tt[1]).unwrap
+    assert off == tt[2], "##{i}: Seek(#{tt[0]}, #{tt[1]}) = #{off} want #{tt[2]}"
+  }
+}
+
+test "SeekError" {
+  r, w = os.pipe.unwrap
+  e = r.seek!(0, 0).err.unwrap
+  assert e.path_error? && e.failure.err == "illegal seek", "Seek returned error #{e}, want ESPIPE"
+  e2 = w.seek!(0, 0).err.unwrap
+  assert e2.path_error? && e2.failure.err == "illegal seek", "Seek returned error #{e2}, want ESPIPE"
+  r.close!.unwrap
+  w.close!.unwrap
+}
+
+# Go's makefs: files, and directories for names ending in "/".
+def makefs(t: testing.T, names: [Str]) -> Str {
+  dir = t.temp_dir
+  for n in names {
+    parts = n.split(" => ")
+    if parts.size == 2 {
+      os.mkdir_all(filepath.dir(dir + "/" + parts[0]), 0o777).unwrap
+      os.symlink(parts[1], dir + "/" + parts[0]).unwrap
+    } elsif n.end_with?("/") {
+      os.mkdir_all(dir + "/" + n, 0o777).unwrap
+    } else {
+      os.mkdir_all(filepath.dir(dir + "/" + n), 0o777).unwrap
+      os.write_file(dir + "/" + n, [], 0o666).unwrap
+    }
+  }
+  dir
+}
+
+test "OpenError" { |t|
+  dir = makefs(t, ["is-a-file", "is-a-dir/"])
+  cases = [("no-such-file", os.O_RDONLY, "no such file or directory"), ("is-a-dir", os.O_WRONLY, "is a directory"), ("is-a-file/no-such-file", os.O_WRONLY, "not a directory")]
+  for tt in cases {
+    path = dir + "/" + tt[0]
+    r = os.open_file(path, tt[1], 0)
+    if r.ok? {
+      t.error("OpenFile(#{path}, #{tt[1]}) succeeded")
+      next
+    }
+    e = r.err.unwrap
+    assert e.path_error?
+    assert_eq e.failure.err, tt[2]
+  }
+}
+
+test "OpenNoName" {
+  assert os.open("").err?, "Open(\"\") succeeded"
+}
+
+def run_bin_hostname(t: testing.T) -> Str {
+  r, w = os.pipe.unwrap
+  path = exec.look_path("hostname")
+  t.skip("skipping test; test requires hostname but it does not exist") if path.err?
+  files: [os.File?] = [none, w, os.stderr]
+  p = os.start_process(path.unwrap, ["hostname"], os.ProcAttr.new(dir: "", env: none, files: files)).unwrap
+  w.close!.unwrap
+  out = Str.from_bytes(io.read_all(r).unwrap)
+  r.close!.unwrap
+  p.wait!.unwrap
+  assert p.kill.err?, "expected an error from Kill running 'hostname'"
+  out = out[0...out.size - 1] if out.end_with?("\n")
+  t.fatal("/bin/hostname produced no output") if out == ""
+  out
+}
+
+test "Hostname" { |t|
+  hostname = os.hostname.unwrap
+  t.fatal("Hostname returned empty string and no error") if hostname == ""
+  assert !hostname.bytes.to_a.include?(0), "unexpected zero byte in hostname"
+  want = run_bin_hostname(t)
+  if hostname != want {
+    host = hostname.split(".")[0]
+    assert host == want, "Hostname() = #{hostname}, want #{want}"
+  }
+}
+
+test "ReadAt" { |t|
+  f = new_file(t)
+  f.write_string!("hello, world\n").unwrap
+  b: [Byte] = [0; 5]
+  assert_eq f.read_at(b, 7).unwrap, 5
+  assert_eq Str.from_bytes(b), "world"
+}
+
+test "ReadAtOffset" { |t|
+  f = new_file(t)
+  f.write_string!("hello, world\n").unwrap
+  f.seek!(0, 0).unwrap
+  b: [Byte] = [0; 5]
+  assert_eq f.read_at(b, 7).unwrap, 5
+  assert_eq Str.from_bytes(b), "world"
+  assert_eq f.read!(b).unwrap, 5
+  assert_eq Str.from_bytes(b), "hello"
+}
+
+test "ReadAtNegativeOffset" { |t|
+  f = new_file(t)
+  f.write_string!("hello, world\n").unwrap
+  f.seek!(0, 0).unwrap
+  b: [Byte] = [0; 5]
+  e = f.read_at(b, -10).err.unwrap
+  assert e.message.include?("negative offset"), "ReadAt(-10) = #{e}"
+}
+
+test "WriteAt" { |t|
+  f = new_file(t)
+  f.write_string!("hello, world").unwrap
+  assert_eq f.write_at("WOR".bytes.to_a, 7).unwrap, 3
+  assert_eq f.write_string!("!").unwrap, 1 # WriteAt doesn't change the file offset
+  assert_eq os.read_file_string(f.name).unwrap, "hello, WORld!"
+}
+
+test "WriteAtConcurrent" { |t|
+  f = new_file(t)
+  f.write_string!("0000000000").unwrap
+  tasks: [Task[Int]] = []
+  for i in 0...10 {
+    g = f.dup
+    tasks << spawn {
+      assert_eq g.write_at(i.to_s.bytes.to_a, i).unwrap, 1
+      assert_eq g.write_string!("!").unwrap, 1
+      0
+    }
+  }
+  for tk in tasks { tk.wait.unwrap }
+  assert_eq os.read_file_string(f.name).unwrap, "0123456789!!!!!!!!!!"
+}
+
+test "WriteAtNegativeOffset" { |t|
+  f = new_file(t)
+  e = f.write_at("WORLD".bytes.to_a, -10).err.unwrap
+  assert e.message.include?("negative offset"), "WriteAt(-10) = #{e}"
+}
+
+test "WriteAtInAppendMode" { |t|
+  t.chdir(t.temp_dir)
+  f = os.open_file("write_at_in_append_mode.txt", os.O_APPEND | os.O_CREATE, 0o666).unwrap
+  e = f.write_at([], 1).err.unwrap
+  assert_eq e.errno, os.ERR_WRITE_AT_APPEND
+  assert_eq e.message, "os: invalid use of WriteAt on file opened with O_APPEND"
+  f.close!.unwrap
+}
+
+def write_file_flag(fname: Str, flag: Int, text: Str) -> Str {
+  f = os.open_file(fname, flag, 0o666).unwrap
+  f.write_string!(text).unwrap
+  f.close!.unwrap
+  os.read_file_string(fname).unwrap
+}
+
+test "Append" { |t|
+  t.chdir(t.temp_dir)
+  f = "append.txt"
+  assert_eq write_file_flag(f, os.O_CREATE | os.O_TRUNC | os.O_RDWR, "new"), "new"
+  assert_eq write_file_flag(f, os.O_APPEND | os.O_RDWR, "|append"), "new|append"
+  assert_eq write_file_flag(f, os.O_CREATE | os.O_APPEND | os.O_RDWR, "|append"), "new|append|append"
+  os.remove(f).unwrap
+  assert_eq write_file_flag(f, os.O_CREATE | os.O_APPEND | os.O_RDWR, "new&append"), "new&append"
+  assert_eq write_file_flag(f, os.O_CREATE | os.O_RDWR, "old"), "old&append"
+  assert_eq write_file_flag(f, os.O_CREATE | os.O_TRUNC | os.O_RDWR, "new"), "new"
+}
+
+test "FilePermissions" { |pt|
+  pt.skip("skipping test when running as root") if os.getuid == 0
+  for tc in [("r", 0o444), ("w", 0o222), ("rw", 0o666)] {
+    pt.run(tc[0]) { |t|
+      mode = tc[1]
+      t.chdir(t.temp_dir)
+      filename = "f"
+      f = os.open_file(filename, os.O_RDWR | os.O_CREATE | os.O_EXCL, mode).unwrap
+      f.close!.unwrap
+      b = os.read_file(filename)
+      if (mode & 0o444) != 0 {
+        assert b.ok?, "ReadFile = #{b.err}; want success"
+      } else {
+        assert b.err?, "ReadFile succeeded; want failure"
+      }
+      os.stat(filename).unwrap
+      w = os.write_file(filename, [], 0o666)
+      if (mode & 0o222) != 0 {
+        assert w.ok?, "WriteFile = #{w.err}; want success"
+      } else {
+        assert w.err?, "WriteFile(#{filename}) = <nil>; want failure"
+      }
+    }
+  }
+}
+
+test "OpenFileCreateExclDanglingSymlink" { |t|
+  t.chdir(t.temp_dir)
+  link = "link"
+  os.symlink("does_not_exist", link).unwrap
+  r = os.open_file(link, os.O_WRONLY | os.O_CREATE | os.O_EXCL, 0o444)
+  assert r.err? && os.is_exist(r.err.unwrap), "OpenFile of a dangling symlink with O_CREATE|O_EXCL = #{r.err}, want ErrExist"
+  assert os.stat(link).err?, "OpenFile of a dangling symlink with O_CREATE|O_EXCL created a file"
+}
+
+test "FileRDWRFlags" { |pt|
+  for tc in [("O_RDONLY", os.O_RDONLY), ("O_WRONLY", os.O_WRONLY), ("O_RDWR", os.O_RDWR)] {
+    pt.run(tc[0]) { |t|
+      flag = tc[1]
+      t.chdir(t.temp_dir)
+      filename = "f"
+      os.write_file(filename, "content".bytes, 0o666).unwrap
+      f = os.open_file(filename, flag, 0).unwrap
+      got = io.read_all(f)
+      if flag == os.O_WRONLY {
+        assert got.err?, "read file: want error"
+      } else {
+        assert_eq Str.from_bytes(got.unwrap), "content"
+      }
+      f.seek!(0, 0).unwrap
+      w = f.write!("CONTENT".bytes.to_a)
+      if flag == os.O_RDONLY {
+        assert w.err?, "write file: succeeded, want error"
+      } else {
+        assert w.ok?, "write file: #{w.err}, want success"
+      }
+      f.close!.unwrap
+      want = flag == os.O_RDONLY ? "content" : "CONTENT"
+      assert_eq os.read_file_string(filename).unwrap, want
+    }
+  }
+}
+
+test "StatDirWithTrailingSlash" { |t|
+  path = t.temp_dir
+  os.stat(path).unwrap
+  os.stat(path + "/").unwrap
+}
+
+test "SameFile" { |t|
+  t.chdir(t.temp_dir)
+  touch("a")
+  touch("b")
+  ia1 = os.stat("a").unwrap
+  ia2 = os.stat("a").unwrap
+  assert os.same_file(ia1, ia2), "files should be same"
+  ib = os.stat("b").unwrap
+  assert !os.same_file(ia1, ib), "files should be different"
+}
+
+def test_dev_null_file_info(statname: Str, fi: os.FileInfo) {
+  pre = "#{statname}(#{os.DEV_NULL}): "
+  assert fi.size == 0, pre + "wrong file size have #{fi.size} want 0"
+  m = fi.go_mode
+  assert (m & (1 << 26)) != 0, pre + "ModeDevice is not set"
+  assert (m & (1 << 21)) != 0, pre + "ModeCharDevice is not set"
+  assert !fi.is_regular, pre + "IsRegular returns true"
+}
+
+test "DevNullFile" {
+  f = os.open(os.DEV_NULL).unwrap
+  test_dev_null_file_info("f.Stat", f.stat.unwrap)
+  test_dev_null_file_info("Stat", os.stat(os.DEV_NULL).unwrap)
+  f.close!.unwrap
+}
+
+test "StatDirModeExec" { |t|
+  path = t.temp_dir
+  os.chmod(path, 0o777).unwrap
+  dir = os.stat(path).unwrap
+  assert (dir.mode & 0o111) == 0o111, "Stat #{path}: mode #{dir.mode & 0o111} want 0o111"
+}
+
+# Go re-runs the test binary with a pipe as stdin; here a pipe's read end
+# (what that child's stdin would be) is checked directly.
+test "StatStdin" {
+  fi = os.stdin.stat.unwrap
+  # (A regular file or a socket too: alx test passes its own stdin on.)
+  ok = fi.is_char_device || fi.is_named_pipe || fi.is_regular || (fi.mode & os.MODE_TYPE) == os.MODE_SOCKET
+  assert ok, "unexpected Stdin mode (#{fi.mode}), want ModeCharDevice or ModeNamedPipe"
+  r, w = os.pipe.unwrap
+  assert r.stat.unwrap.is_named_pipe, "a pipe is not a named pipe"
+  r.close!.unwrap
+  w.close!.unwrap
+}
+
+test "StatRelativeSymlink" { |t|
+  tmpdir = t.temp_dir
+  target = tmpdir + "/target"
+  f = os.create(target).unwrap
+  st = f.stat.unwrap
+  link = tmpdir + "/link"
+  os.symlink(filepath.base(target), link).unwrap
+  st1 = os.stat(link).unwrap
+  assert os.same_file(st, st1), "Stat doesn't follow relative symlink"
+  f.close!.unwrap
+}
+
+# Go's io.EOF from a short ReadAt is a short count here.
+test "ReadAtEOF" { |t|
+  f = new_file(t)
+  b: [Byte] = [0; 10]
+  assert_eq f.read_at(b, 0).unwrap, 0
+}
+
+test "LongPath" { |t|
+  tmpdir = t.temp_dir
+  while tmpdir.size < 400 {
+    tmpdir += "/dir3456789"
+  }
+  for sz in [247, 248, 249, 400] {
+    t.run("length=#{sz}") { |t|
+      sized = tmpdir[0...sz - 1] + "x"
+      os.mkdir_all(sized, 0o755).unwrap
+      data = "hello world\n"
+      os.write_file(sized + "/foo.txt", data.bytes, 0o644).unwrap
+      os.rename(sized + "/foo.txt", sized + "/bar.txt").unwrap
+      mtime = 1_700_000_000 * SECOND
+      os.chtimes(sized + "/bar.txt", mtime, mtime).unwrap
+      os.symlink(sized + "/bar.txt", sized + "/symlink.txt").unwrap
+      os.link(sized + "/bar.txt", sized + "/link.txt").unwrap
+      names = ["bar.txt", "symlink.txt", "link.txt"]
+      for want_size in [data.size, 0] {
+        for name in names {
+          path = sized + "/" + name
+          dir = os.stat(path).unwrap
+          filesize = size(path)
+          assert dir.size == filesize && filesize == want_size, "Size(#{path}) is #{dir.size}, len(ReadFile()) is #{filesize}, want #{want_size}"
+          os.chmod(path, dir.perm).unwrap
+        }
+        os.truncate(sized + "/bar.txt", 0).unwrap
+      }
+    }
+  }
+}
+
+# Go's testKillProcess re-runs the test binary as a child that drains its
+# stdin; here `cat` does, with its stdin a pipe kept open.
+def test_kill_process(killer: (os.Process) -> Unit) {
+  r, w = os.pipe.unwrap
+  files: [os.File?] = [r, none, none]
+  p = os.start_process("/bin/cat", ["cat"], os.ProcAttr.new(dir: "", env: none, files: files)).unwrap
+  r.close!.unwrap
+  killer.call(p)
+  st = p.wait!.unwrap
+  assert !st.success, "Test process succeeded, but expected to fail"
+  w.close!.unwrap
+}
+
+test "KillStartProcess" {
+  test_kill_process { |p| p.kill.unwrap }
+}
+
+# Go's child prints Getppid; here sh prints $PPID.
+test "Getppid" {
+  r, w = os.pipe.unwrap
+  files: [os.File?] = [none, w, none]
+  p = os.start_process("/bin/sh", ["sh", "-c", "printf %s $PPID"], os.ProcAttr.new(dir: "", env: none, files: files)).unwrap
+  w.close!.unwrap
+  child_ppid = Str.from_bytes(io.read_all(r).unwrap)
+  r.close!.unwrap
+  p.wait!.unwrap
+  assert_eq child_ppid, os.getpid.to_s
+}
+
+test "KillFindProcess" {
+  test_kill_process { |p|
+    p2 = os.find_process(p.pid).unwrap
+    p2.kill.unwrap
+  }
+}
+
+# Go calls each method on a nil *File (ErrInvalid); alx has no nil File
+# (new_file(-1) is none), so the same methods on a closed File fail with
+# ErrClosed instead.
+test "NilFileMethods" { |t|
+  f = os.create(t.temp_dir + "/f").unwrap
+  f.close!.unwrap
+  e: [Byte] = []
+  checks = [
+    ("Chdir", f.chdir!.err),
+    ("Close", f.close!.err),
+    ("Chmod", f.chmod!(0).err),
+    ("Chown", f.chown!(0, 0).err),
+    ("Read", f.read!(e).err),
+    ("ReadAt", f.read_at(e, 0).err),
+    ("Readdir", f.readdir!(1).err),
+    ("Readdirnames", f.readdirnames!(1).err),
+    ("Seek", f.seek!(0, io.SEEK_START).err),
+    ("Stat", f.stat.err),
+    ("Sync", f.sync!.err),
+    ("Truncate", f.truncate!(0).err),
+    ("Write", f.write!(e).err),
+    ("WriteAt", f.write_at(e, 0).err),
+    ("WriteString", f.write_string!("").err),
+  ]
+  for c in checks {
+    got = c[1]
+    assert got != none && os.is_closed(got.unwrap), "#{c[0]} should fail when f is closed; got #{got}"
+  }
+}
+
+def mkdir_tree(root: Str, level: Int, max: Int) -> Unit {
+  return if level >= max
+  for c in ["a", "b"] {
+    dir = root + "/" + c
+    os.mkdir(dir, 0o700).unwrap
+    mkdir_tree(dir, level + 1, max)
+  }
+}
+
+test "RemoveAllRace" { |t|
+  root = t.temp_dir
+  mkdir_tree(root, 1, 6)
+  hold = Chan[Int].new(0)
+  tasks: [Task[Int]] = []
+  for _i in 0...4 {
+    h = hold
+    rt = root
+    tasks << spawn {
+      h.recv
+      r = os.remove_all(rt)
+      assert r.ok?, "unexpected error: #{r.err}"
+      0
+    }
+  }
+  hold.close
+  for tk in tasks { tk.wait.unwrap }
+}
+
+# 100 tasks each blocked reading its own pipe (port-issues #166: none may
+# block a worker).
+test "PipeThreads" {
+  threads = 100
+  rs: [os.File] = []
+  ws: [os.File] = []
+  for _i in 0...threads {
+    r, w = os.pipe.unwrap
+    rs << r
+    ws << w
+  }
+  creading = Chan[Bool].new(threads)
+  cdone = Chan[Bool].new(threads)
+  for i in 0...threads {
+    r = rs[i].dup
+    cr = creading
+    cd = cdone
+    spawn {
+      b: [Byte] = [0; 1]
+      cr << true
+      f = r
+      f.read!(b).unwrap
+      f.close!.unwrap
+      cd << true
+    }
+  }
+  for _i in 0...threads { creading.recv }
+  for i in 0...threads {
+    w = ws[i]
+    w.write!([0]).unwrap
+    w.close!.unwrap
+    cdone.recv
+  }
+}
+
+def test_double_close_error(path: Str) {
+  file = os.open(path).unwrap
+  file.close!.unwrap
+  e = file.close!.err
+  assert e != none, "second Close did not fail"
+  pe = e.unwrap
+  assert pe.path_error?, "second Close: want a PathError"
+  assert os.is_closed(pe), "second Close: got #{pe}, want ErrClosed"
+}
+
+test "DoubleCloseError" { |t|
+  d = sysdir(t)
+  t.run("file") { |_t| test_double_close_error(d + "/group") }
+  t.run("dir") { |_t| test_double_close_error(d) }
+}
+
+test "UserCacheDir" { |t|
+  r = os.user_cache_dir
+  t.skip("skipping: #{r.err}") if r.err?
+  dir = r.unwrap
+  t.fatal("UserCacheDir returned #{dir}; want non-empty path or error") if dir == ""
+  fi = os.stat(dir)
+  if e = fi.err {
+    return if os.is_not_exist(e)
+    t.fatal(e.message)
+  }
+  assert fi.unwrap.is_dir, "dir #{dir} is not directory"
+}
+
+test "UserCacheDirXDGConfigDirEnvVar" { |t|
+  t.skip("$XDG_CACHE_HOME is effective only on Unix systems") if os.getenv("HOME") != none && os.user_cache_dir.unwrap.end_with?("/Library/Caches")
+  wd = os.getwd.unwrap
+  t.setenv("XDG_CACHE_HOME", wd)
+  assert_eq os.user_cache_dir.unwrap, wd
+  t.setenv("XDG_CACHE_HOME", "some-dir")
+  assert os.user_cache_dir.err?, "UserCacheDir succeeded though $XDG_CACHE_HOME contains a relative path"
+}
+
+test "UserConfigDir" { |t|
+  r = os.user_config_dir
+  t.skip("skipping: #{r.err}") if r.err?
+  dir = r.unwrap
+  t.fatal("UserConfigDir returned #{dir}; want non-empty path or error") if dir == ""
+  fi = os.stat(dir)
+  if e = fi.err {
+    return if os.is_not_exist(e)
+    t.fatal(e.message)
+  }
+  assert fi.unwrap.is_dir, "dir #{dir} is not directory"
+}
+
+test "UserConfigDirXDGConfigDirEnvVar" { |t|
+  t.skip("$XDG_CONFIG_HOME is effective only on Unix systems") if os.getenv("HOME") != none && os.user_config_dir.unwrap.end_with?("/Library/Application Support")
+  wd = os.getwd.unwrap
+  t.setenv("XDG_CONFIG_HOME", wd)
+  assert_eq os.user_config_dir.unwrap, wd
+  t.setenv("XDG_CONFIG_HOME", "some-dir")
+  assert os.user_config_dir.err?, "UserConfigDir succeeded though $XDG_CONFIG_HOME contains a relative path"
+}
+
+test "UserHomeDir" { |t|
+  r = os.user_home_dir
+  t.skip("skipping: #{r.err}") if r.err?
+  dir = r.unwrap
+  fi = os.stat(dir)
+  if e = fi.err {
+    return if os.is_not_exist(e)
+    t.fatal(e.message)
+  }
+  assert fi.unwrap.is_dir, "dir #{dir} is not directory"
+}
+
+# Go lists the working directory; a fixture here.
+test "DirSeek" { |t|
+  f = os.open(dotdir(t)).unwrap
+  dirnames1 = f.readdirnames!(0).unwrap
+  assert_eq f.seek!(0, 0).unwrap, 0
+  dirnames2 = f.readdirnames!(0).unwrap
+  assert_eq dirnames1, dirnames2
+  assert_eq dirnames1.size, DOT.size
+  f.close!.unwrap
+}
+
+# Go's testdata/issue37161 holds three files.
+test "ReaddirSmallSeek" { |t|
+  d = t.temp_dir
+  for n in ["a", "b", "c"] { touch(d + "/" + n) }
+  df = os.open(d).unwrap
+  names1 = df.readdirnames!(1).unwrap
+  df.seek!(0, 0).unwrap
+  names2 = df.readdirnames!(0).unwrap
+  assert names2.size == 3, "first names: #{names1}, second names: #{names2}"
+  df.close!.unwrap
+}
+
+test "OpenFileKeepsPermissions" { |t|
+  name = t.temp_dir + "/x"
+  touch(name)
+  f = os.open_file(name, os.O_WRONLY | os.O_CREATE | os.O_TRUNC, 0).unwrap
+  assert (f.stat.unwrap.mode & 0o222) != 0, "f.Stat.Mode after OpenFile should be writable"
+  f.close!.unwrap
+  assert (os.stat(name).unwrap.mode & 0o222) != 0, "Stat after OpenFile should be writable"
+}
+
+test "FileIOCloseRace" { |t|
+  file = os.create(t.temp_dir + "/test.txt").unwrap
+  a = file.dup
+  b = file.dup
+  t1 = spawn {
+    tmp: [Byte] = [0; 100]
+    f = a
+    r = f.write!(tmp)
+    assert r.ok? || os.is_closed(r.err.unwrap) || r.err.unwrap.message.include?("bad file descriptor"), "#{r.err}"
+    0
+  }
+  t2 = spawn {
+    tmp: [Byte] = [0; 100]
+    f = b
+    r = f.read!(tmp)
+    assert r.ok? || os.is_closed(r.err.unwrap) || r.err.unwrap.message.include?("bad file descriptor"), "#{r.err}"
+    0
+  }
+  file.close!.unwrap
+  t1.wait.unwrap
+  t2.wait.unwrap
+}
+
+test "PipeIOCloseRace" {
+  r, w = os.pipe.unwrap
+  wa = w.dup
+  ra = r.dup
+  writer = spawn {
+    f = wa
+    loop {
+      res = f.write!("hi".bytes.to_a)
+      if e = res.err {
+        ok = os.is_closed(e) || e.message.include?("broken pipe") || e.message.include?("bad file descriptor")
+        assert ok, e.message
+        break
+      }
+      assert_eq res.unwrap, 2
+    }
+    0
+  }
+  reader = spawn {
+    f = ra
+    buf: [Byte] = [0; 2]
+    loop {
+      res = f.read!(buf)
+      if e = res.err {
+        ok = os.is_closed(e) || e.message.include?("bad file descriptor")
+        assert ok, e.message
+        break
+      }
+      break if res.unwrap == 0
+    }
+    0
+  }
+  time.sleep(time.millisecond)
+  r.close!.unwrap
+  w.close!.unwrap
+  writer.wait.unwrap
+  reader.wait.unwrap
+}
+
+# Go closes the same pipe from two goroutines: one close of each end wins.
+# Copies of a File share its state (D36), as Go's goroutines share *File.
+test "PipeCloseRace" {
+  r, w = os.pipe.unwrap
+  c = Chan[Bool].new(4)
+  st = Mutex.new((r, w))
+  for _i in 0...2 {
+    s = st
+    ch = c
+    spawn {
+      p = s.lock { |p| p }
+      rr = p[0]
+      ww = p[1]
+      ch << rr.close!.ok?
+      ch << ww.close!.ok?
+    }
+  }
+  nils = 0
+  errs = 0
+  for _i in 0...4 {
+    if c.recv.unwrap {
+      nils += 1
+    } else {
+      errs += 1
+    }
+  }
+  assert nils == 2 && errs == 2, "got nils #{nils} errs #{errs}, want 2 2"
+}
+
+test "RandomLen" { |t|
+  for _i in 0...5 {
+    dir = os.mkdir_temp(t.temp_dir, "*").unwrap
+    base = filepath.base(dir)
+    assert base.size <= 10, "MkdirTemp returned len #{base.size}: #{base}"
+  }
+  for _i in 0...5 {
+    f = os.create_temp(t.temp_dir, "*").unwrap
+    base = filepath.base(f.name)
+    f.close!.unwrap
+    assert base.size <= 10, "CreateTemp returned len #{base.size}: #{base}"
+  }
+}
+
+test "AppendDoesntOverwrite" { |t|
+  t.chdir(t.temp_dir)
+  name = "file"
+  os.write_file(name, "hello".bytes, 0o666).unwrap
+  f = os.open_file(name, os.O_APPEND | os.O_WRONLY, 0).unwrap
+  f.write!(" world".bytes.to_a).unwrap
+  f.close!.unwrap
+  assert_eq os.read_file_string(name).unwrap, "hello world"
+}
+
+test "RemoveReadOnlyFile" { |t|
+  t.chdir(t.temp_dir)
+  os.write_file("file", "1".bytes, 0).unwrap
+  os.remove("file").unwrap
+  assert os.is_not_exist(os.stat("file").err.unwrap)
+}
+
+test "OpenFileDevNull" {
+  f = os.open_file(os.DEV_NULL, os.O_WRONLY | os.O_CREATE | os.O_TRUNC, 0o644).unwrap
+  f.close!.unwrap
+}

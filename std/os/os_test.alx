@@ -78,10 +78,6 @@ test "errors read like Go's" {
     NotExist => assert true
     _ => assert false, "expected NotExist"
   }
-  case e {
-    FsError => assert true
-    _ => assert false, "expected FsError"
-  }
   assert is_not_exist(stat("/no/such").err.unwrap)
   assert_eq stat("/no/such").err.unwrap.message, "stat /no/such: no such file or directory"
   assert is_not_exist(read_dir("/no/such").err.unwrap)
@@ -248,7 +244,8 @@ test "stdout is a Writer" {
 }
 
 test "bad descriptors" {
-  f = new_file(-1, "nofile")
+  assert new_file(-1, "nofile") == none
+  f = new_file(987, "nofile").unwrap
   buf: [Byte] = [0; 4]
   e = f.read!(buf).err.unwrap
   assert_eq e.message, "read nofile: bad file descriptor"
@@ -270,4 +267,49 @@ test "io functions drive shared Buffers" {
   assert_eq dst.string, "3456789!ab"
   assert_eq Str.from_bytes(io.read_all(dst).unwrap), "3456789!ab"
   assert_eq dst.size, 0
+}
+
+# Go's TestSplitPath (os_unix_test.go, through export_unix_test.go).
+test "SplitPath" {
+  tests = [
+    ("a", ".", "a"), ("a/", ".", "a"), ("a//", ".", "a"), ("a/b", "a", "b"), ("a/b/", "a", "b"), ("a/b/c", "a/b", "c"),
+    ("/a", "/", "a"), ("/a/", "/", "a"), ("/a/b", "/a", "b"), ("/a/b/", "/a", "b"), ("/a/b/c", "/a/b", "c"),
+    ("//a", "/", "a"), ("//a/", "/", "a"), ("///a", "/", "a"), ("///a/", "/", "a"),
+  ]
+  for tt in tests {
+    d, b2 = split_path(tt[0])
+    assert d == tt[1] && b2 == tt[2], "splitPath(#{tt[0]}) = #{d}, #{b2}, want #{tt[1]}, #{tt[2]}"
+  }
+}
+
+# Go's TestReadFileContents (through export_test.go's ExportReadFileContents).
+# alx's reads return 0 at the end where Go's return io.EOF: a step's io.EOF
+# is its count, then one read returning 0 (its buffer size unchecked).
+# A step returning a count and an error in Go is a count, then -errno.
+# (step: buffer size to check (0: don't), count or -errno, unused)
+test "ReadFileContents" {
+  efoo = 5 # stands for errFoo
+  tests = [
+    ("big-file", 2000, 2000, 0, [(2001, 21, 0), (1980, 1979, 0), (1, 0, 0)]),
+    ("small-file", 100, 100, 0, [(512, 100, 0), (0, 0, 0)]),
+    ("returning-error", 1000, 50, efoo, [(1001, 25, 0), (0, 25, 0), (0, -efoo, 0)]),
+    ("proc-file", 0, 1023, 0, [(512, 512, 0), (0, 511, 0), (0, 0, 0)]),
+    ("plan9-iproute-file", 0, 1032, 0, [(512, 511, 0), (0, 511, 0), (0, 10, 0), (0, 0, 0)]),
+  ]
+  for tt in tests {
+    steps = tt[4]
+    i = Atomic.new(0)
+    got, err = read_file_contents(tt[1]) { |buf|
+      k = i.load
+      i.store(k + 1)
+      assert k < steps.size, "#{tt[0]}: unexpected read of length #{buf.size} after #{steps.size} expected reads"
+      assert !(tt[1] == 0 && buf.size < 512 && steps[k][1] != 0), "#{tt[0]}: read[#{k}] with buf size #{buf.size}; want at least 512 for 0-sized file"
+      step = steps[k]
+      assert step[0] == 0 || buf.size == step[0], "#{tt[0]}: read[#{k}] has buffer size #{buf.size}; want #{step[0]}"
+      step[1]
+    }
+    assert_eq i.load, steps.size
+    assert_eq err, tt[3]
+    assert_eq got.size, tt[2]
+  }
 }

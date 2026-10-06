@@ -488,10 +488,16 @@ const char *alx_sys_const_name(int64_t i);
 
 /* ---------- files and directories (std os) ---------- */
 /* stat(2)/lstat(2)/fstat(2) as ALX_STAT_FIELDS int64s (native endian) in out:
- * mode, size, mtime_ns, atime_ns, ino, nlink. 0 or -errno. */
-#define ALX_STAT_FIELDS 6
+ * mode, size, mtime_ns, atime_ns, ino, nlink, dev, uid, gid, rdev, ctime_ns.
+ * 0 or -errno. */
+#define ALX_STAT_FIELDS 11
 int32_t alx_sys_stat(const char *path, uint8_t *out, int32_t follow);
 int32_t alx_sys_fstat(int32_t fd, uint8_t *out);
+/* The running executable's path into out (n bytes, NUL-terminated): its
+ * length, or -errno. */
+int64_t alx_sys_executable(uint8_t *out, int64_t n);
+/* A directory handle (as alx_sys_dir_open's) over a duplicate of fd, or -errno. */
+int64_t alx_sys_dir_fdopen(int64_t fd);
 /* A directory handle or -errno; entries one at a time (NULL at the end). */
 int64_t alx_sys_dir_open(const char *path);
 const char *alx_sys_dir_next(int64_t h, uint8_t *kind);
@@ -516,6 +522,14 @@ int64_t alx_sys_pipe(uint8_t *out, int64_t nonblock);
  * with -errno. Arguments as for alx_sys_spawn. */
 int64_t alx_sys_exec(const uint8_t *argv, int64_t argc, const uint8_t *env, int64_t envc, const char *dir,
                      int64_t fd0, int64_t fd1, int64_t fd2);
+/* alx_sys_spawn with the program's path apart from argv[0] and nfds
+ * descriptors (int64s in fds) for the child's 0, 1, 2, 3, ... (-1: inherit
+ * 0-2, close the rest). The pid or -errno. */
+int64_t alx_sys_spawn2(const char *path, const uint8_t *argv, int64_t argc, const uint8_t *env, int64_t envc,
+                       const char *dir, const uint8_t *fds, int64_t nfds);
+/* Blocks until one of n descriptors is ready: blob holds n (fd, mode)
+ * int64 pairs, mode 1 read / 2 write; negative fds are skipped. 0 or -errno. */
+int64_t alx_sys_polln(const uint8_t *blob, int64_t n);
 /* Blocks until a or b (either may be -1) is readable or hung up. 0 or -errno. */
 int64_t alx_sys_poll2(int64_t a, int64_t b);
 int64_t alx_sig_watch(int64_t mask);
@@ -531,6 +545,11 @@ int64_t alx_user_groups(const char *name, int64_t gid, uint8_t *out, int64_t n);
 int64_t alx_fd_wait(int64_t fd, int64_t mode);
 /* close(2) that wakes tasks waiting on fd first. 0 or -errno. */
 int64_t alx_fd_close(int64_t fd);
+/* read(2) / write(2) that park a task instead of blocking its worker on a
+ * pipe, FIFO, terminal or socket (port-issues #166); EAGAIN on a non-blocking
+ * fd waits. The count (a write may take fewer than n), or -errno. */
+int64_t alx_sys_read(int64_t fd, uint8_t *buf, int64_t n);
+int64_t alx_sys_write(int64_t fd, const uint8_t *buf, int64_t n);
 /* Sockets: non-blocking, close-on-exec fds; negative results are -errno
  * (-100000: name not found). Address buffers must hold 64 bytes. */
 int64_t alx_sock_listen(const char *host, int64_t port, int64_t backlog);

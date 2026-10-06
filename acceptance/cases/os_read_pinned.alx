@@ -1,0 +1,69 @@
+# A task blocked reading or writing a pipe must not block its worker
+# (port-issues #166, the sequel of #154). Tasks are pinned to the worker
+# they first ran on; File.read! / write! used to block that worker in
+# read(2) / write(2), so every task pinned there stopped until the pipe was
+# ready. Now the task parks on the poller (alx_sys_read / alx_sys_write).
+#
+# One worker makes the collision certain: the main task parks (sleeps 100
+# ms), the worker picks up the reader (or writer) task, and before the fix
+# it blocked there until a child process, 1 s later, made the pipe ready,
+# so the 100 ms sleep took over a second.
+import "os"
+import "time"
+
+_ = os.setenv("ALX_PROCS", "1") # read when the first task starts
+
+def child(script: Str, files: [os.File?]) -> os.Process {
+  os.start_process("/bin/sh", ["sh", "-c", script], os.ProcAttr.new(dir: "", env: none, files: files)).unwrap
+}
+
+# A reader waiting for a child that writes after 1 s.
+def read_case -> Str {
+  r, w = os.pipe.unwrap
+  p = child("sleep 1; echo hello", [none, w])
+  w.close!.unwrap
+  t = spawn {
+    rd = spawn {
+      buf: [Byte] = [0; 64]
+      f = r
+      n = f.read!(buf).unwrap
+      f.close!.unwrap
+      Str.from_bytes(buf[0...n]).strip
+    }
+    t0 = time.now
+    time.sleep(time.millisecond * 100) # parks: the worker runs `rd`
+    slept = time.since(t0)
+    got = rd.wait.unwrap
+    "read: #{got}, stalled: #{slept > time.millisecond * 600}"
+  }
+  out = t.wait.unwrap
+  p.wait!.unwrap
+  out
+}
+
+# A writer filling a pipe that a child starts draining after 1 s.
+def write_case -> Str {
+  r, w = os.pipe.unwrap
+  p = child("sleep 1; wc -c | tr -d ' '", [r, none])
+  r.close!.unwrap
+  t = spawn {
+    wr = spawn {
+      f = w
+      data: [Byte] = [120; 300000]
+      n = f.write!(data).unwrap
+      f.close!.unwrap
+      n
+    }
+    t0 = time.now
+    time.sleep(time.millisecond * 100) # parks: the worker runs `wr`
+    slept = time.since(t0)
+    n = wr.wait.unwrap
+    "write: #{n}, stalled: #{slept > time.millisecond * 600}"
+  }
+  out = t.wait.unwrap
+  p.wait!.unwrap
+  out
+}
+
+puts read_case
+puts write_case

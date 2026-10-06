@@ -1,0 +1,271 @@
+# Go's listen_test.go, translated. The wildcard rows of the listener tables
+# are skipped as Go skips them without an external network (these tests
+# stay on loopback); TestWildWildcardListener and TestIPv6MulticastListener
+# likewise (external network; root). TestIPv4MulticastListener runs on the
+# loopback interface without Go's multicast-RIB check (MulticastAddrs
+# reports none here).
+
+import "os"
+import "time"
+
+# Go's testableListenArgs, with HasExternalNetwork false.
+def testable_listen_args?(network: Str, address: Str) -> Bool {
+  return false unless testable_network?(network) && testable_address?(network, address)
+  k = net_kind(network)
+  return true if k != 0 && k != 1
+  h, _ = split_host_port(address).unwrap
+  return false if h == "" || h == "0.0.0.0" || h == "::" || h == "::ffff:0.0.0.0"
+  ip = parse_ip(h) || return true
+  return false if !supports_ipv4? && ip.to4.present?
+  return false if !supports_ipv6? && !ip.to4.present?
+  true
+}
+
+def port_of(addr: Str) -> Str {
+  r = split_host_port(addr)
+  return "" if r.err?
+  _, p = r.unwrap
+  p
+}
+
+# Go's checkFirstListener, on the socket's family.
+def check_first_listener(network: Str, fd: NetFD) -> Str? {
+  if network == "tcp4" || network == "udp4" {
+    return "#{fd.la} got #{fd.family}; want 4" if fd.family != 4
+  } elsif network == "tcp6" || network == "udp6" {
+    return "#{fd.la} got #{fd.family}; want 6" if fd.family != 6
+  } else {
+    la = fd.laddr || return "no local address"
+    want = supports_ipv4map? && addr_wildcard?(la) ? 6 : addr_family(la)
+    return "listen(#{fd.net}, #{la}) returns #{fd.family}; want #{want}" if fd.family != want
+  }
+  none
+}
+
+def tcp_listener_rows -> [(Str, Str)] {
+  [("tcp", ""), ("tcp", "0.0.0.0"), ("tcp", "::ffff:0.0.0.0"), ("tcp", "::"), ("tcp", "127.0.0.1"), ("tcp", "::ffff:127.0.0.1"), ("tcp", "::1"), ("tcp4", ""), ("tcp4", "0.0.0.0"), ("tcp4", "::ffff:0.0.0.0"), ("tcp4", "127.0.0.1"), ("tcp4", "::ffff:127.0.0.1"), ("tcp6", ""), ("tcp6", "::"), ("tcp6", "::1")]
+}
+
+test "TCPListener" {
+  for tt in tcp_listener_rows {
+    network, address = tt
+    next unless testable_listen_args?(network, join_host_port(address, "0"))
+    ln1 = listen(network, join_host_port(address, "0")).unwrap
+    if p = check_first_listener(network, ln1.nfd) {
+      assert false, p
+    }
+    r = listen(network, join_host_port(address, port_of(ln1.addr)))
+    if r.ok? {
+      ln2 = r.unwrap
+      ln2.close!
+    }
+    assert r.err?, "#{network} #{address} should fail"
+    ln1.close!
+  }
+}
+
+test "UDPListener" {
+  for tt in tcp_listener_rows {
+    tnet, address = tt
+    network = "udp" + tnet[3...tnet.size]
+    next unless testable_listen_args?(network, join_host_port(address, "0"))
+    c1 = listen_packet(network, join_host_port(address, "0")).unwrap
+    if p = check_first_listener(network, c1.conn.nfd) {
+      assert false, p
+    }
+    r = listen_packet(network, join_host_port(address, port_of(c1.local_addr)))
+    if r.ok? {
+      c2 = r.unwrap
+      c2.close!
+    }
+    assert r.err?, "#{network} #{address} should fail"
+    c1.close!
+  }
+}
+
+def dual_stack_rows -> [(Str, Str, Str, Str, Bool)] {
+  [
+    ("tcp", "", "tcp", "", true),
+    ("tcp", "", "tcp", "0.0.0.0", true),
+    ("tcp", "0.0.0.0", "tcp", "", true),
+    ("tcp", "", "tcp", "::", true),
+    ("tcp", "::", "tcp", "", true),
+    ("tcp", "0.0.0.0", "tcp", "::", true),
+    ("tcp", "::", "tcp", "0.0.0.0", true),
+    ("tcp", "::ffff:0.0.0.0", "tcp", "::", true),
+    ("tcp", "::", "tcp", "::ffff:0.0.0.0", true),
+    ("tcp4", "", "tcp6", "", false),
+    ("tcp6", "", "tcp4", "", false),
+    ("tcp4", "0.0.0.0", "tcp6", "::", false),
+    ("tcp6", "::", "tcp4", "0.0.0.0", false),
+    ("tcp", "127.0.0.1", "tcp", "::1", false),
+    ("tcp", "::1", "tcp", "127.0.0.1", false),
+    ("tcp4", "127.0.0.1", "tcp6", "::1", false),
+    ("tcp6", "::1", "tcp4", "127.0.0.1", false)
+  ]
+}
+
+def different_wildcard_addr?(i: Str, j: Str) -> Bool {
+  return false if (i == "" || i == "0.0.0.0" || i == "::ffff:0.0.0.0") && (j == "" || j == "0.0.0.0" || j == "::ffff:0.0.0.0")
+  return false if i == "[::]" && j == "[::]"
+  true
+}
+
+test "DualStackTCPListener" {
+  if supports_ipv4? && supports_ipv6? {
+    for tt in dual_stack_rows {
+      network1, address1, network2, address2, xerr0 = tt
+      next unless testable_listen_args?(network1, join_host_port(address1, "0"))
+      xerr = xerr0
+      xerr = false if !supports_ipv4map? && different_wildcard_addr?(address1, address2)
+      second = ""
+      for _i in 0...5 {
+        lns = new_dual_stack_listener || panic("no dualstack port available")
+        port = "#{lns[0].port}"
+        for l in lns {
+          ll = l
+          ll.close!
+        }
+        r1 = listen(network1, join_host_port(address1, port))
+        next if r1.err?
+        ln1 = r1.unwrap
+        if p = check_first_listener(network1, ln1.nfd) {
+          assert false, p
+        }
+        r2 = listen(network2, join_host_port(address2, port_of(ln1.addr)))
+        if r2.ok? {
+          ln2 = r2.unwrap
+          ln2.close!
+        }
+        second = r2.err? != xerr ? "#{network2} #{address2} got error #{r2.err?}; want #{xerr}" : ""
+        ln1.close!
+        break if second == ""
+      }
+      assert_eq second, ""
+    }
+  }
+}
+
+test "DualStackUDPListener" {
+  if supports_ipv4? && supports_ipv6? {
+    for tt in dual_stack_rows {
+      n1, address1, n2, address2, xerr0 = tt
+      network1 = "udp" + n1[3...n1.size]
+      network2 = "udp" + n2[3...n2.size]
+      next unless testable_listen_args?(network1, join_host_port(address1, "0"))
+      xerr = xerr0
+      xerr = false if !supports_ipv4map? && different_wildcard_addr?(address1, address2)
+      second = ""
+      for _i in 0...5 {
+        c4 = listen_udp("udp4", UDPAddr.new(ip: ipv4(127, 0, 0, 1))).unwrap
+        port = port_of(c4.local_addr)
+        r6 = listen_udp("udp6", UDPAddr.new(ip: ipv6_loopback, port: c4.local_addr.split(":")[1].to_i))
+        c4.close!
+        if r6.err? {
+          next
+        }
+        c6 = r6.unwrap
+        c6.close!
+        r1 = listen_packet(network1, join_host_port(address1, port))
+        next if r1.err?
+        c1 = r1.unwrap
+        if p = check_first_listener(network1, c1.conn.nfd) {
+          assert false, p
+        }
+        r2 = listen_packet(network2, join_host_port(address2, port_of(c1.local_addr)))
+        if r2.ok? {
+          c2 = r2.unwrap
+          c2.close!
+        }
+        second = r2.err? != xerr ? "#{network2} #{address2} got error #{r2.err?}; want #{xerr}" : ""
+        c1.close!
+        break if second == ""
+      }
+      assert_eq second, ""
+    }
+  }
+}
+
+# Go's loopbackInterface.
+def loopback_interface -> Interface? {
+  ift = interfaces.unwrap
+  for ifi in ift {
+    return ifi if ifi.flags.has?(FLAG_LOOPBACK) && ifi.flags.has?(FLAG_UP)
+  }
+  none
+}
+
+test "IPv4MulticastListener" {
+  if supports_ipv4? {
+    if ifi = loopback_interface {
+      for net in ["udp", "udp4"] {
+        gaddr = UDPAddr.new(ip: ipv4(224, 0, 0, 254), port: 12345)
+        c0 = listen_multicast_udp(net, ifi, gaddr).unwrap
+        assert udp_port_of(c0.local_net_addr) > 0, "c0 port"
+        c1 = listen_multicast_udp(net, ifi, gaddr).unwrap
+        assert udp_port_of(c1.local_net_addr) > 0, "c1 port"
+        c0.close!
+        c1.close!
+      }
+    }
+  }
+}
+
+test "ClosingListener" {
+  ln = new_local_listener("tcp")
+  addr = ln.addr
+  t = spawn {
+    loop {
+      r = ln.accept
+      break if r.err?
+      c = r.unwrap
+      c.close!
+    }
+  }
+  time.sleep(time.millisecond)
+  ln.close!
+  ln2 = listen("tcp", addr).unwrap
+  ln2.close!
+  t.wait
+}
+
+# Go's controlOnConnSetup.
+def control_on_conn_setup(network: Str, address: Str, c: RawConn) -> ~Unit {
+  fail errors_new("ambiguous network: " + network) if network == "tcp" || network == "udp" || network == "ip"
+  operr = Atomic.new(0)
+  if network == "unix" || network == "unixpacket" || network == "unixgram" {
+    ~c.control(->(s: Int) {
+      r = alx_net_getsockopt(s, "SO_ERROR")
+      operr.store(r < 0 ? -r : 0)
+    })
+  } else {
+    last = network[network.size - 1]
+    if last == 52 {
+      ~c.control(->(s: Int) { operr.store(-alx_net_setsockopt(s, "IP_TTL", 1)) })
+    } elsif last == 54 {
+      ~c.control(->(s: Int) { operr.store(-alx_net_setsockopt(s, "IPV6_UNICAST_HOPS", 1)) })
+    } else {
+      fail errors_new("unknown network: " + network)
+    }
+  }
+  fail syscall_error("setsockopt", operr.load) if operr.load != 0
+}
+
+def control_hook -> ((Str, Str, RawConn) -> ~Unit)? {
+  f = ->(n: Str, a: Str, c: RawConn) -> ~Unit { ~control_on_conn_setup(n, a, c) }
+  f
+}
+
+test "ListenConfigControl" {
+  for network in ["tcp", "tcp4", "tcp6", "unix", "unixpacket"] {
+    next unless testable_network?(network)
+    ln = new_local_listener(network, ListenConfig.new(control: control_hook))
+    ln.close!
+  }
+  for network in ["udp", "udp4", "udp6", "unixgram"] {
+    next unless testable_network?(network)
+    c = new_local_packet_listener(network, ListenConfig.new(control: control_hook))
+    c.close!
+    os.remove(c.local_addr) if network == "unixgram"
+  }
+}

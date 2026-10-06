@@ -29,6 +29,21 @@ pub struct Dialer {
   resolver: Resolver?
   # Called with the socket before it connects (Go's Control).
   control: ((Str, Str, RawConn) -> ~Unit)?
+  # Called with the socket and the dial's context before it connects (Go's
+  # ControlContext; it wins over control).
+  control_context: ((context.Context, Str, Str, RawConn) -> ~Unit)?
+  # Closing this channel cancels the dial (Go's deprecated Cancel).
+  cancel: Chan[Bool]?
+
+  # The control hook for a dial with this context.
+  def ctrl_for(ctx: context.Context) -> ((Str, Str, RawConn) -> ~Unit)? {
+    if cc = control_context {
+      c2 = ctx
+      f = ->(n: Str, a: Str, rc: RawConn) -> ~Unit { ~cc.call(c2, n, a, rc) }
+      return f
+    }
+    control
+  }
 
   def dual_stack_on? -> Bool { fallback_delay.ns >= 0 }
 
@@ -56,9 +71,9 @@ pub struct Dialer {
   # whole dial; a name with several addresses is tried address by address
   # (IPv6 and IPv4 raced, Go's Happy Eyeballs, for "tcp").
   pub def dial_context(ctx0: context.Context, network: Str, address: Str) -> ~Conn {
-    ctx, cancel = dial_ctx(ctx0)
+    ctx, stop = dial_ctx(ctx0)
     defer {
-      cancel.call
+      stop.call
     }
     ar = res.resolve_addr_list(ctx, "dial", network, address, local_addr)
     if e = ar.err {
@@ -78,9 +93,9 @@ pub struct Dialer {
 
   # Go's Dialer.DialTCP (from netip.AddrPorts; an invalid laddr: any).
   pub def dial_tcp(ctx0: context.Context, network: Str, laddr: netip.AddrPort, raddr: netip.AddrPort) -> ~Conn {
-    ctx, cancel = dial_ctx(ctx0)
+    ctx, stop = dial_ctx(ctx0)
     defer {
-      cancel.call
+      stop.call
     }
     la: TCPAddr? = laddr.valid? ? tcp_addr_from_addr_port(laddr) : none
     ~dial_tcp_with(ctx, self, network, la, tcp_addr_from_addr_port(raddr))
@@ -88,9 +103,9 @@ pub struct Dialer {
 
   # Go's Dialer.DialUDP.
   pub def dial_udp(ctx0: context.Context, network: Str, laddr: netip.AddrPort, raddr: netip.AddrPort) -> ~Conn {
-    ctx, cancel = dial_ctx(ctx0)
+    ctx, stop = dial_ctx(ctx0)
     defer {
-      cancel.call
+      stop.call
     }
     la: UDPAddr? = laddr.valid? ? udp_addr_from_addr_port(laddr) : none
     ~dial_udp_with(ctx, self, network, la, udp_addr_from_addr_port(raddr))
@@ -98,9 +113,9 @@ pub struct Dialer {
 
   # Go's Dialer.DialIP.
   pub def dial_ip(ctx0: context.Context, network: Str, laddr: netip.Addr, raddr: netip.Addr) -> ~Conn {
-    ctx, cancel = dial_ctx(ctx0)
+    ctx, stop = dial_ctx(ctx0)
     defer {
-      cancel.call
+      stop.call
     }
     la: IPAddr? = laddr.valid? ? ip_addr_from_addr(laddr) : none
     ~dial_ip_with(ctx, self, network, la, ip_addr_from_addr(raddr))
@@ -108,9 +123,9 @@ pub struct Dialer {
 
   # Go's Dialer.DialUnix.
   pub def dial_unix(ctx0: context.Context, network: Str, laddr: UnixAddr?, raddr: UnixAddr) -> ~Conn {
-    ctx, cancel = dial_ctx(ctx0)
+    ctx, stop = dial_ctx(ctx0)
     defer {
-      cancel.call
+      stop.call
     }
     ~dial_unix_with(ctx, self, network, laddr, raddr)
   }
@@ -120,15 +135,36 @@ pub struct Dialer {
 
   # Go's dialCtx: the context bounded by the dialer's deadline, and its
   # cancel function.
-  def dial_ctx(ctx: context.Context) -> (context.Context, () -> Unit) {
+  def dial_ctx(ctx0: context.Context) -> (context.Context, () -> Unit) {
+    ctx = ctx0
+    cancel1 = ->() { nil }
     dl = deadline_for(ctx, alx_wall_ns())
     if dl != 0 {
       cd = ctx.deadline || 0
       if cd == 0 || dl < cd {
-        return context.with_deadline(ctx, dl)
+        c1, f1 = context.with_deadline(ctx, dl)
+        ctx = c1
+        cancel1 = f1
       }
     }
-    (ctx, ->() { nil })
+    if ch = cancel {
+      # The returned cancel ends sub (and with it the watcher); the watcher
+      # cancels sub2 when the Cancel channel closes.
+      sub, cancel2 = context.with_cancel(ctx)
+      sub2, cancel3 = context.with_cancel(sub)
+      done = sub2.done
+      spawn {
+        select {
+          when v = ch.recv => cancel3.call
+          when v = done.recv => nil
+        }
+      }
+      return (sub2, ->() {
+        cancel2.call
+        cancel1.call
+      })
+    }
+    (ctx, cancel1)
   }
 }
 
@@ -171,7 +207,7 @@ struct SysDialer {
   def dial_parallel(ctx: context.Context, primaries: [Addr], fallbacks: [Addr]) -> ~Conn {
     return ~dial_serial(ctx, primaries) if fallbacks.size == 0
     # A control hook can't be shared between tasks: no racing then.
-    return ~dial_serial(ctx, primaries + fallbacks) if d.control.present?
+    return ~dial_serial(ctx, primaries + fallbacks) if d.control.present? || d.control_context.present?
     results = Chan[(Conn?, Error?, Bool)].new(2)
     pctx, pcancel = context.with_cancel(ctx)
     fctx, fcancel = context.with_cancel(ctx)
@@ -545,14 +581,17 @@ def sys_dial_tcp(ctx: context.Context, d: Dialer, net: Str, laddr: TCPAddr?, rad
   if l = laddr {
     lport = l.port
   }
-  r = internet_socket(ctx, net, la, raddr, SOCK_STREAM, 0, "dial", d.control)
+  if TEST_HOOK_DIAL_TCP.load != "" {
+    return ~test_hook_dial_tcp(ctx, d, net, laddr, raddr)
+  }
+  r = internet_socket(ctx, net, la, raddr, SOCK_STREAM, 0, "dial", d.ctrl_for(ctx))
   i = 0
   while i < 2 && lport == 0 && (self_connect?(r) || spurious_enotavail?(r)) {
     if r.ok? {
       f = r.unwrap
       alx_fd_close(f.fd)
     }
-    r = internet_socket(ctx, net, la, raddr, SOCK_STREAM, 0, "dial", d.control)
+    r = internet_socket(ctx, net, la, raddr, SOCK_STREAM, 0, "dial", d.ctrl_for(ctx))
     i += 1
   }
   fd = ~r
@@ -616,7 +655,7 @@ pub def listen_tcp(network: Str, laddr0: TCPAddr?) -> ~Listener {
 # --------------------------------------------------------------------- UDP
 
 def sys_dial_udp(ctx: context.Context, d: Dialer, net: Str, laddr: UDPAddr?, raddr: UDPAddr) -> ~Conn {
-  fd = ~internet_socket(ctx, net, opt_addr(laddr), raddr, SOCK_DGRAM, 0, "dial", d.control)
+  fd = ~internet_socket(ctx, net, opt_addr(laddr), raddr, SOCK_DGRAM, 0, "dial", d.ctrl_for(ctx))
   new_conn(fd)
 }
 
@@ -693,7 +732,7 @@ def listen_multicast_raw(network: Str, ifi: Interface?, g: UDPAddr) -> ~Conn {
 def sys_dial_ip(ctx: context.Context, d: Dialer, net: Str, laddr: IPAddr?, raddr: IPAddr) -> ~Conn {
   afnet, proto = ~parse_network(net, true)
   fail UnknownNetworkError.Network(net) unless afnet == "ip" || afnet == "ip4" || afnet == "ip6"
-  fd = ~internet_socket(ctx, afnet, opt_addr(laddr), raddr, SOCK_RAW, proto, "dial", d.control)
+  fd = ~internet_socket(ctx, afnet, opt_addr(laddr), raddr, SOCK_RAW, proto, "dial", d.ctrl_for(ctx))
   new_conn(fd)
 }
 
@@ -759,7 +798,7 @@ def unix_socket(ctx: context.Context, net: Str, laddr0: UnixAddr?, raddr0: UnixA
 }
 
 def sys_dial_unix(ctx: context.Context, d: Dialer, net: Str, laddr: UnixAddr?, raddr: UnixAddr) -> ~Conn {
-  fd = ~unix_socket(ctx, net, laddr, raddr, "dial", d.control)
+  fd = ~unix_socket(ctx, net, laddr, raddr, "dial", d.ctrl_for(ctx))
   new_conn(fd)
 }
 
@@ -787,7 +826,7 @@ def dial_unix_with(ctx: context.Context, d: Dialer, network: Str, laddr: UnixAdd
 }
 
 def sys_dial_unix_opt(ctx: context.Context, d: Dialer, net: Str, laddr: UnixAddr?, raddr: UnixAddr?) -> ~Conn {
-  fd = ~unix_socket(ctx, net, laddr, raddr, "dial", d.control)
+  fd = ~unix_socket(ctx, net, laddr, raddr, "dial", d.ctrl_for(ctx))
   new_conn(fd)
 }
 
@@ -816,4 +855,32 @@ pub def listen_unixgram(network: Str, laddr: UnixAddr?) -> ~Conn {
     fail wrap_any("listen", network, "", ls, e)
   }
   r.unwrap
+}
+
+# Go's testHookDialTCP, for this package's tests: "" (off), "parallel:<n>"
+# (fake dials: those to network n fail, those to the slow addresses wait for
+# the context, the others succeed with an unconnected Conn) or "barrier"
+# (each dial waits until two have started, then dials for real).
+TEST_HOOK_DIAL_TCP = Atomic.new("")
+TEST_HOOK_BARRIER = Atomic.new(0)
+
+def test_hook_dial_tcp(ctx: context.Context, d: Dialer, net: Str, laddr: TCPAddr?, raddr: TCPAddr) -> ~Conn {
+  mode = TEST_HOOK_DIAL_TCP.load
+  if mode == "barrier" {
+    TEST_HOOK_BARRIER.add(1)
+    while TEST_HOOK_BARRIER.load < 2 {
+      alx_sleep_ns(1000000)
+    }
+    fd = ~internet_socket(context.background, net, opt_addr(laddr), raddr, SOCK_STREAM, 0, "dial", none)
+    return new_tcp_conn(fd, d.keep_alive, d.keep_alive_config)
+  }
+  teardown = mode.size > 9 ? mode[9...mode.size] : ""
+  n = raddr.ip.to4.present? ? "tcp4" : "tcp6"
+  fail errors_new("unreachable") if n == teardown
+  r = raddr.ip.to_s
+  if r == "198.18.0.254" || r == "2001:2::254" {
+    ctx.done.recv
+    fail ctx_error(ctx)
+  }
+  new_conn(new_fd(-1, 4, SOCK_STREAM, "tcp", none, raddr, true))
 }

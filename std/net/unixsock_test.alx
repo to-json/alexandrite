@@ -1,0 +1,255 @@
+# Go's unixsock_test.go, translated (TestUnixConnLocalWindows is
+# Windows-only). Go's io.EOF results are a 0 count here (GO-VS-RUBY F3).
+
+import "os"
+import "time"
+
+def ua(name: Str, net: Str) -> UnixAddr { UnixAddr.new(name: name, net: net) }
+
+def unix_eq?(a: Addr?, want: UnixAddr?) -> Bool {
+  w = want || return !a.present?
+  x = a || return false
+  case x {
+    UnixAddr(u) => return u.name == w.name && u.net == w.net
+    _ => return false
+  }
+}
+
+test "ReadUnixgramWithUnnamedSocket" {
+  addr = test_unix_addr
+  c = listen_unixgram("unixgram", resolve_unix_addr("unixgram", addr).unwrap).unwrap
+  data: [Byte] = [1, 2, 3, 4, 5]
+  sent = data.dup
+  sender = spawn {
+    s = alx_net_socket(1, SOCK_DGRAM, 0)
+    assert s >= 0, "socket"
+    r = alx_net_sendto(s, sent, sent.size, sa_unix(addr).unwrap)
+    assert r == sent.size, "sendto: #{r}"
+    alx_fd_close(s)
+  }
+  sender.wait
+  b: [Byte] = [0; 64]
+  c.set_read_deadline(time.now.add(time.millisecond * 100))
+  n, from = c.read_from!(b).unwrap
+  assert !from.present?, "unexpected peer address"
+  assert_eq b[0...n], data
+  c.close!
+  os.remove(addr)
+}
+
+test "UnixgramZeroBytePayload" {
+  c1 = new_local_packet_listener("unixgram")
+  c2 = dial("unixgram", c1.local_addr).unwrap
+  for generic_read in [false, true] {
+    empty: [Byte] = []
+    assert_eq c2.write!(empty).unwrap, 0
+    c1.set_read_deadline(time.now.add(time.millisecond * 100))
+    b: [Byte] = [0]
+    err: Error? = none
+    if generic_read {
+      err = c1.conn.read!(b).err
+    } else {
+      r = c1.read_from!(b)
+      err = r.err
+      if r.ok? {
+        _, peer = r.unwrap
+        assert !peer.present?, "unexpected peer address"
+      }
+    }
+    if e = err {
+      assert deadline_exceeded?(e), e.message
+    }
+  }
+  c2.close!
+  c1.close!
+  os.remove(c1.local_addr)
+}
+
+test "UnixgramZeroByteBuffer" {
+  c1 = new_local_packet_listener("unixgram")
+  c2 = dial("unixgram", c1.local_addr).unwrap
+  b = bytes_of("UNIXGRAM ZERO BYTE BUFFER TEST")
+  for generic_read in [false, true] {
+    assert_eq c2.write!(b).unwrap, b.size
+    c1.set_read_deadline(time.now.add(time.millisecond * 100))
+    empty: [Byte] = []
+    err: Error? = none
+    if generic_read {
+      err = c1.conn.read!(empty).err
+    } else {
+      r = c1.read_from!(empty)
+      err = r.err
+      if r.ok? {
+        _, peer = r.unwrap
+        assert !peer.present?, "unexpected peer address"
+      }
+    }
+    if e = err {
+      assert deadline_exceeded?(e), e.message
+    }
+  }
+  c2.close!
+  c1.close!
+  os.remove(c1.local_addr)
+}
+
+test "UnixgramWrite" {
+  addr = test_unix_addr
+  laddr = resolve_unix_addr("unixgram", addr).unwrap
+  c = listen_packet("unixgram", addr).unwrap
+  # testUnixgramWriteConn
+  cc = dial("unixgram", laddr.to_s).unwrap
+  b = bytes_of("CONNECTED-MODE SOCKET")
+  e1 = cc.write_to_unix!(b, laddr).err.unwrap
+  assert_eq inner_of(e1), "use of WriteTo with pre-connected connection"
+  e2 = cc.write_to!(b, laddr).err.unwrap
+  assert_eq inner_of(e2), "use of WriteTo with pre-connected connection"
+  empty: [Byte] = []
+  e3 = cc.write_msg_unix!(b, empty, laddr).err.unwrap
+  assert_eq inner_of(e3), "use of WriteTo with pre-connected connection"
+  cc.write!(b).unwrap
+  cc.close!
+  # testUnixgramWritePacketConn
+  addr2 = test_unix_addr
+  pc = listen_packet("unixgram", addr2).unwrap
+  b2 = bytes_of("UNCONNECTED-MODE SOCKET")
+  pc.conn.write_to_unix!(b2, laddr).unwrap
+  pc.write_to!(b2, laddr).unwrap
+  pc.conn.write_msg_unix!(b2, empty, laddr).unwrap
+  assert pc.conn.write!(b2).err?, "should fail"
+  pc.close!
+  os.remove(addr2)
+  c.close!
+  os.remove(addr)
+}
+
+test "UnixConnLocalAndRemoteNames" {
+  for laddr0 in ["", test_unix_addr] {
+    laddr = laddr0
+    taddr = test_unix_addr
+    ta = resolve_unix_addr("unix", taddr).unwrap
+    ln = listen_unix("unix", ta).unwrap
+    la: UnixAddr? = none
+    la = resolve_unix_addr("unix", laddr).unwrap if laddr != ""
+    c = dial_unix("unix", la, ta).unwrap
+    c.write!(bytes_of("UNIXCONN LOCAL AND REMOTE NAME TEST")).unwrap
+    laddr = "@" if laddr == "" && linux?
+    assert unix_eq?(ln.net_addr, ta), "listener addr #{addr_s(ln.net_addr)}"
+    assert unix_eq?(c.local_net_addr, ua(laddr, "unix")), "local #{addr_s(c.local_net_addr)}, want #{laddr}"
+    assert unix_eq?(c.remote_net_addr, ta), "remote #{addr_s(c.remote_net_addr)}"
+    c.close!
+    os.remove(laddr) if la.present?
+    ln.close!
+  }
+}
+
+test "UnixgramConnLocalAndRemoteNames" {
+  for laddr0 in ["", test_unix_addr] {
+    laddr = laddr0
+    taddr = test_unix_addr
+    ta = resolve_unix_addr("unixgram", taddr).unwrap
+    c1 = listen_unixgram("unixgram", ta).unwrap
+    la: UnixAddr? = none
+    la = resolve_unix_addr("unixgram", laddr).unwrap if laddr != ""
+    c2 = dial_unix("unixgram", la, ta).unwrap
+    laddr = "@" if laddr == "" && linux?
+    assert unix_eq?(c1.local_net_addr, ta), "c1 local"
+    assert unix_eq?(c1.remote_net_addr, none), "c1 remote"
+    assert unix_eq?(c2.local_net_addr, ua(laddr, "unixgram")), "c2 local #{addr_s(c2.local_net_addr)}"
+    assert unix_eq?(c2.remote_net_addr, ta), "c2 remote"
+    c2.close!
+    os.remove(laddr) if la.present?
+    c1.close!
+    os.remove(taddr)
+  }
+}
+
+def exists?(name: Str) -> Bool { os.stat(name).ok? }
+
+test "UnixUnlink" {
+  name = test_unix_addr
+  # Listen
+  l = listen("unix", name).unwrap
+  assert exists?(name), "after Listen"
+  l.close!
+  assert !exists?(name), "after Listener close"
+  # FileListener
+  l = listen("unix", name).unwrap
+  f = l.file.unwrap
+  l1 = file_listener(f).unwrap
+  assert exists?(name), "after FileListener"
+  f.close!
+  assert exists?(name), "after File close"
+  l1.close!
+  assert exists?(name), "after FileListener close"
+  l.close!
+  assert !exists?(name), "after Listener close"
+  # SecondClose
+  l = listen("unix", name).unwrap
+  l.close!
+  assert !exists?(name), "after Listener close"
+  os.write_file(name, bytes_of("hello world"), 0o666).unwrap
+  assert exists?(name), "after writing temp file"
+  l.close!
+  assert exists?(name), "after second Listener close"
+  os.remove(name)
+  # Listen/SetUnlinkOnClose(true)
+  l = listen("unix", name).unwrap
+  l.set_unlink_on_close(true)
+  l.close!
+  assert !exists?(name), "after Listener close (unlink on)"
+  # Listen/SetUnlinkOnClose(false)
+  l = listen("unix", name).unwrap
+  l.set_unlink_on_close(false)
+  l.close!
+  assert exists?(name), "after Listener close (unlink off)"
+  os.remove(name)
+  # FileListener/SetUnlinkOnClose(true)
+  l = listen("unix", name).unwrap
+  f = l.file.unwrap
+  l1 = file_listener(f).unwrap
+  l1.set_unlink_on_close(true)
+  f.close!
+  assert exists?(name), "after File close"
+  l1.close!
+  assert !exists?(name), "after FileListener close (unlink on)"
+  l.close!
+  # FileListener/SetUnlinkOnClose(false)
+  l = listen("unix", name).unwrap
+  f = l.file.unwrap
+  l1 = file_listener(f).unwrap
+  l1.set_unlink_on_close(false)
+  f.close!
+  l1.close!
+  assert exists?(name), "after FileListener close (unlink off)"
+  l.close!
+}
+
+test "UnixConnReadEOF" {
+  for which in ["ReadMsgUnix", "ReadFromUnix", "ReadFrom"] {
+    addr = ua(test_unix_addr, "unix")
+    ln = listen_unix("unix", addr).unwrap
+    srv = spawn {
+      s = ln.~accept_unix
+      s.~close!
+    }
+    cl = dial_unix("unix", none, addr).unwrap
+    srv.wait.unwrap
+    buf: [Byte] = [0]
+    empty: [Byte] = []
+    n = 0
+    if which == "ReadMsgUnix" {
+      n0, _, _, _ = cl.read_msg_unix!(buf, empty).unwrap
+      n = n0
+    } elsif which == "ReadFromUnix" {
+      n0, _ = cl.read_from_unix!(buf).unwrap
+      n = n0
+    } else {
+      n0, _ = cl.read_from!(buf).unwrap
+      n = n0
+    }
+    assert_eq n, 0
+    cl.close!
+    ln.close!
+  }
+}

@@ -1,213 +1,457 @@
 # Package flag: Go's flag — command-line flag parsing.
 #
-# Go's flag.Int returns a *int that Parse fills in. Alexandrite has no
-# pointers, so a FlagSet owns the values and you read them back by name:
+#   Go                                      alx
+#   fs := NewFlagSet(name, handling)        fs = new_flag_set(name, handling) (new_set(name):
+#                                             CONTINUE_ON_ERROR)
+#   p := fs.Int(name, v, usage) *int        p = fs.int!(name, v, usage) -> Atomic[Int]; *p is p.load
+#   fs.IntVar(&x, name, v, usage)           fs.int_var!(x, name, v, usage), x an Atomic[Int]
+#   Bool, Int, Int64, Uint, Uint64,         bool!, int!, int64!, uint!, uint64!, string!,
+#   String, Float64, Duration (and Var      float64!, duration! (and the _var! forms);
+#   forms)                                    Int64 is Int, Uint / Uint64 are U64
+#   fs.Func / BoolFunc(name, usage, fn)     fs.func! / bool_func!(name, usage) { |s| ... } (fn: (Str) -> ~Unit)
+#   fs.TextVar(p, name, v, usage)           fs.text_var!(p, name, v, usage): p an Atomic[T], T with
+#                                             unmarshal_text! and marshal_text (encoding's protocols)
+#   fs.Var(value, name, usage)              fs.var!(value, name, usage)
+#   Value {String; Set(string) error}       Value { to_s; set!(s) -> ~Unit }
+#   IsBoolFlag() bool (boolFlag)            bool_flag? -> Bool (BoolFlag)
+#   Getter (Get() any)                      the value types' typed `get` (BoolValue.get -> Bool, ...)
+#   Flag {Name, Usage, Value, DefValue}     Flag (name, usage, value, def_value)
+#   fs.Lookup(name) *Flag                   fs.lookup(name) -> Flag?
+#   fs.Set(name, value) error               fs.set!(name, value) -> ~Unit<FlagError>
+#   fs.Parse(args) error / Parsed()         fs.parse!(args) -> ~Unit<FlagError> / parsed?
+#   fs.Args / Arg(i) / NArg / NFlag         args / arg(i) / narg / nflag
+#   fs.Visit / VisitAll(fn)                 visit { |f| } / visit_all { |f| } (sorted by name)
+#   fs.PrintDefaults()                      print_defaults (the text: defaults)
+#   fs.Usage = f; fs.Usage()                fs.set_usage!(f); fs.usage (the default's text: usage_text)
+#   fs.Output / SetOutput(w)                output -> io.Writer / set_output!(w)
+#   fs.Name / ErrorHandling / Init          name / error_handling / init!(name, handling)
+#   ContinueOnError, ExitOnError,           CONTINUE_ON_ERROR, EXIT_ON_ERROR, PANIC_ON_ERROR
+#     PanicOnError
+#   ErrHelp                                 FlagError.Help (carries the usage text)
+#   UnquoteUsage(flag)                      unquote_usage(flag) -> (Str, Str)
+#   CommandLine                             COMMAND_LINE (an Atomic[FlagSet]; command_line loads it)
+#   flag.Bool, Parse, Args, ... (the        bool, parse, args, ... (package functions on
+#     package functions)                      COMMAND_LINE)
+#   Usage (package var)                     usage() calls it; set_usage(f) replaces it (none: default)
 #
-#   fs = flag.new_set("prog")
-#   fs.int!("n", 5, "how many")          # Go: n := fs.Int("n", 5, "how many")
-#   fs.bool!("v", false, "verbose")
-#   fs.str!("name", "x", "who")
-#   fs.strs!("I", "include dir")         # repeated: -I a -I b collects both
-#   fs.var!("level", my_value, "level")  # custom flag.Value (set! returns the rejection reason or none)
-#   r = fs.parse!(args)                  # a ~Unit<FlagError>; `~r` propagates it
-#   n = fs.get_int("n")                  # *n
-#   rest = fs.args                       # fs.Args(): the non-flag arguments
+# Alexandrite extensions: `strs!(name, usage)` (a repeatable flag
+# collecting every occurrence); getters by name (get_bool, get_int,
+# get_uint, get_float, get_str, get_strs, get_duration, get_value; they panic
+# on an unknown name or another kind); `set?(name)` (was it given);
+# `names` (sorted); `args_of_program` (argv without argv[0]) and
+# `parse_program!`; the aliases `str!` / `float!` of string! / float64!.
 #
-# Getters (get_bool, get_int, get_float, get_str, get_strs, get_value) panic
-# on an unknown name or the wrong kind. `set?(name)` is Go's Visit (was the
-# flag given on the command line); `names` lists the flags sorted.
-#
-# Parsing follows Go: `-f`, `--f`, `-f=x`, `-f x` (not for bools: a bool
-# takes only `-f` or `-f=false`), `--` ends the flags and is consumed,
-# parsing stops at the first non-flag argument (or a lone `-`), integers
-# take Go's syntax (0x, 0o, 0b, underscores: strconv.parse_int base 0).
-# `-h` / `-help` (when not defined) fail with FlagError.Help carrying the
-# usage text. Unlike Go, parse! never prints: `fs.usage` returns the text.
-#
-# The program's own arguments: `flag.args_of_program` (argv without argv[0]),
-# `fs.parse_program!` = `fs.parse!(args_of_program)`.
-#
-# A FlagSet is a handle on shared state (GO-VS-RUBY D36): copies are the same
-# set, so a set passed to a function that defines flags or parses keeps the
-# result. Make one with `new_set` (the zero value has no state).
-#
-# Differences from Go: no Duration/Uint/Int64 flags (no time package yet; use
-# `var!` with your own Value), no global CommandLine set, no ContinueOnError
-# policy (parse! always returns the error and never exits or prints), no
-# per-flag Lookup struct. A custom Value is copied into the set (interface
-# values are sums), so read it back with `get_value(name)`.
+# Differences from Go:
+#  - No pointers: a flag's variable is an Atomic[T] (a handle shared by its
+#    copies), returned by the definers and taken by the _var! forms. A
+#    FlagSet is a handle too (its state is behind a Mutex), so copies of it,
+#    and COMMAND_LINE.load, are the same set. Make one with new_flag_set /
+#    new_set (no zero value). A custom Value is held by the set (interface
+#    values are sums) and set! runs on the set's copy: one with plain fields
+#    is updated there (read it back with get_value / lookup), one keeping
+#    its state in a one-element slice (D36) is updated everywhere. set! runs
+#    under the set's lock, so a Value must not call back into its own set.
+#  - Whether a Value is a BoolFlag, and the zero value whose to_s decides
+#    "(default ...)" in PrintDefaults, are found per Value type when it is
+#    defined (S6; `V.new.to_s`); Go asks at run time with reflection. So a
+#    Value type needs a zero value: one with an Atomic / Mutex field can't
+#    be passed to var! (port-issues #250). A to_s that panics on the zero
+#    value panics (Go recovers and lists it).
+#  - The built-in values store what Go's do on a bad value (0, or the
+#    limit on a range error) before failing.
+#  - Parse errors print as Go's do (message, then the usage, to output;
+#    stderr by default) and are FlagErrors with Go's texts; ExitOnError
+#    exits (2, or 0 for -help), PanicOnError panics with the message.
+#  - Set on an undefined flag remembers the caller's file:line (S9,
+#    #[track_caller]); defining that flag later panics as Go's does.
+#  - Visit / VisitAll take blocks; flags are visited sorted by name.
 
+import "io"
+import "os"
 import "strconv"
 import "strings"
+import "time"
 
-# The ways parsing fails (Go reports these as plain errors; ErrHelp is Help).
+# How parse! reacts to an error (Go's ErrorHandling).
+pub CONTINUE_ON_ERROR = 0
+pub EXIT_ON_ERROR = 1
+pub PANIC_ON_ERROR = 2
+
+# The ways parsing fails, with Go's messages.
 pub error FlagError {
   Unknown(name: Str)                        # flag provided but not defined
   Missing(name: Str)                        # flag needs an argument
-  BadValue(name: Str, value: Str, why: Str) # the value didn't parse / set failed
+  BadValue(name: Str, value: Str, why: Str) # the value didn't parse / set! failed
+  BadBool(name: Str, value: Str, why: Str)  # -b=x for a bool flag
+  BadBoolFlag(name: Str, why: Str)          # -b: set!("true") failed
   BadSyntax(arg: Str)                       # ---x, -=x
-  Help(usage: Str)                          # -h / -help: the usage text
+  NoSuchFlag(name: Str)                     # set! of an undefined flag
+  Help(usage: Str)                          # -h / -help (Go's ErrHelp); the usage text
 
   def message -> Str {
     case self {
       Unknown(n) => "flag provided but not defined: -#{n}"
       Missing(n) => "flag needs an argument: -#{n}"
       BadValue(n, v, why) => "invalid value #{strconv.quote(v)} for flag -#{n}: #{why}"
+      BadBool(n, v, why) => "invalid boolean value #{strconv.quote(v)} for -#{n}: #{why}"
+      BadBoolFlag(n, why) => "invalid boolean flag #{n}: #{why}"
       BadSyntax(a) => "bad flag syntax: #{a}"
-      Help(u) => u
+      NoSuchFlag(n) => "no such flag -#{n}"
+      Help(_u) => "flag: help requested"
     }
   }
 }
 
-# A custom flag value (Go's flag.Value). `set!` receives the text after the
-# flag and returns none, or the reason it was rejected (shown as
-# "invalid value ...: reason"). (Not `~Unit`: a fallible result doesn't
-# survive an interface call yet.)
-pub interface Value {
-  def set!(s: Str) -> Str?
-  def to_s -> Str
+# The errors of the built-in values (Go's errParse, errRange).
+pub error ValueError {
+  Parse
+  Range
+
+  def message -> Str {
+    case self {
+      Parse => "parse error"
+      Range => "value out of range"
+    }
+  }
 }
 
-K_BOOL = 0
-K_INT = 1
-K_FLOAT = 2
-K_STR = 3
-K_LIST = 4
-K_VAR = 5
+# A flag's value (Go's flag.Value): set! parses the text after the flag.
+pub interface Value {
+  def to_s -> Str
+  def set!(s: Str) -> ~Unit
+}
 
-struct Flag {
+# A Value whose bool_flag? is true takes no argument: `-name` means
+# `-name=true` (Go's IsBoolFlag).
+pub interface BoolFlag {
+  def bool_flag? -> Bool
+}
+
+# Go's numError: strconv's syntax / range errors as errParse / errRange.
+def num_err(e: Error) -> ValueError {
+  case e {
+    ErrRange(_, _) => ValueError.Range
+    _ => ValueError.Parse
+  }
+}
+
+def range?(e: Error) -> Bool {
+  case e {
+    ErrRange(_, _) => true
+    _ => false
+  }
+}
+
+# ----------------------------------------------------------------- values
+
+pub struct BoolValue {
+  p: Atomic[Bool]
+
+  pub def set!(s: Str) -> ~Unit {
+    r = strconv.parse_bool(s)
+    if e = r.err {
+      p.store(false) # Go stores ParseBool's result, false
+      fail num_err(e)
+    }
+    p.store(r.unwrap)
+  }
+  pub def to_s -> Str { p.load ? "true" : "false" }
+  pub def get -> Bool { p.load }
+  pub def bool_flag? -> Bool { true }
+}
+
+pub struct IntValue {
+  p: Atomic[Int]
+
+  pub def set!(s: Str) -> ~Unit {
+    r = strconv.parse_int(s, 0, 64)
+    if e = r.err {
+      # Go stores ParseInt's result: 0, or the limit on the input's side.
+      v = 0
+      if range?(e) {
+        v = s.start_with?("-") ? -9223372036854775807 - 1 : 9223372036854775807
+      }
+      p.store(v)
+      fail num_err(e)
+    }
+    p.store(r.unwrap)
+  }
+  pub def to_s -> Str { "#{p.load}" }
+  pub def get -> Int { p.load }
+}
+
+pub struct UintValue {
+  p: Atomic[U64]
+
+  pub def set!(s: Str) -> ~Unit {
+    r = strconv.parse_uint(s, 0, 64)
+    if e = r.err {
+      v: U64 = 0
+      v = 18446744073709551615 if range?(e)
+      p.store(v)
+      fail num_err(e)
+    }
+    p.store(r.unwrap)
+  }
+  pub def to_s -> Str { "#{p.load}" }
+  pub def get -> U64 { p.load }
+}
+
+pub struct StringValue {
+  p: Atomic[Str]
+
+  pub def set!(s: Str) -> ~Unit { p.store(s) }
+  pub def to_s -> Str { p.load }
+  pub def get -> Str { p.load }
+}
+
+pub struct FloatValue {
+  p: Atomic[Float]
+
+  pub def set!(s: Str) -> ~Unit {
+    r = strconv.parse_float(s)
+    if e = r.err {
+      # Go stores ParseFloat's result: 0, or an infinity on overflow.
+      v = 0.0
+      if range?(e) {
+        v = strconv.parse_float(s.start_with?("-") ? "-Inf" : "+Inf").unwrap
+      }
+      p.store(v)
+      fail num_err(e)
+    }
+    p.store(r.unwrap)
+  }
+  pub def to_s -> Str { strconv.format_float(p.load, "g", -1, 64) }
+  pub def get -> Float { p.load }
+}
+
+pub struct DurationValue {
+  p: Atomic[time.Duration]
+
+  pub def set!(s: Str) -> ~Unit {
+    r = time.parse_duration(s)
+    if r.err? {
+      p.store(time.Duration.new(0))
+      fail ValueError.Parse
+    }
+    p.store(r.unwrap)
+  }
+  pub def to_s -> Str { p.load.to_s }
+  pub def get -> time.Duration { p.load }
+}
+
+# The value of a strs! flag: every occurrence, in order.
+pub struct StrsValue {
+  p: Atomic[[Str]]
+
+  pub def set!(s: Str) -> ~Unit {
+    xs = p.load
+    xs << s
+    p.store(xs)
+  }
+  pub def to_s -> Str { p.load.size == 0 ? "" : "#{p.load}" }
+  pub def get -> [Str] { p.load }
+}
+
+pub struct FuncValue {
+  f: (Str) -> ~Unit
+
+  pub def set!(s: Str) -> ~Unit { ~f.call(s) }
+  pub def to_s -> Str { "" }
+}
+
+pub struct BoolFuncValue {
+  f: (Str) -> ~Unit
+
+  pub def set!(s: Str) -> ~Unit { ~f.call(s) }
+  pub def to_s -> Str { "" }
+  pub def bool_flag? -> Bool { true }
+}
+
+# marshal_text, whether or not it can fail.
+def marshal_of[T](v: T) -> ~[Byte] {
+  if T is PlainText {
+    v.marshal_text
+  } else {
+    v.~marshal_text
+  }
+}
+
+interface PlainText {
+  def marshal_text -> [Byte]
+}
+
+# TextVar's value: T parses itself (unmarshal_text!) and prints itself
+# (marshal_text), as encoding.TextUnmarshaler / TextMarshaler.
+pub struct TextValue[T] {
+  p: Atomic[T]
+
+  pub def set!(s: Str) -> ~Unit {
+    v = p.load
+    _r = v.~unmarshal_text!(s.bytes.to_a)
+    p.store(v)
+  }
+  pub def to_s -> Str {
+    r = marshal_of(p.load)
+    if b = r.ok {
+      return Str.from_bytes(b)
+    }
+    ""
+  }
+  pub def get -> T { p.load }
+}
+
+# ------------------------------------------------------------------- Flag
+
+# A defined flag (Go's Flag).
+pub struct Flag {
   name: Str
   usage: Str
-  kind: Int
-  defv: Str # the default, as text (for usage)
-  b: Bool
-  i: Int
-  f: Float
-  s: Str
-  list: [Str]
-  vidx: Int # index into the set's custom values
-  given: Bool
+  value: Value
+  def_value: Str
+  # The to_s of the value type's zero value (Go's isZeroValue).
+  zero: Str
+  # UnquoteUsage's name for the value's type ("int", "value", ...).
+  kind: Str
+  # The value's bool_flag?, or false.
+  is_bool: (Value) -> Bool
+
+  # Is it a bool flag (no argument needed)?
+  pub def bool_flag? -> Bool { is_bool.call(value) }
 }
 
-# The mutable part of a FlagSet, kept in a one-element slice (D36).
+def never_bool -> (Value) -> Bool {
+  ->(v: Value) -> Bool { false }
+}
+
+def always_bool -> (Value) -> Bool {
+  ->(v: Value) -> Bool { true }
+}
+
+# Go's UnquoteUsage: a `back-quoted` word in the usage is the value's name
+# (shown without the quotes); otherwise the name of the value's type, or
+# "" for a bool flag.
+pub def unquote_usage(fl: Flag) -> (Str, Str) {
+  u = fl.usage
+  i = 0
+  while i < u.size {
+    if u[i] == 96 {
+      j = i + 1
+      while j < u.size {
+        if u[j] == 96 {
+          name = u[(i + 1)...j]
+          return name, u[0...i] + name + u[(j + 1)...u.size]
+        }
+        j += 1
+      }
+      break
+    }
+    i += 1
+  }
+  return "", u if fl.bool_flag?
+  return fl.kind, u
+}
+
+# ---------------------------------------------------------------- FlagSet
+
 struct SetState {
-  flags: [Flag]
-  vals: [Value]
-  rest: [Str]
+  name: Str
+  handling: Int
   parsed: Bool
+  formal: Map[Str, Flag]
+  actual: Map[Str, Bool]
+  args: [Str]
+  output: io.Writer?
+  usage_fn: (() -> Unit)?
+  # COMMAND_LINE's usage calls the package-level usage (Go's commandLineUsage).
+  global_usage: Bool
+  undef: Map[Str, Str]
 }
 
+# A set of flags (Go's FlagSet). A handle: copies are the same set.
 pub struct FlagSet {
-  name: Str
-  cell: [SetState]
+  st: Mutex[SetState]
 
-  def flags -> [Flag] { cell[0].flags }
-  def vals -> [Value] { cell[0].vals }
-  def rest -> [Str] { cell[0].rest }
-  def parsed -> Bool { cell[0].parsed }
+  # The name given to new_flag_set / init!.
+  pub def name -> Str { st.lock { |s| s.name } }
+  pub def error_handling -> Int { st.lock { |s| s.handling } }
 
-  def add!(name: Str, usage: Str, kind: Int, defv: Str) -> Int {
-    if name.size == 0 || name[0] == 45 || name.contains("=") {
-      panic "flag: bad flag name #{strconv.quote(name)}"
+  # Where usage and error messages go (stderr unless set_output! was used).
+  pub def output -> io.Writer {
+    o = st.lock { |s| s.output }
+    if w = o {
+      return w
     }
-    for fl in flags {
-      panic "flag redefined: #{name}" if fl.name == name
+    e: io.Writer = os.stderr
+    e
+  }
+
+  pub def set_output!(w: io.Writer) {
+    st.lock { |s| s.output = w }
+  }
+
+  # Writes to the output inside the lock: the writer stays the one given
+  # (a copy taken out of the Mutex would not share a bytes.Buffer's state).
+  def write_out(msg: Str) {
+    st.lock { |s|
+      if w = s.output {
+        ww = w
+        _r = io.write_string(ww, msg)
+      } else {
+        _r2 = io.write_string(os.stderr, msg)
+      }
     }
-    self.cell[0].flags << Flag.new(name: name, usage: usage, kind: kind, defv: defv, b: false, i: 0, f: 0.0, s: "", list: [], vidx: -1, given: false)
-    flags.size - 1
   }
 
-  def find(name: Str) -> Int {
-    i = 0
-    while i < flags.size {
-      return i if flags[i].name == name
-      i += 1
+  # Go's Init: the name and error handling.
+  pub def init!(name: Str, handling: Int) {
+    st.lock { |s|
+      s.name = name
+      s.handling = handling
     }
-    -1
   }
 
-  def must(name: Str, kind: Int) -> Int {
-    i = find(name)
-    panic "flag: no flag named #{name}" if i < 0
-    panic "flag: -#{name} has a different type" if flags[i].kind != kind
-    i
+  # Replaces the usage function (Go's `fs.Usage = f`).
+  pub def set_usage!(f: () -> Unit) {
+    st.lock { |s|
+      s.usage_fn = f
+      s.global_usage = false
+    }
   }
 
-  # Defines a bool flag with a default.
-  pub def bool!(name: Str, value: Bool, usage: Str) {
-    i = add!(name, usage, K_BOOL, "#{value}")
-    self.cell[0].flags[i].b = value
+  # Calls the usage function (by default: usage_text to output).
+  pub def usage {
+    g, f = st.lock { |s| (s.global_usage, s.usage_fn) }
+    if g {
+      call_global_usage()
+    } elsif cb = f {
+      cb.call
+    } else {
+      default_usage
+    }
   }
 
-  pub def int!(name: Str, value: Int, usage: Str) {
-    i = add!(name, usage, K_INT, "#{value}")
-    self.cell[0].flags[i].i = value
+  def default_usage {
+    write_out(usage_text)
   }
 
-  pub def float!(name: Str, value: Float, usage: Str) {
-    i = add!(name, usage, K_FLOAT, "#{value}")
-    self.cell[0].flags[i].f = value
-  }
-
-  pub def str!(name: Str, value: Str, usage: Str) {
-    i = add!(name, usage, K_STR, value)
-    self.cell[0].flags[i].s = value
-  }
-
-  # A flag that may repeat; every occurrence is collected, in order.
-  pub def strs!(name: Str, usage: Str) {
-    add!(name, usage, K_LIST, "")
-  }
-
-  # A flag with a user-defined Value; its current to_s is the default.
-  pub def var!(name: Str, v: Value, usage: Str) {
-    i = add!(name, usage, K_VAR, v.to_s)
-    self.cell[0].vals << v
-    self.cell[0].flags[i].vidx = vals.size - 1
-  }
-
-  pub def get_bool(name: Str) -> Bool { flags[must(name, K_BOOL)].b }
-  pub def get_int(name: Str) -> Int { flags[must(name, K_INT)].i }
-  pub def get_float(name: Str) -> Float { flags[must(name, K_FLOAT)].f }
-  pub def get_str(name: Str) -> Str { flags[must(name, K_STR)].s }
-  pub def get_strs(name: Str) -> [Str] { flags[must(name, K_LIST)].list }
-  pub def get_value(name: Str) -> Value { vals[flags[must(name, K_VAR)].vidx] }
-
-  # Was the flag given on the command line (Go's Visit)?
-  pub def set?(name: Str) -> Bool {
-    i = find(name)
-    panic "flag: no flag named #{name}" if i < 0
-    flags[i].given
-  }
-
-  # The flag names, sorted.
-  pub def names -> [Str] {
-    out: [Str] = []
-    for fl in flags { out << fl.name }
-    sort_strs(out)
-  }
-
-  # The arguments left after the flags (Go's Args).
-  pub def args -> [Str] { rest }
-  pub def arg(i: Int) -> Str? {
-    return none if i < 0 || i >= rest.size
-    rest[i]
-  }
-  pub def nargs -> Int { rest.size }
-  pub def parsed? -> Bool { parsed }
-
-  # "Usage of prog:" and the defaults.
-  pub def usage -> Str {
-    head = name.size == 0 ? "Usage:\n" : "Usage of #{name}:\n"
+  # "Usage of name:" and the defaults (Go's defaultUsage output).
+  pub def usage_text -> Str {
+    n = name
+    head = n.size == 0 ? "Usage:\n" : "Usage of #{n}:\n"
     head + defaults
+  }
+
+  # Prints the defaults to output (Go's PrintDefaults).
+  pub def print_defaults {
+    write_out(defaults)
   }
 
   # The flag descriptions in Go's PrintDefaults format, sorted by name:
   #   "  -n int\n    \thow many (default 5)\n"
   pub def defaults -> Str {
     out = ""
-    for n in names {
-      fl = flags[find(n)]
+    for fl in sorted_flags {
       line = "  -" + fl.name
       ty, usage = unquote_usage(fl)
       line += " " + ty if ty.size > 0
@@ -216,12 +460,11 @@ pub struct FlagSet {
       } else {
         line += "\n    \t"
       }
-      line += usage.replace_all("\n", "\n    \t")
-      if !zero_default?(fl) {
-        if fl.kind == K_STR {
-          line += " (default #{strconv.quote(fl.defv)})"
-        } else {
-          line += " (default #{fl.defv})"
+      line += strings.replace_all(usage, "\n", "\n    \t")
+      if fl.def_value != fl.zero {
+        case fl.value {
+          StringValue(_s) => { line += " (default #{strconv.quote(fl.def_value)})" }
+          _ => { line += " (default #{fl.def_value})" }
         }
       }
       out += line + "\n"
@@ -229,188 +472,606 @@ pub struct FlagSet {
     out
   }
 
-  def set_flag!(i: Int, value: Str, has_value: Bool) -> FlagError? {
-    fl = flags[i]
-    nm = fl.name
-    k = fl.kind
-    if k == K_BOOL {
-      v = true
-      if has_value {
-        r = strconv.parse_bool(value)
+  def sorted_flags -> [Flag] {
+    fls = st.lock { |s| s.formal.values.to_a }
+    i = 1
+    while i < fls.size {
+      j = i
+      while j > 0 && fls[j - 1].name > fls[j].name {
+        t = fls[j]
+        fls[j] = fls[j - 1]
+        fls[j - 1] = t
+        j -= 1
+      }
+      i += 1
+    }
+    fls
+  }
+
+  # Calls f for every flag, sorted by name (Go's VisitAll).
+  pub def visit_all(f: (Flag) -> Unit) {
+    for fl in sorted_flags { f.call(fl) }
+  }
+
+  # Calls f for every flag that was set, sorted by name (Go's Visit).
+  pub def visit(f: (Flag) -> Unit) {
+    set = st.lock { |s| s.actual }
+    for fl in sorted_flags {
+      f.call(fl) if set.has_key?(fl.name)
+    }
+  }
+
+  # The named flag (Go's Lookup).
+  pub def lookup(name: Str) -> Flag? {
+    st.lock { |s| s.formal[name] }
+  }
+
+  # Sets the named flag (Go's Set).
+  #[track_caller]
+  pub def set!(name: Str, value: Str) -> ~Unit {
+    found, err = set_value!(name, value)
+    if !found {
+      site = caller_location
+      st.lock { |s| s.undef[name] = "#{site.file}:#{site.line}" }
+      fail FlagError.NoSuchFlag(name)
+    }
+    if e = err {
+      fail e
+    }
+  }
+
+  # Calls the named flag's set! on the set's own copy of its value (inside
+  # the lock, so a Value sharing state with its maker's copy updates it);
+  # marks the flag set when that succeeds. (found, the set! error).
+  def set_value!(name: Str, value: Str) -> (Bool, Error?) {
+    st.lock { |s|
+      found = false
+      err: Error? = none
+      if fl = s.formal[name] {
+        found = true
+        v = fl.value
+        r = v.set!(value)
+        s.formal[name] = Flag.new(name: fl.name, usage: fl.usage, value: v, def_value: fl.def_value, zero: fl.zero, kind: fl.kind, is_bool: fl.is_bool)
         if e = r.err {
-          return FlagError.BadValue(nm, value, num_why(e))
+          err = e
+        } else {
+          s.actual[name] = true
         }
-        v = r.unwrap
       }
-      self.cell[0].flags[i].b = v
-    } else if k == K_INT {
-      ri = strconv.parse_int(value, 0, 64)
-      if e2 = ri.err {
-        return FlagError.BadValue(nm, value, num_why(e2))
-      }
-      self.cell[0].flags[i].i = ri.unwrap
-    } else if k == K_FLOAT {
-      rf = strconv.parse_float(value)
-      if e3 = rf.err {
-        return FlagError.BadValue(nm, value, num_why(e3))
-      }
-      self.cell[0].flags[i].f = rf.unwrap
-    } else if k == K_STR {
-      self.cell[0].flags[i].s = value
-    } else if k == K_LIST {
-      self.cell[0].flags[i].list << value
-    } else {
-      if why = self.cell[0].vals[fl.vidx].set!(value) {
-        return FlagError.BadValue(nm, value, why)
-      }
+      (found, err)
     }
-    self.cell[0].flags[i].given = true
-    none
   }
 
-  # Parses args (without the program name). Stops at the first non-flag
-  # argument; the rest is available as `args`.
-  def run!(args: [Str]) -> FlagError? {
-    self.cell[0].parsed = true
-    p = 0
-    while p < args.size {
-      s = args[p]
-      break if s.size < 2 || s[0] != 45
-      minuses = 1
-      if s[1] == 45 {
-        minuses = 2
-        if s.size == 2 {
-          p += 1
-          break
+  # Prints msg (and a newline) to output; returns it (Go's sprintf).
+  def say(msg: Str) -> Str {
+    write_out(msg + "\n")
+    msg
+  }
+
+  # Defines a flag with a Value of the caller's type (Go's Var).
+  pub def var![V](value: V, name: Str, usage: Str) {
+    zero = V.new.to_s
+    is_bool = never_bool
+    if V is BoolFlag {
+      is_bool = ->(v: Value) -> Bool {
+        case v {
+          V(x) => x.bool_flag?
+          _ => false
         }
       }
-      fname = s[minuses...s.size]
-      if fname.size == 0 || fname[0] == 45 || fname[0] == 61 {
-        return FlagError.BadSyntax(s)
-      }
-      p += 1
-      value = ""
-      has_value = false
-      eq = fname.index("=")
-      if eq >= 0 {
-        value = fname[(eq + 1)...fname.size]
-        has_value = true
-        fname = fname[0...eq]
-      }
-      i = find(fname)
-      if i < 0 {
-        return FlagError.Help(usage) if fname == "help" || fname == "h"
-        return FlagError.Unknown(fname)
-      }
-      if flags[i].kind == K_BOOL {
-        e = set_flag!(i, value, has_value)
-        return e if e.present?
+    }
+    define!(value, name, usage, zero, "value", is_bool)
+  }
+
+  def define!(value: Value, name: Str, usage: Str, zero: Str, kind: Str, is_bool: (Value) -> Bool) {
+    if name.start_with?("-") {
+      panic say("flag #{strconv.quote(name)} begins with -")
+    } elsif name.include?("=") {
+      panic say("flag #{strconv.quote(name)} contains =")
+    }
+    fl = Flag.new(name: name, usage: usage, value: value, def_value: value.to_s, zero: zero, kind: kind, is_bool: is_bool)
+    n, there, pos = st.lock { |s| (s.name, s.formal.has_key?(name), s.undef[name] || "") }
+    if there {
+      msg = n == "" ? "flag redefined: #{name}" : "#{n} flag redefined: #{name}"
+      panic say(msg)
+    }
+    if pos != "" {
+      panic "flag #{name} set at #{pos} before being defined"
+    }
+    st.lock { |s| s.formal[name] = fl }
+  }
+
+  pub def bool_var!(p: Atomic[Bool], name: Str, value: Bool, usage: Str) {
+    p.store(value)
+    define!(BoolValue.new(p: p), name, usage, "false", "", always_bool)
+  }
+
+  # Defines a bool flag; returns its variable (Go's Bool).
+  pub def bool!(name: Str, value: Bool, usage: Str) -> Atomic[Bool] {
+    p = Atomic.new(value)
+    bool_var!(p, name, value, usage)
+    p
+  }
+
+  pub def int_var!(p: Atomic[Int], name: Str, value: Int, usage: Str) {
+    p.store(value)
+    define!(IntValue.new(p: p), name, usage, "0", "int", never_bool)
+  }
+
+  pub def int!(name: Str, value: Int, usage: Str) -> Atomic[Int] {
+    p = Atomic.new(value)
+    int_var!(p, name, value, usage)
+    p
+  }
+
+  # Go's Int64Var / Int64: the same as int (Int is 64 bits).
+  pub def int64_var!(p: Atomic[Int], name: Str, value: Int, usage: Str) { int_var!(p, name, value, usage) }
+  pub def int64!(name: Str, value: Int, usage: Str) -> Atomic[Int] { int!(name, value, usage) }
+
+  pub def uint_var!(p: Atomic[U64], name: Str, value: U64, usage: Str) {
+    p.store(value)
+    define!(UintValue.new(p: p), name, usage, "0", "uint", never_bool)
+  }
+
+  pub def uint!(name: Str, value: U64, usage: Str) -> Atomic[U64] {
+    p = Atomic.new(value)
+    uint_var!(p, name, value, usage)
+    p
+  }
+
+  # Go's Uint64Var / Uint64: the same as uint (U64).
+  pub def uint64_var!(p: Atomic[U64], name: Str, value: U64, usage: Str) { uint_var!(p, name, value, usage) }
+  pub def uint64!(name: Str, value: U64, usage: Str) -> Atomic[U64] { uint!(name, value, usage) }
+
+  pub def string_var!(p: Atomic[Str], name: Str, value: Str, usage: Str) {
+    p.store(value)
+    define!(StringValue.new(p: p), name, usage, "", "string", never_bool)
+  }
+
+  pub def string!(name: Str, value: Str, usage: Str) -> Atomic[Str] {
+    p = Atomic.new(value)
+    string_var!(p, name, value, usage)
+    p
+  }
+
+  pub def str!(name: Str, value: Str, usage: Str) -> Atomic[Str] { string!(name, value, usage) }
+
+  pub def float64_var!(p: Atomic[Float], name: Str, value: Float, usage: Str) {
+    p.store(value)
+    define!(FloatValue.new(p: p), name, usage, "0", "float", never_bool)
+  }
+
+  pub def float64!(name: Str, value: Float, usage: Str) -> Atomic[Float] {
+    p = Atomic.new(value)
+    float64_var!(p, name, value, usage)
+    p
+  }
+
+  pub def float!(name: Str, value: Float, usage: Str) -> Atomic[Float] { float64!(name, value, usage) }
+
+  pub def duration_var!(p: Atomic[time.Duration], name: Str, value: time.Duration, usage: Str) {
+    p.store(value)
+    define!(DurationValue.new(p: p), name, usage, "0s", "duration", never_bool)
+  }
+
+  pub def duration!(name: Str, value: time.Duration, usage: Str) -> Atomic[time.Duration] {
+    p = Atomic.new(value)
+    duration_var!(p, name, value, usage)
+    p
+  }
+
+  # A flag that may repeat; every occurrence is collected, in order.
+  pub def strs!(name: Str, usage: Str) -> Atomic[[Str]] {
+    e: [Str] = []
+    p = Atomic.new(e)
+    define!(StrsValue.new(p: p), name, usage, "", "string", never_bool)
+    p
+  }
+
+  # A flag whose every occurrence calls cb with its value (Go's Func).
+  pub def func!(name: Str, usage: Str, cb: (Str) -> ~Unit) {
+    define!(FuncValue.new(f: cb), name, usage, "", "value", never_bool)
+  }
+
+  # A flag taking no value whose every occurrence calls cb with "true" (or
+  # the -name=x text) (Go's BoolFunc).
+  pub def bool_func!(name: Str, usage: Str, cb: (Str) -> ~Unit) {
+    define!(BoolFuncValue.new(f: cb), name, usage, "", "", always_bool)
+  }
+
+  # A flag whose value parses itself (Go's TextVar): p gets value, then
+  # each occurrence's unmarshal_text!.
+  pub def text_var![T](p: Atomic[T], name: Str, value: T, usage: Str) {
+    p.store(value)
+    tv = TextValue[T].new(p: p)
+    zero = TextValue[T].new(p: Atomic.new(T.new)).to_s
+    define!(tv, name, usage, zero, "value", never_bool)
+  }
+
+  # -------------------------------------------------- reading it back
+
+  def must(name: Str) -> Flag {
+    fl = lookup(name) || panic "flag: no flag named #{name}"
+    fl
+  }
+
+  pub def get_bool(name: Str) -> Bool {
+    case must(name).value {
+      BoolValue(v) => v.get
+      _ => panic "flag: -#{name} has a different type"
+    }
+  }
+
+  pub def get_int(name: Str) -> Int {
+    case must(name).value {
+      IntValue(v) => v.get
+      _ => panic "flag: -#{name} has a different type"
+    }
+  }
+
+  pub def get_uint(name: Str) -> U64 {
+    case must(name).value {
+      UintValue(v) => v.get
+      _ => panic "flag: -#{name} has a different type"
+    }
+  }
+
+  pub def get_float(name: Str) -> Float {
+    case must(name).value {
+      FloatValue(v) => v.get
+      _ => panic "flag: -#{name} has a different type"
+    }
+  }
+
+  pub def get_str(name: Str) -> Str {
+    case must(name).value {
+      StringValue(v) => v.get
+      _ => panic "flag: -#{name} has a different type"
+    }
+  }
+
+  pub def get_strs(name: Str) -> [Str] {
+    case must(name).value {
+      StrsValue(v) => v.get
+      _ => panic "flag: -#{name} has a different type"
+    }
+  }
+
+  pub def get_duration(name: Str) -> time.Duration {
+    case must(name).value {
+      DurationValue(v) => v.get
+      _ => panic "flag: -#{name} has a different type"
+    }
+  }
+
+  pub def get_value(name: Str) -> Value { must(name).value }
+
+  # Was the flag given on the command line (or set!)?
+  pub def set?(name: Str) -> Bool {
+    must(name)
+    st.lock { |s| s.actual.has_key?(name) }
+  }
+
+  # The flag names, sorted.
+  pub def names -> [Str] { sorted_flags.map { it.name }.to_a }
+
+  # The number of flags set (Go's NFlag).
+  pub def nflag -> Int { st.lock { |s| s.actual.size } }
+
+  # The arguments left after the flags (Go's Args).
+  pub def args -> [Str] { st.lock { |s| s.args } }
+
+  # The i'th remaining argument; "" if there is none (Go's Arg).
+  pub def arg(i: Int) -> Str {
+    a = args
+    return "" if i < 0 || i >= a.size
+    a[i]
+  }
+
+  pub def narg -> Int { args.size }
+  pub def nargs -> Int { args.size }
+  pub def parsed? -> Bool { st.lock { |s| s.parsed } }
+
+  # ------------------------------------------------------------ parsing
+
+  # Prints msg and the usage; returns e (Go's failf).
+  def failf(e: FlagError) -> FlagError {
+    say(e.message)
+    usage
+    e
+  }
+
+  def take_arg -> Str? {
+    st.lock { |s|
+      if s.args.size == 0 {
+        none
       } else {
-        if !has_value && p < args.size {
-          value = args[p]
-          has_value = true
-          p += 1
-        }
-        return FlagError.Missing(fname) if !has_value
-        e = set_flag!(i, value, true)
-        return e if e.present?
+        a = s.args[0]
+        s.args = s.args[1...s.args.size]
+        a
       }
     }
-    self.cell[0].rest = args[p...args.size]
-    none
   }
 
-  # Parses args (without the program name). Stops at the first non-flag
-  # argument; the rest is available as `args`. Fails with a FlagError.
-  # (Propagate with a held value: `r = fs.parse!(a)` then `~r`; `fs.~parse!(a)`
-  # isn't accepted for `!` methods yet.)
-  pub def parse!(args: [Str]) -> ~Unit<FlagError> {
-    if e = run!(args) {
+  # Go's parseOne: (a flag was seen, the error).
+  def parse_one! -> (Bool, FlagError?) {
+    a = args
+    return false, none if a.size == 0
+    s = a[0]
+    return false, none if s.size < 2 || s[0] != 45
+    minuses = 1
+    if s[1] == 45 {
+      minuses = 2
+      if s.size == 2 {
+        take_arg
+        return false, none
+      }
+    }
+    name = s[minuses...s.size]
+    if name.size == 0 || name[0] == 45 || name[0] == 61 {
+      return false, failf(FlagError.BadSyntax(s))
+    }
+    take_arg
+    has_value = false
+    value = ""
+    i = 1
+    while i < name.size {
+      if name[i] == 61 {
+        value = name[(i + 1)...name.size]
+        has_value = true
+        name = name[0...i]
+        break
+      }
+      i += 1
+    }
+    fo = lookup(name)
+    if fo.none? {
+      if name == "help" || name == "h" {
+        usage
+        return false, FlagError.Help(usage_text)
+      }
+      return false, failf(FlagError.Unknown(name))
+    }
+    fl = fo.unwrap
+    if fl.bool_flag? {
+      if has_value {
+        if e = set_value!(name, value)[1] {
+          return false, failf(FlagError.BadBool(name, value, e.message))
+        }
+      } else {
+        if e = set_value!(name, "true")[1] {
+          return false, failf(FlagError.BadBoolFlag(name, e.message))
+        }
+      }
+    } else {
+      if !has_value {
+        if nx = take_arg {
+          value = nx
+          has_value = true
+        }
+      }
+      return false, failf(FlagError.Missing(name)) if !has_value
+      if e = set_value!(name, value)[1] {
+        return false, failf(FlagError.BadValue(name, value, e.message))
+      }
+    }
+    return true, none
+  }
+
+  # Parses args (without the program name), stopping at the first non-flag
+  # argument (or after "--"); the rest is `args`. On an error: prints it and
+  # the usage, then returns it (CONTINUE_ON_ERROR), exits (EXIT_ON_ERROR:
+  # 2, or 0 for -help) or panics (PANIC_ON_ERROR).
+  pub def parse!(arguments: [Str]) -> ~Unit<FlagError> {
+    st.lock { |s|
+      s.parsed = true
+      s.args = arguments
+    }
+    loop {
+      seen, err = parse_one!
+      next if seen
+      e = err || break
+      h = error_handling
+      if h == EXIT_ON_ERROR {
+        case e {
+          Help(_u) => os.exit(0)
+          _ => os.exit(2)
+        }
+      } elsif h == PANIC_ON_ERROR {
+        panic e.message
+      }
       fail e
     }
   }
 
   # Parses the program's own arguments.
   pub def parse_program! -> ~Unit<FlagError> {
-    if e = run!(args_of_program) {
-      fail e
-    }
+    r = parse!(args_of_program)
+    ~r
   }
 }
 
-# A new, empty set. `name` is shown in the usage header.
-pub def new_set(name: Str) -> FlagSet {
-  cell: [SetState] = [SetState.new(flags: [], vals: [], rest: [], parsed: false)]
-  FlagSet.new(name: name, cell: cell)
+# A new, empty set (Go's NewFlagSet). `name` is shown in the usage and
+# error messages.
+pub def new_flag_set(name: Str, handling: Int) -> FlagSet {
+  FlagSet.new(st: Mutex.new(SetState.new(name: name, handling: handling, parsed: false, formal: {}, actual: {}, args: [], output: none, usage_fn: none, global_usage: false, undef: {})))
 }
 
-extern def alx_argc -> Int
-extern def alx_argv(i: Int) -> Ptr
+# new_flag_set(name, CONTINUE_ON_ERROR).
+pub def new_set(name: Str) -> FlagSet { new_flag_set(name, CONTINUE_ON_ERROR) }
 
 # The program's arguments, without argv[0].
 pub def args_of_program -> [Str] {
-  out: [Str] = []
-  i = 1
-  n = alx_argc
-  while i < n {
-    out << Str.from_cstr(alx_argv(i))
-    i += 1
-  }
-  out
+  a = os.args
+  return a if a.size == 0
+  a[1...a.size]
 }
 
-# Go's errParse / errRange text for a failed number.
-def num_why(e: Error) -> Str {
-  case e {
-    ErrRange(_, _) => "value out of range"
-    _ => "parse error"
-  }
+def program_name -> Str {
+  a = os.args
+  a.size == 0 ? "" : a[0]
 }
 
-# Go's UnquoteUsage: a `back-quoted` word in the usage is the value's name
-# (and is shown without quotes); otherwise a name by kind.
-def unquote_usage(fl: Flag) -> (Str, Str) {
-  u = fl.usage
-  a = u.index("`")
-  if a >= 0 {
-    rest = u[(a + 1)...u.size]
-    b = rest.index("`")
-    if b >= 0 {
-      return rest[0...b], u[0...a] + rest[0...b] + rest[(b + 1)...rest.size]
-    }
-  }
-  ty = case fl.kind {
-    K_BOOL => ""
-    K_INT => "int"
-    K_FLOAT => "float"
-    K_STR => "string"
-    K_LIST => "string"
-    _ => "value"
-  }
-  return ty, u
+def new_command_line -> FlagSet {
+  fs = new_flag_set(program_name, EXIT_ON_ERROR)
+  fs.st.lock { |s| s.global_usage = true }
+  fs
 }
 
-def zero_default?(fl: Flag) -> Bool {
-  case fl.kind {
-    K_BOOL => fl.defv == "false"
-    K_INT => fl.defv == "0"
-    K_FLOAT => fl.defv == "0"
-    _ => fl.defv == ""
+# ------------------------------------------------------------ CommandLine
+
+# The program's flag set (Go's CommandLine), parsed by `parse` from
+# os.args. Replace it with COMMAND_LINE.store(new_flag_set(...)).
+pub COMMAND_LINE = Atomic.new(new_command_line)
+
+USAGE = Atomic[(() -> Unit)?].new(none)
+
+pub def command_line -> FlagSet { COMMAND_LINE.load }
+
+# The package's usage function (Go's Usage): by default "Usage of
+# <program>:" and COMMAND_LINE's defaults, to its output.
+pub def usage { call_global_usage() }
+
+def call_global_usage {
+  if f = USAGE.load {
+    f.call
+  } else {
+    cl = COMMAND_LINE.load
+    cl.write_out("Usage of #{program_name}:\n")
+    cl.print_defaults
   }
 }
 
-def sort_strs(xs: [Str]) -> [Str] {
-  out = xs
-  i = 1
-  while i < out.size {
-    j = i
-    while j > 0 && out[j - 1] > out[j] {
-      t = out[j]
-      out[j] = out[j - 1]
-      out[j - 1] = t
-      j -= 1
-    }
-    i += 1
-  }
-  out
+# Replaces the package's usage function (Go's `flag.Usage = f`); none
+# restores the default.
+pub def set_usage(f: (() -> Unit)?) { USAGE.store(f) }
+
+# Parses os.args[1...] into COMMAND_LINE (Go's Parse); on an error it exits
+# (COMMAND_LINE's EXIT_ON_ERROR).
+pub def parse {
+  fs = COMMAND_LINE.load
+  r = fs.parse!(args_of_program)
+  _ok = r.ok?
+}
+
+pub def parsed? -> Bool { COMMAND_LINE.load.parsed? }
+pub def args -> [Str] { COMMAND_LINE.load.args }
+pub def arg(i: Int) -> Str { COMMAND_LINE.load.arg(i) }
+pub def narg -> Int { COMMAND_LINE.load.narg }
+pub def nflag -> Int { COMMAND_LINE.load.nflag }
+pub def lookup(name: Str) -> Flag? { COMMAND_LINE.load.lookup(name) }
+pub def print_defaults { COMMAND_LINE.load.print_defaults }
+pub def visit(f: (Flag) -> Unit) { COMMAND_LINE.load.visit(f) }
+pub def visit_all(f: (Flag) -> Unit) { COMMAND_LINE.load.visit_all(f) }
+
+#[track_caller]
+pub def set(name: Str, value: Str) -> ~Unit {
+  fs = COMMAND_LINE.load
+  r = fs.set!(name, value)
+  ~r
+}
+
+pub def var[V](value: V, name: Str, usage: Str) {
+  fs = COMMAND_LINE.load
+  fs.var!(value, name, usage)
+}
+
+pub def bool(name: Str, value: Bool, usage: Str) -> Atomic[Bool] {
+  fs = COMMAND_LINE.load
+  fs.bool!(name, value, usage)
+}
+
+pub def bool_var(p: Atomic[Bool], name: Str, value: Bool, usage: Str) {
+  fs = COMMAND_LINE.load
+  fs.bool_var!(p, name, value, usage)
+}
+
+pub def int(name: Str, value: Int, usage: Str) -> Atomic[Int] {
+  fs = COMMAND_LINE.load
+  fs.int!(name, value, usage)
+}
+
+pub def int_var(p: Atomic[Int], name: Str, value: Int, usage: Str) {
+  fs = COMMAND_LINE.load
+  fs.int_var!(p, name, value, usage)
+}
+
+pub def int64(name: Str, value: Int, usage: Str) -> Atomic[Int] {
+  fs = COMMAND_LINE.load
+  fs.int64!(name, value, usage)
+}
+
+pub def int64_var(p: Atomic[Int], name: Str, value: Int, usage: Str) {
+  fs = COMMAND_LINE.load
+  fs.int64_var!(p, name, value, usage)
+}
+
+pub def uint(name: Str, value: U64, usage: Str) -> Atomic[U64] {
+  fs = COMMAND_LINE.load
+  fs.uint!(name, value, usage)
+}
+
+pub def uint_var(p: Atomic[U64], name: Str, value: U64, usage: Str) {
+  fs = COMMAND_LINE.load
+  fs.uint_var!(p, name, value, usage)
+}
+
+pub def uint64(name: Str, value: U64, usage: Str) -> Atomic[U64] {
+  fs = COMMAND_LINE.load
+  fs.uint64!(name, value, usage)
+}
+
+pub def uint64_var(p: Atomic[U64], name: Str, value: U64, usage: Str) {
+  fs = COMMAND_LINE.load
+  fs.uint64_var!(p, name, value, usage)
+}
+
+pub def string(name: Str, value: Str, usage: Str) -> Atomic[Str] {
+  fs = COMMAND_LINE.load
+  fs.string!(name, value, usage)
+}
+
+pub def string_var(p: Atomic[Str], name: Str, value: Str, usage: Str) {
+  fs = COMMAND_LINE.load
+  fs.string_var!(p, name, value, usage)
+}
+
+pub def float64(name: Str, value: Float, usage: Str) -> Atomic[Float] {
+  fs = COMMAND_LINE.load
+  fs.float64!(name, value, usage)
+}
+
+pub def float64_var(p: Atomic[Float], name: Str, value: Float, usage: Str) {
+  fs = COMMAND_LINE.load
+  fs.float64_var!(p, name, value, usage)
+}
+
+pub def duration(name: Str, value: time.Duration, usage: Str) -> Atomic[time.Duration] {
+  fs = COMMAND_LINE.load
+  fs.duration!(name, value, usage)
+}
+
+pub def duration_var(p: Atomic[time.Duration], name: Str, value: time.Duration, usage: Str) {
+  fs = COMMAND_LINE.load
+  fs.duration_var!(p, name, value, usage)
+}
+
+pub def strs(name: Str, usage: Str) -> Atomic[[Str]] {
+  fs = COMMAND_LINE.load
+  fs.strs!(name, usage)
+}
+
+pub def func(name: Str, usage: Str, cb: (Str) -> ~Unit) {
+  fs = COMMAND_LINE.load
+  fs.func!(name, usage, cb)
+}
+
+pub def bool_func(name: Str, usage: Str, cb: (Str) -> ~Unit) {
+  fs = COMMAND_LINE.load
+  fs.bool_func!(name, usage, cb)
+}
+
+pub def text_var[T](p: Atomic[T], name: Str, value: T, usage: Str) {
+  fs = COMMAND_LINE.load
+  fs.text_var!(p, name, value, usage)
 }

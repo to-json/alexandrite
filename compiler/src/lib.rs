@@ -7,6 +7,7 @@ pub mod ast;
 pub mod capture;
 pub mod cgen;
 pub mod check;
+pub mod check_json;
 pub mod consts;
 pub mod derive;
 pub mod derive_asn1;

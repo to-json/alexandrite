@@ -1,0 +1,1152 @@
+#![test(external)]
+# Go's time_test.go (package time_test). The local zone is US Pacific, as in Go's
+# tests (force_us_pacific_for_testing); importing time/tzdata makes the zones load
+# without a system database (Go's tests read $GOROOT/lib/time/zoneinfo.zip).
+# The tables at the end were extracted from Go's file by a scratch Go program.
+#
+# Not translated, and why:
+#   - TestTimeGob / TestTimeJSON go through encoding/gob and encoding/json, which
+#     take Time by reflection in Go; here they test gob_encode / gob_decode! and
+#     marshal_json / unmarshal_json! directly (the same bytes).
+#   - TestCountMallocs, TestUnmarshalTextAllocations: allocation counting
+#     (testing.AllocsPerRun) doesn't exist.
+#   - TestLocationRace: resets Go's sync.Once for the local zone; the local zone
+#     isn't loaded lazily here (it is set_local's or the C library's).
+#   - TestDefaultLoc's "== Time{}" row: Go compares struct fields (loc nil vs
+#     &utcLoc); alx's == on Times compares instants, so it is Equal's row.
+#   - Benchmarks are translated as `bench` blocks for the common paths only.
+import "time"
+import _ "time/tzdata"
+import "math/big"
+import "strings"
+
+test "TestZeroTime" {
+  zero = time.Time.new()
+  year, month, day = zero.date
+  hour, min, sec = zero.clock
+  assert_eq [year, month, day, hour, min, sec], [1, time.JANUARY, 1, 0, 0, 0]
+  assert_eq zero.nanosecond, 0
+  assert_eq zero.year_day, 1
+  assert_eq zero.weekday, time.MONDAY
+}
+
+test "TestZoneData" {
+  pacific()
+  _, off = time.now().zone_info
+  assert off == -8 * 60 * 60 || off == -7 * 60 * 60, "US Pacific: offset #{off}"
+}
+
+# (seconds, year, month, day, hour, minute, second, nanosecond, weekday, offset, zone)
+def utctests -> [(Int, [Int], Str)] {
+  [
+    (0, [1970, 1, 1, 0, 0, 0, 0, 4, 0], "UTC"),
+    (1221681866, [2008, 9, 17, 20, 4, 26, 0, 3, 0], "UTC"),
+    (-1221681866, [1931, 4, 16, 3, 55, 34, 0, 4, 0], "UTC"),
+    (-11644473600, [1601, 1, 1, 0, 0, 0, 0, 1, 0], "UTC"),
+    (599529660, [1988, 12, 31, 0, 1, 0, 0, 6, 0], "UTC"),
+    (978220860, [2000, 12, 31, 0, 1, 0, 0, 0, 0], "UTC"),
+  ]
+}
+
+def nanoutctests -> [(Int, [Int], Str)] {
+  [
+    (0, [1970, 1, 1, 0, 0, 0, 100000000, 4, 0], "UTC"),
+    (1221681866, [2008, 9, 17, 20, 4, 26, 200000000, 3, 0], "UTC"),
+  ]
+}
+
+def localtests -> [(Int, [Int], Str)] {
+  [
+    (0, [1969, 12, 31, 16, 0, 0, 0, 3, -8 * 60 * 60], "PST"),
+    (1221681866, [2008, 9, 17, 13, 4, 26, 0, 3, -7 * 60 * 60], "PDT"),
+    (2159200800, [2038, 6, 3, 11, 0, 0, 0, 4, -7 * 60 * 60], "PDT"),
+    (2152173599, [2038, 3, 14, 1, 59, 59, 0, 0, -8 * 60 * 60], "PST"),
+    (2152173600, [2038, 3, 14, 3, 0, 0, 0, 0, -7 * 60 * 60], "PDT"),
+    (2152173601, [2038, 3, 14, 3, 0, 1, 0, 0, -7 * 60 * 60], "PDT"),
+    (2172733199, [2038, 11, 7, 1, 59, 59, 0, 0, -7 * 60 * 60], "PDT"),
+    (2172733200, [2038, 11, 7, 1, 0, 0, 0, 0, -8 * 60 * 60], "PST"),
+    (2172733201, [2038, 11, 7, 1, 0, 1, 0, 0, -8 * 60 * 60], "PST"),
+  ]
+}
+
+def nanolocaltests -> [(Int, [Int], Str)] {
+  [
+    (0, [1969, 12, 31, 16, 0, 0, 100000000, 3, -8 * 60 * 60], "PST"),
+    (1221681866, [2008, 9, 17, 13, 4, 26, 300000000, 3, -7 * 60 * 60], "PDT"),
+  ]
+}
+
+# Go's same(): the aggregates and the single fields agree with the golden ones.
+#[track_caller]
+def same(t: time.Time, g: [Int], zone: Str) {
+  year, month, day = t.date
+  hour, min, sec = t.clock
+  name, offset = t.zone_info
+  assert_eq [year, month, day, hour, min, sec, offset], [g[0], g[1], g[2], g[3], g[4], g[5], g[8]]
+  assert_eq name, zone
+  assert_eq [t.year, t.month, t.day, t.hour, t.minute, t.second, t.nanosecond, t.weekday], [g[0], g[1], g[2], g[3], g[4], g[5], g[6], g[7]]
+}
+
+test "TestUnixUTC" {
+  for tt in utctests() {
+    tm = time.unix(tt[0], 0).utc
+    assert_eq tm.unix, tt[0]
+    same(tm, tt[1], tt[2])
+  }
+}
+
+test "TestUnixNanoUTC" {
+  for tt in nanoutctests() {
+    nsec = tt[0] * 1000000000 + tt[1][6]
+    tm = time.unix(0, nsec).utc
+    assert_eq tm.unix * 1000000000 + tm.nanosecond, nsec
+    same(tm, tt[1], tt[2])
+  }
+}
+
+test "TestUnix" {
+  pacific()
+  for tt in localtests() {
+    tm = time.unix(tt[0], 0)
+    assert_eq tm.unix, tt[0]
+    same(tm, tt[1], tt[2])
+  }
+}
+
+test "TestUnixNano" {
+  pacific()
+  for tt in nanolocaltests() {
+    nsec = tt[0] * 1000000000 + tt[1][6]
+    tm = time.unix(0, nsec)
+    assert_eq tm.unix * 1000000000 + tm.nanosecond, nsec
+    same(tm, tt[1], tt[2])
+  }
+}
+
+test "TestUnixUTCAndBack" {
+  x = 7
+  for i in 0...20000 {
+    x = mix(x)
+    sec = i < 10000 ? x >> 32 : x
+    assert_eq time.unix(sec, 0).utc.unix, sec
+  }
+}
+
+test "TestUnixNanoUTCAndBack" {
+  x = 11
+  for i in 0...20000 {
+    x = mix(x)
+    nsec = i < 10000 ? x >> 32 : x
+    t = time.unix(0, nsec).utc
+    assert_eq t.unix *% 1000000000 +% t.nanosecond, nsec
+  }
+}
+
+test "TestUnixMilli" {
+  pacific()
+  x = 13
+  for _i in 0...10000 {
+    x = mix(x)
+    assert_eq time.unix_milli(x).unix_milli, x
+  }
+}
+
+test "TestUnixMicro" {
+  pacific()
+  x = 17
+  for _i in 0...10000 {
+    x = mix(x)
+    assert_eq time.unix_micro(x).unix_micro, x
+  }
+}
+
+# Go's unixToZero: seconds from year 1 to 1970 by Go's arithmetic.
+UNIX_TO_ZERO = -978307200 + 63113904000
+
+# t - d * floor(t / d) for t = sec * 1e9 + nsec nanoseconds since year 1 (math/big).
+def big_rem(sec: Int, nsec: Int, d: Int) -> Int {
+  bt = big.new_int(0)
+  bt.mul!(big.new_int(sec), big.new_int(1000000000))
+  bt.add!(bt, big.new_int(nsec))
+  bq = big.new_int(0)
+  _, br = bq.div_mod!(bt, big.new_int(d))
+  br.int64
+}
+
+# Go's testOne in TestTruncateRound.
+def truncate_round_one(ti: Int, tns: Int, di: Int) -> Bool {
+  t0 = time.unix(ti, tns).utc
+  d = di
+  d = 0 - d if d < 0 && d != -9223372036854775808
+  d = 1 if d <= 0
+  r = big_rem(t0.unix + UNIX_TO_ZERO, t0.nanosecond, d)
+  t1 = t0.add(time.duration(0 - r))
+  trunc = t0.truncate(time.duration(d))
+  if trunc != t1 {
+    assert false, "#{t0.format(time.RFC3339_NANO)}.truncate(#{d}) = #{trunc.format(time.RFC3339_NANO)}, want #{t1.format(time.RFC3339_NANO)}"
+    return false
+  }
+  t1 = t1.add(time.duration(d)) if r > d / 2 || r + r == d
+  rnd = t0.round(time.duration(d))
+  if rnd != t1 {
+    assert false, "#{t0.format(time.RFC3339_NANO)}.round(#{d}) = #{rnd.format(time.RFC3339_NANO)}, want #{t1.format(time.RFC3339_NANO)}"
+    return false
+  }
+  true
+}
+
+test "TestTruncateRound" {
+  manual = [
+    (time.date(-1, 1, 1, 12, 15, 30, 500000000, time.utc()), 3),
+    (time.date(-1, 1, 1, 12, 15, 31, 500000000, time.utc()), 3),
+    (time.date(2012, 1, 1, 12, 15, 30, 500000000, time.utc()), 1000000000),
+    (time.date(2012, 1, 1, 12, 15, 31, 500000000, time.utc()), 1000000000),
+    (time.unix(-19012425939, 649146258), 7435029458905025217),
+  ]
+  for tt in manual {
+    truncate_round_one(tt[0].unix, tt[0].nanosecond, tt[1])
+  }
+  # exhaustive near 0
+  for i in 0...100 {
+    for j in 1...100 {
+      return if !truncate_round_one(UNIX_TO_ZERO, i, j)
+      return if !truncate_round_one(UNIX_TO_ZERO, 0 - i, j)
+    }
+  }
+  # random cases (Go's four quick.Checks, 2000 each)
+  x = 19
+  for _i in 0...2000 {
+    # divisors of a second
+    x = mix(x)
+    ti = x >> 1
+    x = mix(x)
+    tns = x >> 32
+    logdi = (x >> 8) & 2147483647
+    d = 1 << (logdi % 9)
+    for _k in 0...((logdi >> 16) % 9) { d *= 5 }
+    return if !truncate_round_one(ti, tns, d)
+    # multiples of a second
+    x = mix(x)
+    di = (x >> 32) * 1000000000
+    return if !truncate_round_one(ti, tns, di < 0 ? 0 - di : di)
+    # halfway cases
+    x = mix(x)
+    hns = x
+    x = mix(x)
+    hdi = x & 4294967294
+    hdi = 2 if hdi == 0
+    hns -= hns % hdi
+    hns = hns < 0 ? hns + hdi / 2 : hns - hdi / 2
+    return if !truncate_round_one(0, hns, hdi)
+    # full generality
+    x = mix(x)
+    return if !truncate_round_one(ti, tns, x)
+  }
+}
+
+test "TestISOWeek" {
+  for wt in iso_week_tests() {
+    y, w = time.date(wt[0], wt[1], wt[2], 0, 0, 0, 0, time.utc()).iso_week
+    assert_eq [y, w], [wt[3], wt[4]]
+  }
+  # the only real invariant: Jan 04 is in week 1
+  for year in 1950...2100 {
+    y, w = time.date(year, 1, 4, 0, 0, 0, 0, time.utc()).iso_week
+    assert_eq [y, w], [year, 1]
+  }
+}
+
+test "TestYearDay" {
+  locs = [
+    time.fixed_zone("UTC-8", -8 * 60 * 60), time.fixed_zone("UTC-4", -4 * 60 * 60), time.utc(),
+    time.fixed_zone("UTC+4", 4 * 60 * 60), time.fixed_zone("UTC+8", 8 * 60 * 60),
+  ]
+  i = 0
+  for loc in locs {
+    for ydt in year_day_tests() {
+      dt = time.date(ydt[0], ydt[1], ydt[2], 0, 0, 0, 0, loc)
+      assert_eq dt.year_day, ydt[3]
+      if ydt[0] >= 0 && ydt[0] <= 9999 {
+        off = (i - 2) * 4
+        f = sprintf("%04d-%02d-%02d %03d %+.2d00", ydt[0], ydt[1], ydt[2], ydt[3], off)
+        dt1 = ~time.parse("2006-01-02 002 -0700", f)
+        assert dt1.equal(dt), "parse #{f}"
+      }
+    }
+    i += 1
+  }
+}
+
+test "TestDurationString" {
+  for tt in duration_tests() {
+    d = time.duration(tt[1])
+    assert_eq d.to_s, tt[0]
+    assert_eq time.duration(0 - tt[1]).to_s, "-" + tt[0] if tt[1] > 0
+  }
+}
+
+test "TestDate" {
+  pacific()
+  for tt in date_tests() {
+    t = time.date(tt[0], tt[1], tt[2], tt[3], tt[4], tt[5], tt[6], time.local())
+    want = time.unix(tt[7], 0)
+    assert t.equal(want), "date(#{tt}) = #{t}, want #{want}"
+  }
+}
+
+test "TestAddDate" {
+  t0 = time.date(2011, 11, 18, 7, 56, 35, 0, time.utc())
+  t1 = time.date(2016, 3, 19, 7, 56, 35, 0, time.utc())
+  for at in add_date_tests() {
+    assert t0.add_date(at[0], at[1], at[2]).equal(t1), "add_date(#{at})"
+  }
+  t2 = time.date(1899, 12, 31, 0, 0, 0, 0, time.utc())
+  days = t2.unix / (24 * 60 * 60)
+  t3 = time.unix(0, 0).add_date(0, 0, days)
+  assert t2.equal(t3), "add_date(0, 0, #{days}) = #{t3}"
+}
+
+test "TestDaysIn" {
+  for tt in [[2011, 1, 31], [2011, 2, 28], [2012, 2, 29], [2011, 6, 30], [2011, 12, 31]] {
+    assert_eq time.days_in(tt[1], tt[0]), tt[2]
+  }
+}
+
+test "TestAddToExactSecond" {
+  t1 = time.now()
+  t2 = t1.add(time.second - time.duration(t1.nanosecond))
+  assert_eq t2.second, (t1.second + 1) % 60
+  assert_eq t2.nanosecond, 0
+}
+
+#[track_caller]
+def equal_time_and_zone(a: time.Time, b: time.Time) -> Bool {
+  a.equal(b) && a.zone_info == b.zone_info
+}
+
+def gob_tests -> [time.Time] {
+  [
+    time.date(0, 1, 2, 3, 4, 5, 6, time.utc()),
+    time.date(7, 8, 9, 10, 11, 12, 13, time.fixed_zone("", 0)),
+    time.unix(81985467080890095, 0x76543210),
+    time.Time.new(),
+    time.date(1, 2, 3, 4, 5, 6, 7, time.fixed_zone("", 32767 * 60)),
+    time.date(1, 2, 3, 4, 5, 6, 7, time.fixed_zone("", -32768 * 60)),
+  ]
+}
+
+test "TestTimeGob" {
+  pacific()
+  for tt in gob_tests() {
+    b = ~tt.gob_encode
+    got = time.Time.new()
+    ~got.gob_decode!(b)
+    assert equal_time_and_zone(got, tt), "#{got} want #{tt}"
+  }
+}
+
+test "TestInvalidTimeGob" {
+  tests = [
+    ([], "Time.unmarshal_binary: no data"),
+    ([0, 2, 3], "Time.unmarshal_binary: unsupported version"),
+    ([1, 2, 3], "Time.unmarshal_binary: invalid length"),
+  ]
+  for tt in tests {
+    b: [Byte] = tt[0].map { it.as_u8 }
+    ignored = time.Time.new()
+    r = ignored.gob_decode!(b)
+    assert_eq r.err?.message, tt[1]
+    r2 = ignored.unmarshal_binary!(b)
+    assert_eq r2.err?.message, tt[1]
+  }
+}
+
+test "TestNotGobEncodableTime" {
+  for off in [-1 * 60, -32769 * 60, 32768 * 60] {
+    t = time.date(0, 1, 2, 3, 4, 5, 6, time.fixed_zone("", off))
+    assert_eq t.gob_encode.err?.message, "Time.marshal_binary: unexpected zone offset"
+    assert_eq t.marshal_binary.err?.message, "Time.marshal_binary: unexpected zone offset"
+  }
+}
+
+test "TestTimeJSON" {
+  pacific()
+  tests = [
+    (time.date(9999, 4, 12, 23, 20, 50, 520 * 1000000, time.utc()), "\"9999-04-12T23:20:50.52Z\""),
+    (time.date(1996, 12, 19, 16, 39, 57, 0, time.local()), "\"1996-12-19T16:39:57-08:00\""),
+    (time.date(0, 1, 1, 0, 0, 0, 1, time.fixed_zone("", 1 * 60)), "\"0000-01-01T00:00:00.000000001+00:01\""),
+    (time.date(2020, 1, 1, 0, 0, 0, 0, time.fixed_zone("", 23 * 60 * 60 + 59 * 60)), "\"2020-01-01T00:00:00+23:59\""),
+  ]
+  for tt in tests {
+    b = ~tt[0].marshal_json
+    assert_eq Str.from_bytes(b), tt[1]
+    got = time.Time.new()
+    ~got.unmarshal_json!(b)
+    assert equal_time_and_zone(got, tt[0]), "#{got} want #{tt[0]}"
+  }
+}
+
+test "TestUnmarshalInvalidTimes" {
+  pacific()
+  tests = [
+    ("{}", "Time.unmarshal_json: input is not a JSON string"),
+    ("[]", "Time.unmarshal_json: input is not a JSON string"),
+    ("\"2000-01-01T1:12:34Z\"", "<nil>"),
+    ("\"2000-01-01T00:00:00,000Z\"", "<nil>"),
+    ("\"2000-01-01T00:00:00+24:00\"", "<nil>"),
+    ("\"2000-01-01T00:00:00+00:60\"", "<nil>"),
+    ("\"2000-01-01T00:00:00+123:45\"", "parsing time \"2000-01-01T00:00:00+123:45\" as \"2006-01-02T15:04:05Z07:00\": cannot parse \"+123:45\" as \"Z07:00\""),
+  ]
+  for tt in tests {
+    ts = time.Time.new()
+    r = ts.unmarshal_json!(tt[0].bytes)
+    assert_eq r.err?.message || "<nil>", tt[1]
+    if tt[0].start_with?("\"") && tt[0].end_with?("\"") {
+      r2 = ts.unmarshal_text!(strings.trim(tt[0], "\"").bytes)
+      assert_eq r2.err?.message || "<nil>", tt[1]
+    }
+  }
+}
+
+test "TestMarshalInvalidTimes" {
+  tests = [
+    (time.date(10000, 1, 1, 0, 0, 0, 0, time.utc()), "Time.marshal_json: year outside of range [0,9999]"),
+    (time.date(-998, 1, 1, 0, 0, 0, 0, time.utc()).add(time.duration(-1000000000)), "Time.marshal_json: year outside of range [0,9999]"),
+    (time.date(0, 1, 1, 0, 0, 0, 0, time.utc()).add(time.duration(-1)), "Time.marshal_json: year outside of range [0,9999]"),
+    (time.date(2020, 1, 1, 0, 0, 0, 0, time.fixed_zone("", 24 * 60 * 60)), "Time.marshal_json: timezone hour outside of range [0,23]"),
+    (time.date(2020, 1, 1, 0, 0, 0, 0, time.fixed_zone("", 123 * 60 * 60)), "Time.marshal_json: timezone hour outside of range [0,23]"),
+  ]
+  for tt in tests {
+    assert_eq tt[0].marshal_json.err?.message, tt[1]
+    assert_eq tt[0].marshal_text.err?.message, strings.replace_all(tt[1], "json", "text")
+    buf: [Byte] = []
+    assert_eq tt[0].append_text(buf).err?.message, strings.replace_all(tt[1], "marshal_json", "append_text")
+  }
+}
+
+test "TestParseDuration" {
+  for tc in parse_duration_tests() {
+    r = time.parse_duration(tc[0])
+    assert r.ok?, "parse_duration(#{tc[0]}): #{r.err?.message}"
+    assert_eq r.unwrap.nanoseconds, tc[1] if r.ok?
+  }
+}
+
+test "TestParseDurationErrors" {
+  for tc in parse_duration_error_tests() {
+    r = time.parse_duration(tc[0])
+    if e = r.err {
+      assert strings.contains(e.message, tc[1]), "parse_duration(#{tc[1]}) = #{e.message}"
+    } else {
+      assert false, "parse_duration(#{tc[1]}) didn't fail"
+    }
+  }
+}
+
+test "TestParseDurationRoundTrip" {
+  max0 = time.duration(9223372036854775807)
+  assert time.~parse_duration(max0.to_s) == max0
+  min0 = time.duration(-9223372036854775808)
+  assert time.~parse_duration(min0.to_s) == min0
+  x = 23
+  for _i in 0...100 {
+    x = mix(x)
+    d0 = time.millisecond * ((x >> 33) & 2147483647)
+    d1 = time.~parse_duration(d0.to_s)
+    assert d0 == d1, "round trip #{d0.nanoseconds} => #{d0} => #{d1.nanoseconds}"
+  }
+}
+
+test "TestLoadFixed" {
+  loc = ~time.load_location("Etc/GMT+1")
+  name, offset = time.now().in_zone(loc).zone_info
+  assert name == "GMT+1" || name == "-01", name
+  assert_eq offset, -1 * 60 * 60
+}
+
+test "TestSub" {
+  min = time.duration(-9223372036854775808)
+  max = time.duration(9223372036854775807)
+  hr = time.hour
+  zero = time.Time.new()
+  u = time.utc()
+  tests = [
+    (zero, zero, time.duration(0)),
+    (time.date(2009, 11, 23, 0, 0, 0, 1, u), time.date(2009, 11, 23, 0, 0, 0, 0, u), time.duration(1)),
+    (time.date(2009, 11, 23, 0, 0, 0, 0, u), time.date(2009, 11, 24, 0, 0, 0, 0, u), hr * -24),
+    (time.date(2009, 11, 24, 0, 0, 0, 0, u), time.date(2009, 11, 23, 0, 0, 0, 0, u), hr * 24),
+    (time.date(-2009, 11, 24, 0, 0, 0, 0, u), time.date(-2009, 11, 23, 0, 0, 0, 0, u), hr * 24),
+    (zero, time.date(2109, 11, 23, 0, 0, 0, 0, u), min),
+    (time.date(2109, 11, 23, 0, 0, 0, 0, u), zero, max),
+    (zero, time.date(-2109, 11, 23, 0, 0, 0, 0, u), max),
+    (time.date(-2109, 11, 23, 0, 0, 0, 0, u), zero, min),
+    (time.date(2290, 1, 1, 0, 0, 0, 0, u), time.date(2000, 1, 1, 0, 0, 0, 0, u), hr * (290 * 365 * 24) + hr * (71 * 24)),
+    (time.date(2300, 1, 1, 0, 0, 0, 0, u), time.date(2000, 1, 1, 0, 0, 0, 0, u), max),
+    (time.date(2000, 1, 1, 0, 0, 0, 0, u), time.date(2290, 1, 1, 0, 0, 0, 0, u), hr * (-290 * 365 * 24) - hr * (71 * 24)),
+    (time.date(2000, 1, 1, 0, 0, 0, 0, u), time.date(2300, 1, 1, 0, 0, 0, 0, u), min),
+    (time.date(2311, 11, 26, 2, 16, 47, 63535996, u), time.date(2019, 8, 16, 2, 29, 30, 268436582, u), time.duration(9223372036795099414)),
+    (time.min_mono_time(), time.max_mono_time(), min),
+    (time.max_mono_time(), time.min_mono_time(), max),
+  ]
+  i = 0
+  for st in tests {
+    assert_eq st[0].sub(st[1]).nanoseconds, st[2].nanoseconds
+    i += 1
+  }
+}
+
+test "TestDurationNanoseconds" {
+  for tt in [[-1000, -1000], [-1, -1], [1, 1], [1000, 1000]] {
+    assert_eq time.duration(tt[0]).nanoseconds, tt[1]
+  }
+}
+
+test "TestDurationMicroseconds" {
+  for tt in [[-1000, -1], [1000, 1]] {
+    assert_eq time.duration(tt[0]).microseconds, tt[1]
+  }
+}
+
+test "TestDurationMilliseconds" {
+  for tt in [[-1000000, -1], [1000000, 1]] {
+    assert_eq time.duration(tt[0]).milliseconds, tt[1]
+  }
+}
+
+test "TestDurationSeconds" {
+  assert_eq time.duration(300000000).seconds, 0.3
+}
+
+test "TestDurationMinutes" {
+  for tt in min_duration_tests() {
+    assert_eq time.duration(tt[0]).minutes, tt[1]
+  }
+}
+
+test "TestDurationHours" {
+  for tt in hour_duration_tests() {
+    assert_eq time.duration(tt[0]).hours, tt[1]
+  }
+}
+
+test "TestDurationTruncate" {
+  for tt in duration_truncate_tests() {
+    assert_eq time.duration(tt[0]).truncate(time.duration(tt[1])).nanoseconds, tt[2]
+  }
+}
+
+test "TestDurationRound" {
+  for tt in duration_round_tests() {
+    assert_eq time.duration(tt[0]).round(time.duration(tt[1])).nanoseconds, tt[2]
+  }
+}
+
+test "TestDurationAbs" {
+  for tt in duration_abs_tests() {
+    assert_eq time.duration(tt[0]).abs.nanoseconds, tt[1]
+  }
+}
+
+test "TestDefaultLoc" {
+  pacific()
+  t1 = time.Time.new()
+  t2 = time.Time.new().utc
+  assert_eq t1.after(t2), t2.after(t1)
+  assert_eq t1.before(t2), t2.before(t1)
+  assert_eq t1.equal(t2), t2.equal(t1)
+  assert_eq t1.compare(t2), t2.compare(t1)
+  assert_eq t1.is_zero, t2.is_zero
+  assert_eq t1.date, t2.date
+  assert_eq t1.year, t2.year
+  assert_eq t1.month, t2.month
+  assert_eq t1.day, t2.day
+  assert_eq t1.weekday, t2.weekday
+  assert_eq t1.iso_week, t2.iso_week
+  assert_eq t1.clock, t2.clock
+  assert_eq t1.hour, t2.hour
+  assert_eq t1.minute, t2.minute
+  assert_eq t1.second, t2.second
+  assert_eq t1.nanosecond, t2.nanosecond
+  assert_eq t1.year_day, t2.year_day
+  assert t1.add(time.hour).equal(t2.add(time.hour))
+  assert t1.sub(t2) == t2.sub(t1)
+  assert t1.add_date(1991, 9, 3) == t2.add_date(1991, 9, 3)
+  assert_eq t1.add_date(1991, 9, 3).zone_info, t2.add_date(1991, 9, 3).zone_info
+  assert t1.utc == t2.utc
+  assert t1.local == t2.local
+  assert_eq t1.local.zone_info, t2.local.zone_info
+  assert t1.in_zone(time.utc()) == t2.in_zone(time.utc())
+  assert_eq t1.zone_info, t2.zone_info
+  assert_eq t1.unix, t2.unix
+  assert_eq t1.unix_milli, t2.unix_milli
+  assert_eq t1.unix_micro, t2.unix_micro
+  b1: [Byte] = [0, 0, 0, 0]
+  b2: [Byte] = [0, 0, 0, 0]
+  assert_eq ~t1.append_binary(b1), ~t2.append_binary(b2)
+  assert_eq ~t1.marshal_binary, ~t2.marshal_binary
+  assert_eq ~t1.gob_encode, ~t2.gob_encode
+  assert_eq ~t1.marshal_json, ~t2.marshal_json
+  assert_eq ~t1.append_text(b1), ~t2.append_text(b2)
+  assert_eq ~t1.marshal_text, ~t2.marshal_text
+  assert t1.truncate(time.hour).equal(t2.truncate(time.hour))
+  assert t1.round(time.hour).equal(t2.round(time.hour))
+}
+
+bench "BenchmarkNow" { time.now() }
+bench "BenchmarkNowUnixNano" { time.now().unix_nano }
+bench "BenchmarkFormat" { time.unix(1265346057, 0).format("Mon Jan  2 15:04:05 2006") }
+bench "BenchmarkFormatRFC3339Nano" { time.unix(1265346057, 0).format("2006-01-02T15:04:05.999999999Z07:00") }
+bench "BenchmarkParse" { time.parse(time.ANSIC, "Mon Jan  2 15:04:05 2006") }
+bench "BenchmarkParseRFC3339TZ" { time.parse(time.RFC3339, "2020-08-22T11:27:43.123456789-02:00") }
+bench "BenchmarkParseDuration" { time.parse_duration("9007199254.740993ms") }
+bench "BenchmarkDateFunc" { time.date(2020, 8, 22, 11, 27, 43, 123456789, time.utc()) }
+
+test "TestMarshalBinaryZeroTime" {
+  t0 = time.Time.new()
+  enc = ~t0.marshal_binary
+  t1 = time.now()
+  ~t1.unmarshal_binary!(enc)
+  assert t1 == t0
+  assert_eq t1.zone_info, t0.zone_info
+  assert_eq t1.location.string, "UTC"
+}
+
+test "TestMarshalBinaryVersion2" {
+  t0 = ~time.parse(time.RFC3339, "1880-01-01T00:00:00Z")
+  loc = ~time.load_location("US/Eastern")
+  t1 = t0.in_zone(loc)
+  b = ~t1.marshal_binary
+  t2 = time.Time.new()
+  ~t2.unmarshal_binary!(b)
+  assert t0.equal(t1) && t1.equal(t2)
+}
+
+test "TestMarshalBinaryVersion2Bugfix" {
+  offset_sec = -5 * 3600 - 30 * 60 - 45
+  t1 = time.date(2024, 6, 15, 12, 0, 0, 0, time.fixed_zone("LMT", offset_sec))
+  b = ~t1.marshal_binary
+  t2 = time.Time.new()
+  ~t2.unmarshal_binary!(b)
+  _, o1 = t1.zone_info
+  _, o2 = t2.zone_info
+  assert_eq o2, o1
+}
+
+test "TestZeroMonthString" {
+  assert_eq time.month_name(0), "%!Month(0)"
+}
+
+test "TestWeekdayString" {
+  assert_eq time.weekday_name(time.TUESDAY), "Tuesday"
+  assert_eq time.weekday_name(14), "%!Weekday(14)"
+}
+
+test "TestReadFileLimit" {
+  msg = time.read_file_error("/dev/zero")
+  assert strings.contains(msg, "is too large"), msg
+}
+
+test "TestConcurrentTimerReset" {
+  timer = time.new_timer(time.hour)
+  tasks = (0...8).map { |i|
+    tm = timer
+    spawn {
+      for j in 0...1000 { tm.reset(time.hour + time.duration(i * j)) }
+    }
+  }
+  for t in tasks { t.wait }
+  timer.stop
+}
+
+test "TestConcurrentTimerResetStop" {
+  timer = time.new_timer(time.hour)
+  tasks = (0...8).map { |i|
+    tm = timer
+    spawn {
+      for j in 0...1000 { tm.reset(time.hour + time.duration(i * j)) }
+    }
+  }
+  stops = (0...8).map { |_i|
+    tm = timer
+    spawn { tm.stop }
+  }
+  for t in tasks { t.wait }
+  for t in stops { t.wait }
+  timer.stop
+}
+
+test "TestTimeIsDST" {
+  undo = time.disable_platform_sources()
+  defer { undo.call() }
+  with_dst = ~time.load_location("Australia/Sydney")
+  without_dst = ~time.load_location("Australia/Brisbane")
+  fixed = time.fixed_zone("FIXED_TIME", 12345)
+  u = time.utc()
+  tests = [
+    (time.date(2009, 1, 1, 12, 0, 0, 0, u), false),
+    (time.date(2009, 6, 1, 12, 0, 0, 0, u), false),
+    (time.date(2009, 1, 1, 12, 0, 0, 0, with_dst), true),
+    (time.date(2009, 6, 1, 12, 0, 0, 0, with_dst), false),
+    (time.date(2009, 1, 1, 12, 0, 0, 0, without_dst), false),
+    (time.date(2009, 6, 1, 12, 0, 0, 0, without_dst), false),
+    (time.date(2009, 1, 1, 12, 0, 0, 0, fixed), false),
+    (time.date(2009, 6, 1, 12, 0, 0, 0, fixed), false),
+  ]
+  for tt in tests {
+    assert_eq tt[0].is_dst, tt[1]
+  }
+}
+
+test "TestTimeAddSecOverflow" {
+  max = 9223372036854775807
+  ext = max - time.unix_to_internal() - 50
+  t = time.unix(ext, 0)
+  for i in 0...100 {
+    sec = t.unix
+    t = t.add(time.duration(i * 1000000000))
+    ns = t.unix
+    assert ns == sec + i || ns +% time.unix_to_internal() == max, "overflow at #{ns}"
+  }
+  t = time.not_mono_negative_time()
+  for k in 0...100 {
+    i = 0 - k
+    sec = t.unix
+    t = t.add(time.duration(i * 1000000000))
+    ns = t.unix
+    assert ns == sec +% i || ns +% time.unix_to_internal() == 0 - max, "overflow at #{ns}"
+  }
+}
+
+test "TestTimeWithZoneTransition" {
+  undo = time.disable_platform_sources()
+  defer { undo.call() }
+  loc = ~time.load_location("Asia/Shanghai")
+  u = time.utc()
+  tests = [
+    (time.date(1991, 4, 13, 17, 50, 0, 0, loc), time.date(1991, 4, 13, 9, 50, 0, 0, u)),
+    (time.date(1991, 4, 13, 18, 0, 0, 0, loc), time.date(1991, 4, 13, 10, 0, 0, 0, u)),
+    (time.date(1991, 4, 14, 1, 50, 0, 0, loc), time.date(1991, 4, 13, 17, 50, 0, 0, u)),
+    (time.date(1991, 4, 14, 3, 0, 0, 0, loc), time.date(1991, 4, 13, 18, 0, 0, 0, u)),
+    (time.date(1991, 9, 14, 16, 50, 0, 0, loc), time.date(1991, 9, 14, 7, 50, 0, 0, u)),
+    (time.date(1991, 9, 14, 17, 0, 0, 0, loc), time.date(1991, 9, 14, 8, 0, 0, 0, u)),
+    (time.date(1991, 9, 15, 0, 50, 0, 0, loc), time.date(1991, 9, 14, 15, 50, 0, 0, u)),
+    (time.date(1991, 9, 15, 2, 0, 0, 0, loc), time.date(1991, 9, 14, 18, 0, 0, 0, u)),
+  ]
+  for tt in tests {
+    assert tt[0].equal(tt[1]), "#{tt[0].format(time.RFC3339)} != #{tt[1].format(time.RFC3339)}"
+  }
+}
+
+test "TestZoneBounds" {
+  pacific()
+  undo = time.disable_platform_sources()
+  defer { undo.call() }
+  loc = ~time.load_location("Asia/Shanghai")
+  for tt in utctests() {
+    s, e = time.unix(tt[0], 0).utc.zone_bounds
+    assert s.is_zero && e.is_zero
+  }
+  s, e = time.date(-2147483648, 1, 1, 0, 0, 0, 0, loc).zone_bounds
+  assert s.is_zero && !e.is_zero
+  s, e = time.date(2147483647, 1, 1, 0, 0, 0, 0, loc).zone_bounds
+  assert !s.is_zero && e.is_zero
+  b1 = time.date(1990, 9, 16, 1, 0, 0, 0, loc)
+  b2 = time.date(1991, 4, 14, 3, 0, 0, 0, loc)
+  b3 = time.date(1991, 9, 15, 1, 0, 0, 0, loc)
+  z = time.Time.new()
+  lt = ->(sec: Int) -> time.Time { time.unix(sec, 0) }
+  tests = [
+    (time.date(1991, 4, 13, 17, 50, 0, 0, loc), b1, b2),
+    (time.date(1991, 4, 13, 18, 0, 0, 0, loc), b1, b2),
+    (time.date(1991, 4, 14, 1, 50, 0, 0, loc), b1, b2),
+    (b2, b2, b3),
+    (time.date(1991, 9, 14, 16, 50, 0, 0, loc), b2, b3),
+    (time.date(1991, 9, 14, 17, 0, 0, 0, loc), b2, b3),
+    (time.date(1991, 9, 15, 0, 50, 0, 0, loc), b2, b3),
+    (b3, b3, z),
+    (time.date(1991, 12, 15, 1, 50, 0, 0, loc), b3, z),
+    (time.date(1992, 4, 13, 17, 50, 0, 0, loc), b3, z),
+    (time.date(1992, 4, 13, 18, 0, 0, 0, loc), b3, z),
+    (time.date(1992, 4, 14, 1, 50, 0, 0, loc), b3, z),
+    (time.date(1992, 9, 14, 16, 50, 0, 0, loc), b3, z),
+    (time.date(1992, 9, 14, 17, 0, 0, 0, loc), b3, z),
+    (time.date(1992, 9, 15, 0, 50, 0, 0, loc), b3, z),
+    (lt.call(0), lt.call(-5756400), lt.call(9972000)),
+    (lt.call(1221681866), lt.call(1205056800), lt.call(1225616400)),
+    (lt.call(2152173599), lt.call(2145916800), lt.call(2152173600)),
+    (lt.call(2152173600), lt.call(2152173600), lt.call(2172733200)),
+    (lt.call(2152173601), lt.call(2152173600), lt.call(2172733200)),
+    (lt.call(2159200800), lt.call(2152173600), lt.call(2172733200)),
+    (lt.call(2172733199), lt.call(2152173600), lt.call(2172733200)),
+    (lt.call(2172733200), lt.call(2172733200), lt.call(2177452800)),
+  ]
+  i = 0
+  for tt in tests {
+    s2, e2 = tt[0].zone_bounds
+    assert s2.equal(tt[1]) && e2.equal(tt[2]), "##{i}: zone_bounds of #{tt[0]}: #{s2}, #{e2}, want #{tt[1]}, #{tt[2]}"
+    i += 1
+  }
+}
+
+# ---------------------------------------------------------------- Go's tables
+
+# (string, ns)
+def duration_tests -> [(Str, Int)] {
+  [
+    ("0s", 0),
+    ("1ns", 1),
+    ("1.1µs", 1100),
+    ("2.2ms", 2200000),
+    ("3.3s", 3300000000),
+    ("4m5s", 245000000000),
+    ("4m5.001s", 245001000000),
+    ("5h6m7.001s", 18367001000000),
+    ("8m0.000000001s", 480000000001),
+    ("2562047h47m16.854775807s", 9223372036854775807),
+    ("-2562047h47m16.854775808s", -9223372036854775808),
+  ]
+}
+
+# (year, month, day, hour, min, sec, nsec, unix); all in Local
+def date_tests -> [[Int]] {
+  [
+    [2011, 11, 6, 1, 0, 0, 0, 1320566400],
+    [2011, 11, 6, 1, 59, 59, 0, 1320569999],
+    [2011, 11, 6, 2, 0, 0, 0, 1320573600],
+    [2011, 3, 13, 1, 0, 0, 0, 1300006800],
+    [2011, 3, 13, 1, 59, 59, 0, 1300010399],
+    [2011, 3, 13, 3, 0, 0, 0, 1300010400],
+    [2011, 3, 13, 2, 30, 0, 0, 1300008600],
+    [2012, 12, 24, 0, 0, 0, 0, 1356336000],
+    [2011, 11, 18, 7, 56, 35, 0, 1321631795],
+    [2011, 11, 19, -17, 56, 35, 0, 1321631795],
+    [2011, 11, 17, 31, 56, 35, 0, 1321631795],
+    [2011, 11, 18, 6, 116, 35, 0, 1321631795],
+    [2011, 10, 49, 7, 56, 35, 0, 1321631795],
+    [2011, 11, 18, 7, 55, 95, 0, 1321631795],
+    [2011, 11, 18, 7, 56, 34, 1000000000, 1321631795],
+    [2011, 12, -12, 7, 56, 35, 0, 1321631795],
+    [2012, 1, -43, 7, 56, 35, 0, 1321631795],
+    [2012, -1, 18, 7, 56, 35, 0, 1321631795],
+    [2010, 23, 18, 7, 56, 35, 0, 1321631795],
+    [1970, 1, 15297, 7, 56, 35, 0, 1321631795],
+    [1970, 1, -25508, 0, 0, 0, 0, -2203948800],
+  ]
+}
+
+def add_date_tests -> [[Int]] {
+  [
+    [4, 4, 1],
+    [3, 16, 1],
+    [3, 15, 30],
+    [5, -6, -60],
+  ]
+}
+
+def parse_duration_tests -> [(Str, Int)] {
+  [
+    ("0", 0),
+    ("5s", 5000000000),
+    ("30s", 30000000000),
+    ("1478s", 1478000000000),
+    ("-5s", -5000000000),
+    ("+5s", 5000000000),
+    ("-0", 0),
+    ("+0", 0),
+    ("5.0s", 5000000000),
+    ("5.6s", 5600000000),
+    ("5.s", 5000000000),
+    (".5s", 500000000),
+    ("1.0s", 1000000000),
+    ("1.00s", 1000000000),
+    ("1.004s", 1004000000),
+    ("1.0040s", 1004000000),
+    ("100.00100s", 100001000000),
+    ("10ns", 10),
+    ("11us", 11000),
+    ("12µs", 12000),
+    ("12μs", 12000),
+    ("13ms", 13000000),
+    ("14s", 14000000000),
+    ("15m", 900000000000),
+    ("16h", 57600000000000),
+    ("3h30m", 12600000000000),
+    ("10.5s4m", 250500000000),
+    ("-2m3.4s", -123400000000),
+    ("1h2m3s4ms5us6ns", 3723004005006),
+    ("39h9m14.425s", 140954425000000),
+    ("52763797000ns", 52763797000),
+    ("0.3333333333333333333h", 1200000000000),
+    ("9007199254740993ns", 9007199254740993),
+    ("9223372036854775807ns", 9223372036854775807),
+    ("9223372036854775.807us", 9223372036854775807),
+    ("9223372036s854ms775us807ns", 9223372036854775807),
+    ("-9223372036854775808ns", -9223372036854775808),
+    ("-9223372036854775.808us", -9223372036854775808),
+    ("-9223372036s854ms775us808ns", -9223372036854775808),
+    ("-9223372036854775808ns", -9223372036854775808),
+    ("-2562047h47m16.854775808s", -9223372036854775808),
+    ("0.100000000000000000000h", 360000000000),
+    ("0.830103483285477580700h", 2988372539827),
+  ]
+}
+
+def parse_duration_error_tests -> [(Str, Str)] {
+  [
+    (Str.from_bytes([]), "\"\""),
+    (Str.from_bytes([51]), "\"3\""),
+    (Str.from_bytes([45]), "\"-\""),
+    (Str.from_bytes([115]), "\"s\""),
+    (Str.from_bytes([46]), "\".\""),
+    (Str.from_bytes([45, 46]), "\"-.\""),
+    (Str.from_bytes([46, 115]), "\".s\""),
+    (Str.from_bytes([43, 46, 115]), "\"+.s\""),
+    (Str.from_bytes([49, 100]), "\"1d\""),
+    (Str.from_bytes([133, 133]), "\"\\x85\\x85\""),
+    (Str.from_bytes([255, 102, 102]), "\"\\xffff\""),
+    (Str.from_bytes([104, 101, 108, 108, 111, 32, 255, 102, 102, 32, 119, 111, 114, 108, 100]), "\"hello \\xffff world\""),
+    (Str.from_bytes([239, 191, 189]), "\"\\xef\\xbf\\xbd\""),
+    (Str.from_bytes([239, 191, 189, 32, 104, 101, 108, 108, 111, 32, 239, 191, 189, 32, 119, 111, 114, 108, 100]), "\"\\xef\\xbf\\xbd hello \\xef\\xbf\\xbd world\""),
+    (Str.from_bytes([57, 50, 50, 51, 51, 55, 50, 48, 51, 54, 56, 53, 52, 55, 55, 53, 56, 49, 48, 110, 115]), "\"9223372036854775810ns\""),
+    (Str.from_bytes([57, 50, 50, 51, 51, 55, 50, 48, 51, 54, 56, 53, 52, 55, 55, 53, 56, 48, 56, 110, 115]), "\"9223372036854775808ns\""),
+    (Str.from_bytes([45, 57, 50, 50, 51, 51, 55, 50, 48, 51, 54, 56, 53, 52, 55, 55, 53, 56, 48, 57, 110, 115]), "\"-9223372036854775809ns\""),
+    (Str.from_bytes([57, 50, 50, 51, 51, 55, 50, 48, 51, 54, 56, 53, 52, 55, 55, 54, 117, 115]), "\"9223372036854776us\""),
+    (Str.from_bytes([51, 48, 48, 48, 48, 48, 48, 104]), "\"3000000h\""),
+    (Str.from_bytes([57, 50, 50, 51, 51, 55, 50, 48, 51, 54, 56, 53, 52, 55, 55, 53, 46, 56, 48, 56, 117, 115]), "\"9223372036854775.808us\""),
+    (Str.from_bytes([57, 50, 50, 51, 51, 55, 50, 48, 51, 54, 56, 53, 52, 109, 115, 55, 55, 53, 117, 115, 56, 48, 56, 110, 115]), "\"9223372036854ms775us808ns\""),
+  ]
+}
+
+def duration_truncate_tests -> [[Int]] {
+  [
+    [0, 1000000000, 0],
+    [60000000000, -7000000000, 60000000000],
+    [60000000000, 0, 60000000000],
+    [60000000000, 1, 60000000000],
+    [70000000000, 10000000000, 70000000000],
+    [130000000000, 60000000000, 120000000000],
+    [610000000000, 180000000000, 540000000000],
+    [70000000000, 70000000001, 0],
+    [70000000000, 3600000000000, 0],
+    [-60000000000, 1000000000, -60000000000],
+    [-600000000000, 180000000000, -540000000000],
+    [-600000000000, 3600000000000, 0],
+  ]
+}
+
+def duration_round_tests -> [[Int]] {
+  [
+    [0, 1000000000, 0],
+    [60000000000, -11000000000, 60000000000],
+    [60000000000, 0, 60000000000],
+    [60000000000, 1, 60000000000],
+    [120000000000, 60000000000, 120000000000],
+    [130000000000, 60000000000, 120000000000],
+    [150000000000, 60000000000, 180000000000],
+    [170000000000, 60000000000, 180000000000],
+    [-60000000000, 1, -60000000000],
+    [-120000000000, 60000000000, -120000000000],
+    [-130000000000, 60000000000, -120000000000],
+    [-150000000000, 60000000000, -180000000000],
+    [-170000000000, 60000000000, -180000000000],
+    [8000000000000000000, 3000000000000000000, 9000000000000000000],
+    [9000000000000000000, 5000000000000000000, 9223372036854775807],
+    [-8000000000000000000, 3000000000000000000, -9000000000000000000],
+    [-9000000000000000000, 5000000000000000000, -9223372036854775808],
+    [6917529027641081855, 6917529027641081856, 6917529027641081856],
+  ]
+}
+
+def duration_abs_tests -> [[Int]] {
+  [
+    [0, 0],
+    [1, 1],
+    [-1, 1],
+    [60000000000, 60000000000],
+    [-60000000000, 60000000000],
+    [-9223372036854775808, 9223372036854775807],
+    [-9223372036854775807, 9223372036854775807],
+    [-9223372036854775806, 9223372036854775806],
+    [9223372036854775807, 9223372036854775807],
+    [9223372036854775806, 9223372036854775806],
+  ]
+}
+
+def min_duration_tests -> [(Int, Float)] {
+  [
+    (-60000000000, -1),
+    (-1, -1.6666666666666667e-11),
+    (1, 1.6666666666666667e-11),
+    (60000000000, 1),
+    (3000, 5e-08),
+  ]
+}
+
+def hour_duration_tests -> [(Int, Float)] {
+  [
+    (-3600000000000, -1),
+    (-1, -2.777777777777778e-13),
+    (1, 2.777777777777778e-13),
+    (3600000000000, 1),
+    (36, 1e-11),
+  ]
+}
+
+# (year, month, day, iso year, iso week)
+def iso_week_tests -> [[Int]] {
+  [
+    [1981, 1, 1, 1981, 1],
+    [1982, 1, 1, 1981, 53],
+    [1983, 1, 1, 1982, 52],
+    [1984, 1, 1, 1983, 52],
+    [1985, 1, 1, 1985, 1],
+    [1986, 1, 1, 1986, 1],
+    [1987, 1, 1, 1987, 1],
+    [1988, 1, 1, 1987, 53],
+    [1989, 1, 1, 1988, 52],
+    [1990, 1, 1, 1990, 1],
+    [1991, 1, 1, 1991, 1],
+    [1992, 1, 1, 1992, 1],
+    [1993, 1, 1, 1992, 53],
+    [1994, 1, 1, 1993, 52],
+    [1995, 1, 2, 1995, 1],
+    [1996, 1, 1, 1996, 1],
+    [1996, 1, 7, 1996, 1],
+    [1996, 1, 8, 1996, 2],
+    [1997, 1, 1, 1997, 1],
+    [1998, 1, 1, 1998, 1],
+    [1999, 1, 1, 1998, 53],
+    [2000, 1, 1, 1999, 52],
+    [2001, 1, 1, 2001, 1],
+    [2002, 1, 1, 2002, 1],
+    [2003, 1, 1, 2003, 1],
+    [2004, 1, 1, 2004, 1],
+    [2005, 1, 1, 2004, 53],
+    [2006, 1, 1, 2005, 52],
+    [2007, 1, 1, 2007, 1],
+    [2008, 1, 1, 2008, 1],
+    [2009, 1, 1, 2009, 1],
+    [2010, 1, 1, 2009, 53],
+    [2010, 1, 1, 2009, 53],
+    [2011, 1, 1, 2010, 52],
+    [2011, 1, 2, 2010, 52],
+    [2011, 1, 3, 2011, 1],
+    [2011, 1, 4, 2011, 1],
+    [2011, 1, 5, 2011, 1],
+    [2011, 1, 6, 2011, 1],
+    [2011, 1, 7, 2011, 1],
+    [2011, 1, 8, 2011, 1],
+    [2011, 1, 9, 2011, 1],
+    [2011, 1, 10, 2011, 2],
+    [2011, 1, 11, 2011, 2],
+    [2011, 6, 12, 2011, 23],
+    [2011, 6, 13, 2011, 24],
+    [2011, 12, 25, 2011, 51],
+    [2011, 12, 26, 2011, 52],
+    [2011, 12, 27, 2011, 52],
+    [2011, 12, 28, 2011, 52],
+    [2011, 12, 29, 2011, 52],
+    [2011, 12, 30, 2011, 52],
+    [2011, 12, 31, 2011, 52],
+    [1995, 1, 1, 1994, 52],
+    [2012, 1, 1, 2011, 52],
+    [2012, 1, 2, 2012, 1],
+    [2012, 1, 8, 2012, 1],
+    [2012, 1, 9, 2012, 2],
+    [2012, 12, 23, 2012, 51],
+    [2012, 12, 24, 2012, 52],
+    [2012, 12, 30, 2012, 52],
+    [2012, 12, 31, 2013, 1],
+    [2013, 1, 1, 2013, 1],
+    [2013, 1, 6, 2013, 1],
+    [2013, 1, 7, 2013, 2],
+    [2013, 12, 22, 2013, 51],
+    [2013, 12, 23, 2013, 52],
+    [2013, 12, 29, 2013, 52],
+    [2013, 12, 30, 2014, 1],
+    [2014, 1, 1, 2014, 1],
+    [2014, 1, 5, 2014, 1],
+    [2014, 1, 6, 2014, 2],
+    [2015, 1, 1, 2015, 1],
+    [2016, 1, 1, 2015, 53],
+    [2017, 1, 1, 2016, 52],
+    [2018, 1, 1, 2018, 1],
+    [2019, 1, 1, 2019, 1],
+    [2020, 1, 1, 2020, 1],
+    [2021, 1, 1, 2020, 53],
+    [2022, 1, 1, 2021, 52],
+    [2023, 1, 1, 2022, 52],
+    [2024, 1, 1, 2024, 1],
+    [2025, 1, 1, 2025, 1],
+    [2026, 1, 1, 2026, 1],
+    [2027, 1, 1, 2026, 53],
+    [2028, 1, 1, 2027, 52],
+    [2029, 1, 1, 2029, 1],
+    [2030, 1, 1, 2030, 1],
+    [2031, 1, 1, 2031, 1],
+    [2032, 1, 1, 2032, 1],
+    [2033, 1, 1, 2032, 53],
+    [2034, 1, 1, 2033, 52],
+    [2035, 1, 1, 2035, 1],
+    [2036, 1, 1, 2036, 1],
+    [2037, 1, 1, 2037, 1],
+    [2038, 1, 1, 2037, 53],
+    [2039, 1, 1, 2038, 52],
+    [2040, 1, 1, 2039, 52],
+  ]
+}
+
+def year_day_tests -> [[Int]] {
+  [
+    [2007, 1, 1, 1],
+    [2007, 1, 15, 15],
+    [2007, 2, 1, 32],
+    [2007, 2, 15, 46],
+    [2007, 3, 1, 60],
+    [2007, 3, 15, 74],
+    [2007, 4, 1, 91],
+    [2007, 12, 31, 365],
+    [2008, 1, 1, 1],
+    [2008, 1, 15, 15],
+    [2008, 2, 1, 32],
+    [2008, 2, 15, 46],
+    [2008, 3, 1, 61],
+    [2008, 3, 15, 75],
+    [2008, 4, 1, 92],
+    [2008, 12, 31, 366],
+    [1900, 1, 1, 1],
+    [1900, 1, 15, 15],
+    [1900, 2, 1, 32],
+    [1900, 2, 15, 46],
+    [1900, 3, 1, 60],
+    [1900, 3, 15, 74],
+    [1900, 4, 1, 91],
+    [1900, 12, 31, 365],
+    [1, 1, 1, 1],
+    [1, 1, 15, 15],
+    [1, 2, 1, 32],
+    [1, 2, 15, 46],
+    [1, 3, 1, 60],
+    [1, 3, 15, 74],
+    [1, 4, 1, 91],
+    [1, 12, 31, 365],
+    [-1, 1, 1, 1],
+    [-1, 1, 15, 15],
+    [-1, 2, 1, 32],
+    [-1, 2, 15, 46],
+    [-1, 3, 1, 60],
+    [-1, 3, 15, 74],
+    [-1, 4, 1, 91],
+    [-1, 12, 31, 365],
+    [-400, 1, 1, 1],
+    [-400, 1, 15, 15],
+    [-400, 2, 1, 32],
+    [-400, 2, 15, 46],
+    [-400, 3, 1, 61],
+    [-400, 3, 15, 75],
+    [-400, 4, 1, 92],
+    [-400, 12, 31, 366],
+    [1582, 10, 4, 277],
+    [1582, 10, 15, 288],
+  ]
+}

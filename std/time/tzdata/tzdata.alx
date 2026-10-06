@@ -2,19 +2,18 @@
 # so that zones load on systems without one (minimal containers, the browser).
 #
 #   Go                                        alx
-#   import _ "time/tzdata"                    import "time/tzdata"
-#   time.LoadLocation(name) (with tzdata)     tzdata.load_location(name) -> ~time.Location
+#   import _ "time/tzdata"                    import _ "time/tzdata"
+#   time.LoadLocation(name) (with tzdata)     time.load_location(name), or tzdata.load_location(name)
 #   (internal) loadFromEmbeddedTZData(name)   tzdata.tzinfo(name) -> ~[Byte]<TzdataError>
 #   (none)                                    tzdata.zip_data -> [Byte]  (the whole archive)
 #
 # Differences from Go, and why:
-#   - Go's tzdata registers itself with package time from an init function (through
-#     a linkname), so that every time.LoadLocation falls back to it. alx has no
-#     package initializers and no mutable package state (port-issues #30, #51), so
-#     the fallback is explicit: call `tzdata.load_location(name)` where Go would call
-#     time.LoadLocation with tzdata imported. It is exactly that: time.load_location
-#     ($ZONEINFO, then the system's database), then the embedded copy, with Go's
-#     error precedence. `time.load_location_from_tzdata(name, tzdata.tzinfo(name).unwrap)`
+#   - As Go's, importing the package registers the embedded database with package
+#     time (a package global's initializer, R11, runs time.register_embedded_tzdata
+#     before main), so that every time.load_location falls back to it after $ZONEINFO
+#     and the system's database. `import _ "time/tzdata"` imports it for that alone.
+#     tzdata.load_location(name) is the same lookup, kept from before the
+#     registration existed. `time.load_location_from_tzdata(name, tzdata.tzinfo(name).unwrap)`
 #     uses the embedded copy alone (what Go's tests get with DisablePlatformSources).
 #   - The archive is Go's own lib/time/zoneinfo.zip (an uncompressed zip, as Go
 #     embeds it), generated into zzipdata.alx. Str literals are UTF-8 text and can't
@@ -24,6 +23,22 @@
 #   - The browser backend runs tzinfo and load_location_from_tzdata (pure alx), but
 #     refuses load_location, which reads the system's database first.
 import "time"
+
+# Importing the package registers the embedded database with package time (R11:
+# this initializer runs before main), as Go's init does.
+REGISTERED = Atomic.new(time.register_embedded_tzdata(->(name: Str) -> ~[Byte]<time.LocationError> { ~embedded_tzinfo(name) }))
+
+# tzinfo, with its errors as package time's loader wants them.
+def embedded_tzinfo(name: Str) -> ~[Byte]<time.LocationError> {
+  r = tzinfo(name)
+  if e = r.err {
+    case e {
+      TzdataError.NoSuchZone(_) => fail time.LocationError.Errno(2)
+      _ => fail time.LocationError.BadZip(e.message)
+    }
+  }
+  r.unwrap
+}
 
 ZECHEADER = 0x06054b50
 ZCHEADER = 0x02014b50

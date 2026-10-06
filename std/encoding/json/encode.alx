@@ -1,12 +1,44 @@
 #![overflow(wrap)]
-# Encoding: the Encoder that derived `json_enc` methods write to.
+# Encoding: the Encoder that derived `json_enc` methods write to (also Go's
+# streaming Encoder), Marshal, and the dispatch to Go's Marshaler /
+# TextMarshaler interfaces.
 #
 # The output is a list of pieces (literals, numbers, strings), joined once at
 # `finish!`: appending a piece costs one push, where appending bytes costs one
 # push each, and a push is the expensive thing in a loop (it switches regions).
 
+import "encoding"
+import "encoding/base64"
+import "io"
 import "strconv"
 import "unicode/utf8"
+
+# Go's json.Marshaler: a type that writes its own JSON. The output is checked
+# and compacted (and HTML-escaped when the encoder escapes HTML).
+pub interface Marshaler {
+  def marshal_json -> ~[Byte]
+}
+
+# Go's json.Unmarshaler: a type that reads its own JSON. `data` is one whole,
+# valid JSON value (null included).
+pub interface Unmarshaler {
+  def unmarshal_json!(data: [Byte]) -> ~Unit
+}
+
+# The protocol's text method (what a derive writes).
+pub interface JsonStr {
+  def json_str(e: Encoder) -> Str
+}
+
+# Go's IsZero method, for omitzero.
+pub interface IsZeroer {
+  def zero? -> Bool
+}
+
+# What a derived type has for omitzero (a struct: every field zero).
+pub interface JsonZeroer {
+  def json_is_zero -> Bool
+}
 
 # Can s be written between quotes as it is? (No escapes, valid UTF-8.)
 def plain(s: Str, html: Bool) -> Bool {
@@ -48,12 +80,19 @@ def fmt_float(f: Float) -> Str {
 
 struct EState {
   pieces: [Str]
-  err: Str
+  errs: [JsonError]
   html: Bool
+  # Go's streaming Encoder: where `encode!` writes, and its indent.
+  w: io.Writer?
+  prefix: Str
+  ind: Str
+  werr: [Error]
 }
 
-# The output side. Copies share the buffer (GO-VS-RUBY D36), so a derived
-# `json_enc(e)` can be handed `e` by value. Make one with `new_encoder`.
+# The output side, and Go's Encoder. Copies share the state (GO-VS-RUBY D36),
+# so a derived `json_enc(e)` can be handed `e` by value. Make one with
+# `new_encoder(w)` (Go's NewEncoder) or `new_encoder()` (no writer: what
+# marshal and the derived methods use).
 pub struct Encoder {
   st: [EState]
 
@@ -83,23 +122,26 @@ pub struct Encoder {
     self.st[0].pieces << f!(v)
   }
 
+  # Records the first error (`finish!` reports it).
+  pub def fail!(e: JsonError) {
+    self.st[0].errs << e if st[0].errs.size == 0
+    nil
+  }
+
   # The text of f; for NaN and the infinities, "null" and an error `finish!` reports.
   pub def f!(v: Float) -> Str {
     s = fmt_float(v)
     if s == "" {
-      if st[0].err == "" {
-        self.st[0].err = strconv.format_float(v, "g", -1, 64)
-      }
+      fail!(JsonError.UnsupportedValue(str: strconv.format_float(v, "g", -1, 64)))
       return "null"
     }
     s
   }
 
-  # A value of a type encoding/json (v1) has no encoding for (a field a
-  # derive in a file that uses encoding/json/v2 accepted): "null", and an
-  # error `finish!` reports.
+  # A value of a type encoding/json has no encoding for (Go's
+  # UnsupportedTypeError): "null", and an error `finish!` reports.
   pub def unsupported!(t: Str) -> Str {
-    self.st[0].err = "type " + t if st[0].err == ""
+    fail!(JsonError.UnsupportedType(t))
     "null"
   }
 
@@ -121,9 +163,15 @@ pub struct Encoder {
     self.st[0].html = on
   }
 
-  # The JSON written so far, or the first error (a NaN or infinity).
+  # Go's SetIndent: `encode!` writes each value indented.
+  pub def set_indent!(prefix: Str, ind: Str) {
+    self.st[0].prefix = prefix
+    self.st[0].ind = ind
+  }
+
+  # The JSON written so far, or the first error.
   pub def finish! -> ~Str<JsonError> {
-    fail JsonError.Unsupported(st[0].err) if st[0].err != ""
+    fail st[0].errs[0] if st[0].errs.size > 0
     st[0].pieces.join("")
   }
 
@@ -134,22 +182,215 @@ pub struct Encoder {
     st[0].pieces.each { |p| n += p.size }
     n
   }
+
+  # Go's Encoder.Encode: writes the JSON of v and a newline to the writer
+  # (indented after set_indent!). After a write error, every call fails with it.
+  pub def encode![T](v: T) -> ~Unit {
+    fail st[0].werr[0] if st[0].werr.size > 0
+    e = new_encoder()
+    e.set_escape_html!(st[0].html)
+    e.raw!(enc_val(e, v))
+    s = e.~finish!
+    s = ~indent(s, st[0].prefix, st[0].ind) if st[0].prefix != "" || st[0].ind != ""
+    if w = st[0].w {
+      ww = w
+      r = ww.write!((s + "\n").bytes)
+      if err = r.err {
+        self.st[0].werr << err
+        fail err
+      }
+    }
+  }
 }
 
-pub def new_encoder -> Encoder {
-  Encoder.new(st: [EState.new(pieces: [], err: "", html: true)])
+# Go's NewEncoder(w); without a writer, an encoder for marshal and the
+# derived methods (read the result with `finish!`).
+pub def new_encoder(w: io.Writer? = none) -> Encoder {
+  Encoder.new(st: [EState.new(pieces: [], errs: [], html: true, w: w, prefix: "", ind: "", werr: [])])
 }
 
-# Go's Marshal: v is anything with a `json_enc` (a derived type, a Value).
+# Go's Marshal: v is a derived type (or anything with a `json_str`, or a
+# Marshaler / TextMarshaler).
 pub def marshal[T](v: T) -> ~Str<JsonError> {
   e = new_encoder()
-  v.json_enc(e)
+  e.raw!(enc_val(e, v))
   e.~finish!
 }
 
+# Go's MarshalIndent.
 pub def marshal_indent[T](v: T, prefix: Str, ind: Str) -> ~Str<JsonError> {
-  e = new_encoder()
-  v.json_enc(e)
-  s = e.~finish!
+  s = ~marshal(v)
   ~indent(s, prefix, ind)
 }
+
+# ---------------------------------------------------------- what derives call
+
+# The JSON text of x: a Str, Bool, integer or Float as Go writes them; a
+# value of a named type: Go's Marshaler first, then TextMarshaler (a
+# string), then the type's own `json_str` (or `json_enc`).
+pub def enc_val[T](e: Encoder, x: T) -> Str {
+  if T is Str {
+    return e.q(x)
+  } else if T is Bool {
+    return x ? "true" : "false"
+  } else if T is like Int {
+    return x.to_s
+  } else if T is Float {
+    return e.f!(x)
+  } else if T is Marshaler {
+    r = json_bytes(x)
+    if err = r.err {
+      e.fail!(JsonError.Marshaler(type_name: format("%T", x), cause: err.message, source_func: "marshal_json"))
+      return "null"
+    }
+    out = Str.from_bytes(r.unwrap)
+    c = check(out)
+    if err = c.err {
+      e.fail!(JsonError.Marshaler(type_name: format("%T", x), cause: err.message, source_func: "marshal_json"))
+      return "null"
+    }
+    return compact_text(out, e.html)
+  } else if T is encoding.TextMarshaler {
+    r = text_bytes(x)
+    if err = r.err {
+      e.fail!(JsonError.Marshaler(type_name: format("%T", x), cause: err.message, source_func: "marshal_text"))
+      return "null"
+    }
+    return e.q(Str.from_bytes(r.unwrap))
+  } else if T is JsonStr {
+    return x.json_str(e)
+  } else {
+    # only a json_enc: write into an encoder of its own
+    e2 = new_encoder()
+    e2.set_escape_html!(e.html)
+    x.json_enc(e2)
+    r = e2.finish!
+    if err = r.err {
+      e.fail!(err)
+      return "null"
+    }
+    return r.unwrap
+  }
+}
+
+# x.marshal_text / x.marshal_json as fallible calls (a method that can't
+# fail satisfies the interfaces too).
+def text_bytes[T](x: T) -> ~[Byte] {
+  if T is PlainText {
+    return x.marshal_text
+  } else {
+    return x.~marshal_text
+  }
+}
+
+def json_bytes[T](x: T) -> ~[Byte] {
+  if T is PlainJson {
+    return x.marshal_json
+  } else {
+    return x.~marshal_json
+  }
+}
+
+interface PlainText {
+  def marshal_text -> [Byte]
+}
+
+interface PlainJson {
+  def marshal_json -> [Byte]
+}
+
+# A map key of a named type as its text (Go: a TextMarshaler).
+pub def key_text[K](e: Encoder, k: K) -> Str {
+  if K is encoding.TextMarshaler {
+    r = text_bytes(k)
+    if err = r.err {
+      e.fail!(JsonError.Marshaler(type_name: format("%T", k), cause: err.message, source_func: "marshal_text"))
+      return ""
+    }
+    return Str.from_bytes(r.unwrap)
+  } else {
+    e.unsupported!("Map[" + format("%T", k) + ", ...]")
+    return ""
+  }
+}
+
+# omitzero for a value of a named type: Go's IsZero method if it has one,
+# else the derive's test.
+pub def is_zero[T](x: T) -> Bool {
+  if T is IsZeroer {
+    return x.zero?
+  } else if T is JsonZeroer {
+    return x.json_is_zero
+  } else {
+    return false
+  }
+}
+
+# An object of the members `pieces` (each `"key":value`) in the order of
+# their `keys` (Go sorts a map's keys).
+pub def sorted_object(keys: [Str], pieces: [Str]) -> Str {
+  n = keys.size
+  return "{" + pieces.join(",") + "}" if n < 2
+  idx: [Int] = []
+  i = 0
+  while i < n {
+    idx << i
+    i += 1
+  }
+  # insertion sort for small maps, merge sort otherwise
+  if n <= 16 {
+    i = 1
+    while i < n {
+      x = idx[i]
+      j = i
+      while j > 0 && keys[idx[j - 1]] > keys[x] {
+        idx[j] = idx[j - 1]
+        j -= 1
+      }
+      idx[j] = x
+      i += 1
+    }
+  } else {
+    idx = merge_sort(idx, keys)
+  }
+  out: [Str] = []
+  for k in idx { out << pieces[k] }
+  "{" + out.join(",") + "}"
+}
+
+def merge_sort(idx: [Int], keys: [Str]) -> [Int] {
+  n = idx.size
+  return idx if n < 2
+  m = n / 2
+  a = merge_sort(idx[0...m], keys)
+  b = merge_sort(idx[m...n], keys)
+  out: [Int] = []
+  i = 0
+  j = 0
+  while i < a.size && j < b.size {
+    if keys[b[j]] < keys[a[i]] {
+      out << b[j]
+      j += 1
+    } else {
+      out << a[i]
+      i += 1
+    }
+  }
+  while i < a.size {
+    out << a[i]
+    i += 1
+  }
+  while j < b.size {
+    out << b[j]
+    j += 1
+  }
+  out
+}
+
+# Go's []byte encoding: standard base64 in a string.
+pub def bytes_text(b: [Byte]) -> Str {
+  "\"" + base64.std_encoding.encode_to_string(b) + "\""
+}
+
+# The `,string` option: a number or bool written inside a string.
+pub def quoted(text: Str) -> Str { "\"" + text + "\"" }

@@ -594,7 +594,7 @@ impl<'a> Parser<'a> {
             }
         }
         for job in &jobs {
-            let text = if job.derive == "Asn1" { crate::derive_asn1::asn1_source(job, &asn1_alias, &imports, &asn1_types)? } else if job.derive == "Row" { crate::derive::row_source(job, &sql_alias)? } else if job.derive == "Arbitrary" { crate::derive::arbitrary_source(job, &quick, &rand)? } else { crate::derive::json_source(job, &alias, &types, wants_v2, &v2_only)? };
+            let text = if job.derive == "Asn1" { crate::derive_asn1::asn1_source(job, &asn1_alias, &imports, &asn1_types)? } else if job.derive == "Row" { crate::derive::row_source(job, &sql_alias)? } else if job.derive == "Arbitrary" { crate::derive::arbitrary_source(job, &quick, &rand)? } else { crate::derive::json_source(job, &alias, &types, wants_v2, &v2_only, &jobs)? };
             // One struct body: v1's methods, then v2's (both texts are `struct Name { ... }`).
             let text = match v2_texts.get(&job.name).filter(|_| job.derive == "Json") {
                 Some(v2) => {

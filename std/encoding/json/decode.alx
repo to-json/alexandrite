@@ -8,7 +8,11 @@
 # errors are sticky: the first one is kept, every later call returns at once
 # with a zero value, and `done!` (the one fallible method) reports it.
 
+import "bytes"
+import "encoding/base64"
+import "io"
 import "strconv"
+import "strings"
 import "unicode/utf8"
 
 MAX_DEPTH = 10000
@@ -40,26 +44,27 @@ def err_from(s: Str, c: Int) -> JsonError {
   kind = v % 64
   return err_eof(pos) if kind == E_EOF
   return JsonError.Invalid(msg: "exceeded max depth", offset: pos) if kind == E_DEPTH
-  ch = s[pos]
+  return err_escape(s, pos, pos + 2) if kind == E_ESC
+  if kind == E_HEX {
+    e = pos + 6
+    e = s.size if e > s.size
+    return err_escape(s, pos, e)
+  }
   if kind >= E_LIT {
     w = (kind - E_LIT) / 5
     i = (kind - E_LIT) % 5
     word = w == 0 ? "true" : (w == 1 ? "false" : "null")
-    return err_char(ch, "in literal " + word + " (expecting " + quote_char(word[i].to_i) + ")", pos)
+    return err_char(s, pos, "in literal " + word + " (expecting " + strconv.quote_rune(word[i].to_i32) + ")")
   }
   ctx = "looking for beginning of value"
   ctx = "in numeric literal" if kind == E_NUM
-  ctx = "after decimal point in numeric literal" if kind == E_DEC
-  ctx = "in exponent of numeric literal" if kind == E_EXP
-  ctx = "in string literal" if kind == E_STRLIT
-  ctx = "in string escape code" if kind == E_ESC
-  ctx = "in \\u hexadecimal character escape" if kind == E_HEX
+  ctx = "in string" if kind == E_STRLIT
   ctx = "after object key" if kind == E_KEY
   ctx = "after array element" if kind == E_ELEM
   ctx = "after object key:value pair" if kind == E_PAIR
   ctx = "looking for beginning of object key string" if kind == E_KEYSTART
   ctx = "after top-level value" if kind == E_TOP
-  err_char(ch, ctx, pos)
+  err_char(s, pos, ctx)
 }
 
 # Index of the first non-space byte at or after p (JSON's four spaces).
@@ -83,7 +88,7 @@ def num_end(s: Str, p0: Int) -> Int {
   p = p0
   if s[p] == 45 {
     p += 1
-    return code(p, E_EOF) if p >= n
+    return code(p0, E_EOF) if p >= n
     return code(p, E_NUM) if !is_digit(s[p])
   }
   if s[p] == 48 {
@@ -93,18 +98,18 @@ def num_end(s: Str, p0: Int) -> Int {
   }
   if p < n && s[p] == 46 {
     p += 1
-    return code(p, E_EOF) if p >= n
-    return code(p, E_DEC) if !is_digit(s[p])
+    return code(p0, E_EOF) if p >= n
+    return code(p, E_NUM) if !is_digit(s[p])
     while p < n && is_digit(s[p]) { p += 1 }
   }
   if p < n && (s[p] == 101 || s[p] == 69) {
     p += 1
-    return code(p, E_EOF) if p >= n
+    return code(p0, E_EOF) if p >= n
     if s[p] == 43 || s[p] == 45 {
       p += 1
-      return code(p, E_EOF) if p >= n
+      return code(p0, E_EOF) if p >= n
     }
-    return code(p, E_EXP) if !is_digit(s[p])
+    return code(p, E_NUM) if !is_digit(s[p])
     while p < n && is_digit(s[p]) { p += 1 }
   }
   p
@@ -151,7 +156,8 @@ def hex4(s: Str, p: Int) -> Int {
 def is_hex(h: Int) -> Bool { (h >= 48 && h <= 57) || (h >= 97 && h <= 102) || (h >= 65 && h <= 70) }
 
 # The index after the string literal starting at p (s[p] is the opening quote),
-# checking escapes and control characters; or an error code.
+# checking escapes and control characters; or an error code (an escape's code
+# is at its backslash).
 def str_end(s: Str, p0: Int) -> Int {
   n = s.size
   p = p0 + 1
@@ -160,24 +166,43 @@ def str_end(s: Str, p0: Int) -> Int {
     return p + 1 if c == 34
     return code(p, E_STRLIT) if c < 32
     if c == 92 {
-      p += 1
-      return code(p, E_EOF) if p >= n
-      e = s[p]
+      return code(p, E_EOF) if p + 1 >= n
+      e = s[p + 1]
       if e == 117 {
-        k = 1
-        while k <= 4 {
-          return code(p + k, E_EOF) if p + k >= n
-          return code(p + k, E_HEX) if !is_hex(s[p + k].to_i)
+        k = 2
+        while k < 6 {
+          # a valid prefix of \uXXXX cut short by the end
+          return code(p, E_EOF) if p + k >= n
+          return code(p, E_HEX) if !is_hex(s[p + k].to_i)
           k += 1
         }
-        p += 4
+        p += 5
       } else if !(e == 34 || e == 92 || e == 47 || e == 98 || e == 102 || e == 110 || e == 114 || e == 116) {
         return code(p, E_ESC)
+      } else {
+        p += 1
       }
     }
     p += 1
   }
-  code(n, E_EOF)
+  code(cut_rune(s, p0), E_EOF)
+}
+
+# Where an input that ends inside a string reports its end: before a UTF-8
+# sequence the end cut short, else at the end.
+def cut_rune(s: Str, p0: Int) -> Int {
+  n = s.size
+  k = 1
+  while k <= 3 && n - k > p0 {
+    c = s[n - k]
+    if c >= 0xC0 {
+      return n - k if !utf8.full_rune_in_string(s[(n - k)...n])
+      return n
+    }
+    return n if c < 0x80
+    k += 1
+  }
+  n
 }
 
 # Skips one value starting at p0 (after whitespace) while checking its syntax;
@@ -289,7 +314,7 @@ pub def check(s: Str) -> ~Unit<JsonError> {
   p = skip_value(s, 0, 0)
   fail err_from(s, p) if p < 0
   p = skip_ws(s, p)
-  fail err_char(s[p], "after top-level value", p) if p < s.size
+  fail err_char(s, p, "after top-level value") if p < s.size
 }
 
 # Go's json.Valid.
@@ -305,19 +330,37 @@ struct DState {
   ctx: Str
   wrapped: Bool
   fresh: Bool
+  # a syntax error or a failed Unmarshaler: decoding stops
   failed: Bool
   errs: [JsonError]
+  # the first type error: decoding goes on (Go's Unmarshal does)
+  terr: [JsonError]
+  nerr: Int
+  # the root type's name, for type errors
+  root: Str
+  root_set: Bool
+  # Go's Decoder.UseNumber / DisallowUnknownFields
+  use_number: Bool
+  disallow: Bool
+  # added to the offsets in errors (a value read from a stream)
+  base: Int
 }
 
-# The input side. Copies share the position and the error (GO-VS-RUBY D36).
+# The input side. Copies share the position and the errors (GO-VS-RUBY D36).
 # Derived `json_dec` methods call these in a fixed pattern; each reads the next
 # value (spaces before it are skipped) and leaves the position after it. They
-# don't fail: the first problem is remembered (`failed`), every call after it
-# returns a zero value at once, and `done!` reports the error. So a hand-written
-# `json_dec` has no error handling to write; call `d.~done!` at the end.
+# don't fail: a syntax error is remembered (`failed`) and every call after it
+# returns at once; a type error (Go's UnmarshalTypeError) is remembered, the
+# value skipped and decoding goes on, as Go's Unmarshal does; `done!` reports
+# the first. So a hand-written `json_dec` has no error handling to write.
+#
+# The same type is Go's streaming Decoder: `new_decoder(r)` with an io.Reader
+# (stream.alx: decode!, token!, more?, buffered, input_offset, use_number!,
+# disallow_unknown_fields!).
 pub struct Decoder {
   s: Str
   st: [DState]
+  ss: [SState]
 
   pub def pos -> Int { st[0].pos }
 
@@ -326,14 +369,27 @@ pub struct Decoder {
 
   pub def wrapped -> Bool { st[0].wrapped }
 
+  # A syntax error (or a failed Unmarshaler) stopped decoding.
   pub def failed -> Bool { st[0].failed }
 
-  # Names the field being read, for type errors ("User.age").
+  # Go's UseNumber is on: a Number is read for a number in a Value.
+  pub def using_number -> Bool { st[0].use_number }
+
+  # Names what is being read, for messages of hand-written decoders.
   pub def at!(ctx: Str) {
     self.st[0].ctx = ctx
   }
 
-  # Records the first error.
+  # The root type's name (Go's UnmarshalTypeError.Struct): the first call wins.
+  pub def root!(name: Str) {
+    if !st[0].root_set {
+      self.st[0].root_set = true
+      self.st[0].root = name
+    }
+    nil
+  }
+
+  # Records the first error; decoding stops.
   pub def fail!(e: JsonError) {
     if !st[0].failed {
       self.st[0].failed = true
@@ -343,11 +399,32 @@ pub struct Decoder {
   }
 
   def bad!(c: Int) {
-    fail!(err_from(s, c))
+    fail!(rebase(err_from(s, c), st[0].base))
   }
 
-  def wrong!(p: Int, got: Str, want: Str) {
-    fail!(JsonError.Type(value: got, want: want, field: st[0].ctx, offset: p))
+  # A type error for the value at p (it is skipped): `got` is the JSON value
+  # ("string", "number 1.5"), `want` the alx type.
+  pub def wrong!(p: Int, got: Str, want: Str, cause: Str = "") {
+    e = skip_value(s, p, 0)
+    if e < 0 {
+      bad!(e)
+      return
+    }
+    c = s[p]
+    off = (c == 91 || c == 123) ? p + 1 : e
+    type_err!(got, want, off, p, cause)
+    self.st[0].pos = e
+    nil
+  }
+
+  # Records a type error (the first one is kept) for the value at `at`.
+  pub def type_err!(got: Str, want: Str, off: Int, at: Int, cause: Str = "") {
+    self.st[0].nerr += 1
+    if st[0].terr.size == 0 {
+      path = path_at(s, at)
+      self.st[0].terr << JsonError.Type(value: got, type_name: want, offset: off + st[0].base, struct_name: path == "" ? "" : st[0].root, field: path, cause: cause)
+    }
+    nil
   }
 
   # The index of the next value's first byte; -1 (and an error) at the end or after an error.
@@ -355,13 +432,13 @@ pub struct Decoder {
     return -1 if st[0].failed
     p = skip_ws(s, st[0].pos)
     if p >= s.size {
-      fail!(err_eof(p))
+      fail!(err_eof(p + st[0].base))
       return -1
     }
     p
   }
 
-  # Skips the value at p (a mismatch: the error is already recorded).
+  # Skips the value at p.
   def skip_at!(p: Int) {
     e = skip_value(s, p, 0)
     if e < 0 {
@@ -369,6 +446,17 @@ pub struct Decoder {
     } else {
       self.st[0].pos = e
     }
+  }
+
+  # Consumes the literal word w at p (true, false, null); false after a syntax error.
+  def lit!(p: Int, w: Str) -> Bool {
+    e = lit_end(s, p, w)
+    if e < 0 {
+      bad!(e)
+      return false
+    }
+    self.st[0].pos = e
+    true
   }
 
   # ---- null
@@ -387,155 +475,130 @@ pub struct Decoder {
     true
   }
 
-  # ---- scalars (null reads as the zero value, as in Go)
-
-  pub def bool! -> Bool {
+  # Is the next value null? (Nothing is consumed.)
+  pub def null? -> Bool {
     p = start!
-    return false if p < 0
+    p >= 0 && s[p] == 110
+  }
+
+  # The text of the next value, as it is written (Go's RawMessage); "" after an error.
+  pub def raw_value! -> Str {
+    p = start!
+    return "" if p < 0
+    e = skip_value(s, p, 0)
+    if e < 0 {
+      bad!(e)
+      return ""
+    }
+    self.st[0].pos = e
+    s[p...e]
+  }
+
+  # ---- scalars (null and a type error leave the old value, as in Go)
+
+  pub def bool!(old: Bool = false) -> Bool {
+    p = start!
+    return old if p < 0
     c = s[p]
-    if c == 116 || c == 102 || c == 110 {
-      w = c == 116 ? "true" : (c == 102 ? "false" : "null")
-      e = lit_end(s, p, w)
-      if e < 0 {
-        bad!(e)
-        return false
-      }
-      self.st[0].pos = e
+    if c == 116 || c == 102 {
+      return false if !lit!(p, c == 116 ? "true" : "false")
       return c == 116
     }
+    if c == 110 {
+      lit!(p, "null")
+      return old
+    }
     wrong!(p, kind_word(c), "Bool")
-    false
+    old
   }
 
   # The number at p as an integer with at most neg_lim / pos_lim magnitude.
-  def int_in!(want: Str, neg_lim: U64, pos_lim: U64) -> Int {
+  def int_in!(want: Str, neg_lim: U64, pos_lim: U64, old: Int) -> Int {
     p = start!
-    return 0 if p < 0
+    return old if p < 0
     c = s[p]
     if c == 110 {
-      take_null!
-      return 0
+      lit!(p, "null")
+      return old
     }
     if !(c == 45 || is_digit(c)) {
       wrong!(p, kind_word(c), want)
-      return 0
+      return old
     }
     e = num_end(s, p)
     if e < 0 {
       bad!(e)
-      return 0
+      return old
     }
-    i = p
-    neg = false
-    if c == 45 {
-      neg = true
-      i += 1
-    }
-    u: U64 = 0
-    lim = neg ? neg_lim : pos_lim
-    ok = true
-    while i < e {
-      d = s[i]
-      if !is_digit(d) {
-        ok = false
-        break
-      }
-      dv = (d - 48).to_u64
-      if u > (lim - dv) / 10 {
-        ok = false
-        break
-      }
-      u = u * 10 + dv
-      i += 1
-    }
-    if !ok {
+    r = int_text(s[p...e], neg_lim, pos_lim)
+    if r.none? {
       wrong!(p, "number " + s[p...e], want)
-      return 0
+      return old
     }
     self.st[0].pos = e
-    return 0 -% u.as_i64 if neg
-    u.as_i64
+    r || 0
   }
 
-  pub def int! -> Int {
-    int_in!("Int", 9223372036854775808, 9223372036854775807)
+  pub def int!(old: Int = 0) -> Int {
+    int_in!("Int", 9223372036854775808, 9223372036854775807, old)
   }
 
   # A signed integer of `bits` bits (the caller converts with as_i8 ...).
-  pub def sint!(bits: Int) -> Int {
+  pub def sint!(bits: Int, old: Int = 0) -> Int {
     one: U64 = 1
     half = one << (bits - 1)
-    int_in!("I" + bits.to_s, half, half - 1)
+    int_in!(bits == 64 ? "Int" : "I" + bits.to_s, half, half - 1, old)
   }
 
   # An unsigned integer of `bits` bits.
-  pub def uint!(bits: Int) -> U64 {
+  pub def uint!(bits: Int, old: U64 = 0) -> U64 {
     p = start!
-    return 0 if p < 0
+    return old if p < 0
     c = s[p]
     if c == 110 {
-      take_null!
-      return 0
+      lit!(p, "null")
+      return old
     }
     want = "U" + bits.to_s
     if !(c == 45 || is_digit(c)) {
       wrong!(p, kind_word(c), want)
-      return 0
+      return old
     }
     e = num_end(s, p)
     if e < 0 {
       bad!(e)
-      return 0
+      return old
     }
-    one: U64 = 1
-    lim: U64 = 18446744073709551615
-    lim = (one << bits) - 1 if bits < 64
-    u: U64 = 0
-    i = p
-    ok = c != 45
-    while ok && i < e {
-      d = s[i]
-      if !is_digit(d) {
-        ok = false
-      } else {
-        dv = (d - 48).to_u64
-        if u > (lim - dv) / 10 {
-          ok = false
-        } else {
-          u = u * 10 + dv
-          i += 1
-        }
-      }
-    }
-    if !ok {
+    r = uint_text(s[p...e], bits)
+    if r.none? {
       wrong!(p, "number " + s[p...e], want)
-      return 0
+      return old
     }
     self.st[0].pos = e
-    u
+    r || 0
   }
 
-  pub def float! -> Float {
+  pub def float!(old: Float = 0.0) -> Float {
     p = start!
-    return 0.0 if p < 0
+    return old if p < 0
     c = s[p]
     if c == 110 {
-      take_null!
-      return 0.0
+      lit!(p, "null")
+      return old
     }
     if !(c == 45 || is_digit(c)) {
       wrong!(p, kind_word(c), "Float")
-      return 0.0
+      return old
     }
     e = num_end(s, p)
     if e < 0 {
       bad!(e)
-      return 0.0
+      return old
     }
     f = parse_number(s[p...e])
     if f.none? {
       wrong!(p, "number " + s[p...e], "Float")
-      return 0.0
+      return old
     }
     self.st[0].pos = e
     f || 0.0
@@ -564,107 +627,187 @@ pub struct Decoder {
       bad!(e)
       return ""
     }
-    # Slow path (the string is well formed up to e).
-    b: [Byte] = []
-    j = start
-    while j < i {
-      b << s[j]
-      j += 1
-    }
-    while i < e - 1 {
-      c = s[i]
-      if c == 92 {
-        i += 1
-        x = s[i]
-        if x == 98 {
-          b << 8
-        } else if x == 102 {
-          b << 12
-        } else if x == 110 {
-          b << 10
-        } else if x == 114 {
-          b << 13
-        } else if x == 116 {
-          b << 9
-        } else if x == 117 {
-          r = hex4(s, i + 1)
-          i += 4
-          if r >= 0xD800 && r < 0xDC00 {
-            # a high surrogate: needs \uDC00..\uDFFF right after
-            if i + 6 < e && s[i + 1] == 92 && s[i + 2] == 117 {
-              lo = hex4(s, i + 3)
-              if lo >= 0xDC00 && lo < 0xE000 {
-                r = 0x10000 + ((r - 0xD800) << 10) + (lo - 0xDC00)
-                i += 6
-              } else {
-                r = 0xFFFD
-              }
-            } else {
-              r = 0xFFFD
-            }
-          } else if r >= 0xDC00 && r < 0xE000 {
-            r = 0xFFFD
-          }
-          b = push_rune(b, r)
-        } else {
-          b << x
-        }
-        i += 1
-      } else if c < 128 {
-        b << c
-        i += 1
-      } else {
-        rr, w = utf8.decode_rune_at(s, i)
-        if rr == 0xFFFD && w == 1 {
-          b << 0xEF
-          b << 0xBF
-          b << 0xBD
-        } else {
-          k = 0
-          while k < w {
-            b << s[i + k]
-            k += 1
-          }
-        }
-        i += w
-      }
-    }
     self.st[0].pos = e
-    Str.from_bytes(b)
+    unquote_slow(s, start, i, e)
   }
 
-  pub def str! -> Str {
+  pub def str!(old: Str = "") -> Str {
     p = start!
-    return "" if p < 0
+    return old if p < 0
     c = s[p]
     return read_string!(p) if c == 34
     if c == 110 {
-      take_null!
-      return ""
+      lit!(p, "null")
+      return old
     }
     wrong!(p, kind_word(c), "Str")
-    ""
+    old
   }
 
-  # ---- objects
-
-  # Consumes `{`. False if the value was null (then there is nothing to read).
-  pub def open_obj! -> Bool {
+  # Go's []byte: a base64 string (or an array of numbers); null is empty.
+  pub def bytes!(old: [Byte], want: Str = "[U8]") -> [Byte] {
     p = start!
-    return false if p < 0
+    return old if p < 0
     c = s[p]
-    if c == 123 {
+    if c == 110 {
+      lit!(p, "null")
+      out: [Byte] = []
+      return out
+    }
+    if c == 34 {
+      t = read_string!(p)
+      return old if st[0].failed
+      r = decode_base64(t)
+      if err = r.err {
+        type_err!("string", want, st[0].pos, p, err.message)
+        return old
+      }
+      return r.unwrap
+    }
+    if c == 91 {
+      out: [Byte] = []
       self.st[0].pos = p + 1
       self.st[0].fresh = true
-      return true
+      while more! {
+        out << uint!(8).as_u8
+      }
+      return out
     }
-    if c == 110 {
-      take_null!
-      return false
-    }
-    wrong!(p, kind_word(c), "object")
-    false
+    wrong!(p, kind_word(c), want)
+    old
   }
+
+  # ---- the `,string` option: a scalar inside a JSON string
+
+  # The text inside the string at the decoder's position; none (and the old
+  # value stays) for null, "null", and after an error. `num`: the content
+  # must be a JSON number (else a type error, value "number <text>").
+  def quoted!(want: Str) -> Str? {
+    p = start!
+    return none if p < 0
+    c = s[p]
+    if c == 110 {
+      lit!(p, "null")
+      return none
+    }
+    if c != 34 {
+      wrong!(p, kind_word(c), want)
+      return none
+    }
+    t = read_string!(p)
+    return none if st[0].failed || t == "null"
+    t
+  }
+
+  def num_text?(t: Str) -> Bool {
+    t.size > 0 && (t[0] == 45 || is_digit(t[0])) && num_end(t, 0) == t.size
+  }
+
+  pub def qsint!(bits: Int, old: Int = 0) -> Int {
+    p = skip_ws(s, st[0].pos)
+    want = bits == 64 ? "Int" : "I" + bits.to_s
+    t = quoted!(want) || return old
+    one: U64 = 1
+    half = one << (bits - 1)
+    r = num_text?(t) ? int_text(t, half, half - 1) : none
+    if v = r {
+      return v
+    }
+    type_err!("number " + t, want, st[0].pos, p)
+    old
+  }
+
+  pub def quint!(bits: Int, old: U64 = 0) -> U64 {
+    p = skip_ws(s, st[0].pos)
+    want = "U" + bits.to_s
+    t = quoted!(want) || return old
+    r = num_text?(t) ? uint_text(t, bits) : none
+    if v = r {
+      return v
+    }
+    type_err!("number " + t, want, st[0].pos, p)
+    old
+  }
+
+  pub def qfloat!(old: Float = 0.0) -> Float {
+    p = skip_ws(s, st[0].pos)
+    t = quoted!("Float") || return old
+    r = num_text?(t) ? parse_number(t) : none
+    if v = r {
+      return v
+    }
+    type_err!("number " + t, "Float", st[0].pos, p)
+    old
+  }
+
+  pub def qbool!(old: Bool = false) -> Bool {
+    p = skip_ws(s, st[0].pos)
+    t = quoted!("Bool") || return old
+    return true if t == "true"
+    return false if t == "false"
+    type_err!("string " + s[p...st[0].pos], "Bool", st[0].pos, p, "invalid syntax")
+    old
+  }
+
+  pub def qstr!(old: Str = "") -> Str {
+    p = skip_ws(s, st[0].pos)
+    t = quoted!("Str") || return old
+    msg = ""
+    if t.size == 0 {
+      msg = "unexpected end of JSON input"
+    } else if t[0] != 34 {
+      msg = err_char(t, 0, "looking for beginning of object key string").message
+    } else {
+      e = str_end(t, 0)
+      if e < 0 {
+        msg = err_from(t, e).message
+      } else if e < t.size {
+        msg = err_char(t, e, "after string value").message
+      } else {
+        return unquote_at(t, 0)
+      }
+    }
+    type_err!("string", "Str", st[0].pos, p, msg)
+    old
+  }
+
+  # If the next value is the string "null" (which `,string` reads as null),
+  # consumes it and returns true.
+  pub def qnull! -> Bool {
+    p = start!
+    return false if p < 0
+    return false if p + 6 > s.size || s[p...(p + 6)] != "\"null\""
+    self.st[0].pos = p + 6
+    true
+  }
+
+  # How many type errors there were (the first is kept): a caller compares
+  # before and after reading a value.
+  pub def nerr -> Int { st[0].nerr }
+
+  # ---- objects and arrays
+
+  # Consumes `{` (c = 123) or `[` (c = 91): 1; null: 0; another value: -1
+  # (a type error naming `want`, the alx type).
+  pub def open!(c: Int, want: Str) -> Int {
+    p = start!
+    return -1 if p < 0
+    k = s[p]
+    if k.to_i == c {
+      self.st[0].pos = p + 1
+      self.st[0].fresh = true
+      return 1
+    }
+    if k == 110 {
+      lit!(p, "null")
+      return 0
+    }
+    wrong!(p, kind_word(k), want)
+    -1
+  }
+
+  # Consumes `{`. False if the value was null or not an object.
+  pub def open_obj!(want: Str = "object") -> Bool { open!(123, want) == 1 }
 
   # The next member: reads its key (see `key`) and the colon, leaving the
   # position at the value; false at the closing `}` (or after an error).
@@ -714,25 +857,42 @@ pub struct Decoder {
     true
   }
 
-  # ---- arrays
-
-  # Consumes `[`. False if the value was null.
-  pub def open_arr! -> Bool {
-    p = start!
-    return false if p < 0
-    c = s[p]
-    if c == 91 {
-      self.st[0].pos = p + 1
-      self.st[0].fresh = true
-      return true
+  # A member no field takes: skipped, or an error after disallow_unknown_fields!.
+  pub def unknown! {
+    if st[0].disallow {
+      fail!(JsonError.UnknownField(st[0].key))
+    } else {
+      skip!
     }
-    if c == 110 {
-      take_null!
-      return false
-    }
-    wrong!(p, kind_word(c), "array")
-    false
+    nil
   }
+
+  # A map key that should be an integer: the key's text (the position is at
+  # the member's value); a type error (Go's, at the key) when it isn't one.
+  pub def int_key!(bits: Int, signed: Bool, want: Str) -> I64? {
+    k = st[0].key
+    ok = num_text?(k)
+    if ok {
+      if signed {
+        one: U64 = 1
+        half = one << (bits - 1)
+        if v = int_text(k, half, half - 1) {
+          return v
+        }
+      } else if v = uint_text(k, bits) {
+        return v.as_i64
+      }
+    }
+    # the key's end: the colon's position
+    q = st[0].pos - 1
+    while q > 0 && s[q] != 34 { q -= 1 }
+    type_err!("number " + k, want, q + 1, st[0].pos)
+    skip!
+    none
+  }
+
+  # Consumes `[`. False if the value was null or not an array.
+  pub def open_arr!(want: Str = "array") -> Bool { open!(91, want) == 1 }
 
   # True if another element follows (the position is then at it); false at `]`
   # (or after an error).
@@ -775,6 +935,7 @@ pub struct Decoder {
       return
     }
     wrong!(p, kind_word(c), "tuple")
+    fail!(st[0].terr[0]) if st[0].terr.size > 0
     nil
   }
 
@@ -788,7 +949,7 @@ pub struct Decoder {
     }
     c = s[p]
     if c == 93 {
-      wrong!(p, "array of length " + k.to_s, "tuple of length " + n.to_s)
+      fail!(JsonError.Type(value: "array of length " + k.to_s, type_name: "tuple of length " + n.to_s, offset: p + st[0].base, struct_name: "", field: "", cause: ""))
       return
     }
     if k > 0 {
@@ -811,7 +972,7 @@ pub struct Decoder {
       return
     }
     if s[p] != 93 {
-      wrong!(p, "array of length more than " + n.to_s, "tuple of length " + n.to_s)
+      fail!(JsonError.Type(value: "array of length more than " + n.to_s, type_name: "tuple of length " + n.to_s, offset: p + st[0].base, struct_name: "", field: "", cause: ""))
       return
     }
     self.st[0].pos = p + 1
@@ -857,6 +1018,7 @@ pub struct Decoder {
       return k
     }
     wrong!(p, kind_word(c), "enum")
+    fail!(st[0].terr[0]) if st[0].terr.size > 0
     ""
   }
 
@@ -873,7 +1035,7 @@ pub struct Decoder {
   pub def need_payload!(wrapped: Bool) {
     return if st[0].failed
     if !wrapped {
-      fail!(JsonError.Invalid(msg: "variant " + st[0].ctx + " needs a payload: {\"Variant\": ...}", offset: st[0].pos))
+      fail!(JsonError.Invalid(msg: "variant " + st[0].ctx + " needs a payload: {\"Variant\": ...}", offset: st[0].pos + st[0].base))
     }
     nil
   }
@@ -898,7 +1060,292 @@ pub struct Decoder {
 
   # Records "unknown variant" for an enum named `owner`.
   pub def bad_variant!(owner: Str, name: Str) {
-    fail!(JsonError.Invalid(msg: "unknown variant " + quote(name) + " for " + owner, offset: st[0].pos))
+    fail!(JsonError.Invalid(msg: "unknown variant " + quote(name) + " for " + owner, offset: st[0].pos + st[0].base))
+  }
+
+  # ======== Go's streaming Decoder (the state is in ss[0]; stream.alx)
+
+  # ---- reading
+
+  # Reads more input; false at the end (or after a read error, recorded).
+  def fill! -> Bool {
+    st = ss[0]
+    return false if st.eof || st.err.size > 0
+    # drop what was read
+    if st.pos > 4096 && st.pos * 2 > st.buf.size {
+      self.ss[0].off = st.off + st.pos
+      self.ss[0].buf = st.buf[st.pos...st.buf.size]
+      self.ss[0].pos = 0
+    }
+    p: [Byte] = [0; 4096]
+    r = ss[0].r
+    res = r.read!(p)
+    self.ss[0].r = r
+    if err = res.err {
+      self.ss[0].err << err
+      return false
+    }
+    n = res.unwrap
+    if n == 0 {
+      self.ss[0].eof = true
+      return false
+    }
+    self.ss[0].buf = ss[0].buf + Str.from_bytes(p[0...n])
+    true
+  }
+
+  # The index (in buf) of the next non-space byte, reading as needed; buf.size at the end.
+  def peek_ws! -> Int {
+    loop {
+      b = ss[0].buf
+      p = ss[0].pos
+      while p < b.size && white?(b[p]) { p += 1 }
+      self.ss[0].pos = p
+      return p if p < b.size
+      return p if !fill!
+    }
+  }
+
+  # The end (in buf) of the value starting at p, reading until it is
+  # complete; or a negative error code (decode.alx) relative to buf.
+  def value_end!(p: Int) -> Int {
+    loop {
+      b = ss[0].buf
+      e = skip_value(b, p, ss[0].kinds.size)
+      if e >= 0 {
+        # a number at the end of the input may go on
+        c = b[p]
+        return e if !(c == 45 || is_digit(c)) || e < b.size || ss[0].eof
+      } else {
+        v = -e - 1
+        return e if v % 64 != E_EOF || ss[0].eof
+      }
+      if !fill! {
+        return value_end!(p) if ss[0].eof
+        return code(b.size, E_EOF)
+      }
+    }
+  }
+
+  # The error a code (relative to buf) stands for, with stream offsets.
+  def stream_err(c: Int) -> JsonError {
+    rebase(err_from(ss[0].buf, c), ss[0].off)
+  }
+
+  # Records a syntax error (sticky); returns it.
+  def sfail!(e: JsonError) -> JsonError {
+    self.ss[0].err << e if ss[0].err.size == 0
+    e
+  }
+
+  # Moves past the separators before the next token: the `,` or `:` the
+  # grammar needs there. The position is then at the token (buf.size at the
+  # end of input). `close`: a closing delimiter may come instead.
+  def separate! -> ~Int<JsonError> {
+    p = peek_ws!
+    b = ss[0].buf
+    k = ss[0].kinds.size
+    return p if k == 0 || p >= b.size
+    top = ss[0].kinds[k - 1]
+    n = ss[0].lens[k - 1]
+    c = b[p]
+    if top == 123 && n % 2 == 1 {
+      fail sfail!(rebase(err_char(b, p, "after object key"), ss[0].off)) if c != 58
+      self.ss[0].pos = p + 1
+      return peek_ws!
+    }
+    return p if n == 0
+    if c == 44 {
+      self.ss[0].pos = p + 1
+      q = peek_ws!
+      b2 = ss[0].buf
+      if q < b2.size && top == 123 && b2[q] != 34 {
+        fail sfail!(rebase(err_char(b2, q, "looking for beginning of object key string"), ss[0].off))
+      }
+      if q < b2.size && top == 91 && (b2[q] == 93 || b2[q] == 125) {
+        fail sfail!(rebase(err_char(b2, q, "looking for beginning of value"), ss[0].off))
+      }
+      return q
+    }
+    return p if c == 93 || c == 125
+    fail sfail!(rebase(err_char(b, p, top == 91 ? "after array element" : "after object key:value pair"), ss[0].off))
+  }
+
+  # Counts a token at the current level.
+  def count! {
+    k = ss[0].kinds.size
+    self.ss[0].lens[k - 1] += 1 if k > 0
+    nil
+  }
+
+  # ---- Go's Decoder API
+
+  # Go's UseNumber: a number read into a Value or as a token is a Number.
+  pub def use_number! {
+    self.st[0].use_number = true
+  }
+
+  # Go's DisallowUnknownFields: an object member no field takes is an error.
+  pub def disallow_unknown_fields! {
+    self.st[0].disallow = true
+  }
+
+  # The text of the next JSON value in the stream (its syntax checked);
+  # none at the end of the input.
+  pub def read_value! -> ~Str? {
+    fail ss[0].err[0] if ss[0].err.size > 0
+    p = ~separate!
+    b = ss[0].buf
+    if p >= b.size {
+      fail ss[0].err[0] if ss[0].err.size > 0
+      return none if ss[0].kinds.size == 0
+      fail sfail!(io.StreamError.UnexpectedEof)
+    }
+    if ss[0].kinds.size > 0 && (b[p] == 93 || b[p] == 125) {
+      fail sfail!(rebase(err_char(b, p, "looking for beginning of value"), ss[0].off))
+    }
+    e = value_end!(p)
+    b = ss[0].buf
+    if e < 0 {
+      fail ss[0].err[0] if ss[0].err.size > 0
+      v2 = -e - 1
+      fail sfail!(io.StreamError.UnexpectedEof) if v2 % 64 == E_EOF
+      fail sfail!(stream_err(e))
+    }
+    self.ss[0].pos = e
+    self.ss[0].peeked = false
+    self.ss[0].had_eof = false
+    self.ss[0].vstart = ss[0].off + p
+    count!
+    b[p...e]
+  }
+
+  # Go's Decode exactly: reads the next JSON value into a copy of v (fields
+  # the input doesn't name keep v's values) and returns it with the first
+  # error: as far as it was decoded after a type error, v itself after a
+  # syntax or read error. (none, none) at the end of the input (Go's io.EOF).
+  pub def decode_partial![T](v: T) -> (T?, Error?) {
+    r = read_value!
+    if err = r.err {
+      return (v, err)
+    }
+    text = r.unwrap || return (none, none)
+    d = new_decoder(text)
+    d.st[0].use_number = st[0].use_number
+    d.st[0].disallow = st[0].disallow
+    d.st[0].base = ss[0].vstart
+    out = dec_val(d, v)
+    done = d.done!
+    if err = done.err {
+      return (out, err)
+    }
+    (out, none)
+  }
+
+  # Go's Decode: reads the next JSON value and decodes it into a copy of v
+  # (Go's Unmarshal into &v: fields the input doesn't name keep v's values),
+  # returned; none at the end of the input (Go's io.EOF).
+  pub def decode![T](v: T) -> ~T? {
+    r, err = decode_partial!(v)
+    fail err.unwrap if err.some?
+    r
+  }
+
+  # Go's Token: the next token (separators are implicit); none at the end of
+  # the input.
+  pub def token! -> ~Token? {
+    fail ss[0].err[0] if ss[0].err.size > 0
+    p = ~separate!
+    b = ss[0].buf
+    if p >= b.size {
+      fail ss[0].err[0] if ss[0].err.size > 0
+      # Go: io.EOF when only separators are left
+      self.ss[0].had_eof = true
+      return none
+    }
+    self.ss[0].peeked = false
+    self.ss[0].had_eof = false
+    c = b[p]
+    k = ss[0].kinds.size
+    if c == 123 || c == 91 {
+      count!
+      self.ss[0].kinds << c.to_i
+      self.ss[0].lens << 0
+      self.ss[0].pos = p + 1
+      return Token.Delim(c.to_i32)
+    }
+    if c == 125 || c == 93 {
+      want = k > 0 ? (ss[0].kinds[k - 1] == 123 ? 125 : 93) : -1
+      if c.to_i != want || (want == 125 && ss[0].lens[k - 1] % 2 == 1) {
+        where = "looking for beginning of value"
+        if k > 0 && ss[0].lens[k - 1] > 0 {
+          where = ss[0].kinds[k - 1] == 91 ? "after array element" : "after object key:value pair"
+        }
+        fail sfail!(rebase(err_char(b, p, where), ss[0].off))
+      }
+      self.ss[0].kinds = ss[0].kinds[0...(k - 1)]
+      self.ss[0].lens = ss[0].lens[0...(k - 1)]
+      self.ss[0].pos = p + 1
+      return Token.Delim(c.to_i32)
+    }
+    if k > 0 && ss[0].kinds[k - 1] == 123 && ss[0].lens[k - 1] % 2 == 0 && c != 34 {
+      fail sfail!(rebase(err_char(b, p, "looking for beginning of object key string"), ss[0].off))
+    }
+    e = value_end!(p)
+    b = ss[0].buf
+    if e < 0 {
+      fail ss[0].err[0] if ss[0].err.size > 0
+      v2 = -e - 1
+      fail sfail!(io.StreamError.UnexpectedEof) if v2 % 64 == E_EOF
+      fail sfail!(stream_err(e))
+    }
+    self.ss[0].pos = e
+    count!
+    t = b[p...e]
+    return Token.String(unquote_at(t, 0)) if c == 34
+    return Token.Bool(true) if c == 116
+    return Token.Bool(false) if c == 102
+    return Token.Null if c == 110
+    return Token.Num(Number.new(t)) if st[0].use_number
+    if f = parse_number(t) {
+      return Token.Float(f)
+    }
+    fail JsonError.Type(value: "number " + t, type_name: "Float", offset: ss[0].off + e, struct_name: "", field: "", cause: "")
+  }
+
+  # Go's More: is there another element in the current array or object (or
+  # another value at the top level)?
+  pub def more? -> Bool {
+    self.ss[0].peeked = true
+    return false if ss[0].err.size > 0
+    p = peek_ws!
+    b = ss[0].buf
+    return false if p >= b.size
+    c = b[p]
+    c != 93 && c != 125
+  }
+
+  # Go's Buffered: the input read from the reader but not yet decoded.
+  pub def buffered -> bytes.Reader {
+    b = ss[0].buf
+    bytes.new_reader(b[ss[0].pos...b.size].bytes)
+  }
+
+  # Go's InputOffset: the offset in the stream after the last token or value.
+  pub def input_offset -> Int {
+    st = ss[0]
+    off = st.off + st.pos
+    if st.peeked || st.had_eof {
+      # the spaces after it count once the next token was looked for
+      b = st.buf
+      p = st.pos
+      while p < b.size && white?(b[p]) { p += 1 }
+      if p < b.size {
+        off = st.off + p
+        off += 1 if st.had_eof && (b[p] == 44 || b[p] == 58)
+      }
+    }
+    off
   }
 
   # ---- skipping and the end
@@ -915,12 +1362,241 @@ pub struct Decoder {
   pub def done! -> ~Unit<JsonError> {
     fail st[0].errs[0] if st[0].failed
     p = skip_ws(s, st[0].pos)
-    fail err_char(s[p], "after top-level value", p) if p < s.size
+    fail rebase(err_char(s, p, "after top-level value"), st[0].base) if p < s.size
+    fail st[0].terr[0] if st[0].terr.size > 0
   }
 }
 
-pub def new_decoder(s: Str) -> Decoder {
-  Decoder.new(s: s, st: [DState.new(pos: 0, key: "", ctx: "", wrapped: false, fresh: false, failed: false, errs: [])])
+# A decoder reading one JSON document: `s` a Str (what the derived from_json
+# and hand-written json_dec use), or, as Go's NewDecoder, an io.Reader
+# (stream.alx).
+pub def new_decoder[R](r: R) -> Decoder {
+  if R is Str {
+    Decoder.new(s: r, st: [new_dstate()], ss: [])
+  } else {
+    Decoder.new(s: "", st: [new_dstate()], ss: [new_sstate(r)])
+  }
+}
+
+def new_dstate -> DState {
+  DState.new(pos: 0, key: "", ctx: "", wrapped: false, fresh: false, failed: false, errs: [], terr: [], nerr: 0, root: "", root_set: false, use_number: false, disallow: false, base: 0)
+}
+
+# e with its offset moved by base (a value read from a stream).
+def rebase(e: JsonError, base: Int) -> JsonError {
+  return e if base == 0
+  case e {
+    JsonError.Syntax(m, o) => JsonError.Syntax(msg: m, offset: o + base)
+    _ => e
+  }
+}
+
+# The integer in the number text t (JSON's grammar), if it is one and fits
+# in -neg_lim..pos_lim.
+def int_text(t: Str, neg_lim: U64, pos_lim: U64) -> Int? {
+  i = 0
+  neg = false
+  if t[0] == 45 {
+    neg = true
+    i = 1
+  }
+  u: U64 = 0
+  lim = neg ? neg_lim : pos_lim
+  while i < t.size {
+    d = t[i]
+    return none if !is_digit(d)
+    dv = (d - 48).to_u64
+    return none if u > (lim - dv) / 10
+    u = u * 10 + dv
+    i += 1
+  }
+  return 0 -% u.as_i64 if neg
+  u.as_i64
+}
+
+# The unsigned integer of `bits` bits in the number text t.
+def uint_text(t: Str, bits: Int) -> U64? {
+  return none if t[0] == 45
+  one: U64 = 1
+  lim: U64 = 18446744073709551615
+  lim = (one << bits) - 1 if bits < 64
+  u: U64 = 0
+  i = 0
+  while i < t.size {
+    d = t[i]
+    return none if !is_digit(d)
+    dv = (d - 48).to_u64
+    return none if u > (lim - dv) / 10
+    u = u * 10 + dv
+    i += 1
+  }
+  u
+}
+
+# The string s[start...e-1] (inside quotes; s[start...i] has no escapes),
+# unescaped: \uXXXX with surrogate pairs; a lone surrogate and invalid UTF-8
+# become U+FFFD.
+def unquote_slow(s: Str, start: Int, i0: Int, e: Int) -> Str {
+  b: [Byte] = []
+  j = start
+  while j < i0 {
+    b << s[j]
+    j += 1
+  }
+  i = i0
+  while i < e - 1 {
+    c = s[i]
+    if c == 92 {
+      i += 1
+      x = s[i]
+      if x == 98 {
+        b << 8
+      } else if x == 102 {
+        b << 12
+      } else if x == 110 {
+        b << 10
+      } else if x == 114 {
+        b << 13
+      } else if x == 116 {
+        b << 9
+      } else if x == 117 {
+        r = hex4(s, i + 1)
+        i += 4
+        if r >= 0xD800 && r < 0xDC00 {
+          # a high surrogate: needs \uDC00..\uDFFF right after
+          if i + 6 < e && s[i + 1] == 92 && s[i + 2] == 117 {
+            lo = hex4(s, i + 3)
+            if lo >= 0xDC00 && lo < 0xE000 {
+              r = 0x10000 + ((r - 0xD800) << 10) + (lo - 0xDC00)
+              i += 6
+            } else {
+              r = 0xFFFD
+            }
+          } else {
+            r = 0xFFFD
+          }
+        } else if r >= 0xDC00 && r < 0xE000 {
+          r = 0xFFFD
+        }
+        b = push_rune(b, r)
+      } else {
+        b << x
+      }
+      i += 1
+    } else if c < 128 {
+      b << c
+      i += 1
+    } else {
+      rr, w = utf8.decode_rune_at(s, i)
+      if rr == 0xFFFD && w == 1 {
+        b << 0xEF
+        b << 0xBF
+        b << 0xBD
+      } else {
+        k = 0
+        while k < w {
+          b << s[i + k]
+          k += 1
+        }
+      }
+      i += w
+    }
+  }
+  Str.from_bytes(b)
+}
+
+# The string literal at p (valid): its text.
+def unquote_at(s: Str, p: Int) -> Str {
+  e = str_end(s, p)
+  unquote_slow(s, p + 1, p + 1, e)
+}
+
+# One JSON Pointer token, as Go's v1 errors show it (~ as ~0, / as ~1).
+def ptr_token(k: Str) -> Str {
+  return k if !k.include?("~") && !k.include?("/")
+  strings.replace_all(strings.replace_all(k, "~", "~0"), "/", "~1")
+}
+
+# The path to the value starting at `at` in the (valid) document s: member
+# names and array indices joined with dots (Go's UnmarshalTypeError.Field).
+def path_at(s: Str, at: Int) -> Str {
+  objs: [Bool] = []
+  names: [Str] = []
+  idx: [Int] = []
+  p = skip_ws(s, 0)
+  loop {
+    p = skip_ws(s, p)
+    return names.join(".") if p >= at || p >= s.size
+    c = s[p]
+    if c == 123 || c == 91 {
+      q = skip_ws(s, p + 1)
+      if s[q] == 125 || s[q] == 93 {
+        p = q + 1
+      } else if c == 123 {
+        objs << true
+        idx << 0
+        names << ptr_token(unquote_at(s, q))
+        p = skip_ws(s, str_end(s, q)) + 1
+        next
+      } else {
+        objs << false
+        idx << 0
+        names << "0"
+        p = q
+        next
+      }
+    } else if c == 34 {
+      p = str_end(s, p)
+    } else if c == 116 || c == 110 {
+      p += 4
+    } else if c == 102 {
+      p += 5
+    } else {
+      p = num_end(s, p)
+    }
+    # after a value: commas and closings
+    loop {
+      return "" if objs.size == 0
+      p = skip_ws(s, p)
+      c2 = s[p]
+      if c2 == 44 {
+        p = skip_ws(s, p + 1)
+        top = objs.size - 1
+        if objs[top] {
+          names[top] = ptr_token(unquote_at(s, p))
+          p = skip_ws(s, str_end(s, p)) + 1
+        } else {
+          idx[top] += 1
+          names[top] = idx[top].to_s
+        }
+        break
+      }
+      # } or ]
+      objs = objs[0...(objs.size - 1)]
+      names = names[0...(names.size - 1)]
+      idx = idx[0...(idx.size - 1)]
+      p += 1
+    }
+  }
+}
+
+# Go's case-insensitive field match (after the exact names failed): the
+# index of the first name equal to key under Unicode case folding, or -1.
+pub def fold_index(key: Str, names: [Str]) -> Int {
+  i = 0
+  while i < names.size {
+    return i if strings.equal_fold(key, names[i])
+    i += 1
+  }
+  -1
+}
+
+# Go's []byte from a JSON string: standard base64 (padding required; \r and
+# \n are skipped).
+def decode_base64(t: Str) -> ~[Byte] {
+  u = t
+  u = strings.replace_all(strings.replace_all(u, "\r", ""), "\n", "") if u.include?("\r") || u.include?("\n")
+  base64.std_encoding.~decode_string(u)
 }
 
 # ---------------------------------------------------------------- numbers

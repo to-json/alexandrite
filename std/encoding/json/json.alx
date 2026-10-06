@@ -106,19 +106,40 @@
 import "strconv"
 import "unicode/utf8"
 
-# What can go wrong. `offset` is a byte offset into the input.
+# What can go wrong: Go's error types, one variant each. `offset` is a byte
+# offset into the input.
 pub error JsonError {
+  # Go's *SyntaxError: the offset is after the bytes that show the problem.
   Syntax(msg: Str, offset: Int)
-  Type(value: Str, want: Str, field: Str, offset: Int)
-  Unsupported(msg: Str)
+  # Go's *UnmarshalTypeError: the JSON value ("string", "number 1.5"), the alx
+  # type it could not go into, the offset after the value (after `[` / `{` for
+  # an array / object), the root type's name and the path from the root
+  # ("a.b.2", names as written in the input), and the cause's text ("" for none).
+  Type(value: Str, type_name: Str, offset: Int, struct_name: Str, field: Str, cause: Str)
+  # Go's *UnsupportedTypeError
+  UnsupportedType(type_name: Str)
+  # Go's *UnsupportedValueError ("NaN", "+Inf", "-Inf")
+  UnsupportedValue(str: Str)
+  # Go's *MarshalerError: a marshal_json / marshal_text method failed (or
+  # marshal_json wrote invalid JSON).
+  Marshaler(type_name: Str, cause: Str, source_func: Str)
+  # Go's `json: unknown field "x"` (Decoder.disallow_unknown_fields!)
+  UnknownField(name: Str)
+  # alx's own: an unknown enum variant and the like
   Invalid(msg: Str, offset: Int)
+  # the error an Unmarshaler returned (Go returns it as it is)
+  Custom(msg: Str)
 
   def message -> Str {
     case self {
       Syntax(m, _) => m
-      Type(v, w, f, _) => f == "" ? "json: cannot unmarshal " + v + " into value of type " + w : "json: cannot unmarshal " + v + " into field " + f + " of type " + w
-      Unsupported(m) => "json: unsupported value: " + m
+      Type(v, t, _, st, f, c) => type_error_text(v, t, st, f, c)
+      UnsupportedType(t) => "json: unsupported type: " + t
+      UnsupportedValue(v) => "json: unsupported value: " + v
+      Marshaler(t, c, src) => "json: error calling " + src + " for type " + t + ": " + c
+      UnknownField(n) => "json: unknown field " + strconv.quote(n)
       Invalid(m, _) => "json: " + m
+      Custom(m) => m
     }
   }
 
@@ -126,27 +147,78 @@ pub error JsonError {
   pub def offset -> Int {
     case self {
       Syntax(_, o) => o
-      Type(_, _, _, o) => o
-      Unsupported(_) => 0
+      Type(_, _, o, _, _, _) => o
       Invalid(_, o) => o
+      _ => 0
     }
   }
+}
+
+# Go's UnmarshalTypeError.Error (Go 1.27): "Go struct field" unless the path
+# ends in an array index.
+def type_error_text(v: Str, t: Str, st: Str, f: Str, c: Str) -> Str {
+  s = ""
+  if st != "" || f != "" {
+    into = "Go struct field "
+    i = f.size
+    while i > 0 && f[i - 1] != 46 { i -= 1 }
+    digits = i < f.size
+    j = i
+    while j < f.size {
+      digits = false if !is_digit(f[j])
+      j += 1
+    }
+    into = "" if digits
+    s = "json: cannot unmarshal " + v + " into " + into + st + "." + f + " of type " + t
+  } else {
+    s = "json: cannot unmarshal " + v + " into Go value of type " + t
+  }
+  s = s + ": " + c if c != ""
+  s
 }
 
 HEX = "0123456789abcdef"
 
 # ------------------------------------------------------------------ helpers
 
-# Go's quoteChar: the byte c as a quoted character for syntax errors.
-def quote_char(c: Int) -> Str {
-  return "'\\''" if c == 39
-  return "'\"'" if c == 34
-  q = strconv.quote_rune(c.to_i32)
-  q
+# Go's jsonwire.QuoteRune: the rune at s[p] quoted ('\xff' for a byte that
+# isn't UTF-8), and its width.
+def quote_rune_at(s: Str, p: Int) -> (Str, Int) {
+  r, w = utf8.decode_rune_at(s, p)
+  return ("'\\x" + strconv.format_uint(s[p].to_u64, 16) + "'", 1) if r == 0xFFFD && w == 1
+  (strconv.quote_rune(r), w)
 }
 
-def err_char(c: Byte, ctx: Str, off: Int) -> JsonError {
-  JsonError.Syntax(msg: "invalid character " + quote_char(c.to_i) + " " + ctx, offset: off)
+# The invalid character at s[p] (Go 1.27's error, with v1's offset: after it).
+def err_char(s: Str, p: Int, ctx: Str) -> JsonError {
+  q, w = quote_rune_at(s, p)
+  JsonError.Syntax(msg: "invalid character " + q + " " + ctx, offset: p + w)
+}
+
+# unicode.IsSpace, without the tables.
+def space_rune?(r: Rune) -> Bool {
+  return true if (r >= 9 && r <= 13) || r == 32 || r == 0x85 || r == 0xA0 || r == 0x1680
+  return true if (r >= 0x2000 && r <= 0x200A) || r == 0x2028 || r == 0x2029 || r == 0x202F || r == 0x205F || r == 0x3000
+  false
+}
+
+# Go's jsonwire InvalidTextError text for the raw text w.
+def what_text(w: Str) -> Str {
+  return quote_rune_at(w, 0)[0] if utf8.rune_count_in_string(w) == 1
+  esc = false
+  i = 0
+  while i < w.size {
+    r, n = utf8.decode_rune_at(w, i)
+    esc = true if r == 96 || r == 0xFFFD || space_rune?(r) || !strconv.is_print(r)
+    i += n
+  }
+  return strconv.quote(w) if esc
+  "`" + w + "`"
+}
+
+# An invalid escape sequence: the text s[bs...e] (e is also the offset).
+def err_escape(s: Str, bs: Int, e: Int) -> JsonError {
+  JsonError.Syntax(msg: "invalid escape sequence " + what_text(s[bs...e]) + " in string", offset: e)
 }
 
 def err_eof(off: Int) -> JsonError {

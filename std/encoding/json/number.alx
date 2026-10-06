@@ -1,0 +1,232 @@
+#![overflow(wrap)]
+# Number, RawMessage, Unmarshal, and the dispatch derived decoders use for
+# values of named types (Go's Unmarshaler / TextUnmarshaler first).
+
+import "encoding"
+import "strconv"
+
+# What a derived type has: decoding merges into an existing value
+# (`json_merge`), as Go's Unmarshal does into the value a pointer points at.
+pub interface JsonMergeable {
+  def json_mergeable -> Bool
+}
+
+# Go's Number: a JSON number's text (Decoder.use_number!, or a field of this
+# type). The zero Number encodes as 0.
+pub struct Number {
+  s: Str
+
+  pub def to_s -> Str { s }
+
+  # Go's Float64: strconv.parse_float of the text.
+  pub def float64 -> ~Float { strconv.~parse_float(s) }
+
+  # Go's Int64: strconv.parse_int(text, 10, 64).
+  pub def int64 -> ~Int { strconv.~parse_int(s, 10, 64) }
+
+  pub def json_str(e: Encoder) -> Str {
+    return "0" if s == ""
+    if !valid_number?(s) {
+      e.fail!(JsonError.Marshaler(type_name: "json.Number", cause: "cannot parse " + strconv.quote(s) + " as JSON number: invalid syntax", source_func: "marshal_json"))
+      return "null"
+    }
+    s
+  }
+
+  pub def json_enc(e: Encoder) { e.raw!(json_str(e)) }
+
+  pub def json_is_zero -> Bool { s == "" }
+
+  pub def self.json_zero -> Number { Number.new(s: "") }
+
+  pub def json_mergeable -> Bool { true }
+
+  # A number, or a string holding one (Go accepts both); null keeps the value.
+  # Go's errors here carry no offset or field.
+  pub def json_merge(d: Decoder) -> Number {
+    dd = d
+    p = dd.start!
+    return self if p < 0
+    c = dd.s[p]
+    if c == 110 {
+      dd.skip!
+      return self
+    }
+    if c == 34 {
+      t = dd.str!
+      return Number.new(s: t) if valid_number?(t)
+      dd.type_err!("string " + strconv.quote(t), "json.Number", -dd.st[0].base, 0, "invalid syntax")
+      return self
+    }
+    if c == 45 || is_digit(c) {
+      return Number.new(s: dd.raw_value!)
+    }
+    dd.skip!
+    dd.type_err!(kind_word(c), "json.Number", -dd.st[0].base, 0)
+    self
+  }
+
+  pub def self.json_dec(d: Decoder) -> Number { Number.json_zero.json_merge(d) }
+}
+
+# Go's isValidNumber: s is a JSON number, all of it.
+pub def valid_number?(s: Str) -> Bool {
+  s.size > 0 && (s[0] == 45 || is_digit(s[0])) && num_end(s, 0) == s.size
+}
+
+# Go's RawMessage: raw JSON text, kept as it was read and written compacted
+# (empty writes null). Its marshal_json / unmarshal_json! make it a
+# Marshaler and an Unmarshaler, as in Go.
+pub struct RawMessage {
+  data: [Byte]
+
+  pub def self.from(s: Str) -> RawMessage { RawMessage.new(data: s.bytes) }
+
+  pub def to_s -> Str { Str.from_bytes(data) }
+
+  pub def marshal_json -> ~[Byte] {
+    return "null".bytes if data.size == 0
+    data
+  }
+
+  pub def unmarshal_json!(b: [Byte]) -> ~Unit {
+    self.data = b.dup
+  }
+
+  pub def json_str(e: Encoder) -> Str { enc_val(e, self) }
+
+  pub def json_enc(e: Encoder) { e.raw!(json_str(e)) }
+
+  pub def self.json_zero -> RawMessage { RawMessage.new(data: []) }
+
+  pub def self.json_dec(d: Decoder) -> RawMessage { dec_val(d, RawMessage.json_zero) }
+}
+
+# The value read from d into a copy of `old`: a Str, Bool, integer or Float
+# as Go reads them; for a named type: Go's
+# Unmarshaler first, then TextUnmarshaler (a string; null keeps the value),
+# then the derive's json_merge (fields the input doesn't name keep their
+# values), then the type's own json_dec.
+pub def dec_val[T](d: Decoder, old: T) -> T {
+  dd = d
+  if T is Str {
+    return dd.str!(old)
+  } else if T is Bool {
+    return dd.bool!(old)
+  } else if T is Int {
+    return dd.int!(old)
+  } else if T is I8 {
+    return dd.sint!(8, old.to_i).as_i8
+  } else if T is I16 {
+    return dd.sint!(16, old.to_i).as_i16
+  } else if T is I32 {
+    return dd.sint!(32, old.to_i).as_i32
+  } else if T is U8 {
+    return dd.uint!(8, old.to_u64).as_u8
+  } else if T is U16 {
+    return dd.uint!(16, old.to_u64).as_u16
+  } else if T is U32 {
+    return dd.uint!(32, old.to_u64).as_u32
+  } else if T is U64 {
+    return dd.uint!(64, old)
+  } else if T is Float {
+    return dd.float!(old)
+  } else if T is Unmarshaler {
+    raw = dd.raw_value!
+    return old if dd.failed
+    v = old
+    r = v.unmarshal_json!(raw.bytes)
+    if err = r.err {
+      dd.fail!(JsonError.Custom(err.message))
+      return old
+    }
+    return v
+  } else if T is encoding.TextUnmarshaler {
+    p = dd.start!
+    return old if p < 0
+    c = dd.s[p]
+    if c == 110 {
+      dd.skip!
+      return old
+    }
+    if c != 34 {
+      dd.wrong!(p, kind_word(c), format("%T", old), "JSON value must be string type")
+      return old
+    }
+    t = dd.str!
+    v = old
+    r = v.unmarshal_text!(t.bytes)
+    if err = r.err {
+      dd.type_err!("string", format("%T", old), dd.pos, p, err.message)
+      return old
+    }
+    return v
+  } else if T is JsonMergeable {
+    return old.json_merge(dd)
+  } else {
+    return T.json_dec(dd)
+  }
+}
+
+# A map key of a named type from its text (Go: a TextUnmarshaler); none
+# (and an error) when it can't be one.
+pub def dec_key[K](d: Decoder, zero: K) -> K? {
+  dd = d
+  if K is encoding.TextUnmarshaler {
+    v = zero
+    r = v.unmarshal_text!(dd.key.bytes)
+    if err = r.err {
+      q = dd.pos - 1
+      while q > 0 && dd.s[q] != 34 { q -= 1 }
+      dd.type_err!("string", format("%T", zero), q + 1, dd.pos, err.message)
+      dd.skip!
+      return none
+    }
+    return v
+  } else {
+    dd.fail!(JsonError.UnsupportedType("Map[" + format("%T", zero) + ", ...]"))
+    return none
+  }
+}
+
+# The text of a document given as a Str or as bytes.
+def text_of[D](data: D) -> Str {
+  if D is Str {
+    data
+  } else {
+    Str.from_bytes(data)
+  }
+}
+
+# Go's Unmarshal into a fresh value: `u: User = ~json.unmarshal(s)`. data is
+# a Str or [Byte]; T is a derived type (anything with json_zero and a
+# json_dec / json_merge, or an Unmarshaler with json_zero).
+pub def unmarshal[T, D](data: D) -> ~T<JsonError> {
+  ~unmarshal_into(data, T.json_zero)
+}
+
+# Go's Unmarshal into an existing value (fields the input doesn't name keep
+# v's values; a map gets the new keys): the result, or the first error.
+pub def unmarshal_into[T, D](data: D, v: T) -> ~T<JsonError> {
+  r, err = unmarshal_partial(data, v)
+  fail err.unwrap if err.some?
+  r
+}
+
+# Go's Unmarshal exactly: the value as far as it was decoded (Go goes on
+# after a type error, so the other fields are set) and the first error. On a
+# syntax error v comes back unchanged.
+pub def unmarshal_partial[T, D](data: D, v: T) -> (T, JsonError?) {
+  s = text_of(data)
+  c = check(s)
+  if err = c.err {
+    return (v, err)
+  }
+  d = new_decoder(s)
+  r = dec_val(d, v)
+  done = d.done!
+  if err = done.err {
+    return (r, err)
+  }
+  (r, none)
+}

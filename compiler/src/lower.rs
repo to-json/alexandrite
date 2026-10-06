@@ -3469,7 +3469,7 @@ impl<'a> Lw<'a> {
                 let v = self.expr(&args[0]);
                 LE::Rt(Rt::StrFromBytes, vec![v])
             }
-            Dup if matches!(recv.unwrap().ty, Ty::Fn(..) | Ty::Struct(..)) => {
+            Dup if matches!(recv.unwrap().ty, Ty::Fn(..) | Ty::Struct(..) | Ty::Iface(_)) => {
                 let r = recv.unwrap();
                 let v = self.expr(r);
                 let t = self.lty(&r.ty);
@@ -4098,6 +4098,33 @@ impl<'a> Lw<'a> {
                     }
                 });
                 self.emit(LS::If(same, body, vec![]));
+                LE::Var(out)
+            }
+            ErrEq => {
+                // The same error type, its `__eq` of the two payloads, and the
+                // same wrap context (#260). Not the location.
+                let et = self.lty(&Ty::Error);
+                let a = self.expr(recv.unwrap());
+                let a = self.bind(a, et.clone());
+                let b = self.expr(&args[0]);
+                let b = self.bind(b, et);
+                let (ba, bb) = (err_body(a), err_body(b));
+                let out = self.tmp(LTy::Bool);
+                self.emit(LS::Set(out, LE::B(false)));
+                let eqs = self.p.iface_eqs.get("Error").cloned().unwrap_or_default();
+                let tag_a = LE::Field(Box::new(ba.clone()), 0);
+                let same_tag = LE::Cmp(Op::Eq, Box::new(tag_a.clone()), Box::new(LE::Field(Box::new(bb.clone()), 0)), LTy::I64);
+                let same_ctx = LE::Cmp(Op::Eq, Box::new(LE::Field(Box::new(ba.clone()), 2)), Box::new(LE::Field(Box::new(bb.clone()), 2)), LTy::Str);
+                let body = self.sub(|lw| {
+                    for (k, fid) in eqs.iter().enumerate() {
+                        let arm = lw.sub(|lw| {
+                            let (x, y) = (LE::Field(Box::new(ba.clone()), 3 + k), LE::Field(Box::new(bb.clone()), 3 + k));
+                            lw.emit(LS::Set(out, LE::Call(lw.p.funcs[*fid].cname.clone(), vec![x, y])));
+                        });
+                        lw.emit(LS::If(LE::Cmp(Op::Eq, Box::new(tag_a.clone()), Box::new(LE::I(k as i64)), LTy::I64), arm, vec![]));
+                    }
+                });
+                self.emit(LS::If(same_tag, vec![LS::If(same_ctx, body, vec![])], vec![]));
                 LE::Var(out)
             }
             IfaceCall(mi) if matches!(recv.unwrap().ty, Ty::Array(_)) => {

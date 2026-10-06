@@ -130,7 +130,7 @@ pub fn allocates(e: &TExpr, promote: bool) -> bool {
             m,
             // Scalars, reads, and terminals that produce an element or a number
             // (their blocks' allocations are sites of their own).
-            M::TupleGet(_) | M::OptPresent | M::OptGet | M::Unwrap | M::EnumTag | M::Size | M::MapSize | M::MapHas | M::ChanLen | M::ResIsOk | M::ErrIs(_) | M::ErrAs(_) | M::IfaceIs(_) | M::IfaceAs(_) | M::IfaceEq
+            M::TupleGet(_) | M::OptPresent | M::OptGet | M::Unwrap | M::EnumTag | M::Size | M::MapSize | M::MapHas | M::ChanLen | M::ResIsOk | M::ErrIs(_) | M::ErrAs(_) | M::IfaceIs(_) | M::IfaceAs(_) | M::IfaceEq | M::ErrEq
                 | M::Even | M::Odd | M::IntSqrt | M::ToF | M::FloatToI | M::Conv(..) | M::FloatAbs | M::Sqrt | M::Math(_) | M::FloatBits | M::FloatFromBits | M::UMulHi | M::NowNs | M::PtrNull | M::CErrno
                 | M::Sum | M::Max | M::Min | M::MaxBy | M::MinBy | M::Count | M::All | M::Any | M::Include | M::First | M::Last | M::Find | M::Each | M::Loop | M::Step
                 | M::ChanClose | M::CapBegin | M::Exit | M::Global(_) | M::SetGlobal(_)
@@ -431,7 +431,7 @@ impl<'a> Graph<'a> {
                     && match &e.ty {
                         Ty::Array(t) => !has_storage(t),
                         Ty::Map(k, t) => !has_storage(k) && !has_storage(t),
-                        Ty::Fn(..) | Ty::Struct(..) => true,
+                        Ty::Fn(..) | Ty::Struct(..) | Ty::Iface(_) => true,
                         _ => false,
                     };
                 if !matches!(m, M::Spawn | M::Lock) && !flat_copy {

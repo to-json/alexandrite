@@ -90,6 +90,8 @@ struct Point {
 p = Point.new(x: 1, y: 2)            # omitted fields are zero
 interface Shape { def area -> Float }         # structural, like Go
 struct Box[T] { items: [T] }                  # generics; def max[T: like Int](xs: [T]) -> T
+struct Node { kids: [Node]; next: Node? }     # a type may hold itself through [T], Map, a T? field, closures (R12)
+struct Scaled { inner: Shape; k: Float }      # may hold a Shape and be one (R13); `==` works on interface values
 # State shared across copies (Go's pointer receivers): keep the mutable state in a
 # one-element slice field (`st: [State]`); see std/bytes Buffer and std/bufio.
 

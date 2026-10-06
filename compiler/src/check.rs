@@ -85,12 +85,21 @@ pub fn set_packages(public: std::collections::HashSet<String>, imports: HashMap<
     PKGS.with(|p| *p.borrow_mut() = (imports, public));
 }
 
-/// Enter package `pkg`; returns the previous one, for `leave_pkg`.
-pub fn enter_pkg(pkg: &str) -> String {
-    PKG.with(|p| std::mem::replace(&mut *p.borrow_mut(), pkg.to_string()))
+/// Restores the package context that was current at `enter_pkg` when dropped
+/// (also on early returns with `?`). `drop(guard)` leaves early.
+#[must_use]
+pub struct PkgGuard(Option<String>);
+impl Drop for PkgGuard {
+    fn drop(&mut self) {
+        if let Some(prev) = self.0.take() {
+            PKG.with(|p| *p.borrow_mut() = prev);
+        }
+    }
 }
-pub fn leave_pkg(prev: String) {
-    PKG.with(|p| *p.borrow_mut() = prev);
+
+/// Enter package `pkg`; the guard restores the previous one.
+pub fn enter_pkg(pkg: &str) -> PkgGuard {
+    PkgGuard(Some(PKG.with(|p| std::mem::replace(&mut *p.borrow_mut(), pkg.to_string()))))
 }
 pub fn current_pkg() -> String {
     PKG.with(|p| p.borrow().clone())
@@ -361,7 +370,7 @@ impl<'a> World<'a> {
                 ExprKind::Const(c) => {
                     let prev = enter_pkg(&pkg_of(&d.name));
                     let q = resolve_name(c, d.value.span, &|q| self.pending_consts.iter().any(|p| p.name == q));
-                    leave_pkg(prev);
+                    drop(prev);
                     q.is_ok_and(|q| self.pending_consts.iter().any(|p| p.name == q))
                 }
                 _ => false,
@@ -372,7 +381,7 @@ impl<'a> World<'a> {
             }
             let prev = enter_pkg(&pkg_of(&d.name));
             let v = self.eval_const(&d.value);
-            leave_pkg(prev);
+            drop(prev);
             let v = v.map_err(|e| if e.msg.starts_with("a constant must be computable") { not_constant(&d.name, e) } else { e })?;
             let prev = enter_pkg(&pkg_of(&d.name));
             let ty = match &d.ty {
@@ -403,7 +412,7 @@ impl<'a> World<'a> {
                 }
                 None => None,
             };
-            leave_pkg(prev);
+            drop(prev);
             self.consts.insert(d.name.clone(), (v, ty));
         }
         Ok(())
@@ -421,7 +430,7 @@ impl<'a> World<'a> {
             if let Some(e) = &d.embed {
                 let prev = enter_pkg(&pkg_of(&d.name));
                 let t = type_from(d.ty.as_ref().expect("an embedded constant is typed"), &self.structs, &self.consts);
-                leave_pkg(prev);
+                drop(prev);
                 let t = t?;
                 let files = e.files.iter().filter(|(n, _)| !n.ends_with('/')).count();
                 let short = d.name.rsplit('.').next().unwrap_or(&d.name);
@@ -444,7 +453,7 @@ impl<'a> World<'a> {
             let prev = enter_pkg(&pkg_of(&d.name));
             let ev = self.enum_const(&d.value);
             let want = d.ty.as_ref().map(|te| type_from(te, &self.structs, &self.consts));
-            leave_pkg(prev);
+            drop(prev);
             let (v, t) = match ev {
                 Some(r) => r?,
                 None => return Err(not_constant(&d.name, Diag::new(d.value.span, "a constant must be computable at compile time: literals, arrays of them, other constants, operators and enum variants without fields"))),
@@ -537,7 +546,7 @@ impl<'a> World<'a> {
             let sp = self.vars[k].span;
             let prev = enter_pkg(&pkg_of(&self.vars[k].name));
             let r = self.var_global(k, sp);
-            leave_pkg(prev);
+            drop(prev);
             r?;
         }
         let by_global: HashMap<usize, usize> = self.vars.iter().enumerate().map(|(k, v)| (v.global, k)).collect();
@@ -632,7 +641,7 @@ impl<'a> World<'a> {
                     if by_name.contains_key(q.as_str()) {
                         let prev = enter_pkg(&pkg_of(&q));
                         let r = resolve(&q, by_name, done, visiting, consts);
-                        leave_pkg(prev);
+                        drop(prev);
                         r?;
                     }
                 }
@@ -655,17 +664,28 @@ impl<'a> World<'a> {
             // a `Rec` (R12); `inline_cycle` refuses the layouts that can't be.
             done.insert(name.to_string(), Ty::Rec(name.to_string()));
             let prev = enter_pkg(&pkg_of(name));
-            let t = match d {
-                Def::S(s) => Ty::Struct(name.to_string(), Rc::new(fields_of(&s.fields, by_name, done, visiting, consts)?)),
-                Def::E(e) => {
-                    let mut vs = vec![];
-                    for (v, fs, _) in &e.variants {
-                        vs.push((v.clone(), fields_of(fs, by_name, done, visiting, consts)?));
+            let built: R<Ty> = (|| {
+                Ok(match d {
+                    Def::S(s) => Ty::Struct(name.to_string(), Rc::new(fields_of(&s.fields, by_name, done, visiting, consts)?)),
+                    Def::E(e) => {
+                        let mut vs = vec![];
+                        for (v, fs, _) in &e.variants {
+                            vs.push((v.clone(), fields_of(fs, by_name, done, visiting, consts)?));
+                        }
+                        Ty::Enum(name.to_string(), Rc::new(vs))
                     }
-                    Ty::Enum(name.to_string(), Rc::new(vs))
+                })
+            })();
+            drop(prev);
+            // An early return must not leave the placeholder `Rec` or the `visiting` entry behind.
+            let t = match built {
+                Ok(t) => t,
+                Err(e) => {
+                    done.remove(name);
+                    visiting.pop();
+                    return Err(e);
                 }
             };
-            leave_pkg(prev);
             visiting.pop();
             done.insert(name.to_string(), t.clone());
             Ok(t)
@@ -717,7 +737,7 @@ impl<'a> World<'a> {
             }
             let prev = enter_pkg(&pkg_of(&r.name));
             let t = type_from(&r.target, &self.structs, &self.consts);
-            leave_pkg(prev);
+            drop(prev);
             let t = t?;
             let word = texpr_word(&r.target);
             let mut ms = HashMap::new();
@@ -813,7 +833,7 @@ impl<'a> World<'a> {
         for d in defs {
             let prev = enter_pkg(&pkg_of(&d.name));
             let r = self.add_iface_sig(d);
-            leave_pkg(prev);
+            drop(prev);
             r?;
         }
         Ok(())
@@ -968,7 +988,7 @@ impl<'a> World<'a> {
                         Some((alias, n)) => import_path(alias).map_or_else(|| i.clone(), |p| format!("{p}.{n}")),
                         None => resolve_name(i, tp.span, &|q| self.ifaces.contains_key(q)).unwrap_or_else(|_| i.clone()),
                     };
-                    leave_pkg(prev);
+                    drop(prev);
                     if !self.ifaces.contains_key(&key) {
                         return Err(Diag::new(tp.span, format!("`{i}` isn't an interface")));
                     }
@@ -1031,7 +1051,7 @@ impl<'a> World<'a> {
                     }
                 }
             }
-            leave_pkg(prev);
+            drop(prev);
             let name = d.name.clone();
             let id = self.instance(i, tys, d.name_span)?;
             out.push((name, id));
@@ -1075,7 +1095,7 @@ impl<'a> World<'a> {
         let overflow = info.overflow;
         let prev_pkg = enter_pkg(&info.pkg);
         let r = self.instance_in_pkg(id, def, args, def_ast, overflow, call_span);
-        leave_pkg(prev_pkg);
+        drop(prev_pkg);
         r
     }
 
@@ -1446,7 +1466,7 @@ pub fn instantiate(n: &str, g: &GenDef, targs: Vec<Ty>, sp: Span, structs: &Stru
         GenDef::S(d) => fields(&d.fields).map(|fs| Ty::Struct(name.clone(), Rc::new(fs))),
         GenDef::E(d) => d.variants.iter().map(|(v, fs, _)| Ok((v.clone(), fields(fs)?))).collect::<R<Vec<_>>>().map(|vs| Ty::Enum(name.clone(), Rc::new(vs))),
     };
-    leave_pkg(prev);
+    drop(prev);
     DEPTH.with(|d| d.set(d.get() - 1));
     INSTANTIATING.with(|i| i.borrow_mut().pop());
     let t = r?;
@@ -2974,7 +2994,7 @@ impl<'w, 'a> FnCx<'w, 'a> {
                 self.site_salt = salt;
                 self.method = method;
                 self.scopes = scopes;
-                leave_pkg(prev);
+                drop(prev);
                 r?
             }
             ExprKind::OptCall(call) => {
@@ -3998,7 +4018,7 @@ impl<'w, 'a> FnCx<'w, 'a> {
             }),
             None => None,
         };
-        leave_pkg(prev);
+        drop(prev);
         let Some(Ty::Fn(ps, _)) = want.clone() else {
             return Err(Diag::new(b.span, format!("can't tell this block's parameter types from `{}`'s arguments; pass a lambda with typed parameters", d.name)));
         };
@@ -4348,7 +4368,7 @@ impl<'w, 'a> FnCx<'w, 'a> {
                 }
                 let prev = enter_pkg(pkg);
                 let back = subst_type(te, &out, &self.w.structs, &self.w.consts);
-                leave_pkg(prev);
+                drop(prev);
                 if back.as_ref() == Some(t) {
                     return Some((*def, tps.iter().map(|tp| out[&tp.name].clone()).collect()));
                 }
@@ -5546,7 +5566,7 @@ impl<'w, 'a> FnCx<'w, 'a> {
         let here = read(&*self.w)?;
         let prev = enter_pkg(&self.w.defs[di].pkg);
         let there = read(&*self.w);
-        leave_pkg(prev);
+        drop(prev);
         if there? != here {
             return None;
         }
@@ -5842,7 +5862,7 @@ impl<'w, 'a> FnCx<'w, 'a> {
                 (Some(t), true) => match {
                     let prev = enter_pkg(&self.w.defs[def].pkg);
                     let r = type_from(t, &self.w.structs, &self.w.consts);
-                    leave_pkg(prev);
+                    drop(prev);
                     r
                 } {
                     Ok(t) => self.value_as(a, &t)?,
@@ -5975,7 +5995,7 @@ impl<'w, 'a> FnCx<'w, 'a> {
                     match self.coerce(a.clone(), &want) {
                         Ok(v) => *a = v,
                         Err(e) => {
-                            leave_pkg(prev);
+                            drop(prev);
                             return Err(e);
                         }
                     }
@@ -5992,7 +6012,7 @@ impl<'w, 'a> FnCx<'w, 'a> {
             }
             for (tp, want) in d.tparams.iter().zip(&owner_targs) {
                 if let Some(got) = out.get(&tp.name).filter(|got| *got != want && !got.has_var()) {
-                    leave_pkg(prev);
+                    drop(prev);
                     return Err(Diag::new(name_span, format!("`{name}`: `{}` is {}, but the arguments make it {}", tp.name, want.show(), got.show())));
                 }
             }
@@ -6002,13 +6022,13 @@ impl<'w, 'a> FnCx<'w, 'a> {
         let saved = match self.w.bind(def, &arg_tys, sp) {
             Ok(s) => s,
             Err(e) => {
-                leave_pkg(prev);
+                drop(prev);
                 return Err(e);
             }
         };
         let r = self.call_def_args(name_span, &d, ext, args);
         self.w.unbind(saved);
-        leave_pkg(prev);
+        drop(prev);
         let targs = r?;
         self.call_def_inst(def, name, name_span, targs, extra, sp, &d)
     }
@@ -6213,7 +6233,7 @@ impl<'w, 'a> FnCx<'w, 'a> {
                     for (a, p) in args.iter().zip(&d.params) {
                         let prev = enter_pkg(&self.w.defs[def].pkg);
                         let want = p.ty.as_ref().and_then(|te| subst_type(te, &env, &self.w.structs, &self.w.consts));
-                        leave_pkg(prev);
+                        drop(prev);
                         targs.push(match want {
                             Some(w) if !w.has_var() => self.value_as(a, &w)?,
                             _ => self.value(a)?,
@@ -6252,7 +6272,7 @@ impl<'w, 'a> FnCx<'w, 'a> {
                             Some(t) => {
                                 let prev = enter_pkg(&self.w.defs[def].pkg);
                                 let r = type_from(t, &self.w.structs, &self.w.consts);
-                                leave_pkg(prev);
+                                drop(prev);
                                 match r {
                                     Ok(t) => self.value_as(a, &t)?,
                                     Err(_) => self.value(a)?,

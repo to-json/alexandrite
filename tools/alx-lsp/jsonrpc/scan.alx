@@ -1,0 +1,263 @@
+# A small allocation-light JSON scanner for the big messages.
+#
+# Why not encoding/json: parsing or re-encoding a 100 KB didChange through the
+# json package keeps about 1 MB per message alive for the life of the process
+# (its decoder state is a one-element slice shared with callees, which pins the
+# data to the program region: port-issues). A server that gets thousands of
+# edits cannot afford that, so the hot path scans the raw text instead:
+# `raw` finds the text of a value by key path, `string_at` decodes a string.
+# Everything here is plain Str and [Byte] work, freed with the iteration.
+#
+# It assumes well-formed JSON (the client's); on malformed input lookups fail
+# (none) rather than panic. Keys are compared as written (no escapes).
+
+import "strconv"
+import "strings"
+
+def ws?(c: Byte) -> Bool { c == 32 || c == 10 || c == 13 || c == 9 }
+
+def skip_ws(s: Str, i: Int) -> Int {
+  j = i
+  while j < s.size && ws?(s[j]) {
+    j += 1
+  }
+  j
+}
+
+# After the string literal starting at i (s[i] == '"'); -1 if unterminated.
+def skip_string(s: Str, i: Int) -> Int {
+  j = i + 1
+  while j < s.size {
+    c = s[j]
+    return j + 1 if c == 34
+    j += c == 92 ? 2 : 1
+  }
+  -1
+}
+
+# After the value starting at i; -1 on malformed input.
+pub def skip_value(s: Str, i0: Int) -> Int {
+  i = skip_ws(s, i0)
+  return -1 if i >= s.size
+  c = s[i]
+  return skip_string(s, i) if c == 34
+  if c == 123 || c == 91 {
+    depth = 0
+    j = i
+    while j < s.size {
+      d = s[j]
+      if d == 34 {
+        j = skip_string(s, j)
+        return -1 if j < 0
+        next
+      }
+      depth += 1 if d == 123 || d == 91
+      depth -= 1 if d == 125 || d == 93
+      j += 1
+      return j if depth == 0
+    }
+    return -1
+  }
+  j = i
+  while j < s.size && s[j] != 44 && s[j] != 125 && s[j] != 93 && !ws?(s[j]) {
+    j += 1
+  }
+  j
+}
+
+# The start of the value of `key` in the object starting at i; -1 if absent.
+def member(s: Str, i0: Int, key: Str) -> Int {
+  i = skip_ws(s, i0)
+  return -1 if i >= s.size || s[i] != 123
+  i += 1
+  loop {
+    i = skip_ws(s, i)
+    return -1 if i >= s.size || s[i] == 125
+    if s[i] == 44 {
+      i += 1
+      next
+    }
+    return -1 if s[i] != 34
+    e = skip_string(s, i)
+    return -1 if e < 0
+    k = s[(i + 1)...(e - 1)]
+    i = skip_ws(s, e)
+    return -1 if i >= s.size || s[i] != 58
+    i = skip_ws(s, i + 1)
+    return i if k == key
+    i = skip_value(s, i)
+    return -1 if i < 0
+  }
+  -1
+}
+
+def lookup(s: Str, keys: [Str]) -> Int {
+  i = 0
+  for k in keys {
+    i = member(s, i, k)
+    return -1 if i < 0
+  }
+  skip_ws(s, i)
+}
+
+# The raw JSON text of the value at a key path, or none.
+pub def raw(s: Str, keys: [Str]) -> Str? {
+  i = lookup(s, keys)
+  return none if i < 0
+  e = skip_value(s, i)
+  return none if e < 0
+  s[i...e]
+}
+
+pub def string_at(s: Str, keys: [Str]) -> Str? {
+  r = raw(s, keys) || return none
+  unquote(r)
+}
+
+pub def int_at(s: Str, keys: [Str]) -> Int? {
+  r = raw(s, keys) || return none
+  n = strconv.atoi(r)
+  return none unless n.ok?
+  n.unwrap
+}
+
+# The raw text of each element of an array value.
+pub def elements(arr: Str) -> [Str] {
+  out: [Str] = []
+  i = skip_ws(arr, 0)
+  return out if i >= arr.size || arr[i] != 91
+  i += 1
+  loop {
+    i = skip_ws(arr, i)
+    break if i >= arr.size || arr[i] == 93
+    if arr[i] == 44 {
+      i += 1
+      next
+    }
+    e = skip_value(arr, i)
+    break if e < 0
+    out << arr[i...e]
+    i = e
+  }
+  out
+}
+
+def hex4(s: Str, i: Int) -> Int {
+  return -1 if i + 4 > s.size
+  v = 0
+  for k in 0...4 {
+    c = s[i + k]
+    d = -1
+    d = (c - 48).to_i if c >= 48 && c <= 57
+    d = (c - 97).to_i + 10 if c >= 97 && c <= 102
+    d = (c - 65).to_i + 10 if c >= 65 && c <= 70
+    return -1 if d < 0
+    v = v * 16 + d
+  }
+  v
+}
+
+def put_rune(out: [Byte], cp: Int) -> [Byte] {
+  o = out
+  if cp < 0x80 {
+    o << cp.as_u8
+  } else if cp < 0x800 {
+    o << (0xC0 | (cp >> 6)).as_u8
+    o << (0x80 | (cp & 0x3F)).as_u8
+  } else if cp < 0x10000 {
+    o << (0xE0 | (cp >> 12)).as_u8
+    o << (0x80 | ((cp >> 6) & 0x3F)).as_u8
+    o << (0x80 | (cp & 0x3F)).as_u8
+  } else {
+    o << (0xF0 | (cp >> 18)).as_u8
+    o << (0x80 | ((cp >> 12) & 0x3F)).as_u8
+    o << (0x80 | ((cp >> 6) & 0x3F)).as_u8
+    o << (0x80 | (cp & 0x3F)).as_u8
+  }
+  o
+}
+
+# A fresh copy: a result that is stored in the server's document map must not
+# alias the message it was cut from, or the whole message is kept alive with it
+# (the region analysis cannot free storage that a stored value may share).
+pub def copy_of(s: Str) -> Str {
+  out: [Byte] = []
+  for c in s.bytes {
+    out << c
+  }
+  Str.from_bytes(out)
+}
+
+# The value of a string literal (with its quotes); none if it is not a string.
+pub def unquote(lit: Str) -> Str? {
+  return none if lit.size < 2 || lit[0] != 34 || lit[lit.size - 1] != 34
+  body = lit[1...(lit.size - 1)]
+  return copy_of(body) unless strings.contains(body, "\\")
+  out: [Byte] = []
+  i = 0
+  n = body.size
+  while i < n {
+    c = body[i]
+    if c != 92 || i + 1 >= n {
+      out << c
+      i += 1
+      next
+    }
+    e = body[i + 1]
+    i += 2
+    case e {
+      110 => out << 10
+      116 => out << 9
+      114 => out << 13
+      98 => out << 8
+      102 => out << 12
+      117 => {
+        cp = hex4(body, i)
+        return none if cp < 0
+        i += 4
+        if cp >= 0xD800 && cp < 0xDC00 && i + 6 <= n && body[i] == 92 && body[i + 1] == 117 {
+          lo = hex4(body, i + 2)
+          if lo >= 0xDC00 && lo < 0xE000 {
+            cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00)
+            i += 6
+          }
+        }
+        out = put_rune(out, cp)
+      }
+      _ => out << e # \" \\ \/
+    }
+  }
+  Str.from_bytes(out)
+}
+
+# A Str as a JSON string literal.
+pub def quote(s: Str) -> Str {
+  digits = "0123456789abcdef"
+  out: [Byte] = [34]
+  for c in s.bytes {
+    if c == 34 || c == 92 {
+      out << 92
+      out << c
+    } else if c == 10 {
+      out << 92
+      out << 110
+    } else if c == 13 {
+      out << 92
+      out << 114
+    } else if c == 9 {
+      out << 92
+      out << 116
+    } else if c < 32 {
+      out << 92
+      out << 117
+      out << 48
+      out << 48
+      out << digits[(c / 16).to_i]
+      out << digits[(c % 16).to_i]
+    } else {
+      out << c
+    }
+  }
+  out << 34
+  Str.from_bytes(out)
+}

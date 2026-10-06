@@ -1,0 +1,1127 @@
+#![test(external)]
+# Go's bufio_test.go (package bufio_test), translated.
+#
+# Not translated, and why:
+#  - TestZeroReader, TestReadZero, TestWriterReadFromUntilEOF,
+#    TestWriterReadFromErrNoProgress: a reader returning 0 is at its end here
+#    (io's shape), so empty reads that aren't the end can't be expressed.
+#  - TestNewReaderSizeIdempotent, TestNewWriterSizeIdempotent, and the
+#    "bufio over a bufio" parts of TestReaderReset / TestWriterReset: a
+#    bufio.Reader / Writer isn't an io.Reader / Writer here (see bufio's
+#    header).
+#  - TestWriteStringStringWriter, TestWriterReadFromWithBufferedData,
+#    TestWriterReadFromMustSetUnderlyingError: Go asks the wrapped writer at
+#    run time for WriteString / ReadFrom; alx has no type assertions, so the
+#    Writer always goes through write!.
+#  - TestReadStringAllocs (allocation counts), the benchmarks.
+#  - TestWriterAppend's capacity checks: alx slices have no spare capacity
+#    (appending to available_buffer copies).
+# Readers that return data together with io.EOF in Go return the data, then
+# 0, here.
+
+import "bufio"
+import "bytes"
+import "io"
+import "strings"
+import "testing/iotest"
+import "unicode/utf8"
+
+MIN_READ_BUFFER_SIZE = 16
+
+def sreader(s: Str) -> bytes.Reader {
+  bytes.new_reader(s.bytes.to_a)
+}
+
+def bytes_of(s: Str) -> [Byte] {
+  s.bytes.to_a
+}
+
+def timeout?(e: Error) -> Bool {
+  case e {
+    iotest.IotestError.Timeout => true
+    _ => false
+  }
+}
+
+error PipeErr {
+  ClosedPipe
+  Fake
+  FiveThenError
+
+  def message -> Str {
+    case self {
+      ClosedPipe => "io: read/write on closed pipe"
+      Fake => "fake error"
+      FiveThenError => "5-then-error"
+    }
+  }
+}
+
+# Reads from a reader and rot13s the result.
+struct Rot13Reader[R] {
+  st: [R]
+
+  def read!(p: [Byte]) -> ~Int {
+    n = self.st[0].~read!(p)
+    i = 0
+    while i < n {
+      # lowercase byte
+      c = p[i] | 0x20
+      if 97 <= c && c <= 109 {
+        p[i] = p[i] + 13
+      } else if 110 <= c && c <= 122 {
+        p[i] = p[i] - 13
+      }
+      i += 1
+    }
+    n
+  }
+}
+
+# read_byte! to accumulate the text of a file.
+def read_bytes(buf: bufio.Reader) -> Str {
+  b = buf
+  out: [Byte] = []
+  loop {
+    r = b.read_byte!
+    if e = r.err {
+      panic "Data: #{e.message}" if !timeout?(e)
+      next
+    }
+    c = r.unwrap || break
+    out << c
+  }
+  Str.from_bytes(out)
+}
+
+test "ReaderSimple" {
+  data = "hello world"
+  b = bufio.new_reader(sreader(data))
+  assert_eq read_bytes(b), "hello world"
+  b = bufio.new_reader(Rot13Reader[bytes.Reader].new(st: [sreader(data)]))
+  assert_eq read_bytes(b), "uryyb jbeyq"
+}
+
+# read_string! (which ends up calling everything else) to accumulate the
+# text of a file.
+def read_lines(buf: bufio.Reader) -> Str {
+  b = buf
+  s = ""
+  loop {
+    r = b.read_string!(10)
+    if e = r.err {
+      panic "GetLines: #{e.message}" if !timeout?(e)
+      next
+    }
+    s1 = r.unwrap || break
+    s = s + s1
+  }
+  s
+}
+
+# read! to accumulate the text of a file.
+def reads(buf: bufio.Reader, m: Int) -> Str {
+  b = buf
+  out: [Byte] = [0; 1000]
+  nb = 0
+  loop {
+    r = b.read!(out[nb...nb + m])
+    next if r.err?
+    n = r.unwrap
+    break if n == 0
+    nb += n
+  }
+  Str.from_bytes(out[0...nb])
+}
+
+def make_reader(kind: Int, text: Str) -> io.Reader {
+  case kind {
+    0 => sreader(text)
+    1 => iotest.one_byte_reader(sreader(text))
+    2 => iotest.half_reader(sreader(text))
+    3 => iotest.data_err_reader(sreader(text))
+    _ => iotest.timeout_reader(sreader(text))
+  }
+}
+
+def buf_read(kind: Int, b: bufio.Reader) -> Str {
+  case kind {
+    0 => reads(b, 1)
+    1 => reads(b, 2)
+    2 => reads(b, 3)
+    3 => reads(b, 4)
+    4 => reads(b, 5)
+    5 => reads(b, 7)
+    6 => read_bytes(b)
+    _ => read_lines(b)
+  }
+}
+
+def bufsizes -> [Int] {
+  [0, MIN_READ_BUFFER_SIZE, 23, 32, 46, 64, 93, 128, 1024, 4096]
+}
+
+test "Reader" {
+  texts: [Str] = []
+  str = ""
+  all = ""
+  i = 0
+  while i < 30 {
+    texts << str + "\n"
+    all = all + texts[i]
+    str = str + Str.from_bytes([(i % 26 + 97).as_u8])
+    i += 1
+  }
+  texts << all
+  reader_names = ["full", "byte", "half", "data+err", "timeout"]
+  fn_names = ["1", "2", "3", "4", "5", "7", "bytes", "lines"]
+  for text in texts {
+    for ri in 0...5 {
+      for fi in 0...8 {
+        for bufsize in bufsizes() {
+          buf = bufio.new_reader_size(make_reader(ri, text), bufsize)
+          s = buf_read(fi, buf)
+          assert s == text, format("reader=%s fn=%s bufsize=%d want=%q got=%q", reader_names[ri], fn_names[fi], bufsize, text, s)
+        }
+      }
+    }
+  }
+}
+
+# Delivers its data one string segment at a time via read!. (Go's returns
+# (0, nil) for an empty segment; a 0 read is the end here, so empty
+# segments are skipped.)
+struct StringReader {
+  st: [Int]
+  data: [Str]
+
+  def read!(p: [Byte]) -> ~Int {
+    while st[0] < data.size && data[st[0]].size == 0 {
+      self.st[0] = st[0] + 1
+    }
+    return 0 if st[0] >= data.size
+    s = data[st[0]]
+    n = s.size < p.size ? s.size : p.size
+    copy(p[0...n], s.bytes.to_a[0...n])
+    self.st[0] = st[0] + 1
+    n
+  }
+}
+
+def string_reader(segments: [Str]) -> StringReader {
+  StringReader.new(st: [0], data: segments)
+}
+
+#[track_caller]
+def read_rune_segments(segments: [Str]) {
+  got = ""
+  want = strings.join(segments, "")
+  r = bufio.new_reader(string_reader(segments))
+  loop {
+    res = r.read_rune!
+    return if res.err?
+    rr, _w = res.unwrap || break
+    got = got + Str.from_bytes(utf8.encode_rune(rr))
+  }
+  assert got == want, format("segments=%v got=%s want=%s", segments, got, want)
+}
+
+def segment_list -> [[Str]] {
+  [
+    [],
+    [""],
+    ["日", "本語"],
+    ["日", "本", "語"],
+    ["\U000065e5", "\U0000672c", "\U00008a9e"],
+    [Str.from_bytes([0xe6]), Str.from_bytes([0x97, 0xa5, 0xe6]), Str.from_bytes([0x9c, 0xac, 0xe8, 0xaa, 0x9e])],
+    ["Hello", ", ", "World", "!"],
+    ["Hello", ", ", "", "World", "!"],
+  ]
+}
+
+test "ReadRune" {
+  for s in segment_list() {
+    read_rune_segments(s)
+  }
+}
+
+test "UnreadRune" {
+  segments = ["Hello, world:", "日本語"]
+  r = bufio.new_reader(string_reader(segments))
+  got = ""
+  want = strings.join(segments, "")
+  # Normal execution.
+  loop {
+    r1, _w = r.read_rune!.unwrap || break
+    got = got + Str.from_bytes(utf8.encode_rune(r1))
+    # Put it back and read it again.
+    r.unread_rune!.unwrap
+    r2, _w2 = r.read_rune!.unwrap.unwrap
+    assert_eq r1, r2
+  }
+  assert_eq got, want
+}
+
+test "NoUnreadRuneAfterPeek" {
+  br = bufio.new_reader(sreader("example"))
+  br.read_rune!.unwrap
+  br.peek!(1).unwrap
+  assert br.unread_rune!.err?, "UnreadRune didn't fail after Peek"
+}
+
+test "NoUnreadByteAfterPeek" {
+  br = bufio.new_reader(sreader("example"))
+  br.read_byte!.unwrap
+  br.peek!(1).unwrap
+  assert br.unread_byte!.err?, "UnreadByte didn't fail after Peek"
+}
+
+test "NoUnreadRuneAfterDiscard" {
+  br = bufio.new_reader(sreader("example"))
+  br.read_rune!.unwrap
+  br.discard!(1).unwrap
+  assert br.unread_rune!.err?, "UnreadRune didn't fail after Discard"
+}
+
+test "NoUnreadByteAfterDiscard" {
+  br = bufio.new_reader(sreader("example"))
+  br.read_byte!.unwrap
+  br.discard!(1).unwrap
+  assert br.unread_byte!.err?, "UnreadByte didn't fail after Discard"
+}
+
+test "NoUnreadRuneAfterWriteTo" {
+  br = bufio.new_reader(sreader("example"))
+  br.write_to!(io.Discard.new()).unwrap
+  assert br.unread_rune!.err?, "UnreadRune didn't fail after WriteTo"
+}
+
+test "NoUnreadByteAfterWriteTo" {
+  br = bufio.new_reader(sreader("example"))
+  br.write_to!(io.Discard.new()).unwrap
+  assert br.unread_byte!.err?, "UnreadByte didn't fail after WriteTo"
+}
+
+test "UnreadByte" {
+  segments = ["Hello, ", "world"]
+  r = bufio.new_reader(string_reader(segments))
+  got = ""
+  want = strings.join(segments, "")
+  # Normal execution.
+  loop {
+    b1 = r.read_byte!.unwrap || break
+    got = got + Str.from_bytes([b1])
+    # Put it back and read it again.
+    r.unread_byte!.unwrap
+    b2 = r.read_byte!.unwrap.unwrap
+    assert_eq b1, b2
+  }
+  assert_eq got, want
+}
+
+test "UnreadByteMultiple" {
+  segments = ["Hello, ", "world"]
+  data = strings.join(segments, "")
+  n = 0
+  while n <= data.size {
+    r = bufio.new_reader(string_reader(segments))
+    # Read n bytes.
+    i = 0
+    while i < n {
+      b = r.read_byte!.unwrap.unwrap
+      assert_eq b, data[i]
+      i += 1
+    }
+    # Unread one byte if there is one.
+    r.unread_byte!.unwrap if n > 0
+    # Test that we cannot unread any further.
+    e = r.unread_byte!.err.unwrap
+    case e {
+      bufio.BufioError.InvalidUnreadByte => assert_eq e.message, "bufio: invalid use of UnreadByte"
+      _ => assert false, "n = #{n}: wrong error #{e.message}"
+    }
+    n += 1
+  }
+}
+
+def read_with(kind: Int, r: bufio.Reader, delim: Byte) -> ~[Byte] {
+  rd = r
+  case kind {
+    0 => rd.~read_bytes!(delim) || []
+    1 => {
+      t = rd.~read_slice!(delim)
+      if x = t {
+        return x[0]
+      }
+      []
+    }
+    _ => {
+      s = rd.~read_string!(delim)
+      (s || "").bytes.to_a
+    }
+  }
+}
+
+test "UnreadByteOthers" {
+  for rno in 0...3 {
+    # Some input data that is longer than the minimum reader buffer size.
+    n = 10
+    buf = bytes.new_buffer([])
+    i = 0
+    while i < n {
+      buf.write_string!("abcdefg")
+      i += 1
+    }
+    r = bufio.new_reader_size(buf, MIN_READ_BUFFER_SIZE)
+    # Read the data with occasional unread_byte! calls.
+    i = 0
+    while i < n {
+      assert_eq Str.from_bytes(read_with(rno, r, 100).unwrap), "abcd"
+      for _j in 0...3 {
+        r.unread_byte!.unwrap
+        assert_eq Str.from_bytes(read_with(rno, r, 100).unwrap), "d"
+      }
+      assert_eq Str.from_bytes(read_with(rno, r, 103).unwrap), "efg"
+      i += 1
+    }
+    # All data should have been read.
+    assert r.read_byte!.unwrap.none?, "##{rno}: want the end"
+  }
+}
+
+# unread_rune! fails if the preceding operation was not a read_rune!.
+test "UnreadRuneError" {
+  # All runes in this test are 3 bytes long.
+  buf: [Byte] = [0; 3]
+  r = bufio.new_reader(string_reader(["日本語日本語日本語"]))
+  assert r.unread_rune!.err?, "expected error on UnreadRune from fresh buffer"
+  r.read_rune!.unwrap.unwrap
+  r.unread_rune!.unwrap
+  assert r.unread_rune!.err?, "expected error after UnreadRune (1)"
+  # Test error after read!.
+  r.read_rune!.unwrap.unwrap
+  r.read!(buf).unwrap
+  assert r.unread_rune!.err?, "expected error after Read (2)"
+  # Test error after read_byte!.
+  r.read_rune!.unwrap.unwrap
+  for _b in buf {
+    r.read_byte!.unwrap.unwrap
+  }
+  assert r.unread_rune!.err?, "expected error after ReadByte"
+  # Test error after unread_byte!.
+  r.read_rune!.unwrap.unwrap
+  r.read_byte!.unwrap.unwrap
+  r.unread_byte!.unwrap
+  assert r.unread_rune!.err?, "expected error after UnreadByte (3)"
+  # Test error after read_slice!.
+  r.read_rune!.unwrap.unwrap
+  r.read_slice!(0).unwrap
+  e = r.unread_rune!.err.unwrap
+  case e {
+    bufio.BufioError.InvalidUnreadRune => assert_eq e.message, "bufio: invalid use of UnreadRune"
+    _ => assert false, "wrong error #{e.message}"
+  }
+}
+
+test "UnreadRuneAtEOF" {
+  # read_rune! / unread_rune! should fail at the end (was a bug; used to panic).
+  r = bufio.new_reader(sreader("x"))
+  r.read_rune!.unwrap
+  r.read_rune!.unwrap
+  assert r.unread_rune!.err?, "unread at the end"
+  assert r.read_rune!.unwrap.none?, "expected the end"
+}
+
+test "ReadWriteRune" {
+  n_rune: Rune = 1000
+  byte_buf = bytes.new_buffer([])
+  w = bufio.new_writer(byte_buf)
+  # Write the runes out using write_rune!.
+  r: Rune = 0
+  while r < n_rune {
+    size = utf8.rune_len(r)
+    nbytes = w.write_rune!(r).unwrap
+    assert_eq nbytes, size
+    r += 1
+  }
+  w.flush!.unwrap
+  rd = bufio.new_reader(byte_buf)
+  # Read them back with read_rune!.
+  r1: Rune = 0
+  while r1 < n_rune {
+    size = utf8.rune_len(r1)
+    nr, nbytes = rd.read_rune!.unwrap.unwrap
+    assert nr == r1 && nbytes == size, format("ReadRune(0x%x) got 0x%x,%d not 0x%x,%d", r1, nr, nbytes, r1, size)
+    r1 += 1
+  }
+}
+
+test "WriteInvalidRune" {
+  # Invalid runes, including negative ones, are written as the replacement
+  # character.
+  rs: [Rune] = [-1, 0x110000]
+  for r in rs {
+    buf = bytes.new_buffer([])
+    w = bufio.new_writer(buf)
+    w.write_rune!(r).unwrap
+    w.flush!.unwrap
+    assert_eq buf.string, "�"
+  }
+}
+
+test "Writer" {
+  data: [Byte] = [0; 8192]
+  i = 0
+  while i < data.size {
+    data[i] = (32 + i % (126 - 32)).as_u8
+    i += 1
+  }
+  w = bytes.new_buffer([])
+  for nwrite in bufsizes() {
+    for bs in bufsizes() {
+      # Write nwrite bytes using buffer size bs; check that the right amount
+      # makes it out and that the data is correct.
+      w.reset!
+      buf = bufio.new_writer_size(w, bs)
+      context = "nwrite=#{nwrite} bufsize=#{bs}"
+      n = buf.write!(data[0...nwrite]).unwrap
+      assert n == nwrite, "#{context}: buf.write! #{nwrite} = #{n}"
+      buf.flush!.unwrap
+      written = w.bytes
+      assert written.size == nwrite, "#{context}: #{written.size} bytes written"
+      assert written == data[0...written.size], "#{context}: wrong bytes written"
+    }
+  }
+}
+
+test "WriterAppend" {
+  got = bytes.new_buffer([])
+  want: [Byte] = []
+  seed = [12345]
+  rnd = ->(n: Int) -> Int {
+    seed[0] = (seed[0] * 1103515245 + 12345) % 2147483648
+    seed[0] % n
+  }
+  w = bufio.new_writer_size(got, 64)
+  for _i in 0...100 {
+    # Obtain a buffer to append to.
+    b = w.available_buffer
+    assert_eq b.size, 0
+    # Append a random integer of varying width.
+    n = rnd.call(1 << rnd.call(30))
+    want = want + "#{n} ".bytes.to_a
+    b = b + "#{n} ".bytes.to_a
+    w.write!(b).unwrap
+  }
+  w.flush!.unwrap
+  assert got.bytes == want, "output mismatch"
+}
+
+# Write errors are returned properly.
+struct ErrorWriterTest {
+  n: Int
+  m: Int
+  err: Error?
+  expect: Str
+
+  def write!(p: [Byte]) -> ~Int {
+    if e = err {
+      fail e
+    }
+    p.size * n / m
+  }
+}
+
+test "WriteErrors" {
+  tests = [
+    ErrorWriterTest.new(n: 0, m: 1, err: none, expect: "short write"),
+    ErrorWriterTest.new(n: 1, m: 2, err: none, expect: "short write"),
+    ErrorWriterTest.new(n: 1, m: 1, err: none, expect: ""),
+    ErrorWriterTest.new(n: 0, m: 1, err: PipeErr.ClosedPipe, expect: "io: read/write on closed pipe"),
+    ErrorWriterTest.new(n: 1, m: 2, err: PipeErr.ClosedPipe, expect: "io: read/write on closed pipe"),
+    ErrorWriterTest.new(n: 1, m: 1, err: PipeErr.ClosedPipe, expect: "io: read/write on closed pipe"),
+  ]
+  for w in tests {
+    buf = bufio.new_writer(w)
+    buf.write!(bytes_of("hello world")).unwrap
+    # Two flushes, to verify the error is sticky.
+    for _i in 0...2 {
+      e = buf.flush!.err
+      got = e?.message || ""
+      assert_eq got, w.expect
+    }
+  }
+}
+
+test "WriteString" {
+  buf = bytes.new_buffer([])
+  b = bufio.new_writer_size(buf, 8)
+  b.write_string!("0").unwrap
+  b.write_string!("123456").unwrap
+  b.write_string!("7890").unwrap
+  b.write_string!("abcdefghijklmnopqrstuvwxy").unwrap
+  b.write_string!("z").unwrap
+  b.flush!.unwrap
+  assert_eq buf.string, "01234567890abcdefghijklmnopqrstuvwxyz"
+}
+
+test "BufferFull" {
+  long_string = "And now, hello, world! It is the time for all good men to come to the aid of their party"
+  buf = bufio.new_reader_size(sreader(long_string), MIN_READ_BUFFER_SIZE)
+  line, full = buf.read_slice!(33).unwrap.unwrap
+  assert Str.from_bytes(line) == "And now, hello, " && full, "first ReadSlice"
+  line2, full2 = buf.read_slice!(33).unwrap.unwrap
+  assert Str.from_bytes(line2) == "world!" && !full2, "second ReadSlice"
+}
+
+# Returns its data, then the end (Go's returns the data with io.EOF).
+struct DataAndEOFReader {
+  st: [Str]
+
+  def read!(p: [Byte]) -> ~Int {
+    s = st[0]
+    n = s.size < p.size ? s.size : p.size
+    copy(p[0...n], s.bytes.to_a[0...n])
+    self.st[0] = s[n...s.size]
+    n
+  }
+}
+
+test "Peek" {
+  p: [Byte] = [0; 10]
+  # The string is 16 (MIN_READ_BUFFER_SIZE) long.
+  buf = bufio.new_reader_size(sreader("abcdefghijklmnop"), MIN_READ_BUFFER_SIZE)
+  assert_eq Str.from_bytes(buf.peek!(1).unwrap), "a"
+  assert_eq Str.from_bytes(buf.peek!(4).unwrap), "abcd"
+  assert_eq buf.peek!(-1).err.unwrap.message, "bufio: negative count"
+  assert_eq buf.peek!(32).err.unwrap.message, "bufio: buffer full"
+  buf.read!(p[0...3]).unwrap
+  assert_eq Str.from_bytes(p[0...3]), "abc"
+  assert_eq Str.from_bytes(buf.peek!(1).unwrap), "d"
+  assert_eq Str.from_bytes(buf.peek!(2).unwrap), "de"
+  buf.read!(p[0...3]).unwrap
+  assert_eq Str.from_bytes(p[0...3]), "def"
+  assert_eq Str.from_bytes(buf.peek!(4).unwrap), "ghij"
+  buf.read!(p).unwrap
+  assert_eq Str.from_bytes(p), "ghijklmnop"
+  assert_eq Str.from_bytes(buf.peek!(0).unwrap), ""
+  # Go: io.EOF; here: fewer bytes (none) at the end.
+  assert_eq buf.peek!(1).unwrap.size, 0
+  # Issue 3022: not exposing a reader's error on a successful peek!.
+  buf = bufio.new_reader_size(DataAndEOFReader.new(st: ["abcd"]), 32)
+  assert_eq Str.from_bytes(buf.peek!(2).unwrap), "ab"
+  assert_eq Str.from_bytes(buf.peek!(4).unwrap), "abcd"
+  n = buf.read!(p[0...5]).unwrap
+  assert_eq Str.from_bytes(p[0...n]), "abcd"
+  assert_eq buf.read!(p[0...1]).unwrap, 0
+}
+
+test "PeekThenUnreadRune" {
+  # This sequence used to cause a crash.
+  r = bufio.new_reader(sreader("x"))
+  r.read_rune!.unwrap
+  r.peek!(1).unwrap
+  r.unread_rune!
+  # Used to panic here.
+  r.read_rune!.unwrap
+}
+
+def test_output -> [Byte] {
+  bytes_of("0123456789abcdefghijklmnopqrstuvwxy")
+}
+
+def test_input -> [Byte] {
+  bytes_of("012\n345\n678\n9ab\ncde\nfgh\nijk\nlmn\nopq\nrst\nuvw\nxy")
+}
+
+def test_inputrn -> [Byte] {
+  bytes_of("012\r\n345\r\n678\r\n9ab\r\ncde\r\nfgh\r\nijk\r\nlmn\r\nopq\r\nrst\r\nuvw\r\nxy\r\n\n\r\n")
+}
+
+# Wraps a [Byte] and returns reads of a specific length.
+struct TestReader {
+  st: [[Byte]]
+  stride: Int
+
+  def read!(buf: [Byte]) -> ~Int {
+    data = st[0]
+    n = stride
+    n = data.size if n > data.size
+    n = buf.size if n > buf.size
+    copy(buf[0...n], data[0...n])
+    self.st[0] = data[n...data.size]
+    n
+  }
+}
+
+#[track_caller]
+def test_read_line(input: [Byte]) {
+  stride = 1
+  while stride < 2 {
+    done = 0
+    reader = TestReader.new(st: [input], stride: stride)
+    l = bufio.new_reader_size(reader, input.size + 1)
+    loop {
+      line, is_prefix = l.read_line_prefix!.unwrap || break
+      assert !is_prefix, "read_line_prefix! returned a prefix"
+      want = test_output()[done...done + line.size]
+      assert want == line, format("bad line at stride %d: want: %x got: %x", stride, want, line)
+      done += line.size
+    }
+    assert done == test_output().size, "read_line_prefix! didn't return everything: got #{done}, want #{test_output().size} (stride #{stride})"
+    stride += 1
+  }
+}
+
+test "ReadLine" {
+  test_read_line(test_input())
+  test_read_line(test_inputrn())
+}
+
+test "LineTooLong" {
+  data: [Byte] = []
+  i = 0
+  while i < MIN_READ_BUFFER_SIZE * 5 / 2 {
+    data << (48 + i % 10).as_u8
+    i += 1
+  }
+  l = bufio.new_reader_size(bytes.new_reader(data), MIN_READ_BUFFER_SIZE)
+  line, is_prefix = l.read_line_prefix!.unwrap.unwrap
+  assert is_prefix && line == data[0...MIN_READ_BUFFER_SIZE], "bad result for first line"
+  data = data[line.size...data.size]
+  line2, is_prefix2 = l.read_line_prefix!.unwrap.unwrap
+  assert is_prefix2 && line2 == data[0...MIN_READ_BUFFER_SIZE], "bad result for second line"
+  data = data[line2.size...data.size]
+  line3, is_prefix3 = l.read_line_prefix!.unwrap.unwrap
+  assert !is_prefix3 && line3 == data[0...MIN_READ_BUFFER_SIZE / 2], "bad result for third line"
+  assert l.read_line_prefix!.unwrap.none?, "expected no more lines"
+}
+
+test "ReadAfterLines" {
+  line1 = "this is line1"
+  rest_data = "this is line2\nthis is line 3\n"
+  inbuf = bytes.new_reader(bytes_of(line1 + "\n" + rest_data))
+  outbuf = bytes.new_buffer([])
+  max_line_length = line1.size + rest_data.size / 2
+  l = bufio.new_reader_size(inbuf, max_line_length)
+  line, is_prefix = l.read_line_prefix!.unwrap.unwrap
+  assert !is_prefix && Str.from_bytes(line) == line1, "bad result for first line"
+  # Go's io.Copy(outbuf, l) uses l.WriteTo.
+  n = l.write_to!(outbuf).unwrap
+  assert_eq n, rest_data.size
+  assert_eq outbuf.string, rest_data
+}
+
+test "ReadEmptyBuffer" {
+  l = bufio.new_reader_size(bytes.new_buffer([]), MIN_READ_BUFFER_SIZE)
+  assert l.read_line_prefix!.unwrap.none?, "expected the end from read_line_prefix!"
+}
+
+# Go's io.ReadAll over a bufio.Reader.
+def read_all(r: bufio.Reader) -> ~[Byte] {
+  rd = r
+  out: [Byte] = []
+  buf: [Byte] = [0; 512]
+  loop {
+    n = rd.~read!(buf)
+    break if n == 0
+    out = out + buf[0...n]
+  }
+  out
+}
+
+test "LinesAfterRead" {
+  l = bufio.new_reader_size(bytes.new_reader(bytes_of("foo")), MIN_READ_BUFFER_SIZE)
+  ~read_all(l)
+  assert l.read_line_prefix!.unwrap.none?, "expected the end from read_line_prefix!"
+}
+
+test "ReadLineNonNilLineOrError" {
+  r = bufio.new_reader(sreader("line 1\n"))
+  line, _p = r.read_line_prefix!.unwrap.unwrap
+  assert_eq Str.from_bytes(line), "line 1"
+  assert r.read_line_prefix!.unwrap.none?, "then the end"
+}
+
+#[track_caller]
+def test_read_line_newlines(input: Str, expect: [(Str, Bool, Bool)]) {
+  b = bufio.new_reader_size(sreader(input), MIN_READ_BUFFER_SIZE)
+  for e in expect {
+    res = b.read_line_prefix!.unwrap
+    if e[2] {
+      assert res.none?, format("%q: want the end", input)
+    } else {
+      line, is_prefix = res.unwrap
+      assert_eq Str.from_bytes(line), e[0]
+      assert_eq is_prefix, e[1]
+    }
+  }
+}
+
+test "ReadLineNewlines" {
+  # (line, is_prefix, the end)
+  test_read_line_newlines("012345678901234\r\n012345678901234\r\n", [("012345678901234", true, false), ("", false, false), ("012345678901234", true, false), ("", false, false), ("", false, true)])
+  test_read_line_newlines("0123456789012345\r012345678901234\r", [("0123456789012345", true, false), ("\r012345678901234", true, false), ("\r", false, false), ("", false, true)])
+}
+
+def create_test_input(n: Int) -> [Byte] {
+  input: [Byte] = [0; n]
+  i = 0
+  while i < n {
+    # 101 and 251 are arbitrary prime numbers: a sequence which doesn't
+    # repeat too frequently.
+    input[i] = (i % 251).as_u8
+    input[i] = input[i] ^ (i / 101).as_u8 if i % 101 == 0
+    i += 1
+  }
+  input
+}
+
+test "ReaderWriteTo" {
+  input = create_test_input(8192)
+  r = bufio.new_reader(bytes.new_reader(input))
+  w = bytes.new_buffer([])
+  n = r.write_to!(w).unwrap
+  assert_eq n, input.size
+  assert w.bytes == input, "after write: mismatch"
+}
+
+# Reads len(p) * rn bytes or fails with rerr ("EOF": returns 0); writes
+# len(p) * wn bytes or fails with werr.
+struct ErrorRW {
+  rn: Int
+  wn: Int
+  rerr: Str
+  werr: Str
+  expected: Str
+
+  def read!(p: [Byte]) -> ~Int {
+    return 0 if rerr == "EOF"
+    ~fail_with(rerr)
+    p.size * rn
+  }
+
+  def write!(p: [Byte]) -> ~Int {
+    ~fail_with(werr)
+    p.size * wn
+  }
+}
+
+def fail_with(name: Str) -> ~Unit {
+  case name {
+    "closed" => fail PipeErr.ClosedPipe
+    "unexpected" => fail io.StreamError.UnexpectedEof
+    "short" => fail io.StreamError.ShortWrite
+    _ => {}
+  }
+}
+
+test "ReaderWriteToErrors" {
+  tests = [
+    ErrorRW.new(rn: 1, wn: 0, rerr: "", werr: "closed", expected: "io: read/write on closed pipe"),
+    ErrorRW.new(rn: 0, wn: 1, rerr: "closed", werr: "", expected: "io: read/write on closed pipe"),
+    ErrorRW.new(rn: 0, wn: 0, rerr: "unexpected", werr: "closed", expected: "unexpected EOF"),
+    ErrorRW.new(rn: 0, wn: 1, rerr: "EOF", werr: "", expected: ""),
+  ]
+  for rw in tests {
+    r = bufio.new_reader(rw)
+    e = r.write_to!(rw).err
+    assert_eq e?.message || "", rw.expected
+  }
+}
+
+def make_src(kind: Int, input: [Byte]) -> io.Reader {
+  return iotest.data_err_reader(bytes.new_reader(input)) if kind == 0
+  bytes.new_reader(input)
+}
+
+test "WriterReadFrom" {
+  for ri in 0...2 {
+    input = create_test_input(8192)
+    b = bytes.new_buffer([])
+    w = bufio.new_writer(b)
+    r = make_src(ri, input)
+    n = w.read_from!(r).unwrap
+    assert_eq n, input.size
+    w.flush!.unwrap
+    assert b.bytes == input, "rs[#{ri}]: mismatch"
+  }
+}
+
+# Go's {1, 1, io.EOF, nil, nil} reads len(p) bytes together with EOF: here
+# len(p) bytes once, then the end.
+struct OnceThenEOF {
+  st: [Bool]
+
+  def read!(p: [Byte]) -> ~Int {
+    return 0 if st[0]
+    self.st[0] = true
+    p.size
+  }
+
+  def write!(p: [Byte]) -> ~Int {
+    p.size
+  }
+}
+
+test "WriterReadFromErrors" {
+  tests = [
+    ErrorRW.new(rn: 0, wn: 1, rerr: "EOF", werr: "", expected: ""),
+    ErrorRW.new(rn: 0, wn: 1, rerr: "closed", werr: "", expected: "io: read/write on closed pipe"),
+    ErrorRW.new(rn: 0, wn: 0, rerr: "closed", werr: "short", expected: "io: read/write on closed pipe"),
+    ErrorRW.new(rn: 1, wn: 0, rerr: "", werr: "short", expected: "short write"),
+  ]
+  for rw in tests {
+    w = bufio.new_writer(rw)
+    e = w.read_from!(rw).err
+    assert_eq e?.message || "", rw.expected
+  }
+  o = OnceThenEOF.new(st: [false])
+  w2 = bufio.new_writer(o)
+  assert w2.read_from!(o).ok?, "data with EOF"
+}
+
+# Like io.Discard, counting the write! calls.
+struct WriteCountingDiscard {
+  st: [Int]
+
+  def write!(p: [Byte]) -> ~Int {
+    self.st[0] = st[0] + 1
+    p.size
+  }
+}
+
+# Copying into a bufio.Writer (Go's io.Copy, which uses ReadFrom) doesn't
+# flush the buffer prematurely: e.g. on a network socket, excessive writes
+# should be avoided.
+test "WriterReadFromCounts" {
+  w0 = WriteCountingDiscard.new(st: [0])
+  b0 = bufio.new_writer_size(w0, 1234)
+  b0.write_string!("x" * 1000).unwrap
+  assert_eq w0.st[0], 0
+  b0.write_string!("x" * 200).unwrap
+  assert_eq w0.st[0], 0
+  b0.read_from!(sreader("x" * 30)).unwrap
+  assert_eq w0.st[0], 0
+  b0.read_from!(sreader("x" * 9)).unwrap
+  assert_eq w0.st[0], 1
+
+  w1 = WriteCountingDiscard.new(st: [0])
+  b1 = bufio.new_writer_size(w1, 1234)
+  b1.write_string!("x" * 1200).unwrap
+  b1.flush!.unwrap
+  assert_eq w1.st[0], 1
+  b1.write_string!("x" * 89).unwrap
+  assert_eq w1.st[0], 1
+  b1.read_from!(sreader("x" * 700)).unwrap
+  assert_eq w1.st[0], 1
+  b1.read_from!(sreader("x" * 600)).unwrap
+  assert_eq w1.st[0], 2
+  b1.flush!.unwrap
+  assert_eq w1.st[0], 3
+}
+
+struct NegativeReader {
+  def read!(_p: [Byte]) -> ~Int {
+    -1
+  }
+}
+
+test "NegativeRead" {
+  # Panics with a description pointing at the reader, not at itself (not
+  # with a slice index error, for example).
+  b = bufio.new_reader(NegativeReader.new())
+  assert_panics("reader returned negative count from Read") {
+    buf: [Byte] = [0; 100]
+    b.read!(buf).unwrap
+  }
+}
+
+struct ErrorThenGoodReader {
+  st: [(Bool, Int)]
+
+  def read!(p: [Byte]) -> ~Int {
+    did, nread = st[0]
+    self.st[0] = (true, nread + 1)
+    fail PipeErr.Fake if !did
+    p.size
+  }
+}
+
+test "ReaderClearError" {
+  r = ErrorThenGoodReader.new(st: [(false, 0)])
+  b = bufio.new_reader(r)
+  buf: [Byte] = [0; 1]
+  empty: [Byte] = []
+  assert b.read!(empty).ok?, "1st nil Read"
+  assert_eq b.read!(buf).err.unwrap.message, "fake error"
+  assert b.read!(empty).ok?, "2nd nil Read"
+  assert b.read!(buf).ok?, "3rd Read with buffer"
+  assert_eq r.st[0][1], 2
+}
+
+# golang.org/issue/5947
+test "WriterReadFromWhileFull" {
+  buf = bytes.new_buffer([])
+  w = bufio.new_writer_size(buf, 10)
+  # Fill buffer exactly.
+  assert_eq w.write!(bytes_of("0123456789")).unwrap, 10
+  # Use read_from! to read in some data.
+  assert_eq w.read_from!(sreader("abcdef")).unwrap, 6
+}
+
+test "ReaderReset" {
+  r = bufio.new_reader(sreader("foo foo"))
+  buf: [Byte] = [0; 3]
+  r.read!(buf).unwrap
+  assert_eq Str.from_bytes(buf), "foo"
+  r.reset!(sreader("bar bar"))
+  assert_eq Str.from_bytes(read_all(r).unwrap), "bar bar"
+  # A zero Reader.
+  r = bufio.Reader.new()
+  r.reset!(sreader("bar bar"))
+  assert_eq Str.from_bytes(read_all(r).unwrap), "bar bar"
+}
+
+test "WriterReset" {
+  buf1 = bytes.new_buffer([])
+  buf2 = bytes.new_buffer([])
+  buf3 = bytes.new_buffer([])
+  w = bufio.new_writer(buf1)
+  w.write_string!("foo").unwrap
+  # and not flushed
+  w.reset!(buf2)
+  w.write_string!("bar").unwrap
+  w.flush!.unwrap
+  assert_eq buf1.string, ""
+  assert_eq buf2.string, "bar"
+  # A zero Writer.
+  w = bufio.Writer.new()
+  w.reset!(buf3)
+  w.write_string!("bar").unwrap
+  w.flush!.unwrap
+  assert_eq buf1.string, ""
+  assert_eq buf3.string, "bar"
+}
+
+# A reader following a script: 5 bytes, then an error (Go's step returns
+# both at once); a missing step panics.
+struct ScriptedReader {
+  st: [Int]
+  steps: Int
+
+  def read!(p: [Byte]) -> ~Int {
+    panic "too many Read calls on scripted Reader. No steps remain." if st[0] >= steps
+    k = st[0]
+    self.st[0] = k + 1
+    panic "unexpected small read" if p.size < 5
+    fail PipeErr.FiveThenError if k == 1
+    5
+  }
+}
+
+def scripted(steps: Int) -> ScriptedReader {
+  ScriptedReader.new(st: [0], steps: steps)
+}
+
+struct DiscardTest {
+  name: Str
+  r: io.Reader
+  # 0 means 16
+  buf_size: Int
+  peek_size: Int
+  # input to discard!
+  n: Int
+  # from discard!
+  want: Int
+  # the error from discard!, or (Go's data with error) from the next call
+  want_err: Str
+  want_buffered: Int
+}
+
+test "ReaderDiscard" {
+  alpha = "abcdefghijklmnopqrstuvwxyz"
+  tests = [
+    DiscardTest.new(name: "normal case", r: sreader(alpha), peek_size: 16, n: 6, want: 6, want_buffered: 10),
+    DiscardTest.new(name: "discard causing read", r: sreader(alpha), n: 6, want: 6, want_buffered: 10),
+    DiscardTest.new(name: "discard all without peek", r: sreader(alpha), n: 26, want: 26, want_buffered: 0),
+    # Go: io.EOF; here fewer bytes are the end.
+    DiscardTest.new(name: "discard more than end", r: sreader(alpha), n: 27, want: 26, want_buffered: 0),
+    DiscardTest.new(name: "fill error, discard less", r: scripted(2), n: 4, want: 4, want_buffered: 1),
+    DiscardTest.new(name: "fill error, discard equal", r: scripted(2), n: 5, want: 5, want_buffered: 0),
+    DiscardTest.new(name: "fill error, discard more", r: scripted(2), n: 6, want: 5, want_err: "5-then-error", want_buffered: 0),
+    # will panic on read!
+    DiscardTest.new(name: "discard zero", r: scripted(0), n: 0, want: 0, want_buffered: 0),
+    DiscardTest.new(name: "discard negative", r: scripted(0), n: -1, want: 0, want_err: "bufio: negative count", want_buffered: 0),
+  ]
+  for tt in tests {
+    br = bufio.new_reader_size(tt.r, tt.buf_size)
+    if tt.peek_size > 0 {
+      pb = br.peek!(tt.peek_size).unwrap
+      assert_eq pb.size, tt.peek_size
+    }
+    res = br.discard!(tt.n)
+    if e = res.err {
+      assert_eq "#{tt.name}: #{e.message}", "#{tt.name}: #{tt.want_err}"
+    } else {
+      assert_eq "#{tt.name}: #{res.unwrap}", "#{tt.name}: #{tt.want}"
+      if tt.want_err != "" {
+        # Go returns the count and the error together: here the error
+        # fails the next call.
+        assert_eq br.discard!(1).err?.message || "", tt.want_err
+      }
+    }
+    assert_eq "#{tt.name}: #{br.buffered}", "#{tt.name}: #{tt.want_buffered}"
+  }
+}
+
+test "ReaderSize" {
+  assert_eq bufio.new_reader(sreader("")).size, bufio.DEFAULT_BUF_SIZE
+  assert_eq bufio.new_reader_size(sreader(""), 1234).size, 1234
+}
+
+test "WriterSize" {
+  assert_eq bufio.new_writer(io.Discard.new()).size, bufio.DEFAULT_BUF_SIZE
+  assert_eq bufio.new_writer_size(io.Discard.new(), 1234).size, 1234
+}
+
+# Returns the data, then the end (Go's returns io.EOF with the last data).
+struct EOFReader {
+  st: [[Byte]]
+
+  def read!(p: [Byte]) -> ~Int {
+    b = st[0]
+    k = b.size < p.size ? b.size : p.size
+    copy(p[0...k], b[0...k])
+    self.st[0] = b[k...b.size]
+    k
+  }
+}
+
+test "PartialReadEOF" {
+  src: [Byte] = [0; 10]
+  eof_r = EOFReader.new(st: [src])
+  r = bufio.new_reader(eof_r)
+  dest: [Byte] = [0; 5]
+  assert_eq r.read!(dest).unwrap, dest.size
+  assert_eq eof_r.st[0].size, 0
+  assert_eq r.buffered, 5
+  empty: [Byte] = []
+  assert_eq r.read!(empty).unwrap, 0
+}
+
+struct WriteErrorOnlyWriter {
+  def write!(_p: [Byte]) -> ~Int {
+    fail PipeErr.Fake
+  }
+}
+
+test "WriterReadFromMustReturnUnderlyingError" {
+  wr = bufio.new_writer(WriteErrorOnlyWriter.new())
+  s = "test1"
+  want_buffered = s.size
+  wr.write_string!(s).unwrap
+  assert wr.flush!.err?, "expected flush error"
+  assert wr.read_from!(sreader("test2")).err?, "expected error"
+  assert_eq wr.buffered, want_buffered
+}

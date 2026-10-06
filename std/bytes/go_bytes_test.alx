@@ -1,0 +1,706 @@
+#![test(external)]
+# Go's bytes_test.go and compare_test.go, translated (their tables are in
+# go_tables_test.alx). External tests, as Go's are (package bytes_test).
+#
+# Not translated, and why:
+#  - allocation counts (testing.AllocsPerRun in TestEqual, runIndexTests,
+#    TestIndexRune, TestReplace): alx has no allocation counter; the values
+#    those tests check are checked.
+#  - nil versus empty (runStringTests, trimNilTests, TestTrimFunc, TestClone):
+#    alx has no nil slice; the contents are checked.
+#  - capacity and backing-array identity (TestSplit's Join copy check,
+#    TestReplace's spare-capacity input, TestClone's unsafe.SliceData): no
+#    capacity or pointers; copies are checked by writing to the result.
+#  - TestEqualExhaustive / TestNotEqual / TestIndexByteBig / TestCompareBytes
+#    run at Go's -short sizes (the full sizes take minutes without Go's
+#    vectorized kernels).
+#  - benchmarks (Benchmark*), bytes_js_wasm_test.go and boundary_test.go
+#    (page-boundary reads through syscall.Mmap; alx's functions don't read
+#    past the slice).
+
+import "bytes"
+import "strconv"
+import "unicode"
+import "unicode/utf8"
+
+# ---------------------------------------------------------------- helpers
+
+pub def b(t: Str) -> [Byte] { t.bytes.to_a }
+pub def x(v: [Byte]) -> [Byte] { v }
+pub def s(v: [Byte]) -> Str { Str.from_bytes(v) }
+pub def xs(v: [Byte]) -> Str { Str.from_bytes(v) }
+pub def rb(c: Byte, n: Int) -> [Byte] {
+  out: [Byte] = [0; n]
+  i = 0
+  while i < n {
+    out[i] = c
+    i += 1
+  }
+  out
+}
+#[track_caller]
+pub def check[T](got: T, want: T, what: Str) {
+  assert got == want, "#{what} = #{got}, want #{want}"
+}
+pub def q(v: [Byte]) -> Str { strconv.quote(Str.from_bytes(v)) }
+pub def strs(a: [[Byte]]) -> [Str] { a.map { Str.from_bytes(it) } }
+def runes_str(rs: [Rune]) -> Str {
+  out: [Byte] = []
+  for r in rs { out = utf8.append_rune(out, r) }
+  Str.from_bytes(out)
+}
+
+# Go's predicates by the names its tables give them.
+def holds(name: Str, r: Rune) -> Bool {
+  return !holds(name[4...name.size], r) if name.start_with?("not ")
+  case name {
+    "IsSpace" => unicode.is_space(r)
+    "IsDigit" => unicode.is_digit(r)
+    "IsUpper" => unicode.is_upper(r)
+    "IsValidRune" => r != 0xFFFD
+    _ => panic("unknown predicate #{name}")
+  }
+}
+
+# ------------------------------------------------------------- Lines
+
+test "Lines" {
+  for tc in lines_tests {
+    check(strs(bytes.lines(tc[0])), tc[1], "lines(#{q(tc[0])})")
+  }
+}
+
+# ------------------------------------------------------------- Equal
+
+test "Equal" {
+  for tc in compare_tests {
+    check(bytes.equal(tc[0], tc[1]), tc[2] == 0, "equal(#{q(tc[0])}, #{q(tc[1])})")
+  }
+}
+
+test "EqualExhaustive" {
+  size = 32
+  a: [Byte] = [0; size]
+  bb: [Byte] = [0; size]
+  b_init: [Byte] = [0; size]
+  for i in 0...size {
+    a[i] = (17 * i).as_u8
+    b_init[i] = (23 * i + 100).as_u8
+  }
+  for len in 0..size {
+    for xi in 0..size - len {
+      for y in 0..size - len {
+        copy(bb, b_init)
+        copy(bb[y...y + len], a[xi...xi + len])
+        ok = bytes.equal(a[xi...xi + len], bb[y...y + len]) && bytes.equal(bb[y...y + len], a[xi...xi + len])
+        assert ok, "Equal(#{len}, #{xi}, #{y}) = false"
+      }
+    }
+  }
+}
+
+test "NotEqual" {
+  size = 32
+  a: [Byte] = [0; size]
+  bb: [Byte] = [0; size]
+  for len in 0..size {
+    for xi in 0..size - len {
+      for y in 0..size - len {
+        for diffpos in xi...xi + len {
+          a[diffpos] = 1
+          same = bytes.equal(a[xi...xi + len], bb[y...y + len]) || bytes.equal(bb[y...y + len], a[xi...xi + len])
+          assert !same, "NotEqual(#{len}, #{xi}, #{y}, #{diffpos}) = true"
+          a[diffpos] = 0
+        }
+      }
+    }
+  }
+}
+
+# ------------------------------------------------------------- Index family
+
+test "Index" {
+  for tc in index_tests {
+    check(bytes.index(tc[0], tc[1]), tc[2], "index(#{q(tc[0])}, #{q(tc[1])})")
+  }
+  # runIndexTests' allocation cases, for their values.
+  assert_eq bytes.index(rb(0x30, 64) + b("10000"), rb(0x30, 61) + b("1")), 3
+  assert_eq bytes.last_index(rb(0x30, 71) + b("1"), rb(0x30, 66) + b("1")), 5
+}
+
+test "LastIndex" {
+  for tc in last_index_tests {
+    check(bytes.last_index(tc[0], tc[1]), tc[2], "last_index(#{q(tc[0])}, #{q(tc[1])})")
+  }
+}
+
+test "IndexAny" {
+  for tc in index_any_tests {
+    check(bytes.index_any(tc[0], tc[1]), tc[2], "index_any(#{q(tc[0])}, #{strconv.quote(tc[1])})")
+  }
+}
+
+test "LastIndexAny" {
+  for tc in last_index_any_tests {
+    check(bytes.last_index_any(tc[0], tc[1]), tc[2], "last_index_any(#{q(tc[0])}, #{strconv.quote(tc[1])})")
+  }
+}
+
+test "IndexByte" {
+  for tc in index_tests {
+    next if tc[1].size != 1
+    check(bytes.index_byte(tc[0], tc[1][0]), tc[2], "index_byte(#{q(tc[0])}, #{tc[1][0]})")
+  }
+}
+
+test "LastIndexByte" {
+  for tc in last_index_byte_tests {
+    check(bytes.last_index_byte(tc[0], tc[1][0]), tc[2], "last_index_byte(#{q(tc[0])}, #{tc[1][0]})")
+  }
+}
+
+# A larger buffer with different sizes and alignments.
+test "IndexByteBig" {
+  n = 128
+  bb: [Byte] = [0; n]
+  for i in 0...n {
+    windows = [bb[i...n], bb[0...i], bb[i / 2...n - (i + 1) / 2]]
+    for b1 in windows {
+      for j in 0...b1.size {
+        b1[j] = 120
+        assert_eq bytes.index_byte(b1, 120), j
+        b1[j] = 0
+        assert_eq bytes.index_byte(b1, 120), -1
+      }
+    }
+  }
+}
+
+# A small index across all offsets of a buffer bigger than a page.
+test "IndexByteSmall" {
+  bb: [Byte] = [0; 5015]
+  for i in 0..bb.size - 15 {
+    for j in 0...15 { bb[i + j] = (100 + j).as_u8 }
+    for j in 0...15 {
+      assert_eq bytes.index_byte(bb[i...i + 15], (100 + j).as_u8), j
+    }
+    for j in 0...15 { bb[i + j] = 0 }
+  }
+  # Matches outside the slice never trigger.
+  for i in 0..bb.size - 15 {
+    for j in 0...15 { bb[i + j] = 1 }
+    for _j in 0...15 {
+      assert_eq bytes.index_byte(bb[i...i + 15], 0), -1
+    }
+    for j in 0...15 { bb[i + j] = 0 }
+  }
+}
+
+test "IndexRune" {
+  for tc in index_rune_tests {
+    check(bytes.index_rune(tc[0], tc[1]), tc[2], "index_rune(#{q(tc[0])}, #{tc[1]})")
+  }
+  haystack = b("test世界")
+  assert_eq bytes.index_rune(haystack, 115), 2
+  assert_eq bytes.index_rune(haystack, 19990), 4
+}
+
+# The count of a single byte across page offsets.
+test "CountByte" {
+  bb: [Byte] = [0; 5015]
+  windows = [1, 2, 3, 4, 15, 16, 17, 31, 32, 33, 63, 64, 65, 128]
+  max_wnd = windows[windows.size - 1]
+  starts = (0..2 * max_wnd).to_a + (4096 - (max_wnd + 1)...bb.size).to_a
+  for i in starts {
+    for w in windows {
+      window = w
+      window = bb.size - i if window > bb.size - i
+      for j in 0...window {
+        bb[i + j] = 100
+        assert_eq bytes.count(bb[i...i + window], [100]), j + 1
+      }
+      for j in 0...window { bb[i + j] = 0 }
+    }
+  }
+}
+
+# Bytes outside the window are never counted.
+test "CountByteNoMatch" {
+  bb: [Byte] = [0; 5015]
+  windows = [1, 2, 3, 4, 15, 16, 17, 31, 32, 33, 63, 64, 65, 128]
+  for i in 0..bb.size {
+    for w in windows {
+      window = w
+      window = bb.size - i if window > bb.size - i
+      for j in 0...window { bb[i + j] = 100 }
+      assert_eq bytes.count(bb[i...i + window], [0]), 0
+      for j in 0...window { bb[i + j] = 0 }
+    }
+  }
+}
+
+# ------------------------------------------------------------- Split, Fields
+
+# Appends 'z' to each piece (as Go's tests do, to check that appending to a
+# result can't change the next one); returns the last.
+def append_z(a: [[Byte]]) -> [Byte] {
+  last: [Byte] = []
+  for v in a {
+    w = v
+    w << 122
+    last = w
+  }
+  last
+}
+
+test "Split" {
+  for tc in split_tests {
+    input = tc[0]
+    sep = tc[1]
+    n = tc[2]
+    want = tc[3]
+    a = bytes.split_n(input, sep, n)
+    xz = append_z(a)
+    result = strs(a)
+    check(result, want, "split_n(#{q(input)}, #{q(sep)}, #{n})")
+    assert_eq strs(bytes.split_seq(input, sep)), want if n < 0
+    next if n == 0 || a.size == 0
+    assert_eq s(xz), want[want.size - 1] + "z"
+    joined = bytes.join(a, sep)
+    check(s(joined), s(input), "join(split(#{q(input)}))")
+    assert_eq strs(bytes.split(input, sep)), result if n < 0
+    # Join copies: writing to its result leaves the pieces alone.
+    if joined.size > 0 && a[0].size > 0 {
+      first = a[0][0]
+      joined[0] = first +% 1
+      check(a[0][0], first, "join didn't copy")
+    }
+  }
+}
+
+test "SplitAfter" {
+  for tc in split_after_tests {
+    input = tc[0]
+    sep = tc[1]
+    n = tc[2]
+    want = tc[3]
+    a = bytes.split_after_n(input, sep, n)
+    xz = append_z(a)
+    result = strs(a)
+    check(result, want, "split_after_n(#{q(input)}, #{q(sep)}, #{n})")
+    assert_eq strs(bytes.split_after_seq(input, sep)), want if n < 0
+    assert_eq s(xz), want[want.size - 1] + "z"
+    assert_eq s(bytes.join(a, [])), s(input)
+    assert_eq strs(bytes.split_after(input, sep)), result if n < 0
+  }
+}
+
+test "Fields" {
+  for tc in fields_tests {
+    bb = tc[0]
+    want = tc[1]
+    before = s(bb)
+    a = bytes.fields(bb)
+    xz = append_z(a)
+    check(strs(a), want, "fields(#{strconv.quote(before)})")
+    assert_eq strs(bytes.fields_seq(bb)), want
+    check(s(bb), before, "slice changed")
+    assert_eq s(xz), want[want.size - 1] + "z" if want.size > 0
+  }
+}
+
+test "FieldsFunc" {
+  for tc in fields_tests {
+    assert_eq strs(bytes.fields_func(tc[0], ->(r: Rune) -> Bool { unicode.is_space(r) })), tc[1]
+  }
+  pred = ->(c: Rune) -> Bool { c == 88 }
+  for tc in fields_func_tests {
+    bb = tc[0]
+    want = tc[1]
+    before = s(bb)
+    a = bytes.fields_func(bb, pred)
+    xz = append_z(a)
+    check(strs(a), want, "fields_func(#{strconv.quote(before)})")
+    assert_eq strs(bytes.fields_func_seq(bb, pred)), want
+    check(s(bb), before, "slice changed")
+    assert_eq s(xz), want[want.size - 1] + "z" if want.size > 0
+  }
+}
+
+# ------------------------------------------------------------- mapping
+
+test "ToUpper" {
+  for tc in upper_tests {
+    check(s(bytes.to_upper(tc[0])), s(tc[1]), "to_upper(#{q(tc[0])})")
+  }
+}
+
+test "ToLower" {
+  for tc in lower_tests {
+    check(s(bytes.to_lower(tc[0])), s(tc[1]), "to_lower(#{q(tc[0])})")
+  }
+}
+
+test "TrimSpace" {
+  for tc in trim_space_tests {
+    check(s(bytes.trim_space(tc[0])), s(tc[1]), "trim_space(#{q(tc[0])})")
+  }
+}
+
+def ten_runes(r: Rune) -> Str { runes_str([r; 10]) }
+
+def rot13(r: Rune) -> Rune {
+  step: Rune = 13
+  return ((r - 97 + step) % 26) + 97 if r >= 97 && r <= 122
+  return ((r - 65 + step) % 26) + 65 if r >= 65 && r <= 90
+  r
+}
+
+test "Map" {
+  a = ten_runes(97)
+  # 1. Grow.
+  m = bytes.map(->(_r: Rune) -> Rune { unicode.MAX_RUNE }, b(a))
+  check(s(m), ten_runes(unicode.MAX_RUNE), "growing")
+  # 2. Shrink.
+  m = bytes.map(->(_r: Rune) -> Rune { 97 }, b(ten_runes(unicode.MAX_RUNE)))
+  check(s(m), a, "shrinking")
+  # 3. Rot13.
+  m = bytes.map(->(r: Rune) -> Rune { rot13(r) }, b("a to zed"))
+  assert_eq s(m), "n gb mrq"
+  # 4. Rot13^2.
+  m = bytes.map(->(r: Rune) -> Rune { rot13(r) }, bytes.map(->(r: Rune) -> Rune { rot13(r) }, b("a to zed")))
+  assert_eq s(m), "a to zed"
+  # 5. Drop.
+  latin = unicode.script("Latin").unwrap
+  m = bytes.map(->(r: Rune) -> Rune { unicode.is(latin, r) ? r : -1 }, b("Hello, 세계"))
+  assert_eq s(m), "Hello"
+  # 6. Invalid rune.
+  m = bytes.map(->(_r: Rune) -> Rune { utf8.MAX_RUNE + 1 }, b("x"))
+  assert_eq s(m), "\uFFFD"
+}
+
+test "ToValidUTF8" {
+  for tc in to_valid_utf8_tests {
+    check(s(bytes.to_valid_utf8(tc[0], tc[1])), s(tc[2]), "to_valid_utf8(#{q(tc[0])}, #{q(tc[1])})")
+  }
+}
+
+test "Repeat" {
+  for tc in repeat_tests {
+    assert bytes.equal(bytes.repeat(tc[0], tc[2]), tc[1]), "repeat(#{q(tc[0])}, #{tc[2]})"
+  }
+}
+
+# golang.org/issue/16237
+test "RepeatCatchesOverflow" {
+  max_int = 0x7FFF_FFFF_FFFF_FFFF
+  assert_panics("negative") { bytes.repeat(b("--"), -2147483647) }
+  assert_eq bytes.repeat([], max_int).size, 0
+  assert_eq bytes.repeat(b("-"), 10).size, 10
+  assert_eq bytes.repeat(b("gopher"), 0).size, 0
+  assert_panics("negative") { bytes.repeat(b("-"), -1) }
+  assert_panics("negative") { bytes.repeat(b("--"), -102) }
+  assert_panics("overflow") { bytes.repeat(rb(0, 255), 0xFFFF_FFFF_FFFF_FFFF / 255 + 1) }
+  assert_panics("out of range") { bytes.repeat(b("-"), max_int) }
+}
+
+test "Runes" {
+  for tc in runes_tests {
+    a = bytes.runes(tc[0])
+    check(a, tc[1], "runes(#{q(tc[0])})")
+    assert_eq runes_str(a), s(tc[0]) if !tc[2]
+  }
+}
+
+# ------------------------------------------------------------- trimming
+
+def trim_by(name: Str, input: [Byte], arg: Str) -> [Byte] {
+  case name {
+    "Trim" => bytes.trim(input, arg)
+    "TrimLeft" => bytes.trim_left(input, arg)
+    "TrimRight" => bytes.trim_right(input, arg)
+    "TrimPrefix" => bytes.trim_prefix(input, b(arg))
+    "TrimSuffix" => bytes.trim_suffix(input, b(arg))
+    _ => panic("undefined trim function #{name}")
+  }
+}
+
+test "Trim" {
+  for tc in trim_tests {
+    check(s(trim_by(tc[0], tc[1], tc[2])), s(tc[3]), "#{tc[0]}(#{q(tc[1])}, #{strconv.quote(tc[2])})")
+  }
+  for tc in trim_nil_tests {
+    check(trim_by(tc[0], tc[1], tc[2]).size, 0, "#{tc[0]}(#{q(tc[1])}, #{strconv.quote(tc[2])}) returned non-empty value")
+  }
+}
+
+test "TrimFunc" {
+  for tc in trim_func_tests {
+    name = tc[0]
+    f = ->(r: Rune) -> Bool { holds(name, r) }
+    check(s(bytes.trim_func(tc[1], f)), s(tc[2]), "trim_func(#{q(tc[1])}, #{name})")
+    check(s(bytes.trim_left_func(tc[1], f)), s(tc[3]), "trim_left_func(#{q(tc[1])}, #{name})")
+    check(s(bytes.trim_right_func(tc[1], f)), s(tc[4]), "trim_right_func(#{q(tc[1])}, #{name})")
+  }
+}
+
+test "IndexFunc" {
+  for tc in index_func_tests {
+    name = tc[1]
+    f = ->(r: Rune) -> Bool { holds(name, r) }
+    check(bytes.index_func(tc[0], f), tc[2], "index_func(#{q(tc[0])}, #{name})")
+    check(bytes.last_index_func(tc[0], f), tc[3], "last_index_func(#{q(tc[0])}, #{name})")
+  }
+}
+
+# ------------------------------------------------------------- replacing
+
+test "Replace" {
+  for tc in replace_tests {
+    input = tc[0]
+    out = bytes.replace(input, tc[1], tc[2], tc[3])
+    check(s(out), tc[4], "replace(#{q(input)}, #{q(tc[1])}, #{q(tc[2])}, #{tc[3]})")
+    # Replace copies.
+    if out.size > 0 && input.size > 0 {
+      first = input[0]
+      out[0] = out[0] +% 1
+      check(input[0], first, "replace didn't copy")
+    }
+    assert_eq s(bytes.replace_all(input, tc[1], tc[2])), tc[4] if tc[3] == -1
+  }
+}
+
+# FuzzReplace's other implementation, run on its seed corpus.
+def replace_other(input: [Byte], old: [Byte], new: [Byte], count: Int) -> [Byte] {
+  out = bytes.new_buffer([])
+  n = count < 0 ? 0x7FFF_FFFF_FFFF_FFFF : count
+  i = 0
+  while i < input.size {
+    if n == 0 {
+      out.write!(input[i...input.size])
+      break
+    }
+    if bytes.has_prefix(input[i...input.size], old) {
+      out.write!(new)
+      i += old.size
+      n -= 1
+      next if old.size != 0
+      break if i == input.size
+    }
+    if old.size == 0 {
+      _r, length = utf8.decode_rune(input[i...input.size])
+      out.write!(input[i...i + length])
+      i += length
+    } else {
+      out.write_byte!(input[i])
+      i += 1
+    }
+  }
+  out.write!(new) if old.size == 0 && n != 0
+  out.bytes
+}
+
+test "FuzzReplace seeds" {
+  for tc in replace_tests {
+    simple = replace_other(tc[0], tc[1], tc[2], tc[3])
+    assert_eq s(simple), s(bytes.replace(tc[0], tc[1], tc[2], tc[3]))
+  }
+}
+
+test "Title" {
+  for tc in title_tests {
+    check(s(bytes.title(tc[0])), tc[1], "title(#{q(tc[0])})")
+  }
+}
+
+test "ToTitle" {
+  for tc in to_title_tests {
+    check(s(bytes.to_title(tc[0])), tc[1], "to_title(#{q(tc[0])})")
+  }
+}
+
+test "EqualFold" {
+  for tc in equal_fold_tests {
+    check(bytes.equal_fold(tc[0], tc[1]), tc[2], "equal_fold(#{q(tc[0])}, #{q(tc[1])})")
+    check(bytes.equal_fold(tc[1], tc[0]), tc[2], "equal_fold(#{q(tc[1])}, #{q(tc[0])})")
+  }
+}
+
+# ------------------------------------------------------------- cutting
+
+# Go's (before, after, found) from an alx cut result.
+def cut3(input: [Byte], r: ([Byte], [Byte])?) -> (Str, Str, Bool) {
+  if p = r { return (s(p[0]), s(p[1]), true) }
+  (s(input), "", false)
+}
+
+test "Cut" {
+  for tc in cut_tests {
+    check(cut3(tc[0], bytes.cut(tc[0], tc[1])), (tc[2], tc[3], tc[4]), "cut(#{q(tc[0])}, #{q(tc[1])})")
+  }
+}
+
+test "CutLast" {
+  for tc in cut_last_tests {
+    check(cut3(tc[0], bytes.cut_last(tc[0], tc[1])), (tc[2], tc[3], tc[4]), "cut_last(#{q(tc[0])}, #{q(tc[1])})")
+  }
+}
+
+def cut2(input: [Byte], r: [Byte]?) -> (Str, Bool) {
+  if v = r { return (s(v), true) }
+  (s(input), false)
+}
+
+test "CutPrefix" {
+  for tc in cut_prefix_tests {
+    got = cut2(tc[0], bytes.cut_prefix(tc[0], tc[1]))
+    check(got, (tc[2], tc[3]), "cut_prefix(#{q(tc[0])}, #{q(tc[1])})")
+  }
+}
+
+test "CutSuffix" {
+  for tc in cut_suffix_tests {
+    got = cut2(tc[0], bytes.cut_suffix(tc[0], tc[1]))
+    check(got, (tc[2], tc[3]), "cut_suffix(#{q(tc[0])}, #{q(tc[1])})")
+  }
+}
+
+# ------------------------------------------------------------- Buffer panics
+
+test "BufferGrowNegative" {
+  assert_panics {
+    bf = bytes.Buffer.new
+    bf.grow!(-1)
+  }
+}
+
+test "BufferTruncateNegative" {
+  assert_panics {
+    bf = bytes.Buffer.new
+    bf.truncate!(-1)
+  }
+}
+
+test "BufferTruncateOutOfRange" {
+  assert_panics {
+    bf = bytes.Buffer.new
+    bf.write!(rb(0, 10))
+    bf.truncate!(20)
+  }
+}
+
+# ------------------------------------------------------------- Contains
+
+test "Contains" {
+  for tc in contains_tests {
+    check(bytes.contains(tc[0], tc[1]), tc[2], "contains(#{q(tc[0])}, #{q(tc[1])})")
+  }
+}
+
+test "ContainsAny" {
+  for tc in contains_any_tests {
+    check(bytes.contains_any(tc[0], tc[1]), tc[2], "contains_any(#{q(tc[0])}, #{strconv.quote(tc[1])})")
+  }
+}
+
+test "ContainsRune" {
+  for tc in contains_rune_tests {
+    check(bytes.contains_rune(tc[0], tc[1]), tc[2], "contains_rune(#{q(tc[0])}, #{tc[1]})")
+  }
+}
+
+test "ContainsFunc" {
+  for tc in contains_rune_tests {
+    want = tc[1]
+    assert_eq bytes.contains_func(tc[0], ->(r: Rune) -> Bool { r == want }), tc[2]
+  }
+}
+
+test "Clone" {
+  inputs = [[], bytes.clone([]), b("short"), rb(0x61, 42), rb(0x61, 42)[0...0]]
+  for input in inputs {
+    c = bytes.clone(input)
+    assert bytes.equal(c, input), "clone(#{q(input)})"
+    if c.size > 0 {
+      first = input[0]
+      c[0] = 0
+      check(input[0], first, "clone shares the input's storage")
+    }
+  }
+}
+
+# ------------------------------------------------------------- compare_test.go
+
+test "Compare" {
+  for tc in compare_tests {
+    num_shifts = 16
+    buffer: [Byte] = [0; tc[1].size + num_shifts]
+    # Vary the offset of tc[1].
+    for offset in 0..num_shifts {
+      shifted = buffer[offset...tc[1].size + offset]
+      copy(shifted, tc[1])
+      check(bytes.compare(tc[0], shifted), tc[2], "compare(#{q(tc[0])}, #{q(tc[1])}), offset #{offset}")
+    }
+  }
+}
+
+test "CompareIdenticalSlice" {
+  bb = b("Hello Gophers!")
+  assert_eq bytes.compare(bb, bb), 0
+  assert_eq bytes.compare(bb, bb[0...1]), 1
+}
+
+test "CompareBytes" {
+  lengths = (0..128).to_a + [256, 512, 1024, 1333, 4095, 4096, 4097]
+  n = lengths[lengths.size - 1]
+  a: [Byte] = [0; n + 1]
+  bb: [Byte] = [0; n + 1]
+  for len in lengths {
+    # Randomish but deterministic data, no 0 or 255.
+    for i in 0...len {
+      a[i] = (1 + 31 * i % 254).as_u8
+      bb[i] = (1 + 31 * i % 254).as_u8
+    }
+    # The data past the end differs.
+    for i in len..n {
+      a[i] = 8
+      bb[i] = 9
+    }
+    check(bytes.compare(a[0...len], bb[0...len]), 0, "CompareIdentical(#{len})")
+    if len > 0 {
+      check(bytes.compare(a[0...len - 1], bb[0...len]), -1, "CompareAshorter(#{len})")
+      check(bytes.compare(a[0...len], bb[0...len - 1]), 1, "CompareBshorter(#{len})")
+    }
+    for k in 0...len {
+      bb[k] = a[k] - 1
+      check(bytes.compare(a[0...len], bb[0...len]), 1, "CompareAbigger(#{len},#{k})")
+      bb[k] = a[k] + 1
+      check(bytes.compare(a[0...len], bb[0...len]), -1, "CompareBbigger(#{len},#{k})")
+      bb[k] = a[k]
+    }
+  }
+}
+
+test "EndianBaseCompare" {
+  max_length = 512
+  a: [Byte] = [0; max_length]
+  bb: [Byte] = [0; max_length]
+  for i in 0...max_length {
+    a[i] = (1 + 31 * i % 254).as_u8
+    bb[i] = (1 + 31 * i % 254).as_u8
+  }
+  i = 2
+  while i <= max_length {
+    for j in 0...i - 1 {
+      a[j] = bb[j] - 1
+      a[j + 1] = bb[j + 1] + 1
+      check(bytes.compare(a[0...i], bb[0...i]), -1, "CompareBbigger(#{i},#{j})")
+      a[j] = bb[j] + 1
+      a[j + 1] = bb[j + 1] - 1
+      check(bytes.compare(a[0...i], bb[0...i]), 1, "CompareAbigger(#{i},#{j})")
+      a[j] = bb[j]
+      a[j + 1] = bb[j + 1]
+    }
+    i <<= 1
+  }
+}

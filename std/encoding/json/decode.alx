@@ -598,7 +598,8 @@ pub struct Decoder {
     f = parse_number(s[p...e])
     if f.none? {
       wrong!(p, "number " + s[p...e], "Float")
-      return old
+      # Go stores the infinity strconv returns, then reports the error
+      return s[p] == 45 ? -1.0e308 * 10.0 : 1.0e308 * 10.0
     }
     self.st[0].pos = e
     f || 0.0
@@ -703,15 +704,15 @@ pub struct Decoder {
     t.size > 0 && (t[0] == 45 || is_digit(t[0])) && num_end(t, 0) == t.size
   }
 
+  # Go 1.27 reads a quoted number with Go's syntax (strconv: leading zeros,
+  # a sign, hex floats), as v1 did (go.dev/issue/75619).
   pub def qsint!(bits: Int, old: Int = 0) -> Int {
     p = skip_ws(s, st[0].pos)
     want = bits == 64 ? "Int" : "I" + bits.to_s
     t = quoted!(want) || return old
-    one: U64 = 1
-    half = one << (bits - 1)
-    r = num_text?(t) ? int_text(t, half, half - 1) : none
-    if v = r {
-      return v
+    r = strconv.parse_int(t, 10, bits)
+    if r.ok? {
+      return r.unwrap
     }
     type_err!("number " + t, want, st[0].pos, p)
     old
@@ -721,9 +722,9 @@ pub struct Decoder {
     p = skip_ws(s, st[0].pos)
     want = "U" + bits.to_s
     t = quoted!(want) || return old
-    r = num_text?(t) ? uint_text(t, bits) : none
-    if v = r {
-      return v
+    r = strconv.parse_uint(t, 10, bits)
+    if r.ok? {
+      return r.unwrap
     }
     type_err!("number " + t, want, st[0].pos, p)
     old
@@ -732,9 +733,9 @@ pub struct Decoder {
   pub def qfloat!(old: Float = 0.0) -> Float {
     p = skip_ws(s, st[0].pos)
     t = quoted!("Float") || return old
-    r = num_text?(t) ? parse_number(t) : none
-    if v = r {
-      return v
+    r = strconv.parse_float(t)
+    if r.ok? {
+      return r.unwrap
     }
     type_err!("number " + t, "Float", st[0].pos, p)
     old
@@ -857,13 +858,14 @@ pub struct Decoder {
     true
   }
 
-  # A member no field takes: skipped, or an error after disallow_unknown_fields!.
+  # A member no field takes: skipped (an error after disallow_unknown_fields!).
   pub def unknown! {
+    # Go records the error and goes on, as for a type error
     if st[0].disallow {
-      fail!(JsonError.UnknownField(st[0].key))
-    } else {
-      skip!
+      self.st[0].nerr += 1
+      self.st[0].terr << JsonError.UnknownField(st[0].key) if st[0].terr.size == 0
     }
+    skip!
     nil
   }
 
@@ -1069,12 +1071,12 @@ pub struct Decoder {
 
   # Reads more input; false at the end (or after a read error, recorded).
   def fill! -> Bool {
-    st = ss[0]
-    return false if st.eof || st.err.size > 0
+    sv = ss[0]
+    return false if sv.eof || sv.err.size > 0
     # drop what was read
-    if st.pos > 4096 && st.pos * 2 > st.buf.size {
-      self.ss[0].off = st.off + st.pos
-      self.ss[0].buf = st.buf[st.pos...st.buf.size]
+    if sv.pos > 4096 && sv.pos * 2 > sv.buf.size {
+      self.ss[0].off = sv.off + sv.pos
+      self.ss[0].buf = sv.buf[sv.pos...sv.buf.size]
       self.ss[0].pos = 0
     }
     p: [Byte] = [0; 4096]
@@ -1133,7 +1135,7 @@ pub struct Decoder {
   }
 
   # Records a syntax error (sticky); returns it.
-  def sfail!(e: JsonError) -> JsonError {
+  def sfail![E](e: E) -> E {
     self.ss[0].err << e if ss[0].err.size == 0
     e
   }
@@ -1333,16 +1335,16 @@ pub struct Decoder {
 
   # Go's InputOffset: the offset in the stream after the last token or value.
   pub def input_offset -> Int {
-    st = ss[0]
-    off = st.off + st.pos
-    if st.peeked || st.had_eof {
+    sv = ss[0]
+    off = sv.off + sv.pos
+    if sv.peeked || sv.had_eof {
       # the spaces after it count once the next token was looked for
-      b = st.buf
-      p = st.pos
+      b = sv.buf
+      p = sv.pos
       while p < b.size && white?(b[p]) { p += 1 }
       if p < b.size {
-        off = st.off + p
-        off += 1 if st.had_eof && (b[p] == 44 || b[p] == 58)
+        off = sv.off + p
+        off += 1 if sv.had_eof && (b[p] == 44 || b[p] == 58)
       }
     }
     off

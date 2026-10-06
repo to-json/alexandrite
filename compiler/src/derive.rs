@@ -141,7 +141,8 @@ fn apply_json_tag(v: &str, sp: Span, o: &mut Opts) -> Result<(), Diag> {
             "case:ignore" | "nocase" => o.casing = 1,
             "case:strict" | "strictcase" => o.casing = 2,
             "" => {}
-            p => return Err(Diag::new(sp, format!("unknown json tag option `{p}`")).note("options: omitempty, omitzero, string, case:ignore, case:strict, embed, format:F (last)")),
+            // Go ignores options it doesn't know (a struct tag is free text)
+            _ => {}
         }
     }
     if let Some(f) = fmt {
@@ -670,6 +671,7 @@ impl<'a> Gen<'a> {
             Ty::Float => q(vec![Frag::Ex(format!("_e.f!({x})"))]),
             Ty::Str if quoted => vec![Frag::Ex(format!("_e.q(_e.q({x}))"))],
             Ty::Str => vec![Frag::Ex(format!("_e.q({x})"))],
+            Ty::Named(n) if quoted && n == format!("{}.Number", self.alias) => vec![Frag::Ex(format!("{}.enc_qnumber(_e, {x})", self.alias))],
             Ty::Named(_) => vec![Frag::Ex(format!("{}.enc_val(_e, {x})", self.alias))],
             Ty::Opt(inner) => {
                 let (o, v) = (self.fresh("o"), self.fresh("v"));
@@ -698,7 +700,7 @@ impl<'a> Gen<'a> {
                 let ktext = match self.key_ty(kt)? {
                     KeyTy::Str => k.clone(),
                     KeyTy::Int(_) => format!("{k}.to_s"),
-                    KeyTy::Named => format!("{}.key_text(_e, {k})", self.alias),
+                    KeyTy::Named => format!("{}.key_text(_e, {k}, {})", self.alias, lit(&type_src(t))),
                 };
                 self.w(ind + 1, format!("{kx} = {ktext}"));
                 let mut fr = vec![Frag::Ex(format!("_e.q({kx})")), Frag::Lit(":".into())];
@@ -875,6 +877,7 @@ impl<'a> Gen<'a> {
             Ty::Float => self.w(ind, format!("{dest} = _d.{}({old})", if quoted { "qfloat!" } else { "float!" })),
             Ty::Bool => self.w(ind, format!("{dest} = _d.{}({old})", if quoted { "qbool!" } else { "bool!" })),
             Ty::Str => self.w(ind, format!("{dest} = _d.{}({old})", if quoted { "qstr!" } else { "str!" })),
+            Ty::Named(n) if quoted && n == format!("{a}.Number") => self.w(ind, format!("{dest} = {a}.dec_qnumber(_d, {old})")),
             Ty::Named(_) => self.w(ind, format!("{dest} = {a}.dec_val(_d, {old})")),
             Ty::Opt(inner) => {
                 let (v, ov) = (self.fresh("v"), self.fresh("ov"));
@@ -1176,8 +1179,11 @@ pub fn json_source(job: &DeriveJob, alias: &str, types: &ModuleTypes, lenient: b
                 g.w(2, "_d.root!(\"\")");
                 g.w(2, format!("_r.{} = {name}.json_f_{}(_d, _r.{})", f.name, f.name, f.name));
             } else {
-                g.w(2, format!("_d.root!({})", lit(&name)));
-                g.w(2, format!("if _d.open!(123, {}) == 1 {{", lit(&name)));
+                // `#[data("pkg.T")]` names the type in errors (Go's name; "" for
+                // a Go anonymous struct)
+                let shown = job.go_name.clone().unwrap_or_else(|| name.clone());
+                g.w(2, format!("_d.root!({})", lit(&shown)));
+                g.w(2, format!("if _d.open!(123, {}) == 1 {{", lit(&shown)));
                 g.w(3, "while _d.next_key! {");
                 let names: Vec<String> = resolved.iter().map(|rf| lit(&rf.name)).collect();
                 g.w(4, "_i = case _d.key {");

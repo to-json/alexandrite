@@ -69,6 +69,27 @@ pub struct Number {
   pub def self.json_dec(d: Decoder) -> Number { Number.json_zero.json_merge(d) }
 }
 
+# A Number with the `,string` option: written inside a JSON string, read
+# from one (a bare number is an error, which Go reports without a place).
+pub def enc_qnumber(e: Encoder, n: Number) -> Str { "\"" + n.json_str(e) + "\"" }
+
+pub def dec_qnumber(d: Decoder, old: Number) -> Number {
+  dd = d
+  p = dd.start!
+  return old if p < 0
+  c = dd.s[p]
+  if c == 110 {
+    dd.skip!
+    return old
+  }
+  if c != 34 {
+    dd.skip!
+    dd.type_err!(kind_word(c), "json.Number", -dd.st[0].base, 0)
+    return old
+  }
+  old.json_merge(dd)
+}
+
 # Go's isValidNumber: s is a JSON number, all of it.
 pub def valid_number?(s: Str) -> Bool {
   s.size > 0 && (s[0] == 45 || is_digit(s[0])) && num_end(s, 0) == s.size
@@ -137,7 +158,7 @@ pub def dec_val[T](d: Decoder, old: T) -> T {
     v = old
     r = v.unmarshal_json!(raw.bytes)
     if err = r.err {
-      dd.fail!(JsonError.Custom(err.message))
+      dd.fail!(as_json_error(err))
       return old
     }
     return v
@@ -150,14 +171,14 @@ pub def dec_val[T](d: Decoder, old: T) -> T {
       return old
     }
     if c != 34 {
-      dd.wrong!(p, kind_word(c), format("%T", old), "JSON value must be string type")
+      dd.wrong!(p, kind_word(c), type_name(old), "JSON value must be string type")
       return old
     }
     t = dd.str!
     v = old
     r = v.unmarshal_text!(t.bytes)
     if err = r.err {
-      dd.type_err!("string", format("%T", old), dd.pos, p, err.message)
+      dd.type_err!("string", type_name(old), dd.pos, p, err.message)
       return old
     }
     return v
@@ -178,14 +199,32 @@ pub def dec_key[K](d: Decoder, zero: K) -> K? {
     if err = r.err {
       q = dd.pos - 1
       while q > 0 && dd.s[q] != 34 { q -= 1 }
-      dd.type_err!("string", format("%T", zero), q + 1, dd.pos, err.message)
+      dd.type_err!("string", type_name(zero), q + 1, dd.pos, err.message)
       dd.skip!
       return none
     }
     return v
   } else {
-    dd.fail!(JsonError.UnsupportedType("Map[" + format("%T", zero) + ", ...]"))
+    # Go: a type error at the key (the member is skipped)
+    q = dd.pos - 1
+    while q > 0 && dd.s[q] != 34 { q -= 1 }
+    dd.type_err!("string", type_name(zero), q + 1, dd.pos)
+    dd.skip!
     return none
+  }
+}
+
+# err as a JsonError: itself when it is one, else its text (Custom).
+def as_json_error(err: Error) -> JsonError {
+  case err {
+    JsonError.Syntax(m, o) => JsonError.Syntax(msg: m, offset: o)
+    JsonError.Type(v, t, o, st, f, c) => JsonError.Type(value: v, type_name: t, offset: o, struct_name: st, field: f, cause: c)
+    JsonError.UnsupportedType(t) => JsonError.UnsupportedType(type_name: t)
+    JsonError.UnsupportedValue(v) => JsonError.UnsupportedValue(str: v)
+    JsonError.Marshaler(t, c, src) => JsonError.Marshaler(type_name: t, cause: c, source_func: src)
+    JsonError.UnknownField(n) => JsonError.UnknownField(name: n)
+    JsonError.Invalid(m, o) => JsonError.Invalid(msg: m, offset: o)
+    _ => JsonError.Custom(msg: err.message)
   }
 }
 

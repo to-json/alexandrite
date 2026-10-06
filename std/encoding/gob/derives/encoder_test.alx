@@ -1,9 +1,7 @@
 # Go's encoder_test.go, the parts with structs and interfaces (the rest is in
 # ../codec_test.alx). Not translated: TestUnsupported, TestChanFuncIgnored
 # (chan/func fields: the derive refuses them at compile time),
-# TestRecursiveMapType/SliceType, TestIgnoreRecursiveType's encoder half,
-# TestNestedInterfaces' recursion, TestGobPtrSlices' Children (recursive
-# types are refused), TestValueError, TestCatchInvalidNilValue,
+# TestValueError, TestCatchInvalidNilValue,
 # TestTopLevelNilPointer, TestNilPointerPanics (no nil values or pointers at
 # the top level), TestSliceReusesMemory (decoding returns a new value; no
 # addresses to compare), TestMarshalFloatMap (Map keys are strings, bools
@@ -238,11 +236,14 @@ test "TestGobMapInterfaceEncode" {
   assert_eq hexof(enc_dec(m, MapIface.new).unwrap), hexof(m)
 }
 
+# Mutually recursive slices of structs caused problems.
 #[derive(Gob)]
 struct Bug3 {
   num: Int
+  children: [Bug3?]
 }
 
+# (Go encodes []*Bug3 itself; a top-level slice of a derived type needs a struct here)
 #[derive(Gob)]
 struct Bug3s {
   xs: [Bug3?]
@@ -251,6 +252,150 @@ struct Bug3s {
 test "TestGobPtrSlices" {
   in_ = Bug3s.new(xs: [Bug3.new(num: 1), Bug3.new(num: 2)])
   assert_eq hexof(enc_dec(in_, Bug3s.new).unwrap), hexof(in_)
+  # with Children: Go's bytes (Bug3s{[]*Bug3{{1, nil}, {2, []*Bug3{{3, nil}}}}})
+  in2 = Bug3s.new(xs: [Bug3.new(num: 1), Bug3.new(num: 2, children: [Bug3.new(num: 3)])])
+  h = "1a7f03010105427567337301ff800001010102587301ff840000001bff830201010c5b5d2a6d61696e2e4275673301ff840001ff82000022ff81030102ff8200010201034e756d01040001084368696c6472656e01ff8400000010ff800102010200010401010106000000"
+  assert_eq hexof(in2), h
+  dd = dec_of(h)
+  out = dd.decode!(Bug3s.new).unwrap
+  assert out == in2
+  assert_eq (out.xs[1]?.children || [])[0]?.num || 0, 3
+}
+
+# TestRecursiveMapType and TestRecursiveSliceType: Go's `type recursiveMap
+# map[string]recursiveMap` has no alx counterpart (a Map can't be named), so
+# the recursion goes through a struct; the bytes are Go's for the same struct.
+#[derive(Gob)]
+struct RecMap {
+  m: Map[Str, RecMap]
+}
+
+test "TestRecursiveMapType" {
+  r1 = RecMap.new(m: {"A" => RecMap.new(m: {"B" => RecMap.new, "C" => RecMap.new}), "D" => RecMap.new})
+  r2 = enc_dec(r1, RecMap.new).unwrap
+  assert r2 == r1
+  # one entry per map, so Go's map order doesn't matter
+  h = "1a7f030101065265634d617001ff8000010101014d01ff8200000027ff81040101166d61705b737472696e675d6d61696e2e5265634d617001ff8200010c01ff8000000dff800101014101010142000000"
+  r3 = RecMap.new(m: {"A" => RecMap.new(m: {"B" => RecMap.new})})
+  assert_eq hexof(r3), h
+  dd = dec_of(h)
+  assert dd.decode!(RecMap.new).unwrap == r3
+}
+
+#[derive(Gob)]
+struct RecSlice {
+  s: [RecSlice]
+}
+
+test "TestRecursiveSliceType" {
+  r1 = RecSlice.new(s: [RecSlice.new(s: [RecSlice.new]), RecSlice.new])
+  h = "1c7f03010108526563536c69636501ff8000010101015301ff820000001eff810201010f5b5d6d61696e2e526563536c69636501ff820001ff8000000aff800102010100000000"
+  assert_eq hexof(r1), h
+  r2 = enc_dec(r1, RecSlice.new).unwrap
+  assert r2 == r1
+  assert_eq r2.s[0].s.size, 1
+}
+
+# Mutual recursion: MA holds MB through a slice, MB holds MA through a
+# pointer. Go numbers each first reached type before its fields'.
+#[derive(Gob)]
+struct MA {
+  n: Int
+  bs: [MB]
+}
+
+#[derive(Gob)]
+struct MB {
+  s: Str
+  a: MA?
+}
+
+test "mutually recursive types" {
+  a = MA.new(n: 1, bs: [MB.new(s: "x", a: MA.new(n: 2))])
+  ha = "1d7f030101024d4101ff8000010201014e0104000102427301ff8400000018ff83020101095b5d6d61696e2e4d4201ff840001ff8200001dff81030101024d4201ff82000102010153010c0001014101ff800000000fff8001020101010178010104000000"
+  assert_eq hexof(a), ha
+  dd = dec_of(ha)
+  assert dd.decode!(MA.new).unwrap == a
+  b = MB.new(s: "y", a: MA.new(n: 3, bs: [MB.new(s: "z")]))
+  hb = "1c7f030101024d4201ff80000102010153010c0001014101ff820000001eff81030101024d4101ff8200010201014e0104000102427301ff8400000018ff83020101095b5d6d61696e2e4d4201ff840001ff80000010ff80010179010106010101017a000000"
+  assert_eq hexof(b), hb
+  dd = dec_of(hb)
+  assert dd.decode!(MB.new).unwrap == b
+}
+
+# TestIgnoreRecursiveType's encoder half: a recursive field the receiver
+# doesn't have is skipped (Go's bytes; Go decodes them into IgnLocal too).
+#[derive(Gob)]
+struct Ign {
+  x: Int
+  rec: RecSlice
+  y: Str
+}
+
+#[derive(Gob)]
+#[data("main.Ign")]
+struct IgnLocal {
+  x: Int
+  y: Str
+}
+
+test "TestIgnoreRecursiveType (encoder)" {
+  v = Ign.new(x: 5, rec: RecSlice.new(s: [RecSlice.new(s: [RecSlice.new])]), y: "why")
+  h = "257f0301010349676e01ff80000103010158010400010352656301ff8200010159010c0000001dff8103010108526563536c69636501ff8200010101015301ff840000001eff830201010f5b5d6d61696e2e526563536c69636501ff840001ff82000012ff80010a0101010101000000010377687900"
+  assert_eq hexof(v), h
+  dd = dec_of(h)
+  l = dd.decode!(IgnLocal.new).unwrap
+  assert_eq l.x, 5
+  assert_eq l.y, "why"
+  d = dec_of(h)
+  d.skip!.unwrap
+}
+
+# TestNestedInterfaces: an interface holding a struct holding the interface.
+# Go registers *Bug0Outer and *Bug0Inner (the names are Go's, package main).
+#[derive(Gob)]
+enum Bug0 {
+  #[field(gob: "*main.Bug0Outer")] Outer(Bug0Outer)
+  #[field(gob: "*main.Bug0Inner")] Inner(Bug0Inner)
+}
+
+#[derive(Gob)]
+struct Bug0Outer {
+  bug0_field: Bug0?
+}
+
+#[derive(Gob)]
+struct Bug0Inner {
+  a: Int
+}
+
+test "TestNestedInterfaces" {
+  v = Bug0.Outer(Bug0Outer.new(bug0_field: Bug0.Outer(Bug0Outer.new(bug0_field: Bug0.Inner(Bug0Inner.new(a: 7))))))
+  h = "3610000f2a6d61696e2e427567304f757465727f03010109427567304f7574657201ff800001010109427567304669656c6401100000004eff804b010f2a6d61696e2e427567304f75746572ff802e010f2a6d61696e2e42756730496e6e6572ff810301010942756730496e6e657201ff82000101010141010400000007ff8203010e000000"
+  assert_eq hexof(v), h
+  dd = dec_of(h)
+  got = dd.decode!(Bug0.Inner(Bug0Inner.new)).unwrap
+  assert got == v
+  a = 0
+  case got {
+    Outer(o1) => {
+      if f1 = o1.bug0_field {
+        case f1 {
+          Outer(o2) => {
+            if f2 = o2.bug0_field {
+              case f2 {
+                Inner(i) => {a = i.a}
+                _ => {}
+              }
+            }
+          }
+          _ => {}
+        }
+      }
+    }
+    _ => {}
+  }
+  assert_eq a, 7
 }
 
 #[derive(Gob)]

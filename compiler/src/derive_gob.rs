@@ -496,14 +496,16 @@ pub fn source(gj: &GobJob, alias: &str, locals: &HashMap<String, LocalType>) -> 
             g.w(2, "}");
             let rts: Vec<String> = sh.tys.iter().map(|t| g.rt(t)).collect();
             let names: Vec<String> = sh.names.iter().map(|n| lit(n)).collect();
+            // registered before its fields' types are described: a type may hold itself (R12)
+            g.w(2, format!("_r = _t.strct!({}, [], [])", lit(&go_name)));
             g.w(2, format!("_fn: [Str] = [{}]", names.join(", ")));
             g.w(2, format!("_ft: [Int] = [{}]", rts.join(", ")));
-            g.w(2, format!("_t.strct!({}, _fn, _ft)", lit(&go_name)));
+            g.w(2, "_t.fields!(_r, _fn, _ft)");
             g.w(1, "}");
             g.w(1, format!("def gob_type_name -> Str {{ {} }}", lit(&go_name)));
             g.w(1, format!("def self.gob_zero -> {name} {{ {name}.new }}"));
             // gob_enc
-            g.w(1, format!("def gob_enc(_e0: {a}.Encoder) {{").replace(".Encoder)", ".Enc)"));
+            g.w(1, format!("def gob_enc(_e0: {a}.Enc) -> Unit {{"));
             g.w(2, "_e = _e0");
             if sent_none {
                 g.w(2, format!("_e.fail!({})", lit(&format!("gob: type {go_name} has no exported fields"))));
@@ -561,13 +563,15 @@ pub fn source(gj: &GobJob, alias: &str, locals: &HashMap<String, LocalType>) -> 
                 g.w(2, "}");
                 let rts: Vec<String> = sh.tys.iter().map(|t| g.rt(t)).collect();
                 let names: Vec<String> = sh.names.iter().map(|n| lit(n)).collect();
+                // registered before its fields' types are described: a type may hold itself (R12)
+                g.w(2, format!("_r = _t.strct!({}, [], [])", lit(&vgo)));
                 g.w(2, format!("_fn: [Str] = [{}]", names.join(", ")));
                 g.w(2, format!("_ft: [Int] = [{}]", rts.join(", ")));
-                g.w(2, format!("_t.strct!({}, _fn, _ft)", lit(&vgo)));
+                g.w(2, "_t.fields!(_r, _fn, _ft)");
                 g.w(1, "}");
             }
             // gob_enc: an interface value
-            g.w(1, format!("def gob_enc(_e0: {a}.Enc) {{"));
+            g.w(1, format!("def gob_enc(_e0: {a}.Enc) -> Unit {{"));
             g.w(2, "_e = _e0");
             g.w(2, "_t = _e.types");
             g.w(2, "case self {");
@@ -682,12 +686,21 @@ fn gen_struct_dec(g: &mut G, name: &str, go: &str, sh: &Shape, var: Option<(usiz
         None => String::new(),
     };
     // the plan: for each wire field, the local one (or -1); Go's compileDec
+    // Go's getDecEnginePtr: the plan is marked underway (an empty one) while
+    // it is made, so a type holding itself finds it; dropped if making fails
     g.w(1, format!("def self.gob_plan{sfx}(_d0: {a}.Dec, _wid: Int) -> ~[Int] {{"));
     g.w(2, "_d = _d0");
-    g.w(2, "_t = _d.types");
     g.w(2, format!("if _c = _d.plan({}, _wid) {{", lit(go)));
     g.w(3, "return _c");
     g.w(2, "}");
+    g.w(2, format!("_d.store_plan!({}, _wid, [])", lit(go)));
+    g.w(2, format!("_m = {name}.gob_mkplan{sfx}(_d, _wid)"));
+    g.w(2, format!("_d.drop_plan!({}, _wid) unless _m.ok?", lit(go)));
+    g.w(2, "~_m");
+    g.w(1, "}");
+    g.w(1, format!("def self.gob_mkplan{sfx}(_d0: {a}.Dec, _wid: Int) -> ~[Int] {{"));
+    g.w(2, "_d = _d0");
+    g.w(2, "_t = _d.types");
     g.w(2, format!("_ws = _d.~wire_struct(_wid, {})", lit(go)));
     g.w(2, "_p: [Int] = []");
     g.w(2, "for _k in 0..._ws.fnames.size {");

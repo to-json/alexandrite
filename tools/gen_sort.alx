@@ -1,7 +1,10 @@
-# Instantiates sort.tmpl (the sorting kernels) as alexandrite source.
+# Instantiates sort.tmpl (Go's sorting kernels) as alexandrite source, as Go's
+# sort/gen_sort_variants.go does for Go:
 #
-#   slices/sort_kernels.alx   ordered (`<`) and cmp-function (`_func`) variants
-#   sort/sort_kernels.alx     less-function (`_less`) variant, for sort.slice
+#   slices/sort_kernels.alx   `_ordered` (`<`), `_ordered_nan` (cmp.Less: NaNs
+#                             first) and `_cmp_func` (a cmp function) variants
+#   sort/sort_kernels.alx     the sort.Interface variant (no suffix) and
+#                             `_func` (an index less function, for sort.slice)
 #
 # Run from the repository: alx run tools/gen_sort.alx
 
@@ -11,66 +14,107 @@ import "strings"
 
 struct Variant {
   s: Str    # name suffix
+  tp: Str   # type parameters
+  dp: Str   # the data parameter
   p: Str    # extra parameter
   a: Str    # extra argument
-  kind: Int # how LT(a, b) reads: 0 `<`, 1 cmp, 2 less
+  kind: Int # how LESS(i, j) reads: 0 `<`, 1 cmp.Less, 2 cmp, 3 interface, 4 less(i, j)
 }
 
-def lt(v: Variant, a: Str, b: Str) -> Str {
+def less(v: Variant, i: Str, j: Str) -> Str {
+  x = "data[#{i}]"
+  y = "data[#{j}]"
   case v.kind {
-    0 => "(#{a} < #{b})"
-    1 => "(cmp(#{a}, #{b}) < 0)"
-    _ => "less(#{a}, #{b})"
+    0 => "(#{x} < #{y})"
+    1 => "(#{x} < #{y} || (#{x} != #{x} && #{y} == #{y}))"
+    2 => "(cmp(#{x}, #{y}) < 0)"
+    3 => "data.less(#{i}, #{j})"
+    _ => "less(#{i}, #{j})"
   }
+}
+
+# SWAP(i, j) as statements at `indent`.
+def swap(v: Variant, i: Str, j: Str, indent: Str) -> Str {
+  return "#{indent}data.swap!(#{i}, #{j})" if v.kind == 3
+  "#{indent}t = data[#{i}]\n#{indent}data[#{i}] = data[#{j}]\n#{indent}data[#{j}] = t"
 }
 
 def variant(name: Str) -> Variant {
+  slice = "data: [T]"
   case name {
-    "ord" => Variant.new(s: "", p: "", a: "", kind: 0)
-    "func" => Variant.new(s: "_func", p: ", cmp: (T, T) -> Int", a: ", cmp", kind: 1)
-    _ => Variant.new(s: "_less", p: ", less: (T, T) -> Bool", a: ", less", kind: 2)
+    "ordered" => Variant.new(s: "_ordered", tp: "[T]", dp: slice, p: "", a: "", kind: 0)
+    "ordered_nan" => Variant.new(s: "_ordered_nan", tp: "[T]", dp: slice, p: "", a: "", kind: 1)
+    "cmp_func" => Variant.new(s: "_cmp_func", tp: "[T]", dp: slice, p: ", cmp: (T, T) -> Int", a: ", cmp", kind: 2)
+    "iface" => Variant.new(s: "", tp: "[D: Interface]", dp: "data: D", p: "", a: "", kind: 3)
+    _ => Variant.new(s: "_func", tp: "[T]", dp: slice, p: ", less: (Int, Int) -> Bool", a: ", less", kind: 4)
   }
 }
 
-# Every LT(a, b) expanded (arguments may hold [...] indexing, no commas).
-def expand_lt(s: Str, v: Variant) -> Str {
+# The two arguments of the macro call whose "(" is at s[k - 1]: (i, j, end),
+# end the index of the closing ")".
+def args(s: Str, k0: Int) -> (Str, Str, Int) {
+  k = k0
+  depth = 0
+  comma = -1
+  while k < s.size {
+    c = s[k]
+    if c == 40 || c == 91 {
+      depth += 1
+    } else if c == 93 || (c == 41 && depth > 0) {
+      depth -= 1
+    } else if c == 41 {
+      break
+    } else if c == 44 && depth == 0 {
+      comma = k
+    }
+    k += 1
+  }
+  (s[k0...comma], s[comma + 1...k], k)
+}
+
+# Every LESS(i, j) expanded.
+def expand_less(s: Str, v: Variant) -> Str {
   out = ""
   i = 0
   loop {
-    j = strings.index(s[i...s.size], "LT(")
+    j = strings.index(s[i...s.size], "LESS(")
     if j < 0 {
       out += s[i...s.size]
       break
     }
     j += i
     out += s[i...j]
-    k = j + 3
-    depth = 0
-    comma = -1
-    while k < s.size {
-      c = s[k]
-      if c == 40 || c == 91 {
-        depth += 1
-      } else if c == 93 || (c == 41 && depth > 0) {
-        depth -= 1
-      } else if c == 41 {
-        break
-      } else if c == 44 && depth == 0 {
-        comma = k
-      }
-      k += 1
-    }
-    out += lt(v, strings.trim_space(s[j + 3...comma]), strings.trim_space(s[comma + 1...k]))
+    a, b, k = args(s, j + 5)
+    out += less(v, strings.trim_space(a), strings.trim_space(b))
     i = k + 1
   }
   out
 }
 
+# Every line that is a SWAP(i, j) expanded.
+def expand_swap(s: Str, v: Variant) -> Str {
+  lines: [Str] = []
+  for line in strings.split(s, "\n") {
+    t = strings.trim_left(line, " ")
+    if strings.has_prefix(t, "SWAP(") {
+      indent = line[0...line.size - t.size]
+      a, b, _ = args(t, 5)
+      lines << swap(v, strings.trim_space(a), strings.trim_space(b), indent)
+    } else {
+      lines << line
+    }
+  }
+  strings.join(lines, "\n")
+}
+
 def inst(tmpl: Str, v: Variant) -> Str {
   # drop the template's own header comment
   s = tmpl[strings.index(tmpl, "\n\n") + 2...tmpl.size]
-  s = expand_lt(s, v)
+  s = expand_swap(s, v)
+  s = expand_less(s, v)
   s = strings.replace_all(s, "{S}", v.s)
+  s = strings.replace_all(s, "{TP}", v.tp)
+  s = strings.replace_all(s, "{DP}", v.dp)
   s = strings.replace_all(s, "{P}", v.p)
   s = strings.replace_all(s, "{A}", v.a)
   s
@@ -86,5 +130,5 @@ def emit(here: Str, tmpl: Str, file: Str, names: [Str], note: Str) -> ~Unit {
 here = "std/slices"
 sh.abort("run from the repository root") if !sh.exists?("#{here}/sort.tmpl")
 tmpl = sh.~read("#{here}/sort.tmpl")
-~emit(here, tmpl, "slices/sort_kernels.alx", ["ord", "func"], "Sorting kernels: ordered and cmp-function variants.")
-~emit(here, tmpl, "sort/sort_kernels.alx", ["less"], "Sorting kernels: less-function variant.")
+~emit(here, tmpl, "slices/sort_kernels.alx", ["ordered", "ordered_nan", "cmp_func"], "Go's zsortordered.go (twice: `<`, and cmp.Less for floats) and zsortanyfunc.go.")
+~emit(here, tmpl, "sort/sort_kernels.alx", ["iface", "func"], "Go's zsortinterface.go and zsortfunc.go.")

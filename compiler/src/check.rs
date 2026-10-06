@@ -177,6 +177,15 @@ pub struct World<'a> {
     /// An error inside a callee is final: retry passes of the caller must
     /// not swallow it.
     fatal: Option<Diag>,
+    /// Collect mode (editor analysis, analyze.rs): record diagnostics instead of
+    /// latching `fatal`, so one failure doesn't hide the next. Off for compiles.
+    pub collect: bool,
+    /// The diagnostics recorded in collect mode, in emission order.
+    pub diags: Vec<Diag>,
+    /// Instances whose check failed (collect mode): their callers are abandoned silently.
+    failed: std::collections::HashSet<FuncId>,
+    /// A declaration failed (collect mode): bodies are not checked.
+    pub decl_failed: bool,
     /// User structs by name, fields resolved.
     pub structs: Structs,
     /// Top-level constants: value and declared type (None = untyped, Go).
@@ -348,12 +357,34 @@ impl<'a> World<'a> {
         GENERICS.with(|g| g.borrow_mut().clear());
         RECS.with(|r| r.borrow_mut().clear());
         INSTS.with(|g| g.borrow_mut().clear());
-        Ok(World { sm, defs, by_name, instances: HashMap::new(), declared_errs: HashMap::new(), funcs: vec![], sigs: HashMap::new(), fatal: None, structs: HashMap::new(), consts: HashMap::new(), ifaces: HashMap::new(), iface_order: vec![], impls: HashMap::new(), stringers: HashMap::new(), errors: vec![], refines: HashMap::new(), grefines: HashMap::new(), warnings: vec![], globals: vec![], pending_consts: vec![], vars: vec![], eq_ifaces: vec![] })
+        Ok(World { sm, defs, by_name, instances: HashMap::new(), declared_errs: HashMap::new(), funcs: vec![], sigs: HashMap::new(), fatal: None, collect: false, diags: vec![], failed: Default::default(), decl_failed: false, structs: HashMap::new(), consts: HashMap::new(), ifaces: HashMap::new(), iface_order: vec![], impls: HashMap::new(), stringers: HashMap::new(), errors: vec![], refines: HashMap::new(), grefines: HashMap::new(), warnings: vec![], globals: vec![], pending_consts: vec![], vars: vec![], eq_ifaces: vec![] })
+    }
+
+    /// Collect mode: record `e` (once per place and message); a cascade is not a diagnostic.
+    pub fn record(&mut self, e: Diag) {
+        if !is_cascade(&e) && !self.diags.iter().any(|d| d.span == e.span && d.msg == e.msg) {
+            self.diags.push(e);
+        }
+    }
+
+    /// A declaration's result: in collect mode a failure is recorded and
+    /// `decl_failed` set (the caller goes on to the next item); otherwise it propagates.
+    fn decl<T>(&mut self, r: R<T>) -> R<Option<T>> {
+        match r {
+            Ok(v) => Ok(Some(v)),
+            Err(e) if self.collect => {
+                self.record(e);
+                self.decl_failed = true;
+                Ok(None)
+            }
+            Err(e) => Err(e),
+        }
     }
 
     /// Evaluate top-level constants, in order (each may use earlier ones).
     pub fn add_consts(&mut self, defs: &[ConstDef]) -> R<()> {
         for d in defs {
+            let r: R<()> = (|| {
             if self.consts.contains_key(&d.name) || self.structs.contains_key(&d.name) || self.vars.iter().any(|v| v.name == d.name) {
                 return Err(Diag::new(d.span, format!("`{}` is already defined", d.name)));
             }
@@ -362,7 +393,7 @@ impl<'a> World<'a> {
                 let global = self.globals.len();
                 self.globals.push((d.name.clone(), TExpr { kind: TK::Unit, ty: Ty::Unit, span: d.span }));
                 self.vars.push(VarInfo { name: d.name.clone(), span: d.span, global, ty: None, init: None, checking: false });
-                continue;
+                return Ok(());
             }
             // `Enum.Variant`, or a constant naming one, or embedded files: after the types.
             let deferred = d.embed.is_some() || match &d.value.kind {
@@ -377,7 +408,7 @@ impl<'a> World<'a> {
             };
             if deferred {
                 self.pending_consts.push(d.clone());
-                continue;
+                return Ok(());
             }
             let prev = enter_pkg(&pkg_of(&d.name));
             let v = self.eval_const(&d.value);
@@ -414,6 +445,9 @@ impl<'a> World<'a> {
             };
             drop(prev);
             self.consts.insert(d.name.clone(), (v, ty));
+            Ok(())
+            })();
+            self.decl(r)?;
         }
         Ok(())
     }
@@ -427,6 +461,7 @@ impl<'a> World<'a> {
     pub fn add_enum_consts(&mut self) -> R<()> {
         let pending = std::mem::take(&mut self.pending_consts);
         for d in &pending {
+            let r: R<()> = (|| {
             if let Some(e) = &d.embed {
                 let prev = enter_pkg(&pkg_of(&d.name));
                 let t = type_from(d.ty.as_ref().expect("an embedded constant is typed"), &self.structs, &self.consts);
@@ -441,14 +476,14 @@ impl<'a> World<'a> {
                         }
                         let one: Vec<_> = e.files.iter().filter(|(n, _)| !n.ends_with('/')).cloned().collect();
                         self.consts.insert(d.name.clone(), (CVal::Embed(std::rc::Rc::new(one)), Some(t)));
-                        continue;
+                        return Ok(());
                     }
                     // embed.FS (just `FS` in embed's own tests).
                     Ty::Struct(n, fs) if (n == "embed.FS" || n == "FS") && fs.iter().any(|(f, _)| f == "names") && fs.iter().any(|(f, _)| f == "datas") => {}
                     _ => return Err(Diag::new(d.span, format!("an embedded constant is a Str, a [Byte] or an embed.FS, not {}", t.show()))),
                 }
                 self.consts.insert(d.name.clone(), (CVal::Embed(e.files.clone()), Some(t)));
-                continue;
+                return Ok(());
             }
             let prev = enter_pkg(&pkg_of(&d.name));
             let ev = self.enum_const(&d.value);
@@ -465,6 +500,9 @@ impl<'a> World<'a> {
                 }
             }
             self.consts.insert(d.name.clone(), (v, Some(t)));
+            Ok(())
+            })();
+            self.decl(r)?;
         }
         Ok(())
     }
@@ -547,7 +585,17 @@ impl<'a> World<'a> {
             let prev = enter_pkg(&pkg_of(&self.vars[k].name));
             let r = self.var_global(k, sp);
             drop(prev);
+            if self.collect {
+                if let Err(e) = r {
+                    self.record(e);
+                    self.decl_failed = true;
+                }
+                continue;
+            }
             r?;
+        }
+        if self.decl_failed {
+            return Ok(vec![]);
         }
         let by_global: HashMap<usize, usize> = self.vars.iter().enumerate().map(|(k, v)| (v.global, k)).collect();
         // Each function's direct callees and the values it reads.
@@ -693,7 +741,11 @@ impl<'a> World<'a> {
         let mut names: Vec<&str> = by_name.keys().copied().collect();
         names.sort_unstable();
         for n in &names {
-            resolve(n, &by_name, &mut self.structs, &mut vec![], &self.consts)?;
+            let r = resolve(n, &by_name, &mut self.structs, &mut vec![], &self.consts);
+            self.decl(r)?;
+        }
+        if self.decl_failed {
+            return Ok(());
         }
         // The types that mention themselves get their definitions recorded
         // (for `Ty::Rec`), then each must have a finite layout.
@@ -714,7 +766,13 @@ impl<'a> World<'a> {
                         Def::S(s) => s.span,
                         Def::E(e) => e.span,
                     };
-                    return Err(infinite_layout(span, n, &path));
+                    let e = infinite_layout(span, n, &path);
+                    if self.collect {
+                        self.record(e);
+                        self.decl_failed = true;
+                        continue;
+                    }
+                    return Err(e);
                 }
             }
         }
@@ -728,12 +786,13 @@ impl<'a> World<'a> {
     /// Resolve refinement targets (after structs).
     pub fn add_refines(&mut self, defs: &[RefineDef]) -> R<()> {
         for r in defs {
+            let res: R<()> = (|| {
             if !r.tparams.is_empty() {
                 let word = texpr_word(&r.target);
                 let ms: HashMap<String, usize> = r.methods.iter().map(|m| (m.clone(), self.by_name[&refine_def_name(&r.name, &word, m)])).collect();
                 self.refines.entry(r.name.clone()).or_default();
                 self.grefines.entry(r.name.clone()).or_default().push((r.target.clone(), r.tparams.clone(), pkg_of(&r.name), ms));
-                continue;
+                return Ok(());
             }
             let prev = enter_pkg(&pkg_of(&r.name));
             let t = type_from(&r.target, &self.structs, &self.consts);
@@ -749,6 +808,9 @@ impl<'a> World<'a> {
                 Some((_, old)) => old.extend(ms),
                 None => entry.push((t, ms)),
             }
+            Ok(())
+            })();
+            self.decl(res)?;
         }
         Ok(())
     }
@@ -794,7 +856,14 @@ impl<'a> World<'a> {
                         changed = true;
                         continue;
                     }
-                    let fid = self.instance(def, vec![t.clone(), t.clone()], Span::default())?;
+                    let fid = match self.instance(def, vec![t.clone(), t.clone()], Span::default()) {
+                        Ok(f) => f,
+                        Err(e) if self.collect => {
+                            self.record(e);
+                            continue;
+                        }
+                        Err(e) => return Err(e),
+                    };
                     out.entry(n.clone()).or_default().push(fid);
                     changed = true;
                 }
@@ -810,7 +879,14 @@ impl<'a> World<'a> {
         for (k, t) in self.errors.clone().iter().enumerate() {
             let Some(tn) = t.type_name() else { continue };
             if let Some(&def) = self.by_name.get(&method_name(tn, "message")) {
-                let fid = self.instance(def, vec![t.clone()], Span::default())?;
+                let fid = match self.instance(def, vec![t.clone()], Span::default()) {
+                    Ok(f) => f,
+                    Err(e) if self.collect => {
+                        self.record(e);
+                        continue;
+                    }
+                    Err(e) => return Err(e),
+                };
                 out.insert(k, fid);
             }
         }
@@ -834,7 +910,7 @@ impl<'a> World<'a> {
             let prev = enter_pkg(&pkg_of(&d.name));
             let r = self.add_iface_sig(d);
             drop(prev);
-            r?;
+            self.decl(r)?;
         }
         Ok(())
     }
@@ -1059,9 +1135,32 @@ impl<'a> World<'a> {
         Ok(out)
     }
 
+    /// Collect mode: can def `i` be checked on its own? Not generic, every
+    /// parameter typed (a generic owner's method has an untyped `self`), not an
+    /// `extern`, and not code a derive wrote (its tokens all carry one span).
+    pub fn is_root(&self, i: usize) -> bool {
+        let d = &self.defs[i].def;
+        d.tparams.is_empty() && d.ffi.is_none() && self.defs[i].external.is_none() && d.params.iter().all(|p| p.ty.is_some()) && d.name_span != d.span
+    }
+
+    /// Collect mode: check def `i` as a root. Failures are recorded, never returned.
+    pub fn check_root(&mut self, i: usize) {
+        let prev = enter_pkg(&self.defs[i].pkg);
+        let d = &self.defs[i].def;
+        let (name_span, tys): (Span, R<Vec<Ty>>) = (d.name_span, d.params.iter().map(|p| type_from(p.ty.as_ref().expect("a root's parameters are typed"), &self.structs, &self.consts)).collect());
+        drop(prev);
+        let r = tys.and_then(|tys| self.instance(i, tys, name_span));
+        if let Err(e) = r {
+            self.record(e);
+        }
+    }
+
     fn instance(&mut self, def: usize, args: Vec<Ty>, call_span: Span) -> R<FuncId> {
         let args: Vec<Ty> = if args.iter().any(|t| matches!(t, Ty::Rec(_))) { args.iter().map(Ty::unrec).collect() } else { args };
         if let Some(id) = self.instances.get(&(def, args.clone())) {
+            if self.collect && self.failed.contains(id) {
+                return Err(cascade());
+            }
             return Ok(*id);
         }
         let id = self.funcs.len();
@@ -1113,7 +1212,7 @@ impl<'a> World<'a> {
                 Ok(r) => r,
                 Err(e) => {
                     self.unbind(saved);
-                    return Err(e);
+                    return Err(self.fail_instance(id, e));
                 }
             };
             self.sigs.insert(id, (r, def_ast.fallible, def_ast.pure));
@@ -1128,6 +1227,12 @@ impl<'a> World<'a> {
         self.unbind(saved);
         let f = match f {
             Ok(f) => f,
+            Err(e) if self.collect => {
+                // Record once, remember the failure, and unwind callers with a cascade.
+                self.failed.insert(id);
+                self.record(e);
+                return Err(cascade());
+            }
             Err(e) => {
                 self.fatal.get_or_insert(e.clone());
                 return Err(e);
@@ -1136,6 +1241,17 @@ impl<'a> World<'a> {
         self.sigs.insert(id, (f.ret.clone(), f.fallible, f.pure));
         self.funcs[id] = Some(f);
         Ok(id)
+    }
+
+    /// An instance failed outside its body check. Fail-fast: the error itself.
+    /// Collect mode: record it, mark the instance, and unwind with a cascade.
+    fn fail_instance(&mut self, id: FuncId, e: Diag) -> Diag {
+        if !self.collect {
+            return e;
+        }
+        self.failed.insert(id);
+        self.record(e);
+        cascade()
     }
 
     fn check_fn(&mut self, id: FuncId, def: Option<&Def>, args: &[Ty], body: &[Stmt], overflow: Overflow, span: Span) -> R<TFunc> {
@@ -1161,6 +1277,7 @@ impl<'a> World<'a> {
                     return Ok(f);
                 }
                 Ok(_) => {}
+                Err(e) if self.collect && is_cascade(&e) => return Err(e),
                 Err(e) => last_err = Some(e),
             }
             if strict {
@@ -1420,6 +1537,16 @@ thread_local! {
     static INSTANTIATING: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(vec![]) };
     /// Every struct and enum name (for `@T` handles to types not resolved yet).
     pub static DECLARED: std::cell::RefCell<std::collections::HashSet<String>> = std::cell::RefCell::new(Default::default());
+}
+
+/// Collect mode: the error a caller sees when the instance it needs already
+/// failed (and was recorded). It is never reported; it only unwinds.
+fn cascade() -> Diag {
+    Diag::new(Span::default(), CASCADE)
+}
+const CASCADE: &str = "\0cascade";
+pub fn is_cascade(d: &Diag) -> bool {
+    d.msg == CASCADE
 }
 
 pub fn generic(n: &str) -> Option<GenDef> {

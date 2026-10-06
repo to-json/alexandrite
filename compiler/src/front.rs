@@ -4,6 +4,7 @@ use crate::ast::{import_name, Import, Module, NodeId, Overflow, TestDecl, TestKi
 use std::collections::{HashMap, HashSet};
 use crate::check::{DefInfo, World};
 use crate::diag::{Diag, SourceMap, Span};
+use crate::analyze::{Item, Phase};
 use crate::tast::TProgram;
 use crate::{lexer, parser, prove};
 use std::path::{Path, PathBuf};
@@ -492,6 +493,21 @@ fn def_info(d: &Def, overflow: Overflow, pkg: &str) -> Result<DefInfo, Diag> {
 /// `externs`: the interface of packages compiled separately (whose
 /// declarations are then left out).
 pub fn check_program(l: &Loaded, externs: Vec<DefInfo>) -> Result<TProgram, Diag> {
+    check_program_impl(l, externs, None).map(|p| p.expect("a normal check returns a program"))
+}
+
+/// Editor analysis (analyze.rs): `check_program` in collect mode. Every
+/// problem goes to `out` in emission order (the first error is the one
+/// `check_program` would return); `own` says which files belong to the unit,
+/// whose defs are checked even when nothing calls them.
+pub fn check_collect(l: &Loaded, own: &dyn Fn(u32) -> bool, out: &mut Vec<Item>) {
+    if let Err(d) = check_program_impl(l, vec![], Some((own, out))) {
+        // Only an early failure that has no collecting path (e.g. a duplicate def name).
+        out.push(Item { diag: d, phase: Phase::Check, error: true });
+    }
+}
+
+fn check_program_impl(l: &Loaded, externs: Vec<DefInfo>, mut collect: Option<(&dyn Fn(u32) -> bool, &mut Vec<Item>)>) -> Result<Option<TProgram>, Diag> {
     let ov = |file: u32| l.overflow.get(&file).copied().unwrap_or(Overflow::Abort);
     let ext: HashSet<String> = externs.iter().map(|d| d.pkg.clone()).collect();
     let ext_names: Vec<String> = externs.iter().map(|d| d.def.name.clone()).collect();
@@ -503,10 +519,15 @@ pub fn check_program(l: &Loaded, externs: Vec<DefInfo>) -> Result<TProgram, Diag
     }
     defs.extend(externs);
     // T3: a package's public defs spell their parameter types.
+    let mut pre: Vec<Diag> = vec![];
     for p in &l.pkgs {
         for d in p.module.defs.iter().filter(|d| d.public) {
             if let Some(q) = d.params.iter().find(|q| q.ty.is_none() && q.name != "self") {
-                return Err(Diag::new(q.span, format!("`pub def` parameters need types: `{}: Type`", q.name)));
+                let e = Diag::new(q.span, format!("`pub def` parameters need types: `{}: Type`", q.name));
+                if collect.is_none() {
+                    return Err(e);
+                }
+                pre.push(e);
             }
         }
     }
@@ -524,40 +545,164 @@ pub fn check_program(l: &Loaded, externs: Vec<DefInfo>) -> Result<TProgram, Diag
     let all = || std::iter::once(&l.main).chain(l.pkgs.iter().filter(|p| !ext.contains(&p.path)).map(|p| &p.module));
     let structs: Vec<_> = all().flat_map(|m| m.structs.iter()).cloned().collect();
     let consts: Vec<_> = l.pkgs.iter().filter(|p| !ext.contains(&p.path)).flat_map(|p| p.module.consts.iter()).chain(l.main.consts.iter()).cloned().collect();
-    w.add_consts(&consts)?;
     let enums: Vec<_> = all().flat_map(|m| m.enums.iter()).cloned().collect();
     let ifaces: Vec<_> = all().flat_map(|m| m.ifaces.iter()).cloned().collect();
-    w.add_iface_names(&ifaces)?;
-    w.add_builtin_errors();
-    w.add_structs(&structs, &enums)?;
-    w.add_enum_consts()?;
-    w.add_iface_sigs(&ifaces)?;
     let refines: Vec<_> = all().flat_map(|m| m.refines.iter()).cloned().collect();
-    w.add_refines(&refines)?;
-    let main = w.check_main(&l.main.main, l.main.overflow, Span { file: l.main.file, lo: 0, hi: 0 })?;
-    // R11: package-level Atomics / Mutexes are set first thing in main.
-    let inits = w.var_inits()?;
-    let vars: Vec<usize> = inits.iter().map(|(g, _)| *g).collect();
-    if let Some(Some(mf)) = w.funcs.get_mut(main) {
-        let sp = mf.span;
-        let pre: Vec<crate::tast::TStmt> = inits
-            .iter()
-            .map(|&(g, fid)| {
-                let t = w.funcs[fid].as_ref().unwrap().ret.clone();
-                let call = crate::tast::TExpr { kind: crate::tast::TK::Call(fid, vec![]), ty: t, span: sp };
-                crate::tast::TStmt::Expr(crate::tast::TExpr { kind: crate::tast::TK::M(crate::tast::M::SetGlobal(g), None, vec![call], None), ty: Ty::Unit, span: sp })
-            })
-            .collect();
-        let mf = w.funcs[main].as_mut().unwrap();
-        mf.body.splice(0..0, pre);
+    if collect.is_some() {
+        w.collect = true;
+        for e in pre {
+            w.record(e);
+            w.decl_failed = true;
+        }
+        // Declarations, in `check_program`'s order, stopping at the first kind that failed
+        // (later kinds would only cascade).
+        let mut step = |w: &mut World, r: Result<(), Diag>| {
+            if let Err(e) = r {
+                w.record(e);
+                w.decl_failed = true;
+            }
+            !w.decl_failed
+        };
+        let _ = (|| {
+            let r = w.add_consts(&consts);
+            if !step(&mut w, r) {
+                return;
+            }
+            let r = w.add_iface_names(&ifaces);
+            if !step(&mut w, r) {
+                return;
+            }
+            w.add_builtin_errors();
+            let r = w.add_structs(&structs, &enums);
+            if !step(&mut w, r) {
+                return;
+            }
+            let r = w.add_enum_consts();
+            if !step(&mut w, r) {
+                return;
+            }
+            let r = w.add_iface_sigs(&ifaces);
+            if !step(&mut w, r) {
+                return;
+            }
+            let r = w.add_refines(&refines);
+            step(&mut w, r);
+        })();
+    } else {
+        w.add_consts(&consts)?;
+        w.add_iface_names(&ifaces)?;
+        w.add_builtin_errors();
+        w.add_structs(&structs, &enums)?;
+        w.add_enum_consts()?;
+        w.add_iface_sigs(&ifaces)?;
+        w.add_refines(&refines)?;
     }
-    let messages = w.message_instances()?;
-    let iface_eqs = w.iface_eq_instances()?;
-    let ifaces = std::mem::take(&mut w.impls);
-    let stringers = std::mem::take(&mut w.stringers);
-    let errors = std::mem::take(&mut w.errors);
+    let mut main = 0;
+    if let Some((own, _)) = &collect {
+        if !w.decl_failed {
+            // The unit's main (a script's statements, a package's test runner), then every
+            // def of the unit's own files that stands alone, then what only a build needs.
+            match w.check_main(&l.main.main, l.main.overflow, Span { file: l.main.file, lo: 0, hi: 0 }) {
+                Ok(id) => main = id,
+                Err(e) => w.record(e),
+            }
+            for i in 0..w.defs.len() {
+                if own(w.defs[i].def.span.file) && w.is_root(i) {
+                    w.check_root(i);
+                }
+            }
+            match w.var_inits() {
+                Ok(_) => {}
+                Err(e) => w.record(e),
+            }
+            let _ = w.message_instances();
+            let _ = w.iface_eq_instances();
+        }
+    } else {
+        main = w.check_main(&l.main.main, l.main.overflow, Span { file: l.main.file, lo: 0, hi: 0 })?;
+    }
+    if collect.is_none() {
+        // R11: package-level Atomics / Mutexes are set first thing in main.
+        let inits = w.var_inits()?;
+        let vars: Vec<usize> = inits.iter().map(|(g, _)| *g).collect();
+        if let Some(Some(mf)) = w.funcs.get_mut(main) {
+            let sp = mf.span;
+            let pre: Vec<crate::tast::TStmt> = inits
+                .iter()
+                .map(|&(g, fid)| {
+                    let t = w.funcs[fid].as_ref().unwrap().ret.clone();
+                    let call = crate::tast::TExpr { kind: crate::tast::TK::Call(fid, vec![]), ty: t, span: sp };
+                    crate::tast::TStmt::Expr(crate::tast::TExpr { kind: crate::tast::TK::M(crate::tast::M::SetGlobal(g), None, vec![call], None), ty: Ty::Unit, span: sp })
+                })
+                .collect();
+            let mf = w.funcs[main].as_mut().unwrap();
+            mf.body.splice(0..0, pre);
+        }
+        let messages = w.message_instances()?;
+        let iface_eqs = w.iface_eq_instances()?;
+        let ifaces = std::mem::take(&mut w.impls);
+        let stringers = std::mem::take(&mut w.stringers);
+        let errors = std::mem::take(&mut w.errors);
+        let mut warnings = std::mem::take(&mut w.warnings);
+        unused_imports(l, &ext, &mut warnings);
+        warnings.sort_by_key(|d| (d.span.file, d.span.lo));
+        let globals = w.globals.into_iter().map(|(_, v)| v).collect();
+        let mut funcs: Vec<_> = w.funcs.into_iter().map(|f| f.expect("every instance checked")).collect();
+        for f in funcs.iter_mut() {
+            if !f.external {
+                f.overflow = if f.is_main { l.main.overflow } else { ov(f.span.file) };
+            }
+        }
+        for f in &funcs {
+            prove::prove(f, &l.sm)?;
+        }
+        let mut p = TProgram { funcs, main, ifaces, stringers, errors, messages, warnings, globals, vars, iface_eqs };
+        // R5: lambdas see the variables they capture, not copies.
+        crate::capture::convert(&mut p);
+        // R6: what goes to another task isn't used here afterwards.
+        crate::sharing::check(&p, &l.sm)?;
+        return Ok(Some(p));
+    }
+    // Collect mode: what is left is reported in `check_program`'s order.
+    let (_, out) = collect.as_mut().unwrap();
+    let errs = std::mem::take(&mut w.diags);
+    let failed = !errs.is_empty();
+    out.extend(errs.into_iter().map(|diag| Item { diag, phase: Phase::Check, error: true }));
     let mut warnings = std::mem::take(&mut w.warnings);
-    // Imports nothing refers to (packages compiled separately count as used).
+    unused_imports(l, &ext, &mut warnings);
+    warnings.sort_by_key(|d| (d.span.file, d.span.lo));
+    if !failed && !w.decl_failed {
+        // Every instance succeeded: the build's later passes (the prover, then the sharing check).
+        let funcs: Vec<_> = w.funcs.into_iter().map(|f| f.expect("every instance checked")).collect();
+        let mut funcs = funcs;
+        for f in funcs.iter_mut() {
+            if !f.external {
+                f.overflow = if f.is_main { l.main.overflow } else { ov(f.span.file) };
+            }
+        }
+        let mut proved = true;
+        for f in &funcs {
+            if let Err(d) = prove::prove(f, &l.sm) {
+                proved = false;
+                if !out.iter().any(|i| i.diag.span == d.span && i.diag.msg == d.msg) {
+                    out.push(Item { diag: d, phase: Phase::Prove, error: true });
+                }
+            }
+        }
+        if proved {
+            let mut p = TProgram { funcs, main, ifaces: Default::default(), stringers: Default::default(), errors: Default::default(), messages: Default::default(), warnings: vec![], globals: vec![], vars: vec![], iface_eqs: Default::default() };
+            crate::capture::convert(&mut p);
+            if let Err(d) = crate::sharing::check(&p, &l.sm) {
+                out.push(Item { diag: d, phase: Phase::Check, error: true });
+            }
+        }
+    }
+    out.extend(warnings.into_iter().map(|diag| Item { diag, phase: Phase::Warning, error: false }));
+    Ok(None)
+}
+
+/// Imports nothing refers to (packages compiled separately count as used).
+fn unused_imports(l: &Loaded, ext: &HashSet<String>, warnings: &mut Vec<Diag>) {
     let mods = std::iter::once((String::new(), &l.main)).chain(l.pkgs.iter().filter(|p| !ext.contains(&p.path)).map(|p| (p.path.clone(), &p.module)));
     for (pkg, m) in mods {
         if !pkg.is_empty() && is_std(&pkg) {
@@ -568,7 +713,7 @@ pub fn check_program(l: &Loaded, externs: Vec<DefInfo>) -> Result<TProgram, Diag
             // Only reached code records uses (generic and untested defs
             // aren't checked), so a reference in the file's text counts too.
             let in_text = l.sm.files.get(i.span.file as usize).is_some_and(|f| mentions(&f.text, &alias));
-            // An import a derive added for its own code (`alxjson`, `alxdyn`, ...):
+            // An import a derive added for its own code (`alxjson`, `alxjson2`, ...):
             // the derived methods the program doesn't call aren't checked. Or one
             // `alx test` added (no span: the runner's, an external test's testing).
             if i.alias.as_deref().is_some_and(|a| matches!(a, "alxjson" | "alxjson2" | "alxjsontext" | "alxdyn") || a.starts_with("__alx")) || i.span.hi == 0 {
@@ -579,23 +724,6 @@ pub fn check_program(l: &Loaded, externs: Vec<DefInfo>) -> Result<TProgram, Diag
             }
         }
     }
-    warnings.sort_by_key(|d| (d.span.file, d.span.lo));
-    let globals = w.globals.into_iter().map(|(_, v)| v).collect();
-    let mut funcs: Vec<_> = w.funcs.into_iter().map(|f| f.expect("every instance checked")).collect();
-    for f in funcs.iter_mut() {
-        if !f.external {
-            f.overflow = if f.is_main { l.main.overflow } else { ov(f.span.file) };
-        }
-    }
-    for f in &funcs {
-        prove::prove(f, &l.sm)?;
-    }
-    let mut p = TProgram { funcs, main, ifaces, stringers, errors, messages, warnings, globals, vars, iface_eqs };
-    // R5: lambdas see the variables they capture, not copies.
-    crate::capture::convert(&mut p);
-    // R6: what goes to another task isn't used here afterwards.
-    crate::sharing::check(&p, &l.sm)?;
-    Ok(p)
 }
 
 /// Kept for callers of the old library interface: packages are now
@@ -958,10 +1086,38 @@ fn runner_source(items: &[TestItem], dir: &str, o: &TestOpts, tp: &str, main: Op
 /// module (tests see the package's private names), then a generated runner.
 /// `dir_shown` is how the directory was written on the command line.
 pub fn load_tests(dir: &Path, dir_shown: &str, only: Option<&Path>, o: &TestOpts) -> Result<(Loaded, usize, usize), (SourceMap, Diag)> {
+    let read = |p: &Path| std::fs::read_to_string(p);
+    let list = |p: &Path| -> std::io::Result<Vec<PathBuf>> {
+        let mut v: Vec<PathBuf> = std::fs::read_dir(p)?.filter_map(|e| e.ok().map(|e| e.path())).collect();
+        v.sort();
+        Ok(v)
+    };
+    let sel = match only {
+        Some(f) => Tests::Only(f),
+        None => Tests::All,
+    };
+    load_tests_with(dir, dir_shown, sel, o, &read, &list)
+}
+
+/// Which test files `load_tests_with` loads.
+#[derive(Clone, Copy)]
+pub enum Tests<'a> {
+    /// Every `*_test.alx` in the directory.
+    All,
+    /// Just this one (it need not be listed: an unsaved buffer).
+    Only(&'a Path),
+    /// None: the package alone with an empty runner (editor analysis of a package's own files).
+    NoTests,
+}
+
+/// `load_tests`, reading through `read` and listing through `list` (unsaved
+/// buffers). `Tests::NoTests` is the only selection that accepts a package
+/// without tests.
+pub fn load_tests_with(dir: &Path, dir_shown: &str, sel: Tests, o: &TestOpts, read: ReadFn, list: &dyn Fn(&Path) -> std::io::Result<Vec<PathBuf>>) -> Result<(Loaded, usize, usize), (SourceMap, Diag)> {
     let mut sm = SourceMap::default();
     let fail = |sm: SourceMap, msg: String| Err((sm, Diag::new(Span::default(), msg)));
-    let mut files: Vec<PathBuf> = match std::fs::read_dir(dir) {
-        Ok(rd) => rd.filter_map(|e| e.ok().map(|e| e.path())).filter(|p| p.extension().is_some_and(|e| e == "alx")).collect(),
+    let mut files: Vec<PathBuf> = match list(dir) {
+        Ok(rd) => rd.into_iter().filter(|p| p.extension().is_some_and(|e| e == "alx")).collect(),
         Err(e) => {
             sm.add(dir_shown.into(), String::new());
             return fail(sm, format!("cannot read `{dir_shown}`: {e}"));
@@ -969,11 +1125,12 @@ pub fn load_tests(dir: &Path, dir_shown: &str, only: Option<&Path>, o: &TestOpts
     };
     files.sort();
     let is_test = |p: &Path| p.to_string_lossy().ends_with("_test.alx");
-    let tests: Vec<PathBuf> = match only {
-        Some(f) => vec![f.to_path_buf()],
-        None => files.iter().filter(|p| is_test(p)).cloned().collect(),
+    let tests: Vec<PathBuf> = match sel {
+        Tests::Only(f) => vec![f.to_path_buf()],
+        Tests::All => files.iter().filter(|p| is_test(p)).cloned().collect(),
+        Tests::NoTests => vec![],
     };
-    if tests.is_empty() {
+    if tests.is_empty() && !matches!(sel, Tests::NoTests) {
         sm.add(dir_shown.into(), String::new());
         return fail(sm, format!("no `*_test.alx` files in `{dir_shown}`"));
     }
@@ -989,7 +1146,7 @@ pub fn load_tests(dir: &Path, dir_shown: &str, only: Option<&Path>, o: &TestOpts
     let mut xacc: Option<Module> = None;
     let mut decls: Vec<(TestDecl, bool)> = vec![];
     for f in files.iter().filter(|p| !is_test(p)).chain(tests.iter()) {
-        let text = match std::fs::read_to_string(f) {
+        let text = match read(f) {
             Ok(t) => t,
             Err(e) => {
                 sm.add(shown(f), String::new());
@@ -1024,8 +1181,7 @@ pub fn load_tests(dir: &Path, dir_shown: &str, only: Option<&Path>, o: &TestOpts
         sm.add(dir_shown.into(), String::new());
         return fail(sm, format!("`{dir_shown}` has only external tests (`#![test(external)]`): there is no package to test"));
     };
-    let read = |p: &Path| std::fs::read_to_string(p);
-    let mods = match load_mods(dir, &read) {
+    let mods = match load_mods(dir, read) {
         Ok(m) => m,
         Err(d) => return Err((sm, d)),
     };
@@ -1134,16 +1290,11 @@ pub fn load_tests(dir: &Path, dir_shown: &str, only: Option<&Path>, o: &TestOpts
         merge_decls(&mut runner, acc);
         None
     };
-    let list = |p: &Path| -> std::io::Result<Vec<PathBuf>> {
-        let mut v: Vec<PathBuf> = std::fs::read_dir(p)?.filter_map(|e| e.ok().map(|e| e.path())).collect();
-        v.sort();
-        Ok(v)
-    };
     let mut pkgs: Vec<Package> = vec![];
     let mut visiting: Vec<String> = vec![];
     let root = if dir_shown == "." { PathBuf::new() } else { PathBuf::from(dir_shown) };
     for imp in &imports {
-        if let Err(d) = load_pkg(imp, &mods, &mut sm, &mut next_id, &mut pkgs, &mut visiting, &mut overflow, &read, &list, &root) {
+        if let Err(d) = load_pkg(imp, &mods, &mut sm, &mut next_id, &mut pkgs, &mut visiting, &mut overflow, read, list, &root) {
             return Err((sm, d));
         }
     }
@@ -1156,7 +1307,7 @@ pub fn load_tests(dir: &Path, dir_shown: &str, only: Option<&Path>, o: &TestOpts
     // are this one: the package is compiled once.
     if let Some(x) = xacc {
         for imp in &x.imports {
-            if let Err(d) = load_pkg(imp, &mods, &mut sm, &mut next_id, &mut pkgs, &mut visiting, &mut overflow, &read, &list, &root) {
+            if let Err(d) = load_pkg(imp, &mods, &mut sm, &mut next_id, &mut pkgs, &mut visiting, &mut overflow, read, list, &root) {
                 return Err((sm, d));
             }
         }

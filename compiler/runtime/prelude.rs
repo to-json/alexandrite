@@ -731,6 +731,27 @@ mod rt {
             }
         }
     }
+    pub unsafe fn shim_alx_fd_wait_timeout(fd: i64, mode: i64, timeout_ns: i64) -> i64 {
+        let start = std::time::Instant::now();
+        let total = std::time::Duration::from_nanos(timeout_ns.max(0) as u64);
+        loop {
+            let left = total.saturating_sub(start.elapsed());
+            let ms = ((left.as_nanos() + 999_999) / 1_000_000) as i32;
+            let mut p = PollFd { fd: fd as i32, events: if mode == 1 { 1 } else { 4 }, revents: 0 };
+            let r = unsafe { poll(&mut p, 1, ms) };
+            if r > 0 {
+                return 1;
+            }
+            if r < 0 {
+                let e = std::io::Error::last_os_error();
+                if e.raw_os_error() != Some(4) {
+                    return neg_errno(&e);
+                }
+            } else if start.elapsed() >= total {
+                return 0;
+            }
+        }
+    }
     pub unsafe fn shim_alx_fd_close(fd: i64) -> i64 {
         if unsafe { close(fd as i32) } == 0 { 0 } else { neg_errno(&std::io::Error::last_os_error()) }
     }

@@ -1905,7 +1905,7 @@ const char *alx_argv(int64_t i) { return i >= 0 && i < g_argc ? g_argv[i] : NULL
 
 /* A task asleep parks on a deadline-ordered list; one timer thread wakes
  * each at its deadline. A plain thread (main) just sleeps. */
-typedef struct Timer { int64_t at; Parker *p; struct Timer *next; } Timer;
+typedef struct Timer { int64_t at; Parker *p; struct Timer *next; bool owned, fired; } Timer;
 static Timer *g_timers;
 static pthread_cond_t g_tcv = PTHREAD_COND_INITIALIZER;
 static bool g_timer_thread;
@@ -1935,25 +1935,15 @@ static void *timer_main(void *arg) {
         Timer *t = g_timers;
         g_timers = t->next;
         g_sleepers--;
+        t->fired = true;
         unpark(t->p);
-        free(t);
+        if (!t->owned) free(t);
     }
     return NULL;
 }
 
-void alx_sleep_ns(int64_t ns) {
-    if (ns <= 0) return;
-    if (!tl_task) {
-        struct timespec ts = { (time_t)(ns / 1000000000), (long)(ns % 1000000000) };
-        while (nanosleep(&ts, &ts) != 0 && errno == EINTR) {}
-        return;
-    }
-    Parker *p = cur_pk();
-    Timer *t = malloc(sizeof *t);
-    if (!t) alx_panic("out of memory", "runtime");
-    t->at = mono_ns() + ns;
-    t->p = p;
-    pthread_mutex_lock(&g_mu);
+/* Insert t (g_mu held); counts as a sleeper until it fires or is withdrawn. */
+static void timer_add(Timer *t) {
     if (!g_timer_thread) {
         pthread_t th;
         pthread_attr_t at;
@@ -1969,6 +1959,22 @@ void alx_sleep_ns(int64_t ns) {
     *pp = t;
     if (g_timers == t) pthread_cond_signal(&g_tcv);
     g_sleepers++;
+}
+
+void alx_sleep_ns(int64_t ns) {
+    if (ns <= 0) return;
+    if (!tl_task) {
+        struct timespec ts = { (time_t)(ns / 1000000000), (long)(ns % 1000000000) };
+        while (nanosleep(&ts, &ts) != 0 && errno == EINTR) {}
+        return;
+    }
+    Parker *p = cur_pk();
+    Timer *t = calloc(1, sizeof *t);
+    if (!t) alx_panic("out of memory", "runtime");
+    t->at = mono_ns() + ns;
+    t->p = p;
+    pthread_mutex_lock(&g_mu);
+    timer_add(t);
     p->parked = true; p->dead = false;
     if (p->counted) g_runnable--;
     pthread_mutex_unlock(&g_mu);
@@ -2620,7 +2626,7 @@ static bool poller_start(void) {
  * its own one-shot registration; whichever fires first wakes the task, and
  * the others are withdrawn here (a late event for one finds nothing). 0, or
  * -errno if an fd can't be polled. In a task only. */
-static int64_t fd_wait_task(const int *fds, const int *modes, int n) {
+static int64_t fd_wait_task(const int *fds, const int *modes, int n, int64_t deadline) {
     IoWait *ws = calloc((size_t)(n ? n : 1), sizeof *ws);
     if (!ws) alx_panic("out of memory", "runtime");
     Parker *p = cur_pk();
@@ -2647,11 +2653,29 @@ static int64_t fd_wait_task(const int *fds, const int *modes, int n) {
     }
     if (k == 0) { pthread_mutex_unlock(&g_mu); free(ws); return 0; }
     g_sleepers += k;
+    Timer *tm = NULL;
+    if (deadline >= 0) {
+        tm = calloc(1, sizeof *tm);
+        if (!tm) alx_panic("out of memory", "runtime");
+        tm->at = deadline; tm->p = p; tm->owned = true;
+        timer_add(tm);
+    }
     p->parked = true; p->dead = false;
     if (p->counted) g_runnable--;
     pthread_mutex_unlock(&g_mu);
     sw_out(p->task, false);
-    if (k > 1) {
+    if (tm) {
+        /* Withdraw the timer if it didn't fire. */
+        pthread_mutex_lock(&g_mu);
+        if (!tm->fired) {
+            Timer **tp = &g_timers;
+            while (*tp && *tp != tm) tp = &(*tp)->next;
+            if (*tp) { *tp = tm->next; g_sleepers--; }
+        }
+        pthread_mutex_unlock(&g_mu);
+        free(tm);
+    }
+    if (k > 1 || tm) {
         /* Withdraw the registrations that didn't fire. */
         pthread_mutex_lock(&g_mu);
         for (int j = 0; j < k; j++) {
@@ -2677,7 +2701,37 @@ int64_t alx_fd_wait(int64_t fd, int64_t mode) {
         return 0;
     }
     int f = (int)fd, m = (int)mode;
-    return fd_wait_task(&f, &m, 1);
+    return fd_wait_task(&f, &m, 1, -1);
+}
+
+/* Wait until fd is readable (mode 1) or writable (mode 2), has an error or
+ * hung up, or timeout_ns passes. 1 ready, 0 timed out, -errno on failure.
+ * A task parks with a deadline (the timer thread wakes it); a plain thread
+ * poll(2)s with the remaining time, retrying on EINTR. */
+int64_t alx_fd_wait_timeout(int64_t fd, int64_t mode, int64_t timeout_ns) {
+    struct pollfd pf;
+    pf.fd = (int)fd; pf.events = mode == 1 ? POLLIN : POLLOUT; pf.revents = 0;
+    int64_t deadline = mono_ns() + (timeout_ns > 0 ? timeout_ns : 0);
+    for (;;) {
+        int64_t left = deadline - mono_ns();
+        if (left < 0) left = 0;
+        pf.revents = 0;
+        if (!tl_task) {
+            int ms = (int)((left + 999999) / 1000000);
+            int r = poll(&pf, 1, ms);
+            if (r < 0) { if (errno == EINTR) continue; return -errno; }
+            if (r > 0) return 1;
+            if (mono_ns() >= deadline) return 0;
+            continue;
+        }
+        int r = poll(&pf, 1, 0);
+        if (r < 0) { if (errno == EINTR) continue; return -errno; }
+        if (r > 0) return 1;
+        if (left <= 0) return 0;
+        int f = (int)fd, m = (int)mode;
+        int64_t rc = fd_wait_task(&f, &m, 1, deadline);
+        if (rc < 0) return rc;
+    }
 }
 
 /* Wait until a or b (-1: none) is readable or hung up. A task parks, so its
@@ -2687,7 +2741,7 @@ int64_t alx_fd_wait(int64_t fd, int64_t mode) {
 int64_t alx_sys_poll2(int64_t a, int64_t b) {
     if (tl_task) {
         int fds[2] = { (int)a, (int)b }, modes[2] = { 1, 1 };
-        return fd_wait_task(fds, modes, 2);
+        return fd_wait_task(fds, modes, 2, -1);
     }
     struct pollfd pf[2] = { { (int)a, POLLIN, 0 }, { (int)b, POLLIN, 0 } };
     while (poll(pf, 2, -1) < 0)

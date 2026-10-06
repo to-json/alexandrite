@@ -529,6 +529,7 @@ int64_t alx_user_groups(const char *name, int64_t gid, uint8_t *out, int64_t n);
 /* Wait until fd is readable (mode 1) or writable (mode 2) or in error: parks a
  * task (poller thread), poll(2)s otherwise. 0, or -errno if fd can't be polled. */
 int64_t alx_fd_wait(int64_t fd, int64_t mode);
+int64_t alx_fd_wait_timeout(int64_t fd, int64_t mode, int64_t timeout_ns);
 /* close(2) that wakes tasks waiting on fd first. 0 or -errno. */
 int64_t alx_fd_close(int64_t fd);
 /* Sockets: non-blocking, close-on-exec fds; negative results are -errno

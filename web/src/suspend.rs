@@ -17,7 +17,8 @@ use crate::wasmgen::{ty_of, Tys};
 use alx::lir::*;
 use std::collections::{HashMap, HashSet};
 
-/// The externs the browser provides (anything else is refused).
+/// The externs the browser provides itself (with `os::EXTERNS`; anything
+/// else is refused).
 pub const BROWSER_FFI: &[&str] = &["alx_wall_ns", "alx_mono_ns", "alx_sleep_ns", "alx_local_offset", "alx_local_zone"];
 
 pub struct Info {
@@ -122,7 +123,7 @@ struct Uses {
     spawns: Vec<usize>,
     pmaps: Vec<usize>,
     /// Something only the C library has (named for the error).
-    c_only: bool,
+    c_only: Option<String>,
 }
 
 fn uses(body: &mut [LS], externs: &[FfiSig], sleep: Option<usize>) -> Uses {
@@ -150,11 +151,10 @@ fn uses(body: &mut [LS], externs: &[FfiSig], sleep: Option<usize>) -> Uses {
                     if Some(*i) == sleep {
                         u.blocks = true;
                     }
-                    if !BROWSER_FFI.contains(&externs[*i].sym.as_str()) {
-                        u.c_only = true;
+                    if !BROWSER_FFI.contains(&externs[*i].sym.as_str()) && crate::wasmgen::browser_rt(&externs[*i]).is_none() && u.c_only.is_none() {
+                        u.c_only = Some(format!("`{}`", externs[*i].sym));
                     }
                 }
-                LE::Rt(Rt::Errno | Rt::StrFromPtr, _) => u.c_only = true,
                 _ => {}
             });
         }
@@ -183,18 +183,40 @@ pub fn prepare(p: &mut LProgram) -> Result<Info, String> {
     }
     let main = main.ok_or("no main")?;
     // Reachable from main.
+    // Reachable from main, breadth first, with the caller that reached each
+    // (to name a call path in the error).
     let mut seen: HashSet<Node> = HashSet::new();
-    let mut todo = vec![main.clone()];
-    while let Some(n) = todo.pop() {
-        if !seen.insert(n.clone()) {
-            continue;
-        }
+    let mut from: HashMap<Node, Node> = HashMap::new();
+    let mut order = vec![main.clone()];
+    seen.insert(main.clone());
+    let mut k = 0;
+    while k < order.len() {
+        let n = order[k].clone();
+        k += 1;
         if let Some(u) = graph.get(&n) {
-            todo.extend(u.edges.iter().cloned());
+            for e in &u.edges {
+                if seen.insert(e.clone()) {
+                    from.insert(e.clone(), n.clone());
+                    order.push(e.clone());
+                }
+            }
         }
     }
-    if seen.iter().any(|n| graph.get(n).is_some_and(|u| u.c_only)) {
-        return Err("`extern def` and the C library aren't available in the browser".into());
+    if let Some((n, what)) = order.iter().find_map(|n| graph.get(n).and_then(|u| u.c_only.clone()).map(|w| (n.clone(), w))) {
+        let mut path = vec![n.clone()];
+        while let Some(c) = from.get(path.last().unwrap()) {
+            path.push(c.clone());
+        }
+        let names: Vec<String> = path
+            .iter()
+            .rev()
+            .map(|n| match n {
+                Node::F(f) => f.clone(),
+                Node::W(w) => format!("<spawned {w}>"),
+                Node::G(g) => format!("<generator {g}>"),
+            })
+            .collect();
+        return Err(format!("`extern def` and the C library aren't available in the browser ({what}, reached by {})", names.join(" -> ")));
     }
     // Suspends: blocks, or calls something that suspends (not through a
     // spawn: the new task suspends on its own).

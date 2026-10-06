@@ -101,6 +101,8 @@ const RT: &[(&str, &str)] = &[
     ("alxr_local_offset", "j>j"),
     ("alxr_local_zone", "j>j"),
     ("alxr_str_from_cstr", "j>"),
+    ("alxr_str_from_ptr", "jj>"),
+    ("alxr_errno", ">j"),
     // tasks (sched.rs)
     ("alxr_task_begin", "i>j"),
     ("alxr_task_resuming", ">i"),
@@ -271,6 +273,8 @@ struct Ctx<'p> {
     info: Info,
     /// Each extern's symbol.
     externs: Vec<String>,
+    /// Each extern's browser stand-in (`os::EXTERNS`), if it has one.
+    ffi_rt: Vec<Option<&'static str>>,
     /// Each pmap worker's chunk function (threads).
     chunks: HashMap<usize, u32>,
 }
@@ -323,13 +327,23 @@ fn worker_sig(w: &LWorker) -> (Vec<ValType>, Vec<ValType>) {
     (vts(&w.func.vars[p].ty), vts(&w.func.ret))
 }
 
+/// The browser's stand-in for an extern (`os::EXTERNS`): its symbol with
+/// the same signature in wasm value types.
+pub fn browser_rt(x: &FfiSig) -> Option<&'static str> {
+    let code = |v: &ValType| if *v == W { 'j' } else if *v == D { 'f' } else { 'i' };
+    let params: String = x.params.iter().flat_map(|t| vts(&t.lty())).map(|v| code(&v)).collect();
+    let ret: String = vts(&x.ret.lty()).iter().map(code).collect();
+    let sig = format!("{params}>{ret}");
+    crate::os::EXTERNS.iter().find(|(s, _, g)| *s == x.sym && *g == sig).map(|(_, f, _)| *f)
+}
+
 pub fn emit(p: &LProgram) -> Result<Vec<u8>, String> {
     let mut owned = p.clone();
     alx::lir::copy_views(&mut owned);
     let info = suspend::prepare(&mut owned)?;
     let p = &owned;
     rt::sh().consts.clear();
-    let mut cx = Ctx { types: vec![], type_idx: HashMap::new(), rt_idx: HashMap::new(), funcs: HashMap::new(), gens: HashMap::new(), workers: HashMap::new(), consts: HashMap::new(), globals: vec![], tys: Tys::new(p), info, externs: p.externs.iter().map(|x| x.sym.clone()).collect(), chunks: HashMap::new() };
+    let mut cx = Ctx { types: vec![], type_idx: HashMap::new(), rt_idx: HashMap::new(), funcs: HashMap::new(), gens: HashMap::new(), workers: HashMap::new(), consts: HashMap::new(), globals: vec![], tys: Tys::new(p), info, externs: p.externs.iter().map(|x| x.sym.clone()).collect(), ffi_rt: p.externs.iter().map(browser_rt).collect(), chunks: HashMap::new() };
     for t in &p.globals {
         let b: Box<[u8]> = vec![0u8; lay(t).size.next_multiple_of(8) as usize].into_boxed_slice();
         cx.globals.push((t.clone(), b.as_ptr() as usize as i64));
@@ -338,13 +352,13 @@ pub fn emit(p: &LProgram) -> Result<Vec<u8>, String> {
     let mut imports = ImportSection::new();
     imports.import("env", "memory", EntityType::Memory(MemoryType { minimum: 1, maximum: MT.then_some(65536), memory64: false, shared: MT, page_size_log2: None }));
     imports.import("rt", "ret", EntityType::Global(GlobalType { val_type: I, mutable: false, shared: false }));
-    for (k, (name, sig)) in RT.iter().enumerate() {
+    for (k, (name, sig)) in RT.iter().copied().chain(crate::os::rt_funcs()).enumerate() {
         let (a, r) = sig_of(sig);
         let t = cx.ty(a, r);
         imports.import("rt", name, EntityType::Function(t));
         cx.rt_idx.insert(name, k as u32);
     }
-    let mut next = RT.len() as u32;
+    let mut next = cx.rt_idx.len() as u32;
     let mut order: Vec<(u32, (Vec<ValType>, Vec<ValType>))> = vec![];
     for f in &p.funcs {
         if f.external {
@@ -1744,10 +1758,13 @@ impl<'c, 'p> Fx<'c, 'p> {
                         self.rt("alxr_sleep");
                         self.ins().drop();
                     }
-                    // Unreachable: `suspend::prepare` refuses programs that call these.
-                    _ => {
-                        self.ins().unreachable();
-                    }
+                    _ => match self.cx.ffi_rt[*i] {
+                        Some(f) => self.rt(f),
+                        // Unreachable: `suspend::prepare` refuses programs that call these.
+                        None => {
+                            self.ins().unreachable();
+                        }
+                    },
                 }
             }
             LE::Global(k) => {
@@ -2320,11 +2337,9 @@ impl<'c, 'p> Fx<'c, 'p> {
             Rt::FToS => call_ret(self, "alxr_f_to_s", 2),
             Rt::U64ToS => call_ret(self, "alxr_u64_to_s", 2),
             Rt::IntFmt => call_ret(self, "alxr_int_fmt", 2),
-            // Unreachable: `suspend::prepare` refuses programs that use these.
             Rt::Strerror => call_ret(self, "alxr_strerror", 2),
-            Rt::Errno | Rt::StrFromPtr => {
-                self.ins().unreachable();
-            }
+            Rt::Errno => call(self, "alxr_errno"),
+            Rt::StrFromPtr => call_ret(self, "alxr_str_from_ptr", 2),
             Rt::StrFromCstr => call_ret(self, "alxr_str_from_cstr", 2),
             Rt::NowNs => call(self, "alxr_now_ns"),
             Rt::CapBegin => call(self, "alxr_cap_begin"),

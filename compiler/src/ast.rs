@@ -543,6 +543,18 @@ pub enum ExprKind {
     SliceRange(Option<Box<Expr>>, Option<Box<Expr>>, bool),
     /// `x?.m(...)`: the inner Call's receiver is the optional value.
     OptCall(Box<Expr>),
+    /// `R is io.Seeker`, `T is like Int`, `T is Str`: a question about a
+    /// type, answered at compile time per instance of a generic def (S6).
+    Is(TypeExpr, IsTest),
+}
+
+/// The right side of `T is ...` (S6).
+#[derive(Debug, Clone)]
+pub enum IsTest {
+    /// An interface (implements it) or any other type (is exactly it).
+    Type(TypeExpr),
+    /// `like Int` / `like Float`, as in a bound.
+    Like(String),
 }
 
 #[derive(Debug, Clone)]

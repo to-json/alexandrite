@@ -31,6 +31,8 @@ const TOUR = [
   ['syntax', 'everyday syntax', 'for-in, case, if expressions, interpolation, defer.'],
   ['collections', 'collections', 'Slices and fixed arrays, byte strings, ordered maps, T?.'],
   ['types', 'types', 'Methods, operators, enums, interfaces, generics, lambdas.'],
+  ['concurrency', 'tasks and channels', 'spawn, wait, Chan, select; a panic ends only its task.'],
+  ['sync', 'Mutex and Atomic', 'A Mutex guards a value shared between tasks; atomic cells.'],
   ['tuples', 'tuples', 'Multiple results as values.'],
   ['closures', 'closures', 'Lambdas capture variables, not copies.'],
   ['funcvalues', 'function values', 'Named defs and blocks where a function is wanted.'],
@@ -42,6 +44,9 @@ const TOUR = [
   ['errors', 'errors', '`error` types, `fail`, `~` propagation, declared error sets, Results.'],
   ['packages', 'packages', 'Directory packages (bundled under pkgs/), `pub`, refinements across packages.'],
   ['refinements', 'refinements', 'Methods on existing types, active only under `using`.'],
+];
+const LEARN = [
+  ['learnruby', 'Ruby', 'Learn Ruby in Y minutes, the parts that carry over.'],
 ];
 const MISTAKES = [
   ['pe001.typo', 'a typo', 'Did-you-mean suggestions name the line and column.'],
@@ -63,6 +68,9 @@ for (const [id, title, note] of BENCHMARKS) {
 }
 for (const [id, title, note] of TOUR) {
   ex.push({ id, group: 'language tour', title, source: `# ${note}\n${read(id + '.alx')}` });
+}
+for (const [id, title, note] of LEARN) {
+  ex.push({ id, group: 'learn x in y minutes', title, source: read(id + '.alx') });
 }
 for (const [id, title, note] of MISTAKES) {
   ex.push({ id, group: 'mistakes', title, source: `# Mistake: ${title}. ${note}\n${read(id + '.alx')}` });

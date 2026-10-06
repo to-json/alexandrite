@@ -143,7 +143,7 @@ In `Parser::module`'s declaration loop, record the error, skip to the next top-l
 
 ### 2.4 Store and scheduler
 
-Per 0.1: either one task owning all state with a reader task and `select` over message and result channels plus `time.after` (150 ms debounce), or a single-task loop. One loop on the main task: read a message; handle it; when stdin has nothing buffered or pending for 150 ms (0.5) and a document changed since the last check, run the compiler (synchronously, with a timeout) and publish. Messages that arrive during a run queue in the pipe and are handled next; the result is published only if the checked versions are still current, else the check reruns. Per unit the server remembers which URIs it last published to, so diagnostics in files that are not open are cleared when they go away.
+Per 0.1, no `Chan` and no `spawn`. One loop on the main task: read a message; handle it; when stdin has nothing buffered or pending for 150 ms (0.5) and a document changed since the last check, run the compiler (synchronously, with a timeout) and publish. Messages that arrive during a run queue in the pipe and are handled next; the result is published only if the checked versions are still current, else the check reruns. Per unit the server remembers which URIs it last published to, so diagnostics in files that are not open are cleared when they go away.
 
 **Which units recheck:** the edited file's unit; and every other open buffer whose unit imports the edited package (the server tracks imports from the last successful check's file list).
 

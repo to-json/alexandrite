@@ -5288,6 +5288,11 @@ impl<'w, 'a> FnCx<'w, 'a> {
                 if !self.w.by_name.contains_key(&q) {
                     return Err(Diag::new(name_span, format!("package `{}` has no `{name}`", path)));
                 }
+                if args.is_empty() && block.is_none() && bsym.is_none() {
+                    if let Some(lam) = self.qualified_fn_value(r, &q, name, sp) {
+                        return self.expr(&lam);
+                    }
+                }
                 return self.global_call(&q, name_span, args, block, bsym, sp);
             }
             if let ExprKind::Call { recv: Some(r2), name: tn, args: a2, block: None, name_span: tsp, .. } = &r.kind {
@@ -5397,6 +5402,47 @@ impl<'w, 'a> FnCx<'w, 'a> {
         }
         let r = self.expr(recv)?;
         self.method(r, name, name_span, args, block, bsym, sp)
+    }
+
+    /// `pkg.f` used as a value (`s.split!(bufio.scan_words)`): a lambda
+    /// calling it, as a bare `f` is in its own package. Only for a function
+    /// whose signature means the same here as in its package (built from
+    /// builtin types: the lambda's parameter types are read here), with
+    /// parameters (none defaulted) and no type parameters; None otherwise.
+    fn qualified_fn_value(&mut self, recv: &Expr, q: &str, name: &str, sp: Span) -> Option<Expr> {
+        let &di = self.w.by_name.get(q)?;
+        let d = self.w.defs[di].def.clone();
+        if d.params.is_empty() || !d.tparams.is_empty() || d.params.iter().any(|p| p.ty.is_none()) || d.params.iter().all(|p| p.default.is_some()) || !is_public(q) {
+            return None;
+        }
+        let tys: Vec<&TypeExpr> = d.params.iter().filter_map(|p| p.ty.as_ref()).chain(d.ret.as_ref()).collect();
+        let read = |w: &World| tys.iter().map(|t| type_from(t, &w.structs, &w.consts)).collect::<R<Vec<Ty>>>().ok();
+        let here = read(&*self.w)?;
+        let prev = enter_pkg(&self.w.defs[di].pkg);
+        let there = read(&*self.w);
+        leave_pkg(prev);
+        if there? != here {
+            return None;
+        }
+        let id = NodeId::MAX;
+        let names: Vec<String> = (0..d.params.len()).map(|i| format!("__arg{i}")).collect();
+        let call = Expr {
+            id,
+            kind: ExprKind::Call { recv: Some(Box::new(recv.clone())), name: name.to_string(), name_span: sp, args: names.iter().map(|a| Expr { id, kind: ExprKind::Name(a.clone()), span: sp }).collect(), block: None, block_sym: None },
+            span: sp,
+        };
+        let call = if d.fallible { Expr { id, kind: ExprKind::Try(Box::new(call)), span: sp } } else { call };
+        let ret = if d.fallible {
+            let t = d.ret.clone().unwrap_or(TypeExpr::Named("Unit".into(), sp));
+            // The error set is inferred from the call (its names belong to the
+            // other package).
+            Some(TypeExpr::Result(Box::new(t), None, sp))
+        } else {
+            d.ret.clone()
+        };
+        let body = Block { id, params: names.iter().map(|a| (a.clone(), sp)).collect(), body: vec![Stmt { kind: StmtKind::Expr(call), span: sp }], span: sp };
+        let params = names.into_iter().zip(&d.params).map(|(name, p)| Param { name, ty: p.ty.clone(), span: sp, default: None }).collect();
+        Some(Expr { id, kind: ExprKind::Lambda(params, ret, Box::new(body)), span: sp })
     }
 
     fn global_call(&mut self, name: &str, name_span: Span, args: &[Expr], block: Option<&Block>, bsym: Option<&(String, Span)>, sp: Span) -> R<TExpr> {

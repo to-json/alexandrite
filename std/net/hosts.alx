@@ -1,0 +1,314 @@
+# The hosts file (Go's hosts.go) and resolv.conf (dnsconfig.go,
+# dnsconfig_unix.go).
+
+import "net/netip"
+import "os"
+
+# Where the hosts file is (Go's hostsFilePath; tests point it elsewhere).
+HOSTS_FILE_PATH = Atomic.new("/etc/hosts")
+
+# How long a read hosts file is trusted before its mtime is checked again.
+CACHE_MAX_AGE_NS = 5000000000
+
+struct HostsByName {
+  addrs: [Str]
+  canonical_name: Str
+}
+
+struct HostsState {
+  by_name: Map[Str, HostsByName]
+  by_addr: Map[Str, [Str]]
+  # Monotonic ns when the cache should be checked again.
+  expire: Int
+  path: Str
+  mtime: Int
+  size: Int
+}
+
+HOSTS = Mutex[HostsState].new(HostsState.new(by_name: {}, by_addr: {}, expire: 0, path: "", mtime: 0, size: 0))
+
+# Go's parseLiteralIP: the canonical form of an IP literal, "" otherwise.
+def parse_literal_ip(addr: Str) -> Str {
+  r = netip.parse_addr(addr)
+  return "" if r.err?
+  r.unwrap.to_s
+}
+
+# Go's absDomainName: a name with a dot gets a final dot.
+def abs_domain_name(s: Str) -> Str {
+  return s + "." if index_byte(s, 46) != -1 && s[s.size - 1] != 46
+  s
+}
+
+# Go's readHosts (with hosts locked).
+def read_hosts(h: HostsState) -> HostsState {
+  now = alx_mono_ns()
+  hp = HOSTS_FILE_PATH.load
+  return h if now < h.expire && h.path == hp && h.by_name.size > 0
+  st = os.stat(hp)
+  mtime = 0
+  size = 0
+  if st.ok? {
+    fi = st.unwrap
+    mtime = fi.mod_time
+    size = fi.size
+    if h.path == hp && h.mtime == mtime && h.size == size {
+      return HostsState.new(by_name: h.by_name, by_addr: h.by_addr, expire: now + CACHE_MAX_AGE_NS, path: h.path, mtime: h.mtime, size: h.size)
+    }
+  }
+  hs: Map[Str, HostsByName] = {}
+  is: Map[Str, [Str]] = {}
+  fr = open_lines(hp)
+  if fr.ok? {
+    file = fr.unwrap
+    loop {
+      line = file.read_line || break
+      f = get_fields(remove_comment(line))
+      next if f.size < 2
+      addr = parse_literal_ip(f[0])
+      next if addr == ""
+      canonical = ""
+      for i in 1...f.size {
+        name = abs_domain_name(f[i])
+        key = abs_domain_name(lower_ascii_str(f[i]))
+        canonical = key if i == 1
+        list: [Str] = is[addr] || []
+        list << name
+        is[addr] = list
+        if v = hs[key] {
+          hs[key] = HostsByName.new(addrs: v.addrs + [addr], canonical_name: v.canonical_name)
+          next
+        }
+        hs[key] = HostsByName.new(addrs: [addr], canonical_name: canonical)
+      }
+    }
+  }
+  HostsState.new(by_name: hs, by_addr: is, expire: now + CACHE_MAX_AGE_NS, path: hp, mtime: mtime, size: size)
+}
+
+# Go's lookupStaticHost: the addresses of host in the hosts file and its
+# canonical name.
+def lookup_static_host(host: Str) -> ([Str], Str) {
+  HOSTS.lock { |h|
+    h = read_hosts(h)
+    res: ([Str], Str) = ([], "")
+    if h.by_name.size != 0 {
+      if v = h.by_name[abs_domain_name(lower_ascii_str(host))] {
+        res = (v.addrs.dup, v.canonical_name)
+      }
+    }
+    res
+  }
+}
+
+# Go's lookupStaticAddr: the names of addr in the hosts file.
+def lookup_static_addr(addr0: Str) -> [Str] {
+  addr = parse_literal_ip(addr0)
+  return [] if addr == ""
+  HOSTS.lock { |h|
+    h = read_hosts(h)
+    res: [Str] = []
+    if v = h.by_addr[addr] {
+      res = v.dup
+    }
+    res
+  }
+}
+
+# ------------------------------------------------------------- resolv.conf
+
+DEFAULT_NS: [Str] = ["127.0.0.1:53", "[::1]:53"]
+
+# Go's getHostname, for tests: "" uses os.hostname; HOSTNAME_FAIL makes it
+# fail.
+HOSTNAME_OVERRIDE = Atomic.new("")
+HOSTNAME_FAIL = Atomic.new(false)
+
+# Go's dnsConfig.
+struct DnsConfig {
+  # Server addresses (host:port).
+  servers: [Str]
+  # Rooted suffixes to append to local names.
+  search: [Str]
+  # Dots in a name that make it absolute first.
+  ndots: Int
+  # Per-query timeout (ns), attempts per server.
+  timeout_ns: Int
+  attempts: Int
+  rotate: Bool
+  unknown_opt: Bool
+  # OpenBSD's "lookup" order.
+  lookup: [Str]
+  # Why resolv.conf couldn't be read.
+  err: Error?
+  mtime: Int
+  single_request: Bool
+  use_tcp: Bool
+  trust_ad: Bool
+  no_reload: Bool
+  # Round-robin position (rotate).
+  soffset: Atomic[Int]
+  # The servers are the built-in default (Go compares with defaultNS by
+  # identity: isDefaultNS).
+  default_ns: Bool
+
+  # Go's serverOffset.
+  def server_offset -> Int {
+    return 0 unless rotate
+    soffset.add(1) - 1
+  }
+}
+
+def new_dns_config -> DnsConfig {
+  DnsConfig.new(servers: [], search: [], ndots: 1, timeout_ns: 5000000000, attempts: 2, lookup: [], soffset: Atomic.new(0))
+}
+
+# Go's dnsReadConfig.
+def dns_read_config(filename: Str) -> DnsConfig {
+  conf = new_dns_config
+  st = os.stat(filename)
+  fr = open_lines(filename)
+  if fr.err? || st.err? {
+    conf.servers = DEFAULT_NS.dup
+    conf.default_ns = true
+    conf.search = dns_default_search
+    if e = fr.err {
+      conf.err = e
+    } elsif e = st.err {
+      conf.err = e
+    }
+    return conf
+  }
+  conf.mtime = st.unwrap.mod_time
+  file = fr.unwrap
+  loop {
+    line = file.read_line || break
+    next if line.size > 0 && (line[0] == 59 || line[0] == 35)
+    f = get_fields(line)
+    next if f.size < 1
+    k = f[0]
+    if k == "nameserver" {
+      if f.size > 1 && conf.servers.size < 3 && netip.parse_addr(f[1]).ok? {
+        conf.servers << join_host_port(f[1], "53")
+      }
+    } elsif k == "domain" {
+      conf.search = [ensure_rooted(f[1])] if f.size > 1
+    } elsif k == "search" {
+      s: [Str] = []
+      for i in 1...f.size {
+        name = ensure_rooted(f[i])
+        s << name if name != "."
+      }
+      conf.search = s
+    } elsif k == "options" {
+      for s in f[1...f.size] {
+        if s.start_with?("ndots:") {
+          n, _, _ = dtoi(s[6...s.size])
+          n = 0 if n < 0
+          n = 15 if n > 15
+          conf.ndots = n
+        } elsif s.start_with?("timeout:") {
+          n, _, _ = dtoi(s[8...s.size])
+          n = 1 if n < 1
+          conf.timeout_ns = n * 1000000000
+        } elsif s.start_with?("attempts:") {
+          n, _, _ = dtoi(s[9...s.size])
+          n = 1 if n < 1
+          conf.attempts = n
+        } elsif s == "rotate" {
+          conf.rotate = true
+        } elsif s == "single-request" || s == "single-request-reopen" {
+          conf.single_request = true
+        } elsif s == "use-vc" || s == "usevc" || s == "tcp" {
+          conf.use_tcp = true
+        } elsif s == "trust-ad" {
+          conf.trust_ad = true
+        } elsif s == "edns0" {
+          nil
+        } elsif s == "no-reload" {
+          conf.no_reload = true
+        } else {
+          conf.unknown_opt = true
+        }
+      }
+    } elsif k == "lookup" {
+      conf.lookup = f[1...f.size]
+    } else {
+      conf.unknown_opt = true
+    }
+  }
+  if conf.servers.size == 0 {
+    conf.servers = DEFAULT_NS.dup
+    conf.default_ns = true
+  }
+  conf.search = dns_default_search if conf.search.size == 0
+  conf
+}
+
+# Go's dnsDefaultSearch: the domain of the hostname.
+def dns_default_search -> [Str] {
+  r = get_hostname
+  return [] if r.err?
+  hn = r.unwrap
+  i = index_byte(hn, 46)
+  return [ensure_rooted(hn[i + 1...hn.size])] if i >= 0 && i < hn.size - 1
+  []
+}
+
+def ensure_rooted(s: Str) -> Str {
+  return s if s.size > 0 && s[s.size - 1] == 46
+  s + "."
+}
+
+# The parsed resolv.conf and when it was last checked (Go's
+# resolverConfig). `no_recheck` is Go's distantFuture lastChecked (tests).
+struct ResolvState {
+  conf: DnsConfig?
+  last_checked: Int
+  no_recheck: Bool
+}
+
+RESOLV_STATE = Mutex[ResolvState].new(ResolvState.new(conf: none, last_checked: 0, no_recheck: false))
+
+# Go's getSystemDNSConfig.
+def get_system_dns_config -> DnsConfig { get_system_dns_config_named("/etc/resolv.conf") }
+
+# Go's getSystemDNSConfigNamed: resolv.conf, re-read when it changed
+# (checked at most every 5 s, or on every use while the default servers
+# are used).
+def get_system_dns_config_named(path: Str) -> DnsConfig {
+  RESOLV_STATE.lock { |s|
+    now = alx_mono_ns()
+    if !s.conf.present? {
+      s.conf = dns_read_config("/etc/resolv.conf")
+      s.last_checked = now
+    }
+    dc = s.conf.unwrap
+    panic "unreachable" if dc.servers.size == 0
+    expired = now > s.last_checked + 5000000000
+    if !dc.no_reload && (expired || dc.default_ns) && !s.no_recheck {
+      s.last_checked = now
+      mtime = 0
+      st = os.stat(path)
+      mtime = st.unwrap.mod_time if st.ok?
+      s.conf = dns_read_config(path) if mtime != dc.mtime
+    }
+    s.conf.unwrap
+  }
+}
+
+# Go's distantFuture, as an offset from now (tests).
+DISTANT_FUTURE = 1 << 62
+
+# Go's time.Time{}, as an offset from now (tests).
+LONG_AGO = -(1 << 62)
+
+# For tests (Go's resolvConfTest.forceUpdateConf): use c, as if last
+# checked `last_checked` ns from now (DISTANT_FUTURE: never check again).
+def force_update_conf(c: DnsConfig, last_checked: Int) {
+  RESOLV_STATE.lock { |s|
+    s.conf = c
+    s.no_recheck = last_checked >= DISTANT_FUTURE
+    s.last_checked = s.no_recheck ? 0 : alx_mono_ns() + last_checked
+  }
+}

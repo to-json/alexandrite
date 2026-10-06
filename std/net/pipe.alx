@@ -27,6 +27,7 @@ struct PipeDeadline {
     # The gen of a timer to start (0: none).
     g = st.lock { |s|
       s.gen += 1
+      s.at = t.is_zero ? 0 : t.unix_nano
       start = 0
       if t.is_zero || dur > 0 {
         if s.closed {
@@ -54,15 +55,20 @@ struct PipeDeadline {
   }
 
   def wait -> Chan[Bool] { st.lock { |s| s.cancel } }
+
+  # The deadline (Unix ns; 0: none).
+  def at -> Int { st.lock { |s| s.at } }
 }
 
 struct PipeDlState {
   cancel: Chan[Bool]
   closed: Bool
   gen: Int
+  # The deadline (Unix ns; 0: none), for tests' fake servers.
+  at: Int
 }
 
-def make_pipe_deadline -> PipeDeadline { PipeDeadline.new(st: Mutex.new(PipeDlState.new(cancel: Chan[Bool].new, closed: false, gen: 0))) }
+def make_pipe_deadline -> PipeDeadline { PipeDeadline.new(st: Mutex.new(PipeDlState.new(cancel: Chan[Bool].new, closed: false, gen: 0, at: 0))) }
 
 def closed_chan?(c: Chan[Bool]) -> Bool {
   r = false
@@ -81,6 +87,10 @@ struct PipeEnd {
   wr_tx: Chan[[Byte]]
   wr_rx: Chan[Int]
   closed_once: Atomic[Bool]
+  # What a read fails with once the other end closed with
+  # close_with_error! ("" for EOF), and the other end's.
+  my_fail: Atomic[Str]
+  remote_fail: Atomic[Str]
   local_done: Chan[Bool]
   remote_done: Chan[Bool]
   read_dl: PipeDeadline
@@ -88,7 +98,7 @@ struct PipeEnd {
 
   def read!(b: [Byte]) -> ~Int {
     fail PipeError.ClosedPipe if closed_chan?(local_done)
-    return 0 if closed_chan?(remote_done)
+    return ~peer_eof if closed_chan?(remote_done)
     dl = read_dl.wait
     fail timeout_error("read", "pipe", "", "") if closed_chan?(dl)
     select {
@@ -98,7 +108,7 @@ struct PipeEnd {
         return nr
       }
       when v = local_done.recv => { fail PipeError.ClosedPipe }
-      when v = remote_done.recv => { return 0 }
+      when v = remote_done.recv => { return ~peer_eof }
       when v = dl.recv => { fail timeout_error("read", "pipe", "", "") }
     }
     0
@@ -143,6 +153,23 @@ struct PipeEnd {
   def close! -> ~Unit {
     local_done.close if closed_once.compare_and_swap(false, true)
   }
+
+  # For tests' fake servers: closes, making the other end's reads fail
+  # with an error instead of reading the end of the stream: "timeout" (an
+  # i/o timeout), "op:TEXT" (a failed operation, Go's *OpError) or
+  # "err:TEXT" (another error).
+  def close_with_error!(kind: Str) {
+    remote_fail.store(kind)
+    local_done.close if closed_once.compare_and_swap(false, true)
+  }
+
+  def peer_eof -> ~Int {
+    f = my_fail.load
+    return 0 if f == ""
+    fail timeout_error("", "", "", "") if f == "timeout"
+    fail wrap_error("write", "", "", "", "", f[3...f.size]) if f.start_with?("op:")
+    fail client_error(f[4...f.size])
+  }
 }
 
 # Go's Pipe: two connected in-memory ends; a write blocks until the other
@@ -156,8 +183,10 @@ pub def pipe -> (Conn, Conn) {
   cn2 = Chan[Int].new
   done1 = Chan[Bool].new
   done2 = Chan[Bool].new
-  p1 = PipeEnd.new(wr_mu: Mutex.new(0), rd_rx: cb1, rd_tx: cn1, wr_tx: cb2, wr_rx: cn2, closed_once: Atomic.new(false), local_done: done1, remote_done: done2, read_dl: make_pipe_deadline, write_dl: make_pipe_deadline)
-  p2 = PipeEnd.new(wr_mu: Mutex.new(0), rd_rx: cb2, rd_tx: cn2, wr_tx: cb1, wr_rx: cn1, closed_once: Atomic.new(false), local_done: done2, remote_done: done1, read_dl: make_pipe_deadline, write_dl: make_pipe_deadline)
+  f1 = Atomic.new("")
+  f2 = Atomic.new("")
+  p1 = PipeEnd.new(wr_mu: Mutex.new(0), rd_rx: cb1, rd_tx: cn1, wr_tx: cb2, wr_rx: cn2, closed_once: Atomic.new(false), my_fail: f1, remote_fail: f2, local_done: done1, remote_done: done2, read_dl: make_pipe_deadline, write_dl: make_pipe_deadline)
+  p2 = PipeEnd.new(wr_mu: Mutex.new(0), rd_rx: cb2, rd_tx: cn2, wr_tx: cb1, wr_rx: cn1, closed_once: Atomic.new(false), my_fail: f2, remote_fail: f1, local_done: done2, remote_done: done1, read_dl: make_pipe_deadline, write_dl: make_pipe_deadline)
   (pipe_conn(p1), pipe_conn(p2))
 }
 

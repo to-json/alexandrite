@@ -14,8 +14,8 @@ PROTOCOLS_READ = Atomic.new(false)
 
 # Go's services table (completed from /etc/services on first use).
 SERVICES = Mutex[Map[Str, Map[Str, Int]]].new({
-  "udp" => {"domain" => 53},
-  "tcp" => {"ftp" => 21, "ftps" => 990, "gopher" => 70, "http" => 80, "https" => 443, "imap2" => 143, "imap3" => 220, "imaps" => 993, "pop3" => 110, "pop3s" => 995, "smtp" => 25, "submissions" => 465, "ssh" => 22, "telnet" => 23}
+  "udp" => { "domain" => 53 },
+  "tcp" => { "ftp" => 21, "ftps" => 990, "gopher" => 70, "http" => 80, "https" => 443, "imap2" => 143, "imap3" => 220, "imaps" => 993, "pop3" => 110, "pop3s" => 995, "smtp" => 25, "submissions" => 465, "ssh" => 22, "telnet" => 23 }
 })
 SERVICES_READ = Atomic.new(false)
 
@@ -259,14 +259,96 @@ pub struct Resolver {
 
   # Go's LookupAddr: the names of an address (reverse lookup).
   pub def lookup_addr(ctx: context.Context, addr: Str) -> ~[Str] {
+    names, bad = ~self.lookup_addr_filtered(ctx, addr)
+    if e = bad {
+      fail e
+    }
+    names
+  }
+
+  # Go's LookupAddr's two results: the valid names, and the error if some
+  # were dropped.
+  def lookup_addr_filtered(ctx: context.Context, addr: Str) -> ~([Str], DNSError?) {
     names = ~self.lookup_addr_raw(ctx, addr)
     good: [Str] = []
     for n in names {
       good << n if domain_name?(n)
     }
-    fail dns_error(ERR_MALFORMED_DNS_RECORDS, addr, "", "") if good.size != names.size
-    good
+    return (good, none) if good.size == names.size
+    (good, dns_error(ERR_MALFORMED_DNS_RECORDS, addr, "", ""))
   }
+
+  # Go's LookupSRV: the SRV records of _service._proto.name (name itself
+  # when service and proto are ""), sorted by priority and randomized by
+  # weight, and the canonical name. Records with invalid target names make
+  # it fail (Go returns the valid records with the error).
+  pub def lookup_srv(ctx: context.Context, service: Str, proto: Str, name: Str) -> ~(Str, [SRV]) {
+    cname, addrs, bad = ~self.lookup_srv_filtered(ctx, service, proto, name)
+    if e = bad {
+      fail e
+    }
+    (cname, addrs)
+  }
+
+  def lookup_srv_filtered(ctx: context.Context, service: Str, proto: Str, name: Str) -> ~(Str, [SRV], DNSError?) {
+    cname, addrs = ~go_lookup_srv(self, ctx, service, proto, name)
+    fail dns_error("SRV header name is invalid", name, "", "") if cname != "" && !domain_name?(cname)
+    good: [SRV] = []
+    for a in addrs {
+      good << a if domain_name?(a.target)
+    }
+    return (cname, good, none) if good.size == addrs.size
+    (cname, good, dns_error(ERR_MALFORMED_DNS_RECORDS, name, "", ""))
+  }
+
+  # Go's LookupMX: sorted by preference. Hosts that are neither domain
+  # names nor IP addresses make it fail (Go returns the valid records with
+  # the error).
+  pub def lookup_mx(ctx: context.Context, name: Str) -> ~[MX] {
+    records, bad = ~self.lookup_mx_filtered(ctx, name)
+    if e = bad {
+      fail e
+    }
+    records
+  }
+
+  def lookup_mx_filtered(ctx: context.Context, name: Str) -> ~([MX], DNSError?) {
+    records = ~go_lookup_mx(self, ctx, name)
+    good: [MX] = []
+    for mx in records {
+      if !domain_name?(mx.host) {
+        h = mx.host
+        h = h[0...h.size - 1] if h.size > 0 && h[h.size - 1] == 46
+        ip = netip.parse_addr(h)
+        next if ip.err? || ip.unwrap.zone != ""
+      }
+      good << mx
+    }
+    return (good, none) if good.size == records.size
+    (good, dns_error(ERR_MALFORMED_DNS_RECORDS, name, "", ""))
+  }
+
+  # Go's LookupNS (invalid host names make it fail, as lookup_mx).
+  pub def lookup_ns(ctx: context.Context, name: Str) -> ~[NS] {
+    records, bad = ~self.lookup_ns_filtered(ctx, name)
+    if e = bad {
+      fail e
+    }
+    records
+  }
+
+  def lookup_ns_filtered(ctx: context.Context, name: Str) -> ~([NS], DNSError?) {
+    records = ~go_lookup_ns(self, ctx, name)
+    good: [NS] = []
+    for ns in records {
+      good << ns if domain_name?(ns.host)
+    }
+    return (good, none) if good.size == records.size
+    (good, dns_error(ERR_MALFORMED_DNS_RECORDS, name, "", ""))
+  }
+
+  # Go's LookupTXT.
+  pub def lookup_txt(ctx: context.Context, name: Str) -> ~[Str] { ~go_lookup_txt(self, ctx, name) }
 
   # Go's lookupIPAddr: an IP literal as it is, else the system's (or the
   # package's DNS client's) answer.
@@ -278,15 +360,16 @@ pub struct Resolver {
       x = IP.new(b: ip.as_slice)
       return [IPAddr.new(ip: x.to16 || x, zone: ip.zone)]
     }
-    fail dns_error(ERR_CANCELED, host, "", "") if ctx.done?
+    fail new_dns_error(ctx_error(ctx), host, "") if ctx.done?
     ~self.lookup_ip_sys(ctx, network, host)
   }
 
   # The system resolver's addresses for host (getaddrinfo; blocks the
   # worker), or the package's DNS client's with prefer_go.
   def lookup_ip_sys(ctx: context.Context, network: Str, host: Str) -> ~[IPAddr] {
-    if prefer_go || dial.present? {
-      return ~go_lookup_ip(self, ctx, network, host)
+    order, conf = host_order(self, host)
+    if order != HOST_LOOKUP_CGO {
+      return ~go_lookup_ip_order(self, ctx, network, host, order, conf)
     }
     fam = 0
     v = ip_version(network)
@@ -310,8 +393,9 @@ pub struct Resolver {
   }
 
   def lookup_cname_raw(ctx: context.Context, host: Str) -> ~Str {
-    if prefer_go || dial.present? {
-      return ~go_lookup_cname(self, ctx, host)
+    order, conf = host_order(self, host)
+    if order != HOST_LOOKUP_CGO {
+      return ~go_lookup_cname_order(self, ctx, host, order, conf)
     }
     buf: [Byte] = [0; 1024]
     n = alx_net_canonname(host, buf, 1024)
@@ -324,8 +408,9 @@ pub struct Resolver {
   }
 
   def lookup_addr_raw(ctx: context.Context, addr: Str) -> ~[Str] {
-    if prefer_go || dial.present? {
-      return ~go_lookup_ptr(self, ctx, addr)
+    order = system_conf.addr_lookup_order(self, addr)
+    if order != HOST_LOOKUP_CGO {
+      return ~go_lookup_ptr_order(self, ctx, addr, order, none)
     }
     h, zone = split_host_zone(addr)
     ip = parse_ip(h) || fail dns_error("unrecognized address", addr, "", "")
@@ -444,6 +529,18 @@ pub def lookup_cname(host: Str) -> ~Str { default_resolver.~lookup_cname(context
 
 # Go's LookupAddr.
 pub def lookup_addr(addr: Str) -> ~[Str] { default_resolver.~lookup_addr(context.background, addr) }
+
+# Go's LookupSRV.
+pub def lookup_srv(service: Str, proto: Str, name: Str) -> ~(Str, [SRV]) { default_resolver.~lookup_srv(context.background, service, proto, name) }
+
+# Go's LookupMX.
+pub def lookup_mx(name: Str) -> ~[MX] { default_resolver.~lookup_mx(context.background, name) }
+
+# Go's LookupNS.
+pub def lookup_ns(name: Str) -> ~[NS] { default_resolver.~lookup_ns(context.background, name) }
+
+# Go's LookupTXT.
+pub def lookup_txt(name: Str) -> ~[Str] { default_resolver.~lookup_txt(context.background, name) }
 
 # Go's parseNetwork: ("tcp", 0), ("ip4", 1) for "ip4:icmp" or "ip4:1".
 def parse_network(network: Str, needs_proto: Bool) -> ~(Str, Int) {

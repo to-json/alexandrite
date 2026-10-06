@@ -1,0 +1,1948 @@
+#![overflow(wrap)]
+# Package dnsmessage: golang.org/x/net/dns/dnsmessage (the copy Go's std
+# vendors), packing and unpacking DNS messages (RFC 1035 and friends), as
+# Go's net resolver uses it.
+#
+#   Go                                        alx
+#   type Type / Class / RCode / OpCode uint16 U16 values
+#   TypeA ... TypeALL, ClassINET ...          TYPE_A ... TYPE_ALL, CLASS_INET, CLASS_CSNET,
+#                                             CLASS_CHAOS, CLASS_HESIOD, CLASS_ANY
+#   RCodeSuccess ... RCodeRefused             RCODE_SUCCESS, RCODE_FORMAT_ERROR, RCODE_SERVER_FAILURE,
+#                                             RCODE_NAME_ERROR, RCODE_NOT_IMPLEMENTED, RCODE_REFUSED
+#   t.String() / t.GoString()                 type_string(t) / type_go_string(t); class_string /
+#                                             class_go_string, rcode_string / rcode_go_string,
+#                                             opcode_go_string
+#   ErrNotStarted / ErrSectionDone            DnsMessageError.NotStarted / .SectionDone
+#                                             (ERR_NOT_STARTED / ERR_SECTION_DONE), and
+#                                             not_started?(e) / section_done?(e)
+#   Name{Data [255]byte, Length uint8}        Name { data: [Byte; 255], length: U8 }
+#   NewName(s) / MustNewName(s)               new_name(s) -> ~Name / must_new_name(s)
+#   n.String() / n.GoString()                 n.to_s / n.go_string
+#   Header, Question, ResourceHeader          the same structs, fields snake_case (op_code, rcode,
+#                                             ttl, ...; Question/ResourceHeader keep `type`)
+#   h.SetEDNS0(l, rc, do) error               h.set_edns0!(l, rc, do) -> ~Unit (never fails, as in Go)
+#   h.DNSSECAllowed() / ExtendedRCode(rc)     h.dnssec_allowed? / h.extended_rcode(rc)
+#   ResourceBody (interface)                  enum ResourceBody { Nil, A(a), NS(ns), CNAME(cname),
+#                                             SOA(ns, mbox, serial, refresh, retry, expire, min_ttl),
+#                                             PTR(ptr), MX(pref, mx), TXT(txt), AAAA(aaaa),
+#                                             SRV(priority, weight, port, target),
+#                                             SVCB(priority, target, params),
+#                                             HTTPS(priority, target, params), OPT(options),
+#                                             Unknown(type, data) }
+#   *AResource ... *UnknownResource           AResource { a: [Byte; 4] }, AAAAResource { aaaa:
+#                                             [Byte; 16] }, CNAMEResource, MXResource, NSResource,
+#                                             PTRResource, SOAResource, TXTResource, SRVResource,
+#                                             OPTResource { options: [Option] }, Option { code, data },
+#                                             UnknownResource { type, data }, SVCBResource,
+#                                             HTTPSResource (svcb.alx); r.body makes the enum value
+#   Resource{Header, Body}                    Resource { header, body }
+#   Message{Header, Questions, ...}           Message { header, questions, answers, authorities,
+#                                             additionals }
+#   m.Pack() / m.AppendPack(b)                m.pack / m.append_pack(b) -> ~[Byte]
+#   m.Unpack(msg) error                       unpack_message(msg) -> ~Message, or m.unpack!(msg)
+#   m.GoString() (and every GoString)         go_string
+#   Parser, p.Start(msg)                      Parser.new, p.start!(msg) -> ~Header
+#   p.Question / AllQuestions / SkipQuestion  p.question! / all_questions! / skip_question! /
+#     / SkipAllQuestions                        skip_all_questions!
+#   p.AnswerHeader / Answer / AllAnswers /    p.answer_header! / answer! / all_answers! /
+#     SkipAnswer / SkipAllAnswers               skip_answer! / skip_all_answers! (and authority*,
+#                                               additional*)
+#   p.AResource() ... p.UnknownResource()     p.a_resource! ... p.unknown_resource! (also
+#                                             svcb_resource!, https_resource!, opt_resource!)
+#   NewBuilder(buf, h) Builder                new_builder(buf, h) -> Builder
+#   b.EnableCompression / StartQuestions ...  b.enable_compression! / start_questions! /
+#                                             start_answers! / start_authorities! / start_additionals!
+#   b.Question(q) / b.AResource(h, r) ...     b.question!(q) / b.a_resource!(h, r) ... (one per type)
+#   b.Finish() ([]byte, error)                b.finish! -> ~[Byte]
+#   SVCBResource / HTTPSResource / SVCParam   the same structs (svcb.alx); r.get_param(key) -> [Byte]?,
+#     GetParam / SetParam / DeleteParam         r.set_param!(key, value), r.delete_param!(key) -> Bool
+#   SVCParamKey uint16, SVCParamALPN ...      U16, SVC_PARAM_MANDATORY, SVC_PARAM_ALPN, ...,
+#                                             SVC_PARAM_TLS_SUPPORTED_GROUPS; svc_param_key_string /
+#                                             svc_param_key_go_string
+#
+# Differences from Go:
+#   - Errors are one error type, DnsMessageError, with Go's texts. Go's
+#     nestedError ("<context>: <err>") is DnsMessageError.Nested(s, err);
+#     as in Go it has no unwrap, so section_done?(e) only holds for the
+#     bare SectionDone (compare with `==`, as Go's tests do).
+#   - ResourceBody is an enum instead of an interface of pointers. Its zero
+#     value, Nil, is Go's nil body: packing it fails with "nil resource
+#     body". Typed structs exist for the Parser and Builder methods, as in Go.
+#   - Go's Message.Pack writes each Resource's Type (from its body) and
+#     Length back into the message (pointer receiver); here m.pack takes a
+#     copy, so the message is left as it was.
+#   - Parser shares its state across copies (D36); make it with Parser.new.
+#     Every method is a `!`, and the methods other than start! fail with
+#     NotStarted until start! is called.
+#   - Builder is a plain value whose methods are `!` (Go's pointer methods).
+#     A nil buffer can't be told from an empty one: pass [] for Go's nil.
+#   - HTTPSResource has SVCBResource's fields itself (Go embeds it):
+#     HTTPSResource { priority, target, params }; r.svcb_resource and
+#     svcb.https_resource convert.
+#   - SVCB parameter order is checked against the previous key, as in
+#     x/net v0.56.0; the copy vendored in Go 1.27 never updates its
+#     previousKey, so it only rejects a repeated key 0.
+#   - Go's allocation-count tests, benchmarks and fuzz target run as plain
+#     tests (the fuzz target with its seed corpus); TestNoFmt (Go's import
+#     check) has no counterpart.
+#
+# Note for the C backend: `.rescue { |e| fail ... }` whose value isn't a
+# scalar emits an invalid dead assignment there, so such blocks end with a
+# dead value of the right type after the fail.
+
+# ------------------------------------------------------------------ types
+
+pub TYPE_A: U16 = 1
+pub TYPE_NS: U16 = 2
+pub TYPE_CNAME: U16 = 5
+pub TYPE_SOA: U16 = 6
+pub TYPE_PTR: U16 = 12
+pub TYPE_MX: U16 = 15
+pub TYPE_TXT: U16 = 16
+pub TYPE_AAAA: U16 = 28
+pub TYPE_SRV: U16 = 33
+pub TYPE_OPT: U16 = 41
+pub TYPE_SVCB: U16 = 64
+pub TYPE_HTTPS: U16 = 65
+
+# Question.type
+pub TYPE_WKS: U16 = 11
+pub TYPE_HINFO: U16 = 13
+pub TYPE_MINFO: U16 = 14
+pub TYPE_AXFR: U16 = 252
+pub TYPE_ALL: U16 = 255
+
+def type_name(t: U16) -> Str {
+  case t {
+    1 => "TypeA"
+    2 => "TypeNS"
+    5 => "TypeCNAME"
+    6 => "TypeSOA"
+    12 => "TypePTR"
+    15 => "TypeMX"
+    16 => "TypeTXT"
+    28 => "TypeAAAA"
+    33 => "TypeSRV"
+    41 => "TypeOPT"
+    64 => "TypeSVCB"
+    65 => "TypeHTTPS"
+    11 => "TypeWKS"
+    13 => "TypeHINFO"
+    14 => "TypeMINFO"
+    252 => "TypeAXFR"
+    255 => "TypeALL"
+    _ => ""
+  }
+}
+
+# The name of a Type ("TypeA"), or its number (Go's Type.String).
+pub def type_string(t: U16) -> Str {
+  n = type_name(t)
+  n == "" ? print_u16(t) : n
+}
+
+# Go's Type.GoString: "dnsmessage.TypeA", or the number.
+pub def type_go_string(t: U16) -> Str {
+  n = type_name(t)
+  n == "" ? print_u16(t) : "dnsmessage." + n
+}
+
+pub CLASS_INET: U16 = 1
+pub CLASS_CSNET: U16 = 2
+pub CLASS_CHAOS: U16 = 3
+pub CLASS_HESIOD: U16 = 4
+
+# Question.class
+pub CLASS_ANY: U16 = 255
+
+def class_name(c: U16) -> Str {
+  case c {
+    1 => "ClassINET"
+    2 => "ClassCSNET"
+    3 => "ClassCHAOS"
+    4 => "ClassHESIOD"
+    255 => "ClassANY"
+    _ => ""
+  }
+}
+
+# The name of a Class ("ClassINET"), or its number (Go's Class.String).
+pub def class_string(c: U16) -> Str {
+  n = class_name(c)
+  n == "" ? print_u16(c) : n
+}
+
+# Go's Class.GoString.
+pub def class_go_string(c: U16) -> Str {
+  n = class_name(c)
+  n == "" ? print_u16(c) : "dnsmessage." + n
+}
+
+# Go's OpCode.GoString: the number.
+pub def opcode_go_string(o: U16) -> Str { print_u16(o) }
+
+pub RCODE_SUCCESS: U16 = 0
+pub RCODE_FORMAT_ERROR: U16 = 1
+pub RCODE_SERVER_FAILURE: U16 = 2
+pub RCODE_NAME_ERROR: U16 = 3
+pub RCODE_NOT_IMPLEMENTED: U16 = 4
+pub RCODE_REFUSED: U16 = 5
+
+def rcode_name(r: U16) -> Str {
+  case r {
+    0 => "RCodeSuccess"
+    1 => "RCodeFormatError"
+    2 => "RCodeServerFailure"
+    3 => "RCodeNameError"
+    4 => "RCodeNotImplemented"
+    5 => "RCodeRefused"
+    _ => ""
+  }
+}
+
+# The name of an RCode ("RCodeSuccess"), or its number (Go's RCode.String).
+pub def rcode_string(r: U16) -> Str {
+  n = rcode_name(r)
+  n == "" ? print_u16(r) : n
+}
+
+# Go's RCode.GoString.
+pub def rcode_go_string(r: U16) -> Str {
+  n = rcode_name(r)
+  n == "" ? print_u16(r) : "dnsmessage." + n
+}
+
+# ---------------------------------------------------------------- printing
+
+def print_padded_u8(i: U8) -> Str {
+  Str.from_bytes([i / 100 + 48, i / 10 % 10 + 48, i % 10 + 48])
+}
+
+def print_u8_bytes(buf: [Byte], i: U8) -> [Byte] {
+  out = buf
+  out << i / 100 + 48 if i >= 100
+  out << i / 10 % 10 + 48 if i >= 10
+  out << i % 10 + 48
+  out
+}
+
+def print_byte_slice(b: [Byte]) -> Str {
+  return "" if b.size == 0
+  buf: [Byte] = []
+  buf = print_u8_bytes(buf, b[0])
+  for n in b[1...b.size] {
+    buf << 44
+    buf << 32
+    buf = print_u8_bytes(buf, n)
+  }
+  Str.from_bytes(buf)
+}
+
+def print_string(str: [Byte]) -> Str {
+  hex = "0123456789abcdef"
+  buf: [Byte] = []
+  for c in str {
+    if c == 46 || c == 45 || c == 32 || (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || (c >= 48 && c <= 57) {
+      buf << c
+      next
+    }
+    buf << 92
+    buf << 120
+    buf << hex[(c >> 4).to_i]
+    buf << hex[(c & 15).to_i]
+  }
+  Str.from_bytes(buf)
+}
+
+def print_u16(i: U16) -> Str { print_u32(i.as_u32) }
+
+def print_u32(i: U32) -> Str {
+  buf: [Byte] = [0; 10]
+  start = 0
+  pos = 0
+  v = i
+  d: U32 = 1000000000
+  while d > 0 {
+    buf[pos] = (v / d % 10 + 48).as_u8
+    start += 1 if buf[pos] == 48 && pos == start && start < 9
+    pos += 1
+    v = v % d
+    d = d / 10
+  }
+  Str.from_bytes(buf[start...10])
+}
+
+def print_bool(b: Bool) -> Str { b ? "true" : "false" }
+
+# xs joined with ", " (the element lists of the go_strings).
+def join_go(xs: [Str]) -> Str {
+  out = ""
+  for i in 0...xs.size {
+    out += ", " if i > 0
+    out += xs[i]
+  }
+  out
+}
+
+# ------------------------------------------------------------------ errors
+
+pub error DnsMessageError {
+  # Go's ErrNotStarted: a Parser/Builder method called out of order.
+  NotStarted
+  # Go's ErrSectionDone: the section has no more resources.
+  SectionDone
+  BaseLen
+  CalcLen
+  Reserved
+  TooManyPtr
+  InvalidPtr
+  InvalidName
+  NilResourceBody
+  ResourceLen
+  SegTooLong
+  NameTooLong
+  ZeroSegLen
+  ResTooLong
+  TooManyQuestions
+  TooManyAnswers
+  TooManyAuthorities
+  TooManyAdditionals
+  NonCanonicalName
+  StringTooLong
+  ParamOutOfOrder
+  TooLongSVCBValue
+  # Go's nestedError: "<s>: <err>".
+  Nested(s: Str, err: Error?)
+
+  def message -> Str {
+    case self {
+      NotStarted => "parsing/packing of this type isn't available yet"
+      SectionDone => "parsing/packing of this section has completed"
+      BaseLen => "insufficient data for base length type"
+      CalcLen => "insufficient data for calculated length type"
+      Reserved => "segment prefix is reserved"
+      TooManyPtr => "too many pointers (>10)"
+      InvalidPtr => "invalid pointer"
+      InvalidName => "invalid dns name"
+      NilResourceBody => "nil resource body"
+      ResourceLen => "insufficient data for resource body length"
+      SegTooLong => "segment length too long"
+      NameTooLong => "name too long"
+      ZeroSegLen => "zero length segment"
+      ResTooLong => "resource length too long"
+      TooManyQuestions => "too many Questions to pack (>65535)"
+      TooManyAnswers => "too many Answers to pack (>65535)"
+      TooManyAuthorities => "too many Authorities to pack (>65535)"
+      TooManyAdditionals => "too many Additionals to pack (>65535)"
+      NonCanonicalName => "name is not in canonical format (it must end with a .)"
+      StringTooLong => "character string exceeds maximum length (255)"
+      ParamOutOfOrder => "parameter out of order"
+      TooLongSVCBValue => "value too long (>65535 bytes)"
+      Nested(s, e) => s + ": " + (e?.message || "")
+    }
+  }
+}
+
+pub ERR_NOT_STARTED = DnsMessageError.NotStarted
+pub ERR_SECTION_DONE = DnsMessageError.SectionDone
+
+# Whether e is Go's ErrSectionDone.
+pub def section_done?(e: Error) -> Bool { e == DnsMessageError.SectionDone }
+
+# Whether e is Go's ErrNotStarted.
+pub def not_started?(e: Error) -> Bool { e == DnsMessageError.NotStarted }
+
+def nest(s: Str, e: Error) -> DnsMessageError { DnsMessageError.Nested(s: s, err: e) }
+
+PACK_STARTING_CAP = 512
+HEADER_LEN = 12
+
+# ------------------------------------------------------------------ header
+
+# A DNS message header.
+pub struct Header {
+  id: U16
+  response: Bool
+  op_code: U16
+  authoritative: Bool
+  truncated: Bool
+  recursion_desired: Bool
+  recursion_available: Bool
+  authentic_data: Bool
+  checking_disabled: Bool
+  rcode: U16
+
+  def pack_bits -> U16 {
+    bits = op_code << 11 | rcode
+    bits = bits | HEADER_BIT_RA if recursion_available
+    bits = bits | HEADER_BIT_RD if recursion_desired
+    bits = bits | HEADER_BIT_TC if truncated
+    bits = bits | HEADER_BIT_AA if authoritative
+    bits = bits | HEADER_BIT_QR if response
+    bits = bits | HEADER_BIT_AD if authentic_data
+    bits = bits | HEADER_BIT_CD if checking_disabled
+    bits
+  }
+
+  pub def go_string -> Str {
+    "dnsmessage.Header{" +
+      "ID: " + print_u16(id) + ", " +
+      "Response: " + print_bool(response) + ", " +
+      "OpCode: " + opcode_go_string(op_code) + ", " +
+      "Authoritative: " + print_bool(authoritative) + ", " +
+      "Truncated: " + print_bool(truncated) + ", " +
+      "RecursionDesired: " + print_bool(recursion_desired) + ", " +
+      "RecursionAvailable: " + print_bool(recursion_available) + ", " +
+      "AuthenticData: " + print_bool(authentic_data) + ", " +
+      "CheckingDisabled: " + print_bool(checking_disabled) + ", " +
+      "RCode: " + rcode_go_string(rcode) + "}"
+  }
+}
+
+SECTION_NOT_STARTED = 0
+SECTION_HEADER = 1
+SECTION_QUESTIONS = 2
+SECTION_ANSWERS = 3
+SECTION_AUTHORITIES = 4
+SECTION_ADDITIONALS = 5
+SECTION_DONE = 6
+
+HEADER_BIT_QR: U16 = 1 << 15
+HEADER_BIT_AA: U16 = 1 << 10
+HEADER_BIT_TC: U16 = 1 << 9
+HEADER_BIT_RD: U16 = 1 << 8
+HEADER_BIT_RA: U16 = 1 << 7
+HEADER_BIT_AD: U16 = 1 << 5
+HEADER_BIT_CD: U16 = 1 << 4
+
+def section_name(sec: Int) -> Str {
+  case sec {
+    SECTION_HEADER => "header"
+    SECTION_QUESTIONS => "Question"
+    SECTION_ANSWERS => "Answer"
+    SECTION_AUTHORITIES => "Authority"
+    SECTION_ADDITIONALS => "Additional"
+    _ => ""
+  }
+}
+
+# The header as it is on the wire (Go's unexported `header`).
+struct WireHeader {
+  id: U16
+  bits: U16
+  questions: U16
+  answers: U16
+  authorities: U16
+  additionals: U16
+
+  def count(sec: Int) -> U16 {
+    case sec {
+      SECTION_QUESTIONS => questions
+      SECTION_ANSWERS => answers
+      SECTION_AUTHORITIES => authorities
+      SECTION_ADDITIONALS => additionals
+      _ => 0
+    }
+  }
+
+  def pack_wire(msg: [Byte]) -> [Byte] {
+    out = pack_u16(msg, id)
+    out = pack_u16(out, bits)
+    out = pack_u16(out, questions)
+    out = pack_u16(out, answers)
+    out = pack_u16(out, authorities)
+    pack_u16(out, additionals)
+  }
+
+  def unpack_wire!(msg: [Byte], off: Int) -> ~Int {
+    v = unpack_u16(msg, off).rescue { |e| fail nest("id", e) }
+    o = off + 2
+    self.id = v
+    v = unpack_u16(msg, o).rescue { |e| fail nest("bits", e) }
+    o = o + 2
+    self.bits = v
+    v = unpack_u16(msg, o).rescue { |e| fail nest("questions", e) }
+    o = o + 2
+    self.questions = v
+    v = unpack_u16(msg, o).rescue { |e| fail nest("answers", e) }
+    o = o + 2
+    self.answers = v
+    v = unpack_u16(msg, o).rescue { |e| fail nest("authorities", e) }
+    o = o + 2
+    self.authorities = v
+    v = unpack_u16(msg, o).rescue { |e| fail nest("additionals", e) }
+    o = o + 2
+    self.additionals = v
+    o
+  }
+
+  def header -> Header {
+    Header.new(
+      id: id,
+      response: bits & HEADER_BIT_QR != 0,
+      op_code: (bits >> 11) & 15,
+      authoritative: bits & HEADER_BIT_AA != 0,
+      truncated: bits & HEADER_BIT_TC != 0,
+      recursion_desired: bits & HEADER_BIT_RD != 0,
+      recursion_available: bits & HEADER_BIT_RA != 0,
+      authentic_data: bits & HEADER_BIT_AD != 0,
+      checking_disabled: bits & HEADER_BIT_CD != 0,
+      rcode: bits & 15,
+    )
+  }
+}
+
+# ---------------------------------------------------------------- resources
+
+# A DNS resource record.
+pub struct Resource {
+  header: ResourceHeader
+  body: ResourceBody
+
+  pub def go_string -> Str {
+    "dnsmessage.Resource{" +
+      "Header: " + header.go_string +
+      ", Body: &" + body.go_string +
+      "}"
+  }
+
+  # Go's Resource.pack: the header's Type comes from the body and its
+  # Length from the packed body.
+  def pack_res(msg: [Byte], comp: Map[Str, U16]?, comp_off: Int) -> ~[Byte] {
+    fail DnsMessageError.NilResourceBody if body == ResourceBody.Nil
+    h = header
+    h.type = body.real_type
+    out = h.pack_rh(msg, comp, comp_off).rescue { |e|
+      fail nest("ResourceHeader", e)
+      []
+    }
+    len_off = out.size - 2
+    pre_len = out.size
+    out = body.pack_body(out, comp, comp_off).rescue { |e|
+      fail nest("content", e)
+      []
+    }
+    h.~fix_len!(out, len_off, pre_len)
+    out
+  }
+}
+
+# A DNS resource record's data (Go's ResourceBody interface, one variant
+# per implementation). Nil is Go's nil body.
+pub enum ResourceBody {
+  Nil
+  A(a: [Byte; 4])
+  NS(ns: Name)
+  CNAME(cname: Name)
+  SOA(ns: Name, mbox: Name, serial: U32, refresh: U32, retry: U32, expire: U32, min_ttl: U32)
+  PTR(ptr: Name)
+  MX(pref: U16, mx: Name)
+  TXT(txt: [Str])
+  AAAA(aaaa: [Byte; 16])
+  SRV(priority: U16, weight: U16, port: U16, target: Name)
+  SVCB(priority: U16, target: Name, params: [SVCParam])
+  HTTPS(priority: U16, target: Name, params: [SVCParam])
+  OPT(options: [Option])
+  Unknown(type: U16, data: [Byte])
+
+  # The record type the body packs as (Go's realType); 0 for Nil.
+  pub def real_type -> U16 {
+    case self {
+      Nil => 0
+      A(_) => TYPE_A
+      NS(_) => TYPE_NS
+      CNAME(_) => TYPE_CNAME
+      SOA(_, _, _, _, _, _, _) => TYPE_SOA
+      PTR(_) => TYPE_PTR
+      MX(_, _) => TYPE_MX
+      TXT(_) => TYPE_TXT
+      AAAA(_) => TYPE_AAAA
+      SRV(_, _, _, _) => TYPE_SRV
+      SVCB(_, _, _) => TYPE_SVCB
+      HTTPS(_, _, _) => TYPE_HTTPS
+      OPT(_) => TYPE_OPT
+      Unknown(t, _) => t
+    }
+  }
+
+  pub def go_string -> Str {
+    case self {
+      Nil => "nil"
+      A(a) => AResource.new(a: a).go_string
+      NS(ns) => NSResource.new(ns: ns).go_string
+      CNAME(c) => CNAMEResource.new(cname: c).go_string
+      SOA(ns, mb, s, rf, rt, ex, mt) => soa(ns, mb, s, rf, rt, ex, mt).go_string
+      PTR(p) => PTRResource.new(ptr: p).go_string
+      MX(p, mx) => MXResource.new(pref: p, mx: mx).go_string
+      TXT(t) => TXTResource.new(txt: t).go_string
+      AAAA(a) => AAAAResource.new(aaaa: a).go_string
+      SRV(p, w, port, t) => SRVResource.new(priority: p, weight: w, port: port, target: t).go_string
+      SVCB(p, t, ps) => SVCBResource.new(priority: p, target: t, params: ps).go_string
+      HTTPS(p, t, ps) => HTTPSResource.new(priority: p, target: t, params: ps).go_string
+      OPT(o) => OPTResource.new(options: o).go_string
+      Unknown(t, d) => UnknownResource.new(type: t, data: d).go_string
+    }
+  }
+
+  def pack_body(msg: [Byte], comp: Map[Str, U16]?, comp_off: Int) -> ~[Byte] {
+    case self {
+      Nil => fail DnsMessageError.NilResourceBody
+      A(a) => AResource.new(a: a).~pack_rdata(msg)
+      NS(ns) => NSResource.new(ns: ns).~pack_rdata(msg, comp, comp_off)
+      CNAME(c) => CNAMEResource.new(cname: c).~pack_rdata(msg, comp, comp_off)
+      SOA(ns, mb, s, rf, rt, ex, mt) => soa(ns, mb, s, rf, rt, ex, mt).~pack_rdata(msg, comp, comp_off)
+      PTR(p) => PTRResource.new(ptr: p).~pack_rdata(msg, comp, comp_off)
+      MX(p, mx) => MXResource.new(pref: p, mx: mx).~pack_rdata(msg, comp, comp_off)
+      TXT(t) => TXTResource.new(txt: t).~pack_rdata(msg)
+      AAAA(a) => AAAAResource.new(aaaa: a).~pack_rdata(msg)
+      SRV(p, w, port, t) => SRVResource.new(priority: p, weight: w, port: port, target: t).~pack_rdata(msg)
+      SVCB(p, t, ps) => SVCBResource.new(priority: p, target: t, params: ps).~pack_rdata(msg)
+      HTTPS(p, t, ps) => SVCBResource.new(priority: p, target: t, params: ps).~pack_rdata(msg)
+      OPT(o) => OPTResource.new(options: o).~pack_rdata(msg)
+      Unknown(t, d) => UnknownResource.new(type: t, data: d).~pack_rdata(msg)
+    }
+  }
+}
+
+def soa(ns: Name, mbox: Name, serial: U32, refresh: U32, retry: U32, expire: U32, min_ttl: U32) -> SOAResource {
+  SOAResource.new(ns: ns, mbox: mbox, serial: serial, refresh: refresh, retry: retry, expire: expire, min_ttl: min_ttl)
+}
+
+# ------------------------------------------------------------------ parser
+
+struct ParserState {
+  msg: [Byte]
+  header: WireHeader
+  section: Int
+  off: Int
+  index: Int
+  res_header_valid: Bool
+  res_header_offset: Int
+  res_header_type: U16
+  res_header_length: U16
+
+  def check_advance!(sec: Int) -> ~Unit {
+    fail DnsMessageError.NotStarted if section < sec
+    fail DnsMessageError.SectionDone if section > sec
+    self.res_header_valid = false
+    if index == header.count(sec).to_i {
+      self.index = 0
+      self.section += 1
+      fail DnsMessageError.SectionDone
+    }
+  }
+
+  def resource!(sec: Int) -> ~Resource {
+    h = self.~resource_header!(sec)
+    self.res_header_valid = false
+    r = unpack_resource_body(msg, off, h)
+    if e = r.err {
+      fail nest("unpacking " + section_name(sec), e)
+    }
+    body, o = r.unwrap
+    self.off = o
+    self.index += 1
+    Resource.new(header: h, body: body)
+  }
+
+  def resource_header!(sec: Int) -> ~ResourceHeader {
+    # A header read twice without its body: read it again from its start.
+    self.off = res_header_offset if res_header_valid
+    self.~check_advance!(sec)
+    h = ResourceHeader.new()
+    o = h.~unpack_rh!(msg, off)
+    self.res_header_valid = true
+    self.res_header_offset = off
+    self.res_header_type = h.type
+    self.res_header_length = h.length
+    self.off = o
+    h
+  }
+
+  def skip_resource!(sec: Int) -> ~Unit {
+    if res_header_valid && section == sec {
+      new_off = off + res_header_length.to_i
+      fail DnsMessageError.ResourceLen if new_off > msg.size
+      self.off = new_off
+      self.res_header_valid = false
+      self.index += 1
+      return
+    }
+    self.~check_advance!(sec)
+    self.off = skip_resource(msg, off).rescue { |e| fail nest("skipping: " + section_name(sec), e) }
+    self.index += 1
+  }
+
+  def question! -> ~Question {
+    self.~check_advance!(SECTION_QUESTIONS)
+    name = Name.new()
+    o = name.unpack_name!(msg, off).rescue { |e| fail nest("unpacking Question.Name", e) }
+    typ = unpack_u16(msg, o).rescue { |e| fail nest("unpacking Question.Type", e) }
+    o = o + 2
+    class = unpack_u16(msg, o).rescue { |e| fail nest("unpacking Question.Class", e) }
+    o = o + 2
+    self.off = o
+    self.index += 1
+    Question.new(name: name, type: typ, class: class)
+  }
+
+  def skip_question! -> ~Unit {
+    self.~check_advance!(SECTION_QUESTIONS)
+    o = skip_name(msg, off).rescue { |e| fail nest("skipping Question Name", e) }
+    o = skip_u16(msg, o).rescue { |e| fail nest("skipping Question Type", e) }
+    o = skip_u16(msg, o).rescue { |e| fail nest("skipping Question Class", e) }
+    self.off = o
+    self.index += 1
+  }
+
+  # The checks before a typed resource body read (Go's
+  # `!p.resHeaderValid || p.resHeaderType != TypeX`).
+  def expect!(t: U16) -> ~Unit {
+    fail DnsMessageError.NotStarted if !res_header_valid || res_header_type != t
+  }
+
+  # After a typed resource body read.
+  def body_read! {
+    self.off += res_header_length.to_i
+    self.res_header_valid = false
+    self.index += 1
+  }
+}
+
+# A DNS message parser: reads one section at a time (Go's Parser). Make it
+# with Parser.new and start it with start!; copies share the parser.
+pub struct Parser {
+  st: [ParserState]
+
+  # An independent copy at the same position (Go copies a Parser by
+  # assignment).
+  pub def copy -> Parser {
+    return Parser.new(st: []) if st.size == 0
+    s = st[0]
+    Parser.new(st: [s])
+  }
+
+  # Parses the header of msg and starts the questions section.
+  pub def start!(msg: [Byte]) -> ~Header {
+    if st.size == 0 {
+      self.st = [ParserState.new()]
+    } else {
+      self.st[0] = ParserState.new()
+    }
+    self.st[0].msg = msg
+    self.st[0].off = self.st[0].header.unpack_wire!(msg, 0).rescue { |e| fail nest("unpacking header", e) }
+    self.st[0].section = SECTION_QUESTIONS
+    self.st[0].header.header
+  }
+
+  def started! -> ~Unit {
+    fail DnsMessageError.NotStarted if st.size == 0
+  }
+
+  # The next question (SectionDone after the last).
+  pub def question! -> ~Question {
+    self.~started!
+    self.st[0].~question!
+  }
+
+  # All the remaining questions.
+  pub def all_questions! -> ~[Question] {
+    qs: [Question] = []
+    loop {
+      r = self.question!
+      if e = r.err {
+        return qs if section_done?(e)
+        fail e
+      }
+      qs << r.unwrap
+    }
+    qs
+  }
+
+  pub def skip_question! -> ~Unit {
+    self.~started!
+    self.st[0].~skip_question!
+  }
+
+  pub def skip_all_questions! -> ~Unit {
+    loop {
+      r = self.skip_question!
+      if e = r.err {
+        return if section_done?(e)
+        fail e
+      }
+    }
+  }
+
+  def resource_header!(sec: Int) -> ~ResourceHeader {
+    self.~started!
+    self.st[0].~resource_header!(sec)
+  }
+
+  def resource!(sec: Int) -> ~Resource {
+    self.~started!
+    self.st[0].~resource!(sec)
+  }
+
+  def skip_resource!(sec: Int) -> ~Unit {
+    self.~started!
+    self.st[0].~skip_resource!(sec)
+  }
+
+  def all_resources!(sec: Int) -> ~[Resource] {
+    rs: [Resource] = []
+    loop {
+      r = self.resource!(sec)
+      if e = r.err {
+        return rs if section_done?(e)
+        fail e
+      }
+      rs << r.unwrap
+    }
+    rs
+  }
+
+  def skip_all_resources!(sec: Int) -> ~Unit {
+    loop {
+      r = self.skip_resource!(sec)
+      if e = r.err {
+        return if section_done?(e)
+        fail e
+      }
+    }
+  }
+
+  # The next answer's header; its body is read with answer!'s typed
+  # counterparts (a_resource! ...) or skipped with skip_answer!.
+  pub def answer_header! -> ~ResourceHeader { self.~resource_header!(SECTION_ANSWERS) }
+  pub def answer! -> ~Resource { self.~resource!(SECTION_ANSWERS) }
+  pub def all_answers! -> ~[Resource] { self.~all_resources!(SECTION_ANSWERS) }
+  pub def skip_answer! -> ~Unit { self.~skip_resource!(SECTION_ANSWERS) }
+  pub def skip_all_answers! -> ~Unit { self.~skip_all_resources!(SECTION_ANSWERS) }
+
+  pub def authority_header! -> ~ResourceHeader { self.~resource_header!(SECTION_AUTHORITIES) }
+  pub def authority! -> ~Resource { self.~resource!(SECTION_AUTHORITIES) }
+  pub def all_authorities! -> ~[Resource] { self.~all_resources!(SECTION_AUTHORITIES) }
+  pub def skip_authority! -> ~Unit { self.~skip_resource!(SECTION_AUTHORITIES) }
+  pub def skip_all_authorities! -> ~Unit { self.~skip_all_resources!(SECTION_AUTHORITIES) }
+
+  pub def additional_header! -> ~ResourceHeader { self.~resource_header!(SECTION_ADDITIONALS) }
+  pub def additional! -> ~Resource { self.~resource!(SECTION_ADDITIONALS) }
+  pub def all_additionals! -> ~[Resource] { self.~all_resources!(SECTION_ADDITIONALS) }
+  pub def skip_additional! -> ~Unit { self.~skip_resource!(SECTION_ADDITIONALS) }
+  pub def skip_all_additionals! -> ~Unit { self.~skip_all_resources!(SECTION_ADDITIONALS) }
+
+  def expect!(t: U16) -> ~Unit {
+    self.~started!
+    self.st[0].~expect!(t)
+  }
+
+  # The body of the resource whose header was just read, if it is a CNAME.
+  pub def cname_resource! -> ~CNAMEResource {
+    self.~expect!(TYPE_CNAME)
+    r = ~unpack_cname_resource(st[0].msg, st[0].off)
+    self.st[0].body_read!
+    r
+  }
+
+  pub def mx_resource! -> ~MXResource {
+    self.~expect!(TYPE_MX)
+    r = ~unpack_mx_resource(st[0].msg, st[0].off)
+    self.st[0].body_read!
+    r
+  }
+
+  pub def ns_resource! -> ~NSResource {
+    self.~expect!(TYPE_NS)
+    r = ~unpack_ns_resource(st[0].msg, st[0].off)
+    self.st[0].body_read!
+    r
+  }
+
+  pub def ptr_resource! -> ~PTRResource {
+    self.~expect!(TYPE_PTR)
+    r = ~unpack_ptr_resource(st[0].msg, st[0].off)
+    self.st[0].body_read!
+    r
+  }
+
+  pub def soa_resource! -> ~SOAResource {
+    self.~expect!(TYPE_SOA)
+    r = ~unpack_soa_resource(st[0].msg, st[0].off)
+    self.st[0].body_read!
+    r
+  }
+
+  pub def txt_resource! -> ~TXTResource {
+    self.~expect!(TYPE_TXT)
+    r = ~unpack_txt_resource(st[0].msg, st[0].off, st[0].res_header_length)
+    self.st[0].body_read!
+    r
+  }
+
+  pub def srv_resource! -> ~SRVResource {
+    self.~expect!(TYPE_SRV)
+    r = ~unpack_srv_resource(st[0].msg, st[0].off)
+    self.st[0].body_read!
+    r
+  }
+
+  pub def a_resource! -> ~AResource {
+    self.~expect!(TYPE_A)
+    r = ~unpack_a_resource(st[0].msg, st[0].off)
+    self.st[0].body_read!
+    r
+  }
+
+  pub def aaaa_resource! -> ~AAAAResource {
+    self.~expect!(TYPE_AAAA)
+    r = ~unpack_aaaa_resource(st[0].msg, st[0].off)
+    self.st[0].body_read!
+    r
+  }
+
+  pub def opt_resource! -> ~OPTResource {
+    self.~expect!(TYPE_OPT)
+    r = ~unpack_opt_resource(st[0].msg, st[0].off, st[0].res_header_length)
+    self.st[0].body_read!
+    r
+  }
+
+  pub def svcb_resource! -> ~SVCBResource {
+    self.~expect!(TYPE_SVCB)
+    r = ~unpack_svcb_resource(st[0].msg, st[0].off, st[0].res_header_length)
+    self.st[0].body_read!
+    r
+  }
+
+  pub def https_resource! -> ~HTTPSResource {
+    self.~expect!(TYPE_HTTPS)
+    r = ~unpack_svcb_resource(st[0].msg, st[0].off, st[0].res_header_length)
+    self.st[0].body_read!
+    r.https_resource
+  }
+
+  # The body of the resource whose header was just read, whatever its type.
+  pub def unknown_resource! -> ~UnknownResource {
+    self.~started!
+    fail DnsMessageError.NotStarted if !st[0].res_header_valid
+    r = ~unpack_unknown_resource(st[0].res_header_type, st[0].msg, st[0].off, st[0].res_header_length)
+    self.st[0].body_read!
+    r
+  }
+}
+
+# ----------------------------------------------------------------- message
+
+# A DNS message.
+pub struct Message {
+  header: Header
+  questions: [Question]
+  answers: [Resource]
+  authorities: [Resource]
+  additionals: [Resource]
+
+  # Parses a full message into self (Go's Message.Unpack).
+  pub def unpack!(msg: [Byte]) -> ~Unit {
+    p = Parser.new()
+    self.header = p.~start!(msg)
+    self.questions = p.~all_questions!
+    self.answers = p.~all_answers!
+    self.authorities = p.~all_authorities!
+    self.additionals = p.~all_additionals!
+  }
+
+  # The message in wire format.
+  pub def pack -> ~[Byte] {
+    b: [Byte] = []
+    self.~append_pack(b)
+  }
+
+  # Appends the message in wire format to b.
+  pub def append_pack(b: [Byte]) -> ~[Byte] {
+    fail DnsMessageError.TooManyQuestions if questions.size > 65535
+    fail DnsMessageError.TooManyAnswers if answers.size > 65535
+    fail DnsMessageError.TooManyAuthorities if authorities.size > 65535
+    fail DnsMessageError.TooManyAdditionals if additionals.size > 65535
+    h = WireHeader.new(
+      id: header.id,
+      bits: header.pack_bits,
+      questions: questions.size.as_u16,
+      answers: answers.size.as_u16,
+      authorities: authorities.size.as_u16,
+      additionals: additionals.size.as_u16,
+    )
+    comp_off = b.size
+    msg = h.pack_wire(b)
+    comp: Map[Str, U16]? = {}
+    for q in questions {
+      msg = q.pack_q(msg, comp, comp_off).rescue { |e|
+        fail nest("packing Question", e)
+        []
+      }
+    }
+    for r in answers {
+      msg = r.pack_res(msg, comp, comp_off).rescue { |e|
+        fail nest("packing Answer", e)
+        []
+      }
+    }
+    for r in authorities {
+      msg = r.pack_res(msg, comp, comp_off).rescue { |e|
+        fail nest("packing Authority", e)
+        []
+      }
+    }
+    for r in additionals {
+      msg = r.pack_res(msg, comp, comp_off).rescue { |e|
+        fail nest("packing Additional", e)
+        []
+      }
+    }
+    msg
+  }
+
+  pub def go_string -> Str {
+    s = "dnsmessage.Message{Header: " + header.go_string + ", " +
+      "Questions: []dnsmessage.Question{"
+    s += join_go(questions.map { it.go_string })
+    s += "}, Answers: []dnsmessage.Resource{"
+    s += join_go(answers.map { it.go_string })
+    s += "}, Authorities: []dnsmessage.Resource{"
+    s += join_go(authorities.map { it.go_string })
+    s += "}, Additionals: []dnsmessage.Resource{"
+    s += join_go(additionals.map { it.go_string })
+    s + "}}"
+  }
+}
+
+# Parses a full message (Go's Message.Unpack).
+pub def unpack_message(msg: [Byte]) -> ~Message {
+  m = Message.new()
+  m.~unpack!(msg)
+  m
+}
+
+# ----------------------------------------------------------------- builder
+
+# Builds a DNS message section by section (Go's Builder).
+pub struct Builder {
+  msg: [Byte]
+  section: Int
+  header: WireHeader
+  start: Int
+  compression: Map[Str, U16]?
+
+  # Turns on name compression.
+  pub def enable_compression! {
+    c: Map[Str, U16] = {}
+    self.compression = c
+  }
+
+  def start_check(s: Int) -> ~Unit {
+    fail DnsMessageError.NotStarted if section <= SECTION_NOT_STARTED
+    fail DnsMessageError.SectionDone if section > s
+  }
+
+  pub def start_questions! -> ~Unit {
+    ~start_check(SECTION_QUESTIONS)
+    self.section = SECTION_QUESTIONS
+  }
+
+  pub def start_answers! -> ~Unit {
+    ~start_check(SECTION_ANSWERS)
+    self.section = SECTION_ANSWERS
+  }
+
+  pub def start_authorities! -> ~Unit {
+    ~start_check(SECTION_AUTHORITIES)
+    self.section = SECTION_AUTHORITIES
+  }
+
+  pub def start_additionals! -> ~Unit {
+    ~start_check(SECTION_ADDITIONALS)
+    self.section = SECTION_ADDITIONALS
+  }
+
+  def increment_section_count! -> ~Unit {
+    if section == SECTION_QUESTIONS {
+      fail DnsMessageError.TooManyQuestions if header.questions == 65535
+      self.header.questions += 1
+    } else if section == SECTION_ANSWERS {
+      fail DnsMessageError.TooManyAnswers if header.answers == 65535
+      self.header.answers += 1
+    } else if section == SECTION_AUTHORITIES {
+      fail DnsMessageError.TooManyAuthorities if header.authorities == 65535
+      self.header.authorities += 1
+    } else if section == SECTION_ADDITIONALS {
+      fail DnsMessageError.TooManyAdditionals if header.additionals == 65535
+      self.header.additionals += 1
+    }
+    return
+  }
+
+  # Adds a question (in the questions section).
+  pub def question!(q: Question) -> ~Unit {
+    fail DnsMessageError.NotStarted if section < SECTION_QUESTIONS
+    fail DnsMessageError.SectionDone if section > SECTION_QUESTIONS
+    m = q.~pack_q(msg, compression, start)
+    self.~increment_section_count!
+    self.msg = m
+  }
+
+  def check_resource_section -> ~Unit {
+    fail DnsMessageError.NotStarted if section < SECTION_ANSWERS
+    fail DnsMessageError.SectionDone if section > SECTION_ADDITIONALS
+  }
+
+  # Adds a resource; what names the body in errors ("AResource body").
+  def add_resource!(hdr: ResourceHeader, body: ResourceBody, what: Str) -> ~Unit {
+    ~check_resource_section
+    h = hdr
+    h.type = body.real_type
+    m = h.pack_rh(msg, compression, start).rescue { |e|
+      fail nest("ResourceHeader", e)
+      []
+    }
+    len_off = m.size - 2
+    pre_len = m.size
+    m = body.pack_body(m, compression, start).rescue { |e|
+      fail nest(what, e)
+      []
+    }
+    h.~fix_len!(m, len_off, pre_len)
+    self.~increment_section_count!
+    self.msg = m
+  }
+
+  pub def cname_resource!(h: ResourceHeader, r: CNAMEResource) -> ~Unit { self.~add_resource!(h, r.body, "CNAMEResource body") }
+  pub def mx_resource!(h: ResourceHeader, r: MXResource) -> ~Unit { self.~add_resource!(h, r.body, "MXResource body") }
+  pub def ns_resource!(h: ResourceHeader, r: NSResource) -> ~Unit { self.~add_resource!(h, r.body, "NSResource body") }
+  pub def ptr_resource!(h: ResourceHeader, r: PTRResource) -> ~Unit { self.~add_resource!(h, r.body, "PTRResource body") }
+  pub def soa_resource!(h: ResourceHeader, r: SOAResource) -> ~Unit { self.~add_resource!(h, r.body, "SOAResource body") }
+  pub def txt_resource!(h: ResourceHeader, r: TXTResource) -> ~Unit { self.~add_resource!(h, r.body, "TXTResource body") }
+  pub def srv_resource!(h: ResourceHeader, r: SRVResource) -> ~Unit { self.~add_resource!(h, r.body, "SRVResource body") }
+  pub def a_resource!(h: ResourceHeader, r: AResource) -> ~Unit { self.~add_resource!(h, r.body, "AResource body") }
+  pub def aaaa_resource!(h: ResourceHeader, r: AAAAResource) -> ~Unit { self.~add_resource!(h, r.body, "AAAAResource body") }
+  pub def opt_resource!(h: ResourceHeader, r: OPTResource) -> ~Unit { self.~add_resource!(h, r.body, "OPTResource body") }
+  pub def unknown_resource!(h: ResourceHeader, r: UnknownResource) -> ~Unit { self.~add_resource!(h, r.body, "UnknownResource body") }
+  pub def svcb_resource!(h: ResourceHeader, r: SVCBResource) -> ~Unit { self.~add_resource!(h, r.body, "ResourceBody") }
+  pub def https_resource!(h: ResourceHeader, r: HTTPSResource) -> ~Unit { self.~add_resource!(h, r.body, "ResourceBody") }
+
+  # Writes the header counts and returns the message.
+  pub def finish! -> ~[Byte] {
+    fail DnsMessageError.NotStarted if section < SECTION_HEADER
+    self.section = SECTION_DONE
+    hb: [Byte] = []
+    hb = header.pack_wire(hb)
+    copy(self.msg[start...start + HEADER_LEN], hb)
+    msg
+  }
+}
+
+# A Builder appending to buf, with header h (Go's NewBuilder).
+pub def new_builder(buf: [Byte], h: Header) -> Builder {
+  b = Builder.new(msg: buf, start: buf.size)
+  b.header.id = h.id
+  b.header.bits = h.pack_bits
+  hb: [Byte] = [0; 12]
+  b.msg = b.msg + hb
+  b.section = SECTION_HEADER
+  b
+}
+
+# --------------------------------------------------------- resource header
+
+# A resource record's header.
+pub struct ResourceHeader {
+  # The domain name the record is for.
+  name: Name
+  # The record type; packing sets it from the body.
+  type: U16
+  class: U16
+  ttl: U32
+  # The length of the data after the header; packing sets it.
+  length: U16
+
+  pub def go_string -> Str {
+    "dnsmessage.ResourceHeader{" +
+      "Name: " + name.go_string + ", " +
+      "Type: " + type_go_string(type) + ", " +
+      "Class: " + class_go_string(class) + ", " +
+      "TTL: " + print_u32(ttl) + ", " +
+      "Length: " + print_u16(length) + "}"
+  }
+
+  # Packs the header. Its Length field is the last 2 bytes (Go also
+  # returns their offset).
+  def pack_rh(msg: [Byte], comp: Map[Str, U16]?, comp_off: Int) -> ~[Byte] {
+    out = name.pack_name(msg, comp, comp_off).rescue { |e|
+      fail nest("Name", e)
+      []
+    }
+    out = pack_u16(out, type)
+    out = pack_u16(out, class)
+    out = pack_u32(out, ttl)
+    pack_u16(out, length)
+  }
+
+  def unpack_rh!(msg: [Byte], off: Int) -> ~Int {
+    o = self.name.unpack_name!(msg, off).rescue { |e| fail nest("Name", e) }
+    t = unpack_u16(msg, o).rescue { |e| fail nest("Type", e) }
+    o = o + 2
+    self.type = t
+    c = unpack_u16(msg, o).rescue { |e| fail nest("Class", e) }
+    o = o + 2
+    self.class = c
+    ttl_v = unpack_u32(msg, o).rescue { |e| fail nest("TTL", e) }
+    o = o + 4
+    self.ttl = ttl_v
+    l = unpack_u16(msg, o).rescue { |e| fail nest("Length", e) }
+    o = o + 2
+    self.length = l
+    o
+  }
+
+  # Writes the length of the data packed after pre_len into the Length
+  # field at len_off.
+  def fix_len!(msg: [Byte], len_off: Int, pre_len: Int) -> ~Unit {
+    con_len = msg.size - pre_len
+    fail DnsMessageError.ResTooLong if con_len > 65535
+    msg[len_off] = (con_len >> 8).as_u8
+    msg[len_off + 1] = con_len.as_u8
+    self.length = con_len.as_u16
+  }
+
+  # Makes this the header of an EDNS(0) OPT resource (RFC 6891 6.1.2).
+  pub def set_edns0!(udp_payload_len: Int, ext_rcode: U16, dnssec_ok: Bool) -> ~Unit {
+    n = Name.new(length: 1)
+    n.data[0] = 46
+    self.name = n
+    self.type = TYPE_OPT
+    self.class = udp_payload_len.as_u16
+    self.ttl = ext_rcode.as_u32 >> 4 << 24
+    self.ttl = ttl | EDNS0_DNSSEC_OK if dnssec_ok
+  }
+
+  # Whether the DNSSEC OK bit is set (RFC 6891 6.1.3).
+  pub def dnssec_allowed? -> Bool { ttl & EDNS0_DNSSEC_OK_MASK == EDNS0_DNSSEC_OK }
+
+  # The extended RCode from this OPT header and the message's rcode.
+  pub def extended_rcode(rcode: U16) -> U16 {
+    return (ttl >> 24 << 4).as_u16 | rcode if ttl & EDNS_VERSION_MASK == EDNS0_VERSION
+    rcode
+  }
+}
+
+EDNS0_VERSION: U32 = 0
+EDNS0_DNSSEC_OK: U32 = 0x00008000
+EDNS_VERSION_MASK: U32 = 0x00ff0000
+EDNS0_DNSSEC_OK_MASK: U32 = 0x00ff8000
+
+def skip_resource(msg: [Byte], off: Int) -> ~Int {
+  o = skip_name(msg, off).rescue { |e| fail nest("Name", e) }
+  o = skip_u16(msg, o).rescue { |e| fail nest("Type", e) }
+  o = skip_u16(msg, o).rescue { |e| fail nest("Class", e) }
+  o = skip_u32(msg, o).rescue { |e| fail nest("TTL", e) }
+  length = unpack_u16(msg, o).rescue { |e| fail nest("Length", e) }
+  o = o + 2
+  o += length.to_i
+  fail DnsMessageError.ResourceLen if o > msg.size
+  o
+}
+
+# ------------------------------------------------------------ wire helpers
+
+def pack_u16(msg: [Byte], field: U16) -> [Byte] {
+  out = msg
+  out << (field >> 8).as_u8
+  out << field.as_u8
+  out
+}
+
+# The U16 at off (the caller advances by 2).
+def unpack_u16(msg: [Byte], off: Int) -> ~U16 {
+  fail DnsMessageError.BaseLen if off + 2 > msg.size
+  msg[off].as_u16 << 8 | msg[off + 1].as_u16
+}
+
+def skip_u16(msg: [Byte], off: Int) -> ~Int {
+  fail DnsMessageError.BaseLen if off + 2 > msg.size
+  off + 2
+}
+
+def pack_u32(msg: [Byte], field: U32) -> [Byte] {
+  out = msg
+  out << (field >> 24).as_u8
+  out << (field >> 16).as_u8
+  out << (field >> 8).as_u8
+  out << field.as_u8
+  out
+}
+
+# The U32 at off (the caller advances by 4).
+def unpack_u32(msg: [Byte], off: Int) -> ~U32 {
+  fail DnsMessageError.BaseLen if off + 4 > msg.size
+  v = msg[off].as_u32 << 24 | msg[off + 1].as_u32 << 16 | msg[off + 2].as_u32 << 8 | msg[off + 3].as_u32
+  v
+}
+
+def skip_u32(msg: [Byte], off: Int) -> ~Int {
+  fail DnsMessageError.BaseLen if off + 4 > msg.size
+  off + 4
+}
+
+def pack_text(msg: [Byte], field: Str) -> ~[Byte] {
+  fail DnsMessageError.StringTooLong if field.size > 255
+  out = msg
+  out << field.size.as_u8
+  out + field.bytes
+}
+
+# The character string at off (the caller advances by its size + 1).
+def unpack_text(msg: [Byte], off: Int) -> ~Str {
+  fail DnsMessageError.BaseLen if off >= msg.size
+  begin_off = off + 1
+  end_off = begin_off + msg[off].to_i
+  fail DnsMessageError.CalcLen if end_off > msg.size
+  Str.from_bytes(msg[begin_off...end_off])
+}
+
+# n bytes of msg at off, copied (Go's unpackBytes into a field).
+def unpack_bytes(msg: [Byte], off: Int, n: Int) -> ~[Byte] {
+  fail DnsMessageError.BaseLen if off + n > msg.size
+  out: [Byte] = [0; n]
+  copy(out, msg[off...off + n])
+  out
+}
+
+# -------------------------------------------------------------------- name
+
+NON_ENCODED_NAME_MAX = 254
+
+# A domain name: Go's Name, a fixed 255-byte array and a length.
+pub struct Name {
+  data: [Byte; 255]
+  length: U8
+
+  # The name as text (Go's String).
+  pub def to_s -> Str { Str.from_bytes(data[0...length.to_i]) }
+
+  pub def go_string -> Str {
+    "dnsmessage.MustNewName(\"" + print_string(data[0...length.to_i]) + "\")"
+  }
+
+  # Packs the name, compressed with comp (Go's nil map: none).
+  def pack_name(msg: [Byte], comp: Map[Str, U16]?, comp_off: Int) -> ~[Byte] {
+    fail DnsMessageError.NameTooLong if length > NON_ENCODED_NAME_MAX
+    n = length.to_i
+    fail DnsMessageError.NonCanonicalName if n == 0 || data[n - 1] != 46
+    out = msg
+    # Root name.
+    if data[0] == 46 && n == 1 {
+      out << 0
+      return out
+    }
+    name_as_str = ""
+    begin = 0
+    for i in 0...n {
+      if data[i] == 46 {
+        fail DnsMessageError.SegTooLong if i - begin >= 64
+        fail DnsMessageError.ZeroSegLen if i - begin == 0
+        out << (i - begin).as_u8
+        for j in begin...i {
+          out << data[j]
+        }
+        begin = i + 1
+        next
+      }
+      if i == 0 || data[i - 1] == 46 {
+        if c = comp {
+          if ptr = c[Str.from_bytes(data[i...n])] {
+            out << (ptr >> 8 | 0xC0).as_u8
+            out << ptr.as_u8
+            return out
+          }
+          new_ptr = out.size - comp_off
+          if new_ptr <= 0x3FFF {
+            name_as_str = Str.from_bytes(data[0...n]) if name_as_str == ""
+            c[name_as_str[i...n]] = new_ptr.as_u16
+          }
+        }
+      }
+    }
+    out << 0
+    out
+  }
+
+  # Reads a (possibly compressed) name at off; returns the offset after it.
+  def unpack_name!(msg: [Byte], off: Int) -> ~Int {
+    curr = off
+    new_off = off
+    ptr = 0
+    nlen = 0
+    loop {
+      fail DnsMessageError.BaseLen if curr >= msg.size
+      c = msg[curr].to_i
+      curr += 1
+      kind = c & 0xC0
+      if kind == 0x00 {
+        # A label.
+        break if c == 0
+        end_off = curr + c
+        fail DnsMessageError.CalcLen if end_off > msg.size
+        for j in curr...end_off {
+          fail DnsMessageError.InvalidName if msg[j] == 46
+        }
+        fail DnsMessageError.NameTooLong if nlen + (end_off - curr) >= NON_ENCODED_NAME_MAX
+        for j in curr...end_off {
+          self.data[nlen] = msg[j]
+          nlen += 1
+        }
+        self.data[nlen] = 46
+        nlen += 1
+        curr = end_off
+      } else if kind == 0xC0 {
+        # A pointer.
+        fail DnsMessageError.InvalidPtr if curr >= msg.size
+        c1 = msg[curr].to_i
+        curr += 1
+        new_off = curr if ptr == 0
+        ptr += 1
+        fail DnsMessageError.TooManyPtr if ptr > 10
+        curr = (c ^ 0xC0) << 8 | c1
+      } else {
+        fail DnsMessageError.Reserved
+      }
+    }
+    if nlen == 0 {
+      self.data[0] = 46
+      nlen = 1
+    }
+    self.length = nlen.as_u8
+    new_off = curr if ptr == 0
+    new_off
+  }
+}
+
+# A Name from text, which must be at most 255 bytes (Go's NewName).
+pub def new_name(name: Str) -> ~Name {
+  n = Name.new(length: name.size.as_u8)
+  fail DnsMessageError.CalcLen if name.size > 255
+  for i in 0...name.size {
+    n.data[i] = name[i]
+  }
+  n
+}
+
+# new_name, panicking on error (Go's MustNewName).
+pub def must_new_name(name: Str) -> Name {
+  r = new_name(name)
+  if e = r.err {
+    panic("creating name: " + e.message)
+  }
+  r.unwrap
+}
+
+def skip_name(msg: [Byte], off: Int) -> ~Int {
+  new_off = off
+  loop {
+    fail DnsMessageError.BaseLen if new_off >= msg.size
+    c = msg[new_off].to_i
+    new_off += 1
+    kind = c & 0xC0
+    if kind == 0x00 {
+      break if c == 0
+      new_off += c
+      fail DnsMessageError.CalcLen if new_off > msg.size
+    } else if kind == 0xC0 {
+      new_off += 1
+      break
+    } else {
+      fail DnsMessageError.Reserved
+    }
+  }
+  new_off
+}
+
+# ---------------------------------------------------------------- question
+
+# A DNS question.
+pub struct Question {
+  name: Name
+  type: U16
+  class: U16
+
+  def pack_q(msg: [Byte], comp: Map[Str, U16]?, comp_off: Int) -> ~[Byte] {
+    out = name.pack_name(msg, comp, comp_off).rescue { |e|
+      fail nest("Name", e)
+      []
+    }
+    out = pack_u16(out, type)
+    pack_u16(out, class)
+  }
+
+  pub def go_string -> Str {
+    "dnsmessage.Question{" +
+      "Name: " + name.go_string + ", " +
+      "Type: " + type_go_string(type) + ", " +
+      "Class: " + class_go_string(class) + "}"
+  }
+}
+
+# Reads the body of a resource with header hdr at off; returns it and the
+# offset after it.
+def unpack_resource_body(msg: [Byte], off: Int, hdr: ResourceHeader) -> ~(ResourceBody, Int) {
+  name = case hdr.type {
+    TYPE_A => "A"
+    TYPE_NS => "NS"
+    TYPE_CNAME => "CNAME"
+    TYPE_SOA => "SOA"
+    TYPE_PTR => "PTR"
+    TYPE_MX => "MX"
+    TYPE_TXT => "TXT"
+    TYPE_AAAA => "AAAA"
+    TYPE_SRV => "SRV"
+    TYPE_SVCB => "SVCB"
+    TYPE_HTTPS => "HTTPS"
+    TYPE_OPT => "OPT"
+    _ => "Unknown"
+  }
+  body = unpack_body(msg, off, hdr).rescue { |e|
+    fail nest(name + " record", e)
+    ResourceBody.Nil
+  }
+  (body, off + hdr.length.to_i)
+}
+
+def unpack_body(msg: [Byte], off: Int, hdr: ResourceHeader) -> ~ResourceBody {
+  case hdr.type {
+    TYPE_A => {
+      r = ~unpack_a_resource(msg, off)
+      r.body
+    }
+    TYPE_NS => {
+      r = ~unpack_ns_resource(msg, off)
+      r.body
+    }
+    TYPE_CNAME => {
+      r = ~unpack_cname_resource(msg, off)
+      r.body
+    }
+    TYPE_SOA => {
+      r = ~unpack_soa_resource(msg, off)
+      r.body
+    }
+    TYPE_PTR => {
+      r = ~unpack_ptr_resource(msg, off)
+      r.body
+    }
+    TYPE_MX => {
+      r = ~unpack_mx_resource(msg, off)
+      r.body
+    }
+    TYPE_TXT => {
+      r = ~unpack_txt_resource(msg, off, hdr.length)
+      r.body
+    }
+    TYPE_AAAA => {
+      r = ~unpack_aaaa_resource(msg, off)
+      r.body
+    }
+    TYPE_SRV => {
+      r = ~unpack_srv_resource(msg, off)
+      r.body
+    }
+    TYPE_SVCB => {
+      r = ~unpack_svcb_resource(msg, off, hdr.length)
+      r.body
+    }
+    TYPE_HTTPS => {
+      r = ~unpack_svcb_resource(msg, off, hdr.length)
+      r.https_resource.body
+    }
+    TYPE_OPT => {
+      r = ~unpack_opt_resource(msg, off, hdr.length)
+      r.body
+    }
+    _ => {
+      r = ~unpack_unknown_resource(hdr.type, msg, off, hdr.length)
+      r.body
+    }
+  }
+}
+
+# ---------------------------------------------------------- resource types
+
+# A CNAME resource body.
+pub struct CNAMEResource {
+  cname: Name
+
+  pub def real_type -> U16 { TYPE_CNAME }
+  pub def body -> ResourceBody { ResourceBody.CNAME(cname: cname) }
+
+  def pack_rdata(msg: [Byte], comp: Map[Str, U16]?, comp_off: Int) -> ~[Byte] {
+    cname.~pack_name(msg, comp, comp_off)
+  }
+
+  pub def go_string -> Str { "dnsmessage.CNAMEResource{CNAME: " + cname.go_string + "}" }
+}
+
+def unpack_cname_resource(msg: [Byte], off: Int) -> ~CNAMEResource {
+  cname = Name.new()
+  cname.~unpack_name!(msg, off)
+  CNAMEResource.new(cname: cname)
+}
+
+# An MX resource body.
+pub struct MXResource {
+  pref: U16
+  mx: Name
+
+  pub def real_type -> U16 { TYPE_MX }
+  pub def body -> ResourceBody { ResourceBody.MX(pref: pref, mx: mx) }
+
+  def pack_rdata(msg: [Byte], comp: Map[Str, U16]?, comp_off: Int) -> ~[Byte] {
+    out = pack_u16(msg, pref)
+    mx.pack_name(out, comp, comp_off).rescue { |e|
+      fail nest("MXResource.MX", e)
+      []
+    }
+  }
+
+  pub def go_string -> Str {
+    "dnsmessage.MXResource{" +
+      "Pref: " + print_u16(pref) + ", " +
+      "MX: " + mx.go_string + "}"
+  }
+}
+
+def unpack_mx_resource(msg: [Byte], off: Int) -> ~MXResource {
+  pref = unpack_u16(msg, off).rescue { |e| fail nest("Pref", e) }
+  o = off + 2
+  mx = Name.new()
+  mx.unpack_name!(msg, o).rescue { |e| fail nest("MX", e) }
+  MXResource.new(pref: pref, mx: mx)
+}
+
+# An NS resource body.
+pub struct NSResource {
+  ns: Name
+
+  pub def real_type -> U16 { TYPE_NS }
+  pub def body -> ResourceBody { ResourceBody.NS(ns: ns) }
+
+  def pack_rdata(msg: [Byte], comp: Map[Str, U16]?, comp_off: Int) -> ~[Byte] {
+    ns.~pack_name(msg, comp, comp_off)
+  }
+
+  pub def go_string -> Str { "dnsmessage.NSResource{NS: " + ns.go_string + "}" }
+}
+
+def unpack_ns_resource(msg: [Byte], off: Int) -> ~NSResource {
+  ns = Name.new()
+  ns.~unpack_name!(msg, off)
+  NSResource.new(ns: ns)
+}
+
+# A PTR resource body.
+pub struct PTRResource {
+  ptr: Name
+
+  pub def real_type -> U16 { TYPE_PTR }
+  pub def body -> ResourceBody { ResourceBody.PTR(ptr: ptr) }
+
+  def pack_rdata(msg: [Byte], comp: Map[Str, U16]?, comp_off: Int) -> ~[Byte] {
+    ptr.~pack_name(msg, comp, comp_off)
+  }
+
+  pub def go_string -> Str { "dnsmessage.PTRResource{PTR: " + ptr.go_string + "}" }
+}
+
+def unpack_ptr_resource(msg: [Byte], off: Int) -> ~PTRResource {
+  ptr = Name.new()
+  ptr.~unpack_name!(msg, off)
+  PTRResource.new(ptr: ptr)
+}
+
+# An SOA resource body.
+pub struct SOAResource {
+  ns: Name
+  mbox: Name
+  serial: U32
+  refresh: U32
+  retry: U32
+  expire: U32
+  # The negative-caching TTL (RFC 2308), Go's MinTTL.
+  min_ttl: U32
+
+  pub def real_type -> U16 { TYPE_SOA }
+
+  pub def body -> ResourceBody {
+    ResourceBody.SOA(ns: ns, mbox: mbox, serial: serial, refresh: refresh, retry: retry, expire: expire, min_ttl: min_ttl)
+  }
+
+  def pack_rdata(msg: [Byte], comp: Map[Str, U16]?, comp_off: Int) -> ~[Byte] {
+    out = ns.pack_name(msg, comp, comp_off).rescue { |e|
+      fail nest("SOAResource.NS", e)
+      []
+    }
+    out = mbox.pack_name(out, comp, comp_off).rescue { |e|
+      fail nest("SOAResource.MBox", e)
+      []
+    }
+    out = pack_u32(out, serial)
+    out = pack_u32(out, refresh)
+    out = pack_u32(out, retry)
+    out = pack_u32(out, expire)
+    pack_u32(out, min_ttl)
+  }
+
+  pub def go_string -> Str {
+    "dnsmessage.SOAResource{" +
+      "NS: " + ns.go_string + ", " +
+      "MBox: " + mbox.go_string + ", " +
+      "Serial: " + print_u32(serial) + ", " +
+      "Refresh: " + print_u32(refresh) + ", " +
+      "Retry: " + print_u32(retry) + ", " +
+      "Expire: " + print_u32(expire) + ", " +
+      "MinTTL: " + print_u32(min_ttl) + "}"
+  }
+}
+
+def unpack_soa_resource(msg: [Byte], off: Int) -> ~SOAResource {
+  ns = Name.new()
+  o = ns.unpack_name!(msg, off).rescue { |e| fail nest("NS", e) }
+  mbox = Name.new()
+  o = mbox.unpack_name!(msg, o).rescue { |e| fail nest("MBox", e) }
+  serial = unpack_u32(msg, o).rescue { |e| fail nest("Serial", e) }
+  o = o + 4
+  refresh = unpack_u32(msg, o).rescue { |e| fail nest("Refresh", e) }
+  o = o + 4
+  retry = unpack_u32(msg, o).rescue { |e| fail nest("Retry", e) }
+  o = o + 4
+  expire = unpack_u32(msg, o).rescue { |e| fail nest("Expire", e) }
+  o = o + 4
+  min_ttl = unpack_u32(msg, o).rescue { |e| fail nest("MinTTL", e) }
+  _o = o + 4
+  SOAResource.new(ns: ns, mbox: mbox, serial: serial, refresh: refresh, retry: retry, expire: expire, min_ttl: min_ttl)
+}
+
+# A TXT resource body: character strings of at most 255 bytes each.
+pub struct TXTResource {
+  txt: [Str]
+
+  pub def real_type -> U16 { TYPE_TXT }
+  pub def body -> ResourceBody { ResourceBody.TXT(txt: txt) }
+
+  def pack_rdata(msg: [Byte]) -> ~[Byte] {
+    out = msg
+    for s in txt {
+      out = ~pack_text(out, s)
+    }
+    out
+  }
+
+  pub def go_string -> Str {
+    s = "dnsmessage.TXTResource{TXT: []string{"
+    return s + "}}" if txt.size == 0
+    s += "\"" + print_string(txt[0].bytes)
+    for t in txt[1...txt.size] {
+      s += "\", \"" + print_string(t.bytes)
+    }
+    s + "\"}}"
+  }
+}
+
+def unpack_txt_resource(msg: [Byte], off: Int, length: U16) -> ~TXTResource {
+  txts: [Str] = []
+  o = off
+  n: U16 = 0
+  while n < length {
+    t = unpack_text(msg, o).rescue { |e|
+      fail nest("text", e)
+      ""
+    }
+    o += t.size + 1
+    # Check that the string fits in the resource's length.
+    fail DnsMessageError.CalcLen if length - n < t.size.as_u16 + 1
+    n += t.size.as_u16 + 1
+    txts << t
+  }
+  TXTResource.new(txt: txts)
+}
+
+# An SRV resource body.
+pub struct SRVResource {
+  priority: U16
+  weight: U16
+  port: U16
+  # Not compressed (RFC 2782).
+  target: Name
+
+  pub def real_type -> U16 { TYPE_SRV }
+  pub def body -> ResourceBody { ResourceBody.SRV(priority: priority, weight: weight, port: port, target: target) }
+
+  def pack_rdata(msg: [Byte]) -> ~[Byte] {
+    out = pack_u16(msg, priority)
+    out = pack_u16(out, weight)
+    out = pack_u16(out, port)
+    target.pack_name(out, none, 0).rescue { |e|
+      fail nest("SRVResource.Target", e)
+      []
+    }
+  }
+
+  pub def go_string -> Str {
+    "dnsmessage.SRVResource{" +
+      "Priority: " + print_u16(priority) + ", " +
+      "Weight: " + print_u16(weight) + ", " +
+      "Port: " + print_u16(port) + ", " +
+      "Target: " + target.go_string + "}"
+  }
+}
+
+def unpack_srv_resource(msg: [Byte], off: Int) -> ~SRVResource {
+  priority = unpack_u16(msg, off).rescue { |e| fail nest("Priority", e) }
+  o = off + 2
+  weight = unpack_u16(msg, o).rescue { |e| fail nest("Weight", e) }
+  o = o + 2
+  port = unpack_u16(msg, o).rescue { |e| fail nest("Port", e) }
+  o = o + 2
+  target = Name.new()
+  target.unpack_name!(msg, o).rescue { |e| fail nest("Target", e) }
+  SRVResource.new(priority: priority, weight: weight, port: port, target: target)
+}
+
+# An A resource body: an IPv4 address.
+pub struct AResource {
+  a: [Byte; 4]
+
+  pub def real_type -> U16 { TYPE_A }
+  pub def body -> ResourceBody { ResourceBody.A(a: a) }
+
+  def pack_rdata(msg: [Byte]) -> ~[Byte] {
+    out = msg
+    for b in a {
+      out << b
+    }
+    out
+  }
+
+  pub def go_string -> Str {
+    "dnsmessage.AResource{" +
+      "A: [4]byte{" + print_byte_slice(a[0...4]) + "}}"
+  }
+}
+
+def unpack_a_resource(msg: [Byte], off: Int) -> ~AResource {
+  b = ~unpack_bytes(msg, off, 4)
+  a: [Byte; 4] = [b[0], b[1], b[2], b[3]]
+  AResource.new(a: a)
+}
+
+# An AAAA resource body: an IPv6 address.
+pub struct AAAAResource {
+  aaaa: [Byte; 16]
+
+  pub def real_type -> U16 { TYPE_AAAA }
+  pub def body -> ResourceBody { ResourceBody.AAAA(aaaa: aaaa) }
+
+  pub def go_string -> Str {
+    "dnsmessage.AAAAResource{" +
+      "AAAA: [16]byte{" + print_byte_slice(aaaa[0...16]) + "}}"
+  }
+
+  def pack_rdata(msg: [Byte]) -> ~[Byte] {
+    out = msg
+    for b in aaaa {
+      out << b
+    }
+    out
+  }
+}
+
+def unpack_aaaa_resource(msg: [Byte], off: Int) -> ~AAAAResource {
+  b = ~unpack_bytes(msg, off, 16)
+  aaaa: [Byte; 16] = [0; 16]
+  for i in 0...16 {
+    aaaa[i] = b[i]
+  }
+  AAAAResource.new(aaaa: aaaa)
+}
+
+# An OPT pseudo-resource body (RFC 6891).
+pub struct OPTResource {
+  options: [Option]
+
+  pub def real_type -> U16 { TYPE_OPT }
+  pub def body -> ResourceBody { ResourceBody.OPT(options: options) }
+
+  def pack_rdata(msg: [Byte]) -> ~[Byte] {
+    out = msg
+    for opt in options {
+      out = pack_u16(out, opt.code)
+      out = pack_u16(out, opt.data.size.as_u16)
+      out = out + opt.data
+    }
+    out
+  }
+
+  pub def go_string -> Str {
+    s = "dnsmessage.OPTResource{Options: []dnsmessage.Option{"
+    s + join_go(options.map { it.go_string }) + "}}"
+  }
+}
+
+# A DNS message option in an OPT resource (RFC 6891 6.1.2).
+pub struct Option {
+  code: U16
+  data: [Byte]
+
+  pub def go_string -> Str {
+    "dnsmessage.Option{" +
+      "Code: " + print_u16(code) + ", " +
+      "Data: []byte{" + print_byte_slice(data) + "}}"
+  }
+}
+
+def unpack_opt_resource(msg: [Byte], off: Int, length: U16) -> ~OPTResource {
+  opts: [Option] = []
+  o = off
+  end_off = off + length.to_i
+  while o < end_off {
+    code = unpack_u16(msg, o).rescue { |e| fail nest("Code", e) }
+    o2 = o + 2
+    l = unpack_u16(msg, o2).rescue { |e| fail nest("Data", e) }
+    o3 = o2 + 2
+    o = o3
+    fail nest("Data", DnsMessageError.CalcLen) if msg.size - o < l.to_i
+    data: [Byte] = [0; l.to_i]
+    copy(data, msg[o...o + l.to_i])
+    o += l.to_i
+    opts << Option.new(code: code, data: data)
+  }
+  OPTResource.new(options: opts)
+}
+
+# A resource body of a type this package has no struct for.
+pub struct UnknownResource {
+  type: U16
+  data: [Byte]
+
+  pub def real_type -> U16 { type }
+  pub def body -> ResourceBody { ResourceBody.Unknown(type: type, data: data) }
+
+  def pack_rdata(msg: [Byte]) -> ~[Byte] { msg + data }
+
+  pub def go_string -> Str {
+    "dnsmessage.UnknownResource{" +
+      "Type: " + type_go_string(type) + ", " +
+      "Data: []byte{" + print_byte_slice(data) + "}}"
+  }
+}
+
+def unpack_unknown_resource(record_type: U16, msg: [Byte], off: Int, length: U16) -> ~UnknownResource {
+  data = ~unpack_bytes(msg, off, length.to_i)
+  UnknownResource.new(type: record_type, data: data)
+}

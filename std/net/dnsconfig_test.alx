@@ -1,0 +1,170 @@
+# Go's dnsconfig_unix_test.go, translated.
+
+import "os"
+import "strings"
+
+struct WantConf {
+  name: Str
+  servers: [Str]
+  search: [Str]
+  ndots: Int
+  timeout_s: Int
+  attempts: Int
+  rotate: Bool
+  unknown_opt: Bool
+  lookup: [Str]
+  single_request: Bool
+  use_tcp: Bool
+}
+
+def want_conf(name: Str, servers: [Str], search: [Str]) -> WantConf {
+  WantConf.new(name: name, servers: servers, search: search, ndots: 1, timeout_s: 5, attempts: 2, lookup: [])
+}
+
+def dns_read_config_tests -> [WantConf] {
+  t1 = want_conf("testdata/resolv.conf", ["8.8.8.8:53", "[2001:4860:4860::8888]:53", "[fe80::1%lo0]:53"], ["localdomain."])
+  t1.ndots = 5
+  t1.timeout_s = 10
+  t1.attempts = 3
+  t1.rotate = true
+  # The "options attempts 3" line.
+  t1.unknown_opt = true
+  t5 = want_conf("testdata/empty-resolv.conf", DEFAULT_NS, ["domain.local."])
+  t6 = want_conf("testdata/invalid-ndots-resolv.conf", DEFAULT_NS, ["domain.local."])
+  t6.ndots = 0
+  t7 = want_conf("testdata/large-ndots-resolv.conf", DEFAULT_NS, ["domain.local."])
+  t7.ndots = 15
+  t8 = want_conf("testdata/negative-ndots-resolv.conf", DEFAULT_NS, ["domain.local."])
+  t8.ndots = 0
+  t9 = want_conf("testdata/openbsd-resolv.conf", ["169.254.169.254:53", "10.240.0.1:53"], ["c.symbolic-datum-552.internal."])
+  t9.lookup = ["file", "bind"]
+  t10 = want_conf("testdata/single-request-resolv.conf", DEFAULT_NS, ["domain.local."])
+  t10.single_request = true
+  t11 = want_conf("testdata/single-request-reopen-resolv.conf", DEFAULT_NS, ["domain.local."])
+  t11.single_request = true
+  t12 = want_conf("testdata/linux-use-vc-resolv.conf", DEFAULT_NS, ["domain.local."])
+  t12.use_tcp = true
+  t13 = want_conf("testdata/freebsd-usevc-resolv.conf", DEFAULT_NS, ["domain.local."])
+  t13.use_tcp = true
+  t14 = want_conf("testdata/openbsd-tcp-resolv.conf", DEFAULT_NS, ["domain.local."])
+  t14.use_tcp = true
+  [
+    t1,
+    want_conf("testdata/domain-resolv.conf", ["8.8.8.8:53"], ["localdomain."]),
+    want_conf("testdata/search-resolv.conf", ["8.8.8.8:53"], ["test.", "invalid."]),
+    want_conf("testdata/search-single-dot-resolv.conf", ["8.8.8.8:53"], []),
+    t5,
+    t6,
+    t7,
+    t8,
+    t9,
+    t10,
+    t11,
+    t12,
+    t13,
+    t14
+  ]
+}
+
+def check_conf(conf: DnsConfig, want: WantConf, search: [Str]) {
+  n = want.name
+  assert conf.servers == want.servers, "#{n}: servers #{conf.servers}; want #{want.servers}"
+  assert conf.search == search, "#{n}: search #{conf.search}; want #{search}"
+  assert conf.ndots == want.ndots, "#{n}: ndots #{conf.ndots}; want #{want.ndots}"
+  assert conf.timeout_ns == want.timeout_s * 1000000000, "#{n}: timeout #{conf.timeout_ns}"
+  assert conf.attempts == want.attempts, "#{n}: attempts #{conf.attempts}; want #{want.attempts}"
+  assert conf.rotate == want.rotate, "#{n}: rotate"
+  assert conf.unknown_opt == want.unknown_opt, "#{n}: unknown_opt"
+  assert conf.lookup == want.lookup, "#{n}: lookup #{conf.lookup}; want #{want.lookup}"
+  assert conf.single_request == want.single_request, "#{n}: single_request"
+  assert conf.use_tcp == want.use_tcp, "#{n}: use_tcp"
+  assert !conf.trust_ad, "#{n}: trust_ad"
+  assert !conf.no_reload, "#{n}: no_reload"
+}
+
+def with_hostname(name: Str, f: () -> Unit) {
+  HOSTNAME_OVERRIDE.store(name)
+  defer {
+    HOSTNAME_OVERRIDE.store("")
+    HOSTNAME_FAIL.store(false)
+  }
+  f.call
+}
+
+test "DNSReadConfig" {
+  with_hostname("host.domain.local", ->() {
+    for tt in dns_read_config_tests {
+      search = tt.search.size == 0 ? dns_default_search : tt.search
+      conf = dns_read_config(tt.name)
+      if e = conf.err {
+        assert false, "#{tt.name}: #{e.message}"
+      }
+      check_conf(conf, tt, search)
+    }
+  })
+}
+
+test "DNSReadMissingFile" {
+  with_hostname("host.domain.local", ->() {
+    conf = dns_read_config("a-nonexistent-file")
+    assert conf.err.present?, "missing resolv.conf: no error"
+    e = conf.err.unwrap
+    assert os.is_not_exist(e), "missing resolv.conf: got #{e.message}; want file does not exist"
+    check_conf(conf, want_conf("a-nonexistent-file", DEFAULT_NS, ["domain.local."]), ["domain.local."])
+    assert conf.default_ns
+  })
+}
+
+test "DNSDefaultSearch" {
+  tests: [(Str, Bool, [Str])] = [
+    ("host.long.domain.local", false, ["long.domain.local."]),
+    ("host.local", false, ["local."]),
+    ("host", false, []),
+    ("host.domain.local", true, []),
+    # Not [""], which would make duplicate lookups.
+    ("foo.", false, [])
+  ]
+  for tt in tests {
+    name, err, want = tt
+    with_hostname(name, ->() {
+      HOSTNAME_FAIL.store(err)
+      got = dns_default_search
+      assert got == want, "dns_default_search with hostname #{name} and error #{err} = #{got}, wanted #{want}"
+    })
+  }
+}
+
+test "DNSNameLength" {
+  with_hostname("host.domain.local", ->() {
+    char63 = strings.repeat("a", 63)
+    long_domain = strings.repeat(char63 + ".", 5) + "example"
+    for tt in dns_read_config_tests {
+      conf = dns_read_config(tt.name)
+      if e = conf.err {
+        assert false, e.message
+      }
+      suffix_list = tt.search.size == 0 ? dns_default_search : tt.search
+      shortest = 0
+      for suffix in suffix_list {
+        shortest = suffix.size if shortest == 0 || suffix.size < shortest
+      }
+      # A name that is maximally long with the shortest suffix (and the dot
+      # between).
+      long_name = long_domain[long_domain.size - 254 + 1 + shortest...long_domain.size]
+      if long_name[0] == 46 || long_name[1] == 46 {
+        long_name = "aa." + long_name[3...long_name.size]
+      }
+      for fqdn in name_list(conf, long_name) {
+        assert fqdn.size <= 254, "got #{fqdn.size}; want less than or equal to 254"
+      }
+      # A name too long for suffixing.
+      unsuffixable = "a." + long_name[1...long_name.size]
+      res = name_list(conf, unsuffixable)
+      assert res.size == 1, "suffixed names #{res}; want []"
+      # A name too long for DNS.
+      too_long = "a." + long_domain
+      res2 = name_list(conf, too_long)
+      assert res2.size == 0, "suffixed names #{res2}; want nil"
+    }
+  })
+}

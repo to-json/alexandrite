@@ -1,0 +1,1422 @@
+# Go's dnsclient_unix_test.go, translated. Go's fakeDNSServer implements
+# Conn; alx's Conn is a concrete type, so the fake server here is a task
+# answering on the far end of a pipe (packet_pipe for "udp"): it reads the
+# query, calls the handler `rh` and writes the answer, or closes the pipe
+# with the handler's error (close_with_error!), which the client's read
+# then returns.
+#
+# Not translated: the benchmarks.
+
+import "context"
+import "golang.org/x/net/dns/dnsmessage"
+import "os"
+import "strings"
+import "time"
+
+# 192.0.2.1, from 192.0.2.0/24 (RFC 5737, for documentation).
+def test_addr -> [Byte; 4] { [0xc0, 0x00, 0x02, 0x01] }
+
+# 2001:db8::1, from 2001:db8::/32 (RFC 3849, for documentation).
+def test_addr6 -> [Byte; 16] { [0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1] }
+
+def must_question(name: Str, qtype: U16, class: U16) -> dnsmessage.Question { dnsmessage.Question.new(name: dnsmessage.must_new_name(name), type: qtype, class: class) }
+
+# One connection to the fake server: its end, the client's end, the
+# network and server dialed, and whether it is a stream.
+struct FakeReq {
+  srv: Conn
+  cli: Conn
+  n: Str
+  s: Str
+  tcp: Bool
+}
+
+# Go's fakeDNSServer.DialContext: hands the server end of a new pipe to the
+# fake server's task.
+def fake_dial(reqs: Chan[FakeReq], always_tcp: Bool) -> ((context.Context, Str, Str) -> ~Conn) {
+  ->(ctx: context.Context, n: Str, s: Str) -> ~Conn {
+    tcp = always_tcp || n.start_with?("tcp")
+    c, srv = tcp ? pipe : packet_pipe
+    reqs << FakeReq.new(srv: srv, cli: c, n: n, s: s, tcp: tcp)
+    c
+  }
+}
+
+# The fake server's task: answers each connection with rh(network, server,
+# query, the client's deadline in Unix ns) until reqs is closed.
+def fake_serve(rh: (Str, Str, dnsmessage.Message, Int) -> ~dnsmessage.Message, reqs: Chan[FakeReq]) {
+  loop {
+    req = reqs.recv || break
+    fake_answer(rh, req)
+  }
+}
+
+def fake_answer(rh: (Str, Str, dnsmessage.Message, Int) -> ~dnsmessage.Message, req: FakeReq) {
+  srv = req.srv
+  buf: [Byte] = [0; 65536]
+  r = srv.read!(buf)
+  return if r.err?
+  b = buf[0...r.unwrap]
+  b = b[2...b.size] if req.tcp && b.size >= 2
+  mr = dnsmessage.unpack_message(b)
+  if mr.err? {
+    srv.close_with_error!("err:cannot unmarshal DNS message fake #{req.n} (#{b.size})")
+    return
+  }
+  resp = rh.call(req.n, req.s, mr.unwrap, req.cli.pipe_read_deadline)
+  if e = resp.err {
+    srv.close_with_error!(fake_error_kind(e))
+    return
+  }
+  pr = resp.unwrap.pack
+  if e = pr.err {
+    srv.close_with_error!("err:cannot marshal DNS message: " + e.message)
+    return
+  }
+  bb = pr.unwrap
+  if req.tcp {
+    out: [Byte] = [(bb.size >> 8).to_u8, (bb.size & 0xff).to_u8]
+    srv.write!(out + bb)
+  } else {
+    srv.write!(bb)
+  }
+  srv.close!
+}
+
+def fake_error_kind(e: Error) -> Str {
+  case e {
+    NetError.Timeout => return "timeout"
+    NetError.Other(at) => {
+      return "op:" + at.err if at.op != ""
+    }
+    _ => nil
+  }
+  "err:" + e.message
+}
+
+# Go's os.ErrDeadlineExceeded, from a handler.
+def deadline_exceeded -> NetError { timeout_error("", "", "", "") }
+
+# A handler's answer that fails with deadline_exceeded.
+def timeout_answer -> ~dnsmessage.Message { fail deadline_exceeded }
+
+# A handler's failure (Go's fmt.Errorf).
+def fake_failure(text: Str) -> DnsClientError { client_error(text) }
+
+def hdr(id: U16) -> dnsmessage.Header { dnsmessage.Header.new(id: id, response: true) }
+
+def hdr_rcode(id: U16, rcode: U16) -> dnsmessage.Header { dnsmessage.Header.new(id: id, response: true, rcode: rcode) }
+
+def msg(h: dnsmessage.Header, qs: [dnsmessage.Question], answers: [dnsmessage.Resource]) -> dnsmessage.Message { dnsmessage.Message.new(header: h, questions: qs, answers: answers, authorities: [], additionals: []) }
+
+def rhdr(name: dnsmessage.Name, t: U16, length: U16) -> dnsmessage.ResourceHeader { dnsmessage.ResourceHeader.new(name: name, type: t, class: dnsmessage.CLASS_INET, length: length) }
+
+def a_rr(name: dnsmessage.Name) -> dnsmessage.Resource { dnsmessage.Resource.new(header: rhdr(name, dnsmessage.TYPE_A, 4), body: dnsmessage.AResource.new(a: test_addr).body) }
+
+def aaaa_rr(name: dnsmessage.Name) -> dnsmessage.Resource { dnsmessage.Resource.new(header: rhdr(name, dnsmessage.TYPE_AAAA, 16), body: dnsmessage.AAAAResource.new(aaaa: test_addr6).body) }
+
+def txt_rr(name: dnsmessage.Name, t: U16, txt: [Str]) -> dnsmessage.Resource { dnsmessage.Resource.new(header: rhdr(name, t, 0), body: dnsmessage.TXTResource.new(txt: txt).body) }
+
+def ptr_rr(name: dnsmessage.Name, ptr: Str) -> dnsmessage.Resource { dnsmessage.Resource.new(header: rhdr(name, dnsmessage.TYPE_PTR, 4), body: dnsmessage.PTRResource.new(ptr: dnsmessage.must_new_name(ptr)).body) }
+
+def mx_rr(name: Str, mx: Str) -> dnsmessage.Resource { dnsmessage.Resource.new(header: rhdr(dnsmessage.must_new_name(name), dnsmessage.TYPE_MX, 4), body: dnsmessage.MXResource.new(pref: 0, mx: dnsmessage.must_new_name(mx)).body) }
+
+def ns_rr(name: dnsmessage.Name, ns: Str) -> dnsmessage.Resource { dnsmessage.Resource.new(header: rhdr(name, dnsmessage.TYPE_NS, 4), body: dnsmessage.NSResource.new(ns: dnsmessage.must_new_name(ns)).body) }
+
+def srv_rr(name: dnsmessage.Name, target: Str) -> dnsmessage.Resource { dnsmessage.Resource.new(header: rhdr(name, dnsmessage.TYPE_SRV, 4), body: dnsmessage.SRVResource.new(priority: 0, weight: 0, port: 0, target: dnsmessage.must_new_name(target)).body) }
+
+def cname_rr(name: dnsmessage.Name, cname: Str) -> dnsmessage.Resource { dnsmessage.Resource.new(header: rhdr(name, dnsmessage.TYPE_CNAME, 0), body: dnsmessage.CNAMEResource.new(cname: dnsmessage.must_new_name(cname)).body) }
+
+def edns0_rr(rcode: U16) -> dnsmessage.Resource {
+  h = dnsmessage.ResourceHeader.new
+  h.set_edns0!(MAX_DNS_PACKET_SIZE, rcode, false).unwrap
+  dnsmessage.Resource.new(header: h, body: dnsmessage.OPTResource.new(options: []).body)
+}
+
+def go_resolver(reqs: Chan[FakeReq]) -> Resolver { Resolver.new(prefer_go: true, dial: fake_dial(reqs, false)) }
+
+# Go's resolvConfTest: a resolv.conf in a temporary directory.
+struct ResolvConfTest {
+  dir: Str
+  path: Str
+
+  def write(lines: [Str]) { os.write_file(path, lines.join("\n").bytes.to_a, 0o600).unwrap }
+
+  def write_and_update(lines: [Str]) { write_and_update_with_last_checked(lines, DISTANT_FUTURE) }
+
+  def write_and_update_with_last_checked(lines: [Str], last_checked: Int) {
+    write(lines)
+    force_update(path, last_checked)
+  }
+
+  def force_update(name: Str, last_checked: Int) { force_update_conf(dns_read_config(name), last_checked) }
+
+  def servers -> [Str] { RESOLV_STATE.lock { |s| s.conf.unwrap.servers.dup } }
+
+  def teardown {
+    force_update("/etc/resolv.conf", LONG_AGO)
+    os.remove_all(dir)
+  }
+}
+
+def new_resolv_conf_test -> ResolvConfTest {
+  get_system_dns_config
+  dir = os.mkdir_temp("", "go-resolvconftest").unwrap
+  ResolvConfTest.new(dir: dir, path: dir + "/resolv.conf")
+}
+
+# Whether err is a DNSError with these fields (Go's reflect.DeepEqual on
+# *DNSError).
+def dns_error_is?(err: Error?, text: Str, name: Str, server: Str, timeout: Bool, temporary: Bool, not_found: Bool) -> Bool {
+  e = err || return false
+  case e {
+    DNSError.Lookup(d) => d.err == text && d.name == name && d.server == server && d.is_timeout == timeout && d.is_temporary == temporary && d.is_not_found == not_found
+    _ => false
+  }
+}
+
+def dns_failure(err: Error?) -> DNSFailure? {
+  e = err || return none
+  case e {
+    DNSError.Lookup(d) => d
+    _ => none
+  }
+}
+
+def transport_fallback_tests -> [(Str, dnsmessage.Question, Int, U16)] {
+  # Querying "com." with qtype=255 usually makes an answer which requires
+  # more than 512 bytes.
+  [
+    ("8.8.8.8:53", must_question("com.", dnsmessage.TYPE_ALL, dnsmessage.CLASS_INET), 2, dnsmessage.RCODE_SUCCESS),
+    ("8.8.4.4:53", must_question("com.", dnsmessage.TYPE_ALL, dnsmessage.CLASS_INET), 4, dnsmessage.RCODE_SUCCESS)
+  ]
+}
+
+test "DNSTransportFallback" {
+  reqs = Chan[FakeReq].new
+  rh = ->(n: Str, s: Str, q: dnsmessage.Message, t: Int) -> ~dnsmessage.Message {
+    h = hdr_rcode(q.header.id, dnsmessage.RCODE_SUCCESS)
+    h.truncated = true if n == "udp"
+    msg(h, q.questions, [])
+  }
+  spawn {
+    fake_serve(rh, reqs)
+  }
+  r = go_resolver(reqs)
+  for tt in transport_fallback_tests {
+    server, question, _, rcode = tt
+    res = exchange(r, context.background, server, question, 1000000000, false, false)
+    if e = res.err {
+      assert false, e.message
+      next
+    }
+    _, h = res.unwrap
+    assert h.rcode == rcode, "got #{h.rcode} from #{server}; want #{rcode}"
+  }
+  reqs.close
+}
+
+test "DNSTransportNoFallbackOnTCP" {
+  reqs = Chan[FakeReq].new
+  rh = ->(n: Str, s: Str, q: dnsmessage.Message, t: Int) -> ~dnsmessage.Message {
+    h = hdr_rcode(q.header.id, dnsmessage.RCODE_SUCCESS)
+    h.truncated = true
+    answers: [dnsmessage.Resource] = []
+    answers << a_rr(q.questions[0].name) if n == "tcp"
+    msg(h, q.questions, answers)
+  }
+  spawn {
+    fake_serve(rh, reqs)
+  }
+  r = go_resolver(reqs)
+  for tt in transport_fallback_tests {
+    server, question, _, rcode = tt
+    res = exchange(r, context.background, server, question, 1000000000, false, false)
+    if e = res.err {
+      assert false, e.message
+      next
+    }
+    p, h = res.unwrap
+    assert h.rcode == rcode, "got #{h.rcode} from #{server}; want #{rcode}"
+    ar = p.all_answers!
+    if e = ar.err {
+      assert false, "unexpected error #{e.message} getting all answers from #{server}"
+      next
+    }
+    assert ar.unwrap.size == 1, "got #{ar.unwrap.size} answers from #{server}; want 1"
+  }
+  reqs.close
+}
+
+# RFC 6761's reserved, pseudo domain names.
+test "SpecialDomainName" {
+  tests: [(dnsmessage.Question, U16)] = [
+    # Name resolution APIs and libraries should not recognize these as
+    # special.
+    (must_question("1.0.168.192.in-addr.arpa.", dnsmessage.TYPE_PTR, dnsmessage.CLASS_INET), dnsmessage.RCODE_NAME_ERROR),
+    (must_question("test.", dnsmessage.TYPE_ALL, dnsmessage.CLASS_INET), dnsmessage.RCODE_NAME_ERROR),
+    (must_question("example.com.", dnsmessage.TYPE_ALL, dnsmessage.CLASS_INET), dnsmessage.RCODE_SUCCESS),
+    # They should recognize these as special and not send queries; the
+    # negative answers are checked at the query-response level here.
+    (must_question("localhost.", dnsmessage.TYPE_ALL, dnsmessage.CLASS_INET), dnsmessage.RCODE_NAME_ERROR),
+    (must_question("invalid.", dnsmessage.TYPE_ALL, dnsmessage.CLASS_INET), dnsmessage.RCODE_NAME_ERROR)
+  ]
+  reqs = Chan[FakeReq].new
+  rh = ->(n: Str, s: Str, q: dnsmessage.Message, t: Int) -> ~dnsmessage.Message {
+    rc = q.questions[0].name.to_s == "example.com." ? dnsmessage.RCODE_SUCCESS : dnsmessage.RCODE_NAME_ERROR
+    msg(hdr_rcode(q.header.id, rc), q.questions, [])
+  }
+  spawn {
+    fake_serve(rh, reqs)
+  }
+  r = go_resolver(reqs)
+  server = "8.8.8.8:53"
+  for tt in tests {
+    question, rcode = tt
+    res = exchange(r, context.background, server, question, 3000000000, false, false)
+    if e = res.err {
+      assert false, e.message
+      next
+    }
+    _, h = res.unwrap
+    assert h.rcode == rcode, "got #{h.rcode} from #{server}; want #{rcode}"
+  }
+  reqs.close
+}
+
+# golang.org/issue/13705: no DNS for onion addresses, etc.
+test "AvoidDNSName" {
+  tests: [(Str, Bool)] = [
+    ("foo.com", false),
+    ("foo.com.", false),
+    ("foo.onion.", true),
+    ("foo.onion", true),
+    ("foo.ONION", true),
+    ("foo.ONION.", true),
+    # But *.local addresses are resolved (golang.org/issue/16739).
+    ("foo.local.", false),
+    ("foo.local", false),
+    ("foo.LOCAL", false),
+    ("foo.LOCAL.", false),
+    # Rejected earlier too.
+    ("", true),
+    # Without anything before onion/local, DNS is fine: with a search path
+    # "onion.vegetables.com" can use DNS; without one (or with a final
+    # dot) the queries are useless but reveal nothing private.
+    ("local", false),
+    ("onion", false),
+    ("local.", false),
+    ("onion.", false)
+  ]
+  for tt in tests {
+    name, avoid = tt
+    assert avoid_dns?(name) == avoid, "avoid_dns?(#{name}) = #{!avoid}; want #{avoid}"
+  }
+}
+
+test "NameListAvoidDNS" {
+  c = new_dns_config
+  c.search = ["go.dev.", "onion."]
+  c.ndots = 0
+  assert_eq name_list(c, "www"), ["www.", "www.go.dev."]
+  assert_eq name_list(c, "www.onion"), ["www.onion.go.dev."]
+}
+
+# Go's fakeDNSServerSuccessful: A queries get TEST_ADDR.
+def successful_rh -> ((Str, Str, dnsmessage.Message, Int) -> ~dnsmessage.Message) {
+  ->(n: Str, s: Str, q: dnsmessage.Message, t: Int) -> ~dnsmessage.Message {
+    answers: [dnsmessage.Resource] = []
+    answers << a_rr(q.questions[0].name) if q.questions.size == 1 && q.questions[0].type == dnsmessage.TYPE_A
+    msg(hdr(q.header.id), q.questions, answers)
+  }
+}
+
+# golang.org/issue/13705.
+test "LookupTorOnion" {
+  reqs = Chan[FakeReq].new
+  rh = successful_rh
+  spawn {
+    fake_serve(rh, reqs)
+  }
+  r = go_resolver(reqs)
+  addrs = r.lookup_ip_addr(context.background, "foo.onion.").unwrap
+  assert addrs.size == 0, "unexpected addresses: #{addrs}"
+  reqs.close
+}
+
+test "UpdateResolvConf" {
+  tests: [(Str, [Str], [Str])] = [
+    ("golang.org", ["nameserver 8.8.8.8"], ["8.8.8.8:53"]),
+    # An empty resolv.conf uses the default servers.
+    ("", [], DEFAULT_NS),
+    ("www.example.com", ["nameserver 8.8.4.4"], ["8.8.4.4:53"])
+  ]
+  reqs = Chan[FakeReq].new
+  rh = successful_rh
+  spawn {
+    fake_serve(rh, reqs)
+  }
+  conf = new_resolv_conf_test
+  defer {
+    conf.teardown
+    reqs.close
+  }
+  for i in 0...tests.size {
+    name, lines, servers = tests[i]
+    conf.write_and_update(lines)
+    if name != "" {
+      done = Chan[Str].new(10)
+      for j in 0...10 {
+        spawn {
+          r = go_resolver(reqs)
+          res = r.lookup_ip_addr(context.background, name)
+          if e = res.err {
+            done << e.message
+          } elsif res.unwrap.size == 0 {
+            done << "no records for #{name}"
+          } else {
+            done << ""
+          }
+        }
+      }
+      for j in 0...10 {
+        m = done.recv || ""
+        assert m == "", m
+      }
+    }
+    got = conf.servers
+    assert got == servers, "##{i}: got #{got}; want #{servers}"
+  }
+}
+
+def go_lookup_ip_with_resolver_config_tests -> [(Str, [Str], DNSFailure?, Bool, Bool)] {
+  # (name, resolv.conf lines, error (name, server, is_timeout), a, aaaa)
+  name = "jgahvsekduiv9bw4b3qhn4ykdfgj0493iohkrjfhdvhjiu4j"
+  [
+    # No records, transport timeout.
+    (name, ["options timeout:1 attempts:1", "nameserver 255.255.255.255"], DNSFailure.new(err: "", name: name, server: "255.255.255.255:53", is_timeout: true), false, false),
+    # No records, non-existent domain.
+    (name, ["options timeout:3 attempts:1", "nameserver 8.8.8.8"], DNSFailure.new(err: "", name: name, server: "8.8.8.8:53", is_timeout: false), false, false),
+    # A few A records, no AAAA records.
+    ("ipv4.google.com.", ["nameserver 8.8.8.8", "nameserver 2001:4860:4860::8888"], none, true, false),
+    ("ipv4.google.com", ["domain golang.org", "nameserver 2001:4860:4860::8888", "nameserver 8.8.8.8"], none, true, false),
+    ("ipv4.google.com", ["search x.golang.org y.golang.org", "nameserver 2001:4860:4860::8888", "nameserver 8.8.8.8"], none, true, false),
+    # No A records, a few AAAA records.
+    ("ipv6.google.com.", ["nameserver 2001:4860:4860::8888", "nameserver 8.8.8.8"], none, false, true),
+    ("ipv6.google.com", ["domain golang.org", "nameserver 8.8.8.8", "nameserver 2001:4860:4860::8888"], none, false, true),
+    ("ipv6.google.com", ["search x.golang.org y.golang.org", "nameserver 8.8.8.8", "nameserver 2001:4860:4860::8888"], none, false, true),
+    # Both A and AAAA records (RFC 7534).
+    ("hostname.as112.net", ["domain golang.org", "nameserver 2001:4860:4860::8888", "nameserver 8.8.8.8"], none, true, true),
+    ("hostname.as112.net", ["search x.golang.org y.golang.org", "nameserver 2001:4860:4860::8888", "nameserver 8.8.8.8"], none, true, true)
+  ]
+}
+
+test "GoLookupIPWithResolverConfig" {
+  reqs = Chan[FakeReq].new
+  rh = ->(n: Str, s: Str, q: dnsmessage.Message, t: Int) -> ~dnsmessage.Message {
+    if s != "[2001:4860:4860::8888]:53" && s != "8.8.8.8:53" {
+      time.sleep(time.millisecond * 10)
+      return ~timeout_answer
+    }
+    answers: [dnsmessage.Resource] = []
+    for question in q.questions {
+      qn = question.name.to_s
+      if question.type == dnsmessage.TYPE_A && qn == "ipv4.google.com." {
+        answers << a_rr(q.questions[0].name)
+      } elsif question.type == dnsmessage.TYPE_AAAA && qn == "ipv6.google.com." {
+        answers << aaaa_rr(q.questions[0].name)
+      }
+    }
+    msg(hdr(q.header.id), q.questions, answers)
+  }
+  spawn {
+    fake_serve(rh, reqs)
+  }
+  r = go_resolver(reqs)
+  conf = new_resolv_conf_test
+  defer {
+    conf.teardown
+    reqs.close
+  }
+  for tt in go_lookup_ip_with_resolver_config_tests {
+    name, lines, want_err, a, aaaa = tt
+    conf.write_and_update(lines)
+    res = r.lookup_ip_addr(context.background, name)
+    if e = res.err {
+      d = dns_failure(e)
+      ok = d.present?
+      if w = want_err {
+        if x = d {
+          ok = x.name == w.name && x.server == w.server && x.is_timeout == w.is_timeout
+        }
+      }
+      assert ok, "got #{e.message}; want #{want_err}"
+      next
+    }
+    addrs = res.unwrap
+    assert addrs.size > 0, "no records for #{name}"
+    assert a || aaaa || addrs.size == 0, "unexpected #{addrs} for #{name}"
+    for addr in addrs {
+      assert a || !addr.ip.to4.present?, "got #{addr}; must not be IPv4 address"
+      assert aaaa || addr.ip.to4.present?, "got #{addr}; must not be IPv6 address"
+    }
+  }
+}
+
+# go_lookup_ip_cname_order falls back to the hosts file when no DNS servers
+# are available.
+test "GoLookupIPOrderFallbackToFile" {
+  reqs = Chan[FakeReq].new
+  rh = ->(n: Str, s: Str, q: dnsmessage.Message, t: Int) -> ~dnsmessage.Message { msg(hdr(q.header.id), q.questions, []) }
+  spawn {
+    fake_serve(rh, reqs)
+  }
+  r = go_resolver(reqs)
+  # A configuration that simulates no available DNS servers.
+  conf = new_resolv_conf_test
+  orig = HOSTS_FILE_PATH.load
+  defer {
+    conf.teardown
+    reqs.close
+    HOSTS_FILE_PATH.store(orig)
+  }
+  conf.write_and_update([])
+  HOSTS_FILE_PATH.store("testdata/hosts")
+  for order in [HOST_LOOKUP_FILES_DNS, HOST_LOOKUP_DNS_FILES] {
+    name = "order #{lookup_order_name(order)}"
+    # An error for a host that doesn't exist,
+    res = go_lookup_ip_cname_order(r, context.background, "ip", "notarealhost", order, none)
+    assert res.err?, "#{name}: expected error while looking up name not in hosts file"
+    # and an address for a name in the hosts file.
+    res2 = go_lookup_ip_cname_order(r, context.background, "ip", "thor", order, none)
+    if res2.err? {
+      assert false, "#{name}: expected to successfully lookup host entry"
+      next
+    }
+    addrs, _ = res2.unwrap
+    if addrs.size != 1 {
+      assert false, "#{name}: expected exactly one result, but got #{addrs}"
+      next
+    }
+    assert_eq addrs[0].to_s, "127.1.1.1"
+  }
+}
+
+# golang.org/issue/12712: with search domains, the error for the original
+# name is returned, not one for a generated name.
+test "ErrorForOriginalNameWhenSearching" {
+  fqdn = "doesnotexist.domain"
+  conf = new_resolv_conf_test
+  reqs = Chan[FakeReq].new
+  defer {
+    conf.teardown
+    reqs.close
+  }
+  conf.write_and_update(["search servfail"])
+  rh = ->(n: Str, s: Str, q: dnsmessage.Message, t: Int) -> ~dnsmessage.Message {
+    rc = q.questions[0].name.to_s == "doesnotexist.domain.servfail." ? dnsmessage.RCODE_SERVER_FAILURE : dnsmessage.RCODE_NAME_ERROR
+    msg(hdr_rcode(q.header.id, rc), q.questions, [])
+  }
+  spawn {
+    fake_serve(rh, reqs)
+  }
+  # (strict_errors, err, is_temporary)
+  cases: [(Bool, Str, Bool)] = [(true, "server misbehaving", true), (false, ERR_NO_SUCH_HOST, false)]
+  for tt in cases {
+    strict, want_err, want_tmp = tt
+    r = Resolver.new(prefer_go: true, strict_errors: strict, dial: fake_dial(reqs, false))
+    res = r.lookup_ip_addr(context.background, fqdn)
+    assert res.err?, "expected an error"
+    d = dns_failure(res.err)
+    ok = false
+    if x = d {
+      ok = x.name == fqdn && x.err == want_err && x.is_temporary == want_tmp
+    }
+    assert ok, "got #{res.err.unwrap.message}; want #{want_err}"
+  }
+}
+
+# golang.org/issue/15434: after a lame referral, the next server is asked.
+test "IgnoreLameReferrals" {
+  conf = new_resolv_conf_test
+  reqs = Chan[FakeReq].new
+  defer {
+    conf.teardown
+    reqs.close
+  }
+  # 192.0.2.1 gives a lame referral.
+  conf.write_and_update(["nameserver 192.0.2.1", "nameserver 192.0.2.2"])
+  rh = ->(n: Str, s: Str, q: dnsmessage.Message, t: Int) -> ~dnsmessage.Message {
+    h = hdr(q.header.id)
+    answers: [dnsmessage.Resource] = []
+    additionals: [dnsmessage.Resource] = []
+    if s == "192.0.2.2:53" {
+      h.recursion_available = true
+      answers << a_rr(q.questions[0].name) if q.questions[0].type == dnsmessage.TYPE_A
+    } elsif s == "192.0.2.1:53" {
+      if q.questions[0].type == dnsmessage.TYPE_A && q.questions[0].name.to_s.start_with?("empty.com.") {
+        additionals << edns0_rr(dnsmessage.RCODE_SUCCESS)
+      }
+    }
+    dnsmessage.Message.new(header: h, questions: q.questions, answers: answers, authorities: [], additionals: additionals)
+  }
+  spawn {
+    fake_serve(rh, reqs)
+  }
+  r = go_resolver(reqs)
+  addrs = r.lookup_ip(context.background, "ip4", "www.golang.org").unwrap
+  assert_eq addrs.size, 1
+  assert_eq addrs[0].to_s, "192.0.2.1"
+  res = r.lookup_ip(context.background, "ip4", "empty.com")
+  d = dns_failure(res.err)
+  assert d.present?, "err = #{res.err}; wanted a DNSError"
+  assert_eq d.unwrap.err, ERR_NO_SUCH_HOST
+}
+
+# The UDP round trip ignores invalid answers (golang.org/issue/13281).
+test "IgnoreDNSForgeries" {
+  c0, s = pipe
+  c = Conn.new(nfd: new_fd(-1, 0, 0, "packetpipe", none, none, false), pp: c0.pp)
+  spawn {
+    b: [Byte] = [0; MAX_DNS_PACKET_SIZE]
+    n = s.read!(b).unwrap
+    m = dnsmessage.unpack_message(b[0...n]).unwrap
+    s.write!("garbage DNS response packet".bytes.to_a)
+    m.header.response = true
+    # An invalid ID.
+    m.header.id = m.header.id + 1
+    s.write!(m.pack.unwrap)
+    # The original ID.
+    m.header.id = m.header.id - 1
+    m.answers = [a_rr(dnsmessage.must_new_name("www.example.com."))]
+    s.write!(m.pack.unwrap).unwrap
+  }
+  m = msg(dnsmessage.Header.new(id: 42), [must_question("www.example.com.", dnsmessage.TYPE_A, dnsmessage.CLASS_INET)], [])
+  b = m.pack.unwrap
+  p, _ = dns_packet_round_trip(c, 42, m.questions[0], b).unwrap
+  p.skip_all_questions!
+  as = p.all_answers!.unwrap
+  case as[0].body {
+    dnsmessage.ResourceBody.A(a) => assert a == test_addr, "got address #{a}, want #{test_addr}"
+    _ => assert false, "not an A record"
+  }
+}
+
+# golang.org/issue/16865: after a server times out, the next is asked.
+test "RetryTimeout" {
+  conf = new_resolv_conf_test
+  reqs = Chan[FakeReq].new
+  defer {
+    conf.teardown
+    reqs.close
+  }
+  # 192.0.2.1 times out.
+  conf.write_and_update(["nameserver 192.0.2.1", "nameserver 192.0.2.2"])
+  deadline0 = Atomic.new(0)
+  problems = Atomic.new("")
+  rh = ->(n: Str, s: Str, q: dnsmessage.Message, deadline: Int) -> ~dnsmessage.Message {
+    problems.store("zero deadline") if deadline == 0
+    if s == "192.0.2.1:53" {
+      deadline0.store(deadline)
+      time.sleep(time.millisecond * 10)
+      fail deadline_exceeded
+    }
+    problems.store("deadline didn't change") if deadline == deadline0.load
+    mock_txt_response(q)
+  }
+  spawn {
+    fake_serve(rh, reqs)
+  }
+  r = go_resolver(reqs)
+  r.lookup_txt(context.background, "www.golang.org").unwrap
+  assert deadline0.load != 0, "deadline0 still zero"
+  assert_eq problems.load, ""
+}
+
+def check_rotate(rotate: Bool, nameservers: [Str], want_servers: [Str]) {
+  conf = new_resolv_conf_test
+  reqs = Chan[FakeReq].new
+  defer {
+    conf.teardown
+    reqs.close
+  }
+  lines: [Str] = nameservers.map { |ns| "nameserver " + ns }.to_a
+  lines << "options rotate" if rotate
+  conf.write_and_update(lines)
+  used = Mutex[[Str]].new([])
+  rh = ->(n: Str, s: Str, q: dnsmessage.Message, t: Int) -> ~dnsmessage.Message {
+    used.lock { |u| u << s }
+    mock_txt_response(q)
+  }
+  spawn {
+    fake_serve(rh, reqs)
+  }
+  r = go_resolver(reqs)
+  # len(nameservers) + 1, for the rotation to get back to the start.
+  for i in 0...nameservers.size + 1 {
+    r.lookup_txt(context.background, "www.golang.org").unwrap
+  }
+  got = used.lock { |u| u.dup }
+  assert got == want_servers, "rotate=#{rotate} got used servers:\n#{got}\nwant:\n#{want_servers}"
+}
+
+test "Rotate" {
+  # Without rotation, always the first server;
+  check_rotate(false, ["192.0.2.1", "192.0.2.2"], ["192.0.2.1:53", "192.0.2.1:53", "192.0.2.1:53"])
+  # with rotation, round to the first again.
+  check_rotate(true, ["192.0.2.1", "192.0.2.2"], ["192.0.2.1:53", "192.0.2.2:53", "192.0.2.1:53"])
+}
+
+def mock_txt_response(q: dnsmessage.Message) -> dnsmessage.Message {
+  h = hdr(q.header.id)
+  h.recursion_available = true
+  msg(h, q.questions, [txt_rr(q.questions[0].name, dnsmessage.TYPE_TXT, ["ok"])])
+}
+
+RESOLVE_OK = 0
+RESOLVE_OP_ERROR = 1
+RESOLVE_SERVFAIL = 2
+RESOLVE_TIMEOUT = 3
+
+# golang.org/issue/17448: with strict_errors, temporary errors make
+# lookup_ip fail rather than return a partial result.
+test "StrictErrorsLookupIP" {
+  conf = new_resolv_conf_test
+  defer {
+    conf.teardown
+  }
+  conf.write_and_update(["nameserver 192.0.2.53", "search x.golang.org y.golang.org"])
+  name = "test-issue19592"
+  server = "192.0.2.53:53"
+  search_x = "test-issue19592.x.golang.org."
+  search_y = "test-issue19592.y.golang.org."
+  ip4 = "192.0.2.1"
+  ip6 = "2001:db8::1"
+  # The errors: (err text, timeout, temporary, not found); "" for none.
+  temp_error = ->(err: Str) -> (Str, Bool, Bool, Bool) { (err, false, true, false) }
+  timeout_err: (Str, Bool, Bool, Bool) = ("i/o timeout", true, true, false)
+  nx_domain: (Str, Bool, Bool, Bool) = (ERR_NO_SUCH_HOST, false, false, true)
+  no_err: (Str, Bool, Bool, Bool) = ("", false, false, false)
+  # (desc, the query name failing ("" none), its type (0 both), how it
+  # fails, strict error, lax error, addresses)
+  cases: [(Str, Str, U16, Int, (Str, Bool, Bool, Bool), (Str, Bool, Bool, Bool), [Str])] = [
+    ("No errors", "", 0, RESOLVE_OK, no_err, no_err, [ip4, ip6]),
+    ("searchX error fails in strict mode", search_x, 0, RESOLVE_TIMEOUT, timeout_err, no_err, [ip4, ip6]),
+    ("searchX IPv4-only timeout fails in strict mode", search_x, dnsmessage.TYPE_A, RESOLVE_TIMEOUT, timeout_err, no_err, [ip4, ip6]),
+    ("searchX IPv6-only servfail fails in strict mode", search_x, dnsmessage.TYPE_AAAA, RESOLVE_SERVFAIL, temp_error.call("server misbehaving"), no_err, [ip4, ip6]),
+    # The lax one reaches the "test." FQDN.
+    ("searchY error always fails", search_y, 0, RESOLVE_TIMEOUT, timeout_err, nx_domain, []),
+    ("searchY IPv4-only socket error fails in strict mode", search_y, dnsmessage.TYPE_A, RESOLVE_OP_ERROR, temp_error.call("write: socket on fire"), no_err, [ip6]),
+    ("searchY IPv6-only timeout fails in strict mode", search_y, dnsmessage.TYPE_AAAA, RESOLVE_TIMEOUT, timeout_err, no_err, [ip4])
+  ]
+  for i in 0...cases.size {
+    desc, fail_name, fail_type, how, want_strict, want_lax, want_ips = cases[i]
+    reqs = Chan[FakeReq].new
+    rh = ->(n: Str, s: Str, q: dnsmessage.Message, t: Int) -> ~dnsmessage.Message {
+      quest = q.questions[0]
+      which = RESOLVE_OK
+      which = how if quest.name.to_s == fail_name && (fail_type == 0 || quest.type == fail_type)
+      fail wrap_error("write", "", "", "", "", "socket on fire") if which == RESOLVE_OP_ERROR
+      return msg(hdr_rcode(q.header.id, dnsmessage.RCODE_SERVER_FAILURE), q.questions, []) if which == RESOLVE_SERVFAIL
+      fail deadline_exceeded if which == RESOLVE_TIMEOUT
+      qn = quest.name.to_s
+      # NXDOMAIN, to use the search list.
+      return msg(hdr_rcode(q.header.id, dnsmessage.RCODE_NAME_ERROR), q.questions, []) if qn == search_x || qn == name + "."
+      fail fake_failure("Unexpected Name: #{qn}") if qn != search_y
+      return msg(hdr(q.header.id), q.questions, [a_rr(quest.name)]) if quest.type == dnsmessage.TYPE_A
+      fail fake_failure("Unexpected Type: #{quest.type}") if quest.type != dnsmessage.TYPE_AAAA
+      msg(hdr(q.header.id), q.questions, [aaaa_rr(quest.name)])
+    }
+    spawn {
+      fake_serve(rh, reqs)
+    }
+    for strict in [true, false] {
+      r = Resolver.new(prefer_go: true, strict_errors: strict, dial: fake_dial(reqs, false))
+      res = r.lookup_ip_addr(context.background, name)
+      want = strict ? want_strict : want_lax
+      text, tmo, tmp, nf = want
+      if text == "" {
+        assert res.ok?, "##{i} (#{desc}) strict=#{strict}: got err #{res.err}; want none"
+      } else {
+        assert dns_error_is?(res.err, text, name, server, tmo, tmp, nf), "##{i} (#{desc}) strict=#{strict}: got err #{res.err}; want #{want}"
+      }
+      got: [Str] = []
+      if res.ok? {
+        got = res.unwrap.map { |ip| ip.to_s }.to_a.sort
+      }
+      want_set = text == "" ? want_ips.sort : []
+      assert got == want_set, "##{i} (#{desc}) strict=#{strict}: got ips #{got}; want #{want_set}"
+    }
+    reqs.close
+  }
+}
+
+# golang.org/issue/17448: with strict_errors, temporary errors make
+# lookup_txt stop walking the search list.
+test "StrictErrorsLookupTXT" {
+  conf = new_resolv_conf_test
+  reqs = Chan[FakeReq].new
+  defer {
+    conf.teardown
+    reqs.close
+  }
+  conf.write_and_update(["nameserver 192.0.2.53", "search x.golang.org y.golang.org"])
+  name = "test"
+  server = "192.0.2.53:53"
+  rh = ->(n: Str, s: Str, q: dnsmessage.Message, t: Int) -> ~dnsmessage.Message {
+    qn = q.questions[0].name.to_s
+    fail deadline_exceeded if qn == "test.x.golang.org."
+    fail fake_failure("Unexpected Name: #{qn}") if qn != "test.y.golang.org."
+    mock_txt_response(q)
+  }
+  spawn {
+    fake_serve(rh, reqs)
+  }
+  for strict in [true, false] {
+    r = Resolver.new(strict_errors: strict, dial: fake_dial(reqs, false))
+    res = dns_lookup(r, context.background, name, dnsmessage.TYPE_TXT, none)
+    if strict {
+      assert dns_error_is?(res.err, "i/o timeout", name, server, true, true, false), "strict=#{strict}: got err #{res.err}"
+    } else {
+      assert res.ok?, "strict=#{strict}: got err #{res.err}"
+      p, _ = res.unwrap
+      a = p.all_answers!
+      assert a.ok? && a.unwrap.size == 1, "strict=#{strict}: got #{a.ok? ? a.unwrap.size : -1}; want 1"
+    }
+  }
+}
+
+# A lookup ended by its context while the (fake) server is still busy.
+test "DNSGoroutineRace" {
+  reqs = Chan[FakeReq].new
+  rh = ->(n: Str, s: Str, q: dnsmessage.Message, t: Int) -> ~dnsmessage.Message {
+    time.sleep(time.microsecond * 10)
+    ~timeout_answer
+  }
+  spawn {
+    fake_serve(rh, reqs)
+  }
+  r = go_resolver(reqs)
+  # Shorter than the server's delay.
+  ctx, cancel = context.with_timeout(context.background, time.microsecond * 2)
+  defer {
+    cancel.call
+    reqs.close
+  }
+  res = r.lookup_ip_addr(ctx, "where.are.they.now")
+  assert res.err?, "fake DNS lookup unexpectedly succeeded"
+}
+
+# Go's lookupWithFake: try_one_name with the system configuration.
+def lookup_with_fake(reqs: Chan[FakeReq], name: Str, typ: U16) -> Error? {
+  r = go_resolver(reqs)
+  conf = get_system_dns_config
+  res = try_one_name(r, context.background, conf, name, typ)
+  res.err
+}
+
+# golang.org/issue/8434: a SERVFAIL error is temporary.
+test "Issue8434" {
+  reqs = Chan[FakeReq].new
+  rh = ->(n: Str, s: Str, q: dnsmessage.Message, t: Int) -> ~dnsmessage.Message { msg(hdr_rcode(q.header.id, dnsmessage.RCODE_SERVER_FAILURE), q.questions, []) }
+  spawn {
+    fake_serve(rh, reqs)
+  }
+  err = lookup_with_fake(reqs, "golang.org.", dnsmessage.TYPE_ALL)
+  reqs.close
+  assert err.present?, "expected an error"
+  e = err.unwrap
+  assert is_temporary(e), "temporary? = false for err = #{e.message}; want true"
+  d = dns_failure(err)
+  assert d.present? && d.unwrap.is_temporary, "is_temporary = false for err = #{e.message}"
+}
+
+test "IssueNoSuchHostExists" {
+  reqs = Chan[FakeReq].new
+  rh = ->(n: Str, s: Str, q: dnsmessage.Message, t: Int) -> ~dnsmessage.Message { msg(hdr_rcode(q.header.id, dnsmessage.RCODE_NAME_ERROR), q.questions, []) }
+  spawn {
+    fake_serve(rh, reqs)
+  }
+  err = lookup_with_fake(reqs, "golang.org.", dnsmessage.TYPE_ALL)
+  reqs.close
+  assert err.present?, "expected an error"
+  d = dns_failure(err)
+  assert d.present? && d.unwrap.is_not_found, "is_not_found = false for err = #{err}"
+}
+
+# try_one_name for a domain that doesn't exist: NXDOMAIN without the RA bit
+# is "no such host", not "server misbehaving" (golang.org/issue/12778);
+# NXDOMAIN (golang.org/issue/25336) and empty answers
+# (golang.org/issue/27525) fail fast.
+test "NoSuchHost" {
+  # (name, header flags: rcode, authoritative)
+  tests: [(Str, U16, Bool)] = [("NXDOMAIN", dnsmessage.RCODE_NAME_ERROR, false), ("no answers", dnsmessage.RCODE_SUCCESS, true)]
+  for tt in tests {
+    tname, rcode, auth = tt
+    lookups = Atomic.new(0)
+    reqs = Chan[FakeReq].new
+    rh = ->(n: Str, s: Str, q: dnsmessage.Message, t: Int) -> ~dnsmessage.Message {
+      lookups.add(1)
+      msg(dnsmessage.Header.new(id: q.header.id, response: true, rcode: rcode, recursion_available: false, authoritative: auth), q.questions, [])
+    }
+    spawn {
+      fake_serve(rh, reqs)
+    }
+    err = lookup_with_fake(reqs, ".", dnsmessage.TYPE_ALL)
+    reqs.close
+    assert lookups.load == 1, "#{tname}: got #{lookups.load} lookups, wanted 1"
+    assert err.present?, "#{tname}: expected an error"
+    d = dns_failure(err)
+    assert d.present?, "#{tname}: err = #{err}; wanted a DNSError"
+    assert_eq d.unwrap.err, ERR_NO_SUCH_HOST
+    assert d.unwrap.is_not_found, "#{tname}: is_not_found = false wanted true"
+  }
+}
+
+# golang.org/issue/26573: Conns that aren't datagram connections are
+# streams even when udp was asked for.
+test "DNSDialTCP" {
+  reqs = Chan[FakeReq].new
+  rh = ->(n: Str, s: Str, q: dnsmessage.Message, t: Int) -> ~dnsmessage.Message { msg(hdr_rcode(q.header.id, dnsmessage.RCODE_SUCCESS), q.questions, []) }
+  spawn {
+    fake_serve(rh, reqs)
+  }
+  r = Resolver.new(prefer_go: true, dial: fake_dial(reqs, true))
+  res = exchange(r, context.background, "0.0.0.0", must_question("com.", dnsmessage.TYPE_ALL, dnsmessage.CLASS_INET), 1000000000, false, false)
+  reqs.close
+  assert res.ok?, "exchange failed: #{res.err}"
+}
+
+# golang.org/issue/27763: two strings in one TXT record are joined.
+test "TXTRecordTwoStrings" {
+  reqs = Chan[FakeReq].new
+  rh = ->(n: Str, s: Str, q: dnsmessage.Message, t: Int) -> ~dnsmessage.Message {
+    nm = q.questions[0].name
+    msg(hdr_rcode(q.header.id, dnsmessage.RCODE_SUCCESS), q.questions, [txt_rr(nm, dnsmessage.TYPE_A, ["string1 ", "string2"]), txt_rr(nm, dnsmessage.TYPE_A, ["onestring"])])
+  }
+  spawn {
+    fake_serve(rh, reqs)
+  }
+  r = go_resolver(reqs)
+  txt = go_lookup_txt(r, context.background, "golang.org").unwrap
+  reqs.close
+  assert_eq txt.size, 2
+  assert_eq txt[0], "string1 string2"
+  assert_eq txt[1], "onestring"
+}
+
+# golang.org/issue/29644: with single-request the A and AAAA queries go one
+# after the other. (alx's client always queries one after the other.)
+test "SingleRequestLookup" {
+  firstcalled = Atomic.new(0)
+  problems = Atomic.new("")
+  reqs = Chan[FakeReq].new
+  rh = ->(n: Str, s: Str, q: dnsmessage.Message, t: Int) -> ~dnsmessage.Message {
+    answers: [dnsmessage.Resource] = []
+    for question in q.questions {
+      if question.type == dnsmessage.TYPE_A {
+        time.sleep(time.millisecond * 10) if question.name.to_s == "slowipv4.example.net."
+        problems.store("the A query was received after the AAAA query !") unless firstcalled.compare_and_swap(0, 1)
+        answers << a_rr(q.questions[0].name)
+      } elsif question.type == dnsmessage.TYPE_AAAA {
+        firstcalled.compare_and_swap(0, 2)
+        answers << aaaa_rr(q.questions[0].name)
+      }
+    }
+    msg(hdr(q.header.id), q.questions, answers)
+  }
+  spawn {
+    fake_serve(rh, reqs)
+  }
+  r = go_resolver(reqs)
+  conf = new_resolv_conf_test
+  defer {
+    conf.teardown
+    reqs.close
+  }
+  conf.write_and_update(["options single-request"])
+  for name in ["hostname.example.net", "slowipv4.example.net"] {
+    firstcalled.store(0)
+    res = r.lookup_ip_addr(context.background, name)
+    assert res.ok?, "#{res.err}"
+  }
+  assert_eq problems.load, ""
+}
+
+# golang.org/issue/29358: TCP-only DNS queries.
+test "DNSUseTCP" {
+  used_udp = Atomic.new(false)
+  reqs = Chan[FakeReq].new
+  rh = ->(n: Str, s: Str, q: dnsmessage.Message, t: Int) -> ~dnsmessage.Message {
+    used_udp.store(true) if n == "udp"
+    msg(hdr_rcode(q.header.id, dnsmessage.RCODE_SUCCESS), q.questions, [])
+  }
+  spawn {
+    fake_serve(rh, reqs)
+  }
+  r = go_resolver(reqs)
+  res = exchange(r, context.background, "0.0.0.0", must_question("com.", dnsmessage.TYPE_ALL, dnsmessage.CLASS_INET), 1000000000, true, false)
+  reqs.close
+  assert res.ok?, "exchange failed: #{res.err}"
+  assert !used_udp.load, "udp protocol was used instead of tcp"
+}
+
+test "DNSUseTCPTruncated" {
+  used_udp = Atomic.new(false)
+  reqs = Chan[FakeReq].new
+  rh = ->(n: Str, s: Str, q: dnsmessage.Message, t: Int) -> ~dnsmessage.Message {
+    used_udp.store(true) if n == "udp"
+    h = hdr_rcode(q.header.id, dnsmessage.RCODE_SUCCESS)
+    h.truncated = true
+    msg(h, q.questions, [a_rr(q.questions[0].name)])
+  }
+  spawn {
+    fake_serve(rh, reqs)
+  }
+  r = go_resolver(reqs)
+  res = exchange(r, context.background, "0.0.0.0", must_question("com.", dnsmessage.TYPE_ALL, dnsmessage.CLASS_INET), 1000000000, true, false)
+  reqs.close
+  assert !used_udp.load, "udp protocol was used instead of tcp"
+  if e = res.err {
+    assert false, "exchange failed: #{e.message}"
+    return
+  }
+  p, _ = res.unwrap
+  a = p.all_answers!.unwrap
+  assert_eq a.size, 1
+}
+
+# golang.org/issue/34660: non-PTR answers to a PTR query are skipped.
+test "PTRandNonPTR" {
+  reqs = Chan[FakeReq].new
+  rh = ->(n: Str, s: Str, q: dnsmessage.Message, t: Int) -> ~dnsmessage.Message {
+    nm = q.questions[0].name
+    # A fake RRSIG.
+    msg(hdr_rcode(q.header.id, dnsmessage.RCODE_SUCCESS), q.questions, [ptr_rr(nm, "golang.org."), txt_rr(nm, dnsmessage.TYPE_TXT, ["PTR 8 6 60 ..."])])
+  }
+  spawn {
+    fake_serve(rh, reqs)
+  }
+  r = go_resolver(reqs)
+  names = r.lookup_addr_raw(context.background, "192.0.2.123").unwrap
+  reqs.close
+  assert_eq names, ["golang.org."]
+}
+
+def cve_rh -> ((Str, Str, dnsmessage.Message, Int) -> ~dnsmessage.Message) {
+  ->(n: Str, s: Str, q: dnsmessage.Message, t: Int) -> ~dnsmessage.Message {
+    h = hdr_rcode(q.header.id, dnsmessage.RCODE_SUCCESS)
+    h.recursion_available = true
+    html = dnsmessage.must_new_name("<html>.golang.org.")
+    good = dnsmessage.must_new_name("good.golang.org.")
+    answers: [dnsmessage.Resource] = []
+    t2 = q.questions[0].type
+    if t2 == dnsmessage.TYPE_A {
+      # CNAME lookups use A/AAAA as a proxy.
+      answers << a_rr(html)
+    } elsif t2 == dnsmessage.TYPE_SRV {
+      nm = q.questions[0].name
+      nm = html if nm.to_s == "_hdr._tcp.golang.org."
+      answers << srv_rr(nm, "<html>.golang.org.")
+      answers << srv_rr(nm, "good.golang.org.")
+    } elsif t2 == dnsmessage.TYPE_MX {
+      answers << mx_rr("<html>.golang.org.", "<html>.golang.org.")
+      answers << mx_rr("good.golang.org.", "good.golang.org.")
+      answers << mx_rr("127.0.0.1.", "127.0.0.1.")
+      answers << mx_rr("1.2.3.4.5.", "1.2.3.4.5.")
+      answers << mx_rr("2001:4860:0:2001::68.", "2001:4860:0:2001::68.")
+      answers << mx_rr("2001:4860:0:2001::68%zone.", "2001:4860:0:2001::68%zone.")
+    } elsif t2 == dnsmessage.TYPE_NS {
+      answers << ns_rr(html, "<html>.golang.org.")
+      answers << ns_rr(good, "good.golang.org.")
+    } elsif t2 == dnsmessage.TYPE_PTR {
+      answers << ptr_rr(html, "<html>.golang.org.")
+      answers << ptr_rr(good, "good.golang.org.")
+    }
+    msg(h, q.questions, answers)
+  }
+}
+
+# CVE-2021-33195: records with invalid names are dropped, with an error.
+# alx's public lookups fail with the error (Go returns the valid records
+# too); the records are checked through the *_filtered functions they use.
+test "CVE202133195" {
+  reqs = Chan[FakeReq].new
+  rh = cve_rh
+  spawn {
+    fake_serve(rh, reqs)
+  }
+  r = go_resolver(reqs)
+  orig_default = DEFAULT_RESOLVER.load
+  orig_hosts = HOSTS_FILE_PATH.load
+  defer {
+    DEFAULT_RESOLVER.store(orig_default)
+    HOSTS_FILE_PATH.store(orig_hosts)
+    reqs.close
+  }
+  # The default resolver is the fake one.
+  DEFAULT_RESOLVER.store(r)
+  HOSTS_FILE_PATH.store("testdata/hosts")
+  ctx = context.background
+  malformed = "lookup golang.org: DNS response contained records which contain invalid names"
+
+  # CNAME.
+  assert_eq r.lookup_cname(ctx, "golang.org").err.unwrap.message, malformed
+  assert_eq lookup_cname("golang.org").err.unwrap.message, malformed
+
+  # SRV (bad record).
+  _, srvs, bad = r.lookup_srv_filtered(ctx, "target", "tcp", "golang.org").unwrap
+  assert_eq bad.unwrap.message, malformed
+  assert srvs.size == 1 && srvs[0].target == "good.golang.org.", "unexpected record set #{srvs}"
+  assert_eq r.lookup_srv(ctx, "target", "tcp", "golang.org").err.unwrap.message, malformed
+  assert_eq lookup_srv("target", "tcp", "golang.org").err.unwrap.message, malformed
+
+  # SRV (bad header).
+  hdr_err = "lookup golang.org.: SRV header name is invalid"
+  assert_eq r.lookup_srv(ctx, "hdr", "tcp", "golang.org.").err.unwrap.message, hdr_err
+  assert_eq lookup_srv("hdr", "tcp", "golang.org.").err.unwrap.message, hdr_err
+
+  # MX.
+  mxs, bad2 = r.lookup_mx_filtered(ctx, "golang.org").unwrap
+  assert_eq bad2.unwrap.message, malformed
+  hosts = mxs.map { |mx| mx.host }.to_a.sort
+  assert_eq hosts, ["127.0.0.1.", "2001:4860:0:2001::68.", "good.golang.org."]
+  assert_eq r.lookup_mx(ctx, "golang.org").err.unwrap.message, malformed
+  assert_eq lookup_mx("golang.org").err.unwrap.message, malformed
+
+  # NS.
+  nss, bad3 = r.lookup_ns_filtered(ctx, "golang.org").unwrap
+  assert_eq bad3.unwrap.message, malformed
+  assert nss.size == 1 && nss[0].host == "good.golang.org.", "unexpected record set"
+  assert_eq lookup_ns("golang.org").err.unwrap.message, malformed
+
+  # Addr.
+  addr_err = "lookup 192.0.2.42: DNS response contained records which contain invalid names"
+  names, bad4 = r.lookup_addr_filtered(ctx, "192.0.2.42").unwrap
+  assert_eq bad4.unwrap.message, addr_err
+  assert_eq names, ["good.golang.org."]
+  assert_eq lookup_addr("192.0.2.42").err.unwrap.message, addr_err
+}
+
+test "NullMX" {
+  reqs = Chan[FakeReq].new
+  rh = ->(n: Str, s: Str, q: dnsmessage.Message, t: Int) -> ~dnsmessage.Message {
+    rr = dnsmessage.Resource.new(header: rhdr(q.questions[0].name, dnsmessage.TYPE_MX, 0), body: dnsmessage.MXResource.new(pref: 0, mx: dnsmessage.must_new_name(".")).body)
+    msg(hdr_rcode(q.header.id, dnsmessage.RCODE_SUCCESS), q.questions, [rr])
+  }
+  spawn {
+    fake_serve(rh, reqs)
+  }
+  r = go_resolver(reqs)
+  rrset = r.lookup_mx(context.background, "golang.org").unwrap
+  reqs.close
+  assert rrset.size == 1 && rrset[0].host == "." && rrset[0].pref == 0, "records = #{rrset}; want [.]"
+}
+
+# golang.org/issue/45715.
+test "RootNS" {
+  reqs = Chan[FakeReq].new
+  rh = ->(n: Str, s: Str, q: dnsmessage.Message, t: Int) -> ~dnsmessage.Message { msg(hdr_rcode(q.header.id, dnsmessage.RCODE_SUCCESS), q.questions, [ns_rr(q.questions[0].name, "i.root-servers.net.")]) }
+  spawn {
+    fake_serve(rh, reqs)
+  }
+  r = go_resolver(reqs)
+  rrset = r.lookup_ns(context.background, ".").unwrap
+  reqs.close
+  assert rrset.size == 1 && rrset[0].host == "i.root-servers.net.", "records = #{rrset}"
+}
+
+def check_go_lookup_ip_cname_order_hosts_aliases(mode: Int, lookup: Str, lookup_res: Str) {
+  unexpected = Atomic.new(false)
+  reqs = Chan[FakeReq].new
+  rh = ->(n: Str, s: Str, q: dnsmessage.Message, t: Int) -> ~dnsmessage.Message {
+    unexpected.store(true) if mode != HOST_LOOKUP_DNS_FILES
+    msg(hdr(q.header.id), [q.questions[0]], [])
+  }
+  spawn {
+    fake_serve(rh, reqs)
+  }
+  r = go_resolver(reqs)
+  for input in [lookup, abs_domain_name(lookup), strings.to_lower(lookup), strings.to_upper(lookup)] {
+    res = go_lookup_ip_cname_order(r, context.background, "ip", input, mode, none)
+    if e = res.err {
+      assert false, "expected err == nil, but got error: #{e.message}"
+      next
+    }
+    _, cname = res.unwrap
+    assert cname.to_s == lookup_res, "go_lookup_ip_cname_order(#{input}): got #{cname.to_s}, want #{lookup_res}"
+  }
+  reqs.close
+  assert !unexpected.load, "received unexpected DNS query"
+}
+
+test "GoLookupIPCNAMEOrderHostsAliasesFilesOnlyMode" {
+  orig = HOSTS_FILE_PATH.load
+  defer {
+    HOSTS_FILE_PATH.store(orig)
+  }
+  HOSTS_FILE_PATH.store("testdata/aliases")
+  for v in lookup_static_host_aliases_tests {
+    lookup, res = v
+    check_go_lookup_ip_cname_order_hosts_aliases(HOST_LOOKUP_FILES, lookup, abs_domain_name(res))
+  }
+}
+
+test "GoLookupIPCNAMEOrderHostsAliasesFilesDNSMode" {
+  orig = HOSTS_FILE_PATH.load
+  defer {
+    HOSTS_FILE_PATH.store(orig)
+  }
+  HOSTS_FILE_PATH.store("testdata/aliases")
+  for v in lookup_static_host_aliases_tests {
+    lookup, res = v
+    check_go_lookup_ip_cname_order_hosts_aliases(HOST_LOOKUP_FILES_DNS, lookup, abs_domain_name(res))
+  }
+}
+
+test "GoLookupIPCNAMEOrderHostsAliasesDNSFilesMode" {
+  orig = HOSTS_FILE_PATH.load
+  defer {
+    HOSTS_FILE_PATH.store(orig)
+  }
+  HOSTS_FILE_PATH.store("testdata/aliases")
+  # 127.0.1.1
+  check_go_lookup_ip_cname_order_hosts_aliases(HOST_LOOKUP_DNS_FILES, "invalid.invalid", abs_domain_name("invalid.test"))
+}
+
+# The queries advertise a larger DNS packet size (EDNS0) unless turned off.
+def check_dns_packet_size(disable: Bool) {
+  problems = Atomic.new("")
+  reqs = Chan[FakeReq].new
+  rh = ->(n: Str, s: Str, q: dnsmessage.Message, t: Int) -> ~dnsmessage.Message {
+    if disable {
+      problems.store("unexpected additional record") if q.additionals.size > 0
+    } elsif q.additionals.size == 0 {
+      problems.store("missing EDNS record")
+    } else {
+      case q.additionals[0].body {
+        dnsmessage.ResourceBody.OPT(options) => {
+          if options.size != 0 {
+            problems.store("found #{options.size} Options, expected none")
+          } elsif q.additionals[0].header.class.to_i != MAX_DNS_PACKET_SIZE {
+            problems.store("EDNS packet size == #{q.additionals[0].header.class}, want #{MAX_DNS_PACKET_SIZE}")
+          }
+        }
+        _ => problems.store("additional record isn't an OPTResource")
+      }
+    }
+    # A dummy answer, for lookup_ip_addr to complete.
+    answers: [dnsmessage.Resource] = []
+    answers << a_rr(q.questions[0].name) if q.questions[0].type == dnsmessage.TYPE_A
+    msg(hdr_rcode(q.header.id, dnsmessage.RCODE_SUCCESS), q.questions, answers)
+  }
+  spawn {
+    fake_serve(rh, reqs)
+  }
+  NETEDNS0.store(!disable)
+  defer {
+    NETEDNS0.store(true)
+    reqs.close
+  }
+  r = go_resolver(reqs)
+  res = r.lookup_ip_addr(context.background, "go.dev")
+  assert res.ok?, "lookup failed: #{res.err}"
+  assert_eq problems.load, ""
+}
+
+test "DNSPacketSize" {
+  check_dns_packet_size(false)
+  check_dns_packet_size(true)
+}
+
+test "LongDNSNames" {
+  long_suffix = ".go.dev."
+  long_suffix_no_dot = ".go.dev"
+  prefix = strings.repeat("verylongdomainlabel.", 20)
+  tests: [(Str, Bool)] = [
+    (prefix[0...255 - long_suffix.size] + long_suffix, true),
+    (prefix[0...254 - long_suffix.size] + long_suffix, false),
+    (prefix[0...253 - long_suffix.size] + long_suffix, false),
+    (prefix[0...253 - long_suffix_no_dot.size] + long_suffix_no_dot, false),
+    (prefix[0...254 - long_suffix_no_dot.size] + long_suffix_no_dot, true)
+  ]
+  reqs = Chan[FakeReq].new
+  rh = ->(n: Str, s: Str, q: dnsmessage.Message, t: Int) -> ~dnsmessage.Message {
+    nm = q.questions[0].name
+    qt = q.questions[0].type
+    rr = a_rr(nm)
+    if qt == dnsmessage.TYPE_AAAA {
+      rr = aaaa_rr(nm)
+    } elsif qt == dnsmessage.TYPE_TXT {
+      rr = txt_rr(nm, qt, ["."])
+    } elsif qt == dnsmessage.TYPE_MX {
+      rr = dnsmessage.Resource.new(header: rhdr(nm, qt, 0), body: dnsmessage.MXResource.new(pref: 0, mx: dnsmessage.must_new_name("go.dev.")).body)
+    } elsif qt == dnsmessage.TYPE_NS {
+      rr = ns_rr(nm, "go.dev.")
+    } elsif qt == dnsmessage.TYPE_SRV {
+      rr = srv_rr(nm, "go.dev.")
+    } elsif qt == dnsmessage.TYPE_CNAME {
+      rr = cname_rr(nm, "fake.cname.")
+    } elsif qt != dnsmessage.TYPE_A {
+      panic "unknown dnsmessage type"
+    }
+    msg(hdr_rcode(q.header.id, dnsmessage.RCODE_SUCCESS), q.questions, [rr])
+  }
+  spawn {
+    fake_serve(rh, reqs)
+  }
+  r = go_resolver(reqs)
+  ctx = context.background
+  methods = ["CNAME", "Host", "IP", "IPAddr", "MX", "NS", "NetIP", "SRV", "TXT"]
+  for i in 0...tests.size {
+    req, should_fail = tests[i]
+    for m in methods {
+      err: Error? = none
+      if m == "CNAME" {
+        err = r.lookup_cname(ctx, req).err
+      } elsif m == "Host" {
+        err = r.lookup_host(ctx, req).err
+      } elsif m == "IP" {
+        err = r.lookup_ip(ctx, "ip", req).err
+      } elsif m == "IPAddr" {
+        err = r.lookup_ip_addr(ctx, req).err
+      } elsif m == "MX" {
+        err = r.lookup_mx(ctx, req).err
+      } elsif m == "NS" {
+        err = r.lookup_ns(ctx, req).err
+      } elsif m == "NetIP" {
+        err = r.lookup_net_ip(ctx, "ip", req).err
+      } elsif m == "SRV" {
+        # "_service._proto." is added again.
+        err = r.lookup_srv(ctx, "service", "proto", req["service".size + "proto".size + 4...req.size]).err
+      } else {
+        err = r.lookup_txt(ctx, req).err
+      }
+      if should_fail {
+        assert err.present?, "#{i}: Lookup#{m}: unexpected success"
+        assert dns_error_is?(err, ERR_NO_SUCH_HOST, req, "", false, false, true), "#{i}: Lookup#{m}: unexpected error: #{err}"
+        break
+      }
+      assert !err.present?, "#{i}: Lookup#{m}: unexpected error: #{err}"
+    }
+  }
+  reqs.close
+}
+
+test "DNSTrustAD" {
+  problems = Atomic.new("")
+  reqs = Chan[FakeReq].new
+  rh = ->(n: Str, s: Str, q: dnsmessage.Message, t: Int) -> ~dnsmessage.Message {
+    qn = q.questions[0].name.to_s
+    problems.store("unexpected AD bit") if qn == "notrustad.go.dev." && q.header.authentic_data
+    problems.store("expected AD bit") if qn == "trustad.go.dev." && !q.header.authentic_data
+    answers: [dnsmessage.Resource] = []
+    answers << a_rr(q.questions[0].name) if q.questions[0].type == dnsmessage.TYPE_A
+    msg(hdr_rcode(q.header.id, dnsmessage.RCODE_SUCCESS), q.questions, answers)
+  }
+  spawn {
+    fake_serve(rh, reqs)
+  }
+  r = go_resolver(reqs)
+  conf = new_resolv_conf_test
+  defer {
+    conf.teardown
+    reqs.close
+  }
+  conf.write_and_update(["nameserver 127.0.0.1"])
+  res = r.lookup_ip_addr(context.background, "notrustad.go.dev")
+  assert res.ok?, "lookup failed: #{res.err}"
+  conf.write_and_update(["nameserver 127.0.0.1", "options trust-ad"])
+  res2 = r.lookup_ip_addr(context.background, "trustad.go.dev")
+  assert res2.ok?, "lookup failed: #{res2.err}"
+  assert_eq problems.load, ""
+}
+
+test "DNSConfigNoReload" {
+  reqs = Chan[FakeReq].new
+  rh = successful_rh
+  spawn {
+    fake_serve(rh, reqs)
+  }
+  fake = fake_dial(reqs, false)
+  r = Resolver.new(prefer_go: true, dial: ->(ctx: context.Context, network: Str, address: Str) -> ~Conn {
+    fail fake_failure("configuration unexpectedly changed") if address != "192.0.2.1:53"
+    ~fake.call(ctx, network, address)
+  })
+  conf = new_resolv_conf_test
+  defer {
+    conf.teardown
+    reqs.close
+  }
+  conf.write_and_update_with_last_checked(["nameserver 192.0.2.1", "options no-reload"], -3600000000000)
+  r.lookup_host(context.background, "go.dev").unwrap
+  conf.write(["nameserver 192.0.2.200"])
+  r.lookup_host(context.background, "go.dev").unwrap
+}
+
+test "LookupOrderFilesNoSuchHost" {
+  orig_hosts = HOSTS_FILE_PATH.load
+  conf = new_resolv_conf_test
+  dir = os.mkdir_temp("", "").unwrap
+  defer {
+    HOSTS_FILE_PATH.store(orig_hosts)
+    set_system_nss(parse_nss_conf_file(NSS_CONFIG_PATH), 0)
+    conf.teardown
+    os.remove_all(dir)
+  }
+  set_system_nss(nss_str("hosts: files"), 3600000000000)
+  rc = new_dns_config
+  rc.servers = DEFAULT_NS.dup
+  rc.default_ns = true
+  force_update_conf(rc, 3600000000000)
+  tmp = dir + "/hosts"
+  os.write_file(tmp, [], 0o660).unwrap
+  HOSTS_FILE_PATH.store(tmp)
+  test_name = "test.invalid"
+  order = system_conf.host_lookup_order(default_resolver, test_name)
+  # Systems that don't use files only (darwin prefers the system resolver)
+  # skip, as Go's test.
+  return if order != HOST_LOOKUP_FILES
+  r = default_resolver
+  ctx = context.background
+  errs: [(Str, Error?)] = [
+    ("Host", r.lookup_host(ctx, test_name).err),
+    ("IP", r.lookup_ip(ctx, "ip", test_name).err),
+    ("IPAddr", r.lookup_ip_addr(ctx, test_name).err),
+    ("NetIP", r.lookup_net_ip(ctx, "ip", test_name).err)
+  ]
+  for v in errs {
+    name, err = v
+    assert err.present?, "Lookup#{name}: unexpected success"
+    assert dns_error_is?(err, ERR_NO_SUCH_HOST, test_name, "", false, false, true), "Lookup#{name}: unexpected error: #{err}"
+  }
+}
+
+test "ExtendedRCode" {
+  reqs = Chan[FakeReq].new
+  rh = ->(n: Str, s: Str, q: dnsmessage.Message, t: Int) -> ~dnsmessage.Message {
+    fraud_success = dnsmessage.RCODE_SUCCESS | (1 << 10).to_u16
+    dnsmessage.Message.new(header: hdr_rcode(q.header.id, fraud_success), questions: [q.questions[0]], answers: [], authorities: [], additionals: [edns0_rr(fraud_success)])
+  }
+  spawn {
+    fake_serve(rh, reqs)
+  }
+  r = go_resolver(reqs)
+  res = try_one_name(r, context.background, get_system_dns_config, "go.dev.", dnsmessage.TYPE_A)
+  reqs.close
+  d = dns_failure(res.err)
+  assert d.present? && d.unwrap.err == ERR_SERVER_MISBEHAVING, "try_one_name: unexpected error: #{res.err}"
+}
+
+# resolv.conf is checked again whatever the time since the last check while
+# the default servers are used.
+test "EmptyResolvConfReplacedWithConfHaingNameservers" {
+  conf = new_resolv_conf_test
+  defer {
+    conf.teardown
+  }
+  conf.write_and_update_with_last_checked(["# empty resolv.conf file"], 0)
+  assert get_system_dns_config_named(conf.path).default_ns, "resolv.conf was not re-loaded"
+  conf.write_and_update_with_last_checked(["nameserver 192.0.2.1"], 0)
+  assert !get_system_dns_config_named(conf.path).default_ns, "resolv.conf was not re-loaded"
+}

@@ -340,6 +340,9 @@ pub struct ModuleTypes {
     /// type name -> is it derived
     pub local: HashMap<String, bool>,
     pub enums: HashSet<String>,
+    /// Types of this file with their own JSON methods (json_str, json_enc,
+    /// marshal_json, marshal_text: Go's Marshaler / TextMarshaler).
+    pub protocol: HashSet<String>,
 }
 
 pub fn type_src(t: &TypeExpr) -> String {
@@ -612,6 +615,8 @@ impl<'a> Gen<'a> {
                     Ty::Str
                 } else if self.tparams.contains(n) {
                     return Err(format!("the type parameter `{n}` can't be encoded: derive(Json) on a generic type isn't supported yet (use a concrete type)"));
+                } else if self.types.local.get(n.as_str()) == Some(&false) && !self.types.protocol.contains(n.as_str()) {
+                    return Err(format!("`{n}` doesn't derive Json: add `#[derive(Json)]` to it (or give it marshal_json / marshal_text)"));
                 } else if matches!(n.as_str(), "Float32" | "F32" | "Ptr" | "Unit" | "Complex") {
                     return Err(format!("{n} has no JSON encoding"));
                 } else {
@@ -642,7 +647,7 @@ impl<'a> Gen<'a> {
             TypeExpr::Named(n, _) if n == "Str" => Ok(KeyTy::Str),
             TypeExpr::Named(n, _) if IntKind::from_name(n).is_some() && !self.shadowed(n) => Ok(KeyTy::Int(IntKind::from_name(n).unwrap())),
             TypeExpr::Named(n, _) if !matches!(n.as_str(), "Float" | "F64" | "Bool" | "Complex" | "Unit") => Ok(KeyTy::Named),
-            k => Err(format!("map keys must be Str, an integer type or a TextMarshaler to be JSON object keys, not {}", type_src(k))),
+            k => Err(format!("map keys must be Str or an integer type to be JSON object keys, not {}", type_src(k))),
         }
     }
 

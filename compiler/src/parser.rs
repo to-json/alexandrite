@@ -555,7 +555,7 @@ impl<'a> Parser<'a> {
         let sql_alias = alias_of(m, "database/sql", "alxsql", "Row");
         let asn1_alias = alias_of(m, "encoding/asn1", "alxasn1", "Asn1");
         let imports: std::collections::HashMap<String, String> = m.imports.iter().map(|i| (import_name(i), i.path.clone())).collect();
-        let mut asn1_types = crate::derive::ModuleTypes { local: Default::default(), enums: Default::default() };
+        let mut asn1_types = crate::derive::ModuleTypes { local: Default::default(), enums: Default::default(), protocol: Default::default() };
         for s in &m.structs {
             asn1_types.local.insert(s.name.clone(), jobs.iter().any(|j| j.name == s.name && j.derive == "Asn1"));
         }
@@ -563,13 +563,20 @@ impl<'a> Parser<'a> {
             asn1_types.local.insert(e.name.clone(), jobs.iter().any(|j| j.name == e.name && j.derive == "Asn1"));
             asn1_types.enums.insert(e.name.clone());
         }
-        let mut types = crate::derive::ModuleTypes { local: Default::default(), enums: Default::default() };
+        let mut types = crate::derive::ModuleTypes { local: Default::default(), enums: Default::default(), protocol: Default::default() };
         for s in &m.structs {
             types.local.insert(s.name.clone(), jobs.iter().any(|j| j.name == s.name && j.derive == "Json"));
         }
         for e in &m.enums {
             types.local.insert(e.name.clone(), jobs.iter().any(|j| j.name == e.name && j.derive == "Json"));
             types.enums.insert(e.name.clone());
+        }
+        for d in &m.defs {
+            if let Some((ty, meth)) = d.name.rsplit_once('.') {
+                if matches!(meth, "json_str" | "json_enc" | "marshal_json" | "marshal_text") {
+                    types.protocol.insert(ty.to_string());
+                }
+            }
         }
         // encoding/json/v2's methods, for files that use v2 (derive_json2.rs).
         let wants_v2 = jobs.iter().any(|j| j.derive == "Json") && m.imports.iter().any(|i| i.path == "encoding/json/v2" || i.path == "encoding/json/jsontext");

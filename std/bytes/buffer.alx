@@ -1,0 +1,364 @@
+# Go's bytes.Buffer: a growable byte buffer with a read offset. Writes append;
+# reads consume from the front.
+#
+#   Go                                        alx
+#   NewBuffer(b) / NewBufferString(s)         new_buffer(b) / new_buffer_string(s)
+#   var b Buffer                              Buffer.new (see the zero value below)
+#   b.Len / Cap / Available                   b.len (also b.size) / cap / available
+#   b.Bytes / String / AvailableBuffer        b.bytes / string (also to_s) / available_buffer
+#   b.Peek(n) ([]byte, error)                 b.peek(n) -> [Byte] (short at the end)
+#   b.Grow / Truncate / Reset                 b.grow! / truncate! / reset!
+#   b.Write / WriteString / WriteByte / WriteRune   b.write! / write_string! / write_byte! / write_rune!
+#   b.Read / Next / ReadByte / ReadRune       b.read! / next! / read_byte! / read_rune!
+#   b.ReadBytes / ReadString                  b.read_bytes! / read_string!
+#   b.UnreadByte / UnreadRune                 b.unread_byte! / unread_rune! -> ~Unit<BufferError>
+#   b.ReadFrom(r) / WriteTo(w)                b.read_from!(r) / write_to!(w) -> ~Int
+#   MinRead / ErrTooLarge                     MIN_READ / the panic "bytes.Buffer: too large"
+#
+# Differences from Go (io's shape, GO-VS-RUBY F3 / D35): end of data is not an
+# error. `read!` returns 0 at the end (and for an empty p); `read_byte!` and
+# `read_rune!` return none at the end; `read_bytes!` / `read_string!` return
+# the text through the delimiter, or the remainder if there is none (Go adds
+# io.EOF), and none only when nothing was left; `peek(n)` returns fewer than n
+# bytes at the end where Go adds io.EOF. `read_from!` stops when the reader
+# returns 0; on a reader's error it fails without the count read so far.
+# Go's errors name the methods in Go's spelling; these use alx's (S10).
+#
+# Capacity is the buffer's own: Cap, Available and Grow behave as in Go, except
+# that growing takes exactly max(2 * cap, len + n) bytes where Go's append
+# rounds up to an allocator size class. `available_buffer` is an empty slice:
+# alx slices have no spare capacity (D6), so appending to it copies, and the
+# usual `b.write!(append_something(b.available_buffer, ...))` still works.
+# `new_buffer(b)` uses b as the buffer's storage, as Go's does (it doesn't copy):
+# reads alias b, and writes after a reset or truncate land in b.
+#
+# State sharing (GO-VS-RUBY D36): the buffer's bytes and read offset live in a
+# one-element slice `st`, so every copy of a Buffer (a function argument, an
+# io.Reader / io.Writer value, a struct field) is the same buffer, like Go's
+# *bytes.Buffer. Mutating methods keep their `!` (the checker wants it for any
+# write through `self`) and need a variable receiver, but the variable may be
+# a copy.
+# The zero value `Buffer.new` has no state yet: it reads as empty, and its
+# first `!` call creates the state. Copies taken BEFORE that call don't share
+# it, so make the buffer with `new_buffer` / `new_buffer_string` (or write
+# once) before handing out copies.
+
+import "io"
+
+# The smallest slice `read_from!` passes to a reader's read!.
+pub MIN_READ = 512
+
+SMALL_BUFFER_SIZE = 64
+MAX_INT = 0x7FFF_FFFF_FFFF_FFFF
+
+# The last read operation, so that unread_byte! / unread_rune! can check:
+# -1 any other read, 0 none, 1..4 a read_rune! of that width (Go's readOp).
+OP_READ = -1
+OP_INVALID = 0
+
+pub error BufferError {
+  # unread_byte! not after a successful read.
+  UnreadByte
+  # unread_rune! not after a successful read_rune!.
+  UnreadRune
+
+  def message -> Str {
+    case self {
+      UnreadByte => "bytes.Buffer: unread_byte!: previous operation was not a successful read"
+      UnreadRune => "bytes.Buffer: unread_rune!: previous operation was not a successful read_rune!"
+    }
+  }
+}
+
+# buf[0...n] holds the data, buf[off...n] the unread part; buf.size is the
+# capacity.
+struct BufState {
+  buf: [Byte]
+  n: Int
+  off: Int
+  last: Int
+}
+
+def new_state(b: [Byte]) -> [BufState] { [BufState.new(buf: b, n: b.size, off: 0, last: OP_INVALID)] }
+
+def reset_state(st: [BufState]) {
+  st[0].n = 0
+  st[0].off = 0
+  st[0].last = OP_INVALID
+}
+
+# Makes room for k more bytes, extending the data by k; returns where they go
+# (Go's grow).
+def grow_state(st: [BufState], k: Int) -> Int {
+  m = st[0].n - st[0].off
+  reset_state(st) if m == 0 && st[0].off != 0
+  l = st[0].n
+  c = st[0].buf.size
+  if k <= c - l {
+    st[0].n = l + k
+    return l
+  }
+  if c == 0 && k <= SMALL_BUFFER_SIZE {
+    small: [Byte] = [0; SMALL_BUFFER_SIZE]
+    st[0].buf = small
+    st[0].n = k
+    return 0
+  }
+  off = st[0].off
+  if k <= c / 2 - m {
+    copy(st[0].buf[0...m], st[0].buf[off...off + m])
+  } else if c > MAX_INT - c - k {
+    panic("bytes.Buffer: too large")
+  } else {
+    nc = m + off + k
+    nc = 2 * (c - off) if nc < 2 * (c - off)
+    nb: [Byte] = [0; nc]
+    copy(nb, st[0].buf[off...off + m])
+    st[0].buf = nb
+  }
+  st[0].off = 0
+  st[0].n = m + k
+  m
+}
+
+pub struct Buffer {
+  st: [BufState]
+
+  # (The `!` methods create the state of a zero-value Buffer inline,
+  # `if st.size == 0`: a helper `!` call per write would add a cell to the
+  # region each time.)
+
+  # Appends p; returns p.size.
+  pub def write!(p: [Byte]) -> Int {
+    if st.size == 0 { self.st = new_state([]) }
+    k = p.size
+    i = st[0].n
+    if k <= st[0].buf.size - i {
+      self.st[0].n = i + k
+    } else {
+      i = grow_state(st, k)
+    }
+    self.st[0].last = OP_INVALID
+    copy(st[0].buf[i...i + k], p)
+  }
+  # Appends s; returns s.size.
+  pub def write_string!(s: Str) -> Int {
+    if st.size == 0 { self.st = new_state([]) }
+    k = s.size
+    i = st[0].n
+    if k <= st[0].buf.size - i {
+      self.st[0].n = i + k
+    } else {
+      i = grow_state(st, k)
+    }
+    self.st[0].last = OP_INVALID
+    copy(st[0].buf[i...i + k], s.bytes)
+  }
+  pub def write_byte!(c: Byte) {
+    if st.size == 0 { self.st = new_state([]) }
+    i = st[0].n
+    if i < st[0].buf.size {
+      self.st[0].n = i + 1
+    } else {
+      i = grow_state(st, 1)
+    }
+    self.st[0].last = OP_INVALID
+    self.st[0].buf[i] = c
+  }
+  # Appends r as UTF-8 (invalid values become U+FFFD); returns bytes written.
+  pub def write_rune!(r: Rune) -> Int {
+    c = r.to_i
+    if c >= 0 && c < 0x80 {
+      write_byte!(c.as_u8)
+      return 1
+    }
+    enc = put_rune(empty_bytes, c)
+    write!(enc)
+  }
+
+  # The number of unread bytes.
+  pub def len -> Int { st.size == 0 ? 0 : st[0].n - st[0].off }
+  pub def size -> Int { st.size == 0 ? 0 : st[0].n - st[0].off }
+  # The buffer's capacity: the bytes it holds without growing.
+  pub def cap -> Int { st.size == 0 ? 0 : st[0].buf.size }
+  # The unused capacity.
+  pub def available -> Int { st.size == 0 ? 0 : st[0].buf.size - st[0].n }
+  # An empty slice to append to and hand to the next write! (see the header).
+  pub def available_buffer -> [Byte] { empty_bytes }
+  # The unread portion, aliasing the buffer; valid until the next write.
+  pub def bytes -> [Byte] {
+    return empty_bytes if st.size == 0
+    st[0].buf[st[0].off...st[0].n]
+  }
+  pub def to_s -> Str { Str.from_bytes(bytes) }
+  pub def string -> Str { Str.from_bytes(bytes) }
+  # The next n unread bytes without consuming them, aliasing the buffer;
+  # fewer at the end.
+  pub def peek(n: Int) -> [Byte] {
+    return empty_bytes if st.size == 0
+    off = st[0].off
+    return st[0].buf[off...st[0].n] if st[0].n - off < n
+    st[0].buf[off...off + n]
+  }
+
+  # Empties the buffer, keeping its storage.
+  pub def reset! {
+    if st.size == 0 { self.st = new_state([]) }
+    reset_state(st)
+  }
+  # Keeps only the first n unread bytes. Panics unless 0 <= n <= len.
+  pub def truncate!(n: Int) {
+    if st.size == 0 { self.st = new_state([]) }
+    if n == 0 {
+      reset_state(st)
+    } else {
+      self.st[0].last = OP_INVALID
+      panic("bytes.Buffer: truncation out of range") if n < 0 || n > st[0].n - st[0].off
+      self.st[0].n = st[0].off + n
+    }
+  }
+  # Grows the capacity, if needed, so that n more bytes fit without another
+  # allocation. Panics if n is negative.
+  pub def grow!(n: Int) {
+    panic("bytes.Buffer.grow!: negative count") if n < 0
+    if st.size == 0 { self.st = new_state([]) }
+    m = grow_state(st, n)
+    self.st[0].n = m
+  }
+
+  # Reads up to p.size bytes into p; returns the count, 0 at the end (or if p
+  # is empty).
+  pub def read!(p: [Byte]) -> Int {
+    if st.size == 0 { self.st = new_state([]) }
+    self.st[0].last = OP_INVALID
+    off = st[0].off
+    if st[0].n <= off {
+      reset_state(st)
+      return 0
+    }
+    k = copy(p, st[0].buf[off...st[0].n])
+    self.st[0].off = off + k
+    self.st[0].last = OP_READ if k > 0
+    k
+  }
+  # The next n unread bytes (fewer at the end), aliasing the buffer, and
+  # consumes them.
+  pub def next!(n: Int) -> [Byte] {
+    if st.size == 0 { self.st = new_state([]) }
+    self.st[0].last = OP_INVALID
+    off = st[0].off
+    m = st[0].n - off
+    k = n > m ? m : n
+    data = st[0].buf[off...off + k]
+    self.st[0].off = off + k
+    self.st[0].last = OP_READ if k > 0
+    data
+  }
+  pub def read_byte! -> Byte? {
+    if st.size == 0 { self.st = new_state([]) }
+    off = st[0].off
+    if st[0].n <= off {
+      reset_state(st)
+      return none
+    }
+    c = st[0].buf[off]
+    self.st[0].off = off + 1
+    self.st[0].last = OP_READ
+    c
+  }
+  # The next rune and its width in bytes; none at the end. Invalid UTF-8 reads
+  # as (U+FFFD, 1).
+  pub def read_rune! -> (Rune, Int)? {
+    if st.size == 0 { self.st = new_state([]) }
+    off = st[0].off
+    if st[0].n <= off {
+      reset_state(st)
+      return none
+    }
+    v = dec(st[0].buf[0...st[0].n], off)
+    w = v & 7
+    self.st[0].off = off + w
+    self.st[0].last = w
+    ((v >> 3).as_i32, w)
+  }
+  # Unreads the last rune read by read_rune!.
+  pub def unread_rune! -> ~Unit<BufferError> {
+    if st.size == 0 { self.st = new_state([]) }
+    fail BufferError.UnreadRune if st[0].last <= OP_INVALID
+    w = st[0].last
+    self.st[0].off -= w if st[0].off >= w
+    self.st[0].last = OP_INVALID
+  }
+  # Unreads the last byte of the last successful read.
+  pub def unread_byte! -> ~Unit<BufferError> {
+    if st.size == 0 { self.st = new_state([]) }
+    fail BufferError.UnreadByte if st[0].last == OP_INVALID
+    self.st[0].last = OP_INVALID
+    self.st[0].off -= 1 if st[0].off > 0
+  }
+  # Reads through the first delim (included), or to the end if there is none;
+  # none if nothing was left. The result is a copy.
+  pub def read_bytes!(delim: Byte) -> [Byte]? {
+    if st.size == 0 { self.st = new_state([]) }
+    off = st[0].off
+    n = st[0].n
+    i = index_byte(st[0].buf[off...n], delim)
+    e = i < 0 ? n : off + i + 1
+    self.st[0].off = e
+    self.st[0].last = OP_READ
+    return none if e == off
+    clone(st[0].buf[off...e])
+  }
+  pub def read_string!(delim: Byte) -> Str? {
+    if st.size == 0 { self.st = new_state([]) }
+    off = st[0].off
+    n = st[0].n
+    i = index_byte(st[0].buf[off...n], delim)
+    e = i < 0 ? n : off + i + 1
+    self.st[0].off = e
+    self.st[0].last = OP_READ
+    return none if e == off
+    Str.from_bytes(st[0].buf[off...e])
+  }
+
+  # Appends everything r reads until it returns 0; returns the count.
+  pub def read_from![R](r: R) -> ~Int {
+    if st.size == 0 { self.st = new_state([]) }
+    self.st[0].last = OP_INVALID
+    total = 0
+    loop {
+      i = grow_state(st, MIN_READ)
+      self.st[0].n = i
+      c = st[0].buf.size
+      m = r.~read!(st[0].buf[i...c])
+      panic("bytes.Buffer: reader returned negative count from read!") if m < 0
+      self.st[0].n = i + m
+      total += m
+      break if m == 0
+    }
+    total
+  }
+  # Writes the unread bytes to w, consuming them; returns the count.
+  pub def write_to![W](w: W) -> ~Int {
+    if st.size == 0 { self.st = new_state([]) }
+    self.st[0].last = OP_INVALID
+    off = st[0].off
+    k = st[0].n - off
+    m = 0
+    if k > 0 {
+      m = w.~write!(st[0].buf[off...st[0].n])
+      panic("bytes.Buffer.write_to!: invalid write! count") if m > k
+      self.st[0].off = off + m
+      fail io.StreamError.ShortWrite if m != k
+    }
+    reset_state(st)
+    m
+  }
+}
+
+# A Buffer reading b (b becomes its storage: not copied, as in Go); copies of
+# the Buffer share it.
+pub def new_buffer(b: [Byte]) -> Buffer { Buffer.new(st: new_state(b)) }
+
+# A Buffer reading a copy of s.
+pub def new_buffer_string(s: Str) -> Buffer { Buffer.new(st: new_state(s.bytes.to_a)) }

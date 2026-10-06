@@ -71,6 +71,34 @@ struct NetFD {
   wdl: Atomic[Int]
   # Whether connect succeeded (Go's isConnected).
   connected: Bool
+  # Operations in progress, and a descriptor whose close waits for them
+  # (Go's fdMutex): a descriptor number is never reused under a task that
+  # is still using it.
+  refs: Atomic[Int]
+  closing: Atomic[Int]
+
+  # Takes a reference: the descriptor, or -1 if it's closed.
+  def acquire -> Int {
+    refs.add(1)
+    f = sysfd.load
+    if f < 0 {
+      release
+      return -1
+    }
+    f
+  }
+
+  def release {
+    n = refs.add(-1)
+    finish_close if n == 0 && sysfd.load < 0
+  }
+
+  # Closes the descriptor a close! left for the last operation: 0 or -errno.
+  def finish_close -> Int {
+    c = closing.swap(-1)
+    return 0 if c < 0
+    alx_fd_close(c)
+  }
 
   def fd -> Int { sysfd.load }
   def la -> Str { la_s }
@@ -116,17 +144,19 @@ struct NetFD {
   # Go's netFD.Read (poll.FD.Read): up to p.size bytes; 0 at end of stream.
   def fd_read(p: [Byte], op: Str, src: Str, dst: Str) -> ~Int<NetError> {
     return 0 if p.size == 0 && sotype == SOCK_STREAM
+    f = acquire
+    fail err_closed(op, src, dst) if f < 0
+    r = fd_read_in(f, p, op, src, dst)
+    release
+    ~r
+  }
+
+  def fd_read_in(f: Int, p: [Byte], op: Str, src: Str, dst: Str) -> ~Int<NetError> {
     loop {
-      f = fd
-      fail err_closed(op, src, dst) if f < 0
+      fail err_closed(op, src, dst) if sysfd.load < 0
       fail timeout_error(op, net, src, dst) if expired?(1)
       n = c_read(f.to_i32, p, p.size)
-      if n >= 0 {
-        # Tasks don't preempt each other: a reader that never waits would
-        # starve the tasks sharing its worker.
-        alx_task_yield()
-        return n
-      }
+      return n if n >= 0
       code = C.errno
       if code == c("EAGAIN") {
         w = wait(f, 1)
@@ -142,14 +172,25 @@ struct NetFD {
   # Go's netFD.Write: all of p for a stream (looping on partial writes),
   # one datagram otherwise.
   def fd_write(p: [Byte], op: Str, src: Str, dst: Str) -> ~Int<NetError> {
+    f = acquire
+    fail err_closed(op, src, dst) if f < 0
+    r = fd_write_in(f, p, op, src, dst)
+    release
+    ~r
+  }
+
+  def fd_write_in(f: Int, p: [Byte], op: Str, src: Str, dst: Str) -> ~Int<NetError> {
     off = 0
     loop {
-      f = fd
-      fail err_closed(op, src, dst) if f < 0
+      fail err_closed(op, src, dst) if sysfd.load < 0
       fail timeout_error(op, net, src, dst) if expired?(2)
       n = c_write(f.to_i32, p[off...p.size], p.size - off)
       if n >= 0 {
         off += n
+        # Tasks don't preempt each other: a writer that never waits would
+        # starve the tasks sharing its worker. (Readers don't yield: a task
+        # that parks between a read and its use of the data can see it
+        # overwritten, port-issues #230.)
         alx_task_yield()
         return off if off >= p.size || sotype != SOCK_STREAM
         next
@@ -168,16 +209,20 @@ struct NetFD {
 
   # recvfrom: the length and the sender (canonical sockaddr).
   def fd_read_from(p: [Byte], op: Str, src: Str, dst: Str) -> ~(Int, [Byte])<NetError> {
+    f = acquire
+    fail err_closed(op, src, dst) if f < 0
+    r = fd_read_from_in(f, p, op, src, dst)
+    release
+    ~r
+  }
+
+  def fd_read_from_in(f: Int, p: [Byte], op: Str, src: Str, dst: Str) -> ~(Int, [Byte])<NetError> {
     from = sa_none
     loop {
-      f = fd
-      fail err_closed(op, src, dst) if f < 0
+      fail err_closed(op, src, dst) if sysfd.load < 0
       fail timeout_error(op, net, src, dst) if expired?(1)
       n = alx_net_recvfrom(f, p, p.size, 0, from)
-      if n >= 0 {
-        alx_task_yield()
-        return (n, from)
-      }
+      return (n, from) if n >= 0
       code = -n
       if code == c("EAGAIN") {
         w = wait(f, 1)
@@ -192,9 +237,16 @@ struct NetFD {
 
   # sendto (sa: canonical; family 0 sends to the connected peer).
   def fd_write_to(p: [Byte], sa: [Byte], op: Str, src: Str, dst: Str) -> ~Int<NetError> {
+    f = acquire
+    fail err_closed(op, src, dst) if f < 0
+    r = fd_write_to_in(f, p, sa, op, src, dst)
+    release
+    ~r
+  }
+
+  def fd_write_to_in(f: Int, p: [Byte], sa: [Byte], op: Str, src: Str, dst: Str) -> ~Int<NetError> {
     loop {
-      f = fd
-      fail err_closed(op, src, dst) if f < 0
+      fail err_closed(op, src, dst) if sysfd.load < 0
       fail timeout_error(op, net, src, dst) if expired?(2)
       n = alx_net_sendto(f, p, p.size, sa)
       if n >= 0 {
@@ -215,11 +267,18 @@ struct NetFD {
 
   # recvmsg: (n, oobn, flags, sender).
   def fd_read_msg(p: [Byte], oob: [Byte], op: Str, src: Str, dst: Str) -> ~(Int, Int, Int, [Byte])<NetError> {
+    f = acquire
+    fail err_closed(op, src, dst) if f < 0
+    r = fd_read_msg_in(f, p, oob, op, src, dst)
+    release
+    ~r
+  }
+
+  def fd_read_msg_in(f: Int, p: [Byte], oob: [Byte], op: Str, src: Str, dst: Str) -> ~(Int, Int, Int, [Byte])<NetError> {
     from = sa_none
     info: [Byte] = [0; 16]
     loop {
-      f = fd
-      fail err_closed(op, src, dst) if f < 0
+      fail err_closed(op, src, dst) if sysfd.load < 0
       fail timeout_error(op, net, src, dst) if expired?(1)
       n = alx_net_recvmsg(f, p, p.size, oob, oob.size, from, info)
       return (n, le64(info, 0), le64(info, 8), from) if n >= 0
@@ -237,9 +296,16 @@ struct NetFD {
 
   # sendmsg: (n, oobn).
   def fd_write_msg(p: [Byte], oob: [Byte], sa: [Byte], op: Str, src: Str, dst: Str) -> ~(Int, Int)<NetError> {
+    f = acquire
+    fail err_closed(op, src, dst) if f < 0
+    r = fd_write_msg_in(f, p, oob, sa, op, src, dst)
+    release
+    ~r
+  }
+
+  def fd_write_msg_in(f: Int, p: [Byte], oob: [Byte], sa: [Byte], op: Str, src: Str, dst: Str) -> ~(Int, Int)<NetError> {
     loop {
-      f = fd
-      fail err_closed(op, src, dst) if f < 0
+      fail err_closed(op, src, dst) if sysfd.load < 0
       fail timeout_error(op, net, src, dst) if expired?(2)
       n = alx_net_sendmsg(f, p, p.size, oob, oob.size, sa)
       return (n, oob.size) if n >= 0
@@ -257,10 +323,17 @@ struct NetFD {
 
   # Go's netFD.accept: the new connection's socket.
   def fd_accept(op: Str, dst: Str) -> ~NetFD<NetError> {
+    f = acquire
+    fail err_closed(op, "", dst) if f < 0
+    r = fd_accept_in(f, op, dst)
+    release
+    ~r
+  }
+
+  def fd_accept_in(f: Int, op: Str, dst: Str) -> ~NetFD<NetError> {
     rsa = sa_none
     loop {
-      f = fd
-      fail err_closed(op, "", dst) if f < 0
+      fail err_closed(op, "", dst) if sysfd.load < 0
       fail timeout_error(op, net, "", dst) if expired?(1)
       r = alx_net_accept(f, rsa)
       if r >= 0 {
@@ -285,8 +358,21 @@ struct NetFD {
   def fd_close(op: Str, src: Str, dst: Str) -> ~Unit<NetError> {
     f = sysfd.swap(-1)
     fail err_closed(op, src, dst) if f < 0
-    r = alx_fd_close(f)
-    fail op_error(op, net, src, dst, "close", -r) if r < 0
+    closing.store(f)
+    # Operations waiting on it fail with Closed; the last one out closes it.
+    alx_fd_wake(f)
+    if refs.load == 0 {
+      r = finish_close
+      fail op_error(op, net, src, dst, "close", -r) if r < 0
+    }
+    # As Go's Close, return once the descriptor is really closed (the
+    # woken operations let go of it at once).
+    while closing.load >= 0 {
+      # Again and again: an operation may start waiting just after a wake.
+      alx_fd_wake(f)
+      alx_task_yield()
+      alx_sleep_ns(10000) if closing.load >= 0
+    }
   }
 
   # shutdown(2): how 0 read side, 1 write side.
@@ -486,7 +572,7 @@ def socket_setup(ctx: context.Context, s: Int, net: Str, family: Int, sotype: In
 }
 
 def new_fd(s: Int, family: Int, sotype: Int, net: Str, laddr: Addr?, raddr: Addr?, connected: Bool) -> NetFD {
-  NetFD.new(sysfd: Atomic.new(s), family: family, sotype: sotype, net: net, la_s: addr_s(laddr), ra_s: addr_s(raddr), has_la: laddr.present?, has_ra: raddr.present?, rdl: Atomic.new(0), wdl: Atomic.new(0), connected: connected)
+  NetFD.new(sysfd: Atomic.new(s), family: family, sotype: sotype, net: net, la_s: addr_s(laddr), ra_s: addr_s(raddr), has_la: laddr.present?, has_ra: raddr.present?, rdl: Atomic.new(0), wdl: Atomic.new(0), connected: connected, refs: Atomic.new(0), closing: Atomic.new(-1))
 }
 
 # Go's ctrlNetwork: the network with its family digit.
@@ -519,25 +605,29 @@ def connect(ctx: context.Context, fd: NetFD, rsa: [Byte]) -> ~[Byte] {
   if dl = ctx.deadline {
     fd.wdl.store(dl <= 0 ? 1 : dl)
   }
+  # state: 0 connecting, 1 done (the watcher must not touch the socket
+  # any more: it may already be a connection in use), 2 canceled.
   done = Chan[Bool].new(1)
+  state = Atomic.new(0)
   if ctx.cancelable? {
     wd = fd.wdl
     spawn {
       select {
         when v = ctx.done.recv => {
-          wd.store(A_LONG_TIME_AGO)
-          alx_fd_wake(s)
+          if state.compare_and_swap(0, 2) {
+            wd.store(A_LONG_TIME_AGO)
+            alx_fd_wake(s)
+          }
         }
         when v = done.recv => nil
       }
     }
   }
   res = connect_wait(fd, s)
+  canceled = !state.compare_and_swap(0, 1)
   done << true
   fd.wdl.store(0)
-  if ctx.done? {
-    fail ctx_error(ctx)
-  }
+  fail ctx_error(ctx) if canceled
   ~res
 }
 

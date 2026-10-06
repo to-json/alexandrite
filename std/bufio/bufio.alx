@@ -1,52 +1,103 @@
-# Package bufio: Go's bufio — buffered I/O over io.Reader / io.Writer.
+# Package bufio: Go's bufio — buffered I/O over io.Reader / io.Writer, and
+# Scanner.
 #
-# Shape (differences from Go; see also io's header):
-#  - End of input is not an error: `read_byte!`, `read_rune!`, `read_bytes!`,
-#    `read_string!` and `read_line!` return none when nothing is left (the
-#    last, unterminated line is returned normally). Their type is `~T?`: they
-#    fail on an I/O error, are none at the end, else hold the value.
-#    `read_string!(delim)` includes the delimiter, `read_line!` drops "\n" or
-#    "\r\n".
+#   Go                                  alx
+#   NewReader / NewReaderSize           new_reader(rd) / new_reader_size(rd, n) -> Reader
+#   (*Reader) Read                      read!(p) -> ~Int (0 at the end)
+#   ReadByte / ReadRune                 read_byte! -> ~Byte? / read_rune! -> ~(Rune, Int)?
+#   UnreadByte / UnreadRune             unread_byte! / unread_rune! -> ~Unit
+#   Peek / Discard                      peek!(n) -> ~[Byte] / discard!(n) -> ~Int
+#   ReadSlice(delim)                    read_slice!(delim) -> ~([Byte], Bool)? (Bool: buffer full)
+#   ReadLine                            read_line_prefix! -> ~([Byte], Bool)? (Bool: isPrefix)
+#   ReadBytes / ReadString              read_bytes!(delim) -> ~[Byte]? / read_string!(delim) -> ~Str?
+#   WriteTo                             write_to!(w) -> ~Int
+#   Buffered / Size / Reset             buffered / size / reset!(rd)
+#   NewWriter / NewWriterSize           new_writer(wr) / new_writer_size(wr, n) -> Writer
+#   (*Writer) Write / WriteString       write!(p) / write_string!(s) -> ~Int
+#   WriteByte / WriteRune               write_byte!(c) -> ~Unit / write_rune!(r) -> ~Int
+#   Flush / ReadFrom                    flush! / read_from!(r) -> ~Int
+#   Available / AvailableBuffer         available / available_buffer
+#   Buffered / Size / Reset             buffered / size / reset!(wr)
+#   NewReadWriter                       new_read_writer(r, w) -> ReadWriter (.reader, .writer)
+#   NewScanner                          new_scanner(r) -> Scanner
+#   Scan / Text / Bytes / Err           scan! -> Bool / text / bytes / err -> Error?
+#   Split(f) / Buffer(buf, max)         split!(f) / buffer!(buf, max)
+#   SplitFunc                           ([Byte], Bool) -> ~(Int, [Byte]?, Bool)
+#   ScanLines/ScanWords/ScanRunes/      scan_lines / scan_words / scan_runes / scan_bytes
+#     ScanBytes
+#   ErrFinalToken                       a split function's third result, `true`
+#   MaxScanTokenSize                    MAX_SCAN_TOKEN_SIZE
+#   ErrBufferFull, ErrNegativeCount,    BufioError.BufferFull, NegativeCount,
+#     ErrInvalidUnreadByte/Rune,          InvalidUnreadByte / InvalidUnreadRune,
+#     ErrTooLong, ErrNegativeAdvance,     TooLong, NegativeAdvance,
+#     ErrAdvanceTooFar, ErrBadReadCount   AdvanceTooFar, BadReadCount (Go's texts)
+#
+# Differences from Go (see also io's header):
+#  - End of input is not an error (io's shape, GO-VS-RUBY F3): `read!`
+#    returns 0, and read_byte!, read_rune!, read_slice!, read_line_prefix!,
+#    read_bytes!, read_string! and read_line! return none when nothing is
+#    left; the last, unterminated piece is returned normally. `peek!(n)` and
+#    `discard!(n)` return fewer bytes at the end instead of io.EOF.
+#  - Go returns data together with an error ((data, err)). Here the data
+#    comes first and the error, kept by the Reader as Go keeps it, fails the
+#    next call (as Go's next call would see a sticky error too). Writer
+#    errors are sticky as in Go: every later write and flush! fails with it.
+#  - ReadSlice's ErrBufferFull and ReadLine's isPrefix are the Bool of their
+#    tuple. `read_line!` is a convenience on top (Go has no equivalent): the
+#    next whole line without its "\n" / "\r\n", any length.
 #  - A Reader, Writer or Scanner is a handle on shared state (GO-VS-RUBY D36):
-#    its mutable fields live in a one-element slice, so copies are the same
-#    reader / writer / scanner. Pass one to a function and what the callee
-#    consumed (or buffered) is seen by the caller. Call its `!` methods on a
-#    variable (which may be a copy). Make them with `new_reader`,
-#    `new_writer`, `new_scanner`; a zero-value struct has no state.
-#    The io.Reader / io.Writer it wraps is held as a copy too, so it shares
-#    state when it is a std type (`bytes.Buffer`, `os.File`) or follows the
-#    same convention.
+#    copies are the same reader / writer / scanner. Make them with the
+#    constructors; call `!` methods on a variable.
 #  - A bufio.Reader is not itself an io.Reader (it holds one, and a closed
-#    sum can't contain itself): read from it with its own methods.
-#  - A Writer must be `flush!`ed; nothing happens at exit.
-#  - Scanner has no custom split functions: `split!(Split.Lines)` (default),
-#    `Words`, `Runes` or `Bytes`. Tokens longer than `max_token` (64 KiB by
-#    default, `buffer!(n)` changes it) stop the scan with BufioError.TooLong.
-#    `err` is none after a normal end of input.
+#    sum can't contain itself): NewReaderSize's "already a big enough
+#    *Reader, return it" and NewWriterSize's likewise don't exist. ReadWriter
+#    holds both and forwards their methods.
+#  - write_to! / read_from! are generic over the writer / reader; Go's
+#    WriterTo / ReaderFrom fast paths (asked for at run time) aren't taken.
+#    A Writer always writes its buffer when full (no StringWriter shortcut).
+#  - A split function returns (advance, token, final): a none token is Go's
+#    nil token, `final` is Go's ErrFinalToken; other errors are `fail`ed.
+#  - A reader returning 0 means end of input here, so Go's ErrNoProgress
+#    (100 empty reads) can't arise in Reader or Scanner.
+#
+# Tests: Go's bufio_test.go, scan_test.go and example_test.go, translated
+# (go_bufio_test.alx, go_scan_test.alx, example_test.alx, external); see
+# their headers for what isn't. bufio_test.alx holds alx-specific tests.
 
-import "errors"
 import "io"
-import "unicode"
 import "unicode/utf8"
 
 DEFAULT_SIZE = 4096
+MIN_READ_BUFFER_SIZE = 16
+MAX_CONSECUTIVE_EMPTY_READS = 100
 pub MAX_SCAN_TOKEN_SIZE = 65536
+START_BUF_SIZE = 4096
 
 pub error BufioError {
-  # A buffer is full: the data wanted doesn't fit.
   BufferFull
+  NegativeCount
+  InvalidUnreadByte
+  InvalidUnreadRune
   # A token is longer than the scanner's limit.
   TooLong
-  # Nothing to unread, or the last operation can't be undone.
-  InvalidUnread
-  NegativeCount
+  NegativeAdvance
+  AdvanceTooFar
+  BadReadCount
+  NegativeRead
+  NegativeWrite
 
   def message -> Str {
     case self {
       BufferFull => "bufio: buffer full"
-      TooLong => "bufio.Scanner: token too long"
-      InvalidUnread => "bufio: invalid use of unread"
       NegativeCount => "bufio: negative count"
+      InvalidUnreadByte => "bufio: invalid use of UnreadByte"
+      InvalidUnreadRune => "bufio: invalid use of UnreadRune"
+      TooLong => "bufio.Scanner: token too long"
+      NegativeAdvance => "bufio.Scanner: SplitFunc returns negative advance count"
+      AdvanceTooFar => "bufio.Scanner: SplitFunc returns advance count beyond input"
+      BadReadCount => "bufio.Scanner: Read returned impossible count"
+      NegativeRead => "bufio: reader returned negative count from Read"
+      NegativeWrite => "bufio: writer returned negative count from Write"
     }
   }
 }
@@ -61,150 +112,229 @@ def zeros(n: Int) -> [Byte] {
 # The mutable part of a Reader, kept in a one-element slice (D36).
 struct ReaderState {
   rd: io.Reader
+  buf: [Byte]
   r: Int
   w: Int
-  last: Int
+  # The error the underlying reader returned, not yet reported (Go's b.err).
+  err: Error?
+  # The underlying reader is at its end (Go's b.err == io.EOF).
+  eof: Bool
+  last_byte: Int
+  last_rune_size: Int
 }
 
 pub struct Reader {
   cell: [ReaderState]
-  buf: [Byte]
 
-  def rd -> io.Reader { cell[0].rd }
+  def buf -> [Byte] { cell[0].buf }
   def r -> Int { cell[0].r }
   def w -> Int { cell[0].w }
-  def last -> Int { cell[0].last }
+  def stuck -> Bool { cell[0].eof || cell[0].err.some? }
 
-  # Slides the unread bytes to the front and reads once more; returns the
-  # number of bytes read (0 at the end of input).
-  def fill! -> ~Int {
+  # The buffer's size.
+  pub def size -> Int { buf.size }
+
+  # Unread bytes in the buffer.
+  pub def buffered -> Int { w - r }
+
+  # Discards buffered data and any error, and reads from rd2 instead.
+  pub def reset!(rd2: io.Reader) {
+    b: [Byte] = cell.size > 0 ? cell[0].buf : []
+    b = zeros(DEFAULT_SIZE) if b.size == 0
+    st = ReaderState.new(rd: rd2, buf: b, r: 0, w: 0, err: none, eof: false, last_byte: -1, last_rune_size: -1)
+    if cell.size == 0 {
+      self.cell = [st]
+    } else {
+      self.cell[0] = st
+    }
+  }
+
+  # Reads a new chunk into the buffer (Go's fill): slides the unread bytes to
+  # the front, then reads once. An error or the end is recorded, not raised.
+  def fill! {
     if r > 0 {
       copy(buf[0...w - r], buf[r...w])
       self.cell[0].w = w - r
       self.cell[0].r = 0
     }
-    fail BufioError.BufferFull if w >= buf.size
-    n = self.cell[0].rd.~read!(buf[w...buf.size])
-    self.cell[0].w = w + n
-    n
+    panic "bufio: tried to fill full buffer" if w >= buf.size
+    res = self.cell[0].rd.read!(buf[w...buf.size])
+    if e = res.err {
+      self.cell[0].err = e
+      return
+    }
+    n = res.unwrap
+    panic BufioError.NegativeRead.message if n < 0
+    if n == 0 {
+      self.cell[0].eof = true
+    } else {
+      self.cell[0].w = w + n
+    }
   }
 
-  # Reads into p from the buffer, refilling at most once; 0 at the end.
+  # Fails with the recorded error, if any, clearing it (Go's readErr); a
+  # recorded end of input is cleared too, so the next read asks again.
+  def read_err! -> ~Unit {
+    self.cell[0].eof = false
+    if e = cell[0].err {
+      self.cell[0].err = none
+      fail e
+    }
+  }
+
+  # Reads into p, from the buffer or (when p is at least as big as the
+  # buffer and the buffer is empty) directly; at most one underlying read.
+  # 0 at the end of input.
   pub def read!(p: [Byte]) -> ~Int {
-    return 0 if p.size == 0
+    if p.size == 0 {
+      return 0 if buffered > 0
+      self.~read_err!
+      return 0
+    }
     if r == w {
-      if p.size >= buf.size {
-        got = self.cell[0].rd.~read!(p)
-        self.cell[0].last = p[got - 1].to_i if got > 0
-        return got
+      if stuck {
+        self.~read_err!
+        return 0
       }
+      if p.size >= buf.size {
+        # Large read, empty buffer: read directly into p.
+        n = self.cell[0].rd.~read!(p)
+        panic BufioError.NegativeRead.message if n < 0
+        if n > 0 {
+          self.cell[0].last_byte = p[n - 1].to_i
+          self.cell[0].last_rune_size = -1
+        }
+        return n
+      }
+      # One read. Don't use fill!, which loops.
       self.cell[0].r = 0
       self.cell[0].w = 0
       n = self.cell[0].rd.~read!(buf)
+      panic BufioError.NegativeRead.message if n < 0
       return 0 if n == 0
       self.cell[0].w = n
     }
+    # Copy as much as we can.
     n = w - r
     n = p.size if n > p.size
     copy(p[0...n], buf[r...r + n])
     self.cell[0].r = r + n
-    self.cell[0].last = buf[r - 1].to_i
+    self.cell[0].last_byte = buf[r - 1].to_i
+    self.cell[0].last_rune_size = -1
     n
   }
 
   # The next byte, or none at the end of input.
   pub def read_byte! -> ~Byte? {
+    self.cell[0].last_rune_size = -1
     while r == w {
-      n = self.~fill!
-      return none if n == 0
+      if stuck {
+        self.~read_err!
+        return none
+      }
+      self.fill!
     }
     c = buf[r]
     self.cell[0].r = r + 1
-    self.cell[0].last = c.to_i
+    self.cell[0].last_byte = c.to_i
     c
   }
 
-  # Undoes the last read_byte! (or the last byte of a read).
+  # Undoes the last byte read. Only the most recently read byte can be
+  # unread, and not after peek!, discard! or write_to!.
   pub def unread_byte! -> ~Unit {
-    fail BufioError.InvalidUnread if last < 0 || (r == 0 && w > 0)
+    fail BufioError.InvalidUnreadByte if cell[0].last_byte < 0 || (r == 0 && w > 0)
+    # b.r > 0 || b.w == 0
     if r > 0 {
       self.cell[0].r = r - 1
     } else {
+      # b.r == 0 && b.w == 0
       self.cell[0].w = 1
     }
-    self.buf[r] = last.as_u8
-    self.cell[0].last = -1
+    self.cell[0].buf[r] = cell[0].last_byte.as_u8
+    self.cell[0].last_byte = -1
+    self.cell[0].last_rune_size = -1
   }
 
   # The next rune and its width in bytes (invalid UTF-8 reads as U+FFFD, 1),
   # or none at the end of input.
   pub def read_rune! -> ~(Rune, Int)? {
-    while w - r < 4 && !(r < w && utf8.full_rune(buf[r...w])) {
-      n = self.~fill!
-      break if n == 0
+    while r + utf8.UTF_MAX > w && !utf8.full_rune(buf[r...w]) && !stuck && w - r < buf.size {
+      # w - r < buf.size: the buffer is not full.
+      self.fill!
     }
-    return none if r == w
-    c = buf[r]
-    if c < 0x80 {
-      self.cell[0].r = r + 1
-      self.cell[0].last = c.to_i
-      return (c.as_i32, 1)
+    self.cell[0].last_rune_size = -1
+    if r == w {
+      self.~read_err!
+      return none
     }
-    e = w
-    e = r + 4 if e > r + 4
-    rr, size = utf8.decode_rune(buf[r...e])
+    rr, size = utf8.decode_rune(buf[r...w])
     self.cell[0].r = r + size
-    self.cell[0].last = buf[r - 1].to_i
+    self.cell[0].last_byte = buf[r - 1].to_i
+    self.cell[0].last_rune_size = size
     (rr, size)
   }
 
-  # The next n bytes without consuming them (fewer at the end of input). Valid
-  # until the next read. Fails with BufferFull if n exceeds the buffer.
+  # Undoes the last read_rune!. Only valid right after a read_rune!.
+  pub def unread_rune! -> ~Unit {
+    k = cell[0].last_rune_size
+    fail BufioError.InvalidUnreadRune if k < 0 || r < k
+    self.cell[0].r = r - k
+    self.cell[0].last_byte = -1
+    self.cell[0].last_rune_size = -1
+  }
+
+  # The next n bytes without consuming them: valid until the next read.
+  # Fewer at the end of input; fails with BufferFull if n is larger than the
+  # buffer, NegativeCount if n < 0, or with a read error that left fewer than
+  # n bytes.
   pub def peek!(n: Int) -> ~[Byte] {
     fail BufioError.NegativeCount if n < 0
-    fail BufioError.BufferFull if n > buf.size
-    while w - r < n {
-      got = self.~fill!
-      break if got == 0
+    self.cell[0].last_byte = -1
+    self.cell[0].last_rune_size = -1
+    while w - r < n && w - r < buf.size && !stuck {
+      # w - r < buf.size: the buffer is not full.
+      self.fill!
     }
-    e = r + n
-    e = w if e > w
-    buf[r...e]
+    fail BufioError.BufferFull if n > buf.size
+    avail = w - r
+    if avail < n {
+      # Not enough data: the error behind it, if any, fails this call when
+      # there is nothing to return, else the next one.
+      self.~read_err! if avail == 0
+      return buf[r...w]
+    }
+    buf[r...r + n]
   }
 
-  # Skips n bytes; returns how many were skipped (fewer at the end).
+  # Skips the next n bytes; returns how many were skipped (fewer at the end
+  # of input). Fails with a read error that stopped it short.
   pub def discard!(n: Int) -> ~Int {
     fail BufioError.NegativeCount if n < 0
-    left = n
-    while left > 0 {
-      if r == w {
-        got = self.~fill!
-        break if got == 0
+    return 0 if n == 0
+    self.cell[0].last_byte = -1
+    self.cell[0].last_rune_size = -1
+    remain = n
+    loop {
+      skip = buffered
+      if skip == 0 && !stuck {
+        self.fill!
+        skip = buffered
       }
-      k = w - r
-      k = left if k > left
-      self.cell[0].r = r + k
-      left -= k
+      skip = remain if skip > remain
+      self.cell[0].r = r + skip
+      remain -= skip
+      return n if remain == 0
+      if stuck {
+        # The error fails this call if nothing was skipped, else the next.
+        self.~read_err! if remain == n
+        return n - remain
+      }
     }
-    n - left
   }
 
-  # Unread bytes in the buffer.
-  pub def buffered -> Int { w - r }
-
-  # The buffer's size.
-  pub def size -> Int { buf.size }
-
-  # Discards buffered data and reads from rd2 instead.
-  pub def reset!(rd2: io.Reader) {
-    self.cell[0].rd = rd2
-    self.cell[0].r = 0
-    self.cell[0].w = 0
-    self.cell[0].last = -1
-  }
-
-  # Index of the first delim in buf[from...w], or -1.
-  def index_delim(delim: Byte, from: Int) -> Int {
+  # The index of delim in buf[from...w], or -1.
+  def index_from(delim: Byte, from: Int) -> Int {
     i = from
     while i < w {
       return i if buf[i] == delim
@@ -213,52 +343,108 @@ pub struct Reader {
     -1
   }
 
-  # Everything through the first delim (included), or to the end of input;
-  # none if nothing was left.
-  pub def read_bytes!(delim: Byte) -> ~[Byte]? {
-    i = index_delim(delim, r)
-    if i >= 0 {
-      out = zeros(i + 1 - r)
-      copy(out, buf[r...i + 1])
-      self.cell[0].r = i + 1
-      self.cell[0].last = delim.to_i
-      return out
-    }
-    acc: [Byte] = []
+  # Go's ReadSlice: (line, status) with status 0 (delim found), 1 (stopped by
+  # the end or an error, still recorded), 2 (buffer full).
+  def slice!(delim: Byte) -> ([Byte], Int) {
+    line: [Byte] = []
+    status = 0
+    s = 0
     loop {
-      k = r
-      while k < w {
-        acc << buf[k]
-        k += 1
-      }
-      self.cell[0].r = w
-      n = self.~fill!
-      break if n == 0
-      i = index_delim(delim, r)
+      # Search buffer.
+      i = index_from(delim, r + s)
       if i >= 0 {
-        k = r
-        while k <= i {
-          acc << buf[k]
-          k += 1
-        }
+        line = buf[r...i + 1]
         self.cell[0].r = i + 1
         break
       }
+      # Pending error?
+      if stuck {
+        line = buf[r...w]
+        self.cell[0].r = w
+        status = 1
+        break
+      }
+      # Buffer full?
+      if buffered >= buf.size {
+        self.cell[0].r = w
+        line = buf
+        status = 2
+        break
+      }
+      # Do not rescan the area scanned before.
+      s = w - r
+      self.fill!
     }
-    return none if acc.size == 0
-    self.cell[0].last = acc[acc.size - 1].to_i
+    # Handle last byte, if any.
+    if line.size > 0 {
+      self.cell[0].last_byte = line[line.size - 1].to_i
+      self.cell[0].last_rune_size = -1
+    }
+    (line, status)
+  }
+
+  # Reads through the first delim (Go's ReadSlice): a slice of the buffer,
+  # valid until the next read, and whether the buffer filled up before a
+  # delim was found (Go's ErrBufferFull: the slice is the whole buffer).
+  # Without a delim before the end of input, the rest; none if nothing was
+  # left. A read error fails the next call.
+  pub def read_slice!(delim: Byte) -> ~([Byte], Bool)? {
+    line, status = self.slice!(delim)
+    if status == 1 && line.size == 0 {
+      self.~read_err!
+      return none
+    }
+    (line, status == 2)
+  }
+
+  # Go's low-level ReadLine: the next line without its "\n" or "\r\n", and
+  # whether it is only a prefix (the line didn't fit the buffer; the rest
+  # comes in the next calls). A slice of the buffer, valid until the next
+  # read. None at the end of input.
+  pub def read_line_prefix! -> ~([Byte], Bool)? {
+    line, status = self.slice!(10)
+    if status == 2 {
+      # Handle the case where "\r\n" straddles the buffer.
+      if line.size > 0 && line[line.size - 1] == 13 {
+        # Put the '\r' back on buf and drop it from line. Let the next call
+        # to read_line_prefix! check for "\r\n".
+        panic "bufio: tried to rewind past start of buffer" if r == 0
+        self.cell[0].r = r - 1
+        line = line[0...line.size - 1]
+      }
+      return (line, true)
+    }
+    if line.size == 0 {
+      self.~read_err! if status == 1
+      return none
+    }
+    if line[line.size - 1] == 10 {
+      drop = 1
+      drop = 2 if line.size > 1 && line[line.size - 2] == 13
+      line = line[0...line.size - drop]
+    }
+    (line, false)
+  }
+
+  # Everything through the first delim (included), or to the end of input;
+  # none if nothing was left. A read error after some data fails the next
+  # call.
+  pub def read_bytes!(delim: Byte) -> ~[Byte]? {
+    acc: [Byte] = []
+    loop {
+      frag, status = self.slice!(delim)
+      acc = acc + frag
+      if status == 1 && acc.size == 0 {
+        self.~read_err!
+        return none
+      }
+      break if status != 2
+    }
     acc
   }
 
   # Like read_bytes!, as a string.
   pub def read_string!(delim: Byte) -> ~Str? {
-    i = index_delim(delim, r)
-    if i >= 0 {
-      s = Str.from_bytes(buf[r...i + 1])
-      self.cell[0].r = i + 1
-      self.cell[0].last = delim.to_i
-      return s
-    }
     b = self.~read_bytes!(delim)
     if x = b {
       return Str.from_bytes(x)
@@ -266,37 +452,59 @@ pub struct Reader {
     none
   }
 
-  # The next line without its "\n" or "\r\n" ending; none at the end of input.
-  # An unterminated last line is returned as it is.
+  # The next line without its "\n" or "\r\n" ending, whatever its length;
+  # none at the end of input. An unterminated last line is returned as it is.
+  # (Not Go's ReadLine: see read_line_prefix!.)
   pub def read_line! -> ~Str? {
-    i = index_delim(10, r)
-    if i >= 0 {
-      e = i
-      e = i - 1 if e > r && buf[e - 1] == 13
-      s = Str.from_bytes(buf[r...e])
-      self.cell[0].r = i + 1
-      self.cell[0].last = 10
-      return s
-    }
     line = self.~read_string!(10)
     if s = line {
       n = s.size
-      n -= 1 if n > 0 && s[n - 1] == 10
-      n -= 1 if n > 0 && s[n - 1] == 13
+      if n > 0 && s[n - 1] == 10 {
+        n -= 1
+        n -= 1 if n > 0 && s[n - 1] == 13
+      }
       return s[0...n]
     }
     none
+  }
+
+  # Writes everything left (buffered, then read) to w; returns the count.
+  pub def write_to![W](w2: W) -> ~Int {
+    self.cell[0].last_byte = -1
+    self.cell[0].last_rune_size = -1
+    total = 0
+    x = w2
+    if r < w {
+      total += self.~write_buf!(x)
+    }
+    self.fill! if w - r < buf.size && !stuck
+    while r < w {
+      total += self.~write_buf!(x)
+      self.fill! if !stuck
+    }
+    self.~read_err!
+    total
+  }
+
+  def write_buf![W](wr: W) -> ~Int {
+    x = wr
+    n = x.~write!(buf[r...w])
+    panic BufioError.NegativeWrite.message if n < 0
+    self.cell[0].r = r + n
+    fail io.StreamError.ShortWrite if n == 0
+    n
   }
 }
 
 # A Reader over rd with a buffer of `size` bytes (at least 16).
 pub def new_reader_size(rd: io.Reader, size: Int) -> Reader {
   n = size
-  n = 16 if n < 16
-  cell: [ReaderState] = [ReaderState.new(rd: rd, r: 0, w: 0, last: -1)]
-  Reader.new(cell: cell, buf: zeros(n))
+  n = MIN_READ_BUFFER_SIZE if n < MIN_READ_BUFFER_SIZE
+  cell: [ReaderState] = [ReaderState.new(rd: rd, buf: zeros(n), r: 0, w: 0, err: none, eof: false, last_byte: -1, last_rune_size: -1)]
+  Reader.new(cell: cell)
 }
 
+# A Reader over rd with the default buffer size (4096).
 pub def new_reader(rd: io.Reader) -> Reader {
   new_reader_size(rd, DEFAULT_SIZE)
 }
@@ -306,82 +514,20 @@ pub def new_reader(rd: io.Reader) -> Reader {
 # The mutable part of a Writer, kept in a one-element slice (D36).
 struct WriterState {
   wr: io.Writer
+  buf: [Byte]
   n: Int
+  # The sticky error (Go's b.err).
+  err: Error?
 }
 
 pub struct Writer {
   cell: [WriterState]
-  buf: [Byte]
 
-  def wr -> io.Writer { cell[0].wr }
+  def buf -> [Byte] { cell[0].buf }
   def n -> Int { cell[0].n }
 
-  # Writes all buffered data to the underlying writer.
-  pub def flush! -> ~Unit {
-    off = 0
-    while off < n {
-      m = self.cell[0].wr.~write!(buf[off...n])
-      fail io.StreamError.ShortWrite if m <= 0
-      off += m
-    }
-    self.cell[0].n = 0
-  }
-
-  # Buffers p (writing through when it is larger than the buffer); returns
-  # p.size.
-  pub def write!(p: [Byte]) -> ~Int {
-    off = 0
-    while off < p.size {
-      if n == 0 && p.size - off >= buf.size {
-        m = self.cell[0].wr.~write!(p[off...p.size])
-        fail io.StreamError.ShortWrite if m <= 0
-        off += m
-      } else {
-        k = buf.size - n
-        k = p.size - off if k > p.size - off
-        copy(buf[n...n + k], p[off...off + k])
-        self.cell[0].n = n + k
-        off += k
-        if n == buf.size {
-          self.~flush!
-        }
-      }
-    }
-    p.size
-  }
-
-  pub def write_string!(s: Str) -> ~Int {
-    off = 0
-    while off < s.size {
-      k = buf.size - n
-      k = s.size - off if k > s.size - off
-      i = 0
-      while i < k {
-        self.buf[n + i] = s[off + i]
-        i += 1
-      }
-      self.cell[0].n = n + k
-      off += k
-      if n == buf.size {
-        self.~flush!
-      }
-    }
-    s.size
-  }
-
-  pub def write_byte!(c: Byte) -> ~Unit {
-    if n == buf.size {
-      self.~flush!
-    }
-    self.buf[n] = c
-    self.cell[0].n = n + 1
-  }
-
-  # Writes r as UTF-8; returns the byte count.
-  pub def write_rune!(r: Rune) -> ~Int {
-    enc = utf8.encode_rune(r)
-    self.~write!(enc)
-  }
+  # The buffer's size.
+  pub def size -> Int { buf.size }
 
   # Bytes buffered and not yet flushed.
   pub def buffered -> Int { n }
@@ -389,54 +535,226 @@ pub struct Writer {
   # Free space in the buffer.
   pub def available -> Int { buf.size - n }
 
-  pub def size -> Int { buf.size }
+  # An empty slice over the buffer's free space (Go's AvailableBuffer): append
+  # to it and pass the result to write! right away, before any other call.
+  pub def available_buffer -> [Byte] {
+    buf[n...buf.size][0...0]
+  }
 
-  # Drops unflushed data and writes to wr2 instead.
+  # Drops unflushed data and any error, and writes to wr2 instead.
   pub def reset!(wr2: io.Writer) {
-    self.cell[0].wr = wr2
+    b: [Byte] = cell.size > 0 ? cell[0].buf : []
+    b = zeros(DEFAULT_SIZE) if b.size == 0
+    st = WriterState.new(wr: wr2, buf: b, n: 0, err: none)
+    if cell.size == 0 {
+      self.cell = [st]
+    } else {
+      self.cell[0] = st
+    }
+  }
+
+  # Writes the buffered data to the underlying writer. An error is sticky:
+  # every later write and flush fails with it.
+  pub def flush! -> ~Unit {
+    if e = cell[0].err {
+      fail e
+    }
+    return if n == 0
+    res = self.cell[0].wr.write!(buf[0...n])
+    m = res.ok || 0
+    err: Error? = res.err
+    err = io.StreamError.ShortWrite if m < n && err.none?
+    if e = err {
+      if m > 0 && m < n {
+        copy(buf[0...n - m], buf[m...n])
+      }
+      self.cell[0].n = n - m if m > 0
+      self.cell[0].err = e
+      fail e
+    }
     self.cell[0].n = 0
+  }
+
+  # Writes p (through the buffer; directly when the buffer is empty and p
+  # doesn't fit); returns p.size, or fails with the sticky error.
+  pub def write!(p0: [Byte]) -> ~Int {
+    p = p0
+    while p.size > available && cell[0].err.none? {
+      k = 0
+      if buffered == 0 {
+        # Large write, empty buffer: write directly from p.
+        res = self.cell[0].wr.write!(p)
+        if e = res.err {
+          self.cell[0].err = e
+        } else {
+          k = res.unwrap
+        }
+      } else {
+        k = available
+        copy(buf[n...buf.size], p[0...k])
+        self.cell[0].n = n + k
+        self.flush!
+      }
+      p = p[k...p.size]
+    }
+    if e = cell[0].err {
+      fail e
+    }
+    k = p.size
+    copy(buf[n...n + k], p)
+    self.cell[0].n = n + k
+    p0.size
+  }
+
+  # Writes one byte.
+  pub def write_byte!(c: Byte) -> ~Unit {
+    if e = cell[0].err {
+      fail e
+    }
+    if available <= 0 {
+      self.~flush!
+    }
+    self.cell[0].buf[n] = c
+    self.cell[0].n = n + 1
+  }
+
+  # Writes r as UTF-8 (U+FFFD if invalid); returns the byte count.
+  pub def write_rune!(rr: Rune) -> ~Int {
+    if rr >= 0 && rr < utf8.RUNE_SELF {
+      self.~write_byte!(rr.as_u8)
+      return 1
+    }
+    if e = cell[0].err {
+      fail e
+    }
+    enc = utf8.encode_rune(rr)
+    if available < utf8.UTF_MAX {
+      self.~flush!
+      # Can only happen if the buffer is ridiculously small.
+      return self.~write_string!(Str.from_bytes(enc)) if available < utf8.UTF_MAX
+    }
+    k = enc.size
+    copy(buf[n...n + k], enc)
+    self.cell[0].n = n + k
+    k
+  }
+
+  # Writes s; returns s.size.
+  pub def write_string!(s: Str) -> ~Int {
+    off = 0
+    while s.size - off > available && cell[0].err.none? {
+      k = available
+      i = 0
+      while i < k {
+        self.cell[0].buf[n + i] = s[off + i]
+        i += 1
+      }
+      self.cell[0].n = n + k
+      off += k
+      self.flush!
+    }
+    if e = cell[0].err {
+      fail e
+    }
+    k = s.size - off
+    i = 0
+    while i < k {
+      self.cell[0].buf[n + i] = s[off + i]
+      i += 1
+    }
+    self.cell[0].n = n + k
+    s.size
+  }
+
+  # Reads r to its end into the buffer, flushing as it fills (Go's
+  # ReadFrom); returns the bytes read. Leaves what is left buffered.
+  pub def read_from![R](r: R) -> ~Int {
+    if e = cell[0].err {
+      fail e
+    }
+    src = r
+    total = 0
+    loop {
+      if available == 0 {
+        self.~flush!
+      }
+      m = src.~read!(buf[n...buf.size])
+      break if m == 0
+      self.cell[0].n = n + m
+      total += m
+    }
+    # The end: flush only a full buffer.
+    self.~flush! if available == 0
+    total
   }
 }
 
+# A Writer over wr with a buffer of `size` bytes (the default 4096 if size
+# is not positive).
 pub def new_writer_size(wr: io.Writer, size: Int) -> Writer {
   k = size
-  k = 1 if k < 1
-  cell: [WriterState] = [WriterState.new(wr: wr, n: 0)]
-  Writer.new(cell: cell, buf: zeros(k))
+  k = DEFAULT_SIZE if k <= 0
+  cell: [WriterState] = [WriterState.new(wr: wr, buf: zeros(k), n: 0, err: none)]
+  Writer.new(cell: cell)
 }
 
+# A Writer over wr with the default buffer size (4096).
 pub def new_writer(wr: io.Writer) -> Writer {
   new_writer_size(wr, DEFAULT_SIZE)
 }
 
-# --------------------------------------------------------------------- Scanner
+# ------------------------------------------------------------------ ReadWriter
 
-# How a Scanner cuts its input into tokens.
-pub enum Split {
-  # Lines without their "\n" / "\r\n" (the default).
-  Lines
-  # Runs of non-space characters (Unicode spaces).
-  Words
-  # UTF-8 encoded runes (invalid bytes become U+FFFD tokens of one byte).
-  Runes
-  # Single bytes.
-  Bytes
+# A Reader and a Writer together (Go embeds them; here they are fields, and
+# the common methods are forwarded).
+pub struct ReadWriter {
+  reader: Reader
+  writer: Writer
+
+  pub def read!(p: [Byte]) -> ~Int { reader.~read!(p) }
+  pub def read_byte! -> ~Byte? { reader.~read_byte! }
+  pub def unread_byte! -> ~Unit { reader.~unread_byte! }
+  pub def read_rune! -> ~(Rune, Int)? { reader.~read_rune! }
+  pub def unread_rune! -> ~Unit { reader.~unread_rune! }
+  pub def peek!(k: Int) -> ~[Byte] { reader.~peek!(k) }
+  pub def discard!(k: Int) -> ~Int { reader.~discard!(k) }
+  pub def read_slice!(delim: Byte) -> ~([Byte], Bool)? { reader.~read_slice!(delim) }
+  pub def read_line_prefix! -> ~([Byte], Bool)? { reader.~read_line_prefix! }
+  pub def read_bytes!(delim: Byte) -> ~[Byte]? { reader.~read_bytes!(delim) }
+  pub def read_string!(delim: Byte) -> ~Str? { reader.~read_string!(delim) }
+  pub def read_line! -> ~Str? { reader.~read_line! }
+  pub def write!(p: [Byte]) -> ~Int { writer.~write!(p) }
+  pub def write_string!(s: Str) -> ~Int { writer.~write_string!(s) }
+  pub def write_byte!(c: Byte) -> ~Unit { writer.~write_byte!(c) }
+  pub def write_rune!(rr: Rune) -> ~Int { writer.~write_rune!(rr) }
+  pub def flush! -> ~Unit { writer.~flush! }
+  pub def available -> Int { writer.available }
 }
+
+pub def new_read_writer(r: Reader, w: Writer) -> ReadWriter {
+  ReadWriter.new(reader: r, writer: w)
+}
+
+# --------------------------------------------------------------------- Scanner
 
 # The mutable part of a Scanner, kept in a one-element slice (D36).
 struct ScannerState {
+  split: ([Byte], Bool) -> ~(Int, [Byte]?, Bool)
+  max_token_size: Int
+  token: [Byte]?
   buf: [Byte]
   start: Int
   stop: Int
-  ts: Int
-  te: Int
-  mode: Int
-  max_tok: Int
+  # The sticky error; `eof` is Go's err == io.EOF.
+  err: Error?
   eof: Bool
-  fail_kind: Int
-  fail_msg: Str
+  empties: Int
+  scan_called: Bool
+  done: Bool
 }
 
+# Reads input as tokens: lines (the default), words, runes, bytes, or what
+# a split function cuts. Go's Scanner.
 pub struct Scanner {
   src: io.Reader
   cell: [ScannerState]
@@ -444,177 +762,229 @@ pub struct Scanner {
   def buf -> [Byte] { cell[0].buf }
   def start -> Int { cell[0].start }
   def stop -> Int { cell[0].stop }
-  def ts -> Int { cell[0].ts }
-  def te -> Int { cell[0].te }
-  def mode -> Int { cell[0].mode }
-  def max_tok -> Int { cell[0].max_tok }
-  def eof -> Bool { cell[0].eof }
-  def fail_kind -> Int { cell[0].fail_kind }
-  def fail_msg -> Str { cell[0].fail_msg }
+  def stuck -> Bool { cell[0].eof || cell[0].err.some? }
 
-  # Sets the mode (before the first scan!).
-  pub def split!(how: Split) {
-    self.cell[0].mode = case how {
-      Lines => 0
-      Words => 1
-      Runes => 2
-      Bytes => 3
+  # Sets the split function (before the first scan!; panics after).
+  pub def split!(f: ([Byte], Bool) -> ~(Int, [Byte]?, Bool)) {
+    panic "Split called after Scan" if cell[0].scan_called
+    self.cell[0].split = f
+  }
+
+  # Sets the initial buffer and the largest token allowed (before the first
+  # scan!; panics after). The buffer grows up to `max`.
+  pub def buffer!(b: [Byte], max: Int) {
+    panic "Buffer called after Scan" if cell[0].scan_called
+    self.cell[0].buf = b
+    self.cell[0].max_token_size = max
+  }
+
+  def set_err!(e: Error) {
+    if cell[0].err.none? {
+      self.cell[0].err = e
+      self.cell[0].eof = false
     }
   }
 
-  # The largest token allowed (and so the largest buffer), at least 16.
-  pub def buffer!(max: Int) {
-    self.cell[0].max_tok = max < 16 ? 16 : max
-  }
-
-  # Advances to the next token; false at the end of input or on an error (see
-  # `err`).
+  # Advances to the next token; false at the end of input or on an error
+  # (see `err`).
   pub def scan! -> Bool {
-    return false if fail_kind != 0
-    res = false
+    return false if cell[0].done
+    self.cell[0].scan_called = true
+    # Loop until we have a token.
     loop {
-      if stop > start || eof {
-        st, a, b, ns = cut_token(buf, start, stop, eof, mode)
-        self.cell[0].start = ns
-        if st == 1 {
-          self.cell[0].ts = a
-          self.cell[0].te = b
-          res = true
-          break
+      # See if we can get a token with what we already have. If we've run
+      # out of data but have an error, give the split function a chance to
+      # recover any remaining, possibly empty token.
+      if stop > start || stuck {
+        res = cell[0].split.call(buf[start...stop], stuck)
+        if e = res.err {
+          self.set_err!(e)
+          return false
         }
-        break if st == 2
-        # st == 0: more data is needed (or a delimiter was skipped).
+        advance, token, final = res.unwrap
+        if final {
+          self.cell[0].token = token
+          self.cell[0].done = true
+          # When the token is not none, it means the scanning stops with a
+          # trailing token; else it stops without one.
+          return token.some?
+        }
+        return false if !self.advance!(advance)
+        self.cell[0].token = token
+        if token.some? {
+          if !stuck || advance > 0 {
+            self.cell[0].empties = 0
+          } else {
+            # Returning tokens not advancing input at EOF.
+            self.cell[0].empties = cell[0].empties + 1
+            panic "bufio.Scan: too many empty tokens without progressing" if cell[0].empties > MAX_CONSECUTIVE_EMPTY_READS
+          }
+          return true
+        }
       }
-      break if eof
-      # Make room: slide, then grow.
+      # We cannot generate a token with what we are holding. If we've
+      # already hit the end or an error, we're done.
+      if stuck {
+        # Shut it down.
+        self.cell[0].start = 0
+        self.cell[0].stop = 0
+        return false
+      }
+      # Must read more data. First, shift data to the beginning of the
+      # buffer if there's lots of empty space or space is needed.
       if start > 0 && (stop == buf.size || start > buf.size / 2) {
         copy(buf[0...stop - start], buf[start...stop])
         self.cell[0].stop = stop - start
         self.cell[0].start = 0
       }
+      # Is the buffer full? If so, resize.
       if stop == buf.size {
-        if buf.size >= max_tok {
-          self.cell[0].fail_kind = 1
-          break
+        if buf.size >= cell[0].max_token_size {
+          self.set_err!(BufioError.TooLong)
+          return false
         }
-        nb = buf.size * 2
-        nb = max_tok if nb > max_tok
-        bigger = zeros(nb)
-        copy(bigger[0...stop], buf[0...stop])
-        self.cell[0].buf = bigger
+        new_size = buf.size * 2
+        new_size = START_BUF_SIZE if new_size == 0
+        new_size = cell[0].max_token_size if new_size > cell[0].max_token_size
+        new_buf = zeros(new_size)
+        copy(new_buf[0...stop - start], buf[start...stop])
+        self.cell[0].buf = new_buf
+        self.cell[0].stop = stop - start
+        self.cell[0].start = 0
       }
+      # Finally we can read some input.
       got = self.src.read!(buf[stop...buf.size])
-      if got.err? {
-        self.cell[0].fail_kind = 2
-        self.cell[0].fail_msg = got.err.unwrap.message
-        break
-      }
-      n = got.unwrap
-      if n == 0 {
-        self.cell[0].eof = true
+      if e = got.err {
+        self.set_err!(e)
       } else {
-        self.cell[0].stop = stop + n
+        k = got.unwrap
+        if k < 0 || buf.size - stop < k {
+          self.set_err!(BufioError.BadReadCount)
+        } else if k == 0 {
+          self.cell[0].eof = true if cell[0].err.none?
+        } else {
+          self.cell[0].stop = stop + k
+          self.cell[0].empties = 0
+        }
       }
     }
-    res
+  }
+
+  # Consumes n bytes of the buffer; false (with the error set) if n is
+  # impossible.
+  def advance!(k: Int) -> Bool {
+    if k < 0 {
+      self.set_err!(BufioError.NegativeAdvance)
+      return false
+    }
+    if k > stop - start {
+      self.set_err!(BufioError.AdvanceTooFar)
+      return false
+    }
+    self.cell[0].start = start + k
+    true
   }
 
   # The current token as a string (a copy).
   pub def text -> Str {
-    Str.from_bytes(buf[ts...te])
+    if t = cell[0].token {
+      return Str.from_bytes(t)
+    }
+    ""
   }
 
-  # The current token's bytes, aliasing the scanner's buffer: valid until the
-  # next scan!.
+  # The current token's bytes, which may alias the scanner's buffer: valid
+  # until the next scan!. Empty when there is none.
   pub def bytes -> [Byte] {
-    buf[ts...te]
+    cell[0].token || []
   }
 
-  # The error that stopped the scan, if any (none after a normal end). A
-  # failure of the underlying reader comes back as a Failure carrying its
-  # message (the scanner keeps the text, not the value, to stay small: it is
-  # copied on every call).
+  # The error that stopped the scan, if any (none after a normal end).
   pub def err -> Error? {
-    return none if fail_kind == 0
-    return BufioError.TooLong if fail_kind == 1
-    errors.new(fail_msg)
+    cell[0].err
   }
 }
 
-# Looks for a token in buf[start...stop]. Returns (status, token start, token
-# end, new start): status 1 is a token, 2 no more tokens, 0 more data is
-# needed (the new start may skip delimiters). A plain function, not a `!`
-# method: no copy of the scanner is made per token.
-def cut_token(buf: [Byte], start: Int, stop: Int, eof: Bool, mode: Int) -> (Int, Int, Int, Int) {
-  return 2, 0, 0, start if start == stop && eof
-  return 0, 0, 0, start if start == stop
-  if mode == 0 {
-    i = start
-    while i < stop && buf[i] != 10 {
-      i += 1
-    }
-    if i < stop {
-      e = i
-      e = i - 1 if i > start && buf[i - 1] == 13
-      return 1, start, e, i + 1
-    }
-    if eof {
-      e = stop
-      e = stop - 1 if stop > start && buf[stop - 1] == 13
-      return 1, start, e, stop
-    }
-    return 0, 0, 0, start
+# A Scanner over r, splitting into lines.
+pub def new_scanner(r: io.Reader) -> Scanner {
+  cell: [ScannerState] = [ScannerState.new(split: scan_lines, max_token_size: MAX_SCAN_TOKEN_SIZE, token: none, buf: [], start: 0, stop: 0, err: none, eof: false, empties: 0, scan_called: false, done: false)]
+  Scanner.new(src: r, cell: cell)
+}
+
+# ------------------------------------------------------------ split functions
+
+# Each byte is a token.
+pub def scan_bytes(data: [Byte], at_eof: Bool) -> ~(Int, [Byte]?, Bool) {
+  return (0, none, false) if at_eof && data.size == 0
+  (1, data[0...1], false)
+}
+
+# Each UTF-8 encoded rune is a token; an invalid encoding is a U+FFFD token
+# ("\xef\xbf\xbd") of one input byte.
+pub def scan_runes(data: [Byte], at_eof: Bool) -> ~(Int, [Byte]?, Bool) {
+  return (0, none, false) if at_eof && data.size == 0
+  # Fast path 1: ASCII.
+  return (1, data[0...1], false) if data[0] < 0x80
+  # Fast path 2: a correct UTF-8 encoding.
+  _r, width = utf8.decode_rune(data)
+  return (width, data[0...width], false) if width > 1
+  # We know it's an error: width == 1 and the rune is U+FFFD. Is the
+  # error because there wasn't a full rune to be decoded?
+  return (0, none, false) if !at_eof && !utf8.full_rune(data)
+  # We have a real UTF-8 encoding error.
+  err_rune: [Byte] = [0xEF, 0xBF, 0xBD]
+  (1, err_rune, false)
+}
+
+# A trailing \r dropped.
+def drop_cr(data: [Byte]) -> [Byte] {
+  return data[0...data.size - 1] if data.size > 0 && data[data.size - 1] == 13
+  data
+}
+
+# Each line is a token, without its "\n" or "\r\n"; the last line may be
+# unterminated, and an empty final line isn't a token.
+pub def scan_lines(data: [Byte], at_eof: Bool) -> ~(Int, [Byte]?, Bool) {
+  return (0, none, false) if at_eof && data.size == 0
+  i = 0
+  while i < data.size {
+    # We have a full newline-terminated line.
+    return (i + 1, drop_cr(data[0...i]), false) if data[i] == 10
+    i += 1
   }
-  if mode == 3 {
-    return 1, start, start + 1, start + 1
+  # If we're at EOF, we have a final, non-terminated line. Return it.
+  return (data.size, drop_cr(data), false) if at_eof
+  # Request more data.
+  (0, none, false)
+}
+
+# Go's isSpace: unicode.IsSpace without the tables.
+def space?(r: Rune) -> Bool {
+  if r <= 0xFF {
+    return r == 32 || (r >= 9 && r <= 13) || r == 0x85 || r == 0xA0
   }
-  if mode == 2 {
-    c = buf[start]
-    return 1, start, start + 1, start + 1 if c < 0x80
-    e = stop
-    e = start + 4 if e > start + 4
-    return 0, 0, 0, start if !eof && !utf8.full_rune(buf[start...e])
-    _, size = utf8.decode_rune(buf[start...e])
-    return 1, start, start + size, start + size
+  return true if 0x2000 <= r && r <= 0x200a
+  r == 0x1680 || r == 0x2028 || r == 0x2029 || r == 0x202f || r == 0x205f || r == 0x3000
+}
+
+# Each run of non-space characters (Unicode spaces) is a token.
+pub def scan_words(data: [Byte], at_eof: Bool) -> ~(Int, [Byte]?, Bool) {
+  # Skip leading spaces.
+  start = 0
+  while start < data.size {
+    rr, width = utf8.decode_rune(data[start...data.size])
+    break if !space?(rr)
+    start += width
   }
-  # Words: skip leading spaces.
+  # Scan until space, marking end of word.
   i = start
-  while i < stop {
-    c = buf[i]
-    if c < 0x80 {
-      break if !(c == 32 || (c >= 9 && c <= 13))
-      i += 1
-    } else {
-      e = stop
-      e = i + 4 if e > i + 4
-      break if !eof && !utf8.full_rune(buf[i...e])
-      rr, size = utf8.decode_rune(buf[i...e])
-      break if !unicode.is_space(rr)
-      i += size
-    }
+  while i < data.size {
+    rr, width = utf8.decode_rune(data[i...data.size])
+    return (i + width, data[start...i], false) if space?(rr)
+    i += width
   }
-  # The word ends at the next space.
-  j = i
-  while j < stop {
-    c = buf[j]
-    if c < 0x80 {
-      return 1, i, j, j + 1 if c == 32 || (c >= 9 && c <= 13)
-      j += 1
-    } else {
-      e = stop
-      e = j + 4 if e > j + 4
-      break if !eof && !utf8.full_rune(buf[j...e])
-      rr, size = utf8.decode_rune(buf[j...e])
-      return 1, i, j, j + size if unicode.is_space(rr)
-      j += size
-    }
-  }
-  return 1, i, j, j if eof && j > i
-  return 2, 0, 0, i if eof
-  (0, 0, 0, i)
-}
-
-pub def new_scanner(src: io.Reader) -> Scanner {
-  cell: [ScannerState] = [ScannerState.new(buf: zeros(DEFAULT_SIZE), start: 0, stop: 0, ts: 0, te: 0, mode: 0, max_tok: MAX_SCAN_TOKEN_SIZE, eof: false, fail_kind: 0, fail_msg: "")]
-  Scanner.new(src: src, cell: cell)
+  # If we're at EOF, we have a final, non-empty, non-terminated word.
+  return (data.size, data[start...data.size], false) if at_eof && data.size > start
+  # Request more data.
+  (start, none, false)
 }

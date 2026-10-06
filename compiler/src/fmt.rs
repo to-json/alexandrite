@@ -265,7 +265,9 @@ pub fn format(src: &str) -> Result<String, String> {
                 pending.push(id.trim_matches(|c| c == '"' || c == '\'').to_string());
             }
         }
-        let pre_tight = prev.is_some_and(|(pi, _, pv)| op(&toks[pi].tok).is_some() && !pv);
+        // `{` after an operator is a hash literal (tight), except after `->`
+        // (a lambda body) and `=>` (a braced case arm): those are blocks.
+        let pre_tight = prev.is_some_and(|(pi, _, pv)| op(&toks[pi].tok).is_some_and(|o| o != "->" && o != "=>") && !pv);
         let (k, v) = match prev {
             Some((pi, pk, pv)) => {
                 let (sp, k, v) = step(&toks, i, pi, pk, pv, &mut st);

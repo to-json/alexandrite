@@ -37,12 +37,16 @@ Not known: how many pre-existing errors check-all surfaces in std; whether the s
 
 Ordered; 0.1 and 0.2 gate the rest.
 
-### 0.1 Memory and stdin probe
+### 0.1 Memory and stdin probe (done 2026-10-06)
 
-A 50-line program: reader task reads framed messages from stdin, sends them over a `Chan` to an owner task that replaces an entry in a `Map[Str, Str]` and runs a debounce `select`; drive it with 10k × 100 KB messages. Record `max_rss`, `alx explain mem` output, and whether the owner stalls when both tasks land on one worker. Outcomes:
+Probe: 10k framed messages of 100 KB on stdin, each stored by replacing one `Map[Str, Str]` entry; `alx build --release`, macOS `time -l`.
 
-- flat and responsive → server shape as in 2.4;
-- leaks or stalls → pick one before Stream 2 starts: a single-task loop with no `Chan` (store created in the loop function, R3 shape), or fix port-issues #169 / #166 in `regions.rs` / the runtime. Record the choice in this plan.
+| Shape | max RSS |
+|---|---|
+| single task, `read_msg` loop, store in the loop's function | 14.6 MB |
+| reader task → `Chan[Str]` → owner task | **2,566 MB** |
+
+A value sent on a `Chan` lives in the program region and is never freed (R1, port-issues #169 territory). **Decision: the server is a single-task loop with no `Chan` and no `spawn`.** Debounce and compiler runs happen in that loop (2.4, 0.5). The probe is `docs/notes/lsp-probe-memory.alx`.
 
 ### 0.2 Checker recovery spike
 
@@ -58,10 +62,11 @@ Throwaway branch: 1.3's unit selection plus root-level recovery, run on `std/str
 - `SourceMap` file names carry real absolute paths for files that exist on disk (std included, `$std/rel` mapped back to `ALX_STD_DIR/rel`); synthetic files (`<builtin>`, the test runner) keep their names and are reported on the focused file.
 - `load_tests` and `embed::resolve` take the same `read`/`list`.
 
-### 0.5 stdin wait and process control (std)
+### 0.5 Timed readability wait and process control (std, runtime)
 
-- `os.File` read on fd 0 parks the task on the poller (as `alx_sys_poll2`; the `alx_fd_wait` extern exists in `net.alx`) instead of blocking the worker. Only needed if 0.1 shows the stall, or for any stdin-reading server shape.
-- `os/exec` gets `Cmd.kill` and a timeout (Go's `Process.Kill`, `exec.CommandContext` shape), documented in the package header. Needed to cancel superseded checks and survive a hung compiler.
+- `os.File.wait_readable(timeout: Duration) -> ~Bool`: true when a read would not block (data, EOF or error pending), false on timeout. An alx extension (Go has `SetReadDeadline`); documented in the `os` header. On the main thread it is `poll(2)` with a timeout; in a task it parks on the poller. The server's debounce is `if buffered == 0 && !stdin.wait_readable(150ms)`, with bytes already in the `bufio.Reader` checked first. Runtime function in `alx.c` (the JIT links the same C); the oracle and wasm either implement it or refuse it as they do other FFI.
+- `os/exec` gets `Cmd.timeout` (a `Duration`; the child is killed when it expires and the run fails with a timeout error) and `Process.kill`, documented in the package header (Go: `exec.CommandContext`, `Process.Kill`). The server uses the timeout to survive a hung compiler.
+- Blocking stdin reads inside tasks (port-issues #166) are fixed only if cheap; the server is single-task and does not depend on it.
 
 Port-issues #166 and #169 are updated with what is found, whatever the outcome.
 
@@ -138,7 +143,7 @@ In `Parser::module`'s declaration loop, record the error, skip to the next top-l
 
 ### 2.4 Store and scheduler
 
-Per 0.1: either one task owning all state with a reader task and `select` over message and result channels plus `time.after` (150 ms debounce), or a single-task loop. Either way: one compiler process in flight; results carry the document versions they were computed from; stale results are dropped and the check reruns if anything changed meanwhile; a superseded run is killed (0.5). Per unit the server remembers which URIs it last published to, so diagnostics in files that are not open are cleared when they go away.
+Per 0.1: either one task owning all state with a reader task and `select` over message and result channels plus `time.after` (150 ms debounce), or a single-task loop. One loop on the main task: read a message; handle it; when stdin has nothing buffered or pending for 150 ms (0.5) and a document changed since the last check, run the compiler (synchronously, with a timeout) and publish. Messages that arrive during a run queue in the pipe and are handled next; the result is published only if the checked versions are still current, else the check reruns. Per unit the server remembers which URIs it last published to, so diagnostics in files that are not open are cleared when they go away.
 
 **Which units recheck:** the edited file's unit; and every other open buffer whose unit imports the edited package (the server tracks imports from the last successful check's file list).
 

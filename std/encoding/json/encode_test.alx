@@ -1,0 +1,809 @@
+#![test(external)]
+# Go's encode_test.go (go1.27, the jsonv2-backed build), translated.
+#
+# alx has no nil slices and maps (an empty one is the zero value), so Go's
+# `null` for a nil slice or map is `[]` / `{}` here, and omitzero omits an
+# empty one (Go keeps a non-nil empty one). The embedding tests spell Go's
+# names with a lower-case first letter (see decode_types_test.alx).
+#
+# Not translated, and why:
+#   TestOmitZero's interface-typed fields (isZeroer holding nil, a
+#     time.Time, a nil or non-nil *NoPanicStruct): no interface fields in a
+#     derived type.
+#   TestEncodeRenamedByteSlice, the named byte types of TestEncodeBytekind:
+#     alx has no named []byte / byte types.
+#   TestUnsupportedValues' cycles, TestMarshalErrorAndReuseEncodeState's
+#     cycle: alx values can't refer to themselves (no pointers).
+#   TestMarshalTextFloatMap, TestTextMarshalerMapKeysAreSorted,
+#     TestNilMarshalerTextMapKey: alx Map keys are integers, Str or Bool.
+#   TestNilMarshal's nil interface values and nil pointers with methods: no
+#     nil in alx; the struct case is below.
+#   TestMarshalRawMessageValue's empty non-nil RawMessage: alx can't tell it
+#     from nil (both are empty; both write null).
+#   TestMarshalFloat's float32 half: alx has no float32.
+
+import "encoding/json"
+import "math"
+import "regexp"
+import "strconv"
+
+#[derive(Json)]
+struct Empty2 {
+}
+
+#[derive(Json)]
+struct OptionalsEmpty {
+  #[json("sr")] sr: Str
+  #[field(json: "so,omitempty")] so: Str
+  #[json(skip)] sw: Str
+  # actually named omitempty, not an option
+  #[json("omitempty")] ir: Int
+  #[field(json: "io,omitempty")] io: Int
+  #[field(json: "slr,random")] slr: [Str]
+  #[field(json: "slo,omitempty")] slo: [Str]
+  #[json("mr")] mr: Map[Str, json.Value]
+  #[field(json: ",omitempty")] mo: Map[Str, json.Value]
+  #[json("fr")] fr: Float
+  #[field(json: "fo,omitempty")] fo: Float
+  #[json("br")] br: Bool
+  #[field(json: "bo,omitempty")] bo: Bool
+  #[json("ur")] ur: U64
+  #[field(json: "uo,omitempty")] uo: U64
+  #[json("str")] str: Empty2
+  #[field(json: "sto,omitempty")] sto: Empty2
+}
+
+test "TestOmitEmpty" {
+  want = "{\n \"sr\": \"\",\n \"omitempty\": 0,\n \"slr\": [],\n \"mr\": {},\n \"fr\": 0,\n \"br\": false,\n \"ur\": 0,\n \"str\": {},\n \"sto\": {}\n}"
+  o = OptionalsEmpty.new(sw: "something")
+  assert_eq json.~marshal_indent(o, "", " "), want
+}
+
+#[derive(Json)]
+struct NonZeroStruct {
+  def zero? -> Bool { false }
+}
+
+#[derive(Json)]
+struct NoPanicStruct {
+  #[field(json: "int,omitzero")] int: Int
+
+  def zero? -> Bool { int != 0 }
+}
+
+#[derive(Json)]
+struct OptionalsZero {
+  #[json("sr")] sr: Str
+  #[field(json: "so,omitzero")] so: Str
+  #[json(skip)] sw: Str
+  # actually named omitzero, not an option
+  #[json("omitzero")] ir: Int
+  #[field(json: "io,omitzero")] io: Int
+  #[field(json: "slr,random")] slr: [Str]
+  #[field(json: "slo,omitzero")] slo: [Str]
+  #[field(json: "slononnil,omitzero")] slo_non_nil: [Str]
+  #[json("mr")] mr: Map[Str, json.Value]
+  #[field(json: "Mo,omitzero")] mo: Map[Str, json.Value]
+  #[field(json: "moo,omitzero")] moo: Map[Str, json.Value]
+  #[json("fr")] fr: Float
+  #[field(json: "fo,omitzero")] fo: Float
+  #[field(json: "foo,omitzero")] foo: Float
+  #[field(json: "foo2,omitzero")] foo2: [Float; 2]
+  #[json("br")] br: Bool
+  #[field(json: "bo,omitzero")] bo: Bool
+  #[json("ur")] ur: U64
+  #[field(json: "uo,omitzero")] uo: U64
+  #[json("str")] str: Empty2
+  #[field(json: "sto,omitzero")] sto: Empty2
+  #[field(json: "time,omitzero")] time: time.Time
+  #[field(json: "timelocal,omitzero")] time_local: time.Time
+  #[field(json: "nzs,omitzero")] nzs: NonZeroStruct
+  # nil pointer
+  #[field(json: "nps2,omitzero")] no_panic_struct2: NoPanicStruct?
+  # non-nil pointer
+  #[field(json: "nps3,omitzero")] no_panic_struct3: NoPanicStruct?
+  # concrete type
+  #[field(json: "nps4,omitzero")] no_panic_struct4: NoPanicStruct
+}
+
+test "TestOmitZero" {
+  # Go keeps "slononnil": [] and "Mo": {} (non-nil, so not zero); alx has no nil
+  want = "{\n \"sr\": \"\",\n \"omitzero\": 0,\n \"slr\": [],\n \"mr\": {},\n \"fr\": 0,\n \"br\": false,\n \"ur\": 0,\n \"str\": {},\n \"nzs\": {},\n \"nps3\": {},\n \"nps4\": {}\n}"
+  o = OptionalsZero.new(sw: "something", foo: -0.0, foo2: [0.0, -0.0], time_local: time.Time.new.local, no_panic_struct3: NoPanicStruct.new)
+  assert_eq json.~marshal_indent(o, "", " "), want
+}
+
+#[derive(Json)]
+#[json(transparent)]
+struct OptionalsZeroMap {
+  v: Map[Str, OptionalsZero]
+}
+
+test "TestOmitZeroMap" {
+  # Go's "slr" and "mr" are null (nil); alx has no nil
+  want = "{\n \"foo\": {\n  \"sr\": \"\",\n  \"omitzero\": 0,\n  \"slr\": [],\n  \"mr\": {},\n  \"fr\": 0,\n  \"br\": false,\n  \"ur\": 0,\n  \"str\": {},\n  \"nzs\": {},\n  \"nps4\": {}\n }\n}"
+  m = OptionalsZeroMap.new(v: {"foo" => OptionalsZero.new})
+  assert_eq json.~marshal_indent(m, "", " "), want
+}
+
+#[derive(Json)]
+struct OptionalsEmptyZero {
+  #[json("sr")] sr: Str
+  #[field(json: "so,omitempty,omitzero")] so: Str
+  #[json(skip)] sw: Str
+  #[field(json: "io,omitempty,omitzero")] io: Int
+  #[field(json: "slr,random")] slr: [Str]
+  #[field(json: "slo,omitempty,omitzero")] slo: [Str]
+  #[field(json: "slononnil,omitempty,omitzero")] slo_non_nil: [Str]
+  #[json("mr")] mr: Map[Str, json.Value]
+  #[field(json: "Mo,omitempty,omitzero")] mo: Map[Str, json.Value]
+  #[json("fr")] fr: Float
+  #[field(json: "fo,omitempty,omitzero")] fo: Float
+  #[json("br")] br: Bool
+  #[field(json: "bo,omitempty,omitzero")] bo: Bool
+  #[json("ur")] ur: U64
+  #[field(json: "uo,omitempty,omitzero")] uo: U64
+  #[json("str")] str: Empty2
+  #[field(json: "sto,omitempty,omitzero")] sto: Empty2
+  #[field(json: "time,omitempty,omitzero")] time: time.Time
+  #[field(json: "nzs,omitempty,omitzero")] nzs: NonZeroStruct
+}
+
+test "TestOmitEmptyZero" {
+  want = "{\n \"sr\": \"\",\n \"slr\": [],\n \"mr\": {},\n \"fr\": 0,\n \"br\": false,\n \"ur\": 0,\n \"str\": {},\n \"nzs\": {}\n}"
+  o = OptionalsEmptyZero.new(sw: "something")
+  assert_eq json.~marshal_indent(o, "", " "), want
+}
+
+#[derive(Json)]
+struct StringTag {
+  #[field(json: "BoolStr,string")] bool_str: Bool
+  #[field(json: "IntStr,string")] int_str: Int
+  #[field(json: "UintptrStr,string")] uintptr_str: U64
+  #[field(json: "StrStr,string")] str_str: Str
+  #[field(json: "NumberStr,string")] number_str: json.Number
+}
+
+test "TestRoundtripStringTag" {
+  tests = [
+    (StringTag.new(bool_str: true, int_str: 42, uintptr_str: 44, str_str: "xzbit", number_str: json.Number.new(s: "46")), "{\n\t\"BoolStr\": \"true\",\n\t\"IntStr\": \"42\",\n\t\"UintptrStr\": \"44\",\n\t\"StrStr\": \"\\\"xzbit\\\"\",\n\t\"NumberStr\": \"46\"\n}"),
+    # See golang.org/issues/38173.
+    (StringTag.new(str_str: "\b\f\n\r\t\"\\", number_str: json.Number.new(s: "0")), "{\n\t\"BoolStr\": \"false\",\n\t\"IntStr\": \"0\",\n\t\"UintptrStr\": \"0\",\n\t\"StrStr\": \"\\\"\\\\b\\\\f\\\\n\\\\r\\\\t\\\\\\\"\\\\\\\\\\\"\",\n\t\"NumberStr\": \"0\"\n}"),
+  ]
+  for t in tests {
+    got = json.~marshal_indent(t[0], "", "\t")
+    assert_eq got, t[1]
+    # Verify that it round-trips.
+    s2 = json.~unmarshal_into(got, StringTag.json_zero)
+    assert_eq json.~marshal(s2), json.~marshal(t[0])
+  }
+}
+
+#[derive(Json)]
+struct SamePointerNoCycle {
+  #[json("Ptr1")] ptr1: SamePointerNoCycle?
+  #[json("Ptr2")] ptr2: SamePointerNoCycle?
+}
+
+test "TestSamePointerNoCycle" {
+  p = SamePointerNoCycle.new
+  json.~marshal(SamePointerNoCycle.new(ptr1: p, ptr2: p))
+}
+
+test "TestSliceNoCycle" {
+  # Go nests a slice 1000 deep (past the depth where Go starts looking for
+  # cycles); a json.Value here
+  s = "[" * 1001 + "null,[null]" + "]" * 1001
+  v = json.~parse(s)
+  json.~marshal(v)
+}
+
+test "TestUnsupportedValues" {
+  for f in [0.0 / 0.0, -1.0 / 0.0, 1.0 / 0.0] {
+    r = json.marshal(f)
+    case r.err.unwrap {
+      json.JsonError.UnsupportedValue(_) => nil
+      _ => assert false, "want an UnsupportedValue error"
+    }
+  }
+}
+
+# Ref has Marshaler and Unmarshaler methods (pointer receivers in Go).
+#[derive(Json)]
+#[json(transparent)]
+struct Ref {
+  v: Int
+
+  def marshal_json -> ~[Byte] { "\"ref\"".bytes }
+
+  def unmarshal_json!(b: [Byte]) -> ~Unit {
+    self.v = 12
+  }
+}
+
+# Val has Marshaler methods with value receiver.
+#[derive(Json)]
+#[json(transparent)]
+struct Val {
+  v: Int
+
+  def marshal_json -> ~[Byte] { "\"val\"".bytes }
+}
+
+# RefText has Marshaler and Unmarshaler methods (pointer receivers in Go).
+#[derive(Json)]
+#[json(transparent)]
+struct RefText {
+  v: Int
+
+  def marshal_text -> ~[Byte] { "\"ref\"".bytes }
+
+  def unmarshal_text!(b: [Byte]) -> ~Unit {
+    self.v = 13
+  }
+}
+
+# ValText has Marshaler methods with value receiver.
+#[derive(Json)]
+#[json(transparent)]
+struct ValText {
+  v: Int
+
+  def marshal_text -> ~[Byte] { "\"val\"".bytes }
+}
+
+#[derive(Json)]
+struct RefValS {
+  #[json("R0")] r0: Ref
+  #[json("R1")] r1: Ref?
+  #[json("R2")] r2: RefText
+  #[json("R3")] r3: RefText?
+  #[json("V0")] v0: Val
+  #[json("V1")] v1: Val?
+  #[json("V2")] v2: ValText
+  #[json("V3")] v3: ValText?
+}
+
+test "TestRefValMarshal" {
+  s = RefValS.new(r0: Ref.new(v: 12), r1: Ref.new, r2: RefText.new(v: 14), r3: RefText.new, v0: Val.new(v: 13), v1: Val.new, v2: ValText.new(v: 15), v3: ValText.new)
+  want = "{\"R0\":\"ref\",\"R1\":\"ref\",\"R2\":\"\\\"ref\\\"\",\"R3\":\"\\\"ref\\\"\",\"V0\":\"val\",\"V1\":\"val\",\"V2\":\"\\\"val\\\"\",\"V3\":\"\\\"val\\\"\"}"
+  assert_eq json.~marshal(s), want
+}
+
+# C implements Marshaler and returns unescaped JSON.
+struct CMarshal {
+  def marshal_json -> ~[Byte] { "\"<&>\"".bytes }
+}
+
+# CText implements Marshaler and returns unescaped text.
+struct CText {
+  def marshal_text -> ~[Byte] { "\"<&>\"".bytes }
+}
+
+test "TestMarshalerEscaping" {
+  assert_eq json.~marshal(CMarshal.new), "\"\\u003c\\u0026\\u003e\""
+  assert_eq json.~marshal(CText.new), "\"\\\"\\u003c\\u0026\\u003e\\\"\""
+}
+
+# ---- TestAnonymousFields: Go's names with a lower-case first letter;
+# unexported fields are skipped.
+
+#[derive(Json)]
+struct AfS1 {
+  #[json(skip)] x_: Int
+  x: Int
+}
+
+#[derive(Json)]
+struct AfS2 {
+  #[json(skip)] x_: Int
+  x: Int
+}
+
+#[derive(Json)]
+struct AmbiguousField {
+  #[field(json: ",embed")] s1: AfS1
+  #[field(json: ",embed")] s2: AfS2
+}
+
+#[derive(Json)]
+struct DominantField {
+  #[field(json: ",embed")] s1: AfS1
+  #[field(json: ",embed")] s2: AfS2
+  #[json(skip)] x_: Int
+  x: Int
+}
+
+#[derive(Json)]
+struct ExportedEmbeddedInt {
+  # Go names an embedded non-struct after its type
+  #[field(json: ",embed")] myInt: Int
+}
+
+#[derive(Json)]
+struct ExportedEmbeddedIntPointer {
+  #[field(json: ",embed")] myInt: Int?
+}
+
+#[derive(Json)]
+struct Es1 {
+  #[json(skip)] x_: Int
+  x: Int
+}
+
+#[derive(Json)]
+struct EsS2 {
+  #[json(skip)] y_: Int
+  y: Int
+}
+
+#[derive(Json)]
+struct EmbeddedStruct {
+  #[field(json: ",embed")] s1: Es1
+  #[field(json: ",embed")] s2: EsS2
+}
+
+#[derive(Json)]
+struct EmbeddedStructPointer {
+  #[field(json: ",embed")] s1: Es1?
+  #[field(json: ",embed")] s2: EsS2?
+}
+
+#[derive(Json)]
+struct NsS2 {
+  #[field(json: ",embed")] myInt2: Int
+  #[json(skip)] my_int: Int
+}
+
+#[derive(Json)]
+struct NsS1 {
+  #[field(json: ",embed")] myInt1: Int
+  #[json(skip)] my_int: Int
+  #[field(json: ",embed")] s2: NsS2
+}
+
+#[derive(Json)]
+struct NestedStructAndInts {
+  #[field(json: ",embed")] s1: NsS1
+  #[json(skip)] my_int: Int
+}
+
+#[derive(Json)]
+struct FieldS2 {
+  field: Str
+}
+
+#[derive(Json)]
+struct EmbeddedFieldBehindNilPointer {
+  #[field(json: ",embed")] s2: FieldS2?
+}
+
+test "TestAnonymousFields" {
+  # Both S1 and S2 have a field named X: ambiguous, so neither is written.
+  assert_eq json.~marshal(AmbiguousField.new(s1: AfS1.new(x_: 1, x: 2), s2: AfS2.new(x_: 3, x: 4))), "{}"
+  # S's own X takes precedence over S1.X and S2.X.
+  assert_eq json.~marshal(DominantField.new(s1: AfS1.new(x_: 1, x: 2), s2: AfS2.new(x_: 3, x: 4), x_: 5, x: 6)), "{\"x\":6}"
+  # (UnexportedEmbeddedInt and UnexportedEmbeddedIntPointer: alx has no
+  # unexported types)
+  assert_eq json.~marshal(ExportedEmbeddedInt.new(myInt: 5)), "{\"myInt\":5}"
+  assert_eq json.~marshal(ExportedEmbeddedIntPointer.new(myInt: 5)), "{\"myInt\":5}"
+  assert_eq json.~marshal(EmbeddedStruct.new(s1: Es1.new(x_: 1, x: 2), s2: EsS2.new(y_: 3, y: 4))), "{\"x\":2,\"y\":4}"
+  assert_eq json.~marshal(EmbeddedStructPointer.new(s1: Es1.new(x_: 1, x: 2), s2: EsS2.new(y_: 3, y: 4))), "{\"x\":2,\"y\":4}"
+  assert_eq json.~marshal(NestedStructAndInts.new(s1: NsS1.new(myInt1: 1, my_int: 2, s2: NsS2.new(myInt2: 3, my_int: 4)), my_int: 6)), "{\"myInt1\":1,\"myInt2\":3}"
+  # An embedded struct behind a none is left out.
+  assert_eq json.~marshal(EmbeddedFieldBehindNilPointer.new), "{}"
+}
+
+#[derive(Json)]
+struct BugA {
+  s: Str
+}
+
+#[derive(Json)]
+struct BugB {
+  #[field(json: ",embed")] bug_a: BugA
+  s: Str
+}
+
+#[derive(Json)]
+struct BugC {
+  s: Str
+}
+
+# Legal Go: We never use the repeated embedded field (S).
+#[derive(Json)]
+struct BugX {
+  a: Int
+  #[field(json: ",embed")] bug_a: BugA
+  #[field(json: ",embed")] bug_b: BugB
+}
+
+# Same as BugA after tagging.
+#[derive(Json)]
+struct BugD {
+  #[json("s")] xxx: Str
+}
+
+# BugD's tagged S field should dominate BugA's.
+#[derive(Json)]
+struct BugY {
+  #[field(json: ",embed")] bug_a: BugA
+  #[field(json: ",embed")] bug_d: BugD
+}
+
+# There are no tags here, so S should not appear.
+#[derive(Json)]
+struct BugZ {
+  #[field(json: ",embed")] bug_a: BugA
+  #[field(json: ",embed")] bug_c: BugC
+  # Contains a tagged S field through BugD; should not dominate.
+  #[field(json: ",embed")] bug_y: BugY
+}
+
+#[derive(Json)]
+#[data("")]
+struct MString {
+  #[json("M")] m: Str
+}
+
+test "TestNilMarshal" {
+  # (the nil cases: see the header)
+  assert_eq json.~marshal(0.0), "0"
+  assert_eq json.~marshal(MString.new(m: "gopher")), "{\"M\":\"gopher\"}"
+}
+
+# Issue 5245.
+test "TestEmbeddedBug" {
+  v = BugB.new(bug_a: BugA.new(s: "A"), s: "B")
+  assert_eq json.~marshal(v), "{\"s\":\"B\"}"
+  # Now check that the duplicate field, S, does not appear.
+  x = BugX.new(a: 23)
+  assert_eq json.~marshal(x), "{\"a\":23}"
+}
+
+# Test that a field with a tag dominates untagged fields.
+test "TestTaggedFieldDominates" {
+  v = BugY.new(bug_a: BugA.new(s: "BugA"), bug_d: BugD.new(xxx: "BugD"))
+  assert_eq json.~marshal(v), "{\"s\":\"BugD\"}"
+}
+
+test "TestDuplicatedFieldDisappears" {
+  v = BugZ.new(bug_a: BugA.new(s: "BugA"), bug_c: BugC.new(s: "BugC"), bug_y: BugY.new(bug_a: BugA.new(s: "nested BugA"), bug_d: BugD.new(xxx: "nested BugD")))
+  assert_eq json.~marshal(v), "{}"
+}
+
+#[derive(Json)]
+struct Foo10281 {
+  #[json("N")] n: json.Number
+}
+
+test "TestIssue10281" {
+  x = Foo10281.new(n: json.Number.new(s: "invalid"))
+  assert json.marshal(x).err?, "Marshal error: got nil, want non-nil"
+}
+
+#[derive(Json)]
+struct Data {
+  #[json("A")] a: Str
+  #[json("I")] i: Int
+}
+
+test "TestMarshalErrorAndReuseEncodeState" {
+  # (Go's first half marshals a cycle: see the header)
+  want = Data.new(a: "a", i: 1)
+  b = json.~marshal(want)
+  got = json.~unmarshal_into(b, Data.json_zero)
+  assert_eq got.a, want.a
+  assert_eq got.i, want.i
+}
+
+test "TestHTMLEscape" {
+  m = "{\"M\":\"<html>foo &\u2028 \u2029</html>\"}"
+  want = "{\"M\":\"\\u003chtml\\u003efoo \\u0026\\u2028 \\u2029\\u003c/html\\u003e\"}"
+  assert_eq json.html_escape(m), want
+}
+
+#[derive(Json)]
+struct StringPointer {
+  #[field(json: "n,string")] n: Int?
+}
+
+# golang.org/issue/8582
+test "TestEncodePointerString" {
+  b = json.~marshal(StringPointer.new(n: 42))
+  assert_eq b, "{\"n\":\"42\"}"
+  back = json.~unmarshal_into(b, StringPointer.json_zero)
+  assert_eq back.n.unwrap, 42
+}
+
+test "TestEncodeString" {
+  tests = [
+    ("\x00", "\"\\u0000\""), ("\x01", "\"\\u0001\""), ("\x02", "\"\\u0002\""), ("\x03", "\"\\u0003\""),
+    ("\x04", "\"\\u0004\""), ("\x05", "\"\\u0005\""), ("\x06", "\"\\u0006\""), ("\x07", "\"\\u0007\""),
+    ("\x08", "\"\\b\""), ("\x09", "\"\\t\""), ("\x0a", "\"\\n\""), ("\x0b", "\"\\u000b\""),
+    ("\x0c", "\"\\f\""), ("\x0d", "\"\\r\""), ("\x0e", "\"\\u000e\""), ("\x0f", "\"\\u000f\""),
+    ("\x10", "\"\\u0010\""), ("\x11", "\"\\u0011\""), ("\x12", "\"\\u0012\""), ("\x13", "\"\\u0013\""),
+    ("\x14", "\"\\u0014\""), ("\x15", "\"\\u0015\""), ("\x16", "\"\\u0016\""), ("\x17", "\"\\u0017\""),
+    ("\x18", "\"\\u0018\""), ("\x19", "\"\\u0019\""), ("\x1a", "\"\\u001a\""), ("\x1b", "\"\\u001b\""),
+    ("\x1c", "\"\\u001c\""), ("\x1d", "\"\\u001d\""), ("\x1e", "\"\\u001e\""), ("\x1f", "\"\\u001f\""),
+  ]
+  for t in tests {
+    assert_eq json.~marshal(t[0]), t[1]
+  }
+}
+
+# Go: type jsonbyte byte etc. (alx: one-field structs with the methods).
+struct JsonByte {
+  v: U8
+  def marshal_json -> ~[Byte] { "{\"JB\":#{v}}".bytes }
+}
+
+struct TextByte {
+  v: U8
+  def marshal_text -> ~[Byte] { "TB:#{v}".bytes }
+}
+
+struct JsonInt {
+  v: Int
+  def marshal_json -> ~[Byte] { "{\"JI\":#{v}}".bytes }
+}
+
+struct TextInt {
+  v: Int
+  def marshal_text -> ~[Byte] { "TI:#{v}".bytes }
+}
+
+struct TextFloat {
+  v: Float
+  def marshal_text -> ~[Byte] { "TF:#{strconv.format_float(v, "f", 2, 64)}".bytes }
+}
+
+#[derive(Json)]
+#[json(transparent)]
+struct JsonBytes {
+  v: [JsonByte]
+}
+
+#[derive(Json)]
+#[json(transparent)]
+struct JsonBytes2 {
+  v: [[JsonByte]]
+}
+
+#[derive(Json)]
+#[json(transparent)]
+struct TextBytes {
+  v: [TextByte]
+}
+
+#[derive(Json)]
+#[json(transparent)]
+struct JsonInts {
+  v: [JsonInt]
+}
+
+#[derive(Json)]
+#[json(transparent)]
+struct TextInts {
+  v: [TextInt]
+}
+
+#[derive(Json)]
+#[json(transparent)]
+struct Ints2 {
+  v: [Int]
+}
+
+#[derive(Json)]
+#[json(transparent)]
+struct TextFloats {
+  v: [TextFloat]
+}
+
+#[derive(Json)]
+#[json(transparent)]
+struct ByteSlice {
+  v: [Byte]
+}
+
+# Issue 13783
+test "TestEncodeBytekind" {
+  b: U8 = 7
+  assert_eq json.~marshal(b), "7"
+  assert_eq json.~marshal(JsonByte.new(v: 7)), "{\"JB\":7}"
+  assert_eq json.~marshal(TextByte.new(v: 4)), "\"TB:4\""
+  assert_eq json.~marshal(JsonInt.new(v: 5)), "{\"JI\":5}"
+  assert_eq json.~marshal(TextInt.new(v: 1)), "\"TI:1\""
+  assert_eq json.~marshal(ByteSlice.new(v: [0, 1])), "\"AAE=\""
+  assert_eq json.~marshal(JsonBytes.new(v: [JsonByte.new(v: 0), JsonByte.new(v: 1)])), "[{\"JB\":0},{\"JB\":1}]"
+  assert_eq json.~marshal(JsonBytes2.new(v: [[JsonByte.new(v: 0), JsonByte.new(v: 1)], [JsonByte.new(v: 3)]])), "[[{\"JB\":0},{\"JB\":1}],[{\"JB\":3}]]"
+  assert_eq json.~marshal(TextBytes.new(v: [TextByte.new(v: 2), TextByte.new(v: 3)])), "[\"TB:2\",\"TB:3\"]"
+  assert_eq json.~marshal(JsonInts.new(v: [JsonInt.new(v: 5), JsonInt.new(v: 4)])), "[{\"JI\":5},{\"JI\":4}]"
+  assert_eq json.~marshal(TextInts.new(v: [TextInt.new(v: 9), TextInt.new(v: 3)])), "[\"TI:9\",\"TI:3\"]"
+  assert_eq json.~marshal(Ints2.new(v: [9, 3])), "[9,3]"
+  assert_eq json.~marshal(TextFloats.new(v: [TextFloat.new(v: 12.0), TextFloat.new(v: 3.0)])), "[\"TF:12.00\",\"TF:3.00\"]"
+}
+
+# syntactic checks on form of marshaled floating point numbers.
+def bad_float_res -> [regexp.Regexp] {
+  [
+    # no binary exponential notation
+    regexp.must_compile("p"),
+    # no leading + sign
+    regexp.must_compile("^\\+"),
+    # no unnecessary leading zeros
+    regexp.must_compile("^-?0[^.]"),
+    # leading zero required before decimal point
+    regexp.must_compile("^-?\\."),
+    # no trailing decimal
+    regexp.must_compile("\\.(e|$)"),
+    # no trailing zero in fraction
+    regexp.must_compile("\\.[0-9]+0(e|$)"),
+    # exponential notation must have normalized mantissa
+    regexp.must_compile("^-?(0|[0-9]{2,})\\..*e"),
+    # positive exponent must be signed
+    regexp.must_compile("e[0-9]"),
+    # exponent must not have leading zeros
+    regexp.must_compile("e[+-]0"),
+    # not tiny enough for exponential notation
+    regexp.must_compile("e-[1-6]$"),
+    # not big enough for exponential notation
+    regexp.must_compile("e+(.|1.|20)$"),
+    # too tiny, should use exponential notation
+    regexp.must_compile("^-?0\\.0000000"),
+    # too big, should use exponential notation
+    regexp.must_compile("^-?[0-9]{22}"),
+    # too many significant digits in integer
+    regexp.must_compile("[1-9][0-9]{16}[1-9]"),
+    # too many significant digits in decimal
+    regexp.must_compile("[1-9][0-9.]{17}[1-9]"),
+  ]
+}
+
+def check_float(f: Float, bad: [regexp.Regexp]) -> Str? {
+  out = json.~marshal(f).unwrap_or("ERR")
+  g = strconv.parse_float(out)
+  return "parse_float(#{out})" if g.err?
+  return "#{out} reads back as #{g.unwrap}" if g.unwrap != f || (f == 0.0 && (1.0 / f > 0.0) != (1.0 / g.unwrap > 0.0))
+  for re in bad {
+    return "#{out} must not match /#{re}/" if re.match_string?(out)
+  }
+  none
+}
+
+test "TestMarshalFloat" {
+  bad = bad_float_res()
+  bigger = 1.0 / 0.0
+  smaller = -1.0 / 0.0
+  digits = "1.2345678901234567890123"
+  i = digits.size
+  while i >= 2 {
+    exp = -30
+    while exp <= 30 {
+      for sign in ["+", "-"] {
+        s = sign + digits[0...i] + "e" + exp.to_s
+        f = strconv.~parse_float(s)
+        for x in [f, math.nextafter(f, bigger), math.nextafter(f, smaller)] {
+          if m = check_float(x, bad) {
+            assert false, m
+          }
+        }
+      }
+      exp += 1
+    }
+    i -= 1
+  }
+  assert check_float(0.0, bad).none?
+  assert check_float(math.copysign(0.0, -1.0), bad).none?
+}
+
+#[derive(Json)]
+#[data("")]
+struct RawT1 {
+  #[field(json: ",omitempty")] m: json.RawMessage
+}
+
+#[derive(Json)]
+#[data("")]
+struct RawT2 {
+  #[field(json: ",omitempty")] m: json.RawMessage?
+}
+
+#[derive(Json)]
+#[data("")]
+struct RawM {
+  #[json("M")] m: json.RawMessage
+}
+
+#[derive(Json)]
+#[data("")]
+struct RawPM {
+  #[json("M")] m: json.RawMessage?
+}
+
+#[derive(Json)]
+#[json(transparent)]
+struct RawSlice {
+  v: [json.RawMessage]
+}
+
+#[derive(Json)]
+#[json(transparent)]
+struct RawMap {
+  v: Map[Str, json.RawMessage]
+}
+
+test "TestMarshalRawMessageValue" {
+  raw_nil = json.RawMessage.json_zero
+  raw_text = json.RawMessage.from("\"foo\"")
+  # with nil RawMessage
+  assert_eq json.~marshal(raw_nil), "null"
+  assert_eq json.~marshal(RawSlice.new(v: [raw_nil])), "[null]"
+  assert_eq json.~marshal(RawM.new(m: raw_nil)), "{\"M\":null}"
+  assert_eq json.~marshal(RawPM.new(m: raw_nil)), "{\"M\":null}"
+  assert_eq json.~marshal(RawMap.new(v: {"M" => raw_nil})), "{\"M\":null}"
+  assert_eq json.~marshal(RawT1.new(m: raw_nil)), "{}"
+  assert_eq json.~marshal(RawT2.new(m: raw_nil)), "{\"M\":null}"
+  # with RawMessage with some text (Go 1.8 and later write it as it is)
+  assert_eq json.~marshal(raw_text), "\"foo\""
+  assert_eq json.~marshal(RawSlice.new(v: [raw_text])), "[\"foo\"]"
+  assert_eq json.~marshal(RawM.new(m: raw_text)), "{\"M\":\"foo\"}"
+  assert_eq json.~marshal(RawPM.new(m: raw_text)), "{\"M\":\"foo\"}"
+  assert_eq json.~marshal(RawMap.new(v: {"M" => raw_text})), "{\"M\":\"foo\"}"
+  assert_eq json.~marshal(RawT1.new(m: raw_text)), "{\"M\":\"foo\"}"
+  assert_eq json.~marshal(RawT2.new(m: raw_text)), "{\"M\":\"foo\"}"
+}
+
+struct MarshalPanic {
+  def marshal_json -> ~[Byte] { panic "0xdead" }
+}
+
+test "TestMarshalPanic" {
+  assert_panics("0xdead") { json.marshal(MarshalPanic.new) }
+}
+
+#[derive(Json)]
+#[data("")]
+struct Uncommon {
+  #[json("A0")] a0: Int
+  #[json("À")] a_grave: Int
+  #[json("Aβ")] a_beta: Int
+}
+
+test "TestMarshalUncommonFieldNames" {
+  assert_eq json.~marshal(Uncommon.new), "{\"A0\":0,\"À\":0,\"Aβ\":0}"
+}
+
+test "TestMarshalerError" {
+  err_text = "json: test error"
+  e = json.JsonError.Marshaler(type_name: "Str", cause: err_text, source_func: "")
+  assert_eq e.message, "json: error calling marshal_json for type Str: " + err_text
+  e = json.JsonError.Marshaler(type_name: "Str", cause: err_text, source_func: "TestMarshalerError")
+  assert_eq e.message, "json: error calling TestMarshalerError for type Str: " + err_text
+}
+
+struct MarshaledValue {
+  v: Str
+  def marshal_json -> ~[Byte] { v.bytes }
+}
+
+test "TestIssue63379" {
+  for v in ["[]<", "[]>", "[]&", "[]\u2028", "[]\u2029", "{}<", "{}>", "{}&", "{}\u2028", "{}\u2029"] {
+    assert json.marshal(MarshaledValue.new(v: v)).err?, "expected error for #{v}"
+  }
+}
+
+#[derive(Json)]
+#[json(transparent)]
+struct Strs {
+  v: [Str]
+}
+
+# Issue #73733 (Go: marshaling from several synctest bubbles at once): here,
+# from several tasks at once.
+test "TestSynctestMarshal" {
+  tasks = (0...5).map { spawn { json.marshal(Strs.new(v: [])).unwrap } }
+  for t in tasks {
+    assert_eq t.~wait, "[]"
+  }
+}

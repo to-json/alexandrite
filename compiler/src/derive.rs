@@ -750,6 +750,10 @@ impl<'a> Gen<'a> {
             },
             TypeExpr::App(n, ..) if n == "Map" => Some(format!("{x}.size == 0")),
             TypeExpr::Opt(..) => Some(format!("{x}.none?")),
+            // Go's RawMessage is a []byte, Number a string, any an interface
+            TypeExpr::Named(n, _) if *n == format!("{}.RawMessage", self.alias) => Some(format!("{x}.data.size == 0")),
+            TypeExpr::Named(n, _) if *n == format!("{}.Number", self.alias) => Some(format!("{x}.to_s.size == 0")),
+            TypeExpr::Named(n, _) if *n == format!("{}.Value", self.alias) => Some(format!("{x}.null?")),
             _ => None,
         }
     }
@@ -760,7 +764,8 @@ impl<'a> Gen<'a> {
         match t {
             TypeExpr::Named(n, _) if self.shadowed(n) => format!("{}.is_zero({x})", self.alias),
             TypeExpr::Named(n, _) if IntKind::from_name(n).is_some() => format!("{x} == 0"),
-            TypeExpr::Named(n, _) if n == "Float" || n == "F64" => format!("({x} == 0.0 && 1.0 / {x} > 0.0)"),
+            // (Go 1.27 omits -0 too)
+            TypeExpr::Named(n, _) if n == "Float" || n == "F64" => format!("{x} == 0.0"),
             TypeExpr::Named(n, _) if n == "Bool" => format!("!{x}"),
             TypeExpr::Named(n, _) if n == "Str" => format!("{x}.size == 0"),
             TypeExpr::Named(..) => format!("{}.is_zero({x})", self.alias),
@@ -878,6 +883,11 @@ impl<'a> Gen<'a> {
             Ty::Bool => self.w(ind, format!("{dest} = _d.{}({old})", if quoted { "qbool!" } else { "bool!" })),
             Ty::Str => self.w(ind, format!("{dest} = _d.{}({old})", if quoted { "qstr!" } else { "str!" })),
             Ty::Named(n) if quoted && n == format!("{a}.Number") => self.w(ind, format!("{dest} = {a}.dec_qnumber(_d, {old})")),
+            Ty::Named(_) if old.ends_with(".zero_value()") => {
+                let z = self.fresh("z");
+                self.w(ind, format!("{z}: {} = {old}", type_src(t)));
+                self.w(ind, format!("{dest} = {a}.dec_val(_d, {z})"));
+            }
             Ty::Named(_) => self.w(ind, format!("{dest} = {a}.dec_val(_d, {old})")),
             Ty::Opt(inner) => {
                 let (v, ov) = (self.fresh("v"), self.fresh("ov"));
@@ -914,7 +924,9 @@ impl<'a> Gen<'a> {
                 self.w(ind, format!("{dest}: {} = {old}", type_src(t)));
                 self.w(ind, format!("{st} = _d.open!(91, {})", lit(&type_src(t))));
                 self.w(ind, format!("if {st} == 1 {{"));
-                self.w(ind + 1, format!("{acc}: {} = [{z}; {n}]", type_src(t)));
+                let ze = self.fresh("z");
+                self.w(ind + 1, format!("{ze}: {} = {z}", type_src(inner)));
+                self.w(ind + 1, format!("{acc}: {} = [{ze}; {n}]", type_src(t)));
                 self.w(ind + 1, format!("{i} = 0"));
                 self.w(ind + 1, "while _d.more! {");
                 self.w(ind + 2, format!("if {i} < {n} {{"));
@@ -993,7 +1005,10 @@ impl<'a> Gen<'a> {
             TypeExpr::Named(n, _) if n == "Complex" => "Complex.new(0.0, 0.0)".into(),
             // a struct of this file that doesn't derive Json (a hand-written Marshaler)
             TypeExpr::Named(n, _) if self.types.local.get(n.as_str()) == Some(&false) && !self.types.enums.contains(n.as_str()) => format!("{n}.new"),
-            TypeExpr::Named(n, _) if !self.tparams.contains(n) => format!("{n}.json_zero"),
+            // a type of this file that derives Json
+            TypeExpr::Named(n, _) if self.types.local.get(n.as_str()) == Some(&true) => format!("{n}.json_zero"),
+            // another package's type: its json_zero when it was derived, else `T.new`
+            TypeExpr::Named(n, _) if !self.tparams.contains(n) => format!("{}.zero_value()", self.alias),
             TypeExpr::Array(..) => "[]".into(),
             TypeExpr::Fixed(e, n, _) => match &n.kind {
                 ExprKind::Int(v) => format!("[{}; {v}]", self.zero(e)?),
@@ -1145,6 +1160,7 @@ pub fn json_source(job: &DeriveJob, alias: &str, types: &ModuleTypes, lenient: b
         }
     }
     g.w(1, "}");
+    g.w(1, format!("{pubk}def json_derived -> Bool {{ true }}"));
     // ---- omitzero
     if let DShape::Struct(fields) = &job.shape {
         let zs: Vec<String> = fields.iter().filter(|f| !f.opts.skip).map(|f| g.is_zero(&f.ty, &format!("self.{}", f.name))).collect();

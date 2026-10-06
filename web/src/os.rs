@@ -31,6 +31,7 @@ pub const EXTERNS: &[(&str, &str, &str)] = &[
     ("pread", "alxr_nosys_fd_buf_off", "jjjjjj>j"),
     ("pwrite", "alxr_nosys_fd_buf_off", "jjjjjj>j"),
     ("close", "alxr_close", "j>j"),
+    ("alx_fd_close", "alxr_fd_close", "j>j"),
     ("lseek", "alxr_lseek", "jjj>j"),
     ("fsync", "alxr_nosys_fd", "j>j"),
     ("ftruncate", "alxr_nosys_fd_int", "jj>j"),
@@ -170,6 +171,12 @@ pub extern "C" fn alxr_sys_read(fd: i64, p: i64, len: i64, cap: i64, n: i64) -> 
 pub extern "C" fn alxr_sys_write(fd: i64, p: i64, len: i64, cap: i64, n: i64) -> i64 {
     let r = alxr_write(fd, p, len, cap, n);
     if r < 0 { -ERRNO.with(|e| e.get()) } else { r }
+}
+
+/// `alx_fd_close`: close, with -errno on failure.
+#[unsafe(no_mangle)]
+pub extern "C" fn alxr_fd_close(fd: i64) -> i64 {
+    if alxr_close(fd) < 0 { -ERRNO.with(|e| e.get()) } else { 0 }
 }
 
 #[unsafe(no_mangle)]

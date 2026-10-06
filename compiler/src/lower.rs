@@ -637,6 +637,9 @@ struct Lw<'a> {
     /// In a lambda's body: the placement of the function the lambda is
     /// written in (its sites are placed there; the body has no frame).
     lambda_place: Option<&'a crate::regions::FnPlacement>,
+    /// In a task's, generator's or pmap worker's body: the enclosing
+    /// function's placement, for the lambdas made there (port-issues #164).
+    nested_place: Option<&'a crate::regions::FnPlacement>,
     frame: Option<(V, V)>,
     /// A light frame: a mark in the caller's region instead of a region
     /// of its own (see `light_frame`).
@@ -683,6 +686,7 @@ impl<'a> Lw<'a> {
             res: None,
             place: None,
             lambda_place: None,
+            nested_place: None,
             frame: None,
             light: None,
             ambient: crate::regions::Place::Frame,
@@ -1272,7 +1276,22 @@ impl<'a> Lw<'a> {
     /// the current region (and its placement class).
     fn placed(&mut self, key: usize) -> Option<(LE, crate::regions::Place)> {
         if let (Some(pl), None) = (self.lambda_place, self.frame) {
-            use crate::regions::Place;
+            use crate::regions::{LPlace, Place};
+            // Stored into a parameter's or a capture's storage: the region
+            // that storage lives in (port-issues #164).
+            match pl.lambda_sites.get(&key).copied() {
+                Some(LPlace::Cur) => return None,
+                Some(LPlace::Program) => {
+                    return if self.ambient != Place::Global { Some((LE::RegionProgram, Place::Global)) } else { None };
+                }
+                Some(LPlace::Storage(x)) => {
+                    let v = self.var_of(x);
+                    let t = self.f.locals[x].ty.clone();
+                    let r = self.storage_region(LE::Var(v), &t).unwrap_or(LE::RegionProgram);
+                    return Some((r, Place::Into(x)));
+                }
+                None => {}
+            }
             {
                 let class = pl.sites.get(&key).copied().unwrap_or(Place::Global);
                 if matches!(class, Place::Global | Place::Into(_)) && self.ambient != Place::Global {
@@ -1301,15 +1320,11 @@ impl<'a> Lw<'a> {
                             None if self.place.is_some_and(|pl| pl.owner_alias.contains_key(&p)) => self.owner_region(p).unwrap(),
                             // Where the parameter's own storage lives (a
                             // `!` method's receiver: the view's region).
-                            None if matches!(self.lty(&self.f.locals[p].ty), LTy::Arr(_)) => {
+                            None => {
                                 let v = self.var_of(p);
-                                LE::ViewRegion(Box::new(LE::Var(v)))
+                                let t = self.f.locals[p].ty.clone();
+                                self.storage_region(LE::Var(v), &t).unwrap_or(LE::RegionProgram)
                             }
-                            None if matches!(self.lty(&self.f.locals[p].ty), LTy::Str) => {
-                                let v = self.var_of(p);
-                                LE::RegionOf(Box::new(LE::Var(v)))
-                            }
-                            None => LE::RegionProgram,
                         },
                         Place::Global => LE::RegionProgram,
                     };
@@ -1318,6 +1333,35 @@ impl<'a> Lw<'a> {
             }
         }
         None
+    }
+
+    /// The region the storage of value `v` (of type `t`) lives in, when it
+    /// has a single pointer to find it by: an array, map or string, or a
+    /// struct or tuple whose only field with storage is one (port-issues
+    /// #164: `w.header.set!` on a parameter `w`). Through a null pointer
+    /// (an empty slice, a zero map) it's the program region. None when the
+    /// value has several pointers (they may live in different regions).
+    fn storage_region(&mut self, v: LE, t: &Ty) -> Option<LE> {
+        use crate::regions::{contains_int, has_storage};
+        let promote = self.promote();
+        let storage = |t: &Ty| has_storage(t) || (promote && contains_int(t));
+        let fields: Vec<Ty> = match t {
+            Ty::Struct(_, fs) => fs.iter().map(|(_, t)| t.clone()).collect(),
+            Ty::Tuple(ts) => ts.clone(),
+            Ty::Rec(_) | Ty::Opt(_) => return None,
+            _ => {
+                return match self.lty(t) {
+                    LTy::Arr(_) => Some(LE::ViewRegion(Box::new(v))),
+                    LTy::Str => Some(LE::RegionOf(Box::new(v))),
+                    _ => None,
+                };
+            }
+        };
+        let with: Vec<usize> = (0..fields.len()).filter(|k| storage(&fields[*k])).collect();
+        match with.as_slice() {
+            [k] => self.storage_region(LE::Field(Box::new(v), *k), &fields[*k]),
+            _ => None,
+        }
     }
 
     fn expr_in(&mut self, e: &TExpr) -> LE {
@@ -2881,6 +2925,17 @@ impl<'a> Lw<'a> {
         let region = match last {
             Some(j) => LE::ViewRegion(Box::new(crate::lir::place_le(var, &lsteps[..j]))),
             None => match self.placed(e as *const TExpr as usize) {
+                // Into the storage behind the root (a parameter, a lambda's
+                // capture): the region of the place itself when it has one
+                // pointer to find it by (`w.header` holding one map, though
+                // `w` holds more), else the root's.
+                Some((r, crate::regions::Place::Into(x))) if x == l && !lsteps.is_empty() => {
+                    let pt = match &self.f.locals[view].ty {
+                        Ty::Array(t) => (**t).clone(),
+                        _ => unreachable!("a view is an Array"),
+                    };
+                    self.storage_region(crate::lir::place_le(var, &lsteps), &pt).unwrap_or(r)
+                }
                 Some((r, _)) => r,
                 // The current region: by its variable where there is one
                 // (a JIT call per `!` call otherwise).
@@ -3554,7 +3609,7 @@ impl<'a> Lw<'a> {
                 // The body becomes its own function: captures first, then params.
                 let Ty::Fn(pts, rt) = &e.ty else { unreachable!() };
                 let mut w = Lw::new(self.p, self.sm, self.opts, self.f, self.mode, ErrPath::Return(vec![]), self.prog);
-                w.lambda_place = self.place.or(self.lambda_place);
+                w.lambda_place = self.place.or(self.lambda_place).or(self.nested_place);
                 // `(..) -> ~T`: a fallible body, like a fallible def's.
                 let ok_t = match &**rt {
                     Ty::Result(t) => Some(w.lty(t)),
@@ -3675,6 +3730,7 @@ impl<'a> Lw<'a> {
                 let env_t = LTy::Tup(cap_tys.clone());
                 // The body becomes a worker: unpack the captured copies, run, return.
                 let mut w = Lw::new(self.p, self.sm, self.opts, self.f, self.mode, ErrPath::Return(vec![]), self.prog);
+                w.nested_place = self.place.or(self.lambda_place).or(self.nested_place);
                 if fallible {
                     w.res = Some(ok_lty(w.lty(&ok_ty)));
                 }
@@ -5100,6 +5156,7 @@ impl<'a> Lw<'a> {
             _ => unreachable!(),
         };
         let mut g = Lw::new(self.p, self.sm, self.opts, self.f, self.mode, ErrPath::Die(vec![]), self.prog);
+        g.nested_place = self.place.or(self.lambda_place).or(self.nested_place);
         g.consts = self.consts.clone();
         g.fixed_len = self.fixed_len.clone();
         let cap_vars: Vec<V> = caps.iter().map(|l| g.var_of(*l)).collect();
@@ -5137,6 +5194,7 @@ impl<'a> Lw<'a> {
         // propagates after all workers finish.
         let fallible = format!("{:?}", b.body).contains("Try(");
         let mut w = Lw::new(self.p, self.sm, self.opts, self.f, self.mode, ErrPath::Return(vec![]), self.prog);
+        w.nested_place = self.place.or(self.lambda_place).or(self.nested_place);
         if fallible {
             w.res = Some(ok_lty(out_ty.clone()));
         }

@@ -42,7 +42,7 @@ mod rt {
         alxj_die_str, alxj_panic_str, alxj_exit, alxj_now_ns, alxj_cap_begin, alxj_cap_end, alxj_file_status, alxj_file_read_or_empty,
         alxj_ffi_enter, alxj_ffi_save_errno, alxj_cstr_new, alxj_cstr_free, alxj_errno, alxj_strerror, alxj_str_from_cstr, alxj_str_from_ptr,
         alx_sys_open, alx_sys_fcntl, alx_sys_const, alx_sys_stat, alx_sys_fstat, alx_sys_dir_open, alx_sys_dir_next, alx_sys_dir_close, alx_environ, alx_sys_spawn, alx_sys_wait, alx_sys_pipe, alx_sys_exec, alx_sys_poll2, alx_argc, alx_argv, alx_sleep_ns, alx_wall_ns, alx_mono_ns, alx_local_offset, alx_local_zone,
-        alx_fd_wait, alx_fd_close, alx_sock_listen, alx_sock_accept, alx_sock_connect, alx_sock_error, alx_sock_local_addr, alx_sock_peer_addr, alx_sock_set_nodelay, alx_sock_shutdown, alx_sock_lookup, alx_sock_open, alx_sock_recvfrom, alx_fd_wait_until, alx_fd_wake, alx_net_socket, alx_net_bind, alx_net_connect, alx_net_listen, alx_net_accept, alx_net_sockname, alx_net_recvfrom, alx_net_sendto, alx_net_recvmsg, alx_net_sendmsg, alx_net_unix_rights, alx_net_parse_rights, alx_net_setsockopt, alx_net_getsockopt, alx_net_mcast, alx_net_mcast_if4, alx_net_getaddrinfo, alx_net_canonname, alx_net_getnameinfo, alx_net_interfaces, alx_net_socketpair, alx_net_dup, alx_mem_held, alx_mem_peak, alx_count_allocs, alx_alloc_count,
+        alx_fd_wait, alx_fd_close, alx_sock_listen, alx_sock_accept, alx_sock_connect, alx_sock_error, alx_sock_local_addr, alx_sock_peer_addr, alx_sock_set_nodelay, alx_sock_shutdown, alx_sock_lookup, alx_sock_open, alx_sock_recvfrom, alx_fd_wait_until, alx_fd_wake, alx_task_yield, alx_net_socket, alx_net_bind, alx_net_connect, alx_net_listen, alx_net_accept, alx_net_sockname, alx_net_recvfrom, alx_net_sendto, alx_net_recvmsg, alx_net_sendmsg, alx_net_unix_rights, alx_net_parse_rights, alx_net_setsockopt, alx_net_getsockopt, alx_net_mcast, alx_net_mcast_if4, alx_net_getaddrinfo, alx_net_canonname, alx_net_getnameinfo, alx_net_interfaces, alx_net_socketpair, alx_net_dup, alx_mem_held, alx_mem_peak, alx_count_allocs, alx_alloc_count,
         alx_sig_watch, alx_sig_unwatch, alx_sig_reset, alx_sig_ignored, alx_user_lookup, alx_user_groups,
         alxj_spawn, alxj_task_wait, alxj_lock_new, alxj_lock, alxj_unlock, alxj_lock_poisoned, alxj_lock_clear_poison, alxj_atomic_new, alxj_chan_new, alxj_chan_len, alxj_chan_send, alxj_chan_recv, alxj_chan_close, alxj_select,
     );
@@ -251,6 +251,7 @@ fn resolve_c_symbol(name: &str) -> Option<usize> {
         "alx_sock_recvfrom" => Some(rt::alx_sock_recvfrom as usize),
         "alx_fd_wait_until" => Some(rt::alx_fd_wait_until as usize),
         "alx_fd_wake" => Some(rt::alx_fd_wake as usize),
+        "alx_task_yield" => Some(rt::alx_task_yield as usize),
         "alx_net_socket" => Some(rt::alx_net_socket as usize),
         "alx_net_bind" => Some(rt::alx_net_bind as usize),
         "alx_net_connect" => Some(rt::alx_net_connect as usize),

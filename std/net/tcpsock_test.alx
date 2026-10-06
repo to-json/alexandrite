@@ -1,0 +1,197 @@
+# Go's tcpsock_test.go, translated. Left out: TestIPv6LinkLocalUnicastTCP
+# (needs a link-local interface and external network), TestTCPReadWriteAllocs
+# (allocation counting), TestTCPBig (off by default in Go; 5 GB),
+# TestCopyPipeIntoTCP (alx's os has no Pipe), the benchmarks.
+# TestTCPListenerName keeps its loopback case (Go's wildcard cases need an
+# external network).
+
+import "context"
+import "io"
+import "time"
+
+def tcp(ip: IP, port: Int, zone: Str = "") -> TCPAddr { TCPAddr.new(ip: ip, port: port, zone: zone) }
+
+test "ResolveTCPAddr" {
+  tests: [(Str, Str, TCPAddr?, Str)] = [
+    ("tcp", "127.0.0.1:0", tcp(ipv4(127, 0, 0, 1), 0), ""),
+    ("tcp4", "127.0.0.1:65535", tcp(ipv4(127, 0, 0, 1), 65535), ""),
+    ("tcp", "[::1]:0", tcp(pip("::1"), 0), ""),
+    ("tcp6", "[::1]:65535", tcp(pip("::1"), 65535), ""),
+    ("tcp", "[::1%en0]:1", tcp(pip("::1"), 1, "en0"), ""),
+    ("tcp6", "[::1%911]:2", tcp(pip("::1"), 2, "911"), ""),
+    ("", "127.0.0.1:0", tcp(ipv4(127, 0, 0, 1), 0), ""),
+    ("", "[::1]:0", tcp(pip("::1"), 0), ""),
+    ("tcp", ":12345", tcp(IP.new, 12345), ""),
+    ("http", "127.0.0.1:0", none, "unknown network http"),
+    ("tcp", "127.0.0.1:http", tcp(pip("127.0.0.1"), 80), ""),
+    ("tcp", "[::ffff:127.0.0.1]:http", tcp(pip("::ffff:127.0.0.1"), 80), ""),
+    ("tcp", "[2001:db8::1]:http", tcp(pip("2001:db8::1"), 80), ""),
+    ("tcp4", "127.0.0.1:http", tcp(pip("127.0.0.1"), 80), ""),
+    ("tcp4", "[::ffff:127.0.0.1]:http", tcp(pip("127.0.0.1"), 80), ""),
+    ("tcp6", "[2001:db8::1]:http", tcp(pip("2001:db8::1"), 80), ""),
+    ("tcp4", "[2001:db8::1]:http", none, "address 2001:db8::1: no suitable address found"),
+    ("tcp6", "127.0.0.1:http", none, "address 127.0.0.1: no suitable address found"),
+    ("tcp6", "[::ffff:127.0.0.1]:http", none, "address ::ffff:127.0.0.1: no suitable address found")
+  ]
+  for tt in tests {
+    nw, lit, want, err = tt
+    r = resolve_tcp_addr(nw, lit)
+    if w = want {
+      a = r.unwrap
+      assert a.ip.equal?(w.ip) && a.ip.size == w.ip.size && a.port == w.port && a.zone == w.zone, "resolve_tcp_addr(#{nw}, #{lit}) = #{a}, want #{w}"
+      a2 = resolve_tcp_addr(a.network, a.to_s).unwrap
+      assert a2.ip.equal?(w.ip) && a2.port == w.port && a2.zone == w.zone, "(#{nw}, #{lit}): resolve_tcp_addr(#{a.network}, #{a}) = #{a2}, want #{w}"
+    } else {
+      assert_eq r.err.unwrap.message, err
+    }
+  }
+}
+
+test "TCPListenerName" {
+  for laddr in [tcp(ipv4(127, 0, 0, 1), 0)] {
+    ln = listen_tcp("tcp4", laddr).unwrap
+    la = ln.net_addr.unwrap
+    case la {
+      TCPAddr(a) => assert a.port != 0, "got #{la}; expected a proper address with non-zero port number"
+      _ => assert false, "got #{la}; expected a TCPAddr"
+    }
+    ln.close!
+  }
+}
+
+test "TCPConcurrentAccept" {
+  ln = listen("tcp", "127.0.0.1:0").unwrap
+  n = 10
+  acceptors = (0...n).map { |_i|
+    spawn {
+      loop {
+        r = ln.accept
+        break if r.err?
+        c = r.unwrap
+        c.close!
+      }
+    }
+  }.to_a
+  attempts = 10 * n
+  fails = 0
+  d = Dialer.new(timeout: time.millisecond * 200)
+  for _i in 0...attempts {
+    r = d.dial("tcp", ln.addr)
+    if r.err? {
+      fails += 1
+    } else {
+      c = r.unwrap
+      c.close!
+    }
+  }
+  ln.close!
+  for t in acceptors {
+    t.wait
+  }
+  assert fails <= attempts / 9, "too many Dial failed: #{fails}"
+}
+
+test "TCPStress" {
+  conns = 2
+  msg_len = 512
+  msgs = 100
+  ln = listen("tcp", "127.0.0.1:0").unwrap
+  addr = ln.addr
+  server = spawn {
+    handlers: [Task[Unit]] = []
+    loop {
+      r = ln.accept
+      break if r.err?
+      c = r.unwrap
+      handlers << spawn {
+        buf: [Byte] = [0; msg_len]
+        for _m in 0...msgs {
+          break unless recv_msg(c, buf) && send_msg(c, buf)
+        }
+        c.close!
+        nil
+      }
+    }
+    for h in handlers {
+      h.wait
+    }
+  }
+  clients = (0...conns).map { |_i|
+    spawn {
+      c = dial("tcp", addr).unwrap
+      buf: [Byte] = [0; msg_len]
+      ok = 0
+      for _m in 0...msgs {
+        break unless send_msg(c, buf) && recv_msg(c, buf)
+        ok += 1
+      }
+      c.close!
+      ok
+    }
+  }.to_a
+  for t in clients {
+    assert_eq t.wait.unwrap, msgs
+  }
+  ln.close!
+  server.wait
+}
+
+def send_msg(c0: Conn, buf: [Byte]) -> Bool {
+  c = c0
+  r = c.write!(buf)
+  r.ok? && r.unwrap == buf.size
+}
+
+def recv_msg(c0: Conn, buf: [Byte]) -> Bool {
+  c = c0
+  got = 0
+  while got != buf.size {
+    r = c.read!(buf[got...buf.size])
+    return false if r.err? || r.unwrap == 0
+    got += r.unwrap
+  }
+  true
+}
+
+# Go's TestDialTCPDefaultKeepAlive watches the dialer's keep-alive hook;
+# here the socket options say the same: keep-alive on, 15 s idle.
+test "DialTCPDefaultKeepAlive" {
+  ln = new_local_listener("tcp")
+  la = case ln.net_addr.unwrap {
+    TCPAddr(a) => a
+    _ => TCPAddr.new
+  }
+  c = dial_tcp("tcp", none, la).unwrap
+  assert c.nfd.getsockopt("SO_KEEPALIVE").unwrap != 0, "keep-alive off"
+  assert_eq c.nfd.getsockopt("TCP_KEEPIDLE").unwrap, 15
+  c.close!
+  ln.close!
+}
+
+test "TCPListenAfterClose" {
+  ln = new_local_listener("tcp")
+  ctx, cancel = context.with_cancel(context.background)
+  addr = ln.addr
+  dialers = (0...2).map { |_n|
+    spawn {
+      r = Dialer.new.dial_context(ctx, "tcp", addr)
+      if r.ok? {
+        ctx.done.recv
+        c = r.unwrap
+        c.close!
+      }
+    }
+  }.to_a
+  r = ln.accept
+  assert r.ok?, "accept failed"
+  c = r.unwrap
+  c.close!
+  time.sleep(time.millisecond * 10)
+  cancel.call
+  for t in dialers {
+    t.wait
+  }
+  ln.close!
+  r2 = ln.accept
+  assert r2.err? && is_closed(r2.err.unwrap), "after close!, accept = #{r2.err?}; want ErrClosed"
+}

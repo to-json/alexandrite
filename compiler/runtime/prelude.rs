@@ -1094,6 +1094,9 @@ mod rt {
             }
         }
     }
+    pub unsafe fn shim_alx_task_yield() {
+        std::thread::yield_now();
+    }
     pub unsafe fn shim_alx_fd_wake(_fd: i64) -> i64 {
         NET_WAKES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         0

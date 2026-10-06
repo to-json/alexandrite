@@ -15,6 +15,7 @@ extern def alx_fd_close(fd: Int) -> Int
 extern def alx_wall_ns() -> Int
 extern def alx_mono_ns() -> Int
 extern def alx_sleep_ns(ns: Int)
+extern def alx_task_yield()
 extern def alx_sock_error(fd: Int) -> Int
 extern def alx_sock_shutdown(fd: Int, how: Int) -> Int
 extern def alx_net_socket(family: Int, sotype: Int, proto: Int) -> Int
@@ -104,7 +105,8 @@ struct NetFD {
     if dl != 0 {
       left = dl - alx_wall_ns()
       return WAIT_EXPIRED if left <= 0
-      until = alx_mono_ns() + left
+      # A deadline centuries away is no deadline.
+      until = left > 1 << 62 ? 0 : alx_mono_ns() + left
     }
     r = alx_fd_wait_until(f, mode, until)
     return WAIT_EXPIRED if r == -c("ETIMEDOUT") && until > 0
@@ -119,7 +121,12 @@ struct NetFD {
       fail err_closed(op, src, dst) if f < 0
       fail timeout_error(op, net, src, dst) if expired?(1)
       n = c_read(f.to_i32, p, p.size)
-      return n if n >= 0
+      if n >= 0 {
+        # Tasks don't preempt each other: a reader that never waits would
+        # starve the tasks sharing its worker.
+        alx_task_yield()
+        return n
+      }
       code = C.errno
       if code == c("EAGAIN") {
         w = wait(f, 1)
@@ -143,6 +150,7 @@ struct NetFD {
       n = c_write(f.to_i32, p[off...p.size], p.size - off)
       if n >= 0 {
         off += n
+        alx_task_yield()
         return off if off >= p.size || sotype != SOCK_STREAM
         next
       }
@@ -166,7 +174,10 @@ struct NetFD {
       fail err_closed(op, src, dst) if f < 0
       fail timeout_error(op, net, src, dst) if expired?(1)
       n = alx_net_recvfrom(f, p, p.size, 0, from)
-      return (n, from) if n >= 0
+      if n >= 0 {
+        alx_task_yield()
+        return (n, from)
+      }
       code = -n
       if code == c("EAGAIN") {
         w = wait(f, 1)
@@ -186,7 +197,10 @@ struct NetFD {
       fail err_closed(op, src, dst) if f < 0
       fail timeout_error(op, net, src, dst) if expired?(2)
       n = alx_net_sendto(f, p, p.size, sa)
-      return n if n >= 0
+      if n >= 0 {
+        alx_task_yield()
+        return n
+      }
       code = -n
       if code == c("EAGAIN") {
         w = wait(f, 2)
@@ -315,9 +329,14 @@ struct NetFD {
 # deadline stays in the past (never 0).
 def deadline_ns(t: time.Time) -> Int {
   return 0 if t.is_zero
-  v = t.unix_nano
-  v <= 0 ? 1 : v
+  s = t.unix
+  return MAX_DEADLINE if s >= MAX_DEADLINE / 1000000000
+  return 1 if s <= 0
+  s * 1000000000 + t.nanosecond
 }
+
+# The latest deadline (Unix ns), for deadlines past what an Int holds.
+MAX_DEADLINE = 9223372036854775807
 
 # Go's setDefaultSockopts.
 def set_default_sockopts(s: Int, family: Int, sotype: Int, ipv6only: Bool) -> Int {

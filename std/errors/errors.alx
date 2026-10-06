@@ -2,13 +2,45 @@
 #
 # An `Error` is a value of one of the program's `error` types (and the
 # builtin ones: IoError, ArithError, IndexError, Failure, TaskError), with where it
-# happened and any context added by `wrap`. Go's helpers map like this:
+# happened and any context added by `wrap`. Go's API maps like this:
 #
-#   errors.New(text)          errors.new(text)  (a Failure.Msg)
-#   fmt.Errorf("...: %w", e)  e.wrap("...")     (context on the same error)
-#   errors.Is(e, Target)      case e { Target => ... }
-#   errors.As(e, &t)          case e { Target(field) => ... }
-#   err.Error()               e.message  (or "#{e}")
+#   errors.New(text)               errors.new(text)  (a Failure.Msg)
+#   errors.ErrUnsupported          errors.ERR_UNSUPPORTED (ErrorsError.Unsupported)
+#   errors.Is(err, target)         errors.is?(err, target)
+#   errors.As(err, &t)             errors.as(err) { |e| case e { T(f) => f; _ => none } }
+#   errors.AsType[E](err)          the same `as` (the block picks the type)
+#   errors.Unwrap(err)             errors.unwrap(err)  (or e.unwrap)
+#   errors.Join(errs...)           errors.join([e1, e2])  (a JoinError)
+#   fmt.Errorf("...: %w", e)       e.wrap("...")     (context on the same error)
+#   err.Error()                    e.message  (or "#{e}")
+#   err == target                  e == target
+#
+# Go's optional error methods are methods of the error type, which every
+# Error value can call (the compiler dispatches on its type):
+#
+#   Unwrap() error                 def unwrap -> Error?     (e.unwrap)
+#   Unwrap() []error               def unwrap -> [Error]    (e.unwrap_all)
+#   Is(target error) bool          def is?(target: Error) -> Bool  (e.matches?(t))
+#
+# Differences from Go:
+#
+# - `==` on Error values compares their type and values (fields), as `==`
+#   on an error type's values does, not identity: errors.new("abc") ==
+#   errors.new("abc") is true (Go's two New allocations differ: Go's
+#   TestNewEqual's first case is inverted here). An error type whose values
+#   can't be compared (it holds a function, a lock, a task) is never equal
+#   to anything, where Go's `==` panics. Wrap context and the location
+#   aren't compared.
+# - `wrap` adds context to the same error rather than making a new one
+#   around it, so it is invisible to unwrap/is?/as: is?(e.wrap("ctx"), e)
+#   holds without a chain, and unwrap(e.wrap("ctx")) is e.unwrap.
+# - As takes a block instead of a pointer to a target of some type (no
+#   reflection): the block gets each error of the tree, in Go's order, and
+#   the first non-none value it returns is the result. Go's As methods
+#   (`As(any) bool`) have no counterpart; TestAsValidation (bad targets
+#   panic) can't arise.
+# - The tree walk (Go's Unwrap chains) goes through the `unwrap` methods
+#   of error types; JoinError is one.
 #
 # A function that can fail is declared `-> ~T` and fails with `fail e` (or
 # passes a callee's error on with `~call()`).
@@ -16,4 +48,88 @@
 # An error with this message.
 pub def new(text: Str) -> Error {
   Failure.Msg(text)
+}
+
+# Errors of this package.
+pub error ErrorsError {
+  # Go's ErrUnsupported: an operation can't be performed because it isn't
+  # supported (`errors.is?(err, errors.ERR_UNSUPPORTED)`).
+  Unsupported
+
+  def message -> Str {
+    case self {
+      Unsupported => "unsupported operation"
+    }
+  }
+}
+
+pub ERR_UNSUPPORTED = ErrorsError.Unsupported
+
+# Go's joinError: the errors of `join`, its message theirs on separate lines.
+pub error JoinError {
+  Joined(errs: [Error])
+
+  def message -> Str {
+    case self {
+      Joined(es) => es.map { it.message }.to_a.join("\n")
+    }
+  }
+
+  pub def unwrap -> [Error] {
+    case self {
+      Joined(es) => es
+    }
+  }
+}
+
+# Go's Join: an error wrapping the given ones (nones dropped); none if there
+# are none.
+pub def join(errs: [Error?]) -> Error? {
+  es: [Error] = []
+  for e in errs {
+    if x = e { es << x }
+  }
+  return none if es.size == 0
+  JoinError.Joined(errs: es)
+}
+
+# Go's Unwrap: the result of err's `def unwrap -> Error?`, none if it has
+# none (also for the `[Error]` form, as Go's).
+pub def unwrap(err: Error?) -> Error? {
+  if e = err {
+    return e.unwrap
+  }
+  none
+}
+
+# Go's Is: whether some error in err's tree (err, then depth-first through
+# `unwrap`) equals target or matches it by its own `is?` method.
+pub def is?(err: Error?, target: Error?) -> Bool {
+  e = err || return target == none
+  t = target || return false
+  is_in?(e, t)
+}
+
+def is_in?(err: Error, target: Error) -> Bool {
+  return true if err == target || err.matches?(target)
+  err.unwrap_all.any? { is_in?(it, target) }
+}
+
+# Go's As and AsType: the first non-none value `pick` returns for an error
+# of err's tree (err, then depth-first through `unwrap`).
+pub def as[T](err: Error?, pick: (Error) -> T?) -> T? {
+  e = err || return none
+  as_in(e, pick)
+}
+
+def as_in[T](err: Error, pick: (Error) -> T?) -> T? {
+  if v = pick.call(err) {
+    return v
+  }
+  for x in err.unwrap_all {
+    if v = as_in(x, pick) {
+      return v
+    }
+  }
+  none
 }

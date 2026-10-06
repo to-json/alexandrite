@@ -1,21 +1,50 @@
 # Package strconv: Go's strconv, with alx idioms (S2).
 #
-#   Go                              alx
-#   Atoi(s) (int, error)            atoi(s) -> ~Int<NumError>
-#   ParseInt(s, base, bits)         parse_int(s, base, bit_size) -> ~Int<NumError>
-#   ParseUint(s, base, bits)        parse_uint(s, base, bit_size) -> ~U64<NumError>
-#   ParseBool / FormatBool          parse_bool(s) -> ~Bool<NumError> / format_bool(b)
-#   ParseFloat(s, bits)             parse_float(s) / parse_float_bits(s, bit_size)
-#   FormatFloat(f, 'f', -1, 64)     format_float(f, "f", -1, 64)
-#   Quote / Unquote ...             quote, quote_to_ascii, quote_to_graphic, quote_rune, unquote, ...
+#   Go                                  alx
+#   Atoi(s) (int, error)                atoi(s) -> ~Int<NumError>
+#   ParseInt(s, base, bits)             parse_int(s, base, bit_size) -> ~Int<NumError>
+#   ParseUint(s, base, bits)            parse_uint(s, base, bit_size) -> ~U64<NumError>
+#   ParseBool / FormatBool / AppendBool parse_bool(s) -> ~Bool<NumError> / format_bool(b) / append_bool(dst, b)
+#   ParseFloat(s, bits)                 parse_float(s, bit_size = 64) (also parse_float_bits(s, bit_size))
+#   ParseComplex(s, bits)               parse_complex(s, bit_size = 128) -> ~Complex<NumError>
+#   FormatFloat / AppendFloat           format_float(f, "g", -1, 64) / append_float(dst, f, "g", -1, 64)
+#   FormatComplex(c, 'g', -1, 128)      format_complex(c, "g", -1, 128)
+#   FormatInt / FormatUint / Itoa       format_int(i, base) / format_uint(u, base) / itoa(i)
+#   AppendInt / AppendUint              append_int(dst, i, base) / append_uint(dst, u, base)
+#   Quote, QuoteToASCII, QuoteToGraphic quote, quote_to_ascii, quote_to_graphic (+ append_quote*)
+#   QuoteRune, QuoteRuneToASCII, ...    quote_rune, quote_rune_to_ascii, quote_rune_to_graphic (+ append_quote_rune*)
+#   Unquote, UnquoteChar, QuotedPrefix  unquote, unquote_char, quoted_prefix -> ~T<StrconvError>
+#   CanBackquote, IsPrint, IsGraphic    can_backquote, is_print, is_graphic
+#   IntSize                             INT_SIZE
+#   ErrRange, ErrSyntax                 ERR_RANGE, ERR_SYNTAX (StrconvError.Range / .Syntax)
+#   *NumError{Func, Num, Err}           NumError variants ErrSyntax/ErrRange/ErrBase/ErrBitSize
+#                                       (e.func_name, e.num, e.unwrap: Go's Err)
 #
-# Differences from Go, all consequences of `~T` replacing (T, error):
-#   - On a range error Go returns the clamped value together with the error
-#     (ParseInt("999", 10, 8) gives 127 and ErrRange). A `~T` carries one or
-#     the other, so you get only the error; see `NumError.ErrRange`.
-#   - Function names inside error messages are snake_case ("atoi", "parse_int").
-#   - The `fmt` argument of format_float is a one-character Str, not a byte.
-#   - There are no append_* variants and no complex-number functions.
+# Differences from Go:
+#   - On a range error Go returns the clamped value (ParseInt) or ±Inf
+#     (ParseFloat, ParseComplex) together with the error. A `~T` carries one
+#     or the other, so you get only the error; see `NumError.ErrRange`.
+#   - Function names inside error messages are alx's (S10): "strconv.atoi",
+#     "strconv.parse_int", "strconv.parse_float".
+#   - The `fmt` argument of format_float/format_complex is a one-character
+#     Str, not a byte. Invalid bit sizes and bases panic as Go's, with alx's
+#     names in the message ("strconv: illegal format_float bit_size").
+#   - NumError is an enum of its reasons, so Go's NumError with an arbitrary
+#     Err can't be built (TestNumError checks the message through ErrSyntax).
+#   - Unquote's failure is StrconvError.Syntax (Go's bare ErrSyntax).
+#   - The conversions use only exact multiprecision paths (no Eisel-Lemire
+#     or Ryu fast paths): results are Go's, speed is lower.
+#
+# Tests: Go's internal/strconv and strconv tests are translated (atoi, atof,
+# ftoa, itoa, decimal, atob, atoc, ctoa, fp, number, quote, example; the
+# tables emitted from Go's own by a Go program), plus vectors from real Go
+# (vec_*_test.alx). Not translated: the allocation-count tests
+# (TestCountMallocs, TestAllocationsFromBytes), the benchmarks, the
+# fast-vs-slow comparisons as such (TestAtofSlow, TestFtoaRandom,
+# TestParseFloatTestdata, TestFormatFloatTestdata compare with Go's results
+# instead), math_test.go (log10Pow2/log2Pow10: helpers of Go's fast paths,
+# which alx doesn't have), RuntimeFormatBase10 (Go's runtime helper), and
+# the -testbase download.
 #
 # Method sugar applies to the functions whose first parameter is a Str, so
 # "42".atoi and "ff".parse_int(16, 64) work.
@@ -36,7 +65,55 @@ pub error NumError {
       ErrBitSize(f, n, b) => "strconv.#{f}: parsing #{quote(n)}: invalid bit size #{b}"
     }
   }
+
+  # Go's NumError.Err (its Unwrap): ERR_SYNTAX, ERR_RANGE, or an error
+  # "invalid base N" / "invalid bit size N".
+  pub def unwrap -> Error? {
+    case self {
+      ErrSyntax(_, _) => StrconvError.Syntax
+      ErrRange(_, _) => StrconvError.Range
+      ErrBase(_, _, b) => Failure.Msg("invalid base #{b}")
+      ErrBitSize(_, _, b) => Failure.Msg("invalid bit size #{b}")
+    }
+  }
+
+  # The failing function's name (Go's Func; alx's name, "parse_int").
+  pub def func_name -> Str {
+    case self {
+      ErrSyntax(f, _) => f
+      ErrRange(f, _) => f
+      ErrBase(f, _, _) => f
+      ErrBitSize(f, _, _) => f
+    }
+  }
+
+  # The input (Go's Num).
+  pub def num -> Str {
+    case self {
+      ErrSyntax(_, n) => n
+      ErrRange(_, n) => n
+      ErrBase(_, n, _) => n
+      ErrBitSize(_, n, _) => n
+    }
+  }
 }
+
+# Go's ErrSyntax and ErrRange: what a NumError unwraps to, and unquote's
+# failure (`errors.is?(err, strconv.ERR_RANGE)`).
+pub error StrconvError {
+  Syntax
+  Range
+
+  def message -> Str {
+    case self {
+      Syntax => "invalid syntax"
+      Range => "value out of range"
+    }
+  }
+}
+
+pub ERR_SYNTAX = StrconvError.Syntax
+pub ERR_RANGE = StrconvError.Range
 
 # The largest Int that fits in an Int (Go's strconv.IntSize is 64).
 pub INT_SIZE = 64
@@ -253,9 +330,10 @@ pub def atoi(s: Str) -> ~Int<NumError> {
   v
 }
 
-# The string form of `u` in the given base (2..36), lower case.
+# The string form of `u` in the given base (2..36), lower case. Another
+# base panics, as Go's.
 pub def format_uint(u: U64, base: Int) -> Str {
-  assert base >= 2 && base <= 36
+  panic("strconv: illegal append_int/format_int base") if base < 2 || base > 36
   return u.to_s if base == 10
   buf: [U8] = [0; 64]
   i = 64
@@ -274,7 +352,7 @@ pub def format_uint(u: U64, base: Int) -> Str {
 # The string form of `i` in the given base (2..36), lower case, with a
 # leading '-' for negatives.
 pub def format_int(i: Int, base: Int) -> Str {
-  assert base >= 2 && base <= 36
+  panic("strconv: illegal append_int/format_int base") if base < 2 || base > 36
   if i >= 0 {
     return format_uint(i.as_u64, base)
   }
@@ -300,4 +378,29 @@ pub def parse_bool(s: Str) -> ~Bool<NumError> {
 # "true" or "false".
 pub def format_bool(b: Bool) -> Str {
   b ? "true" : "false"
+}
+
+# dst with s's bytes appended (Go's append(dst, s...): dst's storage is
+# reused while it has room).
+def append_str(dst: [Byte], s: Str) -> [Byte] {
+  out = dst
+  for b in s.bytes {
+    out << b
+  }
+  out
+}
+
+# Go's AppendBool: dst with format_bool(b) appended.
+pub def append_bool(dst: [Byte], b: Bool) -> [Byte] {
+  append_str(dst, format_bool(b))
+}
+
+# Go's AppendInt: dst with format_int(i, base) appended.
+pub def append_int(dst: [Byte], i: Int, base: Int) -> [Byte] {
+  append_str(dst, format_int(i, base))
+}
+
+# Go's AppendUint: dst with format_uint(u, base) appended.
+pub def append_uint(dst: [Byte], u: U64, base: Int) -> [Byte] {
+  append_str(dst, format_uint(u, base))
 }

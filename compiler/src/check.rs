@@ -766,9 +766,14 @@ impl<'a> World<'a> {
         loop {
             let mut changed = false;
             for n in self.eq_ifaces.clone() {
-                let impls: Vec<Ty> = self.impls.get(&n).map(|v| v.iter().map(|(t, _)| t.clone()).collect()).unwrap_or_default();
+                let impls: Vec<Ty> = if n == ERR_EQ { self.errors.clone() } else { self.impls.get(&n).map(|v| v.iter().map(|(t, _)| t.clone()).collect()).unwrap_or_default() };
                 let have = out.get(&n).map_or(0, Vec::len);
                 for t in impls.iter().skip(have) {
+                    if n == ERR_EQ && !eq_able(t, &mut vec![]) {
+                        out.entry(n.clone()).or_default().push(usize::MAX);
+                        changed = true;
+                        continue;
+                    }
                     let fid = self.instance(def, vec![t.clone(), t.clone()], Span::default())?;
                     out.entry(n.clone()).or_default().push(fid);
                     changed = true;
@@ -1227,6 +1232,33 @@ pub fn cname(s: &str) -> String {
         }
     }
     o
+}
+
+/// Values `==` can compare (for `==` on Error values: an error type that
+/// holds a function, a lock or a task is never equal to anything, as Go's
+/// `==` on such an error panics).
+pub fn eq_able(t: &Ty, seen: &mut Vec<String>) -> bool {
+    match t {
+        Ty::Rec(n) | Ty::Struct(n, _) | Ty::Enum(n, _) if is_rec(n) => {
+            if seen.contains(n) {
+                return true;
+            }
+            seen.push(n.clone());
+            let Some(d) = rec_def(n) else { return true };
+            match &d {
+                Ty::Struct(_, fs) => fs.iter().all(|(_, t)| eq_able(t, seen)),
+                Ty::Enum(_, vs) => vs.iter().all(|(_, fs)| fs.iter().all(|(_, t)| eq_able(t, seen))),
+                _ => true,
+            }
+        }
+        Ty::Opt(t) | Ty::Array(t) | Ty::Fixed(t, _) => eq_able(t, seen),
+        Ty::Map(k, v) => eq_able(k, seen) && eq_able(v, seen),
+        Ty::Struct(_, fs) => fs.iter().all(|(_, t)| eq_able(t, seen)),
+        Ty::Enum(_, vs) => vs.iter().all(|(_, fs)| fs.iter().all(|(_, t)| eq_able(t, seen))),
+        Ty::Tuple(ts) => ts.iter().all(|t| eq_able(t, seen)),
+        Ty::Fn(..) | Ty::Mutex(_) | Ty::Atomic(_) | Ty::Task(_) | Ty::Pool(_) | Ty::Result(_) | Ty::Seq(..) | Ty::Gen(_) | Ty::Yielder(_) | Ty::Range => false,
+        _ => true,
+    }
 }
 
 /// Values `puts` and interpolation can show.
@@ -3360,8 +3392,15 @@ impl<'w, 'a> FnCx<'w, 'a> {
                             Some((t, v)) => (Some(t.to_string()), v.to_string()),
                             None => (None, full.clone()),
                         };
+                        // `alias.Type`: the import's path (`ttmpl.ExecError` is
+                        // `text/template.ExecError`).
+                        let tq = tq.map(|q| match q.split_once('.') {
+                            Some((a, rest)) => import_path(a).map_or(q.clone(), |p| format!("{p}.{rest}")),
+                            None => q,
+                        });
                         let vn = &vn;
-                        let type_is = |t: &Ty, q: &str| t.type_name().is_some_and(|n| n == q || n.ends_with(&format!(".{q}")));
+                        // `q` may name the package (`fs.FsError` for `io/fs.FsError`).
+                        let type_is = |t: &Ty, q: &str| t.type_name().is_some_and(|n| n == q || n.ends_with(&format!(".{q}")) || n.ends_with(&format!("/{q}")));
                         if let (Some(q), Some(et)) = (&tq, &enum_ty) {
                             if !type_is(et, q) {
                                 return Err(Diag::new(*vsp, format!("`{full}`: the case is over {}, not {q}", et.show())));
@@ -4528,6 +4567,78 @@ impl<'w, 'a> FnCx<'w, 'a> {
         self.mk(TK::M(M::OptGet, Some(Box::new(l)), vec![], None), *inner, sp)
     }
 
+    /// Go's optional error methods, on an Error value: `e.unwrap` (Go's
+    /// `Unwrap() error`: the error type's `def unwrap -> Error?`, none
+    /// without one or for the `[Error]` form), `e.unwrap_all` (either form
+    /// as a list: what errors.is?/as walk) and `e.matches?(target)` (Go's
+    /// `Is(error) bool`: the type's `def is?(target: Error) -> Bool`, false
+    /// without one). Dispatches on the error type, as `case` does.
+    fn err_hook(&mut self, recv: TExpr, name: &str, args: &[Expr], sp: Span) -> R<TExpr> {
+        let oe = Ty::Opt(Box::new(Ty::Error));
+        let ae = Ty::arr(Ty::Error);
+        let (want, meth) = match name {
+            "unwrap" => (oe.clone(), "unwrap"),
+            "unwrap_all" => (ae.clone(), "unwrap"),
+            _ => (Ty::Bool, "is?"),
+        };
+        let (rid, s1) = self.opt_tmp(recv, sp);
+        let mut stmts = vec![s1];
+        let target = if name == "matches?" {
+            let t = self.value(&args[0])?;
+            let t = self.coerce(t, &Ty::Error)?;
+            self.expect(&t.ty, &Ty::Error, t.span, "`matches?` target")?;
+            let (tid, s2) = self.opt_tmp(t, sp);
+            stmts.push(s2);
+            Some(tid)
+        } else {
+            None
+        };
+        let mut acc = match name {
+            "unwrap" => self.mk(TK::None, oe.clone(), sp),
+            "unwrap_all" => self.mk(TK::Array(vec![]), ae.clone(), sp),
+            _ => self.mk(TK::Bool(false), Ty::Bool, sp),
+        };
+        let errors = self.w.errors.clone();
+        for (k, t) in errors.iter().enumerate().rev() {
+            let Some(tn) = t.type_name() else { continue };
+            let Some(&def) = self.w.by_name.get(&method_name(tn, meth)) else { continue };
+            let me = self.mk(TK::Local(rid), Ty::Error, sp);
+            let as_e = self.mk(TK::M(M::ErrAs(k), Some(Box::new(me.clone())), vec![], None), t.clone(), sp);
+            let mut targs = vec![as_e];
+            if let Some(tid) = target {
+                targs.push(self.mk(TK::Local(tid), Ty::Error, sp));
+            }
+            // The hook is the type's contract with Error, as `message` is:
+            // it needn't be `pub`.
+            self.targ_types.push(tn.to_string());
+            let call = self.call_def(def, meth, sp, targs, sp);
+            self.targ_types.pop();
+            let call = call?;
+            let ct = self.resolve(&call.ty);
+            let v = match (name, &ct) {
+                (_, t) if *t == want => call,
+                ("unwrap", t) if *t == ae => continue,
+                ("unwrap_all", t) if *t == oe => {
+                    let (cid, s3) = self.opt_tmp(call, sp);
+                    let p = self.opt_present(cid, &oe, sp);
+                    let g = self.opt_get(cid, &oe, sp);
+                    let one = self.mk(TK::Array(vec![g]), ae.clone(), sp);
+                    let none = self.mk(TK::Array(vec![]), ae.clone(), sp);
+                    let pick = self.mk(TK::Ternary(Box::new(p), Box::new(one), Box::new(none)), ae.clone(), sp);
+                    self.mk(TK::Seq(vec![s3, TStmt::Expr(pick)]), ae.clone(), sp)
+                }
+                _ => {
+                    let sig = if meth == "unwrap" { "`def unwrap -> Error?` or `def unwrap -> [Error]`" } else { "`def is?(target: Error) -> Bool`" };
+                    return Err(Diag::new(sp, format!("`{tn}.{meth}` returns {}; Error's `{name}` calls it as Go's error method, {sig}", ct.show())));
+                }
+            };
+            let is = self.mk(TK::M(M::ErrIs(k), Some(Box::new(me)), vec![], None), Ty::Bool, sp);
+            acc = self.mk(TK::Ternary(Box::new(is), Box::new(v), Box::new(acc)), want.clone(), sp);
+        }
+        stmts.push(TStmt::Expr(acc));
+        Ok(self.mk(TK::Seq(stmts), want, sp))
+    }
+
     /// `if x = e` / `while x = e` where `e` is a T?: the condition tests
     /// presence; the returned binding gives `x` the value in the branch.
     fn opt_let(&mut self, c: &Expr) -> R<Option<(TExpr, String, LocalId, Ty)>> {
@@ -5096,6 +5207,21 @@ impl<'w, 'a> FnCx<'w, 'a> {
                 return Err(Diag::new(sp, format!("`{}` between {} and {}", op.text(), a.show(), b.show())));
             }
             return self.binary(op, l, r, sp);
+        }
+        // Error values (Go's `err == target`): the same error type, and
+        // equal values of it (that type's `__eq`; wrap context and location
+        // aren't compared). A value of an error type converts to Error.
+        if matches!(op, BinOp::Eq | BinOp::Ne) && (lres == Ty::Error || rres == Ty::Error) && !matches!(lres, Ty::Opt(_)) && !matches!(rres, Ty::Opt(_)) {
+            let l = if lres == Ty::Error { l } else { self.coerce(l, &Ty::Error)? };
+            let r = if rres == Ty::Error { r } else { self.coerce(r, &Ty::Error)? };
+            if self.resolve(&l.ty) != Ty::Error || self.resolve(&r.ty) != Ty::Error {
+                return Err(Diag::new(sp, format!("`{}` between {} and {}", op.text(), self.resolve(&l.ty).show(), self.resolve(&r.ty).show())));
+            }
+            if !self.w.eq_ifaces.iter().any(|n| n == ERR_EQ) {
+                self.w.eq_ifaces.push(ERR_EQ.into());
+            }
+            let eq = self.mk(TK::M(M::ErrEq, Some(Box::new(l)), vec![r], None), Ty::Bool, sp);
+            return Ok(if op == BinOp::Ne { self.mk(TK::Not(Box::new(eq)), Ty::Bool, sp) } else { eq });
         }
         if matches!(op, BinOp::Eq | BinOp::Ne) && matches!(lres, Ty::Iface(_)) {
             if !self.unify(&l.ty, &r.ty) {
@@ -6710,7 +6836,8 @@ impl<'w, 'a> FnCx<'w, 'a> {
                     self.expect(&c.ty, &Ty::Str, c.span, "`wrap` context")?;
                     Ok(mk_m(self, M::ErrWrap, recv, vec![c], None, Ty::Error))
                 }
-                _ => Err(Diag::new(name_span, format!("no method `{name}` on Error; it has message, wrap"))),
+                ("unwrap" | "unwrap_all", 0) | ("matches?", 1) => self.err_hook(recv, name, args, sp),
+                _ => Err(Diag::new(name_span, format!("no method `{name}` on Error; it has message, wrap, unwrap, unwrap_all, matches?"))),
             };
         }
         if let Ty::Result(t) = &rt {

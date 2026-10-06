@@ -468,10 +468,11 @@ test "UnmarshalWhitespaceAttrs" {
   assert_eq v, WhitespaceAttrsParent.new(b_false: false, b_true: true, i: 266703, i_neg: -266703, i8: 112, i8_neg: -112, i16: 6703, i16_neg: -6703, i32: 266703, i32_neg: -266703, i64: 266703, i64_neg: -266703, ui: 266703, ui8: 112, ui16: 6703, ui32: 266703, ui64: 266703, f32: 266.703, f32_neg: -266.703, f64: 266.703, f64_neg: -266.703)
 }
 
-# Go's manualNode without the recursive Child field (alx types can't
-# contain themselves): an Unmarshaler that decodes each child element with
-# decode_element!, so the elements nest one level per call.
+# Go's manualNode (plus a depth count): an Unmarshaler that decodes each
+# child element with decode_element!, so the elements nest one level per
+# call.
 struct ManualNode {
+  child: ManualNode?
   depth: Int
 
   pub def unmarshal_xml!(d: xml.Decoder, start: xml.StartElement) -> ~Unit {
@@ -479,8 +480,9 @@ struct ManualNode {
       t = d.~token!
       case t || xml.char_data("") {
         StartElement(s) => {
-          child = d.~decode_element!(ManualNode.new, s)
-          self.depth = child.depth + 1
+          c = d.~decode_element!(ManualNode.new, s)
+          self.child = c
+          self.depth = c.depth + 1
         }
         EndElement(_) => {return nil}
         _ => nil
@@ -518,8 +520,7 @@ test "UnmarshalXMLRawToken" {
 
 test "unmarshal depth limit" {
   # Go's maxUnmarshalDepth through an Unmarshaler that recurses with
-  # decode_element! (TestDecodeElementDepthBypass and friends use recursive
-  # types, which alx doesn't have).
+  # decode_element! (Go's TestRecursiveUnmarshalInterfaceDepth).
   depth = xml.MAX_UNMARSHAL_DEPTH + 1
   payload = "<a>" * depth + "</a>" * depth
   r = xml.unmarshal(payload.bytes, ManualNode.new)
@@ -583,6 +584,43 @@ struct FailureT {
 test "TokenUnmarshaler" {
   d = xml.new_token_decoder(TokReader.new)
   _ = d.decode!(FailureT.new)
+}
+
+# xml_test.go: TestWrapDecoder (a token source mapping another Decoder's
+# tokens; the Decoder holds a closure over a value holding a Decoder).
+struct TokenMap {
+  d: xml.Decoder
+  f: (xml.Token) -> xml.Token
+  pub def token! -> ~xml.Token? {
+    t = d.~token!
+    return none if t == none
+    f(t.unwrap)
+  }
+}
+
+#[derive(Xml)]
+struct Blocking {
+  #[field(xml: "blocking")] xml_name: xml.Name
+  #[field(xml: ",chardata")] chardata: Str
+}
+
+def blocking(n: xml.Name) -> xml.Name {
+  return n if n.local != "quote"
+  xml.name(n.space, "blocking")
+}
+
+test "WrapDecoder" {
+  d = xml.new_string_decoder("<quote>[Re-enter Clown with a letter, and FABIAN]</quote>")
+  m = TokenMap.new(d: d, f: ->(t: xml.Token) -> xml.Token {
+    case t {
+      StartElement(s) => xml.Token.StartElement(xml.StartElement.new(name: blocking(s.name), attr: s.attr))
+      EndElement(e) => xml.Token.EndElement(xml.EndElement.new(name: blocking(e.name)))
+      _ => t
+    }
+  })
+  d2 = xml.new_token_decoder(m)
+  o = d2.~decode!(Blocking.new)
+  assert_eq o.chardata, "[Re-enter Clown with a letter, and FABIAN]"
 }
 
 #[derive(Xml)]

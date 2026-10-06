@@ -27,9 +27,29 @@ pub struct Package {
 }
 
 pub fn parse_file(sm: &mut SourceMap, display: String, text: String, next_id: &mut NodeId) -> Result<Module, Diag> {
-    let f = sm.add(display, text.clone());
+    parse_file_at(sm, display, None, text, next_id)
+}
+
+/// `parse_file`, recording the file's real path (see `SourceFile::path`).
+pub fn parse_file_at(sm: &mut SourceMap, display: String, path: Option<PathBuf>, text: String, next_id: &mut NodeId) -> Result<Module, Diag> {
+    let f = sm.add_at(display, path, text.clone());
     let toks = lexer::lex(f, &text)?;
     parser::parse(f, &toks, next_id)
+}
+
+/// Parse a file keeping going after syntax errors: the (partial) module and one
+/// error per broken top-level declaration, at most `parser::MAX_ERRORS`. A lexer
+/// error ends the file with that one error (the module is empty). The first error is
+/// the one `parse_file_at` returns; the module is complete only when the list is empty.
+pub fn parse_file_recovering(sm: &mut SourceMap, display: String, path: Option<PathBuf>, text: String, next_id: &mut NodeId) -> (Option<Module>, Vec<Diag>) {
+    let f = sm.add_at(display, path, text.clone());
+    match lexer::lex(f, &text) {
+        Err(d) => (None, vec![d]),
+        Ok(toks) => {
+            let (m, errs) = parser::parse_recovering(f, &toks, next_id);
+            (Some(m), errs)
+        }
+    }
 }
 
 /// The builtin declarations (`Complex`), parsed with every program.
@@ -204,45 +224,40 @@ mod stdlib {
     include!(concat!(env!("OUT_DIR"), "/std_files.rs"));
 }
 
-/// The standard library's files: the embedded copy, or, when
-/// `ALX_STD_DIR` names a directory, the `.alx` files under it (read once), so
-/// std edits can be tried without rebuilding the compiler.
+/// The embedded standard library's files.
 fn std_files() -> &'static [(String, String)] {
     static FILES: std::sync::OnceLock<Vec<(String, String)>> = std::sync::OnceLock::new();
-    FILES.get_or_init(|| {
-        let Some(root) = std::env::var_os("ALX_STD_DIR").map(PathBuf::from) else {
-            return stdlib::STD.iter().map(|(p, t)| (p.to_string(), t.to_string())).collect();
-        };
-        let mut out = vec![];
-        let mut dirs = vec![root.clone()];
-        while let Some(d) = dirs.pop() {
-            for e in std::fs::read_dir(&d).into_iter().flatten().flatten() {
-                let p = e.path();
-                if p.is_dir() {
-                    dirs.push(p);
-                } else if p.extension().is_some_and(|x| x == "alx") {
-                    let rel = p.strip_prefix(&root).unwrap().to_string_lossy().replace('\\', "/");
-                    out.push((rel, std::fs::read_to_string(&p).unwrap_or_default()));
-                }
-            }
-        }
-        out.sort();
-        out
-    })
+    FILES.get_or_init(|| stdlib::STD.iter().map(|(p, t)| (p.to_string(), t.to_string())).collect())
 }
 
 /// Where the embedded standard library appears as a directory.
 pub const STD_DIR: &str = "$std";
 
-/// The files of an embedded std package directory.
-fn std_list(dir: &Path) -> Option<Vec<PathBuf>> {
-    let rel = dir.strip_prefix(STD_DIR).ok()?.to_string_lossy().replace('\\', "/");
+/// `ALX_STD_DIR`: std is read from this directory, on demand, through the
+/// loader's `read`/`list` (so unsaved editor buffers win), instead of the embedded copy.
+fn std_root() -> Option<PathBuf> {
+    std::env::var_os("ALX_STD_DIR").map(PathBuf::from)
+}
+
+/// The file on disk behind a `$std/rel` path (only with `ALX_STD_DIR`).
+fn std_real(f: &Path) -> Option<PathBuf> {
+    Some(std_root()?.join(f.strip_prefix(STD_DIR).ok()?))
+}
+
+/// The files of a std package directory (`$std/...` paths).
+fn std_list(dir: &Path, list: &dyn Fn(&Path) -> std::io::Result<Vec<PathBuf>>) -> Option<std::io::Result<Vec<PathBuf>>> {
+    let rel = dir.strip_prefix(STD_DIR).ok()?;
+    if let Some(root) = std_root() {
+        let r = list(&root.join(rel)).map(|fs| fs.into_iter().filter_map(|p| p.file_name().map(|n| Path::new(STD_DIR).join(rel).join(n))).collect());
+        return Some(r);
+    }
+    let rel = rel.to_string_lossy().replace('\\', "/");
     let fs: Vec<PathBuf> = std_files()
         .iter()
         .filter(|(p, _)| p.rsplit_once('/').map(|(d, _)| d) == Some(rel.as_str()))
         .map(|(p, _)| Path::new(STD_DIR).join(p))
         .collect();
-    Some(fs)
+    Some(Ok(fs))
 }
 
 /// The directory `#[embed]` patterns of file `f` are relative to: its own,
@@ -250,19 +265,27 @@ fn std_list(dir: &Path) -> Option<Vec<PathBuf>> {
 /// standard library has no files beside it).
 fn embed_dir(f: &Path) -> PathBuf {
     let d = f.parent().unwrap_or(Path::new(".")).to_path_buf();
-    match (d.strip_prefix(STD_DIR), std::env::var_os("ALX_STD_DIR")) {
-        (Ok(rel), Some(root)) => PathBuf::from(root).join(rel),
+    match (d.strip_prefix(STD_DIR), std_root()) {
+        (Ok(rel), Some(root)) => root.join(rel),
         _ => d,
     }
 }
 
-fn std_read(f: &Path) -> Option<String> {
-    let rel = f.strip_prefix(STD_DIR).ok()?.to_string_lossy().replace('\\', "/");
-    std_files().iter().find(|(p, _)| *p == rel).map(|(_, t)| t.to_string())
+/// A std file's text: through `read` from `ALX_STD_DIR`, else the embedded copy.
+fn std_read(f: &Path, read: &dyn Fn(&Path) -> std::io::Result<String>) -> Option<std::io::Result<String>> {
+    let rel = f.strip_prefix(STD_DIR).ok()?;
+    if let Some(root) = std_root() {
+        return Some(read(&root.join(rel)));
+    }
+    let rel = rel.to_string_lossy().replace('\\', "/");
+    std_files().iter().find(|(p, _)| *p == rel).map(|(_, t)| Ok(t.to_string()))
 }
 
 /// Is `path` a package of the standard library?
 pub fn is_std(path: &str) -> bool {
+    if let Some(root) = std_root() {
+        return std::fs::read_dir(root.join(path)).is_ok_and(|rd| rd.flatten().any(|e| e.path().extension().is_some_and(|x| x == "alx")));
+    }
     let pre = format!("{path}/");
     std_files().iter().any(|(p, _)| p.strip_prefix(&pre).is_some_and(|f| !f.contains('/')))
 }
@@ -308,15 +331,15 @@ pub fn load_with(path: &Path, display: &str, read: &dyn Fn(&Path) -> std::io::Re
         Ok(t) => t,
         Err(e) => {
             let d = Diag::new(Span::default(), format!("cannot read `{display}`: {e}"));
-            sm.add(display.into(), String::new());
+            sm.add_at(display.into(), Some(path.to_path_buf()), String::new());
             return Err((sm, d));
         }
     };
-    let mut main = match parse_file(&mut sm, display.to_string(), text, &mut next_id) {
+    let mut main = match parse_file_at(&mut sm, display.to_string(), Some(path.to_path_buf()), text, &mut next_id) {
         Ok(m) => m,
         Err(d) => return Err((sm, d)),
     };
-    if let Err(d) = crate::embed::resolve(&mut main, path.parent().unwrap_or(Path::new("."))) {
+    if let Err(d) = crate::embed::resolve_with(&mut main, path.parent().unwrap_or(Path::new(".")), read) {
         return Err((sm, d));
     }
     if main.external_test {
@@ -367,7 +390,7 @@ fn load_pkg(
         return Err(Diag::new(imp.span, format!("import cycle: {} -> {path}", visiting.join(" -> "))));
     }
     let dir = pkg_dir(&path, imp, mods, list)?;
-    let files: Vec<PathBuf> = match std_list(&dir).map(Ok).unwrap_or_else(|| list(&dir)) {
+    let files: Vec<PathBuf> = match std_list(&dir, list).unwrap_or_else(|| list(&dir)) {
         Ok(fs) => fs.into_iter().filter(|f| f.extension().is_some_and(|e| e == "alx") && !f.to_string_lossy().ends_with("_test.alx")).collect(),
         Err(_) => vec![],
     };
@@ -378,17 +401,19 @@ fn load_pkg(
     let mut merged: Option<Module> = None;
     let mut source = String::new();
     for f in &files {
-        let text = match std_read(f) {
-            Some(t) => t,
-            None => read(f).map_err(|e| Diag::new(imp.span, format!("cannot read `{}`: {e}", f.display())))?,
+        let text = match std_read(f, read).unwrap_or_else(|| read(f)) {
+            Ok(t) => t,
+            Err(e) => return Err(Diag::new(imp.span, format!("cannot read `{}`: {e}", f.display()))),
         };
         source.push_str(&text);
         let shown = match f.strip_prefix(STD_DIR) {
             Ok(rel) => format!("std/{}", rel.display()),
             Err(_) => shown_root.join(f.strip_prefix(&mods.root).unwrap_or(f)).display().to_string(),
         };
-        let mut m = parse_file(sm, shown, text, next_id)?;
-        crate::embed::resolve(&mut m, &embed_dir(f))?;
+        // The real path: std files map to ALX_STD_DIR (the embedded copy has none).
+        let real = if f.starts_with(STD_DIR) { std_real(f) } else { Some(f.clone()) };
+        let mut m = parse_file_at(sm, shown, real, text, next_id)?;
+        crate::embed::resolve_with(&mut m, &embed_dir(f), read)?;
         if let Some(s) = m.main.iter().find(|s| !matches!(s.kind, crate::ast::StmtKind::Using(_))) {
             return Err(Diag::new(s.span, format!("a package (`{path}`) holds only declarations; move statements into a def")).note("package-level values are constants (`NAME = 42`), or, for state that changes, `NAME = Atomic.new(v)` / `NAME = Mutex.new(v)` (R11)"));
         }

@@ -50,19 +50,35 @@
 #
 # `look_path(name)` is Go's LookPath: the file `name` names in $PATH.
 #
+# `c.timeout = time.Duration` (not in Go; its stand-in for CommandContext
+# with a deadline): when it passes before the command (every stage) has
+# finished, the stages are killed (SIGKILL), reaped, and the run fails with
+# ExecError.Timeout (Go: context.DeadlineExceeded), whatever `check` says. Its
+# info has the stderr read so far and the ProcessState (signal 9). The limit
+# starts at spawn. Only the stages themselves are killed, not their children
+# (no process groups); output is no longer read after the limit. Zero (the
+# default) means no limit.
+#
 # Differences from Go: no Start/Wait split, no pipes to a running process,
-# no Context / timeouts, no Process.Kill. Waiting blocks the calling thread.
+# no Context (use `timeout`), no Process.Kill (there is no handle to a running
+# process; `timeout` is the kill, and os/signal's `kill(pid, sig)` signals a
+# known pid). Waiting blocks the calling thread (a task parks instead).
 
 import "os"
 import "path"
 import "strconv"
 import "strings"
+import "time"
 
 extern def alx_sys_spawn(argv: [Byte], argc: Int, env: [Byte], envc: Int, dir: Str, fd0: Int, fd1: Int, fd2: Int) -> Int
 extern def alx_sys_exec(argv: [Byte], argc: Int, env: [Byte], envc: Int, dir: Str, fd0: Int, fd1: Int, fd2: Int) -> Int
 extern def alx_sys_wait(pid: Int, out: [Byte]) -> Int
 extern def alx_sys_pipe(out: [Byte], nonblock: Int) -> Int
 extern def alx_sys_poll2(a: Int, b: Int) -> Int
+extern def alx_sys_poll2_timeout(a: Int, b: Int, timeout_ns: Int) -> Int
+extern def alx_sys_wait_nohang(pid: Int, out: [Byte]) -> Int
+extern def alx_sleep_ns(ns: Int)
+extern def c_kill(pid: I32, sig: I32) -> I32 = "kill"
 extern def alx_fd_wait(fd: Int, mode: Int) -> Int
 extern def alx_sys_open(p: Str, flags: I32, mode: I32) -> I32
 extern def alx_sys_const(name: Str) -> Int
@@ -103,6 +119,7 @@ pub error ExecError {
   Start(name: Str, code: Int)
   Redirect(file: Str, code: Int)
   Exit(info: ExitInfo)
+  Timeout(info: ExitInfo)
 
   def message -> Str {
     case self {
@@ -110,6 +127,7 @@ pub error ExecError {
       Start(n, code) => "fork/exec #{n}: #{os.errno_message(code)}"
       Redirect(f, code) => "open #{f}: #{os.errno_message(code)}"
       Exit(info) => exit_message(info)
+      Timeout(info) => "`#{info.cmd}`: timed out after #{info.state.wall_ns / 1000000}ms, killed"
     }
   }
 }
@@ -162,6 +180,7 @@ pub struct Cmd {
   stdin: Str?       # none = the null device
   passthrough: Bool # run: stdout/stderr to ours instead of the null device
   check: Bool       # fail on a nonzero exit (default: unless ALX_EXEC_NOFAIL=1)
+  timeout: time.Duration # > 0: kill the command(s) after this long, fail with ExecError.Timeout
 
   # Go's cmd.Path: the first program's name.
   pub def path -> Str { stages[0].args[0] }
@@ -290,16 +309,28 @@ pub struct Cmd {
     for fd in to_close { close_fd(fd) if fd >= 0 }
     close_fd(cap_out[1]) if cap_out[1] >= 0
     close_fd(cap_err[1]) if mode == 1 && cap_err[1] >= 0
-    got = drain(cap_out[0], mode == 1 ? cap_err[0] : -1)
+    deadline = timeout.ns > 0 ? alx_mono_ns + timeout.ns : -1
+    got = drain(cap_out[0], mode == 1 ? cap_err[0] : -1, deadline)
+    timed_out = got[2]
+    kill_all(pids, 0) if timed_out
     states: [ProcessState] = []
     j = 0
     while j < pids.size {
-      s = ~wait(pids[j], t0s[j])
-      states << s
+      if deadline < 0 || timed_out {
+        s = ~wait(pids[j], t0s[j])
+        states << s
+      } else {
+        w = ~wait_until(pids[j], t0s[j], deadline, pids, j)
+        states << w[0]
+        timed_out = true if w[1]
+      }
       j += 1
     }
     if f = failure {
       fail f
+    }
+    if timed_out {
+      fail ExecError.Timeout(ExitInfo.new(cmd: to_s, state: deciding(states), stderr: Str.from_bytes(got[1])))
     }
     Captured.new(stdout: Str.from_bytes(got[0]), stderr: Str.from_bytes(got[1]), state: deciding(states), states: states)
   }
@@ -403,7 +434,7 @@ pub struct Cmd {
 
 # A Cmd for `name args...` (Go's Command).
 pub def command(name: Str, args: [Str]) -> Cmd {
-  Cmd.new(stages: [Stage.new(args: [name] + args, redirs: [])], dir: "", env: none, stdin: none, passthrough: false, check: default_check)
+  Cmd.new(stages: [Stage.new(args: [name] + args, redirs: [])], dir: "", env: none, stdin: none, passthrough: false, check: default_check, timeout: time.Duration.new(0))
 }
 
 # The Cmd a command literal builds, from the parser's split: one group per
@@ -431,7 +462,7 @@ pub def from_literal(groups: [[Str]], kinds: [Int]) -> Cmd {
     i += 1
   }
   stages << Stage.new(args: args, redirs: redirs)
-  Cmd.new(stages: stages, dir: "", env: none, stdin: none, passthrough: true, check: default_check)
+  Cmd.new(stages: stages, dir: "", env: none, stdin: none, passthrough: true, check: default_check, timeout: time.Duration.new(0))
 }
 
 def default_check -> Bool { (os.getenv("ALX_EXEC_NOFAIL") || "") != "1" }
@@ -473,7 +504,9 @@ def deciding(states: [ProcessState]) -> ProcessState {
 }
 
 # Reads a and b (-1: none) to end of file: (a's bytes, b's bytes).
-def drain(a0: Int, b0: Int) -> ([Byte], [Byte]) {
+# With deadline >= 0 (alx_mono_ns), gives up then: the third value is true
+# and the descriptors are closed.
+def drain(a0: Int, b0: Int, deadline: Int) -> ([Byte], [Byte], Bool) {
   out: [Byte] = []
   err: [Byte] = []
   a = a0
@@ -481,6 +514,11 @@ def drain(a0: Int, b0: Int) -> ([Byte], [Byte]) {
   buf: [Byte] = [0; 65536]
   eagain = alx_sys_const("EAGAIN")
   while a >= 0 || b >= 0 {
+    if deadline >= 0 && alx_mono_ns >= deadline {
+      close_fd(a) if a >= 0
+      close_fd(b) if b >= 0
+      return (out, err, true)
+    }
     progress = false
     if a >= 0 {
       n = c_read(a.to_i32, buf, buf.size)
@@ -504,9 +542,16 @@ def drain(a0: Int, b0: Int) -> ([Byte], [Byte]) {
         progress = true
       }
     }
-    alx_sys_poll2(a, b) if !progress
+    if !progress {
+      if deadline < 0 {
+        alx_sys_poll2(a, b)
+      } else {
+        left = deadline - alx_mono_ns
+        alx_sys_poll2_timeout(a, b, left > 0 ? left : 0)
+      }
+    }
   }
-  (out, err)
+  (out, err, false)
 }
 
 def argv_blob(xs: [Str]) -> [Byte] {
@@ -581,6 +626,44 @@ def wait(pid: Int, t0: Int) -> ~ProcessState {
   b: [Byte] = [0; 40]
   r = alx_sys_wait(pid, b)
   fail ExecError.Start("wait", -r) if r < 0
+  state_of(pid, t0, b)
+}
+
+# SIGKILL to pids[from...]: the ones not yet waited for.
+def kill_all(pids: [Int], from: Int) {
+  sigkill = alx_sys_const("SIGKILL")
+  i = from
+  while i < pids.size {
+    c_kill(pids[i].to_i32, sigkill.to_i32)
+    i += 1
+  }
+}
+
+# Waits for pid until the deadline (alx_mono_ns); then kills pids[k...] and
+# waits for pid to die. (state, timed out).
+def wait_until(pid: Int, t0: Int, deadline: Int, pids: [Int], k: Int) -> ~(ProcessState, Bool) {
+  b: [Byte] = [0; 40]
+  step = 500000
+  timed_out = false
+  loop {
+    r = alx_sys_wait_nohang(pid, b)
+    fail ExecError.Start("wait", -r) if r < 0
+    break if r == 1
+    if alx_mono_ns >= deadline {
+      timed_out = true
+      kill_all(pids, k)
+      r2 = alx_sys_wait(pid, b)
+      fail ExecError.Start("wait", -r2) if r2 < 0
+      break
+    }
+    left = deadline - alx_mono_ns
+    alx_sleep_ns(step < left ? step : left)
+    step = step * 2 if step < 10000000
+  }
+  (state_of(pid, t0, b), timed_out)
+}
+
+def state_of(pid: Int, t0: Int, b: [Byte]) -> ProcessState {
   wall = alx_mono_ns - t0
   killed = get64(b, 0) == 1
   code = get64(b, 1)

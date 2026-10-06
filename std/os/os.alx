@@ -22,6 +22,10 @@
 #    closes them all, so a second close on any copy fails, as in Go.
 #  - `stdin` / `stdout` / `stderr` are functions returning those Files. Output
 #    through them is unbuffered; use bufio.Writer.
+#  - `File.wait_readable(timeout: time.Duration) -> ~Bool` is an extension (Go:
+#    SetReadDeadline): true when a read would not block (data, EOF, hangup or
+#    error pending), false on timeout.
+#  - `pipe` returns the two Files as a tuple: `(r, w) = ~os.pipe`.
 #  - Times are Ints: nanoseconds since the Unix epoch.
 #  - Everything blocks the calling worker thread (the event loop arrives with
 #    L3).
@@ -32,6 +36,7 @@
 
 import "path"
 import "slices"
+import "time"
 
 extern def c_read(fd: I32, buf: [Byte], n: Int) -> Int = "read"
 extern def c_write(fd: I32, buf: [Byte], n: Int) -> Int = "write"
@@ -65,6 +70,8 @@ extern def c_exit(code: I32) = "exit"
 extern def c_isatty(fd: I32) -> Bool = "isatty"
 extern def alx_sys_open(p: Str, flags: I32, mode: I32) -> I32
 extern def alx_sys_const(name: Str) -> Int
+extern def alx_sys_pipe(out: [Byte], nonblock: Int) -> Int
+extern def alx_fd_wait_timeout(fd: Int, mode: Int, timeout_ns: Int) -> Int
 extern def alx_sys_stat(p: Str, out: [Byte], follow: I32) -> I32
 extern def alx_sys_fstat(fd: I32, out: [Byte]) -> I32
 extern def alx_sys_dir_open(p: Str) -> Int
@@ -313,6 +320,17 @@ pub struct File {
     n
   }
 
+  # Waits until a read would not block (data, end of file, hangup or an error
+  # is pending): true; false if timeout passes first. An alx extension (Go has
+  # SetReadDeadline). A task parks with a deadline, so its worker runs other
+  # tasks; the main thread poll(2)s. Not supported in the browser.
+  pub def wait_readable(timeout: time.Duration) -> ~Bool {
+    fail ferr("read" + " " + name, c("EBADF")) if fd < 0
+    r = alx_fd_wait_timeout(fd, 1, timeout.ns)
+    fail ferr("read" + " " + name, -r) if r < 0
+    r == 1
+  }
+
   # Writes all of p; returns p.size.
   pub def write!(p: [Byte]) -> ~Int {
     off = 0
@@ -407,6 +425,14 @@ pub struct File {
 pub def new_file(fd: Int, name: Str) -> File {
   cell: [Int] = [fd]
   File.new(cell: cell, name: name)
+}
+
+# Go's os.Pipe: (read end, write end), both blocking and close-on-exec.
+pub def pipe -> ~(File, File) {
+  b: [Byte] = [0; 16]
+  r = alx_sys_pipe(b, 0)
+  fail ferr("pipe", -r) if r < 0
+  (new_file(b[0].to_i, "|0"), new_file(b[8].to_i, "|1"))
 }
 
 pub def stdin -> File { new_file(0, "/dev/stdin") }

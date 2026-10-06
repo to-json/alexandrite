@@ -10,12 +10,21 @@ use std::path::Path;
 /// Resolve the patterns of every embedded constant of `m`, declared in a
 /// file in directory `dir`.
 pub fn resolve(m: &mut Module, dir: &Path) -> Result<(), Diag> {
+    resolve_with(m, dir, &|p| std::fs::read_to_string(p))
+}
+
+/// `resolve`, reading file contents through `read` first (so an unsaved editor
+/// buffer is what gets embedded). `read` yields text: when it fails (binary data
+/// is not UTF-8, or the file is missing) the bytes come from disk. Matching the
+/// patterns still looks at the disk.
+pub fn resolve_with(m: &mut Module, dir: &Path, read: &dyn Fn(&Path) -> std::io::Result<String>) -> Result<(), Diag> {
     for c in &mut m.consts {
         let Some(e) = &mut c.embed else { continue };
         let names = resolve_patterns(dir, &e.patterns).map_err(|msg| Diag::new(e.span, msg))?;
         let mut files = vec![];
         for n in &names {
-            let data = std::fs::read(dir.join(n)).map_err(|err| Diag::new(e.span, format!("cannot embed `{n}`: {err}")))?;
+            let p = dir.join(n);
+            let data = read(&p).map(String::into_bytes).or_else(|_| std::fs::read(&p)).map_err(|err| Diag::new(e.span, format!("cannot embed `{n}`: {err}")))?;
             files.push((n.clone(), data));
         }
         // Go's embed.FS lists every directory leading to a file, named with a trailing `/`.

@@ -33,6 +33,9 @@ impl Diag {
 pub struct SourceFile {
     /// Path as the user wrote it / as it should appear in messages.
     pub name: String,
+    /// The file's real location on disk, when it has one (not `<builtin>`, the
+    /// generated test runner, or the embedded std). Editor output uses it; `name` is for messages.
+    pub path: Option<std::path::PathBuf>,
     pub text: String,
     line_starts: Vec<u32>,
 }
@@ -45,7 +48,17 @@ impl SourceFile {
                 line_starts.push(i as u32 + 1);
             }
         }
-        SourceFile { name, text, line_starts }
+        SourceFile { name, path: None, text, line_starts }
+    }
+
+    /// 0-based line and byte offset within the line (offset clamped to the text).
+    pub fn line_byte_col(&self, off: u32) -> (u32, u32) {
+        let off = off.min(self.text.len() as u32);
+        let line = match self.line_starts.binary_search(&off) {
+            Ok(l) => l,
+            Err(l) => l - 1,
+        };
+        (line as u32, off - self.line_starts[line])
     }
 
     /// 1-based line and column (column counts characters).
@@ -69,6 +82,13 @@ impl SourceMap {
     pub fn add(&mut self, name: String, text: String) -> u32 {
         self.files.push(SourceFile::new(name, text));
         self.files.len() as u32 - 1
+    }
+
+    /// Like `add`, recording the file's real path.
+    pub fn add_at(&mut self, name: String, path: Option<std::path::PathBuf>, text: String) -> u32 {
+        let i = self.add(name, text);
+        self.files[i as usize].path = path;
+        i
     }
 
     pub fn loc(&self, sp: Span) -> String {

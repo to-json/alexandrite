@@ -134,7 +134,7 @@ Every line above compiles (checked 2026-10-05). The design decisions and their r
   - → `check.rs`, the type checker:
     - `binary` (operators, `||` on optionals), `coerce`, `case`, `implement` (interfaces), `bind` / `bind_tparams` / `instance` (generics);
     - `const_call` / `const_call_named` (`Type.method`), `call_def`, `format` (the `%` verbs), `type_from`.
-  - → `tast.rs` (the typed AST)
+  - → `tast.rs` (the typed AST). `Ty` is a structural tree, but a struct's or enum's field list is an `Rc<Vec<..>>`: cloning a type is cheap, so build one with `Rc::new(fields)` and never deep-copy fields (`fs.to_vec()`) on a hot path. Tree walks: `prove::each_child` already enters blocks and `Seq`s; don't also walk their statements yourself (that doubles the work per nesting level).
   - → `lower.rs`, to LIR (`lir.rs`): `fmt_piece`, `iface_result`, `to_s`, `binary`, `shift`, `drop_idle_regions`.
   - → backends: `cgen.rs` (C), `jit.rs` (Cranelift), `rgen.rs` (a Rust "oracle" the acceptance tests compare against), `web/src/wasmgen.rs` (browser).
   - Also: `regions.rs` (where each allocation lives), `prove.rs` (removes checks it can prove), `derive.rs` (`#[derive(Json)]`), `fmt.rs` (formatter), `driver.rs` (the CLI and `alx test`).

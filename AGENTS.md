@@ -164,6 +164,7 @@ Every line above compiles (checked 2026-10-05). The design decisions and their r
 ## Changing the language or the compiler
 
 - **Every backend:** a change goes into C, JIT, oracle and wasm (or wasm refuses it with an error, as it does for most FFI). Add an acceptance case and a GO-VS-RUBY.md row.
+- **Syntax changes:** update the tree-sitter grammar in `tree-sitter-alexandrite/` in the same change. Edit `grammar.js` (or `src/scanner.c`), run `tree-sitter generate`, add a corpus case to `test/corpus/`, and run `tree-sitter test`. The acceptance group `TS` (`alx run acceptance/run.alx -k TS`) checks that the grammar is regenerated, its tests pass, and every tracked `.alx` file parses. A negative case that the compiler rejects while parsing goes in `ts_invalid` in `run.alx`. Without the `tree-sitter` CLI (`npm i -g tree-sitter-cli`, or `brew install tree-sitter-cli`), the group prints SKIP. CI runs the group on Linux x86-64. See `tree-sitter-alexandrite/README.md`.
 - **Problems you don't fix:** add them to `docs/notes/port-issues.md`.
 - **Porting a Go package:** the rules and "done means" are in `docs/notes/porting-std.md`. Status of every package: STDLIB.md (regenerate with `alx run tools/stdlib_status.alx`).
 

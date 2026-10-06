@@ -534,6 +534,54 @@ def modules(h: H) -> ~H {
   h2
 }
 
+# Negative cases the compiler rejects while parsing (lexer.rs / parser.rs),
+# so the grammar may reject them too. The other `.bad` cases must parse.
+def ts_invalid -> [Str] {
+  ["errors.bad3", "parser.bad1", "parser.bad2", "parser.bad3", "parser.bad5", "parser.bad6", "pkgvars.bad4", "consts.bad1", "heredoc.bad1", "scripting.bad1", "sugar.bad1", "sugar.bad2", "sugar.bad4", "sugar.bad5"].map { |c| "acceptance/cases/#{c}.alx" }
+}
+
+# TS: the tree-sitter grammar (tree-sitter-alexandrite/) keeps up with the
+# compiler's parser: its generated files match grammar.js, its corpus and
+# highlight tests pass, and every tracked .alx file (but probes/ and the
+# cases above) parses without an ERROR or MISSING node. Needs the
+# tree-sitter CLI (and a C compiler); without it the group is skipped.
+def tree_sitter(h: H) -> ~H {
+  h2 = h
+  ts = sh.which("tree-sitter") || ""
+  if ts == "" {
+    puts "  [SKIP] TS tree-sitter isn't on PATH: grammar parity not checked (npm i -g tree-sitter-cli)"
+    return h2
+  }
+  gdir = "#{h.root}/tree-sitter-alexandrite"
+  out = "#{h.work}/ts-gen"
+  ~sh.mkdir_p(out)
+  r = ~run_in([ts, "generate", "--no-parser", "--js-runtime", "native", "-o", out], gdir, [])
+  fresh = r.code == 0 && ~sh.read("#{out}/grammar.json") == ~sh.read("#{gdir}/src/grammar.json")
+  h2.check!("TS", "src/ is generated from grammar.js", fresh, r.code != 0 ? first_n(trim(r.stderr), 300) : (fresh ? "" : "run `tree-sitter generate` in tree-sitter-alexandrite"))
+  r = ~run_in([ts, "test"], gdir, [])
+  h2.check!("TS", "corpus and highlight tests", r.code == 0, r.code == 0 ? "" : last_n(trim(r.stdout + r.stderr), 2000))
+  ls = ~run_in(["git", "ls-files", "*.alx"], h.root, [])
+  skip = ts_invalid
+  files: [Str] = []
+  for f in strings.split(trim(ls.stdout), "\n") {
+    files << "#{h.root}/#{f}" if f != "" && !strings.has_prefix(f, "probes/") && !slices.contains(skip, f)
+  }
+  list = "#{h.work}/ts-files"
+  ~sh.write(list, files.join("\n") + "\n")
+  r = ~run_in([ts, "parse", "-p", gdir, "-q", "--paths", list], gdir, [])
+  bad: [Str] = []
+  for line in strings.split(r.stdout, "\n") {
+    if strings.contains(line, "(ERROR") || strings.contains(line, "(MISSING") {
+      f = strings.fields(line)[0]
+      f = f[h.root.size + 1...f.size] if strings.has_prefix(f, h.root + "/")
+      bad << "#{f} #{line[strings.index(line, "(")...line.size]}"
+    }
+  }
+  ok = bad.size == 0 && files.size > 0
+  h2.check!("TS", "every tracked .alx file parses", ok, ok ? "#{files.size} files" : "#{bad.size} of #{files.size} files don't parse (change syntax -> update the grammar):\n    #{bad.join("\n    ")}")
+  h2
+}
+
 def fmt_check(h: H) -> ~H {
   h2 = h
   paths = sh.~glob("#{h.cases}/*.alx") + ["#{h.cases}/pkgs", "#{h.cases}/lib"]
@@ -793,6 +841,10 @@ if filt == "" || strings.contains(filt, "mod") {
   h = ~fmt_check(h)
   puts "== alx test"
   h = ~testing(h)
+}
+if filt == "" || strings.contains(filt, "TS") {
+  puts "== TS tree-sitter grammar"
+  h = ~tree_sitter(h)
 }
 if filt == "" || strings.contains(filt, "A3") {
   puts "== A3 promote overhead"

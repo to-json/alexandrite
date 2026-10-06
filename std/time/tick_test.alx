@@ -1,0 +1,323 @@
+#![test(external)]
+# Go's tick_test.go (package time_test): Ticker, tick, and the channel behaviour
+# of Timers and Tickers (Go 1.23's: no stale value after a stop or reset).
+#
+# Not translated, and why:
+#   - TestTickerStopWithDirectInitialization, TestManualTicker: a Ticker built
+#     around a caller's channel (&Ticker{C: c}); a Ticker here is new_ticker's.
+#   - TestTimerGC: counts what Go's garbage collector frees.
+#   - TestLongAdjustTimers: a stress test of Go's runtime timer heap (5000
+#     sleepers and 50000 queue rounds); the sleeping is covered by sleep_test.
+#   - testTimerChan's len(C) == cap(C) == 0: the channel here has a one-value
+#     buffer that stop and reset empty, so it is never stale, but its cap is 1.
+import "time"
+
+test "TestTicker" {
+  base_count = 6
+  base_delta = time.millisecond * 100
+  errs: [Str] = []
+  ok = false
+  for tt in [(base_count, base_delta), (8, time.second)] {
+    count = tt[0]
+    delta = tt[1]
+    ticker = time.new_ticker(delta)
+    t0 = time.now()
+    for _i in 0...(count / 2) { ticker.c.recv }
+    ticker.reset(delta * 2)
+    for _i in 0...(count - count / 2) { ticker.c.recv }
+    ticker.stop
+    dt = time.now().sub(t0)
+    target = delta * 3 * (count / 2)
+    slop = target * 3 / 10
+    if dt < target - slop || dt > target + slop {
+      errs << "#{count / 2} #{delta} ticks then #{count / 2} #{delta * 2} ticks took #{dt}, expected #{target}"
+      time.sleep(time.second / 2) if dt > target + slop
+      next
+    }
+    time.sleep(delta * 2)
+    shut = true
+    select {
+      when _v = ticker.c.recv => shut = false
+      else => nil
+    }
+    if !shut {
+      errs << "ticker did not shut down"
+      next
+    }
+    ok = true
+    break
+  }
+  assert ok, "saw errors: #{errs}"
+}
+
+test "TestTeardown" {
+  for _i in 0...3 {
+    ticker = time.new_ticker(time.millisecond * 20)
+    ticker.c.recv
+    ticker.stop
+  }
+}
+
+# Go's Tick(-1) is a nil channel: here one that never receives.
+test "TestTick" {
+  c = time.tick(time.duration(-1))
+  got = false
+  select {
+    when _v = c.recv => got = true
+    when _w = time.after(time.millisecond * 20).recv => nil
+  }
+  assert !got
+}
+
+test "TestNewTickerLtZeroDuration" {
+  assert_panics("non-positive interval for new_ticker") { time.new_ticker(time.duration(-1)) }
+}
+
+test "TestTickerResetLtZeroDuration" {
+  assert_panics("non-positive interval for Ticker.reset") {
+    tk = time.new_ticker(time.second)
+    tk.reset(time.duration(0))
+  }
+}
+
+SCHED_MS = 10
+TRIES = 100
+
+def sched -> time.Duration { time.millisecond * SCHED_MS }
+
+#[track_caller]
+def no_tick(c: Chan[time.Time]) {
+  got = false
+  select {
+    when _v = c.recv => got = true
+    else => nil
+  }
+  assert !got, "extra tick"
+}
+
+#[track_caller]
+def assert_tick(c: Chan[time.Time]) {
+  for _i in 0..TRIES {
+    got = false
+    select {
+      when _v = c.recv => got = true
+      else => nil
+    }
+    return if got
+    time.sleep(sched())
+  }
+  assert false, "missing tick"
+}
+
+#[track_caller]
+def not_done(done: Chan[Bool]) {
+  got = false
+  select {
+    when _v = done.recv => got = true
+    else => nil
+  }
+  assert !got, "early done"
+}
+
+#[track_caller]
+def wait_done(done: Chan[Bool]) {
+  for _i in 0...TRIES {
+    time.sleep(sched())
+    got = false
+    select {
+      when _v = done.recv => got = true
+      else => nil
+    }
+    return if got
+  }
+  assert false, "never got done"
+}
+
+# Go's testTimerChan, over a Timer (is_ticker false) or a Ticker whose stop and
+# reset report pending as Go's tickerTimer wrapper does.
+def timer_chan(is_ticker: Bool, timer: time.Timer, ticker: time.Ticker) {
+  stopped = [false]
+  stop = ->() -> Bool {
+    return timer.stop if !is_ticker
+    pending = !stopped[0]
+    stopped[0] = true
+    ticker.stop
+    pending
+  }
+  reset = ->(d: time.Duration) -> Bool {
+    return timer.reset(d) if !is_ticker
+    pending = !stopped[0]
+    stopped[0] = false
+    ticker.reset(d)
+    pending
+  }
+  c = is_ticker ? ticker.c : timer.c
+  big = time.second * 10000
+  one = time.duration(1)
+
+  stop.call()
+  no_tick(c)
+  reset.call(big)
+  no_tick(c)
+  reset.call(one)
+  time.sleep(sched())
+  assert_tick(c)
+  time.sleep(sched())
+  reset.call(big)
+  no_tick(c)
+
+  # a receiver blocked before the reset gets the value
+  reset.call(big)
+  done = Chan[Bool].new(0)
+  not_done(done)
+  c1 = c
+  d1 = done
+  spawn {
+    c1.recv
+    d1.close
+  }
+  time.sleep(sched())
+  not_done(done)
+  reset.call(big * 2)
+  time.sleep(sched())
+  not_done(done)
+  reset.call(one)
+  wait_done(done)
+  if is_ticker {
+    assert_tick(c)
+  } else {
+    no_tick(c)
+  }
+  stop.call()
+  no_tick(c)
+
+  # two receivers: exactly one gets the value
+  reset.call(big)
+  done2 = Chan[Bool].new(2)
+  done_a = Chan[Bool].new(0)
+  done_b = Chan[Bool].new(0)
+  stop_ch = Chan[Bool].new(0)
+  for k in 0...2 {
+    cc = c
+    dd = done2
+    da = k == 0 ? done_a : done_b
+    sc = stop_ch
+    spawn {
+      select {
+        when _v = cc.recv => dd << true
+        when _w = sc.recv => nil
+      }
+      da.close
+    }
+  }
+  time.sleep(sched())
+  not_done(done2)
+  reset.call(sched() / 2)
+  time.sleep(sched())
+  wait_done(done2)
+  stop.call()
+  stop_ch.close
+  wait_done(done_a)
+  wait_done(done_b)
+  if is_ticker {
+    select {
+      when _v = done2.recv => nil
+      else => nil
+    }
+    select {
+      when _v = c.recv => nil
+      else => nil
+    }
+  }
+  not_done(done2)
+
+  # a stopped timer sends nothing to waiting receivers
+  stop_ch2 = Chan[Bool].new(0)
+  done3 = Chan[Bool].new(2)
+  unexpected = Atomic.new(false)
+  for _k in 0...2 {
+    cc = c
+    dd = done3
+    sc = stop_ch2
+    u = unexpected
+    spawn {
+      select {
+        when _v = cc.recv => u.store(true)
+        when _w = sc.recv => nil
+      }
+      dd << true
+    }
+  }
+  time.sleep(sched())
+  stop_ch2.close
+  wait_done(done3)
+  wait_done(done3)
+  assert !unexpected.load, "unexpected data"
+
+  # stop and reset report a value nobody took as pending
+  reset.call(one)
+  time.sleep(time.millisecond * 10)
+  assert stop.call(), "stop of a timer with an untaken value = false"
+  no_tick(c)
+  reset.call(time.hour)
+  no_tick(c)
+  assert reset.call(one), "reset of a pending timer = false"
+  assert_tick(c)
+  time.sleep(time.millisecond * 10)
+  if is_ticker {
+    assert_tick(c)
+    time.sleep(time.millisecond * 10)
+  } else {
+    no_tick(c)
+  }
+  assert_eq reset.call(time.hour), is_ticker
+  no_tick(c)
+  stop.call()
+}
+
+test "TestChan" {
+  timer = time.new_timer(time.second * 10000)
+  ticker = time.new_ticker(time.second * 10000)
+  ticker.stop
+  timer_chan(false, timer, ticker)
+  timer.stop
+  ticker2 = time.new_ticker(time.second * 10000)
+  timer_chan(true, timer, ticker2)
+}
+
+test "TestAfterTimes" {
+  ok = false
+  for _i in 0...10 {
+    start = time.now()
+    c = time.after(time.millisecond * 10)
+    time.sleep(time.millisecond * 500)
+    dt = c.recv.unwrap.sub(start)
+    if dt < time.millisecond * 400 {
+      ok = true
+      break
+    }
+  }
+  assert ok, "after's time is the time it fired"
+}
+
+test "TestTickTimes" {
+  ok = false
+  for _i in 0...10 {
+    start = time.now()
+    tk = time.new_ticker(time.millisecond * 10)
+    time.sleep(time.millisecond * 500)
+    dt = tk.c.recv.unwrap.sub(start)
+    tk.stop
+    if dt < time.millisecond * 400 {
+      ok = true
+      break
+    }
+  }
+  assert ok, "a tick's time is the time it fired"
+}
+
+bench "BenchmarkTicker" {
+  ticker = time.new_ticker(time.nanosecond)
+  ticker.c.recv
+  ticker.stop
+}

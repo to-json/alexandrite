@@ -3974,9 +3974,17 @@ impl<'a> Lw<'a> {
                 let b = blk.unwrap();
                 let res = self.inline_block(b, &[LE::Field(Box::new(cell()), 1)], &[], None);
                 let rt = self.lty(&e.ty);
-                let res = self.bind(res, rt.clone());
-                let res = self.deep_copy(res, &rt);
-                let res = self.bind(res, rt);
+                let res = if rt == LTy::Unit {
+                    // a block ending in a Unit call: evaluate it, there's no value
+                    if !matches!(res, LE::Unit | LE::Var(_) | LE::I(_) | LE::B(_)) {
+                        self.emit(LS::Eval(res));
+                    }
+                    LE::Unit
+                } else {
+                    let res = self.bind(res, rt.clone());
+                    let res = self.deep_copy(res, &rt);
+                    self.bind(res, rt)
+                };
                 let pvar = self.var_of(b.params[0]);
                 self.emit(LS::SetPlace { var: p, steps: vec![crate::lir::Step::Index(LE::I(0), None), crate::lir::Step::Field(1)], val: LE::Var(pvar) });
                 self.emit(LS::Unlock(LE::Field(Box::new(cell()), 0)));

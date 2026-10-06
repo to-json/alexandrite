@@ -1073,7 +1073,7 @@ mod rt {
         c
     }
     pub unsafe fn shim_alx_fd_wait_until(fd: i64, mode: i64, until: i64) -> i64 {
-        let gen = NET_WAKES.load(std::sync::atomic::Ordering::SeqCst);
+        let wake_gen = NET_WAKES.load(std::sync::atomic::Ordering::SeqCst);
         loop {
             if until > 0 && unsafe { shim_alx_mono_ns() } >= until {
                 return -(sysc("ETIMEDOUT") as i64);
@@ -1089,7 +1089,7 @@ mod rt {
                     return neg_errno(&e);
                 }
             }
-            if unsafe { libc_fcntl(fd as i32, 1) } < 0 || NET_WAKES.load(std::sync::atomic::Ordering::SeqCst) != gen {
+            if unsafe { libc_fcntl(fd as i32, 1) } < 0 || NET_WAKES.load(std::sync::atomic::Ordering::SeqCst) != wake_gen {
                 return 0;
             }
         }
@@ -1279,6 +1279,9 @@ mod rt {
         -100001
     }
     pub unsafe fn shim_alx_net_interfaces(_out: *mut u8, _n: i64) -> i64 {
+        enosys()
+    }
+    pub unsafe fn shim_alx_net_multicast_addrs(_out: *mut u8, _n: i64) -> i64 {
         enosys()
     }
     pub unsafe fn shim_alx_net_socketpair(sotype: i64, fds: *mut u8) -> i64 {

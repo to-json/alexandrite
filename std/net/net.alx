@@ -216,9 +216,9 @@ pub struct Conn {
   }
 
   # Go's WriteToUDP.
-  pub def write_to_udp!(p: [Byte], addr: UDPAddr) -> ~Int {
-    a = addr
-    fail write_to_connected_error("write", nfd.net, nfd.la, a.to_s) if nfd.connected
+  pub def write_to_udp!(p: [Byte], addr: UDPAddr?) -> ~Int {
+    fail write_to_connected_error("write", nfd.net, nfd.la, addr_s(opt_addr(addr))) if nfd.connected
+    a = addr || fail wrap_error("write", nfd.net, nfd.la, "", "", ERR_MISSING_ADDRESS)
     sa = ip_to_sockaddr(nfd.family, a.ip, a.port, a.zone)
     if e = sa.err {
       fail wrap_any("write", nfd.net, nfd.la, a.to_s, e)
@@ -238,8 +238,9 @@ pub struct Conn {
   }
 
   # Go's WriteToUnix.
-  pub def write_to_unix!(p: [Byte], addr: UnixAddr) -> ~Int {
-    fail write_to_connected_error("write", nfd.net, nfd.la, addr.to_s) if nfd.connected
+  pub def write_to_unix!(p: [Byte], addr0: UnixAddr?) -> ~Int {
+    fail write_to_connected_error("write", nfd.net, nfd.la, addr_s(opt_addr(addr0))) if nfd.connected
+    addr = addr0 || fail wrap_error("write", nfd.net, nfd.la, "", "", ERR_MISSING_ADDRESS)
     if addr.net != sotype_to_net(nfd.sotype) {
       fail op_error("write", nfd.net, nfd.la, addr.to_s, "", c("EAFNOSUPPORT"))
     }
@@ -251,8 +252,9 @@ pub struct Conn {
   }
 
   # Go's WriteToIP.
-  pub def write_to_ip!(p: [Byte], addr: IPAddr) -> ~Int {
-    fail write_to_connected_error("write", nfd.net, nfd.la, addr.to_s) if nfd.connected
+  pub def write_to_ip!(p: [Byte], addr0: IPAddr?) -> ~Int {
+    fail write_to_connected_error("write", nfd.net, nfd.la, addr_s(opt_addr(addr0))) if nfd.connected
+    addr = addr0 || fail wrap_error("write", nfd.net, nfd.la, "", "", ERR_MISSING_ADDRESS)
     sa = ip_to_sockaddr(nfd.family, addr.ip, 0, addr.zone)
     if e = sa.err {
       fail wrap_any("write", nfd.net, nfd.la, addr.to_s, e)
@@ -331,6 +333,28 @@ pub struct Conn {
       sa = r.unwrap
     }
     nfd.~fd_write_msg(p, oob, sa, "write", nfd.la, dst)
+  }
+
+  # Go's WriteMsgIP.
+  pub def write_msg_ip!(p: [Byte], oob: [Byte], addr0: IPAddr?) -> ~(Int, Int) {
+    dst = addr_s(opt_addr(addr0))
+    fail write_to_connected_error("write", nfd.net, nfd.la, dst) if nfd.connected
+    addr = addr0 || fail wrap_error("write", nfd.net, nfd.la, "", "", ERR_MISSING_ADDRESS)
+    r = ip_to_sockaddr(nfd.family, addr.ip, 0, addr.zone)
+    if e = r.err {
+      fail wrap_any("write", nfd.net, nfd.la, dst, e)
+    }
+    nfd.~fd_write_msg(p, oob, r.unwrap, "write", nfd.la, dst)
+  }
+
+  # Go's ReadMsgIP.
+  pub def read_msg_ip!(p: [Byte], oob: [Byte]) -> ~(Int, Int, Int, IPAddr?) {
+    n, oobn, flags, a = self.~read_msg!(p, oob)
+    x = a || return (n, oobn, flags, none)
+    case x {
+      IPAddr(i) => return (n, oobn, flags, i)
+      _ => return (n, oobn, flags, none)
+    }
   }
 
   # Go's WriteMsgUDP.
@@ -588,6 +612,44 @@ pub struct Buffers {
   pub def write_to![W](w: W) -> ~Int {
     n = 0
     ww = w
+    if W is Conn {
+      # Go writes a Conn's buffers with writev; here small buffers are
+      # gathered (up to 64 KiB) into one write, big ones written as they are.
+      batch: [Byte] = []
+      for b in st[0].v.dup {
+        if b.size >= 65536 || batch.size + b.size > 65536 {
+          if batch.size > 0 {
+            r = ww.write!(batch)
+            if r.err? {
+              consume(n)
+              ~r
+            }
+            n += r.unwrap
+            batch = []
+          }
+        }
+        if b.size >= 65536 {
+          r = ww.write!(b)
+          if r.err? {
+            consume(n)
+            ~r
+          }
+          n += r.unwrap
+        } else {
+          batch = batch + b
+        }
+      }
+      if batch.size > 0 {
+        r = ww.write!(batch)
+        if r.err? {
+          consume(n)
+          ~r
+        }
+        n += r.unwrap
+      }
+      consume(n)
+      return n
+    }
     for b in st[0].v.dup {
       r = ww.write!(b)
       if r.err? {
@@ -621,13 +683,15 @@ pub struct Buffers {
       ln0 = v[0].size
       if ln0 > n {
         v[0] = v[0][n...ln0]
-        st[0].v = v
+        cell = st
+        cell[0] = BuffersState.new(v: v)
         return
       }
       n -= ln0
       v = v[1...v.size]
     }
-    st[0].v = v
+    cell = st
+    cell[0] = BuffersState.new(v: v)
   }
 }
 

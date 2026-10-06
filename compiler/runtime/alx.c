@@ -1631,6 +1631,7 @@ struct AlxChan {
     bool slot_full, closed;
     uint64_t send_seq, taken_seq;  /* ticket of the slot's sender / last taken */
     int64_t recv_waiting, send_waiting;
+    int64_t plain_recv_waiting;    /* receivers in alx_chan_recv: they always take */
     WNode *w;                      /* parked senders / receivers / selects */
 };
 
@@ -1724,9 +1725,11 @@ bool alx_chan_recv(AlxChan *c, void *out) {
             return false;
         }
         c->recv_waiting++;
+        c->plain_recv_waiting++;
         if (c->send_waiting) wake(&c->w); /* a blocked select-sender may now proceed */
         bool ok = block_wait1(&c->w);
         c->recv_waiting--;
+        c->plain_recv_waiting--;
         if (!ok) deadlock();
     }
 }
@@ -1753,6 +1756,12 @@ static uint64_t rnd(void) {
     return tl_rng;
 }
 
+/* An unbuffered send in a select commits only with a receiver that takes
+ * the value: a receiver blocked in alx_chan_recv always does, so the value
+ * goes into the slot at once; a receiver blocked in a select may pick
+ * another case, so the value goes into the slot tentatively and the select
+ * parks until it is taken (the send case wins) or something else happens
+ * (the value is withdrawn and the cases are tried again). */
 int64_t alx_select(AlxSelCase *cs, int64_t n, bool has_default, const char *loc) {
     int64_t order[n ? n : 1];
     pthread_mutex_lock(&g_mu);
@@ -1763,26 +1772,46 @@ int64_t alx_select(AlxSelCase *cs, int64_t n, bool has_default, const char *loc)
             order[i] = order[j];
             order[j] = t;
         }
+        int64_t tentative = -1;
+        uint64_t ticket = 0;
         for (int64_t k = 0; k < n; k++) {
             int64_t i = order[k];
             AlxSelCase *s = &cs[i];
             if (s->is_send) {
-                if (s->ch->closed) {
+                AlxChan *c = s->ch;
+                if (c->closed) {
                     pthread_mutex_unlock(&g_mu);
                     alx_panic("send on a closed channel", loc);
                 }
-                if (try_put(s->ch, s->buf, true)) {
-                    wake(&s->ch->w);
-                    pthread_mutex_unlock(&g_mu);
-                    return i;
+                if (c->cap > 0 || c->plain_recv_waiting > 0) {
+                    if (try_put(c, s->buf, true)) {
+                        wake(&c->w);
+                        pthread_mutex_unlock(&g_mu);
+                        return i;
+                    }
+                } else if (tentative < 0 && !has_default && try_put(c, s->buf, true)) {
+                    tentative = i;
+                    ticket = c->send_seq;
+                    wake(&c->w);
                 }
             } else if (try_take(s->ch, s->buf)) {
                 s->ok = 1;
                 wake(&s->ch->w);
+                if (tentative >= 0) {
+                    /* Withdraw the tentative send: this case won. */
+                    AlxChan *tc = cs[tentative].ch;
+                    tc->slot_full = false;
+                    tc->send_seq--;
+                }
                 pthread_mutex_unlock(&g_mu);
                 return i;
             } else if (s->ch->closed) {
                 s->ok = 0;
+                if (tentative >= 0) {
+                    AlxChan *tc = cs[tentative].ch;
+                    tc->slot_full = false;
+                    tc->send_seq--;
+                }
                 pthread_mutex_unlock(&g_mu);
                 return i;
             }
@@ -1809,6 +1838,18 @@ int64_t alx_select(AlxSelCase *cs, int64_t n, bool has_default, const char *loc)
         for (int64_t i = 0; i < n; i++) {
             if (cs[i].is_send) cs[i].ch->send_waiting--;
             else cs[i].ch->recv_waiting--;
+        }
+        if (tentative >= 0) {
+            AlxChan *tc = cs[tentative].ch;
+            if (tc->taken_seq >= ticket) {
+                pthread_mutex_unlock(&g_mu);
+                return tentative;
+            }
+            /* Not taken (yet): withdraw it and look at every case again. */
+            if (tc->slot_full && tc->send_seq == ticket) {
+                tc->slot_full = false;
+                tc->send_seq--;
+            }
         }
         if (!ok) deadlock();
     }
@@ -3613,6 +3654,40 @@ int64_t alx_net_interfaces(uint8_t *out, int64_t n) {
     freeifaddrs(ifs);
     return len;
 }
+
+/* The multicast group memberships (getifmaddrs(3), the BSDs and macOS), one
+ * "index family hexip" line each, into out: the length, or -errno (-ENOSYS
+ * on Linux, where std/net reads /proc/net/igmp and igmp6 instead). */
+#if defined(__APPLE__) || defined(__FreeBSD__) || defined(__NetBSD__) || defined(__OpenBSD__) || defined(__DragonFly__)
+#  include <net/if_dl.h>
+int64_t alx_net_multicast_addrs(uint8_t *out, int64_t n) {
+    struct ifmaddrs *ifm = NULL;
+    if (getifmaddrs(&ifm) < 0) return -errno;
+    int64_t len = 0;
+    char line[128];
+    for (struct ifmaddrs *a = ifm; a; a = a->ifma_next) {
+        if (!a->ifma_addr || !a->ifma_name) continue;
+        int f = a->ifma_addr->sa_family;
+        if (f != AF_INET && f != AF_INET6) continue;
+        unsigned idx = 0;
+        if (a->ifma_name->sa_family == AF_LINK) idx = ((const struct sockaddr_dl *)(const void *)a->ifma_name)->sdl_index;
+        const unsigned char *ip;
+        int il = f == AF_INET ? 4 : 16;
+        if (f == AF_INET) ip = (const void *)&((const struct sockaddr_in *)(const void *)a->ifma_addr)->sin_addr;
+        else ip = (const void *)&((const struct sockaddr_in6 *)(const void *)a->ifma_addr)->sin6_addr;
+        int k = snprintf(line, sizeof line, "%u %d ", idx, f == AF_INET ? 4 : 6);
+        for (int i = 0; i < il; i++) k += snprintf(line + k, sizeof line - (size_t)k, "%02x", ip[i]);
+        line[k++] = '\n';
+        if (len + k > n) { freeifmaddrs(ifm); return -ENOBUFS; }
+        memcpy(out + len, line, (size_t)k);
+        len += k;
+    }
+    freeifmaddrs(ifm);
+    return len;
+}
+#else
+int64_t alx_net_multicast_addrs(uint8_t *out, int64_t n) { (void)out; (void)n; return -ENOSYS; }
+#endif
 
 /* socketpair(2) (sotype as alx_net_socket's) into fds (two native int64s). */
 int64_t alx_net_socketpair(int64_t sotype, uint8_t *fds) {

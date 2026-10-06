@@ -566,6 +566,7 @@ int64_t alx_net_getaddrinfo(const char *host, int64_t family, uint8_t *out, int6
 int64_t alx_net_canonname(const char *host, uint8_t *out, int64_t n);
 int64_t alx_net_getnameinfo(const uint8_t *sa, uint8_t *out, int64_t n);
 int64_t alx_net_interfaces(uint8_t *out, int64_t n);
+int64_t alx_net_multicast_addrs(uint8_t *out, int64_t n);
 int64_t alx_net_socketpair(int64_t sotype, uint8_t *fds);
 int64_t alx_net_dup(int64_t fd, int64_t nonblock);
 

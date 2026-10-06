@@ -1,0 +1,240 @@
+# Go's error_test.go, translated. Go's TestDialError and TestListenError
+# replace name lookups and connects with test hooks (socktest); here the
+# rows that would look a name up on the network ("no-such-name:80",
+# "mh/astro/r70:http") are left out and the rest run for real: each fails
+# before connecting. TestAcceptError's handler loop is kept.
+
+import "context"
+import "os"
+import "time"
+
+def dial_error_rows -> [(Str, Str)] {
+  [("foo", ""), ("bar", "baz"), ("datakit", "mh/astro/r70"), ("tcp", ""), ("tcp", "127.0.0.1:☺"), ("tcp", join_host_port("127.0.0.1", "-1")), ("tcp", join_host_port("127.0.0.1", "123456789")), ("udp", join_host_port("127.0.0.1", "-1")), ("udp", join_host_port("127.0.0.1", "123456789")), ("ip:icmp", "127.0.0.1"), ("unix", "/path/to/somewhere"), ("unixgram", "/path/to/somewhere"), ("unixpacket", "/path/to/somewhere")]
+}
+
+test "DialError" {
+  d = Dialer.new(timeout: some_timeout)
+  for tt in dial_error_rows {
+    network, address = tt
+    r = d.dial(network, address)
+    if r.ok? {
+      c = r.unwrap
+      c.close!
+      # A raw socket may open as root.
+      assert network == "ip:icmp", "should fail; #{network}:#{address}"
+      next
+    }
+    if p = parse_dial_error(r.err.unwrap) {
+      assert false, "#{network} #{address}: #{p}"
+    }
+  }
+}
+
+test "ProtocolDialError" {
+  for network in ["tcp", "udp", "ip:4294967296", "unix", "unixpacket", "unixgram"] {
+    err: Error? = none
+    if network == "tcp" {
+      err = dial_tcp(network, none, TCPAddr.new(port: 1 << 16)).err
+    } elsif network == "udp" {
+      err = dial_udp(network, none, UDPAddr.new(port: 1 << 16)).err
+    } elsif network == "ip:4294967296" {
+      err = dial_ip(network, none, none).err
+    } else {
+      err = dial_unix(network, none, UnixAddr.new(name: "//")).err
+    }
+    e = err || panic("#{network}: should fail")
+    if p = parse_dial_error(e) {
+      assert false, "#{network}: #{p}"
+    }
+  }
+}
+
+test "DialAddrError" {
+  if supports_ipv4? && supports_ipv6? {
+    rows: [(Str, Str, TCPAddr?)] = [("tcp4", "::1", none), ("tcp4", "", TCPAddr.new(ip: ipv6_loopback)), ("tcp6", "", TCPAddr.new(ip: ip_from([0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef])))]
+    for tt in rows {
+      network, lit, addr = tt
+      r = lit != "" ? dial(network, join_host_port(lit, "0")) : dial_tcp(network, none, addr)
+      assert r.err?, "#{network} #{lit}: succeeded, want error"
+      e = r.err.unwrap
+      if p = parse_dial_error(e) {
+        assert false, p
+      }
+      want = lit != "" ? lit : addr.unwrap.ip.to_s
+      case e {
+        NetError.BadAddr(at) => assert at.err.start_with?("address #{want}:"), "error Addr in #{at.err}, want #{want}"
+        _ => assert false, "inner error is not an AddrError: #{e.message}"
+      }
+    }
+  }
+}
+
+def listen_error_rows -> [(Str, Str)] {
+  [("foo", ""), ("bar", "baz"), ("datakit", "mh/astro/r70"), ("tcp", "127.0.0.1:☺"), ("tcp", join_host_port("127.0.0.1", "-1")), ("tcp", join_host_port("127.0.0.1", "123456789")), ("unix", "/path/to/somewhere"), ("unixpacket", "/path/to/somewhere")]
+}
+
+test "ListenError" {
+  for tt in listen_error_rows {
+    network, address = tt
+    r = listen(network, address)
+    if r.ok? {
+      ln = r.unwrap
+      ln.close!
+      assert false, "should fail; #{network}:#{address}"
+      next
+    }
+    if p = parse_dial_error(r.err.unwrap) {
+      assert false, "#{network} #{address}: #{p}"
+    }
+  }
+}
+
+test "ListenPacketError" {
+  rows: [(Str, Str)] = [("foo", ""), ("bar", "baz"), ("datakit", "mh/astro/r70"), ("udp", "127.0.0.1:☺"), ("udp", join_host_port("127.0.0.1", "-1")), ("udp", join_host_port("127.0.0.1", "123456789"))]
+  for tt in rows {
+    network, address = tt
+    r = listen_packet(network, address)
+    if r.ok? {
+      c = r.unwrap
+      c.close!
+      assert false, "should fail; #{network}:#{address}"
+      next
+    }
+    if p = parse_dial_error(r.err.unwrap) {
+      assert false, "#{network} #{address}: #{p}"
+    }
+  }
+}
+
+test "ProtocolListenError" {
+  for network in ["tcp", "udp", "ip:4294967296", "unix", "unixpacket", "unixgram"] {
+    err: Error? = none
+    if network == "tcp" {
+      err = listen_tcp(network, TCPAddr.new(port: 1 << 16)).err
+    } elsif network == "udp" {
+      err = listen_udp(network, UDPAddr.new(port: 1 << 16)).err
+    } elsif network == "ip:4294967296" {
+      err = listen_ip(network, none).err
+    } elsif network == "unixgram" {
+      err = listen_unixgram(network, UnixAddr.new(name: "//")).err
+    } else {
+      err = listen_unix(network, UnixAddr.new(name: "//")).err
+    }
+    e = err || panic("#{network}: should fail")
+    if p = parse_dial_error(e) {
+      assert false, "#{network}: #{p}"
+    }
+  }
+}
+
+test "CloseError" {
+  ln = new_local_listener("tcp")
+  c = dial(ln.network, ln.addr).unwrap
+  for _i in 0...3 {
+    if e = c.close_read!.err {
+      if p = parse_close_error(e, true) {
+        assert false, p
+      }
+    }
+  }
+  for _i in 0...3 {
+    if e = c.close_write!.err {
+      if p = parse_close_error(e, true) {
+        assert false, p
+      }
+    }
+  }
+  for i in 0...3 {
+    if e = c.close!.err {
+      if p = parse_close_error(e, false) {
+        assert false, "##{i}: #{p}"
+      }
+    }
+    if e = ln.close!.err {
+      if p = parse_close_error(e, false) {
+        assert false, "##{i}: #{p}"
+      }
+    }
+  }
+  pc = listen_packet("udp", "127.0.0.1:0").unwrap
+  for i in 0...3 {
+    if e = pc.close!.err {
+      if p = parse_close_error(e, false) {
+        assert false, "##{i}: #{p}"
+      }
+    }
+  }
+}
+
+test "AcceptError" {
+  ln = new_local_listener("tcp")
+  errs = Chan[Str].new(16)
+  srv = spawn {
+    loop {
+      ln.set_deadline(time.now.add(time.millisecond * 5))
+      r = ln.accept
+      if e = r.err {
+        if p = parse_accept_error(e) {
+          errs << p
+        }
+        break unless is_timeout(e) || is_temporary(e)
+        next
+      }
+      c = r.unwrap
+      c.close!
+    }
+    errs.close
+  }
+  time.sleep(time.millisecond * 100)
+  ln.close!
+  srv.wait
+  assert_eq drain(errs), ""
+}
+
+test "FileError" {
+  path = os.mkdir_temp("", "").unwrap + "/go-nettest"
+  os.write_file(path, bytes_of("x"), 0o600).unwrap
+  f = os.open(path).unwrap
+  r1 = file_conn(f)
+  e1 = r1.err.unwrap
+  if p = parse_common_error(e1) {
+    assert false, p
+  }
+  r2 = file_listener(f)
+  e2 = r2.err.unwrap
+  if p = parse_common_error(e2) {
+    assert false, p
+  }
+  r3 = file_packet_conn(f)
+  e3 = r3.err.unwrap
+  if p = parse_common_error(e3) {
+    assert false, p
+  }
+  f.close!
+  os.remove(path)
+  ln = new_local_listener("tcp")
+  for _i in 0...3 {
+    r = ln.file
+    if e = r.err {
+      if p = parse_common_error(e) {
+        assert false, p
+      }
+    } else {
+      ff = r.unwrap
+      ff.close!
+    }
+    ln.close!
+  }
+}
+
+# Go's TestContextError: errCanceled is context.Canceled and errTimeout
+# context.DeadlineExceeded; here the errors a canceled or expired dial
+# context gives.
+test "ContextError" {
+  ctx, cancel = context.with_cancel(context.background)
+  cancel.call
+  assert_eq ctx_error(ctx).message, "operation was canceled"
+  ctx2, cancel2 = context.with_deadline(context.background, 1)
+  assert is_timeout(ctx_error(ctx2)), "a passed deadline is a timeout"
+  cancel2.call
+}

@@ -2192,11 +2192,21 @@ int64_t alx_sys_spawn(const uint8_t *argv, int64_t argc, const uint8_t *env, int
     return rc ? -(int64_t)rc : (int64_t)pid;
 }
 
+/* A task doesn't block its worker in wait4(2): tasks are pinned to their
+ * worker, and one of them may be what the child is waiting on (port-issues
+ * #154). wait4_task is with the poller below. */
+static int64_t wait4_task(pid_t pid, int *st, struct rusage *ru);
+
 int64_t alx_sys_wait(int64_t pid, uint8_t *out) {
     int st;
     struct rusage ru;
-    while (wait4((pid_t)pid, &st, 0, &ru) < 0)
-        if (errno != EINTR) return -errno;
+    if (tl_task) {
+        int64_t r = wait4_task((pid_t)pid, &st, &ru);
+        if (r < 0) return r;
+    } else {
+        while (wait4((pid_t)pid, &st, 0, &ru) < 0)
+            if (errno != EINTR) return -errno;
+    }
 #ifdef __APPLE__
     int64_t rss = (int64_t)ru.ru_maxrss;  /* bytes */
 #else
@@ -2218,7 +2228,9 @@ int64_t alx_sys_pipe(uint8_t *out, int64_t nonblock) {
     if (pipe(p) != 0) return -errno;
     fcntl(p[0], F_SETFD, FD_CLOEXEC);
     fcntl(p[1], F_SETFD, FD_CLOEXEC);
-    if (nonblock) fcntl(p[0], F_SETFL, fcntl(p[0], F_GETFL) | O_NONBLOCK);
+    /* nonblock: bit 0 the read end, bit 1 the write end. */
+    if (nonblock & 1) fcntl(p[0], F_SETFL, fcntl(p[0], F_GETFL) | O_NONBLOCK);
+    if (nonblock & 2) fcntl(p[1], F_SETFL, fcntl(p[1], F_GETFL) | O_NONBLOCK);
     int64_t v[2] = { p[0], p[1] };
     memcpy(out, v, sizeof v);
     return 0;
@@ -2238,13 +2250,6 @@ int64_t alx_sys_exec(const uint8_t *argv, int64_t argc, const uint8_t *env, int6
     if (envc >= 0) environ = ev;
     execvp(av[0], av);
     return -errno;
-}
-
-int64_t alx_sys_poll2(int64_t a, int64_t b) {
-    struct pollfd pf[2] = { { (int)a, POLLIN, 0 }, { (int)b, POLLIN, 0 } };
-    while (poll(pf, 2, -1) < 0)
-        if (errno != EINTR) return -errno;
-    return 0;
 }
 
 /* ---------- signals (std os/signal) ----------
@@ -2610,6 +2615,56 @@ static bool poller_start(void) {
     return true;
 }
 
+/* Park the current task until one of fds[i] is ready for modes[i] (1 read,
+ * 2 write), has an error or hung up. Negative fds are skipped. Each fd gets
+ * its own one-shot registration; whichever fires first wakes the task, and
+ * the others are withdrawn here (a late event for one finds nothing). 0, or
+ * -errno if an fd can't be polled. In a task only. */
+static int64_t fd_wait_task(const int *fds, const int *modes, int n) {
+    IoWait *ws = calloc((size_t)(n ? n : 1), sizeof *ws);
+    if (!ws) alx_panic("out of memory", "runtime");
+    Parker *p = cur_pk();
+    pthread_mutex_lock(&g_mu);
+    if (!poller_start()) { int e = errno; pthread_mutex_unlock(&g_mu); free(ws); return -e; }
+    int k = 0;
+    for (int i = 0; i < n; i++) {
+        if (fds[i] < 0) continue;
+        IoWait *w = &ws[k++];
+        w->fd = fds[i]; w->mode = modes[i]; w->p = p;
+        IoWait **b = IOW_B(w->fd);
+        w->next = *b; *b = w;
+#ifdef ALX_EPOLL
+        int rc = poll_arm(w->fd);
+#else
+        int rc = poll_arm(w->fd, w->mode);
+#endif
+        if (rc < 0) {
+            for (int j = 0; j < k; j++) iow_remove(&ws[j]);
+            pthread_mutex_unlock(&g_mu);
+            free(ws);
+            return rc;
+        }
+    }
+    if (k == 0) { pthread_mutex_unlock(&g_mu); free(ws); return 0; }
+    g_sleepers += k;
+    p->parked = true; p->dead = false;
+    if (p->counted) g_runnable--;
+    pthread_mutex_unlock(&g_mu);
+    sw_out(p->task, false);
+    if (k > 1) {
+        /* Withdraw the registrations that didn't fire. */
+        pthread_mutex_lock(&g_mu);
+        for (int j = 0; j < k; j++) {
+            IoWait **pp = IOW_B(ws[j].fd);
+            while (*pp && *pp != &ws[j]) pp = &(*pp)->next;
+            if (*pp) { *pp = ws[j].next; g_sleepers--; }
+        }
+        pthread_mutex_unlock(&g_mu);
+    }
+    free(ws);
+    return 0;
+}
+
 /* Wait until fd is readable (mode 1) or writable (mode 2), or has an error or
  * hung up (the caller retries its syscall and sees which). Parks the task;
  * outside a task it blocks in poll(2). 0, or -errno if the fd can't be polled. */
@@ -2621,27 +2676,81 @@ int64_t alx_fd_wait(int64_t fd, int64_t mode) {
             if (errno != EINTR) return -errno;
         return 0;
     }
-    IoWait *w = malloc(sizeof *w);
-    if (!w) alx_panic("out of memory", "runtime");
-    Parker *p = cur_pk();
-    w->fd = (int)fd; w->mode = (int)mode; w->p = p;
-    pthread_mutex_lock(&g_mu);
-    if (!poller_start()) { int e = errno; pthread_mutex_unlock(&g_mu); free(w); return -e; }
-    IoWait **b = IOW_B(w->fd);
-    w->next = *b; *b = w;
-#ifdef ALX_EPOLL
-    int rc = poll_arm(w->fd);
-#else
-    int rc = poll_arm(w->fd, w->mode);
-#endif
-    if (rc < 0) { iow_remove(w); pthread_mutex_unlock(&g_mu); free(w); return rc; }
-    g_sleepers++;
-    p->parked = true; p->dead = false;
-    if (p->counted) g_runnable--;
-    pthread_mutex_unlock(&g_mu);
-    sw_out(p->task, false);
-    free(w);
+    int f = (int)fd, m = (int)mode;
+    return fd_wait_task(&f, &m, 1);
+}
+
+/* Wait until a or b (-1: none) is readable or hung up. A task parks, so its
+ * worker runs other tasks: blocking the worker in poll(2) would starve every
+ * task pinned to it, the one the child process is waiting on among them
+ * (port-issues #154). A plain thread blocks in poll(2). 0 or -errno. */
+int64_t alx_sys_poll2(int64_t a, int64_t b) {
+    if (tl_task) {
+        int fds[2] = { (int)a, (int)b }, modes[2] = { 1, 1 };
+        return fd_wait_task(fds, modes, 2);
+    }
+    struct pollfd pf[2] = { { (int)a, POLLIN, 0 }, { (int)b, POLLIN, 0 } };
+    while (poll(pf, 2, -1) < 0)
+        if (errno != EINTR) return -errno;
     return 0;
+}
+
+/* wait4(2) from a task: a helper thread blocks in it while the task parks
+ * (for the same reason as alx_sys_poll2). */
+typedef struct WaitJob {
+    pid_t pid;
+    int st, err;
+    struct rusage ru;
+    bool done, waiting;
+    Parker *p;
+} WaitJob;
+
+static void *wait_main(void *arg) {
+    WaitJob *j = arg;
+    tl_uncounted = true;
+    int err = 0;
+    while (wait4(j->pid, &j->st, 0, &j->ru) < 0)
+        if (errno != EINTR) { err = errno; break; }
+    pthread_mutex_lock(&g_mu);
+    j->err = err;
+    j->done = true;
+    if (j->waiting) { j->waiting = false; g_sleepers--; unpark(j->p); }
+    pthread_mutex_unlock(&g_mu);
+    return NULL;
+}
+
+/* 0 with *st and *ru filled, or -errno. The job is on the heap: a parked
+ * task's stack may be another task's while it waits (copy mode). */
+static int64_t wait4_task(pid_t pid, int *st, struct rusage *ru) {
+    WaitJob *j = calloc(1, sizeof *j);
+    if (!j) alx_panic("out of memory", "runtime");
+    j->pid = pid;
+    j->p = cur_pk();
+    pthread_t th;
+    pthread_attr_t at;
+    pthread_attr_init(&at);
+    pthread_attr_setdetachstate(&at, PTHREAD_CREATE_DETACHED);
+    pthread_attr_setstacksize(&at, 64 << 10);
+    int rc = pthread_create(&th, &at, wait_main, j);
+    pthread_attr_destroy(&at);
+    if (rc != 0) { free(j); return -(int64_t)rc; }
+    pthread_mutex_lock(&g_mu);
+    while (!j->done) {
+        Parker *p = j->p;
+        j->waiting = true;
+        g_sleepers++;
+        p->parked = true; p->dead = false;
+        if (p->counted) g_runnable--;
+        pthread_mutex_unlock(&g_mu);
+        sw_out(p->task, false);
+        pthread_mutex_lock(&g_mu);
+    }
+    pthread_mutex_unlock(&g_mu);
+    int64_t r = j->err ? -(int64_t)j->err : 0;
+    *st = j->st;
+    *ru = j->ru;
+    free(j);
+    return r;
 }
 
 /* close(2) that first wakes every task waiting on fd (they retry and see

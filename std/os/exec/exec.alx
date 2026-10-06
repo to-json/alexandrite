@@ -63,6 +63,7 @@ extern def alx_sys_exec(argv: [Byte], argc: Int, env: [Byte], envc: Int, dir: St
 extern def alx_sys_wait(pid: Int, out: [Byte]) -> Int
 extern def alx_sys_pipe(out: [Byte], nonblock: Int) -> Int
 extern def alx_sys_poll2(a: Int, b: Int) -> Int
+extern def alx_fd_wait(fd: Int, mode: Int) -> Int
 extern def alx_sys_open(p: Str, flags: I32, mode: I32) -> I32
 extern def alx_sys_const(name: Str) -> Int
 extern def alx_mono_ns -> Int
@@ -307,14 +308,24 @@ pub struct Cmd {
   # (written by a task while the child reads, so any size works).
   def stdin_fd -> ~Int {
     if s = stdin {
-      p = ~os_pipe(false)
+      # The write end is non-blocking: a task blocked in write(2) would
+      # block its worker, and with it every task pinned there.
+      b: [Byte] = [0; 16]
+      r = alx_sys_pipe(b, 2)
+      fail ExecError.Start("pipe", -r) if r < 0
+      p = (get64(b, 0), get64(b, 1))
       w = p[1]
       data = s.bytes.to_a
       spawn {
+        eagain = alx_sys_const("EAGAIN")
         off = 0
         while off < data.size {
           n = c_write(w.to_i32, data[off...data.size], data.size - off)
-          break if n < 0
+          if n < 0 {
+            break if C.errno != eagain
+            break if alx_fd_wait(w, 2) < 0
+            next
+          }
           off += n
         }
         close_fd(w)

@@ -88,7 +88,11 @@ extern def sqlite3_changes(db: Int) -> I32
 #[link("sqlite3")]
 extern def sqlite3_last_insert_rowid(db: Int) -> Int
 #[link("sqlite3")]
-extern def sqlite3_prepare_v2(db: Int, sql: [Byte], n: I32, out: [Byte], tail: [Byte]) -> I32
+extern def sqlite3_prepare_v2(db: Int, sql: Int, n: I32, out: [Byte], tail: [Byte]) -> I32
+#[link("sqlite3")]
+extern def sqlite3_malloc64(n: Int) -> Int
+#[link("sqlite3")]
+extern def sqlite3_free(p: Int)
 #[link("sqlite3")]
 extern def sqlite3_finalize(st: Int) -> I32
 #[link("sqlite3")]
@@ -129,8 +133,7 @@ extern def sqlite3_column_text(st: Int, i: I32) -> Ptr
 extern def sqlite3_column_blob(st: Int, i: I32) -> Ptr
 #[link("sqlite3")]
 extern def sqlite3_column_bytes(st: Int, i: I32) -> I32
-# The address of a [Byte]'s first element: memchr finds its first byte there.
-extern def c_memchr(p: [Byte], c: I32, n: Int) -> Int = "memchr"
+extern def c_memcpy(dst: Int, src: [Byte], n: Int) -> Int = "memcpy"
 
 SQLITE_OK = 0
 SQLITE_ROW = 100
@@ -321,15 +324,25 @@ pub struct Conn {
 
   # Prepares the statement starting at byte `from` of `sql`: (handle or 0
   # for none, the offset after it).
+  #
+  # The text goes to C memory first: SQLite's tail pointer is an address in
+  # the buffer it was given, so the offset must be taken against that same
+  # buffer. (Taking a [Byte]'s address with a second FFI call isn't that:
+  # the Rust oracle passes every call a fresh copy, so the two addresses
+  # differed whenever the allocator didn't hand back the same block, and the
+  # offset ran past the end; port-issues #162.)
   def prepare_at(sql: [Byte], from: Int) -> ~(Int, Int) {
     buf = zbytes(sql[from...sql.size])
+    cbuf = sqlite3_malloc64(buf.size)
+    fail SqliteError.Error(code: 7, extended: 7, msg: "sqlite: out of memory") if cbuf == 0
+    defer sqlite3_free(cbuf)
+    _ = c_memcpy(cbuf, buf, buf.size)
     out: [Byte] = [0; 8]
     tail: [Byte] = [0; 8]
-    rc = sqlite3_prepare_v2(h, buf, buf.size.as_i32, out, tail).to_i
+    rc = sqlite3_prepare_v2(h, cbuf, buf.size.as_i32, out, tail).to_i
     fail db_error(h, rc) if rc != SQLITE_OK
-    base = c_memchr(buf, buf[0].to_i32, 1)
     t = read_ptr(tail)
-    used = t == 0 ? buf.size - 1 : t - base
+    used = t == 0 ? buf.size - 1 : t - cbuf
     (read_ptr(out), from + used)
   }
 

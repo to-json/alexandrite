@@ -13,7 +13,7 @@
 #   Var (interface { String() string })     Var (interface { to_s -> Str })
 #   Int / Float / String (zero usable)      make_int / make_float / make_string -> Int / Float / String
 #     Value / String / Add / AddFloat / Set   value / to_s / add(d) / set(v)
-#   Map                                     reg.make_map -> Map (see "Maps" below)
+#   Map                                     make_map -> Map (Go's new(Map).Init())
 #     Get / Set / Add / AddFloat /            get(k) -> Var? / set(k, v: Var?) / add(k, d) / add_float(k, d) /
 #     Delete / Do / Init / String             delete(k) / do { |kv| } / init -> Map / to_s
 #   KeyValue{Key, Value}                    KeyValue (key, value: Var?)
@@ -53,38 +53,30 @@
 # accessor and the wrappers. The explicit Registry stays for tests and for
 # programs that want more than one.
 #
-# Maps. An expvar Map holds Vars and is itself a Var, so a Map can hold a
-# Map. Recursive types don't exist yet (a value can't contain itself, and a
-# closure can't hold a closure of its own type), so a registry keeps all of
-# its maps' contents in one store (a Pool under a Mutex) and a Map is a
-# handle into it. Hence:
-#  - Maps are made by a registry: `reg.make_map` (Go's new(Map).Init()) or
-#    `reg.new_map(name)` (Go's NewMap). A Map can be put into a Map (or
-#    published) only in the registry that made it; another registry's Map
-#    panics ("expvar: Map from another Registry").
-#  - A Map deleted or replaced in its parent keeps its contents in the store
-#    (its handle may still be in use): making maps in a loop grows the
-#    registry.
-#  - Int, Float, String and Func are independent of registries: their state
-#    is an Atomic or Mutex of their own.
+# Maps. A Map holds Vars and is itself a Var, so a Map can hold Maps (R12,
+# R13: Var is a boxed interface). Its state (sorted keys and entries) is a
+# Mutex of its own, so copies of a Map share it, a Map belongs to no
+# registry (make_map, or reg.new_map(name) for Go's NewMap; reg.make_map is
+# the same as make_map), and a Map dropped from every parent is freed.
 #
-# Other differences from Go:
-#  - Int, Float and String have no usable zero value (an Atomic or Mutex is
-#    a handle that must be made): use make_int / make_float / make_string
-#    (Go's new(Int)) or reg.new_int(name) and friends.
+# Differences from Go:
+#  - Int, Float, String and Map have no usable zero value (an Atomic or
+#    Mutex is a handle that must be made): use make_int / make_float /
+#    make_string / make_map (Go's new(Int), new(Map).Init()) or
+#    reg.new_int(name) and friends.
 #  - `get` returns a Var interface value; Go's type assertions
 #    `v.(*expvar.Int)` are `v.as_int` (and as_float, as_string, as_map),
-#    optionals. A Var of a type of your own is stored as its `to_s` (a
-#    closure over a copy of the value), so it comes back from `get` as an
-#    Other whose to_s calls yours: give it shared state (D36) if it changes.
-#    A Func comes back the same way (as_* are none).
+#    optionals. A Var of a type of your own is stored as a copy of the
+#    value: give it shared state (D36) if it changes after it is stored.
+#  - A Map that holds itself (directly or through other maps) has no end
+#    to its JSON: to_s recurses until the stack runs out, as Go's does.
 #  - Func is generic: `func { v }` makes a Func[T] whose to_s is
 #    json.marshal of the block's value, so T must be something json.marshal
 #    takes (a `#[derive(Json)]` type, json.Value, or a type with json_enc).
 #    `value` returns T (Go: any).
 #  - `do` and the JSON output take a snapshot of a map's keys and entries
-#    under the registry's lock, then call the block (or the Vars' to_s)
-#    without it, so a block or a Var may use the registry. Go holds the
+#    under the map's lock, then call the block (or the Vars' to_s)
+#    without it, so a block or a Var may use the map. Go holds the
 #    map's read lock during the iteration. Values are read live either way.
 #  - "memstats" can't be Go's runtime.MemStats (no GC, no Go runtime): it is
 #    the runtime's own counters, `{"HeldBytes": n, "PeakHeldBytes": n}`
@@ -104,7 +96,6 @@ import "strconv"
 import "math"
 import "unicode/utf8"
 
-extern def c_getentropy(buf: [Byte], n: Int) -> I32 = "getentropy"
 extern def alx_mem_held -> I64
 extern def alx_mem_peak -> I64
 
@@ -115,9 +106,6 @@ HEX = "0123456789abcdef"
 # A public variable: to_s returns its JSON.
 pub interface Var {
   def to_s -> Str
-
-  # How a Map stores the Var (types of your own: as their to_s).
-  def var_entry -> Entry { Entry.new(other: Other.new(f: -> {to_s})) }
 
   # Go's v.(*Int) and friends: the Var as that type, if it is one.
   def as_int -> Int? { none }
@@ -144,7 +132,6 @@ pub struct Int {
   pub def add(delta: I64) { v.add(delta) }
   pub def set(value: I64) { v.store(value) }
 
-  def var_entry -> Entry { Entry.new(int: self) }
   pub def as_int -> Int? { self }
 }
 
@@ -173,7 +160,6 @@ pub struct Float {
 
   pub def set(value: F64) { bits.store(math.float64bits(value).as_i64) }
 
-  def var_entry -> Entry { Entry.new(float: self) }
   pub def as_float -> Float? { self }
 }
 
@@ -191,7 +177,6 @@ pub struct String {
   pub def to_s -> Str { json_quote(value) }
   pub def set(value: Str) { s.lock { |v| v = value } }
 
-  def var_entry -> Entry { Entry.new(string: self) }
   pub def as_string -> String? { self }
 }
 
@@ -212,68 +197,33 @@ pub struct Func[T] {
 # Go's expvar.Func(f).
 pub def func[T](f: () -> T) -> Func[T] { Func[T].new(f: f) }
 
-# ----------------------------------------------------------------- Other
-
-# A Var of another type, as a Map holds it: its to_s.
-pub struct Other {
-  f: () -> Str
-
-  pub def to_s -> Str { f.call }
-  def var_entry -> Entry { Entry.new(other: self) }
-}
-
 # ------------------------------------------------------------------- Map
-
-# What a Map holds under a key: one of the fields (all none: Go's nil Var).
-struct Entry {
-  int: Int?
-  float: Float?
-  string: String?
-  map: @MapState?
-  map_sid: I64
-  other: Other?
-}
 
 # A Map's keys (sorted) and entries.
 struct MapState {
   keys: [Str]
-  m: Map[Str, Entry]
+  m: Map[Str, KeyValue]
 }
 
-# A registry's maps.
-struct Store {
-  sid: I64
-  maps: Pool[MapState]
-}
-
-# A string-to-Var map variable, itself a Var. A handle into its registry's
-# store (see the header); copies share it.
+# A string-to-Var map variable, itself a Var (so it can hold Maps). Its
+# state is a Mutex of its own: copies share it.
 pub struct Map {
-  st: Mutex[Store]
-  id: @MapState
-  sid: I64
+  st: Mutex[MapState]
 
   # The Var under key, or none (absent, or set to none).
   pub def get(key: Str) -> Var? {
-    e = st.lock { |s| s.maps[id].m[key] }
-    if x = e {
-      return to_var(x)
+    kv = st.lock { |s| s.m[key] }
+    if x = kv {
+      return x.value
     }
     none
   }
 
   # Sets key to v (none: Go's nil Var, written as null).
   pub def set(key: Str, v: Var?) {
-    e = Entry.new
-    if x = v {
-      e = x.var_entry
-    }
-    check_store(e)
     st.lock { |s|
-      ms = s.maps[id]
-      ms.keys = insert_key(ms.keys, key) unless ms.m.has_key?(key)
-      ms.m[key] = e
-      s.maps[id] = ms
+      s.keys = insert_key(s.keys, key) unless s.m.has_key?(key)
+      s.m[key] = KeyValue.new(key: key, value: v)
       nil
     }
   }
@@ -281,49 +231,47 @@ pub struct Map {
   # Adds delta to the Int under key, making it if key is absent; does
   # nothing if key holds another kind of Var.
   pub def add(key: Str, delta: I64) {
-    e = st.lock { |s|
-      ms = s.maps[id]
-      if !ms.m.has_key?(key) {
-        ms.keys = insert_key(ms.keys, key)
-        ms.m[key] = Entry.new(int: make_int)
-        s.maps[id] = ms
+    v = st.lock { |s|
+      if !s.m.has_key?(key) {
+        s.keys = insert_key(s.keys, key)
+        s.m[key] = KeyValue.new(key: key, value: make_int)
       }
-      ms.m[key].unwrap
+      s.m[key].unwrap.value
     }
-    if i = e.int {
-      i.add(delta)
+    if x = v {
+      if i = x.as_int {
+        i.add(delta)
+      }
     }
   }
 
   # Adds delta to the Float under key, making it if key is absent; does
   # nothing if key holds another kind of Var.
   pub def add_float(key: Str, delta: F64) {
-    e = st.lock { |s|
-      ms = s.maps[id]
-      if !ms.m.has_key?(key) {
-        ms.keys = insert_key(ms.keys, key)
-        ms.m[key] = Entry.new(float: make_float)
-        s.maps[id] = ms
+    v = st.lock { |s|
+      if !s.m.has_key?(key) {
+        s.keys = insert_key(s.keys, key)
+        s.m[key] = KeyValue.new(key: key, value: make_float)
       }
-      ms.m[key].unwrap
+      s.m[key].unwrap.value
     }
-    if f = e.float {
-      f.add(delta)
+    if x = v {
+      if f = x.as_float {
+        f.add(delta)
+      }
     }
   }
 
   # Removes key (nothing if it is absent).
   pub def delete(key: Str) {
     st.lock { |s|
-      ms = s.maps[id]
-      i = find_key(ms.keys, key)
-      if i < ms.keys.size && ms.keys[i] == key {
-        rest = ms.keys[i + 1...ms.keys.size]
-        keys = ms.keys[0...i]
+      i = find_key(s.keys, key)
+      if i < s.keys.size && s.keys[i] == key {
+        rest = s.keys[i + 1...s.keys.size]
+        keys = s.keys[0...i]
         keys += rest
-        ms.keys = keys
-        ms.m.delete(key)
-        s.maps[id] = ms
+        s.keys = keys
+        s.m.delete(key)
       }
       nil
     }
@@ -331,23 +279,15 @@ pub struct Map {
 
   # Calls f for each entry, in key order (on a snapshot: see the header).
   pub def do(f: (KeyValue) -> Unit) {
-    kvs = st.lock { |s|
-      ms = s.maps[id]
-      out: [(Str, Entry)] = []
-      for k in ms.keys {
-        out << (k, ms.m[k].unwrap)
-      }
-      out
-    }
-    for kv in kvs {
-      f.call(KeyValue.new(key: kv[0], value: to_var(kv[1])))
+    for kv in entries {
+      f.call(kv)
     }
   }
 
   # Removes every key; returns the map.
   pub def init -> Map {
     st.lock { |s|
-      s.maps[id] = MapState.new
+      s = MapState.new
       nil
     }
     self
@@ -358,52 +298,44 @@ pub struct Map {
 
   pub def as_map -> Map? { self }
 
-  def var_entry -> Entry { Entry.new(map: id, map_sid: sid) }
-
-  # The JSON: pieces of text and leaf Vars taken under the lock, the leaves'
-  # to_s called after.
-  def json_of(expand: Bool) -> Str {
-    pieces = st.lock { |s|
-      out: [(Str, Entry?)] = []
-      snapshot(s, id, expand, out)
+  # A snapshot of the entries, in key order.
+  def entries -> [KeyValue] {
+    st.lock { |s|
+      out: [KeyValue] = []
+      for k in s.keys {
+        out << s.m[k].unwrap
+      }
+      out
     }
+  }
+
+  # Go's appendJSONMayExpand, on a snapshot of the entries: the Vars' to_s
+  # (a nested Map's included) runs without the lock.
+  def json_of(expand: Bool) -> Str {
+    sep = expand ? ",\n" : ", "
+    nl = expand ? "\n" : ""
     b: [Byte] = []
-    for p in pieces {
-      b += p[0].bytes.to_a
-      if e = p[1] {
-        b += leaf_json(e).bytes.to_a
+    b += ("{" + nl).bytes.to_a
+    first = true
+    for kv in entries {
+      b += sep.bytes.to_a unless first
+      first = false
+      b += (json_quote(kv.key) + ": ").bytes.to_a
+      if v = kv.value {
+        b += v.to_s.bytes.to_a
+      } else {
+        b += "null".bytes.to_a
       }
     }
+    b += (nl + "}" + nl).bytes.to_a
     Str.from_bytes(b)
   }
-
-  # The Var an entry holds.
-  def to_var(e: Entry) -> Var? {
-    if i = e.int {
-      return i
-    }
-    if f = e.float {
-      return f
-    }
-    if s = e.string {
-      return s
-    }
-    if h = e.map {
-      return Map.new(st: st, id: h, sid: sid)
-    }
-    if o = e.other {
-      return o
-    }
-    none
-  }
-
-  # Panics if e is a Map from another registry.
-  def check_store(e: Entry) {
-    if e.map != none && e.map_sid != sid {
-      assert false, "expvar: Map from another Registry"
-    }
-  }
 }
+
+# A new empty Map (Go's new(Map).Init()).
+pub def make_map -> Map { empty_map }
+
+def empty_map -> Map { Map.new(st: Mutex.new(MapState.new)) }
 
 # The index of key in sorted keys, or where it would go.
 def find_key(keys: [Str], key: Str) -> I64 {
@@ -435,51 +367,6 @@ def insert_key(keys0: [Str], key: Str) -> [Str] {
   keys
 }
 
-# Go's appendJSONMayExpand: the map's text with its leaves left as entries.
-def snapshot(s: Store, id: @MapState, expand: Bool, into: [(Str, Entry?)]) -> [(Str, Entry?)] {
-  out = into
-  ms = s.maps[id]
-  sep = expand ? ",\n" : ", "
-  nl = expand ? "\n" : ""
-  text = "{" + nl
-  first = true
-  for k in ms.keys {
-    text += sep unless first
-    first = false
-    text += json_quote(k) + ": "
-    e = ms.m[k].unwrap
-    if h = e.map {
-      out << (text, none)
-      text = ""
-      out = snapshot(s, h, false, out)
-    } else if e.int == none && e.float == none && e.string == none && e.other == none {
-      text += "null"
-    } else {
-      out << (text, e)
-      text = ""
-    }
-  }
-  out << (text + nl + "}" + nl, none)
-  out
-}
-
-# The JSON of a leaf entry (not a map).
-def leaf_json(e: Entry) -> Str {
-  if i = e.int {
-    return i.to_s
-  }
-  if f = e.float {
-    return f.to_s
-  }
-  if s = e.string {
-    return s.to_s
-  }
-  if o = e.other {
-    return o.to_s
-  }
-  "null"
-}
-
 # -------------------------------------------------------------- Registry
 
 # Go's package-level registry of published Vars (see the header): a Map
@@ -489,7 +376,7 @@ pub struct Registry {
 
   # Publishes v under name; panics if name is taken (Go's log.Panicln).
   pub def publish(name: Str, v: Var) {
-    taken = vars.st.lock { |s| s.maps[vars.id].m.has_key?(name) }
+    taken = vars.st.lock { |s| s.m.has_key?(name) }
     if taken {
       log.panicln("Reuse of exported var name: #{name}")
     }
@@ -523,16 +410,14 @@ pub struct Registry {
 
   # A new empty Map, published under name.
   pub def new_map(name: Str) -> Map {
-    v = make_map
+    v = empty_map
     publish(name, v)
     v
   }
 
-  # A new empty Map in this registry, not published (Go's new(Map).Init()).
-  pub def make_map -> Map {
-    h = vars.st.lock { |s| s.maps.add(MapState.new) }
-    Map.new(st: vars.st, id: h, sid: vars.sid)
-  }
+  # A new empty Map, not published: the same as expvar.make_map (Maps
+  # belonged to a registry before R12).
+  pub def make_map -> Map { empty_map }
 
   # Every published Var as Go's handler writes it: `{\n"name": v,\n...\n}\n`.
   pub def json -> Str { vars.json_of(true) }
@@ -560,17 +445,7 @@ pub struct Registry {
 }
 
 # A registry without any Vars.
-pub def new_empty_registry -> Registry {
-  b: [Byte] = [0; 8]
-  c_getentropy(b, 8)
-  sid = 0
-  for x in b {
-    sid = (sid << 8) | x.to_i
-  }
-  st = Mutex.new(Store.new(sid: sid, maps: Pool[MapState].new))
-  h = st.lock { |s| s.maps.add(MapState.new) }
-  Registry.new(vars: Map.new(st: st, id: h, sid: sid))
-}
+pub def new_empty_registry -> Registry { Registry.new(vars: empty_map) }
 
 # A registry with "cmdline" and "memstats" published, as Go's init does.
 pub def new_registry -> Registry {

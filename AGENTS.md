@@ -72,6 +72,10 @@ def parse(t: Str) -> ~Int<ParseErr> { # ~T is (T, error) in Go; <ParseErr> decla
   fail ParseErr.Bad(pos: 0) if t == ""
   t.size
 }
+def first(k: Str) -> ~Int {
+  n = find(k) || fail ParseErr.Bad(pos: 1)   # opt || jump (S8): also || return v, || break, || next
+  case n { 0 => return 0; _ => n * 2 }       # a bare jump can be a case arm (=> fail e, => break)
+}
 n = ~parse("x")                      # ~ propagates an error to the caller; it attaches to the NEXT call
 m2 = obj.~method(1)                  # ~ on a method call goes after the dot
 r = parse("")                        # without ~: a ~Int value (r.ok?, r.err, r.unwrap)
@@ -114,6 +118,9 @@ REG = Mutex[Map[Str, Int]].new({})   #   set before main runs; read as HITS / pk
 
 # Lambdas, shell, FFI, tests --------------------------------------------------------
 add = ->(a: Int, b: Int) -> Int { a + b }; add.call(1, 2)
+def info(msg: Str, tags: [Str] = [], level: Int = 0) { }   # defaults (S8): per call, in the callee's package
+info("hi"); info("hi", level: 2)              # arguments by name too (after the positional ones). No variadics
+# A package's own def named like a builtin (`print`, `sprintf`, `copy`) shadows it there (S12)
 out = `ls -l #{dir}`.~output                    # a command literal (no shell): os/exec.Cmd
 extern def c_getpid() -> I32 = "getpid"       # C FFI; std uses it only for OS access
 test "adds" { assert_eq 1 + 1, 2; assert x > 0, "why" }   # in *_test.alx beside the package

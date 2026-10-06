@@ -245,7 +245,7 @@ impl<'a> Parser<'a> {
                         let Tok::Ident(p) = self.bump().tok else { unreachable!() };
                         self.bump();
                         self.declare(&p);
-                        param = Some(Param { name: p, ty: None, span: psp });
+                        param = Some(Param { name: p, ty: None, span: psp, default: None });
                         self.stmts_to_brace()
                     } else {
                         self.braced_stmts()
@@ -803,7 +803,7 @@ impl<'a> Parser<'a> {
             let t = TypeExpr::Named(o.to_string(), name_span);
             let ty = if name.ends_with('!') { TypeExpr::Array(Box::new(t), name_span) } else { t };
             self.declare("self");
-            params.push(Param { name: "self".into(), ty: if in_iface { None } else { Some(ty) }, span: name_span });
+            params.push(Param { name: "self".into(), ty: if in_iface { None } else { Some(ty) }, span: name_span, default: None });
         }
         let name = match owner {
             Some(o) => method_name(o, &name),
@@ -811,6 +811,7 @@ impl<'a> Parser<'a> {
         };
         if self.is_op("(") && !self.space_before() {
             self.bump();
+            let mut defaults_at = vec![];
             while !self.is_op(")") {
                 let sp = self.span();
                 let pname = match self.bump().tok {
@@ -818,13 +819,33 @@ impl<'a> Parser<'a> {
                     t => return Err(Diag::new(sp, format!("expected a parameter name, found {}", describe(&t)))),
                 };
                 let ty = if self.eat_op(":") { Some(self.type_expr()?) } else { None };
+                // S8: `name: T = default`.
+                let default = if self.is_op("=") {
+                    let esp = self.bump().span;
+                    if ty.is_none() {
+                        return Err(Diag::new(esp, format!("a parameter with a default needs a type: `{pname}: Type = value`")));
+                    }
+                    if self.extern_mode {
+                        return Err(Diag::new(esp, "an `extern def` can't have default values"));
+                    }
+                    if in_iface {
+                        return Err(Diag::new(esp, "an interface method can't have default values").note("an implementor's own method may; calls through the interface pass every argument"));
+                    }
+                    let from = self.pos;
+                    let e = self.ternary()?;
+                    defaults_at.push((params.len(), from, self.pos));
+                    Some(Box::new(e))
+                } else {
+                    None
+                };
                 self.declare(&pname);
-                params.push(Param { name: pname, ty, span: sp });
+                params.push(Param { name: pname, ty, span: sp, default });
                 if !self.eat_op(",") {
                     break;
                 }
             }
             self.expect_op(")")?;
+            self.check_defaults(&params, &defaults_at)?;
         }
         let (mut ret, mut fallible, mut errs) = (None, false, None);
         if self.eat_op("->") {
@@ -864,6 +885,33 @@ impl<'a> Parser<'a> {
         };
         self.scopes.pop();
         Ok(DefSig { name, span: start.to(self.prev_span()), tparams, name_span, params, ret, fallible, errs, pure, ffi, body })
+    }
+
+    /// S8: defaults use no parameters (they are evaluated at the call site,
+    /// without the call's other arguments), and a required parameter can't
+    /// follow one with a default (except a last function parameter, which
+    /// a block fills). `at`: each default's parameter and token range.
+    fn check_defaults(&self, params: &[Param], at: &[(usize, usize, usize)]) -> PResult<()> {
+        for &(k, from, to) in at {
+            for i in from..to {
+                let Tok::Ident(n) = &self.toks[i].tok else { continue };
+                let after_dot = i > from && matches!(self.toks[i - 1].tok, Tok::Op(".") | Tok::Op("&."));
+                let kw = matches!(self.toks.get(i + 1).map(|t| &t.tok), Some(Tok::Op(":"))) && !matches!(self.toks.get(i + 2).map(|t| &t.tok), Some(Tok::Op(":")));
+                if !after_dot && !kw && params.iter().any(|p| &p.name == n) {
+                    return Err(Diag::new(self.toks[i].span, format!("the default of `{}` uses parameter `{n}`", params[k].name)).note("defaults are evaluated at the call site, without the call's other arguments (S8)"));
+                }
+            }
+        }
+        if let Some(first) = params.iter().position(|p| p.default.is_some()) {
+            let last = params.len() - 1;
+            for (i, p) in params.iter().enumerate().skip(first) {
+                let block = i == last && matches!(p.ty, Some(TypeExpr::Fn(..)));
+                if p.default.is_none() && !block {
+                    return Err(Diag::new(p.span, format!("parameter `{}` needs a default: it follows `{}`, which has one", p.name, params[first].name)).note("parameters with defaults come last (a last function parameter, filled by a block, may follow them)"));
+                }
+            }
+        }
+        Ok(())
     }
 
     /// `[T, U: Shape, N: like Int]` after a type or def name (no space before `[`).
@@ -1692,6 +1740,9 @@ impl<'a> Parser<'a> {
             self.expect_op("=>")?;
             let body = if self.is_op("{") {
                 self.braced_stmts()?
+            } else if self.at_jump() {
+                // S8: `X => return v`, `X => fail e`, `X => break`, `X => next`.
+                vec![self.jump()?]
             } else {
                 let e = self.expr()?;
                 vec![Stmt { span: e.span, kind: StmtKind::Expr(e) }]
@@ -1828,7 +1879,56 @@ impl<'a> Parser<'a> {
     }
 
     fn or(&mut self) -> PResult<Expr> {
-        self.binary_level(&[("||", BinOp::Or)], Self::and)
+        let mut l = self.and()?;
+        while self.is_op("||") {
+            self.bump();
+            self.skip_line_continuation();
+            if self.at_jump() {
+                // S8: `opt || return v` (`|| fail e`, `|| break`, `|| next`):
+                // the optional's value, else the jump. Desugared to
+                // `if tmp = opt { tmp } else { jump }`.
+                let jump = self.jump()?;
+                let sp = l.span.to(jump.span);
+                let tmp = format!("{OR_JUMP_TMP}{}", *self.next_id);
+                let t1 = self.mk(ExprKind::Name(tmp.clone()), l.span);
+                let cond = self.mk(ExprKind::Assign(Box::new(t1), Box::new(l)), sp);
+                let t2 = self.mk(ExprKind::Name(tmp), sp);
+                let then = vec![Stmt { span: sp, kind: StmtKind::Expr(t2) }];
+                return Ok(self.mk(ExprKind::If(Box::new(cond), then, vec![jump]), sp));
+            }
+            let r = self.and()?;
+            let sp = l.span.to(r.span);
+            l = self.mk(ExprKind::Binary(BinOp::Or, Box::new(l), Box::new(r)), sp);
+        }
+        Ok(l)
+    }
+
+    /// Does a jump (`return`, `fail`, `break`, `next`) start here?
+    fn at_jump(&self) -> bool {
+        match self.peek() {
+            Tok::Kw(Kw::Return) | Tok::Kw(Kw::Break) | Tok::Kw(Kw::Next) => true,
+            // (`fail` takes an error; without one it may be a def's name.)
+            Tok::Ident(n) => {
+                n == "fail"
+                    && !self.is_local("fail")
+                    && !matches!(self.peek_at(1), Tok::Op("(") | Tok::Op("=") | Tok::Op(";") | Tok::Op("}") | Tok::Op(")") | Tok::Op(",") | Tok::Op("]") | Tok::Newline | Tok::Eof)
+            }
+            _ => false,
+        }
+    }
+
+    /// A jump where an expression or a case arm ends (S8): `return [v]`,
+    /// `fail e`, `break [v]`, `next`. No `return a, b` (write a tuple).
+    fn jump(&mut self) -> PResult<Stmt> {
+        let start = self.span();
+        let ends = |p: &Self| p.at_stmt_end() || p.is_op(",") || p.is_op(")") || p.is_op("]");
+        let kind = match self.bump().tok {
+            Tok::Kw(Kw::Next) => StmtKind::Next,
+            Tok::Kw(Kw::Break) => StmtKind::Break(if ends(self) { None } else { Some(self.ternary()?) }),
+            Tok::Kw(Kw::Return) => StmtKind::Return(if ends(self) { None } else { Some(self.ternary()?) }),
+            _ => StmtKind::Fail(self.ternary()?),
+        };
+        Ok(Stmt { kind, span: start.to(self.prev_span()) })
     }
     fn and(&mut self) -> PResult<Expr> {
         self.binary_level(&[("&&", BinOp::And)], Self::not)
@@ -2430,7 +2530,7 @@ impl<'a> Parser<'a> {
                         };
                         let ty = if self.eat_op(":") { Some(self.type_expr()?) } else { None };
                         self.declare(&pname);
-                        params.push(Param { name: pname, ty, span: psp });
+                        params.push(Param { name: pname, ty, span: psp, default: None });
                         if !self.eat_op(",") {
                             break;
                         }
@@ -2505,6 +2605,9 @@ impl<'a> Parser<'a> {
                 self.expect_op("]")?;
                 self.mk(ExprKind::Array(items), sp.to(self.prev_span()))
             }
+            // (A `fail` here may be a def of that name: the checker explains
+            // an undefined one.)
+            Tok::Kw(k @ (Kw::Return | Kw::Break | Kw::Next)) => return Err(jump_here(sp, &kw_name(k))),
             Tok::Ident(name) => {
                 if self.is_local(&name) {
                     // `f(x)` on a local: calling a lambda.
@@ -2566,6 +2669,15 @@ pub fn is_place(e: &Expr) -> bool {
 }
 
 /// A keyword's spelling, for keywords used as method names (`e.next`).
+/// Prefix of the temporaries `opt || jump` binds (check.rs names them in errors).
+pub const OR_JUMP_TMP: &str = "__or_jump";
+
+/// A jump where a value is wanted.
+fn jump_here(sp: Span, kw: &str) -> Diag {
+    Diag::new(sp, format!("`{kw}` is a statement, not a value"))
+        .note(format!("as part of an expression it can only follow `||` (`v = opt || {kw}`) or be a whole `case` arm (`X => {kw}`) (S8)"))
+}
+
 fn kw_name(k: Kw) -> String {
     format!("{k:?}").to_lowercase()
 }

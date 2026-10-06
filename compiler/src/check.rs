@@ -4800,6 +4800,11 @@ impl<'w, 'a> FnCx<'w, 'a> {
             let eq = self.call_def(def, "__map_eq", sp, vec![l, r], sp)?;
             return Ok(if op == BinOp::Ne { self.mk(TK::Not(Box::new(eq)), Ty::Bool, sp) } else { eq });
         }
+        // A Mutex (or a locked Atomic) is a handle to shared state: no `==`
+        // (it used to reach the backends as a comparison of arrays).
+        if matches!(op, BinOp::Eq | BinOp::Ne) && (matches!(lres, Ty::Mutex(_)) || matches!(&lres, Ty::Atomic(t) if t.atomic_boxed())) {
+            return Err(Diag::new(sp, format!("`{}` on {}: a lock's state can't be compared; compare what it guards (`m.lock {{ |v| v }}`)", op.text(), lres.show())));
+        }
         // Interface values: the same implementor, and equal values of it
         // (#108). Lowering dispatches on the tag to each implementor's `__eq`.
         let rres = self.resolve(&r.ty);

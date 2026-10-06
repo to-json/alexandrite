@@ -63,22 +63,35 @@ if (filter.endsWith('.alx') && filter.includes('/')) {
 }
 let fail = 0;
 // What needs the C library must be refused at compile time.
-const browserless = ['ffi.alx', 'echo.alx', 'httpdemo.alx', 'scripting.alx', 'parseexec.alx'];
+const browserless = [
+  'ffi.alx', 'echo.alx', 'httpdemo.alx', 'scripting.alx', 'parseexec.alx',
+  'exec_pinned.alx', // processes (os/exec)
+  'mutex_http.alx', 'net_dgram.alx', // sockets
+  'sqlite_demo.alx', // SQLite through C FFI
+];
 // Cases that need a file system: they run, and fail as Go's js/wasm does.
 const fileless = ['wc.alx'];
+// Wasm-backend bugs, each logged in docs/notes/port-issues.md; not run.
+const skip = [
+  'embed_fs.alx', // #170: #[embed] reads the host file system, not the browser's virtual one
+];
+for (const f of skip.filter(f => f.includes(filter))) console.log(`skip ${f} (wasm bug, see docs/notes/port-issues.md)`);
 for (const f of browserless.filter(f => f.includes(filter))) {
   const r = await run(f, readFileSync(cases + f, 'utf8'));
   const ok = (r.compileError ?? '').includes("aren't available in the browser") && !(r.compileError ?? '').includes('internal');
   if (!ok) fail++;
   console.log(`${ok ? 'ok  ' : 'FAIL'} ${f} refused in the browser ${ok ? '' : JSON.stringify(r)}`);
 }
-for (const f of readdirSync(cases).filter(f => /^[a-z]+\d*\.alx$/.test(f) && !browserless.includes(f) && !fileless.includes(f) && readdirSync(cases).includes(f.replace('.alx', '.expected')) && f.includes(filter)).sort()) {
+// Positive cases: `name.alx` with a `name.expected` (a dot in the name marks
+// the negative and runtime-failure cases, run below).
+const names = readdirSync(cases);
+for (const f of names.filter(f => /^[a-z][a-z0-9_]*\.alx$/.test(f) && ![...browserless, ...fileless, ...skip].includes(f) && names.includes(f.replace('.alx', '.expected')) && f.includes(filter)).sort()) {
   const want = readFileSync(cases + f.replace('.alx', '.expected'), 'utf8').trim();
   const r = await run(f, readFileSync(cases + f, 'utf8'));
   const got = (r.stdout ?? '').trim();
   const ok = got === want && r.status === 0;
   if (!ok) fail++;
-  console.log(`${ok ? 'ok  ' : 'FAIL'} ${f.padEnd(10)} compile ${r.compileMs?.toFixed(1)} ms  inst ${r.instMs?.toFixed(1)} ms  run ${r.runMs?.toFixed(1)} ms` + (ok ? '' : `  got ${JSON.stringify(got)} ${r.compileError ?? ''} ${r.stderr ?? ''} ${r.status}`));
+  console.log(`${ok ? 'ok  ' : 'FAIL'} ${f.padEnd(22)} compile ${r.compileMs?.toFixed(1)} ms  inst ${r.instMs?.toFixed(1)} ms  run ${r.runMs?.toFixed(1)} ms` + (ok ? '' : `  got ${JSON.stringify(got)} ${r.compileError ?? ''} ${r.stderr ?? ''} ${r.status}`));
 }
 // Runtime failures.
 for (const [f, status, needle] of [['wc.alx', 1, 'open wc.alx: function not implemented'], ['pe020.bad.alx', 'abort', 'overflow at pe020.bad.alx:1:'], ['pe022.missing.alx', 1, 'File.read: no such file `fixtures/nope.txt` (pe022.missing.alx:1:10)'], ['concurrency.deadlock.alx', 'abort', 'alexandrite: all tasks are asleep: deadlock']]) {

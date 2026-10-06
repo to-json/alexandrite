@@ -3309,8 +3309,19 @@ int64_t alx_net_recvmsg(int64_t fd, uint8_t *buf, int64_t n, uint8_t *oob, int64
     m.msg_name = &ss; m.msg_namelen = sizeof ss;
     m.msg_iov = &iov; m.msg_iovlen = 1;
     if (oobn > 0) { m.msg_control = oob; m.msg_controllen = (socklen_t)oobn; }
+#ifdef MSG_CMSG_CLOEXEC
+    ssize_t r = recvmsg((int)fd, &m, MSG_CMSG_CLOEXEC);
+#else
     ssize_t r = recvmsg((int)fd, &m, 0);
+#endif
     if (r < 0) return -errno;
+    /* Received descriptors are close-on-exec, as Go makes them. */
+    for (struct cmsghdr *h = CMSG_FIRSTHDR(&m); h; h = CMSG_NXTHDR(&m, h)) {
+        if (h->cmsg_level != SOL_SOCKET || h->cmsg_type != SCM_RIGHTS) continue;
+        size_t cnt = (h->cmsg_len - CMSG_LEN(0)) / sizeof(int);
+        int *p = (int *)(void *)CMSG_DATA(h);
+        for (size_t i = 0; i < cnt; i++) fcntl(p[i], F_SETFD, FD_CLOEXEC);
+    }
     int64_t iv[2] = { (int64_t)m.msg_controllen, (m.msg_flags & MSG_TRUNC ? 1 : 0) | (m.msg_flags & MSG_CTRUNC ? 2 : 0) };
     memcpy(info, iv, sizeof iv);
     sa_to(&ss, m.msg_namelen, out);

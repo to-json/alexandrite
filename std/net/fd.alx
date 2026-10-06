@@ -437,39 +437,52 @@ def set_default_sockopts(s: Int, family: Int, sotype: Int, ipv6only: Bool) -> In
   0
 }
 
-# The hooks Dialer.control and ListenConfig.control receive: Go's
-# syscall.RawConn, reduced to its Control method.
+# Go's syscall.RawConn for a socket (SyscallConn, and what the control hooks
+# of Dialer and ListenConfig receive): access to the descriptor.
 pub struct RawConn {
-  sysfd: Atomic[Int]
+  nfd: NetFD
+  # A listener's: Read and Write fail (Go's rawListener).
+  listener: Bool
 
   # Calls f with the descriptor. Go's Control.
   pub def control(f: (Int) -> Unit) -> ~Unit {
-    d = sysfd.load
-    fail closed_error("raw-control", "", "", "") if d < 0
+    d = nfd.acquire
+    fail closed_error("raw-control", nfd.net, nfd.la, nfd.ra) if d < 0
     f.call(d)
+    nfd.release
   }
 
   # Calls f with the descriptor until it returns true, waiting until the
-  # socket is readable between calls. Go's Read.
-  pub def read(f: (Int) -> Bool) -> ~Unit { ~raw_loop(f, 1) }
+  # socket is readable between calls (honoring the read deadline). Go's
+  # Read.
+  pub def read(f: (Int) -> Bool) -> ~Unit { ~raw_loop(f, 1, "raw-read") }
 
   # As read, waiting until the socket is writable. Go's Write.
-  pub def write(f: (Int) -> Bool) -> ~Unit { ~raw_loop(f, 2) }
+  pub def write(f: (Int) -> Bool) -> ~Unit { ~raw_loop(f, 2, "raw-write") }
 
-  def raw_loop(f: (Int) -> Bool, mode: Int) -> ~Unit {
+  def raw_loop(f: (Int) -> Bool, mode: Int, op: Str) -> ~Unit {
+    fail op_error(op, nfd.net, "", nfd.la, "", c("EINVAL")) if listener
+    d = nfd.acquire
+    fail closed_error(op, nfd.net, nfd.la, nfd.ra) if d < 0
+    r = raw_loop_in(f, mode, op, d)
+    nfd.release
+    ~r
+  }
+
+  def raw_loop_in(f: (Int) -> Bool, mode: Int, op: Str, d: Int) -> ~Unit {
     loop {
-      d = sysfd.load
-      fail closed_error(mode == 1 ? "raw-read" : "raw-write", "", "", "") if d < 0
+      fail closed_error(op, nfd.net, nfd.la, nfd.ra) if nfd.sysfd.load < 0
+      fail timeout_error(op, nfd.net, nfd.la, nfd.ra) if nfd.expired?(mode)
       return if f.call(d)
-      w = alx_fd_wait_until(d, mode, 0)
-      fail syscall_error("wait", -w) if w < 0
+      w = nfd.wait(d, mode)
+      fail timeout_error(op, nfd.net, nfd.la, nfd.ra) if w == WAIT_EXPIRED
+      fail op_error(op, nfd.net, nfd.la, nfd.ra, "wait", -w) if w < 0
     }
   }
 
   # The descriptor (-1 once closed).
-  pub def fd -> Int { sysfd.load }
+  pub def fd -> Int { nfd.fd }
 }
-
 
 # Go's socket(): makes, binds and connects (dial) or binds and listens
 # (listen) a socket. Errors are the bare cause (the caller wraps them in
@@ -490,7 +503,7 @@ def socket(ctx: context.Context, net: Str, family: Int, sotype: Int, proto: Int,
 }
 
 def socket_setup(ctx: context.Context, s: Int, net: Str, family: Int, sotype: Int, laddr: Addr?, raddr: Addr?, ctrl: ((Str, Str, RawConn) -> ~Unit)?) -> ~NetFD {
-  rc = RawConn.new(sysfd: Atomic.new(s))
+  rc = RawConn.new(nfd: new_fd(s, family, sotype, net, none, none, false), listener: false)
   cnet = ctrl_network(net, family)
   if la = laddr {
     unless raddr.present? {

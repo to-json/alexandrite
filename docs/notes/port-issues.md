@@ -1,7 +1,5 @@
 # Compiler issues found while porting std
-
 Open problems agents reported; each gets fixed in a compiler round between waves.
-
 | # | Found by | Problem | Status |
 |---|---|---|---|
 | 1 | text/tabwriter | JIT gives every temporary its own stack slot (`jit.rs` `slot()`), never reused: deep call chains need 130-160 KB of a 256 KB task stack; a 100-call test block overflowed on the JIT only | fixed: slots are pooled and reused per statement |
@@ -176,3 +174,4 @@ Open problems agents reported; each gets fixed in a compiler round between waves
 | 170 | (main) web harness | `#[embed]` in the browser: `embed::resolve` reads the host file system directly (`std::fs` read / read_dir / symlink_metadata, `glob_dir`), so the in-browser compiler finds no files even when they are in its virtual file system (`set_file`): acceptance `embed_fs` fails with "pattern embed_data/hello.txt: no matching files found". Fix: route embed through `load_with`'s `read`/`list` callbacks (plus a metadata/is-dir query), and have web/test.mjs `set_file` `embed_data/` (including `.secret/` for `all:`) | open; `embed_fs` is in web/test.mjs's `skip` list |
 | 171 | errors (C backend) | an error type with a function field and no `message` method (`error E { F(f: (Int) -> Int) }`) fails in clang: its default message `to_s` passes the closure to `alx_int_to_s` (JIT prints it) | open (small: refuse or print `<fn>`) |
 | 172 | errors, os, io/fs | os.open's errors (`os.FsError.NotExist(at)`) aren't io/fs's sentinels: `errors.is?(err, fs.FsError.NotExist)` is false where Go's errors.Is(err, fs.ErrNotExist) is true (os can't import io/fs). Go's ExampleIs/ExampleAs match os.FsError.NotExist instead | open: move the sentinels below os (or give os.FsError an `is?` method against a shared sentinel type) |
+| 173 | database/sql (R6) | `put_conn_db_locked!` sends its parameter `dc` on a `Chan` (`req << ConnRequest.new(conn: dc, ...)`): check-all (collect-mode analysis of every def, lsp plan 1.4) reports "`dc` is the caller's, so handing it to another task would share it without synchronization" (sql.alx:517). Never seen by a normal build because nothing instantiates the def | open: copy the value or restructure; found by `alx check --json` on std/database/sql |

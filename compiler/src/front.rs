@@ -1170,7 +1170,14 @@ pub fn load_tests_with(dir: &Path, dir_shown: &str, sel: Tests, o: &TestOpts, re
     let mut acc: Option<Module> = None;
     let mut xacc: Option<Module> = None;
     let mut decls: Vec<(TestDecl, bool)> = vec![];
-    for f in files.iter().filter(|p| !is_test(p)).chain(tests.iter()) {
+    // `Only`: the other test files still contribute their helpers, not their tests;
+    // one that doesn't parse is skipped (the focused file's diagnostics come first).
+    let siblings: Vec<PathBuf> = match sel {
+        Tests::Only(f) => files.iter().filter(|p| is_test(p) && p.as_path() != f).cloned().collect(),
+        _ => vec![],
+    };
+    for f in files.iter().filter(|p| !is_test(p)).chain(siblings.iter()).chain(tests.iter()) {
+        let sibling = siblings.contains(f);
         let text = match read(f) {
             Ok(t) => t,
             Err(e) => {
@@ -1179,11 +1186,15 @@ pub fn load_tests_with(dir: &Path, dir_shown: &str, sel: Tests, o: &TestOpts, re
             }
         };
         let test_file = is_test(f);
-        let mut m = match parse_file(&mut sm, shown(f), text, &mut next_id) {
+        let mut m = match parse_file_at(&mut sm, shown(f), Some(f.clone()), text, &mut next_id) {
             Ok(m) => m,
+            Err(_) if sibling => continue,
             Err(d) => return Err((sm, d)),
         };
-        if let Err(d) = crate::embed::resolve(&mut m, &embed_dir(f)) {
+        if sibling {
+            m.tests.clear();
+        }
+        if let Err(d) = crate::embed::resolve_with(&mut m, &embed_dir(f), read) {
             return Err((sm, d));
         }
         if let Some(s) = m.main.iter().find(|s| !matches!(s.kind, crate::ast::StmtKind::Using(_))) {

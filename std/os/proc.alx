@@ -24,32 +24,17 @@ pub struct ProcessState {
   }
 }
 
-# Go's syscall.Signal.String for the common signals.
+# Go's syscall.Signal.String: the platform's signal names (Go's tables for
+# darwin and linux).
 pub def signal_name(s: Int) -> Str {
-  return "bus error" if s == c("SIGBUS")
-  return "broken pipe" if s == c("SIGPIPE")
-  return "user defined signal 1" if s == c("SIGUSR1")
-  return "user defined signal 2" if s == c("SIGUSR2")
-  return "child exited" if s == c("SIGCHLD")
-  return "stopped (signal)" if s == c("SIGSTOP")
-  return "stopped" if s == c("SIGTSTP")
-  return "continued" if s == c("SIGCONT")
-  case s {
-    1 => "hangup"
-    2 => "interrupt"
-    3 => "quit"
-    4 => "illegal instruction"
-    5 => "trace/breakpoint trap"
-    6 => "abort trap"
-    8 => "floating point exception"
-    9 => "killed"
-    11 => "segmentation fault"
-    13 => "broken pipe"
-    14 => "alarm clock"
-    15 => "terminated"
-    _ => "signal #{s}"
-  }
+  names = darwin? ? DARWIN_SIGNALS : LINUX_SIGNALS
+  return names[s] if s >= 1 && s < names.size
+  "signal #{s}"
 }
+
+DARWIN_SIGNALS = ["", "hangup", "interrupt", "quit", "illegal instruction", "trace/BPT trap", "abort trap", "EMT trap", "floating point exception", "killed", "bus error", "segmentation fault", "bad system call", "broken pipe", "alarm clock", "terminated", "urgent I/O condition", "suspended (signal)", "suspended", "continued", "child exited", "stopped (tty input)", "stopped (tty output)", "I/O possible", "cputime limit exceeded", "filesize limit exceeded", "virtual timer expired", "profiling timer expired", "window size changes", "information request", "user defined signal 1", "user defined signal 2"]
+
+LINUX_SIGNALS = ["", "hangup", "interrupt", "quit", "illegal instruction", "trace/breakpoint trap", "aborted", "bus error", "floating point exception", "killed", "user defined signal 1", "segmentation fault", "user defined signal 2", "broken pipe", "alarm clock", "terminated", "stack fault", "child exited", "continued", "stopped (signal)", "stopped", "stopped (tty input)", "stopped (tty output)", "urgent I/O condition", "CPU time limit exceeded", "file size limit exceeded", "virtual timer expired", "profiling timer expired", "window changed", "I/O possible", "power failure", "bad system call"]
 
 # Go's os.Interrupt and os.Kill, as signal numbers.
 pub INTERRUPT = 2
@@ -110,8 +95,8 @@ pub def find_process(pid: Int) -> ~Process<FsError> {
 }
 
 # Go's ProcAttr: the working directory ("" = ours), the environment (none =
-# ours) and the child's first files (stdin, stdout, stderr: none is the
-# null device; at most three).
+# ours) and the child's files: its 0 (stdin), 1, 2, 3, ... (none is the null
+# device for 0-2, closed above).
 pub struct ProcAttr {
   dir: Str
   env: [Str]?
@@ -121,7 +106,6 @@ pub struct ProcAttr {
 # Go's StartProcess: runs the program at `name` (a path: no $PATH search,
 # relative to attr.dir) with arguments argv (argv[0] is its name for itself).
 pub def start_process(name: Str, argv: [Str], attr: ProcAttr) -> ~Process<FsError> {
-  fail ferr("fork/exec " + name, c("E2BIG")) if attr.files.size > 3
   prog = name
   # execve semantics: a relative name (even without a slash) is relative to
   # the child's directory.
@@ -129,21 +113,22 @@ pub def start_process(name: Str, argv: [Str], attr: ProcAttr) -> ~Process<FsErro
     prog = attr.dir.size > 0 ? join_path(attr.dir, prog) : "./" + prog
   }
   av = argv.size == 0 ? [name] : argv
-  fds: [Int] = [-1, -1, -1]
+  n = attr.files.size < 3 ? 3 : attr.files.size
+  blob = zeros(8 * n)
   nulls: [Int] = []
   k = 0
-  while k < 3 {
+  while k < n {
     fd = -1
     if k < attr.files.size {
       if f = attr.files[k] {
         fd = f.fd
       }
     }
-    if fd < 0 {
+    if fd < 0 && k < 3 {
       fd = alx_sys_open(DEV_NULL, (k == 0 ? c("O_RDONLY") : c("O_WRONLY")).to_i32, 0).to_i
       nulls << fd
     }
-    fds[k] = fd
+    put64(blob, k, fd)
     k += 1
   }
   envc = -1
@@ -153,8 +138,7 @@ pub def start_process(name: Str, argv: [Str], attr: ProcAttr) -> ~Process<FsErro
     eb = nul_blob(e)
   }
   eb << 0
-  args = [prog] + av[1...av.size]
-  pid = alx_sys_spawn(nul_blob(args), args.size, eb, envc, attr.dir, fds[0], fds[1], fds[2])
+  pid = alx_sys_spawn2(prog, nul_blob(av), av.size, eb, envc, attr.dir, blob, n)
   for fd in nulls { alx_fd_close(fd) }
   fail ferr("fork/exec " + name, -pid) if pid < 0
   new_process(pid)

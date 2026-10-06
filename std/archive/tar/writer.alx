@@ -1,5 +1,6 @@
 # The tar Writer (Go's writer.go).
 
+import "io"
 import "io/fs"
 import "path"
 import "strings"
@@ -265,11 +266,23 @@ pub struct Writer[W] {
     (off, none)
   }
 
-  # Copies r into the current entry (Go's unexported readFrom, without its
-  # seeking over holes): the count and an error.
+  # Copies r into the current entry (Go's unexported readFrom): the count
+  # and an error. Into a sparse entry from an input that seeks (R is an
+  # io.ReadSeeker), the holes are seeked over instead of read.
   def read_from![R](r: R) -> (Int, Error?) {
     if e = st[0].err {
       return (0, e)
+    }
+    if R is io.ReadSeeker {
+      rs = r
+      # Not every seeker can seek (os.stdin): try one that moves nowhere.
+      if st[0].sparse && rs.seek!(0, io.SEEK_CURRENT).ok? {
+        n, err = sparse_read_from!(rs)
+        if e = err {
+          self.st[0].err = e if !write_too_long?(e)
+        }
+        return (n, err)
+      }
     }
     buf: [Byte] = [0; 32 * 1024]
     total = 0
@@ -287,6 +300,78 @@ pub struct Writer[W] {
         return (total, e)
       }
     }
+  }
+
+  # Go's sparseFileWriter.ReadFrom from an io.ReadSeeker: data fragments
+  # are copied, holes seeked over; a trailing hole's last byte is read, so
+  # an input too short fails.
+  def sparse_read_from![R](r: R) -> (Int, Error?) {
+    rs = r
+    read_last = false
+    pos0 = st[0].pos
+    err: Error? = none
+    eof = false
+    while logical_remaining > 0 && !read_last && err.none? && !eof {
+      data_start = st[0].sp[0].offset
+      data_end = st[0].sp[0].end_offset
+      nf = 0
+      if st[0].pos < data_start {
+        nf = data_start - st[0].pos
+        if physical_remaining == 0 {
+          read_last = true
+          nf -= 1
+        }
+        err = rs.seek!(nf, io.SEEK_CURRENT).err
+      } else {
+        nf, err, eof = copy_n_in!(rs, data_end - st[0].pos)
+      }
+      self.st[0].pos += nf
+      if st[0].pos >= data_end && st[0].sp.size > 1 {
+        self.st[0].sp = st[0].sp[1...st[0].sp.size]
+      }
+    }
+    if read_last && err.none? && !eof {
+      one: [Byte] = [0]
+      rr = read_some(rs, one)
+      err = rr.err
+      eof = rr.ok == 0
+      self.st[0].pos += 1
+    }
+    n = st[0].pos - pos0
+    return (n, io.StreamError.UnexpectedEof) if eof
+    if e = err {
+      return (n, TarError.MissData) if write_too_long?(e)
+      return (n, e)
+    }
+    return (n, TarError.UnrefData) if logical_remaining == 0 && physical_remaining > 0
+    # Go's ensureEOF: input left over is too long for the entry.
+    one: [Byte] = [0]
+    rr = read_some(rs, one)
+    return (n, rr.err) if rr.err?
+    return (n, TarError.WriteTooLong) if rr.unwrap > 0
+    (n, none)
+  }
+
+  # Go's io.CopyN(fw, r, n) into the entry's data: the count, an error, and
+  # whether r ended first (io.EOF).
+  def copy_n_in![R](r: R, n: Int) -> (Int, Error?, Bool) {
+    src = r
+    size = n < 32 * 1024 ? n : 32 * 1024
+    buf: [Byte] = [0; size]
+    total = 0
+    while total < n {
+      k = n - total < buf.size ? n - total : buf.size
+      rr = read_some(src, buf[0...k])
+      if e = rr.err {
+        return (total, e, false)
+      }
+      m = rr.unwrap
+      return (total, none, true) if m == 0
+      w, err = reg_write!(buf[0...m])
+      total += w
+      return (total, err, false) if err.some?
+    }
+    (total, none, false)
   }
 
   # ------------------------------------------------------------ headers

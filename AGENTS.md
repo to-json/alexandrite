@@ -68,16 +68,16 @@ pub error ParseErr {                 # an error type: an enum with a message
     case self { Bad(pos) => "bad input at #{pos}" }
   }
 }
-def parse(t: Str) -> ~Int {          # ~T is (T, error) in Go
+def parse(t: Str) -> ~Int<ParseErr> { # ~T is (T, error) in Go; <ParseErr> declares the error set
   fail ParseErr.Bad(pos: 0) if t == ""
   t.size
 }
 n = ~parse("x")                      # ~ propagates an error to the caller; it attaches to the NEXT call
 m2 = obj.~method(1)                  # ~ on a method call goes after the dot
 r = parse("")                        # without ~: a ~Int value (r.ok?, r.err, r.unwrap)
-if e = r.err {                       # r.err is an Error? (an open Error, not ParseErr)
+if e = r.err {                       # a ParseErr? (S7: the def declares one type; else an open Error?)
   case e { Bad(p) => puts p }        # match variants (also ParseErr.Bad(p), pkg.ParseErr.Bad(p))
-}
+}                                    # `~r` re-raises it in a def declaring ParseErr; e.message, e.wrap work
 
 # Structs, methods, interfaces --------------------------------------------------------
 struct Point {
@@ -89,7 +89,13 @@ struct Point {
 }
 p = Point.new(x: 1, y: 2)            # omitted fields are zero
 interface Shape { def area -> Float }         # structural, like Go
+interface Seeker { def seek!(off: Int) -> Int }
 struct Box[T] { items: [T] }                  # generics; def max[T: like Int](xs: [T]) -> T
+def rewind[R](r: R) -> R {                    # `if R is Iface`: decided per instance (S6); the
+  x = r                                       #   branch an instance skips isn't checked
+  x.seek!(0) if R is Seeker                   # (also `T is like Int`, `T is Str`, as a Bool)
+  x
+}
 # State shared across copies (Go's pointer receivers): keep the mutable state in a
 # one-element slice field (`st: [State]`); see std/bytes Buffer and std/bufio.
 
@@ -122,7 +128,7 @@ def check_pos(n: Int) { assert n > 0, "at #{caller_location}" }   # failures rep
 
 **Missing on purpose:** reflection (compile-time derives such as `#[derive(Json)]` instead), nil, inheritance, exceptions, a GC.
 
-Every line above compiles (checked 2026-10-03). The design decisions and their reasons are in GO-VS-RUBY.md, one row each (`D12`, `S3`, `R5`...).
+Every line above compiles (checked 2026-10-05). The design decisions and their reasons are in GO-VS-RUBY.md, one row each (`D12`, `S3`, `R5`...).
 
 ## Where things live
 

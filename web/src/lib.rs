@@ -4,6 +4,7 @@
 //! with this module's memory and `alxr_*` exports as imports, then calls
 //! its `main`.
 
+mod os;
 mod rt;
 mod sched;
 mod suspend;
@@ -44,6 +45,7 @@ pub fn compile(name: &str, source: &str) -> Result<Vec<u8>, String> {
     let l = alx::front::load_with(Path::new(name), name, &read, &list).map_err(|(sm, d)| sm.render(&d))?;
     let p = alx::front::check_program(&l, alx::front::lib_defs(&l)).map_err(|d| l.sm.render(&d))?;
     let lp = alx::lower::lower(&p, &l.sm, &alx::lower::Opts { release: false });
+    rt::sh().prog = name.to_string();
     wasmgen::emit(&lp).map_err(|e| if e.contains("available in the browser") { format!("error: {e}") } else { format!("internal compiler error: {e}") })
 }
 

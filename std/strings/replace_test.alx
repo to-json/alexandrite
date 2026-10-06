@@ -1,0 +1,226 @@
+#![test(external)]
+# Go's replace_test.go, translated (TestPickAlgorithm and
+# TestGenericTrieBuilding use Go's export_test.go hooks; they are in-package,
+# in export_test.alx). Not translated: the benchmarks.
+
+import "bytes"
+import "strings"
+
+def html_escaper -> strings.Replacer {
+  strings.new_replacer(["&", "&amp;", "<", "&lt;", ">", "&gt;", "\"", "&quot;", "'", "&apos;"])
+}
+
+def html_unescaper -> strings.Replacer {
+  strings.new_replacer(["&amp;", "&", "&lt;", "<", "&gt;", ">", "&quot;", "\"", "&apos;", "'"])
+}
+
+def capital_letters -> strings.Replacer { strings.new_replacer(["a", "A", "b", "B"]) }
+
+# The http package's old HTML escaping function.
+def old_html_escape(s0: Str) -> Str {
+  s = strings.replace(s0, "&", "&amp;", -1)
+  s = strings.replace(s, "<", "&lt;", -1)
+  s = strings.replace(s, ">", "&gt;", -1)
+  s = strings.replace(s, "\"", "&quot;", -1)
+  strings.replace(s, "'", "&apos;", -1)
+}
+
+# The one-byte string of b (not its UTF-8 encoding).
+def str1(b: Int) -> Str {
+  one: [Byte] = [b.as_u8]
+  Str.from_bytes(one)
+}
+
+struct ReplCase {
+  r: strings.Replacer
+  input: Str
+  out: Str
+}
+
+test "Replacer" {
+  tc: [ReplCase] = []
+  add = ->(r: strings.Replacer, input: Str, out: Str) { tc << ReplCase.new(r: r, input: input, out: out) }
+
+  # inc maps "\x00"->"\x01", ..., "a"->"b", "b"->"c", ..., "\xff"->"\x00".
+  s: [Str] = []
+  for i in 0...256 {
+    s << str1(i)
+    s << str1((i + 1) % 256)
+  }
+  inc = strings.new_replacer(s)
+
+  # Test cases with 1-byte old strings, 1-byte new strings.
+  add.call(capital_letters(), "brad", "BrAd")
+  add.call(capital_letters(), strings.repeat("a", (32 << 10) + 123), strings.repeat("A", (32 << 10) + 123))
+  add.call(capital_letters(), "", "")
+  add.call(inc, "brad", "csbe")
+  add.call(inc, bs([0x00, 0xff]), bs([0x01, 0x00]))
+  add.call(inc, "", "")
+  add.call(strings.new_replacer(["a", "1", "a", "2"]), "brad", "br1d")
+
+  # repeat maps "a"->"a", "b"->"bb", "c"->"ccc", ...
+  s = []
+  for i in 0...256 {
+    n = i + 1 - 97
+    n = 1 if n < 1
+    s << str1(i)
+    s << strings.repeat(str1(i), n)
+  }
+  repeat = strings.new_replacer(s)
+
+  # Test cases with 1-byte old strings, variable length new strings.
+  add.call(html_escaper(), "No changes", "No changes")
+  add.call(html_escaper(), "I <3 escaping & stuff", "I &lt;3 escaping &amp; stuff")
+  add.call(html_escaper(), "&&&", "&amp;&amp;&amp;")
+  add.call(html_escaper(), "", "")
+  add.call(repeat, "brad", "bbrrrrrrrrrrrrrrrrrradddd")
+  add.call(repeat, "abba", "abbbba")
+  add.call(repeat, "", "")
+  add.call(strings.new_replacer(["a", "11", "a", "22"]), "brad", "br11d")
+
+  # The remaining test cases have variable length old strings.
+  add.call(html_unescaper(), "&amp;amp;", "&amp;")
+  add.call(html_unescaper(), "&lt;b&gt;HTML&apos;s neat&lt;/b&gt;", "<b>HTML's neat</b>")
+  add.call(html_unescaper(), "", "")
+  add.call(strings.new_replacer(["a", "1", "a", "2", "xxx", "xxx"]), "brad", "br1d")
+  add.call(strings.new_replacer(["a", "1", "aa", "2", "aaa", "3"]), "aaaa", "1111")
+  add.call(strings.new_replacer(["aaa", "3", "aa", "2", "a", "1"]), "aaaa", "31")
+
+  # gen1 has multiple old strings of variable length. There is no overall
+  # non-empty common prefix, but some pairwise common prefixes.
+  gen1 = strings.new_replacer(["aaa", "3[aaa]", "aa", "2[aa]", "a", "1[a]", "i", "i", "longerst", "most long", "longer", "medium", "long", "short", "xx", "xx", "x", "X", "X", "Y", "Y", "Z"])
+  add.call(gen1, "fooaaabar", "foo3[aaa]b1[a]r")
+  add.call(gen1, "long, longerst, longer", "short, most long, medium")
+  add.call(gen1, "xxxxx", "xxxxX")
+  add.call(gen1, "XiX", "YiY")
+  add.call(gen1, "", "")
+
+  # gen2 has multiple old strings with no pairwise common prefix.
+  gen2 = strings.new_replacer(["roses", "red", "violets", "blue", "sugar", "sweet"])
+  add.call(gen2, "roses are red, violets are blue...", "red are red, blue are blue...")
+  add.call(gen2, "", "")
+
+  # gen3 has multiple old strings with an overall common prefix.
+  gen3 = strings.new_replacer(["abracadabra", "poof", "abracadabrakazam", "splat", "abraham", "lincoln", "abrasion", "scrape", "abraham", "isaac"])
+  add.call(gen3, "abracadabrakazam abraham", "poofkazam lincoln")
+  add.call(gen3, "abrasion abracad", "scrape abracad")
+  add.call(gen3, "abba abram abrasive", "abba abram abrasive")
+  add.call(gen3, "", "")
+
+  # foo{1,2,3,4} have multiple old strings with an overall common prefix and
+  # 1- or 2- byte extensions from the common prefix.
+  foo1 = strings.new_replacer(["foo1", "A", "foo2", "B", "foo3", "C"])
+  foo2 = strings.new_replacer(["foo1", "A", "foo2", "B", "foo31", "C", "foo32", "D"])
+  foo3 = strings.new_replacer(["foo11", "A", "foo12", "B", "foo31", "C", "foo32", "D"])
+  foo4 = strings.new_replacer(["foo12", "B", "foo32", "D"])
+  add.call(foo1, "fofoofoo12foo32oo", "fofooA2C2oo")
+  add.call(foo1, "", "")
+  add.call(foo2, "fofoofoo12foo32oo", "fofooA2Doo")
+  add.call(foo2, "", "")
+  add.call(foo3, "fofoofoo12foo32oo", "fofooBDoo")
+  add.call(foo3, "", "")
+  add.call(foo4, "fofoofoo12foo32oo", "fofooBDoo")
+  add.call(foo4, "", "")
+
+  # gen_all maps "\x00\x01\x02...\xfe\xff" to "[all]", amongst other things.
+  all_bytes: [Byte] = [0; 256]
+  for i in 0...256 { all_bytes[i] = i.as_u8 }
+  all_string = Str.from_bytes(all_bytes)
+  gen_all = strings.new_replacer([all_string, "[all]", bs([0xff]), "[ff]", bs([0x00]), "[00]"])
+  add.call(gen_all, all_string, "[all]")
+  add.call(gen_all, "a" + bs([0xff]) + all_string + bs([0x00]), "a[ff][all][00]")
+  add.call(gen_all, "", "")
+
+  # Test cases with empty old strings.
+  blank_to_x1 = strings.new_replacer(["", "X"])
+  blank_to_x2 = strings.new_replacer(["", "X", "", ""])
+  blank_high_priority = strings.new_replacer(["", "X", "o", "O"])
+  blank_low_priority = strings.new_replacer(["o", "O", "", "X"])
+  blank_no_op1 = strings.new_replacer(["", ""])
+  blank_no_op2 = strings.new_replacer(["", "", "", "A"])
+  blank_foo = strings.new_replacer(["", "X", "foobar", "R", "foobaz", "Z"])
+  add.call(blank_to_x1, "foo", "XfXoXoX")
+  add.call(blank_to_x1, "", "X")
+  add.call(blank_to_x2, "foo", "XfXoXoX")
+  add.call(blank_to_x2, "", "X")
+  add.call(blank_high_priority, "oo", "XOXOX")
+  add.call(blank_high_priority, "ii", "XiXiX")
+  add.call(blank_high_priority, "oiio", "XOXiXiXOX")
+  add.call(blank_high_priority, "iooi", "XiXOXOXiX")
+  add.call(blank_high_priority, "", "X")
+  add.call(blank_low_priority, "oo", "OOX")
+  add.call(blank_low_priority, "ii", "XiXiX")
+  add.call(blank_low_priority, "oiio", "OXiXiOX")
+  add.call(blank_low_priority, "iooi", "XiOOXiX")
+  add.call(blank_low_priority, "", "X")
+  add.call(blank_no_op1, "foo", "foo")
+  add.call(blank_no_op1, "", "")
+  add.call(blank_no_op2, "foo", "foo")
+  add.call(blank_no_op2, "", "")
+  add.call(blank_foo, "foobarfoobaz", "XRXZX")
+  add.call(blank_foo, "foobar-foobaz", "XRX-XZX")
+  add.call(blank_foo, "", "X")
+
+  # single string replacer
+  abc_matcher = strings.new_replacer(["abc", "[match]"])
+  add.call(abc_matcher, "", "")
+  add.call(abc_matcher, "ab", "ab")
+  add.call(abc_matcher, "abc", "[match]")
+  add.call(abc_matcher, "abcd", "[match]d")
+  add.call(abc_matcher, "cabcabcdabca", "c[match][match]d[match]a")
+
+  # Issue 6659 cases (more single string replacer)
+  no_hello = strings.new_replacer(["Hello", ""])
+  add.call(no_hello, "Hello", "")
+  add.call(no_hello, "Hellox", "x")
+  add.call(no_hello, "xHello", "x")
+  add.call(no_hello, "xHellox", "xx")
+
+  # No-arg test cases.
+  nop = strings.new_replacer([])
+  add.call(nop, "abc", "abc")
+  add.call(nop, "", "")
+
+  for c in tc {
+    assert_eq c.r.replace(c.input), c.out
+    buf = bytes.new_buffer([])
+    n = c.r.~write_string(buf, c.input)
+    assert_eq buf.to_s, c.out
+    assert_eq n, c.out.size
+  }
+}
+
+test "Replacer agrees with old HTML escape" {
+  for s in ["", "No changes", "I <3 escaping & stuff", "&&&", "<'\"'>"] {
+    assert_eq html_escaper().replace(s), old_html_escape(s)
+  }
+}
+
+test "NewReplacer odd argument count" {
+  assert_panics("odd argument count") { strings.new_replacer(["a"]) }
+}
+
+struct ErrWriter {
+  def write!(_p: [Byte]) -> ~Int { fail WriteErr.Unwritable }
+}
+
+error WriteErr {
+  Unwritable
+  def message -> Str { "unwritable" }
+}
+
+# Go's TestWriteStringError: write_string returns the writer's error.
+test "WriteStringError" {
+  rs = [
+    capital_letters(), html_escaper(), strings.new_replacer(["12", "123"]), strings.new_replacer(["1", "12"]),
+    strings.new_replacer(["", "X"]), strings.new_replacer(["a", "1", "b", "12", "cde", "123"]),
+  ]
+  for r in rs {
+    res = r.write_string(ErrWriter.new(), "abc")
+    if e = res.err {
+      assert_eq e.message, "unwritable"
+    } else {
+      assert false, "write_string: want an error"
+    }
+  }
+}

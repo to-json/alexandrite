@@ -19,7 +19,7 @@ struct User {
 
 v = u.to_data                    # dyn.Value: a struct "main.User" {Name, tags, boss}
 u2 = ~User.from_data(v)          # and back
-dyn.fmt_printf("%+v", [v])       # {Name:ann tags:[a b] boss:<nil>}
+dyn.sprintf("%+v", [v])       # {Name:ann tags:[a b] boss:<nil>}
 t.execute_str(u)                 # text/template: {{.Name}} {{.greet "hi"}}
 ```
 
@@ -34,7 +34,7 @@ The value type started inside text/template, but every reflection-shaped Go pack
 ## The value (std/dyn/value.alx)
 
 - A `Value` is a kind (Go's reflect kinds folded: every int width is `KIND_INT`; plus `KIND_PTR`), the Go type name as text (`"map[string]int"`, `"*main.T"`, `"template.HTML"`), scalars inline, and lists, maps, structs, pointers and functions as nodes of a `Doc` arena. alx values can't contain themselves (port-issues #2, #80), so a tree is stored flat, as json.Value is. Values are immutable and cheap to copy; a container's constructor copies its elements into one arena.
-- The type name decides what Go's reflection would: printing (`fmt_print` / `fmt_printf` / `fmt_println` are Go's fmt over Values, std/dyn/fmt.alx), `%T`, comparison rules and error messages.
+- The type name decides what Go's reflection would: printing (`sprint` / `sprintf` / `sprintln` are Go's fmt over Values, std/dyn/fmt.alx), `%T`, comparison rules and error messages.
 - A nil pointer is a pointer node without an element; a nil interface is a nil pointer whose type name isn't `*...`; a value read out of a container through `interface {}` remembers that (`Value.it`, only for error text: Go says "in type interface {}").
 - A struct node may carry a `Data` object: the original alx value, whose exposed methods a consumer calls by name (`data_sig`, `data_call`, `data_string`).
 - Functions are `Func { Sig, ([Value]) -> ~Value }`; `Sig.parse` reads Go's signature text (`Func.of("func(int, ...string) (string, error)", f)`), so callers can check arity and convert arguments as Go's reflection would. `fail` in a function is Go's error result.
@@ -73,5 +73,5 @@ A new derive reads its key from `Opts.tags` and parses Go's tag syntax for it; n
 - `std/dyn/value_test.alx`: constructors, type names, fmt, from_json, the conversions, functions.
 - `std/dyn/derives/derive_test.alx`: every field kind both ways, enums, options, errors, methods through `Data`.
 - `std/encoding/json/derives/derives_test.alx` "field tags": `#[field(json: ...)]`, foreign keys ignored.
-- Acceptance case `tmpl_fixes` (all backends and the Rust oracle): a derived type with methods and function fields in a template; to_data / from_data round trip; one `#[field(...)]` read by Json and Data.
+- Acceptance case `tmplfixes` (all backends and the Rust oracle): a derived type with methods and function fields in a template; to_data / from_data round trip; one `#[field(...)]` read by Json and Data.
 - text/template and html/template run on it (their derives tests, generated vectors and Go's test tables).

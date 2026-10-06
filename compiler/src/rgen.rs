@@ -305,6 +305,18 @@ impl FnEmit<'_> {
     fn stmt(&mut self, s: &LS) {
         match s {
             LS::SetGlobal(k, v) => {
+                // A big table of scalar literals (crypto and unicode tables)
+                // goes in a `static` array: rustc compiles that quickly, where a
+                // 100k-element `vec![...]` in main took it half an hour.
+                if let LE::ArrLit(el, vs) = v {
+                    let scalar = matches!(el, LTy::I64 | LTy::F64 | LTy::Bool);
+                    if scalar && vs.len() > 256 && vs.iter().all(|x| matches!(x, LE::I(_) | LE::F(_) | LE::B(_))) {
+                        let items: Vec<String> = vs.iter().map(|x| self.e(x)).collect();
+                        self.line(&format!("static T{k}: [{}; {}] = [{}];", rty(el), vs.len(), items.join(", ")));
+                        self.line(&format!("let _ = G{k}.set(Sl::from(T{k}.to_vec()));"));
+                        return;
+                    }
+                }
                 let v = self.e(v);
                 self.line(&format!("let _ = G{k}.set({v});"));
             }

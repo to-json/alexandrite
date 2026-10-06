@@ -68,16 +68,20 @@ pub error ParseErr {                 # an error type: an enum with a message
     case self { Bad(pos) => "bad input at #{pos}" }
   }
 }
-def parse(t: Str) -> ~Int {          # ~T is (T, error) in Go
+def parse(t: Str) -> ~Int<ParseErr> { # ~T is (T, error) in Go; <ParseErr> declares the error set
   fail ParseErr.Bad(pos: 0) if t == ""
   t.size
+}
+def first(k: Str) -> ~Int {
+  n = find(k) || fail ParseErr.Bad(pos: 1)   # opt || jump (S8): also || return v, || break, || next
+  case n { 0 => return 0; _ => n * 2 }       # a bare jump can be a case arm (=> fail e, => break)
 }
 n = ~parse("x")                      # ~ propagates an error to the caller; it attaches to the NEXT call
 m2 = obj.~method(1)                  # ~ on a method call goes after the dot
 r = parse("")                        # without ~: a ~Int value (r.ok?, r.err, r.unwrap)
-if e = r.err {                       # r.err is an Error? (an open Error, not ParseErr)
+if e = r.err {                       # a ParseErr? (S7: the def declares one type; else an open Error?)
   case e { Bad(p) => puts p }        # match variants (also ParseErr.Bad(p), pkg.ParseErr.Bad(p))
-}
+}                                    # `~r` re-raises it in a def declaring ParseErr; e.message, e.wrap work
 
 # Structs, methods, interfaces --------------------------------------------------------
 struct Point {
@@ -89,9 +93,15 @@ struct Point {
 }
 p = Point.new(x: 1, y: 2)            # omitted fields are zero
 interface Shape { def area -> Float }         # structural, like Go
+interface Seeker { def seek!(off: Int) -> Int }
 struct Box[T] { items: [T] }                  # generics; def max[T: like Int](xs: [T]) -> T
 struct Node { kids: [Node]; next: Node? }     # a type may hold itself through [T], Map, a T? field, closures (R12)
 struct Scaled { inner: Shape; k: Float }      # may hold a Shape and be one (R13); `==` works on interface values
+def rewind[R](r: R) -> R {                    # `if R is Iface`: decided per instance (S6); the
+  x = r                                       #   branch an instance skips isn't checked
+  x.seek!(0) if R is Seeker                   # (also `T is like Int`, `T is Str`, as a Bool)
+  x
+}
 # State shared across copies (Go's pointer receivers): keep the mutable state in a
 # one-element slice field (`st: [State]`); see std/bytes Buffer and std/bufio.
 
@@ -110,6 +120,9 @@ REG = Mutex[Map[Str, Int]].new({})   #   set before main runs; read as HITS / pk
 
 # Lambdas, shell, FFI, tests --------------------------------------------------------
 add = ->(a: Int, b: Int) -> Int { a + b }; add.call(1, 2)
+def info(msg: Str, tags: [Str] = [], level: Int = 0) { }   # defaults (S8): per call, in the callee's package
+info("hi"); info("hi", level: 2)              # arguments by name too (after the positional ones). No variadics
+# A package's own def named like a builtin (`print`, `sprintf`, `copy`) shadows it there (S12)
 out = `ls -l #{dir}`.~output                    # a command literal (no shell): os/exec.Cmd
 extern def c_getpid() -> I32 = "getpid"       # C FFI; std uses it only for OS access
 test "adds" { assert_eq 1 + 1, 2; assert x > 0, "why" }   # in *_test.alx beside the package
@@ -120,7 +133,7 @@ example "hi" { puts "hi" } outputs "hi\n"
 
 **Missing on purpose:** reflection (compile-time derives such as `#[derive(Json)]` instead), nil, inheritance, exceptions, a GC.
 
-Every line above compiles (checked 2026-10-03). The design decisions and their reasons are in GO-VS-RUBY.md, one row each (`D12`, `S3`, `R5`...).
+Every line above compiles (checked 2026-10-05). The design decisions and their reasons are in GO-VS-RUBY.md, one row each (`D12`, `S3`, `R5`...).
 
 ## Where things live
 

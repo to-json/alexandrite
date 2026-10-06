@@ -762,7 +762,7 @@ pub fn parse_header(text: &str, overflow: Overflow, span: Span, pkg: &str) -> Re
             span,
             tparams: vec![],
             name_span: span,
-            params: (0..ptys.len()).map(|i| Param { name: format!("p{i}"), ty: None, span }).collect(),
+            params: (0..ptys.len()).map(|i| Param { name: format!("p{i}"), ty: None, span, default: None }).collect(),
             ret: None,
             fallible: flags.contains(&"fallible"),
             errs: Some(vec!["Error".into()]),

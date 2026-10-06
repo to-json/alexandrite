@@ -7,8 +7,13 @@ use crate::ast::{BinOp, Overflow};
 use num_bigint::BigInt;
 use num_rational::BigRational;
 use crate::diag::Span;
+use std::rc::Rc;
 
-#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+/// A type: a structural tree. A struct's or enum's field list is shared
+/// (`Rc`), so cloning a type is cheap however large its fields are: the
+/// checker copies types into every expression, and a struct like
+/// crypto/tls.Conn expands to ~11,000 nodes (port-issues #160).
+#[derive(Clone, Debug)]
 pub enum Ty {
     /// I64, the default integer.
     Int,
@@ -24,7 +29,7 @@ pub enum Ty {
     Fixed(Box<Ty>, u64),
     /// `enum`: its name and variants (each with its fields). A value: the
     /// tag, then every variant's fields side by side.
-    Enum(String, Vec<(String, Vec<(String, Ty)>)>),
+    Enum(String, Rc<Vec<(String, Vec<(String, Ty)>)>>),
     /// Any error value: one of the program's `error` types (and the
     /// builtin ones), with where it happened and any `wrap` context.
     Error,
@@ -57,7 +62,7 @@ pub enum Ty {
     /// `Ptr`: an opaque C pointer (pointer-sized; no deref in alexandrite).
     Ptr,
     /// A user struct (a value): its name and fields, in order.
-    Struct(String, Vec<(String, Ty)>),
+    Struct(String, Rc<Vec<(String, Ty)>>),
     /// Range[Int]
     Range,
     /// An unmaterialized pipeline: elements of type T. `true` = lazy.
@@ -68,9 +73,139 @@ pub enum Ty {
     Yielder(Box<Ty>),
     Var(u32),
     Never,
+    /// A struct or enum named where it is being defined, inside its own
+    /// definition (R12): `struct Node { kids: [Node] }` is
+    /// `Struct("Node", [("kids", Array(Rec("Node")))])`. Equal to the
+    /// struct or enum of that name; `Ty::unrec` gives its definition.
+    Rec(String),
+}
+
+thread_local! {
+    /// The definitions of the struct and enum types that contain
+    /// themselves (through a slice, a map, an optional, a closure...), by
+    /// name, for `Ty::Rec` (R12).
+    pub static RECS: std::cell::RefCell<HashMap<String, Ty>> = std::cell::RefCell::new(HashMap::new());
+    /// The `Rec` names being unfolded by `with_rec` now.
+    static UNFOLDING: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(vec![]) };
+}
+
+/// Record the definition of a type that refers to itself.
+pub fn define_rec(name: &str, t: Ty) {
+    RECS.with(|r| r.borrow_mut().insert(name.to_string(), t));
+}
+
+/// Is `name` a struct or enum that contains itself?
+pub fn is_rec(name: &str) -> bool {
+    RECS.with(|r| r.borrow().contains_key(name))
+}
+
+/// The definition of a named struct or enum (one that contains itself).
+pub fn rec_def(name: &str) -> Option<Ty> {
+    RECS.with(|r| r.borrow().get(name).cloned())
+}
+
+/// Walk into a recursive type's definition at most once per walk: `f`
+/// gets the definition of `name`, unless `name` is already being walked
+/// (or unknown); then the walk gets `cycle` (a coinductive answer: what
+/// the rest of the walk decides).
+pub fn with_rec<T>(name: &str, cycle: T, f: impl FnOnce(&Ty) -> T) -> T {
+    if UNFOLDING.with(|u| u.borrow().iter().any(|x| x == name)) {
+        return cycle;
+    }
+    let Some(def) = rec_def(name) else { return cycle };
+    UNFOLDING.with(|u| u.borrow_mut().push(name.to_string()));
+    let r = f(&def);
+    UNFOLDING.with(|u| u.borrow_mut().pop());
+    r
+}
+
+/// Does `t` hold (inline: in its fields, tuple slots, optionals) a value
+/// of a type that contains itself? Such a value in an optional field may
+/// be boxed (R12).
+pub fn mentions_rec(t: &Ty) -> bool {
+    match t {
+        Ty::Rec(_) => true,
+        Ty::Struct(n, _) | Ty::Enum(n, _) if is_rec(n) => true,
+        Ty::Struct(_, fs) => fs.iter().any(|(_, t)| mentions_rec(t)),
+        Ty::Enum(_, vs) => vs.iter().any(|(_, fs)| fs.iter().any(|(_, t)| mentions_rec(t))),
+        Ty::Tuple(ts) => ts.iter().any(mentions_rec),
+        Ty::Opt(t) | Ty::Fixed(t, _) | Ty::Result(t) => mentions_rec(t),
+        _ => false,
+    }
+}
+
+impl PartialEq for Ty {
+    fn eq(&self, o: &Ty) -> bool {
+        use Ty::*;
+        match (self, o) {
+            (Rec(a), Rec(b)) => a == b,
+            (Rec(a), Struct(b, _) | Enum(b, _)) | (Struct(b, _) | Enum(b, _), Rec(a)) => a == b,
+            (Struct(a, x), Struct(b, y)) => a == b && x == y,
+            (Enum(a, x), Enum(b, y)) => a == b && x == y,
+            (Int, Int) | (Float, Float) | (Bool, Bool) | (Str, Str) | (Unit, Unit) | (Error, Error) | (Ptr, Ptr) | (Range, Range) | (Never, Never) => true,
+            (IntK(a), IntK(b)) => a == b,
+            (Array(a), Array(b)) | (Result(a), Result(b)) | (Task(a), Task(b)) | (Chan(a), Chan(b)) | (Pool(a), Pool(b)) | (Mutex(a), Mutex(b)) | (Atomic(a), Atomic(b)) | (Opt(a), Opt(b)) | (Gen(a), Gen(b)) | (Yielder(a), Yielder(b)) => a == b,
+            (Fixed(a, n), Fixed(b, m)) => n == m && a == b,
+            (Handle(a), Handle(b)) | (Iface(a), Iface(b)) => a == b,
+            (Fn(a, r), Fn(b, s)) => a == b && r == s,
+            (Map(a, x), Map(b, y)) => a == b && x == y,
+            (Tuple(a), Tuple(b)) => a == b,
+            (Seq(a, l), Seq(b, m)) => l == m && a == b,
+            (Var(a), Var(b)) => a == b,
+            _ => false,
+        }
+    }
+}
+impl Eq for Ty {}
+
+impl std::hash::Hash for Ty {
+    fn hash<H: std::hash::Hasher>(&self, h: &mut H) {
+        use Ty::*;
+        match self {
+            // Equal to each other by name.
+            Struct(n, _) | Enum(n, _) | Rec(n) => {
+                0u8.hash(h);
+                n.hash(h);
+            }
+            t => {
+                std::mem::discriminant(t).hash(h);
+                match t {
+                    IntK(k) => k.hash(h),
+                    Array(a) | Result(a) | Task(a) | Chan(a) | Pool(a) | Mutex(a) | Atomic(a) | Opt(a) | Gen(a) | Yielder(a) => a.hash(h),
+                    Fixed(a, n) => {
+                        a.hash(h);
+                        n.hash(h);
+                    }
+                    Handle(a) | Iface(a) => a.hash(h),
+                    Fn(a, r) => {
+                        a.hash(h);
+                        r.hash(h);
+                    }
+                    Map(a, b) => {
+                        a.hash(h);
+                        b.hash(h);
+                    }
+                    Tuple(a) => a.hash(h),
+                    Seq(a, l) => {
+                        a.hash(h);
+                        l.hash(h);
+                    }
+                    Var(v) => v.hash(h),
+                    _ => {}
+                }
+            }
+        }
+    }
 }
 
 impl Ty {
+    /// A `Rec` as the struct or enum it names; anything else as it is.
+    pub fn unrec(&self) -> Ty {
+        match self {
+            Ty::Rec(n) => rec_def(n).unwrap_or_else(|| self.clone()),
+            t => t.clone(),
+        }
+    }
     /// The value type of an `Atomic[self]` that isn't a runtime cell (not
     /// an Int or a Bool): it is kept behind a lock, laid out like a Mutex.
     pub fn atomic_boxed(&self) -> bool {
@@ -88,7 +223,7 @@ impl Ty {
             Ty::IntK(k) => k.name().into(),
             Ty::Float => "Float".into(),
             Ty::Ptr => "Ptr".into(),
-            Ty::Struct(n, _) | Ty::Enum(n, _) | Ty::Iface(n) => n.clone(),
+            Ty::Struct(n, _) | Ty::Enum(n, _) | Ty::Iface(n) | Ty::Rec(n) => n.clone(),
             Ty::Opt(t) => format!("{}?", t.show()),
             Ty::Bool => "Bool".into(),
             Ty::Str => "Str".into(),
@@ -141,13 +276,16 @@ impl Ty {
     pub fn type_name(&self) -> Option<&str> {
         match self {
             // A generic instance (`Stack[Int]`) has its type's methods.
-            Ty::Struct(n, _) | Ty::Enum(n, _) => Some(n.split('[').next().unwrap_or(n)),
+            Ty::Struct(n, _) | Ty::Enum(n, _) | Ty::Rec(n) => Some(n.split('[').next().unwrap_or(n)),
             _ => None,
         }
     }
     /// An enum's flattened slots: variant `k`'s first field is at slot
     /// `enum_slot(k)` of the value (slot 0 is the tag).
     pub fn enum_slot(&self, k: usize) -> usize {
+        if let Ty::Rec(_) = self {
+            return self.unrec().enum_slot(k);
+        }
         let Ty::Enum(_, vs) = self else { panic!("not an enum") };
         1 + vs[..k].iter().map(|(_, fs)| fs.len()).sum::<usize>()
     }
@@ -166,11 +304,13 @@ impl Ty {
             Ty::Tuple(ts) => ts.iter().any(Ty::is_value_array),
             Ty::Enum(_, vs) => vs.iter().any(|(_, fs)| fs.iter().any(|(_, t)| t.is_value_array())),
             Ty::Opt(t) => t.is_value_array(),
+            Ty::Rec(n) => with_rec(n, false, Ty::is_value_array),
             _ => false,
         }
     }
     pub fn field(&self, name: &str) -> Option<(usize, Ty)> {
         match self {
+            Ty::Rec(_) => self.unrec().field(name),
             Ty::Struct(_, fs) => fs.iter().position(|(f, _)| f == name).map(|k| (k, fs[k].1.clone())),
             _ => None,
         }
@@ -368,6 +508,9 @@ pub enum M {
     /// `v.as(T)`: the interface value as implementor `k` (a `T?`; Go's
     /// `t, ok := v.(T)`).
     IfaceOpt(usize),
+    /// `a == b` on interface values (recv a, args [b]): the same
+    /// implementor, and `__eq` of the two values (`TProgram::iface_eqs`).
+    IfaceEq,
     /// Build variant `k` of an enum: args are every slot after the tag.
     VariantNew(usize),
     /// `find { pred }` → T? (a select stage, then this terminal).
@@ -450,6 +593,11 @@ pub enum TK {
     Array(Vec<TExpr>),
     /// `place = v`, or `place op= v`: a local, then index and field steps.
     PlaceAssign(LocalId, Vec<TStep>, Option<BinOp>, Box<TExpr>),
+    /// `place.m!(args)`: the call (whose receiver argument is `Local(view)`)
+    /// runs with `view` a one-element slice that *is* the place (a local,
+    /// then index and field steps): writes through it land in the place.
+    /// See docs/notes/bang-calls.md.
+    Bang(LocalId, Vec<TStep>, LocalId, Box<TExpr>),
     /// `format("...", args)`: pieces checked against the arguments.
     Format(Vec<FmtPiece>, Vec<TExpr>),
     /// Statements whose value is the last one's (a `case` arm, a desugaring).
@@ -606,4 +754,7 @@ pub struct TProgram {
     /// The globals that are package-level values (R11), set by
     /// `M::SetGlobal` at the start of main rather than from a literal.
     pub vars: Vec<usize>,
+    /// For each interface whose values are compared with `==`: the
+    /// `__eq` instance of each implementor, in tag order.
+    pub iface_eqs: HashMap<String, Vec<FuncId>>,
 }

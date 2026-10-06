@@ -37,9 +37,57 @@ pub enum LTy {
     /// makes (arrays, strings, map storage, growth) goes into the thread's
     /// *current* region. See `LS::RegionEnter` and friends.
     Region,
+    /// A type that contains itself (R12, R13): `LProgram::recs[i]`, a Tup.
+    /// Laid out exactly like that Tup; its mentions of itself are behind
+    /// an Arr, so the layout is finite. Backends name it (a C struct, a
+    /// Rust tuple struct) so it can be declared before it is complete.
+    Rec(usize),
+}
+
+thread_local! {
+    /// The bodies of `LTy::Rec` types (`LProgram::recs`), for `LTy::unrec`.
+    /// Lowering fills it; each backend sets it from its program first.
+    static RECS: std::cell::RefCell<Vec<LTy>> = const { std::cell::RefCell::new(vec![]) };
+}
+
+/// Make `recs` the bodies `LTy::Rec` refers to (on this thread).
+pub fn set_recs(recs: &[LTy]) {
+    RECS.with(|r| *r.borrow_mut() = recs.to_vec());
+}
+
+/// The current bodies of `LTy::Rec` types.
+pub fn recs() -> Vec<LTy> {
+    RECS.with(|r| r.borrow().clone())
+}
+
+/// A new `LTy::Rec`, its body filled in later by `define_rec` (lowering).
+pub fn new_rec() -> usize {
+    RECS.with(|r| {
+        let mut r = r.borrow_mut();
+        r.push(LTy::Unit);
+        r.len() - 1
+    })
+}
+
+pub fn define_rec(i: usize, body: LTy) {
+    RECS.with(|r| r.borrow_mut()[i] = body);
 }
 
 impl LTy {
+    /// A `Rec` as its body (a Tup); anything else as it is.
+    pub fn unrec(&self) -> LTy {
+        match self {
+            LTy::Rec(i) => RECS.with(|r| r.borrow()[*i].clone()),
+            t => t.clone(),
+        }
+    }
+    /// The fields of a Tup (or a Rec's body).
+    pub fn tup_fields(&self) -> Vec<LTy> {
+        match self.unrec() {
+            LTy::Tup(ts) => ts,
+            t => panic!("not a tuple: {t:?}"),
+        }
+    }
     /// The element type of an array type.
     pub fn arr_elem_lty(self) -> LTy {
         match self {
@@ -168,6 +216,9 @@ pub enum LE {
     /// region. Used to store values into a caller's container: they go
     /// where the container's storage lives.
     RegionOf(Box<LE>),
+    /// The region of an Arr that may be a `View`: the one it carries (a
+    /// negative cap), else `RegionOf`.
+    ViewRegion(Box<LE>),
     /// A new *child* region of `parent` (not made current): freed together
     /// with its parent (when the parent is exited or freed), or earlier by
     /// `LS::RegionFree`. Used for a container that owns its contents (R3).
@@ -364,6 +415,15 @@ pub enum LS {
     SetIndex { arr: V, idx: LE, val: LE, check: Option<String> },
     /// `var[i].f... = val`: a write through index and field steps.
     SetPlace { var: V, steps: Vec<Step>, val: LE },
+    /// `dst` (an `Arr(ty)`) becomes a one-element slice that refers to the
+    /// place `var[i].f...` (no copy): `{&place, 1, -region}`, where `region`
+    /// is where what's stored into the place must live (read back with
+    /// `ViewRegion`). The receiver of a `!` call (docs/notes/bang-calls.md).
+    /// The oracle and wasm run it as a copy (`copy_views`).
+    View { dst: V, var: V, steps: Vec<Step>, ty: LTy, region: LE },
+    /// The end of `dst`'s use as a view of the place (a no-op where `View`
+    /// refers; the write-back where it copies). Its steps have no checks.
+    Unview { dst: V, var: V, steps: Vec<Step> },
     Push(V, LE),
     Eval(LE),
     If(LE, Vec<LS>, Vec<LS>),
@@ -488,6 +548,55 @@ pub struct LProgram {
     pub externs: Vec<FfiSig>,
     /// Program-wide variables (array constants), by `LE::Global` index.
     pub globals: Vec<LTy>,
+    /// The bodies of the `LTy::Rec` types, by index.
+    pub recs: Vec<LTy>,
+}
+
+/// The place `var` + `steps` as an expression (its current value).
+pub fn place_le(var: V, steps: &[Step]) -> LE {
+    let mut cur = LE::Var(var);
+    for st in steps {
+        cur = match st {
+            Step::Index(i, check) => LE::Index { arr: Box::new(cur), idx: Box::new(i.clone()), check: check.clone() },
+            Step::Field(k) => LE::Field(Box::new(cur), *k),
+        };
+    }
+    cur
+}
+
+/// For backends that can't refer into a place (the Rust oracle, wasm):
+/// each `View` becomes a one-element copy of the place, and its `Unview`
+/// writes the copy back (the semantics are the same: nothing else reads the
+/// place while the view is in use).
+pub fn copy_views(p: &mut LProgram) {
+    fn walk(ss: &mut Vec<LS>) {
+        for s in ss.iter_mut() {
+            match s {
+                LS::View { dst, var, steps, ty, .. } => {
+                    *s = LS::Set(*dst, LE::ArrLit(ty.clone(), vec![place_le(*var, steps)]));
+                }
+                LS::Unview { dst, var, steps } => {
+                    let val = LE::Index { arr: Box::new(LE::Var(*dst)), idx: Box::new(LE::I(0)), check: None };
+                    *s = if steps.is_empty() { LS::Set(*var, val) } else { LS::SetPlace { var: *var, steps: std::mem::take(steps), val } };
+                }
+                LS::If(_, a, b) => {
+                    walk(a);
+                    walk(b);
+                }
+                LS::Loop(_, b) => walk(b),
+                _ => {}
+            }
+        }
+    }
+    for f in p.funcs.iter_mut() {
+        walk(&mut f.body);
+    }
+    for g in p.gens.iter_mut() {
+        walk(&mut g.func.body);
+    }
+    for w in p.workers.iter_mut() {
+        walk(&mut w.func.body);
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

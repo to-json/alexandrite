@@ -6,7 +6,7 @@
 #   WaitGroup Add/Done/Wait/Go          new_wait_group -> WaitGroup: add, done, wait, go
 #   Once.Do(f)                          new_once -> Once: do { }, done?
 #   OnceFunc(f) / OnceValue(f) /        once_func(f) / once_value(f) / once_values(f)
-#     OnceValues(f): a func               -> OnceValue[T]: call
+#     OnceValues(f): a func               -> a func (`() -> T`)
 #   Mutex Lock/Unlock/TryLock           new_lock -> Lock: lock, unlock, try_lock?, with { }
 #   RWMutex                             new_rw_mutex -> RWMutex: lock, unlock, rlock,
 #                                         runlock, try_lock?, try_rlock?, rlocker,
@@ -37,13 +37,11 @@
 #    SharedMap (the builtin `Map[K, V]` is used inside), Pool -> ItemPool
 #    (`Pool[T]` is the language's handle pool). Zero values aren't usable:
 #    make each with its constructor (they hold shared state, GO-VS-RUBY D36).
-#  - OnceFunc / OnceValue / OnceValues return a `OnceValue[T]` whose `call`
-#    is Go's returned func: a closure can't hold a closure of its own type
-#    (a closure contains its captures), so the wrapper is a struct.
-#    (`once_func(f).call`, `once_value { 42 }.call`, `a, b = f.call`.)
 #  - `Once.do`, `once_func`, ... take a block (or a function). A panic in the
 #    function ends the task (alexandrite has no recover), so Go's re-panic
-#    behaviour of OnceFunc/OnceValue/OnceValues can't be observed.
+#    behaviour of OnceFunc/OnceValue/OnceValues can't be observed. The
+#    returned function goes into each task as a copy (`f.dup`); the copies
+#    share one Once.
 #  - `WaitGroup.go(f)` spawns `f` as a task, as Go 1.25's WaitGroup.Go.
 #  - SharedMap is a `Map[K, V]` under a lock (Go's is lock-free for reads).
 #    `range` calls the block on a snapshot taken under the lock, so the block
@@ -150,19 +148,19 @@ struct OnceState[T] {
   v: T?
 }
 
-# `f` behind a Once (Go's OnceFunc / OnceValue / OnceValues result): `call`
-# runs `f` the first time and returns its value every time. Callers that
-# arrive while it runs wait for it.
-pub struct OnceValue[T] {
-  st: Mutex[OnceState[T]]
-
-  pub def call -> T {
+# Go's OnceValue: a function that runs `f` the first time it is called and
+# returns its value every time. Callers that arrive while it runs wait for
+# it. (The returned closure holds `f`, a function of its own type: R12.)
+pub def once_value[T](f: () -> T) -> () -> T {
+  g = f.dup
+  st = Mutex.new(OnceState[T].new(f: g, v: none))
+  ->() -> T {
     st.lock { |s|
       if v = s.v {
         v
       } else {
-        g = s.f
-        x = g()
+        h = s.f
+        x = h()
         s.v = x
         x
       }
@@ -170,19 +168,13 @@ pub struct OnceValue[T] {
   }
 }
 
-# Go's OnceFunc: `f` runs at the first `call` only.
-pub def once_func(f: () -> Unit) -> OnceValue[Unit] {
+# Go's OnceFunc: `f` runs at the first call only.
+pub def once_func(f: () -> Unit) -> () -> Unit {
   once_value(f)
 }
 
-# Go's OnceValue: `call` returns the value of the first call of `f`.
-pub def once_value[T](f: () -> T) -> OnceValue[T] {
-  g = f.dup
-  OnceValue[T].new(st: Mutex.new(OnceState[T].new(f: g, v: none)))
-}
-
 # Go's OnceValues: once_value for a function returning a pair.
-pub def once_values[T, U](f: () -> (T, U)) -> OnceValue[(T, U)] {
+pub def once_values[T, U](f: () -> (T, U)) -> () -> (T, U) {
   once_value(f)
 }
 

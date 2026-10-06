@@ -19,7 +19,7 @@ struct User {
 
 v = u.to_data                    # dyn.Value: a struct "main.User" {Name, tags, boss}
 u2 = ~User.from_data(v)          # and back
-dyn.fmt_printf("%+v", [v])       # {Name:ann tags:[a b] boss:<nil>}
+dyn.sprintf("%+v", [v])       # {Name:ann tags:[a b] boss:<nil>}
 t.execute_str(u)                 # text/template: {{.Name}} {{.greet "hi"}}
 ```
 
@@ -34,7 +34,7 @@ The value type started inside text/template, but every reflection-shaped Go pack
 ## The value (std/dyn/value.alx)
 
 - A `Value` is a kind (Go's reflect kinds folded: every int width is `KIND_INT`; plus `KIND_PTR`), the Go type name as text (`"map[string]int"`, `"*main.T"`, `"template.HTML"`), scalars inline, and lists, maps, structs, pointers and functions as nodes of a `Doc` arena. alx values can't contain themselves (port-issues #2, #80), so a tree is stored flat, as json.Value is. Values are immutable and cheap to copy; a container's constructor copies its elements into one arena.
-- The type name decides what Go's reflection would: printing (`fmt_print` / `fmt_printf` / `fmt_println` are Go's fmt over Values, std/dyn/fmt.alx), `%T`, comparison rules and error messages.
+- The type name decides what Go's reflection would: printing (`sprint` / `sprintf` / `sprintln` are Go's fmt over Values, std/dyn/fmt.alx), `%T`, comparison rules and error messages.
 - A nil pointer is a pointer node without an element; a nil interface is a nil pointer whose type name isn't `*...`; a value read out of a container through `interface {}` remembers that (`Value.it`, only for error text: Go says "in type interface {}").
 - A struct node may carry a `Data` object: the original alx value, whose exposed methods a consumer calls by name (`data_sig`, `data_call`, `data_string`).
 - Functions are `Func { Sig, ([Value]) -> ~Value }`; `Sig.parse` reads Go's signature text (`Func.of("func(int, ...string) (string, error)", f)`), so callers can check arity and convert arguments as Go's reflection would. `fail` in a function is Go's error result.
@@ -54,7 +54,7 @@ Expansion by source text, like `#[derive(Json)]` (json-derive.md): the parser re
 - **Field types:** Int and the sized integers (Go's int, int8 ... uint64; Rune is int32, Byte uint8), Float, Bool, Str, Complex, `T?` (a pointer, or a typed nil), `[T]`, `[T; N]`, `Map[K, V]`, function types (to a `Func`, signature from the alx type), `Error` (Go's `*errors.errorString`: its message), `dyn.Value` (any value, passed through), and local or imported types that derive Data. Enums: a payload-free variant of a type without methods is a string of the enum's type; otherwise a struct `{variant, fields...}`.
 - **from_data** is generated when every (non-skipped) field type can come back; a function field can't (a closure calling through the Value's `Func` would hold the closure `to_data` wraps it in: a closure containing itself, port-issues #71), and a skipped field needs a literal zero (numbers, Str, Bool, arrays, maps, options). A type whose fields can't come back simply has no `from_data` (types that contain it lose theirs too: a fixpoint over the module's derived types).
 - **Methods** exposed: public, non-`!`, non-static, non-generic, with parameters of scalar types, `[scalar]` or `dyn.Value` and a result the derive can convert. `to_s` is also `data_string` (Go's String()).
-- **Not done:** generic types (as for Json: expansion is per declaration); methods with other parameter types are not exposed; a derived type with methods can't hold a `dyn.Value` field (the `Data` interface would contain itself, port-issues #82) — such values are built with `Value.struct_with`.
+- **Not done:** generic types (as for Json: expansion is per declaration); methods with other parameter types are not exposed. (A derived type with methods may hold `dyn.Value` fields since R13: the `Data` interface is boxed when it contains itself.) A function field still has no `from_data`: that needs the derive to wrap a `Func` back into a closure, which R12 now allows but nobody has written.
 
 ## One attribute form: `#[field(...)]` (compiler/src/derive.rs)
 

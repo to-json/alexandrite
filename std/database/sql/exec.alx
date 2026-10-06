@@ -10,45 +10,30 @@ import "unicode"
 
 # --------------------------------------------------------------- releasing
 
-# How a borrowed connection is given back (Go passes a `func(error)`; a
-# closure can't hold a value holding a closure of its own type, so these are
-# data). A Tx keeps the BaseRelease it was begun with.
-#
-# (Structs with optional parts rather than enums: an enum's every variant
-# needs zero values for the others' fields, and a DB, Conn or Tx has none.)
-struct BaseRelease {
-  db: DB
-  dc: DriverConn
-  # Set: a sql.Conn's read lock (Go's closemuRUnlockCondReleaseConn);
-  # none: back to the pool (Go's dc.releaseConn).
-  conn: Conn?
+# How a borrowed connection is given back: Go's releaseConn funcs, a
+# `(Error?) -> Unit` called once with the operation's error. The closures
+# capture the DB, Conn or Tx they release to (which may hold such closures
+# themselves: a Tx keeps the one it was begun with).
+
+# Back to the pool (Go's dc.releaseConn).
+def db_release(db: DB, dc: DriverConn) -> (Error?) -> Unit {
+  ->(err: Error?) { db.put_conn(dc, err, true) }
 }
 
-struct Release {
-  base: BaseRelease
-  # Set: a Tx's read lock (Go's closemuRUnlockRelease).
-  tx: Tx?
-}
-
-def db_release(db: DB, dc: DriverConn) -> Release { Release.new(base: BaseRelease.new(db: db, dc: dc, conn: none), tx: none) }
-
-def release_base(b: BaseRelease, err: Error?) -> Unit {
-  if c = b.conn {
+# A sql.Conn's read lock (Go's closemuRUnlockCondReleaseConn).
+def conn_release(c: Conn) -> (Error?) -> Unit {
+  ->(err: Error?) {
     c.closemu.runlock
     if bad_conn?(err) {
       _ = c.close_with(err)
     }
-    return nil
+    return
   }
-  b.db.put_conn(b.dc, err, true)
 }
 
-def release(r: Release, err: Error?) -> Unit {
-  if tx = r.tx {
-    tx.closemu.runlock
-    return nil
-  }
-  release_base(r.base, err)
+# A Tx's read lock (Go's closemuRUnlockRelease).
+def tx_release(tx: Tx) -> (Error?) -> Unit {
+  ->(err: Error?) { tx.closemu.runlock }
 }
 
 # ------------------------------------------------------------------ Result
@@ -161,9 +146,9 @@ def prepare_locked(db: DB, ctx: context.Context, dc: DriverConn, has_cg: Bool, q
 }
 
 # Go's execDC.
-def exec_dc(db: DB, ctx: context.Context, dc: DriverConn, rel: Release, query: Str, args: [driver.NamedValue]) -> ~Result {
+def exec_dc(db: DB, ctx: context.Context, dc: DriverConn, rel: (Error?) -> Unit, query: Str, args: [driver.NamedValue]) -> ~Result {
   r = exec_dc_inner(db, ctx, dc, query, args)
-  release(rel, r.err)
+  rel.call(r.err)
   ~r
 }
 
@@ -214,13 +199,13 @@ def rowsi_from_statement(ctx: context.Context, ci: driver.Conn, ds: DriverStmt, 
 }
 
 # Go's queryDC.
-def query_dc(db: DB, ctx: context.Context, txctx: context.Context?, dc: DriverConn, rel: Release, query: Str, args: [driver.NamedValue]) -> ~Rows {
+def query_dc(db: DB, ctx: context.Context, txctx: context.Context?, dc: DriverConn, rel: (Error?) -> Unit, query: Str, args: [driver.NamedValue]) -> ~Rows {
   dc.lock.lock
   r = query_conn_locked(ctx, dc, query, args)
   dc.lock.unlock
   if e = r.err {
     if !driver.skip?(e) {
-      release(rel, e)
+      rel.call(e)
       fail e
     }
   } else {
@@ -232,14 +217,14 @@ def query_dc(db: DB, ctx: context.Context, txctx: context.Context?, dc: DriverCo
   sr = dc.ci.prepare_context(ctx, query)
   dc.lock.unlock
   if e = sr.err {
-    release(rel, e)
+    rel.call(e)
     fail e
   }
   ds = new_driver_stmt(db.next_id, sr.unwrap, dc.lock)
   rr = rowsi_from_statement(ctx, dc.ci, ds, args)
   if e = rr.err {
     _ = ds.close
-    release(rel, e)
+    rel.call(e)
     fail e
   }
   rows = new_rows(db, dc, rel, none, rr.unwrap, ds)
@@ -248,12 +233,12 @@ def query_dc(db: DB, ctx: context.Context, txctx: context.Context?, dc: DriverCo
 }
 
 # Go's prepareDC.
-def prepare_dc(db: DB, ctx: context.Context, dc: DriverConn, rel: Release, cg: Grabber, query: Str) -> ~Stmt {
+def prepare_dc(db: DB, ctx: context.Context, dc: DriverConn, rel: (Error?) -> Unit, cg: Grabber, query: Str) -> ~Stmt {
   has_cg = cg.some?
   dc.lock.lock
   r = prepare_locked(db, ctx, dc, has_cg, query)
   dc.lock.unlock
-  release(rel, r.err)
+  rel.call(r.err)
   ds = ~r
   css: [ConnStmt] = []
   if !has_cg {
@@ -270,7 +255,7 @@ def prepare_dc(db: DB, ctx: context.Context, dc: DriverConn, rel: Release, cg: G
 }
 
 # Go's beginDC.
-def begin_dc(db: DB, ctx: context.Context, dc: DriverConn, rel: BaseRelease, opts: TxOptions?) -> ~Tx {
+def begin_dc(db: DB, ctx: context.Context, dc: DriverConn, rel: (Error?) -> Unit, opts: TxOptions?) -> ~Tx {
   o = opts || TxOptions.new(isolation: 0, read_only: false)
   dopts = driver.TxOptions.new(isolation: o.isolation, read_only: o.read_only)
   dc.lock.lock
@@ -278,7 +263,7 @@ def begin_dc(db: DB, ctx: context.Context, dc: DriverConn, rel: BaseRelease, opt
   r = dc.ci.begin_tx(ctx, dopts)
   dc.lock.unlock
   if e = r.err {
-    release_base(rel, e)
+    rel.call(e)
     fail e
   }
   tctx, cancel = context.with_cancel(ctx)
@@ -305,7 +290,7 @@ pub struct Conn {
     dc
   }
 
-  def rel -> Release { Release.new(base: BaseRelease.new(db: db, dc: dc, conn: self), tx: none) }
+  def rel -> (Error?) -> Unit { conn_release(self) }
 
   pub def ping_context(ctx: context.Context) -> ~Unit {
     d = ~grab_conn(ctx)
@@ -339,7 +324,7 @@ pub struct Conn {
 
   pub def begin_tx(ctx: context.Context, opts: TxOptions?) -> ~Tx {
     d = ~grab_conn(ctx)
-    ~begin_dc(db, ctx, d, BaseRelease.new(db: db, dc: dc, conn: self), opts)
+    ~begin_dc(db, ctx, d, conn_release(self), opts)
   }
 
   # Go's Conn.Raw: runs f with the driver's connection, under its lock. If
@@ -349,7 +334,7 @@ pub struct Conn {
     d.lock.lock
     r = f(d.ci)
     d.lock.unlock
-    release(rel, r.err)
+    rel.call(r.err)
     ~r
   }
 
@@ -377,7 +362,7 @@ pub struct Tx {
   db: DB
   dc: DriverConn
   txi: driver.Tx
-  rel: BaseRelease
+  rel: (Error?) -> Unit
   done: Atomic[Bool]
   keep_conn_on_rollback: Atomic[Bool]
   stmts: Mutex[[StmtCloser]]
@@ -393,7 +378,7 @@ pub struct Tx {
   def done? -> Bool { done.load }
 
   def close_tx(err: Error?) {
-    release_base(rel, err)
+    rel.call(err)
   }
 
   def grab_conn(c: context.Context) -> ~DriverConn {
@@ -449,7 +434,7 @@ pub struct Tx {
   # Aborts the transaction.
   pub def rollback -> ~Unit { ~rollback_with(false) }
 
-  def rel_tx -> Release { Release.new(base: rel, tx: self) }
+  def rel_tx -> (Error?) -> Unit { tx_release(self) }
 
   pub def prepare(query: Str) -> ~Stmt { ~prepare_context(context.background, query) }
 

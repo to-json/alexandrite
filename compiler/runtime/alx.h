@@ -157,6 +157,9 @@ static inline AlxRegion *alx_region_of(const void *p) {
     if (g && g == alx_tls.last_g) return alx_tls.last_r;  /* (granule 0 is never a region's) */
     return alx_region_of_slow(p);
 }
+/* The region of an array that may be a `!` call's receiver view (lir.rs
+ * LS::View): a view carries its region as a negative cap. */
+#define ALX_VIEW_REGION(a) ({ __typeof__(a) v_ = (a); v_.cap < 0 ? (AlxRegion *)(intptr_t)-v_.cap : alx_region_of(v_.ptr); })
 /* Stats (all threads): bytes held in chunks/large blocks, live regions + free lists. */
 size_t alx_mem_held(void);
 size_t alx_mem_peak(void);
@@ -204,8 +207,12 @@ static inline bool alx_even(int64_t a) { return (a & 1) == 0; }
 int64_t alx_isqrt(int64_t n, const char *loc);
 
 /* ---------- arrays ---------- */
-#define ALX_ARR(T, N)                                                                 \
-    typedef struct { T *ptr; int64_t len; int64_t cap; } N;                           \
+/* ALX_ARR_T declares the slice type (T only needs to be declared), ALX_ARR_F
+   its functions (T must be complete): types that contain themselves (R12)
+   declare every slice type before any struct and define the functions last. */
+#define ALX_ARR(T, N) ALX_ARR_T(T, N) ALX_ARR_F(T, N)
+#define ALX_ARR_T(T, N) typedef struct { T *ptr; int64_t len; int64_t cap; } N;
+#define ALX_ARR_F(T, N)                                                               \
     static inline N N##_cap(int64_t c) {                                              \
         if (c < 0) c = 0;                                                             \
         N a = { c ? (T *)alx_alloc((size_t)c * sizeof(T)) : NULL, 0, c };             \

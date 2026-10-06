@@ -72,6 +72,10 @@ def parse(t: Str) -> ~Int<ParseErr> { # ~T is (T, error) in Go; <ParseErr> decla
   fail ParseErr.Bad(pos: 0) if t == ""
   t.size
 }
+def first(k: Str) -> ~Int {
+  n = find(k) || fail ParseErr.Bad(pos: 1)   # opt || jump (S8): also || return v, || break, || next
+  case n { 0 => return 0; _ => n * 2 }       # a bare jump can be a case arm (=> fail e, => break)
+}
 n = ~parse("x")                      # ~ propagates an error to the caller; it attaches to the NEXT call
 m2 = obj.~method(1)                  # ~ on a method call goes after the dot
 r = parse("")                        # without ~: a ~Int value (r.ok?, r.err, r.unwrap)
@@ -91,6 +95,8 @@ p = Point.new(x: 1, y: 2)            # omitted fields are zero
 interface Shape { def area -> Float }         # structural, like Go
 interface Seeker { def seek!(off: Int) -> Int }
 struct Box[T] { items: [T] }                  # generics; def max[T: like Int](xs: [T]) -> T
+struct Node { kids: [Node]; next: Node? }     # a type may hold itself through [T], Map, a T? field, closures (R12)
+struct Scaled { inner: Shape; k: Float }      # may hold a Shape and be one (R13); `==` works on interface values
 def rewind[R](r: R) -> R {                    # `if R is Iface`: decided per instance (S6); the
   x = r                                       #   branch an instance skips isn't checked
   x.seek!(0) if R is Seeker                   # (also `T is like Int`, `T is Str`, as a Bool)
@@ -114,6 +120,9 @@ REG = Mutex[Map[Str, Int]].new({})   #   set before main runs; read as HITS / pk
 
 # Lambdas, shell, FFI, tests --------------------------------------------------------
 add = ->(a: Int, b: Int) -> Int { a + b }; add.call(1, 2)
+def info(msg: Str, tags: [Str] = [], level: Int = 0) { }   # defaults (S8): per call, in the callee's package
+info("hi"); info("hi", level: 2)              # arguments by name too (after the positional ones). No variadics
+# A package's own def named like a builtin (`print`, `sprintf`, `copy`) shadows it there (S12)
 out = `ls -l #{dir}`.~output                    # a command literal (no shell): os/exec.Cmd
 extern def c_getpid() -> I32 = "getpid"       # C FFI; std uses it only for OS access
 test "adds" { assert_eq 1 + 1, 2; assert x > 0, "why" }   # in *_test.alx beside the package
@@ -138,7 +147,7 @@ Every line above compiles (checked 2026-10-05). The design decisions and their r
   - → `check.rs`, the type checker:
     - `binary` (operators, `||` on optionals), `coerce`, `case`, `implement` (interfaces), `bind` / `bind_tparams` / `instance` (generics);
     - `const_call` / `const_call_named` (`Type.method`), `call_def`, `format` (the `%` verbs), `type_from`.
-  - → `tast.rs` (the typed AST)
+  - → `tast.rs` (the typed AST). `Ty` is a structural tree, but a struct's or enum's field list is an `Rc<Vec<..>>`: cloning a type is cheap, so build one with `Rc::new(fields)` and never deep-copy fields (`fs.to_vec()`) on a hot path. Tree walks: `prove::each_child` already enters blocks and `Seq`s; don't also walk their statements yourself (that doubles the work per nesting level).
   - → `lower.rs`, to LIR (`lir.rs`): `fmt_piece`, `iface_result`, `to_s`, `binary`, `shift`, `drop_idle_regions`.
   - → backends: `cgen.rs` (C), `jit.rs` (Cranelift), `rgen.rs` (a Rust "oracle" the acceptance tests compare against), `web/src/wasmgen.rs` (browser).
   - Also: `regions.rs` (where each allocation lives), `prove.rs` (removes checks it can prove), `derive.rs` (`#[derive(Json)]`), `fmt.rs` (formatter), `driver.rs` (the CLI and `alx test`).

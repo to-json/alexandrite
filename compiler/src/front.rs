@@ -552,6 +552,7 @@ pub fn check_program(l: &Loaded, externs: Vec<DefInfo>) -> Result<TProgram, Diag
         mf.body.splice(0..0, pre);
     }
     let messages = w.message_instances()?;
+    let iface_eqs = w.iface_eq_instances()?;
     let ifaces = std::mem::take(&mut w.impls);
     let stringers = std::mem::take(&mut w.stringers);
     let errors = std::mem::take(&mut w.errors);
@@ -586,11 +587,10 @@ pub fn check_program(l: &Loaded, externs: Vec<DefInfo>) -> Result<TProgram, Diag
             f.overflow = if f.is_main { l.main.overflow } else { ov(f.span.file) };
         }
     }
-    crate::check::self_containing_closures(&funcs, &ifaces)?;
     for f in &funcs {
         prove::prove(f, &l.sm)?;
     }
-    let mut p = TProgram { funcs, main, ifaces, stringers, errors, messages, warnings, globals, vars };
+    let mut p = TProgram { funcs, main, ifaces, stringers, errors, messages, warnings, globals, vars, iface_eqs };
     // R5: lambdas see the variables they capture, not copies.
     crate::capture::convert(&mut p);
     // R6: what goes to another task isn't used here afterwards.
@@ -637,6 +637,45 @@ pub fn separable(p: &Package) -> bool {
         && !(p.source.contains("Map[") && (p.source.contains("==") || p.source.contains("!=")))
         // Embedded files aren't part of the source the cache is keyed by.
         && !m.consts.iter().any(|c| c.embed.is_some())
+        // `==` on a type that contains itself calls `__eq` (builtin.alx, R12).
+        && !recursive_types(m)
+}
+
+/// Does a struct or enum of the module mention itself through its fields
+/// (directly or through the module's other types)?
+fn recursive_types(m: &crate::ast::Module) -> bool {
+    let short = |n: &str| n.rsplit('.').next().unwrap_or(n).to_string();
+    let mut uses: HashMap<String, Vec<String>> = HashMap::new();
+    let mut add = |name: &str, fields: &mut dyn Iterator<Item = &crate::ast::TypeExpr>| {
+        let mut out = vec![];
+        for te in fields {
+            crate::check::type_names(te, &mut out);
+        }
+        uses.insert(short(name), out.iter().map(|n| short(n)).collect());
+    };
+    for s in &m.structs {
+        add(&s.name, &mut s.fields.iter().map(|f| &f.1));
+    }
+    for e in &m.enums {
+        add(&e.name, &mut e.variants.iter().flat_map(|v| v.1.iter().map(|f| &f.1)));
+    }
+    uses.keys().any(|start| {
+        let mut seen: Vec<&String> = vec![];
+        let mut stack: Vec<&String> = uses[start].iter().collect();
+        while let Some(n) = stack.pop() {
+            if n == start {
+                return true;
+            }
+            if seen.contains(&n) {
+                continue;
+            }
+            seen.push(n);
+            if let Some(next) = uses.get(n) {
+                stack.extend(next.iter());
+            }
+        }
+        false
+    })
 }
 
 fn uses_complex(src: &str) -> bool {
@@ -669,6 +708,7 @@ pub fn check_library(l: &Loaded, idx: usize, prefix: &str) -> Result<(TProgram, 
     w.add_iface_sigs(&m.ifaces)?;
     let exports = w.check_exports()?;
     let messages = w.message_instances()?;
+    let iface_eqs = w.iface_eq_instances()?;
     let ifaces = std::mem::take(&mut w.impls);
     let stringers = std::mem::take(&mut w.stringers);
     let errors = std::mem::take(&mut w.errors);
@@ -679,11 +719,10 @@ pub fn check_library(l: &Loaded, idx: usize, prefix: &str) -> Result<(TProgram, 
     for (name, fid) in &exports {
         funcs[*fid].cname = format!("{prefix}_{}", crate::check::cname(name));
     }
-    crate::check::self_containing_closures(&funcs, &ifaces)?;
     for f in &funcs {
         prove::prove(f, &l.sm)?;
     }
-    Ok((TProgram { funcs, main: usize::MAX, ifaces, stringers, errors, messages, warnings: vec![], globals: vec![], vars: vec![] }, exports))
+    Ok((TProgram { funcs, main: usize::MAX, ifaces, stringers, errors, messages, warnings: vec![], globals: vec![], vars: vec![], iface_eqs }, exports))
 }
 
 /// The generated header: one line per export.
@@ -732,7 +771,7 @@ pub fn parse_header(text: &str, overflow: Overflow, span: Span, pkg: &str) -> Re
             span,
             tparams: vec![],
             name_span: span,
-            params: (0..ptys.len()).map(|i| Param { name: format!("p{i}"), ty: None, span }).collect(),
+            params: (0..ptys.len()).map(|i| Param { name: format!("p{i}"), ty: None, span, default: None }).collect(),
             ret: None,
             fallible: flags.contains(&"fallible"),
             errs: Some(vec!["Error".into()]),

@@ -28,6 +28,8 @@ thread_local! {
     /// index, type): an Int is a bignum in promote mode, so one constant
     /// can need two.
     static GLOBALS: RefCell<Vec<(usize, LTy)>> = const { RefCell::new(Vec::new()) };
+    /// The generated helper functions made so far (`Lw::helper`).
+    static HELPERS: RefCell<std::collections::HashSet<String>> = RefCell::new(Default::default());
 }
 
 /// The LIR global for array constant `k` as an `t`.
@@ -94,6 +96,7 @@ pub fn lower(p: &TProgram, sm: &SourceMap, opts: &Opts) -> LProgram {
         *l.borrow_mut() = p.funcs.iter().flat_map(|f| f.lambdas.iter().map(move |(lo, t, caps)| (f.cname.clone(), *lo, t.clone(), caps.iter().map(|c| f.locals[*c].ty.clone()).collect()))).collect();
     });
     GLOBALS.with(|g| g.borrow_mut().clear());
+    reset_recs();
     let prog = RefCell::new(LProgram::default());
 
     // R1: where each allocation lives (unless turned off, for comparison).
@@ -163,6 +166,7 @@ pub fn lower(p: &TProgram, sm: &SourceMap, opts: &Opts) -> LProgram {
         main.body.splice(0..0, init);
     }
     prog.globals = globals.into_iter().map(|(_, t)| t).collect();
+    prog.recs = crate::lir::recs();
     drop_idle_regions(&mut prog);
     prog
 }
@@ -311,7 +315,243 @@ fn fn_ret(f: &TFunc) -> LTy {
     if f.fallible && !f.is_main { result_lty(t, f.overflow) } else { t }
 }
 
+// ---------- types that contain themselves (R12, R13) ----------
+//
+// A struct, enum, interface or function type is *recursive* when its
+// layout reaches itself: `struct Node { kids: [Node] }`, an interface
+// with an implementor that holds the interface, a closure type with a
+// lambda capturing a value that holds such closures. Its LIR type is an
+// `LTy::Rec` (a named tuple), and its self-mentions are kept behind an
+// array, so the layout is finite:
+//
+// - slices, maps, pools, mutexes, channels already are arrays;
+// - an optional *field* (of a struct or an enum variant) whose value
+//   leads back to its type is boxed: a zero- or one-element array
+//   instead of (present, value);
+// - a recursive interface value is (tag, [implementor 0], [implementor 1],
+//   ...): each implementor's value in a one-element array (R13);
+// - a recursive closure type holds each lambda's captures in a
+//   one-element array.
+//
+// A box is never written through (an optional, an interface value and a
+// closure's captures change only by being replaced), so copies share it.
+// An empty box stands for the zero value: none, the first implementor's
+// zero, the first lambda with zero captures.
+
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+enum Node {
+    Named(String),
+    Iface(String),
+    /// A function type, by `Ty::show`.
+    Fn(String),
+    /// `Error`: every error type's value.
+    Err,
+}
+
+thread_local! {
+    /// Struct and enum definitions met so far, by name.
+    static NAMED: RefCell<HashMap<String, Ty>> = RefCell::new(HashMap::new());
+    /// Whether each node's layout reaches itself.
+    static RECURSIVE: RefCell<HashMap<Node, bool>> = RefCell::new(HashMap::new());
+    /// The `LTy::Rec` of each recursive node, per overflow mode.
+    static REC_LTY: RefCell<HashMap<(Node, bool), usize>> = RefCell::new(HashMap::new());
+    /// Whether an optional field (container, payload by `Ty::show`) is boxed.
+    static BOXED: RefCell<HashMap<(String, String), bool>> = RefCell::new(HashMap::new());
+}
+
+fn reset_recs() {
+    HELPERS.with(|h| h.borrow_mut().clear());
+    NAMED.with(|m| m.borrow_mut().clear());
+    RECURSIVE.with(|m| m.borrow_mut().clear());
+    REC_LTY.with(|m| m.borrow_mut().clear());
+    BOXED.with(|m| m.borrow_mut().clear());
+    crate::lir::set_recs(&[]);
+}
+
+fn named_def(n: &str) -> Option<Ty> {
+    NAMED.with(|m| m.borrow().get(n).cloned()).or_else(|| rec_def(n))
+}
+
+fn node_of(t: &Ty) -> Option<Node> {
+    match t {
+        Ty::Struct(n, _) | Ty::Enum(n, _) => {
+            NAMED.with(|m| {
+                if !m.borrow().contains_key(n) {
+                    m.borrow_mut().insert(n.clone(), t.clone());
+                }
+            });
+            Some(Node::Named(n.clone()))
+        }
+        Ty::Rec(n) => Some(Node::Named(n.clone())),
+        Ty::Iface(n) => Some(Node::Iface(n.clone())),
+        Ty::Fn(..) => Some(Node::Fn(t.show())),
+        Ty::Error => Some(Node::Err),
+        _ => None,
+    }
+}
+
+/// The nodes `t`'s layout reaches first (not looking inside them).
+fn nodes_in(t: &Ty, out: &mut Vec<Node>) {
+    if let Some(n) = node_of(t) {
+        if !out.contains(&n) {
+            out.push(n);
+        }
+        return;
+    }
+    match t {
+        Ty::Array(x) | Ty::Fixed(x, _) | Ty::Seq(x, _) | Ty::Gen(x) | Ty::Opt(x) | Ty::Task(x) | Ty::Chan(x) | Ty::Pool(x) | Ty::Mutex(x) | Ty::Atomic(x) => nodes_in(x, out),
+        Ty::Result(x) => {
+            nodes_in(x, out);
+            nodes_in(&Ty::Error, out);
+        }
+        Ty::Tuple(ts) => ts.iter().for_each(|x| nodes_in(x, out)),
+        Ty::Map(k, v) => {
+            nodes_in(k, out);
+            nodes_in(v, out);
+        }
+        _ => {}
+    }
+}
+
+fn fields_of_def(def: &Ty) -> Vec<Ty> {
+    match def {
+        Ty::Struct(_, fs) => fs.iter().map(|(_, t)| t.clone()).collect(),
+        Ty::Enum(_, vs) => vs.iter().flat_map(|(_, fs)| fs.iter().map(|(_, t)| t.clone())).collect(),
+        _ => vec![],
+    }
+}
+
+/// What a node's layout is made of.
+fn node_parts(n: &Node) -> Vec<Ty> {
+    match n {
+        Node::Named(name) => named_def(name).map(|d| fields_of_def(&d)).unwrap_or_default(),
+        Node::Iface(name) => IFACES.with(|m| m.borrow().get(name).cloned().unwrap_or_default()),
+        Node::Fn(key) => LAMBDAS.with(|l| l.borrow().iter().filter(|s| s.2.show() == *key).flat_map(|s| s.3.clone()).collect()),
+        Node::Err => ERRORS.with(|e| e.borrow().clone()),
+    }
+}
+
+fn succ(n: &Node) -> Vec<Node> {
+    let mut out = vec![];
+    for t in node_parts(n) {
+        nodes_in(&t, &mut out);
+    }
+    out
+}
+
+/// Does the node's layout reach itself?
+fn recursive(n: &Node) -> bool {
+    if let Some(r) = RECURSIVE.with(|m| m.borrow().get(n).copied()) {
+        return r;
+    }
+    let mut seen: Vec<Node> = vec![];
+    let mut stack = succ(n);
+    let mut found = false;
+    while let Some(x) = stack.pop() {
+        if x == *n {
+            found = true;
+            break;
+        }
+        if seen.contains(&x) {
+            continue;
+        }
+        let next = succ(&x);
+        seen.push(x);
+        stack.extend(next);
+    }
+    RECURSIVE.with(|m| m.borrow_mut().insert(n.clone(), found));
+    found
+}
+
+fn ty_recursive(t: &Ty) -> bool {
+    match t {
+        Ty::Struct(..) | Ty::Enum(..) | Ty::Rec(_) | Ty::Iface(_) | Ty::Fn(..) => node_of(t).is_some_and(|n| recursive(&n)),
+        _ => false,
+    }
+}
+
+/// Is an optional field of `container` holding a `payload` boxed? When the
+/// payload leads back to the container without passing an array (or a
+/// boxed interface value or closure).
+fn boxed_opt(container: &str, payload: &Ty) -> bool {
+    let key = (container.to_string(), payload.show());
+    if let Some(b) = BOXED.with(|m| m.borrow().get(&key).copied()) {
+        return b;
+    }
+    fn reaches(t: &Ty, target: &str, seen: &mut Vec<Node>) -> bool {
+        match t {
+            Ty::Struct(..) | Ty::Enum(..) | Ty::Rec(_) | Ty::Iface(_) | Ty::Fn(..) => {
+                let n = node_of(t).unwrap();
+                if n == Node::Named(target.to_string()) {
+                    return true;
+                }
+                if seen.contains(&n) || (matches!(n, Node::Iface(_) | Node::Fn(_)) && recursive(&n)) {
+                    return false;
+                }
+                seen.push(n.clone());
+                node_parts(&n).iter().any(|x| reaches(x, target, seen))
+            }
+            Ty::Opt(x) | Ty::Fixed(x, _) | Ty::Result(x) => reaches(x, target, seen),
+            Ty::Tuple(ts) => ts.iter().any(|x| reaches(x, target, seen)),
+            _ => false,
+        }
+    }
+    let b = reaches(payload, container, &mut vec![]);
+    BOXED.with(|m| m.borrow_mut().insert(key, b));
+    b
+}
+
+/// The payload of slot `k` of a struct or enum value (an enum's slot 0 is
+/// its tag) when that slot is a boxed optional.
+fn boxed_slot(container: &Ty, k: usize) -> Option<Ty> {
+    let def = container.unrec();
+    let (name, ft) = match &def {
+        Ty::Struct(n, fs) => (n, fs.get(k)?.1.clone()),
+        Ty::Enum(n, vs) => (n, vs.iter().flat_map(|(_, fs)| fs.iter().map(|(_, t)| t.clone())).nth(k.checked_sub(1)?)?),
+        _ => return None,
+    };
+    let Ty::Opt(x) = ft else { return None };
+    (recursive(&Node::Named(name.clone())) && boxed_opt(name, &x)).then(|| *x)
+}
+
+/// The LIR type of field `ft` of recursive struct or enum `container`.
+fn slot_lty(container: &str, ft: &Ty, mode: Overflow) -> LTy {
+    match ft {
+        Ty::Opt(x) if boxed_opt(container, x) => LTy::Arr(Box::new(lty(x, mode))),
+        t => lty(t, mode),
+    }
+}
+
+/// The `LTy::Rec` of a recursive node (its body made on first use).
+fn rec_lty(n: Node, mode: Overflow, body: impl FnOnce() -> LTy) -> LTy {
+    let key = (n, mode == Overflow::Promote);
+    if let Some(i) = REC_LTY.with(|m| m.borrow().get(&key).copied()) {
+        return LTy::Rec(i);
+    }
+    let i = crate::lir::new_rec();
+    REC_LTY.with(|m| m.borrow_mut().insert(key, i));
+    let b = body();
+    crate::lir::define_rec(i, b);
+    LTy::Rec(i)
+}
+
 pub fn lty(t: &Ty, mode: Overflow) -> LTy {
+    match t {
+        Ty::Rec(_) => lty(&t.unrec(), mode),
+        Ty::Struct(n, fs) if ty_recursive(t) => rec_lty(Node::Named(n.clone()), mode, || LTy::Tup(fs.iter().map(|(_, ft)| slot_lty(n, ft, mode)).collect())),
+        Ty::Enum(n, vs) if ty_recursive(t) => rec_lty(Node::Named(n.clone()), mode, || LTy::Tup(std::iter::once(LTy::I64).chain(vs.iter().flat_map(|(_, fs)| fs.iter().map(|(_, ft)| slot_lty(n, ft, mode)))).collect())),
+        Ty::Iface(n) if ty_recursive(t) => rec_lty(Node::Iface(n.clone()), mode, || {
+            let impls = IFACES.with(|m| m.borrow().get(n).cloned().unwrap_or_default());
+            LTy::Tup(std::iter::once(LTy::I64).chain(impls.iter().map(|t| LTy::Arr(Box::new(lty(t, mode))))).collect())
+        }),
+        Ty::Fn(..) if ty_recursive(t) => rec_lty(Node::Fn(t.show()), mode, || {
+            LTy::Tup(std::iter::once(LTy::I64).chain(lambda_sites(t).iter().map(|(_, caps)| LTy::Arr(Box::new(LTy::Tup(caps.iter().map(|c| lty(c, mode)).collect()))))).collect())
+        }),
+        _ => lty_plain(t, mode),
+    }
+}
+
+fn lty_plain(t: &Ty, mode: Overflow) -> LTy {
     match t {
         Ty::Int => {
             if mode == Overflow::Promote {
@@ -355,6 +595,7 @@ pub fn lty(t: &Ty, mode: Overflow) -> LTy {
         Ty::Tuple(ts) => LTy::Tup(ts.iter().map(|t| lty(t, mode)).collect()),
         Ty::Range => LTy::Range,
         Ty::Gen(t) => LTy::Gen(Box::new(lty(t, mode))),
+        Ty::Rec(_) => unreachable!(),
     }
 }
 
@@ -943,6 +1184,7 @@ impl<'a> Lw<'a> {
                 let v = self.var_of(l);
                 let region = match self.owner_region(l) {
                     Some(reg) => reg,
+                    None if matches!(self.lty(&self.f.locals[l].ty), LTy::Arr(_)) => LE::ViewRegion(Box::new(LE::Var(v))),
                     None => LE::RegionOf(Box::new(LE::Var(v))),
                 };
                 self.emit(LS::Set(r, region));
@@ -1020,10 +1262,19 @@ impl<'a> Lw<'a> {
         // (stored into a captured variable that outlives the call, say) must
         // go there: the region current when the lambda runs may be the
         // frame of whoever called it, freed when that returns.
+        if !crate::regions::allocates(e, self.promote()) {
+            return None;
+        }
+        self.placed(e as *const TExpr as usize)
+    }
+
+    /// Where allocation site `key` (by address) is placed, when that isn't
+    /// the current region (and its placement class).
+    fn placed(&mut self, key: usize) -> Option<(LE, crate::regions::Place)> {
         if let (Some(pl), None) = (self.lambda_place, self.frame) {
             use crate::regions::Place;
-            if crate::regions::allocates(e, self.promote()) {
-                let class = pl.sites.get(&(e as *const TExpr as usize)).copied().unwrap_or(Place::Global);
+            {
+                let class = pl.sites.get(&key).copied().unwrap_or(Place::Global);
                 if matches!(class, Place::Global | Place::Into(_)) && self.ambient != Place::Global {
                     return Some((LE::RegionProgram, Place::Global));
                 }
@@ -1031,9 +1282,9 @@ impl<'a> Lw<'a> {
             return None;
         }
         if let (Some(pl), Some((frame, dest))) = (self.place, self.frame) {
-            if crate::regions::allocates(e, self.promote()) {
+            {
                 use crate::regions::Place;
-                let mut class = pl.sites.get(&(e as *const TExpr as usize)).copied().unwrap_or(Place::Global);
+                let mut class = pl.sites.get(&key).copied().unwrap_or(Place::Global);
                 // A loop not open here (can't happen, but never guess): the frame.
                 if let Place::Iter(k) = class {
                     if !self.iter_open.iter().any(|(_, r, _)| Some(r) == self.iter_vars.get(&k).map(|x| &x.0)) {
@@ -1048,8 +1299,13 @@ impl<'a> Lw<'a> {
                         Place::Into(p) => match self.into.last().copied() {
                             Some(r) => LE::Var(r),
                             None if self.place.is_some_and(|pl| pl.owner_alias.contains_key(&p)) => self.owner_region(p).unwrap(),
-                            // Where the parameter's own storage lives.
-                            None if matches!(self.lty(&self.f.locals[p].ty), LTy::Arr(_) | LTy::Str) => {
+                            // Where the parameter's own storage lives (a
+                            // `!` method's receiver: the view's region).
+                            None if matches!(self.lty(&self.f.locals[p].ty), LTy::Arr(_)) => {
+                                let v = self.var_of(p);
+                                LE::ViewRegion(Box::new(LE::Var(v)))
+                            }
+                            None if matches!(self.lty(&self.f.locals[p].ty), LTy::Str) => {
                                 let v = self.var_of(p);
                                 LE::RegionOf(Box::new(LE::Var(v)))
                             }
@@ -1076,12 +1332,13 @@ impl<'a> Lw<'a> {
             TK::Const(_) => unreachable!("constants are typed by the checker"),
             TK::Float(v) => LE::F(*v),
             TK::PlaceAssign(l, steps, op, v) => self.place_assign(*l, steps, *op, v, e),
+            TK::Bang(l, steps, view, call) => self.bang(*l, steps, *view, call, e),
             TK::Format(pieces, args) => self.format(pieces, args),
             TK::Seq(ss) => self.scoped_value(ss, &e.ty),
             TK::Zero => zero_le(&self.lty(&e.ty)),
             TK::None => {
                 let t = self.lty(&e.ty);
-                let LTy::Tup(ts) = &t else { unreachable!() };
+                let ts = t.tup_fields();
                 let z = zero_le(&ts[1]);
                 LE::Tup(t, vec![LE::B(false), z])
             }
@@ -1392,6 +1649,99 @@ impl<'a> Lw<'a> {
     }
 
     /// A copy of an array with its own storage (elements copied as values).
+    /// Call the generated function `name` (making it on first use): its
+    /// parameters are `params`, its body what `body` makes of them. For
+    /// work on types that contain themselves (R12), which can't be done
+    /// inline. It has no region of its own: it allocates in its caller's.
+    fn helper(&mut self, name: String, params: Vec<LTy>, ret: LTy, body: impl FnOnce(&mut Lw<'a>, Vec<LE>) -> LE) -> String {
+        if HELPERS.with(|h| h.borrow_mut().insert(name.clone())) {
+            let mut w = Lw::new(self.p, self.sm, self.opts, self.f, self.mode, ErrPath::Return(vec![]), self.prog);
+            let pvs: Vec<V> = params.into_iter().map(|t| w.new_var("p", t)).collect();
+            let args: Vec<LE> = pvs.iter().map(|v| LE::Var(*v)).collect();
+            let (mut stmts, v) = w.sub_val(|w| body(w, args));
+            stmts.push(LS::Return(Some(v)));
+            let func = LFunc { name: name.clone(), params: pvs, vars: w.vars, ret, body: stmts, external: false, is_main: false, labels: w.labels };
+            self.prog.borrow_mut().funcs.push(func);
+        }
+        name
+    }
+
+    /// Slot `k` of a struct or enum value `v` of type `container` (a
+    /// boxed optional field read as an optional).
+    fn slot_read(&mut self, container: &Ty, v: LE, k: usize) -> LE {
+        let f = LE::Field(Box::new(v), k);
+        match boxed_slot(container, k) {
+            Some(x) => self.opt_unbox(f, &x),
+            None => f,
+        }
+    }
+
+    /// A boxed optional (a zero- or one-element array) as a `x?`.
+    fn opt_unbox(&mut self, b: LE, x: &Ty) -> LE {
+        let xt = self.lty(x);
+        let ot = self.lty(&Ty::Opt(Box::new(x.clone())));
+        let b = self.bind(b, LTy::Arr(Box::new(xt.clone())));
+        let o = self.tmp(ot.clone());
+        self.emit(LS::Set(o, LE::Tup(ot.clone(), vec![LE::B(false), zero_le(&xt)])));
+        let got = LE::Tup(ot, vec![LE::B(true), LE::Index { arr: Box::new(b.clone()), idx: Box::new(LE::I(0)), check: None }]);
+        self.emit(LS::If(LE::Cmp(Op::Gt, Box::new(LE::Len(Box::new(b))), Box::new(LE::I(0)), LTy::I64), vec![LS::Set(o, got)], vec![]));
+        LE::Var(o)
+    }
+
+    /// A `x?` boxed, for an optional field that leads back to its type.
+    fn opt_box(&mut self, o: LE, x: &Ty) -> LE {
+        let xt = self.lty(x);
+        let ot = self.lty(&Ty::Opt(Box::new(x.clone())));
+        let at = LTy::Arr(Box::new(xt.clone()));
+        let o = self.bind(o, ot);
+        let b = self.tmp(at);
+        self.emit(LS::Set(b, LE::ArrWithCap(xt.clone(), Box::new(LE::I(0)))));
+        let set = LS::Set(b, LE::ArrLit(xt, vec![LE::Field(Box::new(o.clone()), 1)]));
+        self.emit(LS::If(LE::Field(Box::new(o), 0), vec![set], vec![]));
+        LE::Var(b)
+    }
+
+    /// The value of a box (a one-element array), or the zero value of `t`
+    /// when it is empty (a zero interface value or closure, R13).
+    fn unbox(&mut self, b: LE, t: &LTy) -> LE {
+        let b = self.bind(b, LTy::Arr(Box::new(t.clone())));
+        let x = self.tmp(t.clone());
+        self.emit(LS::Set(x, zero_le(t)));
+        let got = LE::Index { arr: Box::new(b.clone()), idx: Box::new(LE::I(0)), check: None };
+        self.emit(LS::If(LE::Cmp(Op::Gt, Box::new(LE::Len(Box::new(b))), Box::new(LE::I(0)), LTy::I64), vec![LS::Set(x, got)], vec![]));
+        LE::Var(x)
+    }
+
+    /// Implementor `k`'s value of interface value `v` (bound) of type `it`.
+    fn iface_get(&mut self, v: LE, it: &Ty, k: usize) -> LE {
+        let f = LE::Field(Box::new(v), k + 1);
+        if !ty_recursive(it) {
+            return f;
+        }
+        let Ty::Iface(n) = it else { unreachable!() };
+        let impl_t = self.p.ifaces[n][k].0.clone();
+        let lt = self.lty(&impl_t);
+        self.unbox(f, &lt)
+    }
+
+    /// The interface value of type `it` holding `v` as implementor `k`.
+    fn make_iface(&mut self, it: &Ty, k: usize, v: LE) -> LE {
+        let lt = self.lty(it);
+        let ts = lt.tup_fields();
+        let boxed = ty_recursive(it);
+        let mut vals = vec![LE::I(k as i64)];
+        for (j, t) in ts[1..].iter().enumerate() {
+            vals.push(if j != k {
+                zero_le(t)
+            } else if boxed {
+                LE::ArrLit(t.clone().arr_elem_lty(), vec![v.clone()])
+            } else {
+                v.clone()
+            });
+        }
+        LE::Tup(lt, vals)
+    }
+
     fn copy_arr(&mut self, v: LE, el: &Ty) -> LE {
         let lt = LTy::Arr(Box::new(self.lty(el)));
         let c = self.tmp(lt);
@@ -1547,13 +1897,7 @@ impl<'a> Lw<'a> {
         if let (Ty::Iface(n), Ty::Struct(..) | Ty::Enum(..)) = (&e.ty, &f.ret) {
             let impls = self.p.ifaces.get(n).cloned().unwrap_or_default();
             let k = impls.iter().position(|(t, _)| *t == f.ret).expect("covariant result implements the interface");
-            let lt = self.lty(&e.ty);
-            let LTy::Tup(ts) = &lt else { unreachable!() };
-            let mut vals = vec![LE::I(k as i64)];
-            for (j, t) in ts[1..].iter().enumerate() {
-                vals.push(if j == k { call.clone() } else { zero_le(t) });
-            }
-            return (vec![], LE::Tup(lt, vals));
+            return (vec![], self.make_iface(&e.ty, k, call));
         }
         let Ty::Result(t) = &e.ty else { return (vec![], call) };
         if f.fallible {
@@ -1625,7 +1969,7 @@ impl<'a> Lw<'a> {
                 // A Mutex (a one-element array of lock and value) is a handle:
                 // copies share it, like channels and atomics.
                 LTy::Arr(el) if matches!(&**el, LTy::Tup(ts) if ts.first() == Some(&LTy::Lock)) => false,
-                LTy::Str | LTy::Arr(_) | LTy::PInt => true,
+                LTy::Str | LTy::Arr(_) | LTy::PInt | LTy::Rec(_) => true,
                 LTy::Tup(ts) => ts.iter().any(has_storage),
                 _ => false,
             }
@@ -1634,6 +1978,16 @@ impl<'a> Lw<'a> {
             return v;
         }
         match t {
+            // A type that contains itself: a function (copying inline would never end).
+            LTy::Rec(i) => {
+                let body = t.unrec();
+                let rt = t.clone();
+                let name = self.helper(format!("__dup_rec{i}"), vec![t.clone()], t.clone(), move |w, ps| {
+                    let fields = body.tup_fields().iter().enumerate().map(|(k, ft)| w.deep_copy(LE::Field(Box::new(ps[0].clone()), k), ft)).collect();
+                    LE::Tup(rt, fields)
+                });
+                LE::Call(name, vec![v])
+            }
             // (A one-part concatenation always copies.)
             LTy::Str => LE::Rt(Rt::StrCat, vec![v]),
             LTy::PInt => v,
@@ -2008,6 +2362,13 @@ impl<'a> Lw<'a> {
         if !ty.is_value_array() {
             return v;
         }
+        let unfolded;
+        let ty = if let Ty::Rec(_) = ty {
+            unfolded = ty.unrec();
+            &unfolded
+        } else {
+            ty
+        };
         match ty {
             Ty::Fixed(el, n) => {
                 let lt = self.lty(ty);
@@ -2045,7 +2406,8 @@ impl<'a> Lw<'a> {
             Ty::Struct(_, fs) => {
                 let lt = self.lty(ty);
                 let t = self.bind(v, lt.clone());
-                let vals = fs.iter().enumerate().map(|(k, (_, ft))| self.copy_value(LE::Field(Box::new(t.clone()), k), ft)).collect();
+                // A boxed optional field is never written through: copies share it.
+                let vals = fs.iter().enumerate().map(|(k, (_, ft))| if boxed_slot(ty, k).is_some() { LE::Field(Box::new(t.clone()), k) } else { self.copy_value(LE::Field(Box::new(t.clone()), k), ft) }).collect();
                 LE::Tup(lt, vals)
             }
             Ty::Tuple(ts) => {
@@ -2427,6 +2789,21 @@ impl<'a> Lw<'a> {
                 };
             }
         }
+        // The type at each step: the last one may be a boxed optional field.
+        let mut cur_t = self.f.locals[l].ty.clone();
+        let mut last_box = None;
+        for (k, st) in steps.iter().enumerate() {
+            let u = cur_t.unrec();
+            if let (TStep::Field(f), true) = (st, k + 1 == steps.len()) {
+                last_box = boxed_slot(&u, *f);
+            }
+            cur_t = match (st, &u) {
+                (TStep::Index(_), _) => u.arr_elem().unwrap_or(Ty::Unit),
+                (TStep::Field(f), Ty::Struct(_, fs)) => fs.get(*f).map(|x| x.1.clone()).unwrap_or(Ty::Unit),
+                (TStep::Field(f), Ty::Tuple(ts)) => ts.get(*f).cloned().unwrap_or(Ty::Unit),
+                _ => Ty::Unit,
+            };
+        }
         let pty = self.lty(&e.ty);
         let rhs = self.expr(v);
         let val = match op {
@@ -2445,10 +2822,131 @@ impl<'a> Lw<'a> {
         let val = self.bind(val, pty);
         if lsteps.is_empty() {
             self.emit(LS::Set(var, val.clone()));
+        } else if let Some(x) = last_box {
+            let b = self.opt_box(val.clone(), &x);
+            self.emit(LS::SetPlace { var, steps: lsteps, val: b });
         } else {
             self.emit(LS::SetPlace { var, steps: lsteps, val: val.clone() });
         }
         val
+    }
+
+    /// `place.m!(args)` (`TK::Bang`): `view` refers to the place for the
+    /// call (docs/notes/bang-calls.md). A copy instead (made in the region
+    /// the view would carry, written back after) where the callee might
+    /// keep its receiver past the call, and for a bare narrow-integer local
+    /// (its C variable is wider than the element a view points at).
+    fn bang(&mut self, l: LocalId, steps: &[TStep], view: LocalId, call: &TExpr, e: &TExpr) -> LE {
+        let var = self.var_of(l);
+        let mut lsteps = vec![];
+        for (k, st) in steps.iter().enumerate() {
+            match st {
+                TStep::Index(i) => {
+                    let check = if k == 0 {
+                        let arr_t = TExpr { kind: TK::Local(l), ty: self.f.locals[l].ty.clone(), span: e.span };
+                        self.index_check(&arr_t, i)
+                    } else {
+                        Some(self.loc(i.span))
+                    };
+                    let iv = self.expr(i);
+                    let iv = self.int_in_t(iv, &i.ty, i.span);
+                    let iv = self.bind(iv, LTy::I64);
+                    lsteps.push(Step::Index(iv, check));
+                }
+                TStep::Field(f) => lsteps.push(Step::Field(*f)),
+            }
+        }
+        if self.try_mode {
+            // Each index checked against the place it indexes, in order.
+            let mut cur = LE::Var(var);
+            for (st, ts) in lsteps.iter_mut().zip(steps) {
+                cur = match st {
+                    Step::Index(i, check) => {
+                        let TStep::Index(ie) = ts else { unreachable!() };
+                        self.guard(Self::out_of_bounds(&cur, i), "index out of bounds", ie.span, "IndexError", 0);
+                        *check = None;
+                        LE::Index { arr: Box::new(cur), idx: Box::new(i.clone()), check: None }
+                    }
+                    Step::Field(f) => LE::Field(Box::new(cur), *f),
+                };
+            }
+        }
+        let vv = self.var_of(view);
+        let LTy::Arr(et) = self.lty(&self.f.locals[view].ty) else { unreachable!("a view is an Arr") };
+        let et = *et;
+        // The region what the callee stores into the place must live in:
+        // the region of the array holding it (the innermost index), else
+        // (a local's own variables) where the analysis placed this site.
+        let last = lsteps.iter().rposition(|s| matches!(s, Step::Index(..)));
+        let region = match last {
+            Some(j) => LE::ViewRegion(Box::new(crate::lir::place_le(var, &lsteps[..j]))),
+            None => match self.placed(e as *const TExpr as usize) {
+                Some((r, _)) => r,
+                // The current region: by its variable where there is one
+                // (a JIT call per `!` call otherwise).
+                None => {
+                    use crate::regions::Place;
+                    match (self.ambient, self.frame) {
+                        (Place::Frame, Some((frame, _))) if self.lambda_place.is_none() => LE::Var(frame),
+                        (Place::Iter(k), Some(_)) if self.iter_vars.contains_key(&k) => LE::Var(self.iter_vars[&k].0),
+                        _ => LE::Rt(Rt::RegionCur, vec![]),
+                    }
+                }
+            },
+        };
+        let narrow = last.is_none() && matches!(et, LTy::IntK(_));
+        let escapes = self.bang_callees(call).into_iter().any(|f| self_escapes(&self.p.funcs[f]));
+        let unchecked: Vec<Step> = lsteps.iter().map(|s| match s {
+            Step::Index(i, _) => Step::Index(i.clone(), None),
+            Step::Field(f) => Step::Field(*f),
+        }).collect();
+        if escapes || narrow {
+            let r = self.bind(region, LTy::Region);
+            let saved = self.tmp(LTy::Region);
+            let cur = crate::lir::place_le(var, &lsteps);
+            self.emit(LS::RegionUse { region: r, saved });
+            self.emit(LS::Set(vv, LE::ArrLit(et, vec![cur])));
+            self.emit(LS::RegionRestore(saved));
+        } else {
+            let r = self.bind(region, LTy::Region);
+            self.emit(LS::View { dst: vv, var, steps: lsteps, ty: et, region: r });
+        }
+        let rt = self.lty(&e.ty);
+        let v = self.expr(call);
+        let out = if rt == LTy::Unit {
+            if !matches!(v, LE::Unit | LE::Var(_) | LE::I(_) | LE::B(_)) {
+                self.emit(LS::Eval(v));
+            }
+            LE::Unit
+        } else {
+            let o = self.tmp(rt.clone());
+            self.emit(LS::Set(o, v));
+            LE::Var(o)
+        };
+        if escapes || narrow {
+            let back = LE::Index { arr: Box::new(LE::Var(vv)), idx: Box::new(LE::I(0)), check: None };
+            if unchecked.is_empty() {
+                self.emit(LS::Set(var, back));
+            } else {
+                self.emit(LS::SetPlace { var, steps: unchecked, val: back });
+            }
+        } else {
+            self.emit(LS::Unview { dst: vv, var, steps: unchecked });
+        }
+        out
+    }
+
+    /// The functions a `!` call (`TK::Bang`'s call) may run.
+    fn bang_callees(&self, call: &TExpr) -> Vec<FuncId> {
+        match &call.kind {
+            TK::Call(f, _) => vec![*f],
+            TK::M(M::IfaceCall(mi), Some(r), ..) => {
+                let Ty::Array(it) = &r.ty else { return vec![] };
+                let Ty::Iface(iname) = &**it else { return vec![] };
+                self.p.ifaces.get(iname).into_iter().flatten().filter_map(|(_, fids)| fids.get(*mi).copied()).collect()
+            }
+            _ => vec![],
+        }
     }
 
     /// `a op b` on promoted Ints. Under `~`, a zero divisor and a negative
@@ -2566,6 +3064,25 @@ impl<'a> Lw<'a> {
         if *t == Ty::Error {
             return self.error_message(v);
         }
+        let unfolded;
+        let t = if let Ty::Rec(_) = t {
+            unfolded = t.unrec();
+            &unfolded
+        } else {
+            t
+        };
+        // A type that contains itself: a function (printing inline would never end).
+        if matches!(t, Ty::Struct(..) | Ty::Enum(..) | Ty::Iface(_)) && ty_recursive(t) {
+            let lt = self.lty(t);
+            let LTy::Rec(i) = lt else { unreachable!() };
+            let t2 = t.clone();
+            let name = self.helper(format!("__to_s_rec{i}"), vec![lt], LTy::Str, move |w, ps| w.to_s_parts(ps[0].clone(), &t2));
+            return LE::Call(name, vec![v]);
+        }
+        self.to_s_parts(v, t)
+    }
+
+    fn to_s_parts(&mut self, v: LE, t: &Ty) -> LE {
         match t {
             Ty::Opt(inner) => {
                 let lt = self.lty(t);
@@ -2603,7 +3120,8 @@ impl<'a> Lw<'a> {
                 self.emit(LS::Set(s, LE::S(String::new())));
                 for (k, (it, _)) in impls.iter().enumerate() {
                     let body = self.sub(|lw| {
-                        let v = lw.to_s(LE::Field(Box::new(x.clone()), k + 1), it);
+                        let v = lw.iface_get(x.clone(), t, k);
+                        let v = lw.to_s(v, it);
                         lw.emit(LS::Set(s, v));
                     });
                     self.emit(LS::If(LE::Cmp(Op::Eq, Box::new(LE::Field(Box::new(x.clone()), 0)), Box::new(LE::I(k as i64)), LTy::I64), body, vec![]));
@@ -2617,7 +3135,7 @@ impl<'a> Lw<'a> {
                 let tag = LE::Field(Box::new(x.clone()), 0);
                 let mut slot = 1;
                 let mut shown = vec![];
-                for (name, fs) in vs {
+                for (name, fs) in vs.iter() {
                     let s = if fs.is_empty() {
                         LE::S(name.clone())
                     } else {
@@ -2626,7 +3144,8 @@ impl<'a> Lw<'a> {
                             if j > 0 {
                                 parts.push(LE::S(", ".into()));
                             }
-                            let f = self.to_s(LE::Field(Box::new(x.clone()), slot + j), ft);
+                            let f = self.slot_read(t, x.clone(), slot + j);
+                            let f = self.to_s(f, ft);
                             let fv = self.tmp(LTy::Str);
                             self.emit(LS::Set(fv, f));
                             parts.push(LE::Var(fv));
@@ -2657,7 +3176,8 @@ impl<'a> Lw<'a> {
                     if k > 0 {
                         parts.push(LE::S(" ".into()));
                     }
-                    let fs = self.to_s(LE::Field(Box::new(x.clone()), k), ft);
+                    let fs = self.slot_read(t, x.clone(), k);
+                    let fs = self.to_s(fs, ft);
                     let fv = self.tmp(LTy::Str);
                     self.emit(LS::Set(fv, fs));
                     parts.push(LE::Var(fv));
@@ -3004,7 +3524,14 @@ impl<'a> Lw<'a> {
             }
             StructNew => {
                 let t = self.lty(&e.ty);
-                let vs = args.iter().map(|a| self.arg(a)).collect();
+                let mut vs = vec![];
+                for (k, a) in args.iter().enumerate() {
+                    let v = self.arg(a);
+                    vs.push(match boxed_slot(&e.ty, k) {
+                        Some(x) => self.opt_box(v, &x),
+                        None => v,
+                    });
+                }
                 LE::Tup(t, vs)
             }
             OptPresent => LE::Field(Box::new(self.expr(recv.unwrap())), 0),
@@ -3075,11 +3602,21 @@ impl<'a> Lw<'a> {
                 let func = LFunc { name: format!("__lambda_{g}"), params, vars: std::mem::take(&mut w.vars), ret, body, external: false, is_main: false, labels: w.labels };
                 self.prog.borrow_mut().funcs.push(func);
                 let lt = self.lty(&e.ty);
-                let LTy::Tup(ts) = &lt else { unreachable!() };
+                let ts = lt.tup_fields();
                 let caps: Vec<LE> = args.iter().map(|a| self.arg(a)).collect();
+                // A closure type that contains itself (R12) holds each
+                // lambda's captures in a box.
+                let boxed = ty_recursive(&e.ty);
                 let mut vals = vec![LE::I(tag as i64)];
                 for (j, t) in ts[1..].iter().enumerate() {
-                    vals.push(if j == tag { LE::Tup(t.clone(), caps.clone()) } else { zero_le(t) });
+                    vals.push(if j != tag {
+                        zero_le(t)
+                    } else if boxed {
+                        let ct = t.clone().arr_elem_lty();
+                        LE::ArrLit(ct.clone(), vec![LE::Tup(ct, caps.clone())])
+                    } else {
+                        LE::Tup(t.clone(), caps.clone())
+                    });
                 }
                 LE::Tup(lt, vals)
             }
@@ -3098,8 +3635,21 @@ impl<'a> Lw<'a> {
                     self.emit(LS::Set(o, zero_le(&rt)));
                 }
                 let tag = LE::Field(Box::new(fv.clone()), 0);
+                let boxed = ty_recursive(&f.ty);
+                let fts = self.lty(&f.ty).tup_fields();
                 for (k, (g, caps)) in lambda_sites(&f.ty).iter().enumerate() {
                     let env = LE::Field(Box::new(fv.clone()), k + 1);
+                    let env = if boxed {
+                        let ct = fts[k + 1].clone().arr_elem_lty();
+                        let (pre, env) = self.sub_val(|lw| lw.unbox(env, &ct));
+                        let env_v = self.tmp(ct.clone());
+                        let mut pre = pre;
+                        pre.push(LS::Set(env_v, env));
+                        self.emit(LS::If(LE::Cmp(Op::Eq, Box::new(tag.clone()), Box::new(LE::I(k as i64)), LTy::I64), pre, vec![]));
+                        LE::Var(env_v)
+                    } else {
+                        env
+                    };
                     let cargs = (0..caps.len()).map(|j| LE::Field(Box::new(env.clone()), j)).chain(avs.iter().cloned()).collect();
                     let call = LE::Call(format!("__lambda_{g}"), cargs);
                     let st = match out {
@@ -3465,19 +4015,38 @@ impl<'a> Lw<'a> {
                 }
             }
             ToIface(k) => {
-                let lt = self.lty(&e.ty);
-                let LTy::Tup(ts) = &lt else { unreachable!() };
                 let v = self.arg(recv.unwrap());
-                let mut vals = vec![LE::I(k as i64)];
-                for (j, t) in ts[1..].iter().enumerate() {
-                    vals.push(if j == k { v.clone() } else { zero_le(t) });
-                }
-                LE::Tup(lt, vals)
+                self.make_iface(&e.ty, k, v)
+            }
+            IfaceEq => {
+                // The same implementor, and its `__eq` of the two values (#108).
+                let r = recv.unwrap();
+                let Ty::Iface(n) = &r.ty else { unreachable!() };
+                let lt = self.lty(&r.ty);
+                let a = self.expr(r);
+                let a = self.bind(a, lt.clone());
+                let b = self.expr(&args[0]);
+                let b = self.bind(b, lt);
+                let out = self.tmp(LTy::Bool);
+                self.emit(LS::Set(out, LE::B(false)));
+                let eqs = self.p.iface_eqs.get(n).cloned().unwrap_or_default();
+                let tag_a = LE::Field(Box::new(a.clone()), 0);
+                let same = LE::Cmp(Op::Eq, Box::new(tag_a.clone()), Box::new(LE::Field(Box::new(b.clone()), 0)), LTy::I64);
+                let body = self.sub(|lw| {
+                    for (k, fid) in eqs.iter().enumerate() {
+                        let arm = lw.sub(|lw| {
+                            let (x, y) = (lw.iface_get(a.clone(), &r.ty, k), lw.iface_get(b.clone(), &r.ty, k));
+                            lw.emit(LS::Set(out, LE::Call(lw.p.funcs[*fid].cname.clone(), vec![x, y])));
+                        });
+                        lw.emit(LS::If(LE::Cmp(Op::Eq, Box::new(tag_a.clone()), Box::new(LE::I(k as i64)), LTy::I64), arm, vec![]));
+                    }
+                });
+                self.emit(LS::If(same, body, vec![]));
+                LE::Var(out)
             }
             IfaceCall(mi) if matches!(recv.unwrap().ty, Ty::Array(_)) => {
-                // A `!` method: the receiver is a one-element slice holding the
-                // interface value; each implementor's method gets a slice of its
-                // own type (in the same region), which is written back.
+                // A `!` method: the receiver is a view of the interface value;
+                // each implementor's method gets a view of the value inside it.
                 let r = recv.unwrap();
                 let Ty::Array(it) = &r.ty else { unreachable!() };
                 let Ty::Iface(iname) = &**it else { unreachable!() };
@@ -3496,15 +4065,27 @@ impl<'a> Lw<'a> {
                 }
                 let held = LE::Index { arr: Box::new(LE::Var(tv)), idx: Box::new(LE::I(0)), check: None };
                 let tag = LE::Field(Box::new(held.clone()), 0);
+                let boxed = ty_recursive(it);
                 for (k, (ty, fids)) in impls.iter().enumerate() {
                     let ct = self.lty(ty);
                     let cell = self.tmp(LTy::Arr(Box::new(ct.clone())));
                     let f = self.p.funcs[fids[mi]].cname.clone();
+                    let escapes = self_escapes(&self.p.funcs[fids[mi]]);
                     let body = self.sub(|lw| {
-                        let saved = lw.tmp(LTy::Region);
-                        lw.emit(LS::RegionUse { region: LE::RegionOf(Box::new(LE::Var(tv))), saved });
-                        lw.emit(LS::Set(cell, LE::ArrLit(ct.clone(), vec![LE::Field(Box::new(held.clone()), k + 1)])));
-                        lw.emit(LS::RegionRestore(saved));
+                        let steps = vec![crate::lir::Step::Index(LE::I(0), None), crate::lir::Step::Field(k + 1)];
+                        let region = LE::ViewRegion(Box::new(LE::Var(tv)));
+                        if escapes || boxed {
+                            // The method may keep its receiver (or the value sits in a
+                            // box that may be empty, R13): a copy, written back.
+                            let saved = lw.tmp(LTy::Region);
+                            lw.emit(LS::RegionUse { region, saved });
+                            let cur = lw.iface_get(held.clone(), it, k);
+                            lw.emit(LS::Set(cell, LE::ArrLit(ct.clone(), vec![cur])));
+                            lw.emit(LS::RegionRestore(saved));
+                        } else {
+                            let r = lw.bind(region, LTy::Region);
+                            lw.emit(LS::View { dst: cell, var: tv, steps: steps.clone(), ty: ct.clone(), region: r });
+                        }
                         let call = LE::Call(f.clone(), std::iter::once(LE::Var(cell)).chain(avs.iter().cloned()).collect());
                         let (pre, call) = lw.iface_result(e, fids[mi], call);
                         for st in pre {
@@ -3514,8 +4095,15 @@ impl<'a> Lw<'a> {
                             Some(o) => lw.emit(LS::Set(o, call)),
                             None => lw.emit(LS::Eval(call)),
                         }
-                        let back = LE::Index { arr: Box::new(LE::Var(cell)), idx: Box::new(LE::I(0)), check: None };
-                        lw.emit(LS::SetPlace { var: tv, steps: vec![crate::lir::Step::Index(LE::I(0), None), crate::lir::Step::Field(k + 1)], val: back });
+                        if boxed {
+                            // A boxed implementor (R13): the cell is its new box.
+                            lw.emit(LS::SetPlace { var: tv, steps, val: LE::Var(cell) });
+                        } else if escapes {
+                            let back = LE::Index { arr: Box::new(LE::Var(cell)), idx: Box::new(LE::I(0)), check: None };
+                            lw.emit(LS::SetPlace { var: tv, steps, val: back });
+                        } else {
+                            lw.emit(LS::Unview { dst: cell, var: tv, steps });
+                        }
                     });
                     self.emit(LS::If(LE::Cmp(Op::Eq, Box::new(tag.clone()), Box::new(LE::I(k as i64)), LTy::I64), body, vec![]));
                 }
@@ -3529,12 +4117,15 @@ impl<'a> Lw<'a> {
                 let rv = self.expr(r);
                 let rv = self.bind(rv, self.lty(&r.ty));
                 let t = self.lty(&e.ty);
-                let LTy::Tup(ts) = &t else { unreachable!() };
+                let ts = t.tup_fields();
                 let out = self.tmp(t.clone());
                 self.emit(LS::Set(out, LE::Tup(t.clone(), vec![LE::B(false), zero_le(&ts[1])])));
                 let tag = LE::Field(Box::new(rv.clone()), 0);
-                let got = LS::Set(out, LE::Tup(t.clone(), vec![LE::B(true), LE::Field(Box::new(rv), k + 1)]));
-                self.emit(LS::If(LE::Cmp(Op::Eq, Box::new(tag), Box::new(LE::I(k as i64)), LTy::I64), vec![got], vec![]));
+                let arm = self.sub(|lw| {
+                    let v = lw.iface_get(rv.clone(), &r.ty, k);
+                    lw.emit(LS::Set(out, LE::Tup(t.clone(), vec![LE::B(true), v])));
+                });
+                self.emit(LS::If(LE::Cmp(Op::Eq, Box::new(tag), Box::new(LE::I(k as i64)), LTy::I64), arm, vec![]));
                 LE::Var(out)
             }
             IfaceCall(mi) => {
@@ -3555,14 +4146,20 @@ impl<'a> Lw<'a> {
                 }
                 let tag = LE::Field(Box::new(rv.clone()), 0);
                 for (k, (_, fids)) in impls.iter().enumerate() {
-                    let f = &self.p.funcs[fids[mi]];
-                    let call = LE::Call(f.cname.clone(), std::iter::once(LE::Field(Box::new(rv.clone()), k + 1)).chain(avs.iter().cloned()).collect());
-                    let (mut sts, call) = self.iface_result(e, fids[mi], call);
-                    sts.push(match out {
-                        Some(o) => LS::Set(o, call),
-                        None => LS::Eval(call),
+                    let fname = self.p.funcs[fids[mi]].cname.clone();
+                    let arm = self.sub(|lw| {
+                        let me = lw.iface_get(rv.clone(), &r.ty, k);
+                        let call = LE::Call(fname, std::iter::once(me).chain(avs.iter().cloned()).collect());
+                        let (sts, call) = lw.iface_result(e, fids[mi], call);
+                        for st in sts {
+                            lw.emit(st);
+                        }
+                        lw.emit(match out {
+                            Some(o) => LS::Set(o, call),
+                            None => LS::Eval(call),
+                        });
                     });
-                    self.emit(LS::If(LE::Cmp(Op::Eq, Box::new(tag.clone()), Box::new(LE::I(k as i64)), LTy::I64), sts, vec![]));
+                    self.emit(LS::If(LE::Cmp(Op::Eq, Box::new(tag.clone()), Box::new(LE::I(k as i64)), LTy::I64), arm, vec![]));
                 }
                 match out {
                     Some(o) => LE::Var(o),
@@ -3572,8 +4169,17 @@ impl<'a> Lw<'a> {
             VariantNew(k) => {
                 let lt = self.lty(&e.ty);
                 let mut vals = vec![LE::I(k as i64)];
-                for a in args {
-                    vals.push(self.arg(a));
+                for (j, a) in args.iter().enumerate() {
+                    let v = match (boxed_slot(&e.ty, j + 1), &a.kind) {
+                        // Another variant's slot: an empty box.
+                        (Some(x), TK::None | TK::Zero) => LE::ArrWithCap(self.lty(&x), Box::new(LE::I(0))),
+                        (Some(x), _) => {
+                            let v = self.arg(a);
+                            self.opt_box(v, &x)
+                        }
+                        (None, _) => self.arg(a),
+                    };
+                    vals.push(v);
                 }
                 LE::Tup(lt, vals)
             }
@@ -3582,7 +4188,13 @@ impl<'a> Lw<'a> {
                 self.int_out(LE::Field(Box::new(v), 0))
             }
             TupleGet(k) => {
-                let v = self.expr(recv.unwrap());
+                let r = recv.unwrap();
+                let v = self.expr(r);
+                if boxed_slot(&r.ty, k).is_some() {
+                    let lt = self.lty(&r.ty);
+                    let v = self.bind(v, lt);
+                    return self.slot_read(&r.ty, v, k);
+                }
                 LE::Field(Box::new(v), k)
             }
             Push => {
@@ -3698,8 +4310,10 @@ impl<'a> Lw<'a> {
                 LE::Cmp(Op::Eq, Box::new(LE::Field(Box::new(v), 0)), Box::new(LE::I(k as i64)), LTy::I64)
             }
             IfaceAs(k) => {
-                let v = self.expr(recv.unwrap());
-                LE::Field(Box::new(v), 1 + k)
+                let r = recv.unwrap();
+                let v = self.expr(r);
+                let v = self.bind(v, self.lty(&r.ty));
+                self.iface_get(v, &r.ty, k)
             }
             ResOk | ResErr | ResIsOk | ResUnwrap | ResUnwrapOr | ResRescue => {
                 let r = recv.unwrap();
@@ -4651,8 +5265,11 @@ pub(crate) fn collect_locals(e: &TExpr, out: &mut Vec<LocalId>) {
         }
         TK::Call(_, xs) | TK::Array(xs) | TK::Format(_, xs) => xs.iter().for_each(|x| collect_locals(x, out)),
         TK::Seq(ss) => ss.iter().for_each(|s| collect_locals_stmt(s, out)),
-        TK::PlaceAssign(l, steps, _, v) => {
+        TK::PlaceAssign(l, steps, _, v) | TK::Bang(l, steps, _, v) => {
             out.push(*l);
+            if let TK::Bang(_, _, view, _) = &e.kind {
+                out.push(*view);
+            }
             for st in steps {
                 if let TStep::Index(i) = st {
                     collect_locals(i, out);
@@ -4736,6 +5353,7 @@ fn zero_le(t: &LTy) -> LE {
         LTy::PInt => LE::ToP(Box::new(LE::I(0))),
         LTy::Arr(e) => LE::ArrWithCap((**e).clone(), Box::new(LE::I(0))),
         LTy::Tup(ts) => LE::Tup(t.clone(), ts.iter().map(zero_le).collect()),
+        LTy::Rec(_) => LE::Tup(t.clone(), t.tup_fields().iter().map(zero_le).collect()),
         LTy::Range => LE::Range(Box::new(LE::I(0)), Box::new(LE::I(0)), false),
         LTy::Gen(_) => panic!("an optional generator has no zero value yet"),
     }
@@ -4743,7 +5361,7 @@ fn zero_le(t: &LTy) -> LE {
 
 fn lty_has_storage(t: &LTy) -> bool {
     match t {
-        LTy::Str | LTy::Arr(_) | LTy::PInt | LTy::Gen(_) => true,
+        LTy::Str | LTy::Arr(_) | LTy::PInt | LTy::Gen(_) | LTy::Rec(_) => true,
         LTy::Tup(ts) => ts.iter().any(lty_has_storage),
         _ => false,
     }
@@ -4757,7 +5375,7 @@ fn le_allocates(e: &LE, rets: &(std::collections::HashSet<String>, std::collecti
     match e {
         LE::Var(_) | LE::I(_) | LE::F(_) | LE::B(_) | LE::S(_) | LE::SB(_) | LE::Loc(_) | LE::Unit | LE::RegionProgram | LE::Global(_) => false,
         LE::Tup(_, xs) | LE::Prim(_, xs) => any(xs),
-        LE::Field(x, _) | LE::Neg(x, _) | LE::FNeg(x) | LE::Not(x) | LE::Len(x) | LE::RangeField(x, _) | LE::ChanLen(x) | LE::LockPoisoned(x) | LE::AtomicLoad(x) | LE::RegionOf(x) | LE::RegionBytes(x) => one(x),
+        LE::Field(x, _) | LE::Neg(x, _) | LE::FNeg(x) | LE::Not(x) | LE::Len(x) | LE::RangeField(x, _) | LE::ChanLen(x) | LE::LockPoisoned(x) | LE::AtomicLoad(x) | LE::RegionOf(x) | LE::ViewRegion(x) | LE::RegionBytes(x) => one(x),
         LE::Arith(_, a, b, _) | LE::Cmp(_, a, b, _) | LE::FArith(_, a, b) | LE::Range(a, b, _) => one(a) || one(b),
         LE::Cond(a, b, c) => one(a) || one(b) || one(c),
         LE::Index { arr, idx, .. } => one(arr) || one(idx),
@@ -4820,7 +5438,8 @@ fn frame_allocates(body: &[LS], frame: V, rets: &(std::collections::HashSet<Stri
                     *cur = *cur || c2;
                     false
                 }
-                LS::Break(_) | LS::Continue(_) | LS::Panic(..) | LS::RegionFree(_) => false,
+                LS::Break(_) | LS::Continue(_) | LS::Panic(..) | LS::RegionFree(_) | LS::Unview { .. } => false,
+                LS::View { region, .. } => *cur && alloc(region),
                 _ => *cur,
             };
             if hit {
@@ -4872,7 +5491,8 @@ fn stmts_allocate(ss: &[LS], rets: &(std::collections::HashSet<String>, std::col
         LS::SetIndex { idx, val, .. } => alloc(idx) || alloc(val),
         LS::If(c, a, b) => alloc(c) || stmts_allocate(a, rets) || stmts_allocate(b, rets),
         LS::Loop(_, b) => stmts_allocate(b, rets),
-        LS::Break(_) | LS::Continue(_) => false,
+        LS::Break(_) | LS::Continue(_) | LS::Unview { .. } => false,
+        LS::View { region, .. } => alloc(region),
         _ => true,
     })
 }
@@ -4991,7 +5611,8 @@ fn iter_light_ok(body: &[LS], r: V, rets: &(std::collections::HashSet<String>, s
                 _ if !open => false,
                 LS::Break(_) | LS::Continue(_) | LS::Panic(..) => false,
                 LS::Set(_, e) | LS::Eval(e) | LS::Return(Some(e)) | LS::Puts(e, _) | LS::Print(e) | LS::Die(e) | LS::PanicStr(e) | LS::Exit(e) => calls_storing(e, sp) || (*st == St::Other && alloc(e)),
-                LS::Return(None) => false,
+                LS::Return(None) | LS::Unview { .. } => false,
+                LS::View { region, .. } => calls_storing(region, sp) || (*st == St::Other && alloc(region)),
                 LS::SetIndex { idx, val, .. } => calls_storing(idx, sp) || calls_storing(val, sp) || (*st == St::Other && (alloc(idx) || alloc(val))),
                 LS::Push(_, e) => calls_storing(e, sp) || *st == St::Other,
                 _ => true,
@@ -5010,7 +5631,7 @@ fn visit_le(e: &LE, f: &mut dyn FnMut(&LE)) {
     f(e);
     match e {
         LE::Tup(_, xs) | LE::Prim(_, xs) | LE::Call(_, xs) | LE::Ffi(_, xs) | LE::Rt(_, xs) | LE::ArrLit(_, xs) | LE::GenNew(_, xs) => xs.iter().for_each(|x| visit_le(x, f)),
-        LE::Field(x, _) | LE::Neg(x, _) | LE::FNeg(x) | LE::Not(x) | LE::Len(x) | LE::RangeField(x, _) | LE::ChanLen(x) | LE::LockPoisoned(x) | LE::AtomicLoad(x) | LE::RegionOf(x) | LE::RegionBytes(x) | LE::RegionNew(x) | LE::ToP(x) | LE::AtomicNew(x) | LE::ArrWithCap(_, x) | LE::ChanNew(_, x) => visit_le(x, f),
+        LE::Field(x, _) | LE::Neg(x, _) | LE::FNeg(x) | LE::Not(x) | LE::Len(x) | LE::RangeField(x, _) | LE::ChanLen(x) | LE::LockPoisoned(x) | LE::AtomicLoad(x) | LE::RegionOf(x) | LE::ViewRegion(x) | LE::RegionBytes(x) | LE::RegionNew(x) | LE::ToP(x) | LE::AtomicNew(x) | LE::ArrWithCap(_, x) | LE::ChanNew(_, x) => visit_le(x, f),
         LE::Arith(_, a, b, _) | LE::Cmp(_, a, b, _) | LE::FArith(_, a, b) | LE::PArith(_, a, b) | LE::Range(a, b, _) | LE::AtomicRmw(_, a, b) | LE::ArrNew(_, a, b, _) => {
             visit_le(a, f);
             visit_le(b, f);
@@ -5057,6 +5678,47 @@ fn light_iter(ss: &mut Vec<LS>, r: V, mark: V, larges: V) {
         }
     }
     *ss = out;
+}
+
+/// Can a `!` method keep its receiver (the view of its caller's place)
+/// past the call? Only through `self` itself, the one-element slice: a
+/// lambda, task or generator capturing it, or a copy of it stored
+/// somewhere. Its other uses (`self[0]`, places under it, receivers of
+/// further `!` calls) end with the call.
+pub(crate) fn self_escapes(f: &TFunc) -> bool {
+    let Some(&me) = f.params.first() else { return false };
+    if !f.src_name.ends_with('!') || f.locals[me].name != "self" || !matches!(f.locals[me].ty, Ty::Array(_)) {
+        return false;
+    }
+    fn walk(e: &TExpr, me: LocalId, hit: &mut bool) {
+        if *hit {
+            return;
+        }
+        match &e.kind {
+            TK::Local(l) if *l == me => {
+                *hit = true;
+                return;
+            }
+            // `self[0]`.
+            TK::Index(a, i) if matches!(a.kind, TK::Local(l) if l == me) => {
+                walk(i, me, hit);
+                return;
+            }
+            // The receiver of a `!` call: a view of `self[0]`'s place, or
+            // `self` passed through (its first argument).
+            TK::Call(_, args) if matches!(args.first().map(|a| &a.kind), Some(TK::Local(l)) if *l == me) => {
+                args[1..].iter().for_each(|a| walk(a, me, hit));
+                return;
+            }
+            _ => {}
+        }
+        crate::prove::each_child(e, &mut |c| walk(c, me, hit));
+    }
+    let mut hit = false;
+    for s in &f.body {
+        crate::prove::stmt_exprs(s, &mut |e| walk(e, me, &mut hit));
+    }
+    hit
 }
 
 /// The range of an integer type narrower than 64 bits (I64, U64: none).

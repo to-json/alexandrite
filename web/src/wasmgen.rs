@@ -211,6 +211,8 @@ fn lay(t: &LTy) -> Lay {
             }
             Lay { size: off.next_multiple_of(align).max(1), align, fields }
         }
+        // A type that contains itself (R12): laid out as its body.
+        LTy::Rec(_) => lay(&t.unrec()),
     }
 }
 
@@ -338,7 +340,9 @@ pub fn browser_rt(x: &FfiSig) -> Option<&'static str> {
 }
 
 pub fn emit(p: &LProgram) -> Result<Vec<u8>, String> {
+    alx::lir::set_recs(&p.recs);
     let mut owned = p.clone();
+    alx::lir::copy_views(&mut owned);
     let info = suspend::prepare(&mut owned)?;
     let p = &owned;
     rt::sh().consts.clear();
@@ -1243,6 +1247,7 @@ impl<'c, 'p> Fx<'c, 'p> {
                 self.store(&t, base, 0, &vals);
             }
             LS::RegionFree(_) => {}
+            LS::View { .. } | LS::Unview { .. } => unreachable!("copy_views ran first"),
             LS::RegionEnter { .. } | LS::RegionExit { .. } | LS::RegionUse { .. } | LS::RegionRestore(_) => {}
             LS::Spawn { dst, worker, env } => {
                 let p = self.boxed(env);
@@ -1304,7 +1309,7 @@ impl<'c, 'p> Fx<'c, 'p> {
                 for st in steps {
                     match st {
                         Step::Field(k) => {
-                            let LTy::Tup(ts) = ty.clone() else { panic!("wasmgen: field of {ty:?}") };
+                            let LTy::Tup(ts) = ty.unrec() else { panic!("wasmgen: field of {ty:?}") };
                             match &mut mem {
                                 None => start += ts[..*k].iter().map(|t| vts(t).len()).sum::<usize>(),
                                 Some((_, off)) => *off += field_offset(&ty, *k),
@@ -1739,7 +1744,7 @@ impl<'c, 'p> Fx<'c, 'p> {
         match e {
             LE::RegionNew(_) => self.i64c(0),
             LE::RegionBytes(_) => self.i64c(0),
-            LE::RegionOf(_) => self.i64c(0),
+            LE::RegionOf(_) | LE::ViewRegion(_) => self.i64c(0),
             // The browser never frees: regions are no-ops (handle 0).
             LE::RegionProgram => self.i64c(0),
             LE::Ffi(i, args) => {
@@ -1951,12 +1956,12 @@ impl<'c, 'p> Fx<'c, 'p> {
                 let a = self.eval_locals(arr);
                 let iv = self.eval_locals(idx)[0];
                 let addr = self.elem_addr(a[0], a[1], iv, &et, check.as_deref());
-                let LTy::Tup(ts) = &et else { unreachable!() };
+                let LTy::Tup(ts) = &et.unrec() else { unreachable!() };
                 let off = field_offset(&et, *i);
                 self.load(&ts[*i].clone(), addr, off);
             }
             LE::Field(x, i) => {
-                let LTy::Tup(ts) = self.ty(x) else { unreachable!() };
+                let LTy::Tup(ts) = self.ty(x).unrec() else { unreachable!() };
                 let ls = self.eval_locals(x);
                 let start: usize = ts[..*i].iter().map(|t| vts(t).len()).sum();
                 let n = vts(&ts[*i]).len();
@@ -2405,7 +2410,7 @@ pub(crate) fn ty_of(tys: &Tys, vars: &[LVar], e: &LE) -> LTy {
         LE::AtomicCas(..) => LTy::Bool,
         LE::RegionNew(_) => LTy::Region,
         LE::RegionBytes(_) => LTy::I64,
-        LE::RegionOf(_) => LTy::Region,
+        LE::RegionOf(_) | LE::ViewRegion(_) => LTy::Region,
         LE::RegionProgram => LTy::Region,
         LE::ChanNew(t, _) => LTy::Chan(Box::new(t.clone())),
         LE::ChanLen(_) => LTy::I64,
@@ -2419,7 +2424,7 @@ pub(crate) fn ty_of(tys: &Tys, vars: &[LVar], e: &LE) -> LTy {
         LE::B(_) | LE::Cmp(..) | LE::Not(_) => LTy::Bool,
         LE::Unit => LTy::Unit,
         LE::Tup(t, _) => t.clone(),
-        LE::Field(x, i) => match ty(x) {
+        LE::Field(x, i) => match ty(x).unrec() {
             LTy::Tup(ts) => ts[*i].clone(),
             t => panic!("wasmgen: field of {t:?}"),
         },
@@ -2469,6 +2474,8 @@ pub(crate) fn ty_of(tys: &Tys, vars: &[LVar], e: &LE) -> LTy {
 
 /// Byte offset of field `k` of a tuple type (C layout).
 fn field_offset(t: &LTy, k: usize) -> u32 {
+    let t = &t.unrec();
+    let t = &t.unrec();
     let LTy::Tup(ts) = t else { panic!("wasmgen: field of {t:?}") };
     let mut off = 0u32;
     for (i, ft) in ts.iter().enumerate() {

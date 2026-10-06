@@ -72,6 +72,9 @@ fn convert_fn(f: &mut TFunc) {
 /// A zero value of a type, if it's simple to build here.
 fn zero(t: &Ty) -> Option<TExpr> {
     let sp = crate::diag::Span::default();
+    if let Ty::Rec(_) = t {
+        return zero(&t.unrec());
+    }
     let kind = match t {
         Ty::Int | Ty::IntK(_) => TK::Int(0),
         Ty::Float => TK::Float(0.0),
@@ -110,17 +113,23 @@ fn scan_expr(e: &TExpr, by_task: &mut HashSet<LocalId>, multi: &mut HashSet<Loca
             by_task.extend(ls);
         }
     }
-    if let TK::M(_, _, _, Some(b)) = &e.kind {
-        for s in &b.body {
-            scan_stmt(s, by_task, multi);
+    // A block's or a Seq's statements go through scan_stmt (multiple
+    // assignment); `each_child` would visit them again, which doubles the
+    // work at every level of nesting.
+    match &e.kind {
+        TK::M(_, r, args, Some(b)) => {
+            r.iter().map(|r| &**r).chain(args).for_each(|c| scan_expr(c, by_task, multi));
+            for s in &b.body {
+                scan_stmt(s, by_task, multi);
+            }
         }
-    }
-    if let TK::Seq(ss) = &e.kind {
-        for s in ss {
-            scan_stmt(s, by_task, multi);
+        TK::Seq(ss) => {
+            for s in ss {
+                scan_stmt(s, by_task, multi);
+            }
         }
+        _ => crate::prove::each_child(e, &mut |c| scan_expr(c, by_task, multi)),
     }
-    crate::prove::each_child(e, &mut |c| scan_expr(c, by_task, multi));
 }
 
 struct Rewriter<'a> {
@@ -210,7 +219,7 @@ impl Rewriter<'_> {
                     self.stmts(&mut b.body);
                 }
             }
-            TK::PlaceAssign(_, steps, _, v) => {
+            TK::PlaceAssign(_, steps, _, v) | TK::Bang(_, steps, _, v) => {
                 for st in steps.iter_mut() {
                     if let TStep::Index(i) = st {
                         self.expr(i);
@@ -255,6 +264,12 @@ impl Rewriter<'_> {
                 let mut st = vec![TStep::Index(z)];
                 st.extend(steps.iter().cloned());
                 TExpr { kind: TK::PlaceAssign(*c, st, *op, v.clone()), ty: e.ty.clone(), span: sp }
+            }),
+            TK::Bang(l, steps, view, call) => self.cells.get(l).map(|c| {
+                let z = TExpr { kind: TK::Int(0), ty: Ty::Int, span: sp };
+                let mut st = vec![TStep::Index(z)];
+                st.extend(steps.iter().cloned());
+                TExpr { kind: TK::Bang(*c, st, *view, call.clone()), ty: e.ty.clone(), span: sp }
             }),
             // `xs << v` on a cell variable: through a temporary, written back.
             TK::M(M::Push, Some(recv), args, None) => match recv.kind {

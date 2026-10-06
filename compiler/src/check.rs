@@ -7,6 +7,7 @@
 //! records the concrete types it learned per binding site and the next pass
 //! starts from them. Only the final pass reports errors.
 
+use std::rc::Rc;
 use crate::ast::*;
 use crate::consts;
 use crate::diag::{Diag, SourceMap, Span};
@@ -198,6 +199,8 @@ pub struct World<'a> {
     /// R11: package-level `Atomic[T]` / `Mutex[T]` values, in declaration
     /// order (each package after its imports, the main file last).
     pub vars: Vec<VarInfo>,
+    /// Interfaces whose values are compared with `==` (`iface_eq_instances`).
+    pub eq_ifaces: Vec<String>,
 }
 
 /// A package-level `Atomic[T]` / `Mutex[T]` (R11): the global holding it
@@ -334,8 +337,9 @@ impl<'a> World<'a> {
             }
         }
         GENERICS.with(|g| g.borrow_mut().clear());
+        RECS.with(|r| r.borrow_mut().clear());
         INSTS.with(|g| g.borrow_mut().clear());
-        Ok(World { sm, defs, by_name, instances: HashMap::new(), declared_errs: HashMap::new(), funcs: vec![], sigs: HashMap::new(), fatal: None, structs: HashMap::new(), consts: HashMap::new(), ifaces: HashMap::new(), iface_order: vec![], impls: HashMap::new(), stringers: HashMap::new(), errors: vec![], refines: HashMap::new(), grefines: HashMap::new(), warnings: vec![], globals: vec![], pending_consts: vec![], vars: vec![] })
+        Ok(World { sm, defs, by_name, instances: HashMap::new(), declared_errs: HashMap::new(), funcs: vec![], sigs: HashMap::new(), fatal: None, structs: HashMap::new(), consts: HashMap::new(), ifaces: HashMap::new(), iface_order: vec![], impls: HashMap::new(), stringers: HashMap::new(), errors: vec![], refines: HashMap::new(), grefines: HashMap::new(), warnings: vec![], globals: vec![], pending_consts: vec![], vars: vec![], eq_ifaces: vec![] })
     }
 
     /// Evaluate top-level constants, in order (each may use earlier ones).
@@ -645,19 +649,20 @@ impl<'a> World<'a> {
                 Def::S(s) => s.span,
                 Def::E(e) => e.span,
             };
-            if visiting.iter().any(|v| v == name) {
-                return Err(Diag::new(span, format!("`{name}` contains itself; it is a value, so it can't (recursive types come with the memory model)")));
-            }
+            let _ = span;
             visiting.push(name.to_string());
+            // While its fields are resolved, a mention of the type itself is
+            // a `Rec` (R12); `inline_cycle` refuses the layouts that can't be.
+            done.insert(name.to_string(), Ty::Rec(name.to_string()));
             let prev = enter_pkg(&pkg_of(name));
             let t = match d {
-                Def::S(s) => Ty::Struct(name.to_string(), fields_of(&s.fields, by_name, done, visiting, consts)?),
+                Def::S(s) => Ty::Struct(name.to_string(), Rc::new(fields_of(&s.fields, by_name, done, visiting, consts)?)),
                 Def::E(e) => {
                     let mut vs = vec![];
                     for (v, fs, _) in &e.variants {
                         vs.push((v.clone(), fields_of(fs, by_name, done, visiting, consts)?));
                     }
-                    Ty::Enum(name.to_string(), vs)
+                    Ty::Enum(name.to_string(), Rc::new(vs))
                 }
             };
             leave_pkg(prev);
@@ -665,9 +670,33 @@ impl<'a> World<'a> {
             done.insert(name.to_string(), t.clone());
             Ok(t)
         }
-        let names: Vec<&str> = by_name.keys().copied().collect();
-        for n in names {
+        let mut names: Vec<&str> = by_name.keys().copied().collect();
+        names.sort_unstable();
+        for n in &names {
             resolve(n, &by_name, &mut self.structs, &mut vec![], &self.consts)?;
+        }
+        // The types that mention themselves get their definitions recorded
+        // (for `Ty::Rec`), then each must have a finite layout.
+        let mut recs = vec![];
+        for n in &names {
+            rec_names(&self.structs[*n], &mut recs);
+        }
+        recs.sort();
+        for n in &recs {
+            if let Some(t) = self.structs.get(n) {
+                define_rec(n, t.clone());
+            }
+        }
+        for n in &recs {
+            if by_name.contains_key(n.as_str()) {
+                if let Some(path) = inline_cycle(n) {
+                    let span = match by_name[n.as_str()] {
+                        Def::S(s) => s.span,
+                        Def::E(e) => e.span,
+                    };
+                    return Err(infinite_layout(span, n, &path));
+                }
+            }
         }
         for e in enums.iter().filter(|e| e.error) {
             let t = self.structs[&e.name].clone();
@@ -715,7 +744,7 @@ impl<'a> World<'a> {
             ("TaskError", vec![("Panicked".to_string(), vec![("message".to_string(), Ty::Str)])]),
         ];
         for (n, vs) in builtins {
-            let t = Ty::Enum(n.into(), vs);
+            let t = Ty::Enum(n.into(), Rc::new(vs));
             self.structs.insert(n.into(), t.clone());
             self.errors.push(t);
         }
@@ -727,6 +756,30 @@ impl<'a> World<'a> {
     }
 
     /// Instances of each error type's `message` method.
+    /// `==` on interface values (#108): for each interface compared, the
+    /// instance of `__eq` for each implementor, in tag order. The
+    /// implementors are known only now (closed world, D12); making these
+    /// instances may compare more interfaces, so it runs to a fixpoint.
+    pub fn iface_eq_instances(&mut self) -> R<HashMap<String, Vec<FuncId>>> {
+        let mut out: HashMap<String, Vec<FuncId>> = HashMap::new();
+        let Some(&def) = self.by_name.get("__eq") else { return Ok(out) };
+        loop {
+            let mut changed = false;
+            for n in self.eq_ifaces.clone() {
+                let impls: Vec<Ty> = self.impls.get(&n).map(|v| v.iter().map(|(t, _)| t.clone()).collect()).unwrap_or_default();
+                let have = out.get(&n).map_or(0, Vec::len);
+                for t in impls.iter().skip(have) {
+                    let fid = self.instance(def, vec![t.clone(), t.clone()], Span::default())?;
+                    out.entry(n.clone()).or_default().push(fid);
+                    changed = true;
+                }
+            }
+            if !changed {
+                return Ok(out);
+            }
+        }
+    }
+
     pub fn message_instances(&mut self) -> R<HashMap<usize, FuncId>> {
         let mut out = HashMap::new();
         for (k, t) in self.errors.clone().iter().enumerate() {
@@ -785,31 +838,17 @@ impl<'a> World<'a> {
         Ok(())
     }
 
-    /// Whether a value of type `t` contains (not behind a handle) a value
-    /// of interface `iface`.
-    fn contains_iface(&self, t: &Ty, iface: &str, seen: &mut Vec<String>) -> bool {
-        match t {
-            Ty::Iface(j) if j == iface => true,
-            Ty::Iface(j) => {
-                if seen.contains(j) {
-                    return false;
-                }
-                seen.push(j.clone());
-                let impls: Vec<Ty> = self.impls.get(j).map(|v| v.iter().map(|(t, _)| t.clone()).collect()).unwrap_or_default();
-                impls.iter().any(|x| self.contains_iface(x, iface, seen))
-            }
-            Ty::Struct(_, fs) => fs.iter().any(|(_, f)| self.contains_iface(f, iface, seen)),
-            Ty::Enum(_, vs) => vs.iter().any(|(_, fs)| fs.iter().any(|(_, f)| self.contains_iface(f, iface, seen))),
-            Ty::Tuple(ts) => ts.iter().any(|x| self.contains_iface(x, iface, seen)),
-            Ty::Opt(x) | Ty::Array(x) | Ty::Fixed(x, _) | Ty::Result(x) | Ty::Mutex(x) | Ty::Chan(x) => self.contains_iface(x, iface, seen),
-            Ty::Map(k, v) => self.contains_iface(k, iface, seen) || self.contains_iface(v, iface, seen),
-            _ => false,
-        }
-    }
 
     /// Make `t` an implementor of interface `iface` (checking it has every
     /// method), returning its tag.
     fn implement(&mut self, iface: &str, t: &Ty, sp: Span) -> R<usize> {
+        let unfolded;
+        let t = if let Ty::Rec(_) = t {
+            unfolded = t.unrec();
+            &unfolded
+        } else {
+            t
+        };
         if let Some(k) = self.impls.get(iface).and_then(|v| v.iter().position(|(x, _)| x == t)) {
             return Ok(k);
         }
@@ -817,11 +856,8 @@ impl<'a> World<'a> {
             return Err(Diag::new(sp, format!("{} can't satisfy {iface}: only structs and enums have methods", t.show())));
         };
         let tn = tn.to_string();
-        // An interface value holds its implementors by value: one that holds
-        // the interface itself would be infinitely large.
-        if self.contains_iface(t, iface, &mut vec![]) {
-            return Err(Diag::new(sp, format!("{tn} can't be a {iface}: it holds a {iface} value itself, and an interface value contains its implementors")).note(format!("make {tn} generic over what it holds (`struct {tn}[T] {{ inner: T }}`, like Rust's BufReader<R>), or keep the inner value in a Pool and hold an @handle")));
-        }
+        // An implementor may hold the interface itself (a wrapper, a list of
+        // handlers): then the interface's values are boxed (R13, lowering).
         let methods = self.ifaces[iface].clone();
         let impls = self.impls.entry(iface.to_string()).or_default();
         impls.push((t.clone(), vec![]));
@@ -920,7 +956,7 @@ impl<'a> World<'a> {
             let tps = d.tparams.clone();
             for tp in &tps {
                 if let Some(Bound::Iface(i)) = &tp.bound {
-                    let t = out[&tp.name].clone();
+                    let t = out[&tp.name].unrec();
                     // `io.Reader` through an import alias; `Reader` in its own package.
                     let prev = enter_pkg(&self.defs[def].pkg);
                     let key = match i.split_once('.') {
@@ -936,6 +972,8 @@ impl<'a> World<'a> {
             }
         }
         Ok(b.into_iter().map(|(n, t)| {
+            // A recursive type's self-mention (R12) binds as the type itself.
+            let t = if let Ty::Rec(_) = t { t.unrec() } else { t };
             let old = self.structs.insert(n.clone(), t);
             (n, old)
         }).collect())
@@ -997,6 +1035,7 @@ impl<'a> World<'a> {
     }
 
     fn instance(&mut self, def: usize, args: Vec<Ty>, call_span: Span) -> R<FuncId> {
+        let args: Vec<Ty> = if args.iter().any(|t| matches!(t, Ty::Rec(_))) { args.iter().map(Ty::unrec).collect() } else { args };
         if let Some(id) = self.instances.get(&(def, args.clone())) {
             return Ok(*id);
         }
@@ -1193,6 +1232,12 @@ pub fn cname(s: &str) -> String {
 /// Values `puts` and interpolation can show.
 pub fn printable(t: &Ty) -> bool {
     match t {
+        Ty::Rec(n) => with_rec(n, true, printable),
+        Ty::Struct(n, _) | Ty::Enum(n, _) if is_rec(n) => with_rec(n, true, |d| match d {
+            Ty::Struct(_, fs) => fs.iter().all(|(_, t)| printable(t)),
+            Ty::Enum(_, vs) => vs.iter().all(|(_, fs)| fs.iter().all(|(_, t)| printable(t))),
+            _ => true,
+        }),
         Ty::Int | Ty::IntK(_) | Ty::Float | Ty::Str | Ty::Bool | Ty::Var(_) | Ty::Iface(_) | Ty::Error | Ty::Handle(_) => true,
         Ty::Opt(t) | Ty::Array(t) | Ty::Fixed(t, _) => printable(t),
         Ty::Map(k, v) => printable(k) && printable(v),
@@ -1203,11 +1248,85 @@ pub fn printable(t: &Ty) -> bool {
     }
 }
 
+/// The names of the `Rec` types mentioned anywhere in `t`.
+pub fn rec_names(t: &Ty, out: &mut Vec<String>) {
+    match t {
+        Ty::Rec(n) => {
+            if !out.contains(n) {
+                out.push(n.clone());
+            }
+        }
+        Ty::Struct(_, fs) => fs.iter().for_each(|(_, x)| rec_names(x, out)),
+        Ty::Enum(_, vs) => vs.iter().for_each(|(_, fs)| fs.iter().for_each(|(_, x)| rec_names(x, out))),
+        Ty::Array(x) | Ty::Fixed(x, _) | Ty::Seq(x, _) | Ty::Gen(x) | Ty::Yielder(x) | Ty::Opt(x) | Ty::Result(x) | Ty::Task(x) | Ty::Chan(x) | Ty::Pool(x) | Ty::Mutex(x) | Ty::Atomic(x) => rec_names(x, out),
+        Ty::Tuple(ts) => ts.iter().for_each(|x| rec_names(x, out)),
+        Ty::Map(k, v) => {
+            rec_names(k, out);
+            rec_names(v, out);
+        }
+        Ty::Fn(ps, r) => {
+            ps.iter().for_each(|x| rec_names(x, out));
+            rec_names(r, out);
+        }
+        _ => {}
+    }
+}
+
+/// A recursive struct or enum whose value would contain itself directly
+/// (not behind a slice, a map, an optional field, a closure or an
+/// interface value, which hold it elsewhere: R12): the path that does.
+pub fn inline_cycle(name: &str) -> Option<Vec<String>> {
+    fn walk(t: &Ty, field: bool, target: &str, path: &mut Vec<String>, seen: &mut Vec<String>) -> bool {
+        match t {
+            Ty::Struct(n, _) | Ty::Enum(n, _) | Ty::Rec(n) => {
+                if n == target {
+                    return true;
+                }
+                if seen.contains(n) {
+                    return false;
+                }
+                seen.push(n.clone());
+                let def = t.unrec();
+                fields(&def, target, path, seen)
+            }
+            // An optional field of a struct or an enum variant is boxed when it
+            // leads back to its type; anywhere else it is inline.
+            Ty::Opt(x) if !field => walk(x, false, target, path, seen),
+            Ty::Tuple(ts) => ts.iter().any(|x| walk(x, false, target, path, seen)),
+            Ty::Fixed(x, _) | Ty::Result(x) => walk(x, false, target, path, seen),
+            _ => false,
+        }
+    }
+    fn fields(def: &Ty, target: &str, path: &mut Vec<String>, seen: &mut Vec<String>) -> bool {
+        let fs: Vec<(String, Ty)> = match def {
+            Ty::Struct(_, fs) => fs.to_vec(),
+            Ty::Enum(_, vs) => vs.iter().flat_map(|(v, fs)| fs.iter().map(move |(f, t)| (format!("{v}({f})"), t.clone()))).collect(),
+            _ => return false,
+        };
+        for (f, t) in fs {
+            path.push(format!("{}.{f}", def.show()));
+            if walk(&t, true, target, path, seen) {
+                return true;
+            }
+            path.pop();
+        }
+        false
+    }
+    let def = rec_def(name)?;
+    let mut path = vec![];
+    fields(&def, name, &mut path, &mut vec![name.to_string()]).then_some(path)
+}
+
+fn infinite_layout(sp: Span, name: &str, path: &[String]) -> Diag {
+    Diag::new(sp, format!("`{name}` contains itself directly ({}), so a value of it would never end", path.join(" -> ")))
+        .note("hold it through a slice, a map or an optional field (`[T]`, `Map[K, T]`, `T?`), which keep it elsewhere")
+}
+
 pub fn map_key_ok(t: &Ty) -> bool {
     matches!(t, Ty::Str | Ty::Bool | Ty::Var(_)) || t.int_kind().is_some()
 }
 
-fn type_names(t: &TypeExpr, out: &mut Vec<String>) {
+pub fn type_names(t: &TypeExpr, out: &mut Vec<String>) {
     match t {
         TypeExpr::Named(n, _) => out.push(n.clone()),
         TypeExpr::Array(t, _) | TypeExpr::Opt(t, _) | TypeExpr::Fixed(t, _, _) => type_names(t, out),
@@ -1245,6 +1364,8 @@ thread_local! {
     /// Generic instances: `Stack[Int]` → (`Stack`, [Int]).
     pub static INSTS: std::cell::RefCell<HashMap<String, (String, Vec<Ty>)>> = std::cell::RefCell::new(HashMap::new());
     static DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Generic instances whose fields are being resolved (`Tree[Int]`).
+    static INSTANTIATING: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(vec![]) };
     /// Every struct and enum name (for `@T` handles to types not resolved yet).
     pub static DECLARED: std::cell::RefCell<std::collections::HashSet<String>> = std::cell::RefCell::new(Default::default());
 }
@@ -1271,27 +1392,41 @@ pub fn instantiate(n: &str, g: &GenDef, targs: Vec<Ty>, sp: Span, structs: &Stru
     for (tp, t) in tps.iter().zip(&targs) {
         check_bound(tp, t, sp)?;
     }
-    if DEPTH.with(|d| d.get()) > 16 {
-        return Err(Diag::new(sp, format!("`{n}` contains itself; it is a value, so it can't (recursive types come with the memory model)")));
-    }
     let name = format!("{n}[{}]", targs.iter().map(Ty::show).collect::<Vec<_>>().join(", "));
+    // An instance mentioning itself (`struct Tree[T] { kids: [Tree[T]] }`): R12.
+    if INSTANTIATING.with(|i| i.borrow().contains(&name)) {
+        return Ok(Ty::Rec(name));
+    }
+    if DEPTH.with(|d| d.get()) > 16 {
+        return Err(Diag::new(sp, format!("`{n}` is instantiated with ever larger type arguments (`{name}`): its instances would never end")));
+    }
     let mut env = structs.clone();
     for (tp, t) in tps.iter().zip(&targs) {
         env.insert(tp.name.clone(), t.clone());
     }
     DEPTH.with(|d| d.set(d.get() + 1));
+    INSTANTIATING.with(|i| i.borrow_mut().push(name.clone()));
     // The field types are the generic's package's names (`list.List[Int]`
     // made in another package still finds list's private `Node`).
     let prev = enter_pkg(&pkg_of(n));
     let fields = |fs: &[(String, TypeExpr, Span)]| fs.iter().map(|(f, te, _)| Ok((f.clone(), type_from(te, &env, consts)?))).collect::<R<Vec<_>>>();
     let r = match g {
-        GenDef::S(d) => fields(&d.fields).map(|fs| Ty::Struct(name.clone(), fs)),
-        GenDef::E(d) => d.variants.iter().map(|(v, fs, _)| Ok((v.clone(), fields(fs)?))).collect::<R<Vec<_>>>().map(|vs| Ty::Enum(name.clone(), vs)),
+        GenDef::S(d) => fields(&d.fields).map(|fs| Ty::Struct(name.clone(), Rc::new(fs))),
+        GenDef::E(d) => d.variants.iter().map(|(v, fs, _)| Ok((v.clone(), fields(fs)?))).collect::<R<Vec<_>>>().map(|vs| Ty::Enum(name.clone(), Rc::new(vs))),
     };
     leave_pkg(prev);
     DEPTH.with(|d| d.set(d.get() - 1));
+    INSTANTIATING.with(|i| i.borrow_mut().pop());
     let t = r?;
-    INSTS.with(|m| m.borrow_mut().insert(name, (n.to_string(), targs)));
+    INSTS.with(|m| m.borrow_mut().insert(name.clone(), (n.to_string(), targs)));
+    let mut recs = vec![];
+    rec_names(&t, &mut recs);
+    if recs.contains(&name) {
+        define_rec(&name, t.clone());
+        if let Some(path) = inline_cycle(&name) {
+            return Err(infinite_layout(sp, &name, &path));
+        }
+    }
     Ok(t)
 }
 
@@ -1545,9 +1680,9 @@ struct FnCx<'w, 'a> {
     /// Inside a `lock` block: `self.loops`' length outside it (leaving the
     /// block early would keep the lock held).
     lock_floor: Option<usize>,
-    /// The `!`-call cells of the function being checked, made empty on
-    /// entry (None inside lambdas, task and generator bodies, which become
-    /// functions of their own).
+    /// The `!`-call receiver views of the function being checked, by type
+    /// (`view_local`), made empty on entry (None inside lambdas, task and
+    /// generator bodies, which become functions of their own).
     cells: Option<Vec<(LocalId, Ty)>>,
     /// Lambda literals checked so far: (block span start, fn type, captures).
     lambdas: Vec<(u64, Ty, Vec<LocalId>)>,
@@ -1560,6 +1695,9 @@ struct FnCx<'w, 'a> {
     tail_want: Option<Ty>,
     /// `R[Str].empty`: the type arguments a static method's call gives (consumed by `call_def`).
     owner_targs: Vec<Ty>,
+    /// Mixed into inference sites while a parameter's default is checked
+    /// (one default expression serves every call that leaves it out).
+    site_salt: u32,
     /// In a method: `Some(true)` for a `!` method (`self` is a one-element
     /// slice holding the receiver), `Some(false)` for one taking a copy.
     method: Option<bool>,
@@ -1572,6 +1710,8 @@ struct FnCx<'w, 'a> {
     targ_names: Vec<(String, String)>,
     /// The next block checked has its value discarded (`each`, `step`).
     block_unused: bool,
+    /// Checking `__eq`'s body: its `==` compares one level, inline.
+    eq_top: bool,
     /// Locals named in a branch an `if T is X` left unchecked (S6): read,
     /// for the unused-local warning.
     dead_reads: std::collections::HashSet<LocalId>,
@@ -1638,6 +1778,7 @@ impl<'w, 'a> FnCx<'w, 'a> {
             want_hint: None,
             tail_want: None,
             owner_targs: vec![],
+            site_salt: 0,
             errs: Default::default(),
             decl_spans: vec![],
             usings: def.map_or_else(Vec::new, |d| d.using.iter().map(|u| (0, resolve_name(u, Span::default(), &|_| true).unwrap_or_else(|_| u.clone()))).collect()),
@@ -1657,6 +1798,7 @@ impl<'w, 'a> FnCx<'w, 'a> {
             ret: Ty::Unit,
             impure: false,
             fallible_decl: def.is_some_and(|d| d.fallible),
+            eq_top: def.is_some_and(|d| d.name == "__eq"),
             under_try: false,
             bare_name: false,
             declared_errs: def.is_some_and(|d| d.errs.is_some()),
@@ -1677,6 +1819,7 @@ impl<'w, 'a> FnCx<'w, 'a> {
     /// A type variable tied to a binding site: starts from what earlier
     /// passes learned there.
     fn site(&mut self, node: NodeId, slot: u32) -> Ty {
+        let slot = slot ^ self.site_salt;
         if let Some(t) = self.hints.get(&(node, slot)) {
             return t.clone();
         }
@@ -1710,6 +1853,7 @@ impl<'w, 'a> FnCx<'w, 'a> {
             Ty::Opt(t) => Ty::Opt(Box::new(self.resolve(t))),
             Ty::Yielder(t) => Ty::Yielder(Box::new(self.resolve(t))),
             Ty::Tuple(ts) => Ty::Tuple(ts.iter().map(|t| self.resolve(t)).collect()),
+            Ty::Rec(_) => t.unrec(),
             t => t.clone(),
         }
     }
@@ -1799,22 +1943,8 @@ impl<'w, 'a> FnCx<'w, 'a> {
             self.tail_want = Some(self.ret.clone());
         }
         let r = self.body_as(body, def.is_some_and(|d| d.ret.is_some()));
-        let cells = self.cells.take().unwrap_or_default();
+        self.cells = None;
         let (mut stmts, tail_ty) = r?;
-        // The cells exist from the start, in the frame (a cell made inside a
-        // loop would die with the iteration it was made in).
-        if !cells.is_empty() {
-            let mut init: Vec<TStmt> = cells
-                .into_iter()
-                .map(|(c, t)| {
-                    let sp = def.map_or(Span::default(), |d| d.span);
-                    let empty = self.mk(TK::Array(vec![]), t.clone(), sp);
-                    TStmt::Expr(self.mk(TK::Assign(c, Box::new(empty)), t, sp))
-                })
-                .collect();
-            init.append(&mut stmts);
-            stmts = init;
-        }
         if !self.is_main {
             let sp = def.map_or(Span::default(), |d| d.span);
             // The value of the last statement is the return value.
@@ -1880,7 +2010,7 @@ impl<'w, 'a> FnCx<'w, 'a> {
         let mut read = std::collections::HashSet::new();
         fn reads(e: &TExpr, out: &mut std::collections::HashSet<LocalId>) {
             match &e.kind {
-                TK::Local(l) | TK::IndexAssign(l, ..) | TK::PlaceAssign(l, ..) => {
+                TK::Local(l) | TK::IndexAssign(l, ..) | TK::PlaceAssign(l, ..) | TK::Bang(l, ..) => {
                     out.insert(*l);
                 }
                 _ => {}
@@ -1892,11 +2022,7 @@ impl<'w, 'a> FnCx<'w, 'a> {
                     }
                 }
             }
-            if let TK::M(_, _, _, Some(b)) = &e.kind {
-                for s in &b.body {
-                    crate::prove::stmt_exprs(s, &mut |x| reads(x, out));
-                }
-            }
+            // (each_child visits blocks' and Seqs' statements too.)
             crate::prove::each_child(e, &mut |x| reads(x, out));
         }
         for s in &body {
@@ -2034,6 +2160,18 @@ impl<'w, 'a> FnCx<'w, 'a> {
                     .collect(),
                 op,
                 b(v),
+            ),
+            TK::Bang(l, steps, view, call) => TK::Bang(
+                l,
+                steps
+                    .into_iter()
+                    .map(|st| match st {
+                        TStep::Index(i) => TStep::Index(self.zonk(i)),
+                        f => f,
+                    })
+                    .collect(),
+                view,
+                b(call),
             ),
             k => k,
         };
@@ -2333,6 +2471,8 @@ impl<'w, 'a> FnCx<'w, 'a> {
     }
 
     fn mk(&self, kind: TK, ty: Ty, span: Span) -> TExpr {
+        // A recursive type's mention of itself, reached (`node.kids[0]`): R12.
+        let ty = if let Ty::Rec(_) = ty { ty.unrec() } else { ty };
         TExpr { kind, ty, span }
     }
 
@@ -2371,12 +2511,13 @@ impl<'w, 'a> FnCx<'w, 'a> {
                 None => {
                     // A function passed as a value where one is wanted:
                     // `sort_func(xs, by_len)` is `sort_func(xs, ->(a, b) { by_len(a, b) })`.
-                    // (A bare name of a function with parameters can't be a call.)
+                    // (A bare name of a function with parameters can't be a call,
+                    // unless they all have defaults (S8): then it is one, as in Ruby.)
                     let q = resolve_name(n, sp, &|q| self.w.by_name.contains_key(q)).unwrap_or_else(|_| n.clone());
                     let def = self.w.by_name.get(&q).map(|&d| self.w.defs[d].def.clone());
                     // A field of the receiver shadows a function of the same name.
                     let def = def.filter(|_| self.self_field(e).is_none());
-                    if let Some(d) = def.filter(|d| !d.params.is_empty() && d.tparams.is_empty() && d.params.iter().all(|p| p.ty.is_some())) {
+                    if let Some(d) = def.filter(|d| !d.params.is_empty() && d.tparams.is_empty() && d.params.iter().all(|p| p.ty.is_some()) && !d.params.iter().all(|p| p.default.is_some())) {
                         {
                             let id = NodeId::MAX;
                             let names: Vec<String> = (0..d.params.len()).map(|i| format!("__arg{i}")).collect();
@@ -2395,7 +2536,7 @@ impl<'w, 'a> FnCx<'w, 'a> {
                                 d.ret.clone()
                             };
                             let body = Block { id, params: names.iter().map(|a| (a.clone(), sp)).collect(), body: vec![Stmt { kind: StmtKind::Expr(call), span: sp }], span: sp };
-                            let params = names.into_iter().zip(&d.params).map(|(name, p)| Param { name, ty: p.ty.clone(), span: sp }).collect();
+                            let params = names.into_iter().zip(&d.params).map(|(name, p)| Param { name, ty: p.ty.clone(), span: sp, default: None }).collect();
                             let lam = Expr { id, kind: ExprKind::Lambda(params, ret, Box::new(body)), span: sp };
                             return self.expr(&lam);
                         }
@@ -2707,7 +2848,7 @@ impl<'w, 'a> FnCx<'w, 'a> {
                 let mut mut_call = false;
                 let held = if let Ty::Result(t) = self.resolve(&inner.ty) {
                     match (&inner.kind, self.mut_errs.take()) {
-                        (TK::Seq(..), Some(es)) if !es.is_empty() => {
+                        (TK::Seq(..) | TK::Bang(..), Some(es)) if !es.is_empty() => {
                             errs.extend(es.into_iter().filter(|e| !e.is_empty()));
                             mut_call = true;
                         }
@@ -2740,7 +2881,9 @@ impl<'w, 'a> FnCx<'w, 'a> {
                     }
                     None
                 };
-                let fallible_op = held.is_some() || is_fallible_expr(&inner, self);
+                // (A `!` call that can't fail is accepted under `~`: a generic
+                // body's `w.~write!(b)` may be instantiated with either kind.)
+                let fallible_op = held.is_some() || is_fallible_expr(&inner, self) || is_bang(&inner);
                 if !mut_call {
                     let selfl = if self.method == Some(true) { self.lookup("self") } else { None };
                     let eqi: std::collections::HashSet<LocalId> = self.locals.iter().enumerate().filter(|(_, l)| l.name.starts_with("_eqi")).map(|(k, _)| k).collect();
@@ -2784,6 +2927,24 @@ impl<'w, 'a> FnCx<'w, 'a> {
                 let t = self.fresh();
                 self.mk(TK::None, Ty::Opt(Box::new(t)), sp)
             }
+            ExprKind::DefaultArg(d) => {
+                // S8: in the callee's package, seeing none of the caller's locals.
+                let prev = enter_pkg(&d.pkg);
+                let scopes = std::mem::replace(&mut self.scopes, vec![HashMap::new()]);
+                let method = self.method.take();
+                let salt = self.site_salt;
+                self.site_salt ^= d.salt;
+                let want = d.ty.as_ref().and_then(|t| type_from(t, &self.w.structs, &self.w.consts).ok());
+                let r = match want {
+                    Some(w) => self.value_as(&d.expr, &w),
+                    None => self.value(&d.expr),
+                };
+                self.site_salt = salt;
+                self.method = method;
+                self.scopes = scopes;
+                leave_pkg(prev);
+                r?
+            }
             ExprKind::OptCall(call) => {
                 let ExprKind::Call { recv: Some(recv), name, name_span, args, block, block_sym } = &call.kind else { unreachable!() };
                 let o = self.value(recv)?;
@@ -2808,7 +2969,7 @@ impl<'w, 'a> FnCx<'w, 'a> {
                 self.mk(TK::Seq(vec![pre, TStmt::Expr(t)]), ty, sp)
             }
             ExprKind::If(c, a, b) => return self.if_value(c, a, b, sp, true),
-            ExprKind::KwArg(n, nsp, _) => return Err(Diag::new(*nsp, format!("keyword argument `{n}:` outside `Struct.new`")).note("keyword arguments name struct fields: `Body.new(x: 1.0, mass: m)`")),
+            ExprKind::KwArg(n, nsp, _) => return Err(Diag::new(*nsp, format!("keyword argument `{n}:` where nothing takes it")).note("keyword arguments name struct fields (`Body.new(x: 1.0, mass: m)`) or a def's parameters (`info(\"msg\", level: 2)`)")),
             ExprKind::Array(items) => {
                 let el = self.site(e.id, 0);
                 let mut out = vec![];
@@ -3124,9 +3285,9 @@ impl<'w, 'a> FnCx<'w, 'a> {
             Ty::Enum(_, vs) => {
                 // The first variant, with zero fields.
                 let mut slots = vec![];
-                for (_, fs) in vs.clone() {
+                for (_, fs) in vs.clone().iter() {
                     for (_, ft) in fs {
-                        slots.push(self.zero_of(&ft, sp)?);
+                        slots.push(self.zero_of(ft, sp)?);
                     }
                 }
                 TK::M(M::VariantNew(0), None, slots, None)
@@ -3530,7 +3691,16 @@ impl<'w, 'a> FnCx<'w, 'a> {
                 return Ok(());
             }
         }
-        match &t {
+        // A type that contains itself is walked once (R12).
+        if let Some(n) = t.type_name().map(|_| t.show()).filter(|n| is_rec(n)) {
+            let t2 = t.clone();
+            return with_rec(&n, Ok(()), |_| self.stringer_parts(&t2, sp));
+        }
+        self.stringer_parts(&t, sp)
+    }
+
+    fn stringer_parts(&mut self, t: &Ty, sp: Span) -> R<()> {
+        match t {
             Ty::Array(e) | Ty::Fixed(e, _) | Ty::Opt(e) => self.stringers(e, sp),
             Ty::Map(k, v) => {
                 self.stringers(k, sp)?;
@@ -3562,6 +3732,14 @@ impl<'w, 'a> FnCx<'w, 'a> {
     /// `a == b` field by field (Go's comparable structs).
     fn struct_eq(&mut self, l: TExpr, r: TExpr, sp: Span) -> R<TExpr> {
         let t = self.resolve(&l.ty);
+        // A type that contains itself (R12) is compared by a function
+        // (`__eq`, whose own `==` compares one level here): comparing it
+        // inline would never end.
+        let top = std::mem::take(&mut self.eq_top);
+        if !top && matches!(&t, Ty::Struct(n, _) | Ty::Enum(n, _) if is_rec(n)) {
+            let def = *self.w.by_name.get("__eq").expect("builtin __eq");
+            return self.call_def(def, "__eq", sp, vec![l, r], sp);
+        }
         let fts: Vec<Ty> = match &t {
             Ty::Struct(_, fs) => fs.iter().map(|(_, t)| t.clone()).collect(),
             Ty::Tuple(ts) => ts.clone(),
@@ -3789,7 +3967,7 @@ impl<'w, 'a> FnCx<'w, 'a> {
         if blk.params.is_empty() && ps.len() == 1 {
             blk.params = vec![("it".into(), b.span)];
         }
-        let params = blk.params.iter().map(|(n, s)| Param { name: n.clone(), ty: None, span: *s }).collect();
+        let params = blk.params.iter().map(|(n, s)| Param { name: n.clone(), ty: None, span: *s, default: None }).collect();
         let lam = Expr { id: NodeId::MAX, kind: ExprKind::Lambda(params, None, Box::new(blk)), span: b.span };
         let saved = self.want_hint.replace(want.unwrap());
         let r = self.expr(&lam);
@@ -4150,17 +4328,19 @@ impl<'w, 'a> FnCx<'w, 'a> {
         }
     }
 
-    /// `recv.m!(args)`: call a mutating method on a place, through a
-    /// one-element slice, and write the receiver back.
+    /// `recv.m!(args)`: call a mutating method on a place. The method gets
+    /// a view of the place (a one-element slice referring to it), so its
+    /// writes land in the place (docs/notes/bang-calls.md).
     fn mutating_call(&mut self, recv: &Expr, def: usize, name: &str, name_span: Span, args: &[Expr], block: Option<&Block>, sp: Span) -> R<TExpr> {
         let (id, steps, pty) = self.place(recv).map_err(|d| {
             if matches!(recv.kind, ExprKind::Name(_) | ExprKind::Index(..) | ExprKind::Call { .. }) { d } else { Diag::new(recv.span, format!("`{name}` changes its receiver; call it on a variable")) }
         })?;
-        // Arguments are evaluated before the receiver is read: an argument
-        // that calls something (`p.push!(p.new_node!)`) may change the
-        // receiver, and the call must see that change.
+        // Arguments are evaluated before the call starts writing through
+        // the view: an argument that calls something (`p.push!(p.new_node!)`)
+        // may change the receiver, and the call must see that change.
         let mut pre = vec![];
         let mut vals = vec![];
+        let args = &*self.fill_args(def, args, 1, block.is_some(), sp)?;
         for a in args {
             let v = self.value(a)?;
             if has_call(&v) {
@@ -4171,15 +4351,8 @@ impl<'w, 'a> FnCx<'w, 'a> {
                 vals.push(v);
             }
         }
-        let cur = self.place_read(id, &steps, &pty, recv.span);
-        let (tid, s1) = self.call_cell(cur, &pty, recv.span, true);
-        let s1 = if pre.is_empty() {
-            s1
-        } else {
-            pre.push(s1);
-            TStmt::Expr(self.mk(TK::Seq(pre), Ty::Unit, sp))
-        };
-        let mut targs = vec![self.mk(TK::Local(tid), Ty::arr(pty.clone()), recv.span)];
+        let view = self.view_local(&pty);
+        let mut targs = vec![self.mk(TK::Local(view), Ty::arr(pty.clone()), recv.span)];
         targs.extend(vals);
         // A block for a last parameter of function type (`r.shuffle!(n) { |i, j| }`).
         if let Some(b) = block {
@@ -4190,8 +4363,9 @@ impl<'w, 'a> FnCx<'w, 'a> {
             let f = self.block_as_lambda(def, &targs, b)?;
             targs.push(f);
         }
-        // The receiver is written back after the call, so a fallible call
-        // is held (a `~T`) here; an enclosing `~` propagates it after.
+        // A fallible call is held (a `~T`) here, as it always was (the
+        // receiver used to be written back after it); an enclosing `~`
+        // propagates it after.
         let saved = std::mem::replace(&mut self.under_try, false);
         let call = self.call_def(def, name, name_span, targs, sp);
         self.under_try = saved;
@@ -4206,90 +4380,69 @@ impl<'w, 'a> FnCx<'w, 'a> {
             };
         }
         let rty = call.ty.clone();
-        if matches!(self.resolve(&rty), Ty::Unit) {
-            let tl = self.mk(TK::Local(tid), Ty::arr(pty.clone()), sp);
-            let z = self.mk(TK::Int(0), Ty::Int, sp);
-            let back = self.mk(TK::Index(Box::new(tl), Box::new(z)), pty.clone(), sp);
-            let wb = if steps.is_empty() { self.mk(TK::Assign(id, Box::new(back)), pty, sp) } else { self.mk(TK::PlaceAssign(id, steps, None, Box::new(back)), pty, sp) };
-            let u = self.mk(TK::Unit, Ty::Unit, sp);
-            return Ok(self.mk(TK::Seq(vec![s1, TStmt::Expr(call), TStmt::Expr(wb), TStmt::Expr(u)]), Ty::Unit, sp));
+        let bang = self.mk(TK::Bang(id, steps, view, Box::new(call)), rty.clone(), sp);
+        if pre.is_empty() {
+            return Ok(bang);
         }
-        let (rid, s2) = self.opt_tmp(call, sp);
-        let tl = self.mk(TK::Local(tid), Ty::arr(pty.clone()), sp);
-        let z = self.mk(TK::Int(0), Ty::Int, sp);
-        let back = self.mk(TK::Index(Box::new(tl), Box::new(z)), pty.clone(), sp);
-        let wb = if steps.is_empty() { self.mk(TK::Assign(id, Box::new(back)), pty, sp) } else { self.mk(TK::PlaceAssign(id, steps, None, Box::new(back)), pty, sp) };
-        let r = self.mk(TK::Local(rid), rty.clone(), sp);
-        Ok(self.mk(TK::Seq(vec![s1, s2, TStmt::Expr(wb), TStmt::Expr(r)]), rty, sp))
+        pre.push(TStmt::Expr(bang));
+        Ok(self.mk(TK::Seq(pre), rty, sp))
     }
 
-    /// The one-element slice a `!` call gets its receiver in: one per call
-    /// site, made on first use and reused after (a loop allocates it once).
-    ///
-    /// `share`: the call's arguments are evaluated before the cell is filled
-    /// (`mutating_call`), so no other `!` call on the same type can run while
-    /// the cell is in use, and call sites with the same receiver type share
-    /// one cell. That keeps frames small in recursive methods with many `!`
-    /// calls (std/regexp/syntax's printer and compiler).
-    fn call_cell(&mut self, cur: TExpr, pty: &Ty, sp: Span, share: bool) -> (LocalId, TStmt) {
-        let n = self.locals.len();
+    /// The local a `!` call's view of its receiver is held in (`TK::Bang`):
+    /// one per receiver type in a function, since a view is only used by
+    /// the call it's made for (arguments that call something are evaluated
+    /// before it's made). Shared views keep frames small in recursive
+    /// methods with many `!` calls (std/regexp/syntax's printer and compiler).
+    fn view_local(&mut self, pty: &Ty) -> LocalId {
         let at = Ty::arr(pty.clone());
-        if self.cells.is_none() {
-            // A lambda or task body: a fresh cell per call.
-            let arr = self.mk(TK::Array(vec![cur]), at, sp);
-            return self.opt_tmp(arr, sp);
+        if let Some(c) = self.cells.as_ref().and_then(|cs| cs.iter().find(|(_, t)| *t == at).map(|(c, _)| *c)) {
+            return c;
         }
-        let shared = if share { self.cells.as_ref().unwrap().iter().find(|(_, t)| *t == at).map(|(c, _)| *c) } else { None };
-        let cell = match shared {
-            Some(c) => c,
-            None => self.declare(&format!("__cell{n}"), at.clone()),
-        };
-        let l = |ck: &mut Self| ck.mk(TK::Local(cell), at.clone(), sp);
-        let size = { let c = l(self); self.mk(TK::M(M::Size, Some(Box::new(c)), vec![], None), Ty::Int, sp) };
-        let zero = self.mk(TK::Int(0), Ty::Int, sp);
-        let fresh = self.mk(TK::Bin(BinOp::Eq, Box::new(size), Box::new(zero)), Ty::Bool, sp);
-        if shared.is_none() {
-            self.cells.as_mut().unwrap().push((cell, at.clone()));
+        let n = self.locals.len();
+        let v = self.declare(&format!("__view{n}"), at.clone());
+        self.locals[v].mutated = true;
+        if let Some(cs) = self.cells.as_mut() {
+            cs.push((v, at));
         }
-        self.locals[cell].mutated = true;
-        self.locals[cell].pushed = true;
-        let c = l(self);
-        let make = self.mk(TK::M(M::Push, Some(Box::new(c)), vec![cur.clone()], None), Ty::Unit, sp);
-        let z = self.mk(TK::Int(0), Ty::Int, sp);
-        let reuse = self.mk(TK::IndexAssign(cell, Box::new(z), Box::new(cur)), pty.clone(), sp);
-        (cell, TStmt::If(fresh, vec![TStmt::Expr(make)], vec![TStmt::Expr(reuse)]))
+        v
     }
 
     /// `w.m!(args)` where `w` is an interface value in a place: dispatch on
-    /// a one-element slice holding the value, then write it back.
+    /// a view of the place; each implementor's method gets a view of the
+    /// value inside it (lower.rs).
     fn mutating_iface_call(&mut self, recv: &Expr, iname: &str, k: usize, m: &IfaceMethod, args: &[Expr], sp: Span) -> R<TExpr> {
         let (id, steps, pty) = self.place(recv)?;
-        let cur = self.place_read(id, &steps, &pty, recv.span);
-        let (tid, s1) = self.call_cell(cur, &pty, recv.span, false);
         if args.len() != m.params.len() {
             return Err(Diag::new(sp, format!("`{iname}.{}` takes {} argument(s), got {}", m.name, m.params.len(), args.len())));
         }
+        let mut pre = vec![];
         let mut targs = vec![];
         for (a, pt) in args.iter().zip(&m.params) {
             let v = self.value(a)?;
             let v = self.coerce(v, pt)?;
             self.expect(&v.ty, pt, v.span, "argument")?;
-            targs.push(v);
+            if has_call(&v) {
+                let (aid, st) = self.opt_tmp(v.clone(), v.span);
+                pre.push(st);
+                targs.push(self.mk(TK::Local(aid), v.ty.clone(), v.span));
+            } else {
+                targs.push(v);
+            }
         }
         if m.caller {
             targs.push(self.call_site(sp)?);
         }
         self.impure = true;
-        let tl = self.mk(TK::Local(tid), Ty::arr(pty.clone()), sp);
+        let view = self.view_local(&pty);
+        let tl = self.mk(TK::Local(view), Ty::arr(pty.clone()), sp);
         let call = self.mk(TK::M(M::IfaceCall(k), Some(Box::new(tl)), targs, None), m.ret.clone(), sp);
         let rty = call.ty.clone();
-        let (rid, s2) = self.opt_tmp(call, sp);
-        let tl = self.mk(TK::Local(tid), Ty::arr(pty.clone()), sp);
-        let z = self.mk(TK::Int(0), Ty::Int, sp);
-        let back = self.mk(TK::Index(Box::new(tl), Box::new(z)), pty.clone(), sp);
-        let wb = if steps.is_empty() { self.mk(TK::Assign(id, Box::new(back)), pty, sp) } else { self.mk(TK::PlaceAssign(id, steps, None, Box::new(back)), pty, sp) };
-        let r = self.mk(TK::Local(rid), rty.clone(), sp);
-        Ok(self.mk(TK::Seq(vec![s1, s2, TStmt::Expr(wb), TStmt::Expr(r)]), rty, sp))
+        let bang = self.mk(TK::Bang(id, steps, view, Box::new(call)), rty.clone(), sp);
+        if pre.is_empty() {
+            return Ok(bang);
+        }
+        pre.push(TStmt::Expr(bang));
+        Ok(self.mk(TK::Seq(pre), rty, sp))
     }
 
     /// The type of a local or a field path, without checking anything.
@@ -4383,6 +4536,14 @@ impl<'w, 'a> FnCx<'w, 'a> {
         let v = self.value(rhs)?;
         let vt = self.resolve(&v.ty);
         if !matches!(vt, Ty::Opt(_)) {
+            if n.starts_with(crate::parser::OR_JUMP_TMP) {
+                let note = match vt {
+                    Ty::Bool => "for a condition, write the jump with `unless`: `return unless ok`",
+                    Ty::Result(_) => "a `~T` result propagates with `~` (`v = ~r`); `r.ok?` / `r.err` test it",
+                    _ => "the left side of `|| return` (`|| fail`, `|| break`, `|| next`) must be a T?",
+                };
+                return Err(Diag::new(rhs.span, format!("`|| jump` unwraps a T?, but this is {}", vt.show())).note(note));
+            }
             return Err(Diag::new(c.span, format!("`if {n} = ...` unwraps a T?, but this is {}", vt.show())).note("to compare, use `==`"));
         }
         let (tmp, pre) = self.opt_tmp(v, c.span);
@@ -4487,7 +4648,12 @@ impl<'w, 'a> FnCx<'w, 'a> {
                 s
             }
             TK::Call(f, _) => self.w.declared_errs.get(f).cloned(),
-            // A `!` call: `Seq[.., tmp = call, .., tmp]`.
+            // A `!` call (its arguments may be evaluated ahead of it).
+            TK::Bang(.., call) => self.held_set(call),
+            TK::Seq(ss) if matches!(ss.last(), Some(TStmt::Expr(x)) if matches!(x.kind, TK::Bang(..))) => {
+                let Some(TStmt::Expr(x)) = ss.last() else { unreachable!() };
+                self.held_set(x)
+            }
             TK::Seq(ss) => {
                 let Some(TStmt::Expr(TExpr { kind: TK::Local(r), .. })) = ss.last() else { return None };
                 ss.iter().find_map(|s| match s {
@@ -4727,7 +4893,7 @@ impl<'w, 'a> FnCx<'w, 'a> {
             }
             Ty::Struct(_, fields) => {
                 let mut vals = vec![];
-                for (f, ft) in fields.clone() {
+                for (f, ft) in fields.clone().iter().cloned() {
                     let v = match f.as_str() {
                         "names" => {
                             let items = files.iter().map(|(n, _)| self.mk(TK::Str(n.clone()), Ty::Str, sp)).collect();
@@ -4756,7 +4922,7 @@ impl<'w, 'a> FnCx<'w, 'a> {
             (CVal::Enum(_, k), Some(et @ Ty::Enum(..))) => {
                 let Ty::Enum(_, vs) = &et else { unreachable!() };
                 let mut slots = vec![];
-                for (_, fs) in vs {
+                for (_, fs) in vs.iter() {
                     for (_, ft) in fs {
                         slots.push(self.zero_of(ft, sp).ok_or_else(|| Diag::new(sp, format!("{} has no zero value", ft.show())))?);
                     }
@@ -4912,6 +5078,34 @@ impl<'w, 'a> FnCx<'w, 'a> {
             }
             let def = *self.w.by_name.get("__map_eq").expect("builtin __map_eq");
             let eq = self.call_def(def, "__map_eq", sp, vec![l, r], sp)?;
+            return Ok(if op == BinOp::Ne { self.mk(TK::Not(Box::new(eq)), Ty::Bool, sp) } else { eq });
+        }
+        // A Mutex (or a locked Atomic) is a handle to shared state: no `==`
+        // (it used to reach the backends as a comparison of arrays).
+        if matches!(op, BinOp::Eq | BinOp::Ne) && (matches!(lres, Ty::Mutex(_)) || matches!(&lres, Ty::Atomic(t) if t.atomic_boxed())) {
+            return Err(Diag::new(sp, format!("`{}` on {}: a lock's state can't be compared; compare what it guards (`m.lock {{ |v| v }}`)", op.text(), lres.show())));
+        }
+        // Interface values: the same implementor, and equal values of it
+        // (#108). Lowering dispatches on the tag to each implementor's `__eq`.
+        let rres = self.resolve(&r.ty);
+        if matches!(op, BinOp::Eq | BinOp::Ne) && (matches!(lres, Ty::Iface(_)) || matches!(rres, Ty::Iface(_))) && lres != rres {
+            // `iface == concrete`: the concrete value as the interface.
+            let (l, r) = if let Ty::Iface(_) = lres { let r = self.coerce(r, &lres)?; (l, r) } else { let l = self.coerce(l, &rres)?; (l, r) };
+            let (a, b) = (self.resolve(&l.ty), self.resolve(&r.ty));
+            if a != b {
+                return Err(Diag::new(sp, format!("`{}` between {} and {}", op.text(), a.show(), b.show())));
+            }
+            return self.binary(op, l, r, sp);
+        }
+        if matches!(op, BinOp::Eq | BinOp::Ne) && matches!(lres, Ty::Iface(_)) {
+            if !self.unify(&l.ty, &r.ty) {
+                return Err(Diag::new(sp, format!("`{}` between {} and {}", op.text(), lres.show(), self.resolve(&r.ty).show())));
+            }
+            let Ty::Iface(n) = &lres else { unreachable!() };
+            if !self.w.eq_ifaces.contains(n) {
+                self.w.eq_ifaces.push(n.clone());
+            }
+            let eq = self.mk(TK::M(M::IfaceEq, Some(Box::new(l)), vec![r], None), Ty::Bool, sp);
             return Ok(if op == BinOp::Ne { self.mk(TK::Not(Box::new(eq)), Ty::Bool, sp) } else { eq });
         }
         if matches!(op, BinOp::Eq | BinOp::Ne) && matches!(lres, Ty::Struct(..) | Ty::Tuple(_) | Ty::Enum(..)) {
@@ -5235,7 +5429,14 @@ impl<'w, 'a> FnCx<'w, 'a> {
                 }
             }
         }
-        match name {
+        // S12: a def of the current package (or of the main file, there)
+        // shadows a builtin of the same name, as in Go.
+        let own_def = {
+            let pkg = current_pkg();
+            let q = if pkg.is_empty() { name.to_string() } else { format!("{pkg}.{name}") };
+            self.w.by_name.get(&q).is_some_and(|&d| self.w.defs[d].pkg == pkg)
+        };
+        match if own_def { "" } else { name } {
             "puts" | "print" | "p" => {
                 if self.pure_decl {
                     return Err(Diag::new(sp, format!("`#[pure] def {}` can't do I/O: `{name}`", self.fn_name)));
@@ -5419,7 +5620,7 @@ impl<'w, 'a> FnCx<'w, 'a> {
             let tn = st.as_ref().and_then(|t| t.type_name()).map(str::to_string);
             if let Some(sn) = &tn {
                 let fs: Vec<(String, Ty)> = match &st {
-                    Some(Ty::Struct(_, fs)) => fs.clone(),
+                    Some(Ty::Struct(_, fs)) => fs.to_vec(),
                     _ => vec![],
                 };
                 let is_field = args.is_empty() && block.is_none() && fs.iter().any(|(f, _)| f == name);
@@ -5442,9 +5643,13 @@ impl<'w, 'a> FnCx<'w, 'a> {
             if let Some(best) = cands.iter().filter(|c| c.as_str() != name && lev(c, name) <= 2).min_by_key(|c| lev(c, name)) {
                 msg.push_str(&format!("; did you mean `{best}`?"));
             }
+            if name == "fail" {
+                return Err(Diag::new(name_span, "`fail` is a statement, not a function: `fail e`, without parentheses").note("inside an expression it can only follow `||` (`v = opt || fail e`) or be a whole `case` arm (`X => fail e`) (S8)"));
+            }
             return Err(Diag::new(name_span, msg));
         };
         let d = self.w.defs[def].def.clone();
+        let args = &*self.fill_args(def, args, 0, block.is_some(), sp)?;
         // A block for a last parameter of function type: `index_func(xs) { |x| ... }`.
         if let Some(b) = block {
             if d.params.len() != args.len() + 1 || !matches!(d.params.last().and_then(|p| p.ty.as_ref()), Some(TypeExpr::Fn(..))) {
@@ -5519,6 +5724,58 @@ impl<'w, 'a> FnCx<'w, 'a> {
             }
             None => Ok(self.mk(TK::Str(self.w.sm.loc(sp)), Ty::Str, sp)),
         }
+    }
+
+    /// S8: a call's arguments matched to def `def`'s parameters: keyword
+    /// arguments (`name: v`, after the positional ones) by name, and the
+    /// ones left out by their defaults. `nself`: parameters passed apart
+    /// (the receiver); `block`: a block fills the last parameter. Borrowed
+    /// as given when there is nothing to match (counts are checked later).
+    fn fill_args<'e>(&self, def: usize, args: &'e [Expr], nself: usize, block: bool, sp: Span) -> R<std::borrow::Cow<'e, [Expr]>> {
+        use std::borrow::Cow;
+        let info = &self.w.defs[def];
+        let d = &info.def;
+        let end = d.params.len() - usize::from(block && d.params.len() > nself);
+        let params = &d.params[nself.min(end)..end];
+        let kw = args.iter().any(|a| matches!(a.kind, ExprKind::KwArg(..)));
+        if !kw && (args.len() >= params.len() || params.iter().all(|p| p.default.is_none())) {
+            return Ok(Cow::Borrowed(args));
+        }
+        let shown = d.name.rsplit('/').next().unwrap_or(&d.name);
+        let shown = shown.rsplit_once('.').filter(|_| nself == 1).map_or(shown, |(_, m)| m);
+        let mut slots: Vec<Option<Expr>> = vec![None; params.len()];
+        let mut seen_kw = false;
+        for (i, a) in args.iter().enumerate() {
+            match &a.kind {
+                ExprKind::KwArg(n, nsp, v) => {
+                    seen_kw = true;
+                    let Some(k) = params.iter().position(|p| &p.name == n) else {
+                        let names: Vec<String> = params.iter().map(|p| format!("`{}`", p.name)).collect();
+                        return Err(Diag::new(*nsp, format!("`{shown}` has no parameter `{n}`")).note(if names.is_empty() { "it takes no arguments".to_string() } else { format!("its parameters: {}", names.join(", ")) }));
+                    };
+                    if slots[k].is_some() {
+                        return Err(Diag::new(*nsp, format!("argument `{n}` given twice")));
+                    }
+                    slots[k] = Some((**v).clone());
+                }
+                _ if seen_kw => return Err(Diag::new(a.span, "a positional argument can't follow a keyword argument")),
+                _ if i >= params.len() => return Err(Diag::new(a.span, format!("`{shown}` takes {} argument(s), got {}", params.len(), args.len()))),
+                _ => slots[i] = Some(a.clone()),
+            }
+        }
+        let mut out = vec![];
+        for (k, (s, p)) in slots.into_iter().zip(params).enumerate() {
+            out.push(match (s, &p.default) {
+                (Some(a), _) => a,
+                (None, Some(e)) => {
+                    let salt = (sp.file.wrapping_mul(0x9E37_79B1) ^ sp.lo.wrapping_mul(0x85EB_CA6B) ^ (k as u32).wrapping_mul(0xC2B2_AE35)) | 0x8000_0000;
+                    let da = DefaultArg { pkg: info.pkg.clone(), ty: p.ty.clone(), expr: (**e).clone(), salt };
+                    Expr { id: NodeId::MAX, kind: ExprKind::DefaultArg(Box::new(da)), span: sp }
+                }
+                (None, None) => return Err(Diag::new(sp, format!("`{shown}` needs argument `{}`", p.name))),
+            });
+        }
+        Ok(Cow::Owned(out))
     }
 
     /// Call def `def` with checked arguments (a method's include `self`).
@@ -5778,6 +6035,7 @@ impl<'w, 'a> FnCx<'w, 'a> {
                     if block.is_some() {
                         return Err(Diag::new(sp, format!("`{c}.{name}` doesn't take a block")));
                     }
+                    let args = &*self.fill_args(def, args, 0, false, sp)?;
                     if args.len() != d.params.len() {
                         return Err(Diag::new(name_span, format!("`{c}.{name}` takes {} argument(s), got {}", d.params.len(), args.len())));
                     }
@@ -5815,6 +6073,7 @@ impl<'w, 'a> FnCx<'w, 'a> {
                         return Err(Diag::new(sp, format!("`{c}.{name}` doesn't take a block")));
                     }
                     let d = self.w.defs[def].def.clone();
+                    let args = &*self.fill_args(def, args, 0, false, sp)?;
                     if args.len() != d.params.len() {
                         return Err(Diag::new(name_span, format!("`{c}.{name}` takes {} argument(s), got {}", d.params.len(), args.len())));
                     }
@@ -5920,7 +6179,7 @@ impl<'w, 'a> FnCx<'w, 'a> {
                 return Err(Diag::new(sp, format!("`{c}.new` takes {} arguments ({}), got {}", fields.len(), fields.iter().map(|(f, _)| f.as_str()).collect::<Vec<_>>().join(", "), args.len())));
             }
             let mut vals = vec![];
-            for (a, (f, ft)) in args.iter().zip(fields) {
+            for (a, (f, ft)) in args.iter().zip(fields.iter()) {
                 let v = self.value(a)?;
                 let v = self.coerce(v, ft)?;
                 if !self.unify(&v.ty, ft) {
@@ -6186,6 +6445,7 @@ impl<'w, 'a> FnCx<'w, 'a> {
             Err(d) if d.msg.starts_with(&format!("no method `{name}`")) && bsym.is_none() => {
                 let rt = self.resolve(&recv.ty);
                 let Some(def) = self.std_sugar(&rt, name)? else { return Err(d) };
+                let args = &*self.fill_args(def, args, 1, block.is_some(), sp)?;
                 let mut targs = vec![recv];
                 for a in args {
                     targs.push(self.value(a)?);
@@ -6246,6 +6506,7 @@ impl<'w, 'a> FnCx<'w, 'a> {
             if block.is_some() {
                 return Err(Diag::new(sp, format!("`{name}` doesn't take a block")));
             }
+            let args = &*self.fill_args(def, args, 1, false, sp)?;
             let mut targs = vec![recv];
             for a in args {
                 targs.push(self.value(a)?);
@@ -6374,6 +6635,7 @@ impl<'w, 'a> FnCx<'w, 'a> {
                 if name.ends_with('!') {
                     return Err(Diag::new(recv.span, format!("`{name}` changes its receiver; call it on a variable")));
                 }
+                let args = &*self.fill_args(def, args, 1, block.is_some(), sp)?;
                 let mut targs = vec![recv];
                 for a in args {
                     targs.push(self.value(a)?);
@@ -6613,6 +6875,7 @@ impl<'w, 'a> FnCx<'w, 'a> {
                 if name.ends_with('!') {
                     return Err(Diag::new(recv.span, format!("`{name}` changes its receiver; call it on a variable")));
                 }
+                let args = &*self.fill_args(def, args, 1, false, sp)?;
                 let mut targs = vec![recv];
                 for a in args {
                     targs.push(self.value(a)?);
@@ -7126,9 +7389,18 @@ fn is_fallible_expr(e: &TExpr, cx: &FnCx) -> bool {
     }
 }
 
+/// A `!` call (`TK::Bang`), after any arguments evaluated ahead of it.
+fn is_bang(e: &TExpr) -> bool {
+    match &e.kind {
+        TK::Bang(..) => true,
+        TK::Seq(ss) => matches!(ss.last(), Some(TStmt::Expr(x)) if matches!(x.kind, TK::Bang(..))),
+        _ => false,
+    }
+}
+
 /// Whether evaluating `e` calls a function (and so may change state).
 fn has_call(e: &TExpr) -> bool {
-    if matches!(e.kind, TK::Call(..) | TK::Seq(..)) {
+    if matches!(e.kind, TK::Call(..) | TK::Seq(..) | TK::Bang(..)) {
         return true;
     }
     let mut found = false;
@@ -7264,51 +7536,6 @@ fn expr_breaks_out(e: &TExpr) -> bool {
             hit
         }
     }
-}
-
-/// A closure value holds its captures, so a closure that captures a value
-/// holding the closure's own type would be infinitely large (and can't be
-/// laid out): `s.f = -> () { s.n }` where `s: S` has a field of that type.
-pub fn self_containing_closures(funcs: &[TFunc], ifaces: &HashMap<String, Vec<(Ty, Vec<FuncId>)>>) -> Result<(), Diag> {
-    let sites: Vec<(Ty, Vec<Ty>)> = funcs.iter().flat_map(|f| f.lambdas.iter().map(move |(_, t, caps)| (t.clone(), caps.iter().map(|c| f.locals[*c].ty.clone()).collect()))).collect();
-    fn holds(t: &Ty, want: &Ty, sites: &[(Ty, Vec<Ty>)], ifaces: &HashMap<String, Vec<(Ty, Vec<FuncId>)>>, seen: &mut Vec<Ty>) -> bool {
-        if t == want {
-            return true;
-        }
-        let go = |x: &Ty, seen: &mut Vec<Ty>| holds(x, want, sites, ifaces, seen);
-        match t {
-            Ty::Struct(_, fs) => fs.iter().any(|(_, f)| go(f, seen)),
-            Ty::Enum(_, vs) => vs.iter().any(|(_, fs)| fs.iter().any(|(_, f)| go(f, seen))),
-            Ty::Tuple(ts) => ts.iter().any(|x| go(x, seen)),
-            Ty::Opt(x) | Ty::Array(x) | Ty::Fixed(x, _) | Ty::Result(x) | Ty::Mutex(x) | Ty::Chan(x) => go(x, seen),
-            Ty::Map(k, v) => go(k, seen) || go(v, seen),
-            Ty::Fn(..) | Ty::Iface(_) => {
-                if seen.contains(t) {
-                    return false;
-                }
-                seen.push(t.clone());
-                match t {
-                    Ty::Iface(n) => ifaces.get(n).is_some_and(|v| v.iter().any(|(x, _)| go(x, seen))),
-                    _ => sites.iter().filter(|(ft, _)| ft == t).any(|(_, caps)| caps.iter().any(|c| go(c, seen))),
-                }
-            }
-            _ => false,
-        }
-    }
-    for f in funcs {
-        for (lo, t, caps) in &f.lambdas {
-            for c in caps {
-                let ct = &f.locals[*c].ty;
-                if holds(ct, t, &sites, ifaces, &mut vec![]) {
-                    let l = (*lo & 0xffff_ffff) as u32;
-                    let sp = Span { file: f.span.file, lo: l, hi: l + 1 };
-                    return Err(Diag::new(sp, format!("this closure captures `{}` ({}), which holds a closure of this same type ({}): a closure contains what it captures, so it would contain itself", f.locals[*c].name, ct.show(), t.show()))
-                        .note("pass the value as a parameter instead, or keep it in a Pool and capture its @handle"));
-                }
-            }
-        }
-    }
-    Ok(())
 }
 
 /// Whether an interface declares a method `name`.

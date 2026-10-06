@@ -357,6 +357,9 @@ pub struct Param {
     pub name: String,
     pub ty: Option<TypeExpr>,
     pub span: Span,
+    /// `attrs: [Attr] = []` (S8): evaluated per call, at the call site,
+    /// in the callee's package, when the call leaves the parameter out.
+    pub default: Option<Box<Expr>>,
 }
 
 #[derive(Debug, Clone)]
@@ -560,6 +563,21 @@ pub enum ExprKind {
     /// `R is io.Seeker`, `T is like Int`, `T is Str`: a question about a
     /// type, answered at compile time per instance of a generic def (S6).
     Is(TypeExpr, IsTest),
+    /// A parameter's default value standing in for an argument the call
+    /// left out (made by the checker, never parsed; S8).
+    DefaultArg(Box<DefaultArg>),
+}
+
+#[derive(Debug, Clone)]
+pub struct DefaultArg {
+    /// The callee's package: the default's names resolve there.
+    pub pkg: String,
+    /// The parameter's declared type (in the callee's package).
+    pub ty: Option<TypeExpr>,
+    pub expr: Expr,
+    /// Distinguishes this use's inference sites from other uses of the
+    /// same default expression.
+    pub salt: u32,
 }
 
 /// The right side of `T is ...` (S6).

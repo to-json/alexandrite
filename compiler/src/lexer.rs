@@ -111,7 +111,7 @@ pub fn lex_at(file: u32, src: &str, base: u32) -> Result<Vec<Token>, Diag> {
     let b = src.as_bytes();
     let mut i = 0usize;
     let mut out: Vec<Token> = Vec::new();
-    // Heredocs whose bodies start on the next line: (index in `out`, terminator, squiggly).
+    // Heredocs whose bodies start on the next line: (index in `out`, terminator, raw).
     let mut pending: Vec<(usize, String, bool)> = Vec::new();
     let mut space = false;
     let sp = |lo: usize, hi: usize| Span { file, lo: base + lo as u32, hi: base + hi as u32 };
@@ -127,7 +127,7 @@ pub fn lex_at(file: u32, src: &str, base: u32) -> Result<Vec<Token>, Diag> {
             i += 1;
             space = false;
             // Heredoc bodies follow the line that introduced them.
-            for (idx, term, squiggly) in std::mem::take(&mut pending) {
+            for (idx, term, raw) in std::mem::take(&mut pending) {
                 let body_lo = i;
                 let mut lines = Vec::new();
                 loop {
@@ -145,12 +145,10 @@ pub fn lex_at(file: u32, src: &str, base: u32) -> Result<Vec<Token>, Diag> {
                 // The body is [body_lo, i); the terminator line follows.
                 let body_hi = i;
                 i = src[i..].find('\n').map_or(b.len(), |k| i + k + 1);
-                let indent = if squiggly {
-                    lines.iter().filter(|l| !l.trim().is_empty()).map(|l| l.len() - l.trim_start().len()).min().unwrap_or(0)
-                } else {
-                    0
-                };
-                out[idx].tok = heredoc_body(src, body_lo, body_hi, indent, base).map_err(|k| Diag::new(sp(k, k + 2), "unterminated `#{` in heredoc"))?;
+                // Squiggly: the common indent of the non-blank lines, measured
+                // on the source text (before escapes), as Ruby does.
+                let indent = lines.iter().filter(|l| !l.trim().is_empty()).map(|l| l.len() - l.trim_start().len()).min().unwrap_or(0);
+                out[idx].tok = heredoc_body(src, body_lo, body_hi, indent, raw, sp)?;
             }
             continue;
         }
@@ -361,37 +359,7 @@ pub fn lex_at(file: u32, src: &str, base: u32) -> Result<Vec<Token>, Diag> {
                     break;
                 }
                 if b[i] == b'\\' && q == b'"' && i + 1 < b.len() {
-                    // Go's escapes; `\x` up to 7f (a Str is UTF-8 text here),
-                    // `\u` / `\U` code points; punctuation stands for itself.
-                    let hex = |from: usize, n: usize| -> Option<u32> {
-                        let h = b.get(from..from + n)?;
-                        u32::from_str_radix(std::str::from_utf8(h).ok()?, 16).ok()
-                    };
-                    let (ch, len) = match b[i + 1] {
-                        b'n' => ('\n', 2),
-                        b't' => ('\t', 2),
-                        b'r' => ('\r', 2),
-                        b'0' => ('\0', 2),
-                        b'a' => ('\x07', 2),
-                        b'b' => ('\x08', 2),
-                        b'f' => ('\x0c', 2),
-                        b'v' => ('\x0b', 2),
-                        b'e' => ('\x1b', 2),
-                        b'x' => match hex(i + 2, 2) {
-                            Some(v) if v < 0x80 => (char::from(v as u8), 4),
-                            Some(_) => return Err(Diag::new(sp(i, i + 4), "`\\x` escapes above 7f would make invalid UTF-8; write the character, use `\\u`, or build bytes with `Str.from_bytes`")),
-                            None => return Err(Diag::new(sp(i, i + 2), "`\\x` needs two hex digits")),
-                        },
-                        b'u' | b'U' => {
-                            let n = if b[i + 1] == b'u' { 4 } else { 8 };
-                            match hex(i + 2, n).and_then(char::from_u32) {
-                                Some(c) => (c, 2 + n),
-                                None => return Err(Diag::new(sp(i, i + 2), format!("`\\{}` needs {n} hex digits naming a valid code point", b[i + 1] as char))),
-                            }
-                        }
-                        o if o.is_ascii_alphanumeric() => return Err(Diag::new(sp(i, i + 2), format!("unknown escape `\\{}`", o as char))),
-                        o => (o as char, 2),
-                    };
+                    let (ch, len) = escape(src, i, sp)?;
                     s.push(ch);
                     i += len;
                     continue;
@@ -425,17 +393,20 @@ pub fn lex_at(file: u32, src: &str, base: u32) -> Result<Vec<Token>, Diag> {
             space = false;
             continue;
         }
-        // Heredoc: only the squiggly form, `<<~ID`.
+        // Heredoc: only the squiggly form, `<<~ID` / `<<~"ID"` (escapes and
+        // `#{}`, like "...") or `<<~'ID'` (raw, like '...').
         if src[i..].starts_with("<<~") {
-            let id_start = i + 3;
+            let quote = b.get(i + 3).copied().filter(|q| *q == b'"' || *q == b'\'');
+            let id_start = i + 3 + quote.is_some() as usize;
             let mut j = id_start;
             while j < b.len() && (b[j].is_ascii_alphanumeric() || b[j] == b'_') {
                 j += 1;
             }
-            if j > id_start {
-                pending.push((out.len(), src[id_start..j].to_string(), true));
-                out.push(Token { tok: Tok::Str(String::new()), span: sp(i, j), space_before: space });
-                i = j;
+            if j > id_start && quote.is_none_or(|q| b.get(j) == Some(&q)) {
+                pending.push((out.len(), src[id_start..j].to_string(), quote == Some(b'\'')));
+                let end = j + quote.is_some() as usize;
+                out.push(Token { tok: Tok::Str(String::new()), span: sp(i, end), space_before: space });
+                i = end;
                 space = false;
                 continue;
             }
@@ -492,10 +463,12 @@ pub fn lex_at(file: u32, src: &str, base: u32) -> Result<Vec<Token>, Diag> {
 }
 
 /// A heredoc's body, `src[lo..hi]` (whole lines), with `indent` bytes of
-/// leading blanks taken off each line. The text is raw except that `#{...}`
-/// interpolates, as in a double-quoted string, and `\#` is a literal `#`
-/// (so `\#{` stays literal). Err: the index of an unterminated `#{`.
-fn heredoc_body(src: &str, lo: usize, hi: usize, indent: usize, base: u32) -> Result<Tok, usize> {
+/// leading blanks taken off each line. Like a double-quoted string, `#{...}`
+/// interpolates and backslash escapes work (`\#` is `#`, so `\#{` stays
+/// literal), and a `\` ending a line joins the next one to it (Ruby's
+/// continuation; the joined line still loses its indent). `raw` (`<<~'ID'`):
+/// the text as written, like '...'.
+fn heredoc_body(src: &str, lo: usize, hi: usize, indent: usize, raw: bool, sp: impl Fn(usize, usize) -> Span + Copy) -> Result<Tok, Diag> {
     let b = src.as_bytes();
     let (mut s, mut pieces) = (String::new(), Vec::new());
     let (mut k, mut line_start) = (lo, true);
@@ -515,16 +488,25 @@ fn heredoc_body(src: &str, lo: usize, hi: usize, indent: usize, base: u32) -> Re
                 k += 1;
                 line_start = true;
             }
-            b'\\' if b.get(k + 1) == Some(&b'#') => {
-                s.push('#');
+            b'\\' if !raw && b.get(k + 1) == Some(&b'\n') => {
                 k += 2;
+                line_start = true;
             }
-            b'#' if b.get(k + 1) == Some(&b'{') => {
-                let end = interp_end(b, k + 2).filter(|e| *e < hi).ok_or(k)?;
+            b'\\' if !raw && b.get(k + 1) == Some(&b'\r') && b.get(k + 2) == Some(&b'\n') => {
+                k += 3;
+                line_start = true;
+            }
+            b'\\' if !raw && k + 1 < hi => {
+                let (ch, len) = escape(src, k, sp).map_err(|d| d.note("a heredoc takes a double-quoted string's escapes: write `\\\\` for a backslash, or use `<<~'ID'` for raw text"))?;
+                s.push(ch);
+                k += len;
+            }
+            b'#' if !raw && b.get(k + 1) == Some(&b'{') => {
+                let end = interp_end(b, k + 2).filter(|e| *e < hi).ok_or_else(|| Diag::new(sp(k, k + 2), "unterminated `#{` in heredoc"))?;
                 if !s.is_empty() {
                     pieces.push(IPiece::Lit(std::mem::take(&mut s)));
                 }
-                pieces.push(IPiece::Code(src[k + 2..end].to_string(), base + (k + 2) as u32));
+                pieces.push(IPiece::Code(src[k + 2..end].to_string(), sp(k + 2, k + 2).lo));
                 k = end + 1;
             }
             _ => {
@@ -541,6 +523,46 @@ fn heredoc_body(src: &str, lo: usize, hi: usize, indent: usize, base: u32) -> Re
         pieces.push(IPiece::Lit(s));
     }
     Ok(Tok::Interp(pieces))
+}
+
+/// The backslash escape at `src[i]` (with at least one byte after it) in a
+/// double-quoted string or heredoc: its character and length. Go's escapes;
+/// `\x` up to 7f (a Str is UTF-8 text here), `\u` / `\U` code points;
+/// punctuation (any other character) stands for itself.
+fn escape(src: &str, i: usize, sp: impl Fn(usize, usize) -> Span) -> Result<(char, usize), Diag> {
+    let b = src.as_bytes();
+    let hex = |from: usize, n: usize| -> Option<u32> {
+        let h = b.get(from..from + n)?;
+        u32::from_str_radix(std::str::from_utf8(h).ok()?, 16).ok()
+    };
+    Ok(match b[i + 1] {
+        b'n' => ('\n', 2),
+        b't' => ('\t', 2),
+        b'r' => ('\r', 2),
+        b'0' => ('\0', 2),
+        b'a' => ('\x07', 2),
+        b'b' => ('\x08', 2),
+        b'f' => ('\x0c', 2),
+        b'v' => ('\x0b', 2),
+        b'e' => ('\x1b', 2),
+        b'x' => match hex(i + 2, 2) {
+            Some(v) if v < 0x80 => (char::from(v as u8), 4),
+            Some(_) => return Err(Diag::new(sp(i, i + 4), "`\\x` escapes above 7f would make invalid UTF-8; write the character, use `\\u`, or build bytes with `Str.from_bytes`")),
+            None => return Err(Diag::new(sp(i, i + 2), "`\\x` needs two hex digits")),
+        },
+        b'u' | b'U' => {
+            let n = if b[i + 1] == b'u' { 4 } else { 8 };
+            match hex(i + 2, n).and_then(char::from_u32) {
+                Some(c) => (c, 2 + n),
+                None => return Err(Diag::new(sp(i, i + 2), format!("`\\{}` needs {n} hex digits naming a valid code point", b[i + 1] as char))),
+            }
+        }
+        o if o.is_ascii_alphanumeric() => return Err(Diag::new(sp(i, i + 2), format!("unknown escape `\\{}`", o as char))),
+        _ => {
+            let ch = src[i + 1..].chars().next().unwrap();
+            (ch, 1 + ch.len_utf8())
+        }
+    })
 }
 
 /// The end of a `#{...}` whose code starts at `open`: the index of its `}`.

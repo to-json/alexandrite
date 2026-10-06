@@ -262,7 +262,7 @@ pub fn format(src: &str) -> Result<String, String> {
         let tok_text = &src[lo..hi];
         if let Tok::Str(_) | Tok::Interp(_) = t.tok {
             if let Some(id) = tok_text.strip_prefix("<<~") {
-                pending.push(id.to_string());
+                pending.push(id.trim_matches(|c| c == '"' || c == '\'').to_string());
             }
         }
         let pre_tight = prev.is_some_and(|(pi, _, pv)| op(&toks[pi].tok).is_some() && !pv);

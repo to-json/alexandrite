@@ -37,7 +37,7 @@ import "os/exec"
 x = 42                               # Int (= I64). Also I8..I64, U8..U64, Byte (= U8), Rune (= I32)
 f = 2.5                              # Float (= F64)
 s = "héllo #{x}"                     # Str: immutable UTF-8 bytes; #{} interpolates
-doc = <<~EOS                         # heredoc: indent stripped, raw text, #{} interpolates (\#{ stays literal)
+doc = <<~EOS                         # heredoc, as Ruby's: indent stripped, "..." escapes and #{}; <<~'EOS' is raw
   x is #{x}
 EOS
 s.size; s[0]; s[1...3]               # byte length; a Byte; a substring by bytes (... excludes the end)

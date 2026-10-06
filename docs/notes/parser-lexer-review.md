@@ -21,7 +21,7 @@ Line numbers below are from the review and stale; find code by name.
 | 6a. `#![foo(f(1))]` | **fixed** (strips one `)`) |
 | 6b. dead `let _ = word_start` | **fixed** |
 | 6c. `1.e5` | **stays a method call** (user decision, GO-VS-RUBY T12); "no method `e5` on Int" now says to write `1.0e5` (also for `e`, from `1.e-3`). Test: parser.bad4 |
-| 6d. heredocs and `#{` | **heredocs interpolate** (user decision, T11): `#{}` as in `"..."`, body otherwise raw, `\#` is `#`. Test: parsefix |
+| 6d. heredocs and `#{` | **heredocs follow Ruby** (user decision, T11): `<<~ID` / `<<~"ID"` take `#{}` and every `"..."` escape; `<<~'ID'` is raw. Tests: parsefix, heredoc, heredoc.bad1 |
 | Unify the `.name` parsers | **done**: `dot_step` (with `type_args_then_dot`) serves `.`, `.~`, `?.` and the `~` chain |
 | `+=` skips place/const validation | **open** (not in this pass) |
 | `=` RHS on the next line | **fixed**, also `op=`, `a, b =` and place multi-assign (T10). Test: parsefix |

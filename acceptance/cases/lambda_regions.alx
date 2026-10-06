@@ -1,0 +1,226 @@
+# port-issues #164: what a lambda's body stores into storage it doesn't own
+# (a parameter's, a capture's) lives where that storage lives, not in the
+# region current when the lambda runs (its caller's frame, freed when that
+# returns). Each shape below wrote into a dead frame before the fix.
+
+struct Hdr {
+  m: Map[Str, [Str]]
+  def set!(k: Str, v: Str) { self.m[k] = [v + "!"] }
+  def add!(k: Str, v: Str) {
+    if vs = m[k] {
+      vs << v
+      self.m[k] = vs
+    } else {
+      self.m[k] = [v]
+    }
+  }
+}
+
+struct Buf {
+  xs: [Str]
+  def push!(s: Str) { self.xs << "<#{s}>" }
+}
+
+struct Writer {
+  st: [Int]
+  header: Hdr
+}
+
+# Allocate in the current frame so a freed region gets reused.
+def churn {
+  junk = (0...64).map { "junk#{it}" }
+  puts "?" if junk.size != 64
+}
+
+def call1(f: (Writer, Str) -> Unit, w: Writer, s: Str) {
+  g = f
+  g(w, s)
+  churn()
+}
+
+# 1. `!` on a parameter's field inside a lambda: map growth.
+def one_level(w: Writer) {
+  f = ->(x: Writer, s: Str) { x.header.set!("k#{s}", "v#{s}") }
+  for i in 0...40 {
+    call1(f, w, "#{i}")
+  }
+}
+
+# 2. Nested 2 and 3 levels: each lambda calls the next from a frame of its own.
+def two_levels(w: Writer) {
+  inner = ->(x: Writer, s: Str) { x.header.add!("two", s) }
+  outer = ->(x: Writer, s: Str) {
+    call1(inner, x, "in#{s}")
+    churn()
+  }
+  for i in 0...30 {
+    call1(outer, w, "#{i}")
+  }
+}
+
+def three_levels(w: Writer) {
+  a = ->(x: Writer, s: Str) { x.header.add!("three", s) }
+  b = ->(x: Writer, s: Str) { call1(a, x, "b#{s}") }
+  c = ->(x: Writer, s: Str) { call1(b, x, "c#{s}") }
+  for i in 0...30 {
+    call1(c, w, "#{i}")
+  }
+}
+
+# 3. Through a recursive closure type: handlers wrapping handlers
+# (http.StripPrefix-style), the leaf writing a header.
+interface Handler { def serve(w: Writer, path: Str) }
+
+struct HF {
+  f: (Writer, Str) -> Unit
+  def serve(w: Writer, path: Str) {
+    g = f
+    g(w, path)
+    churn()
+  }
+}
+
+def strip(prefix: Str, h: Handler) -> Handler {
+  HF.new(f: ->(w: Writer, p: Str) {
+    q = p.size >= prefix.size ? p[prefix.size...p.size] : p
+    h.serve(w, q)
+  })
+}
+
+def wrapped(depth: Int) -> Handler {
+  leaf: Handler = HF.new(f: ->(w: Writer, p: Str) { w.header.set!("X-Path", p) })
+  h = leaf
+  for i in 0...depth {
+    h = strip("/p#{depth - 1 - i}", h)
+  }
+  h
+}
+
+# 4. Slice growth in a `!` method on a parameter's field, and plain writes
+# through a parameter (a map entry, a struct field's map).
+struct Out { buf: Buf; tags: Map[Str, Int] }
+
+def call_out(f: (Out, Int) -> Unit, o: Out, i: Int) {
+  g = f
+  g(o, i)
+  churn()
+}
+
+def slices_and_writes(o: Out) {
+  f = ->(x: Out, i: Int) {
+    x.buf.push!("s#{i}")
+    x.tags["t#{i}"] = i
+  }
+  for i in 0...50 {
+    call_out(f, o, i)
+  }
+}
+
+# 5. Writes into captured storage, from a lambda run in another frame.
+def call0(f: () -> Unit) {
+  g = f
+  g()
+  churn()
+}
+
+def captures -> Str {
+  seen: Map[Str, [Int]] = {}
+  b = Buf.new()
+  f = ->() {
+    seen["k#{seen.size}"] = [seen.size]
+    b.push!("c#{b.xs.size}")
+  }
+  for _i in 0...40 {
+    call0(f)
+  }
+  "#{seen.size} #{seen["k39"]} #{b.xs.size} #{b.xs[39]}"
+}
+
+# 6. Tasks and generators: a lambda run inside a task, a task inside a
+# lambda, a generator driven by a lambda writing into its parameter.
+def in_task -> Str {
+  t = spawn {
+    w = Writer.new(header: Hdr.new(m: {}))
+    f = ->(x: Writer, s: Str) { x.header.set!("t#{s}", s) }
+    for i in 0...30 {
+      call1(f, w, "#{i}")
+    }
+    "#{w.header.m.size} #{w.header.m["t29"]}"
+  }
+  t.wait.unwrap
+}
+
+def task_in_lambda -> Str {
+  f = ->(n: Int) -> Str {
+    t = spawn {
+      w = Writer.new(header: Hdr.new(m: {}))
+      g = ->(x: Writer, s: Str) { x.header.add!("k", s) }
+      for i in 0...n {
+        call1(g, w, "#{i}")
+      }
+      "#{w.header.m["k"]}"
+    }
+    t.wait.unwrap
+  }
+  f(5)
+}
+
+def gen_lambda -> Str {
+  w = Writer.new(header: Hdr.new(m: {}))
+  f = ->(x: Writer, s: Str) { x.header.add!("g", s) }
+  e = Enumerator.new { |y| i = 0; loop { y << i; i += 1 } }
+  for i in e.take(20) {
+    call1(f, w, "#{i}")
+  }
+  "#{w.header.m["g"]}"
+}
+
+# A lambda made inside a generator's body, writing into its parameter.
+def lambda_in_gen -> Str {
+  e = Enumerator.new { |y|
+    w = Writer.new(header: Hdr.new(m: {}))
+    f = ->(x: Writer, s: Str) { x.header.set!("y#{s}", s) }
+    i = 0
+    loop {
+      call1(f, w, "#{i}")
+      y << "#{w.header.m.size}:#{w.header.m["y#{i}"]}"
+      i += 1
+    }
+  }
+  xs = e.take(25)
+  xs[xs.size - 1]
+}
+
+w1 = Writer.new(st: [0], header: Hdr.new(m: {}))
+one_level(w1)
+puts "one: #{w1.header.m.size} #{w1.header.m["k0"]} #{w1.header.m["k39"]}"
+
+w2 = Writer.new(header: Hdr.new(m: {}))
+two_levels(w2)
+puts "two: #{w2.header.m["two"]}"
+
+w3 = Writer.new(header: Hdr.new(m: {}))
+three_levels(w3)
+puts "three: #{w3.header.m["three"]}"
+
+for d in 0...4 {
+  h = wrapped(d)
+  w = Writer.new(header: Hdr.new(m: {}))
+  path = ""
+  for i in 0...d {
+    path = path + "/p#{i}"
+  }
+  h.serve(w, path + "/leaf")
+  churn()
+  puts "depth #{d}: #{w.header.m["X-Path"]}"
+}
+
+o = Out.new(buf: Buf.new(), tags: {})
+slices_and_writes(o)
+puts "out: #{o.tags.size} #{o.tags["t49"]} (captured buf: #{o.buf.xs.size})"
+
+puts "captures: #{captures()}"
+puts "task: #{in_task()}"
+puts "task in lambda: #{task_in_lambda()}"
+puts "generator: #{gen_lambda()}"
+puts "lambda in generator: #{lambda_in_gen()}"

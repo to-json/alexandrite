@@ -115,8 +115,23 @@ static inline AlxRegion *alx_region_use(AlxRegion *r) {
     alx_region_set(r);
     return p;
 }
-/* Region structs freed with their one chunk wait here for the next enter. */
+/* Region structs freed with their one chunk wait here for the next enter.
+ * Not under ASan: a freed region's chunk is free()d there, so a use after
+ * the region ends is reported (port-issues #164) instead of reading the
+ * next region's data. */
+#if defined(__has_feature)
+#  if __has_feature(address_sanitizer)
+#    define ALX_NO_REGION_CACHE 1
+#  endif
+#endif
+#if defined(__SANITIZE_ADDRESS__)
+#  define ALX_NO_REGION_CACHE 1
+#endif
+#ifdef ALX_NO_REGION_CACHE
+enum { ALX_CACHED_CAP = 0 };
+#else
 enum { ALX_CACHED_CAP = 8 };
+#endif
 /* A fresh empty region, made current. The common case (a pooled struct that
  * kept its chunk) is inline. */
 static inline AlxRegion *alx_region_enter(void) {

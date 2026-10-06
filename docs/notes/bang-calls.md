@@ -39,6 +39,27 @@ call). There is no write-back in the typed tree.
      the local (what the old cell's site was): the frame, an iteration region,
      the result's, the program region.
 
+In a lambda's body (port-issues #164) the analysis of the function the
+lambda is written in can't name a frame: a lambda has none, and the region
+current when it runs is its caller's choice (its result's region), which
+may be a frame that ends right after the call. regions.rs gives each site
+in a lambda's body an `LPlace` of its own (`FnPlacement::lambda_sites`),
+found by following what the site must outlive through the lambda's own
+locals and stopping at its parameters and captures:
+
+- nothing outside the lambda: the current region (`Cur`);
+- one parameter or capture `x`: the region `x`'s storage lives in, found
+  at run time (`Storage(x)`). For a `!` call on `x.f.g` that is the region
+  of the place `x.f.g` when it holds a single pointer (an array, map or
+  string, or a struct with one such field: `w.header` is one map although
+  `w` holds more), else of `x`, else the program region (lower.rs
+  `storage_region`; a null pointer gives the program region);
+- anything else (several of them, the program region): the program region.
+
+A def's `Place::Into(p)` uses the same `storage_region` (it took the
+region of array and string parameters only, the program region for
+everything else).
+
 Copies are kept (a cell in that region, written back after the call) where a
 view can't be used:
 

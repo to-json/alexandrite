@@ -1,0 +1,118 @@
+# Handlers that wrap handlers (Go's server.go: HandlerFunc, StripPrefix,
+# TimeoutHandler, AllowQuerySemicolons). Each returns a Handler whose
+# closure holds the wrapped Handler, which may itself be one of these
+# (a closure holding closures of its own type, R12/R13), so they nest:
+#
+#   api = http.new_serve_mux
+#   api.handle_func("GET /items/{id}") { |w, r| ... }
+#   root = http.new_serve_mux
+#   root.handle("/api/", http.strip_prefix("/api", api))
+#   slow = http.timeout_handler(http.handler_func(f), time.second * 2, "")
+import "strings"
+import "time"
+
+# A function as a Handler (Go's HandlerFunc type; `handler_func(f)` is
+# Go's conversion `HandlerFunc(f)`).
+pub struct HandlerFunc {
+  f: (ResponseWriter, Request) -> Unit
+
+  pub def serve_http(w: ResponseWriter, r: Request) {
+    g = f
+    g(w, r)
+  }
+}
+
+pub def handler_func(f: (ResponseWriter, Request) -> Unit) -> Handler {
+  HandlerFunc.new(f: f)
+}
+
+# Go's NotFoundHandler: answers every request with "404 page not found".
+pub def not_found_handler -> Handler {
+  handler_func(->(w: ResponseWriter, r: Request) { not_found(w, r) })
+}
+
+# Go's RedirectHandler: redirects every request to `url` with `code`.
+pub def redirect_handler(url: Str, code: Int) -> Handler {
+  handler_func(->(w: ResponseWriter, r: Request) { redirect(w, r, url, code) })
+}
+
+# Go's StripPrefix: serves the request with `prefix` removed from its path
+# (and its raw path) by `h`; a path without the prefix gets 404.
+pub def strip_prefix(prefix: Str, h: Handler) -> Handler {
+  handler_func(->(w: ResponseWriter, r: Request) {
+    pu = r.parsed_url
+    p = strings.trim_prefix(pu.path, prefix)
+    rp = strings.trim_prefix(pu.raw_path, prefix)
+    unless p.size < pu.path.size && (pu.raw_path == "" || rp.size < pu.raw_path.size) {
+      not_found(w, r)
+      return
+    }
+    r2 = r
+    r2.parsed_url.path = p
+    r2.parsed_url.raw_path = rp
+    r2.path = p
+    h.serve_http(w, r2)
+  })
+}
+
+# Go's AllowQuerySemicolons: serves the request with each ";" in its query
+# turned into "&" (Go's server no longer treats ";" as a separator).
+pub def allow_query_semicolons(h: Handler) -> Handler {
+  handler_func(->(w: ResponseWriter, r: Request) {
+    if strings.contains(r.raw_query, ";") {
+      r2 = r
+      q = strings.replace_all(r.raw_query, ";", "&")
+      r2.raw_query = q
+      r2.parsed_url.raw_query = q
+      r2.form_parsed = false
+      h.serve_http(w, r2)
+    } else {
+      h.serve_http(w, r)
+    }
+  })
+}
+
+# The body TimeoutHandler sends when `msg` is "" (Go's errorBody).
+pub TIMEOUT_BODY = "<html><head><title>Timeout</title></head><body><h1>Timeout</h1></body></html>"
+
+# Go's TimeoutHandler: runs `h` with a buffered writer in its own task and
+# sends what it wrote; if it takes longer than `dt`, answers 503 Service
+# Unavailable with `msg` (TIMEOUT_BODY when "") instead.
+#
+# Differences from Go: the handler isn't told it timed out (Go's writes
+# then fail with ErrHandlerTimeout and the request's context is done; alx's
+# context carries nothing to the handler): it runs to its end and its
+# output is dropped. A panic in the handler ends its task, and the request
+# then times out.
+pub def timeout_handler(h: Handler, dt: time.Duration, msg: Str) -> Handler {
+  body = msg == "" ? TIMEOUT_BODY : msg
+  handler_func(->(w: ResponseWriter, r: Request) {
+    # (the handler's writer comes back over `done` when it ends)
+    done = Chan[ResponseWriter].new(1)
+    h2 = h
+    r2 = r.dup
+    _ = spawn {
+      tw = new_recording_writer
+      h2.serve_http(tw, r2)
+      done << tw
+    }
+    timer = time.after(dt)
+    select {
+      when got = done.recv => {
+        tw = got.unwrap
+        dst = w.header
+        src = tw.recorded_header
+        for k in src.keys {
+          dst.set_raw!(k, src.values(k))
+        }
+        code = tw.status
+        w.write_header!(code == 0 ? 200 : code)
+        _ = w.write!(tw.recorded_body)
+      }
+      when timer.recv => {
+        w.write_header!(503)
+        _ = w.write_string!(body)
+      }
+    }
+  })
+}

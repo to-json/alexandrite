@@ -21,6 +21,14 @@
 //! lived?), solved to a fixpoint over the whole program. Anything not
 //! understood is treated as escaping, so the analysis errs toward keeping
 //! memory, never toward freeing it early.
+//!
+//! Lambdas: a lambda's body is part of its function's graph, but it runs
+//! later, from anywhere, with no frame of its own (port-issues #164). Its
+//! parameters are its caller's storage (`Caller` nodes, as a def's), its
+//! captures are not aliased to them, and its result doesn't flow into the
+//! lambda value. Each site in its body also gets an `LPlace`
+//! (`lambda_place`): the current region, the storage of one parameter or
+//! capture, or the program region.
 
 use crate::tast::*;
 use std::fmt::Write;
@@ -60,6 +68,25 @@ pub struct FnPlacement {
     /// which locals refer to each one's header.
     pub owners: HashMap<LocalId, Owner>,
     pub owner_alias: HashMap<LocalId, LocalId>,
+    /// Sites inside a lambda's body (by address): where they go when the
+    /// lambda runs (port-issues #164). A lambda has no frame of its own: the
+    /// region current when it runs is its caller's choice, which outlives
+    /// only the call. What the body stores into storage it doesn't own (a
+    /// parameter's, a capture's) must go where that storage lives.
+    pub lambda_sites: HashMap<usize, LPlace>,
+}
+
+/// Where an allocation site in a lambda's body goes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LPlace {
+    /// The current region (the lambda's result, or temporaries).
+    Cur,
+    /// Stored into the storage behind this parameter or capture of the
+    /// lambda (and nothing else outside it): the region that storage lives
+    /// in, found at run time (the program region when it can't be).
+    Storage(LocalId),
+    /// Anything else: the program region.
+    Program,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -139,9 +166,22 @@ struct Graph<'a> {
     why_global: HashMap<Node, crate::diag::Span>,
     /// Where each loop is (its condition, or the iterating call).
     loop_at: HashMap<usize, crate::diag::Span>,
+    /// The lambdas (by key, innermost last) around the walk's current
+    /// point, and the innermost one of each site inside one.
+    lambdas: Vec<u64>,
+    site_lambda: HashMap<usize, u64>,
 }
 
 impl<'a> Graph<'a> {
+    fn add_site(&mut self, e: &'a TExpr) {
+        let k = e as *const TExpr as usize;
+        self.sites.push(k);
+        self.site_exprs.insert(k, e);
+        self.site_loops.insert(k, self.loops.clone());
+        if let Some(l) = self.lambdas.last() {
+            self.site_lambda.insert(k, *l);
+        }
+    }
     fn edge(&mut self, a: Node, b: Node) {
         if a != b {
             self.edges.entry(a).or_default().push(b);
@@ -189,11 +229,8 @@ impl<'a> Graph<'a> {
         let ctor = matches!(e.kind, TK::Call(..) | TK::M(M::StructNew | M::TupleNew | M::VariantNew(_) | M::EnumNew, ..));
         let scalar_call = ctor && !has_storage(&e.ty) && !(promote && contains_int(&e.ty));
         if allocates(e, promote) && !scalar_call {
-            let s = site(e);
-            self.sites.push(e as *const TExpr as usize);
-            self.site_exprs.insert(e as *const TExpr as usize, e);
-            self.site_loops.insert(e as *const TExpr as usize, self.loops.clone());
-            v.push(s);
+            self.add_site(e);
+            v.push(site(e));
         }
         match &e.kind {
             TK::Local(l) => v.push(Node::Local(*l)),
@@ -235,10 +272,7 @@ impl<'a> Graph<'a> {
                 let vw = [Node::Local(*view)];
                 self.alias(&[Node::Local(*l)], &vw);
                 if !steps.iter().any(|s| matches!(s, TStep::Index(_))) {
-                    let k = e as *const TExpr as usize;
-                    self.sites.push(k);
-                    self.site_exprs.insert(k, e);
-                    self.site_loops.insert(k, self.loops.clone());
+                    self.add_site(e);
                     self.flow(&[site(e)], &vw);
                 }
                 self.mutations.push((vw.to_vec(), self.loops.clone()));
@@ -339,11 +373,24 @@ impl<'a> Graph<'a> {
                 if let Some(b) = blk {
                     // Block parameters refer to the receiver's elements (and
                     // to the accumulator, for reduce-like methods).
+                    // A lambda's parameters are its caller's arguments, not
+                    // its captures (graph() gives them `Caller` nodes).
                     let params: Vec<Node> = b.params.iter().map(|p| Node::Local(*p)).collect();
                     let mut src = rv.clone();
                     src.extend(avs.iter().copied());
-                    self.alias(&src, &params);
-                    if matches!(m, M::Spawn | M::EnumNew) {
+                    if *m != M::Lambda {
+                        self.alias(&src, &params);
+                    }
+                    if *m == M::Lambda {
+                        // The body runs when the lambda is called, with the
+                        // caller's region current; its result goes to that
+                        // caller, not into the lambda value.
+                        self.lambdas.push(((b.id as u64) << 32) | b.span.lo as u64);
+                        for s in &b.body {
+                            self.stmt(s);
+                        }
+                        self.lambdas.pop();
+                    } else if matches!(m, M::Spawn | M::EnumNew) {
                         // Everything the body touches outlives the caller.
                         let mut inner = vec![];
                         for s in &b.body {
@@ -512,9 +559,10 @@ pub fn has_storage(t: &Ty) -> bool {
 }
 
 fn graph<'a>(f: &'a TFunc, sums: &'a [Summary], ifaces: &'a Ifaces) -> Graph<'a> {
-    let mut g = Graph { f, sums, ifaces, edges: HashMap::new(), sites: vec![], site_exprs: HashMap::new(), loops: vec![], site_loops: HashMap::new(), loop_bodies: HashMap::new(), mutations: vec![], defs: vec![], at: f.span, why_global: HashMap::new(), loop_at: HashMap::new() };
-    // Writing into a parameter's storage writes into the caller's objects.
-    for p in &f.params {
+    let mut g = Graph { f, sums, ifaces, edges: HashMap::new(), sites: vec![], site_exprs: HashMap::new(), loops: vec![], site_loops: HashMap::new(), loop_bodies: HashMap::new(), mutations: vec![], defs: vec![], at: f.span, why_global: HashMap::new(), loop_at: HashMap::new(), lambdas: vec![], site_lambda: HashMap::new() };
+    // Writing into a parameter's storage writes into the caller's objects
+    // (a lambda's parameters too: its caller's).
+    for p in f.params.iter().chain(f.lambda_info.iter().flat_map(|(_, ps, _)| ps)) {
         g.edge(Node::Local(*p), Node::Caller(*p));
     }
     let n = f.body.len();
@@ -567,8 +615,8 @@ pub fn aliases(p: &TProgram) -> Vec<HashMap<LocalId, (Vec<LocalId>, Vec<LocalId>
                         }
                         seen.push(*m);
                         match m {
-                            Node::Caller(q) => callers.push(*q),
-                            Node::Ret | Node::Global => {}
+                            Node::Caller(q) if f.params.contains(q) => callers.push(*q),
+                            Node::Caller(_) | Node::Ret | Node::Global => {}
                             // A mutex is a wall: what it guards is reached
                             // only under its lock.
                             Node::Local(x) if matches!(f.locals[*x].ty, Ty::Mutex(_) | Ty::Atomic(_)) => {}
@@ -621,7 +669,9 @@ fn clean_fn_types(p: &TProgram, sums: &[Summary]) -> std::collections::HashSet<S
             let escapes = params.iter().any(|pl| {
                 reaches_from(&g, Node::Local(*pl)).iter().any(|n| match n {
                     Node::Local(x) => *x < *own_lo || *x >= *own_hi,
-                    Node::Global | Node::Ret | Node::Caller(_) => true,
+                    // Into its own argument: placed where that lives.
+                    Node::Caller(q) => q != pl,
+                    Node::Global | Node::Ret => true,
                     _ => false,
                 })
             });
@@ -700,7 +750,10 @@ fn analyze_with(p: &TProgram, sums: &[Summary]) -> Vec<FnPlacement> {
                 let reach = reaches_from(&g, Node::Site(*s));
                 let callers: Vec<LocalId> = reach.iter().filter_map(|n| if let Node::Caller(l) = n { Some(*l) } else { None }).collect();
                 let ret = reach.contains(&Node::Ret);
-                let place = if reach.contains(&Node::Global) || callers.len() > 1 || (ret && !callers.is_empty()) {
+                // Into a lambda's argument (through a capture the lambda
+                // stores there): storage of unknown lifetime.
+                let lambda_arg = callers.iter().any(|c| !f.params.contains(c));
+                let place = if reach.contains(&Node::Global) || lambda_arg || callers.len() > 1 || (ret && !callers.is_empty()) {
                     Place::Global
                 } else if let [p] = callers.as_slice() {
                     out.into = true;
@@ -717,11 +770,61 @@ fn analyze_with(p: &TProgram, sums: &[Summary]) -> Vec<FnPlacement> {
                     out.loops.insert(l);
                 }
                 out.sites.insert(*s, place);
+                if let Some(lk) = g.site_lambda.get(s) {
+                    out.lambda_sites.insert(*s, lambda_place(f, &g, *s, *lk));
+                }
             }
             owners(f, &g, &fresh, &mut out);
             out
         })
         .collect()
+}
+
+/// Where site `s`, in the body of lambda `lk`, goes when the lambda runs:
+/// follow what it must outlive through the lambda's own locals; stop at its
+/// parameters and captures (storage it doesn't own, which lives wherever
+/// its caller or creator put it).
+fn lambda_place(f: &TFunc, g: &Graph, s: usize, lk: u64) -> LPlace {
+    let Some((_, params, (lo, hi))) = f.lambda_info.iter().find(|(l, _, _)| *l == lk) else {
+        return LPlace::Program;
+    };
+    let caps: &[LocalId] = f.lambdas.iter().find(|(l, _, _)| *l == lk).map_or(&[], |(_, _, c)| c);
+    let mut into: Vec<LocalId> = vec![];
+    let start = Node::Site(s);
+    let mut seen = vec![start];
+    let mut stack = vec![start];
+    while let Some(n) = stack.pop() {
+        for m in g.edges.get(&n).into_iter().flatten() {
+            if seen.contains(m) {
+                continue;
+            }
+            seen.push(*m);
+            match m {
+                Node::Global => return LPlace::Program,
+                // The def's own result (a `return` in the body has none of
+                // the lambda's storage) or a parameter's caller (reached
+                // from the parameter, below).
+                Node::Ret | Node::Caller(_) => {}
+                // What the argument's or capture's storage must outlive,
+                // it outlives already.
+                Node::Local(x) if params.contains(x) || caps.contains(x) => {
+                    if !into.contains(x) {
+                        into.push(*x);
+                    }
+                }
+                // A variable of the enclosing function the body can't name
+                // (never guess). Compiler temporaries made after checking
+                // (capture.rs's `_push`) sit outside the lambda's range too.
+                Node::Local(x) if (*x < *lo || *x >= *hi) && (f.locals[*x].user || f.params.contains(x)) => return LPlace::Program,
+                _ => stack.push(*m),
+            }
+        }
+    }
+    match into.as_slice() {
+        [] => LPlace::Cur,
+        [x] => LPlace::Storage(*x),
+        _ => LPlace::Program,
+    }
 }
 
 /// Nodes reachable from `start` (following "must live as long as" edges).
@@ -980,6 +1083,19 @@ pub fn explain(p: &TProgram, sm: &crate::diag::SourceMap, files: &[u32]) -> Stri
                 continue;
             }
             let place = pl.sites.get(&s).copied().unwrap_or(Place::Frame);
+            let in_lambda = match pl.lambda_sites.get(&s) {
+                Some(LPlace::Cur) => Some("in a lambda: the region current when it runs (its caller's)".to_string()),
+                Some(LPlace::Storage(x)) => Some(format!("in a lambda: the region of `{}` (stored into it)", f.locals[*x].name)),
+                Some(LPlace::Program) => {
+                    total += 1;
+                    Some("in a lambda: program region, never freed".to_string())
+                }
+                None => None,
+            };
+            if let Some(why) = in_lambda {
+                let _ = writeln!(lines, "  {:<7} {:<34} {why}", line_col(e.span), snip);
+                continue;
+            }
             let why = match place {
                 Place::Frame => {
                     let when = if f.is_main { "the program ends".to_string() } else { format!("`{}` returns", f.src_name) };

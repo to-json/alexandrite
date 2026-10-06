@@ -1,0 +1,181 @@
+# Handlers that wrap handlers: Go's serve_test.go TestStripPrefix,
+# TestStripPrefixNotModifyRequest, TestQuerySemicolon, TestTimeoutHandler,
+# TestTimeoutHandlerEmptyResponse, translated, and wrappers nested in each
+# other and in muxes.
+import "net"
+import "strings"
+import "time"
+
+# Starts a server for any Handler on a free port.
+def start_handler(h: Handler) -> (Server, Int) {
+  srv = new_server_handler(h)
+  ln = net.listen("tcp", "127.0.0.1:0").unwrap
+  port = ln.port
+  spawn { srv.serve(ln) }
+  (srv, port)
+}
+
+def at(port: Int, path: Str) -> Str {
+  "http://127.0.0.1:#{port}#{path}"
+}
+
+test "strip prefix" {
+  h = handler_func(->(w: ResponseWriter, r: Request) {
+    w.header.set!("X-Path", r.parsed_url.path)
+    w.header.set!("X-RawPath", r.parsed_url.raw_path)
+  })
+  srv, port = start_handler(strip_prefix("/foo/bar", h))
+  # (request path, path, raw path; "" path: want a 404)
+  cases = [("/foo/bar/qux", "/qux", ""), ("/foo/bar%2Fqux", "/qux", "%2Fqux"), ("/foo%2Fbar/qux", "", ""), ("/bar", "", "")]
+  for c in cases {
+    res = get(at(port, c[0])).unwrap
+    if c[1] == "" {
+      assert res.status == 404, c[0]
+      next
+    }
+    assert res.status == 200, c[0]
+    assert res.header.get("X-Path") == c[1], "#{c[0]}: got #{res.header.get("X-Path")} #{res.header.keys}"
+    assert res.header.get("X-RawPath") == c[2], c[0]
+  }
+  srv.shutdown
+}
+
+test "strip prefix does not modify the request" {
+  h = strip_prefix("/foo", not_found_handler())
+  req = new_request("GET", "http://example.com/foo/bar", []).unwrap
+  req.path = req.parsed_url.path
+  rec = new_recording_writer
+  h.serve_http(rec, req)
+  assert_eq req.parsed_url.path, "/foo/bar"
+  assert_eq req.path, "/foo/bar"
+  assert_eq rec.status, 404
+}
+
+# (query, x without allow_query_semicolons, x with it, parse_form fails
+# without it)
+def semicolon_cases -> [(Str, Str, Str, Bool)] {
+  [("?a=1;x=bad&x=good", "good", "bad", true), ("?a=1;b=bad&x=good", "good", "good", true), ("?a=1%3Bx=bad&x=good%3B", "good;", "good;", false), ("?a=1;x=good;x=bad", "", "good", true)]
+}
+
+def write_back_x(want_parse_err: Bool) -> Handler {
+  handler_func(->(w: ResponseWriter, r: Request) {
+    x = query_value(r.parsed_url.raw_query, "x") || ""
+    rq = r
+    pr = rq.parse_form!
+    if want_parse_err {
+      assert strings.contains(pr.err.unwrap.message, "semicolon")
+    } else {
+      assert pr.ok?
+    }
+    assert_eq rq.form_value("x") || "", x
+    w.write_string!(x).unwrap
+  })
+}
+
+test "allow query semicolons" {
+  for allow in [false, true] {
+    for c in semicolon_cases() {
+      want_err = allow ? false : c[3]
+      h = write_back_x(want_err)
+      h = allow_query_semicolons(h) if allow
+      srv, port = start_handler(h)
+      res = get(at(port, "/" + c[0])).unwrap
+      assert_eq res.status, 200
+      assert res.body_string == (allow ? c[2] : c[1]), "#{c[0]} allow=#{allow}"
+      srv.shutdown
+    }
+  }
+}
+
+test "timeout handler" {
+  send_hi = Chan[Bool].new(1)
+  say_hi = handler_func(->(w: ResponseWriter, r: Request) {
+    _ = send_hi.recv
+    w.write!("hi".bytes).unwrap
+  })
+  srv, port = start_handler(timeout_handler(say_hi, time.millisecond * 200, ""))
+  # succeeds without timing out
+  send_hi << true
+  res = get(at(port, "/")).unwrap
+  assert_eq res.status, 200
+  assert_eq res.body_string, "hi"
+  # times out
+  res = get(at(port, "/")).unwrap
+  assert_eq res.status, 503
+  assert strings.contains(res.body_string, "<title>Timeout</title>")
+  assert_eq res.header.get("Content-Type"), "text/html; charset=utf-8"
+  # (lets the timed-out handler end)
+  send_hi << true
+  srv.shutdown
+}
+
+test "timeout handler: empty response, status, headers and a message" {
+  empty = handler_func(->(w: ResponseWriter, r: Request) {})
+  srv, port = start_handler(timeout_handler(empty, time.millisecond * 300, ""))
+  res = get(at(port, "/")).unwrap
+  assert_eq res.status, 200
+  srv.shutdown
+
+  teapot = handler_func(->(w: ResponseWriter, r: Request) {
+    w.header.set!("X-Tea", "earl grey")
+    w.write_header!(418)
+    w.write_string!("short and stout").unwrap
+  })
+  srv, port = start_handler(timeout_handler(teapot, time.second, ""))
+  res = get(at(port, "/")).unwrap
+  assert_eq res.status, 418
+  assert_eq res.header.get("X-Tea"), "earl grey"
+  assert_eq res.body_string, "short and stout"
+  srv.shutdown
+
+  slow = handler_func(->(w: ResponseWriter, r: Request) { time.sleep(time.second) })
+  srv, port = start_handler(timeout_handler(slow, time.millisecond * 20, "too slow"))
+  res = get(at(port, "/")).unwrap
+  assert_eq res.status, 503
+  assert_eq res.body_string, "too slow"
+  srv.shutdown
+}
+
+# Wrappers hold wrappers: a mux mounted inside another one under a prefix,
+# behind a timeout, with redirects and 404s from the inner handlers.
+test "nested handlers and muxes" {
+  api = new_serve_mux
+  api.handle_func("GET /items/{id}") { |w, r|
+    w.write_string!("item #{r.path_value("id")} at #{r.parsed_url.path}").unwrap
+  }
+  api.handle("/old", redirect_handler("/api/items/1", 301))
+  v2 = new_serve_mux
+  v2.handle_func("/ping") { |w, r| w.write_string!("pong").unwrap }
+  api.handle("/v2/", strip_prefix("/v2", v2))
+  root = new_serve_mux
+  root.handle("/api/", timeout_handler(strip_prefix("/api", api), time.second, ""))
+  root.handle_func("/{$}") { |w, r| w.write_string!("root").unwrap }
+  srv, port = start_handler(root)
+  assert_eq get(at(port, "/")).unwrap.body_string, "root"
+  assert_eq get(at(port, "/api/items/7")).unwrap.body_string, "item 7 at /items/7"
+  assert_eq get(at(port, "/api/v2/ping")).unwrap.body_string, "pong"
+  assert_eq get(at(port, "/api/old")).unwrap.body_string, "item 1 at /items/1"
+  assert_eq get(at(port, "/api/nope")).unwrap.status, 404
+  assert_eq get(at(port, "/nope")).unwrap.status, 404
+  srv.shutdown
+}
+
+# Go-style middleware: a function from Handler to Handler, applied in a
+# chain; each layer's closure holds the next layer.
+def tagged(tag: Str, inner: Handler) -> Handler {
+  handler_func(->(w: ResponseWriter, r: Request) {
+    w.header.add!("X-Chain", tag)
+    inner.serve_http(w, r)
+  })
+}
+
+test "middleware chain" {
+  h = handler_func(->(w: ResponseWriter, r: Request) { w.write_string!("end").unwrap })
+  for t in ["c", "b", "a"] {
+    h = tagged(t, h)
+  }
+  rec = new_recording_writer
+  h.serve_http(rec, new_request("GET", "http://x/", []).unwrap)
+  assert_eq rec.header.values("X-Chain"), ["a", "b", "c"]
+  assert_eq Str.from_bytes(rec.recorded_body), "end"
+}

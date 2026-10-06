@@ -210,7 +210,7 @@ impl Rewriter<'_> {
                     self.stmts(&mut b.body);
                 }
             }
-            TK::PlaceAssign(_, steps, _, v) => {
+            TK::PlaceAssign(_, steps, _, v) | TK::Bang(_, steps, _, v) => {
                 for st in steps.iter_mut() {
                     if let TStep::Index(i) = st {
                         self.expr(i);
@@ -255,6 +255,12 @@ impl Rewriter<'_> {
                 let mut st = vec![TStep::Index(z)];
                 st.extend(steps.iter().cloned());
                 TExpr { kind: TK::PlaceAssign(*c, st, *op, v.clone()), ty: e.ty.clone(), span: sp }
+            }),
+            TK::Bang(l, steps, view, call) => self.cells.get(l).map(|c| {
+                let z = TExpr { kind: TK::Int(0), ty: Ty::Int, span: sp };
+                let mut st = vec![TStep::Index(z)];
+                st.extend(steps.iter().cloned());
+                TExpr { kind: TK::Bang(*c, st, *view, call.clone()), ty: e.ty.clone(), span: sp }
             }),
             // `xs << v` on a cell variable: through a temporary, written back.
             TK::M(M::Push, Some(recv), args, None) => match recv.kind {

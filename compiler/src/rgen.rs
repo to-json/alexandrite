@@ -88,7 +88,9 @@ enum Ctx {
 
 pub fn emit(p: &LProgram) -> String {
     WIDE.with(|w| w.borrow_mut().clear());
-    let out = emit_inner(p);
+    let mut owned = p.clone();
+    crate::lir::copy_views(&mut owned);
+    let out = emit_inner(&owned);
     // The wide tuples met while emitting (a type may name another: loop).
     let mut defs = String::new();
     let mut k = 0;
@@ -313,6 +315,7 @@ impl FnEmit<'_> {
                 self.line(&format!("let _ = G{k}.set({v});"));
             }
             LS::RegionFree(_) => {}
+            LS::View { .. } | LS::Unview { .. } => unreachable!("copy_views ran first"),
             // Rust owns its memory: regions are meaningless here.
             LS::RegionEnter { .. } | LS::RegionExit { .. } | LS::RegionUse { .. } | LS::RegionRestore(_) => {}
             LS::Spawn { dst, worker, env } => {
@@ -527,7 +530,7 @@ impl FnEmit<'_> {
             LE::Global(k) => format!("G{k}.get().unwrap().clone()"),
             LE::RegionNew(_) => "()".into(),
             LE::RegionBytes(_) => "(0i64)".into(),
-            LE::RegionOf(_) => "()".into(),
+            LE::RegionOf(_) | LE::ViewRegion(_) => "()".into(),
             LE::RegionProgram => "()".into(),
             LE::ChanNew(t, cap) => format!("Chan::<{}>::new({})", rty(t), self.e(cap)),
             LE::ChanLen(c) => format!("({}).len()", self.e(c)),

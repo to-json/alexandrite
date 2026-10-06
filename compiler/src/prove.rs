@@ -112,7 +112,7 @@ pub(crate) fn each_child<'a>(e: &'a TExpr, f: &mut dyn FnMut(&'a TExpr)) {
                 stmt_exprs(s, f);
             }
         }
-        TK::PlaceAssign(_, steps, _, v) => {
+        TK::PlaceAssign(_, steps, _, v) | TK::Bang(_, steps, _, v) => {
             for st in steps {
                 if let TStep::Index(i) = st {
                     f(i);
@@ -212,7 +212,7 @@ pub(crate) fn fault(e: &TExpr) -> Option<Fault> {
     let nonneg = |x: &TExpr| konst(x).is_some_and(|c| c >= 0) || x.ty.int_kind().is_some_and(|k| !k.signed());
     match &e.kind {
         TK::Index(..) | TK::IndexAssign(..) => fault_of("IndexError", "index", "may be out of bounds"),
-        TK::PlaceAssign(_, steps, ..) if steps.iter().any(|s| matches!(s, TStep::Index(_))) => fault_of("IndexError", "index", "may be out of bounds"),
+        TK::PlaceAssign(_, steps, ..) | TK::Bang(_, steps, ..) if steps.iter().any(|s| matches!(s, TStep::Index(_))) => fault_of("IndexError", "index", "may be out of bounds"),
         TK::Slice(_, lo, hi, _) => {
             let from_start = lo.as_ref().is_none_or(|x| konst(x) == Some(0));
             if from_start && hi.is_none() { None } else { fault_of("IndexError", "slice", "may be out of range") }

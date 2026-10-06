@@ -216,6 +216,28 @@ impl<'a> Graph<'a> {
                 let xv = self.expr(x);
                 self.flow(&xv, &[Node::Local(*l)]);
             }
+            // `place.m!(..)`: the view refers to the place (an alias). A
+            // place in a local's own variables (no index step) gets its
+            // region from this site: what the callee stores into it lives
+            // there (see docs/notes/bang-calls.md).
+            TK::Bang(l, steps, view, call) => {
+                for st in steps {
+                    if let TStep::Index(i) = st {
+                        self.expr(i);
+                    }
+                }
+                let vw = [Node::Local(*view)];
+                self.alias(&[Node::Local(*l)], &vw);
+                if !steps.iter().any(|s| matches!(s, TStep::Index(_))) {
+                    let k = e as *const TExpr as usize;
+                    self.sites.push(k);
+                    self.site_exprs.insert(k, e);
+                    self.site_loops.insert(k, self.loops.clone());
+                    self.flow(&[site(e)], &vw);
+                }
+                self.mutations.push((vw.to_vec(), self.loops.clone()));
+                v.extend(self.expr(call));
+            }
             TK::Call(fid, args) => {
                 let sum = self.sums.get(*fid).cloned().unwrap_or_default();
                 for (i, a) in args.iter().enumerate() {
@@ -889,7 +911,7 @@ fn local_spans(s: &TStmt, l: LocalId, out: &mut Vec<crate::diag::Span>) {
 
 fn expr_spans(e: &TExpr, l: LocalId, out: &mut Vec<crate::diag::Span>) {
     match &e.kind {
-        TK::Local(x) | TK::Assign(x, _) | TK::IndexAssign(x, ..) | TK::PlaceAssign(x, ..) if *x == l => out.push(e.span),
+        TK::Local(x) | TK::Assign(x, _) | TK::IndexAssign(x, ..) | TK::PlaceAssign(x, ..) | TK::Bang(x, ..) if *x == l => out.push(e.span),
         _ => {}
     }
     if let TK::M(_, _, _, Some(b)) = &e.kind {
@@ -942,7 +964,7 @@ pub fn explain(p: &TProgram, sm: &crate::diag::SourceMap, files: &[u32]) -> Stri
                 None => "?".into(),
             };
             // Values without storage allocate nothing, except a store's growth.
-            let stores = matches!(e.kind, TK::IndexAssign(..) | TK::PlaceAssign(..) | TK::M(M::Push | M::MapSet | M::CopyInto | M::PoolAdd | M::PoolSet, ..));
+            let stores = matches!(e.kind, TK::IndexAssign(..) | TK::PlaceAssign(..) | TK::Bang(..) | TK::M(M::Push | M::MapSet | M::CopyInto | M::PoolAdd | M::PoolSet, ..));
             if (!has_storage(&e.ty) && !stores) || !shown.insert((e.span.lo, e.span.hi)) {
                 continue;
             }

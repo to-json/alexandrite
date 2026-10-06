@@ -1,5 +1,6 @@
 import "os"
 import "strings"
+import "time"
 
 def t(s: Str) -> Str { strings.trim_space(s) }
 
@@ -88,4 +89,66 @@ test "from_literal: stages and redirects in order" {
 test "look_path" {
   assert strings.has_suffix(look_path("sh").unwrap, "/sh")
   assert look_path("no-such-program-alx").err?
+}
+
+
+def ms(n: Int) -> time.Duration { time.Duration.new(n * 1000000) }
+
+def timeout_case -> ~Bool {
+  c = command("sleep", ["5"])
+  c.timeout = ms(100)
+  t0 = time.now
+  r = c.capture
+  dt = time.now.sub(t0).ns / 1000000
+  assert r.err?, "timed out"
+  assert dt >= 90 && dt < 3000, "returned in #{dt}ms"
+  e = r.err.unwrap
+  assert strings.contains(e.message, "timed out"), e.message
+  case e {
+    Timeout(info) => {
+      assert_eq info.state.signal, 9
+      assert c_kill(info.state.pid.to_i32, 0) != 0, "child was reaped (no zombie)"
+    }
+    _ => assert false, "wrong error: #{e.message}"
+  }
+  true
+}
+
+test "timeout kills a hung command, reaps it" { timeout_case.unwrap }
+
+test "timeout in a task" {
+  t = spawn { timeout_case.unwrap }
+  assert t.~wait
+}
+
+test "timeout kills a command whose output is discarded (run)" {
+  c = command("sleep", ["5"])
+  c.timeout = ms(100)
+  t0 = time.now
+  assert c.run.err?
+  assert time.now.sub(t0).ns / 1000000 < 3000
+}
+
+test "timeout kills every stage of a pipeline" {
+  c = command("sleep", ["5"]).pipe(command("cat", []))
+  c.timeout = ms(100)
+  t0 = time.now
+  assert c.capture.err?
+  assert time.now.sub(t0).ns / 1000000 < 3000
+}
+
+test "a command finishing before the timeout is unaffected" {
+  c = command("sh", ["-c", "echo out; echo err >&2"])
+  c.timeout = ms(10000)
+  r = c.capture.unwrap
+  assert_eq t(r.stdout), "out"
+  assert_eq t(r.stderr), "err"
+  assert r.state.success
+  d = command("true", [])
+  d.timeout = ms(10000)
+  assert d.run.unwrap.success
+  e = command("false", [])
+  e.timeout = ms(10000)
+  assert e.run.err?
+  assert_eq e.run.err.unwrap.message, "`false`: exit status 1"
 }

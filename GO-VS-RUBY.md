@@ -91,6 +91,10 @@ Status: **decided** (with who/when), **open** (recommendation given), or **curre
 | T6 | Matching | `case x { pattern => value }`, an expression; values, ranges, enum patterns, `_` (user, 2026-10-01) |
 | T7 | Loops | add `for x in xs { }` (statement; `break`/`next`/`return` as in Go's for-range) alongside Enumerable (user, 2026-10-01) |
 | T8 | Arrays | C1: `[T]` is a Go slice (shared storage, reslicing, append); `[T; N]` a fixed-size value array whose slices view its storage (user, 2026-10-01) |
+| T9 | Keyword tiers | **hard keywords transfer control**: `return`, `break`, `next`, `fail`, `spawn`, `defer` (with `def`, `if`, `case`, ...) can't name a local, parameter or top-level def, whatever the position: `fail(e)` is `fail (e)`, a bare `fail` is an error. They still name methods and fields (`t.fail`, `def fail` in a struct, `next: n`; a field is read as `self.fail`). **Contextual words** sit in declaration or infix position and are recognised only there: `import`, `pub`, `refine`, `error`, `extern`, `using`, `select`, `test`/`bench`/`example` start a statement only when no local of that name is in scope and the next token fits (`import = 1` and `pub + 1` are expressions; `import 42` is an error); `outputs`, `is`, `like` only follow what they belong to (user, 2026-10-06) |
+| T10 | Line continuation | an expression continues on the next line after a binary operator, `=` / `op=` / `a, b =`, or `.`, and when the next line **starts** with `.` or `?.` (Ruby's leading-dot chains: `xs\n  .map { }\n  .select { }`; comments may sit between the steps) (user, 2026-10-06) |
+| T11 | Heredocs | `<<~ID` interpolates `#{...}` like a double-quoted string (Ruby's default heredoc); the body is otherwise raw (no backslash escapes), except that `\#` is `#`, so `\#{` stays literal. The `#{...}` code may span lines and hold `#` comments, in strings and command literals too (user, 2026-10-06; was literal text since M2) |
+| T12 | `1.e5` | a method call `e5` on 1, as in Ruby (no Float literal without a digit after the point); the "no method" error says to write `1.0e5` (user, 2026-10-06) |
 
 ## Errors and optionals: spelling (user, 2026-10-01)
 

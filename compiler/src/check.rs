@@ -201,6 +201,11 @@ pub struct World<'a> {
     pub vars: Vec<VarInfo>,
     /// Interfaces whose values are compared with `==` (`iface_eq_instances`).
     pub eq_ifaces: Vec<String>,
+    /// Error values are compared with `==` somewhere (`M::ErrEq`).
+    pub eq_errors: bool,
+    /// Interfaces whose values are shown (`"#{v}"`): each implementor's
+    /// `to_s` is a stringer (`iface_stringers`).
+    pub show_ifaces: Vec<String>,
 }
 
 /// A package-level `Atomic[T]` / `Mutex[T]` (R11): the global holding it
@@ -339,7 +344,7 @@ impl<'a> World<'a> {
         GENERICS.with(|g| g.borrow_mut().clear());
         RECS.with(|r| r.borrow_mut().clear());
         INSTS.with(|g| g.borrow_mut().clear());
-        Ok(World { sm, defs, by_name, instances: HashMap::new(), declared_errs: HashMap::new(), funcs: vec![], sigs: HashMap::new(), fatal: None, structs: HashMap::new(), consts: HashMap::new(), ifaces: HashMap::new(), iface_order: vec![], impls: HashMap::new(), stringers: HashMap::new(), errors: vec![], refines: HashMap::new(), grefines: HashMap::new(), warnings: vec![], globals: vec![], pending_consts: vec![], vars: vec![], eq_ifaces: vec![] })
+        Ok(World { sm, defs, by_name, instances: HashMap::new(), declared_errs: HashMap::new(), funcs: vec![], sigs: HashMap::new(), fatal: None, structs: HashMap::new(), consts: HashMap::new(), ifaces: HashMap::new(), iface_order: vec![], impls: HashMap::new(), stringers: HashMap::new(), errors: vec![], refines: HashMap::new(), grefines: HashMap::new(), warnings: vec![], globals: vec![], pending_consts: vec![], vars: vec![], eq_ifaces: vec![], eq_errors: false, show_ifaces: vec![] })
     }
 
     /// Evaluate top-level constants, in order (each may use earlier ones).
@@ -765,6 +770,15 @@ impl<'a> World<'a> {
         let Some(&def) = self.by_name.get("__eq") else { return Ok(out) };
         loop {
             let mut changed = false;
+            // Error values (`M::ErrEq`): each error type's `__eq`, by error index.
+            if self.eq_errors {
+                let have = out.get("Error").map_or(0, Vec::len);
+                for t in self.errors.clone().iter().skip(have) {
+                    let fid = self.instance(def, vec![t.clone(), t.clone()], Span::default())?;
+                    out.entry("Error".into()).or_default().push(fid);
+                    changed = true;
+                }
+            }
             for n in self.eq_ifaces.clone() {
                 let impls: Vec<Ty> = self.impls.get(&n).map(|v| v.iter().map(|(t, _)| t.clone()).collect()).unwrap_or_default();
                 let have = out.get(&n).map_or(0, Vec::len);
@@ -776,6 +790,56 @@ impl<'a> World<'a> {
             }
             if !changed {
                 return Ok(out);
+            }
+        }
+    }
+
+    /// A shown interface value prints through its implementor's `to_s`
+    /// (Go's Stringer behind an interface, #261): the implementors are known
+    /// only now, so their stringers (and those of what they hold) are made
+    /// here, until nothing new appears.
+    pub fn iface_stringers(&mut self) -> R<()> {
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut done = 0;
+        loop {
+            let mut todo: Vec<Ty> = vec![];
+            for n in self.show_ifaces.clone() {
+                for (t, _) in self.impls.get(&n).cloned().unwrap_or_default() {
+                    todo.push(t);
+                }
+            }
+            let before = (self.show_ifaces.len(), self.impls.values().map(Vec::len).sum::<usize>());
+            while let Some(t) = todo.pop() {
+                if t.has_var() || !seen.insert(t.show()) {
+                    continue;
+                }
+                if self.stringers.contains_key(&t.show()) {
+                    continue;
+                }
+                if let Some(tn) = t.type_name() {
+                    if let Some(&def) = self.by_name.get(&method_name(tn, "to_s")) {
+                        let fid = self.instance(def, vec![t.clone()], Span::default())?;
+                        self.stringers.insert(t.show(), fid);
+                        continue;
+                    }
+                }
+                match t.unrec() {
+                    Ty::Array(e) | Ty::Fixed(e, _) | Ty::Opt(e) => todo.push((*e).clone()),
+                    Ty::Map(k, v) => {
+                        todo.push((*k).clone());
+                        todo.push((*v).clone());
+                    }
+                    Ty::Tuple(ts) => todo.extend(ts.iter().cloned()),
+                    Ty::Struct(_, fs) => todo.extend(fs.iter().map(|(_, x)| x.clone())),
+                    Ty::Enum(_, vs) => todo.extend(vs.iter().flat_map(|(_, fs)| fs.iter().map(|(_, x)| x.clone()))),
+                    Ty::Iface(n) if !self.show_ifaces.contains(&n) => self.show_ifaces.push(n),
+                    _ => {}
+                }
+            }
+            let after = (self.show_ifaces.len(), self.impls.values().map(Vec::len).sum::<usize>());
+            done += 1;
+            if after == before || done > 64 {
+                return Ok(());
             }
         }
     }
@@ -1954,7 +2018,9 @@ impl<'w, 'a> FnCx<'w, 'a> {
                 let e2 = self.coerce(e2, &rt)?;
                 *e = e2;
                 let t = e.ty.clone();
-                let rt = self.ret.clone();
+                // (Resolved: a bare `return` earlier made an undeclared
+                // result Unit, and then the tail's value is dropped, #263.)
+                let rt = self.resolve(&self.ret);
                 if !matches!(rt, Ty::Unit) && !self.unify(&t, &rt) {
                     return Err(Diag::new(e.span, format!("`{}` returns {}, but its last expression is {}", self.fn_name, self.resolve(&rt).show(), self.resolve(&t).show())));
                 }
@@ -3707,6 +3773,12 @@ impl<'w, 'a> FnCx<'w, 'a> {
                 self.stringers(v, sp)
             }
             Ty::Tuple(ts) => ts.iter().try_for_each(|x| self.stringers(x, sp)),
+            Ty::Iface(n) => {
+                if !self.w.show_ifaces.contains(n) {
+                    self.w.show_ifaces.push(n.clone());
+                }
+                Ok(())
+            }
             Ty::Struct(_, fs) => fs.clone().iter().try_for_each(|(_, x)| self.stringers(x, sp)),
             Ty::Enum(_, vs) => vs.clone().iter().flat_map(|(_, fs)| fs.iter().map(|(_, x)| x.clone())).collect::<Vec<_>>().iter().try_for_each(|x| self.stringers(x, sp)),
             _ => Ok(()),
@@ -3714,6 +3786,16 @@ impl<'w, 'a> FnCx<'w, 'a> {
     }
 
     fn show_value(&mut self, v: TExpr) -> R<TExpr> {
+        // An interface with a `to_s` method (its own or a default) shows
+        // through it (#261).
+        if let Ty::Iface(n) = self.resolve(&v.ty) {
+            let ms = self.w.ifaces.get(&n).cloned().unwrap_or_default();
+            if let Some(k) = ms.iter().position(|m| m.name == "to_s" && m.params.is_empty() && m.ret == Ty::Str && !m.caller) {
+                let sp = v.span;
+                self.impure = true;
+                return Ok(self.mk(TK::M(M::IfaceCall(k), Some(Box::new(v)), vec![], None), Ty::Str, sp));
+            }
+        }
         self.stringers(&v.ty.clone(), v.span)?;
         if let Some(sn) = self.resolve(&v.ty).type_name().map(str::to_string) {
             if let Some(&def) = self.w.by_name.get(&method_name(&sn, "to_s")) {
@@ -5084,6 +5166,21 @@ impl<'w, 'a> FnCx<'w, 'a> {
         // (it used to reach the backends as a comparison of arrays).
         if matches!(op, BinOp::Eq | BinOp::Ne) && (matches!(lres, Ty::Mutex(_)) || matches!(&lres, Ty::Atomic(t) if t.atomic_boxed())) {
             return Err(Diag::new(sp, format!("`{}` on {}: a lock's state can't be compared; compare what it guards (`m.lock {{ |v| v }}`)", op.text(), lres.show())));
+        }
+        // Errors (Go's `err == ErrX`, port-issues #260): the same error type,
+        // equal values of it and the same `wrap` context (where each was
+        // raised doesn't matter). An error type's value converts to Error.
+        let rres = self.resolve(&r.ty);
+        if matches!(op, BinOp::Eq | BinOp::Ne) && (lres == Ty::Error || rres == Ty::Error) && !matches!(lres, Ty::Opt(_) | Ty::Var(_)) && !matches!(rres, Ty::Opt(_) | Ty::Var(_)) {
+            let l = self.coerce(l, &Ty::Error)?;
+            let r = self.coerce(r, &Ty::Error)?;
+            let (a, b) = (self.resolve(&l.ty), self.resolve(&r.ty));
+            if a != Ty::Error || b != Ty::Error {
+                return Err(Diag::new(sp, format!("`{}` between {} and {}", op.text(), a.show(), b.show())));
+            }
+            self.w.eq_errors = true;
+            let eq = self.mk(TK::M(M::ErrEq, Some(Box::new(l)), vec![r], None), Ty::Bool, sp);
+            return Ok(if op == BinOp::Ne { self.mk(TK::Not(Box::new(eq)), Ty::Bool, sp) } else { eq });
         }
         // Interface values: the same implementor, and equal values of it
         // (#108). Lowering dispatches on the tag to each implementor's `__eq`.
@@ -6838,6 +6935,11 @@ impl<'w, 'a> FnCx<'w, 'a> {
                 let t = type_from(&te, &self.w.structs, &self.w.consts)?;
                 let k = self.w.implement(iname, &t, args[0].span)?;
                 return Ok(mk_m(self, M::IfaceOpt(k), recv, vec![], None, Ty::Opt(Box::new(t))));
+            }
+            // An interface value's `dup`: a deep copy of the value inside
+            // (so a boxed one, R13, can go to a task, #262).
+            if matches!(name, "dup" | "clone") && args.is_empty() && block.is_none() && !ms_has(&self.w.ifaces[iname], name) {
+                return Ok(mk_m(self, M::Dup, recv, vec![], None, rt.clone()));
             }
             let ms = self.w.ifaces[iname].clone();
             let Some(k) = ms.iter().position(|m| m.name == name) else {

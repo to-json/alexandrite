@@ -511,6 +511,10 @@ pub enum M {
     /// `a == b` on interface values (recv a, args [b]): the same
     /// implementor, and `__eq` of the two values (`TProgram::iface_eqs`).
     IfaceEq,
+    /// `a == b` on Error values (recv a, args [b]): the same error type,
+    /// `__eq` of the two values of it (`TProgram::iface_eqs["Error"]`, by
+    /// error index) and the same `wrap` context; not where they were raised.
+    ErrEq,
     /// Build variant `k` of an enum: args are every slot after the tag.
     VariantNew(usize),
     /// `find { pred }` → T? (a select stage, then this terminal).
@@ -755,6 +759,8 @@ pub struct TProgram {
     /// `M::SetGlobal` at the start of main rather than from a literal.
     pub vars: Vec<usize>,
     /// For each interface whose values are compared with `==`: the
-    /// `__eq` instance of each implementor, in tag order.
+    /// `__eq` instance of each implementor, in tag order. Under "Error"
+    /// (no interface has that name): each error type's, by error index,
+    /// when Error values are compared.
     pub iface_eqs: HashMap<String, Vec<FuncId>>,
 }

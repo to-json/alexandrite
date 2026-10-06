@@ -30,7 +30,7 @@ test "child cancel leaves the parent" {
 }
 
 test "timeout" {
-  ctx, _ = with_timeout(background, time.duration(20000000))
+  ctx, _ = with_timeout(background, time.millisecond * 20)
   assert !ctx.done?
   ctx.done.recv
   assert ctx.err.unwrap == ContextError.DeadlineExceeded
@@ -56,4 +56,203 @@ test "a task stops when cancelled" {
   time.sleep(time.duration(5000000))
   cancel()
   assert (results.recv || -1) > 0
+}
+
+# ------------------------------------------------------------ context_test.go
+
+def very_long_duration -> time.Duration { time.hour * 1000 }
+
+# The CancelCtx behind `c` (Go's c.(*cancelCtx) / c.(*timerCtx)).
+def cc_of(c: Context) -> CancelCtx {
+  case c {
+    CancelCtx(x) => { return x }
+    _ => { panic "not a cancel context: #{c}" }
+  }
+}
+
+def kids(c: CancelCtx) -> [Int] {
+  c.st.lock { |s| s.children.keys }
+}
+
+def open?(ch: Chan[Bool]) -> Bool {
+  r = true
+  select {
+    when _ = ch.recv => r = false
+    else => r = true
+  }
+  r
+}
+
+test "ParentFinishesChild" {
+  parent, cancel = with_cancel(background)
+  cancel_child, stop = with_cancel(parent)
+  defer { stop() }
+  value_child = with_value(parent, "key", "value")
+  timer_child, stop2 = with_timeout(value_child, very_long_duration)
+  defer { stop2() }
+  after_stop = after_func(parent, ->() {})
+  defer { _ = after_stop() }
+
+  assert open?(parent.done), "<-parent.Done() should block"
+  assert open?(cancel_child.done), "<-cancelChild.Done() should block"
+  assert open?(timer_child.done), "<-timerChild.Done() should block"
+  assert open?(value_child.done), "<-valueChild.Done() should block"
+
+  pc = cc_of(parent)
+  cc = cc_of(cancel_child)
+  tc = cc_of(timer_child)
+  assert_eq tc.kind, KIND_TIMER
+  ks = kids(pc)
+  # The after-func context is the one child that is neither.
+  ac = ks.select { it != cc.id && it != tc.id }
+  assert ks.size == 3 && ks.include?(cc.id) && ks.include?(tc.id) && ac.size == 1, "bad linkage: pc.children = #{ks}"
+
+  p1 = parent_cancel_ctx(cc.parent) || panic "no parent"
+  assert_eq p1.id, pc.id
+  p2 = parent_cancel_ctx(tc.parent) || panic "no parent"
+  assert_eq p2.id, pc.id
+
+  cancel()
+  assert_eq kids(pc).size, 0
+  check = ->(ctx: Context, name: Str) {
+    assert !open?(ctx.done), "<-#{name}.Done() blocked, but shouldn't have"
+    assert ctx.err == ContextError.Canceled, "#{name}.Err() == #{ctx.err} want context canceled"
+  }
+  check.call(parent, "parent")
+  check.call(cancel_child, "cancelChild")
+  check.call(value_child, "valueChild")
+  check.call(timer_child, "timerChild")
+
+  precanceled = with_value(parent, "key", "value")
+  assert !open?(precanceled.done), "<-precanceledChild.Done() blocked, but shouldn't have"
+  assert precanceled.err == ContextError.Canceled
+}
+
+test "ChildFinishesFirst" {
+  cancelable, stop = with_cancel(background)
+  defer { stop() }
+  for parent in [background, cancelable] {
+    child, cancel = with_cancel(parent)
+    assert open?(parent.done), "<-parent.Done() should block"
+    assert open?(child.done), "<-child.Done() should block"
+
+    cc = cc_of(child)
+    pcok = case parent {
+      CancelCtx(_x) => true
+      _ => false
+    }
+    p = parent_cancel_ctx(cc.parent)
+    assert_eq p != none, pcok
+    if pcok {
+      pc = cc_of(parent)
+      assert_eq p?.id, pc.id
+      assert_eq kids(pc), [cc.id]
+    }
+
+    cancel()
+    if pcok {
+      assert kids(cc_of(parent)).size == 0, "child's cancel didn't remove self from pc.children"
+    }
+    assert !open?(child.done), "<-child.Done() blocked, but shouldn't have"
+    assert child.err == ContextError.Canceled
+    assert open?(parent.done), "<-parent.Done() should block"
+    assert parent.err == none
+  }
+}
+
+test "CancelRemoves" {
+  check_children = ->(at: Str, ctx: Context, want: Int) {
+    assert kids(cc_of(ctx)).size == want, at
+  }
+  ctx, _ = with_cancel(background)
+  check_children.call("after creation", ctx, 0)
+  _, cancel = with_cancel(ctx)
+  check_children.call("with WithCancel child", ctx, 1)
+  cancel()
+  check_children.call("after canceling WithCancel child", ctx, 0)
+
+  ctx, _ = with_cancel(background)
+  check_children.call("after creation", ctx, 0)
+  _, cancel = with_timeout(ctx, time.minute * 60)
+  check_children.call("with WithTimeout child", ctx, 1)
+  cancel()
+  check_children.call("after canceling WithTimeout child", ctx, 0)
+
+  ctx, _ = with_cancel(background)
+  check_children.call("after creation", ctx, 0)
+  stop = after_func(ctx, ->() {})
+  check_children.call("with AfterFunc child", ctx, 1)
+  _ = stop()
+  check_children.call("after stopping AfterFunc child", ctx, 0)
+}
+
+# Go's myCtx: wraps a Context, adding nothing.
+struct MyCtx {
+  c: Context
+
+  def deadline -> time.Time? { c.deadline }
+  def done -> Chan[Bool] { c.done }
+  def err -> Error? { c.err }
+  def value(key: Key) -> Any? { c.value(key) }
+  def cancelable? -> Bool { c.cancelable? }
+}
+
+# Go's myDoneCtx: wraps a Context but has a done channel of its own (never
+# closed), so it must be watched by a task.
+struct MyDoneCtx {
+  c: Context
+
+  def deadline -> time.Time? { c.deadline }
+  def done -> Chan[Bool] { Chan[Bool].new }
+  def err -> Error? { c.err }
+  def value(key: Key) -> Any? { c.value(key) }
+}
+
+test "CustomContextGoroutines" {
+  g = GOROUTINES.load
+  _, cancel0 = with_cancel(MyDoneCtx.new(c: background))
+  cancel0()
+  assert GOROUTINES.load == g + 1, "want 1 goroutine created"
+  g = GOROUTINES.load
+
+  _, cancel0 = with_timeout(MyDoneCtx.new(c: background), very_long_duration)
+  cancel0()
+  assert GOROUTINES.load == g + 1, "want 1 goroutine created"
+  g = GOROUTINES.load
+
+  ctx1, cancel1 = with_cancel(background)
+  defer { cancel1() }
+  assert_eq GOROUTINES.load, g
+
+  ctx2 = MyCtx.new(c: ctx1)
+  ctx3, cancel3 = with_cancel(ctx2)
+  defer { cancel3() }
+  assert_eq GOROUTINES.load, g
+
+  _, cancel3b = with_cancel(MyDoneCtx.new(c: ctx2))
+  defer { cancel3b() }
+  # ctx1 doesn't provide that Done: it must not be used.
+  assert GOROUTINES.load == g + 1, "want 1 goroutine created"
+  g = GOROUTINES.load
+
+  ctx4, cancel4 = with_timeout(ctx3, very_long_duration)
+  defer { cancel4() }
+  assert_eq GOROUTINES.load, g
+
+  ctx5, cancel5 = with_cancel(ctx4)
+  defer { cancel5() }
+  assert_eq GOROUTINES.load, g
+
+  cancel5()
+  assert_eq GOROUTINES.load, g
+
+  _, cancel6 = with_timeout(ctx5, very_long_duration)
+  defer { cancel6() }
+  assert_eq GOROUTINES.load, g
+
+  cancel6()
+  cancel1()
+  _, cancel7 = with_cancel(ctx5)
+  defer { cancel7() }
+  assert_eq GOROUTINES.load, g
 }

@@ -552,6 +552,7 @@ pub fn check_program(l: &Loaded, externs: Vec<DefInfo>) -> Result<TProgram, Diag
         mf.body.splice(0..0, pre);
     }
     let messages = w.message_instances()?;
+    w.iface_stringers()?;
     let iface_eqs = w.iface_eq_instances()?;
     let ifaces = std::mem::take(&mut w.impls);
     let stringers = std::mem::take(&mut w.stringers);
@@ -708,6 +709,7 @@ pub fn check_library(l: &Loaded, idx: usize, prefix: &str) -> Result<(TProgram, 
     w.add_iface_sigs(&m.ifaces)?;
     let exports = w.check_exports()?;
     let messages = w.message_instances()?;
+    w.iface_stringers()?;
     let iface_eqs = w.iface_eq_instances()?;
     let ifaces = std::mem::take(&mut w.impls);
     let stringers = std::mem::take(&mut w.stringers);

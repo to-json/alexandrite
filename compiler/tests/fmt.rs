@@ -27,7 +27,13 @@ fn acceptance_cases_are_fixed_points() {
     let mut bad = Vec::new();
     for p in cases() {
         let src = std::fs::read_to_string(&p).unwrap();
-        let out = format(&src).unwrap_or_else(|e| panic!("{}: {e}", p.display()));
+        // A negative case that fails to lex on purpose (`heredoc.bad1`) has nothing to format.
+        let negative = p.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.contains(".bad"));
+        let out = match format(&src) {
+            Ok(out) => out,
+            Err(_) if negative => continue,
+            Err(e) => panic!("{}: {e}", p.display()),
+        };
         assert_eq!(norm_tokens(&src).unwrap(), norm_tokens(&out).unwrap(), "tokens changed: {}", p.display());
         assert_eq!(format(&out).unwrap(), out, "not idempotent: {}", p.display());
         if out != src {

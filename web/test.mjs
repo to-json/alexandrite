@@ -63,7 +63,7 @@ if (filter.endsWith('.alx') && filter.includes('/')) {
 }
 let fail = 0;
 // What needs the C library must be refused at compile time.
-const browserless = ['ffi.alx', 'echo.alx', 'httpdemo.alx', 'scripting.alx'];
+const browserless = ['ffi.alx', 'echo.alx', 'httpdemo.alx', 'scripting.alx', 'parseexec.alx'];
 // Cases that need a file system: they run, and fail as Go's js/wasm does.
 const fileless = ['wc.alx'];
 for (const f of browserless.filter(f => f.includes(filter))) {

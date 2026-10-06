@@ -2203,6 +2203,20 @@ int64_t alx_sys_spawn(const uint8_t *argv, int64_t argc, const uint8_t *env, int
  * #154). wait4_task is with the poller below. */
 static int64_t wait4_task(pid_t pid, int *st, struct rusage *ru);
 
+static int64_t wait_fill(int st, struct rusage *rup, uint8_t *out);
+
+/* wait4(WNOHANG): 1 reaped (out filled as alx_sys_wait does), 0 still running. */
+int64_t alx_sys_wait_nohang(int64_t pid, uint8_t *out) {
+    int st;
+    struct rusage ru;
+    pid_t r;
+    while ((r = wait4((pid_t)pid, &st, WNOHANG, &ru)) < 0)
+        if (errno != EINTR) return -errno;
+    if (r == 0) return 0;
+    wait_fill(st, &ru, out);
+    return 1;
+}
+
 int64_t alx_sys_wait(int64_t pid, uint8_t *out) {
     int st;
     struct rusage ru;
@@ -2213,6 +2227,11 @@ int64_t alx_sys_wait(int64_t pid, uint8_t *out) {
         while (wait4((pid_t)pid, &st, 0, &ru) < 0)
             if (errno != EINTR) return -errno;
     }
+    return wait_fill(st, &ru, out);
+}
+
+static int64_t wait_fill(int st, struct rusage *rup, uint8_t *out) {
+    struct rusage ru = *rup;
 #ifdef __APPLE__
     int64_t rss = (int64_t)ru.ru_maxrss;  /* bytes */
 #else
@@ -2747,6 +2766,27 @@ int64_t alx_sys_poll2(int64_t a, int64_t b) {
     while (poll(pf, 2, -1) < 0)
         if (errno != EINTR) return -errno;
     return 0;
+}
+
+/* Like alx_sys_poll2, but gives up after timeout_ns: 1 ready, 0 timed out,
+ * -errno. A task parks with a deadline; a plain thread poll(2)s. */
+int64_t alx_sys_poll2_timeout(int64_t a, int64_t b, int64_t timeout_ns) {
+    int64_t deadline = mono_ns() + (timeout_ns > 0 ? timeout_ns : 0);
+    struct pollfd pf[2] = { { (int)a, POLLIN, 0 }, { (int)b, POLLIN, 0 } };
+    for (;;) {
+        int64_t left = deadline - mono_ns();
+        if (left < 0) left = 0;
+        pf[0].revents = pf[1].revents = 0;
+        int r = poll(pf, 2, tl_task ? 0 : (int)((left + 999999) / 1000000));
+        if (r < 0) { if (errno == EINTR) continue; return -errno; }
+        if (r > 0) return 1;
+        if (left <= 0) return 0;
+        if (tl_task) {
+            int fds[2] = { (int)a, (int)b }, modes[2] = { 1, 1 };
+            int64_t rc = fd_wait_task(fds, modes, 2, deadline);
+            if (rc < 0) return rc;
+        }
+    }
 }
 
 /* wait4(2) from a task: a helper thread blocks in it while the task parks

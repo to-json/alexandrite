@@ -634,10 +634,23 @@ mod rt {
         }
     }
     pub unsafe fn shim_alx_sys_wait(pid: i64, out: *mut u8) -> i64 {
+        unsafe { wait_flags(pid, out, 0) }
+    }
+    /// Like alx_sys_wait without blocking: 1 reaped, 0 still running.
+    pub unsafe fn shim_alx_sys_wait_nohang(pid: i64, out: *mut u8) -> i64 {
+        let r = unsafe { wait_flags(pid, out, 1) };
+        if r == 0 { 1 } else if r == 1 { 0 } else { r }
+    }
+    // 0 reaped, 1 (WNOHANG only) still running, or -errno.
+    unsafe fn wait_flags(pid: i64, out: *mut u8, flags: i32) -> i64 {
         let mut st = 0i32;
         let mut ru = [0i64; 18];
         loop {
-            if unsafe { wait4(pid as i32, &mut st, 0, ru.as_mut_ptr()) } >= 0 {
+            let w = unsafe { wait4(pid as i32, &mut st, flags, ru.as_mut_ptr()) };
+            if w == 0 {
+                return 1;
+            }
+            if w > 0 {
                 break;
             }
             let e = std::io::Error::last_os_error();
@@ -727,6 +740,28 @@ mod rt {
             }
             // F_GETFD (1) fails with EBADF once the descriptor is closed.
             if unsafe { libc_fcntl(fd as i32, 1) } < 0 {
+                return 0;
+            }
+        }
+    }
+    /// 1 ready, 0 timed out, -errno: a or b (-1: none) readable or hung up.
+    pub unsafe fn shim_alx_sys_poll2_timeout(a: i64, b: i64, timeout_ns: i64) -> i64 {
+        let start = std::time::Instant::now();
+        let total = std::time::Duration::from_nanos(timeout_ns.max(0) as u64);
+        loop {
+            let left = total.saturating_sub(start.elapsed());
+            let ms = ((left.as_nanos() + 999_999) / 1_000_000) as i32;
+            let mut fds = [PollFd { fd: a as i32, events: 1, revents: 0 }, PollFd { fd: b as i32, events: 1, revents: 0 }];
+            let r = unsafe { poll(fds.as_mut_ptr(), 2, ms) };
+            if r > 0 {
+                return 1;
+            }
+            if r < 0 {
+                let e = std::io::Error::last_os_error();
+                if e.raw_os_error() != Some(4) {
+                    return neg_errno(&e);
+                }
+            } else if start.elapsed() >= total {
                 return 0;
             }
         }

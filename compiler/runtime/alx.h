@@ -509,6 +509,7 @@ int64_t alx_sys_spawn(const uint8_t *argv, int64_t argc, const uint8_t *env, int
 /* Waits for pid. out (5 int64s): 0 exited / 1 killed, its status / signal,
  * user and system CPU ns, peak resident bytes. 0 or -errno. */
 int64_t alx_sys_wait(int64_t pid, uint8_t *out);
+int64_t alx_sys_wait_nohang(int64_t pid, uint8_t *out);
 /* A pipe, both ends close-on-exec (the read end non-blocking if nonblock):
  * out = 2 int64s (read, write). 0 or -errno. */
 int64_t alx_sys_pipe(uint8_t *out, int64_t nonblock);
@@ -518,6 +519,7 @@ int64_t alx_sys_exec(const uint8_t *argv, int64_t argc, const uint8_t *env, int6
                      int64_t fd0, int64_t fd1, int64_t fd2);
 /* Blocks until a or b (either may be -1) is readable or hung up. 0 or -errno. */
 int64_t alx_sys_poll2(int64_t a, int64_t b);
+int64_t alx_sys_poll2_timeout(int64_t a, int64_t b, int64_t timeout_ns);
 int64_t alx_sig_watch(int64_t mask);
 int64_t alx_sig_unwatch(int64_t rfd);
 int64_t alx_sig_reset(int64_t mask, int64_t how);
